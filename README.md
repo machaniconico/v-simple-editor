@@ -138,21 +138,32 @@ A professional video editing application built from scratch with C++17, Qt6, and
 - pkg-config
 - Python 3.8+ (optional, for scripting extension)
 
-### Windows (vcpkg)
+### Windows (One-Click Setup)
+
+**Visual Studio 2022 が必須です。** 先にインストールしてください：
+1. [Visual Studio 2022](https://visualstudio.microsoft.com/downloads/) をダウンロード（Community版は無料）
+2. インストーラーで **「C++によるデスクトップ開発」** ワークロードにチェックを入れてインストール
+
+VS2022が入っていれば、あとは `setup.bat` が全自動でやります：
 
 ```bash
-# One-time setup
-git clone https://github.com/microsoft/vcpkg.git
-cd vcpkg && bootstrap-vcpkg.bat
+# GitHub から取得（git clone または ZIP ダウンロード）
+git clone https://github.com/machaniconico/v-editor-simple.git
+cd v-editor-simple
 
-# Install dependencies
-vcpkg install qt6 ffmpeg
-
-# Or use the setup script
+# ワンクリックセットアップ（vcpkg, Qt6, FFmpeg 自動インストール & ビルド）
 setup.bat
+```
 
-# Build
-cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=[vcpkg-root]/scripts/buildsystems/vcpkg.cmake
+`setup.bat` が行うこと：
+- vcpkg の自動インストール（C:\vcpkg）
+- Qt6, FFmpeg, pkgconf のインストール（初回は30-60分）
+- CMake configure & Release ビルド
+- 完了後にアプリを起動するか確認
+
+手動でビルドする場合：
+```bash
+cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake
 cmake --build build --config Release
 ```
 
