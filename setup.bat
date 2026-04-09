@@ -1,14 +1,18 @@
 @echo off
+chcp 65001 >nul 2>&1
 setlocal enabledelayedexpansion
-title V Editor Simple - One-Click Setup & Build
+title V Editor Simple - One-Click Setup and Build
 color 0A
 
 echo.
 echo  ============================================================
-echo   V Editor Simple - One-Click Setup ^& Build
+echo   V Editor Simple - One-Click Setup and Build
 echo   This script will install everything and build the app.
 echo  ============================================================
 echo.
+
+:: Save project directory
+set "PROJECT_DIR=%~dp0"
 
 :: ---- Step 0: Check for Visual Studio ----
 echo [Step 0/5] Checking Visual Studio...
@@ -20,13 +24,12 @@ for %%p in (
     "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvarsall.bat"
     "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat"
     "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat"
-    "C:\Program Files\Microsoft Visual Studio\18\Insiders\VC\Auxiliary\Build\vcvarsall.bat"
     "C:\Program Files\Microsoft Visual Studio\2026\Community\VC\Auxiliary\Build\vcvarsall.bat"
     "C:\Program Files\Microsoft Visual Studio\2026\Professional\VC\Auxiliary\Build\vcvarsall.bat"
     "C:\Program Files (x86)\Microsoft Visual Studio\2026\BuildTools\VC\Auxiliary\Build\vcvarsall.bat"
 ) do (
     if exist %%p (
-        set VCVARSALL=%%~p
+        set "VCVARSALL=%%~p"
         set VS_FOUND=1
         echo   [OK] Visual Studio found: %%~p
     )
@@ -54,7 +57,7 @@ echo.
 
 :: ---- Step 1: Setup vcpkg ----
 echo [Step 1/5] Setting up vcpkg...
-set VCPKG_ROOT=C:\vcpkg
+set "VCPKG_ROOT=C:\vcpkg"
 
 if exist "%VCPKG_ROOT%\vcpkg.exe" (
     echo   [OK] vcpkg already installed at %VCPKG_ROOT%
@@ -67,9 +70,9 @@ if exist "%VCPKG_ROOT%\vcpkg.exe" (
         pause
         exit /b 1
     )
-    cd /d "%VCPKG_ROOT%"
+    pushd "%VCPKG_ROOT%"
     call bootstrap-vcpkg.bat -disableMetrics
-    cd /d "%~dp0"
+    popd
     echo   [OK] vcpkg installed
 )
 
@@ -83,61 +86,52 @@ echo [Step 2/5] Installing dependencies via vcpkg (this may take 30-60 min first
 echo   Packages: qt6, ffmpeg, pkgconf
 echo.
 
-set VCPKG=%VCPKG_ROOT%\vcpkg.exe
-set TRIPLET=x64-windows
+set "VCPKG=%VCPKG_ROOT%\vcpkg.exe"
+set "TRIPLET=x64-windows"
 
-:: Check if Qt6 is already installed
-"%VCPKG%" list qtbase:%TRIPLET% 2>nul | findstr /i "qtbase" >nul 2>&1
-if !errorlevel! equ 0 (
-    echo   [OK] Qt6 already installed
-) else (
-    echo   [Installing] Qt6 (this is the big one, grab a coffee)...
-    "%VCPKG%" install "qtbase[core,gui,widgets,opengl]:%TRIPLET%" qtmultimedia:%TRIPLET% qtnetworkauth:%TRIPLET%
-    if !errorlevel! neq 0 (
-        echo   [ERROR] Failed to install Qt6
-        pause
-        exit /b 1
-    )
-    echo   [OK] Qt6 installed
+:: Install Qt6 (vcpkg install is idempotent — safe to re-run)
+echo   [Installing] Qt6...
+"%VCPKG%" install qtbase:x64-windows qtmultimedia:x64-windows qtnetworkauth:x64-windows
+if !errorlevel! neq 0 (
+    echo   [ERROR] Failed to install Qt6
+    pause
+    exit /b 1
 )
+echo   [OK] Qt6 ready
 
 :: FFmpeg
-"%VCPKG%" list ffmpeg:%TRIPLET% 2>nul | findstr /i "ffmpeg" >nul 2>&1
-if !errorlevel! equ 0 (
-    echo   [OK] FFmpeg already installed
-) else (
-    echo   [Installing] FFmpeg...
-    "%VCPKG%" install ffmpeg:%TRIPLET%
-    if !errorlevel! neq 0 (
-        echo   [ERROR] Failed to install FFmpeg
-        pause
-        exit /b 1
-    )
-    echo   [OK] FFmpeg installed
+echo   [Installing] FFmpeg...
+"%VCPKG%" install ffmpeg:x64-windows
+if !errorlevel! neq 0 (
+    echo   [ERROR] Failed to install FFmpeg
+    pause
+    exit /b 1
 )
+echo   [OK] FFmpeg ready
 
 :: pkgconf
-"%VCPKG%" list pkgconf:%TRIPLET% 2>nul | findstr /i "pkgconf" >nul 2>&1
-if !errorlevel! equ 0 (
-    echo   [OK] pkgconf already installed
-) else (
-    echo   [Installing] pkgconf...
-    "%VCPKG%" install pkgconf:%TRIPLET%
-    echo   [OK] pkgconf installed
-)
+echo   [Installing] pkgconf...
+"%VCPKG%" install pkgconf:x64-windows
+echo   [OK] pkgconf ready
 
 echo.
 
 :: ---- Step 3: CMake configure ----
 echo [Step 3/5] Configuring with CMake...
-cd /d "%~dp0"
+cd /d "%PROJECT_DIR%"
 
 if not exist build mkdir build
 
-cmake -B build -S . ^
-    -DCMAKE_TOOLCHAIN_FILE="%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake" ^
-    -DVCPKG_TARGET_TRIPLET=%TRIPLET% ^
-    -G "Visual Studio 17 2022" -A x64
+:: Detect Visual Studio generator
+set "CMAKE_GEN=Visual Studio 17 2022"
+cmake --help 2>nul | findstr /c:"Visual Studio 18 2026" >nul 2>&1
+if !errorlevel! equ 0 (
+    set "CMAKE_GEN=Visual Studio 18 2026"
+)
+
+echo   Using generator: !CMAKE_GEN!
+
+cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE="%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=x64-windows -G "!CMAKE_GEN!" -A x64
 
 if !errorlevel! neq 0 (
     echo.
@@ -165,9 +159,9 @@ echo.
 
 :: ---- Step 5: Done! ----
 echo [Step 5/5] Locating executable...
-set EXE_PATH=
+set "EXE_PATH="
 for /r build %%f in (v-editor-simple.exe) do (
-    set EXE_PATH=%%f
+    set "EXE_PATH=%%f"
 )
 
 echo.
@@ -178,7 +172,7 @@ echo.
 if defined EXE_PATH (
     echo   Executable: !EXE_PATH!
     echo.
-    set /p LAUNCH="   Launch V Editor Simple now? (y/n): "
+    set /p "LAUNCH=   Launch V Editor Simple now? (y/n): "
     if /i "!LAUNCH!"=="y" (
         start "" "!EXE_PATH!"
     )
