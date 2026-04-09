@@ -2080,23 +2080,18 @@ void MainWindow::addTextAnimation()
     if (!ok || text.isEmpty()) return;
 
     auto presets = TextAnimator::presetAnimations();
-    QStringList animNames;
-    for (const auto &p : presets)
-        animNames << p.first;
+    QStringList animNames = presets.keys();
 
     QString selected = QInputDialog::getItem(this, "Text Animation",
         "Animation style:", animNames, 0, false, &ok);
     if (!ok) return;
 
-    for (const auto &p : presets) {
-        if (p.first == selected) {
-            TextAnimator animator;
-            animator.setText(text, QFont("Arial", 48), QPointF(100, 100));
-            animator.setAnimation(p.second);
-            statusBar()->showMessage(QString("Added text animation: \"%1\" with %2")
-                .arg(text, selected));
-            break;
-        }
+    if (presets.contains(selected)) {
+        TextAnimator animator;
+        animator.setText(text, QFont("Arial", 48), QPointF(100, 100));
+        animator.setAnimation(presets.value(selected));
+        statusBar()->showMessage(QString("Added text animation: \"%1\" with %2")
+            .arg(text, selected));
     }
 }
 
@@ -2176,9 +2171,9 @@ void MainWindow::editExpressions()
         "Expression code:", QLineEdit::Normal, "wiggle(2, 10)", &ok);
     if (!ok || code.isEmpty()) return;
 
-    auto result = Expression::validate(code);
-    if (!result.success) {
-        QMessageBox::warning(this, "Expression Error", "Invalid expression: " + result.error);
+    QString validationError = Expression::validate(code);
+    if (!validationError.isEmpty()) {
+        QMessageBox::warning(this, "Expression Error", "Invalid expression: " + validationError);
         return;
     }
 
@@ -2252,7 +2247,7 @@ void MainWindow::openRecentFile(const QString &filePath)
             statusBar()->showMessage("Opened project: " + fi.fileName());
         }
     } else {
-        m_player->openFile(filePath);
+        m_player->loadFile(filePath);
         statusBar()->showMessage("Opened: " + fi.fileName());
     }
     m_recentFilesManager->addFile(filePath);
@@ -2260,7 +2255,7 @@ void MainWindow::openRecentFile(const QString &filePath)
 
 void MainWindow::editShortcuts()
 {
-    ShortcutEditorDialog dialog(&m_shortcutManager, this);
+    ShortcutEditorDialog dialog(this);
     if (dialog.exec() == QDialog::Accepted) {
         m_shortcutManager.saveShortcuts();
         statusBar()->showMessage("Keyboard shortcuts updated");
@@ -2311,13 +2306,13 @@ void MainWindow::openVSTPlugins()
 
 void MainWindow::openScriptConsole()
 {
-    ScriptConsole console(m_scriptEngine, this);
+    ScriptConsole console(m_scriptEngine, &m_scriptManager, this);
     console.exec();
 }
 
 void MainWindow::openNetworkRender()
 {
-    NetworkRenderDialog dialog(this);
+    NetworkRenderDialog dialog(&m_networkRenderServer, this);
     dialog.exec();
 }
 
@@ -2331,7 +2326,7 @@ void MainWindow::exportToRemotion()
     data.markIn = m_timeline->markedIn();
     data.markOut = m_timeline->markedOut();
 
-    RemotionExportDialog dialog(data, this);
+    RemotionExportDialog dialog(m_projectConfig, data, this);
     dialog.exec();
 }
 

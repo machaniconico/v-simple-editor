@@ -205,6 +205,8 @@ private:
     RecentFilesManager *m_recentFilesManager = nullptr;
     RecentFilesMenu *m_recentFilesMenu = nullptr;
     ScriptEngine *m_scriptEngine = nullptr;
+    ScriptManager m_scriptManager;
+    NetworkRenderServer m_networkRenderServer;
 
     // UI/UX (Phase 14b)
     QSplitter *m_mainSplitter = nullptr;
