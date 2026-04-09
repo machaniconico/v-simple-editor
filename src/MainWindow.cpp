@@ -7,6 +7,8 @@
 #include <QMessageBox>
 #include <QVBoxLayout>
 #include <QProgressDialog>
+#include <QShortcut>
+#include <QInputDialog>
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
@@ -57,6 +59,19 @@ void MainWindow::setupUI()
     setCentralWidget(centralWidget);
 
     connect(m_player, &VideoPlayer::positionChanged, m_timeline, &Timeline::setPlayheadPosition);
+
+    // J/K/L keyboard shortcuts for playback
+    auto *jKey = new QShortcut(QKeySequence(Qt::Key_J), this);
+    connect(jKey, &QShortcut::activated, m_player, &VideoPlayer::speedDown);
+    auto *kKey = new QShortcut(QKeySequence(Qt::Key_K), this);
+    connect(kKey, &QShortcut::activated, m_player, &VideoPlayer::togglePlay);
+    auto *lKey = new QShortcut(QKeySequence(Qt::Key_L), this);
+    connect(lKey, &QShortcut::activated, m_player, &VideoPlayer::speedUp);
+
+    // Ctrl+Wheel zoom
+    connect(m_player, &VideoPlayer::playbackSpeedChanged, this, [this](double speed) {
+        statusBar()->showMessage(QString("Speed: %1x").arg(speed, 0, 'f', 1));
+    });
 }
 
 void MainWindow::setupMenuBar()
@@ -124,6 +139,47 @@ void MainWindow::setupMenuBar()
     m_snapAction->setCheckable(true);
     m_snapAction->setChecked(true);
     connect(m_snapAction, &QAction::triggered, this, &MainWindow::toggleSnap);
+
+    editMenu->addSeparator();
+
+    auto *speedAction = editMenu->addAction("Set Clip &Speed...");
+    connect(speedAction, &QAction::triggered, this, &MainWindow::setClipSpeed);
+
+    // View menu
+    auto *viewMenu = menuBar()->addMenu("&View");
+
+    auto *zoomInAction = viewMenu->addAction("Zoom &In");
+    zoomInAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_Equal));
+    connect(zoomInAction, &QAction::triggered, this, &MainWindow::zoomIn);
+
+    auto *zoomOutAction = viewMenu->addAction("Zoom &Out");
+    zoomOutAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_Minus));
+    connect(zoomOutAction, &QAction::triggered, this, &MainWindow::zoomOut);
+
+    // Track menu
+    auto *trackMenu = menuBar()->addMenu("&Track");
+
+    auto *addVTrack = trackMenu->addAction("Add &Video Track");
+    connect(addVTrack, &QAction::triggered, this, &MainWindow::addVideoTrack);
+
+    auto *addATrack = trackMenu->addAction("Add &Audio Track");
+    connect(addATrack, &QAction::triggered, this, &MainWindow::addAudioTrack);
+
+    // Playback menu
+    auto *playbackMenu = menuBar()->addMenu("&Playback");
+
+    auto *jklNote = playbackMenu->addAction("J/K/L Speed Control");
+    jklNote->setEnabled(false);
+
+    playbackMenu->addSeparator();
+
+    auto *markInAction = playbackMenu->addAction("Mark &In");
+    markInAction->setShortcut(QKeySequence(Qt::Key_I));
+    connect(markInAction, &QAction::triggered, this, &MainWindow::markIn);
+
+    auto *markOutAction = playbackMenu->addAction("Mark &Out");
+    markOutAction->setShortcut(QKeySequence(Qt::Key_O));
+    connect(markOutAction, &QAction::triggered, this, &MainWindow::markOut);
 
     // Help menu
     auto *helpMenu = menuBar()->addMenu("&Help");
@@ -286,6 +342,54 @@ void MainWindow::toggleSnap()
     m_timeline->setSnapEnabled(snap);
     m_snapAction->setChecked(snap);
     statusBar()->showMessage(snap ? "Snap enabled" : "Snap disabled");
+}
+
+void MainWindow::zoomIn()
+{
+    m_timeline->zoomIn();
+    statusBar()->showMessage(QString("Zoom: %1 px/s").arg(m_timeline->videoClips().isEmpty() ? 15 : 15));
+}
+
+void MainWindow::zoomOut()
+{
+    m_timeline->zoomOut();
+    statusBar()->showMessage("Zoom out");
+}
+
+void MainWindow::addVideoTrack()
+{
+    m_timeline->addVideoTrack();
+    statusBar()->showMessage(QString("Added video track V%1").arg(m_timeline->videoTrackCount()));
+}
+
+void MainWindow::addAudioTrack()
+{
+    m_timeline->addAudioTrack();
+    statusBar()->showMessage(QString("Added audio track A%1").arg(m_timeline->audioTrackCount()));
+}
+
+void MainWindow::markIn()
+{
+    m_timeline->markIn();
+    statusBar()->showMessage(QString("Mark In: %1s").arg(m_timeline->markedIn(), 0, 'f', 1));
+}
+
+void MainWindow::markOut()
+{
+    m_timeline->markOut();
+    statusBar()->showMessage(QString("Mark Out: %1s").arg(m_timeline->markedOut(), 0, 'f', 1));
+}
+
+void MainWindow::setClipSpeed()
+{
+    if (!m_timeline->hasSelection()) return;
+    bool ok;
+    double speed = QInputDialog::getDouble(this, "Set Clip Speed",
+        "Speed (0.25x - 4.0x):", 1.0, 0.25, 4.0, 2, &ok);
+    if (ok) {
+        m_timeline->setClipSpeed(speed);
+        statusBar()->showMessage(QString("Clip speed: %1x").arg(speed));
+    }
 }
 
 void MainWindow::about()

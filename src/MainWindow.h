@@ -32,6 +32,13 @@ private slots:
     void undoAction();
     void redoAction();
     void toggleSnap();
+    void zoomIn();
+    void zoomOut();
+    void addVideoTrack();
+    void addAudioTrack();
+    void markIn();
+    void markOut();
+    void setClipSpeed();
     void about();
 
 private:

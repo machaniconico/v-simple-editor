@@ -29,11 +29,16 @@ public slots:
     void pause();
     void stop();
     void seek(int position);
+    void setPlaybackSpeed(double speed);
+    void speedUp();    // L key
+    void speedDown();  // J key
+    void togglePlay(); // K key
 
 signals:
     void positionChanged(int position);
     void durationChanged(int duration);
     void stateChanged(bool playing);
+    void playbackSpeedChanged(double speed);
 
 private:
     void setupUI();
@@ -53,4 +58,5 @@ private:
     int64_t m_duration = 0;
     int m_canvasWidth = 1920;
     int m_canvasHeight = 1080;
+    double m_playbackSpeed = 1.0;
 };

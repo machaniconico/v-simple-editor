@@ -188,6 +188,42 @@ void VideoPlayer::seek(int position)
     emit positionChanged(position);
 }
 
+void VideoPlayer::setPlaybackSpeed(double speed)
+{
+    m_playbackSpeed = qMax(0.25, qMin(4.0, speed));
+    emit playbackSpeedChanged(m_playbackSpeed);
+}
+
+void VideoPlayer::speedUp()
+{
+    // L key: increase speed (1x -> 2x -> 4x), or if paused/reverse start forward
+    if (!m_playing) { play(); m_playbackSpeed = 1.0; }
+    else if (m_playbackSpeed < 0) m_playbackSpeed = 1.0;
+    else if (m_playbackSpeed < 4.0) m_playbackSpeed *= 2.0;
+    setPlaybackSpeed(m_playbackSpeed);
+}
+
+void VideoPlayer::speedDown()
+{
+    // J key: decrease/reverse speed (1x -> -1x -> -2x -> -4x)
+    if (!m_playing) { m_playbackSpeed = -1.0; play(); }
+    else if (m_playbackSpeed > 0) m_playbackSpeed = -1.0;
+    else if (m_playbackSpeed > -4.0) m_playbackSpeed *= 2.0;
+    setPlaybackSpeed(m_playbackSpeed);
+}
+
+void VideoPlayer::togglePlay()
+{
+    // K key: toggle play/pause, reset speed to 1x
+    if (m_playing) {
+        pause();
+    } else {
+        m_playbackSpeed = 1.0;
+        play();
+    }
+    setPlaybackSpeed(m_playbackSpeed);
+}
+
 void VideoPlayer::updatePlayButton()
 {
     m_playButton->setText(m_playing ? "Pause" : "Play");

@@ -20,9 +20,10 @@ struct ClipInfo {
     double duration;
     double inPoint = 0.0;
     double outPoint = 0.0;
+    double speed = 1.0; // 0.25x - 4.0x
     double effectiveDuration() const {
         double out = (outPoint > 0.0) ? outPoint : duration;
-        return out - inPoint;
+        return (out - inPoint) / speed;
     }
 };
 
@@ -59,6 +60,8 @@ public:
 
     void setSnapEnabled(bool enabled) { m_snapEnabled = enabled; }
     bool snapEnabled() const { return m_snapEnabled; }
+    void setPixelsPerSecond(int pps);
+    int pixelsPerSecond() const { return m_pixelsPerSecond; }
 
 signals:
     void clipClicked(int index);
@@ -85,8 +88,8 @@ private:
     bool m_snapEnabled = true;
     int m_dropTargetIndex = -1;
 
+    int m_pixelsPerSecond = 10;
     static constexpr int CLIP_HEIGHT = 50;
-    static constexpr int PIXELS_PER_SECOND = 10;
     static constexpr int TRIM_HANDLE_WIDTH = 6;
     static constexpr int SNAP_THRESHOLD = 8;
 };
@@ -119,10 +122,31 @@ public:
     void setSnapEnabled(bool enabled);
     bool snapEnabled() const;
 
+    // Zoom
+    void zoomIn();
+    void zoomOut();
+    void setZoomLevel(int pixelsPerSecond);
+
+    // I/O markers
+    void markIn();
+    void markOut();
+    double markedIn() const { return m_markIn; }
+    double markedOut() const { return m_markOut; }
+    bool hasMarkedRange() const { return m_markIn >= 0 && m_markOut > m_markIn; }
+
+    // Multi-track
+    void addVideoTrack();
+    void addAudioTrack();
+    int videoTrackCount() const { return m_videoTracks.size(); }
+    int audioTrackCount() const { return m_audioTracks.size(); }
+
+    // Clip speed
+    void setClipSpeed(double speed);
+
     void setPlayheadPosition(double seconds);
     double playheadPosition() const { return m_playheadPos; }
     double totalDuration() const;
-    const QVector<ClipInfo> &videoClips() const { return m_videoTrack->clips(); }
+    const QVector<ClipInfo> &videoClips() const { return m_videoTracks[0]->clips(); }
 
     UndoManager *undoManager() const { return m_undoManager; }
 
@@ -141,11 +165,18 @@ private:
     TimelineState currentState() const;
     void updateInfoLabel();
 
-    TimelineTrack *m_videoTrack;
-    TimelineTrack *m_audioTrack;
+    QVector<TimelineTrack*> m_videoTracks;
+    QVector<TimelineTrack*> m_audioTracks;
+    TimelineTrack *m_videoTrack; // alias for m_videoTracks[0]
+    TimelineTrack *m_audioTrack; // alias for m_audioTracks[0]
     QScrollArea *m_scrollArea;
+    QWidget *m_tracksWidget;
+    QVBoxLayout *m_tracksLayout;
     QLabel *m_infoLabel;
     double m_playheadPos = 0.0;
+    double m_markIn = -1.0;
+    double m_markOut = -1.0;
+    int m_zoomLevel = 10; // pixels per second
 
     UndoManager *m_undoManager;
     std::optional<ClipInfo> m_clipboard;
