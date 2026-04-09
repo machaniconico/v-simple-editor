@@ -1,5 +1,6 @@
 #include "Exporter.h"
 #include "CodecDetector.h"
+#include "VideoEffect.h"
 #include <QFileInfo>
 
 Exporter::Exporter(QObject *parent)
@@ -243,8 +244,40 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
                 }
 
                 av_frame_make_writable(outFrame);
-                sws_scale(swsCtx, frame->data, frame->linesize, 0, frame->height,
-                          outFrame->data, outFrame->linesize);
+
+                // Apply color correction & effects if clip has any
+                bool hasEffects = !clip.colorCorrection.isDefault() || !clip.effects.isEmpty();
+                if (hasEffects) {
+                    // Decode to RGB for effect processing
+                    QImage rgbFrame(config.width, config.height, QImage::Format_RGB888);
+                    SwsContext *toRgbCtx = sws_getContext(
+                        frame->width, frame->height, decCtx->pix_fmt,
+                        config.width, config.height, AV_PIX_FMT_RGB24,
+                        SWS_BILINEAR, nullptr, nullptr, nullptr);
+                    uint8_t *rgbDest[1] = { rgbFrame.bits() };
+                    int rgbLinesize[1] = { static_cast<int>(rgbFrame.bytesPerLine()) };
+                    sws_scale(toRgbCtx, frame->data, frame->linesize, 0, frame->height,
+                              rgbDest, rgbLinesize);
+                    sws_freeContext(toRgbCtx);
+
+                    // Apply effects
+                    rgbFrame = VideoEffectProcessor::applyEffectStack(
+                        rgbFrame, clip.colorCorrection, clip.effects);
+
+                    // Convert processed RGB back to YUV420P
+                    SwsContext *toYuvCtx = sws_getContext(
+                        config.width, config.height, AV_PIX_FMT_RGB24,
+                        config.width, config.height, AV_PIX_FMT_YUV420P,
+                        SWS_BILINEAR, nullptr, nullptr, nullptr);
+                    const uint8_t *rgbSrc[1] = { rgbFrame.constBits() };
+                    int rgbSrcLinesize[1] = { static_cast<int>(rgbFrame.bytesPerLine()) };
+                    sws_scale(toYuvCtx, rgbSrc, rgbSrcLinesize, 0, config.height,
+                              outFrame->data, outFrame->linesize);
+                    sws_freeContext(toYuvCtx);
+                } else {
+                    sws_scale(swsCtx, frame->data, frame->linesize, 0, frame->height,
+                              outFrame->data, outFrame->linesize);
+                }
 
                 outFrame->pts = globalPts++;
 

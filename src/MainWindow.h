@@ -8,6 +8,10 @@
 #include <QFileDialog>
 #include "ProjectSettings.h"
 #include "Exporter.h"
+#include "ProjectFile.h"
+#include "AutoEdit.h"
+#include "ThemeManager.h"
+#include "MultiCam.h"
 
 class VideoPlayer;
 class Timeline;
@@ -23,6 +27,9 @@ public:
 private slots:
     void newProject();
     void openFile();
+    void saveProject();
+    void saveProjectAs();
+    void openProject();
     void exportVideo();
     void splitClip();
     void deleteClip();
@@ -40,6 +47,9 @@ private slots:
     void markOut();
     void setClipSpeed();
     void addTextOverlay();
+    void manageTextOverlays();
+    void importSubtitles();
+    void saveTextTemplate();
     void addTransition();
     void addImageOverlay();
     void addPip();
@@ -47,6 +57,16 @@ private slots:
     void addBgm();
     void toggleMute();
     void toggleSolo();
+    void colorCorrection();
+    void videoEffects();
+    void pluginEffects();
+    void editKeyframes();
+    void autoSilenceDetect();
+    void autoJumpCut();
+    void autoSceneDetect();
+    void changeTheme();
+    void multiCamSetup();
+    void multiCamSwitch();
     void about();
 
 private:
@@ -71,4 +91,6 @@ private:
     QAction *m_redoAction;
     QAction *m_snapAction;
     Exporter *m_exporter;
+    QString m_projectFilePath; // current .veditor file
+    MultiCamSession *m_multiCam = nullptr;
 };

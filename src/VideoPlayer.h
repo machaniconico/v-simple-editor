@@ -6,6 +6,9 @@
 #include <QSlider>
 #include <QHBoxLayout>
 #include <QVBoxLayout>
+#include "VideoEffect.h"
+
+class GLPreview;
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -23,6 +26,9 @@ public:
 
     void loadFile(const QString &filePath);
     void setCanvasSize(int width, int height);
+    void setColorCorrection(const ColorCorrection &cc);
+    bool isGLAccelerated() const { return m_useGL; }
+    void setGLAcceleration(bool enabled);
 
 public slots:
     void play();
@@ -46,6 +52,8 @@ private:
     void displayFrame(const QImage &image);
 
     QLabel *m_videoDisplay;
+    GLPreview *m_glPreview = nullptr;
+    bool m_useGL = true;
     QPushButton *m_playButton;
     QPushButton *m_stopButton;
     QSlider *m_seekBar;

@@ -8,7 +8,7 @@ set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
 # Qt6
-find_package(Qt6 REQUIRED COMPONENTS Widgets Multimedia MultimediaWidgets)
+find_package(Qt6 REQUIRED COMPONENTS Widgets Multimedia MultimediaWidgets OpenGL OpenGLWidgets)
 
 # FFmpeg via pkg-config
 find_package(PkgConfig REQUIRED)
@@ -30,6 +30,18 @@ add_executable(${PROJECT_NAME}
     src/UndoManager.cpp
     src/Overlay.cpp
     src/OverlayDialogs.cpp
+    src/VideoEffect.cpp
+    src/VideoEffectDialogs.cpp
+    src/Keyframe.cpp
+    src/EffectPlugin.cpp
+    src/ProjectFile.cpp
+    src/GLPreview.cpp
+    src/WaveformGenerator.cpp
+    src/AutoEdit.cpp
+    src/ThemeManager.cpp
+    src/MultiCam.cpp
+    src/TextManager.cpp
+    src/TextInteractive.cpp
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE
@@ -45,6 +57,8 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     Qt6::Widgets
     Qt6::Multimedia
     Qt6::MultimediaWidgets
+    Qt6::OpenGL
+    Qt6::OpenGLWidgets
     ${AVFORMAT_LIBRARIES}
     ${AVCODEC_LIBRARIES}
     ${AVUTIL_LIBRARIES}

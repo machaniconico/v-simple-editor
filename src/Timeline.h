@@ -10,6 +10,10 @@
 #include <QFileInfo>
 #include <QVector>
 #include <QMenu>
+#include "VideoEffect.h"
+#include "Keyframe.h"
+#include "WaveformGenerator.h"
+#include "TextManager.h"
 
 class UndoManager;
 struct TimelineState;
@@ -22,6 +26,18 @@ struct ClipInfo {
     double outPoint = 0.0;
     double speed = 1.0;   // 0.25x - 4.0x
     double volume = 1.0;  // 0.0 - 2.0 (0=mute, 1=normal, 2=boost)
+
+    // Phase 3: Color correction, effects, keyframes
+    ColorCorrection colorCorrection;
+    QVector<VideoEffect> effects;
+    KeyframeManager keyframes;
+
+    // Phase 5: Waveform
+    WaveformData waveform;
+
+    // Phase 6: Enhanced text overlays
+    TextManager textManager;
+
     double effectiveDuration() const {
         double out = (outPoint > 0.0) ? outPoint : duration;
         return (out - inPoint) / speed;
@@ -151,6 +167,15 @@ public:
     void setClipSpeed(double speed);
     void setClipVolume(double volume);
 
+    // Phase 3: Color correction, effects, keyframes
+    void setClipColorCorrection(const ColorCorrection &cc);
+    void setClipEffects(const QVector<VideoEffect> &effects);
+    void setClipKeyframes(const KeyframeManager &km);
+    ColorCorrection clipColorCorrection() const;
+    QVector<VideoEffect> clipEffects() const;
+    KeyframeManager clipKeyframes() const;
+    double selectedClipDuration() const;
+
     // Audio
     void addAudioFile(const QString &filePath);
     void toggleMuteTrack(int audioTrackIndex);
@@ -162,6 +187,13 @@ public:
     const QVector<ClipInfo> &videoClips() const { return m_videoTracks[0]->clips(); }
 
     UndoManager *undoManager() const { return m_undoManager; }
+
+    // Project save/load support
+    QVector<QVector<ClipInfo>> allVideoTracks() const;
+    QVector<QVector<ClipInfo>> allAudioTracks() const;
+    void restoreFromProject(const QVector<QVector<ClipInfo>> &videoTracks,
+                            const QVector<QVector<ClipInfo>> &audioTracks,
+                            double playhead, double markIn, double markOut, int zoom);
 
 signals:
     void clipSelected(int index);

@@ -1,5 +1,7 @@
 #include "VideoPlayer.h"
+#include "GLPreview.h"
 #include <QTime>
+#include <QStackedWidget>
 
 VideoPlayer::VideoPlayer(QWidget *parent)
     : QWidget(parent)
@@ -19,13 +21,22 @@ void VideoPlayer::setupUI()
 {
     auto *layout = new QVBoxLayout(this);
 
+    auto *displayStack = new QStackedWidget(this);
+
     m_videoDisplay = new QLabel(this);
     m_videoDisplay->setAlignment(Qt::AlignCenter);
-    m_videoDisplay->setStyleSheet("background-color: #1a1a1a;");
     m_videoDisplay->setMinimumSize(640, 360);
     m_videoDisplay->setText("Drop a video file or use File > Open");
     m_videoDisplay->setStyleSheet("background-color: #1a1a1a; color: #888; font-size: 16px;");
-    layout->addWidget(m_videoDisplay, 1);
+
+    m_glPreview = new GLPreview(this);
+    m_glPreview->setMinimumSize(640, 360);
+
+    displayStack->addWidget(m_videoDisplay); // index 0: software
+    displayStack->addWidget(m_glPreview);    // index 1: GL
+    displayStack->setCurrentIndex(m_useGL ? 1 : 0);
+
+    layout->addWidget(displayStack, 1);
 
     auto *controls = new QHBoxLayout();
 
@@ -231,6 +242,24 @@ void VideoPlayer::updatePlayButton()
 
 void VideoPlayer::displayFrame(const QImage &image)
 {
-    QPixmap pixmap = QPixmap::fromImage(image);
-    m_videoDisplay->setPixmap(pixmap.scaled(m_videoDisplay->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
+    if (m_useGL && m_glPreview) {
+        m_glPreview->displayFrame(image);
+    } else {
+        QPixmap pixmap = QPixmap::fromImage(image);
+        m_videoDisplay->setPixmap(pixmap.scaled(m_videoDisplay->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
+    }
+}
+
+void VideoPlayer::setColorCorrection(const ColorCorrection &cc)
+{
+    if (m_glPreview)
+        m_glPreview->setColorCorrection(cc);
+}
+
+void VideoPlayer::setGLAcceleration(bool enabled)
+{
+    m_useGL = enabled;
+    auto *stack = qobject_cast<QStackedWidget*>(m_videoDisplay->parentWidget());
+    if (stack)
+        stack->setCurrentIndex(enabled ? 1 : 0);
 }

@@ -174,6 +174,27 @@ void TimelineTrack::paintEvent(QPaintEvent *)
             painter.setPen(QPen(Qt::white, 1));
             painter.drawRect(clipRect);
         }
+        // Draw waveform if available
+        if (!m_clips[i].waveform.isEmpty()) {
+            painter.setPen(QPen(QColor(100, 200, 150, 180), 1));
+            const auto &wf = m_clips[i].waveform;
+            int wfStart = 0;
+            int wfEnd = wf.peaks.size();
+            double clipDurSec = m_clips[i].effectiveDuration();
+            int peaksForClip = static_cast<int>(clipDurSec * wf.peaksPerSecond);
+            if (peaksForClip > 0 && clipWidth > 2) {
+                int midY = CLIP_HEIGHT / 2;
+                int maxAmp = CLIP_HEIGHT / 2 - 4;
+                for (int px = 0; px < clipWidth; ++px) {
+                    int peakIdx = px * peaksForClip / clipWidth;
+                    if (peakIdx >= wf.peaks.size()) break;
+                    float amp = wf.peaks[peakIdx];
+                    int h = static_cast<int>(amp * maxAmp);
+                    painter.drawLine(x + px, midY - h, x + px, midY + h);
+                }
+            }
+        }
+
         // Label with speed indicator
         painter.setPen(Qt::white);
         QRect textRect = clipRect.adjusted(8, 4, -8, -4);
@@ -379,6 +400,23 @@ void Timeline::addClip(const QString &filePath)
     clip.filePath = filePath;
     clip.displayName = QFileInfo(filePath).fileName();
     clip.duration = duration;
+    // Generate waveform async
+    auto *wfGen = new WaveformGenerator(this);
+    connect(wfGen, &WaveformGenerator::waveformReady, this,
+        [this, wfGen](const QString &path, const WaveformData &data) {
+            // Find and update clip with matching path
+            auto vClips = m_videoTrack->clips();
+            for (int i = 0; i < vClips.size(); ++i) {
+                if (vClips[i].filePath == path && vClips[i].waveform.isEmpty()) {
+                    vClips[i].waveform = data;
+                    m_videoTrack->setClips(vClips);
+                    break;
+                }
+            }
+            wfGen->deleteLater();
+        });
+    wfGen->generateAsync(filePath);
+
     m_videoTrack->addClip(clip);
     m_audioTrack->addClip(clip);
     saveUndoState("Add clip");
@@ -510,6 +548,66 @@ void Timeline::setClipVolume(double volume)
     saveUndoState(QString("Set volume %1%").arg(static_cast<int>(volume * 100)));
 }
 
+// --- Phase 3: Color correction, effects, keyframes ---
+
+void Timeline::setClipColorCorrection(const ColorCorrection &cc)
+{
+    int sel = m_videoTrack->selectedClip();
+    if (sel < 0) return;
+    auto clips = m_videoTrack->clips();
+    clips[sel].colorCorrection = cc;
+    m_videoTrack->setClips(clips);
+    saveUndoState("Color correction");
+}
+
+void Timeline::setClipEffects(const QVector<VideoEffect> &effects)
+{
+    int sel = m_videoTrack->selectedClip();
+    if (sel < 0) return;
+    auto clips = m_videoTrack->clips();
+    clips[sel].effects = effects;
+    m_videoTrack->setClips(clips);
+    saveUndoState("Video effects");
+}
+
+void Timeline::setClipKeyframes(const KeyframeManager &km)
+{
+    int sel = m_videoTrack->selectedClip();
+    if (sel < 0) return;
+    auto clips = m_videoTrack->clips();
+    clips[sel].keyframes = km;
+    m_videoTrack->setClips(clips);
+    saveUndoState("Keyframes");
+}
+
+ColorCorrection Timeline::clipColorCorrection() const
+{
+    int sel = m_videoTrack->selectedClip();
+    if (sel < 0 || sel >= m_videoTrack->clips().size()) return {};
+    return m_videoTrack->clips()[sel].colorCorrection;
+}
+
+QVector<VideoEffect> Timeline::clipEffects() const
+{
+    int sel = m_videoTrack->selectedClip();
+    if (sel < 0 || sel >= m_videoTrack->clips().size()) return {};
+    return m_videoTrack->clips()[sel].effects;
+}
+
+KeyframeManager Timeline::clipKeyframes() const
+{
+    int sel = m_videoTrack->selectedClip();
+    if (sel < 0 || sel >= m_videoTrack->clips().size()) return {};
+    return m_videoTrack->clips()[sel].keyframes;
+}
+
+double Timeline::selectedClipDuration() const
+{
+    int sel = m_videoTrack->selectedClip();
+    if (sel < 0 || sel >= m_videoTrack->clips().size()) return 0.0;
+    return m_videoTrack->clips()[sel].effectiveDuration();
+}
+
 void Timeline::addAudioFile(const QString &filePath)
 {
     AVFormatContext *fmt = nullptr;
@@ -589,6 +687,54 @@ void Timeline::restoreState(const TimelineState &state)
     m_audioTrack->setSelectedClip(state.selectedClip);
     m_playheadPos = state.playheadPos;
     emit clipSelected(state.selectedClip);
+}
+
+// --- Project save/load ---
+
+QVector<QVector<ClipInfo>> Timeline::allVideoTracks() const
+{
+    QVector<QVector<ClipInfo>> result;
+    for (const auto *t : m_videoTracks)
+        result.append(t->clips());
+    return result;
+}
+
+QVector<QVector<ClipInfo>> Timeline::allAudioTracks() const
+{
+    QVector<QVector<ClipInfo>> result;
+    for (const auto *t : m_audioTracks)
+        result.append(t->clips());
+    return result;
+}
+
+void Timeline::restoreFromProject(const QVector<QVector<ClipInfo>> &videoTracks,
+                                   const QVector<QVector<ClipInfo>> &audioTracks,
+                                   double playhead, double markInVal, double markOutVal, int zoom)
+{
+    // Set first video/audio track clips
+    if (!videoTracks.isEmpty())
+        m_videoTrack->setClips(videoTracks[0]);
+    if (!audioTracks.isEmpty())
+        m_audioTrack->setClips(audioTracks[0]);
+
+    // Add extra video tracks
+    for (int i = 1; i < videoTracks.size(); ++i) {
+        if (i >= m_videoTracks.size()) addVideoTrack();
+        m_videoTracks[i]->setClips(videoTracks[i]);
+    }
+
+    // Add extra audio tracks
+    for (int i = 1; i < audioTracks.size(); ++i) {
+        if (i >= m_audioTracks.size()) addAudioTrack();
+        m_audioTracks[i]->setClips(audioTracks[i]);
+    }
+
+    m_playheadPos = playhead;
+    m_markIn = markInVal;
+    m_markOut = markOutVal;
+    setZoomLevel(zoom);
+    saveUndoState("Load project");
+    updateInfoLabel();
 }
 
 void Timeline::updateInfoLabel()
