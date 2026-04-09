@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#1a1a2e"/>
+      <stop offset="100%" style="stop-color:#16213e"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#e94560"/>
+      <stop offset="100%" style="stop-color:#ff6b6b"/>
+    </linearGradient>
+    <linearGradient id="play" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#0f3460"/>
+      <stop offset="100%" style="stop-color:#533483"/>
+    </linearGradient>
+  </defs>
+  <!-- Background rounded square -->
+  <rect x="16" y="16" width="480" height="480" rx="80" ry="80" fill="url(#bg)"/>
+  <!-- Film strip left -->
+  <rect x="60" y="100" width="40" height="312" rx="4" fill="#0f3460" opacity="0.6"/>
+  <rect x="68" y="112" width="24" height="20" rx="2" fill="#1a1a2e"/>
+  <rect x="68" y="144" width="24" height="20" rx="2" fill="#1a1a2e"/>
+  <rect x="68" y="176" width="24" height="20" rx="2" fill="#1a1a2e"/>
+  <rect x="68" y="208" width="24" height="20" rx="2" fill="#1a1a2e"/>
+  <rect x="68" y="240" width="24" height="20" rx="2" fill="#1a1a2e"/>
+  <rect x="68" y="272" width="24" height="20" rx="2" fill="#1a1a2e"/>
+  <rect x="68" y="304" width="24" height="20" rx="2" fill="#1a1a2e"/>
+  <rect x="68" y="336" width="24" height="20" rx="2" fill="#1a1a2e"/>
+  <rect x="68" y="368" width="24" height="20" rx="2" fill="#1a1a2e"/>
+  <!-- Film strip right -->
+  <rect x="412" y="100" width="40" height="312" rx="4" fill="#0f3460" opacity="0.6"/>
+  <rect x="420" y="112" width="24" height="20" rx="2" fill="#1a1a2e"/>
+  <rect x="420" y="144" width="24" height="20" rx="2" fill="#1a1a2e"/>
+  <rect x="420" y="176" width="24" height="20" rx="2" fill="#1a1a2e"/>
+  <rect x="420" y="208" width="24" height="20" rx="2" fill="#1a1a2e"/>
+  <rect x="420" y="240" width="24" height="20" rx="2" fill="#1a1a2e"/>
+  <rect x="420" y="272" width="24" height="20" rx="2" fill="#1a1a2e"/>
+  <rect x="420" y="304" width="24" height="20" rx="2" fill="#1a1a2e"/>
+  <rect x="420" y="336" width="24" height="20" rx="2" fill="#1a1a2e"/>
+  <rect x="420" y="368" width="24" height="20" rx="2" fill="#1a1a2e"/>
+  <!-- V letter / play button combined -->
+  <path d="M200 140 L320 256 L200 372 Z" fill="url(#accent)" opacity="0.9"/>
+  <!-- Timeline bars at bottom -->
+  <rect x="120" y="410" width="272" height="8" rx="4" fill="#0f3460" opacity="0.5"/>
+  <rect x="120" y="410" width="160" height="8" rx="4" fill="url(#accent)" opacity="0.7"/>
+  <rect x="120" y="426" width="272" height="6" rx="3" fill="#0f3460" opacity="0.3"/>
+  <rect x="120" y="426" width="200" height="6" rx="3" fill="#533483" opacity="0.5"/>
+  <!-- Playhead indicator -->
+  <rect x="276" y="404" width="4" height="34" rx="2" fill="#ffffff" opacity="0.8"/>
+  <polygon points="272,402 284,402 278,396" fill="#ffffff" opacity="0.8"/>
+</svg>

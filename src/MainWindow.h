@@ -39,6 +39,13 @@
 #include "Precompose.h"
 #include "Rotoscope.h"
 #include "WarpDistortion.h"
+#include "ShortcutEditor.h"
+#include "RecentFiles.h"
+#include "ShaderEffect.h"
+#include "VSTHost.h"
+#include "PythonScript.h"
+#include "NetworkRender.h"
+#include "RemotionExport.h"
 
 class VideoPlayer;
 class Timeline;
@@ -127,10 +134,21 @@ private slots:
     void analyzeHighlights();
     void about();
 
+    // Phase 14 slots
+    void editShortcuts();
+    void openRecentFile(const QString &filePath);
+    void applyShaderEffect();
+    void manageShaderEffects();
+    void openVSTPlugins();
+    void openScriptConsole();
+    void openNetworkRender();
+    void exportToRemotion();
+
 private:
     void setupMenuBar();
     void setupToolBar();
     void setupUI();
+    void setupRecentFiles();
     void updateEditActions();
     void applyProjectConfig(const ProjectConfig &config);
     void updateTitle();
@@ -164,4 +182,10 @@ private:
     AIHighlight *m_aiHighlight = nullptr;
     LayerCompositor m_layerCompositor;
     PrecomposeManager m_precomposeManager;
+
+    // Phase 14
+    ShortcutManager m_shortcutManager;
+    RecentFilesManager *m_recentFilesManager = nullptr;
+    RecentFilesMenu *m_recentFilesMenu = nullptr;
+    ScriptEngine *m_scriptEngine = nullptr;
 };

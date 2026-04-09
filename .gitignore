@@ -2,6 +2,10 @@
 build/
 cmake-build-*/
 out/
+Release/
+Debug/
+x64/
+*.dir/
 
 # IDE
 .vs/
@@ -12,6 +16,7 @@ out/
 *.sln.docstates
 CMakeSettings.json
 CMakeUserPresets.json
+compile_commands.json
 
 # Compiled
 *.o
@@ -23,11 +28,14 @@ CMakeUserPresets.json
 *.a
 *.lib
 *.pdb
+*.ilk
+*.exp
 
 # OS
 .DS_Store
 Thumbs.db
 Desktop.ini
+._*
 
 # Qt
 *.pro.user
@@ -37,3 +45,42 @@ qrc_*.cpp
 
 # Package managers
 vcpkg_installed/
+
+# Project files (auto-generated)
+*.veditor.autosave
+*.veditor.recovery
+autosave/
+crash_recovery/
+
+# Proxy files
+proxy_cache/
+*.proxy.mp4
+*.proxy.mkv
+
+# Render output
+render_output/
+render_queue_temp/
+
+# Plugin cache
+plugin_cache/
+vst_scan_cache.json
+
+# Python scripting
+__pycache__/
+*.pyc
+*.pyo
+scripts/*.log
+
+# Network render temp
+network_render_temp/
+*.render_chunk
+
+# Logs
+*.log
+logs/
+
+# Remotion export output
+remotion_export/
+
+# User settings (optional - uncomment to ignore)
+# settings.ini

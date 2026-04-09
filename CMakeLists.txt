@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(v-editor-simple VERSION 0.1.0 LANGUAGES CXX)
+project(v-editor-simple VERSION 0.14.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -8,7 +8,7 @@ set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
 # Qt6
-find_package(Qt6 REQUIRED COMPONENTS Widgets Gui Multimedia MultimediaWidgets OpenGL OpenGLWidgets)
+find_package(Qt6 REQUIRED COMPONENTS Widgets Gui Multimedia MultimediaWidgets OpenGL OpenGLWidgets Network)
 
 # FFmpeg via pkg-config
 find_package(PkgConfig REQUIRED)
@@ -37,6 +37,7 @@ add_executable(${PROJECT_NAME}
     src/EffectPlugin.cpp
     src/ProjectFile.cpp
     src/GLPreview.cpp
+    src/ShaderEffect.cpp
     src/WaveformGenerator.cpp
     src/AutoEdit.cpp
     src/ThemeManager.cpp
@@ -70,6 +71,13 @@ add_executable(${PROJECT_NAME}
     src/Precompose.cpp
     src/Rotoscope.cpp
     src/WarpDistortion.cpp
+    src/RecentFiles.cpp
+    src/ShortcutEditor.cpp
+    src/VSTHost.cpp
+    src/NetworkRender.cpp
+    src/RemotionExport.cpp
+    src/PythonScript.cpp
+    resources/resources.qrc
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE
@@ -89,6 +97,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     Qt6::MultimediaWidgets
     Qt6::OpenGL
     Qt6::OpenGLWidgets
+    Qt6::Network
     ${AVFORMAT_LIBRARIES}
     ${AVCODEC_LIBRARIES}
     ${AVUTIL_LIBRARIES}
