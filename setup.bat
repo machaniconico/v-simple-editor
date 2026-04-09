@@ -120,6 +120,12 @@ echo.
 echo [Step 3/5] Configuring with CMake...
 cd /d "%PROJECT_DIR%"
 
+:: Clean old CMake cache if generator changed
+if exist build\CMakeCache.txt (
+    echo   Cleaning old CMake cache...
+    del /q build\CMakeCache.txt >nul 2>&1
+    rmdir /s /q build\CMakeFiles >nul 2>&1
+)
 if not exist build mkdir build
 
 :: Detect Visual Studio generator
