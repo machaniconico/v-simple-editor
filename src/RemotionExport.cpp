@@ -349,7 +349,7 @@ QString RemotionExporter::generateVideoCompositionBody(const RemotionExportConfi
                 const int ovDur   = ovEnd - ovStart;
                 s << "          <Sequence from={" << ovStart << "} durationInFrames={" << ovDur << "}>\n";
                 s << "            <TextOverlay\n";
-                s << "              text={" << "\"" << ov.text.replace("\"", "\\\"") << "\"}\n";
+                s << "              text={" << "\"" << QString(ov.text).replace("\"", "\\\"") << "\"}\n";
                 s << "              x={" << ov.x << "}\n";
                 s << "              y={" << ov.y << "}\n";
                 s << "              opacity={" << ov.opacity << "}\n";
@@ -648,7 +648,7 @@ QString RemotionExporter::generateTimelineData(const RemotionExportConfig &confi
                                       ? static_cast<int>(std::round(ov.endTime * fps))
                                       : durFrames;
                     s << "          {\n";
-                    s << "            text: \"" << ov.text.replace("\"", "\\\"") << "\",\n";
+                    s << "            text: \"" << QString(ov.text).replace("\"", "\\\"") << "\",\n";
                     s << "            startFrame: " << ovStart << ",\n";
                     s << "            durationInFrames: " << (ovEnd - ovStart) << ",\n";
                     s << "            x: " << ov.x << ",\n";

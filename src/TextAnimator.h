@@ -14,7 +14,7 @@
 
 // --- Per-character animation type ---
 
-enum class TextAnimationType {
+enum class CharAnimationType {
     Typewriter,
     FadeInLetters,
     FadeOutLetters,
@@ -44,7 +44,7 @@ enum class TextAnimEasing {
 // --- Animation configuration ---
 
 struct TextAnimConfig {
-    TextAnimationType animation = TextAnimationType::FadeInLetters;
+    CharAnimationType animation = CharAnimationType::FadeInLetters;
     double duration = 0.5;       // per-character animation duration (seconds)
     double delay = 0.05;         // stagger delay between characters (seconds)
 
@@ -54,8 +54,8 @@ struct TextAnimConfig {
     double amplitude = 10.0;     // for WaveMotion (pixels)
     bool reverse = false;        // play animation in reverse
 
-    static QString animationName(TextAnimationType type);
-    static TextAnimationType animationFromName(const QString &name);
+    static QString animationName(CharAnimationType type);
+    static CharAnimationType animationFromName(const QString &name);
     static QString easingName(TextAnimEasing easing);
     static TextAnimEasing easingFromName(const QString &name);
 };

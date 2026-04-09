@@ -7,46 +7,46 @@
 
 // --- TextAnimConfig helpers ---
 
-QString TextAnimConfig::animationName(TextAnimationType type)
+QString TextAnimConfig::animationName(CharAnimationType type)
 {
     switch (type) {
-    case TextAnimationType::Typewriter:        return QStringLiteral("Typewriter");
-    case TextAnimationType::FadeInLetters:     return QStringLiteral("FadeInLetters");
-    case TextAnimationType::FadeOutLetters:    return QStringLiteral("FadeOutLetters");
-    case TextAnimationType::BounceIn:          return QStringLiteral("BounceIn");
-    case TextAnimationType::SlideInLeft:       return QStringLiteral("SlideInLeft");
-    case TextAnimationType::SlideInRight:      return QStringLiteral("SlideInRight");
-    case TextAnimationType::SlideInUp:         return QStringLiteral("SlideInUp");
-    case TextAnimationType::SlideInDown:       return QStringLiteral("SlideInDown");
-    case TextAnimationType::ScaleUp:           return QStringLiteral("ScaleUp");
-    case TextAnimationType::ScaleDown:         return QStringLiteral("ScaleDown");
-    case TextAnimationType::SpinIn:            return QStringLiteral("SpinIn");
-    case TextAnimationType::WaveMotion:        return QStringLiteral("WaveMotion");
-    case TextAnimationType::RandomAppear:      return QStringLiteral("RandomAppear");
-    case TextAnimationType::GlitchText:        return QStringLiteral("GlitchText");
-    case TextAnimationType::KaraokeHighlight:  return QStringLiteral("KaraokeHighlight");
+    case CharAnimationType::Typewriter:        return QStringLiteral("Typewriter");
+    case CharAnimationType::FadeInLetters:     return QStringLiteral("FadeInLetters");
+    case CharAnimationType::FadeOutLetters:    return QStringLiteral("FadeOutLetters");
+    case CharAnimationType::BounceIn:          return QStringLiteral("BounceIn");
+    case CharAnimationType::SlideInLeft:       return QStringLiteral("SlideInLeft");
+    case CharAnimationType::SlideInRight:      return QStringLiteral("SlideInRight");
+    case CharAnimationType::SlideInUp:         return QStringLiteral("SlideInUp");
+    case CharAnimationType::SlideInDown:       return QStringLiteral("SlideInDown");
+    case CharAnimationType::ScaleUp:           return QStringLiteral("ScaleUp");
+    case CharAnimationType::ScaleDown:         return QStringLiteral("ScaleDown");
+    case CharAnimationType::SpinIn:            return QStringLiteral("SpinIn");
+    case CharAnimationType::WaveMotion:        return QStringLiteral("WaveMotion");
+    case CharAnimationType::RandomAppear:      return QStringLiteral("RandomAppear");
+    case CharAnimationType::GlitchText:        return QStringLiteral("GlitchText");
+    case CharAnimationType::KaraokeHighlight:  return QStringLiteral("KaraokeHighlight");
     }
     return QStringLiteral("FadeInLetters");
 }
 
-TextAnimationType TextAnimConfig::animationFromName(const QString &name)
+CharAnimationType TextAnimConfig::animationFromName(const QString &name)
 {
-    if (name == QLatin1String("Typewriter"))        return TextAnimationType::Typewriter;
-    if (name == QLatin1String("FadeInLetters"))     return TextAnimationType::FadeInLetters;
-    if (name == QLatin1String("FadeOutLetters"))    return TextAnimationType::FadeOutLetters;
-    if (name == QLatin1String("BounceIn"))          return TextAnimationType::BounceIn;
-    if (name == QLatin1String("SlideInLeft"))       return TextAnimationType::SlideInLeft;
-    if (name == QLatin1String("SlideInRight"))      return TextAnimationType::SlideInRight;
-    if (name == QLatin1String("SlideInUp"))         return TextAnimationType::SlideInUp;
-    if (name == QLatin1String("SlideInDown"))       return TextAnimationType::SlideInDown;
-    if (name == QLatin1String("ScaleUp"))           return TextAnimationType::ScaleUp;
-    if (name == QLatin1String("ScaleDown"))         return TextAnimationType::ScaleDown;
-    if (name == QLatin1String("SpinIn"))            return TextAnimationType::SpinIn;
-    if (name == QLatin1String("WaveMotion"))        return TextAnimationType::WaveMotion;
-    if (name == QLatin1String("RandomAppear"))      return TextAnimationType::RandomAppear;
-    if (name == QLatin1String("GlitchText"))        return TextAnimationType::GlitchText;
-    if (name == QLatin1String("KaraokeHighlight"))  return TextAnimationType::KaraokeHighlight;
-    return TextAnimationType::FadeInLetters; // fallback
+    if (name == QLatin1String("Typewriter"))        return CharAnimationType::Typewriter;
+    if (name == QLatin1String("FadeInLetters"))     return CharAnimationType::FadeInLetters;
+    if (name == QLatin1String("FadeOutLetters"))    return CharAnimationType::FadeOutLetters;
+    if (name == QLatin1String("BounceIn"))          return CharAnimationType::BounceIn;
+    if (name == QLatin1String("SlideInLeft"))       return CharAnimationType::SlideInLeft;
+    if (name == QLatin1String("SlideInRight"))      return CharAnimationType::SlideInRight;
+    if (name == QLatin1String("SlideInUp"))         return CharAnimationType::SlideInUp;
+    if (name == QLatin1String("SlideInDown"))       return CharAnimationType::SlideInDown;
+    if (name == QLatin1String("ScaleUp"))           return CharAnimationType::ScaleUp;
+    if (name == QLatin1String("ScaleDown"))         return CharAnimationType::ScaleDown;
+    if (name == QLatin1String("SpinIn"))            return CharAnimationType::SpinIn;
+    if (name == QLatin1String("WaveMotion"))        return CharAnimationType::WaveMotion;
+    if (name == QLatin1String("RandomAppear"))      return CharAnimationType::RandomAppear;
+    if (name == QLatin1String("GlitchText"))        return CharAnimationType::GlitchText;
+    if (name == QLatin1String("KaraokeHighlight"))  return CharAnimationType::KaraokeHighlight;
+    return CharAnimationType::FadeInLetters; // fallback
 }
 
 QString TextAnimConfig::easingName(TextAnimEasing easing)
@@ -161,7 +161,7 @@ double TextAnimator::bounceEaseOut(double t)
 
 int TextAnimator::characterOrder(int charIndex) const
 {
-    if (m_config.animation == TextAnimationType::RandomAppear
+    if (m_config.animation == CharAnimationType::RandomAppear
         && charIndex < m_shuffleOrder.size()) {
         return m_shuffleOrder[charIndex];
     }
@@ -342,49 +342,49 @@ QVector<CharacterState> TextAnimator::getCharacterStates(double time) const
 
         CharacterState animated;
         switch (m_config.animation) {
-        case TextAnimationType::Typewriter:
+        case CharAnimationType::Typewriter:
             animated = applyTypewriter(base, progress);
             break;
-        case TextAnimationType::FadeInLetters:
+        case CharAnimationType::FadeInLetters:
             animated = applyFadeInLetters(base, progress);
             break;
-        case TextAnimationType::FadeOutLetters:
+        case CharAnimationType::FadeOutLetters:
             animated = applyFadeOutLetters(base, progress);
             break;
-        case TextAnimationType::BounceIn:
+        case CharAnimationType::BounceIn:
             animated = applyBounceIn(base, progress);
             break;
-        case TextAnimationType::SlideInLeft:
+        case CharAnimationType::SlideInLeft:
             animated = applySlideIn(base, progress, -1.0, 0.0);
             break;
-        case TextAnimationType::SlideInRight:
+        case CharAnimationType::SlideInRight:
             animated = applySlideIn(base, progress, 1.0, 0.0);
             break;
-        case TextAnimationType::SlideInUp:
+        case CharAnimationType::SlideInUp:
             animated = applySlideIn(base, progress, 0.0, -1.0);
             break;
-        case TextAnimationType::SlideInDown:
+        case CharAnimationType::SlideInDown:
             animated = applySlideIn(base, progress, 0.0, 1.0);
             break;
-        case TextAnimationType::ScaleUp:
+        case CharAnimationType::ScaleUp:
             animated = applyScaleUp(base, progress);
             break;
-        case TextAnimationType::ScaleDown:
+        case CharAnimationType::ScaleDown:
             animated = applyScaleDown(base, progress);
             break;
-        case TextAnimationType::SpinIn:
+        case CharAnimationType::SpinIn:
             animated = applySpinIn(base, progress);
             break;
-        case TextAnimationType::WaveMotion:
+        case CharAnimationType::WaveMotion:
             animated = applyWaveMotion(base, i, time);
             break;
-        case TextAnimationType::RandomAppear:
+        case CharAnimationType::RandomAppear:
             animated = applyRandomAppear(base, progress);
             break;
-        case TextAnimationType::GlitchText:
+        case CharAnimationType::GlitchText:
             animated = applyGlitchText(base, progress, i);
             break;
-        case TextAnimationType::KaraokeHighlight:
+        case CharAnimationType::KaraokeHighlight:
             animated = applyKaraokeHighlight(base, progress);
             break;
         }
@@ -459,7 +459,7 @@ double TextAnimator::totalDuration() const
         return 0.0;
 
     // WaveMotion is continuous — return a nominal cycle duration
-    if (m_config.animation == TextAnimationType::WaveMotion)
+    if (m_config.animation == CharAnimationType::WaveMotion)
         return m_config.duration + m_config.delay * m_text.size();
 
     // Last character start + its animation duration
@@ -482,7 +482,7 @@ QMap<QString, TextAnimConfig> TextAnimator::presetAnimations()
     // Typewriter
     {
         TextAnimConfig c;
-        c.animation = TextAnimationType::Typewriter;
+        c.animation = CharAnimationType::Typewriter;
         c.duration = 0.01;
         c.delay = 0.06;
         c.easing = TextAnimEasing::Linear;
@@ -492,7 +492,7 @@ QMap<QString, TextAnimConfig> TextAnimator::presetAnimations()
     // Fade In Letters
     {
         TextAnimConfig c;
-        c.animation = TextAnimationType::FadeInLetters;
+        c.animation = CharAnimationType::FadeInLetters;
         c.duration = 0.4;
         c.delay = 0.04;
         c.easing = TextAnimEasing::EaseOut;
@@ -502,7 +502,7 @@ QMap<QString, TextAnimConfig> TextAnimator::presetAnimations()
     // Fade Out Letters
     {
         TextAnimConfig c;
-        c.animation = TextAnimationType::FadeOutLetters;
+        c.animation = CharAnimationType::FadeOutLetters;
         c.duration = 0.4;
         c.delay = 0.04;
         c.easing = TextAnimEasing::EaseIn;
@@ -512,7 +512,7 @@ QMap<QString, TextAnimConfig> TextAnimator::presetAnimations()
     // Bounce In
     {
         TextAnimConfig c;
-        c.animation = TextAnimationType::BounceIn;
+        c.animation = CharAnimationType::BounceIn;
         c.duration = 0.6;
         c.delay = 0.05;
         c.easing = TextAnimEasing::Linear; // bounce uses its own easing
@@ -523,7 +523,7 @@ QMap<QString, TextAnimConfig> TextAnimator::presetAnimations()
     // Slide In Left
     {
         TextAnimConfig c;
-        c.animation = TextAnimationType::SlideInLeft;
+        c.animation = CharAnimationType::SlideInLeft;
         c.duration = 0.4;
         c.delay = 0.03;
         c.easing = TextAnimEasing::EaseOut;
@@ -533,7 +533,7 @@ QMap<QString, TextAnimConfig> TextAnimator::presetAnimations()
     // Slide In Right
     {
         TextAnimConfig c;
-        c.animation = TextAnimationType::SlideInRight;
+        c.animation = CharAnimationType::SlideInRight;
         c.duration = 0.4;
         c.delay = 0.03;
         c.easing = TextAnimEasing::EaseOut;
@@ -543,7 +543,7 @@ QMap<QString, TextAnimConfig> TextAnimator::presetAnimations()
     // Slide In Up
     {
         TextAnimConfig c;
-        c.animation = TextAnimationType::SlideInUp;
+        c.animation = CharAnimationType::SlideInUp;
         c.duration = 0.4;
         c.delay = 0.03;
         c.easing = TextAnimEasing::EaseOut;
@@ -553,7 +553,7 @@ QMap<QString, TextAnimConfig> TextAnimator::presetAnimations()
     // Slide In Down
     {
         TextAnimConfig c;
-        c.animation = TextAnimationType::SlideInDown;
+        c.animation = CharAnimationType::SlideInDown;
         c.duration = 0.4;
         c.delay = 0.03;
         c.easing = TextAnimEasing::EaseOut;
@@ -563,7 +563,7 @@ QMap<QString, TextAnimConfig> TextAnimator::presetAnimations()
     // Scale Up
     {
         TextAnimConfig c;
-        c.animation = TextAnimationType::ScaleUp;
+        c.animation = CharAnimationType::ScaleUp;
         c.duration = 0.5;
         c.delay = 0.04;
         c.easing = TextAnimEasing::EaseOut;
@@ -573,7 +573,7 @@ QMap<QString, TextAnimConfig> TextAnimator::presetAnimations()
     // Scale Down
     {
         TextAnimConfig c;
-        c.animation = TextAnimationType::ScaleDown;
+        c.animation = CharAnimationType::ScaleDown;
         c.duration = 0.5;
         c.delay = 0.04;
         c.easing = TextAnimEasing::EaseOut;
@@ -583,7 +583,7 @@ QMap<QString, TextAnimConfig> TextAnimator::presetAnimations()
     // Spin In
     {
         TextAnimConfig c;
-        c.animation = TextAnimationType::SpinIn;
+        c.animation = CharAnimationType::SpinIn;
         c.duration = 0.6;
         c.delay = 0.06;
         c.easing = TextAnimEasing::EaseOut;
@@ -593,7 +593,7 @@ QMap<QString, TextAnimConfig> TextAnimator::presetAnimations()
     // Wave Motion
     {
         TextAnimConfig c;
-        c.animation = TextAnimationType::WaveMotion;
+        c.animation = CharAnimationType::WaveMotion;
         c.duration = 1.0;
         c.delay = 0.0;
         c.easing = TextAnimEasing::Linear;
@@ -604,7 +604,7 @@ QMap<QString, TextAnimConfig> TextAnimator::presetAnimations()
     // Random Appear
     {
         TextAnimConfig c;
-        c.animation = TextAnimationType::RandomAppear;
+        c.animation = CharAnimationType::RandomAppear;
         c.duration = 0.3;
         c.delay = 0.06;
         c.easing = TextAnimEasing::EaseOut;
@@ -614,7 +614,7 @@ QMap<QString, TextAnimConfig> TextAnimator::presetAnimations()
     // Glitch Text
     {
         TextAnimConfig c;
-        c.animation = TextAnimationType::GlitchText;
+        c.animation = CharAnimationType::GlitchText;
         c.duration = 0.5;
         c.delay = 0.02;
         c.easing = TextAnimEasing::Linear;
@@ -624,7 +624,7 @@ QMap<QString, TextAnimConfig> TextAnimator::presetAnimations()
     // Karaoke Highlight
     {
         TextAnimConfig c;
-        c.animation = TextAnimationType::KaraokeHighlight;
+        c.animation = CharAnimationType::KaraokeHighlight;
         c.duration = 0.2;
         c.delay = 0.08;
         c.easing = TextAnimEasing::Linear;

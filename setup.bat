@@ -20,16 +20,20 @@ for %%p in (
     "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvarsall.bat"
     "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat"
     "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat"
+    "C:\Program Files\Microsoft Visual Studio\18\Insiders\VC\Auxiliary\Build\vcvarsall.bat"
+    "C:\Program Files\Microsoft Visual Studio\2026\Community\VC\Auxiliary\Build\vcvarsall.bat"
+    "C:\Program Files\Microsoft Visual Studio\2026\Professional\VC\Auxiliary\Build\vcvarsall.bat"
+    "C:\Program Files (x86)\Microsoft Visual Studio\2026\BuildTools\VC\Auxiliary\Build\vcvarsall.bat"
 ) do (
     if exist %%p (
         set VCVARSALL=%%~p
         set VS_FOUND=1
-        echo   [OK] Visual Studio 2022 found
+        echo   [OK] Visual Studio found: %%~p
     )
 )
 
 if !VS_FOUND! equ 0 (
-    echo   [MISSING] Visual Studio 2022 not found!
+    echo   [MISSING] Visual Studio 2022/2026 not found!
     echo.
     echo   Please install Visual Studio 2022 first:
     echo     https://visualstudio.microsoft.com/downloads/
@@ -83,12 +87,12 @@ set VCPKG=%VCPKG_ROOT%\vcpkg.exe
 set TRIPLET=x64-windows
 
 :: Check if Qt6 is already installed
-"%VCPKG%" list qt6-base:%TRIPLET% 2>nul | findstr /i "qt6-base" >nul 2>&1
+"%VCPKG%" list qtbase:%TRIPLET% 2>nul | findstr /i "qtbase" >nul 2>&1
 if !errorlevel! equ 0 (
     echo   [OK] Qt6 already installed
 ) else (
     echo   [Installing] Qt6 (this is the big one, grab a coffee)...
-    "%VCPKG%" install qt6-base:%TRIPLET% qt6-multimedia:%TRIPLET% qt6-opengl:%TRIPLET% qt6-networkauth:%TRIPLET%
+    "%VCPKG%" install "qtbase[core,gui,widgets,opengl]:%TRIPLET%" qtmultimedia:%TRIPLET% qtnetworkauth:%TRIPLET%
     if !errorlevel! neq 0 (
         echo   [ERROR] Failed to install Qt6
         pause
@@ -103,7 +107,7 @@ if !errorlevel! equ 0 (
     echo   [OK] FFmpeg already installed
 ) else (
     echo   [Installing] FFmpeg...
-    "%VCPKG%" install "ffmpeg[avformat,avcodec,avutil,swscale,swresample,avfilter]:%TRIPLET%"
+    "%VCPKG%" install ffmpeg:%TRIPLET%
     if !errorlevel! neq 0 (
         echo   [ERROR] Failed to install FFmpeg
         pause
