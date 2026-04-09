@@ -8,7 +8,6 @@
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
 {
-    setWindowTitle("V Editor Simple");
     resize(1280, 720);
 
     m_supportedFormats = {
@@ -23,8 +22,9 @@ MainWindow::MainWindow(QWidget *parent)
     setupMenuBar();
     setupToolBar();
     updateEditActions();
+    updateTitle();
 
-    statusBar()->showMessage("Ready");
+    statusBar()->showMessage("Ready — Use File > New Project to start");
 
     connect(m_timeline, &Timeline::clipSelected, this, [this](int) {
         updateEditActions();
@@ -59,7 +59,11 @@ void MainWindow::setupMenuBar()
     // File menu
     auto *fileMenu = menuBar()->addMenu("&File");
 
-    auto *openAction = fileMenu->addAction("&Open...");
+    auto *newAction = fileMenu->addAction("&New Project...");
+    newAction->setShortcut(QKeySequence::New);
+    connect(newAction, &QAction::triggered, this, &MainWindow::newProject);
+
+    auto *openAction = fileMenu->addAction("&Open File...");
     openAction->setShortcut(QKeySequence::Open);
     connect(openAction, &QAction::triggered, this, &MainWindow::openFile);
 
@@ -95,6 +99,7 @@ void MainWindow::setupToolBar()
     auto *toolbar = addToolBar("Main");
     toolbar->setMovable(false);
 
+    toolbar->addAction("New", this, &MainWindow::newProject);
     toolbar->addAction("Open", this, &MainWindow::openFile);
     toolbar->addSeparator();
     toolbar->addAction("Split", this, &MainWindow::splitClip);
@@ -107,6 +112,33 @@ void MainWindow::updateEditActions()
 {
     bool hasSel = m_timeline->hasSelection();
     m_deleteAction->setEnabled(hasSel);
+}
+
+void MainWindow::updateTitle()
+{
+    setWindowTitle(QString("V Editor Simple - %1 (%2 %3fps)")
+        .arg(m_projectConfig.name)
+        .arg(m_projectConfig.resolutionLabel())
+        .arg(m_projectConfig.fps));
+}
+
+void MainWindow::applyProjectConfig(const ProjectConfig &config)
+{
+    m_projectConfig = config;
+    m_player->setCanvasSize(config.width, config.height);
+    updateTitle();
+    statusBar()->showMessage(QString("Project: %1 — %2 %3fps")
+        .arg(config.name)
+        .arg(config.resolutionLabel())
+        .arg(config.fps));
+}
+
+void MainWindow::newProject()
+{
+    ProjectSettingsDialog dialog(this);
+    if (dialog.exec() == QDialog::Accepted) {
+        applyProjectConfig(dialog.config());
+    }
 }
 
 void MainWindow::openFile()
@@ -131,7 +163,7 @@ void MainWindow::exportVideo()
         "MP4 - AV1 (*.mp4)");
     if (!filePath.isEmpty()) {
         statusBar()->showMessage("Exporting: " + filePath);
-        // TODO: Implement export via FFmpeg
+        // TODO: Implement export via FFmpeg using m_projectConfig
     }
 }
 
@@ -158,7 +190,12 @@ void MainWindow::about()
                 "Built with Qt and FFmpeg.\n\n"
                 "Supported codecs: H.264, H.265, AV1\n"
                 "Containers: MP4, MKV, MOV, WebM, FLV\n\n"
+                "Export presets:\n"
+                "  YouTube, YouTube Shorts, TikTok/Reels,\n"
+                "  X/Twitter, Facebook, Twitch, Discord,\n"
+                "  Niconico, Instagram Square\n\n"
                 "Shortcuts:\n"
+                "  Ctrl+N - New project\n"
                 "  S - Split at playhead\n"
                 "  Delete - Delete selected clip\n"
                 "  Drag clip edges to trim")

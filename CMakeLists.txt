@@ -23,6 +23,7 @@ add_executable(${PROJECT_NAME}
     src/MainWindow.cpp
     src/VideoPlayer.cpp
     src/Timeline.cpp
+    src/ProjectSettings.cpp
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE

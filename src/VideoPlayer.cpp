@@ -141,6 +141,21 @@ void VideoPlayer::loadFile(const QString &filePath)
     m_timeLabel->setText("00:00 / " + total.toString("mm:ss"));
 }
 
+void VideoPlayer::setCanvasSize(int width, int height)
+{
+    m_canvasWidth = width;
+    m_canvasHeight = height;
+    double ar = static_cast<double>(width) / height;
+    // Adjust display aspect ratio
+    int displayH = m_videoDisplay->width() / ar;
+    m_videoDisplay->setMinimumSize(
+        qMin(640, width / 2),
+        qMin(360, height / 2));
+    QString orientation = (ar > 1.0) ? "Landscape" : (ar < 1.0) ? "Portrait" : "Square";
+    m_videoDisplay->setText(QString("%1x%2 %3\nDrop a video file or use File > Open")
+        .arg(width).arg(height).arg(orientation));
+}
+
 void VideoPlayer::play()
 {
     m_playing = true;

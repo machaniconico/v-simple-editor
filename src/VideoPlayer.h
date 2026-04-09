@@ -22,6 +22,7 @@ public:
     ~VideoPlayer();
 
     void loadFile(const QString &filePath);
+    void setCanvasSize(int width, int height);
 
 public slots:
     void play();
@@ -50,4 +51,6 @@ private:
     int m_videoStreamIndex = -1;
     bool m_playing = false;
     int64_t m_duration = 0;
+    int m_canvasWidth = 1920;
+    int m_canvasHeight = 1080;
 };
