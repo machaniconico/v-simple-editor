@@ -17,6 +17,16 @@
 #include "SubtitleGenerator.h"
 #include "EffectPreset.h"
 #include "ResourceGuide.h"
+#include "AutoSave.h"
+#include "LutImporter.h"
+#include "ProxyManager.h"
+#include "VideoStabilizer.h"
+#include "SpeedRamp.h"
+#include "AudioEQ.h"
+#include "TimelineMarker.h"
+#include "RenderQueue.h"
+#include "ScreenRecorder.h"
+#include "AIHighlight.h"
 
 class VideoPlayer;
 class Timeline;
@@ -80,6 +90,21 @@ private slots:
     void saveEffectPreset();
     void manageEffectPresets();
     void showResourceGuide();
+    void stabilizeVideo();
+    void applyLut();
+    void manageLuts();
+    void toggleProxyMode();
+    void generateProxies();
+    void setSpeedRamp();
+    void audioEqualizer();
+    void audioEffects();
+    void addMarker();
+    void showMarkers();
+    void exportChapters();
+    void openRenderQueue();
+    void startScreenRecording();
+    void stopScreenRecording();
+    void analyzeHighlights();
     void about();
 
 private:
@@ -109,4 +134,12 @@ private:
     MotionTracker *m_motionTracker = nullptr;
     NoiseReduction *m_noiseReduction = nullptr;
     SubtitleGenerator *m_subtitleGen = nullptr;
+    AutoSave *m_autoSave = nullptr;
+    VideoStabilizer *m_stabilizer = nullptr;
+    SpeedRamp *m_speedRamp = nullptr;
+    AudioEQProcessor *m_audioEQ = nullptr;
+    MarkerManager m_markerManager;
+    RenderQueue *m_renderQueue = nullptr;
+    ScreenRecorder *m_screenRecorder = nullptr;
+    AIHighlight *m_aiHighlight = nullptr;
 };

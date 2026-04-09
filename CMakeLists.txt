@@ -8,7 +8,7 @@ set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
 # Qt6
-find_package(Qt6 REQUIRED COMPONENTS Widgets Multimedia MultimediaWidgets OpenGL OpenGLWidgets)
+find_package(Qt6 REQUIRED COMPONENTS Widgets Gui Multimedia MultimediaWidgets OpenGL OpenGLWidgets)
 
 # FFmpeg via pkg-config
 find_package(PkgConfig REQUIRED)
@@ -48,6 +48,16 @@ add_executable(${PROJECT_NAME}
     src/MotionTracker.cpp
     src/NoiseReduction.cpp
     src/ResourceGuide.cpp
+    src/AutoSave.cpp
+    src/ProxyManager.cpp
+    src/LutImporter.cpp
+    src/TimelineMarker.cpp
+    src/VideoStabilizer.cpp
+    src/SpeedRamp.cpp
+    src/RenderQueue.cpp
+    src/AudioEQ.cpp
+    src/ScreenRecorder.cpp
+    src/AIHighlight.cpp
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE
@@ -62,6 +72,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
     Qt6::Widgets
+    Qt6::Gui
     Qt6::Multimedia
     Qt6::MultimediaWidgets
     Qt6::OpenGL

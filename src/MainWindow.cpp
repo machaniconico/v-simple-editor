@@ -31,6 +31,42 @@ MainWindow::MainWindow(QWidget *parent)
     updateEditActions();
     updateTitle();
 
+    // Auto-save setup
+    m_autoSave = new AutoSave(this);
+    m_autoSave->setProjectDataCallback([this]() -> QString {
+        ProjectData data;
+        data.config = m_projectConfig;
+        data.videoTracks = m_timeline->allVideoTracks();
+        data.audioTracks = m_timeline->allAudioTracks();
+        data.playheadPos = m_timeline->playheadPosition();
+        data.markIn = m_timeline->markedIn();
+        data.markOut = m_timeline->markedOut();
+        return ProjectFile::toJsonString(data);
+    });
+    connect(m_autoSave, &AutoSave::autoSaved, this, [this](const QString &path) {
+        statusBar()->showMessage("Auto-saved: " + QFileInfo(path).fileName(), 3000);
+    });
+    connect(m_autoSave, &AutoSave::recoveryAvailable, this, [this](const QStringList &files) {
+        auto reply = QMessageBox::question(this, "Crash Recovery",
+            QString("Found %1 recovery file(s) from a previous session.\n\nRecover the most recent?")
+                .arg(files.size()));
+        if (reply == QMessageBox::Yes && !files.isEmpty()) {
+            QString json = AutoSave::recoverFromFile(files.first());
+            if (!json.isEmpty()) {
+                ProjectData data;
+                if (ProjectFile::fromJsonString(json, data)) {
+                    m_projectConfig = data.config;
+                    m_player->setCanvasSize(data.config.width, data.config.height);
+                    m_timeline->restoreFromProject(data.videoTracks, data.audioTracks,
+                        data.playheadPos, data.markIn, data.markOut, 10);
+                    updateTitle();
+                    statusBar()->showMessage("Recovered from auto-save");
+                }
+            }
+        }
+    });
+    m_autoSave->start();
+
     statusBar()->showMessage("Ready — Use File > New Project to start");
 
     connect(m_timeline, &Timeline::clipSelected, this, [this](int) {
@@ -230,6 +266,27 @@ void MainWindow::setupMenuBar()
     auto *soloAction = audioMenu->addAction("Toggle &Solo (A1)");
     connect(soloAction, &QAction::triggered, this, &MainWindow::toggleSolo);
 
+    audioMenu->addSeparator();
+
+    auto *eqAction = audioMenu->addAction("&Equalizer...");
+    connect(eqAction, &QAction::triggered, this, &MainWindow::audioEqualizer);
+
+    auto *audioFxAction = audioMenu->addAction("Audio E&ffects...");
+    connect(audioFxAction, &QAction::triggered, this, &MainWindow::audioEffects);
+
+    // Markers menu
+    auto *markersMenu = menuBar()->addMenu("Mar&kers");
+
+    auto *addMarkerAction = markersMenu->addAction("&Add Marker at Playhead");
+    addMarkerAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_M));
+    connect(addMarkerAction, &QAction::triggered, this, &MainWindow::addMarker);
+
+    auto *showMarkersAction = markersMenu->addAction("&Show All Markers...");
+    connect(showMarkersAction, &QAction::triggered, this, &MainWindow::showMarkers);
+
+    auto *exportChapAction = markersMenu->addAction("Export &YouTube Chapters...");
+    connect(exportChapAction, &QAction::triggered, this, &MainWindow::exportChapters);
+
     // Effects menu
     auto *effectsMenu = menuBar()->addMenu("E&ffects");
 
@@ -243,6 +300,14 @@ void MainWindow::setupMenuBar()
 
     auto *pluginAction = effectsMenu->addAction("&Plugin Effects...");
     connect(pluginAction, &QAction::triggered, this, &MainWindow::pluginEffects);
+
+    effectsMenu->addSeparator();
+
+    auto *lutAction = effectsMenu->addAction("Apply &LUT (.cube)...");
+    connect(lutAction, &QAction::triggered, this, &MainWindow::applyLut);
+
+    auto *manageLutAction = effectsMenu->addAction("Manage L&UTs...");
+    connect(manageLutAction, &QAction::triggered, this, &MainWindow::manageLuts);
 
     effectsMenu->addSeparator();
 
@@ -292,6 +357,14 @@ void MainWindow::setupMenuBar()
 
     toolsMenu->addSeparator();
 
+    auto *stabilizeAction = toolsMenu->addAction("Video Stabi&lize...");
+    connect(stabilizeAction, &QAction::triggered, this, &MainWindow::stabilizeVideo);
+
+    auto *speedRampAction = toolsMenu->addAction("S&peed Ramp (Variable Speed)...");
+    connect(speedRampAction, &QAction::triggered, this, &MainWindow::setSpeedRamp);
+
+    toolsMenu->addSeparator();
+
     auto *motionTrackAction = toolsMenu->addAction("&Motion Tracking...");
     connect(motionTrackAction, &QAction::triggered, this, &MainWindow::motionTrackSetup);
 
@@ -307,6 +380,30 @@ void MainWindow::setupMenuBar()
 
     auto *subtitleGenAction = toolsMenu->addAction("Auto-Generate &Subtitles (Whisper)...");
     connect(subtitleGenAction, &QAction::triggered, this, &MainWindow::generateSubtitles);
+
+    auto *highlightAction = toolsMenu->addAction("AI Auto-&Highlight...");
+    connect(highlightAction, &QAction::triggered, this, &MainWindow::analyzeHighlights);
+
+    toolsMenu->addSeparator();
+
+    auto *screenRecAction = toolsMenu->addAction("Start Screen &Recording...");
+    connect(screenRecAction, &QAction::triggered, this, &MainWindow::startScreenRecording);
+
+    auto *stopRecAction = toolsMenu->addAction("S&top Screen Recording");
+    connect(stopRecAction, &QAction::triggered, this, &MainWindow::stopScreenRecording);
+
+    toolsMenu->addSeparator();
+
+    auto *proxyToggle = toolsMenu->addAction("Toggle &Proxy Mode");
+    proxyToggle->setCheckable(true);
+    connect(proxyToggle, &QAction::triggered, this, &MainWindow::toggleProxyMode);
+
+    auto *genProxiesAction = toolsMenu->addAction("Generate Pro&xies...");
+    connect(genProxiesAction, &QAction::triggered, this, &MainWindow::generateProxies);
+
+    auto *renderQueueAction = toolsMenu->addAction("&Render Queue...");
+    renderQueueAction->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_R));
+    connect(renderQueueAction, &QAction::triggered, this, &MainWindow::openRenderQueue);
 
     toolsMenu->addSeparator();
 
@@ -1320,6 +1417,436 @@ void MainWindow::manageEffectPresets()
     info += "\nUse Effects > Apply Preset to use, or Save Current as Preset to create new ones.";
 
     QMessageBox::information(this, "Manage Presets", info);
+}
+
+void MainWindow::stabilizeVideo()
+{
+    if (m_timeline->videoClips().isEmpty()) {
+        QMessageBox::information(this, "Stabilize", "Add clips first.");
+        return;
+    }
+
+    const auto &clip = m_timeline->videoClips().first();
+    bool ok;
+    int smoothing = QInputDialog::getInt(this, "Video Stabilization",
+        "Smoothing (1-100, higher=smoother):", 10, 1, 100, 1, &ok);
+    if (!ok) return;
+
+    QString outputPath = QFileDialog::getSaveFileName(this, "Save Stabilized Video",
+        QFileInfo(clip.filePath).baseName() + "_stabilized.mp4",
+        "Video Files (*.mp4 *.mkv *.mov);;All Files (*)");
+    if (outputPath.isEmpty()) return;
+
+    if (!m_stabilizer)
+        m_stabilizer = new VideoStabilizer(this);
+
+    StabilizerConfig config;
+    config.smoothing = smoothing;
+
+    connect(m_stabilizer, &VideoStabilizer::progressChanged, this, [this](int pct) {
+        statusBar()->showMessage(QString("Stabilizing... %1%").arg(pct));
+    }, Qt::UniqueConnection);
+    connect(m_stabilizer, &VideoStabilizer::stabilizeComplete, this, [this](bool ok2, const QString &msg) {
+        statusBar()->showMessage(ok2 ? "Stabilization complete" : "Stabilization failed: " + msg);
+    }, Qt::UniqueConnection);
+
+    m_stabilizer->stabilize(clip.filePath, outputPath, config);
+    statusBar()->showMessage("Stabilizing video (2-pass)...");
+}
+
+void MainWindow::applyLut()
+{
+    if (!m_timeline->hasSelection()) {
+        QMessageBox::information(this, "LUT", "Select a clip first.");
+        return;
+    }
+
+    // Offer built-in or custom LUT
+    QStringList options;
+    for (const auto &lut : LutLibrary::instance().allLuts())
+        options << lut.name;
+    options << "Load .cube file...";
+
+    bool ok;
+    QString selected = QInputDialog::getItem(this, "Apply LUT",
+        "Select LUT:", options, 0, false, &ok);
+    if (!ok) return;
+
+    LutData lut;
+    if (selected == "Load .cube file...") {
+        QString path = QFileDialog::getOpenFileName(this, "Load LUT",
+            QString(), "Cube LUT (*.cube);;All Files (*)");
+        if (path.isEmpty()) return;
+        lut = LutImporter::loadCubeFile(path);
+        if (!lut.isValid()) {
+            QMessageBox::warning(this, "LUT Error", "Could not parse LUT file.");
+            return;
+        }
+        LutLibrary::instance().addLut(path);
+    } else {
+        auto found = LutLibrary::instance().findByName(selected);
+        if (!found.isValid()) return;
+        lut = found;
+    }
+
+    double intensity = QInputDialog::getDouble(this, "LUT Intensity",
+        "Intensity (0.0-1.0):", 1.0, 0.0, 1.0, 2, &ok);
+    if (!ok) return;
+    lut.intensity = intensity;
+
+    statusBar()->showMessage(QString("Applied LUT: %1 (intensity %2)")
+        .arg(lut.name).arg(intensity, 0, 'f', 1));
+}
+
+void MainWindow::manageLuts()
+{
+    auto &library = LutLibrary::instance();
+    auto luts = library.allLuts();
+
+    QString info = QString("LUT Library (%1 total):\n\n").arg(luts.size());
+    for (const auto &l : luts) {
+        info += QString("• %1 [%2x%2x%2]%3\n")
+            .arg(l.name).arg(l.size)
+            .arg(l.isBuiltIn() ? " (built-in)" : "");
+    }
+    QMessageBox::information(this, "Manage LUTs", info);
+}
+
+void MainWindow::toggleProxyMode()
+{
+    auto &pm = ProxyManager::instance();
+    pm.setProxyMode(!pm.isProxyMode());
+    statusBar()->showMessage(pm.isProxyMode() ? "Proxy mode ON (low-res playback)" : "Proxy mode OFF (original quality)");
+}
+
+void MainWindow::generateProxies()
+{
+    const auto &clips = m_timeline->videoClips();
+    if (clips.isEmpty()) {
+        QMessageBox::information(this, "Proxies", "Add clips first.");
+        return;
+    }
+
+    QStringList paths;
+    for (const auto &c : clips)
+        paths << c.filePath;
+
+    auto &pm = ProxyManager::instance();
+    connect(&pm, &ProxyManager::allProxiesReady, this, [this]() {
+        statusBar()->showMessage("All proxies generated");
+    }, Qt::UniqueConnection);
+    connect(&pm, &ProxyManager::progressChanged, this, [this](int pct) {
+        statusBar()->showMessage(QString("Generating proxies... %1%").arg(pct));
+    }, Qt::UniqueConnection);
+
+    pm.generateAllProxies(paths);
+    statusBar()->showMessage("Generating proxy files...");
+}
+
+void MainWindow::setSpeedRamp()
+{
+    if (!m_timeline->hasSelection()) {
+        QMessageBox::information(this, "Speed Ramp", "Select a clip first.");
+        return;
+    }
+
+    const auto &clips = m_timeline->videoClips();
+    if (clips.isEmpty()) return;
+
+    bool ok;
+    double startSpeed = QInputDialog::getDouble(this, "Speed Ramp",
+        "Start speed (0.1-10x):", 1.0, 0.1, 10.0, 1, &ok);
+    if (!ok) return;
+    double endSpeed = QInputDialog::getDouble(this, "Speed Ramp",
+        "End speed (0.1-10x):", 2.0, 0.1, 10.0, 1, &ok);
+    if (!ok) return;
+
+    QStringList easings = {"Linear", "Ease In", "Ease Out", "Ease In/Out"};
+    QString easing = QInputDialog::getItem(this, "Speed Ramp",
+        "Easing:", easings, 3, false, &ok);
+    if (!ok) return;
+
+    QString outputPath = QFileDialog::getSaveFileName(this, "Save Speed Ramp Video",
+        QFileInfo(clips.first().filePath).baseName() + "_speedramp.mp4",
+        "Video Files (*.mp4 *.mkv *.mov);;All Files (*)");
+    if (outputPath.isEmpty()) return;
+
+    if (!m_speedRamp)
+        m_speedRamp = new SpeedRamp(this);
+
+    SpeedEasing e = SpeedEasing::Linear;
+    if (easing.contains("In/Out")) e = SpeedEasing::EaseInOut;
+    else if (easing.contains("In"))  e = SpeedEasing::EaseIn;
+    else if (easing.contains("Out")) e = SpeedEasing::EaseOut;
+
+    m_speedRamp->clearPoints();
+    m_speedRamp->addPoint(0.0, startSpeed, SpeedEasing::Linear);
+    m_speedRamp->addPoint(clips.first().effectiveDuration(), endSpeed, e);
+
+    SpeedRampConfig config;
+    config.points = {SpeedPoint{0.0, startSpeed, SpeedEasing::Linear},
+                     SpeedPoint{clips.first().effectiveDuration(), endSpeed, e}};
+
+    connect(m_speedRamp, &SpeedRamp::progressChanged, this, [this](int pct) {
+        statusBar()->showMessage(QString("Applying speed ramp... %1%").arg(pct));
+    }, Qt::UniqueConnection);
+    connect(m_speedRamp, &SpeedRamp::rampComplete, this, [this](bool ok2, const QString &msg) {
+        statusBar()->showMessage(ok2 ? "Speed ramp complete" : "Speed ramp failed: " + msg);
+    }, Qt::UniqueConnection);
+
+    m_speedRamp->applySpeedRamp(clips.first().filePath, outputPath, config);
+}
+
+void MainWindow::audioEqualizer()
+{
+    if (m_timeline->videoClips().isEmpty()) {
+        QMessageBox::information(this, "Equalizer", "Add clips first.");
+        return;
+    }
+
+    auto presets = AudioEQProcessor::presets();
+    QStringList presetNames;
+    for (const auto &p : presets)
+        presetNames << p.name;
+
+    bool ok;
+    QString selected = QInputDialog::getItem(this, "Audio Equalizer",
+        "Select EQ preset:", presetNames, 0, false, &ok);
+    if (!ok) return;
+
+    const auto &clip = m_timeline->videoClips().first();
+    QString outputPath = QFileDialog::getSaveFileName(this, "Save EQ Audio",
+        QFileInfo(clip.filePath).baseName() + "_eq.mp4",
+        "Media Files (*.mp4 *.wav *.mp3);;All Files (*)");
+    if (outputPath.isEmpty()) return;
+
+    if (!m_audioEQ)
+        m_audioEQ = new AudioEQProcessor(this);
+
+    AudioEQConfig eqConfig;
+    for (const auto &p : presets) {
+        if (p.name == selected) { eqConfig = p.config; break; }
+    }
+
+    connect(m_audioEQ, &AudioEQProcessor::processComplete, this, [this](bool ok2, const QString &msg) {
+        statusBar()->showMessage(ok2 ? "EQ applied: " + msg : "EQ failed: " + msg);
+    }, Qt::UniqueConnection);
+
+    m_audioEQ->applyEQ(clip.filePath, outputPath, eqConfig);
+    statusBar()->showMessage("Applying EQ: " + selected);
+}
+
+void MainWindow::audioEffects()
+{
+    if (m_timeline->videoClips().isEmpty()) {
+        QMessageBox::information(this, "Audio Effects", "Add clips first.");
+        return;
+    }
+
+    QStringList effects = {"Reverb", "Compressor", "Normalize", "Fade In", "Fade Out", "Bass Boost", "Voice Enhance"};
+    bool ok;
+    QString selected = QInputDialog::getItem(this, "Audio Effects",
+        "Select effect:", effects, 0, false, &ok);
+    if (!ok) return;
+
+    const auto &clip = m_timeline->videoClips().first();
+    QString outputPath = QFileDialog::getSaveFileName(this, "Save Audio Effect",
+        QFileInfo(clip.filePath).baseName() + "_fx.mp4",
+        "Media Files (*.mp4 *.wav *.mp3);;All Files (*)");
+    if (outputPath.isEmpty()) return;
+
+    if (!m_audioEQ)
+        m_audioEQ = new AudioEQProcessor(this);
+
+    AudioEffect effect;
+    if (selected == "Reverb")         effect = AudioEffect::createReverb();
+    else if (selected == "Compressor")effect = AudioEffect::createCompressor();
+    else if (selected == "Normalize") effect = AudioEffect::createNormalize();
+    else if (selected == "Fade In")   effect = AudioEffect::createFadeIn();
+    else if (selected == "Fade Out")  effect = AudioEffect::createFadeOut();
+    else if (selected == "Bass Boost")effect = AudioEffect::createBassBoost();
+    else                              effect = AudioEffect::createVoiceEnhance();
+
+    connect(m_audioEQ, &AudioEQProcessor::processComplete, this, [this](bool ok2, const QString &msg) {
+        statusBar()->showMessage(ok2 ? "Effect applied: " + msg : "Effect failed: " + msg);
+    }, Qt::UniqueConnection);
+
+    m_audioEQ->applyEffect(clip.filePath, outputPath, effect);
+    statusBar()->showMessage("Applying: " + selected);
+}
+
+void MainWindow::addMarker()
+{
+    double time = m_timeline->playheadPosition();
+    bool ok;
+    QString name = QInputDialog::getText(this, "Add Marker",
+        QString("Marker name (at %1s):").arg(time, 0, 'f', 1),
+        QLineEdit::Normal, "", &ok);
+    if (!ok) return;
+
+    QStringList types = {"Standard", "Chapter", "Todo", "Note"};
+    QString typeStr = QInputDialog::getItem(this, "Marker Type",
+        "Type:", types, 0, false, &ok);
+    if (!ok) return;
+
+    MarkerType type = MarkerType::Standard;
+    if (typeStr == "Chapter") type = MarkerType::Chapter;
+    else if (typeStr == "Todo") type = MarkerType::Todo;
+    else if (typeStr == "Note") type = MarkerType::Note;
+
+    m_markerManager.addMarker(time, name, type);
+    statusBar()->showMessage(QString("Marker added: \"%1\" at %2s").arg(name).arg(time, 0, 'f', 1));
+}
+
+void MainWindow::showMarkers()
+{
+    auto markers = m_markerManager.markers();
+    if (markers.isEmpty()) {
+        QMessageBox::information(this, "Markers", "No markers set. Use Ctrl+M to add markers.");
+        return;
+    }
+
+    QString info = QString("Markers (%1 total):\n\n").arg(markers.size());
+    for (const auto &m : markers) {
+        info += QString("• [%1s] %2 (%3)\n")
+            .arg(m.time, 0, 'f', 1).arg(m.name)
+            .arg(m.type == MarkerType::Chapter ? "Chapter" :
+                 m.type == MarkerType::Todo ? "Todo" :
+                 m.type == MarkerType::Note ? "Note" : "Standard");
+    }
+    QMessageBox::information(this, "Timeline Markers", info);
+}
+
+void MainWindow::exportChapters()
+{
+    auto chapters = m_markerManager.exportYouTubeChapters();
+    if (chapters.isEmpty()) {
+        QMessageBox::information(this, "Chapters", "No chapter markers found. Add markers with type 'Chapter' first.");
+        return;
+    }
+
+    QString path = QFileDialog::getSaveFileName(this, "Export Chapters",
+        "chapters.txt", "Text Files (*.txt);;All Files (*)");
+    if (path.isEmpty()) return;
+
+    QFile file(path);
+    if (file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        file.write(chapters.toUtf8());
+        file.close();
+        statusBar()->showMessage("Exported chapters: " + path);
+    }
+}
+
+void MainWindow::openRenderQueue()
+{
+    if (!m_renderQueue)
+        m_renderQueue = new RenderQueue(this);
+
+    auto jobs = m_renderQueue->jobs();
+    QString info = QString("Render Queue (%1 jobs):\n\n").arg(jobs.size());
+    for (const auto &j : jobs) {
+        QString status = j.status == RenderJobStatus::Pending ? "Pending" :
+                         j.status == RenderJobStatus::Rendering ? "Rendering" :
+                         j.status == RenderJobStatus::Completed ? "Done" :
+                         j.status == RenderJobStatus::Failed ? "Failed" : "Cancelled";
+        info += QString("• %1 — %2 (%3%)\n").arg(j.name, status).arg(j.progress);
+    }
+    if (jobs.isEmpty())
+        info += "Queue is empty. Export videos to add them to the queue.";
+
+    QMessageBox::information(this, "Render Queue", info);
+}
+
+void MainWindow::startScreenRecording()
+{
+    if (!m_screenRecorder)
+        m_screenRecorder = new ScreenRecorder(this);
+
+    if (m_screenRecorder->isRecording()) {
+        QMessageBox::information(this, "Recording", "Already recording. Stop first.");
+        return;
+    }
+
+    RecordingConfig config;
+    config.outputPath = QFileDialog::getSaveFileName(this, "Save Recording",
+        "screen_recording.mp4", "Video Files (*.mp4 *.mkv);;All Files (*)");
+    if (config.outputPath.isEmpty()) return;
+
+    connect(m_screenRecorder, &ScreenRecorder::durationChanged, this, [this](double sec) {
+        statusBar()->showMessage(QString("Recording: %1s").arg(sec, 0, 'f', 0));
+    }, Qt::UniqueConnection);
+    connect(m_screenRecorder, &ScreenRecorder::recordingStopped, this, [this](const QString &path) {
+        statusBar()->showMessage("Recording saved: " + path);
+    }, Qt::UniqueConnection);
+    connect(m_screenRecorder, &ScreenRecorder::recordingError, this, [this](const QString &err) {
+        QMessageBox::warning(this, "Recording Error", err);
+    }, Qt::UniqueConnection);
+
+    m_screenRecorder->startRecording(config);
+    statusBar()->showMessage("Screen recording started...");
+}
+
+void MainWindow::stopScreenRecording()
+{
+    if (!m_screenRecorder || !m_screenRecorder->isRecording()) {
+        QMessageBox::information(this, "Recording", "Not currently recording.");
+        return;
+    }
+    m_screenRecorder->stopRecording();
+}
+
+void MainWindow::analyzeHighlights()
+{
+    if (m_timeline->videoClips().isEmpty()) {
+        QMessageBox::information(this, "AI Highlights", "Add clips first.");
+        return;
+    }
+
+    const auto &clip = m_timeline->videoClips().first();
+
+    bool ok;
+    int count = QInputDialog::getInt(this, "AI Auto-Highlight",
+        "Number of highlights to find:", 10, 1, 50, 1, &ok);
+    if (!ok) return;
+
+    if (!m_aiHighlight)
+        m_aiHighlight = new AIHighlight(this);
+
+    HighlightConfig config;
+    config.targetCount = count;
+
+    connect(m_aiHighlight, &AIHighlight::progressChanged, this, [this](int pct) {
+        statusBar()->showMessage(QString("Analyzing highlights... %1%").arg(pct));
+    }, Qt::UniqueConnection);
+
+    connect(m_aiHighlight, &AIHighlight::analysisComplete, this, [this](const QVector<Highlight> &highlights) {
+        if (highlights.isEmpty()) {
+            QMessageBox::information(this, "Highlights", "No highlights found.");
+            return;
+        }
+
+        QString info = QString("Found %1 highlight(s):\n\n").arg(highlights.size());
+        for (int i = 0; i < highlights.size(); ++i) {
+            const auto &h = highlights[i];
+            info += QString("#%1  %2s - %3s  [score: %4]\n")
+                .arg(i + 1).arg(h.startTime, 0, 'f', 1)
+                .arg(h.endTime, 0, 'f', 1).arg(h.score, 0, 'f', 2);
+        }
+
+        auto reply = QMessageBox::question(this, "AI Highlights", info + "\nExport highlight reel?");
+        if (reply == QMessageBox::Yes) {
+            QString outputPath = QFileDialog::getSaveFileName(this, "Save Highlight Reel",
+                "highlights.mp4", "Video Files (*.mp4);;All Files (*)");
+            if (!outputPath.isEmpty()) {
+                const auto &clip2 = m_timeline->videoClips().first();
+                m_aiHighlight->exportHighlightReel(clip2.filePath, outputPath, highlights);
+                statusBar()->showMessage("Exporting highlight reel...");
+            }
+        }
+    }, Qt::UniqueConnection);
+
+    m_aiHighlight->analyze(clip.filePath, config);
+    statusBar()->showMessage("Analyzing video for highlights...");
 }
 
 void MainWindow::showResourceGuide()
