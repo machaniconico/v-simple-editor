@@ -12,6 +12,9 @@
 #include <QProgressDialog>
 #include <QShortcut>
 #include <QInputDialog>
+#include <QCloseEvent>
+#include <QFileInfo>
+#include <QUrl>
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
@@ -77,6 +80,16 @@ MainWindow::MainWindow(QWidget *parent)
     });
     m_autoSave->start();
 
+    // Apply dark theme by default
+    ThemeManager::instance().applyTheme(ThemeType::Dark, this);
+
+    // Enable drag & drop
+    setAcceptDrops(true);
+
+    // Setup permanent status bar widgets
+    setupStatusBarWidgets();
+    updateStatusInfo();
+
     statusBar()->showMessage("Ready — Use File > New Project to start");
 
     connect(m_timeline, &Timeline::clipSelected, this, [this](int) {
@@ -85,6 +98,12 @@ MainWindow::MainWindow(QWidget *parent)
     connect(m_timeline->undoManager(), &UndoManager::stateChanged, this, [this]() {
         updateEditActions();
     });
+
+    // Show welcome screen initially
+    showWelcomeScreen();
+
+    // Restore saved window state
+    restoreWindowState();
 }
 
 void MainWindow::setupUI()
@@ -94,17 +113,24 @@ void MainWindow::setupUI()
     mainLayout->setContentsMargins(0, 0, 0, 0);
     mainLayout->setSpacing(0);
 
-    auto *splitter = new QSplitter(Qt::Vertical, this);
+    m_mainSplitter = new QSplitter(Qt::Vertical, this);
 
     m_player = new VideoPlayer(this);
     m_timeline = new Timeline(this);
 
-    splitter->addWidget(m_player);
-    splitter->addWidget(m_timeline);
-    splitter->setStretchFactor(0, 3);
-    splitter->setStretchFactor(1, 1);
+    // Welcome widget (shown when empty)
+    m_welcomeWidget = new WelcomeWidget(this);
+    connect(m_welcomeWidget, &WelcomeWidget::newProjectClicked, this, &MainWindow::newProject);
+    connect(m_welcomeWidget, &WelcomeWidget::openFileClicked, this, &MainWindow::openFile);
+    connect(m_welcomeWidget, &WelcomeWidget::openProjectClicked, this, &MainWindow::openProject);
 
-    mainLayout->addWidget(splitter);
+    m_mainSplitter->addWidget(m_player);
+    m_mainSplitter->addWidget(m_timeline);
+    m_mainSplitter->setStretchFactor(0, 3);
+    m_mainSplitter->setStretchFactor(1, 1);
+
+    mainLayout->addWidget(m_welcomeWidget);
+    mainLayout->addWidget(m_mainSplitter);
     setCentralWidget(centralWidget);
 
     connect(m_player, &VideoPlayer::positionChanged, m_timeline, &Timeline::setPlayheadPosition);
@@ -490,9 +516,44 @@ void MainWindow::setupMenuBar()
     auto *precompAction = compMenu->addAction("Pre-&Compose Selected...");
     connect(precompAction, &QAction::triggered, this, &MainWindow::precomposeSelected);
 
-    // View menu - add theme submenu
+    // View menu extras
     auto *themeAction = viewMenu->addAction("Change &Theme...");
     connect(themeAction, &QAction::triggered, this, &MainWindow::changeTheme);
+
+    viewMenu->addSeparator();
+
+    auto *tooltipAction = viewMenu->addAction("Show Toolbar &Tooltips");
+    tooltipAction->setCheckable(true);
+    {
+        QSettings prefSettings("VEditorSimple", "Preferences");
+        tooltipAction->setChecked(prefSettings.value("showTooltips", true).toBool());
+    }
+    connect(tooltipAction, &QAction::toggled, this, [this](bool checked) {
+        QSettings prefSettings("VEditorSimple", "Preferences");
+        prefSettings.setValue("showTooltips", checked);
+        // Re-apply tooltips on all toolbar actions
+        auto *toolbar = findChild<QToolBar *>("Main");
+        if (!toolbar) return;
+        if (checked) {
+            // Rebuild toolbar to restore tooltips
+            statusBar()->showMessage("Tooltips enabled — restart to apply");
+        } else {
+            for (auto *action : toolbar->actions())
+                action->setToolTip("");
+            statusBar()->showMessage("Toolbar tooltips disabled");
+        }
+    });
+
+    auto *toolbarStyleAction = viewMenu->addAction("Toolbar &Icons Only");
+    toolbarStyleAction->setCheckable(true);
+    connect(toolbarStyleAction, &QAction::toggled, this, [this](bool iconOnly) {
+        auto *toolbar = findChild<QToolBar *>();
+        if (toolbar) {
+            toolbar->setToolButtonStyle(iconOnly ? Qt::ToolButtonIconOnly : Qt::ToolButtonTextBesideIcon);
+            QSettings prefSettings("VEditorSimple", "Preferences");
+            prefSettings.setValue("toolbarIconOnly", iconOnly);
+        }
+    });
 
     // Help menu
     auto *helpMenu = menuBar()->addMenu("&Help");
@@ -511,19 +572,45 @@ void MainWindow::setupToolBar()
 {
     auto *toolbar = addToolBar("Main");
     toolbar->setMovable(false);
+    toolbar->setIconSize(QSize(20, 20));
+    toolbar->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
 
-    toolbar->addAction("New", this, &MainWindow::newProject);
-    toolbar->addAction("Open", this, &MainWindow::openFile);
+    auto icon = [](const QString &name) { return QIcon(":/icons/" + name + ".svg"); };
+
+    auto addBtn = [&](const QString &iconName, const QString &label,
+                      const QString &tooltip, auto slot) {
+        auto *action = toolbar->addAction(icon(iconName), label, this, slot);
+        action->setToolTip(tooltip);
+        return action;
+    };
+
+    addBtn("new", "New", "New Project (Ctrl+N)", &MainWindow::newProject);
+    addBtn("open", "Open", "Open File (Ctrl+O)", &MainWindow::openFile);
+    addBtn("save", "Save", "Save Project (Ctrl+S)", &MainWindow::saveProject);
     toolbar->addSeparator();
-    toolbar->addAction("Undo", this, &MainWindow::undoAction);
-    toolbar->addAction("Redo", this, &MainWindow::redoAction);
+    addBtn("undo", "Undo", "Undo (Ctrl+Z)", &MainWindow::undoAction);
+    addBtn("redo", "Redo", "Redo (Ctrl+Shift+Z)", &MainWindow::redoAction);
     toolbar->addSeparator();
-    toolbar->addAction("Split", this, &MainWindow::splitClip);
-    toolbar->addAction("Delete", this, &MainWindow::deleteClip);
-    toolbar->addAction("Copy", this, &MainWindow::copyClip);
-    toolbar->addAction("Paste", this, &MainWindow::pasteClip);
+    addBtn("split", "Split", "Split at Playhead (S)", &MainWindow::splitClip);
+    addBtn("delete", "Delete", "Delete Clip (Del)", &MainWindow::deleteClip);
+    addBtn("copy", "Copy", "Copy Clip (Ctrl+C)", &MainWindow::copyClip);
+    addBtn("paste", "Paste", "Paste Clip (Ctrl+V)", &MainWindow::pasteClip);
     toolbar->addSeparator();
-    toolbar->addAction("Export", this, &MainWindow::exportVideo);
+    addBtn("text", "Text", "Add Text Overlay (T)", &MainWindow::addTextOverlay);
+    addBtn("color", "Color", "Color Correction (Ctrl+G)", &MainWindow::colorCorrection);
+    addBtn("effects", "Effects", "Video Effects (Ctrl+Shift+F)", &MainWindow::videoEffects);
+    addBtn("marker", "Marker", "Add Marker (Ctrl+M)", &MainWindow::addMarker);
+    toolbar->addSeparator();
+    addBtn("export", "Export", "Export Video (Ctrl+E)", &MainWindow::exportVideo);
+    addBtn("record", "Record", "Start Screen Recording", &MainWindow::startScreenRecording);
+
+    // Apply saved tooltip preference
+    QSettings settings("VEditorSimple", "Preferences");
+    bool showTooltips = settings.value("showTooltips", true).toBool();
+    if (!showTooltips) {
+        for (auto *action : toolbar->actions())
+            action->setToolTip("");
+    }
 }
 
 void MainWindow::updateEditActions()
@@ -560,8 +647,11 @@ void MainWindow::applyProjectConfig(const ProjectConfig &config)
 void MainWindow::newProject()
 {
     ProjectSettingsDialog dialog(this);
-    if (dialog.exec() == QDialog::Accepted)
+    if (dialog.exec() == QDialog::Accepted) {
         applyProjectConfig(dialog.config());
+        hideWelcomeScreen();
+        updateStatusInfo();
+    }
 }
 
 void MainWindow::saveProject()
@@ -616,6 +706,8 @@ void MainWindow::openProject()
     m_timeline->restoreFromProject(data.videoTracks, data.audioTracks,
         data.playheadPos, data.markIn, data.markOut, data.zoomLevel);
     updateTitle();
+    hideWelcomeScreen();
+    updateStatusInfo();
     updateEditActions();
     statusBar()->showMessage("Opened: " + filePath);
 }
@@ -628,6 +720,8 @@ void MainWindow::openFile()
         m_player->loadFile(filePath);
         m_timeline->addClip(filePath);
         m_recentFilesManager->addFile(filePath);
+        hideWelcomeScreen();
+        updateStatusInfo();
         statusBar()->showMessage("Loaded: " + filePath);
         updateEditActions();
     }
@@ -2239,4 +2333,139 @@ void MainWindow::exportToRemotion()
 
     RemotionExportDialog dialog(data, this);
     dialog.exec();
+}
+
+// --- UI/UX improvements ---
+
+void MainWindow::setupStatusBarWidgets()
+{
+    auto makeLabel = [this](const QString &text) {
+        auto *label = new QLabel(text, this);
+        label->setStyleSheet("QLabel { color: #888; padding: 0 8px; font-size: 11px; }");
+        statusBar()->addPermanentWidget(label);
+        return label;
+    };
+
+    m_statusResolution = makeLabel("1920x1080");
+    m_statusFps = makeLabel("30 fps");
+    m_statusDuration = makeLabel("00:00:00");
+    m_statusTheme = makeLabel("Dark");
+}
+
+void MainWindow::updateStatusInfo()
+{
+    m_statusResolution->setText(QString("%1x%2").arg(m_projectConfig.width).arg(m_projectConfig.height));
+    m_statusFps->setText(QString("%1 fps").arg(m_projectConfig.fps));
+
+    double totalDur = m_timeline->totalDuration();
+    int h = (int)(totalDur / 3600);
+    int m = (int)(fmod(totalDur, 3600) / 60);
+    int s = (int)(fmod(totalDur, 60));
+    m_statusDuration->setText(QString("%1:%2:%3")
+        .arg(h, 2, 10, QChar('0'))
+        .arg(m, 2, 10, QChar('0'))
+        .arg(s, 2, 10, QChar('0')));
+
+    m_statusTheme->setText(ThemeManager::themeName(ThemeManager::instance().currentTheme()));
+}
+
+void MainWindow::showWelcomeScreen()
+{
+    m_welcomeWidget->setRecentFiles(m_recentFilesManager->recentFiles());
+    m_welcomeWidget->setVisible(true);
+    m_mainSplitter->setVisible(false);
+    m_hasContent = false;
+}
+
+void MainWindow::hideWelcomeScreen()
+{
+    if (!m_hasContent) {
+        m_welcomeWidget->setVisible(false);
+        m_mainSplitter->setVisible(true);
+        m_hasContent = true;
+    }
+}
+
+void MainWindow::saveWindowState()
+{
+    QSettings settings("VEditorSimple", "WindowState");
+    settings.setValue("geometry", saveGeometry());
+    settings.setValue("windowState", saveState());
+    settings.setValue("splitterState", m_mainSplitter->saveState());
+    settings.setValue("theme", (int)ThemeManager::instance().currentTheme());
+}
+
+void MainWindow::restoreWindowState()
+{
+    QSettings settings("VEditorSimple", "WindowState");
+    if (settings.contains("geometry")) {
+        restoreGeometry(settings.value("geometry").toByteArray());
+    }
+    if (settings.contains("windowState")) {
+        restoreState(settings.value("windowState").toByteArray());
+    }
+    if (settings.contains("splitterState")) {
+        m_mainSplitter->restoreState(settings.value("splitterState").toByteArray());
+    }
+    if (settings.contains("theme")) {
+        auto themeType = (ThemeType)settings.value("theme").toInt();
+        ThemeManager::instance().applyTheme(themeType, this);
+    }
+}
+
+void MainWindow::dragEnterEvent(QDragEnterEvent *event)
+{
+    if (event->mimeData()->hasUrls()) {
+        for (auto &url : event->mimeData()->urls()) {
+            QString path = url.toLocalFile().toLower();
+            if (path.endsWith(".mp4") || path.endsWith(".mkv") || path.endsWith(".mov") ||
+                path.endsWith(".webm") || path.endsWith(".flv") || path.endsWith(".veditor") ||
+                path.endsWith(".png") || path.endsWith(".jpg") || path.endsWith(".jpeg") ||
+                path.endsWith(".wav") || path.endsWith(".mp3") || path.endsWith(".aac")) {
+                event->acceptProposedAction();
+                return;
+            }
+        }
+    }
+}
+
+void MainWindow::dropEvent(QDropEvent *event)
+{
+    for (auto &url : event->mimeData()->urls()) {
+        QString filePath = url.toLocalFile();
+        if (filePath.isEmpty()) continue;
+
+        if (filePath.endsWith(".veditor", Qt::CaseInsensitive)) {
+            // Open as project
+            ProjectData data;
+            if (ProjectFile::load(filePath, data)) {
+                m_projectFilePath = filePath;
+                m_recentFilesManager->addFile(filePath);
+                m_projectConfig = data.config;
+                m_player->setCanvasSize(data.config.width, data.config.height);
+                m_timeline->restoreFromProject(data.videoTracks, data.audioTracks,
+                    data.playheadPos, data.markIn, data.markOut, data.zoomLevel);
+                updateTitle();
+                hideWelcomeScreen();
+                updateStatusInfo();
+                statusBar()->showMessage("Opened project: " + QFileInfo(filePath).fileName());
+            }
+        } else {
+            // Open as media file
+            m_player->loadFile(filePath);
+            m_timeline->addClip(filePath);
+            m_recentFilesManager->addFile(filePath);
+            hideWelcomeScreen();
+            updateStatusInfo();
+            statusBar()->showMessage("Loaded: " + QFileInfo(filePath).fileName());
+        }
+    }
+    updateEditActions();
+}
+
+void MainWindow::closeEvent(QCloseEvent *event)
+{
+    saveWindowState();
+    if (m_autoSave) m_autoSave->stop();
+    QMainWindow::closeEvent(event);
 }

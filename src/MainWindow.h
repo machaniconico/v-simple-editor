@@ -6,6 +6,11 @@
 #include <QStatusBar>
 #include <QSplitter>
 #include <QFileDialog>
+#include <QSettings>
+#include <QDragEnterEvent>
+#include <QDropEvent>
+#include <QMimeData>
+#include <QLabel>
 #include "ProjectSettings.h"
 #include "Exporter.h"
 #include "ProjectFile.h"
@@ -46,6 +51,7 @@
 #include "PythonScript.h"
 #include "NetworkRender.h"
 #include "RemotionExport.h"
+#include "WelcomeWidget.h"
 
 class VideoPlayer;
 class Timeline;
@@ -144,11 +150,22 @@ private slots:
     void openNetworkRender();
     void exportToRemotion();
 
+protected:
+    void dragEnterEvent(QDragEnterEvent *event) override;
+    void dropEvent(QDropEvent *event) override;
+    void closeEvent(QCloseEvent *event) override;
+
 private:
     void setupMenuBar();
     void setupToolBar();
     void setupUI();
     void setupRecentFiles();
+    void setupStatusBarWidgets();
+    void saveWindowState();
+    void restoreWindowState();
+    void showWelcomeScreen();
+    void hideWelcomeScreen();
+    void updateStatusInfo();
     void updateEditActions();
     void applyProjectConfig(const ProjectConfig &config);
     void updateTitle();
@@ -188,4 +205,13 @@ private:
     RecentFilesManager *m_recentFilesManager = nullptr;
     RecentFilesMenu *m_recentFilesMenu = nullptr;
     ScriptEngine *m_scriptEngine = nullptr;
+
+    // UI/UX (Phase 14b)
+    QSplitter *m_mainSplitter = nullptr;
+    WelcomeWidget *m_welcomeWidget = nullptr;
+    QLabel *m_statusResolution = nullptr;
+    QLabel *m_statusFps = nullptr;
+    QLabel *m_statusDuration = nullptr;
+    QLabel *m_statusTheme = nullptr;
+    bool m_hasContent = false;
 };

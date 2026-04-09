@@ -1,5 +1,30 @@
 <RCC>
     <qresource prefix="/">
         <file>icons/app-icon.svg</file>
+        <file>icons/new.svg</file>
+        <file>icons/open.svg</file>
+        <file>icons/save.svg</file>
+        <file>icons/undo.svg</file>
+        <file>icons/redo.svg</file>
+        <file>icons/split.svg</file>
+        <file>icons/delete.svg</file>
+        <file>icons/copy.svg</file>
+        <file>icons/paste.svg</file>
+        <file>icons/export.svg</file>
+        <file>icons/play.svg</file>
+        <file>icons/pause.svg</file>
+        <file>icons/stop.svg</file>
+        <file>icons/text.svg</file>
+        <file>icons/color.svg</file>
+        <file>icons/effects.svg</file>
+        <file>icons/zoom-in.svg</file>
+        <file>icons/zoom-out.svg</file>
+        <file>icons/marker.svg</file>
+        <file>icons/record.svg</file>
+        <file>icons/settings.svg</file>
+        <file>icons/shortcut.svg</file>
+        <file>icons/script.svg</file>
+        <file>icons/network.svg</file>
+        <file>icons/plugin.svg</file>
     </qresource>
 </RCC>
