@@ -39,6 +39,10 @@ private slots:
     void markIn();
     void markOut();
     void setClipSpeed();
+    void addTextOverlay();
+    void addTransition();
+    void addImageOverlay();
+    void addPip();
     void about();
 
 private:

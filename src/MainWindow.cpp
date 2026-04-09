@@ -3,6 +3,7 @@
 #include "Timeline.h"
 #include "ExportDialog.h"
 #include "UndoManager.h"
+#include "OverlayDialogs.h"
 #include <QApplication>
 #include <QMessageBox>
 #include <QVBoxLayout>
@@ -164,6 +165,22 @@ void MainWindow::setupMenuBar()
 
     auto *addATrack = trackMenu->addAction("Add &Audio Track");
     connect(addATrack, &QAction::triggered, this, &MainWindow::addAudioTrack);
+
+    // Insert menu
+    auto *insertMenu = menuBar()->addMenu("&Insert");
+
+    auto *addTextAction = insertMenu->addAction("Add &Text / Telop...");
+    addTextAction->setShortcut(QKeySequence(Qt::Key_T));
+    connect(addTextAction, &QAction::triggered, this, &MainWindow::addTextOverlay);
+
+    auto *addTransAction = insertMenu->addAction("Add T&ransition...");
+    connect(addTransAction, &QAction::triggered, this, &MainWindow::addTransition);
+
+    auto *addImageAction = insertMenu->addAction("Add &Image / Still...");
+    connect(addImageAction, &QAction::triggered, this, &MainWindow::addImageOverlay);
+
+    auto *addPipAction = insertMenu->addAction("Add &Picture in Picture...");
+    connect(addPipAction, &QAction::triggered, this, &MainWindow::addPip);
 
     // Playback menu
     auto *playbackMenu = menuBar()->addMenu("&Playback");
@@ -389,6 +406,53 @@ void MainWindow::setClipSpeed()
     if (ok) {
         m_timeline->setClipSpeed(speed);
         statusBar()->showMessage(QString("Clip speed: %1x").arg(speed));
+    }
+}
+
+void MainWindow::addTextOverlay()
+{
+    TextOverlayDialog dialog(this);
+    if (dialog.exec() == QDialog::Accepted) {
+        auto overlay = dialog.result();
+        // TODO: Store overlay in project and render on preview
+        statusBar()->showMessage(QString("Added text: \"%1\"").arg(overlay.text));
+    }
+}
+
+void MainWindow::addTransition()
+{
+    if (!m_timeline->hasSelection()) {
+        QMessageBox::information(this, "Transition", "Select a clip first to add a transition.");
+        return;
+    }
+    TransitionDialog dialog(this);
+    if (dialog.exec() == QDialog::Accepted) {
+        auto transition = dialog.result();
+        statusBar()->showMessage(QString("Added transition: %1 (%2s)")
+            .arg(Transition::typeName(transition.type)).arg(transition.duration));
+    }
+}
+
+void MainWindow::addImageOverlay()
+{
+    ImageOverlayDialog dialog(this);
+    if (dialog.exec() == QDialog::Accepted) {
+        auto overlay = dialog.result();
+        statusBar()->showMessage(QString("Added image: %1").arg(overlay.filePath));
+    }
+}
+
+void MainWindow::addPip()
+{
+    int maxClip = m_timeline->videoClips().size() - 1;
+    if (maxClip < 0) {
+        QMessageBox::information(this, "PiP", "Add at least one clip first.");
+        return;
+    }
+    PipDialog dialog(maxClip, this);
+    if (dialog.exec() == QDialog::Accepted) {
+        auto config = dialog.result();
+        statusBar()->showMessage(QString("Added PiP from clip #%1").arg(config.sourceClipIndex));
     }
 }
 

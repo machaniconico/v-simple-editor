@@ -28,6 +28,8 @@ add_executable(${PROJECT_NAME}
     src/Exporter.cpp
     src/CodecDetector.cpp
     src/UndoManager.cpp
+    src/Overlay.cpp
+    src/OverlayDialogs.cpp
 )
 
 target_include_directories(${PROJECT_NAME} PRIVATE
