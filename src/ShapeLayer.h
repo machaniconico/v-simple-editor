@@ -2,6 +2,7 @@
 
 #include <QColor>
 #include <QImage>
+#include <QPainterPath>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QPointF>

@@ -1,5 +1,6 @@
 #include "Overlay.h"
 #include <QPainter>
+#include <QPainterPath>
 #include <QFontMetrics>
 
 void OverlayRenderer::renderTextOverlay(QImage &frame, const TextOverlay &overlay, double currentTime)
