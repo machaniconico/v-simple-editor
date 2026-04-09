@@ -163,15 +163,55 @@ if !errorlevel! neq 0 (
 echo   [OK] Build successful!
 echo.
 
-:: ---- Step 5: Done! ----
-echo [Step 5/5] Locating executable...
+:: ---- Step 5: Deploy DLLs ----
+echo [Step 5/6] Deploying DLLs...
 set "EXE_PATH="
+set "EXE_DIR="
 :: Check common output locations
 for %%d in (Release RelWithDebInfo Debug MinSizeRel) do (
     if exist "build\%%d\v-editor-simple.exe" (
         set "EXE_PATH=%PROJECT_DIR%build\%%d\v-editor-simple.exe"
+        set "EXE_DIR=%PROJECT_DIR%build\%%d"
     )
 )
+
+if defined EXE_DIR (
+    :: Run windeployqt to copy Qt DLLs
+    where windeployqt >nul 2>&1
+    if !errorlevel! equ 0 (
+        echo   Running windeployqt...
+        windeployqt --release --no-translations "!EXE_PATH!" >nul 2>&1
+        echo   [OK] Qt DLLs deployed
+    ) else (
+        :: Try vcpkg's Qt windeployqt
+        set "WINDEPLOY=%VCPKG_ROOT%\installed\x64-windows\tools\Qt6\bin\windeployqt.exe"
+        if exist "!WINDEPLOY!" (
+            echo   Running windeployqt from vcpkg...
+            "!WINDEPLOY!" --release --no-translations "!EXE_PATH!" >nul 2>&1
+            echo   [OK] Qt DLLs deployed
+        ) else (
+            echo   [WARN] windeployqt not found, copying DLLs manually...
+        )
+    )
+
+    :: Copy FFmpeg DLLs from vcpkg
+    echo   Copying FFmpeg DLLs...
+    for %%f in (avformat avcodec avutil swscale swresample avfilter) do (
+        if exist "%VCPKG_ROOT%\installed\x64-windows\bin\%%f.dll" (
+            copy /y "%VCPKG_ROOT%\installed\x64-windows\bin\%%f.dll" "!EXE_DIR!" >nul 2>&1
+        )
+    )
+    :: Copy any remaining FFmpeg dependency DLLs
+    for %%f in (avdevice postproc swresample-*) do (
+        if exist "%VCPKG_ROOT%\installed\x64-windows\bin\%%f.dll" (
+            copy /y "%VCPKG_ROOT%\installed\x64-windows\bin\%%f.dll" "!EXE_DIR!" >nul 2>&1
+        )
+    )
+    echo   [OK] FFmpeg DLLs deployed
+)
+
+:: ---- Step 6: Done! ----
+echo [Step 6/6] Done!
 
 echo.
 echo  ============================================================
