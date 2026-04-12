@@ -19,6 +19,10 @@
 class UndoManager;
 class PlayheadOverlay;
 struct TimelineState;
+class QDragEnterEvent;
+class QDragMoveEvent;
+class QDragLeaveEvent;
+class QDropEvent;
 
 struct ClipInfo {
     QString filePath;
@@ -29,6 +33,10 @@ struct ClipInfo {
     double leadInSec = 0.0; // leading gap before the clip on the timeline, grows on left-trim to keep the right edge fixed
     double speed = 1.0;   // 0.25x - 4.0x
     double volume = 1.0;  // 0.0 - 2.0 (0=mute, 1=normal, 2=boost)
+    // Non-zero → clip is linked with every other clip that shares the same
+    // linkGroup. Linked clips are selected together, dragged together, and
+    // deleted together so V/A stays in AV sync. 0 = unlinked / standalone.
+    int linkGroup = 0;
 
     // Phase 3: Color correction, effects, keyframes
     ColorCorrection colorCorrection;
@@ -83,6 +91,15 @@ public:
     int secondsToX(double seconds) const;
     int clipStartX(int index) const;
 
+    // Remove clip[index] and push its freed time (leadInSec + effectiveDur)
+    // into clip[index+1]'s leadInSec so downstream clips keep their absolute
+    // timeline positions. Used by cross-track drag.
+    void removeClipPreservingDownstream(int index);
+    // Insert clip at (index), with a specific leadInSec, then subtract the
+    // inserted clip's footprint from clip[index+1]'s leadInSec so downstream
+    // clips don't slide right. Caller must have verified the plan fits.
+    void insertClipPreservingDownstream(int index, const ClipInfo &clip, double leadInSec);
+
     void setSnapEnabled(bool enabled) { m_snapEnabled = enabled; }
     bool snapEnabled() const { return m_snapEnabled; }
     void setPixelsPerSecond(double pps);
@@ -96,6 +113,11 @@ public:
     void setHidden(bool hidden) { m_hidden = hidden; update(); }
     bool isHidden() const { return m_hidden; }
 
+    // Quietly mutate a clip's leadInSec (and optionally its next clip's
+    // leadInSec) during a drag coordinated at the Timeline level. Does NOT
+    // emit modified(); the drag owner batches a single save-undo on release.
+    void applyDragMove(int clipIdx, double leadIn, double nextLeadIn);
+
 signals:
     void clipClicked(int index);
     void selectionChanged(int primaryIndex, bool additive);
@@ -104,14 +126,30 @@ signals:
     void modified();
     void seekRequested(double seconds);
     void rowHeightChanged(int newHeight);
+    void clipContextMenuRequested(int clipIndex, const QPoint &globalPos);
+    void linkedDragStarted(int clipIndex);
+    void linkedDragDelta(int clipIndex, double deltaSec);
+    void linkedDragCancelled();
 
 protected:
     void paintEvent(QPaintEvent *event) override;
     void mousePressEvent(QMouseEvent *event) override;
     void mouseMoveEvent(QMouseEvent *event) override;
     void mouseReleaseEvent(QMouseEvent *event) override;
+    void dragEnterEvent(QDragEnterEvent *event) override;
+    void dragMoveEvent(QDragMoveEvent *event) override;
+    void dragLeaveEvent(QDragLeaveEvent *event) override;
+    void dropEvent(QDropEvent *event) override;
 
 private:
+    struct DropPlan {
+        bool valid = false;
+        int insertIdx = -1;
+        double newLeadIn = 0.0;          // leadInSec for the clip being inserted
+        double nextLeadInDelta = 0.0;    // amount to subtract from clip[insertIdx+1].leadInSec
+    };
+    DropPlan planDrop(double dropTime, double clipDuration) const;
+
     void updateMinimumWidth();
     int snapToEdge(int x) const;
 
@@ -122,6 +160,10 @@ private:
     int m_dragStartX = 0;
     double m_dragOriginalValue = 0.0;
     double m_dragOriginalLeadIn = 0.0;
+    // leadInSec of the clip RIGHT AFTER the dragged one, captured at drag
+    // start. Used to compensate its gap during a MoveClip drag so downstream
+    // clips don't slide when the user repositions a single clip. -1 = no next.
+    double m_dragOriginalLeadInNext = -1.0;
     bool m_snapEnabled = true;
     int m_dropTargetIndex = -1;
 
@@ -133,9 +175,14 @@ private:
     bool m_resizingHeight = false;
     int m_resizeStartY = 0;
     int m_resizeStartHeight = 0;
+    // Cross-track drop preview state. -1 = no indicator. When >=0 this is
+    // the widget-local x where the dropped clip's left edge would land.
+    int m_dropIndicatorX = -1;
+    bool m_dropIndicatorValid = false;
     static constexpr int TRIM_HANDLE_WIDTH = 6;
     static constexpr int SNAP_THRESHOLD = 8;
     static constexpr int RESIZE_HANDLE_HEIGHT = 6;
+    static constexpr int CROSS_TRACK_DRAG_THRESHOLD = 10;
 };
 
 class Timeline : public QWidget
@@ -256,6 +303,8 @@ private:
     void notifyMutationsChanged();
     void wireTrackSelection(TimelineTrack *track);
     void clearAllSelections();
+    void captureZoomAnchor();
+    void clearZoomAnchor();
 
     QVector<TimelineTrack*> m_videoTracks;
     QVector<TimelineTrack*> m_audioTracks;
@@ -275,9 +324,42 @@ private:
     double m_markOut = -1.0;
     double m_zoomLevel = 10.0; // pixels per second (double so we can go sub-1 for long clips)
     int m_trackHeight = 50; // default row height for new and existing tracks
+    // Viewport-X of the playhead captured at the start of a zoom drag. While
+    // set (>= 0), setZoomLevel pins the playhead to this viewport column so
+    // the user zooms into the frame they were looking at, not the left edge.
+    int m_zoomAnchorViewportX = -1;
 
     UndoManager *m_undoManager;
     std::optional<ClipInfo> m_clipboard;
+    // Monotonic counter for generating new linkGroup IDs. Zero is reserved
+    // for "unlinked" so the next usable id is 1.
+    int m_nextLinkGroup = 1;
+    // Re-entrancy guard so propagating a selection to linked clips doesn't
+    // bounce back through the selectionChanged signals and recurse forever.
+    bool m_inLinkedSelectionSync = false;
+
+    // Snapshot of every linked partner's leadInSec state at the start of a
+    // MoveClip drag. Timeline applies the globally-clamped drag delta to
+    // every partner (including the source clip) each frame so the V/A pair
+    // stays locked together, without letting one partner drift past its
+    // neighbor while another clamps short.
+    struct LinkedDragPartner {
+        TimelineTrack *track = nullptr;
+        int clipIdx = -1;
+        double origLeadIn = 0.0;
+        double origLeadInNext = -1.0; // -1 = no next clip
+    };
+    QVector<LinkedDragPartner> m_linkedDragPartners;
+
+    int allocateLinkGroup() { return m_nextLinkGroup++; }
+    void onTrackSelectionChanged(int primaryIndex, bool additive);
+    void showClipContextMenu(TimelineTrack *track, int clipIndex, const QPoint &globalPos);
+    void unlinkClipGroup(int linkGroup);
+    void cutSelectedClip();
+    void captureLinkedDragPartners(TimelineTrack *source, int clipIdx);
+    void applyLinkedDragDelta(double rawDeltaSec);
+    void revertLinkedDragPartners();
+    void clearLinkedDragState();
 };
 
 class PlayheadOverlay : public QWidget
@@ -320,6 +402,8 @@ protected:
 
 signals:
     void zoomChanged(double newPixelsPerSecond);
+    void zoomDragStarted();
+    void zoomDragEnded();
 
 private:
     double m_pixelsPerSecond = 10.0;

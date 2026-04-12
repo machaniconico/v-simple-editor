@@ -66,24 +66,10 @@ MainWindow::MainWindow(QWidget *parent)
     connect(m_autoSave, &AutoSave::autoSaved, this, [this](const QString &path) {
         statusBar()->showMessage("Auto-saved: " + QFileInfo(path).fileName(), 3000);
     });
-    connect(m_autoSave, &AutoSave::recoveryAvailable, this, [this](const QStringList &files) {
-        auto reply = QMessageBox::question(this, "Crash Recovery",
-            QString("Found %1 recovery file(s) from a previous session.\n\nRecover the most recent?")
-                .arg(files.size()));
-        if (reply == QMessageBox::Yes && !files.isEmpty()) {
-            QString json = AutoSave::recoverFromFile(files.first());
-            if (!json.isEmpty()) {
-                ProjectData data;
-                if (ProjectFile::fromJsonString(json, data)) {
-                    m_projectConfig = data.config;
-                    m_player->setCanvasSize(data.config.width, data.config.height);
-                    m_timeline->restoreFromProject(data.videoTracks, data.audioTracks,
-                        data.playheadPos, data.markIn, data.markOut, 10);
-                    updateTitle();
-                    statusBar()->showMessage("Recovered from auto-save");
-                }
-            }
-        }
+    connect(m_autoSave, &AutoSave::recoveryAvailable, this, [](const QStringList &files) {
+        // Crash Recovery dialog suppressed per user preference — silently
+        // clean up stale recovery files on startup so the prompt never
+        // blocks the app opening.
         for (const QString &path : files)
             QFile::remove(path);
     });

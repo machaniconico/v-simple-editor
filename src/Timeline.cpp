@@ -7,6 +7,19 @@
 #include <QScrollBar>
 #include <QWheelEvent>
 #include <QDebug>
+#include <QCoreApplication>
+#include <QTimer>
+#include <QDrag>
+#include <QMimeData>
+#include <QDragEnterEvent>
+#include <QDragMoveEvent>
+#include <QDragLeaveEvent>
+#include <QDropEvent>
+#include <QPixmap>
+#include <QPainter>
+#include <QMenu>
+#include <QAction>
+#include <QHash>
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -159,9 +172,14 @@ void TimeRuler::mousePressEvent(QMouseEvent *event)
         return;
     }
     m_dragging = true;
-    m_dragStartX = event->pos().x();
+    // Use global (screen) X, not widget-local X. While dragging, setZoomLevel
+    // resizes the ruler and the scroll area may auto-scroll, which would
+    // shift the ruler's widget-relative origin under the cursor and cause the
+    // drag delta to spiral — zoom→resize→shift→bigger delta→more zoom, runaway.
+    m_dragStartX = event->globalPosition().toPoint().x();
     m_dragStartPps = m_pixelsPerSecond;
     grabMouse();
+    emit zoomDragStarted();
     event->accept();
 }
 
@@ -171,7 +189,7 @@ void TimeRuler::mouseMoveEvent(QMouseEvent *event)
         QWidget::mouseMoveEvent(event);
         return;
     }
-    const int dx = event->pos().x() - m_dragStartX;
+    const int dx = event->globalPosition().toPoint().x() - m_dragStartX;
     // Multiplicative drag: each pixel multiplies zoom by ~2%. Works uniformly
     // from 0.1 pps (4h clip fits) up to 200 pps (frame-precise).
     const double factor = std::pow(1.02, static_cast<double>(dx));
@@ -192,6 +210,7 @@ void TimeRuler::mouseReleaseEvent(QMouseEvent *event)
     }
     m_dragging = false;
     releaseMouse();
+    emit zoomDragEnded();
     event->accept();
 }
 
@@ -264,6 +283,88 @@ void TimelineTrack::splitClipAt(int index, double localSeconds)
     original.outPoint = splitPoint;
     m_clips.insert(index + 1, secondHalf);
     updateMinimumWidth(); update(); emit modified();
+}
+
+void TimelineTrack::applyDragMove(int clipIdx, double leadIn, double nextLeadIn)
+{
+    if (clipIdx < 0 || clipIdx >= m_clips.size()) return;
+    m_clips[clipIdx].leadInSec = qMax(0.0, leadIn);
+    if (nextLeadIn >= 0.0 && clipIdx + 1 < m_clips.size())
+        m_clips[clipIdx + 1].leadInSec = qMax(0.0, nextLeadIn);
+    updateMinimumWidth();
+    update();
+}
+
+void TimelineTrack::removeClipPreservingDownstream(int index)
+{
+    if (index < 0 || index >= m_clips.size()) return;
+    const double absorbed = m_clips[index].leadInSec + m_clips[index].effectiveDuration();
+    m_clips.removeAt(index);
+    // Push the vacated time into the next clip's leadInSec so everything
+    // downstream stays at the same absolute timeline position.
+    if (index < m_clips.size())
+        m_clips[index].leadInSec += absorbed;
+    QList<int> newSel;
+    for (int s : m_selectedClips) {
+        if (s < index) newSel.append(s);
+        else if (s > index) newSel.append(s - 1);
+    }
+    m_selectedClips = newSel;
+    const int primary = m_selectedClips.isEmpty() ? -1 : m_selectedClips.last();
+    updateMinimumWidth(); update();
+    emit selectionChanged(primary, false);
+    emit modified();
+}
+
+void TimelineTrack::insertClipPreservingDownstream(int index, const ClipInfo &clip, double leadInSec)
+{
+    if (index < 0) index = 0;
+    if (index > m_clips.size()) index = m_clips.size();
+    ClipInfo newClip = clip;
+    newClip.leadInSec = qMax(0.0, leadInSec);
+    const double consumed = newClip.leadInSec + newClip.effectiveDuration();
+    m_clips.insert(index, newClip);
+    // The existing clip that now sits at index+1 used to start at
+    //   (prevEnd + oldLeadIn)
+    // and must continue to start at that same absolute time. After the
+    // insertion, prevEnd effectively advanced by `consumed`, so we shave
+    // `consumed` off its leadInSec. If we'd go negative the plan was bad.
+    if (index + 1 < m_clips.size()) {
+        double &nextLead = m_clips[index + 1].leadInSec;
+        nextLead -= consumed;
+        if (nextLead < 0) nextLead = 0;
+    }
+    updateMinimumWidth(); update();
+    emit modified();
+}
+
+TimelineTrack::DropPlan TimelineTrack::planDrop(double dropTime, double clipDuration) const
+{
+    DropPlan plan{};
+    if (dropTime < 0.0) dropTime = 0.0;
+    double cursor = 0.0; // end time of the previous clip (i.e. start of the gap before clip[i])
+    for (int i = 0; i < m_clips.size(); ++i) {
+        const double clipStart = cursor + m_clips[i].leadInSec;
+        const double clipEnd = clipStart + m_clips[i].effectiveDuration();
+        // Does the dropped clip fit entirely within the gap before clip[i]?
+        if (dropTime + clipDuration <= clipStart + 1e-6) {
+            plan.insertIdx = i;
+            plan.newLeadIn = qMax(0.0, dropTime - cursor);
+            plan.nextLeadInDelta = plan.newLeadIn + clipDuration;
+            plan.valid = true;
+            return plan;
+        }
+        // Overlap with clip[i] — no valid slot here.
+        if (dropTime < clipEnd - 1e-6)
+            return plan; // invalid
+        cursor = clipEnd;
+    }
+    // After the last clip: always valid, just appends.
+    plan.insertIdx = m_clips.size();
+    plan.newLeadIn = qMax(0.0, dropTime - cursor);
+    plan.nextLeadInDelta = 0.0;
+    plan.valid = true;
+    return plan;
 }
 
 void TimelineTrack::setClips(const QVector<ClipInfo> &clips) { m_clips = clips; updateMinimumWidth(); update(); }
@@ -488,6 +589,21 @@ void TimelineTrack::paintEvent(QPaintEvent *event)
         x += clipWidth;
     }
 
+    // Cross-track drop preview. Cyan bar = valid drop, red bar = overlap.
+    if (m_dropIndicatorX >= 0) {
+        const QColor color = m_dropIndicatorValid
+            ? QColor(100, 220, 255, 200)
+            : QColor(255, 80, 80, 200);
+        painter.setPen(QPen(color, 3));
+        painter.drawLine(m_dropIndicatorX, 0, m_dropIndicatorX, m_rowHeight);
+        if (!m_dropIndicatorValid) {
+            // Crosshatched band so the invalid state reads at a glance even
+            // on top of waveform noise.
+            painter.fillRect(m_dropIndicatorX - 2, 0, 4, m_rowHeight,
+                             QColor(255, 80, 80, 90));
+        }
+    }
+
     // Visual indication of hidden / muted state — overlay the whole track.
     if (m_hidden) {
         painter.fillRect(rect(), QColor(0, 0, 0, 140));
@@ -520,6 +636,19 @@ void TimelineTrack::mousePressEvent(QMouseEvent *event)
 
     const bool additive = event->modifiers() & (Qt::ShiftModifier | Qt::ControlModifier);
 
+    // Right-click on a clip → context menu. We fire the signal and let
+    // Timeline assemble / show the menu so it can coordinate cross-track
+    // operations (delete, unlink, etc.) that can't be done from inside a
+    // single TimelineTrack.
+    if (event->button() == Qt::RightButton) {
+        const int hit = clipAtX(event->pos().x());
+        if (hit >= 0) {
+            emit clipContextMenuRequested(hit, event->globalPosition().toPoint());
+            event->accept();
+            return;
+        }
+    }
+
     if (event->button() == Qt::LeftButton && !additive)
         emit seekRequested(qMax(0.0, xToSeconds(event->pos().x())));
 
@@ -550,7 +679,16 @@ void TimelineTrack::mousePressEvent(QMouseEvent *event)
             m_dragOriginalValue = m_clips[clickedClip].outPoint > 0 ? m_clips[clickedClip].outPoint : m_clips[clickedClip].duration;
         } else {
             m_dragMode = DragMode::MoveClip; m_dragClipIndex = clickedClip;
-            m_dragStartX = event->pos().x(); m_dropTargetIndex = -1;
+            m_dragStartX = event->pos().x();
+            m_dragOriginalLeadIn = m_clips[clickedClip].leadInSec;
+            m_dragOriginalLeadInNext = (clickedClip + 1 < m_clips.size())
+                ? m_clips[clickedClip + 1].leadInSec
+                : -1.0;
+            m_dropTargetIndex = -1;
+            // Tell Timeline so it can snapshot every linked partner's
+            // leadInSec state — the drag will stay in sync as long as we
+            // broadcast deltas through linkedDragDelta each move.
+            emit linkedDragStarted(clickedClip);
         }
     } else if (clickedClip < 0 && !additive) {
         setSelectedClip(-1);
@@ -572,21 +710,91 @@ void TimelineTrack::mouseMoveEvent(QMouseEvent *event)
         return;
     }
     if (m_dragMode == DragMode::MoveClip && m_dragClipIndex >= 0 && m_dragClipIndex < m_clips.size()) {
-        // Fixed 40 px step per reorder — every 40 px of drag advances the
-        // drop target by one slot. Predictable and independent of clip widths
-        // so long clips can still be reordered.
-        constexpr int STEP_PX = 40;
-        const int dx = event->pos().x() - m_dragStartX;
-        int target = m_dragClipIndex;
-        if (dx > 0) {
-            const int steps = dx / STEP_PX;
-            target = qMin(m_dragClipIndex + steps, m_clips.size() - 1);
-        } else if (dx < 0) {
-            const int steps = (-dx) / STEP_PX;
-            target = qMax(m_dragClipIndex - steps, 0);
+        const int y = event->pos().y();
+        // If the user has pulled the cursor far enough vertically out of our
+        // row, promote the in-track leadInSec drag into a full Qt drag so
+        // other tracks can accept it as a drop. Revert the leadInSec we
+        // tentatively applied so canceling the drag leaves the clip alone.
+        if (y < -CROSS_TRACK_DRAG_THRESHOLD || y >= height() + CROSS_TRACK_DRAG_THRESHOLD) {
+            // Snapshot the data we need before mutating the drag state.
+            const int srcIdx = m_dragClipIndex;
+            m_clips[srcIdx].leadInSec = m_dragOriginalLeadIn;
+            if (m_dragOriginalLeadInNext >= 0.0 && srcIdx + 1 < m_clips.size())
+                m_clips[srcIdx + 1].leadInSec = m_dragOriginalLeadInNext;
+            const int grabOffsetPx = m_dragStartX - clipStartX(srcIdx);
+
+            // Ask Timeline to roll back any linked partners it already
+            // shifted — otherwise they'd be stuck at the interim positions
+            // when the QDrag starts.
+            emit linkedDragCancelled();
+
+            // End the in-track drag BEFORE starting QDrag — drag->exec() runs
+            // a nested event loop and we don't want a stale MoveClip state.
+            m_dragMode = DragMode::None;
+            m_dragClipIndex = -1;
+            m_dragOriginalLeadInNext = -1.0;
+            setCursor(Qt::ArrowCursor);
+            updateMinimumWidth();
+            update();
+
+            // Build MIME payload: "srcIdx:grabOffsetPx".
+            QByteArray payload;
+            payload += QByteArray::number(srcIdx);
+            payload += ':';
+            payload += QByteArray::number(grabOffsetPx);
+            auto *mime = new QMimeData();
+            mime->setData("application/x-vse-clip", payload);
+
+            auto *drag = new QDrag(this);
+            drag->setMimeData(mime);
+            // Ghost pixmap so the user sees what they're dragging.
+            const int ghostW = qMax(20, static_cast<int>(
+                m_clips[srcIdx].effectiveDuration() * m_pixelsPerSecond));
+            QPixmap ghost(ghostW, m_rowHeight);
+            ghost.fill(QColor(68, 136, 204, 180));
+            QPainter gp(&ghost);
+            gp.setPen(QPen(QColor(255, 255, 255, 220), 1));
+            gp.drawRect(0, 0, ghostW - 1, m_rowHeight - 1);
+            gp.drawText(ghost.rect().adjusted(4, 0, -4, 0),
+                        Qt::AlignLeft | Qt::AlignVCenter,
+                        m_clips[srcIdx].displayName);
+            gp.end();
+            drag->setPixmap(ghost);
+            drag->setHotSpot(QPoint(grabOffsetPx, m_rowHeight / 2));
+
+            drag->exec(Qt::MoveAction);
+            return;
         }
-        m_dropTargetIndex = target;
-        setCursor(Qt::ClosedHandCursor); update(); return;
+
+        // Positional drag: shift leadInSec + compensate the next clip so
+        // downstream clips don't slide. Linked clips take a different path
+        // — Timeline applies a globally-clamped delta to every partner
+        // (including this one) so the V/A pair stays locked together even
+        // when each track has different clamp room.
+        const int dx = event->pos().x() - m_dragStartX;
+        const double rawDeltaSec = static_cast<double>(dx) / m_pixelsPerSecond;
+        const int linkGroup = m_clips[m_dragClipIndex].linkGroup;
+        if (linkGroup > 0) {
+            emit linkedDragDelta(m_dragClipIndex, rawDeltaSec);
+            setCursor(Qt::ClosedHandCursor);
+            return;
+        }
+
+        double deltaSec = rawDeltaSec;
+        if (deltaSec < -m_dragOriginalLeadIn)
+            deltaSec = -m_dragOriginalLeadIn;
+        if (m_dragOriginalLeadInNext >= 0.0 && deltaSec > m_dragOriginalLeadInNext)
+            deltaSec = m_dragOriginalLeadInNext;
+        m_clips[m_dragClipIndex].leadInSec = m_dragOriginalLeadIn + deltaSec;
+        if (m_dragOriginalLeadInNext >= 0.0
+            && m_dragClipIndex + 1 < m_clips.size()) {
+            m_clips[m_dragClipIndex + 1].leadInSec =
+                m_dragOriginalLeadInNext - deltaSec;
+        }
+        setCursor(Qt::ClosedHandCursor);
+        updateMinimumWidth();
+        update();
+        return;
     }
     if (m_dragMode == DragMode::TrimLeft || m_dragMode == DragMode::TrimRight) {
         if (m_dragClipIndex < 0 || m_dragClipIndex >= m_clips.size()) {
@@ -641,17 +849,120 @@ void TimelineTrack::mouseReleaseEvent(QMouseEvent *event)
         return;
     }
     if (m_dragMode == DragMode::MoveClip
-        && m_dragClipIndex >= 0 && m_dragClipIndex < m_clips.size()
-        && m_dropTargetIndex >= 0 && m_dropTargetIndex < m_clips.size()) {
-        if (m_selectedClips.size() > 1) {
-            moveSelectedClipsGroup(m_dropTargetIndex);
-        } else if (m_dragClipIndex != m_dropTargetIndex) {
-            moveClip(m_dragClipIndex, m_dropTargetIndex);
-        }
+        && m_dragClipIndex >= 0 && m_dragClipIndex < m_clips.size()) {
+        // Fire modified() so Timeline saves an undo snapshot and the playback
+        // schedule rebuilds with the new leadInSec gaps.
+        if (!qFuzzyCompare(m_clips[m_dragClipIndex].leadInSec, m_dragOriginalLeadIn))
+            emit modified();
     }
     if (m_dragMode == DragMode::TrimLeft || m_dragMode == DragMode::TrimRight) emit modified();
     m_dragMode = DragMode::None; m_dragClipIndex = -1; m_dropTargetIndex = -1;
+    m_dragOriginalLeadInNext = -1.0;
     setCursor(Qt::ArrowCursor); update();
+}
+
+// --- Cross-track drag & drop ---
+
+static int parseDropPayload(const QByteArray &payload, int &grabOffsetPx)
+{
+    const int sep = payload.indexOf(':');
+    if (sep <= 0) return -1;
+    bool okIdx = false, okOff = false;
+    const int srcIdx = payload.left(sep).toInt(&okIdx);
+    grabOffsetPx = payload.mid(sep + 1).toInt(&okOff);
+    if (!okIdx || !okOff) return -1;
+    return srcIdx;
+}
+
+void TimelineTrack::dragEnterEvent(QDragEnterEvent *event)
+{
+    if (event->mimeData()->hasFormat("application/x-vse-clip"))
+        event->acceptProposedAction();
+    else
+        event->ignore();
+}
+
+void TimelineTrack::dragMoveEvent(QDragMoveEvent *event)
+{
+    if (!event->mimeData()->hasFormat("application/x-vse-clip")) {
+        event->ignore();
+        return;
+    }
+    auto *src = qobject_cast<TimelineTrack *>(event->source());
+    if (!src || src == this) {
+        // Same-track drags are handled by the leadInSec path — nothing to do here.
+        event->ignore();
+        m_dropIndicatorX = -1;
+        update();
+        return;
+    }
+    int grabOffsetPx = 0;
+    const int srcIdx = parseDropPayload(
+        event->mimeData()->data("application/x-vse-clip"), grabOffsetPx);
+    if (srcIdx < 0 || srcIdx >= src->m_clips.size()) {
+        event->ignore();
+        return;
+    }
+    const int dropX = event->position().toPoint().x() - grabOffsetPx;
+    const double dropTime = qMax(0.0, dropX / m_pixelsPerSecond);
+    const DropPlan plan = planDrop(dropTime, src->m_clips[srcIdx].effectiveDuration());
+    m_dropIndicatorX = qMax(0, dropX);
+    m_dropIndicatorValid = plan.valid;
+    event->acceptProposedAction();
+    update();
+}
+
+void TimelineTrack::dragLeaveEvent(QDragLeaveEvent *)
+{
+    if (m_dropIndicatorX != -1) {
+        m_dropIndicatorX = -1;
+        m_dropIndicatorValid = false;
+        update();
+    }
+}
+
+void TimelineTrack::dropEvent(QDropEvent *event)
+{
+    const int oldIndicator = m_dropIndicatorX;
+    m_dropIndicatorX = -1;
+    m_dropIndicatorValid = false;
+    if (oldIndicator >= 0) update();
+
+    if (!event->mimeData()->hasFormat("application/x-vse-clip")) {
+        event->ignore();
+        return;
+    }
+    auto *src = qobject_cast<TimelineTrack *>(event->source());
+    if (!src || src == this) {
+        event->ignore();
+        return;
+    }
+    int grabOffsetPx = 0;
+    const int srcIdx = parseDropPayload(
+        event->mimeData()->data("application/x-vse-clip"), grabOffsetPx);
+    if (srcIdx < 0 || srcIdx >= src->m_clips.size()) {
+        event->ignore();
+        return;
+    }
+    const ClipInfo clipData = src->m_clips[srcIdx];
+    const double clipDur = clipData.effectiveDuration();
+    const int dropX = event->position().toPoint().x() - grabOffsetPx;
+    const double dropTime = qMax(0.0, dropX / m_pixelsPerSecond);
+    const DropPlan plan = planDrop(dropTime, clipDur);
+    if (!plan.valid) {
+        event->ignore();
+        return;
+    }
+
+    // Order matters: remove from source first (while our indices are still
+    // valid — source and this track have separate m_clips, so removing from
+    // source never perturbs this track's indices, but doing it first also
+    // matches the "move, not copy" semantics if src == this ever slips
+    // through in the future).
+    src->removeClipPreservingDownstream(srcIdx);
+    insertClipPreservingDownstream(plan.insertIdx, clipData, plan.newLeadIn);
+
+    event->acceptProposedAction();
 }
 
 // --- Timeline ---
@@ -756,6 +1067,8 @@ void Timeline::setupUI()
     m_timeRuler = new TimeRuler(tracksContainer);
     m_timeRuler->setPixelsPerSecond(m_zoomLevel);
     connect(m_timeRuler, &TimeRuler::zoomChanged, this, &Timeline::setZoomLevel);
+    connect(m_timeRuler, &TimeRuler::zoomDragStarted, this, &Timeline::captureZoomAnchor);
+    connect(m_timeRuler, &TimeRuler::zoomDragEnded, this, &Timeline::clearZoomAnchor);
     tracksOuterLayout->addWidget(m_timeRuler);
 
     m_playheadOverlay = new PlayheadOverlay(tracksContainer);
@@ -963,6 +1276,10 @@ void Timeline::addClip(const QString &filePath)
     clip.filePath = filePath;
     clip.displayName = QFileInfo(filePath).fileName();
     clip.duration = duration;
+    // Every freshly-added clip gets a unique linkGroup shared by its video
+    // and audio halves so the two stay locked together until the user
+    // explicitly severs the sync via the clip's context menu.
+    clip.linkGroup = allocateLinkGroup();
 
     // Premiere-style stacking: each drop goes onto the first EMPTY video track
     // (creating a new V<n>/A<n> track if every existing track is occupied).
@@ -1030,30 +1347,80 @@ void Timeline::addClip(const QString &filePath)
 
 void Timeline::splitAtPlayhead()
 {
-    const auto &clips = m_videoTrack->clips();
-    double accum = 0.0;
-    for (int i = 0; i < clips.size(); ++i) {
-        double clipDur = clips[i].effectiveDuration();
-        if (m_playheadPos >= accum && m_playheadPos < accum + clipDur) {
-            double localPos = m_playheadPos - accum;
-            m_videoTrack->splitClipAt(i, localPos);
-            m_audioTrack->splitClipAt(i, localPos);
-            saveUndoState("Split clip");
-            updateInfoLabel();
-            return;
+    // Split only the clips the user has explicitly selected (on any track),
+    // and only when the playhead lies inside that clip. This matches how
+    // NLEs behave with a multi-selection: if you selected one clip you get
+    // one cut; if nothing is selected, nothing happens.
+    //
+    // The right half of every cut gets a FRESH linkGroup so post-split
+    // halves are treated as independent clips. A single shared map keeps
+    // V_right and A_right in the same new group — the linked V/A pair
+    // stays linked after the split, just with a new identity separate from
+    // the left half.
+    bool anySplit = false;
+    QHash<int, int> oldGroupToNewGroup;
+    auto splitTrack = [&](TimelineTrack *track) {
+        if (!track) return;
+        const QList<int> selected = track->selectedClips();
+        if (selected.isEmpty()) return;
+        QVector<ClipInfo> clips = track->clips();
+        double accum = 0.0;
+        for (int i = 0; i < clips.size(); ++i) {
+            accum += clips[i].leadInSec;
+            const double clipDur = clips[i].effectiveDuration();
+            const double clipEnd = accum + clipDur;
+            if (selected.contains(i)
+                && m_playheadPos > accum + 0.05
+                && m_playheadPos < clipEnd - 0.05) {
+                track->splitClipAt(i, m_playheadPos - accum);
+                auto updated = track->clips();
+                if (i + 1 < updated.size()) {
+                    const int oldGroup = updated[i + 1].linkGroup;
+                    if (oldGroup > 0) {
+                        auto it = oldGroupToNewGroup.find(oldGroup);
+                        if (it == oldGroupToNewGroup.end())
+                            it = oldGroupToNewGroup.insert(oldGroup, allocateLinkGroup());
+                        updated[i + 1].linkGroup = it.value();
+                        track->setClips(updated);
+                    }
+                }
+                anySplit = true;
+                return;
+            }
+            accum = clipEnd;
         }
-        accum += clipDur;
+    };
+    for (auto *t : m_videoTracks) splitTrack(t);
+    for (auto *t : m_audioTracks) splitTrack(t);
+    if (anySplit) {
+        saveUndoState("Split clip");
+        updateInfoLabel();
     }
 }
 
 void Timeline::deleteSelectedClip()
 {
-    int sel = m_videoTrack->selectedClip();
-    if (sel < 0) return;
-    m_videoTrack->removeClip(sel);
-    m_audioTrack->removeClip(sel);
-    saveUndoState("Delete clip");
-    updateInfoLabel();
+    bool anyRemoved = false;
+    // Walk every track and remove its selected clips (descending so indices
+    // stay valid). Preserve downstream positions — we want the rest of the
+    // sequence to stay put when a linked V/A pair is deleted out of the
+    // middle of the timeline.
+    auto deleteFrom = [&](TimelineTrack *t) {
+        if (!t) return;
+        QList<int> sel = t->selectedClips();
+        if (sel.isEmpty()) return;
+        std::sort(sel.begin(), sel.end(), std::greater<int>());
+        for (int idx : sel) {
+            t->removeClipPreservingDownstream(idx);
+            anyRemoved = true;
+        }
+    };
+    for (auto *t : m_videoTracks) deleteFrom(t);
+    for (auto *t : m_audioTracks) deleteFrom(t);
+    if (anyRemoved) {
+        saveUndoState("Delete clip");
+        updateInfoLabel();
+    }
 }
 
 void Timeline::rippleDeleteSelectedClip() { deleteSelectedClip(); }
@@ -1080,6 +1447,65 @@ void Timeline::pasteClip()
     m_audioTrack->setSelectedClip(insertAt);
     saveUndoState("Paste clip");
     updateInfoLabel();
+}
+
+void Timeline::cutSelectedClip()
+{
+    copySelectedClip();
+    deleteSelectedClip();
+}
+
+void Timeline::unlinkClipGroup(int linkGroup)
+{
+    if (linkGroup <= 0) return;
+    bool changed = false;
+    auto strip = [&](TimelineTrack *t) {
+        if (!t) return;
+        auto clips = t->clips();
+        bool local = false;
+        for (auto &c : clips) {
+            if (c.linkGroup == linkGroup) {
+                c.linkGroup = 0;
+                local = true;
+            }
+        }
+        if (local) {
+            t->setClips(clips);
+            changed = true;
+        }
+    };
+    for (auto *t : m_videoTracks) strip(t);
+    for (auto *t : m_audioTracks) strip(t);
+    if (changed) {
+        saveUndoState("Unlink clip");
+        updateInfoLabel();
+    }
+}
+
+void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QPoint &globalPos)
+{
+    if (!track || clipIndex < 0 || clipIndex >= track->clips().size()) return;
+
+    // Make sure the right-clicked clip is the active selection — NLE users
+    // expect "right click acts on the thing under the cursor".
+    if (!track->isClipSelected(clipIndex))
+        track->setSelectedClip(clipIndex);
+
+    const int linkGroup = track->clips()[clipIndex].linkGroup;
+    QMenu menu;
+    QAction *cutAct = menu.addAction(QStringLiteral("カット"));
+    QAction *copyAct = menu.addAction(QStringLiteral("コピー"));
+    QAction *deleteAct = menu.addAction(QStringLiteral("削除"));
+    menu.addSeparator();
+    QAction *unlinkAct = menu.addAction(QStringLiteral("同期を切る"));
+    unlinkAct->setEnabled(linkGroup > 0);
+
+    QAction *chosen = menu.exec(globalPos);
+    if (!chosen) return;
+    if (chosen == cutAct) cutSelectedClip();
+    else if (chosen == copyAct) copySelectedClip();
+    else if (chosen == deleteAct) deleteSelectedClip();
+    else if (chosen == unlinkAct) unlinkClipGroup(linkGroup);
 }
 
 void Timeline::undo()
@@ -1114,6 +1540,35 @@ bool Timeline::snapEnabled() const {
 void Timeline::zoomIn() { setZoomLevel(m_zoomLevel * 1.25); }
 void Timeline::zoomOut() { setZoomLevel(m_zoomLevel / 1.25); }
 
+void Timeline::captureZoomAnchor()
+{
+    // Record the playhead's current viewport column (or the viewport center
+    // if the playhead is offscreen). setZoomLevel uses this as a fixed
+    // reference point so the playhead doesn't slide sideways while the user
+    // drags the ruler to zoom.
+    if (!m_scrollArea || !m_scrollArea->viewport() || !m_videoTrack) {
+        m_zoomAnchorViewportX = -1;
+        return;
+    }
+    const QScrollBar *hbar = m_scrollArea->horizontalScrollBar();
+    const int scrollX = hbar ? hbar->value() : 0;
+    const int viewportW = m_scrollArea->viewport()->width();
+    if (viewportW <= 0) {
+        m_zoomAnchorViewportX = -1;
+        return;
+    }
+    const int playheadX = m_videoTrack->secondsToX(m_playheadPos);
+    if (playheadX >= scrollX && playheadX <= scrollX + viewportW)
+        m_zoomAnchorViewportX = playheadX - scrollX;
+    else
+        m_zoomAnchorViewportX = viewportW / 2;
+}
+
+void Timeline::clearZoomAnchor()
+{
+    m_zoomAnchorViewportX = -1;
+}
+
 void Timeline::setZoomLevel(double pixelsPerSecond)
 {
     m_zoomLevel = qBound(0.1, pixelsPerSecond, 200.0);
@@ -1121,7 +1576,38 @@ void Timeline::setZoomLevel(double pixelsPerSecond)
     for (auto *t : m_audioTracks) t->setPixelsPerSecond(m_zoomLevel);
     if (m_timeRuler)
         m_timeRuler->setPixelsPerSecond(m_zoomLevel);
-    syncPlayheadOverlay();
+
+    if (m_zoomAnchorViewportX >= 0 && m_scrollArea && m_videoTrack) {
+        // Force the scroll area to refresh its content width synchronously so
+        // the horizontal scrollbar's max is current before setValue(). We
+        // scope the layout activation and LayoutRequest to the scroll area so
+        // it can't ripple into unrelated widgets.
+        if (m_tracksWidget && m_tracksWidget->layout())
+            m_tracksWidget->layout()->activate();
+        if (QWidget *content = m_scrollArea->widget()) {
+            if (content->layout()) content->layout()->activate();
+            content->adjustSize();
+        }
+        QEvent layoutEvt(QEvent::LayoutRequest);
+        QCoreApplication::sendEvent(m_scrollArea, &layoutEvt);
+
+        // IMPORTANT: do NOT read hbar->value() here. The anchor is the
+        // FIXED column captured at drag start; feeding the current (possibly
+        // clamped) scroll value back into the anchor would create a runaway
+        // loop on rapid drag events.
+        if (QScrollBar *hbar = m_scrollArea->horizontalScrollBar()) {
+            const int newPlayheadX = m_videoTrack->secondsToX(m_playheadPos);
+            int target = newPlayheadX - m_zoomAnchorViewportX;
+            if (target < 0) target = 0;
+            hbar->setValue(target);
+        }
+        // Overlay update without auto-scroll (syncPlayheadOverlay would undo
+        // our anchored scroll by re-centering on the playhead).
+        if (m_playheadOverlay)
+            m_playheadOverlay->setPlayheadX(m_videoTrack->secondsToX(m_playheadPos));
+    } else {
+        syncPlayheadOverlay();
+    }
     updateInfoLabel();
 }
 
@@ -1234,6 +1720,9 @@ void Timeline::addAudioFile(const QString &filePath)
     clip.filePath = filePath;
     clip.displayName = QFileInfo(filePath).fileName();
     clip.duration = duration;
+    // Solo audio imports still get a unique linkGroup so they participate
+    // in the selection/drag/delete plumbing; they just have no partner.
+    clip.linkGroup = allocateLinkGroup();
 
     // Add to first audio track (or second if exists for BGM)
     TimelineTrack *target = m_audioTracks.size() > 1 ? m_audioTracks[1] : m_audioTrack;
@@ -1303,23 +1792,133 @@ bool Timeline::eventFilter(QObject *watched, QEvent *event)
 void Timeline::wireTrackSelection(TimelineTrack *track)
 {
     connect(track, &TimelineTrack::selectionChanged, this, [this, track](int index, bool additive) {
+        if (m_inLinkedSelectionSync) return;
+        m_inLinkedSelectionSync = true;
+
+        // Non-additive click clears every OTHER track first so at most one
+        // clip (or one link group) is selected across the whole timeline.
         if (!additive && index >= 0) {
             auto clearOther = [track](TimelineTrack *t) {
                 if (!t || t == track || t->selectedClip() < 0) return;
-                const bool was = t->blockSignals(true);
                 t->setSelectedClip(-1);
-                t->blockSignals(was);
-                t->update();
             };
             for (auto *t : m_videoTracks) clearOther(t);
             for (auto *t : m_audioTracks) clearOther(t);
         }
+
+        // Propagate selection to every clip that shares a non-zero linkGroup
+        // so the linked V/A pair (and anything else the user has grouped)
+        // moves as a unit.
+        if (index >= 0 && index < track->clips().size()) {
+            const int linkGroup = track->clips()[index].linkGroup;
+            if (linkGroup > 0) {
+                auto syncLinked = [linkGroup, additive](TimelineTrack *t) {
+                    if (!t) return;
+                    const auto &clips = t->clips();
+                    for (int i = 0; i < clips.size(); ++i) {
+                        if (clips[i].linkGroup == linkGroup && !t->isClipSelected(i)) {
+                            if (additive) t->toggleClipSelection(i);
+                            else t->setSelectedClip(i);
+                        }
+                    }
+                };
+                for (auto *t : m_videoTracks) if (t != track) syncLinked(t);
+                for (auto *t : m_audioTracks) if (t != track) syncLinked(t);
+            }
+        }
+
+        m_inLinkedSelectionSync = false;
         emit clipSelected(index);
     });
     connect(track, &TimelineTrack::emptyAreaClicked, this, [this]() {
         clearAllSelections();
     });
     connect(track, &TimelineTrack::modified, this, &Timeline::onTrackModified);
+    connect(track, &TimelineTrack::clipContextMenuRequested, this,
+        [this, track](int clipIndex, const QPoint &globalPos) {
+            showClipContextMenu(track, clipIndex, globalPos);
+        });
+    connect(track, &TimelineTrack::linkedDragStarted, this,
+        [this, track](int clipIdx) {
+            captureLinkedDragPartners(track, clipIdx);
+        });
+    connect(track, &TimelineTrack::linkedDragDelta, this,
+        [this](int, double rawDeltaSec) {
+            applyLinkedDragDelta(rawDeltaSec);
+        });
+    connect(track, &TimelineTrack::linkedDragCancelled, this, [this]() {
+        revertLinkedDragPartners();
+        clearLinkedDragState();
+    });
+}
+
+void Timeline::captureLinkedDragPartners(TimelineTrack *source, int clipIdx)
+{
+    clearLinkedDragState();
+    if (!source || clipIdx < 0 || clipIdx >= source->clips().size()) return;
+    const int linkGroup = source->clips()[clipIdx].linkGroup;
+    if (linkGroup <= 0) return;
+    // Include the source clip in the partners list so Timeline is the
+    // single authoritative applier — simpler than splitting the math
+    // between TimelineTrack and Timeline.
+    auto capture = [&](TimelineTrack *t) {
+        if (!t) return;
+        const auto &clips = t->clips();
+        for (int i = 0; i < clips.size(); ++i) {
+            if (clips[i].linkGroup == linkGroup) {
+                LinkedDragPartner p;
+                p.track = t;
+                p.clipIdx = i;
+                p.origLeadIn = clips[i].leadInSec;
+                p.origLeadInNext = (i + 1 < clips.size())
+                    ? clips[i + 1].leadInSec
+                    : -1.0;
+                m_linkedDragPartners.append(p);
+            }
+        }
+    };
+    for (auto *t : m_videoTracks) capture(t);
+    for (auto *t : m_audioTracks) capture(t);
+}
+
+void Timeline::applyLinkedDragDelta(double rawDeltaSec)
+{
+    if (m_linkedDragPartners.isEmpty()) return;
+    // Global clamp: the tightest allowed delta across every partner, so
+    // no partner crosses its own neighbor even when others have more room.
+    double minDelta = -1e18;
+    double maxDelta = 1e18;
+    for (const auto &p : m_linkedDragPartners) {
+        const double lower = -p.origLeadIn;
+        const double upper = (p.origLeadInNext >= 0.0) ? p.origLeadInNext : 1e18;
+        if (lower > minDelta) minDelta = lower;
+        if (upper < maxDelta) maxDelta = upper;
+    }
+    double clamped = rawDeltaSec;
+    if (clamped < minDelta) clamped = minDelta;
+    if (clamped > maxDelta) clamped = maxDelta;
+
+    for (const auto &p : m_linkedDragPartners) {
+        if (!p.track) continue;
+        const double newLeadIn = p.origLeadIn + clamped;
+        const double newNextLeadIn = (p.origLeadInNext >= 0.0)
+            ? p.origLeadInNext - clamped
+            : -1.0;
+        p.track->applyDragMove(p.clipIdx, newLeadIn, newNextLeadIn);
+    }
+}
+
+void Timeline::revertLinkedDragPartners()
+{
+    for (const auto &p : m_linkedDragPartners) {
+        if (!p.track) continue;
+        p.track->applyDragMove(p.clipIdx, p.origLeadIn, p.origLeadInNext);
+    }
+}
+
+void Timeline::clearLinkedDragState()
+{
+    m_linkedDragPartners.clear();
 }
 
 void Timeline::clearAllSelections()
