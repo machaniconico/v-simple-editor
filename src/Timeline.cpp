@@ -1,5 +1,6 @@
 #include "Timeline.h"
 #include "UndoManager.h"
+#include "ProxyManager.h"
 
 // Small strip drawn above the V/A tracks that visualizes each text
 // overlay's time range as a rounded rectangle with the (truncated) overlay
@@ -2749,7 +2750,11 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
     for (const auto &iv : visible) {
         if (iv.timelineEnd - iv.timelineStart < 1e-6) continue;
         PlaybackEntry e;
-        e.filePath = iv.filePath;
+        // Stage 2.7 — route through ProxyManager so playback uses the
+        // pre-transcoded 1080p H.264 proxy when it's Ready. getProxyPath()
+        // returns the original path when no proxy exists yet, so this is
+        // a safe unconditional swap.
+        e.filePath = ProxyManager::instance().getProxyPath(iv.filePath);
         e.clipIn = iv.clipIn;
         e.clipOut = iv.clipOut;
         e.timelineStart = iv.timelineStart;
@@ -2871,7 +2876,11 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
     for (const auto &iv : visible) {
         if (iv.timelineEnd - iv.timelineStart < 1e-6) continue;
         PlaybackEntry e;
-        e.filePath = iv.filePath;
+        // Stage 2.7 — route through ProxyManager so playback uses the
+        // pre-transcoded 1080p H.264 proxy when it's Ready. getProxyPath()
+        // returns the original path when no proxy exists yet, so this is
+        // a safe unconditional swap.
+        e.filePath = ProxyManager::instance().getProxyPath(iv.filePath);
         e.clipIn = iv.clipIn;
         e.clipOut = iv.clipOut;
         e.timelineStart = iv.timelineStart;

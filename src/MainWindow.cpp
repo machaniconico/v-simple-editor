@@ -254,6 +254,23 @@ void MainWindow::setupUI()
         m_player->setAudioSequence(resolved);
     });
 
+    // Stage 2.7 — when a proxy transcode finishes in the background, re-push
+    // the current sequence so VideoPlayer / SecondaryLayer swap the original
+    // path for the Ready proxy without the user having to reload.
+    connect(&ProxyManager::instance(), &ProxyManager::proxyGenerated,
+            this, [this](const QString &original, const QString &proxy) {
+        qInfo() << "MainWindow: proxy ready for" << original
+                << "→" << proxy << "(re-forwarding sequences)";
+        if (!m_timeline || !m_player) return;
+        auto &pm = ProxyManager::instance();
+        auto entries = m_timeline->computePlaybackSequence();
+        auto audio   = m_timeline->computeAudioPlaybackSequence();
+        for (auto &e : entries) e.filePath = pm.getProxyPath(e.filePath);
+        for (auto &e : audio)   e.filePath = pm.getProxyPath(e.filePath);
+        m_player->setSequence(entries);
+        m_player->setAudioSequence(audio);
+    });
+
     // J/K/L keyboard shortcuts for playback
     auto *jKey = new QShortcut(QKeySequence(Qt::Key_J), this);
     connect(jKey, &QShortcut::activated, m_player, &VideoPlayer::speedDown);
@@ -596,6 +613,42 @@ void MainWindow::setupMenuBar()
 
     auto *genProxiesAction = toolsMenu->addAction("プロキシ生成...");
     connect(genProxiesAction, &QAction::triggered, this, &MainWindow::generateProxies);
+
+    // Stage 2.9 — プロキシコーデック切替 (Premiere/DaVinci 式の intermediate codec)
+    auto *codecMenu = toolsMenu->addMenu("プロキシコーデック");
+    auto *codecGroup = new QActionGroup(this);
+    codecGroup->setExclusive(true);
+    auto *h264CodecAct  = codecMenu->addAction("H.264 (高速・NVENC対応)");
+    auto *proresCodecAct = codecMenu->addAction("ProRes LT (編集最適・CPU)");
+    auto *dnxhrCodecAct  = codecMenu->addAction("DNxHR LB (放送品質・CPU)");
+    for (auto *a : { h264CodecAct, proresCodecAct, dnxhrCodecAct }) {
+        a->setCheckable(true);
+        a->setActionGroup(codecGroup);
+    }
+    {
+        QSettings codecPref("VSimpleEditor", "Preferences");
+        const int savedCodec = codecPref.value("proxyCodec", 0).toInt();
+        if      (savedCodec == 1) proresCodecAct->setChecked(true);
+        else if (savedCodec == 2) dnxhrCodecAct->setChecked(true);
+        else                      h264CodecAct->setChecked(true);
+        auto initialCfg = ProxyManager::instance().config();
+        initialCfg.codec = static_cast<ProxyCodec>(qBound(0, savedCodec, 2));
+        ProxyManager::instance().setConfig(initialCfg);
+    }
+    auto applyProxyCodec = [this](int idx, const QString &label) {
+        auto cfg = ProxyManager::instance().config();
+        cfg.codec = static_cast<ProxyCodec>(idx);
+        ProxyManager::instance().setConfig(cfg);
+        QSettings("VSimpleEditor", "Preferences").setValue("proxyCodec", idx);
+        qInfo() << "[PROXY] codec switched to" << idx
+                << "(0=H264, 1=ProResLT, 2=DNxHRLB) — applies to new proxies only";
+        statusBar()->showMessage(
+            "新規プロキシから " + label + " を使用します (既存プロキシは変更なし)",
+            5000);
+    };
+    connect(h264CodecAct,   &QAction::triggered, this, [applyProxyCodec](){ applyProxyCodec(0, "H.264"); });
+    connect(proresCodecAct, &QAction::triggered, this, [applyProxyCodec](){ applyProxyCodec(1, "ProRes LT"); });
+    connect(dnxhrCodecAct,  &QAction::triggered, this, [applyProxyCodec](){ applyProxyCodec(2, "DNxHR LB"); });
 
     auto *renderQueueAction = toolsMenu->addAction("レンダーキュー...");
     renderQueueAction->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_R));
@@ -3300,6 +3353,11 @@ void MainWindow::loadMediaFile(const QString &filePath, bool addToTimeline, cons
         m_timeline->addClip(filePath);
     if (m_recentFilesManager)
         m_recentFilesManager->addFile(filePath);
+
+    // Stage 2.8 — kick off a background proxy transcode so Premiere-style
+    // editing stays responsive even when the source is 4K AV1. The call is
+    // idempotent: ProxyManager skips paths it already has queued / generated.
+    ProxyManager::instance().generateProxy(filePath);
 
     hideWelcomeScreen();
     updateStatusInfo();

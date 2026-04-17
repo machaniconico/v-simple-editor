@@ -131,13 +131,24 @@ void VideoPlayer::setupUI()
     connect(m_glPreview, &GLPreview::textOverlayRectChanged,
             this, &VideoPlayer::textOverlayRectChanged);
     connect(m_glPreview, &GLPreview::videoSourceTransformChanged,
-            this, [this](double scale, double dx, double dy) {
-                // Map back to the current entry's source clip so MainWindow
-                // can persist the new transform to the right ClipInfo.
-                if (m_activeEntry < 0 || m_activeEntry >= m_sequence.size())
-                    return;
-                const auto &entry = m_sequence[m_activeEntry];
-                emit videoSourceTransformChanged(entry.sourceTrack, entry.sourceClipIndex,
+            this, [this](int sourceTrack, double scale, double dx, double dy) {
+                // Stage 2 PiP — route the drag back to the owning ClipInfo
+                // based on which sourceTrack GLPreview was editing. V1
+                // uses the primary m_sequence; V2+ uses m_secondarySequence
+                // at the current timeline position.
+                int clipIdx = -1;
+                if (sourceTrack == 0) {
+                    if (m_activeEntry < 0 || m_activeEntry >= m_sequence.size())
+                        return;
+                    clipIdx = m_sequence[m_activeEntry].sourceClipIndex;
+                } else {
+                    const int idx = findSecondaryEntryAt(m_timelinePositionUs);
+                    if (idx < 0) return;
+                    const auto &entry = m_secondarySequence[idx];
+                    if (entry.sourceTrack != sourceTrack) return;
+                    clipIdx = entry.sourceClipIndex;
+                }
+                emit videoSourceTransformChanged(sourceTrack, clipIdx,
                                                  scale, dx, dy);
             });
 
@@ -409,16 +420,82 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
 {
     qInfo() << "VideoPlayer::setSequence count=" << entries.size();
 
-    // PiP staging shim (Stage 1): Timeline now emits every track's entries
-    // without mutual subtraction, but VideoPlayer still drives a single
-    // decoder. Drop V2+ entries so findActiveEntryAt / advanceToEntry stay
-    // monotonic in timelineStart. The multi-layer compositor (Stage 2+) will
-    // replace this with per-sourceTrack LayerDecoders and this filter is
-    // removed at that time.
+    // Stage 2 MVP: primary (V1, sourceTrack==0) drives the main HW decoder.
+    // Secondary (the smallest non-zero sourceTrack present, typically V2) runs
+    // through a parallel software decoder in SecondaryLayer. Higher V3+ tracks
+    // are dropped in the MVP until Stage 3 generalises this to N layers.
     QVector<PlaybackEntry> primary;
     primary.reserve(entries.size());
+    int secondaryTrack = -1;
     for (const auto &e : entries) {
-        if (e.sourceTrack == 0) primary.append(e);
+        if (e.sourceTrack == 0) {
+            primary.append(e);
+        } else if (secondaryTrack < 0 || e.sourceTrack < secondaryTrack) {
+            secondaryTrack = e.sourceTrack;
+        }
+    }
+    QVector<PlaybackEntry> secondary;
+    if (secondaryTrack > 0) {
+        secondary.reserve(entries.size());
+        for (const auto &e : entries) {
+            if (e.sourceTrack == secondaryTrack) secondary.append(e);
+        }
+    }
+    // Stage 2.6 — Timeline emits sequenceChanged many times per second on
+    // UI interactions, but the secondary clip list usually doesn't actually
+    // change. Skip the expensive reset/alloc/seed when it's structurally
+    // identical so SecondaryLayer's decoder keeps advancing in lockstep
+    // instead of being seek-reset on every signal.
+    auto secondarySequencesEqual = [](const QVector<PlaybackEntry> &a,
+                                      const QVector<PlaybackEntry> &b) -> bool {
+        if (a.size() != b.size()) return false;
+        for (int i = 0; i < a.size(); ++i) {
+            const auto &x = a[i]; const auto &y = b[i];
+            if (x.filePath        != y.filePath)        return false;
+            if (x.timelineStart   != y.timelineStart)   return false;
+            if (x.timelineEnd     != y.timelineEnd)     return false;
+            if (x.clipIn          != y.clipIn)          return false;
+            if (x.clipOut         != y.clipOut)         return false;
+            if (x.sourceTrack     != y.sourceTrack)     return false;
+            if (x.sourceClipIndex != y.sourceClipIndex) return false;
+        }
+        return true;
+    };
+    const bool secondaryStructurallyChanged =
+        !secondarySequencesEqual(m_secondarySequence, secondary);
+
+    qInfo() << "[PIP] setSequence split: primary=" << primary.size()
+            << "secondary=" << secondary.size()
+            << "secondaryTrack=" << secondaryTrack
+            << "structurallyChanged=" << secondaryStructurallyChanged;
+
+    if (secondaryStructurallyChanged) {
+        m_secondarySequence    = secondary;
+        m_activeSecondaryEntry = -1;
+        m_lastSecondaryImage   = QImage();
+        if (secondary.isEmpty()) {
+            if (m_secondaryLayer) {
+                m_secondaryLayer.reset();
+                qInfo() << "  secondary layer freed (no V2+ clips)";
+            }
+        } else if (!m_secondaryLayer) {
+            m_secondaryLayer = std::make_unique<SecondaryLayer>();
+            qInfo() << "  secondary layer allocated for sourceTrack=" << secondaryTrack;
+        }
+        // Default drag target: V1 (front). Stage 4 will switch this in
+        // response to Timeline clip selection so users can still edit V2's
+        // transform by clicking its timeline clip.
+        if (m_glPreview) {
+            m_glPreview->setActiveTransformLayer(0);
+            // Seed GLPreview's live m_videoSource* with V1's stored
+            // transform so the next OBS-style drag snapshots V1 (the
+            // front layer), matching the default active layer.
+            if (!primary.isEmpty()) {
+                const auto &e = primary.first();
+                m_glPreview->setVideoSourceTransform(
+                    e.videoScale > 0.0 ? e.videoScale : 1.0, e.videoDx, e.videoDy);
+            }
+        }
     }
 
     // Compute total duration in microseconds from the full (multi-track) set
@@ -432,16 +509,38 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
     m_sequence = primary;
     m_sequenceDurationUs = totalUs;
 
-    // V1-empty-but-V2+-populated case can only happen once the PiP
-    // compositor lands. Until then, treat it as "no primary stream" and
-    // leave the slider range intact so the user still sees V2's span.
+    // V1-empty-but-V2+-populated case: V1 track is hidden (or empty) but
+    // V2 still has clips. Clear the GLPreview surface so the last-seen V1
+    // frame doesn't linger on top, then attempt to render V2 alone via
+    // the secondary layer. Full V2-solo playback (tick + audio sync) is
+    // still a Stage 3 item; this branch at least honours the V1 hide
+    // toggle visually.
     if (!entries.isEmpty() && primary.isEmpty()) {
         m_activeEntry = -1;
         m_timelinePositionUs = qBound<int64_t>(0, m_timelinePositionUs, m_sequenceDurationUs);
         if (m_playing) pause();
         applySequenceSliderRange();
         emit durationChanged(static_cast<double>(m_sequenceDurationUs) / AV_TIME_BASE);
-        if (m_glPreview) m_glPreview->resetVideoSourceTransform();
+        if (m_glPreview) {
+            m_glPreview->resetVideoSourceTransform();
+            // Decode a secondary frame at the current timeline point and
+            // present it as the sole layer. If V2 can't be opened the
+            // preview just goes black — better UX than a stuck V1.
+            refreshSecondaryForTimeline(m_timelinePositionUs, /*isSeek=*/true);
+            QVector<GLPreview::LayerFrame> layers;
+            if (m_activeSecondaryEntry >= 0 && !m_lastSecondaryImage.isNull()) {
+                GLPreview::LayerFrame lf;
+                lf.image       = m_lastSecondaryImage;
+                lf.scale       = m_lastSecondaryScale;
+                lf.dx          = m_lastSecondaryDx;
+                lf.dy          = m_lastSecondaryDy;
+                lf.opacity     = m_lastSecondaryOpacity;
+                lf.sourceTrack = m_lastSecondarySourceTrack;
+                lf.aspectRatio = m_lastSecondaryAspect;
+                layers.append(lf);
+            }
+            m_glPreview->setLayers(layers);
+        }
         return;
     }
 
@@ -1004,6 +1103,151 @@ void VideoPlayer::updatePlayButton()
     if (m_stopButton)  m_stopButton->setEnabled(true);
 }
 
+int VideoPlayer::findSecondaryEntryAt(int64_t timelineUs) const
+{
+    if (m_secondarySequence.isEmpty()) return -1;
+    const double tSec = static_cast<double>(timelineUs) / AV_TIME_BASE;
+    for (int i = 0; i < m_secondarySequence.size(); ++i) {
+        const auto &e = m_secondarySequence[i];
+        if (tSec >= e.timelineStart && tSec < e.timelineEnd)
+            return i;
+    }
+    return -1;
+}
+
+void VideoPlayer::refreshSecondaryForTimeline(int64_t timelineUs, bool isSeek)
+{
+    if (!m_secondaryLayer) return;
+
+    const int idx = findSecondaryEntryAt(timelineUs);
+    if (idx < 0) {
+        // No V2+ clip overlaps this timeline point. Retain the last image
+        // so we can fade-in smoothly, but mark the entry as inactive so
+        // pushLayersToPreview omits the secondary layer.
+        static int noMatchCount = 0;
+        if (++noMatchCount <= 3)
+            qInfo() << "[PIP] refreshSecondary: no match at us=" << timelineUs
+                    << "secSize=" << m_secondarySequence.size();
+        m_activeSecondaryEntry = -1;
+        return;
+    }
+
+    const PlaybackEntry &entry = m_secondarySequence[idx];
+    m_lastSecondaryScale       = entry.videoScale > 0.0 ? entry.videoScale : 1.0;
+    m_lastSecondaryDx          = entry.videoDx;
+    m_lastSecondaryDy          = entry.videoDy;
+    m_lastSecondaryOpacity     = (entry.opacity > 0.0) ? entry.opacity : 1.0;
+    m_lastSecondarySourceTrack = entry.sourceTrack;
+
+    const bool entryChanged = (idx != m_activeSecondaryEntry);
+    const bool fileChanged  = (m_secondaryLayer->currentFilePath() != entry.filePath);
+    const bool needsOpen    = fileChanged;
+    const bool needsSeek    = entryChanged || isSeek;
+
+    if (needsOpen) {
+        qInfo() << "[PIP] opening secondary file" << entry.filePath
+                << "sharedHw=" << (m_hwDeviceCtx != nullptr);
+        // Stage 2.7 — lend our D3D11VA device context so the secondary layer
+        // gets HW decode too. If HW init fails it silently falls back to SW.
+        if (!m_secondaryLayer->open(entry.filePath, m_hwDeviceCtx)) {
+            qWarning() << "[PIP] SecondaryLayer::open FAILED for" << entry.filePath;
+            m_activeSecondaryEntry = -1;
+            m_lastSecondaryImage = QImage();
+            return;
+        }
+        m_lastSecondaryAspect = m_secondaryLayer->aspectRatio();
+        qInfo() << "[PIP] secondary opened OK"
+                << "size=" << m_secondaryLayer->width() << "x" << m_secondaryLayer->height()
+                << "aspect=" << m_lastSecondaryAspect;
+    }
+
+    const double tSec       = static_cast<double>(timelineUs) / AV_TIME_BASE;
+    const double secLocalSec = entry.clipIn + (tSec - entry.timelineStart) * entry.speed;
+    const int64_t secLocalUs = static_cast<int64_t>(qMax(0.0, secLocalSec) * AV_TIME_BASE);
+
+    static int refreshTickCount = 0;
+    const int myTick = ++refreshTickCount;
+    const bool logThis = (myTick <= 10 || (myTick % 30) == 0);
+    if (needsOpen || needsSeek) {
+        if (logThis)
+            qInfo() << "[PIP] tick#" << myTick << "SEEK secLocalUs=" << secLocalUs
+                    << "needsOpen=" << needsOpen << "needsSeek=" << needsSeek
+                    << "isSeek=" << isSeek << "entryChanged=" << entryChanged;
+        // precise=true decodes forward until PTS >= target so V2 lands at the
+        // actual requested file-local microsecond instead of the nearest
+        // earlier keyframe (non-precise always bottomed out at PTS=0).
+        m_secondaryLayer->seekToFileUs(secLocalUs, /*precise=*/true);
+    } else {
+        // In-lockstep advance — one decodeNextFrame per primary tick keeps
+        // V2 in sync. When the primary ran ahead (e.g. setSequence churn
+        // skipped many ticks), fall back to a precise seek so V2 catches up
+        // instead of being re-stranded on the nearest earlier keyframe.
+        const int64_t lastPts = m_secondaryLayer->lastPtsUs();
+        const int64_t targetFileLocalUs = secLocalUs;
+        const int64_t drift  = targetFileLocalUs - lastPts;
+        const bool driftReseek = (drift > 100000 || drift < -50000);
+        if (logThis)
+            qInfo() << "[PIP] tick#" << myTick
+                    << (driftReseek ? "RESEEK" : "DECODE")
+                    << "target=" << secLocalUs << "lastPts=" << lastPts
+                    << "drift=" << drift;
+        if (driftReseek) {
+            m_secondaryLayer->seekToFileUs(targetFileLocalUs, /*precise=*/true);
+        } else {
+            m_secondaryLayer->decodeNextFrame();
+        }
+    }
+
+    m_lastSecondaryImage  = m_secondaryLayer->lastImage();
+    m_lastSecondaryAspect = m_secondaryLayer->aspectRatio();
+    m_activeSecondaryEntry = idx;
+}
+
+void VideoPlayer::pushLayersToPreview(const QImage &primary)
+{
+    if (!m_useGL || !m_glPreview) return;
+
+    QVector<GLPreview::LayerFrame> layers;
+    layers.reserve(2);
+
+    GLPreview::LayerFrame primaryLayer;
+    primaryLayer.image       = primary;
+    primaryLayer.sourceTrack = 0;
+    primaryLayer.aspectRatio = effectiveDisplayAspectRatio();
+    if (m_activeEntry >= 0 && m_activeEntry < m_sequence.size()) {
+        const auto &entry  = m_sequence[m_activeEntry];
+        primaryLayer.scale   = entry.videoScale > 0.0 ? entry.videoScale : 1.0;
+        primaryLayer.dx      = entry.videoDx;
+        primaryLayer.dy      = entry.videoDy;
+        primaryLayer.opacity = (entry.opacity > 0.0) ? entry.opacity : 1.0;
+    } else {
+        primaryLayer.opacity = 1.0;
+    }
+    layers.append(primaryLayer);
+
+    if (m_activeSecondaryEntry >= 0 && !m_lastSecondaryImage.isNull()) {
+        GLPreview::LayerFrame secondaryLayer;
+        secondaryLayer.image       = m_lastSecondaryImage;
+        secondaryLayer.scale       = m_lastSecondaryScale;
+        secondaryLayer.dx          = m_lastSecondaryDx;
+        secondaryLayer.dy          = m_lastSecondaryDy;
+        secondaryLayer.opacity     = m_lastSecondaryOpacity;
+        secondaryLayer.sourceTrack = m_lastSecondarySourceTrack;
+        secondaryLayer.aspectRatio = m_lastSecondaryAspect;
+        layers.append(secondaryLayer);
+    }
+
+    static int pushCount = 0;
+    if (++pushCount <= 10 || (pushCount % 300) == 0) {
+        qInfo() << "[PIP] pushLayersToPreview #" << pushCount
+                << "layers=" << layers.size()
+                << "secActive=" << m_activeSecondaryEntry
+                << "secImgNull=" << m_lastSecondaryImage.isNull();
+    }
+
+    m_glPreview->setLayers(layers);
+}
+
 void VideoPlayer::displayFrame(const QImage &image)
 {
     m_lastSourceFrame = image;
@@ -1017,7 +1261,23 @@ void VideoPlayer::displayFrame(const QImage &image)
             else if (m_hdrInfo.trc == AVCOL_TRC_ARIB_STD_B67) hdrTransfer = 2;
         }
         m_glPreview->setHdrTransfer(hdrTransfer);
-        m_glPreview->displayFrame(composed);
+
+        // Stage 2 PiP — keep the secondary layer in lockstep with the
+        // primary tick before composing the layer list. `m_seekInProgress`
+        // captures explicit seeks; the initial frame after a setSequence
+        // also counts because m_activeSecondaryEntry will still be -1 and
+        // refreshSecondaryForTimeline takes the entry-changed branch.
+        //
+        // Compute the freshest timeline microsecond available — presentDecodedFrame
+        // has already updated m_currentPositionUs, but m_timelinePositionUs is
+        // only refreshed later in updatePositionUi(). Using the stale value
+        // made the secondary layer's drift logic seek back every tick.
+        int64_t freshTimelineUs = m_timelinePositionUs;
+        if (sequenceActive() && m_activeEntry >= 0 && m_activeEntry < m_sequence.size()) {
+            freshTimelineUs = fileLocalToTimelineUs(m_activeEntry, m_currentPositionUs);
+        }
+        refreshSecondaryForTimeline(freshTimelineUs, m_seekInProgress);
+        pushLayersToPreview(composed);
     } else {
         const QSize targetSize = fittedDisplaySize(m_videoDisplay->size());
         const QPixmap pixmap = QPixmap::fromImage(composed);

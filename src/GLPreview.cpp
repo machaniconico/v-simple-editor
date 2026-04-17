@@ -1,7 +1,9 @@
 #include "GLPreview.h"
+#include <algorithm>
 #include <cmath>
 #include <QtGlobal>
 #include <QDateTime>
+#include <QHash>
 #include <QVector2D>
 #include <QOpenGLContext>
 #include <QDebug>
@@ -57,6 +59,10 @@ uniform bool uLutEnabled;
 
 // 0=sRGB, 1=PQ, 2=HLG. Non-zero applies inverse EOTF + Hable tone map before grading.
 uniform int uHdrTransfer;
+
+// Stage 2 PiP — per-layer opacity multiplied into alpha for straight-alpha
+// blend (GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA). 1.0 preserves legacy output.
+uniform float uOpacity;
 
 // GPU Video Effects — run after CC. Sharpen/Mosaic/ChromaKey stay CPU.
 uniform bool  uFxBlurEnable;
@@ -294,7 +300,7 @@ void main() {
     if (uFxVignetteEnable) color = fxApplyVignette(color, vTexCoord);
     if (uFxNoiseEnable)    color = fxApplyNoise(color, vTexCoord);
 
-    FragColor = vec4(clamp(color, 0.0, 1.0), texColor.a);
+    FragColor = vec4(clamp(color, 0.0, 1.0), texColor.a * uOpacity);
 }
 )";
 
@@ -319,7 +325,9 @@ GLPreview::~GLPreview()
     } else {
         // Context already gone — clear raw pointers to skip double-free, but don't
         // touch GL state.
-        m_texture = nullptr;
+        for (auto &layer : m_layers) layer.texture = nullptr;
+        m_layers.clear();
+        m_pendingTextureDeletes.clear();
         m_program = nullptr;
     }
 }
@@ -334,10 +342,17 @@ void GLPreview::cleanupGL()
         delete m_lutTexture;
         m_lutTexture = nullptr;
     }
-    if (m_texture) {
-        delete m_texture;
-        m_texture = nullptr;
+    for (auto *t : m_pendingTextureDeletes) {
+        delete t;
     }
+    m_pendingTextureDeletes.clear();
+    for (auto &layer : m_layers) {
+        if (layer.texture) {
+            delete layer.texture;
+            layer.texture = nullptr;
+        }
+    }
+    m_layers.clear();
     if (m_program) {
         delete m_program;
         m_program = nullptr;
@@ -436,6 +451,7 @@ void GLPreview::createShaderProgram()
     m_locFxVignetteIntensity = m_program->uniformLocation("uFxVignetteIntensity");
     m_locFxVignetteRadius    = m_program->uniformLocation("uFxVignetteRadius");
     m_locFxTime              = m_program->uniformLocation("uFxTime");
+    m_locOpacity             = m_program->uniformLocation("uOpacity");
 
     // Lift/Gamma/Gain
     m_locLiftR  = m_program->uniformLocation("uLiftR");
@@ -465,18 +481,105 @@ void GLPreview::displayFrame(const QImage &frame)
         qWarning() << "GLPreview::displayFrame called with null image";
         return;
     }
-    const bool is16 = (frame.format() == QImage::Format_RGBA64
-                       || frame.format() == QImage::Format_RGBA64_Premultiplied);
-    m_currentFrame = frame.convertToFormat(is16 ? QImage::Format_RGBA64
-                                                : QImage::Format_RGBA8888);
-    if (m_currentFrame.isNull()) {
-        qWarning() << "GLPreview: convertToFormat returned null";
-        return;
+    // Stage 2 PiP — legacy single-frame entry reuses the multi-layer path.
+    // The OBS-style live transform (m_videoSource*) is treated as the
+    // foreground layer's transform so existing behavior is identical when
+    // only one layer is in use.
+    LayerFrame lf;
+    lf.image       = frame;
+    lf.scale       = m_videoSourceScale;
+    lf.dx          = m_videoSourceDx;
+    lf.dy          = m_videoSourceDy;
+    lf.opacity     = 1.0;
+    lf.sourceTrack = 0;
+    lf.aspectRatio = (m_displayAspectRatio > 0.0) ? m_displayAspectRatio : 0.0;
+    QVector<LayerFrame> v;
+    v.append(lf);
+    setLayers(v);
+}
+
+void GLPreview::setLayers(const QVector<LayerFrame> &frames)
+{
+    // Reuse existing GLLayer textures keyed by sourceTrack so we don't
+    // thrash GPU allocations between frames. Un-matched textures are
+    // deferred for deletion until the next paintGL when the GL context
+    // is guaranteed current.
+    QHash<int, int> existingBySource;
+    existingBySource.reserve(m_layers.size());
+    for (int i = 0; i < m_layers.size(); ++i)
+        existingBySource.insert(m_layers[i].sourceTrack, i);
+
+    QVector<bool> reused(m_layers.size(), false);
+    QVector<GLLayer> newLayers;
+    newLayers.reserve(frames.size());
+
+    for (const LayerFrame &lf : frames) {
+        if (lf.image.isNull()) continue;
+        GLLayer layer;
+        const bool is16 = (lf.image.format() == QImage::Format_RGBA64
+                           || lf.image.format() == QImage::Format_RGBA64_Premultiplied);
+        layer.image = lf.image.convertToFormat(is16 ? QImage::Format_RGBA64
+                                                   : QImage::Format_RGBA8888);
+        if (layer.image.isNull()) {
+            qWarning() << "GLPreview::setLayers: convertToFormat returned null";
+            continue;
+        }
+        layer.needsUpload = true;
+        layer.scale       = lf.scale;
+        layer.dx          = lf.dx;
+        layer.dy          = lf.dy;
+        layer.opacity     = qBound(0.0, lf.opacity, 1.0);
+        layer.sourceTrack = lf.sourceTrack;
+        layer.aspectRatio = (lf.aspectRatio > 0.0 && std::isfinite(lf.aspectRatio))
+            ? lf.aspectRatio
+            : (layer.image.height() > 0
+                   ? static_cast<double>(layer.image.width()) / layer.image.height()
+                   : 1.0);
+
+        auto it = existingBySource.find(lf.sourceTrack);
+        if (it != existingBySource.end()) {
+            const int idx = it.value();
+            layer.texture       = m_layers[idx].texture;
+            layer.textureFormat = m_layers[idx].textureFormat;
+            m_layers[idx].texture = nullptr;
+            reused[idx] = true;
+        }
+
+        newLayers.append(std::move(layer));
     }
-    if (m_displayAspectRatio <= 0.0 && m_currentFrame.height() > 0)
-        m_displayAspectRatio = static_cast<double>(m_currentFrame.width()) / m_currentFrame.height();
-    m_needsUpload = true;
+
+    for (int i = 0; i < m_layers.size(); ++i) {
+        if (!reused[i] && m_layers[i].texture) {
+            m_pendingTextureDeletes.append(m_layers[i].texture);
+            m_layers[i].texture = nullptr;
+        }
+    }
+
+    m_layers = std::move(newLayers);
+
+    // Keep the legacy single-aspect member in sync with the first layer so
+    // letterboxRect() and canvasFrameRect() callers see a consistent value.
+    if (!m_layers.isEmpty() && m_layers.first().aspectRatio > 0.0)
+        m_displayAspectRatio = m_layers.first().aspectRatio;
+
     update();
+}
+
+void GLPreview::setActiveTransformLayer(int sourceTrack)
+{
+    if (m_activeTransformLayer == sourceTrack) return;
+    m_activeTransformLayer = sourceTrack;
+    update();
+}
+
+int GLPreview::activeTrackForEmit() const
+{
+    if (m_activeTransformLayer >= 0) return m_activeTransformLayer;
+    if (m_layers.isEmpty()) return 0;
+    int highest = m_layers.first().sourceTrack;
+    for (const auto &l : m_layers)
+        if (l.sourceTrack > highest) highest = l.sourceTrack;
+    return highest;
 }
 
 void GLPreview::setDisplayAspectRatio(double aspectRatio)
@@ -513,13 +616,20 @@ void GLPreview::paintGL()
         qInfo() << "GLPreview::paintGL #" << paintCount
                 << "widget(logical)=" << width() << "x" << height()
                 << "dpr=" << devicePixelRatioF()
-                << "frame=" << m_currentFrame.width() << "x" << m_currentFrame.height()
-                << "upload=" << m_needsUpload;
+                << "layers=" << m_layers.size();
     }
 
     glClear(GL_COLOR_BUFFER_BIT);
 
-    if (m_currentFrame.isNull()) return;
+    // Drain any textures retired by setLayers. Only safe now that the GL
+    // context is current — setLayers() can be called from any thread that
+    // ultimately owns the decoded frames.
+    if (!m_pendingTextureDeletes.isEmpty()) {
+        for (auto *t : m_pendingTextureDeletes) delete t;
+        m_pendingTextureDeletes.clear();
+    }
+
+    if (m_layers.isEmpty() || !m_program) return;
 
     // glViewport expects PHYSICAL pixels, but QWidget::width()/height() are
     // LOGICAL (device-independent) pixels. On a high-DPI display with DPR=1.5
@@ -528,109 +638,40 @@ void GLPreview::paintGL()
     const qreal dpr = devicePixelRatioF();
     const int physW = qMax(1, qRound(width() * dpr));
     const int physH = qMax(1, qRound(height() * dpr));
-
-    const double frameAspect =
-        (m_displayAspectRatio > 0.0 && std::isfinite(m_displayAspectRatio))
-            ? m_displayAspectRatio
-            : ((m_currentFrame.height() > 0)
-                   ? static_cast<double>(m_currentFrame.width()) / m_currentFrame.height()
-                   : 1.0);
     const double widgetAspect =
-        (physH > 0) ? static_cast<double>(physW) / physH : frameAspect;
+        (physH > 0) ? static_cast<double>(physW) / physH : 1.0;
 
-    int viewportX = 0;
-    int viewportY = 0;
-    int viewportW = physW;
-    int viewportH = physH;
+    // Stage 2 PiP — sort by sourceTrack DESC so V2+ (behind) draws first and
+    // V1 (sourceTrack=0, upper track in UI) draws last on top as the PiP
+    // overlay. Matches Premiere/DaVinci/Final Cut conventions where the
+    // UPPER track is the FOREGROUND. The user scales V1 via the OBS drag
+    // handles to reveal V2 behind.
+    QVector<int> drawOrder;
+    drawOrder.reserve(m_layers.size());
+    for (int i = 0; i < m_layers.size(); ++i) drawOrder.append(i);
+    std::sort(drawOrder.begin(), drawOrder.end(), [this](int a, int b) {
+        return m_layers[a].sourceTrack > m_layers[b].sourceTrack;
+    });
 
-    if (frameAspect > 0.0 && widgetAspect > 0.0) {
-        if (widgetAspect > frameAspect) {
-            viewportW = qMax(1, qRound(physH * frameAspect));
-            viewportX = (physW - viewportW) / 2;
-        } else {
-            viewportH = qMax(1, qRound(physW / frameAspect));
-            viewportY = (physH - viewportH) / 2;
-        }
+    // Which layer receives the live OBS-drag transform? -1 means "highest
+    // sourceTrack present" so PiP overlays are targeted by default. For the
+    // legacy single-layer path this resolves to that sole layer.
+    int activeTrack = m_activeTransformLayer;
+    if (activeTrack < 0 || m_layers.size() == 1) {
+        activeTrack = m_layers.first().sourceTrack;
+        for (const auto &l : m_layers)
+            if (l.sourceTrack > activeTrack) activeTrack = l.sourceTrack;
     }
-
-    // US-T34 OBS-style source transform — shrink/move the viewport so the
-    // same texture renders inside a translated+scaled sub-rect of the
-    // letterbox. OpenGL's Y axis is bottom-up, so dy is inverted.
-    if (m_videoSourceScale != 1.0 || m_videoSourceDx != 0.0 || m_videoSourceDy != 0.0) {
-        const int baseW = viewportW;
-        const int baseH = viewportH;
-        const int newW = qMax(1, qRound(baseW * m_videoSourceScale));
-        const int newH = qMax(1, qRound(baseH * m_videoSourceScale));
-        const int baseCx = viewportX + baseW / 2;
-        const int baseCy = viewportY + baseH / 2;
-        const int offsetPxX = qRound(m_videoSourceDx * baseW);
-        const int offsetPxY = qRound(m_videoSourceDy * baseH);
-        viewportX = baseCx + offsetPxX - newW / 2;
-        viewportY = baseCy - offsetPxY - newH / 2;
-        viewportW = newW;
-        viewportH = newH;
-    }
-
-    // Upload texture if new frame.
-    //
-    // Re-use a single QOpenGLTexture across frames — allocating a new texture
-    // per frame (~8 MB for 1080p RGBA) thrashes driver memory and has been
-    // observed to crash Intel/AMD drivers after a few hundred frames.
-    if (m_needsUpload) {
-        const int fw = m_currentFrame.width();
-        const int fh = m_currentFrame.height();
-        if (fw <= 0 || fh <= 0) {
-            m_needsUpload = false;
-            return;
-        }
-
-        const QImage::Format frameFmt = m_currentFrame.format();
-        const bool is16 = (frameFmt == QImage::Format_RGBA64
-                           || frameFmt == QImage::Format_RGBA64_Premultiplied);
-
-        const bool sizeChanged = !m_texture
-            || m_texture->width() != fw
-            || m_texture->height() != fh
-            || m_textureFormat != frameFmt;
-
-        if (sizeChanged) {
-            if (m_texture) {
-                delete m_texture;
-                m_texture = nullptr;
-            }
-            m_texture = new QOpenGLTexture(QOpenGLTexture::Target2D);
-            m_texture->setSize(fw, fh);
-            m_texture->setFormat(is16 ? QOpenGLTexture::RGBA16_UNorm
-                                      : QOpenGLTexture::RGBA8_UNorm);
-            m_texture->setMinificationFilter(QOpenGLTexture::Linear);
-            m_texture->setMagnificationFilter(QOpenGLTexture::Linear);
-            m_texture->setWrapMode(QOpenGLTexture::ClampToEdge);
-            m_texture->allocateStorage(QOpenGLTexture::RGBA,
-                                       is16 ? QOpenGLTexture::UInt16
-                                            : QOpenGLTexture::UInt8);
-            m_textureFormat = frameFmt;
-        }
-
-        // Upload pixel data into the already-allocated texture.
-        m_texture->setData(0, 0,
-                           QOpenGLTexture::RGBA,
-                           is16 ? QOpenGLTexture::UInt16 : QOpenGLTexture::UInt8,
-                           static_cast<const void*>(m_currentFrame.constBits()));
-        m_needsUpload = false;
-    }
-
-    if (!m_texture || !m_program) return;
 
     m_program->bind();
-    m_texture->bind();
-    glViewport(viewportX, viewportY, viewportW, viewportH);
 
-    // Set uniforms
+    // Project-scope uniforms (color correction / effects / LUT / HDR) apply
+    // uniformly to every layer in the MVP. Stage 3 will make effects and
+    // color grading per-layer; for now they carry the V1 meaning.
     m_program->setUniformValue(m_locTexture, 0);
     m_program->setUniformValue(m_locEffectsEnabled, m_effectsEnabled);
     m_program->setUniformValue(m_locHdrTransfer, m_hdrTransfer);
 
-    // Seed every Fx uniform to off/zero; enable only those found in m_videoEffects.
     bool  fxBlur = false, fxNoise = false, fxSepia = false;
     bool  fxGray = false, fxInvert = false, fxVignette = false;
     float fxBlurR = 0.0f, fxNoiseA = 0.0f, fxSepiaS = 0.0f;
@@ -665,14 +706,11 @@ void GLPreview::paintGL()
             fxVigR = static_cast<float>(qBound(0.0, e.param2, 1.0));
             break;
         default:
-            break; // Sharpen/Mosaic/ChromaKey stay on the CPU fallback path.
+            break;
         }
     }
     m_program->setUniformValue(m_locFxBlurEnable, fxBlur);
     m_program->setUniformValue(m_locFxBlurRadius, fxBlurR);
-    m_program->setUniformValue(m_locFxTexSize,
-        QVector2D(m_texture ? static_cast<float>(m_texture->width())  : 1.0f,
-                  m_texture ? static_cast<float>(m_texture->height()) : 1.0f));
     m_program->setUniformValue(m_locFxNoiseEnable, fxNoise);
     m_program->setUniformValue(m_locFxNoiseAmount, fxNoiseA);
     m_program->setUniformValue(m_locFxSepiaEnable, fxSepia);
@@ -696,8 +734,6 @@ void GLPreview::paintGL()
     m_program->setUniformValue(m_locHighlights,  static_cast<float>(m_cc.highlights));
     m_program->setUniformValue(m_locShadows,     static_cast<float>(m_cc.shadows));
     m_program->setUniformValue(m_locExposure,    static_cast<float>(m_cc.exposure));
-
-    // Lift/Gamma/Gain
     m_program->setUniformValue(m_locLiftR,  static_cast<float>(m_cc.liftR));
     m_program->setUniformValue(m_locLiftG,  static_cast<float>(m_cc.liftG));
     m_program->setUniformValue(m_locLiftB,  static_cast<float>(m_cc.liftB));
@@ -707,19 +743,120 @@ void GLPreview::paintGL()
     m_program->setUniformValue(m_locGainR,  static_cast<float>(m_cc.gainR));
     m_program->setUniformValue(m_locGainG,  static_cast<float>(m_cc.gainG));
     m_program->setUniformValue(m_locGainB,  static_cast<float>(m_cc.gainB));
-
-    // LUT
     m_program->setUniformValue(m_locLutEnabled, m_lutEnabled);
     m_program->setUniformValue(m_locLutIntensity, m_lutIntensity);
     if (m_lutEnabled && m_lutTexture) {
         glActiveTexture(GL_TEXTURE1);
         m_lutTexture->bind();
         m_program->setUniformValue(m_locLut3D, 1);
+        glActiveTexture(GL_TEXTURE0);
     }
 
-    // Draw quad
+    // Straight-alpha blending for multi-layer compositing. Qt converts frames
+    // to Format_RGBA8888 / Format_RGBA64 (non-premultiplied) in setLayers, so
+    // this matches.
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
     m_vao.bind();
-    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    for (int idx : drawOrder) {
+        GLLayer &layer = m_layers[idx];
+
+        // Per-layer letterbox viewport based on this layer's own aspect.
+        const double frameAspect = (layer.aspectRatio > 0.0 && std::isfinite(layer.aspectRatio))
+            ? layer.aspectRatio
+            : (layer.image.height() > 0
+                   ? static_cast<double>(layer.image.width()) / layer.image.height()
+                   : 1.0);
+        int viewportX = 0;
+        int viewportY = 0;
+        int viewportW = physW;
+        int viewportH = physH;
+        if (frameAspect > 0.0 && widgetAspect > 0.0) {
+            if (widgetAspect > frameAspect) {
+                viewportW = qMax(1, qRound(physH * frameAspect));
+                viewportX = (physW - viewportW) / 2;
+            } else {
+                viewportH = qMax(1, qRound(physW / frameAspect));
+                viewportY = (physH - viewportH) / 2;
+            }
+        }
+
+        // The layer whose sourceTrack matches the active transform slot
+        // reads live m_videoSource* so OBS-drag updates feel frame-accurate
+        // without waiting for the next decoded frame. Other layers use
+        // whatever the caller stored in the LayerFrame.
+        const bool isActive = (layer.sourceTrack == activeTrack);
+        const double layerScale = isActive ? m_videoSourceScale : layer.scale;
+        const double layerDx    = isActive ? m_videoSourceDx    : layer.dx;
+        const double layerDy    = isActive ? m_videoSourceDy    : layer.dy;
+        if (layerScale != 1.0 || layerDx != 0.0 || layerDy != 0.0) {
+            const int baseW = viewportW;
+            const int baseH = viewportH;
+            const int newW = qMax(1, qRound(baseW * layerScale));
+            const int newH = qMax(1, qRound(baseH * layerScale));
+            const int baseCx = viewportX + baseW / 2;
+            const int baseCy = viewportY + baseH / 2;
+            const int offsetPxX = qRound(layerDx * baseW);
+            const int offsetPxY = qRound(layerDy * baseH);
+            viewportX = baseCx + offsetPxX - newW / 2;
+            viewportY = baseCy - offsetPxY - newH / 2;
+            viewportW = newW;
+            viewportH = newH;
+        }
+
+        // (Re)create or update this layer's texture. Reuse when size+format
+        // are unchanged so we don't thrash GPU memory on every frame.
+        if (layer.needsUpload && !layer.image.isNull()) {
+            const int fw = layer.image.width();
+            const int fh = layer.image.height();
+            if (fw <= 0 || fh <= 0) {
+                layer.needsUpload = false;
+                continue;
+            }
+            const QImage::Format fmt = layer.image.format();
+            const bool is16 = (fmt == QImage::Format_RGBA64
+                               || fmt == QImage::Format_RGBA64_Premultiplied);
+            const bool sizeChanged = !layer.texture
+                || layer.texture->width() != fw
+                || layer.texture->height() != fh
+                || layer.textureFormat != fmt;
+            if (sizeChanged) {
+                if (layer.texture) {
+                    delete layer.texture;
+                    layer.texture = nullptr;
+                }
+                layer.texture = new QOpenGLTexture(QOpenGLTexture::Target2D);
+                layer.texture->setSize(fw, fh);
+                layer.texture->setFormat(is16 ? QOpenGLTexture::RGBA16_UNorm
+                                              : QOpenGLTexture::RGBA8_UNorm);
+                layer.texture->setMinificationFilter(QOpenGLTexture::Linear);
+                layer.texture->setMagnificationFilter(QOpenGLTexture::Linear);
+                layer.texture->setWrapMode(QOpenGLTexture::ClampToEdge);
+                layer.texture->allocateStorage(QOpenGLTexture::RGBA,
+                                               is16 ? QOpenGLTexture::UInt16
+                                                    : QOpenGLTexture::UInt8);
+                layer.textureFormat = fmt;
+            }
+            layer.texture->setData(0, 0,
+                                   QOpenGLTexture::RGBA,
+                                   is16 ? QOpenGLTexture::UInt16 : QOpenGLTexture::UInt8,
+                                   static_cast<const void*>(layer.image.constBits()));
+            layer.needsUpload = false;
+        }
+
+        if (!layer.texture) continue;
+
+        glActiveTexture(GL_TEXTURE0);
+        layer.texture->bind();
+        m_program->setUniformValue(m_locFxTexSize,
+            QVector2D(static_cast<float>(layer.texture->width()),
+                      static_cast<float>(layer.texture->height())));
+        m_program->setUniformValue(m_locOpacity, static_cast<float>(layer.opacity));
+        glViewport(viewportX, viewportY, viewportW, viewportH);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        layer.texture->release();
+    }
     m_vao.release();
 
     if (m_lutEnabled && m_lutTexture) {
@@ -728,8 +865,8 @@ void GLPreview::paintGL()
         glActiveTexture(GL_TEXTURE0);
     }
 
-    m_texture->release();
     m_program->release();
+    glDisable(GL_BLEND);
     glViewport(0, 0, physW, physH);
 
     // Adobe-style text tool overlay: draw the dashed marquee plus 8 resize
@@ -902,7 +1039,7 @@ void GLPreview::resetVideoSourceTransform()
     m_videoTransformSelected = false;
     m_videoDragMode = VideoDragNone;
     m_videoDragHandle = HandleNone;
-    emit videoSourceTransformChanged(m_videoSourceScale, m_videoSourceDx, m_videoSourceDy);
+    emit videoSourceTransformChanged(activeTrackForEmit(), m_videoSourceScale, m_videoSourceDx, m_videoSourceDy);
     update();
 }
 
@@ -1327,7 +1464,7 @@ void GLPreview::mouseMoveEvent(QMouseEvent *event)
                     m_videoSourceDy = qBound(-5.0, m_videoSourceDy + shiftY / lbh, 5.0);
                 }
             }
-            emit videoSourceTransformChanged(m_videoSourceScale, m_videoSourceDx, m_videoSourceDy);
+            emit videoSourceTransformChanged(activeTrackForEmit(), m_videoSourceScale, m_videoSourceDx, m_videoSourceDy);
             update();
             event->accept();
             return;
@@ -1388,7 +1525,7 @@ void GLPreview::mouseReleaseEvent(QMouseEvent *event)
     if (!m_textToolActive && m_videoDragMode != VideoDragNone) {
         m_videoDragMode = VideoDragNone;
         m_videoDragHandle = HandleNone;
-        emit videoSourceTransformChanged(m_videoSourceScale, m_videoSourceDx, m_videoSourceDy);
+        emit videoSourceTransformChanged(activeTrackForEmit(), m_videoSourceScale, m_videoSourceDx, m_videoSourceDy);
         update();
         event->accept();
         return;

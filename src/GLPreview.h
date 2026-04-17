@@ -24,7 +24,31 @@ public:
     explicit GLPreview(QWidget *parent = nullptr);
     ~GLPreview();
 
+    // Stage 2 PiP — payload used by VideoPlayer to hand over one or more
+    // decoded layers at once. aspectRatio <= 0 means "infer from image".
+    // sourceTrack follows Timeline track indices (0 = V1 = front, 1 = V2 = behind).
+    // opacity is applied in the fragment shader; 1.0 is fully opaque.
+    struct LayerFrame {
+        QImage image;
+        double scale       = 1.0;
+        double dx          = 0.0;
+        double dy          = 0.0;
+        double opacity     = 1.0;
+        int    sourceTrack = 0;
+        double aspectRatio = 0.0;
+    };
+
     void displayFrame(const QImage &frame);
+    // Stage 2 PiP primary API. Replaces m_layers wholesale; textures keyed
+    // by sourceTrack are reused across calls. Legacy displayFrame() wraps
+    // this with a single-element vector so existing callers stay working.
+    void setLayers(const QVector<LayerFrame> &layers);
+    // Stage 2 PiP — declare which sourceTrack the OBS-style drag UI is
+    // currently targeting. Live m_videoSource* members are applied to that
+    // layer during paintGL. Defaults to the highest sourceTrack (the PiP
+    // overlay). -1 means "no explicit selection; use highest sourceTrack".
+    void setActiveTransformLayer(int sourceTrack);
+    int  activeTransformLayer() const { return m_activeTransformLayer; }
     void setDisplayAspectRatio(double aspectRatio);
     void setColorCorrection(const ColorCorrection &cc);
     // 0 = none (SDR sRGB), 1 = PQ (SMPTE ST 2084), 2 = HLG (ARIB STD-B67)
@@ -110,7 +134,12 @@ signals:
     void textOverlayRectChanged(int overlayIndex, const QRectF &normalizedRect);
     // US-T34 — emitted while the user drags or resizes the video source so
     // VideoPlayer / MainWindow can persist the transform across sessions.
-    void videoSourceTransformChanged(double scale, double dx, double dy);
+    // Stage 2 PiP — sourceTrack identifies which layer the drag is updating.
+    // It is resolved from m_activeTransformLayer, falling back to the
+    // highest sourceTrack present in m_layers so the PiP overlay is the
+    // default drag target.
+    void videoSourceTransformChanged(int sourceTrack,
+                                     double scale, double dx, double dy);
 
 protected:
     void initializeGL() override;
@@ -131,15 +160,39 @@ private:
     void updateUniforms();
     // letterboxRect() moved to public section (US-T32).
 
+    // Stage 2 PiP helper — resolves which sourceTrack should be reported
+    // in the videoSourceTransformChanged signal. Returns m_activeTransformLayer
+    // when it is set to a valid value; otherwise falls back to the highest
+    // sourceTrack among m_layers (PiP overlay). For legacy single-layer
+    // callers this is always 0.
+    int activeTrackForEmit() const;
+
     QOpenGLShaderProgram *m_program = nullptr;
-    QOpenGLTexture *m_texture = nullptr;
     QOpenGLBuffer m_vbo;
     QOpenGLVertexArrayObject m_vao;
 
-    QImage m_currentFrame;
+    // Stage 2 PiP layer storage. One GLLayer per active sourceTrack.
+    // Texture ownership lives here; deletion is deferred to paintGL via
+    // m_pendingTextureDeletes so we only ever touch GL while a context
+    // is current.
+    struct GLLayer {
+        QOpenGLTexture *texture = nullptr;
+        QImage         image;
+        bool           needsUpload = false;
+        QImage::Format textureFormat = QImage::Format_Invalid;
+        double         scale       = 1.0;
+        double         dx          = 0.0;
+        double         dy          = 0.0;
+        double         opacity     = 1.0;
+        int            sourceTrack = 0;
+        double         aspectRatio = 0.0;
+    };
+    QVector<GLLayer>           m_layers;
+    QVector<QOpenGLTexture *>  m_pendingTextureDeletes;
+    int                        m_activeTransformLayer = -1;
+
     ColorCorrection m_cc;
     bool m_effectsEnabled = true;
-    bool m_needsUpload = false;
     double m_displayAspectRatio = 0.0;
 
     // Text tool drag state — press/move/release in widget-pixel coordinates.
@@ -238,7 +291,7 @@ private:
     int m_locFxInvertEnable = -1, m_locFxInvertStrength = -1;
     int m_locFxVignetteEnable = -1, m_locFxVignetteIntensity = -1, m_locFxVignetteRadius = -1;
     int m_locFxTime = -1;
-    QImage::Format m_textureFormat = QImage::Format_Invalid;
+    int m_locOpacity = -1;
 
     // Lift/Gamma/Gain uniform locations
     int m_locLiftR = -1, m_locLiftG = -1, m_locLiftB = -1;

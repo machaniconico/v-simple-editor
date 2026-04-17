@@ -15,6 +15,8 @@
 #include "VideoEffect.h"
 #include "PlaybackTypes.h"
 #include "TextManager.h"
+#include "SecondaryLayer.h"
+#include <memory>
 
 class GLPreview;
 class QResizeEvent;
@@ -174,6 +176,19 @@ private:
     // playback. Returns the number of extra frames actually skip-decoded.
     int correctVideoDriftAgainstAudioClock();
 
+    // Stage 2 PiP — resolve the current secondary PlaybackEntry for a given
+    // timeline microsecond, or -1 when no V2+ clip overlaps that time.
+    int findSecondaryEntryAt(int64_t timelineUs) const;
+    // Advance (or seek) SecondaryLayer so its lastImage matches the given
+    // timeline microsecond. When isSeek=true, the loader re-opens files or
+    // calls seekToFileUs; otherwise it just decodeNextFrame()s in lockstep
+    // with the primary tick. Populates m_lastSecondary* from the owning
+    // PlaybackEntry so pushLayersToPreview can forward transform/opacity.
+    void refreshSecondaryForTimeline(int64_t timelineUs, bool isSeek);
+    // Build the LayerFrame vector and forward to GLPreview::setLayers,
+    // attaching the secondary image when it's present for the current time.
+    void pushLayersToPreview(const QImage &primary);
+
     QLabel *m_videoDisplay;
     GLPreview *m_glPreview = nullptr;
     bool m_useGL = true;
@@ -225,6 +240,21 @@ private:
     int m_activeEntry = -1;
     QVector<PlaybackEntry> m_audioSequence;
     int m_activeAudioEntry = -1;
+
+    // Stage 2 PiP — secondary video layer (V2+). Runs alongside the primary
+    // HW-accelerated pipeline without touching its decoder state. A single
+    // SecondaryLayer is sufficient for the MVP because Stage 2 caps the
+    // composite at two layers; Stage 3 will generalise this to N layers.
+    QVector<PlaybackEntry>          m_secondarySequence;
+    int                             m_activeSecondaryEntry = -1;
+    std::unique_ptr<SecondaryLayer> m_secondaryLayer;
+    QImage                          m_lastSecondaryImage;
+    double                          m_lastSecondaryScale   = 1.0;
+    double                          m_lastSecondaryDx      = 0.0;
+    double                          m_lastSecondaryDy      = 0.0;
+    double                          m_lastSecondaryOpacity = 1.0;
+    int                             m_lastSecondarySourceTrack = 1;
+    double                          m_lastSecondaryAspect  = 0.0;
     QString m_audioLoadedFilePath;  // current m_audioPlayer source, tracked separately from m_loadedFilePath
     // Qt MediaFoundation setSource() is asynchronous on Windows — setPosition
     // and play() calls issued before LoadedMedia fires are silently dropped,

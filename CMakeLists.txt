@@ -50,6 +50,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/EffectPlugin.cpp
     src/ProjectFile.cpp
     src/GLPreview.cpp
+    src/SecondaryLayer.cpp
     src/ShaderEffect.cpp
     src/WaveformGenerator.cpp
     src/AutoEdit.cpp
