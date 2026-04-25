@@ -299,13 +299,42 @@ void ProxyManager::processNextInQueue()
          << "-i" << originalPath
          << "-vf" << QString("scale=%1:%2").arg(m_config.proxyWidth).arg(m_config.proxyHeight);
 
+    // Encoder priority: GPU H.264 (~5-10x faster than CPU) → AV1 software
+    // (smaller, accurate seek; Modern build only) → libx264 software.
+    // We probe the actual ffmpeg binary (not the linked libavcodec) because
+    // the two can disagree when ffmpeg is on PATH but built independently.
+    const QString gpuEnc = chosenGpuH264Encoder();
+    if (gpuEnc == "h264_nvenc") {
+        args << "-c:v" << "h264_nvenc"
+             << "-preset" << "p1"
+             << "-tune" << "hq"
+             << "-rc" << "constqp" << "-qp" << "28"
+             << "-pix_fmt" << "yuv420p"
+             << "-c:a" << "aac"
+             << "-b:a" << "128k"
+             << "-movflags" << "+faststart"
+             << entry.proxyPath;
+    } else if (gpuEnc == "h264_qsv") {
+        args << "-c:v" << "h264_qsv"
+             << "-preset" << "veryfast"
+             << "-global_quality" << "28"
+             << "-pix_fmt" << "nv12"
+             << "-c:a" << "aac"
+             << "-b:a" << "128k"
+             << "-movflags" << "+faststart"
+             << entry.proxyPath;
+    } else if (gpuEnc == "h264_amf") {
+        args << "-c:v" << "h264_amf"
+             << "-quality" << "speed"
+             << "-rc" << "cqp" << "-qp_i" << "28" << "-qp_p" << "28"
+             << "-pix_fmt" << "yuv420p"
+             << "-c:a" << "aac"
+             << "-b:a" << "128k"
+             << "-movflags" << "+faststart"
+             << entry.proxyPath;
+    }
 #if defined(VEDITOR_AV1)
-    // Modern Edition: AV1 proxy via SVT-AV1 with fragmented MP4 for accurate seeking.
-    // Runtime fallback to H.264 if the runtime ffmpeg.exe lacks libsvtav1.
-    // We probe the actual binary (not the linked libavcodec) because the two
-    // can disagree when ffmpeg is on PATH but built independently.
-    const bool av1Available = ffmpegHasEncoder("libsvtav1");
-    if (av1Available) {
+    else if (ffmpegHasEncoder("libsvtav1")) {
         // preset 12: near-fastest SVT-AV1 — proxies trade quality for speed.
         args << "-c:v" << "libsvtav1"
              << "-preset" << "12"
@@ -316,11 +345,11 @@ void ProxyManager::processNextInQueue()
              << "-b:a" << "128k"
              << "-movflags" << "+faststart+frag_keyframe+empty_moov+default_base_moof"
              << entry.proxyPath;
-    } else
+    }
 #endif
-    {
-        // Classic / fallback: H.264 proxy. -g 120 forces keyframes every ~4s and
-        // +faststart ensures accurate seek (past bug: missing keyframes broke seekbar).
+    else {
+        // Last-resort software H.264 — slowest but always available. -g 120
+        // forces keyframes every ~4 s so the seekbar stays accurate.
         args << "-c:v" << "libx264"
              << "-crf" << QString::number(m_config.quality)
              << "-g" << "120"
@@ -474,4 +503,18 @@ qint64 ProxyManager::probeDurationUs(const QString &path)
     const qint64 us = static_cast<qint64>(seconds * 1'000'000.0);
     cache.insert(path, us);
     return us;
+}
+
+QString ProxyManager::chosenGpuH264Encoder()
+{
+    static QString cached;
+    static bool probed = false;
+    if (probed)
+        return cached;
+    probed = true;
+
+    if (ffmpegHasEncoder("h264_nvenc")) cached = "h264_nvenc";
+    else if (ffmpegHasEncoder("h264_qsv")) cached = "h264_qsv";
+    else if (ffmpegHasEncoder("h264_amf")) cached = "h264_amf";
+    return cached;
 }

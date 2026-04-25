@@ -107,6 +107,13 @@ private:
     // the same source can be re-queued and ffprobe spawn is ~200 ms.
     static qint64 probeDurationUs(const QString &path);
 
+    // Probe the runtime ffmpeg.exe for the first available GPU H.264 encoder
+    // in the order h264_nvenc → h264_qsv → h264_amf (typical throughput
+    // ranking on consumer hardware). Returns the encoder name or an empty
+    // string when no GPU encoder is registered. Cached for the singleton
+    // lifetime — encoders don't appear at runtime.
+    static QString chosenGpuH264Encoder();
+
     // Source duration in microseconds for the in-flight proxy job, populated
     // by probeDurationUs at queue time. Zero means probe failed or input has
     // no duration (image-only) — see probeDurationUs for the contract.
