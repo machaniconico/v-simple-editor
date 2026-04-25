@@ -624,6 +624,9 @@ void MainWindow::setupMenuBar()
 
     toolsMenu->addSeparator();
 
+    auto *proxySettingsAction = toolsMenu->addAction("プロキシ設定...");
+    connect(proxySettingsAction, &QAction::triggered, this, &MainWindow::openProxySettings);
+
     auto *proxyToggle = toolsMenu->addAction("プロキシモード切替");
     proxyToggle->setCheckable(true);
     connect(proxyToggle, &QAction::triggered, this, &MainWindow::toggleProxyMode);
