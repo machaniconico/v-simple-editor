@@ -56,8 +56,7 @@ void ProxyProgressDialog::onProxyStarted(const QString &clipName)
 {
     // Cancel any pending auto-hide from a prior cancel — otherwise the
     // 800ms timer scheduled in onProxyCancelled would fire mid-new-job.
-    if (m_autoHideTimer)
-        m_autoHideTimer->stop();
+    m_autoHideTimer->stop();
     m_clipLabel->setText(tr("処理中: %1").arg(clipName));
     m_progressBar->setRange(0, 0); // indeterminate until first percent arrives
     m_progressBar->setValue(0);
@@ -99,8 +98,7 @@ void ProxyProgressDialog::onProxyProgress(const QString &clipName, int percent)
 
 void ProxyProgressDialog::onProxyFinished(const QString &clipName, bool ok)
 {
-    if (m_autoHideTimer)
-        m_autoHideTimer->stop();
+    m_autoHideTimer->stop();
     m_progressBar->setRange(0, 100);
     m_progressBar->setValue(ok ? 100 : 0);
     m_statusLabel->setText(ok ? tr("完了: %1").arg(clipName)
@@ -125,8 +123,7 @@ void ProxyProgressDialog::onProxyCancelled(const QString &clipName)
     // accept()) keeps the QDialog instance alive so onProxyStarted can
     // resurrect it for the next run. The timer is a member so a fresh
     // generation kicked off within 800ms can stop() it before it fires.
-    if (m_autoHideTimer)
-        m_autoHideTimer->start();
+    m_autoHideTimer->start();
 }
 
 void ProxyProgressDialog::closeEvent(QCloseEvent *event)
