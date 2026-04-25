@@ -263,6 +263,14 @@ void ProxyManager::cancelGeneration()
         m_process->deleteLater();
         m_process = nullptr;
     }
+    // The disconnect above prevents the finished-lambda from running, so any
+    // entry still marked Generating will never be reset by that lambda.
+    // Reset them explicitly here so generateAllProxies can queue them again.
+    for (auto it = m_entries.begin(); it != m_entries.end(); ++it) {
+        if (it.value().status == ProxyStatus::Generating)
+            it.value().status = ProxyStatus::None;
+    }
+
     // Reset synchronously so a follow-up generateAllProxies on the same
     // call stack doesn't see leftover cancel state.
     m_cancelRequested = false;
