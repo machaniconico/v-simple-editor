@@ -413,35 +413,17 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
     // sequence as-is. Timeline::computePlaybackSequence sorts by
     // (timelineStart asc, sourceTrack asc), so findActiveEntryAt naturally
     // hits V1 first wherever V1 exists; in V1-empty gaps only V2 (or V3,
-    // ...) matches, which is what makes seeks into V2-only regions actually
-    // load V2's source instead of bouncing back to V1's head. The Stage 2
-    // multi-layer compositor will replace this with per-sourceTrack
-    // LayerDecoders.
-    QVector<PlaybackEntry> primary = entries;
-
-    // Compute total duration in microseconds from the full (multi-track) set
-    // so the slider range still reflects V2-only segments beyond V1's tail.
+    // ...) matches — that's what lets seeks into V2-only regions load V2's
+    // source instead of bouncing back to V1's head. The Stage 2 multi-layer
+    // compositor will replace this with per-sourceTrack LayerDecoders.
     int64_t totalUs = 0;
     for (const auto &e : entries) {
         const int64_t entryEndUs = static_cast<int64_t>(e.timelineEnd * AV_TIME_BASE);
         if (entryEndUs > totalUs) totalUs = entryEndUs;
     }
 
-    m_sequence = primary;
+    m_sequence = entries;
     m_sequenceDurationUs = totalUs;
-
-    // V1-empty-but-V2+-populated case can only happen once the PiP
-    // compositor lands. Until then, treat it as "no primary stream" and
-    // leave the slider range intact so the user still sees V2's span.
-    if (!entries.isEmpty() && primary.isEmpty()) {
-        m_activeEntry = -1;
-        m_timelinePositionUs = qBound<int64_t>(0, m_timelinePositionUs, m_sequenceDurationUs);
-        if (m_playing) pause();
-        applySequenceSliderRange();
-        emit durationChanged(static_cast<double>(m_sequenceDurationUs) / AV_TIME_BASE);
-        if (m_glPreview) m_glPreview->resetVideoSourceTransform();
-        return;
-    }
 
     if (entries.isEmpty()) {
         // Timeline emptied (all clips deleted). Pause and clear the slider so
