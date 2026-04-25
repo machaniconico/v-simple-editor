@@ -294,20 +294,28 @@ void ProxyManager::processNextInQueue()
 
     m_process = new QProcess(this);
 
-    QStringList args;
-    args << "-y"
-         << "-i" << originalPath
-         << "-vf" << QString("scale=%1:%2").arg(m_config.proxyWidth).arg(m_config.proxyHeight);
-
     // Encoder priority: GPU H.264 (~5-10x faster than CPU) → AV1 software
     // (smaller, accurate seek; Modern build only) → libx264 software.
     // We probe the actual ffmpeg binary (not the linked libavcodec) because
     // the two can disagree when ffmpeg is on PATH but built independently.
+    // Each branch owns its full input chain: GPU encoders need -hwaccel
+    // before -i so that decode and scale stay on-card and CPU stays idle.
+    QStringList args;
+    args << "-y";
+
     const QString gpuEnc = chosenGpuH264Encoder();
+    const QString scaleSize = QString("%1:%2").arg(m_config.proxyWidth).arg(m_config.proxyHeight);
+
     if (gpuEnc == "h264_nvenc") {
-        args << "-c:v" << "h264_nvenc"
+        // Full CUDA pipeline: NVDEC decode → scale_cuda → NVENC encode, no
+        // VRAM↔RAM round-trips. Crucial on long sources where software decode
+        // and scale would dominate wall-clock even with NVENC encode.
+        args << "-hwaccel" << "cuda"
+             << "-hwaccel_output_format" << "cuda"
+             << "-i" << originalPath
+             << "-vf" << QString("scale_cuda=%1").arg(scaleSize)
+             << "-c:v" << "h264_nvenc"
              << "-preset" << "p1"
-             << "-tune" << "hq"
              << "-rc" << "constqp" << "-qp" << "28"
              << "-pix_fmt" << "yuv420p"
              << "-c:a" << "aac"
@@ -315,7 +323,12 @@ void ProxyManager::processNextInQueue()
              << "-movflags" << "+faststart"
              << entry.proxyPath;
     } else if (gpuEnc == "h264_qsv") {
-        args << "-c:v" << "h264_qsv"
+        // Full QSV pipeline: Intel hardware decode → scale_qsv → QSV encode.
+        args << "-hwaccel" << "qsv"
+             << "-hwaccel_output_format" << "qsv"
+             << "-i" << originalPath
+             << "-vf" << QString("scale_qsv=%1").arg(scaleSize)
+             << "-c:v" << "h264_qsv"
              << "-preset" << "veryfast"
              << "-global_quality" << "28"
              << "-pix_fmt" << "nv12"
@@ -324,7 +337,13 @@ void ProxyManager::processNextInQueue()
              << "-movflags" << "+faststart"
              << entry.proxyPath;
     } else if (gpuEnc == "h264_amf") {
-        args << "-c:v" << "h264_amf"
+        // AMF doesn't expose a clean GPU scale chain in ffmpeg, so we run
+        // d3d11va decode and let the scale fall back to CPU. Still better
+        // than full software because decode is the bigger half.
+        args << "-hwaccel" << "d3d11va"
+             << "-i" << originalPath
+             << "-vf" << QString("scale=%1").arg(scaleSize)
+             << "-c:v" << "h264_amf"
              << "-quality" << "speed"
              << "-rc" << "cqp" << "-qp_i" << "28" << "-qp_p" << "28"
              << "-pix_fmt" << "yuv420p"
@@ -336,7 +355,9 @@ void ProxyManager::processNextInQueue()
 #if defined(VEDITOR_AV1)
     else if (ffmpegHasEncoder("libsvtav1")) {
         // preset 12: near-fastest SVT-AV1 — proxies trade quality for speed.
-        args << "-c:v" << "libsvtav1"
+        args << "-i" << originalPath
+             << "-vf" << QString("scale=%1").arg(scaleSize)
+             << "-c:v" << "libsvtav1"
              << "-preset" << "12"
              << "-crf" << "35"
              << "-g" << "120"
@@ -350,7 +371,9 @@ void ProxyManager::processNextInQueue()
     else {
         // Last-resort software H.264 — slowest but always available. -g 120
         // forces keyframes every ~4 s so the seekbar stays accurate.
-        args << "-c:v" << "libx264"
+        args << "-i" << originalPath
+             << "-vf" << QString("scale=%1").arg(scaleSize)
+             << "-c:v" << "libx264"
              << "-crf" << QString::number(m_config.quality)
              << "-g" << "120"
              << "-c:a" << "aac"
