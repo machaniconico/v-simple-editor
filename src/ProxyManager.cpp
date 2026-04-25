@@ -431,6 +431,12 @@ qint64 ProxyManager::probeDurationUs(const QString &path)
     // Cache per source path — same file may be re-queued (settings change,
     // user toggles proxy mode, etc.) and ffprobe spawn is ~200 ms.
     static QHash<QString, qint64> cache;
+    // Mirrors the probeBroken pattern in ffmpegHasEncoder: once we learn
+    // ffprobe is not on PATH, stop burning a 2 s waitForStarted per clip.
+    static bool ffprobeMissing = false;
+    if (ffprobeMissing)
+        return 0;
+
     auto it = cache.constFind(path);
     if (it != cache.constEnd())
         return it.value();
@@ -443,6 +449,7 @@ qint64 ProxyManager::probeDurationUs(const QString &path)
          << path;
     probe.start("ffprobe", args);
     if (!probe.waitForStarted(2000)) {
+        ffprobeMissing = true;
         cache.insert(path, 0);
         return 0;
     }
