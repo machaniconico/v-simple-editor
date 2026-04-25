@@ -1,4 +1,5 @@
 #include "ProxyManager.h"
+#include <QDateTime>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -9,6 +10,7 @@
 #include <QStandardPaths>
 #include <QCryptographicHash>
 #include <QDirIterator>
+#include <QTextStream>
 
 ProxyManager &ProxyManager::instance()
 {
@@ -292,6 +294,22 @@ void ProxyManager::processNextInQueue()
         emit proxyProgress(m_currentClipName, -1);
     }
 
+    // Resolve the encoder we'll actually invoke for this job and log it. The
+    // decision mirrors the priority chain in the args composition below.
+    const QString jobGpuEnc = chosenGpuH264Encoder();
+    QString jobEncoder = jobGpuEnc;
+    if (jobEncoder.isEmpty()) {
+#if defined(VEDITOR_AV1)
+        if (ffmpegHasEncoder("libsvtav1")) jobEncoder = "libsvtav1";
+        else
+#endif
+            jobEncoder = "libx264";
+    }
+    appendEncoderLog(QString("[%1] job source=%2 encoder=%3")
+                     .arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate),
+                          m_currentClipName,
+                          jobEncoder));
+
     m_process = new QProcess(this);
 
     // Encoder priority: GPU H.264 (~5-10x faster than CPU) → AV1 software
@@ -539,5 +557,18 @@ QString ProxyManager::chosenGpuH264Encoder()
     if (ffmpegHasEncoder("h264_nvenc")) cached = "h264_nvenc";
     else if (ffmpegHasEncoder("h264_qsv")) cached = "h264_qsv";
     else if (ffmpegHasEncoder("h264_amf")) cached = "h264_amf";
+
+    appendEncoderLog(QString("[%1] chosen=%2")
+                     .arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate),
+                          cached.isEmpty() ? QStringLiteral("<software-fallback>") : cached));
     return cached;
+}
+
+void ProxyManager::appendEncoderLog(const QString &line)
+{
+    QFile f(proxyDir() + "/encoder_log.txt");
+    if (!f.open(QIODevice::Append | QIODevice::Text))
+        return;
+    QTextStream out(&f);
+    out << line << '\n';
 }

@@ -114,6 +114,12 @@ private:
     // lifetime — encoders don't appear at runtime.
     static QString chosenGpuH264Encoder();
 
+    // Append a single line to ~/.veditor/proxies/encoder_log.txt for
+    // diagnostic visibility into which encoder was picked and which clips
+    // ran through it. Failures are silently ignored — proxy generation
+    // never blocks on the diagnostic side-channel.
+    static void appendEncoderLog(const QString &line);
+
     // Source duration in microseconds for the in-flight proxy job, populated
     // by probeDurationUs at queue time. Zero means probe failed or input has
     // no duration (image-only) — see probeDurationUs for the contract.
