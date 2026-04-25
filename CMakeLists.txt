@@ -71,6 +71,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/AutoSave.cpp
     src/ProxyManager.cpp
     src/ProxyProgressDialog.cpp
+    src/ProxyManagementDialog.cpp
     src/DecoderSlotManager.cpp
     src/LutImporter.cpp
     src/TimelineMarker.cpp

@@ -80,6 +80,9 @@ public:
     // settings dialog can grey out unsupported items. Cached internally.
     static bool ffmpegHasEncoder(const QString &encoderName);
 
+    // Read-only access to the entry registry for the management dialog.
+    const QHash<QString, ProxyEntry> &entries() const { return m_entries; }
+
 signals:
     void proxyGenerated(const QString &originalPath, const QString &proxyPath);
     void progressChanged(int percent);

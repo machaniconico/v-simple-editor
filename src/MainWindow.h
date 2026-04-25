@@ -146,6 +146,7 @@ private slots:
     // from the same place. Replaces the divisor-only cycle handler that
     // used to live inside VideoPlayer.
     void openProxySettings();
+    void openProxyManagement();
     void setSpeedRamp();
     void audioEqualizer();
     void audioEffects();

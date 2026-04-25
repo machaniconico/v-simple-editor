@@ -10,6 +10,7 @@
 #include "GLPreview.h"
 #include "ProxyManager.h"
 #include "ProxyProgressDialog.h"
+#include "ProxyManagementDialog.h"
 #include <QApplication>
 #include <QMessageBox>
 #include <QVBoxLayout>
@@ -629,6 +630,9 @@ void MainWindow::setupMenuBar()
 
     auto *genProxiesAction = toolsMenu->addAction("プロキシ生成...");
     connect(genProxiesAction, &QAction::triggered, this, &MainWindow::generateProxies);
+
+    auto *proxyMgmtAction = toolsMenu->addAction("プロキシ管理...");
+    connect(proxyMgmtAction, &QAction::triggered, this, &MainWindow::openProxyManagement);
 
     auto *renderQueueAction = toolsMenu->addAction("レンダーキュー...");
     renderQueueAction->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_R));
@@ -2891,6 +2895,12 @@ void MainWindow::generateProxies()
 
     pm.generateAllProxies(paths);
     statusBar()->showMessage("Generating proxy files...");
+}
+
+void MainWindow::openProxyManagement()
+{
+    ProxyManagementDialog dlg(this);
+    dlg.exec();
 }
 
 void MainWindow::setSpeedRamp()
