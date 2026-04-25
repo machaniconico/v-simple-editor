@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.20)
 project(v-simple-editor VERSION 0.14.0 LANGUAGES CXX)
 
+set(VEDITOR_EDITION "classic" CACHE STRING "Build edition: classic (H.264/HEVC) | modern (+ AV1)")
+set_property(CACHE VEDITOR_EDITION PROPERTY STRINGS classic modern)
+message(STATUS "VEDITOR_EDITION = ${VEDITOR_EDITION}")
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
@@ -66,6 +70,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/ResourceGuide.cpp
     src/AutoSave.cpp
     src/ProxyManager.cpp
+    src/ProxyProgressDialog.cpp
+    src/DecoderSlotManager.cpp
     src/LutImporter.cpp
     src/TimelineMarker.cpp
     src/VideoStabilizer.cpp
@@ -124,4 +130,6 @@ endif()
 
 target_compile_definitions(${PROJECT_NAME} PRIVATE
     APP_VERSION="${PROJECT_VERSION}"
+    VEDITOR_EDITION="${VEDITOR_EDITION}"
+    $<$<STREQUAL:${VEDITOR_EDITION},modern>:VEDITOR_AV1=1>
 )
