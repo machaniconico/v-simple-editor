@@ -8,6 +8,8 @@
 #include "EffectPlugin.h"
 #include "ColorGradingPanel.h"
 #include "GLPreview.h"
+#include "ProxyManager.h"
+#include "ProxyProgressDialog.h"
 #include <QApplication>
 #include <QMessageBox>
 #include <QVBoxLayout>
@@ -252,6 +254,33 @@ void MainWindow::setupUI()
             e.filePath = pm.getProxyPath(e.filePath);
         qInfo() << "MainWindow: forwarding audioSequenceChanged entries=" << resolved.size();
         m_player->setAudioSequence(resolved);
+    });
+
+    // Proxy generation progress dialog (US-3): modeless window with the
+    // current clip name + progress bar + cancel button. Created on demand
+    // when ProxyManager emits proxyStarted; reused across the session so
+    // the user keeps a stable place to monitor / abort the queue.
+    auto &proxyMgr = ProxyManager::instance();
+    connect(&proxyMgr, &ProxyManager::proxyStarted, this, [this](const QString &clipName) {
+        if (!m_proxyDialog) {
+            m_proxyDialog = new ProxyProgressDialog(this);
+            m_proxyDialog->setAttribute(Qt::WA_DeleteOnClose, false);
+            connect(m_proxyDialog, &ProxyProgressDialog::cancelRequested,
+                    &ProxyManager::instance(), &ProxyManager::cancelGeneration);
+        }
+        m_proxyDialog->onProxyStarted(clipName);
+    });
+    connect(&proxyMgr, &ProxyManager::proxyProgress, this,
+            [this](const QString &clipName, int percent) {
+        if (m_proxyDialog) m_proxyDialog->onProxyProgress(clipName, percent);
+    });
+    connect(&proxyMgr, &ProxyManager::proxyFinished, this,
+            [this](const QString &clipName, bool ok) {
+        if (m_proxyDialog) m_proxyDialog->onProxyFinished(clipName, ok);
+    });
+    connect(&proxyMgr, &ProxyManager::proxyCancelled, this,
+            [this](const QString &clipName) {
+        if (m_proxyDialog) m_proxyDialog->onProxyCancelled(clipName);
     });
 
     // J/K/L keyboard shortcuts for playback

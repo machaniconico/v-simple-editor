@@ -187,6 +187,7 @@ private:
 
     VideoPlayer *m_player;
     Timeline *m_timeline;
+    class ProxyProgressDialog *m_proxyDialog = nullptr;
     class ColorGradingPanel *m_colorGradingPanel = nullptr;
     QStringList m_supportedFormats;
     ProjectConfig m_projectConfig;
