@@ -5,6 +5,7 @@
 #include <QLabel>
 #include <QProgressBar>
 #include <QPushButton>
+#include <QTimer>
 #include <QVBoxLayout>
 
 ProxyProgressDialog::ProxyProgressDialog(QWidget *parent)
@@ -47,7 +48,22 @@ void ProxyProgressDialog::onProxyStarted(const QString &clipName)
     m_progressBar->setRange(0, 0); // indeterminate until first percent arrives
     m_progressBar->setValue(0);
     m_statusLabel->clear();
+
+    // Reset the cancel button to its active state. onProxyFinished /
+    // onProxyCancelled rewire it to「閉じる」+ accept; without this
+    // restoration a follow-up generation would inherit the stale wiring
+    // and the user would lose the ability to cancel — the button just
+    // closes the dialog while the new ffmpeg job keeps running silently
+    // in the background.
+    m_cancelButton->setText(tr("キャンセル"));
     m_cancelButton->setEnabled(true);
+    disconnect(m_cancelButton, nullptr, nullptr, nullptr);
+    connect(m_cancelButton, &QPushButton::clicked, this, [this]() {
+        m_statusLabel->setText(tr("キャンセル中..."));
+        m_cancelButton->setEnabled(false);
+        emit cancelRequested();
+    });
+
     if (!isVisible())
         show();
     raise();
@@ -88,6 +104,11 @@ void ProxyProgressDialog::onProxyCancelled(const QString &clipName)
     m_cancelButton->setEnabled(true);
     disconnect(m_cancelButton, nullptr, nullptr, nullptr);
     connect(m_cancelButton, &QPushButton::clicked, this, &QDialog::accept);
+    // Auto-hide so the user doesn't have to manually dismiss a residual
+    // "cancelled" dialog before kicking off a new generation. hide() (not
+    // accept()) keeps the QDialog instance alive so onProxyStarted can
+    // resurrect it for the next run.
+    QTimer::singleShot(800, this, &QDialog::hide);
 }
 
 void ProxyProgressDialog::closeEvent(QCloseEvent *event)
