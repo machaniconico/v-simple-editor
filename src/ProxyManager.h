@@ -56,6 +56,18 @@ public:
     static QString proxyDir();
     qint64 diskUsage() const;
 
+    // Manual encoder override. Empty string = Auto (existing behaviour:
+    // chosenGpuH264Encoder() priority chain). Otherwise one of
+    //   "h264_nvenc" / "h264_qsv" / "h264_amf" / "libx264"
+    // Persisted via QSettings("VSimpleEditor", "Preferences") under
+    // "proxyEncoderOverride".
+    QString encoderOverride() const { return m_encoderOverride; }
+    void setEncoderOverride(const QString &name);
+
+    // Probe the runtime ffmpeg.exe for the named encoder. Public so the
+    // settings dialog can grey out unsupported items. Cached internally.
+    static bool ffmpegHasEncoder(const QString &encoderName);
+
 signals:
     void proxyGenerated(const QString &originalPath, const QString &proxyPath);
     void progressChanged(int percent);
@@ -88,15 +100,6 @@ private:
     void saveIndex();
     void processNextInQueue();
     void parseFfmpegProgress(const QByteArray &chunk);
-
-    // Probe the runtime ffmpeg.exe (the binary we'll actually invoke) for an
-    // encoder by parsing `ffmpeg -hide_banner -encoders` output. This is
-    // *different* from CodecDetector::isEncoderAvailable — that one queries
-    // the linked libavcodec, which can disagree with the PATH ffmpeg when
-    // they were built independently. Result is cached per encoder name for
-    // the lifetime of the singleton (encoders never appear/disappear at
-    // runtime).
-    static bool ffmpegHasEncoder(const QString &encoderName);
 
     // Mirror of ffmpegHasEncoder for the decoder side. Parses the output of
     // `ffmpeg -hide_banner -decoders` so we can verify a hardware decoder
@@ -150,4 +153,6 @@ private:
     int m_completed = 0;
     QProcess *m_process = nullptr;
     QThread *m_thread = nullptr;
+
+    QString m_encoderOverride;
 };

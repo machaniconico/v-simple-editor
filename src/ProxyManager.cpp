@@ -19,6 +19,7 @@ bool g_ffprobeMissing = false;
 #include <QCryptographicHash>
 #include <QDirIterator>
 #include <QTextStream>
+#include <QSettings>
 
 ProxyManager &ProxyManager::instance()
 {
@@ -29,7 +30,16 @@ ProxyManager &ProxyManager::instance()
 ProxyManager::ProxyManager()
 {
     QDir().mkpath(proxyDir());
+    QSettings prefs("VSimpleEditor", "Preferences");
+    m_encoderOverride = prefs.value("proxyEncoderOverride").toString();
     loadIndex();
+}
+
+void ProxyManager::setEncoderOverride(const QString &name)
+{
+    m_encoderOverride = name;
+    QSettings prefs("VSimpleEditor", "Preferences");
+    prefs.setValue("proxyEncoderOverride", name);
 }
 
 ProxyManager::~ProxyManager()
@@ -363,11 +373,26 @@ void ProxyManager::processNextInQueue()
 
     // Resolve the encoder we'll actually invoke for this job and log it. The
     // decision mirrors the priority chain in the args composition below.
-    const QString jobGpuEnc = chosenGpuH264Encoder();
+    // Manual override (US-1): if the user pinned a specific encoder via the
+    // settings dialog, use that instead of the auto-detect chain. We accept
+    // only the four whitelisted names; anything else falls through to Auto
+    // so a stale QSettings value can't wedge proxy generation.
+    QString jobGpuEnc;
+    static const QStringList kValidEncoders = {
+        "h264_nvenc", "h264_qsv", "h264_amf", "libx264"
+    };
+    if (!m_encoderOverride.isEmpty() && kValidEncoders.contains(m_encoderOverride)) {
+        if (m_encoderOverride != "libx264")
+            jobGpuEnc = m_encoderOverride;
+        // libx264 override → leave jobGpuEnc empty so the software branch runs
+    } else {
+        jobGpuEnc = chosenGpuH264Encoder();
+    }
     QString jobEncoder = jobGpuEnc;
     if (jobEncoder.isEmpty()) {
 #if defined(VEDITOR_AV1)
-        if (ffmpegHasEncoder("libsvtav1")) jobEncoder = "libsvtav1";
+        if (m_encoderOverride.isEmpty() && ffmpegHasEncoder("libsvtav1"))
+            jobEncoder = "libsvtav1";
         else
 #endif
             jobEncoder = "libx264";
@@ -419,7 +444,7 @@ void ProxyManager::processNextInQueue()
     QStringList args;
     args << "-y";
 
-    const QString gpuEnc = chosenGpuH264Encoder();
+    const QString gpuEnc = jobGpuEnc;
     const QString scaleSize = QString("%1:%2").arg(m_config.proxyWidth).arg(m_config.proxyHeight);
 
     if (gpuEnc == "h264_nvenc") {
@@ -475,7 +500,7 @@ void ProxyManager::processNextInQueue()
              << entry.proxyPath;
     }
 #if defined(VEDITOR_AV1)
-    else if (ffmpegHasEncoder("libsvtav1")) {
+    else if (m_encoderOverride.isEmpty() && ffmpegHasEncoder("libsvtav1")) {
         // preset 12: near-fastest SVT-AV1 — proxies trade quality for speed.
         args << "-i" << originalPath
              << "-vf" << QString("scale=%1").arg(scaleSize)

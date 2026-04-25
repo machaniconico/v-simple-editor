@@ -46,6 +46,7 @@
 #include <QColorDialog>
 #include <QFormLayout>
 #include <QLabel>
+#include <QStandardItemModel>
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
@@ -2624,6 +2625,40 @@ void MainWindow::openProxySettings()
         "OFF: 元解像度ファイルを使用"));
     layout->addWidget(modeCheck);
 
+    // Encoder override (US-1): empty itemData = Auto. Probe each GPU
+    // encoder up-front and disable items the runtime ffmpeg can't run so
+    // the user can't pin an encoder that will fall through to libx264.
+    layout->addWidget(new QLabel(QStringLiteral("エンコーダー:"), &dlg));
+    auto *encoderCombo = new QComboBox(&dlg);
+    struct EncOpt { const char *label; const char *value; };
+    const EncOpt encOpts[] = {
+        {"Auto (自動検出)",      ""},
+        {"NVIDIA NVENC",         "h264_nvenc"},
+        {"Intel QSV",            "h264_qsv"},
+        {"AMD AMF",              "h264_amf"},
+        {"CPU (libx264)",        "libx264"},
+    };
+    auto *encModel = new QStandardItemModel(encoderCombo);
+    for (const auto &opt : encOpts) {
+        auto *item = new QStandardItem(QString::fromUtf8(opt.label));
+        item->setData(QString::fromLatin1(opt.value), Qt::UserRole);
+        const QString enc = QString::fromLatin1(opt.value);
+        const bool isGpu = (enc == "h264_nvenc" || enc == "h264_qsv" || enc == "h264_amf");
+        if (isGpu && !ProxyManager::ffmpegHasEncoder(enc)) {
+            item->setFlags(item->flags() & ~(Qt::ItemIsEnabled | Qt::ItemIsSelectable));
+        }
+        encModel->appendRow(item);
+    }
+    encoderCombo->setModel(encModel);
+    const QString currentEnc = pm.encoderOverride();
+    for (int i = 0; i < encoderCombo->count(); ++i) {
+        if (encoderCombo->itemData(i, Qt::UserRole).toString() == currentEnc) {
+            encoderCombo->setCurrentIndex(i);
+            break;
+        }
+    }
+    layout->addWidget(encoderCombo);
+
     auto *divisorLabel = new QLabel(
         QStringLiteral("プレビュー解像度 (CPU エフェクト適用時に効く):"), &dlg);
     layout->addWidget(divisorLabel);
@@ -2649,6 +2684,8 @@ void MainWindow::openProxySettings()
 
     if (dlg.exec() != QDialog::Accepted)
         return;
+
+    pm.setEncoderOverride(encoderCombo->currentData(Qt::UserRole).toString());
 
     // Apply proxy mode flip first — the refresh below relies on the new
     // mode to resolve paths correctly.
