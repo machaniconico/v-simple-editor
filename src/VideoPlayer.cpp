@@ -441,6 +441,41 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
     m_sequence = entries;
     m_sequenceDurationUs = totalUs;
 
+    // Phase 1d pool reconciliation. For every active V2+ TrackDecoder, drop
+    // it to the eviction grace pool when the (sourceClipIndex, sourceTrack)
+    // tuple either disappeared from the new sequence or now points at a
+    // different file path. The grace TTL keeps lastFrameRgb available for a
+    // few ticks after eviction so harvestOverlayLayer can fall back to it
+    // while the replacement decoder catches up. The slot manager release
+    // mirrors the (track << 16 | clip) packing used in acquireDecoderForClip.
+    {
+        QHash<TrackKey, QString> newPaths;
+        for (const auto &e : entries) {
+            if (e.sourceTrack == 0)
+                continue;  // V1 stays on the legacy decoder, never pooled
+            newPaths.insert(TrackKey{e.sourceClipIndex, e.sourceTrack}, e.filePath);
+        }
+        for (auto it = m_trackDecoders.begin(); it != m_trackDecoders.end(); ) {
+            const TrackKey &k = it.key();
+            const auto p = newPaths.constFind(k);
+            const bool stillValid = (p != newPaths.constEnd())
+                                    && it.value()
+                                    && (*p == it.value()->filePath);
+            if (stillValid) {
+                ++it;
+                continue;
+            }
+            TrackDecoder *d = it.value();
+            const int slotClipId = (k.sourceTrack << 16) | (k.sourceClipIndex & 0xFFFF);
+            m_slotManager.releaseSlot(slotClipId);
+            it = m_trackDecoders.erase(it);
+            if (d) {
+                d->graceTtlTicks = 4;
+                m_evictionGracePool.append(d);
+            }
+        }
+    }
+
     if (entries.isEmpty()) {
         // Timeline emptied (all clips deleted). Pause and clear the slider so
         // the player doesn't keep ticking against a stale file. We don't tear
@@ -1519,6 +1554,12 @@ void VideoPlayer::performPendingSeek()
     }
 
     m_seekInProgress = false;
+    // After a seek completes, V2+ pool decoders may still hold lastFrameRgb
+    // and currentPositionUs from before the seek. Ask the next playback tick
+    // to clear firstFrameDecoded on every active pool decoder so
+    // harvestOverlayLayer drops into its catch-up loop and lands on the
+    // correct file-local position for the new playhead.
+    m_postSeekResyncRequested = true;
 
     if (m_pendingSeekMs >= 0) {
         if (m_seekTimer)
@@ -1669,7 +1710,12 @@ bool VideoPlayer::presentDecodedFrame(AVFrame *frame, bool displayFrameRequested
         const QImage image = frameToImage(displayable);
         if (image.isNull())
             return false;
-        displayFrame(image);
+        // Cache the raw V1 source BEFORE the display gate so the Phase 1d
+        // compositor in handlePlaybackTick has the latest frame to paint
+        // overlays on, even when we defer the displayFrame call below.
+        m_lastSourceFrame = image;
+        if (!m_deferDisplayThisTick)
+            displayFrame(image);
         updatePositionUi();
     }
 
@@ -1864,6 +1910,33 @@ void VideoPlayer::handlePlaybackTick()
     if (!m_playing)
         return;
 
+    // Sweep the eviction grace pool first so any decoder whose graceTtl
+    // dropped to 0 last tick is freed before we touch the pool again. Safe
+    // here because no decode loop has started this tick.
+    tickEvictionGracePool();
+
+    // Post-seek resync: clear firstFrameDecoded on every V2+ pool decoder
+    // so harvestOverlayLayer drops into its long catch-up path on the very
+    // next call, instead of trusting stale lastFrameRgb from before the
+    // seek. Cheap — sets a bool, doesn't free anything.
+    if (m_postSeekResyncRequested) {
+        for (auto it = m_trackDecoders.begin(); it != m_trackDecoders.end(); ++it) {
+            if (it.value())
+                it.value()->firstFrameDecoded = false;
+        }
+        m_postSeekResyncRequested = false;
+    }
+
+    // Decide upfront whether the V1 frame for this tick will be composited
+    // with V2+ overlays. When yes, presentDecodedFrame caches the V1 frame
+    // into m_lastSourceFrame but skips displayFrame so the compositor step
+    // below can blend the overlays before pushing the final image.
+    const bool willComposite = m_playbackSpeed >= 0.0
+                               && sequenceActive()
+                               && !m_seekInProgress
+                               && hasOverlayActive(findActiveEntriesAt(m_timelinePositionUs));
+    m_deferDisplayThisTick = willComposite;
+
     bool advanced = false;
     if (m_playbackSpeed >= 0.0) {
         // Drift correction runs BEFORE the display decode so the frame the
@@ -1875,6 +1948,38 @@ void VideoPlayer::handlePlaybackTick()
         const int64_t stepUs = qMax<int64_t>(1, m_frameDurationUs);
         const int64_t targetUs = qMax<int64_t>(0, m_currentPositionUs - stepUs);
         advanced = seekInternal(targetUs, true, true);
+    }
+    // Always clear the flag so any subsequent displayFrame call (boundary
+    // jump, seekInternal in reverse, etc.) is unguarded.
+    m_deferDisplayThisTick = false;
+
+    // Compositor step: paint V2+ overlays on top of the cached V1 frame and
+    // push to the GLPreview. Only runs forward, in sequence mode, when not
+    // in a preview seek. V1-only timelines short-circuit via hasOverlayActive
+    // (overlays.isEmpty -> displayFrame is bypassed entirely on the legacy
+    // path because m_deferDisplayThisTick was false above).
+    if (advanced && willComposite && !m_lastSourceFrame.isNull()) {
+        const QVector<int> activeIdxs = findActiveEntriesAt(m_timelinePositionUs);
+        QVector<DecodedLayer> overlays;
+        overlays.reserve(activeIdxs.size());
+        for (int idx : activeIdxs) {
+            if (idx < 0 || idx >= m_sequence.size())
+                continue;
+            const auto &e = m_sequence[idx];
+            if (e.sourceTrack == 0)
+                continue;  // V1 base, already cached in m_lastSourceFrame
+            DecodedLayer layer;
+            if (harvestOverlayLayer(e, idx, &layer))
+                overlays.append(layer);
+        }
+        if (!overlays.isEmpty()) {
+            const QImage composed = composeMultiTrackFrame(m_lastSourceFrame, overlays);
+            displayFrame(composed);
+        } else {
+            // Every overlay bailed (decoder open failed, slot exhausted).
+            // Fall back to the V1-only display so the user still sees video.
+            displayFrame(m_lastSourceFrame);
+        }
     }
 
     // A/V sync: INDEPENDENT schedules by default (video owns
@@ -2259,4 +2364,223 @@ enum AVPixelFormat VideoPlayer::poolGetHwFormatCallback(AVCodecContext *ctx, con
     }
     qWarning() << "poolGetHwFormatCallback: HW pixel format not offered, falling back to SW";
     return pixFmts[0];
+}
+
+// ---- Phase 1d software compositor ------------------------------------------
+//
+// composeMultiTrackFrame paints overlay layers (V2+) on top of the V1 base
+// using QPainter::CompositionMode_SourceOver against an ARGB32_Premultiplied
+// canvas. Each layer's videoScale/videoDx/videoDy follows the OBS-style
+// transform convention used elsewhere in the player: dx/dy in canvas-relative
+// 0..1 units, scale around the canvas center.
+//
+// V1-only timeline regression safety: when overlayLayers is empty we return
+// v1Frame unchanged so the legacy displayFrame path (composeFrameWithOverlays
+// for text + GLPreview push) sees the exact same QImage it always saw.
+
+QImage VideoPlayer::composeMultiTrackFrame(const QImage &v1Frame,
+                                           const QVector<DecodedLayer> &overlayLayers) const
+{
+    if (v1Frame.isNull() || overlayLayers.isEmpty())
+        return v1Frame;
+
+    QImage composed = v1Frame.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+    QPainter p(&composed);
+    p.setRenderHint(QPainter::SmoothPixmapTransform, true);
+    p.setCompositionMode(QPainter::CompositionMode_SourceOver);
+
+    const QSize canvas(composed.width(), composed.height());
+    for (const DecodedLayer &L : overlayLayers) {
+        if (L.rgb.isNull() || L.opacity <= 0.001)
+            continue;
+        p.save();
+        p.setOpacity(qBound(0.0, L.opacity, 1.0));
+        const double cx = canvas.width()  * 0.5 + L.videoDx * canvas.width();
+        const double cy = canvas.height() * 0.5 + L.videoDy * canvas.height();
+        p.translate(cx, cy);
+        p.scale(L.videoScale, L.videoScale);
+        p.drawImage(QRectF(-L.rgb.width() * 0.5, -L.rgb.height() * 0.5,
+                           L.rgb.width(), L.rgb.height()),
+                    L.rgb);
+        p.restore();
+    }
+    p.end();
+    return composed;
+}
+
+// decodePoolFrame is decodeNextFrame's V2+ twin: same FFmpeg loop logic but
+// runs against a TrackDecoder* instead of the legacy m_formatCtx/m_codecCtx
+// pair. It does NOT call displayFrame — the compositor in handlePlaybackTick
+// owns the display step. On success the pool decoder's lastFrameRgb /
+// currentPositionUs / firstFrameDecoded are updated; on failure (EOF) the
+// caller falls back to the previous lastFrameRgb so the overlay stays sticky
+// instead of going black at clip ends.
+bool VideoPlayer::decodePoolFrame(TrackDecoder *d)
+{
+    if (!d || !d->formatCtx || !d->codecCtx || !d->packet || !d->frame)
+        return false;
+
+    const auto receiveFrame = [this, d]() -> bool {
+        const int receiveResult = avcodec_receive_frame(d->codecCtx, d->frame);
+        if (receiveResult != 0)
+            return false;
+
+        // Compute file-local position in microseconds.
+        AVStream *stream = d->formatCtx->streams[d->videoStreamIndex];
+        const int64_t bestEffortTimestamp =
+            (d->frame->best_effort_timestamp != AV_NOPTS_VALUE)
+                ? d->frame->best_effort_timestamp
+                : d->frame->pts;
+        int64_t positionUs = d->currentPositionUs;
+        if (bestEffortTimestamp != AV_NOPTS_VALUE) {
+            int64_t ts = bestEffortTimestamp;
+            if (stream->start_time != AV_NOPTS_VALUE)
+                ts -= stream->start_time;
+            positionUs = av_rescale_q(ts, stream->time_base, AV_TIME_BASE_Q);
+        } else if (d->frameDurationUs > 0) {
+            positionUs += d->frameDurationUs;
+        }
+        positionUs = qMax<int64_t>(0, positionUs);
+        if (d->durationUs > 0)
+            positionUs = qMin(positionUs, d->durationUs);
+        d->currentPositionUs = positionUs;
+
+        // HW->SW transfer if the decoder is on D3D11VA.
+        AVFrame *displayable = d->frame;
+        if (d->hwPixFmt != AV_PIX_FMT_NONE && d->frame->format == d->hwPixFmt) {
+            if (!d->swFrame)
+                return false;
+            av_frame_unref(d->swFrame);
+            if (av_hwframe_transfer_data(d->swFrame, d->frame, 0) < 0) {
+                qWarning() << "decodePoolFrame: av_hwframe_transfer_data failed";
+                return false;
+            }
+            d->swFrame->pts = d->frame->pts;
+            d->swFrame->best_effort_timestamp = d->frame->best_effort_timestamp;
+            displayable = d->swFrame;
+        }
+
+        if (!displayable || displayable->width <= 0 || displayable->height <= 0)
+            return false;
+
+        // sws_scale into a QImage. Pool stays SDR for the MVP — HDR overlay
+        // mixing isn't supported yet (V1 still drives the HDR transfer
+        // metadata). RGB24 is fine for SourceOver compositing because we
+        // promote to ARGB32_Premultiplied in composeMultiTrackFrame anyway.
+        d->swsCtx = sws_getCachedContext(
+            d->swsCtx,
+            displayable->width, displayable->height,
+            static_cast<AVPixelFormat>(displayable->format),
+            displayable->width, displayable->height,
+            AV_PIX_FMT_RGB24,
+            SWS_BILINEAR, nullptr, nullptr, nullptr);
+        if (!d->swsCtx)
+            return false;
+        QImage image(displayable->width, displayable->height, QImage::Format_RGB888);
+        if (image.isNull())
+            return false;
+        uint8_t *dest[4]      = { image.bits(), nullptr, nullptr, nullptr };
+        int      destLines[4] = { static_cast<int>(image.bytesPerLine()), 0, 0, 0 };
+        sws_scale(d->swsCtx, displayable->data, displayable->linesize, 0,
+                  displayable->height, dest, destLines);
+
+        d->lastFrameRgb = image;
+        d->firstFrameDecoded = true;
+        return true;
+    };
+
+    if (receiveFrame())
+        return true;
+
+    while (av_read_frame(d->formatCtx, d->packet) >= 0) {
+        if (d->packet->stream_index != d->videoStreamIndex) {
+            av_packet_unref(d->packet);
+            continue;
+        }
+        const int sendResult = avcodec_send_packet(d->codecCtx, d->packet);
+        av_packet_unref(d->packet);
+        if (sendResult < 0)
+            continue;
+        if (receiveFrame())
+            return true;
+    }
+
+    if (avcodec_send_packet(d->codecCtx, nullptr) >= 0 && receiveFrame())
+        return true;
+
+    return false;
+}
+
+bool VideoPlayer::harvestOverlayLayer(const PlaybackEntry &e, int seqIdx, DecodedLayer *out)
+{
+    if (!out)
+        return false;
+
+    TrackDecoder *d = acquireDecoderForClip(e);
+    if (!d)
+        return false;
+
+    const int64_t expectedFileLocalUs = entryLocalPositionUs(seqIdx, m_timelinePositionUs);
+    const int64_t halfFrame = qMax<int64_t>(1, d->frameDurationUs / 2);
+    const int64_t drift = expectedFileLocalUs - d->currentPositionUs;
+
+    // Case B: large drift (rewind / non-1x speed mismatch / post-seek). Re-seek.
+    if (d->firstFrameDecoded
+        && (drift < -halfFrame * 2 || drift > d->frameDurationUs * 4)) {
+        const int64_t clipInUs  = static_cast<int64_t>(e.clipIn  * AV_TIME_BASE);
+        const int64_t clipOutUs = static_cast<int64_t>(e.clipOut * AV_TIME_BASE);
+        const int64_t targetUs = qBound<int64_t>(clipInUs, expectedFileLocalUs, clipOutUs);
+        av_seek_frame(d->formatCtx, -1, targetUs, AVSEEK_FLAG_BACKWARD);
+        avcodec_flush_buffers(d->codecCtx);
+        d->currentPositionUs = targetUs;
+    }
+
+    int catchupCap = d->firstFrameDecoded ? 4 : 8;
+    bool ok = false;
+    while (catchupCap-- > 0) {
+        ok = decodePoolFrame(d);
+        if (!ok)
+            break;
+        if (d->currentPositionUs + halfFrame >= expectedFileLocalUs)
+            break;
+    }
+
+    if (!d->lastFrameRgb.isNull()) {
+        out->rgb     = d->lastFrameRgb;
+        out->isFresh = ok;
+    } else {
+        // Fresh decoder with no successful decode yet — try the eviction
+        // grace pool for the same (clip, track). Not common but it keeps
+        // the overlay visible across reconciliation churn.
+        for (TrackDecoder *g : m_evictionGracePool) {
+            if (!g)
+                continue;
+            if (g->sourceClipIndex == e.sourceClipIndex
+                && g->sourceTrack    == e.sourceTrack
+                && !g->lastFrameRgb.isNull()) {
+                out->rgb     = g->lastFrameRgb;
+                out->isFresh = false;
+                break;
+            }
+        }
+        if (out->rgb.isNull())
+            return false;
+    }
+
+    out->opacity     = e.opacity;
+    out->videoScale  = e.videoScale;
+    out->videoDx     = e.videoDx;
+    out->videoDy     = e.videoDy;
+    out->sourceTrack = e.sourceTrack;
+    out->sequenceIdx = seqIdx;
+    return true;
+}
+
+bool VideoPlayer::hasOverlayActive(const QVector<int> &activeIdxs) const
+{
+    for (int idx : activeIdxs) {
+        if (idx >= 0 && idx < m_sequence.size() && m_sequence[idx].sourceTrack > 0)
+            return true;
+    }
+    return false;
 }

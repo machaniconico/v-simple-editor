@@ -270,6 +270,29 @@ private:
 
     TrackDecoder *acquireDecoderForClip(const PlaybackEntry &entry);
     void releaseDecoderForClip(const TrackKey &key);
+
+    // ---- Phase 1d software compositor ---------------------------------------
+    // One overlay layer harvested from a V2+ TrackDecoder for the current
+    // tick. composeMultiTrackFrame paints these on top of the V1 frame in
+    // m_sequence order (V1 base + V2/V3/... above), with isFresh=false
+    // entries falling back to the previous decoded frame from the eviction
+    // grace pool when a re-seek hasn't caught up yet.
+    struct DecodedLayer {
+        QImage rgb;
+        double opacity = 1.0;
+        double videoScale = 1.0;
+        double videoDx = 0.0;
+        double videoDy = 0.0;
+        int sourceTrack = 0;
+        int sequenceIdx = -1;
+        bool isFresh = true;
+    };
+
+    QImage composeMultiTrackFrame(const QImage &v1Frame,
+                                  const QVector<DecodedLayer> &overlayLayers) const;
+    bool harvestOverlayLayer(const PlaybackEntry &entry, int seqIdx, DecodedLayer *out);
+    bool decodePoolFrame(TrackDecoder *d);
+    bool hasOverlayActive(const QVector<int> &activeIdxs) const;
     // Tear down every active V2+ decoder + every grace-pool decoder.
     // Called from the destructor and from setSequence() reconciliation
     // when the clip set genuinely changed (US-3 will refine this).
@@ -324,6 +347,16 @@ private:
     bool m_pendingSeekPrecise = false;
     bool m_seekInProgress = false;
     bool m_suppressUiUpdates = false; // guard against intermediate slider flashes during cross-file seeks
+    // Phase 1d compositor: when true, presentDecodedFrame caches the V1
+    // frame into m_lastSourceFrame but skips displayFrame so the compositor
+    // step in handlePlaybackTick can blend overlays on top before pushing
+    // the final image to the GLPreview.
+    bool m_deferDisplayThisTick = false;
+    // After preview/seek completes the V2+ pool decoders may still hold
+    // stale lastFrameRgb / currentPositionUs values. This flag asks the
+    // next handlePlaybackTick to re-seed them by clearing firstFrameDecoded
+    // so harvestOverlayLayer falls into its catch-up loop.
+    bool m_postSeekResyncRequested = false;
     int m_lastDragMs = -1;
     int m_audioResyncTickCount = 0;
     qint64 m_audioUnmuteToken = 0;
