@@ -109,8 +109,7 @@ private:
 
     // Source duration in microseconds for the in-flight proxy job, populated
     // by probeDurationUs at queue time. Zero means probe failed or input has
-    // no duration (image-only); parseFfmpegProgress short-circuits in that
-    // case and the dialog runs indeterminate.
+    // no duration (image-only) — see probeDurationUs for the contract.
     qint64 m_currentSourceDurationUs = 0;
     QString m_currentClipName;
     bool m_cancelRequested = false;

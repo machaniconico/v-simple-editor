@@ -288,8 +288,7 @@ void ProxyManager::processNextInQueue()
     emit proxyStarted(m_currentClipName);
     if (m_currentSourceDurationUs <= 0) {
         // Probe failed or input has no duration (image, broken file). Push
-        // an indeterminate marker so the dialog stops sitting at 0% — the
-        // bar will spin until proxyFinished/proxyCancelled fires.
+        // an indeterminate marker so the dialog stops sitting at 0%.
         emit proxyProgress(m_currentClipName, -1);
     }
 
