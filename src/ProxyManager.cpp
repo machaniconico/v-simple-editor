@@ -199,7 +199,18 @@ QString ProxyManager::currentEffectiveEncoder() const
     if (!m_encoderOverride.isEmpty() && kValid.contains(m_encoderOverride))
         return m_encoderOverride;
     const QString gpu = chosenGpuH264Encoder();
-    return gpu.isEmpty() ? QStringLiteral("libx264") : gpu;
+    if (!gpu.isEmpty())
+        return gpu;
+    // Mirror the #if VEDITOR_AV1 branch in processNextInQueue: when no GPU
+    // encoder is available and override is empty, that path falls through
+    // to libsvtav1 in the modern edition. Otherwise every modern-edition
+    // proxy would carry a libsvtav1 fingerprint while currentEffectiveEncoder
+    // returns libx264, marking every entry permanently stale.
+#if defined(VEDITOR_AV1)
+    if (ffmpegHasEncoder("libsvtav1"))
+        return QStringLiteral("libsvtav1");
+#endif
+    return QStringLiteral("libx264");
 }
 
 bool ProxyManager::isEntryStale(const ProxyEntry &entry) const
