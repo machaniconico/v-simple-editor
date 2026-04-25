@@ -451,8 +451,13 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
     {
         QSet<TrackKey> newKeys;
         for (const auto &e : entries) {
-            if (e.sourceTrack == 0)
-                continue;  // V1 stays on the legacy decoder, never pooled
+            // Include every entry (V1 included). V1 enters the pool when
+            // it isn't m_activeEntry — Scenario E: V2 starts earlier than
+            // V1 so m_sequence sorts V2 first; the legacy decoder rides
+            // V2 while V1 has to come from the pool to paint on top.
+            // Excluding V1 here would force-evict its pool decoder on
+            // every Timeline edit and the user sees a stutter every
+            // drag/trim commit.
             newKeys.insert(TrackKey{e.filePath, qRound64(e.clipIn * 1000.0),
                                     e.sourceTrack, e.sourceClipIndex});
         }
@@ -2189,7 +2194,14 @@ VideoPlayer::TrackDecoder *VideoPlayer::acquireDecoderForClip(const PlaybackEntr
 
     DecoderSlotManager::SlotRequest req;
     req.clipId = slotClipId;
-    req.trackIdx = entry.sourceTrack;
+    // Slot manager treats trackIdx==0 as "the protected V1 slot — never
+    // evict". Pool entries are by construction NOT m_activeEntry (the
+    // layer-construction loop gates that case), so a V1 entry that lands
+    // in the pool is just another overlay layer, not the main timeline
+    // video. Map V1's 0 → 1 so the protection logic doesn't pin a pool
+    // slot indefinitely; the legacy decoder still owns the primary V1
+    // instance when V1 IS m_activeEntry.
+    req.trackIdx = (entry.sourceTrack == 0) ? 1 : entry.sourceTrack;
     req.clipStartSec = entry.timelineStart;
 
     int evictedClipId = -1;
