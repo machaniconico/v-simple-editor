@@ -2612,21 +2612,18 @@ void MainWindow::toggleProxyMode()
 
     if (!m_timeline || !m_player)
         return;
-    // Re-resolve every clip's playback path through the sequenceChanged →
-    // setSequence wiring. A bare loadFile() would only swap the single-file
-    // legacy player and never touch the multi-clip sequence VideoPlayer is
-    // actually running, so the preview would silently keep the old path.
-    //
-    // Wrap the refresh in pause/play because setSequence will tear down the
-    // ffmpeg decoder when the resolved file path differs (original→proxy or
-    // proxy→original), and the audio side-player is reset by setAudioSequence
-    // immediately after. Without the wrap, the frame scheduler tries to
-    // resume against a half-rebuilt audio clock and the preview rewinds and
-    // speeds up while it catches up.
+    // Snapshot playback state, refresh the sequence so getProxyPath picks
+    // up the new resolution, then re-seek to where we were. setSequence's
+    // own clamped restoration is not enough because loadFile resets the
+    // file-local position to 0 and the decoder bootstraps from there —
+    // the explicit seek after refresh forces the new decoder to land on
+    // the same timeline position the user was watching.
     const bool wasPlaying = m_player->isPlaying();
+    const int64_t posUs = m_player->timelinePositionUs();
     if (wasPlaying)
         m_player->pause();
     m_timeline->refreshPlaybackSequence();
+    m_player->seek(static_cast<int>(posUs / 1000));
     if (wasPlaying)
         m_player->play();
 }
@@ -2668,8 +2665,26 @@ void MainWindow::generateProxies()
         if (reply == QMessageBox::Cancel)
             return;
         if (reply == QMessageBox::Yes) {
+            // Releasing the proxy file while VideoPlayer is mid-decode on
+            // it crashes the app — the avformat demuxer holds an open
+            // handle that suddenly points at deleted bytes. Cancel any
+            // in-flight ffmpeg job, force the player off proxy paths, and
+            // only then unlink the files. The proxy mode flag is restored
+            // afterwards so the new generation will switch the preview to
+            // the freshly-built proxies once allProxiesReady fires.
+            pm.cancelGeneration();
+            if (m_player && m_player->isPlaying())
+                m_player->pause();
+            const bool wasProxyMode = pm.isProxyMode();
+            if (wasProxyMode) {
+                pm.setProxyMode(false);
+                if (m_timeline)
+                    m_timeline->refreshPlaybackSequence();
+            }
             for (const auto &p : paths)
                 pm.deleteProxy(p);
+            if (wasProxyMode)
+                pm.setProxyMode(true);
         }
     }
 
@@ -2683,14 +2698,16 @@ void MainWindow::generateProxies()
         // would keep playing the original even after generation finishes.
         // Re-emit the sequences so getProxyPath picks up the now-Ready paths.
         //
-        // Pause/play wrap matches toggleProxyMode: the file swap inside
-        // setSequence and the audio side-player rebuild inside
-        // setAudioSequence both happen synchronously in the same emit chain,
-        // and resuming through that gap caused a visible rewind + speed-up.
+        // Pause/play wrap + explicit re-seek matches toggleProxyMode: the
+        // file swap inside setSequence resets the decoder's file-local
+        // position to 0, so we have to push the timeline position back
+        // ourselves once the new entries are in place.
         const bool wasPlaying = m_player->isPlaying();
+        const int64_t posUs = m_player->timelinePositionUs();
         if (wasPlaying)
             m_player->pause();
         m_timeline->refreshPlaybackSequence();
+        m_player->seek(static_cast<int>(posUs / 1000));
         if (wasPlaying)
             m_player->play();
     }, Qt::UniqueConnection);

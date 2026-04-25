@@ -68,6 +68,13 @@ public:
     // visible rewind + speed-up when the path resolution changed underneath
     // an active playback.
     bool isPlaying() const { return m_playing; }
+
+    // Current playhead in timeline microseconds. MainWindow calls this
+    // before refreshPlaybackSequence so it can re-seek the player to the
+    // same position once the path resolution settles, instead of relying
+    // on setSequence's clamped restoration which drifts back to the head
+    // when the new entries trigger a fresh decoder open.
+    int64_t timelinePositionUs() const { return m_timelinePositionUs; }
     GLPreview *glPreview() const { return m_glPreview; }
 
     struct HdrInfo {
