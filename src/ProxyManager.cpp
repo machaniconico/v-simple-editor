@@ -181,9 +181,44 @@ QString ProxyManager::proxyFilePath(const QString &originalPath) const
     return proxyDir() + "/" + hash + "." + m_config.format;
 }
 
+// Returns the canonical path for proxy_index.json, intentionally stored
+// OUTSIDE proxyDir(). Rationale (Codex review, 2026-04-25): proxyDir() is
+// now user-configurable via QSettings (US-3). If we kept the index inside
+// the storage directory, switching the storage path would make the old
+// index invisible and every Ready entry would be reported as None. By
+// pinning the index to AppLocalDataLocation we keep the registry stable
+// across storageDir changes and let proxyPath itself remain absolute.
+static QString proxyIndexPath()
+{
+    QString base = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
+    if (base.isEmpty())
+        base = QDir::homePath() + "/.veditor";
+    QDir().mkpath(base);
+    return base + "/proxy_index.json";
+}
+
 void ProxyManager::loadIndex()
 {
-    QString indexPath = proxyDir() + "/index.json";
+    const QString indexPath = proxyIndexPath();
+    // One-shot migration: if the new path doesn't exist but the legacy
+    // proxyDir()/index.json does, copy it over and remove the old one.
+    if (!QFile::exists(indexPath)) {
+        const QString legacyPath = proxyDir() + "/index.json";
+        if (QFile::exists(legacyPath)) {
+            QFile legacy(legacyPath);
+            if (legacy.open(QIODevice::ReadOnly)) {
+                const QByteArray content = legacy.readAll();
+                legacy.close();
+                QFile dst(indexPath);
+                if (dst.open(QIODevice::WriteOnly)) {
+                    dst.write(content);
+                    dst.close();
+                    QFile::remove(legacyPath);
+                }
+            }
+        }
+    }
+
     QFile file(indexPath);
     if (!file.open(QIODevice::ReadOnly))
         return;
@@ -216,7 +251,7 @@ void ProxyManager::loadIndex()
 
 void ProxyManager::saveIndex()
 {
-    QString indexPath = proxyDir() + "/index.json";
+    const QString indexPath = proxyIndexPath();
     QJsonArray entries;
 
     for (auto it = m_entries.constBegin(); it != m_entries.constEnd(); ++it) {
