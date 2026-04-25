@@ -11,10 +11,33 @@
 #include <QMediaPlayer>
 #include <QAudioOutput>
 #include <QVector>
+#include <QHash>
 #include <QRectF>
 #include "VideoEffect.h"
 #include "PlaybackTypes.h"
 #include "TextManager.h"
+#include "DecoderSlotManager.h"
+
+// Identifies a per-clip decoder in the V2+ pool. Keyed on the source
+// (sourceClipIndex, sourceTrack) tuple rather than the m_sequence index so
+// the entry can survive Timeline::sequenceChanged re-emits (which renumber
+// the sequence even when the underlying clip set hasn't changed). V1
+// (sourceTrack == 0) is *never* keyed into the pool — it stays on the
+// legacy single-decoder path (m_formatCtx/m_codecCtx).
+struct TrackKey {
+    int sourceClipIndex = -1;
+    int sourceTrack = 0;
+    bool operator==(const TrackKey &other) const noexcept
+    {
+        return sourceClipIndex == other.sourceClipIndex
+            && sourceTrack == other.sourceTrack;
+    }
+};
+
+inline uint qHash(const TrackKey &k, uint seed = 0) noexcept
+{
+    return qHash(k.sourceClipIndex, seed) ^ qHash(k.sourceTrack, seed + 0x9e3779b9u);
+}
 
 class GLPreview;
 class QResizeEvent;
@@ -213,6 +236,53 @@ private:
     // playback. Returns the number of extra frames actually skip-decoded.
     int correctVideoDriftAgainstAudioClock();
 
+    // ---- Per-clip decoder pool (Phase 1b infrastructure) ---------------------
+    // V1 (sourceTrack == 0) keeps using the existing single decoder
+    // (m_formatCtx/m_codecCtx/m_frame/...). V2+ entries open their own
+    // TrackDecoder lazily on demand. Per-tick wiring (acquire on active
+    // entries, composite, evict via grace) is added in US-3 — this struct
+    // and its lifecycle helpers are the infrastructure that wiring builds
+    // upon.
+    struct TrackDecoder {
+        int sourceClipIndex = -1;
+        int sourceTrack = 0;
+        QString filePath;
+        AVFormatContext *formatCtx = nullptr;
+        AVCodecContext *codecCtx = nullptr;
+        SwsContext *swsCtx = nullptr;
+        AVFrame *frame = nullptr;
+        AVFrame *swFrame = nullptr;
+        AVPacket *packet = nullptr;
+        int videoStreamIndex = -1;
+        AVPixelFormat hwPixFmt = AV_PIX_FMT_NONE;
+        int64_t durationUs = 0;
+        int64_t frameDurationUs = 0;
+        double displayAspect = 0.0;
+        int64_t currentPositionUs = 0;
+        QImage lastFrameRgb;
+        int64_t lastFramePresentedTimelineUs = -1;
+        bool firstFrameDecoded = false;
+        // > 0 means this decoder has been moved into the eviction grace
+        // pool. Decremented per playback tick; reaches 0 → safe to free
+        // (deferred outside decode loop).
+        int graceTtlTicks = 0;
+    };
+
+    TrackDecoder *acquireDecoderForClip(const PlaybackEntry &entry);
+    void releaseDecoderForClip(const TrackKey &key);
+    // Tear down every active V2+ decoder + every grace-pool decoder.
+    // Called from the destructor and from setSequence() reconciliation
+    // when the clip set genuinely changed (US-3 will refine this).
+    void clearAllPoolDecoders();
+    // Decrement grace TTLs and free any TrackDecoder that hits zero.
+    // MUST NOT be called from inside decodeNextFrame / presentDecodedFrame
+    // / handlePlaybackTick — call only from a deferred QTimer::singleShot
+    // or at the start of the next tick.
+    void tickEvictionGracePool();
+    TrackDecoder *openTrackDecoder(const PlaybackEntry &entry);
+    void closeTrackDecoder(TrackDecoder *d);
+    static enum AVPixelFormat poolGetHwFormatCallback(AVCodecContext *ctx, const enum AVPixelFormat *pixFmts);
+
     QLabel *m_videoDisplay;
     GLPreview *m_glPreview = nullptr;
     bool m_useGL = true;
@@ -295,6 +365,22 @@ private:
     // CPU-path effects are active during playback, so heavy Sharpen/Mosaic/
     // ChromaKey stay smooth. Persisted via QSettings "proxyDivisor".
     int m_proxyDivisor = 1;
+
+    // ---- Per-clip decoder pool state (V2+ only) -----------------------------
+    // Active V2+ decoders, keyed on (sourceClipIndex, sourceTrack). V1
+    // never lives here — it stays on m_formatCtx/m_codecCtx.
+    QHash<TrackKey, TrackDecoder*> m_trackDecoders;
+    // Bounded grace pool for evicted decoders. Each entry counts down
+    // graceTtlTicks per playback tick; when it reaches 0 the decoder
+    // is freed. Capped at 4 entries — newer evictions push older ones
+    // straight to closeTrackDecoder.
+    QVector<TrackDecoder*> m_evictionGracePool;
+    DecoderSlotManager m_slotManager;
+    // Shared HW device context used by every pool decoder. Created lazily
+    // on the first openTrackDecoder() call. Kept distinct from the legacy
+    // V1 m_hwDeviceCtx so V1 regression risk stays at zero.
+    AVBufferRef *m_sharedPoolHwDeviceCtx = nullptr;
+    AVPixelFormat m_sharedPoolHwPixFmt = AV_PIX_FMT_NONE;
 
     // Return a new QImage with any active text overlays drawn on top.
     // Active = startTime <= now < (endTime > 0 ? endTime : infinity),

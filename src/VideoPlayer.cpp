@@ -103,6 +103,14 @@ VideoPlayer::~VideoPlayer()
     if (m_playbackTimer) m_playbackTimer->stop();
     if (m_seekTimer)     m_seekTimer->stop();
     resetDecoder();
+    // Tear down V2+ decoder pool after the legacy V1 decoder is gone, then
+    // release the shared HW device context. The pool decoders only hold
+    // av_buffer_ref'd handles to m_sharedPoolHwDeviceCtx, so freeing them
+    // first decrements the refcount to 1 (held by VideoPlayer itself).
+    clearAllPoolDecoders();
+    if (m_sharedPoolHwDeviceCtx)
+        av_buffer_unref(&m_sharedPoolHwDeviceCtx);
+    m_sharedPoolHwPixFmt = AV_PIX_FMT_NONE;
 }
 
 void VideoPlayer::setupUI()
@@ -1924,4 +1932,331 @@ void VideoPlayer::handlePlaybackTick()
     applyAudioEntryAtTimeline(m_timelinePositionUs, /*forceSourceReload=*/false, /*forceReposition=*/false);
 
     scheduleNextFrame();
+}
+
+// ---- Per-clip decoder pool (V2+ only) ---------------------------------------
+//
+// V1 (sourceTrack == 0) is intentionally never routed here: it stays on the
+// legacy single-decoder path (m_formatCtx/m_codecCtx/...). The pool exists so
+// V2+ overlay clips can keep their own AVFormatContext / AVCodecContext open
+// across short cuts without re-opening the file every time the playhead
+// crosses a clip boundary, while DecoderSlotManager bounds the number of
+// concurrent HW-decoder sessions on the GPU.
+//
+// Lifecycle invariant (US-2 contract):
+//   - Acquire returns a TrackDecoder for the requested entry; refresh path
+//     for already-open clips, eviction-with-grace path otherwise.
+//   - Eviction does NOT immediately tear down the displaced decoder; it
+//     drops to m_evictionGracePool with graceTtlTicks=4 so a stale
+//     reference held inside decodeNextFrame / presentDecodedFrame survives
+//     long enough to finish its current frame.
+//   - tickEvictionGracePool runs from a deferred / next-tick context only
+//     (US-3 wiring) — never from inside the decode loop.
+
+VideoPlayer::TrackDecoder *VideoPlayer::acquireDecoderForClip(const PlaybackEntry &entry)
+{
+    // V1 stays on the legacy decoder path — never poolable.
+    if (entry.sourceTrack == 0)
+        return nullptr;
+    if (entry.sourceClipIndex < 0)
+        return nullptr;
+
+    const TrackKey key{entry.sourceClipIndex, entry.sourceTrack};
+
+    // DecoderSlotManager indexes by a single int. Combine clip + track into a
+    // unique id; mirroring what TrackKey::operator== checks so two distinct
+    // (clip, track) tuples never collide. sourceTrack is small (<= a few),
+    // sourceClipIndex is a clip array index — high 16 bits for track, low
+    // 16 for clip is plenty.
+    const int slotClipId = (entry.sourceTrack << 16) | (entry.sourceClipIndex & 0xFFFF);
+
+    DecoderSlotManager::SlotRequest req;
+    req.clipId = slotClipId;
+    req.trackIdx = entry.sourceTrack;
+    req.clipStartSec = entry.timelineStart;
+
+    int evictedClipId = -1;
+    if (!m_slotManager.requestSlot(req, &evictedClipId)) {
+        // Every slot is held by V1 clips — caller must skip rendering this
+        // V2+ layer this tick. Should be rare since V1 is single-decoder.
+        return nullptr;
+    }
+
+    if (evictedClipId != -1) {
+        // Find the TrackDecoder that maps to evictedClipId and move it to
+        // the grace pool. We can't reverse the (track << 16 | clip) packing
+        // without iterating m_trackDecoders, so do that.
+        for (auto it = m_trackDecoders.begin(); it != m_trackDecoders.end(); ++it) {
+            const TrackKey &k = it.key();
+            const int packed = (k.sourceTrack << 16) | (k.sourceClipIndex & 0xFFFF);
+            if (packed == evictedClipId) {
+                TrackDecoder *evicted = it.value();
+                m_trackDecoders.erase(it);
+                if (evicted) {
+                    evicted->graceTtlTicks = 4;
+                    m_evictionGracePool.append(evicted);
+                }
+                break;
+            }
+        }
+    }
+
+    // Refresh path: slot manager refreshed an existing entry. Return the
+    // already-open decoder unchanged.
+    if (auto it = m_trackDecoders.find(key); it != m_trackDecoders.end())
+        return it.value();
+
+    // No existing decoder for this (clip, track) — open one.
+    TrackDecoder *fresh = openTrackDecoder(entry);
+    if (!fresh) {
+        // Open failed: free the slot we just claimed so a future retry can
+        // succeed. Pool stays consistent.
+        m_slotManager.releaseSlot(slotClipId);
+        return nullptr;
+    }
+    m_trackDecoders.insert(key, fresh);
+    return fresh;
+}
+
+void VideoPlayer::releaseDecoderForClip(const TrackKey &key)
+{
+    auto it = m_trackDecoders.find(key);
+    if (it == m_trackDecoders.end())
+        return;
+    TrackDecoder *d = it.value();
+    m_trackDecoders.erase(it);
+
+    const int slotClipId = (key.sourceTrack << 16) | (key.sourceClipIndex & 0xFFFF);
+    m_slotManager.releaseSlot(slotClipId);
+
+    // Synchronous teardown is OK here: callers reach this path from
+    // setSequence reconciliation or explicit clip removal — never from
+    // inside decodeNextFrame / presentDecodedFrame.
+    if (d) {
+        closeTrackDecoder(d);
+        delete d;
+    }
+}
+
+void VideoPlayer::clearAllPoolDecoders()
+{
+    for (auto it = m_trackDecoders.begin(); it != m_trackDecoders.end(); ++it) {
+        TrackDecoder *d = it.value();
+        if (!d)
+            continue;
+        closeTrackDecoder(d);
+        delete d;
+    }
+    m_trackDecoders.clear();
+
+    for (TrackDecoder *d : m_evictionGracePool) {
+        if (!d)
+            continue;
+        closeTrackDecoder(d);
+        delete d;
+    }
+    m_evictionGracePool.clear();
+
+    m_slotManager.clear();
+}
+
+void VideoPlayer::tickEvictionGracePool()
+{
+    // Walk in reverse so removal indices stay valid.
+    for (int i = m_evictionGracePool.size() - 1; i >= 0; --i) {
+        TrackDecoder *d = m_evictionGracePool[i];
+        if (!d) {
+            m_evictionGracePool.removeAt(i);
+            continue;
+        }
+        if (d->graceTtlTicks > 0)
+            --d->graceTtlTicks;
+        if (d->graceTtlTicks <= 0) {
+            closeTrackDecoder(d);
+            delete d;
+            m_evictionGracePool.removeAt(i);
+        }
+    }
+}
+
+VideoPlayer::TrackDecoder *VideoPlayer::openTrackDecoder(const PlaybackEntry &entry)
+{
+    auto *d = new TrackDecoder();
+    d->sourceClipIndex = entry.sourceClipIndex;
+    d->sourceTrack = entry.sourceTrack;
+    d->filePath = entry.filePath;
+
+    const QByteArray pathUtf8 = entry.filePath.toUtf8();
+    if (avformat_open_input(&d->formatCtx, pathUtf8.constData(), nullptr, nullptr) != 0) {
+        qWarning() << "openTrackDecoder: avformat_open_input failed for" << entry.filePath;
+        closeTrackDecoder(d);
+        delete d;
+        return nullptr;
+    }
+    if (avformat_find_stream_info(d->formatCtx, nullptr) < 0) {
+        qWarning() << "openTrackDecoder: avformat_find_stream_info failed for" << entry.filePath;
+        closeTrackDecoder(d);
+        delete d;
+        return nullptr;
+    }
+
+    d->videoStreamIndex = av_find_best_stream(d->formatCtx, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+    if (d->videoStreamIndex < 0) {
+        qWarning() << "openTrackDecoder: no video stream in" << entry.filePath;
+        closeTrackDecoder(d);
+        delete d;
+        return nullptr;
+    }
+
+    auto *codecpar = d->formatCtx->streams[d->videoStreamIndex]->codecpar;
+    const AVCodec *codec = avcodec_find_decoder(codecpar->codec_id);
+    if (!codec) {
+        qWarning() << "openTrackDecoder: unsupported codec for" << entry.filePath;
+        closeTrackDecoder(d);
+        delete d;
+        return nullptr;
+    }
+
+    d->codecCtx = avcodec_alloc_context3(codec);
+    if (!d->codecCtx || avcodec_parameters_to_context(d->codecCtx, codecpar) < 0) {
+        qWarning() << "openTrackDecoder: codec context alloc failed for" << entry.filePath;
+        closeTrackDecoder(d);
+        delete d;
+        return nullptr;
+    }
+
+    // Lazily create the shared HW device context the first time a pool
+    // decoder actually needs HW. Subsequent decoders just bump its refcount.
+    // V1's m_hwDeviceCtx is intentionally separate so any V2 HW failure
+    // never destabilises V1's decoder.
+    d->hwPixFmt = AV_PIX_FMT_NONE;
+    if (!m_sharedPoolHwDeviceCtx) {
+        AVBufferRef *fresh = nullptr;
+        if (av_hwdevice_ctx_create(&fresh, AV_HWDEVICE_TYPE_D3D11VA, nullptr, nullptr, 0) >= 0) {
+            m_sharedPoolHwDeviceCtx = fresh;
+        }
+    }
+    if (m_sharedPoolHwDeviceCtx) {
+        // Find the codec-specific HW pixel format for D3D11VA.
+        for (int i = 0;; ++i) {
+            const AVCodecHWConfig *cfg = avcodec_get_hw_config(codec, i);
+            if (!cfg)
+                break;
+            if ((cfg->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX)
+                && cfg->device_type == AV_HWDEVICE_TYPE_D3D11VA) {
+                d->hwPixFmt = cfg->pix_fmt;
+                break;
+            }
+        }
+        if (d->hwPixFmt != AV_PIX_FMT_NONE) {
+            d->codecCtx->opaque = d;
+            d->codecCtx->get_format = &VideoPlayer::poolGetHwFormatCallback;
+            d->codecCtx->hw_device_ctx = av_buffer_ref(m_sharedPoolHwDeviceCtx);
+        }
+    }
+    // Software fallback path: leave hwPixFmt = AV_PIX_FMT_NONE, no get_format
+    // hook, no hw_device_ctx. Decoder will emit SW frames directly.
+
+    if (avcodec_open2(d->codecCtx, codec, nullptr) < 0) {
+        qWarning() << "openTrackDecoder: avcodec_open2 failed for" << entry.filePath;
+        closeTrackDecoder(d);
+        delete d;
+        return nullptr;
+    }
+
+    d->packet = av_packet_alloc();
+    d->frame = av_frame_alloc();
+    d->swFrame = av_frame_alloc();
+    if (!d->packet || !d->frame || !d->swFrame) {
+        qWarning() << "openTrackDecoder: frame/packet alloc failed";
+        closeTrackDecoder(d);
+        delete d;
+        return nullptr;
+    }
+
+    // Duration / frame timing. Mirror loadFile's resolution order so the
+    // numbers downstream code expects line up.
+    if (d->formatCtx->duration > 0) {
+        d->durationUs = d->formatCtx->duration;
+    } else {
+        AVStream *stream = d->formatCtx->streams[d->videoStreamIndex];
+        if (stream->duration > 0)
+            d->durationUs = av_rescale_q(stream->duration, stream->time_base, AV_TIME_BASE_Q);
+    }
+
+    AVStream *vs = d->formatCtx->streams[d->videoStreamIndex];
+    AVRational fr = vs->avg_frame_rate;
+    if (fr.num <= 0 || fr.den <= 0)
+        fr = vs->r_frame_rate;
+    if (fr.num > 0 && fr.den > 0)
+        d->frameDurationUs = av_rescale_q(1, AVRational{fr.den, fr.num}, AV_TIME_BASE_Q);
+    if (d->frameDurationUs <= 0)
+        d->frameDurationUs = AV_TIME_BASE / 30;
+
+    if (vs->codecpar->width > 0 && vs->codecpar->height > 0) {
+        AVRational sar = vs->sample_aspect_ratio;
+        double sarVal = (sar.num > 0 && sar.den > 0)
+            ? static_cast<double>(sar.num) / sar.den : 1.0;
+        d->displayAspect = (static_cast<double>(vs->codecpar->width) * sarVal)
+            / static_cast<double>(vs->codecpar->height);
+    }
+
+    // Seek to the entry's clipIn so the first decoded frame is meaningful.
+    // Pool decoders are demand-decoded by US-3 wiring, but seeding the seek
+    // here means the first decoded packet won't be from t=0 of the source
+    // file when clipIn > 0.
+    const int64_t clipInUs = static_cast<int64_t>(entry.clipIn * AV_TIME_BASE);
+    if (clipInUs > 0) {
+        av_seek_frame(d->formatCtx, -1, clipInUs, AVSEEK_FLAG_BACKWARD);
+        avcodec_flush_buffers(d->codecCtx);
+    }
+    d->currentPositionUs = clipInUs;
+
+    return d;
+}
+
+void VideoPlayer::closeTrackDecoder(TrackDecoder *d)
+{
+    if (!d)
+        return;
+    // sws first since it doesn't depend on codec lifetime.
+    if (d->swsCtx) {
+        sws_freeContext(d->swsCtx);
+        d->swsCtx = nullptr;
+    }
+    if (d->frame)
+        av_frame_free(&d->frame);
+    if (d->swFrame)
+        av_frame_free(&d->swFrame);
+    if (d->packet)
+        av_packet_free(&d->packet);
+    if (d->codecCtx)
+        avcodec_free_context(&d->codecCtx);
+    if (d->formatCtx)
+        avformat_close_input(&d->formatCtx);
+    // m_sharedPoolHwDeviceCtx is intentionally NOT touched here. Each pool
+    // decoder holds its own av_buffer_ref'd handle through codecCtx; freeing
+    // the codec context above already drops that ref. The shared device
+    // itself stays alive until ~VideoPlayer.
+    d->hwPixFmt = AV_PIX_FMT_NONE;
+    d->videoStreamIndex = -1;
+    d->firstFrameDecoded = false;
+    d->lastFrameRgb = QImage();
+    d->lastFramePresentedTimelineUs = -1;
+    // Caller owns the heap allocation — closeTrackDecoder only does state
+    // cleanup so it can be called from openTrackDecoder's failure path
+    // before the pointer is even handed to the caller.
+}
+
+enum AVPixelFormat VideoPlayer::poolGetHwFormatCallback(AVCodecContext *ctx, const enum AVPixelFormat *pixFmts)
+{
+    auto *d = static_cast<TrackDecoder*>(ctx->opaque);
+    if (!d || d->hwPixFmt == AV_PIX_FMT_NONE)
+        return pixFmts[0];
+    for (const enum AVPixelFormat *p = pixFmts; *p != AV_PIX_FMT_NONE; ++p) {
+        if (*p == d->hwPixFmt)
+            return *p;
+    }
+    qWarning() << "poolGetHwFormatCallback: HW pixel format not offered, falling back to SW";
+    return pixFmts[0];
 }
