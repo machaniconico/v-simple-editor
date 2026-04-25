@@ -2616,7 +2616,19 @@ void MainWindow::toggleProxyMode()
     // setSequence wiring. A bare loadFile() would only swap the single-file
     // legacy player and never touch the multi-clip sequence VideoPlayer is
     // actually running, so the preview would silently keep the old path.
+    //
+    // Wrap the refresh in pause/play because setSequence will tear down the
+    // ffmpeg decoder when the resolved file path differs (original→proxy or
+    // proxy→original), and the audio side-player is reset by setAudioSequence
+    // immediately after. Without the wrap, the frame scheduler tries to
+    // resume against a half-rebuilt audio clock and the preview rewinds and
+    // speeds up while it catches up.
+    const bool wasPlaying = m_player->isPlaying();
+    if (wasPlaying)
+        m_player->pause();
     m_timeline->refreshPlaybackSequence();
+    if (wasPlaying)
+        m_player->play();
 }
 
 void MainWindow::generateProxies()
@@ -2636,6 +2648,31 @@ void MainWindow::generateProxies()
         paths << c.filePath;
 
     auto &pm = ProxyManager::instance();
+
+    // generateAllProxies skips clips whose entry is Ready/Generating, so a
+    // bare invocation on a project that already has proxies would emit
+    // allProxiesReady immediately without doing any work — confusing if the
+    // user expected to "regenerate". Offer to delete the existing proxies
+    // first so the queue actually runs.
+    int existing = 0;
+    for (const auto &p : paths)
+        if (pm.hasProxy(p)) ++existing;
+    if (existing > 0) {
+        const auto reply = QMessageBox::question(
+            this, "Proxies",
+            QString("既存のプロキシ %1 個を削除して再生成しますか?\n\n"
+                    "「いいえ」を選ぶと既存プロキシをそのまま使い、未生成のクリップだけ生成します。")
+                .arg(existing),
+            QMessageBox::Yes | QMessageBox::No | QMessageBox::Cancel,
+            QMessageBox::No);
+        if (reply == QMessageBox::Cancel)
+            return;
+        if (reply == QMessageBox::Yes) {
+            for (const auto &p : paths)
+                pm.deleteProxy(p);
+        }
+    }
+
     connect(&pm, &ProxyManager::allProxiesReady, this, [this]() {
         statusBar()->showMessage("All proxies generated");
         if (!m_timeline || !m_player)
@@ -2645,7 +2682,17 @@ void MainWindow::generateProxies()
         // loadFile() does not retarget the active sequence, so the preview
         // would keep playing the original even after generation finishes.
         // Re-emit the sequences so getProxyPath picks up the now-Ready paths.
+        //
+        // Pause/play wrap matches toggleProxyMode: the file swap inside
+        // setSequence and the audio side-player rebuild inside
+        // setAudioSequence both happen synchronously in the same emit chain,
+        // and resuming through that gap caused a visible rewind + speed-up.
+        const bool wasPlaying = m_player->isPlaying();
+        if (wasPlaying)
+            m_player->pause();
         m_timeline->refreshPlaybackSequence();
+        if (wasPlaying)
+            m_player->play();
     }, Qt::UniqueConnection);
     connect(&pm, &ProxyManager::progressChanged, this, [this](int pct) {
         statusBar()->showMessage(QString("Generating proxies... %1%").arg(pct));

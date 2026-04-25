@@ -60,6 +60,14 @@ public:
     void setPreviewEffects(const QVector<VideoEffect> &effects, bool live = false);
     bool isGLAccelerated() const { return m_useGL; }
     void setGLAcceleration(bool enabled);
+
+    // Read-only accessor used by MainWindow when retargeting the sequence
+    // (proxy generation finished, proxy mode toggled). Wrapping the swap in
+    // pause/play stops the audio side-player and the frame timer from
+    // running through the loadFile reset, which previously surfaced as a
+    // visible rewind + speed-up when the path resolution changed underneath
+    // an active playback.
+    bool isPlaying() const { return m_playing; }
     GLPreview *glPreview() const { return m_glPreview; }
 
     struct HdrInfo {
