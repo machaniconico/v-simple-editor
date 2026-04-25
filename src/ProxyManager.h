@@ -98,8 +98,19 @@ private:
     // runtime).
     static bool ffmpegHasEncoder(const QString &encoderName);
 
-    // Source duration in microseconds, looked up via QMediaPlayer probe at
-    // queue time. Used to convert ffmpeg's out_time_ms into a percentage.
+    // Spawn ffprobe to read the source file duration in microseconds. Used
+    // to convert ffmpeg's out_time_ms into a percentage for proxyProgress.
+    // Returns 0 on any probe failure (start failed, timeout, non-zero exit,
+    // unparseable output) — callers treat 0 as "duration unknown" and emit
+    // proxyProgress(name, -1) so the dialog stays in indeterminate mode.
+    // Result is cached per path for the lifetime of the singleton because
+    // the same source can be re-queued and ffprobe spawn is ~200 ms.
+    static qint64 probeDurationUs(const QString &path);
+
+    // Source duration in microseconds for the in-flight proxy job, populated
+    // by probeDurationUs at queue time. Zero means probe failed or input has
+    // no duration (image-only); parseFfmpegProgress short-circuits in that
+    // case and the dialog runs indeterminate.
     qint64 m_currentSourceDurationUs = 0;
     QString m_currentClipName;
     bool m_cancelRequested = false;

@@ -283,9 +283,15 @@ void ProxyManager::processNextInQueue()
     entry.status = ProxyStatus::Generating;
 
     m_currentClipName = QFileInfo(originalPath).fileName();
-    m_currentSourceDurationUs = 0; // will be filled by ffprobe-lite below if available
+    m_currentSourceDurationUs = probeDurationUs(originalPath);
     m_cancelRequested = false;
     emit proxyStarted(m_currentClipName);
+    if (m_currentSourceDurationUs <= 0) {
+        // Probe failed or input has no duration (image, broken file). Push
+        // an indeterminate marker so the dialog stops sitting at 0% — the
+        // bar will spin until proxyFinished/proxyCancelled fires.
+        emit proxyProgress(m_currentClipName, -1);
+    }
 
     m_process = new QProcess(this);
 
@@ -418,4 +424,47 @@ bool ProxyManager::ffmpegHasEncoder(const QString &encoderName)
     const bool has = out.contains(encoderName.toUtf8());
     cache.insert(encoderName, has);
     return has;
+}
+
+qint64 ProxyManager::probeDurationUs(const QString &path)
+{
+    // Cache per source path — same file may be re-queued (settings change,
+    // user toggles proxy mode, etc.) and ffprobe spawn is ~200 ms.
+    static QHash<QString, qint64> cache;
+    auto it = cache.constFind(path);
+    if (it != cache.constEnd())
+        return it.value();
+
+    QProcess probe;
+    QStringList args;
+    args << "-v" << "error"
+         << "-show_entries" << "format=duration"
+         << "-of" << "default=noprint_wrappers=1:nokey=1"
+         << path;
+    probe.start("ffprobe", args);
+    if (!probe.waitForStarted(2000)) {
+        cache.insert(path, 0);
+        return 0;
+    }
+    if (!probe.waitForFinished(5000)) {
+        probe.kill();
+        cache.insert(path, 0);
+        return 0;
+    }
+    if (probe.exitCode() != 0) {
+        cache.insert(path, 0);
+        return 0;
+    }
+
+    const QByteArray out = probe.readAllStandardOutput().trimmed();
+    bool ok = false;
+    const double seconds = out.toDouble(&ok);
+    if (!ok || seconds <= 0.0) {
+        cache.insert(path, 0);
+        return 0;
+    }
+
+    const qint64 us = static_cast<qint64>(seconds * 1'000'000.0);
+    cache.insert(path, us);
+    return us;
 }
