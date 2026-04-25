@@ -61,6 +61,23 @@ signals:
     void progressChanged(int percent);
     void allProxiesReady();
 
+    // Per-clip progress signals consumed by ProxyProgressDialog.
+    // proxyStarted: emitted right before ffmpeg launches for a clip.
+    // proxyProgress: percent is parsed from ffmpeg's `out_time_ms` against
+    //   the source duration (best-effort; -1 if duration is unknown).
+    // proxyFinished: ok=true on success, false on error or user cancel.
+    // proxyCancelled: distinct from proxyFinished(ok=false) so the UI can
+    //   distinguish user-initiated abort from a real failure.
+    void proxyStarted(const QString &clipName);
+    void proxyProgress(const QString &clipName, int percent);
+    void proxyFinished(const QString &clipName, bool ok);
+    void proxyCancelled(const QString &clipName);
+
+public slots:
+    // Terminate the in-flight ffmpeg process and clear the queue. Safe to
+    // call when no generation is active (no-op).
+    void cancelGeneration();
+
 private:
     ProxyManager();
     ~ProxyManager();
@@ -70,6 +87,13 @@ private:
     void loadIndex();
     void saveIndex();
     void processNextInQueue();
+    void parseFfmpegProgress(const QByteArray &chunk);
+
+    // Source duration in microseconds, looked up via QMediaPlayer probe at
+    // queue time. Used to convert ffmpeg's out_time_ms into a percentage.
+    qint64 m_currentSourceDurationUs = 0;
+    QString m_currentClipName;
+    bool m_cancelRequested = false;
 
     ProxyConfig m_config;
     bool m_proxyMode = true;

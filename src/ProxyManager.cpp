@@ -1,4 +1,5 @@
 #include "ProxyManager.h"
+#include "CodecDetector.h"
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -234,6 +235,38 @@ void ProxyManager::saveIndex()
     }
 }
 
+void ProxyManager::cancelGeneration()
+{
+    m_cancelRequested = true;
+    m_queue.clear();
+    if (m_process) {
+        m_process->terminate();
+        if (!m_process->waitForFinished(2000))
+            m_process->kill();
+    }
+}
+
+void ProxyManager::parseFfmpegProgress(const QByteArray &chunk)
+{
+    // ffmpeg -progress pipe:1 emits key=value lines. We care about
+    // out_time_ms (presentation time in microseconds).
+    const QList<QByteArray> lines = chunk.split('\n');
+    for (const QByteArray &line : lines) {
+        const int eq = line.indexOf('=');
+        if (eq < 0) continue;
+        const QByteArray key = line.left(eq).trimmed();
+        const QByteArray val = line.mid(eq + 1).trimmed();
+        if (key != "out_time_ms" && key != "out_time_us") continue;
+        bool ok = false;
+        const qint64 us = val.toLongLong(&ok);
+        if (!ok || m_currentSourceDurationUs <= 0) continue;
+        qint64 pct = us * 100 / m_currentSourceDurationUs;
+        if (pct < 0) pct = 0;
+        if (pct > 100) pct = 100;
+        emit proxyProgress(m_currentClipName, static_cast<int>(pct));
+    }
+}
+
 void ProxyManager::processNextInQueue()
 {
     if (m_queue.isEmpty()) {
@@ -250,22 +283,63 @@ void ProxyManager::processNextInQueue()
     auto &entry = m_entries[originalPath];
     entry.status = ProxyStatus::Generating;
 
+    m_currentClipName = QFileInfo(originalPath).fileName();
+    m_currentSourceDurationUs = 0; // will be filled by ffprobe-lite below if available
+    m_cancelRequested = false;
+    emit proxyStarted(m_currentClipName);
+
     m_process = new QProcess(this);
 
     QStringList args;
     args << "-y"
          << "-i" << originalPath
-         << "-vf" << QString("scale=%1:%2").arg(m_config.proxyWidth).arg(m_config.proxyHeight)
-         << "-c:v" << "libx264"
-         << "-crf" << QString::number(m_config.quality)
-         << "-c:a" << "aac"
-         << "-b:a" << "128k"
-         << entry.proxyPath;
+         << "-vf" << QString("scale=%1:%2").arg(m_config.proxyWidth).arg(m_config.proxyHeight);
+
+#if defined(VEDITOR_AV1)
+    // Modern Edition: AV1 proxy via SVT-AV1 with sidx fragmented MP4 for accurate seeking.
+    // Runtime fallback to H.264 if the linked ffmpeg lacks libsvtav1.
+    const bool av1Available = CodecDetector::isEncoderAvailable("libsvtav1");
+    if (av1Available) {
+        args << "-c:v" << "libsvtav1"
+             << "-preset" << "8"
+             << "-crf" << "35"
+             << "-g" << "120"
+             << "-pix_fmt" << "yuv420p"
+             << "-c:a" << "aac"
+             << "-b:a" << "128k"
+             << "-movflags" << "+faststart+sidx+frag_keyframe+empty_moov+default_base_moof"
+             << entry.proxyPath;
+    } else
+#endif
+    {
+        // Classic / fallback: H.264 proxy. -g 120 forces keyframes every ~4s and
+        // +faststart ensures accurate seek (past bug: missing keyframes broke seekbar).
+        args << "-c:v" << "libx264"
+             << "-crf" << QString::number(m_config.quality)
+             << "-g" << "120"
+             << "-c:a" << "aac"
+             << "-b:a" << "128k"
+             << "-movflags" << "+faststart"
+             << entry.proxyPath;
+    }
+
+    // ffmpeg's -progress pipe:1 emits key=value progress lines on stdout
+    // (out_time_us, frame, fps, ...) which feed proxyProgress for the UI.
+    args.prepend("pipe:1");
+    args.prepend("-progress");
+
+    connect(m_process, &QProcess::readyReadStandardOutput, this, [this]() {
+        if (!m_process) return;
+        parseFfmpegProgress(m_process->readAllStandardOutput());
+    });
 
     connect(m_process, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
             this, [this, originalPath](int exitCode, QProcess::ExitStatus exitStatus) {
 
-        bool success = (exitCode == 0 && exitStatus == QProcess::NormalExit);
+        const bool wasCancelled = m_cancelRequested;
+        const bool success = !wasCancelled
+            && (exitCode == 0 && exitStatus == QProcess::NormalExit);
+        const QString clipName = m_currentClipName;
 
         if (m_entries.contains(originalPath)) {
             auto &entry = m_entries[originalPath];
@@ -285,8 +359,20 @@ void ProxyManager::processNextInQueue()
             emit progressChanged(percent);
         }
 
+        if (wasCancelled)
+            emit proxyCancelled(clipName);
+        else
+            emit proxyFinished(clipName, success);
+
         m_process->deleteLater();
         m_process = nullptr;
+        m_currentClipName.clear();
+        m_currentSourceDurationUs = 0;
+
+        if (wasCancelled) {
+            m_cancelRequested = false;
+            return; // queue was cleared in cancelGeneration().
+        }
 
         processNextInQueue();
     });
