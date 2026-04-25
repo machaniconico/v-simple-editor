@@ -32,6 +32,11 @@ class VideoPlayer : public QWidget
     Q_OBJECT
 
 public:
+    // Multi-track decoder slot ceiling. The LRU manager (DecoderSlotManager)
+    // evicts the slot whose clip is furthest from the playhead when this is
+    // exceeded; V1 (track 0) is protected so the main video never gets bumped.
+    static constexpr int MAX_ACTIVE_DECODERS = 4;
+
     explicit VideoPlayer(QWidget *parent = nullptr);
     ~VideoPlayer();
 
