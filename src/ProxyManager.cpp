@@ -173,7 +173,9 @@ QString ProxyManager::getProxyPath(const QString &originalPath) const
 {
     if (m_proxyMode && m_entries.contains(originalPath)) {
         const auto &entry = m_entries[originalPath];
-        if (entry.status == ProxyStatus::Ready && QFile::exists(entry.proxyPath))
+        if (entry.status == ProxyStatus::Ready
+            && !isEntryStale(entry)
+            && QFile::exists(entry.proxyPath))
             return entry.proxyPath;
     }
     return originalPath;
@@ -184,7 +186,63 @@ bool ProxyManager::hasProxy(const QString &originalPath) const
     if (!m_entries.contains(originalPath))
         return false;
     const auto &entry = m_entries[originalPath];
-    return entry.status == ProxyStatus::Ready && QFile::exists(entry.proxyPath);
+    return entry.status == ProxyStatus::Ready
+        && !isEntryStale(entry)
+        && QFile::exists(entry.proxyPath);
+}
+
+QString ProxyManager::currentEffectiveEncoder() const
+{
+    static const QStringList kValid = {
+        "h264_nvenc", "h264_qsv", "h264_amf", "libx264"
+    };
+    if (!m_encoderOverride.isEmpty() && kValid.contains(m_encoderOverride))
+        return m_encoderOverride;
+    const QString gpu = chosenGpuH264Encoder();
+    return gpu.isEmpty() ? QStringLiteral("libx264") : gpu;
+}
+
+bool ProxyManager::isEntryStale(const ProxyEntry &entry) const
+{
+    // Legacy entries (pre-2026-04-25) carry no fingerprint. Treat them as
+    // not-stale so existing proxies keep working until the user explicitly
+    // regenerates them — that pass will populate the fingerprint.
+    if (entry.configFingerprint.isEmpty())
+        return false;
+
+    const QString currentFp = computeConfigFingerprint(
+        m_config, currentEffectiveEncoder(), m_qualityPreset);
+    if (entry.configFingerprint != currentFp)
+        return true;
+
+    const qint64 srcMtime =
+        QFileInfo(entry.originalPath).lastModified().toMSecsSinceEpoch();
+    if (entry.sourceMtimeMs > 0 && srcMtime > entry.sourceMtimeMs)
+        return true;
+
+    return false;
+}
+
+QString ProxyManager::staleReason(const QString &originalPath) const
+{
+    if (!m_entries.contains(originalPath))
+        return QString();
+    const ProxyEntry &entry = m_entries[originalPath];
+    if (entry.configFingerprint.isEmpty())
+        return QString();
+
+    QStringList reasons;
+    const QString currentFp = computeConfigFingerprint(
+        m_config, currentEffectiveEncoder(), m_qualityPreset);
+    if (entry.configFingerprint != currentFp)
+        reasons << QStringLiteral("設定が変更されました");
+
+    const qint64 srcMtime =
+        QFileInfo(entry.originalPath).lastModified().toMSecsSinceEpoch();
+    if (entry.sourceMtimeMs > 0 && srcMtime > entry.sourceMtimeMs)
+        reasons << QStringLiteral("ソース動画が更新されました");
+
+    return reasons.join(QStringLiteral(" / "));
 }
 
 void ProxyManager::setProxyMode(bool enabled)

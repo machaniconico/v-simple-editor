@@ -86,6 +86,15 @@ public:
     // Read-only access to the entry registry for the management dialog.
     const QHash<QString, ProxyEntry> &entries() const { return m_entries; }
 
+    // True iff entry was generated under a different (encoder, preset, size)
+    // tuple OR the source file has been modified since the proxy was made.
+    // Legacy entries (empty fingerprint) always return false for back-compat.
+    bool isEntryStale(const ProxyEntry &entry) const;
+
+    // Human-readable reason joined by " / " when both apply, or empty if not
+    // stale. Used by the management dialog tooltip.
+    QString staleReason(const QString &originalPath) const;
+
 signals:
     void proxyGenerated(const QString &originalPath, const QString &proxyPath);
     void progressChanged(int percent);
@@ -116,6 +125,11 @@ private:
     QString proxyFilePath(const QString &originalPath) const;
     void loadIndex();
     void saveIndex();
+
+    // Encoder that the next proxy job would use given the current settings.
+    // Mirrors the override + auto-fallback chain inside processNextInQueue
+    // so isEntryStale can predict the fingerprint without re-running it.
+    QString currentEffectiveEncoder() const;
     void processNextInQueue();
     void parseFfmpegProgress(const QByteArray &chunk);
 
