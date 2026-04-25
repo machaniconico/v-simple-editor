@@ -320,6 +320,13 @@ public:
     QVector<PlaybackEntry> computePlaybackSequence() const;
     QVector<PlaybackEntry> computeAudioPlaybackSequence() const;
 
+    // Re-emit sequenceChanged / audioSequenceChanged with the current clip
+    // graph. Called when an external source (proxy generation, proxy mode
+    // toggle) changes the path resolution rules without altering the clip
+    // structure itself, so VideoPlayer's setSequence wiring picks up the
+    // new resolved paths.
+    void refreshPlaybackSequence();
+
     // Project save/load support
     QVector<QVector<ClipInfo>> allVideoTracks() const;
     QVector<QVector<ClipInfo>> allAudioTracks() const;

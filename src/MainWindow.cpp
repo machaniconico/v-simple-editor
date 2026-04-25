@@ -2612,9 +2612,11 @@ void MainWindow::toggleProxyMode()
 
     if (!m_timeline || !m_player)
         return;
-    const auto &clips = m_timeline->videoClips();
-    if (!clips.isEmpty())
-        m_player->loadFile(pm.getProxyPath(clips.first().filePath));
+    // Re-resolve every clip's playback path through the sequenceChanged →
+    // setSequence wiring. A bare loadFile() would only swap the single-file
+    // legacy player and never touch the multi-clip sequence VideoPlayer is
+    // actually running, so the preview would silently keep the old path.
+    m_timeline->refreshPlaybackSequence();
 }
 
 void MainWindow::generateProxies()
@@ -2638,9 +2640,12 @@ void MainWindow::generateProxies()
         statusBar()->showMessage("All proxies generated");
         if (!m_timeline || !m_player)
             return;
-        const auto &clips = m_timeline->videoClips();
-        if (!clips.isEmpty())
-            m_player->loadFile(ProxyManager::instance().getProxyPath(clips.first().filePath));
+        // VideoPlayer is sequence-driven (Timeline::sequenceChanged →
+        // MainWindow's setSequence lambda → m_player->setSequence). A bare
+        // loadFile() does not retarget the active sequence, so the preview
+        // would keep playing the original even after generation finishes.
+        // Re-emit the sequences so getProxyPath picks up the now-Ready paths.
+        m_timeline->refreshPlaybackSequence();
     }, Qt::UniqueConnection);
     connect(&pm, &ProxyManager::progressChanged, this, [this](int pct) {
         statusBar()->showMessage(QString("Generating proxies... %1%").arg(pct));

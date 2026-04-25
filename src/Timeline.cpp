@@ -2884,6 +2884,17 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
     return result;
 }
 
+void Timeline::refreshPlaybackSequence()
+{
+    // External hook for proxy generation / proxy mode toggle. The clip graph
+    // hasn't changed, but the resolved playback paths have, so just re-emit
+    // the same sequences we'd produce for any other rebuild trigger and let
+    // MainWindow's getProxyPath translation in the sequenceChanged handler
+    // pick up the now-Ready proxies.
+    emit sequenceChanged(computePlaybackSequence());
+    emit audioSequenceChanged(computeAudioPlaybackSequence());
+}
+
 void Timeline::saveUndoState(const QString &description)
 {
     m_undoManager->saveState(currentState(), description);
