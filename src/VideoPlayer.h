@@ -229,7 +229,6 @@ private:
     // Sequence helpers (Phase A/B). When m_sequence is empty, the player runs
     // in single-file legacy mode and these are unused.
     bool sequenceActive() const { return !m_sequence.isEmpty(); }
-    bool audioSequenceActive() const { return !m_audioSequence.isEmpty(); }
     int findActiveEntryAt(int64_t timelineUs) const;
     // Multi-track: every sequence index whose [timelineStart, timelineEnd)
     // contains timelineUs. Returned in source order (same as m_sequence),
