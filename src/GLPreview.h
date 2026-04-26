@@ -36,6 +36,10 @@ public:
     bool effectsEnabled() const { return m_effectsEnabled; }
     void setLut(const LutData &lut);
     void clearLut();
+
+    // Phase 1e — true only when VEDITOR_GL_INTEROP=1 AND WGL_NV_DX_interop2
+    // is supported AND all 6 wglDX*NV procs resolved during initializeGL().
+    bool isInteropAvailable() const noexcept { return m_interopAvailable; }
     // Adobe-style text tool mode. When active, the cursor is Qt::IBeamCursor
     // and mouse press+drag+release captures a text box rectangle; on release
     // textRectRequested is emitted with the rect in normalized 0.0–1.0
@@ -138,6 +142,7 @@ private slots:
 private:
     void createShaderProgram();
     void updateUniforms();
+    void detectInteropExtension();
     // letterboxRect() moved to public section (US-T32).
 
     QOpenGLShaderProgram *m_program = nullptr;
@@ -262,4 +267,9 @@ private:
     QOpenGLTexture *m_lutTexture = nullptr;
     float m_lutIntensity = 1.0f;
     bool m_lutEnabled = false;
+
+    // Phase 1e — m_interopDevice will hold the wglDXOpenDeviceNV HANDLE
+    // once Section C lands; void* avoids leaking windows.h through the header.
+    bool m_interopAvailable = false;
+    void *m_interopDevice = nullptr;
 };

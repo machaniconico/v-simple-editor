@@ -128,7 +128,9 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 )
 
 if(WIN32)
-    target_link_libraries(${PROJECT_NAME} PRIVATE dbghelp)
+    # opengl32 — needed for wglGetCurrentDC and the WGL_NV_DX_interop2 entry
+    # points (Phase 1e). Qt6::OpenGL is the Qt wrapper, not the system GL.
+    target_link_libraries(${PROJECT_NAME} PRIVATE dbghelp opengl32)
 endif()
 
 target_compile_definitions(${PROJECT_NAME} PRIVATE

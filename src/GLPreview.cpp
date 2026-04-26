@@ -1,5 +1,6 @@
 #include "GLPreview.h"
 #include <cmath>
+#include <cstring>
 #include <QtGlobal>
 #include <QDateTime>
 #include <QVector2D>
@@ -11,6 +12,62 @@
 #include <QKeyEvent>
 #include <QFocusEvent>
 #include <QFontMetrics>
+
+#if defined(Q_OS_WIN)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+// windef.h leaks `near`/`far` and min/max macros that collide with C++
+// identifiers used elsewhere in this file (see hitTestTextToolHandle).
+#undef near
+#undef far
+#ifdef min
+#undef min
+#endif
+#ifdef max
+#undef max
+#endif
+
+// WGL_NV_DX_interop2 typedefs. Kept in the .cpp so windows.h doesn't leak
+// through GLPreview.h to the rest of the codebase. WGL_ACCESS_*_NV constants
+// are defined here for Section B/C use.
+#ifndef WGL_ACCESS_READ_ONLY_NV
+#define WGL_ACCESS_READ_ONLY_NV  0x00000000
+#define WGL_ACCESS_READ_WRITE_NV 0x00000001
+#define WGL_ACCESS_WRITE_DISCARD_NV 0x00000002
+#endif
+
+// PFNWGLDXSETRESOURCESHAREHANDLENVPROC slot is resolved in Section C when
+// shared-texture creation needs it; Section A does not call it.
+typedef BOOL    (WINAPI *PFNWGLDXSETRESOURCESHAREHANDLENVPROC)(void *dxObject, HANDLE shareHandle);
+typedef HANDLE  (WINAPI *PFNWGLDXOPENDEVICENVPROC)(void *dxDevice);
+typedef BOOL    (WINAPI *PFNWGLDXCLOSEDEVICENVPROC)(HANDLE hDevice);
+typedef HANDLE  (WINAPI *PFNWGLDXREGISTEROBJECTNVPROC)(HANDLE hDevice, void *dxObject, GLuint name, GLenum type, GLenum access);
+typedef BOOL    (WINAPI *PFNWGLDXUNREGISTEROBJECTNVPROC)(HANDLE hDevice, HANDLE hObject);
+typedef BOOL    (WINAPI *PFNWGLDXLOCKOBJECTSNVPROC)(HANDLE hDevice, GLint count, HANDLE *hObjects);
+typedef BOOL    (WINAPI *PFNWGLDXUNLOCKOBJECTSNVPROC)(HANDLE hDevice, GLint count, HANDLE *hObjects);
+
+typedef const char * (WINAPI *PFNWGLGETEXTENSIONSSTRINGARBPROC)(HDC hdc);
+
+namespace {
+PFNWGLDXOPENDEVICENVPROC       gWglDXOpenDeviceNV       = nullptr;
+PFNWGLDXCLOSEDEVICENVPROC      gWglDXCloseDeviceNV      = nullptr;
+PFNWGLDXREGISTEROBJECTNVPROC   gWglDXRegisterObjectNV   = nullptr;
+PFNWGLDXUNREGISTEROBJECTNVPROC gWglDXUnregisterObjectNV = nullptr;
+PFNWGLDXLOCKOBJECTSNVPROC      gWglDXLockObjectsNV      = nullptr;
+PFNWGLDXUNLOCKOBJECTSNVPROC    gWglDXUnlockObjectsNV    = nullptr;
+} // namespace
+#endif // Q_OS_WIN
+
+namespace {
+// Read VEDITOR_GL_INTEROP once and cache; mirrors veditorTickTraceEnabled()
+// pattern in VideoPlayer.cpp so production with the envvar unset pays a
+// single env read at first call and zero work after.
+bool veditorGlInteropEnabled()
+{
+    static const bool kEnabled = qEnvironmentVariableIntValue("VEDITOR_GL_INTEROP") != 0;
+    return kEnabled;
+}
+} // namespace
 
 // Vertex shader — simple fullscreen quad
 static const char *vertexShaderSrc = R"(
@@ -389,6 +446,87 @@ void GLPreview::initializeGL()
 
     m_vbo.release();
     m_vao.release();
+
+    detectInteropExtension();
+}
+
+void GLPreview::detectInteropExtension()
+{
+    m_interopAvailable = false;
+
+#if defined(Q_OS_WIN)
+    if (!veditorGlInteropEnabled()) {
+        qInfo() << "[interop] disabled (envvar VEDITOR_GL_INTEROP not set)";
+        return;
+    }
+
+    QOpenGLContext *ctx = context();
+    if (!ctx) {
+        qInfo() << "[interop] unavailable (no current QOpenGLContext)";
+        return;
+    }
+
+    auto getExtensionsString = reinterpret_cast<PFNWGLGETEXTENSIONSSTRINGARBPROC>(
+        ctx->getProcAddress("wglGetExtensionsStringARB"));
+    if (!getExtensionsString) {
+        qInfo() << "[interop] unavailable (wglGetExtensionsStringARB missing)";
+        return;
+    }
+
+    HDC hdc = wglGetCurrentDC();
+    if (!hdc) {
+        qInfo() << "[interop] unavailable (wglGetCurrentDC returned null)";
+        return;
+    }
+
+    const char *exts = getExtensionsString(hdc);
+    if (!exts) {
+        qInfo() << "[interop] unavailable (wglGetExtensionsStringARB returned null)";
+        return;
+    }
+
+    // Match exact token to avoid matching WGL_NV_DX_interop (v1, no multi-thread
+    // lock) or hypothetical WGL_NV_DX_interop2_extended. Leading match substitutes
+    // a space sentinel for the missing predecessor; trailing must be space or NUL.
+    const char *needle = "WGL_NV_DX_interop2";
+    bool found = false;
+    for (const char *p = std::strstr(exts, needle); p; p = std::strstr(p + 1, needle)) {
+        const char before = (p == exts) ? ' ' : *(p - 1);
+        const char after  = *(p + std::strlen(needle));
+        if (before == ' ' && (after == ' ' || after == '\0')) {
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        qInfo() << "[interop] unavailable (WGL_NV_DX_interop2 not in extension string)";
+        return;
+    }
+
+    struct ProcEntry { const char *name; void **slot; };
+    const ProcEntry procs[] = {
+        { "wglDXOpenDeviceNV",       reinterpret_cast<void**>(&gWglDXOpenDeviceNV)       },
+        { "wglDXCloseDeviceNV",      reinterpret_cast<void**>(&gWglDXCloseDeviceNV)      },
+        { "wglDXRegisterObjectNV",   reinterpret_cast<void**>(&gWglDXRegisterObjectNV)   },
+        { "wglDXUnregisterObjectNV", reinterpret_cast<void**>(&gWglDXUnregisterObjectNV) },
+        { "wglDXLockObjectsNV",      reinterpret_cast<void**>(&gWglDXLockObjectsNV)      },
+        { "wglDXUnlockObjectsNV",    reinterpret_cast<void**>(&gWglDXUnlockObjectsNV)    },
+    };
+    for (const ProcEntry &e : procs) {
+        *e.slot = reinterpret_cast<void*>(ctx->getProcAddress(e.name));
+        if (!*e.slot) {
+            qInfo() << "[interop] unavailable (proc resolution failed:" << e.name << ")";
+            return;
+        }
+    }
+
+    m_interopAvailable = true;
+    const char *renderer = reinterpret_cast<const char*>(glGetString(GL_RENDERER));
+    qInfo() << "[interop] available (WGL_NV_DX_interop2, GL_RENDERER="
+            << (renderer ? renderer : "<unknown>") << ")";
+#else
+    qInfo() << "[interop] disabled (non-Windows platform)";
+#endif
 }
 
 void GLPreview::createShaderProgram()
