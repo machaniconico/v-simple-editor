@@ -10,6 +10,8 @@
 #include <QDebug>
 #include <QPointer>
 #include <QTimer>
+#include <QElapsedTimer>
+#include <QtConcurrent>
 #include <QPainter>
 #include <QPainterPath>
 #include <QLinearGradient>
@@ -20,6 +22,17 @@
 #include <limits>
 
 namespace {
+
+// VEDITOR_TICK_TRACE=1 turns on per-tick wall-time accumulators that print a
+// 30-tick rollup line to qInfo. Default off — read once per process so the
+// hot path stays at one branch on a cached bool.
+inline bool tickTraceEnabled()
+{
+    static const bool enabled = qEnvironmentVariableIntValue("VEDITOR_TICK_TRACE") != 0;
+    return enabled;
+}
+
+inline qint64 nsToMs(qint64 ns) { return ns / 1000000LL; }
 
 QString formatTimestamp(int64_t positionUs)
 {
@@ -1377,6 +1390,23 @@ int VideoPlayer::correctVideoDriftAgainstAudioClock()
 
     const int64_t audioTlUs = m_mixer->audibleClockUs();
     const int64_t frameUs = (m_frameDurationUs > 0) ? m_frameDurationUs : (AV_TIME_BASE / 30);
+
+    // VEDITOR_SEEK_ON_DRIFT=1 opt-in (Phase 1e Sprint US-2): when drift
+    // exceeds ~30 video frames (~1 sec at 30fps), do a single keyframe
+    // seek instead of chewing through up to 6 throwaway decodes per tick.
+    // Trades a brief audio glitch on the seek for eliminating the wasted
+    // decode time observed in baseline tick traces. Default off so the
+    // legacy skip-decode path runs identically to before.
+    static const bool seekOnDrift =
+        qEnvironmentVariableIntValue("VEDITOR_SEEK_ON_DRIFT") != 0;
+    if (seekOnDrift) {
+        const int64_t driftUs = audioTlUs - m_timelinePositionUs;
+        if (driftUs > frameUs * 30) {
+            seekToTimelineUs(audioTlUs, /*precise=*/false);
+            return 0;
+        }
+    }
+
     // Threshold > 1.5 frames avoids skipping on natural scheduler jitter.
     const int64_t catchupThresholdUs = (frameUs * 3) / 2;
     const int maxSkips = 6; // bounded so one tick can't block the UI
@@ -1795,10 +1825,38 @@ void VideoPlayer::resizeEvent(QResizeEvent *event)
     refreshDisplayedFrame();
 }
 
+void VideoPlayer::recordTickTrace(qint64 workNs)
+{
+    if (!tickTraceEnabled())
+        return;
+    m_tickTraceWorkNs += workNs;
+    if (++m_tickTraceCount < 30)
+        return;
+    qInfo().nospace()
+        << "[tick] ticks=" << m_tickTraceCount
+        << " workMs=" << nsToMs(m_tickTraceWorkNs)
+        << " decodeMs=" << nsToMs(m_tickTraceDecodeNs)
+        << " composeMs=" << nsToMs(m_tickTraceComposeNs)
+        << " driftMs=" << nsToMs(m_tickTraceDriftNs)
+        << " skipped=" << m_tickTraceSkipped;
+    m_tickTraceCount = 0;
+    m_tickTraceWorkNs = 0;
+    m_tickTraceDecodeNs = 0;
+    m_tickTraceComposeNs = 0;
+    m_tickTraceDriftNs = 0;
+    m_tickTraceSkipped = 0;
+}
+
 void VideoPlayer::handlePlaybackTick()
 {
     if (!m_playing)
         return;
+
+    QElapsedTimer tickTimer;
+    const bool traceTick = tickTraceEnabled();
+    qint64 sectionMark = 0;
+    if (traceTick)
+        tickTimer.start();
 
     // Feed the slot manager's distance-from-playhead eviction heuristic.
     // Without this every slot looks equidistant from a stale playhead at
@@ -1854,12 +1912,25 @@ void VideoPlayer::handlePlaybackTick()
         // Drift correction runs BEFORE the display decode so the frame the
         // user sees this tick is always the freshest one, not the tail of a
         // skip-decode batch. Helper short-circuits on J-cut/L-cut.
-        correctVideoDriftAgainstAudioClock();
+        if (traceTick)
+            sectionMark = tickTimer.nsecsElapsed();
+        const int driftSkipped = correctVideoDriftAgainstAudioClock();
+        if (traceTick) {
+            m_tickTraceDriftNs += tickTimer.nsecsElapsed() - sectionMark;
+            m_tickTraceSkipped += driftSkipped;
+            sectionMark = tickTimer.nsecsElapsed();
+        }
         advanced = decodeNextFrame(true);
+        if (traceTick)
+            m_tickTraceDecodeNs += tickTimer.nsecsElapsed() - sectionMark;
     } else {
         const int64_t stepUs = qMax<int64_t>(1, m_frameDurationUs);
         const int64_t targetUs = qMax<int64_t>(0, m_currentPositionUs - stepUs);
+        if (traceTick)
+            sectionMark = tickTimer.nsecsElapsed();
         advanced = seekInternal(targetUs, true, true);
+        if (traceTick)
+            m_tickTraceDecodeNs += tickTimer.nsecsElapsed() - sectionMark;
     }
     // Always clear the flag so any subsequent displayFrame call (boundary
     // jump, seekInternal in reverse, etc.) is unguarded.
@@ -1882,32 +1953,132 @@ void VideoPlayer::handlePlaybackTick()
         // currently m_activeEntry (sorted V1-first, so usually V1 — but in
         // a V1-gap V2-active section it can be V2). All other active
         // entries come from the pool via harvestOverlayLayer.
+        if (traceTick)
+            sectionMark = tickTimer.nsecsElapsed();
         QVector<DecodedLayer> layers;
         layers.reserve(activeIdxs.size());
         bool overlayPresent = false;
-        for (int idx : activeIdxs) {
-            if (idx < 0 || idx >= m_sequence.size())
-                continue;
-            const auto &e = m_sequence[idx];
-            DecodedLayer layer;
-            if (idx == m_activeEntry) {
-                if (m_lastV1RawFrame.isNull())
-                    continue;
-                layer.rgb = m_lastV1RawFrame;
-                layer.isFresh = true;
-            } else {
-                if (!harvestOverlayLayer(e, idx, &layer))
-                    continue;
+
+        // VEDITOR_THREADED_POOL=1 (Phase 1e Sprint US-3): when 2+ non-V1
+        // overlays are active this tick, fan out their decode steps onto
+        // QtConcurrent worker threads so they run in parallel instead of
+        // serializing on the main thread. Default off — single-overlay
+        // ticks short-circuit straight back to the legacy serial path.
+        static const bool threadedPool =
+            qEnvironmentVariableIntValue("VEDITOR_THREADED_POOL") != 0;
+        int nonV1Count = 0;
+        if (threadedPool) {
+            for (int idx : activeIdxs) {
+                if (idx >= 0 && idx < m_sequence.size() && idx != m_activeEntry)
+                    ++nonV1Count;
             }
-            layer.opacity = e.opacity;
-            layer.videoScale = e.videoScale;
-            layer.videoDx = e.videoDx;
-            layer.videoDy = e.videoDy;
-            layer.sourceTrack = e.sourceTrack;
-            layer.sequenceIdx = idx;
-            layers.append(layer);
-            if (e.sourceTrack > 0)
-                overlayPresent = true;
+        }
+
+        if (threadedPool && nonV1Count >= 2) {
+            struct OverlayJob {
+                TrackDecoder *d = nullptr;
+                int seqIdx = -1;
+                qint64 expectedFileLocalUs = 0;
+                qint64 clipInUs = 0;
+                qint64 clipOutUs = 0;
+                bool decodedOk = false;
+            };
+            QVector<OverlayJob> overlayJobs;
+            overlayJobs.reserve(nonV1Count);
+            // Defense-in-depth: assert TrackDecoder uniqueness across this
+            // tick's parallel jobs. acquireDecoderForClip is keyed on
+            // (filePath, clipIn, sourceTrack, sourceClipIndex) and active
+            // sequence indices are distinct, so this set should never see
+            // a duplicate today — but if a future change to the slot pool
+            // ever returned the same decoder for two acquire calls, the
+            // worker fan-out would race on d->swsCtx. Skipping a duplicate
+            // here turns that future bug into a deterministic missed
+            // overlay instead of a heisenbug.
+            QSet<TrackDecoder*> seenDecoders;
+            // Pass 1 (main thread): acquire decoders, build V1 layer.
+            for (int idx : activeIdxs) {
+                if (idx < 0 || idx >= m_sequence.size())
+                    continue;
+                const auto &e = m_sequence[idx];
+                if (idx == m_activeEntry) {
+                    if (m_lastV1RawFrame.isNull())
+                        continue;
+                    DecodedLayer layer;
+                    layer.rgb = m_lastV1RawFrame;
+                    layer.isFresh = true;
+                    layer.opacity = e.opacity;
+                    layer.videoScale = e.videoScale;
+                    layer.videoDx = e.videoDx;
+                    layer.videoDy = e.videoDy;
+                    layer.sourceTrack = e.sourceTrack;
+                    layer.sequenceIdx = idx;
+                    layers.append(layer);
+                    if (e.sourceTrack > 0)
+                        overlayPresent = true;
+                    continue;
+                }
+                TrackDecoder *d = acquireDecoderForClip(e);
+                if (!d)
+                    continue;
+                if (seenDecoders.contains(d))
+                    continue; // duplicate decoder across overlays — skip to keep workers race-free
+                seenDecoders.insert(d);
+                OverlayJob job;
+                job.d = d;
+                job.seqIdx = idx;
+                job.expectedFileLocalUs = entryLocalPositionUs(idx, m_timelinePositionUs);
+                job.clipInUs = static_cast<int64_t>(e.clipIn * AV_TIME_BASE);
+                job.clipOutUs = static_cast<int64_t>(e.clipOut * AV_TIME_BASE);
+                overlayJobs.append(job);
+            }
+            // Pass 2 (workers): parallel decode. Each job touches only its
+            // own TrackDecoder so there is no shared mutable state across
+            // workers — see runOverlayDecodeForDecoder contract.
+            if (!overlayJobs.isEmpty()) {
+                QtConcurrent::blockingMap(overlayJobs, [this](OverlayJob &job) {
+                    job.decodedOk = runOverlayDecodeForDecoder(
+                        job.d, job.expectedFileLocalUs,
+                        job.clipInUs, job.clipOutUs);
+                });
+            }
+            // Pass 3 (main thread): finalize layers + grace-pool fallback.
+            for (const OverlayJob &job : overlayJobs) {
+                if (job.seqIdx < 0 || job.seqIdx >= m_sequence.size())
+                    continue;
+                const auto &e = m_sequence[job.seqIdx];
+                DecodedLayer layer;
+                if (!finalizeOverlayFromDecoder(e, job.seqIdx, job.d,
+                                                 job.decodedOk, &layer))
+                    continue;
+                layers.append(layer);
+                if (e.sourceTrack > 0)
+                    overlayPresent = true;
+            }
+        } else {
+            for (int idx : activeIdxs) {
+                if (idx < 0 || idx >= m_sequence.size())
+                    continue;
+                const auto &e = m_sequence[idx];
+                DecodedLayer layer;
+                if (idx == m_activeEntry) {
+                    if (m_lastV1RawFrame.isNull())
+                        continue;
+                    layer.rgb = m_lastV1RawFrame;
+                    layer.isFresh = true;
+                } else {
+                    if (!harvestOverlayLayer(e, idx, &layer))
+                        continue;
+                }
+                layer.opacity = e.opacity;
+                layer.videoScale = e.videoScale;
+                layer.videoDx = e.videoDx;
+                layer.videoDy = e.videoDy;
+                layer.sourceTrack = e.sourceTrack;
+                layer.sequenceIdx = idx;
+                layers.append(layer);
+                if (e.sourceTrack > 0)
+                    overlayPresent = true;
+            }
         }
         // V1-wins paint order: higher sourceTrack = back, V1 (sourceTrack 0)
         // = front. Sort DESCENDING by sourceTrack so V_max paints first into
@@ -1942,10 +2113,18 @@ void VideoPlayer::handlePlaybackTick()
                         v1e.videoScale, v1e.videoDx, v1e.videoDy);
                     m_glPreview->setCompositeBakedMode(false);
                 }
+                if (traceTick)
+                    m_tickTraceDecodeNs += tickTimer.nsecsElapsed() - sectionMark;
                 displayFrame(m_lastV1RawFrame);
             } else {
+                if (traceTick) {
+                    m_tickTraceDecodeNs += tickTimer.nsecsElapsed() - sectionMark;
+                    sectionMark = tickTimer.nsecsElapsed();
+                }
                 m_canvasBase.fill(Qt::black);
                 const QImage composed = composeMultiTrackFrame(m_canvasBase, layers);
+                if (traceTick)
+                    m_tickTraceComposeNs += tickTimer.nsecsElapsed() - sectionMark;
                 // Switch the GL viewport into baked mode so paintGL skips
                 // applying m_videoSourceScale on top of the canvas (which
                 // already has every layer's transform baked in). This
@@ -1970,6 +2149,8 @@ void VideoPlayer::handlePlaybackTick()
                 m_glPreview->setVideoSourceTransform(v1e.videoScale, v1e.videoDx, v1e.videoDy);
                 m_glPreview->setCompositeBakedMode(false);
             }
+            if (traceTick)
+                m_tickTraceDecodeNs += tickTimer.nsecsElapsed() - sectionMark;
             displayFrame(m_lastV1RawFrame);
         }
     }
@@ -1994,6 +2175,8 @@ void VideoPlayer::handlePlaybackTick()
             if (nextIdx < m_sequence.size()) {
                 if (advanceToEntry(nextIdx)) {
                     updatePositionUi();
+                    if (traceTick)
+                        recordTickTrace(tickTimer.nsecsElapsed());
                     scheduleNextFrame();
                     return;
                 }
@@ -2002,6 +2185,8 @@ void VideoPlayer::handlePlaybackTick()
                 m_timelinePositionUs = m_sequenceDurationUs;
                 m_currentPositionUs = entryEndLocalUs;
                 updatePositionUi();
+                if (traceTick)
+                    recordTickTrace(tickTimer.nsecsElapsed());
                 pause();
                 if (m_mixer) m_mixer->stop();
                 return;
@@ -2014,6 +2199,8 @@ void VideoPlayer::handlePlaybackTick()
             m_currentPositionUs = m_durationUs;
             updatePositionUi();
         }
+        if (traceTick)
+            recordTickTrace(tickTimer.nsecsElapsed());
         pause();
         if (m_mixer)
             m_mixer->stop();
@@ -2025,6 +2212,8 @@ void VideoPlayer::handlePlaybackTick()
     // and seeks are handled separately via m_mixer->seekTo from the
     // seekToTimelineUs / advanceToEntry call sites.
 
+    if (traceTick)
+        recordTickTrace(tickTimer.nsecsElapsed());
     scheduleNextFrame();
 }
 
@@ -2576,24 +2765,35 @@ bool VideoPlayer::decodePoolFrame(TrackDecoder *d, bool ensureRgb)
     return false;
 }
 
-bool VideoPlayer::harvestOverlayLayer(const PlaybackEntry &e, int seqIdx, DecodedLayer *out)
+// Parallelizable decode-only step (Phase 1e Sprint US-3). Touches ONLY the
+// per-decoder TrackDecoder state, so multiple instances may run on QtConcurrent
+// worker threads when VEDITOR_THREADED_POOL=1 + 2+ overlays are active.
+//
+// Threading contract for callers:
+//   - FFmpeg per-context calls (av_seek_frame, avcodec_send_packet/receive_frame,
+//     av_hwframe_transfer_data, sws_scale, sws_getCachedContext) are thread-safe
+//     when each thread uses its own AVFormatContext / AVCodecContext / SwsContext
+//     — which is the case here because TrackDecoder owns those contexts privately.
+//   - The shared D3D11 device context (m_sharedPoolHwDeviceCtx) is created at
+//     decoder open and read-only thereafter; FFmpeg's d3d11va hwaccel sets
+//     D3D11_CREATE_DEVICE_VIDEO_SUPPORT so multi-threaded video-context access
+//     is officially supported.
+//   - If hw_device_ctx ever becomes mutable from this hot path, revisit the
+//     parallel contract.
+bool VideoPlayer::runOverlayDecodeForDecoder(TrackDecoder *d,
+                                              qint64 expectedFileLocalUs,
+                                              qint64 clipInUs,
+                                              qint64 clipOutUs)
 {
-    if (!out)
-        return false;
-
-    TrackDecoder *d = acquireDecoderForClip(e);
     if (!d)
         return false;
 
-    const int64_t expectedFileLocalUs = entryLocalPositionUs(seqIdx, m_timelinePositionUs);
     const int64_t halfFrame = qMax<int64_t>(1, d->frameDurationUs / 2);
     const int64_t drift = expectedFileLocalUs - d->currentPositionUs;
 
     // Case B: large drift (rewind / non-1x speed mismatch / post-seek). Re-seek.
     if (d->firstFrameDecoded
         && (drift < -halfFrame * 2 || drift > d->frameDurationUs * 4)) {
-        const int64_t clipInUs  = static_cast<int64_t>(e.clipIn  * AV_TIME_BASE);
-        const int64_t clipOutUs = static_cast<int64_t>(e.clipOut * AV_TIME_BASE);
         const int64_t targetUs = qBound<int64_t>(clipInUs, expectedFileLocalUs, clipOutUs);
         av_seek_frame(d->formatCtx, -1, targetUs, AVSEEK_FLAG_BACKWARD);
         avcodec_flush_buffers(d->codecCtx);
@@ -2621,10 +2821,22 @@ bool VideoPlayer::harvestOverlayLayer(const PlaybackEntry &e, int seqIdx, Decode
             break;
         }
     }
+    return ok;
+}
+
+// Main-thread finalize: builds DecodedLayer fields from the decoder, falling
+// back to m_evictionGracePool when the decoder produced nothing. Walks the
+// grace pool, which is main-thread state — must NOT run from a worker.
+bool VideoPlayer::finalizeOverlayFromDecoder(const PlaybackEntry &e, int seqIdx,
+                                              TrackDecoder *d, bool decodedOk,
+                                              DecodedLayer *out) const
+{
+    if (!out || !d)
+        return false;
 
     if (!d->lastFrameRgb.isNull()) {
         out->rgb     = d->lastFrameRgb;
-        out->isFresh = ok;
+        out->isFresh = decodedOk;
     } else {
         // Fresh decoder with no successful decode yet — try the eviction
         // grace pool for the same identity. Match the TrackKey contract
@@ -2656,6 +2868,22 @@ bool VideoPlayer::harvestOverlayLayer(const PlaybackEntry &e, int seqIdx, Decode
     out->sourceTrack = e.sourceTrack;
     out->sequenceIdx = seqIdx;
     return true;
+}
+
+bool VideoPlayer::harvestOverlayLayer(const PlaybackEntry &e, int seqIdx, DecodedLayer *out)
+{
+    if (!out)
+        return false;
+
+    TrackDecoder *d = acquireDecoderForClip(e);
+    if (!d)
+        return false;
+
+    const int64_t expectedFileLocalUs = entryLocalPositionUs(seqIdx, m_timelinePositionUs);
+    const int64_t clipInUs  = static_cast<int64_t>(e.clipIn  * AV_TIME_BASE);
+    const int64_t clipOutUs = static_cast<int64_t>(e.clipOut * AV_TIME_BASE);
+    const bool ok = runOverlayDecodeForDecoder(d, expectedFileLocalUs, clipInUs, clipOutUs);
+    return finalizeOverlayFromDecoder(e, seqIdx, d, ok, out);
 }
 
 bool VideoPlayer::hasOverlayActive(const QVector<int> &activeIdxs) const

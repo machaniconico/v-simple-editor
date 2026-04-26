@@ -308,6 +308,17 @@ private:
     QImage composeMultiTrackFrame(const QImage &v1Frame,
                                   const QVector<DecodedLayer> &overlayLayers) const;
     bool harvestOverlayLayer(const PlaybackEntry &entry, int seqIdx, DecodedLayer *out);
+    // Phase 1e Sprint US-3: parallelizable decode-only step. ONLY touches
+    // the per-decoder TrackDecoder state — no pool / sequence / Qt object
+    // access — so it is safe to invoke from a QtConcurrent worker thread.
+    bool runOverlayDecodeForDecoder(TrackDecoder *d, qint64 expectedFileLocalUs,
+                                    qint64 clipInUs, qint64 clipOutUs);
+    // Main-thread post-processing: builds DecodedLayer fields from the
+    // decoder's lastFrameRgb, falling back to the eviction grace pool when
+    // the decoder produced nothing.
+    bool finalizeOverlayFromDecoder(const PlaybackEntry &entry, int seqIdx,
+                                    TrackDecoder *d, bool decodedOk,
+                                    DecodedLayer *out) const;
     // ensureRgb=false skips av_hwframe_transfer_data + sws_scale and only
     // advances d->currentPositionUs. Used by harvestOverlayLayer's catch-up
     // loop on intermediate frames the user will never see — saves ~6-12 ms
@@ -462,4 +473,14 @@ private:
     // using the current timeline seconds. Returns the source image
     // unmodified when the overlay list is empty.
     QImage composeFrameWithOverlays(const QImage &source) const;
+
+    // VEDITOR_TICK_TRACE accumulators (Phase 1e Sprint US-1). Populated only
+    // when tickTraceEnabled() is true; flushed and reset every 30 ticks.
+    qint64 m_tickTraceWorkNs = 0;
+    qint64 m_tickTraceDecodeNs = 0;
+    qint64 m_tickTraceComposeNs = 0;
+    qint64 m_tickTraceDriftNs = 0;
+    int m_tickTraceSkipped = 0;
+    int m_tickTraceCount = 0;
+    void recordTickTrace(qint64 workNs);
 };
