@@ -1326,10 +1326,14 @@ void VideoPlayer::scheduleNextFrame()
         // timer at 1 ms — every tick already runs up to 7 frame decodes
         // (correctVideoDriftAgainstAudioClock + decodeNextFrame), so a 1 ms
         // tick rate saturates one CPU thread without giving the decoder room
-        // to actually catch up.
+        // to actually catch up. Cap at 5 s to keep the UI responsive even
+        // if the audio clock has drifted absurdly far behind the video
+        // cursor (also avoids signed overflow on the int cast).
         const int floorMs = qMax(1, frameIntervalMs / 2);
-        intervalMs = (waitUs <= 0) ? floorMs
-                                   : qMax(floorMs, static_cast<int>(waitUs / 1000));
+        constexpr int64_t kCeilingMs = 5000;
+        intervalMs = (waitUs <= 0)
+            ? floorMs
+            : static_cast<int>(qBound<int64_t>(floorMs, waitUs / 1000, kCeilingMs));
     }
     m_playbackTimer->start(intervalMs);
 }

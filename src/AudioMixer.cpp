@@ -436,6 +436,12 @@ void AudioMixer::seekTo(int64_t timelineUs) {
     {
         QMutexLocker lock(&m_controlMutex);
         m_writeCursorUs.store(timelineUs, std::memory_order_release);
+        // Drop the stale OS-buffered estimate too: sinkSnap->reset() below
+        // empties the OS buffer, so the next readData() will publish a
+        // fresh lag against an empty buffer. Without this reset, the first
+        // audibleClockUs() call after a seek subtracted the pre-seek
+        // bufferedUs from the post-seek cursor.
+        m_audibleLagUs.store(0, std::memory_order_release);
         m_consecutiveStallCallbacks.store(0, std::memory_order_release);
         for (auto *e : qAsConst(m_entries)) {
             if (!e) continue;
