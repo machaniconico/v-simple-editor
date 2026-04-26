@@ -28,12 +28,17 @@ struct AudioDecoderEntry {
     AVCodecContext *codecCtx = nullptr;
     SwrContext *swrCtx = nullptr;
     int audioStreamIdx = -1;
-    QByteArray ring;                 // resampled s16 stereo, FIFO
-    // Timeline microseconds of the FIRST sample currently in the ring.
+    // Resampled s16 stereo, FIFO. Drained via ringHead advance instead of
+    // QByteArray::remove(0, N) so the audio callback doesn't pay an O(N)
+    // memmove per drain — the ring is compacted only when ringHead crosses
+    // the kRingCompactThreshold below, amortising compaction cost.
+    QByteArray ring;
+    int ringHead = 0;
+    // Timeline microseconds of the FIRST live sample (ring[ringHead]).
     // Used by readData to skip past samples behind the master clock when a
     // ring underrun + decoder catch-up has produced samples that should
     // have been mixed earlier. Without this tracker, late-arriving samples
-    // would play out of phase with other tracks (see CRITICAL #2 from the
+    // would play out of phase with other tracks (CRITICAL #2 from the
     // Phase 2 review).
     int64_t ringStartTlUs = 0;
     bool eof = false;
@@ -41,6 +46,17 @@ struct AudioDecoderEntry {
     AVPacket *pkt = nullptr;
     AVFrame *frame = nullptr;
 };
+
+namespace {
+// Helpers to keep AudioDecoderEntry's head-indexed FIFO consistent.
+inline int liveBytes(const AudioDecoderEntry &e) {
+    return e.ring.size() - e.ringHead;
+}
+inline const char *liveData(const AudioDecoderEntry &e) {
+    return e.ring.constData() + e.ringHead;
+}
+constexpr int kRingCompactThreshold = 32 * 1024;
+} // namespace
 
 class MixerIODevice : public QIODevice {
 public:
@@ -119,6 +135,15 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
     QVarLengthArray<int32_t, 16384> accum(sampleCount);
     std::memset(accum.data(), 0, sampleCount * sizeof(int32_t));
 
+    auto bytesToUs = [](qint64 bytes) -> int64_t {
+        return bytes * 1'000'000LL
+               / (AudioMixer::kSampleRateHz * AudioMixer::kBytesPerFrame);
+    };
+    auto usToBytes = [](int64_t us) -> qint64 {
+        return us * AudioMixer::kSampleRateHz * AudioMixer::kBytesPerFrame
+               / 1'000'000LL;
+    };
+
     bool anyMixed = false;
     for (auto it = m_mixer->m_entries.begin(); it != m_mixer->m_entries.end(); ++it) {
         AudioDecoderEntry *e = it.value();
@@ -126,7 +151,7 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
         const int64_t startUs = static_cast<int64_t>(e->entry.timelineStart * 1e6);
         const int64_t endUs = static_cast<int64_t>(e->entry.timelineEnd * 1e6);
         if (cursorUs < startUs || cursorUs >= endUs) continue;
-        if (e->ring.isEmpty()) continue;
+        if (liveBytes(*e) <= 0) continue;
 
         // Drop samples that landed in the ring late — i.e. their timeline
         // position is already behind the master cursor. Without this, a
@@ -134,16 +159,13 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
         // entry's audio relative to the rest of the mix.
         if (e->ringStartTlUs < cursorUs) {
             const int64_t lateUs = cursorUs - e->ringStartTlUs;
-            const qint64 lateBytes = lateUs * AudioMixer::kSampleRateHz
-                                     * AudioMixer::kBytesPerFrame / 1'000'000LL;
-            const qint64 dropBytes = qMin<qint64>(lateBytes, e->ring.size());
+            const qint64 lateB = usToBytes(lateUs);
+            const qint64 dropBytes = qMin<qint64>(lateB, liveBytes(*e));
             if (dropBytes > 0) {
-                e->ring.remove(0, static_cast<int>(dropBytes));
-                e->ringStartTlUs += dropBytes * 1'000'000LL
-                                    / (AudioMixer::kSampleRateHz
-                                       * AudioMixer::kBytesPerFrame);
+                e->ringHead += static_cast<int>(dropBytes);
+                e->ringStartTlUs += bytesToUs(dropBytes);
             }
-            if (e->ring.isEmpty()) continue;
+            if (liveBytes(*e) <= 0) continue;
         }
         // If samples sit in the future the entry shouldn't be mixed yet.
         if (e->ringStartTlUs > cursorUs + maxlenUs / 2) continue;
@@ -154,20 +176,18 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
         if (trackIdx >= 0 && trackIdx < m_mixer->m_trackStates.size())
             gain *= m_mixer->m_trackStates[trackIdx].effectiveGain;
         if (gain <= 0.0) {
-            // Still drain the ring so this muted entry stays in time with
-            // the cursor; otherwise unmuting mid-playback would resume from
-            // a stale position.
-            const int dropBytes = static_cast<int>(qMin<qint64>(maxlen, e->ring.size()));
-            e->ring.remove(0, dropBytes);
-            e->ringStartTlUs += static_cast<int64_t>(dropBytes) * 1'000'000LL
-                                / (AudioMixer::kSampleRateHz
-                                   * AudioMixer::kBytesPerFrame);
+            // Drain the ring so this muted entry stays in time with the
+            // cursor; otherwise unmuting mid-playback would resume from a
+            // stale position.
+            const int dropBytes = static_cast<int>(qMin<qint64>(maxlen, liveBytes(*e)));
+            e->ringHead += dropBytes;
+            e->ringStartTlUs += bytesToUs(dropBytes);
             continue;
         }
 
-        const int copyBytes = static_cast<int>(qMin<qint64>(maxlen, e->ring.size()));
+        const int copyBytes = static_cast<int>(qMin<qint64>(maxlen, liveBytes(*e)));
         const int copySamples = copyBytes / static_cast<int>(sizeof(int16_t));
-        const int16_t *src = reinterpret_cast<const int16_t *>(e->ring.constData());
+        const int16_t *src = reinterpret_cast<const int16_t *>(liveData(*e));
         if (qFuzzyCompare(gain, 1.0)) {
             for (int i = 0; i < copySamples; ++i)
                 accum[i] += src[i];
@@ -175,11 +195,21 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
             for (int i = 0; i < copySamples; ++i)
                 accum[i] += static_cast<int32_t>(src[i] * gain);
         }
-        e->ring.remove(0, copyBytes);
-        e->ringStartTlUs += static_cast<int64_t>(copyBytes) * 1'000'000LL
-                            / (AudioMixer::kSampleRateHz
-                               * AudioMixer::kBytesPerFrame);
+        e->ringHead += copyBytes;
+        e->ringStartTlUs += bytesToUs(copyBytes);
         anyMixed = true;
+    }
+
+    // Compact rings whose consumed prefix has grown past the threshold.
+    // O(remaining) memmove, but only one per ~32 KB consumed (~170 ms of
+    // audio at 48 kHz stereo s16) — amortised cost is constant per byte.
+    for (auto it = m_mixer->m_entries.begin(); it != m_mixer->m_entries.end(); ++it) {
+        AudioDecoderEntry *e = it.value();
+        if (!e) continue;
+        if (e->ringHead >= kRingCompactThreshold) {
+            e->ring.remove(0, e->ringHead);
+            e->ringHead = 0;
+        }
     }
 
     if (anyMixed) {
@@ -285,6 +315,7 @@ void AudioMixer::setSequence(const QVector<PlaybackEntry> &entries) {
                     || !qFuzzyCompare(oldEnd, e.timelineEnd)) {
                     de->seekPending = true;
                     de->ring.clear();
+                    de->ringHead = 0;
                 }
                 retained.insert(key, de);
             } else {
@@ -333,6 +364,7 @@ void AudioMixer::seekTo(int64_t timelineUs) {
             if (!e) continue;
             e->seekPending = true;
             e->ring.clear();
+            e->ringHead = 0;
             e->ringStartTlUs = timelineUs;
             e->eof = false;
         }
@@ -498,6 +530,7 @@ void AudioMixer::seekEntryToTimeline(AudioDecoderEntry *e, int64_t timelineUs) {
     av_seek_frame(e->fmtCtx, e->audioStreamIdx, ts, AVSEEK_FLAG_BACKWARD);
     avcodec_flush_buffers(e->codecCtx);
     e->ring.clear();
+    e->ringHead = 0;
     // The next sample appended to the ring corresponds to the timeline
     // position we just seeked the file to.
     e->ringStartTlUs = timelineUs;
@@ -518,7 +551,7 @@ void AudioMixer::resampleAndAppend(AudioDecoderEntry *e) {
                                 e->frame->nb_samples);
     // Truncate to actual output count. Note: ringStartTlUs is unchanged
     // because we only appended to the back — readData advances ringStartTlUs
-    // on drain.
+    // and ringHead on drain.
     if (got > 0) {
         e->ring.resize(prevSize + got * AudioMixer::kBytesPerFrame);
     } else {
@@ -528,7 +561,7 @@ void AudioMixer::resampleAndAppend(AudioDecoderEntry *e) {
 
 void AudioMixer::refillRingForEntry(AudioDecoderEntry *e, int targetBytes) {
     if (!e || !e->fmtCtx || !e->codecCtx) return;
-    while (e->ring.size() < targetBytes && !e->eof) {
+    while (liveBytes(*e) < targetBytes && !e->eof) {
         const int rc = av_read_frame(e->fmtCtx, e->pkt);
         if (rc == AVERROR_EOF) {
             // Drain decoder.
@@ -588,8 +621,8 @@ bool AudioMixer::refillRings() {
             e->seekPending = false;
             didWork = true;
         }
-        if (e->ring.size() < kRingTargetBytes) {
-            const int chunkTarget = qMin<int>(e->ring.size() + kPerCallChunkBytes,
+        if (liveBytes(*e) < kRingTargetBytes) {
+            const int chunkTarget = qMin<int>(liveBytes(*e) + kPerCallChunkBytes,
                                               kRingTargetBytes);
             refillRingForEntry(e, chunkTarget);
             didWork = true;
