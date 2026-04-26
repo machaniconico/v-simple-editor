@@ -2353,10 +2353,10 @@ void Timeline::toggleSoloTrack(int audioTrackIndex)
             emit trackSoloChanged(i, nowSolo);
         }
     }
-    // Solo state lives on the mixer (per-track effectiveGain), so a re-emit
-    // of the schedule is not strictly required — but harmless and keeps the
-    // legacy listeners (track header UI) coherent.
-    emit audioSequenceChanged(computeAudioPlaybackSequence());
+    // Solo state lives on the mixer (per-track effectiveGain), so the
+    // PlaybackEntry-shaped schedule is unchanged — no audioSequenceChanged
+    // re-emit needed. trackSoloChanged carries the only state the mixer
+    // cares about and the track header UI updates from setSolo directly.
     updateInfoLabel();
 }
 
