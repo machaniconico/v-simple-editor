@@ -2089,6 +2089,22 @@ void VideoPlayer::handlePlaybackTick()
                 && qFuzzyIsNull(v1e.videoDy)
                 && v1e.sourceTrack == 0;
         }
+        // One-shot diagnostic so user (and log readers) can confirm
+        // whether the cull engaged for this project, and if not, why.
+        static bool loggedCullState = false;
+        if (occlusionCull && !loggedCullState && m_activeEntry >= 0
+            && m_activeEntry < m_sequence.size()) {
+            const auto &v1e = m_sequence[m_activeEntry];
+            qInfo() << "[cull] occlusion cull check: v1FullyCovers="
+                    << v1FullyCoversCanvas
+                    << "v1Track=" << v1e.sourceTrack
+                    << "v1Opacity=" << v1e.opacity
+                    << "v1Scale=" << v1e.videoScale
+                    << "v1Dx=" << v1e.videoDx
+                    << "v1Dy=" << v1e.videoDy
+                    << "activeIdxs=" << activeIdxs.size();
+            loggedCullState = true;
+        }
 
         if (threadedPool && nonV1Count >= 2) {
             struct OverlayJob {
