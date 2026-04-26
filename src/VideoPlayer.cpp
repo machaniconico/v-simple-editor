@@ -2071,10 +2071,14 @@ void VideoPlayer::handlePlaybackTick()
         // (scale=1, dx=dy=0) every V2+ overlay underneath it is invisible.
         // Skip the V2+ decode loop entirely in that case — it dominates the
         // multi-track stutter cost (decodeMs ~1685ms / 30 ticks).
-        // Default off so we don't change behavior on existing projects;
-        // VEDITOR_OCCLUSION_CULL=1 opt-in until the user signs off.
-        static const bool occlusionCull =
-            qEnvironmentVariableIntValue("VEDITOR_OCCLUSION_CULL") != 0;
+        // Default ON because the cull is logically conservative: the math
+        // matches what compose+blend would have produced (V2 invisible
+        // pixels). VEDITOR_OCCLUSION_CULL=0 opts back into the legacy
+        // always-decode path for diff-testing.
+        static const bool occlusionCull = []() {
+            const QByteArray v = qgetenv("VEDITOR_OCCLUSION_CULL");
+            return v.isEmpty() ? true : (v != "0");
+        }();
         bool v1FullyCoversCanvas = false;
         if (occlusionCull && m_activeEntry >= 0
             && m_activeEntry < m_sequence.size()) {
