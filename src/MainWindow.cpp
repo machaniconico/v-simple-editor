@@ -76,9 +76,16 @@ MainWindow::MainWindow(QWidget *parent)
     // Shortcut manager - load saved shortcuts
     ShortcutManager::instance().loadShortcuts();
 
-    // Script engine
+    // Script engine. init() probes python3/python via QProcess with 3-second
+    // timeouts each — on Windows when Python isn't installed, the
+    // Microsoft Store python stub launches a Store dialog and the wait can
+    // block much longer, freezing the splash screen and "preventing the
+    // app from starting" from the user's perspective. Defer init to after
+    // the event loop starts so startup never blocks on it.
     m_scriptEngine = new ScriptEngine(this);
-    m_scriptEngine->init();
+    QTimer::singleShot(0, this, [this]() {
+        if (m_scriptEngine) m_scriptEngine->init();
+    });
 
     // Auto-save setup
     m_autoSave = new AutoSave(this);

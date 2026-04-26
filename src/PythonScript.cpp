@@ -464,12 +464,16 @@ ScriptResult ScriptEngine::runViaProcess(const QString &code, const QString & /*
 
 QString ScriptEngine::pythonExecutable() const
 {
-    // Try python3 first, then python
+    // PATH-only resolution — do NOT spawn a probe process. On Windows
+    // when Python isn't installed, both `python.exe` and `python3.exe`
+    // resolve to a Microsoft Store stub that opens an Install dialog;
+    // QProcess::waitForFinished blocks against that dialog and was the
+    // direct cause of the "app cannot start" regression. findExecutable
+    // is a pure PATH lookup with no process spawn, so it never blocks.
     for (const QString &candidate : {"python3", "python"}) {
-        QProcess probe;
-        probe.start(candidate, {"--version"});
-        if (probe.waitForFinished(3000) && probe.exitCode() == 0)
-            return candidate;
+        const QString resolved = QStandardPaths::findExecutable(candidate);
+        if (!resolved.isEmpty())
+            return resolved;
     }
     return {};
 }
