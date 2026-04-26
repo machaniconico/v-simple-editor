@@ -2692,6 +2692,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         double videoDx = 0.0;
         double videoDy = 0.0;
         double opacity = 1.0;
+        double volume = 1.0;
         int clipIdx = -1;
     };
 
@@ -2721,6 +2722,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
                 iv.videoDx = c.videoDx;
                 iv.videoDy = c.videoDy;
                 iv.opacity = c.opacity;
+                iv.volume = c.volume;
                 iv.clipIdx = ci;
                 ivs.append(iv);
                 accum += clipDur;
@@ -2760,6 +2762,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         e.videoDx = iv.videoDx;
         e.videoDy = iv.videoDy;
         e.opacity = iv.opacity;
+        e.volume = iv.volume;
         e.sourceClipIndex = iv.clipIdx;
         qInfo() << "[SEQ] entry idx=" << result.size()
                 << "tl=[" << iv.timelineStart << "," << iv.timelineEnd << "]"
@@ -2797,6 +2800,8 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
         QString filePath;
         int trackIdx;
         bool muted;
+        double volume = 1.0;
+        int clipIdx = -1;
     };
 
     QVector<QVector<Interval>> trackIntervals;
@@ -2807,7 +2812,8 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
         if (track && !track->isHidden()) {
             const auto &clips = track->clips();
             double accum = 0.0;
-            for (const auto &c : clips) {
+            for (int ci = 0; ci < clips.size(); ++ci) {
+                const auto &c = clips[ci];
                 accum += qMax(0.0, c.leadInSec);
                 const double clipDur = c.effectiveDuration();
                 if (clipDur <= 0.0) continue;
@@ -2820,6 +2826,8 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
                 iv.filePath = c.filePath;
                 iv.trackIdx = t;
                 iv.muted = track->isMuted();
+                iv.volume = c.volume;
+                iv.clipIdx = ci;
                 ivs.append(iv);
                 accum += clipDur;
             }
@@ -2879,6 +2887,8 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
         e.speed = iv.speed;
         e.sourceTrack = iv.trackIdx;
         e.audioMuted = iv.muted;
+        e.volume = iv.volume;
+        e.sourceClipIndex = iv.clipIdx;
         result.append(e);
     }
     return result;

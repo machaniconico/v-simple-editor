@@ -24,6 +24,7 @@ struct PlaybackEntry {
     double videoDx = 0.0;
     double videoDy = 0.0;
     double opacity = 1.0;        // PiP alpha, propagated from ClipInfo::opacity
+    double volume = 1.0;         // Per-clip audio gain (0.0-2.0), propagated from ClipInfo::volume
     int sourceClipIndex = -1;    // Index into TimelineTrack::m_clips
 };
 
