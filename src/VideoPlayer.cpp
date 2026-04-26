@@ -31,6 +31,26 @@ extern "C" void *veditor_avHwDeviceCtxToD3D11Device(AVBufferRef *ref);
 
 namespace {
 
+// Phase 1e — VEDITOR_PLAYBACK_PROXY divisor for the playback decode path.
+// 1 = full resolution (default). 2 / 4 = half / quarter resolution. The
+// returned divisor scales the sws_scale destination width/height in
+// frameToImage and decodePoolFrame so we cut sws + QImage cost while the
+// compose path scales the smaller QImage up to the full canvas via nearest
+// drawImage. Pause and export stay at full resolution because they bypass
+// these decode wrappers.
+inline int playbackProxyDivisor()
+{
+    static const int kDivisor = []() {
+        int v = qEnvironmentVariableIntValue("VEDITOR_PLAYBACK_PROXY");
+        if (v < 1) v = 1;
+        if (v > 8) v = 8;
+        // Allow only powers of 2 to keep sws/QImage row alignment friendly.
+        if (v != 1 && v != 2 && v != 4 && v != 8) v = 1;
+        return v;
+    }();
+    return kDivisor;
+}
+
 // Phase 1e — opaque reference into FFmpeg's D3D11 frame pool. Only valid
 // while the originating AVFrame is held; we hand it to GLPreview which
 // registers it once via WGL_NV_DX_interop2 and caches by (texture, subres).
@@ -1777,13 +1797,20 @@ QImage VideoPlayer::frameToImage(const AVFrame *frame)
     const AVPixelFormat dstPixFmt = hdr ? AV_PIX_FMT_RGBA64LE : AV_PIX_FMT_RGB24;
     const QImage::Format qFmt = hdr ? QImage::Format_RGBA64 : QImage::Format_RGB888;
 
+    // Phase 1e proxy: optionally downscale during sws_scale so the
+    // destination QImage is 1/N each axis. Compose draws this small
+    // image at full canvas dst rect with nearest sampling.
+    const int proxy = playbackProxyDivisor();
+    const int dstW = qMax(2, frame->width  / proxy);
+    const int dstH = qMax(2, frame->height / proxy);
+
     m_swsCtx = sws_getCachedContext(
         m_swsCtx,
         frame->width,
         frame->height,
         static_cast<AVPixelFormat>(frame->format),
-        frame->width,
-        frame->height,
+        dstW,
+        dstH,
         dstPixFmt,
         SWS_BILINEAR,
         nullptr,
@@ -1795,9 +1822,9 @@ QImage VideoPlayer::frameToImage(const AVFrame *frame)
         return {};
     }
 
-    QImage image(frame->width, frame->height, qFmt);
+    QImage image(dstW, dstH, qFmt);
     if (image.isNull()) {
-        qWarning() << "frameToImage: QImage alloc failed" << frame->width << "x" << frame->height;
+        qWarning() << "frameToImage: QImage alloc failed" << dstW << "x" << dstH;
         return {};
     }
 
@@ -2855,16 +2882,19 @@ bool VideoPlayer::decodePoolFrame(TrackDecoder *d, bool ensureRgb)
         // mixing isn't supported yet (V1 still drives the HDR transfer
         // metadata). RGB24 is fine for SourceOver compositing because we
         // promote to ARGB32_Premultiplied in composeMultiTrackFrame anyway.
+        const int proxy = playbackProxyDivisor();
+        const int dstW = qMax(2, displayable->width  / proxy);
+        const int dstH = qMax(2, displayable->height / proxy);
         d->swsCtx = sws_getCachedContext(
             d->swsCtx,
             displayable->width, displayable->height,
             static_cast<AVPixelFormat>(displayable->format),
-            displayable->width, displayable->height,
+            dstW, dstH,
             AV_PIX_FMT_RGB24,
             SWS_BILINEAR, nullptr, nullptr, nullptr);
         if (!d->swsCtx)
             return false;
-        QImage image(displayable->width, displayable->height, QImage::Format_RGB888);
+        QImage image(dstW, dstH, QImage::Format_RGB888);
         if (image.isNull())
             return false;
         uint8_t *dest[4]      = { image.bits(), nullptr, nullptr, nullptr };
