@@ -1458,19 +1458,17 @@ void VideoPlayer::scheduleNextFrame()
         // to actually catch up. Cap the regular case at frameIntervalMs so a
         // chronic audio-buffer lag (audible clock running behind audio write
         // by ~50 ms on Windows) cannot turn every tick into a >50 ms wait
-        // and starve playback to ~19 fps; the audio clock will catch up
-        // organically over the next frames since each tick still advances
-        // the video timeline by exactly one frame. The 5 s ceiling kicks
-        // in only after a real seek-induced drift (handled separately).
+        // and starve playback to ~19 fps; the audio clock catches up
+        // organically over the next ticks since each tick still advances
+        // the video timeline by exactly one frame. Larger seek-induced
+        // drift is fixed by correctVideoDriftAgainstAudioClock's skip-
+        // decode loop (and the optional VEDITOR_SEEK_ON_DRIFT seek), not
+        // by the timer interval, so we don't need a multi-second ceiling.
         const int floorMs = qMax(1, frameIntervalMs / 2);
-        constexpr int64_t kCeilingMs = 5000;
-        if (waitUs <= 0) {
-            intervalMs = floorMs;
-        } else {
-            const int64_t bounded = qBound<int64_t>(floorMs, waitUs / 1000, kCeilingMs);
-            const int64_t framePaced = qMin<int64_t>(bounded, frameIntervalMs);
-            intervalMs = static_cast<int>(framePaced);
-        }
+        intervalMs = (waitUs <= 0)
+            ? floorMs
+            : static_cast<int>(qBound<int64_t>(floorMs, waitUs / 1000,
+                                               static_cast<int64_t>(frameIntervalMs)));
     }
     m_playbackTimer->start(intervalMs);
 }
