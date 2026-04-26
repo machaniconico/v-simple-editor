@@ -2781,116 +2781,53 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
 
 QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
 {
-    // A1-wins resolution across A1..An, mirroring computePlaybackSequence's
-    // V1-wins video logic. A1 is the primary audio layer; A2 only plays in
-    // time ranges where A1 has a gap; A3 only fills A1+A2 gaps; and so on.
-    // This is what lets V2 "fill" clips produce audible audio: when V2 is
-    // showing a clip, the corresponding A2 clip (created together at import)
-    // fills A1's gap and the audio schedule emits an A2 entry.
+    // Sum-mix every visible audio track. AudioMixer in VideoPlayer combines
+    // each emitted entry into a single stereo output, so unlike the legacy
+    // A1-wins gap-fill (which silently dropped overlapping clips) every
+    // unmuted track contributes simultaneously. Track mute, per-clip
+    // volume, and source identity all ride on the PlaybackEntry — the
+    // mixer keys decoders by (filePath, clipIn, sourceTrack, sourceClipIndex)
+    // to reuse open file contexts across re-emits.
     QVector<PlaybackEntry> result;
     if (m_audioTracks.isEmpty())
         return result;
 
-    struct Interval {
-        double timelineStart;
-        double timelineEnd;
-        double clipIn;
-        double clipOut;
-        double speed;
-        QString filePath;
-        int trackIdx;
-        bool muted;
-        double volume = 1.0;
-        int clipIdx = -1;
-    };
-
-    QVector<QVector<Interval>> trackIntervals;
-    trackIntervals.reserve(m_audioTracks.size());
     for (int t = 0; t < m_audioTracks.size(); ++t) {
-        QVector<Interval> ivs;
         auto *track = m_audioTracks[t];
-        if (track && !track->isHidden()) {
-            const auto &clips = track->clips();
-            double accum = 0.0;
-            for (int ci = 0; ci < clips.size(); ++ci) {
-                const auto &c = clips[ci];
-                accum += qMax(0.0, c.leadInSec);
-                const double clipDur = c.effectiveDuration();
-                if (clipDur <= 0.0) continue;
-                Interval iv;
-                iv.timelineStart = accum;
-                iv.timelineEnd = accum + clipDur;
-                iv.clipIn = c.inPoint;
-                iv.clipOut = (c.outPoint > 0.0) ? c.outPoint : c.duration;
-                iv.speed = (c.speed > 0.0) ? c.speed : 1.0;
-                iv.filePath = c.filePath;
-                iv.trackIdx = t;
-                iv.muted = track->isMuted();
-                iv.volume = c.volume;
-                iv.clipIdx = ci;
-                ivs.append(iv);
-                accum += clipDur;
-            }
+        if (!track || track->isHidden()) continue;
+        const auto &clips = track->clips();
+        const bool trackMuted = track->isMuted();
+        double accum = 0.0;
+        for (int ci = 0; ci < clips.size(); ++ci) {
+            const auto &c = clips[ci];
+            accum += qMax(0.0, c.leadInSec);
+            const double clipDur = c.effectiveDuration();
+            if (clipDur <= 0.0) continue;
+            PlaybackEntry e;
+            e.filePath = c.filePath;
+            e.clipIn = c.inPoint;
+            e.clipOut = (c.outPoint > 0.0) ? c.outPoint : c.duration;
+            e.timelineStart = accum;
+            e.timelineEnd = accum + clipDur;
+            e.speed = (c.speed > 0.0) ? c.speed : 1.0;
+            e.sourceTrack = t;
+            e.audioMuted = trackMuted;
+            e.volume = c.volume;
+            e.sourceClipIndex = ci;
+            result.append(e);
+            accum += clipDur;
         }
-        trackIntervals.append(ivs);
     }
 
-    auto subtractRange = [](const QVector<Interval> &input,
-                            double cutStart, double cutEnd) -> QVector<Interval> {
-        QVector<Interval> out;
-        out.reserve(input.size());
-        for (const auto &iv : input) {
-            if (iv.timelineEnd <= cutStart || iv.timelineStart >= cutEnd) {
-                out.append(iv);
-                continue;
-            }
-            if (iv.timelineStart < cutStart) {
-                Interval left = iv;
-                left.timelineEnd = cutStart;
-                left.clipOut = iv.clipIn + (cutStart - iv.timelineStart) * iv.speed;
-                out.append(left);
-            }
-            if (iv.timelineEnd > cutEnd) {
-                Interval right = iv;
-                right.timelineStart = cutEnd;
-                right.clipIn = iv.clipIn + (cutEnd - iv.timelineStart) * iv.speed;
-                out.append(right);
-            }
-        }
-        return out;
-    };
-
-    QVector<Interval> visible;
-    for (int t = 0; t < trackIntervals.size(); ++t) {
-        QVector<Interval> trackClips = trackIntervals[t];
-        for (const auto &existing : visible) {
-            trackClips = subtractRange(trackClips, existing.timelineStart, existing.timelineEnd);
-        }
-        for (const auto &iv : trackClips)
-            visible.append(iv);
-    }
-
-    std::sort(visible.begin(), visible.end(),
-              [](const Interval &a, const Interval &b) {
-                  return a.timelineStart < b.timelineStart;
+    // Stable order: (timelineStart asc, sourceTrack asc) — purely cosmetic
+    // for the mixer (entry lookup is by AudioTrackKey) but keeps debug logs
+    // easy to follow.
+    std::sort(result.begin(), result.end(),
+              [](const PlaybackEntry &a, const PlaybackEntry &b) {
+                  if (a.timelineStart != b.timelineStart)
+                      return a.timelineStart < b.timelineStart;
+                  return a.sourceTrack < b.sourceTrack;
               });
-
-    result.reserve(visible.size());
-    for (const auto &iv : visible) {
-        if (iv.timelineEnd - iv.timelineStart < 1e-6) continue;
-        PlaybackEntry e;
-        e.filePath = iv.filePath;
-        e.clipIn = iv.clipIn;
-        e.clipOut = iv.clipOut;
-        e.timelineStart = iv.timelineStart;
-        e.timelineEnd = iv.timelineEnd;
-        e.speed = iv.speed;
-        e.sourceTrack = iv.trackIdx;
-        e.audioMuted = iv.muted;
-        e.volume = iv.volume;
-        e.sourceClipIndex = iv.clipIdx;
-        result.append(e);
-    }
     return result;
 }
 

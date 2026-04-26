@@ -4,6 +4,7 @@
 #include <QDebug>
 #include <QtMath>
 #include <QThread>
+#include <QVarLengthArray>
 #include <cstring>
 #include <algorithm>
 
@@ -63,10 +64,11 @@ private:
 };
 
 // =====================================================================
-// MixerIODevice — pulls samples from the active entry's ring buffer.
-// US-3 single-entry path: pick the first entry whose timeline range
-// contains m_writeCursorUs, drain its ring into the output. US-5 will
-// extend this to sum multiple active entries with int32 accumulator.
+// MixerIODevice — sums samples across every active entry into an int32
+// accumulator, then clamps to s16 stereo. Per-clip volume + per-track
+// effective gain (mute / solo / linear gain) are applied per entry
+// before summation. The master clock advances by the full requested
+// length so silence in gaps and decode catch-up don't stall the clock.
 // =====================================================================
 qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
     if (!data || maxlen <= 0) return 0;
@@ -78,46 +80,61 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
     }
 
     const int64_t cursorUs = m_mixer->m_writeCursorUs.load(std::memory_order_acquire);
+    const int frameCount = static_cast<int>(maxlen / AudioMixer::kBytesPerFrame);
+    const int sampleCount = frameCount * AudioMixer::kChannels;
 
-    AudioDecoderEntry *active = nullptr;
+    // Accumulator for the sum-mix. int32 lets us add up to 65535 unit-gain
+    // s16 sources before saturating; we cap inputs at MAX_AUDIO_TRACKS=16
+    // and the per-track effective gain is bounded at 4.0, so headroom is
+    // ample.
+    QVarLengthArray<int32_t, 8192> accum(sampleCount);
+    std::memset(accum.data(), 0, sampleCount * sizeof(int32_t));
+
+    bool anyMixed = false;
     for (auto it = m_mixer->m_entries.begin(); it != m_mixer->m_entries.end(); ++it) {
         AudioDecoderEntry *e = it.value();
         if (!e) continue;
         const int64_t startUs = static_cast<int64_t>(e->entry.timelineStart * 1e6);
         const int64_t endUs = static_cast<int64_t>(e->entry.timelineEnd * 1e6);
-        if (cursorUs >= startUs && cursorUs < endUs) {
-            active = e;
-            break;
-        }
-    }
+        if (cursorUs < startUs || cursorUs >= endUs) continue;
+        if (e->ring.isEmpty()) continue;
 
-    if (active && !active->ring.isEmpty()) {
-        const int copyBytes = static_cast<int>(qMin<qint64>(maxlen, active->ring.size()));
-        std::memcpy(data, active->ring.constData(), copyBytes);
-        active->ring.remove(0, copyBytes);
-
-        // Apply per-clip volume + per-track gain. US-5 will handle this in
-        // the per-entry sum loop with an int32 accumulator. For now scale
-        // the output buffer in place when gain != 1.0.
-        double gain = active->entry.volume;
-        const int trackIdx = active->entry.sourceTrack;
+        double gain = e->entry.volume;
+        if (e->entry.audioMuted) gain = 0.0;
+        const int trackIdx = e->entry.sourceTrack;
         if (trackIdx >= 0 && trackIdx < m_mixer->m_trackStates.size())
             gain *= m_mixer->m_trackStates[trackIdx].effectiveGain;
-        if (active->entry.audioMuted) gain = 0.0;
-        if (gain != 1.0) {
-            int16_t *samples = reinterpret_cast<int16_t *>(data);
-            const int n = copyBytes / static_cast<int>(sizeof(int16_t));
-            for (int i = 0; i < n; ++i) {
-                const int32_t v = static_cast<int32_t>(samples[i] * gain);
-                samples[i] = static_cast<int16_t>(qBound<int32_t>(-32768, v, 32767));
-            }
+        if (gain <= 0.0) {
+            // Still drain the ring so this muted entry stays in time with
+            // the cursor; otherwise unmuting mid-playback would resume from
+            // a stale position.
+            const int dropBytes = static_cast<int>(qMin<qint64>(maxlen, e->ring.size()));
+            e->ring.remove(0, dropBytes);
+            continue;
+        }
+
+        const int copyBytes = static_cast<int>(qMin<qint64>(maxlen, e->ring.size()));
+        const int copySamples = copyBytes / static_cast<int>(sizeof(int16_t));
+        const int16_t *src = reinterpret_cast<const int16_t *>(e->ring.constData());
+        if (qFuzzyCompare(gain, 1.0)) {
+            for (int i = 0; i < copySamples; ++i)
+                accum[i] += src[i];
+        } else {
+            for (int i = 0; i < copySamples; ++i)
+                accum[i] += static_cast<int32_t>(src[i] * gain);
+        }
+        e->ring.remove(0, copyBytes);
+        anyMixed = true;
+    }
+
+    if (anyMixed) {
+        int16_t *dst = reinterpret_cast<int16_t *>(data);
+        for (int i = 0; i < sampleCount; ++i) {
+            dst[i] = static_cast<int16_t>(qBound<int32_t>(-32768, accum[i], 32767));
         }
     }
 
-    // Advance the master clock by the full requested length so the audio
-    // side-clock keeps moving across gaps and decoder catch-up windows.
-    const int frames = static_cast<int>(maxlen / AudioMixer::kBytesPerFrame);
-    const int64_t deltaUs = static_cast<int64_t>(frames) * 1'000'000
+    const int64_t deltaUs = static_cast<int64_t>(frameCount) * 1'000'000
                             / AudioMixer::kSampleRateHz;
     m_mixer->m_writeCursorUs.fetch_add(deltaUs, std::memory_order_release);
 
