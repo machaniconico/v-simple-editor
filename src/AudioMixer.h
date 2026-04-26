@@ -126,7 +126,7 @@ private:
     void seekEntryToTimeline(AudioDecoderEntry *e, int64_t timelineUs);
     void refillRingForEntry(AudioDecoderEntry *e, int targetBytes);
     void resampleAndAppend(AudioDecoderEntry *e);
-    void refillRings();                   // called by AudioDecodeRunner
+    bool refillRings();                   // called by AudioDecodeRunner; returns whether work was done
 
     QAudioFormat m_format;
     QAudioSink *m_sink = nullptr;

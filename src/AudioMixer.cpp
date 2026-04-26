@@ -7,6 +7,7 @@
 #include <QVarLengthArray>
 #include <QSet>
 #include <QStringList>
+#include <QWaitCondition>
 #include <cstring>
 #include <algorithm>
 
@@ -52,23 +53,41 @@ private:
 };
 
 // AudioDecodeRunner — dedicated decode thread that periodically refills
-// ring buffers ahead of the audio sink. Sleeps 5 ms between refills; the
-// audio thread blocks on m_controlMutex only briefly because each refill
-// pass is bounded.
+// ring buffers ahead of the audio sink. When refillRings reports no work
+// (every active entry's ring is already at target), the runner sleeps
+// kIdleSleepMs instead of kBusySleepMs to keep idle CPU draw negligible.
+// External wake() can short-circuit the wait when setSequence / seekTo /
+// play schedules new work.
 class AudioDecodeRunner : public QThread {
 public:
+    static constexpr int kBusySleepMs = 5;
+    static constexpr int kIdleSleepMs = 50;
+
     explicit AudioDecodeRunner(AudioMixer *m, QObject *parent = nullptr)
         : QThread(parent), m_mixer(m) {}
-    void requestStop() { m_stopRequested.store(true, std::memory_order_release); }
+
+    void requestStop() {
+        m_stopRequested.store(true, std::memory_order_release);
+        QMutexLocker lock(&m_wakeMutex);
+        m_wakeCond.wakeAll();
+    }
+    void wake() {
+        QMutexLocker lock(&m_wakeMutex);
+        m_wakeCond.wakeOne();
+    }
 protected:
     void run() override {
         while (!m_stopRequested.load(std::memory_order_acquire)) {
-            m_mixer->refillRings();
-            QThread::msleep(5);
+            const bool didWork = m_mixer->refillRings();
+            QMutexLocker lock(&m_wakeMutex);
+            if (m_stopRequested.load(std::memory_order_acquire)) break;
+            m_wakeCond.wait(&m_wakeMutex, didWork ? kBusySleepMs : kIdleSleepMs);
         }
     }
 private:
     AudioMixer *m_mixer;
+    QMutex m_wakeMutex;
+    QWaitCondition m_wakeCond;
     std::atomic<bool> m_stopRequested{false};
 };
 
@@ -296,6 +315,7 @@ void AudioMixer::setSequence(const QVector<PlaybackEntry> &entries) {
     // listener that calls back into setSequence) does not deadlock.
     for (const auto &msg : qAsConst(pendingErrors))
         emit decoderError(msg);
+    if (m_decodeRunner) m_decodeRunner->wake();
 }
 
 void AudioMixer::seekTo(int64_t timelineUs) {
@@ -327,20 +347,24 @@ void AudioMixer::seekTo(int64_t timelineUs) {
             sinkSnap->start(ioSnap);
         }
     }
+    if (m_decodeRunner) m_decodeRunner->wake();
 }
 
 void AudioMixer::play() {
-    QMutexLocker lock(&m_controlMutex);
-    m_playing.store(true, std::memory_order_release);
-    ensureSinkLocked();
-    if (m_sink) {
-        if (m_sink->state() == QAudio::SuspendedState
-            || m_sink->state() == QAudio::IdleState) {
-            m_sink->resume();
-        } else if (m_sink->state() == QAudio::StoppedState && m_io) {
-            m_sink->start(m_io);
+    {
+        QMutexLocker lock(&m_controlMutex);
+        m_playing.store(true, std::memory_order_release);
+        ensureSinkLocked();
+        if (m_sink) {
+            if (m_sink->state() == QAudio::SuspendedState
+                || m_sink->state() == QAudio::IdleState) {
+                m_sink->resume();
+            } else if (m_sink->state() == QAudio::StoppedState && m_io) {
+                m_sink->start(m_io);
+            }
         }
     }
+    if (m_decodeRunner) m_decodeRunner->wake();
 }
 
 void AudioMixer::pause() {
@@ -535,9 +559,9 @@ void AudioMixer::refillRingForEntry(AudioDecoderEntry *e, int targetBytes) {
     }
 }
 
-void AudioMixer::refillRings() {
+bool AudioMixer::refillRings() {
     QMutexLocker lock(&m_controlMutex);
-    if (m_entries.isEmpty()) return;
+    if (m_entries.isEmpty()) return false;
     const int64_t cursorUs = m_writeCursorUs.load(std::memory_order_acquire);
     // Bound decode work per refill pass so the 200 ms QAudioSink OS buffer
     // doesn't underrun while readData waits on m_controlMutex. ~8 KB per
@@ -546,6 +570,7 @@ void AudioMixer::refillRings() {
     // ~16 ticks (~80 ms total).
     constexpr int kPerCallChunkBytes = 8 * 1024;
     int remainingSeekBudget = 1;  // at most one expensive avformat_seek_file per pass
+    bool didWork = false;
     for (auto *e : qAsConst(m_entries)) {
         if (!e) continue;
         const int64_t startUs = static_cast<int64_t>(e->entry.timelineStart * 1e6);
@@ -561,13 +586,16 @@ void AudioMixer::refillRings() {
             const int64_t target = qMax<int64_t>(cursorUs, startUs);
             seekEntryToTimeline(e, target);
             e->seekPending = false;
+            didWork = true;
         }
         if (e->ring.size() < kRingTargetBytes) {
             const int chunkTarget = qMin<int>(e->ring.size() + kPerCallChunkBytes,
                                               kRingTargetBytes);
             refillRingForEntry(e, chunkTarget);
+            didWork = true;
         }
     }
+    return didWork;
 }
 
 int64_t AudioMixer::audibleClockUs() const {
