@@ -533,8 +533,8 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
 void VideoPlayer::setAudioSequence(const QVector<PlaybackEntry> &entries)
 {
     qInfo() << "VideoPlayer::setAudioSequence count=" << entries.size();
-    const bool hadEntries = !m_audioSequence.isEmpty();
-    m_audioSequence = entries;
+    const bool hadEntries = m_audioSequenceHadEntries;
+    m_audioSequenceHadEntries = !entries.isEmpty();
     if (!m_mixer) return;
     m_mixer->setSequence(entries);
     if (entries.isEmpty()) {

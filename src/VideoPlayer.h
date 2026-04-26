@@ -391,7 +391,11 @@ private:
     // resolved timeline position when sequence mode is active.
     QVector<PlaybackEntry> m_sequence;
     int m_activeEntry = -1;
-    QVector<PlaybackEntry> m_audioSequence;
+    // Tracks the empty -> non-empty transition so setAudioSequence only
+    // seeks the AudioMixer the first time a schedule arrives. The full
+    // entry list is owned by the mixer; mirroring it here would just be
+    // dead state.
+    bool m_audioSequenceHadEntries = false;
     int64_t m_timelinePositionUs = 0;
     int64_t m_sequenceDurationUs = 0;
     QString m_loadedFilePath;
