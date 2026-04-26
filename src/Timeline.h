@@ -340,6 +340,10 @@ signals:
     void positionChanged(double seconds);
     void sequenceChanged(const QVector<PlaybackEntry> &entries);
     void audioSequenceChanged(const QVector<PlaybackEntry> &entries);
+    // Per-track audio state updates that don't fit cleanly into the
+    // PlaybackEntry struct. AudioMixer applies them via setTrackSolo on
+    // receipt; mute and per-clip volume already ride on PlaybackEntry.
+    void trackSoloChanged(int trackIdx, bool solo);
     // Fired when the user drags a text overlay's edge handle on the
     // timeline text strip so MainWindow can resync the right-panel
     // 開始時間 / 表示時間 spinboxes and re-push the preview overlays.

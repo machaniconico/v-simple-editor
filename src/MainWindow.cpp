@@ -250,8 +250,9 @@ void MainWindow::setupUI()
         qInfo() << "MainWindow: forwarding sequenceChanged entries=" << resolved.size();
         m_player->setSequence(resolved);
     });
-    // Audio-side schedule — drives m_audioPlayer independently so unlinked
-    // A clips can play a J-cut / L-cut at their own timeline offset.
+    // Audio-side schedule — feeds AudioMixer so every active entry across
+    // A1..A16 is sum-mixed into a single output. Unlinked A clips and
+    // overlapping tracks all sound simultaneously.
     connect(m_timeline, &Timeline::audioSequenceChanged, this, [this](const QVector<PlaybackEntry> &entries) {
         if (!m_player) return;
         QVector<PlaybackEntry> resolved = entries;
@@ -260,6 +261,14 @@ void MainWindow::setupUI()
             e.filePath = pm.getProxyPath(e.filePath);
         qInfo() << "MainWindow: forwarding audioSequenceChanged entries=" << resolved.size();
         m_player->setAudioSequence(resolved);
+    });
+    // Per-track solo state lives on the mixer (effective gain applied per
+    // entry); audioSequenceChanged alone can't carry it because solo is
+    // global state, not a per-clip flag. Forward it directly.
+    connect(m_timeline, &Timeline::trackSoloChanged, this, [this](int trackIdx, bool solo) {
+        if (!m_player) return;
+        if (auto *mixer = m_player->audioMixer())
+            mixer->setTrackSolo(trackIdx, solo);
     });
 
     // Proxy generation progress dialog: modeless window created lazily on

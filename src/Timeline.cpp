@@ -2239,6 +2239,9 @@ void Timeline::setClipVolume(double volume)
         m_audioTrack->setClips(audioClips);
     }
     saveUndoState(QString("Set volume %1%").arg(static_cast<int>(volume * 100)));
+    // Re-emit so AudioMixer picks up the new per-clip volume for the
+    // matching PlaybackEntry on its next setSequence call.
+    emit audioSequenceChanged(computeAudioPlaybackSequence());
 }
 
 // --- Phase 3: Color correction, effects, keyframes ---
@@ -2330,6 +2333,10 @@ void Timeline::toggleMuteTrack(int audioTrackIndex)
     if (audioTrackIndex < 0 || audioTrackIndex >= m_audioTracks.size()) return;
     auto *track = m_audioTracks[audioTrackIndex];
     track->setMuted(!track->isMuted());
+    // Re-emit so AudioMixer picks up the new audioMuted flag for every
+    // entry on this track. Without this the mute toggle stayed silent
+    // until the next clip edit triggered a sequence rebuild.
+    emit audioSequenceChanged(computeAudioPlaybackSequence());
     updateInfoLabel();
 }
 
@@ -2338,8 +2345,18 @@ void Timeline::toggleSoloTrack(int audioTrackIndex)
     if (audioTrackIndex < 0 || audioTrackIndex >= m_audioTracks.size()) return;
     bool newSolo = !m_audioTracks[audioTrackIndex]->isSolo();
     // Clear all solo first, then set the target
-    for (auto *t : m_audioTracks) t->setSolo(false);
-    if (newSolo) m_audioTracks[audioTrackIndex]->setSolo(true);
+    for (int i = 0; i < m_audioTracks.size(); ++i) {
+        const bool wasSolo = m_audioTracks[i]->isSolo();
+        const bool nowSolo = (i == audioTrackIndex && newSolo);
+        if (wasSolo != nowSolo) {
+            m_audioTracks[i]->setSolo(nowSolo);
+            emit trackSoloChanged(i, nowSolo);
+        }
+    }
+    // Solo state lives on the mixer (per-track effectiveGain), so a re-emit
+    // of the schedule is not strictly required — but harmless and keeps the
+    // legacy listeners (track header UI) coherent.
+    emit audioSequenceChanged(computeAudioPlaybackSequence());
     updateInfoLabel();
 }
 
