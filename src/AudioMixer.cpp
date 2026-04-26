@@ -105,6 +105,12 @@ public:
         m_wakeCond.wakeAll();
     }
     void wake() {
+        // Mark work pending before wakeOne so a wake() that races between
+        // refillRings()'s return and run()'s wait() is not lost. Without
+        // this flag, that window left the decoder asleep for up to
+        // kIdleSleepMs after setSequence/seekTo/play/stall events had
+        // already queued more decode work.
+        m_workPending.store(true, std::memory_order_release);
         QMutexLocker lock(&m_wakeMutex);
         m_wakeCond.wakeOne();
     }
@@ -114,6 +120,11 @@ protected:
             const bool didWork = m_mixer->refillRings();
             QMutexLocker lock(&m_wakeMutex);
             if (m_stopRequested.load(std::memory_order_acquire)) break;
+            // If a wake came in between refillRings() and now, skip the
+            // wait entirely — we already have work to do. The exchange
+            // also clears the flag for the next iteration.
+            if (m_workPending.exchange(false, std::memory_order_acq_rel))
+                continue;
             m_wakeCond.wait(&m_wakeMutex, didWork ? kBusySleepMs : kIdleSleepMs);
         }
     }
@@ -122,6 +133,7 @@ private:
     QMutex m_wakeMutex;
     QWaitCondition m_wakeCond;
     std::atomic<bool> m_stopRequested{false};
+    std::atomic<bool> m_workPending{false};
 };
 
 // =====================================================================
@@ -136,7 +148,22 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
     QMutexLocker lock(&m_mixer->m_controlMutex);
     std::memset(data, 0, static_cast<size_t>(maxlen));
 
+    // Refresh the audible-lag publication so audibleClockUs() can stay
+    // lock-free. The audio worker thread is the only path that calls into
+    // QAudioSink internals; doing it here avoids the GUI thread blocking on
+    // m_controlMutex (and on Qt sink mutexes) once per video tick — which
+    // was starving the audio worker before this fix and producing silence.
+    if (m_mixer->m_sink) {
+        const qint64 buffered = m_mixer->m_sink->bufferSize() - m_mixer->m_sink->bytesFree();
+        const int64_t lagUs = (buffered > 0)
+            ? buffered * 1'000'000LL
+                  / (static_cast<int64_t>(AudioMixer::kBytesPerFrame) * AudioMixer::kSampleRateHz)
+            : 0;
+        m_mixer->m_audibleLagUs.store(lagUs, std::memory_order_release);
+    }
+
     if (!m_mixer->m_playing.load(std::memory_order_acquire)) {
+        m_mixer->m_consecutiveStallCallbacks.store(0, std::memory_order_release);
         return maxlen;
     }
 
@@ -162,13 +189,22 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
     };
 
     bool anyMixed = false;
+    // Set when an entry is active at the current cursor but its ring has no
+    // samples yet (decoder warming up after open/seek). Used below to freeze
+    // the cursor for up to kMaxStallCallbacks so we don't race past samples
+    // the decoder is about to produce — which would land them in the late-drop
+    // path and discard them, leaving permanent silence.
+    bool entryActiveButStalled = false;
     for (auto it = m_mixer->m_entries.begin(); it != m_mixer->m_entries.end(); ++it) {
         AudioDecoderEntry *e = it.value();
         if (!e) continue;
         const int64_t startUs = static_cast<int64_t>(e->entry.timelineStart * 1e6);
         const int64_t endUs = static_cast<int64_t>(e->entry.timelineEnd * 1e6);
         if (cursorUs < startUs || cursorUs >= endUs) continue;
-        if (liveBytes(*e) <= 0) continue;
+        if (liveBytes(*e) <= 0) {
+            entryActiveButStalled = true;
+            continue;
+        }
 
         // Drop samples that landed in the ring late — i.e. their timeline
         // position is already behind the master cursor. Without this, a
@@ -238,6 +274,29 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
 
     const int64_t deltaUs = static_cast<int64_t>(frameCount) * 1'000'000
                             / AudioMixer::kSampleRateHz;
+
+    // Freeze the cursor while we're waiting on the decoder. If we always
+    // advance, the very next callback's late-drop discards the samples the
+    // decoder is about to produce — they arrive timestamped at the freeze
+    // point but the cursor is now ahead. Result: permanent silence at every
+    // cold start / seek. Bound the freeze with kMaxStallCallbacks so a truly
+    // broken decoder (avformat error, file unavailable) doesn't deadlock the
+    // video pacer indefinitely.
+    constexpr int kMaxStallCallbacks = 50; // ~50 callbacks * ~21 ms = ~1 s
+    if (entryActiveButStalled && !anyMixed) {
+        const int stalls = m_mixer->m_consecutiveStallCallbacks.fetch_add(1,
+                               std::memory_order_acq_rel) + 1;
+        // Wake the decode thread out of its idle 50 ms wait so it gets a
+        // chance to refill before this stall budget runs out.
+        if (m_mixer->m_decodeRunner) m_mixer->m_decodeRunner->wake();
+        if (stalls < kMaxStallCallbacks) {
+            return maxlen;
+        }
+        // Fall through and advance the cursor so video can keep moving.
+    } else {
+        m_mixer->m_consecutiveStallCallbacks.store(0, std::memory_order_release);
+    }
+
     m_mixer->m_writeCursorUs.fetch_add(deltaUs, std::memory_order_release);
 
     return maxlen;
@@ -377,6 +436,7 @@ void AudioMixer::seekTo(int64_t timelineUs) {
     {
         QMutexLocker lock(&m_controlMutex);
         m_writeCursorUs.store(timelineUs, std::memory_order_release);
+        m_consecutiveStallCallbacks.store(0, std::memory_order_release);
         for (auto *e : qAsConst(m_entries)) {
             if (!e) continue;
             e->seekPending = true;
@@ -646,12 +706,13 @@ bool AudioMixer::refillRings() {
 }
 
 int64_t AudioMixer::audibleClockUs() const {
-    QMutexLocker lock(&m_controlMutex);
+    // Lock-free: scheduleNextFrame and correctVideoDriftAgainstAudioClock
+    // call this on every video tick. Locking m_controlMutex here previously
+    // produced heavy contention with MixerIODevice::readData on the audio
+    // worker thread, manifesting as audio underruns and silence. The
+    // audible-lag estimate is published by readData itself so we can read
+    // it via two atomic loads.
     const int64_t cursor = m_writeCursorUs.load(std::memory_order_acquire);
-    if (!m_sink) return cursor;
-    const qint64 buffered = m_sink->bufferSize() - m_sink->bytesFree();
-    if (buffered <= 0) return cursor;
-    const int64_t bufferedUs = static_cast<int64_t>(buffered) * 1'000'000LL
-                               / (kBytesPerFrame * kSampleRateHz);
-    return qMax<int64_t>(0, cursor - bufferedUs);
+    const int64_t lag = m_audibleLagUs.load(std::memory_order_acquire);
+    return qMax<int64_t>(0, cursor - lag);
 }

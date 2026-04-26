@@ -137,6 +137,16 @@ private:
 
     mutable QMutex m_controlMutex;
     std::atomic<int64_t> m_writeCursorUs{0};
+    // OS-buffered samples in microseconds, published by MixerIODevice::readData
+    // so audibleClockUs() is lock-free. Reading m_sink->bytesFree() from the
+    // GUI thread under m_controlMutex caused starvation of the audio worker
+    // thread (called audibleClockUs every video tick).
+    std::atomic<int64_t> m_audibleLagUs{0};
+    // Consecutive readData callbacks that wanted to mix an active entry but
+    // found its ring empty. Drives the cursor-stall logic so cursor doesn't
+    // race past unfilled rings while still self-healing if the decoder is
+    // permanently broken.
+    std::atomic<int> m_consecutiveStallCallbacks{0};
     std::atomic<bool> m_playing{false};
 
     AudioDecodeRunner *m_decodeRunner = nullptr;
