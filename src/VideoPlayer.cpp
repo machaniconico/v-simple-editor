@@ -835,6 +835,7 @@ void VideoPlayer::setPlaybackSpeed(double speed)
     if (qFuzzyIsNull(speed))
         speed = 1.0;
 
+    const bool wasReverse = (m_playbackSpeed < 0.0);
     const double absSpeed = qBound(0.25, std::abs(speed), 16.0);
     m_playbackSpeed = (speed < 0.0) ? -absSpeed : absSpeed;
     emit playbackSpeedChanged(m_playbackSpeed);
@@ -847,8 +848,17 @@ void VideoPlayer::setPlaybackSpeed(double speed)
             // Reverse playback: silence the mixer. We don't yet support
             // reverse audio — pause until forward playback resumes.
             m_mixer->pause();
-        } else if (m_playing) {
-            m_mixer->play();
+        } else {
+            // Re-anchor the mixer if we're coming out of reverse: the
+            // video timeline cursor moved backward while the mixer was
+            // paused, so resuming without a seek would play audio from
+            // the pre-reverse position.
+            if (wasReverse) {
+                m_mixer->seekTo(m_timelinePositionUs);
+            }
+            if (m_playing) {
+                m_mixer->play();
+            }
         }
     }
 }
