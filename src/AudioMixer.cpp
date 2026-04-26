@@ -120,9 +120,8 @@ protected:
             const bool didWork = m_mixer->refillRings();
             QMutexLocker lock(&m_wakeMutex);
             if (m_stopRequested.load(std::memory_order_acquire)) break;
-            // If a wake came in between refillRings() and now, skip the
-            // wait entirely — we already have work to do. The exchange
-            // also clears the flag for the next iteration.
+            // Skip the wait when wake() set the flag during the
+            // refillRings() pass. exchange clears the flag atomically.
             if (m_workPending.exchange(false, std::memory_order_acq_rel))
                 continue;
             m_wakeCond.wait(&m_wakeMutex, didWork ? kBusySleepMs : kIdleSleepMs);
