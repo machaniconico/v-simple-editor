@@ -1,6 +1,14 @@
 #include "VideoPlayer.h"
 #include <QSet>
 #include "GLPreview.h"
+
+#if defined(_WIN32)
+// Phase 1e — d3d11.h pulls in WinSDK 10.0.26100 headers that fight Qt's
+// QCborTag operator==, so we keep the AVD3D11VADeviceContext peek inside
+// D3D11Bridge.cpp where d3d11.h is the only public header. Here we just
+// forward-declare the bridge entry point.
+extern "C" void *veditor_avHwDeviceCtxToD3D11Device(AVBufferRef *ref);
+#endif
 #include <QSettings>
 #include <QResizeEvent>
 #include <QSignalBlocker>
@@ -22,6 +30,28 @@
 #include <limits>
 
 namespace {
+
+// Phase 1e — opaque reference into FFmpeg's D3D11 frame pool. Only valid
+// while the originating AVFrame is held; we hand it to GLPreview which
+// registers it once via WGL_NV_DX_interop2 and caches by (texture, subres).
+struct D3D11FrameRef {
+    void *texture = nullptr;
+    int   subresource = 0;
+    int   width = 0;
+    int   height = 0;
+};
+
+bool extractD3D11FrameRef(const AVFrame *frame, D3D11FrameRef *out)
+{
+    if (!out || !frame || frame->format != AV_PIX_FMT_D3D11)
+        return false;
+    out->texture = reinterpret_cast<void*>(frame->data[0]);
+    out->subresource = static_cast<int>(reinterpret_cast<intptr_t>(frame->data[1]));
+    out->width = frame->width;
+    out->height = frame->height;
+    return out->texture != nullptr;
+}
+
 
 // VEDITOR_TICK_TRACE=1 turns on per-tick wall-time accumulators that print a
 // 30-tick rollup line to qInfo. Default off — read once per process so the
@@ -92,6 +122,12 @@ VideoPlayer::~VideoPlayer()
     // av_buffer_ref'd handles to m_sharedPoolHwDeviceCtx, so freeing them
     // first decrements the refcount to 1 (held by VideoPlayer itself).
     clearAllPoolDecoders();
+    if (m_glPreview) {
+        // Pool textures the cache might still reference are about to be
+        // freed alongside the device — drop them before that happens.
+        m_glPreview->flushInteropCache();
+        m_glPreview->setSharedD3D11Device(nullptr);
+    }
     if (m_sharedPoolHwDeviceCtx)
         av_buffer_unref(&m_sharedPoolHwDeviceCtx);
     m_sharedPoolHwPixFmt = AV_PIX_FMT_NONE;
@@ -334,12 +370,16 @@ void VideoPlayer::loadFile(const QString &filePath)
         m_codecCtx->get_format = &VideoPlayer::getHwFormatCallback;
         m_codecCtx->hw_device_ctx = av_buffer_ref(m_hwDeviceCtx);
         qInfo() << "  HW decode enabled via D3D11VA";
+        if (m_glPreview)
+            m_glPreview->setSharedD3D11Device(sharedD3D11Device());
     } else {
         if (m_hwDeviceCtx) {
             av_buffer_unref(&m_hwDeviceCtx);
             m_hwDeviceCtx = nullptr;
         }
         qInfo() << "  HW decode unavailable, using software decoding";
+        if (m_glPreview)
+            m_glPreview->setSharedD3D11Device(nullptr);
     }
 
     if (avcodec_open2(m_codecCtx, codec, nullptr) < 0) {
@@ -953,6 +993,30 @@ void VideoPlayer::updatePlayButton()
     if (m_stopButton) m_stopButton->setEnabled(true);
 }
 
+void *VideoPlayer::sharedD3D11Device() const noexcept
+{
+#if defined(_WIN32)
+    if (void *dev = veditor_avHwDeviceCtxToD3D11Device(m_hwDeviceCtx)) return dev;
+    return veditor_avHwDeviceCtxToD3D11Device(m_sharedPoolHwDeviceCtx);
+#else
+    return nullptr;
+#endif
+}
+
+bool VideoPlayer::canUseInteropFastPath(const AVFrame *frame) const
+{
+    // Section C dual-register (Y as R8, UV as RG8 against the same
+    // ID3D11Texture2D) crashed the NVIDIA driver during wglDXRegisterObjectNV.
+    // Three independent reviews (architect/codex/gemini) agreed the WGL spec
+    // does not permit plane-split views; the production-proven path is a
+    // D3D11 NV12->RGBA blit (VideoProcessor or HLSL compute) followed by a
+    // single register. That work is Section D scope. Until then the fast
+    // path is hard-off — the surrounding infra (device open, AVFrame
+    // extraction, cache) stays so Section D can drop in.
+    Q_UNUSED(frame);
+    return false;
+}
+
 void VideoPlayer::displayFrame(const QImage &image)
 {
     m_lastSourceFrame = image;
@@ -1319,6 +1383,12 @@ void VideoPlayer::resetDecoder()
     if (m_hwDeviceCtx)
         av_buffer_unref(&m_hwDeviceCtx);
     m_hwPixFmt = AV_PIX_FMT_NONE;
+    if (m_glPreview) {
+        // Flush before clearing the device pointer — every cached entry
+        // points into the texture pool that's about to be destroyed.
+        m_glPreview->flushInteropCache();
+        m_glPreview->setSharedD3D11Device(nullptr);
+    }
 
     // Drop the cached compositor base. Otherwise the next tick after a
     // clip switch (advanceToEntry → loadFile → resetDecoder → fresh
@@ -1620,6 +1690,28 @@ bool VideoPlayer::presentDecodedFrame(AVFrame *frame, bool displayFrameRequested
     m_currentPositionUs = positionUs;
 
     if (displayFrameRequested) {
+        // Phase 1e fast path — when the narrow set of preconditions holds
+        // we hand the FFmpeg D3D11 texture to GLPreview without an
+        // av_hwframe_transfer_data + sws_scale round-trip. m_lastSourceFrame
+        // is intentionally NOT updated here; pause/resize during fast path
+        // shows whatever was last cached by the legacy path. Acceptable for
+        // V1-only narrow conditions; revisit if user reports staleness.
+        if (canUseInteropFastPath(frame)) {
+            D3D11FrameRef ref;
+            if (extractD3D11FrameRef(frame, &ref)) {
+                static bool loggedFastPathEngage = false;
+                if (!loggedFastPathEngage) {
+                    qInfo() << "[interop] fast path engaged for V1 (texture="
+                            << ref.texture << "subres=" << ref.subresource
+                            << ref.width << "x" << ref.height << ")";
+                    loggedFastPathEngage = true;
+                }
+                m_glPreview->displayD3D11Frame(ref.texture, ref.subresource,
+                                               ref.width, ref.height);
+                updatePositionUi();
+                return true;
+            }
+        }
         AVFrame *displayable = ensureSwFrame(frame);
         if (!displayable)
             return false;

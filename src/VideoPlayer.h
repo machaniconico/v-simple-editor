@@ -124,6 +124,10 @@ public:
     int proxyDivisor() const { return m_proxyDivisor; }
     void setProxyDivisor(int divisor);
     GLPreview *glPreview() const { return m_glPreview; }
+    // Phase 1e — returns the ID3D11Device* the FFmpeg HW context owns so
+    // GLPreview can hand it to wglDXOpenDeviceNV. nullptr when no D3D11VA
+    // device is currently active. Opaque void* keeps d3d11.h out of headers.
+    void *sharedD3D11Device() const noexcept;
 
     struct HdrInfo {
         bool isHdr = false;
@@ -215,6 +219,11 @@ private:
     bool seekInternal(int64_t positionUs, bool displayFrame, bool precise);
     bool decodeNextFrame(bool displayFrame);
     bool presentDecodedFrame(AVFrame *frame, bool displayFrame);
+    // Phase 1e — V1 fast path is opt-in via VEDITOR_GL_INTEROP=1 and limited
+    // to a narrow set of conditions: HW-decoded D3D11 frame, no overlays
+    // (text or V2+), no preview effects, no HDR, not deferred. Anything
+    // outside this set falls through to the legacy sws_scale + QImage path.
+    bool canUseInteropFastPath(const AVFrame *frame) const;
     QImage frameToImage(const AVFrame *frame);
     AVFrame *ensureSwFrame(AVFrame *frame);
     static enum AVPixelFormat getHwFormatCallback(AVCodecContext *ctx, const enum AVPixelFormat *pixFmts);

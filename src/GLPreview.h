@@ -40,6 +40,19 @@ public:
     // Phase 1e — true only when VEDITOR_GL_INTEROP=1 AND WGL_NV_DX_interop2
     // is supported AND all 6 wglDX*NV procs resolved during initializeGL().
     bool isInteropAvailable() const noexcept { return m_interopAvailable; }
+    // Section B: VideoPlayer pushes its FFmpeg-owned ID3D11Device pointer; we
+    // store it and open the interop handle lazily inside paintGL where the GL
+    // context is guaranteed current. nullptr means "no D3D11 device yet" or
+    // "decoder closed" — close any open interop handle on the next paint.
+    void setSharedD3D11Device(void *d3d11Device);
+    void *interopDevice() const noexcept { return m_interopDevice; }
+    // Section C: zero-copy display path. d3d11Texture is the ID3D11Texture2D*
+    // owned by FFmpeg's frame pool; it stays valid while the AVFrame is held.
+    void displayD3D11Frame(void *d3d11Texture, int subresource, int width, int height);
+    // Drop every cached register entry. Called by VideoPlayer when the
+    // decoder pool is destroyed/reset so we don't dereference recycled
+    // ID3D11Texture2D pointers.
+    void flushInteropCache();
     // Adobe-style text tool mode. When active, the cursor is Qt::IBeamCursor
     // and mouse press+drag+release captures a text box rectangle; on release
     // textRectRequested is emitted with the rect in normalized 0.0–1.0
@@ -143,6 +156,9 @@ private:
     void createShaderProgram();
     void updateUniforms();
     void detectInteropExtension();
+    bool ensureInteropDeviceForPaint();
+    void releaseRegisteredTexturesLocked();
+    void renderPendingD3D11Frame();
     // letterboxRect() moved to public section (US-T32).
 
     QOpenGLShaderProgram *m_program = nullptr;
@@ -268,8 +284,21 @@ private:
     float m_lutIntensity = 1.0f;
     bool m_lutEnabled = false;
 
-    // Phase 1e — m_interopDevice will hold the wglDXOpenDeviceNV HANDLE
-    // once Section C lands; void* avoids leaking windows.h through the header.
+    // Phase 1e — m_interopDevice holds the wglDXOpenDeviceNV HANDLE once
+    // Section B opens it lazily in paintGL; void* avoids leaking windows.h.
+    // m_pendingD3D11Device is the ID3D11Device* the decoder gave us; the
+    // paint callback opens / re-opens / closes m_interopDevice based on it.
     bool m_interopAvailable = false;
     void *m_interopDevice = nullptr;
+    void *m_pendingD3D11Device = nullptr;
+    void *m_currentInteropD3D11Device = nullptr;
+    // Section C — pending zero-copy frame published by displayD3D11Frame.
+    // Cleared after paintGL renders it.
+    void *m_pendingD3D11Texture = nullptr;
+    int m_pendingD3D11Subresource = 0;
+    int m_pendingD3D11Width = 0;
+    int m_pendingD3D11Height = 0;
+    QOpenGLShaderProgram *m_nv12Program = nullptr;
+    int m_locNv12TexY = -1;
+    int m_locNv12TexUV = -1;
 };

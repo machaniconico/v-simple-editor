@@ -1,6 +1,8 @@
 #include "GLPreview.h"
 #include <cmath>
 #include <cstring>
+#include <functional>
+#include <unordered_map>
 #include <QtGlobal>
 #include <QDateTime>
 #include <QVector2D>
@@ -355,6 +357,76 @@ void main() {
 }
 )";
 
+// Section C — NV12 zero-copy preview. We sample two single-component textures
+// (Y as R8, UV as RG8) backed by the same FFmpeg-decoded ID3D11Texture2D
+// subresource and convert to BT.709 limited-range RGB on the GPU.
+static const char *nv12VertexShaderSrc = R"(
+#version 330 core
+layout(location = 0) in vec2 aPos;
+layout(location = 1) in vec2 aTexCoord;
+out vec2 vTexCoord;
+void main() {
+    gl_Position = vec4(aPos, 0.0, 1.0);
+    vTexCoord = aTexCoord;
+}
+)";
+
+static const char *nv12FragmentShaderSrc = R"(
+#version 330 core
+in vec2 vTexCoord;
+out vec4 FragColor;
+uniform sampler2D uTexY;
+uniform sampler2D uTexUV;
+void main() {
+    float y = (texture(uTexY, vTexCoord).r - 0.0625) * 1.164;
+    vec2 cb_cr = texture(uTexUV, vTexCoord).rg - vec2(0.5, 0.5);
+    float r = y                  + 1.793 * cb_cr.y;
+    float g = y - 0.213 * cb_cr.x - 0.533 * cb_cr.y;
+    float b = y + 2.112 * cb_cr.x;
+    FragColor = vec4(clamp(vec3(r, g, b), 0.0, 1.0), 1.0);
+}
+)";
+
+#if defined(Q_OS_WIN)
+namespace {
+struct NV12RegisteredTex {
+    void *d3d11Tex = nullptr;
+    int   subresource = 0;
+    HANDLE hY = nullptr;
+    HANDLE hUV = nullptr;
+    GLuint glTexY = 0;
+    GLuint glTexUV = 0;
+    int    width = 0;
+    int    height = 0;
+};
+
+struct CacheKey {
+    const GLPreview *owner;
+    void *d3d11Tex;
+    int   subresource;
+    bool operator==(const CacheKey &o) const noexcept {
+        return owner == o.owner && d3d11Tex == o.d3d11Tex && subresource == o.subresource;
+    }
+};
+struct CacheKeyHash {
+    size_t operator()(const CacheKey &k) const noexcept {
+        // Mix all three identity components — owner discriminates instances,
+        // tex+subresource discriminate frames within an instance.
+        const auto a = reinterpret_cast<uintptr_t>(k.owner);
+        const auto b = reinterpret_cast<uintptr_t>(k.d3d11Tex);
+        return std::hash<uintptr_t>{}(a) ^ (std::hash<uintptr_t>{}(b) << 1)
+               ^ (std::hash<int>{}(k.subresource) << 2);
+    }
+};
+
+std::unordered_map<CacheKey, NV12RegisteredTex, CacheKeyHash> &nv12Cache()
+{
+    static std::unordered_map<CacheKey, NV12RegisteredTex, CacheKeyHash> g;
+    return g;
+}
+} // namespace
+#endif // Q_OS_WIN
+
 GLPreview::GLPreview(QWidget *parent)
     : QOpenGLWidget(parent), m_vbo(QOpenGLBuffer::VertexBuffer)
 {
@@ -387,6 +459,19 @@ void GLPreview::cleanupGL()
         return;
 
     makeCurrent();
+    releaseRegisteredTexturesLocked();
+#if defined(Q_OS_WIN)
+    if (m_interopDevice) {
+        if (gWglDXCloseDeviceNV)
+            gWglDXCloseDeviceNV(static_cast<HANDLE>(m_interopDevice));
+        m_interopDevice = nullptr;
+        m_currentInteropD3D11Device = nullptr;
+    }
+#endif
+    if (m_nv12Program) {
+        delete m_nv12Program;
+        m_nv12Program = nullptr;
+    }
     if (m_lutTexture) {
         delete m_lutTexture;
         m_lutTexture = nullptr;
@@ -529,6 +614,114 @@ void GLPreview::detectInteropExtension()
 #endif
 }
 
+void GLPreview::setSharedD3D11Device(void *d3d11Device)
+{
+#if defined(Q_OS_WIN)
+    // Store the pointer regardless of m_interopAvailable — VideoPlayer can
+    // call us before initializeGL runs (loadFile races the first paint).
+    // Lazy ensureInteropDeviceForPaint gates the actual open by detection.
+    if (d3d11Device == m_pendingD3D11Device)
+        return;
+    m_pendingD3D11Device = d3d11Device;
+    // Existing interop handle was opened against the previous device — drop
+    // every cached register entry plus the device handle itself before the
+    // next paint reopens against the new device. close on the GL thread.
+    if (m_interopDevice && d3d11Device != m_currentInteropD3D11Device) {
+        if (context() && QOpenGLContext::currentContext() != context()) {
+            makeCurrent();
+            releaseRegisteredTexturesLocked();
+            if (gWglDXCloseDeviceNV)
+                gWglDXCloseDeviceNV(static_cast<HANDLE>(m_interopDevice));
+            doneCurrent();
+        } else {
+            releaseRegisteredTexturesLocked();
+            if (gWglDXCloseDeviceNV)
+                gWglDXCloseDeviceNV(static_cast<HANDLE>(m_interopDevice));
+        }
+        m_interopDevice = nullptr;
+        m_currentInteropD3D11Device = nullptr;
+    }
+    update();
+#else
+    Q_UNUSED(d3d11Device);
+#endif
+}
+
+void GLPreview::displayD3D11Frame(void *d3d11Texture, int subresource, int width, int height)
+{
+#if defined(Q_OS_WIN)
+    if (!m_interopAvailable || !d3d11Texture || width <= 0 || height <= 0)
+        return;
+    m_pendingD3D11Texture = d3d11Texture;
+    m_pendingD3D11Subresource = subresource;
+    m_pendingD3D11Width = width;
+    m_pendingD3D11Height = height;
+    update();
+#else
+    Q_UNUSED(d3d11Texture);
+    Q_UNUSED(subresource);
+    Q_UNUSED(width);
+    Q_UNUSED(height);
+#endif
+}
+
+void GLPreview::flushInteropCache()
+{
+#if defined(Q_OS_WIN)
+    if (!context())
+        return;
+    makeCurrent();
+    releaseRegisteredTexturesLocked();
+    doneCurrent();
+    m_pendingD3D11Texture = nullptr;
+#endif
+}
+
+bool GLPreview::ensureInteropDeviceForPaint()
+{
+#if defined(Q_OS_WIN)
+    if (!m_interopAvailable)
+        return false;
+    if (m_interopDevice)
+        return true;
+    if (!m_pendingD3D11Device)
+        return false;
+    if (!gWglDXOpenDeviceNV)
+        return false;
+    HANDLE h = gWglDXOpenDeviceNV(m_pendingD3D11Device);
+    if (!h) {
+        qWarning() << "[interop] device open failed (wglDXOpenDeviceNV returned null) for d3d11Device="
+                   << m_pendingD3D11Device;
+        return false;
+    }
+    m_interopDevice = h;
+    m_currentInteropD3D11Device = m_pendingD3D11Device;
+    qInfo() << "[interop] device opened (d3d11Device=" << m_pendingD3D11Device
+            << ", interopHandle=" << h << ")";
+    return true;
+#else
+    return false;
+#endif
+}
+
+void GLPreview::releaseRegisteredTexturesLocked()
+{
+#if defined(Q_OS_WIN)
+    auto &cache = nv12Cache();
+    for (auto it = cache.begin(); it != cache.end(); ) {
+        if (it->first.owner != this) { ++it; continue; }
+        NV12RegisteredTex &r = it->second;
+        if (m_interopDevice && gWglDXUnregisterObjectNV) {
+            if (r.hY)  gWglDXUnregisterObjectNV(static_cast<HANDLE>(m_interopDevice), r.hY);
+            if (r.hUV) gWglDXUnregisterObjectNV(static_cast<HANDLE>(m_interopDevice), r.hUV);
+        }
+        if (r.glTexY)  glDeleteTextures(1, &r.glTexY);
+        if (r.glTexUV) glDeleteTextures(1, &r.glTexUV);
+        it = cache.erase(it);
+    }
+#endif
+}
+
 void GLPreview::createShaderProgram()
 {
     m_program = new QOpenGLShaderProgram(this);
@@ -590,6 +783,21 @@ void GLPreview::createShaderProgram()
     m_locLut3D         = m_program->uniformLocation("uLut3D");
     m_locLutIntensity  = m_program->uniformLocation("uLutIntensity");
     m_locLutEnabled    = m_program->uniformLocation("uLutEnabled");
+
+    // NV12 zero-copy program — only used when the interop fast path engages.
+    // Failure to compile/link is non-fatal: callers fall back to the legacy
+    // QImage path automatically.
+    m_nv12Program = new QOpenGLShaderProgram(this);
+    if (!m_nv12Program->addShaderFromSourceCode(QOpenGLShader::Vertex, nv12VertexShaderSrc)
+        || !m_nv12Program->addShaderFromSourceCode(QOpenGLShader::Fragment, nv12FragmentShaderSrc)
+        || !m_nv12Program->link()) {
+        qWarning() << "GLPreview: NV12 shader build failed:" << m_nv12Program->log();
+        delete m_nv12Program;
+        m_nv12Program = nullptr;
+    } else {
+        m_locNv12TexY  = m_nv12Program->uniformLocation("uTexY");
+        m_locNv12TexUV = m_nv12Program->uniformLocation("uTexUV");
+    }
 }
 
 void GLPreview::resizeGL(int w, int h)
@@ -644,6 +852,143 @@ void GLPreview::setVideoEffects(const QVector<VideoEffect> &effects)
     update();
 }
 
+void GLPreview::renderPendingD3D11Frame()
+{
+#if defined(Q_OS_WIN)
+    if (!m_pendingD3D11Texture)
+        return;
+
+    void *d3d11Tex = m_pendingD3D11Texture;
+    int subresource = m_pendingD3D11Subresource;
+    int frameW = m_pendingD3D11Width;
+    int frameH = m_pendingD3D11Height;
+    // Always clear pending so a failed-to-register frame does not retry forever.
+    m_pendingD3D11Texture = nullptr;
+
+    if (!m_nv12Program || !ensureInteropDeviceForPaint())
+        return;
+    if (!gWglDXRegisterObjectNV || !gWglDXLockObjectsNV || !gWglDXUnlockObjectsNV)
+        return;
+
+    auto &cache = nv12Cache();
+    CacheKey key{this, d3d11Tex, subresource};
+    auto it = cache.find(key);
+    if (it == cache.end()) {
+        NV12RegisteredTex r;
+        r.d3d11Tex = d3d11Tex;
+        r.subresource = subresource;
+        r.width = frameW;
+        r.height = frameH;
+        glGenTextures(1, &r.glTexY);
+        glGenTextures(1, &r.glTexUV);
+        // Allocate format-specific storage on the GL side BEFORE registering —
+        // WGL_NV_DX_interop2 requires the GL texture's internal format to
+        // match what the driver will expose. NV12 maps cleanly to Y as R8
+        // (full WxH) and UV interleaved as RG8 (W/2 x H/2). Without
+        // glTexImage2D the driver cannot resolve the plane mapping and
+        // wglDXRegisterObjectNV either fails or returns aliased handles.
+        glBindTexture(GL_TEXTURE_2D, r.glTexY);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, frameW, frameH,
+                     0, GL_RED, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glBindTexture(GL_TEXTURE_2D, r.glTexUV);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8, frameW / 2, frameH / 2,
+                     0, GL_RG, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glBindTexture(GL_TEXTURE_2D, 0);
+
+        r.hY = gWglDXRegisterObjectNV(static_cast<HANDLE>(m_interopDevice),
+                                      d3d11Tex, r.glTexY,
+                                      GL_TEXTURE_2D, WGL_ACCESS_READ_ONLY_NV);
+        if (!r.hY) {
+            static bool warnedY = false;
+            if (!warnedY) {
+                qWarning() << "[interop] register Y plane failed for d3d11Tex=" << d3d11Tex
+                           << "subres=" << subresource
+                           << "— falling back to QImage path for this frame";
+                warnedY = true;
+            }
+            glDeleteTextures(1, &r.glTexY);
+            glDeleteTextures(1, &r.glTexUV);
+            return;
+        }
+        r.hUV = gWglDXRegisterObjectNV(static_cast<HANDLE>(m_interopDevice),
+                                       d3d11Tex, r.glTexUV,
+                                       GL_TEXTURE_2D, WGL_ACCESS_READ_ONLY_NV);
+        if (!r.hUV) {
+            static bool warnedUV = false;
+            if (!warnedUV) {
+                qWarning() << "[interop] register UV plane failed for d3d11Tex=" << d3d11Tex
+                           << "subres=" << subresource
+                           << "— falling back to QImage path for this frame";
+                warnedUV = true;
+            }
+            if (gWglDXUnregisterObjectNV)
+                gWglDXUnregisterObjectNV(static_cast<HANDLE>(m_interopDevice), r.hY);
+            glDeleteTextures(1, &r.glTexY);
+            glDeleteTextures(1, &r.glTexUV);
+            return;
+        }
+        auto inserted = cache.emplace(key, r);
+        it = inserted.first;
+    }
+
+    NV12RegisteredTex &r = it->second;
+
+    HANDLE handles[2] = { r.hY, r.hUV };
+    if (!gWglDXLockObjectsNV(static_cast<HANDLE>(m_interopDevice), 2, handles)) {
+        static bool warnedLock = false;
+        if (!warnedLock) {
+            qWarning() << "[interop] wglDXLockObjectsNV failed — falling back this frame";
+            warnedLock = true;
+        }
+        return;
+    }
+
+    // Letterbox the NV12 fast path the same way the legacy path does so
+    // viewport math stays consistent with displayAspectRatio.
+    const qreal dpr = devicePixelRatioF();
+    const int physW = qMax(1, qRound(width() * dpr));
+    const int physH = qMax(1, qRound(height() * dpr));
+    const double frameAspect =
+        (m_displayAspectRatio > 0.0 && std::isfinite(m_displayAspectRatio))
+            ? m_displayAspectRatio
+            : (r.height > 0 ? static_cast<double>(r.width) / r.height : 1.0);
+    const double widgetAspect = physH > 0 ? static_cast<double>(physW) / physH : frameAspect;
+    int viewportX = 0, viewportY = 0, viewportW = physW, viewportH = physH;
+    if (frameAspect > 0.0 && widgetAspect > 0.0) {
+        if (widgetAspect > frameAspect) {
+            viewportW = qMax(1, qRound(physH * frameAspect));
+            viewportX = (physW - viewportW) / 2;
+        } else {
+            viewportH = qMax(1, qRound(physW / frameAspect));
+            viewportY = (physH - viewportH) / 2;
+        }
+    }
+    glViewport(viewportX, viewportY, viewportW, viewportH);
+
+    m_nv12Program->bind();
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, r.glTexY);
+    m_nv12Program->setUniformValue(m_locNv12TexY, 0);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, r.glTexUV);
+    m_nv12Program->setUniformValue(m_locNv12TexUV, 1);
+    m_vao.bind();
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    m_vao.release();
+    m_nv12Program->release();
+
+    gWglDXUnlockObjectsNV(static_cast<HANDLE>(m_interopDevice), 2, handles);
+#endif
+}
+
 void GLPreview::paintGL()
 {
     static int paintCount = 0;
@@ -656,6 +1001,18 @@ void GLPreview::paintGL()
     }
 
     glClear(GL_COLOR_BUFFER_BIT);
+
+#if defined(Q_OS_WIN)
+    // Lazy-open the interop device the first paint after VideoPlayer hands
+    // us a D3D11 device — eager open would race initializeGL.
+    if (m_interopAvailable && m_pendingD3D11Device && !m_interopDevice)
+        ensureInteropDeviceForPaint();
+
+    if (m_pendingD3D11Texture && m_interopAvailable) {
+        renderPendingD3D11Frame();
+        return;
+    }
+#endif
 
     if (m_currentFrame.isNull()) return;
 
