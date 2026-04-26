@@ -45,6 +45,22 @@ struct AudioDecoderEntry {
     bool seekPending = true;         // first-time seek to entry's start when approached
     AVPacket *pkt = nullptr;
     AVFrame *frame = nullptr;
+
+    AudioDecoderEntry() = default;
+    AudioDecoderEntry(const AudioDecoderEntry &) = delete;
+    AudioDecoderEntry &operator=(const AudioDecoderEntry &) = delete;
+
+    // RAII tear-down. Free FFmpeg resources in the reverse order of
+    // creation: frame -> pkt -> swr -> codec -> fmt. This means a
+    // partial-failure openEntry path can simply `delete e;` rather than
+    // relying on every caller to remember closeEntry().
+    ~AudioDecoderEntry() {
+        if (frame) av_frame_free(&frame);
+        if (pkt) av_packet_free(&pkt);
+        if (swrCtx) swr_free(&swrCtx);
+        if (codecCtx) avcodec_free_context(&codecCtx);
+        if (fmtCtx) avformat_close_input(&fmtCtx);
+    }
 };
 
 namespace {
@@ -61,6 +77,7 @@ constexpr int kRingCompactThreshold = 32 * 1024;
 class MixerIODevice : public QIODevice {
 public:
     explicit MixerIODevice(AudioMixer *mixer) : m_mixer(mixer) {}
+    ~MixerIODevice() override = default;
 protected:
     qint64 readData(char *data, qint64 maxlen) override;
     qint64 writeData(const char *, qint64) override { return -1; }
@@ -511,12 +528,9 @@ bool AudioMixer::openEntry(AudioDecoderEntry *e) {
 }
 
 void AudioMixer::closeEntry(AudioDecoderEntry *e) {
-    if (!e) return;
-    if (e->frame) av_frame_free(&e->frame);
-    if (e->pkt) av_packet_free(&e->pkt);
-    if (e->swrCtx) swr_free(&e->swrCtx);
-    if (e->codecCtx) avcodec_free_context(&e->codecCtx);
-    if (e->fmtCtx) avformat_close_input(&e->fmtCtx);
+    // FFmpeg cleanup lives in ~AudioDecoderEntry now. Keeping this thin
+    // wrapper around `delete` lets callers say "close this entry" without
+    // reading the destructor's full responsibility list.
     delete e;
 }
 
