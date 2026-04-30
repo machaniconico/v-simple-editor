@@ -3322,7 +3322,9 @@ void VideoPlayer::setEditTargetByClip(int sourceTrack, int sourceClipIndex)
 
     // Push transform to GLPreview whenever edit target changes (paused or not).
     auto pushTransform = [&]() {
-        const int displayIdx = (m_editTargetEntry >= 0 && m_editTargetEntry < m_sequence.size())
+        const bool hasExplicitTarget = (m_editTargetEntry >= 0
+                                         && m_editTargetEntry < m_sequence.size());
+        const int displayIdx = hasExplicitTarget
                                ? m_editTargetEntry
                                : m_activeEntry;
         if (displayIdx >= 0 && displayIdx < m_sequence.size() && m_glPreview) {
@@ -3330,12 +3332,15 @@ void VideoPlayer::setEditTargetByClip(int sourceTrack, int sourceClipIndex)
             m_glPreview->setVideoSourceTransform(targetE.videoScale,
                                                   targetE.videoDx,
                                                   targetE.videoDy);
-            // V3 sprint — arm handle-draw gate so V3 selection produces
-            // visible handles even before the user clicks the preview canvas.
-            m_glPreview->setVideoTransformSelected(true);
+            // V3 sprint NIT — arm handle gate ONLY for explicit Timeline-driven
+            // selection (m_editTargetEntry >= 0). Active-entry fallback keeps
+            // the legacy "click preview to arm" UX for V1 so handles don't
+            // appear unprompted on project load.
+            if (hasExplicitTarget) {
+                m_glPreview->setVideoTransformSelected(true);
+            }
         } else if (m_glPreview) {
-            // Edit target cleared and no fallback active entry — clear the
-            // handle gate so stale handles don't linger over a blank preview.
+            // No valid index at all — clear the gate so stale handles vanish.
             m_glPreview->setVideoTransformSelected(false);
         }
     };
