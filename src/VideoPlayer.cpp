@@ -118,6 +118,28 @@ inline bool tickTraceEnabled()
     return enabled;
 }
 
+// Phase 1e Win #10 — VEDITOR_STALL_TRACE=1 logs wall-time around the
+// known multi-second stall candidates (cold openTrackDecoder probing
+// avformat_find_stream_info, V2 prefetch waitForFinished, blockingMap
+// overlay decode, clip transition advanceToEntry, AudioMixer's
+// av_read_frame inside refillRingForEntry). Default off; emits
+// qWarning only when a section exceeds its per-section threshold so
+// the log stays short enough to attach to a bug report. The intent
+// is to identify whether stalls are caused by cold decoder open
+// (avformat_find_stream_info on a 4h H.264 source), prefetch
+// synchronization (Win #6 worker waiting on FFmpeg HW transfer),
+// blockingMap overlay decode contention, clip transition
+// resetDecoder, or audio refill blocking I/O.
+inline bool stallTraceEnabled()
+{
+    static const bool enabled = qEnvironmentVariableIntValue("VEDITOR_STALL_TRACE") != 0;
+    return enabled;
+}
+
+inline constexpr qint64 kStallThresholdOpenMs = 100;
+inline constexpr qint64 kStallThresholdWaitMs = 200;
+inline constexpr qint64 kStallThresholdTickMs = 200;
+
 inline qint64 nsToMs(qint64 ns) { return ns / 1000000LL; }
 
 QString formatTimestamp(int64_t positionUs)
@@ -2131,9 +2153,22 @@ void VideoPlayer::handlePlaybackTick()
 
     QElapsedTimer tickTimer;
     const bool traceTick = tickTraceEnabled();
+    const bool traceStall = stallTraceEnabled();
     qint64 sectionMark = 0;
-    if (traceTick)
+    if (traceTick || traceStall)
         tickTimer.start();
+    auto reportStallIfSlow = [&]() {
+        if (!traceStall || !tickTimer.isValid()) return;
+        const qint64 elapsedMs = tickTimer.nsecsElapsed() / 1000000LL;
+        if (elapsedMs >= kStallThresholdTickMs) {
+            qWarning().noquote()
+                << QStringLiteral("[stall>=%1ms] tick %2ms tlUs=%3 activeEntry=%4")
+                       .arg(kStallThresholdTickMs)
+                       .arg(elapsedMs)
+                       .arg(m_timelinePositionUs)
+                       .arg(m_activeEntry);
+        }
+    };
 
     // Feed the slot manager's distance-from-playhead eviction heuristic.
     // Without this every slot looks equidistant from a stale playhead at
@@ -2278,9 +2313,23 @@ void VideoPlayer::handlePlaybackTick()
             m_tickTraceSkipped += driftSkipped;
             sectionMark = tickTimer.nsecsElapsed();
         }
+        QElapsedTimer decodeTimer;
+        if (traceStall)
+            decodeTimer.start();
         advanced = decodeNextFrame(true);
         if (traceTick)
             m_tickTraceDecodeNs += tickTimer.nsecsElapsed() - sectionMark;
+        if (traceStall && decodeTimer.isValid()) {
+            const qint64 elapsedMs = decodeTimer.elapsed();
+            if (elapsedMs >= kStallThresholdWaitMs) {
+                qWarning().noquote()
+                    << QStringLiteral("[stall>=%1ms] decodeNextFrame(V1) %2ms tlUs=%3 entry=%4")
+                           .arg(kStallThresholdWaitMs)
+                           .arg(elapsedMs)
+                           .arg(m_timelinePositionUs)
+                           .arg(m_activeEntry);
+            }
+        }
     } else {
         const int64_t stepUs = qMax<int64_t>(1, m_frameDurationUs);
         const int64_t targetUs = qMax<int64_t>(0, m_currentPositionUs - stepUs);
@@ -2303,7 +2352,18 @@ void VideoPlayer::handlePlaybackTick()
         // Phase 1e Win #6: wait for V2 prefetch to finish before the
         // compositor branch reads pool-decoder state.
         if (v2PrefetchFuture.isStarted()) {
+            QElapsedTimer waitTimer;
+            if (stallTraceEnabled())
+                waitTimer.start();
             v2PrefetchFuture.waitForFinished();
+            if (stallTraceEnabled() && waitTimer.isValid()) {
+                const qint64 elapsedMs = waitTimer.elapsed();
+                if (elapsedMs >= kStallThresholdWaitMs) {
+                    qWarning().noquote()
+                        << QStringLiteral("[stall>=%1ms] v2PrefetchFuture.waitForFinished %2ms site=compositor-entry")
+                               .arg(kStallThresholdWaitMs).arg(elapsedMs);
+                }
+            }
         }
         const QVector<int> activeIdxs = findActiveEntriesAt(m_timelinePositionUs);
         // GL viewport's setVideoSourceTransform is normally driven by the
@@ -2446,11 +2506,24 @@ void VideoPlayer::handlePlaybackTick()
             // own TrackDecoder so there is no shared mutable state across
             // workers — see runOverlayDecodeForDecoder contract.
             if (!overlayJobs.isEmpty()) {
+                QElapsedTimer mapTimer;
+                if (stallTraceEnabled())
+                    mapTimer.start();
                 QtConcurrent::blockingMap(overlayJobs, [this](OverlayJob &job) {
                     job.decodedOk = runOverlayDecodeForDecoder(
                         job.d, job.expectedFileLocalUs,
                         job.clipInUs, job.clipOutUs);
                 });
+                if (stallTraceEnabled() && mapTimer.isValid()) {
+                    const qint64 elapsedMs = mapTimer.elapsed();
+                    if (elapsedMs >= kStallThresholdWaitMs) {
+                        qWarning().noquote()
+                            << QStringLiteral("[stall>=%1ms] blockingMap %2ms jobs=%3")
+                                   .arg(kStallThresholdWaitMs)
+                                   .arg(elapsedMs)
+                                   .arg(overlayJobs.size());
+                    }
+                }
             }
             // Pass 3 (main thread): finalize layers + grace-pool fallback.
             for (const OverlayJob &job : overlayJobs) {
@@ -2635,10 +2708,25 @@ void VideoPlayer::handlePlaybackTick()
         if (reachedEntryEnd || decodeStopped) {
             const int nextIdx = m_activeEntry + 1;
             if (nextIdx < m_sequence.size()) {
-                if (advanceToEntry(nextIdx)) {
+                QElapsedTimer advTimer;
+                if (stallTraceEnabled())
+                    advTimer.start();
+                const bool advanced = advanceToEntry(nextIdx);
+                if (stallTraceEnabled() && advTimer.isValid()) {
+                    const qint64 elapsedMs = advTimer.elapsed();
+                    if (elapsedMs >= kStallThresholdWaitMs) {
+                        qWarning().noquote()
+                            << QStringLiteral("[stall>=%1ms] advanceToEntry %2ms next=%3")
+                                   .arg(kStallThresholdWaitMs)
+                                   .arg(elapsedMs)
+                                   .arg(nextIdx);
+                    }
+                }
+                if (advanced) {
                     updatePositionUi();
                     if (traceTick)
                         recordTickTrace(tickTimer.nsecsElapsed());
+                    reportStallIfSlow();
                     scheduleNextFrame();
                     return;
                 }
@@ -2649,6 +2737,7 @@ void VideoPlayer::handlePlaybackTick()
                 updatePositionUi();
                 if (traceTick)
                     recordTickTrace(tickTimer.nsecsElapsed());
+                reportStallIfSlow();
                 pause();
                 if (m_mixer) m_mixer->stop();
                 return;
@@ -2665,7 +2754,18 @@ void VideoPlayer::handlePlaybackTick()
     // prefetch dispatch and this wait without porting the wait to the new
     // return site.
     if (v2PrefetchFuture.isStarted()) {
+        QElapsedTimer waitTimer;
+        if (stallTraceEnabled())
+            waitTimer.start();
         v2PrefetchFuture.waitForFinished();
+        if (stallTraceEnabled() && waitTimer.isValid()) {
+            const qint64 elapsedMs = waitTimer.elapsed();
+            if (elapsedMs >= kStallThresholdWaitMs) {
+                qWarning().noquote()
+                    << QStringLiteral("[stall>=%1ms] v2PrefetchFuture.waitForFinished %2ms site=tick-exit")
+                           .arg(kStallThresholdWaitMs).arg(elapsedMs);
+            }
+        }
     }
     Q_ASSERT(!v2PrefetchFuture.isStarted() || v2PrefetchFuture.isFinished());
 
@@ -2676,6 +2776,7 @@ void VideoPlayer::handlePlaybackTick()
         }
         if (traceTick)
             recordTickTrace(tickTimer.nsecsElapsed());
+        reportStallIfSlow();
         pause();
         if (m_mixer)
             m_mixer->stop();
@@ -2689,6 +2790,7 @@ void VideoPlayer::handlePlaybackTick()
 
     if (traceTick)
         recordTickTrace(tickTimer.nsecsElapsed());
+    reportStallIfSlow();
     scheduleNextFrame();
 }
 
@@ -2860,6 +2962,15 @@ void VideoPlayer::tickEvictionGracePool()
 
 VideoPlayer::TrackDecoder *VideoPlayer::openTrackDecoder(const PlaybackEntry &entry)
 {
+    // Phase 1e Win #10 stall trace — wall-time around the cold open
+    // (avformat_open_input + avformat_find_stream_info on the source
+    // file). On a 4h sparse-keyframe H.264 source this can take 1-3
+    // seconds and runs synchronously on the main thread, fitting the
+    // user-reported "数秒" intermittent stall pattern at clip
+    // boundaries. Default off.
+    QElapsedTimer stallTimer;
+    if (stallTraceEnabled())
+        stallTimer.start();
     auto *d = new TrackDecoder();
     d->sourceClipIndex = entry.sourceClipIndex;
     d->sourceTrack = entry.sourceTrack;
@@ -3023,6 +3134,16 @@ VideoPlayer::TrackDecoder *VideoPlayer::openTrackDecoder(const PlaybackEntry &en
                                ? av_get_pix_fmt_name(d->hwPixFmt) : "SW")
             << "sourceTrack=" << entry.sourceTrack;
 
+    if (stallTraceEnabled() && stallTimer.isValid()) {
+        const qint64 elapsedMs = stallTimer.elapsed();
+        if (elapsedMs >= kStallThresholdOpenMs) {
+            qWarning().noquote() << QStringLiteral("[stall>=%1ms] openTrackDecoder %2ms file=%3 track=%4")
+                                        .arg(kStallThresholdOpenMs)
+                                        .arg(elapsedMs)
+                                        .arg(entry.filePath)
+                                        .arg(entry.sourceTrack);
+        }
+    }
     return d;
 }
 

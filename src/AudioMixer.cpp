@@ -1,5 +1,6 @@
 #include "AudioMixer.h"
 
+#include <QElapsedTimer>
 #include <QtGlobal>
 #include <QDebug>
 #include <QtMath>
@@ -67,6 +68,20 @@ struct AudioDecoderEntry {
 };
 
 namespace {
+// Phase 1e Win #10 — VEDITOR_STALL_TRACE=1 logs wall-time around
+// refillRingForEntry's av_read_frame loop. Architect H1 (stall
+// investigation): the loop runs under m_controlMutex, so a slow
+// av_read_frame (cache miss / network share / sparse-keyframe
+// 4h MP4) freezes both the audio sink callback and any GUI
+// audio control call. Logging the per-call wall time helps the
+// user identify whether the stall is rooted in audio I/O.
+inline bool stallTraceEnabled()
+{
+    static const bool enabled = qEnvironmentVariableIntValue("VEDITOR_STALL_TRACE") != 0;
+    return enabled;
+}
+inline constexpr qint64 kStallThresholdRefillMs = 100;
+
 // Helpers to keep AudioDecoderEntry's head-indexed FIFO consistent.
 inline int liveBytes(const AudioDecoderEntry &e) {
     return e.ring.size() - e.ringHead;
@@ -787,6 +802,14 @@ void AudioMixer::resampleAndAppend(AudioDecoderEntry *e) {
 
 void AudioMixer::refillRingForEntry(AudioDecoderEntry *e, int targetBytes) {
     if (!e || !e->fmtCtx || !e->codecCtx) return;
+    // Phase 1e Win #10 stall trace — log when av_read_frame takes long
+    // enough (>=100 ms) to plausibly contribute to the user-reported
+    // multi-second stall. The mutex held across this loop blocks
+    // MixerIODevice::readData on the audio worker thread, which would
+    // explain a synchronous video freeze through the audio clock.
+    QElapsedTimer stallTimer;
+    if (stallTraceEnabled())
+        stallTimer.start();
     while (liveBytes(*e) < targetBytes && !e->eof) {
         const int rc = av_read_frame(e->fmtCtx, e->pkt);
         if (rc == AVERROR_EOF) {
@@ -814,6 +837,17 @@ void AudioMixer::refillRingForEntry(AudioDecoderEntry *e, int targetBytes) {
             if (recvRc == AVERROR(EAGAIN) || recvRc == AVERROR_EOF) break;
             if (recvRc < 0) break;
             resampleAndAppend(e);
+        }
+    }
+    if (stallTraceEnabled() && stallTimer.isValid()) {
+        const qint64 elapsedMs = stallTimer.elapsed();
+        if (elapsedMs >= kStallThresholdRefillMs) {
+            qWarning().noquote()
+                << QStringLiteral("[stall>=%1ms] refillRingForEntry %2ms targetBytes=%3 file=%4")
+                       .arg(kStallThresholdRefillMs)
+                       .arg(elapsedMs)
+                       .arg(targetBytes)
+                       .arg(e ? e->entry.filePath : QString());
         }
     }
 }
