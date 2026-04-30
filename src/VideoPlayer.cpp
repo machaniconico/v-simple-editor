@@ -2053,6 +2053,53 @@ void VideoPlayer::handlePlaybackTick()
     }
     m_lastTickWasComposite = willComposite;
 
+    // Phase 1e Win #6 — parallel V1 + V2 decode.
+    // Hoist V2+ overlay catch-up onto a worker thread so it overlaps with
+    // V1's main-thread decodeNextFrame call below. acquireDecoderForClip
+    // touches main-only state (m_trackDecoders, m_slotManager) so it must
+    // run here, not inside the worker. The decode itself only mutates the
+    // per-decoder TrackDecoder, which the threading contract on
+    // runOverlayDecodeForDecoder already permits.
+    static const bool prefetchV2Enabled =
+        qEnvironmentVariableIntValue("VEDITOR_PREFETCH_V2_DISABLE") == 0;
+    struct V2PrefetchJob {
+        TrackDecoder *d = nullptr;
+        qint64 expectedFileLocalUs = 0;
+        qint64 clipInUs = 0;
+        qint64 clipOutUs = 0;
+    };
+    QVector<V2PrefetchJob> v2PrefetchJobs;
+    QFuture<void> v2PrefetchFuture;
+    if (prefetchV2Enabled && willComposite && m_playbackSpeed >= 0.0) {
+        const QVector<int> prefetchIdxs = findActiveEntriesAt(m_timelinePositionUs);
+        for (int idx : prefetchIdxs) {
+            if (idx < 0 || idx >= m_sequence.size())
+                continue;
+            if (idx == m_activeEntry)
+                continue;  // V1 main path handles itself.
+            const auto &e = m_sequence[idx];
+            if (e.sourceTrack <= 0)
+                continue;  // Only V2+ overlays go through pool path.
+            TrackDecoder *d = acquireDecoderForClip(e);
+            if (!d)
+                continue;
+            V2PrefetchJob job;
+            job.d = d;
+            job.expectedFileLocalUs = entryLocalPositionUs(idx, m_timelinePositionUs);
+            job.clipInUs  = static_cast<int64_t>(e.clipIn  * AV_TIME_BASE);
+            job.clipOutUs = static_cast<int64_t>(e.clipOut * AV_TIME_BASE);
+            v2PrefetchJobs.append(job);
+        }
+        if (!v2PrefetchJobs.isEmpty()) {
+            v2PrefetchFuture = QtConcurrent::run([this, jobs = v2PrefetchJobs]() mutable {
+                for (V2PrefetchJob &j : jobs) {
+                    runOverlayDecodeForDecoder(j.d, j.expectedFileLocalUs,
+                                               j.clipInUs, j.clipOutUs);
+                }
+            });
+        }
+    }
+
     bool advanced = false;
     if (m_playbackSpeed >= 0.0) {
         // Drift correction runs BEFORE the display decode so the frame the
@@ -2088,6 +2135,11 @@ void VideoPlayer::handlePlaybackTick()
     // (overlays.isEmpty -> displayFrame is bypassed entirely on the legacy
     // path because m_deferDisplayThisTick was false above).
     if (advanced && willComposite && !m_lastV1RawFrame.isNull()) {
+        // Phase 1e Win #6: wait for V2 prefetch to finish before the
+        // compositor branch reads pool-decoder state.
+        if (v2PrefetchFuture.isStarted()) {
+            v2PrefetchFuture.waitForFinished();
+        }
         const QVector<int> activeIdxs = findActiveEntriesAt(m_timelinePositionUs);
         // GL viewport's setVideoSourceTransform is normally driven by the
         // active entry's videoScale/Dx/Dy in advanceToEntry. When we hand
@@ -2383,6 +2435,15 @@ void VideoPlayer::handlePlaybackTick()
                 return;
             }
         }
+    }
+
+    // Phase 1e Win #6: ensure any V2 prefetch we started has finished before
+    // returning, so worker threads cannot race the next tick on shared
+    // TrackDecoder state. Compositor branch already waits internally; this
+    // catches paths where willComposite=true but compositor was skipped
+    // (advanced=false or lastV1RawFrame became null mid-tick).
+    if (v2PrefetchFuture.isStarted()) {
+        v2PrefetchFuture.waitForFinished();
     }
 
     if (!advanced) {
@@ -3074,9 +3135,22 @@ bool VideoPlayer::harvestOverlayLayer(const PlaybackEntry &e, int seqIdx, Decode
         return false;
 
     const int64_t expectedFileLocalUs = entryLocalPositionUs(seqIdx, m_timelinePositionUs);
-    const int64_t clipInUs  = static_cast<int64_t>(e.clipIn  * AV_TIME_BASE);
-    const int64_t clipOutUs = static_cast<int64_t>(e.clipOut * AV_TIME_BASE);
-    const bool ok = runOverlayDecodeForDecoder(d, expectedFileLocalUs, clipInUs, clipOutUs);
+    const int64_t halfFrame = qMax<int64_t>(d->frameDurationUs / 2, 1);
+    bool ok = true;
+    // Phase 1e Win #6: skip catch-up entirely when a worker prefetch already
+    // brought the decoder current. Without this, the parallel-path optimization
+    // would still re-enter the decode loop on the main thread and decode an
+    // extra frame past the playhead. firstFrameDecoded gates against fresh
+    // decoders that have no usable lastFrameRgb yet.
+    if (d->firstFrameDecoded
+        && !d->lastFrameRgb.isNull()
+        && d->currentPositionUs + halfFrame >= expectedFileLocalUs) {
+        // Already current — no decode needed; just finalize.
+    } else {
+        const int64_t clipInUs  = static_cast<int64_t>(e.clipIn  * AV_TIME_BASE);
+        const int64_t clipOutUs = static_cast<int64_t>(e.clipOut * AV_TIME_BASE);
+        ok = runOverlayDecodeForDecoder(d, expectedFileLocalUs, clipInUs, clipOutUs);
+    }
     return finalizeOverlayFromDecoder(e, seqIdx, d, ok, out);
 }
 
