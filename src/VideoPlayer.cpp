@@ -183,11 +183,16 @@ void VideoPlayer::setupUI()
             this, &VideoPlayer::textOverlayRectChanged);
     connect(m_glPreview, &GLPreview::videoSourceTransformChanged,
             this, [this](double scale, double dx, double dy) {
-                // Map back to the current entry's source clip so MainWindow
-                // can persist the new transform to the right ClipInfo.
-                if (m_activeEntry < 0 || m_activeEntry >= m_sequence.size())
+                // V3 sprint: prefer m_editTargetEntry when set (Timeline 上で
+                // V2/V3 clip を選択している状態)。invalid なら m_activeEntry
+                // にフォールバックして V1 編集の従来挙動を維持。
+                int targetIdx = (m_editTargetEntry >= 0
+                                 && m_editTargetEntry < m_sequence.size())
+                                ? m_editTargetEntry
+                                : m_activeEntry;
+                if (targetIdx < 0 || targetIdx >= m_sequence.size())
                     return;
-                const auto &entry = m_sequence[m_activeEntry];
+                const auto &entry = m_sequence[targetIdx];
                 emit videoSourceTransformChanged(entry.sourceTrack, entry.sourceClipIndex,
                                                  scale, dx, dy);
             });
@@ -467,6 +472,7 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
 {
     qInfo() << "VideoPlayer::setSequence count=" << entries.size();
     m_loggedCullState = false; // re-emit [cull] diagnostic for the new project
+    m_editTargetEntry = -1;    // V3 sprint — clear edit target on project / sequence change
 
     // Topmost-track-wins via single-decoder pipeline: take Timeline's
     // sequence as-is. Timeline::computePlaybackSequence sorts by
@@ -3195,4 +3201,23 @@ bool VideoPlayer::hasOverlayActive(const QVector<int> &activeIdxs) const
             return true;
     }
     return false;
+}
+
+// V3 sprint — Timeline で V2/V3 clip を選択したときに preview drag handle が
+// 編集する layer を切り替える。再生 source の m_activeEntry には触れない。
+void VideoPlayer::setEditTargetByClip(int sourceTrack, int sourceClipIndex)
+{
+    if (sourceTrack < 0 || sourceClipIndex < 0) {
+        m_editTargetEntry = -1;
+        return;
+    }
+    for (int i = 0; i < m_sequence.size(); ++i) {
+        const auto &e = m_sequence[i];
+        if (e.sourceTrack == sourceTrack && e.sourceClipIndex == sourceClipIndex) {
+            m_editTargetEntry = i;
+            return;
+        }
+    }
+    // No matching entry — fall back to follow active.
+    m_editTargetEntry = -1;
 }

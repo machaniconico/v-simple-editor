@@ -121,8 +121,48 @@ MainWindow::MainWindow(QWidget *parent)
 
     statusBar()->showMessage("準備完了 — ファイル > 新規プロジェクトから開始してください");
 
-    connect(m_timeline, &Timeline::clipSelected, this, [this](int) {
+    connect(m_timeline, &Timeline::clipSelected, this, [this](int index) {
         updateEditActions();
+        // V3 sprint — preview drag handle の edit target を選択 clip に
+        // 同期させる。Timeline::clipSelected は track を運ばないので
+        // allVideoTracks() を walk して playhead カバレッジで track を
+        // 特定する (複数 V-track が同じ clipIdx を持つ場合の disambiguate)。
+        if (!m_player) return;
+        if (index < 0) {
+            m_player->setEditTargetByClip(-1, -1);
+            return;
+        }
+        const auto videoTracks = m_timeline->allVideoTracks();
+        const double playhead = m_timeline->playheadPosition();
+        int chosenTrack = -1;
+        // First pass: track whose clip[index] timeline range covers playhead.
+        for (int t = 0; t < videoTracks.size(); ++t) {
+            const auto &clips = videoTracks[t];
+            if (index >= clips.size()) continue;
+            double accum = 0.0;
+            for (int ci = 0; ci <= index; ++ci) {
+                accum += qMax(0.0, clips[ci].leadInSec);
+                const double dur = clips[ci].effectiveDuration();
+                if (ci == index) {
+                    if (playhead >= accum && playhead < accum + dur) {
+                        chosenTrack = t;
+                    }
+                    break;
+                }
+                accum += dur;
+            }
+            if (chosenTrack >= 0) break;
+        }
+        // Fallback: first track that has a clip at this index (typically V1).
+        if (chosenTrack < 0) {
+            for (int t = 0; t < videoTracks.size(); ++t) {
+                if (index < videoTracks[t].size()) { chosenTrack = t; break; }
+            }
+        }
+        if (chosenTrack >= 0)
+            m_player->setEditTargetByClip(chosenTrack, index);
+        else
+            m_player->setEditTargetByClip(-1, -1);
     });
     connect(m_timeline->undoManager(), &UndoManager::stateChanged, this, [this]() {
         updateEditActions();

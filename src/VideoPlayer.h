@@ -183,6 +183,11 @@ public slots:
     // Step one frame while paused (no-op during playback).
     void stepForward();
     void stepBackward();
+    // V3 sprint — Timeline 上で V2/V3 clip を選択したときに preview の drag
+    // handle が選択 layer を target にするための edit target setter。
+    // sourceTrack, sourceClipIndex から m_sequence を逆引きして該当 seqIdx
+    // を計算し m_editTargetEntry に設定する。-1, -1 で follow active に戻す。
+    void setEditTargetByClip(int sourceTrack, int sourceClipIndex);
 
 signals:
     void positionChanged(double positionSeconds);
@@ -457,6 +462,10 @@ private:
     // CPU-path effects are active during playback, so heavy Sharpen/Mosaic/
     // ChromaKey stay smooth. Persisted via QSettings "proxyDivisor".
     int m_proxyDivisor = 1;
+    // V3 sprint — Timeline clipSelected で更新する drag-edit target。
+    // -1 = follow m_activeEntry (legacy)。 >= 0 = explicit sequence index。
+    // 再生用の m_activeEntry とは独立。setSequence でリセット。
+    int m_editTargetEntry = -1;
 
     // ---- Per-clip decoder pool state (V2+ only) -----------------------------
     // Active V2+ decoders, keyed on TrackKey. V1 never lives here — it
