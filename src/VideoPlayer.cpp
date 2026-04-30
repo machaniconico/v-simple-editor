@@ -796,8 +796,15 @@ bool VideoPlayer::seekToTimelineUs(int64_t timelineUs, bool precise)
     const bool ok = seekInternal(localUs, true, precise);
     // Push the seeked-to clip's own transform so cross-clip seeks don't
     // inherit the previously-active clip's OBS-style scale/offset.
+    // V3 sprint fix (architect NIT) — prefer edit-target transform on seek so
+    // a seek while V3 is selected doesn't briefly flash V1's transform.
     if (m_glPreview) {
-        m_glPreview->setVideoSourceTransform(e.videoScale, e.videoDx, e.videoDy);
+        const int displayIdx = (m_editTargetEntry >= 0
+                                && m_editTargetEntry < m_sequence.size())
+                               ? m_editTargetEntry
+                               : idx;
+        const auto &targetE = m_sequence[displayIdx];
+        m_glPreview->setVideoSourceTransform(targetE.videoScale, targetE.videoDx, targetE.videoDy);
         // Drop composite-baked mode here too: a seek-while-paused that
         // followed a composite tick (flag = true) would otherwise render
         // the seek-displayed raw V1 frame at viewport identity even
@@ -847,8 +854,15 @@ bool VideoPlayer::advanceToEntry(int newEntryIdx)
     m_activeEntry = newEntryIdx;
     // US-T35 apply the new entry's per-clip video source transform to the
     // GL preview so each clip keeps its own scale/offset.
+    // V3 sprint fix (architect NIT) — prefer edit-target transform on boundary
+    // cross so a seek/advance while V3 is selected doesn't briefly flash V1's transform.
     if (m_glPreview) {
-        m_glPreview->setVideoSourceTransform(next.videoScale, next.videoDx, next.videoDy);
+        const int displayIdx = (m_editTargetEntry >= 0
+                                && m_editTargetEntry < m_sequence.size())
+                               ? m_editTargetEntry
+                               : newEntryIdx;
+        const auto &targetE = m_sequence[displayIdx];
+        m_glPreview->setVideoSourceTransform(targetE.videoScale, targetE.videoDx, targetE.videoDy);
         // Match the seek path's defensive un-bake — a paused boundary
         // crossing followed by a single-clip displayFrame would otherwise
         // render at viewport identity if the prior tick was composite.
@@ -2912,6 +2926,18 @@ VideoPlayer::TrackDecoder *VideoPlayer::openTrackDecoder(const PlaybackEntry &en
     if (m_postSeekResyncRequested) {
         d->firstFrameDecoded = false;
     }
+
+    // V3 sprint diagnostic — codec / HW path log so we can spot AV1 SW
+    // fallback or other non-HW pool decoders when the user reports stutter
+    // on a specific overlay track.
+    qInfo() << "[pool] openTrackDecoder"
+            << "filePath=" << entry.filePath
+            << "codec=" << avcodec_get_name(d->codecCtx->codec_id)
+            << "width=" << d->codecCtx->width
+            << "height=" << d->codecCtx->height
+            << "hwPixFmt=" << (d->hwPixFmt != AV_PIX_FMT_NONE
+                               ? av_get_pix_fmt_name(d->hwPixFmt) : "SW")
+            << "sourceTrack=" << entry.sourceTrack;
 
     return d;
 }
