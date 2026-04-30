@@ -2062,6 +2062,13 @@ void VideoPlayer::handlePlaybackTick()
     // runOverlayDecodeForDecoder already permits.
     static const bool prefetchV2Enabled =
         qEnvironmentVariableIntValue("VEDITOR_PREFETCH_V2_DISABLE") == 0;
+    // MAJOR-1 mutual-exclusion gate: read VEDITOR_THREADED_POOL here too so
+    // we can suppress this prefetch when the compositor branch's threadedPool
+    // path will fan out the same V2 jobs via blockingMap. Without the gate,
+    // 2+ overlays would be decoded twice per tick (worker prefetch + Pass 2
+    // blockingMap), consuming an extra frame from each pool decoder.
+    static const bool s_prefetchGateThreadedPoolEnabled =
+        qEnvironmentVariableIntValue("VEDITOR_THREADED_POOL") != 0;
     struct V2PrefetchJob {
         TrackDecoder *d = nullptr;
         qint64 expectedFileLocalUs = 0;
@@ -2090,7 +2097,19 @@ void VideoPlayer::handlePlaybackTick()
             job.clipOutUs = static_cast<int64_t>(e.clipOut * AV_TIME_BASE);
             v2PrefetchJobs.append(job);
         }
-        if (!v2PrefetchJobs.isEmpty()) {
+        // MAJOR-1: when 2+ V2 overlays are active AND VEDITOR_THREADED_POOL is
+        // on, the compositor branch's threadedPool path (Pass 2 blockingMap)
+        // will N-way fan-out the same decoders. Skip prefetch in that case to
+        // avoid double-decoding. Win #6 prefetch is the "1 V2 overlay"
+        // complement to that legacy parallel fan-out.
+        const bool threadedPoolWillFire =
+            s_prefetchGateThreadedPoolEnabled && v2PrefetchJobs.size() >= 2;
+        if (!v2PrefetchJobs.isEmpty() && !threadedPoolWillFire) {
+            // MAJOR-4: a single QtConcurrent worker iterates the jobs serially.
+            // This is intentional — for 1 overlay it overlaps neatly with the
+            // V1 main-thread decodeNextFrame below. The N-way fan-out for 2+
+            // overlays is the threadedPool branch's blockingMap; the gate
+            // above ensures these two paths never both fire on the same tick.
             v2PrefetchFuture = QtConcurrent::run([this, jobs = v2PrefetchJobs]() mutable {
                 for (V2PrefetchJob &j : jobs) {
                     runOverlayDecodeForDecoder(j.d, j.expectedFileLocalUs,
@@ -2437,14 +2456,18 @@ void VideoPlayer::handlePlaybackTick()
         }
     }
 
-    // Phase 1e Win #6: ensure any V2 prefetch we started has finished before
-    // returning, so worker threads cannot race the next tick on shared
-    // TrackDecoder state. Compositor branch already waits internally; this
-    // catches paths where willComposite=true but compositor was skipped
-    // (advanced=false or lastV1RawFrame became null mid-tick).
+    // Phase 1e Win #6 — safety-net: every exit path of handlePlaybackTick MUST
+    // pass through this wait so worker lifetime is bounded by the tick.
+    // Compositor branch already waits internally at its entry; this catches
+    // paths where willComposite=true but compositor was skipped (advanced=false
+    // or lastV1RawFrame became null mid-tick), AND any future early-return
+    // inserted into handlePlaybackTick. Do NOT add a return between the
+    // prefetch dispatch and this wait without porting the wait to the new
+    // return site.
     if (v2PrefetchFuture.isStarted()) {
         v2PrefetchFuture.waitForFinished();
     }
+    Q_ASSERT(!v2PrefetchFuture.isStarted() || v2PrefetchFuture.isFinished());
 
     if (!advanced) {
         if (m_playbackSpeed >= 0.0 && m_durationUs > 0) {
