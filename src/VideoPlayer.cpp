@@ -3319,10 +3319,25 @@ bool VideoPlayer::hasOverlayActive(const QVector<int> &activeIdxs) const
 void VideoPlayer::setEditTargetByClip(int sourceTrack, int sourceClipIndex)
 {
     const int oldTarget = m_editTargetEntry;
+
+    // Push transform to GLPreview whenever edit target changes (paused or not).
+    auto pushTransform = [&]() {
+        const int displayIdx = (m_editTargetEntry >= 0 && m_editTargetEntry < m_sequence.size())
+                               ? m_editTargetEntry
+                               : m_activeEntry;
+        if (displayIdx >= 0 && displayIdx < m_sequence.size() && m_glPreview) {
+            const auto &targetE = m_sequence[displayIdx];
+            m_glPreview->setVideoSourceTransform(targetE.videoScale,
+                                                  targetE.videoDx,
+                                                  targetE.videoDy);
+        }
+    };
+
     if (sourceTrack < 0 || sourceClipIndex < 0) {
         m_editTargetEntry = -1;
         if (oldTarget != m_editTargetEntry) {
             qInfo() << "[edit-target] cleared (was seq=" << oldTarget << ")";
+            pushTransform();
         }
         return;
     }
@@ -3335,6 +3350,7 @@ void VideoPlayer::setEditTargetByClip(int sourceTrack, int sourceClipIndex)
                         << "track=" << sourceTrack
                         << "clip=" << sourceClipIndex
                         << "(was seq=" << oldTarget << ")";
+                pushTransform();
             }
             return;
         }
@@ -3344,5 +3360,6 @@ void VideoPlayer::setEditTargetByClip(int sourceTrack, int sourceClipIndex)
     if (oldTarget != m_editTargetEntry) {
         qInfo() << "[edit-target] no match for track=" << sourceTrack
                 << "clip=" << sourceClipIndex << "(was seq=" << oldTarget << ")";
+        pushTransform();
     }
 }
