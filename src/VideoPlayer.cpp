@@ -3255,6 +3255,8 @@ bool VideoPlayer::hasOverlayActive(const QVector<int> &activeIdxs) const
 // 編集する layer を切り替える。再生 source の m_activeEntry には触れない。
 void VideoPlayer::setEditTargetByClip(int sourceTrack, int sourceClipIndex)
 {
+    qInfo() << "[edit-target] setEditTargetByClip called track=" << sourceTrack
+            << "clip=" << sourceClipIndex;
     if (sourceTrack < 0 || sourceClipIndex < 0) {
         m_editTargetEntry = -1;
         return;
