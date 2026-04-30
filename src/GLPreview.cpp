@@ -820,11 +820,25 @@ void GLPreview::displayFrame(const QImage &frame)
     // frame on this hardware) at no GPU cost — paintGL uploads as
     // QOpenGLTexture::RGB / RGB8_UNorm and the shader's texture() lookup
     // returns vec4(r,g,b,1.0) per the GL spec, identical to RGBA sampling.
+    //
+    // Phase 1e Win #8: same trick for the multi-track compositor output,
+    // which arrives as ARGB32_Premultiplied. Qt stores that format as
+    // BGRA bytes on little-endian; uploading via GL_BGRA + GL_UNSIGNED_BYTE
+    // saves the per-pixel byte swap + alpha-unpremul that
+    // convertToFormat(RGBA8888) costs (~3-5 ms / 1080p tick). Compositor
+    // output has alpha=1.0 everywhere (black-fill base + opaque overlay
+    // SourceOver), so premul=straight and the fragment shader's
+    // texture().rgb sampling produces the same visible pixels. Disable
+    // path: VEDITOR_BGRA_UPLOAD_DISABLE=1.
+    static const bool bgraUploadEnabled =
+        qEnvironmentVariableIntValue("VEDITOR_BGRA_UPLOAD_DISABLE") == 0;
     if (is16) {
         m_currentFrame = (inFmt == QImage::Format_RGBA64)
             ? frame
             : frame.convertToFormat(QImage::Format_RGBA64);
     } else if (inFmt == QImage::Format_RGB888) {
+        m_currentFrame = frame;
+    } else if (bgraUploadEnabled && inFmt == QImage::Format_ARGB32_Premultiplied) {
         m_currentFrame = frame;
     } else {
         m_currentFrame = frame.convertToFormat(QImage::Format_RGBA8888);
@@ -1103,6 +1117,13 @@ void GLPreview::paintGL()
         const bool is16 = (frameFmt == QImage::Format_RGBA64
                            || frameFmt == QImage::Format_RGBA64_Premultiplied);
         const bool isRGB888 = (frameFmt == QImage::Format_RGB888);
+        // Phase 1e Win #8: ARGB32_Premultiplied bytes are BGRA on
+        // little-endian. Upload via GL_BGRA so the GL driver swizzles
+        // into the RGBA8 internal format, skipping a CPU-side
+        // convertToFormat(RGBA8888). Compositor output is always alpha=1.0
+        // so premul vs straight produces identical visible pixels through
+        // the existing fragment shader (texture().rgb sampling).
+        const bool isARGB32Premul = (frameFmt == QImage::Format_ARGB32_Premultiplied);
 
         const bool sizeChanged = !m_texture
             || m_texture->width() != fw
@@ -1127,6 +1148,10 @@ void GLPreview::paintGL()
                 texFormat = QOpenGLTexture::RGB8_UNorm;
                 pixFormat = QOpenGLTexture::RGB;
                 pixType   = QOpenGLTexture::UInt8;
+            } else if (isARGB32Premul) {
+                texFormat = QOpenGLTexture::RGBA8_UNorm;
+                pixFormat = QOpenGLTexture::BGRA;
+                pixType   = QOpenGLTexture::UInt8;
             } else {
                 texFormat = QOpenGLTexture::RGBA8_UNorm;
                 pixFormat = QOpenGLTexture::RGBA;
@@ -1146,7 +1171,9 @@ void GLPreview::paintGL()
         // bytesPerLine to 4-byte alignment, so the default GL value works.
         const QOpenGLTexture::PixelFormat upPixFormat = is16
             ? QOpenGLTexture::RGBA
-            : (isRGB888 ? QOpenGLTexture::RGB : QOpenGLTexture::RGBA);
+            : (isRGB888 ? QOpenGLTexture::RGB
+                : (isARGB32Premul ? QOpenGLTexture::BGRA
+                    : QOpenGLTexture::RGBA));
         const QOpenGLTexture::PixelType upPixType = is16
             ? QOpenGLTexture::UInt16
             : QOpenGLTexture::UInt8;
