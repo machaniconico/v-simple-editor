@@ -830,6 +830,15 @@ void GLPreview::displayFrame(const QImage &frame)
     // SourceOver), so premul=straight and the fragment shader's
     // texture().rgb sampling produces the same visible pixels. Disable
     // path: VEDITOR_BGRA_UPLOAD_DISABLE=1.
+    //
+    // INVARIANT (architect NIT-1): the alpha=1.0 invariant relies on
+    // overlay layer pixels themselves being opaque (alpha=1.0). The
+    // current decode pipeline emits RGB24 frames (no alpha), which
+    // QPainter promotes to alpha=0xFF when drawing — preserving the
+    // invariant. If a future overlay format introduces non-opaque
+    // pixels (transparent PNG / sticker), this fast path's premul=
+    // straight assumption breaks for those pixels and Win #8 must
+    // gate on an opacity check or fall back to RGBA8888.
     static const bool bgraUploadEnabled =
         qEnvironmentVariableIntValue("VEDITOR_BGRA_UPLOAD_DISABLE") == 0;
     if (is16) {
