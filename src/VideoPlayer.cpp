@@ -224,12 +224,15 @@ void VideoPlayer::setupUI()
 
     m_videoDisplay = new QLabel(this);
     m_videoDisplay->setAlignment(Qt::AlignCenter);
-    m_videoDisplay->setMinimumSize(480, 270);
+    // Soft minimum kept small so the preview can be shrunk to give the
+    // timeline more vertical room; setCanvasSize tightens this once a clip
+    // is loaded.
+    m_videoDisplay->setMinimumSize(240, 135);
     m_videoDisplay->setText("Drop a video file or use File > Open");
     m_videoDisplay->setStyleSheet("background-color: #1a1a1a; color: #888; font-size: 16px;");
 
     m_glPreview = new GLPreview(this);
-    m_glPreview->setMinimumSize(384, 216);
+    m_glPreview->setMinimumSize(240, 135);
     connect(m_glPreview, &GLPreview::textRectRequested,
             this, &VideoPlayer::textRectRequested);
     connect(m_glPreview, &GLPreview::textInlineCommitted,
@@ -1235,9 +1238,11 @@ void VideoPlayer::setCanvasSize(int width, int height)
     m_canvasWidth = width;
     m_canvasHeight = height;
     double ar = static_cast<double>(width) / height;
+    // Per-canvas floor matches the constructor minimum so loading a clip
+    // never grows the floor back up and trapping the user above 240x135.
     m_videoDisplay->setMinimumSize(
-        qMin(640, width / 2),
-        qMin(360, height / 2));
+        qMin(240, width / 2),
+        qMin(135, height / 2));
     if (m_currentFrameImage.isNull()) {
         QString orientation = (ar > 1.0) ? "Landscape" : (ar < 1.0) ? "Portrait" : "Square";
         m_videoDisplay->setText(QString("%1x%2 %3\nDrop a video file or use File > Open")

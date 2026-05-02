@@ -208,34 +208,42 @@ QString ThemeManager::darkTheme()
         /* ── Scrollbars ── */
         QScrollBar:vertical {
             background: #1a1a2e;
-            width: 10px;
+            width: 14px;
             margin: 0;
+            border-left: 1px solid #2a2a3e;
         }
         QScrollBar::handle:vertical {
-            background: #363655;
-            min-height: 24px;
-            border-radius: 5px;
-            margin: 1px;
+            background: #5a5a8c;
+            min-height: 32px;
+            border-radius: 6px;
+            margin: 2px;
         }
         QScrollBar::handle:vertical:hover {
             background: #e94560;
+        }
+        QScrollBar::handle:vertical:pressed {
+            background: #c93550;
         }
         QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
             height: 0;
         }
         QScrollBar:horizontal {
             background: #1a1a2e;
-            height: 10px;
+            height: 14px;
             margin: 0;
+            border-top: 1px solid #2a2a3e;
         }
         QScrollBar::handle:horizontal {
-            background: #363655;
-            min-width: 24px;
-            border-radius: 5px;
-            margin: 1px;
+            background: #5a5a8c;
+            min-width: 32px;
+            border-radius: 6px;
+            margin: 2px;
         }
         QScrollBar::handle:horizontal:hover {
             background: #e94560;
+        }
+        QScrollBar::handle:horizontal:pressed {
+            background: #c93550;
         }
         QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
             width: 0;
@@ -670,35 +678,43 @@ QString ThemeManager::lightTheme()
 
         /* ── Scrollbars ── */
         QScrollBar:vertical {
-            background: #f8f8fc;
-            width: 10px;
+            background: #ececf5;
+            width: 14px;
             margin: 0;
+            border-left: 1px solid #d0d0e0;
         }
         QScrollBar::handle:vertical {
-            background: #c8c8dc;
-            min-height: 24px;
-            border-radius: 5px;
-            margin: 1px;
+            background: #8888a8;
+            min-height: 32px;
+            border-radius: 6px;
+            margin: 2px;
         }
         QScrollBar::handle:vertical:hover {
             background: #e94560;
+        }
+        QScrollBar::handle:vertical:pressed {
+            background: #c93550;
         }
         QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
             height: 0;
         }
         QScrollBar:horizontal {
-            background: #f8f8fc;
-            height: 10px;
+            background: #ececf5;
+            height: 14px;
             margin: 0;
+            border-top: 1px solid #d0d0e0;
         }
         QScrollBar::handle:horizontal {
-            background: #c8c8dc;
-            min-width: 24px;
-            border-radius: 5px;
-            margin: 1px;
+            background: #8888a8;
+            min-width: 32px;
+            border-radius: 6px;
+            margin: 2px;
         }
         QScrollBar::handle:horizontal:hover {
             background: #e94560;
+        }
+        QScrollBar::handle:horizontal:pressed {
+            background: #c93550;
         }
         QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
             width: 0;
@@ -1135,34 +1151,42 @@ QString ThemeManager::midnightTheme()
         /* ── Scrollbars ── */
         QScrollBar:vertical {
             background: #0d0d1a;
-            width: 10px;
+            width: 14px;
             margin: 0;
+            border-left: 1px solid #1a1a30;
         }
         QScrollBar::handle:vertical {
-            background: #2a2a50;
-            min-height: 24px;
-            border-radius: 5px;
-            margin: 1px;
+            background: #4a4a80;
+            min-height: 32px;
+            border-radius: 6px;
+            margin: 2px;
         }
         QScrollBar::handle:vertical:hover {
             background: #6366f1;
+        }
+        QScrollBar::handle:vertical:pressed {
+            background: #4f52d8;
         }
         QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
             height: 0;
         }
         QScrollBar:horizontal {
             background: #0d0d1a;
-            height: 10px;
+            height: 14px;
             margin: 0;
+            border-top: 1px solid #1a1a30;
         }
         QScrollBar::handle:horizontal {
-            background: #2a2a50;
-            min-width: 24px;
-            border-radius: 5px;
-            margin: 1px;
+            background: #4a4a80;
+            min-width: 32px;
+            border-radius: 6px;
+            margin: 2px;
         }
         QScrollBar::handle:horizontal:hover {
             background: #6366f1;
+        }
+        QScrollBar::handle:horizontal:pressed {
+            background: #4f52d8;
         }
         QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
             width: 0;
@@ -1600,34 +1624,42 @@ QString ThemeManager::oceanTheme()
         /* ── Scrollbars ── */
         QScrollBar:vertical {
             background: #0d1a1f;
-            width: 10px;
+            width: 14px;
             margin: 0;
+            border-left: 1px solid #1a2a32;
         }
         QScrollBar::handle:vertical {
-            background: #264554;
-            min-height: 24px;
-            border-radius: 5px;
-            margin: 1px;
+            background: #3d6e84;
+            min-height: 32px;
+            border-radius: 6px;
+            margin: 2px;
         }
         QScrollBar::handle:vertical:hover {
             background: #06b6d4;
+        }
+        QScrollBar::handle:vertical:pressed {
+            background: #0891a8;
         }
         QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
             height: 0;
         }
         QScrollBar:horizontal {
             background: #0d1a1f;
-            height: 10px;
+            height: 14px;
             margin: 0;
+            border-top: 1px solid #1a2a32;
         }
         QScrollBar::handle:horizontal {
-            background: #264554;
-            min-width: 24px;
-            border-radius: 5px;
-            margin: 1px;
+            background: #3d6e84;
+            min-width: 32px;
+            border-radius: 6px;
+            margin: 2px;
         }
         QScrollBar::handle:horizontal:hover {
             background: #06b6d4;
+        }
+        QScrollBar::handle:horizontal:pressed {
+            background: #0891a8;
         }
         QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
             width: 0;

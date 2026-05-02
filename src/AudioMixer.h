@@ -105,6 +105,14 @@ public:
     void setTrackSolo(int trackIdx, bool solo);
     void setTrackGain(int trackIdx, double gain);
 
+    // Master loudness normalizer (FCP-style Loudness effect, applied to the
+    // sum-mixed master output before s16 clamping).
+    //   amount     0..1 — 0 bypasses entirely, 1 = full target-gain follow.
+    //   uniformity 0..1 — 0 = slow smoothing (preserves dynamics),
+    //                     1 = fast smoothing (uniform output).
+    void setNormalizerAmount(double amount);
+    void setNormalizerUniformity(double uniformity);
+
 signals:
     void decoderError(const QString &message);
 
@@ -164,6 +172,14 @@ private:
     // permanently broken.
     std::atomic<int> m_consecutiveStallCallbacks{0};
     std::atomic<bool> m_playing{false};
+
+    // Master loudness normalizer state. Atomics are touched from the GUI
+    // thread (setters) and the audio worker thread (readData). The mutable
+    // RMS / smoothed-gain fields are touched only from readData.
+    std::atomic<double> m_normalizerAmount{0.0};
+    std::atomic<double> m_normalizerUniformity{0.5};
+    double m_normalizerRmsMeanSq = 0.0;
+    double m_normalizerSmoothedGain = 1.0;
 
     AudioDecodeRunner *m_decodeRunner = nullptr;
 };

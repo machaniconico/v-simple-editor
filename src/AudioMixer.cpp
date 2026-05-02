@@ -13,6 +13,7 @@
 #include <QAudioDevice>
 #include <cstring>
 #include <algorithm>
+#include <cmath>
 #include <limits>
 
 extern "C" {
@@ -301,6 +302,69 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
         if (e->ringHead >= kRingCompactThreshold) {
             e->ring.remove(0, e->ringHead);
             e->ringHead = 0;
+        }
+    }
+
+    // Master loudness normalizer (FCP-style). Applies after sum-mix, before
+    // s16 clamp. amount=0 bypasses entirely; amount=1 fully follows the
+    // running RMS toward kTargetLevel. uniformity controls smoothing time.
+    {
+        const double amount = m_mixer->m_normalizerAmount.load(std::memory_order_acquire);
+        if (anyMixed && amount > 0.001) {
+            const double uniformity =
+                m_mixer->m_normalizerUniformity.load(std::memory_order_acquire);
+
+            double blockSumSq = 0.0;
+            for (int i = 0; i < sampleCount; ++i) {
+                const double s = accum[i] / 32768.0;
+                blockSumSq += s * s;
+            }
+            const double blockMeanSq = blockSumSq / sampleCount;
+
+            constexpr double kRmsWindowMs = 100.0;
+            const double blockMs = static_cast<double>(frameCount) * 1000.0
+                                   / AudioMixer::kSampleRateHz;
+            const double rmsAlpha = qBound(0.001, blockMs / kRmsWindowMs, 1.0);
+            m_mixer->m_normalizerRmsMeanSq =
+                (1.0 - rmsAlpha) * m_mixer->m_normalizerRmsMeanSq
+                + rmsAlpha * blockMeanSq;
+
+            const double currentRms = std::sqrt(m_mixer->m_normalizerRmsMeanSq);
+
+            // Target = -16 dBFS, accept range -32 dBFS..0 dBFS clamp.
+            constexpr double kTargetLevel = 0.158;
+            constexpr double kRmsFloor    = 0.001;
+            constexpr double kMaxBoost    = 4.0;   // +12 dB
+            constexpr double kMinCut      = 0.25;  // -12 dB
+            double rawGain = 1.0;
+            if (currentRms > kRmsFloor) {
+                rawGain = qBound(kMinCut, kTargetLevel / currentRms, kMaxBoost);
+            }
+
+            const double targetGain = (1.0 - amount) + amount * rawGain;
+
+            // uniformity=0 → tau=2000 ms (gradual, preserves dynamics)
+            // uniformity=1 → tau=  50 ms (fast, more uniform)
+            const double tauMs = 2000.0 - 1950.0 * uniformity;
+            const double tauSamples = tauMs * 0.001 * AudioMixer::kSampleRateHz;
+            const double smoothAlpha = (tauSamples > 1.0)
+                ? qBound(0.001,
+                         1.0 - std::exp(-static_cast<double>(frameCount) / tauSamples),
+                         1.0)
+                : 1.0;
+            m_mixer->m_normalizerSmoothedGain +=
+                (targetGain - m_mixer->m_normalizerSmoothedGain) * smoothAlpha;
+
+            const double appliedGain = m_mixer->m_normalizerSmoothedGain;
+            if (std::abs(appliedGain - 1.0) > 0.001) {
+                for (int i = 0; i < sampleCount; ++i) {
+                    accum[i] = static_cast<int32_t>(accum[i] * appliedGain);
+                }
+            }
+        } else if (amount <= 0.001) {
+            // Reset state so re-enabling starts at unity and ramps cleanly.
+            m_mixer->m_normalizerSmoothedGain = 1.0;
+            m_mixer->m_normalizerRmsMeanSq = 0.0;
         }
     }
 
@@ -713,6 +777,14 @@ void AudioMixer::setTrackGain(int trackIdx, double gain) {
         m_trackStates.resize(trackIdx + 1);
     m_trackStates[trackIdx].gain = qBound(0.0, gain, 4.0);
     recomputeEffectiveGainsLocked();
+}
+
+void AudioMixer::setNormalizerAmount(double amount) {
+    m_normalizerAmount.store(qBound(0.0, amount, 1.0), std::memory_order_release);
+}
+
+void AudioMixer::setNormalizerUniformity(double uniformity) {
+    m_normalizerUniformity.store(qBound(0.0, uniformity, 1.0), std::memory_order_release);
 }
 
 bool AudioMixer::ensureSinkLocked() {

@@ -44,6 +44,9 @@
 #include <QPushButton>
 #include <QDialog>
 #include <QDialogButtonBox>
+#include <QHBoxLayout>
+#include <QSettings>
+#include <QSlider>
 #include <QColorDialog>
 #include <QFormLayout>
 #include <QLabel>
@@ -354,6 +357,15 @@ void MainWindow::setupUI()
             m_player->setPreviewMaximized(false);
         }
     });
+
+    // Restore master loudness normalizer settings on startup.
+    if (auto *mixer = m_player ? m_player->audioMixer() : nullptr) {
+        QSettings audioPrefs("VSimpleEditor", "Preferences");
+        mixer->setNormalizerAmount(
+            audioPrefs.value("audio/normalizerAmount", 0.0).toDouble());
+        mixer->setNormalizerUniformity(
+            audioPrefs.value("audio/normalizerUniformity", 0.5).toDouble());
+    }
 }
 
 void MainWindow::setupMenuBar()
@@ -976,6 +988,15 @@ void MainWindow::setupMenuBar()
             .setValue("autoPlayOnFirstSequence", on);
     });
     prefsMenu->addAction(autoPlayAction);
+    prefsMenu->addSeparator();
+
+    auto *loudnessAction = new QAction(
+        QStringLiteral("オーディオ均一化..."), this);
+    loudnessAction->setStatusTip(QStringLiteral(
+        "全トラックの出力レベルを動的に均一化 (FCP の Loudness 風)"));
+    connect(loudnessAction, &QAction::triggered,
+            this, &MainWindow::openLoudnessSettings);
+    prefsMenu->addAction(loudnessAction);
     prefsMenu->addSeparator();
 
     // US-T39 Snap strength submenu — pulls/flushes the video source onto
@@ -3015,6 +3036,92 @@ void MainWindow::generateProxies()
 
     pm.generateAllProxies(paths);
     statusBar()->showMessage("Generating proxy files...");
+}
+
+void MainWindow::openLoudnessSettings()
+{
+    QSettings prefs("VSimpleEditor", "Preferences");
+    const double initAmount =
+        prefs.value("audio/normalizerAmount", 0.0).toDouble();
+    const double initUniformity =
+        prefs.value("audio/normalizerUniformity", 0.5).toDouble();
+
+    QDialog dlg(this);
+    dlg.setWindowTitle(QStringLiteral("オーディオ均一化"));
+    auto *layout = new QVBoxLayout(&dlg);
+
+    auto *intro = new QLabel(QStringLiteral(
+        "<b>全トラックの出力レベルを動的に均一化します。</b><br>"
+        "<small>"
+        "適用量 0% で完全 OFF。均一性が高いほど反応が速く出力が平らになり、"
+        "低いほど元の強弱が残ります。"
+        "</small>"), &dlg);
+    intro->setWordWrap(true);
+    layout->addWidget(intro);
+
+    // Amount slider 0..100 == 0..1.0
+    auto *amountRow = new QHBoxLayout();
+    amountRow->addWidget(new QLabel(QStringLiteral("適用量 (Amount):"), &dlg));
+    auto *amountValue = new QLabel(&dlg);
+    amountValue->setMinimumWidth(48);
+    amountValue->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    amountRow->addWidget(amountValue);
+    layout->addLayout(amountRow);
+    auto *amountSlider = new QSlider(Qt::Horizontal, &dlg);
+    amountSlider->setRange(0, 100);
+    amountSlider->setValue(static_cast<int>(qBound(0.0, initAmount, 1.0) * 100.0));
+    amountValue->setText(QString::number(amountSlider->value()) + " %");
+    layout->addWidget(amountSlider);
+
+    auto *uniformRow = new QHBoxLayout();
+    uniformRow->addWidget(new QLabel(QStringLiteral("均一性 (Uniformity):"), &dlg));
+    auto *uniformValue = new QLabel(&dlg);
+    uniformValue->setMinimumWidth(48);
+    uniformValue->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    uniformRow->addWidget(uniformValue);
+    layout->addLayout(uniformRow);
+    auto *uniformSlider = new QSlider(Qt::Horizontal, &dlg);
+    uniformSlider->setRange(0, 100);
+    uniformSlider->setValue(static_cast<int>(qBound(0.0, initUniformity, 1.0) * 100.0));
+    uniformValue->setText(QString::number(uniformSlider->value()) + " %");
+    layout->addWidget(uniformSlider);
+
+    AudioMixer *mixer = m_player ? m_player->audioMixer() : nullptr;
+
+    auto pushAmount = [mixer, amountValue](int v) {
+        amountValue->setText(QString::number(v) + " %");
+        if (mixer) mixer->setNormalizerAmount(v / 100.0);
+    };
+    auto pushUniformity = [mixer, uniformValue](int v) {
+        uniformValue->setText(QString::number(v) + " %");
+        if (mixer) mixer->setNormalizerUniformity(v / 100.0);
+    };
+    connect(amountSlider, &QSlider::valueChanged, &dlg, pushAmount);
+    connect(uniformSlider, &QSlider::valueChanged, &dlg, pushUniformity);
+
+    auto *buttons = new QDialogButtonBox(
+        QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    layout->addWidget(buttons);
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+
+    if (dlg.exec() == QDialog::Accepted) {
+        const double amount = amountSlider->value() / 100.0;
+        const double uniformity = uniformSlider->value() / 100.0;
+        prefs.setValue("audio/normalizerAmount", amount);
+        prefs.setValue("audio/normalizerUniformity", uniformity);
+        if (mixer) {
+            mixer->setNormalizerAmount(amount);
+            mixer->setNormalizerUniformity(uniformity);
+        }
+    } else {
+        // Cancel restores the original values (they were live-applied during
+        // slider drag).
+        if (mixer) {
+            mixer->setNormalizerAmount(initAmount);
+            mixer->setNormalizerUniformity(initUniformity);
+        }
+    }
 }
 
 void MainWindow::openProxyManagement()

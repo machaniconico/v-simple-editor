@@ -1367,7 +1367,9 @@ void Timeline::setupUI()
     // bar above. Auto-fit zoom makes content fit the viewport in most cases;
     // the scroll position is still controllable via wheel / drag.
     m_scrollArea->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-    m_scrollArea->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    // AlwaysOn (not AsNeeded) so the bar stays visible while the timeline
+    // pane is shrunk via the splitter — every track stays reachable.
+    m_scrollArea->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOn);
 
     auto *tracksContainer = new QWidget();
     auto *tracksOuterLayout = new QVBoxLayout(tracksContainer);
@@ -1476,6 +1478,10 @@ void Timeline::setupUI()
 
     layout->addWidget(contentArea);
     setStyleSheet("background-color: #333;");
+
+    // Floor for the splitter so the preview can grow vertically; tracks that
+    // overflow this height stay reachable via the always-on scroll bar above.
+    setMinimumHeight(150);
 
     wireTrackSelection(m_videoTrack);
     wireTrackSelection(m_audioTrack);
