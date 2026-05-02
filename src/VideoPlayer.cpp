@@ -1,6 +1,7 @@
 #include "VideoPlayer.h"
 #include <QSet>
 #include "GLPreview.h"
+#include "ProxyManager.h"
 
 #if defined(_WIN32)
 // Phase 1e — d3d11.h pulls in WinSDK 10.0.26100 headers that fight Qt's
@@ -209,6 +210,10 @@ VideoPlayer::~VideoPlayer()
     if (m_sharedPoolHwDeviceCtx)
         av_buffer_unref(&m_sharedPoolHwDeviceCtx);
     m_sharedPoolHwPixFmt = AV_PIX_FMT_NONE;
+    // Final release of the V1 HW device context (resetDecoder no longer
+    // touches it so it survives clip switches; release at process exit).
+    if (m_hwDeviceCtx)
+        av_buffer_unref(&m_hwDeviceCtx);
 }
 
 void VideoPlayer::setupUI()
@@ -444,7 +449,14 @@ void VideoPlayer::loadFile(const QString &filePath)
     }
 
     m_hwPixFmt = AV_PIX_FMT_NONE;
-    if (av_hwdevice_ctx_create(&m_hwDeviceCtx, AV_HWDEVICE_TYPE_D3D11VA, nullptr, nullptr, 0) >= 0) {
+    // Reuse the D3D11VA device context across loadFile calls — it is
+    // process-global and stateless between clips. Recreating it every
+    // switch added ~22 ms of main-thread block per loadFile (debugger
+    // breakdown of the 120 ms freeze on track switch).
+    const bool hwDeviceReady = m_hwDeviceCtx
+        || av_hwdevice_ctx_create(&m_hwDeviceCtx, AV_HWDEVICE_TYPE_D3D11VA,
+                                   nullptr, nullptr, 0) >= 0;
+    if (hwDeviceReady) {
         for (int i = 0;; i++) {
             const AVCodecHWConfig *cfg = avcodec_get_hw_config(codec, i);
             if (!cfg)
@@ -537,6 +549,16 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
 {
     qInfo() << "VideoPlayer::setSequence count=" << entries.size();
     m_loggedCullState = false; // re-emit [cull] diagnostic for the new project
+    // Phase 1e Win #16 (Iteration 9) — invalidate any pending preroll
+    // de-dup. The new sequence may renumber entries, so the cached
+    // prerolled index can point at an unrelated clip after reconciliation.
+    m_prerolledEntryIdx = -1;
+    // Iteration 10 — capture wasEmpty before the assignment below so the
+    // empty -> non-empty auto-play branch at function tail can fire only on
+    // the very first sequence delivery (app launch + first clip drop).
+    // Subsequent re-emits (proxy promote, edit, scrub) already carry the
+    // user's prior playing/paused state via Iteration 10 boundary auto-resume.
+    const bool seqWasEmpty = m_sequence.isEmpty();
 
     // V3 sprint — preserve drag-edit target across sequenceChanged round-trips.
     // Timeline::setClipVideoTransform fires sequenceChanged on every drag event,
@@ -728,6 +750,33 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
     }
 
     updatePositionUi();
+
+    // Iteration 10 — auto-play on the first non-empty sequence delivery.
+    // User-accepted side effect of the boundary auto-resume request:
+    // "アプリ立ち上げて最初にクリップ貼った時も自動で再生始まるかも". The
+    // QTimer::singleShot defers play() to the next event loop tick so any
+    // pending loadFile / seekInternal(0) inside this setSequence call has
+    // settled before play() arms the playback timer (avoids the cold-open
+    // !advanced safety-net that motivated Fix J in the first place).
+    static const bool kAutoplayDisabled =
+        qEnvironmentVariableIntValue("VEDITOR_AUTOPLAY_ON_FIRST_SEQUENCE_DISABLE") != 0;
+    // Iteration 12: gate auto-play behind a user preference (default OFF).
+    // User feedback after Iteration 10 shipped: the auto-play side effect on
+    // first clip drop was useful but should be opt-in via 環境設定 menu, not
+    // forced on. The envvar override still wins (force-disable for CI/test
+    // automation); the QSettings key is the user-facing toggle.
+    const bool autoplayPref = QSettings("VSimpleEditor", "Preferences")
+        .value("autoPlayOnFirstSequence", false).toBool();
+    if (!kAutoplayDisabled && autoplayPref
+        && seqWasEmpty && !entries.isEmpty() && !m_playing) {
+        // NIT-1 (architect Iteration 10): re-check guard inside the lambda
+        // because the user could delete the just-dropped clip before the
+        // next event loop tick, leaving an empty sequence that would
+        // otherwise generate one spurious tick + redundant pause() chain.
+        QTimer::singleShot(0, this, [this]() {
+            if (!m_playing && !m_sequence.isEmpty()) play();
+        });
+    }
 }
 
 void VideoPlayer::setAudioSequence(const QVector<PlaybackEntry> &entries)
@@ -840,7 +889,19 @@ bool VideoPlayer::seekToTimelineUs(int64_t timelineUs, bool precise)
     m_suppressUiUpdates = needSwitch;
     const bool wasPlayingOuter = m_playing;
     if (needSwitch) {
-        loadFile(e.filePath); // reloads the video decoder; audio routes through the mixer
+        // Phase 1e Win #16 (Iteration 9) — try hot-swap before legacy
+        // loadFile. When the target entry's TrackDecoder is already warm
+        // (V2+ pool entries usually are; V1 becomes warm via boundary
+        // preroll), the swap is a sub-ms pointer move and the entire
+        // resetDecoder→avformat_open_input chain is skipped.
+        if (!tryPromotePoolDecoderTo(idx)) {
+            // Phase 1e Win #15 (Fix M) — same retention rationale as
+            // advanceToEntry: keep the displayed frame across the loadFile
+            // latency so the cross-file seek doesn't flash a black GLPreview.
+            m_retainLastFrameAcrossLoad = true;
+            loadFile(e.filePath); // reloads the video decoder; audio routes through the mixer
+            m_retainLastFrameAcrossLoad = false;
+        }
         if (wasPlayingOuter)
             m_playing = true;
     }
@@ -903,7 +964,21 @@ bool VideoPlayer::advanceToEntry(int newEntryIdx)
     const bool prevSuppress = m_suppressUiUpdates;
     m_suppressUiUpdates = needSwitch;
     if (needSwitch) {
-        loadFile(next.filePath); // loadFile only reloads the video decoder; audio is driven by setAudioSequence
+        // Phase 1e Win #16 (Iteration 9) — try the Premiere Pro-style
+        // hot-swap first. When handlePlaybackTick prerolled the next
+        // entry's pool decoder before the boundary, the swap is a sub-ms
+        // pointer move and the loadFile / resetDecoder chain (with its
+        // 60-200 ms stall + black-frame window) is bypassed entirely.
+        // Fall back to legacy loadFile when no warm pool decoder exists.
+        if (!tryPromotePoolDecoderTo(newEntryIdx)) {
+            // Phase 1e Win #15 (Fix M) — keep the previous clip's last
+            // displayed frame alive through resetDecoder so the GLPreview
+            // doesn't flash black/empty during the loadFile latency window
+            // (~60-145 ms for a typical proxy). Cleared again right after.
+            m_retainLastFrameAcrossLoad = true;
+            loadFile(next.filePath); // loadFile only reloads the video decoder; audio is driven by setAudioSequence
+            m_retainLastFrameAcrossLoad = false;
+        }
     }
 
     m_activeEntry = newEntryIdx;
@@ -945,6 +1020,200 @@ bool VideoPlayer::advanceToEntry(int newEntryIdx)
     // boundary that crosses a file switch.
     updatePlayButton();
     updatePositionUi();
+
+    // Iteration 10 — auto-resume invariant on clip boundary. User report:
+    // "クリップの切り替えの所で止まる、クリップの最初所に来たら自動で再生
+    // される様には出来る？" Even with Iteration 9 hot-swap clean, a
+    // subtle race in the playback chain (AudioMixer state callback,
+    // scheduleNextFrame !advanced safety-net, downstream UI signal) can
+    // still flip m_playing back to false during the transition. Forcing
+    // wasPlaying invariant here delivers the user's stated guarantee:
+    // landing on a clip's first frame means playback continues. We bypass
+    // play() to avoid Fix J's 200ms debounce + Fix L's re-anchor logic
+    // (m_activeEntry is already correct so re-anchor is unnecessary).
+    static const bool kBoundaryAutoresumeDisabled =
+        qEnvironmentVariableIntValue("VEDITOR_BOUNDARY_AUTORESUME_DISABLE") != 0;
+    if (!kBoundaryAutoresumeDisabled && wasPlaying) {
+        const bool wasNotPlaying = !m_playing;
+        m_playing = true;
+        if (wasNotPlaying) emit stateChanged(true);
+        if (m_mixer) m_mixer->play();
+        scheduleNextFrame();
+    }
+    return true;
+}
+
+bool VideoPlayer::tryPromotePoolDecoderTo(int newEntryIdx)
+{
+    // Phase 1e Win #16 (Iteration 9) — Premiere Pro-style decoder hot-swap.
+    // Iterations 5-8 (Fix J/K/L/M) layered debounce / dedup / re-anchor /
+    // last-frame-retention on top of advanceToEntry's loadFile call,
+    // because that call took 60-200 ms on the main thread and forced the
+    // UI / AudioMixer / GL pipeline into a series of stop-restart cycles
+    // that each had their own race conditions. The actual fix is to
+    // remove the loadFile from the boundary path entirely: when the next
+    // entry's TrackDecoder has already been opened by handlePlaybackTick's
+    // boundary preroll (or by V2+ overlay rendering), move its
+    // formatCtx/codecCtx/frame/swFrame/packet straight into the V1 primary
+    // slots and demote the old primary to the eviction grace pool. The
+    // sub-ms pointer swap eliminates the underlying race.
+    static const bool kHotSwapDisabled =
+        qEnvironmentVariableIntValue("VEDITOR_HOTSWAP_DISABLE") != 0;
+    if (kHotSwapDisabled) return false;
+    if (newEntryIdx < 0 || newEntryIdx >= m_sequence.size()) return false;
+
+    const PlaybackEntry &next = m_sequence[newEntryIdx];
+    const TrackKey nextKey{next.filePath, qRound64(next.clipIn * 1000.0),
+                           next.sourceTrack, next.sourceClipIndex};
+
+    auto it = m_trackDecoders.find(nextKey);
+    if (it == m_trackDecoders.end()) return false;
+
+    TrackDecoder *target = it.value();
+    if (!target || !target->formatCtx || !target->codecCtx) return false;
+
+    QElapsedTimer swapTimer;
+    swapTimer.start();
+    const int prevEntry = m_activeEntry;
+
+    // Release the slot the pool decoder was holding — primary doesn't go
+    // through DecoderSlotManager (V1's slot is intentionally unmanaged).
+    const int targetSlotId = static_cast<int>(qHash(nextKey));
+    m_slotManager.releaseSlot(targetSlotId);
+    m_slotIdToKey.remove(targetSlotId);
+    m_trackDecoders.erase(it);
+
+    // Demote the old primary into the eviction grace pool so any in-flight
+    // tick that still has a stale pointer to its codec can finish before
+    // the heavy avformat_close_input runs (graceTtlTicks=4 ≈ 4 ticks).
+    if (prevEntry >= 0 && prevEntry < m_sequence.size()
+        && m_formatCtx && m_codecCtx) {
+        const PlaybackEntry &old = m_sequence[prevEntry];
+        TrackDecoder *evicted = new TrackDecoder();
+        evicted->sourceClipIndex = old.sourceClipIndex;
+        evicted->sourceTrack = old.sourceTrack;
+        evicted->filePath = m_loadedFilePath;
+        evicted->clipIn = old.clipIn;
+        evicted->formatCtx = m_formatCtx;
+        evicted->codecCtx = m_codecCtx;
+        evicted->swsCtx = m_swsCtx;
+        evicted->frame = m_frame;
+        evicted->swFrame = m_swFrame;
+        evicted->packet = m_packet;
+        evicted->videoStreamIndex = m_videoStreamIndex;
+        evicted->hwPixFmt = m_hwPixFmt;
+        evicted->durationUs = m_durationUs;
+        evicted->frameDurationUs = m_frameDurationUs;
+        evicted->displayAspect = m_displayAspectRatio;
+        evicted->currentPositionUs = m_currentPositionUs;
+        evicted->lastFrameRgb = m_lastV1RawFrame;
+        evicted->firstFrameDecoded = !m_lastV1RawFrame.isNull();
+        evicted->graceTtlTicks = 4;
+
+        // Cap the grace pool at 4 — same policy as the existing
+        // acquireDecoderForClip eviction path. Pop the oldest if full.
+        while (m_evictionGracePool.size() >= 4) {
+            TrackDecoder *oldest = m_evictionGracePool.takeFirst();
+            if (oldest) {
+                closeTrackDecoder(oldest);
+                delete oldest;
+            }
+        }
+        m_evictionGracePool.append(evicted);
+    } else {
+        // No prior primary to demote — drop any stray state.
+        if (m_swsCtx) { sws_freeContext(m_swsCtx); m_swsCtx = nullptr; }
+        if (m_frame) av_frame_free(&m_frame);
+        if (m_swFrame) av_frame_free(&m_swFrame);
+        if (m_packet) av_packet_free(&m_packet);
+        if (m_codecCtx) avcodec_free_context(&m_codecCtx);
+        if (m_formatCtx) avformat_close_input(&m_formatCtx);
+    }
+
+    // Move target's contexts into primary slots. target's codecCtx already
+    // has hw_device_ctx ref'd to m_sharedPoolHwDeviceCtx; legacy m_hwDeviceCtx
+    // stays separate and continues to ref V1-only HW state. GLPreview's
+    // interop binding is updated explicitly below (NIT-1) so the cache
+    // re-keys on the pool device — sharedD3D11Device()'s legacy-first
+    // fallback would otherwise leave the cache pointing at m_hwDeviceCtx.
+    m_formatCtx = target->formatCtx;
+    m_codecCtx = target->codecCtx;
+    // swsCtx is canvas-size-dependent — pool's may not match the primary
+    // canvas. Free target's, leave m_swsCtx null so frameToImage rebuilds.
+    if (target->swsCtx) sws_freeContext(target->swsCtx);
+    m_swsCtx = nullptr;
+    m_frame = target->frame;
+    m_swFrame = target->swFrame;
+    m_packet = target->packet;
+    m_videoStreamIndex = target->videoStreamIndex;
+    m_hwPixFmt = target->hwPixFmt;
+    m_durationUs = target->durationUs;
+    m_frameDurationUs = target->frameDurationUs;
+    m_displayAspectRatio = target->displayAspect;
+    m_currentPositionUs = target->currentPositionUs;
+    m_loadedFilePath = next.filePath;
+
+    // The pool's get_format callback was poolGetHwFormatCallback with
+    // opaque == target. We delete `target` below; a stray re-probe would
+    // dereference a dangling pointer. Codec is already open so get_format
+    // normally won't fire again, but null the opaque defensively.
+    if (m_codecCtx)
+        m_codecCtx->opaque = nullptr;
+
+    // Rebuild HDR metadata from the new primary's codec parameters,
+    // mirroring loadFile's logic so downstream code sees identical fields.
+    m_hdrInfo = {};
+    if (m_formatCtx && m_videoStreamIndex >= 0
+        && m_videoStreamIndex < static_cast<int>(m_formatCtx->nb_streams)) {
+        auto *codecpar = m_formatCtx->streams[m_videoStreamIndex]->codecpar;
+        m_hdrInfo.primaries = codecpar->color_primaries;
+        m_hdrInfo.trc = codecpar->color_trc;
+        m_hdrInfo.colorspace = codecpar->color_space;
+        const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(
+            static_cast<AVPixelFormat>(codecpar->format));
+        m_hdrInfo.bitDepth = desc ? std::max(8, av_get_bits_per_pixel(desc) / 3) : 8;
+        m_hdrInfo.isHdr = (codecpar->color_trc == AVCOL_TRC_SMPTE2084
+                           || codecpar->color_trc == AVCOL_TRC_ARIB_STD_B67);
+    }
+
+    // UI updates that loadFile would normally fire — seekbar range and
+    // duration signal anchored to the freshly-active file.
+    if (!m_suppressUiUpdates) {
+        m_seekBar->setRange(0, sliderPositionForUs(m_durationUs));
+        if (sequenceActive()) {
+            applySequenceSliderRange();
+            emit durationChanged(static_cast<double>(m_sequenceDurationUs) / AV_TIME_BASE);
+        } else {
+            emit durationChanged(static_cast<double>(m_durationUs) / AV_TIME_BASE);
+        }
+    }
+    if (m_glPreview) {
+        m_glPreview->setDisplayAspectRatio(m_displayAspectRatio);
+        // Architect NIT-1: route GLPreview to the device backing the NEW
+        // primary (pool D3D11Device*), not sharedD3D11Device()'s default
+        // preference for legacy m_hwDeviceCtx. Without this override the
+        // first ~5-10 post-swap frames see GLPreview's interop cache
+        // keyed on the wrong D3D11Device pointer and miss the GL_BGRA
+        // fast path. flushInteropCache drops stale texture handles bound
+        // to the legacy device so the next paint rebuilds against the
+        // pool device cleanly.
+        void *poolDevice = veditor_avHwDeviceCtxToD3D11Device(m_sharedPoolHwDeviceCtx);
+        if (poolDevice) {
+            m_glPreview->flushInteropCache();
+            m_glPreview->setSharedD3D11Device(poolDevice);
+        } else {
+            m_glPreview->setSharedD3D11Device(sharedD3D11Device());
+        }
+    }
+
+    // target shell is empty — its inner contexts moved to primary or were
+    // freed above; safe to delete the wrapper.
+    delete target;
+
+    qInfo() << "VideoPlayer::tryPromotePoolDecoderTo SWAPPED entry"
+            << prevEntry << "->" << newEntryIdx
+            << "file=" << next.filePath
+            << "elapsed=" << swapTimer.elapsed() << "ms";
     return true;
 }
 
@@ -978,6 +1247,96 @@ void VideoPlayer::play()
 
     if (m_playing)
         return;
+
+    // Phase 1e Win #12 — Fix J: collapse rapid play() bursts. The
+    // scheduleNextFrame !advanced safety-net (line 2911-2923) auto-pauses
+    // and stops the AudioMixer when a tick can't decode in time, which can
+    // happen on the first tick after play() during a cold-open. Each
+    // pause→play→pause cycle synchronously dispatches a QAudioSink stop/
+    // start (~10-20 ms on the main thread) and the UI's button feedback
+    // can re-emit play() before the cycle settles. Log
+    // veditor_20260501_091710.log @ 09:20:18-19 caught 4 entries in 934 ms
+    // → 10.7 s paintGL stall. A 200 ms window collapses the cascade while
+    // still letting deliberate user pause→play sequences (~250 ms reaction
+    // floor) through.
+    static const bool kPlayDebounceDisabled =
+        qEnvironmentVariableIntValue("VEDITOR_PLAY_DEBOUNCE_DISABLE") != 0;
+    if (!kPlayDebounceDisabled
+        && m_lastPlayCallTimer.isValid()
+        && m_lastPlayCallTimer.elapsed() < 200) {
+        qInfo() << "VideoPlayer::play() debounced — within 200 ms of last call (elapsed="
+                << m_lastPlayCallTimer.elapsed() << "ms)";
+        return;
+    }
+    m_lastPlayCallTimer.restart();
+
+    // Phase 1e Win #14 — Fix L: re-anchor m_activeEntry against the current
+    // playhead before the first tick. Empirical log
+    // veditor_20260501_105849.log @ 11:02:26-28 caught play() three times
+    // in a row with `m_playing=false speed=1 tlPos=7540076009 activeEntry=0`,
+    // i.e. the playhead is past entry 0's clipOut (ナイトレイン 6386 s) but
+    // m_activeEntry still pointed at entry 0. handlePlaybackTick's
+    // reachedEntryEnd path (line 2748) sees m_currentPositionUs ≥
+    // entryEndLocalUs immediately, drops into the Stage 1+2 candidate
+    // search, and — because findActiveEntryAt's strict `<` boundary at
+    // line 778 misses the next entry whose timelineStart equals the
+    // current entry's timelineEnd — falls into the end-of-sequence
+    // pause() at line 2880. That leaves m_currentPositionUs pinned at
+    // clipOut, m_activeEntry untouched, and the next play() click
+    // re-enters the same loop. User-visible: "前の clip 終端で停止、再生
+    // 押しなおしても動かない、seek bar を次 clip 上まで持って行ってから
+    // 再生で 2 clip まで動く".
+    //
+    // Resolution: when the cached activeEntry is out-of-range or its
+    // file-local clipOut has been reached, resolve the entry from the
+    // current m_timelinePositionUs and route through seekToTimelineUs —
+    // which handles loadFile + decoder seek + m_activeEntry assignment
+    // atomically, and also kicks AudioMixer::seekTo so the master clock
+    // re-anchors. Fall back to the entry's timelineStart if the cached
+    // tlPos pre-dates it (defensive).
+    static const bool kPlayReanchorDisabled =
+        qEnvironmentVariableIntValue("VEDITOR_PLAY_REANCHOR_DISABLE") != 0;
+    if (!kPlayReanchorDisabled && sequenceActive() && !m_sequence.isEmpty()) {
+        bool entryStale = (m_activeEntry < 0 || m_activeEntry >= m_sequence.size());
+        if (!entryStale) {
+            const auto &ae = m_sequence[m_activeEntry];
+            // Phase 1e Win #15 (Fix M): judge stale on the TIMELINE axis, not
+            // file-local. The original Fix L test
+            // `m_currentPositionUs >= ae.clipOut * AV_TIME_BASE` mixed two
+            // different position spaces — m_currentPositionUs is the
+            // *currently-loaded file's* local cursor, but resetDecoder
+            // (VideoPlayer.cpp:1597) clears it back to 0 on every
+            // loadFile, including loadFiles invoked from a cross-file seek
+            // toward a later entry. Empirical log
+            // veditor_20260501_113335.log @ 11:35:42-49 caught 12 play()
+            // entries with `tlPos=6386090998 activeEntry=0` (entry 0
+            // ナイトレイン timelineEnd=6386.09 s) and zero `Fix L:
+            // re-anchor` lines — m_currentPositionUs had been reset to 0,
+            // entryStale stayed false, the re-anchor never fired. Comparing
+            // the timeline cursor against the active entry's timeline
+            // [start, end) range removes that dependency: as long as the
+            // playhead is outside the entry's own timeline range, the
+            // entry is stale regardless of which file's cursor lives in
+            // m_currentPositionUs.
+            const int64_t aeStartUs = static_cast<int64_t>(ae.timelineStart * AV_TIME_BASE);
+            const int64_t aeEndUs = static_cast<int64_t>(ae.timelineEnd * AV_TIME_BASE);
+            entryStale = (m_timelinePositionUs < aeStartUs
+                       || m_timelinePositionUs >= aeEndUs);
+        }
+        if (entryStale) {
+            const int resolved = findActiveEntryAt(m_timelinePositionUs);
+            if (resolved >= 0 && resolved < m_sequence.size()
+                && resolved != m_activeEntry) {
+                const int64_t startUs = static_cast<int64_t>(
+                    m_sequence[resolved].timelineStart * AV_TIME_BASE);
+                qInfo() << "VideoPlayer::play() Fix L/M: re-anchor activeEntry"
+                        << m_activeEntry << "->" << resolved
+                        << "tlPos=" << m_timelinePositionUs
+                        << "currentPos=" << m_currentPositionUs;
+                seekToTimelineUs(qMax(m_timelinePositionUs, startUs), /*precise=*/true);
+            }
+        }
+    }
 
     m_playing = true;
     updatePlayButton();
@@ -1515,7 +1874,18 @@ void VideoPlayer::resetDecoder()
     m_currentPositionUs = 0;
     m_frameDurationUs = 0;
     m_displayAspectRatio = 0.0;
-    m_currentFrameImage = QImage();
+    // Phase 1e Win #15 (Fix M): retain the last presented QImage across
+    // an advanceToEntry/seekToTimelineUs cross-file hand-off so the
+    // GLPreview keeps showing the previous clip's final frame until the
+    // new file's first decoded frame replaces it (≈60-145 ms window,
+    // dominated by avformat_find_stream_info + first seek). Honoured
+    // only when VideoPlayer::advanceToEntry has set
+    // m_retainLastFrameAcrossLoad; the freshly-imported / Timeline-
+    // empty path still clears as before.
+    static const bool kLastFrameRetentionDisabled =
+        qEnvironmentVariableIntValue("VEDITOR_LAST_FRAME_RETENTION_DISABLE") != 0;
+    if (kLastFrameRetentionDisabled || !m_retainLastFrameAcrossLoad)
+        m_currentFrameImage = QImage();
     m_pendingSeekMs = -1;
     m_pendingSeekPrecise = false;
     m_seekInProgress = false;
@@ -1534,12 +1904,21 @@ void VideoPlayer::resetDecoder()
         avcodec_free_context(&m_codecCtx);
     if (m_formatCtx)
         avformat_close_input(&m_formatCtx);
-    if (m_hwDeviceCtx)
-        av_buffer_unref(&m_hwDeviceCtx);
+    // Do NOT unref m_hwDeviceCtx here — it's reused across loadFile calls
+    // (see hwDeviceReady gate in loadFile). Final release happens in the
+    // destructor after clearAllPoolDecoders. Skipping per-clip teardown
+    // saves ~22 ms per track switch (avoid av_hwdevice_ctx_create rebuild)
+    // and also keeps the GL interop cache valid — the cache is keyed by
+    // the D3D11 device pointer, so destroying the ctx invalidates every
+    // cached pool texture handle.
     m_hwPixFmt = AV_PIX_FMT_NONE;
-    if (m_glPreview) {
-        // Flush before clearing the device pointer — every cached entry
-        // points into the texture pool that's about to be destroyed.
+    // Skip interop cache flush when m_hwDeviceCtx survives the reset
+    // (the common case under Fix G). The cache is keyed on the D3D11
+    // device pointer, which we keep, so retaining it spares ~5-10 ms
+    // of texture re-register on the next paint after a clip switch.
+    // Only flush when the device is going away (HW failure path or
+    // never-opened state).
+    if (m_glPreview && !m_hwDeviceCtx) {
         m_glPreview->flushInteropCache();
         m_glPreview->setSharedD3D11Device(nullptr);
     }
@@ -1549,7 +1928,12 @@ void VideoPlayer::resetDecoder()
     // decode) hands the compositor the previous clip's V1 frame as the
     // canvas base, and the user briefly sees the old clip behind any
     // V2+ overlays.
-    m_lastV1RawFrame = QImage();
+    // Phase 1e Win #15 (Fix M) — same retention window as
+    // m_currentFrameImage above. The compositor's V1 base canvas keeps
+    // the previous frame so a still-running V2/V3/V4 overlay doesn't see
+    // a black backdrop while the new V1 file warms up.
+    if (kLastFrameRetentionDisabled || !m_retainLastFrameAcrossLoad)
+        m_lastV1RawFrame = QImage();
 
     updatePlayButton();
     if (!m_suppressUiUpdates)
@@ -2194,6 +2578,53 @@ void VideoPlayer::handlePlaybackTick()
         m_postSeekResyncRequested = false;
     }
 
+    // Phase 1e Win #16 (Iteration 9) — boundary preroll. When the playhead
+    // is within kPrerollUs of the active entry's timelineEnd, ask
+    // acquireDecoderForClip to open + slot-allocate the NEXT same-track
+    // entry's TrackDecoder. The reachedEntryEnd → advanceToEntry path then
+    // finds a warm decoder via tryPromotePoolDecoderTo and skips the
+    // 60-200 ms loadFile stall. De-duped by m_prerolledEntryIdx; reset
+    // whenever the prerolled entry has rotated into the active slot.
+    static const bool kPrerollDisabled =
+        qEnvironmentVariableIntValue("VEDITOR_BOUNDARY_PREROLL_DISABLE") != 0;
+    if (!kPrerollDisabled && sequenceActive()
+        && m_activeEntry >= 0 && m_activeEntry < m_sequence.size()) {
+        if (m_prerolledEntryIdx == m_activeEntry) {
+            m_prerolledEntryIdx = -1;
+        }
+        constexpr int64_t kPrerollUs = 1'000'000LL; // 1.0 s
+        const auto &active = m_sequence[m_activeEntry];
+        const int64_t activeEndUs = static_cast<int64_t>(active.timelineEnd * AV_TIME_BASE);
+        if (m_timelinePositionUs >= activeEndUs - kPrerollUs) {
+            // Track-aware next-entry search so boundary preroll doesn't
+            // accidentally warm up an unrelated V2/V3 layer that happens
+            // to sort after the active entry in m_sequence's flat order.
+            const double eps = 1e-3;
+            int prerollIdx = -1;
+            for (int i = 0; i < m_sequence.size(); ++i) {
+                if (i == m_activeEntry) continue;
+                const auto &e = m_sequence[i];
+                if (e.sourceTrack != active.sourceTrack) continue;
+                if (e.timelineStart >= active.timelineEnd - eps) {
+                    if (prerollIdx < 0
+                        || m_sequence[prerollIdx].timelineStart > e.timelineStart) {
+                        prerollIdx = i;
+                    }
+                }
+            }
+            if (prerollIdx >= 0 && prerollIdx != m_prerolledEntryIdx) {
+                const auto &nextE = m_sequence[prerollIdx];
+                TrackDecoder *warm = acquireDecoderForClip(nextE);
+                if (warm) {
+                    qInfo() << "VideoPlayer: boundary preroll entry"
+                            << prerollIdx << "file=" << nextE.filePath
+                            << "tlPos=" << m_timelinePositionUs;
+                    m_prerolledEntryIdx = prerollIdx;
+                }
+            }
+        }
+    }
+
     // Decide upfront whether the V1 frame for this tick will be composited
     // with V2+ overlays. When yes, presentDecodedFrame caches the V1 frame
     // into m_lastSourceFrame but skips displayFrame so the compositor step
@@ -2703,21 +3134,126 @@ void VideoPlayer::handlePlaybackTick()
         const auto &active = m_sequence[m_activeEntry];
         const int64_t entryEndLocalUs = static_cast<int64_t>(active.clipOut * AV_TIME_BASE);
         const bool reachedEntryEnd = (m_currentPositionUs >= entryEndLocalUs);
-        const bool decodeStopped = !advanced;
+        // NB: previously also triggered on `decodeStopped = !advanced`, but
+        // that fires for any transient decode stall (cold open of the new
+        // primary after overlay rotation, V2 prefetch worker starving the
+        // main decoder, single dropped frame on a heavy 1080p source). The
+        // false positives caused (a) cross-track sideways jumps when the
+        // sequence was sorted by (timelineStart, trackIdx) and (b) immediate
+        // end-of-sequence after rotation while the new primary's decoder
+        // was still warming up. Limit to the genuine end-of-clip signal.
 
-        if (reachedEntryEnd || decodeStopped) {
-            const int nextIdx = m_activeEntry + 1;
-            if (nextIdx < m_sequence.size()) {
+        if (reachedEntryEnd) {
+            // PiP regression fix: previous code used `nextIdx = m_activeEntry + 1`,
+            // which conflated flat sequence index with "next clip on this track".
+            // With ParallelTrack mode (V1-V4 stacked at timelineStart=0), +1
+            // jumps sideways into a different track's entry — the user saw
+            // V1's transient stall load Xマッチ.mp4 (V4 raw 1080p) instead.
+            //
+            // Two-stage candidate selection:
+            //   (1) Prefer the next clip on the SAME sourceTrack at/past the
+            //       active entry's timelineEnd (sequential play within track).
+            //   (2) If none, rotate primary to the OTHER sourceTrack overlay
+            //       that is still alive at the current timeline position with
+            //       the largest remaining duration. This keeps PiP playback
+            //       going when the V1 primary clip is shorter than overlays
+            //       (V2/V3/V4) — without this, V1 ending stopped everything.
+            const int activeTrack = active.sourceTrack;
+            const double nextTlSec = active.timelineEnd;
+            int nextIdx = -1;
+            for (int i = 0; i < m_sequence.size(); ++i) {
+                if (i == m_activeEntry) continue;
+                if (m_sequence[i].sourceTrack != activeTrack) continue;
+                if (m_sequence[i].timelineStart >= nextTlSec - 1e-6) {
+                    nextIdx = i;
+                    break;
+                }
+            }
+            if (nextIdx < 0) {
+                const double tlSec = m_timelinePositionUs
+                                   / static_cast<double>(AV_TIME_BASE);
+                // Prefer proxy over raw when rotating primary: raw 1080p+
+                // sources block the main decoder thread and cause every
+                // overlay's compose tick to stutter (user-reported "V4
+                // 再生されて V2 がカクつく"). Picking a proxy primary keeps
+                // the legacy decoder light. Among same-class candidates,
+                // pick the longest-remaining timelineEnd.
+                // Proxy detection uses ProxyManager::proxyDir() so custom
+                // storage (`D:/proxies/...`) is honored — substring match
+                // on `/.veditor/proxies/` would silently false-negative
+                // there and degrade to longest-remaining-only (regressing
+                // V4 raw → primary). Both forward and back slash variants
+                // are checked to defend against QDir::toNativeSeparators
+                // ever leaking native paths into m_sequence.
+                const QString proxyRoot = ProxyManager::proxyDir();
+                const auto isProxyPath = [&proxyRoot](const QString &p) {
+                    return p.startsWith(proxyRoot + QChar('/'))
+                        || p.startsWith(proxyRoot + QChar('\\'));
+                };
+                double bestEnd = active.timelineEnd;
+                bool bestIsProxy = false;
+                bool bestSet = false;
+                for (int i = 0; i < m_sequence.size(); ++i) {
+                    if (i == m_activeEntry) continue;
+                    const auto &e = m_sequence[i];
+                    // Fix L (c): boundary inclusive on the upper bound. The
+                    // earlier `e.timelineEnd > tlSec + 1e-6` check disqualified
+                    // entries whose timelineEnd exactly equaled tlSec (= the
+                    // active entry's timelineEnd at reachedEntryEnd time),
+                    // which excluded the legitimate next-clip whose own
+                    // timelineStart equals tlSec. Loosening to `>=` keeps the
+                    // same lower-bound semantics while covering the boundary
+                    // case the empirical 110238 log exposed (entry 1 テスト
+                    // [0,7540] vs tlSec=7540 → entry 3 参加型 [7540,14372]).
+                    if (!(e.timelineStart <= tlSec + 1e-6
+                          && e.timelineEnd >= tlSec + 1e-6))
+                        continue;
+                    const bool isProxy = isProxyPath(e.filePath);
+                    bool prefer = false;
+                    if (!bestSet) {
+                        prefer = true;
+                    } else if (isProxy && !bestIsProxy) {
+                        prefer = true;            // proxy class always wins
+                    } else if (isProxy == bestIsProxy
+                               && e.timelineEnd > bestEnd) {
+                        prefer = true;            // tie → longer remaining
+                    }
+                    if (prefer) {
+                        nextIdx = i;
+                        bestEnd = e.timelineEnd;
+                        bestIsProxy = isProxy;
+                        bestSet = true;
+                    }
+                }
+            }
+            // self-rotation guard: refuse to re-load the same active entry,
+            // which would otherwise re-trigger AudioMixer::seekTo + sink
+            // stop/start every tick during the new primary's cold-open
+            // window and produce audible clicks.
+            if (nextIdx == m_activeEntry)
+                nextIdx = -1;
+            if (nextIdx >= 0 && nextIdx < m_sequence.size()) {
+                const auto &nextE = m_sequence[nextIdx];
+                const bool isOverlayRotation =
+                    (nextE.sourceTrack != active.sourceTrack);
                 QElapsedTimer advTimer;
                 if (stallTraceEnabled())
                     advTimer.start();
-                const bool advanced = advanceToEntry(nextIdx);
+                // Overlay rotation: keep the current timeline position and
+                // let seekToTimelineUs pick the new primary — findActiveEntryAt
+                // skips the just-ended active entry and picks the next alive
+                // overlay. Sequential same-track advance goes through
+                // advanceToEntry which seeks to the next clip's clipIn.
+                const bool advanced = isOverlayRotation
+                    ? seekToTimelineUs(m_timelinePositionUs, /*precise=*/true)
+                    : advanceToEntry(nextIdx);
                 if (stallTraceEnabled() && advTimer.isValid()) {
                     const qint64 elapsedMs = advTimer.elapsed();
                     if (elapsedMs >= kStallThresholdWaitMs) {
                         qWarning().noquote()
-                            << QStringLiteral("[stall>=%1ms] advanceToEntry %2ms next=%3")
+                            << QStringLiteral("[stall>=%1ms] advance(%2) %3ms next=%4")
                                    .arg(kStallThresholdWaitMs)
+                                   .arg(isOverlayRotation ? "rotate" : "seq")
                                    .arg(elapsedMs)
                                    .arg(nextIdx);
                     }
@@ -2770,6 +3306,60 @@ void VideoPlayer::handlePlaybackTick()
     Q_ASSERT(!v2PrefetchFuture.isStarted() || v2PrefetchFuture.isFinished());
 
     if (!advanced) {
+        // Iteration 11 — walking playhead. User-stated invariant
+        // 「ユーザーが止めない限りシークバー及びヘッドが進み続ける」: only
+        // explicit user pause should stop forward motion. In sequence
+        // mode the decoder can transiently fail to deliver a frame
+        // (cold-open after hot-swap miss, slot-manager eviction race,
+        // proxy retry, etc.); the previous auto-pause here turned every
+        // such transient stall into a hard stop. Walking the playhead by
+        // one frame interval keeps the seekbar visually advancing while
+        // the decoder catches up — the next tick either decodes
+        // successfully (presentDecodedFrame overwrites m_timelinePositionUs
+        // with the actual decoded PTS) or walks again. Single-file (legacy)
+        // mode keeps the original auto-pause because a decode failure
+        // there is a real end-of-file event, not a transient.
+        static const bool kWalkingPlayheadDisabled =
+            qEnvironmentVariableIntValue("VEDITOR_WALKING_PLAYHEAD_DISABLE") != 0;
+        // NIT-1 (architect): forward-only. Reverse playback's transient
+        // stall would otherwise snap the playhead toward 0 instead of
+        // continuing backward. Reverse falls through to the legacy pause
+        // (rare path).
+        if (!kWalkingPlayheadDisabled && sequenceActive() && m_playbackSpeed >= 0.0) {
+            const double speed = m_playbackSpeed;
+            const int64_t frameStep = m_frameDurationUs > 0
+                ? m_frameDurationUs : (AV_TIME_BASE / 30);
+            const int64_t deltaUs = static_cast<int64_t>(
+                static_cast<double>(frameStep) * speed);
+            const int64_t maxUs = m_sequenceDurationUs > 0
+                ? m_sequenceDurationUs : (m_timelinePositionUs + deltaUs);
+            // NIT-2 (architect, CRITICAL): updatePositionUi recomputes
+            // m_timelinePositionUs = fileLocalToTimelineUs(m_activeEntry,
+            // m_currentPositionUs), so a timeline-only walk is silently
+            // overwritten and the seekbar never advances. Walk
+            // m_currentPositionUs by the same delta — overshoot past the
+            // active entry's clipOut is fine: the next tick's
+            // reachedEntryEnd path will retry advanceToEntry (which may
+            // hot-swap successfully now that more time has passed).
+            // presentDecodedFrame overwrites m_currentPositionUs with the
+            // real PTS once the decoder catches up, healing any drift.
+            m_timelinePositionUs = qBound<int64_t>(
+                0, m_timelinePositionUs + deltaUs, maxUs);
+            m_currentPositionUs = m_currentPositionUs + deltaUs;
+            updatePositionUi();
+            // Throttled diagnostic — a sustained stall would otherwise
+            // flood the log at 60 Hz.
+            static QElapsedTimer walkLogThrottle;
+            if (!walkLogThrottle.isValid() || walkLogThrottle.elapsed() >= 1000) {
+                qInfo() << "VideoPlayer: walking playhead (decoder behind) tlPos="
+                        << m_timelinePositionUs << "deltaUs=" << deltaUs;
+                walkLogThrottle.start();
+            }
+            if (traceTick) recordTickTrace(tickTimer.nsecsElapsed());
+            reportStallIfSlow();
+            scheduleNextFrame();
+            return;
+        }
         if (m_playbackSpeed >= 0.0 && m_durationUs > 0) {
             m_currentPositionUs = m_durationUs;
             updatePositionUi();

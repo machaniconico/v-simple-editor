@@ -478,6 +478,118 @@ void AudioMixer::setSequence(const QVector<PlaybackEntry> &entries) {
 void AudioMixer::seekTo(int64_t timelineUs) {
     qInfo() << "AudioMixer::seekTo us=" << timelineUs
             << "playing=" << m_playing.load(std::memory_order_acquire);
+    // De-dup: if we're already at exactly this timeline position with
+    // the sink in ActiveState, skip the stop/start cycle. Each
+    // QAudioSink restart dispatches synchronously on the main thread
+    // (~10–20 ms) and audibly clicks. Win #6 overlay rotation +
+    // sequenceChanged storm previously produced 256 seek calls in a
+    // 30 s session, the primary source of the "V2 のところでノイズ"
+    // user report. Skip only when state matches — paused/idle or a
+    // pending sink rebuild still needs the full path.
+    {
+        const int64_t cur = m_writeCursorUs.load(std::memory_order_acquire);
+        const auto sinkState = m_sink ? m_sink->state() : QAudio::IdleState;
+        if (cur == timelineUs
+            && sinkState == QAudio::ActiveState
+            && m_playing.load(std::memory_order_acquire)) {
+            // m_audibleLagUs and per-entry seekPending stay valid here:
+            // the cursor never moved and the sink kept producing samples,
+            // so the prior seek's bookkeeping remains accurate.
+            return;
+        }
+        // Iteration 13 — tolerance-based dedup for clip boundary advance.
+        // User report 「たまに音声にノイズが入る」: at every clip boundary
+        // VideoPlayer::advanceToEntry calls m_mixer->seekTo(next.timelineStart *
+        // AV_TIME_BASE), but AudioMixer's master clock has typically already
+        // crossed the boundary by a few ms via natural playback. The strict
+        // equality dedup above misses (cur ≠ timelineUs by µs–ms), the 50 ms
+        // Fix K dedup also misses (the last seekTo was on the previous
+        // boundary, far outside the 50 ms window), so the full path runs:
+        // sinkSnap->reset() drops OS-buffered samples + sinkSnap->start()
+        // restarts the audio backend → 5–15 ms gap + transient pop = the
+        // boundary click the user is hearing.
+        // When the cursor and target are within kTolerantDedupUs (100 ms)
+        // and the sink is already producing the right audio (Active +
+        // playing), skip the sink restart — the audio is correct, only the
+        // bookkeeping cursor needs the small bump. Trade-off: up to ~100 ms
+        // of AV-sync drift between video PTS and audio output, bounded to
+        // one OS-buffer period (~170 ms at 48 kHz/8 KB) and self-corrected
+        // via correctVideoDriftAgainstAudioClock; imperceptible vs. the
+        // audible click. Per-entry rings stay intact because the active
+        // entry is already streaming.
+        // Opt-out: VEDITOR_SEEK_TOLERANT_DEDUP_DISABLE=1.
+        static const bool kTolerantDedupDisabled =
+            qEnvironmentVariableIntValue("VEDITOR_SEEK_TOLERANT_DEDUP_DISABLE") != 0;
+        static constexpr int64_t kTolerantDedupUs = 100'000;
+        const int64_t deltaUs = cur >= timelineUs ? (cur - timelineUs)
+                                                  : (timelineUs - cur);
+        if (!kTolerantDedupDisabled
+            && deltaUs < kTolerantDedupUs
+            && sinkState == QAudio::ActiveState
+            && m_playing.load(std::memory_order_acquire)) {
+            QMutexLocker lock(&m_controlMutex);
+            m_writeCursorUs.store(timelineUs, std::memory_order_release);
+            // NIT-2 (architect): restart the Fix K scrub-dedup timer here
+            // too. Otherwise rapid back-to-back tolerance hits (e.g.,
+            // multi-clip timeline boundaries arriving < 50 ms apart) would
+            // let the next call slip into Fix K's full ring.clear() path,
+            // wiping the rings the tolerance path was meant to preserve.
+            m_lastSeekToCallTimer.restart();
+            // 1 Hz throttle keeps boundary-rate logging out of the file.
+            static QElapsedTimer tolerantLogThrottle;
+            if (!tolerantLogThrottle.isValid()
+                || tolerantLogThrottle.elapsed() >= 1000) {
+                qInfo() << "AudioMixer::seekTo tolerant dedup hit cur=" << cur
+                        << "target=" << timelineUs << "delta=" << deltaUs;
+                tolerantLogThrottle.start();
+            }
+            return;
+        }
+        // Phase 1e Win #13 — Fix K: time-based scrub dedup. When the user
+        // drags the timeline slider or a post-loadFile settling burst fires
+        // sequenceChanged at ~35 ms cadence, each seekTo arrives with a
+        // *different* timelineUs and slips past the equality dedup above —
+        // but the actual cost is the synchronous sinkSnap->reset() +
+        // sinkSnap->start() pair below, which monopolises the GUI thread
+        // for ~15 ms per call. Empirical log
+        // veditor_20260501_103732.log @ 10:39:39.673-983 logged 8 such
+        // calls in 310 ms = ~120 ms cumulative main-thread block, which
+        // slipped scheduleNextFrame into the !advanced auto-pause path
+        // (VideoPlayer.cpp:2911-2923) and re-armed the play() cascade
+        // outside Fix J's 200 ms window. Inside a 50 ms window we still
+        // update the cursor and invalidate the per-entry rings (so the
+        // next readData() reads from the new position) but skip the sink
+        // restart entirely. The next seekTo outside the window — or the
+        // user releasing the slider — will run the full path with the
+        // final position. Cursor lag stays bounded to one window.
+        static const bool kScrubDedupDisabled =
+            qEnvironmentVariableIntValue("VEDITOR_SEEK_SCRUB_DEDUP_DISABLE") != 0;
+        if (!kScrubDedupDisabled
+            && sinkState == QAudio::ActiveState
+            && m_playing.load(std::memory_order_acquire)
+            && m_lastSeekToCallTimer.isValid()
+            && m_lastSeekToCallTimer.elapsed() < 50) {
+            QMutexLocker lock(&m_controlMutex);
+            m_writeCursorUs.store(timelineUs, std::memory_order_release);
+            m_audibleLagUs.store(0, std::memory_order_release);
+            m_consecutiveStallCallbacks.store(0, std::memory_order_release);
+            for (auto *e : qAsConst(m_entries)) {
+                if (!e) continue;
+                e->seekPending = true;
+                e->ring.clear();
+                e->ringHead = 0;
+                e->ringStartTlUs = timelineUs;
+                e->eof = false;
+            }
+            // Wake the decode runner so the next readData() pulls from the
+            // updated cursor without an audible click. The sink stays in
+            // ActiveState; the worker thread will refill from the new
+            // position transparently.
+            if (m_decodeRunner) m_decodeRunner->wake();
+            return;
+        }
+    }
+    m_lastSeekToCallTimer.restart();
     // Hoist QAudioSink state changes outside the lock — start/reset can
     // synchronously dispatch into MixerIODevice::readData on the audio
     // worker thread, which would deadlock if it tries to take this same

@@ -8,6 +8,7 @@
 #include <QIODevice>
 #include <QAudioSink>
 #include <QAudioFormat>
+#include <QElapsedTimer>
 #include <atomic>
 
 #include "PlaybackTypes.h"
@@ -137,6 +138,21 @@ private:
 
     mutable QMutex m_controlMutex;
     std::atomic<int64_t> m_writeCursorUs{0};
+    // Phase 1e Win #13 — Fix K: time-based scrub dedup for seekTo. The
+    // existing us-equality + Active + playing early-return (Fix C/F) only
+    // skips identical re-seeks. During slider scrub or post-loadFile
+    // settling the timeline position changes monotonically every 35-40 ms,
+    // so each call wins the dedup but still pays a synchronous QAudioSink
+    // stop/start cycle (~15 ms on the main thread). Empirical log
+    // veditor_20260501_103732.log @ 10:39:39.673-983 captured 8 such calls
+    // in 310 ms, monopolising the GUI thread for ~120 ms and slipping
+    // scheduleNextFrame into !advanced auto-pause. The cascade then
+    // multiplied via Fix J's 200 ms window (which only catches play()
+    // bursts, not seek bursts). Within a 50 ms window we update the cursor,
+    // reset the per-entry ring, and wake the decode runner — but skip the
+    // sink stop/start. The next seekTo outside the window will run the
+    // full path; cursor never lags more than one window.
+    QElapsedTimer m_lastSeekToCallTimer;
     // OS-buffered samples in microseconds, published by MixerIODevice::readData
     // so audibleClockUs() is lock-free. Reading m_sink->bytesFree() from the
     // GUI thread under m_controlMutex caused starvation of the audio worker

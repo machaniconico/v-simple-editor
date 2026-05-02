@@ -256,6 +256,18 @@ private:
     int64_t fileLocalToTimelineUs(int entryIdx, int64_t fileLocalUs) const;
     bool seekToTimelineUs(int64_t timelineUs, bool precise);
     bool advanceToEntry(int newEntryIdx);
+    // Phase 1e Win #16 (Iteration 9) — Premiere Pro-style decoder hot-swap.
+    // When `m_sequence[newEntryIdx]` already has a warm TrackDecoder in
+    // m_trackDecoders (typically prerolled by handlePlaybackTick before the
+    // boundary), move its formatCtx/codecCtx/frame/swFrame/packet straight
+    // into the legacy V1 primary slots and demote the old primary into the
+    // eviction grace pool. Result: no avformat_open_input / find_stream_info
+    // / avcodec_open2 on the main thread → boundary cross becomes a sub-ms
+    // pointer swap instead of the previous 60-200 ms loadFile stall.
+    // Returns true on a successful swap (caller must skip its loadFile),
+    // false when no warm pool decoder is available (caller falls back to
+    // legacy loadFile). Opt-out via VEDITOR_HOTSWAP_DISABLE=1.
+    bool tryPromotePoolDecoderTo(int newEntryIdx);
     void applySequenceSliderRange();
     int sliderTimelinePosition(int64_t timelineUs) const;
     // A/V drift correction: pace video against the AudioMixer master clock
@@ -398,6 +410,34 @@ private:
     double m_displayAspectRatio = 0.0;
     bool m_loggedCullState = false;
     QElapsedTimer m_tickWallStart;
+    // Phase 1e Win #12 — Fix J: per-call play() debounce. scheduleNextFrame's
+    // !advanced safety-net (VideoPlayer.cpp:2911-2923) calls pause() +
+    // m_mixer->stop() the moment a tick can't decode/advance, which can fire
+    // on the very first tick after play() during a cold-open. The UI sees
+    // m_playing flip false→true→false and the user's single click can land
+    // a re-play() callback while AudioMixer is still mid-stop/start. Empirical
+    // log veditor_20260501_091710.log @ 09:20:18-19 captured 4 such play()
+    // entries within 934 ms, each producing a sink Stopped→Active→Suspended→
+    // Stopped cycle on the main thread (≈10 ms each), accumulating a 10.7 s
+    // paintGL gap (#5600→#5700 at 09:20:14→09:20:24). Collapsing close-spaced
+    // play() calls to one within a 200 ms window stops the cascade without
+    // affecting deliberate user pause→play sequences (≥250 ms reaction).
+    // Opt-out via VEDITOR_PLAY_DEBOUNCE_DISABLE=1 for empirical comparisons.
+    QElapsedTimer m_lastPlayCallTimer;
+    // Phase 1e Win #15 — Fix M: last-frame retention across same-tick clip
+    // switches. advanceToEntry's loadFile call funnels into resetDecoder,
+    // which historically nuked m_lastV1RawFrame and m_currentFrameImage
+    // (VideoPlayer.cpp:1600 / :1643). The 60-145 ms window between the
+    // clear and the next clip's first decoded frame paints a black/empty
+    // GLPreview — visible as a flash at every entry boundary. When this
+    // flag is set across a planned advanceToEntry/seekToTimelineUs hand-
+    // off, resetDecoder skips those two clears so the previous clip's
+    // last frame stays on screen until the new file's first frame
+    // displaces it. Industry-standard cut behaviour (Premiere/DaVinci);
+    // also gives the pending transition pipeline a frame to fade out
+    // from instead of black. Opt-out via
+    // VEDITOR_LAST_FRAME_RETENTION_DISABLE=1.
+    bool m_retainLastFrameAcrossLoad = false;
     int m_canvasWidth = 1920;
     int m_canvasHeight = 1080;
     double m_playbackSpeed = 1.0;
@@ -434,6 +474,14 @@ private:
     // resolved timeline position when sequence mode is active.
     QVector<PlaybackEntry> m_sequence;
     int m_activeEntry = -1;
+    // Phase 1e Win #16 (Iteration 9) — boundary preroll de-dup. Set to the
+    // sequence index of the entry we last asked acquireDecoderForClip to
+    // warm up; cleared whenever m_activeEntry advances so the next entry's
+    // preroll fires fresh. Without this, every playback tick within the
+    // 1000 ms preroll window would re-call acquireDecoderForClip, which
+    // re-hashes + slot-manager-refreshes 60 times a second and pollutes
+    // the [pool] log. Opt-out via VEDITOR_BOUNDARY_PREROLL_DISABLE=1.
+    int m_prerolledEntryIdx = -1;
     // Tracks the empty -> non-empty transition so setAudioSequence only
     // seeks the AudioMixer the first time a schedule arrives. The full
     // entry list is owned by the mixer; mirroring it here would just be

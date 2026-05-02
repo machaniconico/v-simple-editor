@@ -837,6 +837,48 @@ void MainWindow::setupMenuBar()
         statusBar()->showMessage("取り込み先を V1/A1 追加に設定");
     });
 
+    // 自動プロキシ生成: 重い素材 (AV1 / QHD+) 取り込み時の挙動 3 択
+    auto *autoProxyGroup = new QActionGroup(this);
+    autoProxyGroup->setExclusive(true);
+    auto *autoProxyDisabledAction = new QAction("自動プロキシ生成: しない", this);
+    autoProxyDisabledAction->setCheckable(true);
+    autoProxyDisabledAction->setActionGroup(autoProxyGroup);
+    auto *autoProxyMultiAction = new QAction("自動プロキシ生成: V2 以降のみ", this);
+    autoProxyMultiAction->setCheckable(true);
+    autoProxyMultiAction->setActionGroup(autoProxyGroup);
+    auto *autoProxyAlwaysAction = new QAction("自動プロキシ生成: 常時", this);
+    autoProxyAlwaysAction->setCheckable(true);
+    autoProxyAlwaysAction->setActionGroup(autoProxyGroup);
+    {
+        QSettings prefSettings("VSimpleEditor", "Preferences");
+        const int saved = prefSettings.value("autoProxyMode",
+                                              static_cast<int>(AutoProxyMode::MultiTrackOnly)).toInt();
+        if (saved == static_cast<int>(AutoProxyMode::Disabled))
+            autoProxyDisabledAction->setChecked(true);
+        else if (saved == static_cast<int>(AutoProxyMode::Always))
+            autoProxyAlwaysAction->setChecked(true);
+        else
+            autoProxyMultiAction->setChecked(true);
+    }
+    connect(autoProxyDisabledAction, &QAction::toggled, this, [this](bool checked) {
+        if (!checked) return;
+        QSettings("VSimpleEditor", "Preferences").setValue("autoProxyMode",
+            static_cast<int>(AutoProxyMode::Disabled));
+        statusBar()->showMessage("自動プロキシ生成を無効化");
+    });
+    connect(autoProxyMultiAction, &QAction::toggled, this, [this](bool checked) {
+        if (!checked) return;
+        QSettings("VSimpleEditor", "Preferences").setValue("autoProxyMode",
+            static_cast<int>(AutoProxyMode::MultiTrackOnly));
+        statusBar()->showMessage("自動プロキシ生成: V2 以降のみ");
+    });
+    connect(autoProxyAlwaysAction, &QAction::toggled, this, [this](bool checked) {
+        if (!checked) return;
+        QSettings("VSimpleEditor", "Preferences").setValue("autoProxyMode",
+            static_cast<int>(AutoProxyMode::Always));
+        statusBar()->showMessage("自動プロキシ生成: 常時");
+    });
+
     // 自動保存（バックアップ）トグル — デフォルトOFF、30分周期
     auto *autoSaveAction = new QAction("自動保存を有効化 (30分ごと)", this);
     autoSaveAction->setCheckable(true);
@@ -870,6 +912,10 @@ void MainWindow::setupMenuBar()
     prefsMenu->addAction(importParallelAction);
     prefsMenu->addAction(importAppendAction);
     prefsMenu->addSeparator();
+    prefsMenu->addAction(autoProxyDisabledAction);
+    prefsMenu->addAction(autoProxyMultiAction);
+    prefsMenu->addAction(autoProxyAlwaysAction);
+    prefsMenu->addSeparator();
 
     auto *gpuEffectsAction = new QAction("GPUエフェクトを使用", this);
     gpuEffectsAction->setCheckable(true);
@@ -885,6 +931,26 @@ void MainWindow::setupMenuBar()
             m_player->setPreviewEffects({}, /*live=*/true);
     });
     prefsMenu->addAction(gpuEffectsAction);
+    prefsMenu->addSeparator();
+
+    // Iteration 12: toggle for auto-play on first clip drop. Default OFF
+    // per user request — the auto-play side effect of Iteration 10
+    // setSequence empty -> non-empty handler is now opt-in. VideoPlayer
+    // reads QSettings("VSimpleEditor", "Preferences")/autoPlayOnFirstSequence
+    // every setSequence call so the toggle takes effect immediately
+    // without a restart.
+    auto *autoPlayAction = new QAction("クリップ追加で自動再生", this);
+    autoPlayAction->setCheckable(true);
+    {
+        QSettings autoPlaySettings("VSimpleEditor", "Preferences");
+        autoPlayAction->setChecked(
+            autoPlaySettings.value("autoPlayOnFirstSequence", false).toBool());
+    }
+    connect(autoPlayAction, &QAction::toggled, this, [](bool on) {
+        QSettings("VSimpleEditor", "Preferences")
+            .setValue("autoPlayOnFirstSequence", on);
+    });
+    prefsMenu->addAction(autoPlayAction);
     prefsMenu->addSeparator();
 
     // US-T39 Snap strength submenu — pulls/flushes the video source onto

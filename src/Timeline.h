@@ -24,6 +24,16 @@ enum class ImportPlacement {
     AppendToFirstTrack = 1  // Append to the end of V1/A1 as a continuous sequence
 };
 
+// Persisted via QSettings('VSimpleEditor','Preferences')/autoProxyMode.
+// Decides whether Timeline::addClip auto-enqueues proxy generation for
+// heavy sources (AV1 or QHD+). VEDITOR_AUTO_PROXY_DISABLE=1 still acts as
+// a global kill switch regardless of the value chosen here.
+enum class AutoProxyMode {
+    Disabled = 0,         // Never auto-generate; user runs ツール → プロキシ管理 manually
+    MultiTrackOnly = 1,   // Default: only when the clip lands on V2 or later
+    Always = 2            // Generate on every heavy import regardless of track
+};
+
 class UndoManager;
 class PlayheadOverlay;
 class TextStripWidget;
@@ -32,6 +42,7 @@ class QDragEnterEvent;
 class QDragMoveEvent;
 class QDragLeaveEvent;
 class QDropEvent;
+class QTimer;
 
 struct ClipInfo {
     QString filePath;
@@ -374,6 +385,15 @@ private:
     void clearAllSelections();
     void captureZoomAnchor();
     void clearZoomAnchor();
+    // Coalesces sequenceChanged + audioSequenceChanged emissions across
+    // rapid mutations (drag-scrub, batch import, linked-drag stream). Each
+    // call restarts a 50 ms single-shot timer; on timeout both signals fire
+    // once with the latest computed sequences. Without this, every mouse-
+    // move during a clip drag emitted sequenceChanged synchronously, and
+    // the downstream AudioMixer::seekTo + QAudioSink stop/restart per
+    // emission accumulated multi-second main-thread blocking.
+    void scheduleEmitSequenceChanged();
+    void emitSequenceChangedNow();
 
     QVector<TimelineTrack*> m_videoTracks;
     QVector<TimelineTrack*> m_audioTracks;
@@ -425,6 +445,10 @@ private:
         double origLeadInNext = -1.0; // -1 = no next clip
     };
     QVector<LinkedDragPartner> m_linkedDragPartners;
+
+    // Single-shot debouncer for sequenceChanged + audioSequenceChanged.
+    // Owned by Qt object tree; created in the ctor.
+    QTimer *m_emitSequenceTimer = nullptr;
 
     int allocateLinkGroup() { return m_nextLinkGroup++; }
     void onTrackSelectionChanged(int primaryIndex, bool additive);

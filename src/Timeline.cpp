@@ -1257,8 +1257,31 @@ void TimelineTrack::dropEvent(QDropEvent *event)
 Timeline::Timeline(QWidget *parent) : QWidget(parent)
 {
     m_undoManager = new UndoManager(this);
+    // Coalesce sequenceChanged storm: drag/scrub events used to emit on
+    // every mouse-move (~30 Hz), each driving AudioMixer::seekTo +
+    // QAudioSink stop/restart synchronously on the main thread. The 50 ms
+    // single-shot timer collapses bursts to one emission per quiescent
+    // window without delaying user-visible feedback (≤ 1 frame at 20 fps).
+    m_emitSequenceTimer = new QTimer(this);
+    m_emitSequenceTimer->setSingleShot(true);
+    m_emitSequenceTimer->setInterval(50);
+    connect(m_emitSequenceTimer, &QTimer::timeout, this, &Timeline::emitSequenceChangedNow);
     setupUI();
     saveUndoState("Initial state");
+}
+
+void Timeline::scheduleEmitSequenceChanged()
+{
+    if (m_emitSequenceTimer)
+        m_emitSequenceTimer->start();
+}
+
+void Timeline::emitSequenceChangedNow()
+{
+    // Direct emit — never call scheduleEmitSequenceChanged() here, that
+    // would restart the debounce timer and recurse.
+    emit sequenceChanged(computePlaybackSequence());
+    emit audioSequenceChanged(computeAudioPlaybackSequence());
 }
 
 void Timeline::setupUI()
@@ -1562,8 +1585,8 @@ QWidget *Timeline::createTrackHeader(TimelineTrack *track, const QString &name, 
                     : QString::fromUtf8("\xF0\x9F\x94\x8A")); // 🔊
             }
             // Re-emit sequences so VideoPlayer picks up the audioMuted flag.
-            emit sequenceChanged(computePlaybackSequence());
-            emit audioSequenceChanged(computeAudioPlaybackSequence());
+            scheduleEmitSequenceChanged();
+            scheduleEmitSequenceChanged();
         });
     }
     if (hideBtn) {
@@ -1576,8 +1599,8 @@ QWidget *Timeline::createTrackHeader(TimelineTrack *track, const QString &name, 
                     ? QString::fromUtf8("\xE2\x8A\x98")    // ⊘
                     : QString::fromUtf8("\xE2\x97\x89")); // ◉
             }
-            emit sequenceChanged(computePlaybackSequence());
-            emit audioSequenceChanged(computeAudioPlaybackSequence());
+            scheduleEmitSequenceChanged();
+            scheduleEmitSequenceChanged();
         });
     }
 
@@ -1661,34 +1684,24 @@ void Timeline::addClip(const QString &filePath)
             const int h = st->codecpar->height;
             const bool isAv1  = st->codecpar->codec_id == AV_CODEC_ID_AV1;
             const bool isQhdPlus = (w >= 2560) || (h >= 1440);
-            if (isAv1 || isQhdPlus)
+            // h.264 1080p+ も対象 (cinemascope や ultra-wide 含めるため OR)。
+            // 1920×800 シネスコや 3840×800 ultra-wide も raw decode 負荷は
+            // 1080p に匹敵するので bandwidth 観点で OR の方が semantic に近い。
+            // single-track 編集なら直接 decode で問題ないが、PiP 4 並列の中に
+            // 1080p raw が混ざると compose に追いつかなくなり smooth な PiP
+            // source (proxy 360p) と並べたとき差が出る。MultiTrackOnly mode の
+            // videoTrackIdx >= 1 gate (下記 switch) が V1 単体編集を保護する
+            // ので過剰 encode は起きない。
+            const bool isHdPlus = (w >= 1920) || (h >= 1080);
+            if (isAv1 || isQhdPlus || isHdPlus)
                 wantsAutoProxy = true;
             break;
         }
         avformat_close_input(&fmt);
     }
-    if (wantsAutoProxy) {
-        static const bool autoProxyDisabled =
-            qEnvironmentVariableIntValue("VEDITOR_AUTO_PROXY_DISABLE") != 0;
-        if (!autoProxyDisabled) {
-            ProxyManager &pm = ProxyManager::instance();
-            // Intentionally do NOT gate on pm.isProxyMode() here:
-            // proxy mode controls whether *playback* substitutes the
-            // proxy path, but generating a proxy for a heavy source on
-            // import is cheap (idempotent, background QProcess) and
-            // pays off the moment the user toggles proxy mode on. The
-            // observed stall pattern is users with proxy mode off and
-            // no proxy registered — gating on proxy mode would leave
-            // those users stuck at the AV1 1440p direct-decode path.
-            // VEDITOR_AUTO_PROXY_DISABLE=1 fully suppresses the encode
-            // cost for users who never want a proxy.
-            if (pm.config().enabled && !pm.hasProxy(filePath)) {
-                qDebug() << "[auto-proxy] queuing proxy for heavy source"
-                         << "file=" << filePath;
-                pm.generateProxy(filePath);
-            }
-        }
-    }
+    // NOTE: auto-proxy trigger moved past the track-index decision below
+    // (search for "autoProxyMode" in this function). wantsAutoProxy is
+    // the probe verdict consumed there.
     ClipInfo clip;
     clip.filePath = filePath;
     clip.displayName = QFileInfo(filePath).fileName();
@@ -1746,6 +1759,44 @@ void Timeline::addClip(const QString &filePath)
     qInfo() << "Timeline::addClip routing video→V" << (videoTrackIdx + 1)
             << "audio→A" << (audioTrackIdx + 1)
             << "file=" << filePath;
+
+    // Auto-proxy dispatch — runs after the track index is settled so that
+    // MultiTrackOnly mode can gate on V2-or-later. wantsAutoProxy was
+    // probed up at the top of this function (AV1 OR ≥2560×1440).
+    if (wantsAutoProxy) {
+        static const bool autoProxyDisabled =
+            qEnvironmentVariableIntValue("VEDITOR_AUTO_PROXY_DISABLE") != 0;
+        if (!autoProxyDisabled) {
+            const auto mode = static_cast<AutoProxyMode>(
+                prefs.value("autoProxyMode",
+                            static_cast<int>(AutoProxyMode::MultiTrackOnly)).toInt());
+            bool shouldTrigger = false;
+            switch (mode) {
+                case AutoProxyMode::Disabled:
+                    break;
+                case AutoProxyMode::MultiTrackOnly:
+                    shouldTrigger = (videoTrackIdx >= 1);
+                    break;
+                case AutoProxyMode::Always:
+                    shouldTrigger = true;
+                    break;
+            }
+            if (shouldTrigger) {
+                ProxyManager &pm = ProxyManager::instance();
+                // Intentionally do NOT gate on pm.isProxyMode() here: proxy
+                // mode controls *playback* substitution, but generating on
+                // import is cheap (idempotent, background QProcess) and
+                // pays off the moment the user toggles proxy mode on.
+                if (pm.config().enabled && !pm.hasProxy(filePath)) {
+                    qDebug() << "[auto-proxy] queuing proxy for heavy source"
+                             << "file=" << filePath
+                             << "mode=" << static_cast<int>(mode)
+                             << "videoTrackIdx=" << videoTrackIdx;
+                    pm.generateProxy(filePath);
+                }
+            }
+        }
+    }
 
     // Generate waveform async; apply to the AUDIO track that received the clip.
     auto *wfGen = new WaveformGenerator(this);
@@ -1930,7 +1981,7 @@ bool Timeline::setClipVideoTransform(int trackIdx, int clipIdx,
     clips[clipIdx].videoDx = qBound(-5.0, dx, 5.0);
     clips[clipIdx].videoDy = qBound(-5.0, dy, 5.0);
     track->setClips(clips);
-    emit sequenceChanged(computePlaybackSequence());
+    scheduleEmitSequenceChanged();
     return true;
 }
 
@@ -2120,8 +2171,8 @@ void Timeline::relinkClipAt(TimelineTrack *track, int clipIndex)
     stamp(hit.track, hit.idx);
 
     saveUndoState("Relink clip");
-    emit sequenceChanged(computePlaybackSequence());
-    emit audioSequenceChanged(computeAudioPlaybackSequence());
+    scheduleEmitSequenceChanged();
+    scheduleEmitSequenceChanged();
     updateInfoLabel();
 }
 
@@ -2295,7 +2346,7 @@ void Timeline::setClipVolume(double volume)
     saveUndoState(QString("Set volume %1%").arg(static_cast<int>(volume * 100)));
     // Re-emit so AudioMixer picks up the new per-clip volume for the
     // matching PlaybackEntry on its next setSequence call.
-    emit audioSequenceChanged(computeAudioPlaybackSequence());
+    scheduleEmitSequenceChanged();
 }
 
 // --- Phase 3: Color correction, effects, keyframes ---
@@ -2390,7 +2441,7 @@ void Timeline::toggleMuteTrack(int audioTrackIndex)
     // Re-emit so AudioMixer picks up the new audioMuted flag for every
     // entry on this track. Without this the mute toggle stayed silent
     // until the next clip edit triggered a sequence rebuild.
-    emit audioSequenceChanged(computeAudioPlaybackSequence());
+    scheduleEmitSequenceChanged();
     updateInfoLabel();
 }
 
@@ -2686,8 +2737,8 @@ void Timeline::onTrackModified()
     // long-form sequences hit the kMaxWidth hard cap and tail clips get
     // visually clipped). Then recompute the flat playback schedule.
     ensureSequenceFitsViewport();
-    emit sequenceChanged(computePlaybackSequence());
-    emit audioSequenceChanged(computeAudioPlaybackSequence());
+    scheduleEmitSequenceChanged();
+    scheduleEmitSequenceChanged();
 }
 
 void Timeline::setTrackHeight(int h)
@@ -2922,8 +2973,8 @@ void Timeline::refreshPlaybackSequence()
     // the same sequences we'd produce for any other rebuild trigger and let
     // MainWindow's getProxyPath translation in the sequenceChanged handler
     // pick up the now-Ready proxies.
-    emit sequenceChanged(computePlaybackSequence());
-    emit audioSequenceChanged(computeAudioPlaybackSequence());
+    scheduleEmitSequenceChanged();
+    scheduleEmitSequenceChanged();
 }
 
 void Timeline::saveUndoState(const QString &description)
@@ -2965,8 +3016,8 @@ void Timeline::restoreState(const TimelineState &state)
                              state.selectedClip);
     // setClips bypasses the modified() signal path; trigger explicitly so the
     // VideoPlayer rebuilds its sequence after undo/redo.
-    emit sequenceChanged(computePlaybackSequence());
-    emit audioSequenceChanged(computeAudioPlaybackSequence());
+    scheduleEmitSequenceChanged();
+    scheduleEmitSequenceChanged();
 }
 
 // --- Project save/load ---
@@ -3017,8 +3068,8 @@ void Timeline::restoreFromProject(const QVector<QVector<ClipInfo>> &videoTracks,
     saveUndoState("Load project");
     updateInfoLabel();
     // setClips bypasses modified(); trigger sequence rebuild explicitly.
-    emit sequenceChanged(computePlaybackSequence());
-    emit audioSequenceChanged(computeAudioPlaybackSequence());
+    scheduleEmitSequenceChanged();
+    scheduleEmitSequenceChanged();
 }
 
 void Timeline::syncPlayheadOverlay()
