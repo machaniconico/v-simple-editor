@@ -2423,6 +2423,15 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     QAction *fiAct = transitionMenu->addAction(QStringLiteral("フェードイン (0.5s)"));
     QAction *foAct = transitionMenu->addAction(QStringLiteral("フェードアウト (0.5s)"));
     transitionMenu->addSeparator();
+    QMenu *wipeMenu = transitionMenu->addMenu(QStringLiteral("ワイプ (1.0s)"));
+    QAction *wlAct = wipeMenu->addAction(QStringLiteral("左 → 右"));
+    QAction *wrAct = wipeMenu->addAction(QStringLiteral("右 → 左"));
+    QAction *wuAct = wipeMenu->addAction(QStringLiteral("上 → 下"));
+    QAction *wdAct = wipeMenu->addAction(QStringLiteral("下 → 上"));
+    QMenu *slideMenu = transitionMenu->addMenu(QStringLiteral("スライド (1.0s)"));
+    QAction *slAct = slideMenu->addAction(QStringLiteral("左へ"));
+    QAction *srAct = slideMenu->addAction(QStringLiteral("右へ"));
+    transitionMenu->addSeparator();
     QAction *transDialogAct = transitionMenu->addAction(QStringLiteral("カスタム..."));
     QAction *transClearAct = nullptr;
     if (hasTransition) {
@@ -2456,6 +2465,18 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
         Transition t;
         t.type = TransitionType::FadeOut;
         t.duration = 0.5;
+        applyTransitionToSelected(t);
+    }
+    else if (chosen == wlAct || chosen == wrAct || chosen == wuAct
+             || chosen == wdAct || chosen == slAct || chosen == srAct) {
+        Transition t;
+        t.duration = 1.0;
+        if (chosen == wlAct)      t.type = TransitionType::WipeLeft;
+        else if (chosen == wrAct) t.type = TransitionType::WipeRight;
+        else if (chosen == wuAct) t.type = TransitionType::WipeUp;
+        else if (chosen == wdAct) t.type = TransitionType::WipeDown;
+        else if (chosen == slAct) t.type = TransitionType::SlideLeft;
+        else                      t.type = TransitionType::SlideRight;
         applyTransitionToSelected(t);
     }
     else if (chosen == transDialogAct) emit transitionDialogRequested();
@@ -3213,19 +3234,20 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         trackIntervals.append(ivs);
     }
 
-    // Premiere-style CrossDissolve overlap: when two adjacent same-track
-    // clips share a CrossDissolve transition (A.trailOut + B.leadIn), pull
-    // B's timelineStart back by the transition duration so the two intervals
-    // actually overlap on the timeline. End-at-Cut alignment — only B's
-    // clipIn handle is consumed (no need to extend A past its clipOut). The
-    // duration is clamped to B's available source handle so we never seek
-    // before the start of B's source media.
+    // Premiere-style overlap for boundary transitions: when two adjacent
+    // same-track clips share a matching CrossDissolve / Wipe / Slide
+    // transition (A.trailOut + B.leadIn same type), pull B's timelineStart
+    // back by the transition duration so the two intervals actually
+    // overlap. End-at-Cut alignment — only B's clipIn handle is consumed
+    // (no need to extend A past its clipOut). Duration clamped to B's
+    // available source handle so we never seek before the start of B's
+    // source media.
     for (auto &trackIvs : trackIntervals) {
         for (int j = 1; j < trackIvs.size(); ++j) {
             Interval &a = trackIvs[j - 1];
             Interval &b = trackIvs[j];
-            if (a.trailOutType != TransitionType::CrossDissolve) continue;
-            if (b.leadInType != TransitionType::CrossDissolve) continue;
+            if (!isOverlapTransition(a.trailOutType)) continue;
+            if (a.trailOutType != b.leadInType) continue;
             const double askedD = qMin(a.trailOutDuration, b.leadInDuration);
             if (askedD <= 0.0) continue;
             const double bSpeed = (b.speed > 0.0) ? b.speed : 1.0;
@@ -3236,7 +3258,9 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
             b.clipIn -= effectiveD * bSpeed;
             a.trailOutDuration = effectiveD;
             b.leadInDuration = effectiveD;
-            qInfo() << "[SEQ] CrossDissolve overlap pair: track=" << a.trackIdx
+            qInfo() << "[SEQ] overlap pair:"
+                    << Transition::typeName(a.trailOutType)
+                    << "track=" << a.trackIdx
                     << "askedD=" << askedD << "availableD=" << availableD
                     << "effectiveD=" << effectiveD
                     << "B.timelineStart=" << b.timelineStart

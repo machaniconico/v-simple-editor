@@ -289,19 +289,21 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
         const double posSec = static_cast<double>(cursorUs) / 1e6;
         const double elapsed = posSec - e->entry.timelineStart;
         const double remaining = e->entry.timelineEnd - posSec;
-        if ((e->entry.leadInType == TransitionType::FadeIn
-             || e->entry.leadInType == TransitionType::CrossDissolve)
+        const bool leadInFade = (e->entry.leadInType == TransitionType::FadeIn
+                                 || isOverlapTransition(e->entry.leadInType))
             && e->entry.leadInDuration > 0.0
-            && elapsed >= 0.0 && elapsed < e->entry.leadInDuration) {
-            // CrossDissolve leadIn is symmetric to the trailOut extension
-            // below — Timeline overlaps the pair on the timeline so A's
-            // trailOut fade-out and B's leadIn fade-in fire at the same
-            // wall-clock window, combining into a linear audio crossfade.
-            gain *= qBound(0.0, elapsed / e->entry.leadInDuration, 1.0);
-        } else if ((e->entry.trailOutType == TransitionType::FadeOut
-                    || e->entry.trailOutType == TransitionType::CrossDissolve)
+            && elapsed >= 0.0 && elapsed < e->entry.leadInDuration;
+        const bool trailOutFade = (e->entry.trailOutType == TransitionType::FadeOut
+                                   || isOverlapTransition(e->entry.trailOutType))
             && e->entry.trailOutDuration > 0.0
-            && remaining >= 0.0 && remaining < e->entry.trailOutDuration) {
+            && remaining >= 0.0 && remaining < e->entry.trailOutDuration;
+        if (leadInFade) {
+            // Overlap transitions (CrossDissolve / Wipe / Slide) fire both
+            // arms simultaneously during the timeline overlap window —
+            // A's trailOut ramps down while B's leadIn ramps up, combining
+            // into a linear audio crossfade.
+            gain *= qBound(0.0, elapsed / e->entry.leadInDuration, 1.0);
+        } else if (trailOutFade) {
             gain *= qBound(0.0, remaining / e->entry.trailOutDuration, 1.0);
         }
         if (gain <= 0.0) {

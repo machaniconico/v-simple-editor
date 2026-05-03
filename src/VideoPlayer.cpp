@@ -1612,12 +1612,12 @@ void VideoPlayer::displayFrame(const QImage &image)
             composed = faded;
         }
 
-        // CrossDissolve overlap blend. When this entry's trailOutType is
-        // CrossDissolve and we're inside its trailOut window, look for the
-        // overlapping next same-track entry (Timeline pulled its
-        // timelineStart back by D) and blend its currently-playing frame
-        // on top of the active frame using progress-based opacity.
-        if (e.trailOutType == TransitionType::CrossDissolve
+        // Overlap blend for boundary transitions (CrossDissolve / Wipe /
+        // Slide). Timeline pulled the next clip's timelineStart back by D
+        // so we look up the same-track neighbour with a matching leadIn
+        // type and blend its currently-playing frame via the type-specific
+        // path inside OverlayRenderer::applyTransition.
+        if (isOverlapTransition(e.trailOutType)
             && e.trailOutDuration > 0.0
             && remaining >= 0.0 && remaining < e.trailOutDuration) {
             int nextIdx = -1;
@@ -1629,7 +1629,7 @@ void VideoPlayer::displayFrame(const QImage &image)
                 if (i == m_activeEntry) continue;
                 const auto &c = m_sequence[i];
                 if (c.sourceTrack != e.sourceTrack) continue;
-                if (c.leadInType != TransitionType::CrossDissolve) continue;
+                if (c.leadInType != e.trailOutType) continue;
                 if (c.timelineStart >= overlapStart - eps
                     && c.timelineStart <= e.timelineEnd + eps) {
                     if (nextIdx < 0
@@ -1647,7 +1647,7 @@ void VideoPlayer::displayFrame(const QImage &image)
                                                    1.0);
                     composed = OverlayRenderer::applyTransition(
                         composed, layer.rgb,
-                        TransitionType::CrossDissolve, progress);
+                        e.trailOutType, progress);
                 }
             }
         }

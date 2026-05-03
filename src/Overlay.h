@@ -39,6 +39,25 @@ enum class TransitionType {
     SlideRight
 };
 
+// True when the type renders as a "boundary" blend between two clips:
+// the timeline overlaps the pair and both frames are needed at every
+// tick during the transition window. False for FadeIn/FadeOut which
+// blend a single clip against black with no neighbour involvement.
+inline bool isOverlapTransition(TransitionType t) {
+    switch (t) {
+        case TransitionType::CrossDissolve:
+        case TransitionType::WipeLeft:
+        case TransitionType::WipeRight:
+        case TransitionType::WipeUp:
+        case TransitionType::WipeDown:
+        case TransitionType::SlideLeft:
+        case TransitionType::SlideRight:
+            return true;
+        default:
+            return false;
+    }
+}
+
 struct Transition {
     TransitionType type = TransitionType::None;
     double duration = 0.5; // seconds
