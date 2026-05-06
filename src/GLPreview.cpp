@@ -7,6 +7,7 @@
 #include <QtGlobal>
 #include <QDateTime>
 #include <QVector2D>
+#include <QVector4D>
 #include <QOpenGLContext>
 #include <QDebug>
 #include <QPainter>
@@ -118,10 +119,11 @@ uniform float uHighlights;   // -100 to 100
 uniform float uShadows;      // -100 to 100
 uniform float uExposure;     // -3.0 to 3.0
 
-// Lift/Gamma/Gain color wheels (DaVinci Resolve style)
-uniform float uLiftR, uLiftG, uLiftB;     // -1.0 to 1.0
-uniform float uGammaR, uGammaG, uGammaB;  // -1.0 to 1.0
-uniform float uGainR, uGainG, uGainB;     // -1.0 to 1.0
+// US-WIRE-2: Lift/Gamma/Gain color wheels (DaVinci Resolve style)
+// xyz = RGB channel scalar, w = Luma scalar applied across all channels
+uniform vec4 uLift;      // additive offset
+uniform vec4 uLggGamma;  // power-curve exponent denominator (renamed from uGamma to avoid collision with scalar uGamma at line ~117)
+uniform vec4 uGain;      // multiplicative scaling
 
 // 3D LUT uniforms
 uniform sampler3D uLut3D;
@@ -252,23 +254,26 @@ vec3 adjustGamma(vec3 color, float gamma) {
     return pow(max(color, vec3(0.0)), vec3(invGamma));
 }
 
-// DaVinci Resolve-style Lift/Gamma/Gain
-// Lift  = shadows offset (applied more in darks)
-// Gamma = midtone power (applied via power function weighted to midtones)
-// Gain  = highlight multiplier (scales the entire signal)
-vec3 applyLiftGammaGain(vec3 color, vec3 lift, vec3 gamma, vec3 gain) {
-    // Gain: multiply signal  (1.0 + gain adjustment)
-    vec3 gained = color * (vec3(1.0) + gain);
+// US-WIRE-2: Lift/Gamma/Gain color wheels
+// Order: Lift → Gamma → Gain applied BEFORE LUT (grading → LUT, DaVinci-style)
+// Math per pixel RGB in [0,1] linear-ish space:
+//   1. Lift:  c1 = c + lift_rgb + lift_luma  (additive, can be negative)
+//   2. Gamma: c2 = pow(max(c1,0.0), 1.0 / max(gamma_rgb * gamma_luma, 1e-3))
+//   3. Gain:  c3 = c2 * gain_rgb * gain_luma
+vec3 applyLiftGammaGain(vec3 color) {
+    // Stage 1 — Lift: additive offset, applied uniformly (not shadow-weighted)
+    vec3 c1 = color + uLift.rgb + uLift.www;
 
-    // Lift: add offset weighted by inverse luminance (affects shadows more)
-    vec3 lifted = gained + lift * (vec3(1.0) - gained);
+    // Stage 2 — Gamma: power curve; denominator clamped >= 1e-3 for safety
+    vec3 gammaTotal = max(uLggGamma.rgb * uLggGamma.w, vec3(1e-3));
+    vec3 c2 = pow(max(c1, vec3(0.0)), vec3(1.0) / gammaTotal);
 
-    // Gamma: power curve through midtones
-    // gamma adjustment maps [-1,1] to a power curve: 0 = no change, negative = darken mids, positive = brighten mids
-    vec3 gammaPow = vec3(1.0) / max(vec3(1.0) + gamma, vec3(0.01));
-    vec3 result = pow(max(lifted, vec3(0.0)), gammaPow);
+    // Stage 3 — Gain: multiplicative scaling, hard-capped at 16
+    vec3 gainTotal = min(uGain.rgb * uGain.w, vec3(16.0));
+    vec3 c3 = c2 * gainTotal;
 
-    return result;
+    c3 = clamp(c3, 0.0, 1.0);
+    return c3;
 }
 
 vec3 fxBlur(vec2 uv) {
@@ -374,12 +379,10 @@ void main() {
         if (uGamma != 1.0)
             color = adjustGamma(color, uGamma);
 
-        // Lift/Gamma/Gain color wheels (DaVinci Resolve style)
-        vec3 lift  = vec3(uLiftR,  uLiftG,  uLiftB);
-        vec3 gamma = vec3(uGammaR, uGammaG, uGammaB);
-        vec3 gain  = vec3(uGainR,  uGainG,  uGainB);
-        if (lift != vec3(0.0) || gamma != vec3(0.0) || gain != vec3(0.0))
-            color = applyLiftGammaGain(color, lift, gamma, gain);
+        // US-WIRE-2: Lift/Gamma/Gain color wheels (DaVinci Resolve style)
+        // Identity: vec4(0,0,0,0) / vec4(1,1,1,1) / vec4(1,1,1,1) = no-op
+        if (uLift != vec4(0.0) || uLggGamma != vec4(1.0, 1.0, 1.0, 1.0) || uGain != vec4(1.0, 1.0, 1.0, 1.0))
+            color = applyLiftGammaGain(color);
 
         // US-FEAT-B: LUT 3D-texture blend — sample 3D LUT and mix with intensity
         if (uLutEnabled) {
@@ -821,16 +824,10 @@ void GLPreview::createShaderProgram()
     m_locFxChromaTolerance   = m_program->uniformLocation("uFxChromaTolerance");
     m_locFxTime              = m_program->uniformLocation("uFxTime");
 
-    // Lift/Gamma/Gain
-    m_locLiftR  = m_program->uniformLocation("uLiftR");
-    m_locLiftG  = m_program->uniformLocation("uLiftG");
-    m_locLiftB  = m_program->uniformLocation("uLiftB");
-    m_locGammaR = m_program->uniformLocation("uGammaR");
-    m_locGammaG = m_program->uniformLocation("uGammaG");
-    m_locGammaB = m_program->uniformLocation("uGammaB");
-    m_locGainR  = m_program->uniformLocation("uGainR");
-    m_locGainG  = m_program->uniformLocation("uGainG");
-    m_locGainB  = m_program->uniformLocation("uGainB");
+    // Lift/Gamma/Gain (vec4: xyz=RGB, w=Luma)
+    m_locLift     = m_program->uniformLocation("uLift");
+    m_locLggGamma = m_program->uniformLocation("uLggGamma");
+    m_locGain     = m_program->uniformLocation("uGain");
 
     // LUT
     m_locLut3D         = m_program->uniformLocation("uLut3D");
@@ -1364,16 +1361,22 @@ void GLPreview::paintGL()
     m_program->setUniformValue(m_locShadows,     static_cast<float>(m_cc.shadows));
     m_program->setUniformValue(m_locExposure,    static_cast<float>(m_cc.exposure));
 
-    // Lift/Gamma/Gain
-    m_program->setUniformValue(m_locLiftR,  static_cast<float>(m_cc.liftR));
-    m_program->setUniformValue(m_locLiftG,  static_cast<float>(m_cc.liftG));
-    m_program->setUniformValue(m_locLiftB,  static_cast<float>(m_cc.liftB));
-    m_program->setUniformValue(m_locGammaR, static_cast<float>(m_cc.gammaR));
-    m_program->setUniformValue(m_locGammaG, static_cast<float>(m_cc.gammaG));
-    m_program->setUniformValue(m_locGammaB, static_cast<float>(m_cc.gammaB));
-    m_program->setUniformValue(m_locGainR,  static_cast<float>(m_cc.gainR));
-    m_program->setUniformValue(m_locGainG,  static_cast<float>(m_cc.gainG));
-    m_program->setUniformValue(m_locGainB,  static_cast<float>(m_cc.gainB));
+    // Lift/Gamma/Gain (US-WIRE-2: vec4: xyz=RGB, w=Luma)
+    m_program->setUniformValue(m_locLift,
+        QVector4D(static_cast<float>(m_liftGammaGain[0][0]),
+                  static_cast<float>(m_liftGammaGain[0][1]),
+                  static_cast<float>(m_liftGammaGain[0][2]),
+                  static_cast<float>(m_liftGammaGain[0][3])));
+    m_program->setUniformValue(m_locLggGamma,
+        QVector4D(static_cast<float>(m_liftGammaGain[1][0]),
+                  static_cast<float>(m_liftGammaGain[1][1]),
+                  static_cast<float>(m_liftGammaGain[1][2]),
+                  static_cast<float>(m_liftGammaGain[1][3])));
+    m_program->setUniformValue(m_locGain,
+        QVector4D(static_cast<float>(m_liftGammaGain[2][0]),
+                  static_cast<float>(m_liftGammaGain[2][1]),
+                  static_cast<float>(m_liftGammaGain[2][2]),
+                  static_cast<float>(m_liftGammaGain[2][3])));
 
     // LUT
     m_program->setUniformValue(m_locLutEnabled, m_lutEnabled);
@@ -2341,6 +2344,19 @@ void GLPreview::setLutTexture(const QImage &lutGrid, float intensity)
 void GLPreview::setLutIntensity(double intensity)
 {
     m_lutIntensity = qBound(0.0f, static_cast<float>(intensity), 1.0f);
+    update();
+}
+
+void GLPreview::setLiftGammaGain(const std::array<std::array<double,4>,3> &values)
+{
+    // values[0] = Lift:  panel stores slider/100  [-1,1], neutral=0 → scale to [-0.5, 0.5]
+    // values[1] = Gamma: panel stores 0.1*pow(40,t) [~0.1,4], neutral≈1 → pass through
+    // values[2] = Gain:  panel stores slider/100  [-1,1], neutral=0 → convert to 2^(v*2) [0.25,4]
+    for (int ch = 0; ch < 4; ++ch) {
+        m_liftGammaGain[0][ch] = values[0][ch] * 0.5;
+        m_liftGammaGain[1][ch] = values[1][ch];
+        m_liftGammaGain[2][ch] = std::pow(2.0, values[2][ch] * 2.0);
+    }
     update();
 }
 

@@ -13,6 +13,7 @@
 #include <QTimer>
 #include <QFont>
 #include <QColor>
+#include <array>
 #include "VideoEffect.h"
 #include "LutImporter.h"
 
@@ -39,6 +40,8 @@ public:
     void setLutTexture(const QImage &lutGrid, float intensity);
     void setLutIntensity(double intensity);
     void clearLut();
+    // US-WIRE-2: Lift/Gamma/Gain color wheels from ColorGradingPanel
+    void setLiftGammaGain(const std::array<std::array<double,4>,3> &values);
 
     // Phase 1e — true only when VEDITOR_GL_INTEROP=1 AND WGL_NV_DX_interop2
     // is supported AND all 6 wglDX*NV procs resolved during initializeGL().
@@ -282,10 +285,14 @@ private:
     int m_locFxTime = -1;
     QImage::Format m_textureFormat = QImage::Format_Invalid;
 
-    // Lift/Gamma/Gain uniform locations
-    int m_locLiftR = -1, m_locLiftG = -1, m_locLiftB = -1;
-    int m_locGammaR = -1, m_locGammaG = -1, m_locGammaB = -1;
-    int m_locGainR = -1, m_locGainG = -1, m_locGainB = -1;
+    // Lift/Gamma/Gain uniform locations (vec4: xyz=RGB, w=Luma)
+    int m_locLift = -1, m_locLggGamma = -1, m_locGain = -1;
+    // Identity: lift=(0,0,0,0), gamma=(1,1,1,1), gain=(1,1,1,1)
+    std::array<std::array<double,4>,3> m_liftGammaGain = {{
+        {0.0, 0.0, 0.0, 0.0},
+        {1.0, 1.0, 1.0, 1.0},
+        {1.0, 1.0, 1.0, 1.0}
+    }};
 
     // LUT uniform locations and texture
     int m_locLut3D = -1;

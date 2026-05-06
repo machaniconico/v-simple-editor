@@ -43,6 +43,7 @@
 #include <QJsonObject>
 #include <QDir>
 #include <cmath>
+#include <array>
 #include "AudioMeterWidget.h"
 #include "GradientStopBar.h"
 #include <QPushButton>
@@ -993,6 +994,26 @@ void MainWindow::setupMenuBar()
             m_player->setColorCorrection(cc);
             m_player->glPreview()->clearLut();
         }
+    });
+    // US-WIRE-2: wire ColorGradingPanel wheels → GLPreview shader
+    connect(m_colorGradingPanel, &ColorGradingPanel::colorWheelsChanged,
+            this, [this](const ColorWheels &cw) {
+        if (!m_player || !m_player->glPreview())
+            return;
+        std::array<std::array<double,4>,3> values;
+        values[0] = {static_cast<double>(cw.lift.x()),
+                     static_cast<double>(cw.lift.y()),
+                     static_cast<double>(cw.lift.z()),
+                     cw.liftLuma};
+        values[1] = {static_cast<double>(cw.gamma.x()),
+                     static_cast<double>(cw.gamma.y()),
+                     static_cast<double>(cw.gamma.z()),
+                     cw.gammaLuma};
+        values[2] = {static_cast<double>(cw.gain.x()),
+                     static_cast<double>(cw.gain.y()),
+                     static_cast<double>(cw.gain.z()),
+                     cw.gainLuma};
+        m_player->glPreview()->setLiftGammaGain(values);
     });
 
     viewMenu->addSeparator();
