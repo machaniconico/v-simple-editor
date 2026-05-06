@@ -51,6 +51,7 @@
 #include <QHBoxLayout>
 #include <QSettings>
 #include <QSlider>
+#include <QWidgetAction>
 #include <QColorDialog>
 #include <QFormLayout>
 #include <QLabel>
@@ -762,6 +763,26 @@ void MainWindow::setupMenuBar()
 
     auto *manageLutAction = effectsMenu->addAction("LUT管理...");
     connect(manageLutAction, &QAction::triggered, this, &MainWindow::manageLuts);
+
+    effectsMenu->addSeparator();
+
+    auto *loadLutCubeAction = effectsMenu->addAction("LUT を読み込み…");
+    connect(loadLutCubeAction, &QAction::triggered, this, &MainWindow::loadLutCubeFile);
+
+    m_lutIntensitySlider = new QSlider(Qt::Horizontal, this);
+    m_lutIntensitySlider->setRange(0, 100);
+    m_lutIntensitySlider->setValue(100);
+    m_lutIntensitySlider->setToolTip("LUT Intensity (0-100%)");
+    connect(m_lutIntensitySlider, &QSlider::valueChanged, this, [this](int value) {
+        if (m_player)
+            m_player->glPreview()->setLutIntensity(value / 100.0);
+    });
+    auto *lutSliderAction = new QWidgetAction(this);
+    lutSliderAction->setDefaultWidget(m_lutIntensitySlider);
+    effectsMenu->addAction(lutSliderAction);
+
+    auto *clearLutMenuAction = effectsMenu->addAction("LUT 解除");
+    connect(clearLutMenuAction, &QAction::triggered, this, &MainWindow::clearLutIntensity);
 
     effectsMenu->addSeparator();
 
@@ -3221,6 +3242,40 @@ void MainWindow::applyLut()
 
     statusBar()->showMessage(QString("Applied LUT: %1 (intensity %2)")
         .arg(lut.name).arg(intensity, 0, 'f', 1));
+}
+
+void MainWindow::loadLutCubeFile()
+{
+    QString path = QFileDialog::getOpenFileName(this, "LUT を読み込み",
+        QString(), "Cube LUT (*.cube);;All Files (*)");
+    if (path.isEmpty()) return;
+
+    LutData lut = LutImporter::loadCubeFile(path);
+    if (!lut.isValid()) {
+        QMessageBox::warning(this, "LUT Error", "Could not parse LUT file.");
+        return;
+    }
+
+    if (m_player)
+        m_player->glPreview()->setLut(lut);
+
+    if (m_lutIntensitySlider)
+        m_lutIntensitySlider->setValue(100);
+
+    LutLibrary::instance().addLut(path);
+    if (m_colorGradingPanel)
+        m_colorGradingPanel->setLutList(LutLibrary::instance().allLuts());
+
+    statusBar()->showMessage(QString("LUT 読み込み: %1").arg(lut.name));
+}
+
+void MainWindow::clearLutIntensity()
+{
+    if (m_player)
+        m_player->glPreview()->clearLut();
+    if (m_lutIntensitySlider)
+        m_lutIntensitySlider->setValue(0);
+    statusBar()->showMessage("LUT 解除");
 }
 
 void MainWindow::manageLuts()

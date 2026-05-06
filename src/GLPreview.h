@@ -37,6 +37,7 @@ public:
     void setLut(const LutData &lut);
     // US-FEAT-B: LUT 3D-texture blend — upload QImage grid as GL_TEXTURE_3D
     void setLutTexture(const QImage &lutGrid, float intensity);
+    void setLutIntensity(double intensity);
     void clearLut();
 
     // Phase 1e — true only when VEDITOR_GL_INTEROP=1 AND WGL_NV_DX_interop2

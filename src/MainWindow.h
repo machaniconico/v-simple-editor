@@ -142,6 +142,8 @@ private slots:
     void showResourceGuide();
     void stabilizeVideo();
     void applyLut();
+    void loadLutCubeFile();
+    void clearLutIntensity();
     void manageLuts();
     void toggleProxyMode();
     void generateProxies();
@@ -221,6 +223,7 @@ private:
     ProjectConfig m_projectConfig;
 
     QAction *m_trackMotionAction = nullptr; // US-FEAT-D: motion tracking UI
+    class QSlider *m_lutIntensitySlider = nullptr; // LUT intensity slider (0..100)
     QAction *m_splitAction;
     QAction *m_deleteAction;
     QAction *m_rippleDeleteAction;

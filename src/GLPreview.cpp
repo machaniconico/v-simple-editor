@@ -2338,6 +2338,12 @@ void GLPreview::setLutTexture(const QImage &lutGrid, float intensity)
     update();
 }
 
+void GLPreview::setLutIntensity(double intensity)
+{
+    m_lutIntensity = qBound(0.0f, static_cast<float>(intensity), 1.0f);
+    update();
+}
+
 void GLPreview::clearLut()
 {
     makeCurrent();
