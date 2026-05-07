@@ -8,6 +8,7 @@
 #include "VideoEffect.h"
 #include "Keyframe.h"
 #include "Overlay.h"
+#include "MarkerData.h"
 
 // --- Audio mixer serialization sub-types ---
 
@@ -76,6 +77,9 @@ struct ProjectData {
 
     // US-FEAT-A: overlay persistence
     QList<OverlayItem> overlays;
+
+    // Timeline markers
+    QVector<Marker> markers;
 };
 
 class ProjectFile
