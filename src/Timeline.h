@@ -18,6 +18,7 @@
 #include "PlaybackTypes.h"
 #include "Overlay.h"
 #include "SnapEngine.h"
+#include "MarkerData.h"
 
 // Where Timeline::addClip drops a freshly-imported clip. Persisted via
 // QSettings('VSimpleEditor','Preferences')/importPlacement; the MainWindow
@@ -342,6 +343,17 @@ public:
     double markedOut() const { return m_markOut; }
     bool hasMarkedRange() const { return m_markIn >= 0 && m_markOut > m_markIn; }
 
+    // Timeline Marker API
+    int addMarker(qint64 timelineUs, const QString &label = {}, QColor color = {});
+    bool removeMarker(int id);
+    bool updateMarker(int id, const Marker &updated);
+    Marker markerById(int id) const;
+    QVector<Marker> markersInRange(qint64 startUs, qint64 endUs) const;
+    int nextMarkerAfter(qint64 timelineUs) const;
+    int prevMarkerBefore(qint64 timelineUs) const;
+    void setMarkers(const QVector<Marker> &markers);
+    const QVector<Marker> &markers() const { return m_markersData; }
+
     // Multi-track
     void addVideoTrack();
     void addAudioTrack();
@@ -480,6 +492,7 @@ signals:
     void transitionShortened(QString transitionTypeName,
                              double askedSec, double effectiveSec);
     void statusMessageRequested(const QString &message, int timeoutMs);
+    void markersChanged();
 
 protected:
     bool eventFilter(QObject *watched, QEvent *event) override;
@@ -605,6 +618,11 @@ private:
 
     // AudioMixer pointer — set by MainWindow for undo/restore of track gains
     AudioMixer *m_audioMixer = nullptr;
+
+    // Marker API data
+    QVector<Marker> m_markersData;
+    int m_nextMarkerId = 1;
+    MarkerLane *m_markerLane = nullptr;
 };
 
 class PlayheadOverlay : public QWidget
@@ -655,4 +673,23 @@ private:
     bool m_dragging = false;
     int m_dragStartX = 0;
     double m_dragStartPps = 10.0;
+};
+
+class MarkerLane : public QWidget
+{
+    Q_OBJECT
+
+public:
+    explicit MarkerLane(QWidget *parent = nullptr);
+    void setMarkers(const QVector<Marker> *markers);
+    void setPixelsPerSecond(double pps);
+    void setScrollOffset(int v);
+
+protected:
+    void paintEvent(QPaintEvent *event) override;
+
+private:
+    const QVector<Marker> *m_markers = nullptr;
+    double m_pps = 10.0;
+    int m_scrollOffset = 0;
 };
