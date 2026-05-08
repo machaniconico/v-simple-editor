@@ -1878,6 +1878,25 @@ void VideoPlayer::displayFrame(const QImage &image)
             else if (m_hdrInfo.trc == AVCOL_TRC_ARIB_STD_B67) hdrTransfer = 2;
         }
         m_glPreview->setHdrTransfer(hdrTransfer);
+        // US-INT-4: push the active entry's stabilizer keyframes (V1 only;
+        // higher-track stabilization is a follow-up) and the current source
+        // time so GLPreview's binary-search lookup can pick the matching
+        // keyframe and bake the inverse 2D affine pre-warp.
+        if (sequenceActive() && m_activeEntry >= 0 && m_activeEntry < m_sequence.size()) {
+            const auto &ae = m_sequence[m_activeEntry];
+            if (ae.sourceTrack == 0) {
+                m_glPreview->setStabilizerKeyframes(ae.stabilizerKeyframes);
+                const double T = static_cast<double>(m_timelinePositionUs)
+                               / static_cast<double>(AV_TIME_BASE);
+                const double srcSec = ae.clipIn + (T - ae.timelineStart) * ae.speed;
+                m_glPreview->setStabilizerSourceTimeUs(
+                    static_cast<qint64>(srcSec * 1.0e6));
+            } else {
+                m_glPreview->setStabilizerKeyframes({});
+            }
+        } else {
+            m_glPreview->setStabilizerKeyframes({});
+        }
         m_glPreview->displayFrame(composed);
     } else {
         const QSize targetSize = fittedDisplaySize(m_videoDisplay->size());
@@ -1991,8 +2010,30 @@ QImage VideoPlayer::composeFrameWithOverlays(const QImage &source) const
             boxW = textSize.width() + 16;
             boxH = textSize.height() + 8;
         }
-        const int cx = static_cast<int>(ov.x * W);
-        const int cy = static_cast<int>(ov.y * H);
+        double ovX = ov.x;
+        double ovY = ov.y;
+        const double ovRelTime = nowSec - ov.startTime;
+        if (!ov.positionKeyframes.isEmpty()) {
+            const auto &kfs = ov.positionKeyframes;
+            if (ovRelTime <= kfs.first().time) {
+                ovX = kfs.first().cx;
+                ovY = kfs.first().cy;
+            } else if (ovRelTime >= kfs.last().time) {
+                ovX = kfs.last().cx;
+                ovY = kfs.last().cy;
+            } else {
+                for (int k = 0; k < kfs.size() - 1; ++k) {
+                    if (ovRelTime >= kfs[k].time && ovRelTime <= kfs[k + 1].time) {
+                        double t = (ovRelTime - kfs[k].time) / (kfs[k + 1].time - kfs[k].time);
+                        ovX = kfs[k].cx + (kfs[k + 1].cx - kfs[k].cx) * t;
+                        ovY = kfs[k].cy + (kfs[k + 1].cy - kfs[k].cy) * t;
+                        break;
+                    }
+                }
+            }
+        }
+        const int cx = static_cast<int>(ovX * W);
+        const int cy = static_cast<int>(ovY * H);
         QRect box(cx - boxW / 2, cy - boxH / 2, boxW, boxH);
 
         if (ov.backgroundColor.alpha() > 0)
@@ -2108,10 +2149,11 @@ void VideoPlayer::enterRegionPickerMode(std::function<void(QRect)> callback)
     QStackedWidget *stack = qobject_cast<QStackedWidget *>(m_glPreview->parentWidget());
     QRect overlayGeo = stack ? stack->geometry() : m_glPreview->geometry();
 
-    m_regionPickerOverlay = new RegionPickerOverlay(this);
+    auto *picker = new RegionPickerOverlay(this);
+    m_regionPickerOverlay = picker;
     m_regionPickerOverlay->setGeometry(overlayGeo);
 
-    m_regionPickerOverlay->setCallback([this](QRect widgetRect) {
+    picker->setCallback([this](QRect widgetRect) {
         if (!m_regionPickerCallback) return;
 
         if (widgetRect.isNull()) {
@@ -2156,6 +2198,43 @@ void VideoPlayer::exitRegionPickerMode()
         m_regionPickerOverlay->deleteLater();
         m_regionPickerOverlay = nullptr;
     }
+}
+
+// US-EF-2: enter mask drawing mode. Reuses the US-WIRE-3 region picker
+// overlay (same drag-rect UX) but the callback receives a normalized
+// QRectF in [0..1] vTexCoord space — derived from the source-frame pixel
+// rect by dividing by the codec's frame size. This matches what GLPreview's
+// uMaskRect uniform expects, so callers can feed the result into
+// ColorGradingPanel::setMaskRect or GLPreview::setMask directly.
+void VideoPlayer::enterMaskEditMode(std::function<void(QRectF)> callback)
+{
+    if (!callback) return;
+    // Wrap the user callback so the QRect → QRectF conversion happens here
+    // and the rest of the picker plumbing stays unchanged.
+    enterRegionPickerMode([this, cb = std::move(callback)](QRect srcRect) {
+        if (srcRect.isNull() || srcRect.width() <= 0 || srcRect.height() <= 0) {
+            cb(QRectF());
+            return;
+        }
+        const int srcW = (m_codecCtx && m_codecCtx->width > 0)
+                             ? m_codecCtx->width  : m_canvasWidth;
+        const int srcH = (m_codecCtx && m_codecCtx->height > 0)
+                             ? m_codecCtx->height : m_canvasHeight;
+        if (srcW <= 0 || srcH <= 0) {
+            cb(QRectF());
+            return;
+        }
+        QRectF normalized(static_cast<double>(srcRect.x()) / srcW,
+                          static_cast<double>(srcRect.y()) / srcH,
+                          static_cast<double>(srcRect.width())  / srcW,
+                          static_cast<double>(srcRect.height()) / srcH);
+        cb(normalized);
+    });
+}
+
+void VideoPlayer::exitMaskEditMode()
+{
+    exitRegionPickerMode();
 }
 
 void VideoPlayer::setColorCorrection(const ColorCorrection &cc)

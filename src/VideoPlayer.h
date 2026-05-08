@@ -10,6 +10,7 @@
 #include <QHBoxLayout>
 #include <QVBoxLayout>
 #include "AudioMixer.h"
+#include "SpeedRampData.h"
 #include <QVector>
 #include <QHash>
 #include <QRectF>
@@ -87,6 +88,10 @@ public:
     // switched automatically at clip boundaries. Empty argument falls back to
     // single-file mode (current loaded file is left intact).
     void setSequence(const QVector<PlaybackEntry> &entries);
+    // Parallel speed-ramp array for the video sequence. Must be called
+    // after setSequence with the same index alignment. Identity ramps are
+    // the default so callers may omit this call for non-ramped sequences.
+    void setSpeedRamps(const QVector<speedramp::SpeedRamp> &ramps);
     // Audio-side schedule routed to AudioMixer. The mixer owns its own
     // FFmpeg decoder pool + ring buffers and mixes every active entry into
     // a single QAudioSink output, so unlinked J-cut/L-cut clips and stacked
@@ -180,6 +185,13 @@ public:
     void enterRegionPickerMode(std::function<void(QRect)> callback);
     void exitRegionPickerMode();
     bool isRegionPickerActive() const { return m_regionPickerActive; }
+    // US-EF-2: Mask Animation drawing. Reuses the same overlay infrastructure
+    // as enterRegionPickerMode but the callback receives a normalized
+    // QRectF in [0..1] vTexCoord-space — derived by mapping the source-frame
+    // pixel rect against the codec's frame size. Suitable for feeding back
+    // into ColorGradingPanel::setMaskRect or GLPreview::setMask directly.
+    void enterMaskEditMode(std::function<void(QRectF)> callback);
+    void exitMaskEditMode();
 
 public slots:
     void play();
@@ -517,6 +529,7 @@ private:
     // entry list is owned by the mixer; mirroring it here would just be
     // dead state.
     bool m_audioSequenceHadEntries = false;
+    QVector<speedramp::SpeedRamp> m_speedRamps;  // parallel to m_sequence
     int64_t m_timelinePositionUs = 0;
     int64_t m_sequenceDurationUs = 0;
     QString m_loadedFilePath;
@@ -524,7 +537,7 @@ private:
     // US-WIRE-3: region picker for motion tracking
     bool m_regionPickerActive = false;
     std::function<void(QRect)> m_regionPickerCallback;
-    class RegionPickerOverlay *m_regionPickerOverlay = nullptr;
+    QWidget *m_regionPickerOverlay = nullptr;
     QVector<EnhancedTextOverlay> m_textOverlays;
     // Cached raw source of the most recent frame. Needed so
     // setHiddenTextOverlayIndex can re-compose while paused (the cached

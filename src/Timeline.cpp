@@ -374,6 +374,7 @@ private:
 #include <QSettings>
 #include <QAction>
 #include <QToolTip>
+#include <QHelpEvent>
 #include <QHash>
 #include <QProgressDialog>
 #include <cstdint>
@@ -570,6 +571,143 @@ void TimeRuler::mouseReleaseEvent(QMouseEvent *event)
     releaseMouse();
     emit zoomDragEnded();
     event->accept();
+}
+
+// --- MarkerLane ---
+// 16px-tall strip painted above the time ruler. Reads markers directly from
+// the owning Timeline so there's no per-marker QObject and no manual
+// add/remove syncing — every paint reflects the current QVector<Marker>.
+
+MarkerLane::MarkerLane(Timeline *timeline, QWidget *parent)
+    : QWidget(parent), m_timeline(timeline)
+{
+    setFixedHeight(kLaneHeight);
+    setStyleSheet("background-color: #232323;");
+    setMouseTracking(true);
+    // Enable hover tooltips via QHelpEvent without per-marker setToolTip.
+    setAttribute(Qt::WA_Hover, true);
+}
+
+void MarkerLane::setPixelsPerSecond(double pps)
+{
+    if (qFuzzyCompare(pps, m_pixelsPerSecond))
+        return;
+    m_pixelsPerSecond = qBound(0.02, pps, 200.0);
+    update();
+}
+
+void MarkerLane::setScrollOffset(int offsetX)
+{
+    if (offsetX == m_scrollOffset)
+        return;
+    m_scrollOffset = offsetX;
+    update();
+}
+
+int MarkerLane::markerScreenX(qint64 timelineUs) const
+{
+    // contentX = timelineUs / 1e6 * pps. Subtract scroll offset so the lane
+    // pans together with the tracks below.
+    const double seconds = static_cast<double>(timelineUs) / 1'000'000.0;
+    const int contentX = static_cast<int>(seconds * m_pixelsPerSecond);
+    return contentX - m_scrollOffset;
+}
+
+int MarkerLane::hitTestMarker(const QPoint &pos) const
+{
+    if (!m_timeline) return -1;
+    const int half = kTriangleSize / 2 + kHitPad;
+    // Reverse iterate so a topmost (rightmost-painted) marker wins on overlap.
+    const auto &markers = m_timeline->markers();
+    for (int i = markers.size() - 1; i >= 0; --i) {
+        const int x = markerScreenX(markers[i].timelineUs);
+        if (qAbs(pos.x() - x) <= half && pos.y() <= kLaneHeight)
+            return markers[i].id;
+    }
+    return -1;
+}
+
+void MarkerLane::paintEvent(QPaintEvent *)
+{
+    QPainter painter(this);
+    painter.fillRect(rect(), QColor(0x23, 0x23, 0x23));
+    // Bottom hairline so the lane visually sits as a tray above the ruler.
+    painter.setPen(QPen(QColor(0x3a, 0x3a, 0x3a), 1));
+    painter.drawLine(0, height() - 1, width(), height() - 1);
+
+    if (!m_timeline) return;
+    const auto &markers = m_timeline->markers();
+    if (markers.isEmpty()) return;
+
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    const int half = kTriangleSize / 2;
+    const int top = 2;                  // small top gap so triangle base
+    const int tipY = top + kTriangleSize; // hangs cleanly off the ruler line.
+
+    for (const auto &m : markers) {
+        const int x = markerScreenX(m.timelineUs);
+        // Cull off-screen triangles cheaply — important for the
+        // 100-marker spec acceptance.
+        if (x + half < 0 || x - half > width()) continue;
+
+        QPolygonF tri;
+        tri << QPointF(x - half, top)
+            << QPointF(x + half, top)
+            << QPointF(x,        tipY);
+        const QColor fill = m.color.isValid() ? m.color : QColor("#ff5050");
+        painter.setBrush(fill);
+        painter.setPen(QPen(fill.darker(140), 1));
+        painter.drawPolygon(tri);
+    }
+}
+
+void MarkerLane::mousePressEvent(QMouseEvent *event)
+{
+    if (event->button() != Qt::LeftButton) {
+        QWidget::mousePressEvent(event);
+        return;
+    }
+    const int id = hitTestMarker(event->pos());
+    if (id >= 0) {
+        emit markerClicked(id);
+        event->accept();
+        return;
+    }
+    QWidget::mousePressEvent(event);
+}
+
+bool MarkerLane::event(QEvent *event)
+{
+    // Hover tooltip — show label + H:MM:SS.mmm time. Computed lazily so
+    // there's no per-marker setToolTip overhead even with hundreds of
+    // markers.
+    if (event->type() == QEvent::ToolTip && m_timeline) {
+        auto *helpEvent = static_cast<QHelpEvent *>(event);
+        const int id = hitTestMarker(helpEvent->pos());
+        if (id >= 0) {
+            const Marker mk = m_timeline->markerById(id);
+            const qint64 us = mk.timelineUs;
+            const qint64 totalMs = us / 1000;
+            const int hours = static_cast<int>(totalMs / 3'600'000);
+            const int mins  = static_cast<int>((totalMs / 60'000) % 60);
+            const int secs  = static_cast<int>((totalMs / 1000) % 60);
+            const int millis = static_cast<int>(totalMs % 1000);
+            const QString timeStr = QString("%1:%2:%3.%4")
+                .arg(hours)
+                .arg(mins,   2, 10, QChar('0'))
+                .arg(secs,   2, 10, QChar('0'))
+                .arg(millis, 3, 10, QChar('0'));
+            const QString text = mk.label.isEmpty()
+                ? timeStr
+                : (mk.label + QChar('\n') + timeStr);
+            QToolTip::showText(helpEvent->globalPos(), text, this);
+            return true;
+        }
+        QToolTip::hideText();
+        event->ignore();
+        return true;
+    }
+    return QWidget::event(event);
 }
 
 // --- TimelineTrack ---
@@ -2004,6 +2142,15 @@ void Timeline::setupUI()
     tracksOuterLayout->setContentsMargins(0, 0, 0, 0);
     tracksOuterLayout->setSpacing(0);
 
+    // Marker lane sits ABOVE the time ruler so colored triangles align with
+    // ruler ticks and hover tooltips don't overlap track widgets. The lane
+    // mirrors m_zoomLevel + scrollX so triangle positions track ruler ticks.
+    m_markerLane = new MarkerLane(this, tracksContainer);
+    m_markerLane->setPixelsPerSecond(m_zoomLevel);
+    connect(m_markerLane, &MarkerLane::markerClicked,
+            this, &Timeline::markerClicked);
+    tracksOuterLayout->addWidget(m_markerLane);
+
     m_timeRuler = new TimeRuler(tracksContainer);
     m_timeRuler->setPixelsPerSecond(m_zoomLevel);
     connect(m_timeRuler, &TimeRuler::zoomChanged, this, &Timeline::setZoomLevel);
@@ -2197,6 +2344,17 @@ void Timeline::setupUI()
 
     tracksOuterLayout->addWidget(m_tracksWidget);
     m_scrollArea->setWidget(tracksContainer);
+
+    // Keep the marker lane's content-x offset in sync with horizontal
+    // scrolling so triangles stay aligned with their underlying clips
+    // while the user pans. Cheap signal — only fires on scrollbar value
+    // changes, not on every paint.
+    if (m_markerLane) {
+        if (QScrollBar *hbar = m_scrollArea->horizontalScrollBar()) {
+            connect(hbar, &QScrollBar::valueChanged,
+                    m_markerLane, &MarkerLane::setScrollOffset);
+        }
+    }
 
     // Install event filters so clicks on empty areas (below tracks, outer
     // container, scroll viewport) deselect all clips like clicks on a track's
@@ -2882,6 +3040,24 @@ bool Timeline::updateTextOverlayRect(int overlayIndex, double x, double y, doubl
     ov.height = qMax(0.0, height);
     track->setClips(clips);
     saveUndoState("Resize text overlay");
+    refreshTextStrip();
+    return true;
+}
+
+bool Timeline::applyTrackingToOverlay(int overlayIndex, const EnhancedTextOverlay &updated)
+{
+    if (m_videoTracks.isEmpty() || !m_videoTracks.first())
+        return false;
+    auto *track = m_videoTracks.first();
+    QVector<ClipInfo> clips = track->clips();
+    if (clips.isEmpty())
+        return false;
+    auto &mgr = clips[0].textManager;
+    if (overlayIndex < 0 || overlayIndex >= mgr.count())
+        return false;
+    mgr.updateOverlay(overlayIndex, updated);
+    track->setClips(clips);
+    saveUndoState("Apply tracking to overlay");
     refreshTextStrip();
     return true;
 }
@@ -3601,6 +3777,8 @@ void Timeline::setZoomLevel(double pixelsPerSecond)
         m_timeRuler->setPixelsPerSecond(m_zoomLevel);
     if (m_textStrip)
         m_textStrip->setPixelsPerSecond(m_zoomLevel);
+    if (m_markerLane)
+        m_markerLane->setPixelsPerSecond(m_zoomLevel);
 
     if (m_zoomAnchorViewportX >= 0 && m_scrollArea && m_videoTrack) {
         // Force the scroll area to refresh its content width synchronously so
@@ -3639,6 +3817,28 @@ void Timeline::setZoomLevel(double pixelsPerSecond)
 // I/O markers
 void Timeline::markIn() { m_markIn = m_playheadPos; updateInfoLabel(); }
 void Timeline::markOut() { m_markOut = m_playheadPos; updateInfoLabel(); }
+
+// Per-clip speed ramp
+static const speedramp::SpeedRamp kIdentityRamp = speedramp::SpeedRamp::identity();
+
+const speedramp::SpeedRamp &Timeline::speedRamp(int clipIndex) const
+{
+    if (clipIndex < 0 || !m_videoTrack) return kIdentityRamp;
+    const auto &clips = m_videoTrack->clips();
+    if (clipIndex >= clips.size()) return kIdentityRamp;
+    return clips[clipIndex].speedRamp;
+}
+
+void Timeline::setSpeedRamp(int clipIndex, const speedramp::SpeedRamp &ramp)
+{
+    if (clipIndex < 0 || !m_videoTrack) return;
+    auto clips = m_videoTrack->clips();
+    if (clipIndex >= clips.size()) return;
+    clips[clipIndex].speedRamp = ramp;
+    m_videoTrack->setClips(clips);
+    saveUndoState(QString("Set speed ramp clip %1").arg(clipIndex));
+    scheduleEmitSequenceChanged();
+}
 
 // Clip speed
 void Timeline::setClipSpeed(double speed)
@@ -3910,6 +4110,12 @@ double Timeline::selectedClipDuration() const
     int sel = m_videoTrack->selectedClip();
     if (sel < 0 || sel >= m_videoTrack->clips().size()) return 0.0;
     return m_videoTrack->clips()[sel].effectiveDuration();
+}
+
+int Timeline::selectedVideoClipIndex() const
+{
+    if (!m_videoTrack) return -1;
+    return m_videoTrack->selectedClip();
 }
 
 void Timeline::addAudioFile(const QString &filePath)
@@ -4592,6 +4798,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         double trailOutDuration = 0.0;
         TransitionAlignment trailOutAlignment = TransitionAlignment::Center;
         TransitionEasing trailOutEasing = TransitionEasing::Linear;
+        QVector<StabilizerKeyframe> stabilizerKeyframes;
     };
 
     QVector<QVector<Interval>> trackIntervals;
@@ -4631,6 +4838,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
                 iv.trailOutDuration = c.trailOut.duration;
                 iv.trailOutAlignment = c.trailOut.alignment;
                 iv.trailOutEasing = c.trailOut.easing;
+                iv.stabilizerKeyframes = c.stabilizerKeyframes;
                 ivs.append(iv);
                 accum += clipDur;
             }
@@ -4759,6 +4967,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         e.trailOutType = iv.trailOutType;
         e.trailOutDuration = iv.trailOutDuration;
         e.trailOutEasing = iv.trailOutEasing;
+        e.stabilizerKeyframes = iv.stabilizerKeyframes;
         qInfo() << "[SEQ] entry idx=" << result.size()
                 << "tl=[" << iv.timelineStart << "," << iv.timelineEnd << "]"
                 << "clip=[" << iv.clipIn << "," << iv.clipOut << "]"
@@ -5034,6 +5243,188 @@ void Timeline::restoreFromProject(const QVector<QVector<ClipInfo>> &videoTracks,
     scheduleEmitSequenceChanged();
 }
 
+// --- Timeline markers (Premiere Pro / DaVinci Resolve parity) ---
+// Markers are stored sorted by timelineUs so navigation is O(log N) and
+// lane painting is left-to-right without per-paint sorting. Mutations emit
+// markersChanged() so any future panel UI re-syncs without manual hooks.
+
+namespace {
+// Insert `m` into the sorted vector by timelineUs. Stable for equal stamps.
+inline void insertMarkerSorted(QVector<Marker> &vec, const Marker &m)
+{
+    auto it = std::lower_bound(vec.begin(), vec.end(), m.timelineUs,
+        [](const Marker &lhs, qint64 rhs) { return lhs.timelineUs < rhs; });
+    vec.insert(it, m);
+}
+} // namespace
+
+int Timeline::addMarker(qint64 timelineUs, const QString &label, QColor color)
+{
+    Marker m;
+    m.id = m_nextMarkerId++;
+    m.timelineUs = qMax<qint64>(0, timelineUs);
+    m.label = label;
+    m.color = color.isValid() ? color : QColor(QStringLiteral("#ff5050"));
+    insertMarkerSorted(m_markersData, m);
+    if (m_markerLane) m_markerLane->update();
+    emit markersChanged();
+    return m.id;
+}
+
+bool Timeline::removeMarker(int id)
+{
+    for (int i = 0; i < m_markersData.size(); ++i) {
+        if (m_markersData[i].id == id) {
+            m_markersData.removeAt(i);
+            if (m_markerLane) m_markerLane->update();
+            emit markersChanged();
+            return true;
+        }
+    }
+    return false;
+}
+
+bool Timeline::updateMarker(int id, const Marker &updated)
+{
+    for (int i = 0; i < m_markersData.size(); ++i) {
+        if (m_markersData[i].id == id) {
+            // Preserve the original id even if `updated.id` was 0 / unset
+            // (callers shouldn't have to thread the id back through).
+            Marker copy = updated;
+            copy.id = id;
+            if (!copy.color.isValid())
+                copy.color = QColor(QStringLiteral("#ff5050"));
+            // Re-sort if the time changed, otherwise just overwrite in place.
+            if (copy.timelineUs == m_markersData[i].timelineUs) {
+                m_markersData[i] = copy;
+            } else {
+                m_markersData.removeAt(i);
+                insertMarkerSorted(m_markersData, copy);
+            }
+            if (m_markerLane) m_markerLane->update();
+            emit markersChanged();
+            return true;
+        }
+    }
+    return false;
+}
+
+Marker Timeline::markerById(int id) const
+{
+    for (const auto &m : m_markersData)
+        if (m.id == id) return m;
+    return Marker{}; // default-constructed (id == -1) on miss
+}
+
+QVector<Marker> Timeline::markersInRange(qint64 startUs, qint64 endUs) const
+{
+    QVector<Marker> result;
+    if (endUs < startUs) std::swap(startUs, endUs);
+    // Markers are sorted; binary-search the lower bound for cheap range queries.
+    auto lo = std::lower_bound(m_markersData.begin(), m_markersData.end(), startUs,
+        [](const Marker &m, qint64 v) { return m.timelineUs < v; });
+    auto hi = std::upper_bound(m_markersData.begin(), m_markersData.end(), endUs,
+        [](qint64 v, const Marker &m) { return v < m.timelineUs; });
+    for (auto it = lo; it != hi; ++it)
+        result.append(*it);
+    return result;
+}
+
+int Timeline::nextMarkerAfter(qint64 timelineUs) const
+{
+    auto it = std::upper_bound(m_markersData.begin(), m_markersData.end(), timelineUs,
+        [](qint64 v, const Marker &m) { return v < m.timelineUs; });
+    if (it == m_markersData.end()) return -1;
+    return it->id;
+}
+
+int Timeline::prevMarkerBefore(qint64 timelineUs) const
+{
+    auto it = std::lower_bound(m_markersData.begin(), m_markersData.end(), timelineUs,
+        [](const Marker &m, qint64 v) { return m.timelineUs < v; });
+    if (it == m_markersData.begin()) return -1;
+    --it;
+    return it->id;
+}
+
+void Timeline::setMarkers(const QVector<Marker> &markers)
+{
+    m_markersData = markers;
+    std::sort(m_markersData.begin(), m_markersData.end(),
+        [](const Marker &a, const Marker &b) { return a.timelineUs < b.timelineUs; });
+    // Restore the monotonic id counter so newly-added markers don't collide
+    // with serialized ids from a loaded project.
+    int maxId = 0;
+    for (const auto &m : m_markersData) maxId = qMax(maxId, m.id);
+    m_nextMarkerId = maxId + 1;
+    if (m_markerLane) m_markerLane->update();
+    emit markersChanged();
+}
+
+// --- Adjustment layers (Premiere/Photoshop parity) ---
+// CRUD methods mirror the marker pattern above. Stored unsorted; the
+// composeAdjustmentLayersAt() helper handles trackIndex stacking at
+// render time. Id counter is monotonic and resets on setAdjustmentLayers().
+
+int Timeline::addAdjustmentLayer(const AdjustmentLayer &layer)
+{
+    AdjustmentLayer copy = layer;
+    copy.id = m_nextAdjustmentLayerId++;
+    // Defensive: clamp negative timestamps and keep start <= end.
+    copy.timelineStartUs = qMax<qint64>(0, copy.timelineStartUs);
+    copy.timelineEndUs   = qMax<qint64>(copy.timelineStartUs, copy.timelineEndUs);
+    m_adjustmentLayers.append(copy);
+    emit adjustmentLayersChanged();
+    return copy.id;
+}
+
+bool Timeline::removeAdjustmentLayer(int id)
+{
+    for (int i = 0; i < m_adjustmentLayers.size(); ++i) {
+        if (m_adjustmentLayers[i].id == id) {
+            m_adjustmentLayers.removeAt(i);
+            emit adjustmentLayersChanged();
+            return true;
+        }
+    }
+    return false;
+}
+
+bool Timeline::updateAdjustmentLayer(int id, const AdjustmentLayer &layer)
+{
+    for (int i = 0; i < m_adjustmentLayers.size(); ++i) {
+        if (m_adjustmentLayers[i].id == id) {
+            // Preserve the original id even if `layer.id` was 0 / unset.
+            AdjustmentLayer copy = layer;
+            copy.id = id;
+            copy.timelineStartUs = qMax<qint64>(0, copy.timelineStartUs);
+            copy.timelineEndUs   = qMax<qint64>(copy.timelineStartUs, copy.timelineEndUs);
+            m_adjustmentLayers[i] = copy;
+            emit adjustmentLayersChanged();
+            return true;
+        }
+    }
+    return false;
+}
+
+AdjustmentLayer Timeline::adjustmentLayerById(int id) const
+{
+    for (const auto &l : m_adjustmentLayers)
+        if (l.id == id) return l;
+    return AdjustmentLayer{}; // default-constructed (id == -1) on miss
+}
+
+void Timeline::setAdjustmentLayers(const QVector<AdjustmentLayer> &layers)
+{
+    m_adjustmentLayers = layers;
+    // Restore the monotonic id counter so newly-added layers don't collide
+    // with serialized ids from a loaded project.
+    int maxId = 0;
+    for (const auto &l : m_adjustmentLayers) maxId = qMax(maxId, l.id);
+    m_nextAdjustmentLayerId = maxId + 1;
+    emit adjustmentLayersChanged();
+}
+
 void Timeline::onPlayheadAutoScrollTick()
 {
     // Drives auto-scroll while the user drags the playhead bar with the
@@ -5118,4 +5509,22 @@ void Timeline::updateInfoLabel()
     if (hasMarkedRange())
         info += QString(" | I/O: %1s-%2s").arg(m_markIn, 0, 'f', 1).arg(m_markOut, 0, 'f', 1);
     m_infoLabel->setText(info);
+}
+
+// US-INT-4: V1-only writer. Mutates the underlying TimelineTrack clip
+// vector via clips()/setClips() so the change participates in the normal
+// invalidation/repaint flow.
+void Timeline::setClipStabilizerKeyframes(int clipIndex,
+                                          const QVector<StabilizerKeyframe> &kfs)
+{
+    if (m_videoTracks.isEmpty() || !m_videoTracks.first())
+        return;
+    auto *track = m_videoTracks.first();
+    QVector<ClipInfo> clips = track->clips();
+    if (clipIndex < 0 || clipIndex >= clips.size())
+        return;
+    clips[clipIndex].stabilizerKeyframes = kfs;
+    track->setClips(clips);
+    track->update();
+    scheduleEmitSequenceChanged();
 }

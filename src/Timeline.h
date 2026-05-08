@@ -18,6 +18,10 @@
 #include "PlaybackTypes.h"
 #include "Overlay.h"
 #include "SnapEngine.h"
+#include "MarkerData.h"
+#include "SpeedRampData.h"
+#include "AdjustmentLayer.h"
+#include "MotionStabilizer.h"
 
 // Where Timeline::addClip drops a freshly-imported clip. Persisted via
 // QSettings('VSimpleEditor','Preferences')/importPlacement; the MainWindow
@@ -44,6 +48,7 @@ class PlayheadOverlay;
 class TextStripWidget;
 struct TimelineState;
 class MarkerManager;
+class MarkerLane;  // 16px-tall lane painting Marker triangles above the time ruler
 class QDragEnterEvent;
 class QDragMoveEvent;
 class QDragLeaveEvent;
@@ -97,6 +102,19 @@ struct ClipInfo {
 
     // Phase 6: Enhanced text overlays
     TextManager textManager;
+
+    // Per-clip variable-speed curve. Default = identity (single keyframe at
+    // 0us, speed 1.0). When non-identity, consumers (VideoPlayer / AudioMixer)
+    // must walk the curve via timelineToSourceUs to map timeline ticks to
+    // source PTS. Consumer wiring is deferred — see SpeedRampData.h header
+    // comment for the integration sites.
+    speedramp::SpeedRamp speedRamp = speedramp::SpeedRamp::identity();
+
+    // US-INT-4: per-frame stabilization transform keyframes baked by the
+    // 編集 > スタビライズ slot. Empty = identity (no stabilization). GLPreview
+    // looks up the active source-time via std::lower_bound and applies the
+    // INVERSE 2D affine, composed with the user 3D-rotate matrix.
+    QVector<StabilizerKeyframe> stabilizerKeyframes;
 
     double effectiveDuration() const {
         double out = (outPoint > 0.0) ? outPoint : duration;
@@ -326,6 +344,38 @@ public:
     void setMarkerManager(MarkerManager *mm) { m_markerManager = mm; }
     MarkerManager *markerManager() const { return m_markerManager; }
 
+    // --- Timeline markers (Premiere Pro / DaVinci Resolve parity) ---
+    // Independent of the legacy MarkerManager/SnapEngine pipeline. Owns a
+    // monotonic id counter so ids survive save/load and can be referenced
+    // from a future markers-panel UI without churn. Spec acceptance #1-4.
+    int addMarker(qint64 timelineUs, const QString &label,
+                  QColor color = QColor(QStringLiteral("#ff5050")));
+    bool removeMarker(int id);
+    bool updateMarker(int id, const Marker &updated);
+    Marker markerById(int id) const;
+    const QVector<Marker> &markers() const { return m_markersData; }
+    QVector<Marker> markersInRange(qint64 startUs, qint64 endUs) const;
+    int nextMarkerAfter(qint64 timelineUs) const;   // returns id, -1 if none
+    int prevMarkerBefore(qint64 timelineUs) const;  // returns id, -1 if none
+    // Replace the entire marker list (used on project load). Resets the
+    // monotonic id counter to max(existing ids)+1 so new markers don't
+    // collide with serialized ids.
+    void setMarkers(const QVector<Marker> &markers);
+
+    // --- Adjustment layers (Premiere/Photoshop parity) ---
+    // Stored unsorted; ordering is dictated by the layer's `trackIndex`
+    // and stack position which composeAdjustmentLayersAt() resolves at
+    // render time. Mutations emit adjustmentLayersChanged() so future
+    // panel UI re-syncs without manual hooks.
+    int addAdjustmentLayer(const AdjustmentLayer &layer);   // returns id
+    bool removeAdjustmentLayer(int id);
+    bool updateAdjustmentLayer(int id, const AdjustmentLayer &layer);
+    const QVector<AdjustmentLayer> &adjustmentLayers() const { return m_adjustmentLayers; }
+    AdjustmentLayer adjustmentLayerById(int id) const;
+    // Replace the entire adjustment layer list (used on project load).
+    // Resets the monotonic id counter to max(existing ids)+1.
+    void setAdjustmentLayers(const QVector<AdjustmentLayer> &layers);
+
     // AudioMixer integration for undo/restore of track gains
     void setAudioMixer(AudioMixer *mixer) { m_audioMixer = mixer; }
     AudioMixer *audioMixer() const { return m_audioMixer; }
@@ -372,6 +422,14 @@ public:
     void setClipSpeed(double speed);
     void setClipVolume(double volume);
 
+    // Per-clip speed-ramp (variable speed curve). Operates on V1 by clip
+    // index. Returns the identity ramp for invalid indices so callers can
+    // safely query without bounds-checking. setSpeedRamp re-emits the
+    // playback sequences so VideoPlayer / AudioMixer pull the new ramp on
+    // their next pass.
+    const speedramp::SpeedRamp &speedRamp(int clipIndex) const;
+    void setSpeedRamp(int clipIndex, const speedramp::SpeedRamp &ramp);
+
     // Phase 3: Color correction, effects, keyframes
     void setClipColorCorrection(const ColorCorrection &cc);
     // Attach a transition to the currently selected clip. FadeIn writes to
@@ -386,6 +444,8 @@ public:
     QVector<VideoEffect> clipEffects() const;
     KeyframeManager clipKeyframes() const;
     double selectedClipDuration() const;
+    // Index of the selected clip on V1 (delegates to m_videoTrack); -1 if none.
+    int selectedVideoClipIndex() const;
 
     // Audio
     void addAudioFile(const QString &filePath);
@@ -407,6 +467,17 @@ public:
             return kEmpty;
         return m_videoTracks.first()->clips();
     }
+    // US-INT-4: V1-only stabilizer keyframe accessors. Returns empty for
+    // out-of-range indices. setClipStabilizerKeyframes overwrites the
+    // existing vector (the slot calls clear-then-write semantics).
+    const QVector<StabilizerKeyframe> &clipStabilizerKeyframesAt(int clipIndex) const {
+        static const QVector<StabilizerKeyframe> kEmpty;
+        const auto &clips = videoClips();
+        if (clipIndex < 0 || clipIndex >= clips.size())
+            return kEmpty;
+        return clips[clipIndex].stabilizerKeyframes;
+    }
+    void setClipStabilizerKeyframes(int clipIndex, const QVector<StabilizerKeyframe> &kfs);
     // Add a text overlay to V1's first clip, writing back via setClips so
     // the mutation actually persists. Used by MainWindow's Adobe-style text
     // tool. Returns true if an overlay was added.
@@ -417,6 +488,9 @@ public:
     // Rewrite an existing overlay's rect (center-based normalized x/y,
     // normalized width/height). Returns false if the index is invalid.
     bool updateTextOverlayRect(int overlayIndex, double x, double y, double width, double height);
+    // Apply a fully-mutated overlay (e.g. from TrackerLink) back into the
+    // clip's TextManager without requiring a const_cast at the call site.
+    bool applyTrackingToOverlay(int overlayIndex, const EnhancedTextOverlay &updated);
     // US-T35 update a V-track clip's per-clip video source transform.
     // trackIdx 0 = V1, 1 = V2, ... ; clipIdx is the clip position within
     // that track. Triggers sequenceChanged so VideoPlayer re-pulls the
@@ -480,6 +554,16 @@ signals:
     void transitionShortened(QString transitionTypeName,
                              double askedSec, double effectiveSec);
     void statusMessageRequested(const QString &message, int timeoutMs);
+    // Spec-conformant marker signals. markersChanged fires on every
+    // addMarker/removeMarker/updateMarker/setMarkers mutation; markerClicked
+    // fires from MarkerLane when the user clicks the body of a marker
+    // triangle (future story will route this to an edit dialog).
+    void markersChanged();
+    void markerClicked(int id);
+    // Fires on every addAdjustmentLayer / removeAdjustmentLayer /
+    // updateAdjustmentLayer / setAdjustmentLayers mutation. Future
+    // GLPreview composite + panel UI subscribe here.
+    void adjustmentLayersChanged();
 
 protected:
     bool eventFilter(QObject *watched, QEvent *event) override;
@@ -605,6 +689,21 @@ private:
 
     // AudioMixer pointer — set by MainWindow for undo/restore of track gains
     AudioMixer *m_audioMixer = nullptr;
+
+    // --- Timeline markers (Premiere Pro / DaVinci Resolve parity) ---
+    // Markers are kept sorted by timelineUs so binary navigation in
+    // nextMarkerAfter / prevMarkerBefore stays O(log N). The id counter is
+    // monotonic and resets on setMarkers() to max(loaded ids)+1.
+    QVector<Marker> m_markersData;
+    int m_nextMarkerId = 1;
+    MarkerLane *m_markerLane = nullptr;
+
+    // --- Adjustment layers (Premiere/Photoshop parity) ---
+    // Storage is order-of-insertion; trackIndex + stack position are
+    // resolved by composeAdjustmentLayersAt() at render time. Id counter
+    // resets on setAdjustmentLayers() to max(loaded ids)+1.
+    QVector<AdjustmentLayer> m_adjustmentLayers;
+    int m_nextAdjustmentLayerId = 1;
 };
 
 class PlayheadOverlay : public QWidget
@@ -655,4 +754,45 @@ private:
     bool m_dragging = false;
     int m_dragStartX = 0;
     double m_dragStartPps = 10.0;
+};
+
+// 16px-tall strip painted above the time ruler. Draws each Timeline marker
+// as an 8x8 downward-pointing triangle at its time-mapped X. Hover shows a
+// QToolTip with `label\nH:MM:SS.mmm`; left-click on a marker emits
+// Timeline::markerClicked(id). The lane mirrors the timeline content
+// width + scroll offset so marker positions track ruler tick positions
+// exactly. No per-marker QObject overhead — every marker is a value in
+// QVector<Marker>, so ~100 markers stays a single paint call.
+class MarkerLane : public QWidget
+{
+    Q_OBJECT
+
+public:
+    explicit MarkerLane(Timeline *timeline, QWidget *parent = nullptr);
+
+public slots:
+    void setPixelsPerSecond(double pps);
+    // Content x-offset to subtract when drawing. Mirrors the horizontal
+    // scrollbar value of the timeline scroll area so markers align with
+    // clip x-coordinates while the user pans.
+    void setScrollOffset(int offsetX);
+
+signals:
+    void markerClicked(int id);
+
+protected:
+    void paintEvent(QPaintEvent *event) override;
+    void mousePressEvent(QMouseEvent *event) override;
+    bool event(QEvent *event) override;  // for QHelpEvent / QToolTip
+
+private:
+    int markerScreenX(qint64 timelineUs) const;
+    int hitTestMarker(const QPoint &pos) const;  // returns marker id, -1 on miss
+
+    Timeline *m_timeline = nullptr;
+    double m_pixelsPerSecond = 10.0;
+    int m_scrollOffset = 0;
+    static constexpr int kLaneHeight = 16;
+    static constexpr int kTriangleSize = 8;
+    static constexpr int kHitPad = 3;  // padding around triangle for hit-test
 };
