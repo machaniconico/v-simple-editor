@@ -48,6 +48,13 @@ struct AudioDecoderEntry {
     // Phase 2 review).
     int64_t ringStartTlUs = 0;
     double prevGain = 1.0; // last gain applied in inner copy loop, used to ramp at fragment seam
+    // US-INT-2 Phase B M2 fix: fractional source-frame remainder carried
+    // across atempo fragments. Without this, int(outputFrames*speedMul)
+    // truncates per fragment, leaving ringHead lagging ringStartTlUs by up
+    // to ~83µs each call on non-integer speedMul. Reset on seek/restart
+    // alongside the ring reset; preserved across ring compaction (which
+    // only reindexes — source pointer is unchanged).
+    double atempoSrcFrameCarry = 0.0;
     bool eof = false;
     bool seekPending = true;         // first-time seek to entry's start when approached
     AVPacket *pkt = nullptr;
@@ -380,6 +387,7 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
             if (dropBytes > 0) {
                 e->ringHead += static_cast<int>(dropBytes);
                 e->ringStartTlUs += bytesToUs(dropBytes);
+                e->atempoSrcFrameCarry = 0.0;
             }
             if (liveBytes(*e) <= 0) continue;
         }
@@ -447,6 +455,7 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
             const int dropBytes = static_cast<int>(qMin<qint64>(maxlen, liveBytes(*e)));
             e->ringHead += dropBytes;
             e->ringStartTlUs += bytesToUs(dropBytes);
+            e->atempoSrcFrameCarry = 0.0;
             continue;
         }
 
@@ -516,16 +525,44 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
                 continue;
             }
             copyBytes = outputFrames * AudioMixer::kBytesPerFrame;
-            sourceBytesConsumed = qMin<int>(liveB, qMax<int>(0,
-                static_cast<int>(outputFrames * speedMul)
-                    * AudioMixer::kBytesPerFrame));
+            // M2 fix: phase-coherent fractional source-frame accounting.
+            // Without this, int(outputFrames*speedMul) truncates per
+            // fragment (e.g. 1.5 × 999 = 1498.5 → 1498), so ringHead lags
+            // ringStartTlUs and the loop's first srcFrameIdx in fragment
+            // N+1 misaligns with fragment N's last read by the truncated
+            // fraction. Tracking the residual phase fixes both:
+            //   • wantSrcFrames adds last fragment's leftover phase, so
+            //     ringHead advances by floor(phase_in + outFrames*speed)
+            //     and (over time) averages exactly outFrames*speed.
+            //   • The inner loop offsets srcFrameIdx by phase_in so the
+            //     fragment-local walk continues the global continuous
+            //     walk without a sample-boundary skip.
+            const double phaseIn = e->atempoSrcFrameCarry;
+            const double wantSrcFrames =
+                static_cast<double>(outputFrames) * speedMul + phaseIn;
+            const int takeSrcFrames =
+                static_cast<int>(qMax<double>(0.0, wantSrcFrames));
+            const int unclampedSrcBytes =
+                takeSrcFrames * AudioMixer::kBytesPerFrame;
+            sourceBytesConsumed = qMin<int>(liveB,
+                qMax<int>(0, unclampedSrcBytes));
+            if (sourceBytesConsumed == unclampedSrcBytes) {
+                e->atempoSrcFrameCarry = wantSrcFrames
+                    - static_cast<double>(takeSrcFrames);
+            } else {
+                // Ring-underflow clamp tripped — drop carry so the
+                // late-drop / re-sync path (cursorUs vs ringStartTlUs)
+                // does not see an amplified deficit on the next fragment.
+                e->atempoSrcFrameCarry = 0.0;
+            }
             const int outputSamples = copyBytes
                 / static_cast<int>(sizeof(int16_t));
             stagedSamples.resize(outputSamples);
             const int16_t *ringSrc = reinterpret_cast<const int16_t *>(liveData(*e));
             const int liveFrames = liveB / AudioMixer::kBytesPerFrame;
             for (int frame = 0; frame < outputFrames; ++frame) {
-                int srcFrameIdx = static_cast<int>(frame * speedMul);
+                int srcFrameIdx = static_cast<int>(
+                    phaseIn + static_cast<double>(frame) * speedMul);
                 if (srcFrameIdx >= liveFrames) srcFrameIdx = liveFrames - 1;
                 if (srcFrameIdx < 0) srcFrameIdx = 0;
                 for (int ch = 0; ch < AudioMixer::kChannels; ++ch) {
@@ -1443,6 +1480,7 @@ void AudioMixer::setSequence(const QVector<PlaybackEntry> &entries) {
                     de->seekPending = true;
                     de->ring.clear();
                     de->ringHead = 0;
+                    de->atempoSrcFrameCarry = 0.0;
                 }
                 retained.insert(key, de);
             } else {
@@ -1654,6 +1692,7 @@ void AudioMixer::seekTo(int64_t timelineUs) {
                 e->seekPending = true;
                 e->ring.clear();
                 e->ringHead = 0;
+                e->atempoSrcFrameCarry = 0.0;
                 e->ringStartTlUs = timelineUs;
                 e->eof = false;
             }
@@ -1688,6 +1727,7 @@ void AudioMixer::seekTo(int64_t timelineUs) {
             e->seekPending = true;
             e->ring.clear();
             e->ringHead = 0;
+            e->atempoSrcFrameCarry = 0.0;
             e->ringStartTlUs = timelineUs;
             e->eof = false;
         }
@@ -2281,6 +2321,7 @@ void AudioMixer::seekEntryToTimeline(AudioDecoderEntry *e, int64_t timelineUs) {
     avcodec_flush_buffers(e->codecCtx);
     e->ring.clear();
     e->ringHead = 0;
+    e->atempoSrcFrameCarry = 0.0;
     // The next sample appended to the ring corresponds to the timeline
     // position we just seeked the file to.
     e->ringStartTlUs = timelineUs;
