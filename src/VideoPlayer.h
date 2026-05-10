@@ -98,6 +98,8 @@ public:
     // A2/A3/... tracks all sound simultaneously.
     void setAudioSequence(const QVector<PlaybackEntry> &entries);
     AudioMixer *audioMixer() { return m_mixer; }
+    void setMuted(bool muted);
+    bool isMuted() const { return m_muted; }
     void setCanvasSize(int width, int height);
     void setColorCorrection(const ColorCorrection &cc);
     // Transient effect stack applied on top of every composed frame (live dialog preview).
@@ -434,6 +436,7 @@ private:
     QTimer *m_playbackTimer = nullptr;
     QTimer *m_seekTimer = nullptr;
     AudioMixer *m_mixer = nullptr;
+    bool m_muted = false;
 
     AVFormatContext *m_formatCtx = nullptr;
     AVCodecContext *m_codecCtx = nullptr;

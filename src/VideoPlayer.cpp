@@ -903,6 +903,17 @@ void VideoPlayer::setAudioSequence(const QVector<PlaybackEntry> &entries)
     }
 }
 
+void VideoPlayer::setMuted(bool muted)
+{
+    if (m_muted == muted) return;
+    m_muted = muted;
+    if (!m_mixer) return;
+    const int trackCount = m_audioSequenceHadEntries ? 16 : 1;
+    for (int i = 0; i < trackCount; ++i) {
+        m_mixer->setTrackMute(i, muted);
+    }
+}
+
 // US-INT-2 Phase A: store per-entry speed ramps parallel to m_sequence.
 // The active consumer is entryLocalPositionUs (video reprojection); audio
 // time-stretching is deferred to Phase B. Caller (MainWindow) MUST invoke

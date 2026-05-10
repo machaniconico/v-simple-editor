@@ -1,0 +1,12 @@
+build/
+.git/
+.omc/
+.claude/
+resources/
+*.log
+build_log.txt
+setup_log.txt
+pip.log
+AGENTS.md
+CLAUDE.md
+graphify-out/
