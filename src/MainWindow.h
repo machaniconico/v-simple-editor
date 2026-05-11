@@ -13,6 +13,7 @@
 #include <QLabel>
 #include <QShowEvent>
 #include <QColor>
+#include <QHash>
 #include <QRectF>
 #include "ProjectSettings.h"
 #include "Exporter.h"
@@ -71,6 +72,7 @@ class VoiceOverDialog;
 class VideoPlayer;
 class Timeline;
 class ExportDialog;
+class BrushAnimation;
 
 class MainWindow : public QMainWindow
 {
@@ -153,6 +155,7 @@ private slots:
     void addShapeLayer();
     void addParticleEffect();
     void addTextAnimation();
+    void addBrushAnimation();
     void editTransformKeyframes();
     void addMask();
     void applyWarpEffect();
@@ -260,6 +263,11 @@ private:
     void updateTitle();
     void collectAudioState(ProjectData &data);
     void applyAudioState(const ProjectData &data);
+    static QString brushClipId(int trackIdx, int clipIdx);
+    void setBrushAnimationEntries(const QVector<BrushAnimationEntry> &entries);
+    void upsertBrushAnimationEntry(const BrushAnimationEntry &entry);
+    BrushAnimation *materializeBrushAnimation(const QString &clipId);
+    void syncBrushAnimationPreviewForClip(int trackIdx, int clipIdx);
 
     VideoPlayer *m_player;
     Timeline *m_timeline;
@@ -268,6 +276,8 @@ private:
     effectctrl::EffectControlsPanel *m_effectControlsPanel = nullptr;
     QStringList m_supportedFormats;
     ProjectConfig m_projectConfig;
+    QVector<BrushAnimationEntry> m_brushAnimationEntries;
+    QHash<QString, BrushAnimation *> m_liveBrushAnimations;
 
     QAction *m_trackMotionAction = nullptr; // US-FEAT-D: motion tracking UI
     class QSlider *m_lutIntensitySlider = nullptr; // LUT intensity slider (0..100)

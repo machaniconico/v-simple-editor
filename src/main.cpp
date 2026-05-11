@@ -21,6 +21,10 @@
 #include "MainWindow.h"
 #include "SplashScreen.h"
 
+#if defined(VEDITOR_BRUSH_SELFTEST)
+#include "BrushAnimation.h"
+#endif
+
 // ──────────────────────────────────────────────────────────────────────────
 // Lightweight file-backed logger + unhandled-exception reporter.
 //
@@ -181,6 +185,41 @@ int main(int argc, char *argv[])
     )");
 
     writeLogLine("INFO", "QApplication constructed");
+
+#if defined(VEDITOR_BRUSH_SELFTEST)
+    {
+        qDebug() << "=== VEDITOR_BRUSH_SELFTEST: BrushAnimation synthetic self-test ===";
+        BrushAnimation brush;
+        brush.setText("Hello World");
+
+        brush.setProgress(0.0);
+        QImage frame0 = brush.renderFrame(1920, 1080);
+        int pixels0 = 0;
+        for (int y = 0; y < frame0.height(); ++y)
+            for (int x = 0; x < frame0.width(); ++x)
+                if (qAlpha(frame0.pixel(x, y)) > 0) ++pixels0;
+        qDebug() << "  progress=0.0  non-transparent pixels:" << pixels0;
+
+        brush.setProgress(0.5);
+        QImage frame5 = brush.renderFrame(1920, 1080);
+        int pixels5 = 0;
+        for (int y = 0; y < frame5.height(); ++y)
+            for (int x = 0; x < frame5.width(); ++x)
+                if (qAlpha(frame5.pixel(x, y)) > 0) ++pixels5;
+        qDebug() << "  progress=0.5  non-transparent pixels:" << pixels5;
+
+        brush.setProgress(1.0);
+        QImage frame1 = brush.renderFrame(1920, 1080);
+        int pixels1 = 0;
+        for (int y = 0; y < frame1.height(); ++y)
+            for (int x = 0; x < frame1.width(); ++x)
+                if (qAlpha(frame1.pixel(x, y)) > 0) ++pixels1;
+        qDebug() << "  progress=1.0  non-transparent pixels:" << pixels1;
+
+        Q_ASSERT(pixels0 <= pixels5 && pixels5 <= pixels1);
+        qDebug() << "=== VEDITOR_BRUSH_SELFTEST: PASSED ===";
+    }
+#endif
 
     // スプラッシュ画面
     AppSplashScreen splash;

@@ -111,6 +111,18 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
         root["planarTracks"] = ptArr;
     }
 
+    // US-BRUSH-5: brush animations
+    {
+        QJsonArray baArr;
+        for (const auto &entry : data.brushAnimations) {
+            QJsonObject obj;
+            obj["clipId"] = entry.clipId;
+            obj["brushData"] = entry.brushData;
+            baArr.append(obj);
+        }
+        root["brushAnimations"] = baArr;
+    }
+
     QJsonDocument doc(root);
     QFile file(filePath);
     if (!file.open(QIODevice::WriteOnly))
@@ -174,6 +186,18 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
             data.planarTracks.append(planarTrackFromJson(v.toObject()));
     }
 
+    // US-BRUSH-5: brush animations — backward compat: missing key = empty list
+    data.brushAnimations.clear();
+    if (root.contains("brushAnimations")) {
+        for (const auto &v : root["brushAnimations"].toArray()) {
+            QJsonObject obj = v.toObject();
+            BrushAnimationEntry entry;
+            entry.clipId = obj["clipId"].toString();
+            entry.brushData = obj["brushData"].toObject();
+            data.brushAnimations.append(entry);
+        }
+    }
+
     return true;
 }
 
@@ -235,6 +259,18 @@ QString ProjectFile::toJsonString(const ProjectData &data)
         root["planarTracks"] = ptArr;
     }
 
+    // US-BRUSH-5: brush animations
+    {
+        QJsonArray baArr;
+        for (const auto &entry : data.brushAnimations) {
+            QJsonObject obj;
+            obj["clipId"] = entry.clipId;
+            obj["brushData"] = entry.brushData;
+            baArr.append(obj);
+        }
+        root["brushAnimations"] = baArr;
+    }
+
     QJsonDocument doc(root);
     return QString::fromUtf8(doc.toJson(QJsonDocument::Compact));
 }
@@ -288,6 +324,18 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
     if (root.contains("planarTracks")) {
         for (const auto &v : root["planarTracks"].toArray())
             data.planarTracks.append(planarTrackFromJson(v.toObject()));
+    }
+
+    // US-BRUSH-5: brush animations — backward compat: missing key = empty list
+    data.brushAnimations.clear();
+    if (root.contains("brushAnimations")) {
+        for (const auto &v : root["brushAnimations"].toArray()) {
+            QJsonObject obj = v.toObject();
+            BrushAnimationEntry entry;
+            entry.clipId = obj["clipId"].toString();
+            entry.brushData = obj["brushData"].toObject();
+            data.brushAnimations.append(entry);
+        }
     }
 
     return true;

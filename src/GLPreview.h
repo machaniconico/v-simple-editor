@@ -21,6 +21,7 @@
 
 class Timeline;
 class SurfaceTool;
+class BrushAnimation;
 
 class GLPreview : public QOpenGLWidget, protected QOpenGLFunctions
 {
@@ -31,6 +32,9 @@ public:
     ~GLPreview();
 
     void displayFrame(const QImage &frame);
+    void setBrushAnimation(BrushAnimation *animation);
+    void clearBrushAnimation();
+    void setBrushAnimationProgress(double progress);
     void setDisplayAspectRatio(double aspectRatio);
     void setColorCorrection(const ColorCorrection &cc);
     // 0 = none (SDR sRGB), 1 = PQ (SMPTE ST 2084), 2 = HLG (ARIB STD-B67)
@@ -298,6 +302,8 @@ private:
     QOpenGLVertexArrayObject m_vao;
 
     QImage m_currentFrame;
+    BrushAnimation *m_brushAnimation = nullptr;
+    double m_brushAnimationProgress = 0.0;
     ColorCorrection m_cc;
     bool m_effectsEnabled = true;
     bool m_needsUpload = false;

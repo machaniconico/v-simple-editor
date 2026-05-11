@@ -1,4 +1,5 @@
 #include "GLPreview.h"
+#include "Overlay.h"
 #include "Timeline.h"
 #include "VideoPlayer.h"
 #include "AdjustmentLayer.h"
@@ -964,6 +965,33 @@ GLPreview::GLPreview(QWidget *parent)
     });
 }
 
+void GLPreview::setBrushAnimation(BrushAnimation *animation)
+{
+    if (m_brushAnimation == animation)
+        return;
+    m_brushAnimation = animation;
+    m_needsUpload = true;
+    update();
+}
+
+void GLPreview::clearBrushAnimation()
+{
+    m_brushAnimation = nullptr;
+    m_brushAnimationProgress = 0.0;
+    m_needsUpload = true;
+    update();
+}
+
+void GLPreview::setBrushAnimationProgress(double progress)
+{
+    const double clamped = qBound(0.0, progress, 1.0);
+    if (std::abs(m_brushAnimationProgress - clamped) <= 1.0e-6)
+        return;
+    m_brushAnimationProgress = clamped;
+    m_needsUpload = true;
+    update();
+}
+
 GLPreview::~GLPreview()
 {
     // Primary cleanup path is cleanupGL() via QOpenGLContext::aboutToBeDestroyed.
@@ -1720,6 +1748,11 @@ void GLPreview::paintGL()
     double renderDy = m_videoSourceDy;
     double clipOpacity = 1.0;
     QImage uploadFrame = m_currentFrame;
+    if (m_brushAnimation) {
+        OverlayRenderer::renderBrushOverlay(uploadFrame,
+                                            m_brushAnimation,
+                                            m_brushAnimationProgress);
+    }
     if (previewMotion.valid) {
         renderScale = previewMotion.scale;
         renderDx = previewMotion.dx;
@@ -1732,7 +1765,7 @@ void GLPreview::paintGL()
         }
         if (!m_compositeBakedMode
             && (std::abs(previewMotion.rotation2D) > 1e-4 || previewMotion.is3DLayer)) {
-            uploadFrame = applyPlanarRotation(m_currentFrame, previewMotion.rotation2D);
+            uploadFrame = applyPlanarRotation(uploadFrame, previewMotion.rotation2D);
             if (previewMotion.is3DLayer) {
                 Camera3DState cameraState;
                 uploadFrame = Camera3D::applyPerspective(uploadFrame,

@@ -1,4 +1,5 @@
 #include "Overlay.h"
+#include "BrushAnimation.h"
 #include <QPainter>
 #include <QPainterPath>
 #include <QFontMetrics>
@@ -63,6 +64,26 @@ QImage rasterTextAlpha(const QString &text, const QRect &rect,
     p.drawText(QRect(padPx, padPx, rect.width(), rect.height()), alignFlags, text);
     p.end();
     return buf;
+}
+
+double brushProgressForTime(const BrushOverlay &overlay, double currentTime)
+{
+    if (!overlay.visible || !overlay.animation) {
+        return -1.0;
+    }
+
+    if (overlay.durationSec > 0.0) {
+        const double localTime = currentTime - overlay.startTime;
+        if (localTime <= 0.0) {
+            return 0.0;
+        }
+        if (localTime >= overlay.durationSec) {
+            return 1.0;
+        }
+        return localTime / overlay.durationSec;
+    }
+
+    return overlay.animation->progress();
 }
 
 } // namespace
@@ -208,6 +229,36 @@ void OverlayRenderer::renderImageOverlay(QImage &frame, const ImageOverlay &over
 
         painter.drawImage(x, y, scaled);
     }
+}
+
+void OverlayRenderer::renderBrushOverlay(QImage &frame, const BrushOverlay &overlay, double currentTime)
+{
+    const double progress = brushProgressForTime(overlay, currentTime);
+    if (progress < 0.0) {
+        return;
+    }
+    renderBrushOverlay(frame, overlay.animation, progress);
+}
+
+void OverlayRenderer::renderBrushOverlay(QImage &frame, BrushAnimation *brushAnimation, double progress)
+{
+    if (frame.isNull() || !brushAnimation) {
+        return;
+    }
+
+    const double clampedProgress = qBound(0.0, progress, 1.0);
+    if (clampedProgress <= 0.0) {
+        return;
+    }
+
+    const QImage brushFrame = brushAnimation->renderFrame(frame.size(), clampedProgress);
+    if (brushFrame.isNull()) {
+        return;
+    }
+
+    QPainter painter(&frame);
+    painter.setCompositionMode(QPainter::CompositionMode_SourceOver);
+    painter.drawImage(0, 0, brushFrame);
 }
 
 void OverlayRenderer::renderPip(QImage &frame, const QImage &pipSource, const PipConfig &config)

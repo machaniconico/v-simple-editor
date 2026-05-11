@@ -147,3 +147,12 @@ double KeyframeManager::valueAt(const QString &propertyName, double time, double
     const auto *t = track(propertyName);
     return t ? t->valueAt(time) : defaultVal;
 }
+
+// US-BRUSH-5: idempotent helper — adds a 'brush_progress' KeyframeTrack
+// with default 0.0 if not already present.
+void ensureBrushProgressTrack(KeyframeManager &manager)
+{
+    if (!manager.hasTrack(QStringLiteral("brush_progress"))) {
+        manager.addTrack(KeyframeTrack(QStringLiteral("brush_progress"), 0.0));
+    }
+}

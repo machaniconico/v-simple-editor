@@ -8,6 +8,8 @@
 #include <QVector>
 #include <QPolygonF>
 
+class BrushAnimation;
+
 // --- Text Overlay (Telop) ---
 
 struct TextOverlay {
@@ -306,6 +308,18 @@ struct PipConfig {
     }
 };
 
+// --- Brush / Write-On Overlay ---
+
+struct BrushOverlay {
+    BrushAnimation *animation = nullptr;
+    double startTime = 0.0;
+    double durationSec = 0.0;
+    bool visible = true;
+
+    void setBrushAnimation(BrushAnimation *brushAnimation) { animation = brushAnimation; }
+    BrushAnimation *brushAnimation() const { return animation; }
+};
+
 // --- Composite render layer ---
 
 class OverlayRenderer
@@ -313,6 +327,8 @@ class OverlayRenderer
 public:
     static void renderTextOverlay(QImage &frame, const TextOverlay &overlay, double currentTime);
     static void renderImageOverlay(QImage &frame, const ImageOverlay &overlay, double currentTime);
+    static void renderBrushOverlay(QImage &frame, const BrushOverlay &overlay, double currentTime);
+    static void renderBrushOverlay(QImage &frame, BrushAnimation *brushAnimation, double progress);
     static void renderPip(QImage &frame, const QImage &pipSource, const PipConfig &config);
     static QImage applyTransition(const QImage &from, const QImage &to, TransitionType type, double progress);
 };

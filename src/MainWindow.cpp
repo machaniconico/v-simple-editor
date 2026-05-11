@@ -61,6 +61,8 @@
 #include <array>
 #include "AudioMeterWidget.h"
 #include "GradientStopBar.h"
+#include "BrushAnimationDialog.h"
+#include "Keyframe.h"
 #include <QPushButton>
 #include <QDialog>
 #include <QDialogButtonBox>
@@ -122,6 +124,7 @@ MainWindow::MainWindow(QWidget *parent)
         data.playheadPos = m_timeline->playheadPosition();
         data.markIn = m_timeline->markedIn();
         data.markOut = m_timeline->markedOut();
+        data.brushAnimations = m_brushAnimationEntries;
         return ProjectFile::toJsonString(data);
     });
     connect(m_autoSave, &AutoSave::autoSaved, this, [this](const QString &path) {
@@ -158,6 +161,7 @@ MainWindow::MainWindow(QWidget *parent)
         [this](int trackIdx, int clipIdx) {
             if (m_player)
                 m_player->setEditTargetByClip(trackIdx, clipIdx);
+            syncBrushAnimationPreviewForClip(trackIdx, clipIdx);
         });
     connect(m_timeline->undoManager(), &UndoManager::stateChanged, this, [this]() {
         updateEditActions();
@@ -181,6 +185,82 @@ MainWindow::MainWindow(QWidget *parent)
 double MainWindow::currentPlayheadSeconds() const
 {
     return m_timeline ? m_timeline->playheadPosition() : 0.0;
+}
+
+QString MainWindow::brushClipId(int trackIdx, int clipIdx)
+{
+    return QStringLiteral("%1:%2").arg(trackIdx).arg(clipIdx);
+}
+
+void MainWindow::setBrushAnimationEntries(const QVector<BrushAnimationEntry> &entries)
+{
+    for (auto it = m_liveBrushAnimations.cbegin(); it != m_liveBrushAnimations.cend(); ++it) {
+        if (it.value())
+            it.value()->deleteLater();
+    }
+    m_liveBrushAnimations.clear();
+    m_brushAnimationEntries = entries;
+}
+
+void MainWindow::upsertBrushAnimationEntry(const BrushAnimationEntry &entry)
+{
+    for (auto &existing : m_brushAnimationEntries) {
+        if (existing.clipId == entry.clipId) {
+            existing = entry;
+            return;
+        }
+    }
+    m_brushAnimationEntries.append(entry);
+}
+
+BrushAnimation *MainWindow::materializeBrushAnimation(const QString &clipId)
+{
+    if (auto *live = m_liveBrushAnimations.value(clipId, nullptr))
+        return live;
+
+    for (const auto &entry : m_brushAnimationEntries) {
+        if (entry.clipId != clipId)
+            continue;
+        auto *animation = new BrushAnimation(this);
+        animation->fromJson(entry.brushData);
+        m_liveBrushAnimations.insert(clipId, animation);
+        return animation;
+    }
+    return nullptr;
+}
+
+void MainWindow::syncBrushAnimationPreviewForClip(int trackIdx, int clipIdx)
+{
+    if (!m_player || !m_player->glPreview())
+        return;
+
+    if (!m_timeline || trackIdx < 0 || clipIdx < 0) {
+        m_player->glPreview()->clearBrushAnimation();
+        return;
+    }
+
+    auto *track = m_timeline->videoTracks().value(trackIdx, nullptr);
+    if (!track) {
+        m_player->glPreview()->clearBrushAnimation();
+        return;
+    }
+
+    const auto &clips = track->clips();
+    if (clipIdx >= clips.size()) {
+        m_player->glPreview()->clearBrushAnimation();
+        return;
+    }
+
+    auto *animation = materializeBrushAnimation(brushClipId(trackIdx, clipIdx));
+    if (!animation) {
+        m_player->glPreview()->clearBrushAnimation();
+        return;
+    }
+
+    const double progress = clips[clipIdx].keyframes.valueAt(
+        QStringLiteral("brush_progress"), 0.0, 0.0);
+    m_player->glPreview()->setBrushAnimation(animation);
+    m_player->glPreview()->setBrushAnimationProgress(progress);
 }
 
 void MainWindow::setupUI()
@@ -686,6 +766,10 @@ void MainWindow::setupMenuBar()
 
     auto *saveTemplateAction = insertMenu->addAction("テキストテンプレートを保存...");
     connect(saveTemplateAction, &QAction::triggered, this, &MainWindow::saveTextTemplate);
+
+    auto *addBrushAnimAction = insertMenu->addAction("ブラシ / 書き起こしアニメ追加(&B)...");
+    addBrushAnimAction->setShortcut(QKeySequence(Qt::Key_B));
+    connect(addBrushAnimAction, &QAction::triggered, this, &MainWindow::addBrushAnimation);
 
     insertMenu->addSeparator();
 
@@ -1852,6 +1936,7 @@ void MainWindow::saveProject()
     data.markIn = m_timeline->markedIn();
     data.markOut = m_timeline->markedOut();
     data.zoomLevel = 10; // TODO: expose zoom level getter
+    data.brushAnimations = m_brushAnimationEntries;
 
     collectAudioState(data);
 
@@ -1888,6 +1973,7 @@ void MainWindow::openProject()
     if (m_recentFilesManager)
         m_recentFilesManager->addFile(filePath);
     m_projectConfig = data.config;
+    setBrushAnimationEntries(data.brushAnimations);
     if (m_player)
         m_player->setCanvasSize(data.config.width, data.config.height);
     if (m_timeline)
@@ -1899,6 +1985,7 @@ void MainWindow::openProject()
     hideWelcomeScreen();
     updateStatusInfo();
     updateEditActions();
+    syncBrushAnimationPreviewForClip(0, m_timeline ? m_timeline->selectedVideoClipIndex() : -1);
     statusBar()->showMessage("Opened: " + filePath);
 }
 
@@ -4625,6 +4712,53 @@ void MainWindow::addTextAnimation()
         statusBar()->showMessage(QString("Added text animation: \"%1\" with %2")
             .arg(text, selected));
     }
+}
+
+void MainWindow::addBrushAnimation()
+{
+    BrushAnimationDialog dialog(this);
+    if (dialog.exec() == QDialog::Rejected)
+        return;
+
+    auto params = dialog.params();
+
+    auto brushAnim = new BrushAnimation(this);
+    brushAnim->setText(params.text, params.font, params.basePosition);
+    brushAnim->setBrushWidth(params.brushWidth);
+    brushAnim->setMode(params.mode);
+
+    const auto &clips = m_timeline->videoClips();
+    if (clips.isEmpty()) {
+        statusBar()->showMessage("ブラシアニメ追加失敗 — クリップが見つかりません");
+        brushAnim->deleteLater();
+        return;
+    }
+
+    // AC2 — attach to the first selected video clip (fallback: first clip on
+    // first video track), mirroring addTextOverlayToFirstVideoClip pattern.
+    const int trackIdx = 0;
+    const int selectedIdx = m_timeline->selectedVideoClipIndex();
+    const int clipIdx = (selectedIdx >= 0 && selectedIdx < clips.size()) ? selectedIdx : 0;
+    const QString clipId = brushClipId(trackIdx, clipIdx);
+
+    BrushAnimationEntry entry;
+    entry.clipId = clipId;
+    entry.brushData = brushAnim->toJson();
+    upsertBrushAnimationEntry(entry);
+
+    if (auto *previous = m_liveBrushAnimations.value(clipId, nullptr))
+        previous->deleteLater();
+    m_liveBrushAnimations.insert(clipId, brushAnim);
+
+    KeyframeManager km = m_timeline->clipKeyframes();
+    ensureBrushProgressTrack(km);
+    m_timeline->setClipKeyframes(km);
+
+    syncBrushAnimationPreviewForClip(trackIdx, clipIdx);
+
+    statusBar()->showMessage(QString("ブラシアニメを追加: 「%1」 (%2)")
+        .arg(params.text, params.mode == BrushAnimationMode::PerCharacter
+            ? QStringLiteral("Per Character") : QStringLiteral("Per Stroke")));
 }
 
 void MainWindow::editTransformKeyframes()

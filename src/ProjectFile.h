@@ -59,6 +59,12 @@ struct OverlayItem {
     int trackIdx = 0;
 };
 
+// US-BRUSH-5: brush animation persistence entry
+struct BrushAnimationEntry {
+    QString clipId;           // "trackIndex:clipIndex" reference to owning clip
+    QJsonObject brushData;    // serialized BrushAnimation via toJson()
+};
+
 // Full project state for serialization
 struct ProjectData {
     ProjectConfig config;
@@ -80,6 +86,9 @@ struct ProjectData {
 
     // US-MOCHA-2: planar track persistence
     QVector<planartrack::PlanarTrack> planarTracks;
+
+    // US-BRUSH-5: brush animation persistence
+    QVector<BrushAnimationEntry> brushAnimations;
 };
 
 class ProjectFile

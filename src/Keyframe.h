@@ -63,3 +63,7 @@ public:
 private:
     QVector<KeyframeTrack> m_tracks;
 };
+
+// US-BRUSH-5: idempotent helper — adds a 'brush_progress' KeyframeTrack
+// with default 0.0 if not already present on the given KeyframeManager.
+void ensureBrushProgressTrack(KeyframeManager &manager);
