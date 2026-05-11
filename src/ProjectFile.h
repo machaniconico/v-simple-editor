@@ -65,6 +65,31 @@ struct BrushAnimationEntry {
     QJsonObject brushData;    // serialized BrushAnimation via toJson()
 };
 
+// US-AETEXT-12: AE text feature persistence entries
+struct PathTextEntry {
+    QJsonObject data;
+};
+
+struct Text3DLayerEntry {
+    QJsonObject data;
+};
+
+struct TextMaskRevealEntry {
+    QJsonObject data;
+};
+
+struct TextPathWarpEntry {
+    QJsonObject data;
+};
+
+struct VariableFontAxisEntry {
+    QJsonObject data;
+};
+
+struct MographTextEntry {
+    QJsonObject data;
+};
+
 // Full project state for serialization
 struct ProjectData {
     ProjectConfig config;
@@ -89,6 +114,14 @@ struct ProjectData {
 
     // US-BRUSH-5: brush animation persistence
     QVector<BrushAnimationEntry> brushAnimations;
+
+    // US-AETEXT-12: AE text feature persistence
+    QVector<PathTextEntry> pathTexts;
+    QVector<Text3DLayerEntry> text3DLayers;
+    QVector<TextMaskRevealEntry> textMaskReveals;
+    QVector<TextPathWarpEntry> textPathWarps;
+    QVector<VariableFontAxisEntry> variableFontAxes;
+    QVector<MographTextEntry> mographTexts;
 };
 
 class ProjectFile
@@ -143,4 +176,18 @@ private:
     // US-MOCHA-2: planar track persistence
     static QJsonObject planarTrackToJson(const planartrack::PlanarTrack &t);
     static planartrack::PlanarTrack planarTrackFromJson(const QJsonObject &obj);
+
+    // US-AETEXT-12: AE text feature persistence
+    static QJsonObject pathTextToJson(const PathTextEntry &e);
+    static PathTextEntry pathTextFromJson(const QJsonObject &obj);
+    static QJsonObject text3DLayerToJson(const Text3DLayerEntry &e);
+    static Text3DLayerEntry text3DLayerFromJson(const QJsonObject &obj);
+    static QJsonObject textMaskRevealToJson(const TextMaskRevealEntry &e);
+    static TextMaskRevealEntry textMaskRevealFromJson(const QJsonObject &obj);
+    static QJsonObject textPathWarpToJson(const TextPathWarpEntry &e);
+    static TextPathWarpEntry textPathWarpFromJson(const QJsonObject &obj);
+    static QJsonObject variableFontAxisToJson(const VariableFontAxisEntry &e);
+    static VariableFontAxisEntry variableFontAxisFromJson(const QJsonObject &obj);
+    static QJsonObject mographTextToJson(const MographTextEntry &e);
+    static MographTextEntry mographTextFromJson(const QJsonObject &obj);
 };

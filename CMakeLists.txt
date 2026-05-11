@@ -144,6 +144,20 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/MaskSystem.cpp
     src/ParticleSystem.cpp
     src/TextAnimator.cpp
+    src/VariableFontAxis.h
+    src/VariableFontAxis.cpp
+    src/TextAnimPresets.h
+    src/TextAnimPresets.cpp
+    src/MographText.h
+    src/MographText.cpp
+    src/TextMaskReveal.h
+    src/TextMaskReveal.cpp
+    src/PathText.h
+    src/PathText.cpp
+    src/Text3DLayer.h
+    src/Text3DLayer.cpp
+    src/TextPathWarp.h
+    src/TextPathWarp.cpp
     src/BrushAnimation.h
     src/BrushAnimation.cpp
     src/BrushAnimationDialog.h

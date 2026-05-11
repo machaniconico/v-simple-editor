@@ -123,6 +123,44 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
         root["brushAnimations"] = baArr;
     }
 
+    // US-AETEXT-12: AE text features
+    {
+        QJsonArray ptArr;
+        for (const auto &e : data.pathTexts)
+            ptArr.append(pathTextToJson(e));
+        root["pathTexts"] = ptArr;
+    }
+    {
+        QJsonArray t3Arr;
+        for (const auto &e : data.text3DLayers)
+            t3Arr.append(text3DLayerToJson(e));
+        root["text3DLayers"] = t3Arr;
+    }
+    {
+        QJsonArray mrArr;
+        for (const auto &e : data.textMaskReveals)
+            mrArr.append(textMaskRevealToJson(e));
+        root["textMaskReveals"] = mrArr;
+    }
+    {
+        QJsonArray pwArr;
+        for (const auto &e : data.textPathWarps)
+            pwArr.append(textPathWarpToJson(e));
+        root["textPathWarps"] = pwArr;
+    }
+    {
+        QJsonArray vfArr;
+        for (const auto &e : data.variableFontAxes)
+            vfArr.append(variableFontAxisToJson(e));
+        root["variableFontAxes"] = vfArr;
+    }
+    {
+        QJsonArray mgArr;
+        for (const auto &e : data.mographTexts)
+            mgArr.append(mographTextToJson(e));
+        root["mographTexts"] = mgArr;
+    }
+
     QJsonDocument doc(root);
     QFile file(filePath);
     if (!file.open(QIODevice::WriteOnly))
@@ -198,6 +236,37 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
         }
     }
 
+    // US-AETEXT-12: AE text features — backward compat: missing key = empty vector
+    data.pathTexts.clear();
+    if (root.contains("pathTexts"))
+        for (const auto &v : root["pathTexts"].toArray())
+            data.pathTexts.append(pathTextFromJson(v.toObject()));
+
+    data.text3DLayers.clear();
+    if (root.contains("text3DLayers"))
+        for (const auto &v : root["text3DLayers"].toArray())
+            data.text3DLayers.append(text3DLayerFromJson(v.toObject()));
+
+    data.textMaskReveals.clear();
+    if (root.contains("textMaskReveals"))
+        for (const auto &v : root["textMaskReveals"].toArray())
+            data.textMaskReveals.append(textMaskRevealFromJson(v.toObject()));
+
+    data.textPathWarps.clear();
+    if (root.contains("textPathWarps"))
+        for (const auto &v : root["textPathWarps"].toArray())
+            data.textPathWarps.append(textPathWarpFromJson(v.toObject()));
+
+    data.variableFontAxes.clear();
+    if (root.contains("variableFontAxes"))
+        for (const auto &v : root["variableFontAxes"].toArray())
+            data.variableFontAxes.append(variableFontAxisFromJson(v.toObject()));
+
+    data.mographTexts.clear();
+    if (root.contains("mographTexts"))
+        for (const auto &v : root["mographTexts"].toArray())
+            data.mographTexts.append(mographTextFromJson(v.toObject()));
+
     return true;
 }
 
@@ -271,6 +340,44 @@ QString ProjectFile::toJsonString(const ProjectData &data)
         root["brushAnimations"] = baArr;
     }
 
+    // US-AETEXT-12: AE text features
+    {
+        QJsonArray ptArr;
+        for (const auto &e : data.pathTexts)
+            ptArr.append(pathTextToJson(e));
+        root["pathTexts"] = ptArr;
+    }
+    {
+        QJsonArray t3Arr;
+        for (const auto &e : data.text3DLayers)
+            t3Arr.append(text3DLayerToJson(e));
+        root["text3DLayers"] = t3Arr;
+    }
+    {
+        QJsonArray mrArr;
+        for (const auto &e : data.textMaskReveals)
+            mrArr.append(textMaskRevealToJson(e));
+        root["textMaskReveals"] = mrArr;
+    }
+    {
+        QJsonArray pwArr;
+        for (const auto &e : data.textPathWarps)
+            pwArr.append(textPathWarpToJson(e));
+        root["textPathWarps"] = pwArr;
+    }
+    {
+        QJsonArray vfArr;
+        for (const auto &e : data.variableFontAxes)
+            vfArr.append(variableFontAxisToJson(e));
+        root["variableFontAxes"] = vfArr;
+    }
+    {
+        QJsonArray mgArr;
+        for (const auto &e : data.mographTexts)
+            mgArr.append(mographTextToJson(e));
+        root["mographTexts"] = mgArr;
+    }
+
     QJsonDocument doc(root);
     return QString::fromUtf8(doc.toJson(QJsonDocument::Compact));
 }
@@ -337,6 +444,37 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
             data.brushAnimations.append(entry);
         }
     }
+
+    // US-AETEXT-12: AE text features — backward compat: missing key = empty vector
+    data.pathTexts.clear();
+    if (root.contains("pathTexts"))
+        for (const auto &v : root["pathTexts"].toArray())
+            data.pathTexts.append(pathTextFromJson(v.toObject()));
+
+    data.text3DLayers.clear();
+    if (root.contains("text3DLayers"))
+        for (const auto &v : root["text3DLayers"].toArray())
+            data.text3DLayers.append(text3DLayerFromJson(v.toObject()));
+
+    data.textMaskReveals.clear();
+    if (root.contains("textMaskReveals"))
+        for (const auto &v : root["textMaskReveals"].toArray())
+            data.textMaskReveals.append(textMaskRevealFromJson(v.toObject()));
+
+    data.textPathWarps.clear();
+    if (root.contains("textPathWarps"))
+        for (const auto &v : root["textPathWarps"].toArray())
+            data.textPathWarps.append(textPathWarpFromJson(v.toObject()));
+
+    data.variableFontAxes.clear();
+    if (root.contains("variableFontAxes"))
+        for (const auto &v : root["variableFontAxes"].toArray())
+            data.variableFontAxes.append(variableFontAxisFromJson(v.toObject()));
+
+    data.mographTexts.clear();
+    if (root.contains("mographTexts"))
+        for (const auto &v : root["mographTexts"].toArray())
+            data.mographTexts.append(mographTextFromJson(v.toObject()));
 
     return true;
 }
@@ -820,4 +958,78 @@ planartrack::PlanarTrack ProjectFile::planarTrackFromJson(const QJsonObject &obj
     planartrack::PlanarTrack t;
     planartrack::fromJson(obj, t);
     return t;
+}
+
+// --- US-AETEXT-12: AE text feature persistence ---
+
+QJsonObject ProjectFile::pathTextToJson(const PathTextEntry &e)
+{
+    return e.data;
+}
+
+PathTextEntry ProjectFile::pathTextFromJson(const QJsonObject &obj)
+{
+    PathTextEntry e;
+    e.data = obj;
+    return e;
+}
+
+QJsonObject ProjectFile::text3DLayerToJson(const Text3DLayerEntry &e)
+{
+    return e.data;
+}
+
+Text3DLayerEntry ProjectFile::text3DLayerFromJson(const QJsonObject &obj)
+{
+    Text3DLayerEntry e;
+    e.data = obj;
+    return e;
+}
+
+QJsonObject ProjectFile::textMaskRevealToJson(const TextMaskRevealEntry &e)
+{
+    return e.data;
+}
+
+TextMaskRevealEntry ProjectFile::textMaskRevealFromJson(const QJsonObject &obj)
+{
+    TextMaskRevealEntry e;
+    e.data = obj;
+    return e;
+}
+
+QJsonObject ProjectFile::textPathWarpToJson(const TextPathWarpEntry &e)
+{
+    return e.data;
+}
+
+TextPathWarpEntry ProjectFile::textPathWarpFromJson(const QJsonObject &obj)
+{
+    TextPathWarpEntry e;
+    e.data = obj;
+    return e;
+}
+
+QJsonObject ProjectFile::variableFontAxisToJson(const VariableFontAxisEntry &e)
+{
+    return e.data;
+}
+
+VariableFontAxisEntry ProjectFile::variableFontAxisFromJson(const QJsonObject &obj)
+{
+    VariableFontAxisEntry e;
+    e.data = obj;
+    return e;
+}
+
+QJsonObject ProjectFile::mographTextToJson(const MographTextEntry &e)
+{
+    return e.data;
+}
+
+MographTextEntry ProjectFile::mographTextFromJson(const QJsonObject &obj)
+{
+    MographTextEntry e;
+    e.data = obj;
+    return e;
 }

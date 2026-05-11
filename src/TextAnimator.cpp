@@ -1,4 +1,5 @@
 #include "TextAnimator.h"
+#include "Keyframe.h"
 
 #include <QPainter>
 #include <QRandomGenerator>
@@ -100,6 +101,289 @@ void TextAnimator::setText(const QString &text, const QFont &font, const QPointF
 void TextAnimator::setAnimation(const TextAnimConfig &config)
 {
     m_config = config;
+}
+
+// --- Range Selector ---
+
+void TextAnimator::setAnimatorRange(const AnimatorRange &range)
+{
+    m_animatorRange = range;
+}
+
+// --- Scope (US-AETEXT-9) ---
+
+void TextAnimator::setScope(TextAnimScope scope)
+{
+    m_scope = scope;
+}
+
+int TextAnimator::wordIndexOf(int charIdx) const
+{
+    if (charIdx < 0 || charIdx >= m_text.size())
+        return 0;
+
+    int wordIdx = 0;
+    bool inWord = false;
+    for (int i = 0; i <= charIdx; ++i) {
+        if (m_text[i].isSpace()) {
+            inWord = false;
+        } else {
+            if (!inWord) {
+                if (i > 0)
+                    wordIdx++;
+                inWord = true;
+            }
+        }
+    }
+    return wordIdx;
+}
+
+int TextAnimator::lineIndexOf(int charIdx) const
+{
+    if (charIdx < 0 || charIdx >= m_text.size())
+        return 0;
+
+    int lineIdx = 0;
+    for (int i = 0; i < charIdx; ++i) {
+        if (m_text[i] == QLatin1Char('\n'))
+            lineIdx++;
+    }
+    return lineIdx;
+}
+
+double TextAnimator::computeCharSelectorWeight(int charIdx, int totalChars) const
+{
+    if (totalChars <= 0)
+        return 0.0;
+
+    int effectiveIdx = charIdx;
+    int effectiveTotal = totalChars;
+
+    switch (m_scope) {
+    case TextAnimScope::Words: {
+        int totalWords = 0;
+        bool inWord = false;
+        for (int i = 0; i < m_text.size(); ++i) {
+            if (m_text[i].isSpace()) {
+                inWord = false;
+            } else {
+                if (!inWord) {
+                    totalWords++;
+                    inWord = true;
+                }
+            }
+        }
+        if (totalWords <= 0)
+            return 0.0;
+        effectiveIdx = wordIndexOf(charIdx);
+        effectiveTotal = totalWords;
+        break;
+    }
+    case TextAnimScope::Lines: {
+        int totalLines = 1;
+        for (int i = 0; i < m_text.size(); ++i) {
+            if (m_text[i] == QLatin1Char('\n'))
+                totalLines++;
+        }
+        effectiveIdx = lineIndexOf(charIdx);
+        effectiveTotal = totalLines;
+        break;
+    }
+    case TextAnimScope::CharactersExcludingSpaces: {
+        if (charIdx < m_text.size() && m_text[charIdx].isSpace())
+            return 0.0;
+        int nonSpaceCount = 0;
+        int nonSpaceIdx = 0;
+        for (int i = 0; i < m_text.size(); ++i) {
+            if (!m_text[i].isSpace()) {
+                if (i == charIdx) {
+                    nonSpaceIdx = nonSpaceCount;
+                }
+                nonSpaceCount++;
+            }
+        }
+        if (nonSpaceCount <= 0)
+            return 0.0;
+        effectiveIdx = nonSpaceIdx;
+        effectiveTotal = nonSpaceCount;
+        break;
+    }
+    case TextAnimScope::Characters:
+    default:
+        break;
+    }
+
+    double t = static_cast<double>(effectiveIdx) / static_cast<double>(effectiveTotal - 1);
+    if (effectiveTotal == 1)
+        t = 0.5;
+
+    // Apply offset (wraps around -1..1 to shift the range)
+    double offsetT = t - m_animatorRange.offset;
+    // Wrap into [0, 1]
+    while (offsetT < 0.0) offsetT += 1.0;
+    while (offsetT > 1.0) offsetT -= 1.0;
+
+    double start = std::clamp(m_animatorRange.start, 0.0, 1.0);
+    double end = std::clamp(m_animatorRange.end, 0.0, 1.0);
+
+    if (end <= start) {
+        // Degenerate range: no selection
+        return 0.0;
+    }
+
+    double rawWeight;
+    if (offsetT < start) {
+        rawWeight = 0.0;
+    } else if (offsetT > end) {
+        rawWeight = 0.0;
+    } else if (offsetT <= start + m_animatorRange.smoothness * (end - start) / 2.0) {
+        // Smooth ramp up at start edge
+        double smoothStart = start;
+        double smoothWidth = m_animatorRange.smoothness * (end - start) / 2.0;
+        if (smoothWidth <= 0.0) {
+            rawWeight = 1.0;
+        } else {
+            double ramp = (offsetT - smoothStart) / smoothWidth;
+            ramp = std::clamp(ramp, 0.0, 1.0);
+            rawWeight = applyEasing(ramp, m_animatorRange.ease);
+        }
+    } else if (offsetT >= end - m_animatorRange.smoothness * (end - start) / 2.0) {
+        // Smooth ramp down at end edge
+        double smoothEnd = end;
+        double smoothWidth = m_animatorRange.smoothness * (end - start) / 2.0;
+        if (smoothWidth <= 0.0) {
+            rawWeight = 1.0;
+        } else {
+            double ramp = (smoothEnd - offsetT) / smoothWidth;
+            ramp = std::clamp(ramp, 0.0, 1.0);
+            rawWeight = applyEasing(ramp, m_animatorRange.ease);
+        }
+    } else {
+        rawWeight = 1.0;
+    }
+
+    return std::clamp(rawWeight, 0.0, 1.0);
+}
+
+// --- Wiggly Selector ---
+
+void TextAnimator::setWigglySelector(const WigglySelector &sel)
+{
+    m_wigglySelector = sel;
+}
+
+double TextAnimator::computeWigglyWeight(int charIdx, int total, double time) const
+{
+    if (!m_wigglySelector.enabled)
+        return 1.0;
+
+    if (total <= 0)
+        return 1.0;
+
+    int effectiveIdx = charIdx;
+    int effectiveTotal = total;
+
+    switch (m_scope) {
+    case TextAnimScope::Words: {
+        int totalWords = 0;
+        bool inWord = false;
+        for (int i = 0; i < m_text.size(); ++i) {
+            if (m_text[i].isSpace()) {
+                inWord = false;
+            } else {
+                if (!inWord) {
+                    totalWords++;
+                    inWord = true;
+                }
+            }
+        }
+        if (totalWords <= 0)
+            return 1.0;
+        effectiveIdx = wordIndexOf(charIdx);
+        effectiveTotal = totalWords;
+        break;
+    }
+    case TextAnimScope::Lines: {
+        int totalLines = 1;
+        for (int i = 0; i < m_text.size(); ++i) {
+            if (m_text[i] == QLatin1Char('\n'))
+                totalLines++;
+        }
+        effectiveIdx = lineIndexOf(charIdx);
+        effectiveTotal = totalLines;
+        break;
+    }
+    case TextAnimScope::CharactersExcludingSpaces: {
+        if (charIdx < m_text.size() && m_text[charIdx].isSpace())
+            return 1.0;
+        int nonSpaceCount = 0;
+        int nonSpaceIdx = 0;
+        for (int i = 0; i < m_text.size(); ++i) {
+            if (!m_text[i].isSpace()) {
+                if (i == charIdx) {
+                    nonSpaceIdx = nonSpaceCount;
+                }
+                nonSpaceCount++;
+            }
+        }
+        if (nonSpaceCount <= 0)
+            return 1.0;
+        effectiveIdx = nonSpaceIdx;
+        effectiveTotal = nonSpaceCount;
+        break;
+    }
+    case TextAnimScope::Characters:
+    default:
+        break;
+    }
+
+    double normIdx = static_cast<double>(effectiveIdx) / static_cast<double>(effectiveTotal - 1);
+    if (effectiveTotal == 1)
+        normIdx = 0.5;
+
+    double freq = std::max(m_wigglySelector.wigglesPerSec, 0.001);
+
+    double temporalOffset = time * freq * 2.0 * M_PI + m_wigglySelector.temporalPhase * 2.0 * M_PI;
+    double spatialOffset = normIdx * freq * 2.0 * M_PI + m_wigglySelector.spatialPhase * 2.0 * M_PI;
+
+    double combinedSeed = static_cast<double>(m_wigglySelector.seed) + effectiveIdx * 137.509 + effectiveTotal * 311.017;
+
+    double v1 = std::sin(combinedSeed * 1.1 + temporalOffset);
+    double v2 = std::cos(combinedSeed * 2.3 + spatialOffset);
+    double v3 = std::sin(combinedSeed * 3.7 + temporalOffset * 0.7 + spatialOffset * 0.3);
+
+    double blend = m_wigglySelector.correlation;
+    blend = std::clamp(blend, 0.0, 1.0);
+
+    double independent = (v1 * 0.5 + v2 * 0.3 + v3 * 0.2);
+    double correlated = std::sin(temporalOffset + spatialOffset * 0.5);
+
+    double raw = independent * (1.0 - blend) + correlated * blend;
+
+    double normalized = (raw + 1.0) * 0.5;
+    normalized = std::clamp(normalized, 0.0, 1.0);
+
+    double minA = std::clamp(m_wigglySelector.minAmount, 0.0, 1.0);
+    double maxA = std::clamp(m_wigglySelector.maxAmount, 0.0, 1.0);
+
+    if (minA > maxA)
+        std::swap(minA, maxA);
+
+    return minA + normalized * (maxA - minA);
+}
+
+// --- Source Text keyframing (US-AETEXT-4) ---
+
+void TextAnimator::setKeyframedText(KeyframeManager *keyframeManager, const QString &property)
+{
+    m_keyframeManager = keyframeManager;
+    m_sourceTextProperty = property;
+}
+
+QString TextAnimator::currentTextAt(double time) const
+{
+    if (!m_keyframeManager) return m_text;
+    return m_keyframeManager->stringValueAt(m_sourceTextProperty, time, m_text);
 }
 
 // --- Character layout ---
@@ -339,53 +623,61 @@ QVector<CharacterState> TextAnimator::getCharacterStates(double time) const
         base.offsetY = 0.0;
 
         double progress = characterProgress(i, time);
+        double selectorWeight = computeCharSelectorWeight(i, m_text.size());
+        double wigglyWeight = computeWigglyWeight(i, m_text.size(), time);
+
+        // Selector weight gates the animation amount: 0 = default state, 1 = full anim
+        double combinedWeight = selectorWeight * wigglyWeight;
+        double gatedProgress = progress * combinedWeight;
 
         CharacterState animated;
         switch (m_config.animation) {
         case CharAnimationType::Typewriter:
-            animated = applyTypewriter(base, progress);
+            animated = applyTypewriter(base, gatedProgress);
             break;
         case CharAnimationType::FadeInLetters:
-            animated = applyFadeInLetters(base, progress);
+            animated = applyFadeInLetters(base, gatedProgress);
             break;
         case CharAnimationType::FadeOutLetters:
-            animated = applyFadeOutLetters(base, progress);
+            animated = applyFadeOutLetters(base, gatedProgress);
             break;
         case CharAnimationType::BounceIn:
-            animated = applyBounceIn(base, progress);
+            animated = applyBounceIn(base, gatedProgress);
             break;
         case CharAnimationType::SlideInLeft:
-            animated = applySlideIn(base, progress, -1.0, 0.0);
+            animated = applySlideIn(base, gatedProgress, -1.0, 0.0);
             break;
         case CharAnimationType::SlideInRight:
-            animated = applySlideIn(base, progress, 1.0, 0.0);
+            animated = applySlideIn(base, gatedProgress, 1.0, 0.0);
             break;
         case CharAnimationType::SlideInUp:
-            animated = applySlideIn(base, progress, 0.0, -1.0);
+            animated = applySlideIn(base, gatedProgress, 0.0, -1.0);
             break;
         case CharAnimationType::SlideInDown:
-            animated = applySlideIn(base, progress, 0.0, 1.0);
+            animated = applySlideIn(base, gatedProgress, 0.0, 1.0);
             break;
         case CharAnimationType::ScaleUp:
-            animated = applyScaleUp(base, progress);
+            animated = applyScaleUp(base, gatedProgress);
             break;
         case CharAnimationType::ScaleDown:
-            animated = applyScaleDown(base, progress);
+            animated = applyScaleDown(base, gatedProgress);
             break;
         case CharAnimationType::SpinIn:
-            animated = applySpinIn(base, progress);
+            animated = applySpinIn(base, gatedProgress);
             break;
         case CharAnimationType::WaveMotion:
             animated = applyWaveMotion(base, i, time);
+            // Apply combined weight as opacity multiplier for wave
+            animated.opacity *= combinedWeight;
             break;
         case CharAnimationType::RandomAppear:
-            animated = applyRandomAppear(base, progress);
+            animated = applyRandomAppear(base, gatedProgress);
             break;
         case CharAnimationType::GlitchText:
-            animated = applyGlitchText(base, progress, i);
+            animated = applyGlitchText(base, gatedProgress, i);
             break;
         case CharAnimationType::KaraokeHighlight:
-            animated = applyKaraokeHighlight(base, progress);
+            animated = applyKaraokeHighlight(base, gatedProgress);
             break;
         }
 
@@ -402,10 +694,24 @@ QImage TextAnimator::renderFrame(const QSize &canvasSize, double time) const
     QImage image(canvasSize, QImage::Format_ARGB32_Premultiplied);
     image.fill(Qt::transparent);
 
-    if (m_text.isEmpty())
+    // US-AETEXT-4: use keyframed text if available
+    QString activeText = currentTextAt(time);
+    if (activeText.isEmpty())
         return image;
 
-    QVector<CharacterState> states = getCharacterStates(time);
+    // If keyframed text differs from base text, compute positions on-the-fly
+    bool useKeyframed = (m_keyframeManager != nullptr && activeText != m_text);
+    QVector<double> charXOffsets;
+    if (useKeyframed) {
+        charXOffsets.reserve(activeText.size());
+        QFontMetricsF fm(m_font);
+        double xAccum = 0.0;
+        for (int i = 0; i < activeText.size(); ++i) {
+            charXOffsets.append(xAccum);
+            xAccum += fm.horizontalAdvance(activeText[i]);
+        }
+    }
+
     QFontMetricsF fm(m_font);
     double fontHeight = fm.height();
     double ascent = fm.ascent();
@@ -414,13 +720,87 @@ QImage TextAnimator::renderFrame(const QSize &canvasSize, double time) const
     painter.setRenderHint(QPainter::Antialiasing);
     painter.setRenderHint(QPainter::TextAntialiasing);
 
-    for (const auto &cs : states) {
+    int charCount = useKeyframed ? activeText.size() : m_text.size();
+    const QVector<double> &xOffsets = useKeyframed ? charXOffsets : m_charXOffsets;
+
+    for (int i = 0; i < charCount; ++i) {
+        QChar ch = useKeyframed ? activeText[i] : m_text[i];
+        double xPos = m_basePosition.x() + xOffsets[i];
+        double yPos = m_basePosition.y();
+
+        // Compute progress for this character
+        double progress = characterProgress(i, time);
+        double selectorWeight = computeCharSelectorWeight(i, charCount);
+        double wigglyWeight = computeWigglyWeight(i, charCount, time);
+        double combinedWeight = selectorWeight * wigglyWeight;
+        double gatedProgress = progress * combinedWeight;
+
+        // Build character state
+        CharacterState base;
+        base.character = ch;
+        base.position = QPointF(xPos, yPos);
+        base.opacity = 1.0;
+        base.scale = 1.0;
+        base.rotation = 0.0;
+        base.color = m_baseColor;
+        base.offsetX = 0.0;
+        base.offsetY = 0.0;
+
+        CharacterState cs;
+        switch (m_config.animation) {
+        case CharAnimationType::Typewriter:
+            cs = applyTypewriter(base, gatedProgress);
+            break;
+        case CharAnimationType::FadeInLetters:
+            cs = applyFadeInLetters(base, gatedProgress);
+            break;
+        case CharAnimationType::FadeOutLetters:
+            cs = applyFadeOutLetters(base, gatedProgress);
+            break;
+        case CharAnimationType::BounceIn:
+            cs = applyBounceIn(base, gatedProgress);
+            break;
+        case CharAnimationType::SlideInLeft:
+            cs = applySlideIn(base, gatedProgress, -1.0, 0.0);
+            break;
+        case CharAnimationType::SlideInRight:
+            cs = applySlideIn(base, gatedProgress, 1.0, 0.0);
+            break;
+        case CharAnimationType::SlideInUp:
+            cs = applySlideIn(base, gatedProgress, 0.0, -1.0);
+            break;
+        case CharAnimationType::SlideInDown:
+            cs = applySlideIn(base, gatedProgress, 0.0, 1.0);
+            break;
+        case CharAnimationType::ScaleUp:
+            cs = applyScaleUp(base, gatedProgress);
+            break;
+        case CharAnimationType::ScaleDown:
+            cs = applyScaleDown(base, gatedProgress);
+            break;
+        case CharAnimationType::SpinIn:
+            cs = applySpinIn(base, gatedProgress);
+            break;
+        case CharAnimationType::WaveMotion:
+            cs = applyWaveMotion(base, i, time);
+            cs.opacity *= combinedWeight;
+            break;
+        case CharAnimationType::RandomAppear:
+            cs = applyRandomAppear(base, gatedProgress);
+            break;
+        case CharAnimationType::GlitchText:
+            cs = applyGlitchText(base, gatedProgress, i);
+            break;
+        case CharAnimationType::KaraokeHighlight:
+            cs = applyKaraokeHighlight(base, gatedProgress);
+            break;
+        }
+
         if (cs.opacity <= 0.0)
             continue;
 
         painter.save();
 
-        // Compute the draw position (center of character for rotation/scale)
         double charWidth = fm.horizontalAdvance(cs.character);
         double cx = cs.position.x() + cs.offsetX + charWidth / 2.0;
         double cy = cs.position.y() + cs.offsetY + fontHeight / 2.0;
@@ -439,7 +819,6 @@ QImage TextAnimator::renderFrame(const QSize &canvasSize, double time) const
         painter.setFont(m_font);
         painter.setPen(cs.color);
 
-        // Draw the character at its animated position
         double drawX = cs.position.x() + cs.offsetX;
         double drawY = cs.position.y() + cs.offsetY + ascent;
         painter.drawText(QPointF(drawX, drawY), QString(cs.character));
@@ -663,6 +1042,37 @@ QJsonObject TextAnimator::toJson() const
     animObj[QStringLiteral("reverse")] = m_config.reverse;
     obj[QStringLiteral("animation")] = animObj;
 
+    // Animator Range
+    QJsonObject rangeObj;
+    rangeObj[QStringLiteral("start")] = m_animatorRange.start;
+    rangeObj[QStringLiteral("end")] = m_animatorRange.end;
+    rangeObj[QStringLiteral("offset")] = m_animatorRange.offset;
+    rangeObj[QStringLiteral("smoothness")] = m_animatorRange.smoothness;
+    rangeObj[QStringLiteral("ease")] = TextAnimConfig::easingName(m_animatorRange.ease);
+    rangeObj[QStringLiteral("basedOn")] = static_cast<int>(m_animatorRange.basedOn);
+    obj[QStringLiteral("animatorRange")] = rangeObj;
+
+    // Scope (US-AETEXT-9)
+    obj[QStringLiteral("scope")] = static_cast<int>(m_scope);
+
+    // Wiggly Selector
+    QJsonObject wigglyObj;
+    wigglyObj[QStringLiteral("enabled")] = m_wigglySelector.enabled;
+    wigglyObj[QStringLiteral("maxAmount")] = m_wigglySelector.maxAmount;
+    wigglyObj[QStringLiteral("minAmount")] = m_wigglySelector.minAmount;
+    wigglyObj[QStringLiteral("wigglesPerSec")] = m_wigglySelector.wigglesPerSec;
+    wigglyObj[QStringLiteral("correlation")] = m_wigglySelector.correlation;
+    wigglyObj[QStringLiteral("temporalPhase")] = m_wigglySelector.temporalPhase;
+    wigglyObj[QStringLiteral("spatialPhase")] = m_wigglySelector.spatialPhase;
+    wigglyObj[QStringLiteral("seed")] = static_cast<double>(m_wigglySelector.seed);
+    obj[QStringLiteral("wigglySelector")] = wigglyObj;
+
+    // US-AETEXT-4: keyframed source text property
+    if (m_keyframeManager != nullptr) {
+        obj[QStringLiteral("sourceTextProperty")] = m_sourceTextProperty;
+        obj[QStringLiteral("hasKeyframedText")] = true;
+    }
+
     return obj;
 }
 
@@ -697,4 +1107,44 @@ void TextAnimator::fromJson(const QJsonObject &obj)
     config.reverse = animObj[QStringLiteral("reverse")].toBool(false);
 
     setAnimation(config);
+
+    // Animator Range
+    AnimatorRange range;
+    QJsonObject rangeObj = obj[QStringLiteral("animatorRange")].toObject();
+    if (!rangeObj.isEmpty()) {
+        range.start = rangeObj[QStringLiteral("start")].toDouble(0.0);
+        range.end = rangeObj[QStringLiteral("end")].toDouble(1.0);
+        range.offset = rangeObj[QStringLiteral("offset")].toDouble(0.0);
+        range.smoothness = rangeObj[QStringLiteral("smoothness")].toDouble(0.0);
+        range.ease = TextAnimConfig::easingFromName(
+            rangeObj[QStringLiteral("ease")].toString(QStringLiteral("Linear")));
+        range.basedOn = static_cast<TextAnimBasedOn>(
+            rangeObj[QStringLiteral("basedOn")].toInt(0));
+    }
+    setAnimatorRange(range);
+
+    // Scope (US-AETEXT-9)
+    if (obj.contains(QStringLiteral("scope"))) {
+        m_scope = static_cast<TextAnimScope>(obj[QStringLiteral("scope")].toInt(0));
+    }
+
+    // Wiggly Selector
+    WigglySelector wiggly;
+    QJsonObject wigglyObj = obj[QStringLiteral("wigglySelector")].toObject();
+    if (!wigglyObj.isEmpty()) {
+        wiggly.enabled = wigglyObj[QStringLiteral("enabled")].toBool(false);
+        wiggly.maxAmount = wigglyObj[QStringLiteral("maxAmount")].toDouble(1.0);
+        wiggly.minAmount = wigglyObj[QStringLiteral("minAmount")].toDouble(0.0);
+        wiggly.wigglesPerSec = wigglyObj[QStringLiteral("wigglesPerSec")].toDouble(1.0);
+        wiggly.correlation = wigglyObj[QStringLiteral("correlation")].toDouble(0.0);
+        wiggly.temporalPhase = wigglyObj[QStringLiteral("temporalPhase")].toDouble(0.0);
+        wiggly.spatialPhase = wigglyObj[QStringLiteral("spatialPhase")].toDouble(0.0);
+        wiggly.seed = static_cast<quint32>(wigglyObj[QStringLiteral("seed")].toDouble(0.0));
+    }
+    setWigglySelector(wiggly);
+
+    // US-AETEXT-4: restore keyframed source text property (manager set externally)
+    if (obj[QStringLiteral("hasKeyframedText")].toBool(false)) {
+        m_sourceTextProperty = obj[QStringLiteral("sourceTextProperty")].toString(QStringLiteral("source_text"));
+    }
 }

@@ -44,6 +44,12 @@
 #include "Expression.h"
 #include "ShapeLayer.h"
 #include "TextAnimator.h"
+#include "PathText.h"
+#include "Text3DLayer.h"
+#include "TextPathWarp.h"
+#include "TextMaskReveal.h"
+#include "VariableFontAxis.h"
+#include "MographText.h"
 #include "TrackerLink.h"
 #include "Precompose.h"
 #include "Rotoscope.h"
@@ -240,6 +246,19 @@ private slots:
     void jumpToNextMarker();
     void jumpToPrevMarker();
 
+    // US-AETEXT-12: MainWindow Text menu integration
+    void addPathText();
+    void addRangeSelector();
+    void addWigglySelector();
+    void addSourceTextKeyframe();
+    void addAnimationPreset();
+    void add3DText();
+    void addMaskTextReveal();
+    void addBendTextWarp();
+    void changeTextScope();
+    void addVariableFontAxis();
+    void addMographTemplate();
+
 protected:
     void dragEnterEvent(QDragEnterEvent *event) override;
     void dropEvent(QDropEvent *event) override;
@@ -278,6 +297,14 @@ private:
     ProjectConfig m_projectConfig;
     QVector<BrushAnimationEntry> m_brushAnimationEntries;
     QHash<QString, BrushAnimation *> m_liveBrushAnimations;
+
+    // US-AETEXT-12: AE text feature objects
+    QVector<PathText *> m_pathTexts;
+    QVector<Text3DLayer *> m_text3DLayers;
+    QVector<TextMaskReveal *> m_textMaskReveals;
+    QVector<TextPathWarp *> m_textPathWarps;
+    QVector<VariableFontAxis *> m_variableFontAxes;
+    QVector<MographText *> m_mographTexts;
 
     QAction *m_trackMotionAction = nullptr; // US-FEAT-D: motion tracking UI
     class QSlider *m_lutIntensitySlider = nullptr; // LUT intensity slider (0..100)

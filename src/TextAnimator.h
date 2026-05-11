@@ -12,6 +12,8 @@
 #include <QString>
 #include <QVector>
 
+class KeyframeManager;
+
 // --- Per-character animation type ---
 
 enum class CharAnimationType {
@@ -39,6 +41,46 @@ enum class TextAnimEasing {
     EaseIn,
     EaseOut,
     EaseInOut
+};
+
+// --- Range Selector (AE-style animator range) ---
+
+enum class TextAnimBasedOn {
+    Characters,
+    CharactersExcludingSpaces,
+    Words,
+    Lines
+};
+
+// --- Scope for selector grouping (US-AETEXT-9) ---
+
+enum class TextAnimScope {
+    Characters,
+    CharactersExcludingSpaces,
+    Words,
+    Lines
+};
+
+struct AnimatorRange {
+    double start = 0.0;
+    double end = 1.0;
+    double offset = 0.0;
+    double smoothness = 0.0;
+    TextAnimEasing ease = TextAnimEasing::Linear;
+    TextAnimBasedOn basedOn = TextAnimBasedOn::Characters;
+};
+
+// --- Wiggly Selector (AE-style random per-char weight overlay) ---
+
+struct WigglySelector {
+    bool enabled = false;
+    double maxAmount = 1.0;
+    double minAmount = 0.0;
+    double wigglesPerSec = 1.0;
+    double correlation = 0.0;
+    double temporalPhase = 0.0;
+    double spatialPhase = 0.0;
+    quint32 seed = 0;
 };
 
 // --- Animation configuration ---
@@ -93,6 +135,27 @@ public:
     void setAnimation(const TextAnimConfig &config);
     const TextAnimConfig &config() const { return m_config; }
 
+    // --- Range Selector ---
+
+    void setAnimatorRange(const AnimatorRange &range);
+    AnimatorRange animatorRange() const { return m_animatorRange; }
+
+    // Returns 0.0..1.0 weight for the given character index
+    double computeCharSelectorWeight(int charIdx, int totalChars) const;
+
+    // --- Scope (US-AETEXT-9) ---
+
+    void setScope(TextAnimScope scope);
+    TextAnimScope scope() const { return m_scope; }
+    int wordIndexOf(int charIdx) const;
+    int lineIndexOf(int charIdx) const;
+
+    // --- Wiggly Selector ---
+
+    void setWigglySelector(const WigglySelector &sel);
+    WigglySelector wigglySelector() const { return m_wigglySelector; }
+    double computeWigglyWeight(int charIdx, int total, double time) const;
+
     // --- Evaluation ---
 
     // Return animated state for every character at the given time
@@ -112,6 +175,11 @@ public:
 
     // Return all named preset animation configurations
     static QMap<QString, TextAnimConfig> presetAnimations();
+
+    // --- Source Text keyframing (US-AETEXT-4) ---
+
+    void setKeyframedText(KeyframeManager *keyframeManager, const QString &property = QStringLiteral("source_text"));
+    QString currentTextAt(double time) const;
 
     // --- Serialisation ---
 
@@ -166,7 +234,14 @@ private:
     QColor m_baseColor = Qt::white;
 
     TextAnimConfig m_config;
+    AnimatorRange m_animatorRange;
+    WigglySelector m_wigglySelector;
+    TextAnimScope m_scope = TextAnimScope::Characters;
 
     QVector<double> m_charXOffsets; // per-character X offset from base position
     QVector<int> m_shuffleOrder;    // randomized order for RandomAppear
+
+    // US-AETEXT-4: keyframed source text
+    KeyframeManager *m_keyframeManager = nullptr;
+    QString m_sourceTextProperty;
 };

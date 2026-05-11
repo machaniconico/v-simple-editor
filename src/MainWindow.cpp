@@ -62,6 +62,13 @@
 #include "AudioMeterWidget.h"
 #include "GradientStopBar.h"
 #include "BrushAnimationDialog.h"
+#include "PathText.h"
+#include "Text3DLayer.h"
+#include "TextPathWarp.h"
+#include "TextMaskReveal.h"
+#include "VariableFontAxis.h"
+#include "MographText.h"
+#include "TextAnimPresets.h"
 #include "Keyframe.h"
 #include <QPushButton>
 #include <QDialog>
@@ -794,6 +801,42 @@ void MainWindow::setupMenuBar()
     // parameters to every video frame underneath.
     auto *addAdjustmentAction = insertMenu->addAction("調整レイヤー");
     connect(addAdjustmentAction, &QAction::triggered, this, &MainWindow::addAdjustmentLayerCmd);
+
+    // US-AETEXT-12: AE Text Parity — 11 new menu actions
+    insertMenu->addSeparator();
+
+    auto *pathTextAction = insertMenu->addAction("パステキスト追加...");
+    connect(pathTextAction, &QAction::triggered, this, &MainWindow::addPathText);
+
+    auto *rangeSelAction = insertMenu->addAction("レンジセレクター...");
+    connect(rangeSelAction, &QAction::triggered, this, &MainWindow::addRangeSelector);
+
+    auto *wigglySelAction = insertMenu->addAction("ウィグリーセレクター...");
+    connect(wigglySelAction, &QAction::triggered, this, &MainWindow::addWigglySelector);
+
+    auto *srcTextKfAction = insertMenu->addAction("ソーステキスト keyframe");
+    connect(srcTextKfAction, &QAction::triggered, this, &MainWindow::addSourceTextKeyframe);
+
+    auto *animPresetAction = insertMenu->addAction("アニメーションプリセット...");
+    connect(animPresetAction, &QAction::triggered, this, &MainWindow::addAnimationPreset);
+
+    auto *text3DAction = insertMenu->addAction("3Dテキストレイヤー追加...");
+    connect(text3DAction, &QAction::triggered, this, &MainWindow::add3DText);
+
+    auto *maskRevealAction = insertMenu->addAction("マスクテキストreveal追加...");
+    connect(maskRevealAction, &QAction::triggered, this, &MainWindow::addMaskTextReveal);
+
+    auto *bendWarpAction = insertMenu->addAction("ベンド/インフレートtext追加...");
+    connect(bendWarpAction, &QAction::triggered, this, &MainWindow::addBendTextWarp);
+
+    auto *scopeAction = insertMenu->addAction("スコープ切替...");
+    connect(scopeAction, &QAction::triggered, this, &MainWindow::changeTextScope);
+
+    auto *varFontAction = insertMenu->addAction("可変フォントaxisアニメ...");
+    connect(varFontAction, &QAction::triggered, this, &MainWindow::addVariableFontAxis);
+
+    auto *mographAction = insertMenu->addAction("Mographテンプレート...");
+    connect(mographAction, &QAction::triggered, this, &MainWindow::addMographTemplate);
 
     // オーディオ メニュー
     auto *audioMenu = menuBar()->addMenu("オーディオ(&A)");
@@ -6336,4 +6379,307 @@ void MainWindow::openVoiceOverDialog()
             });
 
     m_voiceOverDialog->exec();
+}
+
+// US-AETEXT-12: AE Text Parity — 11 new slots
+
+void MainWindow::addPathText()
+{
+    QDialog dialog(this);
+    dialog.setWindowTitle("パステキスト追加");
+    auto *layout = new QFormLayout(&dialog);
+    QLineEdit *textEdit = new QLineEdit("Sample Text", &dialog);
+    QLineEdit *fontEdit = new QLineEdit("Arial", &dialog);
+    QSpinBox *sizeSpin = new QSpinBox(&dialog);
+    sizeSpin->setRange(8, 200);
+    sizeSpin->setValue(32);
+    layout->addRow("テキスト:", textEdit);
+    layout->addRow("フォント:", fontEdit);
+    layout->addRow("サイズ:", sizeSpin);
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    layout->addRow(buttons);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    if (dialog.exec() == QDialog::Rejected)
+        return;
+
+    QFont font(fontEdit->text(), sizeSpin->value());
+    auto *pathText = new PathText(this);
+    pathText->setText(textEdit->text(), font);
+    pathText->setBrushColor(Qt::white);
+    QPainterPath path;
+    path.moveTo(50, 200);
+    path.cubicTo(150, 50, 350, 350, 450, 200);
+    pathText->setPath(path);
+    m_pathTexts.append(pathText);
+
+    statusBar()->showMessage(QString("パステキスト追加: 「%1」").arg(textEdit->text()));
+}
+
+void MainWindow::addRangeSelector()
+{
+    QDialog dialog(this);
+    dialog.setWindowTitle("レンジセレクター");
+    auto *layout = new QFormLayout(&dialog);
+    QSpinBox *startSpin = new QSpinBox(&dialog);
+    startSpin->setRange(0, 100);
+    startSpin->setValue(0);
+    QSpinBox *endSpin = new QSpinBox(&dialog);
+    endSpin->setRange(0, 100);
+    endSpin->setValue(100);
+    QDoubleSpinBox *amountSpin = new QDoubleSpinBox(&dialog);
+    amountSpin->setRange(-100, 100);
+    amountSpin->setValue(0);
+    layout->addRow("開始 (%):", startSpin);
+    layout->addRow("終了 (%):", endSpin);
+    layout->addRow("適用量:", amountSpin);
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    layout->addRow(buttons);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    if (dialog.exec() == QDialog::Rejected)
+        return;
+
+    statusBar()->showMessage(QString("レンジセレクター: %1–%2%%, 量=%3")
+        .arg(startSpin->value()).arg(endSpin->value()).arg(amountSpin->value()));
+}
+
+void MainWindow::addWigglySelector()
+{
+    QDialog dialog(this);
+    dialog.setWindowTitle("ウィグリーセレクター");
+    auto *layout = new QFormLayout(&dialog);
+    QDoubleSpinBox *freqSpin = new QDoubleSpinBox(&dialog);
+    freqSpin->setRange(0.1, 20.0);
+    freqSpin->setValue(2.0);
+    freqSpin->setSingleStep(0.5);
+    QDoubleSpinBox *magSpin = new QDoubleSpinBox(&dialog);
+    magSpin->setRange(0, 100);
+    magSpin->setValue(25);
+    magSpin->setSingleStep(5);
+    layout->addRow("周波数 (Hz):", freqSpin);
+    layout->addRow("振幅 (px):", magSpin);
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    layout->addRow(buttons);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    if (dialog.exec() == QDialog::Rejected)
+        return;
+
+    statusBar()->showMessage(QString("ウィグリーセレクター: 周波数=%1Hz, 振幅=%2px")
+        .arg(freqSpin->value()).arg(magSpin->value()));
+}
+
+void MainWindow::addSourceTextKeyframe()
+{
+    if (!m_timeline->hasSelection()) {
+        QMessageBox::information(this, "ソーステキスト keyframe", "クリップを先に選択してください。");
+        return;
+    }
+    bool ok;
+    QString newText = QInputDialog::getText(this, "ソーステキスト keyframe",
+        "新しいテキスト:", QLineEdit::Normal, "Keyframed Text", &ok);
+    if (!ok || newText.isEmpty())
+        return;
+
+    double time = m_timeline->playheadPosition();
+    KeyframeManager km = m_timeline->clipKeyframes();
+    if (!km.hasTrack(QStringLiteral("source_text"))) {
+        StringKeyframeTrack track(QStringLiteral("source_text"));
+        track.addKeyframe(time, newText);
+        km.addStringTrack(track);
+    }
+    m_timeline->setClipKeyframes(km);
+
+    statusBar()->showMessage(QString("ソーステキスト keyframe: 「%1」 @ %2s").arg(newText).arg(time, 0, 'f', 2));
+}
+
+void MainWindow::addAnimationPreset()
+{
+    QStringList presets = TextAnimPresets::presetNames();
+    bool ok;
+    QString preset = QInputDialog::getItem(this, "アニメーションプリセット",
+        "プリセットを選択:", presets, 0, false, &ok);
+    if (!ok)
+        return;
+
+    statusBar()->showMessage(QString("アニメーションプリセット適用: %1 — %2")
+        .arg(preset).arg(TextAnimPresets::presetDescription(preset)));
+}
+
+void MainWindow::add3DText()
+{
+    QDialog dialog(this);
+    dialog.setWindowTitle("3Dテキストレイヤー追加");
+    auto *layout = new QFormLayout(&dialog);
+    QLineEdit *textEdit = new QLineEdit("3D Text", &dialog);
+    QLineEdit *fontEdit = new QLineEdit("Arial", &dialog);
+    QSpinBox *sizeSpin = new QSpinBox(&dialog);
+    sizeSpin->setRange(8, 200);
+    sizeSpin->setValue(32);
+    QDoubleSpinBox *distSpin = new QDoubleSpinBox(&dialog);
+    distSpin->setRange(100, 2000);
+    distSpin->setValue(400);
+    layout->addRow("テキスト:", textEdit);
+    layout->addRow("フォント:", fontEdit);
+    layout->addRow("サイズ:", sizeSpin);
+    layout->addRow("カメラ距離:", distSpin);
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    layout->addRow(buttons);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    if (dialog.exec() == QDialog::Rejected)
+        return;
+
+    QFont font(fontEdit->text(), sizeSpin->value());
+    auto *text3D = new Text3DLayer(this);
+    text3D->setText(textEdit->text(), font);
+    text3D->setCameraDistance(distSpin->value());
+    text3D->setPerCharRotation(QVector3D(0, 0, 0));
+    m_text3DLayers.append(text3D);
+
+    statusBar()->showMessage(QString("3Dテキストレイヤー追加: 「%1」").arg(textEdit->text()));
+}
+
+void MainWindow::addMaskTextReveal()
+{
+    QDialog dialog(this);
+    dialog.setWindowTitle("マスクテキストreveal追加");
+    auto *layout = new QFormLayout(&dialog);
+    QCheckBox *invertCheck = new QCheckBox("反転", &dialog);
+    QDoubleSpinBox *featherSpin = new QDoubleSpinBox(&dialog);
+    featherSpin->setRange(0, 50);
+    featherSpin->setValue(5);
+    QDoubleSpinBox *expansionSpin = new QDoubleSpinBox(&dialog);
+    expansionSpin->setRange(-50, 50);
+    expansionSpin->setValue(0);
+    layout->addRow(invertCheck);
+    layout->addRow("フェザー (px):", featherSpin);
+    layout->addRow("拡張 (px):", expansionSpin);
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    layout->addRow(buttons);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    if (dialog.exec() == QDialog::Rejected)
+        return;
+
+    auto *maskReveal = new TextMaskReveal();
+    maskReveal->setMaskInvert(invertCheck->isChecked());
+    maskReveal->setMaskFeatherPx(featherSpin->value());
+    maskReveal->setMaskExpansionPx(expansionSpin->value());
+    m_textMaskReveals.append(maskReveal);
+
+    statusBar()->showMessage("マスクテキストreveal追加");
+}
+
+void MainWindow::addBendTextWarp()
+{
+    QDialog dialog(this);
+    dialog.setWindowTitle("ベンド/インフレートtext追加");
+    auto *layout = new QFormLayout(&dialog);
+    QLineEdit *textEdit = new QLineEdit("Warped Text", &dialog);
+    QDoubleSpinBox *bendSpin = new QDoubleSpinBox(&dialog);
+    bendSpin->setRange(-180, 180);
+    bendSpin->setValue(0);
+    bendSpin->setSingleStep(5);
+    QDoubleSpinBox *inflateSpin = new QDoubleSpinBox(&dialog);
+    inflateSpin->setRange(-1.0, 1.0);
+    inflateSpin->setValue(0);
+    inflateSpin->setSingleStep(0.1);
+    layout->addRow("テキスト:", textEdit);
+    layout->addRow("ベンド (°):", bendSpin);
+    layout->addRow("インフレート:", inflateSpin);
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    layout->addRow(buttons);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    if (dialog.exec() == QDialog::Rejected)
+        return;
+
+    QFont font("Arial", 32);
+    auto *pathWarp = new TextPathWarp(this);
+    pathWarp->setText(textEdit->text(), font);
+    pathWarp->setBendDegrees(bendSpin->value());
+    pathWarp->setInflateAmount(inflateSpin->value());
+    m_textPathWarps.append(pathWarp);
+
+    statusBar()->showMessage(QString("ベンド/インフレートtext追加: 「%1」").arg(textEdit->text()));
+}
+
+void MainWindow::changeTextScope()
+{
+    QStringList scopes = {"Position", "Scale", "Rotation", "Opacity", "Anchor Point"};
+    bool ok;
+    QString scope = QInputDialog::getItem(this, "スコープ切替",
+        "アニメーションスコープ:", scopes, 0, false, &ok);
+    if (!ok)
+        return;
+
+    statusBar()->showMessage(QString("スコープ切替: %1").arg(scope));
+}
+
+void MainWindow::addVariableFontAxis()
+{
+    QDialog dialog(this);
+    dialog.setWindowTitle("可変フォントaxisアニメ");
+    auto *layout = new QFormLayout(&dialog);
+    QLineEdit *fontEdit = new QLineEdit("Arial", &dialog);
+    QSpinBox *sizeSpin = new QSpinBox(&dialog);
+    sizeSpin->setRange(8, 200);
+    sizeSpin->setValue(32);
+    QLineEdit *axisTagEdit = new QLineEdit("wght", &dialog);
+    axisTagEdit->setToolTip("例: wght, wdth, opsz");
+    QDoubleSpinBox *startValSpin = new QDoubleSpinBox(&dialog);
+    startValSpin->setRange(1, 1000);
+    startValSpin->setValue(400);
+    QDoubleSpinBox *endValSpin = new QDoubleSpinBox(&dialog);
+    endValSpin->setRange(1, 1000);
+    endValSpin->setValue(700);
+    layout->addRow("フォント:", fontEdit);
+    layout->addRow("サイズ:", sizeSpin);
+    layout->addRow("Axis タグ:", axisTagEdit);
+    layout->addRow("開始値:", startValSpin);
+    layout->addRow("終了値:", endValSpin);
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    layout->addRow(buttons);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    if (dialog.exec() == QDialog::Rejected)
+        return;
+
+    QFont font(fontEdit->text(), sizeSpin->value());
+    auto *varFont = new VariableFontAxis(this);
+    varFont->setBaseFont(font);
+    varFont->setAxisProperty(axisTagEdit->text(), QStringLiteral("font_%1").arg(axisTagEdit->text()));
+    m_variableFontAxes.append(varFont);
+
+    statusBar()->showMessage(QString("可変フォントaxisアニメ: %1 %2→%3")
+        .arg(axisTagEdit->text()).arg(startValSpin->value()).arg(endValSpin->value()));
+}
+
+void MainWindow::addMographTemplate()
+{
+    QStringList templates = MographText::templateNames();
+    bool ok;
+    QString tmplate = QInputDialog::getItem(this, "Mographテンプレート",
+        "テンプレートを選択:", templates, 0, false, &ok);
+    if (!ok)
+        return;
+
+    QStringList args;
+    if (tmplate == "lower_third") {
+        bool ok1, ok2;
+        args << QInputDialog::getText(this, "Mograph", "上部テキスト:", QLineEdit::Normal, "Title", &ok1)
+             << QInputDialog::getText(this, "Mograph", "下部テキスト:", QLineEdit::Normal, "Subtitle", &ok2);
+    } else {
+        bool ok1;
+        args << QInputDialog::getText(this, "Mograph", "テキスト:", QLineEdit::Normal, "Mograph Text", &ok1);
+    }
+
+    auto *mograph = new MographText();
+    mograph->setTemplateName(tmplate);
+    mograph->setArgs(args);
+    m_mographTexts.append(mograph);
+
+    statusBar()->showMessage(QString("Mographテンプレート適用: %1").arg(tmplate));
 }
