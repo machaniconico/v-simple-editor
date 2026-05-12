@@ -1,11 +1,29 @@
 #include "Exporter.h"
 #include "CodecDetector.h"
 #include "VideoEffect.h"
+#include "SmartReframe.h"
+#include "SubtitleTrackRenderer.h"
 #include <QFileInfo>
+#include <QPainter>
 
 Exporter::Exporter(QObject *parent)
     : QObject(parent)
 {
+}
+
+void Exporter::setSmartReframe(SmartReframe *reframe)
+{
+    m_smartReframe = reframe;
+}
+
+void Exporter::setSubtitleRenderer(SubtitleTrackRenderer *renderer)
+{
+    m_subtitleRenderer = renderer;
+}
+
+void Exporter::setLoudnessGainDb(double gainDb)
+{
+    m_loudnessGainDb = gainDb;
 }
 
 void Exporter::cancel()
@@ -281,31 +299,66 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
                 const bool tenBitPath = config.hdr10 || config.proresProfile >= 0;
                 bool hasEffects = !tenBitPath
                                   && (!clip.colorCorrection.isDefault() || !clip.effects.isEmpty());
-                if (hasEffects) {
-                    // Decode to RGB for effect processing
-                    QImage rgbFrame(config.width, config.height, QImage::Format_RGB888);
-                    SwsContext *toRgbCtx = sws_getContext(
-                        frame->width, frame->height, decCtx->pix_fmt,
-                        config.width, config.height, AV_PIX_FMT_RGB24,
-                        SWS_BILINEAR, nullptr, nullptr, nullptr);
-                    uint8_t *rgbDest[1] = { rgbFrame.bits() };
-                    int rgbLinesize[1] = { static_cast<int>(rgbFrame.bytesPerLine()) };
-                    sws_scale(toRgbCtx, frame->data, frame->linesize, 0, frame->height,
-                              rgbDest, rgbLinesize);
-                    sws_freeContext(toRgbCtx);
+                bool needsRgbPass = hasEffects
+                                    || (m_smartReframe != nullptr)
+                                    || (m_subtitleRenderer != nullptr);
+                if (needsRgbPass) {
+                    QImage workingImage;
+                    if (hasEffects) {
+                        // Decode to RGB for effect processing
+                        workingImage = QImage(config.width, config.height, QImage::Format_RGB888);
+                        SwsContext *toRgbCtx = sws_getContext(
+                            frame->width, frame->height, decCtx->pix_fmt,
+                            config.width, config.height, AV_PIX_FMT_RGB24,
+                            SWS_BILINEAR, nullptr, nullptr, nullptr);
+                        uint8_t *rgbDest[1] = { workingImage.bits() };
+                        int rgbLinesize[1] = { static_cast<int>(workingImage.bytesPerLine()) };
+                        sws_scale(toRgbCtx, frame->data, frame->linesize, 0, frame->height,
+                                  rgbDest, rgbLinesize);
+                        sws_freeContext(toRgbCtx);
 
-                    // Apply effects
-                    rgbFrame = VideoEffectProcessor::applyEffectStack(
-                        rgbFrame, clip.colorCorrection, clip.effects);
+                        // Apply effects
+                        workingImage = VideoEffectProcessor::applyEffectStack(
+                            workingImage, clip.colorCorrection, clip.effects);
+                    } else {
+                        // No traditional effects, but reframe/subtitles need RGB.
+                        // Scale to output size first.
+                        workingImage = QImage(config.width, config.height, QImage::Format_RGB888);
+                        SwsContext *toRgbCtx = sws_getContext(
+                            frame->width, frame->height, decCtx->pix_fmt,
+                            config.width, config.height, AV_PIX_FMT_RGB24,
+                            SWS_BILINEAR, nullptr, nullptr, nullptr);
+                        uint8_t *rgbDest[1] = { workingImage.bits() };
+                        int rgbLinesize[1] = { static_cast<int>(workingImage.bytesPerLine()) };
+                        sws_scale(toRgbCtx, frame->data, frame->linesize, 0, frame->height,
+                                  rgbDest, rgbLinesize);
+                        sws_freeContext(toRgbCtx);
+                    }
+
+                    // SmartReframe: crop/pan to target aspect
+                    if (m_smartReframe != nullptr) {
+                        workingImage = m_smartReframe->applyReframe(
+                            workingImage, framePts - clip.inPoint,
+                            QSize(config.width, config.height));
+                    }
+
+                    // Subtitle burn-in
+                    if (m_subtitleRenderer != nullptr) {
+                        QPainter painter(&workingImage);
+                        m_subtitleRenderer->paintOnto(
+                            painter,
+                            QRectF(0, 0, workingImage.width(), workingImage.height()),
+                            framePts - clip.inPoint);
+                    }
 
                     // Convert processed RGB back to YUV420P
                     SwsContext *toYuvCtx = sws_getContext(
-                        config.width, config.height, AV_PIX_FMT_RGB24,
+                        workingImage.width(), workingImage.height(), AV_PIX_FMT_RGB24,
                         config.width, config.height, AV_PIX_FMT_YUV420P,
                         SWS_BILINEAR, nullptr, nullptr, nullptr);
-                    const uint8_t *rgbSrc[1] = { rgbFrame.constBits() };
-                    int rgbSrcLinesize[1] = { static_cast<int>(rgbFrame.bytesPerLine()) };
-                    sws_scale(toYuvCtx, rgbSrc, rgbSrcLinesize, 0, config.height,
+                    const uint8_t *rgbSrc[1] = { workingImage.constBits() };
+                    int rgbSrcLinesize[1] = { static_cast<int>(workingImage.bytesPerLine()) };
+                    sws_scale(toYuvCtx, rgbSrc, rgbSrcLinesize, 0, workingImage.height(),
                               outFrame->data, outFrame->linesize);
                     sws_freeContext(toYuvCtx);
                 } else {

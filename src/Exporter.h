@@ -5,6 +5,9 @@
 #include "ExportDialog.h"
 #include "Timeline.h"
 
+class SmartReframe;
+class SubtitleTrackRenderer;
+
 extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
@@ -23,6 +26,10 @@ public:
     void startExport(const ExportConfig &config, const QVector<ClipInfo> &clips);
     void cancel();
 
+    void setSmartReframe(SmartReframe *reframe);
+    void setSubtitleRenderer(SubtitleTrackRenderer *renderer);
+    void setLoudnessGainDb(double gainDb);
+
 signals:
     void progressChanged(int percent);
     void exportFinished(bool success, const QString &message);
@@ -35,4 +42,8 @@ private:
 
     bool m_cancelled = false;
     QThread *m_thread = nullptr;
+
+    SmartReframe *m_smartReframe = nullptr;
+    SubtitleTrackRenderer *m_subtitleRenderer = nullptr;
+    double m_loudnessGainDb = 0.0;
 };

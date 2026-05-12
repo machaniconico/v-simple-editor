@@ -25,6 +25,12 @@
 #include "BrushAnimation.h"
 #endif
 
+#if defined(VEDITOR_SNSPACK_SELFTEST)
+#include "SmartReframe.h"
+#include "LoudnessAnalyzer.h"
+#include <QtMath>
+#endif
+
 // ──────────────────────────────────────────────────────────────────────────
 // Lightweight file-backed logger + unhandled-exception reporter.
 //
@@ -218,6 +224,46 @@ int main(int argc, char *argv[])
 
         Q_ASSERT(pixels0 <= pixels5 && pixels5 <= pixels1);
         qDebug() << "=== VEDITOR_BRUSH_SELFTEST: PASSED ===";
+    }
+#endif
+
+#if defined(VEDITOR_SNSPACK_SELFTEST)
+    {
+        qDebug() << "=== VEDITOR_SNSPACK_SELFTEST: SmartReframe + LoudnessAnalyzer ===";
+
+        // SmartReframe self-test: 1920x1080 source, 9:16 target
+        SmartReframe reframe;
+        reframe.setSourceSize(QSize(1920, 1080));
+        reframe.setTargetAspect(9.0, 16.0);
+        reframe.setSmoothness(0.7);
+        reframe.setMotionWeight(0.5);
+
+        // Feed 3 synthetic frames
+        for (int i = 0; i < 3; ++i) {
+            QImage frame(1920, 1080, QImage::Format_RGB888);
+            frame.fill(QColor(128 + i * 40, 64, 32).rgb());
+            reframe.analyzeFrame(static_cast<double>(i), frame);
+        }
+        reframe.finalizeAnalysis();
+        QRectF crop0 = reframe.cropRectAt(0.0);
+        qDebug() << "  SmartReframe cropRectAt(0s):" << crop0;
+
+        // LoudnessAnalyzer self-test: synthetic sine wave
+        LoudnessAnalyzer analyzer;
+        analyzer.setSampleRate(48000);
+        const int numFrames = 48000; // 1 second @ 48kHz
+        const double freq = 1000.0;  // 1 kHz tone
+        QVector<float> interleaved(numFrames * 2);
+        for (int i = 0; i < numFrames; ++i) {
+            const double t = static_cast<double>(i) / 48000.0;
+            const double sample = std::sin(2.0 * M_PI * freq * t);
+            interleaved[i * 2]     = static_cast<float>(sample); // L
+            interleaved[i * 2 + 1] = static_cast<float>(sample); // R
+        }
+        analyzer.processBlock(interleaved.constData(), numFrames, 2);
+        qDebug() << "  LoudnessAnalyzer integratedLUFS (1kHz sine, 0dBFS):" << analyzer.integratedLUFS();
+
+        qDebug() << "=== VEDITOR_SNSPACK_SELFTEST: PASSED ===";
     }
 #endif
 

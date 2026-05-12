@@ -90,6 +90,13 @@ struct MographTextEntry {
     QJsonObject data;
 };
 
+// US-SNS-6: subtitle segment persistence for burn-in export
+struct SubtitleEntry {
+    double start = 0.0;
+    double end = 0.0;
+    QString text;
+};
+
 // Full project state for serialization
 struct ProjectData {
     ProjectConfig config;
@@ -122,6 +129,12 @@ struct ProjectData {
     QVector<TextPathWarpEntry> textPathWarps;
     QVector<VariableFontAxisEntry> variableFontAxes;
     QVector<MographTextEntry> mographTexts;
+
+    // US-SNS-6: SmartReframe, subtitle burn-in, loudness normalization
+    QJsonObject smartReframe;
+    QVector<SubtitleEntry> subtitleSegments;
+    QJsonObject subtitleStyle;
+    QJsonObject loudnessSettings;
 };
 
 class ProjectFile

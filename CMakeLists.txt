@@ -7,6 +7,7 @@ message(STATUS "VEDITOR_EDITION = ${VEDITOR_EDITION}")
 option(VEDITOR_PLANAR_TRACKER_SELFTEST "Enable the planar tracker synthetic self-test helper" OFF)
 option(VEDITOR_EFFECT_PARAM_SCHEMA_SELFTEST "Enable the effect param schema round-trip self-test" OFF)
 option(VEDITOR_BRUSH_SELFTEST "Enable the brush animation synthetic self-test helper" OFF)
+option(VEDITOR_SNSPACK_SELFTEST "Enable the SNS pack synthetic self-test" OFF)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -93,6 +94,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/GradientStopBar.cpp
     src/EffectPreset.cpp
     src/SubtitleGenerator.cpp
+    src/SubtitleTrackRenderer.h
+    src/SubtitleTrackRenderer.cpp
     src/MotionTracker.cpp
     src/MotionStabilizer.cpp
     src/TrackerLink.cpp
@@ -114,6 +117,10 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/CompressorPanel.h
     src/ReverbPanel.cpp
     src/ReverbPanel.h
+    src/LoudnessPanel.cpp
+    src/LoudnessPanel.h
+    src/LoudnessAnalyzer.h
+    src/LoudnessAnalyzer.cpp
     src/NoiseReductionPanel.cpp
     src/NoiseReductionPanel.h
     src/AudioMeterWidget.cpp
@@ -162,6 +169,10 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/BrushAnimation.cpp
     src/BrushAnimationDialog.h
     src/BrushAnimationDialog.cpp
+    src/SmartReframe.h
+    src/SmartReframe.cpp
+    src/SmartReframeDialog.h
+    src/SmartReframeDialog.cpp
     src/ShapeLayer.cpp
     src/Camera3D.cpp
     src/Expression.cpp
@@ -215,5 +226,6 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE
     $<$<BOOL:${VEDITOR_PLANAR_TRACKER_SELFTEST}>:VEDITOR_PLANAR_TRACKER_SELFTEST=1>
     $<$<BOOL:${VEDITOR_EFFECT_PARAM_SCHEMA_SELFTEST}>:VEDITOR_EFFECT_PARAM_SCHEMA_SELFTEST=1>
     $<$<BOOL:${VEDITOR_BRUSH_SELFTEST}>:VEDITOR_BRUSH_SELFTEST=1>
+    $<$<BOOL:${VEDITOR_SNSPACK_SELFTEST}>:VEDITOR_SNSPACK_SELFTEST=1>
     $<$<STREQUAL:${VEDITOR_EDITION},modern>:VEDITOR_AV1=1>
 )

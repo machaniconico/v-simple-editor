@@ -161,6 +161,22 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
         root["mographTexts"] = mgArr;
     }
 
+    // US-SNS-6: SmartReframe, subtitle burn-in, loudness normalization
+    root["smartReframe"] = data.smartReframe;
+    {
+        QJsonArray subArr;
+        for (const auto &entry : data.subtitleSegments) {
+            QJsonObject obj;
+            obj["start"] = entry.start;
+            obj["end"] = entry.end;
+            obj["text"] = entry.text;
+            subArr.append(obj);
+        }
+        root["subtitleSegments"] = subArr;
+    }
+    root["subtitleStyle"] = data.subtitleStyle;
+    root["loudnessSettings"] = data.loudnessSettings;
+
     QJsonDocument doc(root);
     QFile file(filePath);
     if (!file.open(QIODevice::WriteOnly))
@@ -266,6 +282,25 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
     if (root.contains("mographTexts"))
         for (const auto &v : root["mographTexts"].toArray())
             data.mographTexts.append(mographTextFromJson(v.toObject()));
+
+    // US-SNS-6: SmartReframe, subtitle burn-in, loudness normalization — backward compat: missing key = empty/default
+    if (root.contains("smartReframe"))
+        data.smartReframe = root["smartReframe"].toObject();
+    data.subtitleSegments.clear();
+    if (root.contains("subtitleSegments")) {
+        for (const auto &v : root["subtitleSegments"].toArray()) {
+            QJsonObject obj = v.toObject();
+            SubtitleEntry entry;
+            entry.start = obj["start"].toDouble(0.0);
+            entry.end = obj["end"].toDouble(0.0);
+            entry.text = obj["text"].toString();
+            data.subtitleSegments.append(entry);
+        }
+    }
+    if (root.contains("subtitleStyle"))
+        data.subtitleStyle = root["subtitleStyle"].toObject();
+    if (root.contains("loudnessSettings"))
+        data.loudnessSettings = root["loudnessSettings"].toObject();
 
     return true;
 }
@@ -378,6 +413,22 @@ QString ProjectFile::toJsonString(const ProjectData &data)
         root["mographTexts"] = mgArr;
     }
 
+    // US-SNS-6: SmartReframe, subtitle burn-in, loudness normalization
+    root["smartReframe"] = data.smartReframe;
+    {
+        QJsonArray subArr;
+        for (const auto &entry : data.subtitleSegments) {
+            QJsonObject obj;
+            obj["start"] = entry.start;
+            obj["end"] = entry.end;
+            obj["text"] = entry.text;
+            subArr.append(obj);
+        }
+        root["subtitleSegments"] = subArr;
+    }
+    root["subtitleStyle"] = data.subtitleStyle;
+    root["loudnessSettings"] = data.loudnessSettings;
+
     QJsonDocument doc(root);
     return QString::fromUtf8(doc.toJson(QJsonDocument::Compact));
 }
@@ -475,6 +526,25 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
     if (root.contains("mographTexts"))
         for (const auto &v : root["mographTexts"].toArray())
             data.mographTexts.append(mographTextFromJson(v.toObject()));
+
+    // US-SNS-6: SmartReframe, subtitle burn-in, loudness normalization — backward compat: missing key = empty/default
+    if (root.contains("smartReframe"))
+        data.smartReframe = root["smartReframe"].toObject();
+    data.subtitleSegments.clear();
+    if (root.contains("subtitleSegments")) {
+        for (const auto &v : root["subtitleSegments"].toArray()) {
+            QJsonObject obj = v.toObject();
+            SubtitleEntry entry;
+            entry.start = obj["start"].toDouble(0.0);
+            entry.end = obj["end"].toDouble(0.0);
+            entry.text = obj["text"].toString();
+            data.subtitleSegments.append(entry);
+        }
+    }
+    if (root.contains("subtitleStyle"))
+        data.subtitleStyle = root["subtitleStyle"].toObject();
+    if (root.contains("loudnessSettings"))
+        data.loudnessSettings = root["loudnessSettings"].toObject();
 
     return true;
 }

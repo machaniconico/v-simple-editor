@@ -63,6 +63,18 @@
 #include "RemotionExport.h"
 #include "WelcomeWidget.h"
 #include "HistoryDockWidget.h"
+#include "SmartReframe.h"
+#include "LoudnessAnalyzer.h"
+#include "SubtitleTrackRenderer.h"
+
+class VideoPlayer;
+class Timeline;
+class ExportDialog;
+class BrushAnimation;
+
+namespace voiceover {
+class VoiceOverDialog;
+}
 
 namespace effectctrl {
 class EffectClipboard;
@@ -70,15 +82,8 @@ class EffectControlsPanel;
 struct ClipMotion;
 }
 class PasteAttributesDialog;
-
-namespace voiceover {
-class VoiceOverDialog;
-}
-
-class VideoPlayer;
-class Timeline;
-class ExportDialog;
-class BrushAnimation;
+class LoudnessPanel;
+class QDockWidget;
 
 class MainWindow : public QMainWindow
 {
@@ -94,6 +99,15 @@ public slots:
 
     // Used by main.cpp --play flag: start video playback.
     void testStartPlayback();
+
+    // US-SNS-7: Smart Reframe dialog + analysis
+    void openSmartReframe();
+
+    // US-SNS-7: Render subtitle track from existing segments
+    void renderSubtitleTrack();
+
+    // US-SNS-7: Loudness normalization slot
+    void applyLoudnessNormalize(double targetLUFS, double gainDb);
 
 public:
     // Current playhead position in seconds. Used by EffectControlsPanel
@@ -333,6 +347,13 @@ private:
     RenderQueue *m_renderQueue = nullptr;
     ScreenRecorder *m_screenRecorder = nullptr;
     AIHighlight *m_aiHighlight = nullptr;
+
+    // US-SNS-7: SNS pack members
+    SmartReframe m_smartReframe;
+    QVector<SubtitleSegment> m_subtitleSegments;
+    SubtitleStyle m_subtitleStyle;
+    LoudnessPanel *m_loudnessPanel = nullptr;
+    QDockWidget *m_loudnessDock = nullptr;
     LayerCompositor m_layerCompositor;
     PrecomposeManager m_precomposeManager;
 
