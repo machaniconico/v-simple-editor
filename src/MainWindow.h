@@ -14,7 +14,10 @@
 #include <QShowEvent>
 #include <QColor>
 #include <QHash>
+#include <QVector>
+#include <QPair>
 #include <QRectF>
+#include <QString>
 #include "ProjectSettings.h"
 #include "Exporter.h"
 #include "ProjectFile.h"
@@ -292,6 +295,11 @@ protected:
 
 private:
     void setupMenuBar();
+    // Beginner-friendly Japanese hover help for menu items. Iterates
+    // m_menuHelpEntries and either sets each QAction's tooltip to its
+    // description (enabled) or clears it (disabled). Persisted via
+    // QSettings("VSimpleEditor","Preferences") key "showMenuHints".
+    void applyMenuHelpTooltips(bool enabled);
     void setupToolBar();
     void setupUI();
     void setupRecentFiles();
@@ -462,6 +470,12 @@ private:
     // History dock
     HistoryDockWidget *m_historyDock = nullptr;
     QAction *m_vfxControlsAction = nullptr;
+
+    // Beginner-friendly hover help: pairs of (menu action, Japanese
+    // explanation). Populated in setupMenuBar() as each action is created;
+    // applied/cleared by applyMenuHelpTooltips() and toggled via the
+    // "メニューの説明を表示" preference.
+    QVector<QPair<QAction *, QString>> m_menuHelpEntries;
 
     // Consolidation: docks for the per-track audio panels (EQ /
     // Compressor / Reverb / Noise Reduction). Created on first use and

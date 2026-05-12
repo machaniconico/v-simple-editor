@@ -906,33 +906,48 @@ void MainWindow::setupMenuBar()
     auto *newAction = fileMenu->addAction("新規プロジェクト(&N)...");
     newAction->setShortcut(QKeySequence::New);
     connect(newAction, &QAction::triggered, this, &MainWindow::newProject);
+    m_menuHelpEntries.append({newAction,
+        QStringLiteral("まっさらな状態で編集を始めます。今の作業は保存していないと消えてしまうので注意してください。")});
 
     auto *projectSettingsAction = fileMenu->addAction("プロジェクト設定(&T)...");
     connect(projectSettingsAction, &QAction::triggered, this, &MainWindow::editProjectSettings);
+    m_menuHelpEntries.append({projectSettingsAction,
+        QStringLiteral("動画の縦横サイズ・フレームレート（なめらかさ）・名前を決めます。YouTube や TikTok 向けのひな型も選べます。")});
 
     auto *openAction = fileMenu->addAction("ファイルを開く(&O)...");
     openAction->setShortcut(QKeySequence::Open);
     connect(openAction, &QAction::triggered, this, &MainWindow::openFile);
+    m_menuHelpEntries.append({openAction,
+        QStringLiteral("パソコンの中の動画・画像・音声ファイルを読み込んで素材として取り込みます。")});
 
     // 最近使ったファイル
     m_recentFilesMenu = new RecentFilesMenu(m_recentFilesManager, fileMenu);
     m_recentFilesMenu->setTitle("最近使ったファイル");
     fileMenu->addMenu(m_recentFilesMenu);
     connect(m_recentFilesMenu, &RecentFilesMenu::fileSelected, this, &MainWindow::openRecentFile);
+    if (m_recentFilesMenu->menuAction())
+        m_menuHelpEntries.append({m_recentFilesMenu->menuAction(),
+            QStringLiteral("直前に開いた素材やプロジェクトを一覧からすぐに呼び出せます。")});
 
     fileMenu->addSeparator();
 
     auto *openProjectAction = fileMenu->addAction("プロジェクトを開く(&P)...");
     openProjectAction->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_O));
     connect(openProjectAction, &QAction::triggered, this, &MainWindow::openProject);
+    m_menuHelpEntries.append({openProjectAction,
+        QStringLiteral("以前に保存した編集プロジェクト（.veproj）ファイルを開いて続きから作業します。")});
 
     auto *saveAction = fileMenu->addAction("プロジェクトを保存(&S)");
     saveAction->setShortcut(QKeySequence::Save);
     connect(saveAction, &QAction::triggered, this, &MainWindow::saveProject);
+    m_menuHelpEntries.append({saveAction,
+        QStringLiteral("今の編集内容をプロジェクトファイルに書き出します。こまめに保存しましょう。")});
 
     auto *saveAsAction = fileMenu->addAction("名前を付けて保存(&A)...");
     saveAsAction->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_S));
     connect(saveAsAction, &QAction::triggered, this, &MainWindow::saveProjectAs);
+    m_menuHelpEntries.append({saveAsAction,
+        QStringLiteral("別名でプロジェクトを保存します。元のファイルを残したまま別バージョンを作りたいときに使います。")});
 
     fileMenu->addSeparator();
 
@@ -942,29 +957,42 @@ void MainWindow::setupMenuBar()
     // standalone dialog that builds a MultiCamProject EDL.
     auto *multiCamDialogAction = fileMenu->addAction("マルチカメラ...");
     connect(multiCamDialogAction, &QAction::triggered, this, &MainWindow::openMultiCamDialog);
+    m_menuHelpEntries.append({multiCamDialogAction,
+        QStringLiteral("複数カメラで撮った同じ場面の映像を切り替えながら 1 本にまとめます。")});
 
     // Premiere Media Encoder / Resolve Deliver page parity — modeless
     // dialog that lists pending / running / completed export jobs.
     auto *renderQueueDialogAction = fileMenu->addAction("レンダーキュー...");
     connect(renderQueueDialogAction, &QAction::triggered, this, &MainWindow::openRenderQueueDialog);
+    m_menuHelpEntries.append({renderQueueDialogAction,
+        QStringLiteral("複数の書き出しをまとめて順番に処理する待ち行列を開きます。")});
 
     fileMenu->addSeparator();
 
     auto *exportAction = fileMenu->addAction("エクスポート(&E)...");
     exportAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_E));
     connect(exportAction, &QAction::triggered, this, &MainWindow::exportVideo);
+    m_menuHelpEntries.append({exportAction,
+        QStringLiteral("完成した動画を mp4 などの 1 本の動画ファイルに書き出します。")});
 
     auto *remotionAction = fileMenu->addAction("Remotion形式でエクスポート(&R)...");
     connect(remotionAction, &QAction::triggered, this, &MainWindow::exportToRemotion);
+    m_menuHelpEntries.append({remotionAction,
+        QStringLiteral("プログラム（Remotion）で再編集できる形式に書き出します。上級者向けです。")});
 
     fileMenu->addSeparator();
 
     auto *prefsMenu = fileMenu->addMenu("環境設定(&S)");
+    if (prefsMenu->menuAction())
+        m_menuHelpEntries.append({prefsMenu->menuAction(),
+            QStringLiteral("テーマ、ショートカット、自動保存などアプリ全体の設定をまとめて変更できます。")});
     fileMenu->addSeparator();
 
     auto *quitAction = fileMenu->addAction("終了(&Q)");
     quitAction->setShortcut(QKeySequence::Quit);
     connect(quitAction, &QAction::triggered, qApp, &QApplication::quit);
+    m_menuHelpEntries.append({quitAction,
+        QStringLiteral("アプリを閉じます。保存していない変更があるか確認してから終了してください。")});
 
     // 編集 メニュー
     auto *editMenu = menuBar()->addMenu("編集(&E)");
@@ -972,47 +1000,67 @@ void MainWindow::setupMenuBar()
     m_undoAction = editMenu->addAction("元に戻す(&U)");
     m_undoAction->setShortcut(QKeySequence::Undo);
     connect(m_undoAction, &QAction::triggered, this, &MainWindow::undoAction);
+    m_menuHelpEntries.append({m_undoAction,
+        QStringLiteral("直前の操作を取り消します。間違えたらまずこれ（Ctrl+Z）。")});
 
     m_redoAction = editMenu->addAction("やり直す(&R)");
     m_redoAction->setShortcut(QKeySequence::Redo);
     connect(m_redoAction, &QAction::triggered, this, &MainWindow::redoAction);
+    m_menuHelpEntries.append({m_redoAction,
+        QStringLiteral("「元に戻す」で取り消した操作を、もう一度やり直します。")});
 
     editMenu->addSeparator();
 
     m_copyAction = editMenu->addAction("クリップをコピー(&C)");
     m_copyAction->setShortcut(QKeySequence::Copy);
     connect(m_copyAction, &QAction::triggered, this, &MainWindow::copyClip);
+    m_menuHelpEntries.append({m_copyAction,
+        QStringLiteral("選んでいるクリップを複製用にコピーします。貼り付けと組み合わせて使います。")});
 
     m_pasteAction = editMenu->addAction("クリップを貼り付け(&P)");
     m_pasteAction->setShortcut(QKeySequence::Paste);
     connect(m_pasteAction, &QAction::triggered, this, &MainWindow::pasteClip);
+    m_menuHelpEntries.append({m_pasteAction,
+        QStringLiteral("コピーしたクリップを再生ヘッドの位置に貼り付けます。")});
 
     editMenu->addSeparator();
 
     m_splitAction = editMenu->addAction("再生ヘッドで分割(&S)");
     m_splitAction->setShortcut(QKeySequence(Qt::Key_S));
     connect(m_splitAction, &QAction::triggered, this, &MainWindow::splitClip);
+    m_menuHelpEntries.append({m_splitAction,
+        QStringLiteral("再生ヘッド（縦線）の位置でクリップを 2 つに切り分けます。いらない部分を消す前準備に。")});
 
     m_deleteAction = editMenu->addAction("クリップを削除(&D)");
     m_deleteAction->setShortcut(QKeySequence::Delete);
     connect(m_deleteAction, &QAction::triggered, this, &MainWindow::deleteClip);
+    m_menuHelpEntries.append({m_deleteAction,
+        QStringLiteral("選んだクリップをタイムラインから消します。元の素材ファイル自体は消えません。")});
 
     m_rippleDeleteAction = editMenu->addAction("リップル削除");
     m_rippleDeleteAction->setShortcut(QKeySequence(Qt::SHIFT | Qt::Key_Delete));
     connect(m_rippleDeleteAction, &QAction::triggered, this, &MainWindow::rippleDelete);
+    m_menuHelpEntries.append({m_rippleDeleteAction,
+        QStringLiteral("クリップを消して、空いた隙間を後ろのクリップが詰めて埋めます。間を空けたくないときに。")});
 
     editMenu->addSeparator();
 
     m_copyEffectsAction = editMenu->addAction("Copy Effects");
     m_copyEffectsAction->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_C));
     connect(m_copyEffectsAction, &QAction::triggered, this, &MainWindow::copyEffects);
+    m_menuHelpEntries.append({m_copyEffectsAction,
+        QStringLiteral("選んだクリップに付けたエフェクト（色補正やぼかし等）の設定だけをコピーします。")});
 
     m_pasteEffectsAction = editMenu->addAction("Paste Effects");
     m_pasteEffectsAction->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_V));
     connect(m_pasteEffectsAction, &QAction::triggered, this, &MainWindow::pasteEffects);
+    m_menuHelpEntries.append({m_pasteEffectsAction,
+        QStringLiteral("コピーしたエフェクト設定を別のクリップに貼り付けます。同じ見た目をまとめて適用できます。")});
 
     m_pasteAttributesAction = editMenu->addAction("Paste Attributes...");
     connect(m_pasteAttributesAction, &QAction::triggered, this, &MainWindow::pasteAttributes);
+    m_menuHelpEntries.append({m_pasteAttributesAction,
+        QStringLiteral("エフェクトのうちどの項目を貼り付けるかを選んで適用します。")});
 
     auto &clipBoard = effectctrl::EffectClipboard::instance();
     m_pasteEffectsAction->setEnabled(clipBoard.hasContent());
@@ -1039,11 +1087,15 @@ void MainWindow::setupMenuBar()
     m_snapAction->setCheckable(true);
     m_snapAction->setChecked(true);
     connect(m_snapAction, &QAction::triggered, this, &MainWindow::toggleSnap);
+    m_menuHelpEntries.append({m_snapAction,
+        QStringLiteral("ON にすると、クリップを動かすとき隣のクリップや再生ヘッドにピタッと吸い付きます。")});
 
     editMenu->addSeparator();
 
     auto *speedAction = editMenu->addAction("再生速度を設定...");
     connect(speedAction, &QAction::triggered, this, &MainWindow::setClipSpeed);
+    m_menuHelpEntries.append({speedAction,
+        QStringLiteral("選んだクリップを早送り・スローモーションにします。倍率を数字で指定できます。")});
 
     // Premiere "Speed / Duration" parity — applies a flat SpeedRamp
     // curve to the selected clip via Timeline.
@@ -1071,6 +1123,8 @@ void MainWindow::setupMenuBar()
     shortcutAction->setShortcut(QKeySequence(Qt::CTRL | Qt::ALT | Qt::Key_K));
     connect(shortcutAction, &QAction::triggered, this, &MainWindow::editShortcuts);
     prefsMenu->addAction(shortcutAction);
+    m_menuHelpEntries.append({shortcutAction,
+        QStringLiteral("よく使う操作のキー割り当てを自分好みに変えられます。")});
 
     // 表示 メニュー
     auto *viewMenu = menuBar()->addMenu("表示(&V)");
@@ -1078,19 +1132,27 @@ void MainWindow::setupMenuBar()
     auto *zoomInAction = viewMenu->addAction("拡大(&I)");
     zoomInAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_Equal));
     connect(zoomInAction, &QAction::triggered, this, &MainWindow::zoomIn);
+    m_menuHelpEntries.append({zoomInAction,
+        QStringLiteral("タイムラインを拡大して、細かい位置あわせをしやすくします。")});
 
     auto *zoomOutAction = viewMenu->addAction("縮小(&O)");
     zoomOutAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_Minus));
     connect(zoomOutAction, &QAction::triggered, this, &MainWindow::zoomOut);
+    m_menuHelpEntries.append({zoomOutAction,
+        QStringLiteral("タイムラインを縮小して、動画全体を一目で見られるようにします。")});
 
     // トラック メニュー
     auto *trackMenu = menuBar()->addMenu("トラック(&T)");
 
     auto *addVTrack = trackMenu->addAction("ビデオトラックを追加(&V)");
     connect(addVTrack, &QAction::triggered, this, &MainWindow::addVideoTrack);
+    m_menuHelpEntries.append({addVTrack,
+        QStringLiteral("映像を重ねるための「段」を増やします。上の段ほど手前（前面）に表示されます。")});
 
     auto *addATrack = trackMenu->addAction("オーディオトラックを追加(&A)");
     connect(addATrack, &QAction::triggered, this, &MainWindow::addAudioTrack);
+    m_menuHelpEntries.append({addATrack,
+        QStringLiteral("音声を重ねるための段を増やします。ナレーションと BGM を別々の段に置けます。")});
 
     // 挿入 メニュー
     auto *insertMenu = menuBar()->addMenu("挿入(&I)");
@@ -1098,13 +1160,19 @@ void MainWindow::setupMenuBar()
     auto *addTextAction = insertMenu->addAction("テキスト / テロップ追加(&T)...");
     addTextAction->setShortcut(QKeySequence(Qt::Key_T));
     connect(addTextAction, &QAction::triggered, this, &MainWindow::addTextOverlay);
+    m_menuHelpEntries.append({addTextAction,
+        QStringLiteral("画面に字幕やテロップ（文字）を追加します。フォントや色も選べます。")});
 
     auto *manageTextAction = insertMenu->addAction("テキスト管理(&M)...");
     manageTextAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_T));
     connect(manageTextAction, &QAction::triggered, this, &MainWindow::manageTextOverlays);
+    m_menuHelpEntries.append({manageTextAction,
+        QStringLiteral("追加済みのテロップを一覧で確認・編集・削除できます。")});
 
     auto *importSubAction = insertMenu->addAction("字幕をインポート (SRT/VTT)...");
     connect(importSubAction, &QAction::triggered, this, &MainWindow::importSubtitles);
+    m_menuHelpEntries.append({importSubAction,
+        QStringLiteral("字幕ファイル（.srt / .vtt）を読み込んでテロップとして取り込みます。")});
 
     auto *exportTextAction = insertMenu->addAction("テキストを書き出し (SRT / CSV)...");
     connect(exportTextAction, &QAction::triggered, this, &MainWindow::exportTextOverlays);
@@ -1115,17 +1183,25 @@ void MainWindow::setupMenuBar()
     auto *addBrushAnimAction = insertMenu->addAction("ブラシ / 書き起こしアニメ追加(&B)...");
     addBrushAnimAction->setShortcut(QKeySequence(Qt::Key_B));
     connect(addBrushAnimAction, &QAction::triggered, this, &MainWindow::addBrushAnimation);
+    m_menuHelpEntries.append({addBrushAnimAction,
+        QStringLiteral("手書き風に文字や線が少しずつ描かれていくアニメーションを追加します。")});
 
     insertMenu->addSeparator();
 
     auto *addTransAction = insertMenu->addAction("トランジションを追加...");
     connect(addTransAction, &QAction::triggered, this, &MainWindow::addTransition);
+    m_menuHelpEntries.append({addTransAction,
+        QStringLiteral("クリップのつなぎ目に、フェードやワイプなどの切り替え演出を入れます。")});
 
     auto *addImageAction = insertMenu->addAction("画像 / 静止画を追加...");
     connect(addImageAction, &QAction::triggered, this, &MainWindow::addImageOverlay);
+    m_menuHelpEntries.append({addImageAction,
+        QStringLiteral("写真やロゴなどの画像をタイムラインに重ねます。")});
 
     auto *addPipAction = insertMenu->addAction("ピクチャー・イン・ピクチャー追加...");
     connect(addPipAction, &QAction::triggered, this, &MainWindow::addPip);
+    m_menuHelpEntries.append({addPipAction,
+        QStringLiteral("画面の隅にもう 1 つ小さい動画を重ねて表示します（ワイプ・実況風）。")});
 
     insertMenu->addSeparator();
 
@@ -1133,12 +1209,16 @@ void MainWindow::setupMenuBar()
     auto *titlePresetAction = insertMenu->addAction("タイトルプリセット...");
     titlePresetAction->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_Y));
     connect(titlePresetAction, &QAction::triggered, this, &MainWindow::openTitlePresetDialog);
+    m_menuHelpEntries.append({titlePresetAction,
+        QStringLiteral("デザイン済みのタイトル・テロップのひな型から選んで、文字だけ差し替えて使えます。")});
 
     // Photoshop / Premiere "Adjustment Layer" — a special timeline clip
     // that carries no video content of its own but applies grading
     // parameters to every video frame underneath.
     auto *addAdjustmentAction = insertMenu->addAction("調整レイヤー");
     connect(addAdjustmentAction, &QAction::triggered, this, &MainWindow::addAdjustmentLayerCmd);
+    m_menuHelpEntries.append({addAdjustmentAction,
+        QStringLiteral("その下にある全部の映像にまとめて色補正やエフェクトをかけられる特別なレイヤーを追加します。")});
 
     // US-AETEXT-12: AE Text Parity — 11 new menu actions
     insertMenu->addSeparator();
@@ -1181,35 +1261,51 @@ void MainWindow::setupMenuBar()
 
     auto *volumeAction = audioMenu->addAction("音量を設定...");
     connect(volumeAction, &QAction::triggered, this, &MainWindow::setClipVolume);
+    m_menuHelpEntries.append({volumeAction,
+        QStringLiteral("選んだ音声クリップの大きさや、フェードイン・フェードアウトを調整します。")});
 
     auto *bgmAction = audioMenu->addAction("BGM / 音声ファイルを追加...");
     connect(bgmAction, &QAction::triggered, this, &MainWindow::addBgm);
+    m_menuHelpEntries.append({bgmAction,
+        QStringLiteral("BGM や効果音などの音声ファイルをタイムラインに追加します。")});
 
     auto *voiceOverAction = audioMenu->addAction("Voice-over Record...");
     voiceOverAction->setShortcut(QKeySequence(Qt::Key_F12));
     connect(voiceOverAction, &QAction::triggered, this, &MainWindow::openVoiceOverDialog);
+    m_menuHelpEntries.append({voiceOverAction,
+        QStringLiteral("映像を見ながらマイクでナレーションを録音し、その場でトラックに追加します。")});
 
     audioMenu->addSeparator();
 
     auto *muteAction = audioMenu->addAction("ミュート切替 (A1)");
     muteAction->setShortcut(QKeySequence(Qt::Key_M));
     connect(muteAction, &QAction::triggered, this, &MainWindow::toggleMute);
+    m_menuHelpEntries.append({muteAction,
+        QStringLiteral("オーディオトラック A1 の音を一時的に消す／戻すを切り替えます。")});
 
     auto *soloAction = audioMenu->addAction("ソロ切替 (A1)");
     connect(soloAction, &QAction::triggered, this, &MainWindow::toggleSolo);
+    m_menuHelpEntries.append({soloAction,
+        QStringLiteral("オーディオトラック A1 だけを鳴らして、他の音を止めて確認します。")});
 
     audioMenu->addSeparator();
 
     auto *eqAction = audioMenu->addAction("イコライザー...");
     connect(eqAction, &QAction::triggered, this, &MainWindow::audioEqualizer);
+    m_menuHelpEntries.append({eqAction,
+        QStringLiteral("低音・高音などの聞こえ方を調整して音質を整えます。こもった声をクリアにしたいときに。")});
 
     auto *audioFxAction = audioMenu->addAction("オーディオエフェクト...");
     connect(audioFxAction, &QAction::triggered, this, &MainWindow::audioEffects);
+    m_menuHelpEntries.append({audioFxAction,
+        QStringLiteral("音にエコーや音量の自動調整などの効果をかけます。")});
 
     audioMenu->addSeparator();
 
     auto *vstAction = audioMenu->addAction("VST / AUプラグイン...");
     connect(vstAction, &QAction::triggered, this, &MainWindow::openVSTPlugins);
+    m_menuHelpEntries.append({vstAction,
+        QStringLiteral("外部の音響プラグイン（VST/AU）を読み込んで使います。上級者向けです。")});
 
     audioMenu->addSeparator();
 
@@ -1262,6 +1358,8 @@ void MainWindow::setupMenuBar()
     // Master Compressor dialog
     auto *compressorAction = audioMenu->addAction("Master Compressor...");
     connect(compressorAction, &QAction::triggered, this, &MainWindow::openMasterCompressor);
+    m_menuHelpEntries.append({compressorAction,
+        QStringLiteral("動画全体の音量の差を縮めて、小さい音は聞こえやすく、大きすぎる音はおさえます。")});
 
     audioMenu->addSeparator();
 
@@ -1329,6 +1427,8 @@ void MainWindow::setupMenuBar()
 
     auto *duckSettingsAction = audioMenu->addAction("Auto-Duck Settings...");
     connect(duckSettingsAction, &QAction::triggered, this, &MainWindow::openAutoDuckSettings);
+    m_menuHelpEntries.append({duckSettingsAction,
+        QStringLiteral("ナレーションが入っている間だけ BGM を自動で小さくする「自動ダッキング」の細かい設定です。")});
 
     audioMenu->addSeparator();
 
@@ -1339,15 +1439,23 @@ void MainWindow::setupMenuBar()
     // setReverbForTrack / setNoiseReductionForTrack.
     auto *eqPanelAction = audioMenu->addAction("EQ パネル...");
     connect(eqPanelAction, &QAction::triggered, this, &MainWindow::openEqualizerPanel);
+    m_menuHelpEntries.append({eqPanelAction,
+        QStringLiteral("トラックごとに低音・中音・高音のバランスを調整する画面を開きます。")});
 
     auto *compPanelAction = audioMenu->addAction("コンプレッサー / リミッター...");
     connect(compPanelAction, &QAction::triggered, this, &MainWindow::openCompressorPanel);
+    m_menuHelpEntries.append({compPanelAction,
+        QStringLiteral("音量の差をならし、急に大きくなりすぎる音を防ぐ画面を開きます。")});
 
     auto *reverbPanelAction = audioMenu->addAction("リバーブ...");
     connect(reverbPanelAction, &QAction::triggered, this, &MainWindow::openReverbPanel);
+    m_menuHelpEntries.append({reverbPanelAction,
+        QStringLiteral("音に残響（広い部屋やホールにいるような響き）を足す画面を開きます。")});
 
     auto *nrPanelAction = audioMenu->addAction("ノイズリダクション...");
     connect(nrPanelAction, &QAction::triggered, this, &MainWindow::openNoiseReductionPanel);
+    m_menuHelpEntries.append({nrPanelAction,
+        QStringLiteral("「サーッ」という背景ノイズや空調音を減らす画面を開きます。")});
 
     // マーカー メニュー
     auto *markersMenu = menuBar()->addMenu("マーカー(&K)");
@@ -1355,6 +1463,8 @@ void MainWindow::setupMenuBar()
     auto *addMarkerAction = markersMenu->addAction("再生ヘッドにマーカー追加");
     addMarkerAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_M));
     connect(addMarkerAction, &QAction::triggered, this, &MainWindow::addMarker);
+    m_menuHelpEntries.append({addMarkerAction,
+        QStringLiteral("今の再生位置に名前付きの目印を付けます。「あとで直す場所」を見失いません。")});
 
     // Quick "M" key — Premiere/Resolve parity. Uses default red marker
     // colour and an empty label so the user gets a marker without a
@@ -1362,6 +1472,8 @@ void MainWindow::setupMenuBar()
     auto *quickMarkerAction = markersMenu->addAction("マーカー追加 (クイック)");
     quickMarkerAction->setShortcut(QKeySequence(Qt::Key_M));
     connect(quickMarkerAction, &QAction::triggered, this, &MainWindow::addQuickMarker);
+    m_menuHelpEntries.append({quickMarkerAction,
+        QStringLiteral("名前を聞かれずにサッと目印を 1 つ置きます（M キー）。名前はあとで付けられます。")});
 
     // Shift+M — open colour picker first, then drop a marker tagged with
     // the chosen colour. Persists colour into Timeline marker data via
@@ -1369,20 +1481,30 @@ void MainWindow::setupMenuBar()
     auto *colouredMarkerAction = markersMenu->addAction("色付きマーカー追加...");
     colouredMarkerAction->setShortcut(QKeySequence(Qt::SHIFT | Qt::Key_M));
     connect(colouredMarkerAction, &QAction::triggered, this, &MainWindow::addColoredMarker);
+    m_menuHelpEntries.append({colouredMarkerAction,
+        QStringLiteral("色を選んでから目印を置きます。「赤＝要修正」「青＝後で確認」など色分けに便利です。")});
 
     auto *nextMarkerAction = markersMenu->addAction("次のマーカーへジャンプ");
     nextMarkerAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_Right));
     connect(nextMarkerAction, &QAction::triggered, this, &MainWindow::jumpToNextMarker);
+    m_menuHelpEntries.append({nextMarkerAction,
+        QStringLiteral("再生ヘッドを次の目印（マーカー）の位置まで一気に移動します。")});
 
     auto *prevMarkerAction = markersMenu->addAction("前のマーカーへジャンプ");
     prevMarkerAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_Left));
     connect(prevMarkerAction, &QAction::triggered, this, &MainWindow::jumpToPrevMarker);
+    m_menuHelpEntries.append({prevMarkerAction,
+        QStringLiteral("再生ヘッドを 1 つ前の目印（マーカー）の位置まで戻します。")});
 
     auto *showMarkersAction = markersMenu->addAction("全マーカーを表示...");
     connect(showMarkersAction, &QAction::triggered, this, &MainWindow::showMarkers);
+    m_menuHelpEntries.append({showMarkersAction,
+        QStringLiteral("付けた目印を一覧で確認し、名前の変更や削除ができます。")});
 
     auto *exportChapAction = markersMenu->addAction("YouTubeチャプターをエクスポート...");
     connect(exportChapAction, &QAction::triggered, this, &MainWindow::exportChapters);
+    m_menuHelpEntries.append({exportChapAction,
+        QStringLiteral("マーカーをもとに、YouTube の概要欄に貼れるチャプター一覧（時刻＋見出し）を書き出します。")});
 
     // エフェクト メニュー
     auto *effectsMenu = menuBar()->addMenu("エフェクト(&F)");
@@ -1390,34 +1512,50 @@ void MainWindow::setupMenuBar()
     auto *ccAction = effectsMenu->addAction("色補正 / グレーディング(&C)...");
     ccAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_G));
     connect(ccAction, &QAction::triggered, this, &MainWindow::colorCorrection);
+    m_menuHelpEntries.append({ccAction,
+        QStringLiteral("映像の明るさ・色合い・コントラストを整えます。映画風の色味に寄せることもできます。")});
 
     auto *fxAction = effectsMenu->addAction("ビデオエフェクト(&V)...");
     fxAction->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_F));
     connect(fxAction, &QAction::triggered, this, &MainWindow::videoEffects);
+    m_menuHelpEntries.append({fxAction,
+        QStringLiteral("ぼかし・モザイク・光らせるなど、映像に視覚効果を追加します。")});
 
     effectsMenu->addSeparator();
 
     auto *sharpenFxAction = effectsMenu->addAction("シャープン...");
     connect(sharpenFxAction, &QAction::triggered, this, &MainWindow::applySharpenEffect);
+    m_menuHelpEntries.append({sharpenFxAction,
+        QStringLiteral("映像の輪郭をくっきりさせます。少しぼやけた映像をシャキッと見せたいときに。")});
 
     auto *mosaicFxAction = effectsMenu->addAction("モザイク...");
     connect(mosaicFxAction, &QAction::triggered, this, &MainWindow::applyMosaicEffect);
+    m_menuHelpEntries.append({mosaicFxAction,
+        QStringLiteral("顔やナンバープレートなど、見せたくない部分をモザイクで隠します。")});
 
     auto *chromaFxAction = effectsMenu->addAction("クロマキー...");
     connect(chromaFxAction, &QAction::triggered, this, &MainWindow::applyChromaKeyEffect);
+    m_menuHelpEntries.append({chromaFxAction,
+        QStringLiteral("緑や青の背景（グリーンバック）を透明にして、別の映像と合成します。")});
 
     effectsMenu->addSeparator();
 
     auto *pluginAction = effectsMenu->addAction("プラグインエフェクト(&P)...");
     connect(pluginAction, &QAction::triggered, this, &MainWindow::pluginEffects);
+    m_menuHelpEntries.append({pluginAction,
+        QStringLiteral("追加でインストールした映像エフェクト（プラグイン）を使います。")});
 
     effectsMenu->addSeparator();
 
     auto *lutAction = effectsMenu->addAction("LUT適用 (.cube)...");
     connect(lutAction, &QAction::triggered, this, &MainWindow::applyLut);
+    m_menuHelpEntries.append({lutAction,
+        QStringLiteral("用意された色味のレシピ（LUT ファイル）を読み込んで、映像の色を一発で変えます。")});
 
     auto *manageLutAction = effectsMenu->addAction("LUT管理...");
     connect(manageLutAction, &QAction::triggered, this, &MainWindow::manageLuts);
+    m_menuHelpEntries.append({manageLutAction,
+        QStringLiteral("登録済みの色味レシピ（LUT）を整理・追加・削除します。")});
 
     effectsMenu->addSeparator();
 
@@ -1444,18 +1582,26 @@ void MainWindow::setupMenuBar()
     auto *applyPresetAction = effectsMenu->addAction("エフェクトプリセット適用...");
     applyPresetAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_P));
     connect(applyPresetAction, &QAction::triggered, this, &MainWindow::applyEffectPreset);
+    m_menuHelpEntries.append({applyPresetAction,
+        QStringLiteral("保存済みのエフェクト設定の組み合わせを、選んだクリップにまとめて適用します。")});
 
     auto *savePresetAction = effectsMenu->addAction("現在設定をプリセットに保存...");
     connect(savePresetAction, &QAction::triggered, this, &MainWindow::saveEffectPreset);
+    m_menuHelpEntries.append({savePresetAction,
+        QStringLiteral("今のクリップに付けているエフェクトの組み合わせに名前を付けて保存し、後で使い回せます。")});
 
     auto *managePresetsAction = effectsMenu->addAction("プリセット管理...");
     connect(managePresetsAction, &QAction::triggered, this, &MainWindow::manageEffectPresets);
+    m_menuHelpEntries.append({managePresetsAction,
+        QStringLiteral("保存したエフェクトプリセットの名前変更・削除をします。")});
 
     effectsMenu->addSeparator();
 
     auto *kfAction = effectsMenu->addAction("キーフレーム編集(&K)...");
     kfAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_K));
     connect(kfAction, &QAction::triggered, this, &MainWindow::editKeyframes);
+    m_menuHelpEntries.append({kfAction,
+        QStringLiteral("時間とともに動く・色が変わるなどの動きを「キーフレーム」で細かく設定します。")});
 
     effectsMenu->addSeparator();
 
@@ -1463,115 +1609,169 @@ void MainWindow::setupMenuBar()
     m_trackMotionAction = effectsMenu->addAction("Track Motion…");
     m_trackMotionAction->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_T));
     connect(m_trackMotionAction, &QAction::triggered, this, &MainWindow::trackMotion);
+    m_menuHelpEntries.append({m_trackMotionAction,
+        QStringLiteral("映像の中で動く対象を追いかけ、その動きにテロップやモザイクを追従させます。")});
 
     effectsMenu->addSeparator();
 
     auto *shaderFxAction = effectsMenu->addAction("GPUシェーダーエフェクト...");
     connect(shaderFxAction, &QAction::triggered, this, &MainWindow::applyShaderEffect);
+    m_menuHelpEntries.append({shaderFxAction,
+        QStringLiteral("グラフィックボードの力で動く特殊なエフェクトを使います。上級者向けです。")});
 
     auto *manageShaderAction = effectsMenu->addAction("GPUシェーダー管理...");
     connect(manageShaderAction, &QAction::triggered, this, &MainWindow::manageShaderEffects);
+    m_menuHelpEntries.append({manageShaderAction,
+        QStringLiteral("登録済みの GPU シェーダーエフェクトを整理・追加・削除します。")});
 
     // 再生 メニュー
     auto *playbackMenu = menuBar()->addMenu("再生(&P)");
 
     auto *jklNote = playbackMenu->addAction("J/K/L 速度コントロール");
     jklNote->setEnabled(false);
+    m_menuHelpEntries.append({jklNote,
+        QStringLiteral("J＝逆再生 / K＝停止 / L＝再生。押すたびに早送り・早戻しが速くなります（参考表示）。")});
 
     playbackMenu->addSeparator();
 
     auto *markInAction = playbackMenu->addAction("イン点をマーク(&I)");
     markInAction->setShortcut(QKeySequence(Qt::Key_I));
     connect(markInAction, &QAction::triggered, this, &MainWindow::markIn);
+    m_menuHelpEntries.append({markInAction,
+        QStringLiteral("使いたい範囲の「開始位置」を今の再生位置に決めます（I キー）。")});
 
     auto *markOutAction = playbackMenu->addAction("アウト点をマーク(&O)");
     markOutAction->setShortcut(QKeySequence(Qt::Key_O));
     connect(markOutAction, &QAction::triggered, this, &MainWindow::markOut);
+    m_menuHelpEntries.append({markOutAction,
+        QStringLiteral("使いたい範囲の「終了位置」を今の再生位置に決めます（O キー）。")});
 
     // ツール メニュー (AI / 自動編集)
     auto *toolsMenu = menuBar()->addMenu("ツール(&T)");
 
     auto *silenceAction = toolsMenu->addAction("無音検出...");
     connect(silenceAction, &QAction::triggered, this, &MainWindow::autoSilenceDetect);
+    m_menuHelpEntries.append({silenceAction,
+        QStringLiteral("しゃべっていない静かな部分を自動で見つけます。間延びカットの下準備に。")});
 
     auto *jumpCutAction = toolsMenu->addAction("自動ジャンプカット...");
     connect(jumpCutAction, &QAction::triggered, this, &MainWindow::autoJumpCut);
+    m_menuHelpEntries.append({jumpCutAction,
+        QStringLiteral("無音部分を自動で切り取って、テンポの良い動画にします（実況・解説系で人気）。")});
 
     auto *sceneAction = toolsMenu->addAction("シーン変化検出...");
     connect(sceneAction, &QAction::triggered, this, &MainWindow::autoSceneDetect);
+    m_menuHelpEntries.append({sceneAction,
+        QStringLiteral("映像が大きく切り替わる場所を自動で見つけて、そこに目印を付けます。")});
 
     toolsMenu->addSeparator();
 
     auto *stabilizeAction = toolsMenu->addAction("手ブレ補正...");
     connect(stabilizeAction, &QAction::triggered, this, &MainWindow::stabilizeVideo);
+    m_menuHelpEntries.append({stabilizeAction,
+        QStringLiteral("カメラのブレでガタガタ揺れる映像を、なめらかに見えるよう自動で補正します。")});
 
     auto *speedRampAction = toolsMenu->addAction("スピードランプ (可変速)...");
     connect(speedRampAction, &QAction::triggered, this, &MainWindow::setSpeedRamp);
+    m_menuHelpEntries.append({speedRampAction,
+        QStringLiteral("途中から徐々にスローになる／速くなるなど、再生速度を時間ごとに変化させます。")});
 
     toolsMenu->addSeparator();
 
     auto *motionTrackAction = toolsMenu->addAction("モーショントラッキング...");
     connect(motionTrackAction, &QAction::triggered, this, &MainWindow::motionTrackSetup);
+    m_menuHelpEntries.append({motionTrackAction,
+        QStringLiteral("動く対象を追いかけて、テロップやモザイクをその動きにくっつけて移動させます。")});
 
     toolsMenu->addSeparator();
 
     auto *audioDenoiseAction = toolsMenu->addAction("音声ノイズ除去...");
     connect(audioDenoiseAction, &QAction::triggered, this, &MainWindow::audioNoiseDenoise);
+    m_menuHelpEntries.append({audioDenoiseAction,
+        QStringLiteral("録音に入った「サーッ」というノイズや空調音を減らして、声を聞き取りやすくします。")});
 
     auto *videoDenoiseAction = toolsMenu->addAction("映像ノイズ除去...");
     connect(videoDenoiseAction, &QAction::triggered, this, &MainWindow::videoNoiseDenoise);
+    m_menuHelpEntries.append({videoDenoiseAction,
+        QStringLiteral("暗い場所で撮ったときに出るザラザラしたノイズを減らして、映像をきれいにします。")});
 
     toolsMenu->addSeparator();
 
     auto *subtitleGenAction = toolsMenu->addAction("字幕自動生成 (Whisper)...");
     connect(subtitleGenAction, &QAction::triggered, this, &MainWindow::generateSubtitles);
+    m_menuHelpEntries.append({subtitleGenAction,
+        QStringLiteral("しゃべっている内容を AI が聞き取って、字幕（テロップ）を自動で作ります。")});
 
     auto *highlightAction = toolsMenu->addAction("AI自動ハイライト...");
     connect(highlightAction, &QAction::triggered, this, &MainWindow::analyzeHighlights);
+    m_menuHelpEntries.append({highlightAction,
+        QStringLiteral("長い映像の中から盛り上がっている見せ場を AI が探して、候補として並べます。")});
 
     toolsMenu->addSeparator();
 
     auto *screenRecAction = toolsMenu->addAction("画面録画を開始...");
     connect(screenRecAction, &QAction::triggered, this, &MainWindow::startScreenRecording);
+    m_menuHelpEntries.append({screenRecAction,
+        QStringLiteral("パソコンの画面を動画として録画します。ゲーム実況や操作説明動画に。")});
 
     auto *stopRecAction = toolsMenu->addAction("画面録画を停止");
     connect(stopRecAction, &QAction::triggered, this, &MainWindow::stopScreenRecording);
+    m_menuHelpEntries.append({stopRecAction,
+        QStringLiteral("実行中の画面録画を終了して、録画した動画を保存します。")});
 
     toolsMenu->addSeparator();
 
     auto *proxySettingsAction = toolsMenu->addAction("プロキシ設定...");
     connect(proxySettingsAction, &QAction::triggered, this, &MainWindow::openProxySettings);
+    m_menuHelpEntries.append({proxySettingsAction,
+        QStringLiteral("重い動画を軽い「代理映像（プロキシ）」に置き換えて、編集中の動作を軽くする設定です。")});
 
     auto *proxyToggle = toolsMenu->addAction("プロキシモード切替");
     proxyToggle->setCheckable(true);
     connect(proxyToggle, &QAction::triggered, this, &MainWindow::toggleProxyMode);
+    m_menuHelpEntries.append({proxyToggle,
+        QStringLiteral("編集中に軽い代理映像を使うか、元の高画質映像を使うかを切り替えます。書き出しは常に高画質です。")});
 
     auto *genProxiesAction = toolsMenu->addAction("プロキシ生成...");
     connect(genProxiesAction, &QAction::triggered, this, &MainWindow::generateProxies);
+    m_menuHelpEntries.append({genProxiesAction,
+        QStringLiteral("読み込んだ素材から、編集を軽くするための代理映像（プロキシ）を作ります。")});
 
     auto *proxyMgmtAction = toolsMenu->addAction("プロキシ管理...");
     connect(proxyMgmtAction, &QAction::triggered, this, &MainWindow::openProxyManagement);
+    m_menuHelpEntries.append({proxyMgmtAction,
+        QStringLiteral("作成済みの代理映像（プロキシ）の一覧確認・削除をします。")});
 
     auto *renderQueueAction = toolsMenu->addAction("レンダーキュー...");
     renderQueueAction->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_R));
     connect(renderQueueAction, &QAction::triggered, this, &MainWindow::openRenderQueue);
+    m_menuHelpEntries.append({renderQueueAction,
+        QStringLiteral("複数の書き出しをまとめて順番に処理する待ち行列を開きます。")});
 
     auto *networkRenderAction = toolsMenu->addAction("ネットワークレンダー...");
     connect(networkRenderAction, &QAction::triggered, this, &MainWindow::openNetworkRender);
+    m_menuHelpEntries.append({networkRenderAction,
+        QStringLiteral("他のパソコンの力も借りて、動画の書き出しを分担して速くします。上級者向けです。")});
 
     toolsMenu->addSeparator();
 
     auto *scriptAction = toolsMenu->addAction("Pythonスクリプトコンソール...");
     scriptAction->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_P));
     connect(scriptAction, &QAction::triggered, this, &MainWindow::openScriptConsole);
+    m_menuHelpEntries.append({scriptAction,
+        QStringLiteral("Python のプログラムで編集作業を自動化します。プログラミングに詳しい人向けです。")});
 
     toolsMenu->addSeparator();
 
     auto *multiCamSetupAction = toolsMenu->addAction("マルチカメラセットアップ...");
     connect(multiCamSetupAction, &QAction::triggered, this, &MainWindow::multiCamSetup);
+    m_menuHelpEntries.append({multiCamSetupAction,
+        QStringLiteral("複数カメラの映像を音で合わせて、切り替え編集できる状態にまとめます。")});
 
     auto *multiCamSwitchAction = toolsMenu->addAction("マルチカメラ切替...");
     connect(multiCamSwitchAction, &QAction::triggered, this, &MainWindow::multiCamSwitch);
+    m_menuHelpEntries.append({multiCamSwitchAction,
+        QStringLiteral("再生しながらカメラを切り替えていくと、その通りに編集されます。")});
 
     // US-SNS-7: LoudnessPanel dock (created here so menu action can reference it)
     m_loudnessDock = new QDockWidget("ラウドネスパネル", this);
@@ -1588,9 +1788,13 @@ void MainWindow::setupMenuBar()
 
     auto *smartReframeAction = streamMenu->addAction("スマートリフレーム (縦/正方形)...");
     connect(smartReframeAction, &QAction::triggered, this, &MainWindow::openSmartReframe);
+    m_menuHelpEntries.append({smartReframeAction,
+        QStringLiteral("横長の動画を、TikTok 等の縦型や正方形に自動で切り出し直します。被写体を追って枠を合わせます。")});
 
     auto *subtitleTrackAction = streamMenu->addAction("字幕トラックを生成・表示");
     connect(subtitleTrackAction, &QAction::triggered, this, &MainWindow::renderSubtitleTrack);
+    m_menuHelpEntries.append({subtitleTrackAction,
+        QStringLiteral("作成済みの字幕をタイムライン上のトラックとして表示し、見た目を調整できるようにします。")});
 
     streamMenu->addSeparator();
 
@@ -1606,40 +1810,62 @@ void MainWindow::setupMenuBar()
 
     auto *addShapeAction = compMenu->addAction("シェイプレイヤー追加...");
     connect(addShapeAction, &QAction::triggered, this, &MainWindow::addShapeLayer);
+    m_menuHelpEntries.append({addShapeAction,
+        QStringLiteral("四角・丸・線などの図形を作って画面に重ねます。装飾や下地に使えます。")});
 
     auto *addParticleAction = compMenu->addAction("パーティクルエフェクト追加...");
     connect(addParticleAction, &QAction::triggered, this, &MainWindow::addParticleEffect);
+    m_menuHelpEntries.append({addParticleAction,
+        QStringLiteral("キラキラ・雪・煙などの粒が舞うエフェクトを追加します。")});
 
     auto *textAnimAction = compMenu->addAction("テキストアニメーション追加...");
     connect(textAnimAction, &QAction::triggered, this, &MainWindow::addTextAnimation);
+    m_menuHelpEntries.append({textAnimAction,
+        QStringLiteral("文字が出てくる・流れる・揺れるなどの動きをテロップに付けます。")});
 
     compMenu->addSeparator();
 
     auto *transformKfAction = compMenu->addAction("トランスフォームキーフレーム編集...");
     connect(transformKfAction, &QAction::triggered, this, &MainWindow::editTransformKeyframes);
+    m_menuHelpEntries.append({transformKfAction,
+        QStringLiteral("位置・大きさ・回転を時間に沿って変化させ、動くアニメーションを作ります。")});
 
     auto *maskAction = compMenu->addAction("マスク追加...");
     connect(maskAction, &QAction::triggered, this, &MainWindow::addMask);
+    m_menuHelpEntries.append({maskAction,
+        QStringLiteral("映像の一部分だけを見せる／隠す「窓」を作ります。一部だけ色を変える・切り抜くのに。")});
 
     auto *warpAction = compMenu->addAction("ワープ / 歪みエフェクト...");
     connect(warpAction, &QAction::triggered, this, &MainWindow::applyWarpEffect);
+    m_menuHelpEntries.append({warpAction,
+        QStringLiteral("映像をぐにゃっと曲げたり波打たせたりして変形させます。")});
 
     auto *rotoToolsAction = compMenu->addAction(QStringLiteral("ロトツール..."));
     connect(rotoToolsAction, &QAction::triggered, this, &MainWindow::openRotoToolsDialog);
+    m_menuHelpEntries.append({rotoToolsAction,
+        QStringLiteral("人や物の輪郭をなぞって切り抜きます。コマが進んでも形を自動で追従させられます。")});
 
     auto *timeRemapAction = compMenu->addAction(QStringLiteral("タイムリマップ..."));
     connect(timeRemapAction, &QAction::triggered, this, &MainWindow::openTimeRemapDialog);
+    m_menuHelpEntries.append({timeRemapAction,
+        QStringLiteral("クリップの再生速度を時間ごとに自由に変えます（だんだん遅く→速く 等）。なめらかに補間されます。")});
 
     auto *trackMatteAction = compMenu->addAction(QStringLiteral("トラックマット..."));
     connect(trackMatteAction, &QAction::triggered, this, &MainWindow::configureTrackMatte);
+    m_menuHelpEntries.append({trackMatteAction,
+        QStringLiteral("上のレイヤーの形や明るさを「型」にして、下のレイヤーをその形に切り抜きます。")});
 
     compMenu->addSeparator();
 
     auto *exprAction = compMenu->addAction("エクスプレッション...");
     connect(exprAction, &QAction::triggered, this, &MainWindow::editExpressions);
+    m_menuHelpEntries.append({exprAction,
+        QStringLiteral("簡単な数式で値を自動で動かします（例：ずっと揺らし続ける）。上級者向けです。")});
 
     auto *precompAction = compMenu->addAction("選択をプリコンポーズ...");
     connect(precompAction, &QAction::triggered, this, &MainWindow::precomposeSelected);
+    m_menuHelpEntries.append({precompAction,
+        QStringLiteral("複数のレイヤーを 1 つにまとめて扱いやすくします。整理整頓に便利です。")});
 
     // --- カラーグレーディングパネル ---
     m_colorGradingPanel = new ColorGradingPanel(this);
@@ -1897,16 +2123,22 @@ void MainWindow::setupMenuBar()
     colorPanelAction->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_G));
     connect(colorPanelAction, &QAction::toggled, m_colorGradingPanel, &QDockWidget::setVisible);
     connect(m_colorGradingPanel, &QDockWidget::visibilityChanged, colorPanelAction, &QAction::setChecked);
+    m_menuHelpEntries.append({colorPanelAction,
+        QStringLiteral("色味・明るさを細かく調整する作業パネルを出し入れします。閉じてもここから戻せます。")});
 
     auto *effectControlsAction = viewMenu->addAction("Effect Controls");
     effectControlsAction->setCheckable(true);
     connect(effectControlsAction, &QAction::toggled, m_effectControlsPanel, &QDockWidget::setVisible);
     connect(m_effectControlsPanel, &QDockWidget::visibilityChanged, effectControlsAction, &QAction::setChecked);
+    m_menuHelpEntries.append({effectControlsAction,
+        QStringLiteral("選んだクリップに付いているエフェクトの設定値を編集するパネルを出し入れします。")});
 
     m_vfxControlsAction = viewMenu->addAction(QStringLiteral("VFX コントロール"));
     m_vfxControlsAction->setCheckable(true);
     connect(m_vfxControlsAction, &QAction::toggled, m_vfxControlsDock, &QDockWidget::setVisible);
     connect(m_vfxControlsDock, &QDockWidget::visibilityChanged, m_vfxControlsAction, &QAction::setChecked);
+    m_menuHelpEntries.append({m_vfxControlsAction,
+        QStringLiteral("グロー（光らせる）やにじみなどの特殊効果を調整するパネルを出し入れします。")});
 
     // Lumetri Scopes dock — Histogram + Luma Waveform + Vectorscope. Off
     // by default so first-run users aren't paying CPU on scope math; the
@@ -1925,6 +2157,8 @@ void MainWindow::setupMenuBar()
     scopesAction->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_L));
     connect(scopesAction, &QAction::toggled, scopesDock, &QDockWidget::setVisible);
     connect(scopesDock, &QDockWidget::visibilityChanged, scopesAction, &QAction::setChecked);
+    m_menuHelpEntries.append({scopesAction,
+        QStringLiteral("映像の明るさや色の分布をグラフで確認するパネルを出し入れします。色調整の目安に。")});
 
     // Audio Meters dock
     m_audioMetersDock = new QDockWidget("Audio Meters", this);
@@ -1936,6 +2170,8 @@ void MainWindow::setupMenuBar()
     audioMetersAction->setChecked(true);
     connect(audioMetersAction, &QAction::toggled, m_audioMetersDock, &QDockWidget::setVisible);
     connect(m_audioMetersDock, &QDockWidget::visibilityChanged, audioMetersAction, &QAction::setChecked);
+    m_menuHelpEntries.append({audioMetersAction,
+        QStringLiteral("音の大きさをメーターで表示するパネルを出し入れします。音割れしていないか確認できます。")});
 
     // History dock
     m_historyDock = new HistoryDockWidget(m_timeline->undoManager(), this);
@@ -1946,21 +2182,29 @@ void MainWindow::setupMenuBar()
     historyAction->setChecked(true);
     connect(historyAction, &QAction::toggled, m_historyDock, &QDockWidget::setVisible);
     connect(m_historyDock, &QDockWidget::visibilityChanged, historyAction, &QAction::setChecked);
+    m_menuHelpEntries.append({historyAction,
+        QStringLiteral("これまでの操作の履歴を一覧で表示するパネルを出し入れします。前の状態まで一気に戻れます。")});
 
     // US-NODE-9: Node compositing mode toggle
     m_nodeModeAction = viewMenu->addAction("ノードコンポジットモード");
     m_nodeModeAction->setCheckable(true);
     m_nodeModeAction->setChecked(false);
     connect(m_nodeModeAction, &QAction::toggled, this, &MainWindow::toggleNodeCompositingMode);
+    m_menuHelpEntries.append({m_nodeModeAction,
+        QStringLiteral("高度な合成を、箱（ノード）を線でつなぐ方式の画面に切り替えます。上級者向けです。")});
 
     // 表示メニュー追加項目
     auto *themeAction = viewMenu->addAction("テーマ変更...");
     connect(themeAction, &QAction::triggered, this, &MainWindow::changeTheme);
+    m_menuHelpEntries.append({themeAction,
+        QStringLiteral("画面の見た目（暗いテーマ／明るいテーマなど）を変えます。")});
 
     viewMenu->addSeparator();
 
     auto *tooltipAction = viewMenu->addAction("ツールバーのツールチップを表示");
     tooltipAction->setCheckable(true);
+    m_menuHelpEntries.append({tooltipAction,
+        QStringLiteral("上のボタン列にマウスを当てたとき、ボタンの説明を吹き出しで出すかどうかを切り替えます。")});
     {
         QSettings prefSettings("VSimpleEditor", "Preferences");
         tooltipAction->setChecked(prefSettings.value("showTooltips", true).toBool());
@@ -1980,6 +2224,26 @@ void MainWindow::setupMenuBar()
         }
     });
 
+    // メニュー項目に初心者向けの説明（hover ヘルプ）を出すかどうかのトグル。
+    // デフォルト ON。QSettings("VSimpleEditor","Preferences") キー
+    // "showMenuHints" に保存し、即座に applyMenuHelpTooltips() で反映する。
+    auto *menuHintsAction = viewMenu->addAction("メニューの説明を表示");
+    menuHintsAction->setCheckable(true);
+    {
+        QSettings prefSettings("VSimpleEditor", "Preferences");
+        menuHintsAction->setChecked(prefSettings.value("showMenuHints", true).toBool());
+    }
+    connect(menuHintsAction, &QAction::toggled, this, [this](bool checked) {
+        QSettings prefSettings("VSimpleEditor", "Preferences");
+        prefSettings.setValue("showMenuHints", checked);
+        applyMenuHelpTooltips(checked);
+        statusBar()->showMessage(checked
+            ? QStringLiteral("メニューの説明（hover ヘルプ）を表示します")
+            : QStringLiteral("メニューの説明（hover ヘルプ）を非表示にしました"));
+    });
+    m_menuHelpEntries.append({menuHintsAction,
+        QStringLiteral("この説明（メニューにマウスを当てると出る吹き出し）を表示するかどうかを切り替えます。")});
+
     auto *toolbarStyleAction = viewMenu->addAction("ツールバーをアイコンのみ表示");
     toolbarStyleAction->setCheckable(true);
     connect(toolbarStyleAction, &QAction::toggled, this, [this](bool iconOnly) {
@@ -1990,6 +2254,8 @@ void MainWindow::setupMenuBar()
             prefSettings.setValue("toolbarIconOnly", iconOnly);
         }
     });
+    m_menuHelpEntries.append({toolbarStyleAction,
+        QStringLiteral("上のボタン列を、アイコンだけの小さい表示にするか、文字付きの表示にするかを切り替えます。")});
 
     // 取り込み配置ポリシー: 並列トラック (V2/A2...) か 現在トラック追加 (V1/A1 連結)
     auto *importPlacementGroup = new QActionGroup(this);
@@ -2067,6 +2333,8 @@ void MainWindow::setupMenuBar()
     // 自動保存（バックアップ）トグル — デフォルトOFF、30分周期
     auto *autoSaveAction = new QAction("自動保存を有効化 (30分ごと)", this);
     autoSaveAction->setCheckable(true);
+    m_menuHelpEntries.append({autoSaveAction,
+        QStringLiteral("一定時間ごとに自動でバックアップを保存します。万一のクラッシュ対策に ON がおすすめです。")});
     {
         QSettings prefSettings("VSimpleEditor", "Preferences");
         autoSaveAction->setChecked(prefSettings.value("autoSaveEnabled", false).toBool());
@@ -2091,6 +2359,7 @@ void MainWindow::setupMenuBar()
     // 環境設定サブメニューに共有QActionを集約
     prefsMenu->addSeparator();
     prefsMenu->addAction(themeAction);
+    prefsMenu->addAction(menuHintsAction);
     prefsMenu->addAction(tooltipAction);
     prefsMenu->addAction(toolbarStyleAction);
     prefsMenu->addSeparator();
@@ -2116,6 +2385,8 @@ void MainWindow::setupMenuBar()
             m_player->setPreviewEffects({}, /*live=*/true);
     });
     prefsMenu->addAction(gpuEffectsAction);
+    m_menuHelpEntries.append({gpuEffectsAction,
+        QStringLiteral("グラフィックボードを使ってエフェクト処理を速くします。動作が不安定なときは OFF にしてください。")});
     prefsMenu->addSeparator();
 
     // Iteration 12: toggle for auto-play on first clip drop. Default OFF
@@ -2145,6 +2416,8 @@ void MainWindow::setupMenuBar()
     connect(loudnessAction, &QAction::triggered,
             this, &MainWindow::openLoudnessSettings);
     prefsMenu->addAction(loudnessAction);
+    m_menuHelpEntries.append({loudnessAction,
+        QStringLiteral("動画全体の音量バランスを自動でそろえます。配信プラットフォーム向けの音量調整に。")});
     prefsMenu->addSeparator();
 
     // US-T39 Snap strength submenu — pulls/flushes the video source onto
@@ -2195,11 +2468,41 @@ void MainWindow::setupMenuBar()
     auto *resourceGuideAction = helpMenu->addAction("無料素材ガイド...");
     resourceGuideAction->setShortcut(QKeySequence(Qt::Key_F1));
     connect(resourceGuideAction, &QAction::triggered, this, &MainWindow::showResourceGuide);
+    m_menuHelpEntries.append({resourceGuideAction,
+        QStringLiteral("商用利用 OK の無料動画・音楽・画像が手に入るサイトの一覧を開きます。")});
 
     helpMenu->addSeparator();
 
     auto *aboutAction = helpMenu->addAction("バージョン情報(&A)");
     connect(aboutAction, &QAction::triggered, this, &MainWindow::about);
+    m_menuHelpEntries.append({aboutAction,
+        QStringLiteral("このアプリのバージョンや情報を表示します。")});
+
+    // 全メニュー（サブメニュー含む）でツールチップを有効化。これをしないと
+    // Qt のメニューはマウスを当てても説明（ツールチップ）を出さない。
+    const QList<QMenu *> allMenus = menuBar()->findChildren<QMenu *>();
+    for (QMenu *menu : allMenus) {
+        if (menu)
+            menu->setToolTipsVisible(true);
+    }
+
+    // メニュー項目の hover ヘルプを設定の保存値（デフォルト ON）にしたがって適用。
+    {
+        QSettings prefSettings("VSimpleEditor", "Preferences");
+        applyMenuHelpTooltips(prefSettings.value("showMenuHints", true).toBool());
+    }
+}
+
+void MainWindow::applyMenuHelpTooltips(bool enabled)
+{
+    for (const auto &entry : m_menuHelpEntries) {
+        QAction *action = entry.first;
+        if (!action)
+            continue;
+        // Only manage the tooltip — leaving any pre-existing status tip
+        // (e.g. set explicitly elsewhere) untouched.
+        action->setToolTip(enabled ? entry.second : QString());
+    }
 }
 
 void MainWindow::setupToolBar()
