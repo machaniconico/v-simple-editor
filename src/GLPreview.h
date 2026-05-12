@@ -138,6 +138,10 @@ public:
     void setSharpen(float amount);
     void setBlur(float radiusPx);
     void setLensDistortion(float amount);
+    void setGlow(bool enabled, float threshold, float radius, float intensity);
+    void setBloom(bool enabled, float threshold, float intensity, float spread);
+    void setChromaticAberration(bool enabled, float amount, float radialFalloff);
+    void setLightWrap(bool enabled, float amount, float radius);
 
     // US-3D: 3-axis rotation + perspective foreshortening (Premiere "Basic 3D"
     // / Resolve "Transform" 3D rotation parity). Implemented in the fragment
@@ -529,9 +533,37 @@ private:
     int   m_locSharpenAmount  = -1;
     int   m_locBlurRadius     = -1;
     int   m_locLensDistortion = -1;
+    int   m_locGlowEnabled    = -1;
+    int   m_locGlowThreshold  = -1;
+    int   m_locGlowRadius     = -1;
+    int   m_locGlowIntensity  = -1;
+    int   m_locBloomEnabled   = -1;
+    int   m_locBloomThreshold = -1;
+    int   m_locBloomIntensity = -1;
+    int   m_locBloomSpread    = -1;
+    int   m_locChromAbEnabled = -1;
+    int   m_locChromAbAmount  = -1;
+    int   m_locChromAbFalloff = -1;
+    int   m_locLightWrapEnabled = -1;
+    int   m_locLightWrapAmount  = -1;
+    int   m_locLightWrapRadius  = -1;
     float m_sharpenAmount  = 0.0f;
     float m_blurRadius     = 0.0f;
     float m_lensDistortion = 0.0f;
+    bool  m_glowEnabled    = false;
+    float m_glowThreshold  = 0.8f;
+    float m_glowRadius     = 0.0f;
+    float m_glowIntensity  = 0.0f;
+    bool  m_bloomEnabled   = false;
+    float m_bloomThreshold = 0.8f;
+    float m_bloomIntensity = 0.0f;
+    float m_bloomSpread    = 0.0f;
+    bool  m_chromAbEnabled = false;
+    float m_chromAbAmount  = 0.0f;
+    float m_chromAbFalloff = 2.0f;
+    bool  m_lightWrapEnabled = false;
+    float m_lightWrapAmount  = 0.0f;
+    float m_lightWrapRadius  = 0.0f;
 
     // US-3D: 3-axis rotation + perspective foreshortening. The CPU side
     // builds a 3x3 rotation matrix from XYZ Euler angles (intrinsic

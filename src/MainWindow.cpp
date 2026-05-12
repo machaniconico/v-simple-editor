@@ -75,6 +75,8 @@
 #include "LoudnessAnalyzer.h"
 #include "SubtitleTrackRenderer.h"
 #include "LoudnessPanel.h"
+#include "ParticleEffectDialog.h"
+#include "VfxControlsPanel.h"
 #include <QPushButton>
 #include <QDialog>
 #include <QDialogButtonBox>
@@ -86,12 +88,83 @@
 #include <QFormLayout>
 #include <QLabel>
 #include <QStandardItemModel>
+#include <QTemporaryDir>
+#include <QProcess>
 #include "NodeGraph.h"
 #include "NodeEvaluator.h"
 #include "NodeLibrary.h"
 #include "NodeCanvasWidget.h"
 #include "NodePropertiesPanel.h"
 #include "LayerNodeBridge.h"
+
+namespace {
+
+QString findFfmpegBinary()
+{
+    QString path = QStandardPaths::findExecutable(QStringLiteral("ffmpeg"));
+    if (!path.isEmpty())
+        return path;
+
+    const QStringList searchPaths = {
+        QStringLiteral("/usr/local/bin"),
+        QStringLiteral("/opt/homebrew/bin"),
+        QStringLiteral("/usr/bin")
+    };
+    return QStandardPaths::findExecutable(QStringLiteral("ffmpeg"), searchPaths);
+}
+
+QGroupBox *findVfxGroup(VfxControlsPanel *panel, const QString &title)
+{
+    if (!panel)
+        return nullptr;
+    const auto groups = panel->findChildren<QGroupBox *>(QString(), Qt::FindDirectChildrenOnly);
+    for (auto *group : groups) {
+        if (group && group->title() == title)
+            return group;
+    }
+    return nullptr;
+}
+
+void setVfxPanelState(VfxControlsPanel *panel, const ProjectVfxState &state)
+{
+    if (!panel)
+        return;
+
+    panel->blockAndReset();
+
+    auto applySection = [](QGroupBox *group, bool enabled, std::initializer_list<double> values) {
+        if (!group)
+            return;
+        if (auto *check = group->findChild<QCheckBox *>()) {
+            QSignalBlocker blocker(check);
+            check->setChecked(enabled);
+        }
+        const auto spins = group->findChildren<QDoubleSpinBox *>(QString(), Qt::FindDirectChildrenOnly);
+        int index = 0;
+        for (double value : values) {
+            if (index >= spins.size())
+                break;
+            QSignalBlocker blocker(spins[index]);
+            spins[index]->setValue(value);
+            ++index;
+        }
+    };
+
+    applySection(findVfxGroup(panel, QStringLiteral("Glow")),
+                 state.glow.enabled,
+                 {state.glow.threshold, state.glow.radius, state.glow.intensity});
+    applySection(findVfxGroup(panel, QStringLiteral("Bloom")),
+                 state.bloom.enabled,
+                 {state.bloom.threshold, state.bloom.intensity, state.bloom.spread});
+    applySection(findVfxGroup(panel, QStringLiteral("Chromatic Aberration")),
+                 state.chromaticAberration.enabled,
+                 {state.chromaticAberration.amount, state.chromaticAberration.radialFalloff});
+    applySection(findVfxGroup(panel, QStringLiteral("Light Wrap")),
+                 state.lightWrap.enabled,
+                 {state.lightWrap.amount, state.lightWrap.radius});
+}
+
+} // namespace
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
@@ -136,13 +209,7 @@ MainWindow::MainWindow(QWidget *parent)
     m_autoSave = new AutoSave(this);
     m_autoSave->setProjectData([this]() -> QString {
         ProjectData data;
-        data.config = m_projectConfig;
-        data.videoTracks = m_timeline->allVideoTracks();
-        data.audioTracks = m_timeline->allAudioTracks();
-        data.playheadPos = m_timeline->playheadPosition();
-        data.markIn = m_timeline->markedIn();
-        data.markOut = m_timeline->markedOut();
-        data.brushAnimations = m_brushAnimationEntries;
+        populateProjectData(data);
         return ProjectFile::toJsonString(data);
     });
     connect(m_autoSave, &AutoSave::autoSaved, this, [this](const QString &path) {
@@ -1494,6 +1561,38 @@ void MainWindow::setupMenuBar()
         m_timeline->setClipEffects(effects);
     });
 
+    m_vfxControlsPanel = new VfxControlsPanel(this);
+    m_vfxControlsDock = new QDockWidget(QStringLiteral("VFX コントロール"), this);
+    m_vfxControlsDock->setObjectName(QStringLiteral("VfxControlsDock"));
+    m_vfxControlsDock->setWidget(m_vfxControlsPanel);
+    addDockWidget(Qt::RightDockWidgetArea, m_vfxControlsDock);
+    m_vfxControlsDock->setVisible(false);
+
+    connect(m_vfxControlsPanel, &VfxControlsPanel::glowChanged,
+            this, [this](bool enabled, float threshold, float radius, float intensity) {
+        if (!m_player || !m_player->glPreview())
+            return;
+        m_player->glPreview()->setGlow(enabled, threshold, radius, intensity);
+    });
+    connect(m_vfxControlsPanel, &VfxControlsPanel::bloomChanged,
+            this, [this](bool enabled, float threshold, float intensity, float spread) {
+        if (!m_player || !m_player->glPreview())
+            return;
+        m_player->glPreview()->setBloom(enabled, threshold, intensity, spread);
+    });
+    connect(m_vfxControlsPanel, &VfxControlsPanel::chromaticAberrationChanged,
+            this, [this](bool enabled, float amount, float radialFalloff) {
+        if (!m_player || !m_player->glPreview())
+            return;
+        m_player->glPreview()->setChromaticAberration(enabled, amount, radialFalloff);
+    });
+    connect(m_vfxControlsPanel, &VfxControlsPanel::lightWrapChanged,
+            this, [this](bool enabled, float amount, float radius) {
+        if (!m_player || !m_player->glPreview())
+            return;
+        m_player->glPreview()->setLightWrap(enabled, amount, radius);
+    });
+
     // US-3D: 3-axis rotation + perspective foreshortening (Premiere "Basic
     // 3D" / Resolve "Transform" 3D rotation parity). Forwarded directly to
     // GLPreview::setRotation3D, which builds the 3x3 rotation matrix on the
@@ -1538,6 +1637,11 @@ void MainWindow::setupMenuBar()
     effectControlsAction->setCheckable(true);
     connect(effectControlsAction, &QAction::toggled, m_effectControlsPanel, &QDockWidget::setVisible);
     connect(m_effectControlsPanel, &QDockWidget::visibilityChanged, effectControlsAction, &QAction::setChecked);
+
+    m_vfxControlsAction = viewMenu->addAction(QStringLiteral("VFX コントロール"));
+    m_vfxControlsAction->setCheckable(true);
+    connect(m_vfxControlsAction, &QAction::toggled, m_vfxControlsDock, &QDockWidget::setVisible);
+    connect(m_vfxControlsDock, &QDockWidget::visibilityChanged, m_vfxControlsAction, &QAction::setChecked);
 
     // Lumetri Scopes dock — Histogram + Luma Waveform + Vectorscope. Off
     // by default so first-run users aren't paying CPU on scope math; the
@@ -1915,6 +2019,207 @@ void MainWindow::applyProjectConfig(const ProjectConfig &config)
         .arg(config.name).arg(config.resolutionLabel()).arg(config.fps));
 }
 
+QString MainWindow::particleClipKey(const ClipInfo &clip)
+{
+    return clip.filePath;
+}
+
+void MainWindow::populateProjectData(ProjectData &data)
+{
+    data.config = m_projectConfig;
+    data.videoTracks = m_timeline->allVideoTracks();
+    data.audioTracks = m_timeline->allAudioTracks();
+    data.playheadPos = m_timeline->playheadPosition();
+    data.markIn = m_timeline->markedIn();
+    data.markOut = m_timeline->markedOut();
+    data.zoomLevel = 10; // TODO: expose zoom level getter
+    data.brushAnimations = m_brushAnimationEntries;
+
+    collectAudioState(data);
+
+    data.smartReframe = m_smartReframe.toJson();
+    data.subtitleSegments.clear();
+    for (const auto &seg : m_subtitleSegments) {
+        SubtitleEntry entry;
+        entry.start = seg.startTime;
+        entry.end = seg.endTime;
+        entry.text = seg.text;
+        data.subtitleSegments.append(entry);
+    }
+    QJsonObject styleJson;
+    styleJson["fontName"] = m_subtitleStyle.font.family();
+    styleJson["fontSize"] = m_subtitleStyle.font.pointSize();
+    styleJson["fontBold"] = m_subtitleStyle.font.bold();
+    styleJson["color"] = m_subtitleStyle.color.name(QColor::HexArgb);
+    styleJson["outlineColor"] = m_subtitleStyle.outlineColor.name(QColor::HexArgb);
+    styleJson["outlineWidth"] = m_subtitleStyle.outlineWidth;
+    styleJson["verticalPos"] = m_subtitleStyle.verticalPos;
+    data.subtitleStyle = styleJson;
+
+    QJsonObject loudnessJson;
+    loudnessJson["normalizerAmount"] = 0.0;
+    loudnessJson["loudnessGainDb"] = 0.0;
+    data.loudnessSettings = loudnessJson;
+
+    data.particleClipEntries.clear();
+    for (int trackIdx = 0; trackIdx < data.videoTracks.size(); ++trackIdx) {
+        const auto &track = data.videoTracks[trackIdx];
+        for (int clipIdx = 0; clipIdx < track.size(); ++clipIdx) {
+            const auto &clip = track[clipIdx];
+            const QString key = particleClipKey(clip);
+            if (!m_particleClipConfigs.contains(key))
+                continue;
+            ParticleClipEntry entry;
+            entry.trackIndex = trackIdx;
+            entry.clipIndex = clipIdx;
+            entry.clipFilePath = clip.filePath;
+            entry.config = m_particleClipConfigs.value(key);
+            data.particleClipEntries.append(entry);
+        }
+    }
+
+    data.clipNodeGraphs.clear();
+    if (m_nodeModeActive && m_activeNodeGraph && !m_nodeModeClipId.isEmpty()) {
+        ClipNodeGraph cng;
+        cng.clipId = m_nodeModeClipId;
+        cng.graph = m_activeNodeGraph->toJson();
+        cng.compositingMode = QStringLiteral("node");
+        data.clipNodeGraphs.append(cng);
+    }
+
+    if (m_vfxControlsPanel) {
+        const GlowState glow = m_vfxControlsPanel->glowState();
+        data.vfxState.glow.enabled = glow.enabled;
+        data.vfxState.glow.threshold = glow.threshold;
+        data.vfxState.glow.radius = glow.radius;
+        data.vfxState.glow.intensity = glow.intensity;
+
+        const BloomState bloom = m_vfxControlsPanel->bloomState();
+        data.vfxState.bloom.enabled = bloom.enabled;
+        data.vfxState.bloom.threshold = bloom.threshold;
+        data.vfxState.bloom.intensity = bloom.intensity;
+        data.vfxState.bloom.spread = bloom.spread;
+
+        const ChromaticAberrationState chromatic = m_vfxControlsPanel->chromaticAberrationState();
+        data.vfxState.chromaticAberration.enabled = chromatic.enabled;
+        data.vfxState.chromaticAberration.amount = chromatic.amount;
+        data.vfxState.chromaticAberration.radialFalloff = chromatic.radialFalloff;
+
+        const LightWrapState lightWrap = m_vfxControlsPanel->lightWrapState();
+        data.vfxState.lightWrap.enabled = lightWrap.enabled;
+        data.vfxState.lightWrap.amount = lightWrap.amount;
+        data.vfxState.lightWrap.radius = lightWrap.radius;
+    }
+}
+
+void MainWindow::applyVfxProjectState(const ProjectVfxState &state)
+{
+    setVfxPanelState(m_vfxControlsPanel, state);
+
+    if (!m_player || !m_player->glPreview())
+        return;
+
+    auto *preview = m_player->glPreview();
+    preview->setGlow(state.glow.enabled, state.glow.threshold, state.glow.radius, state.glow.intensity);
+    preview->setBloom(state.bloom.enabled, state.bloom.threshold, state.bloom.intensity, state.bloom.spread);
+    preview->setChromaticAberration(state.chromaticAberration.enabled,
+                                    state.chromaticAberration.amount,
+                                    state.chromaticAberration.radialFalloff);
+    preview->setLightWrap(state.lightWrap.enabled, state.lightWrap.amount, state.lightWrap.radius);
+}
+
+void MainWindow::applyLoadedProjectData(const ProjectData &data, const QString &filePath)
+{
+    m_projectFilePath = filePath;
+    if (m_recentFilesManager && !filePath.isEmpty())
+        m_recentFilesManager->addFile(filePath);
+
+    m_projectConfig = data.config;
+    setBrushAnimationEntries(data.brushAnimations);
+
+    if (m_player)
+        m_player->setCanvasSize(data.config.width, data.config.height);
+    if (m_timeline)
+        m_timeline->restoreFromProject(data.videoTracks, data.audioTracks,
+                                       data.playheadPos, data.markIn, data.markOut, data.zoomLevel);
+
+    rebuildAudioMeters();
+    applyAudioState(data);
+
+    m_particleClipConfigs.clear();
+    for (const auto &entry : data.particleClipEntries) {
+        QString key = entry.clipFilePath;
+        if (key.isEmpty()
+            && entry.trackIndex >= 0
+            && entry.trackIndex < data.videoTracks.size()
+            && entry.clipIndex >= 0
+            && entry.clipIndex < data.videoTracks[entry.trackIndex].size()) {
+            key = particleClipKey(data.videoTracks[entry.trackIndex][entry.clipIndex]);
+        }
+        if (!key.isEmpty())
+            m_particleClipConfigs.insert(key, entry.config);
+    }
+
+    if (!data.smartReframe.isEmpty()) {
+        m_smartReframe.fromJson(data.smartReframe);
+        m_exporter->setSmartReframe(&m_smartReframe);
+    }
+    m_subtitleSegments.clear();
+    for (const auto &entry : data.subtitleSegments) {
+        SubtitleSegment seg;
+        seg.startTime = entry.start;
+        seg.endTime = entry.end;
+        seg.text = entry.text;
+        m_subtitleSegments.append(seg);
+    }
+    m_subtitleStyle = SubtitleStyle{};
+    if (!data.subtitleStyle.isEmpty()) {
+        m_subtitleStyle.font.setFamily(data.subtitleStyle.value("fontName").toString());
+        m_subtitleStyle.font.setPointSize(data.subtitleStyle.value("fontSize").toInt());
+        m_subtitleStyle.font.setBold(data.subtitleStyle.value("fontBold").toBool());
+        m_subtitleStyle.color = QColor(data.subtitleStyle.value("color").toString());
+        m_subtitleStyle.outlineColor = QColor(data.subtitleStyle.value("outlineColor").toString());
+        m_subtitleStyle.outlineWidth = data.subtitleStyle.value("outlineWidth").toDouble();
+        m_subtitleStyle.verticalPos = data.subtitleStyle.value("verticalPos").toDouble();
+    }
+
+    applyVfxProjectState(data.vfxState);
+
+    m_nodeModeActive = false;
+    m_nodeModeClipId.clear();
+    if (m_nodeModeAction) {
+        QSignalBlocker blocker(m_nodeModeAction);
+        m_nodeModeAction->setChecked(false);
+    }
+    if (m_nodeCanvasDock)
+        m_nodeCanvasDock->setVisible(false);
+    if (m_nodePropsDock)
+        m_nodePropsDock->setVisible(false);
+
+    for (const auto &cng : data.clipNodeGraphs) {
+        if (cng.compositingMode != QLatin1String("node") || cng.graph.isEmpty())
+            continue;
+        m_nodeModeClipId = cng.clipId;
+        m_activeNodeGraph->fromJson(cng.graph);
+        m_nodeModeActive = true;
+        setupNodeCompositingDocks();
+        m_nodeCanvas->setGraph(m_activeNodeGraph);
+        m_nodeCanvasDock->setVisible(true);
+        m_nodePropsDock->setVisible(true);
+        if (m_nodeModeAction) {
+            QSignalBlocker blocker(m_nodeModeAction);
+            m_nodeModeAction->setChecked(true);
+        }
+        break;
+    }
+
+    updateTitle();
+    hideWelcomeScreen();
+    updateStatusInfo();
+    updateEditActions();
+    syncBrushAnimationPreviewForClip(0, m_timeline ? m_timeline->selectedVideoClipIndex() : -1);
+}
+
 void MainWindow::collectAudioState(ProjectData &data)
 {
     if (auto *mixer = m_player ? m_player->audioMixer() : nullptr) {
@@ -2021,50 +2326,7 @@ void MainWindow::saveProject()
     }
 
     ProjectData data;
-    data.config = m_projectConfig;
-    data.videoTracks = m_timeline->allVideoTracks();
-    data.audioTracks = m_timeline->allAudioTracks();
-    data.playheadPos = m_timeline->playheadPosition();
-    data.markIn = m_timeline->markedIn();
-    data.markOut = m_timeline->markedOut();
-    data.zoomLevel = 10; // TODO: expose zoom level getter
-    data.brushAnimations = m_brushAnimationEntries;
-
-    collectAudioState(data);
-
-    // US-SNS-7: Persist SNS pack fields
-    data.smartReframe = m_smartReframe.toJson();
-    data.subtitleSegments.clear();
-    for (const auto &seg : m_subtitleSegments) {
-        SubtitleEntry entry;
-        entry.start = seg.startTime;
-        entry.end = seg.endTime;
-        entry.text = seg.text;
-        data.subtitleSegments.append(entry);
-    }
-    QJsonObject styleJson;
-    styleJson["fontName"] = m_subtitleStyle.font.family();
-    styleJson["fontSize"] = m_subtitleStyle.font.pointSize();
-    styleJson["fontBold"] = m_subtitleStyle.font.bold();
-    styleJson["color"] = m_subtitleStyle.color.name(QColor::HexArgb);
-    styleJson["outlineColor"] = m_subtitleStyle.outlineColor.name(QColor::HexArgb);
-    styleJson["outlineWidth"] = m_subtitleStyle.outlineWidth;
-    styleJson["verticalPos"] = m_subtitleStyle.verticalPos;
-    data.subtitleStyle = styleJson;
-
-    QJsonObject loudnessJson;
-    loudnessJson["normalizerAmount"] = 0.0;
-    loudnessJson["loudnessGainDb"] = 0.0;
-    data.loudnessSettings = loudnessJson;
-
-    // US-NODE-9: Persist active node graph and compositing mode
-    if (m_nodeModeActive && m_activeNodeGraph && !m_nodeModeClipId.isEmpty()) {
-        ClipNodeGraph cng;
-        cng.clipId = m_nodeModeClipId;
-        cng.graph = m_activeNodeGraph->toJson();
-        cng.compositingMode = "node";
-        data.clipNodeGraphs.append(cng);
-    }
+    populateProjectData(data);
 
     if (ProjectFile::save(m_projectFilePath, data)) {
         statusBar()->showMessage("Saved: " + m_projectFilePath);
@@ -2095,62 +2357,7 @@ void MainWindow::openProject()
         return;
     }
 
-    m_projectFilePath = filePath;
-    if (m_recentFilesManager)
-        m_recentFilesManager->addFile(filePath);
-    m_projectConfig = data.config;
-    setBrushAnimationEntries(data.brushAnimations);
-    if (m_player)
-        m_player->setCanvasSize(data.config.width, data.config.height);
-    if (m_timeline)
-        m_timeline->restoreFromProject(data.videoTracks, data.audioTracks,
-            data.playheadPos, data.markIn, data.markOut, data.zoomLevel);
-    rebuildAudioMeters();
-    applyAudioState(data);
-
-    // US-SNS-7: Restore SNS pack fields
-    if (!data.smartReframe.isEmpty()) {
-        m_smartReframe.fromJson(data.smartReframe);
-        m_exporter->setSmartReframe(&m_smartReframe);
-    }
-    m_subtitleSegments.clear();
-    for (const auto &entry : data.subtitleSegments) {
-        SubtitleSegment seg;
-        seg.startTime = entry.start;
-        seg.endTime = entry.end;
-        seg.text = entry.text;
-        m_subtitleSegments.append(seg);
-    }
-    if (!data.subtitleStyle.isEmpty()) {
-        m_subtitleStyle.font.setFamily(data.subtitleStyle.value("fontName").toString());
-        m_subtitleStyle.font.setPointSize(data.subtitleStyle.value("fontSize").toInt());
-        m_subtitleStyle.font.setBold(data.subtitleStyle.value("fontBold").toBool());
-        m_subtitleStyle.color = QColor(data.subtitleStyle.value("color").toString());
-        m_subtitleStyle.outlineColor = QColor(data.subtitleStyle.value("outlineColor").toString());
-        m_subtitleStyle.outlineWidth = data.subtitleStyle.value("outlineWidth").toDouble();
-        m_subtitleStyle.verticalPos = data.subtitleStyle.value("verticalPos").toDouble();
-    }
-
-    updateTitle();
-    hideWelcomeScreen();
-    updateStatusInfo();
-    updateEditActions();
-    syncBrushAnimationPreviewForClip(0, m_timeline ? m_timeline->selectedVideoClipIndex() : -1);
-
-    // US-NODE-9: Restore node compositing mode
-    for (const auto &cng : data.clipNodeGraphs) {
-        if (cng.compositingMode == "node" && !cng.graph.isEmpty()) {
-            m_nodeModeClipId = cng.clipId;
-            m_activeNodeGraph->fromJson(cng.graph);
-            m_nodeModeActive = true;
-            setupNodeCompositingDocks();
-            m_nodeCanvas->setGraph(m_activeNodeGraph);
-            m_nodeCanvasDock->setVisible(true);
-            m_nodePropsDock->setVisible(true);
-            break;
-        }
-    }
-
+    applyLoadedProjectData(data, filePath);
     statusBar()->showMessage("Opened: " + filePath);
 }
 
@@ -4841,19 +5048,88 @@ void MainWindow::addShapeLayer()
 
 void MainWindow::addParticleEffect()
 {
-    auto presets = ParticleSystem::presetConfigs();
-    QStringList presetNames = presets.keys();
-
-    bool ok;
-    QString selected = QInputDialog::getItem(this, "Add Particle Effect",
-        "Particle preset:", presetNames, 0, false, &ok);
-    if (!ok) return;
-
-    if (presets.contains(selected)) {
-        ParticleSystem ps;
-        ps.setConfig(presets.value(selected));
-        statusBar()->showMessage(QString("Added particle effect: %1").arg(selected));
+    ParticleEffectDialog dialog(this);
+    const auto &clips = m_timeline->videoClips();
+    const int selectedIdx = m_timeline->selectedVideoClipIndex();
+    if (selectedIdx >= 0 && selectedIdx < clips.size()) {
+        const QString key = particleClipKey(clips[selectedIdx]);
+        if (m_particleClipConfigs.contains(key))
+            dialog.setConfig(m_particleClipConfigs.value(key));
     }
+
+    if (dialog.exec() != QDialog::Accepted)
+        return;
+
+    const ParticleEmitterConfig config = dialog.config();
+    const QSize canvasSize(m_projectConfig.width, m_projectConfig.height);
+    const double fps = qMax(1, m_projectConfig.fps);
+    double durationSec = 3.0;
+    if (selectedIdx >= 0 && selectedIdx < clips.size())
+        durationSec = qMax(0.5, clips[selectedIdx].effectiveDuration());
+
+    ParticleSystem system;
+    system.setConfig(config);
+    const QVector<QImage> frames = system.renderParticleSequence(canvasSize, 0.0, durationSec, fps);
+    if (frames.isEmpty()) {
+        QMessageBox::warning(this, QStringLiteral("Particle Effect"),
+                             QStringLiteral("パーティクルフレームを生成できませんでした。"));
+        return;
+    }
+
+    const QString ffmpegBin = findFfmpegBinary();
+    if (ffmpegBin.isEmpty()) {
+        QMessageBox::warning(this, QStringLiteral("Particle Effect"),
+                             QStringLiteral("ffmpeg が見つからないため粒子クリップを作成できません。"));
+        return;
+    }
+
+    QTemporaryDir tempDir;
+    if (!tempDir.isValid()) {
+        QMessageBox::warning(this, QStringLiteral("Particle Effect"),
+                             QStringLiteral("一時ディレクトリを作成できませんでした。"));
+        return;
+    }
+    tempDir.setAutoRemove(false);
+
+    for (int i = 0; i < frames.size(); ++i) {
+        const QString framePath = tempDir.path()
+            + QStringLiteral("/frame_%1.png").arg(i, 6, 10, QChar('0'));
+        if (!frames[i].save(framePath)) {
+            QMessageBox::warning(this, QStringLiteral("Particle Effect"),
+                                 QStringLiteral("パーティクルフレームを書き出せませんでした。"));
+            return;
+        }
+    }
+
+    const QString outputPath = tempDir.path() + QStringLiteral("/particle_effect.mp4");
+    QStringList args;
+    args << QStringLiteral("-y")
+         << QStringLiteral("-framerate") << QString::number(fps)
+         << QStringLiteral("-i") << (tempDir.path() + QStringLiteral("/frame_%06d.png"))
+         << QStringLiteral("-c:v") << QStringLiteral("mpeg4")
+         << QStringLiteral("-q:v") << QStringLiteral("3")
+         << QStringLiteral("-pix_fmt") << QStringLiteral("yuv420p")
+         << QStringLiteral("-movflags") << QStringLiteral("+faststart")
+         << outputPath;
+
+    QProcess ffmpeg;
+    ffmpeg.start(ffmpegBin, args);
+    if (!ffmpeg.waitForStarted(5000)) {
+        QMessageBox::warning(this, QStringLiteral("Particle Effect"),
+                             QStringLiteral("ffmpeg を起動できませんでした。"));
+        return;
+    }
+    ffmpeg.waitForFinished(-1);
+    if (ffmpeg.exitStatus() != QProcess::NormalExit || ffmpeg.exitCode() != 0 || !QFileInfo::exists(outputPath)) {
+        QMessageBox::warning(this, QStringLiteral("Particle Effect"),
+                             QStringLiteral("粒子クリップのエンコードに失敗しました。\n%1")
+                                 .arg(QString::fromUtf8(ffmpeg.readAllStandardError())));
+        return;
+    }
+
+    m_particleClipConfigs.insert(outputPath, config);
+    loadMediaFile(outputPath, true, QStringLiteral("Added particle effect"));
+    statusBar()->showMessage(QStringLiteral("Added particle effect clip"), 3000);
 }
 
 void MainWindow::addTextAnimation()
@@ -5070,21 +5346,7 @@ void MainWindow::openRecentFile(const QString &filePath)
     if (filePath.endsWith(".veditor", Qt::CaseInsensitive)) {
         ProjectData data;
         if (ProjectFile::load(filePath, data)) {
-            m_projectConfig = data.config;
-            if (m_player)
-                m_player->setCanvasSize(data.config.width, data.config.height);
-            if (m_timeline)
-                m_timeline->restoreFromProject(data.videoTracks, data.audioTracks,
-                    data.playheadPos, data.markIn, data.markOut, data.zoomLevel);
-            rebuildAudioMeters();
-            applyAudioState(data);
-            m_projectFilePath = filePath;
-            if (m_recentFilesManager)
-                m_recentFilesManager->addFile(filePath);
-            updateTitle();
-            hideWelcomeScreen();
-            updateStatusInfo();
-            updateEditActions();
+            applyLoadedProjectData(data, filePath);
             statusBar()->showMessage("Opened project: " + fi.fileName());
         }
     } else {
@@ -5158,12 +5420,7 @@ void MainWindow::openNetworkRender()
 void MainWindow::exportToRemotion()
 {
     ProjectData data;
-    data.config = m_projectConfig;
-    data.videoTracks = m_timeline->allVideoTracks();
-    data.audioTracks = m_timeline->allAudioTracks();
-    data.playheadPos = m_timeline->playheadPosition();
-    data.markIn = m_timeline->markedIn();
-    data.markOut = m_timeline->markedOut();
+    populateProjectData(data);
 
     RemotionExportDialog dialog(m_projectConfig, data, this);
     dialog.exec();
@@ -5344,20 +5601,7 @@ void MainWindow::dropEvent(QDropEvent *event)
             // Open as project
             ProjectData data;
             if (ProjectFile::load(filePath, data)) {
-                m_projectFilePath = filePath;
-                if (m_recentFilesManager)
-                    m_recentFilesManager->addFile(filePath);
-                m_projectConfig = data.config;
-                if (m_player)
-                    m_player->setCanvasSize(data.config.width, data.config.height);
-                if (m_timeline)
-                    m_timeline->restoreFromProject(data.videoTracks, data.audioTracks,
-                        data.playheadPos, data.markIn, data.markOut, data.zoomLevel);
-                rebuildAudioMeters();
-                applyAudioState(data);
-                updateTitle();
-                hideWelcomeScreen();
-                updateStatusInfo();
+                applyLoadedProjectData(data, filePath);
                 statusBar()->showMessage("Opened project: " + QFileInfo(filePath).fileName());
             }
         } else {

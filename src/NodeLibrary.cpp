@@ -1,5 +1,8 @@
 #include "NodeLibrary.h"
 
+#include "FractalNoise.h"
+#include "ParticleSystem.h"
+
 #include <QImage>
 #include <QPainter>
 #include <QTransform>
@@ -464,8 +467,106 @@ static QImage evaluateInvert(const GraphNode& node, const QVector<QVariant>& inp
     return result;
 }
 
+static QImage evaluateParticleEmitter(const GraphNode& node, double time, QSize outputSize)
+{
+    if (outputSize.isEmpty()) outputSize = QSize(1, 1);
+
+    ParticleEmitterConfig cfg;
+
+    int typeIdx = node.params.value(QStringLiteral("type"), 0).toInt();
+    cfg.type = static_cast<ParticleType>(clampInt(typeIdx, 0, static_cast<int>(ParticleType::Custom)));
+    cfg.emitRate = clampDbl(node.params.value(QStringLiteral("emitRate"), 50.0).toDouble(), 0.0, 10000.0);
+    cfg.gravity.setX(node.params.value(QStringLiteral("gravityX"), 0.0).toDouble());
+    cfg.gravity.setY(node.params.value(QStringLiteral("gravityY"), 0.0).toDouble());
+    cfg.turbulenceAmount = clampDbl(node.params.value(QStringLiteral("turbulenceAmount"), 0.0).toDouble(), 0.0, 5000.0);
+    cfg.lifeMin = clampDbl(node.params.value(QStringLiteral("lifeMin"), 2.0).toDouble(), 0.01, 60.0);
+    cfg.lifeMax = clampDbl(node.params.value(QStringLiteral("lifeMax"), 4.0).toDouble(), cfg.lifeMin, 60.0);
+    cfg.sizeMin = clampDbl(node.params.value(QStringLiteral("sizeMin"), 2.0).toDouble(), 0.1, 500.0);
+    cfg.sizeMax = clampDbl(node.params.value(QStringLiteral("sizeMax"), 6.0).toDouble(), cfg.sizeMin, 500.0);
+    cfg.startColor = node.params.value(QStringLiteral("startColor"), QColor(255, 255, 255)).value<QColor>();
+    cfg.endColor = node.params.value(QStringLiteral("endColor"), QColor(255, 255, 255)).value<QColor>();
+
+    ParticleSystem system;
+    system.setConfig(cfg);
+    system.reset();
+
+    double simTime = qMin(time, 10.0);
+    const double dt = 1.0 / 30.0;
+    double elapsed = 0.0;
+    while (elapsed < simTime) {
+        double step = qMin(dt, simTime - elapsed);
+        system.update(step);
+        elapsed += step;
+    }
+
+    return system.renderFrame(outputSize, time);
+}
+
+static QImage evaluateFractalNoise(const GraphNode& node, double time, QSize outputSize)
+{
+    if (outputSize.isEmpty()) outputSize = QSize(1, 1);
+
+    FractalNoise::Params p;
+    int kindIdx = node.params.value(QStringLiteral("kind"), 0).toInt();
+    p.kind = static_cast<FractalNoise::FractalKind>(clampInt(kindIdx, 0, 2));
+    p.octaves = clampInt(node.params.value(QStringLiteral("octaves"), 5).toInt(), 1, 16);
+    p.lacunarity = clampDbl(node.params.value(QStringLiteral("lacunarity"), 2.0).toDouble(), 0.5, 8.0);
+    p.gain = clampDbl(node.params.value(QStringLiteral("gain"), 0.5).toDouble(), 0.0, 2.0);
+    p.frequency = clampDbl(node.params.value(QStringLiteral("frequency"), 4.0).toDouble(), 0.1, 100.0);
+    p.seed = static_cast<unsigned>(node.params.value(QStringLiteral("seed"), 1337).toInt());
+
+    return FractalNoise::render(outputSize, time, p, false);
+}
+
+static QImage evaluateDisplace(const GraphNode& node, const QVector<QVariant>& inputs, QSize outputSize)
+{
+    if (outputSize.isEmpty()) outputSize = QSize(1, 1);
+
+    QImage img;
+    if (inputs.size() >= 1 && inputs[0].canConvert<QImage>()) img = inputs[0].value<QImage>();
+    if (img.isNull()) return QImage(outputSize, QImage::Format_ARGB32_Premultiplied);
+
+    QImage mapImg;
+    if (inputs.size() >= 2 && inputs[1].canConvert<QImage>()) mapImg = inputs[1].value<QImage>();
+    if (mapImg.isNull()) {
+        mapImg = QImage(outputSize, QImage::Format_ARGB32_Premultiplied);
+        mapImg.fill(QColor(128, 128, 128));
+    }
+
+    img = img.convertToFormat(QImage::Format_ARGB32);
+    mapImg = mapImg.convertToFormat(QImage::Format_ARGB32);
+    QSize sz = img.size();
+    if (mapImg.size() != sz) mapImg = mapImg.scaled(sz.width(), sz.height());
+
+    double hAmt = node.params.value(QStringLiteral("hAmount"), 0.0).toDouble();
+    double vAmt = node.params.value(QStringLiteral("vAmount"), 0.0).toDouble();
+
+    if (hAmt == 0.0 && vAmt == 0.0) return img;
+
+    QImage result(sz, QImage::Format_ARGB32);
+    int w = sz.width(), h = sz.height();
+
+    for (int y = 0; y < h; ++y) {
+        const QRgb *imgLine = reinterpret_cast<const QRgb*>(img.constScanLine(y));
+        const QRgb *mapLine = reinterpret_cast<const QRgb*>(mapImg.constScanLine(y));
+        QRgb *dstLine = reinterpret_cast<QRgb*>(result.scanLine(y));
+
+        for (int x = 0; x < w; ++x) {
+            QRgb mp = mapLine[x];
+            double lum = (0.2126 * qRed(mp) + 0.587 * qGreen(mp) + 0.114 * qBlue(mp)) / 255.0;
+            double m = lum * 2.0 - 1.0;
+
+            int sx = qBound(0, static_cast<int>(std::round(x + m * hAmt)), w - 1);
+            int sy = qBound(0, static_cast<int>(std::round(y + m * vAmt)), h - 1);
+
+            dstLine[x] = reinterpret_cast<const QRgb*>(img.constScanLine(sy))[sx];
+        }
+    }
+    return result;
+}
+
 QVariant evaluateBuiltinNode(const GraphNode& node,
-                             double /*time*/,
+                             double time,
                              const QVector<QVariant>& inputs,
                              QSize outputSize)
 {
@@ -518,6 +619,18 @@ QVariant evaluateBuiltinNode(const GraphNode& node,
 
     if (node.typeName == QLatin1String("Invert")) {
         return QVariant::fromValue(evaluateInvert(node, inputs, outputSize));
+    }
+
+    if (node.typeName == QLatin1String("ParticleEmitter")) {
+        return QVariant::fromValue(evaluateParticleEmitter(node, time, outputSize));
+    }
+
+    if (node.typeName == QLatin1String("FractalNoise")) {
+        return QVariant::fromValue(evaluateFractalNoise(node, time, outputSize));
+    }
+
+    if (node.typeName == QLatin1String("Displace")) {
+        return QVariant::fromValue(evaluateDisplace(node, inputs, outputSize));
     }
 
     return QVariant();
@@ -707,6 +820,64 @@ void registerBuiltinNodes()
         d.inputs = {makeInputPort(QStringLiteral("Image"), NodeSocketType::Image)};
         d.outputs = {makeOutputPort(QStringLiteral("Image"), NodeSocketType::Image)};
         d.defaultParams = {};
+        reg.registerType(d);
+    }
+
+    {
+        NodeTypeDescriptor d;
+        d.typeName = QStringLiteral("ParticleEmitter");
+        d.displayName = QStringLiteral("Particle Emitter");
+        d.category = QStringLiteral("VFX");
+        d.inputs = {};
+        d.outputs = {makeOutputPort(QStringLiteral("Image"), NodeSocketType::Image)};
+        d.defaultParams = {
+            {QStringLiteral("type"), 0},
+            {QStringLiteral("emitRate"), 50.0},
+            {QStringLiteral("gravityX"), 0.0},
+            {QStringLiteral("gravityY"), 0.0},
+            {QStringLiteral("turbulenceAmount"), 0.0},
+            {QStringLiteral("lifeMin"), 2.0},
+            {QStringLiteral("lifeMax"), 4.0},
+            {QStringLiteral("sizeMin"), 2.0},
+            {QStringLiteral("sizeMax"), 6.0},
+            {QStringLiteral("startColor"), QColor(255, 255, 255)},
+            {QStringLiteral("endColor"), QColor(255, 255, 255)},
+        };
+        reg.registerType(d);
+    }
+
+    {
+        NodeTypeDescriptor d;
+        d.typeName = QStringLiteral("FractalNoise");
+        d.displayName = QStringLiteral("Fractal Noise");
+        d.category = QStringLiteral("VFX");
+        d.inputs = {};
+        d.outputs = {makeOutputPort(QStringLiteral("Image"), NodeSocketType::Image)};
+        d.defaultParams = {
+            {QStringLiteral("kind"), 0},
+            {QStringLiteral("octaves"), 5},
+            {QStringLiteral("lacunarity"), 2.0},
+            {QStringLiteral("gain"), 0.5},
+            {QStringLiteral("frequency"), 4.0},
+            {QStringLiteral("seed"), 1337},
+        };
+        reg.registerType(d);
+    }
+
+    {
+        NodeTypeDescriptor d;
+        d.typeName = QStringLiteral("Displace");
+        d.displayName = QStringLiteral("Displace");
+        d.category = QStringLiteral("VFX");
+        d.inputs = {
+            makeInputPort(QStringLiteral("Image"), NodeSocketType::Image),
+            makeInputPort(QStringLiteral("Map"), NodeSocketType::Image),
+        };
+        d.outputs = {makeOutputPort(QStringLiteral("Image"), NodeSocketType::Image)};
+        d.defaultParams = {
+            {QStringLiteral("hAmount"), 0.0},
+            {QStringLiteral("vAmount"), 0.0},
+        };
         reg.registerType(d);
     }
 }

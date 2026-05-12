@@ -9,6 +9,7 @@
 #include "Keyframe.h"
 #include "Overlay.h"
 #include "PlanarTracker.h"
+#include "ParticleSystem.h"
 
 // --- Audio mixer serialization sub-types ---
 
@@ -97,6 +98,52 @@ struct SubtitleEntry {
     QString text;
 };
 
+struct ParticleClipEntry {
+    int trackIndex = -1;
+    int clipIndex = -1;
+    QString clipFilePath;
+    ParticleEmitterConfig config;
+};
+
+struct ClipNodeGraph {
+    QString clipId;
+    QJsonObject graph;
+    QString compositingMode = QStringLiteral("layer");
+};
+
+struct ProjectGlowState {
+    bool enabled = false;
+    float threshold = 0.5f;
+    float radius = 10.0f;
+    float intensity = 1.0f;
+};
+
+struct ProjectBloomState {
+    bool enabled = false;
+    float threshold = 0.5f;
+    float intensity = 1.0f;
+    float spread = 0.3f;
+};
+
+struct ProjectChromaticAberrationState {
+    bool enabled = false;
+    float amount = 5.0f;
+    float radialFalloff = 2.0f;
+};
+
+struct ProjectLightWrapState {
+    bool enabled = false;
+    float amount = 0.5f;
+    float radius = 10.0f;
+};
+
+struct ProjectVfxState {
+    ProjectGlowState glow;
+    ProjectBloomState bloom;
+    ProjectChromaticAberrationState chromaticAberration;
+    ProjectLightWrapState lightWrap;
+};
+
 // Full project state for serialization
 struct ProjectData {
     ProjectConfig config;
@@ -135,6 +182,9 @@ struct ProjectData {
     QVector<SubtitleEntry> subtitleSegments;
     QJsonObject subtitleStyle;
     QJsonObject loudnessSettings;
+    QVector<ParticleClipEntry> particleClipEntries;
+    QVector<ClipNodeGraph> clipNodeGraphs;
+    ProjectVfxState vfxState;
 };
 
 class ProjectFile
@@ -189,6 +239,17 @@ private:
     // US-MOCHA-2: planar track persistence
     static QJsonObject planarTrackToJson(const planartrack::PlanarTrack &t);
     static planartrack::PlanarTrack planarTrackFromJson(const QJsonObject &obj);
+
+    static QJsonObject forceFieldToJson(const ForceField &field);
+    static ForceField forceFieldFromJson(const QJsonObject &obj);
+    static QJsonObject particleEmitterConfigToJson(const ParticleEmitterConfig &config);
+    static ParticleEmitterConfig particleEmitterConfigFromJson(const QJsonObject &obj);
+    static QJsonObject particleClipEntryToJson(const ParticleClipEntry &entry);
+    static ParticleClipEntry particleClipEntryFromJson(const QJsonObject &obj);
+    static QJsonObject clipNodeGraphToJson(const ClipNodeGraph &entry);
+    static ClipNodeGraph clipNodeGraphFromJson(const QJsonObject &obj);
+    static QJsonObject vfxStateToJson(const ProjectVfxState &state);
+    static ProjectVfxState vfxStateFromJson(const QJsonObject &obj);
 
     // US-AETEXT-12: AE text feature persistence
     static QJsonObject pathTextToJson(const PathTextEntry &e);

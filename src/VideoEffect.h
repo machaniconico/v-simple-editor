@@ -49,7 +49,9 @@ enum class VideoEffectType {
     Sepia,
     Grayscale,
     Invert,
-    Noise
+    Noise,
+    DisplacementMap,
+    FractalNoiseGen
 };
 
 struct VideoEffect {
@@ -64,6 +66,8 @@ struct VideoEffect {
     //   Vignette: p1=intensity(0-1), p2=radius(0-1)
     //   Sepia: p1=intensity(0-1)
     //   Noise: p1=amount(0-100)
+    //   DisplacementMap: p1=hAmount(-200..200), p2=vAmount(-200..200), p3=mapMode(0=fractal,1=luminance)
+    //   FractalNoiseGen: p1=scale/frequency, p2=octaves(1..8), p3=evolution(time offset)
     double param1 = 0.0;
     double param2 = 0.0;
     double param3 = 0.0;
@@ -82,6 +86,8 @@ struct VideoEffect {
     static VideoEffect createGrayscale();
     static VideoEffect createInvert();
     static VideoEffect createNoise(double amount = 20.0);
+    static VideoEffect createDisplacementMap(double hAmount = 50.0, double vAmount = 0.0, int mapMode = 0);
+    static VideoEffect createFractalNoise(double scale = 4.0, int octaves = 5, double evolution = 0.0);
 };
 
 // --- Processor ---
@@ -113,4 +119,6 @@ private:
     static QImage applyGrayscale(const QImage &img);
     static QImage applyInvert(const QImage &img);
     static QImage applyNoise(const QImage &img, double amount);
+    static QImage applyDisplacementMap(const QImage &img, double hAmt, double vAmt, int mode);
+    static QImage applyFractalNoise(const QImage &img, double scale, int octaves, double evolution);
 };

@@ -1,5 +1,6 @@
 #include "VideoEffect.h"
 #include "EffectParamSchema.h"
+#include "FractalNoise.h"
 #include <QPainter>
 #include <QtMath>
 #include <QRandomGenerator>
@@ -25,7 +26,9 @@ QString VideoEffect::typeName(VideoEffectType t)
     case VideoEffectType::Sepia:     return "Sepia";
     case VideoEffectType::Grayscale: return "Grayscale";
     case VideoEffectType::Invert:    return "Invert";
-    case VideoEffectType::Noise:     return "Noise";
+    case VideoEffectType::Noise:          return "Noise";
+    case VideoEffectType::DisplacementMap: return "Displacement Map";
+    case VideoEffectType::FractalNoiseGen: return "Fractal Noise";
     }
     return "Unknown";
 }
@@ -34,7 +37,8 @@ QVector<VideoEffectType> VideoEffect::allTypes()
 {
     return { VideoEffectType::Blur, VideoEffectType::Sharpen, VideoEffectType::Mosaic,
              VideoEffectType::ChromaKey, VideoEffectType::Vignette, VideoEffectType::Sepia,
-             VideoEffectType::Grayscale, VideoEffectType::Invert, VideoEffectType::Noise };
+             VideoEffectType::Grayscale, VideoEffectType::Invert, VideoEffectType::Noise,
+             VideoEffectType::DisplacementMap, VideoEffectType::FractalNoiseGen };
 }
 
 VideoEffect VideoEffect::createBlur(double r)
@@ -55,6 +59,10 @@ VideoEffect VideoEffect::createInvert()
     { VideoEffect e; e.type = VideoEffectType::Invert; return e; }
 VideoEffect VideoEffect::createNoise(double a)
     { VideoEffect e; e.type = VideoEffectType::Noise; e.param1 = a; return e; }
+VideoEffect VideoEffect::createDisplacementMap(double h, double v, int m)
+    { VideoEffect e; e.type = VideoEffectType::DisplacementMap; e.param1 = h; e.param2 = v; e.param3 = static_cast<double>(m); return e; }
+VideoEffect VideoEffect::createFractalNoise(double s, int o, double evol)
+    { VideoEffect effect; effect.type = VideoEffectType::FractalNoiseGen; effect.param1 = s; effect.param2 = static_cast<double>(o); effect.param3 = evol; return effect; }
 
 // ===== EffectParamSchema helper accessors =====
 
@@ -361,7 +369,9 @@ QImage VideoEffectProcessor::applyEffect(const QImage &input, const VideoEffect 
     case VideoEffectType::Sepia:     return applySepia(input, effect.param1);
     case VideoEffectType::Grayscale: return applyGrayscale(input);
     case VideoEffectType::Invert:    return applyInvert(input);
-    case VideoEffectType::Noise:     return applyNoise(input, effect.param1);
+    case VideoEffectType::Noise:          return applyNoise(input, effect.param1);
+    case VideoEffectType::DisplacementMap: return applyDisplacementMap(input, effect.param1, effect.param2, static_cast<int>(effect.param3));
+    case VideoEffectType::FractalNoiseGen: return applyFractalNoise(input, effect.param1, static_cast<int>(effect.param2), effect.param3);
     default: return input;
     }
 }
@@ -601,4 +611,87 @@ QImage VideoEffectProcessor::applyNoise(const QImage &input, double amount)
         }
     }
     return img;
+}
+
+QImage VideoEffectProcessor::applyDisplacementMap(const QImage &input, double hAmt, double vAmt, int mode)
+{
+    QImage src = input.convertToFormat(QImage::Format_RGB888);
+    int w = src.width(), h = src.height();
+    QImage result(w, h, QImage::Format_RGB888);
+
+    // Build or obtain the displacement map
+    QImage mapImg;
+    if (mode == 1) {
+        // Use the image's own luminance as the map
+        mapImg = src.copy();
+        for (int y = 0; y < h; ++y) {
+            uint8_t *line = mapImg.scanLine(y);
+            for (int x = 0; x < w; ++x) {
+                int idx = x * 3;
+                uint8_t lum = static_cast<uint8_t>(
+                    0.2126 * line[idx] + 0.7152 * line[idx + 1] + 0.0722 * line[idx + 2]);
+                line[idx] = line[idx + 1] = line[idx + 2] = lum;
+            }
+        }
+    } else {
+        // Generate procedural fractal noise map (mode == 0)
+        FractalNoise::Params p;
+        p.kind = FractalNoise::FractalKind::FBm;
+        p.octaves = 5;
+        p.lacunarity = 2.0;
+        p.gain = 0.5;
+        p.frequency = 4.0;
+        p.seed = 1337;
+        mapImg = FractalNoise::render(QSize(w, h), 0.0, p, true);
+        // Convert grayscale8 to RGB888 for uniform access below
+        if (mapImg.format() != QImage::Format_RGB888)
+            mapImg = mapImg.convertToFormat(QImage::Format_RGB888);
+    }
+
+    // Identity fast-path
+    if (hAmt == 0.0 && vAmt == 0.0)
+        return src.copy();
+
+    for (int y = 0; y < h; ++y) {
+        const uint8_t *srcLine = src.constScanLine(y);
+        const uint8_t *mapLine = mapImg.constScanLine(y);
+        uint8_t *dstLine = result.scanLine(y);
+
+        for (int x = 0; x < w; ++x) {
+            // Read map value (use red channel; map is grayscale so all channels equal)
+            double m = mapLine[x * 3] / 255.0;   // 0..1
+            m = m * 2.0 - 1.0;                     // -1..1
+
+            // Compute displaced source coordinates
+            int sx = qBound(0, static_cast<int>(std::round(x + m * hAmt)), w - 1);
+            int sy = qBound(0, static_cast<int>(std::round(y + m * vAmt)), h - 1);
+
+            // Sample source at displaced position (nearest-neighbor)
+            const uint8_t *srcSy = src.constScanLine(sy);
+            dstLine[x * 3]     = srcSy[sx * 3];
+            dstLine[x * 3 + 1] = srcSy[sx * 3 + 1];
+            dstLine[x * 3 + 2] = srcSy[sx * 3 + 2];
+        }
+    }
+
+    return result;
+}
+
+QImage VideoEffectProcessor::applyFractalNoise(const QImage &input, double scale, int octaves, double evolution)
+{
+    // FractalNoiseGen is a generator: it replaces the input with a fractal noise image
+    // of the same dimensions.  The input image is used only for its size.
+    int w = input.width(), h = input.height();
+
+    FractalNoise::Params p;
+    p.kind = FractalNoise::FractalKind::FBm;
+    p.octaves = qBound(1, octaves, 8);
+    p.lacunarity = 2.0;
+    p.gain = 0.5;
+    p.frequency = scale;
+    p.seed = 1337;
+
+    // Render as grayscale (matches FractalNoise::render output)
+    QImage noiseImg = FractalNoise::render(QSize(w, h), evolution, p, true);
+    return noiseImg.convertToFormat(QImage::Format_RGB888);
 }

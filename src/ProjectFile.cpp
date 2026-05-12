@@ -176,6 +176,19 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
     }
     root["subtitleStyle"] = data.subtitleStyle;
     root["loudnessSettings"] = data.loudnessSettings;
+    {
+        QJsonArray particleArr;
+        for (const auto &entry : data.particleClipEntries)
+            particleArr.append(particleClipEntryToJson(entry));
+        root["particleClipEntries"] = particleArr;
+    }
+    {
+        QJsonArray nodeArr;
+        for (const auto &entry : data.clipNodeGraphs)
+            nodeArr.append(clipNodeGraphToJson(entry));
+        root["clipNodeGraphs"] = nodeArr;
+    }
+    root["vfxState"] = vfxStateToJson(data.vfxState);
 
     QJsonDocument doc(root);
     QFile file(filePath);
@@ -284,6 +297,7 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
             data.mographTexts.append(mographTextFromJson(v.toObject()));
 
     // US-SNS-6: SmartReframe, subtitle burn-in, loudness normalization — backward compat: missing key = empty/default
+    data.smartReframe = QJsonObject{};
     if (root.contains("smartReframe"))
         data.smartReframe = root["smartReframe"].toObject();
     data.subtitleSegments.clear();
@@ -297,10 +311,25 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
             data.subtitleSegments.append(entry);
         }
     }
+    data.subtitleStyle = QJsonObject{};
     if (root.contains("subtitleStyle"))
         data.subtitleStyle = root["subtitleStyle"].toObject();
+    data.loudnessSettings = QJsonObject{};
     if (root.contains("loudnessSettings"))
         data.loudnessSettings = root["loudnessSettings"].toObject();
+    data.particleClipEntries.clear();
+    if (root.contains("particleClipEntries")) {
+        for (const auto &v : root["particleClipEntries"].toArray())
+            data.particleClipEntries.append(particleClipEntryFromJson(v.toObject()));
+    }
+    data.clipNodeGraphs.clear();
+    if (root.contains("clipNodeGraphs")) {
+        for (const auto &v : root["clipNodeGraphs"].toArray())
+            data.clipNodeGraphs.append(clipNodeGraphFromJson(v.toObject()));
+    }
+    data.vfxState = root.contains("vfxState")
+        ? vfxStateFromJson(root["vfxState"].toObject())
+        : ProjectVfxState{};
 
     return true;
 }
@@ -428,6 +457,19 @@ QString ProjectFile::toJsonString(const ProjectData &data)
     }
     root["subtitleStyle"] = data.subtitleStyle;
     root["loudnessSettings"] = data.loudnessSettings;
+    {
+        QJsonArray particleArr;
+        for (const auto &entry : data.particleClipEntries)
+            particleArr.append(particleClipEntryToJson(entry));
+        root["particleClipEntries"] = particleArr;
+    }
+    {
+        QJsonArray nodeArr;
+        for (const auto &entry : data.clipNodeGraphs)
+            nodeArr.append(clipNodeGraphToJson(entry));
+        root["clipNodeGraphs"] = nodeArr;
+    }
+    root["vfxState"] = vfxStateToJson(data.vfxState);
 
     QJsonDocument doc(root);
     return QString::fromUtf8(doc.toJson(QJsonDocument::Compact));
@@ -528,6 +570,7 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
             data.mographTexts.append(mographTextFromJson(v.toObject()));
 
     // US-SNS-6: SmartReframe, subtitle burn-in, loudness normalization — backward compat: missing key = empty/default
+    data.smartReframe = QJsonObject{};
     if (root.contains("smartReframe"))
         data.smartReframe = root["smartReframe"].toObject();
     data.subtitleSegments.clear();
@@ -541,10 +584,25 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
             data.subtitleSegments.append(entry);
         }
     }
+    data.subtitleStyle = QJsonObject{};
     if (root.contains("subtitleStyle"))
         data.subtitleStyle = root["subtitleStyle"].toObject();
+    data.loudnessSettings = QJsonObject{};
     if (root.contains("loudnessSettings"))
         data.loudnessSettings = root["loudnessSettings"].toObject();
+    data.particleClipEntries.clear();
+    if (root.contains("particleClipEntries")) {
+        for (const auto &v : root["particleClipEntries"].toArray())
+            data.particleClipEntries.append(particleClipEntryFromJson(v.toObject()));
+    }
+    data.clipNodeGraphs.clear();
+    if (root.contains("clipNodeGraphs")) {
+        for (const auto &v : root["clipNodeGraphs"].toArray())
+            data.clipNodeGraphs.append(clipNodeGraphFromJson(v.toObject()));
+    }
+    data.vfxState = root.contains("vfxState")
+        ? vfxStateFromJson(root["vfxState"].toObject())
+        : ProjectVfxState{};
 
     return true;
 }
@@ -1028,6 +1086,227 @@ planartrack::PlanarTrack ProjectFile::planarTrackFromJson(const QJsonObject &obj
     planartrack::PlanarTrack t;
     planartrack::fromJson(obj, t);
     return t;
+}
+
+QJsonObject ProjectFile::forceFieldToJson(const ForceField &field)
+{
+    QJsonObject obj;
+    obj["kind"] = field.kind;
+    obj["positionX"] = field.position.x();
+    obj["positionY"] = field.position.y();
+    obj["strength"] = field.strength;
+    obj["radius"] = field.radius;
+    return obj;
+}
+
+ForceField ProjectFile::forceFieldFromJson(const QJsonObject &obj)
+{
+    ForceField field;
+    field.kind = static_cast<ForceField::Kind>(obj["kind"].toInt(static_cast<int>(ForceField::PointAttract)));
+    field.position.setX(obj["positionX"].toDouble(field.position.x()));
+    field.position.setY(obj["positionY"].toDouble(field.position.y()));
+    field.strength = obj["strength"].toDouble(field.strength);
+    field.radius = obj["radius"].toDouble(field.radius);
+    return field;
+}
+
+QJsonObject ProjectFile::particleEmitterConfigToJson(const ParticleEmitterConfig &config)
+{
+    QJsonObject obj;
+    obj["type"] = static_cast<int>(config.type);
+    obj["emitRate"] = config.emitRate;
+    obj["maxParticles"] = config.maxParticles;
+    obj["emitPositionX"] = config.emitPosition.x();
+    obj["emitPositionY"] = config.emitPosition.y();
+    obj["emitAreaWidth"] = config.emitAreaSize.width();
+    obj["emitAreaHeight"] = config.emitAreaSize.height();
+    obj["lifeMin"] = config.lifeMin;
+    obj["lifeMax"] = config.lifeMax;
+    obj["sizeMin"] = config.sizeMin;
+    obj["sizeMax"] = config.sizeMax;
+    obj["speedMin"] = config.speedMin;
+    obj["speedMax"] = config.speedMax;
+    obj["direction"] = config.direction;
+    obj["spread"] = config.spread;
+    obj["gravityX"] = config.gravity.x();
+    obj["gravityY"] = config.gravity.y();
+    obj["windX"] = config.wind.x();
+    obj["windY"] = config.wind.y();
+    obj["collisionFloor"] = config.collisionFloor;
+    obj["floorY"] = config.floorY;
+    obj["restitution"] = config.restitution;
+    obj["floorFriction"] = config.floorFriction;
+    obj["turbulenceAmount"] = config.turbulenceAmount;
+    obj["turbulenceScale"] = config.turbulenceScale;
+    obj["turbulenceSpeed"] = config.turbulenceSpeed;
+    obj["startColor"] = config.startColor.name(QColor::HexArgb);
+    obj["endColor"] = config.endColor.name(QColor::HexArgb);
+    obj["fadeIn"] = config.fadeIn;
+    obj["fadeOut"] = config.fadeOut;
+    obj["sizeStartMult"] = config.sizeStartMult;
+    obj["sizeEndMult"] = config.sizeEndMult;
+
+    QJsonArray forceArr;
+    for (const auto &field : config.forceFields)
+        forceArr.append(forceFieldToJson(field));
+    obj["forceFields"] = forceArr;
+    return obj;
+}
+
+ParticleEmitterConfig ProjectFile::particleEmitterConfigFromJson(const QJsonObject &obj)
+{
+    ParticleEmitterConfig config;
+    config.type = static_cast<ParticleType>(obj["type"].toInt(static_cast<int>(config.type)));
+    config.emitRate = obj["emitRate"].toDouble(config.emitRate);
+    config.maxParticles = obj["maxParticles"].toInt(config.maxParticles);
+    config.emitPosition.setX(obj["emitPositionX"].toDouble(config.emitPosition.x()));
+    config.emitPosition.setY(obj["emitPositionY"].toDouble(config.emitPosition.y()));
+    config.emitAreaSize.setWidth(obj["emitAreaWidth"].toDouble(config.emitAreaSize.width()));
+    config.emitAreaSize.setHeight(obj["emitAreaHeight"].toDouble(config.emitAreaSize.height()));
+    config.lifeMin = obj["lifeMin"].toDouble(config.lifeMin);
+    config.lifeMax = obj["lifeMax"].toDouble(config.lifeMax);
+    config.sizeMin = obj["sizeMin"].toDouble(config.sizeMin);
+    config.sizeMax = obj["sizeMax"].toDouble(config.sizeMax);
+    config.speedMin = obj["speedMin"].toDouble(config.speedMin);
+    config.speedMax = obj["speedMax"].toDouble(config.speedMax);
+    config.direction = obj["direction"].toDouble(config.direction);
+    config.spread = obj["spread"].toDouble(config.spread);
+    config.gravity.setX(obj["gravityX"].toDouble(config.gravity.x()));
+    config.gravity.setY(obj["gravityY"].toDouble(config.gravity.y()));
+    config.wind.setX(obj["windX"].toDouble(config.wind.x()));
+    config.wind.setY(obj["windY"].toDouble(config.wind.y()));
+    config.collisionFloor = obj["collisionFloor"].toBool(config.collisionFloor);
+    config.floorY = obj["floorY"].toDouble(config.floorY);
+    config.restitution = obj["restitution"].toDouble(config.restitution);
+    config.floorFriction = obj["floorFriction"].toDouble(config.floorFriction);
+    config.turbulenceAmount = obj["turbulenceAmount"].toDouble(config.turbulenceAmount);
+    config.turbulenceScale = obj["turbulenceScale"].toDouble(config.turbulenceScale);
+    config.turbulenceSpeed = obj["turbulenceSpeed"].toDouble(config.turbulenceSpeed);
+    config.startColor = QColor(obj["startColor"].toString(config.startColor.name(QColor::HexArgb)));
+    config.endColor = QColor(obj["endColor"].toString(config.endColor.name(QColor::HexArgb)));
+    config.fadeIn = obj["fadeIn"].toDouble(config.fadeIn);
+    config.fadeOut = obj["fadeOut"].toDouble(config.fadeOut);
+    config.sizeStartMult = obj["sizeStartMult"].toDouble(config.sizeStartMult);
+    config.sizeEndMult = obj["sizeEndMult"].toDouble(config.sizeEndMult);
+
+    config.forceFields.clear();
+    if (obj.contains("forceFields")) {
+        for (const auto &value : obj["forceFields"].toArray())
+            config.forceFields.append(forceFieldFromJson(value.toObject()));
+    }
+    return config;
+}
+
+QJsonObject ProjectFile::particleClipEntryToJson(const ParticleClipEntry &entry)
+{
+    QJsonObject obj;
+    obj["trackIndex"] = entry.trackIndex;
+    obj["clipIndex"] = entry.clipIndex;
+    obj["clipFilePath"] = entry.clipFilePath;
+    obj["config"] = particleEmitterConfigToJson(entry.config);
+    return obj;
+}
+
+ParticleClipEntry ProjectFile::particleClipEntryFromJson(const QJsonObject &obj)
+{
+    ParticleClipEntry entry;
+    entry.trackIndex = obj["trackIndex"].toInt(-1);
+    entry.clipIndex = obj["clipIndex"].toInt(-1);
+    entry.clipFilePath = obj["clipFilePath"].toString();
+    if (obj.contains("config"))
+        entry.config = particleEmitterConfigFromJson(obj["config"].toObject());
+    return entry;
+}
+
+QJsonObject ProjectFile::clipNodeGraphToJson(const ClipNodeGraph &entry)
+{
+    QJsonObject obj;
+    obj["clipId"] = entry.clipId;
+    obj["graph"] = entry.graph;
+    obj["compositingMode"] = entry.compositingMode;
+    return obj;
+}
+
+ClipNodeGraph ProjectFile::clipNodeGraphFromJson(const QJsonObject &obj)
+{
+    ClipNodeGraph entry;
+    entry.clipId = obj["clipId"].toString();
+    entry.graph = obj["graph"].toObject();
+    entry.compositingMode = obj["compositingMode"].toString(entry.compositingMode);
+    return entry;
+}
+
+QJsonObject ProjectFile::vfxStateToJson(const ProjectVfxState &state)
+{
+    auto glowToJson = [](const ProjectGlowState &glow) {
+        QJsonObject obj;
+        obj["enabled"] = glow.enabled;
+        obj["threshold"] = glow.threshold;
+        obj["radius"] = glow.radius;
+        obj["intensity"] = glow.intensity;
+        return obj;
+    };
+    auto bloomToJson = [](const ProjectBloomState &bloom) {
+        QJsonObject obj;
+        obj["enabled"] = bloom.enabled;
+        obj["threshold"] = bloom.threshold;
+        obj["intensity"] = bloom.intensity;
+        obj["spread"] = bloom.spread;
+        return obj;
+    };
+    auto chromaToJson = [](const ProjectChromaticAberrationState &chromatic) {
+        QJsonObject obj;
+        obj["enabled"] = chromatic.enabled;
+        obj["amount"] = chromatic.amount;
+        obj["radialFalloff"] = chromatic.radialFalloff;
+        return obj;
+    };
+    auto wrapToJson = [](const ProjectLightWrapState &wrap) {
+        QJsonObject obj;
+        obj["enabled"] = wrap.enabled;
+        obj["amount"] = wrap.amount;
+        obj["radius"] = wrap.radius;
+        return obj;
+    };
+
+    QJsonObject obj;
+    obj["glow"] = glowToJson(state.glow);
+    obj["bloom"] = bloomToJson(state.bloom);
+    obj["chromaticAberration"] = chromaToJson(state.chromaticAberration);
+    obj["lightWrap"] = wrapToJson(state.lightWrap);
+    return obj;
+}
+
+ProjectVfxState ProjectFile::vfxStateFromJson(const QJsonObject &obj)
+{
+    ProjectVfxState state;
+    if (obj.contains("glow")) {
+        const QJsonObject glow = obj["glow"].toObject();
+        state.glow.enabled = glow["enabled"].toBool(state.glow.enabled);
+        state.glow.threshold = static_cast<float>(glow["threshold"].toDouble(state.glow.threshold));
+        state.glow.radius = static_cast<float>(glow["radius"].toDouble(state.glow.radius));
+        state.glow.intensity = static_cast<float>(glow["intensity"].toDouble(state.glow.intensity));
+    }
+    if (obj.contains("bloom")) {
+        const QJsonObject bloom = obj["bloom"].toObject();
+        state.bloom.enabled = bloom["enabled"].toBool(state.bloom.enabled);
+        state.bloom.threshold = static_cast<float>(bloom["threshold"].toDouble(state.bloom.threshold));
+        state.bloom.intensity = static_cast<float>(bloom["intensity"].toDouble(state.bloom.intensity));
+        state.bloom.spread = static_cast<float>(bloom["spread"].toDouble(state.bloom.spread));
+    }
+    if (obj.contains("chromaticAberration")) {
+        const QJsonObject chromatic = obj["chromaticAberration"].toObject();
+        state.chromaticAberration.enabled = chromatic["enabled"].toBool(state.chromaticAberration.enabled);
+        state.chromaticAberration.amount = static_cast<float>(chromatic["amount"].toDouble(state.chromaticAberration.amount));
+        state.chromaticAberration.radialFalloff = static_cast<float>(chromatic["radialFalloff"].toDouble(state.chromaticAberration.radialFalloff));
+    }
+    if (obj.contains("lightWrap")) {
+        const QJsonObject wrap = obj["lightWrap"].toObject();
+        state.lightWrap.enabled = wrap["enabled"].toBool(state.lightWrap.enabled);
+        state.lightWrap.amount = static_cast<float>(wrap["amount"].toDouble(state.lightWrap.amount));
+        state.lightWrap.radius = static_cast<float>(wrap["radius"].toDouble(state.lightWrap.radius));
+    }
+    return state;
 }
 
 // --- US-AETEXT-12: AE text feature persistence ---

@@ -339,6 +339,20 @@ uniform int uHdrTransfer;
 uniform float uSharpenAmount;   // 0..200; shader multiplies by 0.01
 uniform float uBlurRadius;      // 0..50 px; identity at 0
 uniform float uLensDistortion;  // -100..+100; shader multiplies by 0.01
+uniform bool  uGlowEnabled;
+uniform float uGlowThreshold;
+uniform float uGlowRadius;      // pixels
+uniform float uGlowIntensity;
+uniform bool  uBloomEnabled;
+uniform float uBloomThreshold;
+uniform float uBloomIntensity;
+uniform float uBloomSpread;     // pixels
+uniform bool  uChromAbEnabled;
+uniform float uChromAbAmount;   // pixels at frame corners
+uniform float uChromAbFalloff;
+uniform bool  uLightWrapEnabled;
+uniform float uLightWrapAmount;
+uniform float uLightWrapRadius; // pixels
 
 // US-3D: 3-axis rotation + perspective foreshortening (Premiere "Basic 3D" /
 // Resolve "Transform" 3D rotation parity). Composed AFTER lens distortion
@@ -535,9 +549,32 @@ vec3 applyLiftGammaGain(vec3 color) {
     return c3;
 }
 
+float luminance(vec3 color) {
+    return dot(color, vec3(0.2126, 0.7152, 0.0722));
+}
+
+vec4 sampleScene(vec2 uv) {
+    if (!uChromAbEnabled || abs(uChromAbAmount) <= 0.001)
+        return texture(uTexture, uv);
+
+    vec2 baseUv = clamp(uv, vec2(0.0), vec2(1.0));
+    vec2 fromCenter = baseUv - vec2(0.5);
+    float distNorm = clamp(length(fromCenter) / 0.70710678, 0.0, 1.0);
+    if (distNorm <= 1e-5)
+        return texture(uTexture, baseUv);
+
+    vec2 dir = normalize(fromCenter);
+    float offsetPx = uChromAbAmount * pow(distNorm, max(uChromAbFalloff, 0.001));
+    vec2 offsetUv = dir * offsetPx / vec2(textureSize(uTexture, 0));
+    vec2 uvR = clamp(baseUv + offsetUv, vec2(0.0), vec2(1.0));
+    vec2 uvB = clamp(baseUv - offsetUv, vec2(0.0), vec2(1.0));
+    vec4 center = texture(uTexture, baseUv);
+    return vec4(texture(uTexture, uvR).r, center.g, texture(uTexture, uvB).b, center.a);
+}
+
 vec3 fxBlur(vec2 uv) {
     float r = clamp(uFxBlurRadius, 0.0, 8.0);
-    if (r < 0.5 || uFxTexSize.x <= 0.0) return texture(uTexture, uv).rgb;
+    if (r < 0.5 || uFxTexSize.x <= 0.0) return sampleScene(uv).rgb;
     vec2 px = 1.0 / uFxTexSize;
     vec3 acc = vec3(0.0);
     float wsum = 0.0;
@@ -546,11 +583,11 @@ vec3 fxBlur(vec2 uv) {
         for (int dx = -4; dx <= 4; ++dx) {
             if (abs(dx) > ri || abs(dy) > ri) continue;
             vec2 off = vec2(float(dx), float(dy)) * px;
-            acc += texture(uTexture, uv + off).rgb;
+            acc += sampleScene(uv + off).rgb;
             wsum += 1.0;
         }
     }
-    return (wsum > 0.0) ? acc / wsum : texture(uTexture, uv).rgb;
+    return (wsum > 0.0) ? acc / wsum : sampleScene(uv).rgb;
 }
 )"
 R"(
@@ -594,9 +631,9 @@ vec3 applySharpen(sampler2D tex, vec2 uv, vec2 texelSize, float amount) {
     vec3 blurred = vec3(0.0);
     for (int dy = -1; dy <= 1; ++dy)
         for (int dx = -1; dx <= 1; ++dx)
-            blurred += texture(tex, uv + vec2(float(dx), float(dy)) * texelSize).rgb;
+            blurred += sampleScene(uv + vec2(float(dx), float(dy)) * texelSize).rgb;
     blurred /= 9.0;
-    vec3 color = texture(tex, uv).rgb;
+    vec3 color = sampleScene(uv).rgb;
     return color + amount * (color - blurred);
 }
 
@@ -607,6 +644,48 @@ vec2 applyMosaic(vec2 uv, float mosaicSize) {
 
 vec4 applyChromaKey(vec3 color, vec3 key, float tolerance) {
     return vec4(color, smoothstep(tolerance, tolerance + 0.05, distance(color, key)));
+}
+
+vec3 blurScene9(vec2 uv, float radiusPx) {
+    vec2 texel = max(vec2(radiusPx) / vec2(textureSize(uTexture, 0)), vec2(0.0));
+    vec2 diag = texel * 0.70710678;
+    vec3 blurred = sampleScene(uv).rgb * 0.204164;
+    blurred += sampleScene(uv + vec2( texel.x, 0.0)).rgb * 0.123841;
+    blurred += sampleScene(uv + vec2(-texel.x, 0.0)).rgb * 0.123841;
+    blurred += sampleScene(uv + vec2(0.0,  texel.y)).rgb * 0.123841;
+    blurred += sampleScene(uv + vec2(0.0, -texel.y)).rgb * 0.123841;
+    blurred += sampleScene(uv + vec2( diag.x,  diag.y)).rgb * 0.075113;
+    blurred += sampleScene(uv + vec2(-diag.x,  diag.y)).rgb * 0.075113;
+    blurred += sampleScene(uv + vec2( diag.x, -diag.y)).rgb * 0.075113;
+    blurred += sampleScene(uv + vec2(-diag.x, -diag.y)).rgb * 0.075113;
+    return blurred;
+}
+
+vec3 blurBright9(vec2 uv, float radiusPx, float threshold) {
+    vec2 texel = max(vec2(radiusPx) / vec2(textureSize(uTexture, 0)), vec2(0.0));
+    vec2 diag = texel * 0.70710678;
+    vec3 center = sampleScene(uv).rgb;
+    float wCenter = smoothstep(threshold, threshold + 0.15, luminance(center));
+    vec3 blurred = center * wCenter * 0.204164;
+
+    vec3 sx = sampleScene(uv + vec2( texel.x, 0.0)).rgb;
+    vec3 sxn = sampleScene(uv + vec2(-texel.x, 0.0)).rgb;
+    vec3 sy = sampleScene(uv + vec2(0.0,  texel.y)).rgb;
+    vec3 syn = sampleScene(uv + vec2(0.0, -texel.y)).rgb;
+    vec3 s1 = sampleScene(uv + vec2( diag.x,  diag.y)).rgb;
+    vec3 s2 = sampleScene(uv + vec2(-diag.x,  diag.y)).rgb;
+    vec3 s3 = sampleScene(uv + vec2( diag.x, -diag.y)).rgb;
+    vec3 s4 = sampleScene(uv + vec2(-diag.x, -diag.y)).rgb;
+
+    blurred += sx  * smoothstep(threshold, threshold + 0.15, luminance(sx )) * 0.123841;
+    blurred += sxn * smoothstep(threshold, threshold + 0.15, luminance(sxn)) * 0.123841;
+    blurred += sy  * smoothstep(threshold, threshold + 0.15, luminance(sy )) * 0.123841;
+    blurred += syn * smoothstep(threshold, threshold + 0.15, luminance(syn)) * 0.123841;
+    blurred += s1  * smoothstep(threshold, threshold + 0.15, luminance(s1 )) * 0.075113;
+    blurred += s2  * smoothstep(threshold, threshold + 0.15, luminance(s2 )) * 0.075113;
+    blurred += s3  * smoothstep(threshold, threshold + 0.15, luminance(s3 )) * 0.075113;
+    blurred += s4  * smoothstep(threshold, threshold + 0.15, luminance(s4 )) * 0.075113;
+    return blurred;
 }
 
 void main() {
@@ -651,7 +730,7 @@ void main() {
         lensCoord = rotCoord;
     }
     vec2 sampleUv = uFxMosaicEnable ? applyMosaic(lensCoord, uFxMosaicSize) : lensCoord;
-    vec4 texColor = texture(uTexture, sampleUv);
+    vec4 texColor = sampleScene(sampleUv);
     vec3 color = uFxBlurEnable ? fxBlur(lensCoord) : texColor.rgb;
 
     if (uHdrTransfer == 1) {
@@ -728,7 +807,8 @@ void main() {
         // Identity uWb=vec3(1.0) is a free no-op.
         if (uWb != vec3(1.0))
             color *= uWb;
-
+)"
+R"(
         // Apply color correction pipeline (same order as CPU)
         if (uExposure != 0.0)
             color = adjustExposure(color, uExposure);
@@ -841,15 +921,15 @@ void main() {
     if (uBlurRadius > 0.5) {
         vec2 px = uBlurRadius / vec2(textureSize(uTexture, 0));
         vec3 b = vec3(0.0);
-        b += texture(uTexture, sampleUv + vec2(-px.x, -px.y)).rgb;
-        b += texture(uTexture, sampleUv + vec2( 0.0, -px.y)).rgb;
-        b += texture(uTexture, sampleUv + vec2( px.x, -px.y)).rgb;
-        b += texture(uTexture, sampleUv + vec2(-px.x,  0.0)).rgb;
-        b += texture(uTexture, sampleUv).rgb;
-        b += texture(uTexture, sampleUv + vec2( px.x,  0.0)).rgb;
-        b += texture(uTexture, sampleUv + vec2(-px.x,  px.y)).rgb;
-        b += texture(uTexture, sampleUv + vec2( 0.0,  px.y)).rgb;
-        b += texture(uTexture, sampleUv + vec2( px.x,  px.y)).rgb;
+        b += sampleScene(sampleUv + vec2(-px.x, -px.y)).rgb;
+        b += sampleScene(sampleUv + vec2( 0.0, -px.y)).rgb;
+        b += sampleScene(sampleUv + vec2( px.x, -px.y)).rgb;
+        b += sampleScene(sampleUv + vec2(-px.x,  0.0)).rgb;
+        b += sampleScene(sampleUv).rgb;
+        b += sampleScene(sampleUv + vec2( px.x,  0.0)).rgb;
+        b += sampleScene(sampleUv + vec2(-px.x,  px.y)).rgb;
+        b += sampleScene(sampleUv + vec2( 0.0,  px.y)).rgb;
+        b += sampleScene(sampleUv + vec2( px.x,  px.y)).rgb;
         color = mix(color, b / 9.0, smoothstep(0.0, 50.0, uBlurRadius));
     }
 
@@ -861,18 +941,44 @@ void main() {
     if (uSharpenAmount > 0.001) {
         vec2 px = 1.0 / vec2(textureSize(uTexture, 0));
         vec3 blur = vec3(0.0);
-        blur += texture(uTexture, sampleUv + vec2(-px.x, -px.y)).rgb;
-        blur += texture(uTexture, sampleUv + vec2( 0.0, -px.y)).rgb;
-        blur += texture(uTexture, sampleUv + vec2( px.x, -px.y)).rgb;
-        blur += texture(uTexture, sampleUv + vec2(-px.x,  0.0)).rgb;
-        blur += texture(uTexture, sampleUv).rgb;
-        blur += texture(uTexture, sampleUv + vec2( px.x,  0.0)).rgb;
-        blur += texture(uTexture, sampleUv + vec2(-px.x,  px.y)).rgb;
-        blur += texture(uTexture, sampleUv + vec2( 0.0,  px.y)).rgb;
-        blur += texture(uTexture, sampleUv + vec2( px.x,  px.y)).rgb;
+        blur += sampleScene(sampleUv + vec2(-px.x, -px.y)).rgb;
+        blur += sampleScene(sampleUv + vec2( 0.0, -px.y)).rgb;
+        blur += sampleScene(sampleUv + vec2( px.x, -px.y)).rgb;
+        blur += sampleScene(sampleUv + vec2(-px.x,  0.0)).rgb;
+        blur += sampleScene(sampleUv).rgb;
+        blur += sampleScene(sampleUv + vec2( px.x,  0.0)).rgb;
+        blur += sampleScene(sampleUv + vec2(-px.x,  px.y)).rgb;
+        blur += sampleScene(sampleUv + vec2( 0.0,  px.y)).rgb;
+        blur += sampleScene(sampleUv + vec2( px.x,  px.y)).rgb;
         blur /= 9.0;
-        vec3 baseRgb = texture(uTexture, sampleUv).rgb;
+        vec3 baseRgb = sampleScene(sampleUv).rgb;
         color = clamp(color + uSharpenAmount * 0.01 * (baseRgb - blur), 0.0, 1.0);
+    }
+
+    if (uGlowEnabled && uGlowIntensity > 0.001 && uGlowRadius > 0.001) {
+        vec3 glow = blurBright9(sampleUv, uGlowRadius, uGlowThreshold);
+        color = clamp(color + glow * uGlowIntensity, 0.0, 1.0);
+    }
+
+    if (uBloomEnabled && uBloomIntensity > 0.001 && uBloomSpread > 0.001) {
+        float innerRadius = max(uBloomSpread, 1.0);
+        float outerRadius = max(uBloomSpread * 2.5, innerRadius + 1.0);
+        vec3 bloomInner = blurBright9(sampleUv, innerRadius, uBloomThreshold);
+        vec3 bloomOuter = blurBright9(sampleUv, outerRadius, uBloomThreshold);
+        vec3 bloom = bloomInner * 0.6 + bloomOuter * 0.4;
+        color = clamp(color + bloom * uBloomIntensity, 0.0, 1.0);
+    }
+
+    // Single-frame light-wrap approximation: GLPreview only composites one
+    // texture, so instead of true foreground/background isolation we blur the
+    // current frame and blend that soft neighborhood back only where the
+    // local contrast indicates an edge halo.
+    if (uLightWrapEnabled && uLightWrapAmount > 0.001 && uLightWrapRadius > 0.001) {
+        vec3 wrapBase = sampleScene(sampleUv).rgb;
+        vec3 wrapBlur = blurScene9(sampleUv, uLightWrapRadius);
+        float edge = smoothstep(0.03, 0.30, length(wrapBase - wrapBlur));
+        vec3 wrapped = max(color, wrapBlur);
+        color = mix(color, wrapped, clamp(edge * uLightWrapAmount, 0.0, 1.0));
     }
 
     vec4 outColor = vec4(clamp(color, 0.0, 1.0), texColor.a);
@@ -957,6 +1063,10 @@ std::unordered_map<CacheKey, NV12RegisteredTex, CacheKeyHash> &nv12Cache()
 GLPreview::GLPreview(QWidget *parent)
     : QOpenGLWidget(parent), m_vbo(QOpenGLBuffer::VertexBuffer)
 {
+    m_glowEnabled = false;
+    m_bloomEnabled = false;
+    m_chromAbEnabled = false;
+    m_lightWrapEnabled = false;
     setMinimumSize(320, 180);
     m_textToolCaretTimer.setInterval(500);
     connect(&m_textToolCaretTimer, &QTimer::timeout, this, [this]() {
@@ -1396,6 +1506,20 @@ void GLPreview::createShaderProgram()
     m_locSharpenAmount  = m_program->uniformLocation("uSharpenAmount");
     m_locBlurRadius     = m_program->uniformLocation("uBlurRadius");
     m_locLensDistortion = m_program->uniformLocation("uLensDistortion");
+    m_locGlowEnabled    = m_program->uniformLocation("uGlowEnabled");
+    m_locGlowThreshold  = m_program->uniformLocation("uGlowThreshold");
+    m_locGlowRadius     = m_program->uniformLocation("uGlowRadius");
+    m_locGlowIntensity  = m_program->uniformLocation("uGlowIntensity");
+    m_locBloomEnabled   = m_program->uniformLocation("uBloomEnabled");
+    m_locBloomThreshold = m_program->uniformLocation("uBloomThreshold");
+    m_locBloomIntensity = m_program->uniformLocation("uBloomIntensity");
+    m_locBloomSpread    = m_program->uniformLocation("uBloomSpread");
+    m_locChromAbEnabled = m_program->uniformLocation("uChromAbEnabled");
+    m_locChromAbAmount  = m_program->uniformLocation("uChromAbAmount");
+    m_locChromAbFalloff = m_program->uniformLocation("uChromAbFalloff");
+    m_locLightWrapEnabled = m_program->uniformLocation("uLightWrapEnabled");
+    m_locLightWrapAmount  = m_program->uniformLocation("uLightWrapAmount");
+    m_locLightWrapRadius  = m_program->uniformLocation("uLightWrapRadius");
 
     // US-3D: 3-axis rotation + perspective foreshortening. Identity matrix
     // (uRot3DEnabled=false) is a free no-op — the shader skips the warp.
@@ -2096,6 +2220,20 @@ void GLPreview::paintGL()
     m_program->setUniformValue(m_locSharpenAmount,  m_sharpenAmount);
     m_program->setUniformValue(m_locBlurRadius,     m_blurRadius);
     m_program->setUniformValue(m_locLensDistortion, m_lensDistortion);
+    m_program->setUniformValue(m_locGlowEnabled,    m_glowEnabled);
+    m_program->setUniformValue(m_locGlowThreshold,  m_glowThreshold);
+    m_program->setUniformValue(m_locGlowRadius,     m_glowRadius);
+    m_program->setUniformValue(m_locGlowIntensity,  m_glowIntensity);
+    m_program->setUniformValue(m_locBloomEnabled,   m_bloomEnabled);
+    m_program->setUniformValue(m_locBloomThreshold, m_bloomThreshold);
+    m_program->setUniformValue(m_locBloomIntensity, m_bloomIntensity);
+    m_program->setUniformValue(m_locBloomSpread,    m_bloomSpread);
+    m_program->setUniformValue(m_locChromAbEnabled, m_chromAbEnabled);
+    m_program->setUniformValue(m_locChromAbAmount,  m_chromAbAmount);
+    m_program->setUniformValue(m_locChromAbFalloff, m_chromAbFalloff);
+    m_program->setUniformValue(m_locLightWrapEnabled, m_lightWrapEnabled);
+    m_program->setUniformValue(m_locLightWrapAmount,  m_lightWrapAmount);
+    m_program->setUniformValue(m_locLightWrapRadius,  m_lightWrapRadius);
 
     // US-3D: 3-axis rotation + perspective. Ship the CPU-built 3x3 rotation
     // matrix as a QMatrix3x3 (column-major float[9]). Identity is a free
@@ -3361,6 +3499,40 @@ void GLPreview::setBlur(float radiusPx)
 void GLPreview::setLensDistortion(float amount)
 {
     m_lensDistortion = amount;
+    update();
+}
+
+void GLPreview::setGlow(bool enabled, float threshold, float radius, float intensity)
+{
+    m_glowEnabled = enabled;
+    m_glowThreshold = threshold;
+    m_glowRadius = radius;
+    m_glowIntensity = intensity;
+    update();
+}
+
+void GLPreview::setBloom(bool enabled, float threshold, float intensity, float spread)
+{
+    m_bloomEnabled = enabled;
+    m_bloomThreshold = threshold;
+    m_bloomIntensity = intensity;
+    m_bloomSpread = spread;
+    update();
+}
+
+void GLPreview::setChromaticAberration(bool enabled, float amount, float radialFalloff)
+{
+    m_chromAbEnabled = enabled;
+    m_chromAbAmount = amount;
+    m_chromAbFalloff = radialFalloff;
+    update();
+}
+
+void GLPreview::setLightWrap(bool enabled, float amount, float radius)
+{
+    m_lightWrapEnabled = enabled;
+    m_lightWrapAmount = amount;
+    m_lightWrapRadius = radius;
     update();
 }
 

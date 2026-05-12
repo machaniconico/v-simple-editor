@@ -88,6 +88,8 @@ class NodeCanvasWidget;
 class NodePropertiesPanel;
 class NodeGraph;
 class NodeEvaluator;
+class ParticleEffectDialog;
+class VfxControlsPanel;
 
 class MainWindow : public QMainWindow
 {
@@ -298,22 +300,28 @@ private:
     void updateEditActions();
     void applyProjectConfig(const ProjectConfig &config);
     void updateTitle();
+    void populateProjectData(ProjectData &data);
+    void applyLoadedProjectData(const ProjectData &data, const QString &filePath);
     void collectAudioState(ProjectData &data);
     void applyAudioState(const ProjectData &data);
     static QString brushClipId(int trackIdx, int clipIdx);
+    static QString particleClipKey(const ClipInfo &clip);
     void setBrushAnimationEntries(const QVector<BrushAnimationEntry> &entries);
     void upsertBrushAnimationEntry(const BrushAnimationEntry &entry);
     BrushAnimation *materializeBrushAnimation(const QString &clipId);
     void syncBrushAnimationPreviewForClip(int trackIdx, int clipIdx);
+    void applyVfxProjectState(const ProjectVfxState &state);
 
     VideoPlayer *m_player;
     Timeline *m_timeline;
     class ProxyProgressDialog *m_proxyDialog = nullptr;
     class ColorGradingPanel *m_colorGradingPanel = nullptr;
     effectctrl::EffectControlsPanel *m_effectControlsPanel = nullptr;
+    VfxControlsPanel *m_vfxControlsPanel = nullptr;
     QStringList m_supportedFormats;
     ProjectConfig m_projectConfig;
     QVector<BrushAnimationEntry> m_brushAnimationEntries;
+    QHash<QString, ParticleEmitterConfig> m_particleClipConfigs;
     QHash<QString, BrushAnimation *> m_liveBrushAnimations;
 
     // US-AETEXT-12: AE text feature objects
@@ -358,6 +366,7 @@ private:
     SubtitleStyle m_subtitleStyle;
     LoudnessPanel *m_loudnessPanel = nullptr;
     QDockWidget *m_loudnessDock = nullptr;
+    QDockWidget *m_vfxControlsDock = nullptr;
     LayerCompositor m_layerCompositor;
     PrecomposeManager m_precomposeManager;
 
@@ -434,6 +443,7 @@ private:
 
     // History dock
     HistoryDockWidget *m_historyDock = nullptr;
+    QAction *m_vfxControlsAction = nullptr;
 
     // Consolidation: docks for the per-track audio panels (EQ /
     // Compressor / Reverb / Noise Reduction). Created on first use and

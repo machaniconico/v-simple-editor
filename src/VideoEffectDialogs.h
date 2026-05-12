@@ -90,6 +90,7 @@ private:
     QLabel *m_param2Label;
     QLabel *m_param3Label;
     QPushButton *m_colorButton;
+    QComboBox *m_mapSourceCombo;
     QCheckBox *m_enabledCheck;
 };
 

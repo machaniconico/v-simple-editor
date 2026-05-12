@@ -187,6 +187,12 @@ VideoEffectDialog::VideoEffectDialog(const QVector<VideoEffect> &initial, QWidge
     connect(m_colorButton, &QPushButton::clicked, this, &VideoEffectDialog::pickColor);
     paramGrid->addWidget(m_colorButton, 3, 0, 1, 2);
 
+    m_mapSourceCombo = new QComboBox();
+    m_mapSourceCombo->addItem("Procedural noise");
+    m_mapSourceCombo->addItem("Image luminance");
+    connect(m_mapSourceCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &VideoEffectDialog::onParamChanged);
+    paramGrid->addWidget(m_mapSourceCombo, 4, 0, 1, 2);
+
     rightPanel->addWidget(paramGroup);
     rightPanel->addStretch();
 
@@ -223,6 +229,8 @@ void VideoEffectDialog::addEffect()
     case VideoEffectType::Grayscale: effect = VideoEffect::createGrayscale(); break;
     case VideoEffectType::Invert:    effect = VideoEffect::createInvert(); break;
     case VideoEffectType::Noise:     effect = VideoEffect::createNoise(); break;
+    case VideoEffectType::DisplacementMap: effect = VideoEffect::createDisplacementMap(); break;
+    case VideoEffectType::FractalNoiseGen: effect = VideoEffect::createFractalNoise(); break;
     default: return;
     }
     m_effects.append(effect);
@@ -282,6 +290,7 @@ void VideoEffectDialog::updateParamUI(int index)
     m_param2Label->setVisible(false); m_param2Spin->setVisible(false);
     m_param3Label->setVisible(false); m_param3Spin->setVisible(false);
     m_colorButton->setVisible(false);
+    m_mapSourceCombo->setVisible(false);
 
     if (!valid) return;
 
@@ -292,6 +301,11 @@ void VideoEffectDialog::updateParamUI(int index)
     m_param1Spin->blockSignals(true);
     m_param2Spin->blockSignals(true);
     m_param3Spin->blockSignals(true);
+
+    // Reset decimals and singleStep to defaults before per-type config
+    m_param1Spin->setDecimals(1); m_param1Spin->setSingleStep(1.0);
+    m_param2Spin->setDecimals(1); m_param2Spin->setSingleStep(1.0);
+    m_param3Spin->setDecimals(1); m_param3Spin->setSingleStep(1.0);
 
     switch (e.type) {
     case VideoEffectType::Blur:
@@ -337,6 +351,28 @@ void VideoEffectDialog::updateParamUI(int index)
         m_param1Spin->setValue(e.param1);
         m_param1Label->setVisible(true); m_param1Spin->setVisible(true);
         break;
+    case VideoEffectType::DisplacementMap:
+        m_param1Label->setText("Horizontal (px):"); m_param1Spin->setRange(-200, 200);
+        m_param1Spin->setValue(e.param1);
+        m_param2Label->setText("Vertical (px):"); m_param2Spin->setRange(-200, 200);
+        m_param2Spin->setValue(e.param2);
+        m_param3Label->setText("Map source:");
+        m_mapSourceCombo->setCurrentIndex(static_cast<int>(e.param3));
+        m_param1Label->setVisible(true); m_param1Spin->setVisible(true);
+        m_param2Label->setVisible(true); m_param2Spin->setVisible(true);
+        m_param3Label->setVisible(true); m_mapSourceCombo->setVisible(true);
+        break;
+    case VideoEffectType::FractalNoiseGen:
+        m_param1Label->setText("Scale:"); m_param1Spin->setRange(0.1, 100.0);
+        m_param1Spin->setValue(e.param1);
+        m_param2Label->setText("Octaves:"); m_param2Spin->setRange(1, 8); m_param2Spin->setDecimals(0);
+        m_param2Spin->setValue(e.param2);
+        m_param3Label->setText("Evolution:"); m_param3Spin->setRange(0.0, 360.0); m_param3Spin->setDecimals(1);
+        m_param3Spin->setValue(e.param3);
+        m_param1Label->setVisible(true); m_param1Spin->setVisible(true);
+        m_param2Label->setVisible(true); m_param2Spin->setVisible(true);
+        m_param3Label->setVisible(true); m_param3Spin->setVisible(true);
+        break;
     default:
         break; // Grayscale, Invert: no params
     }
@@ -354,7 +390,10 @@ void VideoEffectDialog::onParamChanged()
     m_effects[row].enabled = m_enabledCheck->isChecked();
     m_effects[row].param1 = m_param1Spin->value();
     m_effects[row].param2 = m_param2Spin->value();
-    m_effects[row].param3 = m_param3Spin->value();
+    if (m_mapSourceCombo->isVisible())
+        m_effects[row].param3 = m_mapSourceCombo->currentIndex();
+    else
+        m_effects[row].param3 = m_param3Spin->value();
     refreshList();
     m_effectList->setCurrentRow(row);
     emit effectsChanged(m_effects);

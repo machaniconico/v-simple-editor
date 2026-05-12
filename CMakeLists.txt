@@ -53,6 +53,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/Overlay.cpp
     src/OverlayDialogs.cpp
     src/VideoEffect.cpp
+    src/FractalNoise.h
+    src/FractalNoise.cpp
     src/EffectParamSchema.h
     src/EffectParamSchema.cpp
     src/VideoEffectDialogs.cpp
@@ -151,7 +153,11 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/TransformAnimator.cpp
     src/MaskSystem.cpp
     src/ParticleSystem.cpp
+    src/ParticleEffectDialog.h
+    src/ParticleEffectDialog.cpp
     src/TextAnimator.cpp
+    src/VfxControlsPanel.h
+    src/VfxControlsPanel.cpp
     src/VariableFontAxis.h
     src/VariableFontAxis.cpp
     src/TextAnimPresets.h

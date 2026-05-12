@@ -18,6 +18,64 @@ static double degToRad(double deg)
     return deg * M_PI / 180.0;
 }
 
+// --- Deterministic Value Noise (hash-based lattice) ---
+
+static int hashInt(int x, int y)
+{
+    int h = (x * 374761393 + y * 668265263 + 1013904223);
+    h = (h ^ (h >> 13)) * 1274126177;
+    h = h ^ (h >> 16);
+    return h & 0x7FFFFFFF;
+}
+
+static double smoothstep(double t)
+{
+    return t * t * (3.0 - 2.0 * t);
+}
+
+static double lerp(double a, double b, double t)
+{
+    return a + (b - a) * t;
+}
+
+namespace {
+
+double valueNoise2D(double x, double y)
+{
+    int ix = static_cast<int>(std::floor(x));
+    int iy = static_cast<int>(std::floor(y));
+    double fx = x - static_cast<double>(ix);
+    double fy = y - static_cast<double>(iy);
+    double sx = smoothstep(fx);
+    double sy = smoothstep(fy);
+
+    double n00 = (hashInt(ix, iy) & 0xFFFF) / 65535.0 * 2.0 - 1.0;
+    double n10 = (hashInt(ix + 1, iy) & 0xFFFF) / 65535.0 * 2.0 - 1.0;
+    double n01 = (hashInt(ix, iy + 1) & 0xFFFF) / 65535.0 * 2.0 - 1.0;
+    double n11 = (hashInt(ix + 1, iy + 1) & 0xFFFF) / 65535.0 * 2.0 - 1.0;
+
+    double nx0 = lerp(n00, n10, sx);
+    double nx1 = lerp(n01, n11, sx);
+    return lerp(nx0, nx1, sy);
+}
+
+double fbm3D(double x, double y, double t)
+{
+    double val = 0.0;
+    double amp = 1.0;
+    double freq = 1.0;
+    double maxVal = 0.0;
+    for (int i = 0; i < 3; ++i) {
+        val += valueNoise2D(x * freq + t * 0.7, y * freq + t * 0.3) * amp;
+        maxVal += amp;
+        amp *= 0.5;
+        freq *= 2.0;
+    }
+    return val / maxVal;
+}
+
+} // anonymous namespace
+
 // --- ParticleSystem ---
 
 ParticleSystem::ParticleSystem() = default;
@@ -31,25 +89,55 @@ void ParticleSystem::reset()
 {
     m_particles.clear();
     m_emitAccumulator = 0.0;
+    m_simTime = 0.0;
 }
 
 // --- Simulation ---
 
-void ParticleSystem::update(double deltaTime)
+void ParticleSystem::stepParticles(double deltaTime, const QSize &canvasSize)
 {
-    if (deltaTime <= 0.0) return;
+    double cw = canvasSize.width() > 1 ? static_cast<double>(canvasSize.width()) : 1920.0;
+    double ch = canvasSize.height() > 1 ? static_cast<double>(canvasSize.height()) : 1080.0;
 
-    // Update existing particles
+    bool hasForceFields = !m_config.forceFields.isEmpty();
+    bool hasTurbulence = m_config.turbulenceAmount > 0.0;
+    bool hasCollision = m_config.collisionFloor;
+    double floorPixelY = m_config.floorY * ch;
+
     for (int i = m_particles.size() - 1; i >= 0; --i) {
         Particle &p = m_particles[i];
 
-        // Apply forces
-        p.velocity += p.acceleration * deltaTime;
-        p.velocity += m_config.gravity * deltaTime;
-        p.velocity += m_config.wind * deltaTime;
+        // Base acceleration: per-particle + gravity + wind
+        QPointF accel = p.acceleration + m_config.gravity + m_config.wind;
 
-        // Integrate position
+        // Force fields
+        if (hasForceFields) {
+            double nx = p.position.x() / cw;
+            double ny = p.position.y() / ch;
+            accel += evaluateForceFields(QPointF(nx, ny), canvasSize);
+        }
+
+        // Turbulence
+        if (hasTurbulence) {
+            double scale = m_config.turbulenceScale;
+            double tx = p.position.x() / cw * scale;
+            double ty = p.position.y() / ch * scale;
+            double turbX = fbm3D(tx, ty, m_simTime * m_config.turbulenceSpeed);
+            double turbY = fbm3D(tx + 100.0, ty + 100.0, m_simTime * m_config.turbulenceSpeed + 50.0);
+            accel += QPointF(turbX * m_config.turbulenceAmount,
+                             turbY * m_config.turbulenceAmount);
+        }
+
+        // Integrate
+        p.velocity += accel * deltaTime;
         p.position += p.velocity * deltaTime;
+
+        // Floor collision
+        if (hasCollision && p.position.y() >= floorPixelY) {
+            p.position.setY(floorPixelY);
+            p.velocity.setY(-p.velocity.y() * m_config.restitution);
+            p.velocity.setX(p.velocity.x() * (1.0 - m_config.floorFriction));
+        }
 
         // Rotation
         p.rotation += p.rotationSpeed * deltaTime;
@@ -62,6 +150,16 @@ void ParticleSystem::update(double deltaTime)
             m_particles.removeAt(i);
         }
     }
+}
+
+void ParticleSystem::update(double deltaTime)
+{
+    if (deltaTime <= 0.0) return;
+
+    m_simTime += deltaTime;
+
+    // Update existing particles
+    stepParticles(deltaTime, QSize(1, 1));
 
     // Spawn new particles
     m_emitAccumulator += m_config.emitRate * deltaTime;
@@ -120,6 +218,53 @@ void ParticleSystem::spawnParticle(const QSize &canvasSize)
     p.opacity = 1.0;
 
     m_particles.append(p);
+}
+
+// --- Force field evaluation ---
+
+QPointF ParticleSystem::evaluateForceFields(const QPointF &normPos, const QSize &canvasSize) const
+{
+    QPointF accel(0.0, 0.0);
+    double cw = canvasSize.width() > 1 ? static_cast<double>(canvasSize.width()) : 1920.0;
+    double ch = canvasSize.height() > 1 ? static_cast<double>(canvasSize.height()) : 1080.0;
+
+    for (const ForceField &ff : m_config.forceFields) {
+        double dx = normPos.x() - ff.position.x();
+        double dy = normPos.y() - ff.position.y();
+        double dist = std::sqrt(dx * dx + dy * dy);
+
+        if (ff.kind == ForceField::Wind) {
+            // Wind: uniform directional push; position is direction vector offset from center
+            double wx = ff.position.x() - 0.5;
+            double wy = ff.position.y() - 0.5;
+            double mag = std::sqrt(wx * wx + wy * wy);
+            if (mag > 1e-6) {
+                accel += QPointF(wx / mag * ff.strength, wy / mag * ff.strength);
+            }
+            continue;
+        }
+
+        // For PointAttract, PointRepel, Vortex: check radius influence
+        if (dist < 1e-6 || dist > ff.radius) continue;
+
+        double influence = ff.strength * (1.0 - dist / ff.radius);
+        double nx = dx / dist;
+        double ny = dy / dist;
+
+        if (ff.kind == ForceField::PointAttract) {
+            accel += QPointF(nx * influence, ny * influence);
+        } else if (ff.kind == ForceField::PointRepel) {
+            accel += QPointF(-nx * influence, -ny * influence);
+        } else if (ff.kind == ForceField::Vortex) {
+            // Tangential (perpendicular) acceleration: rotate (nx, ny) by 90 degrees
+            double tx = -ny;
+            double ty = nx;
+            accel += QPointF(tx * influence, ty * influence);
+        }
+    }
+
+    // Convert from normalized to pixel-space acceleration
+    return QPointF(accel.x() * cw, accel.y() * ch);
 }
 
 // --- Per-particle helpers ---
@@ -257,24 +402,14 @@ QVector<QImage> ParticleSystem::renderParticleSequence(const QSize &canvasSize,
         double preWarmTime = 0.0;
         while (preWarmTime < startTime) {
             double step = qMin(preWarmStep, startTime - preWarmTime);
+            m_simTime += step;
             // Temporarily set canvas size for spawn positions
             m_emitAccumulator += m_config.emitRate * step;
             int toSpawn = static_cast<int>(m_emitAccumulator);
             m_emitAccumulator -= toSpawn;
             for (int i = 0; i < toSpawn && m_particles.size() < m_config.maxParticles; ++i)
                 spawnParticle(canvasSize);
-            // Update physics without spawning again
-            for (int i = m_particles.size() - 1; i >= 0; --i) {
-                Particle &p = m_particles[i];
-                p.velocity += p.acceleration * step;
-                p.velocity += m_config.gravity * step;
-                p.velocity += m_config.wind * step;
-                p.position += p.velocity * step;
-                p.rotation += p.rotationSpeed * step;
-                p.life -= step;
-                if (p.life <= 0.0)
-                    m_particles.removeAt(i);
-            }
+            stepParticles(step, canvasSize);
             preWarmTime += step;
         }
     }
@@ -283,6 +418,8 @@ QVector<QImage> ParticleSystem::renderParticleSequence(const QSize &canvasSize,
     for (int f = 0; f < frameCount; ++f) {
         double currentTime = startTime + f * dt;
 
+        m_simTime += dt;
+
         // Spawn new particles for this step
         m_emitAccumulator += m_config.emitRate * dt;
         int toSpawn = static_cast<int>(m_emitAccumulator);
@@ -290,18 +427,7 @@ QVector<QImage> ParticleSystem::renderParticleSequence(const QSize &canvasSize,
         for (int i = 0; i < toSpawn && m_particles.size() < m_config.maxParticles; ++i)
             spawnParticle(canvasSize);
 
-        // Update physics
-        for (int i = m_particles.size() - 1; i >= 0; --i) {
-            Particle &p = m_particles[i];
-            p.velocity += p.acceleration * dt;
-            p.velocity += m_config.gravity * dt;
-            p.velocity += m_config.wind * dt;
-            p.position += p.velocity * dt;
-            p.rotation += p.rotationSpeed * dt;
-            p.life -= dt;
-            if (p.life <= 0.0)
-                m_particles.removeAt(i);
-        }
+        stepParticles(dt, canvasSize);
 
         frames.append(renderFrame(canvasSize, currentTime));
     }
@@ -502,6 +628,120 @@ QMap<QString, ParticleEmitterConfig> ParticleSystem::presetConfigs()
         c.sizeStartMult = 0.8;
         c.sizeEndMult = 1.2;
         presets["Dust"] = c;
+    }
+
+    // Fireworks Burst — radial spawn + gravity + Vortex force field + fade
+    {
+        ParticleEmitterConfig c;
+        c.type = ParticleType::Spark;
+        c.emitRate = 200.0;
+        c.maxParticles = 600;
+        c.emitPosition = QPointF(0.5, 0.5);
+        c.emitAreaSize = QSizeF(0.0, 0.0);  // point source
+        c.lifeMin = 1.5;
+        c.lifeMax = 3.0;
+        c.sizeMin = 2.0;
+        c.sizeMax = 6.0;
+        c.speedMin = 100.0;
+        c.speedMax = 300.0;
+        c.direction = 0.0;
+        c.spread = 360.0;    // full radial burst
+        c.gravity = QPointF(0.0, 80.0);
+        c.wind = QPointF(0.0, 0.0);
+        c.startColor = QColor(255, 220, 100);
+        c.endColor = QColor(255, 80, 30);
+        c.fadeIn = 0.0;
+        c.fadeOut = 0.5;
+        c.sizeStartMult = 1.0;
+        c.sizeEndMult = 0.2;
+
+        ForceField vortex;
+        vortex.kind = ForceField::Vortex;
+        vortex.position = QPointF(0.5, 0.4);
+        vortex.strength = 300.0;
+        vortex.radius = 0.5;
+        c.forceFields.append(vortex);
+
+        presets["Fireworks Burst"] = c;
+    }
+
+    // Magic Swirl — Vortex + turbulence, additive-feel colors
+    {
+        ParticleEmitterConfig c;
+        c.type = ParticleType::Star;
+        c.emitRate = 30.0;
+        c.maxParticles = 300;
+        c.emitPosition = QPointF(0.5, 0.5);
+        c.emitAreaSize = QSizeF(0.1, 0.1);
+        c.lifeMin = 3.0;
+        c.lifeMax = 6.0;
+        c.sizeMin = 3.0;
+        c.sizeMax = 8.0;
+        c.speedMin = 20.0;
+        c.speedMax = 60.0;
+        c.direction = 0.0;
+        c.spread = 360.0;
+        c.gravity = QPointF(0.0, 0.0);
+        c.wind = QPointF(0.0, 0.0);
+        c.startColor = QColor(180, 100, 255, 200);
+        c.endColor = QColor(100, 200, 255, 80);
+        c.fadeIn = 0.1;
+        c.fadeOut = 0.3;
+        c.sizeStartMult = 1.0;
+        c.sizeEndMult = 0.5;
+
+        ForceField vortex;
+        vortex.kind = ForceField::Vortex;
+        vortex.position = QPointF(0.5, 0.5);
+        vortex.strength = 200.0;
+        vortex.radius = 0.6;
+        c.forceFields.append(vortex);
+
+        ForceField attract;
+        attract.kind = ForceField::PointAttract;
+        attract.position = QPointF(0.5, 0.5);
+        attract.strength = 50.0;
+        attract.radius = 0.5;
+        c.forceFields.append(attract);
+
+        c.turbulenceAmount = 80.0;
+        c.turbulenceScale = 4.0;
+        c.turbulenceSpeed = 1.5;
+
+        presets["Magic Swirl"] = c;
+    }
+
+    // Bouncing Confetti — gravity + collisionFloor with restitution
+    {
+        ParticleEmitterConfig c;
+        c.type = ParticleType::Confetti;
+        c.emitRate = 40.0;
+        c.maxParticles = 400;
+        c.emitPosition = QPointF(0.5, 0.0);
+        c.emitAreaSize = QSizeF(0.6, 0.0);
+        c.lifeMin = 4.0;
+        c.lifeMax = 8.0;
+        c.sizeMin = 4.0;
+        c.sizeMax = 8.0;
+        c.speedMin = 30.0;
+        c.speedMax = 80.0;
+        c.direction = 90.0;   // downward
+        c.spread = 45.0;
+        c.gravity = QPointF(0.0, 200.0);
+        c.wind = QPointF(20.0, 0.0);
+        c.startColor = Qt::white;
+        c.endColor = Qt::white;
+        c.fadeIn = 0.0;
+        c.fadeOut = 0.15;
+        c.sizeStartMult = 1.0;
+        c.sizeEndMult = 1.0;
+
+        c.collisionFloor = true;
+        c.floorY = 0.95;
+        c.restitution = 0.5;
+        c.floorFriction = 0.1;
+
+        presets["Bouncing Confetti"] = c;
     }
 
     return presets;

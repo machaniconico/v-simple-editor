@@ -40,6 +40,21 @@ struct Particle {
     double opacity = 1.0;
 };
 
+// --- Force Field ---
+
+struct ForceField {
+    enum Kind {
+        PointAttract,
+        PointRepel,
+        Vortex,
+        Wind
+    };
+    Kind kind = PointAttract;
+    QPointF position = QPointF(0.5, 0.5);  // normalized (0-1)
+    double strength = 100.0;               // px/s^2 at radius=0
+    double radius = 0.4;                   // normalized falloff radius
+};
+
 // --- Emitter Configuration ---
 
 struct ParticleEmitterConfig {
@@ -68,6 +83,20 @@ struct ParticleEmitterConfig {
     // Forces
     QPointF gravity = QPointF(0.0, 0.0);   // pixels/sec^2
     QPointF wind = QPointF(0.0, 0.0);      // pixels/sec^2
+
+    // Force fields
+    QVector<ForceField> forceFields;
+
+    // Collision
+    bool collisionFloor = false;
+    double floorY = 1.0;           // normalized; particles bounce when position.y >= floorY*canvasH
+    double restitution = 0.5;      // 0..1 velocity retained on bounce
+    double floorFriction = 0.1;    // tangential damping on bounce
+
+    // Turbulence
+    double turbulenceAmount = 0.0; // px/s^2
+    double turbulenceScale = 3.0;  // spatial frequency
+    double turbulenceSpeed = 1.0;  // temporal evolution rate
 
     // Color
     QColor startColor = Qt::white;
@@ -126,12 +155,21 @@ private:
     static QColor interpolateColor(const QColor &a, const QColor &b, double t);
     static double computeSize(const Particle &p, const ParticleEmitterConfig &cfg);
 
+    // --- Force field evaluation ---
+
+    QPointF evaluateForceFields(const QPointF &normPos, const QSize &canvasSize) const;
+
     // --- Render helpers ---
 
     void renderParticle(QPainter &painter, const Particle &p,
                         const ParticleEmitterConfig &cfg) const;
 
+    // --- Internal physics step (shared by update and renderParticleSequence) ---
+
+    void stepParticles(double deltaTime, const QSize &canvasSize);
+
     ParticleEmitterConfig m_config;
     QVector<Particle> m_particles;
     double m_emitAccumulator = 0.0;  // fractional particle accumulation
+    double m_simTime = 0.0;          // accumulated simulation time for turbulence
 };
