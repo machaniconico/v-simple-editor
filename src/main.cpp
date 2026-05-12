@@ -12,6 +12,7 @@
 #include <QTimer>
 #include <QMetaObject>
 #include <QTemporaryDir>
+#include <QPainter>
 #include <cmath>
 
 #ifdef Q_OS_WIN
@@ -24,7 +25,13 @@
 #include "FractalNoise.h"
 #include "ParticleSystem.h"
 #include "ProjectFile.h"
+#include "MaskSystem.h"
+#include "OpticalFlow.h"
+#include "RotoAutoTrace.h"
+#include "RotoTracking.h"
+#include "Rotoscope.h"
 #include "SplashScreen.h"
+#include "TimeRemap.h"
 
 #if defined(VEDITOR_BRUSH_SELFTEST)
 #include "BrushAnimation.h"
@@ -151,7 +158,7 @@ bool requireSelftest(bool condition, const QString &message, QString *error)
         return true;
     if (error)
         *error = message;
-    qCritical() << "VFX selftest failed:" << message;
+    qCritical() << "selftest failed:" << message;
     return false;
 }
 
@@ -309,6 +316,290 @@ int runVfxSelftest()
     }
 
     qInfo().noquote() << QStringLiteral("VFX selftest OK");
+    return 0;
+}
+
+RotoPath makeRectRotoPath(const QRectF &rect)
+{
+    RotoPath path;
+    path.closed = true;
+    const QVector<QPointF> points = {
+        rect.topLeft(),
+        QPointF(rect.right(), rect.top()),
+        rect.bottomRight(),
+        QPointF(rect.left(), rect.bottom())
+    };
+    for (const QPointF &pos : points) {
+        RotoPoint point;
+        point.position = pos;
+        point.handleIn = pos;
+        point.handleOut = pos;
+        path.points.append(point);
+    }
+    return path;
+}
+
+bool masksEqual(const QImage &a, const QImage &b)
+{
+    if (a.size() != b.size())
+        return false;
+    const QImage lhs = a.convertToFormat(QImage::Format_Grayscale8);
+    const QImage rhs = b.convertToFormat(QImage::Format_Grayscale8);
+    for (int y = 0; y < lhs.height(); ++y) {
+        const uchar *lhsLine = lhs.constScanLine(y);
+        const uchar *rhsLine = rhs.constScanLine(y);
+        for (int x = 0; x < lhs.width(); ++x) {
+            if (lhsLine[x] != rhsLine[x])
+                return false;
+        }
+    }
+    return true;
+}
+
+int runProSelftest()
+{
+    QString error;
+    auto countBrightPixels = [](const QImage &image, int threshold) {
+        if (image.isNull())
+            return 0;
+        int count = 0;
+        for (int y = 0; y < image.height(); ++y) {
+            for (int x = 0; x < image.width(); ++x) {
+                if (qGray(image.pixel(x, y)) >= threshold)
+                    ++count;
+            }
+        }
+        return count;
+    };
+
+    QImage flowA(64, 64, QImage::Format_ARGB32);
+    flowA.fill(Qt::black);
+    {
+        QPainter painter(&flowA);
+        painter.fillRect(QRect(16, 16, 18, 18), Qt::white);
+    }
+    QImage flowB(64, 64, QImage::Format_ARGB32);
+    flowB.fill(Qt::black);
+    {
+        QPainter painter(&flowB);
+        painter.fillRect(QRect(20, 18, 18, 18), Qt::white);
+    }
+
+    const opticalflow::FlowField flow = opticalflow::estimateFlow(flowA, flowB);
+    if (!requireSelftest(flow.width == 64 && flow.height == 64 && flow.v.size() == 64 * 64,
+                         QStringLiteral("optical flow field invalid"), &error)) {
+        return 1;
+    }
+    const QPointF centerFlow = flow.at(24, 24);
+    if (!requireSelftest(centerFlow.x() > 1.0 && centerFlow.y() > 0.5,
+                         QStringLiteral("optical flow shift estimate too small"), &error)) {
+        return 1;
+    }
+    const QImage warped = opticalflow::warpImage(flowA, flow, 1.0);
+    if (!requireSelftest(!warped.isNull() && warped.size() == flowA.size(),
+                         QStringLiteral("warpImage returned invalid image"), &error)
+        || !requireSelftest(qGray(warped.pixel(24, 24)) > 32,
+                            QStringLiteral("warpImage lost tracked content"), &error)) {
+        return 1;
+    }
+
+    QImage traceFrame(128, 128, QImage::Format_ARGB32);
+    traceFrame.fill(Qt::black);
+    {
+        QPainter painter(&traceFrame);
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(Qt::white);
+        painter.drawEllipse(QRectF(28.0, 28.0, 72.0, 56.0));
+    }
+    const RotoPath tracedPath = rototrace::autoTraceContour(traceFrame, QRectF(20.0, 20.0, 88.0, 72.0));
+    if (!requireSelftest(!tracedPath.points.isEmpty() && tracedPath.closed,
+                         QStringLiteral("autoTraceContour returned empty path"), &error)) {
+        return 1;
+    }
+
+    QVector<QImage> trackFrames;
+    for (int i = 0; i < 3; ++i) {
+        QImage frame(96, 96, QImage::Format_ARGB32);
+        frame.fill(Qt::black);
+        QPainter painter(&frame);
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(Qt::white);
+        painter.drawRect(QRectF(18.0 + i * 4.0, 28.0, 24.0, 24.0));
+        trackFrames.append(frame);
+    }
+    const RotoPath seedPath = makeRectRotoPath(QRectF(18.0, 28.0, 24.0, 24.0));
+    rototrack::RotoTrackParams trackParams;
+    trackParams.keyframeInterval = 1;
+    const QVector<RotoKeyframe> propagated = rototrack::propagateRotoShape(seedPath, 0, trackFrames, 0, trackParams);
+    if (!requireSelftest(propagated.size() >= 3 && propagated.last().frameNumber == 2,
+                         QStringLiteral("propagateRotoShape produced insufficient keyframes"), &error)
+        || !requireSelftest(propagated.last().path.points.first().position.x()
+                                >= seedPath.points.first().position.x(),
+                            QStringLiteral("propagateRotoShape failed to move path forward"), &error)) {
+        return 1;
+    }
+
+    QImage matteAlphaSource(32, 32, QImage::Format_ARGB32);
+    matteAlphaSource.fill(Qt::transparent);
+    {
+        QPainter painter(&matteAlphaSource);
+        painter.fillRect(QRect(0, 0, 16, 32), QColor(255, 255, 255, 255));
+    }
+    QImage matteLumaSource(32, 32, QImage::Format_ARGB32);
+    matteLumaSource.fill(QColor(0, 0, 0, 255));
+    {
+        QPainter painter(&matteLumaSource);
+        painter.fillRect(QRect(0, 0, 16, 32), QColor(255, 255, 255, 255));
+    }
+    QImage matteClip(32, 32, QImage::Format_ARGB32);
+    matteClip.fill(QColor(255, 0, 0, 255));
+    const QImage alphaMatte = MaskSystem::applyTrackMatte(matteClip, matteAlphaSource, TrackMatteType::AlphaMatte);
+    const QImage alphaInverted = MaskSystem::applyTrackMatte(matteClip, matteAlphaSource, TrackMatteType::AlphaInvertedMatte);
+    const QImage lumaMatte = MaskSystem::applyTrackMatte(matteClip, matteLumaSource, TrackMatteType::LumaMatte);
+    const QImage lumaInverted = MaskSystem::applyTrackMatte(matteClip, matteLumaSource, TrackMatteType::LumaInvertedMatte);
+    if (!requireSelftest(!alphaMatte.isNull() && !alphaInverted.isNull()
+                             && !lumaMatte.isNull() && !lumaInverted.isNull(),
+                         QStringLiteral("applyTrackMatte returned null"), &error)
+        || !requireSelftest(qAlpha(alphaMatte.pixel(8, 8)) > qAlpha(alphaMatte.pixel(24, 8)),
+                            QStringLiteral("alpha matte result invalid"), &error)
+        || !requireSelftest(qAlpha(alphaInverted.pixel(8, 8)) < qAlpha(alphaInverted.pixel(24, 8)),
+                            QStringLiteral("alpha inverted matte result invalid"), &error)
+        || !requireSelftest(qAlpha(lumaMatte.pixel(8, 8)) > qAlpha(lumaMatte.pixel(24, 8)),
+                            QStringLiteral("luma matte result invalid"), &error)
+        || !requireSelftest(qAlpha(lumaInverted.pixel(8, 8)) < qAlpha(lumaInverted.pixel(24, 8)),
+                            QStringLiteral("luma inverted matte result invalid"), &error)) {
+        return 1;
+    }
+
+    timeremap::TimeRemapCurve nearestCurve;
+    nearestCurve.sourceFps = 1.0;
+    nearestCurve.addKey(0.0, 0.0);
+    nearestCurve.addKey(2.0, 2.0);
+    QVector<QImage> solidFrames;
+    for (const QColor &color : {QColor(255, 0, 0), QColor(0, 255, 0), QColor(0, 0, 255)}) {
+        QImage frame(12, 12, QImage::Format_ARGB32);
+        frame.fill(color);
+        solidFrames.append(frame);
+    }
+    const auto solidFetch = [solidFrames](int index) -> QImage {
+        if (index < 0 || index >= solidFrames.size())
+            return {};
+        return solidFrames[index];
+    };
+
+    nearestCurve.blendMode = timeremap::FrameBlendMode::NearestFrame;
+    const QImage nearest = timeremap::resolveFrame(nearestCurve, 0.1, solidFetch);
+    nearestCurve.blendMode = timeremap::FrameBlendMode::Blend;
+    const QImage blended = timeremap::resolveFrame(nearestCurve, 0.5, solidFetch);
+
+    timeremap::TimeRemapCurve flowCurve;
+    flowCurve.sourceFps = 1.0;
+    flowCurve.addKey(0.0, 0.0);
+    flowCurve.addKey(1.0, 1.0);
+    flowCurve.blendMode = timeremap::FrameBlendMode::OpticalFlow;
+    const auto motionFetch = [trackFrames](int index) -> QImage {
+        if (index < 0 || index >= trackFrames.size())
+            return {};
+        return trackFrames[index];
+    };
+    const QImage flowRemapped = timeremap::resolveFrame(flowCurve, 0.5, motionFetch);
+    if (!requireSelftest(!nearest.isNull() && !blended.isNull() && !flowRemapped.isNull(),
+                         QStringLiteral("resolveFrame returned null"), &error)
+        || !requireSelftest(qRed(nearest.pixel(2, 2)) > 200,
+                            QStringLiteral("nearest-frame remap incorrect"), &error)
+        || !requireSelftest(qRed(blended.pixel(2, 2)) > 32 && qGreen(blended.pixel(2, 2)) > 32,
+                            QStringLiteral("blend remap did not mix frames"), &error)
+        || !requireSelftest(countBrightPixels(flowRemapped, 64) > 64,
+                            QStringLiteral("optical-flow remap lost foreground"), &error)) {
+        return 1;
+    }
+
+    ProjectData saveData;
+    saveData.config.name = QStringLiteral("PRO Selftest");
+    saveData.config.width = 640;
+    saveData.config.height = 360;
+    saveData.config.fps = 30;
+    ClipInfo clip;
+    clip.filePath = QStringLiteral("synthetic-pro.mp4");
+    clip.displayName = QStringLiteral("synthetic-pro.mp4");
+    clip.duration = 3.0;
+    saveData.videoTracks = QVector<QVector<ClipInfo>>{QVector<ClipInfo>{clip}, QVector<ClipInfo>{clip}};
+    saveData.audioTracks = QVector<QVector<ClipInfo>>{QVector<ClipInfo>{}};
+
+    RotoClipEntry rotoEntry;
+    rotoEntry.clipId = QStringLiteral("0:0");
+    rotoEntry.path = tracedPath;
+    rotoEntry.keyframes = propagated;
+    rotoEntry.brushMask = QImage(4, 4, QImage::Format_Grayscale8);
+    rotoEntry.brushMask.fill(0);
+    rotoEntry.brushMask.scanLine(0)[0] = 255;
+    rotoEntry.brushMask.scanLine(1)[1] = 192;
+    saveData.rotoClipEntries.append(rotoEntry);
+
+    TimeRemapClipEntry remapEntry;
+    remapEntry.clipId = QStringLiteral("0:0");
+    remapEntry.curve = nearestCurve;
+    saveData.timeRemapClipEntries.append(remapEntry);
+
+    TrackMatteClipEntry matteEntry;
+    matteEntry.clipId = QStringLiteral("0:0");
+    matteEntry.matteType = TrackMatteType::LumaMatte;
+    matteEntry.matteSourceClipId = QStringLiteral("1:0");
+    saveData.trackMatteClipEntries.append(matteEntry);
+
+    ProjectData roundTrip;
+    if (!requireSelftest(ProjectFile::fromJsonString(ProjectFile::toJsonString(saveData), roundTrip),
+                         QStringLiteral("project string round-trip failed"), &error)
+        || !requireSelftest(roundTrip.rotoClipEntries.size() == 1
+                                && roundTrip.timeRemapClipEntries.size() == 1
+                                && roundTrip.trackMatteClipEntries.size() == 1,
+                            QStringLiteral("project clip sidecar counts mismatch"), &error)
+        || !requireSelftest(roundTrip.rotoClipEntries.first().clipId == rotoEntry.clipId
+                                && roundTrip.rotoClipEntries.first().keyframes.size() == propagated.size(),
+                            QStringLiteral("roto clip entry round-trip failed"), &error)
+        || !requireSelftest(masksEqual(roundTrip.rotoClipEntries.first().brushMask, rotoEntry.brushMask),
+                            QStringLiteral("roto brush mask round-trip failed"), &error)
+        || !requireSelftest(roundTrip.timeRemapClipEntries.first().curve.keys.size()
+                                == remapEntry.curve.keys.size()
+                                && roundTrip.timeRemapClipEntries.first().curve.blendMode
+                                       == remapEntry.curve.blendMode,
+                            QStringLiteral("time remap curve round-trip failed"), &error)
+        || !requireSelftest(roundTrip.trackMatteClipEntries.first().matteType == matteEntry.matteType
+                                && roundTrip.trackMatteClipEntries.first().matteSourceClipId == matteEntry.matteSourceClipId,
+                            QStringLiteral("track matte round-trip failed"), &error)) {
+        return 1;
+    }
+
+    ProjectData legacyData;
+    const QString legacyJson = QStringLiteral(
+        "{\"version\":1,\"config\":{\"name\":\"legacy-pro\",\"width\":1920,\"height\":1080,\"fps\":30},"
+        "\"videoTracks\":[[{\"filePath\":\"legacy.mp4\",\"displayName\":\"legacy.mp4\",\"duration\":1.0,"
+        "\"inPoint\":0.0,\"outPoint\":1.0,\"speed\":1.0,\"volume\":1.0}]],"
+        "\"audioTracks\":[[]],\"playheadPos\":0.0,\"markIn\":-1.0,\"markOut\":-1.0,\"zoomLevel\":10}");
+    if (!requireSelftest(ProjectFile::fromJsonString(legacyJson, legacyData),
+                         QStringLiteral("legacy PRO project load failed"), &error)
+        || !requireSelftest(legacyData.rotoClipEntries.isEmpty()
+                                && legacyData.timeRemapClipEntries.isEmpty()
+                                && legacyData.trackMatteClipEntries.isEmpty(),
+                            QStringLiteral("legacy PRO project should default new fields"), &error)) {
+        return 1;
+    }
+
+    QTemporaryDir tempDir;
+    if (!requireSelftest(tempDir.isValid(), QStringLiteral("PRO selftest temp dir invalid"), &error))
+        return 1;
+    const QString projectPath = tempDir.path() + QStringLiteral("/pro_selftest.veditor");
+    ProjectData fileLoaded;
+    if (!requireSelftest(ProjectFile::save(projectPath, saveData), QStringLiteral("PRO project save failed"), &error)
+        || !requireSelftest(ProjectFile::load(projectPath, fileLoaded), QStringLiteral("PRO project load failed"), &error)
+        || !requireSelftest(fileLoaded.rotoClipEntries.size() == 1
+                                && fileLoaded.timeRemapClipEntries.size() == 1
+                                && fileLoaded.trackMatteClipEntries.size() == 1,
+                            QStringLiteral("saved PRO project reload mismatch"), &error)) {
+        return 1;
+    }
+
+    qInfo().noquote() << QStringLiteral("PRO selftest OK");
     return 0;
 }
 
@@ -492,6 +783,10 @@ int main(int argc, char *argv[])
     if (qEnvironmentVariableIntValue("VEDITOR_VFX_SELFTEST") != 0) {
         writeLogLine("INFO", "running VEDITOR_VFX_SELFTEST");
         return runVfxSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_PRO_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_PRO_SELFTEST");
+        return runProSelftest();
     }
 
     // スプラッシュ画面

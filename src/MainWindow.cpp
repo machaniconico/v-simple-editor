@@ -57,6 +57,7 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QDir>
+#include <algorithm>
 #include <cmath>
 #include <array>
 #include "AudioMeterWidget.h"
@@ -88,16 +89,34 @@
 #include <QFormLayout>
 #include <QLabel>
 #include <QStandardItemModel>
+#include <QSet>
 #include <QTemporaryDir>
 #include <QProcess>
+#include <numeric>
 #include "NodeGraph.h"
 #include "NodeEvaluator.h"
 #include "NodeLibrary.h"
 #include "NodeCanvasWidget.h"
 #include "NodePropertiesPanel.h"
 #include "LayerNodeBridge.h"
+#include "RotoToolsDialog.h"
+#include "TimeRemapDialog.h"
+#include <QPainter>
+
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libswscale/swscale.h>
+}
 
 namespace {
+
+struct VideoSourceInfo {
+    double fps = 30.0;
+    int frameCount = 0;
+    double durationSeconds = 0.0;
+    QSize frameSize;
+};
 
 QString findFfmpegBinary()
 {
@@ -162,6 +181,236 @@ void setVfxPanelState(VfxControlsPanel *panel, const ProjectVfxState &state)
     applySection(findVfxGroup(panel, QStringLiteral("Light Wrap")),
                  state.lightWrap.enabled,
                  {state.lightWrap.amount, state.lightWrap.radius});
+}
+
+double clipSourceOutPoint(const ClipInfo &clip)
+{
+    return (clip.outPoint > 0.0) ? clip.outPoint : clip.duration;
+}
+
+double clipEffectiveSourceFps(const VideoSourceInfo &info, double fallback)
+{
+    return (info.fps > 0.0) ? info.fps : qMax(1.0, fallback);
+}
+
+QString trackMatteTypeLabel(TrackMatteType type)
+{
+    switch (type) {
+    case TrackMatteType::None:
+        return QStringLiteral("なし");
+    case TrackMatteType::AlphaMatte:
+        return QStringLiteral("Alpha Matte");
+    case TrackMatteType::AlphaInvertedMatte:
+        return QStringLiteral("Alpha Matte (反転)");
+    case TrackMatteType::LumaMatte:
+        return QStringLiteral("Luma Matte");
+    case TrackMatteType::LumaInvertedMatte:
+        return QStringLiteral("Luma Matte (反転)");
+    }
+    return QStringLiteral("なし");
+}
+
+bool openVideoDecoder(const QString &filePath,
+                      AVFormatContext **fmtCtx,
+                      AVCodecContext **decCtx,
+                      int *streamIndex)
+{
+    *fmtCtx = nullptr;
+    *decCtx = nullptr;
+    *streamIndex = -1;
+
+    if (avformat_open_input(fmtCtx, filePath.toUtf8().constData(), nullptr, nullptr) < 0)
+        return false;
+    if (avformat_find_stream_info(*fmtCtx, nullptr) < 0) {
+        avformat_close_input(fmtCtx);
+        return false;
+    }
+
+    for (unsigned i = 0; i < (*fmtCtx)->nb_streams; ++i) {
+        if ((*fmtCtx)->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            *streamIndex = static_cast<int>(i);
+            break;
+        }
+    }
+    if (*streamIndex < 0) {
+        avformat_close_input(fmtCtx);
+        return false;
+    }
+
+    const AVCodecParameters *codecpar = (*fmtCtx)->streams[*streamIndex]->codecpar;
+    const AVCodec *codec = avcodec_find_decoder(codecpar->codec_id);
+    if (!codec) {
+        avformat_close_input(fmtCtx);
+        return false;
+    }
+
+    *decCtx = avcodec_alloc_context3(codec);
+    if (!*decCtx) {
+        avformat_close_input(fmtCtx);
+        return false;
+    }
+    if (avcodec_parameters_to_context(*decCtx, codecpar) < 0
+        || avcodec_open2(*decCtx, codec, nullptr) < 0) {
+        avcodec_free_context(decCtx);
+        avformat_close_input(fmtCtx);
+        return false;
+    }
+    return true;
+}
+
+VideoSourceInfo probeVideoSourceInfo(const QString &filePath, double fallbackFps)
+{
+    VideoSourceInfo info;
+    info.fps = qMax(1.0, fallbackFps);
+
+    AVFormatContext *fmtCtx = nullptr;
+    AVCodecContext *decCtx = nullptr;
+    int streamIndex = -1;
+    if (!openVideoDecoder(filePath, &fmtCtx, &decCtx, &streamIndex))
+        return info;
+
+    if (streamIndex >= 0 && streamIndex < static_cast<int>(fmtCtx->nb_streams)) {
+        AVStream *stream = fmtCtx->streams[streamIndex];
+        const AVRational guessed = av_guess_frame_rate(fmtCtx, stream, nullptr);
+        if (guessed.num > 0 && guessed.den > 0)
+            info.fps = av_q2d(guessed);
+        if (stream->duration > 0)
+            info.durationSeconds = stream->duration * av_q2d(stream->time_base);
+    }
+    if (info.durationSeconds <= 0.0 && fmtCtx->duration > 0)
+        info.durationSeconds = static_cast<double>(fmtCtx->duration) / AV_TIME_BASE;
+    info.frameCount = (info.durationSeconds > 0.0 && info.fps > 0.0)
+        ? qMax(1, static_cast<int>(std::llround(info.durationSeconds * info.fps)))
+        : 0;
+    info.frameSize = QSize(decCtx ? decCtx->width : 0, decCtx ? decCtx->height : 0);
+
+    avcodec_free_context(&decCtx);
+    avformat_close_input(&fmtCtx);
+    return info;
+}
+
+QImage avFrameToQImage(const AVFrame *frame, AVCodecContext *decCtx)
+{
+    if (!frame || !decCtx)
+        return {};
+
+    SwsContext *toRgbCtx = sws_getContext(frame->width, frame->height, decCtx->pix_fmt,
+                                          frame->width, frame->height, AV_PIX_FMT_RGBA,
+                                          SWS_BILINEAR, nullptr, nullptr, nullptr);
+    if (!toRgbCtx)
+        return {};
+
+    QImage image(frame->width, frame->height, QImage::Format_RGBA8888);
+    uint8_t *dest[4] = { image.bits(), nullptr, nullptr, nullptr };
+    int linesize[4] = { static_cast<int>(image.bytesPerLine()), 0, 0, 0 };
+    sws_scale(toRgbCtx, frame->data, frame->linesize, 0, frame->height, dest, linesize);
+    sws_freeContext(toRgbCtx);
+    return image;
+}
+
+QImage decodeFrameAtSecondsFromFile(const QString &filePath, double sourceTimeSeconds)
+{
+    AVFormatContext *fmtCtx = nullptr;
+    AVCodecContext *decCtx = nullptr;
+    int streamIndex = -1;
+    if (!openVideoDecoder(filePath, &fmtCtx, &decCtx, &streamIndex))
+        return {};
+
+    AVStream *stream = fmtCtx->streams[streamIndex];
+    const double targetSeconds = qMax(0.0, sourceTimeSeconds);
+    const int64_t seekTarget = av_rescale_q(
+        static_cast<int64_t>(targetSeconds * AV_TIME_BASE),
+        AVRational{1, AV_TIME_BASE},
+        stream->time_base);
+    av_seek_frame(fmtCtx, streamIndex, seekTarget, AVSEEK_FLAG_BACKWARD);
+    avcodec_flush_buffers(decCtx);
+
+    AVPacket *packet = av_packet_alloc();
+    AVFrame *frame = av_frame_alloc();
+    QImage result;
+
+    while (av_read_frame(fmtCtx, packet) >= 0) {
+        if (packet->stream_index != streamIndex) {
+            av_packet_unref(packet);
+            continue;
+        }
+        if (avcodec_send_packet(decCtx, packet) < 0) {
+            av_packet_unref(packet);
+            continue;
+        }
+        av_packet_unref(packet);
+
+        while (avcodec_receive_frame(decCtx, frame) == 0) {
+            const int64_t pts = (frame->best_effort_timestamp != AV_NOPTS_VALUE)
+                ? frame->best_effort_timestamp
+                : frame->pts;
+            const double frameSeconds = (pts != AV_NOPTS_VALUE)
+                ? pts * av_q2d(stream->time_base)
+                : targetSeconds;
+            result = avFrameToQImage(frame, decCtx);
+            if (result.isNull() || frameSeconds + 1.0 / 120.0 < targetSeconds)
+                continue;
+            goto decode_done;
+        }
+    }
+
+decode_done:
+    av_frame_free(&frame);
+    av_packet_free(&packet);
+    avcodec_free_context(&decCtx);
+    avformat_close_input(&fmtCtx);
+    return result;
+}
+
+QImage combineMasksMax(const QImage &a, const QImage &b)
+{
+    if (a.isNull())
+        return b.convertToFormat(QImage::Format_Grayscale8);
+    if (b.isNull())
+        return a.convertToFormat(QImage::Format_Grayscale8);
+
+    QImage base = a.convertToFormat(QImage::Format_Grayscale8);
+    QImage overlay = b.convertToFormat(QImage::Format_Grayscale8);
+    if (overlay.size() != base.size()) {
+        overlay = overlay.scaled(base.size(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation)
+                         .convertToFormat(QImage::Format_Grayscale8);
+    }
+
+    for (int y = 0; y < base.height(); ++y) {
+        uchar *baseLine = base.scanLine(y);
+        const uchar *overlayLine = overlay.constScanLine(y);
+        for (int x = 0; x < base.width(); ++x)
+            baseLine[x] = std::max(baseLine[x], overlayLine[x]);
+    }
+    return base;
+}
+
+QImage renderCompositeImage(const QImage &source, const CompositeLayer &layer, const QSize &canvasSize)
+{
+    if (source.isNull() || !canvasSize.isValid())
+        return {};
+
+    QImage image = source.convertToFormat(QImage::Format_ARGB32);
+    if (image.size() != canvasSize) {
+        image = image.scaled(canvasSize, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+    }
+
+    QImage canvas(canvasSize, QImage::Format_ARGB32);
+    canvas.fill(Qt::transparent);
+
+    QPainter painter(&canvas);
+    painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
+
+    QTransform transform;
+    transform.translate(layer.position.x(), layer.position.y());
+    transform.translate(layer.anchorPoint.x(), layer.anchorPoint.y());
+    transform.rotate(layer.rotation);
+    transform.scale(layer.scale.x(), layer.scale.y());
+    transform.translate(-layer.anchorPoint.x(), -layer.anchorPoint.y());
+    painter.setTransform(transform);
+    painter.drawImage(0, 0, image);
+    painter.end();
+    return canvas;
 }
 
 } // namespace
@@ -244,6 +493,8 @@ MainWindow::MainWindow(QWidget *parent)
     // failure mode があったので削除。
     connect(m_timeline, &Timeline::clipSelectedOnTrack, this,
         [this](int trackIdx, int clipIdx) {
+            m_selectedVideoTrackIndex = trackIdx;
+            m_selectedVideoClipIndexTracked = clipIdx;
             if (m_player)
                 m_player->setEditTargetByClip(trackIdx, clipIdx);
             syncBrushAnimationPreviewForClip(trackIdx, clipIdx);
@@ -630,6 +881,11 @@ void MainWindow::setupUI()
         if (m_player && m_player->isPreviewMaximized()) {
             m_player->setPreviewMaximized(false);
         }
+    });
+    connect(m_player, &VideoPlayer::frameComposited, this, [this](const QImage &) {
+        if (!m_player || m_player->isPlaying())
+            return;
+        refreshSpecialClipPreview();
     });
 
     // Restore master loudness normalizer settings on startup.
@@ -1368,6 +1624,15 @@ void MainWindow::setupMenuBar()
     auto *warpAction = compMenu->addAction("ワープ / 歪みエフェクト...");
     connect(warpAction, &QAction::triggered, this, &MainWindow::applyWarpEffect);
 
+    auto *rotoToolsAction = compMenu->addAction(QStringLiteral("ロトツール..."));
+    connect(rotoToolsAction, &QAction::triggered, this, &MainWindow::openRotoToolsDialog);
+
+    auto *timeRemapAction = compMenu->addAction(QStringLiteral("タイムリマップ..."));
+    connect(timeRemapAction, &QAction::triggered, this, &MainWindow::openTimeRemapDialog);
+
+    auto *trackMatteAction = compMenu->addAction(QStringLiteral("トラックマット..."));
+    connect(trackMatteAction, &QAction::triggered, this, &MainWindow::configureTrackMatte);
+
     compMenu->addSeparator();
 
     auto *exprAction = compMenu->addAction("エクスプレッション...");
@@ -2024,6 +2289,291 @@ QString MainWindow::particleClipKey(const ClipInfo &clip)
     return clip.filePath;
 }
 
+bool MainWindow::selectedVideoClipRef(int &trackIdx, int &clipIdx, ClipInfo *clip) const
+{
+    trackIdx = m_selectedVideoTrackIndex;
+    clipIdx = m_selectedVideoClipIndexTracked;
+
+    if (m_timeline && trackIdx >= 0 && trackIdx < m_timeline->videoTracks().size()) {
+        const auto *track = m_timeline->videoTracks().value(trackIdx, nullptr);
+        if (track && clipIdx >= 0 && clipIdx < track->clips().size()) {
+            if (clip)
+                *clip = track->clips().at(clipIdx);
+            return true;
+        }
+    }
+
+    trackIdx = 0;
+    clipIdx = m_timeline ? m_timeline->selectedVideoClipIndex() : -1;
+    if (!m_timeline)
+        return false;
+    const auto &clips = m_timeline->videoClips();
+    if (clipIdx >= 0 && clipIdx < clips.size()) {
+        if (clip)
+            *clip = clips.at(clipIdx);
+        return true;
+    }
+    return false;
+}
+
+double MainWindow::clipTimelineStartSeconds(int trackIdx, int clipIdx) const
+{
+    if (!m_timeline || trackIdx < 0 || trackIdx >= m_timeline->videoTracks().size())
+        return 0.0;
+    const auto *track = m_timeline->videoTracks().value(trackIdx, nullptr);
+    if (!track || clipIdx < 0)
+        return 0.0;
+
+    double start = 0.0;
+    const auto &clips = track->clips();
+    for (int i = 0; i < clips.size() && i < clipIdx; ++i) {
+        start += qMax(0.0, clips[i].leadInSec);
+        start += clips[i].effectiveDuration();
+    }
+    if (clipIdx < clips.size())
+        start += qMax(0.0, clips[clipIdx].leadInSec);
+    return start;
+}
+
+double MainWindow::clipSourceTimeAtPlayheadSeconds(int trackIdx, int clipIdx, const ClipInfo &clip) const
+{
+    const double clipStart = clipTimelineStartSeconds(trackIdx, clipIdx);
+    const double localSeconds = qBound(0.0,
+                                       (m_timeline ? m_timeline->playheadPosition() : 0.0) - clipStart,
+                                       clip.effectiveDuration());
+    const double clipOut = clipSourceOutPoint(clip);
+    const double sourceSeconds = clip.inPoint + localSeconds * qMax(clip.speed, 0.0001);
+    return qBound(clip.inPoint, sourceSeconds, clipOut);
+}
+
+QImage MainWindow::decodeClipFrameAtSourceTime(const ClipInfo &clip, double sourceTimeSeconds) const
+{
+    const QString playbackPath = ProxyManager::instance().getProxyPath(clip.filePath);
+    const double clipOut = clipSourceOutPoint(clip);
+    return decodeFrameAtSecondsFromFile(playbackPath, qBound(clip.inPoint, sourceTimeSeconds, clipOut));
+}
+
+QImage MainWindow::decodeClipFrameByIndex(const ClipInfo &clip, int sourceFrameIndex, double sourceFps) const
+{
+    const double fps = qMax(1.0, sourceFps);
+    const double seconds = clip.inPoint + (qMax(0, sourceFrameIndex) / fps);
+    return decodeClipFrameAtSourceTime(clip, seconds);
+}
+
+QImage MainWindow::applyStoredRotoData(const QString &clipId,
+                                       const QImage &frame,
+                                       int sourceFrameIndex) const
+{
+    const auto it = m_rotoClipEntries.constFind(clipId);
+    if (it == m_rotoClipEntries.cend() || frame.isNull())
+        return frame;
+
+    const RotoClipEntry &entry = it.value();
+    QImage mask;
+    if (!entry.keyframes.isEmpty()) {
+        Rotoscope roto;
+        for (const auto &keyframe : entry.keyframes)
+            roto.addKeyframe(keyframe.frameNumber, keyframe.path);
+        mask = roto.renderMask(sourceFrameIndex, frame.size());
+    } else if (!entry.path.points.isEmpty()) {
+        Rotoscope roto;
+        roto.addKeyframe(sourceFrameIndex, entry.path);
+        mask = roto.renderMask(sourceFrameIndex, frame.size());
+    }
+    if (!entry.brushMask.isNull())
+        mask = combineMasksMax(mask, entry.brushMask);
+    if (mask.isNull())
+        return frame;
+    return Rotoscope::applyToFrame(frame, mask);
+}
+
+QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
+{
+    if (!m_timeline)
+        return {};
+
+    const QSize canvasSize = (m_projectConfig.width > 0 && m_projectConfig.height > 0)
+        ? QSize(m_projectConfig.width, m_projectConfig.height)
+        : QSize(1920, 1080);
+
+    struct ActiveLayer {
+        CompositeLayer layer;
+        QString clipId;
+        QImage image;
+    };
+
+    QVector<ActiveLayer> activeLayers;
+    bool hasActiveSpecialData = false;
+    for (int trackIdx = 0; trackIdx < m_timeline->videoTracks().size(); ++trackIdx) {
+        const auto *track = m_timeline->videoTracks().value(trackIdx, nullptr);
+        if (!track || track->isHidden())
+            continue;
+
+        const auto &clips = track->clips();
+        double cursor = 0.0;
+        for (int clipIdx = 0; clipIdx < clips.size(); ++clipIdx) {
+            const ClipInfo &clip = clips[clipIdx];
+            cursor += qMax(0.0, clip.leadInSec);
+            const double clipStart = cursor;
+            const double clipEnd = clipStart + clip.effectiveDuration();
+            cursor = clipEnd;
+
+            if (timelineSeconds + 1.0 / 120.0 < clipStart
+                || timelineSeconds > clipEnd + 1.0 / 120.0) {
+                continue;
+            }
+
+            const QString clipId = brushClipId(trackIdx, clipIdx);
+            hasActiveSpecialData = hasActiveSpecialData
+                || m_rotoClipEntries.contains(clipId)
+                || m_timeRemapClipEntries.contains(clipId)
+                || m_trackMatteClipEntries.contains(clipId);
+            const VideoSourceInfo info = probeVideoSourceInfo(
+                ProxyManager::instance().getProxyPath(clip.filePath),
+                m_projectConfig.fps > 0 ? m_projectConfig.fps : 30.0);
+            const double fps = clipEffectiveSourceFps(info, m_projectConfig.fps > 0 ? m_projectConfig.fps : 30.0);
+            const double localSeconds = qBound(0.0, timelineSeconds - clipStart, clip.effectiveDuration());
+
+            QImage frame;
+            int sourceFrameIndex = 0;
+            auto trIt = m_timeRemapClipEntries.constFind(clipId);
+            if (trIt != m_timeRemapClipEntries.cend()) {
+                timeremap::TimeRemapCurve curve = trIt.value().curve;
+                if (curve.sourceFps <= 0.0)
+                    curve.sourceFps = fps;
+                sourceFrameIndex = qMax(0, static_cast<int>(std::llround(
+                    (clip.inPoint + curve.srcTimeAt(localSeconds)) * curve.sourceFps)));
+                frame = timeremap::resolveFrame(curve, localSeconds, [this, clip, curve](int srcFrameIndex) {
+                    return decodeClipFrameByIndex(clip, srcFrameIndex, curve.sourceFps);
+                });
+            } else {
+                const double clipOut = clipSourceOutPoint(clip);
+                const double sourceTime = qBound(clip.inPoint,
+                                                 clip.inPoint + localSeconds * qMax(clip.speed, 0.0001),
+                                                 clipOut);
+                sourceFrameIndex = qMax(0, static_cast<int>(std::llround(sourceTime * fps)));
+                frame = decodeClipFrameAtSourceTime(clip, sourceTime);
+            }
+
+            if (frame.isNull())
+                continue;
+            frame = applyStoredRotoData(clipId, frame, sourceFrameIndex);
+
+            ActiveLayer active;
+            active.clipId = clipId;
+            active.image = frame;
+            active.layer.name = clip.displayName;
+            active.layer.opacity = qBound(0.0, clip.opacity, 1.0);
+            active.layer.blendMode = BlendMode::Normal;
+            active.layer.position = QPointF(clip.videoDx, clip.videoDy);
+            active.layer.scale = QPointF(clip.videoScale, clip.videoScale);
+            active.layer.rotation = clip.rotation2DDegrees;
+            active.layer.anchorPoint = QPointF(canvasSize.width() / 2.0, canvasSize.height() / 2.0);
+            active.layer.zOrder = trackIdx;
+            active.layer.inPoint = clipStart;
+            active.layer.outPoint = clipEnd;
+            if (auto matteIt = m_trackMatteClipEntries.constFind(clipId);
+                matteIt != m_trackMatteClipEntries.cend()) {
+                active.layer.matteType = matteIt.value().matteType;
+            }
+            activeLayers.append(active);
+        }
+    }
+
+    if (activeLayers.isEmpty())
+        return {};
+    if (!hasActiveSpecialData)
+        return {};
+
+    QHash<QString, int> indexByClipId;
+    for (int i = 0; i < activeLayers.size(); ++i)
+        indexByClipId.insert(activeLayers[i].clipId, i);
+
+    for (int i = 0; i < activeLayers.size(); ++i) {
+        const auto matteIt = m_trackMatteClipEntries.constFind(activeLayers[i].clipId);
+        if (matteIt == m_trackMatteClipEntries.cend())
+            continue;
+        activeLayers[i].layer.matteType = matteIt.value().matteType;
+        activeLayers[i].layer.matteSourceLayerIndex =
+            indexByClipId.value(matteIt.value().matteSourceClipId, -1);
+    }
+
+    QVector<int> order(activeLayers.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(), [&activeLayers](int a, int b) {
+        return activeLayers[a].layer.zOrder < activeLayers[b].layer.zOrder;
+    });
+
+    QSet<int> matteSourceIndices;
+    for (int sortedIdx : order) {
+        const CompositeLayer &layer = activeLayers[sortedIdx].layer;
+        if (layer.matteType == TrackMatteType::None)
+            continue;
+        const int matteIndex = layer.matteSourceLayerIndex;
+        if (matteIndex >= 0 && matteIndex < activeLayers.size() && matteIndex != sortedIdx)
+            matteSourceIndices.insert(matteIndex);
+    }
+
+    QImage canvas(canvasSize, QImage::Format_ARGB32);
+    canvas.fill(Qt::transparent);
+    for (int sortedIdx : order) {
+        const ActiveLayer &active = activeLayers[sortedIdx];
+        const CompositeLayer &layer = active.layer;
+        if (!layer.visible || matteSourceIndices.contains(sortedIdx))
+            continue;
+
+        QImage transformed = renderCompositeImage(active.image, layer, canvasSize);
+        if (transformed.isNull())
+            continue;
+
+        if (layer.matteType != TrackMatteType::None
+            && layer.matteSourceLayerIndex >= 0
+            && layer.matteSourceLayerIndex < activeLayers.size()
+            && layer.matteSourceLayerIndex != sortedIdx) {
+            const QImage matteImage = renderCompositeImage(
+                activeLayers[layer.matteSourceLayerIndex].image,
+                activeLayers[layer.matteSourceLayerIndex].layer,
+                canvasSize);
+            if (!matteImage.isNull())
+                transformed = MaskSystem::applyTrackMatte(transformed, matteImage, layer.matteType);
+        }
+
+        canvas = LayerCompositor::blendImages(canvas, transformed, layer.blendMode, layer.opacity);
+    }
+    return canvas;
+}
+
+void MainWindow::refreshSpecialClipPreview()
+{
+    if (!m_player || !m_player->glPreview() || !m_timeline)
+        return;
+
+    static thread_local bool s_refreshingPreview = false;
+    if (s_refreshingPreview)
+        return;
+
+    const int timelineMs = qRound(m_timeline->playheadPosition() * 1000.0);
+    if (m_rotoClipEntries.isEmpty() && m_timeRemapClipEntries.isEmpty() && m_trackMatteClipEntries.isEmpty()) {
+        if (!m_player->isPlaying()) {
+            s_refreshingPreview = true;
+            m_player->previewSeek(timelineMs);
+            s_refreshingPreview = false;
+        }
+        return;
+    }
+
+    const QImage composed = buildSpecialClipComposite(m_timeline->playheadPosition());
+    if (!composed.isNull()) {
+        s_refreshingPreview = true;
+        m_player->glPreview()->displayFrame(composed);
+        s_refreshingPreview = false;
+    } else if (!m_player->isPlaying()) {
+        s_refreshingPreview = true;
+        m_player->previewSeek(timelineMs);
+        s_refreshingPreview = false;
+    }
+}
+
 void MainWindow::populateProjectData(ProjectData &data)
 {
     data.config = m_projectConfig;
@@ -2034,6 +2584,21 @@ void MainWindow::populateProjectData(ProjectData &data)
     data.markOut = m_timeline->markedOut();
     data.zoomLevel = 10; // TODO: expose zoom level getter
     data.brushAnimations = m_brushAnimationEntries;
+    data.rotoClipEntries.clear();
+    for (auto it = m_rotoClipEntries.cbegin(); it != m_rotoClipEntries.cend(); ++it)
+        data.rotoClipEntries.append(it.value());
+    std::sort(data.rotoClipEntries.begin(), data.rotoClipEntries.end(),
+              [](const RotoClipEntry &a, const RotoClipEntry &b) { return a.clipId < b.clipId; });
+    data.timeRemapClipEntries.clear();
+    for (auto it = m_timeRemapClipEntries.cbegin(); it != m_timeRemapClipEntries.cend(); ++it)
+        data.timeRemapClipEntries.append(it.value());
+    std::sort(data.timeRemapClipEntries.begin(), data.timeRemapClipEntries.end(),
+              [](const TimeRemapClipEntry &a, const TimeRemapClipEntry &b) { return a.clipId < b.clipId; });
+    data.trackMatteClipEntries.clear();
+    for (auto it = m_trackMatteClipEntries.cbegin(); it != m_trackMatteClipEntries.cend(); ++it)
+        data.trackMatteClipEntries.append(it.value());
+    std::sort(data.trackMatteClipEntries.begin(), data.trackMatteClipEntries.end(),
+              [](const TrackMatteClipEntry &a, const TrackMatteClipEntry &b) { return a.clipId < b.clipId; });
 
     collectAudioState(data);
 
@@ -2136,6 +2701,23 @@ void MainWindow::applyLoadedProjectData(const ProjectData &data, const QString &
 
     m_projectConfig = data.config;
     setBrushAnimationEntries(data.brushAnimations);
+    m_rotoClipEntries.clear();
+    for (const auto &entry : data.rotoClipEntries) {
+        if (!entry.clipId.isEmpty())
+            m_rotoClipEntries.insert(entry.clipId, entry);
+    }
+    m_timeRemapClipEntries.clear();
+    for (const auto &entry : data.timeRemapClipEntries) {
+        if (!entry.clipId.isEmpty())
+            m_timeRemapClipEntries.insert(entry.clipId, entry);
+    }
+    m_trackMatteClipEntries.clear();
+    for (const auto &entry : data.trackMatteClipEntries) {
+        if (!entry.clipId.isEmpty())
+            m_trackMatteClipEntries.insert(entry.clipId, entry);
+    }
+    m_selectedVideoTrackIndex = -1;
+    m_selectedVideoClipIndexTracked = -1;
 
     if (m_player)
         m_player->setCanvasSize(data.config.width, data.config.height);
@@ -2218,6 +2800,7 @@ void MainWindow::applyLoadedProjectData(const ProjectData &data, const QString &
     updateStatusInfo();
     updateEditActions();
     syncBrushAnimationPreviewForClip(0, m_timeline ? m_timeline->selectedVideoClipIndex() : -1);
+    refreshSpecialClipPreview();
 }
 
 void MainWindow::collectAudioState(ProjectData &data)
@@ -5200,6 +5783,272 @@ void MainWindow::addBrushAnimation()
     statusBar()->showMessage(QString("ブラシアニメを追加: 「%1」 (%2)")
         .arg(params.text, params.mode == BrushAnimationMode::PerCharacter
             ? QStringLiteral("Per Character") : QStringLiteral("Per Stroke")));
+}
+
+void MainWindow::openRotoToolsDialog()
+{
+    if (!m_timeline) {
+        QMessageBox::information(this, QStringLiteral("ロトツール"),
+                                 QStringLiteral("タイムラインの初期化が完了していません。"));
+        return;
+    }
+
+    int trackIdx = -1;
+    int clipIdx = -1;
+    ClipInfo clip;
+    if (!selectedVideoClipRef(trackIdx, clipIdx, &clip)) {
+        QMessageBox::information(this, QStringLiteral("ロトツール"),
+                                 QStringLiteral("先にビデオクリップを選択してください。"));
+        return;
+    }
+
+    const double fallbackFps = (m_projectConfig.fps > 0) ? m_projectConfig.fps : 30.0;
+    const VideoSourceInfo info = probeVideoSourceInfo(
+        ProxyManager::instance().getProxyPath(clip.filePath), fallbackFps);
+    const double fps = clipEffectiveSourceFps(info, fallbackFps);
+    const double sourceTime = clipSourceTimeAtPlayheadSeconds(trackIdx, clipIdx, clip);
+    const int sourceFrameIndex = qMax(0, static_cast<int>(std::llround(sourceTime * fps)));
+
+    QImage currentFrame = decodeClipFrameAtSourceTime(clip, sourceTime);
+    if (currentFrame.isNull()) {
+        QMessageBox::warning(this, QStringLiteral("ロトツール"),
+                             QStringLiteral("現在フレームのデコードに失敗しました。"));
+        return;
+    }
+
+    QVector<QImage> frames;
+    const int frameBudget = (info.frameCount > 0)
+        ? qMin(8, qMax(1, info.frameCount - sourceFrameIndex))
+        : 8;
+    for (int i = 0; i < frameBudget; ++i) {
+        QImage frame = decodeClipFrameByIndex(clip, sourceFrameIndex + i, fps);
+        if (frame.isNull())
+            break;
+        frames.append(frame);
+    }
+    if (frames.isEmpty())
+        frames.append(currentFrame);
+
+    RotoToolsDialog dialog(this);
+    dialog.setWindowTitle(QStringLiteral("ロトツール - %1").arg(clip.displayName));
+    dialog.setFrame(currentFrame);
+    dialog.setFrameSequence(frames, sourceFrameIndex);
+
+    const QString clipId = brushClipId(trackIdx, clipIdx);
+    if (m_rotoClipEntries.contains(clipId)) {
+        const RotoClipEntry &entry = m_rotoClipEntries.value(clipId);
+        if (!entry.keyframes.isEmpty()) {
+            Rotoscope roto;
+            for (const auto &keyframe : entry.keyframes)
+                roto.addKeyframe(keyframe.frameNumber, keyframe.path);
+            dialog.setRotoPath(roto.getPathAtFrame(sourceFrameIndex));
+        } else if (!entry.path.points.isEmpty()) {
+            dialog.setRotoPath(entry.path);
+        }
+    }
+
+    if (dialog.exec() != QDialog::Accepted)
+        return;
+
+    RotoClipEntry entry = m_rotoClipEntries.value(clipId);
+    entry.clipId = clipId;
+    entry.path = dialog.rotoPath();
+
+    QVector<RotoKeyframe> keyframes = dialog.trackedKeyframes();
+    if (!keyframes.isEmpty()) {
+        entry.keyframes = keyframes;
+    } else if (!entry.path.points.isEmpty()) {
+        bool replaced = false;
+        for (auto &keyframe : entry.keyframes) {
+            if (keyframe.frameNumber == sourceFrameIndex) {
+                keyframe.path = entry.path;
+                replaced = true;
+                break;
+            }
+        }
+        if (!replaced) {
+            RotoKeyframe keyframe;
+            keyframe.frameNumber = sourceFrameIndex;
+            keyframe.path = entry.path;
+            entry.keyframes.append(keyframe);
+            std::sort(entry.keyframes.begin(), entry.keyframes.end(),
+                      [](const RotoKeyframe &a, const RotoKeyframe &b) {
+                          return a.frameNumber < b.frameNumber;
+                      });
+        }
+    }
+
+    const QImage brushMask = dialog.brushMask();
+    if (!brushMask.isNull())
+        entry.brushMask = brushMask.convertToFormat(QImage::Format_Grayscale8);
+
+    if (entry.path.points.isEmpty() && entry.keyframes.isEmpty() && entry.brushMask.isNull()) {
+        m_rotoClipEntries.remove(clipId);
+    } else {
+        m_rotoClipEntries.insert(clipId, entry);
+    }
+
+    refreshSpecialClipPreview();
+    statusBar()->showMessage(QStringLiteral("ロトデータを %1 に保存しました").arg(clip.displayName), 4000);
+}
+
+void MainWindow::openTimeRemapDialog()
+{
+    if (!m_timeline) {
+        QMessageBox::information(this, QStringLiteral("タイムリマップ"),
+                                 QStringLiteral("タイムラインの初期化が完了していません。"));
+        return;
+    }
+
+    int trackIdx = -1;
+    int clipIdx = -1;
+    ClipInfo clip;
+    if (!selectedVideoClipRef(trackIdx, clipIdx, &clip)) {
+        QMessageBox::information(this, QStringLiteral("タイムリマップ"),
+                                 QStringLiteral("先にビデオクリップを選択してください。"));
+        return;
+    }
+
+    const double fallbackFps = (m_projectConfig.fps > 0) ? m_projectConfig.fps : 30.0;
+    const VideoSourceInfo info = probeVideoSourceInfo(
+        ProxyManager::instance().getProxyPath(clip.filePath), fallbackFps);
+    const double fps = clipEffectiveSourceFps(info, fallbackFps);
+    const int frameCount = (info.frameCount > 0)
+        ? info.frameCount
+        : qMax(1, static_cast<int>(std::llround((clipSourceOutPoint(clip) - clip.inPoint) * fps)));
+
+    const QString clipId = brushClipId(trackIdx, clipIdx);
+    TimeRemapClipEntry entry = m_timeRemapClipEntries.value(clipId);
+    entry.clipId = clipId;
+    if (entry.curve.sourceFps <= 0.0)
+        entry.curve.sourceFps = fps;
+
+    TimeRemapDialog dialog(this);
+    dialog.setWindowTitle(QStringLiteral("タイムリマップ - %1").arg(clip.displayName));
+    dialog.setCurve(entry.curve);
+    dialog.setSourceFrameCount(frameCount);
+    dialog.setFrameFetcher([this, clip, fps](int sourceFrameIndex) {
+        return decodeClipFrameByIndex(clip, sourceFrameIndex, fps);
+    });
+
+    if (dialog.exec() != QDialog::Accepted)
+        return;
+
+    entry.curve = dialog.curve();
+    if (entry.curve.sourceFps <= 0.0)
+        entry.curve.sourceFps = fps;
+    m_timeRemapClipEntries.insert(clipId, entry);
+
+    refreshSpecialClipPreview();
+    statusBar()->showMessage(QStringLiteral("タイムリマップを %1 に保存しました").arg(clip.displayName), 4000);
+}
+
+void MainWindow::configureTrackMatte()
+{
+    if (!m_timeline) {
+        QMessageBox::information(this, QStringLiteral("トラックマット"),
+                                 QStringLiteral("タイムラインの初期化が完了していません。"));
+        return;
+    }
+
+    int targetTrackIdx = -1;
+    int targetClipIdx = -1;
+    ClipInfo targetClip;
+    if (!selectedVideoClipRef(targetTrackIdx, targetClipIdx, &targetClip)) {
+        QMessageBox::information(this, QStringLiteral("トラックマット"),
+                                 QStringLiteral("先にビデオクリップを選択してください。"));
+        return;
+    }
+
+    struct ClipOption {
+        QString id;
+        QString label;
+    };
+    QVector<ClipOption> candidates;
+    for (int trackIdx = 0; trackIdx < m_timeline->videoTracks().size(); ++trackIdx) {
+        const auto *track = m_timeline->videoTracks().value(trackIdx, nullptr);
+        if (!track)
+            continue;
+        const auto &clips = track->clips();
+        for (int clipIdx = 0; clipIdx < clips.size(); ++clipIdx) {
+            const QString clipId = brushClipId(trackIdx, clipIdx);
+            if (trackIdx == targetTrackIdx && clipIdx == targetClipIdx)
+                continue;
+            candidates.append({clipId,
+                               QStringLiteral("V%1 #%2 - %3")
+                                   .arg(trackIdx + 1)
+                                   .arg(clipIdx + 1)
+                                   .arg(clips[clipIdx].displayName)});
+        }
+    }
+
+    QDialog dialog(this);
+    dialog.setWindowTitle(QStringLiteral("トラックマット設定"));
+    auto *layout = new QFormLayout(&dialog);
+    auto *typeCombo = new QComboBox(&dialog);
+    auto *sourceCombo = new QComboBox(&dialog);
+
+    const QList<TrackMatteType> matteTypes = {
+        TrackMatteType::None,
+        TrackMatteType::AlphaMatte,
+        TrackMatteType::AlphaInvertedMatte,
+        TrackMatteType::LumaMatte,
+        TrackMatteType::LumaInvertedMatte
+    };
+    for (TrackMatteType type : matteTypes)
+        typeCombo->addItem(trackMatteTypeLabel(type), static_cast<int>(type));
+    sourceCombo->addItem(QStringLiteral("なし"), QString{});
+    for (const auto &candidate : candidates)
+        sourceCombo->addItem(candidate.label, candidate.id);
+
+    const QString targetClipId = brushClipId(targetTrackIdx, targetClipIdx);
+    const TrackMatteClipEntry existing = m_trackMatteClipEntries.value(targetClipId);
+    const int existingTypeIndex = typeCombo->findData(static_cast<int>(existing.matteType));
+    if (existingTypeIndex >= 0)
+        typeCombo->setCurrentIndex(existingTypeIndex);
+    const int existingSourceIndex = sourceCombo->findData(existing.matteSourceClipId);
+    if (existingSourceIndex >= 0)
+        sourceCombo->setCurrentIndex(existingSourceIndex);
+
+    layout->addRow(QStringLiteral("タイプ:"), typeCombo);
+    layout->addRow(QStringLiteral("マット元:"), sourceCombo);
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    layout->addRow(buttons);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    connect(typeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), &dialog, [typeCombo, sourceCombo](int) {
+        const TrackMatteType currentType = static_cast<TrackMatteType>(typeCombo->currentData().toInt());
+        sourceCombo->setEnabled(currentType != TrackMatteType::None);
+    });
+    sourceCombo->setEnabled(existing.matteType != TrackMatteType::None);
+
+    if (dialog.exec() != QDialog::Accepted)
+        return;
+
+    const TrackMatteType matteType = static_cast<TrackMatteType>(typeCombo->currentData().toInt());
+    const QString matteSourceId = sourceCombo->currentData().toString();
+    if (matteType == TrackMatteType::None || matteSourceId.isEmpty()) {
+        m_trackMatteClipEntries.remove(targetClipId);
+        refreshSpecialClipPreview();
+        statusBar()->showMessage(QStringLiteral("トラックマットを解除しました"), 3000);
+        return;
+    }
+    if (matteSourceId == targetClipId) {
+        QMessageBox::warning(this, QStringLiteral("トラックマット"),
+                             QStringLiteral("同じクリップはマット元に指定できません。"));
+        return;
+    }
+
+    TrackMatteClipEntry entry;
+    entry.clipId = targetClipId;
+    entry.matteType = matteType;
+    entry.matteSourceClipId = matteSourceId;
+    m_trackMatteClipEntries.insert(targetClipId, entry);
+
+    refreshSpecialClipPreview();
+    statusBar()->showMessage(QStringLiteral("%1 に %2 を設定しました")
+                                 .arg(targetClip.displayName, trackMatteTypeLabel(matteType)),
+                             4000);
 }
 
 void MainWindow::editTransformKeyframes()

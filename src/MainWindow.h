@@ -71,6 +71,8 @@ class VideoPlayer;
 class Timeline;
 class ExportDialog;
 class BrushAnimation;
+class RotoToolsDialog;
+class TimeRemapDialog;
 
 namespace voiceover {
 class VoiceOverDialog;
@@ -278,6 +280,9 @@ private slots:
     void changeTextScope();
     void addVariableFontAxis();
     void addMographTemplate();
+    void openRotoToolsDialog();
+    void openTimeRemapDialog();
+    void configureTrackMatte();
 
 protected:
     void dragEnterEvent(QDragEnterEvent *event) override;
@@ -306,6 +311,14 @@ private:
     void applyAudioState(const ProjectData &data);
     static QString brushClipId(int trackIdx, int clipIdx);
     static QString particleClipKey(const ClipInfo &clip);
+    bool selectedVideoClipRef(int &trackIdx, int &clipIdx, ClipInfo *clip = nullptr) const;
+    double clipTimelineStartSeconds(int trackIdx, int clipIdx) const;
+    double clipSourceTimeAtPlayheadSeconds(int trackIdx, int clipIdx, const ClipInfo &clip) const;
+    QImage decodeClipFrameAtSourceTime(const ClipInfo &clip, double sourceTimeSeconds) const;
+    QImage decodeClipFrameByIndex(const ClipInfo &clip, int sourceFrameIndex, double sourceFps) const;
+    void refreshSpecialClipPreview();
+    QImage buildSpecialClipComposite(double timelineSeconds) const;
+    QImage applyStoredRotoData(const QString &clipId, const QImage &frame, int sourceFrameIndex) const;
     void setBrushAnimationEntries(const QVector<BrushAnimationEntry> &entries);
     void upsertBrushAnimationEntry(const BrushAnimationEntry &entry);
     BrushAnimation *materializeBrushAnimation(const QString &clipId);
@@ -323,6 +336,11 @@ private:
     QVector<BrushAnimationEntry> m_brushAnimationEntries;
     QHash<QString, ParticleEmitterConfig> m_particleClipConfigs;
     QHash<QString, BrushAnimation *> m_liveBrushAnimations;
+    QHash<QString, RotoClipEntry> m_rotoClipEntries;
+    QHash<QString, TimeRemapClipEntry> m_timeRemapClipEntries;
+    QHash<QString, TrackMatteClipEntry> m_trackMatteClipEntries;
+    int m_selectedVideoTrackIndex = -1;
+    int m_selectedVideoClipIndexTracked = -1;
 
     // US-AETEXT-12: AE text feature objects
     QVector<PathText *> m_pathTexts;

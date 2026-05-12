@@ -2,6 +2,7 @@
 #include "AudioMixer.h"
 #include "MarkerData.h"
 #include "AdjustmentLayer.h"
+#include <QBuffer>
 #include <QFile>
 #include <QJsonDocument>
 #include <algorithm>
@@ -40,6 +41,35 @@ QJsonArray projectFileAdjustmentLayersToJson(const QVector<AdjustmentLayer> &lay
 QVector<AdjustmentLayer> projectFileAdjustmentLayersFromJson(const QJsonArray &arr)
 {
     return adjustmentLayersFromJsonArray(arr);
+}
+
+QByteArray imageToPngBase64(const QImage &image)
+{
+    if (image.isNull())
+        return {};
+
+    QByteArray pngBytes;
+    QBuffer buffer(&pngBytes);
+    if (!buffer.open(QIODevice::WriteOnly))
+        return {};
+    QImage encoded = image;
+    if (encoded.format() != QImage::Format_Grayscale8
+        && encoded.format() != QImage::Format_Alpha8) {
+        encoded = encoded.convertToFormat(QImage::Format_Grayscale8);
+    }
+    if (!encoded.save(&buffer, "PNG"))
+        return {};
+    return pngBytes.toBase64();
+}
+
+QImage imageFromPngBase64(const QString &encoded)
+{
+    if (encoded.isEmpty())
+        return {};
+    const QByteArray pngBytes = QByteArray::fromBase64(encoded.toUtf8());
+    QImage image;
+    image.loadFromData(pngBytes, "PNG");
+    return image.isNull() ? QImage() : image.convertToFormat(QImage::Format_Grayscale8);
 }
 
 static const int PROJECT_FORMAT_VERSION = 1;
@@ -188,6 +218,24 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
             nodeArr.append(clipNodeGraphToJson(entry));
         root["clipNodeGraphs"] = nodeArr;
     }
+    {
+        QJsonArray rotoArr;
+        for (const auto &entry : data.rotoClipEntries)
+            rotoArr.append(rotoClipEntryToJson(entry));
+        root["rotoClipEntries"] = rotoArr;
+    }
+    {
+        QJsonArray timeRemapArr;
+        for (const auto &entry : data.timeRemapClipEntries)
+            timeRemapArr.append(timeRemapClipEntryToJson(entry));
+        root["timeRemapClipEntries"] = timeRemapArr;
+    }
+    {
+        QJsonArray matteArr;
+        for (const auto &entry : data.trackMatteClipEntries)
+            matteArr.append(trackMatteClipEntryToJson(entry));
+        root["trackMatteClipEntries"] = matteArr;
+    }
     root["vfxState"] = vfxStateToJson(data.vfxState);
 
     QJsonDocument doc(root);
@@ -326,6 +374,21 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
     if (root.contains("clipNodeGraphs")) {
         for (const auto &v : root["clipNodeGraphs"].toArray())
             data.clipNodeGraphs.append(clipNodeGraphFromJson(v.toObject()));
+    }
+    data.rotoClipEntries.clear();
+    if (root.contains("rotoClipEntries")) {
+        for (const auto &v : root["rotoClipEntries"].toArray())
+            data.rotoClipEntries.append(rotoClipEntryFromJson(v.toObject()));
+    }
+    data.timeRemapClipEntries.clear();
+    if (root.contains("timeRemapClipEntries")) {
+        for (const auto &v : root["timeRemapClipEntries"].toArray())
+            data.timeRemapClipEntries.append(timeRemapClipEntryFromJson(v.toObject()));
+    }
+    data.trackMatteClipEntries.clear();
+    if (root.contains("trackMatteClipEntries")) {
+        for (const auto &v : root["trackMatteClipEntries"].toArray())
+            data.trackMatteClipEntries.append(trackMatteClipEntryFromJson(v.toObject()));
     }
     data.vfxState = root.contains("vfxState")
         ? vfxStateFromJson(root["vfxState"].toObject())
@@ -469,6 +532,24 @@ QString ProjectFile::toJsonString(const ProjectData &data)
             nodeArr.append(clipNodeGraphToJson(entry));
         root["clipNodeGraphs"] = nodeArr;
     }
+    {
+        QJsonArray rotoArr;
+        for (const auto &entry : data.rotoClipEntries)
+            rotoArr.append(rotoClipEntryToJson(entry));
+        root["rotoClipEntries"] = rotoArr;
+    }
+    {
+        QJsonArray timeRemapArr;
+        for (const auto &entry : data.timeRemapClipEntries)
+            timeRemapArr.append(timeRemapClipEntryToJson(entry));
+        root["timeRemapClipEntries"] = timeRemapArr;
+    }
+    {
+        QJsonArray matteArr;
+        for (const auto &entry : data.trackMatteClipEntries)
+            matteArr.append(trackMatteClipEntryToJson(entry));
+        root["trackMatteClipEntries"] = matteArr;
+    }
     root["vfxState"] = vfxStateToJson(data.vfxState);
 
     QJsonDocument doc(root);
@@ -599,6 +680,21 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
     if (root.contains("clipNodeGraphs")) {
         for (const auto &v : root["clipNodeGraphs"].toArray())
             data.clipNodeGraphs.append(clipNodeGraphFromJson(v.toObject()));
+    }
+    data.rotoClipEntries.clear();
+    if (root.contains("rotoClipEntries")) {
+        for (const auto &v : root["rotoClipEntries"].toArray())
+            data.rotoClipEntries.append(rotoClipEntryFromJson(v.toObject()));
+    }
+    data.timeRemapClipEntries.clear();
+    if (root.contains("timeRemapClipEntries")) {
+        for (const auto &v : root["timeRemapClipEntries"].toArray())
+            data.timeRemapClipEntries.append(timeRemapClipEntryFromJson(v.toObject()));
+    }
+    data.trackMatteClipEntries.clear();
+    if (root.contains("trackMatteClipEntries")) {
+        for (const auto &v : root["trackMatteClipEntries"].toArray())
+            data.trackMatteClipEntries.append(trackMatteClipEntryFromJson(v.toObject()));
     }
     data.vfxState = root.contains("vfxState")
         ? vfxStateFromJson(root["vfxState"].toObject())
@@ -1233,6 +1329,72 @@ ClipNodeGraph ProjectFile::clipNodeGraphFromJson(const QJsonObject &obj)
     entry.clipId = obj["clipId"].toString();
     entry.graph = obj["graph"].toObject();
     entry.compositingMode = obj["compositingMode"].toString(entry.compositingMode);
+    return entry;
+}
+
+QJsonObject ProjectFile::rotoClipEntryToJson(const RotoClipEntry &entry)
+{
+    QJsonObject obj;
+    obj["clipId"] = entry.clipId;
+    obj["path"] = entry.path.toJson();
+
+    QJsonArray keyframeArr;
+    for (const auto &keyframe : entry.keyframes)
+        keyframeArr.append(keyframe.toJson());
+    obj["keyframes"] = keyframeArr;
+
+    const QByteArray encodedMask = imageToPngBase64(entry.brushMask);
+    if (!encodedMask.isEmpty())
+        obj["brushMaskPngBase64"] = QString::fromLatin1(encodedMask);
+    return obj;
+}
+
+RotoClipEntry ProjectFile::rotoClipEntryFromJson(const QJsonObject &obj)
+{
+    RotoClipEntry entry;
+    entry.clipId = obj["clipId"].toString();
+    if (obj.contains("path"))
+        entry.path = RotoPath::fromJson(obj["path"].toObject());
+    if (obj.contains("keyframes")) {
+        for (const auto &value : obj["keyframes"].toArray())
+            entry.keyframes.append(RotoKeyframe::fromJson(value.toObject()));
+    }
+    entry.brushMask = imageFromPngBase64(obj["brushMaskPngBase64"].toString());
+    return entry;
+}
+
+QJsonObject ProjectFile::timeRemapClipEntryToJson(const TimeRemapClipEntry &entry)
+{
+    QJsonObject obj;
+    obj["clipId"] = entry.clipId;
+    obj["curve"] = entry.curve.toJson();
+    return obj;
+}
+
+TimeRemapClipEntry ProjectFile::timeRemapClipEntryFromJson(const QJsonObject &obj)
+{
+    TimeRemapClipEntry entry;
+    entry.clipId = obj["clipId"].toString();
+    if (obj.contains("curve"))
+        entry.curve = timeremap::TimeRemapCurve::fromJson(obj["curve"].toObject());
+    return entry;
+}
+
+QJsonObject ProjectFile::trackMatteClipEntryToJson(const TrackMatteClipEntry &entry)
+{
+    QJsonObject obj;
+    obj["clipId"] = entry.clipId;
+    obj["matteType"] = static_cast<int>(entry.matteType);
+    obj["matteSourceClipId"] = entry.matteSourceClipId;
+    return obj;
+}
+
+TrackMatteClipEntry ProjectFile::trackMatteClipEntryFromJson(const QJsonObject &obj)
+{
+    TrackMatteClipEntry entry;
+    entry.clipId = obj["clipId"].toString();
+    entry.matteType = static_cast<TrackMatteType>(obj["matteType"].toInt(static_cast<int>(TrackMatteType::None)));
+    entry.matteSourceClipId = obj["matteSourceClipId"].toString();
     return entry;
 }
 

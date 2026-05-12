@@ -185,6 +185,20 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/Expression.cpp
     src/Precompose.cpp
     src/Rotoscope.cpp
+    src/RotoAutoTrace.h
+    src/RotoAutoTrace.cpp
+    src/RotoTracking.h
+    src/RotoTracking.cpp
+    src/OpticalFlow.h
+    src/OpticalFlow.cpp
+    src/TimeRemap.h
+    src/TimeRemap.cpp
+    src/RotoBrushTool.h
+    src/RotoBrushTool.cpp
+    src/RotoToolsDialog.h
+    src/RotoToolsDialog.cpp
+    src/TimeRemapDialog.h
+    src/TimeRemapDialog.cpp
     src/WarpDistortion.cpp
     src/NodeGraph.h
     src/NodeGraph.cpp

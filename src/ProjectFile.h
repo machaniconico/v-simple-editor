@@ -3,13 +3,17 @@
 #include <QString>
 #include <QJsonObject>
 #include <QJsonArray>
+#include <QImage>
 #include "ProjectSettings.h"
 #include "Timeline.h"
 #include "VideoEffect.h"
 #include "Keyframe.h"
 #include "Overlay.h"
+#include "MaskSystem.h"
 #include "PlanarTracker.h"
 #include "ParticleSystem.h"
+#include "Rotoscope.h"
+#include "TimeRemap.h"
 
 // --- Audio mixer serialization sub-types ---
 
@@ -111,6 +115,24 @@ struct ClipNodeGraph {
     QString compositingMode = QStringLiteral("layer");
 };
 
+struct RotoClipEntry {
+    QString clipId;
+    RotoPath path;
+    QVector<RotoKeyframe> keyframes;
+    QImage brushMask;
+};
+
+struct TimeRemapClipEntry {
+    QString clipId;
+    timeremap::TimeRemapCurve curve;
+};
+
+struct TrackMatteClipEntry {
+    QString clipId;
+    TrackMatteType matteType = TrackMatteType::None;
+    QString matteSourceClipId;
+};
+
 struct ProjectGlowState {
     bool enabled = false;
     float threshold = 0.5f;
@@ -184,6 +206,9 @@ struct ProjectData {
     QJsonObject loudnessSettings;
     QVector<ParticleClipEntry> particleClipEntries;
     QVector<ClipNodeGraph> clipNodeGraphs;
+    QVector<RotoClipEntry> rotoClipEntries;
+    QVector<TimeRemapClipEntry> timeRemapClipEntries;
+    QVector<TrackMatteClipEntry> trackMatteClipEntries;
     ProjectVfxState vfxState;
 };
 
@@ -248,6 +273,12 @@ private:
     static ParticleClipEntry particleClipEntryFromJson(const QJsonObject &obj);
     static QJsonObject clipNodeGraphToJson(const ClipNodeGraph &entry);
     static ClipNodeGraph clipNodeGraphFromJson(const QJsonObject &obj);
+    static QJsonObject rotoClipEntryToJson(const RotoClipEntry &entry);
+    static RotoClipEntry rotoClipEntryFromJson(const QJsonObject &obj);
+    static QJsonObject timeRemapClipEntryToJson(const TimeRemapClipEntry &entry);
+    static TimeRemapClipEntry timeRemapClipEntryFromJson(const QJsonObject &obj);
+    static QJsonObject trackMatteClipEntryToJson(const TrackMatteClipEntry &entry);
+    static TrackMatteClipEntry trackMatteClipEntryFromJson(const QJsonObject &obj);
     static QJsonObject vfxStateToJson(const ProjectVfxState &state);
     static ProjectVfxState vfxStateFromJson(const QJsonObject &obj);
 
