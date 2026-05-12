@@ -30,6 +30,7 @@
 #include "ProxyManagementDialog.h"
 #include <QApplication>
 #include <QMessageBox>
+#include <QMenu>
 #include <QVBoxLayout>
 #include <QProgressDialog>
 #include <QShortcut>
@@ -101,6 +102,7 @@
 #include "LayerNodeBridge.h"
 #include "RotoToolsDialog.h"
 #include "TimeRemapDialog.h"
+#include "FavoritesEditDialog.h"
 #include <QPainter>
 
 extern "C" {
@@ -1125,6 +1127,19 @@ void MainWindow::setupMenuBar()
     prefsMenu->addAction(shortcutAction);
     m_menuHelpEntries.append({shortcutAction,
         QStringLiteral("よく使う操作のキー割り当てを自分好みに変えられます。")});
+
+    // お気に入り メニュー — placed right after 編集 so the user's hand-picked
+    // shortcuts sit near the top of the menu bar. Mnemonic &O is unused by the
+    // other top-level menus (F/E/V/T/I/A/K/P/S/C/H). The dynamic part (the
+    // proxy actions) is filled in by rebuildFavoritesMenu() at the very end of
+    // setupMenuBar(), once every favoritable QAction exists; here we only
+    // create the menu shell and the 「お気に入りを編集...」 action it always
+    // keeps at the bottom.
+    m_favoritesMenu = menuBar()->addMenu(QStringLiteral("お気に入り(&O)"));
+    m_editFavoritesAction = new QAction(QStringLiteral("お気に入りを編集..."), this);
+    connect(m_editFavoritesAction, &QAction::triggered, this, &MainWindow::editFavorites);
+    m_menuHelpEntries.append({m_editFavoritesAction,
+        QStringLiteral("この「お気に入り」メニューに表示する機能を、自分でチェックして選べます。")});
 
     // 表示 メニュー
     auto *viewMenu = menuBar()->addMenu("表示(&V)");
@@ -2491,6 +2506,157 @@ void MainWindow::setupMenuBar()
         QSettings prefSettings("VSimpleEditor", "Preferences");
         applyMenuHelpTooltips(prefSettings.value("showMenuHints", true).toBool());
     }
+
+    // --- お気に入り: build the registry of favoritable actions ---
+    // Walk every top-level menu (the お気に入り menu itself excluded) and
+    // register each direct, named, non-submenu action. The stable id is
+    // "<menuKey>.<index>" where menuKey comes from a fixed title→key map and
+    // index is the action's position among the favoritable actions in that
+    // menu. This sprint model only ever appends actions to a menu, so existing
+    // ids stay stable; the id is NEVER derived from the (translatable) text so
+    // the persisted favorites list survives UI-text changes. label / menuPath
+    // are display strings used only by FavoritesEditDialog for grouping.
+    {
+        static const QHash<QString, QString> menuKeyByTitle = {
+            {QStringLiteral("ファイル"),       QStringLiteral("file")},
+            {QStringLiteral("編集"),           QStringLiteral("edit")},
+            {QStringLiteral("表示"),           QStringLiteral("view")},
+            {QStringLiteral("トラック"),       QStringLiteral("track")},
+            {QStringLiteral("挿入"),           QStringLiteral("insert")},
+            {QStringLiteral("オーディオ"),     QStringLiteral("audio")},
+            {QStringLiteral("マーカー"),       QStringLiteral("marker")},
+            {QStringLiteral("エフェクト"),     QStringLiteral("effect")},
+            {QStringLiteral("再生"),           QStringLiteral("playback")},
+            {QStringLiteral("ツール"),         QStringLiteral("tools")},
+            {QStringLiteral("配信向け"),       QStringLiteral("stream")},
+            {QStringLiteral("コンポジション"), QStringLiteral("comp")},
+            {QStringLiteral("ヘルプ"),         QStringLiteral("help")},
+        };
+        m_favoritableActions.clear();
+        const QList<QAction *> topActions = menuBar()->actions();
+        for (QAction *menuAct : topActions) {
+            if (!menuAct)
+                continue;
+            QMenu *menu = menuAct->menu();
+            if (!menu || menu == m_favoritesMenu)
+                continue;
+            // Sanitize the title for display: drop the "(&X)" mnemonic hint
+            // — e.g. "ファイル(&F)" → "ファイル", "配信向け(&S)" → "配信向け",
+            // "コンポジション(&C)" → "コンポジション". Falls back to a generic
+            // "&"-strip for any title that doesn't follow the "...(&X)" form.
+            QString title = menu->title();
+            const int mnemonicAt = title.indexOf(QStringLiteral("(&"));
+            if (mnemonicAt >= 0 && title.endsWith(QLatin1Char(')')))
+                title.truncate(mnemonicAt);
+            title.remove(QLatin1Char('&'));
+            title = title.trimmed();
+            if (title.isEmpty())
+                title = QStringLiteral("その他");
+            const QString menuKey = menuKeyByTitle.value(title, QStringLiteral("menu"));
+            int index = 0;
+            const QList<QAction *> acts = menu->actions();
+            for (QAction *act : acts) {
+                if (!act || act->isSeparator() || act->menu())
+                    continue;
+                const QString label = act->text();
+                if (label.isEmpty())
+                    continue; // widget actions (e.g. the LUT slider) etc.
+                const QString id = QStringLiteral("%1.%2").arg(menuKey).arg(index);
+                ++index;
+                m_favoritableActions.append({id, label, title, act});
+            }
+        }
+    }
+
+    // Populate the お気に入り menu's dynamic part from the persisted list.
+    rebuildFavoritesMenu();
+}
+
+void MainWindow::rebuildFavoritesMenu()
+{
+    if (!m_favoritesMenu)
+        return;
+
+    // Clear everything we own (the proxy actions, any placeholder, and the
+    // bottom separator + edit action) and rebuild from scratch. The
+    // m_editFavoritesAction QAction object is reused — only re-added.
+    m_favoritesMenu->clear();
+
+    QStringList favoriteIds;
+    {
+        QSettings prefSettings(QStringLiteral("VSimpleEditor"), QStringLiteral("Preferences"));
+        favoriteIds = prefSettings.value(QStringLiteral("favoriteActions")).toStringList();
+    }
+
+    int added = 0;
+    for (const QString &id : favoriteIds) {
+        const FavoritableAction *fav = nullptr;
+        for (const auto &candidate : m_favoritableActions) {
+            if (candidate.id == id) {
+                fav = &candidate;
+                break;
+            }
+        }
+        if (!fav || !fav->action)
+            continue; // stale id (renamed/removed action) — silently skip
+        QAction *original = fav->action;
+        // Lightweight proxy — never re-parent or move the real action.
+        auto *proxy = new QAction(original->icon(), original->text(), m_favoritesMenu);
+        proxy->setToolTip(original->toolTip());
+        proxy->setEnabled(original->isEnabled());
+        connect(proxy, &QAction::triggered, original, &QAction::trigger);
+        // Keep the proxy in sync with the original so a context-sensitive
+        // command (e.g. "クリップを分割") greys out / re-labels here too.
+        connect(original, &QAction::changed, proxy, [original, proxy]() {
+            proxy->setEnabled(original->isEnabled());
+            proxy->setText(original->text());
+            proxy->setIcon(original->icon());
+            proxy->setToolTip(original->toolTip());
+        });
+        m_favoritesMenu->addAction(proxy);
+        ++added;
+    }
+
+    if (added == 0) {
+        auto *placeholder = m_favoritesMenu->addAction(
+            QStringLiteral("（「お気に入りを編集...」から機能を追加してください）"));
+        placeholder->setEnabled(false);
+    }
+
+    m_favoritesMenu->addSeparator();
+    if (m_editFavoritesAction)
+        m_favoritesMenu->addAction(m_editFavoritesAction);
+}
+
+void MainWindow::editFavorites()
+{
+    FavoritesEditDialog dialog(this);
+
+    QVector<QPair<QString, QString>> idLabelPairs;
+    QHash<QString, QString> idToMenuPath;
+    idLabelPairs.reserve(m_favoritableActions.size());
+    for (const auto &fav : m_favoritableActions) {
+        idLabelPairs.append({fav.id, fav.label});
+        idToMenuPath.insert(fav.id, fav.menuPath);
+    }
+    dialog.setAvailableActions(idLabelPairs, idToMenuPath);
+
+    {
+        QSettings prefSettings(QStringLiteral("VSimpleEditor"), QStringLiteral("Preferences"));
+        dialog.setSelectedIds(prefSettings.value(QStringLiteral("favoriteActions")).toStringList());
+    }
+
+    if (dialog.exec() != QDialog::Accepted)
+        return;
+
+    const QStringList chosen = dialog.selectedIds();
+    {
+        QSettings prefSettings(QStringLiteral("VSimpleEditor"), QStringLiteral("Preferences"));
+        prefSettings.setValue(QStringLiteral("favoriteActions"), chosen);
+    }
+    rebuildFavoritesMenu();
+    statusBar()->showMessage(
+        QStringLiteral("お気に入りを更新しました（%1 件）").arg(chosen.size()), 4000);
 }
 
 void MainWindow::applyMenuHelpTooltips(bool enabled)

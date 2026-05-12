@@ -76,6 +76,7 @@ class ExportDialog;
 class BrushAnimation;
 class RotoToolsDialog;
 class TimeRemapDialog;
+class FavoritesEditDialog;
 
 namespace voiceover {
 class VoiceOverDialog;
@@ -287,6 +288,10 @@ private slots:
     void openTimeRemapDialog();
     void configureTrackMatte();
 
+    // User-customizable "お気に入り" menu — opens FavoritesEditDialog, then
+    // persists the chosen action ids to QSettings and rebuilds the menu.
+    void editFavorites();
+
 protected:
     void dragEnterEvent(QDragEnterEvent *event) override;
     void dropEvent(QDropEvent *event) override;
@@ -300,6 +305,12 @@ private:
     // description (enabled) or clears it (disabled). Persisted via
     // QSettings("VSimpleEditor","Preferences") key "showMenuHints".
     void applyMenuHelpTooltips(bool enabled);
+    // Rebuilds the dynamic part of the お気に入り menu from the persisted
+    // QSettings("VSimpleEditor","Preferences")/favoriteActions id list.
+    // For each known id, adds a fresh lightweight proxy QAction that mirrors
+    // the original action's icon/text and forwards trigger() to it. Always
+    // re-appends a separator + the 「お気に入りを編集...」 action at the bottom.
+    void rebuildFavoritesMenu();
     void setupToolBar();
     void setupUI();
     void setupRecentFiles();
@@ -476,6 +487,24 @@ private:
     // applied/cleared by applyMenuHelpTooltips() and toggled via the
     // "メニューの説明を表示" preference.
     QVector<QPair<QAction *, QString>> m_menuHelpEntries;
+
+    // User-customizable "お気に入り" menu support.
+    // FavoritableAction::id is a STABLE string (e.g. "file.new", "edit.split")
+    // — never the translated text — so the persisted favorites list survives
+    // UI-text changes. label = current display text (shown in the editor
+    // dialog), menuPath = parent menu title used for grouping in the dialog,
+    // action = the real menu QAction (the proxy added to the お気に入り menu
+    // forwards trigger() to it). Populated in setupMenuBar() alongside
+    // m_menuHelpEntries.
+    struct FavoritableAction {
+        QString id;
+        QString label;
+        QString menuPath;
+        QAction *action = nullptr;
+    };
+    QVector<FavoritableAction> m_favoritableActions;
+    QMenu *m_favoritesMenu = nullptr;
+    QAction *m_editFavoritesAction = nullptr;
 
     // Consolidation: docks for the per-track audio panels (EQ /
     // Compressor / Reverb / Noise Reduction). Created on first use and

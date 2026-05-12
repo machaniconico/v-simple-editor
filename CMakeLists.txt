@@ -199,6 +199,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/RotoToolsDialog.cpp
     src/TimeRemapDialog.h
     src/TimeRemapDialog.cpp
+    src/FavoritesEditDialog.h
+    src/FavoritesEditDialog.cpp
     src/WarpDistortion.cpp
     src/NodeGraph.h
     src/NodeGraph.cpp
