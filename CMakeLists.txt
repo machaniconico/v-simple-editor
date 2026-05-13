@@ -255,7 +255,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/RecentFiles.cpp
     src/ShortcutCustomizeDialog.cpp
     src/ShortcutCustomizeDialog.h
-    src/ShortcutEditor.cpp
+
     src/ShortcutManager.cpp
     src/ShortcutManager.h
     src/VSTHost.cpp

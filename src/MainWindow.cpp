@@ -458,8 +458,6 @@ MainWindow::MainWindow(QWidget *parent)
     updateEditActions();
     updateTitle();
 
-    // Shortcut manager - load saved shortcuts
-    ShortcutManager::instance().loadShortcuts();
 
     // Script engine. init() probes python3/python via QProcess with 3-second
     // timeouts each — on Windows when Python isn't installed, the
@@ -1204,13 +1202,6 @@ void MainWindow::setupMenuBar()
     connect(stabilizeAct, &QAction::triggered, this, &MainWindow::runMotionStabilizer);
 
     editMenu->addSeparator();
-
-    auto *shortcutAction = editMenu->addAction("キーボードショートカット(&K)...");
-    shortcutAction->setShortcut(QKeySequence(Qt::CTRL | Qt::ALT | Qt::Key_K));
-    connect(shortcutAction, &QAction::triggered, this, &MainWindow::editShortcuts);
-    prefsMenu->addAction(shortcutAction);
-    m_menuHelpEntries.append({shortcutAction,
-        QStringLiteral("よく使う操作のキー割り当てを自分好みに変えられます。")});
 
     // US-SC-B: Sprint 12 — Premiere/FCP/DaVinci 風プリセット切替 + 個別カスタマイズ
     auto *shortcutCustomizeAction = editMenu->addAction(QStringLiteral("ショートカット設定…"));
@@ -7369,15 +7360,6 @@ void MainWindow::openRecentFile(const QString &filePath)
         }
     } else {
         loadMediaFile(filePath, false, "Opened");
-    }
-}
-
-void MainWindow::editShortcuts()
-{
-    ShortcutEditorDialog dialog(this);
-    if (dialog.exec() == QDialog::Accepted) {
-        ShortcutManager::instance().saveShortcuts();
-        statusBar()->showMessage("Keyboard shortcuts updated");
     }
 }
 

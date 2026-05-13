@@ -59,7 +59,7 @@
 #include "Precompose.h"
 #include "Rotoscope.h"
 #include "WarpDistortion.h"
-#include "ShortcutEditor.h"
+
 #include "RecentFiles.h"
 #include "ShaderEffect.h"
 #include "VSTHost.h"
@@ -240,7 +240,6 @@ private slots:
     void about();
 
     // Phase 14 slots
-    void editShortcuts();
     void openRecentFile(const QString &filePath);
     void applyShaderEffect();
     void manageShaderEffects();
