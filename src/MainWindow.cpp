@@ -34,6 +34,9 @@
 #include "HDRSettingsDialog.h"
 #include "AIProcessingDialog.h"
 #include "PluginBrowserDialog.h"
+#include "AIMaskDialog.h"
+#include "AudioClipEditor.h"
+#include "MagneticTimeline.h"
 #include <QApplication>
 #include <QMessageBox>
 #include <QMenu>
@@ -1070,6 +1073,13 @@ void MainWindow::setupMenuBar()
     m_menuHelpEntries.append({m_rippleDeleteAction,
         QStringLiteral("クリップを消して、空いた隙間を後ろのクリップが詰めて埋めます。間を空けたくないときに。")});
 
+    // US-WF-D: Sprint 11 workflow — magnetic timeline closeGaps demo.
+    auto *magTlDemoAction = editMenu->addAction("タイムラインギャップを詰める (Demo)");
+    magTlDemoAction->setObjectName("action_magnetic_timeline_demo");
+    connect(magTlDemoAction, &QAction::triggered, this, &MainWindow::runMagneticTimelineDemo);
+    m_menuHelpEntries.append({magTlDemoAction,
+        QStringLiteral("Magnetic Timeline の closeGaps を 2 クリップの合成例で実行し、結果を表示します (デモ)。")});
+
     editMenu->addSeparator();
 
     m_copyEffectsAction = editMenu->addAction("Copy Effects");
@@ -1505,6 +1515,13 @@ void MainWindow::setupMenuBar()
     m_menuHelpEntries.append({nrPanelAction,
         QStringLiteral("「サーッ」という背景ノイズや空調音を減らす画面を開きます。")});
 
+    // US-WF-D: Sprint 11 workflow — per-clip volume envelope editor (AudioClipEditor).
+    auto *clipVolumeEditorAction = audioMenu->addAction("クリップボリュームエンベロープエディタ…");
+    clipVolumeEditorAction->setObjectName("action_audio_clip_editor");
+    connect(clipVolumeEditorAction, &QAction::triggered, this, &MainWindow::openAudioClipEditorDialog);
+    m_menuHelpEntries.append({clipVolumeEditorAction,
+        QStringLiteral("クリップ内のボリュームエンベロープ (時間 × dB) を点で編集する画面を開きます。")});
+
     // マーカー メニュー
     auto *markersMenu = menuBar()->addMenu("マーカー(&K)");
 
@@ -1842,6 +1859,13 @@ void MainWindow::setupMenuBar()
     connect(pluginBrowserAction, &QAction::triggered, this, &MainWindow::onPluginBrowser);
     m_menuHelpEntries.append({pluginBrowserAction,
         QStringLiteral("OFX 風 plugin manifest を持つプラグインを検出して一覧表示する (実行は将来対応)。")});
+
+    // US-WF-D: Sprint 11 workflow — AI auto-mask generation.
+    auto *aiMaskAction = toolsMenu->addAction("AI マスクを生成…");
+    aiMaskAction->setObjectName("action_aimask_dialog");
+    connect(aiMaskAction, &QAction::triggered, this, &MainWindow::openAIMaskDialog);
+    m_menuHelpEntries.append({aiMaskAction,
+        QStringLiteral("輝度しきい値 / 色域 / 外部プラグインで自動マスクを生成するダイアログを開く。")});
 
     // US-SNS-7: LoudnessPanel dock (created here so menu action can reference it)
     m_loudnessDock = new QDockWidget("ラウドネスパネル", this);
@@ -7070,6 +7094,57 @@ void MainWindow::onPluginBrowser()
         + QStringLiteral("/plugins");
     PluginBrowserDialog dlg(defaultDir, this);
     dlg.exec();
+}
+
+// US-WF-D: Sprint 11 workflow menu slots. The 3 slots open AI auto-mask /
+// per-clip audio envelope editor / magnetic-timeline demo. Each dialog is
+// kept alive between invocations (cached as a member) so window state and
+// in-progress edits survive a close-and-reopen.
+void MainWindow::openAIMaskDialog()
+{
+    if (!m_aiMaskDialog) {
+        m_aiMaskDialog = new AIMaskDialog(this);
+    }
+    // TODO: pass the currently-selected clip's preview frame as the source
+    // image once a frame-grab path from VideoPlayer/GLPreview is available.
+    m_aiMaskDialog->show();
+    m_aiMaskDialog->raise();
+    m_aiMaskDialog->activateWindow();
+}
+
+void MainWindow::openAudioClipEditorDialog()
+{
+    if (!m_audioClipEditorDialog) {
+        m_audioClipEditorDialog = new QDialog(this);
+        m_audioClipEditorDialog->setWindowTitle(QStringLiteral("クリップボリュームエンベロープ"));
+        m_audioClipEditorDialog->setObjectName(QStringLiteral("audioClipEditorWrapper"));
+        auto *layout = new QVBoxLayout(m_audioClipEditorDialog);
+        auto *editor = new AudioClipEditor(m_audioClipEditorDialog);
+        editor->setObjectName(QStringLiteral("audioClipEditor"));
+        editor->setClipDuration(10000); // demo: 10sec
+        layout->addWidget(editor);
+        m_audioClipEditorDialog->resize(640, 240);
+    }
+    m_audioClipEditorDialog->show();
+    m_audioClipEditorDialog->raise();
+    m_audioClipEditorDialog->activateWindow();
+}
+
+void MainWindow::runMagneticTimelineDemo()
+{
+    QList<magtl::Clip> demo;
+    demo.append(magtl::Clip{0, 0, 1000, QStringLiteral("A")});
+    demo.append(magtl::Clip{0, 1100, 2000, QStringLiteral("B")});  // 100ms gap
+    const auto closed = magtl::closeGaps(demo);
+    QString summary = QStringLiteral("MagneticTimeline closeGaps demo:\n");
+    for (const auto &c : closed) {
+        summary += QStringLiteral("  track=%1 [%2..%3] id=%4\n")
+                       .arg(c.trackIndex)
+                       .arg(c.startMs)
+                       .arg(c.endMs)
+                       .arg(c.id);
+    }
+    QMessageBox::information(this, QStringLiteral("Magnetic Timeline Demo"), summary);
 }
 
 void MainWindow::editTransformKeyframes()

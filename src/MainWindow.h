@@ -91,6 +91,8 @@ class ProjectCollectorDialog;
 class HDRSettingsDialog;
 class AIProcessingDialog;
 class PluginBrowserDialog;
+class AIMaskDialog;
+class AudioClipEditor;
 
 namespace voiceover {
 class VoiceOverDialog;
@@ -317,6 +319,11 @@ private slots:
     void onHDRSettings();
     void onAIProcessing();
     void onPluginBrowser();
+
+    // US-WF-D: Sprint 11 workflow — 3 new menu actions
+    void openAIMaskDialog();
+    void openAudioClipEditorDialog();
+    void runMagneticTimelineDemo();
 
     // User-customizable "お気に入り" menu — opens FavoritesEditDialog, then
     // persists the chosen action ids to QSettings and rebuilds the menu.
@@ -563,6 +570,12 @@ private:
     // Modeless render queue dialog — kept alive between invocations so
     // running jobs persist when the user closes the window.
     class RenderQueueDialog *m_renderQueueDialog = nullptr;
+
+    // US-WF-D: Sprint 11 workflow dialogs — kept alive between invocations.
+    // m_aiMaskDialog hosts AIMask preview & generate UI; m_audioClipEditorDialog
+    // is a lightweight QDialog wrapper around an AudioClipEditor widget.
+    class AIMaskDialog *m_aiMaskDialog = nullptr;
+    class QDialog *m_audioClipEditorDialog = nullptr;
 
     // Voice-over recording
     voiceover::VoiceOverDialog *m_voiceOverDialog = nullptr;

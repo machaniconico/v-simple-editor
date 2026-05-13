@@ -94,6 +94,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/SceneCutScanner.cpp
     src/SceneCutDialog.h
     src/SceneCutDialog.cpp
+    src/AudioClipEditor.h
+    src/AudioClipEditor.cpp
     src/AudioDucking.h
     src/AudioDucking.cpp
     src/AudioDuckingDialog.h
@@ -115,6 +117,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/SubtitleGenerator.cpp
     src/SubtitleTrackRenderer.h
     src/SubtitleTrackRenderer.cpp
+    src/MagneticTimeline.h
+    src/MagneticTimeline.cpp
     src/MotionTracker.cpp
     src/MotionStabilizer.cpp
     src/TrackerLink.cpp
@@ -164,6 +168,10 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/VoiceOverDialog.h
     src/VoiceOverDialog.cpp
     src/AIHighlight.cpp
+    src/AIMask.h
+    src/AIMask.cpp
+    src/AIMaskDialog.h
+    src/AIMaskDialog.cpp
     src/SceneDetector.cpp
     src/LayerCompositor.cpp
     src/TransformAnimator.cpp

@@ -95,6 +95,20 @@
 #define HAVE_PLUGINMANIFEST 1
 #endif
 
+// US-WF-D: Sprint 11 workflow self-test dependencies.
+#if __has_include("AIMask.h")
+#include "AIMask.h"
+#define HAVE_AIMASK 1
+#endif
+#if __has_include("MagneticTimeline.h")
+#include "MagneticTimeline.h"
+#define HAVE_MAGTL 1
+#endif
+#if __has_include("AudioClipEditor.h")
+#include "AudioClipEditor.h"
+#define HAVE_AUDIOCLIPEDITOR 1
+#endif
+
 // ──────────────────────────────────────────────────────────────────────────
 // Lightweight file-backed logger + unhandled-exception reporter.
 //
@@ -1414,6 +1428,166 @@ int runProExtSelftest()
     return 0;
 }
 
+// US-WF-D: Sprint 11 workflow self-test (VEDITOR_WORKFLOW_SELFTEST=1).
+// Exercises AI auto-mask, Magnetic Timeline, and AudioClipEditor envelope
+// evaluation without spinning up MainWindow. Each block is guarded by
+// HAVE_* macros so the test still passes when a header is unavailable.
+int runWorkflowSelftest()
+{
+    QString error;
+
+#ifdef HAVE_AIMASK
+    {
+        // Pure white 8x8: LumaThreshold (threshold=0.5) -> all pixels above
+        // threshold, mask should be fully opaque (255).
+        QImage white(8, 8, QImage::Format_ARGB32);
+        white.fill(QColor(255, 255, 255, 255));
+        aimask::MaskParams params;
+        params.engine = aimask::Engine::LumaThreshold;
+        params.lumaThreshold = 0.5;
+        const aimask::MaskResult resultWhite = aimask::generateMask(white, params);
+        if (!requireSelftest(resultWhite.success,
+                             QStringLiteral("aimask::generateMask(white) reported failure: ")
+                                 + resultWhite.error,
+                             &error))
+            return 1;
+        if (!requireSelftest(!resultWhite.mask.isNull()
+                                 && resultWhite.mask.size() == white.size(),
+                             QStringLiteral("aimask::generateMask(white) returned null/wrong-size mask"),
+                             &error))
+            return 1;
+        bool allFullyOpaqueWhite = true;
+        for (int y = 0; y < resultWhite.mask.height() && allFullyOpaqueWhite; ++y) {
+            for (int x = 0; x < resultWhite.mask.width(); ++x) {
+                const int gray = qGray(resultWhite.mask.pixel(x, y));
+                if (gray != 255) {
+                    allFullyOpaqueWhite = false;
+                    break;
+                }
+            }
+        }
+        if (!requireSelftest(allFullyOpaqueWhite,
+                             QStringLiteral("aimask LumaThreshold(white) mask not all 255"),
+                             &error))
+            return 1;
+
+        // Pure black 8x8: LumaThreshold (threshold=0.5) -> all pixels below
+        // threshold, mask should be fully transparent (0).
+        QImage black(8, 8, QImage::Format_ARGB32);
+        black.fill(QColor(0, 0, 0, 255));
+        const aimask::MaskResult resultBlack = aimask::generateMask(black, params);
+        if (!requireSelftest(resultBlack.success,
+                             QStringLiteral("aimask::generateMask(black) reported failure: ")
+                                 + resultBlack.error,
+                             &error))
+            return 1;
+        bool allZeroBlack = true;
+        for (int y = 0; y < resultBlack.mask.height() && allZeroBlack; ++y) {
+            for (int x = 0; x < resultBlack.mask.width(); ++x) {
+                const int gray = qGray(resultBlack.mask.pixel(x, y));
+                if (gray != 0) {
+                    allZeroBlack = false;
+                    break;
+                }
+            }
+        }
+        if (!requireSelftest(allZeroBlack,
+                             QStringLiteral("aimask LumaThreshold(black) mask not all 0"),
+                             &error))
+            return 1;
+    }
+#endif // HAVE_AIMASK
+
+#ifdef HAVE_MAGTL
+    {
+        // AC2: 2 clips with a 100ms gap should be packed (closeGaps).
+        QList<magtl::Clip> twoWithGap;
+        twoWithGap.append(magtl::Clip{0, 0, 1000, QStringLiteral("A")});
+        twoWithGap.append(magtl::Clip{0, 1100, 2000, QStringLiteral("B")});
+        const QList<magtl::Clip> packed = magtl::closeGaps(twoWithGap);
+        if (!requireSelftest(packed.size() == 2,
+                             QStringLiteral("magtl::closeGaps did not preserve clip count"),
+                             &error))
+            return 1;
+        if (!requireSelftest(packed.at(0).startMs == 0 && packed.at(0).endMs == 1000,
+                             QStringLiteral("magtl::closeGaps moved/altered first clip"),
+                             &error))
+            return 1;
+        // Second clip should now butt up against first (start == 1000) and
+        // preserve its duration (900ms -> end == 1900).
+        if (!requireSelftest(packed.at(1).startMs == 1000 && packed.at(1).endMs == 1900,
+                             QStringLiteral("magtl::closeGaps did not collapse the 100ms gap"),
+                             &error))
+            return 1;
+
+        // AC4: 3 clips, delete index=1, expect 2 clips and the trailing clip
+        // shifted forward by the deleted clip's duration.
+        QList<magtl::Clip> threeClips;
+        threeClips.append(magtl::Clip{0, 0, 1000, QStringLiteral("A")});
+        threeClips.append(magtl::Clip{0, 1000, 1500, QStringLiteral("B")}); // 500ms
+        threeClips.append(magtl::Clip{0, 1500, 2500, QStringLiteral("C")});
+        const QList<magtl::Clip> afterDelete = magtl::rippleDelete(threeClips, 1);
+        if (!requireSelftest(afterDelete.size() == 2,
+                             QStringLiteral("magtl::rippleDelete did not reduce clip count to 2"),
+                             &error))
+            return 1;
+        if (!requireSelftest(afterDelete.at(0).startMs == 0
+                                 && afterDelete.at(0).endMs == 1000
+                                 && afterDelete.at(0).id == QStringLiteral("A"),
+                             QStringLiteral("magtl::rippleDelete altered the first clip"),
+                             &error))
+            return 1;
+        // Third clip (C) should have shifted left by 500ms (deleted B duration).
+        if (!requireSelftest(afterDelete.at(1).startMs == 1000
+                                 && afterDelete.at(1).endMs == 2000
+                                 && afterDelete.at(1).id == QStringLiteral("C"),
+                             QStringLiteral("magtl::rippleDelete did not shift trailing clip"),
+                             &error))
+            return 1;
+    }
+#endif // HAVE_MAGTL
+
+#ifdef HAVE_AUDIOCLIPEDITOR
+    {
+        // AudioClipEditor is a QWidget; QApplication must already exist
+        // (caller dispatches runWorkflowSelftest after QApplication construction).
+        AudioClipEditor editor;
+        editor.setClipDuration(5000);
+        editor.clearEnvelope();
+        const QList<VolumeEnvelopePoint> defaultEnv = editor.envelope();
+        if (!requireSelftest(defaultEnv.size() == 2,
+                             QStringLiteral("AudioClipEditor::clearEnvelope did not yield 2 points"),
+                             &error))
+            return 1;
+        if (!requireSelftest(defaultEnv.at(0).timeMs == 0
+                                 && std::abs(defaultEnv.at(0).dB - 0.0) < 1e-6,
+                             QStringLiteral("AudioClipEditor default first point != (0, 0dB)"),
+                             &error))
+            return 1;
+        if (!requireSelftest(defaultEnv.at(1).timeMs == 5000
+                                 && std::abs(defaultEnv.at(1).dB - 0.0) < 1e-6,
+                             QStringLiteral("AudioClipEditor default last point != (5000, 0dB)"),
+                             &error))
+            return 1;
+
+        QList<VolumeEnvelopePoint> custom;
+        custom.append(VolumeEnvelopePoint{0,    0.0});
+        custom.append(VolumeEnvelopePoint{2500, -6.0});
+        custom.append(VolumeEnvelopePoint{5000, 0.0});
+        editor.setEnvelope(custom);
+        const double dbAtMid = editor.evaluateAt(2500);
+        if (!requireSelftest(std::abs(dbAtMid - (-6.0)) < 1e-6,
+                             QStringLiteral("AudioClipEditor::evaluateAt(2500) != -6.0 (got %1)")
+                                 .arg(dbAtMid),
+                             &error))
+            return 1;
+    }
+#endif // HAVE_AUDIOCLIPEDITOR
+
+    qInfo().noquote() << QStringLiteral("WORKFLOW selftest OK");
+    return 0;
+}
+
 } // anonymous namespace
 
 int main(int argc, char *argv[])
@@ -1610,6 +1784,10 @@ int main(int argc, char *argv[])
     if (qEnvironmentVariableIntValue("VEDITOR_PROEXT_SELFTEST") != 0) {
         writeLogLine("INFO", "running VEDITOR_PROEXT_SELFTEST");
         return runProExtSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_WORKFLOW_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_WORKFLOW_SELFTEST");
+        return runWorkflowSelftest();
     }
 
     // スプラッシュ画面
