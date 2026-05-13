@@ -78,6 +78,23 @@
 #define HAVE_SCENEDETECTOR 1
 #endif
 
+#if __has_include("HDRTransfer.h")
+#include "HDRTransfer.h"
+#define HAVE_HDRTRANSFER 1
+#endif
+#if __has_include("AIUpscale.h")
+#include "AIUpscale.h"
+#define HAVE_AIUPSCALE 1
+#endif
+#if __has_include("FrameInterpolator.h")
+#include "FrameInterpolator.h"
+#define HAVE_FRAMEINTERP 1
+#endif
+#if __has_include("PluginManifest.h")
+#include "PluginManifest.h"
+#define HAVE_PLUGINMANIFEST 1
+#endif
+
 // ──────────────────────────────────────────────────────────────────────────
 // Lightweight file-backed logger + unhandled-exception reporter.
 //
@@ -1246,6 +1263,157 @@ int runHwPerfSelftest()
     return 0;
 }
 
+// US-EXT-5: Sprint 10 pro-extension self-test (VEDITOR_PROEXT_SELFTEST=1)
+int runProExtSelftest()
+{
+    QString error;
+
+#ifdef HAVE_HDRTRANSFER
+    {
+        // PQ EOTF at 0 is ~0
+        if (!requireSelftest(hdr::pqEotf(0.0f) <= 0.001f,
+                             QStringLiteral("PQ EOTF at 0 is ~0"), &error))
+            return 1;
+        // PQ EOTF at 0.5 > 0
+        if (!requireSelftest(hdr::pqEotf(0.5f) > 0.0f,
+                             QStringLiteral("PQ EOTF at 0.5 > 0"), &error))
+            return 1;
+        // Monotonicity: pqOetf(pqEotf(0.3)) ≈ 0.3 within 1e-2
+        if (!requireSelftest(std::abs(hdr::pqOetf(hdr::pqEotf(0.3f)) - 0.3f) < 1e-2f,
+                             QStringLiteral("pqOetf(pqEotf(0.3)) not within 1e-2 of 0.3"), &error))
+            return 1;
+        // applyToneMapReinhard: white 8x8 -> output size 8x8, Format_ARGB32, all pixels <= 255
+        QImage white(8, 8, QImage::Format_ARGB32);
+        white.fill(QColor(255, 255, 255, 255));
+        const QImage tonemapped = hdr::applyToneMapReinhard(white);
+        if (!requireSelftest(!tonemapped.isNull() && tonemapped.size() == QSize(8, 8)
+                                 && tonemapped.format() == QImage::Format_ARGB32,
+                             QStringLiteral("applyToneMapReinhard: invalid output size/format"), &error))
+            return 1;
+        bool allPixelsValid = true;
+        for (int y = 0; y < tonemapped.height(); ++y) {
+            for (int x = 0; x < tonemapped.width(); ++x) {
+                const QRgb px = tonemapped.pixel(x, y);
+                if (qRed(px) > 255 || qGreen(px) > 255 || qBlue(px) > 255) {
+                    allPixelsValid = false;
+                }
+            }
+        }
+        if (!requireSelftest(allPixelsValid,
+                             QStringLiteral("applyToneMapReinhard: pixel value out of range"), &error))
+            return 1;
+        // convertColorSpace determinism: same input -> bits() identical on two calls
+        const QImage cs1 = hdr::convertColorSpace(white, hdr::TransferFn::SDR_Gamma22, hdr::TransferFn::PQ_HDR10);
+        const QImage cs2 = hdr::convertColorSpace(white, hdr::TransferFn::SDR_Gamma22, hdr::TransferFn::PQ_HDR10);
+        if (!requireSelftest(!cs1.isNull() && cs1.size() == white.size(),
+                             QStringLiteral("convertColorSpace returned null/wrong size"), &error))
+            return 1;
+        if (!requireSelftest(std::memcmp(cs1.bits(), cs2.bits(),
+                                         static_cast<size_t>(cs1.sizeInBytes())) == 0,
+                             QStringLiteral("convertColorSpace not deterministic"), &error))
+            return 1;
+    }
+#endif // HAVE_HDRTRANSFER
+
+#ifdef HAVE_AIUPSCALE
+    {
+        // 8x8 test image
+        QImage test(8, 8, QImage::Format_ARGB32);
+        for (int y = 0; y < 8; ++y)
+            for (int x = 0; x < 8; ++x)
+                test.setPixel(x, y, qRgba(x * 32, y * 32, 128, 255));
+        // LanczosUpscaler::upscale(test, 2) -> 16x16
+        LanczosUpscaler lanczos;
+        const QImage upscaled = lanczos.upscale(test, 2);
+        if (!requireSelftest(!upscaled.isNull() && upscaled.size() == QSize(16, 16),
+                             QStringLiteral("LanczosUpscaler::upscale: wrong output size"), &error))
+            return 1;
+        // Determinism: two calls produce identical bits
+        const QImage up1 = lanczos.upscale(test, 2);
+        const QImage up2 = lanczos.upscale(test, 2);
+        if (!requireSelftest(std::memcmp(up1.bits(), up2.bits(),
+                                         static_cast<size_t>(up1.sizeInBytes())) == 0,
+                             QStringLiteral("LanczosUpscaler::upscale not deterministic"), &error))
+            return 1;
+        // Engine registry
+        if (!requireSelftest(AIUpscaleManager::engines().size() >= 2,
+                             QStringLiteral("AIUpscaleManager: fewer than 2 engines registered"), &error))
+            return 1;
+        if (!requireSelftest(AIUpscaleManager::engineByName(QStringLiteral("Lanczos3")) != nullptr,
+                             QStringLiteral("AIUpscaleManager: Lanczos3 engine not found"), &error))
+            return 1;
+    }
+#endif // HAVE_AIUPSCALE
+
+#ifdef HAVE_FRAMEINTERP
+    {
+        QImage black(8, 8, QImage::Format_ARGB32);
+        black.fill(QColor(0, 0, 0, 255));
+        QImage white(8, 8, QImage::Format_ARGB32);
+        white.fill(QColor(255, 255, 255, 255));
+        LinearBlendInterpolator lbi;
+        // interpolate(black, white, 0.5) -> 8x8, channels ~127
+        const QImage mid = lbi.interpolate(black, white, 0.5);
+        if (!requireSelftest(!mid.isNull() && mid.size() == QSize(8, 8),
+                             QStringLiteral("LinearBlendInterpolator::interpolate(0.5): wrong size"), &error))
+            return 1;
+        const QColor midPx = mid.pixelColor(4, 4);
+        if (!requireSelftest(midPx.red() >= 120 && midPx.red() <= 135,
+                             QStringLiteral("LinearBlendInterpolator::interpolate(0.5): channel not ~127"), &error))
+            return 1;
+        // interpolate(black, white, 0.0) bits() == black bits()
+        const QImage atZero = lbi.interpolate(black, white, 0.0);
+        if (!requireSelftest(!atZero.isNull() && atZero.size() == black.size(),
+                             QStringLiteral("LinearBlendInterpolator::interpolate(0.0): wrong size"), &error))
+            return 1;
+        if (!requireSelftest(std::memcmp(atZero.bits(), black.bits(),
+                                         static_cast<size_t>(black.sizeInBytes())) == 0,
+                             QStringLiteral("LinearBlendInterpolator::interpolate(0.0) != a"), &error))
+            return 1;
+        // interpolate(black, white, 1.0) bits() == white bits()
+        const QImage atOne = lbi.interpolate(black, white, 1.0);
+        if (!requireSelftest(!atOne.isNull() && atOne.size() == white.size(),
+                             QStringLiteral("LinearBlendInterpolator::interpolate(1.0): wrong size"), &error))
+            return 1;
+        if (!requireSelftest(std::memcmp(atOne.bits(), white.bits(),
+                                         static_cast<size_t>(white.sizeInBytes())) == 0,
+                             QStringLiteral("LinearBlendInterpolator::interpolate(1.0) != b"), &error))
+            return 1;
+        // Determinism
+        const QImage d1 = lbi.interpolate(black, white, 0.5);
+        const QImage d2 = lbi.interpolate(black, white, 0.5);
+        if (!requireSelftest(std::memcmp(d1.bits(), d2.bits(),
+                                         static_cast<size_t>(d1.sizeInBytes())) == 0,
+                             QStringLiteral("LinearBlendInterpolator::interpolate not deterministic"), &error))
+            return 1;
+        // Engine registry
+        if (!requireSelftest(FrameInterpolatorManager::engineByName(QStringLiteral("Linear")) != nullptr,
+                             QStringLiteral("FrameInterpolatorManager: Linear engine not found"), &error))
+            return 1;
+    }
+#endif // HAVE_FRAMEINTERP
+
+#ifdef HAVE_PLUGINMANIFEST
+    {
+        // Non-existent path -> empty result
+        const QVector<PluginInfo> r1 =
+            PluginManifestScanner::scanFolder(QStringLiteral("/__veditor_no_such_path__"));
+        if (!requireSelftest(r1.isEmpty(),
+                             QStringLiteral("PluginManifest::scanFolder non-existent path should be empty"), &error))
+            return 1;
+        // Determinism: two calls produce identical results
+        const QVector<PluginInfo> r2 =
+            PluginManifestScanner::scanFolder(QStringLiteral("/__veditor_no_such_path__"));
+        if (!requireSelftest(r1.size() == r2.size(),
+                             QStringLiteral("PluginManifest::scanFolder not deterministic"), &error))
+            return 1;
+    }
+#endif // HAVE_PLUGINMANIFEST
+
+    qInfo() << "PROEXT selftest OK";
+    return 0;
+}
+
 } // anonymous namespace
 
 int main(int argc, char *argv[])
@@ -1438,6 +1606,10 @@ int main(int argc, char *argv[])
     if (qEnvironmentVariableIntValue("VEDITOR_HWPERF_SELFTEST") != 0) {
         writeLogLine("INFO", "running VEDITOR_HWPERF_SELFTEST");
         return runHwPerfSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_PROEXT_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_PROEXT_SELFTEST");
+        return runProExtSelftest();
     }
 
     // スプラッシュ画面

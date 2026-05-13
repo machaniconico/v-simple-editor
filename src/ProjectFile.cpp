@@ -278,6 +278,28 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
         root["duckingEnabled"] = data.duckingEnabled;
     }
 
+    // US-EXT-10: HDR + AI processing settings (Sprint 10) — always written so
+    // a saved project round-trips even with default values.
+    {
+        QJsonObject hdr;
+        hdr["mode"]                       = data.hdrSettings.mode;
+        hdr["masterDisplayLuminanceMin"]  = data.hdrSettings.masterDisplayLuminanceMin;
+        hdr["masterDisplayLuminanceMax"]  = data.hdrSettings.masterDisplayLuminanceMax;
+        hdr["maxCll"]                     = data.hdrSettings.maxCll;
+        hdr["maxFall"]                    = data.hdrSettings.maxFall;
+        hdr["previewToneMap"]             = data.hdrSettings.previewToneMap;
+        root["hdrSettings"] = hdr;
+
+        QJsonObject ai;
+        ai["upscaleEnabled"]      = data.aiSettings.upscaleEnabled;
+        ai["upscaleEngine"]       = data.aiSettings.upscaleEngine;
+        ai["upscaleFactor"]       = data.aiSettings.upscaleFactor;
+        ai["frameInterpEnabled"]  = data.aiSettings.frameInterpEnabled;
+        ai["frameInterpEngine"]   = data.aiSettings.frameInterpEngine;
+        ai["frameInterpFactor"]   = data.aiSettings.frameInterpFactor;
+        root["aiSettings"] = ai;
+    }
+
     QJsonDocument doc(root);
     QFile file(filePath);
     if (!file.open(QIODevice::WriteOnly))
@@ -471,6 +493,33 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
         data.duckingEnabled = root.contains("duckingEnabled")
                                 ? root["duckingEnabled"].toBool(false)
                                 : false;
+    }
+
+    // US-EXT-10: HDR + AI processing settings (Sprint 10) — backward compat:
+    // missing keys keep HDRSettings{} / AIProcessingSettings{} defaults so older
+    // .veditor files without these fields still load cleanly.
+    {
+        const HDRSettings hdrDefaults;
+        const QJsonObject hdr = root.contains("hdrSettings")
+                                   ? root["hdrSettings"].toObject()
+                                   : QJsonObject{};
+        data.hdrSettings.mode                      = hdr.value("mode").toString(hdrDefaults.mode);
+        data.hdrSettings.masterDisplayLuminanceMin = hdr.value("masterDisplayLuminanceMin").toDouble(hdrDefaults.masterDisplayLuminanceMin);
+        data.hdrSettings.masterDisplayLuminanceMax = hdr.value("masterDisplayLuminanceMax").toDouble(hdrDefaults.masterDisplayLuminanceMax);
+        data.hdrSettings.maxCll                    = hdr.value("maxCll").toInt(hdrDefaults.maxCll);
+        data.hdrSettings.maxFall                   = hdr.value("maxFall").toInt(hdrDefaults.maxFall);
+        data.hdrSettings.previewToneMap            = hdr.value("previewToneMap").toString(hdrDefaults.previewToneMap);
+
+        const AIProcessingSettings aiDefaults;
+        const QJsonObject ai = root.contains("aiSettings")
+                                   ? root["aiSettings"].toObject()
+                                   : QJsonObject{};
+        data.aiSettings.upscaleEnabled     = ai.value("upscaleEnabled").toBool(aiDefaults.upscaleEnabled);
+        data.aiSettings.upscaleEngine      = ai.value("upscaleEngine").toString(aiDefaults.upscaleEngine);
+        data.aiSettings.upscaleFactor      = ai.value("upscaleFactor").toInt(aiDefaults.upscaleFactor);
+        data.aiSettings.frameInterpEnabled = ai.value("frameInterpEnabled").toBool(aiDefaults.frameInterpEnabled);
+        data.aiSettings.frameInterpEngine  = ai.value("frameInterpEngine").toString(aiDefaults.frameInterpEngine);
+        data.aiSettings.frameInterpFactor  = ai.value("frameInterpFactor").toInt(aiDefaults.frameInterpFactor);
     }
 
     return true;
@@ -671,6 +720,28 @@ QString ProjectFile::toJsonString(const ProjectData &data)
         root["duckingEnabled"] = data.duckingEnabled;
     }
 
+    // US-EXT-10: HDR + AI processing settings (Sprint 10) — always written so
+    // a saved project round-trips even with default values.
+    {
+        QJsonObject hdr;
+        hdr["mode"]                       = data.hdrSettings.mode;
+        hdr["masterDisplayLuminanceMin"]  = data.hdrSettings.masterDisplayLuminanceMin;
+        hdr["masterDisplayLuminanceMax"]  = data.hdrSettings.masterDisplayLuminanceMax;
+        hdr["maxCll"]                     = data.hdrSettings.maxCll;
+        hdr["maxFall"]                    = data.hdrSettings.maxFall;
+        hdr["previewToneMap"]             = data.hdrSettings.previewToneMap;
+        root["hdrSettings"] = hdr;
+
+        QJsonObject ai;
+        ai["upscaleEnabled"]      = data.aiSettings.upscaleEnabled;
+        ai["upscaleEngine"]       = data.aiSettings.upscaleEngine;
+        ai["upscaleFactor"]       = data.aiSettings.upscaleFactor;
+        ai["frameInterpEnabled"]  = data.aiSettings.frameInterpEnabled;
+        ai["frameInterpEngine"]   = data.aiSettings.frameInterpEngine;
+        ai["frameInterpFactor"]   = data.aiSettings.frameInterpFactor;
+        root["aiSettings"] = ai;
+    }
+
     QJsonDocument doc(root);
     return QString::fromUtf8(doc.toJson(QJsonDocument::Compact));
 }
@@ -856,6 +927,33 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
         data.duckingEnabled = root.contains("duckingEnabled")
                                 ? root["duckingEnabled"].toBool(false)
                                 : false;
+    }
+
+    // US-EXT-10: HDR + AI processing settings (Sprint 10) — backward compat:
+    // missing keys keep HDRSettings{} / AIProcessingSettings{} defaults so older
+    // .veditor files without these fields still load cleanly.
+    {
+        const HDRSettings hdrDefaults;
+        const QJsonObject hdr = root.contains("hdrSettings")
+                                   ? root["hdrSettings"].toObject()
+                                   : QJsonObject{};
+        data.hdrSettings.mode                      = hdr.value("mode").toString(hdrDefaults.mode);
+        data.hdrSettings.masterDisplayLuminanceMin = hdr.value("masterDisplayLuminanceMin").toDouble(hdrDefaults.masterDisplayLuminanceMin);
+        data.hdrSettings.masterDisplayLuminanceMax = hdr.value("masterDisplayLuminanceMax").toDouble(hdrDefaults.masterDisplayLuminanceMax);
+        data.hdrSettings.maxCll                    = hdr.value("maxCll").toInt(hdrDefaults.maxCll);
+        data.hdrSettings.maxFall                   = hdr.value("maxFall").toInt(hdrDefaults.maxFall);
+        data.hdrSettings.previewToneMap            = hdr.value("previewToneMap").toString(hdrDefaults.previewToneMap);
+
+        const AIProcessingSettings aiDefaults;
+        const QJsonObject ai = root.contains("aiSettings")
+                                   ? root["aiSettings"].toObject()
+                                   : QJsonObject{};
+        data.aiSettings.upscaleEnabled     = ai.value("upscaleEnabled").toBool(aiDefaults.upscaleEnabled);
+        data.aiSettings.upscaleEngine      = ai.value("upscaleEngine").toString(aiDefaults.upscaleEngine);
+        data.aiSettings.upscaleFactor      = ai.value("upscaleFactor").toInt(aiDefaults.upscaleFactor);
+        data.aiSettings.frameInterpEnabled = ai.value("frameInterpEnabled").toBool(aiDefaults.frameInterpEnabled);
+        data.aiSettings.frameInterpEngine  = ai.value("frameInterpEngine").toString(aiDefaults.frameInterpEngine);
+        data.aiSettings.frameInterpFactor  = ai.value("frameInterpFactor").toInt(aiDefaults.frameInterpFactor);
     }
 
     return true;

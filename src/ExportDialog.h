@@ -21,6 +21,15 @@ struct ExportPreset {
     int proresProfile = -1;  // -1 = not ProRes; 0=Proxy,1=LT,2=SQ,3=HQ,4=4444,5=4444XQ
 };
 
+struct HDRSettings {
+    QString mode = "sdr";                    // "sdr" | "hdr10" | "hlg"
+    double masterDisplayLuminanceMin = 0.01; // cd/m²
+    double masterDisplayLuminanceMax = 1000.0;
+    int maxCll = 1000;                       // cd/m²
+    int maxFall = 400;
+    QString previewToneMap = "reinhard";     // "reinhard" | "hable" | "none"
+};
+
 struct ExportConfig {
     QString outputPath;
     QString videoCodec = "libx264";
@@ -34,8 +43,9 @@ struct ExportConfig {
     bool useHardwareAccel = false;
     QString hwEncoder;       // "", "auto" → auto-detect; "none" → SW only; "nvenc"/"qsv"/"amf" → vendor explicit
     int maxFileSizeMB = 0;
-    bool hdr10 = false;  // 10-bit BT.2020/PQ output when true
+    bool hdr10 = false;  // 10-bit BT.2020/PQ output when true (preserved for backward compat)
     int proresProfile = -1;  // -1 = not ProRes; 0..5 = Proxy/LT/SQ/HQ/4444/4444XQ
+    HDRSettings hdrSettings; // extended HDR metadata
 
     QString codecDisplayName() const;
 };

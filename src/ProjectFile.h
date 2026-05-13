@@ -17,6 +17,8 @@
 #include "ClipExpressionBindings.h"
 #include "WiggleTransform.h"
 #include "AudioDucking.h"
+#include "ExportDialog.h"           // HDRSettings struct
+#include "AIProcessingDialog.h"     // AIProcessingSettings struct
 
 // --- Audio mixer serialization sub-types ---
 
@@ -243,6 +245,13 @@ struct ProjectData {
     // US-HW-10: audio ducking project state (Sprint 9)
     DuckingParams duckingParams;
     bool duckingEnabled = false;
+
+    // US-EXT-10: pro-extension project state (Sprint 10) — HDR output settings
+    // (HDR10 / HLG metadata + preview tone-map) and AI processing settings
+    // (upscale + frame interpolation). Persisted in .veditor JSON; missing keys
+    // restore defaults to keep older project files loadable.
+    HDRSettings          hdrSettings;
+    AIProcessingSettings aiSettings;
 };
 
 class ProjectFile

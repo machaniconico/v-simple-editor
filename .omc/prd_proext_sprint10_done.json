@@ -1,0 +1,373 @@
+{
+  "task": "Sprint 10 — Pro 寄せ拡張: HDR (Rec.2020/HLG/HDR10 display preview + export metadata) + AI Upscale & Frame Interpolation (Real-ESRGAN/RIFE 形状の plugin interface + Lanczos/linear baseline) + プラグイン基盤 (OFX 風 manifest + folder scan + browser UI, 実行は将来課題)。既存 Exporter / ExportConfig / ExportDialog / VideoEffect / MainWindow / ProjectFile を拡張、新規 DSP/エンジン/UI ファイルを 8 個追加し US-EXT-10 で一括 CMake/MainWindow 配線。",
+  "createdAt": "2026-05-14T00:30:00.000Z",
+  "updatedAt": "2026-05-13T15:33:58.742Z",
+  "model": {
+    "implementation": "qwen-local/qwen-160k-q8",
+    "review": null,
+    "codex": "gpt-5.4",
+    "codexEffort": "xhigh",
+    "tierStrategy": {
+      "enabled": true,
+      "windowSeconds": 18000,
+      "applyToReview": true,
+      "tiers": [
+        {
+          "name": "S",
+          "lazyLoad": false,
+          "models": [
+            {
+              "id": "opencode-go/qwen3.6-plus",
+              "quotaPerWindow": 3300
+            },
+            {
+              "id": "opencode-go/deepseek-v4-pro",
+              "quotaPerWindow": 3450
+            },
+            {
+              "id": "opencode-go/minimax-m2.7",
+              "quotaPerWindow": 3400
+            },
+            {
+              "id": "opencode-go/kimi-k2.6",
+              "quotaPerWindow": 1150
+            }
+          ]
+        },
+        {
+          "name": "A",
+          "lazyLoad": false,
+          "models": [
+            {
+              "id": "opencode-go/qwen3.5-plus",
+              "quotaPerWindow": 10200
+            },
+            {
+              "id": "opencode-go/deepseek-v4-flash",
+              "quotaPerWindow": 31650
+            },
+            {
+              "id": "opencode-go/mimo-v2.5-pro",
+              "quotaPerWindow": 1290
+            },
+            {
+              "id": "opencode-go/glm-5.1",
+              "quotaPerWindow": 880
+            }
+          ]
+        },
+        {
+          "name": "Local",
+          "lazyLoad": true,
+          "models": [
+            {
+              "id": "qwen-local/qwen-160k-q8",
+              "quotaPerWindow": null
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "concurrency": {
+    "maxOpencodeWorkers": 2,
+    "maxCodexWorkers": 2,
+    "maxReviewWorkers": 2
+  },
+  "globalConstraints": [
+    "新規アーキは導入しない。既存の Exporter / ExportConfig (ExportDialog.h) / ExportDialog / VideoEffect / GLPreview / Timeline / ClipInfo / ProjectFile / MainWindow を拡張・配線する。",
+    "既存の public API・関数シグネチャ・メニュー項目・View メニューの dock・MainWindow.h の前方宣言は一切削除・改名しない。menu-help 機能 (m_menuHelpEntries / applyMenuHelpTooltips / setToolTipsVisible) と『お気に入り』メニュー機能 (FavoritesEditDialog / m_favorites*) も保持する。Sprint 8 の 3D/Expression/Wiggle 機能、Sprint 9 の HW エンコード/SceneCut/Ducking/Collect Files 機能も壊さない。",
+    "FFmpeg 連携は既存の Exporter のスタイル (extern \"C\" avformat/avcodec/avutil) に合わせる。x265-params 追加は既存 HDR10 経路を拡張する形で。新しい外部依存は追加しない (AI は plugin interface だけ作り、実装は Lanczos / 線形ブレンドの baseline)。",
+    "新規ファイルの CMake 追加・main.cpp include・MainWindow 配線は最終ストーリー US-EXT-10 が一括で行う。各非統合ストーリーの結果には 'CMake/MainWindow wiring deferred to US-EXT-10' と明記する。レビュー前に新規ファイルを `git add -N` すること。",
+    "MSVC + Qt6 ビルド前提。Qt6 の落とし穴に注意: QLabel::pixmap() 値返し / QFormLayout が QWidget::layout() をシャドー / qsizetype↔int 縮小変換 / .cpp 内 Q_OBJECT には #include \"<file>.moc\" 必須 (ただしヘッダに Q_OBJECT なら不要) / QImage Format_RGBA8888 vs ARGB32 / MSVC リテラル ~16KB 制限。",
+    "クラウド OpenCode が連続 hang のため Phase 5 escalation = Claude executor 並列で全 story を実行する想定。engine: opencode のままで良いが実際は dispatcher の Phase 5 ロジック (Claude executor) で実装される。"
+  ],
+  "stories": [
+    {
+      "id": "US-EXT-1",
+      "title": "HDRTransfer (新規) — HDR ↔ SDR 変換ユーティリティ",
+      "description": "Goal: 新規 src/HDRTransfer.{h,cpp}。Pure DSP、QtCore のみ依存 (QImage)。HDR10 (PQ EOTF/OETF), HLG, Rec.2020 ↔ Rec.709 色空間変換、Reinhard/Hable tone map を提供。namespace hdr { enum class TransferFn { Linear, SDR_Gamma22, PQ_HDR10, HLG }; }、float pqEotf(float v) / pqOetf(float L) / hlgEotf / hlgOetf、QImage applyToneMapReinhard(const QImage& linearRec2020, double exposure=1.0) と applyToneMapHable、QImage convertColorSpace(const QImage& src, TransferFn srcFn, TransferFn dstFn) を実装。入出力ともに ARGB32 (QImage 標準 8-bit)、決定的・有界・NaN/inf なし。CMake/MainWindow wiring deferred to US-EXT-10。git add -N。",
+      "acceptance": [
+        "src/HDRTransfer.h が namespace hdr に enum TransferFn と pqEotf/pqOetf/hlgEotf/hlgOetf/applyToneMapReinhard/applyToneMapHable/convertColorSpace を宣言する。",
+        "pqOetf(pqEotf(v))≈v が単調増加で誤差 < 1e-3 (内部 double 精度)。",
+        "applyToneMapReinhard が真っ白入力で全画素 ≤ 1.0 相当に圧縮、真っ黒入力で全画素 0 を維持。出力 QImage::Format_ARGB32、サイズは入力と同じ。NaN/inf を含まない。",
+        "convertColorSpace(src, PQ_HDR10, SDR_Gamma22) が決定的かつ同入力で 2 回呼んで完全一致。値域は 8-bit [0..255]。",
+        "MSVC + Linux でビルドが通る。CMake/MainWindow wiring deferred to US-EXT-10。"
+      ],
+      "touchedFiles": [
+        "src/HDRTransfer.h",
+        "src/HDRTransfer.cpp"
+      ],
+      "dependsOn": [],
+      "priority": 10,
+      "engine": "opencode",
+      "maxRetries": 4,
+      "retryCount": 0,
+      "implemented": true,
+      "reviewed": true,
+      "passes": true,
+      "lastResultPath": ".omc/state/dualralph-results/US-EXT-1.json",
+      "lastFeedback": ""
+    },
+    {
+      "id": "US-EXT-2",
+      "title": "AIUpscale (新規) — Lanczos/Bicubic + plugin hook",
+      "description": "Goal: 新規 src/AIUpscale.{h,cpp}。QImage 入出力で 2x/4x のアップスケール。Lanczos3 / Bicubic を baseline 実装、virtual interface で AI plugin hook (Real-ESRGAN 形状の future-pluggable engine) も用意。class AIUpscaleEngine (abstract): virtual ~AIUpscaleEngine() = default; virtual QString name() const = 0; virtual int maxScale() const = 0; virtual QImage upscale(const QImage& src, int scale) = 0; LanczosUpscaler (Lanczos3, a=3, sinc-windowed)、BicubicUpscaler (Catmull-Rom)、AIUpscaleManager: static QVector<AIUpscaleEngine*> engines()、engineByName、registerEngine。入力 ARGB32, scale=2 or 4。決定的・メモリ安全 (大画像でも段階的 row processing、bits() を使う)。CMake/MainWindow wiring deferred to US-EXT-10。git add -N。",
+      "acceptance": [
+        "src/AIUpscale.h が AIUpscaleEngine abstract (name/maxScale/upscale) と LanczosUpscaler / BicubicUpscaler / AIUpscaleManager を宣言。",
+        "LanczosUpscaler::upscale(src, 2) が src の幅・高さ 2倍の Format_ARGB32 を返す。LanczosUpscaler::name() == \"Lanczos3\"、maxScale() >= 4。",
+        "scale が 1 のときは入力と等しい QImage を返す。scale が 0/負値/maxScale 超過のときはクラッシュしない (入力そのまま or QImage())。",
+        "AIUpscaleManager::engines() が Lanczos と Bicubic を含む。engineByName(\"Lanczos3\") が non-null。",
+        "同入力で 2 回 upscale 呼んで結果完全一致 (決定的)。NaN/inf なし。8x8 のテスト画像で 2x → 16x16 サイズ確認可能。",
+        "MSVC + Linux でビルドが通る。CMake/MainWindow wiring deferred to US-EXT-10。"
+      ],
+      "touchedFiles": [
+        "src/AIUpscale.h",
+        "src/AIUpscale.cpp"
+      ],
+      "dependsOn": [],
+      "priority": 10,
+      "engine": "opencode",
+      "maxRetries": 4,
+      "retryCount": 0,
+      "implemented": true,
+      "reviewed": true,
+      "passes": true,
+      "lastResultPath": ".omc/state/dualralph-results/US-EXT-2.json",
+      "lastFeedback": ""
+    },
+    {
+      "id": "US-EXT-3",
+      "title": "FrameInterpolator (新規) — 線形/モーションブレンド + plugin hook",
+      "description": "Goal: 新規 src/FrameInterpolator.{h,cpp}。2 フレーム間に中間フレームを生成。Linear blend baseline + virtual interface で AI plugin hook (RIFE 形状の future-pluggable engine)。class FrameInterpolatorEngine (abstract): virtual ~FrameInterpolatorEngine() = default; virtual QString name() const = 0; virtual QImage interpolate(const QImage& a, const QImage& b, double t) = 0; LinearBlendInterpolator (a*(1-t) + b*t の per-pixel ブレンド、a/b 同サイズ前提)、MotionBlendInterpolator (簡易 block-match motion estimation + warp + blend、fallback で Linear と同じ OK)、FrameInterpolatorManager: engines()、engineByName、registerEngine。決定的、サイズ不一致でもクラッシュなし、t<0 → a、t>1 → b。CMake/MainWindow wiring deferred to US-EXT-10。git add -N。",
+      "acceptance": [
+        "src/FrameInterpolator.h が FrameInterpolatorEngine abstract + LinearBlendInterpolator + MotionBlendInterpolator + FrameInterpolatorManager を宣言。",
+        "LinearBlendInterpolator::interpolate(a, b, 0.5) が要素毎平均値の QImage (同サイズ、Format_ARGB32) を返す。",
+        "interpolate(a, b, 0.0) が a と等しく、interpolate(a, b, 1.0) が b と等しい。t<0/t>1 でクラッシュなし。",
+        "MotionBlendInterpolator が non-null かつサイズ一致で返ってくる (最低限 Linear と同じ動作で OK)。",
+        "FrameInterpolatorManager::engines() が両エンジンを含み、engineByName(\"Linear\") が non-null。",
+        "同入力で 2 回 interpolate を呼んで結果完全一致 (決定的)。",
+        "MSVC + Linux でビルドが通る。CMake/MainWindow wiring deferred to US-EXT-10。"
+      ],
+      "touchedFiles": [
+        "src/FrameInterpolator.h",
+        "src/FrameInterpolator.cpp"
+      ],
+      "dependsOn": [],
+      "priority": 10,
+      "engine": "opencode",
+      "maxRetries": 4,
+      "retryCount": 0,
+      "implemented": true,
+      "reviewed": true,
+      "passes": true,
+      "lastResultPath": ".omc/state/dualralph-results/US-EXT-3.json",
+      "lastFeedback": ""
+    },
+    {
+      "id": "US-EXT-4",
+      "title": "PluginManifest (新規) — JSON manifest スキャナ",
+      "description": "Goal: 新規 src/PluginManifest.{h,cpp}。指定フォルダ配下の plugin manifest (JSON) を再帰スキャンして PluginInfo の QVector を返す。実行は future、メタデータ表示専用。struct PluginInfo { QString id; QString name; QString version; QString category; QString vendor; QString description; QString manifestPath; QStringList paramNames; QStringList tags; };、class PluginManifestScanner : public QObject with static QVector<PluginInfo> scanFolder(const QString& dir, int maxDepth = 3)。dir 配下を QDirIterator で再帰、.json を読み 'pluginType'==\"ofx\" or \"veditor\" のものをパース。不正 JSON や非該当 type は skip。IO エラーは lastWarnings() に積む。決定的に同入力で同結果 (sort)。CMake/MainWindow wiring deferred to US-EXT-10。git add -N。",
+      "acceptance": [
+        "src/PluginManifest.h が PluginInfo struct と PluginManifestScanner::scanFolder(QString, int) を宣言する。",
+        "scanFolder が valid な .json (pluginType==\"ofx\" or \"veditor\") を読んで PluginInfo を返す。不正 JSON や非該当 type は skip。",
+        "存在しないフォルダパスで空 vector を返し、クラッシュしない。",
+        "同フォルダで 2 回呼ぶと結果順序込みで完全一致 (sort されている)。",
+        "lastWarnings() に IO エラー件が文字列で蓄積される。",
+        "MSVC + Linux でビルドが通る。CMake/MainWindow wiring deferred to US-EXT-10。"
+      ],
+      "touchedFiles": [
+        "src/PluginManifest.h",
+        "src/PluginManifest.cpp"
+      ],
+      "dependsOn": [],
+      "priority": 10,
+      "engine": "opencode",
+      "maxRetries": 4,
+      "retryCount": 0,
+      "implemented": true,
+      "reviewed": true,
+      "passes": true,
+      "lastResultPath": ".omc/state/dualralph-results/US-EXT-4.json",
+      "lastFeedback": ""
+    },
+    {
+      "id": "US-EXT-5",
+      "title": "Pro 拡張自己テスト (main.cpp, VEDITOR_PROEXT_SELFTEST)",
+      "description": "Goal: Sprint 10 の新モジュール (HDRTransfer, AIUpscale, FrameInterpolator, PluginManifest) を env var で起動できる自己テストを main.cpp に追加。既存 selftest パターン (runVfxSelftest/runProSelftest/runMographSelftest/runHwPerfSelftest と requireSelftest ヘルパ) に厳密に倣う。Files: src/main.cpp のみ (include + 新 runProExtSelftest() + env dispatch 1 行)。include は #if __has_include(\"<file>.h\") でガード (US-EXT-10 で CMake に追加されると activate)。runProExtSelftest(): HDRTransfer の pq/hlg 単調性 + tone map 値域 + convertColorSpace 決定性、AIUpscale の 2x サイズ + 決定性、FrameInterpolator の中間値 + 端点 + 決定性、PluginManifest の non-existent フォルダ → 空。全部通れば qInfo 'PROEXT selftest OK' を出して 0。ディスパッチに VEDITOR_PROEXT_SELFTEST 追加。CMake wiring deferred to US-EXT-10。",
+      "acceptance": [
+        "src/main.cpp に int runProExtSelftest() が追加され、HDRTransfer/AIUpscale/FrameInterpolator/PluginManifest の基本動作を requireSelftest で検証する。",
+        "ディスパッチ部に if (qEnvironmentVariableIntValue(\"VEDITOR_PROEXT_SELFTEST\") != 0) { ...; return runProExtSelftest(); } が既存 selftest 群の並びに追加されている。",
+        "include は #if __has_include(\"<file>.h\") でガードされる。",
+        "MainWindow 配線・CMakeLists・他モジュールには手を入れていない (main.cpp のみ)。既存 selftest 関数群 (VFX/PRO/MOGRAPH/HWPERF) と env dispatch は壊していない。",
+        "MSVC + Linux でビルドが通る (モジュール未リンク時は __has_include ガードで selftest 中身がスキップされ、US-EXT-10 後は常時有効)。"
+      ],
+      "touchedFiles": [
+        "src/main.cpp"
+      ],
+      "dependsOn": [],
+      "priority": 10,
+      "engine": "opencode",
+      "maxRetries": 4,
+      "retryCount": 0,
+      "implemented": true,
+      "reviewed": true,
+      "passes": true,
+      "lastResultPath": ".omc/state/dualralph-results/US-EXT-5.json",
+      "lastFeedback": ""
+    },
+    {
+      "id": "US-EXT-6",
+      "title": "HDRSettingsDialog (新規) + ExportConfig HDR 拡張",
+      "description": "Goal: 新規 src/HDRSettingsDialog.{h,cpp} と ExportConfig の HDR メタデータ拡張。Files: src/HDRSettingsDialog.{h,cpp} + src/ExportDialog.h (HDRSettings struct 追加と ExportConfig へのフィールド追加のみ、ExportDialog クラス変更は禁止)。struct HDRSettings { QString mode; double masterDisplayLuminanceMin = 0.01; double masterDisplayLuminanceMax = 1000.0; int maxCll = 1000; int maxFall = 400; QString previewToneMap; };、ExportConfig に HDRSettings hdrSettings; 追加 (既存 bool hdr10 は保持、後方互換)。HDRSettingsDialog (QDialog + Q_OBJECT): コンストラクタ (const HDRSettings&, QWidget*)、UI = mode combo (SDR/HDR10/HLG) + maxLum spin + minLum spin + maxCll/maxFall spin + toneMap combo + OK/Cancel、accessor HDRSettings settings() const。CMake/MainWindow wiring deferred to US-EXT-10。git add -N。",
+      "acceptance": [
+        "src/ExportDialog.h の ExportConfig に HDRSettings hdrSettings フィールドが追加。既存フィールド (hdr10 など) は保持。HDRSettings struct も同 .h に宣言。",
+        "HDRSettingsDialog.h が QDialog 派生で settings() const を持ち、UI は 6 種の widget (mode/maxLum/minLum/maxCll/maxFall/toneMap) + OK/Cancel を持つ。",
+        "コンストラクタが initial を反映し、OK で settings() が編集後の値を返す。Cancel で initial と同じ。",
+        "ExportDialog クラス (UI/slot) は変更されていない。",
+        "MSVC + Qt6 でビルドが通る。CMake/MainWindow wiring deferred to US-EXT-10。"
+      ],
+      "touchedFiles": [
+        "src/HDRSettingsDialog.h",
+        "src/HDRSettingsDialog.cpp",
+        "src/ExportDialog.h"
+      ],
+      "dependsOn": [],
+      "priority": 10,
+      "engine": "opencode",
+      "maxRetries": 4,
+      "retryCount": 0,
+      "implemented": true,
+      "reviewed": true,
+      "passes": true,
+      "lastResultPath": ".omc/state/dualralph-results/US-EXT-6.json",
+      "lastFeedback": ""
+    },
+    {
+      "id": "US-EXT-7",
+      "title": "AIProcessingDialog (新規) — AI Upscale + FrameInterp 設定 UI",
+      "description": "Goal: 新規 src/AIProcessingDialog.{h,cpp}。AIUpscale エンジン選択 + 倍率、FrameInterpolator エンジン選択 + 補間率を編集する。struct AIProcessingSettings { bool upscaleEnabled = false; QString upscaleEngine = \"Lanczos3\"; int upscaleFactor = 2; bool frameInterpEnabled = false; QString frameInterpEngine = \"Linear\"; int frameInterpFactor = 2; };、AIProcessingDialog (QDialog + Q_OBJECT): コンストラクタ (const AIProcessingSettings&, QWidget*)、UI = Upscale group (enable check + engine combo + factor spin) + FrameInterp group (enable check + engine combo + factor spin) + OK/Cancel、accessor AIProcessingSettings settings() const。engine combo は AIUpscaleManager::engines() / FrameInterpolatorManager::engines() から populate (hardcoded fallback も OK)。CMake/MainWindow wiring deferred to US-EXT-10。git add -N。",
+      "acceptance": [
+        "src/AIProcessingDialog.h が AIProcessingSettings struct + AIProcessingDialog (QDialog) を宣言し、settings() を持つ。",
+        "UI に Upscale group (enable / engine combo / factor spin) と FrameInterp group (enable / engine combo / factor spin) が並ぶ。",
+        "engine combo は AIUpscaleManager::engines() / FrameInterpolatorManager::engines() から populate (未実装なら hardcoded で OK)。",
+        "initial の各フィールドを UI に反映、OK で settings() が編集後を返す。Cancel で initial と同じ。",
+        "MSVC + Qt6 でビルドが通る。CMake/MainWindow wiring deferred to US-EXT-10。"
+      ],
+      "touchedFiles": [
+        "src/AIProcessingDialog.h",
+        "src/AIProcessingDialog.cpp"
+      ],
+      "dependsOn": [
+        "US-EXT-2",
+        "US-EXT-3"
+      ],
+      "priority": 20,
+      "engine": "opencode",
+      "maxRetries": 4,
+      "retryCount": 0,
+      "implemented": true,
+      "reviewed": true,
+      "passes": true,
+      "lastResultPath": ".omc/state/dualralph-results/US-EXT-7.json",
+      "lastFeedback": ""
+    },
+    {
+      "id": "US-EXT-8",
+      "title": "PluginBrowserDialog (新規) — プラグイン一覧 UI",
+      "description": "Goal: 新規 src/PluginBrowserDialog.{h,cpp}。PluginManifestScanner::scanFolder() で得た PluginInfo を一覧表示。実行ボタンは greyed-out (将来課題)。コンストラクタ PluginBrowserDialog(const QString& pluginRootDir, QWidget* parent)。UI: 'プラグインフォルダ:' QLineEdit + [参照...] [再スキャン] / 中央 QTreeWidget (name/vendor/version/category) / 右側 QTextEdit (readonly, JSON pretty printed) / 下に [プラグイン実行] (disabled, TODO ツールチップ) + [閉じる]。accessor QString currentPluginManifestPath() const。CMake/MainWindow wiring deferred to US-EXT-10。git add -N。",
+      "acceptance": [
+        "src/PluginBrowserDialog.h が QDialog 派生で currentPluginManifestPath() const を持つ。",
+        "UI に plugin フォルダパス入力 + 参照 + 再スキャン + 結果 TreeWidget + 詳細 QTextEdit + 実行 (disabled) + 閉じる があり、再スキャンで PluginManifestScanner が呼ばれて TreeWidget が更新される。",
+        "存在しないフォルダ指定でも空 Tree を表示しクラッシュしない。",
+        "選択変更で QTextEdit に対応する manifest JSON が pretty printed で表示される。",
+        "MSVC + Qt6 でビルドが通る。CMake/MainWindow wiring deferred to US-EXT-10。"
+      ],
+      "touchedFiles": [
+        "src/PluginBrowserDialog.h",
+        "src/PluginBrowserDialog.cpp"
+      ],
+      "dependsOn": [
+        "US-EXT-4"
+      ],
+      "priority": 20,
+      "engine": "opencode",
+      "maxRetries": 4,
+      "retryCount": 0,
+      "implemented": true,
+      "reviewed": true,
+      "passes": true,
+      "lastResultPath": ".omc/state/dualralph-results/US-EXT-8.json",
+      "lastFeedback": ""
+    },
+    {
+      "id": "US-EXT-9",
+      "title": "Exporter HDR メタデータ統合",
+      "description": "Goal: Exporter で HDRSettings に基づいて libx265 の HDR10 mastering metadata と MaxFALL/MaxCLL を x265-params に注入。Files: src/Exporter.cpp, src/Exporter.h。config.hdrSettings.mode が 'hdr10' のとき x265-params に master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(<maxLumX10000>,<minLumX10000>) と max-cll=<maxCll>,<maxFall> を追加。HLG モードは libx265 に colorprim=bt2020 transfer=arib-std-b67 colormatrix=bt2020nc を AVColorSpace 経由で設定。SDR モードは既存挙動。HDR モード時に pix_fmt を AV_PIX_FMT_YUV420P10LE。HW エンコーダ (nvenc/qsv/amf) も HDR と組合せ可能 (metadata は output stream に av_dict_set)。qInfo 'HDR mode: <mode>, MaxCLL=<v>, MaxFALL=<v>' を encoder open 直後に。CMake/MainWindow wiring deferred to US-EXT-10。",
+      "acceptance": [
+        "Exporter.cpp で config.hdrSettings.mode が 'hdr10' のとき、x265-params に master-display と max-cll 文字列が追加されている。'sdr' のとき既存 SDR 経路と同等。'hlg' のとき AVColorSpace/AVColorTransfer/AVColorPrimaries が bt2020/arib-std-b67/bt2020 に設定されている。",
+        "qInfo に 'HDR mode: ...' のログが出る。",
+        "既存の libx264/libx265/svtav1/vp9/prores 経路は壊れていない。Sprint 9 の HW エンコーダ経路 (NVENC/QSV/AMF) も保持され、HDR モードと組み合わせ可能。",
+        "MSVC + Linux でビルドが通る。CMake/MainWindow wiring deferred to US-EXT-10。"
+      ],
+      "touchedFiles": [
+        "src/Exporter.cpp",
+        "src/Exporter.h"
+      ],
+      "dependsOn": [
+        "US-EXT-1",
+        "US-EXT-6"
+      ],
+      "priority": 30,
+      "engine": "opencode",
+      "maxRetries": 4,
+      "retryCount": 0,
+      "implemented": true,
+      "reviewed": true,
+      "passes": true,
+      "lastResultPath": ".omc/state/dualralph-results/US-EXT-9.json",
+      "lastFeedback": ""
+    },
+    {
+      "id": "US-EXT-10",
+      "title": "MainWindow 統合 + ProjectFile 永続化 + CMake 配線 (最終)",
+      "description": "Goal: Sprint 10 の全新規モジュールを CMakeLists.txt に追加、MainWindow にメニュー項目とダイアログ起動を配線、ProjectFile に HDRSettings + AIProcessingSettings を永続化。Files: CMakeLists.txt, src/MainWindow.cpp, src/MainWindow.h, src/main.cpp (US-EXT-5 の selftest 関数は触らない), src/ProjectFile.cpp, src/ProjectFile.h。CMakeLists.txt に 7 source pair (HDRTransfer, AIUpscale, FrameInterpolator, PluginManifest, HDRSettingsDialog, AIProcessingDialog, PluginBrowserDialog) 追加。MainWindow に 3 メニュー (HDR 出力設定 / AI アップスケール+フレーム補間 / プラグインブラウザ)、各 QAction に objectName (action_hdr_settings / action_ai_processing / action_plugin_browser)、menu-help エントリ追加。MainWindow.h に前方宣言 + #include + 3 新 slot + m_hdrSettings + m_aiSettings。**既存 forward decl / member / Sprint 6-9 機能を一切削除しない**。ProjectFile に HDRSettings + AIProcessingSettings round-trip with 後方互換 default。ビルド確認: VEDITOR_PROEXT_SELFTEST=1 で 'PROEXT selftest OK'、他 selftest 維持。",
+      "acceptance": [
+        "CMakeLists.txt に HDRTransfer / AIUpscale / FrameInterpolator / PluginManifest / HDRSettingsDialog / AIProcessingDialog / PluginBrowserDialog の .h/.cpp が追加されている (既存エントリ保持)。MSVC + Linux でリンクが通る。",
+        "MainWindow に 'HDR 出力設定...'、'AI アップスケール / フレーム補間...'、'プラグインブラウザ...' のメニュー項目があり、それぞれ対応ダイアログを開く。各 QAction に objectName 設定、お気に入り登録パターンと menu-help エントリに準拠。",
+        "MainWindow.h に m_hdrSettings (HDRSettings) と m_aiSettings (AIProcessingSettings) が追加され、既存の前方宣言・メンバ・menu-help・Favorites・Sprint 6-9 の全機能は一切削除されていない。",
+        "ProjectFile の ProjectData に HDRSettings と AIProcessingSettings が永続フィールドとして追加され、toJsonString↔fromJsonString round-trip。旧 .veditor で読んでもデフォルト値で動く後方互換。",
+        "VEDITOR_PROEXT_SELFTEST=1 で 'PROEXT selftest OK' を出して終了。既存の VFX/PRO/MOGRAPH/HWPERF selftest も壊れていない。",
+        "MSVC (cmd.exe 経由ビルド) でリンク完了。MainWindow.h の前方宣言群削除なし。"
+      ],
+      "touchedFiles": [
+        "CMakeLists.txt",
+        "src/MainWindow.cpp",
+        "src/MainWindow.h",
+        "src/main.cpp",
+        "src/ProjectFile.cpp",
+        "src/ProjectFile.h"
+      ],
+      "dependsOn": [
+        "US-EXT-1",
+        "US-EXT-2",
+        "US-EXT-3",
+        "US-EXT-4",
+        "US-EXT-5",
+        "US-EXT-6",
+        "US-EXT-7",
+        "US-EXT-8",
+        "US-EXT-9"
+      ],
+      "priority": 99,
+      "engine": "opencode",
+      "maxRetries": 5,
+      "retryCount": 0,
+      "implemented": true,
+      "reviewed": true,
+      "passes": true,
+      "lastResultPath": ".omc/state/dualralph-results/US-EXT-10.json",
+      "lastFeedback": ""
+    }
+  ]
+}

@@ -81,6 +81,10 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/HueVsSatEditor.h
     src/Keyframe.cpp
     src/EffectPlugin.cpp
+    src/PluginManifest.cpp
+    src/HDRTransfer.cpp
+    src/AIUpscale.cpp
+    src/FrameInterpolator.cpp
     src/ProjectFile.cpp
     src/ProjectCollector.cpp
     src/ProjectCollector.h
@@ -249,6 +253,16 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/LumetriScopes.cpp
     src/SplashScreen.h
     src/WelcomeWidget.h
+    src/HDRSettingsDialog.h
+    src/HDRSettingsDialog.cpp
+    src/HDRTransfer.h
+    src/AIUpscale.h
+    src/FrameInterpolator.h
+    src/PluginManifest.h
+    src/AIProcessingDialog.h
+    src/AIProcessingDialog.cpp
+    src/PluginBrowserDialog.h
+    src/PluginBrowserDialog.cpp
     resources/resources.qrc
     ${APP_RESOURCES}
 )

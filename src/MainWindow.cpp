@@ -31,6 +31,9 @@
 #include "SceneCutDialog.h"
 #include "AudioDuckingDialog.h"
 #include "ProjectCollectorDialog.h"
+#include "HDRSettingsDialog.h"
+#include "AIProcessingDialog.h"
+#include "PluginBrowserDialog.h"
 #include <QApplication>
 #include <QMessageBox>
 #include <QMenu>
@@ -988,6 +991,13 @@ void MainWindow::setupMenuBar()
     auto *remotionAction = fileMenu->addAction("Remotion形式でエクスポート(&R)...");
     connect(remotionAction, &QAction::triggered, this, &MainWindow::exportToRemotion);
 
+    // US-EXT-10: HDR (HDR10/HLG) output settings dialog.
+    auto *hdrSettingsAction = fileMenu->addAction("HDR 出力設定...");
+    hdrSettingsAction->setObjectName("action_hdr_settings");
+    connect(hdrSettingsAction, &QAction::triggered, this, &MainWindow::onHDRSettings);
+    m_menuHelpEntries.append({hdrSettingsAction,
+        QStringLiteral("HDR (HDR10 / HLG) 書き出しのメタデータと表示プレビュー設定を編集する。")});
+
     // US-HW-10: collect project + referenced media into a single folder.
     auto *collectAction = fileMenu->addAction("プロジェクトを収集 (Collect Files)...");
     collectAction->setObjectName("action_collect_project");
@@ -1817,6 +1827,21 @@ void MainWindow::setupMenuBar()
     connect(multiCamSwitchAction, &QAction::triggered, this, &MainWindow::multiCamSwitch);
     m_menuHelpEntries.append({multiCamSwitchAction,
         QStringLiteral("再生しながらカメラを切り替えていくと、その通りに編集されます。")});
+
+    toolsMenu->addSeparator();
+
+    // US-EXT-10: Sprint 10 pro extensions — AI upscale / frame interpolation + Plugin browser.
+    auto *aiProcessingAction = toolsMenu->addAction("AI アップスケール / フレーム補間...");
+    aiProcessingAction->setObjectName("action_ai_processing");
+    connect(aiProcessingAction, &QAction::triggered, this, &MainWindow::onAIProcessing);
+    m_menuHelpEntries.append({aiProcessingAction,
+        QStringLiteral("AI アップスケール (Lanczos/Bicubic) とフレーム補間 (Linear/Motion-Blend) の処理を設定する。")});
+
+    auto *pluginBrowserAction = toolsMenu->addAction("プラグインブラウザ...");
+    pluginBrowserAction->setObjectName("action_plugin_browser");
+    connect(pluginBrowserAction, &QAction::triggered, this, &MainWindow::onPluginBrowser);
+    m_menuHelpEntries.append({pluginBrowserAction,
+        QStringLiteral("OFX 風 plugin manifest を持つプラグインを検出して一覧表示する (実行は将来対応)。")});
 
     // US-SNS-7: LoudnessPanel dock (created here so menu action can reference it)
     m_loudnessDock = new QDockWidget("ラウドネスパネル", this);
@@ -3220,6 +3245,10 @@ void MainWindow::populateProjectData(ProjectData &data)
     data.duckingParams  = m_duckingParams;
     data.duckingEnabled = m_duckingEnabled;
 
+    // US-EXT-10: persist project-level HDR + AI processing settings.
+    data.hdrSettings = m_hdrSettings;
+    data.aiSettings  = m_aiSettings;
+
     collectAudioState(data);
 
     data.smartReframe = m_smartReframe.toJson();
@@ -3358,6 +3387,9 @@ void MainWindow::applyLoadedProjectData(const ProjectData &data, const QString &
     // US-HW-10: restore project-level sidechain ducking parameters.
     m_duckingParams  = data.duckingParams;
     m_duckingEnabled = data.duckingEnabled;
+    // US-EXT-10: restore project-level HDR + AI processing settings.
+    m_hdrSettings = data.hdrSettings;
+    m_aiSettings  = data.aiSettings;
     m_selectedVideoTrackIndex = -1;
     m_selectedVideoClipIndexTracked = -1;
 
@@ -7000,6 +7032,44 @@ void MainWindow::onCollectProject()
             QStringLiteral("プロジェクトを収集しました: %1").arg(dlg.outputProjectPath()),
             6000);
     }
+}
+
+// US-EXT-10: Sprint 10 pro extension menu slots.
+// Each slot opens the corresponding dialog seeded with the project's persisted
+// member state and writes the dialog's result back on Accept. Persistence
+// happens the next time the project is saved through populateProjectData →
+// ProjectFile.
+void MainWindow::onHDRSettings()
+{
+    HDRSettingsDialog dlg(m_hdrSettings, this);
+    if (dlg.exec() != QDialog::Accepted)
+        return;
+    m_hdrSettings = dlg.settings();
+    statusBar()->showMessage(
+        QStringLiteral("HDR 出力設定を更新しました (%1)").arg(m_hdrSettings.mode),
+        4000);
+}
+
+void MainWindow::onAIProcessing()
+{
+    AIProcessingDialog dlg(m_aiSettings, this);
+    if (dlg.exec() != QDialog::Accepted)
+        return;
+    m_aiSettings = dlg.settings();
+    statusBar()->showMessage(
+        QStringLiteral("AI 処理設定を更新しました (upscale=%1, interp=%2)")
+            .arg(m_aiSettings.upscaleEnabled ? QStringLiteral("ON") : QStringLiteral("OFF"))
+            .arg(m_aiSettings.frameInterpEnabled ? QStringLiteral("ON") : QStringLiteral("OFF")),
+        4000);
+}
+
+void MainWindow::onPluginBrowser()
+{
+    const QString defaultDir =
+        QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation)
+        + QStringLiteral("/plugins");
+    PluginBrowserDialog dlg(defaultDir, this);
+    dlg.exec();
 }
 
 void MainWindow::editTransformKeyframes()

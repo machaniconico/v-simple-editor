@@ -72,6 +72,8 @@
 #include "LoudnessAnalyzer.h"
 #include "SubtitleTrackRenderer.h"
 #include "AudioDucking.h"
+#include "ExportDialog.h"          // brings in HDRSettings
+#include "AIProcessingDialog.h"    // brings in AIProcessingSettings
 
 class VideoPlayer;
 class Timeline;
@@ -86,6 +88,9 @@ class CameraMotionDialog;
 class SceneCutDialog;
 class AudioDuckingDialog;
 class ProjectCollectorDialog;
+class HDRSettingsDialog;
+class AIProcessingDialog;
+class PluginBrowserDialog;
 
 namespace voiceover {
 class VoiceOverDialog;
@@ -308,6 +313,11 @@ private slots:
     void onAudioDuckingSettings();
     void onCollectProject();
 
+    // US-EXT-10: Sprint 10 pro extensions — 3 new menu actions
+    void onHDRSettings();
+    void onAIProcessing();
+    void onPluginBrowser();
+
     // User-customizable "お気に入り" menu — opens FavoritesEditDialog, then
     // persists the chosen action ids to QSettings and rebuilds the menu.
     void editFavorites();
@@ -389,6 +399,12 @@ private:
     // US-HW-10: project-level audio ducking state, persisted via ProjectFile.
     DuckingParams m_duckingParams;
     bool          m_duckingEnabled = false;
+
+    // US-EXT-10: project-level HDR + AI processing state, persisted via
+    // ProjectFile. HDRSettings is defined in ExportDialog.h; AIProcessingSettings
+    // is defined in AIProcessingDialog.h.
+    HDRSettings           m_hdrSettings;
+    AIProcessingSettings  m_aiSettings;
 
     // US-AETEXT-12: AE text feature objects
     QVector<PathText *> m_pathTexts;

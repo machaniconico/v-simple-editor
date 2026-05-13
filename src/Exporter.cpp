@@ -5,6 +5,36 @@
 #include "SubtitleTrackRenderer.h"
 #include <QFileInfo>
 #include <QPainter>
+#include <cmath>
+
+// ---------------------------------------------------------------------------
+// Helper: build x265-params HDR10 metadata string (BT.2020 primaries / D65).
+// Primaries per Rec.2020 (ITU-R BT.2020) × 50000 (x265 unit = 0.00002):
+//   R (0.708, 0.292) → (35400, 14600)
+//   G (0.170, 0.797) → ( 8500, 39850)
+//   B (0.131, 0.046) → ( 6550,  2300)
+//   WP D65 (0.3127, 0.3290) → (15635, 16450)
+// ---------------------------------------------------------------------------
+namespace {
+static QByteArray buildX265Hdr10Params(const HDRSettings& hdr)
+{
+    const int maxLumX10000 = static_cast<int>(std::round(hdr.masterDisplayLuminanceMax * 10000));
+    const int minLumX10000 = static_cast<int>(std::round(hdr.masterDisplayLuminanceMin * 10000));
+    QByteArray s;
+    s.append("hdr10=1:repeat-headers=1:colorprim=bt2020:"
+             "transfer=smpte2084:colormatrix=bt2020nc:range=limited:"
+             "master-display=G(8500,39850)B(6550,2300)R(35400,14600)"
+             "WP(15635,16450)L(");
+    s.append(QByteArray::number(maxLumX10000));
+    s.append(',');
+    s.append(QByteArray::number(minLumX10000));
+    s.append("):max-cll=");
+    s.append(QByteArray::number(hdr.maxCll));
+    s.append(',');
+    s.append(QByteArray::number(hdr.maxFall));
+    return s;
+}
+} // namespace
 
 Exporter::Exporter(QObject *parent)
     : QObject(parent)
@@ -198,20 +228,29 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
     encCtx->height = config.height;
     encCtx->time_base = {1, config.fps};
     encCtx->framerate = {config.fps, 1};
+    // Resolve effective HDR mode: legacy config.hdr10 flag maps to "hdr10"
+    const bool isHdr10Mode = (config.hdrSettings.mode == "hdr10" || config.hdr10);
+    const bool isHlgMode   = (config.hdrSettings.mode == "hlg");
+
     AVPixelFormat targetPixFmt = AV_PIX_FMT_YUV420P;
     if (config.proresProfile >= 4) {
         targetPixFmt = AV_PIX_FMT_YUVA444P10LE;
     } else if (config.proresProfile >= 0) {
         targetPixFmt = AV_PIX_FMT_YUV422P10LE;
-    } else if (config.hdr10) {
+    } else if (isHdr10Mode || isHlgMode) {
         targetPixFmt = AV_PIX_FMT_YUV420P10LE;
     }
     encCtx->pix_fmt = targetPixFmt;
     encCtx->bit_rate = static_cast<int64_t>(config.videoBitrate) * 1000;
 
-    if (config.hdr10) {
+    if (isHdr10Mode) {
         encCtx->color_primaries = AVCOL_PRI_BT2020;
         encCtx->color_trc = AVCOL_TRC_SMPTE2084;
+        encCtx->colorspace = AVCOL_SPC_BT2020_NCL;
+        encCtx->color_range = AVCOL_RANGE_MPEG;
+    } else if (isHlgMode) {
+        encCtx->color_primaries = AVCOL_PRI_BT2020;
+        encCtx->color_trc = AVCOL_TRC_ARIB_STD_B67;
         encCtx->colorspace = AVCOL_SPC_BT2020_NCL;
         encCtx->color_range = AVCOL_RANGE_MPEG;
     }
@@ -232,13 +271,19 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
     } else if (config.videoCodec == "libx264" || config.videoCodec == "libx265") {
         av_dict_set(&opts, "preset", "medium", 0);
         av_dict_set(&opts, "crf", "23", 0);
-        if (config.hdr10 && config.videoCodec == "libx265") {
-            av_dict_set(&opts, "profile", "main10", 0);
-            av_dict_set(&opts,
-                        "x265-params",
-                        "hdr10=1:repeat-headers=1:colorprim=bt2020:"
-                        "transfer=smpte2084:colormatrix=bt2020nc:range=limited",
-                        0);
+        if (config.videoCodec == "libx265") {
+            if (isHdr10Mode) {
+                av_dict_set(&opts, "profile", "main10", 0);
+                const QByteArray x265p = buildX265Hdr10Params(config.hdrSettings);
+                av_dict_set(&opts, "x265-params", x265p.constData(), 0);
+            } else if (isHlgMode) {
+                av_dict_set(&opts, "profile", "main10", 0);
+                av_dict_set(&opts,
+                            "x265-params",
+                            "repeat-headers=1:colorprim=bt2020:"
+                            "transfer=arib-std-b67:colormatrix=bt2020nc",
+                            0);
+            }
         }
     } else if (config.videoCodec == "libsvtav1") {
         av_dict_set(&opts, "preset", "8", 0);
@@ -273,9 +318,14 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
             encCtx->framerate = {config.fps, 1};
             encCtx->pix_fmt = targetPixFmt;
             encCtx->bit_rate = static_cast<int64_t>(config.videoBitrate) * 1000;
-            if (config.hdr10) {
+            if (isHdr10Mode) {
                 encCtx->color_primaries = AVCOL_PRI_BT2020;
                 encCtx->color_trc = AVCOL_TRC_SMPTE2084;
+                encCtx->colorspace = AVCOL_SPC_BT2020_NCL;
+                encCtx->color_range = AVCOL_RANGE_MPEG;
+            } else if (isHlgMode) {
+                encCtx->color_primaries = AVCOL_PRI_BT2020;
+                encCtx->color_trc = AVCOL_TRC_ARIB_STD_B67;
                 encCtx->colorspace = AVCOL_SPC_BT2020_NCL;
                 encCtx->color_range = AVCOL_RANGE_MPEG;
             }
@@ -284,13 +334,19 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
             AVDictionary *swOpts = nullptr;
             av_dict_set(&swOpts, "preset", "medium", 0);
             av_dict_set(&swOpts, "crf", "23", 0);
-            if (config.hdr10 && swCodec == "libx265") {
-                av_dict_set(&swOpts, "profile", "main10", 0);
-                av_dict_set(&swOpts,
-                            "x265-params",
-                            "hdr10=1:repeat-headers=1:colorprim=bt2020:"
-                            "transfer=smpte2084:colormatrix=bt2020nc:range=limited",
-                            0);
+            if (swCodec == "libx265") {
+                if (isHdr10Mode) {
+                    av_dict_set(&swOpts, "profile", "main10", 0);
+                    const QByteArray x265p = buildX265Hdr10Params(config.hdrSettings);
+                    av_dict_set(&swOpts, "x265-params", x265p.constData(), 0);
+                } else if (isHlgMode) {
+                    av_dict_set(&swOpts, "profile", "main10", 0);
+                    av_dict_set(&swOpts,
+                                "x265-params",
+                                "repeat-headers=1:colorprim=bt2020:"
+                                "transfer=arib-std-b67:colormatrix=bt2020nc",
+                                0);
+                }
             }
             if (avcodec_open2(encCtx, encoder, &swOpts) < 0) {
                 av_dict_free(&swOpts);
@@ -308,6 +364,12 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
         }
     } else {
         av_dict_free(&opts);
+    }
+
+    if (isHdr10Mode || isHlgMode) {
+        qInfo() << "HDR mode:" << config.hdrSettings.mode
+                << "MaxCLL=" << config.hdrSettings.maxCll
+                << "MaxFALL=" << config.hdrSettings.maxFall;
     }
 
     avcodec_parameters_from_context(outStream->codecpar, encCtx);
@@ -361,9 +423,14 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
         outFrame->format = targetPixFmt;
         outFrame->width = config.width;
         outFrame->height = config.height;
-        if (config.hdr10) {
+        if (isHdr10Mode) {
             outFrame->color_primaries = AVCOL_PRI_BT2020;
             outFrame->color_trc = AVCOL_TRC_SMPTE2084;
+            outFrame->colorspace = AVCOL_SPC_BT2020_NCL;
+            outFrame->color_range = AVCOL_RANGE_MPEG;
+        } else if (isHlgMode) {
+            outFrame->color_primaries = AVCOL_PRI_BT2020;
+            outFrame->color_trc = AVCOL_TRC_ARIB_STD_B67;
             outFrame->colorspace = AVCOL_SPC_BT2020_NCL;
             outFrame->color_range = AVCOL_RANGE_MPEG;
         }
@@ -401,8 +468,8 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
 
                 av_frame_make_writable(outFrame);
 
-                // 10-bit outputs (HDR10 / ProRes) bypass the 8-bit RGB24 effect round-trip.
-                const bool tenBitPath = config.hdr10 || config.proresProfile >= 0;
+                // 10-bit outputs (HDR10 / HLG / ProRes) bypass the 8-bit RGB24 effect round-trip.
+                const bool tenBitPath = isHdr10Mode || isHlgMode || config.proresProfile >= 0;
                 bool hasEffects = !tenBitPath
                                   && (!clip.colorCorrection.isDefault() || !clip.effects.isEmpty());
                 bool needsRgbPass = hasEffects
