@@ -162,6 +162,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/RenderQueueDialog.cpp
     src/RenderQueueDialog.h
     src/AudioEQ.cpp
+    src/AspectReframer.h
+    src/AspectReframer.cpp
     src/ScreenRecorder.cpp
     src/VoiceOverRecorder.h
     src/VoiceOverRecorder.cpp
@@ -258,6 +260,10 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
 
     src/ShortcutManager.cpp
     src/ShortcutManager.h
+    src/SocialPreset.h
+    src/SocialPreset.cpp
+    src/SocialExportDialog.h
+    src/SocialExportDialog.cpp
     src/VSTHost.cpp
     src/NetworkRender.cpp
     src/RemotionExport.cpp

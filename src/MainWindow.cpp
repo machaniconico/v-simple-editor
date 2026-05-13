@@ -39,6 +39,9 @@
 #include "MagneticTimeline.h"
 #include "ShortcutManager.h"
 #include "ShortcutCustomizeDialog.h"
+#include "SocialExportDialog.h"
+#include "SocialPreset.h"
+#include "AspectReframer.h"
 #include <QApplication>
 #include <QMessageBox>
 #include <QMenu>
@@ -1040,6 +1043,15 @@ void MainWindow::setupMenuBar()
 
     auto *remotionAction = fileMenu->addAction("Remotion形式でエクスポート(&R)...");
     connect(remotionAction, &QAction::triggered, this, &MainWindow::exportToRemotion);
+
+    // US-SC2-B: Sprint 13 — SNS 向けプリセット (Instagram/TikTok/YouTube Shorts) で
+    // 縦動画リフレーミング込みエクスポートを開く。
+    auto *socialExportAction = fileMenu->addAction(QStringLiteral("SNS 向けエクスポート…"));
+    socialExportAction->setObjectName("action_social_export");
+    connect(socialExportAction, &QAction::triggered,
+            this, &MainWindow::openSocialExportDialog);
+    m_menuHelpEntries.append({socialExportAction,
+        QStringLiteral("Instagram / TikTok / YouTube Shorts などの SNS 向けプリセットでエクスポートします (9:16/1:1/4:5 縦動画自動リフレーミング対応)。")});
 
     // US-EXT-10: HDR (HDR10/HLG) output settings dialog.
     auto *hdrSettingsAction = fileMenu->addAction("HDR 出力設定...");
@@ -7331,6 +7343,40 @@ void MainWindow::openShortcutCustomizeDialog()
     m_shortcutCustomizeDialog->show();
     m_shortcutCustomizeDialog->raise();
     m_shortcutCustomizeDialog->activateWindow();
+}
+
+// US-SC2-B: Sprint 13 — open / raise the SNS 向けエクスポート dialog
+// (modeless; preset と reframe 設定をユーザが行い、exportRequested 受信で
+//  実 export 連携は後続スプリントで実装予定)。
+void MainWindow::openSocialExportDialog()
+{
+    if (!m_socialExportDialog) {
+        m_socialExportDialog = new SocialExportDialog(this);
+        m_socialExportDialog->setObjectName(QStringLiteral("socialExportDialog"));
+        // TODO: 現在の preview frame (GLPreview / VideoPlayer) との連携は
+        //       後続スプリント。getCurrentFrame() 等が整備され次第
+        //       m_socialExportDialog->setSampleFrame(sample) を呼ぶ。
+        connect(m_socialExportDialog, &SocialExportDialog::exportRequested,
+                this, [this](const social::Preset& preset,
+                             const reframe::ReframeParams& reframeParams) {
+                    // 暫定: ログ出力 + status bar 通知のみ。実 export 連携は今後。
+                    qInfo().noquote() << QStringLiteral(
+                        "SocialExport requested: preset=%1 res=%2x%3 mode=%4")
+                        .arg(preset.displayName)
+                        .arg(preset.resolution.width())
+                        .arg(preset.resolution.height())
+                        .arg(reframe::modeDisplayName(reframeParams.mode));
+                    if (statusBar()) {
+                        statusBar()->showMessage(
+                            QStringLiteral("%1 へエクスポート (近日実装予定)")
+                                .arg(preset.displayName),
+                            5000);
+                    }
+                });
+    }
+    m_socialExportDialog->show();
+    m_socialExportDialog->raise();
+    m_socialExportDialog->activateWindow();
 }
 
 // --- Phase 14: New slot implementations ---

@@ -115,6 +115,16 @@
 #define HAVE_SHORTCUTMANAGER 1
 #endif
 
+// US-SC2-B: Sprint 13 social export self-test (VEDITOR_SOCIAL_SELFTEST=1)
+#if __has_include("SocialPreset.h")
+#include "SocialPreset.h"
+#define HAVE_SOCIALPRESET 1
+#endif
+#if __has_include("AspectReframer.h")
+#include "AspectReframer.h"
+#define HAVE_ASPECTREFRAMER 1
+#endif
+
 // ──────────────────────────────────────────────────────────────────────────
 // Lightweight file-backed logger + unhandled-exception reporter.
 //
@@ -1648,6 +1658,74 @@ int runShortcutSelftest()
     return 0;
 }
 
+// US-SC2-B: Sprint 13 social export self-test (VEDITOR_SOCIAL_SELFTEST=1)
+int runSocialSelftest()
+{
+    QString error;
+#ifdef HAVE_SOCIALPRESET
+    {
+        // 1. allPresets >= 9
+        const auto presets = social::allPresets();
+        if (!requireSelftest(presets.size() >= 9,
+                             QStringLiteral("social::allPresets size < 9"), &error))
+            return 1;
+        // 2. instagram_reels の resolution & vertical flag
+        const social::Preset reels = social::presetById("instagram_reels");
+        if (!requireSelftest(!reels.id.isEmpty() && reels.resolution == QSize(1080, 1920)
+                                 && reels.requiresVerticalReframe,
+                             QStringLiteral("instagram_reels preset invalid"), &error))
+            return 1;
+        // 3. youtube_standard horizontal
+        const social::Preset yt = social::presetById("youtube_standard");
+        if (!requireSelftest(!yt.id.isEmpty() && yt.resolution == QSize(1920, 1080)
+                                 && !yt.requiresVerticalReframe,
+                             QStringLiteral("youtube_standard preset invalid"), &error))
+            return 1;
+        // 4. 存在しない id は空 Preset
+        const social::Preset missing = social::presetById("does_not_exist");
+        if (!requireSelftest(missing.id.isEmpty(),
+                             QStringLiteral("presetById missing should be empty"), &error))
+            return 1;
+    }
+#endif
+#ifdef HAVE_ASPECTREFRAMER
+    {
+        // 5. CenterCrop 1920x1080 -> 1080x1920 の crop rect
+        QImage src(1920, 1080, QImage::Format_ARGB32);
+        src.fill(QColor(64, 128, 192, 255));
+        reframe::ReframeParams p;
+        p.sourceSize = QSize(1920, 1080);
+        p.targetSize = QSize(1080, 1920);
+        p.mode = reframe::Mode::CenterCrop;
+        const QRectF rect = reframe::computeCropRect(src, p);
+        const double expectedW = (1080.0 / 1920.0) / (1920.0 / 1080.0); // ~0.316
+        if (!requireSelftest(std::abs(rect.width() - expectedW) < 1e-2
+                                 && std::abs(rect.height() - 1.0) < 1e-2
+                                 && std::abs(rect.y()) < 1e-3,
+                             QStringLiteral("CenterCrop rect math wrong"), &error))
+            return 1;
+        // 6. applyReframe output size matches target
+        const reframe::ReframeResult res = reframe::applyReframe(src, p);
+        if (!requireSelftest(res.success
+                                 && res.previewImage.size() == QSize(1080, 1920),
+                             QStringLiteral("applyReframe output size mismatch"), &error))
+            return 1;
+        // 7. null source -> success=false, error non-empty
+        QImage nullImg;
+        const reframe::ReframeResult nullRes = reframe::applyReframe(nullImg, p);
+        if (!requireSelftest(!nullRes.success && !nullRes.error.isEmpty(),
+                             QStringLiteral("applyReframe null source should fail"), &error))
+            return 1;
+        // 8. modes >= 5
+        if (!requireSelftest(reframe::availableModes().size() >= 5,
+                             QStringLiteral("availableModes < 5"), &error))
+            return 1;
+    }
+#endif
+    qInfo().noquote() << QStringLiteral("SOCIAL selftest OK");
+    return 0;
+}
+
 } // anonymous namespace
 
 int main(int argc, char *argv[])
@@ -1848,6 +1926,10 @@ int main(int argc, char *argv[])
     if (qEnvironmentVariableIntValue("VEDITOR_SHORTCUT_SELFTEST") != 0) {
         writeLogLine("INFO", "running VEDITOR_SHORTCUT_SELFTEST");
         return runShortcutSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_SOCIAL_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_SOCIAL_SELFTEST");
+        return runSocialSelftest();
     }
     if (qEnvironmentVariableIntValue("VEDITOR_WORKFLOW_SELFTEST") != 0) {
         writeLogLine("INFO", "running VEDITOR_WORKFLOW_SELFTEST");
