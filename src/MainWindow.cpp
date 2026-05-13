@@ -40,6 +40,7 @@
 #include "ShortcutManager.h"
 #include "ShortcutCustomizeDialog.h"
 #include "SocialExportDialog.h"
+#include "CaptionEditorDialog.h"
 #include "SocialPreset.h"
 #include "AspectReframer.h"
 #include <QApplication>
@@ -1284,6 +1285,14 @@ void MainWindow::setupMenuBar()
     connect(importSubAction, &QAction::triggered, this, &MainWindow::importSubtitles);
     m_menuHelpEntries.append({importSubAction,
         QStringLiteral("字幕ファイル（.srt / .vtt）を読み込んでテロップとして取り込みます。")});
+
+    // US-CAP-B: Sprint 14 — 字幕エディタダイアログ
+    auto *captionEditorAction = insertMenu->addAction(QStringLiteral("字幕エディタ…"));
+    captionEditorAction->setObjectName("action_caption_editor");
+    connect(captionEditorAction, &QAction::triggered,
+            this, &MainWindow::openCaptionEditorDialog);
+    m_menuHelpEntries.append({captionEditorAction,
+        QStringLiteral("字幕クリップを追加・編集・SRT/VTT で取込/書出し、Whisper.cpp など ASR エンジンで自動生成できます。")});
 
     auto *exportTextAction = insertMenu->addAction("テキストを書き出し (SRT / CSV)...");
     connect(exportTextAction, &QAction::triggered, this, &MainWindow::exportTextOverlays);
@@ -7377,6 +7386,19 @@ void MainWindow::openSocialExportDialog()
     m_socialExportDialog->show();
     m_socialExportDialog->raise();
     m_socialExportDialog->activateWindow();
+}
+
+// US-CAP-B: Sprint 14 — 字幕エディタダイアログ
+// (modeless; 字幕クリップ追加・編集・SRT/VTT 取込/書出し・ASR 自動生成)
+void MainWindow::openCaptionEditorDialog()
+{
+    if (!m_captionEditorDialog) {
+        m_captionEditorDialog = new CaptionEditorDialog(this);
+        m_captionEditorDialog->setObjectName(QStringLiteral("captionEditorDialog"));
+    }
+    m_captionEditorDialog->show();
+    m_captionEditorDialog->raise();
+    m_captionEditorDialog->activateWindow();
 }
 
 // --- Phase 14: New slot implementations ---

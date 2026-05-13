@@ -125,6 +125,24 @@
 #define HAVE_ASPECTREFRAMER 1
 #endif
 
+// US-CAP-B: Sprint 14 caption self-test (VEDITOR_CAPTION_SELFTEST=1)
+#if __has_include("CaptionTrack.h")
+#include "CaptionTrack.h"
+#define HAVE_CAPTIONTRACK 1
+#endif
+#if __has_include("CaptionStyle.h")
+#include "CaptionStyle.h"
+#define HAVE_CAPTIONSTYLE 1
+#endif
+#if __has_include("SubtitleIO.h")
+#include "SubtitleIO.h"
+#define HAVE_SUBTITLEIO 1
+#endif
+#if __has_include("SpeechRecognizer.h")
+#include "SpeechRecognizer.h"
+#define HAVE_SPEECHRECOGNIZER 1
+#endif
+
 // ──────────────────────────────────────────────────────────────────────────
 // Lightweight file-backed logger + unhandled-exception reporter.
 //
@@ -1726,6 +1744,117 @@ int runSocialSelftest()
     return 0;
 }
 
+// US-CAP-B: Sprint 14 caption self-test (VEDITOR_CAPTION_SELFTEST=1)
+int runCaptionSelftest()
+{
+    QString error;
+#ifdef HAVE_CAPTIONTRACK
+    {
+        caption::Track track;
+        caption::Clip c1{1000, 2000, QStringLiteral("hello"), QString()};
+        caption::Clip c2{2500, 3500, QStringLiteral("world"), QString()};
+        track.addClip(c1);
+        track.addClip(c2);
+        track.sortByStart();
+        if (!requireSelftest(track.clipCount() == 2,
+                             QStringLiteral("Track::clipCount != 2"), &error))
+            return 1;
+        const auto active = track.clipsAtTime(1500);
+        if (!requireSelftest(active.size() == 1 && active[0].text == QStringLiteral("hello"),
+                             QStringLiteral("clipsAtTime(1500) wrong"), &error))
+            return 1;
+    }
+#endif
+#ifdef HAVE_CAPTIONSTYLE
+    {
+        const auto style = caption::defaultStyle();
+        if (!requireSelftest(style.anchor == caption::Anchor::BottomCenter
+                                 && style.fontSizePt == 24,
+                             QStringLiteral("defaultStyle wrong"), &error))
+            return 1;
+        if (!requireSelftest(caption::anchorFromString(
+                                 caption::anchorToString(caption::Anchor::TopLeft))
+                                 == caption::Anchor::TopLeft,
+                             QStringLiteral("Anchor round-trip failed"), &error))
+            return 1;
+        if (!requireSelftest(caption::anchorNames().size() == 9,
+                             QStringLiteral("anchorNames size != 9"), &error))
+            return 1;
+    }
+#endif
+#ifdef HAVE_SUBTITLEIO
+    {
+        // formatSrtTimestamp + parseSrtTimestamp round-trip
+        const QString ts = subtitle::formatSrtTimestamp(3661500);
+        if (!requireSelftest(ts == QStringLiteral("01:01:01,500"),
+                             QStringLiteral("formatSrtTimestamp wrong"), &error))
+            return 1;
+        if (!requireSelftest(subtitle::parseSrtTimestamp(ts) == 3661500,
+                             QStringLiteral("parseSrtTimestamp round-trip"), &error))
+            return 1;
+        if (!requireSelftest(subtitle::parseSrtTimestamp(QStringLiteral("invalid")) == -1,
+                             QStringLiteral("parseSrtTimestamp invalid should return -1"), &error))
+            return 1;
+
+        // SRT round-trip: write + read 2 clips
+        const QString tmpPath = QDir::tempPath() + QStringLiteral("/veditor_caption_test.srt");
+        QList<caption::Clip> clips;
+        clips.append({1000, 2000, QStringLiteral("first"), QString()});
+        clips.append({3000, 4500, QStringLiteral("second"), QString()});
+        if (!requireSelftest(subtitle::exportSrt(tmpPath, clips),
+                             QStringLiteral("exportSrt failed"), &error))
+            return 1;
+        const auto imp = subtitle::importSrt(tmpPath);
+        if (!requireSelftest(imp.success && imp.clips.size() == 2
+                                 && imp.clips[0].text == QStringLiteral("first")
+                                 && imp.clips[1].startMs == 3000,
+                             QStringLiteral("SRT round-trip failed"), &error))
+            return 1;
+        QFile::remove(tmpPath);
+
+        // VTT round-trip
+        const QString vttPath = QDir::tempPath() + QStringLiteral("/veditor_caption_test.vtt");
+        if (!requireSelftest(subtitle::exportVtt(vttPath, clips),
+                             QStringLiteral("exportVtt failed"), &error))
+            return 1;
+        const auto vttImp = subtitle::importVtt(vttPath);
+        if (!requireSelftest(vttImp.success && vttImp.clips.size() == 2
+                                 && vttImp.clips[0].text == QStringLiteral("first"),
+                             QStringLiteral("VTT round-trip failed"), &error))
+            return 1;
+        QFile::remove(vttPath);
+    }
+#endif
+#ifdef HAVE_SPEECHRECOGNIZER
+    {
+        const auto recogs = speech::availableRecognizers();
+        if (!requireSelftest(recogs.size() >= 1,
+                             QStringLiteral("availableRecognizers size < 1"), &error))
+            return 1;
+        // Stub fallback
+        auto stub = speech::recognizerByName(QStringLiteral("does_not_exist"));
+        if (!requireSelftest(stub && stub->name() == QStringLiteral("Stub"),
+                             QStringLiteral("recognizerByName fallback failed"), &error))
+            return 1;
+        speech::RecognizeParams p;
+        p.audioPath = QStringLiteral("/tmp/dummy.wav"); // 非空、Stub は中身読まない
+        p.language = QStringLiteral("ja");
+        const auto res = stub->recognize(p);
+        if (!requireSelftest(res.success && res.segments.size() == 3,
+                             QStringLiteral("Stub recognize wrong segment count"), &error))
+            return 1;
+        // empty audioPath -> failure
+        speech::RecognizeParams pEmpty;
+        const auto resEmpty = stub->recognize(pEmpty);
+        if (!requireSelftest(!resEmpty.success && !resEmpty.error.isEmpty(),
+                             QStringLiteral("Stub empty path should fail"), &error))
+            return 1;
+    }
+#endif
+    qInfo().noquote() << QStringLiteral("CAPTION selftest OK");
+    return 0;
+}
+
 } // anonymous namespace
 
 int main(int argc, char *argv[])
@@ -1930,6 +2059,10 @@ int main(int argc, char *argv[])
     if (qEnvironmentVariableIntValue("VEDITOR_SOCIAL_SELFTEST") != 0) {
         writeLogLine("INFO", "running VEDITOR_SOCIAL_SELFTEST");
         return runSocialSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_CAPTION_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_CAPTION_SELFTEST");
+        return runCaptionSelftest();
     }
     if (qEnvironmentVariableIntValue("VEDITOR_WORKFLOW_SELFTEST") != 0) {
         writeLogLine("INFO", "running VEDITOR_WORKFLOW_SELFTEST");

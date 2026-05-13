@@ -119,6 +119,16 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/SubtitleTrackRenderer.cpp
     src/MagneticTimeline.h
     src/MagneticTimeline.cpp
+    src/CaptionTrack.h
+    src/CaptionTrack.cpp
+    src/CaptionStyle.h
+    src/CaptionStyle.cpp
+    src/SubtitleIO.h
+    src/SubtitleIO.cpp
+    src/CaptionEditorDialog.h
+    src/CaptionEditorDialog.cpp
+    src/SpeechRecognizer.h
+    src/SpeechRecognizer.cpp
     src/MotionTracker.cpp
     src/MotionStabilizer.cpp
     src/TrackerLink.cpp

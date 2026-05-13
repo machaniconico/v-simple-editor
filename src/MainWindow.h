@@ -95,6 +95,7 @@ class AIMaskDialog;
 class AudioClipEditor;
 class ShortcutCustomizeDialog;
 class SocialExportDialog;
+class CaptionEditorDialog;
 
 namespace shortcut { class ShortcutManager; }
 
@@ -333,6 +334,9 @@ private slots:
 
     // US-SC2-B: Sprint 13 — SNS 向けエクスポートダイアログ
     void openSocialExportDialog();
+
+    // US-CAP-B: Sprint 14 — 字幕エディタダイアログ
+    void openCaptionEditorDialog();
 
     // User-customizable "お気に入り" menu — opens FavoritesEditDialog, then
     // persists the chosen action ids to QSettings and rebuilds the menu.
@@ -595,6 +599,9 @@ private:
 
     // US-SC2-B: Sprint 13 — SNS 向けエクスポートダイアログ (modeless, 再利用)
     SocialExportDialog *m_socialExportDialog = nullptr;
+
+    // US-CAP-B: Sprint 14 — 字幕エディタダイアログ (modeless, 再利用)
+    CaptionEditorDialog *m_captionEditorDialog = nullptr;
 
     // Voice-over recording
     voiceover::VoiceOverDialog *m_voiceOverDialog = nullptr;
