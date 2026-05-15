@@ -114,6 +114,35 @@
   #include "CloudRenderDialog.h"
   #define HAVE_CLOUD_RENDER 1
 #endif
+// US-INT-2: Sprint 21 — platform expansion / mastering / batch export.
+#if __has_include("XVideoDialog.h")
+  #include "XVideoDialog.h"
+  #define HAVE_XVIDEO 1
+#endif
+#if __has_include("InstagramPublishDialog.h")
+  #include "InstagramPublishDialog.h"
+  #define HAVE_INSTAGRAM_PUBLISH 1
+#endif
+#if __has_include("ProjectTemplateDialog.h")
+  #include "ProjectTemplateDialog.h"
+  #define HAVE_PROJECT_TEMPLATE 1
+#endif
+#if __has_include("LoudnessMasterDialog.h")
+  #include "LoudnessMasterDialog.h"
+  #define HAVE_LOUDNESS_MASTER 1
+#endif
+#if __has_include("HdrGradingDialog.h")
+  #include "HdrGradingDialog.h"
+  #define HAVE_HDR_GRADING 1
+#endif
+#if __has_include("MultiCamSyncDialog.h")
+  #include "MultiCamSyncDialog.h"
+  #define HAVE_MULTICAM_SYNC 1
+#endif
+#if __has_include("BatchExportDialog.h")
+  #include "BatchExportDialog.h"
+  #define HAVE_BATCH_EXPORT 1
+#endif
 #include <QApplication>
 #include <QMessageBox>
 #include <QMenu>
@@ -614,6 +643,13 @@ MainWindow::MainWindow(QWidget *parent)
     , m_smartEditDialog(nullptr)
     , m_vimeoOAuth(nullptr)
     , m_vimeoManager(nullptr)
+    , m_xVideoDialog(nullptr)
+    , m_instagramDialog(nullptr)
+    , m_projectTemplateDialog(nullptr)
+    , m_loudnessDialog(nullptr)
+    , m_hdrDialog(nullptr)
+    , m_multiCamSyncDialog(nullptr)
+    , m_batchExportDialog(nullptr)
 {
     qInfo() << "MainWindow::ctor begin";
     resize(1280, 720);
@@ -2237,6 +2273,63 @@ void MainWindow::setupMenuBar()
             this, &MainWindow::openCloudRenderDialog);
     m_menuHelpEntries.append({cloudRenderAction,
         QStringLiteral("リモート ffmpeg ジョブの送信と進捗監視を行うクラウドレンダリング画面を開きます。")});
+
+    // US-INT-2: Sprint 21 — platform expansion / mastering / batch export.
+    auto *xVideoAction = toolsMenu->addAction(
+        QStringLiteral("X(Twitter) に動画投稿(&X)…"));
+    xVideoAction->setObjectName("action_x_video");
+    connect(xVideoAction, &QAction::triggered,
+            this, &MainWindow::openXVideoDialog);
+    m_menuHelpEntries.append({xVideoAction,
+        QStringLiteral("X(Twitter) アカウントで認証し、書き出し済み動画を chunked upload で直接投稿します。")});
+
+    auto *instagramAction = toolsMenu->addAction(
+        QStringLiteral("Instagram Reels に投稿(&I)…"));
+    instagramAction->setObjectName("action_instagram_publish");
+    connect(instagramAction, &QAction::triggered,
+            this, &MainWindow::openInstagramDialog);
+    m_menuHelpEntries.append({instagramAction,
+        QStringLiteral("Instagram Graph API で Reels コンテナを作成し、書き出し済み動画を公開します。")});
+
+    auto *projectTemplateAction = toolsMenu->addAction(
+        QStringLiteral("プロジェクトテンプレート(&T)…"));
+    projectTemplateAction->setObjectName("action_project_template");
+    connect(projectTemplateAction, &QAction::triggered,
+            this, &MainWindow::openProjectTemplateDialog);
+    m_menuHelpEntries.append({projectTemplateAction,
+        QStringLiteral("用途別のプロジェクトテンプレートを選んで新規プロジェクトを素早く作成します。")});
+
+    auto *loudnessMasterAction = toolsMenu->addAction(
+        QStringLiteral("ラウドネスマスタリング(&L)…"));
+    loudnessMasterAction->setObjectName("action_loudness_master");
+    connect(loudnessMasterAction, &QAction::triggered,
+            this, &MainWindow::openLoudnessDialog);
+    m_menuHelpEntries.append({loudnessMasterAction,
+        QStringLiteral("配信プラットフォーム基準 (EBU R128 / -14 LUFS 等) に合わせてラウドネスを最終調整します。")});
+
+    auto *hdrGradingAction = toolsMenu->addAction(
+        QStringLiteral("HDR カラーグレーディング(&H)…"));
+    hdrGradingAction->setObjectName("action_hdr_grading");
+    connect(hdrGradingAction, &QAction::triggered,
+            this, &MainWindow::openHdrDialog);
+    m_menuHelpEntries.append({hdrGradingAction,
+        QStringLiteral("HDR10 / HLG / PQ トーンマッピングを使った HDR カラーグレーディングを行います。")});
+
+    auto *multiCamSyncAction = toolsMenu->addAction(
+        QStringLiteral("マルチカム同期(&M)…"));
+    multiCamSyncAction->setObjectName("action_multicam_sync");
+    connect(multiCamSyncAction, &QAction::triggered,
+            this, &MainWindow::openMultiCamSyncDialog);
+    m_menuHelpEntries.append({multiCamSyncAction,
+        QStringLiteral("複数カメラのクリップを音声波形で自動同期し、マルチカムシーケンスを作成します。")});
+
+    auto *batchExportAction = toolsMenu->addAction(
+        QStringLiteral("バッチエクスポート(&B)…"));
+    batchExportAction->setObjectName("action_batch_export");
+    connect(batchExportAction, &QAction::triggered,
+            this, &MainWindow::openBatchExportDialog);
+    m_menuHelpEntries.append({batchExportAction,
+        QStringLiteral("複数の書き出しジョブをキューに登録し、まとめてバッチ処理します。")});
 
     // US-SNS-7: LoudnessPanel dock (created here so menu action can reference it)
     m_loudnessDock = new QDockWidget("ラウドネスパネル", this);
@@ -8237,6 +8330,120 @@ void MainWindow::openCloudRenderDialog()
 #else
     QMessageBox::information(this, QStringLiteral("クラウドレンダリング"),
         QStringLiteral("CloudRenderDialog がビルドに含まれていません。"));
+#endif
+}
+
+// --- US-INT-2: Sprint 21 — platform expansion / mastering / batch export. ---
+
+void MainWindow::openXVideoDialog()
+{
+#ifdef HAVE_XVIDEO
+    if (!m_xVideoDialog) {
+        m_xVideoDialog = new XVideoDialog(this);
+        m_xVideoDialog->setObjectName(QStringLiteral("xVideoDialog"));
+    }
+    m_xVideoDialog->show();
+    m_xVideoDialog->raise();
+    m_xVideoDialog->activateWindow();
+#else
+    QMessageBox::information(this, QStringLiteral("X(Twitter) に動画投稿"),
+        QStringLiteral("XVideoDialog がビルドに含まれていません。"));
+#endif
+}
+
+void MainWindow::openInstagramDialog()
+{
+#ifdef HAVE_INSTAGRAM_PUBLISH
+    if (!m_instagramDialog) {
+        m_instagramDialog = new InstagramPublishDialog(this);
+        m_instagramDialog->setObjectName(QStringLiteral("instagramPublishDialog"));
+    }
+    m_instagramDialog->show();
+    m_instagramDialog->raise();
+    m_instagramDialog->activateWindow();
+#else
+    QMessageBox::information(this, QStringLiteral("Instagram Reels に投稿"),
+        QStringLiteral("InstagramPublishDialog がビルドに含まれていません。"));
+#endif
+}
+
+void MainWindow::openProjectTemplateDialog()
+{
+#ifdef HAVE_PROJECT_TEMPLATE
+    if (!m_projectTemplateDialog) {
+        m_projectTemplateDialog = new ProjectTemplateDialog(this);
+        m_projectTemplateDialog->setObjectName(QStringLiteral("projectTemplateDialog"));
+    }
+    m_projectTemplateDialog->show();
+    m_projectTemplateDialog->raise();
+    m_projectTemplateDialog->activateWindow();
+#else
+    QMessageBox::information(this, QStringLiteral("プロジェクトテンプレート"),
+        QStringLiteral("ProjectTemplateDialog がビルドに含まれていません。"));
+#endif
+}
+
+void MainWindow::openLoudnessDialog()
+{
+#ifdef HAVE_LOUDNESS_MASTER
+    if (!m_loudnessDialog) {
+        m_loudnessDialog = new LoudnessMasterDialog(this);
+        m_loudnessDialog->setObjectName(QStringLiteral("loudnessMasterDialog"));
+    }
+    m_loudnessDialog->show();
+    m_loudnessDialog->raise();
+    m_loudnessDialog->activateWindow();
+#else
+    QMessageBox::information(this, QStringLiteral("ラウドネスマスタリング"),
+        QStringLiteral("LoudnessMasterDialog がビルドに含まれていません。"));
+#endif
+}
+
+void MainWindow::openHdrDialog()
+{
+#ifdef HAVE_HDR_GRADING
+    if (!m_hdrDialog) {
+        m_hdrDialog = new HdrGradingDialog(this);
+        m_hdrDialog->setObjectName(QStringLiteral("hdrGradingDialog"));
+    }
+    m_hdrDialog->show();
+    m_hdrDialog->raise();
+    m_hdrDialog->activateWindow();
+#else
+    QMessageBox::information(this, QStringLiteral("HDR カラーグレーディング"),
+        QStringLiteral("HdrGradingDialog がビルドに含まれていません。"));
+#endif
+}
+
+void MainWindow::openMultiCamSyncDialog()
+{
+#ifdef HAVE_MULTICAM_SYNC
+    if (!m_multiCamSyncDialog) {
+        m_multiCamSyncDialog = new MultiCamSyncDialog(this);
+        m_multiCamSyncDialog->setObjectName(QStringLiteral("multiCamSyncDialog"));
+    }
+    m_multiCamSyncDialog->show();
+    m_multiCamSyncDialog->raise();
+    m_multiCamSyncDialog->activateWindow();
+#else
+    QMessageBox::information(this, QStringLiteral("マルチカム同期"),
+        QStringLiteral("MultiCamSyncDialog がビルドに含まれていません。"));
+#endif
+}
+
+void MainWindow::openBatchExportDialog()
+{
+#ifdef HAVE_BATCH_EXPORT
+    if (!m_batchExportDialog) {
+        m_batchExportDialog = new BatchExportDialog(this);
+        m_batchExportDialog->setObjectName(QStringLiteral("batchExportDialog"));
+    }
+    m_batchExportDialog->show();
+    m_batchExportDialog->raise();
+    m_batchExportDialog->activateWindow();
+#else
+    QMessageBox::information(this, QStringLiteral("バッチエクスポート"),
+        QStringLiteral("BatchExportDialog がビルドに含まれていません。"));
 #endif
 }
 

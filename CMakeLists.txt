@@ -404,6 +404,36 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/CloudRenderDialog.h
     src/CloudRenderDialog.cpp
 
+    # Sprint 21 — X(Twitter)/Instagram delivery, project templates, loudness, HDR, multicam, batch export
+    src/XVideoUpload.h
+    src/XVideoUpload.cpp
+    src/XVideoDialog.h
+    src/XVideoDialog.cpp
+    src/InstagramPublish.h
+    src/InstagramPublish.cpp
+    src/InstagramPublishDialog.h
+    src/InstagramPublishDialog.cpp
+    src/ProjectTemplate.h
+    src/ProjectTemplate.cpp
+    src/ProjectTemplateDialog.h
+    src/ProjectTemplateDialog.cpp
+    src/LoudnessMaster.h
+    src/LoudnessMaster.cpp
+    src/LoudnessMasterDialog.h
+    src/LoudnessMasterDialog.cpp
+    src/HdrGrading.h
+    src/HdrGrading.cpp
+    src/HdrGradingDialog.h
+    src/HdrGradingDialog.cpp
+    src/MultiCamSync.h
+    src/MultiCamSync.cpp
+    src/MultiCamSyncDialog.h
+    src/MultiCamSyncDialog.cpp
+    src/BatchExportQueue.h
+    src/BatchExportQueue.cpp
+    src/BatchExportDialog.h
+    src/BatchExportDialog.cpp
+
     resources/resources.qrc
     ${APP_RESOURCES}
 )

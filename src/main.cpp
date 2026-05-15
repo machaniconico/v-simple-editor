@@ -251,6 +251,36 @@
 #define HAVE_CLOUDRENDER_CLIENT 1
 #endif
 
+// US-INT-1: Sprint 21 X/Instagram/template/loudness/HDR/multicam/batch self-tests.
+#if __has_include("XVideoUpload.h")
+#include "XVideoUpload.h"
+#define HAVE_XVIDEO_UPLOAD 1
+#endif
+#if __has_include("InstagramPublish.h")
+#include "InstagramPublish.h"
+#define HAVE_INSTAGRAM_PUBLISH 1
+#endif
+#if __has_include("ProjectTemplate.h")
+#include "ProjectTemplate.h"
+#define HAVE_PROJECT_TEMPLATE 1
+#endif
+#if __has_include("LoudnessMaster.h")
+#include "LoudnessMaster.h"
+#define HAVE_LOUDNESS_MASTER 1
+#endif
+#if __has_include("HdrGrading.h")
+#include "HdrGrading.h"
+#define HAVE_HDR_GRADING 1
+#endif
+#if __has_include("MultiCamSync.h")
+#include "MultiCamSync.h"
+#define HAVE_MULTICAM_SYNC 1
+#endif
+#if __has_include("BatchExportQueue.h")
+#include "BatchExportQueue.h"
+#define HAVE_BATCHEXPORT_QUEUE 1
+#endif
+
 // US-CAP-B: Sprint 14 caption self-test (VEDITOR_CAPTION_SELFTEST=1)
 #if __has_include("CaptionTrack.h")
 #include "CaptionTrack.h"
@@ -2721,6 +2751,181 @@ int runCloudRenderSelftest()
     return 0;
 }
 
+int runXUploadSelftest()
+{
+    QString error;
+#if defined(HAVE_XVIDEO_UPLOAD)
+    {
+        const x::upload::XUploadConfig config = x::upload::XUploadConfig::defaultConfig();
+        if (!requireSelftest(!config.apiBase.isEmpty(),
+                             QStringLiteral("XUPLOAD: apiBase should be non-empty"), &error))
+            return 1;
+        if (!requireSelftest(!config.tweetApiBase.isEmpty(),
+                             QStringLiteral("XUPLOAD: tweetApiBase should be non-empty"), &error))
+            return 1;
+
+        x::upload::UploadJob job;
+        job.filePath = QStringLiteral("/tmp/selftest_clip.mp4");
+        job.tweetText = QStringLiteral("selftest tweet");
+        if (!requireSelftest(!job.filePath.isEmpty() && !job.tweetText.isEmpty(),
+                             QStringLiteral("XUPLOAD: UploadJob round-trip failed"), &error))
+            return 1;
+    }
+#endif
+    qInfo() << "XUPLOAD selftest OK";
+    return 0;
+}
+
+int runInstagramSelftest()
+{
+    QString error;
+#if defined(HAVE_INSTAGRAM_PUBLISH)
+    {
+        const instagram::publish::IgConfig config =
+            instagram::publish::IgConfig::defaultConfig();
+        if (!requireSelftest(config.graphBase.contains(QStringLiteral("graph.facebook.com")),
+                             QStringLiteral("INSTAGRAM: graphBase should target graph.facebook.com"),
+                             &error))
+            return 1;
+
+        instagram::publish::PublishJob job;
+        job.videoUrl = QStringLiteral("https://cdn.example/reel.mp4");
+        job.caption = QStringLiteral("selftest caption");
+        if (!requireSelftest(job.shareToFeed,
+                             QStringLiteral("INSTAGRAM: PublishJob should default shareToFeed=true"),
+                             &error))
+            return 1;
+    }
+#endif
+    qInfo() << "INSTAGRAM selftest OK";
+    return 0;
+}
+
+int runProjTmplSelftest()
+{
+    QString error;
+#if defined(HAVE_PROJECT_TEMPLATE)
+    {
+        const QVector<projtmpl::TemplateMeta> builtins =
+            projtmpl::TemplateLibrary::builtInTemplates();
+        if (!requireSelftest(builtins.size() == 6,
+                             QStringLiteral("PROJTMPL: expected 6 built-in templates"), &error))
+            return 1;
+
+        const QByteArray project =
+            projtmpl::TemplateLibrary::createProjectFromTemplate(QStringLiteral("yt1080p30"));
+        if (!requireSelftest(!project.isEmpty(),
+                             QStringLiteral("PROJTMPL: createProjectFromTemplate returned empty"),
+                             &error))
+            return 1;
+        if (!requireSelftest(project.contains("width"),
+                             QStringLiteral("PROJTMPL: project payload missing \"width\""), &error))
+            return 1;
+    }
+#endif
+    qInfo() << "PROJTMPL selftest OK";
+    return 0;
+}
+
+int runLoudnessSelftest()
+{
+    QString error;
+#if defined(HAVE_LOUDNESS_MASTER)
+    {
+        const double gain = loudness::computeGainDb(-20.0, -14.0);
+        if (!requireSelftest(qFuzzyCompare(gain + 1.0, 6.0 + 1.0),
+                             QStringLiteral("LOUDNESS: computeGainDb(-20,-14) should be +6.0"),
+                             &error))
+            return 1;
+
+        const double broadcast =
+            loudness::presetTargetLufs(loudness::LoudnessPreset::Broadcast);
+        if (!requireSelftest(qFuzzyCompare(broadcast + 100.0, -23.0 + 100.0),
+                             QStringLiteral("LOUDNESS: Broadcast preset should be -23.0 LUFS"),
+                             &error))
+            return 1;
+    }
+#endif
+    qInfo() << "LOUDNESS selftest OK";
+    return 0;
+}
+
+int runHdrSelftest()
+{
+    QString error;
+#if defined(HAVE_HDR_GRADING)
+    {
+        const double pq0 = hdr::applyPqEotf(0.0);
+        if (!requireSelftest(qAbs(pq0) < 1e-6,
+                             QStringLiteral("HDR: applyPqEotf(0.0) should be ~0.0"), &error))
+            return 1;
+
+        const double pq1 = hdr::applyPqEotf(1.0);
+        if (!requireSelftest(pq1 > 0.9,
+                             QStringLiteral("HDR: applyPqEotf(1.0) should be > 0.9"), &error))
+            return 1;
+
+        const double pqMid = hdr::applyPqEotf(0.5);
+        const double pqHigh = hdr::applyPqEotf(0.8);
+        if (!requireSelftest(pqMid < pqHigh,
+                             QStringLiteral("HDR: applyPqEotf should be monotonic increasing"),
+                             &error))
+            return 1;
+    }
+#endif
+    qInfo() << "HDR selftest OK";
+    return 0;
+}
+
+int runMultiCamSelftest()
+{
+    QString error;
+#if defined(HAVE_MULTICAM_SYNC)
+    {
+        // `other` is `ref` delayed by 2 samples; at 10ms/hop that is ~20ms lag.
+        const QVector<float> ref{0, 0, 1, 2, 3, 2, 1, 0, 0, 0};
+        const QVector<float> other{0, 0, 0, 0, 1, 2, 3, 2, 1, 0};
+
+        const double ms =
+            multicam::MultiCamSync::estimateOffsetMs(ref, other, 10.0);
+        // Sign convention is ambiguous; assert magnitude ~20ms within one hop.
+        if (!requireSelftest(qAbs(qAbs(ms) - 20.0) <= 10.0,
+                             QStringLiteral("MULTICAM: estimateOffsetMs magnitude should be ~20ms"),
+                             &error))
+            return 1;
+        if (!requireSelftest(!qFuzzyIsNull(ms),
+                             QStringLiteral("MULTICAM: shifted signal should yield non-zero lag"),
+                             &error))
+            return 1;
+    }
+#endif
+    qInfo() << "MULTICAM selftest OK";
+    return 0;
+}
+
+int runBatchExportSelftest()
+{
+    QString error;
+#if defined(HAVE_BATCHEXPORT_QUEUE)
+    {
+        batchexport::Queue queue;
+        const QString id = queue.addTask(QStringLiteral("a.veditor"),
+                                         QStringLiteral("a.mp4"),
+                                         QStringLiteral("1080p"));
+        if (!requireSelftest(!id.isEmpty(),
+                             QStringLiteral("BATCHEXPORT: addTask should return a non-empty id"),
+                             &error))
+            return 1;
+        if (!requireSelftest(queue.tasks().size() == 1,
+                             QStringLiteral("BATCHEXPORT: queue should hold exactly 1 task"),
+                             &error))
+            return 1;
+    }
+#endif
+    qInfo() << "BATCHEXPORT selftest OK";
+    return 0;
+}
+
 } // anonymous namespace
 
 int main(int argc, char *argv[])
@@ -2993,6 +3198,34 @@ int main(int argc, char *argv[])
     if (qEnvironmentVariableIntValue("VEDITOR_CLOUDRENDER_SELFTEST") != 0) {
         writeLogLine("INFO", "running VEDITOR_CLOUDRENDER_SELFTEST");
         return runCloudRenderSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_XUPLOAD_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_XUPLOAD_SELFTEST");
+        return runXUploadSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_INSTAGRAM_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_INSTAGRAM_SELFTEST");
+        return runInstagramSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_PROJTMPL_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_PROJTMPL_SELFTEST");
+        return runProjTmplSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_LOUDNESS_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_LOUDNESS_SELFTEST");
+        return runLoudnessSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_HDR_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_HDR_SELFTEST");
+        return runHdrSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_MULTICAM_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_MULTICAM_SELFTEST");
+        return runMultiCamSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_BATCHEXPORT_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_BATCHEXPORT_SELFTEST");
+        return runBatchExportSelftest();
     }
     if (qEnvironmentVariableIntValue("VEDITOR_WORKFLOW_SELFTEST") != 0) {
         writeLogLine("INFO", "running VEDITOR_WORKFLOW_SELFTEST");

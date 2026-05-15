@@ -104,6 +104,15 @@ class TwitchStreamDialog;
 class CloudRenderDialog;
 class SmartEditDialog;
 
+// US-INT-2: Sprint 21 — platform expansion / mastering / batch export.
+class XVideoDialog;
+class InstagramPublishDialog;
+class ProjectTemplateDialog;
+class LoudnessMasterDialog;
+class HdrGradingDialog;
+class MultiCamSyncDialog;
+class BatchExportDialog;
+
 // Sprint 17/18/19 — final integration (US-INT-3)
 class YoutubeUploadDialog;
 class CommentsDockWidget;
@@ -396,6 +405,15 @@ private slots:
     void openSmartEditDialog();
     void openCloudRenderDialog();
 
+    // US-INT-2: Sprint 21 — platform expansion / mastering / batch export.
+    void openXVideoDialog();
+    void openInstagramDialog();
+    void openProjectTemplateDialog();
+    void openLoudnessDialog();
+    void openHdrDialog();
+    void openMultiCamSyncDialog();
+    void openBatchExportDialog();
+
     // User-customizable "お気に入り" menu — opens FavoritesEditDialog, then
     // persists the chosen action ids to QSettings and rebuilds the menu.
     void editFavorites();
@@ -687,6 +705,15 @@ private:
     SmartEditDialog                    *m_smartEditDialog;
     vimeo::oauth::AuthClient           *m_vimeoOAuth;
     vimeo::manager::Manager            *m_vimeoManager;
+
+    // US-INT-2: Sprint 21 — platform expansion / mastering / batch export.
+    XVideoDialog                       *m_xVideoDialog;
+    InstagramPublishDialog             *m_instagramDialog;
+    ProjectTemplateDialog              *m_projectTemplateDialog;
+    LoudnessMasterDialog               *m_loudnessDialog;
+    HdrGradingDialog                   *m_hdrDialog;
+    MultiCamSyncDialog                 *m_multiCamSyncDialog;
+    BatchExportDialog                  *m_batchExportDialog;
 
     // Voice-over recording
     voiceover::VoiceOverDialog *m_voiceOverDialog = nullptr;
