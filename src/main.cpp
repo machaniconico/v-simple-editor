@@ -3,6 +3,11 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
 #include <QTextStream>
 #include <QDateTime>
 #include <QStandardPaths>
@@ -14,6 +19,8 @@
 #include <QMetaMethod>
 #include <QTemporaryDir>
 #include <QPainter>
+#include <QUrl>
+#include <QUrlQuery>
 #include <cmath>
 #include <algorithm>
 
@@ -204,6 +211,44 @@
 #if __has_include("ColorMatchLutGenerator.h")
 #include "ColorMatchLutGenerator.h"
 #define HAVE_COLORMATCH_LUT 1
+#endif
+
+// US-INT-1: Sprint 20 platform / interchange / smart-edit self-tests.
+#if __has_include("VimeoOAuth.h")
+#include "VimeoOAuth.h"
+#define HAVE_VIMEO_OAUTH 1
+#endif
+#if __has_include("VimeoUploadClient.h")
+#include "VimeoUploadClient.h"
+#define HAVE_VIMEO_UPLOAD_CLIENT 1
+#endif
+#if __has_include("VimeoUploadManager.h")
+#include "VimeoUploadManager.h"
+#define HAVE_VIMEO_UPLOAD_MANAGER 1
+#endif
+#if __has_include("TwitchStreamConfig.h")
+#include "TwitchStreamConfig.h"
+#define HAVE_TWITCH_STREAM_CONFIG 1
+#endif
+#if __has_include("FrameIoImporter.h")
+#include "FrameIoImporter.h"
+#define HAVE_FRAMEIO_IMPORTER 1
+#endif
+#if __has_include("DavinciResolveXmlExporter.h")
+#include "DavinciResolveXmlExporter.h"
+#define HAVE_DAVINCI_XML 1
+#endif
+#if __has_include("FcpxmlExporter.h")
+#include "FcpxmlExporter.h"
+#define HAVE_FCPXML_EXPORTER 1
+#endif
+#if __has_include("SmartEditAssistant.h")
+#include "SmartEditAssistant.h"
+#define HAVE_SMARTEDIT_ASSISTANT 1
+#endif
+#if __has_include("CloudRenderClient.h")
+#include "CloudRenderClient.h"
+#define HAVE_CLOUDRENDER_CLIENT 1
 #endif
 
 // US-CAP-B: Sprint 14 caption self-test (VEDITOR_CAPTION_SELFTEST=1)
@@ -2383,6 +2428,299 @@ int runColorMatchSelftest()
     return 0;
 }
 
+int runVimeoSelftest()
+{
+    QString error;
+#if defined(HAVE_VIMEO_OAUTH) && defined(HAVE_VIMEO_UPLOAD_CLIENT) && defined(HAVE_VIMEO_UPLOAD_MANAGER)
+    {
+        vimeo::oauth::VimeoOAuthConfig config;
+        config.clientId = QStringLiteral("dummy-vimeo-client");
+        config.clientSecret = QStringLiteral("dummy-vimeo-secret");
+        config.scope = QStringLiteral("private public video_files");
+        config.accessToken = QStringLiteral("dummy-access-token");
+        config.refreshToken = QStringLiteral("dummy-refresh-token");
+        config.redirectUri = QStringLiteral("http://localhost:8080/vimeo/callback");
+
+        const QStringList ffmpegArgs{
+            QStringLiteral("ffmpeg"),
+            QStringLiteral("-i"),
+            QStringLiteral("input.mp4"),
+            QStringLiteral("-c:v"),
+            QStringLiteral("libx264"),
+            QStringLiteral("output.mp4")
+        };
+
+        vimeo::oauth::AuthClient auth(config);
+        const QUrl authUrl = auth.authorizationUrl(config.redirectUri, QStringLiteral("selftest"));
+        if (!requireSelftest(authUrl.isValid(),
+                             QStringLiteral("VIMEO: authorizationUrl should be valid"), &error))
+            return 1;
+        if (!requireSelftest(authUrl.host() == QStringLiteral("api.vimeo.com"),
+                             QStringLiteral("VIMEO: authorizationUrl host mismatch"), &error))
+            return 1;
+
+        const QUrlQuery authQuery(authUrl);
+        if (!requireSelftest(authQuery.queryItemValue(QStringLiteral("client_id")) == config.clientId,
+                             QStringLiteral("VIMEO: client_id query mismatch"), &error))
+            return 1;
+        if (!requireSelftest(authQuery.queryItemValue(QStringLiteral("redirect_uri"))
+                                 == config.redirectUri,
+                             QStringLiteral("VIMEO: redirect_uri query mismatch"), &error))
+            return 1;
+
+        vimeo::upload::UploadClient uploadClient(config);
+        uploadClient.setAccessToken(config.accessToken);
+        if (!requireSelftest(uploadClient.accessToken() == config.accessToken,
+                             QStringLiteral("VIMEO: access token round-trip failed"), &error))
+            return 1;
+
+        vimeo::manager::Manager manager(&auth);
+        if (!requireSelftest(manager.activeJobs().isEmpty(),
+                             QStringLiteral("VIMEO: new Manager should have no jobs"), &error))
+            return 1;
+        if (!requireSelftest(!ffmpegArgs.isEmpty() && ffmpegArgs.front() == QStringLiteral("ffmpeg"),
+                             QStringLiteral("VIMEO: dummy ffmpegArgs should start with ffmpeg"), &error))
+            return 1;
+    }
+#endif
+    qInfo() << "VIMEO selftest OK";
+    return 0;
+}
+
+int runTwitchSelftest()
+{
+    QString error;
+#if defined(HAVE_TWITCH_STREAM_CONFIG)
+    {
+        twitch::stream::StreamConfig config;
+        config.streamKey = QStringLiteral("live_dummy_key");
+        config.server = twitch::stream::StreamServer::USEast;
+        config.bitrate = 6000;
+        config.resolution = QSize(1920, 1080);
+        config.framerate = 60;
+        config.audioBitrate = 160;
+
+        const QStringList command =
+            twitch::stream::buildFfmpegCommand(config, QStringLiteral("input.mp4"));
+        if (!requireSelftest(!command.isEmpty(),
+                             QStringLiteral("TWITCH: buildFfmpegCommand returned no args"), &error))
+            return 1;
+        if (!requireSelftest(command.front() == QStringLiteral("ffmpeg"),
+                             QStringLiteral("TWITCH: command should start with ffmpeg"), &error))
+            return 1;
+        if (!requireSelftest(command.back().contains(QStringLiteral("twitch.tv/app/")),
+                             QStringLiteral("TWITCH: RTMP output URL missing"), &error))
+            return 1;
+    }
+#endif
+    qInfo() << "TWITCH selftest OK";
+    return 0;
+}
+
+int runFrameIoSelftest()
+{
+    QString error;
+#if defined(HAVE_FRAMEIO_IMPORTER)
+    {
+        const QByteArray fixture = R"json(
+[
+  {
+    "id": "c1",
+    "body": "First comment",
+    "timestamp": 1.25,
+    "author": { "name": "alice" },
+    "inserted_at": "2025-01-01T00:00:00.000Z"
+  },
+  {
+    "id": "c2",
+    "body": "Second comment",
+    "timestamp": 3.50,
+    "author": { "name": "bob" },
+    "inserted_at": "2025-01-01T00:00:02.000Z"
+  },
+  {
+    "id": "c3",
+    "body": "Reply comment",
+    "timestamp": 5.75,
+    "author": { "name": "carol" },
+    "parent_id": "c2",
+    "inserted_at": "2025-01-01T00:00:03.000Z"
+  }
+]
+)json";
+
+        const QJsonDocument doc = QJsonDocument::fromJson(fixture);
+        if (!requireSelftest(doc.isArray(),
+                             QStringLiteral("FRAMEIO: fixture should parse to a JSON array"), &error))
+            return 1;
+
+        const collab::CommentTrack track =
+            frameio::importer::FrameIoImporter::parseFrameIoJson(doc.array());
+        if (!requireSelftest(track.comments.size() == 3,
+                             QStringLiteral("FRAMEIO: expected 3 parsed comments"), &error))
+            return 1;
+        if (!requireSelftest(track.comments.at(2).parentId == QStringLiteral("c2"),
+                             QStringLiteral("FRAMEIO: parent_id round-trip mismatch"), &error))
+            return 1;
+    }
+#endif
+    qInfo() << "FRAMEIO selftest OK";
+    return 0;
+}
+
+int runDavinciSelftest()
+{
+    QString error;
+#if defined(HAVE_DAVINCI_XML)
+    {
+        QVector<davinci::xml::ClipEntry> clips;
+        clips.append(davinci::xml::ClipEntry{
+            QStringLiteral("/tmp/selftest_clip.mov"),
+            0,
+            120,
+            0,
+            0
+        });
+
+        davinci::xml::ExporterConfig config;
+        config.sequenceName = QStringLiteral("DaVinci Selftest");
+        config.fps = 24;
+        config.width = 1920;
+        config.height = 1080;
+
+        const QString xml = davinci::xml::buildXml(clips, config);
+        if (!requireSelftest(xml.contains(QStringLiteral("<xmeml")),
+                             QStringLiteral("DAVINCI: xmeml root element missing"), &error))
+            return 1;
+    }
+#endif
+    qInfo() << "DAVINCI selftest OK";
+    return 0;
+}
+
+int runFcpxmlSelftest()
+{
+    QString error;
+#if defined(HAVE_FCPXML_EXPORTER)
+    {
+        QVector<fcpx::xml::ClipEntry> clips;
+        clips.append(fcpx::xml::ClipEntry{
+            QStringLiteral("/tmp/selftest_clip.mov"),
+            0.0,
+            4.0,
+            1.0,
+            QStringLiteral("Selftest Clip")
+        });
+
+        fcpx::xml::ExporterConfig config;
+        config.projectName = QStringLiteral("FCPXML Selftest");
+        config.fps = 30;
+        config.frameDuration = QStringLiteral("1/30s");
+        config.width = 1920;
+        config.height = 1080;
+
+        const QString xml = fcpx::xml::buildXml(clips, config);
+        if (!requireSelftest(xml.contains(QStringLiteral("<fcpxml")),
+                             QStringLiteral("FCPXML: fcpxml root element missing"), &error))
+            return 1;
+    }
+#endif
+    qInfo() << "FCPXML selftest OK";
+    return 0;
+}
+
+int runSmartEditSelftest()
+{
+    QString error;
+#if defined(HAVE_SMARTEDIT_ASSISTANT)
+    {
+        smartedit::Assistant assistant;
+        if (!requireSelftest(assistant.metaObject() != nullptr,
+                             QStringLiteral("SMARTEDIT: Assistant metaObject missing"), &error))
+            return 1;
+
+        QVector<smartedit::CutSuggestion> suggestions{
+            smartedit::CutSuggestion{400, 500, smartedit::CutSuggestion::Silence, 0.5},
+            smartedit::CutSuggestion{100, 300, smartedit::CutSuggestion::SceneChange, 0.9},
+            smartedit::CutSuggestion{100, 200, smartedit::CutSuggestion::Combined, 0.8}
+        };
+
+        std::sort(suggestions.begin(), suggestions.end(),
+                  [](const smartedit::CutSuggestion &left,
+                     const smartedit::CutSuggestion &right) {
+                      if (left.startMs != right.startMs)
+                          return left.startMs < right.startMs;
+                      if (left.endMs != right.endMs)
+                          return left.endMs < right.endMs;
+                      return left.reason < right.reason;
+                  });
+
+        if (!requireSelftest(suggestions.at(0).startMs == 100 && suggestions.at(0).endMs == 200,
+                             QStringLiteral("SMARTEDIT: sorted first suggestion mismatch"), &error))
+            return 1;
+        if (!requireSelftest(suggestions.at(1).startMs == 100 && suggestions.at(1).endMs == 300,
+                             QStringLiteral("SMARTEDIT: sorted second suggestion mismatch"), &error))
+            return 1;
+        if (!requireSelftest(suggestions.at(2).startMs == 400,
+                             QStringLiteral("SMARTEDIT: sorted third suggestion mismatch"), &error))
+            return 1;
+    }
+#endif
+    qInfo() << "SMARTEDIT selftest OK";
+    return 0;
+}
+
+int runCloudRenderSelftest()
+{
+    QString error;
+#if defined(HAVE_CLOUDRENDER_CLIENT)
+    {
+        cloudrender::Client client;
+
+        cloudrender::ProviderConfig config;
+        config.provider = cloudrender::Provider::Generic;
+        config.endpointUrl = QStringLiteral("https://render.example/v1/jobs");
+        config.apiKey = QStringLiteral("dummy-api-key");
+        client.setProviderConfig(config);
+
+        cloudrender::RenderJob job;
+        job.jobId = QStringLiteral("job-selftest");
+        job.inputUrl = QStringLiteral("https://cdn.example/input.mp4");
+        job.outputUrl = QStringLiteral("https://cdn.example/output.mp4");
+        job.ffmpegArgs = QStringLiteral("ffmpeg -i input.mp4 -c:v libx264 output.mp4");
+
+        const QString submittedJobId = client.submitJob(job);
+        if (!requireSelftest(submittedJobId == job.jobId,
+                             QStringLiteral("CLOUDRENDER: submitJob should preserve explicit jobId"), &error))
+            return 1;
+
+        QUrl expectedUrl = QUrl::fromUserInput(config.endpointUrl);
+        QString expectedPath = expectedUrl.path();
+        if (!expectedPath.endsWith(QLatin1Char('/'))) {
+            expectedPath += QLatin1Char('/');
+        }
+        expectedPath += QStringLiteral("submit");
+        expectedUrl.setPath(expectedPath);
+
+        QNetworkAccessManager *network = client.findChild<QNetworkAccessManager *>();
+        const QList<QNetworkReply *> replies =
+            network ? network->findChildren<QNetworkReply *>() : QList<QNetworkReply *>{};
+        if (!requireSelftest(!replies.isEmpty(),
+                             QStringLiteral("CLOUDRENDER: submitJob should create a QNetworkReply"), &error))
+            return 1;
+        if (!requireSelftest(replies.constLast()->url() == expectedUrl,
+                             QStringLiteral("CLOUDRENDER: endpoint URL mismatch"), &error))
+            return 1;
+
+        for (QNetworkReply *reply : replies) {
+            reply->abort();
+        }
+    }
+#endif
+    qInfo() << "CLOUDRENDER selftest OK";
+    return 0;
+}
+
 } // anonymous namespace
 
 int main(int argc, char *argv[])
@@ -2627,6 +2965,34 @@ int main(int argc, char *argv[])
     if (qEnvironmentVariableIntValue("VEDITOR_COLORMATCH_SELFTEST") != 0) {
         writeLogLine("INFO", "running VEDITOR_COLORMATCH_SELFTEST");
         return runColorMatchSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_VIMEO_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_VIMEO_SELFTEST");
+        return runVimeoSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_TWITCH_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_TWITCH_SELFTEST");
+        return runTwitchSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_FRAMEIO_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_FRAMEIO_SELFTEST");
+        return runFrameIoSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_DAVINCI_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_DAVINCI_SELFTEST");
+        return runDavinciSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_FCPXML_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_FCPXML_SELFTEST");
+        return runFcpxmlSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_SMARTEDIT_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_SMARTEDIT_SELFTEST");
+        return runSmartEditSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_CLOUDRENDER_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_CLOUDRENDER_SELFTEST");
+        return runCloudRenderSelftest();
     }
     if (qEnvironmentVariableIntValue("VEDITOR_WORKFLOW_SELFTEST") != 0) {
         writeLogLine("INFO", "running VEDITOR_WORKFLOW_SELFTEST");

@@ -99,6 +99,10 @@ class SocialExportDialog;
 class CaptionEditorDialog;
 class MobileExportDialog;
 class ImportHubDialog;
+class VimeoUploadDialog;
+class TwitchStreamDialog;
+class CloudRenderDialog;
+class SmartEditDialog;
 
 // Sprint 17/18/19 — final integration (US-INT-3)
 class YoutubeUploadDialog;
@@ -110,6 +114,17 @@ namespace youtube {
 namespace oauth   { class AuthClient; }
 namespace manager { class Manager; }
 }
+
+namespace vimeo {
+namespace oauth   { class AuthClient; }
+namespace manager { class Manager; }
+}
+
+namespace frameio {
+namespace importer { class FrameIoImporter; }
+}
+
+namespace cloudrender { class Client; }
 
 namespace collab {
 struct CommentTrack;
@@ -371,6 +386,15 @@ private slots:
     void onCommentsPanel();   // Sprint 18 (US-COL-2): comment dock widget
     void onCollabHistory();   // Sprint 18 (US-COL-4): version history dialog
     void onColorMatch();      // Sprint 19 (US-CMA-3): auto color match dialog
+
+    // US-INT-2: Sprint 20 — platform integration / export / smart-edit / cloud render.
+    void openVimeoUploadDialog();
+    void openTwitchStreamDialog();
+    void openFrameIoImportDialog();
+    void openDavinciExportDialog();
+    void openFcpxmlExportDialog();
+    void openSmartEditDialog();
+    void openCloudRenderDialog();
 
     // User-customizable "お気に入り" menu — opens FavoritesEditDialog, then
     // persists the chosen action ids to QSettings and rebuilds the menu.
@@ -653,6 +677,16 @@ private:
     youtube::manager::Manager    *m_youtubeManager      = nullptr;
     collab::CommentTrack         *m_commentTrack        = nullptr;
     collab::history::HistoryLog  *m_collabHistoryLog    = nullptr;
+
+    // US-INT-2: Sprint 20 — platform expansion / export / smart-edit / cloud render.
+    VimeoUploadDialog                  *m_vimeoUploadDialog;
+    TwitchStreamDialog                 *m_twitchStreamDialog;
+    frameio::importer::FrameIoImporter *m_frameIoImporter;
+    cloudrender::Client                *m_cloudRenderClient;
+    CloudRenderDialog                  *m_cloudRenderDialog;
+    SmartEditDialog                    *m_smartEditDialog;
+    vimeo::oauth::AuthClient           *m_vimeoOAuth;
+    vimeo::manager::Manager            *m_vimeoManager;
 
     // Voice-over recording
     voiceover::VoiceOverDialog *m_voiceOverDialog = nullptr;

@@ -80,6 +80,40 @@
   #include "ColorMatchDialog.h"
   #define HAVE_COLORMATCH 1
 #endif
+
+// US-INT-2: Sprint 20 — Vimeo / Twitch / Frame.io / XML export /
+// Smart Edit / cloud render optional includes.
+#if __has_include("VimeoUploadDialog.h")
+  #include "VimeoOAuth.h"
+  #include "VimeoUploadManager.h"
+  #include "VimeoUploadDialog.h"
+  #define HAVE_VIMEO 1
+#endif
+#if __has_include("TwitchStreamDialog.h")
+  #include "TwitchStreamDialog.h"
+  #define HAVE_TWITCH 1
+#endif
+#if __has_include("FrameIoImporter.h")
+  #include "FrameIoImporter.h"
+  #define HAVE_FRAMEIO 1
+#endif
+#if __has_include("DavinciResolveXmlExporter.h")
+  #include "DavinciResolveXmlExporter.h"
+  #define HAVE_DAVINCI_XML 1
+#endif
+#if __has_include("FcpxmlExporter.h")
+  #include "FcpxmlExporter.h"
+  #define HAVE_FCPXML 1
+#endif
+#if __has_include("SmartEditDialog.h")
+  #include "SmartEditDialog.h"
+  #define HAVE_SMARTEDIT 1
+#endif
+#if __has_include("CloudRenderDialog.h")
+  #include "CloudRenderClient.h"
+  #include "CloudRenderDialog.h"
+  #define HAVE_CLOUD_RENDER 1
+#endif
 #include <QApplication>
 #include <QMessageBox>
 #include <QMenu>
@@ -472,10 +506,114 @@ QImage renderCompositeImage(const QImage &source, const CompositeLayer &layer, c
     return canvas;
 }
 
+#ifdef HAVE_DAVINCI_XML
+QVector<davinci::xml::ClipEntry> buildDavinciExportClips(const Timeline *timeline,
+                                                         int fps)
+{
+    QVector<davinci::xml::ClipEntry> entries;
+    if (!timeline || fps <= 0)
+        return entries;
+
+    const auto &tracks = timeline->videoTracks();
+    for (int trackIdx = 0; trackIdx < tracks.size(); ++trackIdx) {
+        const auto *track = tracks.value(trackIdx, nullptr);
+        if (!track)
+            continue;
+
+        double cursorSec = 0.0;
+        const auto &clips = track->clips();
+        for (const ClipInfo &clip : clips) {
+            cursorSec += clip.leadInSec;
+
+            const double durationSec = qMax(0.0, clip.effectiveDuration());
+            if (clip.filePath.isEmpty() || durationSec <= 0.0) {
+                cursorSec += durationSec;
+                continue;
+            }
+
+            davinci::xml::ClipEntry entry;
+            entry.filePath = clip.filePath;
+            entry.inPoint = qMax(0, qRound(cursorSec * fps));
+            entry.outPoint = entry.inPoint + qMax(1, qRound(durationSec * fps));
+            entry.trackIndex = trackIdx;
+            entry.sourceIn = qMax(0, qRound(clip.inPoint * fps));
+            entries.append(entry);
+
+            cursorSec += durationSec;
+        }
+    }
+
+    return entries;
+}
+#endif
+
+#ifdef HAVE_FCPXML
+QString fcpxFrameDuration(int fps)
+{
+    return QStringLiteral("1/%1s").arg(qMax(1, fps));
+}
+
+QVector<fcpx::xml::ClipEntry> buildFcpxmlExportClips(const Timeline *timeline)
+{
+    QVector<fcpx::xml::ClipEntry> entries;
+    if (!timeline)
+        return entries;
+
+    const auto &tracks = timeline->videoTracks();
+    for (const auto *track : tracks) {
+        if (!track)
+            continue;
+
+        double cursorSec = 0.0;
+        const auto &clips = track->clips();
+        for (const ClipInfo &clip : clips) {
+            cursorSec += clip.leadInSec;
+
+            const double durationSec = qMax(0.0, clip.effectiveDuration());
+            if (clip.filePath.isEmpty() || durationSec <= 0.0) {
+                cursorSec += durationSec;
+                continue;
+            }
+
+            fcpx::xml::ClipEntry entry;
+            entry.filePath = clip.filePath;
+            entry.offset = qMax(0.0, cursorSec);
+            entry.duration = durationSec;
+            entry.startInSource = qMax(0.0, clip.inPoint);
+            entry.name = clip.displayName.isEmpty()
+                ? QFileInfo(clip.filePath).completeBaseName()
+                : clip.displayName;
+            entries.append(entry);
+
+            cursorSec += durationSec;
+        }
+    }
+
+    std::stable_sort(entries.begin(), entries.end(),
+                     [](const fcpx::xml::ClipEntry &lhs,
+                        const fcpx::xml::ClipEntry &rhs) {
+                         if (lhs.offset < rhs.offset)
+                             return true;
+                         if (lhs.offset > rhs.offset)
+                             return false;
+                         return lhs.name < rhs.name;
+                     });
+    return entries;
+}
+#endif
+
 } // namespace
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
+    , m_vimeoUploadDialog(nullptr)
+    , m_twitchStreamDialog(nullptr)
+    , m_frameIoImporter(nullptr)
+    , m_cloudRenderClient(nullptr)
+    , m_cloudRenderDialog(nullptr)
+    , m_smartEditDialog(nullptr)
+    , m_vimeoOAuth(nullptr)
+    , m_vimeoManager(nullptr)
 {
     qInfo() << "MainWindow::ctor begin";
     resize(1280, 720);
@@ -2041,6 +2179,64 @@ void MainWindow::setupMenuBar()
     m_menuHelpEntries.append({colorMatchAction,
         QStringLiteral("基準クリップと対象クリップを選び、平均/分散から 3D LUT を生成して色味を自動的に合わせます (.cube 書き出し対応)。")});
 #endif
+
+    toolsMenu->addSeparator();
+
+    auto *vimeoUploadAction = toolsMenu->addAction(
+        QStringLiteral("Vimeo 直送アップロード(&V)…"));
+    vimeoUploadAction->setObjectName("action_vimeo_upload");
+    connect(vimeoUploadAction, &QAction::triggered,
+            this, &MainWindow::openVimeoUploadDialog);
+    m_menuHelpEntries.append({vimeoUploadAction,
+        QStringLiteral("Vimeo アカウントで認証し、書き出し済み動画を resumable upload で直接送信します。")});
+
+    auto *twitchStreamAction = toolsMenu->addAction(
+        QStringLiteral("Twitch 配信設定(&W)…"));
+    twitchStreamAction->setObjectName("action_twitch_stream");
+    connect(twitchStreamAction, &QAction::triggered,
+            this, &MainWindow::openTwitchStreamDialog);
+    m_menuHelpEntries.append({twitchStreamAction,
+        QStringLiteral("Twitch 向け RTMP 配信設定を作り、ffmpeg コマンドを確認・コピーできます。")});
+
+    auto *frameIoImportAction = toolsMenu->addAction(
+        QStringLiteral("Frame.io コメント取り込み(&F)…"));
+    frameIoImportAction->setObjectName("action_frameio_import");
+    connect(frameIoImportAction, &QAction::triggered,
+            this, &MainWindow::openFrameIoImportDialog);
+    m_menuHelpEntries.append({frameIoImportAction,
+        QStringLiteral("Frame.io の asset comments を取得し、コラボコメントトラックへ流し込みます。")});
+
+    auto *davinciExportAction = toolsMenu->addAction(
+        QStringLiteral("DaVinci Resolve XML 書き出し(&D)…"));
+    davinciExportAction->setObjectName("action_davinci_export");
+    connect(davinciExportAction, &QAction::triggered,
+            this, &MainWindow::openDavinciExportDialog);
+    m_menuHelpEntries.append({davinciExportAction,
+        QStringLiteral("Final Cut Pro 7 XML 互換の DaVinci Resolve XML を書き出します。")});
+
+    auto *fcpxmlExportAction = toolsMenu->addAction(
+        QStringLiteral("FCPXML 書き出し(&X)…"));
+    fcpxmlExportAction->setObjectName("action_fcpxml_export");
+    connect(fcpxmlExportAction, &QAction::triggered,
+            this, &MainWindow::openFcpxmlExportDialog);
+    m_menuHelpEntries.append({fcpxmlExportAction,
+        QStringLiteral("Final Cut Pro X 用の FCPXML を書き出します。")});
+
+    auto *smartEditAction = toolsMenu->addAction(
+        QStringLiteral("Smart Edit アシスタント(&M)…"));
+    smartEditAction->setObjectName("action_smart_edit");
+    connect(smartEditAction, &QAction::triggered,
+            this, &MainWindow::openSmartEditDialog);
+    m_menuHelpEntries.append({smartEditAction,
+        QStringLiteral("無音検出とシーン変化検出を組み合わせた自動カット候補を確認できます。")});
+
+    auto *cloudRenderAction = toolsMenu->addAction(
+        QStringLiteral("クラウドレンダリング(&U)…"));
+    cloudRenderAction->setObjectName("action_cloud_render");
+    connect(cloudRenderAction, &QAction::triggered,
+            this, &MainWindow::openCloudRenderDialog);
+    m_menuHelpEntries.append({cloudRenderAction,
+        QStringLiteral("リモート ffmpeg ジョブの送信と進捗監視を行うクラウドレンダリング画面を開きます。")});
 
     // US-SNS-7: LoudnessPanel dock (created here so menu action can reference it)
     m_loudnessDock = new QDockWidget("ラウドネスパネル", this);
@@ -7743,6 +7939,304 @@ void MainWindow::onColorMatch()
 #else
     QMessageBox::information(this, QStringLiteral("自動カラーマッチ"),
         QStringLiteral("ColorMatchDialog がビルドに含まれていません。"));
+#endif
+}
+
+void MainWindow::openVimeoUploadDialog()
+{
+#ifdef HAVE_VIMEO
+    if (!m_vimeoOAuth) {
+        m_vimeoOAuth = new vimeo::oauth::AuthClient(
+            vimeo::oauth::VimeoOAuthConfig::defaultConfig(), this);
+    }
+    if (!m_vimeoManager) {
+        m_vimeoManager = new vimeo::manager::Manager(m_vimeoOAuth, this);
+    }
+    if (!m_vimeoUploadDialog) {
+        m_vimeoUploadDialog = new VimeoUploadDialog(m_vimeoManager, this);
+        m_vimeoUploadDialog->setObjectName(QStringLiteral("vimeoUploadDialog"));
+    }
+    m_vimeoUploadDialog->show();
+    m_vimeoUploadDialog->raise();
+    m_vimeoUploadDialog->activateWindow();
+#else
+    QMessageBox::information(this, QStringLiteral("Vimeo アップロード"),
+        QStringLiteral("VimeoUploadDialog がビルドに含まれていません。"));
+#endif
+}
+
+void MainWindow::openTwitchStreamDialog()
+{
+#ifdef HAVE_TWITCH
+    if (!m_twitchStreamDialog) {
+        m_twitchStreamDialog = new TwitchStreamDialog(this);
+        m_twitchStreamDialog->setObjectName(QStringLiteral("twitchStreamDialog"));
+    }
+    m_twitchStreamDialog->show();
+    m_twitchStreamDialog->raise();
+    m_twitchStreamDialog->activateWindow();
+#else
+    QMessageBox::information(this, QStringLiteral("Twitch 配信設定"),
+        QStringLiteral("TwitchStreamDialog がビルドに含まれていません。"));
+#endif
+}
+
+void MainWindow::openFrameIoImportDialog()
+{
+#ifdef HAVE_FRAMEIO
+    bool ok = false;
+    const QString apiToken = QInputDialog::getText(
+        this,
+        QStringLiteral("Frame.io コメント取り込み"),
+        QStringLiteral("API token:"),
+        QLineEdit::Password,
+        QString(),
+        &ok).trimmed();
+    if (!ok || apiToken.isEmpty())
+        return;
+
+    const QString assetId = QInputDialog::getText(
+        this,
+        QStringLiteral("Frame.io コメント取り込み"),
+        QStringLiteral("Asset ID:"),
+        QLineEdit::Normal,
+        QString(),
+        &ok).trimmed();
+    if (!ok || assetId.isEmpty())
+        return;
+
+    if (!m_frameIoImporter) {
+        m_frameIoImporter = new frameio::importer::FrameIoImporter(this);
+        connect(m_frameIoImporter,
+                &frameio::importer::FrameIoImporter::importProgress,
+                this, [this](int percent) {
+                    if (statusBar()) {
+                        statusBar()->showMessage(
+                            QStringLiteral("Frame.io コメントを取得中... %1%")
+                                .arg(percent));
+                    }
+                });
+        connect(m_frameIoImporter,
+                &frameio::importer::FrameIoImporter::importFinished,
+                this, [this](const collab::CommentTrack &importedTrack) {
+                    if (!m_commentTrack)
+                        m_commentTrack = new collab::CommentTrack();
+                    if (m_commentTrack->trackId.isEmpty())
+                        m_commentTrack->trackId = importedTrack.trackId;
+
+                    QSet<QString> existingIds;
+                    existingIds.reserve(m_commentTrack->comments.size());
+                    for (const collab::Comment &comment : m_commentTrack->comments)
+                        existingIds.insert(comment.id);
+
+                    int addedCount = 0;
+                    for (const collab::Comment &comment : importedTrack.comments) {
+                        if (existingIds.contains(comment.id))
+                            continue;
+                        m_commentTrack->comments.append(comment);
+                        existingIds.insert(comment.id);
+                        ++addedCount;
+                    }
+                    if (addedCount > 0)
+                        m_commentTrack->version += addedCount;
+
+#ifdef HAVE_COLLAB
+                    if (m_commentsDock) {
+                        const Qt::DockWidgetArea area = dockWidgetArea(m_commentsDock);
+                        const Qt::DockWidgetArea targetArea =
+                            area == Qt::NoDockWidgetArea
+                                ? Qt::RightDockWidgetArea
+                                : area;
+                        const bool wasFloating = m_commentsDock->isFloating();
+                        const bool wasVisible = m_commentsDock->isVisible();
+                        const QRect geometry = m_commentsDock->geometry();
+
+                        delete m_commentsDock;
+                        m_commentsDock = new CommentsDockWidget(m_commentTrack, this);
+                        m_commentsDock->setObjectName(QStringLiteral("commentsDock"));
+                        addDockWidget(targetArea, m_commentsDock);
+
+                        if (wasFloating) {
+                            m_commentsDock->setFloating(true);
+                            m_commentsDock->setGeometry(geometry);
+                        }
+                        if (wasVisible) {
+                            m_commentsDock->show();
+                            m_commentsDock->raise();
+                        }
+                    }
+#endif
+
+                    if (statusBar()) {
+                        statusBar()->showMessage(
+                            QStringLiteral("Frame.io コメントを %1 件取り込みました")
+                                .arg(addedCount),
+                            5000);
+                    }
+                });
+        connect(m_frameIoImporter,
+                &frameio::importer::FrameIoImporter::importFailed,
+                this, [this](const QString &error) {
+                    QMessageBox::warning(
+                        this,
+                        QStringLiteral("Frame.io コメント取り込み"),
+                        QStringLiteral("コメント取り込みに失敗しました:\n%1")
+                            .arg(error));
+                });
+    }
+
+    frameio::importer::ImportConfig config;
+    config.apiToken = apiToken;
+
+    if (statusBar()) {
+        statusBar()->showMessage(
+            QStringLiteral("Frame.io コメントを取得しています..."));
+    }
+    m_frameIoImporter->fetchComments(assetId, config);
+#else
+    QMessageBox::information(this, QStringLiteral("Frame.io コメント取り込み"),
+        QStringLiteral("FrameIoImporter がビルドに含まれていません。"));
+#endif
+}
+
+void MainWindow::openDavinciExportDialog()
+{
+#ifdef HAVE_DAVINCI_XML
+    const QString suggestedPath = QDir::homePath() + QDir::separator()
+        + (m_projectConfig.name.isEmpty() ? QStringLiteral("Untitled")
+                                          : m_projectConfig.name)
+        + QStringLiteral(".xml");
+    const QString outPath = QFileDialog::getSaveFileName(
+        this,
+        QStringLiteral("DaVinci Resolve XML を書き出し"),
+        suggestedPath,
+        QStringLiteral("XML Files (*.xml);;All Files (*)"));
+    if (outPath.isEmpty())
+        return;
+
+    davinci::xml::ExporterConfig config;
+    config.sequenceName = m_projectConfig.name.isEmpty()
+        ? QStringLiteral("Untitled")
+        : m_projectConfig.name;
+    config.fps = qMax(1, m_projectConfig.fps);
+    config.width = qMax(1, m_projectConfig.width);
+    config.height = qMax(1, m_projectConfig.height);
+
+    const QVector<davinci::xml::ClipEntry> clips =
+        buildDavinciExportClips(m_timeline, config.fps);
+    const QString xml = davinci::xml::buildXml(clips, config);
+
+    QFile file(outPath);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        QMessageBox::warning(this, QStringLiteral("DaVinci Resolve XML 書き出し"),
+            QStringLiteral("ファイルを書き込めませんでした:\n%1")
+                .arg(file.errorString()));
+        return;
+    }
+    if (file.write(xml.toUtf8()) < 0) {
+        QMessageBox::warning(this, QStringLiteral("DaVinci Resolve XML 書き出し"),
+            QStringLiteral("XML の書き込みに失敗しました:\n%1")
+                .arg(file.errorString()));
+        return;
+    }
+
+    if (statusBar()) {
+        statusBar()->showMessage(
+            QStringLiteral("DaVinci Resolve XML を書き出しました (%1 クリップ)")
+                .arg(clips.size()),
+            5000);
+    }
+#else
+    QMessageBox::information(this, QStringLiteral("DaVinci Resolve XML 書き出し"),
+        QStringLiteral("DavinciResolveXmlExporter がビルドに含まれていません。"));
+#endif
+}
+
+void MainWindow::openFcpxmlExportDialog()
+{
+#ifdef HAVE_FCPXML
+    const QString suggestedPath = QDir::homePath() + QDir::separator()
+        + (m_projectConfig.name.isEmpty() ? QStringLiteral("Untitled")
+                                          : m_projectConfig.name)
+        + QStringLiteral(".fcpxml");
+    const QString outPath = QFileDialog::getSaveFileName(
+        this,
+        QStringLiteral("FCPXML を書き出し"),
+        suggestedPath,
+        QStringLiteral("FCPXML Files (*.fcpxml *.xml);;All Files (*)"));
+    if (outPath.isEmpty())
+        return;
+
+    fcpx::xml::ExporterConfig config;
+    config.projectName = m_projectConfig.name.isEmpty()
+        ? QStringLiteral("Untitled")
+        : m_projectConfig.name;
+    config.fps = qMax(1, m_projectConfig.fps);
+    config.frameDuration = fcpxFrameDuration(config.fps);
+    config.width = qMax(1, m_projectConfig.width);
+    config.height = qMax(1, m_projectConfig.height);
+
+    const QVector<fcpx::xml::ClipEntry> clips =
+        buildFcpxmlExportClips(m_timeline);
+    const QString xml = fcpx::xml::buildXml(clips, config);
+
+    QFile file(outPath);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        QMessageBox::warning(this, QStringLiteral("FCPXML 書き出し"),
+            QStringLiteral("ファイルを書き込めませんでした:\n%1")
+                .arg(file.errorString()));
+        return;
+    }
+    if (file.write(xml.toUtf8()) < 0) {
+        QMessageBox::warning(this, QStringLiteral("FCPXML 書き出し"),
+            QStringLiteral("XML の書き込みに失敗しました:\n%1")
+                .arg(file.errorString()));
+        return;
+    }
+
+    if (statusBar()) {
+        statusBar()->showMessage(
+            QStringLiteral("FCPXML を書き出しました (%1 クリップ)")
+                .arg(clips.size()),
+            5000);
+    }
+#else
+    QMessageBox::information(this, QStringLiteral("FCPXML 書き出し"),
+        QStringLiteral("FcpxmlExporter がビルドに含まれていません。"));
+#endif
+}
+
+void MainWindow::openSmartEditDialog()
+{
+#ifdef HAVE_SMARTEDIT
+    if (!m_smartEditDialog) {
+        m_smartEditDialog = new SmartEditDialog(this);
+        m_smartEditDialog->setObjectName(QStringLiteral("smartEditDialog"));
+    }
+    m_smartEditDialog->show();
+    m_smartEditDialog->raise();
+    m_smartEditDialog->activateWindow();
+#else
+    QMessageBox::information(this, QStringLiteral("Smart Edit アシスタント"),
+        QStringLiteral("SmartEditDialog がビルドに含まれていません。"));
+#endif
+}
+
+void MainWindow::openCloudRenderDialog()
+{
+#ifdef HAVE_CLOUD_RENDER
+    if (!m_cloudRenderClient)
+        m_cloudRenderClient = new cloudrender::Client(this);
+    if (!m_cloudRenderDialog) {
+        m_cloudRenderDialog = new CloudRenderDialog(this);
+        m_cloudRenderDialog->setObjectName(QStringLiteral("cloudRenderDialog"));
+    }
+    m_cloudRenderDialog->show();
+    m_cloudRenderDialog->raise();
+    m_cloudRenderDialog->activateWindow();
+#else
+    QMessageBox::information(this, QStringLiteral("クラウドレンダリング"),
+        QStringLiteral("CloudRenderDialog がビルドに含まれていません。"));
 #endif
 }
 

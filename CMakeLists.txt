@@ -376,6 +376,34 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/ColorMatchDialog.h
     src/ColorMatchDialog.cpp
 
+    # Sprint 20 — Platform delivery / editorial interchange / smart edit / cloud render
+    src/VimeoOAuth.h
+    src/VimeoOAuth.cpp
+    src/VimeoUploadClient.h
+    src/VimeoUploadClient.cpp
+    src/VimeoUploadManager.h
+    src/VimeoUploadManager.cpp
+    src/VimeoUploadDialog.h
+    src/VimeoUploadDialog.cpp
+    src/TwitchStreamConfig.h
+    src/TwitchStreamConfig.cpp
+    src/TwitchStreamDialog.h
+    src/TwitchStreamDialog.cpp
+    src/FrameIoImporter.h
+    src/FrameIoImporter.cpp
+    src/DavinciResolveXmlExporter.h
+    src/DavinciResolveXmlExporter.cpp
+    src/FcpxmlExporter.h
+    src/FcpxmlExporter.cpp
+    src/SmartEditAssistant.h
+    src/SmartEditAssistant.cpp
+    src/SmartEditDialog.h
+    src/SmartEditDialog.cpp
+    src/CloudRenderClient.h
+    src/CloudRenderClient.cpp
+    src/CloudRenderDialog.h
+    src/CloudRenderDialog.cpp
+
     resources/resources.qrc
     ${APP_RESOURCES}
 )
