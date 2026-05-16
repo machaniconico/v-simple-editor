@@ -74,13 +74,15 @@ QImage applyWatermark(const QImage &frame, const WmConfig &cfg)
     const int sw = stamp.width();
     const int sh = stamp.height();
 
+    // Clamp: negative marginPx pushes corner positions off-canvas and zeroes the tiled step.
+    const int margin = qMax(0, cfg.marginPx);
+
     QPainter painter(&result);
     painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
     painter.setOpacity(cfg.opacity);
 
     if (cfg.position == Position::Tiled) {
         // Tiled: repeat the stamp across the whole frame in a grid
-        const int margin   = qMax(0, cfg.marginPx);
         const int spacingX = qMax(1, sw + qMax(sw / 2, margin));
         const int spacingY = qMax(1, sh + qMax(sh / 2, margin));
 
@@ -104,20 +106,20 @@ QImage applyWatermark(const QImage &frame, const WmConfig &cfg)
 
         switch (cfg.position) {
         case Position::TopLeft:
-            dx = cfg.marginPx;
-            dy = cfg.marginPx;
+            dx = margin;
+            dy = margin;
             break;
         case Position::TopRight:
-            dx = fw - sw - cfg.marginPx;
-            dy = cfg.marginPx;
+            dx = fw - sw - margin;
+            dy = margin;
             break;
         case Position::BottomLeft:
-            dx = cfg.marginPx;
-            dy = fh - sh - cfg.marginPx;
+            dx = margin;
+            dy = fh - sh - margin;
             break;
         case Position::BottomRight:
-            dx = fw - sw - cfg.marginPx;
-            dy = fh - sh - cfg.marginPx;
+            dx = fw - sw - margin;
+            dy = fh - sh - margin;
             break;
         case Position::Center:
             dx = (fw - sw) / 2;
