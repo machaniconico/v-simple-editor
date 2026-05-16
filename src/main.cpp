@@ -3177,6 +3177,204 @@ int runLowerThirdSelftest()
     return 0;
 }
 
+// US-E2E-1: Sprint "実証" real-media end-to-end validation (VEDITOR_E2E_SELFTEST=1).
+//
+// Unlike the other selftests (which feed synthetic in-memory data), this one
+// drives the Sprint 17-22 FFmpeg / audio code with REAL files on disk:
+//   - test_assets/e2e_clip.mp4 : 640x360 30fps 5s H.264+AAC
+//   - test_assets/e2e_hum.wav  : 48kHz 16-bit PCM mono 3s 50Hz sine
+//
+// The point is to surface the stub boundary honestly: if libavformat decode
+// genuinely yields zero pixels, or deHum fails to attenuate the 50Hz energy,
+// this selftest MUST fail (return non-zero). A missing asset is tolerated in
+// CI (qWarning + return 0) but never silently "passes" a broken decode.
+int runE2eSelftest()
+{
+    QString error;
+
+    const QString clipArg = qEnvironmentVariable("VEDITOR_E2E_CLIP",
+                                                  QStringLiteral("test_assets/e2e_clip.mp4"));
+    const QString wavArg  = qEnvironmentVariable("VEDITOR_E2E_WAV",
+                                                  QStringLiteral("test_assets/e2e_hum.wav"));
+    const QString clipPath = QDir::current().absoluteFilePath(clipArg);
+    const QString wavPath  = QDir::current().absoluteFilePath(wavArg);
+    qInfo() << "E2E: clip path" << clipPath;
+    qInfo() << "E2E: wav path" << wavPath;
+
+    if (!QFile::exists(clipPath)) {
+        qWarning() << "E2E: missing test asset" << clipPath;
+        return 0;
+    }
+    if (!QFile::exists(wavPath)) {
+        qWarning() << "E2E: missing test asset" << wavPath;
+        return 0;
+    }
+
+    // ── (A) Real H.264 decode through libavformat (ColorMatchAnalyzer) ──────
+#if defined(HAVE_COLORMATCH_ANALYZE)
+    {
+        const colormatch::analyze::ColorStats stats =
+            colormatch::analyze::analyzeFrameRange(clipPath, 0, 30);
+
+        // analyzeFrameRange returns a zero-filled ColorStats on decode failure
+        // or empty range. If NOTHING was sampled and every accumulator is zero,
+        // the FFmpeg integration is not actually functional.
+        const bool noSamples = (stats.sampleCount <= 0);
+        const bool allStatsZero =
+            stats.rMean == 0.0 && stats.gMean == 0.0 && stats.bMean == 0.0 &&
+            stats.rStd  == 0.0 && stats.gStd  == 0.0 && stats.bStd  == 0.0 &&
+            stats.luminance == 0.0;
+        if (noSamples || allStatsZero) {
+            qCritical() << "E2E: ColorMatch real-decode FAILED (FFmpeg integration not functional)"
+                        << "sampleCount=" << stats.sampleCount
+                        << "luminance=" << stats.luminance;
+            return 1;
+        }
+        qInfo() << "E2E: ColorMatch real-decode ok"
+                << "sampleCount=" << stats.sampleCount
+                << "luminance=" << stats.luminance;
+    }
+#else
+    qWarning() << "E2E: HAVE_COLORMATCH_ANALYZE not defined; skipping decode check";
+#endif
+
+    // ── (B)+(C) Real WAV restoration through audiorestore ───────────────────
+#if defined(HAVE_AUDIO_RESTORATION)
+    {
+        QFile wf(wavPath);
+        if (!requireSelftest(wf.open(QIODevice::ReadOnly),
+                             QStringLiteral("E2E: cannot open WAV asset"), &error))
+            return 1;
+        const QByteArray raw = wf.readAll();
+        wf.close();
+
+        if (!requireSelftest(raw.size() >= 44,
+                             QStringLiteral("E2E: WAV too small for a canonical header"), &error))
+            return 1;
+
+        const auto *u = reinterpret_cast<const unsigned char *>(raw.constData());
+        auto rd16 = [&](int off) -> quint16 {
+            return static_cast<quint16>(u[off] | (u[off + 1] << 8));
+        };
+        auto rd32 = [&](int off) -> quint32 {
+            return static_cast<quint32>(u[off]) |
+                   (static_cast<quint32>(u[off + 1]) << 8) |
+                   (static_cast<quint32>(u[off + 2]) << 16) |
+                   (static_cast<quint32>(u[off + 3]) << 24);
+        };
+
+        const bool riffOk = std::memcmp(raw.constData() + 0, "RIFF", 4) == 0;
+        const bool waveOk = std::memcmp(raw.constData() + 8, "WAVE", 4) == 0;
+        const bool fmtOk  = std::memcmp(raw.constData() + 12, "fmt ", 4) == 0;
+        if (!requireSelftest(riffOk && waveOk && fmtOk,
+                             QStringLiteral("E2E: WAV missing RIFF/WAVE/fmt  markers"), &error))
+            return 1;
+
+        const quint16 numChannels   = rd16(22);
+        const quint32 sampleRate    = rd32(24);
+        const quint16 bitsPerSample = rd16(34);
+        qInfo() << "E2E: WAV fmt channels=" << numChannels
+                << "sampleRate=" << sampleRate
+                << "bits=" << bitsPerSample;
+        if (!requireSelftest(bitsPerSample == 16 && numChannels >= 1,
+                             QStringLiteral("E2E: expected 16-bit PCM with >=1 channel"), &error))
+            return 1;
+
+        // Scan chunks after byte 12 for the "data" id (don't assume it is
+        // exactly at byte 44). Fall back to 44 if the scan fails.
+        int dataOffset = -1;
+        quint32 dataSize = 0;
+        {
+            int pos = 12;
+            while (pos + 8 <= raw.size()) {
+                const quint32 chunkSize = rd32(pos + 4);
+                if (std::memcmp(raw.constData() + pos, "data", 4) == 0) {
+                    dataOffset = pos + 8;
+                    dataSize = chunkSize;
+                    break;
+                }
+                // Chunks are word-aligned (pad byte if odd size).
+                pos += 8 + static_cast<int>(chunkSize) + (chunkSize & 1u);
+            }
+        }
+        if (dataOffset < 0 && raw.size() > 44 &&
+            std::memcmp(raw.constData() + 36, "data", 4) == 0) {
+            dataOffset = 44;
+            dataSize = rd32(40);
+        }
+        if (!requireSelftest(dataOffset > 0 && dataOffset <= raw.size(),
+                             QStringLiteral("E2E: WAV data chunk not found"), &error))
+            return 1;
+
+        const int availBytes = raw.size() - dataOffset;
+        int usableBytes = static_cast<int>(dataSize);
+        if (usableBytes <= 0 || usableBytes > availBytes)
+            usableBytes = availBytes;
+
+        const int totalSamples = usableBytes / 2;                 // PCM16
+        const int channels     = (numChannels >= 1) ? static_cast<int>(numChannels) : 1;
+        const int frameCount   = totalSamples / channels;
+        if (!requireSelftest(frameCount > 0,
+                             QStringLiteral("E2E: WAV data chunk has no samples"), &error))
+            return 1;
+
+        // Convert PCM16 LE to float [-1,1]; take the left channel only.
+        QVector<float> samples;
+        samples.reserve(frameCount);
+        const auto *pcm = reinterpret_cast<const qint16 *>(raw.constData() + dataOffset);
+        for (int f = 0; f < frameCount; ++f) {
+            const qint16 s = pcm[f * channels];                   // left channel
+            samples.append(static_cast<float>(s) / 32768.0f);
+        }
+
+        auto rms = [](const QVector<float> &v) {
+            double acc = 0.0;
+            for (float s : v)
+                acc += static_cast<double>(s) * static_cast<double>(s);
+            return v.isEmpty() ? 0.0 : std::sqrt(acc / v.size());
+        };
+
+        // The asset is 48000 Hz; prefer the header rate if it looks sane.
+        const int procRate = (sampleRate >= 8000 && sampleRate <= 192000)
+                                  ? static_cast<int>(sampleRate)
+                                  : 48000;
+
+        const double preRms = rms(samples);
+        if (!requireSelftest(preRms > 1e-6,
+                             QStringLiteral("E2E: WAV signal has ~zero RMS (asset broken?)"), &error))
+            return 1;
+
+        // (B) deHum: notch out the dominant 50Hz mains hum + harmonics.
+        QVector<float> dehummed = samples;
+        audiorestore::deHum(dehummed, procRate, 50.0, 4);
+        const double postRms = rms(dehummed);
+        const double ratio = (preRms > 0.0) ? (postRms / preRms) : 1.0;
+        if (postRms >= preRms * 0.5) {
+            qCritical() << "E2E: deHum real-audio FAILED ratio=" << ratio;
+            return 1;
+        }
+        qInfo() << "E2E: deHum real-audio ok ratio=" << ratio;
+
+        // (C) processAll: size must be preserved through the full pipeline.
+        const QVector<float> samplesCopy = samples;
+        audiorestore::RestoreConfig cfg;
+        const QVector<float> out =
+            audiorestore::processAll(samplesCopy, procRate, cfg);
+        if (out.size() != samplesCopy.size()) {
+            qCritical() << "E2E: processAll size mismatch in=" << samplesCopy.size()
+                        << "out=" << out.size();
+            return 1;
+        }
+        qInfo() << "E2E: processAll size preserved" << out.size();
+    }
+#else
+    qWarning() << "E2E: HAVE_AUDIO_RESTORATION not defined; skipping audio check";
+#endif
+
+    qInfo() << "E2E selftest OK";
+    return 0;
+}
+
 // US-INT-1: Sprint 22 watermark overlay self-test (VEDITOR_WATERMARK_SELFTEST=1).
 int runWatermarkSelftest()
 {
@@ -3529,6 +3727,10 @@ int main(int argc, char *argv[])
     if (qEnvironmentVariableIntValue("VEDITOR_WATERMARK_SELFTEST") != 0) {
         writeLogLine("INFO", "running VEDITOR_WATERMARK_SELFTEST");
         return runWatermarkSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_E2E_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_E2E_SELFTEST");
+        return runE2eSelftest();
     }
     if (qEnvironmentVariableIntValue("VEDITOR_WORKFLOW_SELFTEST") != 0) {
         writeLogLine("INFO", "running VEDITOR_WORKFLOW_SELFTEST");
