@@ -4223,23 +4223,80 @@ void MainWindow::exportVideo()
         return;
     }
 
+    // S12 single-path: the File->Export action now routes through RenderQueue,
+    // which renders the FULL live edit graph via tlrender::renderFrameAt (S8)
+    // — pixel-identical to the GLPreview composite. The legacy CPU-only
+    // Exporter::doExport (limited applyEffectStack subset, graph skipped for
+    // 10-bit/HDR) is NO LONGER reached from any UI action. See progress.txt
+    // "### S12 single-path audit".
+    if (!m_renderQueue)
+        m_renderQueue = new RenderQueue(this);
+
+    RenderJob job;
+    job.name = QFileInfo(exportCfg.outputPath).fileName();
+    // projectFilePath doubles as RenderQueue's audio-mux source. When a saved
+    // project path exists use it; the in-memory timeline seam below carries
+    // the actual edit graph (LUT/mask/tracking are NOT serialized), and
+    // RenderQueue falls back to the V1 clip's source file for audio when this
+    // is a .veditor / empty path (RenderQueue.cpp:551-563).
+    job.projectFilePath = m_projectFilePath;
+    job.outputPath = exportCfg.outputPath;
+    job.width   = exportCfg.width  > 0 ? exportCfg.width  : 1920;
+    job.height  = exportCfg.height > 0 ? exportCfg.height : 1080;
+    job.bitrateBps = static_cast<qint64>(exportCfg.videoBitrate) * 1000;
+    job.startUs = 0;
+    job.endUs   = 0;   // 0 = whole timeline
+    // The additive in-memory edit-graph seam — the SAME pattern PARITY S8
+    // (main.cpp) and BatchExportQueue (BatchExportQueue.cpp:170) use so the
+    // real RenderQueue renders THIS live Timeline through renderFrameAt.
+    job.timeline = m_timeline;
+
+    // RenderQueue::startRenderPipe consumes these JSON fields directly
+    // (videoCodec/videoBitrate/fps/audioCodec/audioBitrate, plus the HDR10 /
+    // ProRes branch keys). Pass ExportDialog's resolved encoder verbatim.
+    QJsonObject cfg;
+    cfg["width"]        = job.width;
+    cfg["height"]       = job.height;
+    cfg["fps"]          = exportCfg.fps > 0 ? exportCfg.fps : 30;
+    cfg["videoCodec"]   = exportCfg.videoCodec;     // already ffmpeg-named
+    cfg["videoBitrate"] = exportCfg.videoBitrate;   // kbps
+    cfg["audioCodec"]   = exportCfg.audioCodec;
+    cfg["audioBitrate"] = exportCfg.audioBitrate;
+    if (exportCfg.hdr10 || exportCfg.hdrSettings.mode != QStringLiteral("sdr")) {
+        cfg["hdr10"]   = true;
+        cfg["hdrMode"] = exportCfg.hdrSettings.mode;
+    }
+    if (exportCfg.proresProfile >= 0)
+        cfg["proresProfile"] = exportCfg.proresProfile;
+    job.exportConfig = cfg;
+
     auto *progress = new QProgressDialog("Exporting...", "Cancel", 0, 100, this);
     progress->setWindowModality(Qt::WindowModal);
     progress->setMinimumDuration(0);
 
-    connect(m_exporter, &Exporter::progressChanged, progress, &QProgressDialog::setValue);
-    connect(m_exporter, &Exporter::exportFinished, this, [this, progress](bool success, const QString &msg) {
+    // Bridge RenderQueue's uuid-keyed signals to the same progress/finish UX
+    // the old Exporter path showed. Connections are scoped to `progress` so
+    // they auto-disconnect when the dialog is destroyed.
+    connect(m_renderQueue, &RenderQueue::jobProgressUuid, progress,
+            [progress](const QString &, int percent) {
+        progress->setValue(percent);
+    });
+    connect(m_renderQueue, &RenderQueue::jobCompletedUuid, progress,
+            [this, progress](const QString &, bool success, const QString &err) {
         progress->close();
         progress->deleteLater();
         if (success)
-            statusBar()->showMessage(msg);
+            statusBar()->showMessage("Export complete: rendered via timeline SSOT");
         else
-            QMessageBox::critical(this, "Export Failed", msg);
+            QMessageBox::critical(this, "Export Failed",
+                err.isEmpty() ? QStringLiteral("Export failed") : err);
     });
-    connect(progress, &QProgressDialog::canceled, m_exporter, &Exporter::cancel);
+    connect(progress, &QProgressDialog::canceled, m_renderQueue,
+            &RenderQueue::stop);
 
     statusBar()->showMessage("Exporting: " + exportCfg.outputPath);
-    m_exporter->startExport(exportCfg, clips);
+    m_renderQueue->addJob(job);
+    m_renderQueue->start();
 }
 
 void MainWindow::splitClip()
@@ -7927,28 +7984,72 @@ void MainWindow::onMobileExport()
                             QStringLiteral("タイムラインにクリップがありません。"));
                         return;
                     }
+                    // S12 single-path: mobile export also routes through
+                    // RenderQueue -> tlrender::renderFrameAt (S8), NOT the
+                    // legacy CPU-only Exporter. See progress.txt S12.
+                    if (!m_renderQueue)
+                        m_renderQueue = new RenderQueue(this);
+
+                    RenderJob job;
+                    job.name = QFileInfo(cfg.outputPath).fileName();
+                    job.projectFilePath = m_projectFilePath;
+                    job.outputPath = cfg.outputPath;
+                    job.width   = cfg.width  > 0 ? cfg.width  : 1920;
+                    job.height  = cfg.height > 0 ? cfg.height : 1080;
+                    job.bitrateBps =
+                        static_cast<qint64>(cfg.videoBitrate) * 1000;
+                    job.startUs = 0;
+                    job.endUs   = 0;
+                    job.timeline = m_timeline;
+                    QJsonObject jcfg;
+                    jcfg["width"]        = job.width;
+                    jcfg["height"]       = job.height;
+                    jcfg["fps"]          = cfg.fps > 0 ? cfg.fps : 30;
+                    jcfg["videoCodec"]   = cfg.videoCodec;
+                    jcfg["videoBitrate"] = cfg.videoBitrate;
+                    jcfg["audioCodec"]   = cfg.audioCodec;
+                    jcfg["audioBitrate"] = cfg.audioBitrate;
+                    if (cfg.hdr10 ||
+                        cfg.hdrSettings.mode != QStringLiteral("sdr")) {
+                        jcfg["hdr10"]   = true;
+                        jcfg["hdrMode"] = cfg.hdrSettings.mode;
+                    }
+                    if (cfg.proresProfile >= 0)
+                        jcfg["proresProfile"] = cfg.proresProfile;
+                    job.exportConfig = jcfg;
+
                     auto *progress = new QProgressDialog(
                         QStringLiteral("モバイル向けエクスポート中..."),
                         QStringLiteral("キャンセル"), 0, 100, this);
                     progress->setWindowModality(Qt::WindowModal);
                     progress->setMinimumDuration(0);
-                    connect(m_exporter, &Exporter::progressChanged,
-                            progress, &QProgressDialog::setValue);
-                    connect(m_exporter, &Exporter::exportFinished,
-                            this, [this, progress](bool ok, const QString &msg) {
+                    connect(m_renderQueue, &RenderQueue::jobProgressUuid,
+                            progress,
+                            [progress](const QString &, int percent) {
+                                progress->setValue(percent);
+                            });
+                    connect(m_renderQueue, &RenderQueue::jobCompletedUuid,
+                            progress,
+                            [this, progress](const QString &, bool ok,
+                                             const QString &err) {
                                 progress->close();
                                 progress->deleteLater();
                                 if (ok)
-                                    statusBar()->showMessage(msg);
+                                    statusBar()->showMessage(QStringLiteral(
+                                        "モバイル書き出し完了 (timeline SSOT)"));
                                 else
                                     QMessageBox::critical(this,
-                                        QStringLiteral("モバイル書き出し失敗"), msg);
+                                        QStringLiteral("モバイル書き出し失敗"),
+                                        err.isEmpty()
+                                            ? QStringLiteral("Export failed")
+                                            : err);
                             });
                     connect(progress, &QProgressDialog::canceled,
-                            m_exporter, &Exporter::cancel);
+                            m_renderQueue, &RenderQueue::stop);
                     statusBar()->showMessage(
                         QStringLiteral("モバイル書き出し: ") + cfg.outputPath);
-                    m_exporter->startExport(cfg, clips);
+                    m_renderQueue->addJob(job);
+                    m_renderQueue->start();
                 });
     }
     m_mobileExportDialog->show();

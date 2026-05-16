@@ -8,6 +8,9 @@
 #include <QJsonObject>
 #include <QProcess>
 
+class QThread;
+class Timeline;
+
 enum class RenderJobStatus {
     Pending,
     Rendering,
@@ -48,6 +51,18 @@ struct RenderJob {
     QDateTime startTime;
     QDateTime endTime;
     QString errorMessage;
+
+    // S8 (NLE-parity): additive, NON-persisted in-memory render seam. When a
+    // caller already holds a live edit-graph Timeline (the parity selftest, or
+    // any in-process exporter), it can point this at it so RenderQueue renders
+    // THAT timeline through tlrender::renderFrameAt directly. Mirrors the exact
+    // additive pattern ClipInfo::lutFilePath / ClipInfo::maskSystem use
+    // (Timeline.h:108-138): saveQueue/loadQueue and the JSON round-trip never
+    // touch it. When null (every production / dialog caller — RenderQueueDialog
+    // leaves it unset), RenderQueue loads `projectFilePath` into a Timeline via
+    // the genuine ProjectFile::load + Timeline::restoreFromProject path. NOT
+    // owned by RenderJob; the caller guarantees the pointee outlives the job.
+    Timeline *timeline = nullptr;
 
     // Convenience accessor — returns the spec's lowercase status string.
     QString statusString() const {
@@ -139,12 +154,31 @@ signals:
 
 private:
     void startNextJob();
+    // S8: the SSOT render-pipe. Renders every output frame of `job` through
+    // tlrender::renderFrameAt and streams the RGBA bytes to ffmpeg's stdin
+    // (the proven VideoStabilizer.cpp:397-410 rawvideo + second-input audio
+    // mux pattern). Runs on a worker QThread so the queue stays responsive;
+    // emits jobProgress per frame and finishes via finishCurrentJob().
+    void startRenderPipe(int jobIndex);
+    void finishCurrentJob(bool success, const QString &errorMsg);
+    // Build the ffmpeg argv for the rawvideo stdin pipe (video from
+    // renderFrameAt) + the original audio muxed from `audioInputPath`.
+    QStringList buildRenderPipeArgs(const RenderJob &job, int outW, int outH,
+                                    double fps,
+                                    const QString &audioInputPath) const;
     QStringList buildFFmpegArgs(const RenderJob &job) const;
     void parseFFmpegOutput(const QString &line);
     int findJobIndex(int id) const;
     int findJobIndexByUuid(const QString &uuid) const;
     static QString mapCodecToFFmpeg(const QString &codec);
     static QString defaultContainerFor(const QString &codec);
+    static QString findFFmpegBinary();
+    // Resolve the Timeline a job renders: the in-memory job.timeline seam if
+    // set, otherwise ProjectFile::load(projectFilePath) -> a freshly built
+    // Timeline via Timeline::restoreFromProject. `*ownedOut` receives a
+    // heap Timeline the caller must delete (only when loaded from file);
+    // null when job.timeline was used.
+    static Timeline *resolveTimeline(const RenderJob &job, Timeline **ownedOut);
 
     QVector<RenderJob> m_jobs;
     QProcess *m_process = nullptr;
@@ -153,4 +187,10 @@ private:
     bool m_running = false;
     bool m_paused = false;
     double m_currentDuration = 0.0;  // total duration in seconds for progress parsing
+
+    // S8 render-pipe worker state. m_renderThread runs the synchronous
+    // frame-render + stdin-write loop; m_cancelRequested is the cross-thread
+    // cancellation flag (mirrors VideoStabilizer::m_cancelled).
+    QThread *m_renderThread = nullptr;
+    bool m_cancelRequested = false;
 };

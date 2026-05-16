@@ -24,6 +24,8 @@
 #include "MotionStabilizer.h"
 #include "Camera3D.h"
 #include "MotionSectionWidget.h"
+#include "MaskSystem.h"      // S7: per-clip mask container (additive seam)
+#include "MotionTracker.h"   // S7: per-clip tracker data animating the mask
 
 // Where Timeline::addClip drops a freshly-imported clip. Persisted via
 // QSettings('VSimpleEditor','Preferences')/importPlacement; the MainWindow
@@ -94,6 +96,46 @@ struct ClipInfo {
     ColorCorrection colorCorrection;
     QVector<VideoEffect> effects;
     KeyframeManager keyframes;
+
+    // S4 (NLE-parity SSOT): per-clip 3D-LUT reference. The GPU preview's LUT
+    // (GLPreview::setLut, src/GLPreview.cpp:3229) is a single global texture,
+    // but renderFrameAt must grade every clip independently so an export
+    // pixel-matches the preview when a graded clip is on screen. There was no
+    // per-clip LUT storage anywhere (verified: zero ClipInfo / Timeline /
+    // ProjectFile references), so this is the minimal purely-additive seam:
+    // both members default to "no LUT" (empty path) and are read ONLY by the
+    // SSOT renderer + the S4 selftest — no existing code path changes.
+    QString lutFilePath;          // empty == no LUT on this clip
+    double  lutIntensity = 1.0;   // 0.0 = original, 1.0 = full LUT (matches
+                                  // GLPreview uLutIntensity / LutData::intensity)
+
+    // True when this clip carries a 3D LUT to apply. Mirrors the
+    // ColorCorrection::isDefault() gating idiom Exporter uses
+    // (src/Exporter.cpp:473-474) so the SSOT renderer can cheaply skip
+    // un-graded clips and stay byte-identical to S2/S3.
+    bool hasLut() const { return !lutFilePath.isEmpty(); }
+
+    // S7 (NLE-parity SSOT): per-clip compositing mask + the motion-tracker
+    // data that animates it. This is the SAME minimal purely-additive seam
+    // pattern as the S4 lutFilePath member above: there was NO per-clip mask
+    // storage anywhere (verified — zero ClipInfo / Timeline / ProjectFile
+    // references to a per-clip MaskSystem), and the GPU preview's US-EF-2
+    // "Power Window" is a single GLOBAL grade-localisation uniform set
+    // (GLPreview::setMask, src/GLPreview.cpp:3427), not a per-clip alpha
+    // matte. But renderFrameAt must apply each clip's genuine AE/Premiere-
+    // style compositing mask (MaskSystem::applyMask — multiplies the layer's
+    // alpha) independently so an export pixel-matches a masked clip. Both
+    // members default to "no mask" (empty MaskSystem / empty TrackingResult)
+    // and are read ONLY by the SSOT renderer + the S7 selftest. ProjectFile
+    // clipToJson/clipFromJson never touch them (exactly like lutFilePath),
+    // so on-disk project serialisation is byte-identical.
+    MaskSystem    maskSystem;        // empty masks() == no mask on this clip
+    TrackingResult maskTrackingData; // empty == static mask (no animation)
+
+    // True when this clip carries at least one mask. Mirrors the hasLut()
+    // gating idiom so the SSOT renderer can cheaply skip un-masked clips
+    // and stay byte-identical to S2..S6.
+    bool hasMask() const { return !maskSystem.masks().isEmpty(); }
 
     // Phase 5: Waveform
     WaveformData waveform;

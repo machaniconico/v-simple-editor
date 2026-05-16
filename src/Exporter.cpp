@@ -115,6 +115,11 @@ bool Exporter::openInputFile(const QString &path, AVFormatContext **fmtCtx, AVCo
     return true;
 }
 
+// LEGACY — bypasses the SSOT edit graph; do not use for new code.
+// Production export goes RenderQueue -> tlrender::renderFrameAt (S8). This
+// CPU-only transcode applies a hard-coded effect subset and skips the graph
+// for 10-bit/HDR/ProRes. No UI action reaches this as of S12 (File->Export
+// and Mobile Export now route through RenderQueue). See progress.txt S12.
 void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &clips)
 {
     if (clips.isEmpty()) {

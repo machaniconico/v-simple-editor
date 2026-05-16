@@ -195,6 +195,30 @@ public:
     void enterMaskEditMode(std::function<void(QRectF)> callback);
     void exitMaskEditMode();
 
+    // Test-only seam for the PARITY S3 selftest (src/main.cpp
+    // runParitySelftest). composeMultiTrackFrame + the DecodedLayer struct
+    // are private; this thin public forwarder builds DecodedLayer entries
+    // from primitive overlay params and invokes the REAL private
+    // composeMultiTrackFrame so the selftest's reference is the genuine
+    // authoritative compositor (not a copy) without exposing private types.
+    // Production code must keep using composeMultiTrackFrame directly.
+    QImage composeMultiTrackFrameForTest(
+        const QImage &v1Frame,
+        const QVector<QImage> &overlayRgb,
+        const QVector<double> &overlayOpacity,
+        const QVector<double> &overlayScale,
+        const QVector<double> &overlayDx,
+        const QVector<double> &overlayDy) const;
+
+    // NOTE: the genuine text baker is now the free function
+    // textbake::bakeOverlays (src/TextOverlayBake.h), extracted verbatim from
+    // composeFrameWithOverlays so the SSOT renderer's worker-thread export
+    // path can bake text WITHOUT constructing a VideoPlayer (a QWidget) off
+    // the GUI thread. composeFrameWithOverlays delegates to it; the S6 parity
+    // selftest calls it directly. The old composeFrameWithOverlaysForTest
+    // QWidget seam was removed (it forced off-GUI-thread QWidget construction
+    // in the export path — Qt undefined behaviour).
+
 public slots:
     void play();
     void pause();

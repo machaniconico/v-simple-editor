@@ -58,6 +58,10 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/ProjectSettings.cpp
     src/ExportDialog.cpp
     src/Exporter.cpp
+    src/FrameDiff.cpp
+    src/TimelineFrameRenderer.cpp
+    src/TextOverlayBake.h
+    src/TextOverlayBake.cpp
     src/CodecDetector.cpp
     src/UndoManager.cpp
     src/Overlay.cpp
