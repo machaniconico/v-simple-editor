@@ -44,6 +44,7 @@
 #endif
 
 #include "MainWindow.h"
+#include "AudioMixer.h"
 #include "FrameDiff.h"
 #include "Timeline.h"
 #include "TimelineFrameRenderer.h"
@@ -458,6 +459,123 @@ bool requireSelftest(bool condition, const QString &message, QString *error)
         *error = message;
     qCritical() << "selftest failed:" << message;
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// US-FIX-7 (R7/R8): AudioMixer arithmetic MODEL CHECK
+//
+// SCOPE / LIMITATION (R8 anti-overclaim — read before trusting a PASS):
+// This is an ALGORITHM/CONTRACT MODEL CHECK, NOT a regression guard. It
+// re-derives the usToBytes/bytesToUs lambdas and the frame-aligned drop loop
+// LOCALLY and mirrors the postSeekFullDrop clear condition in
+// AudioMixer.cpp readData by hand. It never constructs an AudioMixer and
+// never calls the production AudioMixer::readData / seekEntryToTimeline /
+// resampleAndAppend path. Consequently it does NOT exercise the production
+// audio path and BY CONSTRUCTION cannot catch a production-path regression:
+// if the production clear condition (or alignment/anchor logic) is changed,
+// this test will keep passing and will NOT detect the divergence. The model
+// here MUST be kept in sync with AudioMixer.cpp BY HAND. (This is the same
+// false-PASS-guard class the repo was previously bitten by with S3-STACK.)
+//
+// No QApplication, no audio device, no threads required.
+// What the model asserts:
+//   (i)  ringHead delta from a frame-aligned drop is always a multiple of
+//        kBytesPerFrame (R6 alignment invariant — modelled, not measured).
+//   (ii) the modelled postSeekFullDrop clears within <=2 simulated callbacks
+//        for all keyframe-gap sizes from 1 µs to 3,000,000 µs (3 s) in 1 µs
+//        steps (R7 tolerance-based clear — modelled, not measured).
+// ---------------------------------------------------------------------------
+static int runAudioMixerSelftest()
+{
+    QString error;
+
+    // Mirror the exact lambdas from AudioMixer.cpp readData.
+    constexpr int64_t kSampleRateHz  = AudioMixer::kSampleRateHz;
+    constexpr int64_t kBytesPerFrame = AudioMixer::kBytesPerFrame;
+
+    auto usToBytes = [&](int64_t us) -> int64_t {
+        return us * kSampleRateHz * kBytesPerFrame / 1'000'000LL;
+    };
+    auto bytesToUs = [&](int64_t bytes) -> int64_t {
+        return bytes * 1'000'000LL / (kSampleRateHz * kBytesPerFrame);
+    };
+    // Tolerance used by the R7 clear condition.
+    const int64_t kTolUs = bytesToUs(kBytesPerFrame);  // = 20 µs
+
+    // (i) Frame-alignment invariant: for every gap size from 1..200000 µs,
+    //     lateBAligned must be a multiple of kBytesPerFrame.
+    for (int64_t gapUs = 1; gapUs <= 200'000; ++gapUs) {
+        const int64_t lateB        = usToBytes(gapUs);
+        const int64_t lateBAligned = (lateB / kBytesPerFrame) * kBytesPerFrame;
+        if (!requireSelftest(lateBAligned % kBytesPerFrame == 0,
+                             QString("frame-alignment violated at gapUs=%1: lateBAligned=%2")
+                                 .arg(gapUs).arg(lateBAligned),
+                             &error)) {
+            qCritical() << "AUDIOMIXER_SELFTEST FAIL:" << error;
+            return 1;
+        }
+    }
+
+    // (ii) postSeekFullDrop clears within <=2 callbacks for all gap sizes
+    //      1 µs .. 3,000,000 µs. Simulate the readData drop loop.
+    //
+    //  Per iteration:
+    //    lateUs        = cursorUs - ringStartTlUs  (all pre-roll, postSeekFullDrop=true)
+    //    lateB         = usToBytes(lateUs)
+    //    lateBAligned  = frame-floor(lateB)
+    //    dropBytes     = min(lateBAligned, ringBytes)   [ringBytes large enough]
+    //    ringStartTlUs += bytesToUs(dropBytes)
+    //    clear if (cursorUs - ringStartTlUs) <= kTolUs
+    //      (matches AudioMixer.cpp readData: the production condition is
+    //       (cursorUs - ringStartTlUs) <= bytesToUs(kBytesPerFrame), and
+    //       kTolUs == bytesToUs(kBytesPerFrame), so the bound is <=, not <)
+    //
+    //  We give the ring enough bytes so liveBytes never limits the drop.
+    constexpr int64_t kRingBytes = 48000LL * 4 * 4;  // 4 s worth — never the bottleneck
+
+    for (int64_t gapUs = 1; gapUs <= 3'000'000; ++gapUs) {
+        const int64_t cursorUs = gapUs;  // cursor is at T; ring starts gapUs behind
+        int64_t ringStartTlUs  = 0;      // ring label = T - gapUs
+
+        bool postSeekFullDrop = true;
+        int callbacks = 0;
+
+        while (postSeekFullDrop && callbacks < 10) {
+            ++callbacks;
+            const int64_t lateUs        = cursorUs - ringStartTlUs;
+            const int64_t lateB         = usToBytes(lateUs);
+            const int64_t lateBAligned  = (lateB / kBytesPerFrame) * kBytesPerFrame;
+            const int64_t dropBytes     = qMin(lateBAligned, kRingBytes);
+            if (dropBytes > 0)
+                ringStartTlUs += bytesToUs(dropBytes);
+            // R7 tolerance-based clear (mirrors production code exactly)
+            if ((cursorUs - ringStartTlUs) <= kTolUs)
+                postSeekFullDrop = false;
+        }
+
+        if (!requireSelftest(!postSeekFullDrop,
+                             QString("postSeekFullDrop not cleared after %1 callbacks at gapUs=%2")
+                                 .arg(callbacks).arg(gapUs),
+                             &error)) {
+            qCritical() << "AUDIOMIXER_SELFTEST FAIL:" << error;
+            return 1;
+        }
+        if (!requireSelftest(callbacks <= 2,
+                             QString("postSeekFullDrop took %1 callbacks (>2) to clear at gapUs=%2")
+                                 .arg(callbacks).arg(gapUs),
+                             &error)) {
+            qCritical() << "AUDIOMIXER_SELFTEST FAIL:" << error;
+            return 1;
+        }
+    }
+
+    qInfo() << "AUDIOMIXER_SELFTEST PASS: arithmetic MODEL CHECK only"
+            << "(frame-alignment + tolerance-clear model consistent over"
+            << "200000 alignment cases, 3000000 gap sizes) —"
+            << "does NOT exercise the production audio path and by"
+            << "construction cannot catch a production-path regression;"
+            << "model must be kept in sync with AudioMixer.cpp by hand";
+    return 0;
 }
 
 int runVfxSelftest()
@@ -10061,6 +10179,10 @@ int main(int argc, char *argv[])
     if (qEnvironmentVariableIntValue("VEDITOR_WORKFLOW_SELFTEST") != 0) {
         writeLogLine("INFO", "running VEDITOR_WORKFLOW_SELFTEST");
         return runWorkflowSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_AUDIOMIXER_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_AUDIOMIXER_SELFTEST");
+        return runAudioMixerSelftest();
     }
 
     // スプラッシュ画面

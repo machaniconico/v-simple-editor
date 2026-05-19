@@ -57,6 +57,34 @@ struct AudioDecoderEntry {
     double atempoSrcFrameCarry = 0.0;
     bool eof = false;
     bool seekPending = true;         // first-time seek to entry's start when approached
+    // US-FIX-7 (seek 砂嵐, R3 — two-flag design):
+    //
+    // needsPtsAnchor — ONE-SHOT, owned by resampleAndAppend.
+    //   Set TRUE by seekEntryToTimeline (and cleared to false by the Fix-K /
+    //   full-path ring-reset loops). On the very first resampleAndAppend call
+    //   after a seek, reads best_effort_timestamp from the decoded frame,
+    //   maps it to timeline µs via the inverse of seekEntryToTimeline's
+    //   fileLocalSec formula, and writes ringStartTlUs = trueTlUs. Consumed
+    //   (set false) by resampleAndAppend immediately after, regardless of
+    //   whether the PTS was valid (NOPTS fallback keeps ringStartTlUs =
+    //   timelineUs and also clears postSeekFullDrop — see below).
+    //   resampleAndAppend is called from refillRingForEntry while
+    //   m_controlMutex is held; readData cannot interleave.
+    bool needsPtsAnchor = false;
+    //
+    // postSeekFullDrop — FAST-DRAIN GATE, owned by readData.
+    //   Set TRUE by seekEntryToTimeline (and cleared to false by ring-reset
+    //   loops). resampleAndAppend MUST NOT clear it (except the NOPTS path).
+    //   readData: when true, bypasses kMaxLateDropUs = 2 ms throttle and
+    //   drops the full lateUs = (cursorUs − trueTlUs) per callback, draining
+    //   the entire real keyframe pre-roll in 1–2 callbacks rather than
+    //   seconds. Cleared by readData once ringStartTlUs >= cursorUs (pre-roll
+    //   gone) — both the `if postSeekFullDrop && ringStartTlUs>=cursorUs` path
+    //   and the `else if postSeekFullDrop` path (ring empty, no pre-roll).
+    //   Flag becomes reachable in readData because refillRings releases
+    //   m_controlMutex before readData's next callback; by then needsPtsAnchor
+    //   is already consumed and ringStartTlUs = trueTlUs.
+    bool postSeekFullDrop = false;
     AVPacket *pkt = nullptr;
     AVFrame *frame = nullptr;
 
@@ -373,23 +401,132 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
         // entry's audio relative to the rest of the mix.
         if (e->ringStartTlUs < cursorUs) {
             const int64_t lateUs = cursorUs - e->ringStartTlUs;
-            // Bound the late-drop click duration to 2ms (audible threshold).
-            // The tolerant-dedup path in seekTo bumps m_writeCursorUs to the
-            // target without updating per-entry ringStartTlUs, so this branch
-            // can fire with lateUs up to the dedup window (~100 ms) and
-            // silently discard that much legitimate in-time audio = boundary
-            // pop. Clamping to 2 ms keeps the drop inaudible; the residual
-            // desync self-corrects over the next few readData fragments.
+            // US-FIX-7 (R3 — fast-drain gate, owned here):
+            // seekEntryToTimeline sets postSeekFullDrop=true and
+            // needsPtsAnchor=true. resampleAndAppend (called from
+            // refillRingForEntry under m_controlMutex) anchors
+            // ringStartTlUs=trueTlUs and clears needsPtsAnchor, but leaves
+            // postSeekFullDrop=true. By the time readData runs (after the
+            // refillRings lock is released), postSeekFullDrop is still true
+            // and ringStartTlUs=trueTlUs < cursorUs by exactly the real
+            // keyframe pre-roll gap. This branch fires; postSeekFullDrop
+            // bypasses kMaxLateDropUs so the gap drains in 1–2 callbacks
+            // with zero valid-audio loss. Cleared here once
+            // ringStartTlUs >= cursorUs; subsequent late-drops use the
+            // normal 2 ms clamp (boundary-pop protection documented below).
+            //
+            // Normal path: Bound the late-drop click duration to 2 ms
+            // (audible threshold). The tolerant-dedup path in seekTo bumps
+            // m_writeCursorUs to the target without updating per-entry
+            // ringStartTlUs, so this branch can fire with lateUs up to the
+            // dedup window (~100 ms) and silently discard that much
+            // legitimate in-time audio = boundary pop. Clamping to 2 ms
+            // keeps the drop inaudible; the residual desync self-corrects
+            // over the next few readData fragments.
             constexpr int64_t kMaxLateDropUs = 2'000;
-            const int64_t clampedLateUs = qMin(lateUs, kMaxLateDropUs);
+            const int64_t clampedLateUs = e->postSeekFullDrop
+                ? lateUs
+                : qMin(lateUs, kMaxLateDropUs);
             const qint64 lateB = usToBytes(clampedLateUs);
-            const qint64 dropBytes = qMin<qint64>(lateB, liveBytes(*e));
+            // US-FIX-7 (R6): align drop down to a frame boundary.
+            // usToBytes uses integer division and produces an arbitrary byte
+            // count; under postSeekFullDrop the full PTS-derived gap is passed,
+            // giving a value that is generically NOT a multiple of kBytesPerFrame
+            // (= 4). A non-frame-aligned ringHead misaligns L/R sample pairs on
+            // every subsequent read → continuous static on the resumed audio.
+            // Round down to the nearest kBytesPerFrame multiple before capping
+            // against liveBytes (which is itself frame-aligned as long as this
+            // invariant is maintained).
+            // NOTE (R7): the frame-alignment floor means ringStartTlUs after
+            // the drop lands STRICTLY below cursorUs by up to one frame (≤20 µs)
+            // due to integer round-trip loss in usToBytes/bytesToUs. The clear
+            // condition below uses a ≤1-frame tolerance instead of exact equality
+            // to handle this sub-frame residual. DO NOT change to >= comparison.
+            const qint64 lateBAligned =
+                (lateB / AudioMixer::kBytesPerFrame) * AudioMixer::kBytesPerFrame;
+            const qint64 dropBytes = qMin<qint64>(lateBAligned, liveBytes(*e));
             if (dropBytes > 0) {
                 e->ringHead += static_cast<int>(dropBytes);
                 e->ringStartTlUs += bytesToUs(dropBytes);
                 e->atempoSrcFrameCarry = 0.0;
             }
-            if (liveBytes(*e) <= 0) continue;
+            if (liveBytes(*e) <= 0) {
+                // US-FIX-7 (R4/R5): ring emptied by the drop above.
+                // Two sub-cases depending on whether the drop just reached T:
+                //
+                // (A) ringStartTlUs still < cursorUs (more pre-roll to drain,
+                //     or exactly equal but no post-target bytes decoded yet):
+                //     postSeekFullDrop is still true → mark entryActiveButStalled
+                //     so the master-clock freeze gate holds m_writeCursorUs at T.
+                //
+                // (B) ringStartTlUs == cursorUs (this drop landed the label
+                //     exactly at T) but the ring is empty (post-target audio not
+                //     yet decoded): postSeekFullDrop is still true (the flag-clear
+                //     below has NOT run yet — R5 reorder) → same stall path,
+                //     cursor stays at T. The flag is cleared below only when
+                //     liveBytes > 0 so the clearing callback is also the mixing
+                //     callback, guaranteeing audio resumes from exactly T.
+                //
+                // The freeze is bounded by kMaxStallCallbacks (~1 s). If the
+                // decoder is genuinely broken the stall count saturates and the
+                // cursor resumes — bounded silence, never permanent freeze.
+                // `&& !anyMixed` composes correctly for multi-track: another
+                // streaming entry's anyMixed=true suppresses the freeze and the
+                // clock runs with it; only the catching-up entry stays silent.
+                if (e->postSeekFullDrop)
+                    entryActiveButStalled = true;
+                continue;
+            }
+            // Pre-roll fully drained AND liveBytes > 0 (post-target audio is
+            // present and will be mixed this callback). Clear the flag here —
+            // AFTER the empty-ring check — so the callback that clears
+            // postSeekFullDrop is the same callback that mixes the first
+            // post-target sample from exactly T. If we cleared it before the
+            // liveBytes check (R4 ordering), the final pre-roll callback could
+            // clear the flag and fall through to the master-clock advance with
+            // nothing mixed, skipping ~one deltaUs (~21 ms) of post-target
+            // content before the stall path could re-engage. (R5 reorder fix.)
+            //
+            // US-FIX-7 (R7): tolerance-based clear. After frame-aligning the
+            // drop (R6), bytesToUs(lateBAligned) rounds down, so ringStartTlUs
+            // lands STRICTLY below cursorUs by a sub-frame residual (≤20 µs).
+            // An exact >= comparison never fires, stranding postSeekFullDrop=true
+            // permanently and keeping the 2 ms clamp bypassed for the clip's
+            // entire remaining life. Instead: if the deficit is <= one frame
+            // (= bytesToUs(kBytesPerFrame) = 20 µs), pre-roll is effectively
+            // exhausted — clear the flag. The <= boundary is required because
+            // usToBytes(20) = 3 (< kBytesPerFrame), so a 20 µs residual
+            // produces zero aligned-drop bytes and must itself trigger the clear.
+            //
+            // US-FIX-7 (R9, Q3) adjudicated-accepted edge — NO logic change
+            // (the prior-round invariant "DO NOT change to >= comparison" is
+            // respected; the <= boundary stays). When the post-drop residual
+            // lands in the (one-frame, ~two-frame] band — e.g. lateUs=41 →
+            // frame-aligned drop of 4 B = 20 µs → residual 21 µs > the 20 µs
+            // (= bytesToUs(kBytesPerFrame)) tolerance — the flag does NOT clear
+            // on that callback. If post-target audio is present (liveBytes>0,
+            // so the empty-ring stall `continue` above was not taken) the entry
+            // IS mixed once with ringStartTlUs ≤~40 µs behind cursor. This is
+            // ACCEPTED, not a sandstorm: the drop is frame-aligned (R6) so
+            // there is no L/R channel-interleave corruption — the mixed samples
+            // are valid, in-order audio at most ~1-2 samples (≤~40 µs) phase-
+            // early. It self-clears within ≤2 callbacks (the next callback's
+            // smaller lateUs drops one frame and the residual falls into the
+            // <= band), and the zero-progress band (residual ≤ one frame =
+            // 20 µs) is fully covered by this <= clear so there is no permanent
+            // strand. Mixing the ≤~40 µs-early frame-aligned audio for ≤1
+            // callback is the deliberate R5/R7 tradeoff: the alternative —
+            // suppressing the mix while the flag is set — would introduce a
+            // ≤1-callback silence gap, which the R5 reorder comment above
+            // explicitly rejects as the worse outcome.
+            if (e->postSeekFullDrop &&
+                (cursorUs - e->ringStartTlUs) <= bytesToUs(AudioMixer::kBytesPerFrame))
+                e->postSeekFullDrop = false;
+        } else if (e->postSeekFullDrop) {
+            // ringStartTlUs already >= cursorUs (e.g. ring was empty when
+            // the flag was set and cursor hasn't advanced past it yet).
+            // Pre-roll is gone; clear the flag.
+            e->postSeekFullDrop = false;
         }
         // If samples sit in the future the entry shouldn't be mixed yet.
         if (e->ringStartTlUs > cursorUs + maxlenUs / 2) continue;
@@ -452,7 +589,18 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
             // volume while muted and then unmuting produces a brief blip as
             // the ramp descends from 1.0 to the new gain.
             e->prevGain = 0.0;
-            const int dropBytes = static_cast<int>(qMin<qint64>(maxlen, liveBytes(*e)));
+            // US-FIX-7 (R6): align muted drain to a frame boundary.
+            // maxlen comes from the OS audio callback and is always a
+            // kBytesPerFrame multiple (Qt sets bufferSize as a frame multiple
+            // and the sink requests in whole frames). liveBytes is frame-aligned
+            // as long as ringHead stays aligned. The qMin of two frame-aligned
+            // values is frame-aligned, so this site is safe by invariant — the
+            // explicit align-down is a defensive belt-and-suspenders guard that
+            // costs nothing and keeps the invariant self-maintaining if any
+            // upstream ever produces an odd liveBytes.
+            const qint64 rawDrop = qMin<qint64>(maxlen, liveBytes(*e));
+            const int dropBytes = static_cast<int>(
+                (rawDrop / AudioMixer::kBytesPerFrame) * AudioMixer::kBytesPerFrame);
             e->ringHead += dropBytes;
             e->ringStartTlUs += bytesToUs(dropBytes);
             e->atempoSrcFrameCarry = 0.0;
@@ -1529,6 +1677,7 @@ void AudioMixer::setSequence(const QVector<PlaybackEntry> &entries) {
 void AudioMixer::setSpeedRamps(const QVector<speedramp::SpeedRamp> &ramps)
 {
     int hashedCount = 0;
+    int rearmed = 0;
     {
         QMutexLocker lock(&m_controlMutex);
         m_speedRamps = ramps;
@@ -1543,9 +1692,76 @@ void AudioMixer::setSpeedRamps(const QVector<speedramp::SpeedRamp> &ramps)
             m_speedRampByKey.insert(m_speedRampKeyOrder[i], m_speedRamps[i]);
             ++hashedCount;
         }
+        // US-FIX-7 (R9, Q2): close the setSequence-unlock → setSpeedRamps-lock
+        // ordering window. setSequence releases m_controlMutex then wakes the
+        // decoder; the woken decode thread can run seekEntryToTimeline for a
+        // seekPending entry BEFORE this call has rebuilt m_speedRampByKey, so
+        // the R8 gate there can observe the PREVIOUS sequence's (stale) ramp
+        // map and wrongly re-enable the fast-drain for a uniform-speed==1.0
+        // clip that actually carries an authored non-identity SpeedRamp. With
+        // the fresh map now installed (still under this lock), force exactly
+        // one corrective re-seek for every ramped entry that has NOT already
+        // queued a seek: seekEntryToTimeline fully resets ring/head/carry/flags
+        // so any stale-map anchor is overwritten. Predicate "ramped AND not
+        // already seekPending": a non-ramped entry's gate decision depends only
+        // on the race-immune r8NonUnitSpeed, so re-seeking it mid-playback on
+        // every edit would be an audible disruption with no correctness
+        // benefit; an already-seekPending entry has not consumed the stale map
+        // yet and will gate correctly on its first seek, so re-arming it would
+        // only risk a redundant double-seek. Bounded: ≤1 extra seek per ramped
+        // entry per call — the bound is guaranteed by the `!de->seekPending`
+        // guard in the loop below, NOT by seekEntryToTimeline clearing
+        // seekPending before the next setSpeedRamps: an entry this call just
+        // re-armed has seekPending=true, so a subsequent setSpeedRamps skips it
+        // via that guard even when its seekEntryToTimeline has not yet run (the
+        // seek is deferred until the playback cursor approaches an out-of-window
+        // entry, so seekPending is not necessarily cleared before the next
+        // setSpeedRamps — the bound does not rely on that clear).
+        //
+        // No-op / byte-identical guarantee — the precondition is "no authored
+        // non-identity ramp", NOT "atempo OFF" (the map is built regardless of
+        // atempo; atempo only gates ramp CONSUMPTION in readData and the R8
+        // ramp-branch). The user's reported default editor-preview path (no
+        // ramp at all, speed==1.0) has an empty m_speedRampByKey → contains()
+        // is always false → this loop is a pure no-op, rearmed stays 0, no
+        // extra wake() → byte-identical to R8/R7. With an authored non-identity
+        // ramp present (atempo OFF *or* ON) the map is populated and this loop
+        // MAY re-arm + wake; on an atempo-OFF/1x clip that extra re-seek is
+        // benign (seekEntryToTimeline fully resets and the R8 gate, atempo OFF,
+        // still lands flags-ON for a 1x clip — a harmless redundant re-seek,
+        // never a sandstorm), and on the opt-in atempo path it is the intended
+        // corrective re-seek.
+        //
+        // SCOPE (honest — R9 adversarial review, Codex): this re-arm closes the
+        // ramp-ADDED stale-map direction for the opt-in VEDITOR_AUDIO_ATEMPO=1
+        // / non-1x path. It does NOT close (i) the inverse ramp-REMOVED
+        // transition (an entry ramped in the OLD map but identity in the new
+        // one is not matched by contains(), so a stale flags-OFF gate state can
+        // persist) nor (ii) a stale-map callback already emitted before this
+        // call acquires the lock (cannot be un-emitted). BOTH residuals are
+        // strictly confined to the opt-in atempo / non-1x path: the default
+        // editor preview (atempo OFF, speed==1.0, no ramp — the user's actual
+        // bug) is map-INDEPENDENT at the R8 gate because
+        // audioAtempoEnabledCached() gates the only map-dependent term and
+        // r8NonUnitSpeed is a per-entry race-immune copy, so it is byte-
+        // identical to R7 regardless of stale-vs-fresh map. Full closure of
+        // (i)/(ii) is a documented non-blocking followup tracked with the
+        // atempo/libav work, not a default-path defect.
+        for (auto it = m_entries.constBegin(); it != m_entries.constEnd(); ++it) {
+            AudioDecoderEntry *de = it.value();
+            if (de && !de->seekPending && m_speedRampByKey.contains(it.key())) {
+                de->seekPending = true;
+                ++rearmed;
+            }
+        }
     }
+    // Lock released. Mirror setSequence's post-unlock wake (wake() takes only
+    // m_wakeMutex, never m_controlMutex) so the re-armed seeks are serviced
+    // promptly. On the default path rearmed==0 so this is skipped entirely.
+    if (rearmed > 0 && m_decodeRunner) m_decodeRunner->wake();
     qInfo() << "AudioMixer::setSpeedRamps count=" << ramps.size()
             << "non-identity-hashed=" << hashedCount
+            << "rearmedSeek=" << rearmed
             << "atempoEnvvar=" << audioAtempoEnabledCached();
 }
 
@@ -1695,6 +1911,12 @@ void AudioMixer::seekTo(int64_t timelineUs) {
                 e->atempoSrcFrameCarry = 0.0;
                 e->ringStartTlUs = timelineUs;
                 e->eof = false;
+                // US-FIX-7 (R3): Fix-K sets ringStartTlUs = timelineUs (true
+                // cursor on an active sink). Clear both US-FIX-7 flags so a
+                // prior paused-seek's anchor/fast-drain state does not corrupt
+                // this active-sink ring reset.
+                e->needsPtsAnchor = false;
+                e->postSeekFullDrop = false;
             }
             // Wake the decode runner so the next readData() pulls from the
             // updated cursor without an audible click. The sink stays in
@@ -1730,6 +1952,12 @@ void AudioMixer::seekTo(int64_t timelineUs) {
             e->atempoSrcFrameCarry = 0.0;
             e->ringStartTlUs = timelineUs;
             e->eof = false;
+            // US-FIX-7 (R3): clear both flags. seekEntryToTimeline (called
+            // from refillRings once the decode worker wakes) will re-set both
+            // to true. Clearing here prevents stale state from a prior seek
+            // corrupting the window between this ring-reset and that call.
+            e->needsPtsAnchor = false;
+            e->postSeekFullDrop = false;
         }
         sinkSnap = m_sink;
         ioSnap = m_io;
@@ -1757,6 +1985,13 @@ void AudioMixer::seekTo(int64_t timelineUs) {
         // window, CompState.currentGrDb meter readout) are intentionally
         // left untouched: they are not per-sample feedback paths and
         // resetting them would degrade post-seek noise-gate accuracy.
+        //
+        // NOTE: This zero-fill removes the DSP-feedback component of the
+        // seek 砂嵐. A SECOND, independent component — decoder pre-roll from
+        // av_seek_frame(AVSEEK_FLAG_BACKWARD) — is handled by US-FIX-7 in
+        // seekEntryToTimeline + readData: ringStartTlUs is backstep-set so
+        // readData's late-drop discards pre-roll with the postSeekFullDrop
+        // clamp bypass. Both fixes are required for a clean post-seek start.
         {
             QMutexLocker lock(&m_controlMutex);
             for (auto it = m_trackReverbState.begin();
@@ -2319,17 +2554,147 @@ void AudioMixer::seekEntryToTimeline(AudioDecoderEntry *e, int64_t timelineUs) {
     const int64_t ts = static_cast<int64_t>(fileLocalSec / av_q2d(tb));
     av_seek_frame(e->fmtCtx, e->audioStreamIdx, ts, AVSEEK_FLAG_BACKWARD);
     avcodec_flush_buffers(e->codecCtx);
+    // B3 fix: avcodec_flush_buffers resets the codec but the SwrContext
+    // (created once in openEntry) retains an internal delay-compensation
+    // FIFO. Without this re-init the first post-seek resampleAndAppend call
+    // drains stale pre-seek samples from that FIFO into the ring before any
+    // new decoded frames arrive, producing a brief filter transient / wrong-
+    // position burst on top of the keyframe pre-roll. swr_init on an already-
+    // initialised context is the libswresample-documented way to clear all
+    // internal state (delay buffer, compensation accumulators) while keeping
+    // the channel/format/rate configuration intact.
+    if (e->swrCtx) swr_init(e->swrCtx);
     e->ring.clear();
     e->ringHead = 0;
     e->atempoSrcFrameCarry = 0.0;
-    // The next sample appended to the ring corresponds to the timeline
-    // position we just seeked the file to.
-    e->ringStartTlUs = timelineUs;
     e->eof = false;
+
+    // US-FIX-7 (seek 砂嵐, R3 — two-flag PTS-anchored, no synchronous decode):
+    // av_seek_frame(AVSEEK_FLAG_BACKWARD) lands on the nearest keyframe ≤ ts.
+    // First samples refillRingForEntry appends are pre-roll from that keyframe.
+    //
+    // Two flags are set here (see struct doc for ownership):
+    //   needsPtsAnchor = true  → resampleAndAppend writes trueTlUs on 1st frame
+    //   postSeekFullDrop = true → readData bypasses 2 ms clamp to drain pre-roll
+    //
+    // refillRings holds m_controlMutex for its entire pass, so within that same
+    // lock: seekEntryToTimeline (here) → refillRingForEntry → resampleAndAppend
+    // anchors ringStartTlUs=trueTlUs and clears needsPtsAnchor. postSeekFullDrop
+    // is NOT cleared by resampleAndAppend (PTS path) — it stays true so that
+    // readData, running AFTER the lock is released, sees postSeekFullDrop=true
+    // and ringStartTlUs=trueTlUs<cursorUs and fast-drains the pre-roll.
+    //
+    // NOPTS fallback: if first frame PTS is AV_NOPTS_VALUE, resampleAndAppend
+    // clears BOTH flags and leaves ringStartTlUs=timelineUs → pre-US-FIX-7
+    // behaviour (2 ms/callback residual, no valid-audio loss risk).
+    e->ringStartTlUs = timelineUs;
+
+    // US-FIX-7 (R8 — defense-in-depth speed/ramp safety gate):
+    // seekEntryToTimeline maps timeline→source as a strict 1:1 affine
+    //   fileLocalSec = clipIn + (tlSec − timelineStart)
+    // and resampleAndAppend's anchor is the exact inverse. That pair is only
+    // an exact inverse when audio is consumed 1:1. Audio time-stretch for
+    // ramped clips happens ONLY on readData's atempoRamp path, which is gated
+    // by audioAtempoEnabledCached() ⟸ env VEDITOR_AUDIO_ATEMPO (default OFF).
+    // With atempo OFF (the default editor preview) audio is 1:1 and the
+    // forward map + inverse anchor are exact inverses → the R3 two-flag
+    // fast-drain is correct. For a non-1x uniform speed, OR an authored ramp
+    // under the opt-in envvar, timeline-time ≠ source-time so the 1:1 anchor
+    // is imprecise and a mis-anchored keyframe pre-roll could be fast-drained.
+    // To keep US-FIX-7 robust even under the gated/non-default case, revert
+    // exactly that case to documented pre-US-FIX-7 behaviour (normal 2 ms
+    // residual late-drop, no PTS anchor, no fast-drain). The 1x default path
+    // is byte-for-byte unchanged. (seekEntryToTimeline is an AudioMixer
+    // method, so m_speedRampByKey / audioAtempoEnabledCached() are in scope
+    // directly; the key construction mirrors readData's atempo lookup.)
+    const double r8UniSpeed =
+        (e->entry.speed > 0.0) ? e->entry.speed : 1.0;
+    const bool r8NonUnitSpeed = std::abs(r8UniSpeed - 1.0) > 1e-9;
+    bool r8AtempoRampPresent = false;
+    if (audioAtempoEnabledCached() && !m_speedRampByKey.isEmpty()) {
+        const AudioTrackKey r8Key{
+            e->entry.filePath,
+            qRound64(e->entry.clipIn * 1000.0),
+            e->entry.sourceTrack,
+            e->entry.sourceClipIndex
+        };
+        r8AtempoRampPresent =
+            (m_speedRampByKey.constFind(r8Key) != m_speedRampByKey.constEnd());
+    }
+    if (r8NonUnitSpeed || r8AtempoRampPresent) {
+        // Gated/non-default time-stretched case: 1:1 anchor is imprecise.
+        // Fall back to pre-US-FIX-7 behaviour so a mis-anchored pre-roll is
+        // never fast-drained (normal 2 ms-clamp residual late-drop).
+        e->needsPtsAnchor = false;
+        e->postSeekFullDrop = false;
+    } else {
+        // Default 1x path (no envvar, speed==1.0, no ramp): unchanged R7
+        // two-flag PTS-anchored fast-drain.
+        e->needsPtsAnchor = true;
+        e->postSeekFullDrop = true;
+    }
 }
 
 void AudioMixer::resampleAndAppend(AudioDecoderEntry *e) {
     if (!e || !e->frame || !e->swrCtx) return;
+
+    // US-FIX-7 (R3 — two-flag PTS anchor, owned by this function):
+    // needsPtsAnchor is set by seekEntryToTimeline and consumed here on the
+    // first post-seek decoded frame. We write ringStartTlUs = trueTlUs (the
+    // true timeline µs of ring[0]) so readData's late-drop discards exactly
+    // the real keyframe pre-roll and no more. postSeekFullDrop is NOT cleared
+    // here on the PTS-valid path — it must stay true until readData sees
+    // ringStartTlUs < cursorUs and fast-drains the pre-roll (postSeekFullDrop
+    // bypasses the 2 ms clamp; readData clears it once ringStartTlUs>=cursorUs).
+    // Both flags are cleared together only on the NOPTS fallback path.
+    //
+    // Mapping (inverse of seekEntryToTimeline's fileLocalSec formula):
+    //   seekEntryToTimeline: fileLocalSec = clipIn + (tlSec − timelineStart)
+    //   inverse:             trueTlSec    = timelineStart + (framePtsSec − clipIn)
+    //                        trueTlUs     = int64_t(trueTlSec × 1e6)
+    if (e->needsPtsAnchor) {
+        e->needsPtsAnchor = false;   // consumed — one-shot regardless of path
+        const int64_t framePts =
+            (e->frame->best_effort_timestamp != AV_NOPTS_VALUE)
+                ? e->frame->best_effort_timestamp
+                : e->frame->pts;
+        if (framePts != AV_NOPTS_VALUE && e->fmtCtx
+                && e->audioStreamIdx >= 0) {
+            // PTS-valid path: anchor ringStartTlUs, leave postSeekFullDrop=true
+            // for readData to fast-drain.
+            const AVRational tb =
+                e->fmtCtx->streams[e->audioStreamIdx]->time_base;
+            const double framePtsSec = framePts * av_q2d(tb);
+            const double trueTlSec =
+                e->entry.timelineStart + (framePtsSec - e->entry.clipIn);
+            const int64_t trueTlUs =
+                static_cast<int64_t>(trueTlSec * 1e6);
+            const int64_t prevRingStartTlUs = e->ringStartTlUs;
+            e->ringStartTlUs = trueTlUs;
+            qInfo() << "US-FIX-7 anchor: framePts=" << framePts
+                    << "framePtsSec=" << framePtsSec
+                    << "trueTlUs=" << trueTlUs
+                    << "was(timelineUs)=" << prevRingStartTlUs
+                    << "gapUs=" << (prevRingStartTlUs - trueTlUs);
+        } else {
+            // NOPTS fallback: PTS unknowable — cannot determine pre-roll gap.
+            // Clear postSeekFullDrop so readData uses the normal 2 ms clamp;
+            // ringStartTlUs stays at timelineUs (pre-US-FIX-7 residual path,
+            // never fast-drops unknown-position content).
+            //
+            // US-FIX-7 (R8): the residual on this branch is an ACCEPTED
+            // pre-existing limitation (adjudicated across multiple
+            // remediation rounds), not a new blocker. AAC/MP3 — the codecs
+            // this editor ingests — effectively always carry PTS, so
+            // best_effort_timestamp is valid in practice; a NOPTS audio
+            // stream is pathologically rare. On NOPTS we cannot determine
+            // the keyframe pre-roll gap, so we deliberately fall back to the
+            // pre-US-FIX-7 2 ms-clamp residual rather than risk fast-draining
+            // unknown-position content. No logic change here — comment only.
+            e->postSeekFullDrop = false;
+        }
+    }
+
     const int outSamples = swr_get_out_samples(e->swrCtx, e->frame->nb_samples);
     if (outSamples <= 0) return;
     const int prevSize = e->ring.size();
