@@ -208,7 +208,8 @@ public:
         const QVector<double> &overlayOpacity,
         const QVector<double> &overlayScale,
         const QVector<double> &overlayDx,
-        const QVector<double> &overlayDy) const;
+        const QVector<double> &overlayDy,
+        const QVector<double> &overlayRotationDeg = {}) const;
 
     // NOTE: the genuine text baker is now the free function
     // textbake::bakeOverlays (src/TextOverlayBake.h), extracted verbatim from
@@ -389,10 +390,11 @@ public:
     // entries falling back to the previous decoded frame from the eviction
     // grace pool when a re-seek hasn't caught up yet.
     //
-    // Public so that layerPaintOrderLess (the sort comparator extracted for
-    // testability) can be declared as a free function below and used in
-    // the S3-STACK predicate sub-assertion in src/main.cpp without exposing
-    // the full private compositor surface.
+    // Public so that clipstack::layerPaintOrderLess (the sort comparator
+    // extracted for testability) can be declared as a free function below
+    // (inside namespace clipstack) and used in the S3-STACK predicate
+    // sub-assertion in src/main.cpp without exposing the full private
+    // compositor surface.
     struct DecodedLayer {
         QImage rgb;
         double opacity = 1.0;
@@ -654,5 +656,9 @@ private:
 // Contract: V1 (sourceTrack==0) sorts BEFORE higher tracks, so the
 // compositor paints V1 first (base) and overlays on top — ascending order
 // matches renderFrameAt / trackmatte::composite / buildSpecialClipComposite.
+// Wrapped in namespace clipstack to avoid GLOBAL-namespace ODR/symbol
+// pollution; all call sites must qualify as clipstack::layerPaintOrderLess.
+namespace clipstack {
 bool layerPaintOrderLess(const VideoPlayer::DecodedLayer &a,
                          const VideoPlayer::DecodedLayer &b);
+} // namespace clipstack

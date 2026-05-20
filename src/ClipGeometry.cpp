@@ -6,21 +6,8 @@ namespace clipgeom {
 
 QTransform resolveTransform(const ClipTransform& t, QSize canvasSize)
 {
-    // Anchor = LAYER CENTER. The source is canvas-sized; its center (W/2,H/2)
-    // is mapped to the placement point (canvas-center + normalized offset).
-    // Scale and rotation pivot about the layer center.
-    // videoDx/Dy are NORMALIZED fractions of canvas width/height (not pixels).
-    //
-    // Qt post-multiplies: the trailing translate() is the FIRST op applied
-    // to a point, so the sequence below reads back-to-front:
-    //   (1) un-center the canvas-sized source: shift (0,0) by (-W/2,-H/2)
-    //   (2) scale about the now-centered origin
-    //   (3) rotate about the now-centered origin
-    //   (4) translate center to placement point
-    //
-    // Identity check (scale=1,dx=dy=rot=0):
-    //   source (0,0) -> (+W/2,+H/2) -> scale(1) -> rot(0) -> (0,0)  [fills canvas]
-    //   source (W,H) -> (+W/2,+H/2) -> scale(1) -> rot(0) -> (W,H)  [fills canvas]
+    // 契約と op-order は ClipGeometry.h の CANONICAL CLIP-PLACEMENT CONTRACT を参照。
+    // 以下の数式はそれと厳密一致が必須。
     const double canvasW = canvasSize.width();
     const double canvasH = canvasSize.height();
 

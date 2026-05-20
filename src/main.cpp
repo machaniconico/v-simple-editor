@@ -6004,12 +6004,13 @@ int runParitySelftest()
     //       composeMultiTrackFrame directly — it does NOT go through the
     //       std::stable_sort in handlePlaybackTick. It validates the paint-
     //       loop / compositing logic, NOT the sort comparator.
-    //   (c) PREDICATE SUB-ASSERTION — exercises layerPaintOrderLess (the
-    //       EXACT named comparator that handlePlaybackTick's stable_sort uses)
-    //       by sorting a deliberately reversed 2-element DecodedLayer vector
-    //       and asserting V1 ends up first. This is the ONLY guard that would
-    //       catch a re-inversion of the comparator in VideoPlayer.cpp. A
-    //       descending re-inversion leaves V1 last → assertion FAILS loudly.
+    //   (c) PREDICATE SUB-ASSERTION — exercises clipstack::layerPaintOrderLess
+    //       (the EXACT named comparator that handlePlaybackTick's stable_sort
+    //       uses) by sorting a deliberately reversed 2-element DecodedLayer
+    //       vector and asserting V1 ends up first. This is the ONLY guard
+    //       that would catch a re-inversion of the comparator in
+    //       VideoPlayer.cpp. A descending re-inversion leaves V1 last →
+    //       assertion FAILS loudly.
     {
         QTemporaryDir stackTmpDir;
         if (!stackTmpDir.isValid()) {
@@ -6210,7 +6211,8 @@ int runParitySelftest()
                         { 1.0 },              // opacity
                         { 1.0 },              // scale
                         { 0.0 },              // dx
-                        { 0.0 });             // dy
+                        { 0.0 },              // dy
+                        QVector<double>{});   // rotationDeg (empty = 0°)
                 vp->deleteLater();
 
                 if (previewResult.isNull()
@@ -6242,15 +6244,16 @@ int runParitySelftest()
                            " composeMultiTrackFrameForTest";
             }
 
-            // ── (c) Predicate sub-assertion: layerPaintOrderLess ─────────
+            // ── (c) Predicate sub-assertion: clipstack::layerPaintOrderLess
             // Build a 2-element vector in DELIBERATELY WRONG order:
             //   [0] overlay  (sourceTrack=1)
             //   [1] V1 base  (sourceTrack=0)
-            // Apply the SAME layerPaintOrderLess that handlePlaybackTick's
-            // stable_sort uses. After sorting, V1 (track 0) MUST be first.
-            // If the comparator were re-inverted to `>`, stable_sort would
-            // leave V1 last → FAIL. This is the only assert that guards the
-            // production sort comparator against re-inversion.
+            // Apply the SAME clipstack::layerPaintOrderLess that
+            // handlePlaybackTick's stable_sort uses. After sorting, V1
+            // (track 0) MUST be first. If the comparator were re-inverted
+            // to `>`, stable_sort would leave V1 last → FAIL. This is the
+            // only assert that guards the production sort comparator
+            // against re-inversion.
             {
                 VideoPlayer::DecodedLayer overlay, v1base;
                 overlay.sourceTrack = 1;   // V2 overlay — wrong position
@@ -6260,23 +6263,24 @@ int runParitySelftest()
                 predVec.append(v1base);    // [1]=track0
 
                 std::stable_sort(predVec.begin(), predVec.end(),
-                                 layerPaintOrderLess);
+                                 clipstack::layerPaintOrderLess);
 
                 if (predVec[0].sourceTrack != 0 || predVec[1].sourceTrack != 1) {
                     qCritical()
                         << "PARITY S3-STACK FAILED [PREDICATE]:"
-                           " layerPaintOrderLess produced wrong order after"
-                           " sorting reversed vector — expected [0].track=0"
-                           " [1].track=1, got [0].track="
+                           " clipstack::layerPaintOrderLess produced wrong"
+                           " order after sorting reversed vector — expected"
+                           " [0].track=0 [1].track=1, got [0].track="
                         << predVec[0].sourceTrack
                         << "[1].track=" << predVec[1].sourceTrack
                         << ". The production sort comparator is INVERTED —"
                            " re-inversion regression in VideoPlayer.cpp.";
                     return 1;
                 }
-                qInfo() << "PARITY S3-STACK (predicate): layerPaintOrderLess"
-                           " sorts V1-track0 first — production sort"
-                           " comparator correct, re-inversion guard active";
+                qInfo() << "PARITY S3-STACK (predicate):"
+                           " clipstack::layerPaintOrderLess sorts V1-track0"
+                           " first — production sort comparator correct,"
+                           " re-inversion guard active";
             }
         }
         s3stack_skip:

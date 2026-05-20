@@ -11,11 +11,14 @@
 // main.cpp can exercise the EXACT same comparator and catch a re-inversion.
 // Returns true when `a` should paint BEFORE `b` (i.e. is deeper in the stack):
 // V1 (sourceTrack 0) is the base; higher tracks paint on top — ascending order.
+// Lives in namespace clipstack to avoid GLOBAL-namespace ODR/symbol pollution.
+namespace clipstack {
 bool layerPaintOrderLess(const VideoPlayer::DecodedLayer &a,
                          const VideoPlayer::DecodedLayer &b)
 {
     return a.sourceTrack < b.sourceTrack;
 }
+} // namespace clipstack
 
 #if defined(_WIN32)
 // Phase 1e — d3d11.h pulls in WinSDK 10.0.26100 headers that fight Qt's
@@ -3644,10 +3647,11 @@ void VideoPlayer::handlePlaybackTick()
         // stable_sort: deterministic tie-break for same-sourceTrack clips
         // (preserves input order for equal keys); behaviour-identical to sort
         // for the common distinct-track case.
-        // layerPaintOrderLess is a named free function (declared in
-        // VideoPlayer.h) so the S3-STACK predicate sub-assertion in main.cpp
-        // exercises the SAME comparator — a re-inversion breaks the selftest.
-        std::stable_sort(layers.begin(), layers.end(), layerPaintOrderLess);
+        // clipstack::layerPaintOrderLess is a named free function (declared
+        // in VideoPlayer.h, namespace clipstack) so the S3-STACK predicate
+        // sub-assertion in main.cpp exercises the SAME comparator — a
+        // re-inversion breaks the selftest.
+        std::stable_sort(layers.begin(), layers.end(), clipstack::layerPaintOrderLess);
         if (overlayPresent) {
             // Reuse a canvas-sized scratch buffer so we don't allocate
             // ~8MB (1080p ARGB) every tick. Re-allocates only when the
@@ -4492,17 +4496,19 @@ QImage VideoPlayer::composeMultiTrackFrameForTest(
     const QVector<double> &overlayOpacity,
     const QVector<double> &overlayScale,
     const QVector<double> &overlayDx,
-    const QVector<double> &overlayDy) const
+    const QVector<double> &overlayDy,
+    const QVector<double> &overlayRotationDeg) const
 {
     QVector<DecodedLayer> layers;
     layers.reserve(overlayRgb.size());
     for (int i = 0; i < overlayRgb.size(); ++i) {
         DecodedLayer L;
-        L.rgb        = overlayRgb.value(i);
-        L.opacity    = overlayOpacity.value(i, 1.0);
-        L.videoScale = overlayScale.value(i, 1.0);
-        L.videoDx    = overlayDx.value(i, 0.0);
-        L.videoDy    = overlayDy.value(i, 0.0);
+        L.rgb              = overlayRgb.value(i);
+        L.opacity          = overlayOpacity.value(i, 1.0);
+        L.videoScale       = overlayScale.value(i, 1.0);
+        L.videoDx          = overlayDx.value(i, 0.0);
+        L.videoDy          = overlayDy.value(i, 0.0);
+        L.rotation2DDegrees = overlayRotationDeg.value(i, 0.0);
         layers.append(L);
     }
     return composeMultiTrackFrame(v1Frame, layers);

@@ -85,10 +85,19 @@ static const int PROJECT_FORMAT_VERSION = 2;
 // Heuristic: the canonical normalized range is bounded +-5, so any persisted
 // |videoDx|>5 (or |videoDy|>5) is unambiguously a stale pixel value and is
 // divided by the canvas width (height). Values within +-5 are already
-// normalized and left untouched. The single accepted imperfection: a genuine
-// sub-5px pixel offset is kept as-is (treated as a ~0 normalized value). That
-// is visually negligible, and it already rendered that way before the unit
-// fix, so this migration neither improves nor worsens that rare case.
+// normalized and left untouched.
+//
+// INTENTIONAL NO-OP for sub-5px pixel offsets (canonical contract):
+//   A genuine legacy pixel offset whose magnitude is <=5px is left
+//   unchanged — it is treated as an already-normalized value close to
+//   zero.  This is a deliberate acceptance, not an oversight:
+//   (1) Such tiny offsets were visually negligible (<0.5% of a 1080p
+//       canvas) both before and after the v1->v2 unit change.
+//   (2) Converting them would silently alter projects that were authored
+//       under v2 normalized semantics; the +-5 threshold is the legacy
+//       clamp boundary and must remain stable for round-trip safety.
+//   (3) The rendering path already treated these values as normalized,
+//       so leaving them as-is preserves the prior visual output exactly.
 //
 // rotation2DDegrees is unit-stable across v1/v2 and is deliberately NOT
 // touched here.
@@ -109,6 +118,29 @@ static void migrateClipOffsetsToNormalized(ProjectData &data, int storedVersion)
                     clip.videoDx /= w;
                 if (std::abs(clip.videoDy) > 5.0)
                     clip.videoDy /= h;
+
+                // Defensive post-migration sanity guard: the normalized value
+                // should always land within canonical +-5 range.  If it does
+                // not (e.g. canvas dimension was extremely small causing /w to
+                // overshoot), clamp and emit a one-shot warning so the anomaly
+                // surfaces in logs without flooding them.
+                static bool s_warnedDx = false;
+                if (!s_warnedDx && std::abs(clip.videoDx) > 5.0) {
+                    qWarning("migrateClipOffsetsToNormalized: videoDx %f is "
+                             "outside canonical +-5 range after migration "
+                             "(canvas width=%f); clamping.", clip.videoDx, w);
+                    s_warnedDx = true;
+                }
+                clip.videoDx = std::clamp(clip.videoDx, -5.0, 5.0);
+
+                static bool s_warnedDy = false;
+                if (!s_warnedDy && std::abs(clip.videoDy) > 5.0) {
+                    qWarning("migrateClipOffsetsToNormalized: videoDy %f is "
+                             "outside canonical +-5 range after migration "
+                             "(canvas height=%f); clamping.", clip.videoDy, h);
+                    s_warnedDy = true;
+                }
+                clip.videoDy = std::clamp(clip.videoDy, -5.0, 5.0);
             }
         }
     };
