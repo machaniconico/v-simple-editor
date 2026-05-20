@@ -1,0 +1,57 @@
+# 自動検出 + LF 強制 (Windows でも LF で commit)
+* text=auto eol=lf
+
+# 明示的なテキスト型 (LF を保証)
+*.cpp text eol=lf
+*.h text eol=lf
+*.hpp text eol=lf
+*.c text eol=lf
+*.cc text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.jsonl text eol=lf
+*.txt text eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+*.qrc text eol=lf
+*.ui text eol=lf
+*.qml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.svg text eol=lf
+*.cmake text eol=lf
+*.rc text eol=lf
+*.sln text eol=lf
+*.vcxproj text eol=lf
+*.filters text eol=lf
+*.mjs text eol=lf
+*.ps1 text eol=lf
+*.cube text eol=lf
+*.bat text eol=crlf
+
+# バイナリ資産
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.qm binary
+*.ttf binary
+*.otf binary
+*.woff binary
+*.woff2 binary
+*.mp4 binary
+*.mov binary
+*.wav binary
+*.mp3 binary
+*.dll binary
+*.lib binary
+*.exe binary
+*.pdf binary
+*.zip binary
+*.obj binary
+*.bin binary
+*.res binary
+
+# Extensionless binary harnesses
+test_assets/gif_harness/gif_lzw_harness binary
