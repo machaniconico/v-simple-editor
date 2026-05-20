@@ -1,159 +1,203 @@
 #!/usr/bin/env bash
-# realfootage_parity.sh — multi-codec real-footage parity harness (TM-7)
+# realfootage_parity.sh — real-footage env-gated selftest harness (US-006)
 #
-# Usage: realfootage_parity.sh <footage_dir> [binary_path]
+# USAGE
+#   realfootage_parity.sh [OPTIONS] <clip>
+#   REALFOOTAGE_CLIP=<clip> realfootage_parity.sh [OPTIONS]
 #
-# Runs the general parity selftest (VEDITOR_PARITY_SELFTEST=1) and the
-# track-matte SSOT parity selftest (--selftest-trackmatte-parity /
-# VEDITOR_TRACKMATTE_PARITY_SELFTEST=1) against every video file found in
-# <footage_dir>.  Prints a summary table and exits non-zero if any test fails.
+#   <clip>  Path to a real video file (mp4 / mov / mkv / etc.)
 #
-# Exit codes:
-#   0  — every file passed every test
-#   1  — at least one file failed at least one test
-#   2  — footage_dir missing, not a directory, or contains no video files
+# OPTIONS
+#   -h, --help            Show this help and exit 0
+#
+# ENVIRONMENT
+#   REALFOOTAGE_CLIP      Alternative to positional <clip> argument
+#   REALFOOTAGE_BUILD=1   Run  cmd.exe /c cmake.exe --build build_win --config Release
+#                         before executing selftests
+#
+# OUTPUT FORMAT
+#   [REALFOOTAGE_PARITY] PASS: <testname>
+#   [REALFOOTAGE_PARITY] FAIL: <testname> <reason>
+#
+# EXIT CODES
+#   0  all selftests passed
+#   1  one or more selftests failed
+#   2  usage error (missing clip, file not found)
+#
+# NOTES
+#   * Runs env-gated selftests via cmd.exe so env vars reach the Windows .exe
+#     (WSL env is not propagated to Windows processes — reference_selftest_wsl_windows_env).
+#   * Idempotent: temporary files live under a mktemp -d dir removed on exit.
+#   * C++ sources are never modified by this script.
 
 set -euo pipefail
 
-FOOTAGE_DIR="${1:-}"
-BINARY="${2:-build_win/Release/v-simple-editor.exe}"
-TIMEOUT_SECS=300
+# ── tmpdir ──────────────────────────────────────────────────────────────────
+SCRIPT_TMPDIR="$(mktemp -d)"
+trap 'rm -rf "$SCRIPT_TMPDIR"' EXIT
 
-# ── helpers ─────────────────────────────────────────────────────────────────
-
+# ── usage ────────────────────────────────────────────────────────────────────
 usage() {
-    echo "Usage: $(basename "$0") <footage_dir> [binary_path]" >&2
-    exit 2
+    # Extract only the header block: lines starting with '# ' up to the first non-comment line
+    sed -n '2,/^[^#]/{ /^# /s/^# //p }' "$0"
+    exit 0
 }
 
-# Return codec string via ffprobe; degrade to '?' if ffprobe absent or fails.
-probe_codec() {
-    local file="$1"
-    if command -v ffprobe &>/dev/null; then
-        ffprobe -v error -select_streams v:0 \
-            -show_entries stream=codec_name \
-            -of default=noprint_wrappers=1:nokey=1 \
-            "$file" 2>/dev/null || echo "?"
-    else
-        echo "?"
-    fi
-}
+# ── arg parsing ──────────────────────────────────────────────────────────────
+CLIP="${REALFOOTAGE_CLIP:-}"
 
-# Return WxH resolution string; degrade to '?' if ffprobe absent or fails.
-probe_res() {
-    local file="$1"
-    if command -v ffprobe &>/dev/null; then
-        ffprobe -v error -select_streams v:0 \
-            -show_entries stream=width,height \
-            -of csv=s=x:p=0 \
-            "$file" 2>/dev/null || echo "?"
-    else
-        echo "?"
-    fi
-}
-
-# Run one selftest invocation.  Returns the exit code (0=pass, non-zero=fail,
-# 124=timeout via GNU timeout / 142 on BSD).
-run_test() {
-    local label="$1"   # for error output only
-    local file="$2"
-    shift 2
-    local -a cmd=("$@")
-    local rc=0
-    timeout "$TIMEOUT_SECS" "${cmd[@]}" \
-        >/dev/null 2>&1 || rc=$?
-    # GNU timeout exits 124; some BSD/WSL variants exit 142.
-    if [[ $rc -eq 124 || $rc -eq 142 ]]; then
-        echo "  TIMEOUT (${TIMEOUT_SECS}s) for ${label}: $(basename "$file")" >&2
-    fi
-    return $rc
-}
-
-# ── validate inputs ──────────────────────────────────────────────────────────
-
-if [[ -z "$FOOTAGE_DIR" ]]; then
-    usage
-fi
-
-if [[ ! -d "$FOOTAGE_DIR" ]]; then
-    echo "ERROR: '${FOOTAGE_DIR}' is not a directory." \
-         "Place real clips (diverse codecs/resolutions) there and re-run." >&2
-    exit 2
-fi
-
-# Collect video files (case-insensitive glob via find).
-mapfile -d '' VIDEO_FILES < <(
-    find "$FOOTAGE_DIR" -maxdepth 1 \
-        \( -iname '*.mp4' -o -iname '*.mov' -o -iname '*.mkv' \
-           -o -iname '*.webm' -o -iname '*.avi' -o -iname '*.m4v' \) \
-        -print0 2>/dev/null | sort -z
-)
-
-if [[ ${#VIDEO_FILES[@]} -eq 0 ]]; then
-    echo "ERROR: no footage found in '${FOOTAGE_DIR}'." \
-         "Place real clips (diverse codecs/resolutions) there and re-run." >&2
-    exit 2
-fi
-
-if [[ ! -x "$BINARY" ]]; then
-    echo "ERROR: binary not found or not executable: '${BINARY}'" >&2
-    exit 2
-fi
-
-# ── run tests ────────────────────────────────────────────────────────────────
-
-# Table columns: FILE | CODEC | RES | parity | trackmatte-parity | RESULT
-printf "%-45s %-8s %-10s %-7s %-18s %s\n" \
-    "FILE" "CODEC" "RES" "parity" "trackmatte-parity" "RESULT"
-printf '%s\n' "$(printf '─%.0s' {1..100})"
-
-overall_rc=0
-
-for file in "${VIDEO_FILES[@]}"; do
-    fname="$(basename "$file")"
-    codec="$(probe_codec "$file")"
-    res="$(probe_res "$file")"
-
-    # --- general parity selftest (env-var only) ---
-    parity_rc=0
-    VEDITOR_E2E_CLIP="$file" \
-    VEDITOR_PARITY_SELFTEST=1 \
-        run_test "parity" "$file" "$BINARY" || parity_rc=$?
-
-    parity_label="PASS"
-    [[ $parity_rc -eq 0 ]] || { parity_label="FAIL"; overall_rc=1; }
-
-    # --- track-matte SSOT parity selftest (argv + env-var) ---
-    tm_rc=0
-    VEDITOR_E2E_CLIP="$file" \
-    VEDITOR_TRACKMATTE_PARITY_SELFTEST=1 \
-        run_test "trackmatte-parity" "$file" \
-            "$BINARY" --selftest-trackmatte-parity || tm_rc=$?
-
-    tm_label="PASS"
-    [[ $tm_rc -eq 0 ]] || { tm_label="FAIL"; overall_rc=1; }
-
-    if [[ $parity_rc -eq 0 && $tm_rc -eq 0 ]]; then
-        row_result="PASS"
-    else
-        row_result="FAIL"
-    fi
-
-    # Truncate filename for display if too long.
-    if [[ ${#fname} -gt 44 ]]; then
-        fname="${fname:0:41}..."
-    fi
-
-    printf "%-45s %-8s %-10s %-7s %-18s %s\n" \
-        "$fname" "$codec" "$res" "$parity_label" "$tm_label" "$row_result"
+for arg in "$@"; do
+    case "$arg" in
+        -h|--help) usage ;;
+        -*) echo "Unknown option: $arg" >&2; exit 2 ;;
+        *)  CLIP="$arg" ;;
+    esac
 done
 
-printf '%s\n' "$(printf '─%.0s' {1..100})"
-
-if [[ $overall_rc -eq 0 ]]; then
-    echo "ALL TESTS PASSED"
-else
-    echo "ONE OR MORE TESTS FAILED" >&2
+if [[ -z "$CLIP" ]]; then
+    echo "ERROR: real clip path required (arg \$1 or env REALFOOTAGE_CLIP)" >&2
+    echo "Run  $(basename "$0") --help  for usage." >&2
+    exit 2
 fi
 
-exit $overall_rc
+if [[ ! -f "$CLIP" ]]; then
+    echo "ERROR: clip not found: '$CLIP'" >&2
+    exit 2
+fi
+
+# ── locate repo root (needed for build and binary paths) ─────────────────────
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+# ── optional build ────────────────────────────────────────────────────────────
+if [[ "${REALFOOTAGE_BUILD:-0}" == "1" ]]; then
+    echo "[REALFOOTAGE_PARITY] INFO: REALFOOTAGE_BUILD=1 — building..."
+    cmd.exe /c "cd /d \"$(wslpath -w "$REPO_ROOT")\" && cmake.exe --build build_win --config Release"
+fi
+
+# ── locate Windows binary (WSL → Windows path) ───────────────────────────────
+EXE_WSL="${REPO_ROOT}/build_win/Release/v-simple-editor.exe"
+
+if [[ ! -f "$EXE_WSL" ]]; then
+    echo "[REALFOOTAGE_PARITY] INFO: binary not found at '${EXE_WSL}' — skipping exe-based selftests"
+    EXE_WIN=""
+else
+    EXE_WIN="$(wslpath -w "$EXE_WSL")"
+fi
+
+CLIP_WIN="$(wslpath -w "$CLIP" 2>/dev/null || echo "$CLIP")"
+
+# ── selftest registry ─────────────────────────────────────────────────────────
+# Dynamically populated from grep:
+#   grep -rhoP 'VEDITOR_[A-Z_]+_SELFTEST' src/ | sort -u
+# All env-gated runtime selftests; sorted alphabetically; no duplicates.
+SELFTESTS=(
+    VEDITOR_AFFINITY_SELFTEST
+    VEDITOR_ANIMEXPORT_SELFTEST
+    VEDITOR_AUDIOMIXER_SELFTEST
+    VEDITOR_AUDIORESTORE_SELFTEST
+    VEDITOR_BATCHEXPORT_SELFTEST
+    VEDITOR_BLENDER_SELFTEST
+    VEDITOR_BRUSH_SELFTEST
+    VEDITOR_CAPTION_SELFTEST
+    VEDITOR_CHROMA_SELFTEST
+    VEDITOR_CLOUDRENDER_SELFTEST
+    VEDITOR_COLLAB_SELFTEST
+    VEDITOR_COLORMATCH_SELFTEST
+    VEDITOR_DAVINCI_SELFTEST
+    VEDITOR_EASING_SELFTEST
+    VEDITOR_EFFECT_PARAM_SCHEMA_SELFTEST
+    VEDITOR_EXPORTAUDIT_SELFTEST
+    VEDITOR_FCPXML_SELFTEST
+    VEDITOR_FRAMEIO_SELFTEST
+    VEDITOR_HDR_SELFTEST
+    VEDITOR_HWPERF_SELFTEST
+    VEDITOR_IMPORT_SELFTEST
+    VEDITOR_INSTAGRAM_SELFTEST
+    VEDITOR_LOUDNESS_SELFTEST
+    VEDITOR_LOWERTHIRD_SELFTEST
+    VEDITOR_MOBILE_SELFTEST
+    VEDITOR_MOGRAPH_SELFTEST
+    VEDITOR_MULTICAM_SELFTEST
+    VEDITOR_NODEGRAPH_SELFTEST
+    VEDITOR_OBS_SELFTEST
+    VEDITOR_PARITY_SELFTEST
+    VEDITOR_PLANAR_SELFTEST
+    VEDITOR_PLANAR_TRACKER_SELFTEST
+    VEDITOR_PROEXT_SELFTEST
+    VEDITOR_PROJTMPL_SELFTEST
+    VEDITOR_PRO_SELFTEST
+    VEDITOR_SHORTCUT_SELFTEST
+    VEDITOR_SMARTEDIT_SELFTEST
+    VEDITOR_SNSPACK_SELFTEST
+    VEDITOR_SOCIAL_SELFTEST
+    VEDITOR_SUBXLAT_SELFTEST
+    VEDITOR_TEXTEXPORT_SELFTEST
+    VEDITOR_TRACKMATTE_EXPORT_INTEGRATION_SELFTEST
+    VEDITOR_TRACKMATTE_PARITY_SELFTEST
+    VEDITOR_TRACKMATTE_SELFTEST
+    VEDITOR_TWITCH_SELFTEST
+    VEDITOR_VFX_SELFTEST
+    VEDITOR_VIMEO_SELFTEST
+    VEDITOR_WATERMARK_SELFTEST
+    VEDITOR_WORKFLOW_SELFTEST
+    VEDITOR_XUPLOAD_SELFTEST
+    VEDITOR_YOUTUBE_SELFTEST
+)
+
+# ── run selftests ─────────────────────────────────────────────────────────────
+OVERALL_RC=0
+TIMEOUT_SECS=120
+
+echo "[REALFOOTAGE_PARITY] INFO: clip = $CLIP"
+echo "[REALFOOTAGE_PARITY] INFO: ${#SELFTESTS[@]} env-gated selftests to run"
+
+for TEST in "${SELFTESTS[@]}"; do
+    if [[ -z "$EXE_WIN" ]]; then
+        echo "[REALFOOTAGE_PARITY] FAIL: $TEST binary_not_found"
+        OVERALL_RC=1
+        continue
+    fi
+
+    # Build the cmd.exe command string: set envvars then run the exe
+    # Use cmd.exe canonical quoting: set "VAR=value" to handle spaces in paths
+    CMD_STR="set \"${TEST}=1\" && set \"VEDITOR_E2E_CLIP=${CLIP_WIN}\" && \"${EXE_WIN}\""
+
+    RC=0
+    timeout "$TIMEOUT_SECS" cmd.exe /c "$CMD_STR" \
+        >"${SCRIPT_TMPDIR}/${TEST}.stdout" 2>"${SCRIPT_TMPDIR}/${TEST}.stderr" || RC=$?
+
+    if [[ $RC -eq 0 ]]; then
+        echo "[REALFOOTAGE_PARITY] PASS: $TEST"
+    elif [[ $RC -eq 124 || $RC -eq 142 ]]; then
+        echo "[REALFOOTAGE_PARITY] FAIL: $TEST timeout_after_${TIMEOUT_SECS}s"
+        OVERALL_RC=1
+    else
+        REASON="exit_code_${RC}"
+        # Append first stderr line if available for triage
+        FIRST_ERR="$(head -1 "${SCRIPT_TMPDIR}/${TEST}.stderr" 2>/dev/null | tr -d '\r' || true)"
+        if [[ -n "$FIRST_ERR" ]]; then
+            REASON="${REASON}:${FIRST_ERR}"
+        fi
+        echo "[REALFOOTAGE_PARITY] FAIL: $TEST $REASON"
+        OVERALL_RC=1
+    fi
+done
+
+# ── real-clip existence verification (best-effort) ───────────────────────────
+# If no headless export CLI path exists, confirm the clip is readable at minimum.
+echo "[REALFOOTAGE_PARITY] INFO: verifying clip readability (no headless export path available)"
+if [[ -r "$CLIP" && -s "$CLIP" ]]; then
+    echo "[REALFOOTAGE_PARITY] PASS: clip_readable"
+else
+    echo "[REALFOOTAGE_PARITY] FAIL: clip_readable file_not_readable_or_empty"
+    OVERALL_RC=1
+fi
+
+# ── summary ───────────────────────────────────────────────────────────────────
+if [[ $OVERALL_RC -eq 0 ]]; then
+    echo "[REALFOOTAGE_PARITY] PASS: all_tests"
+else
+    echo "[REALFOOTAGE_PARITY] FAIL: one_or_more_tests_failed" >&2
+fi
+
+exit $OVERALL_RC
