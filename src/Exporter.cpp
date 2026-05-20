@@ -3,38 +3,10 @@
 #include "VideoEffect.h"
 #include "SmartReframe.h"
 #include "SubtitleTrackRenderer.h"
+#include "libavcore/Encode.h"
 #include <QFileInfo>
 #include <QPainter>
 #include <cmath>
-
-// ---------------------------------------------------------------------------
-// Helper: build x265-params HDR10 metadata string (BT.2020 primaries / D65).
-// Primaries per Rec.2020 (ITU-R BT.2020) × 50000 (x265 unit = 0.00002):
-//   R (0.708, 0.292) → (35400, 14600)
-//   G (0.170, 0.797) → ( 8500, 39850)
-//   B (0.131, 0.046) → ( 6550,  2300)
-//   WP D65 (0.3127, 0.3290) → (15635, 16450)
-// ---------------------------------------------------------------------------
-namespace {
-static QByteArray buildX265Hdr10Params(const HDRSettings& hdr)
-{
-    const int maxLumX10000 = static_cast<int>(std::round(hdr.masterDisplayLuminanceMax * 10000));
-    const int minLumX10000 = static_cast<int>(std::round(hdr.masterDisplayLuminanceMin * 10000));
-    QByteArray s;
-    s.append("hdr10=1:repeat-headers=1:colorprim=bt2020:"
-             "transfer=smpte2084:colormatrix=bt2020nc:range=limited:"
-             "master-display=G(8500,39850)B(6550,2300)R(35400,14600)"
-             "WP(15635,16450)L(");
-    s.append(QByteArray::number(maxLumX10000));
-    s.append(',');
-    s.append(QByteArray::number(minLumX10000));
-    s.append("):max-cll=");
-    s.append(QByteArray::number(hdr.maxCll));
-    s.append(',');
-    s.append(QByteArray::number(hdr.maxFall));
-    return s;
-}
-} // namespace
 
 Exporter::Exporter(QObject *parent)
     : QObject(parent)
@@ -137,264 +109,79 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
         return;
     }
 
-    // Open output
-    AVFormatContext *outFmt = nullptr;
-    if (avformat_alloc_output_context2(&outFmt, nullptr, nullptr, config.outputPath.toUtf8().constData()) < 0) {
-        emit exportFinished(false, "Failed to create output context");
-        return;
-    }
+    // Resolve effective HDR mode: legacy config.hdr10 flag maps to "hdr10"
+    const bool isHdr10Mode = (config.hdrSettings.mode == "hdr10" || config.hdr10);
+    const bool isHlgMode   = (config.hdrSettings.mode == "hlg");
 
-    // Find encoder — use best available if requested isn't found
+    // Pre-resolve the requested encoder name (best-of-family fallback) so the
+    // helper sees a registered name. This mirrors Exporter's prior behaviour
+    // when config.videoCodec is a family alias like "h264".
     QString resolvedCodec = config.videoCodec;
-    const AVCodec *encoder = avcodec_find_encoder_by_name(resolvedCodec.toUtf8().constData());
-    if (!encoder) {
-        // Auto-detect best encoder for this codec family
+    if (!avcodec_find_encoder_by_name(resolvedCodec.toUtf8().constData())) {
         if (resolvedCodec.contains("264")) resolvedCodec = CodecDetector::bestVideoEncoder("h264");
         else if (resolvedCodec.contains("265") || resolvedCodec.contains("hevc")) resolvedCodec = CodecDetector::bestVideoEncoder("h265");
         else if (resolvedCodec.contains("av1")) resolvedCodec = CodecDetector::bestVideoEncoder("av1");
         else if (resolvedCodec.contains("vp9")) resolvedCodec = CodecDetector::bestVideoEncoder("vp9");
         else resolvedCodec = "libx264";
-        encoder = avcodec_find_encoder_by_name(resolvedCodec.toUtf8().constData());
-    }
-    if (!encoder) {
-        avformat_free_context(outFmt);
-        emit exportFinished(false, "Video encoder not found");
-        return;
     }
 
-    // HW encoder resolution: try hardware path when useHardwareAccel or hwEncoder is set
-    // hwEncoder == "none" forces software only; "" or "auto" means auto-detect
-    bool wantHW = (config.useHardwareAccel || !config.hwEncoder.isEmpty())
-                  && config.hwEncoder != "none";
-    bool isH264Family = (config.videoCodec == "libx264"
-                         || config.videoCodec.contains("264"));
-    bool isH265Family = (config.videoCodec == "libx265"
-                         || config.videoCodec.contains("265")
-                         || config.videoCodec.contains("hevc"));
-    QString hwVendor = config.hwEncoder.toLower(); // "nvenc", "qsv", "amf", "auto", ""
-
-    const AVCodec *hwEncoder = nullptr;
-    QString hwEncoderName;
-
-    if (wantHW && (isH264Family || isH265Family)) {
-        // Build candidate list based on codec family and vendor hint
-        QVector<QString> candidates;
-        if (isH264Family) {
-            if (hwVendor == "nvenc") candidates = {"h264_nvenc"};
-            else if (hwVendor == "qsv") candidates = {"h264_qsv"};
-            else if (hwVendor == "amf") candidates = {"h264_amf"};
-            else candidates = {"h264_nvenc", "h264_qsv", "h264_amf"}; // auto
-        } else {
-            if (hwVendor == "nvenc") candidates = {"hevc_nvenc"};
-            else if (hwVendor == "qsv") candidates = {"hevc_qsv"};
-            else if (hwVendor == "amf") candidates = {"hevc_amf"};
-            else candidates = {"hevc_nvenc", "hevc_qsv", "hevc_amf"}; // auto
-        }
-        for (const QString &candidateName : candidates) {
-            if (CodecDetector::isEncoderAvailable(candidateName)) {
-                hwEncoder = avcodec_find_encoder_by_name(candidateName.toUtf8().constData());
-                if (hwEncoder) {
-                    hwEncoderName = candidateName;
-                    break;
-                }
-            }
-        }
-        if (hwEncoder) {
-            encoder = hwEncoder;
-            resolvedCodec = hwEncoderName;
-            qInfo() << "Exporter: HW encoder selected:" << hwEncoderName;
-        } else {
-            qInfo() << "Exporter: no HW encoder available, falling back to SW encoder";
-        }
-    }
-
-    qInfo() << "Exporter: using encoder" << encoder->name;
-
-    // Resolve audio encoder — auto-detect best AAC if needed
+    // [P1-MINOR-2] Audio mux is NYI in this CPU path — libavcore::Encode does
+    // not yet support audio streams. resolvedAudioCodec is computed for parity
+    // with the previous Exporter behaviour (and so we keep one place where the
+    // best-of-family AAC detection lives) but it is intentionally unused
+    // downstream until audio mux is wired into the libavcore helper.
+#if 0  // parity-only; TODO: enable when libavcore::Encode supports audio
     QString resolvedAudioCodec = config.audioCodec;
     if (resolvedAudioCodec == "aac" || resolvedAudioCodec.isEmpty()) {
         resolvedAudioCodec = CodecDetector::bestAACEncoder();
     }
     if (!CodecDetector::isEncoderAvailable(resolvedAudioCodec)) {
-        resolvedAudioCodec = "aac"; // final fallback
+        resolvedAudioCodec = "aac";
     }
+#endif
 
-    // Create output stream
-    AVStream *outStream = avformat_new_stream(outFmt, nullptr);
-    if (!outStream) {
-        avformat_free_context(outFmt);
-        emit exportFinished(false, "Failed to create output stream");
+    // Open the encoder session via the libavcore helper (HW>SW fallback inside).
+    libavcore::EncodeRequest req;
+    req.width = config.width;
+    req.height = config.height;
+    req.fps = config.fps;
+    req.videoBitrateBits = static_cast<int64_t>(config.videoBitrate) * 1000;
+    req.outputPath = config.outputPath.toUtf8().toStdString();
+    req.videoCodecName = resolvedCodec.toUtf8().toStdString();
+    req.hwVendorHint = config.hwEncoder.toLower().toUtf8().toStdString();
+    req.useHardwareAccel = config.useHardwareAccel;
+    req.isHdr10 = isHdr10Mode;
+    req.isHlg = isHlgMode;
+    req.proresProfile = config.proresProfile;
+    req.hdrMasterMaxNits = config.hdrSettings.masterDisplayLuminanceMax;
+    req.hdrMasterMinNits = config.hdrSettings.masterDisplayLuminanceMin;
+    req.hdrMaxCll = config.hdrSettings.maxCll;
+    req.hdrMaxFall = config.hdrSettings.maxFall;
+
+    // [P1-M1] Restore the legacy Exporter.cpp HW candidate functional probe
+    // (CodecDetector::isEncoderAvailable) that was dropped during the
+    // libavcore refactor. libavcore::FrameEncoder's HW candidate loop now
+    // calls this hook BEFORE avcodec_find_encoder_by_name so a stub-registered
+    // encoder without a working runtime (e.g. NVENC on a non-NVIDIA host) is
+    // skipped exactly like the legacy code path. Qt-side hook keeps the
+    // libavcore header Qt-free.
+    req.encoderAvailableHook = [](const std::string& name) {
+        return CodecDetector::isEncoderAvailable(QString::fromStdString(name));
+    };
+
+    libavcore::FrameEncoder encoderSession;
+    if (auto err = encoderSession.open(req)) {
+        emit exportFinished(false, QString::fromStdString(*err));
         return;
     }
 
-    // Setup encoder context
-    AVCodecContext *encCtx = avcodec_alloc_context3(encoder);
-    encCtx->width = config.width;
-    encCtx->height = config.height;
-    encCtx->time_base = {1, config.fps};
-    encCtx->framerate = {config.fps, 1};
-    // Resolve effective HDR mode: legacy config.hdr10 flag maps to "hdr10"
-    const bool isHdr10Mode = (config.hdrSettings.mode == "hdr10" || config.hdr10);
-    const bool isHlgMode   = (config.hdrSettings.mode == "hlg");
-
-    AVPixelFormat targetPixFmt = AV_PIX_FMT_YUV420P;
-    if (config.proresProfile >= 4) {
-        targetPixFmt = AV_PIX_FMT_YUVA444P10LE;
-    } else if (config.proresProfile >= 0) {
-        targetPixFmt = AV_PIX_FMT_YUV422P10LE;
-    } else if (isHdr10Mode || isHlgMode) {
-        targetPixFmt = AV_PIX_FMT_YUV420P10LE;
-    }
-    encCtx->pix_fmt = targetPixFmt;
-    encCtx->bit_rate = static_cast<int64_t>(config.videoBitrate) * 1000;
-
-    if (isHdr10Mode) {
-        encCtx->color_primaries = AVCOL_PRI_BT2020;
-        encCtx->color_trc = AVCOL_TRC_SMPTE2084;
-        encCtx->colorspace = AVCOL_SPC_BT2020_NCL;
-        encCtx->color_range = AVCOL_RANGE_MPEG;
-    } else if (isHlgMode) {
-        encCtx->color_primaries = AVCOL_PRI_BT2020;
-        encCtx->color_trc = AVCOL_TRC_ARIB_STD_B67;
-        encCtx->colorspace = AVCOL_SPC_BT2020_NCL;
-        encCtx->color_range = AVCOL_RANGE_MPEG;
-    }
-
-    if (outFmt->oformat->flags & AVFMT_GLOBALHEADER)
-        encCtx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-
-    // Codec-specific options
-    AVDictionary *opts = nullptr;
-    if (resolvedCodec == "h264_nvenc" || resolvedCodec == "hevc_nvenc") {
-        av_dict_set(&opts, "preset", "p4", 0);
-        av_dict_set(&opts, "rc", "vbr", 0);
-        av_dict_set(&opts, "cq", "23", 0);
-    } else if (resolvedCodec == "h264_qsv" || resolvedCodec == "hevc_qsv") {
-        av_dict_set(&opts, "preset", "medium", 0);
-    } else if (resolvedCodec == "h264_amf" || resolvedCodec == "hevc_amf") {
-        av_dict_set(&opts, "quality", "balanced", 0);
-    } else if (config.videoCodec == "libx264" || config.videoCodec == "libx265") {
-        av_dict_set(&opts, "preset", "medium", 0);
-        av_dict_set(&opts, "crf", "23", 0);
-        if (config.videoCodec == "libx265") {
-            if (isHdr10Mode) {
-                av_dict_set(&opts, "profile", "main10", 0);
-                const QByteArray x265p = buildX265Hdr10Params(config.hdrSettings);
-                av_dict_set(&opts, "x265-params", x265p.constData(), 0);
-            } else if (isHlgMode) {
-                av_dict_set(&opts, "profile", "main10", 0);
-                av_dict_set(&opts,
-                            "x265-params",
-                            "repeat-headers=1:colorprim=bt2020:"
-                            "transfer=arib-std-b67:colormatrix=bt2020nc",
-                            0);
-            }
-        }
-    } else if (config.videoCodec == "libsvtav1") {
-        av_dict_set(&opts, "preset", "8", 0);
-        av_dict_set(&opts, "crf", "30", 0);
-    } else if (config.videoCodec == "libvpx-vp9") {
-        av_dict_set(&opts, "quality", "good", 0);
-        av_dict_set(&opts, "cpu-used", "4", 0);
-    } else if (config.videoCodec.startsWith("prores") && config.proresProfile >= 0) {
-        const QByteArray profileStr = QByteArray::number(config.proresProfile);
-        av_dict_set(&opts, "profile", profileStr.constData(), 0);
-    }
-
-    if (avcodec_open2(encCtx, encoder, &opts) < 0) {
-        av_dict_free(&opts);
-        avcodec_free_context(&encCtx);
-
-        // HW encoder open failed — fall back to SW encoder (libx264/libx265)
-        if (hwEncoder) {
-            qInfo() << "Exporter: HW encoder open failed, falling back to SW encoder";
-            QString swCodec = isH265Family ? "libx265" : "libx264";
-            encoder = avcodec_find_encoder_by_name(swCodec.toUtf8().constData());
-            resolvedCodec = swCodec;
-            if (!encoder) {
-                avformat_free_context(outFmt);
-                emit exportFinished(false, "Video encoder not found (SW fallback failed)");
-                return;
-            }
-            encCtx = avcodec_alloc_context3(encoder);
-            encCtx->width = config.width;
-            encCtx->height = config.height;
-            encCtx->time_base = {1, config.fps};
-            encCtx->framerate = {config.fps, 1};
-            encCtx->pix_fmt = targetPixFmt;
-            encCtx->bit_rate = static_cast<int64_t>(config.videoBitrate) * 1000;
-            if (isHdr10Mode) {
-                encCtx->color_primaries = AVCOL_PRI_BT2020;
-                encCtx->color_trc = AVCOL_TRC_SMPTE2084;
-                encCtx->colorspace = AVCOL_SPC_BT2020_NCL;
-                encCtx->color_range = AVCOL_RANGE_MPEG;
-            } else if (isHlgMode) {
-                encCtx->color_primaries = AVCOL_PRI_BT2020;
-                encCtx->color_trc = AVCOL_TRC_ARIB_STD_B67;
-                encCtx->colorspace = AVCOL_SPC_BT2020_NCL;
-                encCtx->color_range = AVCOL_RANGE_MPEG;
-            }
-            if (outFmt->oformat->flags & AVFMT_GLOBALHEADER)
-                encCtx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-            AVDictionary *swOpts = nullptr;
-            av_dict_set(&swOpts, "preset", "medium", 0);
-            av_dict_set(&swOpts, "crf", "23", 0);
-            if (swCodec == "libx265") {
-                if (isHdr10Mode) {
-                    av_dict_set(&swOpts, "profile", "main10", 0);
-                    const QByteArray x265p = buildX265Hdr10Params(config.hdrSettings);
-                    av_dict_set(&swOpts, "x265-params", x265p.constData(), 0);
-                } else if (isHlgMode) {
-                    av_dict_set(&swOpts, "profile", "main10", 0);
-                    av_dict_set(&swOpts,
-                                "x265-params",
-                                "repeat-headers=1:colorprim=bt2020:"
-                                "transfer=arib-std-b67:colormatrix=bt2020nc",
-                                0);
-                }
-            }
-            if (avcodec_open2(encCtx, encoder, &swOpts) < 0) {
-                av_dict_free(&swOpts);
-                avcodec_free_context(&encCtx);
-                avformat_free_context(outFmt);
-                emit exportFinished(false, "Failed to open SW fallback encoder");
-                return;
-            }
-            av_dict_free(&swOpts);
-            qInfo() << "Exporter: using encoder" << encoder->name;
-        } else {
-            avformat_free_context(outFmt);
-            emit exportFinished(false, "Failed to open encoder");
-            return;
-        }
-    } else {
-        av_dict_free(&opts);
-    }
+    const AVPixelFormat targetPixFmt = encoderSession.outputPixelFormat();
+    qInfo() << "Exporter: using encoder" << QString::fromStdString(encoderSession.activeEncoderName());
 
     if (isHdr10Mode || isHlgMode) {
         qInfo() << "HDR mode:" << config.hdrSettings.mode
                 << "MaxCLL=" << config.hdrSettings.maxCll
                 << "MaxFALL=" << config.hdrSettings.maxFall;
-    }
-
-    avcodec_parameters_from_context(outStream->codecpar, encCtx);
-    outStream->time_base = encCtx->time_base;
-
-    // Open output file
-    if (!(outFmt->oformat->flags & AVFMT_NOFILE)) {
-        if (avio_open(&outFmt->pb, config.outputPath.toUtf8().constData(), AVIO_FLAG_WRITE) < 0) {
-            avcodec_free_context(&encCtx);
-            avformat_free_context(outFmt);
-            emit exportFinished(false, "Failed to open output file");
-            return;
-        }
-    }
-
-    if (avformat_write_header(outFmt, nullptr) < 0) {
-        avcodec_free_context(&encCtx);
-        avformat_free_context(outFmt);
-        emit exportFinished(false, "Failed to write header");
-        return;
     }
 
     // Process each clip
@@ -544,19 +331,8 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
                               outFrame->data, outFrame->linesize);
                 }
 
-                outFrame->pts = globalPts++;
-
-                // Encode
-                if (avcodec_send_frame(encCtx, outFrame) == 0) {
-                    AVPacket *encPkt = av_packet_alloc();
-                    while (avcodec_receive_packet(encCtx, encPkt) == 0) {
-                        av_packet_rescale_ts(encPkt, encCtx->time_base, outStream->time_base);
-                        encPkt->stream_index = outStream->index;
-                        av_interleaved_write_frame(outFmt, encPkt);
-                        av_packet_unref(encPkt);
-                    }
-                    av_packet_free(&encPkt);
-                }
+                // Encode via libavcore helper (handles send_frame+packet drain).
+                encoderSession.pushFrameNative(outFrame, globalPts++);
 
                 // Update progress
                 double currentTime = framePts - clip.inPoint;
@@ -576,31 +352,18 @@ clip_done:
         avformat_close_input(&inFmt);
     }
 
-    // Flush encoder
-    avcodec_send_frame(encCtx, nullptr);
-    AVPacket *flushPkt = av_packet_alloc();
-    while (avcodec_receive_packet(encCtx, flushPkt) == 0) {
-        av_packet_rescale_ts(flushPkt, encCtx->time_base, outStream->time_base);
-        flushPkt->stream_index = outStream->index;
-        av_interleaved_write_frame(outFmt, flushPkt);
-        av_packet_unref(flushPkt);
-    }
-    av_packet_free(&flushPkt);
-
-    av_write_trailer(outFmt);
+    // Flush + trailer via helper (drains remaining packets, writes trailer,
+    // closes file). FrameEncoder dtor cleans the rest of the libav state.
+    encoderSession.finalize();
 
     if (swsCtx) sws_freeContext(swsCtx);
-    avcodec_free_context(&encCtx);
-    if (!(outFmt->oformat->flags & AVFMT_NOFILE))
-        avio_closep(&outFmt->pb);
-    avformat_free_context(outFmt);
 
     if (m_cancelled) {
         emit exportFinished(false, "Export cancelled");
     } else {
         emit progressChanged(100);
         emit exportFinished(true, QString("Exported via %1 to %2")
-                                      .arg(QString::fromUtf8(encoder->name))
+                                      .arg(QString::fromStdString(encoderSession.activeEncoderName()))
                                       .arg(config.outputPath));
     }
 }

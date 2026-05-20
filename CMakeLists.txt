@@ -50,6 +50,12 @@ if(WIN32)
 endif()
 
 add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
+    # PRD-B ④ — libavcore shared helpers (Probe + Encode).
+    src/libavcore/Probe.h
+    src/libavcore/Probe.cpp
+    src/libavcore/Encode.h
+    src/libavcore/Encode.cpp
+
     src/main.cpp
     src/MainWindow.cpp
     src/VideoPlayer.cpp
@@ -524,6 +530,7 @@ endif()
 target_compile_definitions(${PROJECT_NAME} PRIVATE
     APP_VERSION="${PROJECT_VERSION}"
     VEDITOR_EDITION="${VEDITOR_EDITION}"
+    VEDITOR_LIBAVCORE_WITH_QIMAGE=1
     $<$<BOOL:${VEDITOR_PLANAR_TRACKER_SELFTEST}>:VEDITOR_PLANAR_TRACKER_SELFTEST=1>
     $<$<BOOL:${VEDITOR_EFFECT_PARAM_SCHEMA_SELFTEST}>:VEDITOR_EFFECT_PARAM_SCHEMA_SELFTEST=1>
     $<$<BOOL:${VEDITOR_BRUSH_SELFTEST}>:VEDITOR_BRUSH_SELFTEST=1>
