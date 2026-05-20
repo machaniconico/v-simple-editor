@@ -340,6 +340,25 @@ private:
     // the existing public API stays QVector-shaped (Phase A compat).
     QVector<AudioTrackKey> m_speedRampKeyOrder;
     QHash<AudioTrackKey, speedramp::SpeedRamp> m_speedRampByKey;
+    // PRD-B / US-FIX-7 R10: monotonically increasing generation counter, bumped
+    // under m_controlMutex inside setSpeedRamps each time m_speedRampByKey is
+    // rebuilt. Decision sites that consult m_speedRampByKey (the readData
+    // atempo path and the seekEntryToTimeline R8 gate) capture the generation
+    // on entry; if a later compare under-lock observes a mismatch the
+    // ramp-dependent branch is silently dropped (no audio side-effect, no
+    // log spam) so an in-flight decision based on a stale snapshot cannot
+    // commit. Atomic so non-locked observers (e.g. defense-in-depth peek)
+    // can still read it lock-free; production decision sites compare under
+    // m_controlMutex so the relaxed memory order is sufficient.
+    //
+    // CRITICAL: this counter is only CONSULTED on the opt-in atempo /
+    // non-1x path. The default editor preview (atempo OFF, speed==1.0, no
+    // ramp) never enters either consulting branch (audioAtempoEnabledCached()
+    // short-circuits and m_speedRampByKey is empty), so byte-identity vs
+    // R7/R8/R9 is preserved by construction. The counter itself increments
+    // unconditionally inside setSpeedRamps — that is a write to a private
+    // atomic with no audible side-effect.
+    std::atomic<uint64_t> m_speedRampGeneration{0};
 
     // 4-band parametric EQ — separate path from TrackState's legacy 3-band.
     // Per-track config + per-channel biquad history (4 bands x 2 channels x
