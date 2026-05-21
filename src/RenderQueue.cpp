@@ -3,19 +3,29 @@
 #include "ProjectFile.h"
 #include "Timeline.h"
 #include "TrackMatteKey.h"
+#include "CodecDetector.h"
+#include "libavcore/Encode.h"
+#include <QByteArray>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
 #include <QJsonArray>
-#include <QRegularExpression>
 #include <QUuid>
 #include <QThread>
 #include <QImage>
 #include <QPainter>
+#include <QtGlobal>
+// US-MF-6: the 10-bit HDR (HDR10/HLG) branch shells out to ffmpeg.exe — the
+// bundled avcodec DLL has no 10-bit encoder. These restore the pre-US-MF-5
+// subprocess render-pipe dependencies for that branch only.
+#include <QProcess>
 #include <QMutexLocker>
 #include <QStandardPaths>
-#include <QtGlobal>
-#include <cmath>  // S11: std::round for HDR10 master-display luminance
+#include <cmath>  // std::round for the HDR10 master-display luminance scaling
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <string>
 
 namespace {
 QString makeUuid() {
@@ -31,6 +41,9 @@ RenderQueue::RenderQueue(QObject *parent)
 RenderQueue::~RenderQueue()
 {
     m_cancelRequested = true;
+    // US-MF-6: if the HDR (HDR10/HLG) subprocess branch is mid-encode, kill
+    // the ffmpeg.exe process so the worker thread's stdin write unblocks and
+    // the thread can be joined below.
     QProcess *process = nullptr;
     {
         QMutexLocker locker(&m_processMutex);
@@ -38,21 +51,13 @@ RenderQueue::~RenderQueue()
         if (process)
             process->kill();
     }
-    if (process) {
+    if (process)
         process->waitForFinished(3000);
-    }
     if (m_renderThread) {
         m_renderThread->wait(10000);
         delete m_renderThread;
         m_renderThread = nullptr;
     }
-    {
-        QMutexLocker locker(&m_processMutex);
-        process = m_process;
-        m_process = nullptr;
-    }
-    if (process)
-        delete process;
 }
 
 int RenderQueue::addJob(const QString &name, const QString &projectFilePath,
@@ -94,13 +99,13 @@ void RenderQueue::addJob(const RenderJob &job)
     if (copy.errorMessage.isEmpty())
         copy.errorMessage = copy.error;
 
-    // Mirror flat fields into exportConfig so the FFmpeg arg builder picks
+    // Mirror flat fields into exportConfig so the render-pipe encoder picks
     // them up without a separate code path.
     QJsonObject cfg = copy.exportConfig;
     cfg["width"] = copy.width;
     cfg["height"] = copy.height;
-    cfg["videoCodec"] = mapCodecToFFmpeg(copy.codec);
-    cfg["videoBitrate"] = copy.bitrateBps / 1000;  // ffmpeg arg builder expects kbps
+    cfg["videoCodec"] = mapCodecToEncoderName(copy.codec);
+    cfg["videoBitrate"] = copy.bitrateBps / 1000;  // legacy config stores kbps
     if (!copy.preset.isEmpty())
         cfg["preset"] = copy.preset;
     copy.exportConfig = cfg;
@@ -221,20 +226,18 @@ void RenderQueue::cancelCurrent()
     if (m_currentJobIndex < 0)
         return;
 
-    // Signal the S8 render-pipe worker (if running) to stop streaming frames;
+    // Signal the S8 render-pipe worker (if running) to stop encoding frames;
     // it polls m_cancelRequested between frames exactly like
     // VideoStabilizer::m_cancelled.
     m_cancelRequested = true;
 
-    QProcess *process = nullptr;
+    // US-MF-6: if the 10-bit HDR subprocess branch is mid-encode, kill the
+    // ffmpeg.exe process so a worker blocked inside a stdin write/flush
+    // unblocks immediately rather than waiting for the next frame boundary.
     {
         QMutexLocker locker(&m_processMutex);
-        process = m_process;
-        if (process)
-            process->kill();
-    }
-    if (process) {
-        process->waitForFinished(3000);
+        if (m_process)
+            m_process->kill();
     }
 
     RenderJob &j = m_jobs[m_currentJobIndex];
@@ -468,7 +471,6 @@ void RenderQueue::startNextJob()
     job.progress = 0;
     job.progressPercent = 0;
     job.startTime = QDateTime::currentDateTime();
-    m_currentDuration = 0.0;
     m_cancelRequested = false;
 
     emit jobStarted(job.id);
@@ -485,24 +487,49 @@ void RenderQueue::startNextJob()
     startRenderPipe(m_currentJobIndex);
 }
 
-// S8: synchronous frame-render + ffmpeg-stdin streaming on a worker thread.
-// Mirrors the proven VideoStabilizer::stabilizePlanarInversion pipe
-// (VideoStabilizer.cpp:359-516): an ffmpeg "-f rawvideo -pix_fmt rgba ..."
-// encoder fed RGBA frames over stdin, with the original media muxed back in
-// as a second input. Here the frames come from tlrender::renderFrameAt
-// instead of a decoded source, which is the whole point of the story.
+// S8/US-MF-5/US-MF-6: 2-way export dispatcher.
+// Frames always come from tlrender::renderFrameAt (the SSOT edit graph). The
+// SINK depends on the job:
+//   • 10-bit HDR (HDR10 / HLG) → startRenderPipeSubprocess: an ffmpeg.exe
+//     QProcess encode (libx265 yuv420p10le + BT.2020/PQ|HLG metadata). The
+//     bundled avcodec DLL has no 10-bit encoder (no libx264/libx265, and
+//     h264_mf/hevc_mf are 8-bit only), so the in-process FrameEncoder cannot
+//     emit a genuine HDR10/HLG stream — it fails with "encoder frame push
+//     failed". The subprocess restores the pre-US-MF-5 render-pipe for this
+//     branch only.
+//   • everything else (8-bit H.264 / H.265 / ProRes / AV1) → the in-process
+//     libavcore::FrameEncoder path below, unchanged from US-MF-5.
 void RenderQueue::startRenderPipe(int jobIndex)
 {
     const RenderJob jobCopy = m_jobs[jobIndex];
 
-    QProcess *process = nullptr;
+    // US-MF-6 dispatch: decide HDR10/HLG from the SAME job-config values the
+    // in-process branch uses for request.isHdr10 / request.isHlg, so the two
+    // branches agree on what "10-bit HDR" means. ProRes is never HDR here
+    // (mirrors the in-process `!isProRes` guard below).
     {
-        QMutexLocker locker(&m_processMutex);
-        process = m_process;
-        m_process = nullptr;
+        const QJsonObject &cfg = jobCopy.exportConfig;
+        QString dispatchCodec = cfg.value("videoCodec").toString();
+        if (dispatchCodec.isEmpty()) {
+            dispatchCodec = mapCodecToEncoderName(jobCopy.codec.isEmpty()
+                ? QStringLiteral("h264") : jobCopy.codec);
+        }
+        const bool dispatchIsProRes =
+            (dispatchCodec == QLatin1String("prores_ks")
+             || dispatchCodec == QLatin1String("prores"));
+        const QString dispatchHdrMode =
+            cfg.value("hdrMode").toString().toLower();
+        const bool dispatchIsHdr10 = !dispatchIsProRes
+            && (dispatchHdrMode == QLatin1String("hdr10")
+                || cfg.value("hdr10").toBool());
+        const bool dispatchIsHlg =
+            !dispatchIsProRes && dispatchHdrMode == QLatin1String("hlg");
+        if (dispatchIsHdr10 || dispatchIsHlg) {
+            startRenderPipeSubprocess(jobIndex);
+            return;
+        }
     }
-    if (process)
-        delete process;
+
     if (m_renderThread) {
         m_renderThread->wait(5000);
         delete m_renderThread;
@@ -512,7 +539,7 @@ void RenderQueue::startRenderPipe(int jobIndex)
     // ── Resolve everything that touches the GUI/Timeline on THIS thread ─────
     // Timeline is a QWidget; constructing / restoring it must happen on the
     // GUI thread (the parity selftest + MainWindow both create it there). The
-    // worker thread below only calls tlrender::renderFrameAt + QProcess I/O.
+    // worker thread below only calls tlrender::renderFrameAt + FrameEncoder.
     // renderFrameAt is pure libav decode + CPU QPainter/QImage compositing
     // with NO QWidget construction — including its S6 text-overlay stage,
     // which bakes through the FREE function textbake::bakeOverlays (NOT a
@@ -520,11 +547,296 @@ void RenderQueue::startRenderPipe(int jobIndex)
     // behaviour, so this property is load-bearing for any timeline that
     // carries a text overlay. So we resolve the Timeline, geometry, frame
     // count and audio input path here and hand plain values to the worker.
+    Timeline *owned = nullptr;
+    Timeline *tl = resolveTimeline(jobCopy, &owned);
+    if (!tl) {
+        delete owned;
+        QMetaObject::invokeMethod(this, [this, jobCopy]() {
+            finishCurrentJob(false, QStringLiteral(
+                "could not obtain a Timeline for job (project load failed and "
+                "no in-memory timeline supplied): ") + jobCopy.projectFilePath);
+        }, Qt::QueuedConnection);
+        return;
+    }
+
+    const QJsonObject &cfg = jobCopy.exportConfig;
+    int outW = cfg.value("width").toInt(jobCopy.width > 0 ? jobCopy.width : 1920);
+    int outH = cfg.value("height").toInt(jobCopy.height > 0 ? jobCopy.height : 1080);
+    if (outW <= 0) outW = 1920;
+    if (outH <= 0) outH = 1080;
+    // The H.264/H.265 4:2:0 path requires even dimensions; keep the legacy
+    // render-pipe rounding behavior before handing geometry to libavcore.
+    outW &= ~1;
+    outH &= ~1;
+    double fps = cfg.value("fps").toDouble(0.0);
+    if (fps <= 0.0)
+        fps = 30.0;
+
+    // Iterate from 0 to the timeline duration at the project fps.
+    // usec-per-frame = 1e6 / fps (the renderFrameAt time unit).
+    const double durationSec = tl->totalDuration();
+    qint64 totalFrames = static_cast<qint64>(durationSec * fps + 0.5);
+    if (jobCopy.endUs > 0 && jobCopy.endUs > jobCopy.startUs) {
+        const double rangeSec =
+            static_cast<double>(jobCopy.endUs - jobCopy.startUs) / 1'000'000.0;
+        totalFrames = static_cast<qint64>(rangeSec * fps + 0.5);
+    }
+    if (totalFrames <= 0)
+        totalFrames = 1;
+    const qint64 startUsec = jobCopy.startUs > 0 ? jobCopy.startUs : 0;
+    const double usecPerFrame = 1'000'000.0 / fps;
+
+    // Audio mux input: the original source file's audio stream. FrameEncoder
+    // handles this via audioSourcePath, preserving the render-pipe's optional
+    // second input in-process.
+    QString audioInputPath = jobCopy.projectFilePath;
+    {
+        const bool projIsMedia = !audioInputPath.isEmpty()
+            && QFile::exists(audioInputPath)
+            && !audioInputPath.endsWith(QStringLiteral(".veditor"),
+                                        Qt::CaseInsensitive);
+        if (!projIsMedia) {
+            const QVector<ClipInfo> &v1 = tl->videoClips();
+            if (!v1.isEmpty() && QFile::exists(v1.first().filePath))
+                audioInputPath = v1.first().filePath;
+            else
+                audioInputPath.clear();
+        }
+    }
+
+    libavcore::EncodeRequest request;
+    request.width = outW;
+    request.height = outH;
+    request.fps = cfg.value("fps").toInt(0);
+    if (request.fps <= 0)
+        request.fps = static_cast<int>(fps + 0.5);
+    if (request.fps <= 0)
+        request.fps = 30;
+    request.outputPath = jobCopy.outputPath.toUtf8().toStdString();
+
+    QString videoCodec = cfg.value("videoCodec").toString();
+    if (videoCodec.isEmpty()) {
+        videoCodec = mapCodecToEncoderName(jobCopy.codec.isEmpty()
+            ? QStringLiteral("h264") : jobCopy.codec);
+    }
+
+    const bool isProRes = (videoCodec == QLatin1String("prores_ks")
+                           || videoCodec == QLatin1String("prores"));
+    const QString hdrMode = cfg.value("hdrMode").toString().toLower();
+    const bool isHdr10 = !isProRes
+        && (hdrMode == QLatin1String("hdr10") || cfg.value("hdr10").toBool());
+    const bool isHlg = !isProRes && hdrMode == QLatin1String("hlg");
+    const int proresProfile = isProRes
+        ? cfg.value("proresProfile").toInt(1) : -1;
+
+    // HDR10/HLG followed the old render-pipe branch by forcing x265 unless the
+    // caller explicitly selected an HEVC hardware encoder.
+    if ((isHdr10 || isHlg)
+        && videoCodec != QLatin1String("libx265")
+        && videoCodec != QLatin1String("hevc_nvenc")
+        && videoCodec != QLatin1String("hevc_qsv")
+        && videoCodec != QLatin1String("hevc_amf")) {
+        videoCodec = QStringLiteral("libx265");
+    }
+
+    request.videoBitrateBits = jobCopy.bitrateBps;
+    if (request.videoBitrateBits <= 0) {
+        int videoBitrateKbps = cfg.value("videoBitrate").toInt(0);
+        if (videoBitrateKbps <= 0)
+            videoBitrateKbps = 10000;
+        request.videoBitrateBits =
+            static_cast<int64_t>(videoBitrateKbps) * 1000;
+    }
+    request.videoCodecName = videoCodec.toUtf8().toStdString();
+    request.isHdr10 = isHdr10;
+    request.isHlg = isHlg;
+    request.proresProfile = proresProfile;
+    request.hdrMasterMaxNits =
+        cfg.value("hdrMasterMaxLum").toDouble(1000.0);
+    request.hdrMasterMinNits =
+        cfg.value("hdrMasterMinLum").toDouble(0.0001);
+    request.hdrMaxCll = cfg.value("hdrMaxCll").toInt(1000);
+    request.hdrMaxFall = cfg.value("hdrMaxFall").toInt(400);
+
+    const bool haveAudio = !audioInputPath.isEmpty()
+        && QFile::exists(audioInputPath);
+    if (haveAudio)
+        request.audioSourcePath = audioInputPath.toUtf8().toStdString();
+
+    request.encoderAvailableHook = [](const std::string &name) {
+        return CodecDetector::isEncoderAvailable(QString::fromStdString(name));
+    };
+
+    m_renderThread = QThread::create(
+        [this, jobCopy, tl, owned, request, outW, outH,
+         totalFrames, startUsec, usecPerFrame]() {
+        QString failMsg;
+        // Delete the heap Timeline (only set when loaded from a project
+        // file). It is a QWidget created on the GUI thread; QObject deletion
+        // is safe from another thread only if it has no thread affinity ops
+        // pending — Timeline here is render-only (never shown, no event loop
+        // posted to it), so deleteLater on the owning thread is the safe
+        // disposal. We schedule that back on the queue thread at the end.
+        const bool ok = [&]() -> bool {
+            libavcore::FrameEncoder encoder;
+            if (auto err = encoder.open(request)) {
+                failMsg = QStringLiteral("failed to open encoder: ")
+                    + QString::fromStdString(*err);
+                return false;
+            }
+
+            const QSize outSize(outW, outH);
+            const int rgbRowBytes = outW * 3;
+            QByteArray frameData;
+            frameData.resize(static_cast<qsizetype>(rgbRowBytes)
+                             * static_cast<qsizetype>(outH));
+
+            int lastPct = -1;
+            bool encodeOk = true;
+            bool cancelled = false;
+            qint64 pts = 0;
+            for (qint64 f = 0; f < totalFrames; ++f) {
+                if (m_cancelRequested) {
+                    cancelled = true;
+                    failMsg = QStringLiteral("cancelled");
+                    break;
+                }
+
+                const qint64 usec =
+                    startUsec + static_cast<qint64>(f * usecPerFrame);
+                QImage frame = tlrender::renderFrameAt(tl, usec, outSize);
+                if (frame.isNull()) {
+                    failMsg = QStringLiteral(
+                        "renderFrameAt returned a null image at frame ")
+                        + QString::number(f);
+                    encodeOk = false;
+                    break;
+                }
+                if (frame.format() != QImage::Format_RGBA8888)
+                    frame = frame.convertToFormat(QImage::Format_RGBA8888);
+                if (frame.width() != outW || frame.height() != outH)
+                    frame = frame.scaled(outSize, Qt::IgnoreAspectRatio,
+                                          Qt::SmoothTransformation)
+                                .convertToFormat(QImage::Format_RGBA8888);
+
+                // A video file is OPAQUE — it has no alpha channel. The SSOT
+                // frame can be partially transparent (a per-clip mask with no
+                // lower track leaves alpha=0 regions). The genuine preview
+                // displays that composite over a BLACK canvas
+                // (VideoPlayer ARGB32_Premultiplied base, VideoPlayer.cpp:1939
+                // fills black) and the genuine Exporter encodes through an
+                // opaque Format_RGB888 (Exporter.cpp:482/499, AV_PIX_FMT_RGB24)
+                // which carries no alpha. So the correct deliverable is the
+                // SSOT flattened onto opaque black. Compose onto a black
+                // Format_RGB888 and feed libavcore rgb24 (3 bytes/px, no
+                // alpha) — identical pixel semantics to the Exporter's RGB24
+                // path.
+                QImage rgb(outW, outH, QImage::Format_RGB888);
+                rgb.fill(Qt::black);
+                {
+                    QPainter pp(&rgb);
+                    pp.setCompositionMode(QPainter::CompositionMode_SourceOver);
+                    pp.drawImage(0, 0, frame);
+                }
+
+                // FrameEncoder receives packed RGB24. Qt pads Format_RGB888
+                // scanlines to a 4-byte boundary, so compact into a contiguous
+                // W*H*3 buffer before pushFrameRgb24(width*3 stride).
+                char *dst = frameData.data();
+                for (int y = 0; y < outH; ++y) {
+                    std::memcpy(dst + static_cast<qsizetype>(y) * rgbRowBytes,
+                                rgb.constScanLine(y),
+                                static_cast<std::size_t>(rgbRowBytes));
+                }
+
+                if (!encoder.pushFrameRgb24(
+                        reinterpret_cast<const uint8_t *>(frameData.constData()),
+                        rgbRowBytes,
+                        pts++)) {
+                    failMsg = QStringLiteral("encoder frame push failed");
+                    encodeOk = false;
+                    break;
+                }
+
+                const int pct = qBound(0, static_cast<int>(
+                    (static_cast<double>(f + 1)
+                        / static_cast<double>(totalFrames)) * 100.0), 99);
+                if (pct != lastPct) {
+                    lastPct = pct;
+                    emit jobProgress(jobCopy.id, pct);
+                    emit jobProgressUuid(jobCopy.uuid, pct);
+                }
+            }
+
+            if (auto err = encoder.finalize()) {
+                if (failMsg.isEmpty()) {
+                    failMsg = QStringLiteral("encoder finalize failed: ")
+                        + QString::fromStdString(*err);
+                }
+                encodeOk = false;
+            }
+
+            if (cancelled || m_cancelRequested)
+                return false;
+            return encodeOk;
+        }();
+
+        // Dispose the heap Timeline (render-only QWidget, never shown). Hand
+        // the result back to the queue thread; delete owned there so the
+        // QWidget is destroyed on the GUI/queue thread that created it.
+        QMetaObject::invokeMethod(this, [this, ok, failMsg, owned]() {
+            delete owned;
+            finishCurrentJob(ok, failMsg);
+        }, Qt::QueuedConnection);
+    });
+    m_renderThread->start();
+}
+
+// US-MF-6: 10-bit HDR (HDR10 / HLG) export branch. The bundled avcodec DLL
+// ships no 10-bit encoder (no libx264/libx265, and h264_mf/hevc_mf are 8-bit
+// only), so the in-process libavcore::FrameEncoder cannot emit a genuine
+// HDR10/HLG stream. This restores the pre-US-MF-5 render-pipe for HDR jobs
+// ONLY: a worker QThread renders every output frame via
+// tlrender::renderFrameAt (the SSOT edit graph — grade / FX / masks / LUT all
+// applied) and streams flattened rgb24 to ffmpeg.exe over stdin; ffmpeg
+// encodes libx265 main10 yuv420p10le with BT.2020 + SMPTE-2084 (HDR10) /
+// ARIB-STD-B67 (HLG) signalling, the HDR10 master-display / MaxCLL / MaxFALL
+// x265-params, and muxes the source audio. The public RenderJob / signal /
+// queue-advance contract is identical to the in-process branch: jobProgress
+// per frame, cancellation honoured via m_cancelRequested, finishCurrentJob()
+// on completion. The argv mirrors the genuine Exporter HDR setup
+// (Exporter.cpp HDR10/HLG x265 path) byte-for-byte so the artifact matches
+// the parity selftest's byte-identical Path A round-trip.
+void RenderQueue::startRenderPipeSubprocess(int jobIndex)
+{
+    const RenderJob jobCopy = m_jobs[jobIndex];
+
+    // Reap any prior subprocess / worker thread before starting a new job.
+    QProcess *staleProc = nullptr;
+    {
+        QMutexLocker locker(&m_processMutex);
+        staleProc = m_process;
+        m_process = nullptr;
+    }
+    if (staleProc)
+        delete staleProc;
+    if (m_renderThread) {
+        m_renderThread->wait(5000);
+        delete m_renderThread;
+        m_renderThread = nullptr;
+    }
+
+    // ── Resolve everything that touches the GUI/Timeline on THIS thread ─────
+    // Identical rationale to the in-process branch: Timeline is a QWidget;
+    // restoring it must happen on the GUI thread. The worker thread below
+    // only calls tlrender::renderFrameAt (pure libav decode + CPU QPainter
+    // compositing, no QWidget construction) + QProcess stdin I/O.
     const QString ffmpegBin = findFFmpegBinary();
     if (ffmpegBin.isEmpty()) {
         QMetaObject::invokeMethod(this, [this]() {
-            finishCurrentJob(false,
-                              QStringLiteral("ffmpeg binary not found"));
+            finishCurrentJob(false, QStringLiteral(
+                "ffmpeg.exe not found — required for 10-bit HDR (HDR10/HLG) "
+                "export (the in-process encoder cannot emit 10-bit)"));
         }, Qt::QueuedConnection);
         return;
     }
@@ -546,15 +858,13 @@ void RenderQueue::startRenderPipe(int jobIndex)
     int outH = cfg.value("height").toInt(jobCopy.height > 0 ? jobCopy.height : 1080);
     if (outW <= 0) outW = 1920;
     if (outH <= 0) outH = 1080;
-    // ffmpeg rejects odd dimensions for yuv420p H.264; round down to even.
+    // libx265 yuv420p10le requires even dimensions; round down to even.
     outW &= ~1;
     outH &= ~1;
     double fps = cfg.value("fps").toDouble(0.0);
     if (fps <= 0.0)
         fps = 30.0;
 
-    // Iterate from 0 to the timeline duration at the project fps.
-    // usec-per-frame = 1e6 / fps (the renderFrameAt time unit).
     const double durationSec = tl->totalDuration();
     qint64 totalFrames = static_cast<qint64>(durationSec * fps + 0.5);
     if (jobCopy.endUs > 0 && jobCopy.endUs > jobCopy.startUs) {
@@ -567,12 +877,9 @@ void RenderQueue::startRenderPipe(int jobIndex)
     const qint64 startUsec = jobCopy.startUs > 0 ? jobCopy.startUs : 0;
     const double usecPerFrame = 1'000'000.0 / fps;
 
-    // Audio mux input: the original source file's audio stream. Mirror
-    // VideoStabilizer.cpp:405-408 (-i original, -map 1:a?, -c:a aac). The
-    // job's projectFilePath is the source media for legacy/transcode callers;
-    // when the in-memory timeline seam is used (projectFilePath is a .veditor
-    // or empty), fall back to the V1 clip's source file so the timeline audio
-    // still rides along.
+    // Audio mux input — identical resolution to the in-process branch's
+    // audioSourcePath: the job's source media, falling back to the V1 clip's
+    // file when projectFilePath is a .veditor / empty.
     QString audioInputPath = jobCopy.projectFilePath;
     {
         const bool projIsMedia = !audioInputPath.isEmpty()
@@ -588,19 +895,132 @@ void RenderQueue::startRenderPipe(int jobIndex)
         }
     }
 
-    const QStringList args =
-        buildRenderPipeArgs(jobCopy, outW, outH, fps, audioInputPath);
+    // ── Build the ffmpeg argv: rawvideo rgb24 stdin → libx265 HDR ───────────
+    QString videoCodec = cfg.value("videoCodec").toString();
+    if (videoCodec.isEmpty()) {
+        videoCodec = mapCodecToEncoderName(jobCopy.codec.isEmpty()
+            ? QStringLiteral("h264") : jobCopy.codec);
+    }
+    const QString hdrMode = cfg.value("hdrMode").toString().toLower();
+    const bool isHdr10 =
+        (hdrMode == QLatin1String("hdr10") || cfg.value("hdr10").toBool());
+    const bool isHlg = hdrMode == QLatin1String("hlg");
+
+    // HDR10/HLG are 10-bit; force libx265 unless the caller explicitly chose
+    // an HEVC hardware encoder (mirrors the in-process branch's override).
+    if (videoCodec != QLatin1String("libx265")
+        && videoCodec != QLatin1String("hevc_nvenc")
+        && videoCodec != QLatin1String("hevc_qsv")
+        && videoCodec != QLatin1String("hevc_amf")) {
+        videoCodec = QStringLiteral("libx265");
+    }
+
+    QStringList args;
+    args << QStringLiteral("-y")
+         << QStringLiteral("-hide_banner")
+         // Input 0: the rendered frame stream on stdin. The SSOT RGBA is
+         // flattened onto opaque black and fed as rgb24 (3 bytes/px, NO
+         // alpha) — same pixel semantics as the genuine Exporter's
+         // AV_PIX_FMT_RGB24 path.
+         << QStringLiteral("-f") << QStringLiteral("rawvideo")
+         << QStringLiteral("-pix_fmt") << QStringLiteral("rgb24")
+         << QStringLiteral("-s:v")
+         << QStringLiteral("%1x%2").arg(outW).arg(outH)
+         << QStringLiteral("-r") << QString::number(fps, 'f', 6)
+         << QStringLiteral("-i") << QStringLiteral("-");
+
+    // Input 1: the original media — used ONLY for its audio stream.
+    const bool haveAudio = !audioInputPath.isEmpty()
+        && QFile::exists(audioInputPath);
+    if (haveAudio)
+        args << QStringLiteral("-i") << audioInputPath;
+
+    args << QStringLiteral("-map") << QStringLiteral("0:v:0");
+    if (haveAudio)
+        args << QStringLiteral("-map") << QStringLiteral("1:a?");
+
+    // Video codec + bitrate.
+    args << QStringLiteral("-c:v") << videoCodec;
+    {
+        int videoBitrateKbps = cfg.value("videoBitrate").toInt(0);
+        if (videoBitrateKbps <= 0)
+            videoBitrateKbps = jobCopy.bitrateBps > 0
+                ? static_cast<int>(jobCopy.bitrateBps / 1000) : 10000;
+        args << QStringLiteral("-b:v")
+             << QStringLiteral("%1k").arg(videoBitrateKbps);
+    }
+
+    // 10-bit pixel format + BT.2020 colour signalling (Exporter HDR path:
+    // HDR10 = PQ/SMPTE-2084, HLG = ARIB-STD-B67, BT.2020 primaries +
+    // non-constant luminance, limited (tv) range).
+    args << QStringLiteral("-pix_fmt") << QStringLiteral("yuv420p10le")
+         << QStringLiteral("-color_primaries") << QStringLiteral("bt2020")
+         << QStringLiteral("-colorspace") << QStringLiteral("bt2020nc")
+         << QStringLiteral("-color_range") << QStringLiteral("tv")
+         << QStringLiteral("-color_trc")
+         << (isHdr10 ? QStringLiteral("smpte2084")
+                     : QStringLiteral("arib-std-b67"));
+
+    if (videoCodec == QLatin1String("libx265")) {
+        args << QStringLiteral("-preset") << QStringLiteral("medium");
+    }
+
+    // libx265 10-bit HDR profile + x265-params — byte-for-byte the genuine
+    // Exporter's HDR10/HLG x265 setup. HDR10 master-display / MaxCLL / MaxFALL
+    // come from exportConfig with the standard 1000-nit P3-D65-in-2020
+    // mastering defaults.
+    if (videoCodec == QLatin1String("libx265")) {
+        args << QStringLiteral("-profile:v") << QStringLiteral("main10");
+        if (isHdr10) {
+            const double maxLum =
+                cfg.value("hdrMasterMaxLum").toDouble(1000.0);
+            const double minLum =
+                cfg.value("hdrMasterMinLum").toDouble(0.0001);
+            const int maxCll  = cfg.value("hdrMaxCll").toInt(1000);
+            const int maxFall = cfg.value("hdrMaxFall").toInt(400);
+            const int maxLumX10000 =
+                static_cast<int>(std::round(maxLum * 10000.0));
+            const int minLumX10000 =
+                static_cast<int>(std::round(minLum * 10000.0));
+            const QString x265p =
+                QStringLiteral(
+                    "hdr10=1:repeat-headers=1:colorprim=bt2020:"
+                    "transfer=smpte2084:colormatrix=bt2020nc:range=limited:"
+                    "master-display=G(8500,39850)B(6550,2300)R(35400,14600)"
+                    "WP(15635,16450)L(%1,%2):max-cll=%3,%4")
+                    .arg(maxLumX10000)
+                    .arg(minLumX10000)
+                    .arg(maxCll)
+                    .arg(maxFall);
+            args << QStringLiteral("-x265-params") << x265p;
+        } else {  // HLG
+            args << QStringLiteral("-x265-params")
+                 << QStringLiteral("repeat-headers=1:colorprim=bt2020:"
+                                   "transfer=arib-std-b67:"
+                                   "colormatrix=bt2020nc");
+        }
+    }
+
+    if (haveAudio) {
+        QString audioCodec = cfg.value("audioCodec").toString();
+        if (audioCodec.isEmpty())
+            audioCodec = QStringLiteral("aac");
+        args << QStringLiteral("-c:a") << audioCodec;
+        const int audioBitrate = cfg.value("audioBitrate").toInt(192);
+        args << QStringLiteral("-b:a")
+             << QStringLiteral("%1k").arg(audioBitrate);
+        // Stop at the shorter of rendered video / source audio so a longer
+        // audio track doesn't pad black frames past the timeline.
+        args << QStringLiteral("-shortest");
+    }
+
+    args << QStringLiteral("-progress") << QStringLiteral("pipe:2");
+    args << jobCopy.outputPath;
 
     m_renderThread = QThread::create(
         [this, jobCopy, tl, owned, ffmpegBin, args, outW, outH,
          totalFrames, startUsec, usecPerFrame]() {
         QString failMsg;
-        // Delete the heap Timeline (only set when loaded from a project
-        // file). It is a QWidget created on the GUI thread; QObject deletion
-        // is safe from another thread only if it has no thread affinity ops
-        // pending — Timeline here is render-only (never shown, no event loop
-        // posted to it), so deleteLater on the owning thread is the safe
-        // disposal. We schedule that back on the queue thread at the end.
         const bool ok = [&]() -> bool {
             QProcess *proc = new QProcess();
             proc->setProcessChannelMode(QProcess::SeparateChannels);
@@ -623,6 +1043,7 @@ void RenderQueue::startRenderPipe(int jobIndex)
             }
 
             const QSize outSize(outW, outH);
+            const int rgbRowBytes = outW * 3;
             int lastPct = -1;
             for (qint64 f = 0; f < totalFrames; ++f) {
                 if (m_cancelRequested) {
@@ -654,17 +1075,9 @@ void RenderQueue::startRenderPipe(int jobIndex)
                                           Qt::SmoothTransformation)
                                 .convertToFormat(QImage::Format_RGBA8888);
 
-                // A video file is OPAQUE — it has no alpha channel. The SSOT
-                // frame can be partially transparent (a per-clip mask with no
-                // lower track leaves alpha=0 regions). The genuine preview
-                // displays that composite over a BLACK canvas
-                // (VideoPlayer ARGB32_Premultiplied base, VideoPlayer.cpp:1939
-                // fills black) and the genuine Exporter encodes through an
-                // opaque Format_RGB888 (Exporter.cpp:482/499, AV_PIX_FMT_RGB24)
-                // which carries no alpha. So the correct deliverable is the
-                // SSOT flattened onto opaque black. Compose onto a black
-                // Format_RGB888 and feed ffmpeg rgb24 (3 bytes/px, no alpha) —
-                // identical pixel semantics to the Exporter's RGB24 path.
+                // A video file is OPAQUE — flatten the (possibly partially
+                // transparent) SSOT composite onto opaque black and feed
+                // rgb24, identical to the in-process branch.
                 QImage rgb(outW, outH, QImage::Format_RGB888);
                 rgb.fill(Qt::black);
                 {
@@ -673,10 +1086,9 @@ void RenderQueue::startRenderPipe(int jobIndex)
                     pp.drawImage(0, 0, frame);
                 }
 
-                // ffmpeg -s WxH -pix_fmt rgb24 expects exactly W*H*3 bytes per
-                // frame with NO row padding; Qt pads Format_RGB888 scanlines
-                // to a 4-byte boundary, so write row by row.
-                const int rgbRowBytes = outW * 3;
+                // ffmpeg -s WxH -pix_fmt rgb24 expects exactly W*H*3 bytes
+                // per frame with NO row padding; Qt pads Format_RGB888
+                // scanlines to a 4-byte boundary, so write row by row.
                 for (int y = 0; y < outH; ++y) {
                     const char *row =
                         reinterpret_cast<const char *>(rgb.constScanLine(y));
@@ -727,9 +1139,6 @@ void RenderQueue::startRenderPipe(int jobIndex)
             return encOk;
         }();
 
-        // Dispose the heap Timeline (render-only QWidget, never shown). Hand
-        // the result back to the queue thread; delete owned there so the
-        // QWidget is destroyed on the GUI/queue thread that created it.
         QMetaObject::invokeMethod(this, [this, ok, failMsg, owned]() {
             delete owned;
             finishCurrentJob(ok, failMsg);
@@ -738,9 +1147,27 @@ void RenderQueue::startRenderPipe(int jobIndex)
     m_renderThread->start();
 }
 
+// US-MF-6: locate the ffmpeg.exe binary for the HDR subprocess branch.
+// Restored from the pre-US-MF-5 render-pipe — PATH first (the WinGet / gyan
+// build installs ffmpeg.exe onto the user PATH), then the common install
+// dirs as a fallback.
+QString RenderQueue::findFFmpegBinary()
+{
+    QString path = QStandardPaths::findExecutable(QStringLiteral("ffmpeg"));
+    if (!path.isEmpty())
+        return path;
+    const QStringList searchPaths = {
+        QStringLiteral("/usr/local/bin"),
+        QStringLiteral("/opt/homebrew/bin"),
+        QStringLiteral("/usr/bin")
+    };
+    return QStandardPaths::findExecutable(QStringLiteral("ffmpeg"),
+                                          searchPaths);
+}
+
 // Finalise the current job and advance the queue. Always runs on the
 // RenderQueue's (main/queue) thread — preserves the exact public contract the
-// old QProcess::finished lambda had.
+// worker completion handler has.
 void RenderQueue::finishCurrentJob(bool success, const QString &errorMsg)
 {
     if (m_renderThread) {
@@ -796,295 +1223,6 @@ void RenderQueue::finishCurrentJob(bool success, const QString &errorMsg)
 
     // Advance to the next pending job.
     startNextJob();
-}
-
-QStringList RenderQueue::buildFFmpegArgs(const RenderJob &job) const
-{
-    QStringList args;
-    args << "-y";  // overwrite output
-
-    const QJsonObject &cfg = job.exportConfig;
-
-    // Optional timeline range trim (flat-field jobs only — legacy callers
-    // leave both at 0 and the trim is skipped).
-    if (job.startUs > 0) {
-        args << "-ss" << QString::number(job.startUs / 1000000.0, 'f', 6);
-    }
-    if (job.endUs > 0 && job.endUs > job.startUs) {
-        args << "-to" << QString::number(job.endUs / 1000000.0, 'f', 6);
-    }
-
-    // Input file — use project file path as source
-    args << "-i" << job.projectFilePath;
-
-    // Video codec
-    QString videoCodec = cfg["videoCodec"].toString("libx264");
-    args << "-c:v" << videoCodec;
-
-    // ProRes uses -profile:v rather than a bitrate flag.
-    const bool isProRes = (videoCodec == "prores_ks" || videoCodec == "prores");
-    if (isProRes) {
-        // Default to ProRes 422 LT (profile 1). buildFFmpegArgs is const so
-        // we read profile from cfg / flat-field codec only.
-        int profile = cfg.value("proresProfile").toInt(1);
-        args << "-profile:v" << QString::number(profile);
-    } else {
-        // Video bitrate (kbps in cfg)
-        int videoBitrate = cfg["videoBitrate"].toInt(10000);
-        args << "-b:v" << QString("%1k").arg(videoBitrate);
-    }
-
-    // Resolution
-    int width = cfg["width"].toInt(1920);
-    int height = cfg["height"].toInt(1080);
-    args << "-vf" << QString("scale=%1:%2").arg(width).arg(height);
-
-    // Frame rate
-    int fps = cfg["fps"].toInt(30);
-    args << "-r" << QString::number(fps);
-
-    // Audio codec
-    QString audioCodec = cfg["audioCodec"].toString("aac");
-    args << "-c:a" << audioCodec;
-
-    // Audio bitrate
-    int audioBitrate = cfg["audioBitrate"].toInt(192);
-    args << "-b:a" << QString("%1k").arg(audioBitrate);
-
-    // Codec-specific options
-    if (videoCodec == "libx264" || videoCodec == "libx265") {
-        args << "-preset" << "medium";
-    } else if (videoCodec == "libsvtav1") {
-        args << "-preset" << "8";
-    } else if (videoCodec == "libvpx-vp9") {
-        args << "-quality" << "good" << "-cpu-used" << "4";
-    }
-
-    // 2-pass VBR support — when job.passes==2 the first pass writes to a
-    // null muxer, the second pass is what produces the final file. Here we
-    // just hint the encoder; orchestrating both runs is left to the caller
-    // / future work (the legacy single-pass path stays the default).
-    if (job.passes == 2 && !isProRes) {
-        args << "-pass" << "2";
-    }
-
-    // Progress reporting
-    args << "-progress" << "pipe:1";
-
-    // Output
-    args << job.outputPath;
-
-    return args;
-}
-
-// S8: ffmpeg argv for the SSOT render-pipe. Video comes from renderFrameAt
-// over stdin as packed RGBA (input 0); the original media is the second input
-// purely so its audio stream can be muxed into the output. This is the exact
-// rawvideo + second-input pattern proven in VideoStabilizer.cpp:397-410:
-//   ffmpeg -y -f rawvideo -pix_fmt rgba -s WxH -r FPS -i -
-//          -i <originalMedia> -map 0:v:0 -map 1:a? -c:a aac ... output
-QStringList RenderQueue::buildRenderPipeArgs(const RenderJob &job,
-                                             int outW, int outH, double fps,
-                                             const QString &audioInputPath) const
-{
-    const QJsonObject &cfg = job.exportConfig;
-
-    QString videoCodec = cfg.value("videoCodec").toString();
-    if (videoCodec.isEmpty())
-        videoCodec = mapCodecToFFmpeg(job.codec.isEmpty() ? QStringLiteral("h264")
-                                                          : job.codec);
-
-    QStringList args;
-    args << QStringLiteral("-y")
-         << QStringLiteral("-hide_banner")
-         // Input 0: the rendered frame stream on stdin. We flatten the SSOT
-         // RGBA onto opaque black and feed rgb24 (3 bytes/px, NO alpha) so the
-         // pixel semantics match the genuine Exporter's AV_PIX_FMT_RGB24 path
-         // (Exporter.cpp:482-508) — a video file is opaque, so a per-clip
-         // mask's transparent region correctly delivers as black.
-         << QStringLiteral("-f") << QStringLiteral("rawvideo")
-         << QStringLiteral("-pix_fmt") << QStringLiteral("rgb24")
-         << QStringLiteral("-s:v")
-         << QStringLiteral("%1x%2").arg(outW).arg(outH)
-         << QStringLiteral("-r") << QString::number(fps, 'f', 6)
-         << QStringLiteral("-i") << QStringLiteral("-");
-
-    // Input 1: the original media — used ONLY for its audio stream
-    // (VideoStabilizer.cpp:405-408 reuses the source the same way).
-    const bool haveAudio = !audioInputPath.isEmpty()
-        && QFile::exists(audioInputPath);
-    if (haveAudio)
-        args << QStringLiteral("-i") << audioInputPath;
-
-    // Map the rendered video; map the source audio if present (optional so a
-    // silent / video-only source still produces a valid file).
-    args << QStringLiteral("-map") << QStringLiteral("0:v:0");
-    if (haveAudio)
-        args << QStringLiteral("-map") << QStringLiteral("1:a?");
-
-    // ── S11: 10-bit / HDR10 / HLG / ProRes path ─────────────────────────────
-    // DEFECT THIS FIXES (Exporter.cpp:471-474): the legacy Exporter's
-    // `tenBitPath = isHdr10Mode || isHlgMode || proresProfile>=0` branch
-    // sets `hasEffects = !tenBitPath && ...`, i.e. it BYPASSES the entire
-    // effect graph for every 10-bit/HDR/ProRes output — an HDR10 clip with
-    // a LUT exported WITHOUT the LUT. Routing the export through the SSOT
-    // render-pipe (renderFrameAt feeds every frame, graph already applied)
-    // and then ENCODING into the genuine 10-bit container closes that gap:
-    // the grade/FX/mask/LUT now reach the 10-bit deliverable.
-    //
-    // PRECISION SCOPE (documented honestly): tlrender::renderFrameAt's
-    // public contract is an 8-bit Format_RGBA8888 composite
-    // (TimelineFrameRenderer.cpp:719-723); the whole CPU compositor
-    // (applyColorCorrection / applyLut / applyEffectStack) emits
-    // Format_RGB888. True >8-bit *internal* precision would require
-    // rewriting the SSOT compositor and is OUT OF SCOPE. S11 delivers the
-    // 8-bit composite (graph fully applied) lifted into a real 10-bit
-    // container with correct BT.2020/PQ|HLG signalling — which is exactly
-    // what removes the "LUT silently dropped for HDR" defect. The pixel
-    // ladder is 8-bit-quantised but the container, bit-depth and colour
-    // metadata are genuine 10-bit/HDR (so HDR-aware players tone-map it
-    // correctly), and crucially the graph is no longer bypassed.
-    //
-    // The HDR encoder settings MIRROR the genuine Exporter
-    // (Exporter.cpp:235-256, 271-287): HDR ⇒ libx265 main10 yuv420p10le
-    // BT.2020 + SMPTE-2084 (HDR10) / ARIB-STD-B67 (HLG), limited range;
-    // ProRes ⇒ yuv422p10le (profile<4) / yuva444p10le (profile>=4).
-    const bool isProRes = (videoCodec == QLatin1String("prores_ks")
-                           || videoCodec == QLatin1String("prores"));
-    const QString hdrMode = cfg.value("hdrMode").toString().toLower();
-    const bool isHdr10 = !isProRes
-        && (hdrMode == QLatin1String("hdr10") || cfg.value("hdr10").toBool());
-    const bool isHlg = !isProRes && hdrMode == QLatin1String("hlg");
-    const int proresProfile = cfg.value("proresProfile").toInt(1);
-
-    // HDR10/HLG are 10-bit and the genuine Exporter forces libx265 for them
-    // (Exporter.cpp:271-287 — only the libx265 branch sets main10 + the HDR
-    // x265-params). Override an 8-bit codec request so the container is
-    // actually a valid HDR10/HLG stream.
-    if ((isHdr10 || isHlg)
-        && videoCodec != QLatin1String("libx265")
-        && videoCodec != QLatin1String("hevc_nvenc")
-        && videoCodec != QLatin1String("hevc_qsv")
-        && videoCodec != QLatin1String("hevc_amf")) {
-        videoCodec = QStringLiteral("libx265");
-    }
-
-    // Video codec + bitrate (mirrors buildFFmpegArgs' encoder selection).
-    args << QStringLiteral("-c:v") << videoCodec;
-    if (isProRes) {
-        args << QStringLiteral("-profile:v")
-             << QString::number(proresProfile);
-    } else {
-        int videoBitrateKbps = cfg.value("videoBitrate").toInt(0);
-        if (videoBitrateKbps <= 0)
-            videoBitrateKbps = job.bitrateBps > 0 ? job.bitrateBps / 1000
-                                                  : 10000;
-        args << QStringLiteral("-b:v")
-             << QStringLiteral("%1k").arg(videoBitrateKbps);
-    }
-
-    // Pixel format: 10-bit for HDR/ProRes (mirror Exporter.cpp:235-242),
-    // yuv420p otherwise so the 8-bit H.264/H.265 output stays broadly
-    // playable (rawvideo rgb24 would otherwise leave the encoder in rgb).
-    if (isProRes) {
-        // Exporter.cpp:236-239: profile 4/5 (4444 / 4444 XQ) ⇒ 4:4:4 + alpha.
-        args << QStringLiteral("-pix_fmt")
-             << (proresProfile >= 4 ? QStringLiteral("yuva444p10le")
-                                    : QStringLiteral("yuv422p10le"));
-    } else if (isHdr10 || isHlg) {
-        args << QStringLiteral("-pix_fmt") << QStringLiteral("yuv420p10le");
-        // Colour signalling — Exporter.cpp:246-256 (HDR10 = PQ/SMPTE-2084,
-        // HLG = ARIB-STD-B67), BT.2020 primaries + non-constant luminance,
-        // limited (tv) range. Carried in the bitstream so HDR-aware players
-        // tone-map correctly.
-        args << QStringLiteral("-color_primaries") << QStringLiteral("bt2020")
-             << QStringLiteral("-colorspace") << QStringLiteral("bt2020nc")
-             << QStringLiteral("-color_range") << QStringLiteral("tv")
-             << QStringLiteral("-color_trc")
-             << (isHdr10 ? QStringLiteral("smpte2084")
-                         : QStringLiteral("arib-std-b67"));
-    } else {
-        args << QStringLiteral("-pix_fmt") << QStringLiteral("yuv420p");
-    }
-
-    if (videoCodec == QLatin1String("libx264")
-        || videoCodec == QLatin1String("libx265")) {
-        args << QStringLiteral("-preset") << QStringLiteral("medium");
-    } else if (videoCodec == QLatin1String("libsvtav1")) {
-        args << QStringLiteral("-preset") << QStringLiteral("8");
-    } else if (videoCodec == QLatin1String("libvpx-vp9")) {
-        args << QStringLiteral("-quality") << QStringLiteral("good")
-             << QStringLiteral("-cpu-used") << QStringLiteral("4");
-    }
-
-    // S11: libx265 10-bit HDR profile + x265-params — byte-for-byte the
-    // genuine Exporter's HDR10/HLG x265 setup (Exporter.cpp:275-286 +
-    // buildX265Hdr10Params Exporter.cpp:19-36). HDR10 master-display /
-    // MaxCLL / MaxFALL come from exportConfig with the standard 1000-nit
-    // P3-D65-in-2020 mastering defaults (the HDRSettings struct defaults).
-    if (videoCodec == QLatin1String("libx265") && (isHdr10 || isHlg)) {
-        args << QStringLiteral("-profile:v") << QStringLiteral("main10");
-        if (isHdr10) {
-            const double maxLum =
-                cfg.value("hdrMasterMaxLum").toDouble(1000.0);
-            const double minLum =
-                cfg.value("hdrMasterMinLum").toDouble(0.0001);
-            const int maxCll  = cfg.value("hdrMaxCll").toInt(1000);
-            const int maxFall = cfg.value("hdrMaxFall").toInt(400);
-            const int maxLumX10000 =
-                static_cast<int>(std::round(maxLum * 10000.0));
-            const int minLumX10000 =
-                static_cast<int>(std::round(minLum * 10000.0));
-            // Identical token order/content to buildX265Hdr10Params().
-            const QString x265p =
-                QStringLiteral(
-                    "hdr10=1:repeat-headers=1:colorprim=bt2020:"
-                    "transfer=smpte2084:colormatrix=bt2020nc:range=limited:"
-                    "master-display=G(8500,39850)B(6550,2300)R(35400,14600)"
-                    "WP(15635,16450)L(%1,%2):max-cll=%3,%4")
-                    .arg(maxLumX10000)
-                    .arg(minLumX10000)
-                    .arg(maxCll)
-                    .arg(maxFall);
-            args << QStringLiteral("-x265-params") << x265p;
-        } else {  // HLG
-            args << QStringLiteral("-x265-params")
-                 << QStringLiteral("repeat-headers=1:colorprim=bt2020:"
-                                   "transfer=arib-std-b67:"
-                                   "colormatrix=bt2020nc");
-        }
-    }
-
-    if (haveAudio) {
-        QString audioCodec = cfg.value("audioCodec").toString();
-        if (audioCodec.isEmpty())
-            audioCodec = QStringLiteral("aac");
-        args << QStringLiteral("-c:a") << audioCodec;
-        const int audioBitrate = cfg.value("audioBitrate").toInt(192);
-        args << QStringLiteral("-b:a")
-             << QStringLiteral("%1k").arg(audioBitrate);
-        // Stop at the shorter of the rendered video / source audio so a
-        // longer audio track doesn't pad black frames past the timeline.
-        args << QStringLiteral("-shortest");
-    }
-
-    args << QStringLiteral("-progress") << QStringLiteral("pipe:2");
-    args << job.outputPath;
-    return args;
-}
-
-QString RenderQueue::findFFmpegBinary()
-{
-    QString path = QStandardPaths::findExecutable(QStringLiteral("ffmpeg"));
-    if (!path.isEmpty())
-        return path;
-    const QStringList searchPaths = {
-        QStringLiteral("/usr/local/bin"),
-        QStringLiteral("/opt/homebrew/bin"),
-        QStringLiteral("/usr/bin")
-    };
-    return QStandardPaths::findExecutable(QStringLiteral("ffmpeg"),
-                                          searchPaths);
 }
 
 // Resolve the Timeline a job renders. Priority:
@@ -1164,58 +1302,6 @@ Timeline *RenderQueue::resolveTimeline(const RenderJob &job,
     return tl;
 }
 
-void RenderQueue::parseFFmpegOutput(const QString &line)
-{
-    if (m_currentJobIndex < 0 || m_currentJobIndex >= m_jobs.size())
-        return;
-
-    // Parse "Duration: HH:MM:SS.ms" to get total duration
-    static QRegularExpression durationRx(R"(Duration:\s*(\d+):(\d+):(\d+)\.(\d+))");
-    QRegularExpressionMatch durationMatch = durationRx.match(line);
-    if (durationMatch.hasMatch()) {
-        int hours = durationMatch.captured(1).toInt();
-        int minutes = durationMatch.captured(2).toInt();
-        int seconds = durationMatch.captured(3).toInt();
-        int centis = durationMatch.captured(4).toInt();
-        m_currentDuration = hours * 3600.0 + minutes * 60.0 + seconds + centis / 100.0;
-        return;
-    }
-
-    auto reportPercent = [this](int percent) {
-        RenderJob &job = m_jobs[m_currentJobIndex];
-        job.progress = percent;
-        job.progressPercent = percent;
-        emit jobProgress(job.id, percent);
-        emit jobProgressUuid(job.uuid, percent);
-    };
-
-    // Parse "out_time_ms=XXXX" from -progress pipe output
-    static QRegularExpression outTimeMsRx(R"(out_time_ms=(\d+))");
-    QRegularExpressionMatch outTimeMatch = outTimeMsRx.match(line);
-    if (outTimeMatch.hasMatch() && m_currentDuration > 0.0) {
-        double currentUs = outTimeMatch.captured(1).toDouble();
-        double currentSec = currentUs / 1000000.0;
-        int percent = static_cast<int>(currentSec / m_currentDuration * 100.0);
-        percent = qBound(0, percent, 99);
-        reportPercent(percent);
-        return;
-    }
-
-    // Parse "time=HH:MM:SS.ms" from regular stderr output
-    static QRegularExpression timeRx(R"(time=\s*(\d+):(\d+):(\d+)\.(\d+))");
-    QRegularExpressionMatch timeMatch = timeRx.match(line);
-    if (timeMatch.hasMatch() && m_currentDuration > 0.0) {
-        int hours = timeMatch.captured(1).toInt();
-        int minutes = timeMatch.captured(2).toInt();
-        int seconds = timeMatch.captured(3).toInt();
-        int centis = timeMatch.captured(4).toInt();
-        double currentTime = hours * 3600.0 + minutes * 60.0 + seconds + centis / 100.0;
-        int percent = static_cast<int>(currentTime / m_currentDuration * 100.0);
-        percent = qBound(0, percent, 99);
-        reportPercent(percent);
-    }
-}
-
 int RenderQueue::findJobIndex(int id) const
 {
     for (int i = 0; i < m_jobs.size(); ++i) {
@@ -1234,10 +1320,10 @@ int RenderQueue::findJobIndexByUuid(const QString &uuid) const
     return -1;
 }
 
-QString RenderQueue::mapCodecToFFmpeg(const QString &codec)
+QString RenderQueue::mapCodecToEncoderName(const QString &codec)
 {
     // The flat-field codec uses Premiere/Resolve naming; map it to the
-    // ffmpeg encoder name the existing buildFFmpegArgs() expects.
+    // libavcore encoder name the render-pipe expects.
     if (codec == "h264") return "libx264";
     if (codec == "hevc" || codec == "h265") return "libx265";
     if (codec == "av1") return "libsvtav1";

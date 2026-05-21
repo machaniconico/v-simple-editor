@@ -4,14 +4,18 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #ifdef VEDITOR_LIBAVCORE_WITH_QIMAGE
 #include <QImage>
 #endif
 
 extern "C" {
+#include <libavutil/error.h>
 #include <libavutil/opt.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/mastering_display_metadata.h>
+#include <libavutil/pixdesc.h>
 }
 
 namespace libavcore {
@@ -40,6 +44,246 @@ static bool nameContains(const std::string& s, const char* needle)
     return s.find(needle) != std::string::npos;
 }
 
+static std::string ffmpegErrorString(int err)
+{
+    char buf[AV_ERROR_MAX_STRING_SIZE] = {};
+    if (av_strerror(err, buf, sizeof(buf)) < 0) {
+        return std::to_string(err);
+    }
+    return std::string(buf);
+}
+
+static void logAudioPassthroughDisabled(const std::string& path,
+                                        const std::string& reason)
+{
+    std::fprintf(stderr,
+                 "FrameEncoder: audio passthrough disabled for '%s': %s\n",
+                 path.c_str(),
+                 reason.c_str());
+}
+
+enum class EncoderFamily {
+    Unknown,
+    H264,
+    H265,
+    AV1,
+    VP9
+};
+
+static EncoderFamily detectEncoderFamily(const std::string& name)
+{
+    if (name == "libx264" || nameContains(name, "264")) {
+        return EncoderFamily::H264;
+    }
+    if (name == "libx265" || nameContains(name, "265") || nameContains(name, "hevc")) {
+        return EncoderFamily::H265;
+    }
+    if (nameContains(name, "av1")) {
+        return EncoderFamily::AV1;
+    }
+    if (nameContains(name, "vp9")) {
+        return EncoderFamily::VP9;
+    }
+    return EncoderFamily::Unknown;
+}
+
+static const char* primarySoftwareEncoderName(EncoderFamily family)
+{
+    switch (family) {
+    case EncoderFamily::H264: return "libx264";
+    case EncoderFamily::H265: return "libx265";
+    case EncoderFamily::AV1: return "libsvtav1";
+    case EncoderFamily::VP9: return "libvpx-vp9";
+    case EncoderFamily::Unknown: break;
+    }
+    return "libx264";
+}
+
+static bool isH264OrH265Family(EncoderFamily family)
+{
+    return family == EncoderFamily::H264 || family == EncoderFamily::H265;
+}
+
+static void appendUnique(std::vector<std::string>& names, const char* name)
+{
+    if (!name || !*name) return;
+    for (const std::string& existing : names) {
+        if (existing == name) return;
+    }
+    names.emplace_back(name);
+}
+
+static void appendHardwareCandidates(std::vector<std::string>& names,
+                                     EncoderFamily family,
+                                     const std::string& vendor)
+{
+    if (family == EncoderFamily::H264) {
+        if (vendor == "nvenc") { appendUnique(names, "h264_nvenc"); return; }
+        if (vendor == "qsv") { appendUnique(names, "h264_qsv"); return; }
+        if (vendor == "amf") { appendUnique(names, "h264_amf"); return; }
+        appendUnique(names, "h264_nvenc");
+        appendUnique(names, "h264_qsv");
+        appendUnique(names, "h264_amf");
+    } else if (family == EncoderFamily::H265) {
+        if (vendor == "nvenc") { appendUnique(names, "hevc_nvenc"); return; }
+        if (vendor == "qsv") { appendUnique(names, "hevc_qsv"); return; }
+        if (vendor == "amf") { appendUnique(names, "hevc_amf"); return; }
+        appendUnique(names, "hevc_nvenc");
+        appendUnique(names, "hevc_qsv");
+        appendUnique(names, "hevc_amf");
+    }
+}
+
+static void appendOrderedFamilyFallbacks(std::vector<std::string>& names,
+                                         EncoderFamily family)
+{
+    if (family == EncoderFamily::H264) {
+        appendUnique(names, "libx264");
+        appendUnique(names, "h264_mf");
+        appendUnique(names, "h264_nvenc");
+        appendUnique(names, "h264_qsv");
+        appendUnique(names, "h264_amf");
+        appendUnique(names, "mpeg4");
+    } else if (family == EncoderFamily::H265) {
+        appendUnique(names, "libx265");
+        appendUnique(names, "hevc_mf");
+        appendUnique(names, "hevc_nvenc");
+        appendUnique(names, "hevc_qsv");
+        appendUnique(names, "hevc_amf");
+        appendUnique(names, "mpeg4");
+    }
+}
+
+static bool isVendorHardwareEncoderName(const std::string& name)
+{
+    return name == "h264_nvenc" || name == "h264_qsv" || name == "h264_amf"
+        || name == "hevc_nvenc" || name == "hevc_qsv" || name == "hevc_amf";
+}
+
+static bool encoderAllowedByHook(const EncodeRequest& req, const std::string& name)
+{
+    return !req.encoderAvailableHook || req.encoderAvailableHook(name);
+}
+
+static const AVCodec* findAllowedEncoderByName(const EncodeRequest& req,
+                                               const std::string& name)
+{
+    if (name.empty()) return nullptr;
+    if (!encoderAllowedByHook(req, name)) return nullptr;
+    return avcodec_find_encoder_by_name(name.c_str());
+}
+
+// Query an encoder's supported pixel-format list. FFmpeg 8 deprecated the
+// AVCodec::pix_fmts array (it is NULL for Media Foundation encoders such as
+// h264_mf / hevc_mf, whose real capability is only known after the wrapped
+// MFT is probed) in favour of avcodec_get_supported_config(). This helper
+// prefers the new API and falls back to the legacy array only when the new
+// API yields nothing, so a NULL pix_fmts no longer silently mis-validates.
+//
+// Returns a heap-allocated, AV_PIX_FMT_NONE-terminated list the caller must
+// av_free(), or nullptr when the encoder advertises no constraint (any input
+// format is then assumed acceptable — legacy behaviour).
+static const AVPixelFormat* querySupportedPixelFormats(const AVCodec* encoder)
+{
+    if (!encoder) return nullptr;
+
+    const void* cfg = nullptr;
+    int numCfg = 0;
+    const int rc = avcodec_get_supported_config(
+        nullptr, encoder, AV_CODEC_CONFIG_PIX_FORMAT, 0, &cfg, &numCfg);
+    if (rc >= 0 && cfg && numCfg > 0) {
+        const AVPixelFormat* src = static_cast<const AVPixelFormat*>(cfg);
+        AVPixelFormat* out = static_cast<AVPixelFormat*>(
+            av_malloc(sizeof(AVPixelFormat) * (static_cast<size_t>(numCfg) + 1)));
+        if (!out) return nullptr;
+        for (int i = 0; i < numCfg; ++i) out[i] = src[i];
+        out[numCfg] = AV_PIX_FMT_NONE;
+        return out;
+    }
+
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable: 4996)
+#endif
+    const AVPixelFormat* legacy = encoder->pix_fmts;
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#elif defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+    if (!legacy) return nullptr;
+
+    int n = 0;
+    while (legacy[n] != AV_PIX_FMT_NONE) ++n;
+    AVPixelFormat* out = static_cast<AVPixelFormat*>(
+        av_malloc(sizeof(AVPixelFormat) * (static_cast<size_t>(n) + 1)));
+    if (!out) return nullptr;
+    for (int i = 0; i <= n; ++i) out[i] = legacy[i];
+    return out;
+}
+
+// True when `encoder` lists `target` among its supported pixel formats. When
+// the encoder advertises no list at all the format is assumed acceptable
+// (an MFT validates the real format at avcodec_open2 / send_frame time).
+static bool encoderSupportsPixelFormat(const AVCodec* encoder,
+                                       AVPixelFormat target)
+{
+    const AVPixelFormat* list = querySupportedPixelFormats(encoder);
+    if (!list) return true;
+    bool found = false;
+    for (const AVPixelFormat* p = list; *p != AV_PIX_FMT_NONE; ++p) {
+        if (*p == target) { found = true; break; }
+    }
+    av_free(const_cast<AVPixelFormat*>(list));
+    return found;
+}
+
+// Resolve the 10-bit pixel format an HDR10/HLG encode should feed `encoder`.
+// hevc_mf (Media Foundation HEVC) takes NV12-style semi-planar input, so its
+// 10-bit format is P010LE — NOT the planar YUV420P10LE libx265 uses. Picking
+// the wrong one makes avcodec_send_frame fail ("encoder frame push failed").
+// The chosen format is verified against the encoder's real supported list;
+// on a verified mismatch AV_PIX_FMT_NONE is returned so the caller can fall
+// through to the next encoder candidate instead of failing the whole encode.
+static AVPixelFormat tenBitPixelFormatForEncoder(const AVCodec* encoder,
+                                                 const std::string& name)
+{
+    const bool isMediaFoundation =
+        nameContains(name, "_mf");
+    AVPixelFormat preferred =
+        isMediaFoundation ? AV_PIX_FMT_P010LE : AV_PIX_FMT_YUV420P10LE;
+
+    if (encoderSupportsPixelFormat(encoder, preferred)) return preferred;
+
+    // The preferred format was rejected. Try the other common 10-bit layout
+    // before giving up (covers HW encoders that only list one of the two).
+    const AVPixelFormat alternate =
+        (preferred == AV_PIX_FMT_P010LE) ? AV_PIX_FMT_YUV420P10LE
+                                         : AV_PIX_FMT_P010LE;
+    if (encoderSupportsPixelFormat(encoder, alternate)) return alternate;
+
+    // Neither 10-bit format is supported -> this encoder cannot do HDR10.
+    //
+    // EMPIRICAL NOTE (FFmpeg n8.0 / libavcodec 62.28, bundled avcodec-62.dll):
+    // hevc_mf advertises exactly {nv12, yuv420p, d3d11} — all 8-bit — and
+    // avcodec_open2() hard-rejects any 10-bit pix_fmt ("Specified pixel
+    // format p010le is not supported by the hevc_mf encoder") inside
+    // ff_encode_preinit, BEFORE the wrapped HEVC Encoder MFT is ever
+    // initialised. The FFmpeg mfenc.c HEVC wrapper simply does not register
+    // P010, so there is no in-process hevc_mf path to a 10-bit HDR10 stream
+    // in this build. Returning NONE here lets openEncoderWithFallback advance
+    // to the next candidate rather than silently downgrading HDR10 to 8-bit.
+    return AV_PIX_FMT_NONE;
+}
+
 } // namespace
 
 FrameEncoder::FrameEncoder() = default;
@@ -63,6 +307,7 @@ void FrameEncoder::releaseAll()
     if (m_rgbToYuvCtx) { sws_freeContext(m_rgbToYuvCtx); m_rgbToYuvCtx = nullptr; }
     if (m_scratchFrame) { av_frame_free(&m_scratchFrame); }
     if (m_encCtx) { avcodec_free_context(&m_encCtx); }
+    if (m_audioInFmt) { avformat_close_input(&m_audioInFmt); }
     if (m_outFmt) {
         if (!(m_outFmt->oformat->flags & AVFMT_NOFILE) && m_outFmt->pb) {
             avio_closep(&m_outFmt->pb);
@@ -71,9 +316,13 @@ void FrameEncoder::releaseAll()
         m_outFmt = nullptr;
     }
     m_outStream = nullptr;
+    m_audioInStream = nullptr;
+    m_audioOutStream = nullptr;
+    m_audioInStreamIndex = -1;
 }
 
 bool FrameEncoder::configureEncoderContext(const EncodeRequest& req,
+                                            const AVCodec* encoder,
                                             AVDictionary** outOpts)
 {
     if (!m_encCtx) return false;
@@ -84,13 +333,40 @@ bool FrameEncoder::configureEncoderContext(const EncodeRequest& req,
     m_encCtx->framerate = {req.fps, 1};
 
     // Decide pixel format mirroring Exporter.cpp policy.
+    //
+    // HDR10/HLG need a 10-bit format, but WHICH 10-bit format is encoder-
+    // specific: libx265 takes planar YUV420P10LE while Media Foundation's
+    // hevc_mf takes the NV12-style semi-planar P010LE. Feeding YUV420P10LE to
+    // hevc_mf made avcodec_send_frame reject every frame ("encoder frame push
+    // failed"). tenBitPixelFormatForEncoder() picks the right layout for the
+    // resolved encoder and verifies it against the encoder's REAL supported
+    // list (avcodec_get_supported_config, since FFmpeg 8 leaves the legacy
+    // pix_fmts array NULL for MF encoders).
+    const std::string& name = m_activeEncoderName;
     AVPixelFormat targetPixFmt = AV_PIX_FMT_YUV420P;
     if (req.proresProfile >= 4) {
         targetPixFmt = AV_PIX_FMT_YUVA444P10LE;
     } else if (req.proresProfile >= 0) {
         targetPixFmt = AV_PIX_FMT_YUV422P10LE;
     } else if (req.isHdr10 || req.isHlg) {
-        targetPixFmt = AV_PIX_FMT_YUV420P10LE;
+        targetPixFmt = tenBitPixelFormatForEncoder(encoder, name);
+        if (targetPixFmt == AV_PIX_FMT_NONE) {
+            // The resolved encoder cannot accept any 10-bit format. Refuse to
+            // configure it so openEncoderWithFallback() advances to the next
+            // candidate instead of silently downgrading HDR10 to 8-bit.
+            std::fprintf(stderr,
+                         "FrameEncoder: encoder '%s' supports no 10-bit pixel "
+                         "format — cannot satisfy HDR10/HLG, trying next "
+                         "candidate\n",
+                         name.c_str());
+            return false;
+        }
+    } else if (!encoderSupportsPixelFormat(encoder, targetPixFmt)) {
+        // 8-bit path: keep the legacy "first supported format" fallback so an
+        // encoder that does not list yuv420p still opens.
+        const AVPixelFormat* list = querySupportedPixelFormats(encoder);
+        if (list && list[0] != AV_PIX_FMT_NONE) targetPixFmt = list[0];
+        av_free(const_cast<AVPixelFormat*>(list));
     }
     m_encCtx->pix_fmt = targetPixFmt;
     m_pixFmt = targetPixFmt;
@@ -108,12 +384,44 @@ bool FrameEncoder::configureEncoderContext(const EncodeRequest& req,
         m_encCtx->color_range = AVCOL_RANGE_MPEG;
     }
 
+    // HEVC 10-bit output requires the Main10 profile. libx265 receives this
+    // via its "profile" private option below; every other HEVC encoder
+    // (hevc_mf, hevc_nvenc/qsv/amf) takes it through AVCodecContext::profile.
+    if ((req.isHdr10 || req.isHlg)
+        && detectEncoderFamily(name) == EncoderFamily::H265
+        && name != "libx265") {
+        m_encCtx->profile = AV_PROFILE_HEVC_MAIN_10;
+    }
+
+    // HDR10 static metadata. libx265 emits the SMPTE-2086 mastering display
+    // and CEA-861.3 content-light SEI from its x265-params string (built
+    // below). Every other encoder — notably hevc_mf — receives the same
+    // information as per-frame side data instead; capture the values here so
+    // pushFrameNative() can attach them. HLG carries no static luminance
+    // metadata, so this is HDR10-only.
+    if (req.isHdr10 && name != "libx265") {
+        m_attachHdr10Metadata = true;
+        m_hdrMasterMaxNits = req.hdrMasterMaxNits;
+        m_hdrMasterMinNits = req.hdrMasterMinNits;
+        m_hdrMaxCll = req.hdrMaxCll;
+        m_hdrMaxFall = req.hdrMaxFall;
+    }
+
+    std::fprintf(stderr,
+                 "FrameEncoder: encoder='%s' pix_fmt=%s hdr10=%d hlg=%d "
+                 "profile=%d\n",
+                 name.c_str(),
+                 av_get_pix_fmt_name(targetPixFmt)
+                     ? av_get_pix_fmt_name(targetPixFmt) : "?",
+                 req.isHdr10 ? 1 : 0, req.isHlg ? 1 : 0,
+                 m_encCtx->profile);
+
     if (m_outFmt && (m_outFmt->oformat->flags & AVFMT_GLOBALHEADER)) {
         m_encCtx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
     }
 
-    // Codec-specific opts — mirrors Exporter.cpp 1:1.
-    const std::string& name = m_activeEncoderName;
+    // Codec-specific opts — mirrors Exporter.cpp 1:1. `name` was bound to
+    // m_activeEncoderName above for the pixel-format / profile decisions.
     if (name == "h264_nvenc" || name == "hevc_nvenc") {
         av_dict_set(outOpts, "preset", "p4", 0);
         av_dict_set(outOpts, "rc", "vbr", 0);
@@ -122,10 +430,10 @@ bool FrameEncoder::configureEncoderContext(const EncodeRequest& req,
         av_dict_set(outOpts, "preset", "medium", 0);
     } else if (name == "h264_amf" || name == "hevc_amf") {
         av_dict_set(outOpts, "quality", "balanced", 0);
-    } else if (req.videoCodecName == "libx264" || req.videoCodecName == "libx265") {
+    } else if (name == "libx264" || name == "libx265") {
         av_dict_set(outOpts, "preset", "medium", 0);
         av_dict_set(outOpts, "crf", "23", 0);
-        if (req.videoCodecName == "libx265") {
+        if (name == "libx265") {
             if (req.isHdr10) {
                 av_dict_set(outOpts, "profile", "main10", 0);
                 const std::string x265p = buildX265Hdr10Params(
@@ -141,13 +449,25 @@ bool FrameEncoder::configureEncoderContext(const EncodeRequest& req,
                             0);
             }
         }
-    } else if (req.videoCodecName == "libsvtav1") {
+    } else if (name == "h264_mf" || name == "hevc_mf") {
+        // Windows Media Foundation H.264/HEVC. Without explicit rate control
+        // mfenc defaults to a CBR-style mode that pads easy frames and starves
+        // hard ones, raising decoded-vs-source MSE at a fixed bitrate.
+        // u_vbr (unconstrained VBR) treats bit_rate as an average target and
+        // lets the encoder reallocate bits toward harder frames; the archive
+        // scenario is a fidelity-priority hint (vs latency-priority scenarios
+        // like video_conference / live_streaming). Together they lower the
+        // decoded-vs-source error at the same configured bitrate.
+        av_dict_set(outOpts, "rate_control", "u_vbr", 0);
+        av_dict_set(outOpts, "scenario", "archive", 0);
+        av_dict_set(outOpts, "quality", "100", 0);
+    } else if (name == "libsvtav1") {
         av_dict_set(outOpts, "preset", "8", 0);
         av_dict_set(outOpts, "crf", "30", 0);
-    } else if (req.videoCodecName == "libvpx-vp9") {
+    } else if (name == "libvpx-vp9") {
         av_dict_set(outOpts, "quality", "good", 0);
         av_dict_set(outOpts, "cpu-used", "4", 0);
-    } else if (req.videoCodecName.rfind("prores", 0) == 0 && req.proresProfile >= 0) {
+    } else if (name.rfind("prores", 0) == 0 && req.proresProfile >= 0) {
         char buf[16];
         std::snprintf(buf, sizeof(buf), "%d", req.proresProfile);
         av_dict_set(outOpts, "profile", buf, 0);
@@ -157,120 +477,266 @@ bool FrameEncoder::configureEncoderContext(const EncodeRequest& req,
 
 bool FrameEncoder::openEncoderWithFallback(const EncodeRequest& req)
 {
+    m_hwInUse = false;
+    m_activeEncoderName.clear();
+
     // Find primary encoder by requested name; if missing, try CodecDetector-
     // style family detection (here inline so libavcore stays Qt-free).
+    EncoderFamily family = detectEncoderFamily(req.videoCodecName);
     std::string resolved = req.videoCodecName;
-    const AVCodec* encoder = avcodec_find_encoder_by_name(resolved.c_str());
-    if (!encoder) {
-        const std::string lower = resolved; // already lowercase by callers
-        if (nameContains(lower, "264")) resolved = "libx264";
-        else if (nameContains(lower, "265") || nameContains(lower, "hevc")) resolved = "libx265";
-        else if (nameContains(lower, "av1")) resolved = "libsvtav1";
-        else if (nameContains(lower, "vp9")) resolved = "libvpx-vp9";
-        else resolved = "libx264";
-        encoder = avcodec_find_encoder_by_name(resolved.c_str());
-    }
-    if (!encoder) return false;
+    const AVCodec* primaryEncoder = findAllowedEncoderByName(req, resolved);
 
-    // HW encoder resolution (mirrors Exporter.cpp lines 165-209).
+    if (!primaryEncoder) {
+        if (family == EncoderFamily::Unknown) {
+            family = EncoderFamily::H264;
+        }
+        resolved = primarySoftwareEncoderName(family);
+        primaryEncoder = findAllowedEncoderByName(req, resolved);
+    }
+
     const bool wantHW = (req.useHardwareAccel || !req.hwVendorHint.empty())
                        && req.hwVendorHint != "none";
-    const bool isH264Family = (req.videoCodecName == "libx264"
-                               || nameContains(req.videoCodecName, "264"));
-    const bool isH265Family = (req.videoCodecName == "libx265"
-                               || nameContains(req.videoCodecName, "265")
-                               || nameContains(req.videoCodecName, "hevc"));
 
-    const AVCodec* hwEncoder = nullptr;
-    std::string hwEncoderName;
-
-    if (wantHW && (isH264Family || isH265Family)) {
-        std::string vendor = req.hwVendorHint;
-        // Build candidate list matching Exporter.cpp.
-        const char* candidates[3] = {nullptr, nullptr, nullptr};
-        if (isH264Family) {
-            if (vendor == "nvenc") { candidates[0] = "h264_nvenc"; }
-            else if (vendor == "qsv") { candidates[0] = "h264_qsv"; }
-            else if (vendor == "amf") { candidates[0] = "h264_amf"; }
-            else { candidates[0] = "h264_nvenc"; candidates[1] = "h264_qsv"; candidates[2] = "h264_amf"; }
-        } else {
-            if (vendor == "nvenc") { candidates[0] = "hevc_nvenc"; }
-            else if (vendor == "qsv") { candidates[0] = "hevc_qsv"; }
-            else if (vendor == "amf") { candidates[0] = "hevc_amf"; }
-            else { candidates[0] = "hevc_nvenc"; candidates[1] = "hevc_qsv"; candidates[2] = "hevc_amf"; }
+    std::vector<std::string> candidates;
+    if (wantHW && primaryEncoder && isH264OrH265Family(family)) {
+        // Preserve the existing HW-preferred path when a primary encoder is
+        // present, then continue through the new MF/mpeg4 fallback chain if
+        // opening the selected encoder fails.
+        appendHardwareCandidates(candidates, family, req.hwVendorHint);
+        appendUnique(candidates, primaryEncoder->name ? primaryEncoder->name : resolved.c_str());
+        appendOrderedFamilyFallbacks(candidates, family);
+    } else if (primaryEncoder) {
+        appendUnique(candidates, primaryEncoder->name ? primaryEncoder->name : resolved.c_str());
+        if (isH264OrH265Family(family)) {
+            appendOrderedFamilyFallbacks(candidates, family);
         }
-        for (int i = 0; i < 3 && candidates[i]; ++i) {
-            // [P1-M1] Restore CodecDetector::isEncoderAvailable() runtime probe
-            // semantics that were dropped during the libavcore refactor. The
-            // legacy Exporter.cpp:194-203 path required BOTH (a) the encoder
-            // name to be registered in this libavcodec build AND (b) the
-            // CodecDetector probe to confirm a functional runtime (e.g. NVENC
-            // requires a driver-loaded GPU; a stub-registered encoder must be
-            // skipped). The hook is optional (default nullptr = always
-            // available) so non-Qt callers retain the simple registration-only
-            // probe.
-            if (req.encoderAvailableHook && !req.encoderAvailableHook(candidates[i]))
-                continue;
-            const AVCodec* candidate = avcodec_find_encoder_by_name(candidates[i]);
-            if (candidate) {
-                hwEncoder = candidate;
-                hwEncoderName = candidates[i];
-                break;
-            }
-        }
-        if (hwEncoder) {
-            encoder = hwEncoder;
-            resolved = hwEncoderName;
-            m_hwInUse = true;
-        }
+    } else if (isH264OrH265Family(family)) {
+        // A missing libx264/libx265 primary must not short-circuit the open.
+        // Windows builds with Media Foundation can still supply h264_mf/hevc_mf,
+        // and mpeg4 remains a last-resort cross-build fallback.
+        appendOrderedFamilyFallbacks(candidates, family);
     }
 
-    // First attempt — primary encoder (possibly HW).
-    m_encCtx = avcodec_alloc_context3(encoder);
-    if (!m_encCtx) return false;
-    m_activeEncoderName = encoder->name ? encoder->name : resolved;
+    for (const std::string& candidateName : candidates) {
+        const AVCodec* encoder = findAllowedEncoderByName(req, candidateName);
+        if (!encoder) continue;
 
-    AVDictionary* opts = nullptr;
-    configureEncoderContext(req, &opts);
+        m_encCtx = avcodec_alloc_context3(encoder);
+        if (!m_encCtx) return false;
+        m_activeEncoderName = encoder->name ? encoder->name : candidateName;
 
-    int rc = avcodec_open2(m_encCtx, encoder, &opts);
-    av_dict_free(&opts);
+        // Reset per-candidate HDR10 state so a rejected candidate cannot leak
+        // its metadata flag into the next one.
+        m_attachHdr10Metadata = false;
 
-    if (rc < 0) {
-        avcodec_free_context(&m_encCtx);
-        m_encCtx = nullptr;
+        AVDictionary* opts = nullptr;
+        if (!configureEncoderContext(req, encoder, &opts)) {
+            // configureEncoderContext now fails (rather than silently
+            // downgrading) when an encoder cannot satisfy the request — e.g.
+            // an HDR10 export landing on the 8-bit-only h264_mf. Skip this
+            // candidate and continue the fallback chain instead of aborting
+            // the whole open, so a 10-bit-capable encoder further down the
+            // list (hevc_mf, hevc_nvenc, …) still gets its turn.
+            av_dict_free(&opts);
+            avcodec_free_context(&m_encCtx);
+            m_encCtx = nullptr;
+            m_activeEncoderName.clear();
+            m_attachHdr10Metadata = false;
+            continue;
+        }
 
-        // HW open failed — fall back to SW encoder, mirroring Exporter.cpp.
-        if (m_hwInUse) {
-            m_hwInUse = false;
-            const std::string swCodec = isH265Family ? "libx265" : "libx264";
-            const AVCodec* swEncoder = avcodec_find_encoder_by_name(swCodec.c_str());
-            if (!swEncoder) return false;
-
-            m_encCtx = avcodec_alloc_context3(swEncoder);
-            if (!m_encCtx) return false;
-            m_activeEncoderName = swEncoder->name ? swEncoder->name : swCodec;
-
-            // For SW fallback we have to rebuild opts using the libx264/265
-            // baseline matching Exporter.cpp's swOpts (preset+crf, possibly
-            // x265 HDR params).
-            EncodeRequest swReq = req;
-            swReq.videoCodecName = swCodec;  // forces the x264/x265 branch
-            AVDictionary* swOpts = nullptr;
-            configureEncoderContext(swReq, &swOpts);
-
-            const int swRc = avcodec_open2(m_encCtx, swEncoder, &swOpts);
-            av_dict_free(&swOpts);
-            if (swRc < 0) {
-                avcodec_free_context(&m_encCtx);
-                m_encCtx = nullptr;
-                return false;
-            }
+        const int rc = avcodec_open2(m_encCtx, encoder, &opts);
+        av_dict_free(&opts);
+        if (rc >= 0) {
+            m_hwInUse = isVendorHardwareEncoderName(m_activeEncoderName);
             return true;
         }
+
+        avcodec_free_context(&m_encCtx);
+        m_encCtx = nullptr;
+        m_activeEncoderName.clear();
+        m_attachHdr10Metadata = false;
+        m_hwInUse = false;
+    }
+
+    return false;
+}
+
+bool FrameEncoder::configureAudioPassthrough(const std::string& audioSourcePath)
+{
+    if (audioSourcePath.empty()) return false;
+    if (!m_outFmt) {
+        logAudioPassthroughDisabled(audioSourcePath, "output context is not ready");
         return false;
     }
+
+    AVFormatContext* inFmt = nullptr;
+    int rc = avformat_open_input(&inFmt, audioSourcePath.c_str(), nullptr, nullptr);
+    if (rc < 0) {
+        logAudioPassthroughDisabled(audioSourcePath,
+                                    "open failed: " + ffmpegErrorString(rc));
+        return false;
+    }
+
+    rc = avformat_find_stream_info(inFmt, nullptr);
+    if (rc < 0) {
+        logAudioPassthroughDisabled(audioSourcePath,
+                                    "stream info parse failed: " + ffmpegErrorString(rc));
+        avformat_close_input(&inFmt);
+        return false;
+    }
+
+    int streamIndex = -1;
+    for (unsigned int i = 0; i < inFmt->nb_streams; ++i) {
+        AVStream* candidate = inFmt->streams[i];
+        if (candidate && candidate->codecpar
+            && candidate->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+            streamIndex = static_cast<int>(i);
+            break;
+        }
+    }
+    if (streamIndex < 0) {
+        logAudioPassthroughDisabled(audioSourcePath, "no audio stream found");
+        avformat_close_input(&inFmt);
+        return false;
+    }
+
+    AVStream* inStream = inFmt->streams[streamIndex];
+    if (!inStream || !inStream->codecpar) {
+        logAudioPassthroughDisabled(audioSourcePath, "audio stream has no codec parameters");
+        avformat_close_input(&inFmt);
+        return false;
+    }
+
+    AVCodecParameters* copiedParams = avcodec_parameters_alloc();
+    if (!copiedParams) {
+        logAudioPassthroughDisabled(audioSourcePath, "failed to allocate audio codec parameters");
+        avformat_close_input(&inFmt);
+        return false;
+    }
+
+    rc = avcodec_parameters_copy(copiedParams, inStream->codecpar);
+    if (rc < 0) {
+        logAudioPassthroughDisabled(audioSourcePath,
+                                    "codec parameter copy failed: " + ffmpegErrorString(rc));
+        avcodec_parameters_free(&copiedParams);
+        avformat_close_input(&inFmt);
+        return false;
+    }
+    copiedParams->codec_tag = 0;
+
+    AVStream* outStream = avformat_new_stream(m_outFmt, nullptr);
+    if (!outStream) {
+        logAudioPassthroughDisabled(audioSourcePath, "failed to create output audio stream");
+        avcodec_parameters_free(&copiedParams);
+        avformat_close_input(&inFmt);
+        return false;
+    }
+
+    avcodec_parameters_free(&outStream->codecpar);
+    outStream->codecpar = copiedParams;
+    copiedParams = nullptr;
+    outStream->time_base = inStream->time_base;
+
+    m_audioInFmt = inFmt;
+    m_audioInStream = inStream;
+    m_audioOutStream = outStream;
+    m_audioInStreamIndex = streamIndex;
     return true;
+}
+
+void FrameEncoder::muxAudioPassthroughPackets()
+{
+    if (!m_audioInFmt || !m_audioInStream || !m_audioOutStream) return;
+
+    AVPacket* pkt = av_packet_alloc();
+    if (!pkt) {
+        std::fprintf(stderr,
+                     "FrameEncoder: audio passthrough skipped: failed to allocate packet\n");
+        return;
+    }
+
+    // [US-MF-8a] Video-length cap (-shortest equivalent). The rendered video
+    // runs framesPushed / fps seconds; source audio that extends past that
+    // (trim/range renders, or an asset longer than the rendered range) must be
+    // truncated so the muxed audio does not outlast the video. When no video
+    // frames were pushed there is nothing to bound against, so the cap is
+    // disabled and every packet is copied (legacy behavior).
+    const bool capEnabled = (m_videoFramesPushed > 0 && m_fps > 0);
+    const double videoDurationSec =
+        capEnabled
+            ? static_cast<double>(m_videoFramesPushed) / static_cast<double>(m_fps)
+            : 0.0;
+
+    // [US-MF-8b] Start-time normalization. Source audio whose stream start_time
+    // is non-zero (AAC encoder delay, mid-stream extracted clips) would copy a
+    // non-zero first PTS against a pts-0 video and desync A/V. Capture a base
+    // offset in input-stream time_base units and subtract it from every
+    // packet's PTS/DTS before rescaling so the audio is 0-origin. The input
+    // stream's start_time is preferred; if it is unset the first decoded
+    // packet's PTS is used instead. The offset is resolved lazily on the first
+    // packet so a stale start_time cannot override an earlier real PTS.
+    int64_t baseOffset = 0;
+    bool baseOffsetResolved = false;
+    if (m_audioInStream->start_time != AV_NOPTS_VALUE) {
+        baseOffset = m_audioInStream->start_time;
+        baseOffsetResolved = true;
+    }
+
+    // Audio tracks passed here are short, pre-rendered assets. Copying them
+    // after the video encoder flush is sufficient for this workflow; the muxer
+    // interleave queue orders DTS as packets are written.
+    while (av_read_frame(m_audioInFmt, pkt) >= 0) {
+        if (pkt->stream_index == m_audioInStreamIndex) {
+            // Resolve the 0-origin base offset from the first packet's PTS
+            // when the container did not advertise a stream start_time.
+            if (!baseOffsetResolved) {
+                baseOffset = (pkt->pts != AV_NOPTS_VALUE) ? pkt->pts : 0;
+                baseOffsetResolved = true;
+            }
+
+            // -shortest cap: stop once a packet's normalized presentation time
+            // (in seconds, input time_base) reaches the video duration. The
+            // remaining source packets are intentionally not written.
+            if (capEnabled && pkt->pts != AV_NOPTS_VALUE) {
+                int64_t normPtsForCap = pkt->pts - baseOffset;
+                if (normPtsForCap < 0) normPtsForCap = 0;
+                const double ptsSec =
+                    static_cast<double>(normPtsForCap)
+                    * av_q2d(m_audioInStream->time_base);
+                if (ptsSec >= videoDurationSec) {
+                    av_packet_unref(pkt);
+                    break;
+                }
+            }
+
+            // Normalize PTS/DTS to 0-origin, clamping any negative result
+            // (e.g. edit-list lead-in) to 0, then rescale to the output
+            // stream time_base.
+            if (pkt->pts != AV_NOPTS_VALUE) {
+                pkt->pts -= baseOffset;
+                if (pkt->pts < 0) pkt->pts = 0;
+            }
+            if (pkt->dts != AV_NOPTS_VALUE) {
+                pkt->dts -= baseOffset;
+                if (pkt->dts < 0) pkt->dts = 0;
+            }
+            av_packet_rescale_ts(pkt,
+                                 m_audioInStream->time_base,
+                                 m_audioOutStream->time_base);
+            pkt->stream_index = m_audioOutStream->index;
+            pkt->pos = -1;
+            const int rc = av_interleaved_write_frame(m_outFmt, pkt);
+            if (rc < 0) {
+                std::fprintf(stderr,
+                             "FrameEncoder: audio passthrough packet write failed: %s\n",
+                             ffmpegErrorString(rc).c_str());
+            }
+        }
+        av_packet_unref(pkt);
+    }
+
+    av_packet_free(&pkt);
 }
 
 std::optional<std::string> FrameEncoder::open(const EncodeRequest& req)
@@ -282,6 +748,10 @@ std::optional<std::string> FrameEncoder::open(const EncodeRequest& req)
     if (req.outputPath.empty()) {
         return std::string("Output path is empty");
     }
+
+    // [US-MF-8] Capture fps for video-duration computation in
+    // muxAudioPassthroughPackets() (-shortest equivalent). Validated > 0 above.
+    m_fps = req.fps;
 
     if (avformat_alloc_output_context2(&m_outFmt, nullptr, nullptr,
                                        req.outputPath.c_str()) < 0 || !m_outFmt) {
@@ -308,6 +778,10 @@ std::optional<std::string> FrameEncoder::open(const EncodeRequest& req)
     }
     m_outStream->time_base = m_encCtx->time_base;
 
+    if (!req.audioSourcePath.empty()) {
+        configureAudioPassthrough(req.audioSourcePath);
+    }
+
     if (!(m_outFmt->oformat->flags & AVFMT_NOFILE)) {
         if (avio_open(&m_outFmt->pb, req.outputPath.c_str(), AVIO_FLAG_WRITE) < 0) {
             releaseAll();
@@ -324,12 +798,94 @@ std::optional<std::string> FrameEncoder::open(const EncodeRequest& req)
     return std::nullopt;
 }
 
+void FrameEncoder::attachHdr10SideData(AVFrame* frame)
+{
+    if (!m_attachHdr10Metadata || !frame) return;
+
+    // Mastering display (SMPTE ST 2086): BT.2020 primaries + D65 white point,
+    // identical to the BT.2020 set buildX265Hdr10Params() encodes for libx265
+    // (G(8500,39850) B(6550,2300) R(35400,14600) WP(15635,16450), units of
+    // 1/50000). The struct uses AVRational, so express each as <value>/50000
+    // for the chromaticity coords and the configured nits for luminance.
+    if (!av_frame_get_side_data(frame,
+                                AV_FRAME_DATA_MASTERING_DISPLAY_METADATA)) {
+        AVMasteringDisplayMetadata* mdm =
+            av_mastering_display_metadata_create_side_data(frame);
+        if (mdm) {
+            mdm->display_primaries[0][0] = AVRational{35400, 50000}; // R x
+            mdm->display_primaries[0][1] = AVRational{14600, 50000}; // R y
+            mdm->display_primaries[1][0] = AVRational{ 8500, 50000}; // G x
+            mdm->display_primaries[1][1] = AVRational{39850, 50000}; // G y
+            mdm->display_primaries[2][0] = AVRational{ 6550, 50000}; // B x
+            mdm->display_primaries[2][1] = AVRational{ 2300, 50000}; // B y
+            mdm->white_point[0] = AVRational{15635, 50000};
+            mdm->white_point[1] = AVRational{16450, 50000};
+            mdm->has_primaries = 1;
+            // Luminance in cd/m^2 (the struct stores it as a rational).
+            mdm->max_luminance = AVRational{
+                static_cast<int>(m_hdrMasterMaxNits + 0.5), 1};
+            mdm->min_luminance = AVRational{
+                static_cast<int>(m_hdrMasterMinNits * 10000.0 + 0.5), 10000};
+            mdm->has_luminance = 1;
+        }
+    }
+
+    // Content light level (CEA-861.3): MaxCLL / MaxFALL.
+    if (!av_frame_get_side_data(frame,
+                                AV_FRAME_DATA_CONTENT_LIGHT_LEVEL)) {
+        AVContentLightMetadata* clm =
+            av_content_light_metadata_create_side_data(frame);
+        if (clm) {
+            clm->MaxCLL  = static_cast<unsigned>(m_hdrMaxCll);
+            clm->MaxFALL = static_cast<unsigned>(m_hdrMaxFall);
+        }
+    }
+}
+
 bool FrameEncoder::pushFrameNative(AVFrame* frame, int64_t pts)
 {
     if (!m_opened || m_finalized || !m_encCtx || !frame) return false;
 
     frame->pts = pts;
-    if (avcodec_send_frame(m_encCtx, frame) < 0) return false;
+
+    // HDR10 through a non-libx265 encoder (hevc_mf): carry the static HDR10
+    // metadata + colour signalling on every frame so the encoder writes the
+    // mastering-display / content-light SEI a genuine HDR10 stream needs.
+    attachHdr10SideData(frame);
+    if (m_attachHdr10Metadata) {
+        frame->color_primaries = m_encCtx->color_primaries;
+        frame->color_trc       = m_encCtx->color_trc;
+        frame->colorspace      = m_encCtx->colorspace;
+        frame->color_range     = m_encCtx->color_range;
+    }
+
+    const int sendRc = avcodec_send_frame(m_encCtx, frame);
+    if (sendRc < 0) {
+        // Surface the exact failure: the silent "encoder frame push failed"
+        // string the caller reports otherwise hides whether this was a
+        // pixel-format mismatch, an unsupported profile, or an MFT error.
+        char errBuf[AV_ERROR_MAX_STRING_SIZE] = {};
+        av_strerror(sendRc, errBuf, sizeof(errBuf));
+        std::fprintf(stderr,
+                     "FrameEncoder: avcodec_send_frame failed (encoder='%s' "
+                     "pix_fmt=%s frame.fmt=%s): %s\n",
+                     m_activeEncoderName.c_str(),
+                     av_get_pix_fmt_name(m_encCtx->pix_fmt)
+                         ? av_get_pix_fmt_name(m_encCtx->pix_fmt) : "?",
+                     av_get_pix_fmt_name(
+                         static_cast<AVPixelFormat>(frame->format))
+                         ? av_get_pix_fmt_name(
+                               static_cast<AVPixelFormat>(frame->format))
+                         : "?",
+                     errBuf);
+        return false;
+    }
+
+    // [US-MF-8] Count frames accepted by the video encoder so finalize() can
+    // derive video duration (framesPushed / fps) for the audio -shortest cap.
+    // pushFrameRgb24() routes through here, so a single increment covers both
+    // public push paths without double-counting.
+    ++m_videoFramesPushed;
 
     AVPacket* encPkt = av_packet_alloc();
     if (!encPkt) return false;
@@ -423,6 +979,8 @@ std::optional<std::string> FrameEncoder::finalize()
             av_packet_free(&flushPkt);
         }
     }
+
+    muxAudioPassthroughPackets();
 
     if (m_outFmt) {
         av_write_trailer(m_outFmt);

@@ -50,11 +50,13 @@ if(WIN32)
 endif()
 
 add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
-    # PRD-B ④ — libavcore shared helpers (Probe + Encode).
+    # PRD-B ④ — libavcore shared helpers (Probe + Encode + Concat).
     src/libavcore/Probe.h
     src/libavcore/Probe.cpp
     src/libavcore/Encode.h
     src/libavcore/Encode.cpp
+    src/libavcore/Concat.h
+    src/libavcore/Concat.cpp
 
     src/main.cpp
     src/MainWindow.cpp

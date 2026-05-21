@@ -2,14 +2,13 @@
 
 #include <QObject>
 #include <QString>
-#include <QStringList>
 #include <QVector>
 #include <QDateTime>
 #include <QJsonObject>
 #include <QMutex>
-#include <QProcess>
 
 class QThread;
+class QProcess;
 class Timeline;
 
 enum class RenderJobStatus {
@@ -155,24 +154,36 @@ signals:
 
 private:
     void startNextJob();
-    // S8: the SSOT render-pipe. Renders every output frame of `job` through
-    // tlrender::renderFrameAt and streams the RGBA bytes to ffmpeg's stdin
-    // (the proven VideoStabilizer.cpp:397-410 rawvideo + second-input audio
-    // mux pattern). Runs on a worker QThread so the queue stays responsive;
-    // emits jobProgress per frame and finishes via finishCurrentJob().
+    // S8/US-MF-5: the SSOT render-pipe. Renders every output frame of `job`
+    // through tlrender::renderFrameAt and feeds flattened RGB24 frames into
+    // libavcore::FrameEncoder in-process. Runs on a worker QThread so the
+    // queue stays responsive; emits jobProgress per frame and finishes via
+    // finishCurrentJob().
+    //
+    // US-MF-6: startRenderPipe is now a 2-way dispatcher. 10-bit HDR exports
+    // (HDR10 / HLG) cannot be produced in-process — the bundled avcodec DLL
+    // ships neither libx264/libx265 nor a 10-bit MediaFoundation encoder, so
+    // h264_mf/hevc_mf top out at 8-bit and an HDR10 job fails the in-process
+    // encoder. For those jobs ONLY, startRenderPipe routes to
+    // startRenderPipeSubprocess, which restores the pre-US-MF-5 ffmpeg.exe
+    // QProcess encode (rawvideo rgb24 over stdin -> libx265 yuv420p10le + the
+    // genuine BT.2020/PQ|HLG HDR metadata). Every non-10-bit-HDR job (8-bit
+    // H.264 / H.265 / ProRes / AV1) keeps the in-process FrameEncoder path.
     void startRenderPipe(int jobIndex);
+    // US-MF-6: ffmpeg.exe subprocess encode for 10-bit HDR (HDR10 / HLG) jobs.
+    // Restored from the pre-US-MF-5 RenderQueue.cpp render-pipe: a worker
+    // QThread renders every frame via tlrender::renderFrameAt and streams
+    // flattened rgb24 to ffmpeg's stdin; ffmpeg encodes libx265 main10
+    // yuv420p10le with the HDR10/HLG colour signalling + master-display /
+    // MaxCLL params, muxing the source audio. Finishes via finishCurrentJob().
+    void startRenderPipeSubprocess(int jobIndex);
     void finishCurrentJob(bool success, const QString &errorMsg);
-    // Build the ffmpeg argv for the rawvideo stdin pipe (video from
-    // renderFrameAt) + the original audio muxed from `audioInputPath`.
-    QStringList buildRenderPipeArgs(const RenderJob &job, int outW, int outH,
-                                    double fps,
-                                    const QString &audioInputPath) const;
-    QStringList buildFFmpegArgs(const RenderJob &job) const;
-    void parseFFmpegOutput(const QString &line);
     int findJobIndex(int id) const;
     int findJobIndexByUuid(const QString &uuid) const;
-    static QString mapCodecToFFmpeg(const QString &codec);
+    static QString mapCodecToEncoderName(const QString &codec);
     static QString defaultContainerFor(const QString &codec);
+    // US-MF-6: locate the ffmpeg.exe binary for the HDR subprocess branch.
+    // Restored verbatim from the pre-US-MF-5 render-pipe.
     static QString findFFmpegBinary();
     // Resolve the Timeline a job renders: the in-memory job.timeline seam if
     // set, otherwise ProjectFile::load(projectFilePath) -> a freshly built
@@ -182,17 +193,22 @@ private:
     static Timeline *resolveTimeline(const RenderJob &job, Timeline **ownedOut);
 
     QVector<RenderJob> m_jobs;
-    QMutex m_processMutex;
-    QProcess *m_process = nullptr;
     int m_nextId = 1;
     int m_currentJobIndex = -1;
     bool m_running = false;
     bool m_paused = false;
-    double m_currentDuration = 0.0;  // total duration in seconds for progress parsing
 
     // S8 render-pipe worker state. m_renderThread runs the synchronous
-    // frame-render + stdin-write loop; m_cancelRequested is the cross-thread
+    // frame-render + in-process encode loop; m_cancelRequested is the cross-thread
     // cancellation flag (mirrors VideoStabilizer::m_cancelled).
     QThread *m_renderThread = nullptr;
     bool m_cancelRequested = false;
+
+    // US-MF-6: ffmpeg.exe subprocess handle for the 10-bit HDR (HDR10/HLG)
+    // render branch. Only the HDR subprocess path sets this; the in-process
+    // FrameEncoder path leaves it null. m_processMutex guards it so
+    // cancelCurrent() / ~RenderQueue() can kill the encoder from the queue
+    // thread while the worker thread owns it.
+    QMutex m_processMutex;
+    QProcess *m_process = nullptr;
 };
