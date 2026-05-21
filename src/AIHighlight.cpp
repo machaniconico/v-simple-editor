@@ -1,20 +1,147 @@
 #include "AIHighlight.h"
 #include "WaveformGenerator.h"
+#include "libavcore/Decode.h"
+#include "libavcore/Encode.h"
+#include <QByteArray>
 #include <QThread>
-#include <QTemporaryFile>
-#include <QProcess>
-#include <QDir>
 #include <cmath>
 #include <algorithm>
+#include <limits>
+#include <memory>
 
 extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libswscale/swscale.h>
 #include <libswresample/swresample.h>
-#include <libavutil/opt.h>
+#include <libavutil/avutil.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/samplefmt.h>
 }
+
+namespace {
+
+struct AvFrameDeleter {
+    void operator()(AVFrame *frame) const
+    {
+        if (frame) av_frame_free(&frame);
+    }
+};
+
+using AvFramePtr = std::unique_ptr<AVFrame, AvFrameDeleter>;
+
+struct SwrContextDeleter {
+    void operator()(SwrContext *ctx) const
+    {
+        if (ctx) swr_free(&ctx);
+    }
+};
+
+using SwrContextPtr = std::unique_ptr<SwrContext, SwrContextDeleter>;
+
+struct ChannelLayoutGuard {
+    AVChannelLayout layout = {};
+
+    ~ChannelLayoutGuard()
+    {
+        av_channel_layout_uninit(&layout);
+    }
+
+    ChannelLayoutGuard() = default;
+    ChannelLayoutGuard(const ChannelLayoutGuard&) = delete;
+    ChannelLayoutGuard& operator=(const ChannelLayoutGuard&) = delete;
+};
+
+static double framePtsSeconds(const AVFrame *frame, AVRational timeBase)
+{
+    if (!frame) return std::numeric_limits<double>::quiet_NaN();
+
+    int64_t pts = frame->best_effort_timestamp;
+    if (pts == AV_NOPTS_VALUE)
+        pts = frame->pts;
+    if (pts == AV_NOPTS_VALUE)
+        return std::numeric_limits<double>::quiet_NaN();
+
+    return static_cast<double>(pts) * av_q2d(timeBase);
+}
+
+static int fpsFromVideoProps(const libavcore::VideoStreamProps &props)
+{
+    double fps = av_q2d(props.frameRate);
+    if (!std::isfinite(fps) || fps <= 0.0)
+        fps = 30.0;
+    return qMax(1, static_cast<int>(std::round(fps)));
+}
+
+static AVSampleFormat firstSupportedAacSampleFormat()
+{
+    const AVCodec *encoder = avcodec_find_encoder(AV_CODEC_ID_AAC);
+    if (!encoder) return AV_SAMPLE_FMT_FLTP;
+
+    const void *cfg = nullptr;
+    int numCfg = 0;
+    const int rc = avcodec_get_supported_config(
+        nullptr, encoder, AV_CODEC_CONFIG_SAMPLE_FORMAT, 0, &cfg, &numCfg);
+    if (rc >= 0 && cfg && numCfg > 0) {
+        const AVSampleFormat *formats =
+            static_cast<const AVSampleFormat*>(cfg);
+        return formats[0];
+    }
+
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable: 4996)
+#endif
+    const AVSampleFormat *legacy = encoder->sample_fmts;
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#elif defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+    if (legacy && legacy[0] != AV_SAMPLE_FMT_NONE)
+        return legacy[0];
+    return AV_SAMPLE_FMT_FLTP;
+}
+
+static bool copyOrDefaultChannelLayout(ChannelLayoutGuard &dst,
+                                       const AVChannelLayout &src,
+                                       int channels)
+{
+    if (src.nb_channels > 0)
+        return av_channel_layout_copy(&dst.layout, &src) >= 0;
+
+    if (channels <= 0) return false;
+    av_channel_layout_default(&dst.layout, channels);
+    return dst.layout.nb_channels > 0;
+}
+
+static bool makeDefaultChannelLayout(ChannelLayoutGuard &dst, int channels)
+{
+    if (channels <= 0) return false;
+    av_channel_layout_default(&dst.layout, channels);
+    return dst.layout.nb_channels > 0;
+}
+
+static QVector<Highlight> chronologicalHighlights(
+    const QVector<Highlight> &highlights)
+{
+    QVector<Highlight> ordered = highlights;
+    std::sort(ordered.begin(), ordered.end(),
+              [](const Highlight &a, const Highlight &b) {
+                  return a.startTime < b.startTime;
+              });
+    return ordered;
+}
+
+} // namespace
 
 // ---------------------------------------------------------------------------
 // Constructor
@@ -523,7 +650,7 @@ QVector<Highlight> AIHighlight::selectTopHighlights(const QVector<Highlight> &al
 }
 
 // ---------------------------------------------------------------------------
-// exportHighlightReel — concatenate highlights via FFmpeg process
+// exportHighlightReel — concatenate highlights via in-process libavcore
 // ---------------------------------------------------------------------------
 
 void AIHighlight::exportHighlightReel(const QString &inputPath, const QString &outputPath,
@@ -535,72 +662,361 @@ void AIHighlight::exportHighlightReel(const QString &inputPath, const QString &o
             return;
         }
 
-        // Create temporary concat filter script
-        // Uses FFmpeg's trim + concat filter for frame-accurate cutting
-        QTemporaryFile concatFile;
-        concatFile.setAutoRemove(true);
-        if (!concatFile.open()) {
-            emit exportComplete(false, "Failed to create temporary file");
-            return;
-        }
+        QString failureMessage;
+        const bool success = [&]() -> bool {
+            libavcore::MediaDecoder decoder;
+            const QByteArray inputUtf8 = inputPath.toUtf8();
+            if (auto err = decoder.open(inputUtf8.constData(), true)) {
+                failureMessage = QString::fromStdString(*err);
+                return false;
+            }
 
-        // Build FFmpeg complex filter for trimming and concatenation
-        // Format: [0:v]trim=start=S:end=E,setpts=PTS-STARTPTS[v0]; ... concat
-        QString filterVideo, filterAudio;
-        QString concatInputsV, concatInputsA;
+            const libavcore::VideoStreamProps videoProps = decoder.videoProps();
+            if (videoProps.width <= 0 || videoProps.height <= 0) {
+                failureMessage = QStringLiteral("invalid input video dimensions");
+                return false;
+            }
 
-        for (int i = 0; i < highlights.size(); ++i) {
-            const auto &h = highlights[i];
-            QString vi = QString("v%1").arg(i);
-            QString ai = QString("a%1").arg(i);
+            libavcore::EncodeRequest request;
+            request.width = videoProps.width;
+            request.height = videoProps.height;
+            request.fps = fpsFromVideoProps(videoProps);
+            request.videoBitrateBits = std::max<int64_t>(
+                4000000,
+                static_cast<int64_t>(request.width)
+                    * static_cast<int64_t>(request.height)
+                    * static_cast<int64_t>(request.fps) / 6);
+            request.outputPath = outputPath.toUtf8().constData();
+            request.videoCodecName = "libx264";
 
-            filterVideo += QString("[0:v]trim=start=%1:end=%2,setpts=PTS-STARTPTS[%3]; ")
-                .arg(h.startTime, 0, 'f', 3)
-                .arg(h.endTime, 0, 'f', 3)
-                .arg(vi);
+            const bool hasAudio = decoder.hasAudio();
+            libavcore::AudioStreamProps audioProps;
+            ChannelLayoutGuard audioInLayout;
+            ChannelLayoutGuard audioOutLayout;
+            AVSampleFormat audioOutSampleFmt = AV_SAMPLE_FMT_NONE;
 
-            filterAudio += QString("[0:a]atrim=start=%1:end=%2,asetpts=PTS-STARTPTS[%3]; ")
-                .arg(h.startTime, 0, 'f', 3)
-                .arg(h.endTime, 0, 'f', 3)
-                .arg(ai);
+            if (hasAudio) {
+                audioProps = decoder.audioProps();
+                if (audioProps.sampleRate <= 0 || audioProps.channels <= 0
+                    || audioProps.sampleFormat == AV_SAMPLE_FMT_NONE) {
+                    failureMessage = QStringLiteral("invalid input audio stream");
+                    return false;
+                }
+                if (!copyOrDefaultChannelLayout(audioInLayout,
+                                                audioProps.channelLayout,
+                                                audioProps.channels)
+                    || !makeDefaultChannelLayout(audioOutLayout,
+                                                audioProps.channels)) {
+                    failureMessage = QStringLiteral("invalid input audio channel layout");
+                    return false;
+                }
 
-            concatInputsV += QString("[%1]").arg(vi);
-            concatInputsA += QString("[%1]").arg(ai);
-        }
+                request.audioEncode = true;
+                request.audioSampleRate = audioProps.sampleRate;
+                request.audioChannels = audioProps.channels;
+                request.audioBitrateBits = 192000;
+                audioOutSampleFmt = firstSupportedAacSampleFormat();
+            }
 
-        int n = highlights.size();
-        QString complexFilter = filterVideo + filterAudio
-            + concatInputsV + concatInputsA
-            + QString("concat=n=%1:v=1:a=1[outv][outa]").arg(n);
+            libavcore::FrameEncoder encoder;
+            if (auto err = encoder.open(request)) {
+                failureMessage = QString::fromStdString(*err);
+                return false;
+            }
 
-        QStringList args;
-        args << "-y"
-             << "-i" << inputPath
-             << "-filter_complex" << complexFilter
-             << "-map" << "[outv]"
-             << "-map" << "[outa]"
-             << "-c:v" << "libx264"
-             << "-preset" << "medium"
-             << "-crf" << "23"
-             << "-c:a" << "aac"
-             << "-b:a" << "192k"
-             << outputPath;
+            AVPixelFormat targetPixFmt = encoder.outputPixelFormat();
 
-        QProcess ffmpeg;
-        ffmpeg.start("ffmpeg", args);
+            AvFramePtr videoOutFrame(av_frame_alloc());
+            if (!videoOutFrame) {
+                failureMessage = QStringLiteral("failed to allocate output video frame");
+                return false;
+            }
+            videoOutFrame->format = targetPixFmt;
+            videoOutFrame->width = request.width;
+            videoOutFrame->height = request.height;
+            if (av_frame_get_buffer(videoOutFrame.get(), 0) < 0) {
+                failureMessage = QStringLiteral("failed to allocate output video buffer");
+                return false;
+            }
 
-        if (!ffmpeg.waitForStarted(5000)) {
-            emit exportComplete(false, "Failed to start ffmpeg");
-            return;
-        }
+            SwsContext *swsCtx = nullptr;
+            SwrContext *swrRaw = nullptr;
+            if (hasAudio) {
+                const int rc = swr_alloc_set_opts2(
+                    &swrRaw,
+                    &audioOutLayout.layout,
+                    audioOutSampleFmt,
+                    request.audioSampleRate,
+                    &audioInLayout.layout,
+                    audioProps.sampleFormat,
+                    audioProps.sampleRate,
+                    0,
+                    nullptr);
+                if (rc < 0 || !swrRaw || swr_init(swrRaw) < 0) {
+                    if (swrRaw) swr_free(&swrRaw);
+                    failureMessage = QStringLiteral("failed to initialize audio resampler");
+                    return false;
+                }
+            }
+            SwrContextPtr swrCtx(swrRaw);
 
-        ffmpeg.waitForFinished(-1); // wait indefinitely
+            int64_t videoPts = 0;
+            int64_t audioPts = 0;
+            bool wroteVideo = false;
+            int swsSrcWidth = 0;
+            int swsSrcHeight = 0;
+            AVPixelFormat swsSrcPixFmt = AV_PIX_FMT_NONE;
+            const QVector<Highlight> orderedHighlights =
+                chronologicalHighlights(highlights);
 
-        bool success = (ffmpeg.exitCode() == 0);
-        QString message = success
+            auto pushVideo = [&](AVFrame *frame) -> bool {
+                AVPixelFormat srcPixFmt =
+                    static_cast<AVPixelFormat>(frame->format);
+                if (srcPixFmt == AV_PIX_FMT_NONE)
+                    srcPixFmt = videoProps.pixelFormat;
+
+                if (!swsCtx
+                    || swsSrcWidth != frame->width
+                    || swsSrcHeight != frame->height
+                    || swsSrcPixFmt != srcPixFmt) {
+                    if (swsCtx) {
+                        sws_freeContext(swsCtx);
+                        swsCtx = nullptr;
+                    }
+                    swsCtx = sws_getContext(frame->width,
+                                            frame->height,
+                                            srcPixFmt,
+                                            request.width,
+                                            request.height,
+                                            targetPixFmt,
+                                            SWS_BILINEAR,
+                                            nullptr,
+                                            nullptr,
+                                            nullptr);
+                    if (!swsCtx) {
+                        failureMessage = QStringLiteral(
+                            "failed to initialize video scaler");
+                        return false;
+                    }
+                    swsSrcWidth = frame->width;
+                    swsSrcHeight = frame->height;
+                    swsSrcPixFmt = srcPixFmt;
+                }
+
+                if (av_frame_make_writable(videoOutFrame.get()) < 0) {
+                    failureMessage = QStringLiteral("failed to prepare output video frame");
+                    return false;
+                }
+
+                sws_scale(swsCtx,
+                          frame->data,
+                          frame->linesize,
+                          0,
+                          frame->height,
+                          videoOutFrame->data,
+                          videoOutFrame->linesize);
+
+                if (!encoder.pushFrameNative(videoOutFrame.get(), videoPts++)) {
+                    failureMessage = QStringLiteral("encoder video frame push failed");
+                    return false;
+                }
+                wroteVideo = true;
+                return true;
+            };
+
+            auto pushAudio = [&](AVFrame *frame) -> bool {
+                if (!swrCtx) return true;
+
+                const int outSamples =
+                    swr_get_out_samples(swrCtx.get(), frame->nb_samples);
+                if (outSamples < 0) {
+                    failureMessage = QStringLiteral("failed to size audio resampler output");
+                    return false;
+                }
+                if (outSamples == 0) return true;
+
+                AvFramePtr audioOutFrame(av_frame_alloc());
+                if (!audioOutFrame) {
+                    failureMessage = QStringLiteral("failed to allocate output audio frame");
+                    return false;
+                }
+                audioOutFrame->format = audioOutSampleFmt;
+                audioOutFrame->sample_rate = request.audioSampleRate;
+                audioOutFrame->nb_samples = outSamples;
+                if (av_channel_layout_copy(&audioOutFrame->ch_layout,
+                                           &audioOutLayout.layout) < 0) {
+                    failureMessage = QStringLiteral("failed to copy output audio layout");
+                    return false;
+                }
+                if (av_frame_get_buffer(audioOutFrame.get(), 0) < 0) {
+                    failureMessage = QStringLiteral("failed to allocate output audio buffer");
+                    return false;
+                }
+
+                const int converted = swr_convert(
+                    swrCtx.get(),
+                    audioOutFrame->extended_data,
+                    outSamples,
+                    const_cast<const uint8_t**>(frame->extended_data),
+                    frame->nb_samples);
+                if (converted < 0) {
+                    failureMessage = QStringLiteral("audio resample failed");
+                    return false;
+                }
+                if (converted == 0) return true;
+
+                audioOutFrame->nb_samples = converted;
+                if (!encoder.pushAudioFrame(audioOutFrame.get(), audioPts)) {
+                    failureMessage = QStringLiteral("encoder audio frame push failed");
+                    return false;
+                }
+                audioPts += converted;
+                return true;
+            };
+
+            auto flushAudio = [&]() -> bool {
+                if (!swrCtx) return true;
+
+                while (true) {
+                    const int outSamples = swr_get_out_samples(swrCtx.get(), 0);
+                    if (outSamples < 0) {
+                        failureMessage = QStringLiteral(
+                            "failed to size audio resampler flush");
+                        return false;
+                    }
+                    if (outSamples == 0) return true;
+
+                    AvFramePtr audioOutFrame(av_frame_alloc());
+                    if (!audioOutFrame) {
+                        failureMessage = QStringLiteral(
+                            "failed to allocate audio flush frame");
+                        return false;
+                    }
+                    audioOutFrame->format = audioOutSampleFmt;
+                    audioOutFrame->sample_rate = request.audioSampleRate;
+                    audioOutFrame->nb_samples = outSamples;
+                    if (av_channel_layout_copy(&audioOutFrame->ch_layout,
+                                               &audioOutLayout.layout) < 0) {
+                        failureMessage = QStringLiteral(
+                            "failed to copy output audio layout");
+                        return false;
+                    }
+                    if (av_frame_get_buffer(audioOutFrame.get(), 0) < 0) {
+                        failureMessage = QStringLiteral(
+                            "failed to allocate audio flush buffer");
+                        return false;
+                    }
+
+                    const int converted = swr_convert(
+                        swrCtx.get(),
+                        audioOutFrame->extended_data,
+                        outSamples,
+                        nullptr,
+                        0);
+                    if (converted < 0) {
+                        failureMessage = QStringLiteral("audio resampler flush failed");
+                        return false;
+                    }
+                    if (converted == 0) return true;
+
+                    audioOutFrame->nb_samples = converted;
+                    if (!encoder.pushAudioFrame(audioOutFrame.get(), audioPts)) {
+                        failureMessage = QStringLiteral(
+                            "encoder audio frame push failed");
+                        return false;
+                    }
+                    audioPts += converted;
+                }
+            };
+
+            for (const Highlight &highlight : orderedHighlights) {
+                if (!std::isfinite(highlight.startTime)
+                    || !std::isfinite(highlight.endTime)
+                    || highlight.endTime <= highlight.startTime) {
+                    continue;
+                }
+
+                if (auto err = decoder.seek(highlight.startTime)) {
+                    failureMessage = QString::fromStdString(*err);
+                    if (swsCtx) sws_freeContext(swsCtx);
+                    return false;
+                }
+
+                bool videoDone = false;
+                bool audioDone = !hasAudio;
+                while (!videoDone || !audioDone) {
+                    bool advanced = false;
+
+                    if (!videoDone) {
+                        AVFrame *frame = decoder.nextVideoFrame();
+                        if (!frame) {
+                            videoDone = true;
+                        } else {
+                            advanced = true;
+                            const double pts =
+                                framePtsSeconds(frame, videoProps.timeBase);
+                            if (std::isfinite(pts)) {
+                                if (pts >= highlight.endTime) {
+                                    videoDone = true;
+                                } else if (pts >= highlight.startTime) {
+                                    if (!pushVideo(frame)) {
+                                        if (swsCtx) sws_freeContext(swsCtx);
+                                        return false;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (!audioDone) {
+                        AVFrame *frame = decoder.nextAudioFrame();
+                        if (!frame) {
+                            audioDone = true;
+                        } else {
+                            advanced = true;
+                            const double pts =
+                                framePtsSeconds(frame, audioProps.timeBase);
+                            if (std::isfinite(pts)) {
+                                if (pts >= highlight.endTime) {
+                                    audioDone = true;
+                                } else if (pts >= highlight.startTime) {
+                                    if (!pushAudio(frame)) {
+                                        if (swsCtx) sws_freeContext(swsCtx);
+                                        return false;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (!advanced) break;
+                }
+            }
+
+            if (swsCtx) {
+                sws_freeContext(swsCtx);
+                swsCtx = nullptr;
+            }
+
+            if (!wroteVideo) {
+                failureMessage = QStringLiteral(
+                    "no video frames matched highlight ranges");
+                return false;
+            }
+
+            if (!flushAudio())
+                return false;
+
+            if (auto err = encoder.finalize()) {
+                failureMessage = QString::fromStdString(*err);
+                return false;
+            }
+            return true;
+        }();
+
+        const QString message = success
             ? QString("Highlight reel exported: %1").arg(outputPath)
-            : QString("Export failed: %1").arg(QString::fromUtf8(ffmpeg.readAllStandardError()));
-
+            : QString("Export failed: %1").arg(failureMessage);
         emit exportComplete(success, message);
     });
     connect(thread, &QThread::finished, thread, &QThread::deleteLater);

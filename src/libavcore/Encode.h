@@ -21,6 +21,7 @@
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
+#include <libavutil/audio_fifo.h>
 #include <libavutil/pixfmt.h>
 #include <libavutil/rational.h>
 #include <libswscale/swscale.h>
@@ -42,6 +43,12 @@ struct EncodeRequest {
     int64_t videoBitrateBits = 0;       // Video bitrate in bits per second (caller multiplies kbps×1000)
     std::string outputPath;             // UTF-8
     std::string audioSourcePath;        // Optional UTF-8 source for stream-copy audio muxing
+    // Re-encode caller-pushed audio frames as AAC. Takes priority over
+    // audioSourcePath passthrough when both are set.
+    bool audioEncode = false;
+    int audioSampleRate = 48000;
+    int audioChannels = 2;
+    int64_t audioBitrateBits = 192000;
 
     // Preferred video encoder name. If an H.264/H.265 encoder is unavailable
     // or fails to open, FrameEncoder walks its ordered fallback chain.
@@ -111,6 +118,13 @@ public:
     // outFrame in the encoder's pixel format.
     bool pushFrameNative(AVFrame* frame, int64_t pts);
 
+    // Push one audio frame for AAC encode mode. Valid only when
+    // EncodeRequest::audioEncode is true. The caller must provide frames that
+    // already match the encoder sample_fmt, sample_rate, and ch_layout
+    // selected from audioSampleRate/audioChannels (perform swresample outside
+    // FrameEncoder). pts is in audio encoder time_base units (1/sample_rate).
+    bool pushAudioFrame(AVFrame* frame, int64_t pts);
+
     // Flush remaining packets and write trailer. Safe to call once.
     // Returns std::nullopt on success or an error message on failure.
     std::optional<std::string> finalize();
@@ -136,6 +150,11 @@ private:
                                   AVDictionary** outOpts);
     bool configureAudioPassthrough(const std::string& audioSourcePath);
     void muxAudioPassthroughPackets();
+    bool configureAudioEncoder(const EncodeRequest& request);
+    bool encodeAudioFifoSamples(int nbSamples);
+    bool sendAudioEncoderFrame(AVFrame* frame);
+    bool drainAudioEncoderPackets();
+    bool flushAudioEncoder();
 
     // Attach HDR10 mastering-display + content-light side data to `frame`
     // (no-op unless m_attachHdr10Metadata is set). Idempotent per frame.
@@ -144,14 +163,20 @@ private:
     AVFormatContext* m_outFmt = nullptr;
     AVFormatContext* m_audioInFmt = nullptr;
     AVCodecContext* m_encCtx = nullptr;
+    AVCodecContext* m_audioEncCtx = nullptr;
     AVStream* m_outStream = nullptr;
     AVStream* m_audioInStream = nullptr;
     AVStream* m_audioOutStream = nullptr;
+    AVAudioFifo* m_audioFifo = nullptr;
     SwsContext* m_rgbToYuvCtx = nullptr;   // used by pushFrameRgb24
     AVFrame* m_scratchFrame = nullptr;     // pre-allocated YUV frame for RGB path
+    AVFrame* m_audioScratchFrame = nullptr;
     AVPixelFormat m_pixFmt = AV_PIX_FMT_YUV420P;
     int m_audioInStreamIndex = -1;
     int m_fps = 30;                        // captured from EncodeRequest::fps in open()
+    int64_t m_audioNextPts = 0;
+    bool m_audioPtsInitialized = false;
+    bool m_audioEncode = false;
 
     // HDR10 static metadata captured in open(). When m_attachHdr10Metadata is
     // true (HDR10 export through a non-libx265 encoder, e.g. hevc_mf), every

@@ -32,6 +32,7 @@
 #include <QRect>
 #include <cmath>
 #include <algorithm>
+#include <functional>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -351,6 +352,7 @@
 // US-MF-4: in-process libavcore encoder regression gate. Drives
 // libavcore::FrameEncoder directly (no QProcess/ffmpeg subprocess) so a
 // missing codec (the libx264 blocker) is caught by VEDITOR_LIBAVCORE_ENCODE_SELFTEST.
+#include "libavcore/Decode.h"
 #include "libavcore/Encode.h"
 #include "libavcore/Probe.h"
 // PRD-B-MF: PARITY S10 Path A round-trip uses the same CodecDetector::
@@ -358,6 +360,12 @@
 // (RenderQueue.cpp:602-604) so the FrameEncoder fallback chain resolves the
 // identical concrete encoder on both compared paths.
 #include "CodecDetector.h"
+
+extern "C" {
+#include <libavutil/error.h>
+#include <libavutil/rational.h>
+#include <libswresample/swresample.h>
+}
 
 // ──────────────────────────────────────────────────────────────────────────
 // Lightweight file-backed logger + unhandled-exception reporter.
@@ -4945,38 +4953,376 @@ int runTrackMatteRm5ReorderSelftest()
     return 0;
 }
 
-// US-MF-4: in-process libavcore encoder regression gate
-// (VEDITOR_LIBAVCORE_ENCODE_SELFTEST=1).
-//
-// PRD-B's costliest lesson: a missing codec (libx264 absent from the Windows
-// libav DLLs) stayed hidden until the very end of the campaign because NO
-// selftest drove libavcore::FrameEncoder. This selftest closes that gap as a
-// permanent regression gate. It is fully in-process — NO QProcess / ffmpeg
-// subprocess — and exercises the libavcore::FrameEncoder open / push / finalize
-// / probe pipeline end-to-end:
-//   (1) build a small EncodeRequest (320x240 / 30fps) requesting the "mpeg4"
-//       codec — a native, always-available libav encoder.
-//   (2) FrameEncoder::open() — std::nullopt asserted. open() failure FAILs the
-//       selftest with the error string (this is the gate that catches a
-//       missing-codec blocker).
-//   (3) ~30 synthetic RGB24 gradient frames pushed via pushFrameRgb24.
-//   (4) finalize() — success asserted.
-//   (5) re-probe the artifact with libavcore::Probe — probeVideoCodecName must
-//       report a real video codec and probeDurationMicroseconds a positive
-//       duration.
-//   (6) activeEncoderName() logged so the encoder that actually ran is visible.
-//   (7) temp file removed; returns 0 on PASS, non-0 on FAIL.
-//
-// Why mpeg4 and NOT libx264/h264_mf: requesting libx264 makes
-// openEncoderWithFallback walk its fallback chain into h264_mf (Windows Media
-// Foundation H.264). h264_mf's avcodec_open2 needs an MTA COM apartment, but
-// this Qt process's threads inherit the GUI thread's STA apartment, so that
-// MF-open fails and its failure pollutes the process exit code. Requesting the
-// native "mpeg4" encoder directly means openEncoderWithFallback opens mpeg4
-// straight away and never touches h264_mf — so the FrameEncoder open->push->
-// finalize->probe pipeline runs deterministically and the process exits 0.
-// This gate validates that pipeline with mpeg4; the production H.264 export
-// path (which DOES use h264_mf) is exercised separately by PARITY S8.
+static QString libavcoreSelftestAvError(int err)
+{
+    char buf[AV_ERROR_MAX_STRING_SIZE] = {};
+    if (av_strerror(err, buf, sizeof(buf)) < 0)
+        return QString::number(err);
+    return QString::fromUtf8(buf);
+}
+
+static bool libavcoreSelftestFail(QString *error, const QString &message)
+{
+    if (error)
+        *error = message;
+    return false;
+}
+
+static bool libavcoreSelftestIsH264Family(const std::string &name)
+{
+    const QString lower = QString::fromStdString(name).toLower();
+    return lower.contains(QStringLiteral("h264"))
+        || lower.contains(QStringLiteral("x264"))
+        || lower.contains(QStringLiteral("264"));
+}
+
+static void runLibavcoreSelftestWorker(const std::function<void()> &fn)
+{
+    QThread *thread = QThread::create([fn]() { fn(); });
+    thread->start();
+    thread->wait();
+    delete thread;
+}
+
+static void fillLibavcoreSelftestRgb24(QByteArray &frameBuf,
+                                       int width,
+                                       int height,
+                                       int stride,
+                                       int frameIndex)
+{
+    for (int y = 0; y < height; ++y) {
+        uint8_t *row = reinterpret_cast<uint8_t*>(frameBuf.data())
+                       + static_cast<qsizetype>(y) * stride;
+        for (int x = 0; x < width; ++x) {
+            uint8_t *px = row + static_cast<qsizetype>(x) * 3;
+            px[0] = static_cast<uint8_t>((x + frameIndex * 4) & 0xFF);
+            px[1] = static_cast<uint8_t>((y + frameIndex * 2) & 0xFF);
+            px[2] = static_cast<uint8_t>((x + y + frameIndex) & 0xFF);
+        }
+    }
+}
+
+static bool pushLibavcoreSelftestAacSine(libavcore::FrameEncoder &enc,
+                                         int sampleRate,
+                                         int channels,
+                                         int totalSamples,
+                                         QString *error)
+{
+    AVChannelLayout layout = {};
+    av_channel_layout_default(&layout, channels);
+
+    SwrContext *swr = nullptr;
+    int rc = swr_alloc_set_opts2(&swr,
+                                 &layout, AV_SAMPLE_FMT_FLTP, sampleRate,
+                                 &layout, AV_SAMPLE_FMT_S16, sampleRate,
+                                 0, nullptr);
+    if (rc < 0 || !swr) {
+        av_channel_layout_uninit(&layout);
+        return libavcoreSelftestFail(
+            error,
+            QStringLiteral("swr_alloc_set_opts2 failed: %1")
+                .arg(libavcoreSelftestAvError(rc)));
+    }
+    rc = swr_init(swr);
+    if (rc < 0) {
+        swr_free(&swr);
+        av_channel_layout_uninit(&layout);
+        return libavcoreSelftestFail(
+            error,
+            QStringLiteral("swr_init failed: %1")
+                .arg(libavcoreSelftestAvError(rc)));
+    }
+
+    constexpr int kChunkSamples = 1024;
+    constexpr double kToneHz = 440.0;
+    double phase = 0.0;
+    const double phaseStep =
+        (2.0 * M_PI * kToneHz) / static_cast<double>(sampleRate);
+    int64_t audioPts = 0;
+
+    for (int offset = 0; offset < totalSamples; offset += kChunkSamples) {
+        const int chunk = qMin(kChunkSamples, totalSamples - offset);
+        QByteArray pcm(static_cast<qsizetype>(chunk) * channels
+                           * static_cast<int>(sizeof(int16_t)),
+                       Qt::Uninitialized);
+        int16_t *pcmSamples = reinterpret_cast<int16_t*>(pcm.data());
+        for (int i = 0; i < chunk; ++i) {
+            const int16_t v = static_cast<int16_t>(
+                std::sin(phase) * 12000.0);
+            phase += phaseStep;
+            if (phase >= 2.0 * M_PI)
+                phase -= 2.0 * M_PI;
+            for (int c = 0; c < channels; ++c)
+                pcmSamples[i * channels + c] = v;
+        }
+
+        AVFrame *audioFrame = av_frame_alloc();
+        if (!audioFrame) {
+            swr_free(&swr);
+            av_channel_layout_uninit(&layout);
+            return libavcoreSelftestFail(
+                error, QStringLiteral("failed to allocate audio frame"));
+        }
+        audioFrame->nb_samples = chunk;
+        audioFrame->format = AV_SAMPLE_FMT_FLTP;
+        audioFrame->sample_rate = sampleRate;
+        rc = av_channel_layout_copy(&audioFrame->ch_layout, &layout);
+        if (rc < 0) {
+            av_frame_free(&audioFrame);
+            swr_free(&swr);
+            av_channel_layout_uninit(&layout);
+            return libavcoreSelftestFail(
+                error,
+                QStringLiteral("audio channel-layout copy failed: %1")
+                    .arg(libavcoreSelftestAvError(rc)));
+        }
+        rc = av_frame_get_buffer(audioFrame, 0);
+        if (rc < 0) {
+            av_frame_free(&audioFrame);
+            swr_free(&swr);
+            av_channel_layout_uninit(&layout);
+            return libavcoreSelftestFail(
+                error,
+                QStringLiteral("audio frame buffer allocation failed: %1")
+                    .arg(libavcoreSelftestAvError(rc)));
+        }
+
+        const uint8_t *srcData[1] = {
+            reinterpret_cast<const uint8_t*>(pcm.constData())
+        };
+        rc = swr_convert(swr, audioFrame->data, chunk, srcData, chunk);
+        if (rc <= 0) {
+            const QString msg =
+                QStringLiteral("swr_convert returned %1").arg(rc);
+            av_frame_free(&audioFrame);
+            swr_free(&swr);
+            av_channel_layout_uninit(&layout);
+            return libavcoreSelftestFail(error, msg);
+        }
+        audioFrame->nb_samples = rc;
+
+        const bool pushed = enc.pushAudioFrame(audioFrame, audioPts);
+        audioPts += rc;
+        av_frame_free(&audioFrame);
+        if (!pushed) {
+            swr_free(&swr);
+            av_channel_layout_uninit(&layout);
+            return libavcoreSelftestFail(
+                error, QStringLiteral("pushAudioFrame returned false"));
+        }
+    }
+
+    swr_free(&swr);
+    av_channel_layout_uninit(&layout);
+    return true;
+}
+
+static bool encodeLibavcoreSelftestClip(const QString &outPath,
+                                        int width,
+                                        int height,
+                                        int fps,
+                                        int frameCount,
+                                        bool encodeAudio,
+                                        std::string *activeEncoder,
+                                        QString *error)
+{
+    QFile::remove(outPath);
+
+    libavcore::EncodeRequest req;
+    req.width = width;
+    req.height = height;
+    req.fps = fps;
+    req.videoBitrateBits = 2000000;
+    req.videoCodecName = "libx264";
+    req.outputPath = outPath.toStdString();
+    req.encoderAvailableHook = [](const std::string &name) {
+        return CodecDetector::isEncoderAvailable(QString::fromStdString(name));
+    };
+    if (encodeAudio) {
+        req.audioEncode = true;
+        req.audioSampleRate = 48000;
+        req.audioChannels = 2;
+        req.audioBitrateBits = 128000;
+    }
+
+    libavcore::FrameEncoder enc;
+    const std::optional<std::string> openErr = enc.open(req);
+    if (openErr.has_value()) {
+        return libavcoreSelftestFail(
+            error,
+            QStringLiteral("FrameEncoder::open() returned error: %1")
+                .arg(QString::fromStdString(*openErr)));
+    }
+    if (!enc.isOpen()) {
+        return libavcoreSelftestFail(
+            error,
+            QStringLiteral("open() reported success but isOpen() is false"));
+    }
+
+    const int stride = width * 3;
+    QByteArray frameBuf(static_cast<qsizetype>(stride) * height,
+                        Qt::Uninitialized);
+    for (int f = 0; f < frameCount; ++f) {
+        fillLibavcoreSelftestRgb24(frameBuf, width, height, stride, f);
+        if (!enc.pushFrameRgb24(
+                reinterpret_cast<const uint8_t*>(frameBuf.constData()),
+                stride, f)) {
+            return libavcoreSelftestFail(
+                error,
+                QStringLiteral("pushFrameRgb24 returned false for frame %1")
+                    .arg(f));
+        }
+    }
+
+    if (encodeAudio) {
+        const int totalSamples =
+            (req.audioSampleRate * frameCount + fps - 1) / fps;
+        if (!pushLibavcoreSelftestAacSine(enc,
+                                          req.audioSampleRate,
+                                          req.audioChannels,
+                                          totalSamples,
+                                          error)) {
+            return false;
+        }
+    }
+
+    const std::optional<std::string> finalizeErr = enc.finalize();
+    if (finalizeErr.has_value()) {
+        return libavcoreSelftestFail(
+            error,
+            QStringLiteral("finalize() returned error: %1")
+                .arg(QString::fromStdString(*finalizeErr)));
+    }
+
+    if (activeEncoder)
+        *activeEncoder = enc.activeEncoderName();
+    return true;
+}
+
+static std::optional<double> libavcoreSelftestFramePtsSeconds(const AVFrame *frame,
+                                                             AVRational timeBase)
+{
+    if (!frame || timeBase.num <= 0 || timeBase.den <= 0)
+        return std::nullopt;
+    int64_t pts = frame->best_effort_timestamp;
+    if (pts == AV_NOPTS_VALUE)
+        pts = frame->pts;
+    if (pts == AV_NOPTS_VALUE)
+        return std::nullopt;
+    return static_cast<double>(pts) * av_q2d(timeBase);
+}
+
+static bool transcodeLibavcoreSelftestRoundTrip(const QString &inputPath,
+                                                const QString &outPath,
+                                                int outWidth,
+                                                int outHeight,
+                                                int fps,
+                                                std::string *activeEncoder,
+                                                int *pushedFrames,
+                                                QString *error)
+{
+    QFile::remove(outPath);
+
+    libavcore::MediaDecoder dec;
+    const std::optional<std::string> openErr =
+        dec.open(inputPath.toStdString(), false);
+    if (openErr.has_value()) {
+        return libavcoreSelftestFail(
+            error,
+            QStringLiteral("MediaDecoder::open(roundtrip input) failed: %1")
+                .arg(QString::fromStdString(*openErr)));
+    }
+
+    const libavcore::VideoStreamProps props = dec.videoProps();
+    SwsContext *sws = sws_getContext(props.width,
+                                     props.height,
+                                     props.pixelFormat,
+                                     outWidth,
+                                     outHeight,
+                                     AV_PIX_FMT_RGB24,
+                                     SWS_BILINEAR,
+                                     nullptr,
+                                     nullptr,
+                                     nullptr);
+    if (!sws) {
+        return libavcoreSelftestFail(
+            error,
+            QStringLiteral("sws_getContext failed for roundtrip scale"));
+    }
+
+    auto fail = [&](const QString &message) {
+        sws_freeContext(sws);
+        return libavcoreSelftestFail(error, message);
+    };
+
+    libavcore::EncodeRequest req;
+    req.width = outWidth;
+    req.height = outHeight;
+    req.fps = fps;
+    req.videoBitrateBits = 1200000;
+    req.videoCodecName = "libx264";
+    req.outputPath = outPath.toStdString();
+    req.encoderAvailableHook = [](const std::string &name) {
+        return CodecDetector::isEncoderAvailable(QString::fromStdString(name));
+    };
+
+    libavcore::FrameEncoder enc;
+    const std::optional<std::string> encOpenErr = enc.open(req);
+    if (encOpenErr.has_value()) {
+        return fail(QStringLiteral("roundtrip FrameEncoder::open() failed: %1")
+                        .arg(QString::fromStdString(*encOpenErr)));
+    }
+
+    const int stride = outWidth * 3;
+    QByteArray scaled(static_cast<qsizetype>(stride) * outHeight,
+                      Qt::Uninitialized);
+    int frameIndex = 0;
+    while (AVFrame *frame = dec.nextVideoFrame()) {
+        uint8_t *dstData[1] = {
+            reinterpret_cast<uint8_t*>(scaled.data())
+        };
+        int dstLinesize[1] = { stride };
+        const int scaledRows = sws_scale(sws,
+                                         frame->data,
+                                         frame->linesize,
+                                         0,
+                                         props.height,
+                                         dstData,
+                                         dstLinesize);
+        if (scaledRows != outHeight) {
+            return fail(QStringLiteral("sws_scale produced %1/%2 rows")
+                            .arg(scaledRows)
+                            .arg(outHeight));
+        }
+        if (!enc.pushFrameRgb24(
+                reinterpret_cast<const uint8_t*>(scaled.constData()),
+                stride,
+                frameIndex)) {
+            return fail(QStringLiteral("roundtrip pushFrameRgb24 failed at "
+                                       "frame %1").arg(frameIndex));
+        }
+        ++frameIndex;
+    }
+    if (frameIndex <= 0)
+        return fail(QStringLiteral("roundtrip decoded no video frames"));
+
+    const std::optional<std::string> finalizeErr = enc.finalize();
+    if (finalizeErr.has_value()) {
+        return fail(QStringLiteral("roundtrip finalize() failed: %1")
+                        .arg(QString::fromStdString(*finalizeErr)));
+    }
+
+    if (activeEncoder)
+        *activeEncoder = enc.activeEncoderName();
+    if (pushedFrames)
+        *pushedFrames = frameIndex;
+    sws_freeContext(sws);
+    return true;
+}
+
+// US-MF-4 / US-B2-8: in-process libavcore encoder regression gate
+// (VEDITOR_LIBAVCORE_ENCODE_SELFTEST=1). This must resolve to an H.264-family
+// encoder (libx264/h264_mf/etc.); an mpeg4 fallback is a regression.
 int runLibavcoreEncodeSelftest()
 {
     qInfo() << "[INFO] LIBAVCORE-ENCODE selftest: in-process FrameEncoder gate";
@@ -4993,70 +5339,34 @@ int runLibavcoreEncodeSelftest()
     }
     const QString outPath = tmpDir.filePath(QStringLiteral("libavcore_encode_selftest.mp4"));
 
-    // (1) Build the encode request. videoCodecName="mpeg4" selects a native,
-    //     always-available libav encoder so openEncoderWithFallback opens it
-    //     directly and never reaches h264_mf (whose STA-COM avcodec_open2
-    //     failure would pollute the process exit code on this Qt build).
-    libavcore::EncodeRequest req;
-    req.width = kWidth;
-    req.height = kHeight;
-    req.fps = kFps;
-    req.videoBitrateBits = 2000000;   // 2 Mbps
-    req.videoCodecName = "mpeg4";
-    req.outputPath = outPath.toStdString();
-
-    // (2) Open the encoder — open() returning a non-nullopt error string is the
-    //     codec-availability blocker this gate exists to catch.
-    libavcore::FrameEncoder enc;
-    const std::optional<std::string> openErr = enc.open(req);
-    if (openErr.has_value()) {
-        qCritical() << "LIBAVCORE-ENCODE selftest FAILED: FrameEncoder::open()"
-                    << "returned error:" << QString::fromStdString(*openErr);
-        return 1;
-    }
-    if (!enc.isOpen()) {
-        qCritical() << "LIBAVCORE-ENCODE selftest FAILED: open() reported success"
-                    << "but isOpen() is false";
+    bool encodeOk = false;
+    QString encodeError;
+    std::string activeEnc;
+    runLibavcoreSelftestWorker([&]() {
+        encodeOk = encodeLibavcoreSelftestClip(outPath,
+                                               kWidth,
+                                               kHeight,
+                                               kFps,
+                                               kFrameCount,
+                                               false,
+                                               &activeEnc,
+                                               &encodeError);
+    });
+    if (!encodeOk) {
+        qCritical() << "LIBAVCORE-ENCODE selftest FAILED:" << encodeError;
+        QFile::remove(outPath);
         return 1;
     }
 
-    // (3) Push synthetic RGB24 gradient frames. stride = width*3 (packed RGB24,
-    //     no row padding); pts runs 0..frameCount-1 in 1/fps units.
-    const int stride = kWidth * 3;
-    QByteArray frameBuf(stride * kHeight, Qt::Uninitialized);
-    for (int f = 0; f < kFrameCount; ++f) {
-        for (int y = 0; y < kHeight; ++y) {
-            uint8_t* row = reinterpret_cast<uint8_t*>(frameBuf.data())
-                           + static_cast<qsizetype>(y) * stride;
-            for (int x = 0; x < kWidth; ++x) {
-                uint8_t* px = row + static_cast<qsizetype>(x) * 3;
-                // Animated colour ramp so consecutive frames differ.
-                px[0] = static_cast<uint8_t>((x + f * 4) & 0xFF);   // R
-                px[1] = static_cast<uint8_t>((y + f * 2) & 0xFF);   // G
-                px[2] = static_cast<uint8_t>((x + y + f) & 0xFF);   // B
-            }
-        }
-        if (!enc.pushFrameRgb24(reinterpret_cast<const uint8_t*>(frameBuf.constData()),
-                                stride, f)) {
-            qCritical() << "LIBAVCORE-ENCODE selftest FAILED: pushFrameRgb24"
-                        << "returned false for frame" << f;
-            return 1;
-        }
-    }
-
-    // (4) Flush + write trailer.
-    const std::optional<std::string> finalizeErr = enc.finalize();
-    if (finalizeErr.has_value()) {
-        qCritical() << "LIBAVCORE-ENCODE selftest FAILED: finalize() returned"
-                    << "error:" << QString::fromStdString(*finalizeErr);
-        return 1;
-    }
-
-    // (6) Report which encoder actually ran (mpeg4, since it is requested
-    //     directly and openEncoderWithFallback opens it without fallback).
-    const std::string activeEnc = enc.activeEncoderName();
     qInfo() << "[INFO] LIBAVCORE-ENCODE selftest: activeEncoderName ="
             << QString::fromStdString(activeEnc);
+    if (!libavcoreSelftestIsH264Family(activeEnc)) {
+        qCritical() << "LIBAVCORE-ENCODE selftest FAILED: expected an H.264"
+                    << "encoder, got" << QString::fromStdString(activeEnc)
+                    << "(mpeg4 fallback is not accepted)";
+        QFile::remove(outPath);
+        return 1;
+    }
 
     if (!QFile::exists(outPath)) {
         qCritical() << "LIBAVCORE-ENCODE selftest FAILED: encoder produced no"
@@ -5095,6 +5405,194 @@ int runLibavcoreEncodeSelftest()
     qInfo() << "[INFO] LIBAVCORE-ENCODE selftest PASSED: encoder ="
             << QString::fromStdString(activeEnc) << "codec ="
             << QString::fromStdString(*codecName);
+    return 0;
+}
+
+// US-B2-8: in-process decode + AAC encode regression gate
+// (VEDITOR_LIBAVCORE_DECODE_SELFTEST=1). Generates a video+AAC MP4 with
+// FrameEncoder, decodes it with MediaDecoder, validates seek, then performs a
+// decode->swscale->FrameEncoder proxy-style round trip and independently
+// re-probes the result.
+int runLibavcoreDecodeSelftest()
+{
+    qInfo() << "[INFO] LIBAVCORE-DECODE selftest: in-process decode gate";
+
+    constexpr int kWidth = 320;
+    constexpr int kHeight = 240;
+    constexpr int kFps = 30;
+    constexpr int kFrameCount = 30;
+    constexpr int kScaledWidth = 160;
+    constexpr int kScaledHeight = 120;
+
+    QTemporaryDir tmpDir;
+    if (!tmpDir.isValid()) {
+        qCritical() << "LIBAVCORE-DECODE selftest FAILED: could not create temp dir";
+        return 1;
+    }
+    const QString inputPath =
+        tmpDir.filePath(QStringLiteral("libavcore_decode_input.mp4"));
+    const QString roundTripPath =
+        tmpDir.filePath(QStringLiteral("libavcore_decode_roundtrip.mp4"));
+
+    auto fail = [&](const QString &message) {
+        qCritical() << "LIBAVCORE-DECODE selftest FAILED:" << message;
+        QFile::remove(inputPath);
+        QFile::remove(roundTripPath);
+        return 1;
+    };
+
+    bool encodeOk = false;
+    QString encodeError;
+    std::string inputEncoder;
+    runLibavcoreSelftestWorker([&]() {
+        encodeOk = encodeLibavcoreSelftestClip(inputPath,
+                                               kWidth,
+                                               kHeight,
+                                               kFps,
+                                               kFrameCount,
+                                               true,
+                                               &inputEncoder,
+                                               &encodeError);
+    });
+    if (!encodeOk)
+        return fail(QStringLiteral("input clip encode failed: %1")
+                        .arg(encodeError));
+    qInfo() << "[INFO] LIBAVCORE-DECODE selftest: input activeEncoderName ="
+            << QString::fromStdString(inputEncoder);
+    if (!libavcoreSelftestIsH264Family(inputEncoder)) {
+        return fail(QStringLiteral("expected H.264 encoder for input clip, got "
+                                   "%1 (mpeg4 fallback is not accepted)")
+                        .arg(QString::fromStdString(inputEncoder)));
+    }
+
+    int decodedVideoFrames = 0;
+    {
+        libavcore::MediaDecoder dec;
+        const std::optional<std::string> openErr =
+            dec.open(inputPath.toStdString(), true);
+        if (openErr.has_value()) {
+            return fail(QStringLiteral("MediaDecoder::open() failed: %1")
+                            .arg(QString::fromStdString(*openErr)));
+        }
+        if (!dec.hasVideo())
+            return fail(QStringLiteral("MediaDecoder reported no video stream"));
+        if (!dec.hasAudio())
+            return fail(QStringLiteral("MediaDecoder reported no audio stream"));
+
+        const libavcore::VideoStreamProps videoProps = dec.videoProps();
+        if (videoProps.width != kWidth || videoProps.height != kHeight) {
+            return fail(QStringLiteral("decoded dimensions were %1x%2, expected "
+                                       "%3x%4")
+                            .arg(videoProps.width)
+                            .arg(videoProps.height)
+                            .arg(kWidth)
+                            .arg(kHeight));
+        }
+
+        const libavcore::AudioStreamProps audioProps = dec.audioProps();
+        if (audioProps.sampleRate <= 0) {
+            return fail(QStringLiteral("decoded audio sampleRate was not positive "
+                                       "(got %1)")
+                            .arg(audioProps.sampleRate));
+        }
+
+        while (dec.nextVideoFrame())
+            ++decodedVideoFrames;
+        if (qAbs(decodedVideoFrames - kFrameCount) > 2) {
+            return fail(QStringLiteral("decoded %1 video frames, expected about %2")
+                            .arg(decodedVideoFrames)
+                            .arg(kFrameCount));
+        }
+
+        AVFrame *audioFrame = dec.nextAudioFrame();
+        if (!audioFrame) {
+            return fail(QStringLiteral("nextAudioFrame() returned no AAC frame"));
+        }
+        qInfo() << "[INFO] LIBAVCORE-DECODE selftest: decoded frames ="
+                << decodedVideoFrames << "audio sampleRate ="
+                << audioProps.sampleRate;
+
+        constexpr double kSeekTargetSeconds = 0.5;
+        constexpr double kSeekToleranceSeconds = 0.25;
+        const std::optional<std::string> seekErr = dec.seek(kSeekTargetSeconds);
+        if (seekErr.has_value()) {
+            return fail(QStringLiteral("MediaDecoder::seek() failed: %1")
+                            .arg(QString::fromStdString(*seekErr)));
+        }
+        AVFrame *seekFrame = dec.nextVideoFrame();
+        if (!seekFrame)
+            return fail(QStringLiteral("nextVideoFrame() after seek returned null"));
+        const std::optional<double> seekPts =
+            libavcoreSelftestFramePtsSeconds(seekFrame, dec.videoProps().timeBase);
+        if (!seekPts.has_value()) {
+            return fail(QStringLiteral("seek frame had no usable PTS"));
+        }
+        if (*seekPts < -kSeekToleranceSeconds
+            || *seekPts > kSeekTargetSeconds + kSeekToleranceSeconds) {
+            return fail(QStringLiteral("seek frame pts %1 was not near target %2")
+                            .arg(*seekPts, 0, 'f', 6)
+                            .arg(kSeekTargetSeconds, 0, 'f', 6));
+        }
+        qInfo() << "[INFO] LIBAVCORE-DECODE selftest: seek target/pts ="
+                << kSeekTargetSeconds << "/" << *seekPts;
+    }
+
+    bool roundTripOk = false;
+    QString roundTripError;
+    std::string roundTripEncoder;
+    int roundTripFrames = 0;
+    runLibavcoreSelftestWorker([&]() {
+        roundTripOk = transcodeLibavcoreSelftestRoundTrip(inputPath,
+                                                          roundTripPath,
+                                                          kScaledWidth,
+                                                          kScaledHeight,
+                                                          kFps,
+                                                          &roundTripEncoder,
+                                                          &roundTripFrames,
+                                                          &roundTripError);
+    });
+    if (!roundTripOk) {
+        return fail(QStringLiteral("roundtrip transcode failed: %1")
+                        .arg(roundTripError));
+    }
+    qInfo() << "[INFO] LIBAVCORE-DECODE selftest: roundtrip activeEncoderName ="
+            << QString::fromStdString(roundTripEncoder) << "frames ="
+            << roundTripFrames;
+    if (!libavcoreSelftestIsH264Family(roundTripEncoder)) {
+        return fail(QStringLiteral("expected H.264 encoder for roundtrip, got "
+                                   "%1 (mpeg4 fallback is not accepted)")
+                        .arg(QString::fromStdString(roundTripEncoder)));
+    }
+
+    const std::string roundTripProbePath = roundTripPath.toStdString();
+    auto codecName = libavcore::probeVideoCodecName(roundTripProbePath);
+    if (!codecName.has_value() || codecName->empty()) {
+        return fail(QStringLiteral("probeVideoCodecName found no video stream "
+                                   "in roundtrip output"));
+    }
+    if (!libavcoreSelftestIsH264Family(*codecName)) {
+        return fail(QStringLiteral("roundtrip probe reported non-H.264 codec "
+                                   "%1")
+                        .arg(QString::fromStdString(*codecName)));
+    }
+    auto durationUs = libavcore::probeDurationMicroseconds(roundTripProbePath);
+    if (!durationUs.has_value() || *durationUs <= 0) {
+        return fail(QStringLiteral("probeDurationMicroseconds did not return "
+                                   "a positive roundtrip duration (got %1)")
+                        .arg(durationUs.has_value()
+                                 ? QString::number(*durationUs)
+                                 : QStringLiteral("nullopt")));
+    }
+    qInfo() << "[INFO] LIBAVCORE-DECODE selftest: roundtrip probe codec/duration ="
+            << QString::fromStdString(*codecName)
+            << static_cast<qlonglong>(*durationUs);
+
+    QFile::remove(inputPath);
+    QFile::remove(roundTripPath);
+
+    qInfo() << "[INFO] LIBAVCORE-DECODE selftest PASSED: decoded frames ="
+            << decodedVideoFrames << "roundtrip frames =" << roundTripFrames
+            << "codec =" << QString::fromStdString(*codecName);
     return 0;
 }
 
@@ -10400,6 +10898,10 @@ int main(int argc, char *argv[])
     if (qEnvironmentVariableIntValue("VEDITOR_LIBAVCORE_ENCODE_SELFTEST") != 0) {
         writeLogLine("INFO", "running VEDITOR_LIBAVCORE_ENCODE_SELFTEST");
         return runLibavcoreEncodeSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_LIBAVCORE_DECODE_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_LIBAVCORE_DECODE_SELFTEST");
+        return runLibavcoreDecodeSelftest();
     }
     if (qEnvironmentVariableIntValue("VEDITOR_PARITY_SELFTEST") != 0) {
         writeLogLine("INFO", "running VEDITOR_PARITY_SELFTEST");

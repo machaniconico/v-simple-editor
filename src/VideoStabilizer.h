@@ -1,10 +1,12 @@
 #pragma once
 
 #include "PlanarTracker.h"
+#include "libavcore/Decode.h"
+#include "libavcore/Encode.h"
 
 #include <QImage>
 #include <QObject>
-#include <QProcess>
+#include <QProcess>  // retained: the vidstab two-pass path still spawns ffmpeg.exe
 #include <QString>
 
 // --- Stabilization crop mode ---
@@ -77,12 +79,6 @@ signals:
     void analysisComplete(const QString &trfPath);
 
 private:
-    struct VideoStreamInfo {
-        int width = 0;
-        int height = 0;
-        double fps = 0.0;
-    };
-
     // Build vidstabdetect filter string for pass 1
     static QString buildDetectFilter(const StabilizerConfig &config,
                                      const QString &trfPath);
@@ -99,7 +95,6 @@ private:
 
     // Find FFmpeg binary
     static QString findFFmpegBinary();
-    static VideoStreamInfo probeVideoStream(const QString &inputPath);
     static planartrack::Homography invertHomographyWithFallback(const planartrack::Homography &H,
                                                                 bool &usedIdentityFallback);
     static planartrack::Homography multiplyHomographies(const planartrack::Homography &lhs,

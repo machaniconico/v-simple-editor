@@ -1,5 +1,6 @@
 #include "Encode.h"
 
+#include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -11,11 +12,14 @@
 #endif
 
 extern "C" {
+#include <libavutil/audio_fifo.h>
+#include <libavutil/channel_layout.h>
 #include <libavutil/error.h>
 #include <libavutil/opt.h>
 #include <libavutil/imgutils.h>
 #include <libavutil/mastering_display_metadata.h>
 #include <libavutil/pixdesc.h>
+#include <libavutil/samplefmt.h>
 }
 
 namespace libavcore {
@@ -230,6 +234,41 @@ static const AVPixelFormat* querySupportedPixelFormats(const AVCodec* encoder)
     return out;
 }
 
+static AVSampleFormat firstSupportedAudioSampleFormat(const AVCodec* encoder)
+{
+    if (!encoder) return AV_SAMPLE_FMT_FLTP;
+
+    const void* cfg = nullptr;
+    int numCfg = 0;
+    const int rc = avcodec_get_supported_config(
+        nullptr, encoder, AV_CODEC_CONFIG_SAMPLE_FORMAT, 0, &cfg, &numCfg);
+    if (rc >= 0 && cfg && numCfg > 0) {
+        const AVSampleFormat* formats = static_cast<const AVSampleFormat*>(cfg);
+        return formats[0];
+    }
+
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable: 4996)
+#endif
+    const AVSampleFormat* legacy = encoder->sample_fmts;
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#elif defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+    if (legacy && legacy[0] != AV_SAMPLE_FMT_NONE) return legacy[0];
+    return AV_SAMPLE_FMT_FLTP;
+}
+
 // True when `encoder` lists `target` among its supported pixel formats. When
 // the encoder advertises no list at all the format is assumed acceptable
 // (an MFT validates the real format at avcodec_open2 / send_frame time).
@@ -306,6 +345,9 @@ void FrameEncoder::releaseAll()
 {
     if (m_rgbToYuvCtx) { sws_freeContext(m_rgbToYuvCtx); m_rgbToYuvCtx = nullptr; }
     if (m_scratchFrame) { av_frame_free(&m_scratchFrame); }
+    if (m_audioScratchFrame) { av_frame_free(&m_audioScratchFrame); }
+    if (m_audioFifo) { av_audio_fifo_free(m_audioFifo); m_audioFifo = nullptr; }
+    if (m_audioEncCtx) { avcodec_free_context(&m_audioEncCtx); }
     if (m_encCtx) { avcodec_free_context(&m_encCtx); }
     if (m_audioInFmt) { avformat_close_input(&m_audioInFmt); }
     if (m_outFmt) {
@@ -319,6 +361,9 @@ void FrameEncoder::releaseAll()
     m_audioInStream = nullptr;
     m_audioOutStream = nullptr;
     m_audioInStreamIndex = -1;
+    m_audioNextPts = 0;
+    m_audioPtsInitialized = false;
+    m_audioEncode = false;
 }
 
 bool FrameEncoder::configureEncoderContext(const EncodeRequest& req,
@@ -645,6 +690,219 @@ bool FrameEncoder::configureAudioPassthrough(const std::string& audioSourcePath)
     return true;
 }
 
+bool FrameEncoder::configureAudioEncoder(const EncodeRequest& req)
+{
+    if (!m_outFmt) return false;
+    if (req.audioSampleRate <= 0 || req.audioChannels <= 0
+        || req.audioBitrateBits <= 0) {
+        std::fprintf(stderr,
+                     "FrameEncoder: invalid AAC audio settings "
+                     "(sample_rate=%d channels=%d bitrate=%lld)\n",
+                     req.audioSampleRate,
+                     req.audioChannels,
+                     static_cast<long long>(req.audioBitrateBits));
+        return false;
+    }
+
+    const AVCodec* encoder = avcodec_find_encoder(AV_CODEC_ID_AAC);
+    if (!encoder) {
+        std::fprintf(stderr, "FrameEncoder: native AAC encoder not found\n");
+        return false;
+    }
+
+    m_audioEncCtx = avcodec_alloc_context3(encoder);
+    if (!m_audioEncCtx) {
+        std::fprintf(stderr, "FrameEncoder: failed to allocate AAC encoder context\n");
+        return false;
+    }
+
+    m_audioEncCtx->sample_fmt = firstSupportedAudioSampleFormat(encoder);
+    m_audioEncCtx->sample_rate = req.audioSampleRate;
+    av_channel_layout_default(&m_audioEncCtx->ch_layout, req.audioChannels);
+    m_audioEncCtx->bit_rate = req.audioBitrateBits;
+    m_audioEncCtx->time_base = AVRational{1, req.audioSampleRate};
+    if (m_outFmt && (m_outFmt->oformat->flags & AVFMT_GLOBALHEADER)) {
+        m_audioEncCtx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    }
+
+    int rc = avcodec_open2(m_audioEncCtx, encoder, nullptr);
+    if (rc < 0) {
+        std::fprintf(stderr,
+                     "FrameEncoder: failed to open AAC encoder: %s\n",
+                     ffmpegErrorString(rc).c_str());
+        return false;
+    }
+
+    AVStream* outStream = avformat_new_stream(m_outFmt, nullptr);
+    if (!outStream) {
+        std::fprintf(stderr, "FrameEncoder: failed to create AAC output stream\n");
+        return false;
+    }
+
+    rc = avcodec_parameters_from_context(outStream->codecpar, m_audioEncCtx);
+    if (rc < 0) {
+        std::fprintf(stderr,
+                     "FrameEncoder: AAC codec parameter copy failed: %s\n",
+                     ffmpegErrorString(rc).c_str());
+        return false;
+    }
+    outStream->time_base = m_audioEncCtx->time_base;
+
+    const int initialFifoSize =
+        (m_audioEncCtx->frame_size > 0) ? m_audioEncCtx->frame_size : 1;
+    m_audioFifo = av_audio_fifo_alloc(m_audioEncCtx->sample_fmt,
+                                      m_audioEncCtx->ch_layout.nb_channels,
+                                      initialFifoSize);
+    if (!m_audioFifo) {
+        std::fprintf(stderr, "FrameEncoder: failed to allocate AAC audio FIFO\n");
+        return false;
+    }
+
+    m_audioScratchFrame = av_frame_alloc();
+    if (!m_audioScratchFrame) {
+        std::fprintf(stderr, "FrameEncoder: failed to allocate AAC scratch frame\n");
+        return false;
+    }
+
+    m_audioOutStream = outStream;
+    m_audioEncode = true;
+    m_audioNextPts = 0;
+    m_audioPtsInitialized = false;
+
+    std::fprintf(stderr,
+                 "FrameEncoder: AAC audio encode enabled sample_fmt=%s "
+                 "sample_rate=%d channels=%d bitrate=%lld\n",
+                 av_get_sample_fmt_name(m_audioEncCtx->sample_fmt)
+                     ? av_get_sample_fmt_name(m_audioEncCtx->sample_fmt) : "?",
+                 m_audioEncCtx->sample_rate,
+                 m_audioEncCtx->ch_layout.nb_channels,
+                 static_cast<long long>(m_audioEncCtx->bit_rate));
+    return true;
+}
+
+bool FrameEncoder::drainAudioEncoderPackets()
+{
+    if (!m_audioEncCtx || !m_audioOutStream || !m_outFmt) return false;
+
+    AVPacket* pkt = av_packet_alloc();
+    if (!pkt) return false;
+
+    bool ok = true;
+    while (true) {
+        const int rc = avcodec_receive_packet(m_audioEncCtx, pkt);
+        if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) {
+            break;
+        }
+        if (rc < 0) {
+            std::fprintf(stderr,
+                         "FrameEncoder: AAC packet receive failed: %s\n",
+                         ffmpegErrorString(rc).c_str());
+            ok = false;
+            break;
+        }
+
+        av_packet_rescale_ts(pkt,
+                             m_audioEncCtx->time_base,
+                             m_audioOutStream->time_base);
+        pkt->stream_index = m_audioOutStream->index;
+        pkt->pos = -1;
+        const int writeRc = av_interleaved_write_frame(m_outFmt, pkt);
+        av_packet_unref(pkt);
+        if (writeRc < 0) {
+            std::fprintf(stderr,
+                         "FrameEncoder: AAC packet write failed: %s\n",
+                         ffmpegErrorString(writeRc).c_str());
+            ok = false;
+            break;
+        }
+    }
+
+    av_packet_free(&pkt);
+    return ok;
+}
+
+bool FrameEncoder::sendAudioEncoderFrame(AVFrame* frame)
+{
+    if (!m_audioEncCtx) return false;
+
+    const int rc = avcodec_send_frame(m_audioEncCtx, frame);
+    if (rc < 0) {
+        std::fprintf(stderr,
+                     "FrameEncoder: AAC frame send failed: %s\n",
+                     ffmpegErrorString(rc).c_str());
+        return false;
+    }
+    return drainAudioEncoderPackets();
+}
+
+bool FrameEncoder::encodeAudioFifoSamples(int nbSamples)
+{
+    if (!m_audioEncCtx || !m_audioFifo || !m_audioScratchFrame || nbSamples <= 0) {
+        return false;
+    }
+
+    av_frame_unref(m_audioScratchFrame);
+    m_audioScratchFrame->nb_samples = nbSamples;
+    m_audioScratchFrame->format = m_audioEncCtx->sample_fmt;
+    m_audioScratchFrame->sample_rate = m_audioEncCtx->sample_rate;
+    if (av_channel_layout_copy(&m_audioScratchFrame->ch_layout,
+                               &m_audioEncCtx->ch_layout) < 0) {
+        std::fprintf(stderr,
+                     "FrameEncoder: failed to copy AAC channel layout\n");
+        return false;
+    }
+
+    int rc = av_frame_get_buffer(m_audioScratchFrame, 0);
+    if (rc < 0) {
+        std::fprintf(stderr,
+                     "FrameEncoder: failed to allocate AAC frame buffer: %s\n",
+                     ffmpegErrorString(rc).c_str());
+        return false;
+    }
+
+    const int readSamples =
+        av_audio_fifo_read(m_audioFifo,
+                           reinterpret_cast<void**>(m_audioScratchFrame->extended_data),
+                           nbSamples);
+    if (readSamples != nbSamples) {
+        std::fprintf(stderr,
+                     "FrameEncoder: AAC FIFO read returned %d/%d samples\n",
+                     readSamples,
+                     nbSamples);
+        return false;
+    }
+
+    if (!m_audioPtsInitialized) {
+        m_audioNextPts = 0;
+        m_audioPtsInitialized = true;
+    }
+    m_audioScratchFrame->pts = m_audioNextPts;
+    m_audioNextPts += nbSamples;
+
+    return sendAudioEncoderFrame(m_audioScratchFrame);
+}
+
+bool FrameEncoder::flushAudioEncoder()
+{
+    if (!m_audioEncode || !m_audioEncCtx) return true;
+
+    const int encoderFrameSize =
+        (m_audioEncCtx->frame_size > 0) ? m_audioEncCtx->frame_size : 0;
+    if (encoderFrameSize > 0) {
+        while (m_audioFifo
+               && av_audio_fifo_size(m_audioFifo) >= encoderFrameSize) {
+            if (!encodeAudioFifoSamples(encoderFrameSize)) return false;
+        }
+    }
+    if (m_audioFifo && av_audio_fifo_size(m_audioFifo) > 0) {
+        if (!encodeAudioFifoSamples(av_audio_fifo_size(m_audioFifo))) {
+            return false;
+        }
+    }
+
+    return sendAudioEncoderFrame(nullptr);
+}
+
 void FrameEncoder::muxAudioPassthroughPackets()
 {
     if (!m_audioInFmt || !m_audioInStream || !m_audioOutStream) return;
@@ -778,7 +1036,18 @@ std::optional<std::string> FrameEncoder::open(const EncodeRequest& req)
     }
     m_outStream->time_base = m_encCtx->time_base;
 
-    if (!req.audioSourcePath.empty()) {
+    if (req.audioEncode) {
+        if (!req.audioSourcePath.empty()) {
+            std::fprintf(stderr,
+                         "FrameEncoder: audioEncode enabled; ignoring "
+                         "audioSourcePath '%s'\n",
+                         req.audioSourcePath.c_str());
+        }
+        if (!configureAudioEncoder(req)) {
+            releaseAll();
+            return std::string("Failed to open AAC audio encoder");
+        }
+    } else if (!req.audioSourcePath.empty()) {
         configureAudioPassthrough(req.audioSourcePath);
     }
 
@@ -899,6 +1168,78 @@ bool FrameEncoder::pushFrameNative(AVFrame* frame, int64_t pts)
     return true;
 }
 
+bool FrameEncoder::pushAudioFrame(AVFrame* frame, int64_t pts)
+{
+    if (!m_opened || m_finalized || !m_audioEncode || !m_audioEncCtx
+        || !m_audioFifo || !frame) {
+        return false;
+    }
+    if (frame->nb_samples <= 0) return false;
+
+    const bool layoutMatches =
+        av_channel_layout_compare(&frame->ch_layout,
+                                  &m_audioEncCtx->ch_layout) == 0;
+    if (frame->format != m_audioEncCtx->sample_fmt
+        || frame->sample_rate != m_audioEncCtx->sample_rate
+        || !layoutMatches) {
+        std::fprintf(stderr,
+                     "FrameEncoder: AAC frame format mismatch "
+                     "(frame fmt=%s rate=%d channels=%d; encoder fmt=%s "
+                     "rate=%d channels=%d)\n",
+                     av_get_sample_fmt_name(
+                         static_cast<AVSampleFormat>(frame->format))
+                         ? av_get_sample_fmt_name(
+                               static_cast<AVSampleFormat>(frame->format))
+                         : "?",
+                     frame->sample_rate,
+                     frame->ch_layout.nb_channels,
+                     av_get_sample_fmt_name(m_audioEncCtx->sample_fmt)
+                         ? av_get_sample_fmt_name(m_audioEncCtx->sample_fmt)
+                         : "?",
+                     m_audioEncCtx->sample_rate,
+                     m_audioEncCtx->ch_layout.nb_channels);
+        return false;
+    }
+
+    if (av_audio_fifo_size(m_audioFifo) == 0 && pts != AV_NOPTS_VALUE) {
+        m_audioNextPts = pts;
+        m_audioPtsInitialized = true;
+    }
+
+    const int fifoSize = av_audio_fifo_size(m_audioFifo);
+    const int rc = av_audio_fifo_realloc(m_audioFifo,
+                                         fifoSize + frame->nb_samples);
+    if (rc < 0) {
+        std::fprintf(stderr,
+                     "FrameEncoder: AAC FIFO realloc failed: %s\n",
+                     ffmpegErrorString(rc).c_str());
+        return false;
+    }
+
+    const int written =
+        av_audio_fifo_write(m_audioFifo,
+                            reinterpret_cast<void**>(frame->extended_data),
+                            frame->nb_samples);
+    if (written != frame->nb_samples) {
+        std::fprintf(stderr,
+                     "FrameEncoder: AAC FIFO write returned %d/%d samples\n",
+                     written,
+                     frame->nb_samples);
+        return false;
+    }
+
+    const int encoderFrameSize =
+        (m_audioEncCtx->frame_size > 0)
+            ? m_audioEncCtx->frame_size
+            : frame->nb_samples;
+    while (encoderFrameSize > 0
+           && av_audio_fifo_size(m_audioFifo) >= encoderFrameSize) {
+        if (!encodeAudioFifoSamples(encoderFrameSize)) return false;
+    }
+
+    return true;
+}
+
 bool FrameEncoder::pushFrameRgb24(const uint8_t* src, int stride, int64_t pts)
 {
     if (!m_opened || m_finalized || !m_encCtx || !src) return false;
@@ -980,7 +1321,13 @@ std::optional<std::string> FrameEncoder::finalize()
         }
     }
 
-    muxAudioPassthroughPackets();
+    if (m_audioEncode) {
+        if (!flushAudioEncoder()) {
+            return std::string("Failed to flush AAC audio encoder");
+        }
+    } else {
+        muxAudioPassthroughPackets();
+    }
 
     if (m_outFmt) {
         av_write_trailer(m_outFmt);

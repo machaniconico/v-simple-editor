@@ -15,6 +15,10 @@
 #include <algorithm>
 #include <cmath>
 
+extern "C" {
+#include <libswscale/swscale.h>
+}
+
 namespace {
 
 constexpr double kHomographySingularThreshold = 1e-12;
@@ -77,49 +81,6 @@ QImage VideoStabilizer::stabilizeFrame(const QImage &source, int frameIndex) con
         return source;
 
     return applyPlanarInversion(source, frameIndex);
-}
-
-VideoStabilizer::VideoStreamInfo VideoStabilizer::probeVideoStream(const QString &inputPath)
-{
-    VideoStreamInfo info;
-    const QString ffmpegBin = findFFmpegBinary();
-    if (ffmpegBin.isEmpty())
-        return info;
-
-    QProcess probe;
-    probe.start(ffmpegBin, QStringList{QStringLiteral("-hide_banner"),
-                                       QStringLiteral("-i"),
-                                       inputPath});
-    if (!probe.waitForStarted(3000))
-        return info;
-
-    probe.closeWriteChannel();
-    probe.waitForFinished(5000);
-
-    const QString stderrOutput = QString::fromLocal8Bit(probe.readAllStandardError());
-    const QStringList lines = stderrOutput.split(QLatin1Char('\n'));
-    static const QRegularExpression sizeRe(R"((\d+)x(\d+))");
-    static const QRegularExpression fpsRe(R"((\d+(?:\.\d+)?)\s+fps)");
-
-    for (const QString &line : lines) {
-        if (!line.contains(QStringLiteral("Video:")))
-            continue;
-
-        const QRegularExpressionMatch sizeMatch = sizeRe.match(line);
-        if (sizeMatch.hasMatch()) {
-            info.width = sizeMatch.captured(1).toInt();
-            info.height = sizeMatch.captured(2).toInt();
-        }
-
-        const QRegularExpressionMatch fpsMatch = fpsRe.match(line);
-        if (fpsMatch.hasMatch())
-            info.fps = fpsMatch.captured(1).toDouble();
-
-        if (info.width > 0 && info.height > 0 && info.fps > 0.0)
-            break;
-    }
-
-    return info;
 }
 
 planartrack::Homography VideoStabilizer::invertHomographyWithFallback(
@@ -250,6 +211,15 @@ void VideoStabilizer::applyTransparentCrop(QImage &image, double cropPercent)
 QString VideoStabilizer::buildDetectFilter(const StabilizerConfig &config,
                                            const QString &trfPath)
 {
+    // PRD-B2 US-B2-5 documented limitation: the vidstab two-pass path
+    // (buildDetectFilter/buildTransformFilter via runFFmpeg) intentionally
+    // stays on QProcess(ffmpeg.exe). vidstabdetect/vidstabtransform require
+    // libvidstab, but the bundled avfilter-11.dll is built with libvidstab
+    // disabled and autodetect off, so both filters are absent from the
+    // in-process libav. This mirrors PRD-B-MF keeping HDR10 export on an
+    // ffmpeg.exe subprocess. Only the PlanarInversion path
+    // (stabilizePlanarInversion) was moved in-process to libavcore.
+    //
     // vidstabdetect: shakiness, accuracy, result (output .trf file)
     return QString("vidstabdetect=shakiness=%1:accuracy=%2:result='%3'")
                .arg(config.shakiness)
@@ -358,136 +328,112 @@ bool VideoStabilizer::runFFmpeg(const QStringList &args, int progressBase, int p
 
 bool VideoStabilizer::stabilizePlanarInversion(const QString &inputPath, const QString &outputPath)
 {
-    const QString ffmpegBin = findFFmpegBinary();
-    if (ffmpegBin.isEmpty())
+    // PRD-B2 US-B2-5: this PlanarInversion path is fully in-process. Decoding
+    // uses libavcore::MediaDecoder and encoding uses libavcore::FrameEncoder
+    // (no ffmpeg.exe subprocess). The vidstab two-pass path below stays on
+    // QProcess(ffmpeg.exe) — see buildDetectFilter() for that documented limit.
+    const std::string inputUtf8 = inputPath.toStdString();
+    const std::string outputUtf8 = outputPath.toStdString();
+
+    // --- Decoder: replaces the "source -> rawvideo rgba pipe" ffmpeg process ---
+    libavcore::MediaDecoder decoder;
+    if (decoder.open(inputUtf8, /*wantAudio=*/false).has_value())
+        return false;
+    if (!decoder.hasVideo())
         return false;
 
-    const VideoStreamInfo info = probeVideoStream(inputPath);
-    if (info.width <= 0 || info.height <= 0)
+    const libavcore::VideoStreamProps vprops = decoder.videoProps();
+    if (vprops.width <= 0 || vprops.height <= 0)
         return false;
 
-    const double fps = info.fps > 0.0 ? info.fps : 30.0;
-    const qsizetype frameBytes = static_cast<qsizetype>(info.width)
-        * static_cast<qsizetype>(info.height) * 4;
-    if (frameBytes <= 0)
-        return false;
+    const double fpsValue = vprops.frameRate.den > 0 && vprops.frameRate.num > 0
+        ? av_q2d(vprops.frameRate)
+        : 30.0;
+    const int fpsRounded = std::max(1, static_cast<int>(std::lround(fpsValue)));
 
-    QProcess decoder;
-    decoder.setProcessChannelMode(QProcess::SeparateChannels);
-    decoder.start(ffmpegBin, QStringList{
-        QStringLiteral("-hide_banner"),
-        QStringLiteral("-loglevel"), QStringLiteral("error"),
-        QStringLiteral("-i"), inputPath,
-        QStringLiteral("-map"), QStringLiteral("0:v:0"),
-        QStringLiteral("-vsync"), QStringLiteral("0"),
-        QStringLiteral("-f"), QStringLiteral("rawvideo"),
-        QStringLiteral("-pix_fmt"), QStringLiteral("rgba"),
-        QStringLiteral("-")
-    });
-    if (!decoder.waitForStarted(5000))
-        return false;
+    // --- Encoder: replaces the "rawvideo rgba pipe -> mux -c:a copy" process.
+    // videoCodecName="libx264" lets FrameEncoder's fallback chain resolve to
+    // h264_mf on Windows; audioSourcePath=inputPath reproduces the prior
+    // "-map 1:a? -c:a copy" audio passthrough behaviour.
+    libavcore::EncodeRequest request;
+    request.width = vprops.width;
+    request.height = vprops.height;
+    request.fps = fpsRounded;
+    request.outputPath = outputUtf8;
+    request.audioSourcePath = inputUtf8;
+    request.videoCodecName = "libx264";
 
-    m_process = new QProcess();
-    m_process->setProcessChannelMode(QProcess::SeparateChannels);
-    connect(m_process, &QProcess::readyReadStandardError, this, [this]() {
-        const QString output = QString::fromLocal8Bit(m_process->readAllStandardError());
-        parseProgress(output, 0, 100);
-    });
-
-    m_process->start(ffmpegBin, QStringList{
-        QStringLiteral("-y"),
-        QStringLiteral("-hide_banner"),
-        QStringLiteral("-f"), QStringLiteral("rawvideo"),
-        QStringLiteral("-pix_fmt"), QStringLiteral("rgba"),
-        QStringLiteral("-s:v"), QStringLiteral("%1x%2").arg(info.width).arg(info.height),
-        QStringLiteral("-r"), QString::number(fps, 'f', 6),
-        QStringLiteral("-i"), QStringLiteral("-"),
-        QStringLiteral("-i"), inputPath,
-        QStringLiteral("-map"), QStringLiteral("0:v:0"),
-        QStringLiteral("-map"), QStringLiteral("1:a?"),
-        QStringLiteral("-c:a"), QStringLiteral("copy"),
-        outputPath
-    });
-    if (!m_process->waitForStarted(5000)) {
-        decoder.kill();
-        decoder.waitForFinished(3000);
-        m_process->deleteLater();
-        m_process = nullptr;
+    libavcore::FrameEncoder encoder;
+    if (encoder.open(request).has_value())
         return false;
-    }
 
     emit progressChanged(0);
-    QByteArray buffer;
-    buffer.reserve(frameBytes * 2);
+
     int frameIndex = 0;
     const int totalFrames = m_planarTrack != nullptr
         ? static_cast<int>(m_planarTrack->frames.size())
         : 0;
 
-    auto cleanupProcesses = [this, &decoder]() {
-        if (m_process) {
-            m_process->deleteLater();
-            m_process = nullptr;
-        }
-        decoder.closeReadChannel(QProcess::StandardOutput);
-    };
+    // Reusable swscale context for AVFrame (decoder pix_fmt) -> RGBA8888.
+    SwsContext *toRgbaCtx = nullptr;
+    int swsSrcW = 0;
+    int swsSrcH = 0;
+    int swsSrcFmt = AV_PIX_FMT_NONE;
+
+    bool encodeFailed = false;
 
     while (true) {
         if (m_cancelled) {
-            decoder.kill();
-            decoder.waitForFinished(3000);
-            if (m_process) {
-                m_process->kill();
-                m_process->waitForFinished(3000);
-            }
-            cleanupProcesses();
+            if (toRgbaCtx)
+                sws_freeContext(toRgbaCtx);
             return false;
         }
 
-        buffer.append(decoder.readAllStandardOutput());
-        while (buffer.size() < frameBytes && decoder.state() != QProcess::NotRunning) {
-            if (!decoder.waitForReadyRead(200))
+        AVFrame *frame = decoder.nextVideoFrame();
+        if (frame == nullptr)
+            break;  // EOF or decode error
+
+        // (Re)build the swscale context if frame geometry/format changed.
+        if (toRgbaCtx == nullptr
+            || frame->width != swsSrcW
+            || frame->height != swsSrcH
+            || frame->format != swsSrcFmt) {
+            if (toRgbaCtx)
+                sws_freeContext(toRgbaCtx);
+            toRgbaCtx = sws_getContext(
+                frame->width, frame->height,
+                static_cast<AVPixelFormat>(frame->format),
+                vprops.width, vprops.height, AV_PIX_FMT_RGBA,
+                SWS_BILINEAR, nullptr, nullptr, nullptr);
+            if (toRgbaCtx == nullptr) {
+                encodeFailed = true;
                 break;
-            buffer.append(decoder.readAllStandardOutput());
-        }
-        buffer.append(decoder.readAllStandardOutput());
-
-        if (buffer.size() < frameBytes) {
-            if (decoder.state() == QProcess::NotRunning)
-                break;
-            continue;
+            }
+            swsSrcW = frame->width;
+            swsSrcH = frame->height;
+            swsSrcFmt = frame->format;
         }
 
-        QByteArray frameData = buffer.left(frameBytes);
-        buffer.remove(0, frameBytes);
+        QImage rawFrame(vprops.width, vprops.height, QImage::Format_RGBA8888);
+        uint8_t *rgbaDest[1] = { rawFrame.bits() };
+        int rgbaLinesize[1] = { static_cast<int>(rawFrame.bytesPerLine()) };
+        sws_scale(toRgbaCtx, frame->data, frame->linesize, 0, frame->height,
+                  rgbaDest, rgbaLinesize);
 
-        const QImage rawFrame(reinterpret_cast<const uchar *>(frameData.constData()),
-                              info.width, info.height, QImage::Format_RGBA8888);
-        const QImage stabilized = stabilizeFrame(rawFrame.copy(), frameIndex)
-                                      .convertToFormat(QImage::Format_RGBA8888);
-        const char *framePtr = reinterpret_cast<const char *>(stabilized.constBits());
-        qsizetype remaining = static_cast<qsizetype>(stabilized.bytesPerLine())
-            * static_cast<qsizetype>(stabilized.height());
-        while (remaining > 0) {
-            const qint64 written = m_process->write(framePtr, remaining);
-            if (written <= 0) {
-                decoder.kill();
-                decoder.waitForFinished(3000);
-                m_process->kill();
-                m_process->waitForFinished(3000);
-                cleanupProcesses();
-                return false;
-            }
-            framePtr += written;
-            remaining -= written;
-            if (remaining > 0 && !m_process->waitForBytesWritten(5000)) {
-                decoder.kill();
-                decoder.waitForFinished(3000);
-                m_process->kill();
-                m_process->waitForFinished(3000);
-                cleanupProcesses();
-                return false;
-            }
+        // Per-frame homography processing — identical to the subprocess path.
+        // h264 output carries no alpha plane: the transparent crop frame
+        // (applyTransparentCrop) and any area left uncovered by a non-identity
+        // homography are flattened to black here. This matches the pre-PRD-B2
+        // subprocess path, whose encoder command had no -c:v and therefore
+        // muxed h264 into the .mp4/.mov — so this is parity, not a regression.
+        // The explicit RGB888 conversion makes that flattening visible at the
+        // call site rather than relying on pushFrame()'s hidden internal one.
+        const QImage stabilized = stabilizeFrame(rawFrame, frameIndex)
+                                      .convertToFormat(QImage::Format_RGB888);
+
+        if (!encoder.pushFrame(stabilized, frameIndex)) {
+            encodeFailed = true;
+            break;
         }
 
         ++frameIndex;
@@ -498,21 +444,50 @@ bool VideoStabilizer::stabilizePlanarInversion(const QString &inputPath, const Q
         }
     }
 
-    decoder.waitForFinished(5000);
-    if (m_process) {
-        m_process->closeWriteChannel();
-        m_process->waitForFinished(-1);
+    if (toRgbaCtx)
+        sws_freeContext(toRgbaCtx);
+
+    if (encodeFailed) {
+        encoder.finalize();
+        QFile::remove(outputPath);
+        return false;
     }
 
-    const bool decodeOk = decoder.exitStatus() == QProcess::NormalExit && decoder.exitCode() == 0;
-    const bool encodeOk = m_process
-        && m_process->exitStatus() == QProcess::NormalExit
-        && m_process->exitCode() == 0;
+    // Decode-failure detection. libavcore::MediaDecoder::nextVideoFrame()
+    // returns nullptr for BOTH a clean EOF and a fatal mid-stream decode
+    // error, and videoEnded() does not distinguish them — so a corrupt input
+    // would otherwise break the loop, finalize() cleanly and report success
+    // with a truncated output file. The old subprocess path guarded against
+    // this via the decoder QProcess exit status (decodeOk && encodeOk). We
+    // restore that guarantee here with a frameIndex-based sanity check, with
+    // no change to the Decode API.
+    bool decodeFailed = false;
+    if (frameIndex == 0) {
+        // Not a single frame decoded from a stream that reported video.
+        decodeFailed = true;
+    } else if (totalFrames > 0) {
+        // m_planarTrack->frames.size() is the authoritative frame count used
+        // as totalFrames for progress. Minor drift (±a few frames) between
+        // the track and the actual decode is tolerated; a large shortfall
+        // means the decoder aborted mid-stream.
+        const int shortfallTolerance =
+            std::max(8, static_cast<int>(std::lround(totalFrames * 0.02)));
+        if (frameIndex < totalFrames - shortfallTolerance)
+            decodeFailed = true;
+    }
 
-    cleanupProcesses();
-    if (decodeOk && encodeOk)
+    if (decodeFailed) {
+        encoder.finalize();
+        QFile::remove(outputPath);
+        return false;
+    }
+
+    const bool encodeOk = !encoder.finalize().has_value();
+    if (encodeOk)
         emit progressChanged(100);
-    return decodeOk && encodeOk;
+    else
+        QFile::remove(outputPath);
+    return encodeOk;
 }
 
 // --- Public API ---
