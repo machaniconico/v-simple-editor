@@ -33,6 +33,7 @@
 #include <QFontMetrics>
 #include <QRect>
 #include <cmath>
+#include <cstring>
 #include <algorithm>
 #include <functional>
 
@@ -365,6 +366,8 @@
 #include "libavcore/Decode.h"
 #include "libavcore/Encode.h"
 #include "libavcore/Probe.h"
+// PRD-PROXY-SELFTEST-V2: static helpers used by runProxySelftestV2()
+#include "ProxyManager.h"
 // US-B3-4: deshake in-process regression gate.
 #include "libavcore/VideoFilterGraph.h"
 #include "VideoStabilizer.h"
@@ -6325,6 +6328,101 @@ static int runAIHighlightSelftest()
     return failed == 0 ? 0 : 1;
 }
 
+// runProxySelftestV2 — argv-switch '--selftest=proxy'
+//
+// Singleton-free regression gates for ProxyManager's in-process pathway.
+// Invoked from main() BEFORE QApplication construction so that env-gate
+// quirks (WSL->cmd.exe propagation, qEnvironmentVariableIntValue parse)
+// are bypassed entirely. No ProxyManager::instance() call — that path was
+// shown to hang in PRD-PROXY-CLEAN US-PXC-3, see
+// [[feedback-selftest-avoid-singleton-init]].
+//
+//   gate1 - ffmpegHasEncoder for at least one of h264_mf/libx264/mpeg4
+//   gate2 - ffmpegHasDecoder('h264')
+//   gate3 - libavcore::encoderAvailable agreement (direct chain check)
+//   gate4 - libavcore::decoderAvailable('h264')
+//   gate5 - ProxyManager::proxyDir() non-empty (static, no instance)
+//   gate6 - ProxyConfig{} default fields (proxyWidth > 0 && proxyHeight > 0)
+static int runProxySelftestV2()
+{
+    qInfo().noquote() << "[PROXY-SELFTEST-V2] start";
+    writeLogLine("INFO", "[PROXY-SELFTEST-V2] start");
+
+    int passed = 0;
+    int failed = 0;
+    auto pass = [&](const char* gateName) {
+        const QString line = QStringLiteral("[PROXY-SELFTEST-V2] %1 PASS").arg(QString::fromLatin1(gateName));
+        qInfo().noquote() << line;
+        writeLogLine("INFO", line);
+        ++passed;
+    };
+    auto fail = [&](const char* gateName, const QString& reason) {
+        const QString line = QStringLiteral("[PROXY-SELFTEST-V2] %1 FAIL: %2").arg(QString::fromLatin1(gateName), reason);
+        qCritical().noquote() << line;
+        writeLogLine("CRIT", line);
+        ++failed;
+    };
+
+    // gate 1
+    {
+        const bool any = ProxyManager::ffmpegHasEncoder("h264_mf")
+                      || ProxyManager::ffmpegHasEncoder("libx264")
+                      || ProxyManager::ffmpegHasEncoder("mpeg4");
+        if (any) pass("gate1-encoder-registry");
+        else     fail("gate1-encoder-registry",
+                       QStringLiteral("none of h264_mf/libx264/mpeg4 in registry"));
+    }
+
+    // gate 2 — ffmpegHasDecoder is private; use libavcore::decoderAvailable directly
+    // (same underlying libavcodec registry probe, no instance required)
+    {
+        if (libavcore::decoderAvailable("h264")) pass("gate2-decoder-registry");
+        else                                     fail("gate2-decoder-registry",
+                                                      QStringLiteral("h264 decoder absent"));
+    }
+
+    // gate 3
+    {
+        const bool any = libavcore::encoderAvailable("h264_mf")
+                      || libavcore::encoderAvailable("libx264")
+                      || libavcore::encoderAvailable("mpeg4");
+        if (any) pass("gate3-libavcore-encoder");
+        else     fail("gate3-libavcore-encoder",
+                       QStringLiteral("libavcore registry empty"));
+    }
+
+    // gate 4
+    {
+        if (libavcore::decoderAvailable("h264")) pass("gate4-libavcore-decoder");
+        else                                     fail("gate4-libavcore-decoder",
+                                                       QStringLiteral("libavcore h264 decoder absent"));
+    }
+
+    // gate 5
+    {
+        const QString dir = ProxyManager::proxyDir();
+        if (!dir.isEmpty()) pass("gate5-proxy-dir");
+        else                fail("gate5-proxy-dir", QStringLiteral("proxyDir is empty"));
+    }
+
+    // gate 6
+    {
+        const ProxyConfig cfg;
+        if (cfg.proxyWidth > 0 && cfg.proxyHeight > 0)
+            pass("gate6-config-defaults");
+        else
+            fail("gate6-config-defaults",
+                 QStringLiteral("default ProxyConfig has zero w/h: %1x%2")
+                     .arg(cfg.proxyWidth).arg(cfg.proxyHeight));
+    }
+
+    const QString summary = QStringLiteral("PROXY-SELFTEST-V2: %1/%2 PASS").arg(passed).arg(passed + failed);
+    if (failed == 0) qInfo().noquote() << summary;
+    else             qCritical().noquote() << summary;
+    writeLogLine("INFO", summary);
+    return failed == 0 ? 0 : 1;
+}
+
 // (VEDITOR_PROJECT_PRESET_SELFTEST=1).
 //
 // Validates MotionTrackerProjectState / PlanarTrackerProjectState persistence helpers
@@ -11632,6 +11730,16 @@ int main(int argc, char *argv[])
 #endif
     writeLogLine("INFO", "=== V Simple Editor starting ===");
     writeLogLine("INFO", QString("log path: %1").arg(g_logFilePath));
+
+    // PRD-PROXY-SELFTEST-V2: argv-switch dispatcher before QApplication construction.
+    // Lets WSL invoke selftests directly without the env-propagation quirks
+    // that PRD-PROXY-CLEAN US-PXC-3 hit. See [[feedback-selftest-avoid-singleton-init]].
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--selftest=proxy") == 0) {
+            writeLogLine("INFO", "argv-switch: --selftest=proxy");
+            return runProxySelftestV2();
+        }
+    }
 
     QApplication app(argc, argv);
     app.setApplicationName("V Simple Editor");
