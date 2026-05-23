@@ -4,6 +4,10 @@
 #include <QVector>
 #include <QString>
 
+// AIHighlight is a PRD-B2 (2026-05-21) in-process refactor: decoding goes
+// through libavcore::MediaDecoder and encoding through libavcore::FrameEncoder.
+// No ffmpeg subprocess is spawned; no QProcess / m_process member exists.
+
 // Type of detected highlight
 enum class HighlightType {
     LoudMoment,
@@ -52,6 +56,20 @@ struct HighlightConfig {
     int motionSampleFps = 1;              // decode at this fps for motion analysis
 };
 
+// Thread-safety contract:
+//   - Static helpers (analyzeAudioEnergy, analyzeMotionActivity,
+//     analyzeSceneChanges, combineScores, selectTopHighlights,
+//     exportTimestamps, normalizeScores, buildHighlightsFromScores) are
+//     stateless and safe to call from any thread.
+//   - Non-static methods (analyze, exportHighlightReel) are caller-thread
+//     entry points that launch worker threads internally (std::async or
+//     equivalent) driving libavcore decode/encode loops.
+//   - Signals (progressChanged, analysisComplete, exportComplete) are
+//     emitted from worker threads and reach connected slots through
+//     Qt::QueuedConnection so consumers can update UI safely.
+//   - Lifetime is caller-managed: AIHighlight is NOT a singleton. Each
+//     consumer owns its instance and must keep it alive until all signals
+//     have been delivered.
 class AIHighlight : public QObject
 {
     Q_OBJECT
@@ -80,7 +98,9 @@ public:
     static QVector<Highlight> selectTopHighlights(const QVector<Highlight> &allHighlights,
                                                    const HighlightConfig &config = {});
 
-    // Export highlights as a concatenated video reel (async — result via exportComplete)
+    // Export highlights as a concatenated video reel via libavcore::FrameEncoder
+    // (async — result via exportComplete signal). No ffmpeg subprocess is spawned;
+    // decoding and encoding happen entirely in-process on a worker thread.
     void exportHighlightReel(const QString &inputPath, const QString &outputPath,
                              const QVector<Highlight> &highlights);
 

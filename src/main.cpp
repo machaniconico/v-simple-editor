@@ -373,6 +373,7 @@
 // (RenderQueue.cpp:602-604) so the FrameEncoder fallback chain resolves the
 // identical concrete encoder on both compared paths.
 #include "CodecDetector.h"
+#include "AIHighlight.h"
 
 extern "C" {
 #include <libavutil/error.h>
@@ -6198,6 +6199,132 @@ static int runPlanarPresetSelftest()
 }
 #endif // HAVE_PLANARTRACKER_PRESET
 
+// runAIHighlightSelftest — env VEDITOR_AIHIGHLIGHT_SELFTEST=1
+//
+// Validates AIHighlight static helpers + Highlight/HighlightConfig structs without
+// instantiating AIHighlight (QObject-derived) or calling async member methods:
+//   gate1  - HighlightConfig default values
+//   gate2  - Highlight::duration()
+//   gate3  - Highlight::overlaps() boundary handling
+//   gate4  - exportTimestamps() empty + single
+//   gate5  - selectTopHighlights() dedup + targetCount cap
+//   gate6  - combineScores() with empty inputs
+static int runAIHighlightSelftest()
+{
+    qInfo().noquote() << "[AIHIGHLIGHT-SELFTEST] start";
+    writeLogLine("INFO", "[AIHIGHLIGHT-SELFTEST] start");
+
+    int passed = 0;
+    int failed = 0;
+    auto pass = [&](const char* gateName) {
+        const QString line = QStringLiteral("[AIHIGHLIGHT-SELFTEST] %1 PASS").arg(QString::fromLatin1(gateName));
+        qInfo().noquote() << line;
+        writeLogLine("INFO", line);
+        ++passed;
+    };
+    auto fail = [&](const char* gateName, const QString& reason) {
+        const QString line = QStringLiteral("[AIHIGHLIGHT-SELFTEST] %1 FAIL: %2").arg(QString::fromLatin1(gateName), reason);
+        qCritical().noquote() << line;
+        writeLogLine("CRIT", line);
+        ++failed;
+    };
+
+    // gate 1: HighlightConfig default values
+    {
+        HighlightConfig c;
+        const bool ok = qFuzzyCompare(c.minHighlightDuration, 3.0)
+                     && qFuzzyCompare(c.maxHighlightDuration, 30.0)
+                     && c.targetCount == 10
+                     && qFuzzyCompare(c.audioWeight, 0.4)
+                     && qFuzzyCompare(c.motionWeight, 0.3)
+                     && qFuzzyCompare(c.sceneWeight, 0.3)
+                     && qFuzzyCompare(c.loudnessThreshold, 0.7)
+                     && qFuzzyCompare(c.audioWindowSize, 0.5)
+                     && c.motionSampleFps == 1;
+        if (ok) pass("gate1-config-defaults");
+        else    fail("gate1-config-defaults", QStringLiteral("default values mismatch"));
+    }
+
+    // gate 2: Highlight::duration()
+    {
+        Highlight h;
+        h.startTime = 5.0;
+        h.endTime = 12.0;
+        if (qFuzzyCompare(h.duration(), 7.0)) pass("gate2-duration");
+        else                                  fail("gate2-duration",
+                                                    QStringLiteral("expected 7.0 got %1").arg(h.duration()));
+    }
+
+    // gate 3: Highlight::overlaps() boundary handling
+    {
+        Highlight a; a.startTime = 0.0; a.endTime = 5.0;
+        Highlight b; b.startTime = 4.0; b.endTime = 10.0;
+        Highlight c; c.startTime = 5.0; c.endTime = 10.0;  // boundary touch
+        const bool ab = a.overlaps(b);    // expect true
+        const bool ac = a.overlaps(c);    // expect false (touch at 5.0)
+        if (ab && !ac) pass("gate3-overlaps");
+        else           fail("gate3-overlaps",
+                            QStringLiteral("ab=%1 ac=%2 (expected true,false)")
+                                .arg(ab).arg(ac));
+    }
+
+    // gate 4: exportTimestamps() empty + single
+    {
+        const QString emptyResult = AIHighlight::exportTimestamps({});
+        if (!emptyResult.isEmpty()) {
+            fail("gate4-export-timestamps", QStringLiteral("empty input did not yield empty string"));
+        } else {
+            QVector<Highlight> singletonV;
+            Highlight one; one.startTime = 10.0; one.endTime = 25.0; one.score = 0.9;
+            singletonV.push_back(one);
+            const QString singleResult = AIHighlight::exportTimestamps(singletonV);
+            if (!singleResult.isEmpty()) pass("gate4-export-timestamps");
+            else                          fail("gate4-export-timestamps",
+                                                QStringLiteral("single-highlight result was empty"));
+        }
+    }
+
+    // gate 5: selectTopHighlights() dedup + targetCount cap
+    {
+        QVector<Highlight> input;
+        for (int i = 0; i < 5; ++i) {
+            Highlight h;
+            h.startTime = i * 4.0;
+            h.endTime = i * 4.0 + 5.0;   // every pair overlaps with the next
+            h.score = 1.0 - i * 0.1;
+            input.push_back(h);
+        }
+        HighlightConfig cfg;
+        cfg.targetCount = 3;
+        const QVector<Highlight> picked = AIHighlight::selectTopHighlights(input, cfg);
+        const bool sizeOk = picked.size() <= 3;
+        bool nonOverlap = true;
+        for (int i = 0; i < picked.size() && nonOverlap; ++i) {
+            for (int j = i + 1; j < picked.size() && nonOverlap; ++j) {
+                if (picked[i].overlaps(picked[j])) nonOverlap = false;
+            }
+        }
+        if (sizeOk && nonOverlap) pass("gate5-select-top");
+        else                       fail("gate5-select-top",
+                                         QStringLiteral("sizeOk=%1 nonOverlap=%2 picked=%3")
+                                             .arg(sizeOk).arg(nonOverlap).arg(picked.size()));
+    }
+
+    // gate 6: combineScores() with empty inputs
+    {
+        const QVector<Highlight> empty = AIHighlight::combineScores({}, {}, {}, HighlightConfig{});
+        if (empty.isEmpty()) pass("gate6-combine-empty");
+        else                 fail("gate6-combine-empty",
+                                   QStringLiteral("empty input produced %1 highlights").arg(empty.size()));
+    }
+
+    const QString summary = QStringLiteral("AIHIGHLIGHT-SELFTEST: %1/%2 PASS").arg(passed).arg(passed + failed);
+    if (failed == 0) qInfo().noquote() << summary;
+    else             qCritical().noquote() << summary;
+    writeLogLine("INFO", summary);
+    return failed == 0 ? 0 : 1;
+}
+
 // (VEDITOR_PROJECT_PRESET_SELFTEST=1).
 //
 // Validates MotionTrackerProjectState / PlanarTrackerProjectState persistence helpers
@@ -11894,6 +12021,10 @@ int main(int argc, char *argv[])
     if (qEnvironmentVariableIntValue("VEDITOR_PROJECT_PRESET_SELFTEST") != 0) {
         writeLogLine("INFO", "running VEDITOR_PROJECT_PRESET_SELFTEST");
         return runProjectPresetSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_AIHIGHLIGHT_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_AIHIGHLIGHT_SELFTEST");
+        return runAIHighlightSelftest();
     }
     if (qEnvironmentVariableIntValue("VEDITOR_VIDEOSTAB_DESHAKE_SELFTEST") != 0) {
         writeLogLine("INFO", "running VEDITOR_VIDEOSTAB_DESHAKE_SELFTEST");
