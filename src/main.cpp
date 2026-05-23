@@ -11944,6 +11944,7 @@ int main(int argc, char *argv[])
     // role) and also by the VEDITOR_TRACKMATTE_PARITY_SELFTEST env var for
     // consistency with the other VEDITOR_*_SELFTEST hooks below.
     if (app.arguments().contains(QStringLiteral("--selftest-trackmatte-parity"))
+        || app.arguments().contains(QStringLiteral("--selftest=trackmatte-parity"))
         || qEnvironmentVariableIntValue("VEDITOR_TRACKMATTE_PARITY_SELFTEST") != 0) {
         writeLogLine("INFO", "running --selftest-trackmatte-parity");
         return runTrackMatteParitySelftest();
@@ -12154,6 +12155,8 @@ int main(int argc, char *argv[])
     // The QApplication-free siblings (proxy/hdr-routing/tracker-preset/
     // planar-preset/project-preset/aihighlight/videostab-deshake) dispatch
     // earlier in main() before QApplication is constructed.
+    // PRD-ARGV-UNIFY-2: All remaining 43 env-gated selftests gain argv-switch
+    // aliases here. Both env-gate and argv-switch paths remain active.
     {
         const QStringList args = app.arguments();
         if (args.contains(QStringLiteral("--selftest=parity"))) {
@@ -12163,6 +12166,186 @@ int main(int argc, char *argv[])
         if (args.contains(QStringLiteral("--selftest=e2e"))) {
             writeLogLine("INFO", "argv-switch: --selftest=e2e");
             return runE2eSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=trackmatte-parity"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=trackmatte-parity");
+            return runTrackMatteParitySelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=vfx"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=vfx");
+            return runVfxSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=pro"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=pro");
+            return runProSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=mograph"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=mograph");
+            return runMographSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=hwperf"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=hwperf");
+            return runHwPerfSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=proext"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=proext");
+            return runProExtSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=shortcut"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=shortcut");
+            return runShortcutSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=social"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=social");
+            return runSocialSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=caption"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=caption");
+            return runCaptionSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=planar"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=planar");
+            return runPlanarSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=mobile"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=mobile");
+            return runMobileSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=obs"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=obs");
+            return runObsSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=affinity"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=affinity");
+            return runAffinitySelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=blender"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=blender");
+            return runBlenderSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=import"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=import");
+            return runImportSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=youtube"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=youtube");
+            return runYoutubeSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=collab"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=collab");
+            return runCollabSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=colormatch"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=colormatch");
+            return runColorMatchSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=vimeo"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=vimeo");
+            return runVimeoSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=twitch"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=twitch");
+            return runTwitchSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=frameio"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=frameio");
+            return runFrameIoSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=davinci"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=davinci");
+            return runDavinciSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=fcpxml"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=fcpxml");
+            return runFcpxmlSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=smartedit"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=smartedit");
+            return runSmartEditSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=cloudrender"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=cloudrender");
+            return runCloudRenderSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=xupload"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=xupload");
+            return runXUploadSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=instagram"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=instagram");
+            return runInstagramSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=projtmpl"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=projtmpl");
+            return runProjTmplSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=loudness"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=loudness");
+            return runLoudnessSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=hdr"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=hdr");
+            return runHdrSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=multicam"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=multicam");
+            return runMultiCamSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=batchexport"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=batchexport");
+            return runBatchExportSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=chroma"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=chroma");
+            return runChromaSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=audiorestore"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=audiorestore");
+            return runAudioRestoreSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=animexport"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=animexport");
+            return runAnimExportSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=easing"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=easing");
+            return runEasingSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=subxlat"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=subxlat");
+            return runSubXlatSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=lowerthird"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=lowerthird");
+            return runLowerThirdSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=watermark"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=watermark");
+            return runWatermarkSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=libavcore-encode"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=libavcore-encode");
+            return runLibavcoreEncodeSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=libavcore-decode"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=libavcore-decode");
+            return runLibavcoreDecodeSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=exportaudit"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=exportaudit");
+            return runExportAuditSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=textexport"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=textexport");
+            return runTextExportSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=workflow"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=workflow");
+            return runWorkflowSelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=audiomixer"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=audiomixer");
+            return runAudioMixerSelftest();
         }
     }
 
