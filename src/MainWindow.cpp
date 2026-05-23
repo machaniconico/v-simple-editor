@@ -1525,6 +1525,14 @@ void MainWindow::setupMenuBar()
     m_menuHelpEntries.append({shortcutCustomizeAction,
         QStringLiteral("メニューやツールバーのキーボードショートカットをカスタマイズしたり、Premiere/FinalCutPro/DaVinci 風プリセットへ切り替えたりします。")});
 
+    // US-TP-6: PRD-TP — モーショントラッカー preset 適用ダイアログ。Ctrl+Alt+T
+    // で開き、選択した preset を m_motionTracker に適用する。既存の
+    // motionTrackSetup() / trackMotion() 経路は変更しない。
+    editMenu->addSeparator();
+    QAction *trackerAct = editMenu->addAction(tr("モーショントラッカー (&T)..."));
+    trackerAct->setShortcut(QKeySequence(tr("Ctrl+Alt+T")));
+    connect(trackerAct, &QAction::triggered, this, &MainWindow::showMotionTrackerDialog);
+
     // お気に入り メニュー — placed right after 編集 so the user's hand-picked
     // shortcuts sit near the top of the menu bar. Mnemonic &O is unused by the
     // other top-level menus (F/E/V/T/I/A/K/P/S/C/H). The dynamic part (the
@@ -7808,6 +7816,26 @@ void MainWindow::openPlanarTrackerDialog()
     m_planarTrackerDialog->show();
     m_planarTrackerDialog->raise();
     m_planarTrackerDialog->activateWindow();
+}
+
+// US-TP-6: PRD-TP — open the motion-tracker preset dialog modally and, on
+// Accepted, apply the selected preset to m_motionTracker via the
+// tracker_preset::applyToMotionTracker() helper from US-TP-4. The dialog is a
+// stack-local QDialog (modal exec) — no persistent member is needed because
+// the apply path is fire-and-forget. Existing startTracking() call-sites
+// (around L5874/5877/5919) remain untouched.
+void MainWindow::showMotionTrackerDialog()
+{
+    if (!m_motionTracker) {
+        m_motionTracker = new MotionTracker(this);
+    }
+    MotionTrackerDialog dlg(this);
+    if (dlg.exec() == QDialog::Accepted) {
+        const auto preset = dlg.selectedPreset();
+        tracker_preset::applyToMotionTracker(m_motionTracker, preset);
+        statusBar()->showMessage(
+            tr("Tracker preset 適用: %1").arg(preset.displayName), 3000);
+    }
 }
 
 void MainWindow::openAudioClipEditorDialog()

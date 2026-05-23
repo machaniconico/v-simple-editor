@@ -162,8 +162,14 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/SpeechRecognizer.h
     src/SpeechRecognizer.cpp
     src/MotionTracker.cpp
+    src/MotionTrackerDialog.h
+    src/MotionTrackerDialog.cpp
     src/MotionStabilizer.cpp
     src/TrackerLink.cpp
+    src/TrackerPreset.h
+    src/TrackerPreset.cpp
+    src/TrackerPresetRegistry.h
+    src/TrackerPresetRegistry.cpp
     src/NoiseReduction.cpp
     src/ResourceGuide.cpp
     src/AutoSave.cpp

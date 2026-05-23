@@ -1,6 +1,7 @@
 #include "MotionTracker.h"
 #include <QThread>
 #include <QFile>
+#include <QDebug>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonArray>
@@ -54,11 +55,76 @@ MotionTracker::MotionTracker(QObject *parent)
 void MotionTracker::setSearchMargin(int margin)
 {
     m_searchMargin = qMax(10, margin);
+    m_searchRadius = qBound(0, m_searchMargin, 128);
+    m_baseSearchMargin = m_searchRadius;
+    if (!m_occluded)
+        m_currentSearchMargin = m_searchRadius;
 }
 
 void MotionTracker::setMinConfidence(double conf)
 {
     m_minConfidence = qBound(0.0, conf, 1.0);
+}
+
+void MotionTracker::setSearchRadius(int radius)
+{
+    const int clamped = qBound(0, radius, 128);
+    if (clamped != radius) {
+        qDebug() << "MotionTracker::setSearchRadius clamped" << radius << "to" << clamped;
+    }
+
+    m_searchRadius = clamped;
+    m_searchMargin = clamped;
+    m_baseSearchMargin = clamped;
+    if (!m_occluded)
+        m_currentSearchMargin = clamped;
+}
+
+void MotionTracker::setMatchMetric(MatchMetric m)
+{
+    switch (m) {
+    case MatchMetric::NCC:
+    case MatchMetric::SSD:
+    case MatchMetric::ZNCC:
+        m_matchMetric = m;
+        return;
+    }
+
+    qDebug() << "MotionTracker::setMatchMetric unsupported value"
+             << static_cast<int>(m) << "falling back to NCC";
+    m_matchMetric = MatchMetric::NCC;
+}
+
+void MotionTracker::setOcclusionThreshold(double v)
+{
+    const double clamped = qBound(0.0, v, 1.0);
+    if (clamped != v) {
+        qDebug() << "MotionTracker::setOcclusionThreshold clamped" << v << "to" << clamped;
+    }
+    m_occlusionThreshold = clamped;
+}
+
+void MotionTracker::setSubPixelPrecision(bool enabled)
+{
+    m_subPixelEnabled = enabled;
+}
+
+void MotionTracker::setKalmanProcessNoise(double q)
+{
+    const double clamped = qBound(0.0, q, 1.0);
+    if (clamped != q) {
+        qDebug() << "MotionTracker::setKalmanProcessNoise clamped" << q << "to" << clamped;
+    }
+    m_kalmanProcessNoise = clamped;
+}
+
+void MotionTracker::setKalmanMeasurementNoise(double r)
+{
+    const double clamped = qBound(0.0, r, 10.0);
+    if (clamped != r) {
+        qDebug() << "MotionTracker::setKalmanMeasurementNoise clamped" << r << "to" << clamped;
+    }
+    m_kalmanMeasurementNoise = clamped;
 }
 
 void MotionTracker::setKalmanEnabled(bool enabled)
@@ -76,8 +142,9 @@ void MotionTracker::setKalmanEnabled(bool enabled)
 //     [0 0 1 0]
 //     [0 0 0 1]
 // Measurement H = [1 0 0 0; 0 1 0 0]  (position only).
-// Process noise Q = diag(0.5, 0.5, 0.05, 0.05).
-// Measurement noise R baseline = diag(1.0, 1.0); inflated 4x when
+// Process noise Q is derived from m_kalmanProcessNoise. The default 0.1 maps
+// to the previous diag(0.5, 0.5, 0.05, 0.05) behavior.
+// Measurement noise R baseline = m_kalmanMeasurementNoise; inflated 4x when
 // matchScore < 0.7 * peakScoreSeenSoFar so a low-confidence frame cannot
 // yank the smoothed track.
 //
@@ -146,11 +213,13 @@ QPointF MotionTracker::kalmanSmooth(const QPointF &measurement, double matchScor
         Pp[i][2] = FP[i][2];
         Pp[i][3] = FP[i][3];
     }
-    // + Q = diag(0.5, 0.5, 0.05, 0.05)
-    Pp[0][0] += 0.5;
-    Pp[1][1] += 0.5;
-    Pp[2][2] += 0.05;
-    Pp[3][3] += 0.05;
+    // + Q. Preserve the previous default Q when m_kalmanProcessNoise == 0.1.
+    const double qPosition = 5.0 * m_kalmanProcessNoise;
+    const double qVelocity = 0.5 * m_kalmanProcessNoise;
+    Pp[0][0] += qPosition;
+    Pp[1][1] += qPosition;
+    Pp[2][2] += qVelocity;
+    Pp[3][3] += qVelocity;
 
     // --- Adaptive R -----------------------------------------------------
     // Update peak BEFORE computing R so the very first low-conf frame after
@@ -160,9 +229,9 @@ QPointF MotionTracker::kalmanSmooth(const QPointF &measurement, double matchScor
     const double peakBefore = m_peakScoreSeenSoFar;
     m_peakScoreSeenSoFar = qMax(m_peakScoreSeenSoFar, matchScore);
 
-    double rDiag = 1.0;
+    double rDiag = m_kalmanMeasurementNoise;
     if (peakBefore > 0.0 && matchScore < 0.7 * peakBefore) {
-        rDiag = 4.0;  // inflate R 4x for low-confidence frame
+        rDiag = m_kalmanMeasurementNoise * 4.0;  // inflate R 4x for low-confidence frame
     }
     // US-MT-3: consume one-shot R multiplier (set to 2.0 at re-acquire).
     // Default 1.0 = identity with US-MT-2.
@@ -249,7 +318,7 @@ QPointF MotionTracker::kalmanPredictOnly()
         m_kalmanState[3]
     };
 
-    // P_pred = F P F^T + Q  (matches kalmanSmooth Q = diag(0.5,0.5,0.05,0.05))
+    // P_pred = F P F^T + Q  (matches kalmanSmooth process-noise mapping)
     double FP[4][4];
     for (int j = 0; j < 4; ++j) {
         FP[0][j] = m_kalmanCov[0][j] + m_kalmanCov[2][j];
@@ -264,10 +333,12 @@ QPointF MotionTracker::kalmanPredictOnly()
         Pp[i][2] = FP[i][2];
         Pp[i][3] = FP[i][3];
     }
-    Pp[0][0] += 0.5;
-    Pp[1][1] += 0.5;
-    Pp[2][2] += 0.05;
-    Pp[3][3] += 0.05;
+    const double qPosition = 5.0 * m_kalmanProcessNoise;
+    const double qVelocity = 0.5 * m_kalmanProcessNoise;
+    Pp[0][0] += qPosition;
+    Pp[1][1] += qPosition;
+    Pp[2][2] += qVelocity;
+    Pp[3][3] += qVelocity;
 
     // Commit predicted state — no update step.
     for (int i = 0; i < 4; ++i) {
@@ -341,8 +412,8 @@ void MotionTracker::resetOcclusionState()
     m_consecLowScoreFrames = 0;
     m_consecOccludedFrames = 0;
     m_postReacquireRamp = 0;
-    m_baseSearchMargin = m_searchMargin;
-    m_currentSearchMargin = m_searchMargin;
+    m_baseSearchMargin = m_searchRadius;
+    m_currentSearchMargin = m_searchRadius;
     m_lastConfidentTemplate = QImage();
     m_lastConfidentTemplateFrame = -1;
     m_recentScores.clear();
@@ -351,7 +422,28 @@ void MotionTracker::resetOcclusionState()
 }
 
 // ---------------------------------------------------------------------------
-// Public: trackFrame — single-frame template matching
+// Private: computeMatchScore - selected higher-is-better match metric
+// ---------------------------------------------------------------------------
+
+double MotionTracker::computeMatchScore(const QImage &frame, const QImage &templ,
+                                        int offsetX, int offsetY) const
+{
+    switch (m_matchMetric) {
+    case MatchMetric::NCC:
+        return computeNCC(frame, templ, offsetX, offsetY);
+    case MatchMetric::SSD:
+        return computeSSD(frame, templ, offsetX, offsetY);
+    case MatchMetric::ZNCC:
+        return computeZNCC(frame, templ, offsetX, offsetY);
+    }
+
+    qDebug() << "MotionTracker::computeMatchScore unsupported metric"
+             << static_cast<int>(m_matchMetric) << "falling back to NCC";
+    return computeNCC(frame, templ, offsetX, offsetY);
+}
+
+// ---------------------------------------------------------------------------
+// Public: trackFrame - single-frame template matching
 // ---------------------------------------------------------------------------
 
 TrackingRegion MotionTracker::trackFrame(const QImage &currentFrame,
@@ -376,11 +468,11 @@ TrackingRegion MotionTracker::trackFrame(const QImage &currentFrame,
     if (ex < sx || ey < sy)
         return best;
 
-    // Slide template over search area, compute NCC at each position.
+    // Slide template over search area, compute the selected score at each position.
     int bestX = sx, bestY = sy;
     for (int y = sy; y <= ey; ++y) {
         for (int x = sx; x <= ex; ++x) {
-            double score = computeNCC(grayFrame, grayTempl, x, y);
+            double score = computeMatchScore(grayFrame, grayTempl, x, y);
             if (score > best.confidence) {
                 best.confidence = score;
                 best.rect = QRect(x, y, tw, th);
@@ -395,14 +487,15 @@ TrackingRegion MotionTracker::trackFrame(const QImage &currentFrame,
     // Only refine when all 4 cardinal neighbours are inside the search window;
     // otherwise leave subPixelCenter default-constructed so callers fall back
     // to the integer center.
-    if (best.confidence >= 0.0 &&
+    if (m_subPixelEnabled &&
+        best.confidence >= 0.0 &&
         bestX > sx && bestX < ex && bestY > sy && bestY < ey)
     {
         const double sCenter = best.confidence;
-        const double sLeft   = computeNCC(grayFrame, grayTempl, bestX - 1, bestY);
-        const double sRight  = computeNCC(grayFrame, grayTempl, bestX + 1, bestY);
-        const double sUp     = computeNCC(grayFrame, grayTempl, bestX,     bestY - 1);
-        const double sDown   = computeNCC(grayFrame, grayTempl, bestX,     bestY + 1);
+        const double sLeft   = computeMatchScore(grayFrame, grayTempl, bestX - 1, bestY);
+        const double sRight  = computeMatchScore(grayFrame, grayTempl, bestX + 1, bestY);
+        const double sUp     = computeMatchScore(grayFrame, grayTempl, bestX,     bestY - 1);
+        const double sDown   = computeMatchScore(grayFrame, grayTempl, bestX,     bestY + 1);
 
         const double denomX = sLeft - 2.0 * sCenter + sRight;
         const double denomY = sUp   - 2.0 * sCenter + sDown;
@@ -733,12 +826,16 @@ bool MotionTracker::decodeAndTrack(const QString &filePath, const QRect &initial
 
                     if (!m_occluded) {
                         // --- Occlusion onset detection -----------------------
-                        // Rule A: matchScore < 0.3 * peakScore for 1 frame.
-                        // Rule B: matchScore < 0.5 * median for 2 consecutive frames.
+                        // Rule A default: matchScore < 0.3 * peakScore for 1 frame.
+                        // Rule B default: matchScore < 0.5 * median for 2 consecutive frames.
+                        const double peakOnsetThreshold =
+                            qBound(0.0, 0.6 * m_occlusionThreshold, 1.0);
+                        const double medianOnsetThreshold = m_occlusionThreshold;
                         bool ruleA = (peakBefore > 0.0 &&
-                                      matchScore < 0.3 * peakBefore);
+                                      matchScore < peakOnsetThreshold * peakBefore);
                         bool ruleB = false;
-                        if (medianBefore > 0.0 && matchScore < 0.5 * medianBefore) {
+                        if (medianBefore > 0.0 &&
+                            matchScore < medianOnsetThreshold * medianBefore) {
                             m_consecLowScoreFrames++;
                             if (m_consecLowScoreFrames >= 2)
                                 ruleB = true;
@@ -752,10 +849,10 @@ bool MotionTracker::decodeAndTrack(const QString &filePath, const QRect &initial
                             m_occludedSince = frameCount;
                             m_consecOccludedFrames = 1;
                             m_consecLowScoreFrames = 0;
-                            // Expand search radius to min(96, srcDim/2). srcDim
-                            // = min(frameW, frameH) is the conservative bound.
+                            // Expand search radius to min(max(base, 96), srcDim/2).
+                            // srcDim = min(frameW, frameH) is the conservative bound.
                             const int srcDim = qMin(frameW, frameH);
-                            m_currentSearchMargin = qMin(96, srcDim / 2);
+                            m_currentSearchMargin = qMin(qMax(m_searchRadius, 96), srcDim / 2);
                             if (m_currentSearchMargin < m_baseSearchMargin)
                                 m_currentSearchMargin = m_baseSearchMargin;
                         }
@@ -774,8 +871,11 @@ bool MotionTracker::decodeAndTrack(const QString &filePath, const QRect &initial
                             continue;
                         }
 
-                        // Re-acquire when score recovers to > 0.7 * peak.
-                        if (peakBefore > 0.0 && matchScore > 0.7 * peakBefore) {
+                        // Re-acquire default: score recovers to > 0.7 * peak.
+                        const double reacquireThreshold =
+                            qBound(0.0, m_occlusionThreshold + 0.2, 1.0);
+                        if (peakBefore > 0.0 &&
+                            matchScore > reacquireThreshold * peakBefore) {
                             m_occluded = false;
                             m_occludedSince = -1;
                             m_consecOccludedFrames = 0;
@@ -801,7 +901,7 @@ bool MotionTracker::decodeAndTrack(const QString &filePath, const QRect &initial
                         int rampLeft = m_postReacquireRamp;
                         const int srcDim = qMin(frameW, frameH);
                         const int expanded = qMax(m_baseSearchMargin,
-                                                  qMin(96, srcDim / 2));
+                                                  qMin(qMax(m_searchRadius, 96), srcDim / 2));
                         const int delta = expanded - m_baseSearchMargin;
                         // After this frame's lerp, decrement so next frame
                         // shrinks further. At rampLeft==1 we set to base
@@ -909,6 +1009,42 @@ double MotionTracker::computeNCC(const QImage &frame, const QImage &templ,
     if (den < 1e-10) return 0.0;
 
     return num / den;
+}
+
+double MotionTracker::computeSSD(const QImage &frame, const QImage &templ,
+                                 int offsetX, int offsetY)
+{
+    int tw = templ.width();
+    int th = templ.height();
+
+    if (offsetX < 0 || offsetY < 0 ||
+        offsetX + tw > frame.width() || offsetY + th > frame.height())
+        return -1.0;
+
+    const int count = tw * th;
+    if (count <= 0)
+        return -1.0;
+
+    double sumSquaredDiff = 0.0;
+    for (int y = 0; y < th; ++y) {
+        const uchar *fRow = frame.constScanLine(offsetY + y);
+        const uchar *tRow = templ.constScanLine(y);
+        for (int x = 0; x < tw; ++x) {
+            const double diff = static_cast<double>(fRow[offsetX + x]) - tRow[x];
+            sumSquaredDiff += diff * diff;
+        }
+    }
+
+    const double normalizedMse = sumSquaredDiff / (static_cast<double>(count) * 255.0 * 255.0);
+    return 1.0 - qBound(0.0, normalizedMse, 1.0);
+}
+
+double MotionTracker::computeZNCC(const QImage &frame, const QImage &templ,
+                                  int offsetX, int offsetY)
+{
+    // The legacy NCC implementation already subtracts local/template means,
+    // so ZNCC explicitly shares that path while keeping the preset enum stable.
+    return computeNCC(frame, templ, offsetX, offsetY);
 }
 
 // ---------------------------------------------------------------------------

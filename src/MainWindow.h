@@ -74,6 +74,8 @@
 #include "AudioDucking.h"
 #include "ExportDialog.h"          // brings in HDRSettings
 #include "AIProcessingDialog.h"    // brings in AIProcessingSettings
+#include "MotionTrackerDialog.h"   // US-TP-6: motion tracker preset dialog
+#include "TrackerPreset.h"         // US-TP-6: tracker preset apply helper
 
 class VideoPlayer;
 class Timeline;
@@ -384,6 +386,9 @@ private slots:
 
     // US-PT-B: Sprint 15 — Planar (4-corner) tracker dialog
     void openPlanarTrackerDialog();
+
+    // US-TP-6: PRD-TP — モーショントラッカー preset 適用ダイアログ
+    void showMotionTrackerDialog();
 
     // US-SC-B: Sprint 12 — ショートカット設定ダイアログ
     void openShortcutCustomizeDialog();

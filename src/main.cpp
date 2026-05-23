@@ -59,6 +59,9 @@
 #include "MaskSystem.h"
 #include "TrackMatteBake.h"  // TM-6 parity: shared trackmatte::composite SSOT under test
 #include "TrackMatteKey.h"   // RM-4: hoisted snapshotTrackClips / remapTrackMatteEntriesAfterMutation
+#include "TrackerPreset.h"         // US-TP-7: tracker preset selftest
+#include "TrackerPresetRegistry.h" // US-TP-7: Registry CRUD gate
+#include "MotionTracker.h"         // US-TP-7: applyToMotionTracker target
 #include "OpticalFlow.h"
 #include "RotoAutoTrace.h"
 #include "RotoTracking.h"
@@ -5843,6 +5846,106 @@ int runVideostabDeshakeSelftest()
 }
 
 // US-B3-8: DLL-ready HDR routing regression gate
+// US-TP-7: tracker preset application regression gate
+// (VEDITOR_TRACKER_PRESET_SELFTEST=1).
+//
+// Validates without spawning any subprocess or QApplication::exec():
+//   (1) builtinPresets().size() == 7
+//   (2) findBuiltin(id) succeeds for all 7
+//   (3) toJson/fromJson round-trip is lossless for all 7
+//   (4) fromJson rejects 3 classes of invalid input
+//   (5) applyToMotionTracker runs without crash for all 7 + nullptr safety
+//   (6) Registry::allPresets().size() >= 7
+//   (7) Registry CRUD: save -> list -> remove -> list
+static int runTrackerPresetSelftest()
+{
+    using tracker_preset::TrackerPreset;
+    auto fail = [](const QString& msg) -> int {
+        writeLogLine("CRIT", QString("TRACKER-PRESET selftest FAILED: %1").arg(msg));
+        return 1;
+    };
+    writeLogLine("INFO", "TRACKER-PRESET selftest: preset application regression gate");
+
+    // (1) builtinPresets().size() == 7
+    const auto& builtins = tracker_preset::builtinPresets();
+    if (builtins.size() != 7)
+        return fail(QString("builtinPresets size != 7 (got %1)").arg(builtins.size()));
+    writeLogLine("INFO", QString("TRACKER-PRESET (1): builtinPresets count = %1").arg(builtins.size()));
+
+    // (2) findBuiltin success for all 7
+    for (const auto& p : builtins) {
+        if (!tracker_preset::findBuiltin(p.id).has_value())
+            return fail(QString("findBuiltin failed for id=%1").arg(p.id));
+    }
+    writeLogLine("INFO", "TRACKER-PRESET (2): findBuiltin OK for all 7");
+
+    // (3) toJson/fromJson round-trip
+    for (const auto& p : builtins) {
+        const auto j  = tracker_preset::toJson(p);
+        const auto rt = tracker_preset::fromJson(j);
+        if (!rt.has_value())
+            return fail(QString("fromJson(toJson(p)) failed for id=%1").arg(p.id));
+        const auto& q = *rt;
+        if (q.id != p.id || q.displayName != p.displayName
+            || q.searchRadius != p.searchRadius
+            || q.kalmanEnabled != p.kalmanEnabled
+            || q.matchMetric != p.matchMetric
+            || q.subPixelEnabled != p.subPixelEnabled)
+            return fail(QString("round-trip mismatch for id=%1").arg(p.id));
+    }
+    writeLogLine("INFO", "TRACKER-PRESET (3): round-trip OK for all 7");
+
+    // (4) fromJson rejects invalid inputs
+    {
+        QJsonObject bad1; bad1["id"] = "x"; bad1["displayName"] = "x"; bad1["searchRadius"] = -1;
+        if (tracker_preset::fromJson(bad1).has_value())
+            return fail("fromJson accepted searchRadius=-1");
+        QJsonObject bad2; bad2["id"] = "x"; bad2["displayName"] = "x"; bad2["matchMetric"] = "UNKNOWN";
+        if (tracker_preset::fromJson(bad2).has_value())
+            return fail("fromJson accepted matchMetric=UNKNOWN");
+        QJsonObject bad3; bad3["id"] = "x"; bad3["displayName"] = "x"; bad3["occlusionGate"] = 2.0;
+        if (tracker_preset::fromJson(bad3).has_value())
+            return fail("fromJson accepted occlusionGate=2.0");
+    }
+    writeLogLine("INFO", "TRACKER-PRESET (4): fromJson rejects 3 invalid inputs");
+
+    // (5) applyToMotionTracker — all 7 + nullptr safety
+    MotionTracker tracker;
+    for (const auto& p : builtins)
+        tracker_preset::applyToMotionTracker(&tracker, p);
+    tracker_preset::applyToMotionTracker(nullptr, builtins.front());
+    writeLogLine("INFO", "TRACKER-PRESET (5): applyToMotionTracker OK for all 7 + nullptr");
+
+    // (6) Registry::allPresets().size() >= 7
+    const int registrySize = static_cast<int>(tracker_preset::Registry::instance().allPresets().size());
+    if (registrySize < 7)
+        return fail(QString("Registry::allPresets size < 7 (got %1)").arg(registrySize));
+    writeLogLine("INFO", QString("TRACKER-PRESET (6): Registry size = %1").arg(registrySize));
+
+    // (7) Registry CRUD
+    TrackerPreset custom = builtins.front();
+    custom.id          = QStringLiteral("__selftest-tmp-custom");
+    custom.displayName = QStringLiteral("__selftest-tmp-custom");
+    if (!tracker_preset::Registry::instance().saveUserPreset(custom))
+        return fail("saveUserPreset failed");
+    {
+        bool found = false;
+        for (const auto& p : tracker_preset::Registry::instance().allPresets())
+            if (p.id == custom.id) { found = true; break; }
+        if (!found)
+            return fail("saved preset not in allPresets after save");
+    }
+    if (!tracker_preset::Registry::instance().removeUserPreset(custom.id))
+        return fail("removeUserPreset failed");
+    for (const auto& p : tracker_preset::Registry::instance().allPresets())
+        if (p.id == custom.id)
+            return fail("removed preset still in allPresets");
+    writeLogLine("INFO", "TRACKER-PRESET (7): Registry CRUD OK");
+
+    writeLogLine("INFO", "TRACKER-PRESET selftest PASSED");
+    return 0;
+}
+
 // (VEDITOR_HDR_ROUTING_SELFTEST=1).
 //
 // Validates three invariants without spawning any subprocess or QProcess:
@@ -11283,6 +11386,10 @@ int main(int argc, char *argv[])
     if (qEnvironmentVariableIntValue("VEDITOR_HDR_ROUTING_SELFTEST") != 0) {
         writeLogLine("INFO", "running VEDITOR_HDR_ROUTING_SELFTEST");
         return runHdrRoutingSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_TRACKER_PRESET_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_TRACKER_PRESET_SELFTEST");
+        return runTrackerPresetSelftest();
     }
     if (qEnvironmentVariableIntValue("VEDITOR_VIDEOSTAB_DESHAKE_SELFTEST") != 0) {
         writeLogLine("INFO", "running VEDITOR_VIDEOSTAB_DESHAKE_SELFTEST");
