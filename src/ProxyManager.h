@@ -161,8 +161,9 @@ private:
     QString currentEffectiveEncoder() const;
     void processNextInQueue();
 
-    // Mirror of ffmpegHasEncoder for the decoder side. Probes the linked
-    // libavcodec registry through libavcore::Probe.
+    // Legacy-named helper for settings UI compatibility (mirror of
+    // ffmpegHasEncoder for the decoder side). Probes the linked libavcodec
+    // registry through libavcore::Probe; no subprocess is spawned.
     static bool ffmpegHasDecoder(const QString &decoderName);
 
     // Read the source file duration in microseconds via libavcore::Probe.

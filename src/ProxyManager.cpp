@@ -70,9 +70,10 @@ struct ProxyTranscodeResult {
 
 bool proxyEncoderAvailableForInProcess(const std::string &name)
 {
-    // The bundled libavcodec build exposes Media Foundation H.264 and omits
-    // the historical subprocess GPU encoder chain. Keep that chain disabled
-    // for proxy generation even if a developer build happens to register it.
+    // The bundled libavcodec build exposes only Media Foundation H.264 on
+    // Windows and software libx264 elsewhere; NVENC/QSV/AMF GPU encoders are
+    // not in the registry. Reject them up-front so a stale user override does
+    // not propagate into an unavailable encoder request to FrameEncoder.
     if (name == "h264_nvenc" || name == "h264_qsv" || name == "h264_amf")
         return false;
     // Prefer the in-process Media Foundation path when present; libx264 is
@@ -163,7 +164,7 @@ ProxyTranscodeResult runProxyTranscode(const ProxyTranscodeJob &job,
     request.audioSourcePath = job.originalPath.toUtf8().constData();
     // Seed the request with the encoder the in-process fallback chain would
     // actually resolve to (h264_mf on Windows, libx264 elsewhere). A bare
-    // "libx264" here was self-contradictory: encoderAvailableHook below
+    // "libx264" here would be self-contradictory: encoderAvailableHook below
     // reports it unavailable whenever h264_mf is registered. FrameEncoder
     // re-runs its own fallback chain regardless, but starting from the real
     // candidate keeps the request internally consistent and the diagnostics
@@ -827,6 +828,7 @@ void ProxyManager::saveIndex()
 
 void ProxyManager::cancelGeneration()
 {
+    qInfo().noquote() << QStringLiteral("[ProxyManager] cancellation requested by user");
     m_cancelRequested.store(true, std::memory_order_release);
     m_queue.clear();
 
