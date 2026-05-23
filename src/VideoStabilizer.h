@@ -58,12 +58,6 @@ public:
     void stabilize(const QString &inputPath, const QString &outputPath,
                    const StabilizerConfig &config = {});
 
-    // Legacy "analyze only" entry point. deshake has no separate detection
-    // pass (no .trf file), so this is retained as a no-op shim for
-    // backward-compatibility — it immediately emits analysisComplete with an
-    // empty path. The signature is preserved so external callers compile.
-    void analyzeOnly(const QString &inputPath, const StabilizerConfig &config = {});
-
     void setModel(Model model);
     Model model() const { return m_model; }
     void setPlanarTrack(const planartrack::PlanarTrack *track);
@@ -84,7 +78,6 @@ public:
 signals:
     void progressChanged(int percent);
     void stabilizeComplete(bool success, const QString &message);
-    void analysisComplete(const QString &trfPath);
 
 private:
     static planartrack::Homography invertHomographyWithFallback(const planartrack::Homography &H,

@@ -6207,11 +6207,27 @@ void MainWindow::stabilizeVideo()
     StabilizerConfig config;
     config.smoothing = smoothing;
 
+    auto *progress = new QProgressDialog(
+        tr("スタビライズ中..."), tr("キャンセル"), 0, 100, this);
+    progress->setWindowTitle(tr("スタビライズ"));
+    progress->setWindowModality(Qt::ApplicationModal);
+    progress->setMinimumDuration(500);
+
     connect(m_stabilizer, &VideoStabilizer::progressChanged, this, [this](int pct) {
         statusBar()->showMessage(QString("Stabilizing... %1%").arg(pct));
     }, Qt::UniqueConnection);
+    connect(m_stabilizer, &VideoStabilizer::progressChanged,
+            progress, &QProgressDialog::setValue, Qt::UniqueConnection);
+    connect(progress, &QProgressDialog::canceled,
+            m_stabilizer, &VideoStabilizer::cancel,
+            Qt::UniqueConnection);
     connect(m_stabilizer, &VideoStabilizer::stabilizeComplete, this, [this](bool ok2, const QString &msg) {
         statusBar()->showMessage(ok2 ? "Stabilization complete" : "Stabilization failed: " + msg);
+    }, Qt::UniqueConnection);
+    connect(m_stabilizer, &VideoStabilizer::stabilizeComplete,
+            this, [progress](bool, const QString &) {
+        progress->close();
+        progress->deleteLater();
     }, Qt::UniqueConnection);
 
     m_stabilizer->stabilize(clip.filePath, outputPath, config);

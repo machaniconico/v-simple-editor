@@ -5836,6 +5836,34 @@ int runVideostabDeshakeSelftest()
     }
 
     // -----------------------------------------------------------------------
+    // (8) cancel() callable smoke test
+    // -----------------------------------------------------------------------
+    {
+        VideoStabilizer canceler;
+        canceler.cancel();
+        qInfo().noquote() << "[INFO] VIDEOSTAB-DESHAKE (8): VideoStabilizer::cancel() callable";
+    }
+
+    // -----------------------------------------------------------------------
+    // (9) analyzeOnly / analysisComplete removal regression gate (US-VST-1)
+    // -----------------------------------------------------------------------
+    {
+        VideoStabilizer probe;
+        const QMetaObject *mo = probe.metaObject();
+        const int idx1 = mo->indexOfMethod("analyzeOnly(QString)");
+        const int idx2 = mo->indexOfMethod("analyzeOnly(QString,StabilizerConfig)");
+        const int sigIdx = mo->indexOfSignal("analysisComplete(QString)");
+        if (idx1 != -1 || idx2 != -1 || sigIdx != -1) {
+            qCritical().noquote() << "VIDEOSTAB-DESHAKE (9) FAILED: analyzeOnly or "
+                                      "analysisComplete signal re-introduced - regression!";
+            QFile::remove(inputPath);
+            QFile::remove(outputPath);
+            return 1;
+        }
+        qInfo().noquote() << "[INFO] VIDEOSTAB-DESHAKE (9): analyzeOnly/analysisComplete removal confirmed";
+    }
+
+    // -----------------------------------------------------------------------
     // Cleanup
     // -----------------------------------------------------------------------
     QFile::remove(inputPath);

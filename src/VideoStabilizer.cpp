@@ -12,6 +12,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <optional>
+#include <string>
 
 extern "C" {
 #include <libswscale/swscale.h>
@@ -25,6 +27,7 @@ constexpr planartrack::Homography kIdentityHomography = {
     0.0, 1.0, 0.0,
     0.0, 0.0, 1.0
 };
+thread_local std::optional<std::string> s_lastDeshakeError;
 
 bool isPlanarFrameIndexValid(const planartrack::PlanarTrack *track, int frameIndex)
 {
@@ -72,11 +75,15 @@ void VideoStabilizer::setOutputCropPercent(double percent)
 
 QImage VideoStabilizer::stabilizeFrame(const QImage &source, int frameIndex) const
 {
-    if (source.isNull())
+    if (source.isNull()) {
+        qWarning() << "VideoStabilizer::stabilizeFrame: null source image at frame" << frameIndex;
         return QImage();
+    }
 
-    if (m_model != Model::PlanarInversion || m_planarTrack == nullptr)
+    if (m_model != Model::PlanarInversion || m_planarTrack == nullptr) {
+        qDebug() << "VideoStabilizer::stabilizeFrame: no planar track, returning source unchanged at frame" << frameIndex;
         return source;
+    }
 
     return applyPlanarInversion(source, frameIndex);
 }
@@ -289,12 +296,15 @@ bool VideoStabilizer::stabilizeDeshake(const QString &inputPath,
     request.outputPath = outputPath.toStdString();
     request.filterDescription = buildDeshakeFilter(config).toStdString();
     // videoCodecName="libx264" lets VideoFilterGraph's encoder fallback chain
-    // resolve to h264_mf on Windows (PRD-B-MF). copyAudio=true reproduces the
-    // prior pass-2 ffmpeg "-c:a copy" passthrough behaviour.
+    // resolve to h264_mf on Windows (PRD-B-MF). copyAudio=true passes the
+    // source audio stream through unchanged (equivalent to the old vidstab
+    // pass-2 audio-copy behaviour, now handled in-process).
     request.videoCodecName = "libx264";
     request.copyAudio = true;
 
     emit progressChanged(0);
+
+    s_lastDeshakeError.reset();
 
     libavcore::VideoFilterGraph graph;
     auto err = graph.run(
@@ -307,6 +317,8 @@ bool VideoStabilizer::stabilizeDeshake(const QString &inputPath,
         });
 
     if (err.has_value() || m_cancelled) {
+        if (err.has_value())
+            s_lastDeshakeError = *err;
         QFile::remove(outputPath);
         return false;
     }
@@ -340,10 +352,11 @@ bool VideoStabilizer::stabilizePlanarInversion(const QString &inputPath, const Q
         : 30.0;
     const int fpsRounded = std::max(1, static_cast<int>(std::lround(fpsValue)));
 
-    // --- Encoder: replaces the "rawvideo rgba pipe -> mux -c:a copy" process.
+    // --- Encoder: in-process FrameEncoder (PRD-B2 US-B2-5).
     // videoCodecName="libx264" lets FrameEncoder's fallback chain resolve to
-    // h264_mf on Windows; audioSourcePath=inputPath reproduces the prior
-    // "-map 1:a? -c:a copy" audio passthrough behaviour.
+    // h264_mf on Windows; audioSourcePath=inputPath copies the source audio
+    // stream unchanged (in-process equivalent of the old subprocess audio
+    // passthrough).
     libavcore::EncodeRequest request;
     request.width = vprops.width;
     request.height = vprops.height;
@@ -409,12 +422,11 @@ bool VideoStabilizer::stabilizePlanarInversion(const QString &inputPath, const Q
         sws_scale(toRgbaCtx, frame->data, frame->linesize, 0, frame->height,
                   rgbaDest, rgbaLinesize);
 
-        // Per-frame homography processing — identical to the subprocess path.
+        // Per-frame homography processing.
         // h264 output carries no alpha plane: the transparent crop frame
         // (applyTransparentCrop) and any area left uncovered by a non-identity
-        // homography are flattened to black here. This matches the pre-PRD-B2
-        // subprocess path, whose encoder command had no -c:v and therefore
-        // muxed h264 into the .mp4/.mov — so this is parity, not a regression.
+        // homography are flattened to black here. This is parity with the
+        // behaviour before PRD-B2 (h264 mux, no alpha), not a regression.
         // The explicit RGB888 conversion makes that flattening visible at the
         // call site rather than relying on pushFrame()'s hidden internal one.
         const QImage stabilized = stabilizeFrame(rawFrame, frameIndex)
@@ -446,10 +458,10 @@ bool VideoStabilizer::stabilizePlanarInversion(const QString &inputPath, const Q
     // returns nullptr for BOTH a clean EOF and a fatal mid-stream decode
     // error, and videoEnded() does not distinguish them — so a corrupt input
     // would otherwise break the loop, finalize() cleanly and report success
-    // with a truncated output file. The old subprocess path guarded against
-    // this via the decoder QProcess exit status (decodeOk && encodeOk). We
-    // restore that guarantee here with a frameIndex-based sanity check, with
-    // no change to the Decode API.
+    // with a truncated output file. We guard against this with a
+    // frameIndex-based sanity check: zero frames decoded from a video stream,
+    // or a large shortfall vs. the expected frame count, signals a mid-stream
+    // abort and causes the output to be discarded.
     bool decodeFailed = false;
     if (frameIndex == 0) {
         // Not a single frame decoded from a stream that reported video.
@@ -505,31 +517,23 @@ void VideoStabilizer::stabilize(const QString &inputPath, const QString &outputP
         const bool ok = stabilizeDeshake(inputPath, outputPath, config);
         if (!ok || m_cancelled) {
             QFile::remove(outputPath);
-            emit stabilizeComplete(false,
-                m_cancelled ? "Stabilization cancelled" : "Deshake stabilization failed");
+            const auto err = s_lastDeshakeError;
+            if (m_cancelled) {
+                emit stabilizeComplete(false, tr("スタビライズを中断しました"));
+            } else if (err.has_value()) {
+                emit stabilizeComplete(false,
+                    tr("スタビライズに失敗しました: %1").arg(QString::fromStdString(*err)));
+            } else {
+                emit stabilizeComplete(false, tr("スタビライズに失敗しました: %1").arg(tr("不明なエラー")));
+            }
             return;
         }
 
-        emit stabilizeComplete(true, "Stabilization complete");
+        emit stabilizeComplete(true, tr("スタビライズが完了しました"));
     });
 
     connect(thread, &QThread::finished, thread, &QThread::deleteLater);
     thread->start();
-}
-
-void VideoStabilizer::analyzeOnly(const QString &inputPath, const StabilizerConfig &config)
-{
-    // PRD-B3 US-B3-3: the deshake filter is single-pass with no separate
-    // detection step (no .trf file). The legacy two-pass vidstab analyzeOnly()
-    // path is therefore dropped. This method is retained as a no-op shim for
-    // backward compatibility — it immediately reports completion and emits
-    // analysisComplete() with an empty path. There are no live callers in the
-    // codebase today; this preserves the public signature for any future use.
-    Q_UNUSED(inputPath);
-    Q_UNUSED(config);
-    m_cancelled = false;
-    emit progressChanged(100);
-    emit analysisComplete(QString());
 }
 
 void VideoStabilizer::cancel()
