@@ -11731,13 +11731,47 @@ int main(int argc, char *argv[])
     writeLogLine("INFO", "=== V Simple Editor starting ===");
     writeLogLine("INFO", QString("log path: %1").arg(g_logFilePath));
 
-    // PRD-PROXY-SELFTEST-V2: argv-switch dispatcher before QApplication construction.
-    // Lets WSL invoke selftests directly without the env-propagation quirks
-    // that PRD-PROXY-CLEAN US-PXC-3 hit. See [[feedback-selftest-avoid-singleton-init]].
+    // PRD-ARGV-UNIFY: argv-switch dispatcher BEFORE QApplication construction.
+    // Originally seeded by PRD-PROXY-SELFTEST-V2 (--selftest=proxy) to dodge
+    // the env-propagation quirks PRD-PROXY-CLEAN US-PXC-3 hit
+    // ([[feedback-selftest-avoid-singleton-init]]). Extended here so any
+    // QApplication-free selftest is reachable via WSL direct exec
+    // (`./build_win/Release/v-simple-editor.exe --selftest=<name>`).
+    //
+    // Each entry below MUST stay QApplication-free — they run before
+    // QApplication construction. QApplication-dependent selftests
+    // (parity, e2e — both seed real Timeline/QWidget paths) are dispatched
+    // by the second argv-switch loop below, just above the env-gate block.
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--selftest=proxy") == 0) {
             writeLogLine("INFO", "argv-switch: --selftest=proxy");
             return runProxySelftestV2();
+        }
+        if (std::strcmp(argv[i], "--selftest=hdr-routing") == 0) {
+            writeLogLine("INFO", "argv-switch: --selftest=hdr-routing");
+            return runHdrRoutingSelftest();
+        }
+        if (std::strcmp(argv[i], "--selftest=tracker-preset") == 0) {
+            writeLogLine("INFO", "argv-switch: --selftest=tracker-preset");
+            return runTrackerPresetSelftest();
+        }
+#ifdef HAVE_PLANARTRACKER_PRESET
+        if (std::strcmp(argv[i], "--selftest=planar-preset") == 0) {
+            writeLogLine("INFO", "argv-switch: --selftest=planar-preset");
+            return runPlanarPresetSelftest();
+        }
+#endif
+        if (std::strcmp(argv[i], "--selftest=project-preset") == 0) {
+            writeLogLine("INFO", "argv-switch: --selftest=project-preset");
+            return runProjectPresetSelftest();
+        }
+        if (std::strcmp(argv[i], "--selftest=aihighlight") == 0) {
+            writeLogLine("INFO", "argv-switch: --selftest=aihighlight");
+            return runAIHighlightSelftest();
+        }
+        if (std::strcmp(argv[i], "--selftest=videostab-deshake") == 0) {
+            writeLogLine("INFO", "argv-switch: --selftest=videostab-deshake");
+            return runVideostabDeshakeSelftest();
         }
     }
 
@@ -12112,6 +12146,26 @@ int main(int argc, char *argv[])
         writeLogLine("INFO", "running VEDITOR_LIBAVCORE_DECODE_SELFTEST");
         return runLibavcoreDecodeSelftest();
     }
+    // PRD-ARGV-UNIFY: argv-switch dispatcher AFTER QApplication construction.
+    // Mirrors the env-gate block below for selftests that need a live
+    // QApplication (parity seeds a QWidget Timeline; e2e wires real
+    // decode/encode through Qt-aware libs). Lets WSL drive them via
+    // `--selftest=parity` / `--selftest=e2e` without env vars.
+    // The QApplication-free siblings (proxy/hdr-routing/tracker-preset/
+    // planar-preset/project-preset/aihighlight/videostab-deshake) dispatch
+    // earlier in main() before QApplication is constructed.
+    {
+        const QStringList args = app.arguments();
+        if (args.contains(QStringLiteral("--selftest=parity"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=parity");
+            return runParitySelftest();
+        }
+        if (args.contains(QStringLiteral("--selftest=e2e"))) {
+            writeLogLine("INFO", "argv-switch: --selftest=e2e");
+            return runE2eSelftest();
+        }
+    }
+
     if (qEnvironmentVariableIntValue("VEDITOR_HDR_ROUTING_SELFTEST") != 0) {
         writeLogLine("INFO", "running VEDITOR_HDR_ROUTING_SELFTEST");
         return runHdrRoutingSelftest();
