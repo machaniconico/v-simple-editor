@@ -9,6 +9,7 @@
 
 #include "PlanarTracker.h"
 #include "PlanarTrackerPreset.h"
+#include "ProjectFile.h"
 
 class QComboBox;
 class QDialogButtonBox;
@@ -72,6 +73,10 @@ public:
 
     // Result after tracking
     QList<planar::Frame> trackResult() const;
+
+    // PRD-PROJECT-PRESET US-PP-4: project-state persistence hooks
+    void setInitialState(const PlanarTrackerProjectState& s);
+    PlanarTrackerProjectState currentState() const;
 
 public slots:
     void accept() override;

@@ -401,6 +401,14 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
         root["colormatch"] = colormatch;
     }
 
+    // PRD-PROJECT-PRESET: tracker preset state persistence
+    {
+        QJsonObject trackerPresets;
+        trackerPresets["motion"] = motionTrackerStateToJson(data.motionTrackerState);
+        trackerPresets["planar"] = planarTrackerStateToJson(data.planarTrackerState);
+        root["trackerPresets"] = trackerPresets;
+    }
+
     QJsonDocument doc(root);
     QFile file(filePath);
     if (!file.open(QIODevice::WriteOnly))
@@ -659,6 +667,13 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
         data.colorMatchLastReferenceClip = colormatch.value("lastReferenceClip").toString();
     }
 
+    // PRD-PROJECT-PRESET: tracker preset state persistence (backward compat: missing key = default struct)
+    {
+        const QJsonObject tp = root.value("trackerPresets").toObject();
+        data.motionTrackerState = motionTrackerStateFromJson(tp.value("motion").toObject());
+        data.planarTrackerState = planarTrackerStateFromJson(tp.value("planar").toObject());
+    }
+
     return true;
 }
 
@@ -902,6 +917,14 @@ QString ProjectFile::toJsonString(const ProjectData &data)
         QJsonObject colormatch;
         colormatch["lastReferenceClip"] = data.colorMatchLastReferenceClip;
         root["colormatch"] = colormatch;
+    }
+
+    // PRD-PROJECT-PRESET: tracker preset state persistence
+    {
+        QJsonObject trackerPresets;
+        trackerPresets["motion"] = motionTrackerStateToJson(data.motionTrackerState);
+        trackerPresets["planar"] = planarTrackerStateToJson(data.planarTrackerState);
+        root["trackerPresets"] = trackerPresets;
     }
 
     QJsonDocument doc(root);
@@ -1152,6 +1175,13 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
     if (root.contains("colormatch")) {
         const QJsonObject colormatch = root["colormatch"].toObject();
         data.colorMatchLastReferenceClip = colormatch.value("lastReferenceClip").toString();
+    }
+
+    // PRD-PROJECT-PRESET: tracker preset state persistence (backward compat: missing key = default struct)
+    {
+        const QJsonObject tp = root.value("trackerPresets").toObject();
+        data.motionTrackerState = motionTrackerStateFromJson(tp.value("motion").toObject());
+        data.planarTrackerState = planarTrackerStateFromJson(tp.value("planar").toObject());
     }
 
     return true;
@@ -1900,6 +1930,63 @@ WiggleClipEntry ProjectFile::wiggleClipEntryFromJson(const QJsonObject &obj)
     entry.clipId = obj["clipId"].toString();
     entry.params = wiggle::fromJson(obj["params"].toObject());
     return entry;
+}
+
+// --- PRD-PROJECT-PRESET: tracker preset state serialization ---
+
+QJsonObject ProjectFile::motionTrackerStateToJson(const MotionTrackerProjectState &s)
+{
+    QJsonObject o;
+    o["lastPresetId"]           = s.lastPresetId;
+    o["searchRadius"]           = s.searchRadius;
+    o["matchMetric"]            = s.matchMetric;
+    o["kalmanEnabled"]          = s.kalmanEnabled;
+    o["kalmanProcessNoise"]     = s.kalmanProcessNoise;
+    o["kalmanMeasurementNoise"] = s.kalmanMeasurementNoise;
+    o["occlusionGate"]          = s.occlusionGate;
+    o["subPixelEnabled"]        = s.subPixelEnabled;
+    o["minConfidence"]          = s.minConfidence;
+    return o;
+}
+
+MotionTrackerProjectState ProjectFile::motionTrackerStateFromJson(const QJsonObject &obj)
+{
+    MotionTrackerProjectState s;
+    if (obj.contains("lastPresetId"))           s.lastPresetId           = obj.value("lastPresetId").toString();
+    if (obj.contains("searchRadius"))           s.searchRadius           = std::clamp(obj.value("searchRadius").toInt(s.searchRadius), 1, 256);
+    if (obj.contains("matchMetric")) {
+        const QString m = obj.value("matchMetric").toString();
+        s.matchMetric = m.isEmpty() ? QStringLiteral("NCC") : m;
+    }
+    if (obj.contains("kalmanEnabled"))          s.kalmanEnabled          = obj.value("kalmanEnabled").toBool(s.kalmanEnabled);
+    if (obj.contains("kalmanProcessNoise"))     s.kalmanProcessNoise     = std::clamp(obj.value("kalmanProcessNoise").toDouble(s.kalmanProcessNoise), 0.0, 10.0);
+    if (obj.contains("kalmanMeasurementNoise")) s.kalmanMeasurementNoise = std::clamp(obj.value("kalmanMeasurementNoise").toDouble(s.kalmanMeasurementNoise), 0.0, 10.0);
+    if (obj.contains("occlusionGate"))          s.occlusionGate          = std::clamp(obj.value("occlusionGate").toDouble(s.occlusionGate), 0.0, 1000.0);
+    if (obj.contains("subPixelEnabled"))        s.subPixelEnabled        = obj.value("subPixelEnabled").toBool(s.subPixelEnabled);
+    if (obj.contains("minConfidence"))          s.minConfidence          = std::clamp(obj.value("minConfidence").toDouble(s.minConfidence), 0.0, 1.0);
+    return s;
+}
+
+QJsonObject ProjectFile::planarTrackerStateToJson(const PlanarTrackerProjectState &s)
+{
+    QJsonObject o;
+    o["lastPresetId"]     = s.lastPresetId;
+    o["searchRadiusPx"]   = s.searchRadiusPx;
+    o["patchSizePx"]      = s.patchSizePx;
+    o["dampingFactor"]    = s.dampingFactor;
+    o["maxFramesPerCall"] = s.maxFramesPerCall;
+    return o;
+}
+
+PlanarTrackerProjectState ProjectFile::planarTrackerStateFromJson(const QJsonObject &obj)
+{
+    PlanarTrackerProjectState s;
+    if (obj.contains("lastPresetId"))     s.lastPresetId     = obj.value("lastPresetId").toString();
+    if (obj.contains("searchRadiusPx"))   s.searchRadiusPx   = std::clamp(obj.value("searchRadiusPx").toDouble(s.searchRadiusPx), 4.0, 64.0);
+    if (obj.contains("patchSizePx"))      s.patchSizePx      = std::clamp(obj.value("patchSizePx").toDouble(s.patchSizePx), 16.0, 128.0);
+    if (obj.contains("dampingFactor"))    s.dampingFactor    = std::clamp(obj.value("dampingFactor").toDouble(s.dampingFactor), 0.0, 1.0);
+    if (obj.contains("maxFramesPerCall")) s.maxFramesPerCall = std::max(0, obj.value("maxFramesPerCall").toInt(s.maxFramesPerCall));
+    return s;
 }
 
 QJsonObject ProjectFile::vfxStateToJson(const ProjectVfxState &state)

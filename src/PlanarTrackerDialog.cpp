@@ -457,6 +457,53 @@ planar_tracker_preset::PlanarTrackerPreset PlanarTrackerDialog::selectedPreset()
 }
 
 // ---------------------------------------------------------------------------
+// PRD-PROJECT-PRESET US-PP-4: restore dialog widgets from persisted project state.
+void PlanarTrackerDialog::setInitialState(const PlanarTrackerProjectState& s)
+{
+    // Restore last-used preset selection by id
+    if (!s.lastPresetId.isEmpty() && m_presetCombo) {
+        for (int i = 0; i < m_presets.size(); ++i) {
+            if (m_presets.at(i).id == s.lastPresetId) {
+                m_presetCombo->setCurrentIndex(i);
+                break;
+            }
+        }
+    }
+
+    // Restore widget values without triggering change signals
+    setPresetWidgetSignalsBlocked(true);
+
+    if (m_patchSizeSpin)
+        m_patchSizeSpin->setValue(static_cast<int>(s.patchSizePx));
+    if (m_searchRadiusSpin)
+        m_searchRadiusSpin->setValue(static_cast<int>(s.searchRadiusPx));
+    if (m_dampingSpin)
+        m_dampingSpin->setValue(static_cast<int>(s.dampingFactor * 100.0));
+
+    setPresetWidgetSignalsBlocked(false);
+}
+
+// ---------------------------------------------------------------------------
+// PRD-PROJECT-PRESET US-PP-4: snapshot current dialog widget state for persistence.
+PlanarTrackerProjectState PlanarTrackerDialog::currentState() const
+{
+    PlanarTrackerProjectState s;
+
+    const int idx = currentPresetIndex();
+    if (idx >= 0 && idx < m_presets.size())
+        s.lastPresetId = m_presets.at(idx).id;
+
+    if (m_patchSizeSpin)
+        s.patchSizePx = static_cast<double>(m_patchSizeSpin->value());
+    if (m_searchRadiusSpin)
+        s.searchRadiusPx = static_cast<double>(m_searchRadiusSpin->value());
+    if (m_dampingSpin)
+        s.dampingFactor = m_dampingSpin->value() / 100.0;
+
+    return s;
+}
+
+// ---------------------------------------------------------------------------
 void PlanarTrackerDialog::accept()
 {
     emit presetApplied(selectedPreset());

@@ -3877,6 +3877,10 @@ void MainWindow::populateProjectData(ProjectData &data)
     data.hdrSettings = m_hdrSettings;
     data.aiSettings  = m_aiSettings;
 
+    // PRD-PROJECT-PRESET US-PP-4: persist tracker dialog states.
+    data.motionTrackerState = m_motionTrackerState;
+    data.planarTrackerState = m_planarTrackerState;
+
     collectAudioState(data);
 
     data.smartReframe = m_smartReframe.toJson();
@@ -4021,6 +4025,11 @@ void MainWindow::applyLoadedProjectData(const ProjectData &data, const QString &
     // US-EXT-10: restore project-level HDR + AI processing settings.
     m_hdrSettings = data.hdrSettings;
     m_aiSettings  = data.aiSettings;
+
+    // PRD-PROJECT-PRESET US-PP-4: restore tracker dialog states.
+    m_motionTrackerState = data.motionTrackerState;
+    m_planarTrackerState = data.planarTrackerState;
+
     m_selectedVideoTrackIndex = -1;
     m_selectedVideoClipIndexTracked = -1;
 
@@ -7828,7 +7837,19 @@ void MainWindow::openPlanarTrackerDialog()
     if (!m_planarTrackerDialog) {
         m_planarTrackerDialog = new PlanarTrackerDialog(this);
         m_planarTrackerDialog->setObjectName(QStringLiteral("planarTrackerDialog"));
+
+        // PRD-PROJECT-PRESET US-PP-4: write back state when dialog is closed.
+        connect(m_planarTrackerDialog, &QDialog::finished, this,
+                [this](int /*result*/) {
+                    if (m_planarTrackerDialog)
+                        m_planarTrackerState = m_planarTrackerDialog->currentState();
+                },
+                Qt::UniqueConnection);
     }
+
+    // PRD-PROJECT-PRESET US-PP-4: restore state before showing.
+    m_planarTrackerDialog->setInitialState(m_planarTrackerState);
+
     m_planarTrackerDialog->show();
     m_planarTrackerDialog->raise();
     m_planarTrackerDialog->activateWindow();
@@ -7846,7 +7867,9 @@ void MainWindow::showMotionTrackerDialog()
         m_motionTracker = new MotionTracker(this);
     }
     MotionTrackerDialog dlg(this);
+    dlg.setInitialState(m_motionTrackerState);   // PRD-PROJECT-PRESET US-PP-4: restore
     if (dlg.exec() == QDialog::Accepted) {
+        m_motionTrackerState = dlg.currentState();  // PRD-PROJECT-PRESET US-PP-4: save
         const auto preset = dlg.selectedPreset();
         tracker_preset::applyToMotionTracker(m_motionTracker, preset);
         statusBar()->showMessage(

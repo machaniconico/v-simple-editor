@@ -442,3 +442,55 @@ int MotionTrackerDialog::currentPresetIndex() const
         return -1;
     return index;
 }
+
+void MotionTrackerDialog::setInitialState(const MotionTrackerProjectState& s)
+{
+    // (a) lastPresetId が m_presets 内に見つかれば combo を選択
+    //     (currentIndexChanged trigger で applyPresetToWidgets が走る)
+    if (!s.lastPresetId.isEmpty() && m_presetCombo) {
+        for (int i = 0; i < m_presets.size(); ++i) {
+            if (m_presets.at(i).id == s.lastPresetId) {
+                m_presetCombo->setCurrentIndex(i);
+                break;
+            }
+        }
+    }
+
+    // (b) widget value を struct field で上書き (custom values が built-in を上書き)
+    //     applyPresetToWidgets と同じ pattern で blockSignals
+    setWidgetSignalsBlocked(true);
+
+    if (m_searchRadiusSpin)            m_searchRadiusSpin->setValue(s.searchRadius);
+    if (m_matchMetricCombo) {
+        const int idx = m_matchMetricCombo->findText(s.matchMetric, Qt::MatchFixedString);
+        m_matchMetricCombo->setCurrentIndex(idx >= 0 ? idx : 0);
+    }
+    if (m_kalmanEnabledCheck)          m_kalmanEnabledCheck->setChecked(s.kalmanEnabled);
+    if (m_kalmanProcessNoiseSpin)      m_kalmanProcessNoiseSpin->setValue(s.kalmanProcessNoise);
+    if (m_kalmanMeasurementNoiseSpin)  m_kalmanMeasurementNoiseSpin->setValue(s.kalmanMeasurementNoise);
+    if (m_occlusionGateSpin)           m_occlusionGateSpin->setValue(s.occlusionGate);
+    if (m_subPixelEnabledCheck)        m_subPixelEnabledCheck->setChecked(s.subPixelEnabled);
+    if (m_minConfidenceSpin)           m_minConfidenceSpin->setValue(s.minConfidence);
+
+    setWidgetSignalsBlocked(false);
+}
+
+MotionTrackerProjectState MotionTrackerDialog::currentState() const
+{
+    MotionTrackerProjectState s;
+
+    const int idx = currentPresetIndex();
+    if (idx >= 0 && idx < m_presets.size())
+        s.lastPresetId = m_presets.at(idx).id;
+
+    if (m_searchRadiusSpin)            s.searchRadius           = m_searchRadiusSpin->value();
+    if (m_matchMetricCombo)            s.matchMetric            = m_matchMetricCombo->currentText();
+    if (m_kalmanEnabledCheck)          s.kalmanEnabled          = m_kalmanEnabledCheck->isChecked();
+    if (m_kalmanProcessNoiseSpin)      s.kalmanProcessNoise     = m_kalmanProcessNoiseSpin->value();
+    if (m_kalmanMeasurementNoiseSpin)  s.kalmanMeasurementNoise = m_kalmanMeasurementNoiseSpin->value();
+    if (m_occlusionGateSpin)           s.occlusionGate          = m_occlusionGateSpin->value();
+    if (m_subPixelEnabledCheck)        s.subPixelEnabled        = m_subPixelEnabledCheck->isChecked();
+    if (m_minConfidenceSpin)           s.minConfidence          = m_minConfidenceSpin->value();
+
+    return s;
+}

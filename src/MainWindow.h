@@ -694,6 +694,10 @@ private:
     // US-PT-B: Sprint 15 — Planar (4-corner) tracker dialog, kept alive between invocations.
     PlanarTrackerDialog *m_planarTrackerDialog = nullptr;
 
+    // PRD-PROJECT-PRESET US-PP-4: tracker dialog state persistence across project save/load.
+    MotionTrackerProjectState  m_motionTrackerState;
+    PlanarTrackerProjectState  m_planarTrackerState;
+
     // US-SC-B: Sprint 12 — ショートカット管理 (preset/カスタムバインド)。
     // m_shortcutManager は registerAction で登録した QAction* の弱参照を保ち、
     // m_shortcutCustomizeDialog はモードレスダイアログとして再利用する。

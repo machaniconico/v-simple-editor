@@ -4,6 +4,7 @@
 #include <QList>
 #include <QMetaType>
 
+#include "ProjectFile.h"
 #include "TrackerPreset.h"
 
 class QCheckBox;
@@ -21,6 +22,9 @@ public:
     explicit MotionTrackerDialog(QWidget* parent = nullptr);
 
     tracker_preset::TrackerPreset selectedPreset() const;
+
+    void setInitialState(const MotionTrackerProjectState& s);
+    MotionTrackerProjectState currentState() const;
 
 public slots:
     void accept() override;

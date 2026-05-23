@@ -6198,6 +6198,248 @@ static int runPlanarPresetSelftest()
 }
 #endif // HAVE_PLANARTRACKER_PRESET
 
+// (VEDITOR_PROJECT_PRESET_SELFTEST=1).
+//
+// Validates MotionTrackerProjectState / PlanarTrackerProjectState persistence helpers
+// without spawning any subprocess or QApplication::exec():
+//   gate1  - MotionTrackerProjectState defaults
+//   gate2  - PlanarTrackerProjectState defaults
+//   gate3  - MotionTrackerProjectState JSON round-trip
+//   gate4  - PlanarTrackerProjectState JSON round-trip
+//   gate5  - ProjectData (defaults) toJsonString/fromJsonString round-trip
+//   gate6  - ProjectData (custom values) toJsonString/fromJsonString round-trip
+//   gate7  - legacy format (no trackerPresets key) yields defaults without crash
+//   gate8  - out-of-range values are clamped by fromJson
+//   gate9  - JSON schema contains trackerPresets / motion / planar keys
+//   gate10 - empty lastPresetId round-trip
+static int runProjectPresetSelftest()
+{
+    qInfo().noquote() << "[PROJECT-PRESET-SELFTEST] start";
+    writeLogLine("INFO", "[PROJECT-PRESET-SELFTEST] start");
+
+    int passed = 0;
+    int failed = 0;
+    auto pass = [&](const char* gateName) {
+        qInfo().noquote() << QStringLiteral("[PROJECT-PRESET-SELFTEST] %1 PASS").arg(QString::fromLatin1(gateName));
+        writeLogLine("INFO", QStringLiteral("[PROJECT-PRESET-SELFTEST] %1 PASS").arg(QString::fromLatin1(gateName)));
+        ++passed;
+    };
+    auto fail = [&](const char* gateName, const QString& reason) {
+        qCritical().noquote() << QStringLiteral("[PROJECT-PRESET-SELFTEST] %1 FAIL: %2").arg(QString::fromLatin1(gateName), reason);
+        writeLogLine("CRIT", QStringLiteral("[PROJECT-PRESET-SELFTEST] %1 FAIL: %2").arg(QString::fromLatin1(gateName), reason));
+        ++failed;
+    };
+
+    // gate1: MotionTrackerProjectState defaults
+    {
+        MotionTrackerProjectState s;
+        if (s.lastPresetId.isEmpty()
+            && s.searchRadius == 16
+            && s.matchMetric == QStringLiteral("NCC")
+            && s.kalmanEnabled == false
+            && qFuzzyCompare(s.kalmanProcessNoise, 0.01)
+            && qFuzzyCompare(s.kalmanMeasurementNoise, 0.1)
+            && qFuzzyCompare(s.occlusionGate, 30.0)
+            && s.subPixelEnabled == true
+            && qFuzzyCompare(s.minConfidence, 0.5)) {
+            pass("gate1-motion-defaults");
+        } else {
+            fail("gate1-motion-defaults", QStringLiteral("default values mismatch"));
+        }
+    }
+
+    // gate2: PlanarTrackerProjectState defaults
+    {
+        PlanarTrackerProjectState s;
+        if (s.lastPresetId.isEmpty()
+            && qFuzzyCompare(s.searchRadiusPx, 16.0)
+            && qFuzzyCompare(s.patchSizePx, 32.0)
+            && qFuzzyCompare(s.dampingFactor, 0.3)
+            && s.maxFramesPerCall == 0) {
+            pass("gate2-planar-defaults");
+        } else {
+            fail("gate2-planar-defaults", QStringLiteral("default values mismatch"));
+        }
+    }
+
+    // gate3: MotionTrackerProjectState JSON round-trip
+    {
+        MotionTrackerProjectState orig;
+        orig.lastPresetId = QStringLiteral("custom-foo");
+        orig.searchRadius = 24;
+        orig.matchMetric = QStringLiteral("SSD");
+        orig.kalmanEnabled = true;
+        orig.kalmanProcessNoise = 0.05;
+        orig.kalmanMeasurementNoise = 0.2;
+        orig.occlusionGate = 60.0;
+        orig.subPixelEnabled = false;
+        orig.minConfidence = 0.7;
+
+        const QJsonObject j = ProjectFile::motionTrackerStateToJson(orig);
+        const MotionTrackerProjectState rt = ProjectFile::motionTrackerStateFromJson(j);
+
+        if (rt.lastPresetId == orig.lastPresetId
+            && rt.searchRadius == orig.searchRadius
+            && rt.matchMetric == orig.matchMetric
+            && rt.kalmanEnabled == orig.kalmanEnabled
+            && qFuzzyCompare(rt.kalmanProcessNoise, orig.kalmanProcessNoise)
+            && qFuzzyCompare(rt.kalmanMeasurementNoise, orig.kalmanMeasurementNoise)
+            && qFuzzyCompare(rt.occlusionGate, orig.occlusionGate)
+            && rt.subPixelEnabled == orig.subPixelEnabled
+            && qFuzzyCompare(rt.minConfidence, orig.minConfidence)) {
+            pass("gate3-motion-round-trip");
+        } else {
+            fail("gate3-motion-round-trip", QStringLiteral("field mismatch"));
+        }
+    }
+
+    // gate4: PlanarTrackerProjectState JSON round-trip
+    {
+        PlanarTrackerProjectState orig;
+        orig.lastPresetId = QStringLiteral("robust-motion");
+        orig.searchRadiusPx = 32.0;
+        orig.patchSizePx = 48.0;
+        orig.dampingFactor = 0.5;
+        orig.maxFramesPerCall = 100;
+
+        const QJsonObject j = ProjectFile::planarTrackerStateToJson(orig);
+        const PlanarTrackerProjectState rt = ProjectFile::planarTrackerStateFromJson(j);
+
+        if (rt.lastPresetId == orig.lastPresetId
+            && qFuzzyCompare(rt.searchRadiusPx, orig.searchRadiusPx)
+            && qFuzzyCompare(rt.patchSizePx, orig.patchSizePx)
+            && qFuzzyCompare(rt.dampingFactor, orig.dampingFactor)
+            && rt.maxFramesPerCall == orig.maxFramesPerCall) {
+            pass("gate4-planar-round-trip");
+        } else {
+            fail("gate4-planar-round-trip", QStringLiteral("field mismatch"));
+        }
+    }
+
+    // gate5: ProjectData (defaults) toJsonString/fromJsonString round-trip
+    {
+        ProjectData data;
+        const QString json = ProjectFile::toJsonString(data);
+        ProjectData restored;
+        if (!ProjectFile::fromJsonString(json, restored)) {
+            fail("gate5-projectdata-defaults-round-trip", QStringLiteral("fromJsonString failed"));
+        } else if (restored.motionTrackerState.searchRadius == 16
+                   && restored.motionTrackerState.matchMetric == QStringLiteral("NCC")
+                   && qFuzzyCompare(restored.planarTrackerState.searchRadiusPx, 16.0)
+                   && qFuzzyCompare(restored.planarTrackerState.patchSizePx, 32.0)) {
+            pass("gate5-projectdata-defaults-round-trip");
+        } else {
+            fail("gate5-projectdata-defaults-round-trip", QStringLiteral("defaults not preserved"));
+        }
+    }
+
+    // gate6: ProjectData (custom values) toJsonString/fromJsonString round-trip
+    {
+        ProjectData data;
+        data.motionTrackerState.lastPresetId = QStringLiteral("custom-a");
+        data.motionTrackerState.searchRadius = 32;
+        data.motionTrackerState.matchMetric = QStringLiteral("ZNCC");
+        data.planarTrackerState.lastPresetId = QStringLiteral("fast-preview");
+        data.planarTrackerState.searchRadiusPx = 12.0;
+        data.planarTrackerState.dampingFactor = 0.2;
+
+        const QString json = ProjectFile::toJsonString(data);
+        ProjectData restored;
+        const bool ok = ProjectFile::fromJsonString(json, restored);
+        if (ok
+            && restored.motionTrackerState.lastPresetId == QStringLiteral("custom-a")
+            && restored.motionTrackerState.searchRadius == 32
+            && restored.motionTrackerState.matchMetric == QStringLiteral("ZNCC")
+            && restored.planarTrackerState.lastPresetId == QStringLiteral("fast-preview")
+            && qFuzzyCompare(restored.planarTrackerState.searchRadiusPx, 12.0)
+            && qFuzzyCompare(restored.planarTrackerState.dampingFactor, 0.2)) {
+            pass("gate6-projectdata-custom-round-trip");
+        } else {
+            fail("gate6-projectdata-custom-round-trip", QStringLiteral("custom values lost"));
+        }
+    }
+
+    // gate7: legacy format (no trackerPresets key) yields defaults without crash
+    {
+        const QString oldFormat = QStringLiteral("{ \"version\": \"old\", \"config\": {} }");
+        ProjectData restored;
+        ProjectFile::fromJsonString(oldFormat, restored);  // return value intentionally ignored
+        if (restored.motionTrackerState.searchRadius == 16
+            && restored.motionTrackerState.matchMetric == QStringLiteral("NCC")
+            && qFuzzyCompare(restored.planarTrackerState.searchRadiusPx, 16.0)) {
+            pass("gate7-legacy-format-defaults");
+        } else {
+            fail("gate7-legacy-format-defaults", QStringLiteral("legacy format did not yield defaults"));
+        }
+    }
+
+    // gate8: out-of-range values are clamped by fromJson
+    {
+        QJsonObject jMotion;
+        jMotion["searchRadius"] = -5;
+        jMotion["minConfidence"] = 2.5;
+        jMotion["occlusionGate"] = -50.0;
+        const MotionTrackerProjectState m = ProjectFile::motionTrackerStateFromJson(jMotion);
+
+        QJsonObject jPlanar;
+        jPlanar["searchRadiusPx"] = 200.0;
+        jPlanar["patchSizePx"] = 8.0;
+        jPlanar["dampingFactor"] = 2.0;
+        const PlanarTrackerProjectState p = ProjectFile::planarTrackerStateFromJson(jPlanar);
+
+        const bool motionOK = (m.searchRadius >= 1 && m.searchRadius <= 256)
+                              && (m.minConfidence >= 0.0 && m.minConfidence <= 1.0)
+                              && (m.occlusionGate >= 0.0 && m.occlusionGate <= 1000.0);
+        const bool planarOK = (p.searchRadiusPx >= 4.0 && p.searchRadiusPx <= 64.0)
+                              && (p.patchSizePx >= 16.0 && p.patchSizePx <= 128.0)
+                              && (p.dampingFactor >= 0.0 && p.dampingFactor <= 1.0);
+        if (motionOK && planarOK) {
+            pass("gate8-clamp");
+        } else {
+            fail("gate8-clamp",
+                 QStringLiteral("clamp failed: m.sr=%1 m.mc=%2 m.og=%3 p.sr=%4 p.ps=%5 p.df=%6")
+                     .arg(m.searchRadius).arg(m.minConfidence).arg(m.occlusionGate)
+                     .arg(p.searchRadiusPx).arg(p.patchSizePx).arg(p.dampingFactor));
+        }
+    }
+
+    // gate9: JSON schema contains trackerPresets / motion / planar keys
+    {
+        ProjectData data;
+        const QString jsonStr = ProjectFile::toJsonString(data);
+        const QJsonDocument doc = QJsonDocument::fromJson(jsonStr.toUtf8());
+        const QJsonObject root = doc.object();
+        if (root.contains("trackerPresets")
+            && root.value("trackerPresets").toObject().contains("motion")
+            && root.value("trackerPresets").toObject().contains("planar")) {
+            pass("gate9-schema");
+        } else {
+            fail("gate9-schema", QStringLiteral("trackerPresets / motion / planar key missing"));
+        }
+    }
+
+    // gate10: empty lastPresetId round-trip
+    {
+        MotionTrackerProjectState s;  // lastPresetId default = empty string
+        const QJsonObject j = ProjectFile::motionTrackerStateToJson(s);
+        const MotionTrackerProjectState rt = ProjectFile::motionTrackerStateFromJson(j);
+        if (rt.lastPresetId.isEmpty()) {
+            pass("gate10-empty-preset-id");
+        } else {
+            fail("gate10-empty-preset-id", QStringLiteral("empty lastPresetId not preserved"));
+        }
+    }
+
+    const QString summary = QStringLiteral("PROJECT-PRESET-SELFTEST: %1/%2 PASS").arg(passed).arg(passed + failed);
+    if (failed == 0) {
+        qInfo().noquote() << summary;
+    } else {
+        qCritical().noquote() << summary;
+    }
+    writeLogLine(failed == 0 ? "INFO" : "CRIT", summary);
+    return failed == 0 ? 0 : 1;
+}
+
 // (VEDITOR_HDR_ROUTING_SELFTEST=1).
 //
 // Validates three invariants without spawning any subprocess or QProcess:
@@ -11649,6 +11891,10 @@ int main(int argc, char *argv[])
         return runPlanarPresetSelftest();
     }
 #endif
+    if (qEnvironmentVariableIntValue("VEDITOR_PROJECT_PRESET_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_PROJECT_PRESET_SELFTEST");
+        return runProjectPresetSelftest();
+    }
     if (qEnvironmentVariableIntValue("VEDITOR_VIDEOSTAB_DESHAKE_SELFTEST") != 0) {
         writeLogLine("INFO", "running VEDITOR_VIDEOSTAB_DESHAKE_SELFTEST");
         return runVideostabDeshakeSelftest();

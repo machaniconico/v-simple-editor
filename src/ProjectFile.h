@@ -191,6 +191,27 @@ struct ProjectVfxState {
     ProjectLightWrapState lightWrap;
 };
 
+// PRD-PROJECT-PRESET: tracker preset persistence — value-only structs (no TrackerPreset.h / PlanarTrackerPreset.h dependency)
+struct MotionTrackerProjectState {
+    QString lastPresetId;
+    int searchRadius = 16;
+    QString matchMetric = "NCC";
+    bool kalmanEnabled = false;
+    double kalmanProcessNoise = 0.01;
+    double kalmanMeasurementNoise = 0.1;
+    double occlusionGate = 30.0;
+    bool subPixelEnabled = true;
+    double minConfidence = 0.5;
+};
+
+struct PlanarTrackerProjectState {
+    QString lastPresetId;
+    double searchRadiusPx = 16.0;
+    double patchSizePx = 32.0;
+    double dampingFactor = 0.3;
+    int maxFramesPerCall = 0;
+};
+
 // Full project state for serialization
 struct ProjectData {
     ProjectConfig config;
@@ -271,6 +292,10 @@ struct ProjectData {
 
     // US-INT-3: Sprint 19 — Auto color match memory. Persisted under root["colormatch"].
     QString colorMatchLastReferenceClip;
+
+    // PRD-PROJECT-PRESET: tracker preset persistence
+    MotionTrackerProjectState motionTrackerState;
+    PlanarTrackerProjectState planarTrackerState;
 };
 
 class ProjectFile
@@ -283,6 +308,12 @@ public:
     static bool fromJsonString(const QString &json, ProjectData &data);
 
     static const QString fileFilter() { return "V Editor Project (*.veditor);;All Files (*)"; }
+
+    // PRD-PROJECT-PRESET: tracker preset state serialization helpers (public for selftest access)
+    static QJsonObject motionTrackerStateToJson(const MotionTrackerProjectState &s);
+    static MotionTrackerProjectState motionTrackerStateFromJson(const QJsonObject &obj);
+    static QJsonObject planarTrackerStateToJson(const PlanarTrackerProjectState &s);
+    static PlanarTrackerProjectState planarTrackerStateFromJson(const QJsonObject &obj);
 
 private:
     // Serialization helpers
