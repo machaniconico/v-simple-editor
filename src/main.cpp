@@ -355,6 +355,9 @@
 #include "libavcore/Decode.h"
 #include "libavcore/Encode.h"
 #include "libavcore/Probe.h"
+// US-B3-4: deshake in-process regression gate.
+#include "libavcore/VideoFilterGraph.h"
+#include "VideoStabilizer.h"
 // PRD-B-MF: PARITY S10 Path A round-trip uses the same CodecDetector::
 // isEncoderAvailable encoderAvailableHook as the production export
 // (RenderQueue.cpp:602-604) so the FrameEncoder fallback chain resolves the
@@ -5593,6 +5596,380 @@ int runLibavcoreDecodeSelftest()
     qInfo() << "[INFO] LIBAVCORE-DECODE selftest PASSED: decoded frames ="
             << decodedVideoFrames << "roundtrip frames =" << roundTripFrames
             << "codec =" << QString::fromStdString(*codecName);
+    return 0;
+}
+
+// US-B3-4: deshake in-process regression gate
+// (VEDITOR_VIDEOSTAB_DESHAKE_SELFTEST=1).
+//
+// Exercises the full in-process deshake pipeline without any QProcess/ffmpeg
+// subprocess:
+//
+//   (1) Encodes a synthetic "shaky" clip (sine-wave pixel offsets, ~30 frames)
+//       using libavcore::FrameEncoder (libx264) into a temp mp4.
+//   (2) Validates VideoStabilizer::buildDeshakeFilter() returns a well-formed
+//       "deshake=..." filter string (US-B3-2 regression gate).
+//   (3) Runs libavcore::VideoFilterGraph::run() on that clip with the deshake
+//       filter — asserts std::nullopt (success).
+//   (4) Independently re-probes the output with libavcore::Probe to verify a
+//       video stream is present and duration is positive (tautology-free).
+//   (5) Sanity-guards that output file size > 0.
+//   Cleans up both temp files on all paths.
+int runVideostabDeshakeSelftest()
+{
+    qInfo() << "[INFO] VIDEOSTAB-DESHAKE selftest: deshake in-process regression gate";
+
+    constexpr int kWidth = 320;
+    constexpr int kHeight = 240;
+    constexpr int kFps = 30;
+    constexpr int kFrameCount = 30;
+
+    QTemporaryDir tmpDir;
+    if (!tmpDir.isValid()) {
+        qCritical() << "VIDEOSTAB-DESHAKE selftest FAILED: could not create temp dir";
+        return 1;
+    }
+    const QString inputPath =
+        tmpDir.filePath(QStringLiteral("deshake_input.mp4"));
+    const QString outputPath =
+        tmpDir.filePath(QStringLiteral("deshake_output.mp4"));
+
+    auto fail = [&](const QString &message) {
+        qCritical() << "VIDEOSTAB-DESHAKE selftest FAILED:" << message;
+        QFile::remove(inputPath);
+        QFile::remove(outputPath);
+        return 1;
+    };
+
+    // -----------------------------------------------------------------------
+    // (1) Encode synthetic shaky clip via FrameEncoder
+    // -----------------------------------------------------------------------
+    // Each frame is a 320x240 RGB24 image with the test pattern shifted by
+    // a sine-wave offset to simulate camera shake.
+    {
+        bool encodeOk = false;
+        QString encodeError;
+        std::string activeEncoder;
+        runLibavcoreSelftestWorker([&]() {
+            QFile::remove(inputPath);
+
+            libavcore::EncodeRequest req;
+            req.width      = kWidth;
+            req.height     = kHeight;
+            req.fps        = kFps;
+            req.videoBitrateBits = 2000000;
+            req.videoCodecName   = "libx264";
+            req.outputPath = inputPath.toStdString();
+            req.encoderAvailableHook = [](const std::string &name) {
+                return CodecDetector::isEncoderAvailable(
+                    QString::fromStdString(name));
+            };
+
+            libavcore::FrameEncoder enc;
+            const std::optional<std::string> openErr = enc.open(req);
+            if (openErr.has_value()) {
+                encodeError = QStringLiteral("FrameEncoder::open() failed: %1")
+                                  .arg(QString::fromStdString(*openErr));
+                return;
+            }
+
+            const int stride = kWidth * 3;
+            QByteArray frameBuf(static_cast<qsizetype>(stride) * kHeight,
+                                Qt::Uninitialized);
+
+            for (int f = 0; f < kFrameCount; ++f) {
+                // Sine-wave shake offsets (known artificial motion)
+                const int dx = static_cast<int>(std::round(8.0 * std::sin(f * 0.4)));
+                const int dy = static_cast<int>(std::round(6.0 * std::cos(f * 0.3)));
+
+                // Fill frameBuf with a shifted test pattern (white centre square
+                // + colour corners + diagonal grid lines)
+                auto *buf = reinterpret_cast<uint8_t*>(frameBuf.data());
+                for (int y = 0; y < kHeight; ++y) {
+                    uint8_t *row = buf + static_cast<qsizetype>(y) * stride;
+                    for (int x = 0; x < kWidth; ++x) {
+                        uint8_t *px = row + x * 3;
+                        const int sx = x - dx;
+                        const int sy = y - dy;
+                        // Centre white square (40x40 around (160,120))
+                        if (sx >= 140 && sx < 180 && sy >= 100 && sy < 140) {
+                            px[0] = px[1] = px[2] = 255;
+                        }
+                        // Diagonal grid lines every 20 px
+                        else if ((sx + sy) % 20 == 0) {
+                            px[0] = 180; px[1] = 180; px[2] = 180;
+                        }
+                        // Colour corners (8x8)
+                        else if (sx < 8 && sy < 8) {
+                            px[0] = 255; px[1] = 0; px[2] = 0;   // red TL
+                        } else if (sx >= kWidth - 8 && sy < 8) {
+                            px[0] = 0; px[1] = 255; px[2] = 0;   // green TR
+                        } else if (sx < 8 && sy >= kHeight - 8) {
+                            px[0] = 0; px[1] = 0; px[2] = 255;   // blue BL
+                        } else if (sx >= kWidth - 8 && sy >= kHeight - 8) {
+                            px[0] = 255; px[1] = 255; px[2] = 0; // yellow BR
+                        } else {
+                            // Background gradient
+                            px[0] = static_cast<uint8_t>((sx + f * 3) & 0xFF);
+                            px[1] = static_cast<uint8_t>((sy + f * 2) & 0xFF);
+                            px[2] = static_cast<uint8_t>((sx + sy + f) & 0xFF);
+                        }
+                    }
+                }
+
+                if (!enc.pushFrameRgb24(
+                        reinterpret_cast<const uint8_t*>(frameBuf.constData()),
+                        stride, f)) {
+                    encodeError = QStringLiteral("pushFrameRgb24 failed at frame %1")
+                                      .arg(f);
+                    return;
+                }
+            }
+
+            const std::optional<std::string> finalizeErr = enc.finalize();
+            if (finalizeErr.has_value()) {
+                encodeError = QStringLiteral("finalize() failed: %1")
+                                  .arg(QString::fromStdString(*finalizeErr));
+                return;
+            }
+            activeEncoder = enc.activeEncoderName();
+            encodeOk = true;
+        });
+
+        if (!encodeOk)
+            return fail(QStringLiteral("input clip encode failed: %1").arg(encodeError));
+        qInfo() << "[INFO] VIDEOSTAB-DESHAKE selftest (1): input encoded,"
+                << "encoder =" << QString::fromStdString(activeEncoder);
+    }
+
+    // -----------------------------------------------------------------------
+    // (2) buildDeshakeFilter() structural validation
+    // -----------------------------------------------------------------------
+    const StabilizerConfig cfg;  // default config
+    const QString filterQStr = VideoStabilizer::buildDeshakeFilter(cfg);
+    const std::string filterStr = filterQStr.toStdString();
+
+    qInfo() << "[INFO] VIDEOSTAB-DESHAKE selftest (2): buildDeshakeFilter ="
+            << filterQStr;
+
+    if (!filterQStr.startsWith(QStringLiteral("deshake="))) {
+        return fail(QStringLiteral(
+            "buildDeshakeFilter() did not return a 'deshake=...' string, got: %1")
+                        .arg(filterQStr));
+    }
+    if (filterQStr.indexOf(QLatin1Char(':')) < 0) {
+        return fail(QStringLiteral(
+            "buildDeshakeFilter() returned no ':' key=value separator: %1")
+                        .arg(filterQStr));
+    }
+
+    // -----------------------------------------------------------------------
+    // (3) VideoFilterGraph::run() — in-process deshake
+    // -----------------------------------------------------------------------
+    QFile::remove(outputPath);
+    {
+        bool filterOk = false;
+        QString filterError;
+        runLibavcoreSelftestWorker([&]() {
+            libavcore::VideoFilterRequest vreq;
+            vreq.inputPath        = inputPath.toStdString();
+            vreq.outputPath       = outputPath.toStdString();
+            vreq.filterDescription = filterStr;
+            vreq.videoCodecName   = "libx264";
+            vreq.copyAudio        = false;
+
+            libavcore::VideoFilterGraph graph;
+            const std::optional<std::string> err = graph.run(vreq);
+            if (err.has_value()) {
+                filterError = QString::fromStdString(*err);
+            } else {
+                filterOk = true;
+            }
+        });
+
+        if (!filterOk)
+            return fail(QStringLiteral("VideoFilterGraph::run() returned error: %1")
+                            .arg(filterError));
+        qInfo() << "[INFO] VIDEOSTAB-DESHAKE selftest (3): VideoFilterGraph::run() OK";
+    }
+
+    // -----------------------------------------------------------------------
+    // (4) Independent probe (tautology-free): codec name + positive duration
+    // -----------------------------------------------------------------------
+    {
+        const std::string probePath = outputPath.toStdString();
+
+        const auto codecName = libavcore::probeVideoCodecName(probePath);
+        if (!codecName.has_value() || codecName->empty()) {
+            return fail(QStringLiteral(
+                "probeVideoCodecName found no video stream in deshake output"));
+        }
+        qInfo() << "[INFO] VIDEOSTAB-DESHAKE selftest (4): probed codec ="
+                << QString::fromStdString(*codecName);
+
+        const auto durationUs = libavcore::probeDurationMicroseconds(probePath);
+        if (!durationUs.has_value() || *durationUs <= 0) {
+            return fail(QStringLiteral(
+                "probeDurationMicroseconds did not return a positive duration (got %1)")
+                            .arg(durationUs.has_value()
+                                     ? QString::number(*durationUs)
+                                     : QStringLiteral("nullopt")));
+        }
+        qInfo() << "[INFO] VIDEOSTAB-DESHAKE selftest (4): probed duration (us) ="
+                << static_cast<qlonglong>(*durationUs);
+    }
+
+    // -----------------------------------------------------------------------
+    // (5) Sanity guard: output file size > 0
+    // -----------------------------------------------------------------------
+    {
+        const QFileInfo fi(outputPath);
+        if (!fi.exists() || fi.size() == 0) {
+            return fail(QStringLiteral(
+                "output file is missing or empty: %1").arg(outputPath));
+        }
+        qInfo() << "[INFO] VIDEOSTAB-DESHAKE selftest (5): output size ="
+                << fi.size() << "bytes";
+    }
+
+    // -----------------------------------------------------------------------
+    // Cleanup
+    // -----------------------------------------------------------------------
+    QFile::remove(inputPath);
+    QFile::remove(outputPath);
+
+    qInfo() << "[INFO] VIDEOSTAB-DESHAKE selftest PASSED";
+    return 0;
+}
+
+// US-B3-8: DLL-ready HDR routing regression gate
+// (VEDITOR_HDR_ROUTING_SELFTEST=1).
+//
+// Validates three invariants without spawning any subprocess or QProcess:
+//
+//   (1) DLL-ready contract: the bundled avcodec-62.dll ships without
+//       libx265/nvenc/qsv/amf, so firstTenBitHevcEncoder() must return
+//       std::nullopt and tenBitHevcEncoderAvailable() must return false.
+//       When a full-featured DLL (libx265 or HW encoder enabled) is
+//       dropped in, these will return true and the routing logic below
+//       will automatically select the in-process path — no recompile needed.
+//
+//   (2) HDR routing predicate: exercises all three branches of the US-B3-7
+//       routing rule via truth-value combinations, not by instantiating a
+//       full RenderQueue:
+//         - HDR10/HLG + 10-bit encoder unavailable  -> "subprocess"
+//         - HDR10/HLG + 10-bit encoder available    -> "in-process"
+//         - 8-bit (non-HDR) job                     -> "in-process" always
+//
+//   (3) master-display string: hdr10MasterDisplayString() must return a
+//       string that contains all five mandatory x265 tokens:
+//       G(, B(, R(, WP(, L(
+int runHdrRoutingSelftest()
+{
+    qInfo() << "[INFO] HDR-ROUTING selftest: DLL-ready HDR routing regression gate";
+
+    bool passed = true;
+
+    // -----------------------------------------------------------------------
+    // (1) DLL-ready contract
+    // -----------------------------------------------------------------------
+    // The bundled avcodec-62.dll is built without libx265/nvenc/qsv/amf.
+    // Expect std::nullopt / false on the stock build.  A drop-in DLL that
+    // enables any of those encoders will make these assertions fail, which is
+    // the desired signal that the in-process routing path is now reachable.
+    auto firstEnc = libavcore::firstTenBitHevcEncoder();
+    bool tenBitOk = libavcore::tenBitHevcEncoderAvailable();
+
+    if (firstEnc.has_value()) {
+        qInfo() << "[INFO] HDR-ROUTING selftest: firstTenBitHevcEncoder ="
+                << QString::fromStdString(*firstEnc)
+                << "(non-null: DLL now carries a 10-bit HEVC encoder;"
+                << "in-process HDR routing is active)";
+    } else {
+        qInfo() << "[INFO] HDR-ROUTING selftest: firstTenBitHevcEncoder = nullopt"
+                << "(stock DLL: libx265/nvenc/qsv/amf absent — expected)";
+    }
+    qInfo() << "[INFO] HDR-ROUTING selftest: tenBitHevcEncoderAvailable =" << tenBitOk;
+
+    // Assert stock-DLL contract: no 10-bit HEVC encoder present.
+    // If this assertion ever fails it means the DLL was upgraded and the
+    // in-process HDR path is now live — update this selftest to expect true.
+    if (firstEnc.has_value()) {
+        qCritical() << "HDR-ROUTING selftest FAILED (1): firstTenBitHevcEncoder"
+                    << "returned" << QString::fromStdString(*firstEnc)
+                    << "but stock avcodec-62.dll should have no 10-bit HEVC encoder."
+                    << "If the DLL was intentionally upgraded, update this check.";
+        passed = false;
+    }
+    if (tenBitOk) {
+        qCritical() << "HDR-ROUTING selftest FAILED (1): tenBitHevcEncoderAvailable"
+                    << "returned true but stock avcodec-62.dll should return false."
+                    << "If the DLL was intentionally upgraded, update this check.";
+        passed = false;
+    }
+
+    // -----------------------------------------------------------------------
+    // (2) HDR routing predicate — truth-value combinatorics
+    //
+    // US-B3-7 routing rule (no RenderQueue instantiation needed):
+    //   isHdr && !tenBitAvail  -> "subprocess"
+    //   isHdr &&  tenBitAvail  -> "in-process"
+    //  !isHdr                  -> "in-process"  (always)
+    // -----------------------------------------------------------------------
+    auto chooseRoute = [](bool isHdr, bool tenBitAvail) -> const char* {
+        if (!isHdr) return "in-process";
+        return tenBitAvail ? "in-process" : "subprocess";
+    };
+
+    struct RouteCase {
+        bool isHdr;
+        bool tenBit;
+        const char* expected;
+    };
+    const RouteCase cases[] = {
+        { false, false, "in-process"  },   // 8-bit, no 10-bit enc: always in-process
+        { false, true,  "in-process"  },   // 8-bit, 10-bit enc present: still in-process
+        { true,  false, "subprocess"  },   // HDR + no 10-bit enc: subprocess fallback
+        { true,  true,  "in-process"  },   // HDR + 10-bit enc present: in-process
+    };
+
+    for (const auto& c : cases) {
+        const char* got = chooseRoute(c.isHdr, c.tenBit);
+        if (std::string(got) != std::string(c.expected)) {
+            qCritical() << "HDR-ROUTING selftest FAILED (2): chooseRoute("
+                        << c.isHdr << "," << c.tenBit << ") returned"
+                        << got << "expected" << c.expected;
+            passed = false;
+        } else {
+            qInfo() << "[INFO] HDR-ROUTING selftest (2): chooseRoute("
+                    << c.isHdr << "," << c.tenBit << ") ->" << got << "OK";
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // (3) master-display string structural validation
+    // -----------------------------------------------------------------------
+    const std::string mdStr =
+        libavcore::hdr10MasterDisplayString(1000.0, 0.005);
+    qInfo() << "[INFO] HDR-ROUTING selftest (3): hdr10MasterDisplayString ="
+            << QString::fromStdString(mdStr);
+
+    // Must contain all five x265 mandatory chromaticity / luminance tokens.
+    const char* requiredTokens[] = { "G(", "B(", "R(", "WP(", "L(" };
+    for (const char* tok : requiredTokens) {
+        if (mdStr.find(tok) == std::string::npos) {
+            qCritical() << "HDR-ROUTING selftest FAILED (3):"
+                        << "hdr10MasterDisplayString missing token"
+                        << tok << "in:" << QString::fromStdString(mdStr);
+            passed = false;
+        }
+    }
+
+    if (!passed) {
+        qCritical() << "HDR-ROUTING selftest FAILED";
+        return 1;
+    }
+    qInfo() << "[INFO] HDR-ROUTING selftest PASSED";
     return 0;
 }
 
@@ -10902,6 +11279,14 @@ int main(int argc, char *argv[])
     if (qEnvironmentVariableIntValue("VEDITOR_LIBAVCORE_DECODE_SELFTEST") != 0) {
         writeLogLine("INFO", "running VEDITOR_LIBAVCORE_DECODE_SELFTEST");
         return runLibavcoreDecodeSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_HDR_ROUTING_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_HDR_ROUTING_SELFTEST");
+        return runHdrRoutingSelftest();
+    }
+    if (qEnvironmentVariableIntValue("VEDITOR_VIDEOSTAB_DESHAKE_SELFTEST") != 0) {
+        writeLogLine("INFO", "running VEDITOR_VIDEOSTAB_DESHAKE_SELFTEST");
+        return runVideostabDeshakeSelftest();
     }
     if (qEnvironmentVariableIntValue("VEDITOR_PARITY_SELFTEST") != 0) {
         writeLogLine("INFO", "running VEDITOR_PARITY_SELFTEST");

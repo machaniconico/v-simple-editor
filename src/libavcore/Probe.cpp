@@ -69,4 +69,47 @@ std::optional<std::string> probeVideoCodecName(const std::string& filePath)
     return std::nullopt;
 }
 
+std::optional<std::string> firstTenBitHevcEncoder()
+{
+    static const char* const kCandidates[] = {
+        "libx265", "hevc_nvenc", "hevc_qsv", "hevc_amf"
+    };
+
+    for (const char* name : kCandidates) {
+        const AVCodec* codec = avcodec_find_encoder_by_name(name);
+        if (!codec) continue;
+
+        // Query supported pixel formats via FFmpeg 8 API.
+        // avcodec_get_supported_config replaces the deprecated AVCodec::pix_fmts.
+        const void* cfgList = nullptr;
+        int count = 0;
+        int ret = avcodec_get_supported_config(
+            nullptr, codec,
+            AV_CODEC_CONFIG_PIX_FORMAT,
+            /*flags=*/0,
+            &cfgList,
+            &count);
+
+        // Treat query failure, NULL list, or empty list as "not 10-bit capable".
+        if (ret < 0 || cfgList == nullptr || count <= 0) continue;
+
+        const AVPixelFormat* fmts = static_cast<const AVPixelFormat*>(cfgList);
+        bool tenBit = false;
+        for (int i = 0; i < count; ++i) {
+            if (fmts[i] == AV_PIX_FMT_YUV420P10LE ||
+                fmts[i] == AV_PIX_FMT_P010LE) {
+                tenBit = true;
+                break;
+            }
+        }
+        if (tenBit) return std::string(name);
+    }
+    return std::nullopt;
+}
+
+bool tenBitHevcEncoderAvailable()
+{
+    return firstTenBitHevcEncoder().has_value();
+}
+
 } // namespace libavcore

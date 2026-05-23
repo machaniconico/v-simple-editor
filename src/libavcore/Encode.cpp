@@ -24,6 +24,34 @@ extern "C" {
 
 namespace libavcore {
 
+// P3-D65-in-BT2020 mastering display chromaticity coordinates (x265 units,
+// i.e. 1/50000 of CIE xy). These are the SSOT for both hdr10MasterDisplayString
+// (public API) and buildX265Hdr10Params (internal x265-params builder).
+// Values match SMPTE ST 2086 / ITU-R BT.2100 Display Primaries P3-D65.
+static constexpr int kHdr10GreenX  =  8500;
+static constexpr int kHdr10GreenY  = 39850;
+static constexpr int kHdr10BlueX   =  6550;
+static constexpr int kHdr10BlueY   =  2300;
+static constexpr int kHdr10RedX    = 35400;
+static constexpr int kHdr10RedY    = 14600;
+static constexpr int kHdr10WpX     = 15635;
+static constexpr int kHdr10WpY     = 16450;
+
+std::string hdr10MasterDisplayString(double masterMaxNits, double masterMinNits)
+{
+    const int maxLumX10000 = static_cast<int>(std::round(masterMaxNits * 10000.0));
+    const int minLumX10000 = static_cast<int>(std::round(masterMinNits * 10000.0));
+    char buf[128];
+    std::snprintf(buf, sizeof(buf),
+                  "G(%d,%d)B(%d,%d)R(%d,%d)WP(%d,%d)L(%d,%d)",
+                  kHdr10GreenX, kHdr10GreenY,
+                  kHdr10BlueX,  kHdr10BlueY,
+                  kHdr10RedX,   kHdr10RedY,
+                  kHdr10WpX,    kHdr10WpY,
+                  maxLumX10000, minLumX10000);
+    return std::string(buf);
+}
+
 namespace {
 
 // Build x265-params HDR10 metadata string (BT.2020 primaries / D65). Identical
@@ -31,15 +59,14 @@ namespace {
 static std::string buildX265Hdr10Params(double maxNits, double minNits,
                                          int maxCll, int maxFall)
 {
-    const int maxLumX10000 = static_cast<int>(std::round(maxNits * 10000.0));
-    const int minLumX10000 = static_cast<int>(std::round(minNits * 10000.0));
+    const std::string masterDisplay =
+        hdr10MasterDisplayString(maxNits, minNits);
     char buf[256];
     std::snprintf(buf, sizeof(buf),
                   "hdr10=1:repeat-headers=1:colorprim=bt2020:"
                   "transfer=smpte2084:colormatrix=bt2020nc:range=limited:"
-                  "master-display=G(8500,39850)B(6550,2300)R(35400,14600)"
-                  "WP(15635,16450)L(%d,%d):max-cll=%d,%d",
-                  maxLumX10000, minLumX10000, maxCll, maxFall);
+                  "master-display=%s:max-cll=%d,%d",
+                  masterDisplay.c_str(), maxCll, maxFall);
     return std::string(buf);
 }
 

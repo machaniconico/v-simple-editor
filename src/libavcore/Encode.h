@@ -33,6 +33,15 @@ class QImage;
 
 namespace libavcore {
 
+// Generate an x265 'master-display' parameter string for HDR10 exports.
+// Chromaticity coordinates (G/B/R/WP) are fixed to P3-D65-in-BT2020 primaries
+// (x265 units: 1/50000 of CIE xy). Luminance terms L(max,min) are derived from
+// masterMaxNits and masterMinNits (cd/m^2) converted to x265 units (nits × 10000,
+// rounded to nearest integer).
+// Example: hdr10MasterDisplayString(1000.0, 0.005) →
+//   "G(8500,39850)B(6550,2300)R(35400,14600)WP(15635,16450)L(10000000,50)"
+std::string hdr10MasterDisplayString(double masterMaxNits, double masterMinNits);
+
 // Request descriptor mirroring the relevant fields of Exporter's ExportConfig.
 // All fields here are pure data (no Qt types) so the header can be included
 // from non-Qt callers.

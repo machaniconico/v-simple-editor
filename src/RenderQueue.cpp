@@ -5,7 +5,10 @@
 #include "TrackMatteKey.h"
 #include "CodecDetector.h"
 #include "libavcore/Encode.h"
+#include "libavcore/Probe.h"
 #include <QByteArray>
+#include <QCoreApplication>
+#include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
@@ -15,10 +18,11 @@
 #include <QImage>
 #include <QPainter>
 #include <QtGlobal>
-// US-MF-6: the 10-bit HDR (HDR10/HLG) branch shells out to ffmpeg.exe — the
-// bundled avcodec DLL has no 10-bit encoder. These restore the pre-US-MF-5
-// subprocess render-pipe dependencies for that branch only.
+// US-MF-6 / US-B3-7: the 10-bit HDR (HDR10/HLG) branch falls back to ffmpeg.exe
+// whenever the loaded avcodec DLL ships no 10-bit HEVC encoder. These restore
+// the pre-US-MF-5 subprocess render-pipe dependencies for that fallback branch.
 #include <QProcess>
+#include <QProcessEnvironment>
 #include <QMutexLocker>
 #include <QStandardPaths>
 #include <cmath>  // std::round for the HDR10 master-display luminance scaling
@@ -487,26 +491,40 @@ void RenderQueue::startNextJob()
     startRenderPipe(m_currentJobIndex);
 }
 
-// S8/US-MF-5/US-MF-6: 2-way export dispatcher.
+// S8/US-MF-5/US-MF-6/US-B3-7: 3-way export dispatcher.
 // Frames always come from tlrender::renderFrameAt (the SSOT edit graph). The
 // SINK depends on the job:
-//   • 10-bit HDR (HDR10 / HLG) → startRenderPipeSubprocess: an ffmpeg.exe
-//     QProcess encode (libx265 yuv420p10le + BT.2020/PQ|HLG metadata). The
-//     bundled avcodec DLL has no 10-bit encoder (no libx264/libx265, and
-//     h264_mf/hevc_mf are 8-bit only), so the in-process FrameEncoder cannot
-//     emit a genuine HDR10/HLG stream — it fails with "encoder frame push
-//     failed". The subprocess restores the pre-US-MF-5 render-pipe for this
-//     branch only.
+//   • 10-bit HDR (HDR10 / HLG) AND the loaded avcodec DLL exposes a 10-bit
+//     HEVC encoder (libx265 / hevc_nvenc / hevc_qsv / hevc_amf — probed at
+//     runtime via libavcore::tenBitHevcEncoderAvailable) → in-process
+//     libavcore::FrameEncoder path, with request.videoCodecName overridden to
+//     libavcore::firstTenBitHevcEncoder() and isHdr10/isHlg + hdrMaster*
+//     populated. The encoder writes a genuine 10-bit HEVC yuv420p10le stream
+//     with the BT.2020/PQ|HLG colour signalling FrameEncoder already wires up
+//     (the same code path that handles main10 / HDR10 side-data was always
+//     present — US-B3-7 just makes it reachable when the DLL supports it).
+//   • 10-bit HDR but the DLL has no 10-bit HEVC encoder
+//     (the bundled avcodec-62.dll: libx264/libx265 absent, h264_mf/hevc_mf
+//     8-bit only) → startRenderPipeSubprocess: an ffmpeg.exe QProcess encode
+//     (libx265 yuv420p10le + BT.2020/PQ|HLG metadata) as a runtime fallback,
+//     identical to the pre-US-B3-7 behaviour.
 //   • everything else (8-bit H.264 / H.265 / ProRes / AV1) → the in-process
 //     libavcore::FrameEncoder path below, unchanged from US-MF-5.
+//
+// The 8-bit routing is unchanged: only HDR jobs consult
+// tenBitHevcEncoderAvailable; an 8-bit job never visits the subprocess
+// fallback. Drop-in replacing the bundled DLL with a libx265-enabled build
+// flips HDR jobs to the in-process path automatically — no recompile needed.
 void RenderQueue::startRenderPipe(int jobIndex)
 {
     const RenderJob jobCopy = m_jobs[jobIndex];
 
-    // US-MF-6 dispatch: decide HDR10/HLG from the SAME job-config values the
-    // in-process branch uses for request.isHdr10 / request.isHlg, so the two
-    // branches agree on what "10-bit HDR" means. ProRes is never HDR here
-    // (mirrors the in-process `!isProRes` guard below).
+    // US-MF-6 / US-B3-7 dispatch: decide HDR10/HLG from the SAME job-config
+    // values the in-process branch uses for request.isHdr10 / request.isHlg,
+    // so the two branches agree on what "10-bit HDR" means. ProRes is never
+    // HDR here (mirrors the in-process `!isProRes` guard below). When the
+    // loaded avcodec DLL exposes a 10-bit HEVC encoder we keep the in-process
+    // path; otherwise we fall through to startRenderPipeSubprocess.
     {
         const QJsonObject &cfg = jobCopy.exportConfig;
         QString dispatchCodec = cfg.value("videoCodec").toString();
@@ -525,8 +543,15 @@ void RenderQueue::startRenderPipe(int jobIndex)
         const bool dispatchIsHlg =
             !dispatchIsProRes && dispatchHdrMode == QLatin1String("hlg");
         if (dispatchIsHdr10 || dispatchIsHlg) {
-            startRenderPipeSubprocess(jobIndex);
-            return;
+            // US-B3-7: route HDR jobs to subprocess fallback only when the
+            // currently loaded avcodec DLL has no 10-bit HEVC encoder. If a
+            // 10-bit HEVC encoder is present, fall through to the in-process
+            // FrameEncoder path (videoCodecName + isHdr10/isHlg are set
+            // below) which can emit a genuine 10-bit HDR stream directly.
+            if (!libavcore::tenBitHevcEncoderAvailable()) {
+                startRenderPipeSubprocess(jobIndex);
+                return;
+            }
         }
     }
 
@@ -630,13 +655,24 @@ void RenderQueue::startRenderPipe(int jobIndex)
         ? cfg.value("proresProfile").toInt(1) : -1;
 
     // HDR10/HLG followed the old render-pipe branch by forcing x265 unless the
-    // caller explicitly selected an HEVC hardware encoder.
+    // caller explicitly selected an HEVC hardware encoder. US-B3-7: when this
+    // branch executes we already know (per the 3-way dispatcher above) that
+    // the loaded avcodec DLL exposes a 10-bit HEVC encoder; override
+    // videoCodec to firstTenBitHevcEncoder() so the in-process encoder uses
+    // whatever the DLL actually has (libx265 / hevc_nvenc / hevc_qsv /
+    // hevc_amf) instead of an arbitrary preference. If the caller already
+    // picked an HEVC encoder we leave it alone so an explicit selection is
+    // respected.
     if ((isHdr10 || isHlg)
         && videoCodec != QLatin1String("libx265")
         && videoCodec != QLatin1String("hevc_nvenc")
         && videoCodec != QLatin1String("hevc_qsv")
         && videoCodec != QLatin1String("hevc_amf")) {
-        videoCodec = QStringLiteral("libx265");
+        const auto probed = libavcore::firstTenBitHevcEncoder();
+        if (probed.has_value() && !probed->empty())
+            videoCodec = QString::fromStdString(*probed);
+        else
+            videoCodec = QStringLiteral("libx265");
     }
 
     request.videoBitrateBits = jobCopy.bitrateBps;
@@ -792,21 +828,29 @@ void RenderQueue::startRenderPipe(int jobIndex)
     m_renderThread->start();
 }
 
-// US-MF-6: 10-bit HDR (HDR10 / HLG) export branch. The bundled avcodec DLL
-// ships no 10-bit encoder (no libx264/libx265, and h264_mf/hevc_mf are 8-bit
-// only), so the in-process libavcore::FrameEncoder cannot emit a genuine
-// HDR10/HLG stream. This restores the pre-US-MF-5 render-pipe for HDR jobs
-// ONLY: a worker QThread renders every output frame via
-// tlrender::renderFrameAt (the SSOT edit graph — grade / FX / masks / LUT all
-// applied) and streams flattened rgb24 to ffmpeg.exe over stdin; ffmpeg
-// encodes libx265 main10 yuv420p10le with BT.2020 + SMPTE-2084 (HDR10) /
-// ARIB-STD-B67 (HLG) signalling, the HDR10 master-display / MaxCLL / MaxFALL
-// x265-params, and muxes the source audio. The public RenderJob / signal /
-// queue-advance contract is identical to the in-process branch: jobProgress
-// per frame, cancellation honoured via m_cancelRequested, finishCurrentJob()
-// on completion. The argv mirrors the genuine Exporter HDR setup
-// (Exporter.cpp HDR10/HLG x265 path) byte-for-byte so the artifact matches
-// the parity selftest's byte-identical Path A round-trip.
+// US-MF-6 / US-B3-7: 10-bit HDR (HDR10 / HLG) subprocess fallback branch.
+// Reached only when startRenderPipe() determined the loaded avcodec DLL has
+// no 10-bit HEVC encoder (libavcore::tenBitHevcEncoderAvailable() == false).
+// When the bundled avcodec DLL is in use this is the active HDR path: it
+// ships neither libx264/libx265 nor a 10-bit MediaFoundation encoder
+// (h264_mf/hevc_mf are 8-bit only), so the in-process libavcore::FrameEncoder
+// cannot emit a genuine HDR10/HLG stream from the stock build.
+//
+// This restores the pre-US-MF-5 render-pipe for HDR fallback ONLY: a worker
+// QThread renders every output frame via tlrender::renderFrameAt (the SSOT
+// edit graph — grade / FX / masks / LUT all applied) and streams flattened
+// rgb24 to ffmpeg.exe over stdin; ffmpeg encodes libx265 main10 yuv420p10le
+// with BT.2020 + SMPTE-2084 (HDR10) / ARIB-STD-B67 (HLG) signalling, the
+// HDR10 master-display / MaxCLL / MaxFALL x265-params, and muxes the source
+// audio. The public RenderJob / signal / queue-advance contract is identical
+// to the in-process branch: jobProgress per frame, cancellation honoured via
+// m_cancelRequested, finishCurrentJob() on completion. The argv mirrors the
+// genuine Exporter HDR setup (Exporter.cpp HDR10/HLG x265 path) byte-for-byte
+// so the artifact matches the parity selftest's byte-identical Path A
+// round-trip. The master-display string itself is sourced from
+// libavcore::hdr10MasterDisplayString (the SSOT shared with FrameEncoder /
+// Exporter) so the in-process and subprocess paths agree on the SMPTE-2086
+// primaries + scaled luminance terms.
 void RenderQueue::startRenderPipeSubprocess(int jobIndex)
 {
     const RenderJob jobCopy = m_jobs[jobIndex];
@@ -834,9 +878,17 @@ void RenderQueue::startRenderPipeSubprocess(int jobIndex)
     const QString ffmpegBin = findFFmpegBinary();
     if (ffmpegBin.isEmpty()) {
         QMetaObject::invokeMethod(this, [this]() {
+            // US-B3-7: surface the genuine requirement so users can fix
+            // their environment instead of seeing a silent failure. The
+            // subprocess path is only reached when the loaded avcodec DLL
+            // has no 10-bit HEVC encoder (libavcore::tenBitHevcEncoderAvailable
+            // returned false), and libx265-enabled ffmpeg.exe is what
+            // produces the genuine HDR10/HLG stream the in-process path
+            // cannot.
             finishCurrentJob(false, QStringLiteral(
-                "ffmpeg.exe not found — required for 10-bit HDR (HDR10/HLG) "
-                "export (the in-process encoder cannot emit 10-bit)"));
+                "10-bit HDR export requires ffmpeg.exe with libx265 in PATH "
+                "or alongside the app — the bundled avcodec DLL has no "
+                "10-bit HEVC encoder and ffmpeg.exe could not be located"));
         }, Qt::QueuedConnection);
         return;
     }
@@ -968,7 +1020,10 @@ void RenderQueue::startRenderPipeSubprocess(int jobIndex)
     // libx265 10-bit HDR profile + x265-params — byte-for-byte the genuine
     // Exporter's HDR10/HLG x265 setup. HDR10 master-display / MaxCLL / MaxFALL
     // come from exportConfig with the standard 1000-nit P3-D65-in-2020
-    // mastering defaults.
+    // mastering defaults. US-B3-7: the master-display chromaticity + scaled
+    // luminance terms are produced by libavcore::hdr10MasterDisplayString —
+    // the SSOT shared with libavcore::FrameEncoder / Exporter — so the
+    // in-process and subprocess HDR paths agree on the SMPTE-2086 primaries.
     if (videoCodec == QLatin1String("libx265")) {
         args << QStringLiteral("-profile:v") << QStringLiteral("main10");
         if (isHdr10) {
@@ -978,18 +1033,14 @@ void RenderQueue::startRenderPipeSubprocess(int jobIndex)
                 cfg.value("hdrMasterMinLum").toDouble(0.0001);
             const int maxCll  = cfg.value("hdrMaxCll").toInt(1000);
             const int maxFall = cfg.value("hdrMaxFall").toInt(400);
-            const int maxLumX10000 =
-                static_cast<int>(std::round(maxLum * 10000.0));
-            const int minLumX10000 =
-                static_cast<int>(std::round(minLum * 10000.0));
+            const QString masterDisplay = QString::fromStdString(
+                libavcore::hdr10MasterDisplayString(maxLum, minLum));
             const QString x265p =
                 QStringLiteral(
                     "hdr10=1:repeat-headers=1:colorprim=bt2020:"
                     "transfer=smpte2084:colormatrix=bt2020nc:range=limited:"
-                    "master-display=G(8500,39850)B(6550,2300)R(35400,14600)"
-                    "WP(15635,16450)L(%1,%2):max-cll=%3,%4")
-                    .arg(maxLumX10000)
-                    .arg(minLumX10000)
+                    "master-display=%1:max-cll=%2,%3")
+                    .arg(masterDisplay)
                     .arg(maxCll)
                     .arg(maxFall);
             args << QStringLiteral("-x265-params") << x265p;
@@ -1147,20 +1198,41 @@ void RenderQueue::startRenderPipeSubprocess(int jobIndex)
     m_renderThread->start();
 }
 
-// US-MF-6: locate the ffmpeg.exe binary for the HDR subprocess branch.
-// Restored from the pre-US-MF-5 render-pipe — PATH first (the WinGet / gyan
-// build installs ffmpeg.exe onto the user PATH), then the common install
-// dirs as a fallback.
+// US-MF-6 / US-B3-7: locate the ffmpeg.exe binary for the HDR subprocess
+// fallback branch. PATH first (the WinGet / gyan build installs ffmpeg.exe
+// onto the user PATH), then a list of common install dirs that cover the
+// realistic ways a Windows user gets ffmpeg.exe onto disk:
+//   - the application's own directory (bundled side-by-side with the .exe)
+//   - %LOCALAPPDATA%\Microsoft\WinGet\Links (WinGet shim, often not in PATH
+//     when launched from a desktop shortcut)
+//   - C:\ffmpeg\bin (the manual gyan.dev install path the project README
+//     suggests)
+// macOS / Linux paths are kept so headless / Unix builds keep working.
 QString RenderQueue::findFFmpegBinary()
 {
     QString path = QStandardPaths::findExecutable(QStringLiteral("ffmpeg"));
     if (!path.isEmpty())
         return path;
-    const QStringList searchPaths = {
-        QStringLiteral("/usr/local/bin"),
-        QStringLiteral("/opt/homebrew/bin"),
-        QStringLiteral("/usr/bin")
-    };
+    QStringList searchPaths;
+    // Application directory — ffmpeg.exe shipped alongside the binary.
+    if (QCoreApplication::instance()) {
+        const QString appDir = QCoreApplication::applicationDirPath();
+        if (!appDir.isEmpty())
+            searchPaths << appDir;
+    }
+    // WinGet shim directory under %LOCALAPPDATA%.
+    const QString localAppData =
+        QProcessEnvironment::systemEnvironment().value(
+            QStringLiteral("LOCALAPPDATA"));
+    if (!localAppData.isEmpty()) {
+        searchPaths << QDir::cleanPath(
+            localAppData + QStringLiteral("/Microsoft/WinGet/Links"));
+    }
+    // Common manual install paths.
+    searchPaths << QStringLiteral("C:/ffmpeg/bin")
+                << QStringLiteral("/usr/local/bin")
+                << QStringLiteral("/opt/homebrew/bin")
+                << QStringLiteral("/usr/bin");
     return QStandardPaths::findExecutable(QStringLiteral("ffmpeg"),
                                           searchPaths);
 }

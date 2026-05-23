@@ -160,30 +160,42 @@ private:
     // queue stays responsive; emits jobProgress per frame and finishes via
     // finishCurrentJob().
     //
-    // US-MF-6: startRenderPipe is now a 2-way dispatcher. 10-bit HDR exports
-    // (HDR10 / HLG) cannot be produced in-process — the bundled avcodec DLL
-    // ships neither libx264/libx265 nor a 10-bit MediaFoundation encoder, so
-    // h264_mf/hevc_mf top out at 8-bit and an HDR10 job fails the in-process
-    // encoder. For those jobs ONLY, startRenderPipe routes to
-    // startRenderPipeSubprocess, which restores the pre-US-MF-5 ffmpeg.exe
-    // QProcess encode (rawvideo rgb24 over stdin -> libx265 yuv420p10le + the
-    // genuine BT.2020/PQ|HLG HDR metadata). Every non-10-bit-HDR job (8-bit
-    // H.264 / H.265 / ProRes / AV1) keeps the in-process FrameEncoder path.
+    // US-MF-6 / US-B3-7: startRenderPipe is a 3-way dispatcher.
+    //   1) 8-bit jobs (H.264 / H.265 / ProRes / AV1) → in-process
+    //      libavcore::FrameEncoder path (unchanged from US-MF-5).
+    //   2) 10-bit HDR (HDR10 / HLG) AND the loaded avcodec DLL exposes a
+    //      10-bit HEVC encoder (libavcore::tenBitHevcEncoderAvailable
+    //      returns true) → in-process FrameEncoder path with
+    //      videoCodecName overridden to libavcore::firstTenBitHevcEncoder()
+    //      and isHdr10/isHlg + hdrMaster* populated. FrameEncoder writes
+    //      a genuine 10-bit HEVC yuv420p10le stream with BT.2020/PQ|HLG
+    //      colour signalling.
+    //   3) 10-bit HDR but the DLL has no 10-bit HEVC encoder (the bundled
+    //      avcodec-62.dll: libx264/libx265 absent, h264_mf/hevc_mf 8-bit
+    //      only) → startRenderPipeSubprocess fallback (ffmpeg.exe QProcess
+    //      encode, rawvideo rgb24 stdin → libx265 yuv420p10le + the genuine
+    //      BT.2020/PQ|HLG HDR metadata). Drop-in replacing the bundled DLL
+    //      with a libx265-enabled build flips HDR jobs to the in-process
+    //      path automatically — no recompile needed.
     void startRenderPipe(int jobIndex);
-    // US-MF-6: ffmpeg.exe subprocess encode for 10-bit HDR (HDR10 / HLG) jobs.
-    // Restored from the pre-US-MF-5 RenderQueue.cpp render-pipe: a worker
-    // QThread renders every frame via tlrender::renderFrameAt and streams
-    // flattened rgb24 to ffmpeg's stdin; ffmpeg encodes libx265 main10
-    // yuv420p10le with the HDR10/HLG colour signalling + master-display /
-    // MaxCLL params, muxing the source audio. Finishes via finishCurrentJob().
+    // US-MF-6 / US-B3-7: ffmpeg.exe subprocess encode for 10-bit HDR
+    // (HDR10 / HLG) jobs — reached only when no 10-bit HEVC encoder is
+    // available in the loaded avcodec DLL. A worker QThread renders every
+    // frame via tlrender::renderFrameAt and streams flattened rgb24 to
+    // ffmpeg's stdin; ffmpeg encodes libx265 main10 yuv420p10le with the
+    // HDR10/HLG colour signalling + master-display / MaxCLL params (sourced
+    // from libavcore::hdr10MasterDisplayString — the SSOT shared with the
+    // in-process FrameEncoder), muxing the source audio. Finishes via
+    // finishCurrentJob().
     void startRenderPipeSubprocess(int jobIndex);
     void finishCurrentJob(bool success, const QString &errorMsg);
     int findJobIndex(int id) const;
     int findJobIndexByUuid(const QString &uuid) const;
     static QString mapCodecToEncoderName(const QString &codec);
     static QString defaultContainerFor(const QString &codec);
-    // US-MF-6: locate the ffmpeg.exe binary for the HDR subprocess branch.
-    // Restored verbatim from the pre-US-MF-5 render-pipe.
+    // US-MF-6 / US-B3-7: locate the ffmpeg.exe binary for the HDR subprocess
+    // fallback branch. PATH first, then app dir, %LOCALAPPDATA%\Microsoft\
+    // WinGet\Links, C:\ffmpeg\bin, and the macOS/Linux install dirs.
     static QString findFFmpegBinary();
     // Resolve the Timeline a job renders: the in-memory job.timeline seam if
     // set, otherwise ProjectFile::load(projectFilePath) -> a freshly built
