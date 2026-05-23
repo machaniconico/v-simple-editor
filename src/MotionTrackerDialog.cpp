@@ -8,10 +8,17 @@
 #include <QComboBox>
 #include <QDialogButtonBox>
 #include <QDoubleSpinBox>
+#include <QFile>
+#include <QFileDialog>
 #include <QFormLayout>
 #include <QHash>
+#include <QHBoxLayout>
 #include <QInputDialog>
+#include <QJsonDocument>
+#include <QJsonParseError>
+#include <QLabel>
 #include <QLineEdit>
+#include <QMessageBox>
 #include <QPushButton>
 #include <QSpinBox>
 #include <QVBoxLayout>
@@ -64,6 +71,16 @@ MotionTrackerDialog::MotionTrackerDialog(QWidget* parent)
 
     m_presetCombo = new QComboBox(this);
 
+    m_descriptionLabel = new QLabel(this);
+    m_descriptionLabel->setWordWrap(true);
+    m_descriptionLabel->setMinimumHeight(40);
+    {
+        QPalette p = m_descriptionLabel->palette();
+        p.setColor(QPalette::WindowText, p.color(QPalette::Disabled, QPalette::WindowText));
+        m_descriptionLabel->setPalette(p);
+    }
+    m_descriptionLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+
     m_searchRadiusSpin = new QSpinBox(this);
     m_searchRadiusSpin->setRange(0, 128);
     m_searchRadiusSpin->setSuffix(tr(" px"));
@@ -98,6 +115,11 @@ MotionTrackerDialog::MotionTrackerDialog(QWidget* parent)
     m_minConfidenceSpin->setDecimals(3);
 
     m_saveCustomPresetButton = new QPushButton(tr("カスタム preset 保存"), this);
+    m_deletePresetBtn = new QPushButton(tr("選択中の preset を削除"), this);
+    m_resetBtn = new QPushButton(tr("Reset to defaults"), this);
+    m_exportBtn = new QPushButton(tr("Preset を JSON エクスポート"), this);
+    m_importBtn = new QPushButton(tr("Preset を JSON インポート"), this);
+    m_deletePresetBtn->setEnabled(false);
     m_buttonBox = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
 
     auto* form = new QFormLayout;
@@ -112,14 +134,29 @@ MotionTrackerDialog::MotionTrackerDialog(QWidget* parent)
 
     auto* root = new QVBoxLayout(this);
     root->addWidget(m_presetCombo);
+    root->addWidget(m_descriptionLabel);
     root->addLayout(form);
-    root->addWidget(m_saveCustomPresetButton);
+    auto* presetButtons = new QHBoxLayout;
+    presetButtons->addWidget(m_saveCustomPresetButton);
+    presetButtons->addWidget(m_deletePresetBtn);
+    presetButtons->addWidget(m_resetBtn);
+    presetButtons->addWidget(m_exportBtn);
+    presetButtons->addWidget(m_importBtn);
+    root->addLayout(presetButtons);
     root->addWidget(m_buttonBox);
 
     connect(m_presetCombo, &QComboBox::currentIndexChanged,
             this, &MotionTrackerDialog::onPresetSelectionChanged);
     connect(m_saveCustomPresetButton, &QPushButton::clicked,
             this, &MotionTrackerDialog::onSaveCustomPreset);
+    connect(m_deletePresetBtn, &QPushButton::clicked,
+            this, &MotionTrackerDialog::onDeleteSelectedPreset);
+    connect(m_resetBtn, &QPushButton::clicked,
+            this, &MotionTrackerDialog::onResetToDefaults);
+    connect(m_exportBtn, &QPushButton::clicked,
+            this, &MotionTrackerDialog::onExportPreset);
+    connect(m_importBtn, &QPushButton::clicked,
+            this, &MotionTrackerDialog::onImportPreset);
     connect(m_buttonBox, &QDialogButtonBox::accepted, this, &MotionTrackerDialog::accept);
     connect(m_buttonBox, &QDialogButtonBox::rejected, this, &MotionTrackerDialog::reject);
 
@@ -156,11 +193,21 @@ void MotionTrackerDialog::accept()
 
 void MotionTrackerDialog::onPresetSelectionChanged(int index)
 {
+    updateDeletePresetButton();
+
     bool ok = false;
     const int presetIndex = m_presetCombo->itemData(index).toInt(&ok);
-    if (!ok || presetIndex < 0 || presetIndex >= m_presets.size())
+    if (!ok || presetIndex < 0 || presetIndex >= m_presets.size()) {
+        if (m_descriptionLabel)
+            m_descriptionLabel->setText(tr("説明: なし"));
         return;
-    applyPresetToWidgets(m_presets.at(presetIndex));
+    }
+    const tracker_preset::TrackerPreset& preset = m_presets.at(presetIndex);
+    if (m_descriptionLabel) {
+        m_descriptionLabel->setText(
+            preset.description.isEmpty() ? tr("説明: なし") : preset.description);
+    }
+    applyPresetToWidgets(preset);
 }
 
 void MotionTrackerDialog::onSaveCustomPreset()
@@ -181,6 +228,127 @@ void MotionTrackerDialog::onSaveCustomPreset()
 
     if (tracker_preset::Registry::instance().saveUserPreset(preset))
         rebuildPresetCombo(preset.id);
+}
+
+void MotionTrackerDialog::onDeleteSelectedPreset()
+{
+    const int index = currentPresetIndex();
+    if (index < 0)
+        return;
+
+    const tracker_preset::TrackerPreset preset = m_presets.at(index);
+    if (tracker_preset::findBuiltin(preset.id).has_value())
+        return;
+
+    const QMessageBox::StandardButton answer =
+        QMessageBox::question(this,
+                              tr("選択中の preset を削除"),
+                              tr("「%1」を削除しますか?").arg(preset.displayName),
+                              QMessageBox::Yes | QMessageBox::No,
+                              QMessageBox::No);
+    if (answer != QMessageBox::Yes)
+        return;
+
+    if (tracker_preset::Registry::instance().removeUserPreset(preset.id))
+        rebuildPresetCombo();
+}
+
+void MotionTrackerDialog::onResetToDefaults()
+{
+    if (m_presetCombo->count() <= 0)
+        return;
+
+    int defaultComboIndex = -1;
+    for (int comboIndex = 0; comboIndex < m_presetCombo->count(); ++comboIndex) {
+        bool ok = false;
+        const int presetIndex = m_presetCombo->itemData(comboIndex).toInt(&ok);
+        if (ok && presetIndex >= 0 && presetIndex < m_presets.size()
+            && m_presets.at(presetIndex).id == QStringLiteral("slow-pan-static-bg")) {
+            defaultComboIndex = comboIndex;
+            break;
+        }
+    }
+
+    if (defaultComboIndex < 0)
+        defaultComboIndex = 0;
+
+    if (m_presetCombo->currentIndex() == defaultComboIndex)
+        onPresetSelectionChanged(defaultComboIndex);
+    else
+        m_presetCombo->setCurrentIndex(defaultComboIndex);
+}
+
+void MotionTrackerDialog::onExportPreset()
+{
+    QString fileName = QFileDialog::getSaveFileName(this,
+                                                    tr("Preset を JSON エクスポート"),
+                                                    QString(),
+                                                    tr("Tracker Preset JSON (*.json)"));
+    if (fileName.isEmpty())
+        return;
+    if (!fileName.endsWith(QStringLiteral(".json"), Qt::CaseInsensitive))
+        fileName.append(QStringLiteral(".json"));
+
+    QFile file(fileName);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        QMessageBox::warning(this,
+                             tr("Preset を JSON エクスポート"),
+                             tr("JSON ファイルを書き込めませんでした。"));
+        return;
+    }
+
+    const QJsonObject obj = tracker_preset::toJson(selectedPreset());
+    const QByteArray json = QJsonDocument(obj).toJson(QJsonDocument::Indented);
+    if (file.write(json) != json.size()) {
+        QMessageBox::warning(this,
+                             tr("Preset を JSON エクスポート"),
+                             tr("JSON ファイルを書き込めませんでした。"));
+    }
+}
+
+void MotionTrackerDialog::onImportPreset()
+{
+    const QString fileName = QFileDialog::getOpenFileName(this,
+                                                          tr("Preset を JSON インポート"),
+                                                          QString(),
+                                                          tr("Tracker Preset JSON (*.json)"));
+    if (fileName.isEmpty())
+        return;
+
+    QFile file(fileName);
+    if (!file.open(QIODevice::ReadOnly)) {
+        QMessageBox::warning(this,
+                             tr("Preset を JSON インポート"),
+                             tr("JSON ファイルを読み込めませんでした。"));
+        return;
+    }
+
+    QJsonParseError parseError{};
+    const QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &parseError);
+    if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
+        QMessageBox::warning(this,
+                             tr("Preset を JSON インポート"),
+                             tr("JSON が不正です"));
+        return;
+    }
+
+    auto imported = tracker_preset::fromJson(doc.object());
+    if (!imported) {
+        QMessageBox::warning(this,
+                             tr("Preset を JSON インポート"),
+                             tr("JSON が不正です"));
+        return;
+    }
+
+    imported->id = makeUserPresetId(imported->displayName);
+    if (!tracker_preset::Registry::instance().saveUserPreset(*imported)) {
+        QMessageBox::warning(this,
+                             tr("Preset を JSON インポート"),
+                             tr("Preset を保存できませんでした。"));
+        return;
+    }
+
+    rebuildPresetCombo(imported->id);
 }
 
 void MotionTrackerDialog::rebuildPresetCombo(const QString& selectedId)
@@ -209,8 +377,18 @@ void MotionTrackerDialog::rebuildPresetCombo(const QString& selectedId)
     m_presetCombo->setCurrentIndex(selectedIndex);
     m_presetCombo->blockSignals(comboWasBlocked);
 
-    if (selectedIndex >= 0)
-        applyPresetToWidgets(m_presets.at(selectedIndex));
+    if (selectedIndex >= 0) {
+        const tracker_preset::TrackerPreset& sel = m_presets.at(selectedIndex);
+        applyPresetToWidgets(sel);
+        if (m_descriptionLabel) {
+            m_descriptionLabel->setText(
+                sel.description.isEmpty() ? tr("説明: なし") : sel.description);
+        }
+    } else {
+        if (m_descriptionLabel)
+            m_descriptionLabel->setText(tr("説明: なし"));
+    }
+    updateDeletePresetButton();
 }
 
 void MotionTrackerDialog::applyPresetToWidgets(const tracker_preset::TrackerPreset& preset)
@@ -240,6 +418,20 @@ void MotionTrackerDialog::setWidgetSignalsBlocked(bool blocked)
     m_occlusionGateSpin->blockSignals(blocked);
     m_subPixelEnabledCheck->blockSignals(blocked);
     m_minConfidenceSpin->blockSignals(blocked);
+}
+
+void MotionTrackerDialog::updateDeletePresetButton()
+{
+    if (!m_deletePresetBtn)
+        return;
+
+    const int index = currentPresetIndex();
+    if (index < 0) {
+        m_deletePresetBtn->setEnabled(false);
+        return;
+    }
+
+    m_deletePresetBtn->setEnabled(!tracker_preset::findBuiltin(m_presets.at(index).id).has_value());
 }
 
 int MotionTrackerDialog::currentPresetIndex() const

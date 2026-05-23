@@ -19,6 +19,7 @@ struct TrackerPreset {
     double  occlusionGate      = 0.5;
     bool    subPixelEnabled    = true;
     double  minConfidence      = 0.7;
+    QString description;               // UI 表示用の説明文 (validation 対象外、optional)
 };
 
 const std::array<TrackerPreset, 7>& builtinPresets();

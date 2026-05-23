@@ -13,49 +13,56 @@ const std::array<TrackerPreset, 7>& builtinPresets()
             "slow-pan-static-bg",
             "Slow Pan, Static Background",
             "rect", "NCC",
-            24, true, 0.08, 1.0, 0.5, true, 0.75
+            24, true, 0.08, 1.0, 0.5, true, 0.75,
+            "固定背景でのゆっくりしたパン用。インタビューやトーキングヘッド向け、被写体動少・揺れ少。"
         },
         // 2. fast-action-handheld
         {
             "fast-action-handheld",
             "Fast Action, Handheld Camera",
             "rect", "ZNCC",
-            48, true, 0.15, 0.8, 0.3, true, 0.6
+            48, true, 0.15, 0.8, 0.3, true, 0.6,
+            "手持ちカメラの高速アクション用。スポーツやダンス等、揺れ大・被写体動高に対応。"
         },
         // 3. logo-corner-static
         {
             "logo-corner-static",
             "Logo Corner, Locked-Off Camera",
             "rect", "SSD",
-            12, false, 0.1, 1.0, 0.8, true, 0.85
+            12, false, 0.1, 1.0, 0.8, true, 0.85,
+            "ロックオフ撮影でのロゴ・テキスト追跡。動なしの高精度トラッキング用。"
         },
         // 4. occlusion-prone-walk
         {
             "occlusion-prone-walk",
             "Occlusion-Prone Walk",
             "rect", "ZNCC",
-            40, true, 0.10, 2.0, 0.25, true, 0.55
+            40, true, 0.10, 2.0, 0.25, true, 0.55,
+            "通行人や障害物で被写体が一時的に隠れる撮影用。Kalman 予測で隙間を埋める。"
         },
         // 5. tight-product-shot
         {
             "tight-product-shot",
             "Tight Product Shot",
             "rect", "NCC",
-            8, true, 0.03, 1.2, 0.6, true, 0.80
+            8, true, 0.03, 1.2, 0.6, true, 0.80,
+            "製品クローズアップや顔のパーツ追跡。小さく狭い範囲、サブピクセル精度重視。"
         },
         // 6. scene-change-resilient
         {
             "scene-change-resilient",
             "Scene Change Resilient",
             "rect", "ZNCC",
-            60, true, 0.20, 2.5, 0.15, false, 0.50
+            60, true, 0.20, 2.5, 0.15, false, 0.50,
+            "カット切替・大きいシーン変化を跨ぐ追跡用。広探索 + 弱信頼度で再捕捉を狙う。"
         },
         // 7. manual-keyframe-only
         {
             "manual-keyframe-only",
             "Manual Keyframes Only",
             "rect", "NCC",
-            0, false, 0.1, 1.0, 1.0, false, 1.0
+            0, false, 0.1, 1.0, 1.0, false, 1.0,
+            "自動追跡を無効化し手動キーフレームのみ使用。被写体が追跡不能な場合のフォールバック。"
         },
     }};
     return kPresets;
@@ -84,6 +91,7 @@ QJsonObject toJson(const TrackerPreset& p)
     obj["occlusionGate"]         = p.occlusionGate;
     obj["subPixelEnabled"]       = p.subPixelEnabled;
     obj["minConfidence"]         = p.minConfidence;
+    obj["description"]           = p.description;
     return obj;
 }
 
@@ -140,6 +148,9 @@ std::optional<TrackerPreset> fromJson(const QJsonObject& j)
     if (mc < 0.0 || mc > 1.0)
         return std::nullopt;
     p.minConfidence = mc;
+
+    // description: optional, no validation
+    p.description = j.value("description").toString();
 
     return p;
 }

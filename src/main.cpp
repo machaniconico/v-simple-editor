@@ -20,6 +20,8 @@
 #include <QMetaObject>
 #include <QMetaMethod>
 #include <QTemporaryDir>
+#include <QTemporaryFile>
+#include <QJsonParseError>
 #include <QProcess>
 #include <QProcessEnvironment>  // TM-6: re-exec self with observer env set
 #include <QHash>
@@ -5969,6 +5971,68 @@ static int runTrackerPresetSelftest()
         if (p.id == custom.id)
             return fail("removed preset still in allPresets");
     writeLogLine("INFO", "TRACKER-PRESET (7): Registry CRUD OK");
+
+    // (8) JSON I/O round-trip via QFile (QTemporaryFile)
+    {
+        for (const auto& p : builtins) {
+            QTemporaryFile tmp;
+            if (!tmp.open()) return fail(QString("QTemporaryFile open failed for id=%1").arg(p.id));
+            const QString tmpPath = tmp.fileName();
+            tmp.close();
+
+            // toJson -> QFile write
+            const auto obj = tracker_preset::toJson(p);
+            QFile out(tmpPath);
+            if (!out.open(QIODevice::WriteOnly | QIODevice::Text))
+                return fail(QString("QFile WriteOnly failed for id=%1").arg(p.id));
+            out.write(QJsonDocument(obj).toJson(QJsonDocument::Indented));
+            out.close();
+
+            // QFile read -> fromJson
+            QFile in(tmpPath);
+            if (!in.open(QIODevice::ReadOnly | QIODevice::Text))
+                return fail(QString("QFile ReadOnly failed for id=%1").arg(p.id));
+            const QByteArray bytes = in.readAll();
+            in.close();
+            QJsonParseError err{};
+            const QJsonDocument doc = QJsonDocument::fromJson(bytes, &err);
+            if (err.error != QJsonParseError::NoError || !doc.isObject())
+                return fail(QString("JSON parse failed for id=%1: %2").arg(p.id, err.errorString()));
+            const auto rt = tracker_preset::fromJson(doc.object());
+            if (!rt.has_value())
+                return fail(QString("fromJson via file failed for id=%1").arg(p.id));
+            const auto& q = *rt;
+            if (q.id != p.id || q.displayName != p.displayName
+                || q.searchRadius != p.searchRadius
+                || q.kalmanEnabled != p.kalmanEnabled
+                || q.matchMetric != p.matchMetric
+                || q.description != p.description)
+                return fail(QString("QFile round-trip mismatch for id=%1").arg(p.id));
+        }
+    }
+    qInfo().noquote() << "[INFO] TRACKER-PRESET (8): JSON QFile round-trip OK for all 7";
+
+    // (9) description 非空 gate (US-MTD2-1 ゲート)
+    {
+        for (const auto& p : builtins) {
+            if (p.description.isEmpty())
+                return fail(QString("description is empty for id=%1").arg(p.id));
+        }
+    }
+    qInfo().noquote() << "[INFO] TRACKER-PRESET (9): description non-empty for all 7";
+
+    // (10) description JSON round-trip
+    {
+        TrackerPreset sample = builtins.front();
+        sample.description = QStringLiteral("__selftest description ALPHA");
+        const auto obj = tracker_preset::toJson(sample);
+        if (!obj.contains("description") || obj["description"].toString() != sample.description)
+            return fail("toJson did not include description");
+        const auto rt = tracker_preset::fromJson(obj);
+        if (!rt.has_value() || rt->description != sample.description)
+            return fail("fromJson did not restore description");
+    }
+    qInfo().noquote() << "[INFO] TRACKER-PRESET (10): description JSON round-trip OK";
 
     writeLogLine("INFO", "TRACKER-PRESET selftest PASSED");
     return 0;

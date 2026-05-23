@@ -10,6 +10,7 @@ class QCheckBox;
 class QComboBox;
 class QDialogButtonBox;
 class QDoubleSpinBox;
+class QLabel;
 class QPushButton;
 class QSpinBox;
 
@@ -30,13 +31,19 @@ signals:
 private slots:
     void onPresetSelectionChanged(int index);
     void onSaveCustomPreset();
+    void onDeleteSelectedPreset();
+    void onResetToDefaults();
+    void onExportPreset();
+    void onImportPreset();
 
 private:
     void rebuildPresetCombo(const QString& selectedId = QString());
     void applyPresetToWidgets(const tracker_preset::TrackerPreset& preset);
     void setWidgetSignalsBlocked(bool blocked);
+    void updateDeletePresetButton();
     int currentPresetIndex() const;
 
+    QLabel*          m_descriptionLabel            = nullptr;
     QComboBox*       m_presetCombo                 = nullptr;
     QSpinBox*        m_searchRadiusSpin            = nullptr;
     QComboBox*       m_matchMetricCombo            = nullptr;
@@ -47,6 +54,10 @@ private:
     QCheckBox*       m_subPixelEnabledCheck        = nullptr;
     QDoubleSpinBox*  m_minConfidenceSpin           = nullptr;
     QPushButton*     m_saveCustomPresetButton      = nullptr;
+    QPushButton*     m_deletePresetBtn             = nullptr;
+    QPushButton*     m_resetBtn                    = nullptr;
+    QPushButton*     m_exportBtn                   = nullptr;
+    QPushButton*     m_importBtn                   = nullptr;
     QDialogButtonBox* m_buttonBox                  = nullptr;
 
     QList<tracker_preset::TrackerPreset> m_presets;
