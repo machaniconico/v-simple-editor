@@ -168,6 +168,10 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/TrackerLink.cpp
     src/TrackerPreset.h
     src/TrackerPreset.cpp
+    src/PlanarTrackerPreset.h
+    src/PlanarTrackerPreset.cpp
+    src/PlanarTrackerPresetRegistry.h
+    src/PlanarTrackerPresetRegistry.cpp
     src/TrackerPresetRegistry.h
     src/TrackerPresetRegistry.cpp
     src/NoiseReduction.cpp

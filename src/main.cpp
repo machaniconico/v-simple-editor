@@ -163,6 +163,11 @@
 #include "PlanarTracker.h"
 #define HAVE_PLANARTRACKER 1
 #endif
+#if __has_include("PlanarTrackerPreset.h")
+#include "PlanarTrackerPreset.h"
+#include "PlanarTrackerPresetRegistry.h"
+#define HAVE_PLANARTRACKER_PRESET 1
+#endif
 
 // US-MOB-2: Sprint 16 mobile export self-test (VEDITOR_MOBILE_SELFTEST=1)
 #if __has_include("MobilePreset.h")
@@ -6038,6 +6043,161 @@ static int runTrackerPresetSelftest()
     return 0;
 }
 
+// (VEDITOR_PLANAR_PRESET_SELFTEST=1).
+//
+// Validates PlanarTrackerPreset system without spawning any subprocess or QApplication::exec():
+//   (1) builtinPresets().size() == 5
+//   (2) findBuiltin(id) succeeds for all 5
+//   (3) toJson/fromJson round-trip is lossless for all 5
+//   (4) fromJson rejects 3 classes of invalid input
+//   (5) applyToPlanarTracker runs without crash for all 5 + nullptr safety
+//   (6) Registry::allPresets().size() >= 5
+//   (7) Registry CRUD: save -> list -> remove -> list
+//   (8) JSON QFile round-trip via QTemporaryFile for all 5
+//   (9) description non-empty for all 5
+//   (10) description JSON round-trip
+#ifdef HAVE_PLANARTRACKER_PRESET
+static int runPlanarPresetSelftest()
+{
+    using planar_tracker_preset::PlanarTrackerPreset;
+    auto fail = [](const QString& msg) -> int {
+        qCritical().noquote() << "[CRIT] PLANAR-PRESET selftest FAILED:" << msg;
+        return 1;
+    };
+    qInfo().noquote() << "[INFO] PLANAR-PRESET selftest: preset application regression gate";
+
+    // (1) builtinPresets().size() == 5
+    const auto& builtins = planar_tracker_preset::builtinPresets();
+    if (builtins.size() != 5)
+        return fail(QString("builtinPresets size != 5 (got %1)").arg(builtins.size()));
+    qInfo().noquote() << "[INFO] PLANAR-PRESET (1): builtinPresets count =" << builtins.size();
+
+    // (2) findBuiltin OK for all 5
+    for (const auto& p : builtins) {
+        if (!planar_tracker_preset::findBuiltin(p.id).has_value())
+            return fail(QString("findBuiltin failed for id=%1").arg(p.id));
+    }
+    qInfo().noquote() << "[INFO] PLANAR-PRESET (2): findBuiltin OK for all 5";
+
+    // (3) toJson/fromJson round-trip
+    for (const auto& p : builtins) {
+        const auto j = planar_tracker_preset::toJson(p);
+        const auto rt = planar_tracker_preset::fromJson(j);
+        if (!rt.has_value())
+            return fail(QString("fromJson(toJson(p)) failed for id=%1").arg(p.id));
+        const auto& q = *rt;
+        if (q.id != p.id || q.displayName != p.displayName
+            || q.searchRadiusPx != p.searchRadiusPx
+            || q.patchSizePx != p.patchSizePx
+            || q.dampingFactor != p.dampingFactor
+            || q.maxFramesPerCall != p.maxFramesPerCall
+            || q.description != p.description)
+            return fail(QString("round-trip mismatch for id=%1").arg(p.id));
+    }
+    qInfo().noquote() << "[INFO] PLANAR-PRESET (3): round-trip OK for all 5";
+
+    // (4) fromJson 値域不正 → nullopt
+    {
+        QJsonObject bad1; bad1["id"]="x"; bad1["displayName"]="x"; bad1["searchRadiusPx"]=2.0;
+        if (planar_tracker_preset::fromJson(bad1).has_value())
+            return fail("fromJson accepted searchRadiusPx=2.0");
+        QJsonObject bad2; bad2["id"]="x"; bad2["displayName"]="x"; bad2["patchSizePx"]=200.0;
+        if (planar_tracker_preset::fromJson(bad2).has_value())
+            return fail("fromJson accepted patchSizePx=200.0");
+        QJsonObject bad3; bad3["id"]="x"; bad3["displayName"]="x"; bad3["dampingFactor"]=1.5;
+        if (planar_tracker_preset::fromJson(bad3).has_value())
+            return fail("fromJson accepted dampingFactor=1.5");
+    }
+    qInfo().noquote() << "[INFO] PLANAR-PRESET (4): fromJson rejects 3 invalid inputs";
+
+    // (5) applyToPlanarTracker — 5 preset 全て + nullptr safety
+    planar::Tracker tracker;
+    for (const auto& p : builtins)
+        planar_tracker_preset::applyToPlanarTracker(&tracker, p);
+    planar_tracker_preset::applyToPlanarTracker(nullptr, builtins.front());
+    qInfo().noquote() << "[INFO] PLANAR-PRESET (5): applyToPlanarTracker OK for all 5 + nullptr";
+
+    // (6) Registry::allPresets().size() >= 5
+    const int registrySize = static_cast<int>(
+        planar_tracker_preset::Registry::instance().allPresets().size());
+    if (registrySize < 5)
+        return fail(QString("Registry size < 5 (got %1)").arg(registrySize));
+    qInfo().noquote() << "[INFO] PLANAR-PRESET (6): Registry size =" << registrySize;
+
+    // (7) Registry CRUD
+    {
+        PlanarTrackerPreset custom = builtins.front();
+        custom.id = QStringLiteral("__selftest-planar-tmp");
+        custom.displayName = QStringLiteral("__selftest-planar-tmp");
+        if (!planar_tracker_preset::Registry::instance().saveUserPreset(custom))
+            return fail("saveUserPreset failed");
+        bool found = false;
+        for (const auto& p : planar_tracker_preset::Registry::instance().allPresets())
+            if (p.id == custom.id) { found = true; break; }
+        if (!found) return fail("saved preset not in allPresets");
+        if (!planar_tracker_preset::Registry::instance().removeUserPreset(custom.id))
+            return fail("removeUserPreset failed");
+        for (const auto& p : planar_tracker_preset::Registry::instance().allPresets())
+            if (p.id == custom.id) return fail("removed preset still in allPresets");
+    }
+    qInfo().noquote() << "[INFO] PLANAR-PRESET (7): Registry CRUD OK";
+
+    // (8) JSON QFile round-trip via QTemporaryFile
+    for (const auto& p : builtins) {
+        QTemporaryFile tmp;
+        if (!tmp.open()) return fail(QString("QTemporaryFile open failed for id=%1").arg(p.id));
+        const QString tmpPath = tmp.fileName();
+        tmp.close();
+        const auto obj = planar_tracker_preset::toJson(p);
+        QFile out(tmpPath);
+        if (!out.open(QIODevice::WriteOnly | QIODevice::Text))
+            return fail(QString("QFile write open failed for id=%1").arg(p.id));
+        out.write(QJsonDocument(obj).toJson(QJsonDocument::Indented));
+        out.close();
+        QFile in(tmpPath);
+        if (!in.open(QIODevice::ReadOnly | QIODevice::Text))
+            return fail(QString("QFile read open failed for id=%1").arg(p.id));
+        const QByteArray bytes = in.readAll();
+        in.close();
+        QJsonParseError err{};
+        const QJsonDocument doc = QJsonDocument::fromJson(bytes, &err);
+        if (err.error != QJsonParseError::NoError || !doc.isObject())
+            return fail(QString("JSON parse failed for id=%1: %2").arg(p.id, err.errorString()));
+        const auto rt = planar_tracker_preset::fromJson(doc.object());
+        if (!rt.has_value())
+            return fail(QString("fromJson via file failed for id=%1").arg(p.id));
+        const auto& q = *rt;
+        if (q.id != p.id || q.searchRadiusPx != p.searchRadiusPx
+            || q.patchSizePx != p.patchSizePx || q.dampingFactor != p.dampingFactor)
+            return fail(QString("QFile round-trip mismatch for id=%1").arg(p.id));
+    }
+    qInfo().noquote() << "[INFO] PLANAR-PRESET (8): JSON QFile round-trip OK for all 5";
+
+    // (9) description 非空
+    for (const auto& p : builtins) {
+        if (p.description.isEmpty())
+            return fail(QString("description is empty for id=%1").arg(p.id));
+    }
+    qInfo().noquote() << "[INFO] PLANAR-PRESET (9): description non-empty for all 5";
+
+    // (10) description JSON round-trip
+    {
+        PlanarTrackerPreset sample = builtins.front();
+        sample.description = QStringLiteral("__selftest description PLANAR");
+        const auto obj = planar_tracker_preset::toJson(sample);
+        if (!obj.contains("description") || obj["description"].toString() != sample.description)
+            return fail("toJson did not include description");
+        const auto rt = planar_tracker_preset::fromJson(obj);
+        if (!rt.has_value() || rt->description != sample.description)
+            return fail("fromJson did not restore description");
+    }
+    qInfo().noquote() << "[INFO] PLANAR-PRESET (10): description JSON round-trip OK";
+
+    qInfo().noquote() << "[INFO] PLANAR-PRESET selftest PASSED";
+    return 0;
+}
+#endif // HAVE_PLANARTRACKER_PRESET
+
 // (VEDITOR_HDR_ROUTING_SELFTEST=1).
 //
 // Validates three invariants without spawning any subprocess or QProcess:
@@ -11483,6 +11643,12 @@ int main(int argc, char *argv[])
         writeLogLine("INFO", "running VEDITOR_TRACKER_PRESET_SELFTEST");
         return runTrackerPresetSelftest();
     }
+#ifdef HAVE_PLANARTRACKER_PRESET
+    if (qEnvironmentVariableIntValue("VEDITOR_PLANAR_PRESET_SELFTEST") != 0) {
+        qInfo().noquote() << "[INFO] running VEDITOR_PLANAR_PRESET_SELFTEST";
+        return runPlanarPresetSelftest();
+    }
+#endif
     if (qEnvironmentVariableIntValue("VEDITOR_VIDEOSTAB_DESHAKE_SELFTEST") != 0) {
         writeLogLine("INFO", "running VEDITOR_VIDEOSTAB_DESHAKE_SELFTEST");
         return runVideostabDeshakeSelftest();
