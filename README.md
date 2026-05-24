@@ -224,27 +224,130 @@ All shortcuts are customizable via Edit > Keyboard Shortcuts.
 
 ---
 
+## Testing
+
+Selftests are wired into the executable itself, dispatched via a single
+`kArgvSelftests[]` table in `src/main.cpp` (SSOT, 54 entries). Four entry
+points cover the routing matrix:
+
+```bash
+# 1. enumerate (compact, one line each + env name)
+./build_win/Release/v-simple-editor.exe --selftest=list
+
+# 2. detailed help (per-entry description + env name + usage header)
+./build_win/Release/v-simple-editor.exe --selftest=help
+
+# 3. run a single selftest
+./build_win/Release/v-simple-editor.exe --selftest=tracker-preset
+./build_win/Release/v-simple-editor.exe --selftest=parity
+./build_win/Release/v-simple-editor.exe --selftest=trackmatte-parity
+
+# 4. CI-friendly full sweep (runs every entry; exit code = failed count)
+./build_win/Release/v-simple-editor.exe --selftest=all
+```
+
+Each `--selftest=<name>` also has a parallel env-gate (`VEDITOR_<NAME>_SELFTEST=1`)
+that runs the same function — useful for legacy CI / dev setups that already
+script env vars:
+
+```bash
+VEDITOR_TRACKER_PRESET_SELFTEST=1 ./build_win/Release/v-simple-editor.exe
+VEDITOR_ALL_SELFTEST=1 ./build_win/Release/v-simple-editor.exe   # full sweep
+```
+
+Typos / stale selftest names exit 2 with a friendly stderr message instead
+of silently launching the GUI:
+
+```bash
+$ ./build_win/Release/v-simple-editor.exe --selftest=unknown-foo
+[ERROR] unknown selftest: --selftest=unknown-foo
+Run with --selftest=list to see available selftests.
+$ echo $?
+2
+```
+
+Adding a new selftest = one line in `kArgvSelftests[]`: argv-switch name +
+`VEDITOR_<NAME>_SELFTEST` env var + function pointer + QApplication-required
+flag + 1-line description. Both argv-switch and env-gate routing are wired
+automatically.
+
+---
+
+## Continuous Integration
+
+`.github/workflows/selftest.yml` — a Windows MSVC smoke workflow on GitHub
+Actions. Currently `workflow_dispatch` (manual trigger only); auto trigger
+on push / pull_request gets enabled once the first green run pins the
+vcpkg + Qt provisioning costs.
+
+Steps (build + light smoke, ~15-30 min on a fresh runner):
+
+1. checkout
+2. MSVC x64 dev env
+3. vcpkg install ffmpeg:x64-windows
+4. Qt 6.7.0 install (qtmultimedia / qtsvg / qtimageformats)
+5. cmake configure + Release build
+6. smoke: `--selftest=list` / `--selftest=tracker-preset` / `--selftest=hdr-routing`
+7. guard: `--selftest=unknown-foo` exits 2
+
+Heavy entries (`--selftest=all` sweep with parity / e2e / libavcore-encode)
+need real footage assets and stronger DLL surface than the runner ships;
+a separate workflow will follow.
+
+---
+
+## Architecture — SSOT modules
+
+A few critical SSOTs (single source of truth) keep preview and export
+byte-equivalent and the selftest dispatch coherent:
+
+| SSOT | Location | Purpose |
+|---|---|---|
+| `tlrender::renderFrameAt` | `src/tlrender/` | Timeline → QImage rendering, every export path goes through here |
+| `trackmatte::composite` | `src/trackmatte/` | Track matte (4 types) compositing, premul ARGB32 + QPainter SourceOver, byte-equivalent to matte-free path |
+| `clipgeom` | `src/clipgeom.h/cpp` | Clip geometry (scale/translate/rotation) anchored at layer center |
+| `libavcore` | `src/libavcore/` | In-process FFmpeg integration (Decode / Encode / Probe / VideoFilterGraph / Concat) replacing per-call ffmpeg.exe subprocess |
+| `kArgvSelftests` | `src/main.cpp` (anonymous ns) | Selftest dispatch table (54 entries × 5 fields: name / envVar / fn / needsQApp / description) |
+
+Architecture rationale: preview ≠ export was historically the #1 NLE
+parity bug source. The three rendering SSOTs (`tlrender` / `trackmatte` /
+`clipgeom`) collapse preview and every export path into the same call
+graph; the `PARITY` selftest (`--selftest=parity` S1-S11) enforces it.
+
+---
+
 ## Project Structure
 
 ```
 v-simple-editor/
 ├── CMakeLists.txt
 ├── setup.bat                    # Windows env setup
+├── .github/workflows/
+│   └── selftest.yml             # CI smoke (draft, workflow_dispatch)
 ├── resources/
 │   ├── resources.qrc            # Qt resource file
 │   └── icons/                   # App icons
+├── scripts/
+│   └── realfootage_parity.sh    # Real-footage selftest harness
 └── src/
-    ├── main.cpp                 # Entry point
+    ├── main.cpp                 # Entry point + kArgvSelftests[] table + 54 selftest functions
+    ├── libavcore/               # In-process FFmpeg (Decode/Encode/Probe/VideoFilterGraph/Concat)
     ├── MainWindow.h/cpp         # Main application window
     ├── VideoPlayer.h/cpp        # Video decode & preview
     ├── Timeline.h/cpp           # Multi-track timeline
     ├── ProjectSettings.h/cpp    # Project configuration
-    ├── ProjectFile.h/cpp        # .veditor save/load
+    ├── ProjectFile.h/cpp        # .veditor save/load + tracker preset persistence
     ├── ExportDialog.h/cpp       # Export settings UI
-    ├── Exporter.h/cpp           # FFmpeg encoding
+    ├── Exporter.h/cpp           # FFmpeg encoding (in-process via libavcore)
     ├── CodecDetector.h/cpp      # HW codec detection
     ├── UndoManager.h/cpp        # Undo/redo stack
     ├── GLPreview.h/cpp          # OpenGL 3.3 GPU preview
+    ├── TrackerPreset.h/cpp           # Motion tracker preset (7 built-in)
+    ├── TrackerPresetRegistry.h/cpp   # Motion preset registry (QSettings)
+    ├── MotionTrackerDialog.h/cpp     # Motion tracker dialog + preset UI
+    ├── PlanarTrackerPreset.h/cpp     # Planar tracker preset (5 built-in)
+    ├── PlanarTrackerPresetRegistry.h/cpp
+    ├── PlanarTrackerDialog.h/cpp     # Planar tracker dialog + preset UI
     ├── ThemeManager.h/cpp       # UI themes
     ├── Overlay.h/cpp            # Video overlays
     ├── TextManager.h/cpp        # Text/telop system
@@ -309,6 +412,16 @@ v-simple-editor/
 - [x] Phase 12: Motion graphics - 3D camera, expressions, shapes, text animator (4 features)
 - [x] Phase 13: Advanced compositing - tracker link, pre-compose, rotoscope, warp (4 features)
 - [x] Phase 14: Polish & extensibility - shortcuts, recent files, icon, GPU shaders, VST/AU, Python scripting, network render, Remotion export
+- [x] Sprint 15-22: External tool import (OBS / Affinity / Blender), mobile export (iOS / Android), platform pipelines (YouTube OAuth, Vimeo, Twitch, Frame.io, DaVinci, FCPXML), AI smart-edit, cloud render, X / Instagram upload, batch export, loudness (BS.1770), HDR routing, multi-cam, chroma key, audio restoration, animated GIF / WebP, easing, subtitle translation, lower-third, watermark
+- [x] NLE Parity SSOT: `tlrender::renderFrameAt` (every export path) + `trackmatte::composite` (4 matte types) + `clipgeom` (transform parity)
+- [x] PRD-B series: `libavcore` in-process FFmpeg migration (h264_mf 8-bit / HDR10 subprocess fallback)
+- [x] Tracker Preset system: Motion / Planar with Registry + Dialog UX + ProjectFile persistence
+- [x] Selftest argv-switch SSOT: `kArgvSelftests[]` 54-entry table, `--selftest=<name>` + `VEDITOR_*_SELFTEST` + `--selftest={list,help,all}` + unknown-name guard
+- [x] CI workflow draft (`.github/workflows/selftest.yml`, `workflow_dispatch` only)
+- [ ] CI green run + auto trigger on push / PR
+- [ ] `src/main.cpp` split refactor (selftest functions → `src/selftests/`, dispatcher → SelftestRegistry module)
+- [ ] CRLF → LF wholesale normalization (per repo-root `.gitattributes`)
+- [ ] Streaming pipeline real-authentication harness (YouTube / Vimeo / Twitch / X / Instagram currently no-op stub for CI)
 
 ---
 
