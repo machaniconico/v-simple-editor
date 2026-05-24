@@ -52,7 +52,10 @@ int runMultiCamSelftest();
 int runObsSelftest();
 int runParitySelftest();
 int runPlanarSelftest();
+#if __has_include("PlanarTrackerPreset.h")
 int runPlanarPresetSelftest();
+#define HAVE_PLANARTRACKER_PRESET 1
+#endif
 int runProExtSelftest();
 int runProSelftest();
 int runProjTmplSelftest();
