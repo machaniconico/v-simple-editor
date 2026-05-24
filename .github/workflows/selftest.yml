@@ -1,0 +1,98 @@
+name: selftest
+
+# Smoke + light sweep for the selftest argv-switch table.
+#
+# STATUS: DRAFT — `workflow_dispatch` only (manual trigger). Auto-trigger
+# on push / pull_request is intentionally disabled until the first successful
+# run pins the vcpkg + Qt provisioning costs. Promote to `on: push, pull_request`
+# once a green run is achieved end-to-end.
+#
+# Exercises (light, no external footage):
+#   1. --selftest=list           : verify kArgvSelftests table populates
+#   2. --selftest=tracker-preset : QApplication-free entry
+#   3. --selftest=hdr-routing    : QApplication-free entry
+#   4. --selftest=unknown-foo    : guard returns exit 2
+#
+# Heavy entries (--selftest=all sweep with parity / e2e / libavcore-encode)
+# are out of scope here — they need real footage assets and stronger DLL
+# surface than the runner ships. Add a separate workflow once asset/DLL
+# provisioning is solved.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-msvc-smoke:
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    env:
+      VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Set up vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: "2024.07.12"
+
+      - name: Install FFmpeg (vcpkg)
+        shell: cmd
+        run: |
+          %VCPKG_ROOT%\vcpkg install ffmpeg:x64-windows
+
+      - name: Install Qt 6
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.7.0"
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          modules: "qtmultimedia qtsvg qtimageformats"
+          cache: true
+
+      - name: Configure CMake
+        shell: cmd
+        run: |
+          cmake -S . -B build_win -G "Visual Studio 17 2022" -A x64 ^
+            -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake
+
+      - name: Build Release
+        shell: cmd
+        run: |
+          cmake --build build_win --config Release
+
+      - name: Smoke — --selftest=list
+        shell: cmd
+        run: |
+          build_win\Release\v-simple-editor.exe --selftest=list
+
+      - name: Smoke — --selftest=tracker-preset (QApp-free)
+        shell: cmd
+        run: |
+          build_win\Release\v-simple-editor.exe --selftest=tracker-preset
+
+      - name: Smoke — --selftest=hdr-routing (QApp-free)
+        shell: cmd
+        run: |
+          build_win\Release\v-simple-editor.exe --selftest=hdr-routing
+
+      - name: Guard — --selftest=<unknown> exits 2
+        shell: cmd
+        run: |
+          build_win\Release\v-simple-editor.exe --selftest=unknown-foo
+          if %ERRORLEVEL% NEQ 2 (
+            echo Expected exit 2 for unknown selftest, got %ERRORLEVEL%
+            exit /b 1
+          )
+          echo PASS: unknown selftest correctly returned exit 2
