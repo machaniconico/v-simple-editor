@@ -81,6 +81,9 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     # PRD-SPLIT-MAIN-3 Phase 3-C: Sprint 11-22 サービス selftests (moved from src/main.cpp).
     src/selftests/sprint_selftests.cpp
 
+    # PRD-SPLIT-MAIN-3 Phase 3-D: misc selftests (moved from src/main.cpp, final phase).
+    src/selftests/misc_selftests.cpp
+
     src/main.cpp
     src/MainWindow.cpp
     src/VideoPlayer.cpp
