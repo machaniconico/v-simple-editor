@@ -11724,73 +11724,76 @@ int runTextExportSelftest()
 // needsQApplication==false entries are dispatched before QApplication is
 // constructed (QApp-free path, safe for WSL direct exec without GUI hang).
 // needsQApplication==true entries are dispatched after QApplication(argc,argv).
-// The env-gate VEDITOR_*_SELFTEST paths are NOT replaced — both routes remain
-// active for backward compatibility.
+// PRD-ENV-TABLE: envVar is the VEDITOR_*_SELFTEST env var name for this entry,
+// or nullptr when no env-gate exists (e.g. proxy: env-gate was reverted in
+// PRD-PROXY-CLEAN US-PXC-3). The env-gate dispatch loop below uses this field
+// as the single source of truth, replacing ~52 individual if-statements.
 struct ArgvSelftestEntry {
     const char* name;       // --selftest=<name> kebab-case identifier
+    const char* envVar;     // VEDITOR_*_SELFTEST env var, or nullptr
     int (*fn)();            // selftest function pointer
     bool needsQApplication; // true = dispatch after QApplication construction
 };
 
 static const ArgvSelftestEntry kArgvSelftests[] = {
     // QApplication-free (needsQApplication=false) -------------------------
-    { "proxy",              runProxySelftestV2,            false },
-    { "hdr-routing",        runHdrRoutingSelftest,         false },
-    { "tracker-preset",     runTrackerPresetSelftest,      false },
+    { "proxy",             nullptr,                               runProxySelftestV2,            false }, // env-gate reverted (PRD-PROXY-CLEAN US-PXC-3)
+    { "hdr-routing",       "VEDITOR_HDR_ROUTING_SELFTEST",        runHdrRoutingSelftest,         false },
+    { "tracker-preset",    "VEDITOR_TRACKER_PRESET_SELFTEST",     runTrackerPresetSelftest,      false },
 #ifdef HAVE_PLANARTRACKER_PRESET
-    { "planar-preset",      runPlanarPresetSelftest,       false },
+    { "planar-preset",     "VEDITOR_PLANAR_PRESET_SELFTEST",      runPlanarPresetSelftest,       false },
 #endif
-    { "project-preset",     runProjectPresetSelftest,      false },
-    { "aihighlight",        runAIHighlightSelftest,        false },
-    { "videostab-deshake",  runVideostabDeshakeSelftest,   false },
+    { "project-preset",    "VEDITOR_PROJECT_PRESET_SELFTEST",     runProjectPresetSelftest,      false },
+    { "aihighlight",       "VEDITOR_AIHIGHLIGHT_SELFTEST",        runAIHighlightSelftest,        false },
+    { "videostab-deshake", "VEDITOR_VIDEOSTAB_DESHAKE_SELFTEST",  runVideostabDeshakeSelftest,   false },
     // QApplication-required (needsQApplication=true) ----------------------
-    { "parity",             runParitySelftest,             true  },
-    { "e2e",                runE2eSelftest,                true  },
-    { "trackmatte-parity",  runTrackMatteParitySelftest,   true  },
-    { "vfx",                runVfxSelftest,                true  },
-    { "pro",                runProSelftest,                true  },
-    { "mograph",            runMographSelftest,            true  },
-    { "hwperf",             runHwPerfSelftest,             true  },
-    { "proext",             runProExtSelftest,             true  },
-    { "shortcut",           runShortcutSelftest,           true  },
-    { "social",             runSocialSelftest,             true  },
-    { "caption",            runCaptionSelftest,            true  },
-    { "planar",             runPlanarSelftest,             true  },
-    { "mobile",             runMobileSelftest,             true  },
-    { "obs",                runObsSelftest,                true  },
-    { "affinity",           runAffinitySelftest,           true  },
-    { "blender",            runBlenderSelftest,            true  },
-    { "import",             runImportSelftest,             true  },
-    { "youtube",            runYoutubeSelftest,            true  },
-    { "collab",             runCollabSelftest,             true  },
-    { "colormatch",         runColorMatchSelftest,         true  },
-    { "vimeo",              runVimeoSelftest,              true  },
-    { "twitch",             runTwitchSelftest,             true  },
-    { "frameio",            runFrameIoSelftest,            true  },
-    { "davinci",            runDavinciSelftest,            true  },
-    { "fcpxml",             runFcpxmlSelftest,             true  },
-    { "smartedit",          runSmartEditSelftest,          true  },
-    { "cloudrender",        runCloudRenderSelftest,        true  },
-    { "xupload",            runXUploadSelftest,            true  },
-    { "instagram",          runInstagramSelftest,          true  },
-    { "projtmpl",           runProjTmplSelftest,           true  },
-    { "loudness",           runLoudnessSelftest,           true  },
-    { "hdr",                runHdrSelftest,                true  },
-    { "multicam",           runMultiCamSelftest,           true  },
-    { "batchexport",        runBatchExportSelftest,        true  },
-    { "chroma",             runChromaSelftest,             true  },
-    { "audiorestore",       runAudioRestoreSelftest,       true  },
-    { "animexport",         runAnimExportSelftest,         true  },
-    { "easing",             runEasingSelftest,             true  },
-    { "subxlat",            runSubXlatSelftest,            true  },
-    { "lowerthird",         runLowerThirdSelftest,         true  },
-    { "watermark",          runWatermarkSelftest,          true  },
-    { "libavcore-encode",   runLibavcoreEncodeSelftest,    true  },
-    { "libavcore-decode",   runLibavcoreDecodeSelftest,    true  },
-    { "exportaudit",        runExportAuditSelftest,        true  },
-    { "textexport",         runTextExportSelftest,         true  },
-    { "workflow",           runWorkflowSelftest,           true  },
-    { "audiomixer",         runAudioMixerSelftest,         true  },
+    { "parity",            "VEDITOR_PARITY_SELFTEST",             runParitySelftest,             true  },
+    { "e2e",               "VEDITOR_E2E_SELFTEST",                runE2eSelftest,                true  },
+    { "trackmatte-parity", "VEDITOR_TRACKMATTE_PARITY_SELFTEST",  runTrackMatteParitySelftest,   true  },
+    { "vfx",               "VEDITOR_VFX_SELFTEST",                runVfxSelftest,                true  },
+    { "pro",               "VEDITOR_PRO_SELFTEST",                runProSelftest,                true  },
+    { "mograph",           "VEDITOR_MOGRAPH_SELFTEST",            runMographSelftest,            true  },
+    { "hwperf",            "VEDITOR_HWPERF_SELFTEST",             runHwPerfSelftest,             true  },
+    { "proext",            "VEDITOR_PROEXT_SELFTEST",             runProExtSelftest,             true  },
+    { "shortcut",          "VEDITOR_SHORTCUT_SELFTEST",           runShortcutSelftest,           true  },
+    { "social",            "VEDITOR_SOCIAL_SELFTEST",             runSocialSelftest,             true  },
+    { "caption",           "VEDITOR_CAPTION_SELFTEST",            runCaptionSelftest,            true  },
+    { "planar",            "VEDITOR_PLANAR_SELFTEST",             runPlanarSelftest,             true  },
+    { "mobile",            "VEDITOR_MOBILE_SELFTEST",             runMobileSelftest,             true  },
+    { "obs",               "VEDITOR_OBS_SELFTEST",                runObsSelftest,                true  },
+    { "affinity",          "VEDITOR_AFFINITY_SELFTEST",           runAffinitySelftest,           true  },
+    { "blender",           "VEDITOR_BLENDER_SELFTEST",            runBlenderSelftest,            true  },
+    { "import",            "VEDITOR_IMPORT_SELFTEST",             runImportSelftest,             true  },
+    { "youtube",           "VEDITOR_YOUTUBE_SELFTEST",            runYoutubeSelftest,            true  },
+    { "collab",            "VEDITOR_COLLAB_SELFTEST",             runCollabSelftest,             true  },
+    { "colormatch",        "VEDITOR_COLORMATCH_SELFTEST",         runColorMatchSelftest,         true  },
+    { "vimeo",             "VEDITOR_VIMEO_SELFTEST",              runVimeoSelftest,              true  },
+    { "twitch",            "VEDITOR_TWITCH_SELFTEST",             runTwitchSelftest,             true  },
+    { "frameio",           "VEDITOR_FRAMEIO_SELFTEST",            runFrameIoSelftest,            true  },
+    { "davinci",           "VEDITOR_DAVINCI_SELFTEST",            runDavinciSelftest,            true  },
+    { "fcpxml",            "VEDITOR_FCPXML_SELFTEST",             runFcpxmlSelftest,             true  },
+    { "smartedit",         "VEDITOR_SMARTEDIT_SELFTEST",          runSmartEditSelftest,          true  },
+    { "cloudrender",       "VEDITOR_CLOUDRENDER_SELFTEST",        runCloudRenderSelftest,        true  },
+    { "xupload",           "VEDITOR_XUPLOAD_SELFTEST",            runXUploadSelftest,            true  },
+    { "instagram",         "VEDITOR_INSTAGRAM_SELFTEST",          runInstagramSelftest,          true  },
+    { "projtmpl",          "VEDITOR_PROJTMPL_SELFTEST",           runProjTmplSelftest,           true  },
+    { "loudness",          "VEDITOR_LOUDNESS_SELFTEST",           runLoudnessSelftest,           true  },
+    { "hdr",               "VEDITOR_HDR_SELFTEST",                runHdrSelftest,                true  },
+    { "multicam",          "VEDITOR_MULTICAM_SELFTEST",           runMultiCamSelftest,           true  },
+    { "batchexport",       "VEDITOR_BATCHEXPORT_SELFTEST",        runBatchExportSelftest,        true  },
+    { "chroma",            "VEDITOR_CHROMA_SELFTEST",             runChromaSelftest,             true  },
+    { "audiorestore",      "VEDITOR_AUDIORESTORE_SELFTEST",       runAudioRestoreSelftest,       true  },
+    { "animexport",        "VEDITOR_ANIMEXPORT_SELFTEST",         runAnimExportSelftest,         true  },
+    { "easing",            "VEDITOR_EASING_SELFTEST",             runEasingSelftest,             true  },
+    { "subxlat",           "VEDITOR_SUBXLAT_SELFTEST",            runSubXlatSelftest,            true  },
+    { "lowerthird",        "VEDITOR_LOWERTHIRD_SELFTEST",         runLowerThirdSelftest,         true  },
+    { "watermark",         "VEDITOR_WATERMARK_SELFTEST",          runWatermarkSelftest,          true  },
+    { "libavcore-encode",  "VEDITOR_LIBAVCORE_ENCODE_SELFTEST",   runLibavcoreEncodeSelftest,    true  },
+    { "libavcore-decode",  "VEDITOR_LIBAVCORE_DECODE_SELFTEST",   runLibavcoreDecodeSelftest,    true  },
+    { "exportaudit",       "VEDITOR_EXPORTAUDIT_SELFTEST",        runExportAuditSelftest,        true  },
+    { "textexport",        "VEDITOR_TEXTEXPORT_SELFTEST",         runTextExportSelftest,         true  },
+    { "workflow",          "VEDITOR_WORKFLOW_SELFTEST",           runWorkflowSelftest,           true  },
+    { "audiomixer",        "VEDITOR_AUDIOMIXER_SELFTEST",         runAudioMixerSelftest,         true  },
 };
 
 } // anonymous namespace
@@ -11993,25 +11996,21 @@ int main(int argc, char *argv[])
     }
 #endif
 
-    // TM-6: track-matte SSOT parity selftest. Dispatched by the argv switch
-    // --selftest-trackmatte-parity (matching the runParitySelftest sibling's
-    // role) and also by the VEDITOR_TRACKMATTE_PARITY_SELFTEST env var for
-    // consistency with the other VEDITOR_*_SELFTEST hooks below.
-    if (app.arguments().contains(QStringLiteral("--selftest-trackmatte-parity"))
-        || qEnvironmentVariableIntValue("VEDITOR_TRACKMATTE_PARITY_SELFTEST") != 0) {
+    // TM-6: track-matte SSOT parity selftest. Dispatched by the legacy argv
+    // switch --selftest-trackmatte-parity. The env-gate path
+    // (VEDITOR_TRACKMATTE_PARITY_SELFTEST) is now handled by the
+    // PRD-ENV-TABLE loop below via kArgvSelftests[].envVar.
+    if (app.arguments().contains(QStringLiteral("--selftest-trackmatte-parity"))) {
         writeLogLine("INFO", "running --selftest-trackmatte-parity");
         return runTrackMatteParitySelftest();
     }
 
     // TM-9: track-matte EXPORT-INTEGRATION selftest (critic M1 closure).
-    // Dispatched by --selftest-trackmatte-export-integration (mirroring the
-    // TM-6 sibling's argv-switch role) and the VEDITOR_TRACKMATTE_EXPORT_
-    // INTEGRATION_SELFTEST env var for consistency with the other
-    // VEDITOR_*_SELFTEST hooks.
+    // Dispatched by the legacy argv switch
+    // --selftest-trackmatte-export-integration. No env-gate alias — this
+    // test is not in kArgvSelftests[] and has no VEDITOR_* CI integration.
     if (app.arguments().contains(
-            QStringLiteral("--selftest-trackmatte-export-integration"))
-        || qEnvironmentVariableIntValue(
-               "VEDITOR_TRACKMATTE_EXPORT_INTEGRATION_SELFTEST") != 0) {
+            QStringLiteral("--selftest-trackmatte-export-integration"))) {
         writeLogLine("INFO",
                      "running --selftest-trackmatte-export-integration");
         return runTrackMatteExportIntegrationSelftest();
@@ -12040,166 +12039,6 @@ int main(int argc, char *argv[])
         return runTrackMatteRm5ReorderSelftest();
     }
 
-    if (qEnvironmentVariableIntValue("VEDITOR_VFX_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_VFX_SELFTEST");
-        return runVfxSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_PRO_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_PRO_SELFTEST");
-        return runProSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_MOGRAPH_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_MOGRAPH_SELFTEST");
-        return runMographSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_HWPERF_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_HWPERF_SELFTEST");
-        return runHwPerfSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_PROEXT_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_PROEXT_SELFTEST");
-        return runProExtSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_SHORTCUT_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_SHORTCUT_SELFTEST");
-        return runShortcutSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_SOCIAL_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_SOCIAL_SELFTEST");
-        return runSocialSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_CAPTION_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_CAPTION_SELFTEST");
-        return runCaptionSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_PLANAR_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_PLANAR_SELFTEST");
-        return runPlanarSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_MOBILE_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_MOBILE_SELFTEST");
-        return runMobileSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_OBS_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_OBS_SELFTEST");
-        return runObsSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_AFFINITY_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_AFFINITY_SELFTEST");
-        return runAffinitySelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_BLENDER_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_BLENDER_SELFTEST");
-        return runBlenderSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_IMPORT_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_IMPORT_SELFTEST");
-        return runImportSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_YOUTUBE_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_YOUTUBE_SELFTEST");
-        return runYoutubeSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_COLLAB_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_COLLAB_SELFTEST");
-        return runCollabSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_COLORMATCH_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_COLORMATCH_SELFTEST");
-        return runColorMatchSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_VIMEO_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_VIMEO_SELFTEST");
-        return runVimeoSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_TWITCH_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_TWITCH_SELFTEST");
-        return runTwitchSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_FRAMEIO_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_FRAMEIO_SELFTEST");
-        return runFrameIoSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_DAVINCI_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_DAVINCI_SELFTEST");
-        return runDavinciSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_FCPXML_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_FCPXML_SELFTEST");
-        return runFcpxmlSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_SMARTEDIT_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_SMARTEDIT_SELFTEST");
-        return runSmartEditSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_CLOUDRENDER_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_CLOUDRENDER_SELFTEST");
-        return runCloudRenderSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_XUPLOAD_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_XUPLOAD_SELFTEST");
-        return runXUploadSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_INSTAGRAM_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_INSTAGRAM_SELFTEST");
-        return runInstagramSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_PROJTMPL_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_PROJTMPL_SELFTEST");
-        return runProjTmplSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_LOUDNESS_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_LOUDNESS_SELFTEST");
-        return runLoudnessSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_HDR_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_HDR_SELFTEST");
-        return runHdrSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_MULTICAM_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_MULTICAM_SELFTEST");
-        return runMultiCamSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_BATCHEXPORT_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_BATCHEXPORT_SELFTEST");
-        return runBatchExportSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_CHROMA_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_CHROMA_SELFTEST");
-        return runChromaSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_AUDIORESTORE_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_AUDIORESTORE_SELFTEST");
-        return runAudioRestoreSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_ANIMEXPORT_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_ANIMEXPORT_SELFTEST");
-        return runAnimExportSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_EASING_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_EASING_SELFTEST");
-        return runEasingSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_SUBXLAT_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_SUBXLAT_SELFTEST");
-        return runSubXlatSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_LOWERTHIRD_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_LOWERTHIRD_SELFTEST");
-        return runLowerThirdSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_WATERMARK_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_WATERMARK_SELFTEST");
-        return runWatermarkSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_LIBAVCORE_ENCODE_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_LIBAVCORE_ENCODE_SELFTEST");
-        return runLibavcoreEncodeSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_LIBAVCORE_DECODE_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_LIBAVCORE_DECODE_SELFTEST");
-        return runLibavcoreDecodeSelftest();
-    }
     // PRD-ARGV-TABLE: central argv-switch dispatcher (QApplication-required entries).
     // See kArgvSelftests in the anonymous namespace; this loop covers every
     // entry with needsQApplication==true. Selftests that touch QWidget /
@@ -12217,55 +12056,16 @@ int main(int argc, char *argv[])
         }
     }
 
-    if (qEnvironmentVariableIntValue("VEDITOR_HDR_ROUTING_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_HDR_ROUTING_SELFTEST");
-        return runHdrRoutingSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_TRACKER_PRESET_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_TRACKER_PRESET_SELFTEST");
-        return runTrackerPresetSelftest();
-    }
-#ifdef HAVE_PLANARTRACKER_PRESET
-    if (qEnvironmentVariableIntValue("VEDITOR_PLANAR_PRESET_SELFTEST") != 0) {
-        qInfo().noquote() << "[INFO] running VEDITOR_PLANAR_PRESET_SELFTEST";
-        return runPlanarPresetSelftest();
-    }
-#endif
-    if (qEnvironmentVariableIntValue("VEDITOR_PROJECT_PRESET_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_PROJECT_PRESET_SELFTEST");
-        return runProjectPresetSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_AIHIGHLIGHT_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_AIHIGHLIGHT_SELFTEST");
-        return runAIHighlightSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_VIDEOSTAB_DESHAKE_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_VIDEOSTAB_DESHAKE_SELFTEST");
-        return runVideostabDeshakeSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_PARITY_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_PARITY_SELFTEST");
-        return runParitySelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_E2E_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_E2E_SELFTEST");
-        return runE2eSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_EXPORTAUDIT_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_EXPORTAUDIT_SELFTEST");
-        return runExportAuditSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_TEXTEXPORT_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_TEXTEXPORT_SELFTEST");
-        return runTextExportSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_WORKFLOW_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_WORKFLOW_SELFTEST");
-        return runWorkflowSelftest();
-    }
-    if (qEnvironmentVariableIntValue("VEDITOR_AUDIOMIXER_SELFTEST") != 0) {
-        writeLogLine("INFO", "running VEDITOR_AUDIOMIXER_SELFTEST");
-        return runAudioMixerSelftest();
+    // PRD-ENV-TABLE: env-gate dispatch via kArgvSelftests envVar field.
+    // Together with the argv-switch loops above, kArgvSelftests is the
+    // single source of truth for selftest entry-point routing.
+    // Replaces ~52 individual if (qEnvironmentVariableIntValue(...)) blocks.
+    for (const auto& e : kArgvSelftests) {
+        if (!e.envVar) continue;
+        if (qEnvironmentVariableIntValue(e.envVar) != 0) {
+            writeLogLine("INFO", QString("running %1").arg(QString::fromLatin1(e.envVar)));
+            return e.fn();
+        }
     }
 
     // スプラッシュ画面
