@@ -11818,9 +11818,15 @@ int main(int argc, char *argv[])
         if (std::strncmp(a, "--selftest=", 11) != 0) continue;
         const char* req = a + 11;
         if (std::strcmp(req, "list") == 0) {
+            // PRD-ARGV-EXTRAS: print argv-switch + env-gate name pair per entry,
+            // so CI / dev workflows can pick whichever path suits the runner.
             for (const auto& e : kArgvSelftests) {
-                std::cout << "--selftest=" << e.name << '\n';
+                std::cout << "--selftest=" << e.name;
+                if (e.envVar) std::cout << "  (env: " << e.envVar << ")";
+                else          std::cout << "  (env: -)";
+                std::cout << '\n';
             }
+            std::cout << "--selftest=all  (env: VEDITOR_ALL_SELFTEST)  # full sweep\n";
             return 0;
         }
         if (std::strcmp(req, "all") == 0) {
