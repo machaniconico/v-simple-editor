@@ -11729,71 +11729,126 @@ int runTextExportSelftest()
 // PRD-PROXY-CLEAN US-PXC-3). The env-gate dispatch loop below uses this field
 // as the single source of truth, replacing ~52 individual if-statements.
 struct ArgvSelftestEntry {
-    const char* name;       // --selftest=<name> kebab-case identifier
-    const char* envVar;     // VEDITOR_*_SELFTEST env var, or nullptr
-    int (*fn)();            // selftest function pointer
-    bool needsQApplication; // true = dispatch after QApplication construction
+    const char* name;        // --selftest=<name> kebab-case identifier
+    const char* envVar;      // VEDITOR_*_SELFTEST env var, or nullptr
+    int (*fn)();             // selftest function pointer
+    bool needsQApplication;  // true = dispatch after QApplication construction
+    const char* description; // one-line summary shown by --selftest=help
 };
 
 static const ArgvSelftestEntry kArgvSelftests[] = {
     // QApplication-free (needsQApplication=false) -------------------------
-    { "proxy",             nullptr,                               runProxySelftestV2,            false }, // env-gate reverted (PRD-PROXY-CLEAN US-PXC-3)
-    { "hdr-routing",       "VEDITOR_HDR_ROUTING_SELFTEST",        runHdrRoutingSelftest,         false },
-    { "tracker-preset",    "VEDITOR_TRACKER_PRESET_SELFTEST",     runTrackerPresetSelftest,      false },
+    { "proxy",             nullptr,                               runProxySelftestV2,            false,
+      "ProxyManager regression gate (libavcore + QSettings struct defaults, 6 gates)" },
+    { "hdr-routing",       "VEDITOR_HDR_ROUTING_SELFTEST",        runHdrRoutingSelftest,         false,
+      "HDR10 3-way routing (in-process 8-bit / in-process HDR / subprocess fallback)" },
+    { "tracker-preset",    "VEDITOR_TRACKER_PRESET_SELFTEST",     runTrackerPresetSelftest,      false,
+      "MotionTracker preset 7 built-in + Registry + JSON round-trip (7 gates)" },
 #ifdef HAVE_PLANARTRACKER_PRESET
-    { "planar-preset",     "VEDITOR_PLANAR_PRESET_SELFTEST",      runPlanarPresetSelftest,       false },
+    { "planar-preset",     "VEDITOR_PLANAR_PRESET_SELFTEST",      runPlanarPresetSelftest,       false,
+      "PlanarTracker preset 5 built-in + Registry + JSON round-trip (10 gates)" },
 #endif
-    { "project-preset",    "VEDITOR_PROJECT_PRESET_SELFTEST",     runProjectPresetSelftest,      false },
-    { "aihighlight",       "VEDITOR_AIHIGHLIGHT_SELFTEST",        runAIHighlightSelftest,        false },
-    { "videostab-deshake", "VEDITOR_VIDEOSTAB_DESHAKE_SELFTEST",  runVideostabDeshakeSelftest,   false },
+    { "project-preset",    "VEDITOR_PROJECT_PRESET_SELFTEST",     runProjectPresetSelftest,      false,
+      "Tracker preset state persistence in ProjectFile save/load cycle (10 gates)" },
+    { "aihighlight",       "VEDITOR_AIHIGHLIGHT_SELFTEST",        runAIHighlightSelftest,        false,
+      "AIHighlight config defaults / Highlight struct helpers (singleton-free, 6 gates)" },
+    { "videostab-deshake", "VEDITOR_VIDEOSTAB_DESHAKE_SELFTEST",  runVideostabDeshakeSelftest,   false,
+      "VideoStabilizer in-process deshake filter-graph + cancel UX (9 gates)" },
     // QApplication-required (needsQApplication=true) ----------------------
-    { "parity",            "VEDITOR_PARITY_SELFTEST",             runParitySelftest,             true  },
-    { "e2e",               "VEDITOR_E2E_SELFTEST",                runE2eSelftest,                true  },
-    { "trackmatte-parity", "VEDITOR_TRACKMATTE_PARITY_SELFTEST",  runTrackMatteParitySelftest,   true  },
-    { "vfx",               "VEDITOR_VFX_SELFTEST",                runVfxSelftest,                true  },
-    { "pro",               "VEDITOR_PRO_SELFTEST",                runProSelftest,                true  },
-    { "mograph",           "VEDITOR_MOGRAPH_SELFTEST",            runMographSelftest,            true  },
-    { "hwperf",            "VEDITOR_HWPERF_SELFTEST",             runHwPerfSelftest,             true  },
-    { "proext",            "VEDITOR_PROEXT_SELFTEST",             runProExtSelftest,             true  },
-    { "shortcut",          "VEDITOR_SHORTCUT_SELFTEST",           runShortcutSelftest,           true  },
-    { "social",            "VEDITOR_SOCIAL_SELFTEST",             runSocialSelftest,             true  },
-    { "caption",           "VEDITOR_CAPTION_SELFTEST",            runCaptionSelftest,            true  },
-    { "planar",            "VEDITOR_PLANAR_SELFTEST",             runPlanarSelftest,             true  },
-    { "mobile",            "VEDITOR_MOBILE_SELFTEST",             runMobileSelftest,             true  },
-    { "obs",               "VEDITOR_OBS_SELFTEST",                runObsSelftest,                true  },
-    { "affinity",          "VEDITOR_AFFINITY_SELFTEST",           runAffinitySelftest,           true  },
-    { "blender",           "VEDITOR_BLENDER_SELFTEST",            runBlenderSelftest,            true  },
-    { "import",            "VEDITOR_IMPORT_SELFTEST",             runImportSelftest,             true  },
-    { "youtube",           "VEDITOR_YOUTUBE_SELFTEST",            runYoutubeSelftest,            true  },
-    { "collab",            "VEDITOR_COLLAB_SELFTEST",             runCollabSelftest,             true  },
-    { "colormatch",        "VEDITOR_COLORMATCH_SELFTEST",         runColorMatchSelftest,         true  },
-    { "vimeo",             "VEDITOR_VIMEO_SELFTEST",              runVimeoSelftest,              true  },
-    { "twitch",            "VEDITOR_TWITCH_SELFTEST",             runTwitchSelftest,             true  },
-    { "frameio",           "VEDITOR_FRAMEIO_SELFTEST",            runFrameIoSelftest,            true  },
-    { "davinci",           "VEDITOR_DAVINCI_SELFTEST",            runDavinciSelftest,            true  },
-    { "fcpxml",            "VEDITOR_FCPXML_SELFTEST",             runFcpxmlSelftest,             true  },
-    { "smartedit",         "VEDITOR_SMARTEDIT_SELFTEST",          runSmartEditSelftest,          true  },
-    { "cloudrender",       "VEDITOR_CLOUDRENDER_SELFTEST",        runCloudRenderSelftest,        true  },
-    { "xupload",           "VEDITOR_XUPLOAD_SELFTEST",            runXUploadSelftest,            true  },
-    { "instagram",         "VEDITOR_INSTAGRAM_SELFTEST",          runInstagramSelftest,          true  },
-    { "projtmpl",          "VEDITOR_PROJTMPL_SELFTEST",           runProjTmplSelftest,           true  },
-    { "loudness",          "VEDITOR_LOUDNESS_SELFTEST",           runLoudnessSelftest,           true  },
-    { "hdr",               "VEDITOR_HDR_SELFTEST",                runHdrSelftest,                true  },
-    { "multicam",          "VEDITOR_MULTICAM_SELFTEST",           runMultiCamSelftest,           true  },
-    { "batchexport",       "VEDITOR_BATCHEXPORT_SELFTEST",        runBatchExportSelftest,        true  },
-    { "chroma",            "VEDITOR_CHROMA_SELFTEST",             runChromaSelftest,             true  },
-    { "audiorestore",      "VEDITOR_AUDIORESTORE_SELFTEST",       runAudioRestoreSelftest,       true  },
-    { "animexport",        "VEDITOR_ANIMEXPORT_SELFTEST",         runAnimExportSelftest,         true  },
-    { "easing",            "VEDITOR_EASING_SELFTEST",             runEasingSelftest,             true  },
-    { "subxlat",           "VEDITOR_SUBXLAT_SELFTEST",            runSubXlatSelftest,            true  },
-    { "lowerthird",        "VEDITOR_LOWERTHIRD_SELFTEST",         runLowerThirdSelftest,         true  },
-    { "watermark",         "VEDITOR_WATERMARK_SELFTEST",          runWatermarkSelftest,          true  },
-    { "libavcore-encode",  "VEDITOR_LIBAVCORE_ENCODE_SELFTEST",   runLibavcoreEncodeSelftest,    true  },
-    { "libavcore-decode",  "VEDITOR_LIBAVCORE_DECODE_SELFTEST",   runLibavcoreDecodeSelftest,    true  },
-    { "exportaudit",       "VEDITOR_EXPORTAUDIT_SELFTEST",        runExportAuditSelftest,        true  },
-    { "textexport",        "VEDITOR_TEXTEXPORT_SELFTEST",         runTextExportSelftest,         true  },
-    { "workflow",          "VEDITOR_WORKFLOW_SELFTEST",           runWorkflowSelftest,           true  },
-    { "audiomixer",        "VEDITOR_AUDIOMIXER_SELFTEST",         runAudioMixerSelftest,         true  },
+    { "parity",            "VEDITOR_PARITY_SELFTEST",             runParitySelftest,             true,
+      "Preview vs export pixel-parity (S1-S11, framediff::mse, 10-bit HDR10)" },
+    { "e2e",               "VEDITOR_E2E_SELFTEST",                runE2eSelftest,                true,
+      "Real-media end-to-end smoke (ColorMatch decode + deHum + processAll)" },
+    { "trackmatte-parity", "VEDITOR_TRACKMATTE_PARITY_SELFTEST",  runTrackMatteParitySelftest,   true,
+      "Track matte SSOT pixel-match across 4 matte types (luma/alpha/chroma/inv)" },
+    { "vfx",               "VEDITOR_VFX_SELFTEST",                runVfxSelftest,                true,
+      "VFX module smoke: Sprint-6 effect graph + GLSL primitive pipeline" },
+    { "pro",               "VEDITOR_PRO_SELFTEST",                runProSelftest,                true,
+      "Pro/advanced toolset smoke (color scopes, envelope, multicam prep)" },
+    { "mograph",           "VEDITOR_MOGRAPH_SELFTEST",            runMographSelftest,            true,
+      "Motion graphics module smoke (title renderer, keyframe graph)" },
+    { "hwperf",            "VEDITOR_HWPERF_SELFTEST",             runHwPerfSelftest,             true,
+      "Hardware perf probe: codec / encoder availability on current GPU" },
+    { "proext",            "VEDITOR_PROEXT_SELFTEST",             runProExtSelftest,             true,
+      "Pro extensions module smoke (LUT pipeline, HDR scope, noise reduction)" },
+    { "shortcut",          "VEDITOR_SHORTCUT_SELFTEST",           runShortcutSelftest,           true,
+      "ShortcutManager binding registration and conflict-detection tests" },
+    { "social",            "VEDITOR_SOCIAL_SELFTEST",             runSocialSelftest,             true,
+      "Social/sharing module smoke (Sprint-12 SNS pipeline stubs)" },
+    { "caption",           "VEDITOR_CAPTION_SELFTEST",            runCaptionSelftest,            true,
+      "Caption/subtitle module smoke (SRT/VTT parse, burn-in, track model)" },
+    { "planar",            "VEDITOR_PLANAR_SELFTEST",             runPlanarSelftest,             true,
+      "Planar tracker primitive smoke (homography solver, pre-Preset era)" },
+    { "mobile",            "VEDITOR_MOBILE_SELFTEST",             runMobileSelftest,             true,
+      "Mobile export module smoke (iOS/Android container + bitrate profiles)" },
+    { "obs",               "VEDITOR_OBS_SELFTEST",                runObsSelftest,                true,
+      "OBS scene import module smoke (Sprint-16 .json scene ingestion)" },
+    { "affinity",          "VEDITOR_AFFINITY_SELFTEST",           runAffinitySelftest,           true,
+      "Affinity Designer/Photo import smoke (Sprint-16 asset bridge)" },
+    { "blender",           "VEDITOR_BLENDER_SELFTEST",            runBlenderSelftest,            true,
+      "Blender .blend import smoke (Sprint-16 3-D asset pipeline stub)" },
+    { "import",            "VEDITOR_IMPORT_SELFTEST",             runImportSelftest,             true,
+      "Generic external import smoke (format registry + clip ingest path)" },
+    { "youtube",           "VEDITOR_YOUTUBE_SELFTEST",            runYoutubeSelftest,            true,
+      "YouTube OAuth2 + resumable-upload manager + progress-dialog smoke" },
+    { "collab",            "VEDITOR_COLLAB_SELFTEST",             runCollabSelftest,             true,
+      "Collaboration smoke: Comments, ProjectShare, and History module stubs" },
+    { "colormatch",        "VEDITOR_COLORMATCH_SELFTEST",         runColorMatchSelftest,         true,
+      "AI ColorMatch analyzer + 3D-LUT generator + dialog smoke" },
+    { "vimeo",             "VEDITOR_VIMEO_SELFTEST",              runVimeoSelftest,              true,
+      "Vimeo upload pipeline smoke (auth token + chunked upload stub)" },
+    { "twitch",            "VEDITOR_TWITCH_SELFTEST",             runTwitchSelftest,             true,
+      "Twitch broadcast pipeline smoke (RTMP push + stream-key stub)" },
+    { "frameio",           "VEDITOR_FRAMEIO_SELFTEST",            runFrameIoSelftest,            true,
+      "Frame.io collaboration smoke (asset upload + review-link stub)" },
+    { "davinci",           "VEDITOR_DAVINCI_SELFTEST",            runDavinciSelftest,            true,
+      "DaVinci Resolve XML round-trip I/O smoke (timeline + grade export)" },
+    { "fcpxml",            "VEDITOR_FCPXML_SELFTEST",             runFcpxmlSelftest,             true,
+      "FCPXML import/export round-trip smoke (Final Cut Pro X interchange)" },
+    { "smartedit",         "VEDITOR_SMARTEDIT_SELFTEST",          runSmartEditSelftest,          true,
+      "AI smart-edit pipeline smoke (scene-detect + auto-cut + beat-sync)" },
+    { "cloudrender",       "VEDITOR_CLOUDRENDER_SELFTEST",        runCloudRenderSelftest,        true,
+      "Cloud render pipeline smoke (job queue + progress polling stub)" },
+    { "xupload",           "VEDITOR_XUPLOAD_SELFTEST",            runXUploadSelftest,            true,
+      "X (Twitter) media upload pipeline smoke (chunked upload + tweet stub)" },
+    { "instagram",         "VEDITOR_INSTAGRAM_SELFTEST",          runInstagramSelftest,          true,
+      "Instagram upload pipeline smoke (reel + story container stub)" },
+    { "projtmpl",          "VEDITOR_PROJTMPL_SELFTEST",           runProjTmplSelftest,           true,
+      "Project template module smoke (preset bundle save/load + apply)" },
+    { "loudness",          "VEDITOR_LOUDNESS_SELFTEST",           runLoudnessSelftest,           true,
+      "BS.1770 loudness measurement smoke (integrated LUFS + true peak)" },
+    { "hdr",               "VEDITOR_HDR_SELFTEST",                runHdrSelftest,                true,
+      "HDR tone-mapping smoke (HLG/HDR10 display transform, Sprint-21)" },
+    { "multicam",          "VEDITOR_MULTICAM_SELFTEST",           runMultiCamSelftest,           true,
+      "Multicam edit module smoke (angle sync, cut-away, monitor layout)" },
+    { "batchexport",       "VEDITOR_BATCHEXPORT_SELFTEST",        runBatchExportSelftest,        true,
+      "Batch export pipeline smoke (queue manager + per-item preset binding)" },
+    { "chroma",            "VEDITOR_CHROMA_SELFTEST",             runChromaSelftest,             true,
+      "Chroma key (greenscreen) module smoke (spill-suppress + matte refine)" },
+    { "audiorestore",      "VEDITOR_AUDIORESTORE_SELFTEST",       runAudioRestoreSelftest,       true,
+      "Audio restoration smoke: deHum filter + deNoise spectral subtraction" },
+    { "animexport",        "VEDITOR_ANIMEXPORT_SELFTEST",         runAnimExportSelftest,         true,
+      "Animated GIF / WebP export smoke (palette quantize + LZW encode)" },
+    { "easing",            "VEDITOR_EASING_SELFTEST",             runEasingSelftest,             true,
+      "Animation easing curve module smoke (bezier, spring, step functions)" },
+    { "subxlat",           "VEDITOR_SUBXLAT_SELFTEST",            runSubXlatSelftest,            true,
+      "Subtitle translation pipeline smoke (locale map + subtitle track swap)" },
+    { "lowerthird",        "VEDITOR_LOWERTHIRD_SELFTEST",         runLowerThirdSelftest,         true,
+      "Lower-third title module smoke (template render + animator keyframes)" },
+    { "watermark",         "VEDITOR_WATERMARK_SELFTEST",          runWatermarkSelftest,          true,
+      "Watermark overlay smoke (tile / corner placement + opacity blend)" },
+    { "libavcore-encode",  "VEDITOR_LIBAVCORE_ENCODE_SELFTEST",   runLibavcoreEncodeSelftest,    true,
+      "libavcore::FrameEncoder h264_mf in-process encode + AAC audio round-trip" },
+    { "libavcore-decode",  "VEDITOR_LIBAVCORE_DECODE_SELFTEST",   runLibavcoreDecodeSelftest,    true,
+      "libavcore::MediaDecoder frame extraction + pixel-format conversion" },
+    { "exportaudit",       "VEDITOR_EXPORTAUDIT_SELFTEST",        runExportAuditSelftest,        true,
+      "Export audit stub-boundary tracker (STUB_AUDIT coverage regression)" },
+    { "textexport",        "VEDITOR_TEXTEXPORT_SELFTEST",         runTextExportSelftest,         true,
+      "Text overlay export pipeline smoke (MSE threshold, AE-text parity)" },
+    { "workflow",          "VEDITOR_WORKFLOW_SELFTEST",           runWorkflowSelftest,           true,
+      "Workflow / scripting module smoke (macro record + replay pipeline)" },
+    { "audiomixer",        "VEDITOR_AUDIOMIXER_SELFTEST",         runAudioMixerSelftest,         true,
+      "Audio mixer module smoke (Sprint-23 bus routing + send/return stubs)" },
 };
 
 } // anonymous namespace
@@ -11827,6 +11882,21 @@ int main(int argc, char *argv[])
                 std::cout << '\n';
             }
             std::cout << "--selftest=all  (env: VEDITOR_ALL_SELFTEST)  # full sweep\n";
+            return 0;
+        }
+        if (std::strcmp(req, "help") == 0) {
+            // PRD-SELFTEST-HELP: print name + description + env block for every entry.
+            std::cout << "V Simple Editor — selftest entry points (54)\n";
+            std::cout << "Usage: ./v-simple-editor.exe --selftest=<name>\n";
+            std::cout << "   or: VEDITOR_<NAME>_SELFTEST=1 ./v-simple-editor.exe\n";
+            std::cout << "   or: --selftest=all  (full sweep)\n";
+            std::cout << "\n";
+            for (const auto& e : kArgvSelftests) {
+                std::cout << "  --selftest=" << e.name << "\n";
+                std::cout << "      " << (e.description ? e.description : "(no description)") << "\n";
+                if (e.envVar) std::cout << "      env: " << e.envVar << "\n";
+                std::cout << "\n";
+            }
             return 0;
         }
         if (std::strcmp(req, "all") == 0) {
