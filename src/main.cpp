@@ -12049,7 +12049,12 @@ int main(int argc, char *argv[])
     // because QApp-required entries need the live Qt context that the
     // surrounding QApplication has constructed. Returns 0 iff every entry
     // exits 0; otherwise returns the count of failures.
-    if (app.arguments().contains(QStringLiteral("--selftest=all"))) {
+    //
+    // PRD-ARGV-EXTRAS: VEDITOR_ALL_SELFTEST=1 mirrors --selftest=all for
+    // env-gated invocation paths (parity with the per-entry VEDITOR_*_SELFTEST
+    // env vars).
+    if (app.arguments().contains(QStringLiteral("--selftest=all"))
+        || qEnvironmentVariableIntValue("VEDITOR_ALL_SELFTEST") != 0) {
         writeLogLine("INFO", "argv-switch: --selftest=all (full sweep)");
         int passed = 0;
         int failed = 0;
@@ -12094,6 +12099,25 @@ int main(int argc, char *argv[])
         if (qEnvironmentVariableIntValue(e.envVar) != 0) {
             writeLogLine("INFO", QString("running %1").arg(QString::fromLatin1(e.envVar)));
             return e.fn();
+        }
+    }
+
+    // PRD-ARGV-EXTRAS: --selftest=<unknown> guard. If any --selftest=<name>
+    // reached here without dispatching to a kArgvSelftests entry, it's a typo
+    // (or stale selftest name) — emit a friendly error and exit code 2 instead
+    // of silently launching the GUI. `list` and `all` are reserved meta-names.
+    for (const QString& arg : app.arguments()) {
+        if (!arg.startsWith(QStringLiteral("--selftest="))) continue;
+        const QString req = arg.mid(11);
+        if (req == QStringLiteral("list") || req == QStringLiteral("all")) continue;
+        bool known = false;
+        for (const auto& e : kArgvSelftests) {
+            if (req == QString::fromLatin1(e.name)) { known = true; break; }
+        }
+        if (!known) {
+            std::cerr << "[ERROR] unknown selftest: " << arg.toStdString() << '\n';
+            std::cerr << "Run with --selftest=list to see available selftests.\n";
+            return 2;
         }
     }
 
