@@ -11823,6 +11823,11 @@ int main(int argc, char *argv[])
             }
             return 0;
         }
+        if (std::strcmp(req, "all") == 0) {
+            // Defer to the post-QApplication block: --selftest=all must run
+            // QApplication-required entries too, so it needs the Qt context.
+            break;
+        }
         for (const auto& e : kArgvSelftests) {
             if (e.needsQApplication) continue;
             if (std::strcmp(req, e.name) == 0) {
@@ -12037,6 +12042,30 @@ int main(int argc, char *argv[])
             QStringLiteral("--selftest-trackmatte-rm5-reorder"))) {
         writeLogLine("INFO", "running --selftest-trackmatte-rm5-reorder");
         return runTrackMatteRm5ReorderSelftest();
+    }
+
+    // PRD-ARGV-ALL: --selftest=all runs every entry in kArgvSelftests
+    // sequentially (CI-friendly single-command full sweep). Runs here
+    // because QApp-required entries need the live Qt context that the
+    // surrounding QApplication has constructed. Returns 0 iff every entry
+    // exits 0; otherwise returns the count of failures.
+    if (app.arguments().contains(QStringLiteral("--selftest=all"))) {
+        writeLogLine("INFO", "argv-switch: --selftest=all (full sweep)");
+        int passed = 0;
+        int failed = 0;
+        for (const auto& e : kArgvSelftests) {
+            writeLogLine("INFO", QString("[--selftest=all] running --selftest=%1").arg(QString::fromLatin1(e.name)));
+            const int rc = e.fn();
+            if (rc == 0) {
+                ++passed;
+                writeLogLine("INFO", QString("[--selftest=all] --selftest=%1 PASS").arg(QString::fromLatin1(e.name)));
+            } else {
+                ++failed;
+                writeLogLine("CRIT", QString("[--selftest=all] --selftest=%1 FAIL rc=%2").arg(QString::fromLatin1(e.name)).arg(rc));
+            }
+        }
+        writeLogLine("INFO", QString("[--selftest=all] summary: %1 PASS, %2 FAIL").arg(passed).arg(failed));
+        return failed == 0 ? 0 : failed;
     }
 
     // PRD-ARGV-TABLE: central argv-switch dispatcher (QApplication-required entries).
