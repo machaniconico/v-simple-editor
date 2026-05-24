@@ -75,6 +75,9 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     # PRD-SPLIT-MAIN-3 Phase 3-A: libavcore-backed selftests (moved from src/main.cpp).
     src/selftests/libavcore_selftests.cpp
 
+    # PRD-SPLIT-MAIN-3 Phase 3-B: effects selftests (moved from src/main.cpp).
+    src/selftests/effects_selftests.cpp
+
     src/main.cpp
     src/MainWindow.cpp
     src/VideoPlayer.cpp
