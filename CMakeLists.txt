@@ -62,6 +62,10 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/libavcore/VideoFilterGraph.h
     src/libavcore/VideoFilterGraph.cpp
 
+    # PRD-SPLIT-MAIN-1: selftest registry (table + dispatch helpers).
+    src/selftests/SelftestRegistry.h
+    src/selftests/SelftestRegistry.cpp
+
     src/main.cpp
     src/MainWindow.cpp
     src/VideoPlayer.cpp
