@@ -34,6 +34,7 @@
 #include <QRect>
 #include <cmath>
 #include <cstring>
+#include <iostream>
 #include <algorithm>
 #include <functional>
 
@@ -11718,6 +11719,80 @@ int runTextExportSelftest()
     return 0;
 }
 
+// PRD-ARGV-TABLE: central selftest dispatch table.
+// Each entry maps a --selftest=<name> argument to its implementation function.
+// needsQApplication==false entries are dispatched before QApplication is
+// constructed (QApp-free path, safe for WSL direct exec without GUI hang).
+// needsQApplication==true entries are dispatched after QApplication(argc,argv).
+// The env-gate VEDITOR_*_SELFTEST paths are NOT replaced — both routes remain
+// active for backward compatibility.
+struct ArgvSelftestEntry {
+    const char* name;       // --selftest=<name> kebab-case identifier
+    int (*fn)();            // selftest function pointer
+    bool needsQApplication; // true = dispatch after QApplication construction
+};
+
+static const ArgvSelftestEntry kArgvSelftests[] = {
+    // QApplication-free (needsQApplication=false) -------------------------
+    { "proxy",              runProxySelftestV2,            false },
+    { "hdr-routing",        runHdrRoutingSelftest,         false },
+    { "tracker-preset",     runTrackerPresetSelftest,      false },
+#ifdef HAVE_PLANARTRACKER_PRESET
+    { "planar-preset",      runPlanarPresetSelftest,       false },
+#endif
+    { "project-preset",     runProjectPresetSelftest,      false },
+    { "aihighlight",        runAIHighlightSelftest,        false },
+    { "videostab-deshake",  runVideostabDeshakeSelftest,   false },
+    // QApplication-required (needsQApplication=true) ----------------------
+    { "parity",             runParitySelftest,             true  },
+    { "e2e",                runE2eSelftest,                true  },
+    { "trackmatte-parity",  runTrackMatteParitySelftest,   true  },
+    { "vfx",                runVfxSelftest,                true  },
+    { "pro",                runProSelftest,                true  },
+    { "mograph",            runMographSelftest,            true  },
+    { "hwperf",             runHwPerfSelftest,             true  },
+    { "proext",             runProExtSelftest,             true  },
+    { "shortcut",           runShortcutSelftest,           true  },
+    { "social",             runSocialSelftest,             true  },
+    { "caption",            runCaptionSelftest,            true  },
+    { "planar",             runPlanarSelftest,             true  },
+    { "mobile",             runMobileSelftest,             true  },
+    { "obs",                runObsSelftest,                true  },
+    { "affinity",           runAffinitySelftest,           true  },
+    { "blender",            runBlenderSelftest,            true  },
+    { "import",             runImportSelftest,             true  },
+    { "youtube",            runYoutubeSelftest,            true  },
+    { "collab",             runCollabSelftest,             true  },
+    { "colormatch",         runColorMatchSelftest,         true  },
+    { "vimeo",              runVimeoSelftest,              true  },
+    { "twitch",             runTwitchSelftest,             true  },
+    { "frameio",            runFrameIoSelftest,            true  },
+    { "davinci",            runDavinciSelftest,            true  },
+    { "fcpxml",             runFcpxmlSelftest,             true  },
+    { "smartedit",          runSmartEditSelftest,          true  },
+    { "cloudrender",        runCloudRenderSelftest,        true  },
+    { "xupload",            runXUploadSelftest,            true  },
+    { "instagram",          runInstagramSelftest,          true  },
+    { "projtmpl",           runProjTmplSelftest,           true  },
+    { "loudness",           runLoudnessSelftest,           true  },
+    { "hdr",                runHdrSelftest,                true  },
+    { "multicam",           runMultiCamSelftest,           true  },
+    { "batchexport",        runBatchExportSelftest,        true  },
+    { "chroma",             runChromaSelftest,             true  },
+    { "audiorestore",       runAudioRestoreSelftest,       true  },
+    { "animexport",         runAnimExportSelftest,         true  },
+    { "easing",             runEasingSelftest,             true  },
+    { "subxlat",            runSubXlatSelftest,            true  },
+    { "lowerthird",         runLowerThirdSelftest,         true  },
+    { "watermark",          runWatermarkSelftest,          true  },
+    { "libavcore-encode",   runLibavcoreEncodeSelftest,    true  },
+    { "libavcore-decode",   runLibavcoreDecodeSelftest,    true  },
+    { "exportaudit",        runExportAuditSelftest,        true  },
+    { "textexport",         runTextExportSelftest,         true  },
+    { "workflow",           runWorkflowSelftest,           true  },
+    { "audiomixer",         runAudioMixerSelftest,         true  },
+};
+
 } // anonymous namespace
 
 int main(int argc, char *argv[])
@@ -11731,47 +11806,26 @@ int main(int argc, char *argv[])
     writeLogLine("INFO", "=== V Simple Editor starting ===");
     writeLogLine("INFO", QString("log path: %1").arg(g_logFilePath));
 
-    // PRD-ARGV-UNIFY: argv-switch dispatcher BEFORE QApplication construction.
-    // Originally seeded by PRD-PROXY-SELFTEST-V2 (--selftest=proxy) to dodge
-    // the env-propagation quirks PRD-PROXY-CLEAN US-PXC-3 hit
-    // ([[feedback-selftest-avoid-singleton-init]]). Extended here so any
-    // QApplication-free selftest is reachable via WSL direct exec
-    // (`./build_win/Release/v-simple-editor.exe --selftest=<name>`).
-    //
-    // Each entry below MUST stay QApplication-free — they run before
-    // QApplication construction. QApplication-dependent selftests
-    // (parity, e2e — both seed real Timeline/QWidget paths) are dispatched
-    // by the second argv-switch loop below, just above the env-gate block.
+    // PRD-ARGV-TABLE: central argv-switch dispatcher (QApplication-free entries).
+    // See kArgvSelftests in the anonymous namespace above; this loop covers
+    // every entry with needsQApplication==false plus the synthetic
+    // --selftest=list helper.
     for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--selftest=proxy") == 0) {
-            writeLogLine("INFO", "argv-switch: --selftest=proxy");
-            return runProxySelftestV2();
+        const char* a = argv[i];
+        if (std::strncmp(a, "--selftest=", 11) != 0) continue;
+        const char* req = a + 11;
+        if (std::strcmp(req, "list") == 0) {
+            for (const auto& e : kArgvSelftests) {
+                std::cout << "--selftest=" << e.name << '\n';
+            }
+            return 0;
         }
-        if (std::strcmp(argv[i], "--selftest=hdr-routing") == 0) {
-            writeLogLine("INFO", "argv-switch: --selftest=hdr-routing");
-            return runHdrRoutingSelftest();
-        }
-        if (std::strcmp(argv[i], "--selftest=tracker-preset") == 0) {
-            writeLogLine("INFO", "argv-switch: --selftest=tracker-preset");
-            return runTrackerPresetSelftest();
-        }
-#ifdef HAVE_PLANARTRACKER_PRESET
-        if (std::strcmp(argv[i], "--selftest=planar-preset") == 0) {
-            writeLogLine("INFO", "argv-switch: --selftest=planar-preset");
-            return runPlanarPresetSelftest();
-        }
-#endif
-        if (std::strcmp(argv[i], "--selftest=project-preset") == 0) {
-            writeLogLine("INFO", "argv-switch: --selftest=project-preset");
-            return runProjectPresetSelftest();
-        }
-        if (std::strcmp(argv[i], "--selftest=aihighlight") == 0) {
-            writeLogLine("INFO", "argv-switch: --selftest=aihighlight");
-            return runAIHighlightSelftest();
-        }
-        if (std::strcmp(argv[i], "--selftest=videostab-deshake") == 0) {
-            writeLogLine("INFO", "argv-switch: --selftest=videostab-deshake");
-            return runVideostabDeshakeSelftest();
+        for (const auto& e : kArgvSelftests) {
+            if (e.needsQApplication) continue;
+            if (std::strcmp(req, e.name) == 0) {
+                writeLogLine("INFO", QString("argv-switch: --selftest=%1").arg(QString::fromLatin1(e.name)));
+                return e.fn();
+            }
         }
     }
 
@@ -11944,7 +11998,6 @@ int main(int argc, char *argv[])
     // role) and also by the VEDITOR_TRACKMATTE_PARITY_SELFTEST env var for
     // consistency with the other VEDITOR_*_SELFTEST hooks below.
     if (app.arguments().contains(QStringLiteral("--selftest-trackmatte-parity"))
-        || app.arguments().contains(QStringLiteral("--selftest=trackmatte-parity"))
         || qEnvironmentVariableIntValue("VEDITOR_TRACKMATTE_PARITY_SELFTEST") != 0) {
         writeLogLine("INFO", "running --selftest-trackmatte-parity");
         return runTrackMatteParitySelftest();
@@ -12147,205 +12200,20 @@ int main(int argc, char *argv[])
         writeLogLine("INFO", "running VEDITOR_LIBAVCORE_DECODE_SELFTEST");
         return runLibavcoreDecodeSelftest();
     }
-    // PRD-ARGV-UNIFY: argv-switch dispatcher AFTER QApplication construction.
-    // Mirrors the env-gate block below for selftests that need a live
-    // QApplication (parity seeds a QWidget Timeline; e2e wires real
-    // decode/encode through Qt-aware libs). Lets WSL drive them via
-    // `--selftest=parity` / `--selftest=e2e` without env vars.
-    // The QApplication-free siblings (proxy/hdr-routing/tracker-preset/
-    // planar-preset/project-preset/aihighlight/videostab-deshake) dispatch
-    // earlier in main() before QApplication is constructed.
-    // PRD-ARGV-UNIFY-2: All remaining 43 env-gated selftests gain argv-switch
-    // aliases here. Both env-gate and argv-switch paths remain active.
+    // PRD-ARGV-TABLE: central argv-switch dispatcher (QApplication-required entries).
+    // See kArgvSelftests in the anonymous namespace; this loop covers every
+    // entry with needsQApplication==true. Selftests that touch QWidget /
+    // libav with Qt singletons run here, after `QApplication app(...)` has
+    // populated the global Qt context.
     {
         const QStringList args = app.arguments();
-        if (args.contains(QStringLiteral("--selftest=parity"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=parity");
-            return runParitySelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=e2e"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=e2e");
-            return runE2eSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=trackmatte-parity"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=trackmatte-parity");
-            return runTrackMatteParitySelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=vfx"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=vfx");
-            return runVfxSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=pro"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=pro");
-            return runProSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=mograph"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=mograph");
-            return runMographSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=hwperf"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=hwperf");
-            return runHwPerfSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=proext"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=proext");
-            return runProExtSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=shortcut"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=shortcut");
-            return runShortcutSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=social"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=social");
-            return runSocialSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=caption"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=caption");
-            return runCaptionSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=planar"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=planar");
-            return runPlanarSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=mobile"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=mobile");
-            return runMobileSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=obs"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=obs");
-            return runObsSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=affinity"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=affinity");
-            return runAffinitySelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=blender"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=blender");
-            return runBlenderSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=import"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=import");
-            return runImportSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=youtube"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=youtube");
-            return runYoutubeSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=collab"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=collab");
-            return runCollabSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=colormatch"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=colormatch");
-            return runColorMatchSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=vimeo"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=vimeo");
-            return runVimeoSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=twitch"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=twitch");
-            return runTwitchSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=frameio"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=frameio");
-            return runFrameIoSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=davinci"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=davinci");
-            return runDavinciSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=fcpxml"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=fcpxml");
-            return runFcpxmlSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=smartedit"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=smartedit");
-            return runSmartEditSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=cloudrender"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=cloudrender");
-            return runCloudRenderSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=xupload"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=xupload");
-            return runXUploadSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=instagram"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=instagram");
-            return runInstagramSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=projtmpl"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=projtmpl");
-            return runProjTmplSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=loudness"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=loudness");
-            return runLoudnessSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=hdr"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=hdr");
-            return runHdrSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=multicam"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=multicam");
-            return runMultiCamSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=batchexport"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=batchexport");
-            return runBatchExportSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=chroma"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=chroma");
-            return runChromaSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=audiorestore"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=audiorestore");
-            return runAudioRestoreSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=animexport"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=animexport");
-            return runAnimExportSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=easing"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=easing");
-            return runEasingSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=subxlat"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=subxlat");
-            return runSubXlatSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=lowerthird"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=lowerthird");
-            return runLowerThirdSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=watermark"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=watermark");
-            return runWatermarkSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=libavcore-encode"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=libavcore-encode");
-            return runLibavcoreEncodeSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=libavcore-decode"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=libavcore-decode");
-            return runLibavcoreDecodeSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=exportaudit"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=exportaudit");
-            return runExportAuditSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=textexport"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=textexport");
-            return runTextExportSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=workflow"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=workflow");
-            return runWorkflowSelftest();
-        }
-        if (args.contains(QStringLiteral("--selftest=audiomixer"))) {
-            writeLogLine("INFO", "argv-switch: --selftest=audiomixer");
-            return runAudioMixerSelftest();
+        for (const auto& e : kArgvSelftests) {
+            if (!e.needsQApplication) continue;
+            const QString sw = QStringLiteral("--selftest=%1").arg(QString::fromLatin1(e.name));
+            if (args.contains(sw)) {
+                writeLogLine("INFO", QString("argv-switch: %1").arg(sw));
+                return e.fn();
+            }
         }
     }
 
