@@ -28,9 +28,10 @@ namespace textbake {
 
 // Test-only observability (see header). std::atomic so the worker-thread
 // selftest can read it from the GUI thread after the export finished.
+// The sentinel-gate is a runtime env check (not a static-init bool) so the
+// argv-switch dispatch path can qputenv("VEDITOR_TEXTEXPORT_SELFTEST", "1")
+// after program startup and still have bakeOverlays observe it.
 static std::atomic<QThread *> g_lastBakeThread{nullptr};
-static const bool g_observeBakeThread =
-    !qEnvironmentVariableIsEmpty("VEDITOR_TEXTEXPORT_SELFTEST");
 
 QThread *lastBakeThreadForTest()
 {
@@ -53,12 +54,13 @@ QImage bakeOverlays(const QImage &source,
     if (overlays.isEmpty())
         return source;
 
-    // Record the thread we actually baked text on (test-only; the static is
-    // computed once so production pays nothing). This is GENUINE evidence:
+    // Record the thread we actually baked text on (test-only). Runtime
+    // env check so the argv-switch dispatch path (which qputenvs the var
+    // after program startup) is honored. This is GENUINE evidence:
     // it observes the real production code path, so the worker-thread text-
     // export selftest can prove renderFrameAt's text stage ran OFF the GUI
     // thread — exactly where the old VideoPlayer-QWidget seam was UB.
-    if (g_observeBakeThread)
+    if (!qEnvironmentVariableIsEmpty("VEDITOR_TEXTEXPORT_SELFTEST"))
         g_lastBakeThread.store(QThread::currentThread(),
                                std::memory_order_release);
 

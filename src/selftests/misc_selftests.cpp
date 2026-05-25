@@ -598,6 +598,12 @@ int runExportAuditSelftest()
 // seam was UB. CI-tolerant: missing asset -> qWarning + return 0.
 int runTextExportSelftest()
 {
+    // Make the bake-thread sentinel observable when this selftest is
+    // reached via the argv-switch dispatch path (no env-gate in that
+    // case). The TextOverlayBake.cpp gate is a runtime env check, so
+    // setting it here before the export is sufficient.
+    qputenv("VEDITOR_TEXTEXPORT_SELFTEST", "1");
+
     const QString clipArg = qEnvironmentVariable(
         "VEDITOR_E2E_CLIP", QStringLiteral("test_assets/e2e_clip.mp4"));
     const QString clipPath = QDir::current().absoluteFilePath(clipArg);
