@@ -227,10 +227,12 @@ d2205a1 refactor(selftest): PRD-SPLIT-MAIN-4 Phase 4 — main.cpp 残り refacto
 
 ## 既知の非ブロック MINOR (critic 全件非ブロック判定済)
 
-- `layerPaintOrderLess` の namespace 内包 (ODR 理論上)
-- clipgeom contract コメント三重複の整理
-- `composeMultiTrackFrameForTest` shim が rotation 非転送
-- G7 `|dx|>5` migration の sub-5px 既知許容
+過去の review ラウンドで指摘された MINOR は本 PR で **すべて整理済**:
+
+- ~~`layerPaintOrderLess` の namespace 内包 (ODR 理論上)~~ — **解消済 (2026-05-20)**: `VideoPlayer.{h,cpp}` で `namespace clipstack { ... }` に wrap 済、全 caller も `clipstack::layerPaintOrderLess` に明示修飾
+- ~~clipgeom contract コメント三重複の整理~~ — **解消済 (2026-05-20)**: `ClipGeometry.h` を canonical contract の単独 SSOT に統合、`ClipGeometry.cpp` は header reference のみ
+- ~~`composeMultiTrackFrameForTest` shim が rotation 非転送~~ — **解消済 (2026-05-20)**: `overlayRotationDeg` 引数を取って `L.rotation2DDegrees` に転送 (`VideoPlayer.cpp:4500-4511`)
+- G7 `|dx|>5` migration の sub-5px 既知許容 — **設計上の意図 (canonical contract)**: `ProjectFile.cpp:90` で `INTENTIONAL NO-OP for sub-5px pixel offsets` として明文化。修正すると v1→v2 round-trip safety を破るため非対応 (defect ではなく contract)
 
 ## push & PR 作成手順
 
