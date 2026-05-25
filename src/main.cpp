@@ -1,7 +1,5 @@
 #include <QApplication>
 #include <QIcon>
-#include <QDir>
-#include <QFile>
 #include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -9,11 +7,6 @@
 #include <QRegularExpression>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
-#include <QTextStream>
-#include <QDateTime>
-#include <QStandardPaths>
-#include <QMutex>
-#include <QMutexLocker>
 #include <QDebug>
 #include <QTimer>
 #include <QEventLoop>
@@ -42,13 +35,9 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-#ifdef Q_OS_WIN
-#include <windows.h>
-#include <dbghelp.h>
-#pragma comment(lib, "dbghelp.lib")
-#endif
-
 #include "MainWindow.h"
+#include "util/CrashHandler.h"
+#include "util/Logger.h"
 #include "AudioMixer.h"
 #include "FrameDiff.h"
 #include "Timeline.h"
@@ -82,22 +71,6 @@
 #include <QFont>
 #include <QVector3D>
 #include "selftests/SelftestRegistry.h"  // PRD-SPLIT-MAIN-1: selftest dispatch
-
-#if defined(VEDITOR_BRUSH_SELFTEST)
-#include "BrushAnimation.h"
-#endif
-
-#if defined(VEDITOR_SNSPACK_SELFTEST)
-#include "SmartReframe.h"
-#include "LoudnessAnalyzer.h"
-#include <QtMath>
-#endif
-
-#if defined(VEDITOR_NODEGRAPH_SELFTEST)
-#include "NodeGraph.h"
-#include "NodeEvaluator.h"
-#include "NodeLibrary.h"
-#endif
 
 // US-HW-9: hardware/perf selftest optional dependencies.
 // US-HW-10 wires AudioDucking.cpp into CMakeLists, so the symbols are now
@@ -204,128 +177,6 @@ extern "C" {
 #include <libswresample/swresample.h>
 }
 
-// ──────────────────────────────────────────────────────────────────────────
-// Lightweight file-backed logger + unhandled-exception reporter.
-//
-// Goal: when the app crashes, we want a log file we can read to understand
-// what was happening just before the crash. Everything here is best-effort —
-// it should never throw or hold locks that could deadlock on shutdown.
-// ──────────────────────────────────────────────────────────────────────────
-
-// PRD-SPLIT-MAIN-1: g_logFilePath, g_logMutex, defaultLogPath(), and
-// writeLogLine() are placed outside the anonymous namespace so that
-// src/selftests/SelftestRegistry.cpp can call writeLogLine() via an
-// extern declaration without requiring it to be in a named namespace.
-QString g_logFilePath;
-QMutex  g_logMutex;
-
-QString defaultLogPath()
-{
-    const QString dir = QStandardPaths::writableLocation(QStandardPaths::HomeLocation)
-                        + "/.veditor/logs";
-    QDir().mkpath(dir);
-    const QString ts = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
-    return dir + "/veditor_" + ts + ".log";
-}
-
-void writeLogLine(const QString &level, const QString &msg)
-{
-    QMutexLocker lock(&g_logMutex);
-    QFile f(g_logFilePath);
-    if (!f.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text))
-        return;
-    QTextStream ts(&f);
-    ts.setEncoding(QStringConverter::Utf8);
-    ts << QDateTime::currentDateTime().toString("HH:mm:ss.zzz")
-       << " [" << level << "] " << msg << "\n";
-    ts.flush();
-    f.close();
-}
-
-namespace {
-
-void qtMessageHandler(QtMsgType type, const QMessageLogContext &ctx, const QString &msg)
-{
-    const char *level = "INFO";
-    switch (type) {
-        case QtDebugMsg:    level = "DEBUG"; break;
-        case QtInfoMsg:     level = "INFO";  break;
-        case QtWarningMsg:  level = "WARN";  break;
-        case QtCriticalMsg: level = "CRIT";  break;
-        case QtFatalMsg:    level = "FATAL"; break;
-    }
-    QString full = msg;
-    if (ctx.file && *ctx.file) {
-        full += QString(" (%1:%2)").arg(ctx.file).arg(ctx.line);
-    }
-    writeLogLine(level, full);
-
-    // Also emit to stderr so console users see it.
-    QTextStream(stderr) << "[" << level << "] " << msg << "\n";
-}
-
-#ifdef Q_OS_WIN
-LONG WINAPI crashHandler(EXCEPTION_POINTERS *info)
-{
-    if (!info) return EXCEPTION_EXECUTE_HANDLER;
-
-    const DWORD code = info->ExceptionRecord->ExceptionCode;
-    const void *addr = info->ExceptionRecord->ExceptionAddress;
-
-    QString msg = QString("UNHANDLED EXCEPTION code=0x%1 addr=0x%2")
-        .arg(QString::number(code, 16))
-        .arg(quint64(addr), 0, 16);
-    writeLogLine("CRASH", msg);
-
-    // Capture stack frames.
-    HANDLE process = GetCurrentProcess();
-    SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_UNDNAME);
-    SymInitialize(process, nullptr, TRUE);
-
-    void *frames[64];
-    USHORT count = CaptureStackBackTrace(0, 64, frames, nullptr);
-
-    char symbolBuf[sizeof(SYMBOL_INFO) + 256] = {0};
-    SYMBOL_INFO *symbol = reinterpret_cast<SYMBOL_INFO*>(symbolBuf);
-    symbol->MaxNameLen = 255;
-    symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
-
-    QString stack;
-    for (USHORT i = 0; i < count; ++i) {
-        DWORD64 disp = 0;
-        if (SymFromAddr(process, DWORD64(frames[i]), &disp, symbol)) {
-            stack += QString("  #%1 %2 + 0x%3 @ 0x%4\n")
-                .arg(i)
-                .arg(QString::fromLocal8Bit(symbol->Name))
-                .arg(disp, 0, 16)
-                .arg(DWORD64(frames[i]), 0, 16);
-        } else {
-            stack += QString("  #%1 ?? @ 0x%2\n")
-                .arg(i).arg(DWORD64(frames[i]), 0, 16);
-        }
-    }
-    writeLogLine("CRASH", "STACK:\n" + stack);
-    SymCleanup(process);
-
-    return EXCEPTION_EXECUTE_HANDLER;
-}
-#endif // Q_OS_WIN
-
-} // anonymous namespace (qtMessageHandler + crashHandler only)
-
-// PRD-SPLIT-MAIN-1: requireSelftest and all run<Foo>Selftest() functions are
-// at file scope (external linkage) so src/selftests/SelftestRegistry.cpp can
-// forward-declare and reference them via function pointers in kArgvSelftests[].
-bool requireSelftest(bool condition, const QString &message, QString *error)
-{
-    if (condition)
-        return true;
-    if (error)
-        *error = message;
-    qCritical() << "selftest failed:" << message;
-    return false;
-}
-
 // PRD-SPLIT-MAIN-3 Phase 3-E: runTrackMatteRm6DuplicateSelftest and
 // runTrackMatteRm5ReorderSelftest have been moved verbatim to
 // src/selftests/parity_matte_selftests.cpp.
@@ -337,10 +188,7 @@ int main(int argc, char *argv[])
 {
     // Install crash handling BEFORE QApplication so GL init crashes are caught.
     g_logFilePath = defaultLogPath();
-    qInstallMessageHandler(qtMessageHandler);
-#ifdef Q_OS_WIN
-    SetUnhandledExceptionFilter(crashHandler);
-#endif
+    installCrashHandling();
     writeLogLine("INFO", "=== V Simple Editor starting ===");
     writeLogLine("INFO", QString("log path: %1").arg(g_logFilePath));
 
@@ -395,174 +243,19 @@ int main(int argc, char *argv[])
     writeLogLine("INFO", "QApplication constructed");
 
 #if defined(VEDITOR_BRUSH_SELFTEST)
-    {
-        qDebug() << "=== VEDITOR_BRUSH_SELFTEST: BrushAnimation synthetic self-test ===";
-        BrushAnimation brush;
-        brush.setText("Hello World");
-
-        brush.setProgress(0.0);
-        QImage frame0 = brush.renderFrame(1920, 1080);
-        int pixels0 = 0;
-        for (int y = 0; y < frame0.height(); ++y)
-            for (int x = 0; x < frame0.width(); ++x)
-                if (qAlpha(frame0.pixel(x, y)) > 0) ++pixels0;
-        qDebug() << "  progress=0.0  non-transparent pixels:" << pixels0;
-
-        brush.setProgress(0.5);
-        QImage frame5 = brush.renderFrame(1920, 1080);
-        int pixels5 = 0;
-        for (int y = 0; y < frame5.height(); ++y)
-            for (int x = 0; x < frame5.width(); ++x)
-                if (qAlpha(frame5.pixel(x, y)) > 0) ++pixels5;
-        qDebug() << "  progress=0.5  non-transparent pixels:" << pixels5;
-
-        brush.setProgress(1.0);
-        QImage frame1 = brush.renderFrame(1920, 1080);
-        int pixels1 = 0;
-        for (int y = 0; y < frame1.height(); ++y)
-            for (int x = 0; x < frame1.width(); ++x)
-                if (qAlpha(frame1.pixel(x, y)) > 0) ++pixels1;
-        qDebug() << "  progress=1.0  non-transparent pixels:" << pixels1;
-
-        Q_ASSERT(pixels0 <= pixels5 && pixels5 <= pixels1);
-        qDebug() << "=== VEDITOR_BRUSH_SELFTEST: PASSED ===";
-    }
+    void runBrushInlineSelftest();
+    runBrushInlineSelftest();
 #endif
 
 #if defined(VEDITOR_SNSPACK_SELFTEST)
-    {
-        qDebug() << "=== VEDITOR_SNSPACK_SELFTEST: SmartReframe + LoudnessAnalyzer ===";
-
-        // SmartReframe self-test: 1920x1080 source, 9:16 target
-        SmartReframe reframe;
-        reframe.setSourceSize(QSize(1920, 1080));
-        reframe.setTargetAspect(9.0, 16.0);
-        reframe.setSmoothness(0.7);
-        reframe.setMotionWeight(0.5);
-
-        // Feed 3 synthetic frames
-        for (int i = 0; i < 3; ++i) {
-            QImage frame(1920, 1080, QImage::Format_RGB888);
-            frame.fill(QColor(128 + i * 40, 64, 32).rgb());
-            reframe.analyzeFrame(static_cast<double>(i), frame);
-        }
-        reframe.finalizeAnalysis();
-        QRectF crop0 = reframe.cropRectAt(0.0);
-        qDebug() << "  SmartReframe cropRectAt(0s):" << crop0;
-
-        // LoudnessAnalyzer self-test: synthetic sine wave
-        LoudnessAnalyzer analyzer;
-        analyzer.setSampleRate(48000);
-        const int numFrames = 48000; // 1 second @ 48kHz
-        const double freq = 1000.0;  // 1 kHz tone
-        QVector<float> interleaved(numFrames * 2);
-        for (int i = 0; i < numFrames; ++i) {
-            const double t = static_cast<double>(i) / 48000.0;
-            const double sample = std::sin(2.0 * M_PI * freq * t);
-            interleaved[i * 2]     = static_cast<float>(sample); // L
-            interleaved[i * 2 + 1] = static_cast<float>(sample); // R
-        }
-        analyzer.processBlock(interleaved.constData(), numFrames, 2);
-        qDebug() << "  LoudnessAnalyzer integratedLUFS (1kHz sine, 0dBFS):" << analyzer.integratedLUFS();
-
-        qDebug() << "=== VEDITOR_SNSPACK_SELFTEST: PASSED ===";
-    }
+    void runSnspackInlineSelftest();
+    runSnspackInlineSelftest();
 #endif
 
 #if defined(VEDITOR_NODEGRAPH_SELFTEST)
-    {
-        qDebug() << "=== VEDITOR_NODEGRAPH_SELFTEST: Node graph synthetic self-test ===";
-
-        nodelib::registerBuiltinNodes();
-
-        NodeGraph graph;
-        int solidId = graph.addNode("SolidColor");
-        GraphNode *solid = graph.node(solidId);
-        solid->params["color"] = QColor(255, 0, 0); // red
-
-        int brightnessId = graph.addNode("BrightnessContrast");
-        GraphNode *brightness = graph.node(brightnessId);
-        brightness->params["brightness"] = 50.0;
-
-        int outputId = graph.addNode("Output");
-
-        graph.connect(solidId, 0, brightnessId, 0);
-        graph.connect(brightnessId, 0, outputId, 0);
-
-        NodeEvaluator evaluator;
-        evaluator.setGraph(&graph);
-        evaluator.setOutputSize(QSize(64, 64));
-
-        QImage result = evaluator.render(0.0);
-
-        bool nonEmpty = !result.isNull() && result.bytesPerLine() != 0;
-        QColor centerPixel;
-        if (!result.isNull() && result.width() > 0 && result.height() > 0) {
-            centerPixel = QColor(result.pixel(result.width() / 2, result.height() / 2));
-        }
-
-        qDebug() << "  output image non-empty:" << nonEmpty;
-        qDebug() << "  output size:" << result.size();
-        qDebug() << "  center pixel color:" << centerPixel.name();
-        qDebug() << "  expected: red-ish (brightness +50 should lighten)";
-
-        Q_ASSERT(nonEmpty);
-        Q_ASSERT(centerPixel.red() > centerPixel.green());
-        Q_ASSERT(centerPixel.red() > centerPixel.blue());
-        qDebug() << "=== VEDITOR_NODEGRAPH_SELFTEST: PASSED ===";
-    }
+    void runNodeGraphInlineSelftest();
+    runNodeGraphInlineSelftest();
 #endif
-
-    // Forward declarations for selftest functions defined in parity_matte_selftests.cpp
-    // (moved from main.cpp in PRD-SPLIT-MAIN-2 Phase 2-2 and PRD-SPLIT-MAIN-3 Phase 3-E).
-    int runTrackMatteParitySelftest();
-    int runTrackMatteExportIntegrationSelftest();
-    int runTrackMatteReindexSelftest();
-    int runTrackMatteRm6DuplicateSelftest();
-    int runTrackMatteRm5ReorderSelftest();
-
-    // TM-6: track-matte SSOT parity selftest. Dispatched by the legacy argv
-    // switch --selftest-trackmatte-parity. The env-gate path
-    // (VEDITOR_TRACKMATTE_PARITY_SELFTEST) is now handled by the
-    // PRD-ENV-TABLE loop below via kArgvSelftests[].envVar.
-    if (app.arguments().contains(QStringLiteral("--selftest-trackmatte-parity"))) {
-        writeLogLine("INFO", "running --selftest-trackmatte-parity");
-        return runTrackMatteParitySelftest();
-    }
-
-    // TM-9: track-matte EXPORT-INTEGRATION selftest (critic M1 closure).
-    // Dispatched by the legacy argv switch
-    // --selftest-trackmatte-export-integration. No env-gate alias — this
-    // test is not in kArgvSelftests[] and has no VEDITOR_* CI integration.
-    if (app.arguments().contains(
-            QStringLiteral("--selftest-trackmatte-export-integration"))) {
-        writeLogLine("INFO",
-                     "running --selftest-trackmatte-export-integration");
-        return runTrackMatteExportIntegrationSelftest();
-    }
-
-    // RM-4: track-matte reindex regression selftest. Dispatched by the argv
-    // switch --selftest-trackmatte-reindex. No env-var alias (the test is
-    // self-contained and does not need VEDITOR_* CI integration hooks).
-    if (app.arguments().contains(
-            QStringLiteral("--selftest-trackmatte-reindex"))) {
-        writeLogLine("INFO", "running --selftest-trackmatte-reindex");
-        return runTrackMatteReindexSelftest();
-    }
-
-    // RM-6: duplicate-identity paste tie-break guard.
-    if (app.arguments().contains(
-            QStringLiteral("--selftest-trackmatte-rm6-duplicate"))) {
-        writeLogLine("INFO", "running --selftest-trackmatte-rm6-duplicate");
-        return runTrackMatteRm6DuplicateSelftest();
-    }
-
-    // RM-5: Timeline carrier remap after within-track reorder / cross-track drop.
-    if (app.arguments().contains(
-            QStringLiteral("--selftest-trackmatte-rm5-reorder"))) {
-        writeLogLine("INFO", "running --selftest-trackmatte-rm5-reorder");
-        return runTrackMatteRm5ReorderSelftest();
-    }
 
     // PRD-SPLIT-MAIN-1: post-QApplication dispatch moved to SelftestRegistry.
     if (auto rc = selftests::dispatchPostQApplication(app.arguments())) {

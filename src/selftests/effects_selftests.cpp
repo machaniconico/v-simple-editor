@@ -8,6 +8,7 @@
 #include "ParticleSystem.h"
 #include "VideoEffect.h"
 #include "ProjectFile.h"
+#include "SelftestRegistry.h"
 #include "MaskSystem.h"
 #include "OpticalFlow.h"
 #include "RotoAutoTrace.h"
@@ -72,7 +73,7 @@
 #define HAVE_PLUGINMANIFEST 1
 #endif
 
-extern bool requireSelftest(bool condition, const QString &message, QString *error);
+using selftests::requireSelftest;
 
 // ---- helper / selftest functions moved verbatim from src/main.cpp ----
 
@@ -1474,4 +1475,3 @@ int runProExtSelftest()
     qInfo() << "PROEXT selftest OK";
     return 0;
 }
-

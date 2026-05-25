@@ -35,13 +35,31 @@
 #define HAVE_CAPTIONTRACK 1
 #endif
 
+#if defined(VEDITOR_BRUSH_SELFTEST)
+#include "BrushAnimation.h"
+#endif
+
+#if defined(VEDITOR_SNSPACK_SELFTEST)
+#include "SmartReframe.h"
+#include "LoudnessAnalyzer.h"
+#include <QtMath>
+#endif
+
+#if defined(VEDITOR_NODEGRAPH_SELFTEST)
+#include "NodeGraph.h"
+#include "NodeEvaluator.h"
+#include "NodeLibrary.h"
+#endif
+
 #include "FrameDiff.h"
+#include "SelftestRegistry.h"
 #include "Timeline.h"
 #include "RenderQueue.h"
 #include "TextOverlayBake.h"
 
 #include <QApplication>
 #include <QColor>
+#include <QDebug>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -57,6 +75,8 @@
 #include <QTimer>
 #include <QEventLoop>
 #include <QJsonObject>
+#include <QRectF>
+#include <QSize>
 #include <QVector>
 #include <cmath>
 
@@ -65,7 +85,7 @@
 #endif
 
 extern void writeLogLine(const QString &level, const QString &msg);
-extern bool requireSelftest(bool condition, const QString &message, QString *error);
+using selftests::requireSelftest;
 
 // US-INT-1: Sprint 22 chroma-key refine self-test (VEDITOR_CHROMA_SELFTEST=1).
 int runChromaSelftest()
@@ -834,3 +854,125 @@ int runTextExportSelftest()
     qInfo() << "TEXTEXPORT selftest OK";
     return 0;
 }
+
+#if defined(VEDITOR_BRUSH_SELFTEST)
+void runBrushInlineSelftest()
+{
+    qDebug() << "=== VEDITOR_BRUSH_SELFTEST: BrushAnimation synthetic self-test ===";
+    BrushAnimation brush;
+    brush.setText("Hello World");
+
+    brush.setProgress(0.0);
+    QImage frame0 = brush.renderFrame(1920, 1080);
+    int pixels0 = 0;
+    for (int y = 0; y < frame0.height(); ++y)
+        for (int x = 0; x < frame0.width(); ++x)
+            if (qAlpha(frame0.pixel(x, y)) > 0) ++pixels0;
+    qDebug() << "  progress=0.0  non-transparent pixels:" << pixels0;
+
+    brush.setProgress(0.5);
+    QImage frame5 = brush.renderFrame(1920, 1080);
+    int pixels5 = 0;
+    for (int y = 0; y < frame5.height(); ++y)
+        for (int x = 0; x < frame5.width(); ++x)
+            if (qAlpha(frame5.pixel(x, y)) > 0) ++pixels5;
+    qDebug() << "  progress=0.5  non-transparent pixels:" << pixels5;
+
+    brush.setProgress(1.0);
+    QImage frame1 = brush.renderFrame(1920, 1080);
+    int pixels1 = 0;
+    for (int y = 0; y < frame1.height(); ++y)
+        for (int x = 0; x < frame1.width(); ++x)
+            if (qAlpha(frame1.pixel(x, y)) > 0) ++pixels1;
+    qDebug() << "  progress=1.0  non-transparent pixels:" << pixels1;
+
+    Q_ASSERT(pixels0 <= pixels5 && pixels5 <= pixels1);
+    qDebug() << "=== VEDITOR_BRUSH_SELFTEST: PASSED ===";
+}
+#endif
+
+#if defined(VEDITOR_SNSPACK_SELFTEST)
+void runSnspackInlineSelftest()
+{
+    qDebug() << "=== VEDITOR_SNSPACK_SELFTEST: SmartReframe + LoudnessAnalyzer ===";
+
+    // SmartReframe self-test: 1920x1080 source, 9:16 target
+    SmartReframe reframe;
+    reframe.setSourceSize(QSize(1920, 1080));
+    reframe.setTargetAspect(9.0, 16.0);
+    reframe.setSmoothness(0.7);
+    reframe.setMotionWeight(0.5);
+
+    // Feed 3 synthetic frames
+    for (int i = 0; i < 3; ++i) {
+        QImage frame(1920, 1080, QImage::Format_RGB888);
+        frame.fill(QColor(128 + i * 40, 64, 32).rgb());
+        reframe.analyzeFrame(static_cast<double>(i), frame);
+    }
+    reframe.finalizeAnalysis();
+    QRectF crop0 = reframe.cropRectAt(0.0);
+    qDebug() << "  SmartReframe cropRectAt(0s):" << crop0;
+
+    // LoudnessAnalyzer self-test: synthetic sine wave
+    LoudnessAnalyzer analyzer;
+    analyzer.setSampleRate(48000);
+    const int numFrames = 48000; // 1 second @ 48kHz
+    const double freq = 1000.0;  // 1 kHz tone
+    QVector<float> interleaved(numFrames * 2);
+    for (int i = 0; i < numFrames; ++i) {
+        const double t = static_cast<double>(i) / 48000.0;
+        const double sample = std::sin(2.0 * M_PI * freq * t);
+        interleaved[i * 2]     = static_cast<float>(sample); // L
+        interleaved[i * 2 + 1] = static_cast<float>(sample); // R
+    }
+    analyzer.processBlock(interleaved.constData(), numFrames, 2);
+    qDebug() << "  LoudnessAnalyzer integratedLUFS (1kHz sine, 0dBFS):" << analyzer.integratedLUFS();
+
+    qDebug() << "=== VEDITOR_SNSPACK_SELFTEST: PASSED ===";
+}
+#endif
+
+#if defined(VEDITOR_NODEGRAPH_SELFTEST)
+void runNodeGraphInlineSelftest()
+{
+    qDebug() << "=== VEDITOR_NODEGRAPH_SELFTEST: Node graph synthetic self-test ===";
+
+    nodelib::registerBuiltinNodes();
+
+    NodeGraph graph;
+    int solidId = graph.addNode("SolidColor");
+    GraphNode *solid = graph.node(solidId);
+    solid->params["color"] = QColor(255, 0, 0); // red
+
+    int brightnessId = graph.addNode("BrightnessContrast");
+    GraphNode *brightness = graph.node(brightnessId);
+    brightness->params["brightness"] = 50.0;
+
+    int outputId = graph.addNode("Output");
+
+    graph.connect(solidId, 0, brightnessId, 0);
+    graph.connect(brightnessId, 0, outputId, 0);
+
+    NodeEvaluator evaluator;
+    evaluator.setGraph(&graph);
+    evaluator.setOutputSize(QSize(64, 64));
+
+    QImage result = evaluator.render(0.0);
+
+    bool nonEmpty = !result.isNull() && result.bytesPerLine() != 0;
+    QColor centerPixel;
+    if (!result.isNull() && result.width() > 0 && result.height() > 0) {
+        centerPixel = QColor(result.pixel(result.width() / 2, result.height() / 2));
+    }
+
+    qDebug() << "  output image non-empty:" << nonEmpty;
+    qDebug() << "  output size:" << result.size();
+    qDebug() << "  center pixel color:" << centerPixel.name();
+    qDebug() << "  expected: red-ish (brightness +50 should lighten)";
+
+    Q_ASSERT(nonEmpty);
+    Q_ASSERT(centerPixel.red() > centerPixel.green());
+    Q_ASSERT(centerPixel.red() > centerPixel.blue());
+    qDebug() << "=== VEDITOR_NODEGRAPH_SELFTEST: PASSED ===";
+}
+#endif

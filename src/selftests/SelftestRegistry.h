@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <optional>
+#include <QString>
 #include <QStringList>
 
 namespace selftests {
@@ -22,6 +23,8 @@ struct ArgvSelftestEntry {
 // The canonical selftest table (defined in SelftestRegistry.cpp).
 extern const ArgvSelftestEntry kArgvSelftests[];
 extern const std::size_t kArgvSelftestsCount;
+
+bool requireSelftest(bool condition, const QString &message, QString *error);
 
 // Pre-QApplication argv parse: handles --selftest=list / --selftest=help /
 // QApp-free entries. Returns the selftest exit code if matched, std::nullopt

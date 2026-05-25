@@ -10,10 +10,8 @@
 #include <QString>
 #include <QStringList>
 #include <QCoreApplication>
-
-// writeLogLine is defined at file scope in src/main.cpp (moved out of the
-// anonymous namespace by PRD-SPLIT-MAIN-1 so it has external linkage).
-extern void writeLogLine(const QString& level, const QString& msg);
+#include <QDebug>
+#include "../util/Logger.h"
 
 // ---------------------------------------------------------------------------
 // Forward declarations for the selftest functions implemented in src/main.cpp.
@@ -66,7 +64,11 @@ int runSmartEditSelftest();
 int runSocialSelftest();
 int runSubXlatSelftest();
 int runTextExportSelftest();
+int runTrackMatteExportIntegrationSelftest();
 int runTrackMatteParitySelftest();
+int runTrackMatteReindexSelftest();
+int runTrackMatteRm5ReorderSelftest();
+int runTrackMatteRm6DuplicateSelftest();
 int runTrackerPresetSelftest();
 int runTwitchSelftest();
 int runVfxSelftest();
@@ -78,6 +80,16 @@ int runXUploadSelftest();
 int runYoutubeSelftest();
 
 namespace selftests {
+
+bool requireSelftest(bool condition, const QString &message, QString *error)
+{
+    if (condition)
+        return true;
+    if (error)
+        *error = message;
+    qCritical() << "selftest failed:" << message;
+    return false;
+}
 
 // ---------------------------------------------------------------------------
 // PRD-ARGV-TABLE: central selftest dispatch table.
@@ -270,6 +282,42 @@ std::optional<int> dispatchPreQApplication(int argc, char* argv[])
     return std::nullopt;
 }
 
+namespace {
+
+// Legacy trackmatte argv switches (pre-PRD-ARGV-UNIFY): kept for back-compat.
+// Each maps directly to a function in parity_matte_selftests.cpp.
+std::optional<int> dispatchLegacyTrackmatte(const QStringList& args)
+{
+    if (args.contains(QStringLiteral("--selftest-trackmatte-parity"))) {
+        writeLogLine("INFO", "running --selftest-trackmatte-parity");
+        return runTrackMatteParitySelftest();
+    }
+
+    if (args.contains(QStringLiteral("--selftest-trackmatte-export-integration"))) {
+        writeLogLine("INFO", "running --selftest-trackmatte-export-integration");
+        return runTrackMatteExportIntegrationSelftest();
+    }
+
+    if (args.contains(QStringLiteral("--selftest-trackmatte-reindex"))) {
+        writeLogLine("INFO", "running --selftest-trackmatte-reindex");
+        return runTrackMatteReindexSelftest();
+    }
+
+    if (args.contains(QStringLiteral("--selftest-trackmatte-rm6-duplicate"))) {
+        writeLogLine("INFO", "running --selftest-trackmatte-rm6-duplicate");
+        return runTrackMatteRm6DuplicateSelftest();
+    }
+
+    if (args.contains(QStringLiteral("--selftest-trackmatte-rm5-reorder"))) {
+        writeLogLine("INFO", "running --selftest-trackmatte-rm5-reorder");
+        return runTrackMatteRm5ReorderSelftest();
+    }
+
+    return std::nullopt;
+}
+
+} // namespace
+
 // ---------------------------------------------------------------------------
 // dispatchPostQApplication: --selftest=all sweep + QApp-required argv-switch
 // entries + env-gate (VEDITOR_*_SELFTEST) loop.
@@ -277,6 +325,10 @@ std::optional<int> dispatchPreQApplication(int argc, char* argv[])
 // ---------------------------------------------------------------------------
 std::optional<int> dispatchPostQApplication(const QStringList& args)
 {
+    if (auto rc = dispatchLegacyTrackmatte(args)) {
+        return rc;
+    }
+
     // PRD-ARGV-ALL: --selftest=all runs every entry sequentially.
     // PRD-ARGV-EXTRAS: VEDITOR_ALL_SELFTEST=1 mirrors --selftest=all.
     if (args.contains(QStringLiteral("--selftest=all"))

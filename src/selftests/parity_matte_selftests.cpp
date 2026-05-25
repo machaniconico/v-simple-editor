@@ -16,6 +16,7 @@
 #include "ColorMatchAnalyzer.h" // colormatch::analyze namespace
 #include "AudioRestoration.h"  // audiorestore::deHum
 #include "ProjectFile.h"       // TrackMatteClipEntry (full definition, forward-decl in TrackMatteKey.h)
+#include "SelftestRegistry.h"  // selftests::requireSelftest
 #include "LutImporter.h"       // LutImporter::loadCubeFile / applyLutWithIntensity
 #include "CodecDetector.h"     // CodecDetector::isEncoderAvailable
 #include "libavcore/Encode.h"  // libavcore::EncodeRequest, libavcore::FrameEncoder
@@ -40,6 +41,7 @@
 #include <QThread>
 #include <cmath>
 
+using selftests::requireSelftest;
 
 // TM-6: track-matte SSOT parity selftest (--selftest-trackmatte-parity).
 //

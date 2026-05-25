@@ -85,6 +85,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/misc_selftests.cpp
 
     src/main.cpp
+    src/util/CrashHandler.cpp
+    src/util/Logger.cpp
     src/MainWindow.cpp
     src/VideoPlayer.cpp
     src/Timeline.cpp

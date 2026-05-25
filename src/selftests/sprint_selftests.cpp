@@ -47,6 +47,7 @@
 #include "HdrGrading.h"
 #include "MultiCamSync.h"
 #include "BatchExportQueue.h"
+#include "SelftestRegistry.h"
 #include "Timeline.h"
 
 #include <QApplication>
@@ -217,7 +218,7 @@
 #define HAVE_BATCHEXPORT_QUEUE 1
 #endif
 
-extern bool requireSelftest(bool condition, const QString &message, QString *error);
+using selftests::requireSelftest;
 
 // ---- selftest functions moved verbatim from src/main.cpp lines 511-2053 ----
 
