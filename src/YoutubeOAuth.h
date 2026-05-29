@@ -25,6 +25,8 @@ class QTcpSocket;
 //
 // セキュリティ注意:
 //   - clientSecret はデスクトップアプリ用 OAuth client (PKCE) で空でも可。
+//   - clientId / clientSecret の取得経路: env (VEDITOR_YOUTUBE_CLIENT_ID/_SECRET)
+//     → QSettings (youtube_oauth/client_id|_secret) → 空文字列 (creds::CredentialStore)
 //   - refresh_token は QSettings に base64 で軽 obfuscate して保存する。
 //     プラットフォーム secure storage は別 story (US-YT-2 以降) で扱う。
 // ---------------------------------------------------------------------------
@@ -38,6 +40,12 @@ struct YoutubeOAuthConfig {
     QString clientSecret;    // PKCE のみなら空でも可 (Web client では必須)
     QString redirectUri;     // 既定: http://localhost:8080/callback
     QString scope;           // 既定: youtube.upload
+
+    // mock server / staging 経由のテスト用に endpoint base を override する。
+    // 空ならハードコードされた https://accounts.google.com と https://oauth2.googleapis.com を使う。
+    // 設定例: "http://localhost:8081" → authorize は <base>/o/oauth2/v2/auth に、
+    //   token は <base>/token に向く。
+    QString baseUrl;
 
     // 既定値 (clientId / clientSecret は空、redirectUri/scope のみ埋まる)
     static YoutubeOAuthConfig defaultConfig();

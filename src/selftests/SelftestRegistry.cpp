@@ -19,9 +19,12 @@
 // ---------------------------------------------------------------------------
 int runAIHighlightSelftest();
 int runAffinitySelftest();
+int runOAuthMockE2eSelftest();
+int runOAuthRefreshE2eSelftest();
 int runAnimExportSelftest();
 int runAudioMixerSelftest();
 int runAudioRestoreSelftest();
+int runAutoClipGenSelftest();
 int runBatchExportSelftest();
 int runBlenderSelftest();
 int runCaptionSelftest();
@@ -29,6 +32,10 @@ int runChromaSelftest();
 int runCloudRenderSelftest();
 int runCollabSelftest();
 int runColorMatchSelftest();
+int runCommandSearchSelftest();
+int runCredAuditLogSelftest();
+int runCredTtlSelftest();
+int runCredentialVaultSelftest();
 int runDavinciSelftest();
 int runE2eSelftest();
 int runEasingSelftest();
@@ -54,6 +61,7 @@ int runPlanarSelftest();
 int runPlanarPresetSelftest();
 #define HAVE_PLANARTRACKER_PRESET 1
 #endif
+int runPlatformMockE2eSelftest();
 int runProExtSelftest();
 int runProSelftest();
 int runProjTmplSelftest();
@@ -69,15 +77,20 @@ int runTrackMatteParitySelftest();
 int runTrackMatteReindexSelftest();
 int runTrackMatteRm5ReorderSelftest();
 int runTrackMatteRm6DuplicateSelftest();
+int runTranscriptHighlighterSelftest();
 int runTrackerPresetSelftest();
 int runTwitchSelftest();
 int runVfxSelftest();
 int runVideostabDeshakeSelftest();
 int runVimeoSelftest();
 int runWatermarkSelftest();
+int runWhisperTranscribeSelftest();
 int runWorkflowSelftest();
 int runXUploadSelftest();
 int runYoutubeSelftest();
+int runYtdlpDownloaderSelftest();
+int runPremiereXmlSelftest();
+int runYoutubeChapterSelftest();
 
 namespace selftests {
 
@@ -120,6 +133,18 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "AIHighlight config defaults / Highlight struct helpers (singleton-free, 6 gates)" },
     { "videostab-deshake", "VEDITOR_VIDEOSTAB_DESHAKE_SELFTEST",  runVideostabDeshakeSelftest,   false,
       "VideoStabilizer in-process deshake filter-graph + cancel UX (9 gates)" },
+    { "cred-ttl",          "VEDITOR_CRED_TTL_SELFTEST",           runCredTtlSelftest,            false,
+      "CredentialStore TTL helper (setExpiry/getExpiry/clearExpiry/isExpired) round-trip + past/future detection (8 gates). QApplication 不要." },
+    { "credential-vault",  "VEDITOR_CREDENTIAL_VAULT_SELFTEST",   runCredentialVaultSelftest,    false,
+      "Windows Credential Manager (wincred.h) backend roundtrip: store/retrieve/erase/exists, Unicode, long value, multi-target isolation (10 gates)." },
+    { "cred-audit-log",    "VEDITOR_CRED_AUDIT_LOG_SELFTEST",     runCredAuditLogSelftest,       false,
+      "CredentialAuditLog 10 gate (file create / append / 7 labels JSONL / mask / ISO8601 / 1MB rotation / re-append / 10-thread safety / readEntries round-trip / purgeOlderThanDays). needsQApp=false (QtConcurrent uses default pool)." },
+    { "ytdlp-downloader",  "VEDITOR_YTDLP_DOWNLOADER_SELFTEST",  runYtdlpDownloaderSelftest,    false,
+      "yt-dlp downloader stub (Phase 6 Wave 1 FOUNDATION, filled in US-6A-4: 6 gate URL detect / outtmpl / subprocess mock / progress / cancel / completion)" },
+    { "premiere-xml",      "VEDITOR_PREMIERE_XML_SELFTEST",       runPremiereXmlSelftest,        false,
+      "Premiere XML (FCP7) exporter stub (Phase 6 Wave 1 FOUNDATION, filled in US-6E-3: 4 gate combined / individual / multi-sequence / DOCTYPE)" },
+    { "youtube-chapter",   "VEDITOR_YOUTUBE_CHAPTER_SELFTEST",    runYoutubeChapterSelftest,     false,
+      "YouTube chapter generator stub (Phase 6 Wave 1 FOUNDATION, filled in US-6F-3: 3 gate M:SS / H:MM:SS / intro auto-insert)" },
     // QApplication-required (needsQApplication=true) ----------------------
     { "parity",            "VEDITOR_PARITY_SELFTEST",             runParitySelftest,             true,
       "Preview vs export pixel-parity (S1-S11, framediff::mse, 10-bit HDR10)" },
@@ -143,6 +168,12 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Social/sharing module smoke (Sprint-12 SNS pipeline stubs)" },
     { "caption",           "VEDITOR_CAPTION_SELFTEST",            runCaptionSelftest,            true,
       "Caption/subtitle module smoke (SRT/VTT parse, burn-in, track model)" },
+    { "whisper-transcribe", "VEDITOR_WHISPER_TRANSCRIBE_SELFTEST", runWhisperTranscribeSelftest,  true,
+      "Whisper transcription service scaffold smoke" },
+    { "transcript-highlighter", "VEDITOR_TRANSCRIPT_HIGHLIGHTER_SELFTEST", runTranscriptHighlighterSelftest, true,
+      "Transcript highlighter scaffold smoke" },
+    { "auto-clip-gen",     "VEDITOR_AUTO_CLIP_GEN_SELFTEST",      runAutoClipGenSelftest,        true,
+      "Auto clip generator scaffold smoke" },
     { "planar",            "VEDITOR_PLANAR_SELFTEST",             runPlanarSelftest,             true,
       "Planar tracker primitive smoke (homography solver, pre-Preset era)" },
     { "mobile",            "VEDITOR_MOBILE_SELFTEST",             runMobileSelftest,             true,
@@ -161,6 +192,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Collaboration smoke: Comments, ProjectShare, and History module stubs" },
     { "colormatch",        "VEDITOR_COLORMATCH_SELFTEST",         runColorMatchSelftest,         true,
       "AI ColorMatch analyzer + 3D-LUT generator + dialog smoke" },
+    { "command-search",    "VEDITOR_COMMAND_SEARCH_SELFTEST",     runCommandSearchSelftest,      true,
+      "Command palette search scaffold smoke" },
     { "vimeo",             "VEDITOR_VIMEO_SELFTEST",              runVimeoSelftest,              true,
       "Vimeo upload pipeline smoke (auth token + chunked upload stub)" },
     { "twitch",            "VEDITOR_TWITCH_SELFTEST",             runTwitchSelftest,             true,
@@ -215,6 +248,12 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Workflow / scripting module smoke (macro record + replay pipeline)" },
     { "audiomixer",        "VEDITOR_AUDIOMIXER_SELFTEST",         runAudioMixerSelftest,         true,
       "Audio mixer module smoke (Sprint-23 bus routing + send/return stubs)" },
+    { "oauth-mock-e2e",   "VEDITOR_OAUTH_MOCK_SELFTEST",        runOAuthMockE2eSelftest,       true,
+      "OAuth + Upload pipeline を localhost mock HTTP server で exercise する 10 gate e2e selftest" },
+    { "oauth-refresh-e2e", "VEDITOR_OAUTH_REFRESH_E2E_SELFTEST", runOAuthRefreshE2eSelftest,    true,
+      "OAuth refresh_token auto-trigger e2e (YT 5 + Vimeo 5 gates via mock server). needs QApplication." },
+    { "platform-mock-e2e", "VEDITOR_PLATFORM_MOCK_SELFTEST",      runPlatformMockE2eSelftest,    true,
+      "Instagram Graph API + X Media Upload を localhost mock 経由で e2e exercise (13 gates: server + 5 IG + 7 X). QApplication 必要。" },
 };
 
 const std::size_t kArgvSelftestsCount = sizeof(kArgvSelftests) / sizeof(kArgvSelftests[0]);
@@ -247,7 +286,7 @@ std::optional<int> dispatchPreQApplication(int argc, char* argv[])
 
         if (std::strcmp(req, "help") == 0) {
             // PRD-SELFTEST-HELP: print name + description + env block for every entry.
-            std::cout << "V Simple Editor — selftest entry points (54)\n";
+            std::cout << "V Simple Editor — selftest entry points (" << kArgvSelftestsCount << ")\n";
             std::cout << "Usage: ./v-simple-editor.exe --selftest=<name>\n";
             std::cout << "   or: VEDITOR_<NAME>_SELFTEST=1 ./v-simple-editor.exe\n";
             std::cout << "   or: --selftest=all  (full sweep)\n";

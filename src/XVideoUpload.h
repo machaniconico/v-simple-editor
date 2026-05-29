@@ -10,6 +10,8 @@ namespace x {
 namespace upload {
 
 struct XUploadConfig {
+    //   bearerToken 取得経路: env (VEDITOR_X_BEARER_TOKEN) → QSettings (x_video/bearer_token)
+    //                      → 空 (creds::CredentialStore)
     QString bearerToken;
     QString apiBase       = QStringLiteral("https://upload.twitter.com/1.1");
     QString tweetApiBase  = QStringLiteral("https://api.twitter.com/2");

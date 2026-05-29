@@ -1,5 +1,6 @@
 #include "Exporter.h"
 #include "CodecDetector.h"
+#include "PremiereXmlExporter.h"
 #include "VideoEffect.h"
 #include "SmartReframe.h"
 #include "SubtitleTrackRenderer.h"
@@ -373,4 +374,30 @@ bool Exporter::transcodeClip(const ClipInfo &, AVFormatContext *, AVCodecContext
 {
     // Handled inline in doExport for now
     return true;
+}
+
+// static
+bool Exporter::exportAsPremiereXml(const QVector<ClipInfo> &clips,
+                                   const ExportConfig &config,
+                                   const QString &outputPath,
+                                   const QString &projectName)
+{
+    QList<PremiereHighlight> highlights;
+    for (const auto &clip : clips) {
+        PremiereHighlight h;
+        h.filePath = clip.filePath;
+        h.title    = clip.displayName.isEmpty()
+                         ? QFileInfo(clip.filePath).baseName()
+                         : clip.displayName;
+        h.startSec = clip.inPoint;
+        h.endSec   = (clip.outPoint > 0.0) ? clip.outPoint : clip.duration;
+        highlights.append(h);
+    }
+
+    PremiereVideoInfo info;
+    info.width  = config.width;
+    info.height = config.height;
+    info.fps    = static_cast<double>(config.fps);
+
+    return PremiereXmlExporter::generateCombinedXml(highlights, info, outputPath, projectName);
 }

@@ -41,7 +41,16 @@
 #include "ShortcutManager.h"
 #include "ShortcutCustomizeDialog.h"
 #include "SocialExportDialog.h"
+#include "YtdlpDownloadDialog.h"
 #include "CaptionEditorDialog.h"
+#include "WhisperTranscribeDialog.h"
+#include "TranscriptHighlightDialog.h"
+#include "TranscriptHighlighter.h"
+#include "AutoClipDialog.h"
+#include "AutoClipGenerator.h"
+#include "CommandPaletteDialog.h"
+#include "WhisperTranscriber.h"
+#include "CredentialDialog.h"
 #include "SocialPreset.h"
 #include "AspectReframer.h"
 #include "ClipGeometry.h"
@@ -1267,6 +1276,11 @@ void MainWindow::setupMenuBar()
     m_menuHelpEntries.append({openAction,
         QStringLiteral("パソコンの中の動画・画像・音声ファイルを読み込んで素材として取り込みます。")});
 
+    auto *importUrlAction = fileMenu->addAction("URL から動画を取り込み(&U)...");
+    connect(importUrlAction, &QAction::triggered, this, &MainWindow::importVideoFromUrl);
+    m_menuHelpEntries.append({importUrlAction,
+        QStringLiteral("YouTube などの動画 URL を貼り付けて、yt-dlp でダウンロードしてそのまま素材に取り込みます。")});
+
     // 最近使ったファイル
     m_recentFilesMenu = new RecentFilesMenu(m_recentFilesManager, fileMenu);
     m_recentFilesMenu->setTitle("最近使ったファイル");
@@ -1524,6 +1538,15 @@ void MainWindow::setupMenuBar()
     prefsMenu->addAction(shortcutCustomizeAction);
     m_menuHelpEntries.append({shortcutCustomizeAction,
         QStringLiteral("メニューやツールバーのキーボードショートカットをカスタマイズしたり、Premiere/FinalCutPro/DaVinci 風プリセットへ切り替えたりします。")});
+
+    editMenu->addSeparator();
+
+    // US-AUTH-6: unified credential dialog for 5 streaming platforms.
+    auto *credentialAction = editMenu->addAction(QStringLiteral("配信認証情報..."));
+    credentialAction->setShortcut(QKeySequence(tr("Ctrl+Alt+A")));
+    connect(credentialAction, &QAction::triggered, this, &MainWindow::onShowCredentialDialog);
+    m_menuHelpEntries.append({credentialAction,
+        QStringLiteral("YouTube / Vimeo / Instagram / X / Twitch の配信認証情報を 1 画面で確認・保存・削除します。")});
 
     // US-TP-6: PRD-TP — モーショントラッカー preset 適用ダイアログ。Ctrl+Alt+T
     // で開き、選択した preset を m_motionTracker に適用する。既存の
@@ -2091,6 +2114,45 @@ void MainWindow::setupMenuBar()
 
     // ツール メニュー (AI / 自動編集)
     auto *toolsMenu = menuBar()->addMenu("ツール(&T)");
+
+    // US-CP-4: コマンドパレット (VS Code 風 機能検索)。Ctrl+Shift+P と
+    // このメニュー項目の両方から openCommandPalette() を起動する。
+    auto *commandPaletteAction =
+        toolsMenu->addAction(QStringLiteral("コマンドパレット... (Ctrl+Shift+P)"));
+    commandPaletteAction->setObjectName("action_command_palette");
+    connect(commandPaletteAction, &QAction::triggered,
+            this, &MainWindow::openCommandPalette);
+    m_menuHelpEntries.append({commandPaletteAction,
+        QStringLiteral("ツール名や『こういう操作がしたい』という語で機能を検索し、選んで即実行できるパレットを開きます。")});
+    auto *commandPaletteShortcut =
+        new QShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+P")), this);
+    connect(commandPaletteShortcut, &QShortcut::activated,
+            this, &MainWindow::openCommandPalette);
+    toolsMenu->addSeparator();
+
+    // Phase 6 Wave 2 (US-6B-4): 動画→Whisper 文字起こし (既存ツールメニューへ配置)
+    auto *whisperTranscribeAction = toolsMenu->addAction(QStringLiteral("動画を文字起こし..."));
+    whisperTranscribeAction->setObjectName("action_whisper_transcribe");
+    connect(whisperTranscribeAction, &QAction::triggered,
+            this, &MainWindow::openWhisperTranscribeDialog);
+    m_menuHelpEntries.append({whisperTranscribeAction,
+        QStringLiteral("動画・音声から音声を抽出し、Whisper などの ASR エンジンで自動的に字幕クリップを生成します。")});
+
+    // Phase 6 Wave 3 (US-6C-4): 文字起こしからハイライト検出 (既存ツールメニューへ配置)
+    auto *transcriptHighlightAction = toolsMenu->addAction(QStringLiteral("文字起こしからハイライト検出..."));
+    transcriptHighlightAction->setObjectName("action_transcript_highlight");
+    connect(transcriptHighlightAction, &QAction::triggered,
+            this, &MainWindow::openTranscriptHighlightDialog);
+    m_menuHelpEntries.append({transcriptHighlightAction,
+        QStringLiteral("現在の字幕トラックを AI に渡し、最も見どころとなる瞬間を自動検出します。")});
+
+    // Phase 6 Wave 4 (US-6D-4): ハイライトから自動カット (既存ツールメニューへ配置)
+    auto *autoClipAction = toolsMenu->addAction(QStringLiteral("ハイライトから自動カット..."));
+    autoClipAction->setObjectName("action_auto_clip");
+    connect(autoClipAction, &QAction::triggered,
+            this, &MainWindow::openAutoClipDialog);
+    m_menuHelpEntries.append({autoClipAction,
+        QStringLiteral("検出済みハイライトから自動でカット範囲を計算し、タイムラインに追加します。")});
 
     auto *silenceAction = toolsMenu->addAction("無音検出...");
     connect(silenceAction, &QAction::triggered, this, &MainWindow::autoSilenceDetect);
@@ -4266,10 +4328,25 @@ void MainWindow::openFile()
         loadMediaFile(filePath, true, "Loaded");
 }
 
+void MainWindow::importVideoFromUrl()
+{
+    YtdlpDownloadDialog dialog(this);
+    if (dialog.exec() != QDialog::Accepted)
+        return;
+    const QString path = dialog.downloadedFilePath();
+    if (path.isEmpty())
+        return;
+    loadMediaFile(path, true, QStringLiteral("URL から取り込み"));
+}
+
 void MainWindow::exportVideo()
 {
     ExportDialog dialog(m_projectConfig, this);
     dialog.setSourceIsHdr(m_player && m_player->isHdrSource());
+    // タイムラインの V1 クリップを渡すことで、ダイアログ内の YouTube 概要欄
+    // チャプター生成 (US-6F-2) と Premiere XML エクスポートが実 export 経路で
+    // 実データを参照できるようにする。
+    dialog.setClips(m_timeline->videoClips());
     if (dialog.exec() != QDialog::Accepted) return;
 
     ExportConfig exportCfg = dialog.config();
@@ -8049,6 +8126,17 @@ void MainWindow::openShortcutCustomizeDialog()
     m_shortcutCustomizeDialog->activateWindow();
 }
 
+void MainWindow::onShowCredentialDialog()
+{
+    if (!m_credentialDialog) {
+        m_credentialDialog = new CredentialDialog(this);
+        m_credentialDialog->setObjectName(QStringLiteral("credentialDialog"));
+    }
+    m_credentialDialog->show();
+    m_credentialDialog->raise();
+    m_credentialDialog->activateWindow();
+}
+
 // US-SC2-B: Sprint 13 — open / raise the SNS 向けエクスポート dialog
 // (modeless; preset と reframe 設定をユーザが行い、exportRequested 受信で
 //  実 export 連携は後続スプリントで実装予定)。
@@ -8094,6 +8182,303 @@ void MainWindow::openCaptionEditorDialog()
     m_captionEditorDialog->show();
     m_captionEditorDialog->raise();
     m_captionEditorDialog->activateWindow();
+}
+
+// Phase 6 Wave 2 (US-6B-4): 動画→Whisper 文字起こし配線。
+// WhisperTranscribeDialog をモーダル exec() し、Accepted なら request() を
+// WhisperTranscriber に渡して caption::Track を生成、結果セグメント数を可視化する。
+void MainWindow::openWhisperTranscribeDialog()
+{
+    WhisperTranscribeDialog dialog(this);
+
+    // 現在タイムラインに乗っている最初の動画を初期メディアパスとして渡す。
+    if (m_timeline) {
+        const QVector<ClipInfo> &videoClips = m_timeline->videoClips();
+        if (!videoClips.isEmpty() && !videoClips.first().filePath.isEmpty())
+            dialog.setMediaPath(videoClips.first().filePath);
+    }
+
+    if (dialog.exec() != QDialog::Accepted)
+        return;
+
+    const whisper::TranscribeRequest req = dialog.request();
+    whisper::WhisperTranscriber transcriber;
+    const whisper::TranscribeOutcome outcome = transcriber.transcribe(req);
+
+    if (!outcome.success) {
+        QMessageBox::warning(this, QStringLiteral("動画を文字起こし"),
+            QStringLiteral("文字起こしに失敗しました:\n%1")
+                .arg(outcome.error.isEmpty()
+                         ? QStringLiteral("不明なエラー")
+                         : outcome.error));
+        return;
+    }
+
+    const int segmentCount = outcome.track.clipCount();
+
+    // 生成した caption::Track を既存の字幕エディタ経路へ渡す (破棄しない)。
+    openCaptionEditorDialog();
+    if (m_captionEditorDialog)
+        m_captionEditorDialog->setTrack(outcome.track);
+
+    const QString summary =
+        QStringLiteral("%1 件のセグメントを生成し、字幕エディタに読み込みました。").arg(segmentCount);
+    statusBar()->showMessage(summary);
+    QMessageBox::information(this, QStringLiteral("動画を文字起こし"), summary);
+}
+
+// Phase 6 Wave 3 (US-6C-4): 文字起こしからハイライト検出配線。
+// 現在の字幕トラック(あれば)を TranscriptHighlightDialog に渡してモーダル exec()。
+// Accepted なら request() を TranscriptHighlighter::detect() に渡し、検出結果を
+// Dialog の結果欄 + statusBar に [mm:ss-mm:ss score] reason 形式で表示する。
+void MainWindow::openTranscriptHighlightDialog()
+{
+    TranscriptHighlightDialog dialog(this);
+
+    // 現在の字幕トラックがあれば transcript として渡す (無ければ空)。
+    if (m_captionEditorDialog)
+        dialog.setTranscript(m_captionEditorDialog->track().clips());
+
+    if (dialog.exec() != QDialog::Accepted)
+        return;
+
+    const transcripthl::HighlightRequest req = dialog.request();
+    QString err;
+    transcripthl::TranscriptHighlighter highlighter;
+    const QVector<Highlight> highlights = highlighter.detect(req, nullptr, &err);
+
+    // dialog.exec() は既に閉じているため、結果は QMessageBox で可視化する
+    // (6B-4 whisper と同じパターン)。
+    if (highlights.isEmpty()) {
+        const QString message = err.isEmpty()
+            ? QStringLiteral("ハイライトを検出できませんでした。")
+            : QStringLiteral("ハイライト検出に失敗しました: %1\n"
+                             "(API キーは設定から登録してください)").arg(err);
+        statusBar()->showMessage(message);
+        QMessageBox::warning(this, QStringLiteral("文字起こしからハイライト検出"), message);
+        return;
+    }
+
+    // [mm:ss-mm:ss score] reason 形式で列挙。
+    const auto fmt = [](double seconds) {
+        const int total = static_cast<int>(seconds);
+        return QStringLiteral("%1:%2")
+            .arg(total / 60, 2, 10, QLatin1Char('0'))
+            .arg(total % 60, 2, 10, QLatin1Char('0'));
+    };
+    QStringList lines;
+    for (const Highlight &h : highlights) {
+        lines.append(QStringLiteral("[%1-%2 %3] %4")
+                         .arg(fmt(h.startTime))
+                         .arg(fmt(h.endTime))
+                         .arg(h.score, 0, 'f', 2)
+                         .arg(h.description));
+    }
+
+    // Phase 6 Wave 4 (US-6D-4): 自動カット (openAutoClipDialog) の計算ソースとして
+    // 直近の検出結果を保持する。
+    m_lastHighlights = highlights;
+
+    const QString summary =
+        QStringLiteral("%1 件のハイライトを検出しました。").arg(highlights.size());
+    statusBar()->showMessage(summary);
+    QMessageBox::information(this, QStringLiteral("文字起こしからハイライト検出"),
+                            summary + QStringLiteral("\n\n") + lines.join(QLatin1Char('\n')));
+}
+
+// Phase 6 Wave 4 (US-6D-4): ハイライトから自動カット配線。
+// 直近の検出結果 (m_lastHighlights) と現在の動画の長さを AutoClipDialog に渡し、
+// Accepted なら AutoClipGenerator::planClips でカット範囲を計算する。結果を
+// QMessageBox::question で件数+一覧表示し、Yes ならタイムライン末尾へ追加する。
+void MainWindow::openAutoClipDialog()
+{
+    // 現在の動画 (timeline 先頭の videoClip) の長さを取得 (無ければ 0)。
+    double durationSec = 0.0;
+    if (m_timeline) {
+        const auto &clips = m_timeline->videoClips();
+        if (!clips.isEmpty())
+            durationSec = clips.first().duration;
+    }
+
+    AutoClipDialog dialog(this);
+    dialog.setHighlightCount(m_lastHighlights.size());
+    dialog.setSourceDuration(durationSec);
+
+    if (dialog.exec() != QDialog::Accepted)
+        return;
+
+    const autoclip::AutoClipConfig config = dialog.config();
+    const QVector<autoclip::ClipPlan> plans =
+        autoclip::AutoClipGenerator::planClips(m_lastHighlights, durationSec, config);
+
+    if (plans.isEmpty()) {
+        QMessageBox::information(
+            this, QStringLiteral("ハイライトから自動カット"),
+            QStringLiteral("カット範囲を計算できませんでした "
+                           "(ハイライト未検出かもしれません)"));
+        return;
+    }
+
+    // [mm:ss-mm:ss score] label 形式で列挙。
+    const auto fmt = [](double seconds) {
+        const int total = static_cast<int>(seconds);
+        return QStringLiteral("%1:%2")
+            .arg(total / 60, 2, 10, QLatin1Char('0'))
+            .arg(total % 60, 2, 10, QLatin1Char('0'));
+    };
+    QStringList lines;
+    for (const autoclip::ClipPlan &p : plans) {
+        lines.append(QStringLiteral("[%1-%2 %3] %4")
+                         .arg(fmt(p.startSec))
+                         .arg(fmt(p.endSec))
+                         .arg(p.score, 0, 'f', 2)
+                         .arg(p.label));
+    }
+
+    const QString question =
+        QStringLiteral("%1 個のカット範囲を検出しました。"
+                       "タイムラインに追加しますか?").arg(plans.size());
+    const auto answer = QMessageBox::question(
+        this, QStringLiteral("ハイライトから自動カット"),
+        question + QStringLiteral("\n\n") + lines.join(QLatin1Char('\n')),
+        QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes);
+
+    if (answer != QMessageBox::Yes)
+        return;
+
+    QString sourceFilePath;
+    if (m_timeline) {
+        const auto &clips = m_timeline->videoClips();
+        if (!clips.isEmpty())
+            sourceFilePath = clips.first().filePath;
+    }
+
+    const QVector<ClipInfo> newClips =
+        autoclip::AutoClipGenerator::toTimelineClips(plans, sourceFilePath, durationSec);
+    // Timeline は ClipInfo を直接受け取る公開 API を持たないため、先頭の
+    // 動画トラック (TimelineTrack::addClip(const ClipInfo&)) に末尾追加する。
+    int added = 0;
+    if (m_timeline && !m_timeline->videoTracks().isEmpty()) {
+        TimelineTrack *track = m_timeline->videoTracks().first();
+        if (track) {
+            for (const ClipInfo &c : newClips) {
+                track->addClip(c);
+                ++added;
+            }
+        }
+    }
+    statusBar()->showMessage(QStringLiteral("%1 個追加").arg(added));
+}
+
+// US-CP-4: コマンドパレット用の index を menuBar() から構築する。
+// 各トップメニューを再帰的に辿り、separator でもサブメニュー親 (menu() を
+// 持つ項目) でもなく text() が非空の QAction を CommandEntry に変換する。
+// id は objectName() が非空ならそれ、空なら "cmd_<連番>" を生成する。
+// keywords には m_menuHelpEntries 由来の説明文 + 所属トップメニュー名 を足す。
+// 副作用として m_commandActions を id→QAction で再構築する。
+QVector<cmdsearch::CommandEntry> MainWindow::buildCommandEntries()
+{
+    m_commandActions.clear();
+
+    // 説明文の高速参照: QAction* → help 文字列。
+    QHash<const QAction *, QString> helpByAction;
+    for (const auto &pair : m_menuHelpEntries) {
+        if (pair.first)
+            helpByAction.insert(pair.first, pair.second);
+    }
+
+    QVector<cmdsearch::CommandEntry> entries;
+    int autoId = 0;
+
+    // 走査キュー: (menu, 所属トップメニュー名)。サブメニューは末尾に積んで
+    // 幅優先で辿る (std::function 再帰を避けるため反復実装)。
+    QVector<QPair<QMenu *, QString>> pending;
+    const QList<QAction *> topActions = menuBar()->actions();
+    for (QAction *topAction : topActions) {
+        if (!topAction || topAction->isSeparator())
+            continue;
+        QMenu *topMenu = topAction->menu();
+        if (!topMenu)
+            continue;
+        QString topName = topAction->text();
+        topName.remove(QLatin1Char('&'));
+        pending.append({topMenu, topName});
+    }
+
+    for (int qi = 0; qi < pending.size(); ++qi) {
+        QMenu *menu = pending[qi].first;
+        const QString topMenuName = pending[qi].second;
+        if (!menu)
+            continue;
+        const QList<QAction *> actions = menu->actions();
+        for (QAction *action : actions) {
+            if (!action || action->isSeparator())
+                continue;
+            if (action->menu()) {
+                // サブメニュー親は実行対象にせず、子を後で辿る。
+                pending.append({action->menu(), topMenuName});
+                continue;
+            }
+            const QString rawText = action->text();
+            if (rawText.isEmpty())
+                continue;
+
+            // id: objectName 優先、無ければ自動採番。
+            QString id = action->objectName();
+            if (id.isEmpty())
+                id = QStringLiteral("cmd_%1").arg(autoId++);
+            // 同一 id 衝突を避ける (objectName が複数 action で空 → 自動採番で回避済だが念のため)。
+            if (m_commandActions.contains(id))
+                id = QStringLiteral("cmd_%1").arg(autoId++);
+
+            // title: '&' (ニーモニック) を除去。末尾の "..."/"…" は保持。
+            QString title = rawText;
+            title.remove(QLatin1Char('&'));
+
+            // keywords: 説明文 + 所属トップメニュー名。
+            QStringList kw;
+            const QString help = helpByAction.value(action);
+            if (!help.isEmpty())
+                kw << help;
+            if (!topMenuName.isEmpty())
+                kw << topMenuName;
+
+            cmdsearch::CommandEntry entry;
+            entry.id = id;
+            entry.title = title;
+            entry.keywords = kw.join(QLatin1Char(' '));
+            entries.append(entry);
+
+            m_commandActions.insert(id, action);
+        }
+    }
+
+    return entries;
+}
+
+// US-CP-4: コマンドパレットを開く。現在のメニュー状態から index を再構築し、
+// CommandPaletteDialog で検索 → commandTriggered(id) を受けて対応 QAction を
+// trigger() する。trigger() の前に必ず accept() でパレットを閉じることで、
+// action がモーダル/別ダイアログを開く場合の入れ子モーダルを避ける。
+void MainWindow::openCommandPalette()
+{
+    const QVector<cmdsearch::CommandEntry> entries = buildCommandEntries();
+
+    CommandPaletteDialog dialog(this);
+    dialog.setCommands(entries);
+    // commandTriggered は accept() 前に emit されるため、ここで直接 trigger すると
+    // パレットが開いたまま action が走り入れ子モーダルになる。id だけ捕捉して
+    // exec() 返却後 (=パレット閉鎖後) に trigger する。
+    QString chosenId;
+    connect(&dialog, &CommandPaletteDialog::commandTriggered,
+            this, [&chosenId](const QString &id) { chosenId = id; });
+    dialog.exec();
+
+    if (!chosenId.isEmpty()) {
+        QAction *action = m_commandActions.value(chosenId, nullptr);
+        if (action)
+            action->trigger();
+    }
 }
 
 // US-INT-1: Sprint 16 — open / raise the mobile-device export dialog (modeless).

@@ -10,11 +10,12 @@
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
-#include <QSettings>
 #include <QTimer>
 #include <QUrl>
 #include <QUrlQuery>
 #include <QtGlobal>
+
+#include "CredentialStore.h"
 
 namespace x {
 namespace upload {
@@ -26,23 +27,11 @@ namespace upload {
 XUploadConfig XUploadConfig::defaultConfig() {
     XUploadConfig cfg;
 
-    // 1) environment variable
-    const QByteArray envToken = qgetenv("VEDITOR_X_BEARER_TOKEN");
-    if (!envToken.isEmpty()) {
-        cfg.bearerToken = QString::fromUtf8(envToken).trimmed();
-        return cfg;
-    }
-
-    // 2) QSettings
-    QSettings settings;
-    const QString settingsToken =
-        settings.value(QStringLiteral("x_oauth/bearer")).toString().trimmed();
-    if (!settingsToken.isEmpty()) {
-        cfg.bearerToken = settingsToken;
-        return cfg;
-    }
-
-    qWarning("X bearer token not set; upload will be a no-op");
+    cfg.bearerToken = creds::CredentialStore::get(
+        "VEDITOR_X_BEARER_TOKEN",
+        QStringLiteral("x_video/bearer_token"),
+        QString(),
+        /*emitWarning=*/true);
     return cfg;
 }
 

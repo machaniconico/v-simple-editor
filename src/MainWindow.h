@@ -16,6 +16,7 @@
 #include <QHash>
 #include <QVector>
 #include <QPair>
+#include <QPointer>
 #include <QRectF>
 #include <QString>
 #include "ProjectSettings.h"
@@ -68,6 +69,7 @@
 #include "RemotionExport.h"
 #include "WelcomeWidget.h"
 #include "HistoryDockWidget.h"
+#include "CommandSearch.h"
 #include "SmartReframe.h"
 #include "LoudnessAnalyzer.h"
 #include "SubtitleTrackRenderer.h"
@@ -99,11 +101,16 @@ class AudioClipEditor;
 class ShortcutCustomizeDialog;
 class SocialExportDialog;
 class CaptionEditorDialog;
+class WhisperTranscribeDialog;
+class TranscriptHighlightDialog;
+class AutoClipDialog;
+class CommandPaletteDialog;
 class MobileExportDialog;
 class ImportHubDialog;
 class VimeoUploadDialog;
 class TwitchStreamDialog;
 class CloudRenderDialog;
+class CredentialDialog;
 class SmartEditDialog;
 
 // US-INT-2: Sprint 21 — platform expansion / mastering / batch export.
@@ -209,6 +216,7 @@ private slots:
     void newProject();
     void editProjectSettings();
     void openFile();
+    void importVideoFromUrl();
     void saveProject();
     void saveProjectAs();
     void openProject();
@@ -392,12 +400,22 @@ private slots:
 
     // US-SC-B: Sprint 12 — ショートカット設定ダイアログ
     void openShortcutCustomizeDialog();
+    void onShowCredentialDialog();
 
     // US-SC2-B: Sprint 13 — SNS 向けエクスポートダイアログ
     void openSocialExportDialog();
 
     // US-CAP-B: Sprint 14 — 字幕エディタダイアログ
     void openCaptionEditorDialog();
+    // Phase 6 Wave 2 (US-6B-4): 動画→Whisper 文字起こし Dialog を開く
+    void openWhisperTranscribeDialog();
+    // Phase 6 Wave 3 (US-6C-4): 文字起こしからハイライト検出 Dialog を開く
+    void openTranscriptHighlightDialog();
+    // Phase 6 Wave 4 (US-6D-4): ハイライトから自動カット Dialog を開く
+    void openAutoClipDialog();
+    // US-CP-4: コマンドパレット (Ctrl+Shift+P) を開く。全メニュー QAction を
+    // index 化し、CommandPaletteDialog で検索・実行する。
+    void openCommandPalette();
 
     // US-INT-1: Sprint 16 — モバイルデバイス向けエクスポートダイアログ
     void onMobileExport();
@@ -463,6 +481,10 @@ private:
     // re-appends a separator + the 「お気に入りを編集...」 action at the bottom.
     void rebuildFavoritesMenu();
     void setupToolBar();
+    // US-CP-4: menuBar() の全トップメニューを再帰的に辿り、実行可能な QAction
+    // (separator/サブメニュー親を除く) を cmdsearch::CommandEntry に変換して返す。
+    // 同時に m_commandActions を id→QAction で再構築する。
+    QVector<cmdsearch::CommandEntry> buildCommandEntries();
     void setupUI();
     void setupRecentFiles();
     void setupStatusBarWidgets();
@@ -562,6 +584,10 @@ private:
     RenderQueue *m_renderQueue = nullptr;
     ScreenRecorder *m_screenRecorder = nullptr;
     AIHighlight *m_aiHighlight = nullptr;
+    // Phase 6 Wave 4 (US-6D-4): 直近の文字起こしハイライト検出結果。
+    // openTranscriptHighlightDialog() の detect 成功時に保存し、
+    // openAutoClipDialog() で自動カット範囲の計算ソースに使う。
+    QVector<Highlight> m_lastHighlights;
 
     // US-SNS-7: SNS pack members
     SmartReframe m_smartReframe;
@@ -654,6 +680,11 @@ private:
     // "メニューの説明を表示" preference.
     QVector<QPair<QAction *, QString>> m_menuHelpEntries;
 
+    // US-CP-4: コマンドパレットの id→QAction マップ。openCommandPalette() の
+    // たびに buildCommandEntries() で再構築され、commandTriggered(id) を受けて
+    // 対応する QAction を trigger() する。
+    QHash<QString, QAction *> m_commandActions;
+
     // User-customizable "お気に入り" menu support.
     // FavoritableAction::id is a STABLE string (e.g. "file.new", "edit.split")
     // — never the translated text — so the persisted favorites list survives
@@ -690,6 +721,7 @@ private:
     // is a lightweight QDialog wrapper around an AudioClipEditor widget.
     class AIMaskDialog *m_aiMaskDialog = nullptr;
     class QDialog *m_audioClipEditorDialog = nullptr;
+    QPointer<CredentialDialog> m_credentialDialog = nullptr;
 
     // US-PT-B: Sprint 15 — Planar (4-corner) tracker dialog, kept alive between invocations.
     PlanarTrackerDialog *m_planarTrackerDialog = nullptr;

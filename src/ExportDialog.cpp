@@ -1,12 +1,18 @@
 #include "ExportDialog.h"
 #include "CodecDetector.h"
+#include "PremiereXmlExporter.h"
+#include "YoutubeChapterGen.h"
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QFormLayout>
 #include <QGroupBox>
 #include <QDialogButtonBox>
 #include <QFileDialog>
+#include <QFileInfo>
+#include <QMessageBox>
 #include <QStandardItemModel>
+#include <QClipboard>
+#include <QGuiApplication>
 
 QString ExportConfig::codecDisplayName() const
 {
@@ -57,6 +63,15 @@ ExportDialog::ExportDialog(const ProjectConfig &project, QWidget *parent)
 void ExportDialog::setupUI()
 {
     auto *mainLayout = new QVBoxLayout(this);
+
+    // Export Type (Video encode vs Premiere XML)
+    auto *typeGroup = new QGroupBox("Export Type");
+    auto *typeLayout = new QVBoxLayout(typeGroup);
+    m_exportTypeCombo = new QComboBox(this);
+    m_exportTypeCombo->addItem("動画ファイル (Video)", static_cast<int>(ExportType::Video));
+    m_exportTypeCombo->addItem("Premiere Pro XML (FCP7)", static_cast<int>(ExportType::PremiereXml));
+    typeLayout->addWidget(m_exportTypeCombo);
+    mainLayout->addWidget(typeGroup);
 
     // Preset
     auto *presetGroup = new QGroupBox("Export Preset");
@@ -202,6 +217,25 @@ void ExportDialog::setupUI()
     m_summaryLabel->setStyleSheet("color: #666; font-size: 12px; padding: 4px;");
     mainLayout->addWidget(m_summaryLabel);
 
+    // YouTube chapter generator (概要欄チャプター)
+    auto *chapterGroup = new QGroupBox(tr("YouTube チャプター"), this);
+    auto *chapterLayout = new QVBoxLayout(chapterGroup);
+    m_chapterCheckbox = new QCheckBox(tr("YouTube 概要欄チャプターを生成"), this);
+    // 空タイムラインでは生成不能なので初期は無効。setClips() で clips が
+    // 入った時点で有効化する。
+    m_chapterCheckbox->setEnabled(!m_clips.isEmpty());
+    chapterLayout->addWidget(m_chapterCheckbox);
+    m_chapterText = new QPlainTextEdit(this);
+    m_chapterText->setReadOnly(true);
+    m_chapterText->setPlaceholderText(tr("チェックを入れると、タイムライン上のクリップから概要欄用チャプターを生成します。"));
+    m_chapterText->setMaximumHeight(140);
+    m_chapterText->setVisible(false);
+    chapterLayout->addWidget(m_chapterText);
+    m_chapterCopyBtn = new QPushButton(tr("クリップボードにコピー"), this);
+    m_chapterCopyBtn->setVisible(false);
+    chapterLayout->addWidget(m_chapterCopyBtn);
+    mainLayout->addWidget(chapterGroup);
+
     // Buttons
     auto *buttons = new QDialogButtonBox(this);
     auto *exportBtn = buttons->addButton("Export", QDialogButtonBox::AcceptRole);
@@ -209,6 +243,7 @@ void ExportDialog::setupUI()
     mainLayout->addWidget(buttons);
 
     // Connections
+    connect(m_exportTypeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &ExportDialog::onExportTypeChanged);
     connect(m_presetCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &ExportDialog::onPresetChanged);
     connect(browseBtn, &QPushButton::clicked, this, &ExportDialog::onBrowseOutput);
     connect(exportBtn, &QPushButton::clicked, this, &ExportDialog::onExport);
@@ -223,8 +258,47 @@ void ExportDialog::setupUI()
         updateSummary();
     });
 
+    connect(m_chapterCheckbox, &QCheckBox::toggled, this, [this](bool on) {
+        m_chapterText->setVisible(on);
+        m_chapterCopyBtn->setVisible(on);
+        if (on)
+            regenerateChapters();
+    });
+    connect(m_chapterCopyBtn, &QPushButton::clicked, this, [this]() {
+        if (QClipboard *cb = QGuiApplication::clipboard())
+            cb->setText(m_chapterText->toPlainText());
+    });
+
     onPresetChanged(0);
     updateSummary();
+}
+
+void ExportDialog::regenerateChapters()
+{
+    QList<ChapterHighlight> highlights;
+    double timelinePos = 0.0;
+    for (const ClipInfo &clip : m_clips) {
+        timelinePos += clip.leadInSec;
+        ChapterHighlight h;
+        h.startSec = timelinePos;
+        h.title = clip.displayName;
+        highlights.append(h);
+
+        // タイムライン上の尺は ClipInfo::effectiveDuration() が SSOT:
+        // ((outPoint>0?outPoint:duration) - inPoint) / speed。
+        // トリム済みクリップ (inPoint>0, outPoint==0) でも後続チャプターの
+        // 開始時刻がタイムラインとずれない。
+        timelinePos += clip.effectiveDuration();
+    }
+
+    if (highlights.isEmpty()) {
+        m_chapterText->setPlainText(
+            tr("タイムラインにクリップがありません。先に素材を配置してください。"));
+        return;
+    }
+
+    m_chapterText->setPlainText(
+        YoutubeChapterGen::generateChapterText(highlights, timelinePos));
 }
 
 void ExportDialog::onPresetChanged(int index)
@@ -289,16 +363,35 @@ void ExportDialog::setSourceIsHdr(bool hdr)
     }
 }
 
+void ExportDialog::onExportTypeChanged(int index)
+{
+    const auto type = static_cast<ExportType>(m_exportTypeCombo->itemData(index).toInt());
+    const bool isVideo = (type == ExportType::Video);
+
+    // Codec / preset controls are only relevant for video encode
+    if (m_presetCombo) m_presetCombo->setEnabled(isVideo);
+    if (m_videoCodecCombo) m_videoCodecCombo->setEnabled(isVideo);
+    if (m_audioCodecCombo) m_audioCodecCombo->setEnabled(isVideo);
+    if (m_videoBitrateSpin) m_videoBitrateSpin->setEnabled(isVideo);
+    if (m_audioBitrateSpin) m_audioBitrateSpin->setEnabled(isVideo);
+    if (m_hwEncoderCombo) m_hwEncoderCombo->setEnabled(isVideo);
+}
+
 void ExportDialog::onBrowseOutput()
 {
-    QString ext = defaultExtension();
+    const auto type = static_cast<ExportType>(m_exportTypeCombo->currentData().toInt());
     QString filter;
-    if (ext == "mp4") filter = "MP4 (*.mp4)";
-    else if (ext == "mkv") filter = "MKV (*.mkv)";
-    else if (ext == "webm") filter = "WebM (*.webm)";
-    else filter = "All Files (*)";
+    if (type == ExportType::PremiereXml) {
+        filter = "Premiere XML (*.xml)";
+    } else {
+        QString ext = defaultExtension();
+        if (ext == "mp4") filter = "MP4 (*.mp4)";
+        else if (ext == "mkv") filter = "MKV (*.mkv)";
+        else if (ext == "webm") filter = "WebM (*.webm)";
+        else filter = "All Files (*)";
+    }
 
-    QString path = QFileDialog::getSaveFileName(this, "Export Video", QString(), filter);
+    QString path = QFileDialog::getSaveFileName(this, "Export", QString(), filter);
     if (!path.isEmpty())
         m_outputEdit->setText(path);
 }
@@ -310,6 +403,42 @@ void ExportDialog::onExport()
         if (m_outputEdit->text().isEmpty()) return;
     }
 
+    const auto exportType = static_cast<ExportType>(m_exportTypeCombo->currentData().toInt());
+
+    if (exportType == ExportType::PremiereXml) {
+        // Premiere Pro XML (FCP7) export via PremiereXmlExporter
+        const QString outputPath = m_outputEdit->text();
+
+        QList<PremiereHighlight> highlights;
+        for (const auto &clip : m_clips) {
+            PremiereHighlight h;
+            h.filePath = clip.filePath;
+            h.title    = clip.displayName.isEmpty() ? QFileInfo(clip.filePath).baseName() : clip.displayName;
+            h.startSec = clip.inPoint;
+            h.endSec   = (clip.outPoint > 0.0) ? clip.outPoint : clip.duration;
+            highlights.append(h);
+        }
+
+        PremiereVideoInfo info;
+        info.width  = m_projectConfig.width;
+        info.height = m_projectConfig.height;
+        info.fps    = static_cast<double>(m_projectConfig.fps);
+
+        const bool ok = PremiereXmlExporter::generateCombinedXml(
+            highlights, info, outputPath,
+            QStringLiteral("v-simple-editor Project"));
+
+        if (!ok) {
+            QMessageBox::warning(this, tr("Export"),
+                                 tr("Premiere XML エクスポートに失敗しました"));
+            return;
+        }
+
+        accept();
+        return;
+    }
+
+    // --- 既存 Video encode path ---
     m_config.outputPath = m_outputEdit->text();
     m_config.videoCodec = m_videoCodecCombo->currentData().toString();
     m_config.audioCodec = m_audioCodecCombo->currentData().toString();

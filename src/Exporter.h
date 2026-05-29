@@ -3,6 +3,7 @@
 #include <QObject>
 #include <QThread>
 #include "ExportDialog.h"
+#include "PremiereXmlExporter.h"
 #include "Timeline.h"
 
 class SmartReframe;
@@ -46,6 +47,14 @@ public:
     void setSmartReframe(SmartReframe *reframe);
     void setSubtitleRenderer(SubtitleTrackRenderer *renderer);
     void setLoudnessGainDb(double gainDb);
+
+    // Premiere Pro XML (FCP7) export dispatcher.
+    // Converts clips to PremiereHighlight list and calls PremiereXmlExporter::generateCombinedXml.
+    // Returns true on success; false on failure (caller should show QMessageBox::warning).
+    static bool exportAsPremiereXml(const QVector<ClipInfo> &clips,
+                                    const ExportConfig &config,
+                                    const QString &outputPath,
+                                    const QString &projectName = QStringLiteral("v-simple-editor Project"));
 
 signals:
     void progressChanged(int percent);

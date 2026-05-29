@@ -84,3 +84,24 @@ remotion_export/
 
 # User settings (optional - uncomment to ignore)
 # settings.ini
+
+# OMC orchestration state
+.omc/
+.claude/worktrees/
+
+# Out-of-tree / scratch build dirs (the canonical one is build/, see top)
+build_*/
+build-*/
+/CMakeCache.txt
+/CMakeFiles/
+build_*.txt
+build_out.txt
+
+# Scratch harnesses / probes / dumps
+/_*
+/NUL
+/progress.txt
+*.diff
+
+# Test fixtures (kept local, not versioned)
+test_assets/

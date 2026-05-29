@@ -61,10 +61,18 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/libavcore/Decode.cpp
     src/libavcore/VideoFilterGraph.h
     src/libavcore/VideoFilterGraph.cpp
+    src/libavcore/AudioExtract.h
+    src/libavcore/AudioExtract.cpp
 
     # PRD-SPLIT-MAIN-1: selftest registry (table + dispatch helpers).
     src/selftests/SelftestRegistry.h
     src/selftests/SelftestRegistry.cpp
+
+    # PRD-PHASE5B-OAUTH-MOCK-HARNESS: localhost OAuth/upload mock server for e2e selftests.
+    src/selftests/oauth_mock_server.h
+    src/selftests/oauth_mock_server.cpp
+    src/selftests/oauth_refresh_e2e_selftest.cpp
+    src/selftests/cred_audit_log_selftest.cpp
 
     # PRD-SPLIT-MAIN-2 Phase 1: preset selftests (moved from src/main.cpp).
     src/selftests/preset_selftests.cpp
@@ -114,8 +122,31 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/EffectParamSchema.h
     src/EffectParamSchema.cpp
     src/VideoEffectDialogs.cpp
-    src/ColorWheelWidget.cpp
     src/ColorGradingPanel.cpp
+    src/ColorWheelWidget.cpp
+    src/CredentialDialog.cpp
+    src/CredentialVault.h
+    src/CredentialVault.cpp
+    src/CredentialAuditLog.h
+    src/CredentialAuditLog.cpp
+    src/PremiereXmlExporter.h
+    src/PremiereXmlExporter.cpp
+    src/YtdlpDownloadDialog.h
+    src/YtdlpDownloadDialog.cpp
+    src/YtdlpDownloader.h
+    src/YtdlpDownloader.cpp
+    src/YoutubeChapterGen.h
+    src/YoutubeChapterGen.cpp
+    src/selftests/ytdlp_downloader_selftest.cpp
+    src/selftests/premiere_xml_selftest.cpp
+    src/selftests/youtube_chapter_selftest.cpp
+    src/selftests/auto_clip_gen_selftest.cpp
+    src/selftests/command_search_selftest.cpp
+    src/CommandSearch.h
+    src/CommandSearch.cpp
+    src/CommandPaletteDialog.h
+    src/CommandPaletteDialog.cpp
+    src/CredentialStore.cpp
     src/EffectControlsPanel.h
     src/EffectControlsPanel.cpp
     src/MotionSectionWidget.h
@@ -183,8 +214,18 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/SubtitleIO.cpp
     src/CaptionEditorDialog.h
     src/CaptionEditorDialog.cpp
+    src/TranscriptHighlighter.h
+    src/TranscriptHighlighter.cpp
+    src/TranscriptHighlightDialog.h
+    src/TranscriptHighlightDialog.cpp
     src/SpeechRecognizer.h
     src/SpeechRecognizer.cpp
+    src/WhisperTranscriber.h
+    src/WhisperTranscriber.cpp
+    src/WhisperTranscribeDialog.h
+    src/WhisperTranscribeDialog.cpp
+    src/selftests/whisper_transcribe_selftest.cpp
+    src/selftests/transcript_highlighter_selftest.cpp
     src/MotionTracker.cpp
     src/MotionTrackerDialog.h
     src/MotionTrackerDialog.cpp
@@ -252,6 +293,10 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/VoiceOverDialog.h
     src/VoiceOverDialog.cpp
     src/AIHighlight.cpp
+    src/AutoClipGenerator.h
+    src/AutoClipGenerator.cpp
+    src/AutoClipDialog.h
+    src/AutoClipDialog.cpp
     src/AIMask.h
     src/AIMask.cpp
     src/AIMaskDialog.h
@@ -564,7 +609,7 @@ endif()
 if(WIN32)
     # opengl32 — needed for wglGetCurrentDC and the WGL_NV_DX_interop2 entry
     # points (Phase 1e). Qt6::OpenGL is the Qt wrapper, not the system GL.
-    target_link_libraries(${PROJECT_NAME} PRIVATE dbghelp opengl32)
+    target_link_libraries(${PROJECT_NAME} PRIVATE dbghelp opengl32 advapi32)
 endif()
 
 target_compile_definitions(${PROJECT_NAME} PRIVATE

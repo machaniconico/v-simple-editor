@@ -86,6 +86,11 @@ public:
     // Range: bytes=0-<lastByte> 形式から lastByte を取り出す。失敗時 -1。
     static qint64 parseRangeHeaderEnd(const QByteArray& rangeHeaderValue);
 
+    // テスト用 base URL override (空 → 既存 https://www.googleapis.com を使う)。
+    // thread-safe ではない: selftest 起動時に setApiBaseUrl 後、production 経路では使わない想定。
+    static void setApiBaseUrl(const QString& url);
+    static QString apiBaseUrl();
+
 signals:
     // initiateSession 成功時。sessionUri を以降の uploadChunk / queryStatus に渡す。
     void sessionInitiated(const QString& sessionUri);

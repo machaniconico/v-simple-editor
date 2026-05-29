@@ -7,7 +7,15 @@
 #include <QProgressBar>
 #include <QPushButton>
 #include <QLabel>
+#include <QCheckBox>
+#include <QPlainTextEdit>
 #include "ProjectSettings.h"
+#include "Timeline.h"
+
+enum class ExportType {
+    Video,       // 既存 video encode (preset/codec 設定を使う)
+    PremiereXml, // Premiere Pro XML (FCP7) — PremiereXmlExporter を呼出
+};
 
 struct ExportPreset {
     QString name;
@@ -60,21 +68,34 @@ public:
     ExportConfig config() const { return m_config; }
     void setSourceIsHdr(bool hdr);
 
+    // clips を渡すと Premiere XML export / YouTube チャプター生成時に
+    // highlight list を構築する。clips が空ならチャプター生成 checkbox を
+    // 無効化する (空タイムラインでは生成不能のため)。
+    void setClips(const QVector<ClipInfo> &clips) {
+        m_clips = clips;
+        if (m_chapterCheckbox)
+            m_chapterCheckbox->setEnabled(!m_clips.isEmpty());
+    }
+
     static QVector<ExportPreset> presets();
 
 private slots:
     void onPresetChanged(int index);
+    void onExportTypeChanged(int index);
     void onBrowseOutput();
     void onExport();
 
 private:
     void setupUI();
     void updateSummary();
+    void regenerateChapters();
     QString defaultExtension() const;
 
     ExportConfig m_config;
     ProjectConfig m_projectConfig;
+    QVector<ClipInfo> m_clips;
 
+    QComboBox *m_exportTypeCombo = nullptr;
     QComboBox *m_presetCombo;
     QComboBox *m_videoCodecCombo;
     QComboBox *m_audioCodecCombo;
@@ -85,4 +106,8 @@ private:
     QLabel *m_summaryLabel;
     QLabel *m_hdrWarningLabel = nullptr;
     bool m_sourceIsHdr = false;
+
+    QCheckBox *m_chapterCheckbox = nullptr;
+    QPlainTextEdit *m_chapterText = nullptr;
+    QPushButton *m_chapterCopyBtn = nullptr;
 };
