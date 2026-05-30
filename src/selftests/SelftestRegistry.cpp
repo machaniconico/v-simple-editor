@@ -39,6 +39,7 @@ int runCredAuditLogSelftest();
 int runCredTtlSelftest();
 int runCredentialVaultSelftest();
 int runDavinciSelftest();
+int runDolbyVisionSelftest();
 int runE2eSelftest();
 int runEasingSelftest();
 int runExportAuditSelftest();
@@ -163,6 +164,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "SpectralEngine: FFT/STFT/iSTFT round-trip + region attenuation" },
     { "aces-color",        "VEDITOR_ACES_COLOR_SELFTEST",         runAcesColorSelftest,          false,
       "AcesColor: primaries matrices, Bradford, IDT/RRT/ODT round-trip" },
+    { "dolby-vision",      "VEDITOR_DOLBY_VISION_SELFTEST",       runDolbyVisionSelftest,        false,
+      "DolbyVision: PQ ST.2084 math + metadata + DV XML generation" },
     // QApplication-required (needsQApplication=true) ----------------------
     { "parity",            "VEDITOR_PARITY_SELFTEST",             runParitySelftest,             true,
       "Preview vs export pixel-parity (S1-S11, framediff::mse, 10-bit HDR10)" },

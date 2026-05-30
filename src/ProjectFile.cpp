@@ -418,6 +418,9 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
     // PRD-PHASE3-ACES: ACES カラーマネジメント設定永続化
     root["acesPipeline"] = aces::pipelineToJson(data.acesPipeline);
 
+    // PRD-PHASE3-DOLBY-VISION: Dolby Vision メタデータ永続化
+    root["dolbyVision"] = dolbyvision::toJson(data.dolbyVision);
+
     QJsonDocument doc(root);
     QFile file(filePath);
     if (!file.open(QIODevice::WriteOnly))
@@ -694,6 +697,10 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
     // (キー欠落でも空 object → enabled=false 既定=identity、旧 .veditor 後方互換)
     data.acesPipeline = aces::pipelineFromJson(root.value("acesPipeline").toObject());
 
+    // PRD-PHASE3-DOLBY-VISION: Dolby Vision メタデータ永続化
+    // (キー欠落でも空 object → 空メタ既定、旧 .veditor 後方互換)
+    data.dolbyVision = dolbyvision::fromJson(root.value("dolbyVision").toObject());
+
     return true;
 }
 
@@ -955,6 +962,9 @@ QString ProjectFile::toJsonString(const ProjectData &data)
 
     // PRD-PHASE3-ACES: ACES カラーマネジメント設定永続化
     root["acesPipeline"] = aces::pipelineToJson(data.acesPipeline);
+
+    // PRD-PHASE3-DOLBY-VISION: Dolby Vision メタデータ永続化
+    root["dolbyVision"] = dolbyvision::toJson(data.dolbyVision);
 
     QJsonDocument doc(root);
     return QString::fromUtf8(doc.toJson(QJsonDocument::Compact));
@@ -1223,6 +1233,10 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
     // PRD-PHASE3-ACES: ACES カラーマネジメント設定永続化
     // (キー欠落でも空 object → enabled=false 既定=identity、旧 .veditor 後方互換)
     data.acesPipeline = aces::pipelineFromJson(root.value("acesPipeline").toObject());
+
+    // PRD-PHASE3-DOLBY-VISION: Dolby Vision メタデータ永続化
+    // (キー欠落でも空 object → 空メタ既定、旧 .veditor 後方互換)
+    data.dolbyVision = dolbyvision::fromJson(root.value("dolbyVision").toObject());
 
     return true;
 }

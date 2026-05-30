@@ -83,6 +83,7 @@
 #include "MarkerPanelDock.h"       // MK-2: マーカー パネル UI ドック
 #include "AudioBusRouting.h"       // AB-5: オーディオ バス ルーティング SSOT モデル
 #include "AcesColor.h"             // AC-4: ACES カラーマネジメント パイプライン SSOT
+#include "DolbyVisionMetadata.h"   // DV-4: Dolby Vision メタデータ SSOT
 
 class VideoPlayer;
 class Timeline;
@@ -99,6 +100,7 @@ class CameraMotionDialog;
 class SceneCutDialog;
 class AudioDuckingDialog;
 class ColorManagementDialog;   // AC-4: ACES カラーマネジメント ダイアログ
+class DolbyVisionDialog;       // DV-4: Dolby Vision メタデータ ダイアログ
 class ProjectCollectorDialog;
 class HDRSettingsDialog;
 class AIProcessingDialog;
@@ -516,6 +518,11 @@ private slots:
     // m_acesPipeline を編集し、OK で確定する (永続化は project save/load 経由)。
     void openColorManagement();
 
+    // DV-4: Dolby Vision メタデータ設定ダイアログを開く。SSOT である
+    // m_dolbyVision を編集し、OK で確定する (永続化は project save/load 経由)。
+    // ダイアログの「XML をエクスポート...」から DV XML をファイル書き出しする。
+    void openDolbyVision();
+
     // User-customizable "お気に入り" menu — opens FavoritesEditDialog, then
     // persists the chosen action ids to QSettings and rebuilds the menu.
     void editFavorites();
@@ -681,6 +688,10 @@ private:
     // ProjectData::acesPipeline 経由に永続化する。
     // TODO: レンダーパイプライン (プレビュー/エクスポート) への ACES 適用は後続。
     aces::AcesPipeline m_acesPipeline;
+
+    // DV-4: Dolby Vision メタデータの SSOT。DolbyVisionDialog で編集し、
+    // プロジェクト保存/読込で ProjectData::dolbyVision 経由に永続化する。
+    dolbyvision::DolbyVisionMetadata m_dolbyVision;
 
     QDockWidget *m_vfxControlsDock = nullptr;
     LayerCompositor m_layerCompositor;

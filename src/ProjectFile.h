@@ -22,6 +22,7 @@
 #include "MediaPool.h"              // PRD-PHASE1-MEDIA-POOL: mediapool::MediaPool
 #include "AudioBusRouting.h"        // PRD-PHASE2-AUDIO-BUS: audiobus::AudioBusRouting
 #include "AcesColor.h"              // PRD-PHASE3-ACES: aces::AcesPipeline
+#include "DolbyVisionMetadata.h"    // PRD-PHASE3-DOLBY-VISION: dolbyvision::DolbyVisionMetadata
 
 // --- Audio mixer serialization sub-types ---
 
@@ -308,6 +309,9 @@ struct ProjectData {
 
     // PRD-PHASE3-ACES: ACES カラーマネジメント設定永続化
     aces::AcesPipeline acesPipeline;
+
+    // PRD-PHASE3-DOLBY-VISION: Dolby Vision メタデータ永続化
+    dolbyvision::DolbyVisionMetadata dolbyVision;
 };
 
 class ProjectFile

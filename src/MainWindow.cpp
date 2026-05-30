@@ -32,6 +32,7 @@
 #include "SceneCutDialog.h"
 #include "AudioDuckingDialog.h"
 #include "ColorManagementDialog.h"   // AC-4: ACES カラーマネジメント ダイアログ
+#include "DolbyVisionDialog.h"        // DV-4: Dolby Vision メタデータ ダイアログ
 #include "ProjectCollectorDialog.h"
 #include "HDRSettingsDialog.h"
 #include "AIProcessingDialog.h"
@@ -202,6 +203,8 @@
 #include <QInputDialog>
 #include <QCloseEvent>
 #include <QFile>
+#include <QFileDialog>      // DV-4: DV XML 保存ダイアログ
+#include <QTextStream>      // DV-4: DV XML 書き出し
 #include <QFileInfo>
 #include <QDateTime>
 #include <QTimer>
@@ -2544,6 +2547,15 @@ void MainWindow::setupMenuBar()
     m_menuHelpEntries.append({colorManagementAction,
         QStringLiteral("ACES のシーンリファード色管理 (入力/作業/出力色空間) を設定します。")});
 
+    // DV-4: Dolby Vision 動的メタデータ (Level1/2/5/6) の編集 + DV XML エクスポート。
+    auto *dolbyVisionAction = toolsMenu->addAction(
+        QStringLiteral("Dolby Vision メタデータ…"));
+    dolbyVisionAction->setObjectName("action_dolby_vision");
+    connect(dolbyVisionAction, &QAction::triggered,
+            this, &MainWindow::openDolbyVision);
+    m_menuHelpEntries.append({dolbyVisionAction,
+        QStringLiteral("Dolby Vision の動的メタデータ (プロファイル/CLL-FALL/ショット輝度) を編集し、DV XML を書き出します。")});
+
     auto *multiCamSyncAction = toolsMenu->addAction(
         QStringLiteral("マルチカム同期(&M)…"));
     multiCamSyncAction->setObjectName("action_multicam_sync");
@@ -4136,6 +4148,9 @@ void MainWindow::populateProjectData(ProjectData &data)
     // AC-4: ACES カラーマネジメント パイプライン設定を保存。
     data.acesPipeline = m_acesPipeline;
 
+    // DV-4: Dolby Vision メタデータ (プロファイル/L6/ショット) を保存。
+    data.dolbyVision = m_dolbyVision;
+
     data.smartReframe = m_smartReframe.toJson();
     data.subtitleSegments.clear();
     for (const auto &seg : m_subtitleSegments) {
@@ -4379,6 +4394,9 @@ void MainWindow::applyLoadedProjectData(const ProjectData &data, const QString &
     // AC-4: ACES カラーマネジメント パイプライン設定を復元 (SSOT)。
     // ダイアログを次に開いたときにこの状態が初期値となる。
     m_acesPipeline = data.acesPipeline;
+
+    // DV-4: Dolby Vision メタデータを復元 (SSOT)。
+    m_dolbyVision = data.dolbyVision;
 
     updateTitle();
     hideWelcomeScreen();
@@ -10060,6 +10078,63 @@ void MainWindow::openColorManagement()
             : QStringLiteral("無効");
         statusBar()->showMessage(
             QStringLiteral("カラーマネジメント (ACES): %1").arg(state), 4000);
+    }
+}
+
+// DV-4: Dolby Vision メタデータ設定ダイアログ。SSOT である m_dolbyVision を編集対象
+// として渡し、OK のときのみ確定する。確定した設定は project save/load を通じて
+// ProjectData::dolbyVision に永続化される。ダイアログの「XML をエクスポート...」では
+// 現在の UI 状態 (dlg.metadata()) から dolbyvision::toDolbyVisionXml を生成し、
+// QFileDialog で選んだ *.xml へ書き出す。
+void MainWindow::openDolbyVision()
+{
+    DolbyVisionDialog dlg(this);
+    dlg.setMetadata(m_dolbyVision);
+
+    // 「XML をエクスポート...」押下でファイル保存する。dlg はモーダルだが、
+    // signal は exec() のイベントループ内で配送されるため this で受けられる。
+    connect(&dlg, &DolbyVisionDialog::exportXmlRequested, this, [this, &dlg]() {
+        const QString filePath = QFileDialog::getSaveFileName(
+            &dlg, QStringLiteral("Dolby Vision XML をエクスポート"),
+            QString(), QStringLiteral("Dolby Vision XML (*.xml)"));
+        if (filePath.isEmpty())
+            return;
+
+        const dolbyvision::DolbyVisionMetadata meta = dlg.metadata();
+
+        // 書き出し前に整合性を検証 (profile/level/L1 順序/ショット時間 等)。
+        QString validationError;
+        if (!dolbyvision::validate(meta, &validationError)) {
+            statusBar()->showMessage(
+                QStringLiteral("Dolby Vision XML エクスポート失敗: %1")
+                    .arg(validationError), 6000);
+            return;
+        }
+
+        const QString xml = dolbyvision::toDolbyVisionXml(meta, m_projectConfig.fps);
+
+        QFile file(filePath);
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+            statusBar()->showMessage(
+                QStringLiteral("Dolby Vision XML を書き込めませんでした: %1")
+                    .arg(filePath), 6000);
+            return;
+        }
+        QTextStream out(&file);
+        out << xml;
+        file.close();
+
+        statusBar()->showMessage(
+            QStringLiteral("Dolby Vision XML をエクスポートしました: %1")
+                .arg(filePath), 4000);
+    });
+
+    if (dlg.exec() == QDialog::Accepted) {
+        m_dolbyVision = dlg.metadata();
+        statusBar()->showMessage(
+            QStringLiteral("Dolby Vision メタデータ: プロファイル %1 / %2 ショット")
+                .arg(m_dolbyVision.profile)
+                .arg(m_dolbyVision.shots.size()), 4000);
     }
 }
 

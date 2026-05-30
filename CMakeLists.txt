@@ -172,6 +172,11 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/AcesColor.cpp
     src/ColorManagementDialog.cpp
     src/selftests/aces_color_selftest.cpp
+    # DV (Dolby Vision): PQ ST.2084 + 動的メタデータモデル + Dolby Vision XML 生成 + Dialog。
+    src/DolbyVisionMetadata.h
+    src/DolbyVisionMetadata.cpp
+    src/DolbyVisionDialog.cpp
+    src/selftests/dolby_vision_selftest.cpp
     src/SourceMonitorDock.cpp
     src/MarkerPanelDock.cpp
     src/CommandPaletteDialog.h
