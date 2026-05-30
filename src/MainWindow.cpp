@@ -33,6 +33,7 @@
 #include "AudioDuckingDialog.h"
 #include "ColorManagementDialog.h"   // AC-4: ACES カラーマネジメント ダイアログ
 #include "DolbyVisionDialog.h"        // DV-4: Dolby Vision メタデータ ダイアログ
+#include "BroadcastCaptionDialog.h"  // CC-4: 放送CC (CEA-608/708) ダイアログ
 #include "ProjectCollectorDialog.h"
 #include "HDRSettingsDialog.h"
 #include "AIProcessingDialog.h"
@@ -2556,6 +2557,15 @@ void MainWindow::setupMenuBar()
     m_menuHelpEntries.append({dolbyVisionAction,
         QStringLiteral("Dolby Vision の動的メタデータ (プロファイル/CLL-FALL/ショット輝度) を編集し、DV XML を書き出します。")});
 
+    // CC-4: 放送用クローズドキャプション (CEA-608/708) の設定 + SCC エクスポート。
+    auto *broadcastCaptionAction = toolsMenu->addAction(
+        QStringLiteral("放送用クローズドキャプション…"));
+    broadcastCaptionAction->setObjectName("action_broadcast_caption");
+    connect(broadcastCaptionAction, &QAction::triggered,
+            this, &MainWindow::openBroadcastCaption);
+    m_menuHelpEntries.append({broadcastCaptionAction,
+        QStringLiteral("放送納品向けの CEA-608/708 クローズドキャプションを設定し、SCC サイドカーを書き出します。")});
+
     auto *multiCamSyncAction = toolsMenu->addAction(
         QStringLiteral("マルチカム同期(&M)…"));
     multiCamSyncAction->setObjectName("action_multicam_sync");
@@ -4151,6 +4161,9 @@ void MainWindow::populateProjectData(ProjectData &data)
     // DV-4: Dolby Vision メタデータ (プロファイル/L6/ショット) を保存。
     data.dolbyVision = m_dolbyVision;
 
+    // CC-4: 放送用クローズドキャプション (CEA-608/708) を保存。
+    data.broadcastCaption = m_broadcastCaption;
+
     data.smartReframe = m_smartReframe.toJson();
     data.subtitleSegments.clear();
     for (const auto &seg : m_subtitleSegments) {
@@ -4397,6 +4410,9 @@ void MainWindow::applyLoadedProjectData(const ProjectData &data, const QString &
 
     // DV-4: Dolby Vision メタデータを復元 (SSOT)。
     m_dolbyVision = data.dolbyVision;
+
+    // CC-4: 放送用クローズドキャプション (CEA-608/708) を復元 (SSOT)。
+    m_broadcastCaption = data.broadcastCaption;
 
     updateTitle();
     hideWelcomeScreen();
@@ -10135,6 +10151,76 @@ void MainWindow::openDolbyVision()
             QStringLiteral("Dolby Vision メタデータ: プロファイル %1 / %2 ショット")
                 .arg(m_dolbyVision.profile)
                 .arg(m_dolbyVision.shots.size()), 4000);
+    }
+}
+
+// CC-4: 放送用クローズドキャプション (CEA-608/708) 設定ダイアログ。SSOT である
+// m_broadcastCaption を編集対象として渡し、OK のときのみ確定する。既存字幕
+// (m_subtitleSegments) があれば放送 CC の cue 源として CaptionCue へ変換して充填する。
+// 確定した設定は project save/load を通じて ProjectData::broadcastCaption に永続化される。
+// ダイアログの「SCC をエクスポート...」では現在の UI 状態 (dlg.document()) から
+// broadcastcc::exportScc を生成し、QFileDialog で選んだ *.scc へ書き出す。
+void MainWindow::openBroadcastCaption()
+{
+    // 既存字幕 (時刻付きテキスト) があれば放送 CC の cue 源として充填する。
+    // cue が未設定のとき (初回 / 字幕ベース) のみ上書きし、ユーザが SCC 用に
+    // 既に整えた cue は保持する。
+    if (m_broadcastCaption.cues.isEmpty() && !m_subtitleSegments.isEmpty()) {
+        QVector<broadcastcc::CaptionCue> cues;
+        cues.reserve(m_subtitleSegments.size());
+        for (const SubtitleSegment &seg : m_subtitleSegments) {
+            broadcastcc::CaptionCue cue;
+            cue.startSec = seg.startTime;
+            cue.endSec = seg.endTime;
+            cue.text = seg.text;
+            // row/col は CaptionCue の既定 (row=15 画面下端, col=0) を使用。
+            cues.append(cue);
+        }
+        m_broadcastCaption.cues = cues;
+    }
+
+    BroadcastCaptionDialog dlg(this);
+    dlg.setDocument(m_broadcastCaption);
+
+    // 「SCC をエクスポート...」押下でファイル保存する。dlg はモーダルだが、
+    // signal は exec() のイベントループ内で配送されるため this で受けられる。
+    connect(&dlg, &BroadcastCaptionDialog::exportSccRequested, this, [this, &dlg]() {
+        const QString filePath = QFileDialog::getSaveFileName(
+            &dlg, QStringLiteral("SCC (Scenarist Closed Caption) をエクスポート"),
+            QString(), QStringLiteral("Scenarist SCC (*.scc)"));
+        if (filePath.isEmpty())
+            return;
+
+        const broadcastcc::BroadcastCaptionDoc doc = dlg.document();
+        if (doc.cues.isEmpty()) {
+            statusBar()->showMessage(
+                QStringLiteral("SCC エクスポート: 字幕 cue がありません"), 6000);
+            return;
+        }
+
+        const QString scc = broadcastcc::exportScc(doc);
+
+        QFile file(filePath);
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+            statusBar()->showMessage(
+                QStringLiteral("SCC を書き込めませんでした: %1").arg(filePath), 6000);
+            return;
+        }
+        QTextStream out(&file);
+        out << scc;
+        file.close();
+
+        statusBar()->showMessage(
+            QStringLiteral("SCC をエクスポートしました: %1").arg(filePath), 4000);
+    });
+
+    if (dlg.exec() == QDialog::Accepted) {
+        m_broadcastCaption = dlg.document();
+        statusBar()->showMessage(
+            QStringLiteral("放送CC: %1 / CC%2 / %3 cue")
+                .arg(m_broadcastCaption.standard)
+                .arg(m_broadcastCaption.channel)
+                .arg(m_broadcastCaption.cues.size()), 4000);
     }
 }
 

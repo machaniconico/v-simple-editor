@@ -421,6 +421,9 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
     // PRD-PHASE3-DOLBY-VISION: Dolby Vision メタデータ永続化
     root["dolbyVision"] = dolbyvision::toJson(data.dolbyVision);
 
+    // PRD-PHASE3-BROADCAST-CC: 放送CC (CEA-608/708) 永続化
+    root["broadcastCaption"] = broadcastcc::toJson(data.broadcastCaption);
+
     QJsonDocument doc(root);
     QFile file(filePath);
     if (!file.open(QIODevice::WriteOnly))
@@ -701,6 +704,10 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
     // (キー欠落でも空 object → 空メタ既定、旧 .veditor 後方互換)
     data.dolbyVision = dolbyvision::fromJson(root.value("dolbyVision").toObject());
 
+    // PRD-PHASE3-BROADCAST-CC: 放送CC (CEA-608/708) 永続化
+    // (キー欠落でも空 object → 空 doc 既定、旧 .veditor 後方互換)
+    data.broadcastCaption = broadcastcc::fromJson(root.value("broadcastCaption").toObject());
+
     return true;
 }
 
@@ -965,6 +972,9 @@ QString ProjectFile::toJsonString(const ProjectData &data)
 
     // PRD-PHASE3-DOLBY-VISION: Dolby Vision メタデータ永続化
     root["dolbyVision"] = dolbyvision::toJson(data.dolbyVision);
+
+    // PRD-PHASE3-BROADCAST-CC: 放送CC (CEA-608/708) 永続化
+    root["broadcastCaption"] = broadcastcc::toJson(data.broadcastCaption);
 
     QJsonDocument doc(root);
     return QString::fromUtf8(doc.toJson(QJsonDocument::Compact));
@@ -1237,6 +1247,10 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
     // PRD-PHASE3-DOLBY-VISION: Dolby Vision メタデータ永続化
     // (キー欠落でも空 object → 空メタ既定、旧 .veditor 後方互換)
     data.dolbyVision = dolbyvision::fromJson(root.value("dolbyVision").toObject());
+
+    // PRD-PHASE3-BROADCAST-CC: 放送CC (CEA-608/708) 永続化
+    // (キー欠落でも空 object → 空 doc 既定、旧 .veditor 後方互換)
+    data.broadcastCaption = broadcastcc::fromJson(root.value("broadcastCaption").toObject());
 
     return true;
 }

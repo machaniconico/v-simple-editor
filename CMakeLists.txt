@@ -177,6 +177,11 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/DolbyVisionMetadata.cpp
     src/DolbyVisionDialog.cpp
     src/selftests/dolby_vision_selftest.cpp
+    # CC (放送 CC): CEA-608/708 + SCC サイドカー純粋エンジン + 編集 Dialog。
+    src/BroadcastCaption.h
+    src/BroadcastCaption.cpp
+    src/BroadcastCaptionDialog.cpp
+    src/selftests/broadcast_caption_selftest.cpp
     src/SourceMonitorDock.cpp
     src/MarkerPanelDock.cpp
     src/CommandPaletteDialog.h

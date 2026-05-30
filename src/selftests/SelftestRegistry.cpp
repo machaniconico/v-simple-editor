@@ -29,6 +29,7 @@ int runAudioRestoreSelftest();
 int runAutoClipGenSelftest();
 int runBatchExportSelftest();
 int runBlenderSelftest();
+int runBroadcastCaptionSelftest();
 int runCaptionSelftest();
 int runChromaSelftest();
 int runCloudRenderSelftest();
@@ -166,6 +167,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "AcesColor: primaries matrices, Bradford, IDT/RRT/ODT round-trip" },
     { "dolby-vision",      "VEDITOR_DOLBY_VISION_SELFTEST",       runDolbyVisionSelftest,        false,
       "DolbyVision: PQ ST.2084 math + metadata + DV XML generation" },
+    { "broadcast-cc",      "VEDITOR_BROADCAST_CC_SELFTEST",       runBroadcastCaptionSelftest,   false,
+      "BroadcastCaption: CEA-608 byte-pair/parity + SCC export + CEA-708 packet" },
     // QApplication-required (needsQApplication=true) ----------------------
     { "parity",            "VEDITOR_PARITY_SELFTEST",             runParitySelftest,             true,
       "Preview vs export pixel-parity (S1-S11, framediff::mse, 10-bit HDR10)" },

@@ -23,6 +23,7 @@
 #include "AudioBusRouting.h"        // PRD-PHASE2-AUDIO-BUS: audiobus::AudioBusRouting
 #include "AcesColor.h"              // PRD-PHASE3-ACES: aces::AcesPipeline
 #include "DolbyVisionMetadata.h"    // PRD-PHASE3-DOLBY-VISION: dolbyvision::DolbyVisionMetadata
+#include "BroadcastCaption.h"       // PRD-PHASE3-BROADCAST-CC: broadcastcc::BroadcastCaptionDoc
 
 // --- Audio mixer serialization sub-types ---
 
@@ -312,6 +313,9 @@ struct ProjectData {
 
     // PRD-PHASE3-DOLBY-VISION: Dolby Vision メタデータ永続化
     dolbyvision::DolbyVisionMetadata dolbyVision;
+
+    // PRD-PHASE3-BROADCAST-CC: 放送CC (CEA-608/708) 永続化
+    broadcastcc::BroadcastCaptionDoc broadcastCaption;
 };
 
 class ProjectFile

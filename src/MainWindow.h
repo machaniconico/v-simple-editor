@@ -84,6 +84,7 @@
 #include "AudioBusRouting.h"       // AB-5: オーディオ バス ルーティング SSOT モデル
 #include "AcesColor.h"             // AC-4: ACES カラーマネジメント パイプライン SSOT
 #include "DolbyVisionMetadata.h"   // DV-4: Dolby Vision メタデータ SSOT
+#include "BroadcastCaption.h"      // CC-4: 放送CC (CEA-608/708) メタデータ SSOT
 
 class VideoPlayer;
 class Timeline;
@@ -101,6 +102,7 @@ class SceneCutDialog;
 class AudioDuckingDialog;
 class ColorManagementDialog;   // AC-4: ACES カラーマネジメント ダイアログ
 class DolbyVisionDialog;       // DV-4: Dolby Vision メタデータ ダイアログ
+class BroadcastCaptionDialog;  // CC-4: 放送CC (CEA-608/708) ダイアログ
 class ProjectCollectorDialog;
 class HDRSettingsDialog;
 class AIProcessingDialog;
@@ -523,6 +525,12 @@ private slots:
     // ダイアログの「XML をエクスポート...」から DV XML をファイル書き出しする。
     void openDolbyVision();
 
+    // CC-4: 放送用クローズドキャプション (CEA-608/708) 設定ダイアログを開く。
+    // SSOT である m_broadcastCaption を編集し、OK で確定する (永続化は
+    // project save/load 経由)。既存字幕があれば cue 源として充填し、ダイアログの
+    // 「SCC をエクスポート...」から SCC サイドカーをファイル書き出しする。
+    void openBroadcastCaption();
+
     // User-customizable "お気に入り" menu — opens FavoritesEditDialog, then
     // persists the chosen action ids to QSettings and rebuilds the menu.
     void editFavorites();
@@ -692,6 +700,11 @@ private:
     // DV-4: Dolby Vision メタデータの SSOT。DolbyVisionDialog で編集し、
     // プロジェクト保存/読込で ProjectData::dolbyVision 経由に永続化する。
     dolbyvision::DolbyVisionMetadata m_dolbyVision;
+
+    // CC-4: 放送用クローズドキャプション (CEA-608/708) の SSOT。
+    // BroadcastCaptionDialog で編集し、プロジェクト保存/読込で
+    // ProjectData::broadcastCaption 経由に永続化する。
+    broadcastcc::BroadcastCaptionDoc m_broadcastCaption;
 
     QDockWidget *m_vfxControlsDock = nullptr;
     LayerCompositor m_layerCompositor;
