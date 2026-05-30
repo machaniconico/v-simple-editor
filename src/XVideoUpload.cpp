@@ -314,7 +314,7 @@ void UploadClient::doStatusPoll(const XUploadConfig &cfg, const QString &mediaId
     }
 
     connect(reply, &QNetworkReply::finished,
-            this, [this, reply, cfg, mediaId, job]() {
+            this, [this, reply, cfg, mediaId, job, attempt]() {
         reply->deleteLater();
         if (reply->error() != QNetworkReply::NoError) {
             emit uploadFailed(
