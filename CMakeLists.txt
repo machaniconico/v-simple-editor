@@ -187,6 +187,10 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/AutoMatte.cpp
     src/AutoMatteDialog.cpp
     src/selftests/auto_matte_selftest.cpp
+    # ED (EDL エクスポート): CMX3600 EDL の純粋書き出しエンジン (放送/Avid/DaVinci 互換)。
+    src/EdlExport.h
+    src/EdlExport.cpp
+    src/selftests/edl_export_selftest.cpp
     src/SourceMonitorDock.cpp
     src/MarkerPanelDock.cpp
     src/CommandPaletteDialog.h

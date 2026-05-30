@@ -42,6 +42,7 @@ int runCredTtlSelftest();
 int runCredentialVaultSelftest();
 int runDavinciSelftest();
 int runDolbyVisionSelftest();
+int runEdlExportSelftest();
 int runE2eSelftest();
 int runEasingSelftest();
 int runExportAuditSelftest();
@@ -172,6 +173,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "BroadcastCaption: CEA-608 byte-pair/parity + SCC export + CEA-708 packet" },
     { "auto-matte",        "VEDITOR_AUTO_MATTE_SELFTEST",         runAutoMatteSelftest,          false,
       "AutoMatte: difference matte, morphology, feather, composite" },
+    { "edl-export",        "VEDITOR_EDL_EXPORT_SELFTEST",         runEdlExportSelftest,          false,
+      "EdlExport: CMX3600 timecode + event lines + drop-frame" },
     // QApplication-required (needsQApplication=true) ----------------------
     { "parity",            "VEDITOR_PARITY_SELFTEST",             runParitySelftest,             true,
       "Preview vs export pixel-parity (S1-S11, framediff::mse, 10-bit HDR10)" },

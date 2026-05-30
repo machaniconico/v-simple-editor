@@ -121,6 +121,9 @@
   #include "FcpxmlExporter.h"
   #define HAVE_FCPXML 1
 #endif
+// ED-3: EdlExport は ED-1 で追加された純粋エンジン (QApplication 不要) なので
+// 常時ビルドに含まれる。HAVE_* ガードは不要で直接 include する。
+#include "EdlExport.h"
 #if __has_include("SmartEditDialog.h")
   #include "SmartEditDialog.h"
   #define HAVE_SMARTEDIT 1
@@ -2486,6 +2489,14 @@ void MainWindow::setupMenuBar()
             this, &MainWindow::openFcpxmlExportDialog);
     m_menuHelpEntries.append({fcpxmlExportAction,
         QStringLiteral("Final Cut Pro X 用の FCPXML を書き出します。")});
+
+    auto *edlExportAction = toolsMenu->addAction(
+        QStringLiteral("EDL (CMX3600) を書き出し(&E)…"));
+    edlExportAction->setObjectName("action_edl_export");
+    connect(edlExportAction, &QAction::triggered,
+            this, &MainWindow::exportEdl);
+    m_menuHelpEntries.append({edlExportAction,
+        QStringLiteral("Avid / DaVinci / 放送ワークフロー互換の CMX3600 EDL を書き出します。")});
 
     auto *smartEditAction = toolsMenu->addAction(
         QStringLiteral("Smart Edit アシスタント(&M)…"));
@@ -9589,6 +9600,79 @@ void MainWindow::openFcpxmlExportDialog()
     QMessageBox::information(this, QStringLiteral("FCPXML 書き出し"),
         QStringLiteral("FcpxmlExporter がビルドに含まれていません。"));
 #endif
+}
+
+// ED-3: CMX3600 EDL 書き出し。V1 (先頭ビデオトラック) のクリップ列を
+// edl::fromClips で中間ドキュメントへ変換し、edl::toCmx3600 で *.edl
+// テキストへ直列化する。EdlExport は純粋エンジンなので HAVE_* ガード不要。
+void MainWindow::exportEdl()
+{
+    if (!m_timeline) {
+        QMessageBox::warning(this, QStringLiteral("EDL 書き出し"),
+            QStringLiteral("タイムラインが初期化されていません。"));
+        return;
+    }
+
+    const QVector<ClipInfo> clips = m_timeline->videoClips();
+    if (clips.isEmpty()) {
+        QMessageBox::warning(this, QStringLiteral("EDL 書き出し"),
+            QStringLiteral("V1 トラックにクリップがありません。\n"
+                           "EDL を書き出すにはクリップを配置してください。"));
+        return;
+    }
+
+    // CMX3600 DF は true NTSC rate のみ。整数 30/60fps projects stay NDF.
+    constexpr double kNtsc2997 = 30000.0 / 1001.0;
+    constexpr double kNtsc5994 = 60000.0 / 1001.0;
+    constexpr double kDropFrameTolerance = 0.005;
+    const double frameRate = m_projectConfig.fps > 0
+        ? static_cast<double>(m_projectConfig.fps)
+        : 30.0;
+    const bool dropFrame = (std::fabs(frameRate - kNtsc2997) < kDropFrameTolerance)
+        || (std::fabs(frameRate - kNtsc5994) < kDropFrameTolerance);
+
+    const QString projectName = m_projectConfig.name.isEmpty()
+        ? QStringLiteral("VEDITOR EDL")
+        : m_projectConfig.name;
+
+    const QString suggestedPath = QDir::homePath() + QDir::separator()
+        + (m_projectConfig.name.isEmpty() ? QStringLiteral("Untitled")
+                                          : m_projectConfig.name)
+        + QStringLiteral(".edl");
+    const QString outPath = QFileDialog::getSaveFileName(
+        this,
+        QStringLiteral("EDL (CMX3600) を書き出し"),
+        suggestedPath,
+        QStringLiteral("EDL Files (*.edl);;All Files (*)"));
+    if (outPath.isEmpty())
+        return;
+
+    const edl::EdlDocument doc =
+        edl::fromClips(clips, projectName, frameRate, dropFrame);
+    const QString text = edl::toCmx3600(doc);
+
+    QFile file(outPath);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        QMessageBox::warning(this, QStringLiteral("EDL 書き出し"),
+            QStringLiteral("ファイルを書き込めませんでした:\n%1")
+                .arg(file.errorString()));
+        return;
+    }
+    const QByteArray bytes = text.toUtf8();
+    const qint64 written = file.write(bytes);
+    if (written != bytes.size()) {
+        QMessageBox::warning(this, QStringLiteral("EDL 書き出し"),
+            QStringLiteral("EDL の書き込みに失敗しました:\n%1")
+                .arg(file.errorString()));
+        return;
+    }
+
+    if (statusBar()) {
+        statusBar()->showMessage(
+            QStringLiteral("EDL (CMX3600) を書き出しました (%1 イベント)")
+                .arg(doc.events.size()),
+            5000);
+    }
 }
 
 void MainWindow::openSmartEditDialog()

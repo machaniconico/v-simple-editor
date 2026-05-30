@@ -491,6 +491,9 @@ private slots:
     void openFrameIoImportDialog();
     void openDavinciExportDialog();
     void openFcpxmlExportDialog();
+    // ED-3: CMX3600 EDL 書き出し。V1 クリップ列を edl::fromClips → toCmx3600 で
+    // *.edl テキストへ直列化する純粋エンジン経由のエクスポート。
+    void exportEdl();
     void openSmartEditDialog();
     void openCloudRenderDialog();
 
