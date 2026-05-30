@@ -55,6 +55,7 @@ void exporter_setAcesPipeline(const aces::AcesPipeline &pipeline);
 #include "WhisperTranscribeDialog.h"
 #include "TranscriptHighlightDialog.h"
 #include "TextBasedEditDialog.h"
+#include "PptxExportDialog.h"   // PPTX: PowerPoint 資料書き出しダイアログ
 #include "TranscriptHighlighter.h"
 #include "AutoClipDialog.h"
 #include "AutoClipGenerator.h"
@@ -2522,6 +2523,15 @@ void MainWindow::setupMenuBar()
             this, &MainWindow::exportEdl);
     m_menuHelpEntries.append({edlExportAction,
         QStringLiteral("Avid / DaVinci / 放送ワークフロー互換の CMX3600 EDL を書き出します。")});
+
+    // PPTX: 文字起こし / マーカー / タイトルから PowerPoint 資料 (.pptx) を書き出す。
+    auto *pptxExportAction = toolsMenu->addAction(
+        QStringLiteral("PowerPoint 資料を書き出し(&P)… (.pptx)"));
+    pptxExportAction->setObjectName("action_pptx_export");
+    connect(pptxExportAction, &QAction::triggered,
+            this, &MainWindow::openPptxExport);
+    m_menuHelpEntries.append({pptxExportAction,
+        QStringLiteral("文字起こし / マーカー / タイトルから PowerPoint スライド資料 (.pptx) を書き出します。")});
 
     auto *smartEditAction = toolsMenu->addAction(
         QStringLiteral("Smart Edit アシスタント(&M)…"));
@@ -8944,6 +8954,35 @@ void MainWindow::openTextBasedEdit()
                         .arg(ranges.size())
                         .arg(deletedSec, 0, 'f', 2));
             });
+
+    dialog.exec();
+}
+
+// PPTX: PowerPoint 資料書き出し配線。
+// 文字起こし結果 (字幕エディタ経由) とタイムラインのマーカーを PptxExportDialog に
+// 渡してモーダル exec()。文字起こしが無くてもタイトル / マーカーで書き出せるため、
+// 案内のみ出して続行可能にする (生成は pptxexport:: 純粋エンジンに委譲)。
+void MainWindow::openPptxExport()
+{
+    PptxExportDialog dialog(this);
+
+    // 文字起こし結果 (openTextBasedEdit と同じ取得経路)。
+    QList<caption::Clip> clips;
+    if (m_captionEditorDialog)
+        clips = m_captionEditorDialog->track().clips();
+    dialog.setCaptions(clips);
+
+    // タイムラインのマーカー一覧 (取れれば章一覧デッキに使う)。
+    if (m_timeline)
+        dialog.setMarkers(m_timeline->markers());
+
+    if (clips.isEmpty()) {
+        // 空でもタイトル / マーカーで書き出せるので、案内のみ出して続行する。
+        QMessageBox::information(this, QStringLiteral("PowerPoint 資料を書き出し"),
+            QStringLiteral("文字起こし結果がありません。\n"
+                           "「タイトルのみ」または「マーカー / 章一覧」での書き出しは可能です。\n"
+                           "文字起こしスライドが必要なら、先に「ツール → 動画を文字起こし...」を実行してください。"));
+    }
 
     dialog.exec();
 }

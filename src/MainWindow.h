@@ -118,6 +118,7 @@ class CaptionEditorDialog;
 class WhisperTranscribeDialog;
 class TranscriptHighlightDialog;
 class TextBasedEditDialog;
+class PptxExportDialog;   // PPTX (PowerPoint 資料書き出し) ダイアログ
 class AutoClipDialog;
 class CommandPaletteDialog;
 class MobileExportDialog;
@@ -460,6 +461,9 @@ private slots:
     // TB-4: テキストベース編集 Dialog を開く。文字起こし結果を一覧表示し、
     // 削除対象に選んだセグメントの区間をタイムラインからリップル削除する。
     void openTextBasedEdit();
+    // PPTX: PowerPoint 資料書き出し Dialog を開く。文字起こし / マーカー / タイトルから
+    // pptxexport::Deck を組み立て、.pptx を書き出す (生成は純粋エンジンに委譲)。
+    void openPptxExport();
     // US-CP-4: コマンドパレット (Ctrl+Shift+P) を開く。全メニュー QAction を
     // index 化し、CommandPaletteDialog で検索・実行する。
     void openCommandPalette();

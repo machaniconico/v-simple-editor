@@ -200,6 +200,11 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/TextBasedEdit.cpp
     src/TextBasedEditDialog.cpp
     src/selftests/text_based_edit_selftest.cpp
+    # PPTX (スライド書き出し): OOXML パートツリー + store-ZIP の純粋エンジン。
+    src/PptxExport.h
+    src/PptxExport.cpp
+    src/PptxExportDialog.cpp
+    src/selftests/pptx_export_selftest.cpp
     src/SourceMonitorDock.cpp
     src/MarkerPanelDock.cpp
     src/CommandPaletteDialog.h

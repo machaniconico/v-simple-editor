@@ -69,6 +69,7 @@ int runPlanarPresetSelftest();
 #define HAVE_PLANARTRACKER_PRESET 1
 #endif
 int runPlatformMockE2eSelftest();
+int runPptxExportSelftest();
 int runProExtSelftest();
 int runProSelftest();
 int runProjTmplSelftest();
@@ -181,6 +182,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "WorkspaceManager: named layout CRUD + base64 blob JSON round-trip" },
     { "text-based-edit",   "VEDITOR_TEXT_BASED_EDIT_SELFTEST",    runTextBasedEditSelftest,      false,
       "TextBasedEdit: transcript search + deletion range merge + kept complement" },
+    { "pptx-export",      "VEDITOR_PPTX_EXPORT_SELFTEST",        runPptxExportSelftest,         false,
+      "PptxExport: OOXML part tree + store-ZIP/CRC32 + slide XML well-formed + escaping" },
     // QApplication-required (needsQApplication=true) ----------------------
     { "parity",            "VEDITOR_PARITY_SELFTEST",             runParitySelftest,             true,
       "Preview vs export pixel-parity (S1-S11, framediff::mse, 10-bit HDR10)" },
