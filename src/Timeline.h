@@ -250,6 +250,15 @@ public:
     // 新クリップを T 開始に配置する。
     void overwriteClip3Point(double timelineStartSec, const ClipInfo &clip);
 
+    // TB-3: タイムラインの時間範囲 [startSec, endSec) をリップル削除する。
+    // 範囲境界で splitClipAt して跨ぐクリップを分割し、範囲内に完全に収まる
+    // クリップを削除した後、後続クリップ全体を削除長ぶん左へ詰める (ripple)。
+    // 文字起こし駆動編集 (textedit::deletionRanges) の各削除区間を適用する口。
+    // 空 / 範囲外 / startSec>=endSec は安全に no-op。既存の点/挿入/上書き挙動は
+    // 壊さず、insertClip3Point/overwriteClip3Point と同じプリミティブを再利用する。
+    // 戻り値はトラック内容または leadInSec が実際に変わったか。
+    bool rippleDeleteTimeRange(double startSec, double endSec);
+
     struct DropPlan {
         bool valid = false;
         int insertIdx = -1;
@@ -538,6 +547,13 @@ public:
     // 配置し、saveUndoState で 1 操作 = 1 Undo にまとめる。
     void insertClip3PointActive(double timelineStartSec, const ClipInfo &clip);
     void overwriteClip3PointActive(double timelineStartSec, const ClipInfo &clip);
+
+    // TB-3: アクティブ動画トラック (m_activeVideoTrackIndex、無ければ先頭 V1) の
+    // タイムライン時間範囲 [startSec, endSec) をリップル削除する薄いラッパー。
+    // 文字起こし駆動編集ダイアログが複数の削除区間を適用する際は、インデックス/
+    // 時刻ズレを避けるため呼び出し側が降順 (後ろの区間から) で呼ぶ前提でよいが、
+    // 単一区間の正しさはここで保証する。1 操作 = 1 Undo (saveUndoState)。
+    void rippleDeleteTimeRangeActive(double startSec, double endSec);
 
     // TR-3: アクティブ動画トラックの現在選択中クリップへ trimops の
     // トリムを適用する薄いラッパー。Roll は選択クリップとその次クリップの編集点

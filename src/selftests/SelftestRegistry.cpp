@@ -79,6 +79,7 @@ int runSmartEditSelftest();
 int runSocialSelftest();
 int runSpectralEditSelftest();
 int runSubXlatSelftest();
+int runTextBasedEditSelftest();
 int runTextExportSelftest();
 int runThreePointEditSelftest();
 int runTrackMatteExportIntegrationSelftest();
@@ -178,6 +179,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "EdlExport: CMX3600 timecode + event lines + drop-frame" },
     { "workspace",         "VEDITOR_WORKSPACE_SELFTEST",          runWorkspaceSelftest,          false,
       "WorkspaceManager: named layout CRUD + base64 blob JSON round-trip" },
+    { "text-based-edit",   "VEDITOR_TEXT_BASED_EDIT_SELFTEST",    runTextBasedEditSelftest,      false,
+      "TextBasedEdit: transcript search + deletion range merge + kept complement" },
     // QApplication-required (needsQApplication=true) ----------------------
     { "parity",            "VEDITOR_PARITY_SELFTEST",             runParitySelftest,             true,
       "Preview vs export pixel-parity (S1-S11, framediff::mse, 10-bit HDR10)" },

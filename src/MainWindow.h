@@ -117,6 +117,7 @@ class SocialExportDialog;
 class CaptionEditorDialog;
 class WhisperTranscribeDialog;
 class TranscriptHighlightDialog;
+class TextBasedEditDialog;
 class AutoClipDialog;
 class CommandPaletteDialog;
 class MobileExportDialog;
@@ -456,6 +457,9 @@ private slots:
     void openTranscriptHighlightDialog();
     // Phase 6 Wave 4 (US-6D-4): ハイライトから自動カット Dialog を開く
     void openAutoClipDialog();
+    // TB-4: テキストベース編集 Dialog を開く。文字起こし結果を一覧表示し、
+    // 削除対象に選んだセグメントの区間をタイムラインからリップル削除する。
+    void openTextBasedEdit();
     // US-CP-4: コマンドパレット (Ctrl+Shift+P) を開く。全メニュー QAction を
     // index 化し、CommandPaletteDialog で検索・実行する。
     void openCommandPalette();

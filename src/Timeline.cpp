@@ -904,6 +904,93 @@ void TimelineTrack::overwriteClip3Point(double timelineStartSec, const ClipInfo 
     // 各プリミティブが update() / emit modified() を内包しているので追加処理は不要。
 }
 
+bool TimelineTrack::rippleDeleteTimeRange(double startSec, double endSec)
+{
+    // TB-3: タイムラインの [startSec, endSec) を削除し、後続クリップを左へ詰める。
+    // 既存の split/remove プリミティブだけで構成し、時間↔leadInSec モデルは
+    // effectiveDuration() / leadInSec の積み上げ (insertClip3Point などと同じ規約)
+    // に従う。境界は安全に no-op。
+    constexpr double kEps = 1e-6;
+    if (m_clips.isEmpty())
+        return false;
+    if (endSec - startSec <= kEps)   // 空 / 反転 / 微小範囲
+        return false;
+    if (startSec < 0.0) startSec = 0.0;
+    if (endSec - startSec <= kEps)
+        return false;
+
+    bool changed = false;
+
+    // (1) 範囲境界で跨ぐクリップを分割する。overwriteClip3Point と同じく、
+    //     末尾境界 (endSec) を先に分割してから先頭境界 (startSec) を分割すると、
+    //     先頭分割で生じる +1 インデックスズレが末尾側に波及しない。
+    //     splitClipAt は clip-local 秒を取るので、各クリップのタイムライン開始時刻を
+    //     leadInSec 積み上げで求め、ローカル秒へ換算する。
+    auto splitAtTimelineSec = [&](double t) {
+        double cursor = 0.0;
+        for (int i = 0; i < m_clips.size(); ++i) {
+            const double clipStart = cursor + m_clips[i].leadInSec;
+            const double clipEnd = clipStart + m_clips[i].effectiveDuration();
+            if (t > clipStart + kEps && t < clipEnd - kEps) {
+                const int beforeCount = m_clips.size();
+                splitClipAt(i, t - clipStart);   // clip-local 秒
+                if (m_clips.size() != beforeCount)
+                    changed = true;
+                return;
+            }
+            cursor = clipEnd;
+        }
+    };
+    splitAtTimelineSec(endSec);
+    splitAtTimelineSec(startSec);
+
+    // (2) [startSec, endSec) に完全に収まるクリップ群を末尾側から削除する。
+    //     removeClipPreservingDownstream は削除クリップの footprint を次クリップの
+    //     leadInSec に押し込むため、この時点では後続の絶対位置は保たれる
+    //     (= 削除区間が空ギャップとして残る)。後ろから消すのは前から消すと
+    //     後続インデックスがズレるため。
+    QVector<int> toRemove;
+    {
+        double cursor = 0.0;
+        for (int i = 0; i < m_clips.size(); ++i) {
+            const double clipStart = cursor + m_clips[i].leadInSec;
+            const double clipEnd = clipStart + m_clips[i].effectiveDuration();
+            if (clipStart >= startSec - kEps && clipEnd <= endSec + kEps)
+                toRemove.append(i);
+            cursor = clipEnd;
+        }
+    }
+    if (!toRemove.isEmpty())
+        changed = true;
+    for (int j = toRemove.size() - 1; j >= 0; --j)
+        removeClipPreservingDownstream(toRemove[j]);
+
+    // (3) リップル: 削除区間ぶん後続クリップを左へ詰める。削除区間の直後に
+    //     位置するクリップ (タイムライン開始が startSec 以降の最初のクリップ) の
+    //     leadInSec から削除長を引く。removeClipPreservingDownstream が空きを
+    //     leadInSec に積んでいるので、ここで引くと後続全体が左シフトする。
+    const double deletedLen = endSec - startSec;
+    double cursor = 0.0;
+    for (int i = 0; i < m_clips.size(); ++i) {
+        const double clipStart = cursor + m_clips[i].leadInSec;
+        if (clipStart >= startSec - kEps) {
+            double &lead = m_clips[i].leadInSec;
+            const double newLead = qMax(0.0, lead - deletedLen);
+            if (qAbs(newLead - lead) > kEps) {
+                lead = newLead;
+                changed = true;
+            }
+            break;
+        }
+        cursor = clipStart + m_clips[i].effectiveDuration();
+    }
+
+    if (!changed)
+        return false;
+    updateMinimumWidth(); update(); emit modified();
+    return true;
+}
+
 TimelineTrack::DropPlan TimelineTrack::planDrop(double dropTime, double clipDuration) const
 {
     DropPlan plan{};
@@ -4249,6 +4336,25 @@ void Timeline::overwriteClip3PointActive(double timelineStartSec, const ClipInfo
     auto *track = m_videoTracks.first();
     track->overwriteClip3Point(timelineStartSec, clip);
     saveUndoState("3点編集: 上書き");
+}
+
+void Timeline::rippleDeleteTimeRangeActive(double startSec, double endSec)
+{
+    if (m_videoTracks.isEmpty())
+        return;
+    // アクティブ動画トラック (無ければ先頭 V1) を選ぶ。
+    TimelineTrack *track = nullptr;
+    if (m_activeVideoTrackIndex >= 0
+        && m_activeVideoTrackIndex < m_videoTracks.size())
+        track = m_videoTracks[m_activeVideoTrackIndex];
+    if (!track)
+        track = m_videoTracks.first();
+    if (!track)
+        return;
+    const bool changed = track->rippleDeleteTimeRange(startSec, endSec);
+    // no-op だった場合 (範囲外/空) は Undo スナップショットを積まない。
+    if (changed)
+        saveUndoState("リップル削除 (範囲)");
 }
 
 bool Timeline::applyTrimActive(trimops::TrimType type, double deltaSec,

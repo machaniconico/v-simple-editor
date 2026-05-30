@@ -54,6 +54,7 @@ void exporter_setAcesPipeline(const aces::AcesPipeline &pipeline);
 #include "CaptionEditorDialog.h"
 #include "WhisperTranscribeDialog.h"
 #include "TranscriptHighlightDialog.h"
+#include "TextBasedEditDialog.h"
 #include "TranscriptHighlighter.h"
 #include "AutoClipDialog.h"
 #include "AutoClipGenerator.h"
@@ -2261,6 +2262,15 @@ void MainWindow::setupMenuBar()
             this, &MainWindow::openAutoClipDialog);
     m_menuHelpEntries.append({autoClipAction,
         QStringLiteral("検出済みハイライトから自動でカット範囲を計算し、タイムラインに追加します。")});
+
+    // TB-4: テキストベース編集 (文字起こし駆動のリップル削除)
+    auto *textBasedEditAction = toolsMenu->addAction(QStringLiteral("テキストベース編集..."));
+    textBasedEditAction->setObjectName("action_text_based_edit");
+    connect(textBasedEditAction, &QAction::triggered,
+            this, &MainWindow::openTextBasedEdit);
+    m_menuHelpEntries.append({textBasedEditAction,
+        QStringLiteral("文字起こし結果を文章のように一覧表示し、削除したいセリフの区間を"
+                       "選んでタイムラインからまとめてリップル削除します (Descript 風)。")});
 
     auto *silenceAction = toolsMenu->addAction("無音検出...");
     connect(silenceAction, &QAction::triggered, this, &MainWindow::autoSilenceDetect);
@@ -8889,6 +8899,53 @@ void MainWindow::openTranscriptHighlightDialog()
     statusBar()->showMessage(summary);
     QMessageBox::information(this, QStringLiteral("文字起こしからハイライト検出"),
                             summary + QStringLiteral("\n\n") + lines.join(QLatin1Char('\n')));
+}
+
+// TB-4: テキストベース編集配線。
+// 現在の文字起こし結果 (字幕エディタが保持する caption::Track) を
+// TextBasedEditDialog に渡してモーダル exec()。文字起こしが無ければ案内して終了する。
+// applyDeletions(各削除区間) を受けたら、後続区間の時刻ズレを避けるため
+// 降順 (末尾の区間から) で Timeline::rippleDeleteTimeRangeActive に適用する。
+void MainWindow::openTextBasedEdit()
+{
+    // 最新の文字起こし結果を字幕エディタ経由で取得 (Whisper 文字起こしが
+    // openCaptionEditorDialog 経由で setTrack 済みの想定)。
+    QList<caption::Clip> clips;
+    if (m_captionEditorDialog)
+        clips = m_captionEditorDialog->track().clips();
+
+    if (clips.isEmpty()) {
+        QMessageBox::information(this, QStringLiteral("テキストベース編集"),
+            QStringLiteral("文字起こし結果がありません。\n"
+                           "先に「ツール → 動画を文字起こし...」を実行してください。"));
+        return;
+    }
+
+    TextBasedEditDialog dialog(this);
+    dialog.setTranscript(clips);
+
+    connect(&dialog, &TextBasedEditDialog::applyDeletions, this,
+            [this](const QVector<textedit::TimeRange> &ranges) {
+                if (!m_timeline)
+                    return;
+                // 前から消すと後続区間の時刻がずれるため、末尾の区間から順に適用する。
+                qint64 totalDeletedMs = 0;
+                for (int i = ranges.size() - 1; i >= 0; --i) {
+                    const textedit::TimeRange &r = ranges.at(i);
+                    if (r.isEmpty())
+                        continue;
+                    m_timeline->rippleDeleteTimeRangeActive(r.startMs / 1000.0,
+                                                            r.endMs / 1000.0);
+                    totalDeletedMs += r.durationMs();
+                }
+                const double deletedSec = totalDeletedMs / 1000.0;
+                statusBar()->showMessage(
+                    QStringLiteral("テキストベース編集: %1 区間 (合計 %2 秒) をリップル削除しました。")
+                        .arg(ranges.size())
+                        .arg(deletedSec, 0, 'f', 2));
+            });
+
+    dialog.exec();
 }
 
 // Phase 6 Wave 4 (US-6D-4): ハイライトから自動カット配線。
