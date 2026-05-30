@@ -21,6 +21,7 @@
 #include "AIProcessingDialog.h"     // AIProcessingSettings struct
 #include "MediaPool.h"              // PRD-PHASE1-MEDIA-POOL: mediapool::MediaPool
 #include "AudioBusRouting.h"        // PRD-PHASE2-AUDIO-BUS: audiobus::AudioBusRouting
+#include "AcesColor.h"              // PRD-PHASE3-ACES: aces::AcesPipeline
 
 // --- Audio mixer serialization sub-types ---
 
@@ -304,6 +305,9 @@ struct ProjectData {
 
     // PRD-PHASE2-AUDIO-BUS: バス/サブミックス/AUXセンド ルーティング永続化
     audiobus::AudioBusRouting audioBusRouting;
+
+    // PRD-PHASE3-ACES: ACES カラーマネジメント設定永続化
+    aces::AcesPipeline acesPipeline;
 };
 
 class ProjectFile

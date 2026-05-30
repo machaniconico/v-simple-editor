@@ -18,6 +18,7 @@
 // Kept alphabetically sorted for ease of maintenance.
 // ---------------------------------------------------------------------------
 int runAIHighlightSelftest();
+int runAcesColorSelftest();
 int runAffinitySelftest();
 int runOAuthMockE2eSelftest();
 int runOAuthRefreshE2eSelftest();
@@ -160,6 +161,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "AudioBusRouting: bus/submix/aux-send gain resolution + cycle guard" },
     { "spectral-edit",     "VEDITOR_SPECTRAL_EDIT_SELFTEST",      runSpectralEditSelftest,       false,
       "SpectralEngine: FFT/STFT/iSTFT round-trip + region attenuation" },
+    { "aces-color",        "VEDITOR_ACES_COLOR_SELFTEST",         runAcesColorSelftest,          false,
+      "AcesColor: primaries matrices, Bradford, IDT/RRT/ODT round-trip" },
     // QApplication-required (needsQApplication=true) ----------------------
     { "parity",            "VEDITOR_PARITY_SELFTEST",             runParitySelftest,             true,
       "Preview vs export pixel-parity (S1-S11, framediff::mse, 10-bit HDR10)" },

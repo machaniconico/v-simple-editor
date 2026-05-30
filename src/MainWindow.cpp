@@ -31,6 +31,7 @@
 #include "ProxyManagementDialog.h"
 #include "SceneCutDialog.h"
 #include "AudioDuckingDialog.h"
+#include "ColorManagementDialog.h"   // AC-4: ACES カラーマネジメント ダイアログ
 #include "ProjectCollectorDialog.h"
 #include "HDRSettingsDialog.h"
 #include "AIProcessingDialog.h"
@@ -2534,6 +2535,15 @@ void MainWindow::setupMenuBar()
     m_menuHelpEntries.append({hdrGradingAction,
         QStringLiteral("HDR10 / HLG / PQ トーンマッピングを使った HDR カラーグレーディングを行います。")});
 
+    // AC-4: ACES シーンリファード色管理 (IDT/RRT/ODT)。
+    auto *colorManagementAction = toolsMenu->addAction(
+        QStringLiteral("カラーマネジメント (ACES)…"));
+    colorManagementAction->setObjectName("action_color_management");
+    connect(colorManagementAction, &QAction::triggered,
+            this, &MainWindow::openColorManagement);
+    m_menuHelpEntries.append({colorManagementAction,
+        QStringLiteral("ACES のシーンリファード色管理 (入力/作業/出力色空間) を設定します。")});
+
     auto *multiCamSyncAction = toolsMenu->addAction(
         QStringLiteral("マルチカム同期(&M)…"));
     multiCamSyncAction->setObjectName("action_multicam_sync");
@@ -4123,6 +4133,9 @@ void MainWindow::populateProjectData(ProjectData &data)
     // AB-5: オーディオ バス ルーティング (バス/サブミックス/AUX) を保存。
     data.audioBusRouting = m_audioBusRouting;
 
+    // AC-4: ACES カラーマネジメント パイプライン設定を保存。
+    data.acesPipeline = m_acesPipeline;
+
     data.smartReframe = m_smartReframe.toJson();
     data.subtitleSegments.clear();
     for (const auto &seg : m_subtitleSegments) {
@@ -4362,6 +4375,10 @@ void MainWindow::applyLoadedProjectData(const ProjectData &data, const QString &
         m_audioBusPanel->setRouting(&m_audioBusRouting);
         m_audioBusPanel->refresh();
     }
+
+    // AC-4: ACES カラーマネジメント パイプライン設定を復元 (SSOT)。
+    // ダイアログを次に開いたときにこの状態が初期値となる。
+    m_acesPipeline = data.acesPipeline;
 
     updateTitle();
     hideWelcomeScreen();
@@ -10022,6 +10039,28 @@ void MainWindow::openSpectralRepair()
     QMessageBox::information(this, QStringLiteral("スペクトル音声修復"),
         QStringLiteral("SpectralEditDialog がビルドに含まれていません。"));
 #endif
+}
+
+// AC-4: ACES カラーマネジメント設定ダイアログ。SSOT である m_acesPipeline を
+// 編集対象として渡し、OK のときのみ確定する。確定した設定は project save/load を
+// 通じて ProjectData::acesPipeline に永続化される。
+// TODO: 確定した m_acesPipeline をプレビュー/エクスポートのレンダーパイプラインへ
+//       実適用するのは後続スコープ (本ストーリーは設定の保持と永続化までを担う)。
+void MainWindow::openColorManagement()
+{
+    ColorManagementDialog dlg(this);
+    dlg.setPipeline(m_acesPipeline);
+    if (dlg.exec() == QDialog::Accepted) {
+        m_acesPipeline = dlg.pipeline();
+        const QString state = m_acesPipeline.enabled
+            ? QStringLiteral("有効 (入力 %1 → 作業 %2 → 出力 %3)")
+                  .arg(aces::colorSpaceName(m_acesPipeline.input),
+                       aces::colorSpaceName(m_acesPipeline.working),
+                       aces::colorSpaceName(m_acesPipeline.output))
+            : QStringLiteral("無効");
+        statusBar()->showMessage(
+            QStringLiteral("カラーマネジメント (ACES): %1").arg(state), 4000);
+    }
 }
 
 void MainWindow::openAnimExportDialog()

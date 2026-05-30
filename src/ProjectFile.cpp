@@ -415,6 +415,9 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
     // PRD-PHASE2-AUDIO-BUS: バス/サブミックス/AUXセンド ルーティング永続化
     root["audioBusRouting"] = data.audioBusRouting.toJson();
 
+    // PRD-PHASE3-ACES: ACES カラーマネジメント設定永続化
+    root["acesPipeline"] = aces::pipelineToJson(data.acesPipeline);
+
     QJsonDocument doc(root);
     QFile file(filePath);
     if (!file.open(QIODevice::WriteOnly))
@@ -687,6 +690,10 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
     // (キー欠落でも空 object → 空ルーティング=identity、旧 .veditor 後方互換)
     data.audioBusRouting.fromJson(root.value("audioBusRouting").toObject());
 
+    // PRD-PHASE3-ACES: ACES カラーマネジメント設定永続化
+    // (キー欠落でも空 object → enabled=false 既定=identity、旧 .veditor 後方互換)
+    data.acesPipeline = aces::pipelineFromJson(root.value("acesPipeline").toObject());
+
     return true;
 }
 
@@ -945,6 +952,9 @@ QString ProjectFile::toJsonString(const ProjectData &data)
 
     // PRD-PHASE2-AUDIO-BUS: バス/サブミックス/AUXセンド ルーティング永続化
     root["audioBusRouting"] = data.audioBusRouting.toJson();
+
+    // PRD-PHASE3-ACES: ACES カラーマネジメント設定永続化
+    root["acesPipeline"] = aces::pipelineToJson(data.acesPipeline);
 
     QJsonDocument doc(root);
     return QString::fromUtf8(doc.toJson(QJsonDocument::Compact));
@@ -1209,6 +1219,10 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
     // PRD-PHASE2-AUDIO-BUS: バス/サブミックス/AUXセンド ルーティング永続化
     // (キー欠落でも空 object → 空ルーティング=identity、旧 .veditor 後方互換)
     data.audioBusRouting.fromJson(root.value("audioBusRouting").toObject());
+
+    // PRD-PHASE3-ACES: ACES カラーマネジメント設定永続化
+    // (キー欠落でも空 object → enabled=false 既定=identity、旧 .veditor 後方互換)
+    data.acesPipeline = aces::pipelineFromJson(root.value("acesPipeline").toObject());
 
     return true;
 }

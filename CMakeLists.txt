@@ -167,6 +167,11 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/SpectrogramWidget.cpp
     src/SpectralEditDialog.cpp
     src/selftests/spectral_edit_selftest.cpp
+    # AC (ACES シーンリファード色管理): 自前行列 ACES 中核変換 + 色管理 Dialog。
+    src/AcesColor.h
+    src/AcesColor.cpp
+    src/ColorManagementDialog.cpp
+    src/selftests/aces_color_selftest.cpp
     src/SourceMonitorDock.cpp
     src/MarkerPanelDock.cpp
     src/CommandPaletteDialog.h

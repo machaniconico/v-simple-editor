@@ -82,6 +82,7 @@
 #include "MediaPoolDock.h"         // MP-5: メディアプール UI ドック
 #include "MarkerPanelDock.h"       // MK-2: マーカー パネル UI ドック
 #include "AudioBusRouting.h"       // AB-5: オーディオ バス ルーティング SSOT モデル
+#include "AcesColor.h"             // AC-4: ACES カラーマネジメント パイプライン SSOT
 
 class VideoPlayer;
 class Timeline;
@@ -97,6 +98,7 @@ class ExpressionBindingDialog;
 class CameraMotionDialog;
 class SceneCutDialog;
 class AudioDuckingDialog;
+class ColorManagementDialog;   // AC-4: ACES カラーマネジメント ダイアログ
 class ProjectCollectorDialog;
 class HDRSettingsDialog;
 class AIProcessingDialog;
@@ -510,6 +512,10 @@ private slots:
     // SP-4: スペクトル音声修復 (iZotope RX 風オフライン処理)。
     void openSpectralRepair();
 
+    // AC-4: ACES カラーマネジメント設定ダイアログを開く。SSOT である
+    // m_acesPipeline を編集し、OK で確定する (永続化は project save/load 経由)。
+    void openColorManagement();
+
     // User-customizable "お気に入り" menu — opens FavoritesEditDialog, then
     // persists the chosen action ids to QSettings and rebuilds the menu.
     void editFavorites();
@@ -669,6 +675,12 @@ private:
     // 経由に永続化する。
     AudioBusPanel *m_audioBusPanel = nullptr;
     audiobus::AudioBusRouting m_audioBusRouting;
+
+    // AC-4: ACES カラーマネジメント パイプライン設定の SSOT。
+    // ColorManagementDialog で編集し、プロジェクト保存/読込で
+    // ProjectData::acesPipeline 経由に永続化する。
+    // TODO: レンダーパイプライン (プレビュー/エクスポート) への ACES 適用は後続。
+    aces::AcesPipeline m_acesPipeline;
 
     QDockWidget *m_vfxControlsDock = nullptr;
     LayerCompositor m_layerCompositor;
