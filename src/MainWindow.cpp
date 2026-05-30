@@ -54,6 +54,7 @@
 #include "SocialPreset.h"
 #include "AspectReframer.h"
 #include "ClipGeometry.h"
+#include "SourceMonitorDock.h"
 
 // US-INT-1: Sprint 16 — モバイルエクスポート + 取り込みハブ (optional includes)
 #if __has_include("MobileExportDialog.h")
@@ -2600,6 +2601,16 @@ void MainWindow::setupMenuBar()
                 this, &MainWindow::refreshMarkerPanel);
     refreshMarkerPanel();
 
+    // SM-5: ソースモニター ドック (右側)。メディアプールのダブルクリックは
+    // openInSourceMonitor() 経由でここへロードされ、マークイン/アウト後に
+    // 挿入/上書きボタンで 3 点編集する。
+    m_sourceMonitorDock = new SourceMonitorDock(this);
+    addDockWidget(Qt::RightDockWidgetArea, m_sourceMonitorDock);
+    connect(m_sourceMonitorDock, &SourceMonitorDock::insertRequested,
+            this, &MainWindow::onSourceInsertRequested);
+    connect(m_sourceMonitorDock, &SourceMonitorDock::overwriteRequested,
+            this, &MainWindow::onSourceOverwriteRequested);
+
     // US-SNS-7: 配信向け submenu
     auto *streamMenu = menuBar()->addMenu("配信向け(&S)");
 
@@ -3035,6 +3046,17 @@ void MainWindow::setupMenuBar()
         connect(m_mediaPoolDock, &QDockWidget::visibilityChanged, mediaPoolAction, &QAction::setChecked);
         m_menuHelpEntries.append({mediaPoolAction,
             QStringLiteral("取り込んだ動画・音声・画像をビン（フォルダ）で整理するパネルを出し入れします。素材をダブルクリックでタイムラインへ追加できます。")});
+    }
+
+    // SM-5: ソースモニター ドックの表示トグル
+    if (m_sourceMonitorDock) {
+        auto *sourceMonitorAction = viewMenu->addAction("ソースモニター");
+        sourceMonitorAction->setCheckable(true);
+        sourceMonitorAction->setChecked(m_sourceMonitorDock->isVisible());
+        connect(sourceMonitorAction, &QAction::toggled, m_sourceMonitorDock, &QDockWidget::setVisible);
+        connect(m_sourceMonitorDock, &QDockWidget::visibilityChanged, sourceMonitorAction, &QAction::setChecked);
+        m_menuHelpEntries.append({sourceMonitorAction,
+            QStringLiteral("素材を再生しながらマークイン/マークアウトで使う範囲を決め、再生ヘッド位置へ挿入/上書きするパネルを出し入れします。")});
     }
 
     // US-NODE-9: Node compositing mode toggle
@@ -4482,13 +4504,94 @@ void MainWindow::importToMediaPool()
     }
 }
 
-// MP-5: メディアプールの素材をダブルクリックしたとき、その実ファイルを
-// タイムラインへ取り込む (File > Open と同じ loadMediaFile 経路)。
+// MP-5 / SM-5: メディアプールの素材をダブルクリックしたとき、直接タイムラインへ
+// 取り込まず、いったんソースモニターへロードする (3 点編集ワークフロー)。
+// マークイン/アウト後に「挿入」/「上書き」で再生ヘッド位置へ取り込む。
 void MainWindow::onMediaPoolAssetActivated(const QString &filePath)
 {
     if (filePath.isEmpty())
         return;
-    loadMediaFile(filePath, true, QStringLiteral("メディアプールから取り込み"));
+    openInSourceMonitor(filePath);
+}
+
+// SM-5: 素材をソースモニターへロードする。長さ/表示名はメディアプールに
+// 登録済みなら MediaAsset から取得し、無ければファイル名 + 長さ 0 で渡す
+// (SourceMonitorDock 側で VideoPlayer の durationChanged から実尺を補正する)。
+void MainWindow::openInSourceMonitor(const QString &filePath)
+{
+    if (filePath.isEmpty() || !m_sourceMonitorDock)
+        return;
+
+    double durationSec = 0.0;
+    QString displayName;
+    for (const mediapool::MediaAsset &asset : m_mediaPool.assets()) {
+        if (asset.filePath == filePath) {
+            if (asset.durationMs > 0)
+                durationSec = static_cast<double>(asset.durationMs) / 1000.0;
+            displayName = asset.displayName;
+            break;
+        }
+    }
+    if (displayName.isEmpty())
+        displayName = QFileInfo(filePath).fileName();
+
+    m_sourceMonitorDock->loadSource(filePath, durationSec, displayName);
+    m_sourceMonitorDock->show();
+    m_sourceMonitorDock->raise();
+    statusBar()->showMessage(
+        QStringLiteral("ソースモニターに読み込みました: %1").arg(displayName));
+}
+
+// SM-5: ソースモニターの「挿入 (Insert)」押下。選択範囲を検証してから
+// ClipInfo へ変換し、再生ヘッド位置へリップル挿入する。
+void MainWindow::onSourceInsertRequested(const threepoint::SourceSelection &sel)
+{
+    QString error;
+    if (!threepoint::validate(sel, &error)) {
+        statusBar()->showMessage(
+            QStringLiteral("挿入できません: %1").arg(error));
+        return;
+    }
+    if (!m_timeline) {
+        statusBar()->showMessage(QStringLiteral("タイムラインがありません"));
+        return;
+    }
+    ClipInfo clip = threepoint::buildClipInfo(sel);
+    const double playheadSec = currentPlayheadSeconds();
+    m_timeline->insertClip3PointActive(playheadSec, clip);
+    updateStatusInfo();
+    statusBar()->showMessage(
+        QStringLiteral("再生ヘッド %1 秒に挿入しました: %2")
+            .arg(playheadSec, 0, 'f', 2)
+            .arg(sel.displayName.isEmpty()
+                     ? QFileInfo(sel.filePath).fileName()
+                     : sel.displayName));
+}
+
+// SM-5: ソースモニターの「上書き (Overwrite)」押下。選択範囲を検証してから
+// ClipInfo へ変換し、再生ヘッド位置から上書き (既存クリップを分割/削除) する。
+void MainWindow::onSourceOverwriteRequested(const threepoint::SourceSelection &sel)
+{
+    QString error;
+    if (!threepoint::validate(sel, &error)) {
+        statusBar()->showMessage(
+            QStringLiteral("上書きできません: %1").arg(error));
+        return;
+    }
+    if (!m_timeline) {
+        statusBar()->showMessage(QStringLiteral("タイムラインがありません"));
+        return;
+    }
+    ClipInfo clip = threepoint::buildClipInfo(sel);
+    const double playheadSec = currentPlayheadSeconds();
+    m_timeline->overwriteClip3PointActive(playheadSec, clip);
+    updateStatusInfo();
+    statusBar()->showMessage(
+        QStringLiteral("再生ヘッド %1 秒から上書きしました: %2")
+            .arg(playheadSec, 0, 'f', 2)
+            .arg(sel.displayName.isEmpty()
+                     ? QFileInfo(sel.filePath).fileName()
+                     : sel.displayName));
 }
 
 void MainWindow::exportVideo()

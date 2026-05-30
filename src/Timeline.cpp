@@ -1,4 +1,5 @@
 #include "Timeline.h"
+#include "ThreePointEdit.h"
 #include "TrackMatteKey.h"
 #include "ProxyManager.h"
 #include "UndoManager.h"
@@ -794,10 +795,12 @@ void TimelineTrack::splitClipAt(int index, double localSeconds)
     double effectiveStart = original.inPoint;
     double effectiveEnd = (original.outPoint > 0.0) ? original.outPoint : original.duration;
     double splitPoint = effectiveStart + localSeconds * original.speed;
-    if (splitPoint <= effectiveStart + 0.1 || splitPoint >= effectiveEnd - 0.1) return;
+    constexpr double kSplitEps = 1e-6;
+    if (splitPoint <= effectiveStart + kSplitEps || splitPoint >= effectiveEnd - kSplitEps) return;
     ClipInfo secondHalf = original;
     secondHalf.inPoint = splitPoint;
     secondHalf.outPoint = effectiveEnd;
+    secondHalf.leadInSec = 0.0;
     original.outPoint = splitPoint;
     m_clips.insert(index + 1, secondHalf);
     updateMinimumWidth(); update(); emit modified();
@@ -854,6 +857,38 @@ void TimelineTrack::insertClipPreservingDownstream(int index, const ClipInfo &cl
     }
     updateMinimumWidth(); update();
     emit modified();
+}
+
+void TimelineTrack::insertClip3Point(double timelineStartSec, const ClipInfo &clip)
+{
+    // ripple insert: T を跨ぐ位置に割り込み、後続クリップを右へ押し出す。
+    // 配置 index と先行ギャップ leadIn は純粋エンジンに委ねる。
+    double leadIn = 0.0;
+    const int index = threepoint::insertIndexForTime(m_clips, timelineStartSec, &leadIn);
+    insertClipPreservingDownstream(index, clip, leadIn);
+    // insertClipPreservingDownstream が update() / emit modified() を済ませている。
+}
+
+void TimelineTrack::overwriteClip3Point(double timelineStartSec, const ClipInfo &clip)
+{
+    const threepoint::OverwritePlan plan =
+        threepoint::planOverwrite(m_clips, timelineStartSec, clip.effectiveDuration());
+    if (!plan.valid)
+        return;
+    // SM-1 notes の実行順序を厳守する:
+    //   (1) tail を先に分割 (head 分割の +1 ズレが tail index に波及しないように)
+    if (plan.splitTailIndex >= 0)
+        splitClipAt(plan.splitTailIndex, plan.splitTailLocalSec);
+    //   (2) head を分割
+    if (plan.splitHeadIndex >= 0)
+        splitClipAt(plan.splitHeadIndex, plan.splitHeadLocalSec);
+    //   (3) [T,T+L) に完全に収まる既存クリップ群を、 downstream の絶対位置を
+    //       保ったまま末尾側から削除 (前から消すと後続インデックスがズレる)。
+    for (int i = plan.removeCount - 1; i >= 0; --i)
+        removeClipPreservingDownstream(plan.removeFromIndex + i);
+    //   (4) 新クリップを T 開始に配置 (先行ギャップ insertLeadInSec)。
+    insertClipPreservingDownstream(plan.insertIndex, clip, plan.insertLeadInSec);
+    // 各プリミティブが update() / emit modified() を内包しているので追加処理は不要。
 }
 
 TimelineTrack::DropPlan TimelineTrack::planDrop(double dropTime, double clipDuration) const
@@ -4183,6 +4218,24 @@ int Timeline::selectedVideoClipIndex() const
 {
     if (!m_videoTrack) return -1;
     return m_videoTrack->selectedClip();
+}
+
+void Timeline::insertClip3PointActive(double timelineStartSec, const ClipInfo &clip)
+{
+    if (m_videoTracks.isEmpty() || !m_videoTracks.first())
+        return;
+    auto *track = m_videoTracks.first();
+    track->insertClip3Point(timelineStartSec, clip);
+    saveUndoState("3点編集: インサート");
+}
+
+void Timeline::overwriteClip3PointActive(double timelineStartSec, const ClipInfo &clip)
+{
+    if (m_videoTracks.isEmpty() || !m_videoTracks.first())
+        return;
+    auto *track = m_videoTracks.first();
+    track->overwriteClip3Point(timelineStartSec, clip);
+    saveUndoState("3点編集: 上書き");
 }
 
 void Timeline::addAudioFile(const QString &filePath)

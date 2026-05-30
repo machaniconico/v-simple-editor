@@ -84,6 +84,7 @@
 
 class VideoPlayer;
 class Timeline;
+class SourceMonitorDock;
 class ExportDialog;
 class BrushAnimation;
 class RotoToolsDialog;
@@ -115,6 +116,10 @@ class TwitchStreamDialog;
 class CloudRenderDialog;
 class CredentialDialog;
 class SmartEditDialog;
+
+namespace threepoint {
+struct SourceSelection;
+}
 
 // US-INT-2: Sprint 21 — platform expansion / mastering / batch export.
 class XVideoDialog;
@@ -435,6 +440,17 @@ private slots:
     // MP-5: メディアプールの素材ダブルクリックでタイムラインに取り込む
     void onMediaPoolAssetActivated(const QString &filePath);
 
+    // SM-5: ソースモニター + 3点編集。メディアプールのダブルクリックは
+    // 直接タイムラインへ取り込まず、いったんソースモニターへロードして
+    // マークイン/アウト → 挿入/上書きの 3 点編集ワークフローに乗せる。
+    void openInSourceMonitor(const QString &filePath);
+    // ソースモニターの「挿入 (Insert)」押下。選択範囲を検証して
+    // insertClip3PointActive で再生ヘッド位置へリップル挿入する。
+    void onSourceInsertRequested(const threepoint::SourceSelection &sel);
+    // ソースモニターの「上書き (Overwrite)」押下。選択範囲を検証して
+    // overwriteClip3PointActive で再生ヘッド位置から上書きする。
+    void onSourceOverwriteRequested(const threepoint::SourceSelection &sel);
+
     // US-INT-1: Sprint 16 — モバイルデバイス向けエクスポートダイアログ
     void onMobileExport();
 
@@ -623,6 +639,10 @@ private:
     // MK-2: マーカー パネル ドック (右側)。Timeline を所有せず、markersChanged
     // を受けて setMarkers() で内容を同期するビュー。
     MarkerPanelDock *m_markerPanelDock = nullptr;
+
+    // SM-5: ソースモニター ドック (右側)。素材を VideoPlayer でプレビューし、
+    // マークイン/アウト後に insertRequested/overwriteRequested で 3 点編集する。
+    SourceMonitorDock *m_sourceMonitorDock = nullptr;
     QDockWidget *m_vfxControlsDock = nullptr;
     LayerCompositor m_layerCompositor;
     PrecomposeManager m_precomposeManager;

@@ -230,6 +230,14 @@ public:
     // clips don't slide right. Caller must have verified the plan fits.
     void insertClipPreservingDownstream(int index, const ClipInfo &clip, double leadInSec);
 
+    // SM-3: ソースモニター3点編集の実行口。純粋エンジン threepoint:: の計算結果を
+    // 既存の split/remove/insert プリミティブで適用する。
+    // Insert = 既存クリップを右へ押し出して timelineStartSec に割り込む (ripple)。
+    void insertClip3Point(double timelineStartSec, const ClipInfo &clip);
+    // Overwrite = [T, T+L) を上書きし、跨ぐクリップを分割・収まるクリップを削除して
+    // 新クリップを T 開始に配置する。
+    void overwriteClip3Point(double timelineStartSec, const ClipInfo &clip);
+
     struct DropPlan {
         bool valid = false;
         int insertIdx = -1;
@@ -512,6 +520,12 @@ public:
     double selectedClipDuration() const;
     // Index of the selected clip on V1 (delegates to m_videoTrack); -1 if none.
     int selectedVideoClipIndex() const;
+
+    // SM-3: アクティブ動画トラック (先頭 V1) へ委譲する 3点編集ラッパー。
+    // ソースモニターから組み立てた ClipInfo を timelineStartSec に Insert / Overwrite で
+    // 配置し、saveUndoState で 1 操作 = 1 Undo にまとめる。
+    void insertClip3PointActive(double timelineStartSec, const ClipInfo &clip);
+    void overwriteClip3PointActive(double timelineStartSec, const ClipInfo &clip);
 
     // Audio
     void addAudioFile(const QString &filePath);

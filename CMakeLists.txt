@@ -143,11 +143,16 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/auto_clip_gen_selftest.cpp
     src/selftests/command_search_selftest.cpp
     src/selftests/media_pool_selftest.cpp
+    src/selftests/three_point_edit_selftest.cpp
     src/CommandSearch.h
     src/CommandSearch.cpp
     src/MediaPool.h
     src/MediaPool.cpp
     src/MediaPoolDock.cpp
+    # SM (ソースモニター3点編集): 純粋エンジン + ドック (SM-2 で本体実装)。
+    src/ThreePointEdit.h
+    src/ThreePointEdit.cpp
+    src/SourceMonitorDock.cpp
     src/MarkerPanelDock.cpp
     src/CommandPaletteDialog.h
     src/CommandPaletteDialog.cpp
