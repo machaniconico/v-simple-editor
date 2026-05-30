@@ -96,6 +96,7 @@ int runVimeoSelftest();
 int runWatermarkSelftest();
 int runWhisperTranscribeSelftest();
 int runWorkflowSelftest();
+int runWorkspaceSelftest();
 int runXUploadSelftest();
 int runYoutubeSelftest();
 int runYtdlpDownloaderSelftest();
@@ -175,6 +176,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "AutoMatte: difference matte, morphology, feather, composite" },
     { "edl-export",        "VEDITOR_EDL_EXPORT_SELFTEST",         runEdlExportSelftest,          false,
       "EdlExport: CMX3600 timecode + event lines + drop-frame" },
+    { "workspace",         "VEDITOR_WORKSPACE_SELFTEST",          runWorkspaceSelftest,          false,
+      "WorkspaceManager: named layout CRUD + base64 blob JSON round-trip" },
     // QApplication-required (needsQApplication=true) ----------------------
     { "parity",            "VEDITOR_PARITY_SELFTEST",             runParitySelftest,             true,
       "Preview vs export pixel-parity (S1-S11, framediff::mse, 10-bit HDR10)" },

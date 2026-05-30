@@ -2,6 +2,7 @@
 
 #include <QMainWindow>
 #include <QMenuBar>
+#include <QActionGroup>  // WS-3: ワークスペース切替アクションの排他グループ
 #include <QToolBar>
 #include <QStatusBar>
 #include <QSplitter>
@@ -25,6 +26,7 @@
 #include "AutoEdit.h"
 #include "ThemeManager.h"
 #include "MultiCam.h"
+#include "WorkspaceManager.h"  // WS-3: 名前付きワークスペース (ドックレイアウト) モデル SSOT
 #include "MotionTracker.h"
 #include "NoiseReduction.h"
 #include "SubtitleGenerator.h"
@@ -247,6 +249,11 @@ private slots:
     void toggleSnap();
     void zoomIn();
     void zoomOut();
+    // WS-3: ワークスペース (ドックレイアウト) の保存/切替/削除/メニュー再構築
+    void saveCurrentWorkspace();
+    void switchWorkspace(const QString &name);
+    void deleteWorkspace();
+    void rebuildWorkspaceMenu();
     void addVideoTrack();
     void addAudioTrack();
     void markIn();
@@ -574,6 +581,9 @@ private:
     void setupStatusBarWidgets();
     void saveWindowState();
     void restoreWindowState();
+    // WS-3: m_workspaces (toJson) を QSettings に永続化 / 起動時に復元する。
+    void saveWorkspacesToSettings();
+    void loadWorkspacesFromSettings();
     void showWelcomeScreen();
     void hideWelcomeScreen();
     void loadMediaFile(const QString &filePath, bool addToTimeline, const QString &statusPrefix);
@@ -679,6 +689,12 @@ private:
     SubtitleStyle m_subtitleStyle;
     LoudnessPanel *m_loudnessPanel = nullptr;
     QDockWidget *m_loudnessDock = nullptr;
+
+    // WS-3: ワークスペース (名前付きドックレイアウト)。m_workspaces が SSOT、
+    // m_workspaceMenu が「表示」配下のサブメニュー (rebuildWorkspaceMenu で動的再構築)。
+    workspace::WorkspaceManager m_workspaces;
+    QMenu *m_workspaceMenu = nullptr;
+    QActionGroup *m_workspaceActionGroup = nullptr;  // 切替アクションの排他グループ
 
     // MP-5: メディアプール (NLE のビン/素材管理)。m_mediaPool が SSOT モデル、
     // m_mediaPoolDock が左ドックの UI。プロジェクト保存/読込で ProjectData

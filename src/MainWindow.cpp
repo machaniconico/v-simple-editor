@@ -847,6 +847,10 @@ MainWindow::MainWindow(QWidget *parent)
     // Restore saved window state
     restoreWindowState();
 
+    // WS-3: 保存済みワークスペースを QSettings から復元し、メニューを再構築する。
+    // 最後に使ったワークスペースがあれば、そのレイアウトに切り替える。
+    loadWorkspacesFromSettings();
+
     m_timeline->setAudioMixer(m_player->audioMixer());
 
     rebuildAudioMeters();
@@ -1612,6 +1616,12 @@ void MainWindow::setupMenuBar()
     connect(zoomOutAction, &QAction::triggered, this, &MainWindow::zoomOut);
     m_menuHelpEntries.append({zoomOutAction,
         QStringLiteral("タイムラインを縮小して、動画全体を一目で見られるようにします。")});
+
+    // WS-3: ワークスペース (名前付きドックレイアウト) サブメニュー。
+    // 中身は rebuildWorkspaceMenu() で動的に組み立てる。
+    viewMenu->addSeparator();
+    m_workspaceMenu = viewMenu->addMenu(QStringLiteral("ワークスペース(&W)"));
+    rebuildWorkspaceMenu();
 
     // トラック メニュー
     auto *trackMenu = menuBar()->addMenu("トラック(&T)");
@@ -3672,6 +3682,7 @@ void MainWindow::applyMenuHelpTooltips(bool enabled)
 void MainWindow::setupToolBar()
 {
     auto *toolbar = addToolBar("Main");
+    toolbar->setObjectName(QStringLiteral("MainToolBar"));
     toolbar->setMovable(false);
     toolbar->setIconSize(QSize(20, 20));
     toolbar->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
@@ -10747,10 +10758,14 @@ void MainWindow::restoreWindowState()
 {
     QSettings settings("VSimpleEditor", "WindowState");
     if (settings.contains("geometry")) {
-        restoreGeometry(settings.value("geometry").toByteArray());
+        const QByteArray geometry = settings.value("geometry").toByteArray();
+        if (!geometry.isEmpty())
+            restoreGeometry(geometry);
     }
     if (settings.contains("windowState")) {
-        restoreState(settings.value("windowState").toByteArray());
+        const QByteArray windowState = settings.value("windowState").toByteArray();
+        if (!windowState.isEmpty())
+            restoreState(windowState);
     }
     // カラーグレーディングパネルは常に非表示で起動
     if (m_colorGradingPanel)
@@ -10765,6 +10780,145 @@ void MainWindow::restoreWindowState()
     if (m_historyDock) {
         QSettings uiSettings("VSimpleEditor", "UI");
         m_historyDock->setVisible(uiSettings.value("historyDockVisible", true).toBool());
+    }
+}
+
+// ===== WS-3: ワークスペース (名前付きドックレイアウト) =====
+
+void MainWindow::rebuildWorkspaceMenu()
+{
+    if (!m_workspaceMenu)
+        return;
+
+    m_workspaceMenu->clear();
+    // clear() は子 QAction を破棄するが QActionGroup は残るため、前回分を破棄する。
+    if (m_workspaceActionGroup) {
+        delete m_workspaceActionGroup;
+        m_workspaceActionGroup = nullptr;
+    }
+
+    // 保存済み各ワークスペースの切替アクション。現在のものにチェックを付ける。
+    const QString current = m_workspaces.currentName();
+    auto *group = new QActionGroup(m_workspaceMenu);
+    group->setExclusive(true);
+    m_workspaceActionGroup = group;
+    for (const QString &name : m_workspaces.names()) {
+        QAction *act = m_workspaceMenu->addAction(name);
+        act->setCheckable(true);
+        act->setChecked(name == current);
+        act->setActionGroup(group);
+        connect(act, &QAction::triggered, this, [this, name]() { switchWorkspace(name); });
+    }
+
+    m_workspaceMenu->addSeparator();
+
+    QAction *saveAct = m_workspaceMenu->addAction(QStringLiteral("現在のレイアウトを保存..."));
+    connect(saveAct, &QAction::triggered, this, &MainWindow::saveCurrentWorkspace);
+
+    QAction *deleteAct = m_workspaceMenu->addAction(QStringLiteral("ワークスペースを削除..."));
+    deleteAct->setEnabled(m_workspaces.count() > 0);
+    connect(deleteAct, &QAction::triggered, this, &MainWindow::deleteWorkspace);
+
+    QAction *resetAct = m_workspaceMenu->addAction(QStringLiteral("既定にリセット"));
+    connect(resetAct, &QAction::triggered, this, [this]() {
+        m_workspaces.clear();
+        m_workspaces.ensureDefaults();
+        saveWorkspacesToSettings();
+        rebuildWorkspaceMenu();
+        statusBar()->showMessage(QStringLiteral("ワークスペースを既定にリセットしました"), 3000);
+    });
+}
+
+void MainWindow::saveCurrentWorkspace()
+{
+    bool ok = false;
+    const QString suggested = m_workspaces.currentName();
+    QString name = QInputDialog::getText(this,
+        QStringLiteral("ワークスペースを保存"),
+        QStringLiteral("ワークスペース名:"),
+        QLineEdit::Normal, suggested, &ok).trimmed();
+    if (!ok || name.isEmpty())
+        return;
+
+    m_workspaces.addOrUpdate(name, saveState(), saveGeometry());
+    m_workspaces.setCurrent(name);
+    saveWorkspacesToSettings();
+    rebuildWorkspaceMenu();
+    statusBar()->showMessage(
+        QStringLiteral("ワークスペース「%1」を保存しました").arg(name), 3000);
+}
+
+void MainWindow::switchWorkspace(const QString &name)
+{
+    const workspace::Workspace *w = m_workspaces.get(name);
+    if (!w)
+        return;
+    // geometry を先に復元してから windowState (ドック配置) を復元する。
+    if (!w->geometry.isEmpty())
+        restoreGeometry(w->geometry);
+    if (!w->windowState.isEmpty())
+        restoreState(w->windowState);
+    m_workspaces.setCurrent(name);
+    rebuildWorkspaceMenu();
+    statusBar()->showMessage(
+        QStringLiteral("ワークスペース「%1」に切り替えました").arg(name), 3000);
+}
+
+void MainWindow::deleteWorkspace()
+{
+    const QStringList names = m_workspaces.names();
+    if (names.isEmpty()) {
+        statusBar()->showMessage(QStringLiteral("削除できるワークスペースがありません"), 3000);
+        return;
+    }
+    bool ok = false;
+    const QString current = m_workspaces.currentName();
+    int idx = names.indexOf(current);
+    if (idx < 0) idx = 0;
+    QString name = QInputDialog::getItem(this,
+        QStringLiteral("ワークスペースを削除"),
+        QStringLiteral("削除するワークスペース:"),
+        names, idx, false, &ok);
+    if (!ok || name.isEmpty())
+        return;
+
+    if (m_workspaces.remove(name)) {
+        saveWorkspacesToSettings();
+        rebuildWorkspaceMenu();
+        statusBar()->showMessage(
+            QStringLiteral("ワークスペース「%1」を削除しました").arg(name), 3000);
+    }
+}
+
+void MainWindow::saveWorkspacesToSettings()
+{
+    QSettings settings("VSimpleEditor", "WindowState");
+    const QJsonDocument doc(m_workspaces.toJson());
+    settings.setValue("workspaces",
+        QString::fromUtf8(doc.toJson(QJsonDocument::Compact)));
+}
+
+void MainWindow::loadWorkspacesFromSettings()
+{
+    QSettings settings("VSimpleEditor", "WindowState");
+    const QString json = settings.value("workspaces").toString();
+    if (!json.isEmpty()) {
+        const QJsonDocument doc = QJsonDocument::fromJson(json.toUtf8());
+        if (doc.isObject())
+            m_workspaces.fromJson(doc.object());
+    }
+    // 1 つも無ければ既定のワークスペース名を投入する (blob は空)。
+    if (m_workspaces.count() == 0)
+        m_workspaces.ensureDefaults();
+
+    rebuildWorkspaceMenu();
+
+    // 最後に使ったワークスペースに blob があれば、そのレイアウトへ切り替える。
+    const QString last = m_workspaces.currentName();
+    if (!last.isEmpty()) {
+        const workspace::Workspace *w = m_workspaces.get(last);
+        if (w && (!w->windowState.isEmpty() || !w->geometry.isEmpty()))
+            switchWorkspace(last);
     }
 }
 
@@ -10927,6 +11081,7 @@ void MainWindow::rebuildAudioMeters()
 void MainWindow::closeEvent(QCloseEvent *event)
 {
     saveWindowState();
+    saveWorkspacesToSettings();  // WS-3: 名前付きワークスペースを永続化
     if (m_autoSave) m_autoSave->markCleanShutdown();
     // US-SC-B: Sprint 12 — persist preset + custom bindings before shutdown.
     if (m_shortcutManager) m_shortcutManager->saveToSettings();

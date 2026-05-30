@@ -191,6 +191,10 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/EdlExport.h
     src/EdlExport.cpp
     src/selftests/edl_export_selftest.cpp
+    # WS (ワークスペース): 名前付きドックレイアウトの純粋モデル (Premiere/Resolve 相当)。
+    src/WorkspaceManager.h
+    src/WorkspaceManager.cpp
+    src/selftests/workspace_selftest.cpp
     src/SourceMonitorDock.cpp
     src/MarkerPanelDock.cpp
     src/CommandPaletteDialog.h
