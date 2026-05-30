@@ -161,6 +161,12 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/AudioBusRouting.cpp
     src/AudioBusPanel.cpp
     src/selftests/audio_bus_selftest.cpp
+    # SP (スペクトル編集): iZotope RX 風 STFT/iSTFT 純粋エンジン + スペクトログラム UI。
+    src/SpectralEngine.h
+    src/SpectralEngine.cpp
+    src/SpectrogramWidget.cpp
+    src/SpectralEditDialog.cpp
+    src/selftests/spectral_edit_selftest.cpp
     src/SourceMonitorDock.cpp
     src/MarkerPanelDock.cpp
     src/CommandPaletteDialog.h

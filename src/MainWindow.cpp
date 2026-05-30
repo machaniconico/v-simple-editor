@@ -186,6 +186,12 @@
   #include "WatermarkDialog.h"
   #define HAVE_WATERMARK_DIALOG 1
 #endif
+// SP-4: スペクトル音声修復ダイアログ。
+#if __has_include("SpectralEditDialog.h")
+  #include "SpectralEditDialog.h"
+  #include "libavcore/AudioExtract.h"
+  #define HAVE_SPECTRAL_EDIT_DIALOG 1
+#endif
 #include <QApplication>
 #include <QMessageBox>
 #include <QMenu>
@@ -220,6 +226,7 @@
 #include <algorithm>
 #include <cmath>
 #include <array>
+#include <limits>
 #include "AudioMeterWidget.h"
 #include "GradientStopBar.h"
 #include "BrushAnimationDialog.h"
@@ -2560,6 +2567,15 @@ void MainWindow::setupMenuBar()
             this, &MainWindow::openAudioRestoreDialog);
     m_menuHelpEntries.append({audioRestoreAction,
         QStringLiteral("ノイズ・クリック・ハムなどの劣化を取り除き、収録音声を復元します。")});
+
+    // SP-4: iZotope RX 風スペクトル音声修復 (時間×周波数の矩形領域を減衰)。
+    auto *spectralRepairAction = toolsMenu->addAction(
+        QStringLiteral("スペクトル音声修復(&S)…"));
+    spectralRepairAction->setObjectName("action_spectral_repair");
+    connect(spectralRepairAction, &QAction::triggered,
+            this, &MainWindow::openSpectralRepair);
+    m_menuHelpEntries.append({spectralRepairAction,
+        QStringLiteral("スペクトログラム上で時間×周波数の矩形を選択し、ノイズ成分を減衰させて音声を修復します。")});
 
     auto *animExportAction = toolsMenu->addAction(
         QStringLiteral("アニメGIF・WebP書き出し(&G)…"));
@@ -9690,6 +9706,321 @@ void MainWindow::openAudioRestoreDialog()
 #else
     QMessageBox::information(this, QStringLiteral("音声リストア"),
         QStringLiteral("AudioRestorationDialog がビルドに含まれていません。"));
+#endif
+}
+
+#ifdef HAVE_SPECTRAL_EDIT_DIALOG
+namespace {
+
+// 16bit PCM WAV (RIFF/fmt/data) を読み込み mono の double サンプル列へ展開する。
+// 多チャンネルは平均してモノラル化。成功時 true、sampleRate を *sampleRate へ。
+// 簡易パーサ — float WAV や 24/32bit は非対応 (抽出側を 16bit に固定する前提)。
+bool readPcm16WavToMono(const QString &wavPath,
+                        std::vector<double> &outSamples,
+                        int &sampleRate,
+                        QString *error)
+{
+    outSamples.clear();
+    sampleRate = 0;
+
+    constexpr qint64 kMaxWavBytes = 512LL * 1024LL * 1024LL;
+    const QFileInfo info(wavPath);
+    if (!info.exists()) {
+        if (error) *error = QStringLiteral("WAV が存在しません: %1").arg(wavPath);
+        return false;
+    }
+    if (info.size() <= 0) {
+        if (error) *error = QStringLiteral("WAV が空です: %1").arg(wavPath);
+        return false;
+    }
+    if (info.size() > kMaxWavBytes) {
+        if (error) *error =
+            QStringLiteral("WAV が大きすぎます (%1 MB、上限 %2 MB)。")
+                .arg(info.size() / (1024.0 * 1024.0), 0, 'f', 1)
+                .arg(kMaxWavBytes / (1024 * 1024));
+        return false;
+    }
+
+    QFile f(wavPath);
+    if (!f.open(QIODevice::ReadOnly)) {
+        if (error) *error = QStringLiteral("WAV を開けません: %1").arg(wavPath);
+        return false;
+    }
+    const QByteArray data = f.readAll();
+    f.close();
+
+    if (data.size() != info.size()) {
+        if (error) *error =
+            QStringLiteral("WAV の読み込みが途中で終了しました (%1/%2 bytes)。")
+                .arg(data.size()).arg(info.size());
+        return false;
+    }
+    if (data.size() < 44 || !data.startsWith("RIFF") ||
+        data.mid(8, 4) != QByteArray("WAVE")) {
+        if (error) *error = QStringLiteral("RIFF/WAVE ヘッダが不正です。");
+        return false;
+    }
+
+    const auto rdU16 = [&](int off) -> quint16 {
+        return static_cast<quint16>(static_cast<unsigned char>(data[off])) |
+               (static_cast<quint16>(static_cast<unsigned char>(data[off + 1])) << 8);
+    };
+    const auto rdU32 = [&](int off) -> quint32 {
+        return static_cast<quint32>(static_cast<unsigned char>(data[off])) |
+               (static_cast<quint32>(static_cast<unsigned char>(data[off + 1])) << 8) |
+               (static_cast<quint32>(static_cast<unsigned char>(data[off + 2])) << 16) |
+               (static_cast<quint32>(static_cast<unsigned char>(data[off + 3])) << 24);
+    };
+
+    int channels = 1;
+    int sr = 0;
+    int bitsPerSample = 16;
+    int audioFormat = 1;
+    int blockAlign = 0;
+    bool haveFmt = false;
+    int dataOff = -1;
+    int dataLen = 0;
+
+    // チャンク走査 (fmt と data を探す)。
+    int pos = 12;
+    while (pos + 8 <= data.size()) {
+        const QByteArray id = data.mid(pos, 4);
+        const quint32 sz = rdU32(pos + 4);
+        const int body = pos + 8;
+        const qint64 chunkEnd = static_cast<qint64>(body) + static_cast<qint64>(sz);
+        const qint64 nextChunk = chunkEnd + ((sz & 1u) ? 1 : 0);
+        if (chunkEnd > data.size()) {
+            if (error) *error =
+                QStringLiteral("WAV チャンク '%1' がファイル終端を越えています。")
+                    .arg(QString::fromLatin1(id.constData(), id.size()));
+            return false;
+        }
+
+        if (id == QByteArray("fmt ")) {
+            if (sz < 16) {
+                if (error) *error = QStringLiteral("WAV fmt チャンクが短すぎます。");
+                return false;
+            }
+            audioFormat   = rdU16(body);
+            channels      = rdU16(body + 2);
+            const quint32 parsedSr = rdU32(body + 4);
+            if (parsedSr > static_cast<quint32>(std::numeric_limits<int>::max())) {
+                if (error) *error = QStringLiteral("WAV の sample rate が大きすぎます。");
+                return false;
+            }
+            sr            = static_cast<int>(parsedSr);
+            blockAlign    = rdU16(body + 12);
+            bitsPerSample = rdU16(body + 14);
+            haveFmt = true;
+        } else if (id == QByteArray("data")) {
+            dataOff = body;
+            dataLen = static_cast<int>(sz);
+        }
+        // チャンクは 2byte 境界 (奇数長は +1 パディング)。
+        pos = static_cast<int>(std::min<qint64>(nextChunk, data.size()));
+        if (dataOff >= 0 && haveFmt) break;
+    }
+
+    if (audioFormat != 1 || bitsPerSample != 16) {
+        if (error) *error =
+            QStringLiteral("対応するのは 16bit PCM WAV のみです (format=%1, bits=%2)。")
+                .arg(audioFormat).arg(bitsPerSample);
+        return false;
+    }
+    if (!haveFmt || dataOff < 0 || dataLen <= 0 || sr <= 0 || channels <= 0) {
+        if (error) *error = QStringLiteral("WAV の data/fmt チャンクが見つかりません。");
+        return false;
+    }
+
+    if (channels > 64) {
+        if (error) *error = QStringLiteral("WAV の channel 数が大きすぎます (%1)。").arg(channels);
+        return false;
+    }
+
+    const int frameBytes = 2 * channels;
+    if (blockAlign != frameBytes) {
+        if (error) *error =
+            QStringLiteral("WAV の block align が不正です (blockAlign=%1, expected=%2)。")
+                .arg(blockAlign).arg(frameBytes);
+        return false;
+    }
+
+    const int frameCount = dataLen / frameBytes;
+    if (frameCount <= 0) {
+        if (error) *error = QStringLiteral("WAV の data チャンクにサンプルがありません。");
+        return false;
+    }
+
+    outSamples.clear();
+    outSamples.reserve(frameCount);
+    const char *p = data.constData() + dataOff;
+    for (int i = 0; i < frameCount; ++i) {
+        double acc = 0.0;
+        for (int c = 0; c < channels; ++c) {
+            const int o = i * frameBytes + c * 2;
+            const qint16 s = static_cast<qint16>(
+                static_cast<quint16>(static_cast<unsigned char>(p[o])) |
+                (static_cast<quint16>(static_cast<unsigned char>(p[o + 1])) << 8));
+            acc += static_cast<double>(s) / 32768.0;
+        }
+        outSamples.push_back(acc / channels);
+    }
+    sampleRate = sr;
+    return true;
+}
+
+} // namespace
+#endif // HAVE_SPECTRAL_EDIT_DIALOG
+
+void MainWindow::openSpectralRepair()
+{
+#ifdef HAVE_SPECTRAL_EDIT_DIALOG
+    // (a) 対象音声を決める: 選択クリップの filePath、無ければファイル選択。
+    QString sourcePath;
+    if (m_timeline) {
+        const int clipIdx = m_timeline->selectedVideoClipIndex();
+        const auto &clips = m_timeline->videoClips();
+        if (clipIdx >= 0 && clipIdx < clips.size())
+            sourcePath = clips[clipIdx].filePath;
+    }
+    if (sourcePath.isEmpty()) {
+        sourcePath = QFileDialog::getOpenFileName(
+            this, QStringLiteral("スペクトル音声修復 — 対象メディアを選択"),
+            QString(),
+            QStringLiteral("メディアファイル (*.mp4 *.mov *.mkv *.wav *.mp3 *.aac *.m4a);;"
+                           "すべてのファイル (*)"));
+    }
+    if (sourcePath.isEmpty()) {
+        statusBar()->showMessage(QStringLiteral("スペクトル音声修復: 対象が選択されていません。"), 3000);
+        return;
+    }
+    if (!QFileInfo::exists(sourcePath)) {
+        QMessageBox::warning(this, QStringLiteral("スペクトル音声修復"),
+            QStringLiteral("ファイルが存在しません:\n%1").arg(sourcePath));
+        return;
+    }
+
+    // (b) 一時 wav へ 48kHz で抽出。
+    const int kSampleRate = 48000;
+    QTemporaryDir tmpDir;
+    if (!tmpDir.isValid()) {
+        QMessageBox::warning(this, QStringLiteral("スペクトル音声修復"),
+            QStringLiteral("一時ディレクトリを作成できませんでした。"));
+        return;
+    }
+    tmpDir.setAutoRemove(true);
+    const QString tmpWav = tmpDir.filePath(QStringLiteral("spectral_src.wav"));
+
+    statusBar()->showMessage(QStringLiteral("音声を抽出しています..."));
+    QString extractErr;
+    if (!libavcore::extractAudioToWav(sourcePath, tmpWav, kSampleRate, &extractErr)) {
+        QMessageBox::warning(this, QStringLiteral("スペクトル音声修復"),
+            QStringLiteral("音声の抽出に失敗しました:\n%1")
+                .arg(extractErr.isEmpty() ? sourcePath : extractErr));
+        statusBar()->showMessage(QStringLiteral("スペクトル音声修復: 抽出失敗。"), 3000);
+        return;
+    }
+
+    // (c) 抽出 wav を mono サンプル列へ読み込む。
+    std::vector<double> samples;
+    int sr = kSampleRate;
+    QString readErr;
+    if (!readPcm16WavToMono(tmpWav, samples, sr, &readErr) || samples.empty()) {
+        QMessageBox::warning(this, QStringLiteral("スペクトル音声修復"),
+            QStringLiteral("抽出した音声を読み込めませんでした:\n%1")
+                .arg(readErr.isEmpty() ? QStringLiteral("(空のサンプル列)") : readErr));
+        statusBar()->showMessage(QStringLiteral("スペクトル音声修復: 読み込み失敗。"), 3000);
+        return;
+    }
+
+    // 長さ上限ガード (最大 10 分)。
+    const double durationSec = static_cast<double>(samples.size()) / (sr > 0 ? sr : kSampleRate);
+    const double kMaxSec = 10.0 * 60.0;
+    if (durationSec > kMaxSec) {
+        const auto ret = QMessageBox::question(this, QStringLiteral("スペクトル音声修復"),
+            QStringLiteral("音声が長すぎます (%1 秒)。先頭 %2 分のみを処理します。続行しますか?")
+                .arg(durationSec, 0, 'f', 1).arg(static_cast<int>(kMaxSec / 60.0)),
+            QMessageBox::Ok | QMessageBox::Cancel, QMessageBox::Ok);
+        if (ret != QMessageBox::Ok) {
+            statusBar()->showMessage(QStringLiteral("スペクトル音声修復: キャンセルしました。"), 3000);
+            return;
+        }
+        samples.resize(static_cast<size_t>(kMaxSec * sr));
+    }
+
+    // (d) ダイアログを開いてスペクトル編集。
+    //
+    // 注: 「適用」ボタンは applied() を emit するがダイアログは閉じない
+    // (modeless 設計)。「閉じる」は QDialog::reject 相当なので exec() の
+    // 戻り値では適用有無を判定できない。applied() を受けてフラグを立て、
+    // exec() 終了後にそのフラグで書き出すか判断する。
+    SpectralEditDialog dlg(this);
+    dlg.setObjectName(QStringLiteral("spectralEditDialog"));
+    dlg.setAudio(samples, sr);
+    bool didApply = false;
+    connect(&dlg, &SpectralEditDialog::applied, &dlg,
+            [&didApply]() { didApply = true; });
+    statusBar()->showMessage(QStringLiteral("スペクトル音声修復ダイアログを開いています..."), 2000);
+    dlg.exec();
+    if (!didApply) {
+        statusBar()->showMessage(QStringLiteral("スペクトル音声修復: 適用されませんでした。"), 3000);
+        return;
+    }
+
+    const std::vector<double> processed = dlg.processedSamples();
+    const int outSr = dlg.sampleRate() > 0 ? dlg.sampleRate() : sr;
+    if (processed.empty()) {
+        statusBar()->showMessage(QStringLiteral("スペクトル音声修復: 修復結果が空のため書き出しをスキップしました。"), 4000);
+        return;
+    }
+    if (processed.size() > static_cast<size_t>(std::numeric_limits<int>::max() / 2)) {
+        QMessageBox::warning(this, QStringLiteral("スペクトル音声修復"),
+            QStringLiteral("修復結果が大きすぎるため WAV として書き出せません。"));
+        return;
+    }
+
+    // (e) 修復結果 (mono 16bit PCM) を「<元名>_repaired.wav」として書き出す。
+    const QFileInfo srcInfo(sourcePath);
+    const QString defaultOut = srcInfo.absolutePath() + QLatin1Char('/') +
+                               srcInfo.completeBaseName() + QStringLiteral("_repaired.wav");
+    QString outPath = QFileDialog::getSaveFileName(
+        this, QStringLiteral("修復済み音声を保存"), defaultOut,
+        QStringLiteral("WAV ファイル (*.wav);;すべてのファイル (*)"));
+    if (outPath.isEmpty()) {
+        statusBar()->showMessage(QStringLiteral("スペクトル音声修復: 保存をキャンセルしました。"), 3000);
+        return;
+    }
+
+    // double → 16bit PCM little-endian へ変換。
+    QByteArray pcm;
+    pcm.resize(static_cast<int>(processed.size()) * 2);
+    char *dst = pcm.data();
+    for (size_t i = 0; i < processed.size(); ++i) {
+        double v = std::isfinite(processed[i]) ? processed[i] : 0.0;
+        if (v > 1.0) v = 1.0;
+        else if (v < -1.0) v = -1.0;
+        const qint16 s = static_cast<qint16>(qRound(v * 32767.0));
+        dst[i * 2]     = static_cast<char>(s & 0xFF);
+        dst[i * 2 + 1] = static_cast<char>((s >> 8) & 0xFF);
+    }
+
+    QString writeErr;
+    if (!libavcore::writePcm16AsWav(outPath, pcm, outSr, /*channels=*/1, &writeErr)) {
+        QMessageBox::warning(this, QStringLiteral("スペクトル音声修復"),
+            QStringLiteral("修復済み音声の書き出しに失敗しました:\n%1")
+                .arg(writeErr.isEmpty() ? outPath : writeErr));
+        return;
+    }
+
+    statusBar()->showMessage(
+        QStringLiteral("スペクトル音声修復: 保存しました — %1").arg(outPath), 6000);
+    QMessageBox::information(this, QStringLiteral("スペクトル音声修復"),
+        QStringLiteral("修復済み音声を書き出しました:\n%1\n\n"
+                       "(クリップの差し替えは行いません。生成したファイルを手動で取り込んでください。)")
+            .arg(outPath));
+#else
+    QMessageBox::information(this, QStringLiteral("スペクトル音声修復"),
+        QStringLiteral("SpectralEditDialog がビルドに含まれていません。"));
 #endif
 }
 

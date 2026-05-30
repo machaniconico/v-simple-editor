@@ -507,6 +507,9 @@ private slots:
     void openLowerThirdDialog();
     void openWatermarkDialog();
 
+    // SP-4: スペクトル音声修復 (iZotope RX 風オフライン処理)。
+    void openSpectralRepair();
+
     // User-customizable "お気に入り" menu — opens FavoritesEditDialog, then
     // persists the chosen action ids to QSettings and rebuilds the menu.
     void editFavorites();

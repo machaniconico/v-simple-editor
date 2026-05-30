@@ -72,6 +72,7 @@ int runProxySelftestV2();
 int runShortcutSelftest();
 int runSmartEditSelftest();
 int runSocialSelftest();
+int runSpectralEditSelftest();
 int runSubXlatSelftest();
 int runTextExportSelftest();
 int runThreePointEditSelftest();
@@ -157,6 +158,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "TrimOps engine: ripple/roll/slip/slide + bounds" },
     { "audio-bus",         "VEDITOR_AUDIO_BUS_SELFTEST",          runAudioBusSelftest,           false,
       "AudioBusRouting: bus/submix/aux-send gain resolution + cycle guard" },
+    { "spectral-edit",     "VEDITOR_SPECTRAL_EDIT_SELFTEST",      runSpectralEditSelftest,       false,
+      "SpectralEngine: FFT/STFT/iSTFT round-trip + region attenuation" },
     // QApplication-required (needsQApplication=true) ----------------------
     { "parity",            "VEDITOR_PARITY_SELFTEST",             runParitySelftest,             true,
       "Preview vs export pixel-parity (S1-S11, framediff::mse, 10-bit HDR10)" },
