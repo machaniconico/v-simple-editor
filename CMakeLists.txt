@@ -205,6 +205,13 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/PptxExport.cpp
     src/PptxExportDialog.cpp
     src/selftests/pptx_export_selftest.cpp
+    # Playback quality/cache (マルチトラック再生強化): CompositeFrameCache + PlaybackQualityPolicy。
+    src/playback/CompositeFrameCache.h
+    src/playback/CompositeFrameCache.cpp
+    src/playback/PlaybackQualityPolicy.h
+    src/playback/PlaybackQualityPolicy.cpp
+    src/selftests/composite_frame_cache_selftests.cpp
+    src/selftests/playback_quality_policy_selftests.cpp
     src/SourceMonitorDock.cpp
     src/MarkerPanelDock.cpp
     src/CommandPaletteDialog.h

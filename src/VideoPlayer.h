@@ -20,6 +20,8 @@
 #include "TextManager.h"
 #include "DecoderSlotManager.h"
 #include "AcesColor.h"  // AR-2: ACES シーンリファード色管理パイプライン (SSOT は MainWindow)
+#include "playback/CompositeFrameCache.h"     // ADAPTIVE-1: 合成フレーム LRU キャッシュ
+#include "playback/PlaybackQualityPolicy.h"   // ADAPTIVE-1: 再生品質ヒステリシスポリシー
 
 // Identifies a per-clip decoder in the V2+ pool. Keyed on
 // (filePath, clipInMs, sourceTrack, sourceClipIndex) so:
@@ -620,6 +622,40 @@ private:
     // displayFrame は enabled=true のときだけ最終合成結果へ適用するので、既定状態では
     // 既存のプレビュー出力とビット同一 (回帰ゼロ)。
     aces::AcesPipeline m_acesPipeline;
+
+    // ---- ADAPTIVE-1: アダプティブプレビュー (品質ポリシー + 合成キャッシュ) --------
+    // プレビュー再生パス専用。書き出し (RenderQueue / Exporter / renderFrameAt) は
+    // 一切経由しないので、編集↔書き出しピクセル一致 (SSOT) は不変。
+    //
+    // m_qualityPolicy: 直近 tick の合成ウォール時間とフレーム予算を比べ、ヒステリシス
+    //   付きで 1.0 → 0.5 → minScale の品質ラダーを上下する。停止時は reset() で 1.0。
+    // m_frameCache: (timelineRevision, timeMs, w, h, tier, useProxy) をキーに最終
+    //   合成 QImage を LRU 保持。同一プレイヘッド・同一編集状態での再描画
+    //   (停止フリッカー修正で残った previewSeek 再描画 / リサイズ再描画) を
+    //   再合成なしで返すための純キャッシュ。再生 tick の displayFrame 発火回数は
+    //   増やさない (cache hit でも 1 tick = 最大 1 displayFrame を厳守)。
+    // m_timelineRevision: 編集 / undo / クリップ変更で単調増加。setSequence で ++ し
+    //   invalidateRevision を呼んで古い世代のキャッシュを破棄する。
+    // m_lastTickRenderMs: 直近 tick の合成ウォール時間 (ms)。次 tick の policy 入力。
+    // m_adaptiveCanvasDivisor: policy が返した scaleFactor 由来の追加キャンバス縮小
+    //   係数 (1 / 2 / 4)。既存 canvasProxyDivisor() に乗算して合成解像度を下げる。
+    // m_adaptivePreviewEnabled: 既定 ON。VEDITOR_ADAPTIVE_PREVIEW_DISABLE=1 で OFF
+    //   (scaleFactor 強制 1.0 + キャッシュバイパス)。
+    playback::PlaybackQualityPolicy m_qualityPolicy;
+    playback::CompositeFrameCache   m_frameCache;
+    quint64 m_timelineRevision = 1;
+    double  m_lastTickRenderMs = 0.0;
+    int     m_adaptiveCanvasDivisor = 1;
+    bool    m_adaptivePreviewEnabled = true;
+    // 直近の cache 採用 tier (qualityTier キー用)。scaleFactor を整数化したもの。
+    int     m_adaptiveQualityTier = 0;
+    // ADAPTIVE-1: tick 冒頭で policy に相談し m_adaptiveCanvasDivisor /
+    // m_adaptiveQualityTier を更新する。停止/シーク経路では呼ばず policy.reset() を使う。
+    void updateAdaptiveQuality();
+    // ADAPTIVE-1: 合成済みプレビューフレームを現在の (timelineRevision, playhead,
+    // size, tier) キーでキャッシュへ put する純ヘルパー。displayFrame は呼ばない。
+    // m_adaptivePreviewEnabled=false 時は no-op。
+    void cachePreviewComposite(const QImage &composed);
 
     // ---- Per-clip decoder pool state (V2+ only) -----------------------------
     // Active V2+ decoders, keyed on TrackKey. V1 never lives here — it

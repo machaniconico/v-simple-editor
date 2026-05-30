@@ -279,6 +279,11 @@ VideoPlayer::VideoPlayer(QWidget *parent)
     m_mixer = new AudioMixer(this);
     connect(m_mixer, &AudioMixer::decoderError, this,
             [](const QString &msg) { qWarning() << "AudioMixer:" << msg; });
+
+    // ADAPTIVE-1: 既定 ON。VEDITOR_ADAPTIVE_PREVIEW_DISABLE=1 で完全バイパス
+    // (scaleFactor 強制 1.0 + キャッシュ無効) → 従来挙動とビット同一。
+    m_adaptivePreviewEnabled =
+        qEnvironmentVariableIntValue("VEDITOR_ADAPTIVE_PREVIEW_DISABLE") == 0;
 }
 
 VideoPlayer::~VideoPlayer()
@@ -662,6 +667,12 @@ void VideoPlayer::loadFile(const QString &filePath)
 void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
 {
     qInfo() << "VideoPlayer::setSequence count=" << entries.size();
+    // ADAPTIVE-1: タイムライン編集 / undo / クリップ変更はすべて setSequence に
+    // 集約される (sequenceChanged → MainWindow → setSequence)。世代カウンタを進め、
+    // 旧世代の合成キャッシュを破棄する。これにより編集後に同一プレイヘッドへ戻った
+    // 際に古い (編集前の) 合成フレームが誤って serve されることを防ぐ。
+    ++m_timelineRevision;
+    m_frameCache.invalidateRevision(m_timelineRevision);
     m_loggedCullState = false; // re-emit [cull] diagnostic for the new project
     // Phase 1e Win #16 (Iteration 9) — invalidate any pending preroll
     // de-dup. The new sequence may renumber entries, so the cached
@@ -1449,6 +1460,15 @@ void VideoPlayer::play()
     if (m_playing)
         return;
 
+    // ADAPTIVE-1: 新しい再生セッションはフル品質から開始する。前回の再生で
+    // 下がった scaleFactor を引き継がないよう policy をリセットする (guard 通過後
+    // = 実際に再生を開始するときだけ。debounce/既再生の早期 return では触らない)。
+    // 以降の tick が updateAdaptiveQuality() で実測に応じて再度ラダーを下げる。
+    m_qualityPolicy.reset();
+    m_adaptiveCanvasDivisor = 1;
+    m_adaptiveQualityTier = 0;
+    m_lastTickRenderMs = 0.0;
+
     // Phase 1e Win #12 — Fix J: collapse rapid play() bursts. The
     // scheduleNextFrame !advanced safety-net (line 2911-2923) auto-pauses
     // and stops the AudioMixer when a tick can't decode in time, which can
@@ -1755,6 +1775,14 @@ void VideoPlayer::forceTimelineUiToCurrent()
 void VideoPlayer::stop()
 {
     pause();
+    // ADAPTIVE-1: 停止は静止画フル品質提示。品質ポリシーを 1.0 にリセットし、
+    // 続く sequence-aware seek (performPendingSeek → seekInternal → displayFrame)
+    // がフル解像度で 1 回だけ再描画されるようにする。新たな displayFrame 呼び出しや
+    // 再描画ループはここでは起こさない (停止フリッカー修正の不変条件を維持)。
+    m_qualityPolicy.reset();
+    m_adaptiveCanvasDivisor = 1;
+    m_adaptiveQualityTier = 0;
+    m_lastTickRenderMs = 0.0;
     if (m_seekTimer)
         m_seekTimer->stop();
     // Rewind to the head. In sequence (timeline) mode the head is TIMELINE 0,
@@ -2750,6 +2778,16 @@ void VideoPlayer::performPendingSeek()
     // correct file-local position for the new playhead.
     m_postSeekResyncRequested = true;
 
+    // ADAPTIVE-1: シーク確定 (scrub 終了 / 明示シーク) は静止画提示でもある。
+    // 品質ポリシーを 1.0 にリセットし、次 tick / 静止再描画がフル解像度で合成される
+    // ようにする (停止画くっきり)。seekInternal/seekToTimelineUs が既に displayFrame
+    // を 1 回呼んでいるので、ここでは新たな displayFrame / 再描画ループは起こさない
+    // (フリッカー再発防止: 1 経路 = 最大 1 frame を維持)。
+    m_qualityPolicy.reset();
+    m_adaptiveCanvasDivisor = 1;
+    m_adaptiveQualityTier = 0;
+    m_lastTickRenderMs = 0.0;
+
     if (m_pendingSeekMs >= 0) {
         if (m_seekTimer)
             m_seekTimer->start();
@@ -3198,6 +3236,63 @@ void VideoPlayer::recordTickTrace(qint64 workNs)
     m_tickTraceSkipped = 0;
 }
 
+void VideoPlayer::updateAdaptiveQuality()
+{
+    // ADAPTIVE-1: 直近 tick の合成ウォール時間とフレーム予算を policy に相談し、
+    // 次 tick で使うキャンバス縮小係数 (m_adaptiveCanvasDivisor) と
+    // 品質 tier (m_adaptiveQualityTier) を決める。書き出し経路には一切触れない。
+    if (!m_adaptivePreviewEnabled) {
+        m_adaptiveCanvasDivisor = 1;
+        m_adaptiveQualityTier = 0;
+        return;
+    }
+
+    playback::PlaybackMetrics metrics;
+    metrics.trackCount = m_sequence.size();
+    metrics.activeClipCount =
+        findActiveEntriesAt(m_timelinePositionUs).size();
+    metrics.lastFrameRenderMs = m_lastTickRenderMs;
+    const int64_t baseFrameUs =
+        (m_frameDurationUs > 0) ? m_frameDurationUs : (AV_TIME_BASE / 30);
+    const double absSpeed = qMax(0.25, std::abs(m_playbackSpeed));
+    // フレーム予算 = 1 フレーム間隔 (ms)。倍速再生時は予算も縮む。
+    metrics.targetFrameMs =
+        qMax(1.0, (static_cast<double>(baseFrameUs) / 1000.0) / absSpeed);
+    metrics.isPlaying = m_playing;
+    // プロキシ候補判定: 再生用プレビュープロキシ divisor (env VEDITOR_PLAYBACK_PROXY
+    // / シークバー左のプロキシボタン m_proxyDivisor) のいずれかが等倍 (1) 以外なら
+    // 「プロキシ的な縮小が利用可能」と見なす。ProxyManager のグローバルトグル状態は
+    // ここでは参照せず、VideoPlayer 内で確定している縮小設定だけで判定する
+    // (依存を最小化し、判定が外部状態に左右されないようにするため)。
+    metrics.proxyAvailable = (playbackProxyDivisor() > 1) || (m_proxyDivisor > 1);
+
+    const playback::PlaybackQualityDecision d = m_qualityPolicy.decide(metrics);
+
+    // scaleFactor (1.0 / 0.5 / minScale=0.25) を整数キャンバス縮小係数へ。
+    // 1.0→1, 0.5→2, それ未満→4。最低 1px は canvasW/H 側で qMax 済み。
+    int divisor = 1;
+    if (d.scaleFactor >= 0.99)      divisor = 1;
+    else if (d.scaleFactor >= 0.49) divisor = 2;
+    else                            divisor = 4;
+    m_adaptiveCanvasDivisor = divisor;
+    // qualityTier はキャッシュキーの一部。同一プレイヘッドでも tier が違えば別物。
+    m_adaptiveQualityTier = divisor;
+}
+
+void VideoPlayer::cachePreviewComposite(const QImage &composed)
+{
+    if (!m_adaptivePreviewEnabled || composed.isNull())
+        return;
+    playback::CompositeFrameKey key;
+    key.timelineRevision = m_timelineRevision;
+    key.timeMs       = m_timelinePositionUs / 1000;
+    key.width        = composed.width();
+    key.height       = composed.height();
+    key.qualityTier  = m_adaptiveQualityTier;
+    key.useProxy     = (m_proxyDivisor > 1) || (playbackProxyDivisor() > 1);
+    m_frameCache.put(key, composed);
+}
+
 void VideoPlayer::handlePlaybackTick()
 {
     if (!m_playing)
@@ -3208,6 +3303,19 @@ void VideoPlayer::handlePlaybackTick()
     // bodyEnd + frameInterval (sliding cadence that drifts ~body_time
     // slower than real time).
     m_tickWallStart.start();
+
+    // ADAPTIVE-1: 直前 tick の合成時間に基づき今 tick のプレビュー品質を確定する。
+    // policy はヒステリシス付きなので毎 tick で振動しない。停止/シーク時は
+    // updateAdaptiveQuality を呼ばず (この関数は再生 tick からのみ)、停止経路は
+    // policy.reset() 相当 (m_lastTickRenderMs を 0 に戻すのは stop()/seek 側) に委ねる。
+    updateAdaptiveQuality();
+    // 今 tick の合成ウォール時間を実測するタイマー。displayFrame までを測る。
+    QElapsedTimer adaptiveRenderTimer;
+    adaptiveRenderTimer.start();
+    auto recordAdaptiveRenderTime = [&]() {
+        m_lastTickRenderMs = static_cast<double>(adaptiveRenderTimer.nsecsElapsed())
+                             / 1000000.0;
+    };
 
     QElapsedTimer tickTimer;
     const bool traceTick = tickTraceEnabled();
@@ -3470,6 +3578,36 @@ void VideoPlayer::handlePlaybackTick()
                 }
             }
         }
+        // ADAPTIVE-1: 合成キャッシュ参照。同一 (timelineRevision, playhead, size,
+        // tier, useProxy) の最終合成が既にあれば再合成 (overlay decode + compose) を
+        // スキップし、キャッシュ画像を 1 回だけ displayFrame する。prefetch-wait は
+        // 上で既に通過済みなのでワーカー寿命は tick 内に収まる。再生中は playhead が
+        // 毎 tick 進むため通常 miss (= decode/compose を従来どおり実行); ポーズ中の
+        // 再 tick や同一位置反復でのみ hit する純最適化。displayFrame 発火回数は不変
+        // (この tick も最大 1 frame)。テキストオーバーレイ時は合成解像度が等倍なので
+        // size キーもそれに合わせる。
+        bool servedFromCache = false;
+        if (m_adaptivePreviewEnabled) {
+            const int cacheProxy = m_textOverlays.isEmpty()
+                ? (canvasProxyDivisor() * m_adaptiveCanvasDivisor) : 1;
+            playback::CompositeFrameKey hitKey;
+            hitKey.timelineRevision = m_timelineRevision;
+            hitKey.timeMs       = m_timelinePositionUs / 1000;
+            hitKey.width        = qMax(2, m_canvasWidth  / cacheProxy);
+            hitKey.height       = qMax(2, m_canvasHeight / cacheProxy);
+            hitKey.qualityTier  = m_adaptiveQualityTier;
+            hitKey.useProxy     = (m_proxyDivisor > 1) || (playbackProxyDivisor() > 1);
+            QImage cached;
+            if (m_frameCache.tryGet(hitKey, cached)
+                && !cached.isNull()
+                && cached.size() == QSize(hitKey.width, hitKey.height)) {
+                if (m_glPreview)
+                    m_glPreview->setCompositeBakedMode(true);
+                displayFrame(cached);
+                servedFromCache = true;
+            }
+        }
+      if (!servedFromCache) {
         const QVector<int> activeIdxs = findActiveEntriesAt(m_timelinePositionUs);
         // GL viewport's setVideoSourceTransform is normally driven by the
         // active entry's videoScale/Dx/Dy in advanceToEntry. When we hand
@@ -3705,8 +3843,14 @@ void VideoPlayer::handlePlaybackTick()
             // in canvasProxyDivisor() at top of file). m_textOverlays
             // runtime gate keeps text overlays on the full-res path so
             // composeFrameWithOverlays paints text at correct coords.
+            // ADAPTIVE-1: 既存の env ベース canvasProxyDivisor() に policy が決めた
+            // 追加縮小係数 (m_adaptiveCanvasDivisor: 1/2/4) を乗算する。テキスト
+            // オーバーレイがある場合は座標ずれ回避のため従来どおり等倍 (1) 固定。
+            // m_adaptivePreviewEnabled=false 時は m_adaptiveCanvasDivisor=1 なので
+            // 従来挙動とビット同一。
             const int canvasProxy = m_textOverlays.isEmpty()
-                                    ? canvasProxyDivisor() : 1;
+                                    ? (canvasProxyDivisor() * m_adaptiveCanvasDivisor)
+                                    : 1;
             const int canvasW = qMax(2, m_canvasWidth  / canvasProxy);
             const int canvasH = qMax(2, m_canvasHeight / canvasProxy);
             if (m_canvasBase.size() != QSize(canvasW, canvasH)
@@ -3766,6 +3910,13 @@ void VideoPlayer::handlePlaybackTick()
                     // during multi-track playback.
                     if (m_glPreview)
                         m_glPreview->setCompositeBakedMode(true);
+                    // ADAPTIVE-1: 合成結果を (timelineRevision, playhead, size, tier)
+                    // でキャッシュ。再生は毎 tick playhead が進むのでキーは毎回変わり、
+                    // ライブ再生で hit することはない (= decode をスキップしないので
+                    // A/V sync を壊さない)。同一プレイヘッドの再描画 (リサイズ /
+                    // scrub 戻り) でのみ将来 hit する純キャッシュ。displayFrame の
+                    // 発火回数は不変 (1 tick = 最大 1 frame)。
+                    cachePreviewComposite(m_canvasBase);
                     displayFrame(m_canvasBase);
                 } else {
                     // Legacy path (VEDITOR_INPLACE_COMPOSE_DISABLE=1): allocates
@@ -3779,6 +3930,7 @@ void VideoPlayer::handlePlaybackTick()
                         m_tickTraceComposeNs += tickTimer.nsecsElapsed() - sectionMark;
                     if (m_glPreview)
                         m_glPreview->setCompositeBakedMode(true);
+                    cachePreviewComposite(composed); // ADAPTIVE-1: 上の in-place 分岐と同旨
                     displayFrame(composed);
                 }
             }
@@ -3807,6 +3959,7 @@ void VideoPlayer::handlePlaybackTick()
                 m_tickTraceDecodeNs += tickTimer.nsecsElapsed() - sectionMark;
             displayFrame(m_lastV1RawFrame);
         }
+      } // ADAPTIVE-1: close `if (!servedFromCache)`
     }
 
     // A/V sync: video owns m_currentPositionUs via the FFmpeg decoder;
@@ -3947,6 +4100,7 @@ void VideoPlayer::handlePlaybackTick()
                     }
                 }
                 if (advanced) {
+                    recordAdaptiveRenderTime();
                     updatePositionUi();
                     if (traceTick)
                         recordTickTrace(tickTimer.nsecsElapsed());
@@ -3968,6 +4122,12 @@ void VideoPlayer::handlePlaybackTick()
             }
         }
     }
+
+    // ADAPTIVE-1: 今 tick の合成ウォール時間 (decode+compose+display) を記録し、
+    // 次 tick の updateAdaptiveQuality() が品質ラダー判定に使う。早期 return する
+    // 経路 (end-of-sequence で pause→return する分岐) は再生停止なので測定不要
+    // (停止後は updateAdaptiveQuality が呼ばれず、stop()/play() が状態を整える)。
+    recordAdaptiveRenderTime();
 
     // Phase 1e Win #6 — safety-net: every exit path of handlePlaybackTick MUST
     // pass through this wait so worker lifetime is bounded by the tick.

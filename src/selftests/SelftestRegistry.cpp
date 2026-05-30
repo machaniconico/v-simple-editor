@@ -104,6 +104,8 @@ int runYoutubeSelftest();
 int runYtdlpDownloaderSelftest();
 int runPremiereXmlSelftest();
 int runYoutubeChapterSelftest();
+int runCompositeFrameCacheSelftest();
+int runPlaybackQualityPolicySelftest();
 
 namespace selftests {
 
@@ -184,6 +186,10 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "TextBasedEdit: transcript search + deletion range merge + kept complement" },
     { "pptx-export",      "VEDITOR_PPTX_EXPORT_SELFTEST",        runPptxExportSelftest,         false,
       "PptxExport: OOXML part tree + store-ZIP/CRC32 + slide XML well-formed + escaping" },
+    { "composite-frame-cache", "VEDITOR_COMPOSITE_FRAME_CACHE_SELFTEST", runCompositeFrameCacheSelftest, false,
+      "CompositeFrameCache: LRU eviction + key hashing + hit/miss accounting" },
+    { "playback-quality-policy", "VEDITOR_PLAYBACK_QUALITY_POLICY_SELFTEST", runPlaybackQualityPolicySelftest, false,
+      "PlaybackQualityPolicy: adaptive quality level selection + drop-frame heuristics" },
     // QApplication-required (needsQApplication=true) ----------------------
     { "parity",            "VEDITOR_PARITY_SELFTEST",             runParitySelftest,             true,
       "Preview vs export pixel-parity (S1-S11, framediff::mse, 10-bit HDR10)" },
