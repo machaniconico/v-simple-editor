@@ -363,6 +363,16 @@ private slots:
     void jumpToNextMarker();
     void jumpToPrevMarker();
 
+    // TR-4: プロ NLE トリムツール (再生ヘッド駆動)。選択クリップの先頭/末尾/
+    // 編集点を再生ヘッドへ合わせる Ripple/Roll と、秒入力で行う Slip/Slide。
+    // いずれも m_timeline->applyTrimActive(type, delta) に委譲し、結果を
+    // ステータスバーに表示する。マウスドラッグのトリムモードは別スコープ。
+    void rippleTrimInToPlayhead();
+    void rippleTrimOutToPlayhead();
+    void rollEditToPlayhead();
+    void slipSelectedClip();
+    void slideSelectedClip();
+
     // MK-2: マーカー パネル ドック関連スロット。
     // Timeline のマーカーが増減したら setMarkers() で表示を同期する。
     void refreshMarkerPanel();

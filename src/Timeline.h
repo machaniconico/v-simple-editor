@@ -61,6 +61,12 @@ class QDragLeaveEvent;
 class QDropEvent;
 class QTimer;
 
+// TR-3: トリム種別。実体は src/TrimOps.h。TrimOps.h は ClipInfo のために
+// この Timeline.h を #include するので、ここで逆 include すると循環参照に
+// なる。enum class は前方宣言できないため namespace + enum 種別だけを
+// 前方宣言し、シグネチャに使う (Timeline.cpp 側で TrimOps.h を実 include)。
+namespace trimops { enum class TrimType; }
+
 struct ClipInfo {
     QString filePath;
     QString displayName;
@@ -204,6 +210,12 @@ public:
     void removeClip(int index);
     void moveClip(int fromIndex, int toIndex);
     void splitClipAt(int index, double localSeconds);
+    // TR-3: 純粋エンジン trimops::applyTrim を clip[clipIndex] に適用する。
+    // 成功時は split/insert と同じ後処理 (updateMinimumWidth/update/emit
+    // modified) を行い true を返す。失敗 (不正 index / 境界違反) 時は
+    // m_clips 不変で false を返し、errorOut に日本語の理由を書き込む。
+    bool applyTrim(int clipIndex, trimops::TrimType type, double deltaSec,
+                   QString *errorOut = nullptr);
     int clipCount() const { return m_clips.size(); }
     const QVector<ClipInfo> &clips() const { return m_clips; }
     void setClips(const QVector<ClipInfo> &clips);
@@ -527,6 +539,13 @@ public:
     void insertClip3PointActive(double timelineStartSec, const ClipInfo &clip);
     void overwriteClip3PointActive(double timelineStartSec, const ClipInfo &clip);
 
+    // TR-3: アクティブ動画トラックの現在選択中クリップへ trimops の
+    // トリムを適用する薄いラッパー。Roll は選択クリップとその次クリップの編集点
+    // として扱う。成功時は 1 操作 = 1 Undo (saveUndoState) でまとめ true を返す。
+    // 選択無し / 動画トラック無し / 境界違反なら false + errorOut に日本語理由。
+    bool applyTrimActive(trimops::TrimType type, double deltaSec,
+                         QString *errorOut = nullptr);
+
     // Audio
     void addAudioFile(const QString &filePath);
     void insertAudioClipAtPlayhead(const QString &wavPath, int trackIdx = 2);
@@ -704,6 +723,7 @@ private:
     QVector<TimelineTrack*> m_audioTracks;
     TimelineTrack *m_videoTrack = nullptr; // alias for m_videoTracks[0]
     TimelineTrack *m_audioTrack = nullptr; // alias for m_audioTracks[0]
+    int m_activeVideoTrackIndex = -1; // last video row that originated selection
     // TM-8: track-matte wiring carried by the Timeline (see
     // setTrackMatteEntries). Keyed by "trackIdx:clipIdx".
     QHash<QString, TimelineTrackMatteEntry> m_trackMatteEntries;

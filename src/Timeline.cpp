@@ -1,5 +1,6 @@
 #include "Timeline.h"
 #include "ThreePointEdit.h"
+#include "TrimOps.h"
 #include "TrackMatteKey.h"
 #include "ProxyManager.h"
 #include "UndoManager.h"
@@ -804,6 +805,18 @@ void TimelineTrack::splitClipAt(int index, double localSeconds)
     original.outPoint = splitPoint;
     m_clips.insert(index + 1, secondHalf);
     updateMinimumWidth(); update(); emit modified();
+}
+
+bool TimelineTrack::applyTrim(int clipIndex, trimops::TrimType type,
+                              double deltaSec, QString *errorOut)
+{
+    // 純粋エンジン trimops:: が境界判定と in-place 変更を担う。成功時のみ
+    // split/insert と同じ後処理 (幅再計算 + 再描画 + modified 発火) を行う。
+    // 失敗時は m_clips が一切変更されないので何もせず false を返す。
+    if (!trimops::applyTrim(m_clips, clipIndex, type, deltaSec, errorOut))
+        return false;
+    updateMinimumWidth(); update(); emit modified();
+    return true;
 }
 
 void TimelineTrack::applyDragMove(int clipIdx, double leadIn, double nextLeadIn)
@@ -4238,6 +4251,50 @@ void Timeline::overwriteClip3PointActive(double timelineStartSec, const ClipInfo
     saveUndoState("3点編集: 上書き");
 }
 
+bool Timeline::applyTrimActive(trimops::TrimType type, double deltaSec,
+                               QString *errorOut)
+{
+    // アクティブ動画トラックの現在選択中クリップへトリムを適用する。
+    // Roll は「選択クリップ = 編集点の左側クリップ」として扱うので、trimops::
+    // applyTrim が clip[sel]/clip[sel+1] の編集点を動かす。選択が無ければ失敗。
+    if (m_videoTracks.isEmpty()) {
+        if (errorOut) *errorOut = QObject::tr("動画トラックがありません");
+        return false;
+    }
+    TimelineTrack *track = nullptr;
+    if (m_activeVideoTrackIndex >= 0
+        && m_activeVideoTrackIndex < m_videoTracks.size()) {
+        auto *candidate = m_videoTracks[m_activeVideoTrackIndex];
+        const int candidateSel = candidate ? candidate->selectedClip() : -1;
+        if (candidate && candidateSel >= 0 && candidateSel < candidate->clipCount())
+            track = candidate;
+    }
+    if (!track) {
+        for (int i = 0; i < m_videoTracks.size(); ++i) {
+            auto *candidate = m_videoTracks[i];
+            const int candidateSel = candidate ? candidate->selectedClip() : -1;
+            if (candidate && candidateSel >= 0 && candidateSel < candidate->clipCount()) {
+                track = candidate;
+                m_activeVideoTrackIndex = i;
+                break;
+            }
+        }
+    }
+    if (!track) {
+        if (errorOut) *errorOut = QObject::tr("トリム対象のクリップが選択されていません");
+        return false;
+    }
+    const int sel = track->selectedClip();
+    if (sel < 0 || sel >= track->clipCount()) {
+        if (errorOut) *errorOut = QObject::tr("トリム対象のクリップが選択されていません");
+        return false;
+    }
+    if (!track->applyTrim(sel, type, deltaSec, errorOut))
+        return false;
+    saveUndoState("トリム");
+    return true;
+}
+
 void Timeline::addAudioFile(const QString &filePath)
 {
     AVFormatContext *fmt = nullptr;
@@ -4614,6 +4671,7 @@ double Timeline::totalDuration() const
 void Timeline::onTrackClipClicked(int index)
 {
     m_audioTrack->setSelectedClip(index);
+    m_activeVideoTrackIndex = index < 0 ? -1 : 0;
     emit clipSelected(index);
     // V3 sprint — track-aware overload. m_videoTrack is m_videoTracks[0]
     // (V1) by construction, so this legacy single-track entry point always
@@ -4677,6 +4735,7 @@ void Timeline::wireTrackSelection(TimelineTrack *track)
         // the click landed on; audio-track clicks emit trackIdx=-1 so the
         // edit target falls back to follow-active.
         int videoTrackIdx = m_videoTracks.indexOf(track);
+        m_activeVideoTrackIndex = (index >= 0 && videoTrackIdx >= 0) ? videoTrackIdx : -1;
         emit clipSelectedOnTrack(index < 0 ? -1 : videoTrackIdx, index);
     });
     connect(track, &TimelineTrack::emptyAreaClicked, this, [this]() {
@@ -4900,6 +4959,7 @@ void Timeline::clearAllSelections()
     for (auto *t : m_videoTracks) clearOne(t);
     for (auto *t : m_audioTracks) clearOne(t);
     if (changed) {
+        m_activeVideoTrackIndex = -1;
         emit clipSelected(-1);
         // V3 sprint — track-aware overload, deselect path.
         emit clipSelectedOnTrack(-1, -1);
@@ -5359,6 +5419,7 @@ void Timeline::restoreState(const TimelineState &state)
     // through so wireTrackSelection can sync linked clips and emit
     // clipSelected/clipSelectedOnTrack.
     clearAllSelections();
+    m_activeVideoTrackIndex = -1;
 
     bool videoSelSet = false;
     if (state.selectedVideoTrackIndex >= 0
@@ -5377,6 +5438,7 @@ void Timeline::restoreState(const TimelineState &state)
         m_videoTrack->setSelectedClip(state.selectedClip);
         m_videoTrack->blockSignals(vWas);
         emit clipSelected(state.selectedClip);
+        m_activeVideoTrackIndex = state.selectedClip < 0 ? -1 : 0;
         emit clipSelectedOnTrack(state.selectedClip < 0 ? -1 : 0,
                                  state.selectedClip);
     }

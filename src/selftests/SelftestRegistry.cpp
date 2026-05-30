@@ -81,6 +81,7 @@ int runTrackMatteRm5ReorderSelftest();
 int runTrackMatteRm6DuplicateSelftest();
 int runTranscriptHighlighterSelftest();
 int runTrackerPresetSelftest();
+int runTrimOpsSelftest();
 int runTwitchSelftest();
 int runVfxSelftest();
 int runVideostabDeshakeSelftest();
@@ -151,6 +152,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "MediaPool model: asset/bin/smartbin CRUD + search + JSON round-trip" },
     { "three-point-edit",  "VEDITOR_THREE_POINT_EDIT_SELFTEST",   runThreePointEditSelftest,     false,
       "ThreePointEdit engine: selection->clip, validate, overwrite plan" },
+    { "trim-ops",          "VEDITOR_TRIM_OPS_SELFTEST",           runTrimOpsSelftest,            false,
+      "TrimOps engine: ripple/roll/slip/slide + bounds" },
     // QApplication-required (needsQApplication=true) ----------------------
     { "parity",            "VEDITOR_PARITY_SELFTEST",             runParitySelftest,             true,
       "Preview vs export pixel-parity (S1-S11, framediff::mse, 10-bit HDR10)" },

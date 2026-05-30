@@ -1,6 +1,7 @@
 #include "MainWindow.h"
 #include "VideoPlayer.h"
 #include "Timeline.h"
+#include "TrimOps.h"
 #include "ExportDialog.h"
 #include "UndoManager.h"
 #include "OverlayDialogs.h"
@@ -1994,6 +1995,41 @@ void MainWindow::setupMenuBar()
     }, Qt::QueuedConnection);
     m_menuHelpEntries.append({markerPanelAction,
         QStringLiteral("タイムライン上のマーカーを表形式で一覧表示するパネルを出し入れします。行をダブルクリックでその時刻へジャンプ、ノートの編集や削除ができます。")});
+
+    // TR-4: トリム メニュー (プロ NLE のリップル/ロール/スリップ/スライド)。
+    // 再生ヘッド駆動なので追加のドラッグ UI なしで成立する。実体は純粋エンジン
+    // trimops:: で、Timeline::applyTrimActive() が選択クリップへ適用する。
+    auto *trimMenu = menuBar()->addMenu("トリム(&T)");
+
+    auto *rippleInAction = trimMenu->addAction("選択クリップの先頭を再生ヘッドへ (リップル)");
+    rippleInAction->setShortcut(QKeySequence(Qt::Key_Q));
+    connect(rippleInAction, &QAction::triggered, this, &MainWindow::rippleTrimInToPlayhead);
+    m_menuHelpEntries.append({rippleInAction,
+        QStringLiteral("選んだクリップの先頭を今の再生位置まで詰めます（リップル）。後ろのクリップは隙間なくついてきます。")});
+
+    auto *rippleOutAction = trimMenu->addAction("選択クリップの末尾を再生ヘッドへ (リップル)");
+    rippleOutAction->setShortcut(QKeySequence(Qt::Key_W));
+    connect(rippleOutAction, &QAction::triggered, this, &MainWindow::rippleTrimOutToPlayhead);
+    m_menuHelpEntries.append({rippleOutAction,
+        QStringLiteral("選んだクリップの末尾を今の再生位置まで伸縮します（リップル）。後ろのクリップは隙間なくついてきます。")});
+
+    auto *rollEditAction = trimMenu->addAction("編集点を再生ヘッドへ (ロール)");
+    rollEditAction->setShortcut(QKeySequence(Qt::Key_R));
+    connect(rollEditAction, &QAction::triggered, this, &MainWindow::rollEditToPlayhead);
+    m_menuHelpEntries.append({rollEditAction,
+        QStringLiteral("選んだクリップと次のクリップの境目（編集点）を今の再生位置へ動かします。全体の長さは変わりません（ロール）。")});
+
+    trimMenu->addSeparator();
+
+    auto *slipAction = trimMenu->addAction("スリップ...");
+    connect(slipAction, &QAction::triggered, this, &MainWindow::slipSelectedClip);
+    m_menuHelpEntries.append({slipAction,
+        QStringLiteral("クリップの位置と長さはそのままで、中で見せる範囲だけを前後にずらします（スリップ）。秒数を入力します。")});
+
+    auto *slideAction = trimMenu->addAction("スライド...");
+    connect(slideAction, &QAction::triggered, this, &MainWindow::slideSelectedClip);
+    m_menuHelpEntries.append({slideAction,
+        QStringLiteral("クリップの中身はそのままで、タイムライン上の位置だけを前後にずらします。隣のクリップが伸縮して吸収します（スライド）。秒数を入力します。")});
 
     // エフェクト メニュー
     auto *effectsMenu = menuBar()->addMenu("エフェクト(&F)");
@@ -4592,6 +4628,157 @@ void MainWindow::onSourceOverwriteRequested(const threepoint::SourceSelection &s
             .arg(sel.displayName.isEmpty()
                      ? QFileInfo(sel.filePath).fileName()
                      : sel.displayName));
+}
+
+// TR-4: 選択クリップの先頭を再生ヘッドへ合わせる (RippleIn)。
+// delta(timeline 秒) = 再生ヘッド秒 - クリップ開始秒。正なら頭を詰めて短く、
+// 負なら頭を伸ばす。下流クリップは applyTrimActive 内で隙間なくシフトする。
+void MainWindow::rippleTrimInToPlayhead()
+{
+    if (!m_timeline) {
+        statusBar()->showMessage(QStringLiteral("タイムラインがありません"));
+        return;
+    }
+    int trackIdx = -1, clipIdx = -1;
+    if (!selectedVideoClipRef(trackIdx, clipIdx)) {
+        statusBar()->showMessage(QStringLiteral("トリムするクリップを選択してください"));
+        return;
+    }
+    const double clipStart = clipTimelineStartSeconds(trackIdx, clipIdx);
+    const double delta = currentPlayheadSeconds() - clipStart;
+
+    QString err;
+    if (m_timeline->applyTrimActive(trimops::TrimType::RippleIn, delta, &err)) {
+        updateStatusInfo();
+        statusBar()->showMessage(
+            QStringLiteral("先頭を再生ヘッドへリップルしました (%1 秒)")
+                .arg(delta, 0, 'f', 2));
+    } else {
+        statusBar()->showMessage(QStringLiteral("リップルできません: %1").arg(err));
+    }
+}
+
+// TR-4: 選択クリップの末尾を再生ヘッドへ合わせる (RippleOut)。
+// delta(timeline 秒) = 再生ヘッド秒 - クリップ終了秒。下流クリップは
+// applyTrimActive 内で同量シフトしてギャップを保つ。
+void MainWindow::rippleTrimOutToPlayhead()
+{
+    if (!m_timeline) {
+        statusBar()->showMessage(QStringLiteral("タイムラインがありません"));
+        return;
+    }
+    int trackIdx = -1, clipIdx = -1;
+    ClipInfo clip;
+    if (!selectedVideoClipRef(trackIdx, clipIdx, &clip)) {
+        statusBar()->showMessage(QStringLiteral("トリムするクリップを選択してください"));
+        return;
+    }
+    const double clipEnd =
+        clipTimelineStartSeconds(trackIdx, clipIdx) + clip.effectiveDuration();
+    const double delta = currentPlayheadSeconds() - clipEnd;
+
+    QString err;
+    if (m_timeline->applyTrimActive(trimops::TrimType::RippleOut, delta, &err)) {
+        updateStatusInfo();
+        statusBar()->showMessage(
+            QStringLiteral("末尾を再生ヘッドへリップルしました (%1 秒)")
+                .arg(delta, 0, 'f', 2));
+    } else {
+        statusBar()->showMessage(QStringLiteral("リップルできません: %1").arg(err));
+    }
+}
+
+// TR-4: 選択クリップと次クリップの編集点を再生ヘッドへ合わせる (Roll)。
+// 編集点 = 選択クリップ終了秒 (= 次クリップ開始秒)。total 尺は不変。
+void MainWindow::rollEditToPlayhead()
+{
+    if (!m_timeline) {
+        statusBar()->showMessage(QStringLiteral("タイムラインがありません"));
+        return;
+    }
+    int trackIdx = -1, clipIdx = -1;
+    ClipInfo clip;
+    if (!selectedVideoClipRef(trackIdx, clipIdx, &clip)) {
+        statusBar()->showMessage(QStringLiteral("トリムするクリップを選択してください"));
+        return;
+    }
+    const double editPoint =
+        clipTimelineStartSeconds(trackIdx, clipIdx) + clip.effectiveDuration();
+    const double delta = currentPlayheadSeconds() - editPoint;
+
+    QString err;
+    if (m_timeline->applyTrimActive(trimops::TrimType::Roll, delta, &err)) {
+        updateStatusInfo();
+        statusBar()->showMessage(
+            QStringLiteral("編集点を再生ヘッドへロールしました (%1 秒)")
+                .arg(delta, 0, 'f', 2));
+    } else {
+        statusBar()->showMessage(QStringLiteral("ロールできません: %1").arg(err));
+    }
+}
+
+// TR-4: 選択クリップのスリップ。秒数を入力させ、見せる窓 (in/out) だけを
+// ずらす。タイムライン上の位置・実尺は不変。
+void MainWindow::slipSelectedClip()
+{
+    if (!m_timeline) {
+        statusBar()->showMessage(QStringLiteral("タイムラインがありません"));
+        return;
+    }
+    int trackIdx = -1, clipIdx = -1;
+    if (!selectedVideoClipRef(trackIdx, clipIdx)) {
+        statusBar()->showMessage(QStringLiteral("トリムするクリップを選択してください"));
+        return;
+    }
+    bool ok = false;
+    const double delta = QInputDialog::getDouble(
+        this, QStringLiteral("スリップ"),
+        QStringLiteral("ずらす秒数 (正=後ろ / 負=前):"),
+        0.0, -3600.0, 3600.0, 2, &ok);
+    if (!ok || qFuzzyIsNull(delta))
+        return;
+
+    QString err;
+    if (m_timeline->applyTrimActive(trimops::TrimType::Slip, delta, &err)) {
+        updateStatusInfo();
+        statusBar()->showMessage(
+            QStringLiteral("クリップをスリップしました (%1 秒)")
+                .arg(delta, 0, 'f', 2));
+    } else {
+        statusBar()->showMessage(QStringLiteral("スリップできません: %1").arg(err));
+    }
+}
+
+// TR-4: 選択クリップのスライド。秒数を入力させ、クリップ中身は不変のまま
+// タイムライン上の位置だけを動かす。隣接クリップが伸縮して吸収する。
+void MainWindow::slideSelectedClip()
+{
+    if (!m_timeline) {
+        statusBar()->showMessage(QStringLiteral("タイムラインがありません"));
+        return;
+    }
+    int trackIdx = -1, clipIdx = -1;
+    if (!selectedVideoClipRef(trackIdx, clipIdx)) {
+        statusBar()->showMessage(QStringLiteral("トリムするクリップを選択してください"));
+        return;
+    }
+    bool ok = false;
+    const double delta = QInputDialog::getDouble(
+        this, QStringLiteral("スライド"),
+        QStringLiteral("動かす秒数 (正=後ろ / 負=前):"),
+        0.0, -3600.0, 3600.0, 2, &ok);
+    if (!ok || qFuzzyIsNull(delta))
+        return;
+
+    QString err;
+    if (m_timeline->applyTrimActive(trimops::TrimType::Slide, delta, &err)) {
+        updateStatusInfo();
+        statusBar()->showMessage(
+            QStringLiteral("クリップをスライドしました (%1 秒)")
+                .arg(delta, 0, 'f', 2));
+    } else {
+        statusBar()->showMessage(QStringLiteral("スライドできません: %1").arg(err));
+    }
 }
 
 void MainWindow::exportVideo()
