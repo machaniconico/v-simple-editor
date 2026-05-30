@@ -1,6 +1,11 @@
 #include "MainWindow.h"
 #include "VideoPlayer.h"
 #include "Timeline.h"
+
+// AR-2: レガシー Exporter 経路へ ACES 色管理パイプラインを渡すフリー関数。実体は
+// Exporter.cpp に TU ローカル状態とともに定義 (Exporter.h は touchedFiles 外のため
+// ヘッダを変更せずに済む設計)。aces::AcesPipeline は MainWindow.h 経由で可視。
+void exporter_setAcesPipeline(const aces::AcesPipeline &pipeline);
 #include "TrimOps.h"
 #include "ExportDialog.h"
 #include "UndoManager.h"
@@ -4432,6 +4437,11 @@ void MainWindow::applyLoadedProjectData(const ProjectData &data, const QString &
     // AC-4: ACES カラーマネジメント パイプライン設定を復元 (SSOT)。
     // ダイアログを次に開いたときにこの状態が初期値となる。
     m_acesPipeline = data.acesPipeline;
+    // AR-2: 復元した ACES 設定をプレビュー / レガシー Exporter 経路へ反映する。
+    // enabled=false なら双方 no-op (従来出力とビット同一)。
+    if (m_player)
+        m_player->setAcesPipeline(m_acesPipeline);
+    exporter_setAcesPipeline(m_acesPipeline);
 
     // DV-4: Dolby Vision メタデータを復元 (SSOT)。
     m_dolbyVision = data.dolbyVision;
@@ -5015,6 +5025,10 @@ void MainWindow::exportVideo()
     // GUI map onto m_timeline immediately before submission so an edit
     // made after the last configure-matte/load is reflected.
     syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+    // AC: production export 経路に ACES SSOT を push (start() 前)。プレビュー /
+    // legacy Exporter には openColorManagement / load で既に push 済み。
+    // RenderQueue は 8bit 経路でのみ適用し、enabled=false 時はビット同一。
+    m_renderQueue->setAcesPipeline(m_acesPipeline);
     statusBar()->showMessage("Exporting: " + exportCfg.outputPath);
     m_renderQueue->addJob(job);
     m_renderQueue->start();
@@ -9153,6 +9167,9 @@ void MainWindow::onMobileExport()
                     // re-sync requirement as File→Export above.
                     syncTrackMatteEntriesToTimeline(
                         m_timeline, m_trackMatteClipEntries);
+                    // AC: production export 経路に ACES SSOT を push (start()
+                    // 前)。8bit 経路のみ適用、enabled=false 時はビット同一。
+                    m_renderQueue->setAcesPipeline(m_acesPipeline);
                     statusBar()->showMessage(
                         QStringLiteral("モバイル書き出し: ") + cfg.outputPath);
                     m_renderQueue->addJob(job);
@@ -10277,14 +10294,20 @@ void MainWindow::openSpectralRepair()
 // AC-4: ACES カラーマネジメント設定ダイアログ。SSOT である m_acesPipeline を
 // 編集対象として渡し、OK のときのみ確定する。確定した設定は project save/load を
 // 通じて ProjectData::acesPipeline に永続化される。
-// TODO: 確定した m_acesPipeline をプレビュー/エクスポートのレンダーパイプラインへ
-//       実適用するのは後続スコープ (本ストーリーは設定の保持と永続化までを担う)。
+// AR-2: 確定した m_acesPipeline をプレビュー (VideoPlayer::setAcesPipeline) と
+//       レガシー Exporter (exporter_setAcesPipeline) へ即反映する。
+//       enabled=false のときは双方とも no-op で従来出力とビット同一 (回帰ゼロ)。
 void MainWindow::openColorManagement()
 {
     ColorManagementDialog dlg(this);
     dlg.setPipeline(m_acesPipeline);
     if (dlg.exec() == QDialog::Accepted) {
         m_acesPipeline = dlg.pipeline();
+        // AR-2: プレビュー即反映 (setAcesPipeline 内で表示中フレームを再描画) +
+        // レガシー Exporter 経路への受け渡し。
+        if (m_player)
+            m_player->setAcesPipeline(m_acesPipeline);
+        exporter_setAcesPipeline(m_acesPipeline);
         const QString state = m_acesPipeline.enabled
             ? QStringLiteral("有効 (入力 %1 → 作業 %2 → 出力 %3)")
                   .arg(aces::colorSpaceName(m_acesPipeline.input),

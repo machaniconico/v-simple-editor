@@ -1,6 +1,9 @@
 #include "AcesColor.h"
 
 #include <algorithm>
+#include <cmath>
+
+#include <QHash>
 
 namespace aces {
 
@@ -306,6 +309,75 @@ Vec3 process(const AcesPipeline& p, const Vec3& encodedInput)
     // working は ACEScg 前提 (idt が ACEScg を返す)。
     const Vec3 working = idt(p.input, encodedInput);
     return rrtOdt(working, p.output);
+}
+
+// ===========================================================================
+// 画像レベル適用
+// ===========================================================================
+QImage applyPipelineToImage(const QImage& src, const AcesPipeline& pipeline)
+{
+    if (src.isNull() || src.width() <= 0 || src.height() <= 0) {
+        return src;
+    }
+    if (!pipeline.enabled) {
+        // identity: 変換せずそのまま返す (QImage は implicit-shared なので深いコピーなし)。
+        return src;
+    }
+
+    // RGBA8888 に正規化して per-pixel に処理する (アルファ保持)。
+    // Format_RGBA8888 は byte-ordered format なので QRgb として読むと
+    // little-endian 環境で R/B が入れ替わる。scanLine はバイト列として扱う。
+    const QImage in = src.convertToFormat(QImage::Format_RGBA8888);
+    QImage out(in.size(), QImage::Format_RGBA8888);
+
+    // 同一入力色 (RGB) の process 再計算を避けるキャッシュ。キーは RGB のみ (アルファ非依存)。
+    QHash<QRgb, QRgb> cache;
+    cache.reserve(1024);
+
+    auto clamp8 = [](double v) -> int {
+        if (!std::isfinite(v)) return 0;
+        const double scaled = v * 255.0;
+        if (scaled <= 0.0) return 0;
+        if (scaled >= 255.0) return 255;
+        // 四捨五入。
+        return static_cast<int>(scaled + 0.5);
+    };
+
+    const int w = in.width();
+    const int h = in.height();
+    for (int y = 0; y < h; ++y) {
+        const uchar* srcLine = in.constScanLine(y);
+        uchar* dstLine = out.scanLine(y);
+        for (int x = 0; x < w; ++x) {
+            const int i = x * 4;
+            const int r = srcLine[i + 0];
+            const int g = srcLine[i + 1];
+            const int b = srcLine[i + 2];
+            const int a = srcLine[i + 3];
+            // RGB のみをキー (アルファは別途保持) にしてキャッシュ参照。
+            const QRgb rgbKey = qRgb(r, g, b);
+            QRgb mapped;
+            auto it = cache.find(rgbKey);
+            if (it != cache.end()) {
+                mapped = it.value();
+            } else {
+                const Vec3 inColor = {
+                    r / 255.0,
+                    g / 255.0,
+                    b / 255.0
+                };
+                const Vec3 outColor = process(pipeline, inColor);
+                mapped = qRgb(clamp8(outColor[0]), clamp8(outColor[1]), clamp8(outColor[2]));
+                cache.insert(rgbKey, mapped);
+            }
+            // mapped は RGB。元ピクセルのアルファを合わせて出力。
+            dstLine[i + 0] = static_cast<uchar>(qRed(mapped));
+            dstLine[i + 1] = static_cast<uchar>(qGreen(mapped));
+            dstLine[i + 2] = static_cast<uchar>(qBlue(mapped));
+            dstLine[i + 3] = static_cast<uchar>(a);
+        }
+    }
+    return out;
 }
 
 // ===========================================================================

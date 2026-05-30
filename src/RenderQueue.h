@@ -7,6 +7,8 @@
 #include <QJsonObject>
 #include <QMutex>
 
+#include "AcesColor.h"  // AC: ACES カラーマネジメント パイプライン (production export 配線)
+
 class QThread;
 class QProcess;
 class Timeline;
@@ -104,6 +106,12 @@ public:
     bool isRunning() const { return m_running; }
     void start();   // process pending jobs sequentially
     void stop();    // cancel current and stop queue
+
+    // AC: production export 経路 (RenderQueue→tlrender::renderFrameAt) に適用する
+    // ACES カラーマネジメント パイプラインを設定する。MainWindow の SSOT
+    // m_acesPipeline を start() 前に push する想定 (UI スレッドから呼ばれる)。
+    // enabled=false (既定) のときレンダーワーカーは一切適用せずビット同一。
+    void setAcesPipeline(const aces::AcesPipeline &p);
 
     static QVector<RenderPreset> availablePresets();
     static RenderJob jobFromPreset(const RenderPreset &preset,
@@ -223,4 +231,11 @@ private:
     // thread while the worker thread owns it.
     QMutex m_processMutex;
     QProcess *m_process = nullptr;
+
+    // AC: production export 経路に適用する ACES パイプライン (SSOT は MainWindow
+    // の m_acesPipeline)。setAcesPipeline は UI スレッドから start() 前に呼ばれ、
+    // レンダーワーカーはフレームループ開始前に 1 度だけスナップショットを取る。
+    // 設定とスナップショット取得を m_acesMutex で保護する (Exporter の前例に倣う)。
+    mutable QMutex m_acesMutex;
+    aces::AcesPipeline m_acesPipeline;
 };

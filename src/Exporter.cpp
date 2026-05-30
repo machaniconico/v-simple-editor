@@ -4,10 +4,38 @@
 #include "VideoEffect.h"
 #include "SmartReframe.h"
 #include "SubtitleTrackRenderer.h"
+#include "AcesColor.h"  // AR-2: ACES シーンリファード色管理パイプライン
 #include "libavcore/Encode.h"
 #include <QFileInfo>
+#include <QMutex>
+#include <QMutexLocker>
 #include <QPainter>
 #include <cmath>
+
+// AR-2: ACES 色管理パイプラインを Exporter (LEGACY パス) へ渡す手段。Exporter.h は
+// 本ストーリーの touchedFiles 外なので、ヘッダを変更せずに済むよう TU ローカルの
+// グローバルとフリー関数セッターで受け取る。setter は UI thread、doExport は
+// worker thread で走るため、読み書きは mutex で保護し、export 開始時に snapshot
+// して以後はローカルコピーだけを読む。
+// 既定 enabled=false のため、未設定/無効時はエクスポート出力が従来とビット同一
+// (回帰ゼロ)。
+namespace {
+QMutex g_exporterAcesPipelineMutex;
+aces::AcesPipeline g_exporterAcesPipeline;
+
+aces::AcesPipeline exporterAcesPipelineSnapshot()
+{
+    QMutexLocker locker(&g_exporterAcesPipelineMutex);
+    return g_exporterAcesPipeline;
+}
+}
+
+// MainWindow.cpp から extern 宣言で参照される。
+void exporter_setAcesPipeline(const aces::AcesPipeline &pipeline)
+{
+    QMutexLocker locker(&g_exporterAcesPipelineMutex);
+    g_exporterAcesPipeline = pipeline;
+}
 
 Exporter::Exporter(QObject *parent)
     : QObject(parent)
@@ -95,6 +123,8 @@ bool Exporter::openInputFile(const QString &path, AVFormatContext **fmtCtx, AVCo
 // and Mobile Export now route through RenderQueue). See progress.txt S12.
 void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &clips)
 {
+    const aces::AcesPipeline exporterAcesPipeline = exporterAcesPipelineSnapshot();
+
     if (clips.isEmpty()) {
         emit exportFinished(false, "No clips to export");
         return;
@@ -265,7 +295,11 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
                 const bool tenBitPath = isHdr10Mode || isHlgMode || config.proresProfile >= 0;
                 bool hasEffects = !tenBitPath
                                   && (!clip.colorCorrection.isDefault() || !clip.effects.isEmpty());
+                // AR-2: ACES が有効なら 8-bit RGB ラウンドトリップが必要。10-bit/HDR/
+                // ProRes 経路 (tenBitPath) では適用しない (ACES 出力は 8-bit RGB)。
+                const bool acesActive = exporterAcesPipeline.enabled && !tenBitPath;
                 bool needsRgbPass = hasEffects
+                                    || acesActive
                                     || (m_smartReframe != nullptr)
                                     || (m_subtitleRenderer != nullptr);
                 if (needsRgbPass) {
@@ -315,6 +349,17 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
                             painter,
                             QRectF(0, 0, workingImage.width(), workingImage.height()),
                             framePts - clip.inPoint);
+                    }
+
+                    // AR-2: ACES シーンリファード色管理を最終 RGB フレームへ適用する。
+                    // enabled=false (既定) のときは一切呼ばず、従来出力とビット同一を維持
+                    // (回帰ゼロ)。applyPipelineToImage は RGBA8888 を返すため、後段の
+                    // RGB24->YUV420P 変換に合わせて RGB888 へ戻す。プレビューは
+                    // VideoPlayer::displayFrame でのみ適用するので二重適用しない。
+                    if (acesActive && !workingImage.isNull()) {
+                        QImage acesOut = aces::applyPipelineToImage(
+                            workingImage, exporterAcesPipeline);
+                        workingImage = acesOut.convertToFormat(QImage::Format_RGB888);
                     }
 
                     // Convert processed RGB back to YUV420P

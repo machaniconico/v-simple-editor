@@ -31,6 +31,7 @@
 
 #include <QString>
 #include <QJsonObject>
+#include <QImage>
 
 namespace aces {
 
@@ -109,6 +110,15 @@ struct AcesPipeline {
 
 // enabled=false なら encodedInput をそのまま返す。true なら idt -> rrtOdt を適用する。
 Vec3 process(const AcesPipeline& p, const Vec3& encodedInput);
+
+// 画像レベルの ACES 適用。
+//   pipeline.enabled=false なら src をそのまま返す (identity, 変換なし)。
+//   enabled=true なら src を RGBA8888 に正規化し、各ピクセルの RGB を [0..1] に正規化 ->
+//   process(pipeline, {r,g,b}) -> [0..255] にクランプ戻し、で出力 QImage を作る。アルファは保持。
+//   process() は 3ch 結合変換 (per-channel な 1D LUT に分解できない) のため per-pixel 適用だが、
+//   同一入力色のキャッシュ (QHash<QRgb,QRgb>) で実画像の色数に対し再計算を避ける。
+//   null / empty な src はそのまま返す。
+QImage applyPipelineToImage(const QImage& src, const AcesPipeline& pipeline);
 
 // AcesPipeline <-> QJsonObject (プロジェクト保存用)。
 QJsonObject pipelineToJson(const AcesPipeline& p);

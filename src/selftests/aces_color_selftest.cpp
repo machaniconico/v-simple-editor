@@ -1,4 +1,6 @@
+#include <QColor>
 #include <QDebug>
+#include <QImage>
 #include <QJsonObject>
 #include <QString>
 
@@ -325,6 +327,134 @@ int runAcesColorSelftest()
             fail("G10 json/name round-trip", QStringLiteral("jsonOk=%1 nameOk=%2 unknownOk=%3")
                     .arg(static_cast<int>(jsonOk)).arg(static_cast<int>(nameOk))
                     .arg(static_cast<int>(unknownOk)));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // G11: applyPipelineToImage — enabled=false で元画像とピクセル一致 (identity)。
+    //      null / empty 入力もそのまま返す。
+    // -----------------------------------------------------------------------
+    {
+        // 4x4 のテスト画像 (各ピクセルに異なる RGBA を入れる)。
+        QImage img(4, 4, QImage::Format_RGBA8888);
+        for (int y = 0; y < 4; ++y) {
+            for (int x = 0; x < 4; ++x) {
+                const int v = (y * 4 + x) * 15;  // 0..225
+                img.setPixelColor(x, y, QColor(v, 255 - v, (v * 2) % 256, 200));
+            }
+        }
+
+        AcesPipeline off;
+        off.enabled = false;
+        const QImage outOff = applyPipelineToImage(img, off);
+
+        bool identityOk = (outOff.width() == img.width()) && (outOff.height() == img.height());
+        const bool sharedOk = (outOff.constBits() == img.constBits());
+        if (identityOk) {
+            // 代表ピクセル (4 隅 + 中央) を比較。
+            const QImage a = img.convertToFormat(QImage::Format_RGBA8888);
+            const QImage b = outOff.convertToFormat(QImage::Format_RGBA8888);
+            const int pts[][2] = { {0, 0}, {3, 0}, {0, 3}, {3, 3}, {1, 2} };
+            for (auto& p : pts) {
+                if (a.pixel(p[0], p[1]) != b.pixel(p[0], p[1])) { identityOk = false; break; }
+            }
+        }
+
+        // null / empty 入力はそのまま (null のまま) 返る。
+        const QImage nullIn;
+        const QImage nullOut = applyPipelineToImage(nullIn, off);
+        const bool nullOk = nullOut.isNull();
+
+        if (identityOk && sharedOk && nullOk) {
+            pass("G11 applyPipelineToImage identity (disabled) preserves pixels, null passthrough");
+        } else {
+            fail("G11 image identity", QStringLiteral("identityOk=%1 sharedOk=%2 nullOk=%3")
+                    .arg(static_cast<int>(identityOk)).arg(static_cast<int>(sharedOk))
+                    .arg(static_cast<int>(nullOk)));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // G12: applyPipelineToImage — enabled=true (sRGB->ACEScg->Rec709) で
+    //      出力が [0,255] 範囲・元と異なる・アルファ保持。非対称 RGB で
+    //      RGBA8888 byte order の R/B 取り違えも検出する。
+    // -----------------------------------------------------------------------
+    {
+        QImage img(4, 4, QImage::Format_RGBA8888);
+        img.fill(QColor(128, 128, 128, 180));
+        img.setPixelColor(0, 0, QColor(210, 35, 90, 64));
+        img.setPixelColor(1, 0, QColor(210, 35, 90, 220));  // same RGB, different alpha
+        img.setPixelColor(2, 0, QColor(20, 180, 70, 128));
+
+        AcesPipeline on;
+        on.enabled = true;
+        on.input = ColorSpace::sRGB;
+        on.working = ColorSpace::ACEScg;
+        on.output = ColorSpace::Rec709;
+        const QImage out = applyPipelineToImage(img, on);
+
+        auto clamp8 = [](double v) -> int {
+            if (!std::isfinite(v)) return 0;
+            const double scaled = v * 255.0;
+            if (scaled <= 0.0) return 0;
+            if (scaled >= 255.0) return 255;
+            return static_cast<int>(scaled + 0.5);
+        };
+        auto expectedFor = [&](const QColor &c) -> QColor {
+            const Vec3 outColor = process(on, Vec3{
+                c.red() / 255.0,
+                c.green() / 255.0,
+                c.blue() / 255.0
+            });
+            return QColor(clamp8(outColor[0]),
+                          clamp8(outColor[1]),
+                          clamp8(outColor[2]),
+                          c.alpha());
+        };
+
+        bool sizeOk = (out.width() == 4) && (out.height() == 4);
+        bool rangeOk = true;     // 0..255 は QRgb なら自明だが、退化のため値を読む
+        bool alphaOk = true;     // 元ピクセルのアルファを保持しているか
+        bool differs = false;    // 元 RGB と異なるか (退化検出)
+        bool expectedOk = true;  // process() と画像適用の RGB が一致するか
+        bool sameRgbAlphaOk = true; // 同一 RGB / 別 alpha で RGB が同じ、alpha は別か
+
+        if (sizeOk) {
+            const QImage o = out.convertToFormat(QImage::Format_RGBA8888);
+            for (int y = 0; y < 4 && rangeOk && alphaOk; ++y) {
+                for (int x = 0; x < 4; ++x) {
+                    const QRgb px = o.pixel(x, y);
+                    const int r = qRed(px), g = qGreen(px), b = qBlue(px), a = qAlpha(px);
+                    const QColor srcPx = img.pixelColor(x, y);
+                    if (r < 0 || r > 255 || g < 0 || g > 255 || b < 0 || b > 255) { rangeOk = false; break; }
+                    if (a != srcPx.alpha()) { alphaOk = false; break; }
+                    if (r != srcPx.red() || g != srcPx.green() || b != srcPx.blue()) { differs = true; }
+                }
+            }
+
+            const QColor src0 = img.pixelColor(0, 0);
+            const QColor src1 = img.pixelColor(1, 0);
+            const QColor got0 = o.pixelColor(0, 0);
+            const QColor got1 = o.pixelColor(1, 0);
+            const QColor exp0 = expectedFor(src0);
+            expectedOk = got0.red() == exp0.red()
+                && got0.green() == exp0.green()
+                && got0.blue() == exp0.blue()
+                && got0.alpha() == exp0.alpha();
+            sameRgbAlphaOk = got0.red() == got1.red()
+                && got0.green() == got1.green()
+                && got0.blue() == got1.blue()
+                && got0.alpha() == src0.alpha()
+                && got1.alpha() == src1.alpha();
+        }
+
+        if (sizeOk && rangeOk && alphaOk && differs && expectedOk && sameRgbAlphaOk) {
+            pass("G12 applyPipelineToImage transform: in-range, alpha preserved, pixels changed");
+        } else {
+            fail("G12 image transform", QStringLiteral("sizeOk=%1 rangeOk=%2 alphaOk=%3 differs=%4 expectedOk=%5 sameRgbAlphaOk=%6")
+                    .arg(static_cast<int>(sizeOk)).arg(static_cast<int>(rangeOk))
+                    .arg(static_cast<int>(alphaOk)).arg(static_cast<int>(differs))
+                    .arg(static_cast<int>(expectedOk)).arg(static_cast<int>(sameRgbAlphaOk)));
         }
     }
 

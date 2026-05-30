@@ -19,6 +19,7 @@
 #include "PlaybackTypes.h"
 #include "TextManager.h"
 #include "DecoderSlotManager.h"
+#include "AcesColor.h"  // AR-2: ACES シーンリファード色管理パイプライン (SSOT は MainWindow)
 
 // Identifies a per-clip decoder in the V2+ pool. Keyed on
 // (filePath, clipInMs, sourceTrack, sourceClipIndex) so:
@@ -102,6 +103,11 @@ public:
     bool isMuted() const { return m_muted; }
     void setCanvasSize(int width, int height);
     void setColorCorrection(const ColorCorrection &cc);
+    // AR-2: ACES シーンリファード色管理。MainWindow の SSOT (m_acesPipeline) を
+    // プレビューへ反映する。enabled=true のときのみ displayFrame の最終合成結果へ
+    // aces::applyPipelineToImage を適用し、enabled=false なら一切呼ばず従来出力と
+    // ビット同一を維持する (回帰ゼロ)。セット時に表示中フレームを即再描画する。
+    void setAcesPipeline(const aces::AcesPipeline &pipeline);
     // Transient effect stack applied on top of every composed frame (live dialog preview).
     // Empty vector disables the path. Does not mutate timeline state.
     // live=true keeps CPU effects active during playback (committed state).
@@ -609,6 +615,11 @@ private:
     // -1 = follow m_activeEntry (legacy)。 >= 0 = explicit sequence index。
     // 再生用の m_activeEntry とは独立。setSequence でリセット。
     int m_editTargetEntry = -1;
+
+    // AR-2: ACES 色管理パイプライン (MainWindow SSOT のコピー)。既定 enabled=false。
+    // displayFrame は enabled=true のときだけ最終合成結果へ適用するので、既定状態では
+    // 既存のプレビュー出力とビット同一 (回帰ゼロ)。
+    aces::AcesPipeline m_acesPipeline;
 
     // ---- Per-clip decoder pool state (V2+ only) -----------------------------
     // Active V2+ decoders, keyed on TrackKey. V1 never lives here — it

@@ -2003,6 +2003,15 @@ void VideoPlayer::displayFrame(const QImage &image)
         }
     }
 
+    // AR-2: ACES シーンリファード色管理を最終フレームへ適用する。enabled=false の
+    // ときは一切呼ばず (applyPipelineToImage 自体も enabled=false なら no-op だが、
+    // 関数呼び出しと QImage 共有コピーすら避けて従来パスとビット同一を厳守する)。
+    // レガシー Exporter は Exporter 側でのみ適用するため、composeFrameWithOverlays /
+    // renderFrameAt の共通コアには ACES を入れていない (二重適用回避)。
+    if (m_acesPipeline.enabled && !composed.isNull()) {
+        composed = aces::applyPipelineToImage(composed, m_acesPipeline);
+    }
+
     m_currentFrameImage = composed;
     emit frameComposited(composed);
     if (m_useGL && m_glPreview) {
@@ -2247,6 +2256,18 @@ void VideoPlayer::setColorCorrection(const ColorCorrection &cc)
 {
     if (m_glPreview)
         m_glPreview->setColorCorrection(cc);
+}
+
+void VideoPlayer::setAcesPipeline(const aces::AcesPipeline &pipeline)
+{
+    // AR-2: MainWindow SSOT (m_acesPipeline) をプレビューへ反映する。displayFrame は
+    // enabled=true のときだけ最終合成結果へ aces::applyPipelineToImage を適用するので、
+    // ここでは設定を保持し、表示中フレームを即再描画して反映するだけでよい。
+    // refreshDisplayedFrame は m_lastSourceFrame (合成前の生フレーム) から
+    // composeFrameWithOverlays を再実行 → displayFrame へ流すため、新しい
+    // ACES 設定が即座に効く。null キャッシュ時は次の通常 tick / seek で反映される。
+    m_acesPipeline = pipeline;
+    refreshDisplayedFrame();
 }
 
 void VideoPlayer::setPreviewEffects(const QVector<VideoEffect> &effects, bool live)

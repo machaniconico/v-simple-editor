@@ -4,6 +4,7 @@
 #include "Timeline.h"
 #include "TrackMatteKey.h"
 #include "CodecDetector.h"
+#include "AcesColor.h"  // AC: production export 経路への ACES 適用 (8bit のみ)
 #include "libavcore/Encode.h"
 #include "libavcore/Probe.h"
 #include <QByteArray>
@@ -62,6 +63,16 @@ RenderQueue::~RenderQueue()
         delete m_renderThread;
         m_renderThread = nullptr;
     }
+}
+
+// AC: production export 経路の ACES パイプラインを設定する。UI スレッドから
+// start() 前に呼ばれる想定。レンダーワーカーはフレームループ開始前に 1 度だけ
+// m_acesMutex 越しにスナップショットを取るので、この代入とスナップショット取得
+// が同一 mutex で直列化される (mid-flight の競合は無い)。
+void RenderQueue::setAcesPipeline(const aces::AcesPipeline &p)
+{
+    QMutexLocker locker(&m_acesMutex);
+    m_acesPipeline = p;
 }
 
 int RenderQueue::addJob(const QString &name, const QString &projectFilePath,
@@ -654,6 +665,18 @@ void RenderQueue::startRenderPipe(int jobIndex)
     const int proresProfile = isProRes
         ? cfg.value("proresProfile").toInt(1) : -1;
 
+    // AC: ACES は 8bit RGBA 出力。10bit/HDR (HDR10/HLG/ProRes) 経路では適用
+    // しない。ここでスナップショットを取り (m_acesMutex で直列化)、適用可否を
+    // 1 つの bool に畳む。フレームループ内ではこの不変値だけ参照するので競合
+    // しない。enabled=false のときは applyAces=false となり一切呼ばれない。
+    aces::AcesPipeline acesPipe;
+    {
+        QMutexLocker locker(&m_acesMutex);
+        acesPipe = m_acesPipeline;
+    }
+    const bool applyAces = acesPipe.enabled
+        && !isHdr10 && !isHlg && !isProRes;
+
     // HDR10/HLG followed the old render-pipe branch by forcing x265 unless the
     // caller explicitly selected an HEVC hardware encoder. US-B3-7: when this
     // branch executes we already know (per the 3-way dispatcher above) that
@@ -705,7 +728,7 @@ void RenderQueue::startRenderPipe(int jobIndex)
 
     m_renderThread = QThread::create(
         [this, jobCopy, tl, owned, request, outW, outH,
-         totalFrames, startUsec, usecPerFrame]() {
+         totalFrames, startUsec, usecPerFrame, applyAces, acesPipe]() {
         QString failMsg;
         // Delete the heap Timeline (only set when loaded from a project
         // file). It is a QWidget created on the GUI thread; QObject deletion
@@ -754,6 +777,14 @@ void RenderQueue::startRenderPipe(int jobIndex)
                     frame = frame.scaled(outSize, Qt::IgnoreAspectRatio,
                                           Qt::SmoothTransformation)
                                 .convertToFormat(QImage::Format_RGBA8888);
+
+                // AC: ACES カラーマネジメントを production export に適用する。
+                // frame は Format_RGBA8888。applyPipelineToImage は RGBA8888 を
+                // 返すので後段の RGB888 flatten 契約を壊さない。applyAces は
+                // (enabled && !HDR && !ProRes) のときだけ真 → 8bit 経路限定。
+                // enabled=false 時は呼ばれずビット同一 (回帰ゼロ)。
+                if (applyAces)
+                    frame = aces::applyPipelineToImage(frame, acesPipe);
 
                 // A video file is OPAQUE — it has no alpha channel. The SSOT
                 // frame can be partially transparent (a per-clip mask with no
@@ -854,6 +885,15 @@ void RenderQueue::startRenderPipe(int jobIndex)
 void RenderQueue::startRenderPipeSubprocess(int jobIndex)
 {
     const RenderJob jobCopy = m_jobs[jobIndex];
+
+    // AC: ACES は 8bit RGBA 出力。この経路は定義上 10bit HDR (HDR10/HLG) 専用
+    // (startRenderPipe が 10bit HEVC encoder 不在のときだけ委譲する) なので
+    // ACES は適用しない。スナップショットだけ取り、apply は意図的にスキップする
+    // (SSOT メンバへのアクセスを mutex で直列化する一貫性のため取得はする)。
+    {
+        QMutexLocker locker(&m_acesMutex);
+        (void)m_acesPipeline;  // 10bit/HDR 経路: apply スキップ (8bit のみ対象)
+    }
 
     // Reap any prior subprocess / worker thread before starting a new job.
     QProcess *staleProc = nullptr;
