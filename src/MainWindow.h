@@ -35,6 +35,9 @@
 #include "AutoSave.h"
 #include "LutImporter.h"
 #include "ProxyManager.h"
+#include "playback/AutoProxyPolicy.h"  // マルチトラック自動プロキシ判定エンジン (プレビュー専用)
+#include <QSet>
+#include "PlaybackTypes.h"
 #include "VideoStabilizer.h"
 #include "SpeedRamp.h"
 #include "AudioEQ.h"
@@ -310,6 +313,11 @@ private slots:
     void manageLuts();
     void toggleProxyMode();
     void generateProxies();
+    // マルチトラック自動プロキシ (プレビュー専用) の有効/無効を切り替える。
+    // QSettings("VSimpleEditor","Preferences")/"autoMultitrackProxy" に永続化し、
+    // メニュー action とプロキシ設定ダイアログのチェックを同期し、現在の
+    // sequence を即再解決して反映する。
+    void setAutoMultitrackProxy(bool enabled);
     // Modal dialog driving the seekbar-left proxy button. Lets the user
     // flip ProxyManager's proxy-mode flag and pick the preview divisor
     // from the same place. Replaces the divisor-only cycle handler that
@@ -611,6 +619,21 @@ private:
     QImage decodeClipFrameAtSourceTime(const ClipInfo &clip, double sourceTimeSeconds) const;
     QImage decodeClipFrameByIndex(const ClipInfo &clip, int sourceFrameIndex, double sourceFps) const;
     void refreshSpecialClipPreview();
+
+    // プレビュー用 sequence のプロキシ解決を 1 箇所に集約する (プレビュー専用)。
+    // 手動 isProxyMode と マルチトラック自動プロキシ (多トラック かつ
+    // 重コーデック/高解像度) の両方をここで適用する。自動判定は各 PlaybackEntry を
+    // playback::AutoProxyClip に変換し playback::AutoProxyPolicy::decide で行い、
+    // metadata は非同期 probe キャッシュから読み、UI スレッドでは同期 probe しない。
+    // plan.useProxyFor の原本パスは proxy mode に関係なく差し替え、plan.generateFor は
+    // generateAllProxies で非ブロック生成キューに積む (Ready/Generating/今セッションで
+    // 要求済みは二重起動しない)。audio 側は再判定せず映像側の useSet を使う。
+    // 各エントリは高々 1 回だけ差し替え (二重変換防止)。
+    // 書き出し経路には一切影響しない (export 用 sequence はこの関数を通らない)。
+    // entries は in-place で書き換える。
+    void resolvePreviewProxies(QVector<PlaybackEntry> &entries, bool allowAutoPlanning);
+    void queueAutoProxyProbe(const QString &filePath);
+
     QImage buildSpecialClipComposite(double timelineSeconds) const;
     QImage applyStoredRotoData(const QString &clipId, const QImage &frame, int sourceFrameIndex) const;
     void setBrushAnimationEntries(const QVector<BrushAnimationEntry> &entries);
@@ -621,6 +644,29 @@ private:
 
     VideoPlayer *m_player;
     Timeline *m_timeline;
+
+    // マルチトラック自動プロキシ (プレビュー専用)。QSettings
+    // "autoMultitrackProxy" 連動フラグ (既定 ON)。OFF のとき
+    // resolvePreviewProxies は自動判定をスキップし従来挙動 (手動 isProxyMode のみ) に戻る。
+    bool m_autoMultitrackProxy = true;
+    // 非同期 metadata probe の結果キャッシュ (原本パス→判定用 clip 情報)。
+    // resolvePreviewProxies から同期 probe しないためのプレビュー専用キャッシュ。
+    QHash<QString, playback::AutoProxyClip> m_autoProxyProbeCache;
+    QSet<QString> m_autoProxyProbePending;
+    // 映像 sequence 側で最後に判定した「自動プロキシを使う原本パス」集合。
+    // audio sequence 側は再 probe/generate せず、この集合だけを参照して差し替える。
+    QSet<QString> m_autoProxyUseSet;
+    // 今セッションで generateProxy を要求済みの原本パス。sequence 再発行のたびに
+    // 再キューしないためのガード (Ready 化後は useProxyFor に回るため二重生成は
+    // 起きないが、生成中の連続再発行に備える)。
+    QSet<QString> m_autoProxyRequested;
+    bool m_autoProxyRefreshPending = false;
+    // メニュー「マルチトラック自動プロキシ」のトグル action。プロキシ設定
+    // ダイアログのチェックと setAutoMultitrackProxy 経由で双方向同期する。
+    QAction *m_autoMultitrackProxyAction = nullptr;
+    QMetaObject::Connection m_generateProxiesAllReadyConnection;
+    QMetaObject::Connection m_generateProxiesProgressConnection;
+
     class ProxyProgressDialog *m_proxyDialog = nullptr;
     class ColorGradingPanel *m_colorGradingPanel = nullptr;
     effectctrl::EffectControlsPanel *m_effectControlsPanel = nullptr;

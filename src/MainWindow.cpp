@@ -281,6 +281,8 @@ void exporter_setAcesPipeline(const aces::AcesPipeline &pipeline);
 #include <QSet>
 #include <QTemporaryDir>
 #include <QProcess>
+#include <QFutureWatcher>
+#include <QtConcurrent>
 #include <numeric>
 #include "NodeGraph.h"
 #include "NodeEvaluator.h"
@@ -482,6 +484,33 @@ VideoSourceInfo probeVideoSourceInfo(const QString &filePath, double fallbackFps
     avcodec_free_context(&decCtx);
     avformat_close_input(&fmtCtx);
     return info;
+}
+
+playback::AutoProxyClip probeAutoProxyClipMetadata(const QString &filePath)
+{
+    playback::AutoProxyClip clip;
+    clip.filePath = filePath;
+
+    AVFormatContext *fmtCtx = nullptr;
+    if (avformat_open_input(&fmtCtx, filePath.toUtf8().constData(), nullptr, nullptr) < 0)
+        return clip;
+
+    if (avformat_find_stream_info(fmtCtx, nullptr) >= 0) {
+        for (unsigned i = 0; i < fmtCtx->nb_streams; ++i) {
+            const AVStream *stream = fmtCtx->streams[i];
+            const AVCodecParameters *par = stream ? stream->codecpar : nullptr;
+            if (!par || par->codec_type != AVMEDIA_TYPE_VIDEO)
+                continue;
+            clip.width = par->width;
+            clip.height = par->height;
+            if (const char *name = avcodec_get_name(par->codec_id))
+                clip.codec = QString::fromLatin1(name).toLower();
+            break;
+        }
+    }
+
+    avformat_close_input(&fmtCtx);
+    return clip;
 }
 
 QImage avFrameToQImage(const AVFrame *frame, AVCodecContext *decCtx)
@@ -1128,6 +1157,22 @@ void MainWindow::setupUI()
     mainLayout->addWidget(m_mainSplitter);
     setCentralWidget(centralWidget);
 
+    // マルチトラック自動プロキシ (プレビュー専用) の有効状態を復元。既定 ON。
+    {
+        QSettings prefs("VSimpleEditor", "Preferences");
+        m_autoMultitrackProxy = prefs.value("autoMultitrackProxy", true).toBool();
+    }
+    // 自動プロキシ生成が完了したら、プレビュー sequence を一度だけ再解決して
+    // 新しい proxy を拾わせる。refreshPlaybackSequence は sequenceChanged を
+    // 再発行するだけで、resolvePreviewProxies は Ready 済みクリップを useProxyFor に
+    // 回し generateFor へは入れないため、生成→再解決→再生成 の無限ループは起きない。
+    connect(&ProxyManager::instance(), &ProxyManager::allProxiesReady, this, [this]() {
+        if (m_timeline && m_autoMultitrackProxy && m_autoProxyRefreshPending) {
+            m_autoProxyRefreshPending = false;
+            m_timeline->refreshPlaybackSequence();
+        }
+    });
+
     connect(m_player, &VideoPlayer::positionChanged, this, [this](double seconds) {
         if (m_timeline) {
             m_timeline->setPlayheadPosition(seconds);
@@ -1145,9 +1190,9 @@ void MainWindow::setupUI()
     connect(m_timeline, &Timeline::sequenceChanged, this, [this](const QVector<PlaybackEntry> &entries) {
         if (!m_player) return;
         QVector<PlaybackEntry> resolved = entries;
-        auto &pm = ProxyManager::instance();
-        for (auto &e : resolved)
-            e.filePath = pm.getProxyPath(e.filePath);
+        // プロキシ解決 (プレビュー専用)。手動 isProxyMode と マルチトラック自動
+        // プロキシの両方をこの 1 箇所で適用する。書き出し経路はここを通らない。
+        resolvePreviewProxies(resolved, true);
         qInfo() << "MainWindow: forwarding sequenceChanged entries=" << resolved.size();
         m_player->setSequence(resolved);
         // US-INT-2 Phase A: gather per-entry speed ramps in lockstep with
@@ -1178,9 +1223,8 @@ void MainWindow::setupUI()
     connect(m_timeline, &Timeline::audioSequenceChanged, this, [this](const QVector<PlaybackEntry> &entries) {
         if (!m_player) return;
         QVector<PlaybackEntry> resolved = entries;
-        auto &pm = ProxyManager::instance();
-        for (auto &e : resolved)
-            e.filePath = pm.getProxyPath(e.filePath);
+        // プロキシ解決 (プレビュー専用)。映像側と同じ単一経路。書き出しは非経由。
+        resolvePreviewProxies(resolved, false);
         qInfo() << "MainWindow: forwarding audioSequenceChanged entries=" << resolved.size();
         m_player->setAudioSequence(resolved);
         // US-INT-2 Phase A: forward audio-side speed ramps (stored only for
@@ -2380,6 +2424,19 @@ void MainWindow::setupMenuBar()
     connect(proxyMgmtAction, &QAction::triggered, this, &MainWindow::openProxyManagement);
     m_menuHelpEntries.append({proxyMgmtAction,
         QStringLiteral("作成済みの代理映像（プロキシ）の一覧確認・削除をします。")});
+
+    // マルチトラック自動プロキシ (プレビュー専用) のトグル。多トラック かつ
+    // 重コーデック/高解像度のとき再生プレビューを自動でプロキシへ切り替える。
+    // checkable + QSettings("autoMultitrackProxy") 永続化 (既定 ON)。実体は
+    // setAutoMultitrackProxy で、プロキシ設定ダイアログのチェックとも連動する。
+    m_autoMultitrackProxyAction =
+        toolsMenu->addAction("マルチトラック自動プロキシ");
+    m_autoMultitrackProxyAction->setCheckable(true);
+    m_autoMultitrackProxyAction->setChecked(m_autoMultitrackProxy);
+    connect(m_autoMultitrackProxyAction, &QAction::toggled,
+            this, &MainWindow::setAutoMultitrackProxy);
+    m_menuHelpEntries.append({m_autoMultitrackProxyAction,
+        QStringLiteral("トラックが多く重い素材があるとき、再生だけ自動で軽いプロキシに切り替えます（書き出しは元の画質のまま）。")});
 
     auto *renderQueueAction = toolsMenu->addAction("レンダーキュー...");
     renderQueueAction->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_R));
@@ -7045,6 +7102,160 @@ void MainWindow::manageLuts()
     QMessageBox::information(this, "Manage LUTs", info);
 }
 
+void MainWindow::setAutoMultitrackProxy(bool enabled)
+{
+    if (m_autoMultitrackProxy == enabled) {
+        // それでもメニュー action のチェック状態だけは確実に同期しておく。
+        if (m_autoMultitrackProxyAction
+            && m_autoMultitrackProxyAction->isChecked() != enabled) {
+            QSignalBlocker block(m_autoMultitrackProxyAction);
+            m_autoMultitrackProxyAction->setChecked(enabled);
+        }
+        return;
+    }
+    m_autoMultitrackProxy = enabled;
+    if (!enabled) {
+        m_autoProxyUseSet.clear();
+        m_autoProxyRefreshPending = false;
+    }
+
+    QSettings prefs("VSimpleEditor", "Preferences");
+    prefs.setValue("autoMultitrackProxy", enabled);
+
+    if (m_autoMultitrackProxyAction
+        && m_autoMultitrackProxyAction->isChecked() != enabled) {
+        QSignalBlocker block(m_autoMultitrackProxyAction);
+        m_autoMultitrackProxyAction->setChecked(enabled);
+    }
+
+    statusBar()->showMessage(enabled
+        ? QStringLiteral("マルチトラック自動プロキシ: ON")
+        : QStringLiteral("マルチトラック自動プロキシ: OFF"));
+
+    // 現在の sequence を即再解決して反映する。OFF にしたときは
+    // resolvePreviewProxies が自動判定をスキップし、手動 isProxyMode のみの
+    // 従来挙動 (= OFF 前に自動で proxy 化していたエントリは原本へ戻る) になる。
+    if (m_timeline)
+        m_timeline->refreshPlaybackSequence();
+}
+
+void MainWindow::queueAutoProxyProbe(const QString &filePath)
+{
+    if (filePath.isEmpty()
+        || m_autoProxyProbeCache.contains(filePath)
+        || m_autoProxyProbePending.contains(filePath)) {
+        return;
+    }
+
+    m_autoProxyProbePending.insert(filePath);
+    auto *watcher = new QFutureWatcher<playback::AutoProxyClip>(this);
+    connect(watcher, &QFutureWatcher<playback::AutoProxyClip>::finished,
+            this, [this, watcher, filePath]() {
+        const playback::AutoProxyClip clip = watcher->result();
+        m_autoProxyProbePending.remove(filePath);
+        m_autoProxyProbeCache.insert(filePath, clip);
+        watcher->deleteLater();
+        if (m_timeline && m_autoMultitrackProxy)
+            m_timeline->refreshPlaybackSequence();
+    });
+    watcher->setFuture(QtConcurrent::run([filePath]() {
+        return probeAutoProxyClipMetadata(filePath);
+    }));
+}
+
+void MainWindow::resolvePreviewProxies(QVector<PlaybackEntry> &entries, bool allowAutoPlanning)
+{
+    // プレビュー専用のプロキシ解決を 1 箇所に集約する。書き出し経路
+    // (RenderQueue / Exporter / tlrender::renderFrameAt) は ProxyManager に
+    // 非依存で、export 用 sequence はこの関数を通らないため影響しない。
+    //
+    // 二重変換を避けるため、各エントリは最大 1 回だけ getProxyPath で差し替える。
+    // 「自動プロキシで proxy を使うべき原本」の集合 (useSet) をまず計算し、
+    //   1) 手動 isProxyMode が ON  → 全エントリを getProxyPath で差し替え
+    //   2) それ以外 かつ useSet に含まれる → そのエントリだけ差し替え
+    // とする。手動 ON のときは自動判定に関わらず従来どおり全差し替え。
+    auto &pm = ProxyManager::instance();
+    const bool manualProxy = pm.isProxyMode();
+
+    QSet<QString> useSet =
+        (!allowAutoPlanning && m_autoMultitrackProxy) ? m_autoProxyUseSet : QSet<QString>();
+    if (allowAutoPlanning)
+        m_autoProxyUseSet.clear();
+
+    if (m_autoMultitrackProxy && allowAutoPlanning && !entries.isEmpty()) {
+        QSet<int> sourceTracks;
+        for (const auto &e : entries) {
+            if (!e.filePath.isEmpty() && e.sourceTrack >= 0)
+                sourceTracks.insert(e.sourceTrack);
+        }
+
+        // Auto-proxy is a multitrack policy. Do not classify a single V1
+        // sequence with two sequential clips as multitrack just because the
+        // playback entry count is >= 2.
+        if (sourceTracks.size() >= 2) {
+            // PlaybackEntry → AutoProxyClip 変換。metadata は QtConcurrent で
+            // 非同期 probe し、ここではキャッシュ済みの結果だけを使う。未 probe の
+            // パスはキューに積んで戻り、完了時の refreshPlaybackSequence で再判定する。
+            QVector<playback::AutoProxyClip> clips;
+            clips.reserve(entries.size());
+            for (const auto &e : entries) {
+                const QString &orig = e.filePath;
+                if (orig.isEmpty())
+                    continue;
+
+                auto it = m_autoProxyProbeCache.constFind(orig);
+                if (it == m_autoProxyProbeCache.constEnd()) {
+                    queueAutoProxyProbe(orig);
+                    continue;
+                }
+
+                playback::AutoProxyClip c = it.value();
+                c.filePath = orig;
+                c.proxyReady = pm.hasProxy(orig);
+                clips.append(c);
+            }
+
+            const playback::AutoProxyPlan plan = playback::AutoProxyPolicy::decide(clips);
+            for (const QString &path : plan.useProxyFor)
+                useSet.insert(path);
+            m_autoProxyUseSet = useSet;
+
+            // generateFor: 未生成の重クリップを非ブロックで生成キューへ。今セッションで
+            // 要求済み / 既に hasProxy のものは積まない (二重起動防止)。generateAllProxies
+            // 内部も Ready/Generating をスキップするため二重で安全。Ready 化後は
+            // useProxyFor に回り generateFor へは二度と入らないので、生成完了 →
+            // refreshPlaybackSequence → 本関数 再実行 でも再キューは起きない (無限ループ防止)。
+            QStringList toGenerate;
+            for (const QString &orig : plan.generateFor) {
+                if (pm.hasProxy(orig))
+                    continue;
+                if (pm.isGenerating(orig)) {
+                    m_autoProxyRefreshPending = true;
+                    continue;
+                }
+                if (m_autoProxyRequested.contains(orig))
+                    continue;
+                if (!QFileInfo::exists(orig))
+                    continue;
+                m_autoProxyRequested.insert(orig);
+                m_autoProxyRefreshPending = true;
+                toGenerate.append(orig);
+            }
+            if (!toGenerate.isEmpty())
+                pm.generateAllProxies(toGenerate);
+        }
+    }
+
+    // 単一の差し替えパス。各エントリは高々 1 回だけ getProxyPath を通る。
+    for (auto &e : entries) {
+        if (manualProxy) {
+            e.filePath = pm.getProxyPath(e.filePath);
+        } else if (useSet.contains(e.filePath)) {
+            e.filePath = pm.getProxyPath(e.filePath, true);
+        }
+    }
+}
+
 void MainWindow::openProxySettings()
 {
     auto &pm = ProxyManager::instance();
@@ -7060,6 +7271,22 @@ void MainWindow::openProxySettings()
         "ON: 生成済みプロキシをタイムラインで使用 (高速再生)\n"
         "OFF: 元解像度ファイルを使用"));
     layout->addWidget(modeCheck);
+
+    // マルチトラック自動プロキシ (プレビュー専用)。多トラック かつ
+    // 重コーデック/高解像度のときだけ自動でプロキシ再生へ切り替える。
+    // ここはダイアログ側のミラー。実体は「再生」メニューの同名トグルと
+    // m_autoMultitrackProxyAction と同じ QSettings キーで連動する。
+    auto *autoProxyCheck = new QCheckBox(
+        QStringLiteral("マルチトラック自動プロキシ (重い素材を自動でプロキシ再生)"), &dlg);
+    autoProxyCheck->setChecked(m_autoMultitrackProxy);
+    autoProxyCheck->setToolTip(QStringLiteral(
+        "ON: トラックが多く、かつ重いコーデック/高解像度の素材があるとき、\n"
+        "    再生プレビューを自動で低解像度プロキシに切り替えます (書き出しは原本)。\n"
+        "OFF: 従来どおり手動プロキシ設定のみで動作します。"));
+    layout->addWidget(autoProxyCheck);
+    connect(autoProxyCheck, &QCheckBox::toggled, this, [this](bool on) {
+        setAutoMultitrackProxy(on);
+    });
 
     // Encoder override (US-1): empty itemData = Auto. Probe each GPU
     // encoder up-front and disable items the runtime ffmpeg can't run so
@@ -7244,14 +7471,13 @@ void MainWindow::generateProxies()
 
     auto &pm = ProxyManager::instance();
 
-    // Drop any prior allProxiesReady / progressChanged lambdas before
-    // wiring up the new ones. Qt::UniqueConnection does NOT deduplicate
-    // distinct lambda objects (each closure is a separate functor type),
-    // so without this disconnect the Nth generateProxies call fires the
-    // refresh handler N times on completion — the visible symptom is the
-    // preview snapping back to position multiple times in a row.
-    disconnect(&pm, &ProxyManager::allProxiesReady, this, nullptr);
-    disconnect(&pm, &ProxyManager::progressChanged, this, nullptr);
+    // Drop only the prior manual-generate lambdas before wiring new ones.
+    // A broad disconnect(&pm, allProxiesReady, this, nullptr) also removes the
+    // permanent auto-proxy refresh connection installed in setupUI().
+    if (m_generateProxiesAllReadyConnection)
+        disconnect(m_generateProxiesAllReadyConnection);
+    if (m_generateProxiesProgressConnection)
+        disconnect(m_generateProxiesProgressConnection);
 
     // generateAllProxies skips clips whose entry is Ready/Generating, so a
     // bare invocation on a project that already has proxies would emit
@@ -7295,10 +7521,34 @@ void MainWindow::generateProxies()
         }
     }
 
-    connect(&pm, &ProxyManager::allProxiesReady, this, [this]() {
+    QStringList proxyQueuePaths;
+    bool waitingForExistingGeneration = false;
+    for (const auto &p : paths) {
+        if (!QFileInfo::exists(p))
+            continue;
+        if (pm.hasProxy(p))
+            continue;
+        if (pm.isGenerating(p)) {
+            waitingForExistingGeneration = true;
+            continue;
+        }
+        proxyQueuePaths << p;
+    }
+    if (proxyQueuePaths.isEmpty() && !waitingForExistingGeneration) {
+        statusBar()->showMessage(QStringLiteral("All proxies already generated"));
+        return;
+    }
+
+    m_generateProxiesAllReadyConnection =
+        connect(&pm, &ProxyManager::allProxiesReady, this, [this]() {
         // Qt::SingleShotConnection so the lambda is removed automatically
         // after one fire, in addition to the upfront disconnect — defense
         // in depth against the same lambda accumulating across calls.
+        m_generateProxiesAllReadyConnection = {};
+        if (m_generateProxiesProgressConnection) {
+            disconnect(m_generateProxiesProgressConnection);
+            m_generateProxiesProgressConnection = {};
+        }
         statusBar()->showMessage("All proxies generated");
         if (!m_timeline || !m_player)
             return;
@@ -7321,12 +7571,17 @@ void MainWindow::generateProxies()
         if (wasPlaying)
             m_player->play();
     }, Qt::SingleShotConnection);
-    connect(&pm, &ProxyManager::progressChanged, this, [this](int pct) {
+    m_generateProxiesProgressConnection =
+        connect(&pm, &ProxyManager::progressChanged, this, [this](int pct) {
         statusBar()->showMessage(QString("Generating proxies... %1%").arg(pct));
     });
 
-    pm.generateAllProxies(paths);
-    statusBar()->showMessage("Generating proxy files...");
+    if (!proxyQueuePaths.isEmpty()) {
+        pm.generateAllProxies(proxyQueuePaths);
+        statusBar()->showMessage("Generating proxy files...");
+    } else {
+        statusBar()->showMessage("Waiting for proxy generation...");
+    }
 }
 
 void MainWindow::openLoudnessSettings()

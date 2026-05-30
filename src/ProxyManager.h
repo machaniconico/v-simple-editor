@@ -66,7 +66,9 @@ public:
     void generateAllProxies(const QStringList &filePaths);
 
     QString getProxyPath(const QString &originalPath) const;
+    QString getProxyPath(const QString &originalPath, bool forceProxy) const;
     bool hasProxy(const QString &originalPath) const;
+    bool isGenerating(const QString &originalPath) const;
 
     bool isProxyMode() const { return m_proxyMode; }
     void setProxyMode(bool enabled);
@@ -101,6 +103,13 @@ public:
     // Legacy-named helper for settings UI compatibility. Probes the linked
     // libavcodec registry through libavcore::Probe; no subprocess is spawned.
     static bool ffmpegHasEncoder(const QString &encoderName);
+
+    // Read the source's first video stream codec name via libavcore::Probe.
+    // Returns an empty QString on any probe failure. Thread-safe (static
+    // helper, protects its own state). Exposed publicly so the auto-proxy
+    // policy (multitrack playback) can classify clips by codec. Synchronous —
+    // callers must cache results to avoid repeated probes on the UI thread.
+    static QString probeSourceCodec(const QString &path);
 
     // Read-only access to the entry registry for the management dialog.
     const QHash<QString, ProxyEntry> &entries() const { return m_entries; }
@@ -170,10 +179,6 @@ private:
     // Returns 0 on any probe failure; callers treat 0 as "duration unknown"
     // and emit proxyProgress(name, -1) so the dialog stays indeterminate.
     static qint64 probeDurationUs(const QString &path);
-
-    // Read the source's first video stream codec name via libavcore::Probe.
-    // Returns an empty QString on any probe failure.
-    static QString probeSourceCodec(const QString &path);
 
     // Append a single line to ~/.veditor/proxies/encoder_log.txt for
     // diagnostic visibility into which encoder was picked and which clips

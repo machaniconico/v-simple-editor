@@ -104,6 +104,7 @@ int runYoutubeSelftest();
 int runYtdlpDownloaderSelftest();
 int runPremiereXmlSelftest();
 int runYoutubeChapterSelftest();
+int runAutoProxyPolicySelftest();
 int runCompositeFrameCacheSelftest();
 int runPlaybackQualityPolicySelftest();
 
@@ -190,6 +191,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "CompositeFrameCache: LRU eviction + key hashing + hit/miss accounting" },
     { "playback-quality-policy", "VEDITOR_PLAYBACK_QUALITY_POLICY_SELFTEST", runPlaybackQualityPolicySelftest, false,
       "PlaybackQualityPolicy: adaptive quality level selection + drop-frame heuristics" },
+    { "auto-proxy-policy",  "VEDITOR_AUTO_PROXY_POLICY_SELFTEST",  runAutoProxyPolicySelftest,     false,
+      "AutoProxyPolicy: heavy-clip detection (width/codec) + useProxyFor/generateFor split + dedup (12 gates)" },
     // QApplication-required (needsQApplication=true) ----------------------
     { "parity",            "VEDITOR_PARITY_SELFTEST",             runParitySelftest,             true,
       "Preview vs export pixel-parity (S1-S11, framediff::mse, 10-bit HDR10)" },

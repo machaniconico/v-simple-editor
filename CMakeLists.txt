@@ -212,6 +212,9 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/playback/PlaybackQualityPolicy.cpp
     src/selftests/composite_frame_cache_selftests.cpp
     src/selftests/playback_quality_policy_selftests.cpp
+    src/playback/AutoProxyPolicy.h
+    src/playback/AutoProxyPolicy.cpp
+    src/selftests/auto_proxy_policy_selftests.cpp
     src/SourceMonitorDock.cpp
     src/MarkerPanelDock.cpp
     src/CommandPaletteDialog.h

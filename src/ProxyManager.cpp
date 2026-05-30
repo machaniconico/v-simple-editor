@@ -447,8 +447,13 @@ void ProxyManager::generateAllProxies(const QStringList &filePaths)
 
 QString ProxyManager::getProxyPath(const QString &originalPath) const
 {
+    return getProxyPath(originalPath, false);
+}
+
+QString ProxyManager::getProxyPath(const QString &originalPath, bool forceProxy) const
+{
     const QString key = normalizePath(originalPath);
-    if (m_proxyMode && !key.isEmpty() && m_entries.contains(key)) {
+    if ((m_proxyMode || forceProxy) && !key.isEmpty() && m_entries.contains(key)) {
         const auto &entry = m_entries[key];
         if (entry.status == ProxyStatus::Ready
             && !isEntryStale(entry)
@@ -467,6 +472,14 @@ bool ProxyManager::hasProxy(const QString &originalPath) const
     return entry.status == ProxyStatus::Ready
         && !isEntryStale(entry)
         && QFile::exists(entry.proxyPath);
+}
+
+bool ProxyManager::isGenerating(const QString &originalPath) const
+{
+    const QString key = normalizePath(originalPath);
+    if (key.isEmpty() || !m_entries.contains(key))
+        return false;
+    return m_entries[key].status == ProxyStatus::Generating;
 }
 
 QString ProxyManager::currentEffectiveEncoder() const
