@@ -2112,6 +2112,19 @@ void MainWindow::setupMenuBar()
     m_menuHelpEntries.append({markOutAction,
         QStringLiteral("使いたい範囲の「終了位置」を今の再生位置に決めます（O キー）。")});
 
+    // 検索 メニュー — 機能発見性 (初心者向け)。機能が増えてどこに何があるか
+    // 分かりにくいため、機能名や「音量を均一にしたい」のような操作内容の言葉で
+    // 機能を探して呼び出せる導線をトップレベルに用意する (Ctrl+Shift+P と等価)。
+    auto *searchMenu = menuBar()->addMenu(QStringLiteral("検索(&S)"));
+    auto *featureSearchAction =
+        searchMenu->addAction(QStringLiteral("🔍 機能を検索... (Ctrl+Shift+P)"));
+    featureSearchAction->setObjectName("action_feature_search");
+    connect(featureSearchAction, &QAction::triggered,
+            this, &MainWindow::openCommandPalette);
+    m_menuHelpEntries.append({featureSearchAction,
+        QStringLiteral("機能名や『音量を均一にしたい』のような操作内容の言葉で、使いたい機能を"
+                       "探して呼び出せます。どこにあるか分からない機能はここから検索してください。")});
+
     // ツール メニュー (AI / 自動編集)
     auto *toolsMenu = menuBar()->addMenu("ツール(&T)");
 
@@ -3196,7 +3209,8 @@ void MainWindow::setupMenuBar()
             this, &MainWindow::openLoudnessSettings);
     prefsMenu->addAction(loudnessAction);
     m_menuHelpEntries.append({loudnessAction,
-        QStringLiteral("動画全体の音量バランスを自動でそろえます。配信プラットフォーム向けの音量調整に。")});
+        QStringLiteral("動画全体の音量を均一にそろえます (音量を均一に / 音量をそろえる / "
+                       "ノーマライズ / ラウドネス均一化)。配信向けの音量調整に。")});
     prefsMenu->addSeparator();
 
     // US-T39 Snap strength submenu — pulls/flushes the video source onto

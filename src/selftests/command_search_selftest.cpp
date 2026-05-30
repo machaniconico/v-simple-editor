@@ -112,6 +112,24 @@ int runCommandSearchSelftest()
         fail("G6 no match", QStringLiteral("indexes=[%1]").arg(indexesToString(noMatchResults)));
     }
 
+    // G7: 挙動を表す連続句 (例「音量を均一」) が keywords (実機では各機能の挙動説明を
+    //     buildCommandEntries が keywords に畳み込む) にマッチする。初心者が「やりたいこと」
+    //     の言葉で機能を引けることをランキング層で保証する回帰ゲート。
+    {
+        const QVector<cmdsearch::CommandEntry> behavior = {
+            { QStringLiteral("normalize"), QStringLiteral("オーディオ均一化"),
+              QStringLiteral("動画全体の音量を均一にそろえます ノーマライズ ラウドネス均一化") }
+        };
+        const QVector<int> behaviorResults =
+            cmdsearch::rankMatches(behavior, QStringLiteral("音量を均一"));
+        if (!behaviorResults.isEmpty() && behaviorResults.first() == 0) {
+            pass("G7 behavior phrase finds feature via folded help keywords");
+        } else {
+            fail("G7 behavior phrase",
+                 QStringLiteral("indexes=[%1]").arg(indexesToString(behaviorResults)));
+        }
+    }
+
     qInfo().noquote().nospace() << "[command-search] selftest end, passed=" << passed << " failed=" << failed;
     return failed == 0 ? 0 : 1;
 }
