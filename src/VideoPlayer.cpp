@@ -1755,7 +1755,17 @@ void VideoPlayer::forceTimelineUiToCurrent()
 void VideoPlayer::stop()
 {
     pause();
+    // Stop is an explicit rewind; discard any deferred scrub/preview seek that
+    // would otherwise repaint over the frame at t=0 after this call returns.
+    if (m_seekTimer)
+        m_seekTimer->stop();
+    m_pendingSeekMs = -1;
+    m_pendingSeekPrecise = false;
     seekInternal(0, true, true);
+    if (m_seekTimer)
+        m_seekTimer->stop();
+    m_pendingSeekMs = -1;
+    m_pendingSeekPrecise = false;
     if (m_mixer) {
         m_mixer->stop();
         m_mixer->seekTo(0);

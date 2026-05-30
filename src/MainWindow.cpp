@@ -1274,9 +1274,17 @@ void MainWindow::setupUI()
         }
     });
     connect(m_player, &VideoPlayer::frameComposited, this, [this](const QImage &) {
-        if (!m_player || m_player->isPlaying())
+        if (!m_player || m_player->isPlaying() || !m_timeline || !m_player->glPreview())
             return;
-        refreshSpecialClipPreview();
+
+        // This signal is emitted from VideoPlayer::displayFrame(), including
+        // paused seeks and stop's rewind-to-zero display. Calling
+        // refreshSpecialClipPreview() here can fall back to previewSeek(),
+        // re-arming VideoPlayer's deferred seek timer while playback is
+        // stopped and creating a self-sustaining repaint loop.
+        const QImage composed = buildSpecialClipComposite(m_timeline->playheadPosition());
+        if (!composed.isNull())
+            m_player->glPreview()->displayFrame(composed);
     });
 
     // Restore master loudness normalizer settings on startup.
