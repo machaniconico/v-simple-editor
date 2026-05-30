@@ -156,6 +156,11 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     # TR (トリムツール): Ripple/Roll/Slip/Slide の純粋計算エンジン。
     src/TrimOps.h
     src/TrimOps.cpp
+    # AB (オーディオバス): Fairlight 風バス/サブミックス/AUXセンドの純粋エンジン。
+    src/AudioBusRouting.h
+    src/AudioBusRouting.cpp
+    src/AudioBusPanel.cpp
+    src/selftests/audio_bus_selftest.cpp
     src/SourceMonitorDock.cpp
     src/MarkerPanelDock.cpp
     src/CommandPaletteDialog.h

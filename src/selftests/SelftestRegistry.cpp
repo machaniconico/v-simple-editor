@@ -22,6 +22,7 @@ int runAffinitySelftest();
 int runOAuthMockE2eSelftest();
 int runOAuthRefreshE2eSelftest();
 int runAnimExportSelftest();
+int runAudioBusSelftest();
 int runAudioMixerSelftest();
 int runAudioRestoreSelftest();
 int runAutoClipGenSelftest();
@@ -154,6 +155,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "ThreePointEdit engine: selection->clip, validate, overwrite plan" },
     { "trim-ops",          "VEDITOR_TRIM_OPS_SELFTEST",           runTrimOpsSelftest,            false,
       "TrimOps engine: ripple/roll/slip/slide + bounds" },
+    { "audio-bus",         "VEDITOR_AUDIO_BUS_SELFTEST",          runAudioBusSelftest,           false,
+      "AudioBusRouting: bus/submix/aux-send gain resolution + cycle guard" },
     // QApplication-required (needsQApplication=true) ----------------------
     { "parity",            "VEDITOR_PARITY_SELFTEST",             runParitySelftest,             true,
       "Preview vs export pixel-parity (S1-S11, framediff::mse, 10-bit HDR10)" },

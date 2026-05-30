@@ -20,6 +20,7 @@
 #include "ExportDialog.h"           // HDRSettings struct
 #include "AIProcessingDialog.h"     // AIProcessingSettings struct
 #include "MediaPool.h"              // PRD-PHASE1-MEDIA-POOL: mediapool::MediaPool
+#include "AudioBusRouting.h"        // PRD-PHASE2-AUDIO-BUS: audiobus::AudioBusRouting
 
 // --- Audio mixer serialization sub-types ---
 
@@ -300,6 +301,9 @@ struct ProjectData {
 
     // PRD-PHASE1-MEDIA-POOL: メディアプール永続化
     mediapool::MediaPool mediaPool;
+
+    // PRD-PHASE2-AUDIO-BUS: バス/サブミックス/AUXセンド ルーティング永続化
+    audiobus::AudioBusRouting audioBusRouting;
 };
 
 class ProjectFile

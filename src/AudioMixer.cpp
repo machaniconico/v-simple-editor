@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <utility>
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -564,6 +565,17 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
         const int trackIdx = e->entry.sourceTrack;
         if (trackIdx >= 0 && trackIdx < m_mixer->m_trackStates.size())
             gain *= m_mixer->m_trackStates[trackIdx].effectiveGain;
+        // AB-4: bus / submix / aux-send routing. Multiply the per-track
+        // bus-chain gain (track → assigned bus → outputBus chain → master,
+        // with bus mute/solo/cycle handling) into the effective gain. With
+        // no buses defined and no track assigned, resolveTrackToMasterGain
+        // returns 1.0 (identity), so the default preview/export path is
+        // bit-identical to pre-AB-4. The resolve is a cheap O(bus-count)
+        // double accumulation and runs under m_controlMutex (held for the
+        // whole readData fragment), so the GUI-thread setBusRouting swap is
+        // race-free against this read.
+        if (trackIdx >= 0)
+            gain *= m_mixer->m_busRouting.resolveTrackToMasterGain(trackIdx);
 
         // Edge-attached audio fade. Equal-power (sqrt) curve so A.trailOut^2
         // + B.leadIn^2 == 1 at the midpoint of an overlap crossfade — linear
@@ -2264,6 +2276,23 @@ double AudioMixer::trackGain(int trackIdx) const
     if (trackIdx < 0 || trackIdx >= kMaxAudioTracks) return 1.0;
     if (trackIdx >= m_trackStates.size()) return 1.0;
     return m_trackStates[trackIdx].gain;
+}
+
+void AudioMixer::setBusRouting(const audiobus::AudioBusRouting &r)
+{
+    audiobus::AudioBusRouting snapshot = r;
+    // Swap the whole routing snapshot under the control mutex so the audio
+    // worker thread (MixerIODevice::readData) never observes a partially
+    // updated bus graph. Copy before locking so the audio callback is not
+    // blocked by QVector/QHash allocation work.
+    QMutexLocker lock(&m_controlMutex);
+    m_busRouting = std::move(snapshot);
+}
+
+audiobus::AudioBusRouting AudioMixer::busRouting() const
+{
+    QMutexLocker lock(&m_controlMutex);
+    return m_busRouting;
 }
 
 void AudioMixer::setTrackEqConfig(int trackIdx, const AudioEQConfig &cfg) {

@@ -15,6 +15,7 @@
 
 #include "PlaybackTypes.h"
 #include "AudioEQ.h"
+#include "AudioBusRouting.h"
 
 // AudioMixer — sums up to MAX_AUDIO_TRACKS independent FFmpeg-decoded
 // audio streams into a single 48 kHz s16 stereo output via QAudioSink in
@@ -120,6 +121,16 @@ public:
     void setTrackSolo(int trackIdx, bool solo);
     void setTrackGain(int trackIdx, double gain);
     double trackGain(int trackIdx) const;
+
+    // Bus / submix / aux-send routing (AB-4). Replaces the per-track →
+    // master bus-gain map consulted in the mix loop. The routing object is
+    // a pure value engine (audiobus::AudioBusRouting); setBusRouting swaps
+    // the whole snapshot under m_controlMutex so the audio worker thread
+    // always reads a coherent copy. When no buses are defined and no track
+    // is assigned, resolveTrackToMasterGain returns 1.0 for every track, so
+    // the mix is bit-identical to the pre-AB-4 path (identity guarantee).
+    void setBusRouting(const audiobus::AudioBusRouting &r);
+    audiobus::AudioBusRouting busRouting() const;
 
     // Per-track realtime EQ (3-band biquad, applied before effectiveGain).
     void setTrackEqConfig(int trackIdx, const AudioEQConfig &cfg);
@@ -464,6 +475,14 @@ private:
     // read by ducking menu handler (GUI thread) to drive Timeline's
     // envelope-based applyDuckingFromTrack.
     AutoDuckParams m_autoDuckParams;
+
+    // Bus / submix / aux-send routing (AB-4). Set from the GUI thread via
+    // setBusRouting under m_controlMutex; the audio worker thread reads it
+    // inside MixerIODevice::readData under the same mutex (resolveTrack-
+    // ToMasterGain is a cheap O(bus-count) double accumulation). Default-
+    // constructed = no buses, no assignments → resolveTrackToMasterGain
+    // returns 1.0 for every track, so the mix path is unchanged (identity).
+    audiobus::AudioBusRouting m_busRouting;
 
     // Master loudness normalizer state. Atomics are touched from the GUI
     // thread (setters) and the audio worker thread (readData). The mutable

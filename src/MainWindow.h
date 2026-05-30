@@ -81,10 +81,12 @@
 #include "MediaPool.h"             // MP-5: メディアプール SSOT モデル
 #include "MediaPoolDock.h"         // MP-5: メディアプール UI ドック
 #include "MarkerPanelDock.h"       // MK-2: マーカー パネル UI ドック
+#include "AudioBusRouting.h"       // AB-5: オーディオ バス ルーティング SSOT モデル
 
 class VideoPlayer;
 class Timeline;
 class SourceMonitorDock;
+class AudioBusPanel;
 class ExportDialog;
 class BrushAnimation;
 class RotoToolsDialog;
@@ -461,6 +463,10 @@ private slots:
     // overwriteClip3PointActive で再生ヘッド位置から上書きする。
     void onSourceOverwriteRequested(const threepoint::SourceSelection &sel);
 
+    // AB-5: オーディオ バス パネルでルーティングが変更されたとき。SSOT である
+    // m_audioBusRouting を AudioMixer::setBusRouting で反映する。
+    void onAudioBusRoutingChanged();
+
     // US-INT-1: Sprint 16 — モバイルデバイス向けエクスポートダイアログ
     void onMobileExport();
 
@@ -653,6 +659,14 @@ private:
     // SM-5: ソースモニター ドック (右側)。素材を VideoPlayer でプレビューし、
     // マークイン/アウト後に insertRequested/overwriteRequested で 3 点編集する。
     SourceMonitorDock *m_sourceMonitorDock = nullptr;
+
+    // AB-5: オーディオ バス パネル ドック (右側)。m_audioBusRouting が SSOT で、
+    // パネルはそれをポインタで指すビュー。routingChanged を受けて AudioMixer へ
+    // setBusRouting で反映し、プロジェクト保存/読込で ProjectData::audioBusRouting
+    // 経由に永続化する。
+    AudioBusPanel *m_audioBusPanel = nullptr;
+    audiobus::AudioBusRouting m_audioBusRouting;
+
     QDockWidget *m_vfxControlsDock = nullptr;
     LayerCompositor m_layerCompositor;
     PrecomposeManager m_precomposeManager;

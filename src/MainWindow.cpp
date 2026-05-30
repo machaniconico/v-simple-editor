@@ -56,6 +56,7 @@
 #include "AspectReframer.h"
 #include "ClipGeometry.h"
 #include "SourceMonitorDock.h"
+#include "AudioBusPanel.h"   // AB-5: オーディオ バス パネル ドック
 
 // US-INT-1: Sprint 16 — モバイルエクスポート + 取り込みハブ (optional includes)
 #if __has_include("MobileExportDialog.h")
@@ -2647,6 +2648,18 @@ void MainWindow::setupMenuBar()
     connect(m_sourceMonitorDock, &SourceMonitorDock::overwriteRequested,
             this, &MainWindow::onSourceOverwriteRequested);
 
+    // AB-5: オーディオ バス パネル ドック (右側)。m_audioBusRouting が SSOT で、
+    // パネルはそのポインタを指すビュー。ユーザ操作 → routingChanged →
+    // onAudioBusRoutingChanged で AudioMixer へ反映する。既定では非表示にして
+    // おき、「表示」メニューのトグルで出し入れする。
+    m_audioBusPanel = new AudioBusPanel(this);
+    addDockWidget(Qt::RightDockWidgetArea, m_audioBusPanel);
+    m_audioBusPanel->setRouting(&m_audioBusRouting);
+    m_audioBusPanel->refresh();
+    m_audioBusPanel->setVisible(false);
+    connect(m_audioBusPanel, &AudioBusPanel::routingChanged,
+            this, &MainWindow::onAudioBusRoutingChanged);
+
     // US-SNS-7: 配信向け submenu
     auto *streamMenu = menuBar()->addMenu("配信向け(&S)");
 
@@ -3093,6 +3106,17 @@ void MainWindow::setupMenuBar()
         connect(m_sourceMonitorDock, &QDockWidget::visibilityChanged, sourceMonitorAction, &QAction::setChecked);
         m_menuHelpEntries.append({sourceMonitorAction,
             QStringLiteral("素材を再生しながらマークイン/マークアウトで使う範囲を決め、再生ヘッド位置へ挿入/上書きするパネルを出し入れします。")});
+    }
+
+    // AB-5: オーディオ バス パネル ドックの表示トグル
+    if (m_audioBusPanel) {
+        auto *audioBusAction = viewMenu->addAction("オーディオ バス");
+        audioBusAction->setCheckable(true);
+        audioBusAction->setChecked(m_audioBusPanel->isVisible());
+        connect(audioBusAction, &QAction::toggled, m_audioBusPanel, &QDockWidget::setVisible);
+        connect(m_audioBusPanel, &QDockWidget::visibilityChanged, audioBusAction, &QAction::setChecked);
+        m_menuHelpEntries.append({audioBusAction,
+            QStringLiteral("複数のオーディオトラックをバス（グループ）へまとめ、ゲイン・ミュート・ソロ・サブミックスをまとめて調整するパネルを出し入れします。")});
     }
 
     // US-NODE-9: Node compositing mode toggle
@@ -4080,6 +4104,9 @@ void MainWindow::populateProjectData(ProjectData &data)
     // MP-5: メディアプール (ビン/素材/スマートビン) をプロジェクトへ保存。
     data.mediaPool = m_mediaPool;
 
+    // AB-5: オーディオ バス ルーティング (バス/サブミックス/AUX) を保存。
+    data.audioBusRouting = m_audioBusRouting;
+
     data.smartReframe = m_smartReframe.toJson();
     data.subtitleSegments.clear();
     for (const auto &seg : m_subtitleSegments) {
@@ -4310,6 +4337,15 @@ void MainWindow::applyLoadedProjectData(const ProjectData &data, const QString &
     m_mediaPool = data.mediaPool;
     if (m_mediaPoolDock)
         m_mediaPoolDock->refresh();
+
+    // AB-5: オーディオ バス ルーティングを復元し、AudioMixer へ反映 + パネル再描画。
+    m_audioBusRouting = data.audioBusRouting;
+    if (auto *mixer = m_player ? m_player->audioMixer() : nullptr)
+        mixer->setBusRouting(m_audioBusRouting);
+    if (m_audioBusPanel) {
+        m_audioBusPanel->setRouting(&m_audioBusRouting);
+        m_audioBusPanel->refresh();
+    }
 
     updateTitle();
     hideWelcomeScreen();
@@ -4628,6 +4664,16 @@ void MainWindow::onSourceOverwriteRequested(const threepoint::SourceSelection &s
             .arg(sel.displayName.isEmpty()
                      ? QFileInfo(sel.filePath).fileName()
                      : sel.displayName));
+}
+
+// AB-5: オーディオ バス パネルでルーティングが変更されたとき。SSOT である
+// m_audioBusRouting (パネルが直接更新済み) を AudioMixer へ反映する。AudioMixer
+// 未生成のときは将来 setSequence/再生開始時に setBusRouting が呼ばれるよう
+// SSOT 側にだけ残す (ここでは no-op)。
+void MainWindow::onAudioBusRoutingChanged()
+{
+    if (auto *mixer = m_player ? m_player->audioMixer() : nullptr)
+        mixer->setBusRouting(m_audioBusRouting);
 }
 
 // TR-4: 選択クリップの先頭を再生ヘッドへ合わせる (RippleIn)。
