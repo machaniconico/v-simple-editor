@@ -9,14 +9,18 @@
 // Free comparator for the production layer sort. Extracted from the inline
 // lambda in handlePlaybackTick so the S3-STACK predicate sub-assertion in
 // main.cpp can exercise the EXACT same comparator and catch a re-inversion.
-// Returns true when `a` should paint BEFORE `b` (i.e. is deeper in the stack):
-// V1 (sourceTrack 0) is the base; higher tracks paint on top — ascending order.
+// Returns true when `a` should paint BEFORE `b` (i.e. is deeper in the stack).
+// V1-wins stacking (PlaybackTypes.h:34): V1 (sourceTrack 0) paints LAST so it
+// ends up ON TOP; the highest track (largest sourceTrack) paints FIRST so it is
+// the backmost layer. SourceOver draws the last image frontmost, so to make V1
+// frontmost the comparator sorts DESCENDING by sourceTrack (V_max first → back,
+// V1 last → front).
 // Lives in namespace clipstack to avoid GLOBAL-namespace ODR/symbol pollution.
 namespace clipstack {
 bool layerPaintOrderLess(const VideoPlayer::DecodedLayer &a,
                          const VideoPlayer::DecodedLayer &b)
 {
-    return a.sourceTrack < b.sourceTrack;
+    return a.sourceTrack > b.sourceTrack;
 }
 } // namespace clipstack
 
@@ -3646,8 +3650,9 @@ void VideoPlayer::handlePlaybackTick()
         }
 
         // Phase 1e occlusion culling: V1 is drawn last (on top) under the
-        // V_max -> V1 sort, so when V1 is fully opaque AND fills the canvas
-        // (scale=1, dx=dy=0) every V2+ overlay underneath it is invisible.
+        // descending V_max -> V1 sort (V1-wins stacking), so when V1 is fully
+        // opaque AND fills the canvas (scale=1, dx=dy=0) every V2+ overlay
+        // underneath it is invisible.
         // Skip the V2+ decode loop entirely in that case — it dominates the
         // multi-track stutter cost (decodeMs ~1685ms / 30 ticks).
         // Default ON because the cull is logically conservative: the math
@@ -3818,12 +3823,13 @@ void VideoPlayer::handlePlaybackTick()
                     overlayPresent = true;
             }
         }
-        // Export-matching paint order: V1 (sourceTrack 0) is the base,
-        // higher tracks (V2, V3, …) paint OVER it — ascending by sourceTrack.
-        // This mirrors renderFrameAt (TimelineFrameRenderer.cpp:681/719/869),
-        // trackmatte::composite (TrackMatteBake.cpp:82 ascending array order),
-        // and MainWindow::buildSpecialClipComposite (zOrder ascending), so
-        // an opaque V2 overlay occludes V1 in preview exactly as in export.
+        // Export-matching paint order (V1-wins stacking, PlaybackTypes.h:34):
+        // V1 (sourceTrack 0) paints LAST so it ends up ON TOP; higher tracks
+        // (V2, V3, …) paint UNDERNEATH it — DESCENDING by sourceTrack so the
+        // highest track is drawn first (backmost) and V1 last (frontmost).
+        // This mirrors renderFrameAt (TimelineFrameRenderer.cpp matte-free
+        // branch paints overlays first then V1 base last), so an opaque V1
+        // occludes V2 in preview exactly as in export.
         // stable_sort: deterministic tie-break for same-sourceTrack clips
         // (preserves input order for equal keys); behaviour-identical to sort
         // for the common distinct-track case.
@@ -4633,11 +4639,14 @@ enum AVPixelFormat VideoPlayer::poolGetHwFormatCallback(AVCodecContext *ctx, con
 
 // ---- Phase 1d software compositor ------------------------------------------
 //
-// composeMultiTrackFrame paints overlay layers (V2+) on top of the V1 base
-// using QPainter::CompositionMode_SourceOver against an ARGB32_Premultiplied
-// canvas. Each layer's videoScale/videoDx/videoDy follows the OBS-style
-// transform convention used elsewhere in the player: dx/dy in canvas-relative
-// 0..1 units, scale around the canvas center.
+// composeMultiTrackFrame paints the supplied layer stack onto the canvas in
+// vector order using QPainter::CompositionMode_SourceOver against an
+// ARGB32_Premultiplied canvas. The caller (handlePlaybackTick) sorts layers
+// DESCENDING by sourceTrack (clipstack::layerPaintOrderLess), so the highest
+// track is painted first (backmost) and V1 last (frontmost) — V1-wins
+// stacking per PlaybackTypes.h:34. Each layer's videoScale/videoDx/videoDy
+// follows the OBS-style transform convention used elsewhere in the player:
+// dx/dy in canvas-relative 0..1 units, scale around the canvas center.
 //
 // V1-only timeline regression safety: when overlayLayers is empty we return
 // v1Frame unchanged so the legacy displayFrame path (composeFrameWithOverlays

@@ -4128,6 +4128,15 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
             indexByClipId.value(matteIt.value().matteSourceClipId, -1);
     }
 
+    // Special-clip composite routes ALL layers (matte AND non-matte) through
+    // the shared trackmatte::composite SSOT, whose isValidMatteSource hard-
+    // reserves index 0 as the base (never a matte source). Reversing this to
+    // V1-on-top would push the highest track to index 0 and silently drop a
+    // legitimately-top matte source, so the matte ADJACENCY contract is kept
+    // by leaving the SSOT array order ASCENDING (matching renderFrameAt's
+    // matte branch and LayerCompositor — full matte parity). The V1-on-top
+    // z-order flip is applied to the non-matte SSOT paths (VideoPlayer preview
+    // compositor + renderFrameAt matte-free branch).
     QVector<int> order(activeLayers.size());
     std::iota(order.begin(), order.end(), 0);
     std::sort(order.begin(), order.end(), [&activeLayers](int a, int b) {

@@ -1254,30 +1254,60 @@ int runParitySelftest()
                 << colB.red() << colB.green() << colB.blue();
 
         // Helper: build a real parentless 2-track Timeline (the exact shape
-        // RenderQueue::resolveTimeline produces for export), V1=basePath,
-        // V2=overlay clip with the given transform, then render through the
-        // SUT export path tlrender::renderFrameAt. (renderFrameAt is the
-        // PRODUCER OF THE ACTUAL ONLY — never used to build EXPECTED values.)
+        // RenderQueue::resolveTimeline produces for export), then render
+        // through the SUT export path tlrender::renderFrameAt. (renderFrameAt
+        // is the PRODUCER OF THE ACTUAL ONLY — never used to build EXPECTED
+        // values.)
+        //
+        // V1-wins stacking (PlaybackTypes.h:34): V1 ends up ON TOP. To keep
+        // these PiP/geometry stages meaningful, the TRANSFORMED clip (the one
+        // whose placement we hand-derive) is put on V1 (the FRONT layer) and
+        // the flat full-canvas base (colour A) is put on V2 (BEHIND). So:
+        //   - inside the transformed clip's hand-derived bbox → colour B
+        //     (the V1 clip, on top), and
+        //   - outside it → colour A (the V2 flat base shows through where the
+        //     transformed V1 clip is absent).
+        // The hand-derived geometry is identical to before — clipgeom places a
+        // clip by its transform regardless of which track it sits on; only the
+        // z-order role (which clip is in front) is swapped to exercise the
+        // V1-on-top contract. (`ovFile` = the transformed clip = V1 now; the
+        // flat colour-A base = V2.)
         auto renderTwoTrack =
             [&](const QString &ovFile, double scale, double dx, double dy,
                 double rotDeg) -> QImage {
             Timeline tl;
-            tl.addClip(basePath);
+            // V1 = the transformed clip (front under V1-wins stacking).
+            tl.addClip(ovFile);
             if (tl.videoClips().isEmpty())
                 return QImage();
+            const QVector<TimelineTrack *> &vtV1 = tl.videoTracks();
+            if (vtV1.isEmpty() || !vtV1[0] || vtV1[0]->clipCount() < 1)
+                return QImage();
+            // Apply the transform to the V1 clip via copy-modify-write through
+            // setClips() (TimelineTrack exposes no mutable clip handle).
+            QVector<ClipInfo> v1Clips = vtV1[0]->clips();
+            if (v1Clips.isEmpty())
+                return QImage();
+            v1Clips[0].videoScale = scale;
+            v1Clips[0].videoDx = dx;
+            v1Clips[0].videoDy = dy;
+            v1Clips[0].rotation2DDegrees = rotDeg;
+            v1Clips[0].opacity = 1.0;                 // opaque: exact colour
+            vtV1[0]->setClips(v1Clips);
+            // V2 = the flat full-canvas base (colour A), behind V1.
             tl.addVideoTrack();
             const QVector<TimelineTrack *> &vt = tl.videoTracks();
             if (vt.size() < 2 || !vt[1])
                 return QImage();
-            ClipInfo ov = tl.videoClips().first();   // probed metadata shell
-            ov.filePath = ovFile;
-            ov.displayName = QStringLiteral("s3-overlay");
-            ov.videoScale = scale;
-            ov.videoDx = dx;
-            ov.videoDy = dy;
-            ov.rotation2DDegrees = rotDeg;
-            ov.opacity = 1.0;                        // opaque: exact colour
-            vt[1]->addClip(ov);
+            ClipInfo base = tl.videoClips().first();  // probed metadata shell
+            base.filePath = basePath;
+            base.displayName = QStringLiteral("s3-base-v2");
+            base.videoScale = 1.0;
+            base.videoDx = 0.0;
+            base.videoDy = 0.0;
+            base.rotation2DDegrees = 0.0;
+            base.opacity = 1.0;
+            vt[1]->addClip(base);
             if (vt[1]->clipCount() != 1)
                 return QImage();
             return tlrender::renderFrameAt(&tl, 0, outSize);
@@ -2027,22 +2057,20 @@ int runParitySelftest()
     //
     // REGRESSION HISTORY: R3 review found that composeMultiTrackFrame sorted
     // layers DESCENDING, painting V1 over V2. The R4-1 fix flipped the sort to
-    // ASCENDING. Neither R3 nor R4 had a test that would have caught the
-    // inversion — the old tautological S3 (removed) compared the two paths
-    // against each other, so both paths being wrong in the SAME direction gave
-    // a false PASS. This stage provides the INDEPENDENT expected value: with an
-    // opaque V2 at default transform (fills the canvas), the WHOLE canvas must
-    // equal colour B regardless of V1's content. That expectation is derived
-    // from the z-order contract alone — it does NOT come from running either
-    // path first. An old descending sort (or any future V1-on-top regression)
-    // makes the canvas colour A instead → both the export and preview asserts
-    // fail loudly.
+    // The old tautological S3 (removed) compared the two paths against each
+    // other, so both paths being wrong in the SAME direction gave a false PASS.
+    // This stage provides the INDEPENDENT expected value: with an opaque V1 at
+    // default transform (fills the canvas), the WHOLE canvas must equal colour A
+    // regardless of V2's content. That expectation is derived from the z-order
+    // contract alone — it does NOT come from running either path first. An
+    // ascending sort (or any future V2-on-top regression) makes the canvas
+    // colour B instead → both the export and preview asserts fail loudly.
     //
-    // INDEPENDENT EXPECTED VALUE: V2 has opacity=1 and default transform
-    // (scale=1, dx=0, dy=0, rot=0) → centre-anchored identity → V2 fills
+    // INDEPENDENT EXPECTED VALUE: V1 has opacity=1 and default transform
+    // (scale=1, dx=0, dy=0, rot=0) → centre-anchored identity → V1 fills
     // every pixel of the 640×360 canvas (verified by the S3 identity assertion
-    // two stages above). V1 = colour A is beneath. "Overlays win" → whole
-    // canvas = colour B. Any V1-on-top path outputs colour A instead.
+    // above). V2 = colour B is beneath. "V1 wins" → whole canvas = colour A.
+    // Any V2-on-top path outputs colour B instead.
     //
     // THREE PATHS TESTED:
     //   (a) tlrender::renderFrameAt — the export SSOT.
@@ -2209,23 +2237,23 @@ int runParitySelftest()
                 bool exportOk = true;
                 for (const P &s : pts) {
                     const QColor m = blockMeanSt(act, s.x, s.y, 4);
-                    if (!colNearSt(m, colB_st, 8)) {
+                    if (!colNearSt(m, colA_st, 8)) {
                         qCritical()
                             << "PARITY S3-STACK FAILED [EXPORT PATH]:"
                                " z-order inversion detected — sample ("
                             << s.x << "," << s.y << ") =" << m.red()
                             << m.green() << m.blue()
-                            << "expected B (V2-on-top)" << colB_st.red()
-                            << colB_st.green() << colB_st.blue()
-                            << "(±8). V1 is on top of V2 in"
-                               " renderFrameAt — R4/stacking-order"
+                            << "expected A (V1-on-top)" << colA_st.red()
+                            << colA_st.green() << colA_st.blue()
+                            << "(±8). V2 is on top of V1 in"
+                               " renderFrameAt — V1-wins stacking-order"
                                " regression in the export path.";
                         exportOk = false;
                     }
                 }
                 if (!exportOk) return 1;
-                qInfo() << "PARITY S3-STACK (export): V2-on-top OK —"
-                           " whole canvas = colour B via renderFrameAt";
+                qInfo() << "PARITY S3-STACK (export): V1-on-top OK —"
+                           " whole canvas = colour A via renderFrameAt";
             }
 
             // ── (b) Preview path: VideoPlayer::composeMultiTrackFrameForTest
@@ -2253,11 +2281,16 @@ int runParitySelftest()
                     rawB.scaled(outSize, Qt::IgnoreAspectRatio,
                                 Qt::SmoothTransformation);
 
+                // The shim paints overlayRgb OVER the base (vector order, no
+                // sort). To exercise V1-on-top we pass V2 (colour B) as the
+                // BASE and V1 (colour A) as the single overlay — i.e. the exact
+                // layer ordering the descending production sort produces (V2
+                // backmost, V1 frontmost). Result must be whole-canvas A.
                 VideoPlayer *vp = new VideoPlayer(nullptr);
                 const QImage previewResult =
                     vp->composeMultiTrackFrameForTest(
-                        v1Frame,
-                        { v2Frame },          // overlayRgb
+                        v2Frame,              // base = V2 (colour B, behind)
+                        { v1Frame },          // overlayRgb = V1 (colour A, front)
                         { 1.0 },              // opacity
                         { 1.0 },              // scale
                         { 0.0 },              // dx
@@ -2274,70 +2307,75 @@ int runParitySelftest()
                 bool previewOk = true;
                 for (const P &s : pts) {
                     const QColor m = blockMeanSt(previewResult, s.x, s.y, 4);
-                    if (!colNearSt(m, colB_st, 8)) {
+                    if (!colNearSt(m, colA_st, 8)) {
                         qCritical()
                             << "PARITY S3-STACK FAILED [PREVIEW PATH]:"
                                " z-order inversion detected — sample ("
                             << s.x << "," << s.y << ") =" << m.red()
                             << m.green() << m.blue()
-                            << "expected B (V2-on-top)" << colB_st.red()
-                            << colB_st.green() << colB_st.blue()
-                            << "(±8). V1 is on top of V2 in"
-                               " composeMultiTrackFrame — R3 stacking"
-                               " inversion still present (or re-introduced).";
+                            << "expected A (V1-on-top)" << colA_st.red()
+                            << colA_st.green() << colA_st.blue()
+                            << "(±8). V2 is on top of V1 in"
+                               " composeMultiTrackFrame — V1-wins paint-loop"
+                               " order broken (or re-introduced inversion).";
                         previewOk = false;
                     }
                 }
                 if (!previewOk) return 1;
-                qInfo() << "PARITY S3-STACK (preview): V2-on-top OK —"
-                           " whole canvas = colour B via"
+                qInfo() << "PARITY S3-STACK (preview): V1-on-top OK —"
+                           " whole canvas = colour A via"
                            " composeMultiTrackFrameForTest";
             }
 
             // ── (c) Predicate sub-assertion: clipstack::layerPaintOrderLess
             // Build a 2-element vector in DELIBERATELY WRONG order:
-            //   [0] overlay  (sourceTrack=1)
-            //   [1] V1 base  (sourceTrack=0)
+            //   [0] V1 base  (sourceTrack=0)
+            //   [1] overlay  (sourceTrack=1)
             // Apply the SAME clipstack::layerPaintOrderLess that
-            // handlePlaybackTick's stable_sort uses. After sorting, V1
-            // (track 0) MUST be first. If the comparator were re-inverted
-            // to `>`, stable_sort would leave V1 last → FAIL. This is the
-            // only assert that guards the production sort comparator
-            // against re-inversion.
+            // handlePlaybackTick's stable_sort uses. V1-wins stacking means V1
+            // (track 0) is painted LAST (frontmost), so after the DESCENDING
+            // sort V1 MUST be LAST in the vector (V_max first/backmost). If the
+            // comparator were re-inverted to `<` (ascending / V2-on-top),
+            // stable_sort would leave V1 first → FAIL. This is the only assert
+            // that guards the production sort comparator against re-inversion.
             {
-                VideoPlayer::DecodedLayer overlay, v1base;
-                overlay.sourceTrack = 1;   // V2 overlay — wrong position
+                VideoPlayer::DecodedLayer v1base, overlay;
                 v1base.sourceTrack  = 0;   // V1 base   — wrong position
+                overlay.sourceTrack = 1;   // V2 overlay — wrong position
                 QVector<VideoPlayer::DecodedLayer> predVec;
-                predVec.append(overlay);   // [0]=track1 (intentionally reversed)
-                predVec.append(v1base);    // [1]=track0
+                predVec.append(v1base);    // [0]=track0 (intentionally reversed)
+                predVec.append(overlay);   // [1]=track1
 
                 std::stable_sort(predVec.begin(), predVec.end(),
                                  clipstack::layerPaintOrderLess);
 
-                if (predVec[0].sourceTrack != 0 || predVec[1].sourceTrack != 1) {
+                // Descending sort → V_max (track 1) first/backmost, V1 (track 0)
+                // last/frontmost.
+                if (predVec[0].sourceTrack != 1 || predVec[1].sourceTrack != 0) {
                     qCritical()
                         << "PARITY S3-STACK FAILED [PREDICATE]:"
                            " clipstack::layerPaintOrderLess produced wrong"
                            " order after sorting reversed vector — expected"
-                           " [0].track=0 [1].track=1, got [0].track="
+                           " [0].track=1 [1].track=0 (V1 frontmost), got"
+                           " [0].track="
                         << predVec[0].sourceTrack
                         << "[1].track=" << predVec[1].sourceTrack
-                        << ". The production sort comparator is INVERTED —"
-                           " re-inversion regression in VideoPlayer.cpp.";
+                        << ". The production sort comparator is INVERTED to"
+                           " ascending (V2-on-top) — re-inversion regression"
+                           " in VideoPlayer.cpp.";
                     return 1;
                 }
                 qInfo() << "PARITY S3-STACK (predicate):"
                            " clipstack::layerPaintOrderLess sorts V1-track0"
-                           " first — production sort comparator correct,"
-                           " re-inversion guard active";
+                           " LAST (frontmost) — production sort comparator"
+                           " correct (descending), re-inversion guard active";
             }
         }
         s3stack_skip:
-        qInfo() << "[INFO] PARITY S3-STACK z-order OK (V2 over V1 in export"
+        qInfo() << "[INFO] PARITY S3-STACK z-order OK (V1 over V2 in export"
                    " SSOT + preview compositor paint-loop; predicate guard"
-                   " confirms production sort comparator is ascending —"
-                   " R3/R4 inversion regression guard active)";
+                   " confirms production sort comparator is descending —"
+                   " V1-wins stacking regression guard active)";
     }
 
     // ── S4: per-clip colour correction + 3D LUT ─────────────────────────────

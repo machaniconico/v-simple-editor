@@ -355,7 +355,11 @@ QImage LayerCompositor::transformLayer(const QImage &source, const CompositeLaye
 QImage LayerCompositor::compositeFrame(const QVector<CompositeLayer> &layers,
                                        const QSize &canvasSize, double time)
 {
-    // Sort by zOrder (bottom to top)
+    // Routes ALL layers through the shared trackmatte::composite SSOT, whose
+    // isValidMatteSource hard-reserves index 0 as the base. Kept ASCENDING by
+    // zOrder to preserve the matte ADJACENCY contract (matching renderFrameAt's
+    // matte branch and buildSpecialClipComposite); the V1-on-top z-order flip
+    // is applied to the non-matte SSOT paths only.
     QVector<CompositeLayer> sorted = layers;
     std::sort(sorted.begin(), sorted.end(),
               [](const CompositeLayer &a, const CompositeLayer &b) {

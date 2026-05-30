@@ -708,7 +708,8 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
         baseLayer.clipId = renderClipId(0, v1Idx);
         baseLayer.image = base;
         baseLayer.layer.name = v1Clip.displayName;
-        baseLayer.layer.opacity = 1.0;
+        baseLayer.layer.visible = v1Clip.opacity > 0.001;
+        baseLayer.layer.opacity = qBound(0.0, v1Clip.opacity, 1.0);
         baseLayer.layer.blendMode = BlendMode::Normal;
         baseLayer.layer.zOrder = 0;
         baseLayer.layer.inPoint = v1Start;
@@ -860,13 +861,22 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
     // then SourceOver-composited at the clip's opacity exactly as before.
     QImage stacked;
     if (!hasTrackMatteLayer) {
-        QImage composed = base.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+        // V1-wins stacking (PlaybackTypes.h:34): V1 (the base layer) paints
+        // LAST so it ends up ON TOP; the overlay tracks (V2, V3, …) paint
+        // UNDERNEATH it. `overlays` is collected ascending by track (V2 first,
+        // V_max last), so paint them in REVERSE (highest track first = backmost)
+        // and then paint the V1 base last (frontmost). This matches the
+        // preview compositor's descending clipstack::layerPaintOrderLess sort,
+        // so an opaque V1 occludes V2 in export exactly as in preview.
+        QImage composed(base.size(), QImage::Format_ARGB32_Premultiplied);
+        composed.fill(Qt::transparent);
         QPainter p(&composed);
         p.setRenderHint(QPainter::SmoothPixmapTransform, false);
         p.setCompositionMode(QPainter::CompositionMode_SourceOver);
 
         const QSize canvas(composed.width(), composed.height());
-        for (const OverlayLayer &L : overlays) {
+        for (int i = overlays.size() - 1; i >= 0; --i) {
+            const OverlayLayer &L = overlays[i];
             if (L.rgb.isNull() || L.opacity <= 0.001)
                 continue;
             const clipgeom::ClipTransform t{L.videoScale, L.videoDx,
@@ -876,10 +886,30 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
             p.setOpacity(qBound(0.0, L.opacity, 1.0));
             p.drawImage(0, 0, placed);
         }
+        // V1 base painted last → on top. `base` is already placed at outSize
+        // via the V1 clip transform (fast-path scaled() or clipgeom).
+        const double v1Opacity = qBound(0.0, v1Clip.opacity, 1.0);
+        if (v1Opacity > 0.001) {
+            p.setOpacity(v1Opacity);
+            p.drawImage(0, 0, base);
+        }
         p.end();
 
         stacked = composed.convertToFormat(QImage::Format_RGBA8888);
     } else {
+        // Track-matte timelines: the matte ADJACENCY contract ("the clip above
+        // provides the matte'd clip's alpha") is encoded as array-index links
+        // (matteSourceLayerIndex) resolved above in the ascending index space,
+        // and trackmatte::composite's isValidMatteSource hard-reserves index 0
+        // as the V1 base (never a matte source). Reversing the array to put V1
+        // frontmost would push the highest track to index 0 and make a
+        // legitimately-top matte SOURCE fail that guard — silently dropping the
+        // matte. So the shared SSOT array order is kept ascending here to
+        // PRESERVE the matte adjacency relationships exactly (per the spec's
+        // "判断が難しければマット隣接関係は維持" fallback). The z-order flip to
+        // V1-on-top is applied to every non-matte path (matte-free branch above,
+        // preview compositor, special-clip composite); matte'd stacks keep their
+        // adjacency-driven order so the alpha relationships stay correct.
         QVector<CompositeLayer> layers;
         QVector<QImage> layerImages;
         layers.reserve(renderLayers.size());

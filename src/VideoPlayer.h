@@ -700,9 +700,10 @@ private:
 // handlePlaybackTick) AND directly exercised by the S3-STACK predicate
 // sub-assertion in src/main.cpp. Extracted from the inline lambda so a
 // re-inversion of the comparator breaks the selftest loudly.
-// Contract: V1 (sourceTrack==0) sorts BEFORE higher tracks, so the
-// compositor paints V1 first (base) and overlays on top — ascending order
-// matches renderFrameAt / trackmatte::composite / buildSpecialClipComposite.
+// Contract (V1-wins stacking, PlaybackTypes.h:34): V1 (sourceTrack==0) sorts
+// AFTER higher tracks, so the compositor paints the highest track first
+// (backmost) and V1 LAST (frontmost, ON TOP) — descending order matches
+// renderFrameAt / trackmatte::composite / buildSpecialClipComposite.
 // Wrapped in namespace clipstack to avoid GLOBAL-namespace ODR/symbol
 // pollution; all call sites must qualify as clipstack::layerPaintOrderLess.
 namespace clipstack {
