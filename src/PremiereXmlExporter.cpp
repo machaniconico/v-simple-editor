@@ -292,13 +292,16 @@ QList<QString> PremiereXmlExporter::generateIndividualXmls(
     for (int i = 0; i < highlights.size(); ++i) {
         const PremiereHighlight& h = highlights[i];
 
-        // File name: use title, sanitised, with index prefix for uniqueness
+        // File name: use title, sanitised, with a 1-based zero-padded index
+        // prefix so highlights sharing the same title never overwrite each other.
         QString safeName = h.title;
         safeName.replace(QRegularExpression(QStringLiteral("[/\\\\:*?\"<>|]")), QStringLiteral("_"));
         if (safeName.isEmpty())
-            safeName = QStringLiteral("clip-%1").arg(i + 1);
+            safeName = QStringLiteral("clip");
 
-        const QString outputPath = outputDir + QStringLiteral("/") + safeName + QStringLiteral(".xml");
+        const QString prefix = QStringLiteral("%1-").arg(i + 1, 3, 10, QLatin1Char('0'));
+        const QString outputPath =
+            outputDir + QStringLiteral("/") + prefix + safeName + QStringLiteral(".xml");
 
         QFile file(outputPath);
         if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text))

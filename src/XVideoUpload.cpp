@@ -285,7 +285,14 @@ void UploadClient::doFinalize(const XUploadConfig &cfg, const QString &mediaId,
 // ---------------------------------------------------------------------------
 
 void UploadClient::doStatusPoll(const XUploadConfig &cfg, const QString &mediaId,
-                                 const UploadJob &job) {
+                                 const UploadJob &job, int attempt) {
+    if (attempt >= kMaxStatusPolls) {
+        emit uploadFailed(
+            QStringLiteral("X media processing timed out after %1 status polls")
+                .arg(kMaxStatusPolls));
+        return;
+    }
+
     if (!m_nam) {
         m_nam = new QNetworkAccessManager(this);
     }
@@ -345,8 +352,8 @@ void UploadClient::doStatusPoll(const XUploadConfig &cfg, const QString &mediaId
         // Still in_progress — respect check_after_secs
         const int checkAfterSecs = procInfo.value(QStringLiteral("check_after_secs")).toInt(5);
         const int delayMs = qMax(1, checkAfterSecs) * 1000;
-        QTimer::singleShot(delayMs, this, [this, cfg, mediaId, job]() {
-            doStatusPoll(cfg, mediaId, job);
+        QTimer::singleShot(delayMs, this, [this, cfg, mediaId, job, attempt]() {
+            doStatusPoll(cfg, mediaId, job, attempt + 1);
         });
     });
 }

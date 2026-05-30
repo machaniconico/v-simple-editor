@@ -97,6 +97,10 @@ void creds::CredentialStore::set(const QString& settingsKey, const QString& valu
             settings.remove(settingsKey);
             return;
         }
+        // Vault store failed: erase any previously stored vault entry so a stale
+        // value cannot shadow (vault is resolved before QSettings) the new value
+        // we are about to persist via the QSettings fallback below.
+        creds::CredentialVault::erase(vaultTargetFor(settingsKey));
     }
 
     QSettings settings;

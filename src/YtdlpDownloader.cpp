@@ -85,6 +85,7 @@ void YtdlpDownloader::start(const QString& url, const QString& outputDir)
                 this, &YtdlpDownloader::onProcessFinished);
     }
 
+    m_cancelled = false;
     m_process->start(ytdlpBin, args);
 }
 
@@ -93,8 +94,12 @@ void YtdlpDownloader::cancel()
     if (!m_process || m_process->state() == QProcess::NotRunning) {
         return;
     }
+    m_cancelled = true;
     m_process->kill();
-    emit finished(false, QString(), QStringLiteral("cancelled by user"));
+    // finished() は同期 emit しない。kill 完了後に届く QProcess::finished を
+    // onProcessFinished で 1 回だけ "cancelled by user" として emit する。
+    // (同期 emit すると二重発火し、かつ kill が非同期なため cancel 直後の
+    //  再 start が running-guard(L41) に弾かれて無言ドロップする競合を生む。)
 }
 
 bool YtdlpDownloader::isRunning() const
@@ -123,6 +128,13 @@ void YtdlpDownloader::onProcessStderr()
 
 void YtdlpDownloader::onProcessFinished(int exitCode, QProcess::ExitStatus /*status*/)
 {
+    if (m_cancelled) {
+        // kill() による終了。ここで初めて & 1 回だけ cancel の finished を emit する。
+        // この時点で process は NotRunning なので後続の start() も正しく通る。
+        m_cancelled = false;
+        emit finished(false, QString(), QStringLiteral("cancelled by user"));
+        return;
+    }
     if (exitCode != 0) {
         emit finished(false, QString(), m_stderrAccumulated.trimmed());
         return;

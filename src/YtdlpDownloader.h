@@ -36,4 +36,8 @@ private:
     QProcess* m_process = nullptr;
     QString m_currentOutputDir;
     QString m_stderrAccumulated;
+    // cancel() で true にし、kill 起因の QProcess::finished を onProcessFinished が
+    // 受けたとき (この時 process は NotRunning) に 1 回だけ cancel 用 finished を
+    // emit する。同期 emit による二重発火と cancel 直後 restart の競合を防ぐ。
+    bool m_cancelled = false;
 };
