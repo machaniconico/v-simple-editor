@@ -1755,13 +1755,24 @@ void VideoPlayer::forceTimelineUiToCurrent()
 void VideoPlayer::stop()
 {
     pause();
-    // Stop is an explicit rewind; discard any deferred scrub/preview seek that
-    // would otherwise repaint over the frame at t=0 after this call returns.
     if (m_seekTimer)
         m_seekTimer->stop();
-    m_pendingSeekMs = -1;
-    m_pendingSeekPrecise = false;
-    seekInternal(0, true, true);
+    // Rewind to the head. In sequence (timeline) mode the head is TIMELINE 0,
+    // which MUST go through the sequence-aware seek path (seekToTimelineUs via
+    // performPendingSeek). A raw file-local seekInternal(0) leaves the timeline
+    // position projection stale — updatePositionUi() then rejects the large
+    // delta, so the seek bar never returns to 0 and the preview can desync to a
+    // black frame. Run the seek synchronously here exactly once.
+    if (sequenceActive()) {
+        m_pendingSeekMs = 0;
+        m_pendingSeekPrecise = true;
+        performPendingSeek();
+    } else {
+        seekInternal(0, true, true);
+    }
+    // Discard any deferred scrub/preview seek left armed so it can't repaint
+    // over the head frame after this returns (defence against the post-stop
+    // repaint loop).
     if (m_seekTimer)
         m_seekTimer->stop();
     m_pendingSeekMs = -1;
