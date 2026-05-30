@@ -645,6 +645,27 @@ void MarkerLane::paintEvent(QPaintEvent *)
     const int top = 2;                  // small top gap so triangle base
     const int tipY = top + kTriangleSize; // hangs cleanly off the ruler line.
 
+    // MK-1: span (duration) markers first, so the triangle/label below
+    // paints on top of the bar. A point marker (durationUs == 0) draws no
+    // bar — it stays byte-identical to the legacy single-triangle look.
+    for (const auto &m : markers) {
+        if (m.durationUs <= 0) continue;
+        const int x0 = markerScreenX(m.timelineUs);
+        const int x1 = markerScreenX(m.timelineUs + m.durationUs);
+        // Cull bars fully off either edge.
+        if (x1 <= 0 || x0 >= width()) continue;
+        const int barLeft  = qMax(0, x0);
+        const int barRight = qMin(width(), x1);
+        const int barW = qMax(1, barRight - barLeft);
+        const QColor base = m.color.isValid() ? m.color : QColor("#ff5050");
+        QColor barFill = base;
+        barFill.setAlpha(80);  // half-transparent so the ruler shows through
+        // Fill the full lane height minus the bottom hairline.
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(barFill);
+        painter.drawRect(QRect(barLeft, 0, barW, height() - 1));
+    }
+
     for (const auto &m : markers) {
         const int x = markerScreenX(m.timelineUs);
         // Cull off-screen triangles cheaply — important for the
@@ -5445,6 +5466,8 @@ bool Timeline::updateMarker(int id, const Marker &updated)
             // (callers shouldn't have to thread the id back through).
             Marker copy = updated;
             copy.id = id;
+            copy.timelineUs = qMax<qint64>(0, copy.timelineUs);
+            copy.durationUs = qMax<qint64>(0, copy.durationUs);
             if (!copy.color.isValid())
                 copy.color = QColor(QStringLiteral("#ff5050"));
             // Re-sort if the time changed, otherwise just overwrite in place.
@@ -5460,6 +5483,23 @@ bool Timeline::updateMarker(int id, const Marker &updated)
         }
     }
     return false;
+}
+
+void Timeline::setMarkerDuration(int markerId, qint64 durationUs)
+{
+    // MK-1: clamp negatives to 0 (point marker). The span never moves the
+    // marker's start, so no re-sort is needed — sort order is by timelineUs.
+    const qint64 dur = qMax<qint64>(0, durationUs);
+    for (int i = 0; i < m_markersData.size(); ++i) {
+        if (m_markersData[i].id == markerId) {
+            if (m_markersData[i].durationUs == dur)
+                return;  // no change, avoid spurious repaint/signal
+            m_markersData[i].durationUs = dur;
+            if (m_markerLane) m_markerLane->update();
+            emit markersChanged();
+            return;
+        }
+    }
 }
 
 Marker Timeline::markerById(int id) const
@@ -5503,6 +5543,12 @@ int Timeline::prevMarkerBefore(qint64 timelineUs) const
 void Timeline::setMarkers(const QVector<Marker> &markers)
 {
     m_markersData = markers;
+    for (Marker &m : m_markersData) {
+        m.timelineUs = qMax<qint64>(0, m.timelineUs);
+        m.durationUs = qMax<qint64>(0, m.durationUs);
+        if (!m.color.isValid())
+            m.color = QColor(QStringLiteral("#ff5050"));
+    }
     std::sort(m_markersData.begin(), m_markersData.end(),
         [](const Marker &a, const Marker &b) { return a.timelineUs < b.timelineUs; });
     // Restore the monotonic id counter so newly-added markers don't collide

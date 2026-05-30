@@ -409,6 +409,9 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
         root["trackerPresets"] = trackerPresets;
     }
 
+    // PRD-PHASE1-MEDIA-POOL: メディアプール永続化
+    root["mediaPool"] = data.mediaPool.toJson();
+
     QJsonDocument doc(root);
     QFile file(filePath);
     if (!file.open(QIODevice::WriteOnly))
@@ -674,6 +677,9 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
         data.planarTrackerState = planarTrackerStateFromJson(tp.value("planar").toObject());
     }
 
+    // PRD-PHASE1-MEDIA-POOL: メディアプール永続化 (キー欠落でも空 object → 空プールで安全)
+    data.mediaPool.fromJson(root.value("mediaPool").toObject());
+
     return true;
 }
 
@@ -926,6 +932,9 @@ QString ProjectFile::toJsonString(const ProjectData &data)
         trackerPresets["planar"] = planarTrackerStateToJson(data.planarTrackerState);
         root["trackerPresets"] = trackerPresets;
     }
+
+    // PRD-PHASE1-MEDIA-POOL: メディアプール永続化
+    root["mediaPool"] = data.mediaPool.toJson();
 
     QJsonDocument doc(root);
     return QString::fromUtf8(doc.toJson(QJsonDocument::Compact));
@@ -1183,6 +1192,9 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
         data.motionTrackerState = motionTrackerStateFromJson(tp.value("motion").toObject());
         data.planarTrackerState = planarTrackerStateFromJson(tp.value("planar").toObject());
     }
+
+    // PRD-PHASE1-MEDIA-POOL: メディアプール永続化 (キー欠落でも空 object → 空プールで安全)
+    data.mediaPool.fromJson(root.value("mediaPool").toObject());
 
     return true;
 }

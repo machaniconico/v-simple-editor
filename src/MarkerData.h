@@ -22,6 +22,11 @@ struct Marker {
     QString label;          // short text shown in tooltip
     QColor color = QColor(QStringLiteral("#ff5050"));
     QString note;           // longer note (optional, multi-line)
+    // Premiere "duration marker" parity. 0 == point marker (legacy
+    // behaviour, a single triangle). >0 == span marker: a half-transparent
+    // bar of this width (in microseconds) is drawn from timelineUs forward,
+    // with the triangle/label sitting on top.
+    qint64 durationUs = 0;
 };
 
 // JSON helpers — header-only/inline so they can be reused from Timeline,
@@ -31,12 +36,15 @@ inline QJsonObject markerToJsonObject(const Marker &m)
 {
     QJsonObject obj;
     obj[QStringLiteral("id")]     = m.id;
-    obj[QStringLiteral("timeUs")] = static_cast<double>(m.timelineUs);
+    obj[QStringLiteral("timeUs")] = static_cast<double>(qMax<qint64>(0, m.timelineUs));
     obj[QStringLiteral("label")]  = m.label;
     obj[QStringLiteral("color")]  = m.color.isValid()
         ? m.color.name(QColor::HexRgb)
         : QStringLiteral("#ff5050");
     obj[QStringLiteral("note")]   = m.note;
+    // Span width; 0 for point markers. Written for every marker so the
+    // key is present on round-trip, but absence on read is treated as 0.
+    obj[QStringLiteral("durationUs")] = static_cast<double>(qMax<qint64>(0, m.durationUs));
     return obj;
 }
 
@@ -46,14 +54,18 @@ inline Marker markerFromJsonObject(const QJsonObject &obj)
     m.id = obj.value(QStringLiteral("id")).toInt(-1);
     // qint64 round-trips through double via QJsonValue.toDouble; precision
     // is exact up to 2^53 us (~ 285 years), well above any timeline range.
-    m.timelineUs = static_cast<qint64>(
-        obj.value(QStringLiteral("timeUs")).toDouble(0.0));
+    m.timelineUs = qMax<qint64>(0, static_cast<qint64>(
+        obj.value(QStringLiteral("timeUs")).toDouble(0.0)));
     m.label = obj.value(QStringLiteral("label")).toString();
     const QString colStr = obj.value(QStringLiteral("color"))
         .toString(QStringLiteral("#ff5050"));
     QColor c(colStr);
     m.color = c.isValid() ? c : QColor(QStringLiteral("#ff5050"));
     m.note = obj.value(QStringLiteral("note")).toString();
+    // Missing key → 0 (point marker) keeps older project files backward
+    // compatible. Same double round-trip rationale as timeUs above.
+    m.durationUs = qMax<qint64>(0, static_cast<qint64>(
+        obj.value(QStringLiteral("durationUs")).toDouble(0.0)));
     return m;
 }
 

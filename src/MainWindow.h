@@ -78,6 +78,9 @@
 #include "AIProcessingDialog.h"    // brings in AIProcessingSettings
 #include "MotionTrackerDialog.h"   // US-TP-6: motion tracker preset dialog
 #include "TrackerPreset.h"         // US-TP-6: tracker preset apply helper
+#include "MediaPool.h"             // MP-5: メディアプール SSOT モデル
+#include "MediaPoolDock.h"         // MP-5: メディアプール UI ドック
+#include "MarkerPanelDock.h"       // MK-2: マーカー パネル UI ドック
 
 class VideoPlayer;
 class Timeline;
@@ -355,6 +358,16 @@ private slots:
     void jumpToNextMarker();
     void jumpToPrevMarker();
 
+    // MK-2: マーカー パネル ドック関連スロット。
+    // Timeline のマーカーが増減したら setMarkers() で表示を同期する。
+    void refreshMarkerPanel();
+    // パネルの行ダブルクリック → 再生ヘッドをその時刻 (マイクロ秒) へ移動。
+    void onMarkerPanelJump(qint64 timelineUs);
+    // パネルのノート列編集 → Timeline 側マーカーの note を更新。
+    void onMarkerPanelNoteEdited(int markerId, const QString &note);
+    // パネルの削除ボタン → Timeline からマーカーを削除して再同期。
+    void onMarkerPanelDeleteRequested(int markerId);
+
     // US-AETEXT-12: MainWindow Text menu integration
     void addPathText();
     void addRangeSelector();
@@ -416,6 +429,11 @@ private slots:
     // US-CP-4: コマンドパレット (Ctrl+Shift+P) を開く。全メニュー QAction を
     // index 化し、CommandPaletteDialog で検索・実行する。
     void openCommandPalette();
+
+    // MP-5: メディアプールへファイルを取り込む (QFileDialog 複数選択 → MediaAsset 化)
+    void importToMediaPool();
+    // MP-5: メディアプールの素材ダブルクリックでタイムラインに取り込む
+    void onMediaPoolAssetActivated(const QString &filePath);
 
     // US-INT-1: Sprint 16 — モバイルデバイス向けエクスポートダイアログ
     void onMobileExport();
@@ -595,6 +613,16 @@ private:
     SubtitleStyle m_subtitleStyle;
     LoudnessPanel *m_loudnessPanel = nullptr;
     QDockWidget *m_loudnessDock = nullptr;
+
+    // MP-5: メディアプール (NLE のビン/素材管理)。m_mediaPool が SSOT モデル、
+    // m_mediaPoolDock が左ドックの UI。プロジェクト保存/読込で ProjectData
+    // 経由に永続化する。
+    mediapool::MediaPool m_mediaPool;
+    MediaPoolDock *m_mediaPoolDock = nullptr;
+
+    // MK-2: マーカー パネル ドック (右側)。Timeline を所有せず、markersChanged
+    // を受けて setMarkers() で内容を同期するビュー。
+    MarkerPanelDock *m_markerPanelDock = nullptr;
     QDockWidget *m_vfxControlsDock = nullptr;
     LayerCompositor m_layerCompositor;
     PrecomposeManager m_precomposeManager;

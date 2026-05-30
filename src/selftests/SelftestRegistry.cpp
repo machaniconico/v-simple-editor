@@ -51,6 +51,7 @@ int runLibavcoreDecodeSelftest();
 int runLibavcoreEncodeSelftest();
 int runLoudnessSelftest();
 int runLowerThirdSelftest();
+int runMediaPoolSelftest();
 int runMobileSelftest();
 int runMographSelftest();
 int runMultiCamSelftest();
@@ -145,6 +146,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Premiere XML (FCP7) exporter stub (Phase 6 Wave 1 FOUNDATION, filled in US-6E-3: 4 gate combined / individual / multi-sequence / DOCTYPE)" },
     { "youtube-chapter",   "VEDITOR_YOUTUBE_CHAPTER_SELFTEST",    runYoutubeChapterSelftest,     false,
       "YouTube chapter generator stub (Phase 6 Wave 1 FOUNDATION, filled in US-6F-3: 3 gate M:SS / H:MM:SS / intro auto-insert)" },
+    { "media-pool",        "VEDITOR_MEDIA_POOL_SELFTEST",         runMediaPoolSelftest,          false,
+      "MediaPool model: asset/bin/smartbin CRUD + search + JSON round-trip" },
     // QApplication-required (needsQApplication=true) ----------------------
     { "parity",            "VEDITOR_PARITY_SELFTEST",             runParitySelftest,             true,
       "Preview vs export pixel-parity (S1-S11, framediff::mse, 10-bit HDR10)" },

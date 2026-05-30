@@ -193,6 +193,7 @@
 #include <QCloseEvent>
 #include <QFile>
 #include <QFileInfo>
+#include <QDateTime>
 #include <QTimer>
 #include <QPointer>
 #include <QUrl>
@@ -1972,6 +1973,27 @@ void MainWindow::setupMenuBar()
     m_menuHelpEntries.append({exportChapAction,
         QStringLiteral("マーカーをもとに、YouTube の概要欄に貼れるチャプター一覧（時刻＋見出し）を書き出します。")});
 
+    // MK-2: マーカー パネル ドックの表示トグル。ドックはこのメニュー構築より
+    // 後で生成されるため、トグル時に runtime で m_markerPanelDock を参照する。
+    markersMenu->addSeparator();
+    auto *markerPanelAction = markersMenu->addAction("マーカー パネル");
+    markerPanelAction->setCheckable(true);
+    connect(markerPanelAction, &QAction::toggled, this,
+            [this](bool on) {
+                if (m_markerPanelDock)
+                    m_markerPanelDock->setVisible(on);
+            });
+    // ドック生成後に初期チェック状態と双方向同期を結線する。
+    QMetaObject::invokeMethod(this, [this, markerPanelAction]() {
+        if (!m_markerPanelDock)
+            return;
+        markerPanelAction->setChecked(m_markerPanelDock->isVisible());
+        connect(m_markerPanelDock, &QDockWidget::visibilityChanged,
+                markerPanelAction, &QAction::setChecked);
+    }, Qt::QueuedConnection);
+    m_menuHelpEntries.append({markerPanelAction,
+        QStringLiteral("タイムライン上のマーカーを表形式で一覧表示するパネルを出し入れします。行をダブルクリックでその時刻へジャンプ、ノートの編集や削除ができます。")});
+
     // エフェクト メニュー
     auto *effectsMenu = menuBar()->addMenu("エフェクト(&F)");
 
@@ -2551,6 +2573,33 @@ void MainWindow::setupMenuBar()
     connect(m_loudnessPanel, &LoudnessPanel::normalizeRequested,
             this, &MainWindow::applyLoudnessNormalize);
 
+    // MP-5: メディアプール ドック (左側)。SSOT モデル m_mediaPool を指すだけ。
+    m_mediaPoolDock = new MediaPoolDock(this);
+    m_mediaPoolDock->setPool(&m_mediaPool);
+    addDockWidget(Qt::LeftDockWidgetArea, m_mediaPoolDock);
+    connect(m_mediaPoolDock, &MediaPoolDock::assetActivated,
+            this, &MainWindow::onMediaPoolAssetActivated);
+    connect(m_mediaPoolDock, &MediaPoolDock::importRequested,
+            this, &MainWindow::importToMediaPool);
+    m_mediaPoolDock->refresh();
+
+    // MK-2: マーカー パネル ドック (右側)。Timeline のマーカーを表で常時表示する。
+    m_markerPanelDock = new MarkerPanelDock(this);
+    addDockWidget(Qt::RightDockWidgetArea, m_markerPanelDock);
+    connect(m_markerPanelDock, &MarkerPanelDock::jumpToMarker,
+            this, &MainWindow::onMarkerPanelJump);
+    connect(m_markerPanelDock, &MarkerPanelDock::markerNoteEdited,
+            this, &MainWindow::onMarkerPanelNoteEdited);
+    connect(m_markerPanelDock, &MarkerPanelDock::markerDeleteRequested,
+            this, &MainWindow::onMarkerPanelDeleteRequested);
+    // Timeline の markersChanged は addMarker/removeMarker/updateMarker/
+    // setMarkers/setMarkerDuration の全変更パスで発火するので、シーンカット検出
+    // やクイックマーカー等あらゆる増減が自動でパネルへ反映される。
+    if (m_timeline)
+        connect(m_timeline, &Timeline::markersChanged,
+                this, &MainWindow::refreshMarkerPanel);
+    refreshMarkerPanel();
+
     // US-SNS-7: 配信向け submenu
     auto *streamMenu = menuBar()->addMenu("配信向け(&S)");
 
@@ -2976,6 +3025,17 @@ void MainWindow::setupMenuBar()
     connect(m_historyDock, &QDockWidget::visibilityChanged, historyAction, &QAction::setChecked);
     m_menuHelpEntries.append({historyAction,
         QStringLiteral("これまでの操作の履歴を一覧で表示するパネルを出し入れします。前の状態まで一気に戻れます。")});
+
+    // MP-5: メディアプール ドックの表示トグル
+    if (m_mediaPoolDock) {
+        auto *mediaPoolAction = viewMenu->addAction("メディアプール");
+        mediaPoolAction->setCheckable(true);
+        mediaPoolAction->setChecked(m_mediaPoolDock->isVisible());
+        connect(mediaPoolAction, &QAction::toggled, m_mediaPoolDock, &QDockWidget::setVisible);
+        connect(m_mediaPoolDock, &QDockWidget::visibilityChanged, mediaPoolAction, &QAction::setChecked);
+        m_menuHelpEntries.append({mediaPoolAction,
+            QStringLiteral("取り込んだ動画・音声・画像をビン（フォルダ）で整理するパネルを出し入れします。素材をダブルクリックでタイムラインへ追加できます。")});
+    }
 
     // US-NODE-9: Node compositing mode toggle
     m_nodeModeAction = viewMenu->addAction("ノードコンポジットモード");
@@ -3959,6 +4019,9 @@ void MainWindow::populateProjectData(ProjectData &data)
 
     collectAudioState(data);
 
+    // MP-5: メディアプール (ビン/素材/スマートビン) をプロジェクトへ保存。
+    data.mediaPool = m_mediaPool;
+
     data.smartReframe = m_smartReframe.toJson();
     data.subtitleSegments.clear();
     for (const auto &seg : m_subtitleSegments) {
@@ -4185,6 +4248,11 @@ void MainWindow::applyLoadedProjectData(const ProjectData &data, const QString &
         break;
     }
 
+    // MP-5: メディアプールを復元し、ドックを再描画する。
+    m_mediaPool = data.mediaPool;
+    if (m_mediaPoolDock)
+        m_mediaPoolDock->refresh();
+
     updateTitle();
     hideWelcomeScreen();
     updateStatusInfo();
@@ -4351,6 +4419,76 @@ void MainWindow::importVideoFromUrl()
     if (path.isEmpty())
         return;
     loadMediaFile(path, true, QStringLiteral("URL から取り込み"));
+}
+
+// MP-5: 拡張子からメディア種別を判定する小ヘルパー (importToMediaPool 専用)。
+// 大文字小文字を無視し、未知の拡張子は Unknown を返す。
+static mediapool::MediaType mediaTypeForExtension(const QString &suffix)
+{
+    const QString ext = suffix.toLower();
+    static const QStringList kVideo = {
+        "mp4", "mkv", "mov", "webm", "flv", "avi", "wmv", "m4v", "mpg", "mpeg"};
+    static const QStringList kAudio = {
+        "mp3", "wav", "aac", "flac", "ogg", "m4a", "wma", "opus", "aiff"};
+    static const QStringList kImage = {
+        "png", "jpg", "jpeg", "bmp", "gif", "tiff", "tif", "webp", "heic"};
+    if (kVideo.contains(ext))
+        return mediapool::MediaType::Video;
+    if (kAudio.contains(ext))
+        return mediapool::MediaType::Audio;
+    if (kImage.contains(ext))
+        return mediapool::MediaType::Image;
+    return mediapool::MediaType::Unknown;
+}
+
+// MP-5: メディアプールへ動画/音声/画像を複数取り込む。各ファイルを MediaAsset
+// 化して m_mediaPool.addAsset() で登録し、ドックを再描画する。重複パスは
+// MediaPool 側で既存 id に集約されるので二重登録にはならない。
+void MainWindow::importToMediaPool()
+{
+    const QString filter = QStringLiteral(
+        "メディアファイル (*.mp4 *.mkv *.mov *.webm *.flv *.avi "
+        "*.mp3 *.wav *.aac *.flac *.ogg *.m4a "
+        "*.png *.jpg *.jpeg *.bmp *.gif *.tiff *.webp);;すべてのファイル (*)");
+    const QStringList paths =
+        QFileDialog::getOpenFileNames(this, QStringLiteral("メディアプールへ取り込み"),
+                                      QString(), filter);
+    if (paths.isEmpty())
+        return;
+
+    const QString nowIso = QDateTime::currentDateTimeUtc().toString(Qt::ISODate);
+    int added = 0;
+    for (const QString &path : paths) {
+        if (path.isEmpty())
+            continue;
+        const QFileInfo fi(path);
+        mediapool::MediaAsset asset;
+        asset.filePath      = path;
+        asset.displayName   = fi.fileName();
+        asset.type          = mediaTypeForExtension(fi.suffix());
+        asset.fileSizeBytes = fi.size();
+        asset.importedAtIso = nowIso;
+        const int beforeCount = m_mediaPool.assets().size();
+        m_mediaPool.addAsset(asset);
+        if (m_mediaPool.assets().size() > beforeCount)
+            ++added;
+    }
+
+    if (m_mediaPoolDock)
+        m_mediaPoolDock->refresh();
+    if (added > 0) {
+        statusBar()->showMessage(
+            QStringLiteral("メディアプールに %1 件取り込みました").arg(added));
+    }
+}
+
+// MP-5: メディアプールの素材をダブルクリックしたとき、その実ファイルを
+// タイムラインへ取り込む (File > Open と同じ loadMediaFile 経路)。
+void MainWindow::onMediaPoolAssetActivated(const QString &filePath)
+{
+    if (filePath.isEmpty())
+        return;
+    loadMediaFile(filePath, true, QStringLiteral("メディアプールから取り込み"));
 }
 
 void MainWindow::exportVideo()
@@ -10670,6 +10808,54 @@ void MainWindow::jumpToPrevMarker()
         tr("マーカーへジャンプ: %1 (%2s)")
             .arg(m.label)
             .arg(m.timelineUs / 1.0e6, 0, 'f', 2), 2500);
+}
+
+// MK-2: Timeline の現在のマーカー一覧をパネルへ流し込む。markersChanged の
+// 全発火パス (追加/削除/更新/差し替え/期間変更) からここに集約される。
+void MainWindow::refreshMarkerPanel()
+{
+    if (!m_markerPanelDock || !m_timeline)
+        return;
+    m_markerPanelDock->setMarkers(m_timeline->markers());
+}
+
+// MK-2: パネル行のダブルクリックで再生ヘッドをその時刻へ移動する
+// (jumpToNextMarker と同じ setPlayheadPosition 経路を流用)。
+void MainWindow::onMarkerPanelJump(qint64 timelineUs)
+{
+    if (!m_timeline)
+        return;
+    m_timeline->setPlayheadPosition(timelineUs / 1.0e6);
+    statusBar()->showMessage(
+        tr("マーカーへジャンプ (%1s)")
+            .arg(timelineUs / 1.0e6, 0, 'f', 2), 2500);
+}
+
+// MK-2: パネルのノート列編集を Timeline 側マーカーへ反映する。
+void MainWindow::onMarkerPanelNoteEdited(int markerId, const QString &note)
+{
+    if (!m_timeline)
+        return;
+    Marker m = m_timeline->markerById(markerId);
+    if (m.id != markerId)
+        return;  // 既に削除済み等
+    if (m.note == note)
+        return;  // 変化なし
+    m.note = note;
+    m_timeline->updateMarker(markerId, m);
+    // updateMarker → markersChanged → refreshMarkerPanel が走るので明示再描画は不要。
+}
+
+// MK-2: パネルの削除ボタンで Timeline からマーカーを削除する。
+void MainWindow::onMarkerPanelDeleteRequested(int markerId)
+{
+    if (!m_timeline)
+        return;
+    if (m_timeline->removeMarker(markerId)) {
+        statusBar()->showMessage(
+            tr("マーカーを削除しました (id=%1)").arg(markerId), 2500);
+        // removeMarker → markersChanged → refreshMarkerPanel で自動再描画。
+    }
 }
 
 void MainWindow::openVoiceOverDialog()

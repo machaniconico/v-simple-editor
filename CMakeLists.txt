@@ -142,8 +142,13 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/youtube_chapter_selftest.cpp
     src/selftests/auto_clip_gen_selftest.cpp
     src/selftests/command_search_selftest.cpp
+    src/selftests/media_pool_selftest.cpp
     src/CommandSearch.h
     src/CommandSearch.cpp
+    src/MediaPool.h
+    src/MediaPool.cpp
+    src/MediaPoolDock.cpp
+    src/MarkerPanelDock.cpp
     src/CommandPaletteDialog.h
     src/CommandPaletteDialog.cpp
     src/CredentialStore.cpp

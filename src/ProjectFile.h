@@ -19,6 +19,7 @@
 #include "AudioDucking.h"
 #include "ExportDialog.h"           // HDRSettings struct
 #include "AIProcessingDialog.h"     // AIProcessingSettings struct
+#include "MediaPool.h"              // PRD-PHASE1-MEDIA-POOL: mediapool::MediaPool
 
 // --- Audio mixer serialization sub-types ---
 
@@ -296,6 +297,9 @@ struct ProjectData {
     // PRD-PROJECT-PRESET: tracker preset persistence
     MotionTrackerProjectState motionTrackerState;
     PlanarTrackerProjectState planarTrackerState;
+
+    // PRD-PHASE1-MEDIA-POOL: メディアプール永続化
+    mediapool::MediaPool mediaPool;
 };
 
 class ProjectFile

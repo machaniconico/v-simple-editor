@@ -413,6 +413,11 @@ public:
                   QColor color = QColor(QStringLiteral("#ff5050")));
     bool removeMarker(int id);
     bool updateMarker(int id, const Marker &updated);
+    // MK-1: turn a point marker into a span (duration) marker, or back to a
+    // point (durationUs == 0). Premiere "duration marker" parity. Finds the
+    // marker by id, writes durationUs, repaints the lane and emits
+    // markersChanged(). No-op if no marker with that id exists.
+    void setMarkerDuration(int markerId, qint64 durationUs);
     Marker markerById(int id) const;
     const QVector<Marker> &markers() const { return m_markersData; }
     QVector<Marker> markersInRange(qint64 startUs, qint64 endUs) const;
