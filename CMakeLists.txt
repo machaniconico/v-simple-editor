@@ -182,6 +182,11 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/BroadcastCaption.cpp
     src/BroadcastCaptionDialog.cpp
     src/selftests/broadcast_caption_selftest.cpp
+    # AM (AutoMatte): グリーンバック不要の自動マッティング純粋エンジン + 編集 Dialog。
+    src/AutoMatte.h
+    src/AutoMatte.cpp
+    src/AutoMatteDialog.cpp
+    src/selftests/auto_matte_selftest.cpp
     src/SourceMonitorDock.cpp
     src/MarkerPanelDock.cpp
     src/CommandPaletteDialog.h

@@ -531,6 +531,13 @@ private slots:
     // 「SCC をエクスポート...」から SCC サイドカーをファイル書き出しする。
     void openBroadcastCaption();
 
+    // AM-4: 自動背景除去 / マッティング ダイアログを開く。現在の選択クリップから
+    // 1 フレームを取得 (取れなければ QFileDialog で画像を開く) して
+    // AutoMatteDialog へ渡し、適用されたら生成マット (透過 PNG) / 合成結果を
+    // ファイルへ書き出してステータスバーへ通知する。
+    // TODO: クリップエフェクトとしての毎フレーム適用は次段スコープ。
+    void openAutoMatte();
+
     // User-customizable "お気に入り" menu — opens FavoritesEditDialog, then
     // persists the chosen action ids to QSettings and rebuilds the menu.
     void editFavorites();

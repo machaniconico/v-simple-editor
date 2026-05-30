@@ -165,6 +165,11 @@
   #include "ChromaKeyRefineDialog.h"
   #define HAVE_CHROMA_KEY_REFINE_DIALOG 1
 #endif
+// AM-4: 自動背景除去 / マッティング ダイアログ。
+#if __has_include("AutoMatteDialog.h")
+  #include "AutoMatteDialog.h"
+  #define HAVE_AUTO_MATTE_DIALOG 1
+#endif
 #if __has_include("AudioRestorationDialog.h")
   #include "AudioRestorationDialog.h"
   #define HAVE_AUDIO_RESTORATION_DIALOG 1
@@ -2591,6 +2596,15 @@ void MainWindow::setupMenuBar()
             this, &MainWindow::openChromaKeyDialog);
     m_menuHelpEntries.append({chromaKeyAction,
         QStringLiteral("スピル除去・エッジ調整などでクロマキー合成の抜きを精緻に仕上げます。")});
+
+    // AM-4: グリーンバック不要の自動背景除去 / マッティング。
+    auto *autoMatteAction = toolsMenu->addAction(
+        QStringLiteral("自動背景除去 / マッティング(&A)…"));
+    autoMatteAction->setObjectName("action_auto_matte");
+    connect(autoMatteAction, &QAction::triggered,
+            this, &MainWindow::openAutoMatte);
+    m_menuHelpEntries.append({autoMatteAction,
+        QStringLiteral("グリーンバック無しでも被写体を自動で抜き、透過 PNG や別背景との合成として書き出します。")});
 
     auto *audioRestoreAction = toolsMenu->addAction(
         QStringLiteral("音声リストア(&R)…"));
@@ -9741,6 +9755,107 @@ void MainWindow::openChromaKeyDialog()
 #else
     QMessageBox::information(this, QStringLiteral("クロマキー精緻化"),
         QStringLiteral("ChromaKeyRefineDialog がビルドに含まれていません。"));
+#endif
+}
+
+// AM-4: 自動背景除去 / マッティング。選択クリップの現在フレームを 1 枚取得し
+// (取れなければ QFileDialog で画像を開く)、AutoMatteDialog でマット生成 →
+// 「適用」されたら透過 PNG (マット) / 合成結果をファイルへ書き出す。
+// TODO: クリップエフェクトとして毎フレーム適用する完全統合は次段スコープ。
+void MainWindow::openAutoMatte()
+{
+#ifdef HAVE_AUTO_MATTE_DIALOG
+    QImage frame;
+    QString sourceLabel = QStringLiteral("image");
+
+    // まず選択中のビデオクリップから現在の再生ヘッド位置のフレームを取得する。
+    int trackIdx = -1;
+    int clipIdx = -1;
+    ClipInfo clip;
+    if (selectedVideoClipRef(trackIdx, clipIdx, &clip)) {
+        const double sourceTime = clipSourceTimeAtPlayheadSeconds(trackIdx, clipIdx, clip);
+        frame = decodeClipFrameAtSourceTime(clip, sourceTime);
+        if (!frame.isNull()) {
+            sourceLabel = clip.displayName.isEmpty()
+                ? QFileInfo(clip.filePath).completeBaseName()
+                : clip.displayName;
+        }
+    }
+
+    // クリップから取れなければ画像ファイルを開かせるフォールバック。
+    if (frame.isNull()) {
+        const QString openPath = QFileDialog::getOpenFileName(this,
+            QStringLiteral("マッティング元画像を開く"), QString(),
+            QStringLiteral("画像ファイル (*.png *.jpg *.jpeg *.bmp *.gif *.tiff *.tif *.webp);;すべてのファイル (*)"));
+        if (openPath.isEmpty())
+            return;
+        frame.load(openPath);
+        if (frame.isNull()) {
+            QMessageBox::warning(this, QStringLiteral("自動背景除去 / マッティング"),
+                QStringLiteral("画像の読み込みに失敗しました。"));
+            return;
+        }
+        sourceLabel = QFileInfo(openPath).completeBaseName();
+    }
+
+    AutoMatteDialog dlg(this);
+    dlg.setWindowTitle(QStringLiteral("自動背景除去 / マッティング - %1").arg(sourceLabel));
+    dlg.setSourceImage(frame);
+
+    // 「適用」されたかどうかを captures。applied() は OK 押下時に emit される。
+    bool applied = false;
+    connect(&dlg, &AutoMatteDialog::applied, this, [&applied]() { applied = true; });
+    dlg.exec();
+    if (!applied)
+        return;
+
+    // 生成マット (透過用) と合成結果を取得。どちらか書き出せれば成立とする。
+    const QImage matte  = dlg.matteImage();
+    const QImage result = dlg.resultImage();
+    if (matte.isNull() && result.isNull()) {
+        QMessageBox::warning(this, QStringLiteral("自動背景除去 / マッティング"),
+            QStringLiteral("マットの生成に失敗しました。"));
+        return;
+    }
+
+    const QString defaultName = sourceLabel.isEmpty()
+        ? QStringLiteral("matte") : sourceLabel;
+    const QString outPath = QFileDialog::getSaveFileName(this,
+        QStringLiteral("マッティング結果を保存"),
+        defaultName + QStringLiteral("_matte.png"),
+        QStringLiteral("PNG 画像 (*.png);;すべてのファイル (*)"));
+    if (outPath.isEmpty())
+        return;
+
+    // 拡張子を .png に正規化 (透過を保つため)。
+    QString matteOut = outPath;
+    if (!matteOut.endsWith(QStringLiteral(".png"), Qt::CaseInsensitive))
+        matteOut += QStringLiteral(".png");
+
+    QStringList saved;
+    if (!matte.isNull() && matte.save(matteOut, "PNG"))
+        saved << QFileInfo(matteOut).fileName();
+
+    // 合成 (or 透過) 結果も併せて書き出す (<名>_composited.png)。
+    if (!result.isNull()) {
+        const QFileInfo mi(matteOut);
+        const QString compOut = mi.absolutePath() + QChar('/')
+            + mi.completeBaseName().replace(QStringLiteral("_matte"), QString())
+            + QStringLiteral("_composited.png");
+        if (result.save(compOut, "PNG"))
+            saved << QFileInfo(compOut).fileName();
+    }
+
+    if (saved.isEmpty()) {
+        QMessageBox::warning(this, QStringLiteral("自動背景除去 / マッティング"),
+            QStringLiteral("ファイルの書き出しに失敗しました。"));
+        return;
+    }
+    statusBar()->showMessage(
+        QStringLiteral("マッティング結果を保存しました: %1").arg(saved.join(QStringLiteral(", "))));
+#else
+    QMessageBox::information(this, QStringLiteral("自動背景除去 / マッティング"),
+        QStringLiteral("AutoMatteDialog がビルドに含まれていません。"));
 #endif
 }
 

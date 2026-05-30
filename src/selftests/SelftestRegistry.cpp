@@ -27,6 +27,7 @@ int runAudioBusSelftest();
 int runAudioMixerSelftest();
 int runAudioRestoreSelftest();
 int runAutoClipGenSelftest();
+int runAutoMatteSelftest();
 int runBatchExportSelftest();
 int runBlenderSelftest();
 int runBroadcastCaptionSelftest();
@@ -169,6 +170,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "DolbyVision: PQ ST.2084 math + metadata + DV XML generation" },
     { "broadcast-cc",      "VEDITOR_BROADCAST_CC_SELFTEST",       runBroadcastCaptionSelftest,   false,
       "BroadcastCaption: CEA-608 byte-pair/parity + SCC export + CEA-708 packet" },
+    { "auto-matte",        "VEDITOR_AUTO_MATTE_SELFTEST",         runAutoMatteSelftest,          false,
+      "AutoMatte: difference matte, morphology, feather, composite" },
     // QApplication-required (needsQApplication=true) ----------------------
     { "parity",            "VEDITOR_PARITY_SELFTEST",             runParitySelftest,             true,
       "Preview vs export pixel-parity (S1-S11, framediff::mse, 10-bit HDR10)" },
