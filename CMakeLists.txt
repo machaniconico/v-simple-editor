@@ -225,6 +225,10 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/playback/GpuCompositeMath.h
     src/playback/GpuCompositeMath.cpp
     src/selftests/gpu_composite_math_selftests.cpp
+    # GPU layer compositor (Stage 2 offscreen-FBO compositor + GPU/CPU parity selftest)。
+    src/playback/GpuLayerCompositor.h
+    src/playback/GpuLayerCompositor.cpp
+    src/selftests/gpu_composite_parity_selftests.cpp
     src/SourceMonitorDock.cpp
     src/MarkerPanelDock.cpp
     src/CommandPaletteDialog.h

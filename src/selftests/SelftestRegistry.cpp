@@ -109,6 +109,7 @@ int runAutoProxyPolicySelftest();
 int runCompositeFrameCacheSelftest();
 int runPlaybackQualityPolicySelftest();
 int runGpuCompositeMathSelftest();
+int runGpuCompositeParitySelftest();
 
 namespace selftests {
 
@@ -206,6 +207,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Real-media end-to-end smoke (ColorMatch decode + deHum + processAll)" },
     { "trackmatte-parity", "VEDITOR_TRACKMATTE_PARITY_SELFTEST",  runTrackMatteParitySelftest,   true,
       "Track matte SSOT pixel-match across 4 matte types (luma/alpha/chroma/inv)" },
+    { "gpu-composite-parity", "VEDITOR_GPU_COMPOSITE_PARITY_SELFTEST", runGpuCompositeParitySelftest, true,
+      "GPU (GpuLayerCompositor FBO) vs CPU SSOT parity, matte-free scenes (SSIM>=0.98, MAE<=3..6/255, 7 gates, graceful GL skip)" },
     { "vfx",               "VEDITOR_VFX_SELFTEST",                runVfxSelftest,                true,
       "VFX module smoke: Sprint-6 effect graph + GLSL primitive pipeline" },
     { "pro",               "VEDITOR_PRO_SELFTEST",                runProSelftest,                true,
