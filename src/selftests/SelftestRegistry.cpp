@@ -108,6 +108,7 @@ int runYoutubeChapterSelftest();
 int runAutoProxyPolicySelftest();
 int runCompositeFrameCacheSelftest();
 int runPlaybackQualityPolicySelftest();
+int runGpuCompositeMathSelftest();
 
 namespace selftests {
 
@@ -194,6 +195,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "CompositeFrameCache: LRU eviction + key hashing + hit/miss accounting" },
     { "playback-quality-policy", "VEDITOR_PLAYBACK_QUALITY_POLICY_SELFTEST", runPlaybackQualityPolicySelftest, false,
       "PlaybackQualityPolicy: adaptive quality level selection + drop-frame heuristics" },
+    { "gpu-composite-math", "VEDITOR_GPU_COMPOSITE_MATH_SELFTEST", runGpuCompositeMathSelftest, false,
+      "GpuCompositeMath: paint order, layer transform matrix, premul source-over, matte validity (15 gates)" },
     { "auto-proxy-policy",  "VEDITOR_AUTO_PROXY_POLICY_SELFTEST",  runAutoProxyPolicySelftest,     false,
       "AutoProxyPolicy: heavy-clip detection (width/codec) + useProxyFor/generateFor split + dedup (12 gates)" },
     // QApplication-required (needsQApplication=true) ----------------------

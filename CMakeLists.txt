@@ -221,6 +221,10 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/playback/AutoProxyPolicy.h
     src/playback/AutoProxyPolicy.cpp
     src/selftests/auto_proxy_policy_selftests.cpp
+    # GPU compositor math (Stage 1 dormant pure engine + headless selftest)。
+    src/playback/GpuCompositeMath.h
+    src/playback/GpuCompositeMath.cpp
+    src/selftests/gpu_composite_math_selftests.cpp
     src/SourceMonitorDock.cpp
     src/MarkerPanelDock.cpp
     src/CommandPaletteDialog.h
