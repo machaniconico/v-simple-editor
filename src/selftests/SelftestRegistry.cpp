@@ -20,6 +20,7 @@
 int runAIHighlightSelftest();
 int runAcesColorSelftest();
 int runAffinitySelftest();
+int runAscCdlExportSelftest();
 int runOAuthMockE2eSelftest();
 int runOAuthRefreshE2eSelftest();
 int runAnimExportSelftest();
@@ -187,6 +188,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "TextBasedEdit: transcript search + deletion range merge + kept complement" },
     { "pptx-export",      "VEDITOR_PPTX_EXPORT_SELFTEST",        runPptxExportSelftest,         false,
       "PptxExport: OOXML part tree + store-ZIP/CRC32 + slide XML well-formed + escaping" },
+    { "asc-cdl-export",   "VEDITOR_ASC_CDL_EXPORT_SELFTEST",     runAscCdlExportSelftest,       false,
+      "AscCdlExport: ASC CDL v1.01 .cc/.ccc/.cdl XML + LGG->SOP mapping + 6-decimal format + guards (13 gates)" },
     { "composite-frame-cache", "VEDITOR_COMPOSITE_FRAME_CACHE_SELFTEST", runCompositeFrameCacheSelftest, false,
       "CompositeFrameCache: LRU eviction + key hashing + hit/miss accounting" },
     { "playback-quality-policy", "VEDITOR_PLAYBACK_QUALITY_POLICY_SELFTEST", runPlaybackQualityPolicySelftest, false,

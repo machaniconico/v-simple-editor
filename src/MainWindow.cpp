@@ -56,6 +56,7 @@ void exporter_setAcesPipeline(const aces::AcesPipeline &pipeline);
 #include "TranscriptHighlightDialog.h"
 #include "TextBasedEditDialog.h"
 #include "PptxExportDialog.h"   // PPTX: PowerPoint 資料書き出しダイアログ
+#include "AscCdlExportDialog.h" // ASC CDL: カラー (.cc/.ccc/.cdl) 書き出しダイアログ
 #include "TranscriptHighlighter.h"
 #include "AutoClipDialog.h"
 #include "AutoClipGenerator.h"
@@ -2597,6 +2598,15 @@ void MainWindow::setupMenuBar()
             this, &MainWindow::openPptxExport);
     m_menuHelpEntries.append({pptxExportAction,
         QStringLiteral("文字起こし / マーカー / タイトルから PowerPoint スライド資料 (.pptx) を書き出します。")});
+
+    // ASC CDL: 現在のカラーグレーディングを ASC CDL (.cc/.ccc/.cdl) として書き出す。
+    auto *ascCdlExportAction = toolsMenu->addAction(
+        QStringLiteral("ASC CDL 書き出し(&C)… (.cc/.ccc/.cdl)"));
+    ascCdlExportAction->setObjectName("action_asc_cdl_export");
+    connect(ascCdlExportAction, &QAction::triggered,
+            this, &MainWindow::exportAscCdl);
+    m_menuHelpEntries.append({ascCdlExportAction,
+        QStringLiteral("現在のカラーグレーディング (Lift/Gamma/Gain + 彩度) を ASC CDL の SOP として書き出します。")});
 
     auto *smartEditAction = toolsMenu->addAction(
         QStringLiteral("Smart Edit アシスタント(&M)…"));
@@ -9256,6 +9266,48 @@ void MainWindow::openPptxExport()
                            "文字起こしスライドが必要なら、先に「ツール → 動画を文字起こし...」を実行してください。"));
     }
 
+    dialog.exec();
+}
+
+// ASC CDL: 現在のカラーグレーディングを ASC CDL (.cc/.ccc/.cdl) として書き出す配線。
+// ColorGradingPanel の currentWheels()/colorCorrection() を asccdl::fromLgg() で
+// CdlCorrection (SOP+Sat) に変換し、AscCdlExportDialog に渡してモーダル exec()。
+// パネルが未生成 / 非表示でも恒等値 (lift0/gamma1/gain0/sat1) で安全に書き出せる。
+void MainWindow::exportAscCdl()
+{
+    // 既定は恒等 (パネル未生成時のフォールバック)。
+    double lift[3]  = {0.0, 0.0, 0.0};
+    double gamma[3] = {1.0, 1.0, 1.0};
+    double gain[3]  = {0.0, 0.0, 0.0};
+    double liftLuma = 0.0, gammaLuma = 1.0, gainLuma = 0.0;
+    double saturation = 1.0;
+
+    if (m_colorGradingPanel) {
+        const ColorWheels cw = m_colorGradingPanel->currentWheels();
+        lift[0]  = cw.lift.x();  lift[1]  = cw.lift.y();  lift[2]  = cw.lift.z();
+        gamma[0] = cw.gamma.x(); gamma[1] = cw.gamma.y(); gamma[2] = cw.gamma.z();
+        gain[0]  = cw.gain.x();  gain[1]  = cw.gain.y();  gain[2]  = cw.gain.z();
+        liftLuma  = cw.liftLuma;
+        gammaLuma = cw.gammaLuma;
+        gainLuma  = cw.gainLuma;
+
+        // ColorCorrection.saturation はアプリ内では -100..+100 (0 = 恒等)。
+        // ASC CDL の Saturation は乗数 (1.0 = 恒等) なので、
+        //   -100 → 0.0 (彩度ゼロ) / 0 → 1.0 (恒等) / +100 → 2.0 (倍)
+        // の線形マッピングで変換する。
+        const ColorCorrection cc = m_colorGradingPanel->colorCorrection();
+        saturation = 1.0 + cc.saturation / 100.0;
+    }
+
+    const asccdl::CdlCorrection correction =
+        asccdl::fromLgg(lift, liftLuma,
+                        gamma, gammaLuma,
+                        gain, gainLuma,
+                        saturation,
+                        QStringLiteral("cc0001"));
+
+    AscCdlExportDialog dialog(this);
+    dialog.setCorrection(correction);
     dialog.exec();
 }
 
