@@ -7,6 +7,22 @@
 #include "AudioMixer.h"
 #include "OverlayDialogs.h"
 
+// STAGE4B: PlaybackEntry::matteTypeOrdinal stores TrackMatteType as a plain int
+// (PlaybackTypes.h must stay MaskSystem.h-free). This is the SSOT populate site
+// and already sees TrackMatteType (via Timeline.h -> MaskSystem.h), so we pin
+// the ordinal correspondence here. If TrackMatteType is ever reordered, these
+// fire at compile time before any silent matte mis-application can occur.
+static_assert(static_cast<int>(TrackMatteType::None) == 0,
+              "PlaybackEntry::matteTypeOrdinal 0 must mean TrackMatteType::None");
+static_assert(static_cast<int>(TrackMatteType::AlphaMatte) == 1,
+              "PlaybackEntry::matteTypeOrdinal 1 must mean TrackMatteType::AlphaMatte");
+static_assert(static_cast<int>(TrackMatteType::AlphaInvertedMatte) == 2,
+              "PlaybackEntry::matteTypeOrdinal 2 must mean TrackMatteType::AlphaInvertedMatte");
+static_assert(static_cast<int>(TrackMatteType::LumaMatte) == 3,
+              "PlaybackEntry::matteTypeOrdinal 3 must mean TrackMatteType::LumaMatte");
+static_assert(static_cast<int>(TrackMatteType::LumaInvertedMatte) == 4,
+              "PlaybackEntry::matteTypeOrdinal 4 must mean TrackMatteType::LumaInvertedMatte");
+
 namespace {
 // Transition badge geometry. The badge width grows with duration so the
 // user gets live visual feedback while dragging the resize handle (a 6 px
@@ -5361,6 +5377,23 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         e.trailOutDuration = iv.trailOutDuration;
         e.trailOutEasing = iv.trailOutEasing;
         e.stabilizerKeyframes = iv.stabilizerKeyframes;
+        // STAGE4B: carry this entry's track-matte assignment (if any) so the
+        // live GPU compositor can apply it identically to the export path
+        // (TimelineFrameRenderer.cpp:792-814). This is pure data plumbing —
+        // no behavior changes until part 2 wires the GPU gate. The matte hash
+        // is keyed by trackMatteClipKey(trackIdx,clipIdx), the same key space
+        // export uses (renderClipId). Read m_trackMatteEntries directly: this
+        // is a const member access (computePlaybackSequence is const) and the
+        // hash is COW so no aliasing risk. Default-OFF (no matte entry) leaves
+        // matteTypeOrdinal=0 / matteSourceClipId empty == today's behavior.
+        {
+            const QString matteKey = trackMatteClipKey(e.sourceTrack, e.sourceClipIndex);
+            const auto mit = m_trackMatteEntries.constFind(matteKey);
+            if (mit != m_trackMatteEntries.cend()) {
+                e.matteTypeOrdinal = static_cast<int>(mit.value().matteType);
+                e.matteSourceClipId = mit.value().matteSourceClipId;
+            }
+        }
         qInfo() << "[SEQ] entry idx=" << result.size()
                 << "tl=[" << iv.timelineStart << "," << iv.timelineEnd << "]"
                 << "clip=[" << iv.clipIn << "," << iv.clipOut << "]"

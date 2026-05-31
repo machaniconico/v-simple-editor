@@ -17,6 +17,7 @@
 #include <functional>
 #include "VideoEffect.h"
 #include "PlaybackTypes.h"
+#include "MaskSystem.h"  // STAGE4B: TrackMatteType for DecodedLayer matte fields
 #include "TextManager.h"
 #include "DecoderSlotManager.h"
 #include "AcesColor.h"  // AR-2: ACES シーンリファード色管理パイプライン (SSOT は MainWindow)
@@ -427,6 +428,17 @@ public:
         int sourceTrack = 0;
         int sequenceIdx = -1;
         bool isFresh = true;
+        // STAGE4B (live GPU track-matte): consumed by tryGpuComposeLayers when
+        // VEDITOR_GPU_COMPOSITE is ON and GL is available (else matte-free).
+        // matteType + matteSourceClipId are copied from the PlaybackEntry; the
+        // matteSourceClipId is the trackMatteClipKey ("trackIdx:clipIdx") of the
+        // matte SOURCE clip. matteSourceIndex is the RESOLVED index into the
+        // final composite() inputs vector, computed by
+        // clipstack::resolveLiveMatteSources (-1 == composite normally / no
+        // matte). Default values == today's matte-free live preview.
+        TrackMatteType matteType = TrackMatteType::None;
+        QString matteSourceClipId;
+        int matteSourceIndex = -1;
     };
 
 private:

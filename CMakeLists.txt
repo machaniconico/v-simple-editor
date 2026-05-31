@@ -233,6 +233,10 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/playback/GpuLayerCompositor.h
     src/playback/GpuLayerCompositor.cpp
     src/selftests/gpu_composite_parity_selftests.cpp
+    # Live track-matte index resolver (STAGE4B data plumbing + headless selftest)。
+    src/playback/LiveMatteResolve.h
+    src/playback/LiveMatteResolve.cpp
+    src/selftests/live_matte_resolve_selftests.cpp
     src/SourceMonitorDock.cpp
     src/MarkerPanelDock.cpp
     src/CommandPaletteDialog.h

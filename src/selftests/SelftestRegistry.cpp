@@ -57,6 +57,7 @@ int runImportSelftest();
 int runInstagramSelftest();
 int runLibavcoreDecodeSelftest();
 int runLibavcoreEncodeSelftest();
+int runLiveMatteResolveSelftest();
 int runLoudnessSelftest();
 int runLowerThirdSelftest();
 int runMediaPoolSelftest();
@@ -199,6 +200,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "PlaybackQualityPolicy: adaptive quality level selection + drop-frame heuristics" },
     { "gpu-composite-math", "VEDITOR_GPU_COMPOSITE_MATH_SELFTEST", runGpuCompositeMathSelftest, false,
       "GpuCompositeMath: paint order, layer transform matrix, premul source-over, matte validity (15 gates)" },
+    { "live-matte-resolve", "VEDITOR_LIVE_MATTE_RESOLVE_SELFTEST", runLiveMatteResolveSelftest, false,
+      "LiveMatteResolve: clipId->index matte source resolution (STAGE4B) — valid + self/base/unknown rejection + no-matte/multi-matte (6 gates)" },
     { "auto-proxy-policy",  "VEDITOR_AUTO_PROXY_POLICY_SELFTEST",  runAutoProxyPolicySelftest,     false,
       "AutoProxyPolicy: heavy-clip detection (width/codec) + useProxyFor/generateFor split + dedup (12 gates)" },
     { "exposure-aids",      "VEDITOR_EXPOSURE_AIDS_SELFTEST",      runExposureAidsSelftest,        false,

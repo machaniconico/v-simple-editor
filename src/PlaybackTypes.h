@@ -46,6 +46,20 @@ struct PlaybackEntry {
     double opacity = 1.0;        // PiP alpha, propagated from ClipInfo::opacity
     double volume = 1.0;         // Per-clip audio gain (0.0-2.0), propagated from ClipInfo::volume
     int sourceClipIndex = -1;    // Index into TimelineTrack::m_clips
+
+    // STAGE4B (live GPU track-matte): carries the matte assignment from the
+    // timeline to VideoPlayer so the live preview can apply it on the GPU the
+    // same way the export path does. matteTypeOrdinal MIRRORS the
+    // TrackMatteType enum ordinals (src/MaskSystem.h): 0=None, 1=AlphaMatte,
+    // 2=AlphaInvertedMatte, 3=LumaMatte, 4=LumaInvertedMatte. Stored as a plain
+    // int (NOT the enum) because PlaybackTypes.h is deliberately lean — it must
+    // not pull in MaskSystem.h's QImage/QJsonObject UI weight (see the struct
+    // comment above). The ordinal correspondence is enforced by a static_assert
+    // in Timeline.cpp (the populating site, which already includes MaskSystem.h).
+    // 0 (None) == no matte. matteSourceClipId is the trackMatteClipKey
+    // ("trackIdx:clipIdx") of the matte SOURCE clip; empty == none.
+    int matteTypeOrdinal = 0;
+    QString matteSourceClipId;
     // Edge-attached transitions (FadeIn/FadeOut/CrossDissolve/...). Copied
     // from ClipInfo::leadIn / trailOut so VideoPlayer can window the alpha
     // (and AudioMixer the gain) over the duration without reading Timeline.

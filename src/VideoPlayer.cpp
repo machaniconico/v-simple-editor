@@ -4,6 +4,8 @@
 #include "ProxyManager.h"
 #include "TextOverlayBake.h"   // textbake::bakeOverlays (shared text baker SSOT)
 #include "ClipGeometry.h"      // clipgeom::renderLayer (shared clip-placement SSOT)
+#include "TrackMatteKey.h"     // STAGE4B: trackMatteClipKey (canonical matte clip key)
+#include "playback/LiveMatteResolve.h" // STAGE4B: clipstack::resolveLiveMatteSources
 #include <algorithm>           // std::stable_sort
 
 // Free comparator for the production layer sort. Extracted from the inline
@@ -3773,6 +3775,15 @@ void VideoPlayer::handlePlaybackTick()
                     layer.rotation2DDegrees = e.rotation2DDegrees;
                     layer.sourceTrack = e.sourceTrack;
                     layer.sequenceIdx = idx;
+                    // STAGE4B: carry the live track-matte assignment from the
+                    // PlaybackEntry. matteTypeOrdinal MIRRORS TrackMatteType
+                    // ordinals (0=None..4=LumaInverted); matteSourceClipId is the
+                    // trackMatteClipKey of the matte SOURCE clip. Consumed ONLY by
+                    // tryGpuComposeLayers when VEDITOR_GPU_COMPOSITE is ON and the
+                    // GPU path is taken; matteSourceIndex stays -1 here (resolved
+                    // there against the final inputs vector).
+                    layer.matteType = static_cast<TrackMatteType>(e.matteTypeOrdinal);
+                    layer.matteSourceClipId = e.matteSourceClipId;
                     layers.append(layer);
                     if (e.sourceTrack > 0)
                         overlayPresent = true;
@@ -3854,6 +3865,10 @@ void VideoPlayer::handlePlaybackTick()
                 layer.rotation2DDegrees = e.rotation2DDegrees;
                 layer.sourceTrack = e.sourceTrack;
                 layer.sequenceIdx = idx;
+                // STAGE4B: mirror the threaded active-layer path and
+                // finalizeOverlayFromDecoder so serial ticks carry matte data too.
+                layer.matteType = static_cast<TrackMatteType>(e.matteTypeOrdinal);
+                layer.matteSourceClipId = e.matteSourceClipId;
                 layers.append(layer);
                 if (e.sourceTrack > 0)
                     overlayPresent = true;
@@ -4860,20 +4875,64 @@ QImage VideoPlayer::tryGpuComposeLayers(const QVector<DecodedLayer> &layers,
     // 多トラックのみ対象 (overlay が無いと CPU 経路と同じ単層描画で意味が無い)。
     if (layers.size() < 2 || canvas.isEmpty())
         return QImage();
-    // マット無しシーンのみ GPU 化 (Stage3)。このプレビュー tick の DecodedLayer は
-    // マット情報フィールドを持たず常に matte-free だが、将来 DecodedLayer に matte が
-    // 付いた場合に備えて GpuLayerInput.desc.matteType は既定 None のままにする。
+
+    // STAGE4B: ライブ・トラックマット (フラグ ON 時のみ到達)。
+    //   - マット無しシーン: 従来 Stage3 の高速経路をビット同一で維持 (matteType
+    //     を None に固定し、null/透明レイヤーは事前スキップ)。共通ホットパス。
+    //   - マット有りシーン: GpuLayerInput を sorted layers と 1:1 に構築する
+    //     (事前スキップ禁止)。composite() は内部で gpucomposite::isLayerComposited
+    //     により描画対象外を弾くが、マット SOURCE レイヤーは画像 (alpha/luma) が
+    //     消費されるため inputs に必ず残す必要があり、かつ matteSourceIndex は
+    //     composite() が走査する vector のインデックスでなければならない
+    //     (INDEX-SPACE 安全性)。よって 1:1 構築でインデックスを末端まで保つ。
+    //   GL 不可時 (isAvailable()==false) は null を返し CPU フォールバック
+    //   (matte-free) が走る。すなわちライブ・マットプレビューには GL が必須であり、
+    //   GL 不在環境ではフラグ ON でもマットは適用されない (= フラグ OFF と同等)。
+    //   これは実験的 opt-in フラグの許容される劣化であり、本タスクでは CPU 側の
+    //   ライブ・マット合成は追加しない。
+    const bool hasMatte = std::any_of(
+        layers.cbegin(), layers.cend(),
+        [](const DecodedLayer &L) { return L.matteType != TrackMatteType::None; });
+
     if (!m_gpuCompositor)
         m_gpuCompositor = std::make_unique<GpuLayerCompositor>();
     if (!m_gpuCompositor->isAvailable())
         return QImage();  // GL 不可 → CPU フォールバック
 
+    // GpuLayerInput を構築する順序 (order) を決める。
+    //   - マット無し: 受領順 (paintOrder 降順) のまま (Stage3 とビット同一)。
+    //   - マット有り: V1-FIRST (sourceTrack 昇順) に並べ替える【C1 修正】。
+    // 理由: matteSourceIndex の検証規則 (index 0 == V1 base、srcIdx>0 && srcIdx!=i
+    // のみ採用) は export 経路 (TimelineFrameRenderer の renderLayers = V1 先頭・
+    // track 昇順) と同一の index 空間を前提とする。受領した layers は paintOrder 用に
+    // sourceTrack 降順 (V1 が末尾) へソート済みのため、そのまま 1:1 で詰めると index 0
+    // が最上位トラックになり、正当なマット源 (通常は被マット層より上のトラック) が
+    // srcIdx==0 で誤って弾かれてマットが黙って無効化される。composite() は内部で
+    // gpucomposite::paintOrder により描画順を再導出するので inputs の並びは出力順に
+    // 影響せず index 空間のみを決める。よってマット時のみ V1 先頭昇順へ整列し、export
+    // と index 規約を一致させる (preview≡export を担保)。
+    QVector<int> order;
+    order.reserve(layers.size());
+    for (int i = 0; i < layers.size(); ++i)
+        order.append(i);
+    if (hasMatte) {
+        std::stable_sort(order.begin(), order.end(),
+                         [&](int a, int b) {
+                             // V1 (sourceTrack 0) を先頭へ。安定ソートで同一トラックの
+                             // 相対順は保持 (実際は tick あたり 1 トラック 1 クリップ)。
+                             return layers.at(a).sourceTrack < layers.at(b).sourceTrack;
+                         });
+    }
+
     // CPU の composeMultiTrackFrameInto が渡すのと同じ layers を GpuLayerInput に
     // 詰める。フィールドは DecodedLayer → gpucomposite::LayerDesc に 1:1 写像。
     QVector<GpuLayerInput> inputs;
     inputs.reserve(layers.size());
-    for (const DecodedLayer &L : layers) {
-        if (L.rgb.isNull() || L.opacity <= 0.001)
+    for (int oi = 0; oi < order.size(); ++oi) {
+        const DecodedLayer &L = layers.at(order.at(oi));
+        // マット無し経路のみ事前スキップ (Stage3 とビット同一)。マット有り経路は
+        // インデックス整合のため 1:1 構築し、スキップ判定は composite() 内部に委ねる。
+        if (!hasMatte && (L.rgb.isNull() || L.opacity <= 0.001))
             continue;  // CPU 経路と同じスキップ条件
         GpuLayerInput in;
         in.image = L.rgb;
@@ -4885,12 +4944,44 @@ QImage VideoPlayer::tryGpuComposeLayers(const QVector<DecodedLayer> &layers,
         in.desc.videoDy            = L.videoDy;
         in.desc.rotation2DDegrees  = L.rotation2DDegrees;
         in.desc.visible            = true;
-        in.desc.matteSourceIndex   = -1;  // matte-free
-        in.desc.matteType          = gpucomposite::MatteType::None;
+        in.desc.matteSourceIndex   = -1;  // 既定 matte-free; マット有り経路で後段解決
+        // TrackMatteType ordinal == gpucomposite::MatteType ordinal
+        // (0=None,1=Alpha,2=AlphaInverted,3=Luma/Luminance,4=LumaInverted)。
+        // マット無し経路では常に None (ビット同一性のため明示固定)。
+        in.desc.matteType = hasMatte
+            ? static_cast<gpucomposite::MatteType>(static_cast<int>(L.matteType))
+            : gpucomposite::MatteType::None;
         inputs.append(in);
     }
     if (inputs.size() < 2)
         return QImage();  // スキップ後に多トラック条件を満たさない → CPU 経路
+
+    // STAGE4B: マット有り経路のみ、各レイヤーの matteSourceClipId を inputs ベクトル
+    // 内のインデックスへ解決する。マット時は事前スキップ無しで inputs は order と 1:1
+    // (V1 先頭昇順) なので、i 番目の input は layers.at(order.at(i)) に対応する。
+    // clipId は trackMatteClipKey(sourceTrack, sourceClipIndex)。sourceClipIndex は
+    // m_sequence[sequenceIdx] から取得 (範囲ガード)。解決規則は export 経路
+    // (TimelineFrameRenderer) と同一: srcIdx>0 && srcIdx!=i のみ採用。
+    if (hasMatte) {
+        clipstack::resolveLiveMatteSources(
+            inputs.size(),
+            [&](int i) -> QString {  // clipIdOf
+                const DecodedLayer &L = layers.at(order.at(i));
+                const int sq = L.sequenceIdx;
+                if (sq < 0 || sq >= m_sequence.size())
+                    return QString();  // 範囲外 → 解決不能 (map に載らず srcIdx=-1)
+                return trackMatteClipKey(L.sourceTrack, m_sequence.at(sq).sourceClipIndex);
+            },
+            [&](int i) -> QString {  // matteSrcClipIdOf
+                return layers.at(order.at(i)).matteSourceClipId;
+            },
+            [&](int i) -> bool {     // hasMatteOf
+                return layers.at(order.at(i)).matteType != TrackMatteType::None;
+            },
+            [&](int idx, int srcIdx) {  // setMatteSrcIndex
+                inputs[idx].desc.matteSourceIndex = srcIdx;
+            });
+    }
 
     // GpuLayerCompositor::composite は内部で gpucomposite::paintOrder により
     // sourceTrack 降順 (V1-wins) に並べ替えるので、CPU 側の stable_sort と
@@ -5133,6 +5224,11 @@ bool VideoPlayer::finalizeOverlayFromDecoder(const PlaybackEntry &e, int seqIdx,
     out->rotation2DDegrees  = e.rotation2DDegrees;
     out->sourceTrack        = e.sourceTrack;
     out->sequenceIdx        = seqIdx;
+    // STAGE4B: carry the live track-matte assignment (see V1 build site). Ordinal
+    // mirrors TrackMatteType; matteSourceIndex resolved later in
+    // tryGpuComposeLayers against the final inputs vector.
+    out->matteType          = static_cast<TrackMatteType>(e.matteTypeOrdinal);
+    out->matteSourceClipId  = e.matteSourceClipId;
     return true;
 }
 
