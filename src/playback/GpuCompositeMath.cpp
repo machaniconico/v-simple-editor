@@ -75,4 +75,58 @@ bool isValidMatteSource(int idx, int count) {
     return idx > 0 && idx < count;
 }
 
+bool isValidMatteSource(int matteIdx, int layerIdx, int count) {
+    return matteIdx > 0 && matteIdx < count && matteIdx != layerIdx;
+}
+
+int matteMaskValue(MatteType type,
+                   int straightR, int straightG, int straightB,
+                   int premulAlpha)
+{
+    // CPU-algebra reference oracle only. The GPU matte combine shader does not
+    // call this helper; its luma path uses continuous normalized floats and is
+    // verified by gpu-composite-parity's luma gates.
+    int mask = 255;
+    switch (type) {
+    case MatteType::Alpha:
+        mask = premulAlpha;
+        break;
+    case MatteType::AlphaInverted:
+        mask = 255 - premulAlpha;
+        break;
+    case MatteType::Luminance:
+        // Rec.601 luma using STRAIGHT (un-premultiplied) RGB; truncating
+        // (NOT rounding) to match MaskSystem::trackMatteLumaRec601 +
+        // applyTrackMatte, which use static_cast<int>(...).
+        mask = static_cast<int>(0.299 * straightR
+                               + 0.587 * straightG
+                               + 0.114 * straightB);
+        break;
+    case MatteType::LuminanceInverted:
+        mask = 255 - static_cast<int>(0.299 * straightR
+                                     + 0.587 * straightG
+                                     + 0.114 * straightB);
+        break;
+    case MatteType::None:
+    default:
+        mask = 255;
+        break;
+    }
+    // Clamp to [0,255] — defensive against any premulAlpha/luma edge.
+    if (mask < 0)   mask = 0;
+    if (mask > 255) mask = 255;
+    return mask;
+}
+
+void applyMaskPremul(int& r, int& g, int& b, int& a, int maskVal)
+{
+    // CPU-algebra reference oracle only. Matches MaskSystem::applyMask:
+    // component = component * maskVal / 255 using integer division
+    // (truncating), not rounding. Inputs premultiplied.
+    r = r * maskVal / 255;
+    g = g * maskVal / 255;
+    b = b * maskVal / 255;
+    a = a * maskVal / 255;
+}
+
 } // namespace gpucomposite

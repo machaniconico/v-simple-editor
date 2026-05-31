@@ -19,10 +19,13 @@
 //   layers already in production paint order (V2 back, V1 front) is compared
 //   against GPU layers carrying the real sourceTrack values.
 //
-// Matte support: GpuLayerCompositor draws matte-requesting layers as plain layers
-// this stage (full GPU matte is the next stage), so matte parity is intentionally
-// NOT gated here. Matte-free scenes are the Stage 2 guarantee and are exercised by
-// G1..G8 below.
+// Matte support: GpuLayerCompositor now composites track mattes ON THE GPU
+// (Stage 4A two-pass path). Matte parity IS gated here by G9..G16, comparing the
+// GPU result against trackmatte::composite (the CPU SSOT). Matte source size ==
+// src size == canvas except G16's transformed matte'd layer; the only slack is
+// float-vs-integer-truncation and small rasterization differences, covered by
+// per-gate tolerances.
+// G1..G8 keep exercising matte-FREE scenes.
 //
 // Graceful skip: if no usable GL context exists (headless box / WSL without GL),
 // GpuLayerCompositor::isAvailable() returns false (or composite() returns a null
@@ -33,6 +36,10 @@
 #include "../playback/GpuLayerCompositor.h"
 #include "../playback/GpuCompositeMath.h"
 #include "../VideoPlayer.h"
+#include "../TrackMatteBake.h"
+#include "../LayerCompositor.h"
+#include "../MaskSystem.h"
+#include "../ClipGeometry.h"
 
 #include <QApplication>
 #include <QGuiApplication>
@@ -178,6 +185,86 @@ GpuLayerInput makeLayer(const QImage& img, int sourceTrack, double opacity,
     in.desc.matteSourceIndex = -1;
     in.desc.matteType = gpucomposite::MatteType::None;
     return in;
+}
+
+// An RGBA image whose ALPHA varies (left->right ramp), RGB constant. Used as an
+// alpha-matte source so Alpha / AlphaInverted mattes produce a visible gradient.
+QImage alphaRamp(QSize sz, int r, int g, int b)
+{
+    QImage img(sz, QImage::Format_ARGB32);
+    for (int y = 0; y < sz.height(); ++y) {
+        for (int x = 0; x < sz.width(); ++x) {
+            const int a = (sz.width() > 1) ? (x * 255 / (sz.width() - 1)) : 255;
+            img.setPixel(x, y, qRgba(r, g, b, a));
+        }
+    }
+    return img;
+}
+
+// An opaque grayscale gradient (R==G==B ramp, alpha 255). Used as a luma-matte
+// source so Luma / LumaInverted mattes produce a visible gradient.
+QImage grayRamp(QSize sz)
+{
+    QImage img(sz, QImage::Format_ARGB32);
+    for (int y = 0; y < sz.height(); ++y) {
+        for (int x = 0; x < sz.width(); ++x) {
+            const int v = (sz.width() > 1) ? (x * 255 / (sz.width() - 1)) : 128;
+            img.setPixel(x, y, qRgba(v, v, v, 255));
+        }
+    }
+    return img;
+}
+
+// A translucent grayscale ramp used to exercise the luma shader's
+// un-premultiply path. CPU MaskSystem converts the premultiplied matte back to
+// ARGB32 and truncates integer Rec.601 luma; the shader uses continuous float
+// luma after dividing premultiplied RGB by alpha.
+QImage translucentGrayRamp(QSize sz, int alpha)
+{
+    QImage img(sz, QImage::Format_ARGB32);
+    for (int y = 0; y < sz.height(); ++y) {
+        for (int x = 0; x < sz.width(); ++x) {
+            const int v = (sz.width() > 1)
+                ? (24 + ((x * 179 / (sz.width() - 1) + y * 13) % 208))
+                : 128;
+            img.setPixel(x, y, qRgba(v, v, v, alpha));
+        }
+    }
+    return img;
+}
+
+// Build the CPU SSOT matte reference via trackmatte::composite for a 3-layer
+// stack: index0 = base (backmost, drawn), index1 = matte source (excluded),
+// index2 = the matte'd layer (frontmost, matteType + matteSourceLayerIndex=1).
+// Callers pass already-rendered canvas-sized layer images. Returns the
+// composited canvas.
+QImage cpuMatteReference(const QImage& base, const QImage& matteSrc,
+                         const QImage& masked, TrackMatteType type,
+                         QSize canvas, double maskedOpacity = 1.0)
+{
+    QVector<CompositeLayer> layers(3);
+    // index0: base, drawn normally.
+    layers[0].visible = true;
+    layers[0].opacity = 1.0;
+    layers[0].matteType = TrackMatteType::None;
+    layers[0].matteSourceLayerIndex = -1;
+    // index1: matte source — excluded from standalone draw.
+    layers[1].visible = true;
+    layers[1].opacity = 1.0;
+    layers[1].matteType = TrackMatteType::None;
+    layers[1].matteSourceLayerIndex = -1;
+    // index2: the matte'd layer, consuming index1 as matte.
+    layers[2].visible = true;
+    layers[2].opacity = maskedOpacity;
+    layers[2].matteType = type;
+    layers[2].matteSourceLayerIndex = 1;
+
+    QVector<QImage> images(3);
+    images[0] = base.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+    images[1] = matteSrc.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+    images[2] = masked.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+
+    return trackmatte::composite(layers, images, canvas);
 }
 
 } // anonymous namespace
@@ -378,10 +465,148 @@ int runGpuCompositeParitySelftest()
              alphaCanvas, 0.98, 2.0, 2.0);
     }
 
-    // NOTE: matte-bearing scenes (LayerDesc::matteType != None) are NOT gated
-    // here. GpuLayerCompositor draws matte layers as plain layers this stage;
-    // full GPU matte (alpha/luminance/inverted sampled from the matte source
-    // in the fragment shader) is the next stage's parity work.
+    // ==================================================================
+    // GPU track-matte parity (Stage 4A). CPU reference = trackmatte::composite.
+    //
+    // Index space (SHARED by CPU + GPU): 0 = base (backmost, drawn),
+    // 1 = matte source (excluded from standalone draw), 2 = matte'd layer
+    // (frontmost, matteSourceLayerIndex/matteSourceIndex == 1). On the GPU,
+    // sourceTrack picks paint order: base=2 (backmost), matteSrc=1 (excluded),
+    // masked=0 (frontmost). matteGate(): builds the GPU layer vector and runs
+    // the CPU reference. Unless a gate says otherwise, images are canvas-sized
+    // and transforms are identity.
+    // ==================================================================
+    auto matteGate = [&](int g, const char* desc,
+                         const QImage& base, const QImage& matteSrc,
+                         const QImage& masked,
+                         gpucomposite::MatteType gpuType, TrackMatteType cpuType,
+                         int gpuMatteSourceIndex, QSize canvas,
+                         double maskedOpacity) {
+        const QImage cpu = cpuMatteReference(base, matteSrc, masked, cpuType,
+                                             canvas, maskedOpacity);
+
+        QVector<GpuLayerInput> g3;
+        // index0: base (backmost on GPU == highest track).
+        g3.push_back(makeLayer(base, /*track*/2, 1.0, 1.0, 0.0, 0.0, 0.0));
+        // index1: matte source (excluded; track value irrelevant but distinct).
+        g3.push_back(makeLayer(matteSrc, /*track*/1, 1.0, 1.0, 0.0, 0.0, 0.0));
+        // index2: matte'd layer (frontmost == lowest track) consuming index1.
+        GpuLayerInput m = makeLayer(masked, /*track*/0, maskedOpacity,
+                                    1.0, 0.0, 0.0, 0.0);
+        m.desc.matteType = gpuType;
+        m.desc.matteSourceIndex = gpuMatteSourceIndex;
+        g3.push_back(m);
+
+        gate(g, desc, cpu, g3, canvas, 0.98, 4.0, 4.0);
+    };
+
+    {
+        const QImage base   = gradient(srcSz, 30, 60, 90);
+        const QImage matteA = alphaRamp(srcSz, 255, 255, 255);     // alpha gradient
+        const QImage masked = gradient(srcSz, 220, 60, 20);
+        matteGate(9, "Alpha matte (alpha-gradient source) over opaque base",
+                  base, matteA, masked,
+                  gpucomposite::MatteType::Alpha, TrackMatteType::AlphaMatte,
+                  /*matteSrcIdx*/1, srcSz, /*maskedOpacity*/1.0);
+    }
+    {
+        const QImage base   = gradient(srcSz, 90, 60, 30);
+        const QImage matteA = alphaRamp(srcSz, 255, 255, 255);
+        const QImage masked = gradient(srcSz, 20, 220, 60);
+        matteGate(10, "AlphaInverted matte",
+                  base, matteA, masked,
+                  gpucomposite::MatteType::AlphaInverted, TrackMatteType::AlphaInvertedMatte,
+                  /*matteSrcIdx*/1, srcSz, /*maskedOpacity*/1.0);
+    }
+    {
+        const QImage base   = gradient(srcSz, 40, 40, 120);
+        const QImage matteL = grayRamp(srcSz);                     // luminance gradient
+        const QImage masked = gradient(srcSz, 200, 200, 40);
+        matteGate(11, "Luma matte (grayscale-gradient source)",
+                  base, matteL, masked,
+                  gpucomposite::MatteType::Luminance, TrackMatteType::LumaMatte,
+                  /*matteSrcIdx*/1, srcSz, /*maskedOpacity*/1.0);
+    }
+    {
+        const QImage base   = gradient(srcSz, 120, 40, 40);
+        const QImage matteL = grayRamp(srcSz);
+        const QImage masked = gradient(srcSz, 40, 200, 200);
+        matteGate(12, "LumaInverted matte",
+                  base, matteL, masked,
+                  gpucomposite::MatteType::LuminanceInverted, TrackMatteType::LumaInvertedMatte,
+                  /*matteSrcIdx*/1, srcSz, /*maskedOpacity*/1.0);
+    }
+    {
+        // G13: INVALID matte source (matteSourceIndex=0 == the base, which
+        // isValidMatteSource rejects). Both CPU and GPU must ignore the matte
+        // and composite the layer NORMALLY. We pass cpuType=None to the CPU
+        // reference (its own isValidMatteSource rejects index 0 identically, so
+        // None vs an index-0 matte produce the same "no matte" result), while
+        // the GPU layer carries matteType!=None with the invalid index 0.
+        const QImage base   = gradient(srcSz, 60, 90, 120);
+        const QImage matteL = grayRamp(srcSz);
+        const QImage masked = gradient(srcSz, 210, 90, 30);
+        const QImage cpu = cpuMatteReference(base, matteL, masked,
+                                             TrackMatteType::None, srcSz);
+        QVector<GpuLayerInput> g3;
+        g3.push_back(makeLayer(base,   /*track*/2, 1.0, 1.0, 0.0, 0.0, 0.0)); // idx0
+        g3.push_back(makeLayer(matteL, /*track*/1, 1.0, 1.0, 0.0, 0.0, 0.0)); // idx1
+        GpuLayerInput m = makeLayer(masked, /*track*/0, 1.0, 1.0, 0.0, 0.0, 0.0); // idx2
+        m.desc.matteType = gpucomposite::MatteType::Luminance;
+        m.desc.matteSourceIndex = 0;   // INVALID: index 0 is the base
+        g3.push_back(m);
+        gate(13, "INVALID matte source (index 0) -> composites normally",
+             cpu, g3, srcSz, 0.98, 4.0, 4.0);
+    }
+    {
+        // G14: matte mask and layer opacity must compose in the same order as
+        // CPU: applyTrackMatte first, then QPainter::setOpacity(0.5).
+        const QImage base   = gradient(srcSz, 45, 90, 135);
+        const QImage matteA = alphaRamp(srcSz, 255, 255, 255);
+        const QImage masked = gradient(srcSz, 230, 80, 25);
+        matteGate(14, "Alpha matte with matte'd layer opacity 0.5",
+                  base, matteA, masked,
+                  gpucomposite::MatteType::Alpha, TrackMatteType::AlphaMatte,
+                  /*matteSrcIdx*/1, srcSz, /*maskedOpacity*/0.5);
+    }
+    {
+        // G15: translucent luma matte source. This specifically exercises the
+        // shader's float un-premultiply path against MaskSystem's ARGB32
+        // conversion + integer Rec.601 truncation.
+        const QImage base   = gradient(srcSz, 25, 115, 75);
+        const QImage matteL = translucentGrayRamp(srcSz, /*alpha*/96);
+        const QImage masked = gradient(srcSz, 180, 70, 210);
+        matteGate(15, "Luma matte with translucent grayscale source",
+                  base, matteL, masked,
+                  gpucomposite::MatteType::Luminance, TrackMatteType::LumaMatte,
+                  /*matteSrcIdx*/1, srcSz, /*maskedOpacity*/1.0);
+    }
+    {
+        // G16: realistic transformed matte'd layer. The matte source remains
+        // an untransformed canvas-sized image; only the matte'd layer is
+        // scaled/offset before MaskSystem::applyTrackMatte sees it.
+        const QImage base   = gradient(srcSz, 15, 65, 120);
+        const QImage matteL = grayRamp(srcSz);
+        const QImage masked = gradient(srcSz, 235, 120, 35);
+        const clipgeom::ClipTransform xf{0.5, 0.18, -0.12, 0.0};
+        const QImage maskedPlaced = clipgeom::renderLayer(
+            masked, xf, srcSz, /*smooth*/false);
+        const QImage cpu = cpuMatteReference(base, matteL, maskedPlaced,
+                                             TrackMatteType::LumaMatte, srcSz);
+
+        QVector<GpuLayerInput> g3;
+        g3.push_back(makeLayer(base,   /*track*/2, 1.0, 1.0, 0.0, 0.0, 0.0));
+        g3.push_back(makeLayer(matteL, /*track*/1, 1.0, 1.0, 0.0, 0.0, 0.0));
+        GpuLayerInput m = makeLayer(masked, /*track*/0, 1.0,
+                                    xf.videoScale, xf.videoDx, xf.videoDy,
+                                    xf.rotationDeg);
+        m.desc.matteType = gpucomposite::MatteType::Luminance;
+        m.desc.matteSourceIndex = 1;
+        g3.push_back(m);
+
+        gate(16, "Luma matte with scaled/offset matte'd layer",
+             cpu, g3, srcSz, 0.98, 4.0, 4.0);
+    }
 
     std::printf("[gpu-composite-parity] Result: %d/%d PASSED\n", passed, total);
     return (passed == total) ? 0 : 1;

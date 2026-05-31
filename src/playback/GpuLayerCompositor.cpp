@@ -13,6 +13,7 @@
 #include <QMatrix4x4>
 #include <QVector>
 #include <QImage>
+#include <QSet>
 
 // ---------------------------------------------------------------------------
 // Shaders
@@ -51,6 +52,65 @@ void main() {
     // source-over, opacity scales ALL components (rgb already carry alpha).
     vec4 c = texture2D(uTex, vTexCoord);
     gl_FragColor = c * uOpacity;
+}
+)";
+
+// ---------------------------------------------------------------------------
+// Matte combine shaders (Stage 4A two-pass track matte).
+//
+// A full-canvas quad whose NDC positions cover [-1,1]^2 and whose texcoords are
+// 0..1 across the canvas. Both srcTex (the matte'd layer, premultiplied) and
+// matteTex (the matte source, premultiplied) are canvas-sized renders sampled
+// at the SAME canvas coordinate, so no transform is needed here — texcoord IS
+// the shared canvas uv. (Both temp FBOs are produced by the same Y-down ortho
+// path as the main FBO, so their rows align; the single read-back flip on the
+// main FBO restores orientation for the final image.)
+// ---------------------------------------------------------------------------
+static const char* kMatteVertSrc = R"(
+#version 120
+attribute vec2 aPos;        // NDC position (-1..1)
+attribute vec2 aTexCoord;   // 0..1 canvas uv
+varying vec2 vTexCoord;
+void main() {
+    gl_Position = vec4(aPos, 0.0, 1.0);
+    vTexCoord = aTexCoord;
+}
+)";
+
+// uMatteType ordinals MIRROR gpucomposite::MatteType / TrackMatteType:
+//   0 None, 1 Alpha, 2 AlphaInverted, 3 Luma, 4 LumaInverted.
+static const char* kMatteFragSrc = R"(
+#version 120
+uniform sampler2D uSrcTex;     // matte'd layer, PREMULTIPLIED, canvas-sized
+uniform sampler2D uMatteTex;   // matte source, PREMULTIPLIED, canvas-sized
+uniform int   uMatteType;
+uniform float uOpacity;        // clampOpacity(desc.opacity) of the matte'd layer
+varying vec2 vTexCoord;
+void main() {
+    vec4 src   = texture2D(uSrcTex,   vTexCoord);   // premultiplied
+    vec4 matte = texture2D(uMatteTex, vTexCoord);   // premultiplied
+
+    // Premultiplied alpha == straight alpha numerically.
+    float a = matte.a;
+
+    // Luma uses STRAIGHT-alpha Rec.601 (CPU un-premultiplies into ARGB32 first).
+    // Un-premultiply matteTex.rgb; guard a==0 (CPU's qRed/qGreen/qBlue on a
+    // fully-transparent premultiplied pixel are 0, matching straight=vec3(0)).
+    vec3 straight = (a > 0.0) ? (matte.rgb / a) : vec3(0.0);
+    float luma = 0.299 * straight.r + 0.587 * straight.g + 0.114 * straight.b;
+
+    float maskVal = 1.0;
+    if      (uMatteType == 1) maskVal = a;          // Alpha
+    else if (uMatteType == 2) maskVal = 1.0 - a;    // AlphaInverted
+    else if (uMatteType == 3) maskVal = luma;       // Luma
+    else if (uMatteType == 4) maskVal = 1.0 - luma; // LumaInverted
+    // uMatteType == 0 (None) -> maskVal stays 1.0 (caller never uses this path).
+
+    maskVal = clamp(maskVal, 0.0, 1.0);
+
+    // applyMask scales every premultiplied component by maskVal, then the layer's
+    // own opacity scales all components again (premultiplied source-over slot).
+    gl_FragColor = src * maskVal * uOpacity;
 }
 )";
 
@@ -123,11 +183,21 @@ void GpuLayerCompositor::releaseGlResources() {
             m_vbo->destroy();
         m_vbo.reset();
     }
-    m_fbo.reset();   // QOpenGLFramebufferObject dtor frees its GL handle
-    m_prog.reset();  // QOpenGLShaderProgram dtor frees the program
+    if (m_matteVbo) {
+        if (m_matteVbo->isCreated())
+            m_matteVbo->destroy();
+        m_matteVbo.reset();
+    }
+    m_fbo.reset();           // QOpenGLFramebufferObject dtor frees its GL handle
+    m_matteFboSrc.reset();
+    m_matteFboMatte.reset();
+    m_prog.reset();          // QOpenGLShaderProgram dtor frees the program
+    m_matteProg.reset();
 
     m_uLayer = m_uProj = m_uTex = m_uOpacity = -1;
     m_aSrcPos = m_aTexCoord = -1;
+    m_mSrcTex = m_mMatteTex = m_mMatteType = m_mOpacity = -1;
+    m_mAPos = m_mATexCoord = -1;
 }
 
 bool GpuLayerCompositor::ensureContext() {
@@ -207,6 +277,31 @@ bool GpuLayerCompositor::ensureProgram() {
     return true;
 }
 
+bool GpuLayerCompositor::ensureMatteProgram() {
+    // Compile/link the matte-combine program ONCE; reuse on every later matte'd
+    // layer composite.
+    if (m_matteProg)
+        return true;
+
+    auto prog = std::make_unique<QOpenGLShaderProgram>();
+    const bool ok =
+        prog->addShaderFromSourceCode(QOpenGLShader::Vertex, kMatteVertSrc) &&
+        prog->addShaderFromSourceCode(QOpenGLShader::Fragment, kMatteFragSrc) &&
+        prog->link();
+    if (!ok)
+        return false;
+
+    m_mAPos      = prog->attributeLocation("aPos");
+    m_mATexCoord = prog->attributeLocation("aTexCoord");
+    m_mSrcTex    = prog->uniformLocation("uSrcTex");
+    m_mMatteTex  = prog->uniformLocation("uMatteTex");
+    m_mMatteType = prog->uniformLocation("uMatteType");
+    m_mOpacity   = prog->uniformLocation("uOpacity");
+
+    m_matteProg = std::move(prog);
+    return true;
+}
+
 bool GpuLayerCompositor::ensureFbo(QSize canvas) {
     // Reuse the FBO while its size matches the requested canvas; only rebuild
     // when the canvas dimensions actually change (the dominant live-preview
@@ -225,6 +320,89 @@ bool GpuLayerCompositor::ensureFbo(QSize canvas) {
         return false;
 
     m_fbo = std::move(fbo);
+    return true;
+}
+
+bool GpuLayerCompositor::renderLayerToFbo(QOpenGLFramebufferObject& target,
+                                          const QImage& img,
+                                          const gpucomposite::LayerDesc& d,
+                                          QSize canvas,
+                                          const QMatrix4x4& proj) {
+    // Render ONE layer into `target` (canvas-sized) using the plain layer
+    // program, the layer's gpucomposite::layerTransform, opacity FORCED to 1,
+    // over a transparent clear. This reproduces CPU's canvas-sized intermediate
+    // image (renderLayer output) for a matte source / matte'd source.
+    if (img.isNull() || img.width() <= 0 || img.height() <= 0)
+        return false;
+    if (!target.bind())
+        return false;
+
+    QOpenGLFunctions* gl = m_ctx->functions();
+    gl->glViewport(0, 0, canvas.width(), canvas.height());
+    gl->glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    gl->glClear(GL_COLOR_BUFFER_BIT);
+    gl->glEnable(GL_BLEND);
+    gl->glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA,
+                            GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    gl->glDisable(GL_DEPTH_TEST);
+    gl->glDisable(GL_CULL_FACE);
+
+    QOpenGLShaderProgram& prog = *m_prog;
+    if (!prog.bind()) {
+        target.release();
+        return false;
+    }
+    prog.setUniformValue(m_uProj, proj);
+    prog.setUniformValue(m_uTex, 0);
+
+    QImage src = img.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+
+    // The temp FBO renders allocate their own throwaway texture rather than
+    // consuming the main loop's texture-pool cursor (kept separate so pooling
+    // logic stays simple). It is destroyed before returning.
+    auto* tex = new QOpenGLTexture(QOpenGLTexture::Target2D);
+    tex->setFormat(QOpenGLTexture::RGBA8_UNorm);
+    tex->setSize(src.width(), src.height());
+    tex->setMinificationFilter(QOpenGLTexture::Nearest);
+    tex->setMagnificationFilter(QOpenGLTexture::Nearest);
+    tex->setWrapMode(QOpenGLTexture::ClampToEdge);
+    tex->allocateStorage();
+    tex->setData(QOpenGLTexture::BGRA, QOpenGLTexture::UInt8, src.constBits());
+
+    gl->glActiveTexture(GL_TEXTURE0);
+    tex->bind(0);
+
+    prog.setUniformValue(m_uLayer, gpucomposite::layerTransform(d, canvas));
+    prog.setUniformValue(m_uOpacity, 1.0f);   // matte intermediates are opacity=1
+
+    const float sw = float(src.width());
+    const float sh = float(src.height());
+    const float verts[] = {
+        0.0f, 0.0f,  0.0f, 0.0f,
+        sw,   0.0f,  1.0f, 0.0f,
+        0.0f, sh,    0.0f, 1.0f,
+        sw,   sh,    1.0f, 1.0f,
+    };
+
+    m_vbo->bind();
+    m_vbo->allocate(verts, int(sizeof(verts)));
+    prog.enableAttributeArray(m_aSrcPos);
+    prog.enableAttributeArray(m_aTexCoord);
+    prog.setAttributeBuffer(m_aSrcPos,   GL_FLOAT, 0, 2, 4 * sizeof(float));
+    prog.setAttributeBuffer(m_aTexCoord, GL_FLOAT, 2 * sizeof(float), 2, 4 * sizeof(float));
+
+    gl->glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+    prog.disableAttributeArray(m_aSrcPos);
+    prog.disableAttributeArray(m_aTexCoord);
+    m_vbo->release();
+    tex->release();
+    prog.release();
+
+    tex->destroy();
+    delete tex;
+
+    target.release();
     return true;
 }
 
@@ -294,6 +472,20 @@ QImage GpuLayerCompositor::composite(const QVector<GpuLayerInput>& layers, QSize
     // LAST and wins (frontmost) under source-over.
     const QVector<int> order = gpucomposite::paintOrder(descs);
 
+    // Matte sources: a layer i whose matteType != None with a VALID
+    // matteSourceIndex (gpucomposite::isValidMatteSource, 3-arg) consumes that
+    // index as its matte. Those source layers are EXCLUDED from being painted
+    // standalone — identical to trackmatte::composite. matteSourceIndex indexes
+    // the ORIGINAL `layers` vector (not paint order).
+    QSet<int> matteSourceIndices;
+    for (int i = 0; i < descs.size(); ++i) {
+        const gpucomposite::LayerDesc& d = descs[i];
+        if (d.matteType == gpucomposite::MatteType::None)
+            continue;
+        if (gpucomposite::isValidMatteSource(d.matteSourceIndex, i, descs.size()))
+            matteSourceIndices.insert(d.matteSourceIndex);
+    }
+
     // Persistent VBO for the interleaved (aSrcPos, aTexCoord) quad. Position
     // depends on per-layer src size, so contents are re-uploaded per draw, but
     // the buffer object itself is allocated once and reused.
@@ -307,6 +499,77 @@ QImage GpuLayerCompositor::composite(const QVector<GpuLayerInput>& layers, QSize
         }
         m_vbo->setUsagePattern(QOpenGLBuffer::DynamicDraw);
     }
+
+    // Lazily (re)create a canvas-sized temp FBO for matte intermediates. Reused
+    // across composite() calls; rebuilt only on canvas-size change. Returns
+    // nullptr on failure.
+    auto ensureTempFbo = [&](std::unique_ptr<QOpenGLFramebufferObject>& slot)
+        -> QOpenGLFramebufferObject* {
+        if (slot && slot->size() == canvas && slot->isValid())
+            return slot.get();
+        slot.reset();
+        QOpenGLFramebufferObjectFormat fboFmt;
+        fboFmt.setInternalTextureFormat(GL_RGBA8);
+        fboFmt.setAttachment(QOpenGLFramebufferObject::NoAttachment);
+        auto f = std::make_unique<QOpenGLFramebufferObject>(canvas, fboFmt);
+        if (!f->isValid())
+            return nullptr;
+        slot = std::move(f);
+        return slot.get();
+    };
+
+    // Draw a full-canvas matte-combine pass into the CURRENTLY-BOUND main FBO,
+    // sampling srcTex (matte'd layer) and matteTex (matte source) at the same
+    // canvas uv, using the matte program. Assumes the main FBO is already bound
+    // with the premultiplied source-over blend state. Returns false on failure.
+    auto drawMatteCombine = [&](GLuint srcTexId, GLuint matteTexId,
+                                int matteTypeOrdinal, float opacity) -> bool {
+        QOpenGLShaderProgram& mp = *m_matteProg;
+        if (!mp.bind())
+            return false;
+
+        gl->glActiveTexture(GL_TEXTURE0);
+        gl->glBindTexture(GL_TEXTURE_2D, srcTexId);
+        gl->glActiveTexture(GL_TEXTURE1);
+        gl->glBindTexture(GL_TEXTURE_2D, matteTexId);
+
+        mp.setUniformValue(m_mSrcTex, 0);
+        mp.setUniformValue(m_mMatteTex, 1);
+        mp.setUniformValue(m_mMatteType, matteTypeOrdinal);
+        mp.setUniformValue(m_mOpacity, opacity);
+
+        // Full-canvas quad: NDC corners + matching 0..1 canvas uv. The temp FBOs
+        // were rendered with the SAME Y-down ortho as the main FBO, so uv aligns
+        // row-for-row with the main FBO's pixels (the single read-back flip later
+        // restores screen orientation).
+        const float quad[] = {
+            // aPos        aTexCoord
+            -1.0f, -1.0f,  0.0f, 0.0f,
+             1.0f, -1.0f,  1.0f, 0.0f,
+            -1.0f,  1.0f,  0.0f, 1.0f,
+             1.0f,  1.0f,  1.0f, 1.0f,
+        };
+        m_matteVbo->bind();
+        m_matteVbo->allocate(quad, int(sizeof(quad)));
+        mp.enableAttributeArray(m_mAPos);
+        mp.enableAttributeArray(m_mATexCoord);
+        mp.setAttributeBuffer(m_mAPos,      GL_FLOAT, 0, 2, 4 * sizeof(float));
+        mp.setAttributeBuffer(m_mATexCoord, GL_FLOAT, 2 * sizeof(float), 2, 4 * sizeof(float));
+
+        gl->glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+        mp.disableAttributeArray(m_mAPos);
+        mp.disableAttributeArray(m_mATexCoord);
+        m_matteVbo->release();
+
+        // Leave texture unit 0 active (the plain path assumes GL_TEXTURE0).
+        gl->glActiveTexture(GL_TEXTURE1);
+        gl->glBindTexture(GL_TEXTURE_2D, 0);
+        gl->glActiveTexture(GL_TEXTURE0);
+        gl->glBindTexture(GL_TEXTURE_2D, 0);
+        mp.release();
+        return true;
+    };
 
     // Texture-pool cursor: we hand out one pooled texture per drawn layer and
     // reuse its GL storage (glTexSubImage2D) when size/format already match.
@@ -352,6 +615,82 @@ QImage GpuLayerCompositor::composite(const QVector<GpuLayerInput>& layers, QSize
             continue;
         if (in.image.isNull() || in.image.width() <= 0 || in.image.height() <= 0)
             continue;
+
+        // A matte-source layer is consumed by its matte'd layer and never
+        // painted standalone (mirrors trackmatte::composite).
+        if (matteSourceIndices.contains(idx))
+            continue;
+
+        // ----------------------------------------------------------------
+        // Matte path: this layer requests a matte AND its source is valid.
+        // Render matte source + this layer to canvas-sized temp FBOs, then a
+        // full-canvas combine pass into the main FBO. The combine emits the
+        // masked + opacity-scaled premultiplied layer, which the main FBO's
+        // source-over blend places in this layer's normal paint-order slot.
+        // ----------------------------------------------------------------
+        const bool wantsMatte =
+            d.matteType != gpucomposite::MatteType::None &&
+            gpucomposite::isValidMatteSource(d.matteSourceIndex, idx, layers.size());
+
+        if (wantsMatte) {
+            const int mIdx = d.matteSourceIndex;
+            const GpuLayerInput& matteIn = layers[mIdx];
+
+            QOpenGLFramebufferObject* srcF   = ensureTempFbo(m_matteFboSrc);
+            QOpenGLFramebufferObject* matteF = ensureTempFbo(m_matteFboMatte);
+
+            if (m_matteVbo == nullptr) {
+                m_matteVbo = std::make_unique<QOpenGLBuffer>(QOpenGLBuffer::VertexBuffer);
+                if (m_matteVbo->create())
+                    m_matteVbo->setUsagePattern(QOpenGLBuffer::DynamicDraw);
+                else
+                    m_matteVbo.reset();
+            }
+
+            const bool matteReady =
+                srcF && matteF && m_matteVbo && ensureMatteProgram() &&
+                !matteIn.image.isNull() &&
+                matteIn.image.width() > 0 && matteIn.image.height() > 0;
+
+            if (matteReady) {
+                // The current plain prog is bound from before the loop; the two
+                // temp renders below rebind/release prog internally, and we
+                // restore prog + main FBO state afterward.
+                prog.release();
+
+                const bool okMatte =
+                    renderLayerToFbo(*matteF, matteIn.image, matteIn.desc, canvas, proj);
+                const bool okSrc =
+                    renderLayerToFbo(*srcF, in.image, d, canvas, proj);
+
+                if (okMatte && okSrc) {
+                    // Rebind the MAIN FBO + state for the combine pass.
+                    fbo.bind();
+                    gl->glViewport(0, 0, canvas.width(), canvas.height());
+                    gl->glEnable(GL_BLEND);
+                    gl->glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA,
+                                            GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+                    gl->glDisable(GL_DEPTH_TEST);
+                    gl->glDisable(GL_CULL_FACE);
+
+                    drawMatteCombine(srcF->texture(), matteF->texture(),
+                                     static_cast<int>(d.matteType),
+                                     float(gpucomposite::clampOpacity(d.opacity)));
+                }
+
+                // Restore the plain path's expected state for subsequent layers:
+                // main FBO bound, plain prog bound, projection/tex sampler set.
+                fbo.bind();
+                gl->glViewport(0, 0, canvas.width(), canvas.height());
+                prog.bind();
+                prog.setUniformValue(m_uProj, proj);
+                prog.setUniformValue(m_uTex, 0);
+                gl->glActiveTexture(GL_TEXTURE0);
+                continue;
+            }
+            // matte not ready -> fall through and composite this layer plainly
+            // (matches trackmatte's invalid-matte "composite normally" rule).
+        }
 
         // Upload premultiplied. ARGB32_Premultiplied matches CPU SSOT's frame
         // format and gives correct premultiplied texels for the blend above.

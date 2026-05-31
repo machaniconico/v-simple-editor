@@ -5,16 +5,15 @@
 #include <QVector>
 #include <QMatrix4x4>
 
-// gpucomposite: PURE compositing-math engine for the future GPU multi-track
-// compositor (Stage 1 — dormant, NOT wired into any rendering path yet).
+// gpucomposite: PURE compositing-math helpers for the GPU multi-track
+// compositor and its headless reference tests.
 //
 // Purpose
 // -------
 // This module captures the *compositing rules* used by the existing CPU
 // preview/export pipeline so they can be verified HEADLESS (no QApplication,
-// no QWidget, no QOpenGL) via deterministic self-tests, ahead of an actual
-// GPU implementation. Behaviour must stay BIT-IDENTICAL to the current
-// pipeline: this file introduces no new policy, only mirrors the canonical
+// no QWidget, no QOpenGL) via deterministic self-tests and reused by the GPU
+// compositor. This file introduces no new policy; it mirrors the canonical
 // math already proven by:
 //   - clipgeom::layerMatrix / placementAnchor (src/ClipGeometry.cpp)
 //   - clipstack::layerPaintOrderLess          (src/VideoPlayer.cpp)
@@ -111,5 +110,44 @@ RGBAf premulSourceOver(const RGBAf& src, const RGBAf& dst);
 //     reserved index-0 V1 base, i.e. idx > 0 && idx < count. Mirrors
 //     trackmatte::isValidMatteSource.
 bool isValidMatteSource(int idx, int count);
+
+// (6b) 3-argument overload: additionally rejects matteIdx == layerIdx (a layer
+//      cannot matte itself). Matches the full trackmatte::isValidMatteSource
+//      (layerIndex, matteIndex, count) contract used in TrackMatteBake.cpp.
+//      Kept alongside the 2-arg overload for back-compat.
+bool isValidMatteSource(int matteIdx, int layerIdx, int count);
+
+// (7) Matte-mask value (0..255) for a single pixel. This is a CPU-algebra
+//     REFERENCE ORACLE, BYTE-EXACT to MaskSystem::applyTrackMatte +
+//     trackMatteLumaRec601.
+//
+//   Alpha          -> premulAlpha            (clamp [0,255])
+//   AlphaInverted  -> 255 - premulAlpha      (clamp [0,255])
+//   Luma           -> static_cast<int>(0.299*R + 0.587*G + 0.114*B)
+//                     using STRAIGHT (un-premultiplied) RGB; Rec.601 luma;
+//                     truncates toward zero (NOT rounded).
+//   LumaInverted   -> 255 - (that luma int)
+//   None           -> 255  (no matte, full opacity)
+//
+// Parameters
+//   type         : matte kind
+//   straightR/G/B: straight (un-premultiplied) RGB components 0..255
+//   premulAlpha  : premultiplied alpha component 0..255
+//
+// Important: this helper is NOT called by the GPU render path and is NOT a
+// byte-identical SSOT for the GLSL matte shader. The shipped shader in
+// GpuLayerCompositor.cpp uses normalized floats and continuous luma after
+// un-premultiplication; parity for that path is gated separately by
+// gpu-composite-parity (notably the luma gates G11/G12).
+int matteMaskValue(MatteType type,
+                   int straightR, int straightG, int straightB,
+                   int premulAlpha);
+
+// (8) Apply a mask value to a premultiplied RGBA pixel (integer truncation),
+//     CPU-algebra REFERENCE ORACLE, BYTE-EXACT to MaskSystem::applyMask.
+//     Each component = component * maskVal / 255  (integer division, truncating).
+//     Inputs and outputs are premultiplied components in [0,255].
+//     Like matteMaskValue(), this helper is not called by the GPU shader path.
+void applyMaskPremul(int& r, int& g, int& b, int& a, int maskVal);
 
 } // namespace gpucomposite

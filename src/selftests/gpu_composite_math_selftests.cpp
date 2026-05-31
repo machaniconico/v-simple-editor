@@ -10,6 +10,13 @@
 // engine's own output — so a regression in the engine cannot make a gate
 // pass tautologically.
 //
+// Matte byte-algebra note: G16..G24 are CPU-algebra reference-oracle gates
+// mirroring MaskSystem's integer matte math. They are intentionally retained
+// for drift detection, but gpucomposite::matteMaskValue/applyMaskPremul are
+// NOT called by the GPU render path. The actual GLSL matte shader uses
+// normalized floats and continuous luma; GPU-vs-CPU shader parity is gated by
+// gpu-composite-parity (notably luma gates G11/G12).
+//
 // Coordinate note: gpucomposite::layerTransform maps native SOURCE-PIXEL coords
 // onto CANVAS-PIXEL coords. It mirrors ClipGeometry::renderLayer by first
 // scaling the native source to canvas dimensions, then un-centering by
@@ -18,7 +25,7 @@
 // matching canvas rectangle. We verify source-quad points against
 // hand-computed canvas positions.
 //
-// Gate map (15 gates):
+// Gate map (24 gates):
 //   G1  paintOrder: descending sourceTrack ordering
 //   G2  layerTransform: identity (full-canvas) maps corners onto canvas corners
 //   G3  layerTransform: videoScale=0.5 halves the quad about its center
@@ -35,6 +42,15 @@
 //   G14 layerTransform: videoDy=-0.5 shifts center up by half canvas height
 //   G15 layerTransform: srcSize!=canvas, non-square canvas, rotation preserves
 //       ClipGeometry's source->canvas pre-scale semantics
+//   G16 CPU-oracle matteMaskValue Alpha -> premulAlpha
+//   G17 CPU-oracle matteMaskValue AlphaInverted -> 255-premulAlpha
+//   G18 CPU-oracle matteMaskValue Luma R=G=B=10 -> 10 (Rec.601 int)
+//   G19 CPU-oracle matteMaskValue Luma R=1,G=B=0 truncates 0.299->0
+//   G20 CPU-oracle matteMaskValue LumaInverted R=G=B=10 -> 245
+//   G21 CPU-oracle matteMaskValue None -> 255
+//   G22 CPU-oracle applyMaskPremul truncation (r=100,g=50,b=0,a=200,mask=128)
+//   G23 3-arg isValidMatteSource valid case (2,0,4) -> true
+//   G24 3-arg isValidMatteSource rejects idx0 / self-ref / OOB / negative
 
 #include <cstdio>
 #include <cmath>
@@ -343,6 +359,111 @@ int runGpuCompositeMathSelftest()
         const bool topMid   = ptNear(mapPoint(m, 100, 0),  350, 150, 1e-2);
         check(15, "src!=canvas non-square + rotation matches ClipGeometry pre-scale",
               rightMid && topMid);
+    }
+
+    // ------------------------------------------------------------------
+    // G16: CPU-oracle matteMaskValue Alpha -> premulAlpha (no luma calculation).
+    // premulAlpha=200, any RGB irrelevant. Oracle: 200.
+    // ------------------------------------------------------------------
+    {
+        const int mask = gpucomposite::matteMaskValue(
+            MatteType::Alpha, 100, 150, 200, /*premulAlpha=*/200);
+        check(16, "matteMaskValue Alpha -> premulAlpha", mask == 200);
+    }
+
+    // ------------------------------------------------------------------
+    // G17: CPU-oracle matteMaskValue AlphaInverted -> 255 - premulAlpha.
+    // premulAlpha=200. Oracle: 255-200 = 55.
+    // ------------------------------------------------------------------
+    {
+        const int mask = gpucomposite::matteMaskValue(
+            MatteType::AlphaInverted, 100, 150, 200, /*premulAlpha=*/200);
+        check(17, "matteMaskValue AlphaInverted -> 255-premulAlpha", mask == 55);
+    }
+
+    // ------------------------------------------------------------------
+    // G18: CPU-oracle matteMaskValue Luma uniform grey (no fractional part).
+    // R=10, G=10, B=10.
+    // 0.299*10 + 0.587*10 + 0.114*10 = 2.99 + 5.87 + 1.14 = 10.00 -> 10.
+    // Oracle: 10.
+    // ------------------------------------------------------------------
+    {
+        const int mask = gpucomposite::matteMaskValue(
+            MatteType::Luminance, 10, 10, 10, /*premulAlpha=*/255);
+        check(18, "matteMaskValue Luma R=G=B=10 -> 10 (Rec.601 truncate)", mask == 10);
+    }
+
+    // ------------------------------------------------------------------
+    // G19: CPU-oracle matteMaskValue Luma fractional-truncation case.
+    // This documents MaskSystem's integer truncation. The GPU shader's luma
+    // path is continuous float and is covered by gpu-composite-parity instead.
+    // R=1, G=0, B=0. 0.299*1 + 0.587*0 + 0.114*0 = 0.299 -> truncate -> 0.
+    // Oracle: 0. (NOT 1 — must NOT round.)
+    // ------------------------------------------------------------------
+    {
+        const int mask = gpucomposite::matteMaskValue(
+            MatteType::Luminance, 1, 0, 0, /*premulAlpha=*/255);
+        check(19, "matteMaskValue Luma R=1 G=B=0 truncates 0.299->0", mask == 0);
+    }
+
+    // ------------------------------------------------------------------
+    // G20: CPU-oracle matteMaskValue LumaInverted.
+    // R=10, G=10, B=10 -> luma=10 -> 255-10 = 245. Oracle: 245.
+    // ------------------------------------------------------------------
+    {
+        const int mask = gpucomposite::matteMaskValue(
+            MatteType::LuminanceInverted, 10, 10, 10, /*premulAlpha=*/255);
+        check(20, "matteMaskValue LumaInverted R=G=B=10 -> 245", mask == 245);
+    }
+
+    // ------------------------------------------------------------------
+    // G21: CPU-oracle matteMaskValue None -> 255 (full opacity, no matte).
+    // ------------------------------------------------------------------
+    {
+        const int mask = gpucomposite::matteMaskValue(
+            MatteType::None, 50, 100, 200, /*premulAlpha=*/128);
+        check(21, "matteMaskValue None -> 255", mask == 255);
+    }
+
+    // ------------------------------------------------------------------
+    // G22: CPU-oracle applyMaskPremul integer-truncation.
+    // Input: r=100, g=50, b=0, a=200. maskVal=128.
+    // Oracle (integer truncation, NOT rounding):
+    //   r = 100*128/255 = 12800/255 = 50  (50.196... truncates to 50)
+    //   g =  50*128/255 =  6400/255 = 25  (25.098... truncates to 25)
+    //   b =   0*128/255 = 0
+    //   a = 200*128/255 = 25600/255 = 100 (100.392... truncates to 100)
+    // ------------------------------------------------------------------
+    {
+        int r = 100, g = 50, b = 0, a = 200;
+        gpucomposite::applyMaskPremul(r, g, b, a, /*maskVal=*/128);
+        check(22, "applyMaskPremul integer truncation r/g/b/a",
+              r == 50 && g == 25 && b == 0 && a == 100);
+    }
+
+    // ------------------------------------------------------------------
+    // G23: 3-arg isValidMatteSource valid case.
+    // matteIdx=2, layerIdx=0, count=4 -> 2>0 && 2<4 && 2!=0 -> true.
+    // ------------------------------------------------------------------
+    {
+        const bool ok = gpucomposite::isValidMatteSource(2, 0, 4);
+        check(23, "3-arg isValidMatteSource valid (2,0,4) -> true", ok);
+    }
+
+    // ------------------------------------------------------------------
+    // G24: 3-arg isValidMatteSource rejection cases.
+    //   matteIdx=0            -> false (reserved V1 slot)
+    //   matteIdx==layerIdx=2  -> false (layer cannot matte itself)
+    //   matteIdx>=count       -> false (out of range)
+    //   matteIdx=-1           -> false (negative)
+    // ------------------------------------------------------------------
+    {
+        const bool ok =
+            !gpucomposite::isValidMatteSource(0, 1, 4)   // reserved index 0
+         && !gpucomposite::isValidMatteSource(2, 2, 4)   // self-reference
+         && !gpucomposite::isValidMatteSource(4, 0, 4)   // out of range (==count)
+         && !gpucomposite::isValidMatteSource(-1, 0, 4); // negative
+        check(24, "3-arg isValidMatteSource rejects idx0/self/OOB/negative", ok);
     }
 
     std::printf("[gpu-composite-math] Result: %d/%d PASSED\n",

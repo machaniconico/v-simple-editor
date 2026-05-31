@@ -30,13 +30,27 @@
 //
 // Matte support status
 // --------------------
-// Stage 2's REQUIRED guarantee is GPU/CPU parity for scenes WITHOUT track
-// mattes (LayerDesc::matteType == None / matteSourceIndex <= 0). Layers that
-// request a matte (matteSourceIndex > 0 && gpucomposite::isValidMatteSource)
-// are, in this stage, drawn WITHOUT applying the matte (i.e. as plain layers).
-// Full GPU matte (alpha / luminance / inverted, sampled from the matte source
-// texture in the fragment shader) is deferred to the next stage. Callers that
-// need matte fidelity today must stay on the CPU path.
+// Track mattes ARE composited on the GPU (Stage 4A). A layer L whose
+// matteType != None and whose desc.matteSourceIndex passes
+// gpucomposite::isValidMatteSource(matteSourceIndex, L, layers.size()) consumes
+// the layer at that index as its matte; that matte-source layer is EXCLUDED
+// from being drawn standalone (mirroring trackmatte::composite). The matte is
+// applied with a TWO-PASS GPU path:
+//   1. render the matte source into a canvas-sized temp FBO (premultiplied,
+//      its layerTransform, opacity=1, transparent clear) -> matteTex;
+//   2. render L into a canvas-sized temp FBO the same way -> srcTex;
+//   3. one full-canvas pass into the MAIN FBO with a matte fragment shader that
+//      samples srcTex and matteTex at the SAME canvas coord, derives the mask
+//      value (alpha straight from matteTex.a; LUMA from STRAIGHT-alpha Rec.601
+//      = 0.299*sr+0.587*sg+0.114*sb after un-premultiplying matteTex.rgb),
+//      multiplies srcTex by mask then by opacity, and emits the premultiplied
+//      result so the main FBO source-over blend places it in L's normal slot.
+// This is measured against the CPU SSOT MaskSystem::applyTrackMatte + applyMask
+// in gpu-composite-parity G9..G16. Alpha masks are direct alpha sampling; luma
+// masks use continuous shader floats rather than GpuCompositeMath's integer
+// reference-oracle helper, so float-vs-integer truncation slack is expected.
+// A layer whose matteType != None but whose matte source is INVALID composites
+// normally (no matte), exactly like trackmatte::composite.
 //
 // Threading / lifetime
 // ---------------------
@@ -69,7 +83,7 @@ class QOpenGLTexture;
 // One decoded layer fed to the GPU compositor.
 struct GpuLayerInput {
     QImage                  image;   // RGBA frame (RGBA8888 / ARGB32 family). Null/empty == skip.
-    gpucomposite::LayerDesc desc;    // placement + opacity + (ignored-this-stage) matte info
+    gpucomposite::LayerDesc desc;    // placement + opacity + matte info (matteSourceIndex / matteType)
 };
 
 class GpuLayerCompositor {
@@ -92,9 +106,20 @@ public:
 
 private:
     bool ensureContext();    // lazy GL bring-up; sets m_triedInit / m_available
-    bool ensureProgram();    // compile/link shader once; reused thereafter
-    bool ensureFbo(QSize canvas);  // create/keep FBO matching canvas size
+    bool ensureProgram();    // compile/link plain layer shader once; reused thereafter
+    bool ensureMatteProgram(); // compile/link the two-pass matte shader once; reused
+    bool ensureFbo(QSize canvas);  // create/keep MAIN FBO matching canvas size
     void releaseGlResources();     // free all GL objects (context must be current)
+
+    // Render ONE layer (its layerTransform, opacity=1, premultiplied) into the
+    // given canvas-sized temp FBO over a transparent clear. Used to produce the
+    // matte-source and matte'd-source textures for the two-pass matte path.
+    // Returns false on any GL failure. Reuses the plain layer program + VBO.
+    bool renderLayerToFbo(QOpenGLFramebufferObject& target,
+                          const QImage& img,
+                          const gpucomposite::LayerDesc& d,
+                          QSize canvas,
+                          const QMatrix4x4& proj);
 
     QOpenGLContext*    m_ctx     = nullptr;
     QOffscreenSurface* m_surface = nullptr;
@@ -102,9 +127,13 @@ private:
     bool               m_available = false;
 
     // Persistent, reused GL resources (created lazily under a current context).
-    std::unique_ptr<QOpenGLShaderProgram>        m_prog;   // compiled once
-    std::unique_ptr<QOpenGLFramebufferObject>    m_fbo;    // re-made only on size change
+    std::unique_ptr<QOpenGLShaderProgram>        m_prog;   // plain layer shader, compiled once
+    std::unique_ptr<QOpenGLShaderProgram>        m_matteProg; // matte combine shader, compiled once
+    std::unique_ptr<QOpenGLFramebufferObject>    m_fbo;    // MAIN FBO; re-made only on size change
+    std::unique_ptr<QOpenGLFramebufferObject>    m_matteFboSrc;   // temp: matte'd source render
+    std::unique_ptr<QOpenGLFramebufferObject>    m_matteFboMatte; // temp: matte source render
     std::unique_ptr<QOpenGLBuffer>               m_vbo;    // interleaved srcPos+texCoord quad
+    std::unique_ptr<QOpenGLBuffer>               m_matteVbo; // full-canvas quad for matte combine
     QVector<QOpenGLTexture*>                      m_texPool; // per-layer texture pool, reused
 
     // Cached uniform/attribute locations (valid for the life of m_prog).
@@ -114,4 +143,12 @@ private:
     int m_uOpacity  = -1;
     int m_aSrcPos   = -1;
     int m_aTexCoord = -1;
+
+    // Cached locations for the matte combine program (life of m_matteProg).
+    int m_mSrcTex     = -1;
+    int m_mMatteTex   = -1;
+    int m_mMatteType  = -1;
+    int m_mOpacity    = -1;
+    int m_mAPos       = -1;  // NDC position attribute (full-canvas quad)
+    int m_mATexCoord  = -1;  // 0..1 texcoord attribute
 };
