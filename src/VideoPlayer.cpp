@@ -2067,6 +2067,21 @@ void VideoPlayer::displayFrame(const QImage &image)
 
     m_currentFrameImage = composed;
     emit frameComposited(composed);
+
+    // EXP-AID: 露出/フォーカス確認エイド (フォルスカラー / ゼブラ / フォーカスピーキング)。
+    // これは画面確認専用のオーバーレイなので「表示用の一時コピー」にだけ適用し、
+    // m_currentFrameImage / frameComposited のペイロード / 合成キャッシュ
+    // (cachePreviewComposite は displayFrame より前で素のフレームを put 済み) は
+    // 一切汚さない。mode == None (既定) のときは apply を呼ばず composed をそのまま
+    // 使うので従来パスとビット同一・性能無影響。書き出し (renderFrameAt /
+    // TimelineFrameRenderer / RenderQueue / Exporter) はこの経路を通らないため、
+    // エイドが書き出し画に焼き込まれることはない。displayFrame 1 回あたりの画像
+    // 加工が 1 つ増えるだけで、displayFrame の発火回数は不変 (1 tick = 最大 1 frame)。
+    QImage display = composed;
+    if (m_exposureAidMode != exposureaid::AidMode::None && !display.isNull()) {
+        display = exposureaid::apply(display, m_exposureAidMode, m_exposureAidConfig);
+    }
+
     if (m_useGL && m_glPreview) {
         m_glPreview->setDisplayAspectRatio(effectiveDisplayAspectRatio());
         int hdrTransfer = 0;
@@ -2094,10 +2109,10 @@ void VideoPlayer::displayFrame(const QImage &image)
         } else {
             m_glPreview->setStabilizerKeyframes({});
         }
-        m_glPreview->displayFrame(composed);
+        m_glPreview->displayFrame(display);
     } else {
         const QSize targetSize = fittedDisplaySize(m_videoDisplay->size());
-        const QPixmap pixmap = QPixmap::fromImage(composed);
+        const QPixmap pixmap = QPixmap::fromImage(display);
         m_videoDisplay->setPixmap(pixmap.scaled(targetSize, Qt::IgnoreAspectRatio, Qt::SmoothTransformation));
     }
 }
@@ -2320,6 +2335,27 @@ void VideoPlayer::setAcesPipeline(const aces::AcesPipeline &pipeline)
     // composeFrameWithOverlays を再実行 → displayFrame へ流すため、新しい
     // ACES 設定が即座に効く。null キャッシュ時は次の通常 tick / seek で反映される。
     m_acesPipeline = pipeline;
+    refreshDisplayedFrame();
+}
+
+void VideoPlayer::setExposureAidMode(exposureaid::AidMode mode)
+{
+    // EXP-AID: 露出/フォーカス確認エイドのモードを切り替える。値を保持するだけで、
+    // 実際の加工は displayFrame が表示直前に「表示用 QImage の一時コピー」へ行う
+    // (キャッシュ / 保持フレーム / 書き出しには非適用)。refreshDisplayedFrame は
+    // m_lastSourceFrame (合成前の生フレーム) から composeFrameWithOverlays を
+    // 再実行 → displayFrame へ流すので、一時停止中でも即座に反映される。
+    if (m_exposureAidMode == mode)
+        return;
+    m_exposureAidMode = mode;
+    refreshDisplayedFrame();
+}
+
+void VideoPlayer::setExposureAidConfig(const exposureaid::AidConfig &cfg)
+{
+    // EXP-AID: しきい値・縞幅・感度・色などのパラメータを更新する。モードと同じく
+    // 表示直前の一時加工にしか使われない。
+    m_exposureAidConfig = cfg;
     refreshDisplayedFrame();
 }
 

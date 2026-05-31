@@ -229,6 +229,7 @@ void exporter_setAcesPipeline(const aces::AcesPipeline &pipeline);
 #include <QUrl>
 #include <QDebug>
 #include <QActionGroup>
+#include "ExposureAids.h"  // EXP-AID: 露出/フォーカス確認エイド (プレビュー表示専用)
 #include <QSignalBlocker>
 #include <QStackedWidget>
 #include <QLineEdit>
@@ -1677,6 +1678,46 @@ void MainWindow::setupMenuBar()
     viewMenu->addSeparator();
     m_workspaceMenu = viewMenu->addMenu(QStringLiteral("ワークスペース(&W)"));
     rebuildWorkspaceMenu();
+
+    // EXP-AID: 露出/フォーカス確認エイド (モニタリング)。フォルスカラー / ゼブラ /
+    // フォーカスピーキング / オフ を排他 (QActionGroup) の checkable 項目として並べ、
+    // 選択を VideoPlayer::setExposureAidMode に流す。これはプレビューの「画面確認用」
+    // オーバーレイで、displayFrame が GL へ渡す直前の表示用コピーにだけ適用される。
+    // 書き出し (renderFrameAt / TimelineFrameRenderer / RenderQueue / Exporter) には
+    // 一切関与しないため、エイドが書き出し画に焼き込まれることはない。
+    viewMenu->addSeparator();
+    auto *monitorMenu = viewMenu->addMenu(QStringLiteral("モニタリング(&M)"));
+    auto *aidGroup = new QActionGroup(this);
+    aidGroup->setExclusive(true);
+
+    struct AidMenuEntry {
+        const char *label;
+        exposureaid::AidMode mode;
+        const char *help;
+    };
+    const AidMenuEntry aidEntries[] = {
+        { "オフ(&O)", exposureaid::AidMode::None,
+          "露出/フォーカス確認エイドを使わない通常表示に戻します。" },
+        { "フォルスカラー(&F)", exposureaid::AidMode::FalseColor,
+          "明るさを色分けして表示し、白飛び/黒つぶれを一目で確認できます。書き出しには焼き込まれません。" },
+        { "ゼブラ(&Z)", exposureaid::AidMode::Zebra,
+          "明るすぎる部分に斜めの縞模様を重ね、白飛び直前の領域を警告します。書き出しには焼き込まれません。" },
+        { "フォーカスピーキング(&P)", exposureaid::AidMode::FocusPeaking,
+          "ピントが合っている輪郭を色で強調し、手動フォーカスを確認しやすくします。書き出しには焼き込まれません。" },
+    };
+    for (const auto &entry : aidEntries) {
+        QAction *act = monitorMenu->addAction(QString::fromUtf8(entry.label));
+        act->setCheckable(true);
+        if (entry.mode == exposureaid::AidMode::None)
+            act->setChecked(true);  // 既定はオフ (従来出力とビット同一)
+        aidGroup->addAction(act);
+        const exposureaid::AidMode mode = entry.mode;
+        connect(act, &QAction::triggered, this, [this, mode]() {
+            if (m_player)
+                m_player->setExposureAidMode(mode);
+        });
+        m_menuHelpEntries.append({act, QString::fromUtf8(entry.help)});
+    }
 
     // トラック メニュー
     auto *trackMenu = menuBar()->addMenu("トラック(&T)");

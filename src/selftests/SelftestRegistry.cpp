@@ -46,6 +46,7 @@ int runDolbyVisionSelftest();
 int runEdlExportSelftest();
 int runE2eSelftest();
 int runEasingSelftest();
+int runExposureAidsSelftest();
 int runExportAuditSelftest();
 int runFcpxmlSelftest();
 int runFrameIoSelftest();
@@ -200,6 +201,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "GpuCompositeMath: paint order, layer transform matrix, premul source-over, matte validity (15 gates)" },
     { "auto-proxy-policy",  "VEDITOR_AUTO_PROXY_POLICY_SELFTEST",  runAutoProxyPolicySelftest,     false,
       "AutoProxyPolicy: heavy-clip detection (width/codec) + useProxyFor/generateFor split + dedup (12 gates)" },
+    { "exposure-aids",      "VEDITOR_EXPOSURE_AIDS_SELFTEST",      runExposureAidsSelftest,        false,
+      "ExposureAids: luma709 oracle + False Color zones + Zebra stripe period + Focus Peaking edge/threshold + dimension/OOB safety (11 gates)" },
     // QApplication-required (needsQApplication=true) ----------------------
     { "parity",            "VEDITOR_PARITY_SELFTEST",             runParitySelftest,             true,
       "Preview vs export pixel-parity (S1-S11, framediff::mse, 10-bit HDR10)" },

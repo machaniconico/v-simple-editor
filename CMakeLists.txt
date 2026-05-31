@@ -221,6 +221,10 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/playback/AutoProxyPolicy.h
     src/playback/AutoProxyPolicy.cpp
     src/selftests/auto_proxy_policy_selftests.cpp
+    # EA (露出/フォーカス確認エイド): False Color / Zebra / Focus Peaking のプレビュー専用純粋エンジン。
+    src/ExposureAids.h
+    src/ExposureAids.cpp
+    src/selftests/exposure_aids_selftests.cpp
     # GPU compositor math (Stage 1 dormant pure engine + headless selftest)。
     src/playback/GpuCompositeMath.h
     src/playback/GpuCompositeMath.cpp

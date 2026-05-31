@@ -20,6 +20,7 @@
 #include "TextManager.h"
 #include "DecoderSlotManager.h"
 #include "AcesColor.h"  // AR-2: ACES シーンリファード色管理パイプライン (SSOT は MainWindow)
+#include "ExposureAids.h"  // EXP-AID: 露出/フォーカス確認エイド (プレビュー表示専用)
 #include "playback/CompositeFrameCache.h"     // ADAPTIVE-1: 合成フレーム LRU キャッシュ
 #include "playback/PlaybackQualityPolicy.h"   // ADAPTIVE-1: 再生品質ヒステリシスポリシー
 #include "playback/GpuLayerCompositor.h"      // STAGE3-GPU: マルチトラック GPU 合成 (既定 OFF)
@@ -112,6 +113,17 @@ public:
     // aces::applyPipelineToImage を適用し、enabled=false なら一切呼ばず従来出力と
     // ビット同一を維持する (回帰ゼロ)。セット時に表示中フレームを即再描画する。
     void setAcesPipeline(const aces::AcesPipeline &pipeline);
+    // EXP-AID: 露出/フォーカス確認エイド (フォルスカラー / ゼブラ / フォーカスピーキング)。
+    // これは「画面確認専用」のオーバーレイで、displayFrame が GL / ラベルへ渡す直前に
+    // 表示用 QImage の一時コピーへのみ適用する。m_currentFrameImage・frameComposited
+    // のペイロード・合成キャッシュ (cachePreviewComposite) には素のフレームが入るので
+    // 汚染しない。書き出し (renderFrameAt / TimelineFrameRenderer / RenderQueue /
+    // Exporter) には一切関与せず、エイドは書き出し画には焼き込まれない。
+    // mode == None (既定) のときは一切呼ばず従来パスとビット同一。set 時に表示中
+    // フレームを即再描画する。
+    void setExposureAidMode(exposureaid::AidMode mode);
+    void setExposureAidConfig(const exposureaid::AidConfig &cfg);
+    exposureaid::AidMode exposureAidMode() const { return m_exposureAidMode; }
     // Transient effect stack applied on top of every composed frame (live dialog preview).
     // Empty vector disables the path. Does not mutate timeline state.
     // live=true keeps CPU effects active during playback (committed state).
@@ -624,6 +636,13 @@ private:
     // displayFrame は enabled=true のときだけ最終合成結果へ適用するので、既定状態では
     // 既存のプレビュー出力とビット同一 (回帰ゼロ)。
     aces::AcesPipeline m_acesPipeline;
+
+    // EXP-AID: 露出/フォーカス確認エイド。既定 None なので displayFrame は apply を
+    // 一切呼ばず従来出力とビット同一 (性能無影響・回帰ゼロ)。None 以外のときだけ
+    // displayFrame 内の 1 箇所で表示用 QImage の一時コピーへ適用する (キャッシュ /
+    // 保持フレーム / 書き出しには非適用)。
+    exposureaid::AidMode m_exposureAidMode = exposureaid::AidMode::None;
+    exposureaid::AidConfig m_exposureAidConfig;
 
     // ---- ADAPTIVE-1: アダプティブプレビュー (品質ポリシー + 合成キャッシュ) --------
     // プレビュー再生パス専用。書き出し (RenderQueue / Exporter / renderFrameAt) は
