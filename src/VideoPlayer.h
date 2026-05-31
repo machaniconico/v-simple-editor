@@ -22,6 +22,8 @@
 #include "AcesColor.h"  // AR-2: ACES シーンリファード色管理パイプライン (SSOT は MainWindow)
 #include "playback/CompositeFrameCache.h"     // ADAPTIVE-1: 合成フレーム LRU キャッシュ
 #include "playback/PlaybackQualityPolicy.h"   // ADAPTIVE-1: 再生品質ヒステリシスポリシー
+#include "playback/GpuLayerCompositor.h"      // STAGE3-GPU: マルチトラック GPU 合成 (既定 OFF)
+#include <memory>                             // STAGE3-GPU: m_gpuCompositor 遅延生成用
 
 // Identifies a per-clip decoder in the V2+ pool. Keyed on
 // (filePath, clipInMs, sourceTrack, sourceClipIndex) so:
@@ -656,6 +658,32 @@ private:
     // size, tier) キーでキャッシュへ put する純ヘルパー。displayFrame は呼ばない。
     // m_adaptivePreviewEnabled=false 時は no-op。
     void cachePreviewComposite(const QImage &composed);
+
+    // ---- STAGE3-GPU: マルチトラックプレビュー GPU 合成 (既定 OFF) -------------
+    // 既定 (VEDITOR_GPU_COMPOSITE 未設定 or "1"以外) では m_gpuCompositeEnabled=false
+    // となり、handlePlaybackTick の合成は従来 CPU 経路 (composeMultiTrackFrameInto
+    // / composeMultiTrackFrame) を一切変えずに通る = 出力ビット同一。
+    //
+    // ON 時 (=="1") かつ 多トラック (overlay layers >= 2) かつ マット無し
+    // (このプレビュー tick の DecodedLayer はマットフィールドを持たず常に matte-free)
+    // かつ compositor.isAvailable() のとき、CPU と同じ layers / 同じ canvas サイズ
+    // (適応縮小後) を GpuLayerInput に詰めて GpuLayerCompositor::composite() で
+    // GPU 合成する。GPU が空 QImage を返したら (GL 失敗) 同 tick 内で CPU 経路へ
+    // フォールバックするので、表示の displayFrame は経路に関わらず常に最大 1 回。
+    //
+    // UI スレッド専用 (GpuLayerCompositor は同一スレッド・非リエントラント契約)。
+    // VideoPlayer は UI スレッドなので OK。書き出しパス (RenderQueue / Exporter /
+    // renderFrameAt) は一切経由しない = 編集↔書き出しピクセル一致 (SSOT) は不変。
+    bool                                m_gpuCompositeChecked = false;
+    bool                                m_gpuCompositeEnabled = false;
+    std::unique_ptr<GpuLayerCompositor> m_gpuCompositor;  // 遅延生成 (初回 GPU 合成時)
+    // 初回 tick で VEDITOR_GPU_COMPOSITE / QSettings を 1 回だけ読み
+    // m_gpuCompositeEnabled をキャッシュする。
+    void ensureGpuCompositeFlag();
+    // GPU 合成を試みる純ヘルパー。成功時に canvas-final な合成 QImage を返す。
+    // 失敗 / 非対象 (flag OFF / 単一トラック / GL 不可) のときは null QImage を返し、
+    // 呼び出し側は従来 CPU 経路へフォールバックする。displayFrame は呼ばない。
+    QImage tryGpuComposeLayers(const QVector<DecodedLayer> &layers, QSize canvas);
 
     // ---- Per-clip decoder pool state (V2+ only) -----------------------------
     // Active V2+ decoders, keyed on TrackKey. V1 never lives here — it

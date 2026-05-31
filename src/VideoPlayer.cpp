@@ -3894,6 +3894,24 @@ void VideoPlayer::handlePlaybackTick()
                     sectionMark = tickTimer.nsecsElapsed();
                 }
                 m_canvasBase.fill(Qt::black);
+                // STAGE3-GPU: 既定 OFF。VEDITOR_GPU_COMPOSITE="1" の時だけ多トラック
+                // (matte-free) を GpuLayerCompositor で GPU 合成する。成功時はこの分岐
+                // 1 本で「合成 → baked mode → cache → displayFrame (1 回)」を完結し、
+                // 下の CPU 経路 (in-place / legacy) はスキップする。GPU が空を返す
+                // (GL 失敗) / flag OFF / 単一トラックなら gpuComposed は null となり、
+                // 従来 CPU 経路へそのままフォールバックする (displayFrame は依然 1 回)。
+                // m_canvasBase.size() を canvas として渡すので CPU と同じ適応縮小解像度。
+                const QImage gpuComposed = tryGpuComposeLayers(layers, m_canvasBase.size());
+                if (!gpuComposed.isNull()) {
+                    if (traceTick)
+                        m_tickTraceComposeNs += tickTimer.nsecsElapsed() - sectionMark;
+                    // CPU 経路と同じ baked-mode: paintGL が m_videoSourceScale を
+                    // 二重適用しないよう viewport を identity 扱いにする。
+                    if (m_glPreview)
+                        m_glPreview->setCompositeBakedMode(true);
+                    cachePreviewComposite(gpuComposed);  // CPU 経路と同じキーで put
+                    displayFrame(gpuComposed);           // 1 tick = 最大 1 displayFrame
+                } else {
                 // Phase 1e Win #7 — in-place compose. Default ON; opt out
                 // via VEDITOR_INPLACE_COMPOSE_DISABLE=1 to fall back to the
                 // legacy composeMultiTrackFrame path that allocates a
@@ -3939,6 +3957,7 @@ void VideoPlayer::handlePlaybackTick()
                     cachePreviewComposite(composed); // ADAPTIVE-1: 上の in-place 分岐と同旨
                     displayFrame(composed);
                 }
+                } // STAGE3-GPU: close `else` (CPU フォールバック経路)
             }
         } else {
             // Every overlay bailed (decoder open failed, slot exhausted).
@@ -4766,6 +4785,84 @@ void VideoPlayer::composeMultiTrackFrameInto(QImage &canvas,
         p.drawImage(0, 0, placed);
     }
     p.end();
+}
+
+// STAGE3-GPU: マルチトラックプレビュー GPU 合成のフラグを 1 回だけ解決する。
+// 既定 (VEDITOR_GPU_COMPOSITE 未設定 or "1"以外) は false → 従来 CPU 経路を
+// 一切変えずに通る (ビット同一)。QSettings "gpuComposite" による任意のメニュー
+// 切替も尊重するが、env が明示されていればそちらを優先する (テスト容易性)。
+void VideoPlayer::ensureGpuCompositeFlag()
+{
+    if (m_gpuCompositeChecked)
+        return;
+    m_gpuCompositeChecked = true;
+    bool enabled = false;
+    const QByteArray env = qgetenv("VEDITOR_GPU_COMPOSITE");
+    if (!env.isEmpty()) {
+        enabled = (env == "1");
+    } else {
+        // env 未設定時のみ QSettings を見る (既定は false)。
+        QSettings settings;
+        enabled = settings.value(QStringLiteral("gpuComposite"), false).toBool();
+    }
+    m_gpuCompositeEnabled = enabled;
+    if (m_gpuCompositeEnabled)
+        qInfo() << "[gpu-composite] enabled (preview multi-track GPU compositing ON)";
+}
+
+// STAGE3-GPU: GPU 合成を試みる。対象外 (flag OFF / 単一トラック / GL 不可) や
+// 失敗時は null QImage を返し、呼び出し側は従来 CPU 経路へフォールバックする。
+// displayFrame は一切呼ばない (表示は呼び出し側の共通 1 箇所が担う)。
+// canvas は CPU 経路と同じ適応縮小後サイズ。layers は CPU 経路と同じ
+// (V1 base + overlays、paint order ソート済) DecodedLayer 群。
+QImage VideoPlayer::tryGpuComposeLayers(const QVector<DecodedLayer> &layers,
+                                        QSize canvas)
+{
+    ensureGpuCompositeFlag();  // 初回 tick で 1 回だけ env/QSettings を解決
+    if (!m_gpuCompositeEnabled)
+        return QImage();
+    // 多トラックのみ対象 (overlay が無いと CPU 経路と同じ単層描画で意味が無い)。
+    if (layers.size() < 2 || canvas.isEmpty())
+        return QImage();
+    // マット無しシーンのみ GPU 化 (Stage3)。このプレビュー tick の DecodedLayer は
+    // マット情報フィールドを持たず常に matte-free だが、将来 DecodedLayer に matte が
+    // 付いた場合に備えて GpuLayerInput.desc.matteType は既定 None のままにする。
+    if (!m_gpuCompositor)
+        m_gpuCompositor = std::make_unique<GpuLayerCompositor>();
+    if (!m_gpuCompositor->isAvailable())
+        return QImage();  // GL 不可 → CPU フォールバック
+
+    // CPU の composeMultiTrackFrameInto が渡すのと同じ layers を GpuLayerInput に
+    // 詰める。フィールドは DecodedLayer → gpucomposite::LayerDesc に 1:1 写像。
+    QVector<GpuLayerInput> inputs;
+    inputs.reserve(layers.size());
+    for (const DecodedLayer &L : layers) {
+        if (L.rgb.isNull() || L.opacity <= 0.001)
+            continue;  // CPU 経路と同じスキップ条件
+        GpuLayerInput in;
+        in.image = L.rgb;
+        in.desc.sourceTrack        = L.sourceTrack;
+        in.desc.srcSize            = L.rgb.size();
+        in.desc.opacity            = L.opacity;
+        in.desc.videoScale         = L.videoScale;
+        in.desc.videoDx            = L.videoDx;
+        in.desc.videoDy            = L.videoDy;
+        in.desc.rotation2DDegrees  = L.rotation2DDegrees;
+        in.desc.visible            = true;
+        in.desc.matteSourceIndex   = -1;  // matte-free
+        in.desc.matteType          = gpucomposite::MatteType::None;
+        inputs.append(in);
+    }
+    if (inputs.size() < 2)
+        return QImage();  // スキップ後に多トラック条件を満たさない → CPU 経路
+
+    // GpuLayerCompositor::composite は内部で gpucomposite::paintOrder により
+    // sourceTrack 降順 (V1-wins) に並べ替えるので、CPU 側の stable_sort と
+    // 同じ V1-frontmost スタッキングになる。空 QImage は GL 失敗のシグナル。
+    QImage out = m_gpuCompositor->composite(inputs, canvas);
+    if (out.isNull() || out.size() != canvas)
+        return QImage();  // 合成失敗 → CPU フォールバック
+    return out;
 }
 
 // decodePoolFrame is decodeNextFrame's V2+ twin: same FFmpeg loop logic but

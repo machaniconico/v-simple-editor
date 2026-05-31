@@ -2,11 +2,13 @@
 
 #include <QOpenGLContext>
 #include <QOffscreenSurface>
+#include <QOpenGLBuffer>
 #include <QOpenGLFramebufferObject>
 #include <QOpenGLFramebufferObjectFormat>
 #include <QOpenGLFunctions>
 #include <QOpenGLShaderProgram>
 #include <QOpenGLTexture>
+#include <QSurface>
 #include <QSurfaceFormat>
 #include <QMatrix4x4>
 #include <QVector>
@@ -55,10 +57,32 @@ void main() {
 namespace {
 
 struct CurrentContextGuard {
-    QOpenGLContext* ctx = nullptr;
+    QOpenGLContext* previousCtx = nullptr;
+    QSurface*       previousSurface = nullptr;
+    QOpenGLContext* targetCtx = nullptr;
+    bool            targetWasMadeCurrent = false;
+
+    explicit CurrentContextGuard(QOpenGLContext* target)
+        : previousCtx(QOpenGLContext::currentContext())
+        , previousSurface(previousCtx ? previousCtx->surface() : nullptr)
+        , targetCtx(target)
+    {
+    }
+
+    bool makeCurrent(QSurface* surface) {
+        if (!targetCtx || !surface)
+            return false;
+        if (!targetCtx->makeCurrent(surface))
+            return false;
+        targetWasMadeCurrent = true;
+        return true;
+    }
+
     ~CurrentContextGuard() {
-        if (ctx)
-            ctx->doneCurrent();
+        if (targetWasMadeCurrent && QOpenGLContext::currentContext() == targetCtx)
+            targetCtx->doneCurrent();
+        if (previousCtx && previousCtx != targetCtx && previousSurface)
+            previousCtx->makeCurrent(previousSurface);
     }
 };
 
@@ -68,15 +92,42 @@ GpuLayerCompositor::GpuLayerCompositor() = default;
 
 GpuLayerCompositor::~GpuLayerCompositor() {
     // Tear down GL objects with the context current, then destroy the context.
+    // (Stage 2's Codex fix: GL resources must be released while the context is
+    // current, NOT after doneCurrent(), or destruction leaks / crashes.)
     if (m_ctx && m_surface) {
-        if (m_ctx->makeCurrent(m_surface)) {
-            m_ctx->doneCurrent();
-        }
+        CurrentContextGuard current(m_ctx);
+        if (current.makeCurrent(m_surface))
+            releaseGlResources();
     }
     delete m_surface;
     m_surface = nullptr;
     delete m_ctx;
     m_ctx = nullptr;
+}
+
+void GpuLayerCompositor::releaseGlResources() {
+    // Caller must hold the owned context CURRENT. Destroys every persistent GL
+    // object (textures, VBO, FBO, program) so their GL handles are freed under
+    // the right context.
+    for (QOpenGLTexture* t : m_texPool) {
+        if (t) {
+            if (t->isCreated())
+                t->destroy();
+            delete t;
+        }
+    }
+    m_texPool.clear();
+
+    if (m_vbo) {
+        if (m_vbo->isCreated())
+            m_vbo->destroy();
+        m_vbo.reset();
+    }
+    m_fbo.reset();   // QOpenGLFramebufferObject dtor frees its GL handle
+    m_prog.reset();  // QOpenGLShaderProgram dtor frees the program
+
+    m_uLayer = m_uProj = m_uTex = m_uOpacity = -1;
+    m_aSrcPos = m_aTexCoord = -1;
 }
 
 bool GpuLayerCompositor::ensureContext() {
@@ -114,7 +165,8 @@ bool GpuLayerCompositor::ensureContext() {
         return false;
     }
 
-    if (!m_ctx->makeCurrent(m_surface)) {
+    CurrentContextGuard current(m_ctx);
+    if (!current.makeCurrent(m_surface)) {
         delete m_surface;
         m_surface = nullptr;
         delete m_ctx;
@@ -122,8 +174,6 @@ bool GpuLayerCompositor::ensureContext() {
         m_available = false;
         return false;
     }
-    m_ctx->doneCurrent();
-
     m_available = true;
     return true;
 }
@@ -132,24 +182,71 @@ bool GpuLayerCompositor::isAvailable() {
     return ensureContext();
 }
 
+bool GpuLayerCompositor::ensureProgram() {
+    // Compile/link the shader program ONCE; reuse on every later composite().
+    if (m_prog)
+        return true;
+
+    auto prog = std::make_unique<QOpenGLShaderProgram>();
+    const bool ok =
+        prog->addShaderFromSourceCode(QOpenGLShader::Vertex, kVertSrc) &&
+        prog->addShaderFromSourceCode(QOpenGLShader::Fragment, kFragSrc) &&
+        prog->link();
+    if (!ok)
+        return false;
+
+    // Cache attribute/uniform locations for the program's lifetime.
+    m_aSrcPos   = prog->attributeLocation("aSrcPos");
+    m_aTexCoord = prog->attributeLocation("aTexCoord");
+    m_uLayer    = prog->uniformLocation("uLayer");
+    m_uProj     = prog->uniformLocation("uProj");
+    m_uTex      = prog->uniformLocation("uTex");
+    m_uOpacity  = prog->uniformLocation("uOpacity");
+
+    m_prog = std::move(prog);
+    return true;
+}
+
+bool GpuLayerCompositor::ensureFbo(QSize canvas) {
+    // Reuse the FBO while its size matches the requested canvas; only rebuild
+    // when the canvas dimensions actually change (the dominant live-preview
+    // case is a fixed canvas, so this allocates exactly once).
+    if (m_fbo && m_fbo->size() == canvas && m_fbo->isValid())
+        return true;
+
+    m_fbo.reset();
+
+    QOpenGLFramebufferObjectFormat fboFmt;
+    fboFmt.setInternalTextureFormat(GL_RGBA8);
+    fboFmt.setAttachment(QOpenGLFramebufferObject::NoAttachment);
+
+    auto fbo = std::make_unique<QOpenGLFramebufferObject>(canvas, fboFmt);
+    if (!fbo->isValid())
+        return false;
+
+    m_fbo = std::move(fbo);
+    return true;
+}
+
 QImage GpuLayerCompositor::composite(const QVector<GpuLayerInput>& layers, QSize canvas) {
     if (canvas.width() <= 0 || canvas.height() <= 0)
         return QImage();
     if (!ensureContext())
         return QImage();
-    if (!m_ctx->makeCurrent(m_surface))
+    CurrentContextGuard current(m_ctx);
+    if (!current.makeCurrent(m_surface))
         return QImage();
-    CurrentContextGuard current{m_ctx};
 
     QOpenGLFunctions* gl = m_ctx->functions();
 
-    // --- Offscreen FBO (canvas, GL_RGBA8) ---
-    QOpenGLFramebufferObjectFormat fboFmt;
-    fboFmt.setInternalTextureFormat(GL_RGBA8);
-    fboFmt.setAttachment(QOpenGLFramebufferObject::NoAttachment);
-    QOpenGLFramebufferObject fbo(canvas, fboFmt);
-    if (!fbo.isValid())
+    // --- Persistent shader program (compiled once, reused) ---
+    if (!ensureProgram())
         return QImage();
+
+    // --- Persistent offscreen FBO (reused while canvas size is unchanged) ---
+    if (!ensureFbo(canvas))
+        return QImage();
+    QOpenGLFramebufferObject& fbo = *m_fbo;
     if (!fbo.bind())
         return QImage();
 
@@ -167,15 +264,8 @@ QImage GpuLayerCompositor::composite(const QVector<GpuLayerInput>& layers, QSize
     gl->glDisable(GL_DEPTH_TEST);
     gl->glDisable(GL_CULL_FACE);
 
-    // --- Shader program ---
-    QOpenGLShaderProgram prog;
-    bool ok = prog.addShaderFromSourceCode(QOpenGLShader::Vertex, kVertSrc) &&
-              prog.addShaderFromSourceCode(QOpenGLShader::Fragment, kFragSrc) &&
-              prog.link();
-    if (!ok) {
-        fbo.release();
-        return QImage();
-    }
+    // --- Bind the persistent shader program ---
+    QOpenGLShaderProgram& prog = *m_prog;
     if (!prog.bind()) {
         fbo.release();
         return QImage();
@@ -188,11 +278,11 @@ QImage GpuLayerCompositor::composite(const QVector<GpuLayerInput>& layers, QSize
     proj.ortho(0.0f, float(canvas.width()),
                float(canvas.height()), 0.0f,
                -1.0f, 1.0f);
-    prog.setUniformValue("uProj", proj);
-    prog.setUniformValue("uTex", 0);
+    prog.setUniformValue(m_uProj, proj);
+    prog.setUniformValue(m_uTex, 0);
 
-    const int aSrcPos   = prog.attributeLocation("aSrcPos");
-    const int aTexCoord = prog.attributeLocation("aTexCoord");
+    const int aSrcPos   = m_aSrcPos;
+    const int aTexCoord = m_aTexCoord;
 
     // Collect LayerDescs for paint-order computation (index-aligned with layers).
     QVector<gpucomposite::LayerDesc> descs;
@@ -203,6 +293,54 @@ QImage GpuLayerCompositor::composite(const QVector<GpuLayerInput>& layers, QSize
     // Back-to-front: paintOrder is DESCENDING sourceTrack, so V1 (lowest) draws
     // LAST and wins (frontmost) under source-over.
     const QVector<int> order = gpucomposite::paintOrder(descs);
+
+    // Persistent VBO for the interleaved (aSrcPos, aTexCoord) quad. Position
+    // depends on per-layer src size, so contents are re-uploaded per draw, but
+    // the buffer object itself is allocated once and reused.
+    if (!m_vbo) {
+        m_vbo = std::make_unique<QOpenGLBuffer>(QOpenGLBuffer::VertexBuffer);
+        if (!m_vbo->create()) {
+            m_vbo.reset();
+            prog.release();
+            fbo.release();
+            return QImage();
+        }
+        m_vbo->setUsagePattern(QOpenGLBuffer::DynamicDraw);
+    }
+
+    // Texture-pool cursor: we hand out one pooled texture per drawn layer and
+    // reuse its GL storage (glTexSubImage2D) when size/format already match.
+    int poolCursor = 0;
+    auto acquireTexture = [&](int w, int h) -> QOpenGLTexture* {
+        if (poolCursor >= m_texPool.size())
+            m_texPool.push_back(nullptr);
+        QOpenGLTexture*& slot = m_texPool[poolCursor];
+        ++poolCursor;
+
+        // Reuse in place if the existing texture already matches w x h RGBA8.
+        if (slot && slot->isCreated() &&
+            slot->width() == w && slot->height() == h &&
+            slot->format() == QOpenGLTexture::RGBA8_UNorm) {
+            return slot;   // storage kept; caller updates via setData (glTexSubImage2D)
+        }
+
+        // Size/format mismatch (or first use): (re)allocate this slot's storage.
+        if (slot) {
+            if (slot->isCreated())
+                slot->destroy();
+            delete slot;
+            slot = nullptr;
+        }
+        auto* tex = new QOpenGLTexture(QOpenGLTexture::Target2D);
+        tex->setFormat(QOpenGLTexture::RGBA8_UNorm);
+        tex->setSize(w, h);
+        tex->setMinificationFilter(QOpenGLTexture::Nearest);
+        tex->setMagnificationFilter(QOpenGLTexture::Nearest);
+        tex->setWrapMode(QOpenGLTexture::ClampToEdge);
+        tex->allocateStorage();
+        slot = tex;
+        return slot;
+    };
 
     for (int idx : order) {
         if (idx < 0 || idx >= layers.size())
@@ -219,24 +357,23 @@ QImage GpuLayerCompositor::composite(const QVector<GpuLayerInput>& layers, QSize
         // format and gives correct premultiplied texels for the blend above.
         QImage img = in.image.convertToFormat(QImage::Format_ARGB32_Premultiplied);
 
-        QOpenGLTexture tex(QOpenGLTexture::Target2D);
-        tex.setFormat(QOpenGLTexture::RGBA8_UNorm);
-        tex.setSize(img.width(), img.height());
-        tex.setMinificationFilter(QOpenGLTexture::Nearest);
-        tex.setMagnificationFilter(QOpenGLTexture::Nearest);
-        tex.setWrapMode(QOpenGLTexture::ClampToEdge);
-        tex.allocateStorage();
+        // Reuse a pooled texture; setData on an already-allocated, matching
+        // texture issues glTexSubImage2D (no reallocation), only re-creating
+        // storage when the layer's size/format changed.
+        QOpenGLTexture* tex = acquireTexture(img.width(), img.height());
+        if (!tex)
+            continue;
         // ARGB32 in memory is BGRA byte order on little-endian -> upload as BGRA.
-        tex.setData(QOpenGLTexture::BGRA, QOpenGLTexture::UInt8, img.constBits());
+        tex->setData(QOpenGLTexture::BGRA, QOpenGLTexture::UInt8, img.constBits());
 
         gl->glActiveTexture(GL_TEXTURE0);
-        tex.bind(0);
+        tex->bind(0);
 
         // src-native -> canvas-pixel (canonical CPU SSOT transform).
         const QMatrix4x4 layerMat =
             gpucomposite::layerTransform(d, canvas);
-        prog.setUniformValue("uLayer", layerMat);
-        prog.setUniformValue("uOpacity",
+        prog.setUniformValue(m_uLayer, layerMat);
+        prog.setUniformValue(m_uOpacity,
                              float(gpucomposite::clampOpacity(d.opacity)));
 
         const float sw = float(img.width());
@@ -253,16 +390,23 @@ QImage GpuLayerCompositor::composite(const QVector<GpuLayerInput>& layers, QSize
             sw,   sh,        1.0f, 1.0f,
         };
 
+        m_vbo->bind();
+        m_vbo->allocate(verts, int(sizeof(verts)));
+
         prog.enableAttributeArray(aSrcPos);
         prog.enableAttributeArray(aTexCoord);
-        prog.setAttributeArray(aSrcPos,   verts,     2, 4 * sizeof(float));
-        prog.setAttributeArray(aTexCoord, verts + 2, 2, 4 * sizeof(float));
+        // Attribute pointers reference the bound VBO (offset-based).
+        prog.setAttributeBuffer(aSrcPos,   GL_FLOAT, 0,
+                                2, 4 * sizeof(float));
+        prog.setAttributeBuffer(aTexCoord, GL_FLOAT, 2 * sizeof(float),
+                                2, 4 * sizeof(float));
 
         gl->glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 
         prog.disableAttributeArray(aSrcPos);
         prog.disableAttributeArray(aTexCoord);
-        tex.release();
+        m_vbo->release();
+        tex->release();
     }
 
     prog.release();

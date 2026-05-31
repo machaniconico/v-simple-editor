@@ -4,6 +4,8 @@
 #include <QSize>
 #include <QVector>
 
+#include <memory>
+
 #include "GpuCompositeMath.h"
 
 // GpuLayerCompositor: Stage 2 of the GPU multi-track compositor.
@@ -46,8 +48,23 @@
 //   * If a GL context cannot be created (headless box, no GL), isAvailable()
 //     returns false and composite() returns a null QImage so the self-test can
 //     SKIP rather than fail.
+//
+// Single-thread / non-reentrant contract
+// ---------------------------------------
+// SAME-THREAD ONLY and NON-REENTRANT. The instance must be constructed, used
+// (isAvailable / composite) and destroyed on ONE thread (Stage 3 wiring calls
+// it from the UI thread). The persistent GL resources below (shader program,
+// FBO, vertex buffers, the layer texture pool) are reused across composite()
+// calls to keep live preview cheap; they are NOT guarded by any lock, so
+// concurrent or re-entrant calls are undefined behaviour. Each composite()
+// makeCurrent()s the owned context, reuses/refreshes resources, then releases
+// it and restores any context that was current before the call.
 class QOpenGLContext;
 class QOffscreenSurface;
+class QOpenGLShaderProgram;
+class QOpenGLFramebufferObject;
+class QOpenGLBuffer;
+class QOpenGLTexture;
 
 // One decoded layer fed to the GPU compositor.
 struct GpuLayerInput {
@@ -74,10 +91,27 @@ public:
     QImage composite(const QVector<GpuLayerInput>& layers, QSize canvas);
 
 private:
-    bool ensureContext();   // lazy GL bring-up; sets m_triedInit / m_available
+    bool ensureContext();    // lazy GL bring-up; sets m_triedInit / m_available
+    bool ensureProgram();    // compile/link shader once; reused thereafter
+    bool ensureFbo(QSize canvas);  // create/keep FBO matching canvas size
+    void releaseGlResources();     // free all GL objects (context must be current)
 
     QOpenGLContext*    m_ctx     = nullptr;
     QOffscreenSurface* m_surface = nullptr;
     bool               m_triedInit = false;
     bool               m_available = false;
+
+    // Persistent, reused GL resources (created lazily under a current context).
+    std::unique_ptr<QOpenGLShaderProgram>        m_prog;   // compiled once
+    std::unique_ptr<QOpenGLFramebufferObject>    m_fbo;    // re-made only on size change
+    std::unique_ptr<QOpenGLBuffer>               m_vbo;    // interleaved srcPos+texCoord quad
+    QVector<QOpenGLTexture*>                      m_texPool; // per-layer texture pool, reused
+
+    // Cached uniform/attribute locations (valid for the life of m_prog).
+    int m_uLayer    = -1;
+    int m_uProj     = -1;
+    int m_uTex      = -1;
+    int m_uOpacity  = -1;
+    int m_aSrcPos   = -1;
+    int m_aTexCoord = -1;
 };
