@@ -229,6 +229,10 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/playback/GpuCompositeMath.h
     src/playback/GpuCompositeMath.cpp
     src/selftests/gpu_composite_math_selftests.cpp
+    # HDR 16-bit compositor math (dormant pure reference engine + headless selftest)。
+    src/playback/HdrCompositeMath.h
+    src/playback/HdrCompositeMath.cpp
+    src/selftests/hdr_composite_math_selftests.cpp
     # GPU layer compositor (Stage 2 offscreen-FBO compositor + GPU/CPU parity selftest)。
     src/playback/GpuLayerCompositor.h
     src/playback/GpuLayerCompositor.cpp
