@@ -51,17 +51,26 @@ using gpucomposite::LayerDesc;
 namespace {
 
 // Build a solid RGBA64-premultiplied image of given size and 16-bit colour.
+// The (r,g,b,a) are stored VERBATIM as premultiplied channels via raw scanline
+// writes — NOT QImage::fill(QColor), which would re-premultiply a straight colour.
+// This matches HdrCompositeMath's raw premultiplied read/write so the literal test
+// numbers round-trip exactly (the hand-derived oracles below treat them as premul).
 QImage solid16(int w, int h, quint16 r, quint16 g, quint16 b, quint16 a) {
     QImage img(w, h, QImage::Format_RGBA64_Premultiplied);
-    QColor c;
-    c.setRgba64(qRgba64(r, g, b, a));
-    img.fill(c);
+    const QRgba64 px = qRgba64(r, g, b, a);
+    for (int y = 0; y < h; ++y) {
+        QRgba64* line = reinterpret_cast<QRgba64*>(img.scanLine(y));
+        for (int x = 0; x < w; ++x) line[x] = px;
+    }
     return img;
 }
 
-// Read a 16-bit premultiplied pixel from an RGBA64 image.
+// Read the RAW 16-bit premultiplied pixel from an RGBA64_Premultiplied image.
+// Deliberately NOT pixelColor() (which un-premultiplies premultiplied formats).
 Rgba16 px16(const QImage& img, int x, int y) {
-    const QRgba64 q = img.pixelColor(x, y).rgba64();
+    const QImage p = (img.format() == QImage::Format_RGBA64_Premultiplied)
+        ? img : img.convertToFormat(QImage::Format_RGBA64_Premultiplied);
+    const QRgba64 q = reinterpret_cast<const QRgba64*>(p.constScanLine(y))[x];
     return Rgba16{ q.red(), q.green(), q.blue(), q.alpha() };
 }
 

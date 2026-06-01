@@ -104,11 +104,22 @@ public:
     // Returns a null QImage if GL is unavailable or canvas is empty.
     QImage composite(const QVector<GpuLayerInput>& layers, QSize canvas);
 
+    // Matte-FREE 16-bit composite (Stage 4C HDR-2). Renders into an RGBA16
+    // offscreen FBO and reads back 16-bit per channel via
+    // glReadPixels(GL_RGBA, GL_UNSIGNED_SHORT). Returns
+    // QImage::Format_RGBA64_Premultiplied, or a NULL QImage if GL or the RGBA16
+    // FBO is unavailable (caller SKIPs). MATTE-FREE: matteType is ignored, no
+    // matte-source exclusion — every isLayerComposited layer is painted plainly
+    // in gpucomposite::paintOrder, mirroring HdrCompositeMath::compositeReference16.
+    // This is a SECOND, independent path; the 8-bit composite() above is unchanged.
+    QImage composite16(const QVector<GpuLayerInput>& layers, QSize canvas);
+
 private:
     bool ensureContext();    // lazy GL bring-up; sets m_triedInit / m_available
     bool ensureProgram();    // compile/link plain layer shader once; reused thereafter
     bool ensureMatteProgram(); // compile/link the two-pass matte shader once; reused
     bool ensureFbo(QSize canvas);  // create/keep MAIN FBO matching canvas size
+    bool ensureFbo16(QSize canvas);// create/keep MAIN RGBA16 FBO matching canvas size
     void releaseGlResources();     // free all GL objects (context must be current)
 
     // Render ONE layer (its layerTransform, opacity=1, premultiplied) into the
@@ -130,11 +141,13 @@ private:
     std::unique_ptr<QOpenGLShaderProgram>        m_prog;   // plain layer shader, compiled once
     std::unique_ptr<QOpenGLShaderProgram>        m_matteProg; // matte combine shader, compiled once
     std::unique_ptr<QOpenGLFramebufferObject>    m_fbo;    // MAIN FBO; re-made only on size change
+    std::unique_ptr<QOpenGLFramebufferObject>    m_fbo16;  // MAIN RGBA16 FBO (composite16); re-made only on size change
     std::unique_ptr<QOpenGLFramebufferObject>    m_matteFboSrc;   // temp: matte'd source render
     std::unique_ptr<QOpenGLFramebufferObject>    m_matteFboMatte; // temp: matte source render
     std::unique_ptr<QOpenGLBuffer>               m_vbo;    // interleaved srcPos+texCoord quad
     std::unique_ptr<QOpenGLBuffer>               m_matteVbo; // full-canvas quad for matte combine
-    QVector<QOpenGLTexture*>                      m_texPool; // per-layer texture pool, reused
+    QVector<QOpenGLTexture*>                      m_texPool; // per-layer texture pool, reused (8-bit)
+    QVector<QOpenGLTexture*>                      m_texPool16; // per-layer texture pool, reused (16-bit composite16)
 
     // Cached uniform/attribute locations (valid for the life of m_prog).
     int m_uLayer    = -1;

@@ -30,17 +30,23 @@ Rgba16 premulSourceOver16(Rgba16 dst, Rgba16 src) {
 
 namespace {
 
-// Reads a premultiplied 16-bit pixel from an RGBA64-premultiplied image.
+// Reads the RAW premultiplied 16-bit pixel from an RGBA64_Premultiplied image.
+// Deliberately NOT QImage::pixelColor(): for premultiplied formats pixelColor()
+// returns the UN-premultiplied (straight) colour, and feeding straight values into
+// the premultiplied source-over below silently corrupts every translucent layer
+// (opaque pixels are unaffected because straight==premultiplied at alpha=MAX, which
+// is why the bug stays invisible until a genuinely translucent source appears).
+// We read the stored premultiplied QRgba64 directly; the caller guarantees the
+// image is Format_RGBA64_Premultiplied.
 inline Rgba16 readPixel16(const QImage& img, int x, int y) {
-    // QColor::rgba64() preserves the full 16-bit channels of an RGBA64 image.
-    const QRgba64 q = img.pixelColor(x, y).rgba64();
+    const QRgba64 q = reinterpret_cast<const QRgba64*>(img.constScanLine(y))[x];
     return Rgba16{ q.red(), q.green(), q.blue(), q.alpha() };
 }
 
+// Writes a RAW premultiplied 16-bit pixel. NOT setPixelColor(), which re-premultiplies
+// a straight QColor — we store the already-premultiplied value verbatim.
 inline void writePixel16(QImage& img, int x, int y, Rgba16 px) {
-    QColor c;
-    c.setRgba64(qRgba64(px.r, px.g, px.b, px.a));
-    img.setPixelColor(x, y, c);
+    reinterpret_cast<QRgba64*>(img.scanLine(y))[x] = qRgba64(px.r, px.g, px.b, px.a);
 }
 
 // Multiplies opacity into a premultiplied 16-bit pixel (all channels scale,

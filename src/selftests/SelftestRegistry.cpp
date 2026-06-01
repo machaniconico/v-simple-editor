@@ -113,6 +113,7 @@ int runPlaybackQualityPolicySelftest();
 int runGpuCompositeMathSelftest();
 int runHdrCompositeMathSelftest();
 int runGpuCompositeParitySelftest();
+int runHdrCompositeParitySelftest();
 
 namespace selftests {
 
@@ -218,6 +219,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Track matte SSOT pixel-match across 4 matte types (luma/alpha/chroma/inv)" },
     { "gpu-composite-parity", "VEDITOR_GPU_COMPOSITE_PARITY_SELFTEST", runGpuCompositeParitySelftest, true,
       "GPU (GpuLayerCompositor FBO) vs CPU SSOT parity, matte-free scenes (SSIM>=0.98, MAE<=3..6/255, 7 gates, graceful GL skip)" },
+    { "hdr-composite-parity", "VEDITOR_HDR_COMPOSITE_PARITY_SELFTEST", runHdrCompositeParitySelftest, true,
+      "GPU RGBA16 FBO (composite16) vs CPU 16-bit oracle (HdrCompositeMath), matte-free (8 gates incl 16-bit precision proof, graceful GL skip)" },
     { "vfx",               "VEDITOR_VFX_SELFTEST",                runVfxSelftest,                true,
       "VFX module smoke: Sprint-6 effect graph + GLSL primitive pipeline" },
     { "pro",               "VEDITOR_PRO_SELFTEST",                runProSelftest,                true,

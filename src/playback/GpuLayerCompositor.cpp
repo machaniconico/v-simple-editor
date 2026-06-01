@@ -15,6 +15,8 @@
 #include <QImage>
 #include <QSet>
 
+#include <cstring>   // std::memcpy (16-bit readback row copy in composite16)
+
 // ---------------------------------------------------------------------------
 // Shaders
 //
@@ -178,6 +180,16 @@ void GpuLayerCompositor::releaseGlResources() {
     }
     m_texPool.clear();
 
+    // 16-bit composite16 texture pool (same ownership rules as m_texPool).
+    for (QOpenGLTexture* t : m_texPool16) {
+        if (t) {
+            if (t->isCreated())
+                t->destroy();
+            delete t;
+        }
+    }
+    m_texPool16.clear();
+
     if (m_vbo) {
         if (m_vbo->isCreated())
             m_vbo->destroy();
@@ -189,6 +201,7 @@ void GpuLayerCompositor::releaseGlResources() {
         m_matteVbo.reset();
     }
     m_fbo.reset();           // QOpenGLFramebufferObject dtor frees its GL handle
+    m_fbo16.reset();         // RGBA16 main FBO (composite16)
     m_matteFboSrc.reset();
     m_matteFboMatte.reset();
     m_prog.reset();          // QOpenGLShaderProgram dtor frees the program
@@ -320,6 +333,30 @@ bool GpuLayerCompositor::ensureFbo(QSize canvas) {
         return false;
 
     m_fbo = std::move(fbo);
+    return true;
+}
+
+bool GpuLayerCompositor::ensureFbo16(QSize canvas) {
+    // RGBA16 sibling of ensureFbo(), used only by composite16(). Reuse while the
+    // size matches; rebuild only on canvas-size change. The internal texture
+    // format is GL_RGBA16 (16 bits per channel) instead of GL_RGBA8. If the GL
+    // driver cannot give a valid RGBA16 FBO we return false so composite16()
+    // gracefully returns a NULL QImage (caller SKIPs) — never a crash or 8-bit
+    // fallback.
+    if (m_fbo16 && m_fbo16->size() == canvas && m_fbo16->isValid())
+        return true;
+
+    m_fbo16.reset();
+
+    QOpenGLFramebufferObjectFormat fboFmt;
+    fboFmt.setInternalTextureFormat(GL_RGBA16);
+    fboFmt.setAttachment(QOpenGLFramebufferObject::NoAttachment);
+
+    auto fbo = std::make_unique<QOpenGLFramebufferObject>(canvas, fboFmt);
+    if (!fbo->isValid())
+        return false;
+
+    m_fbo16 = std::move(fbo);
     return true;
 }
 
@@ -764,5 +801,210 @@ QImage GpuLayerCompositor::composite(const QVector<GpuLayerInput>& layers, QSize
         return QImage();
     if (out.format() != QImage::Format_ARGB32_Premultiplied)
         out = out.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+    return out;
+}
+
+QImage GpuLayerCompositor::composite16(const QVector<GpuLayerInput>& layers, QSize canvas) {
+    // 16-bit-per-channel sibling of composite(), restricted to the MATTE-FREE
+    // plain path (mirrors HdrCompositeMath::compositeReference16). It reuses the
+    // SAME plain-layer shader program (m_prog), the SAME m_vbo, and the SAME
+    // Y-down ortho as composite(); only the FBO format (RGBA16), texture format
+    // (RGBA16), and the read-back (glReadPixels GL_UNSIGNED_SHORT) differ.
+    // Returns a NULL QImage on any GL failure so the caller can SKIP.
+    if (canvas.width() <= 0 || canvas.height() <= 0)
+        return QImage();
+    if (!ensureContext())
+        return QImage();
+    CurrentContextGuard current(m_ctx);
+    if (!current.makeCurrent(m_surface))
+        return QImage();
+
+    QOpenGLFunctions* gl = m_ctx->functions();
+
+    // Reuse the persistent plain-layer program (sampler2D + opacity multiply works
+    // identically for a 16-bit texture).
+    if (!ensureProgram())
+        return QImage();
+
+    // RGBA16 main FBO. If the driver cannot provide a valid RGBA16 FBO, skip.
+    if (!ensureFbo16(canvas))
+        return QImage();
+    QOpenGLFramebufferObject& fbo = *m_fbo16;
+    if (!fbo.bind())
+        return QImage();
+
+    gl->glViewport(0, 0, canvas.width(), canvas.height());
+
+    // Transparent clear (matches the RGBA64 transparent canvas the CPU oracle
+    // starts from).
+    gl->glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    gl->glClear(GL_COLOR_BUFFER_BIT);
+
+    // Premultiplied source-over, identical to composite().
+    gl->glEnable(GL_BLEND);
+    gl->glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA,
+                            GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    gl->glDisable(GL_DEPTH_TEST);
+    gl->glDisable(GL_CULL_FACE);
+
+    QOpenGLShaderProgram& prog = *m_prog;
+    if (!prog.bind()) {
+        fbo.release();
+        return QImage();
+    }
+
+    // SAME Y-down ortho as composite(): canvas-pixel (top-left, Y down) -> NDC.
+    QMatrix4x4 proj;
+    proj.ortho(0.0f, float(canvas.width()),
+               float(canvas.height()), 0.0f,
+               -1.0f, 1.0f);
+    prog.setUniformValue(m_uProj, proj);
+    prog.setUniformValue(m_uTex, 0);
+
+    const int aSrcPos   = m_aSrcPos;
+    const int aTexCoord = m_aTexCoord;
+
+    // Paint order (matte-free: NO matte-source exclusion at all).
+    QVector<gpucomposite::LayerDesc> descs;
+    descs.reserve(layers.size());
+    for (const auto& in : layers)
+        descs.push_back(in.desc);
+    const QVector<int> order = gpucomposite::paintOrder(descs);
+
+    // Persistent VBO (shared with composite()); created lazily here too.
+    if (!m_vbo) {
+        m_vbo = std::make_unique<QOpenGLBuffer>(QOpenGLBuffer::VertexBuffer);
+        if (!m_vbo->create()) {
+            m_vbo.reset();
+            prog.release();
+            fbo.release();
+            return QImage();
+        }
+        m_vbo->setUsagePattern(QOpenGLBuffer::DynamicDraw);
+    }
+
+    // 16-bit texture-pool acquire, analogous to composite()'s acquireTexture but
+    // RGBA16_UNorm. Reuses GL storage in place (glTexSubImage2D via setData) when
+    // size/format already match.
+    int poolCursor = 0;
+    auto acquireTexture16 = [&](int w, int h) -> QOpenGLTexture* {
+        if (poolCursor >= m_texPool16.size())
+            m_texPool16.push_back(nullptr);
+        QOpenGLTexture*& slot = m_texPool16[poolCursor];
+        ++poolCursor;
+
+        if (slot && slot->isCreated() &&
+            slot->width() == w && slot->height() == h &&
+            slot->format() == QOpenGLTexture::RGBA16_UNorm) {
+            return slot;
+        }
+
+        if (slot) {
+            if (slot->isCreated())
+                slot->destroy();
+            delete slot;
+            slot = nullptr;
+        }
+        auto* tex = new QOpenGLTexture(QOpenGLTexture::Target2D);
+        tex->setFormat(QOpenGLTexture::RGBA16_UNorm);
+        tex->setSize(w, h);
+        tex->setMinificationFilter(QOpenGLTexture::Nearest);
+        tex->setMagnificationFilter(QOpenGLTexture::Nearest);
+        tex->setWrapMode(QOpenGLTexture::ClampToEdge);
+        tex->allocateStorage(QOpenGLTexture::RGBA, QOpenGLTexture::UInt16);
+        if (!tex->isCreated() || !tex->isStorageAllocated()) {
+            delete tex;
+            return nullptr;
+        }
+        slot = tex;
+        return slot;
+    };
+
+    for (int idx : order) {
+        if (idx < 0 || idx >= layers.size())
+            continue;
+        const GpuLayerInput& in = layers[idx];
+        const gpucomposite::LayerDesc& d = in.desc;
+
+        if (!gpucomposite::isLayerComposited(d))
+            continue;
+        if (in.image.isNull() || in.image.width() <= 0 || in.image.height() <= 0)
+            continue;
+
+        // MATTE-FREE: matteType is intentionally ignored; no matte-source layer
+        // is skipped. Every composited layer is painted plainly.
+
+        // Upload as RGBA16, PREMULTIPLIED. QRgba64 on little-endian stores the
+        // four shorts in memory order R,G,B,A, which matches GL's RGBA channel
+        // order with QOpenGLTexture::UInt16 — NO swap (unlike the 8-bit BGRA path).
+        QImage img = in.image.convertToFormat(QImage::Format_RGBA64_Premultiplied);
+
+        QOpenGLTexture* tex = acquireTexture16(img.width(), img.height());
+        if (!tex) {
+            prog.release();
+            fbo.release();
+            return QImage();
+        }
+        tex->setData(QOpenGLTexture::RGBA, QOpenGLTexture::UInt16, img.constBits());
+
+        gl->glActiveTexture(GL_TEXTURE0);
+        tex->bind(0);
+
+        const QMatrix4x4 layerMat = gpucomposite::layerTransform(d, canvas);
+        prog.setUniformValue(m_uLayer, layerMat);
+        prog.setUniformValue(m_uOpacity,
+                             float(gpucomposite::clampOpacity(d.opacity)));
+
+        const float sw = float(img.width());
+        const float sh = float(img.height());
+        const float verts[] = {
+            //  aSrcPos      aTexCoord
+            0.0f, 0.0f,      0.0f, 0.0f,
+            sw,   0.0f,      1.0f, 0.0f,
+            0.0f, sh,        0.0f, 1.0f,
+            sw,   sh,        1.0f, 1.0f,
+        };
+
+        m_vbo->bind();
+        m_vbo->allocate(verts, int(sizeof(verts)));
+        prog.enableAttributeArray(aSrcPos);
+        prog.enableAttributeArray(aTexCoord);
+        prog.setAttributeBuffer(aSrcPos,   GL_FLOAT, 0, 2, 4 * sizeof(float));
+        prog.setAttributeBuffer(aTexCoord, GL_FLOAT, 2 * sizeof(float), 2, 4 * sizeof(float));
+
+        gl->glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+        prog.disableAttributeArray(aSrcPos);
+        prog.disableAttributeArray(aTexCoord);
+        m_vbo->release();
+        tex->release();
+    }
+
+    prog.release();
+
+    // 16-bit read-back. QOpenGLFramebufferObject::toImage() is 8-BIT ONLY and
+    // must NOT be used here — we read the RGBA16 framebuffer directly as
+    // GL_UNSIGNED_SHORT into a w*h*4 quint16 buffer.
+    const int w = canvas.width();
+    const int h = canvas.height();
+    QVector<quint16> buf(w * h * 4);
+    gl->glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_SHORT, buf.data());
+
+    fbo.release();
+
+    // Build a top-left-origin RGBA64_Premultiplied QImage. GL row 0 is the BOTTOM
+    // of the framebuffer, and our Y-down ortho put canvas-y=0 (image TOP) into the
+    // LAST GL row, so we flip vertically on copy: dest scanline y comes from GL row
+    // (h-1-y). Each RGBA64 scanline is w*4 shorts in R,G,B,A order, matching the
+    // glReadPixels GL_RGBA/UInt16 layout exactly — a straight memcpy per row.
+    QImage out(canvas, QImage::Format_RGBA64_Premultiplied);
+    if (out.isNull())
+        return QImage();
+    const int rowShorts = w * 4;
+    const size_t rowBytes = size_t(rowShorts) * sizeof(quint16);
+    for (int y = 0; y < h; ++y) {
+        const quint16* srcRow = buf.constData() + size_t(h - 1 - y) * rowShorts;
+        std::memcpy(out.scanLine(y), srcRow, rowBytes);
+    }
     return out;
 }
