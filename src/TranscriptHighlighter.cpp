@@ -13,6 +13,7 @@
 #include <QStringList>
 #include <QUrl>
 
+#include <algorithm>
 #include <exception>
 
 namespace transcripthl {
@@ -96,10 +97,126 @@ QString anthropicResponseText(const QByteArray& payload)
     return QString::fromUtf8(payload);
 }
 
-QString sendAnthropicPrompt(const HighlightRequest& req, const QString& prompt, QString* err)
+QString anthropicApiKey()
 {
-    const QString apiKey = creds::CredentialStore::get(
+    return creds::CredentialStore::get(
         "ANTHROPIC_API_KEY", QStringLiteral("apiKeys/anthropic"));
+}
+
+bool transcriptRange(const QList<caption::Clip>& transcript, qint64* minStartMs, qint64* maxEndMs)
+{
+    bool haveRange = false;
+    qint64 minStart = 0;
+    qint64 maxEnd = 0;
+    for (const caption::Clip& clip : transcript) {
+        if (!haveRange) {
+            minStart = clip.startMs;
+            maxEnd = clip.endMs;
+            haveRange = true;
+        } else {
+            minStart = qMin(minStart, clip.startMs);
+            maxEnd = qMax(maxEnd, clip.endMs);
+        }
+    }
+
+    if (minStartMs)
+        *minStartMs = minStart;
+    if (maxEndMs)
+        *maxEndMs = maxEnd;
+    return haveRange;
+}
+
+void clampHighlightsToTranscript(QVector<Highlight>* highlights, const QList<caption::Clip>& transcript)
+{
+    if (!highlights)
+        return;
+
+    qint64 minStartMs = 0;
+    qint64 maxEndMs = 0;
+    if (!transcriptRange(transcript, &minStartMs, &maxEndMs))
+        return;
+
+    const double minStart = minStartMs / 1000.0;
+    const double maxEnd = maxEndMs / 1000.0;
+    for (Highlight& highlight : *highlights) {
+        highlight.startTime = qBound(minStart, highlight.startTime, maxEnd);
+        highlight.endTime = qBound(minStart, highlight.endTime, maxEnd);
+        if (highlight.endTime < highlight.startTime)
+            highlight.endTime = highlight.startTime;
+    }
+}
+
+int countOccurrences(const QString& text, const QString& needle)
+{
+    if (text.isEmpty() || needle.isEmpty())
+        return 0;
+
+    int count = 0;
+    int index = text.indexOf(needle, 0, Qt::CaseInsensitive);
+    while (index >= 0) {
+        ++count;
+        index = text.indexOf(needle, index + needle.size(), Qt::CaseInsensitive);
+    }
+    return count;
+}
+
+int salientKeywordCount(const QString& text)
+{
+    static const QStringList keywords = {
+        QStringLiteral("amazing"),
+        QStringLiteral("breakthrough"),
+        QStringLiteral("challenge"),
+        QStringLiteral("critical"),
+        QStringLiteral("fail"),
+        QStringLiteral("finally"),
+        QStringLiteral("highlight"),
+        QStringLiteral("important"),
+        QStringLiteral("key"),
+        QStringLiteral("launch"),
+        QStringLiteral("lesson"),
+        QStringLiteral("major"),
+        QStringLiteral("mistake"),
+        QStringLiteral("problem"),
+        QStringLiteral("react"),
+        QStringLiteral("result"),
+        QStringLiteral("reveal"),
+        QStringLiteral("secret"),
+        QStringLiteral("shocking"),
+        QStringLiteral("solution"),
+        QStringLiteral("surprising"),
+        QStringLiteral("unexpected"),
+        QStringLiteral("win"),
+        QStringLiteral("課題"),
+        QStringLiteral("結論"),
+        QStringLiteral("結果"),
+        QStringLiteral("重要"),
+        QStringLiteral("成功"),
+        QStringLiteral("失敗"),
+        QStringLiteral("発見"),
+        QStringLiteral("発表"),
+        QStringLiteral("理由"),
+        QStringLiteral("解決"),
+        QStringLiteral("驚")
+    };
+
+    int count = 0;
+    for (const QString& keyword : keywords)
+        count += countOccurrences(text, keyword);
+    return count;
+}
+
+int emphasisCount(const QString& text)
+{
+    int count = 0;
+    for (const QChar ch : text) {
+        if (ch == QLatin1Char('!') || ch == QLatin1Char('?'))
+            ++count;
+    }
+    return count;
+}
+
+QString sendAnthropicPrompt(const HighlightRequest& req, const QString& prompt, const QString& apiKey, QString* err)
+{
     if (apiKey.trimmed().isEmpty()) {
         if (err)
             *err = QStringLiteral("no api key");
@@ -240,6 +357,81 @@ QVector<Highlight> TranscriptHighlighter::parseHighlights(const QString& json, Q
     return highlights;
 }
 
+QVector<Highlight> TranscriptHighlighter::detectOffline(const QList<caption::Clip>& transcript, int targetCount)
+{
+    const int safeTargetCount = qMax(0, targetCount);
+    if (transcript.isEmpty() || safeTargetCount == 0)
+        return QVector<Highlight>();
+
+    struct Candidate {
+        Highlight highlight;
+        double rawScore = 0.0;
+    };
+
+    QVector<Candidate> candidates;
+    candidates.reserve(transcript.size());
+
+    double maxRawScore = 0.0;
+    for (const caption::Clip& clip : transcript) {
+        const QString text = clip.text.trimmed();
+        const int keywordCount = salientKeywordCount(text);
+        const int marks = emphasisCount(text);
+        const double durationSeconds = qMax(0.25, static_cast<double>(clip.endMs - clip.startMs) / 1000.0);
+        const double speechRate = static_cast<double>(text.size()) / durationSeconds;
+
+        const double keywordScore = qBound(0.0, static_cast<double>(keywordCount) / 3.0, 1.0);
+        const double rateScore = qBound(0.0, speechRate / 18.0, 1.0);
+        const double lengthScore = qBound(0.0, static_cast<double>(text.size()) / 120.0, 1.0);
+        const double emphasisScore = qBound(0.0, static_cast<double>(marks) / 2.0, 1.0);
+        const double rawScore = (0.50 * keywordScore)
+            + (0.25 * rateScore)
+            + (0.10 * lengthScore)
+            + (0.15 * emphasisScore);
+
+        Highlight highlight;
+        highlight.startTime = clip.startMs / 1000.0;
+        highlight.endTime = clip.endMs / 1000.0;
+        highlight.score = rawScore;
+        highlight.type = HighlightType::SpeechSegment;
+        highlight.description = QStringLiteral("offline heuristic: keywords=%1 rate=%2/s emphasis=%3")
+            .arg(keywordCount)
+            .arg(speechRate, 0, 'f', 1)
+            .arg(marks);
+
+        Candidate candidate;
+        candidate.highlight = highlight;
+        candidate.rawScore = rawScore;
+        candidates.append(candidate);
+        maxRawScore = qMax(maxRawScore, rawScore);
+    }
+
+    for (Candidate& candidate : candidates) {
+        candidate.highlight.score = maxRawScore > 0.0
+            ? qBound(0.0, candidate.rawScore / maxRawScore, 1.0)
+            : 0.0;
+    }
+
+    QVector<Highlight> highlights;
+    highlights.reserve(candidates.size());
+    for (const Candidate& candidate : candidates)
+        highlights.append(candidate.highlight);
+
+    clampHighlightsToTranscript(&highlights, transcript);
+
+    std::stable_sort(highlights.begin(), highlights.end(), [](const Highlight& lhs, const Highlight& rhs) {
+        if (lhs.score > rhs.score)
+            return true;
+        if (lhs.score < rhs.score)
+            return false;
+        return lhs.startTime < rhs.startTime;
+    });
+
+    if (highlights.size() > safeTargetCount)
+        highlights.resize(safeTargetCount);
+
+    return highlights;
+}
+
 QVector<Highlight> TranscriptHighlighter::detect(const HighlightRequest& req, SendFn sender, QString* err)
 {
     if (err)
@@ -250,6 +442,7 @@ QVector<Highlight> TranscriptHighlighter::detect(const HighlightRequest& req, Se
         return QVector<Highlight>();
 
     const QString prompt = buildPrompt(req.transcript, targetCount);
+    const QString provider = req.provider.trimmed();
 
     QString sendError;
     QString raw;
@@ -257,13 +450,18 @@ QVector<Highlight> TranscriptHighlighter::detect(const HighlightRequest& req, Se
         if (sender) {
             raw = sender(prompt, &sendError);
         } else {
-            if (!req.provider.trimmed().isEmpty()
-                && req.provider.compare(QStringLiteral("anthropic"), Qt::CaseInsensitive) != 0) {
+            const QString apiKey = anthropicApiKey();
+            const bool offlineProvider = provider.isEmpty()
+                || provider.compare(QStringLiteral("offline"), Qt::CaseInsensitive) == 0;
+            if (offlineProvider || apiKey.trimmed().isEmpty())
+                return detectOffline(req.transcript, targetCount);
+
+            if (provider.compare(QStringLiteral("anthropic"), Qt::CaseInsensitive) != 0) {
                 if (err)
                     *err = QStringLiteral("unsupported provider");
                 return QVector<Highlight>();
             }
-            raw = sendAnthropicPrompt(req, prompt, &sendError);
+            raw = sendAnthropicPrompt(req, prompt, apiKey, &sendError);
         }
     } catch (const std::exception& ex) {
         if (err)
@@ -297,30 +495,7 @@ QVector<Highlight> TranscriptHighlighter::detect(const HighlightRequest& req, Se
         return QVector<Highlight>();
     }
 
-    qint64 minStartMs = 0;
-    qint64 maxEndMs = 0;
-    bool haveRange = false;
-    for (const caption::Clip& clip : req.transcript) {
-        if (!haveRange) {
-            minStartMs = clip.startMs;
-            maxEndMs = clip.endMs;
-            haveRange = true;
-        } else {
-            minStartMs = qMin(minStartMs, clip.startMs);
-            maxEndMs = qMax(maxEndMs, clip.endMs);
-        }
-    }
-
-    if (haveRange) {
-        const double minStart = minStartMs / 1000.0;
-        const double maxEnd = maxEndMs / 1000.0;
-        for (Highlight& highlight : highlights) {
-            highlight.startTime = qBound(minStart, highlight.startTime, maxEnd);
-            highlight.endTime = qBound(minStart, highlight.endTime, maxEnd);
-            if (highlight.endTime < highlight.startTime)
-                highlight.endTime = highlight.startTime;
-        }
-    }
+    clampHighlightsToTranscript(&highlights, req.transcript);
 
     if (highlights.size() > targetCount)
         highlights.resize(targetCount);

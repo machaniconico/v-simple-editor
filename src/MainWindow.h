@@ -606,6 +606,7 @@ private:
     void hideWelcomeScreen();
     void loadMediaFile(const QString &filePath, bool addToTimeline, const QString &statusPrefix);
     void updateStatusInfo();
+    void updateAcesUiState();
     void updateEditActions();
     void applyProjectConfig(const ProjectConfig &config);
     void updateTitle();
@@ -720,6 +721,7 @@ private:
     QAction *m_undoAction;
     QAction *m_redoAction;
     QAction *m_snapAction;
+    QAction *m_colorManagementAction = nullptr;
     Exporter *m_exporter;
     QString m_projectFilePath; // current .veditor file
     MultiCamSession *m_multiCam = nullptr;
@@ -806,6 +808,7 @@ private:
     QLabel *m_statusFps = nullptr;
     QLabel *m_statusDuration = nullptr;
     QLabel *m_statusTheme = nullptr;
+    QLabel *m_statusAces = nullptr;
     bool m_hasContent = false;
     bool m_autoSaveStarted = false;
 

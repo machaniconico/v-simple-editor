@@ -91,6 +91,7 @@ int runTrackMatteParitySelftest();
 int runTrackMatteReindexSelftest();
 int runTrackMatteRm5ReorderSelftest();
 int runTrackMatteRm6DuplicateSelftest();
+int runTranscriptHighlighterOfflineSelftest();
 int runTranscriptHighlighterSelftest();
 int runTrackerPresetSelftest();
 int runTrimOpsSelftest();
@@ -192,6 +193,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "WorkspaceManager: named layout CRUD + base64 blob JSON round-trip" },
     { "text-based-edit",   "VEDITOR_TEXT_BASED_EDIT_SELFTEST",    runTextBasedEditSelftest,      false,
       "TextBasedEdit: transcript search + deletion range merge + kept complement" },
+    { "transcript-highlighter-offline", "VEDITOR_TRANSCRIPT_HIGHLIGHTER_OFFLINE_SELFTEST", runTranscriptHighlighterOfflineSelftest, false,
+      "TranscriptHighlighter offline deterministic scorer (headless, 8 gates)" },
     { "pptx-export",      "VEDITOR_PPTX_EXPORT_SELFTEST",        runPptxExportSelftest,         false,
       "PptxExport: OOXML part tree + store-ZIP/CRC32 + slide XML well-formed + escaping" },
     { "asc-cdl-export",   "VEDITOR_ASC_CDL_EXPORT_SELFTEST",     runAscCdlExportSelftest,       false,

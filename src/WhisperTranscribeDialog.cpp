@@ -38,6 +38,12 @@ WhisperTranscribeDialog::WhisperTranscribeDialog(QWidget* parent)
         }
     }
 
+    m_engineWarningLabel = new QLabel(
+        QStringLiteral("外部エンジン(whisper-cli)が見つかりません。サンプル文字起こしになります。PATH に whisper-cli を配置してください。"),
+        this);
+    m_engineWarningLabel->setWordWrap(true);
+    m_engineWarningLabel->setStyleSheet(QStringLiteral("color: #b00020; font-weight: 600;"));
+
     // --- 言語 ---
     m_languageCombo = new QComboBox(this);
     m_languageCombo->addItem(tr("自動 (auto)"), QStringLiteral("auto"));
@@ -63,15 +69,20 @@ WhisperTranscribeDialog::WhisperTranscribeDialog(QWidget* parent)
     // --- レイアウト ---
     auto* mainLayout = new QVBoxLayout(this);
     mainLayout->addLayout(formLayout);
+    mainLayout->addWidget(m_engineWarningLabel);
     mainLayout->addWidget(m_resultLabel);
     mainLayout->addWidget(m_buttonBox);
 
     // --- 接続 ---
     connect(m_browseButton, &QPushButton::clicked, this, &WhisperTranscribeDialog::onBrowseClicked);
     connect(m_pathEdit, &QLineEdit::textChanged, this, &WhisperTranscribeDialog::updateAcceptState);
+    connect(m_modelCombo, &QComboBox::currentTextChanged, this, [this](const QString&) {
+        updateRecognizerWarning();
+    });
     connect(m_buttonBox, &QDialogButtonBox::accepted, this, &QDialog::accept);
     connect(m_buttonBox, &QDialogButtonBox::rejected, this, &QDialog::reject);
 
+    updateRecognizerWarning();
     updateAcceptState();
 }
 
@@ -117,4 +128,21 @@ void WhisperTranscribeDialog::updateAcceptState()
             b->setEnabled(hasPath);
         }
     }
+}
+
+void WhisperTranscribeDialog::updateRecognizerWarning()
+{
+    const QList<QSharedPointer<speech::Recognizer>> recognizers = speech::availableRecognizers();
+    bool hasExternalRecognizer = false;
+    for (const QSharedPointer<speech::Recognizer>& recognizer : recognizers) {
+        if (recognizer
+            && recognizer->isAvailable()
+            && recognizer->name() != QStringLiteral("Stub")) {
+            hasExternalRecognizer = true;
+            break;
+        }
+    }
+
+    const bool selectedStub = m_modelCombo->currentText() == QStringLiteral("Stub");
+    m_engineWarningLabel->setVisible(selectedStub && !hasExternalRecognizer);
 }

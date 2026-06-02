@@ -24,6 +24,7 @@ public:
     static QString buildPrompt(const QList<caption::Clip>& transcript, int targetCount);
     static QString extractJsonObject(const QString& raw, QString* err = nullptr);
     static QVector<Highlight> parseHighlights(const QString& json, QString* err = nullptr);
+    static QVector<Highlight> detectOffline(const QList<caption::Clip>& transcript, int targetCount);
     QVector<Highlight> detect(const HighlightRequest& req, SendFn sender = nullptr, QString* err = nullptr);
 };
 

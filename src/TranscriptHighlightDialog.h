@@ -36,6 +36,7 @@ private:
     QComboBox*        m_providerCombo = nullptr;
     QSpinBox*         m_countSpin     = nullptr;
     QLabel*           m_descLabel     = nullptr;
+    QLabel*           m_apiKeyWarningLabel = nullptr;
     QPlainTextEdit*   m_resultEdit    = nullptr;
     QDialogButtonBox* m_buttonBox     = nullptr;
 };

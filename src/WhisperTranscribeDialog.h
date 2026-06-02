@@ -29,12 +29,14 @@ public:
 private slots:
     void onBrowseClicked();
     void updateAcceptState();
+    void updateRecognizerWarning();
 
 private:
     QLineEdit*        m_pathEdit       = nullptr;
     QPushButton*      m_browseButton   = nullptr;
     QComboBox*        m_modelCombo     = nullptr;
     QComboBox*        m_languageCombo  = nullptr;
+    QLabel*           m_engineWarningLabel = nullptr;
     QLabel*           m_resultLabel    = nullptr;
     QDialogButtonBox* m_buttonBox      = nullptr;
 };

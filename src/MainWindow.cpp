@@ -849,6 +849,7 @@ MainWindow::MainWindow(QWidget *parent)
     // Setup permanent status bar widgets
     setupStatusBarWidgets();
     updateStatusInfo();
+    updateAcesUiState();
 
     statusBar()->showMessage("準備完了 — ファイル > 新規プロジェクトから開始してください");
 
@@ -2707,13 +2708,15 @@ void MainWindow::setupMenuBar()
         QStringLiteral("HDR10 / HLG / PQ トーンマッピングを使った HDR カラーグレーディングを行います。")});
 
     // AC-4: ACES シーンリファード色管理 (IDT/RRT/ODT)。
-    auto *colorManagementAction = toolsMenu->addAction(
+    m_colorManagementAction = toolsMenu->addAction(
         QStringLiteral("カラーマネジメント (ACES)…"));
-    colorManagementAction->setObjectName("action_color_management");
-    connect(colorManagementAction, &QAction::triggered,
+    m_colorManagementAction->setObjectName("action_color_management");
+    m_colorManagementAction->setCheckable(true);
+    connect(m_colorManagementAction, &QAction::triggered,
             this, &MainWindow::openColorManagement);
-    m_menuHelpEntries.append({colorManagementAction,
+    m_menuHelpEntries.append({m_colorManagementAction,
         QStringLiteral("ACES のシーンリファード色管理 (入力/作業/出力色空間) を設定します。")});
+    updateAcesUiState();
 
     // DV-4: Dolby Vision 動的メタデータ (Level1/2/5/6) の編集 + DV XML エクスポート。
     auto *dolbyVisionAction = toolsMenu->addAction(
@@ -4598,6 +4601,7 @@ void MainWindow::applyLoadedProjectData(const ProjectData &data, const QString &
     if (m_player)
         m_player->setAcesPipeline(m_acesPipeline);
     exporter_setAcesPipeline(m_acesPipeline);
+    updateAcesUiState();
 
     // DV-4: Dolby Vision メタデータを復元 (SSOT)。
     m_dolbyVision = data.dolbyVision;
@@ -10771,6 +10775,7 @@ void MainWindow::openSpectralRepair()
 //       enabled=false のときは双方とも no-op で従来出力とビット同一 (回帰ゼロ)。
 void MainWindow::openColorManagement()
 {
+    updateAcesUiState();
     ColorManagementDialog dlg(this);
     dlg.setPipeline(m_acesPipeline);
     if (dlg.exec() == QDialog::Accepted) {
@@ -10789,6 +10794,7 @@ void MainWindow::openColorManagement()
         statusBar()->showMessage(
             QStringLiteral("カラーマネジメント (ACES): %1").arg(state), 4000);
     }
+    updateAcesUiState();
 }
 
 // DV-4: Dolby Vision メタデータ設定ダイアログ。SSOT である m_dolbyVision を編集対象
@@ -11105,6 +11111,7 @@ void MainWindow::setupStatusBarWidgets()
     m_statusResolution = makeLabel("1920x1080");
     m_statusFps = makeLabel("30 fps");
     m_statusDuration = makeLabel("00:00:00");
+    m_statusAces = makeLabel(QStringLiteral("ACES: 無効"));
     m_statusTheme = makeLabel("Dark");
 }
 
@@ -11128,6 +11135,25 @@ void MainWindow::updateStatusInfo()
 
     if (m_statusTheme)
         m_statusTheme->setText(ThemeManager::themeName(ThemeManager::instance().currentTheme()));
+}
+
+void MainWindow::updateAcesUiState()
+{
+    if (m_colorManagementAction) {
+        QSignalBlocker blocker(m_colorManagementAction);
+        m_colorManagementAction->setChecked(m_acesPipeline.enabled);
+    }
+
+    if (m_statusAces) {
+        const QString text = m_acesPipeline.enabled
+            ? QStringLiteral("ACES: 有効 (%1→%2→%3)")
+                  .arg(aces::colorSpaceName(m_acesPipeline.input),
+                       aces::colorSpaceName(m_acesPipeline.working),
+                       aces::colorSpaceName(m_acesPipeline.output))
+            : QStringLiteral("ACES: 無効");
+        m_statusAces->setText(text);
+        m_statusAces->setToolTip(QStringLiteral("カラーマネジメント (ACES)"));
+    }
 }
 
 void MainWindow::testLoadFile(const QString &filePath)

@@ -1,5 +1,7 @@
 #include "TranscriptHighlightDialog.h"
 
+#include "CredentialStore.h"
+
 #include <QAbstractButton>
 #include <QComboBox>
 #include <QDialogButtonBox>
@@ -18,6 +20,7 @@ TranscriptHighlightDialog::TranscriptHighlightDialog(QWidget* parent)
     // --- プロバイダ ---
     m_providerCombo = new QComboBox(this);
     m_providerCombo->addItem(tr("Anthropic Claude (anthropic)"), QStringLiteral("anthropic"));
+    m_providerCombo->addItem(tr("オフライン (ヒューリスティック)"), QStringLiteral("offline"));
     m_providerCombo->addItem(tr("OpenAI (openai)"), QStringLiteral("openai"));
     m_providerCombo->addItem(tr("Google Gemini (gemini)"), QStringLiteral("gemini"));
 
@@ -32,6 +35,12 @@ TranscriptHighlightDialog::TranscriptHighlightDialog(QWidget* parent)
            "API キーは設定から登録してください。"),
         this);
     m_descLabel->setWordWrap(true);
+
+    m_apiKeyWarningLabel = new QLabel(
+        tr("ANTHROPIC_API_KEY が未設定です。オフライン検出(ヒューリスティック)に切り替えてください。"),
+        this);
+    m_apiKeyWarningLabel->setWordWrap(true);
+    m_apiKeyWarningLabel->setVisible(false);
 
     // --- フォーム ---
     auto* formLayout = new QFormLayout;
@@ -51,12 +60,15 @@ TranscriptHighlightDialog::TranscriptHighlightDialog(QWidget* parent)
     auto* mainLayout = new QVBoxLayout(this);
     mainLayout->addWidget(m_descLabel);
     mainLayout->addLayout(formLayout);
+    mainLayout->addWidget(m_apiKeyWarningLabel);
     mainLayout->addWidget(m_resultEdit);
     mainLayout->addWidget(m_buttonBox);
 
     // --- 接続 ---
     connect(m_buttonBox, &QDialogButtonBox::accepted, this, &QDialog::accept);
     connect(m_buttonBox, &QDialogButtonBox::rejected, this, &QDialog::reject);
+    connect(m_providerCombo, static_cast<void (QComboBox::*)(int)>(&QComboBox::currentIndexChanged),
+            this, [this](int) { updateDetectState(); });
 
     updateDetectState();
 }
@@ -83,6 +95,12 @@ transcripthl::HighlightRequest TranscriptHighlightDialog::request() const
 
 void TranscriptHighlightDialog::updateDetectState()
 {
+    const bool isAnthropic =
+        m_providerCombo->currentData().toString() == QStringLiteral("anthropic");
+    const QString apiKey = creds::CredentialStore::get(
+        "ANTHROPIC_API_KEY", QStringLiteral("apiKeys/anthropic"));
+    m_apiKeyWarningLabel->setVisible(isAnthropic && apiKey.trimmed().isEmpty());
+
     // transcript が空のときは検出ボタンを disable
     const bool hasTranscript = !m_transcript.isEmpty();
     const auto buttons = m_buttonBox->buttons();

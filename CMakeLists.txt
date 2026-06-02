@@ -327,6 +327,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/WhisperTranscribeDialog.cpp
     src/selftests/whisper_transcribe_selftest.cpp
     src/selftests/transcript_highlighter_selftest.cpp
+    src/selftests/transcript_highlighter_offline_selftest.cpp
     src/MotionTracker.cpp
     src/MotionTrackerDialog.h
     src/MotionTrackerDialog.cpp

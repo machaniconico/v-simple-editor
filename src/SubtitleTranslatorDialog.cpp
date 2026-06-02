@@ -7,6 +7,7 @@
 #include <QFileDialog>
 #include <QMessageBox>
 #include <QLabel>
+#include <QLineEdit>
 
 SubtitleTranslatorDialog::SubtitleTranslatorDialog(QWidget *parent)
     : QDialog(parent)
@@ -21,6 +22,19 @@ SubtitleTranslatorDialog::SubtitleTranslatorDialog(QWidget *parent)
     m_providerCombo->addItem(tr("Stub (offline)"),  static_cast<int>(subxlat::Provider::Stub));
     m_providerCombo->addItem(tr("Google Translate"), static_cast<int>(subxlat::Provider::GoogleV2));
     m_providerCombo->addItem(tr("DeepL"),            static_cast<int>(subxlat::Provider::DeepL));
+
+    const subxlat::TranslateConfig defaultCfg = subxlat::TranslateConfig::defaultConfig();
+
+    // --- API key ---
+    m_apiKeyEdit = new QLineEdit(this);
+    m_apiKeyEdit->setText(defaultCfg.apiKey);
+    m_apiKeyEdit->setEchoMode(QLineEdit::PasswordEchoOnEdit);
+
+    m_apiWarningLabel = new QLabel(
+        QStringLiteral("翻訳APIキーが未設定です。[言語]を前置するスタブ動作になります。実翻訳には API キーと provider 設定が必要です。"),
+        this);
+    m_apiWarningLabel->setWordWrap(true);
+    m_apiWarningLabel->setStyleSheet(QStringLiteral("color: #b00020; font-weight: 600;"));
 
     // --- target language combo ---
     m_targetLangCombo = new QComboBox(this);
@@ -40,6 +54,7 @@ SubtitleTranslatorDialog::SubtitleTranslatorDialog(QWidget *parent)
     // --- layout ---
     QFormLayout *form = new QFormLayout;
     form->addRow(tr("Provider:"),     m_providerCombo);
+    form->addRow(tr("API key:"),      m_apiKeyEdit);
     form->addRow(tr("Target lang:"),  m_targetLangCombo);
 
     QHBoxLayout *btnRow = new QHBoxLayout;
@@ -49,6 +64,7 @@ SubtitleTranslatorDialog::SubtitleTranslatorDialog(QWidget *parent)
 
     QVBoxLayout *root = new QVBoxLayout(this);
     root->addLayout(form);
+    root->addWidget(m_apiWarningLabel);
     root->addLayout(btnRow);
     root->addWidget(new QLabel(tr("Preview:"), this));
     root->addWidget(m_preview);
@@ -56,11 +72,22 @@ SubtitleTranslatorDialog::SubtitleTranslatorDialog(QWidget *parent)
     // --- connections ---
     connect(loadBtn,      &QPushButton::clicked, this, &SubtitleTranslatorDialog::onLoadSrtClicked);
     connect(translateBtn, &QPushButton::clicked, this, &SubtitleTranslatorDialog::onTranslateClicked);
+    connect(m_providerCombo,
+            static_cast<void (QComboBox::*)(int)>(&QComboBox::currentIndexChanged),
+            this,
+            [this](int) {
+                updateApiWarning();
+            });
+    connect(m_apiKeyEdit, &QLineEdit::textChanged, this, [this](const QString&) {
+        updateApiWarning();
+    });
 
     connect(m_client, &subxlat::TranslatorClient::translateFinished,
             this, &SubtitleTranslatorDialog::onFinished);
     connect(m_client, &subxlat::TranslatorClient::translateFailed,
             this, &SubtitleTranslatorDialog::onFailed);
+
+    updateApiWarning();
 }
 
 void SubtitleTranslatorDialog::onLoadSrtClicked()
@@ -99,6 +126,7 @@ void SubtitleTranslatorDialog::onTranslateClicked()
 
     subxlat::TranslateConfig cfg = subxlat::TranslateConfig::defaultConfig();
     cfg.provider   = static_cast<subxlat::Provider>(m_providerCombo->currentData().toInt());
+    cfg.apiKey     = m_apiKeyEdit->text();
     cfg.targetLang = m_targetLangCombo->currentData().toString();
 
     m_preview->setPlainText(tr("Translating..."));
@@ -123,4 +151,13 @@ void SubtitleTranslatorDialog::onFailed(const QString &error)
 {
     QMessageBox::critical(this, tr("Translation Failed"), error);
     m_preview->setPlainText(tr("Translation failed: %1").arg(error));
+}
+
+void SubtitleTranslatorDialog::updateApiWarning()
+{
+    const subxlat::Provider provider =
+        static_cast<subxlat::Provider>(m_providerCombo->currentData().toInt());
+    const bool isStubProvider = provider == subxlat::Provider::Stub;
+    const bool hasApiKey = !m_apiKeyEdit->text().isEmpty();
+    m_apiWarningLabel->setVisible(isStubProvider && !hasApiKey);
 }
