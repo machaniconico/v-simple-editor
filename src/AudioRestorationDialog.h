@@ -6,7 +6,9 @@
 class QLineEdit;
 class QCheckBox;
 class QComboBox;
+class QDoubleSpinBox;
 class QPushButton;
+class QSlider;
 
 // ---------------------------------------------------------------------------
 // AudioRestorationDialog — Sprint 22 / US-AREST-1
@@ -32,5 +34,7 @@ private:
     QCheckBox   *m_dehumCheck   = nullptr;
     QCheckBox   *m_gateCheck    = nullptr;
     QComboBox   *m_humFreqCombo = nullptr;
+    QSlider     *m_nrStrengthSlider = nullptr;
+    QDoubleSpinBox *m_nrStrengthSpin = nullptr;
     QPushButton *m_applyBtn     = nullptr;
 };

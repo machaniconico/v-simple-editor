@@ -164,6 +164,7 @@ struct ClipInfo {
     // source PTS. Consumer wiring is deferred — see SpeedRampData.h header
     // comment for the integration sites.
     speedramp::SpeedRamp speedRamp = speedramp::SpeedRamp::identity();
+    bool atempoEnabled = false;
 
     // US-INT-4: per-frame stabilization transform keyframes baked by the
     // 編集 > スタビライズ slot. Empty = identity (no stabilization). GLPreview

@@ -1332,6 +1332,7 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
     // default in clipFromJson).
     if (!clip.speedRamp.isIdentity())
         obj["speedRamp"] = clip.speedRamp.toJson();
+    obj["atempoEnabled"] = clip.atempoEnabled;
 
     return obj;
 }
@@ -1390,6 +1391,7 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
 
     if (obj.contains("speedRamp"))
         clip.speedRamp = speedramp::SpeedRamp::fromJson(obj["speedRamp"].toObject());
+    clip.atempoEnabled = obj["atempoEnabled"].toBool(false);
 
     return clip;
 }

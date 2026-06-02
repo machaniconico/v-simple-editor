@@ -145,16 +145,16 @@ inline void resetAtempoState(AudioDecoderEntry *de) {
     de->seekPending = true;
 }
 
-// US-INT-2 Phase B: per-fragment atempo gate. Default OFF preserves the
-// Phase A bit-identical path; VEDITOR_AUDIO_ATEMPO=1 opts into nearest-
-// neighbor source-pointer drift on non-identity ramps (PRD permits
-// uncorrected pitch for v1). Static-cached since qgetenv is per-fragment.
-inline bool audioAtempoEnabledCached() {
-    static const bool enabled = []() {
+// US-INT-2 Phase B: per-fragment atempo env force. Default OFF preserves the
+// Phase A bit-identical path; VEDITOR_AUDIO_ATEMPO=1 globally opts into the
+// existing atempo path. Per-clip flags are ORed at each decision site via
+// resolveAudioAtempoEnabled(). Static-cached since qgetenv is per-fragment.
+inline bool audioAtempoEnvForceCached() {
+    static const bool forced = []() {
         const QByteArray v = qgetenv("VEDITOR_AUDIO_ATEMPO");
         return !v.isEmpty() && v != "0" && v != "false" && v != "FALSE";
     }();
-    return enabled;
+    return forced;
 }
 constexpr int kRingCompactThreshold = 32 * 1024;
 
@@ -652,7 +652,8 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
         int sourceBytesConsumed = copyBytes;
         const int16_t *src = reinterpret_cast<const int16_t *>(liveData(*e));
         const speedramp::SpeedRamp *atempoRamp = nullptr;
-        if (audioAtempoEnabledCached()
+        if ((audioAtempoEnvForceCached()
+             || !m_mixer->m_atempoByKey.isEmpty())
             && !m_mixer->m_speedRampByKey.isEmpty()) {
             // [P2-M1] R10-b: locking-regression tripwire (Q_ASSERT under
             // mutex invariance). readData holds m_controlMutex via its
@@ -672,13 +673,16 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
                 e->entry.sourceTrack,
                 e->entry.sourceClipIndex
             };
-            const auto rampIt = m_mixer->m_speedRampByKey.constFind(atempoKey);
-            if (rampIt != m_mixer->m_speedRampByKey.constEnd()) {
-                Q_ASSERT(genAtEntry == m_mixer->m_speedRampGeneration.load(
-                                         std::memory_order_relaxed)
-                         && "R10-b: mutex protects gen invariance — if this "
-                            "fires, lock structure regressed");
-                atempoRamp = &rampIt.value();
+            if (resolveAudioAtempoEnabled(audioAtempoEnvForceCached(),
+                                          m_mixer->m_atempoByKey.contains(atempoKey))) {
+                const auto rampIt = m_mixer->m_speedRampByKey.constFind(atempoKey);
+                if (rampIt != m_mixer->m_speedRampByKey.constEnd()) {
+                    Q_ASSERT(genAtEntry == m_mixer->m_speedRampGeneration.load(
+                                             std::memory_order_relaxed)
+                             && "R10-b: mutex protects gen invariance — if this "
+                                "fires, lock structure regressed");
+                    atempoRamp = &rampIt.value();
+                }
             }
         }
         if (atempoRamp) {
@@ -1628,6 +1632,7 @@ void AudioMixer::setSequence(const QVector<PlaybackEntry> &entries) {
         // call — stale keys from a previous sequence would silently mismap.
         m_speedRampKeyOrder.clear();
         m_speedRampKeyOrder.reserve(entries.size());
+        m_atempoByKey.clear();
 
         for (const auto &e : entries) {
             // Cap on UNIQUE source tracks, not total entry count, so a
@@ -1856,9 +1861,9 @@ void AudioMixer::setSpeedRamps(const QVector<speedramp::SpeedRamp> &ramps)
         // has `oldRampKeys` empty AND m_speedRampByKey empty → removedKeys is
         // empty → R10-a loop is a pure no-op. The R10-b generation check
         // lives on the same lock-protected critical sections, only inside
-        // branches already gated by audioAtempoEnabledCached() and a non-empty
-        // map, so byte-identity to R7/R8/R9 on the default path is preserved
-        // by construction.
+        // branches already gated by resolveAudioAtempoEnabled(...) and a
+        // non-empty map, so byte-identity to R7/R8/R9 on the default path is
+        // preserved by construction.
         for (auto it = m_entries.constBegin(); it != m_entries.constEnd(); ++it) {
             AudioDecoderEntry *de = it.value();
             if (de && !de->seekPending && m_speedRampByKey.contains(it.key())) {
@@ -1913,7 +1918,46 @@ void AudioMixer::setSpeedRamps(const QVector<speedramp::SpeedRamp> &ramps)
             << "rearmedSeek=" << rearmed
             << "rearmedRemoved=" << rearmedRemoved
             << "generation=" << newGeneration
-            << "atempoEnvvar=" << audioAtempoEnabledCached();
+            << "atempoEnvvar=" << audioAtempoEnvForceCached();
+}
+
+void AudioMixer::setAtempoFlags(const QVector<bool> &flags)
+{
+    int enabledCount = 0;
+    int rearmed = 0;
+    {
+        QMutexLocker lock(&m_controlMutex);
+        const QSet<AudioTrackKey> oldKeys(m_atempoByKey.keyBegin(),
+                                          m_atempoByKey.keyEnd());
+        m_atempoFlags = flags;
+        m_atempoByKey.clear();
+        const int n = qMin(m_atempoFlags.size(), m_speedRampKeyOrder.size());
+        m_atempoByKey.reserve(n);
+        for (int i = 0; i < n; ++i) {
+            if (!m_atempoFlags[i]) continue;
+            m_atempoByKey.insert(m_speedRampKeyOrder[i], true);
+            ++enabledCount;
+        }
+        const QSet<AudioTrackKey> newKeys(m_atempoByKey.keyBegin(),
+                                          m_atempoByKey.keyEnd());
+        QSet<AudioTrackKey> changedKeys = oldKeys - newKeys;
+        changedKeys.unite(newKeys - oldKeys);
+        for (const auto &k : changedKeys) {
+            auto it = m_entries.constFind(k);
+            if (it == m_entries.constEnd()) continue;
+            AudioDecoderEntry *de = it.value();
+            if (!de) continue;
+            const bool wasSeekPending = de->seekPending;
+            resetAtempoState(de);
+            if (!wasSeekPending) ++rearmed;
+        }
+    }
+    if (rearmed > 0 && m_decodeRunner)
+        m_decodeRunner->wake();
+    qInfo() << "AudioMixer::setAtempoFlags count=" << flags.size()
+            << "enabled=" << enabledCount
+            << "rearmedSeek=" << rearmed
+            << "atempoEnvvar=" << audioAtempoEnvForceCached();
 }
 
 void AudioMixer::seekTo(int64_t timelineUs) {
@@ -2763,7 +2807,7 @@ void AudioMixer::seekEntryToTimeline(AudioDecoderEntry *e, int64_t timelineUs) {
     // and resampleAndAppend's anchor is the exact inverse. That pair is only
     // an exact inverse when audio is consumed 1:1. Audio time-stretch for
     // ramped clips happens ONLY on readData's atempoRamp path, which is gated
-    // by audioAtempoEnabledCached() ⟸ env VEDITOR_AUDIO_ATEMPO (default OFF).
+    // by resolveAudioAtempoEnabled(env, per-clip) (default OFF).
     // With atempo OFF (the default editor preview) audio is 1:1 and the
     // forward map + inverse anchor are exact inverses → the R3 two-flag
     // fast-drain is correct. For a non-1x uniform speed, OR an authored ramp
@@ -2773,13 +2817,14 @@ void AudioMixer::seekEntryToTimeline(AudioDecoderEntry *e, int64_t timelineUs) {
     // exactly that case to documented pre-US-FIX-7 behaviour (normal 2 ms
     // residual late-drop, no PTS anchor, no fast-drain). The 1x default path
     // is byte-for-byte unchanged. (seekEntryToTimeline is an AudioMixer
-    // method, so m_speedRampByKey / audioAtempoEnabledCached() are in scope
+    // method, so the speed-ramp / atempo flag maps are in scope
     // directly; the key construction mirrors readData's atempo lookup.)
     const double r8UniSpeed =
         (e->entry.speed > 0.0) ? e->entry.speed : 1.0;
     const bool r8NonUnitSpeed = std::abs(r8UniSpeed - 1.0) > 1e-9;
     bool r8AtempoRampPresent = false;
-    if (audioAtempoEnabledCached() && !m_speedRampByKey.isEmpty()) {
+    if ((audioAtempoEnvForceCached() || !m_atempoByKey.isEmpty())
+        && !m_speedRampByKey.isEmpty()) {
         // [P2-M1] R10-b: locking-regression tripwire (Q_ASSERT under mutex
         // invariance). seekEntryToTimeline is called from refillRingForEntry
         // under m_controlMutex (the caller holds the mutex for its entire
@@ -2798,8 +2843,10 @@ void AudioMixer::seekEntryToTimeline(AudioDecoderEntry *e, int64_t timelineUs) {
             e->entry.sourceTrack,
             e->entry.sourceClipIndex
         };
-        const bool present =
-            (m_speedRampByKey.constFind(r8Key) != m_speedRampByKey.constEnd());
+        const bool present = resolveAudioAtempoEnabled(
+                audioAtempoEnvForceCached(),
+                m_atempoByKey.contains(r8Key))
+            && (m_speedRampByKey.constFind(r8Key) != m_speedRampByKey.constEnd());
         Q_ASSERT(genAtEntry == m_speedRampGeneration.load(
                                   std::memory_order_relaxed)
                  && "R10-b: mutex protects gen invariance — if this fires, "

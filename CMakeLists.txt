@@ -142,6 +142,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/youtube_chapter_selftest.cpp
     src/selftests/auto_clip_gen_selftest.cpp
     src/selftests/command_search_selftest.cpp
+    src/selftests/import_ingest_selftest.cpp
     src/selftests/media_pool_selftest.cpp
     src/selftests/three_point_edit_selftest.cpp
     src/selftests/trim_ops_selftest.cpp
@@ -161,6 +162,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/AudioBusRouting.cpp
     src/AudioBusPanel.cpp
     src/selftests/audio_bus_selftest.cpp
+    src/selftests/atempo_resolve_selftest.cpp
     # SP (スペクトル編集): iZotope RX 風 STFT/iSTFT 純粋エンジン + スペクトログラム UI。
     src/SpectralEngine.h
     src/SpectralEngine.cpp
@@ -550,6 +552,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     # Sprint 16 — Unified import hub (US-INT-1)
     src/ImportHubDialog.h
     src/ImportHubDialog.cpp
+    src/ImportIngest.h
+    src/ImportIngest.cpp
 
     # Sprint 18 — Collaboration (US-COL-1 / US-COL-2 / US-COL-4)
     src/CollaborationModel.h

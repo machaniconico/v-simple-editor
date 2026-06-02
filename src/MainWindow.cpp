@@ -76,6 +76,8 @@ void exporter_setAcesPipeline(const aces::AcesPipeline &pipeline);
 #endif
 #if __has_include("ImportHubDialog.h")
   #include "ImportHubDialog.h"
+  #include "BlenderExrReader.h"
+  #include "ImportIngest.h"
   #define HAVE_IMPORT_HUB 1
 #endif
 
@@ -342,6 +344,46 @@ QGroupBox *findVfxGroup(VfxControlsPanel *panel, const QString &title)
     }
     return nullptr;
 }
+
+#ifdef HAVE_IMPORT_HUB
+QString importHubSafeStem(QString stem)
+{
+    stem = QFileInfo(stem).completeBaseName().trimmed();
+    if (stem.isEmpty())
+        stem = QStringLiteral("asset");
+
+    QString safe;
+    safe.reserve(stem.size());
+    for (const QChar ch : stem) {
+        if (ch.isLetterOrNumber() || ch == QLatin1Char('-') || ch == QLatin1Char('_'))
+            safe.append(ch);
+        else
+            safe.append(QLatin1Char('_'));
+    }
+    return safe.left(48);
+}
+
+QString importHubTempPngPath(const QString& prefix, const QString& name)
+{
+    QDir dir(QDir::tempPath() + QStringLiteral("/v-simple-editor-importhub"));
+    if (!dir.exists())
+        dir.mkpath(QStringLiteral("."));
+
+    static int sequence = 0;
+    const QString safePrefix = importHubSafeStem(prefix);
+    const QString safeName = importHubSafeStem(name);
+    while (true) {
+        const QString fileName = QStringLiteral("%1_%2_%3_%4.png")
+            .arg(safePrefix)
+            .arg(safeName)
+            .arg(QDateTime::currentMSecsSinceEpoch())
+            .arg(++sequence);
+        const QString path = dir.filePath(fileName);
+        if (!QFileInfo::exists(path))
+            return path;
+    }
+}
+#endif
 
 void setVfxPanelState(VfxControlsPanel *panel, const ProjectVfxState &state)
 {
@@ -1234,7 +1276,9 @@ void MainWindow::setupUI()
         // now; AudioMixer Phase B will read them under m_controlMutex when
         // per-fragment atempo lands).
         QVector<speedramp::SpeedRamp> audioRamps;
+        QVector<bool> audioAtempoFlags;
         audioRamps.reserve(resolved.size());
+        audioAtempoFlags.reserve(resolved.size());
         const auto &aTracks = m_timeline->audioTracks();
         for (const auto &e : resolved) {
             if (e.sourceTrack >= 0 && e.sourceTrack < aTracks.size()) {
@@ -1242,13 +1286,17 @@ void MainWindow::setupUI()
                 if (e.sourceClipIndex >= 0
                     && e.sourceClipIndex < clips.size()) {
                     audioRamps.append(clips[e.sourceClipIndex].speedRamp);
+                    audioAtempoFlags.append(clips[e.sourceClipIndex].atempoEnabled);
                     continue;
                 }
             }
             audioRamps.append(speedramp::SpeedRamp::identity());
+            audioAtempoFlags.append(false);
         }
-        if (auto *mix = m_player->audioMixer())
+        if (auto *mix = m_player->audioMixer()) {
             mix->setSpeedRamps(audioRamps);
+            mix->setAtempoFlags(audioAtempoFlags);
+        }
     });
     // Per-track solo state lives on the mixer (effective gain applied per
     // entry); audioSequenceChanged alone can't carry it because solo is
@@ -9663,9 +9711,7 @@ void MainWindow::onMobileExport()
 
 // US-INT-1: Sprint 16 — open / raise the external-tool import hub dialog (modeless).
 // Wires 4 import signals (timeline placements / image / mesh / EXR sequence) into
-// MainWindow. Timeline import maps each placement to a Timeline::addClip call;
-// image / mesh / EXR sequence imports log a TODO + status until the dedicated
-// helper APIs (image overlay loader, 3D mesh ingest, EXR sequence loader) land.
+// MainWindow. Each import path maps ingest output to a Timeline::addClip call.
 void MainWindow::onImportHub()
 {
 #ifdef HAVE_IMPORT_HUB
@@ -9692,43 +9738,98 @@ void MainWindow::onImportHub()
 
         connect(m_importHubDialog, &ImportHubDialog::imageImportRequested,
                 this, [this](const QImage &image, const QString &name) {
-                    // TODO(US-INT-2): wire to addImageOverlay / image-layer ingest helper.
-                    qInfo().noquote() << QStringLiteral(
-                        "ImportHub image: name=%1 size=%2x%3")
-                        .arg(name)
-                        .arg(image.width())
-                        .arg(image.height());
+                    if (!m_timeline) {
+                        if (statusBar()) {
+                            statusBar()->showMessage(
+                                QStringLiteral("画像取り込み失敗: タイムラインがありません"),
+                                5000);
+                        }
+                        return;
+                    }
+                    const QString tempPng = importHubTempPngPath(QStringLiteral("image"), name);
+                    if (!importingest::savePreviewPng(image, tempPng)) {
+                        if (statusBar()) {
+                            statusBar()->showMessage(
+                                QStringLiteral("画像取り込み失敗: 一時PNGを保存できません"),
+                                5000);
+                        }
+                        return;
+                    }
+                    m_timeline->addClip(tempPng);
                     if (statusBar()) {
                         statusBar()->showMessage(
-                            QStringLiteral("画像取り込み (%1) を受信 (近日 timeline 連携予定)")
-                                .arg(name),
+                            QStringLiteral("画像をタイムラインに追加"),
                             5000);
                     }
                 });
 
         connect(m_importHubDialog, &ImportHubDialog::meshImportRequested,
                 this, [this](const blender::mesh::MeshData &meshData) {
-                    // TODO(US-INT-2): wire to 3D mesh layer ingest once available.
-                    qInfo().noquote() << QStringLiteral(
-                        "ImportHub mesh: vertices=%1 triangles=%2")
-                        .arg(meshData.vertices.size())
-                        .arg(meshData.triangleIndices.size() / 3);
+                    if (!m_timeline) {
+                        if (statusBar()) {
+                            statusBar()->showMessage(
+                                QStringLiteral("メッシュ取り込み失敗: タイムラインがありません"),
+                                5000);
+                        }
+                        return;
+                    }
+                    const int vertexCount = meshData.vertices.size();
+                    const int triangleCount = meshData.triangleIndices.size() / 3;
+                    const QImage preview = importingest::meshToPreviewImage(meshData);
+                    const QString tempPng = importHubTempPngPath(QStringLiteral("mesh"), QStringLiteral("preview"));
+                    if (!importingest::savePreviewPng(preview, tempPng)) {
+                        if (statusBar()) {
+                            statusBar()->showMessage(
+                                QStringLiteral("メッシュ取り込み失敗: プレビューPNGを保存できません"),
+                                5000);
+                        }
+                        return;
+                    }
+                    m_timeline->addClip(tempPng);
                     if (statusBar()) {
                         statusBar()->showMessage(
-                            QStringLiteral("メッシュ取り込みを受信 (近日 3D layer 連携予定)"),
+                            QStringLiteral("メッシュをタイムラインに追加 (頂点 %1 / 三角形 %2)")
+                                .arg(vertexCount)
+                                .arg(triangleCount),
                             5000);
                     }
                 });
 
         connect(m_importHubDialog, &ImportHubDialog::exrSequenceImportRequested,
                 this, [this](const QString &folderPath, const QString &pattern) {
-                    // TODO(US-INT-2): wire to EXR sequence loader / image-sequence layer.
-                    qInfo().noquote() << QStringLiteral(
-                        "ImportHub EXR sequence: folder=%1 pattern=%2")
-                        .arg(folderPath, pattern);
+                    if (!m_timeline) {
+                        if (statusBar()) {
+                            statusBar()->showMessage(
+                                QStringLiteral("EXR取り込み失敗: タイムラインがありません"),
+                                5000);
+                        }
+                        return;
+                    }
+                    const QList<blender::exr::ExrFrame> frames =
+                        blender::exr::loadExrSequence(folderPath, pattern);
+                    if (frames.isEmpty()) {
+                        if (statusBar()) {
+                            statusBar()->showMessage(
+                                QStringLiteral("EXRシーケンスにフレームがありません (%1)")
+                                    .arg(pattern),
+                                5000);
+                        }
+                        return;
+                    }
+                    const QImage firstFrame = frames.first().image;
+                    const QString tempPng = importHubTempPngPath(QStringLiteral("exr"), pattern);
+                    if (!importingest::savePreviewPng(firstFrame, tempPng)) {
+                        if (statusBar()) {
+                            statusBar()->showMessage(
+                                QStringLiteral("EXR取り込み失敗: 先頭フレームをPNG保存できません"),
+                                5000);
+                        }
+                        return;
+                    }
+                    m_timeline->addClip(tempPng);
                     if (statusBar()) {
                         statusBar()->showMessage(
-                            QStringLiteral("EXR シーケンス取り込みを受信 (%1) — 近日対応予定")
+                            QStringLiteral("EXR先頭フレームをタイムラインに追加 (%1)")
                                 .arg(pattern),
                             5000);
                     }
@@ -12444,26 +12545,82 @@ void MainWindow::openSpeedRampDialog()
         return;
     }
 
-    bool ok = false;
-    const double speedMul = QInputDialog::getDouble(this, tr("速度 / 持続時間"),
-        tr("速度倍率 (0.1 - 5.0):"), 1.0, 0.1, 5.0, 2, &ok);
-    if (!ok)
-        return;
-
-    speedramp::SpeedRamp ramp;
-    ramp.clearAndSetIdentity();
-    ramp.addKeyframe(0, speedMul);
-
     const int clipIdx = m_timeline->selectedVideoClipIndex();
     if (clipIdx < 0) {
         QMessageBox::information(this, tr("速度 / 持続時間"),
             tr("V1 にクリップを選択してください。"));
         return;
     }
+    const auto &selectedClips = m_timeline->videoClips();
+    if (clipIdx >= selectedClips.size()) {
+        QMessageBox::information(this, tr("速度 / 持続時間"),
+            tr("V1 にクリップを選択してください。"));
+        return;
+    }
+    const ClipInfo &selectedClip = selectedClips[clipIdx];
+    const double initialSpeed = selectedClip.speedRamp.keyframes.isEmpty()
+        ? 1.0
+        : selectedClip.speedRamp.keyframes.first().speed;
+
+    QDialog dialog(this);
+    dialog.setWindowTitle(tr("速度 / 持続時間"));
+    auto *layout = new QFormLayout(&dialog);
+
+    auto *speedSpin = new QDoubleSpinBox(&dialog);
+    speedSpin->setRange(0.1, 5.0);
+    speedSpin->setDecimals(2);
+    speedSpin->setSingleStep(0.05);
+    speedSpin->setValue(qBound(0.1, initialSpeed, 5.0));
+    speedSpin->setSuffix(QStringLiteral("x"));
+    layout->addRow(tr("速度倍率"), speedSpin);
+
+    auto *atempoCheck = new QCheckBox(tr("音声を速度に追従 (atempo・ピッチ未補正)"), &dialog);
+    atempoCheck->setToolTip(tr("有効にすると音声が速度ランプに追従して伸縮します"
+                               " (現状はリサンプルのみでピッチは速度に応じて変化します)。"));
+    atempoCheck->setChecked(selectedClip.atempoEnabled);
+    layout->addRow(QString(), atempoCheck);
+
+    auto *buttons = new QDialogButtonBox(
+        QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    layout->addRow(buttons);
+
+    if (dialog.exec() != QDialog::Accepted)
+        return;
+
+    const double speedMul = speedSpin->value();
+    const bool atempoEnabled = atempoCheck->isChecked();
+
+    speedramp::SpeedRamp ramp;
+    ramp.clearAndSetIdentity();
+    ramp.addKeyframe(0, speedMul);
+
     m_timeline->setSpeedRamp(clipIdx, ramp);
+
+    const auto &vTracks = m_timeline->videoTracks();
+    if (!vTracks.isEmpty() && vTracks.first()) {
+        auto clips = vTracks.first()->clips();
+        if (clipIdx >= 0 && clipIdx < clips.size()) {
+            clips[clipIdx].atempoEnabled = atempoEnabled;
+            vTracks.first()->setClips(clips);
+        }
+    }
+    const auto &aTracks = m_timeline->audioTracks();
+    if (!aTracks.isEmpty() && aTracks.first()) {
+        auto clips = aTracks.first()->clips();
+        if (clipIdx >= 0 && clipIdx < clips.size()) {
+            clips[clipIdx].speedRamp = ramp;
+            clips[clipIdx].atempoEnabled = atempoEnabled;
+            aTracks.first()->setClips(clips);
+        }
+    }
+    m_timeline->refreshPlaybackSequence();
     statusBar()->showMessage(
-        tr("速度ランプを %1x に設定しました (clip #%2)")
-            .arg(speedMul, 0, 'f', 2).arg(clipIdx), 5000);
+        tr("速度ランプを %1x に設定しました (clip #%2, atempo=%3)")
+            .arg(speedMul, 0, 'f', 2)
+            .arg(clipIdx)
+            .arg(atempoEnabled ? tr("on") : tr("off")), 5000);
 }
 
 void MainWindow::addQuickMarker()

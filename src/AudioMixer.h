@@ -63,6 +63,12 @@ inline uint qHash(const AudioTrackKey &k, uint seed = 0) noexcept {
     return h;
 }
 
+inline constexpr bool resolveAudioAtempoEnabled(bool envForce,
+                                                bool perClipFlag) noexcept
+{
+    return envForce || perClipFlag;
+}
+
 class AudioMixer : public QObject {
     Q_OBJECT
 public:
@@ -93,6 +99,9 @@ public:
     void setSequence(const QVector<PlaybackEntry> &entries);
     // Parallel speed-ramp array aligned to setSequence entries.
     void setSpeedRamps(const QVector<speedramp::SpeedRamp> &ramps);
+    // Parallel per-entry atempo opt-in flags aligned to setSequence entries.
+    // Env VEDITOR_AUDIO_ATEMPO still globally forces the feature on.
+    void setAtempoFlags(const QVector<bool> &flags);
 
     // Jump the audible playhead. Resyncs FFmpeg seek inside every active
     // entry (lazily on next refill) and flushes ring buffers so the next
@@ -351,6 +360,8 @@ private:
     // the existing public API stays QVector-shaped (Phase A compat).
     QVector<AudioTrackKey> m_speedRampKeyOrder;
     QHash<AudioTrackKey, speedramp::SpeedRamp> m_speedRampByKey;
+    QVector<bool> m_atempoFlags;  // parallel to setSequence entries
+    QHash<AudioTrackKey, bool> m_atempoByKey;
     // PRD-B / US-FIX-7 R10: monotonically increasing generation counter, bumped
     // under m_controlMutex inside setSpeedRamps each time m_speedRampByKey is
     // rebuilt. Decision sites that consult m_speedRampByKey (the readData
@@ -364,11 +375,11 @@ private:
     //
     // CRITICAL: this counter is only CONSULTED on the opt-in atempo /
     // non-1x path. The default editor preview (atempo OFF, speed==1.0, no
-    // ramp) never enters either consulting branch (audioAtempoEnabledCached()
-    // short-circuits and m_speedRampByKey is empty), so byte-identity vs
-    // R7/R8/R9 is preserved by construction. The counter itself increments
-    // unconditionally inside setSpeedRamps — that is a write to a private
-    // atomic with no audible side-effect.
+    // ramp) never enters either consulting branch (env and per-clip atempo
+    // both resolve false, and m_speedRampByKey is empty), so byte-identity
+    // vs R7/R8/R9 is preserved by construction. The counter itself
+    // increments unconditionally inside setSpeedRamps — that is a write to a
+    // private atomic with no audible side-effect.
     std::atomic<uint64_t> m_speedRampGeneration{0};
 
     // 4-band parametric EQ — separate path from TrackState's legacy 3-band.

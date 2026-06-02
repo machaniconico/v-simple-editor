@@ -41,6 +41,12 @@ public:
                                    const QVector<float> &otherEnv,
                                    double envHopMs);
 
+    // Pure helper for dialog/selftest use. Angle 0 is the reference and always
+    // returns 0; empty/unusable envelopes fall back to 0 for that angle.
+    static QVector<qint64> computeAngleOffsetsUs(
+        const QVector<QVector<float>> &angleEnvelopes,
+        double envHopMs);
+
     void addAngleCut(double timeMs, int camIndex);
 
     // Simple text EDL, one line per cut sorted by time:

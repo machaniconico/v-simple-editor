@@ -30,8 +30,9 @@ enum class LoudnessPreset {
 double presetTargetLufs(LoudnessPreset p);
 
 // Measure integrated loudness (LUFS) of an audio file.
-// Only raw 32-bit float mono/interleaved .raw/.pcm files are decoded directly.
-// For any other container, or if the .raw/.pcm file cannot be read, the
+// Raw 32-bit float mono/interleaved .raw/.pcm files are decoded directly.
+// Other audio containers are decoded through the project's libav path.
+// If the input cannot be decoded, has no audio, or produces no samples, the
 // function emits a qWarning and returns std::numeric_limits<double>::quiet_NaN().
 // Callers MUST check std::isnan() before using the result.
 // The deterministic BS.1770-4 algorithm lives in measureIntegratedLufsFromSamples().

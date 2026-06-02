@@ -21,6 +21,7 @@ int runAIHighlightSelftest();
 int runAcesColorSelftest();
 int runAffinitySelftest();
 int runAscCdlExportSelftest();
+int runAtempoResolveSelftest();
 int runOAuthMockE2eSelftest();
 int runOAuthRefreshE2eSelftest();
 int runAnimExportSelftest();
@@ -53,6 +54,7 @@ int runFrameIoSelftest();
 int runHdrRoutingSelftest();
 int runHdrSelftest();
 int runHwPerfSelftest();
+int runImportIngestSelftest();
 int runImportSelftest();
 int runInstagramSelftest();
 int runLibavcoreDecodeSelftest();
@@ -177,6 +179,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "TrimOps engine: ripple/roll/slip/slide + bounds" },
     { "audio-bus",         "VEDITOR_AUDIO_BUS_SELFTEST",          runAudioBusSelftest,           false,
       "AudioBusRouting: bus/submix/aux-send gain resolution + cycle guard" },
+    { "atempo-resolve",    "VEDITOR_ATEMPO_RESOLVE_SELFTEST",     runAtempoResolveSelftest,      false,
+      "Audio atempo enable resolver truth table: env force OR per-clip flag" },
     { "spectral-edit",     "VEDITOR_SPECTRAL_EDIT_SELFTEST",      runSpectralEditSelftest,       false,
       "SpectralEngine: FFT/STFT/iSTFT round-trip + region attenuation" },
     { "aces-color",        "VEDITOR_ACES_COLOR_SELFTEST",         runAcesColorSelftest,          false,
@@ -213,6 +217,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "AutoProxyPolicy: heavy-clip detection (width/codec) + useProxyFor/generateFor split + dedup (12 gates)" },
     { "exposure-aids",      "VEDITOR_EXPOSURE_AIDS_SELFTEST",      runExposureAidsSelftest,        false,
       "ExposureAids: luma709 oracle + False Color zones + Zebra stripe period + Focus Peaking edge/threshold + dimension/OOB safety (11 gates)" },
+    { "import-ingest",      "VEDITOR_IMPORT_INGEST_SELFTEST",      runImportIngestSelftest,        false,
+      "ImportHub ingest previews: mesh wireframe determinism + empty placeholder (QApplication-free)" },
     // QApplication-required (needsQApplication=true) ----------------------
     { "parity",            "VEDITOR_PARITY_SELFTEST",             runParitySelftest,             true,
       "Preview vs export pixel-parity (S1-S11, framediff::mse, 10-bit HDR10)" },

@@ -148,6 +148,81 @@ int runAudioRestoreSelftest()
                              &error))
             return 1;
     }
+    {
+        const int sampleRate = 48000;
+        const int nSamples = sampleRate * 2;
+        const int toneStart = sampleRate / 2;
+        const int toneEnd = sampleRate + sampleRate / 2;
+        const double toneHz = 1000.0;
+        QVector<float> noisy;
+        noisy.reserve(nSamples);
+
+        quint32 rng = 0x12345678u;
+        auto whiteNoise = [&rng]() {
+            rng = 1664525u * rng + 1013904223u;
+            const double unit = static_cast<double>(rng) / 4294967295.0;
+            return 2.0 * unit - 1.0;
+        };
+
+        for (int i = 0; i < nSamples; ++i) {
+            const double t = static_cast<double>(i) / sampleRate;
+            double v = 0.08 * whiteNoise();
+            if (i >= toneStart && i < toneEnd)
+                v += 0.40 * std::sin(2.0 * M_PI * toneHz * t);
+            noisy.append(static_cast<float>(v));
+        }
+
+        auto sliceRms = [](const QVector<float> &v, int begin, int end) {
+            double acc = 0.0;
+            int count = 0;
+            for (int i = begin; i < end && i < v.size(); ++i) {
+                const double s = static_cast<double>(v[i]);
+                acc += s * s;
+                ++count;
+            }
+            return count == 0 ? 0.0 : std::sqrt(acc / static_cast<double>(count));
+        };
+
+        auto toneProjectionEnergy = [sampleRate, toneHz](const QVector<float> &v, int begin, int end) {
+            double dot = 0.0;
+            double refEnergy = 0.0;
+            for (int i = begin; i < end && i < v.size(); ++i) {
+                const double t = static_cast<double>(i) / sampleRate;
+                const double ref = std::sin(2.0 * M_PI * toneHz * t);
+                dot += static_cast<double>(v[i]) * ref;
+                refEnergy += ref * ref;
+            }
+            if (refEnergy <= 0.0)
+                return 0.0;
+            const double amp = dot / refEnergy;
+            return amp * amp;
+        };
+
+        audiorestore::RestoreConfig cfg;
+        cfg.doDeclick = false;
+        cfg.doDehum = false;
+        cfg.doNoiseGate = true;
+        cfg.noiseReductionStrength = 1.5;
+
+        const QVector<float> restored = audiorestore::processAll(noisy, sampleRate, cfg);
+        const double noiseBefore = sliceRms(noisy, 2048, toneStart - 2048);
+        const double noiseAfter = sliceRms(restored, 2048, toneStart - 2048);
+        const double toneEnergyBefore = toneProjectionEnergy(noisy, toneStart + 2048, toneEnd - 2048);
+        const double toneEnergyAfter = toneProjectionEnergy(restored, toneStart + 2048, toneEnd - 2048);
+
+        if (!requireSelftest(noiseBefore > 1e-6,
+                             QStringLiteral("AUDIORESTORE: synthesized noise should have non-zero RMS"),
+                             &error))
+            return 1;
+        if (!requireSelftest(noiseAfter < noiseBefore * 0.70,
+                             QStringLiteral("AUDIORESTORE: spectralSubtraction should reduce noise RMS by >30%"),
+                             &error))
+            return 1;
+        if (!requireSelftest(toneEnergyAfter > toneEnergyBefore * 0.60,
+                             QStringLiteral("AUDIORESTORE: spectralSubtraction should preserve >60% tone energy"),
+                             &error))
+            return 1;
+    }
 #endif
     qInfo() << "AUDIORESTORE selftest OK";
     return 0;

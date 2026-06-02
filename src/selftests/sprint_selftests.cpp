@@ -80,6 +80,7 @@
 #include <QVector3D>
 #include <cmath>
 #include <algorithm>
+#include <cstdint>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -1448,6 +1449,113 @@ int runLoudnessSelftest()
                              QStringLiteral("LOUDNESS: Broadcast preset should be -23.0 LUFS"),
                              &error))
             return 1;
+
+        constexpr int kSampleRate = 48000;
+        constexpr int kDurationSeconds = 1;
+        constexpr double kToneHz = 440.0;
+        constexpr double kAmplitude = 0.1; // -20 dBFS peak
+        const int totalSamples = kSampleRate * kDurationSeconds;
+
+        QVector<float> mono(totalSamples);
+        QByteArray pcm(static_cast<qsizetype>(totalSamples)
+                           * static_cast<qsizetype>(sizeof(std::int16_t)),
+                       Qt::Uninitialized);
+        for (int i = 0; i < totalSamples; ++i) {
+            const double phase =
+                (2.0 * M_PI * kToneHz * static_cast<double>(i))
+                / static_cast<double>(kSampleRate);
+            const float sample =
+                static_cast<float>(std::sin(phase) * kAmplitude);
+            mono[i] = sample;
+            const double rounded =
+                std::lround(static_cast<double>(sample) * 32767.0);
+            const auto s16 = static_cast<std::int16_t>(
+                qBound(-32768.0,
+                       rounded,
+                       32767.0));
+            const auto u16 = static_cast<std::uint16_t>(s16);
+            const qsizetype offset =
+                static_cast<qsizetype>(i) * static_cast<qsizetype>(sizeof(s16));
+            pcm[offset] = static_cast<char>(u16 & 0xffu);
+            pcm[offset + 1] = static_cast<char>((u16 >> 8) & 0xffu);
+        }
+
+        QTemporaryDir tempDir;
+        if (!requireSelftest(tempDir.isValid(),
+                             QStringLiteral("LOUDNESS: failed to create temporary directory"),
+                             &error))
+            return 1;
+        const QString wavPath =
+            tempDir.filePath(QStringLiteral("loudness-selftest.wav"));
+
+        QFile wav(wavPath);
+        if (!requireSelftest(wav.open(QIODevice::WriteOnly | QIODevice::Truncate),
+                             QStringLiteral("LOUDNESS: failed to open temporary WAV for writing"),
+                             &error))
+            return 1;
+
+        auto writeBytes = [&wav](const char *data, qint64 bytes) {
+            return wav.write(data, bytes) == bytes;
+        };
+        auto writeFourCc = [&writeBytes](const char (&value)[5]) {
+            return writeBytes(value, 4);
+        };
+        auto writeLe16 = [&writeBytes](std::uint16_t value) {
+            const char data[2] = {
+                static_cast<char>(value & 0xffu),
+                static_cast<char>((value >> 8) & 0xffu)
+            };
+            return writeBytes(data, 2);
+        };
+        auto writeLe32 = [&writeBytes](std::uint32_t value) {
+            const char data[4] = {
+                static_cast<char>(value & 0xffu),
+                static_cast<char>((value >> 8) & 0xffu),
+                static_cast<char>((value >> 16) & 0xffu),
+                static_cast<char>((value >> 24) & 0xffu)
+            };
+            return writeBytes(data, 4);
+        };
+
+        const std::uint32_t dataBytes =
+            static_cast<std::uint32_t>(pcm.size());
+        const bool wroteWav =
+            writeFourCc("RIFF")
+            && writeLe32(36u + dataBytes)
+            && writeFourCc("WAVE")
+            && writeFourCc("fmt ")
+            && writeLe32(16)
+            && writeLe16(1)
+            && writeLe16(1)
+            && writeLe32(kSampleRate)
+            && writeLe32(kSampleRate * 2u)
+            && writeLe16(2)
+            && writeLe16(16)
+            && writeFourCc("data")
+            && writeLe32(dataBytes)
+            && writeBytes(pcm.constData(), pcm.size())
+            && wav.flush();
+        wav.close();
+        if (!requireSelftest(wroteWav,
+                             QStringLiteral("LOUDNESS: failed to write temporary PCM WAV"),
+                             &error))
+            return 1;
+
+        const double sampleLufs =
+            loudness::measureIntegratedLufsFromSamples(mono, kSampleRate);
+        const double wavLufs = loudness::measureIntegratedLufs(wavPath);
+        if (!requireSelftest(std::isfinite(sampleLufs),
+                             QStringLiteral("LOUDNESS: sample LUFS should be finite"),
+                             &error))
+            return 1;
+        if (!requireSelftest(std::isfinite(wavLufs),
+                             QStringLiteral("LOUDNESS: WAV path LUFS should be finite"),
+                             &error))
+            return 1;
+        if (!requireSelftest(qAbs(wavLufs - sampleLufs) <= 2.0,
+                             QStringLiteral("LOUDNESS: WAV path LUFS should match sample LUFS within 2 LU"),
+                             &error))
+            return 1;
     }
 #endif
     qInfo() << "LOUDNESS selftest OK";
@@ -1499,6 +1607,33 @@ int runMultiCamSelftest()
             return 1;
         if (!requireSelftest(!qFuzzyIsNull(ms),
                              QStringLiteral("MULTICAM: shifted signal should yield non-zero lag"),
+                             &error))
+            return 1;
+
+        const QVector<float> angle0{
+            0, 0, 0, 0, 0, 1, 2, 0.5f, 3, 1.5f, 0.25f, 2.5f, 0.75f, 0, 0, 0, 0, 0};
+        const QVector<float> angle1{
+            0, 0, 0, 0, 0, 0, 0, 1, 2, 0.5f, 3, 1.5f, 0.25f, 2.5f, 0.75f, 0, 0, 0};
+        const QVector<float> angle2{
+            0, 0, 0, 1, 2, 0.5f, 3, 1.5f, 0.25f, 2.5f, 0.75f, 0, 0, 0, 0, 0, 0, 0};
+        const QVector<qint64> offsetsUs =
+            multicam::MultiCamSync::computeAngleOffsetsUs(
+                QVector<QVector<float>>{angle0, angle1, angle2}, 10.0);
+
+        if (!requireSelftest(offsetsUs.size() == 3,
+                             QStringLiteral("MULTICAM: computeAngleOffsetsUs should preserve angle count"),
+                             &error))
+            return 1;
+        if (!requireSelftest(offsetsUs[0] == 0,
+                             QStringLiteral("MULTICAM: angle 0 offset should be the zero reference"),
+                             &error))
+            return 1;
+        if (!requireSelftest(qAbs(offsetsUs[1] - 20000LL) <= 10000LL,
+                             QStringLiteral("MULTICAM: delayed angle offset should be ~+20000us"),
+                             &error))
+            return 1;
+        if (!requireSelftest(qAbs(offsetsUs[2] + 20000LL) <= 10000LL,
+                             QStringLiteral("MULTICAM: early angle offset should be ~-20000us"),
                              &error))
             return 1;
     }
