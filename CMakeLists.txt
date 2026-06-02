@@ -228,6 +228,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/ExposureAids.cpp
     src/selftests/exposure_aids_selftests.cpp
     # GPU compositor math (Stage 1 dormant pure engine + headless selftest)。
+    src/selftests/gpu_composite_flag_selftest.cpp
     src/playback/GpuCompositeMath.h
     src/playback/GpuCompositeMath.cpp
     src/selftests/gpu_composite_math_selftests.cpp

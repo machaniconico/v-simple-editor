@@ -113,6 +113,7 @@ int runYoutubeChapterSelftest();
 int runAutoProxyPolicySelftest();
 int runCompositeFrameCacheSelftest();
 int runPlaybackQualityPolicySelftest();
+int runGpuCompositeFlagSelftest();
 int runGpuCompositeMathSelftest();
 int runHdrCompositeMathSelftest();
 int runGpuCompositeParitySelftest();
@@ -207,6 +208,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "CompositeFrameCache: LRU eviction + key hashing + hit/miss accounting" },
     { "playback-quality-policy", "VEDITOR_PLAYBACK_QUALITY_POLICY_SELFTEST", runPlaybackQualityPolicySelftest, false,
       "PlaybackQualityPolicy: adaptive quality level selection + drop-frame heuristics" },
+    { "gpu-composite-flag", "VEDITOR_GPU_COMPOSITE_FLAG_SELFTEST", runGpuCompositeFlagSelftest, false,
+      "GPU合成フラグ解決(env OR settings)の純粋リゾルバ検証" },
     { "gpu-composite-math", "VEDITOR_GPU_COMPOSITE_MATH_SELFTEST", runGpuCompositeMathSelftest, false,
       "GpuCompositeMath: paint order, layer transform matrix, premul source-over, matte validity (15 gates)" },
     { "hdr-composite-math", "VEDITOR_HDR_COMPOSITE_MATH_SELFTEST", runHdrCompositeMathSelftest, false,

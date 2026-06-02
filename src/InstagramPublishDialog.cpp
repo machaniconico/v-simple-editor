@@ -45,6 +45,11 @@ InstagramPublishDialog::InstagramPublishDialog(QWidget *parent)
 
     // --- layout ---
     auto *root = new QVBoxLayout(this);
+    auto *setupHint = new QLabel(
+        QStringLiteral("Instagram Professional アカウント + Meta アプリのアクセストークンが必要です。"),
+        this);
+    setupHint->setWordWrap(true);
+    root->addWidget(setupHint);
     root->addLayout(form);
     root->addWidget(publishBtn);
     root->addWidget(m_progress);

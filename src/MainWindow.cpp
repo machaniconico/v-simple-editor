@@ -2352,6 +2352,22 @@ void MainWindow::setupMenuBar()
     m_menuHelpEntries.append({markOutAction,
         QStringLiteral("使いたい範囲の「終了位置」を今の再生位置に決めます（O キー）。")});
 
+    auto *gpuCompositeAction =
+        playbackMenu->addAction(QStringLiteral("GPU合成プレビュー (実験的)"));
+    gpuCompositeAction->setCheckable(true);
+    {
+        QSettings settings;
+        gpuCompositeAction->setChecked(
+            settings.value(QStringLiteral("gpuComposite"), false).toBool());
+    }
+    connect(gpuCompositeAction, &QAction::triggered, this, [](bool checked) {
+        QSettings settings;
+        settings.setValue(QStringLiteral("gpuComposite"), checked);
+    });
+    m_menuHelpEntries.append({gpuCompositeAction,
+        QStringLiteral("GPU 合成プレビューの ON/OFF を保存します。次回のプレビュー再構築から反映されます (既定OFF)。"
+                       "VEDITOR_GPU_COMPOSITE が設定されている場合は環境変数が優先されます。")});
+
     // 検索 メニュー — 機能発見性 (初心者向け)。機能が増えてどこに何があるか
     // 分かりにくいため、機能名や「音量を均一にしたい」のような操作内容の言葉で
     // 機能を探して呼び出せる導線をトップレベルに用意する (Ctrl+Shift+P と等価)。

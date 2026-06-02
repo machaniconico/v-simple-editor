@@ -53,6 +53,11 @@ CloudRenderDialog::CloudRenderDialog(QWidget* parent)
     resize(980, 560);
 
     auto* root = new QVBoxLayout(this);
+    auto* setupHint = new QLabel(
+        tr("クラウドレンダー先のエンドポイントURLと認証トークンが必要です。"),
+        this);
+    setupHint->setWordWrap(true);
+    root->addWidget(setupHint);
     auto* configForm = new QFormLayout;
     configForm->setFieldGrowthPolicy(QFormLayout::ExpandingFieldsGrow);
 

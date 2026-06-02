@@ -6,6 +6,7 @@
 #include "ClipGeometry.h"      // clipgeom::renderLayer (shared clip-placement SSOT)
 #include "TrackMatteKey.h"     // STAGE4B: trackMatteClipKey (canonical matte clip key)
 #include "playback/LiveMatteResolve.h" // STAGE4B: clipstack::resolveLiveMatteSources
+#include "gpucomposite_flag.h"
 #include <algorithm>           // std::stable_sort
 
 // Free comparator for the production layer sort. Extracted from the inline
@@ -4847,16 +4848,12 @@ void VideoPlayer::ensureGpuCompositeFlag()
     if (m_gpuCompositeChecked)
         return;
     m_gpuCompositeChecked = true;
-    bool enabled = false;
     const QByteArray env = qgetenv("VEDITOR_GPU_COMPOSITE");
-    if (!env.isEmpty()) {
-        enabled = (env == "1");
-    } else {
-        // env 未設定時のみ QSettings を見る (既定は false)。
-        QSettings settings;
-        enabled = settings.value(QStringLiteral("gpuComposite"), false).toBool();
-    }
-    m_gpuCompositeEnabled = enabled;
+    QSettings settings;
+    m_gpuCompositeEnabled = resolveGpuCompositeEnabled(
+        !env.isEmpty(),
+        env,
+        settings.value(QStringLiteral("gpuComposite"), false).toBool());
     if (m_gpuCompositeEnabled)
         qInfo() << "[gpu-composite] enabled (preview multi-track GPU compositing ON)";
 }

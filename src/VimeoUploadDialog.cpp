@@ -1,11 +1,17 @@
 #include "VimeoUploadDialog.h"
 
+#include "VimeoOAuth.h"
+
+#include <QDesktopServices>
 #include <QFileDialog>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QInputDialog>
+#include <QLabel>
+#include <QLineEdit>
 #include <QMessageBox>
 #include <QPushButton>
+#include <QUuid>
 #include <QTableWidget>
 #include <QTableWidgetItem>
 #include <QVBoxLayout>
@@ -21,6 +27,7 @@ VimeoUploadDialog::VimeoUploadDialog(vimeo::manager::Manager *manager,
                                      QWidget *parent)
     : QDialog(parent)
     , m_manager(manager)
+    , m_oauth(new vimeo::oauth::AuthClient(vimeo::oauth::VimeoOAuthConfig::defaultConfig(), this))
 {
     setWindowTitle(QStringLiteral("Vimeo Upload Manager"));
     setModal(false);
@@ -52,6 +59,11 @@ VimeoUploadDialog::VimeoUploadDialog(vimeo::manager::Manager *manager,
 
     // --- Root layout ---
     auto *root = new QVBoxLayout(this);
+    auto *setupHint = new QLabel(
+        QStringLiteral("Vimeo Pro/Business アカウントと API Client ID が必要です。Authenticate で認可します。"),
+        this);
+    setupHint->setWordWrap(true);
+    root->addWidget(setupHint);
     root->addWidget(m_table);
     root->addLayout(btnLayout);
 
@@ -60,6 +72,19 @@ VimeoUploadDialog::VimeoUploadDialog(vimeo::manager::Manager *manager,
     connect(m_retryBtn,  &QPushButton::clicked, this, &VimeoUploadDialog::onRetryClicked);
     connect(m_cancelBtn, &QPushButton::clicked, this, &VimeoUploadDialog::onCancelClicked);
     connect(m_authBtn,   &QPushButton::clicked, this, &VimeoUploadDialog::onAuthenticateClicked);
+    connect(m_oauth, &vimeo::oauth::AuthClient::tokenReceived, this, [this](const QString &accessToken) {
+        Q_UNUSED(accessToken);
+        QMessageBox::information(
+            this,
+            QStringLiteral("Vimeo Authentication"),
+            QStringLiteral("Vimeo 認証が完了しました。"));
+    });
+    connect(m_oauth, &vimeo::oauth::AuthClient::authError, this, [this](const QString &reason) {
+        QMessageBox::warning(
+            this,
+            QStringLiteral("Vimeo Authentication"),
+            QStringLiteral("Vimeo 認証に失敗しました。\n%1").arg(reason));
+    });
 
     if (!m_manager.isNull()) {
         connect(m_manager, &vimeo::manager::Manager::jobStateChanged,
@@ -166,10 +191,58 @@ void VimeoUploadDialog::onCancelClicked()
 
 void VimeoUploadDialog::onAuthenticateClicked()
 {
+    if (!m_oauth)
+        return;
+
+    if (m_oauth->hasAccessToken()) {
+        QMessageBox::information(
+            this,
+            QStringLiteral("Vimeo Authentication"),
+            QStringLiteral("認証済みです (トークン保持中)"));
+        return;
+    }
+
+    const vimeo::oauth::VimeoOAuthConfig &config = m_oauth->config();
+    if (config.clientId.trimmed().isEmpty()) {
+        QMessageBox::warning(
+            this,
+            QStringLiteral("Vimeo Authentication"),
+            QStringLiteral("Vimeo の Client ID が未設定です。環境変数 VEDITOR_VIMEO_CLIENT_ID を設定するか、認証情報ダイアログで登録してください。"));
+        return;
+    }
+
+    const QString redirectUri = config.redirectUri.trimmed().isEmpty()
+        ? QStringLiteral("urn:ietf:wg:oauth:2.0:oob")
+        : config.redirectUri.trimmed();
+    const QString state = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    const QUrl authUrl = m_oauth->authorizationUrl(redirectUri, state);
+
+    if (!QDesktopServices::openUrl(authUrl)) {
+        QMessageBox::warning(
+            this,
+            QStringLiteral("Vimeo Authentication"),
+            QStringLiteral("Vimeo の認可ページをブラウザで開けませんでした。\n%1").arg(authUrl.toString()));
+        return;
+    }
+
     QMessageBox::information(
         this,
         QStringLiteral("Vimeo Authentication"),
-        QStringLiteral("OAuth flow not yet wired — set VEDITOR_VIMEO_CLIENT_ID env var."));
+        QStringLiteral("ブラウザでVimeoの認可ページを開きました。許可後に表示されるコードを次のダイアログに貼り付けてください。"));
+
+    bool ok = false;
+    const QString code = QInputDialog::getText(
+        this,
+        QStringLiteral("Vimeo Authorization Code"),
+        QStringLiteral("Authorization code:"),
+        QLineEdit::Normal,
+        QString(),
+        &ok).trimmed();
+
+    if (!ok || code.isEmpty())
+        return;
+
+    m_oauth->exchangeAuthorizationCode(code, redirectUri);
 }
 
 void VimeoUploadDialog::onJobStateChanged(const QString &jobId,
