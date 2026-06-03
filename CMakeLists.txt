@@ -239,6 +239,10 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/playback/HdrCompositeMath.h
     src/playback/HdrCompositeMath.cpp
     src/selftests/hdr_composite_math_selftests.cpp
+    src/playback/hdrexport16_flag.h
+    src/playback/TlrCompose16.h
+    src/playback/TlrCompose16.cpp
+    src/selftests/hdr_export16_selftest.cpp
     # GPU layer compositor (Stage 2 offscreen-FBO compositor + GPU/CPU parity selftest)。
     src/playback/GpuLayerCompositor.h
     src/playback/GpuLayerCompositor.cpp

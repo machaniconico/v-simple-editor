@@ -11,6 +11,8 @@
 #include "TrackMatteBake.h"     // TM-3 — shared SSOT track-matte compositor
 #include "ClipGeometry.h"       // G3 — canonical clip-placement SSOT (clipgeom)
 #include "TrackMatteKey.h"      // RM-1.1 — single shared clip-key formula
+#include "playback/TlrCompose16.h"
+#include "playback/hdrexport16_flag.h"
 #include "color/ClipColor.h"    // HDR Stage1 — per-clip color metadata plumbing
                                 // TM-8 — track-matte wiring is now read from
                                 // Timeline::trackMatteEntries() (no MainWindow
@@ -872,6 +874,36 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
         // and then paint the V1 base last (frontmost). This matches the
         // preview compositor's descending clipstack::layerPaintOrderLess sort,
         // so an opaque V1 occludes V2 in export exactly as in preview.
+        const bool use16 = hdrexport16::enabledFromEnv();
+        if (use16) {
+            const QSize canvas(base.width(), base.height());
+            QVector<QImage> placedBackToFront;
+            QVector<double> opacities;
+            placedBackToFront.reserve(overlays.size() + 1);
+            opacities.reserve(overlays.size() + 1);
+
+            for (int i = overlays.size() - 1; i >= 0; --i) {
+                const OverlayLayer &L = overlays[i];
+                if (L.rgb.isNull() || L.opacity <= 0.001)
+                    continue;
+                const clipgeom::ClipTransform t{L.videoScale, L.videoDx,
+                                                L.videoDy, L.rotationDeg};
+                const QImage placed =
+                    clipgeom::renderLayer(L.rgb, t, canvas, /*smooth=*/true);
+                placedBackToFront.append(placed);
+                opacities.append(qBound(0.0, L.opacity, 1.0));
+            }
+
+            const double v1Opacity = qBound(0.0, v1Clip.opacity, 1.0);
+            if (v1Opacity > 0.001) {
+                placedBackToFront.append(base);
+                opacities.append(v1Opacity);
+            }
+
+            stacked = tlrcompose16::composeRgba64ToRgba8888(placedBackToFront,
+                                                            opacities,
+                                                            canvas);
+        } else {
         QImage composed(base.size(), QImage::Format_ARGB32_Premultiplied);
         composed.fill(Qt::transparent);
         QPainter p(&composed);
@@ -900,6 +932,7 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
         p.end();
 
         stacked = composed.convertToFormat(QImage::Format_RGBA8888);
+        }
     } else {
         // Track-matte timelines: the matte ADJACENCY contract ("the clip above
         // provides the matte'd clip's alpha") is encoded as array-index links

@@ -117,6 +117,7 @@ int runPlaybackQualityPolicySelftest();
 int runGpuCompositeFlagSelftest();
 int runGpuCompositeMathSelftest();
 int runHdrCompositeMathSelftest();
+int runHdrExport16Selftest();
 int runGpuCompositeParitySelftest();
 int runHdrCompositeParitySelftest();
 
@@ -217,6 +218,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "GpuCompositeMath: paint order, layer transform matrix, premul source-over, matte validity (15 gates)" },
     { "hdr-composite-math", "VEDITOR_HDR_COMPOSITE_MATH_SELFTEST", runHdrCompositeMathSelftest, false,
       "HdrCompositeMath: 16-bit premul source-over + 8-bit SSOT parity + extra-precision proof + paint order (6 gates)" },
+    { "hdr-export16",     "VEDITOR_HDR_EXPORT16_SELFTEST",       runHdrExport16Selftest,       false,
+      "TlrCompose16: export SSOT の matte-free 16bit RGBA64 積層→to8bit パリティ + env フラグ + extra-precision (8 gates)" },
     { "live-matte-resolve", "VEDITOR_LIVE_MATTE_RESOLVE_SELFTEST", runLiveMatteResolveSelftest, false,
       "LiveMatteResolve: clipId->index matte source resolution (STAGE4B) — valid + self/base/unknown rejection + no-matte/multi-matte (6 gates)" },
     { "auto-proxy-policy",  "VEDITOR_AUTO_PROXY_POLICY_SELFTEST",  runAutoProxyPolicySelftest,     false,
