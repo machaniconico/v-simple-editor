@@ -397,6 +397,9 @@ private:
         QImage lastFrameRgb;
         int64_t lastFramePresentedTimelineUs = -1;
         bool firstFrameDecoded = false;
+        // HDR Stage4: write-once in openTrackDecoder from clip HDR metadata
+        // and VEDITOR_HDR_OVERLAY. Default false keeps the RGB888 path.
+        bool wantRgba64Overlay = false;
         // > 0 means this decoder has been moved into the eviction grace
         // pool. Decremented per playback tick; reaches 0 → safe to free
         // (deferred outside decode loop).

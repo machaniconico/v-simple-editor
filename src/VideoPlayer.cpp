@@ -7,6 +7,7 @@
 #include "TrackMatteKey.h"     // STAGE4B: trackMatteClipKey (canonical matte clip key)
 #include "playback/LiveMatteResolve.h" // STAGE4B: clipstack::resolveLiveMatteSources
 #include "playback/hdrexport16_flag.h"
+#include "playback/hdroverlay_flag.h"
 #include "playback/TlrCompose16.h"
 #include "playback/HdrCompositeMath.h"
 #include "gpucomposite_flag.h"
@@ -4492,6 +4493,8 @@ VideoPlayer::TrackDecoder *VideoPlayer::openTrackDecoder(const PlaybackEntry &en
     if (stallTraceEnabled())
         stallTimer.start();
     auto *d = new TrackDecoder();
+    d->wantRgba64Overlay =
+        hdroverlay::wantRgba64(hdroverlay::enabledFromEnv(), entry.colorMeta.isHdr);
     d->sourceClipIndex = entry.sourceClipIndex;
     d->sourceTrack = entry.sourceTrack;
     d->filePath = entry.filePath;
@@ -5086,29 +5089,39 @@ bool VideoPlayer::decodePoolFrame(TrackDecoder *d, bool ensureRgb)
         if (!displayable || displayable->width <= 0 || displayable->height <= 0)
             return false;
 
-        // sws_scale into a QImage. Pool stays SDR for the MVP — HDR overlay
-        // mixing isn't supported yet (V1 still drives the HDR transfer
-        // metadata). RGB24 is fine for SourceOver compositing because we
-        // promote to ARGB32_Premultiplied in composeMultiTrackFrame anyway.
+        // HDR Stage4: RGBA64 container only — transfer curve is NOT tone-mapped here (F1).
+        const bool wantHdr = d->wantRgba64Overlay;
+        const AVPixelFormat dstPixFmt = wantHdr ? AV_PIX_FMT_RGBA64LE : AV_PIX_FMT_RGB24;
+        const QImage::Format qFmt = wantHdr ? QImage::Format_RGBA64 : QImage::Format_RGB888;
+
         const int proxy = playbackProxyDivisor();
         const int dstW = qMax(2, displayable->width  / proxy);
         const int dstH = qMax(2, displayable->height / proxy);
+
         d->swsCtx = sws_getCachedContext(
             d->swsCtx,
-            displayable->width, displayable->height,
+            displayable->width,
+            displayable->height,
             static_cast<AVPixelFormat>(displayable->format),
-            dstW, dstH,
-            AV_PIX_FMT_RGB24,
-            SWS_BILINEAR, nullptr, nullptr, nullptr);
+            dstW,
+            dstH,
+            dstPixFmt,
+            SWS_BILINEAR,
+            nullptr,
+            nullptr,
+            nullptr);
+
         if (!d->swsCtx)
             return false;
-        QImage image(dstW, dstH, QImage::Format_RGB888);
+
+        QImage image(dstW, dstH, qFmt);
         if (image.isNull())
             return false;
-        uint8_t *dest[4]      = { image.bits(), nullptr, nullptr, nullptr };
-        int      destLines[4] = { static_cast<int>(image.bytesPerLine()), 0, 0, 0 };
+
+        uint8_t *dest[4] = { image.bits(), nullptr, nullptr, nullptr };
+        int destLinesize[4] = { static_cast<int>(image.bytesPerLine()), 0, 0, 0 };
         sws_scale(d->swsCtx, displayable->data, displayable->linesize, 0,
-                  displayable->height, dest, destLines);
+                  displayable->height, dest, destLinesize);
 
         // Commit position + frame only after the full pipeline succeeded.
         d->currentPositionUs = positionUs;
