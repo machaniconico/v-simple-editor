@@ -12,8 +12,10 @@
 #include "ClipGeometry.h"       // G3 — canonical clip-placement SSOT (clipgeom)
 #include "TrackMatteKey.h"      // RM-1.1 — single shared clip-key formula
 #include "playback/TlrCompose16.h"
+#include "playback/clipidt_flag.h"
 #include "playback/hdrexport16_flag.h"
 #include "color/ClipColor.h"    // HDR Stage1 — per-clip color metadata plumbing
+#include "color/ClipColorTransform.h"
                                 // TM-8 — track-matte wiring is now read from
                                 // Timeline::trackMatteEntries() (no MainWindow
                                 // include, no #define private public, no
@@ -704,6 +706,7 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
         double videoDx = 0.0;
         double videoDy = 0.0;
         double rotationDeg = 0.0;   // G3: == ClipInfo::rotation2DDegrees
+        clipcolor::ColorMeta colorMeta;
     };
     QVector<RenderLayer> renderLayers;
     QVector<OverlayLayer> overlays;
@@ -773,6 +776,7 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
         overlay.videoDx = c.videoDx;
         overlay.videoDy = c.videoDy;
         overlay.rotationDeg = c.rotation2DDegrees;   // G3: carry clip rotation
+        overlay.colorMeta = c.colorMeta;
         overlays.append(overlay);
 
         renderLayer.layer.name = c.displayName;
@@ -882,21 +886,33 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
             placedBackToFront.reserve(overlays.size() + 1);
             opacities.reserve(overlays.size() + 1);
 
+            const bool idtEnabled = clipidt::enabledFromEnv();
+            aces::ColorSpace v1OutputSpace = aces::ColorSpace::sRGB;
+            if (idtEnabled)
+                v1OutputSpace = clipcolor::acesSpaceFor(v1Clip.colorMeta);
+
             for (int i = overlays.size() - 1; i >= 0; --i) {
                 const OverlayLayer &L = overlays[i];
                 if (L.rgb.isNull() || L.opacity <= 0.001)
                     continue;
                 const clipgeom::ClipTransform t{L.videoScale, L.videoDx,
                                                 L.videoDy, L.rotationDeg};
-                const QImage placed =
+                QImage placed =
                     clipgeom::renderLayer(L.rgb, t, canvas, /*smooth=*/true);
+                if (idtEnabled)
+                    placed = clipcolor::toUnifiedSpace(placed, L.colorMeta, v1OutputSpace);
                 placedBackToFront.append(placed);
                 opacities.append(qBound(0.0, L.opacity, 1.0));
             }
 
             const double v1Opacity = qBound(0.0, v1Clip.opacity, 1.0);
             if (v1Opacity > 0.001) {
-                placedBackToFront.append(base);
+                QImage v1Base = base;
+                if (idtEnabled)
+                    v1Base = clipcolor::toUnifiedSpace(v1Base,
+                                                       v1Clip.colorMeta,
+                                                       v1OutputSpace);
+                placedBackToFront.append(v1Base);
                 opacities.append(v1Opacity);
             }
 

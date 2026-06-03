@@ -6,10 +6,12 @@
 #include "ClipGeometry.h"      // clipgeom::renderLayer (shared clip-placement SSOT)
 #include "TrackMatteKey.h"     // STAGE4B: trackMatteClipKey (canonical matte clip key)
 #include "playback/LiveMatteResolve.h" // STAGE4B: clipstack::resolveLiveMatteSources
+#include "playback/clipidt_flag.h"
 #include "playback/hdrexport16_flag.h"
 #include "playback/hdroverlay_flag.h"
 #include "playback/TlrCompose16.h"
 #include "playback/HdrCompositeMath.h"
+#include "color/ClipColorTransform.h"
 #include "gpucomposite_flag.h"
 #include <algorithm>           // std::stable_sort
 
@@ -4941,6 +4943,7 @@ QImage VideoPlayer::tryGpuComposeLayers(const QVector<DecodedLayer> &layers,
             continue;  // CPU 経路と同じスキップ条件
         GpuLayerInput in;
         in.image = L.rgb;
+        in.colorMeta = L.colorMeta;
         in.desc.sourceTrack        = L.sourceTrack;
         in.desc.srcSize            = L.rgb.size();
         in.desc.opacity            = L.opacity;
@@ -5000,7 +5003,27 @@ QImage VideoPlayer::tryGpuComposeLayers(const QVector<DecodedLayer> &layers,
                                          hasMatte,
                                          static_cast<int>(inputs.size()),
                                          allRgba64)) {
-        const QImage out16 = m_gpuCompositor->composite16(inputs, canvas);
+        const QVector<GpuLayerInput>* composite16Inputs = &inputs;
+        QVector<GpuLayerInput> conv;
+        if (clipidt::enabledFromEnv()) {
+            int v1Index = 0;
+            for (int i = 1; i < inputs.size(); ++i) {
+                if (inputs.at(i).desc.sourceTrack < inputs.at(v1Index).desc.sourceTrack)
+                    v1Index = i;
+            }
+            const aces::ColorSpace v1OutputSpace =
+                clipcolor::acesSpaceFor(inputs.at(v1Index).colorMeta);
+
+            conv = inputs;
+            for (int i = 0; i < conv.size(); ++i) {
+                conv[i].image = clipcolor::toUnifiedSpace(inputs.at(i).image,
+                                                          inputs.at(i).colorMeta,
+                                                          v1OutputSpace);
+            }
+            composite16Inputs = &conv;
+        }
+
+        const QImage out16 = m_gpuCompositor->composite16(*composite16Inputs, canvas);
         if (!out16.isNull() && out16.size() == canvas) {
             const QImage out8 = hdrcomposite::to8bit(out16);
             if (!out8.isNull() && out8.size() == canvas)

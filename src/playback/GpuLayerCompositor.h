@@ -6,6 +6,7 @@
 
 #include <memory>
 
+#include "color/ClipColor.h"
 #include "GpuCompositeMath.h"
 
 // GpuLayerCompositor: Stage 2 of the GPU multi-track compositor.
@@ -83,6 +84,7 @@ class QOpenGLTexture;
 // One decoded layer fed to the GPU compositor.
 struct GpuLayerInput {
     QImage                  image;   // RGBA frame (RGBA8888 / ARGB32 family). Null/empty == skip.
+    clipcolor::ColorMeta    colorMeta; // Per-clip input color metadata for Stage5 IDT.
     gpucomposite::LayerDesc desc;    // placement + opacity + matte info (matteSourceIndex / matteType)
 };
 
