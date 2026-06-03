@@ -96,6 +96,9 @@ double eotf(ColorSpace cs, double encoded);
 // IDT: 入力表示符号値 -> eotf で線形化 -> ACEScg(作業色) へ変換した Vec3 を返す。
 Vec3 idt(ColorSpace inputSpace, const Vec3& encodedInput);
 
+// ACES filmic tone-map approximation shared by RRT+ODT and clip ODT engines.
+double acesFilmicTonemap(double x);
+
 // RRT+ODT: ACEScg 線形 -> トーンマップ (acesFilmic 近似でハイライト圧縮) -> 出力色の
 // プライマリへ変換 -> oetf で符号化した Vec3 を返す。
 Vec3 rrtOdt(const Vec3& acescgLinear, ColorSpace outputSpace);

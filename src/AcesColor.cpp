@@ -251,8 +251,6 @@ double eotf(ColorSpace cs, double encoded)
 // ===========================================================================
 // IDT / RRT+ODT / process
 // ===========================================================================
-namespace {
-
 // ACES filmic トーンマップ近似 (Narkowicz の RRT+ODT フィット, ハイライト圧縮)。
 // 入力線形 -> 出力線形 (display referred 近似)。
 double acesFilmicTonemap(double x)
@@ -268,8 +266,6 @@ double acesFilmicTonemap(double x)
     if (den <= 0.0) return 0.0;
     return num / den;
 }
-
-} // namespace
 
 Vec3 idt(ColorSpace inputSpace, const Vec3& encodedInput)
 {

@@ -214,11 +214,14 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/color/ClipColor.cpp
     src/color/ClipColorTransform.h
     src/color/ClipColorTransform.cpp
+    src/color/ClipOdt.h
+    src/color/ClipOdt.cpp
     src/AscCdlExportDialog.h
     src/AscCdlExportDialog.cpp
     src/selftests/asc_cdl_export_selftest.cpp
     src/selftests/clip_color_selftest.cpp
     src/selftests/clip_idt_selftest.cpp
+    src/selftests/clip_odt_selftest.cpp
     # Playback quality/cache (マルチトラック再生強化): CompositeFrameCache + PlaybackQualityPolicy。
     src/playback/CompositeFrameCache.h
     src/playback/CompositeFrameCache.cpp

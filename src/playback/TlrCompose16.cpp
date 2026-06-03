@@ -8,9 +8,9 @@
 
 namespace tlrcompose16 {
 
-QImage composeRgba64ToRgba8888(const QVector<QImage>& placedBackToFront,
-                               const QVector<double>& opacities,
-                               QSize canvasSize)
+QImage composeRgba64(const QVector<QImage>& placedBackToFront,
+                     const QVector<double>& opacities,
+                     QSize canvasSize)
 {
     if (canvasSize.isEmpty())
         return QImage();
@@ -35,7 +35,15 @@ QImage composeRgba64ToRgba8888(const QVector<QImage>& placedBackToFront,
     }
     painter.end();
 
-    return hdrcomposite::to8bit(canvas64).convertToFormat(QImage::Format_RGBA8888);
+    return canvas64;
+}
+
+QImage composeRgba64ToRgba8888(const QVector<QImage>& placedBackToFront,
+                               const QVector<double>& opacities,
+                               QSize canvasSize)
+{
+    return hdrcomposite::to8bit(composeRgba64(placedBackToFront, opacities, canvasSize))
+        .convertToFormat(QImage::Format_RGBA8888);
 }
 
 QImage composeRgba64ToRgba8888(const QVector<QImage>& placedBackToFront,

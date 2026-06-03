@@ -83,6 +83,28 @@ quint64 convertStraightRgb(quint16 r,
     return packRgb16(outR, outG, outB);
 }
 
+quint64 convertStraightRgbToLinearWorking(quint16 r,
+                                          quint16 g,
+                                          quint16 b,
+                                          const aces::Mat3& matrix,
+                                          aces::ColorSpace inputSpace)
+{
+    const aces::Vec3 encodedIn = {
+        static_cast<double>(r) / kMax16,
+        static_cast<double>(g) / kMax16,
+        static_cast<double>(b) / kMax16
+    };
+    const aces::Vec3 linearIn = {
+        aces::eotf(inputSpace, encodedIn[0]),
+        aces::eotf(inputSpace, encodedIn[1]),
+        aces::eotf(inputSpace, encodedIn[2])
+    };
+    const aces::Vec3 linearWorking = aces::apply(matrix, linearIn);
+    return packRgb16(clampTo16(linearWorking[0]),
+                     clampTo16(linearWorking[1]),
+                     clampTo16(linearWorking[2]));
+}
+
 } // namespace
 
 aces::ColorSpace acesSpaceFor(const ColorMeta& meta)
@@ -146,6 +168,68 @@ QImage toUnifiedSpace(const QImage& rgba64Premul,
             } else {
                 const quint64 packed = convertStraightRgb(straightR, straightG, straightB,
                                                           matrix, inputSpace, outputSpace);
+                unpackRgb16(packed, outR, outG, outB);
+                if (cache.size() < kCacheReserve)
+                    cache.emplace(key, packed);
+            }
+
+            line[x] = qRgba64(premultiply16(outR, a),
+                              premultiply16(outG, a),
+                              premultiply16(outB, a),
+                              a);
+        }
+    }
+
+    return out;
+}
+
+QImage toLinearWorking(const QImage& rgba64Premul, const ColorMeta& in)
+{
+    if (rgba64Premul.isNull()
+        || rgba64Premul.width() <= 0
+        || rgba64Premul.height() <= 0) {
+        return rgba64Premul;
+    }
+
+    const aces::ColorSpace inputSpace = acesSpaceFor(in);
+
+    // Stage6 gap mirrors toUnifiedSpace(): PQ/HLG are not decoded by the ACES
+    // sRGB-style helpers, so HDR transfer clips remain untouched until the
+    // dedicated HDR transfer work lands.
+    if (in.transfer == Transfer::PQ || in.transfer == Transfer::HLG)
+        return rgba64Premul;
+
+    QImage out = rgba64Premul.convertToFormat(QImage::Format_RGBA64_Premultiplied);
+    const aces::Mat3 matrix = aces::conversionMatrix(inputSpace,
+                                                     aces::ColorSpace::Rec2020);
+
+    std::unordered_map<quint64, quint64> cache;
+    cache.reserve(kCacheReserve);
+
+    for (int y = 0; y < out.height(); ++y) {
+        QRgba64* line = reinterpret_cast<QRgba64*>(out.scanLine(y));
+        for (int x = 0; x < out.width(); ++x) {
+            const QRgba64 px = line[x];
+            const quint16 a = px.alpha();
+            if (a == 0) {
+                line[x] = qRgba64(0, 0, 0, 0);
+                continue;
+            }
+
+            const quint16 straightR = unpremultiply16(px.red(), a);
+            const quint16 straightG = unpremultiply16(px.green(), a);
+            const quint16 straightB = unpremultiply16(px.blue(), a);
+            const quint64 key = cacheKey(straightR, straightG, straightB);
+
+            quint16 outR = 0;
+            quint16 outG = 0;
+            quint16 outB = 0;
+            const auto it = cache.find(key);
+            if (it != cache.end()) {
+                unpackRgb16(it->second, outR, outG, outB);
+            } else {
+                const quint64 packed = convertStraightRgbToLinearWorking(
+                    straightR, straightG, straightB, matrix, inputSpace);
                 unpackRgb16(packed, outR, outG, outB);
                 if (cache.size() < kCacheReserve)
                     cache.emplace(key, packed);
