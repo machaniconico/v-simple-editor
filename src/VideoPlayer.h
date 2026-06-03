@@ -17,6 +17,7 @@
 #include <functional>
 #include "VideoEffect.h"
 #include "PlaybackTypes.h"
+#include "color/ClipColor.h"
 #include "MaskSystem.h"  // STAGE4B: TrackMatteType for DecodedLayer matte fields
 #include "TextManager.h"
 #include "DecoderSlotManager.h"
@@ -421,6 +422,7 @@ public:
     struct DecodedLayer {
         QImage rgb;
         double opacity = 1.0;
+        clipcolor::ColorMeta colorMeta;
         double videoScale = 1.0;
         double videoDx = 0.0;
         double videoDy = 0.0;

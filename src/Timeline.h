@@ -22,6 +22,7 @@
 #include "SnapEngine.h"
 #include "MarkerData.h"
 #include "SpeedRampData.h"
+#include "color/ClipColor.h"
 #include "AdjustmentLayer.h"
 #include "MotionStabilizer.h"
 #include "Camera3D.h"
@@ -99,6 +100,10 @@ struct ClipInfo {
     // V1-wins behaviour). <1.0 values are placeholders until the layered
     // compositor lands in a follow-up iteration.
     double opacity = 1.0;
+
+    // HDR Stage1: per-clip input color metadata. Default SDR is deliberately
+    // inert and is omitted from project JSON to preserve old files byte-for-byte.
+    clipcolor::ColorMeta colorMeta;
 
     // Phase 3: Color correction, effects, keyframes
     ColorCorrection colorCorrection;

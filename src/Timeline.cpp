@@ -5194,6 +5194,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         double videoDy = 0.0;
         double rotation2DDegrees = 0.0;
         double opacity = 1.0;
+        clipcolor::ColorMeta colorMeta;
         double volume = 1.0;
         QVector<AudioGainPoint> volumeEnvelope;
         int clipIdx = -1;
@@ -5235,6 +5236,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
                 iv.videoDy = c.videoDy;
                 iv.rotation2DDegrees = c.rotation2DDegrees;
                 iv.opacity = c.opacity;
+                iv.colorMeta = c.colorMeta;
                 iv.volume = c.volume;
                 iv.volumeEnvelope = c.volumeEnvelope;
                 iv.clipIdx = ci;
@@ -5367,6 +5369,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         e.videoDy = iv.videoDy;
         e.rotation2DDegrees = iv.rotation2DDegrees;
         e.opacity = iv.opacity;
+        e.colorMeta = iv.colorMeta;
         e.volume = iv.volume;
         e.volumeEnvelope = iv.volumeEnvelope;
         e.sourceClipIndex = iv.clipIdx;

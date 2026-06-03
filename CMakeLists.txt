@@ -210,9 +210,12 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     # ASC CDL (.cc/.ccc/.cdl 書き出し): ASC CDL v1.01 SOP/Sat の純粋エンジン。
     src/colorexport/AscCdlExport.h
     src/colorexport/AscCdlExport.cpp
+    src/color/ClipColor.h
+    src/color/ClipColor.cpp
     src/AscCdlExportDialog.h
     src/AscCdlExportDialog.cpp
     src/selftests/asc_cdl_export_selftest.cpp
+    src/selftests/clip_color_selftest.cpp
     # Playback quality/cache (マルチトラック再生強化): CompositeFrameCache + PlaybackQualityPolicy。
     src/playback/CompositeFrameCache.h
     src/playback/CompositeFrameCache.cpp

@@ -5,6 +5,7 @@
 #include <QVector>
 #include "Overlay.h"
 #include "MotionStabilizer.h"
+#include "color/ClipColor.h"
 
 // Volume automation point.
 //   time = clip-local TIMELINE-display seconds (0.0 == the entry's
@@ -44,6 +45,7 @@ struct PlaybackEntry {
                                     // clipgeom SSOT (rotate step) identically
                                     // to the export path.
     double opacity = 1.0;        // PiP alpha, propagated from ClipInfo::opacity
+    clipcolor::ColorMeta colorMeta; // Per-clip input color metadata (Stage1 storage only)
     double volume = 1.0;         // Per-clip audio gain (0.0-2.0), propagated from ClipInfo::volume
     int sourceClipIndex = -1;    // Index into TimelineTrack::m_clips
 

@@ -2,6 +2,7 @@
 #include "AudioMixer.h"
 #include "MarkerData.h"
 #include "AdjustmentLayer.h"
+#include "color/ClipColor.h"
 #include <QBuffer>
 #include <QFile>
 #include <QJsonDocument>
@@ -1310,6 +1311,8 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
 
     if (!clip.colorCorrection.isDefault())
         obj["colorCorrection"] = colorCorrectionToJson(clip.colorCorrection);
+    if (!clip.colorMeta.isDefault())
+        obj["colorMeta"] = clipcolor::toJson(clip.colorMeta);
 
     if (!clip.effects.isEmpty()) {
         QJsonArray fxArr;
@@ -1375,6 +1378,9 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
 
     if (obj.contains("colorCorrection"))
         clip.colorCorrection = colorCorrectionFromJson(obj["colorCorrection"].toObject());
+    clip.colorMeta = obj.contains("colorMeta")
+        ? clipcolor::fromJson(obj["colorMeta"].toObject())
+        : clipcolor::defaultSdr();
 
     if (obj.contains("effects")) {
         for (const auto &v : obj["effects"].toArray())

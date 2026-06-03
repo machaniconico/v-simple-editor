@@ -3770,6 +3770,7 @@ void VideoPlayer::handlePlaybackTick()
                     layer.rgb = m_lastV1RawFrame;
                     layer.isFresh = true;
                     layer.opacity = e.opacity;
+                    layer.colorMeta = e.colorMeta;
                     layer.videoScale = e.videoScale;
                     layer.videoDx = e.videoDx;
                     layer.videoDy = e.videoDy;
@@ -3860,6 +3861,7 @@ void VideoPlayer::handlePlaybackTick()
                         continue;
                 }
                 layer.opacity = e.opacity;
+                layer.colorMeta = e.colorMeta;
                 layer.videoScale = e.videoScale;
                 layer.videoDx = e.videoDx;
                 layer.videoDy = e.videoDy;
@@ -5215,6 +5217,7 @@ bool VideoPlayer::finalizeOverlayFromDecoder(const PlaybackEntry &e, int seqIdx,
     }
 
     out->opacity            = e.opacity;
+    out->colorMeta          = e.colorMeta;
     out->videoScale         = e.videoScale;
     out->videoDx            = e.videoDx;
     out->videoDy            = e.videoDy;
@@ -5255,7 +5258,10 @@ bool VideoPlayer::harvestOverlayLayer(const PlaybackEntry &e, int seqIdx, Decode
         const int64_t clipOutUs = static_cast<int64_t>(e.clipOut * AV_TIME_BASE);
         ok = runOverlayDecodeForDecoder(d, expectedFileLocalUs, clipInUs, clipOutUs);
     }
-    return finalizeOverlayFromDecoder(e, seqIdx, d, ok, out);
+    const bool finalized = finalizeOverlayFromDecoder(e, seqIdx, d, ok, out);
+    if (finalized)
+        out->colorMeta = e.colorMeta;
+    return finalized;
 }
 
 bool VideoPlayer::hasOverlayActive(const QVector<int> &activeIdxs) const

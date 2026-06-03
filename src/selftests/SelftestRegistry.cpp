@@ -35,6 +35,7 @@ int runBlenderSelftest();
 int runBroadcastCaptionSelftest();
 int runCaptionSelftest();
 int runChromaSelftest();
+int runClipColorSelftest();
 int runCloudRenderSelftest();
 int runCollabSelftest();
 int runColorMatchSelftest();
@@ -204,6 +205,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "PptxExport: OOXML part tree + store-ZIP/CRC32 + slide XML well-formed + escaping" },
     { "asc-cdl-export",   "VEDITOR_ASC_CDL_EXPORT_SELFTEST",     runAscCdlExportSelftest,       false,
       "AscCdlExport: ASC CDL v1.01 .cc/.ccc/.cdl XML + LGG->SOP mapping + 6-decimal format + guards (13 gates)" },
+    { "clip-color",       "VEDITOR_CLIP_COLOR_SELFTEST",         runClipColorSelftest,          false,
+      "ClipColor: per-clip 色メタデータ模型 — defaultSdr / JSON round-trip / token 逆写像 / describe (>=10 gates)" },
     { "composite-frame-cache", "VEDITOR_COMPOSITE_FRAME_CACHE_SELFTEST", runCompositeFrameCacheSelftest, false,
       "CompositeFrameCache: LRU eviction + key hashing + hit/miss accounting" },
     { "playback-quality-policy", "VEDITOR_PLAYBACK_QUALITY_POLICY_SELFTEST", runPlaybackQualityPolicySelftest, false,

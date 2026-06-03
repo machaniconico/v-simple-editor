@@ -11,6 +11,7 @@
 #include "TrackMatteBake.h"     // TM-3 — shared SSOT track-matte compositor
 #include "ClipGeometry.h"       // G3 — canonical clip-placement SSOT (clipgeom)
 #include "TrackMatteKey.h"      // RM-1.1 — single shared clip-key formula
+#include "color/ClipColor.h"    // HDR Stage1 — per-clip color metadata plumbing
                                 // TM-8 — track-matte wiring is now read from
                                 // Timeline::trackMatteEntries() (no MainWindow
                                 // include, no #define private public, no
@@ -692,6 +693,7 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
         CompositeLayer layer;
         QString clipId;
         QImage image;      // already transformed to outSize
+        clipcolor::ColorMeta colorMeta;
     };
     struct OverlayLayer {
         QImage rgb;        // already scaled to outSize (the shared canvas grid)
@@ -707,6 +709,7 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
         RenderLayer baseLayer;
         baseLayer.clipId = renderClipId(0, v1Idx);
         baseLayer.image = base;
+        baseLayer.colorMeta = v1Clip.colorMeta;
         baseLayer.layer.name = v1Clip.displayName;
         baseLayer.layer.visible = v1Clip.opacity > 0.001;
         baseLayer.layer.opacity = qBound(0.0, v1Clip.opacity, 1.0);
@@ -752,6 +755,7 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
             applyClipFxPack(gradeClipNativeFrame(nativeRaw, c), c), c, srcSec);
         RenderLayer renderLayer;
         renderLayer.clipId = renderClipId(t, idx);
+        renderLayer.colorMeta = c.colorMeta;
         // Scale the overlay source to the shared canvas grid first; the
         // compositor's videoScale then sizes the dst rect relative to the
         // canvas exactly as composeMultiTrackFrame does for L.rgb.
