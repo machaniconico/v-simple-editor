@@ -243,6 +243,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/playback/TlrCompose16.h
     src/playback/TlrCompose16.cpp
     src/selftests/hdr_export16_selftest.cpp
+    src/selftests/preview16_policy_selftest.cpp
     # GPU layer compositor (Stage 2 offscreen-FBO compositor + GPU/CPU parity selftest)。
     src/playback/GpuLayerCompositor.h
     src/playback/GpuLayerCompositor.cpp

@@ -16,4 +16,9 @@ inline bool enabledFromEnv()
     return enabledFromEnvValue(QString::fromLatin1(qgetenv("VEDITOR_HDR_EXPORT16")));
 }
 
+inline bool preview16Applicable(bool flagEnabled, bool hasMatte, int layerCount, bool allRgba64)
+{
+    return flagEnabled && !hasMatte && layerCount >= 2 && allRgba64;
+}
+
 } // namespace hdrexport16

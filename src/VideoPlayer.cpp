@@ -6,6 +6,9 @@
 #include "ClipGeometry.h"      // clipgeom::renderLayer (shared clip-placement SSOT)
 #include "TrackMatteKey.h"     // STAGE4B: trackMatteClipKey (canonical matte clip key)
 #include "playback/LiveMatteResolve.h" // STAGE4B: clipstack::resolveLiveMatteSources
+#include "playback/hdrexport16_flag.h"
+#include "playback/TlrCompose16.h"
+#include "playback/HdrCompositeMath.h"
 #include "gpucomposite_flag.h"
 #include <algorithm>           // std::stable_sort
 
@@ -4985,6 +4988,22 @@ QImage VideoPlayer::tryGpuComposeLayers(const QVector<DecodedLayer> &layers,
     // GpuLayerCompositor::composite は内部で gpucomposite::paintOrder により
     // sourceTrack 降順 (V1-wins) に並べ替えるので、CPU 側の stable_sort と
     // 同じ V1-frontmost スタッキングになる。空 QImage は GL 失敗のシグナル。
+    const bool allRgba64 = std::all_of(
+        inputs.cbegin(), inputs.cend(),
+        [](const GpuLayerInput& in) {
+            return tlrcompose16::isRgba64Format(in.image.format());
+        });
+    if (hdrexport16::preview16Applicable(hdrexport16::enabledFromEnv(),
+                                         hasMatte,
+                                         static_cast<int>(inputs.size()),
+                                         allRgba64)) {
+        const QImage out16 = m_gpuCompositor->composite16(inputs, canvas);
+        if (!out16.isNull() && out16.size() == canvas) {
+            const QImage out8 = hdrcomposite::to8bit(out16);
+            if (!out8.isNull() && out8.size() == canvas)
+                return out8;
+        }
+    }
     QImage out = m_gpuCompositor->composite(inputs, canvas);
     if (out.isNull() || out.size() != canvas)
         return QImage();  // 合成失敗 → CPU フォールバック
