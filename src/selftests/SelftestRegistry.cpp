@@ -65,6 +65,7 @@ int runLibavcoreEncodeSelftest();
 int runLiveMatteResolveSelftest();
 int runLoudnessSelftest();
 int runLowerThirdSelftest();
+int runMatte16ParitySelftest();
 int runMediaPoolSelftest();
 int runMobileSelftest();
 int runMographSelftest();
@@ -251,6 +252,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "GPU (GpuLayerCompositor FBO) vs CPU SSOT parity, matte-free scenes (SSIM>=0.98, MAE<=3..6/255, 7 gates, graceful GL skip)" },
     { "hdr-composite-parity", "VEDITOR_HDR_COMPOSITE_PARITY_SELFTEST", runHdrCompositeParitySelftest, true,
       "GPU RGBA16 FBO (composite16) vs CPU 16-bit oracle (HdrCompositeMath), matte-free (8 gates incl 16-bit precision proof, graceful GL skip)" },
+    { "matte16-parity", "VEDITOR_MATTE16_PARITY_SELFTEST", runMatte16ParitySelftest, true,
+      "16-bit RGBA64 track-matte (trackmatte16::composeExport) vs 8-bit trackmatte:: SSOT parity, all 4 matte types + 16-bit precision + ODT luma-space proof (8 gates)" },
     { "vfx",               "VEDITOR_VFX_SELFTEST",                runVfxSelftest,                true,
       "VFX module smoke: Sprint-6 effect graph + GLSL primitive pipeline" },
     { "pro",               "VEDITOR_PRO_SELFTEST",                runProSelftest,                true,

@@ -253,6 +253,11 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/hdr_export16_selftest.cpp
     src/selftests/hdr_overlay_policy_selftest.cpp
     src/selftests/preview16_policy_selftest.cpp
+    # Stage7: 16-bit RGBA64 track-matte compositor + parity selftest
+    src/playback/hdrmatte16_flag.h
+    src/playback/TrackMatteCompose16.h
+    src/playback/TrackMatteCompose16.cpp
+    src/selftests/matte16_parity_selftests.cpp
     # GPU layer compositor (Stage 2 offscreen-FBO compositor + GPU/CPU parity selftest)。
     src/playback/GpuLayerCompositor.h
     src/playback/GpuLayerCompositor.cpp
