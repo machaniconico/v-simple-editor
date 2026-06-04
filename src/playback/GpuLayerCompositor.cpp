@@ -10,10 +10,15 @@
 #include <QOpenGLTexture>
 #include <QSurface>
 #include <QSurfaceFormat>
+#include <QMatrix3x3>
 #include <QMatrix4x4>
 #include <QVector>
 #include <QImage>
 #include <QSet>
+
+#include "AcesColor.h"
+#include "color/ClipColor.h"
+#include "color/ClipColorTransform.h"
 
 #include <cstring>   // std::memcpy (16-bit readback row copy in composite16)
 
@@ -54,6 +59,32 @@ void main() {
     // source-over, opacity scales ALL components (rgb already carry alpha).
     vec4 c = texture2D(uTex, vTexCoord);
     gl_FragColor = c * uOpacity;
+}
+)";
+
+static const char* kIdtFragSrc = R"(#version 120
+uniform sampler2D uTex;
+uniform float uOpacity;
+uniform mat3  uConvMatrix;
+uniform int   uPassthrough;
+uniform int   uApplyEotf;
+uniform int   uApplyOetf;
+varying vec2 vTexCoord;
+float srgbEotf(float e){ return (e <= 0.04045) ? (e/12.92) : pow((e+0.055)/1.055, 2.4); }
+float srgbOetf(float l){ l = max(l, 0.0); return (l <= 0.0031308) ? (12.92*l) : (1.055*pow(l, 1.0/2.4) - 0.055); }
+void main(){
+    vec4 c = texture2D(uTex, vTexCoord);
+    float a = c.a;
+    if (a <= 0.0) { gl_FragColor = vec4(0.0); return; }
+    if (uPassthrough == 1) { gl_FragColor = c * uOpacity; return; }
+    vec3 straight = c.rgb / a;
+    vec3 lin = (uApplyEotf == 1) ? vec3(srgbEotf(straight.r), srgbEotf(straight.g), srgbEotf(straight.b)) : straight;
+    vec3 outLin = uConvMatrix * lin;
+    vec3 outRgb;
+    if (uApplyOetf == 1) outRgb = vec3(srgbOetf(outLin.r), srgbOetf(outLin.g), srgbOetf(outLin.b));
+    else outRgb = max(outLin, vec3(0.0));
+    outRgb = clamp(outRgb, 0.0, 1.0);
+    gl_FragColor = vec4(outRgb * a, a) * uOpacity;
 }
 )";
 
@@ -207,10 +238,15 @@ void GpuLayerCompositor::releaseGlResources() {
     m_matteFboSrc16.reset();
     m_matteFboMatte16.reset();
     m_prog.reset();          // QOpenGLShaderProgram dtor frees the program
+    m_idtProg.reset();
     m_matteProg.reset();
 
     m_uLayer = m_uProj = m_uTex = m_uOpacity = -1;
     m_aSrcPos = m_aTexCoord = -1;
+    m_idt_uLayer = m_idt_uProj = m_idt_uTex = m_idt_uOpacity = -1;
+    m_idt_uConvMatrix = m_idt_uPassthrough = m_idt_uApplyEotf = -1;
+    m_idt_uApplyOetf = -1;
+    m_idt_aSrcPos = m_idt_aTexCoord = -1;
     m_mSrcTex = m_mMatteTex = m_mMatteType = m_mOpacity = -1;
     m_mAPos = m_mATexCoord = -1;
 }
@@ -289,6 +325,35 @@ bool GpuLayerCompositor::ensureProgram() {
     m_uOpacity  = prog->uniformLocation("uOpacity");
 
     m_prog = std::move(prog);
+    return true;
+}
+
+bool GpuLayerCompositor::ensureIdtProgram() {
+    // Compile/link the per-fragment IDT program ONCE. It deliberately reuses
+    // kVertSrc but has its own fragment shader, program object, and locations.
+    if (m_idtProg)
+        return true;
+
+    auto prog = std::make_unique<QOpenGLShaderProgram>();
+    const bool ok =
+        prog->addShaderFromSourceCode(QOpenGLShader::Vertex, kVertSrc) &&
+        prog->addShaderFromSourceCode(QOpenGLShader::Fragment, kIdtFragSrc) &&
+        prog->link();
+    if (!ok)
+        return false;
+
+    m_idt_aSrcPos      = prog->attributeLocation("aSrcPos");
+    m_idt_aTexCoord    = prog->attributeLocation("aTexCoord");
+    m_idt_uLayer       = prog->uniformLocation("uLayer");
+    m_idt_uProj        = prog->uniformLocation("uProj");
+    m_idt_uTex         = prog->uniformLocation("uTex");
+    m_idt_uOpacity     = prog->uniformLocation("uOpacity");
+    m_idt_uConvMatrix  = prog->uniformLocation("uConvMatrix");
+    m_idt_uPassthrough = prog->uniformLocation("uPassthrough");
+    m_idt_uApplyEotf   = prog->uniformLocation("uApplyEotf");
+    m_idt_uApplyOetf   = prog->uniformLocation("uApplyOetf");
+
+    m_idtProg = std::move(prog);
     return true;
 }
 
@@ -1110,6 +1175,221 @@ QImage GpuLayerCompositor::composite16(const QVector<GpuLayerInput>& layers, QSi
     // LAST GL row, so we flip vertically on copy: dest scanline y comes from GL row
     // (h-1-y). Each RGBA64 scanline is w*4 shorts in R,G,B,A order, matching the
     // glReadPixels GL_RGBA/UInt16 layout exactly — a straight memcpy per row.
+    QImage out(canvas, QImage::Format_RGBA64_Premultiplied);
+    if (out.isNull())
+        return QImage();
+    const int rowShorts = w * 4;
+    const size_t rowBytes = size_t(rowShorts) * sizeof(quint16);
+    for (int y = 0; y < h; ++y) {
+        const quint16* srcRow = buf.constData() + size_t(h - 1 - y) * rowShorts;
+        std::memcpy(out.scanLine(y), srcRow, rowBytes);
+    }
+    return out;
+}
+
+QImage GpuLayerCompositor::composite16Idt(const QVector<GpuLayerInput>& layers, QSize canvas) {
+    // Story1 GPU IDT capability path. Structurally mirrors composite16(): same
+    // RGBA16 FBO, texture upload, matte-free paint order, Y-down ortho, blend
+    // state, and glReadPixels(GL_UNSIGNED_SHORT) readback. The only rendering
+    // difference is the separate IDT shader program and its per-layer uniforms.
+    if (canvas.width() <= 0 || canvas.height() <= 0)
+        return QImage();
+    if (!ensureContext())
+        return QImage();
+    CurrentContextGuard current(m_ctx);
+    if (!current.makeCurrent(m_surface))
+        return QImage();
+
+    QOpenGLFunctions* gl = m_ctx->functions();
+
+    if (!ensureIdtProgram())
+        return QImage();
+
+    if (!ensureFbo16(canvas))
+        return QImage();
+    QOpenGLFramebufferObject& fbo = *m_fbo16;
+    if (!fbo.bind())
+        return QImage();
+
+    gl->glViewport(0, 0, canvas.width(), canvas.height());
+
+    gl->glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    gl->glClear(GL_COLOR_BUFFER_BIT);
+
+    gl->glEnable(GL_BLEND);
+    gl->glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA,
+                            GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    gl->glDisable(GL_DEPTH_TEST);
+    gl->glDisable(GL_CULL_FACE);
+
+    QOpenGLShaderProgram& prog = *m_idtProg;
+    if (!prog.bind()) {
+        fbo.release();
+        return QImage();
+    }
+
+    QMatrix4x4 proj;
+    proj.ortho(0.0f, float(canvas.width()),
+               float(canvas.height()), 0.0f,
+               -1.0f, 1.0f);
+    prog.setUniformValue(m_idt_uProj, proj);
+    prog.setUniformValue(m_idt_uTex, 0);
+
+    const int aSrcPos   = m_idt_aSrcPos;
+    const int aTexCoord = m_idt_aTexCoord;
+
+    aces::ColorSpace outSpace = aces::ColorSpace::sRGB;
+    bool haveOutSpace = false;
+    int minSourceTrack = 0;
+    for (const GpuLayerInput& in : layers) {
+        if (!haveOutSpace || in.desc.sourceTrack < minSourceTrack) {
+            haveOutSpace = true;
+            minSourceTrack = in.desc.sourceTrack;
+            outSpace = clipcolor::acesSpaceFor(in.colorMeta);
+        }
+    }
+
+    QVector<gpucomposite::LayerDesc> descs;
+    descs.reserve(layers.size());
+    for (const auto& in : layers)
+        descs.push_back(in.desc);
+    const QVector<int> order = gpucomposite::paintOrder(descs);
+
+    if (!m_vbo) {
+        m_vbo = std::make_unique<QOpenGLBuffer>(QOpenGLBuffer::VertexBuffer);
+        if (!m_vbo->create()) {
+            m_vbo.reset();
+            prog.release();
+            fbo.release();
+            return QImage();
+        }
+        m_vbo->setUsagePattern(QOpenGLBuffer::DynamicDraw);
+    }
+
+    int poolCursor = 0;
+    auto acquireTexture16 = [&](int w, int h) -> QOpenGLTexture* {
+        if (poolCursor >= m_texPool16.size())
+            m_texPool16.push_back(nullptr);
+        QOpenGLTexture*& slot = m_texPool16[poolCursor];
+        ++poolCursor;
+
+        if (slot && slot->isCreated() &&
+            slot->width() == w && slot->height() == h &&
+            slot->format() == QOpenGLTexture::RGBA16_UNorm) {
+            return slot;
+        }
+
+        if (slot) {
+            if (slot->isCreated())
+                slot->destroy();
+            delete slot;
+            slot = nullptr;
+        }
+        auto* tex = new QOpenGLTexture(QOpenGLTexture::Target2D);
+        tex->setFormat(QOpenGLTexture::RGBA16_UNorm);
+        tex->setSize(w, h);
+        tex->setMinificationFilter(QOpenGLTexture::Nearest);
+        tex->setMagnificationFilter(QOpenGLTexture::Nearest);
+        tex->setWrapMode(QOpenGLTexture::ClampToEdge);
+        tex->allocateStorage(QOpenGLTexture::RGBA, QOpenGLTexture::UInt16);
+        if (!tex->isCreated() || !tex->isStorageAllocated()) {
+            delete tex;
+            return nullptr;
+        }
+        slot = tex;
+        return slot;
+    };
+
+    auto toQMatrix3x3 = [](const aces::Mat3& m) -> QMatrix3x3 {
+        // aces::Mat3 is row-major. QMatrix3x3 consumes row-major floats and
+        // QOpenGLShaderProgram transposes to the column-major GLSL upload.
+        const float values[9] = {
+            float(m[0][0]), float(m[0][1]), float(m[0][2]),
+            float(m[1][0]), float(m[1][1]), float(m[1][2]),
+            float(m[2][0]), float(m[2][1]), float(m[2][2])
+        };
+        return QMatrix3x3(values);
+    };
+
+    for (int idx : order) {
+        if (idx < 0 || idx >= layers.size())
+            continue;
+        const GpuLayerInput& in = layers[idx];
+        const gpucomposite::LayerDesc& d = in.desc;
+
+        if (!gpucomposite::isLayerComposited(d))
+            continue;
+        if (in.image.isNull() || in.image.width() <= 0 || in.image.height() <= 0)
+            continue;
+
+        QImage img = in.image.convertToFormat(QImage::Format_RGBA64_Premultiplied);
+
+        QOpenGLTexture* tex = acquireTexture16(img.width(), img.height());
+        if (!tex) {
+            prog.release();
+            fbo.release();
+            return QImage();
+        }
+        tex->setData(QOpenGLTexture::RGBA, QOpenGLTexture::UInt16, img.constBits());
+
+        gl->glActiveTexture(GL_TEXTURE0);
+        tex->bind(0);
+
+        const aces::ColorSpace inSpace = clipcolor::acesSpaceFor(in.colorMeta);
+        const bool passthrough =
+            in.colorMeta.transfer == clipcolor::Transfer::PQ
+            || in.colorMeta.transfer == clipcolor::Transfer::HLG
+            || inSpace == outSpace;
+        const aces::Mat3 conv =
+            passthrough ? aces::identity3()
+                        : aces::conversionMatrix(inSpace, outSpace);
+        const QMatrix3x3 convMatrix = toQMatrix3x3(conv);
+
+        const QMatrix4x4 layerMat = gpucomposite::layerTransform(d, canvas);
+        prog.setUniformValue(m_idt_uLayer, layerMat);
+        prog.setUniformValue(m_idt_uOpacity,
+                             float(gpucomposite::clampOpacity(d.opacity)));
+        prog.setUniformValue(m_idt_uConvMatrix, convMatrix);
+        prog.setUniformValue(m_idt_uPassthrough, passthrough ? 1 : 0);
+        prog.setUniformValue(m_idt_uApplyEotf,
+                             aces::isLinearSpace(inSpace) ? 0 : 1);
+        prog.setUniformValue(m_idt_uApplyOetf,
+                             aces::isLinearSpace(outSpace) ? 0 : 1);
+
+        const float sw = float(img.width());
+        const float sh = float(img.height());
+        const float verts[] = {
+            //  aSrcPos      aTexCoord
+            0.0f, 0.0f,      0.0f, 0.0f,
+            sw,   0.0f,      1.0f, 0.0f,
+            0.0f, sh,        0.0f, 1.0f,
+            sw,   sh,        1.0f, 1.0f,
+        };
+
+        m_vbo->bind();
+        m_vbo->allocate(verts, int(sizeof(verts)));
+        prog.enableAttributeArray(aSrcPos);
+        prog.enableAttributeArray(aTexCoord);
+        prog.setAttributeBuffer(aSrcPos,   GL_FLOAT, 0, 2, 4 * sizeof(float));
+        prog.setAttributeBuffer(aTexCoord, GL_FLOAT, 2 * sizeof(float), 2, 4 * sizeof(float));
+
+        gl->glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+        prog.disableAttributeArray(aSrcPos);
+        prog.disableAttributeArray(aTexCoord);
+        m_vbo->release();
+        tex->release();
+    }
+
+    prog.release();
+
+    const int w = canvas.width();
+    const int h = canvas.height();
+    QVector<quint16> buf(w * h * 4);
+    gl->glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_SHORT, buf.data());
+
+    fbo.release();
+
     QImage out(canvas, QImage::Format_RGBA64_Premultiplied);
     if (out.isNull())
         return QImage();

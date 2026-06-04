@@ -116,6 +116,12 @@ public:
     // This is a SECOND, independent path; the 8-bit composite() above is unchanged.
     QImage composite16(const QVector<GpuLayerInput>& layers, QSize canvas);
 
+    // Matte-FREE 16-bit composite with a per-fragment input color-space transform
+    // (Story1 GPU IDT capability path). Output space is the acesSpaceFor() of the
+    // minimum-sourceTrack layer (V1). PQ/HLG and same-space layers pass through.
+    // No ODT, no matte handling, and no live wiring.
+    QImage composite16Idt(const QVector<GpuLayerInput>& layers, QSize canvas);
+
     // 16-bit track-matte compositor (Stage8 S8-1). This is a pure 16-bit combine
     // in the already-correct input space: no IDT/ODT/color conversion. Renders
     // matte'd source and matte source into RGBA16 temp FBOs, combines them with
@@ -126,6 +132,7 @@ public:
 private:
     bool ensureContext();    // lazy GL bring-up; sets m_triedInit / m_available
     bool ensureProgram();    // compile/link plain layer shader once; reused thereafter
+    bool ensureIdtProgram(); // compile/link per-fragment IDT shader once; reused
     bool ensureMatteProgram(); // compile/link the two-pass matte shader once; reused
     bool ensureFbo(QSize canvas);  // create/keep MAIN FBO matching canvas size
     bool ensureFbo16(QSize canvas);// create/keep MAIN RGBA16 FBO matching canvas size
@@ -156,6 +163,7 @@ private:
 
     // Persistent, reused GL resources (created lazily under a current context).
     std::unique_ptr<QOpenGLShaderProgram>        m_prog;   // plain layer shader, compiled once
+    std::unique_ptr<QOpenGLShaderProgram>        m_idtProg; // per-fragment IDT shader, compiled once
     std::unique_ptr<QOpenGLShaderProgram>        m_matteProg; // matte combine shader, compiled once
     std::unique_ptr<QOpenGLFramebufferObject>    m_fbo;    // MAIN FBO; re-made only on size change
     std::unique_ptr<QOpenGLFramebufferObject>    m_fbo16;  // MAIN RGBA16 FBO (composite16); re-made only on size change
@@ -175,6 +183,18 @@ private:
     int m_uOpacity  = -1;
     int m_aSrcPos   = -1;
     int m_aTexCoord = -1;
+
+    // Cached locations for the IDT program (life of m_idtProg).
+    int m_idt_uLayer       = -1;
+    int m_idt_uProj        = -1;
+    int m_idt_uTex         = -1;
+    int m_idt_uOpacity     = -1;
+    int m_idt_uConvMatrix  = -1;
+    int m_idt_uPassthrough = -1;
+    int m_idt_uApplyEotf   = -1;
+    int m_idt_uApplyOetf   = -1;
+    int m_idt_aSrcPos      = -1;
+    int m_idt_aTexCoord    = -1;
 
     // Cached locations for the matte combine program (life of m_matteProg).
     int m_mSrcTex     = -1;

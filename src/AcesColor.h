@@ -88,6 +88,7 @@ Mat3 conversionMatrix(ColorSpace from, ColorSpace to);
 // ---------------------------------------------------------------------------
 double oetf(ColorSpace cs, double linear);
 double eotf(ColorSpace cs, double encoded);
+bool isLinearSpace(ColorSpace cs);
 
 // ---------------------------------------------------------------------------
 // シーンリファード パイプライン (IDT / RRT+ODT)

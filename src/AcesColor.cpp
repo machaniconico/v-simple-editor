@@ -227,14 +227,14 @@ double srgbEotf(double encoded)
     return std::pow((encoded + 0.055) / 1.055, 2.4);
 }
 
+} // namespace
+
 bool isLinearSpace(ColorSpace cs)
 {
     return cs == ColorSpace::LinearSRGB
         || cs == ColorSpace::ACEScg
         || cs == ColorSpace::ACES2065_1;
 }
-
-} // namespace
 
 double oetf(ColorSpace cs, double linear)
 {

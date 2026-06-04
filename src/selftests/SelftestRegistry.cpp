@@ -125,6 +125,7 @@ int runHdrExport16Selftest();
 int runHdrOverlayPolicySelftest();
 int runGpuCompositeParitySelftest();
 int runGpuCompositeParity16MatteSelftest();
+int runGpuIdtParitySelftest();
 int runHdrCompositeParitySelftest();
 int runPreview16PolicySelftest();
 
@@ -256,6 +257,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "GPU (GpuLayerCompositor FBO) vs CPU SSOT parity, matte-free scenes (SSIM>=0.98, MAE<=3..6/255, 7 gates, graceful GL skip)" },
     { "gpu-composite-parity-16-matte", "VEDITOR_GPU_COMPOSITE_PARITY_16_MATTE_SELFTEST", runGpuCompositeParity16MatteSelftest, true,
       "GPU RGBA16 track-matte (composite16Matte) vs CPU 16-bit matte oracle, all 4 matte types + premul + precision proof, graceful GL skip" },
+    { "gpu-idt-parity", "VEDITOR_GPU_IDT_PARITY_SELFTEST", runGpuIdtParitySelftest, true,
+      "GpuIdt: per-fragment IDT (eotf->mat3->oetf) vs aces:: CPU oracle" },
     { "hdr-composite-parity", "VEDITOR_HDR_COMPOSITE_PARITY_SELFTEST", runHdrCompositeParitySelftest, true,
       "GPU RGBA16 FBO (composite16) vs CPU 16-bit oracle (HdrCompositeMath), matte-free (8 gates incl 16-bit precision proof, graceful GL skip)" },
     { "matte16-parity", "VEDITOR_MATTE16_PARITY_SELFTEST", runMatte16ParitySelftest, true,
