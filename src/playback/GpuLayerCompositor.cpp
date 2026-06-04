@@ -204,6 +204,8 @@ void GpuLayerCompositor::releaseGlResources() {
     m_fbo16.reset();         // RGBA16 main FBO (composite16)
     m_matteFboSrc.reset();
     m_matteFboMatte.reset();
+    m_matteFboSrc16.reset();
+    m_matteFboMatte16.reset();
     m_prog.reset();          // QOpenGLShaderProgram dtor frees the program
     m_matteProg.reset();
 
@@ -360,6 +362,29 @@ bool GpuLayerCompositor::ensureFbo16(QSize canvas) {
     return true;
 }
 
+QOpenGLFramebufferObject* GpuLayerCompositor::ensureTempFbo16(
+    std::unique_ptr<QOpenGLFramebufferObject>& slot,
+    QSize canvas) {
+    // RGBA16 temp FBO for composite16Matte's two-pass matte intermediates.
+    // Same format/validity policy as ensureFbo16(): never silently fall back to
+    // RGBA8, because that would destroy sub-8-bit matte precision.
+    if (slot && slot->size() == canvas && slot->isValid())
+        return slot.get();
+
+    slot.reset();
+
+    QOpenGLFramebufferObjectFormat fboFmt;
+    fboFmt.setInternalTextureFormat(GL_RGBA16);
+    fboFmt.setAttachment(QOpenGLFramebufferObject::NoAttachment);
+
+    auto fbo = std::make_unique<QOpenGLFramebufferObject>(canvas, fboFmt);
+    if (!fbo->isValid())
+        return nullptr;
+
+    slot = std::move(fbo);
+    return slot.get();
+}
+
 bool GpuLayerCompositor::renderLayerToFbo(QOpenGLFramebufferObject& target,
                                           const QImage& img,
                                           const gpucomposite::LayerDesc& d,
@@ -411,6 +436,94 @@ bool GpuLayerCompositor::renderLayerToFbo(QOpenGLFramebufferObject& target,
 
     prog.setUniformValue(m_uLayer, gpucomposite::layerTransform(d, canvas));
     prog.setUniformValue(m_uOpacity, 1.0f);   // matte intermediates are opacity=1
+
+    const float sw = float(src.width());
+    const float sh = float(src.height());
+    const float verts[] = {
+        0.0f, 0.0f,  0.0f, 0.0f,
+        sw,   0.0f,  1.0f, 0.0f,
+        0.0f, sh,    0.0f, 1.0f,
+        sw,   sh,    1.0f, 1.0f,
+    };
+
+    m_vbo->bind();
+    m_vbo->allocate(verts, int(sizeof(verts)));
+    prog.enableAttributeArray(m_aSrcPos);
+    prog.enableAttributeArray(m_aTexCoord);
+    prog.setAttributeBuffer(m_aSrcPos,   GL_FLOAT, 0, 2, 4 * sizeof(float));
+    prog.setAttributeBuffer(m_aTexCoord, GL_FLOAT, 2 * sizeof(float), 2, 4 * sizeof(float));
+
+    gl->glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+    prog.disableAttributeArray(m_aSrcPos);
+    prog.disableAttributeArray(m_aTexCoord);
+    m_vbo->release();
+    tex->release();
+    prog.release();
+
+    tex->destroy();
+    delete tex;
+
+    target.release();
+    return true;
+}
+
+bool GpuLayerCompositor::renderLayerToFbo16(QOpenGLFramebufferObject& target,
+                                            const QImage& img,
+                                            const gpucomposite::LayerDesc& d,
+                                            QSize canvas,
+                                            const QMatrix4x4& proj) {
+    // RGBA16 sibling of renderLayerToFbo(). Renders exactly one premultiplied
+    // layer into a canvas-sized RGBA16 target with opacity forced to 1, preserving
+    // 16-bit inputs all the way through the temp matte pass.
+    if (img.isNull() || img.width() <= 0 || img.height() <= 0)
+        return false;
+    if (!m_vbo)
+        return false;
+    if (!target.bind())
+        return false;
+
+    QOpenGLFunctions* gl = m_ctx->functions();
+    gl->glViewport(0, 0, canvas.width(), canvas.height());
+    gl->glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    gl->glClear(GL_COLOR_BUFFER_BIT);
+    gl->glEnable(GL_BLEND);
+    gl->glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA,
+                            GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    gl->glDisable(GL_DEPTH_TEST);
+    gl->glDisable(GL_CULL_FACE);
+
+    QOpenGLShaderProgram& prog = *m_prog;
+    if (!prog.bind()) {
+        target.release();
+        return false;
+    }
+    prog.setUniformValue(m_uProj, proj);
+    prog.setUniformValue(m_uTex, 0);
+
+    QImage src = img.convertToFormat(QImage::Format_RGBA64_Premultiplied);
+
+    auto* tex = new QOpenGLTexture(QOpenGLTexture::Target2D);
+    tex->setFormat(QOpenGLTexture::RGBA16_UNorm);
+    tex->setSize(src.width(), src.height());
+    tex->setMinificationFilter(QOpenGLTexture::Nearest);
+    tex->setMagnificationFilter(QOpenGLTexture::Nearest);
+    tex->setWrapMode(QOpenGLTexture::ClampToEdge);
+    tex->allocateStorage(QOpenGLTexture::RGBA, QOpenGLTexture::UInt16);
+    if (!tex->isCreated() || !tex->isStorageAllocated()) {
+        prog.release();
+        tex->destroy();
+        delete tex;
+        target.release();
+        return false;
+    }
+    tex->setData(QOpenGLTexture::RGBA, QOpenGLTexture::UInt16, src.constBits());
+
+    gl->glActiveTexture(GL_TEXTURE0);
+    tex->bind(0);
+
+    prog.setUniformValue(m_uLayer, gpucomposite::layerTransform(d, canvas));
+    prog.setUniformValue(m_uOpacity, 1.0f);
 
     const float sw = float(src.width());
     const float sh = float(src.height());
@@ -997,6 +1110,314 @@ QImage GpuLayerCompositor::composite16(const QVector<GpuLayerInput>& layers, QSi
     // LAST GL row, so we flip vertically on copy: dest scanline y comes from GL row
     // (h-1-y). Each RGBA64 scanline is w*4 shorts in R,G,B,A order, matching the
     // glReadPixels GL_RGBA/UInt16 layout exactly — a straight memcpy per row.
+    QImage out(canvas, QImage::Format_RGBA64_Premultiplied);
+    if (out.isNull())
+        return QImage();
+    const int rowShorts = w * 4;
+    const size_t rowBytes = size_t(rowShorts) * sizeof(quint16);
+    for (int y = 0; y < h; ++y) {
+        const quint16* srcRow = buf.constData() + size_t(h - 1 - y) * rowShorts;
+        std::memcpy(out.scanLine(y), srcRow, rowBytes);
+    }
+    return out;
+}
+
+QImage GpuLayerCompositor::composite16Matte(const QVector<GpuLayerInput>& layers, QSize canvas) {
+    // 16-bit track-matte sibling of composite(): main FBO, per-layer textures, and
+    // matte temp FBOs are RGBA16; matte combine remains the existing float shader.
+    // Returns NULL on GL/RGBA16 failures so parity can SKIP on unsupported systems.
+    if (canvas.width() <= 0 || canvas.height() <= 0)
+        return QImage();
+    if (!ensureContext())
+        return QImage();
+    CurrentContextGuard current(m_ctx);
+    if (!current.makeCurrent(m_surface))
+        return QImage();
+
+    QOpenGLFunctions* gl = m_ctx->functions();
+
+    if (!ensureProgram())
+        return QImage();
+
+    if (!ensureFbo16(canvas))
+        return QImage();
+    QOpenGLFramebufferObject& fbo = *m_fbo16;
+    if (!fbo.bind())
+        return QImage();
+
+    gl->glViewport(0, 0, canvas.width(), canvas.height());
+    gl->glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    gl->glClear(GL_COLOR_BUFFER_BIT);
+    gl->glEnable(GL_BLEND);
+    gl->glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA,
+                            GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    gl->glDisable(GL_DEPTH_TEST);
+    gl->glDisable(GL_CULL_FACE);
+
+    QOpenGLShaderProgram& prog = *m_prog;
+    if (!prog.bind()) {
+        fbo.release();
+        return QImage();
+    }
+
+    QMatrix4x4 proj;
+    proj.ortho(0.0f, float(canvas.width()),
+               float(canvas.height()), 0.0f,
+               -1.0f, 1.0f);
+    prog.setUniformValue(m_uProj, proj);
+    prog.setUniformValue(m_uTex, 0);
+
+    const int aSrcPos   = m_aSrcPos;
+    const int aTexCoord = m_aTexCoord;
+
+    QVector<gpucomposite::LayerDesc> descs;
+    descs.reserve(layers.size());
+    for (const auto& in : layers)
+        descs.push_back(in.desc);
+    const QVector<int> order = gpucomposite::paintOrder(descs);
+
+    QSet<int> matteSourceIndices;
+    for (int i = 0; i < descs.size(); ++i) {
+        const gpucomposite::LayerDesc& d = descs[i];
+        if (d.matteType == gpucomposite::MatteType::None)
+            continue;
+        if (gpucomposite::isValidMatteSource(d.matteSourceIndex, i, descs.size()))
+            matteSourceIndices.insert(d.matteSourceIndex);
+    }
+
+    if (!m_vbo) {
+        m_vbo = std::make_unique<QOpenGLBuffer>(QOpenGLBuffer::VertexBuffer);
+        if (!m_vbo->create()) {
+            m_vbo.reset();
+            prog.release();
+            fbo.release();
+            return QImage();
+        }
+        m_vbo->setUsagePattern(QOpenGLBuffer::DynamicDraw);
+    }
+
+    auto drawMatteCombine = [&](GLuint srcTexId, GLuint matteTexId,
+                                int matteTypeOrdinal, float opacity) -> bool {
+        QOpenGLShaderProgram& mp = *m_matteProg;
+        if (!mp.bind())
+            return false;
+
+        gl->glActiveTexture(GL_TEXTURE0);
+        gl->glBindTexture(GL_TEXTURE_2D, srcTexId);
+        gl->glActiveTexture(GL_TEXTURE1);
+        gl->glBindTexture(GL_TEXTURE_2D, matteTexId);
+
+        mp.setUniformValue(m_mSrcTex, 0);
+        mp.setUniformValue(m_mMatteTex, 1);
+        mp.setUniformValue(m_mMatteType, matteTypeOrdinal);
+        mp.setUniformValue(m_mOpacity, opacity);
+
+        const float quad[] = {
+            -1.0f, -1.0f,  0.0f, 0.0f,
+             1.0f, -1.0f,  1.0f, 0.0f,
+            -1.0f,  1.0f,  0.0f, 1.0f,
+             1.0f,  1.0f,  1.0f, 1.0f,
+        };
+        m_matteVbo->bind();
+        m_matteVbo->allocate(quad, int(sizeof(quad)));
+        mp.enableAttributeArray(m_mAPos);
+        mp.enableAttributeArray(m_mATexCoord);
+        mp.setAttributeBuffer(m_mAPos,      GL_FLOAT, 0, 2, 4 * sizeof(float));
+        mp.setAttributeBuffer(m_mATexCoord, GL_FLOAT, 2 * sizeof(float), 2, 4 * sizeof(float));
+
+        gl->glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+        mp.disableAttributeArray(m_mAPos);
+        mp.disableAttributeArray(m_mATexCoord);
+        m_matteVbo->release();
+
+        gl->glActiveTexture(GL_TEXTURE1);
+        gl->glBindTexture(GL_TEXTURE_2D, 0);
+        gl->glActiveTexture(GL_TEXTURE0);
+        gl->glBindTexture(GL_TEXTURE_2D, 0);
+        mp.release();
+        return true;
+    };
+
+    int poolCursor = 0;
+    auto acquireTexture16 = [&](int w, int h) -> QOpenGLTexture* {
+        if (poolCursor >= m_texPool16.size())
+            m_texPool16.push_back(nullptr);
+        QOpenGLTexture*& slot = m_texPool16[poolCursor];
+        ++poolCursor;
+
+        if (slot && slot->isCreated() &&
+            slot->width() == w && slot->height() == h &&
+            slot->format() == QOpenGLTexture::RGBA16_UNorm) {
+            return slot;
+        }
+
+        if (slot) {
+            if (slot->isCreated())
+                slot->destroy();
+            delete slot;
+            slot = nullptr;
+        }
+        auto* tex = new QOpenGLTexture(QOpenGLTexture::Target2D);
+        tex->setFormat(QOpenGLTexture::RGBA16_UNorm);
+        tex->setSize(w, h);
+        tex->setMinificationFilter(QOpenGLTexture::Nearest);
+        tex->setMagnificationFilter(QOpenGLTexture::Nearest);
+        tex->setWrapMode(QOpenGLTexture::ClampToEdge);
+        tex->allocateStorage(QOpenGLTexture::RGBA, QOpenGLTexture::UInt16);
+        if (!tex->isCreated() || !tex->isStorageAllocated()) {
+            delete tex;
+            return nullptr;
+        }
+        slot = tex;
+        return slot;
+    };
+
+    for (int idx : order) {
+        if (idx < 0 || idx >= layers.size())
+            continue;
+        const GpuLayerInput& in = layers[idx];
+        const gpucomposite::LayerDesc& d = in.desc;
+
+        if (!gpucomposite::isLayerComposited(d))
+            continue;
+        if (in.image.isNull() || in.image.width() <= 0 || in.image.height() <= 0)
+            continue;
+        if (matteSourceIndices.contains(idx))
+            continue;
+
+        const bool wantsMatte =
+            d.matteType != gpucomposite::MatteType::None &&
+            gpucomposite::isValidMatteSource(d.matteSourceIndex, idx, layers.size());
+
+        if (wantsMatte) {
+            const int mIdx = d.matteSourceIndex;
+            const GpuLayerInput& matteIn = layers[mIdx];
+
+            if (!matteIn.image.isNull() &&
+                matteIn.image.width() > 0 && matteIn.image.height() > 0) {
+                QOpenGLFramebufferObject* srcF =
+                    ensureTempFbo16(m_matteFboSrc16, canvas);
+                QOpenGLFramebufferObject* matteF =
+                    ensureTempFbo16(m_matteFboMatte16, canvas);
+
+                if (!srcF || !matteF) {
+                    prog.release();
+                    fbo.release();
+                    return QImage();
+                }
+
+                if (m_matteVbo == nullptr) {
+                    m_matteVbo = std::make_unique<QOpenGLBuffer>(QOpenGLBuffer::VertexBuffer);
+                    if (m_matteVbo->create())
+                        m_matteVbo->setUsagePattern(QOpenGLBuffer::DynamicDraw);
+                    else
+                        m_matteVbo.reset();
+                }
+                if (!m_matteVbo || !ensureMatteProgram()) {
+                    prog.release();
+                    fbo.release();
+                    return QImage();
+                }
+
+                prog.release();
+
+                const bool okMatte =
+                    renderLayerToFbo16(*matteF, matteIn.image, matteIn.desc, canvas, proj);
+                const bool okSrc =
+                    renderLayerToFbo16(*srcF, in.image, d, canvas, proj);
+                if (!okMatte || !okSrc) {
+                    fbo.release();
+                    return QImage();
+                }
+
+                if (!fbo.bind())
+                    return QImage();
+                gl->glViewport(0, 0, canvas.width(), canvas.height());
+                gl->glEnable(GL_BLEND);
+                gl->glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA,
+                                        GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+                gl->glDisable(GL_DEPTH_TEST);
+                gl->glDisable(GL_CULL_FACE);
+
+                const bool okCombine =
+                    drawMatteCombine(srcF->texture(), matteF->texture(),
+                                     static_cast<int>(d.matteType),
+                                     float(gpucomposite::clampOpacity(d.opacity)));
+
+                if (!fbo.bind())
+                    return QImage();
+                gl->glViewport(0, 0, canvas.width(), canvas.height());
+                if (!prog.bind()) {
+                    fbo.release();
+                    return QImage();
+                }
+                prog.setUniformValue(m_uProj, proj);
+                prog.setUniformValue(m_uTex, 0);
+                gl->glActiveTexture(GL_TEXTURE0);
+
+                if (!okCombine) {
+                    prog.release();
+                    fbo.release();
+                    return QImage();
+                }
+                continue;
+            }
+            // Valid matte relationship but missing matte image: match the existing
+            // matte-not-ready rule and composite the layer plainly.
+        }
+
+        QImage img = in.image.convertToFormat(QImage::Format_RGBA64_Premultiplied);
+
+        QOpenGLTexture* tex = acquireTexture16(img.width(), img.height());
+        if (!tex) {
+            prog.release();
+            fbo.release();
+            return QImage();
+        }
+        tex->setData(QOpenGLTexture::RGBA, QOpenGLTexture::UInt16, img.constBits());
+
+        gl->glActiveTexture(GL_TEXTURE0);
+        tex->bind(0);
+
+        const QMatrix4x4 layerMat = gpucomposite::layerTransform(d, canvas);
+        prog.setUniformValue(m_uLayer, layerMat);
+        prog.setUniformValue(m_uOpacity,
+                             float(gpucomposite::clampOpacity(d.opacity)));
+
+        const float sw = float(img.width());
+        const float sh = float(img.height());
+        const float verts[] = {
+            0.0f, 0.0f,  0.0f, 0.0f,
+            sw,   0.0f,  1.0f, 0.0f,
+            0.0f, sh,    0.0f, 1.0f,
+            sw,   sh,    1.0f, 1.0f,
+        };
+
+        m_vbo->bind();
+        m_vbo->allocate(verts, int(sizeof(verts)));
+        prog.enableAttributeArray(aSrcPos);
+        prog.enableAttributeArray(aTexCoord);
+        prog.setAttributeBuffer(aSrcPos,   GL_FLOAT, 0, 2, 4 * sizeof(float));
+        prog.setAttributeBuffer(aTexCoord, GL_FLOAT, 2 * sizeof(float), 2, 4 * sizeof(float));
+
+        gl->glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+        prog.disableAttributeArray(aSrcPos);
+        prog.disableAttributeArray(aTexCoord);
+        m_vbo->release();
+        tex->release();
+    }
+
+    prog.release();
+
+    const int w = canvas.width();
+    const int h = canvas.height();
+    QVector<quint16> buf(w * h * 4);
+    gl->glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_SHORT, buf.data());
+
+    fbo.release();
+
     QImage out(canvas, QImage::Format_RGBA64_Premultiplied);
     if (out.isNull())
         return QImage();

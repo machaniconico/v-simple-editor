@@ -262,6 +262,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/playback/GpuLayerCompositor.h
     src/playback/GpuLayerCompositor.cpp
     src/selftests/gpu_composite_parity_selftests.cpp
+    # Stage8: GPU 16-bit track-matte (composite16Matte) + parity
+    src/selftests/gpu_composite_parity16_matte_selftest.cpp
     # GPU RGBA16 (16-bit HDR) compositor parity selftest (Stage4C HDR-2: composite16 vs HdrCompositeMath oracle)。
     src/selftests/hdr_composite_parity_selftests.cpp
     # Live track-matte index resolver (STAGE4B data plumbing + headless selftest)。

@@ -1,10 +1,12 @@
 #include "HdrCompositeMath.h"
+#include "TrackMatteCompose16.h"
 
 #include <QColor>
 #include <QMatrix4x4>
 #include <QPointF>
 #include <QRect>
 #include <QRgba64>
+#include <QSet>
 #include <QVector3D>
 
 #include <cmath>
@@ -75,6 +77,14 @@ inline bool inverseSample(bool invertible, const QMatrix4x4& inv, int sw, int sh
     return sx >= 0 && sy >= 0 && sx < sw && sy < sh;
 }
 
+inline quint16 unpremultiply16(quint16 premul, quint16 alpha) {
+    if (alpha == 0)
+        return 0;
+    const quint64 straight =
+        static_cast<quint64>(premul) * static_cast<quint64>(kMax16) / alpha;
+    return static_cast<quint16>(straight > kMax16 ? kMax16 : straight);
+}
+
 } // namespace
 
 QImage compositeReference16(const QVector<gpucomposite::LayerDesc>& layers,
@@ -131,6 +141,110 @@ QImage compositeReference16(const QVector<gpucomposite::LayerDesc>& layers,
                 if (!inverseSample(invertible, inv, sw, sh, cx, cy, sx, sy))
                     continue;
                 Rgba16 s = readPixel16(src, sx, sy);
+                if (opacity < 1.0) s = applyOpacity16(s, opacity);
+                const Rgba16 d = readPixel16(out, cx, cy);
+                writePixel16(out, cx, cy, premulSourceOver16(d, s));
+            }
+        }
+    }
+
+    return out;
+}
+
+QImage compositeReference16Matte(const QVector<gpucomposite::LayerDesc>& layers,
+                                const QVector<QImage>& images,
+                                QSize canvas) {
+    if (canvas.isEmpty()) {
+        for (const QImage& im : images) {
+            if (!im.isNull()) { canvas = im.size(); break; }
+        }
+    }
+    if (canvas.isEmpty()) return QImage();
+
+    QImage out(canvas, QImage::Format_RGBA64_Premultiplied);
+    out.fill(QColor(0, 0, 0, 0));
+
+    const int layerCount = layers.size();
+    const QVector<int> order = gpucomposite::paintOrder(layers);
+
+    QSet<int> matteSourceIndices;
+    for (int i = 0; i < layerCount; ++i) {
+        const gpucomposite::LayerDesc& d = layers[i];
+        if (d.matteType == gpucomposite::MatteType::None)
+            continue;
+        if (gpucomposite::isValidMatteSource(d.matteSourceIndex, i, layerCount))
+            matteSourceIndices.insert(d.matteSourceIndex);
+    }
+
+    const int cw = canvas.width();
+    const int ch = canvas.height();
+
+    for (int idx : order) {
+        if (idx < 0 || idx >= layerCount || idx >= images.size()) continue;
+        const gpucomposite::LayerDesc& desc = layers[idx];
+        if (!gpucomposite::isLayerComposited(desc)) continue;
+        if (matteSourceIndices.contains(idx)) continue;
+
+        QImage src = images[idx];
+        if (src.isNull()) continue;
+        if (src.format() != QImage::Format_RGBA64_Premultiplied)
+            src = src.convertToFormat(QImage::Format_RGBA64_Premultiplied);
+
+        const double opacity = gpucomposite::clampOpacity(desc.opacity);
+        if (opacity <= 0.0) continue;
+
+        const QMatrix4x4 fwd = gpucomposite::layerTransform(desc, canvas);
+        bool invertible = false;
+        const QMatrix4x4 inv = fwd.inverted(&invertible);
+        if (!invertible) continue;
+
+        const int sw = src.width();
+        const int sh = src.height();
+
+        QImage matteSrc;
+        QMatrix4x4 matteInv;
+        bool matteInvertible = false;
+        bool useMatte = false;
+        if (desc.matteType != gpucomposite::MatteType::None
+            && gpucomposite::isValidMatteSource(desc.matteSourceIndex, idx, layerCount)
+            && desc.matteSourceIndex >= 0
+            && desc.matteSourceIndex < images.size()) {
+            matteSrc = images[desc.matteSourceIndex];
+            if (!matteSrc.isNull()) {
+                if (matteSrc.format() != QImage::Format_RGBA64_Premultiplied)
+                    matteSrc = matteSrc.convertToFormat(QImage::Format_RGBA64_Premultiplied);
+                const QMatrix4x4 matteFwd =
+                    gpucomposite::layerTransform(layers[desc.matteSourceIndex], canvas);
+                matteInv = matteFwd.inverted(&matteInvertible);
+                useMatte = matteInvertible;
+            }
+        }
+
+        const int mw = matteSrc.width();
+        const int mh = matteSrc.height();
+
+        for (int cy = 0; cy < ch; ++cy) {
+            for (int cx = 0; cx < cw; ++cx) {
+                int sx = 0, sy = 0;
+                if (!inverseSample(invertible, inv, sw, sh, cx, cy, sx, sy))
+                    continue;
+
+                Rgba16 s = readPixel16(src, sx, sy);
+
+                if (useMatte) {
+                    Rgba16 mattePx{0, 0, 0, 0};
+                    int mx = 0, my = 0;
+                    if (inverseSample(matteInvertible, matteInv, mw, mh, cx, cy, mx, my))
+                        mattePx = readPixel16(matteSrc, mx, my);
+
+                    const quint16 straightR = unpremultiply16(mattePx.r, mattePx.a);
+                    const quint16 straightG = unpremultiply16(mattePx.g, mattePx.a);
+                    const quint16 straightB = unpremultiply16(mattePx.b, mattePx.a);
+                    const quint16 maskVal = trackmatte16::matteMaskValue16(
+                        desc.matteType, straightR, straightG, straightB, mattePx.a);
+                    trackmatte16::applyMaskPremul16(s, maskVal);
+                }
+
                 if (opacity < 1.0) s = applyOpacity16(s, opacity);
                 const Rgba16 d = readPixel16(out, cx, cy);
                 writePixel16(out, cx, cy, premulSourceOver16(d, s));

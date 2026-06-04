@@ -17,10 +17,9 @@
 // Dependencies: QtCore + QtGui only (QImage / QTransform / QSize / QColor).
 // NO QOpenGL, NO QApplication. Pure functions — headlessly testable.
 //
-// Matte handling: OUT OF SCOPE here (matte-free only, mirroring the 8-bit
-// Stage 2 compositor). Layers whose matteType != MatteType::None are treated as plain
-// (non-matte) layers — the matte source/target relationship is ignored. A
-// 16-bit matte fragment (Stage4A analogue) is a later phase.
+// Matte handling: compositeReference16 remains matte-free and intentionally
+// treats matte layers as plain. compositeReference16Matte is the separate Stage8
+// track-matte oracle for the dormant GPU 16-bit matte path.
 
 #include "GpuCompositeMath.h"
 
@@ -58,6 +57,15 @@ Rgba16 premulSourceOver16(Rgba16 dst, Rgba16 src);
 QImage compositeReference16(const QVector<gpucomposite::LayerDesc>& layers,
                            const QVector<QImage>& images,
                            QSize canvas);
+
+// 16-bit track-matte oracle for GPU composite16Matte parity. This is still a
+// pure combine in the already-correct input space: no IDT/ODT/color conversion.
+// A valid matte source is sampled through its own layerTransform at the same
+// canvas pixel as the matte'd layer; matte-source layers are excluded from
+// standalone draw. Invalid/missing matte sources leave the layer plain.
+QImage compositeReference16Matte(const QVector<gpucomposite::LayerDesc>& layers,
+                                const QVector<QImage>& images,
+                                QSize canvas);
 
 // Converts an RGBA64(_Premultiplied) image to ARGB32_Premultiplied (8-bit) so a
 // selftest can compare 16-bit reference output against the 8-bit CPU SSOT.
