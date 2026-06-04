@@ -1315,10 +1315,27 @@ void RenderQueue::finishCurrentJob(bool success, const QString &errorMsg)
         job.status = RenderJobStatus::Completed;
         job.progress = 100;
         job.progressPercent = 100;
+        // Capture before emitting: a slot connected to the signals below could
+        // enqueue/remove jobs and reallocate m_jobs, leaving `job` dangling.
+        const QString dvXml = job.dolbyVisionXml;
+        const QString dvOutputPath = job.outputPath;
         emit jobProgress(job.id, 100);
         emit jobProgressUuid(job.uuid, 100);
         emit jobCompleted(job.id);
         emit jobCompletedUuid(job.uuid, true, QString());
+        if (!dvXml.isEmpty()) {
+            // ".dv.xml" (not bare ".xml") avoids clobbering an unrelated sidecar
+            // such as a hand-authored EDL/settings XML sharing the output stem.
+            const QString xmlPath = QFileInfo(dvOutputPath).absolutePath() + "/"
+                + QFileInfo(dvOutputPath).completeBaseName() + ".dv.xml";
+            QFile f(xmlPath);
+            if (f.open(QIODevice::WriteOnly | QIODevice::Text)) {
+                f.write(dvXml.toUtf8());
+                f.close();
+            } else {
+                qWarning() << "[DV XML] Failed to write sidecar:" << xmlPath;
+            }
+        }
     }
 
     emit jobsChanged();

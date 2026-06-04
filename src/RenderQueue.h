@@ -49,6 +49,7 @@ struct RenderJob {
 
     // Legacy fields (still populated for backwards compatibility).
     QJsonObject exportConfig;
+    QString dolbyVisionXml;
     int progress = 0;
     QDateTime startTime;
     QDateTime endTime;

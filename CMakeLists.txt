@@ -177,8 +177,11 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     # DV (Dolby Vision): PQ ST.2084 + 動的メタデータモデル + Dolby Vision XML 生成 + Dialog。
     src/DolbyVisionMetadata.h
     src/DolbyVisionMetadata.cpp
+    src/color/DvTimelineBuilder.h
+    src/color/DvTimelineBuilder.cpp
     src/DolbyVisionDialog.cpp
     src/selftests/dolby_vision_selftest.cpp
+    src/selftests/dv_timeline_selftest.cpp
     # CC (放送 CC): CEA-608/708 + SCC サイドカー純粋エンジン + 編集 Dialog。
     src/BroadcastCaption.h
     src/BroadcastCaption.cpp
@@ -248,6 +251,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/playback/hdrexport16_flag.h
     src/playback/hdroverlay_flag.h
     src/playback/clipidt_flag.h
+    src/playback/dvxml_flag.h
     src/playback/TlrCompose16.h
     src/playback/TlrCompose16.cpp
     src/selftests/hdr_export16_selftest.cpp

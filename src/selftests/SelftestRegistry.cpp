@@ -47,6 +47,7 @@ int runCredTtlSelftest();
 int runCredentialVaultSelftest();
 int runDavinciSelftest();
 int runDolbyVisionSelftest();
+int runDvTimelineSelftest();
 int runEdlExportSelftest();
 int runE2eSelftest();
 int runEasingSelftest();
@@ -196,6 +197,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "AcesColor: primaries matrices, Bradford, IDT/RRT/ODT round-trip" },
     { "dolby-vision",      "VEDITOR_DOLBY_VISION_SELFTEST",       runDolbyVisionSelftest,        false,
       "DolbyVision: PQ ST.2084 math + metadata + DV XML generation" },
+    { "dv-timeline",       "VEDITOR_DV_TIMELINE_SELFTEST",         runDvTimelineSelftest,         false,
+      "DvTimeline: build per-shot DV metadata from timeline spans" },
     { "broadcast-cc",      "VEDITOR_BROADCAST_CC_SELFTEST",       runBroadcastCaptionSelftest,   false,
       "BroadcastCaption: CEA-608 byte-pair/parity + SCC export + CEA-708 packet" },
     { "auto-matte",        "VEDITOR_AUTO_MATTE_SELFTEST",         runAutoMatteSelftest,          false,

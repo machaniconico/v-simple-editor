@@ -38,6 +38,9 @@ void exporter_setAcesPipeline(const aces::AcesPipeline &pipeline);
 #include "AudioDuckingDialog.h"
 #include "ColorManagementDialog.h"   // AC-4: ACES カラーマネジメント ダイアログ
 #include "DolbyVisionDialog.h"        // DV-4: Dolby Vision メタデータ ダイアログ
+#include "DolbyVisionMetadata.h"
+#include "color/DvTimelineBuilder.h"
+#include "playback/dvxml_flag.h"
 #include "BroadcastCaptionDialog.h"  // CC-4: 放送CC (CEA-608/708) ダイアログ
 #include "ProjectCollectorDialog.h"
 #include "HDRSettingsDialog.h"
@@ -5210,13 +5213,54 @@ void MainWindow::exportVideo()
     cfg["videoBitrate"] = exportCfg.videoBitrate;   // kbps
     cfg["audioCodec"]   = exportCfg.audioCodec;
     cfg["audioBitrate"] = exportCfg.audioBitrate;
-    if (exportCfg.hdr10 || exportCfg.hdrSettings.mode != QStringLiteral("sdr")) {
+    const bool isHdrExport =
+        exportCfg.hdr10 || exportCfg.hdrSettings.mode != QStringLiteral("sdr");
+    if (isHdrExport) {
         cfg["hdr10"]   = true;
         cfg["hdrMode"] = exportCfg.hdrSettings.mode;
     }
     if (exportCfg.proresProfile >= 0)
         cfg["proresProfile"] = exportCfg.proresProfile;
     job.exportConfig = cfg;
+
+    if (isHdrExport && dvxml::enabledFromEnv()) {
+        // Apply this export's HDR settings to L6 BEFORE buildFromTimeline so that
+        // default-derived per-shot L1 (min/max from mastering luminance) agrees
+        // with the <Level6> block the sidecar will declare.
+        dolbyvision::DolbyVisionMetadata dvBase = m_dolbyVision;
+        dvBase.l6.masteringMaxNits =
+            static_cast<int>(m_hdrSettings.masterDisplayLuminanceMax);
+        dvBase.l6.maxCll = m_hdrSettings.maxCll;
+        dvBase.l6.maxFall = m_hdrSettings.maxFall;
+
+        QVector<dvtimeline::ShotSpan> spans;
+        spans.reserve(clips.size());
+        double cursorSec = 0.0;
+        for (const auto &clip : clips) {
+            // Mirror Timeline::computePlaybackSequence: clamp negative lead-in,
+            // skip zero/negative-duration clips so sidecar frames match playback.
+            cursorSec += qMax(0.0, clip.leadInSec);
+            const double dur = clip.effectiveDuration();
+            if (dur <= 0.0)
+                continue;
+            dvtimeline::ShotSpan span;
+            span.startSec = cursorSec;
+            span.endSec = cursorSec + dur;
+            span.colorMeta = clip.colorMeta;
+            spans.push_back(span);
+            cursorSec = span.endSec;
+        }
+
+        dolbyvision::DolbyVisionMetadata meta =
+            dvtimeline::buildFromTimeline(spans, dvBase);
+        const double exportFps = exportCfg.fps > 0 ? exportCfg.fps : 30;
+        QString dvErr;
+        if (dolbyvision::validate(meta, &dvErr)) {
+            job.dolbyVisionXml = dolbyvision::toDolbyVisionXml(meta, exportFps);
+        } else {
+            qWarning() << "[DV XML] metadata failed validation, skipping sidecar:" << dvErr;
+        }
+    }
 
     auto *progress = new QProgressDialog("Exporting...", "Cancel", 0, 100, this);
     progress->setWindowModality(Qt::WindowModal);
