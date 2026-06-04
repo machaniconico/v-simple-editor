@@ -10,6 +10,7 @@
 #include "playback/hdrexport16_flag.h"
 #include "playback/hdrmatte16_flag.h"
 #include "playback/hdroverlay_flag.h"
+#include "playback/idtgpu_flag.h"   // Stage9-GPU-IDT Story2: VEDITOR_HDR_IDT_GPU
 #include "playback/TlrCompose16.h"
 #include "playback/HdrCompositeMath.h"
 #include "color/ClipColorTransform.h"
@@ -5016,6 +5017,21 @@ QImage VideoPlayer::tryGpuComposeLayers(const QVector<DecodedLayer> &layers,
                     v1Index = i;
             }
             v1OutputSpace = clipcolor::acesSpaceFor(inputs.at(v1Index).colorMeta);
+        }
+
+        // Story2: IDT-only (ODT OFF) で VEDITOR_HDR_IDT_GPU が ON なら、CPU の
+        // toUnifiedSpace フルフレーム変換を省き、GPU フラグメントシェーダ
+        // (composite16Idt) に per-fragment IDT を行わせる。outSpace は
+        // composite16Idt が内部で V1 (最小 sourceTrack) から導出し v1OutputSpace と
+        // 一致する。GL 失敗時は下の既存 CPU conv 経路へフォールスルー。
+        // ODT ON 時はこの分岐を踏まず従来の toLinearWorking+applyOdt16 を維持。
+        if (idtEnabled && !odtEnabled && idtgpu::enabledFromEnv()) {
+            QImage outIdt = m_gpuCompositor->composite16Idt(inputs, canvas);
+            if (!outIdt.isNull() && outIdt.size() == canvas) {
+                const QImage out8 = hdrcomposite::to8bit(outIdt);
+                if (!out8.isNull() && out8.size() == canvas)
+                    return out8;
+            }
         }
 
         const QVector<GpuLayerInput>* composite16Inputs = &inputs;

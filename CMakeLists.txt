@@ -251,6 +251,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/playback/hdrexport16_flag.h
     src/playback/hdroverlay_flag.h
     src/playback/clipidt_flag.h
+    src/playback/idtgpu_flag.h
     src/playback/dvxml_flag.h
     src/playback/TlrCompose16.h
     src/playback/TlrCompose16.cpp
