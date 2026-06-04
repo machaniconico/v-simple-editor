@@ -12,10 +12,12 @@
 #include "ClipGeometry.h"       // G3 — canonical clip-placement SSOT (clipgeom)
 #include "TrackMatteKey.h"      // RM-1.1 — single shared clip-key formula
 #include "playback/TlrCompose16.h"
+#include "playback/HdrCompositeMath.h"
 #include "playback/clipidt_flag.h"
 #include "playback/hdrexport16_flag.h"
 #include "color/ClipColor.h"    // HDR Stage1 — per-clip color metadata plumbing
 #include "color/ClipColorTransform.h"
+#include "color/ClipOdt.h"
                                 // TM-8 — track-matte wiring is now read from
                                 // Timeline::trackMatteEntries() (no MainWindow
                                 // include, no #define private public, no
@@ -886,9 +888,10 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
             placedBackToFront.reserve(overlays.size() + 1);
             opacities.reserve(overlays.size() + 1);
 
+            const bool odtEnabled = clipodt::enabledFromEnv();
             const bool idtEnabled = clipidt::enabledFromEnv();
             aces::ColorSpace v1OutputSpace = aces::ColorSpace::sRGB;
-            if (idtEnabled)
+            if (!odtEnabled && idtEnabled)
                 v1OutputSpace = clipcolor::acesSpaceFor(v1Clip.colorMeta);
 
             for (int i = overlays.size() - 1; i >= 0; --i) {
@@ -899,7 +902,9 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
                                                 L.videoDy, L.rotationDeg};
                 QImage placed =
                     clipgeom::renderLayer(L.rgb, t, canvas, /*smooth=*/true);
-                if (idtEnabled)
+                if (odtEnabled)
+                    placed = clipcolor::toLinearWorking(placed, L.colorMeta);
+                else if (idtEnabled)
                     placed = clipcolor::toUnifiedSpace(placed, L.colorMeta, v1OutputSpace);
                 placedBackToFront.append(placed);
                 opacities.append(qBound(0.0, L.opacity, 1.0));
@@ -908,7 +913,9 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
             const double v1Opacity = qBound(0.0, v1Clip.opacity, 1.0);
             if (v1Opacity > 0.001) {
                 QImage v1Base = base;
-                if (idtEnabled)
+                if (odtEnabled)
+                    v1Base = clipcolor::toLinearWorking(v1Base, v1Clip.colorMeta);
+                else if (idtEnabled)
                     v1Base = clipcolor::toUnifiedSpace(v1Base,
                                                        v1Clip.colorMeta,
                                                        v1OutputSpace);
@@ -916,9 +923,21 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
                 opacities.append(v1Opacity);
             }
 
-            stacked = tlrcompose16::composeRgba64ToRgba8888(placedBackToFront,
-                                                            opacities,
-                                                            canvas);
+            if (odtEnabled) {
+                QImage c64 = tlrcompose16::composeRgba64(placedBackToFront,
+                                                         opacities,
+                                                         canvas);
+                const clipodt::OdtParams odtP{
+                    clipcolor::acesSpaceFor(v1Clip.colorMeta), true
+                };
+                c64 = clipodt::applyOdt16(c64, odtP);
+                stacked = hdrcomposite::to8bit(c64)
+                              .convertToFormat(QImage::Format_RGBA8888);
+            } else {
+                stacked = tlrcompose16::composeRgba64ToRgba8888(placedBackToFront,
+                                                                opacities,
+                                                                canvas);
+            }
         } else {
         QImage composed(base.size(), QImage::Format_ARGB32_Premultiplied);
         composed.fill(Qt::transparent);

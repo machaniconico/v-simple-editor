@@ -5,6 +5,7 @@
 #include "TrackMatteKey.h"
 #include "CodecDetector.h"
 #include "AcesColor.h"  // AC: production export 経路への ACES 適用 (8bit のみ)
+#include "color/ClipOdt.h"
 #include "libavcore/Encode.h"
 #include "libavcore/Probe.h"
 #include <QByteArray>
@@ -674,8 +675,10 @@ void RenderQueue::startRenderPipe(int jobIndex)
         QMutexLocker locker(&m_acesMutex);
         acesPipe = m_acesPipeline;
     }
+    // When VEDITOR_HDR_ODT is ON the 16-bit ODT in renderFrameAt owns tonemap; suppress 8-bit re-apply.
     const bool applyAces = acesPipe.enabled
-        && !isHdr10 && !isHlg && !isProRes;
+        && !isHdr10 && !isHlg && !isProRes
+        && !clipodt::enabledFromEnv();
 
     // HDR10/HLG followed the old render-pipe branch by forcing x265 unless the
     // caller explicitly selected an HEVC hardware encoder. US-B3-7: when this

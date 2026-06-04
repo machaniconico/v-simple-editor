@@ -653,6 +653,7 @@ private:
     // displayFrame は enabled=true のときだけ最終合成結果へ適用するので、既定状態では
     // 既存のプレビュー出力とビット同一 (回帰ゼロ)。
     aces::AcesPipeline m_acesPipeline;
+    bool m_lastFrameOdtApplied{false};
 
     // EXP-AID: 露出/フォーカス確認エイド。既定 None なので displayFrame は apply を
     // 一切呼ばず従来出力とビット同一 (性能無影響・回帰ゼロ)。None 以外のときだけ

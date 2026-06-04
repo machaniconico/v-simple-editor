@@ -6,14 +6,19 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include <QColor>
 #include <QImage>
+#include <QPainter>
 #include <QRgba64>
 #include <QSize>
 #include <QtGlobal>
+#include <QVector>
 
 #include "../AcesColor.h"
 #include "../color/ClipColorTransform.h"
 #include "../color/ClipOdt.h"
+#include "../playback/HdrCompositeMath.h"
+#include "../playback/TlrCompose16.h"
 
 namespace {
 
@@ -40,6 +45,58 @@ clipcolor::ColorMeta meta(clipcolor::Primaries primaries,
     m.bitDepth = hdr ? 10 : 8;
     m.isHdr = hdr;
     return m;
+}
+
+QImage makeSolidPatch8(QSize size, int r, int g, int b, int a)
+{
+    QImage img(size, QImage::Format_RGBA8888);
+    const QColor color(qBound(0, r, 255),
+                       qBound(0, g, 255),
+                       qBound(0, b, 255),
+                       qBound(0, a, 255));
+    for (int y = 0; y < img.height(); ++y) {
+        for (int x = 0; x < img.width(); ++x)
+            img.setPixelColor(x, y, color);
+    }
+    return img;
+}
+
+int maxPerChannelDelta(const QImage& a, const QImage& b)
+{
+    if (a.isNull() || b.isNull() || a.size() != b.size())
+        return 256;
+
+    const QImage aa = a.convertToFormat(QImage::Format_RGBA8888);
+    const QImage bb = b.convertToFormat(QImage::Format_RGBA8888);
+    int maxDelta = 0;
+    for (int y = 0; y < aa.height(); ++y) {
+        const uchar* la = aa.constScanLine(y);
+        const uchar* lb = bb.constScanLine(y);
+        for (int x = 0; x < aa.width(); ++x) {
+            const int i = x * 4;
+            for (int c = 0; c < 4; ++c) {
+                const int d = std::abs(int(la[i + c]) - int(lb[i + c]));
+                if (d > maxDelta)
+                    maxDelta = d;
+            }
+        }
+    }
+    return maxDelta;
+}
+
+QImage composeEncodedSourceOver(const QVector<QImage>& layers, QSize canvas)
+{
+    QImage out(canvas, QImage::Format_ARGB32_Premultiplied);
+    out.fill(Qt::transparent);
+    QPainter p(&out);
+    p.setRenderHint(QPainter::SmoothPixmapTransform, false);
+    p.setCompositionMode(QPainter::CompositionMode_SourceOver);
+    for (const QImage& layer : layers) {
+        if (!layer.isNull())
+            p.drawImage(0, 0, layer.convertToFormat(QImage::Format_ARGB32_Premultiplied));
+    }
+    p.end();
+    return out.convertToFormat(QImage::Format_RGBA8888);
 }
 
 quint16 clampTo16(double normalized)
@@ -350,34 +407,57 @@ int runClipOdtSelftest()
     }
 
     {
-        const clipcolor::ColorMeta pq = meta(clipcolor::Primaries::Rec2020,
-                                             clipcolor::Transfer::PQ, true);
-        const clipcolor::ColorMeta hlg = meta(clipcolor::Primaries::Rec2020,
-                                              clipcolor::Transfer::HLG, true);
-        const quint16 r = 21000;
-        const quint16 g = 33000;
-        const quint16 b = 47000;
-        const QImage encoded = makeSolidPremul(QSize(1, 1), r, g, b, kMax16);
-        const QImage pqLinear = clipcolor::toLinearWorking(encoded, pq);
-        const QImage hlgLinear = clipcolor::toLinearWorking(encoded, hlg);
-        const clipodt::OdtParams p{aces::ColorSpace::Rec2020, false};
-        const QImage pqOut = clipodt::applyOdt16(pqLinear, p);
-        const QImage hlgOut = clipodt::applyOdt16(hlgLinear, p);
-        const Rgb16 sdrRef{
-            clampTo16(aces::oetf(aces::ColorSpace::Rec2020, double(r) / kMax16)),
-            clampTo16(aces::oetf(aces::ColorSpace::Rec2020, double(g) / kMax16)),
-            clampTo16(aces::oetf(aces::ColorSpace::Rec2020, double(b) / kMax16))
-        };
-        const DiffStats pqNoop = diffImages(encoded, pqLinear);
-        const DiffStats hlgNoop = diffImages(encoded, hlgLinear);
-        check(10, "PQ/HLG Stage6 gap feeds unchanged codes into SDR Rec2020 oetf",
-              pqNoop.maxAbs == 0
-              && hlgNoop.maxAbs == 0
-              && pixelMatchesStraight(pqOut, sdrRef, kMax16, 1)
-              && pixelMatchesStraight(hlgOut, sdrRef, kMax16, 1));
+        const QImage patch8 = makeSolidPatch8(QSize(4, 4), 128, 128, 128, 255);
+        const QImage linearPatch = clipcolor::toLinearWorking(patch8, rec709);
+        const QImage odtOut16 = clipodt::applyOdt16(
+            linearPatch, clipodt::OdtParams{clipcolor::acesSpaceFor(rec709), true});
+        const QImage odtOut8 = hdrcomposite::to8bit(odtOut16)
+                                   .convertToFormat(QImage::Format_RGBA8888);
+
+        aces::AcesPipeline pipe;
+        pipe.enabled = true;
+        pipe.input = clipcolor::acesSpaceFor(rec709);
+        pipe.working = aces::ColorSpace::ACEScg;
+        pipe.output = clipcolor::acesSpaceFor(rec709);
+        const QImage acesOut = aces::applyPipelineToImage(patch8, pipe);
+
+        check(8, "single opaque mid-gray ODT converges with 8-bit ACES pipeline (epsilon <= 6)",
+              maxPerChannelDelta(odtOut8, acesOut) <= 6);
     }
 
-    std::printf("[clip-odt] summary: gates=8 passed=%d failed=%d\n",
+    {
+        const QSize canvas(4, 4);
+        const QImage layerA = makeSolidPatch8(canvas, 128, 0, 0, 128);
+        const QImage layerB = makeSolidPatch8(canvas, 0, 0, 128, 128);
+
+        const QImage linearA = clipcolor::toLinearWorking(layerA, rec709);
+        const QImage linearB = clipcolor::toLinearWorking(layerB, rec709);
+        QImage pathA16 = tlrcompose16::composeRgba64(
+            QVector<QImage>{linearA, linearB},
+            QVector<double>{1.0, 1.0},
+            canvas);
+        pathA16 = clipodt::applyOdt16(
+            pathA16, clipodt::OdtParams{clipcolor::acesSpaceFor(rec709), true});
+        const QImage pathAOut = hdrcomposite::to8bit(pathA16)
+                                    .convertToFormat(QImage::Format_RGBA8888);
+
+        const QImage encodedComposed =
+            composeEncodedSourceOver(QVector<QImage>{layerA, layerB}, canvas);
+        aces::AcesPipeline pipe;
+        pipe.enabled = true;
+        pipe.input = clipcolor::acesSpaceFor(rec709);
+        pipe.working = aces::ColorSpace::ACEScg;
+        pipe.output = clipcolor::acesSpaceFor(rec709);
+        const QImage pathBOut = aces::applyPipelineToImage(encodedComposed, pipe);
+        const int delta = maxPerChannelDelta(pathAOut, pathBOut);
+
+        check(9, "overlapping 50%-alpha encoded-vs-linear paths intentionally diverge (delta > 2)",
+              delta > 2);
+        check(10, "overlapping 50%-alpha divergence remains bounded (delta <= 80)",
+              delta <= 80);
+    }
+
+    std::printf("[clip-odt] summary: gates=10 passed=%d failed=%d\n",
                 passed, failed);
     return failed == 0 ? 0 : 1;
 }

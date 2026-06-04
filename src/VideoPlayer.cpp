@@ -12,6 +12,7 @@
 #include "playback/TlrCompose16.h"
 #include "playback/HdrCompositeMath.h"
 #include "color/ClipColorTransform.h"
+#include "color/ClipOdt.h"
 #include "gpucomposite_flag.h"
 #include <algorithm>           // std::stable_sort
 
@@ -2070,7 +2071,7 @@ void VideoPlayer::displayFrame(const QImage &image)
     // 関数呼び出しと QImage 共有コピーすら避けて従来パスとビット同一を厳守する)。
     // レガシー Exporter は Exporter 側でのみ適用するため、composeFrameWithOverlays /
     // renderFrameAt の共通コアには ACES を入れていない (二重適用回避)。
-    if (m_acesPipeline.enabled && !composed.isNull()) {
+    if (m_acesPipeline.enabled && !composed.isNull() && !m_lastFrameOdtApplied) {
         composed = aces::applyPipelineToImage(composed, m_acesPipeline);
     }
 
@@ -4876,6 +4877,7 @@ void VideoPlayer::ensureGpuCompositeFlag()
 QImage VideoPlayer::tryGpuComposeLayers(const QVector<DecodedLayer> &layers,
                                         QSize canvas)
 {
+    m_lastFrameOdtApplied = false;
     ensureGpuCompositeFlag();  // 初回 tick で 1 回だけ env/QSettings を解決
     if (!m_gpuCompositeEnabled)
         return QImage();
@@ -5003,31 +5005,47 @@ QImage VideoPlayer::tryGpuComposeLayers(const QVector<DecodedLayer> &layers,
                                          hasMatte,
                                          static_cast<int>(inputs.size()),
                                          allRgba64)) {
-        const QVector<GpuLayerInput>* composite16Inputs = &inputs;
-        QVector<GpuLayerInput> conv;
-        if (clipidt::enabledFromEnv()) {
+        const bool odtEnabled = clipodt::enabledFromEnv();
+        const bool idtEnabled = clipidt::enabledFromEnv();
+        aces::ColorSpace v1OutputSpace = aces::ColorSpace::sRGB;
+        if (odtEnabled || idtEnabled) {
             int v1Index = 0;
             for (int i = 1; i < inputs.size(); ++i) {
                 if (inputs.at(i).desc.sourceTrack < inputs.at(v1Index).desc.sourceTrack)
                     v1Index = i;
             }
-            const aces::ColorSpace v1OutputSpace =
-                clipcolor::acesSpaceFor(inputs.at(v1Index).colorMeta);
+            v1OutputSpace = clipcolor::acesSpaceFor(inputs.at(v1Index).colorMeta);
+        }
 
+        const QVector<GpuLayerInput>* composite16Inputs = &inputs;
+        QVector<GpuLayerInput> conv;
+        if (odtEnabled || idtEnabled) {
             conv = inputs;
             for (int i = 0; i < conv.size(); ++i) {
-                conv[i].image = clipcolor::toUnifiedSpace(inputs.at(i).image,
-                                                          inputs.at(i).colorMeta,
-                                                          v1OutputSpace);
+                if (odtEnabled) {
+                    conv[i].image = clipcolor::toLinearWorking(inputs.at(i).image,
+                                                               inputs.at(i).colorMeta);
+                } else {
+                    conv[i].image = clipcolor::toUnifiedSpace(inputs.at(i).image,
+                                                              inputs.at(i).colorMeta,
+                                                              v1OutputSpace);
+                }
             }
             composite16Inputs = &conv;
         }
 
-        const QImage out16 = m_gpuCompositor->composite16(*composite16Inputs, canvas);
+        QImage out16 = m_gpuCompositor->composite16(*composite16Inputs, canvas);
         if (!out16.isNull() && out16.size() == canvas) {
+            if (odtEnabled) {
+                out16 = clipodt::applyOdt16(
+                    out16, clipodt::OdtParams{v1OutputSpace, true});
+            }
             const QImage out8 = hdrcomposite::to8bit(out16);
-            if (!out8.isNull() && out8.size() == canvas)
+            if (!out8.isNull() && out8.size() == canvas) {
+                if (odtEnabled)
+                    m_lastFrameOdtApplied = true;
                 return out8;
+            }
         }
     }
     QImage out = m_gpuCompositor->composite(inputs, canvas);
