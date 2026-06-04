@@ -11,9 +11,11 @@
 #include "TrackMatteBake.h"     // TM-3 — shared SSOT track-matte compositor
 #include "ClipGeometry.h"       // G3 — canonical clip-placement SSOT (clipgeom)
 #include "TrackMatteKey.h"      // RM-1.1 — single shared clip-key formula
+#include "playback/TrackMatteCompose16.h"
 #include "playback/TlrCompose16.h"
 #include "playback/HdrCompositeMath.h"
 #include "playback/clipidt_flag.h"
+#include "playback/hdrmatte16_flag.h"
 #include "playback/hdrexport16_flag.h"
 #include "color/ClipColor.h"    // HDR Stage1 — per-clip color metadata plumbing
 #include "color/ClipColorTransform.h"
@@ -991,8 +993,62 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
             layerImages.append(renderLayer.image);
         }
 
-        const QImage composed = trackmatte::composite(layers, layerImages, outSize);
-        stacked = composed.convertToFormat(QImage::Format_RGBA8888);
+        if (hdrmatte16::enabledFromEnv()) {
+            const QSize canvas(base.width(), base.height());   // == outSize
+            const bool odtEnabled = clipodt::enabledFromEnv();
+            const bool idtEnabled = clipidt::enabledFromEnv();
+            aces::ColorSpace v1OutputSpace = aces::ColorSpace::sRGB;
+            if (!odtEnabled && idtEnabled)
+                v1OutputSpace = clipcolor::acesSpaceFor(v1Clip.colorMeta);
+
+            QVector<gpucomposite::LayerDesc> descs;
+            QVector<QImage> images;
+            descs.reserve(renderLayers.size());
+            images.reserve(renderLayers.size());
+            for (const RenderLayer &rl : renderLayers) {
+                gpucomposite::LayerDesc d;
+                d.sourceTrack = descs.size();              // ascending; composeExport uses array order anyway
+                d.srcSize = rl.image.isNull() ? canvas : rl.image.size();
+                d.visible = rl.layer.visible;
+                d.opacity = rl.layer.opacity;
+                d.matteType = static_cast<gpucomposite::MatteType>(
+                    static_cast<int>(rl.layer.matteType));
+                d.matteSourceIndex = rl.layer.matteSourceLayerIndex;
+                descs.append(d);
+
+                QImage img = rl.image;
+                if (odtEnabled)
+                    img = clipcolor::toLinearWorking(img, rl.colorMeta);
+                else if (idtEnabled)
+                    img = clipcolor::toUnifiedSpace(img, rl.colorMeta, v1OutputSpace);
+                images.append(img);
+            }
+
+            trackmatte16::MatteColorCtx ctx;
+            if (odtEnabled) {
+                ctx.matteSourceIsLinear = true;
+                ctx.odtForLuma = clipodt::OdtParams{
+                    clipcolor::acesSpaceFor(v1Clip.colorMeta), false
+                };
+            } else {
+                // Matte source is already display-referred (IDT-unified or raw).
+                ctx.matteSourceIsLinear = false;
+            }
+
+            QImage c64 = trackmatte16::composeExport(descs, images, canvas, ctx);
+            if (odtEnabled) {
+                c64 = clipodt::applyOdt16(
+                    c64,
+                    clipodt::OdtParams{
+                        clipcolor::acesSpaceFor(v1Clip.colorMeta), true
+                    });
+            }
+            stacked = hdrcomposite::to8bit(c64)
+                          .convertToFormat(QImage::Format_RGBA8888);
+        } else {
+            const QImage composed = trackmatte::composite(layers, layerImages, outSize);
+            stacked = composed.convertToFormat(QImage::Format_RGBA8888);
+        }
     }
 
     // Public contract: Format_RGBA8888 at outSize (Timeline.h header / S2).
