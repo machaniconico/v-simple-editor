@@ -8,6 +8,7 @@
 #include "playback/LiveMatteResolve.h" // STAGE4B: clipstack::resolveLiveMatteSources
 #include "playback/clipidt_flag.h"
 #include "playback/hdrexport16_flag.h"
+#include "playback/hdrmatte16_flag.h"
 #include "playback/hdroverlay_flag.h"
 #include "playback/TlrCompose16.h"
 #include "playback/HdrCompositeMath.h"
@@ -5035,6 +5036,65 @@ QImage VideoPlayer::tryGpuComposeLayers(const QVector<DecodedLayer> &layers,
         }
 
         QImage out16 = m_gpuCompositor->composite16(*composite16Inputs, canvas);
+        if (!out16.isNull() && out16.size() == canvas) {
+            if (odtEnabled) {
+                out16 = clipodt::applyOdt16(
+                    out16, clipodt::OdtParams{v1OutputSpace, true});
+            }
+            const QImage out8 = hdrcomposite::to8bit(out16);
+            if (!out8.isNull() && out8.size() == canvas) {
+                if (odtEnabled)
+                    m_lastFrameOdtApplied = true;
+                return out8;
+            }
+        }
+    }
+    if (hdrmatte16::matte16Applicable(hdrmatte16::enabledFromEnv(),
+                                      hasMatte,
+                                      static_cast<int>(inputs.size()),
+                                      allRgba64)) {
+        const bool odtEnabled = clipodt::enabledFromEnv();
+        const bool idtEnabled = clipidt::enabledFromEnv();
+        aces::ColorSpace v1OutputSpace = aces::ColorSpace::sRGB;
+        if (odtEnabled || idtEnabled) {
+            int v1Index = 0;
+            for (int i = 1; i < inputs.size(); ++i) {
+                if (inputs.at(i).desc.sourceTrack < inputs.at(v1Index).desc.sourceTrack)
+                    v1Index = i;
+            }
+            v1OutputSpace = clipcolor::acesSpaceFor(inputs.at(v1Index).colorMeta);
+        }
+
+        QVector<GpuLayerInput> conv = inputs;
+        for (int i = 0; i < conv.size(); ++i) {
+            if (odtEnabled) {
+                conv[i].image = clipcolor::toLinearWorking(inputs.at(i).image,
+                                                           inputs.at(i).colorMeta);
+            } else if (idtEnabled) {
+                conv[i].image = clipcolor::toUnifiedSpace(inputs.at(i).image,
+                                                          inputs.at(i).colorMeta,
+                                                          v1OutputSpace);
+            }
+        }
+
+        if (odtEnabled) {
+            QSet<int> encoded;
+            for (int i = 0; i < conv.size(); ++i) {
+                const gpucomposite::MatteType mt = conv.at(i).desc.matteType;
+                const bool usesLuma =
+                    mt == gpucomposite::MatteType::Luminance ||
+                    mt == gpucomposite::MatteType::LuminanceInverted;
+                const int k = conv.at(i).desc.matteSourceIndex;
+                if (usesLuma && k >= 0 && k < conv.size() && !encoded.contains(k)) {
+                    conv[k].image = clipodt::applyOdt16(
+                        conv.at(k).image,
+                        clipodt::OdtParams{v1OutputSpace, false});
+                    encoded.insert(k);
+                }
+            }
+        }
+
+        QImage out16 = m_gpuCompositor->composite16Matte(conv, canvas);
         if (!out16.isNull() && out16.size() == canvas) {
             if (odtEnabled) {
                 out16 = clipodt::applyOdt16(
