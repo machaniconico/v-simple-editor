@@ -113,6 +113,40 @@ QImage rec2020Signal16(QSize size)
     });
 }
 
+QImage rec2020LumaMatteSignal16(QSize size)
+{
+    return makePremul16(size, [](int x, int y,
+                                 quint16& r, quint16& g, quint16& b, quint16& a) {
+        // Highly saturated, bright Rec.2020 primaries in every band: the wider
+        // Rec.2020 gamut shifts Rec.601 luma the most under Rec.2020->sRGB, so
+        // the converted-vs-raw matte luma divergence (the negative control) is
+        // large and not gamut-desaturated. Each band is a different primary mix
+        // so the matte still has spatial structure.
+        const int band = ((x / 8) + (y / 6)) % 4;
+        if (band == 0) {
+            r = 60000; g = 60000; b = 2000;   // saturated yellow
+        } else if (band == 1) {
+            r = 2000; g = 60000; b = 60000;   // saturated cyan
+        } else if (band == 2) {
+            r = 60000; g = 2000; b = 60000;   // saturated magenta
+        } else {
+            r = 60000; g = 24000; b = 2000;   // saturated orange
+        }
+        a = kMax16;
+    });
+}
+
+QImage alphaMatteSignal16(QSize size)
+{
+    return makePremul16(size, [](int x, int y,
+                                 quint16& r, quint16& g, quint16& b, quint16& a) {
+        r = static_cast<quint16>(7000 + ((x * 131 + y * 59) % 43000));
+        g = static_cast<quint16>(9000 + ((x * 67 + y * 211) % 41000));
+        b = static_cast<quint16>(6000 + ((x * 191 + y * 103) % 45000));
+        a = static_cast<quint16>(3000 + ((x * 419 + y * 283) % 60000));
+    });
+}
+
 QImage acescgSignal16(QSize size)
 {
     return makePremul16(size, [](int x, int y,
@@ -231,6 +265,41 @@ QImage cpuIdtOracle(const QVector<GpuLayerInput>& layers, QSize canvas)
     }
 
     return hdrcomposite::compositeReference16(descsFor(layers), converted, canvas);
+}
+
+QVector<QImage> idtConvertedImagesFor(const QVector<GpuLayerInput>& layers)
+{
+    const aces::ColorSpace outSpace = outputSpaceFor(layers);
+
+    QVector<QImage> converted;
+    converted.reserve(layers.size());
+    for (const GpuLayerInput& in : layers) {
+        const aces::ColorSpace inSpace = clipcolor::acesSpaceFor(in.colorMeta);
+        const bool passthrough =
+            in.colorMeta.transfer == clipcolor::Transfer::PQ
+            || in.colorMeta.transfer == clipcolor::Transfer::HLG
+            || inSpace == outSpace;
+        converted.push_back(passthrough
+                            ? in.image
+                            : convertLayerNoCache(in.image, in.colorMeta, outSpace));
+    }
+    return converted;
+}
+
+QImage cpuIdtMatteOracle(const QVector<GpuLayerInput>& layers, QSize canvas)
+{
+    return hdrcomposite::compositeReference16Matte(
+        descsFor(layers), idtConvertedImagesFor(layers), canvas);
+}
+
+QVector<QImage> idtConvertedImagesExceptMatteSource(
+    const QVector<GpuLayerInput>& layers,
+    int matteSourceIndex)
+{
+    QVector<QImage> converted = idtConvertedImagesFor(layers);
+    if (matteSourceIndex >= 0 && matteSourceIndex < layers.size())
+        converted[matteSourceIndex] = layers.at(matteSourceIndex).image;
+    return converted;
 }
 
 struct Metrics16 {
@@ -519,5 +588,141 @@ int runGpuIdtParitySelftest()
     }
 
     std::printf("[gpu-idt-parity] Result: %d/%d PASSED\n", passed, total);
+    return (passed == total) ? 0 : 1;
+}
+
+int runGpuIdtMatteParitySelftest()
+{
+    if (!qApp) {
+        std::printf("[gpu-idt-matte-parity] SKIP: no QApplication instance (GL unavailable)\n");
+        return 0;
+    }
+
+    GpuLayerCompositor gpu;
+    if (!gpu.isAvailable()) {
+        std::printf("[gpu-idt-matte-parity] SKIP: no usable GL context (headless/WSL)\n");
+        return 0;
+    }
+
+    const clipcolor::ColorMeta rec709 = meta(clipcolor::Primaries::Rec709);
+    const clipcolor::ColorMeta rec2020 = meta(clipcolor::Primaries::Rec2020);
+    const clipcolor::ColorMeta displayP3 = meta(clipcolor::Primaries::DisplayP3);
+
+    const QSize probeCanvas(64, 48);
+    {
+        QVector<GpuLayerInput> probe;
+        GpuLayerInput masked = makeLayer(rec709Signal16(probeCanvas), rec709,
+                                         /*track*/0, 1.0);
+        masked.desc.matteType = gpucomposite::MatteType::Alpha;
+        masked.desc.matteSourceIndex = 1;
+        probe.push_back(masked);
+        probe.push_back(makeLayer(alphaMatteSignal16(probeCanvas), rec2020,
+                                  /*track*/1, 0.25));
+        const QImage probeImg = gpu.composite16IdtMatte(probe, probeCanvas);
+        if (probeImg.isNull() || probeImg.size() != probeCanvas
+            || probeImg.format() != QImage::Format_RGBA64_Premultiplied) {
+            std::printf("[gpu-idt-matte-parity] SKIP: RGBA16 IDT matte FBO unavailable\n");
+            return 0;
+        }
+    }
+
+    int passed = 0;
+    int total = 0;
+
+    auto gate = [&](int g, const char* desc,
+                    const QVector<GpuLayerInput>& layers, QSize canvas,
+                    double ssimMin, double rgbMaeMax, double aMaeMax) {
+        ++total;
+        const QImage cpu = cpuIdtMatteOracle(layers, canvas);
+        const QImage gpuImg = gpu.composite16IdtMatte(layers, canvas);
+        const Metrics16 m = compare16(cpu, gpuImg);
+        const bool ok = m.valid
+                        && gpuImg.format() == QImage::Format_RGBA64_Premultiplied
+                        && m.ssim >= ssimMin
+                        && m.rgb16Mae <= rgbMaeMax
+                        && m.a16Mae <= aMaeMax;
+        std::printf("[gpu-idt-matte-parity] %s G%d %s "
+                    "(SSIM=%.5f >= %.3f, rgb16Mae=%.3f <= %.1f, a16Mae=%.3f <= %.1f)\n",
+                    ok ? "PASS" : "FAIL", g, desc,
+                    m.ssim, ssimMin, m.rgb16Mae, rgbMaeMax,
+                    m.a16Mae, aMaeMax);
+        if (ok)
+            ++passed;
+    };
+
+    const QSize canvas(96, 64);
+    const double ssimMin = 0.998;
+    const double maeMax = 64.0;
+
+    {
+        ++total;
+        QVector<GpuLayerInput> layers;
+        GpuLayerInput masked = makeLayer(rec709Signal16(canvas), rec709,
+                                         /*track*/0, 1.0);
+        masked.desc.matteType = gpucomposite::MatteType::Luminance;
+        masked.desc.matteSourceIndex = 1;
+        layers.push_back(masked);
+        layers.push_back(makeLayer(rec2020LumaMatteSignal16(canvas), rec2020,
+                                   /*track*/1, 0.20));
+        // No covering top layer: the V1 masked layer (paint order V1-wins) sits
+        // over a transparent canvas so the luma-matte modulation drives the
+        // output directly. A covering opaque layer would mask the matte'd region
+        // and dilute the negative control (rawSignal) below the >256 floor, so a
+        // matte-source-not-converted regression could hide under the parity slack.
+
+        const QImage cpu = cpuIdtMatteOracle(layers, canvas);
+        const QImage gpuImg = gpu.composite16IdtMatte(layers, canvas);
+        const Metrics16 m = compare16(cpu, gpuImg);
+        const QImage rawMatteOracle = hdrcomposite::compositeReference16Matte(
+            descsFor(layers), idtConvertedImagesExceptMatteSource(layers, 1), canvas);
+        const Metrics16 rawSignal = compare16(cpu, rawMatteOracle);
+        const bool ok = m.valid
+                        && gpuImg.format() == QImage::Format_RGBA64_Premultiplied
+                        && m.ssim >= ssimMin
+                        && m.rgb16Mae <= maeMax
+                        && m.a16Mae <= maeMax
+                        && rawSignal.valid
+                        && rawSignal.rgb16Mae > 256.0;
+        std::printf("[gpu-idt-matte-parity] %s G1 cross-primaries Rec2020 luma matte source over sRGB V1 "
+                    "(SSIM=%.5f >= %.3f, rgb16Mae=%.3f <= %.1f, a16Mae=%.3f <= %.1f, "
+                    "rawMatteSignal=%.3f > 256.0)\n",
+                    ok ? "PASS" : "FAIL",
+                    m.ssim, ssimMin, m.rgb16Mae, maeMax,
+                    m.a16Mae, maeMax, rawSignal.rgb16Mae);
+        if (ok)
+            ++passed;
+    }
+
+    {
+        QVector<GpuLayerInput> layers;
+        GpuLayerInput masked = makeLayer(rec709Signal16(canvas), rec709,
+                                         /*track*/0, 0.85);
+        masked.desc.matteType = gpucomposite::MatteType::Alpha;
+        masked.desc.matteSourceIndex = 1;
+        layers.push_back(masked);
+        layers.push_back(makeLayer(alphaMatteSignal16(canvas), rec2020,
+                                   /*track*/1, 0.15));
+        layers.push_back(makeLayer(rec2020Signal16(canvas), displayP3,
+                                   /*track*/2, 1.0));
+        gate(2, "alpha matte keeps mask from transformed matte-source alpha",
+             layers, canvas, ssimMin, maeMax, maeMax);
+    }
+
+    {
+        QVector<GpuLayerInput> layers;
+        GpuLayerInput masked = makeLayer(rec709Signal16(canvas), rec709,
+                                         /*track*/0, 1.0);
+        masked.desc.matteType = gpucomposite::MatteType::Luminance;
+        masked.desc.matteSourceIndex = 1;
+        layers.push_back(masked);
+        layers.push_back(makeLayer(rec709Signal16(canvas), rec709,
+                                   /*track*/1, 0.40));
+        layers.push_back(makeLayer(transparent16(canvas), rec709,
+                                   /*track*/2, 1.0));
+        gate(3, "same-space passthrough luma matte",
+             layers, canvas, ssimMin, maeMax, maeMax);
+    }
+
+    std::printf("[gpu-idt-matte-parity] Result: %d/%d PASSED\n", passed, total);
     return (passed == total) ? 0 : 1;
 }

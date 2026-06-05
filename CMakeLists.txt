@@ -269,6 +269,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/gpu_composite_parity_selftests.cpp
     # Stage8: GPU 16-bit track-matte (composite16Matte) + parity
     src/selftests/gpu_composite_parity16_matte_selftest.cpp
+    # Stage9: GPU IDT matte parity shares the GPU IDT parity translation unit
     src/selftests/gpu_idt_parity_selftest.cpp
     # GPU RGBA16 (16-bit HDR) compositor parity selftest (Stage4C HDR-2: composite16 vs HdrCompositeMath oracle)。
     src/selftests/hdr_composite_parity_selftests.cpp

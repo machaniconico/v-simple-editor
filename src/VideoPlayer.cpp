@@ -5081,6 +5081,18 @@ QImage VideoPlayer::tryGpuComposeLayers(const QVector<DecodedLayer> &layers,
             v1OutputSpace = clipcolor::acesSpaceFor(inputs.at(v1Index).colorMeta);
         }
 
+        // Stage9b: IDT-only matte preview can skip CPU toUnifiedSpace by using
+        // per-fragment IDT on both the matte'd source and the matte source before
+        // luma extraction. ODT ON is excluded to avoid double-application.
+        if (idtEnabled && !odtEnabled && idtgpu::enabledFromEnv()) {
+            QImage out = m_gpuCompositor->composite16IdtMatte(inputs, canvas);
+            if (!out.isNull() && out.size() == canvas) {
+                const QImage out8 = hdrcomposite::to8bit(out);
+                if (!out8.isNull() && out8.size() == canvas)
+                    return out8;
+            }
+        }
+
         QVector<GpuLayerInput> conv = inputs;
         for (int i = 0; i < conv.size(); ++i) {
             if (odtEnabled) {

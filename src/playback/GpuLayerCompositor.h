@@ -6,6 +6,7 @@
 
 #include <memory>
 
+#include "AcesColor.h"
 #include "color/ClipColor.h"
 #include "GpuCompositeMath.h"
 
@@ -129,6 +130,12 @@ public:
     // Dormant parity path only; no live/export call site.
     QImage composite16Matte(const QVector<GpuLayerInput>& layers, QSize canvas);
 
+    // 16-bit track-matte compositor with per-fragment IDT. Matte'd source and
+    // matte source are both transformed into V1 output space before the existing
+    // matte combine shader derives alpha/luma, matching the CPU toUnifiedSpace
+    // then matte order for IDT-only preview.
+    QImage composite16IdtMatte(const QVector<GpuLayerInput>& layers, QSize canvas);
+
 private:
     bool ensureContext();    // lazy GL bring-up; sets m_triedInit / m_available
     bool ensureProgram();    // compile/link plain layer shader once; reused thereafter
@@ -155,6 +162,13 @@ private:
                             const gpucomposite::LayerDesc& d,
                             QSize canvas,
                             const QMatrix4x4& proj);
+    bool renderLayerToFbo16Idt(QOpenGLFramebufferObject& target,
+                               const QImage& img,
+                               const gpucomposite::LayerDesc& d,
+                               const clipcolor::ColorMeta& colorMeta,
+                               aces::ColorSpace outSpace,
+                               QSize canvas,
+                               const QMatrix4x4& proj);
 
     QOpenGLContext*    m_ctx     = nullptr;
     QOffscreenSurface* m_surface = nullptr;
