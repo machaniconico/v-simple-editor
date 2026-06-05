@@ -122,6 +122,7 @@ int runGpuCompositeFlagSelftest();
 int runGpuCompositeMathSelftest();
 int runHdrCompositeMathSelftest();
 int runHdrExport16Selftest();
+int runHdrIngestColorMetaSelftest();
 int runHdrOverlayPolicySelftest();
 int runGpuCompositeParitySelftest();
 int runGpuCompositeParity16MatteSelftest();
@@ -235,6 +236,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "HdrCompositeMath: 16-bit premul source-over + 8-bit SSOT parity + extra-precision proof + paint order (6 gates)" },
     { "hdr-export16",     "VEDITOR_HDR_EXPORT16_SELFTEST",       runHdrExport16Selftest,       false,
       "TlrCompose16: export SSOT の matte-free 16bit RGBA64 積層→to8bit パリティ + env フラグ + extra-precision (8 gates)" },
+    { "hdr-ingest-colormeta", "VEDITOR_HDR_INGEST_COLORMETA_SELFTEST", runHdrIngestColorMetaSelftest, false,
+      "Stage10 ingest ColorMeta derivation from codec primaries/transfer/bit-depth + pixfmt depth extraction (10 gates)" },
     { "hdr-overlay-policy", "VEDITOR_HDR_OVERLAY_POLICY_SELFTEST", runHdrOverlayPolicySelftest, false,
       "Stage4 overlay RGBA64 デコード述語: VEDITOR_HDR_OVERLAY flag×isHdr 真理値表 + env トグル + 混在→8bit ルート確認 (8 gates)" },
     { "preview16-policy", "VEDITOR_PREVIEW16_POLICY_SELFTEST", runPreview16PolicySelftest, false,

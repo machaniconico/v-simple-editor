@@ -255,7 +255,12 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/playback/dvxml_flag.h
     src/playback/TlrCompose16.h
     src/playback/TlrCompose16.cpp
+    # Stage10: ingest-time ColorMeta auto-populate (flag) + pixfmt bit-depth helper
+    src/playback/hdringest_flag.h
+    src/playback/PixFmtDepth.h
+    src/playback/PixFmtDepth.cpp
     src/selftests/hdr_export16_selftest.cpp
+    src/selftests/hdr_ingest_colormeta_selftest.cpp
     src/selftests/hdr_overlay_policy_selftest.cpp
     src/selftests/preview16_policy_selftest.cpp
     # Stage7: 16-bit RGBA64 track-matte compositor + parity selftest

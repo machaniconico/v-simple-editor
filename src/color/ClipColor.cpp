@@ -40,6 +40,60 @@ ColorMeta defaultSdr()
     return {};
 }
 
+ColorMeta fromCodecParams(int avColorPrimaries, int avColorTrc, int bitDepth)
+{
+    constexpr int kAvcolPriBt709 = 1;       // AVCOL_PRI_BT709 = 1
+    constexpr int kAvcolPriUnspecified = 2; // AVCOL_PRI_UNSPECIFIED = 2
+    constexpr int kAvcolPriBt2020 = 9;      // AVCOL_PRI_BT2020 = 9
+    constexpr int kAvcolPriSmpte432 = 12;   // AVCOL_PRI_SMPTE432 = 12 (Display P3)
+
+    constexpr int kAvcolTrcBt709 = 1;         // AVCOL_TRC_BT709 = 1
+    constexpr int kAvcolTrcUnspecified = 2;   // AVCOL_TRC_UNSPECIFIED = 2
+    constexpr int kAvcolTrcIec61966_2_1 = 13; // AVCOL_TRC_IEC61966_2_1 = 13 (sRGB)
+    constexpr int kAvcolTrcSmpte2084 = 16;    // AVCOL_TRC_SMPTE2084 = 16 (PQ)
+    constexpr int kAvcolTrcAribStdB67 = 18;   // AVCOL_TRC_ARIB_STD_B67 = 18 (HLG)
+
+    ColorMeta meta = defaultSdr();
+
+    switch (avColorPrimaries) {
+        case kAvcolPriBt709:
+            meta.primaries = Primaries::Rec709;
+            break;
+        case kAvcolPriBt2020:
+            meta.primaries = Primaries::Rec2020;
+            break;
+        case kAvcolPriSmpte432:
+            meta.primaries = Primaries::DisplayP3;
+            break;
+        case kAvcolPriUnspecified:
+        default:
+            meta.primaries = Primaries::Rec709;
+            break;
+    }
+
+    switch (avColorTrc) {
+        case kAvcolTrcSmpte2084:
+            meta.transfer = Transfer::PQ;
+            break;
+        case kAvcolTrcAribStdB67:
+            meta.transfer = Transfer::HLG;
+            break;
+        case kAvcolTrcBt709:
+        case kAvcolTrcIec61966_2_1:
+            meta.transfer = Transfer::sRGB;
+            break;
+        case kAvcolTrcUnspecified:
+        default:
+            meta.transfer = Transfer::sRGB;
+            break;
+    }
+
+    meta.bitDepth = bitDepth < 8 ? 8 : bitDepth;
+    meta.isHdr = (avColorTrc == kAvcolTrcSmpte2084
+                  || avColorTrc == kAvcolTrcAribStdB67);
+    return meta;
+}
+
 bool ColorMeta::isDefault() const
 {
     return *this == defaultSdr();

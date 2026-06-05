@@ -6,6 +6,11 @@
 #include "UndoManager.h"
 #include "AudioMixer.h"
 #include "OverlayDialogs.h"
+#include "color/ClipColor.h"
+#include "playback/hdringest_flag.h"
+#include "playback/PixFmtDepth.h"
+
+#include <algorithm>
 
 // STAGE4B: PlaybackEntry::matteTypeOrdinal stores TrackMatteType as a plain int
 // (PlaybackTypes.h must stay MaskSystem.h-free). This is the SSOT populate site
@@ -2927,6 +2932,10 @@ void Timeline::addClip(const QString &filePath)
     // first-import encode wait, and gated on resolution/codec to avoid
     // generating proxies for clips that already play smoothly.
     bool wantsAutoProxy = false;
+    bool videoStreamFound = false;
+    int capturedPrimaries = 0;
+    int capturedTrc = 0;
+    int capturedBitDepth = 8;
     if (avformat_open_input(&fmt, filePath.toUtf8().constData(), nullptr, nullptr) == 0) {
         if (avformat_find_stream_info(fmt, nullptr) >= 0 && fmt->duration > 0)
             duration = static_cast<double>(fmt->duration) / AV_TIME_BASE;
@@ -2937,6 +2946,10 @@ void Timeline::addClip(const QString &filePath)
                 continue;
             const int w = st->codecpar->width;
             const int h = st->codecpar->height;
+            videoStreamFound = true;
+            capturedPrimaries = st->codecpar->color_primaries;
+            capturedTrc = st->codecpar->color_trc;
+            capturedBitDepth = pixfmtdepth::bitDepthFromPixFmt(st->codecpar->format);
             const bool isAv1  = st->codecpar->codec_id == AV_CODEC_ID_AV1;
             const bool isQhdPlus = (w >= 2560) || (h >= 1440);
             // h.264 1080p+ も対象 (cinemascope や ultra-wide 含めるため OR)。
@@ -2965,6 +2978,22 @@ void Timeline::addClip(const QString &filePath)
     // and audio halves so the two stay locked together until the user
     // explicitly severs the sync via the clip's context menu.
     clip.linkGroup = allocateLinkGroup();
+
+    const bool hdrIngestEnabled = hdringest::enabledFromEnv();
+    const bool hdrTraceEnabled = hdringest::traceEnabledFromEnv();
+    clipcolor::ColorMeta derivedColorMeta = clip.colorMeta;
+    if (videoStreamFound && (hdrIngestEnabled || hdrTraceEnabled))
+        derivedColorMeta = clipcolor::fromCodecParams(capturedPrimaries, capturedTrc,
+                                                      capturedBitDepth);
+    if (hdrIngestEnabled && videoStreamFound)
+        clip.colorMeta = derivedColorMeta;
+    if (hdrTraceEnabled) {
+        qInfo().noquote() << "[hdr-ingest] file=" << clip.displayName
+                          << "ingest=" << (hdrIngestEnabled ? "on" : "off")
+                          << "videoStreamFound=" << videoStreamFound
+                          << "derived=" << clipcolor::describe(derivedColorMeta)
+                          << "clip=" << clipcolor::describe(clip.colorMeta);
+    }
 
     // Import placement policy — user chooses between parallel stacking
     // (V1→V2→V3...) and append-to-first-track (V1/A1 continuous sequence).
