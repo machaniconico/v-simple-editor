@@ -183,9 +183,14 @@
 // identical concrete encoder on both compared paths.
 #include "CodecDetector.h"
 #include "AIHighlight.h"
+#include "color/ClipColor.h"
+#include "playback/HdrIngestProbe.h"
 
 extern "C" {
+#include <libavcodec/codec_par.h>
+#include <libavformat/avformat.h>
 #include <libavutil/error.h>
+#include <libavutil/pixdesc.h>
 #include <libavutil/rational.h>
 #include <libswresample/swresample.h>
 }
@@ -407,6 +412,108 @@ void printSelftestHelpEntry(const char* name,
     std::cout << "\n";
 }
 
+QString hdrProbeUnknownIfEmpty(const char* value)
+{
+    return value ? QString::fromLatin1(value) : QStringLiteral("unknown");
+}
+
+QString hdrProbeSetState(const char* envVar)
+{
+    return qEnvironmentVariableIsSet(envVar)
+        ? QStringLiteral("set")
+        : QStringLiteral("unset");
+}
+
+int runHdrProbe(const QString& filePath)
+{
+    AVFormatContext* fmt = nullptr;
+
+    qInfo().noquote() << QStringLiteral("file: %1").arg(filePath);
+    if (avformat_open_input(&fmt, filePath.toUtf8().constData(), nullptr, nullptr) < 0) {
+        qInfo().noquote() << QStringLiteral("failed to open input");
+        return 1;
+    }
+
+    if (avformat_find_stream_info(fmt, nullptr) < 0) {
+        qInfo().noquote() << QStringLiteral("failed to read stream info");
+        avformat_close_input(&fmt);
+        return 1;
+    }
+
+    const AVStream* videoStream = nullptr;
+    for (unsigned i = 0; i < fmt->nb_streams; ++i) {
+        const AVStream* st = fmt->streams[i];
+        if (!st || !st->codecpar
+            || st->codecpar->codec_type != AVMEDIA_TYPE_VIDEO)
+            continue;
+        videoStream = st;
+        break;
+    }
+
+    if (!videoStream) {
+        qInfo().noquote() << QStringLiteral("no video stream found");
+        avformat_close_input(&fmt);
+        return 1;
+    }
+
+    const AVCodecParameters* cp = videoStream->codecpar;
+    const hdringest::ColorInputs inputs = hdringest::captureColorInputs(cp);
+    const clipcolor::ColorMeta meta =
+        clipcolor::fromCodecParams(inputs.primaries, inputs.trc,
+                                   inputs.bitDepth, inputs.hasHdrMeta);
+    const char* pixFmtName =
+        av_get_pix_fmt_name(static_cast<AVPixelFormat>(cp->format));
+
+    qInfo().noquote() << QStringLiteral("video stream found");
+    qInfo().noquote() << QStringLiteral("raw codecpar:");
+    qInfo().noquote()
+        << QStringLiteral("  color_primaries: %1 %2")
+               .arg(inputs.primaries)
+               .arg(hdrProbeUnknownIfEmpty(
+                   av_color_primaries_name(
+                       static_cast<AVColorPrimaries>(inputs.primaries))));
+    qInfo().noquote()
+        << QStringLiteral("  color_trc: %1 %2")
+               .arg(inputs.trc)
+               .arg(hdrProbeUnknownIfEmpty(
+                   av_color_transfer_name(
+                       static_cast<AVColorTransferCharacteristic>(inputs.trc))));
+    qInfo().noquote()
+        << QStringLiteral("  pix_fmt: %1")
+               .arg(hdrProbeUnknownIfEmpty(pixFmtName));
+    qInfo().noquote()
+        << QStringLiteral("  bitDepth: %1").arg(inputs.bitDepth);
+    qInfo().noquote()
+        << QStringLiteral("  hasHdrMeta: %1")
+               .arg(inputs.hasHdrMeta ? QStringLiteral("true")
+                                      : QStringLiteral("false"));
+    qInfo().noquote()
+        << QStringLiteral("derived ColorMeta: %1")
+               .arg(clipcolor::describe(meta));
+    qInfo().noquote()
+        << QStringLiteral("  isHdr: %1")
+               .arg(meta.isHdr ? QStringLiteral("true")
+                               : QStringLiteral("false"));
+    qInfo().noquote()
+        << QStringLiteral("env flags: VEDITOR_HDR_INGEST=%1 GPU_COMPOSITE=%2 HDR_OVERLAY=%3 HDR_EXPORT16=%4 HDR_IDT=%5 HDR_ODT=%6")
+               .arg(hdrProbeSetState("VEDITOR_HDR_INGEST"),
+                    hdrProbeSetState("VEDITOR_GPU_COMPOSITE"),
+                    hdrProbeSetState("VEDITOR_HDR_OVERLAY"),
+                    hdrProbeSetState("VEDITOR_HDR_EXPORT16"),
+                    hdrProbeSetState("VEDITOR_HDR_IDT"),
+                    hdrProbeSetState("VEDITOR_HDR_ODT"));
+    if (meta.isHdr) {
+        qInfo().noquote()
+            << QStringLiteral("guidance: HDR detected -- for preview 16-bit, also need VEDITOR_GPU_COMPOSITE + VEDITOR_HDR_OVERLAY + VEDITOR_HDR_EXPORT16 + 2 HDR layers");
+    } else {
+        qInfo().noquote()
+            << QStringLiteral("guidance: HDR not detected for this file -- check ffprobe trc/mastering metadata");
+    }
+
+    avformat_close_input(&fmt);
+    return 0;
+}
+
 int runSelftestListWithCredentialStore()
 {
     forEachSelftestIncludingCredentialStore(
@@ -426,6 +533,7 @@ int runSelftestHelpWithCredentialStore()
     std::cout << "V Simple Editor — selftest entry points ("
               << (selftests::kArgvSelftestsCount + 1) << ")\n";
     std::cout << "Usage: ./v-simple-editor.exe --selftest=<name>\n";
+    std::cout << "  --hdr-probe=<file>   diagnose HDR metadata detection for a file (headless)\n";
     std::cout << "   or: VEDITOR_<NAME>_SELFTEST=1 ./v-simple-editor.exe\n";
     std::cout << "   or: --selftest=all  (full sweep)\n";
     std::cout << "\n";
@@ -498,6 +606,18 @@ std::optional<int> dispatchCredentialStoreCompatPreQApplication(int argc, char* 
             writeLogLine("INFO", "argv-switch: --selftest=credential-store");
             return runCredentialStoreSelftest();
         }
+    }
+    return std::nullopt;
+}
+
+std::optional<int> dispatchHdrProbePreQApplication(int argc, char* argv[])
+{
+    for (int i = 1; i < argc; ++i) {
+        const QString arg = QString::fromLocal8Bit(argv[i]);
+        if (!arg.startsWith(QStringLiteral("--hdr-probe=")))
+            continue;
+        const QString filePath = arg.mid(QStringLiteral("--hdr-probe=").size());
+        return runHdrProbe(filePath);
     }
     return std::nullopt;
 }
@@ -1354,6 +1474,10 @@ int main(int argc, char *argv[])
     writeLogLine("INFO", QString("log path: %1").arg(g_logFilePath));
 
     if (auto rc = dispatchCredentialStoreCompatPreQApplication(argc, argv)) {
+        return *rc;
+    }
+
+    if (auto rc = dispatchHdrProbePreQApplication(argc, argv)) {
         return *rc;
     }
 

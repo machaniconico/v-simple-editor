@@ -7,6 +7,7 @@
 #include "AudioMixer.h"
 #include "OverlayDialogs.h"
 #include "color/ClipColor.h"
+#include "playback/HdrIngestProbe.h"
 #include "playback/hdringest_flag.h"
 #include "playback/PixFmtDepth.h"
 
@@ -2949,18 +2950,12 @@ void Timeline::addClip(const QString &filePath)
             const int w = st->codecpar->width;
             const int h = st->codecpar->height;
             videoStreamFound = true;
-            capturedPrimaries = st->codecpar->color_primaries;
-            capturedTrc = st->codecpar->color_trc;
-            capturedBitDepth = pixfmtdepth::bitDepthFromPixFmt(st->codecpar->format);
-#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(60, 0, 0)
-            capturedHasHdrMeta =
-                av_packet_side_data_get(st->codecpar->coded_side_data,
-                                        st->codecpar->nb_coded_side_data,
-                                        AV_PKT_DATA_MASTERING_DISPLAY_METADATA) != nullptr
-                || av_packet_side_data_get(st->codecpar->coded_side_data,
-                                           st->codecpar->nb_coded_side_data,
-                                           AV_PKT_DATA_CONTENT_LIGHT_LEVEL) != nullptr;
-#endif
+            const hdringest::ColorInputs colorInputs =
+                hdringest::captureColorInputs(st->codecpar);
+            capturedPrimaries = colorInputs.primaries;
+            capturedTrc = colorInputs.trc;
+            capturedBitDepth = colorInputs.bitDepth;
+            capturedHasHdrMeta = colorInputs.hasHdrMeta;
             const bool isAv1  = st->codecpar->codec_id == AV_CODEC_ID_AV1;
             const bool isQhdPlus = (w >= 2560) || (h >= 1440);
             // h.264 1080p+ も対象 (cinemascope や ultra-wide 含めるため OR)。

@@ -262,6 +262,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/playback/hdringest_flag.h
     src/playback/PixFmtDepth.h
     src/playback/PixFmtDepth.cpp
+    src/playback/HdrIngestProbe.cpp
     src/selftests/hdr_export16_selftest.cpp
     src/selftests/hdr_ingest_colormeta_selftest.cpp
     src/selftests/hdr_overlay_policy_selftest.cpp
