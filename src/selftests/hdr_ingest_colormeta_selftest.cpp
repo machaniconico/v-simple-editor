@@ -123,6 +123,7 @@ int runHdrIngestColorMetaSelftest()
           && pixfmtdepth::bitDepthFromPixFmt(AV_PIX_FMT_YUV422P10LE) == 10
           && pixfmtdepth::bitDepthFromPixFmt(AV_PIX_FMT_YUV444P10LE) == 10
           && pixfmtdepth::bitDepthFromPixFmt(AV_PIX_FMT_YUV420P12LE) == 12
+          && pixfmtdepth::bitDepthFromPixFmt(AV_PIX_FMT_BAYER_BGGR16LE) == 16
           && pixfmtdepth::bitDepthFromPixFmt(AV_PIX_FMT_YUV420P) == 8
           && pixfmtdepth::bitDepthFromPixFmt(AV_PIX_FMT_NONE) == 8);
 
