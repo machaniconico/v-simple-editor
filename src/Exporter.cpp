@@ -278,16 +278,11 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
                 if (framePts >= clipEnd) goto clip_done;
 
                 // Scale frame
-                if (!swsCtx || sws_getContext(
+                swsCtx = sws_getCachedContext(
+                    swsCtx,
                     frame->width, frame->height, decCtx->pix_fmt,
                     config.width, config.height, targetPixFmt,
-                    SWS_BILINEAR, nullptr, nullptr, nullptr) != swsCtx) {
-                    if (swsCtx) sws_freeContext(swsCtx);
-                    swsCtx = sws_getContext(
-                        frame->width, frame->height, decCtx->pix_fmt,
-                        config.width, config.height, targetPixFmt,
-                        SWS_BILINEAR, nullptr, nullptr, nullptr);
-                }
+                    SWS_BILINEAR, nullptr, nullptr, nullptr);
 
                 av_frame_make_writable(outFrame);
 

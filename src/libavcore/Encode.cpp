@@ -1185,11 +1185,30 @@ bool FrameEncoder::pushFrameNative(AVFrame* frame, int64_t pts)
 
     AVPacket* encPkt = av_packet_alloc();
     if (!encPkt) return false;
-    while (avcodec_receive_packet(m_encCtx, encPkt) == 0) {
+    int receiveRc = 0;
+    while ((receiveRc = avcodec_receive_packet(m_encCtx, encPkt)) == 0) {
         av_packet_rescale_ts(encPkt, m_encCtx->time_base, m_outStream->time_base);
         encPkt->stream_index = m_outStream->index;
-        av_interleaved_write_frame(m_outFmt, encPkt);
+        const int wr = av_interleaved_write_frame(m_outFmt, encPkt);
         av_packet_unref(encPkt);
+        if (wr < 0) {
+            char errBuf[AV_ERROR_MAX_STRING_SIZE] = {};
+            av_strerror(wr, errBuf, sizeof(errBuf));
+            std::fprintf(stderr,
+                         "FrameEncoder: video packet write failed: %s\n",
+                         errBuf);
+            av_packet_free(&encPkt);
+            return false;
+        }
+    }
+    if (receiveRc < 0 && receiveRc != AVERROR(EAGAIN) && receiveRc != AVERROR_EOF) {
+        char errBuf[AV_ERROR_MAX_STRING_SIZE] = {};
+        av_strerror(receiveRc, errBuf, sizeof(errBuf));
+        std::fprintf(stderr,
+                     "FrameEncoder: video packet receive failed: %s\n",
+                     errBuf);
+        av_packet_free(&encPkt);
+        return false;
     }
     av_packet_free(&encPkt);
     return true;
@@ -1335,17 +1354,46 @@ std::optional<std::string> FrameEncoder::finalize()
     m_finalized = true;
 
     if (m_encCtx) {
-        avcodec_send_frame(m_encCtx, nullptr);
-        AVPacket* flushPkt = av_packet_alloc();
-        if (flushPkt) {
-            while (avcodec_receive_packet(m_encCtx, flushPkt) == 0) {
-                av_packet_rescale_ts(flushPkt, m_encCtx->time_base, m_outStream->time_base);
-                flushPkt->stream_index = m_outStream->index;
-                av_interleaved_write_frame(m_outFmt, flushPkt);
-                av_packet_unref(flushPkt);
-            }
-            av_packet_free(&flushPkt);
+        const int sendRc = avcodec_send_frame(m_encCtx, nullptr);
+        if (sendRc < 0 && sendRc != AVERROR(EAGAIN) && sendRc != AVERROR_EOF) {
+            const std::string err = ffmpegErrorString(sendRc);
+            std::fprintf(stderr,
+                         "FrameEncoder: video encoder flush send failed: %s\n",
+                         err.c_str());
+            return std::string("Video encoder flush send failed: ") + err;
         }
+        AVPacket* flushPkt = av_packet_alloc();
+        if (!flushPkt) {
+            return std::string("Failed to allocate video flush packet");
+        }
+        while (true) {
+            const int rc = avcodec_receive_packet(m_encCtx, flushPkt);
+            if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) {
+                break;
+            }
+            if (rc < 0) {
+                const std::string err = ffmpegErrorString(rc);
+                std::fprintf(stderr,
+                             "FrameEncoder: video packet receive during flush failed: %s\n",
+                             err.c_str());
+                av_packet_free(&flushPkt);
+                return std::string("Video encoder flush receive failed: ") + err;
+            }
+
+            av_packet_rescale_ts(flushPkt, m_encCtx->time_base, m_outStream->time_base);
+            flushPkt->stream_index = m_outStream->index;
+            const int writeRc = av_interleaved_write_frame(m_outFmt, flushPkt);
+            av_packet_unref(flushPkt);
+            if (writeRc < 0) {
+                const std::string err = ffmpegErrorString(writeRc);
+                std::fprintf(stderr,
+                             "FrameEncoder: video packet write during flush failed: %s\n",
+                             err.c_str());
+                av_packet_free(&flushPkt);
+                return std::string("Video packet write during flush failed: ") + err;
+            }
+        }
+        av_packet_free(&flushPkt);
     }
 
     if (m_audioEncode) {
