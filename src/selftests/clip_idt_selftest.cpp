@@ -123,7 +123,8 @@ Rgb16 referenceStraightRgb(aces::ColorSpace inputSpace,
                            aces::ColorSpace outputSpace,
                            quint16 r,
                            quint16 g,
-                           quint16 b)
+                           quint16 b,
+                           bool inputIsLinear = false)
 {
     const aces::Vec3 encodedIn = {
         double(r) / kMax16,
@@ -131,9 +132,9 @@ Rgb16 referenceStraightRgb(aces::ColorSpace inputSpace,
         double(b) / kMax16
     };
     const aces::Vec3 linearIn = {
-        aces::eotf(inputSpace, encodedIn[0]),
-        aces::eotf(inputSpace, encodedIn[1]),
-        aces::eotf(inputSpace, encodedIn[2])
+        inputIsLinear ? encodedIn[0] : aces::eotf(inputSpace, encodedIn[0]),
+        inputIsLinear ? encodedIn[1] : aces::eotf(inputSpace, encodedIn[1]),
+        inputIsLinear ? encodedIn[2] : aces::eotf(inputSpace, encodedIn[2])
     };
     const aces::Mat3 matrix = aces::conversionMatrix(inputSpace, outputSpace);
     const aces::Vec3 linearOut = aces::apply(matrix, linearIn);
@@ -173,6 +174,30 @@ QImage convertNoCache(const QImage& src,
     return out;
 }
 
+Rgb16 referenceLinearWorking(quint16 r,
+                             quint16 g,
+                             quint16 b,
+                             aces::ColorSpace inputSpace,
+                             bool inputIsLinear = false)
+{
+    const aces::Vec3 encodedIn = {
+        double(r) / kMax16,
+        double(g) / kMax16,
+        double(b) / kMax16
+    };
+    const aces::Vec3 linearIn = {
+        inputIsLinear ? encodedIn[0] : aces::eotf(inputSpace, encodedIn[0]),
+        inputIsLinear ? encodedIn[1] : aces::eotf(inputSpace, encodedIn[1]),
+        inputIsLinear ? encodedIn[2] : aces::eotf(inputSpace, encodedIn[2])
+    };
+    const aces::Vec3 linearRec2020 = aces::apply(
+        aces::conversionMatrix(inputSpace, aces::ColorSpace::Rec2020),
+        linearIn);
+    return Rgb16{clampTo16(linearRec2020[0]),
+                 clampTo16(linearRec2020[1]),
+                 clampTo16(linearRec2020[2])};
+}
+
 bool pixelMatchesReference(const QImage& img,
                            const Rgb16& straight,
                            quint16 alpha,
@@ -201,6 +226,10 @@ int runClipIdtSelftest()
 
     const clipcolor::ColorMeta rec709 = meta(clipcolor::Primaries::Rec709);
     const clipcolor::ColorMeta rec2020 = meta(clipcolor::Primaries::Rec2020);
+    const clipcolor::ColorMeta rec709Linear = meta(clipcolor::Primaries::Rec709,
+                                                   clipcolor::Transfer::Linear);
+    const clipcolor::ColorMeta rec2020Linear = meta(clipcolor::Primaries::Rec2020,
+                                                    clipcolor::Transfer::Linear);
 
     {
         const QImage in = makeSolidPremul(QSize(3, 2), 12345, 23456, 34567, kMax16);
@@ -307,7 +336,49 @@ int runClipIdtSelftest()
               got.red() == kMax16 && got.green() <= 1024 && got.blue() <= 1024);
     }
 
-    std::printf("[clip-idt] summary: gates=9 passed=%d failed=%d\n",
+    {
+        const quint16 r = 30000;
+        const quint16 g = 42000;
+        const quint16 b = 11000;
+        const QImage in = makeSolidPremul(QSize(1, 1), r, g, b, kMax16);
+        const QImage unified = clipcolor::toUnifiedSpace(in, rec709, aces::ColorSpace::Rec2020);
+        const QImage working = clipcolor::toLinearWorking(in, rec709);
+        const Rgb16 wantUnified = referenceStraightRgb(
+            aces::ColorSpace::sRGB, aces::ColorSpace::Rec2020, r, g, b);
+        const Rgb16 wantWorking = referenceLinearWorking(r, g, b, aces::ColorSpace::sRGB);
+        check(10, "default Rec709/sRGB still applies legacy sRGB EOTF on IDT paths",
+              pixelMatchesReference(unified, wantUnified, kMax16, 1)
+              && pixelMatchesReference(working, wantWorking, kMax16, 1));
+    }
+
+    {
+        const quint16 r = 30000;
+        const quint16 g = 42000;
+        const quint16 b = 11000;
+        const QImage in = makeSolidPremul(QSize(1, 1), r, g, b, kMax16);
+        const QImage linearOut = clipcolor::toLinearWorking(in, rec709Linear);
+        const QImage srgbOut = clipcolor::toLinearWorking(in, rec709);
+        const Rgb16 want = referenceLinearWorking(r, g, b, aces::ColorSpace::sRGB, true);
+        const DiffStats diff = diffImages(linearOut, srgbOut);
+        check(11, "Rec709 Linear toLinearWorking skips sRGB EOTF and differs from sRGB",
+              pixelMatchesReference(linearOut, want, kMax16, 1)
+              && diff.maxAbs > 4096);
+    }
+
+    {
+        const quint16 r = 18000;
+        const quint16 g = 39000;
+        const quint16 b = 52000;
+        const QImage in = makeSolidPremul(QSize(1, 1), r, g, b, kMax16);
+        const QImage out = clipcolor::toUnifiedSpace(in, rec2020Linear,
+                                                     aces::ColorSpace::sRGB);
+        const Rgb16 want = referenceStraightRgb(
+            aces::ColorSpace::Rec2020, aces::ColorSpace::sRGB, r, g, b, true);
+        check(12, "Rec2020 Linear toUnifiedSpace uses direct linear gamut matrix",
+              pixelMatchesReference(out, want, kMax16, 1));
+    }
+
+    std::printf("[clip-idt] summary: gates=12 passed=%d failed=%d\n",
                 passed, failed);
     return failed == 0 ? 0 : 1;
 }

@@ -113,6 +113,18 @@ int runClipColorSelftest()
               && json.value(QStringLiteral("transfer")).toString() == QStringLiteral("pq"));
     }
 
+    check("G13 AVCOL_TRC_BT709 codec meta remains default SDR",
+          clipcolor::fromCodecParams(1, 1, 8, false).isDefault());
+
+    {
+        const clipcolor::ColorMeta linear = clipcolor::fromCodecParams(1, 8, 8, false);
+        check("G14 AVCOL_TRC_LINEAR maps to Linear SDR transfer",
+              linear.primaries == clipcolor::Primaries::Rec709
+              && linear.transfer == clipcolor::Transfer::Linear
+              && linear.bitDepth == 8
+              && !linear.isHdr);
+    }
+
     qInfo().noquote() << "[clip-color] selftest done: passed=" << passed
                       << "failed=" << failed;
     return failed == 0 ? 0 : 1;

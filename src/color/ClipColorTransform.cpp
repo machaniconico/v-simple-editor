@@ -64,6 +64,7 @@ quint64 convertStraightRgb(quint16 r,
                            quint16 b,
                            const aces::Mat3& matrix,
                            aces::ColorSpace inputSpace,
+                           bool inputIsLinear,
                            aces::ColorSpace outputSpace)
 {
     const aces::Vec3 encodedIn = {
@@ -72,9 +73,9 @@ quint64 convertStraightRgb(quint16 r,
         static_cast<double>(b) / kMax16
     };
     const aces::Vec3 linearIn = {
-        aces::eotf(inputSpace, encodedIn[0]),
-        aces::eotf(inputSpace, encodedIn[1]),
-        aces::eotf(inputSpace, encodedIn[2])
+        inputIsLinear ? encodedIn[0] : aces::eotf(inputSpace, encodedIn[0]),
+        inputIsLinear ? encodedIn[1] : aces::eotf(inputSpace, encodedIn[1]),
+        inputIsLinear ? encodedIn[2] : aces::eotf(inputSpace, encodedIn[2])
     };
     const aces::Vec3 linearOut = aces::apply(matrix, linearIn);
     const quint16 outR = clampTo16(aces::oetf(outputSpace, linearOut[0]));
@@ -87,7 +88,8 @@ quint64 convertStraightRgbToLinearWorking(quint16 r,
                                           quint16 g,
                                           quint16 b,
                                           const aces::Mat3& matrix,
-                                          aces::ColorSpace inputSpace)
+                                          aces::ColorSpace inputSpace,
+                                          bool inputIsLinear)
 {
     const aces::Vec3 encodedIn = {
         static_cast<double>(r) / kMax16,
@@ -95,9 +97,9 @@ quint64 convertStraightRgbToLinearWorking(quint16 r,
         static_cast<double>(b) / kMax16
     };
     const aces::Vec3 linearIn = {
-        aces::eotf(inputSpace, encodedIn[0]),
-        aces::eotf(inputSpace, encodedIn[1]),
-        aces::eotf(inputSpace, encodedIn[2])
+        inputIsLinear ? encodedIn[0] : aces::eotf(inputSpace, encodedIn[0]),
+        inputIsLinear ? encodedIn[1] : aces::eotf(inputSpace, encodedIn[1]),
+        inputIsLinear ? encodedIn[2] : aces::eotf(inputSpace, encodedIn[2])
     };
     const aces::Vec3 linearWorking = aces::apply(matrix, linearIn);
     return packRgb16(clampTo16(linearWorking[0]),
@@ -138,6 +140,10 @@ QImage toUnifiedSpace(const QImage& rgba64Premul,
     if (in.transfer == Transfer::PQ || in.transfer == Transfer::HLG)
         return rgba64Premul;
 
+    // GpuLayerCompositor's GPU IDT path is still transfer-blind; this CPU
+    // Linear fix would diverge when idtgpu is enabled. GPU Linear support and
+    // parity coverage remain separate, with current parity gates non-Linear.
+    const bool inputIsLinear = (in.transfer == Transfer::Linear);
     QImage out = rgba64Premul.convertToFormat(QImage::Format_RGBA64_Premultiplied);
     const aces::Mat3 matrix = aces::conversionMatrix(inputSpace, outputSpace);
 
@@ -167,7 +173,8 @@ QImage toUnifiedSpace(const QImage& rgba64Premul,
                 unpackRgb16(it->second, outR, outG, outB);
             } else {
                 const quint64 packed = convertStraightRgb(straightR, straightG, straightB,
-                                                          matrix, inputSpace, outputSpace);
+                                                          matrix, inputSpace, inputIsLinear,
+                                                          outputSpace);
                 unpackRgb16(packed, outR, outG, outB);
                 if (cache.size() < kCacheReserve)
                     cache.emplace(key, packed);
@@ -199,6 +206,7 @@ QImage toLinearWorking(const QImage& rgba64Premul, const ColorMeta& in)
     if (in.transfer == Transfer::PQ || in.transfer == Transfer::HLG)
         return rgba64Premul;
 
+    const bool inputIsLinear = (in.transfer == Transfer::Linear);
     QImage out = rgba64Premul.convertToFormat(QImage::Format_RGBA64_Premultiplied);
     const aces::Mat3 matrix = aces::conversionMatrix(inputSpace,
                                                      aces::ColorSpace::Rec2020);
@@ -229,7 +237,7 @@ QImage toLinearWorking(const QImage& rgba64Premul, const ColorMeta& in)
                 unpackRgb16(it->second, outR, outG, outB);
             } else {
                 const quint64 packed = convertStraightRgbToLinearWorking(
-                    straightR, straightG, straightB, matrix, inputSpace);
+                    straightR, straightG, straightB, matrix, inputSpace, inputIsLinear);
                 unpackRgb16(packed, outR, outG, outB);
                 if (cache.size() < kCacheReserve)
                     cache.emplace(key, packed);

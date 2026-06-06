@@ -50,6 +50,7 @@ ColorMeta fromCodecParams(int avColorPrimaries, int avColorTrc, int bitDepth,
 
     constexpr int kAvcolTrcBt709 = 1;         // AVCOL_TRC_BT709 = 1
     constexpr int kAvcolTrcUnspecified = 2;   // AVCOL_TRC_UNSPECIFIED = 2
+    constexpr int kAvcolTrcLinear = 8;        // AVCOL_TRC_LINEAR = 8
     constexpr int kAvcolTrcIec61966_2_1 = 13; // AVCOL_TRC_IEC61966_2_1 = 13 (sRGB)
     constexpr int kAvcolTrcSmpte2084 = 16;    // AVCOL_TRC_SMPTE2084 = 16 (PQ)
     constexpr int kAvcolTrcAribStdB67 = 18;   // AVCOL_TRC_ARIB_STD_B67 = 18 (HLG)
@@ -80,6 +81,10 @@ ColorMeta fromCodecParams(int avColorPrimaries, int avColorTrc, int bitDepth,
         case kAvcolTrcAribStdB67:
             meta.transfer = Transfer::HLG;
             meta.isHdr = true;
+            break;
+        case kAvcolTrcLinear:
+            meta.transfer = Transfer::Linear;
+            meta.isHdr = false;
             break;
         case kAvcolTrcBt709:
         case kAvcolTrcIec61966_2_1:
