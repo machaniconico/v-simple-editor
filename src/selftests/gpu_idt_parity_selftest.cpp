@@ -212,6 +212,9 @@ QImage convertLayerNoCache(const QImage& src,
 
     const aces::ColorSpace inputSpace = clipcolor::acesSpaceFor(in);
     const aces::Mat3 matrix = aces::conversionMatrix(inputSpace, outputSpace);
+    const bool inputIsLinear =
+        in.transfer == clipcolor::Transfer::Linear
+        || aces::isLinearSpace(inputSpace);
 
     QImage out = src.convertToFormat(QImage::Format_RGBA64_Premultiplied);
     for (int y = 0; y < out.height(); ++y) {
@@ -230,9 +233,9 @@ QImage convertLayerNoCache(const QImage& src,
                 double(unpremultiply16(px.blue(), a)) / kMax16
             };
             const aces::Vec3 linearIn = {
-                aces::eotf(inputSpace, encodedIn[0]),
-                aces::eotf(inputSpace, encodedIn[1]),
-                aces::eotf(inputSpace, encodedIn[2])
+                inputIsLinear ? encodedIn[0] : aces::eotf(inputSpace, encodedIn[0]),
+                inputIsLinear ? encodedIn[1] : aces::eotf(inputSpace, encodedIn[1]),
+                inputIsLinear ? encodedIn[2] : aces::eotf(inputSpace, encodedIn[2])
             };
             const aces::Vec3 linearOut = aces::apply(matrix, linearIn);
             const quint16 outR = clampTo16(aces::oetf(outputSpace, linearOut[0]));
@@ -435,7 +438,11 @@ int runGpuIdtParitySelftest()
     }
 
     const clipcolor::ColorMeta rec709 = meta(clipcolor::Primaries::Rec709);
+    const clipcolor::ColorMeta rec709Linear =
+        meta(clipcolor::Primaries::Rec709, clipcolor::Transfer::Linear);
     const clipcolor::ColorMeta rec2020 = meta(clipcolor::Primaries::Rec2020);
+    const clipcolor::ColorMeta rec2020Linear =
+        meta(clipcolor::Primaries::Rec2020, clipcolor::Transfer::Linear);
     const clipcolor::ColorMeta displayP3 = meta(clipcolor::Primaries::DisplayP3);
     const clipcolor::ColorMeta acescg =
         meta(clipcolor::Primaries::ACEScg, clipcolor::Transfer::Linear);
@@ -535,6 +542,18 @@ int runGpuIdtParitySelftest()
         layers.push_back(makeLayer(rec2020Signal16(canvas), displayP3,
                                    /*track*/1, 1.0));
         gate(8, "DisplayP3 overlay converted to V1 Rec709/sRGB",
+             layers, canvas, ssimMin, maeMax, maeMax);
+    }
+
+    {
+        QVector<GpuLayerInput> layers;
+        layers.push_back(makeLayer(transparent16(canvas), displayP3,
+                                   /*track*/0, 1.0));
+        layers.push_back(makeLayer(rec709Signal16(canvas), rec709Linear,
+                                   /*track*/1, 0.45));
+        layers.push_back(makeLayer(rec2020Signal16(canvas), rec2020Linear,
+                                   /*track*/2, 1.0));
+        gate(9, "Rec2020/Rec709 Linear transfer converted to V1 DisplayP3/sRGB",
              layers, canvas, ssimMin, maeMax, maeMax);
     }
 

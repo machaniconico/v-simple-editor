@@ -703,8 +703,10 @@ bool GpuLayerCompositor::renderLayerToFbo16Idt(QOpenGLFramebufferObject& target,
     prog.setUniformValue(m_idt_uOpacity, 1.0f);
     prog.setUniformValue(m_idt_uConvMatrix, convMatrix);
     prog.setUniformValue(m_idt_uPassthrough, passthrough ? 1 : 0);
-    prog.setUniformValue(m_idt_uApplyEotf,
-                         aces::isLinearSpace(inSpace) ? 0 : 1);
+    const bool inputIsLinear =
+        colorMeta.transfer == clipcolor::Transfer::Linear
+        || aces::isLinearSpace(inSpace);
+    prog.setUniformValue(m_idt_uApplyEotf, inputIsLinear ? 0 : 1);
     prog.setUniformValue(m_idt_uApplyOetf,
                          aces::isLinearSpace(outSpace) ? 0 : 1);
 
@@ -1469,8 +1471,10 @@ QImage GpuLayerCompositor::composite16Idt(const QVector<GpuLayerInput>& layers, 
                              float(gpucomposite::clampOpacity(d.opacity)));
         prog.setUniformValue(m_idt_uConvMatrix, convMatrix);
         prog.setUniformValue(m_idt_uPassthrough, passthrough ? 1 : 0);
-        prog.setUniformValue(m_idt_uApplyEotf,
-                             aces::isLinearSpace(inSpace) ? 0 : 1);
+        const bool inputIsLinear =
+            in.colorMeta.transfer == clipcolor::Transfer::Linear
+            || aces::isLinearSpace(inSpace);
+        prog.setUniformValue(m_idt_uApplyEotf, inputIsLinear ? 0 : 1);
         prog.setUniformValue(m_idt_uApplyOetf,
                              aces::isLinearSpace(outSpace) ? 0 : 1);
 
@@ -2127,8 +2131,10 @@ QImage GpuLayerCompositor::composite16IdtMatte(const QVector<GpuLayerInput>& lay
                              float(gpucomposite::clampOpacity(d.opacity)));
         prog.setUniformValue(m_idt_uConvMatrix, convMatrix);
         prog.setUniformValue(m_idt_uPassthrough, passthrough ? 1 : 0);
-        prog.setUniformValue(m_idt_uApplyEotf,
-                             aces::isLinearSpace(inSpace) ? 0 : 1);
+        const bool inputIsLinear =
+            in.colorMeta.transfer == clipcolor::Transfer::Linear
+            || aces::isLinearSpace(inSpace);
+        prog.setUniformValue(m_idt_uApplyEotf, inputIsLinear ? 0 : 1);
         prog.setUniformValue(m_idt_uApplyOetf,
                              aces::isLinearSpace(outSpace) ? 0 : 1);
 

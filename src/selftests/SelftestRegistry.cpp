@@ -262,7 +262,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "gpu-composite-parity-16-matte", "VEDITOR_GPU_COMPOSITE_PARITY_16_MATTE_SELFTEST", runGpuCompositeParity16MatteSelftest, true,
       "GPU RGBA16 track-matte (composite16Matte) vs CPU 16-bit matte oracle, all 4 matte types + premul + precision proof, graceful GL skip" },
     { "gpu-idt-parity", "VEDITOR_GPU_IDT_PARITY_SELFTEST", runGpuIdtParitySelftest, true,
-      "GpuIdt: per-fragment IDT (eotf->mat3->oetf) vs aces:: CPU oracle" },
+      "GpuIdt: per-fragment IDT (eotf->mat3->oetf) vs aces:: CPU oracle (9 gates incl Linear transfer, graceful GL skip)" },
     { "gpu-idt-matte-parity", "VEDITOR_GPU_IDT_MATTE_PARITY_SELFTEST", runGpuIdtMatteParitySelftest, true,
       "GpuIdtMatte: per-fragment IDT matte path vs IDT-then-compositeReference16Matte oracle" },
     { "hdr-composite-parity", "VEDITOR_HDR_COMPOSITE_PARITY_SELFTEST", runHdrCompositeParitySelftest, true,
