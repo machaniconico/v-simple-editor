@@ -2946,6 +2946,8 @@ bool VideoPlayer::seekInternal(int64_t positionUs, bool displayFrame, bool preci
         const QImage image = frameToImage(displayable);
         if (image.isNull())
             return false;
+        // This path displays a non-baked frame.
+        m_lastFrameOdtApplied = false;
         this->displayFrame(image);
         m_currentPositionUs = targetUs;
         updatePositionUi();
@@ -3046,8 +3048,11 @@ bool VideoPlayer::presentDecodedFrame(AVFrame *frame, bool displayFrameRequested
         // into m_lastSourceFrame later in the pipeline.
         m_lastV1RawFrame = image;
         m_lastSourceFrame = image;
-        if (!m_deferDisplayThisTick)
+        if (!m_deferDisplayThisTick) {
+            // This path displays a non-baked frame.
+            m_lastFrameOdtApplied = false;
             displayFrame(image);
+        }
         updatePositionUi();
     }
 
@@ -3257,6 +3262,8 @@ void VideoPlayer::refreshDisplayedFrame()
             m_canvasWidth, m_canvasHeight,
             Qt::IgnoreAspectRatio, Qt::FastTransformation);
     }
+    // This path displays a non-baked frame.
+    m_lastFrameOdtApplied = false;
     displayFrame(m_lastSourceFrame);
 }
 
@@ -3353,6 +3360,8 @@ void VideoPlayer::handlePlaybackTick()
 {
     if (!m_playing)
         return;
+
+    m_lastFrameOdtApplied = false;
 
     // Anchor the tick body so scheduleNextFrame can fire the next tick at
     // tickWallStart + frameInterval (constant cadence) rather than
@@ -3659,6 +3668,7 @@ void VideoPlayer::handlePlaybackTick()
                 && cached.size() == QSize(hitKey.width, hitKey.height)) {
                 if (m_glPreview)
                     m_glPreview->setCompositeBakedMode(true);
+                // Cache hits can re-serve ODT-baked frames; without a cached baked flag, paused same-playhead hits can double-apply ACES.
                 displayFrame(cached);
                 servedFromCache = true;
             }
