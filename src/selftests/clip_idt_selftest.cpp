@@ -378,7 +378,22 @@ int runClipIdtSelftest()
               pixelMatchesReference(out, want, kMax16, 1));
     }
 
-    std::printf("[clip-idt] summary: gates=12 passed=%d failed=%d\n",
+    {
+        const quint16 r = 16000;
+        const quint16 g = 30000;
+        const quint16 b = 50000;
+        const QImage in = makeSolidPremul(QSize(1, 1), r, g, b, kMax16);
+        const QImage out = clipcolor::toUnifiedSpace(in, rec709Linear,
+                                                     aces::ColorSpace::sRGB);
+        const Rgb16 want = referenceStraightRgb(
+            aces::ColorSpace::sRGB, aces::ColorSpace::sRGB, r, g, b, true);
+        const DiffStats passthroughDiff = diffImages(in, out);
+        check(13, "Rec709 Linear same-primaries to sRGB applies OETF",
+              pixelMatchesReference(out, want, kMax16, 1)
+              && passthroughDiff.maxAbs > 4096);
+    }
+
+    std::printf("[clip-idt] summary: gates=13 passed=%d failed=%d\n",
                 passed, failed);
     return failed == 0 ? 0 : 1;
 }

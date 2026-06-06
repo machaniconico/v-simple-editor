@@ -6,6 +6,8 @@
 #include "CodecDetector.h"
 #include "AcesColor.h"  // AC: production export 経路への ACES 適用 (8bit のみ)
 #include "color/ClipOdt.h"
+#include "playback/hdrexport16_flag.h"
+#include "playback/hdrmatte16_flag.h"
 #include "libavcore/Encode.h"
 #include "libavcore/Probe.h"
 #include <QByteArray>
@@ -30,6 +32,7 @@
 #include <cmath>  // std::round for the HDR10 master-display luminance scaling
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <string>
 
@@ -37,7 +40,53 @@ namespace {
 QString makeUuid() {
     return QUuid::createUuid().toString(QUuid::WithoutBraces);
 }
+
+bool odtOwnsTonemapForExport(bool clipOdtEnabled,
+                              bool export16Enabled,
+                              bool matte16Enabled)
+{
+    return clipOdtEnabled && (export16Enabled || matte16Enabled);
+}
+
+bool shouldApplyExportAces(bool acesEnabled,
+                           bool isHdr10,
+                           bool isHlg,
+                           bool isProRes,
+                           bool odtOwnsTonemap)
+{
+    return acesEnabled && !isHdr10 && !isHlg && !isProRes && !odtOwnsTonemap;
+}
 } // namespace
+
+int runRenderQueueAcesDecisionSelftest()
+{
+    int passed = 0;
+    int failed = 0;
+
+    auto check = [&](int g, const char* desc, bool ok) {
+        std::printf("[renderqueue-aces] %s G%d %s\n",
+                    ok ? "PASS" : "FAIL", g, desc);
+        ok ? ++passed : ++failed;
+    };
+
+    {
+        const bool odtOwnsTonemap = odtOwnsTonemapForExport(true, false, false);
+        check(1, "ODT-only keeps 8-bit ACES tonemap enabled",
+              !odtOwnsTonemap
+              && shouldApplyExportAces(true, false, false, false, odtOwnsTonemap));
+    }
+
+    {
+        const bool odtOwnsTonemap = odtOwnsTonemapForExport(true, true, false);
+        check(2, "ODT plus EXPORT16 suppresses 8-bit ACES re-apply",
+              odtOwnsTonemap
+              && !shouldApplyExportAces(true, false, false, false, odtOwnsTonemap));
+    }
+
+    std::printf("[renderqueue-aces] summary: gates=2 passed=%d failed=%d\n",
+                passed, failed);
+    return failed == 0 ? 0 : 1;
+}
 
 RenderQueue::RenderQueue(QObject *parent)
     : QObject(parent)
@@ -675,10 +724,14 @@ void RenderQueue::startRenderPipe(int jobIndex)
         QMutexLocker locker(&m_acesMutex);
         acesPipe = m_acesPipeline;
     }
-    // When VEDITOR_HDR_ODT is ON the 16-bit ODT in renderFrameAt owns tonemap; suppress 8-bit re-apply.
-    const bool applyAces = acesPipe.enabled
-        && !isHdr10 && !isHlg && !isProRes
-        && !clipodt::enabledFromEnv();
+    // When VEDITOR_HDR_ODT is ON with a 16-bit renderFrameAt path, that ODT
+    // owns tonemap; otherwise the 8-bit ACES export pass must still run.
+    const bool odtOwnsTonemap = odtOwnsTonemapForExport(
+        clipodt::enabledFromEnv(),
+        hdrexport16::enabledFromEnv(),
+        hdrmatte16::enabledFromEnv());
+    const bool applyAces = shouldApplyExportAces(
+        acesPipe.enabled, isHdr10, isHlg, isProRes, odtOwnsTonemap);
 
     // HDR10/HLG followed the old render-pipe branch by forcing x265 unless the
     // caller explicitly selected an HEVC hardware encoder. US-B3-7: when this

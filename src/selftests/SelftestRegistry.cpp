@@ -85,6 +85,7 @@ int runProSelftest();
 int runProjTmplSelftest();
 int runProjectPresetSelftest();
 int runProxySelftestV2();
+int runRenderQueueAcesDecisionSelftest();
 int runShortcutSelftest();
 int runSmartEditSelftest();
 int runSocialSelftest();
@@ -160,6 +161,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "ProxyManager regression gate (libavcore + QSettings struct defaults, 6 gates)" },
     { "hdr-routing",       "VEDITOR_HDR_ROUTING_SELFTEST",        runHdrRoutingSelftest,         false,
       "HDR10 3-way routing (in-process 8-bit / in-process HDR / subprocess fallback)" },
+    { "renderqueue-aces",  "VEDITOR_RENDERQUEUE_ACES_SELFTEST",   runRenderQueueAcesDecisionSelftest, false,
+      "RenderQueue ACES/ODT ownership decision for 8-bit vs 16-bit tonemap paths (2 gates)" },
     { "tracker-preset",    "VEDITOR_TRACKER_PRESET_SELFTEST",     runTrackerPresetSelftest,      false,
       "MotionTracker preset 7 built-in + Registry + JSON round-trip (7 gates)" },
 #ifdef HAVE_PLANARTRACKER_PRESET
@@ -221,7 +224,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "clip-color",       "VEDITOR_CLIP_COLOR_SELFTEST",         runClipColorSelftest,          false,
       "ClipColor: per-clip 色メタデータ模型 — defaultSdr / JSON round-trip / token 逆写像 / describe / codec transfer mapping (14 gates)" },
     { "clip-idt",         "VEDITOR_CLIP_IDT_SELFTEST",           runClipIdtSelftest,            false,
-      "Clip IDT: per-clip RGBA64 premul input color transform into common 16bit blend space (12 gates)" },
+      "Clip IDT: per-clip RGBA64 premul input color transform into common 16bit blend space (13 gates)" },
     { "clip-odt",         "VEDITOR_CLIP_ODT_SELFTEST",           runClipOdtSelftest,            false,
       "Clip ODT: linear Rec2020 RGBA64 premul output transform + ACES tonemap contract (10 gates)" },
     { "composite-frame-cache", "VEDITOR_COMPOSITE_FRAME_CACHE_SELFTEST", runCompositeFrameCacheSelftest, false,

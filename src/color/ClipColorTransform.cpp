@@ -131,7 +131,8 @@ QImage toUnifiedSpace(const QImage& rgba64Premul,
     }
 
     const aces::ColorSpace inputSpace = acesSpaceFor(in);
-    if (inputSpace == outputSpace)
+    const bool inputIsLinear = (in.transfer == Transfer::Linear);
+    if (inputSpace == outputSpace && inputIsLinear == aces::isLinearSpace(outputSpace))
         return rgba64Premul;
 
     // Stage5 limitation: ACES here only exposes sRGB-style/linear transfer
@@ -143,7 +144,6 @@ QImage toUnifiedSpace(const QImage& rgba64Premul,
     // GpuLayerCompositor's GPU IDT path is still transfer-blind; this CPU
     // Linear fix would diverge when idtgpu is enabled. GPU Linear support and
     // parity coverage remain separate, with current parity gates non-Linear.
-    const bool inputIsLinear = (in.transfer == Transfer::Linear);
     QImage out = rgba64Premul.convertToFormat(QImage::Format_RGBA64_Premultiplied);
     const aces::Mat3 matrix = aces::conversionMatrix(inputSpace, outputSpace);
 
