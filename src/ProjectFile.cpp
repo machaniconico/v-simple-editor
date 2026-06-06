@@ -1265,6 +1265,7 @@ QJsonObject ProjectFile::configToJson(const ProjectConfig &c)
     obj["width"] = c.width;
     obj["height"] = c.height;
     obj["fps"] = c.fps;
+    obj["explicitOutputResolution"] = c.explicitOutputResolution;
     return obj;
 }
 
@@ -1275,6 +1276,7 @@ ProjectConfig ProjectFile::configFromJson(const QJsonObject &obj)
     c.width = obj["width"].toInt(1920);
     c.height = obj["height"].toInt(1080);
     c.fps = obj["fps"].toInt(30);
+    c.explicitOutputResolution = obj["explicitOutputResolution"].toBool(false);
     return c;
 }
 

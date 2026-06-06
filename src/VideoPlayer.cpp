@@ -686,7 +686,9 @@ void VideoPlayer::loadFile(const QString &filePath)
     qInfo() << "  duration=" << m_durationUs << "frameDur=" << m_frameDurationUs
             << "aspect=" << m_displayAspectRatio;
     if (m_glPreview)
-        m_glPreview->setDisplayAspectRatio(m_displayAspectRatio);
+        m_glPreview->setDisplayAspectRatio(
+            m_projectOutputSize.isValid() ? effectiveDisplayAspectRatio()
+                                          : m_displayAspectRatio);
     if (!m_suppressUiUpdates) {
         m_seekBar->setRange(0, sliderPositionForUs(m_durationUs));
         emit durationChanged(static_cast<double>(m_durationUs) / AV_TIME_BASE);
@@ -1462,7 +1464,9 @@ bool VideoPlayer::tryPromotePoolDecoderTo(int newEntryIdx)
         }
     }
     if (m_glPreview) {
-        m_glPreview->setDisplayAspectRatio(m_displayAspectRatio);
+        m_glPreview->setDisplayAspectRatio(
+            m_projectOutputSize.isValid() ? effectiveDisplayAspectRatio()
+                                          : m_displayAspectRatio);
         // Architect NIT-1: route GLPreview to the device backing the NEW
         // primary (pool D3D11Device*), not sharedD3D11Device()'s default
         // preference for legacy m_hwDeviceCtx. Without this override the
@@ -1508,6 +1512,19 @@ void VideoPlayer::setCanvasSize(int width, int height)
     } else {
         refreshDisplayedFrame();
     }
+}
+
+void VideoPlayer::setProjectOutputSize(const QSize &size)
+{
+    const QSize normalized = size.isValid() ? size : QSize();
+    if (m_projectOutputSize == normalized)
+        return;
+    m_projectOutputSize = normalized;
+    if (m_glPreview)
+        m_glPreview->setDisplayAspectRatio(
+            m_projectOutputSize.isValid() ? effectiveDisplayAspectRatio()
+                                          : m_displayAspectRatio);
+    refreshDisplayedFrame();
 }
 
 void VideoPlayer::play()
@@ -3248,6 +3265,9 @@ double VideoPlayer::streamDisplayAspectRatio() const
 
 double VideoPlayer::effectiveDisplayAspectRatio() const
 {
+    if (m_projectOutputSize.isValid() && m_projectOutputSize.height() > 0)
+        return static_cast<double>(m_projectOutputSize.width()) / m_projectOutputSize.height();
+
     if (m_displayAspectRatio > 0.0 && std::isfinite(m_displayAspectRatio))
         return m_displayAspectRatio;
 
@@ -3284,6 +3304,39 @@ void VideoPlayer::refreshDisplayedFrame()
     // an existing overlay is selected and setTextOverlays re-pushes).
     if (m_lastSourceFrame.isNull())
         return;
+    if (m_projectOutputSize.isValid()
+        && sequenceActive()
+        && !m_lastV1RawFrame.isNull()
+        && m_activeEntry >= 0
+        && m_activeEntry < m_sequence.size()) {
+        const QVector<int> activeIdxs = findActiveEntriesAt(m_timelinePositionUs);
+        const auto &e = m_sequence[m_activeEntry];
+        if (!hasOverlayActive(activeIdxs) && e.sourceTrack == 0) {
+            QImage canvas(m_projectOutputSize, QImage::Format_ARGB32_Premultiplied);
+            if (!canvas.isNull()) {
+                canvas.fill(Qt::black);
+                DecodedLayer layer;
+                layer.rgb = m_lastV1RawFrame;
+                layer.isFresh = true;
+                layer.opacity = e.opacity;
+                layer.colorMeta = e.colorMeta;
+                layer.videoScale = e.videoScale;
+                layer.videoDx = e.videoDx;
+                layer.videoDy = e.videoDy;
+                layer.rotation2DDegrees = e.rotation2DDegrees;
+                layer.sourceTrack = e.sourceTrack;
+                layer.sequenceIdx = m_activeEntry;
+                QVector<DecodedLayer> singleLayer;
+                singleLayer.append(layer);
+                composeMultiTrackFrameInto(canvas, singleLayer);
+                if (m_glPreview)
+                    m_glPreview->setCompositeBakedMode(true);
+                m_lastFrameOdtApplied = false;
+                displayFrame(canvas);
+                return;
+            }
+        }
+    }
     // Phase 1e Win #9 — m_lastSourceFrame may hold a canvas-proxy
     // smaller image cached during multi-track playback (when
     // m_textOverlays was empty at compose time, the canvas was sized
@@ -3520,10 +3573,14 @@ void VideoPlayer::handlePlaybackTick()
     // with V2+ overlays. When yes, presentDecodedFrame caches the V1 frame
     // into m_lastSourceFrame but skips displayFrame so the compositor step
     // below can blend the overlays before pushing the final image.
+    const QVector<int> activeForComposite = findActiveEntriesAt(m_timelinePositionUs);
+    const bool forceProjectOutputComposite =
+        m_projectOutputSize.isValid() && !activeForComposite.isEmpty();
     const bool willComposite = m_playbackSpeed >= 0.0
                                && sequenceActive()
                                && !m_seekInProgress
-                               && hasOverlayActive(findActiveEntriesAt(m_timelinePositionUs));
+                               && (hasOverlayActive(activeForComposite)
+                                   || forceProjectOutputComposite);
     m_deferDisplayThisTick = willComposite;
 
     // When leaving the compositor path, restore the active entry's
@@ -3699,11 +3756,14 @@ void VideoPlayer::handlePlaybackTick()
         if (m_adaptivePreviewEnabled) {
             const int cacheProxy = m_textOverlays.isEmpty()
                 ? (canvasProxyDivisor() * m_adaptiveCanvasDivisor) : 1;
+            const QSize cacheCanvasBase = m_projectOutputSize.isValid()
+                ? m_projectOutputSize
+                : QSize(m_canvasWidth, m_canvasHeight);
             playback::CompositeFrameKey hitKey;
             hitKey.timelineRevision = m_timelineRevision;
             hitKey.timeMs       = m_timelinePositionUs / 1000;
-            hitKey.width        = qMax(2, m_canvasWidth  / cacheProxy);
-            hitKey.height       = qMax(2, m_canvasHeight / cacheProxy);
+            hitKey.width        = qMax(2, cacheCanvasBase.width()  / cacheProxy);
+            hitKey.height       = qMax(2, cacheCanvasBase.height() / cacheProxy);
             hitKey.qualityTier  = m_adaptiveQualityTier;
             hitKey.useProxy     = (m_proxyDivisor > 1) || (playbackProxyDivisor() > 1);
             QImage cached;
@@ -3959,7 +4019,7 @@ void VideoPlayer::handlePlaybackTick()
         // sub-assertion in main.cpp exercises the SAME comparator — a
         // re-inversion breaks the selftest.
         std::stable_sort(layers.begin(), layers.end(), clipstack::layerPaintOrderLess);
-        if (overlayPresent) {
+        if (overlayPresent || m_projectOutputSize.isValid()) {
             // Reuse a canvas-sized scratch buffer so we don't allocate
             // ~8MB (1080p ARGB) every tick. Re-allocates only when the
             // canvas size or format changes; otherwise we just refill it
@@ -3978,8 +4038,11 @@ void VideoPlayer::handlePlaybackTick()
             const int canvasProxy = m_textOverlays.isEmpty()
                                     ? (canvasProxyDivisor() * m_adaptiveCanvasDivisor)
                                     : 1;
-            const int canvasW = qMax(2, m_canvasWidth  / canvasProxy);
-            const int canvasH = qMax(2, m_canvasHeight / canvasProxy);
+            const QSize outputCanvasBase = m_projectOutputSize.isValid()
+                ? m_projectOutputSize
+                : QSize(m_canvasWidth, m_canvasHeight);
+            const int canvasW = qMax(2, outputCanvasBase.width()  / canvasProxy);
+            const int canvasH = qMax(2, outputCanvasBase.height() / canvasProxy);
             if (m_canvasBase.size() != QSize(canvasW, canvasH)
                 || m_canvasBase.format() != QImage::Format_ARGB32_Premultiplied) {
                 m_canvasBase = QImage(canvasW, canvasH,

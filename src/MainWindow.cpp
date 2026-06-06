@@ -43,6 +43,7 @@ void exporter_setAcesPipeline(const aces::AcesPipeline &pipeline);
 #include "playback/dvxml_flag.h"
 #include "BroadcastCaptionDialog.h"  // CC-4: 放送CC (CEA-608/708) ダイアログ
 #include "ProjectCollectorDialog.h"
+#include "SequenceSettingsDialog.h"
 #include "HDRSettingsDialog.h"
 #include "AIProcessingDialog.h"
 #include "PluginBrowserDialog.h"
@@ -1409,7 +1410,7 @@ void MainWindow::setupMenuBar()
     auto *projectSettingsAction = fileMenu->addAction("プロジェクト設定(&T)...");
     connect(projectSettingsAction, &QAction::triggered, this, &MainWindow::editProjectSettings);
     m_menuHelpEntries.append({projectSettingsAction,
-        QStringLiteral("動画の縦横サイズ・フレームレート（なめらかさ）・名前を決めます。YouTube や TikTok 向けのひな型も選べます。")});
+        QStringLiteral("プロジェクトの出力解像度を 16:9 / 9:16 / 1:1 / カスタムから選びます。")});
 
     auto *openAction = fileMenu->addAction("ファイルを開く(&O)...");
     openAction->setShortcut(QKeySequence::Open);
@@ -3974,7 +3975,12 @@ void MainWindow::updateTitle()
 void MainWindow::applyProjectConfig(const ProjectConfig &config)
 {
     m_projectConfig = config;
-    m_player->setCanvasSize(config.width, config.height);
+    if (m_player) {
+        m_player->setCanvasSize(config.width, config.height);
+        m_player->setProjectOutputSize(config.explicitOutputResolution
+            ? QSize(config.width, config.height)
+            : QSize());
+    }
     updateTitle();
     statusBar()->showMessage(QString("Project: %1 — %2 %3fps")
         .arg(config.name).arg(config.resolutionLabel()).arg(config.fps));
@@ -4582,8 +4588,12 @@ void MainWindow::applyLoadedProjectData(const ProjectData &data, const QString &
     m_selectedVideoTrackIndex = -1;
     m_selectedVideoClipIndexTracked = -1;
 
-    if (m_player)
+    if (m_player) {
         m_player->setCanvasSize(data.config.width, data.config.height);
+        m_player->setProjectOutputSize(data.config.explicitOutputResolution
+            ? QSize(data.config.width, data.config.height)
+            : QSize());
+    }
     if (m_timeline)
         m_timeline->restoreFromProject(data.videoTracks, data.audioTracks,
                                        data.playheadPos, data.markIn, data.markOut, data.zoomLevel);
@@ -4787,7 +4797,7 @@ void MainWindow::newProject()
 
 void MainWindow::editProjectSettings()
 {
-    ProjectSettingsDialog dialog(this, &m_projectConfig);
+    SequenceSettingsDialog dialog(m_projectConfig, this);
     if (dialog.exec() == QDialog::Accepted) {
         applyProjectConfig(dialog.config());
         updateStatusInfo();
@@ -5206,6 +5216,10 @@ void MainWindow::exportVideo()
     job.outputPath = exportCfg.outputPath;
     job.width   = exportCfg.width  > 0 ? exportCfg.width  : 1920;
     job.height  = exportCfg.height > 0 ? exportCfg.height : 1080;
+    if (m_projectConfig.explicitOutputResolution) {
+        job.width = m_projectConfig.width;
+        job.height = m_projectConfig.height;
+    }
     job.bitrateBps = static_cast<qint64>(exportCfg.videoBitrate) * 1000;
     job.startUs = 0;
     job.endUs   = 0;   // 0 = whole timeline

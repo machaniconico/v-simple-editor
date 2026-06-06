@@ -100,6 +100,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/Timeline.cpp
     src/SnapEngine.cpp
     src/ProjectSettings.cpp
+    src/SequenceSettingsDialog.h
+    src/SequenceSettingsDialog.cpp
     src/ExportDialog.cpp
     src/Exporter.cpp
     src/FrameDiff.cpp

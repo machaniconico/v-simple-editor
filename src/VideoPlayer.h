@@ -111,6 +111,8 @@ public:
     void setMuted(bool muted);
     bool isMuted() const { return m_muted; }
     void setCanvasSize(int width, int height);
+    void setProjectOutputSize(const QSize &size);
+    QSize projectOutputSize() const { return m_projectOutputSize; }
     void setColorCorrection(const ColorCorrection &cc);
     // AR-2: ACES シーンリファード色管理。MainWindow の SSOT (m_acesPipeline) を
     // プレビューへ反映する。enabled=true のときのみ displayFrame の最終合成結果へ
@@ -562,6 +564,7 @@ private:
     bool m_retainLastFrameAcrossLoad = false;
     int m_canvasWidth = 1920;
     int m_canvasHeight = 1080;
+    QSize m_projectOutputSize;
     double m_playbackSpeed = 1.0;
     QImage m_currentFrameImage;
     int m_pendingSeekMs = -1;
