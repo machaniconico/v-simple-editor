@@ -235,8 +235,11 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/playback/CompositeFrameCache.cpp
     src/playback/PlaybackQualityPolicy.h
     src/playback/PlaybackQualityPolicy.cpp
+    src/playback/SnsFit.h
+    src/playback/SnsFit.cpp
     src/selftests/composite_frame_cache_selftests.cpp
     src/selftests/playback_quality_policy_selftests.cpp
+    src/selftests/sns_fit_selftest.cpp
     src/playback/AutoProxyPolicy.h
     src/playback/AutoProxyPolicy.cpp
     src/selftests/auto_proxy_policy_selftests.cpp
