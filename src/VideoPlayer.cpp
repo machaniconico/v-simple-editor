@@ -61,31 +61,49 @@ extern "C" void *veditor_avHwDeviceCtxToD3D11Device(AVBufferRef *ref);
 #include <QRadialGradient>
 #include <QPen>
 #include <QFontMetrics>
+#include <atomic>
 #include <cmath>
 #include <limits>
 
 namespace {
 
-// Phase 1e — VEDITOR_PLAYBACK_PROXY divisor for the playback decode path.
+// Phase 1e — playback preview divisor for the playback decode path.
 // Default 2 (half-res preview) so playback at 1440p / 4K sources hits the
 // frame budget on systems where HW transfer + sws_scale is the bottleneck.
-// VEDITOR_PLAYBACK_PROXY=1 forces full resolution; =4/=8 push further.
+// QSettings controls it at runtime; VEDITOR_PLAYBACK_PROXY is used only as
+// the first-run seed when no saved preference exists.
 // Pause and export stay at full resolution because they bypass these
 // decode wrappers — the user only sees aliasing during active playback.
+std::atomic<int> g_playbackProxyPref{-1};
+
+inline int normalizePlaybackProxyDivisor(int v)
+{
+    if (v != 1 && v != 2 && v != 4 && v != 8)
+        return 2;
+    return v;
+}
+
 inline int playbackProxyDivisor()
 {
-    static const int kDivisor = []() {
-        const QByteArray raw = qgetenv("VEDITOR_PLAYBACK_PROXY");
-        if (raw.isEmpty())
-            return 2; // default half-res preview during playback
-        bool ok = false;
-        int v = raw.toInt(&ok);
-        if (!ok || v < 1) v = 1;
-        if (v > 8) v = 8;
-        if (v != 1 && v != 2 && v != 4 && v != 8) v = 1;
+    int v = g_playbackProxyPref.load(std::memory_order_relaxed);
+    if (v != -1)
         return v;
-    }();
-    return kDivisor;
+
+    QSettings prefs("VSimpleEditor", "Preferences");
+    if (prefs.contains("playbackProxyDivisor")) {
+        v = prefs.value("playbackProxyDivisor", 2).toInt();
+    } else {
+        const QByteArray raw = qgetenv("VEDITOR_PLAYBACK_PROXY");
+        bool ok = false;
+        const int envDivisor = raw.toInt(&ok);
+        v = ok ? envDivisor : 2;
+    }
+
+    v = normalizePlaybackProxyDivisor(v);
+    int expected = -1;
+    if (g_playbackProxyPref.compare_exchange_strong(expected, v, std::memory_order_relaxed))
+        return v;
+    return expected;
 }
 
 // Phase 1e Win #9 — canvas proxy divisor for the multi-track compose path.
@@ -272,6 +290,13 @@ QString formatTimestamp(int64_t positionUs)
         .arg(seconds, 2, 10, QChar('0'));
 }
 
+}
+
+void setPlaybackProxyDivisorPreference(int div)
+{
+    div = normalizePlaybackProxyDivisor(div);
+    g_playbackProxyPref.store(div, std::memory_order_relaxed);
+    QSettings("VSimpleEditor", "Preferences").setValue("playbackProxyDivisor", div);
 }
 
 VideoPlayer::VideoPlayer(QWidget *parent)
@@ -514,6 +539,13 @@ void VideoPlayer::setProxyDivisor(int divisor)
         m_proxyButton->setText(text);
     }
     QSettings("VSimpleEditor", "Preferences").setValue("proxyDivisor", m_proxyDivisor);
+    refreshDisplayedFrame();
+}
+
+void VideoPlayer::applyPlaybackQualityChanged()
+{
+    ++m_timelineRevision;
+    m_frameCache.invalidateRevision(m_timelineRevision);
     refreshDisplayedFrame();
 }
 
@@ -3334,7 +3366,7 @@ void VideoPlayer::updateAdaptiveQuality()
     metrics.targetFrameMs =
         qMax(1.0, (static_cast<double>(baseFrameUs) / 1000.0) / absSpeed);
     metrics.isPlaying = m_playing;
-    // プロキシ候補判定: 再生用プレビュープロキシ divisor (env VEDITOR_PLAYBACK_PROXY
+    // プロキシ候補判定: 再生用プレビュープロキシ divisor (環境設定
     // / シークバー左のプロキシボタン m_proxyDivisor) のいずれかが等倍 (1) 以外なら
     // 「プロキシ的な縮小が利用可能」と見なす。ProxyManager のグローバルトグル状態は
     // ここでは参照せず、VideoPlayer 内で確定している縮小設定だけで判定する

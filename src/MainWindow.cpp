@@ -2525,6 +2525,18 @@ void MainWindow::setupMenuBar()
     m_menuHelpEntries.append({proxyToggle,
         QStringLiteral("編集中に軽い代理映像を使うか、元の高画質映像を使うかを切り替えます。書き出しは常に高画質です。")});
 
+    auto *fullResPlaybackAction = toolsMenu->addAction("再生プレビューをフル解像度");
+    fullResPlaybackAction->setCheckable(true);
+    fullResPlaybackAction->setChecked(
+        QSettings("VSimpleEditor", "Preferences").value("playbackProxyDivisor", 2).toInt() == 1);
+    connect(fullResPlaybackAction, &QAction::toggled, this, [this](bool checked) {
+        setPlaybackProxyDivisorPreference(checked ? 1 : 2);
+        if (m_player)
+            m_player->applyPlaybackQualityChanged();
+    });
+    m_menuHelpEntries.append({fullResPlaybackAction,
+        QStringLiteral("再生中のプレビューを元の高画質で表示します。オフ（既定）は動作を軽くするため半分の解像度で表示します。書き出しには影響しません。")});
+
     auto *genProxiesAction = toolsMenu->addAction("プロキシ生成...");
     connect(genProxiesAction, &QAction::triggered, this, &MainWindow::generateProxies);
     m_menuHelpEntries.append({genProxiesAction,

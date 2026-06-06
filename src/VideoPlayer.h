@@ -77,6 +77,8 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 
+void setPlaybackProxyDivisorPreference(int div);
+
 class VideoPlayer : public QWidget
 {
     Q_OBJECT
@@ -160,6 +162,7 @@ public:
     // internals directly.
     int proxyDivisor() const { return m_proxyDivisor; }
     void setProxyDivisor(int divisor);
+    void applyPlaybackQualityChanged();
     GLPreview *glPreview() const { return m_glPreview; }
     // Phase 1e — returns the ID3D11Device* the FFmpeg HW context owns so
     // GLPreview can hand it to wglDXOpenDeviceNV. nullptr when no D3D11VA
