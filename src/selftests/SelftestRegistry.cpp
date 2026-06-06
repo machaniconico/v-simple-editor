@@ -92,6 +92,7 @@ int runSmartEditSelftest();
 int runSocialSelftest();
 int runSpectralEditSelftest();
 int runSubXlatSelftest();
+int runSwsColorSelftest();
 int runTextBasedEditSelftest();
 int runTextExportSelftest();
 int runThreePointEditSelftest();
@@ -202,6 +203,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Audio atempo enable resolver truth table: env force OR per-clip flag" },
     { "spectral-edit",     "VEDITOR_SPECTRAL_EDIT_SELFTEST",      runSpectralEditSelftest,       false,
       "SpectralEngine: FFT/STFT/iSTFT round-trip + region attenuation" },
+    { "sws-color",         "VEDITOR_SWS_COLOR_SELFTEST",          runSwsColorSelftest,           false,
+      "swscale color matrix helper: colorspace/range/tag resolution + coefficient proof (8 gates)" },
     { "aces-color",        "VEDITOR_ACES_COLOR_SELFTEST",         runAcesColorSelftest,          false,
       "AcesColor: primaries matrices, Bradford, IDT/RRT/ODT round-trip" },
     { "dolby-vision",      "VEDITOR_DOLBY_VISION_SELFTEST",       runDolbyVisionSelftest,        false,

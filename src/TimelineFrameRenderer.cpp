@@ -17,9 +17,11 @@
 #include "playback/clipidt_flag.h"
 #include "playback/hdrmatte16_flag.h"
 #include "playback/hdrexport16_flag.h"
+#include "playback/swsmatrix_flag.h"
 #include "color/ClipColor.h"    // HDR Stage1 — per-clip color metadata plumbing
 #include "color/ClipColorTransform.h"
 #include "color/ClipOdt.h"
+#include "color/SwsColorParams.h"
                                 // TM-8 — track-matte wiring is now read from
                                 // Timeline::trackMatteEntries() (no MainWindow
                                 // include, no #define private public, no
@@ -126,6 +128,37 @@ QImage decodeClipFrameNative(const QString &filePath, double sourceSec)
                                 SWS_BILINEAR, nullptr, nullptr, nullptr);
         if (!swsCtx)
             return;
+        if (swscolor::matrixEnabledFromEnv()) {
+            const AVColorSpace cs = swscolor::resolveColorspace(
+                src->colorspace != AVCOL_SPC_UNSPECIFIED
+                    ? src->colorspace
+                    : decCtx->colorspace,
+                decCtx->width, decCtx->height);
+            const AVColorRange rng = swscolor::resolveRange(
+                src->color_range != AVCOL_RANGE_UNSPECIFIED
+                    ? src->color_range
+                    : decCtx->color_range);
+            int *currentInvTable = nullptr;
+            int *currentTable = nullptr;
+            int currentSrcRange = 0;
+            int currentDstRange = 0;
+            int brightness = 0;
+            int contrast = 0;
+            int saturation = 0;
+            if (sws_getColorspaceDetails(swsCtx, &currentInvTable,
+                                          &currentSrcRange, &currentTable,
+                                          &currentDstRange, &brightness,
+                                          &contrast, &saturation) >= 0) {
+                const int *srcCoeffs =
+                    sws_getCoefficients(swscolor::swsCoeffsId(cs));
+                const int *dstCoeffs = sws_getCoefficients(SWS_CS_DEFAULT);
+                if (srcCoeffs && dstCoeffs) {
+                    (void)sws_setColorspaceDetails(
+                        swsCtx, srcCoeffs, rng == AVCOL_RANGE_JPEG ? 1 : 0,
+                        dstCoeffs, 1, brightness, contrast, saturation);
+                }
+            }
+        }
         uint8_t *dst[1] = { rgba.bits() };
         int dstStride[1] = { static_cast<int>(rgba.bytesPerLine()) };
         sws_scale(swsCtx, src->data, src->linesize, 0, decCtx->height,

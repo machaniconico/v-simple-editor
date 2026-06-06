@@ -219,12 +219,15 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/color/ClipColorTransform.cpp
     src/color/ClipOdt.h
     src/color/ClipOdt.cpp
+    src/color/SwsColorParams.h
+    src/color/SwsColorParams.cpp
     src/AscCdlExportDialog.h
     src/AscCdlExportDialog.cpp
     src/selftests/asc_cdl_export_selftest.cpp
     src/selftests/clip_color_selftest.cpp
     src/selftests/clip_idt_selftest.cpp
     src/selftests/clip_odt_selftest.cpp
+    src/selftests/sws_color_selftest.cpp
     # Playback quality/cache (マルチトラック再生強化): CompositeFrameCache + PlaybackQualityPolicy。
     src/playback/CompositeFrameCache.h
     src/playback/CompositeFrameCache.cpp
@@ -265,6 +268,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/preview16_policy_selftest.cpp
     # Stage7: 16-bit RGBA64 track-matte compositor + parity selftest
     src/playback/hdrmatte16_flag.h
+    src/playback/swsmatrix_flag.h
     src/playback/TrackMatteCompose16.h
     src/playback/TrackMatteCompose16.cpp
     src/selftests/matte16_parity_selftests.cpp

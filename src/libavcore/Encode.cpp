@@ -1,5 +1,8 @@
 #include "Encode.h"
 
+#include "color/SwsColorParams.h"
+#include "playback/swsmatrix_flag.h"
+
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
@@ -463,6 +466,13 @@ bool FrameEncoder::configureEncoderContext(const EncodeRequest& req,
         m_encCtx->color_trc = AVCOL_TRC_ARIB_STD_B67;
         m_encCtx->colorspace = AVCOL_SPC_BT2020_NCL;
         m_encCtx->color_range = AVCOL_RANGE_MPEG;
+    } else if (swscolor::matrixEnabledFromEnv()) {
+        const swscolor::SdrTags t =
+            swscolor::sdrTagsFor(m_encCtx->width, m_encCtx->height);
+        m_encCtx->color_primaries = t.pri;
+        m_encCtx->color_trc = t.trc;
+        m_encCtx->colorspace = t.spc;
+        m_encCtx->color_range = t.range;
     }
 
     // HEVC 10-bit output requires the Main10 profile. libx265 receives this
@@ -1327,6 +1337,33 @@ bool FrameEncoder::pushFrameRgb24(const uint8_t* src, int stride, int64_t pts)
             m_encCtx->width, m_encCtx->height, m_pixFmt,
             SWS_BILINEAR, nullptr, nullptr, nullptr);
         if (!m_rgbToYuvCtx) return false;
+        if (swscolor::matrixEnabledFromEnv()) {
+            const AVColorSpace dstCs = swscolor::resolveColorspace(
+                m_encCtx->colorspace, m_encCtx->width, m_encCtx->height);
+            const AVColorRange dstRange =
+                swscolor::resolveRange(m_encCtx->color_range);
+            int *currentInvTable = nullptr;
+            int *currentTable = nullptr;
+            int currentSrcRange = 0;
+            int currentDstRange = 0;
+            int brightness = 0;
+            int contrast = 0;
+            int saturation = 0;
+            if (sws_getColorspaceDetails(m_rgbToYuvCtx, &currentInvTable,
+                                          &currentSrcRange, &currentTable,
+                                          &currentDstRange, &brightness,
+                                          &contrast, &saturation) >= 0) {
+                const int *srcCoeffs = sws_getCoefficients(SWS_CS_DEFAULT);
+                const int *dstCoeffs =
+                    sws_getCoefficients(swscolor::swsCoeffsId(dstCs));
+                if (srcCoeffs && dstCoeffs) {
+                    (void)sws_setColorspaceDetails(
+                        m_rgbToYuvCtx, srcCoeffs, 1, dstCoeffs,
+                        dstRange == AVCOL_RANGE_JPEG ? 1 : 0,
+                        brightness, contrast, saturation);
+                }
+            }
+        }
     }
 
     // [P1-M2] av_frame_make_writable allocates a fresh buffer if the previous

@@ -6,6 +6,8 @@
 #include "SubtitleTrackRenderer.h"
 #include "AcesColor.h"  // AR-2: ACES シーンリファード色管理パイプライン
 #include "libavcore/Encode.h"
+#include "color/SwsColorParams.h"
+#include "playback/swsmatrix_flag.h"
 #include <QFileInfo>
 #include <QMutex>
 #include <QMutexLocker>
@@ -283,6 +285,59 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
                     frame->width, frame->height, decCtx->pix_fmt,
                     config.width, config.height, targetPixFmt,
                     SWS_BILINEAR, nullptr, nullptr, nullptr);
+                if (swscolor::matrixEnabledFromEnv() && swsCtx) {
+                    // Direct YUV->YUV path (consumed only when needsRgbPass is
+                    // false): transcode the SOURCE matrix to the OUTPUT matrix so
+                    // the pixels match the stream colour tag the encoder applies
+                    // (sdrTagsFor / HDR). Same-matrix cases are an identity. The
+                    // RGB-roundtrip branches below configure their own contexts;
+                    // this set is harmless (unused) on those frames.
+                    const AVColorSpace srcCs = swscolor::resolveColorspace(
+                        frame->colorspace != AVCOL_SPC_UNSPECIFIED
+                            ? frame->colorspace
+                            : decCtx->colorspace,
+                        decCtx->width, decCtx->height);
+                    const AVColorRange srcRng = swscolor::resolveRange(
+                        frame->color_range != AVCOL_RANGE_UNSPECIFIED
+                            ? frame->color_range
+                            : decCtx->color_range);
+                    AVColorSpace dstCs = AVCOL_SPC_UNSPECIFIED;
+                    AVColorRange dstRng = AVCOL_RANGE_UNSPECIFIED;
+                    if (isHdr10Mode || isHlgMode) {
+                        dstCs = swscolor::resolveColorspace(
+                            outFrame->colorspace, config.width, config.height);
+                        dstRng = swscolor::resolveRange(outFrame->color_range);
+                    } else {
+                        const swscolor::SdrTags t =
+                            swscolor::sdrTagsFor(config.width, config.height);
+                        dstCs = t.spc;
+                        dstRng = t.range;
+                    }
+                    int *currentInvTable = nullptr;
+                    int *currentTable = nullptr;
+                    int currentSrcRange = 0;
+                    int currentDstRange = 0;
+                    int brightness = 0;
+                    int contrast = 0;
+                    int saturation = 0;
+                    if (sws_getColorspaceDetails(swsCtx, &currentInvTable,
+                                                  &currentSrcRange, &currentTable,
+                                                  &currentDstRange, &brightness,
+                                                  &contrast, &saturation) >= 0) {
+                        const int *srcCoeffs =
+                            sws_getCoefficients(swscolor::swsCoeffsId(srcCs));
+                        const int *dstCoeffs =
+                            sws_getCoefficients(swscolor::swsCoeffsId(dstCs));
+                        if (srcCoeffs && dstCoeffs) {
+                            (void)sws_setColorspaceDetails(
+                                swsCtx, srcCoeffs,
+                                srcRng == AVCOL_RANGE_JPEG ? 1 : 0,
+                                dstCoeffs,
+                                dstRng == AVCOL_RANGE_JPEG ? 1 : 0,
+                                brightness, contrast, saturation);
+                        }
+                    }
+                }
 
                 av_frame_make_writable(outFrame);
 
@@ -306,6 +361,39 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
                             frame->width, frame->height, decCtx->pix_fmt,
                             config.width, config.height, AV_PIX_FMT_RGB24,
                             SWS_BILINEAR, nullptr, nullptr, nullptr);
+                        if (swscolor::matrixEnabledFromEnv() && toRgbCtx) {
+                            const AVColorSpace cs = swscolor::resolveColorspace(
+                                frame->colorspace != AVCOL_SPC_UNSPECIFIED
+                                    ? frame->colorspace
+                                    : decCtx->colorspace,
+                                decCtx->width, decCtx->height);
+                            const AVColorRange rng = swscolor::resolveRange(
+                                frame->color_range != AVCOL_RANGE_UNSPECIFIED
+                                    ? frame->color_range
+                                    : decCtx->color_range);
+                            int *currentInvTable = nullptr;
+                            int *currentTable = nullptr;
+                            int currentSrcRange = 0;
+                            int currentDstRange = 0;
+                            int brightness = 0;
+                            int contrast = 0;
+                            int saturation = 0;
+                            if (sws_getColorspaceDetails(toRgbCtx, &currentInvTable,
+                                                          &currentSrcRange, &currentTable,
+                                                          &currentDstRange, &brightness,
+                                                          &contrast, &saturation) >= 0) {
+                                const int *srcCoeffs =
+                                    sws_getCoefficients(swscolor::swsCoeffsId(cs));
+                                const int *dstCoeffs = sws_getCoefficients(SWS_CS_DEFAULT);
+                                if (srcCoeffs && dstCoeffs) {
+                                    (void)sws_setColorspaceDetails(
+                                        toRgbCtx, srcCoeffs,
+                                        rng == AVCOL_RANGE_JPEG ? 1 : 0,
+                                        dstCoeffs, 1, brightness, contrast,
+                                        saturation);
+                                }
+                            }
+                        }
                         uint8_t *rgbDest[1] = { workingImage.bits() };
                         int rgbLinesize[1] = { static_cast<int>(workingImage.bytesPerLine()) };
                         sws_scale(toRgbCtx, frame->data, frame->linesize, 0, frame->height,
@@ -323,6 +411,39 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
                             frame->width, frame->height, decCtx->pix_fmt,
                             config.width, config.height, AV_PIX_FMT_RGB24,
                             SWS_BILINEAR, nullptr, nullptr, nullptr);
+                        if (swscolor::matrixEnabledFromEnv() && toRgbCtx) {
+                            const AVColorSpace cs = swscolor::resolveColorspace(
+                                frame->colorspace != AVCOL_SPC_UNSPECIFIED
+                                    ? frame->colorspace
+                                    : decCtx->colorspace,
+                                decCtx->width, decCtx->height);
+                            const AVColorRange rng = swscolor::resolveRange(
+                                frame->color_range != AVCOL_RANGE_UNSPECIFIED
+                                    ? frame->color_range
+                                    : decCtx->color_range);
+                            int *currentInvTable = nullptr;
+                            int *currentTable = nullptr;
+                            int currentSrcRange = 0;
+                            int currentDstRange = 0;
+                            int brightness = 0;
+                            int contrast = 0;
+                            int saturation = 0;
+                            if (sws_getColorspaceDetails(toRgbCtx, &currentInvTable,
+                                                          &currentSrcRange, &currentTable,
+                                                          &currentDstRange, &brightness,
+                                                          &contrast, &saturation) >= 0) {
+                                const int *srcCoeffs =
+                                    sws_getCoefficients(swscolor::swsCoeffsId(cs));
+                                const int *dstCoeffs = sws_getCoefficients(SWS_CS_DEFAULT);
+                                if (srcCoeffs && dstCoeffs) {
+                                    (void)sws_setColorspaceDetails(
+                                        toRgbCtx, srcCoeffs,
+                                        rng == AVCOL_RANGE_JPEG ? 1 : 0,
+                                        dstCoeffs, 1, brightness, contrast,
+                                        saturation);
+                                }
+                            }
+                        }
                         uint8_t *rgbDest[1] = { workingImage.bits() };
                         int rgbLinesize[1] = { static_cast<int>(workingImage.bytesPerLine()) };
                         sws_scale(toRgbCtx, frame->data, frame->linesize, 0, frame->height,
@@ -362,6 +483,41 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
                         workingImage.width(), workingImage.height(), AV_PIX_FMT_RGB24,
                         config.width, config.height, AV_PIX_FMT_YUV420P,
                         SWS_BILINEAR, nullptr, nullptr, nullptr);
+                    if (swscolor::matrixEnabledFromEnv() && toYuvCtx) {
+                        AVColorSpace dstCs = AVCOL_SPC_UNSPECIFIED;
+                        AVColorRange dstRange = AVCOL_RANGE_UNSPECIFIED;
+                        if (isHdr10Mode || isHlgMode) {
+                            dstCs = swscolor::resolveColorspace(
+                                outFrame->colorspace, config.width, config.height);
+                            dstRange = swscolor::resolveRange(outFrame->color_range);
+                        } else {
+                            const swscolor::SdrTags t =
+                                swscolor::sdrTagsFor(config.width, config.height);
+                            dstCs = t.spc;
+                            dstRange = t.range;
+                        }
+                        int *currentInvTable = nullptr;
+                        int *currentTable = nullptr;
+                        int currentSrcRange = 0;
+                        int currentDstRange = 0;
+                        int brightness = 0;
+                        int contrast = 0;
+                        int saturation = 0;
+                        if (sws_getColorspaceDetails(toYuvCtx, &currentInvTable,
+                                                      &currentSrcRange, &currentTable,
+                                                      &currentDstRange, &brightness,
+                                                      &contrast, &saturation) >= 0) {
+                            const int *srcCoeffs = sws_getCoefficients(SWS_CS_DEFAULT);
+                            const int *dstCoeffs =
+                                sws_getCoefficients(swscolor::swsCoeffsId(dstCs));
+                            if (srcCoeffs && dstCoeffs) {
+                                (void)sws_setColorspaceDetails(
+                                    toYuvCtx, srcCoeffs, 1, dstCoeffs,
+                                    dstRange == AVCOL_RANGE_JPEG ? 1 : 0,
+                                    brightness, contrast, saturation);
+                            }
+                        }
+                    }
                     const uint8_t *rgbSrc[1] = { workingImage.constBits() };
                     int rgbSrcLinesize[1] = { static_cast<int>(workingImage.bytesPerLine()) };
                     sws_scale(toYuvCtx, rgbSrc, rgbSrcLinesize, 0, workingImage.height(),
