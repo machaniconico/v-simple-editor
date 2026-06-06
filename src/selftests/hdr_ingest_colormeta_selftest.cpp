@@ -33,6 +33,7 @@ bool isMeta(const clipcolor::ColorMeta& meta,
 int runHdrIngestColorMetaSelftest()
 {
     qInfo().noquote() << "[hdr-ingest-colormeta] selftest start";
+    constexpr int kExpectedGates = 14;
     int passed = 0, failed = 0;
     auto pass = [&](const char* name) {
         ++passed;
@@ -127,7 +128,33 @@ int runHdrIngestColorMetaSelftest()
           && pixfmtdepth::bitDepthFromPixFmt(AV_PIX_FMT_YUV420P) == 8
           && pixfmtdepth::bitDepthFromPixFmt(AV_PIX_FMT_NONE) == 8);
 
-    qInfo().noquote() << "[hdr-ingest-colormeta] selftest done: passed=" << passed
-                      << "failed=" << failed;
+    check("G11 unspecified transfer + HDR metadata -> Rec2020/PQ/10/HDR",
+          isMeta(clipcolor::fromCodecParams(kAvcolPriBt2020, kAvcolTrcUnspecified,
+                                            10, /*hasHdrMetadata=*/true),
+                 clipcolor::Primaries::Rec2020, clipcolor::Transfer::PQ, 10, true));
+
+    check("G12 BT2020+unspecified+10bit without metadata stays SDR",
+          isMeta(clipcolor::fromCodecParams(kAvcolPriBt2020, kAvcolTrcUnspecified,
+                                            10, /*hasHdrMetadata=*/false),
+                 clipcolor::Primaries::Rec2020, clipcolor::Transfer::sRGB, 10, false));
+
+    check("G13 explicit SDR transfer wins over HDR metadata",
+          isMeta(clipcolor::fromCodecParams(kAvcolPriBt709, kAvcolTrcBt709,
+                                            8, /*hasHdrMetadata=*/true),
+                 clipcolor::Primaries::Rec709, clipcolor::Transfer::sRGB, 8, false));
+
+    check("G14 default metadata arg keeps PQ back-compat HDR",
+          isMeta(clipcolor::fromCodecParams(kAvcolPriBt2020, kAvcolTrcSmpte2084, 10),
+                 clipcolor::Primaries::Rec2020, clipcolor::Transfer::PQ, 10, true));
+
+    const int total = passed + failed;
+    qInfo().noquote().nospace() << "[hdr-ingest-colormeta] selftest done: "
+                                << passed << "/" << kExpectedGates
+                                << " passed failed=" << failed;
+    if (total != kExpectedGates) {
+        qWarning().noquote() << "[hdr-ingest-colormeta] FAIL gate count:"
+                             << total << "expected" << kExpectedGates;
+        return 1;
+    }
     return failed == 0 ? 0 : 1;
 }

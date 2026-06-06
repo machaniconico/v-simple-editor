@@ -24,7 +24,8 @@ struct ColorMeta {
 };
 
 ColorMeta defaultSdr();
-ColorMeta fromCodecParams(int avColorPrimaries, int avColorTrc, int bitDepth);
+ColorMeta fromCodecParams(int avColorPrimaries, int avColorTrc, int bitDepth,
+                          bool hasHdrMetadata = false);
 
 QString   primariesToken(Primaries p);
 Primaries primariesFromToken(const QString& token,

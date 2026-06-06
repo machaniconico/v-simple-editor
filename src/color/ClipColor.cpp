@@ -40,7 +40,8 @@ ColorMeta defaultSdr()
     return {};
 }
 
-ColorMeta fromCodecParams(int avColorPrimaries, int avColorTrc, int bitDepth)
+ColorMeta fromCodecParams(int avColorPrimaries, int avColorTrc, int bitDepth,
+                          bool hasHdrMetadata)
 {
     constexpr int kAvcolPriBt709 = 1;       // AVCOL_PRI_BT709 = 1
     constexpr int kAvcolPriUnspecified = 2; // AVCOL_PRI_UNSPECIFIED = 2
@@ -74,23 +75,25 @@ ColorMeta fromCodecParams(int avColorPrimaries, int avColorTrc, int bitDepth)
     switch (avColorTrc) {
         case kAvcolTrcSmpte2084:
             meta.transfer = Transfer::PQ;
+            meta.isHdr = true;
             break;
         case kAvcolTrcAribStdB67:
             meta.transfer = Transfer::HLG;
+            meta.isHdr = true;
             break;
         case kAvcolTrcBt709:
         case kAvcolTrcIec61966_2_1:
             meta.transfer = Transfer::sRGB;
+            meta.isHdr = false;
             break;
         case kAvcolTrcUnspecified:
         default:
-            meta.transfer = Transfer::sRGB;
+            meta.transfer = hasHdrMetadata ? Transfer::PQ : Transfer::sRGB;
+            meta.isHdr = hasHdrMetadata;
             break;
     }
 
     meta.bitDepth = bitDepth < 8 ? 8 : bitDepth;
-    meta.isHdr = (avColorTrc == kAvcolTrcSmpte2084
-                  || avColorTrc == kAvcolTrcAribStdB67);
     return meta;
 }
 

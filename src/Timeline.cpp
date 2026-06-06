@@ -71,6 +71,7 @@ inline double envelopeYToGain(double y, int rowHeight) {
 
 extern "C" {
 #include <libavcodec/avcodec.h>
+#include <libavcodec/packet.h>
 #include <libavformat/avformat.h>
 }
 
@@ -2936,6 +2937,7 @@ void Timeline::addClip(const QString &filePath)
     int capturedPrimaries = 0;
     int capturedTrc = 0;
     int capturedBitDepth = 8;
+    bool capturedHasHdrMeta = false;
     if (avformat_open_input(&fmt, filePath.toUtf8().constData(), nullptr, nullptr) == 0) {
         if (avformat_find_stream_info(fmt, nullptr) >= 0 && fmt->duration > 0)
             duration = static_cast<double>(fmt->duration) / AV_TIME_BASE;
@@ -2950,6 +2952,15 @@ void Timeline::addClip(const QString &filePath)
             capturedPrimaries = st->codecpar->color_primaries;
             capturedTrc = st->codecpar->color_trc;
             capturedBitDepth = pixfmtdepth::bitDepthFromPixFmt(st->codecpar->format);
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(60, 0, 0)
+            capturedHasHdrMeta =
+                av_packet_side_data_get(st->codecpar->coded_side_data,
+                                        st->codecpar->nb_coded_side_data,
+                                        AV_PKT_DATA_MASTERING_DISPLAY_METADATA) != nullptr
+                || av_packet_side_data_get(st->codecpar->coded_side_data,
+                                           st->codecpar->nb_coded_side_data,
+                                           AV_PKT_DATA_CONTENT_LIGHT_LEVEL) != nullptr;
+#endif
             const bool isAv1  = st->codecpar->codec_id == AV_CODEC_ID_AV1;
             const bool isQhdPlus = (w >= 2560) || (h >= 1440);
             // h.264 1080p+ も対象 (cinemascope や ultra-wide 含めるため OR)。
@@ -2984,7 +2995,8 @@ void Timeline::addClip(const QString &filePath)
     clipcolor::ColorMeta derivedColorMeta = clip.colorMeta;
     if (videoStreamFound && (hdrIngestEnabled || hdrTraceEnabled))
         derivedColorMeta = clipcolor::fromCodecParams(capturedPrimaries, capturedTrc,
-                                                      capturedBitDepth);
+                                                      capturedBitDepth,
+                                                      capturedHasHdrMeta);
     if (hdrIngestEnabled && videoStreamFound)
         clip.colorMeta = derivedColorMeta;
     if (hdrTraceEnabled) {
