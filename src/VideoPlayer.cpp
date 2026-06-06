@@ -11,6 +11,7 @@
 #include "playback/hdrmatte16_flag.h"
 #include "playback/hdroverlay_flag.h"
 #include "playback/idtgpu_flag.h"   // Stage9-GPU-IDT Story2: VEDITOR_HDR_IDT_GPU
+#include "playback/PixFmtDepth.h"   // pixfmtdepth::bitDepthFromPixFmt (null-safe per-component depth)
 #include "playback/TlrCompose16.h"
 #include "playback/HdrCompositeMath.h"
 #include "color/ClipColorTransform.h"
@@ -571,8 +572,11 @@ void VideoPlayer::loadFile(const QString &filePath)
     m_hdrInfo.primaries = codecpar->color_primaries;
     m_hdrInfo.trc = codecpar->color_trc;
     m_hdrInfo.colorspace = codecpar->color_space;
-    m_hdrInfo.bitDepth = std::max(8, av_get_bits_per_pixel(av_pix_fmt_desc_get(
-        static_cast<AVPixelFormat>(codecpar->format))) / 3);
+    // Per-component (luma) depth — null-safe and subsampling-correct.
+    // av_get_bits_per_pixel(desc)/3 collapsed 10/12-bit 4:2:0 HDR to 8-bit and
+    // would deref a null descriptor for unknown formats; pixfmtdepth reads
+    // comp[0].depth directly. Mirrors Timeline::addClip's ingest probe.
+    m_hdrInfo.bitDepth = pixfmtdepth::bitDepthFromPixFmt(codecpar->format);
     m_hdrInfo.isHdr = (codecpar->color_trc == AVCOL_TRC_SMPTE2084
                        || codecpar->color_trc == AVCOL_TRC_ARIB_STD_B67);
 
@@ -1395,9 +1399,9 @@ bool VideoPlayer::tryPromotePoolDecoderTo(int newEntryIdx)
         m_hdrInfo.primaries = codecpar->color_primaries;
         m_hdrInfo.trc = codecpar->color_trc;
         m_hdrInfo.colorspace = codecpar->color_space;
-        const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(
-            static_cast<AVPixelFormat>(codecpar->format));
-        m_hdrInfo.bitDepth = desc ? std::max(8, av_get_bits_per_pixel(desc) / 3) : 8;
+        // Per-component (luma) depth — see loadFile note. pixfmtdepth is
+        // null-safe and subsampling-correct (was av_get_bits_per_pixel/3).
+        m_hdrInfo.bitDepth = pixfmtdepth::bitDepthFromPixFmt(codecpar->format);
         m_hdrInfo.isHdr = (codecpar->color_trc == AVCOL_TRC_SMPTE2084
                            || codecpar->color_trc == AVCOL_TRC_ARIB_STD_B67);
     }
