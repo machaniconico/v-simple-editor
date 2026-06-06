@@ -783,7 +783,19 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
         // at the previous position.
         m_activeEntry = -1;
         if (m_playing) pause();
-        m_seekBar->setRange(0, 0);
+        // V3 sprint visibility-toggle fix (part 2): block the seek bar's
+        // valueChanged → seek(0) side effect. Shrinking the range to (0,0)
+        // forces the slider value to 0, and the valueChanged handler
+        // (ctor) would otherwise call seek(0) — which emits positionChanged(0)
+        // (snapping the Timeline playhead/timebar back to the start) AND
+        // overwrites m_timelinePositionUs to 0, defeating the position
+        // preservation intended above so re-showing the only video track no
+        // longer resumes at the prior playhead. Mirrors the QSignalBlocker
+        // already guarding setValue() in updatePositionUi()/seek-commit.
+        {
+            const QSignalBlocker seekBarBlocker(m_seekBar);
+            m_seekBar->setRange(0, 0);
+        }
         emit durationChanged(0.0);
         // US-T35 clear any OBS-style transform so a fresh import starts at
         // identity instead of inheriting the last clip's scale/offset.
