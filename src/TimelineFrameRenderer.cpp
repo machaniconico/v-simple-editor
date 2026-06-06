@@ -660,74 +660,87 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
     TimelineTrack *v1 = tracks.first();
     if (!v1)
         return QImage();
-    const QVector<ClipInfo> &v1Clips = v1->clips();
-    if (v1Clips.isEmpty())
-        return QImage();
-
+    const bool v1Hidden = v1->isHidden();
+    ClipInfo hiddenV1Clip{};
+    hiddenV1Clip.opacity = 0.0;
+    const ClipInfo *v1ClipPtr = &hiddenV1Clip;
+    int v1Idx = -1;
     double v1Start = 0.0;
-    const int v1Idx = activeClipOnTrack(v1Clips, targetSec,
-                                        /*clampToFirst=*/true, &v1Start);
-    if (v1Idx < 0)
-        return QImage();
+    QImage base;
+    if (v1Hidden) {
+        base = QImage(outSize, QImage::Format_RGBA8888);
+        base.fill(Qt::transparent);
+    } else {
+        const QVector<ClipInfo> &v1Clips = v1->clips();
+        if (v1Clips.isEmpty())
+            return QImage();
 
-    const ClipInfo &v1Clip = v1Clips[v1Idx];
-    // Timeline-second -> source-second mapping. Mirrors Exporter
-    // (src/Exporter.cpp:413-455): playback begins at clip.inPoint and walks
-    // forward; clip.speed scales clip-local time onto the source timeline
-    // (consistent with effectiveDuration() in Timeline.h:124-127).
-    const double v1LocalSec = targetSec - v1Start;            // >= 0
-    const double v1SourceSec = v1Clip.inPoint + v1LocalSec * v1Clip.speed;
+        v1Idx = activeClipOnTrack(v1Clips, targetSec,
+                                  /*clampToFirst=*/true, &v1Start);
+        if (v1Idx < 0)
+            return QImage();
 
-    const QImage v1NativeRaw = decodeClipFrameNative(v1Clip.filePath, v1SourceSec);
-    if (v1NativeRaw.isNull())
-        return QImage();
+        const ClipInfo &v1Clip = v1Clips[v1Idx];
+        v1ClipPtr = &v1Clip;
+        // Timeline-second -> source-second mapping. Mirrors Exporter
+        // (src/Exporter.cpp:413-455): playback begins at clip.inPoint and walks
+        // forward; clip.speed scales clip-local time onto the source timeline
+        // (consistent with effectiveDuration() in Timeline.h:124-127).
+        const double v1LocalSec = targetSec - v1Start;            // >= 0
+        const double v1SourceSec = v1Clip.inPoint + v1LocalSec * v1Clip.speed;
 
-    // S4: grade the V1 clip in NATIVE resolution before it is scaled onto the
-    // canvas — the preview shader colour-corrects/LUTs the sampled texel, i.e.
-    // grading happens per source pixel, independent of canvas scale. For a
-    // clip with default colour and no LUT this is a strict no-op so a lone V1
-    // clip stays byte-identical to S2.
-    const QImage v1Graded = gradeClipNativeFrame(v1NativeRaw, v1Clip);
+        const QImage v1NativeRaw = decodeClipFrameNative(v1Clip.filePath, v1SourceSec);
+        if (v1NativeRaw.isNull())
+            return QImage();
 
-    // S5: apply the V1 clip's FX pack on the GRADED native frame — the preview
-    // shader runs the FX uniforms AFTER the CC+LUT block closes
-    // (GLPreview.cpp:908 closes the grade branch; FX consumed at
-    // GLPreview.cpp:910-916), so FX comes strictly after CC -> LUT. No-op when
-    // the clip carries no effects, so a lone V1 clip stays byte-identical to
-    // S2/S3/S4.
-    const QImage v1Fx = applyClipFxPack(v1Graded, v1Clip);
+        // S4: grade the V1 clip in NATIVE resolution before it is scaled onto the
+        // canvas — the preview shader colour-corrects/LUTs the sampled texel, i.e.
+        // grading happens per source pixel, independent of canvas scale. For a
+        // clip with default colour and no LUT this is a strict no-op so a lone V1
+        // clip stays byte-identical to S2.
+        const QImage v1Graded = gradeClipNativeFrame(v1NativeRaw, v1Clip);
 
-    // S7: apply the V1 clip's per-clip compositing mask (motion-tracker
-    // animated) on the GRADED+FX'd native frame, BEFORE it is scaled onto
-    // the canvas — a per-clip AE/Premiere mask cuts the layer's alpha at the
-    // source-pixel level, before scale + the multi-track SourceOver
-    // composite (src/VideoPlayer.cpp:4558-4579), so a lower track shows
-    // through exactly where the mask cuts. No-op when the clip has no mask,
-    // so a lone V1 clip stays byte-identical to S2/S3/S4/S5/S6.
-    const QImage v1Native = applyClipMask(v1Fx, v1Clip, v1SourceSec);
+        // S5: apply the V1 clip's FX pack on the GRADED native frame — the preview
+        // shader runs the FX uniforms AFTER the CC+LUT block closes
+        // (GLPreview.cpp:908 closes the grade branch; FX consumed at
+        // GLPreview.cpp:910-916), so FX comes strictly after CC -> LUT. No-op when
+        // the clip carries no effects, so a lone V1 clip stays byte-identical to
+        // S2/S3/S4.
+        const QImage v1Fx = applyClipFxPack(v1Graded, v1Clip);
 
-    // Base canvas placement — V1 clip transform applied via clipgeom SSOT.
-    // Fast path (byte-identical to S2, MSE=0 preserved): when the V1 clip
-    // carries the exact-default transform (videoScale==1.0, videoDx==0.0,
-    // videoDy==0.0, rotation2DDegrees==0.0) skip clipgeom entirely and use
-    // the direct scaled() path so untransformed single-track projects stay
-    // byte-identical to the S2 reference.
-    // Transformed path: any deviation from exact-default (Ken-Burns, pan,
-    // rotate, motion-track) routes through clipgeom::renderLayer so export
-    // matches the GLPreview transform — closing the edit≠export gap for V1.
-    const bool v1TransformIsDefault =
-        v1Clip.videoScale       == 1.0 &&
-        v1Clip.videoDx          == 0.0 &&
-        v1Clip.videoDy          == 0.0 &&
-        v1Clip.rotation2DDegrees == 0.0;
-    const QImage base = v1TransformIsDefault
-        ? v1Native.scaled(outSize, Qt::IgnoreAspectRatio,
-                          Qt::SmoothTransformation)
-        : clipgeom::renderLayer(
-              v1Native,
-              clipgeom::ClipTransform{v1Clip.videoScale, v1Clip.videoDx,
-                                      v1Clip.videoDy, v1Clip.rotation2DDegrees},
-              outSize, /*smooth=*/true);
+        // S7: apply the V1 clip's per-clip compositing mask (motion-tracker
+        // animated) on the GRADED+FX'd native frame, BEFORE it is scaled onto
+        // the canvas — a per-clip AE/Premiere mask cuts the layer's alpha at the
+        // source-pixel level, before scale + the multi-track SourceOver
+        // composite (src/VideoPlayer.cpp:4558-4579), so a lower track shows
+        // through exactly where the mask cuts. No-op when the clip has no mask,
+        // so a lone V1 clip stays byte-identical to S2/S3/S4/S5/S6.
+        const QImage v1Native = applyClipMask(v1Fx, v1Clip, v1SourceSec);
+
+        // Base canvas placement — V1 clip transform applied via clipgeom SSOT.
+        // Fast path (byte-identical to S2, MSE=0 preserved): when the V1 clip
+        // carries the exact-default transform (videoScale==1.0, videoDx==0.0,
+        // videoDy==0.0, rotation2DDegrees==0.0) skip clipgeom entirely and use
+        // the direct scaled() path so untransformed single-track projects stay
+        // byte-identical to the S2 reference.
+        // Transformed path: any deviation from exact-default (Ken-Burns, pan,
+        // rotate, motion-track) routes through clipgeom::renderLayer so export
+        // matches the GLPreview transform — closing the edit≠export gap for V1.
+        const bool v1TransformIsDefault =
+            v1Clip.videoScale       == 1.0 &&
+            v1Clip.videoDx          == 0.0 &&
+            v1Clip.videoDy          == 0.0 &&
+            v1Clip.rotation2DDegrees == 0.0;
+        base = v1TransformIsDefault
+            ? v1Native.scaled(outSize, Qt::IgnoreAspectRatio,
+                              Qt::SmoothTransformation)
+            : clipgeom::renderLayer(
+                  v1Native,
+                  clipgeom::ClipTransform{v1Clip.videoScale, v1Clip.videoDx,
+                                          v1Clip.videoDy, v1Clip.rotation2DDegrees},
+                  outSize, /*smooth=*/true);
+    }
+    const ClipInfo &v1Clip = *v1ClipPtr;
 
     // ── Collect render layers from tracks V1.. (ascending = bottom-to-top) ──
     struct RenderLayer {
