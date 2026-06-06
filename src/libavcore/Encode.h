@@ -48,7 +48,9 @@ std::string hdr10MasterDisplayString(double masterMaxNits, double masterMinNits)
 struct EncodeRequest {
     int width = 0;
     int height = 0;
-    int fps = 30;                       // numerator; denominator is always 1
+    int fps = 30;                       // Legacy integral fps fallback.
+    int fpsNum = 0;                     // Optional rational fps numerator.
+    int fpsDen = 0;                     // Optional rational fps denominator.
     int64_t videoBitrateBits = 0;       // Video bitrate in bits per second (caller multiplies kbps×1000)
     std::string outputPath;             // UTF-8
     std::string audioSourcePath;        // Optional UTF-8 source for stream-copy audio muxing
@@ -111,8 +113,8 @@ public:
     std::optional<std::string> open(const EncodeRequest& request);
 
     // Push one frame of packed RGB24 pixels. width/height must match
-    // EncodeRequest. stride is bytes per row in src. pts is the output stream
-    // pts (in time_base units of 1/fps). Returns false on send/encode error.
+    // EncodeRequest. stride is bytes per row in src. pts increments once per
+    // output frame and is interpreted in encoderTimeBase().
     bool pushFrameRgb24(const uint8_t* src, int stride, int64_t pts);
 
 #ifdef VEDITOR_LIBAVCORE_WITH_QIMAGE
@@ -182,7 +184,8 @@ private:
     AVFrame* m_audioScratchFrame = nullptr;
     AVPixelFormat m_pixFmt = AV_PIX_FMT_YUV420P;
     int m_audioInStreamIndex = -1;
-    int m_fps = 30;                        // captured from EncodeRequest::fps in open()
+    int m_fpsNum = 30;                     // effective fps numerator captured in open()
+    int m_fpsDen = 1;                      // effective fps denominator captured in open()
     int64_t m_audioNextPts = 0;
     bool m_audioPtsInitialized = false;
     bool m_audioEncode = false;

@@ -86,6 +86,7 @@ int runProjTmplSelftest();
 int runProjectPresetSelftest();
 int runProxySelftestV2();
 int runRenderQueueAcesDecisionSelftest();
+int runRenderQueueFpsRationalSelftest();
 int runShortcutSelftest();
 int runSmartEditSelftest();
 int runSocialSelftest();
@@ -163,6 +164,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "HDR10 3-way routing (in-process 8-bit / in-process HDR / subprocess fallback)" },
     { "renderqueue-aces",  "VEDITOR_RENDERQUEUE_ACES_SELFTEST",   runRenderQueueAcesDecisionSelftest, false,
       "RenderQueue ACES/ODT ownership decision for 8-bit vs 16-bit tonemap paths (2 gates)" },
+    { "renderqueue-fps-rational", "VEDITOR_RENDERQUEUE_FPS_RATIONAL_SELFTEST", runRenderQueueFpsRationalSelftest, false,
+      "RenderQueue in-process export fps rational derivation (6 gates)" },
     { "tracker-preset",    "VEDITOR_TRACKER_PRESET_SELFTEST",     runTrackerPresetSelftest,      false,
       "MotionTracker preset 7 built-in + Registry + JSON round-trip (7 gates)" },
 #ifdef HAVE_PLANARTRACKER_PRESET

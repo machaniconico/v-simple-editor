@@ -84,6 +84,14 @@ static std::string ffmpegErrorString(int err)
     return std::string(buf);
 }
 
+static AVRational effectiveFpsRational(const EncodeRequest& req)
+{
+    if (req.fpsNum > 0 && req.fpsDen > 0) {
+        return AVRational{req.fpsNum, req.fpsDen};
+    }
+    return AVRational{req.fps, 1};
+}
+
 static void logAudioPassthroughDisabled(const std::string& path,
                                         const std::string& reason)
 {
@@ -401,8 +409,9 @@ bool FrameEncoder::configureEncoderContext(const EncodeRequest& req,
 
     m_encCtx->width = req.width;
     m_encCtx->height = req.height;
-    m_encCtx->time_base = {1, req.fps};
-    m_encCtx->framerate = {req.fps, 1};
+    const AVRational fps = effectiveFpsRational(req);
+    m_encCtx->time_base = {fps.den, fps.num};
+    m_encCtx->framerate = {fps.num, fps.den};
 
     // Decide pixel format mirroring Exporter.cpp policy.
     //
@@ -942,15 +951,18 @@ void FrameEncoder::muxAudioPassthroughPackets()
     }
 
     // [US-MF-8a] Video-length cap (-shortest equivalent). The rendered video
-    // runs framesPushed / fps seconds; source audio that extends past that
-    // (trim/range renders, or an asset longer than the rendered range) must be
-    // truncated so the muxed audio does not outlast the video. When no video
-    // frames were pushed there is nothing to bound against, so the cap is
-    // disabled and every packet is copied (legacy behavior).
-    const bool capEnabled = (m_videoFramesPushed > 0 && m_fps > 0);
+    // runs framesPushed * fpsDen / fpsNum seconds; source audio that extends
+    // past that (trim/range renders, or an asset longer than the rendered
+    // range) must be truncated so the muxed audio does not outlast the video.
+    // When no video frames were pushed there is nothing to bound against, so
+    // the cap is disabled and every packet is copied (legacy behavior).
+    const bool capEnabled =
+        (m_videoFramesPushed > 0 && m_fpsNum > 0 && m_fpsDen > 0);
     const double videoDurationSec =
         capEnabled
-            ? static_cast<double>(m_videoFramesPushed) / static_cast<double>(m_fps)
+            ? (static_cast<double>(m_videoFramesPushed)
+               * static_cast<double>(m_fpsDen))
+                  / static_cast<double>(m_fpsNum)
             : 0.0;
 
     // [US-MF-8b] Start-time normalization. Source audio whose stream start_time
@@ -1027,7 +1039,9 @@ void FrameEncoder::muxAudioPassthroughPackets()
 std::optional<std::string> FrameEncoder::open(const EncodeRequest& req)
 {
     if (m_opened) return std::string("FrameEncoder already opened");
-    if (req.width <= 0 || req.height <= 0 || req.fps <= 0) {
+    const AVRational fps = effectiveFpsRational(req);
+    if (req.width <= 0 || req.height <= 0
+        || fps.num <= 0 || fps.den <= 0) {
         return std::string("Invalid frame geometry");
     }
     if (req.outputPath.empty()) {
@@ -1036,7 +1050,8 @@ std::optional<std::string> FrameEncoder::open(const EncodeRequest& req)
 
     // [US-MF-8] Capture fps for video-duration computation in
     // muxAudioPassthroughPackets() (-shortest equivalent). Validated > 0 above.
-    m_fps = req.fps;
+    m_fpsNum = fps.num;
+    m_fpsDen = fps.den;
 
     if (avformat_alloc_output_context2(&m_outFmt, nullptr, nullptr,
                                        req.outputPath.c_str()) < 0 || !m_outFmt) {
@@ -1178,7 +1193,7 @@ bool FrameEncoder::pushFrameNative(AVFrame* frame, int64_t pts)
     }
 
     // [US-MF-8] Count frames accepted by the video encoder so finalize() can
-    // derive video duration (framesPushed / fps) for the audio -shortest cap.
+    // derive rational-fps video duration for the audio -shortest cap.
     // pushFrameRgb24() routes through here, so a single increment covers both
     // public push paths without double-counting.
     ++m_videoFramesPushed;

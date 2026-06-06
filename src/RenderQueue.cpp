@@ -34,6 +34,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <string>
 
 namespace {
@@ -55,6 +56,43 @@ bool shouldApplyExportAces(bool acesEnabled,
                            bool odtOwnsTonemap)
 {
     return acesEnabled && !isHdr10 && !isHlg && !isProRes && !odtOwnsTonemap;
+}
+
+struct FpsRational {
+    int num = 30;
+    int den = 1;
+};
+
+FpsRational deriveFpsRational(double fps)
+{
+    if (!std::isfinite(fps) || fps <= 0.0)
+        return {30, 1};
+
+    static constexpr double kEpsilon = 0.01;
+    static constexpr int kNtscDen = 1001;
+    static constexpr int kNtscNums[] = {
+        24000, 30000, 48000, 60000, 120000
+    };
+
+    for (int num : kNtscNums) {
+        const double ntscFps =
+            static_cast<double>(num) / static_cast<double>(kNtscDen);
+        if (std::fabs(fps - ntscFps) < kEpsilon)
+            return {num, kNtscDen};
+    }
+
+    const double rounded = std::round(fps);
+    if (rounded > 0.0
+        && rounded <= static_cast<double>(std::numeric_limits<int>::max())
+        && std::fabs(fps - rounded) < kEpsilon) {
+        return {static_cast<int>(rounded), 1};
+    }
+
+    const AVRational q = av_d2q(fps, 1 << 16);
+    if (q.num > 0 && q.den > 0)
+        return {q.num, q.den};
+
+    return {static_cast<int>(std::round(fps)), 1};
 }
 } // namespace
 
@@ -84,6 +122,37 @@ int runRenderQueueAcesDecisionSelftest()
     }
 
     std::printf("[renderqueue-aces] summary: gates=2 passed=%d failed=%d\n",
+                passed, failed);
+    return failed == 0 ? 0 : 1;
+}
+
+int runRenderQueueFpsRationalSelftest()
+{
+    int passed = 0;
+    int failed = 0;
+
+    auto check = [&](int gate, double fps, int expNum, int expDen) {
+        const FpsRational got = deriveFpsRational(fps);
+        const bool ok = (got.num == expNum && got.den == expDen);
+        std::printf("[renderqueue-fps-rational] %s G%d fps=%.6f got=%d/%d expected=%d/%d\n",
+                    ok ? "PASS" : "FAIL",
+                    gate,
+                    fps,
+                    got.num,
+                    got.den,
+                    expNum,
+                    expDen);
+        ok ? ++passed : ++failed;
+    };
+
+    check(1, 29.97, 30000, 1001);
+    check(2, 23.976, 24000, 1001);
+    check(3, 59.94, 60000, 1001);
+    check(4, 30.0, 30, 1);
+    check(5, 25.0, 25, 1);
+    check(6, 24.0, 24, 1);
+
+    std::printf("[renderqueue-fps-rational] summary: gates=6 passed=%d failed=%d\n",
                 passed, failed);
     return failed == 0 ? 0 : 1;
 }
@@ -693,11 +762,12 @@ void RenderQueue::startRenderPipe(int jobIndex)
     libavcore::EncodeRequest request;
     request.width = outW;
     request.height = outH;
-    request.fps = cfg.value("fps").toInt(0);
-    if (request.fps <= 0)
-        request.fps = static_cast<int>(fps + 0.5);
+    const FpsRational fpsRational = deriveFpsRational(fps);
+    request.fps = static_cast<int>(std::round(fps));
     if (request.fps <= 0)
         request.fps = 30;
+    request.fpsNum = fpsRational.num;
+    request.fpsDen = fpsRational.den;
     request.outputPath = jobCopy.outputPath.toUtf8().toStdString();
 
     QString videoCodec = cfg.value("videoCodec").toString();
