@@ -1334,6 +1334,8 @@ void RenderQueue::startRenderPipeSubprocess(int jobIndex)
                     }
                 }
 
+                proc->readAllStandardError();
+
                 const int pct = qBound(0, static_cast<int>(
                     (static_cast<double>(f + 1)
                         / static_cast<double>(totalFrames)) * 100.0), 99);
@@ -1345,7 +1347,10 @@ void RenderQueue::startRenderPipeSubprocess(int jobIndex)
             }
 
             proc->closeWriteChannel();
-            proc->waitForFinished(-1);
+            while (!proc->waitForFinished(100)) {
+                proc->readAllStandardError();
+            }
+            proc->readAllStandardError();
             const bool encOk = proc->exitStatus() == QProcess::NormalExit
                 && proc->exitCode() == 0;
             if (!encOk)
