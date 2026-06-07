@@ -74,6 +74,17 @@ QRect alphaBounds(const QImage& image)
     return QRect(left, top, right - left + 1, bottom - top + 1);
 }
 
+bool allPixelsOpaque(const QImage& image)
+{
+    for (int y = 0; y < image.height(); ++y) {
+        for (int x = 0; x < image.width(); ++x) {
+            if (qAlpha(image.pixel(x, y)) != 255)
+                return false;
+        }
+    }
+    return !image.isNull();
+}
+
 } // namespace
 
 int runSnsFitSelftest()
@@ -238,6 +249,187 @@ int runSnsFitSelftest()
     }
 
     qInfo().noquote() << "[sns-fit] selftest done: passed=" << passed
+                      << "failed=" << failed;
+    return failed == 0 ? 0 : 1;
+}
+
+int runSnsCoverSelftest()
+{
+    qInfo().noquote() << "[sns-cover] selftest start";
+    int passed = 0, failed = 0;
+    auto pass = [&](const char* name) {
+        ++passed;
+        qInfo().noquote() << "[sns-cover] PASS" << name;
+    };
+    auto fail = [&](const char* name, const QString& msg) {
+        ++failed;
+        qWarning().noquote() << "[sns-cover] FAIL" << name << ":" << msg;
+    };
+    auto check = [&](const char* name, bool ok, const QString& msg = QString()) {
+        if (ok)
+            pass(name);
+        else
+            fail(name, msg);
+    };
+
+    {
+        const QSize srcSize(1920, 1080);
+        const double aspect = 9.0 / 16.0;
+        const snsfit::CoverGeom g = snsfit::coverGeom(srcSize, aspect);
+        const double croppedAspect =
+            g.croppedSize.width() / static_cast<double>(g.croppedSize.height());
+        check("G1 16:9 into 9:16 geometry crops horizontally",
+              g.croppedSize.height() == 1080
+                  && std::fabs(croppedAspect - aspect) < 1e-3
+                  && g.srcCropRect.x() > 0,
+              QStringLiteral("cropped=%1x%2 aspect=%3 rect=(%4,%5 %6x%7)")
+                  .arg(g.croppedSize.width()).arg(g.croppedSize.height())
+                  .arg(croppedAspect, 0, 'f', 9)
+                  .arg(g.srcCropRect.x()).arg(g.srcCropRect.y())
+                  .arg(g.srcCropRect.width()).arg(g.srcCropRect.height()));
+    }
+
+    {
+        QImage src(192, 108, QImage::Format_RGBA8888);
+        src.fill(qRgba(255, 64, 32, 255));
+        const QImage out = snsfit::coverInAspectCanvas(src, 9.0 / 16.0);
+        const QRect bounds = alphaBounds(out);
+        check("G2 cover output remains fully opaque for opaque source",
+              allPixelsOpaque(out),
+              QStringLiteral("out=%1x%2 format=%3 alphaBounds=%4,%5 %6x%7")
+                  .arg(out.width()).arg(out.height()).arg(static_cast<int>(out.format()))
+                  .arg(bounds.x()).arg(bounds.y())
+                  .arg(bounds.width()).arg(bounds.height()));
+    }
+
+    {
+        const QImage src = makePatternImage(QSize(16, 9), QImage::Format_RGBA8888);
+        const QImage covered = snsfit::coverInAspectCanvas(src, 16.0 / 9.0);
+        const QImage maybeCovered = snsfit::maybeCover(src, true, QSize(160, 90));
+        check("G3 aspect-match identity is byte-identical",
+              imageBytesEqual(src, covered) && imageBytesEqual(src, maybeCovered),
+              QStringLiteral("coverEqual=%1 maybeEqual=%2")
+                  .arg(imageBytesEqual(src, covered))
+                  .arg(imageBytesEqual(src, maybeCovered)));
+    }
+
+    {
+        QImage rgba8(16, 9, QImage::Format_RGBA8888);
+        rgba8.fill(qRgba(1, 2, 3, 255));
+        QImage rgba64(16, 9, QImage::Format_RGBA64);
+        rgba64.fill(Qt::white);
+        const QImage out8 = snsfit::coverInAspectCanvas(rgba8, 1.0);
+        const QImage out64 = snsfit::coverInAspectCanvas(rgba64, 1.0);
+        check("G4 output format is preserved",
+              out8.format() == rgba8.format() && out64.format() == rgba64.format(),
+              QStringLiteral("out8=%1 in8=%2 out64=%3 in64=%4")
+                  .arg(static_cast<int>(out8.format())).arg(static_cast<int>(rgba8.format()))
+                  .arg(static_cast<int>(out64.format())).arg(static_cast<int>(rgba64.format())));
+    }
+
+    {
+        const QSize srcSize(1080, 1920);
+        const snsfit::CoverGeom g = snsfit::coverGeom(srcSize, 16.0 / 9.0);
+        check("G5 portrait source into landscape canvas crops vertically",
+              g.croppedSize.width() == 1080
+                  && g.srcCropRect.y() > 0,
+              QStringLiteral("cropped=%1x%2 rect=(%3,%4 %5x%6)")
+                  .arg(g.croppedSize.width()).arg(g.croppedSize.height())
+                  .arg(g.srcCropRect.x()).arg(g.srcCropRect.y())
+                  .arg(g.srcCropRect.width()).arg(g.srcCropRect.height()));
+    }
+
+    {
+        const QSize srcSize(1920, 1080);
+        const snsfit::CoverGeom g = snsfit::coverGeom(srcSize, 1.0);
+        check("G6 square canvas crops landscape source horizontally",
+              g.srcCropRect.x() > 0
+                  && g.srcCropRect.y() == 0
+                  && g.croppedSize.width() == g.croppedSize.height(),
+              QStringLiteral("cropped=%1x%2 rect=(%3,%4 %5x%6)")
+                  .arg(g.croppedSize.width()).arg(g.croppedSize.height())
+                  .arg(g.srcCropRect.x()).arg(g.srcCropRect.y())
+                  .arg(g.srcCropRect.width()).arg(g.srcCropRect.height()));
+    }
+
+    {
+        const QSize src16x9(1920, 1080);
+        check("G7 shouldCover false cases and true case",
+              !snsfit::shouldCover(true, QSize(), src16x9)
+                  && !snsfit::shouldCover(true, QSize(0, 1920), src16x9)
+                  && !snsfit::shouldCover(false, QSize(1080, 1920), src16x9)
+                  && !snsfit::shouldCover(true, QSize(1080, 1920), QSize())
+                  && !snsfit::shouldCover(true, QSize(1920, 1080), src16x9)
+                  && snsfit::shouldCover(true, QSize(1080, 1920), src16x9),
+              QStringLiteral("invalid=%1 empty=%2 fitFalse=%3 invalidSrc=%4 aspectMatch=%5 trueCase=%6")
+                  .arg(snsfit::shouldCover(true, QSize(), src16x9))
+                  .arg(snsfit::shouldCover(true, QSize(0, 1920), src16x9))
+                  .arg(snsfit::shouldCover(false, QSize(1080, 1920), src16x9))
+                  .arg(snsfit::shouldCover(true, QSize(1080, 1920), QSize()))
+                  .arg(snsfit::shouldCover(true, QSize(1920, 1080), src16x9))
+                  .arg(snsfit::shouldCover(true, QSize(1080, 1920), src16x9)));
+    }
+
+#if SNS_FIT_HAVE_CLIPGEOM
+    {
+        QImage src(144, 81, QImage::Format_RGBA8888);
+        src.fill(qRgba(200, 30, 20, 255));
+        const QImage covered = snsfit::coverInAspectCanvas(src, 9.0 / 16.0, false);
+        const clipgeom::ClipTransform identity;
+        const QSize canvasSize(288, 512);
+        const QImage placed = clipgeom::renderLayer(covered, identity, canvasSize, false);
+        const QRect bounds = alphaBounds(placed);
+        check("G8 cover->clipgeom fills full rect",
+              bounds == QRect(0, 0, canvasSize.width(), canvasSize.height()),
+              QStringLiteral("bounds=(%1,%2 %3x%4) canvas=%5x%6")
+                  .arg(bounds.x()).arg(bounds.y())
+                  .arg(bounds.width()).arg(bounds.height())
+                  .arg(canvasSize.width()).arg(canvasSize.height()));
+    }
+#else
+    qInfo().noquote() << "[sns-cover] SKIP G8 cover->clipgeom fills full rect:"
+                      << "clipgeom header unavailable";
+    pass("G8 cover->clipgeom fills full rect (skipped)");
+#endif
+
+    {
+        // G9 negative control: cover is a 1:1 centered crop, so every output
+        // pixel must EXACTLY equal the corresponding source pixel — including
+        // partial alpha. This is the regression guard for the export path where
+        // maybeCover() runs after applyClipMask() has cut the clip's alpha: if
+        // coverInAspectCanvas ever drops the transparent pre-fill (or switches to
+        // a blend over an uninitialized buffer), partial-alpha pixels corrupt and
+        // this gate fails. makePatternImage carries varying alpha by construction.
+        const QImage src = makePatternImage(QSize(160, 90), QImage::Format_RGBA8888);
+        const snsfit::CoverGeom g = snsfit::coverGeom(src.size(), 9.0 / 16.0);
+        const QImage covered = snsfit::coverInAspectCanvas(src, 9.0 / 16.0);
+        bool exactCrop = covered.size() == g.croppedSize;
+        bool sawPartialAlpha = false;
+        int badX = -1, badY = -1;
+        for (int y = 0; exactCrop && y < covered.height(); ++y) {
+            for (int x = 0; x < covered.width(); ++x) {
+                const QRgb want = src.pixel(g.srcCropRect.x() + x,
+                                            g.srcCropRect.y() + y);
+                if (qAlpha(want) != 255)
+                    sawPartialAlpha = true;
+                if (covered.pixel(x, y) != want) {
+                    exactCrop = false;
+                    badX = x;
+                    badY = y;
+                    break;
+                }
+            }
+        }
+        check("G9 cover preserves partial-alpha crop pixel-exactly",
+              exactCrop && sawPartialAlpha,
+              QStringLiteral("exactCrop=%1 sawPartialAlpha=%2 firstBad=(%3,%4) cropRect=(%5,%6 %7x%8)")
+                  .arg(exactCrop).arg(sawPartialAlpha)
+                  .arg(badX).arg(badY)
+                  .arg(g.srcCropRect.x()).arg(g.srcCropRect.y())
+                  .arg(g.srcCropRect.width()).arg(g.srcCropRect.height()));
+    }
+
+    qInfo().noquote() << "[sns-cover] selftest done: passed=" << passed
                       << "failed=" << failed;
     return failed == 0 ? 0 : 1;
 }

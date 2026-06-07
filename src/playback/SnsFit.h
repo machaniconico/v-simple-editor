@@ -11,11 +11,20 @@ struct ContainGeom {
     QRect contentRect;
 };
 
+struct CoverGeom {
+    QSize croppedSize;
+    QRect srcCropRect;
+};
+
 ContainGeom containGeom(const QSize& srcSize, double canvasAspect);
 QImage containInAspectCanvas(const QImage& src, double canvasAspect, bool smooth = true);
+CoverGeom coverGeom(const QSize& srcSize, double canvasAspect);
+QImage coverInAspectCanvas(const QImage& src, double canvasAspect, bool smooth = true);
 
 // TODO S2b: implement once fitContain is wired into ClipInfo/project output handling.
 bool shouldContain(bool fitContain, QSize projOutSize, QSize srcSize);
 QImage maybeContain(const QImage& src, bool fitContain, QSize projOutSize);
+bool shouldCover(bool fitCover, QSize projOutSize, QSize srcSize);
+QImage maybeCover(const QImage& src, bool fitCover, QSize projOutSize);
 
 } // namespace snsfit

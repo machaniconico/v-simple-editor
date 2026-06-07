@@ -46,6 +46,38 @@ ContainGeom containGeom(const QSize& srcSize, double canvasAspect)
     };
 }
 
+CoverGeom coverGeom(const QSize& srcSize, double canvasAspect)
+{
+    if (!isValidSourceSize(srcSize) || canvasAspect <= 0.0 || !std::isfinite(canvasAspect))
+        return { srcSize, QRect(0, 0, srcSize.width(), srcSize.height()) };
+
+    const double srcA = srcSize.width() / static_cast<double>(srcSize.height());
+    if (std::fabs(srcA - canvasAspect) < kAspectEps) {
+        return {
+            srcSize,
+            QRect(0, 0, srcSize.width(), srcSize.height())
+        };
+    }
+
+    if (srcA > canvasAspect) {
+        const int h = srcSize.height();
+        const int cropW = qRound(h * canvasAspect);
+        const int x = (srcSize.width() - cropW) / 2;
+        return {
+            QSize(cropW, h),
+            QRect(x, 0, cropW, h)
+        };
+    }
+
+    const int w = srcSize.width();
+    const int cropH = qRound(w / canvasAspect);
+    const int y = (srcSize.height() - cropH) / 2;
+    return {
+        QSize(w, cropH),
+        QRect(0, y, w, cropH)
+    };
+}
+
 QImage containInAspectCanvas(const QImage& src, double canvasAspect, bool smooth)
 {
     (void)smooth;
@@ -68,9 +100,46 @@ QImage containInAspectCanvas(const QImage& src, double canvasAspect, bool smooth
     return out;
 }
 
+QImage coverInAspectCanvas(const QImage& src, double canvasAspect, bool smooth)
+{
+    (void)smooth;
+
+    if (src.isNull() || canvasAspect <= 0.0 || !std::isfinite(canvasAspect) || src.height() <= 0)
+        return src;
+
+    const double srcA = src.width() / static_cast<double>(src.height());
+    if (std::fabs(srcA - canvasAspect) < kAspectEps)
+        return src;
+
+    const CoverGeom g = coverGeom(src.size(), canvasAspect);
+    QImage out(g.croppedSize, src.format());
+    out.fill(Qt::transparent);
+
+    QPainter painter(&out);
+    painter.drawImage(QRect(0, 0, out.width(), out.height()), src, g.srcCropRect);
+    painter.end();
+
+    return out;
+}
+
 bool shouldContain(bool fitContain, QSize projOutSize, QSize srcSize)
 {
     if (!fitContain)
+        return false;
+    if (!projOutSize.isValid() || projOutSize.isEmpty())
+        return false;
+    if (!isValidSourceSize(srcSize))
+        return false;
+
+    const double canvasAspect =
+        projOutSize.width() / static_cast<double>(projOutSize.height());
+    const double srcAspect = srcSize.width() / static_cast<double>(srcSize.height());
+    return std::fabs(srcAspect - canvasAspect) >= kShouldContainAspectEps;
+}
+
+bool shouldCover(bool fitCover, QSize projOutSize, QSize srcSize)
+{
+    if (!fitCover)
         return false;
     if (!projOutSize.isValid() || projOutSize.isEmpty())
         return false;
@@ -91,6 +160,16 @@ QImage maybeContain(const QImage& src, bool fitContain, QSize projOutSize)
     const double canvasAspect =
         projOutSize.width() / static_cast<double>(projOutSize.height());
     return containInAspectCanvas(src, canvasAspect);
+}
+
+QImage maybeCover(const QImage& src, bool fitCover, QSize projOutSize)
+{
+    if (!shouldCover(fitCover, projOutSize, src.size()))
+        return src;
+
+    const double canvasAspect =
+        projOutSize.width() / static_cast<double>(projOutSize.height());
+    return coverInAspectCanvas(src, canvasAspect);
 }
 
 } // namespace snsfit
