@@ -3746,6 +3746,7 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
             return;
         ClipInfo &clip = clips[clipIndex];
         clip.fitContain = enabled;
+        clip.fitCover = false;
         clip.videoScale = 1.0;
         clip.videoDx = 0.0;
         clip.videoDy = 0.0;
@@ -5253,6 +5254,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         double rotation2DDegrees = 0.0;
         double opacity = 1.0;
         bool fitContain = false;
+        bool fitCover = false;
         clipcolor::ColorMeta colorMeta;
         double volume = 1.0;
         QVector<AudioGainPoint> volumeEnvelope;
@@ -5296,6 +5298,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
                 iv.rotation2DDegrees = c.rotation2DDegrees;
                 iv.opacity = c.opacity;
                 iv.fitContain = c.fitContain;
+                iv.fitCover = c.fitCover;
                 iv.colorMeta = c.colorMeta;
                 iv.volume = c.volume;
                 iv.volumeEnvelope = c.volumeEnvelope;
@@ -5430,6 +5433,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         e.rotation2DDegrees = iv.rotation2DDegrees;
         e.opacity = iv.opacity;
         e.fitContain = iv.fitContain;
+        e.fitCover = iv.fitCover;
         e.colorMeta = iv.colorMeta;
         e.volume = iv.volume;
         e.volumeEnvelope = iv.volumeEnvelope;

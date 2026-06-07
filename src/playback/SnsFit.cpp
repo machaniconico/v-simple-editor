@@ -172,4 +172,22 @@ QImage maybeCover(const QImage& src, bool fitCover, QSize projOutSize)
     return coverInAspectCanvas(src, canvasAspect);
 }
 
+bool shouldFit(bool fitContain, bool fitCover, QSize projOutSize, QSize srcSize)
+{
+    if (fitCover)
+        return shouldCover(true, projOutSize, srcSize);
+    if (fitContain)
+        return shouldContain(true, projOutSize, srcSize);
+    return false;
+}
+
+QImage maybeFit(const QImage& src, bool fitContain, bool fitCover, QSize projOutSize)
+{
+    if (fitCover)
+        return maybeCover(src, true, projOutSize);
+    if (fitContain)
+        return maybeContain(src, true, projOutSize);
+    return src;
+}
+
 } // namespace snsfit

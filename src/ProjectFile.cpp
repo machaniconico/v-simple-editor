@@ -1301,6 +1301,8 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
     obj["layer3D"] = clip.layer3D.toJson();
     if (clip.fitContain)
         obj["fitContain"] = true;
+    if (clip.fitCover)
+        obj["fitCover"] = true;
 
     if (!clip.volumeEnvelope.isEmpty()) {
         QJsonArray envArr;
@@ -1364,6 +1366,7 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
         ? Layer3DTransform::fromJson(obj["layer3D"].toObject())
         : Layer3DTransform{};
     clip.fitContain = obj["fitContain"].toBool(false);
+    clip.fitCover = obj["fitCover"].toBool(false);
     if (!clip.is3DLayer)
         clip.layer3D.reset();
 

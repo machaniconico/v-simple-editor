@@ -429,6 +429,47 @@ int runSnsCoverSelftest()
                   .arg(g.srcCropRect.width()).arg(g.srcCropRect.height()));
     }
 
+    {
+        const QImage src = makePatternImage(QSize(1280, 720), QImage::Format_RGBA8888);
+        const QSize proj(720, 1280);
+        const QImage fit = snsfit::maybeFit(src, true, true, proj);
+        const QImage covered = snsfit::maybeCover(src, true, proj);
+        check("G10 maybeFit cover priority",
+              imageBytesEqual(fit, covered)
+                  && alphaBounds(fit) == QRect(0, 0, fit.width(), fit.height()),
+              QStringLiteral("fit=%1x%2 cover=%3x%4 equal=%5 bounds=(%6,%7 %8x%9)")
+                  .arg(fit.width()).arg(fit.height())
+                  .arg(covered.width()).arg(covered.height())
+                  .arg(imageBytesEqual(fit, covered))
+                  .arg(alphaBounds(fit).x()).arg(alphaBounds(fit).y())
+                  .arg(alphaBounds(fit).width()).arg(alphaBounds(fit).height()));
+    }
+
+    {
+        const QImage src = makePatternImage(QSize(16, 9), QImage::Format_RGBA8888);
+        const QSize proj(9, 16);
+        const QImage fit = snsfit::maybeFit(src, true, false, proj);
+        const QImage contained = snsfit::maybeContain(src, true, proj);
+        check("G11 maybeFit contain path is byte-identical",
+              imageBytesEqual(fit, contained),
+              QStringLiteral("fit=%1x%2 contain=%3x%4 equal=%5")
+                  .arg(fit.width()).arg(fit.height())
+                  .arg(contained.width()).arg(contained.height())
+                  .arg(imageBytesEqual(fit, contained)));
+    }
+
+    {
+        const QImage src = makePatternImage(QSize(16, 9), QImage::Format_RGBA8888);
+        const QSize proj(9, 16);
+        const QImage fit = snsfit::maybeFit(src, false, false, proj);
+        check("G12 maybeFit/shouldFit both false are identity",
+              imageBytesEqual(src, fit)
+                  && !snsfit::shouldFit(false, false, proj, src.size()),
+              QStringLiteral("identityEqual=%1 shouldFit=%2")
+                  .arg(imageBytesEqual(src, fit))
+                  .arg(snsfit::shouldFit(false, false, proj, src.size())));
+    }
+
     qInfo().noquote() << "[sns-cover] selftest done: passed=" << passed
                       << "failed=" << failed;
     return failed == 0 ? 0 : 1;

@@ -46,6 +46,7 @@ struct PlaybackEntry {
                                     // to the export path.
     double opacity = 1.0;        // PiP alpha, propagated from ClipInfo::opacity
     bool fitContain = false;     // SNS vertical fit, propagated from ClipInfo::fitContain
+    bool fitCover = false;       // SNS cover fit, propagated from ClipInfo::fitCover
     clipcolor::ColorMeta colorMeta; // Per-clip input color metadata (Stage1 storage only)
     double volume = 1.0;         // Per-clip audio gain (0.0-2.0), propagated from ClipInfo::volume
     int sourceClipIndex = -1;    // Index into TimelineTrack::m_clips

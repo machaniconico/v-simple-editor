@@ -2071,7 +2071,8 @@ void VideoPlayer::displaySeekFrameConformed(const QImage &v1Image)
     }
 
     const bool fitContain = entry ? entry->fitContain : false;
-    QImage conformed = snsfit::maybeContain(v1Image, fitContain, m_projectOutputSize);
+    const bool fitCover = entry ? entry->fitCover : false;
+    QImage conformed = snsfit::maybeFit(v1Image, fitContain, fitCover, m_projectOutputSize);
 
     DecodedLayer layer;
     layer.rgb = conformed;
@@ -2086,6 +2087,7 @@ void VideoPlayer::displaySeekFrameConformed(const QImage &v1Image)
     }
     layer.sourceTrack = 0;
     layer.fitContain = fitContain;
+    layer.fitCover = fitCover;
     layer.isFresh = true;
 
     QVector<DecodedLayer> singleLayer;
@@ -3372,7 +3374,8 @@ void VideoPlayer::refreshDisplayedFrame()
                 layer.sourceTrack = e.sourceTrack;
                 layer.sequenceIdx = m_activeEntry;
                 layer.fitContain = e.fitContain;
-                layer.rgb = snsfit::maybeContain(layer.rgb, layer.fitContain, m_projectOutputSize);
+                layer.fitCover = e.fitCover;
+                layer.rgb = snsfit::maybeFit(layer.rgb, layer.fitContain, layer.fitCover, m_projectOutputSize);
                 QVector<DecodedLayer> singleLayer;
                 singleLayer.append(layer);
                 composeMultiTrackFrameInto(canvas, singleLayer);
@@ -3952,6 +3955,7 @@ void VideoPlayer::handlePlaybackTick()
                     layer.sourceTrack = e.sourceTrack;
                     layer.sequenceIdx = idx;
                     layer.fitContain = e.fitContain;
+                    layer.fitCover = e.fitCover;
                     // STAGE4B: carry the live track-matte assignment from the
                     // PlaybackEntry. matteTypeOrdinal MIRRORS TrackMatteType
                     // ordinals (0=None..4=LumaInverted); matteSourceClipId is the
@@ -4044,6 +4048,7 @@ void VideoPlayer::handlePlaybackTick()
                 layer.sourceTrack = e.sourceTrack;
                 layer.sequenceIdx = idx;
                 layer.fitContain = e.fitContain;
+                layer.fitCover = e.fitCover;
                 // STAGE4B: mirror the threaded active-layer path and
                 // finalizeOverlayFromDecoder so serial ticks carry matte data too.
                 layer.matteType = static_cast<TrackMatteType>(e.matteTypeOrdinal);
@@ -4069,7 +4074,7 @@ void VideoPlayer::handlePlaybackTick()
         // re-inversion breaks the selftest.
         std::stable_sort(layers.begin(), layers.end(), clipstack::layerPaintOrderLess);
         for (DecodedLayer &L : layers)
-            L.rgb = snsfit::maybeContain(L.rgb, L.fitContain, m_projectOutputSize);
+            L.rgb = snsfit::maybeFit(L.rgb, L.fitContain, L.fitCover, m_projectOutputSize);
         if (overlayPresent || m_projectOutputSize.isValid()) {
             // Reuse a canvas-sized scratch buffer so we don't allocate
             // ~8MB (1080p ARGB) every tick. Re-allocates only when the
@@ -5558,6 +5563,7 @@ bool VideoPlayer::finalizeOverlayFromDecoder(const PlaybackEntry &e, int seqIdx,
     out->sourceTrack        = e.sourceTrack;
     out->sequenceIdx        = seqIdx;
     out->fitContain         = e.fitContain;
+    out->fitCover           = e.fitCover;
     // STAGE4B: carry the live track-matte assignment (see V1 build site). Ordinal
     // mirrors TrackMatteType; matteSourceIndex resolved later in
     // tryGpuComposeLayers against the final inputs vector.

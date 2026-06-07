@@ -718,9 +718,9 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
         // so a lone V1 clip stays byte-identical to S2/S3/S4/S5/S6.
         const QImage v1Native = applyClipMask(v1Fx, v1Clip, v1SourceSec);
         const bool contained =
-            snsfit::shouldContain(v1Clip.fitContain, outSize, v1Native.size());
+            snsfit::shouldFit(v1Clip.fitContain, v1Clip.fitCover, outSize, v1Native.size());
         const QImage v1Contained =
-            snsfit::maybeContain(v1Native, v1Clip.fitContain, outSize);
+            snsfit::maybeFit(v1Native, v1Clip.fitContain, v1Clip.fitCover, outSize);
 
         // Base canvas placement — V1 clip transform applied via clipgeom SSOT.
         // Fast path (byte-identical to S2, MSE=0 preserved): when the V1 clip
@@ -813,7 +813,7 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
         // for un-masked overlays, so S3's multi-track MSE stays ~0.
         QImage native = applyClipMask(
             applyClipFxPack(gradeClipNativeFrame(nativeRaw, c), c), c, srcSec);
-        native = snsfit::maybeContain(native, c.fitContain, outSize);
+        native = snsfit::maybeFit(native, c.fitContain, c.fitCover, outSize);
         RenderLayer renderLayer;
         renderLayer.clipId = renderClipId(t, idx);
         renderLayer.colorMeta = c.colorMeta;

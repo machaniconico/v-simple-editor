@@ -26,5 +26,7 @@ bool shouldContain(bool fitContain, QSize projOutSize, QSize srcSize);
 QImage maybeContain(const QImage& src, bool fitContain, QSize projOutSize);
 bool shouldCover(bool fitCover, QSize projOutSize, QSize srcSize);
 QImage maybeCover(const QImage& src, bool fitCover, QSize projOutSize);
+bool shouldFit(bool fitContain, bool fitCover, QSize projOutSize, QSize srcSize);
+QImage maybeFit(const QImage& src, bool fitContain, bool fitCover, QSize projOutSize);
 
 } // namespace snsfit
