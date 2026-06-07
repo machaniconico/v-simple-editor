@@ -162,9 +162,11 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     # AB (オーディオバス): Fairlight 風バス/サブミックス/AUXセンドの純粋エンジン。
     src/AudioBusRouting.h
     src/AudioBusRouting.cpp
+    src/SilenceCut.cpp
     src/AudioBusPanel.cpp
     src/selftests/audio_bus_selftest.cpp
     src/selftests/atempo_resolve_selftest.cpp
+    src/selftests/silence_cut_selftest.cpp
     # SP (スペクトル編集): iZotope RX 風 STFT/iSTFT 純粋エンジン + スペクトログラム UI。
     src/SpectralEngine.h
     src/SpectralEngine.cpp

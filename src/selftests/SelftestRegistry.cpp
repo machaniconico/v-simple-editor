@@ -88,6 +88,7 @@ int runProxySelftestV2();
 int runRenderQueueAcesDecisionSelftest();
 int runRenderQueueFpsRationalSelftest();
 int runShortcutSelftest();
+int runSilenceCutSelftest();
 int runSmartEditSelftest();
 int runSnsCoverSelftest();
 int runSnsFitSelftest();
@@ -235,6 +236,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Clip IDT: per-clip RGBA64 premul input color transform into common 16bit blend space (13 gates)" },
     { "clip-odt",         "VEDITOR_CLIP_ODT_SELFTEST",           runClipOdtSelftest,            false,
       "Clip ODT: linear Rec2020 RGBA64 premul output transform + ACES tonemap contract (10 gates)" },
+    { "silence-cut",      "VEDITOR_SILENCE_CUT_SELFTEST",        runSilenceCutSelftest,         false,
+      "SilenceCut RMS silence detection: keep/silence segmentation + consistency (9 gates)" },
     { "sns-fit",          "VEDITOR_SNS_FIT_SELFTEST",            runSnsFitSelftest,             false,
       "snsfit::containGeom/containInAspectCanvas pure geometry" },
     { "sns-cover",        "VEDITOR_SNS_COVER_SELFTEST",          runSnsCoverSelftest,           false,
