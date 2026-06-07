@@ -20,6 +20,7 @@ ContainGeom containGeom(const QSize& srcSize, double canvasAspect);
 QImage containInAspectCanvas(const QImage& src, double canvasAspect, bool smooth = true);
 CoverGeom coverGeom(const QSize& srcSize, double canvasAspect);
 QImage coverInAspectCanvas(const QImage& src, double canvasAspect, bool smooth = true);
+void containContentInset(QSize srcSize, QSize projOut, double& fw, double& fh);
 
 // TODO S2b: implement once fitContain is wired into ClipInfo/project output handling.
 bool shouldContain(bool fitContain, QSize projOutSize, QSize srcSize);

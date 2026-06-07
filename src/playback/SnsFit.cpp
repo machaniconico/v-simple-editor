@@ -122,6 +122,21 @@ QImage coverInAspectCanvas(const QImage& src, double canvasAspect, bool smooth)
     return out;
 }
 
+void containContentInset(QSize srcSize, QSize projOut, double& fw, double& fh)
+{
+    fw = 1.0;
+    fh = 1.0;
+    if (!projOut.isValid() || srcSize.width() <= 0 || srcSize.height() <= 0)
+        return;
+    const double srcA = double(srcSize.width()) / srcSize.height();
+    const double canA = double(projOut.width()) / projOut.height();
+    if (srcA > canA) {
+        fh = canA / srcA;
+    } else {
+        fw = srcA / canA;
+    }
+}
+
 bool shouldContain(bool fitContain, QSize projOutSize, QSize srcSize)
 {
     if (!fitContain)

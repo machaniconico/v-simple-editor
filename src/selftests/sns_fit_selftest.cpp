@@ -248,6 +248,44 @@ int runSnsFitSelftest()
               QStringLiteral("identityEqual=%1").arg(imageBytesEqual(src, out)));
     }
 
+    {
+        double fw = 0.0, fh = 0.0;
+        snsfit::containContentInset(QSize(1920, 1080), QSize(1080, 1920), fw, fh);
+        const double expected = (9.0 / 16.0) / (16.0 / 9.0);
+        check("G_CI1 16:9 src into 9:16 canvas insets vertical band",
+              std::fabs(fw - 1.0) < 0.001 && std::fabs(fh - expected) < 0.001,
+              QStringLiteral("fw=%1 fh=%2 expectedFh=%3")
+                  .arg(fw, 0, 'f', 6).arg(fh, 0, 'f', 6).arg(expected, 0, 'f', 6));
+    }
+
+    {
+        double fw = 0.0, fh = 0.0;
+        snsfit::containContentInset(QSize(1080, 1920), QSize(1920, 1080), fw, fh);
+        const double expected = (9.0 / 16.0) / (16.0 / 9.0);
+        check("G_CI2 9:16 src into 16:9 canvas insets horizontal band",
+              std::fabs(fh - 1.0) < 0.001 && std::fabs(fw - expected) < 0.001,
+              QStringLiteral("fw=%1 fh=%2 expectedFw=%3")
+                  .arg(fw, 0, 'f', 6).arg(fh, 0, 'f', 6).arg(expected, 0, 'f', 6));
+    }
+
+    {
+        double fw = 0.0, fh = 0.0;
+        snsfit::containContentInset(QSize(1920, 1080), QSize(1280, 720), fw, fh);
+        check("G_CI3 equal aspect keeps identity inset",
+              std::fabs(fw - 1.0) < 0.001 && std::fabs(fh - 1.0) < 0.001,
+              QStringLiteral("fw=%1 fh=%2")
+                  .arg(fw, 0, 'f', 6).arg(fh, 0, 'f', 6));
+    }
+
+    {
+        double fw = 0.0, fh = 0.0;
+        snsfit::containContentInset(QSize(0, 0), QSize(1080, 1920), fw, fh);
+        check("G_CI4 invalid zero source keeps identity inset",
+              std::fabs(fw - 1.0) < 0.001 && std::fabs(fh - 1.0) < 0.001,
+              QStringLiteral("fw=%1 fh=%2")
+                  .arg(fw, 0, 'f', 6).arg(fh, 0, 'f', 6));
+    }
+
     qInfo().noquote() << "[sns-fit] selftest done: passed=" << passed
                       << "failed=" << failed;
     return failed == 0 ? 0 : 1;

@@ -2544,6 +2544,17 @@ void GLPreview::setVideoSourceTransform(double scale, double dx, double dy)
     update();
 }
 
+void GLPreview::setVideoContentInset(double fw, double fh)
+{
+    const double nextFw = qBound(0.01, fw, 1.0);
+    const double nextFh = qBound(0.01, fh, 1.0);
+    if (m_contentInsetFw == nextFw && m_contentInsetFh == nextFh)
+        return;
+    m_contentInsetFw = nextFw;
+    m_contentInsetFh = nextFh;
+    update();
+}
+
 void GLPreview::resetVideoSourceTransform()
 {
     m_videoSourceScale = 1.0;
@@ -2574,8 +2585,9 @@ void GLPreview::setCompositeBakedMode(bool enabled)
 QRectF GLPreview::videoDisplayRectFor(double scale, double dx, double dy) const
 {
     const QRectF lb = letterboxRect();
-    const double w = lb.width() * scale;
-    const double h = lb.height() * scale;
+    // fw=fh=1: identical to original full-letterbox transform rect.
+    const double w = lb.width() * scale * m_contentInsetFw;
+    const double h = lb.height() * scale * m_contentInsetFh;
     const double cx = lb.x() + lb.width() / 2.0 + dx * lb.width();
     const double cy = lb.y() + lb.height() / 2.0 + dy * lb.height();
     return QRectF(cx - w / 2.0, cy - h / 2.0, w, h);
@@ -2956,15 +2968,18 @@ void GLPreview::mouseMoveEvent(QMouseEvent *event)
                 }
                 const double mouseDX = qAbs(event->pos().x() - anchor.x());
                 const double mouseDY = qAbs(event->pos().y() - anchor.y());
-                const double scaleFromX = mouseDX / lbw;
-                const double scaleFromY = mouseDY / lbh;
+                const double fw = qMax(0.01, m_contentInsetFw);
+                const double fh = qMax(0.01, m_contentInsetFh);
+                // fw=fh=1: identical to original mouseDX/lbw scale and lbw*scale size math.
+                const double scaleFromX = mouseDX / (lbw * fw);
+                const double scaleFromY = mouseDY / (lbh * fh);
                 double newScale = m_videoDragStartScale;
                 if (driveX && driveY) newScale = qMax(scaleFromX, scaleFromY);
                 else if (driveX)      newScale = scaleFromX;
                 else if (driveY)      newScale = scaleFromY;
                 newScale = qBound(0.1, newScale, 10.0);
-                const double newWpx = lbw * newScale;
-                const double newHpx = lbh * newScale;
+                const double newWpx = lbw * fw * newScale;
+                const double newHpx = lbh * fh * newScale;
                 QPointF newCenter = anchor;
                 switch (m_videoDragHandle) {
                     case HandleTL: newCenter = QPointF(anchor.x() - newWpx / 2.0, anchor.y() - newHpx / 2.0); break;

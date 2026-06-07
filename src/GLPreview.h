@@ -233,6 +233,7 @@ public:
     double videoSourceScale() const { return m_videoSourceScale; }
     double videoSourceDx()    const { return m_videoSourceDx; }
     double videoSourceDy()    const { return m_videoSourceDy; }
+    void setVideoContentInset(double fw, double fh);
     void resetVideoSourceTransform();
     // V3 sprint — Timeline-driven selection arms the handle-draw gate
     // (m_videoTransformSelected) without requiring a separate preview click.
@@ -359,6 +360,8 @@ private:
     double m_videoSourceScale = 1.0;
     double m_videoSourceDx = 0.0;
     double m_videoSourceDy = 0.0;
+    double m_contentInsetFw = 1.0;
+    double m_contentInsetFh = 1.0;
     bool m_compositeBakedMode = false;
     double m_snapStrength = 12.0;
     bool m_videoTransformSelected = false;

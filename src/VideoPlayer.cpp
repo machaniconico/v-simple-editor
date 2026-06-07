@@ -2072,6 +2072,14 @@ void VideoPlayer::displaySeekFrameConformed(const QImage &v1Image)
 
     const bool fitContain = entry ? entry->fitContain : false;
     const bool fitCover = entry ? entry->fitCover : false;
+    {
+        double insetFw = 1.0, insetFh = 1.0;
+        if (fitContain && !fitCover) {
+            snsfit::containContentInset(v1Image.size(), m_projectOutputSize, insetFw, insetFh);
+        }
+        if (m_glPreview)
+            m_glPreview->setVideoContentInset(insetFw, insetFh);
+    }
     QImage conformed = snsfit::maybeFit(v1Image, fitContain, fitCover, m_projectOutputSize);
 
     DecodedLayer layer;
@@ -3390,6 +3398,14 @@ void VideoPlayer::refreshDisplayedFrame()
                 layer.sequenceIdx = m_activeEntry;
                 layer.fitContain = e.fitContain;
                 layer.fitCover = e.fitCover;
+                {
+                    double insetFw = 1.0, insetFh = 1.0;
+                    if (layer.fitContain && !layer.fitCover) {
+                        snsfit::containContentInset(layer.rgb.size(), m_projectOutputSize, insetFw, insetFh);
+                    }
+                    if (m_glPreview)
+                        m_glPreview->setVideoContentInset(insetFw, insetFh);
+                }
                 layer.rgb = snsfit::maybeFit(layer.rgb, layer.fitContain, layer.fitCover, m_projectOutputSize);
                 QVector<DecodedLayer> singleLayer;
                 singleLayer.append(layer);
@@ -4088,8 +4104,17 @@ void VideoPlayer::handlePlaybackTick()
         // sub-assertion in main.cpp exercises the SAME comparator — a
         // re-inversion breaks the selftest.
         std::stable_sort(layers.begin(), layers.end(), clipstack::layerPaintOrderLess);
-        for (DecodedLayer &L : layers)
+        for (DecodedLayer &L : layers) {
+            {
+                double insetFw = 1.0, insetFh = 1.0;
+                if (L.fitContain && !L.fitCover) {
+                    snsfit::containContentInset(L.rgb.size(), m_projectOutputSize, insetFw, insetFh);
+                }
+                if (m_glPreview)
+                    m_glPreview->setVideoContentInset(insetFw, insetFh);
+            }
             L.rgb = snsfit::maybeFit(L.rgb, L.fitContain, L.fitCover, m_projectOutputSize);
+        }
         if (overlayPresent || m_projectOutputSize.isValid()) {
             // Reuse a canvas-sized scratch buffer so we don't allocate
             // ~8MB (1080p ARGB) every tick. Re-allocates only when the
