@@ -1,5 +1,6 @@
 #include "Timeline.h"
 #include "SilenceCut.h"
+#include "BeatDetect.h"
 #include "ThreePointEdit.h"
 #include "TrimOps.h"
 #include "TrackMatteKey.h"
@@ -3648,6 +3649,7 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     QAction *copyAct = menu.addAction(QStringLiteral("コピー"));
     QAction *deleteAct = menu.addAction(QStringLiteral("削除"));
     QAction *silenceCutAct = menu.addAction(QStringLiteral("無音を自動カット..."));
+    QAction *beatMarkerAct = menu.addAction(QStringLiteral("ビートでマーカー..."));
     menu.addSeparator();
     QAction *unlinkAct = menu.addAction(QStringLiteral("同期を切る"));
     unlinkAct->setEnabled(linkGroup > 0);
@@ -3832,6 +3834,74 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
         saveUndoState(QStringLiteral("Silence auto-cut"));
         emitSequenceChangedNow();
         emit positionChanged(m_playheadPos);
+    }
+    else if (chosen == beatMarkerAct) {
+        const QVector<ClipInfo> clips = track->clips();
+        if (clipIndex < 0 || clipIndex >= clips.size()) return;
+        const ClipInfo& src = clips[clipIndex];
+
+        QVector<float> samples;
+        int sr = 0;
+        if (!WaveformGenerator::decodeAudio(src.filePath, samples, sr) || samples.isEmpty() || sr <= 0) {
+            QMessageBox::warning(nullptr, QStringLiteral("ビートマーカー"),
+                                 QStringLiteral("音声のデコードに失敗しました。"));
+            return;
+        }
+
+        const double srcOut = (src.outPoint > 0.0) ? src.outPoint : src.duration;
+        const double totalSec = static_cast<double>(samples.size()) / sr;
+        const double activeStart = std::max(src.inPoint, 0.0);
+        const double activeEnd   = std::min(srcOut, totalSec);
+        if (activeEnd <= activeStart) {
+            QMessageBox::information(nullptr, QStringLiteral("ビートマーカー"),
+                                     QStringLiteral("有効な範囲がありません。"));
+            return;
+        }
+        const int startSample = static_cast<int>(activeStart * sr);
+        const int endSample   = static_cast<int>(activeEnd   * sr);
+        const QVector<float> activeSamples = samples.mid(startSample, endSample - startSample);
+
+        const beatdetect::Result beats =
+            beatdetect::detectBeats(activeSamples, sr, beatdetect::Config{});
+        if (beats.beatTimesSec.isEmpty()) {
+            QMessageBox::information(nullptr, QStringLiteral("ビートマーカー"),
+                                     QStringLiteral("ビートが検出されませんでした。"));
+            return;
+        }
+
+        // クリップのタイムライン開始秒 (ギャップレス配置: 先行クリップの
+        // leadInSec + effectiveDuration を累積 + 自身の leadInSec)。
+        double clipStartSec = 0.0;
+        for (int i = 0; i < clipIndex && i < clips.size(); ++i)
+            clipStartSec += clips[i].leadInSec + clips[i].effectiveDuration();
+        clipStartSec += src.leadInSec;
+        const double speed = (src.speed > 0.0) ? src.speed : 1.0;
+
+        const QString msg = QStringLiteral("%1 個のビート (推定 %2 BPM) をマーカーとして追加しますか?")
+                                .arg(beats.beatTimesSec.size())
+                                .arg(beats.bpm, 0, 'f', 1);
+        if (QMessageBox::question(nullptr, QStringLiteral("ビートマーカー"), msg)
+                != QMessageBox::Yes)
+            return;
+
+        // activeSamples は activeStart からの相対なので、ソース秒 = activeStart + b。
+        // タイムライン秒 = clipStartSec + (ソース秒 - src.inPoint)/speed。
+        const QColor beatColor(QStringLiteral("#39c0ff"));
+        int added = 0;
+        for (double b : beats.beatTimesSec) {
+            const double sourceSec = activeStart + b;
+            const double timelineSec = clipStartSec + (sourceSec - src.inPoint) / speed;
+            if (timelineSec < 0.0)
+                continue;
+            const qint64 timelineUs = static_cast<qint64>(timelineSec * 1.0e6);
+            addMarker(timelineUs,
+                      QStringLiteral("Beat %1").arg(added + 1),
+                      beatColor);
+            ++added;
+        }
+        saveUndoState(QStringLiteral("Beat markers"));
+        if (added > 0)
+            emit positionChanged(m_playheadPos);
     }
     else if (chosen == unlinkAct) unlinkClipGroup(linkGroup);
     else if (chosen == relinkAct) relinkClipAt(track, clipIndex);
