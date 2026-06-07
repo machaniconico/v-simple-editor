@@ -860,6 +860,25 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
         // around and the first compositor tick on the new clip flashes
         // the stale picture (paired with resetDecoder's clear).
         m_lastV1RawFrame = QImage();
+        // Defect-2 fix: 空タイムラインは黒プレビューでなければならない。
+        // 以前は m_lastSourceFrame が残り、GL プレビューも最後にアップロードした
+        // テクスチャを保持したままだった。直前の resetVideoSourceTransform() が
+        // アスペクト/コンテンツインセット補正を外すため、その stale テクスチャが
+        // アスペクト無視で引き伸ばし描画され、「undo で全クリップが消えたのに縦伸び
+        // 映像が再生され続ける」残像になっていた。source キャッシュをクリアし
+        // (refreshDisplayedFrame の null ガードで再描画を抑止)、GL プレビューを
+        // 黒フレームで上書きして stale 表示を断つ。可視トラックを全 OFF にした
+        // ケースでも「非表示 = 黒」で正しく、m_timelinePositionUs は不変。
+        m_lastSourceFrame = QImage();
+        if (m_glPreview) {
+            const QSize blankSize = m_projectOutputSize.isValid()
+                ? m_projectOutputSize
+                : QSize(m_canvasWidth  > 0 ? m_canvasWidth  : 16,
+                        m_canvasHeight > 0 ? m_canvasHeight : 16);
+            QImage blank(blankSize, QImage::Format_ARGB32_Premultiplied);
+            blank.fill(Qt::black);
+            m_glPreview->displayFrame(blank);
+        }
         undotrace::log("setSeq:exit");
         return;
     }

@@ -4888,6 +4888,18 @@ void MainWindow::applyLoadedProjectData(const ProjectData &data, const QString &
     // CC-4: 放送用クローズドキャプション (CEA-608/708) を復元 (SSOT)。
     m_broadcastCaption = data.broadcastCaption;
 
+    // Undo baseline: 読み込んだプロジェクトを新しい undo ベースラインにする。
+    // Timeline 構築時に積まれた "Initial state"(空タイムライン) が stack[0] の
+    // まま残ると、プロジェクトを開いた後の最初の undo がその空状態まで巻き戻り、
+    // 読み込んだ全クリップが消える(縦動画プリセット適用→直 undo でクリップ全消失の
+    // 真因)。restoreFromProject は setClips するだけで undo を積まないため、ここで
+    // 履歴をリセットし、Ctrl+Z が読み込み済みプロジェクトより前へ戻れないようにする。
+    if (m_timeline && m_timeline->undoManager()) {
+        m_timeline->undoManager()->clear();
+        m_timeline->undoManager()->saveState(m_timeline->currentState(),
+                                             QStringLiteral("Project loaded"));
+    }
+
     updateTitle();
     hideWelcomeScreen();
     updateStatusInfo();
