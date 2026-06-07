@@ -9472,6 +9472,11 @@ void MainWindow::openSocialExportDialog()
                         m_timeline->refreshPlaybackSequence();
                     }
 
+                    if (m_timeline)
+                        m_timeline->undoManager()->saveState(
+                            m_timeline->currentState(),
+                            QStringLiteral("Apply SNS preset"));
+
                     setWindowModified(true);
                     qInfo().noquote() << QStringLiteral(
                         "Social preset applied: preset=%1 res=%2x%3 fitV1Clips=%4 v2Added=%5")

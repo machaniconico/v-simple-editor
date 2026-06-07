@@ -3488,16 +3488,6 @@ void VideoPlayer::refreshDisplayedFrame()
             m_canvasWidth, m_canvasHeight,
             Qt::IgnoreAspectRatio, Qt::FastTransformation);
     }
-    // Defensive: if the conform branch above was skipped by any guard and m_lastSourceFrame
-    // is not yet project-sized, conforming via displaySeekFrameConformed prevents
-    // non-isotropic stretch in vertical projects.
-    // project-sized composite proxies (size == m_projectOutputSize) are not touched.
-    if (m_projectOutputSize.isValid()
-        && !m_lastSourceFrame.isNull()
-        && m_lastSourceFrame.size() != m_projectOutputSize) {
-        displaySeekFrameConformed(m_lastSourceFrame);
-        return;
-    }
     // This path displays a non-baked frame.
     m_lastFrameOdtApplied = false;
     displayFrame(m_lastSourceFrame);
