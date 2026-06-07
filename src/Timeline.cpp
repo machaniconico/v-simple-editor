@@ -3735,26 +3735,29 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     QAction *fxAct = menu.addAction(QStringLiteral("ビデオエフェクト..."));
     QAction *ccAct = menu.addAction(QStringLiteral("色補正 / グレーディング..."));
     menu.addSeparator();
-    QAction *snsFitAct = menu.addAction(QStringLiteral("SNS: 幅フィット中央(全表示)"));
-    QAction *snsFillAct = menu.addAction(QStringLiteral("SNS: 全画面に戻す"));
+    // SNS 縦動画フィット (相互排他の3択): 幅フィット=レターボックスで全表示 /
+    // 幅埋め=中央クロップで枠を歪みなく充填 / 解除=既定 (IgnoreAspectRatio で
+    // 枠に伸ばす)。fitContain と fitCover は engine 側 (snsfit::maybeFit) で
+    // cover 優先の相互排他なので、ここでも片方を立てたら他方は必ず倒す。
+    QAction *snsFitAct = menu.addAction(QStringLiteral("SNS: 幅フィット中央(全表示・レターボックス)"));
+    QAction *snsCoverAct = menu.addAction(QStringLiteral("SNS: 幅埋め(クロップ・歪みなし)"));
+    QAction *snsFillAct = menu.addAction(QStringLiteral("SNS: フィット解除(全画面)"));
 
     QAction *chosen = menu.exec(globalPos);
     if (!chosen) return;
-    auto applySnsFitMode = [&](bool enabled) {
+    auto applySnsFitMode = [&](bool contain, bool cover, const QString &undoLabel) {
         QVector<ClipInfo> clips = track->clips();
         if (clipIndex < 0 || clipIndex >= clips.size())
             return;
         ClipInfo &clip = clips[clipIndex];
-        clip.fitContain = enabled;
-        clip.fitCover = false;
+        clip.fitContain = contain;
+        clip.fitCover = cover;
         clip.videoScale = 1.0;
         clip.videoDx = 0.0;
         clip.videoDy = 0.0;
         clip.rotation2DDegrees = 0.0;
         track->setClips(clips);
-        saveUndoState(enabled
-            ? QStringLiteral("SNS width fit center")
-            : QStringLiteral("SNS restore fullscreen"));
+        saveUndoState(undoLabel);
         emitSequenceChangedNow();
         emit positionChanged(m_playheadPos);
     };
@@ -3763,8 +3766,9 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     else if (chosen == deleteAct) deleteSelectedClip();
     else if (chosen == unlinkAct) unlinkClipGroup(linkGroup);
     else if (chosen == relinkAct) relinkClipAt(track, clipIndex);
-    else if (chosen == snsFitAct) applySnsFitMode(true);
-    else if (chosen == snsFillAct) applySnsFitMode(false);
+    else if (chosen == snsFitAct) applySnsFitMode(true, false, QStringLiteral("SNS width fit center"));
+    else if (chosen == snsCoverAct) applySnsFitMode(false, true, QStringLiteral("SNS width fill crop"));
+    else if (chosen == snsFillAct) applySnsFitMode(false, false, QStringLiteral("SNS restore fullscreen"));
     else if (chosen == xdAct) {
         Transition t;
         t.type = TransitionType::CrossDissolve;
