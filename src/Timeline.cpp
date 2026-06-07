@@ -3596,14 +3596,21 @@ void Timeline::applySilenceCutToClip(TimelineTrack *track, int clipIndex)
         return;
     }
 
-    const int silenceCount = keeps.isEmpty() ? 0
-                             : static_cast<int>(keeps.size()) - 1;
+    const QVector<silencecut::Segment> silences =
+        silencecut::detectSilenceSegments(activeSamples, sr, silencecut::Config{});
+    const int silenceCount = static_cast<int>(silences.size());
     const QString msg = QStringLiteral("%1 箇所の無音を除去し、%2 個のクリップに分割します。実行しますか?")
-                            .arg(silenceCount < 0 ? 0 : silenceCount)
+                            .arg(silenceCount)
                             .arg(subClips.size());
     if (QMessageBox::question(nullptr, QStringLiteral("無音カット"), msg)
             != QMessageBox::Yes)
         return;
+
+    for (int i = 0; i < subClips.size(); ++i) {
+        if (i > 0)
+            subClips[i].leadInSec = 0.0;
+        subClips[i].linkGroup = allocateLinkGroup();
+    }
 
     QVector<ClipInfo> newClips = clips;
     newClips.removeAt(clipIndex);
