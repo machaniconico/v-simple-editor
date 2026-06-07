@@ -135,6 +135,7 @@ public:
     void setPreviewMaxLongSide(int px);
     int previewMaxLongSide() const { return m_previewMaxLongSide; }
     exposureaid::AidMode exposureAidMode() const { return m_exposureAidMode; }
+    safezone::Platform safeZonePlatform() const { return m_safeZonePlatform; }
     // Transient effect stack applied on top of every composed frame (live dialog preview).
     // Empty vector disables the path. Does not mutate timeline state.
     // live=true keeps CPU effects active during playback (committed state).

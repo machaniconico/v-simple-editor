@@ -1092,6 +1092,11 @@ void MainWindow::setupUI()
 
         // --- 表示系トグル (すべて表示専用・書き出し非変更) ---
         QMenu *szMenu = menu.addMenu(QStringLiteral("SNS セーフゾーン"));
+        auto *szGroup = new QActionGroup(&menu);
+        szGroup->setExclusive(true);
+        const safezone::Platform currentSafeZone = m_player
+            ? m_player->safeZonePlatform()
+            : safezone::Platform::None;
         const QPair<QString, safezone::Platform> szItems[] = {
             { QStringLiteral("なし"),               safezone::Platform::None },
             { QStringLiteral("TikTok"),             safezone::Platform::TikTok },
@@ -1101,11 +1106,20 @@ void MainWindow::setupUI()
         };
         for (const auto &it : szItems) {
             const safezone::Platform p = it.second;
-            connect(szMenu->addAction(it.first), &QAction::triggered, this,
+            QAction *act = szMenu->addAction(it.first);
+            act->setCheckable(true);
+            act->setChecked(p == currentSafeZone);
+            szGroup->addAction(act);
+            connect(act, &QAction::triggered, this,
                     [this, p]() { if (m_player) m_player->setSafeZonePlatform(p); });
         }
 
         QMenu *aidMenu = menu.addMenu(QStringLiteral("モニタリング (露出/フォーカス)"));
+        auto *aidGroup = new QActionGroup(&menu);
+        aidGroup->setExclusive(true);
+        const exposureaid::AidMode currentAid = m_player
+            ? m_player->exposureAidMode()
+            : exposureaid::AidMode::None;
         const QPair<QString, exposureaid::AidMode> aidItems[] = {
             { QStringLiteral("オフ"),               exposureaid::AidMode::None },
             { QStringLiteral("フォルスカラー"),     exposureaid::AidMode::FalseColor },
@@ -1114,11 +1128,18 @@ void MainWindow::setupUI()
         };
         for (const auto &it : aidItems) {
             const exposureaid::AidMode m = it.second;
-            connect(aidMenu->addAction(it.first), &QAction::triggered, this,
+            QAction *act = aidMenu->addAction(it.first);
+            act->setCheckable(true);
+            act->setChecked(m == currentAid);
+            aidGroup->addAction(act);
+            connect(act, &QAction::triggered, this,
                     [this, m]() { if (m_player) m_player->setExposureAidMode(m); });
         }
 
         QMenu *pqMenu = menu.addMenu(QStringLiteral("再生プレビュー品質"));
+        auto *pqGroup = new QActionGroup(&menu);
+        pqGroup->setExclusive(true);
+        const int currentProxyDivisor = m_player ? m_player->proxyDivisor() : 1;
         const QPair<QString, int> pqItems[] = {
             { QStringLiteral("フル解像度 (1x)"), 1 },
             { QStringLiteral("1/2 解像度 (2x)"), 2 },
@@ -1126,7 +1147,11 @@ void MainWindow::setupUI()
         };
         for (const auto &it : pqItems) {
             const int div = it.second;
-            connect(pqMenu->addAction(it.first), &QAction::triggered, this,
+            QAction *act = pqMenu->addAction(it.first);
+            act->setCheckable(true);
+            act->setChecked(div == currentProxyDivisor);
+            pqGroup->addAction(act);
+            connect(act, &QAction::triggered, this,
                     [this, div]() { if (m_player) m_player->setProxyDivisor(div); });
         }
 
