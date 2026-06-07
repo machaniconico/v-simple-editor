@@ -2212,9 +2212,14 @@ void VideoPlayer::displayFrame(const QImage &image)
     // TimelineFrameRenderer / RenderQueue / Exporter) はこの経路を通らないため、
     // エイドが書き出し画に焼き込まれることはない。displayFrame 1 回あたりの画像
     // 加工が 1 つ増えるだけで、displayFrame の発火回数は不変 (1 tick = 最大 1 frame)。
+    // 精度が必要なエッジ/輝度判定のためエイドは PV-C 縮小前の full res に適用し、
+    // aid=None + cap=0 の既定パスは従来どおり composed をそのまま表示へ渡す。
     QImage display = composed;
-    // PV-C: プレビュー最大解像度キャップ。display専用の一時コピーにだけ縮小を
-    // 掛け、GL アップロード/描画/エイド/スコープ前段の負荷を軽くする。
+    if (m_exposureAidMode != exposureaid::AidMode::None && !display.isNull()) {
+        display = exposureaid::apply(display, m_exposureAidMode, m_exposureAidConfig);
+    }
+    // PV-C: プレビュー最大解像度キャップ。エイド適用後の display 専用コピーにだけ
+    // 縮小を掛け、GL アップロード/描画/スコープ前段の負荷を軽くする。
     // m_currentFrameImage / frameComposited (上で full res 送出済) と書き出し
     // (renderFrameAt 系=この経路を通らない) は不変。0=無制限で従来ビット同一。
     if (m_previewMaxLongSide > 0 && !display.isNull()
@@ -2222,9 +2227,6 @@ void VideoPlayer::displayFrame(const QImage &image)
         display = (display.width() >= display.height())
             ? display.scaledToWidth(m_previewMaxLongSide, Qt::SmoothTransformation)
             : display.scaledToHeight(m_previewMaxLongSide, Qt::SmoothTransformation);
-    }
-    if (m_exposureAidMode != exposureaid::AidMode::None && !display.isNull()) {
-        display = exposureaid::apply(display, m_exposureAidMode, m_exposureAidConfig);
     }
     // SAFE-ZONE: SNS セーフゾーンオーバーレイ。display-local 適用のみ。export 非通過。
     if (m_safeZonePlatform != safezone::Platform::None && !display.isNull()) {
