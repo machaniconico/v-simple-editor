@@ -2,6 +2,7 @@
 #include "Overlay.h"
 #include "Timeline.h"
 #include "VideoPlayer.h"
+#include "UndoTrace.h"
 #include "AdjustmentLayer.h"
 #include "Camera3D.h"
 #include "SurfaceTool.h"
@@ -1123,7 +1124,9 @@ void GLPreview::cleanupGL()
     if (!context())
         return;
 
+    undotrace::log("gl:beforeMakeCurrent");
     makeCurrent();
+    undotrace::log("gl:afterMakeCurrent");
     releaseRegisteredTexturesLocked();
 #if defined(Q_OS_WIN)
     if (m_interopDevice) {
@@ -1301,7 +1304,9 @@ void GLPreview::setSharedD3D11Device(void *d3d11Device)
     // next paint reopens against the new device. close on the GL thread.
     if (m_interopDevice && d3d11Device != m_currentInteropD3D11Device) {
         if (context() && QOpenGLContext::currentContext() != context()) {
+            undotrace::log("gl:beforeMakeCurrent");
             makeCurrent();
+            undotrace::log("gl:afterMakeCurrent");
             releaseRegisteredTexturesLocked();
             if (gWglDXCloseDeviceNV)
                 gWglDXCloseDeviceNV(static_cast<HANDLE>(m_interopDevice));
@@ -1343,7 +1348,9 @@ void GLPreview::flushInteropCache()
 #if defined(Q_OS_WIN)
     if (!context())
         return;
+    undotrace::log("gl:beforeMakeCurrent");
     makeCurrent();
+    undotrace::log("gl:afterMakeCurrent");
     releaseRegisteredTexturesLocked();
     doneCurrent();
     m_pendingD3D11Texture = nullptr;
@@ -1555,8 +1562,10 @@ void GLPreview::resizeGL(int w, int h)
 
 void GLPreview::displayFrame(const QImage &frame)
 {
+    undotrace::log("gl:displayFrame:enter");
     if (frame.isNull()) {
         qWarning() << "GLPreview::displayFrame called with null image";
+        undotrace::log("gl:displayFrame:exit");
         return;
     }
     // US-INT-4: cache the source-frame dimensions so the stabilizer matrix
@@ -1608,12 +1617,14 @@ void GLPreview::displayFrame(const QImage &frame)
     }
     if (m_currentFrame.isNull()) {
         qWarning() << "GLPreview: convertToFormat returned null";
+        undotrace::log("gl:displayFrame:exit");
         return;
     }
     if (m_displayAspectRatio <= 0.0 && m_currentFrame.height() > 0)
         m_displayAspectRatio = static_cast<double>(m_currentFrame.width()) / m_currentFrame.height();
     m_needsUpload = true;
     update();
+    undotrace::log("gl:displayFrame:exit");
 }
 
 void GLPreview::setDisplayAspectRatio(double aspectRatio)
@@ -1799,6 +1810,7 @@ void GLPreview::renderPendingD3D11Frame()
 
 void GLPreview::paintGL()
 {
+    undotrace::log("gl:paintGL:enter");
     static int paintCount = 0;
     if (++paintCount <= 5 || (paintCount % 100) == 0) {
         qInfo() << "GLPreview::paintGL #" << paintCount
@@ -1818,11 +1830,15 @@ void GLPreview::paintGL()
 
     if (m_pendingD3D11Texture && m_interopAvailable) {
         renderPendingD3D11Frame();
+        undotrace::log("gl:paintGL:exit");
         return;
     }
 #endif
 
-    if (m_currentFrame.isNull()) return;
+    if (m_currentFrame.isNull()) {
+        undotrace::log("gl:paintGL:exit");
+        return;
+    }
 
     // glViewport expects PHYSICAL pixels, but QWidget::width()/height() are
     // LOGICAL (device-independent) pixels. On a high-DPI display with DPR=1.5
@@ -1935,6 +1951,7 @@ void GLPreview::paintGL()
         const int fh = uploadFrame.height();
         if (fw <= 0 || fh <= 0) {
             m_needsUpload = false;
+            undotrace::log("gl:paintGL:exit");
             return;
         }
 
@@ -2002,12 +2019,17 @@ void GLPreview::paintGL()
         const QOpenGLTexture::PixelType upPixType = is16
             ? QOpenGLTexture::UInt16
             : QOpenGLTexture::UInt8;
+        undotrace::log("gl:beforeUpload");
         m_texture->setData(0, 0, upPixFormat, upPixType,
                            static_cast<const void*>(uploadFrame.constBits()));
+        undotrace::log("gl:afterUpload");
         m_needsUpload = false;
     }
 
-    if (!m_texture || !m_program) return;
+    if (!m_texture || !m_program) {
+        undotrace::log("gl:paintGL:exit");
+        return;
+    }
 
     m_program->bind();
     m_texture->bind();
@@ -2504,6 +2526,7 @@ void GLPreview::paintGL()
         spainter.setRenderHint(QPainter::Antialiasing, true);
         m_surfaceTool->paintOverlay(spainter, letterboxRect());
     }
+    undotrace::log("gl:paintGL:exit");
 }
 
 QRectF GLPreview::letterboxRect() const
@@ -3261,7 +3284,9 @@ void GLPreview::setLut(const LutData &lut)
         return;
     }
 
+    undotrace::log("gl:beforeMakeCurrent");
     makeCurrent();
+    undotrace::log("gl:afterMakeCurrent");
 
     if (m_lutTexture) {
         delete m_lutTexture;
@@ -3346,7 +3371,9 @@ void GLPreview::setLutTexture(const QImage &lutGrid, float intensity)
         }
     }
 
+    undotrace::log("gl:beforeMakeCurrent");
     makeCurrent();
+    undotrace::log("gl:afterMakeCurrent");
 
     if (m_lutTexture) {
         delete m_lutTexture;
@@ -3719,7 +3746,9 @@ void GLPreview::setLiftGammaGain(const std::array<std::array<double,4>,3> &value
 
 void GLPreview::clearLut()
 {
+    undotrace::log("gl:beforeMakeCurrent");
     makeCurrent();
+    undotrace::log("gl:afterMakeCurrent");
     if (m_lutTexture) {
         delete m_lutTexture;
         m_lutTexture = nullptr;

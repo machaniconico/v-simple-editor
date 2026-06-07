@@ -115,6 +115,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/TrackMatteKey.h
     src/TrackMatteKey.cpp
     src/CodecDetector.cpp
+    src/UndoTrace.h
+    src/UndoTrace.cpp
     src/UndoManager.cpp
     src/Overlay.cpp
     src/OverlayDialogs.cpp

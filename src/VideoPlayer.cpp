@@ -1,6 +1,7 @@
 #include "VideoPlayer.h"
 #include <QSet>
 #include "GLPreview.h"
+#include "UndoTrace.h"
 #include "ProxyManager.h"
 #include "TextOverlayBake.h"   // textbake::bakeOverlays (shared text baker SSOT)
 #include "ClipGeometry.h"      // clipgeom::renderLayer (shared clip-placement SSOT)
@@ -555,6 +556,7 @@ void VideoPlayer::applyPlaybackQualityChanged()
 
 void VideoPlayer::loadFile(const QString &filePath)
 {
+    undotrace::log("loadFile:enter");
     qInfo() << "VideoPlayer::loadFile BEGIN" << filePath;
     // Audio is now driven by the independent A-track schedule via
     // setAudioSequence -> AudioMixer. loadFile only reloads the FFmpeg
@@ -570,16 +572,20 @@ void VideoPlayer::loadFile(const QString &filePath)
     if (avformat_open_input(&m_formatCtx, pathUtf8.constData(), nullptr, nullptr) != 0) {
         qWarning() << "avformat_open_input failed for" << filePath;
         m_videoDisplay->setText("Failed to open file");
+        undotrace::log("loadFile:exit");
         return;
     }
     qInfo() << "  avformat_open_input ok";
 
+    undotrace::log("loadFile:beforeFindStream");
     if (avformat_find_stream_info(m_formatCtx, nullptr) < 0) {
         qWarning() << "avformat_find_stream_info failed";
         resetDecoder();
         m_videoDisplay->setText("Failed to read stream info");
+        undotrace::log("loadFile:exit");
         return;
     }
+    undotrace::log("loadFile:afterFindStream");
     qInfo() << "  avformat_find_stream_info ok, nb_streams=" << m_formatCtx->nb_streams;
 
     m_videoStreamIndex = -1;
@@ -593,6 +599,7 @@ void VideoPlayer::loadFile(const QString &filePath)
     if (m_videoStreamIndex < 0) {
         resetDecoder();
         m_videoDisplay->setText("No video stream found");
+        undotrace::log("loadFile:exit");
         return;
     }
 
@@ -601,6 +608,7 @@ void VideoPlayer::loadFile(const QString &filePath)
     if (!codec) {
         resetDecoder();
         m_videoDisplay->setText("Unsupported codec");
+        undotrace::log("loadFile:exit");
         return;
     }
 
@@ -620,6 +628,7 @@ void VideoPlayer::loadFile(const QString &filePath)
     if (!m_codecCtx || avcodec_parameters_to_context(m_codecCtx, codecpar) < 0) {
         resetDecoder();
         m_videoDisplay->setText("Failed to initialize codec");
+        undotrace::log("loadFile:exit");
         return;
     }
 
@@ -628,9 +637,11 @@ void VideoPlayer::loadFile(const QString &filePath)
     // process-global and stateless between clips. Recreating it every
     // switch added ~22 ms of main-thread block per loadFile (debugger
     // breakdown of the 120 ms freeze on track switch).
+    undotrace::log("loadFile:beforeHwDevice");
     const bool hwDeviceReady = m_hwDeviceCtx
         || av_hwdevice_ctx_create(&m_hwDeviceCtx, AV_HWDEVICE_TYPE_D3D11VA,
                                    nullptr, nullptr, 0) >= 0;
+    undotrace::log("loadFile:afterHwDevice");
     if (hwDeviceReady) {
         for (int i = 0;; i++) {
             const AVCodecHWConfig *cfg = avcodec_get_hw_config(codec, i);
@@ -664,6 +675,7 @@ void VideoPlayer::loadFile(const QString &filePath)
     if (avcodec_open2(m_codecCtx, codec, nullptr) < 0) {
         resetDecoder();
         m_videoDisplay->setText("Failed to open codec");
+        undotrace::log("loadFile:exit");
         return;
     }
 
@@ -673,6 +685,7 @@ void VideoPlayer::loadFile(const QString &filePath)
     if (!m_packet || !m_frame || !m_swFrame) {
         resetDecoder();
         m_videoDisplay->setText("Failed to allocate decode buffers");
+        undotrace::log("loadFile:exit");
         return;
     }
     qInfo() << "  packet/frame allocated";
@@ -703,6 +716,7 @@ void VideoPlayer::loadFile(const QString &filePath)
         qWarning() << "seekInternal(0) failed";
         resetDecoder();
         m_videoDisplay->setText("Failed to decode first frame");
+        undotrace::log("loadFile:exit");
         return;
     }
     qInfo() << "  seekInternal(0) ok";
@@ -720,10 +734,12 @@ void VideoPlayer::loadFile(const QString &filePath)
 
     updatePositionUi();
     qInfo() << "VideoPlayer::loadFile END";
+    undotrace::log("loadFile:exit");
 }
 
 void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
 {
+    undotrace::log("setSeq:enter");
     qInfo() << "VideoPlayer::setSequence count=" << entries.size();
     // ADAPTIVE-1: タイムライン編集 / undo / クリップ変更はすべて setSequence に
     // 集約される (sequenceChanged → MainWindow → setSequence)。世代カウンタを進め、
@@ -844,6 +860,7 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
         // around and the first compositor tick on the new clip flashes
         // the stale picture (paired with resetDecoder's clear).
         m_lastV1RawFrame = QImage();
+        undotrace::log("setSeq:exit");
         return;
     }
 
@@ -908,7 +925,9 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
     if (needFileSwitch) {
         const bool prevRetain = m_retainLastFrameAcrossLoad;
         m_retainLastFrameAcrossLoad = true;   // preserve m_lastV1RawFrame during undo file-switch
+        undotrace::log("setSeq:beforeLoadFile");
         loadFile(target.filePath);  // resets decoder, clears m_playing
+        undotrace::log("setSeq:afterLoadFile");
         m_retainLastFrameAcrossLoad = prevRetain;
         if (wasPlaying)
             m_playing = true;
@@ -919,7 +938,9 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
 
     if (entryStructurallyChanged) {
         const int64_t localUs = entryLocalPositionUs(desiredIdx, clamped);
+        undotrace::log("setSeq:beforeSeek");
         seekInternal(localUs, true, true);
+        undotrace::log("setSeq:afterSeek");
     }
 
     // If a sequenceChanged arrived mid-playback (e.g. a linked-clip drag was
@@ -975,6 +996,7 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
             if (!m_playing && !m_sequence.isEmpty()) play();
         });
     }
+    undotrace::log("setSeq:exit");
 }
 
 void VideoPlayer::setAudioSequence(const QVector<PlaybackEntry> &entries)
@@ -2135,6 +2157,7 @@ void VideoPlayer::displaySeekFrameConformed(const QImage &v1Image)
 
 void VideoPlayer::displayFrame(const QImage &image)
 {
+    undotrace::log("displayFrame:enter");
     m_lastSourceFrame = image;
     QImage composed = composeFrameWithOverlays(image);
 
@@ -2283,7 +2306,9 @@ void VideoPlayer::displayFrame(const QImage &image)
         } else {
             m_glPreview->setStabilizerKeyframes({});
         }
+        undotrace::log("displayFrame:beforeGL");
         m_glPreview->displayFrame(display);
+        undotrace::log("displayFrame:afterGL");
     } else {
         const QSize targetSize = fittedDisplaySize(m_videoDisplay->size());
         const QPixmap pixmap = QPixmap::fromImage(display);
@@ -3093,6 +3118,7 @@ void VideoPlayer::updatePositionUi()
 
 bool VideoPlayer::seekInternal(int64_t positionUs, bool displayFrame, bool precise)
 {
+    undotrace::log("seek:enter");
     if (!m_formatCtx || !m_codecCtx || m_videoStreamIndex < 0)
         return false;
 
@@ -3112,11 +3138,14 @@ bool VideoPlayer::seekInternal(int64_t positionUs, bool displayFrame, bool preci
     }
 
     bool foundFrame = false;
+    undotrace::log("seek:beforeDecodeLoop");
     while (decodeNextFrame(false)) {
+        undotrace::log("seek:decodeIter");
         foundFrame = true;
         if (!precise || m_currentPositionUs >= targetUs)
             break;
     }
+    undotrace::log("seek:afterDecodeLoop");
 
     if (foundFrame && m_frame) {
         AVFrame *displayable = ensureSwFrame(m_frame);
@@ -3416,12 +3445,14 @@ QSize VideoPlayer::fittedDisplaySize(const QSize &bounds) const
 
 void VideoPlayer::refreshDisplayedFrame()
 {
+    undotrace::log("refresh:enter");
     // Use the raw source cache, NOT m_currentFrameImage — the latter is
     // already composited, so re-running composeFrameWithOverlays on it
     // would burn the overlays in twice (visible as duplicated text when
     // an existing overlay is selected and setTextOverlays re-pushes).
     if (m_lastSourceFrame.isNull())
         return;
+    undotrace::log("refresh:conform");
     if (m_projectOutputSize.isValid()
         && sequenceActive()
         && !m_lastV1RawFrame.isNull()
@@ -3490,6 +3521,7 @@ void VideoPlayer::refreshDisplayedFrame()
     }
     // This path displays a non-baked frame.
     m_lastFrameOdtApplied = false;
+    undotrace::log("refresh:fallthrough");
     displayFrame(m_lastSourceFrame);
 }
 

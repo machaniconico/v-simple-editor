@@ -1,6 +1,7 @@
 #include "MainWindow.h"
 #include "VideoPlayer.h"
 #include "Timeline.h"
+#include "UndoTrace.h"
 
 // AR-2: レガシー Exporter 経路へ ACES 色管理パイプラインを渡すフリー関数。実体は
 // Exporter.cpp に TU ローカル状態とともに定義 (Exporter.h は touchedFiles 外のため
@@ -1345,6 +1346,7 @@ void MainWindow::setupUI()
         // プロキシの両方をこの 1 箇所で適用する。書き出し経路はここを通らない。
         resolvePreviewProxies(resolved, true);
         qInfo() << "MainWindow: forwarding sequenceChanged entries=" << resolved.size();
+        undotrace::log("mw:beforeSetSequence");
         m_player->setSequence(resolved);
         // US-INT-2 Phase A: gather per-entry speed ramps in lockstep with
         // setSequence. Key by (sourceTrack, sourceClipIndex) — positional

@@ -5,6 +5,7 @@
 #include "TrimOps.h"
 #include "TrackMatteKey.h"
 #include "ProxyManager.h"
+#include "UndoTrace.h"
 #include "UndoManager.h"
 #include "AudioMixer.h"
 #include "OverlayDialogs.h"
@@ -2225,8 +2226,10 @@ void Timeline::emitSequenceChangedNow()
 {
     // Direct emit — never call scheduleEmitSequenceChanged() here, that
     // would restart the debounce timer and recurse.
+    undotrace::log("emitSeqNow:enter");
     emit sequenceChanged(computePlaybackSequence());
     emit audioSequenceChanged(computeAudioPlaybackSequence());
+    undotrace::log("emitSeqNow:exit");
 }
 
 void Timeline::setupUI()
@@ -4079,6 +4082,7 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
 
 void Timeline::undo()
 {
+    undotrace::log("undo:enter");
     if (!canUndo()) return;
     restoreState(m_undoManager->undo());
     updateInfoLabel();
@@ -5777,6 +5781,7 @@ TimelineState Timeline::currentState() const
 
 void Timeline::restoreState(const TimelineState &state)
 {
+    undotrace::log("restoreState:enter");
     // Make sure the editor has at least as many rows as the snapshot. We
     // only ADD here — never remove — because deleting a track widget
     // mid-undo invalidates pointers other UI code may already hold (the
@@ -5866,6 +5871,7 @@ void Timeline::restoreState(const TimelineState &state)
     // VideoPlayer rebuilds its sequence after undo/redo.
     scheduleEmitSequenceChanged();
     scheduleEmitSequenceChanged();
+    undotrace::log("restoreState:exit");
 }
 
 // --- Project save/load ---
