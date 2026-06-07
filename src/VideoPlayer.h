@@ -131,6 +131,9 @@ public:
     void setExposureAidMode(exposureaid::AidMode mode);
     void setExposureAidConfig(const exposureaid::AidConfig &cfg);
     void setSafeZonePlatform(safezone::Platform p);  // SAFE-ZONE
+    // PV-C: プレビュー表示の長辺上限(px)。0=無制限。display専用(書き出し非変更)。
+    void setPreviewMaxLongSide(int px);
+    int previewMaxLongSide() const { return m_previewMaxLongSide; }
     exposureaid::AidMode exposureAidMode() const { return m_exposureAidMode; }
     // Transient effect stack applied on top of every composed frame (live dialog preview).
     // Empty vector disables the path. Does not mutate timeline state.
@@ -675,6 +678,7 @@ private:
     // 保持フレーム / 書き出しには非適用)。
     exposureaid::AidMode m_exposureAidMode = exposureaid::AidMode::None;
     safezone::Platform m_safeZonePlatform = safezone::Platform::None;  // SAFE-ZONE
+    int m_previewMaxLongSide = 0;  // PV-C: 0=無制限。display専用の長辺上限。
     exposureaid::AidConfig m_exposureAidConfig;
 
     // ---- ADAPTIVE-1: アダプティブプレビュー (品質ポリシー + 合成キャッシュ) --------

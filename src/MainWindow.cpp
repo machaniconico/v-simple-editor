@@ -1887,6 +1887,39 @@ void MainWindow::setupMenuBar()
         m_menuHelpEntries.append({szAct, QString::fromUtf8(szEntry.help)});
     }
 
+    // PV-C: プレビュー最大解像度。重い高解像度素材で GL アップロード/描画/
+    // スコープ負荷を下げる display 専用キャップ(書き出し非変更)。QSettings 永続。
+    viewMenu->addSeparator();
+    auto *prMenu = viewMenu->addMenu(QStringLiteral("プレビュー最大解像度(&R)"));
+    auto *prGroup = new QActionGroup(this);
+    prGroup->setExclusive(true);
+    const QPair<QString, int> prItems[] = {
+        { QStringLiteral("無制限"),  0 },
+        { QStringLiteral("1920px"), 1920 },
+        { QStringLiteral("1280px"), 1280 },
+        { QStringLiteral("960px"),  960 },
+    };
+    {
+        QSettings prSettings;
+        const int savedCap = prSettings.value(QStringLiteral("preview/maxLongSide"), 0).toInt();
+        if (m_player)
+            m_player->setPreviewMaxLongSide(savedCap);
+        for (const auto &it : prItems) {
+            QAction *act = prMenu->addAction(it.first);
+            act->setCheckable(true);
+            act->setChecked(it.second == savedCap);
+            prGroup->addAction(act);
+            const int cap = it.second;
+            connect(act, &QAction::triggered, this, [this, cap]() {
+                if (m_player) m_player->setPreviewMaxLongSide(cap);
+                QSettings s;
+                s.setValue(QStringLiteral("preview/maxLongSide"), cap);
+            });
+            m_menuHelpEntries.append({act, QStringLiteral(
+                "プレビュー表示の長辺をこの上限に縮小し、高解像度素材の再生負荷を軽くします。書き出しには影響しません。")});
+        }
+    }
+
         // トラック メニュー
     auto *trackMenu = menuBar()->addMenu("トラック(&T)");
 

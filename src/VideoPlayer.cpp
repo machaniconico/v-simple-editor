@@ -2213,6 +2213,16 @@ void VideoPlayer::displayFrame(const QImage &image)
     // エイドが書き出し画に焼き込まれることはない。displayFrame 1 回あたりの画像
     // 加工が 1 つ増えるだけで、displayFrame の発火回数は不変 (1 tick = 最大 1 frame)。
     QImage display = composed;
+    // PV-C: プレビュー最大解像度キャップ。display専用の一時コピーにだけ縮小を
+    // 掛け、GL アップロード/描画/エイド/スコープ前段の負荷を軽くする。
+    // m_currentFrameImage / frameComposited (上で full res 送出済) と書き出し
+    // (renderFrameAt 系=この経路を通らない) は不変。0=無制限で従来ビット同一。
+    if (m_previewMaxLongSide > 0 && !display.isNull()
+        && qMax(display.width(), display.height()) > m_previewMaxLongSide) {
+        display = (display.width() >= display.height())
+            ? display.scaledToWidth(m_previewMaxLongSide, Qt::SmoothTransformation)
+            : display.scaledToHeight(m_previewMaxLongSide, Qt::SmoothTransformation);
+    }
     if (m_exposureAidMode != exposureaid::AidMode::None && !display.isNull()) {
         display = exposureaid::apply(display, m_exposureAidMode, m_exposureAidConfig);
     }
@@ -2487,6 +2497,16 @@ void VideoPlayer::setExposureAidMode(exposureaid::AidMode mode)
     if (m_exposureAidMode == mode)
         return;
     m_exposureAidMode = mode;
+    refreshDisplayedFrame();
+}
+
+void VideoPlayer::setPreviewMaxLongSide(int px)
+{
+    // PV-C: 0=無制限。負値は 0 に丸める。変化時のみ現在フレームを再描画。
+    const int next = (px > 0) ? px : 0;
+    if (m_previewMaxLongSide == next)
+        return;
+    m_previewMaxLongSide = next;
     refreshDisplayedFrame();
 }
 
