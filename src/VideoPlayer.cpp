@@ -2205,6 +2205,10 @@ void VideoPlayer::displayFrame(const QImage &image)
     if (m_exposureAidMode != exposureaid::AidMode::None && !display.isNull()) {
         display = exposureaid::apply(display, m_exposureAidMode, m_exposureAidConfig);
     }
+    // SAFE-ZONE: SNS セーフゾーンオーバーレイ。display-local 適用のみ。export 非通過。
+    if (m_safeZonePlatform != safezone::Platform::None && !display.isNull()) {
+        display = safezone::apply(display, m_safeZonePlatform);
+    }
 
     if (m_useGL && m_glPreview) {
         m_glPreview->setDisplayAspectRatio(effectiveDisplayAspectRatio());
@@ -2472,6 +2476,17 @@ void VideoPlayer::setExposureAidMode(exposureaid::AidMode mode)
     if (m_exposureAidMode == mode)
         return;
     m_exposureAidMode = mode;
+    refreshDisplayedFrame();
+}
+
+void VideoPlayer::setSafeZonePlatform(safezone::Platform p)
+{
+    // SAFE-ZONE: SNS セーフゾーンオーバーレイのプラットフォームを切り替える。
+    // 実際の描画は displayFrame が表示直前に「表示用 QImage の一時コピー」へ行う
+    // (キャッシュ / 保持フレーム / 書き出しには非適用)。
+    if (m_safeZonePlatform == p)
+        return;
+    m_safeZonePlatform = p;
     refreshDisplayedFrame();
 }
 

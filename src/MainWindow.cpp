@@ -236,6 +236,7 @@ void exporter_setAcesPipeline(const aces::AcesPipeline &pipeline);
 #include <QDebug>
 #include <QActionGroup>
 #include "ExposureAids.h"  // EXP-AID: 露出/フォーカス確認エイド (プレビュー表示専用)
+#include "SafeZone.h"      // SAFE-ZONE: SNS セーフゾーンオーバーレイ (プレビュー表示専用)
 #include <QSignalBlocker>
 #include <QStackedWidget>
 #include <QLineEdit>
@@ -1772,7 +1773,45 @@ void MainWindow::setupMenuBar()
         m_menuHelpEntries.append({act, QString::fromUtf8(entry.help)});
     }
 
-    // トラック メニュー
+    // SAFE-ZONE: SNS セーフゾーン/プラットフォーム UI ガイドのプレビュー表示専用オーバーレイ。
+    // 選択を VideoPlayer::setSafeZonePlatform に流す。書き出しには焼き込まれない。
+    viewMenu->addSeparator();
+    auto *szMenu = viewMenu->addMenu(QStringLiteral("SNS セーフゾーン(&S)"));
+    auto *szGroup = new QActionGroup(this);
+    szGroup->setExclusive(true);
+
+    struct SzMenuEntry {
+        const char *label;
+        safezone::Platform platform;
+        const char *help;
+    };
+    const SzMenuEntry szEntries[] = {
+        { "なし(&O)", safezone::Platform::None,
+          "SNS セーフゾーンオーバーレイを使わない通常表示に戻します。" },
+        { "TikTok(&T)", safezone::Platform::TikTok,
+          "TikTok のキャプション帯・右側アクション列・上部 UI 領域を半透明赤で表示します。書き出しには焼き込まれません。" },
+        { "Instagram Reels(&I)", safezone::Platform::InstagramReels,
+          "Instagram Reels の UI 被さり領域をガイド表示します。書き出しには焼き込まれません。" },
+        { "YouTube Shorts(&Y)", safezone::Platform::YouTubeShorts,
+          "YouTube Shorts の UI 被さり領域をガイド表示します。書き出しには焼き込まれません。" },
+        { "汎用(&G)", safezone::Platform::Generic,
+          "プラットフォーム汎用のタイトルセーフ/アクションセーフ枠のみ表示します。書き出しには焼き込まれません。" },
+    };
+    for (const auto &szEntry : szEntries) {
+        QAction *szAct = szMenu->addAction(QString::fromUtf8(szEntry.label));
+        szAct->setCheckable(true);
+        if (szEntry.platform == safezone::Platform::None)
+            szAct->setChecked(true);  // 既定はなし (従来出力とビット同一)
+        szGroup->addAction(szAct);
+        const safezone::Platform platform = szEntry.platform;
+        connect(szAct, &QAction::triggered, this, [this, platform]() {
+            if (m_player)
+                m_player->setSafeZonePlatform(platform);
+        });
+        m_menuHelpEntries.append({szAct, QString::fromUtf8(szEntry.help)});
+    }
+
+        // トラック メニュー
     auto *trackMenu = menuBar()->addMenu("トラック(&T)");
 
     auto *addVTrack = trackMenu->addAction("ビデオトラックを追加(&V)");

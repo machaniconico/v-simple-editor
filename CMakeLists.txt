@@ -167,6 +167,9 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/audio_bus_selftest.cpp
     src/selftests/atempo_resolve_selftest.cpp
     src/selftests/silence_cut_selftest.cpp
+    src/selftests/safe_zone_selftest.cpp
+    src/SafeZone.h
+    src/SafeZone.cpp
     src/selftests/subtitle_karaoke_selftest.cpp
     # SP (スペクトル編集): iZotope RX 風 STFT/iSTFT 純粋エンジン + スペクトログラム UI。
     src/SpectralEngine.h

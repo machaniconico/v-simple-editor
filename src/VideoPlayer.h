@@ -23,6 +23,7 @@
 #include "DecoderSlotManager.h"
 #include "AcesColor.h"  // AR-2: ACES シーンリファード色管理パイプライン (SSOT は MainWindow)
 #include "ExposureAids.h"  // EXP-AID: 露出/フォーカス確認エイド (プレビュー表示専用)
+#include "SafeZone.h"      // SAFE-ZONE: SNS セーフゾーンオーバーレイ (プレビュー表示専用)
 #include "playback/CompositeFrameCache.h"     // ADAPTIVE-1: 合成フレーム LRU キャッシュ
 #include "playback/PlaybackQualityPolicy.h"   // ADAPTIVE-1: 再生品質ヒステリシスポリシー
 #include "playback/GpuLayerCompositor.h"      // STAGE3-GPU: マルチトラック GPU 合成 (既定 OFF)
@@ -129,6 +130,7 @@ public:
     // フレームを即再描画する。
     void setExposureAidMode(exposureaid::AidMode mode);
     void setExposureAidConfig(const exposureaid::AidConfig &cfg);
+    void setSafeZonePlatform(safezone::Platform p);  // SAFE-ZONE
     exposureaid::AidMode exposureAidMode() const { return m_exposureAidMode; }
     // Transient effect stack applied on top of every composed frame (live dialog preview).
     // Empty vector disables the path. Does not mutate timeline state.
@@ -669,6 +671,7 @@ private:
     // displayFrame 内の 1 箇所で表示用 QImage の一時コピーへ適用する (キャッシュ /
     // 保持フレーム / 書き出しには非適用)。
     exposureaid::AidMode m_exposureAidMode = exposureaid::AidMode::None;
+    safezone::Platform m_safeZonePlatform = safezone::Platform::None;  // SAFE-ZONE
     exposureaid::AidConfig m_exposureAidConfig;
 
     // ---- ADAPTIVE-1: アダプティブプレビュー (品質ポリシー + 合成キャッシュ) --------

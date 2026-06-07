@@ -89,6 +89,7 @@ int runRenderQueueAcesDecisionSelftest();
 int runRenderQueueFpsRationalSelftest();
 int runShortcutSelftest();
 int runSilenceCutSelftest();
+int runSafeZoneSelftest();
 int runSmartEditSelftest();
 int runSnsCoverSelftest();
 int runSnsFitSelftest();
@@ -239,6 +240,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Clip ODT: linear Rec2020 RGBA64 premul output transform + ACES tonemap contract (10 gates)" },
     { "silence-cut",      "VEDITOR_SILENCE_CUT_SELFTEST",        runSilenceCutSelftest,         false,
       "SilenceCut RMS silence detection: keep/silence segmentation + consistency (9 gates)" },
+    { "safe-zone",        "VEDITOR_SAFE_ZONE_SELFTEST",           runSafeZoneSelftest,           false,
+      "SafeZone: SNS platform UI guide rects + apply display-local overlay (9 gates)" },
     { "subtitle-karaoke", "VEDITOR_SUBTITLE_KARAOKE_SELFTEST",    runSubtitleKaraokeSelftest,    false,
       "SubtitleKaraoke: active word half-open interval + spoken count boundaries (8 gates)" },
     { "sns-fit",          "VEDITOR_SNS_FIT_SELFTEST",            runSnsFitSelftest,             false,
