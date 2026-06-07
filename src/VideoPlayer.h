@@ -437,6 +437,7 @@ public:
         double rotation2DDegrees = 0.0;
         int sourceTrack = 0;
         int sequenceIdx = -1;
+        bool fitContain = false;
         bool isFresh = true;
         // STAGE4B (live GPU track-matte): consumed by tryGpuComposeLayers when
         // VEDITOR_GPU_COMPOSITE is ON and GL is available (else matte-free).

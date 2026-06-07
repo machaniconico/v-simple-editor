@@ -3734,14 +3734,36 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
 
     QAction *fxAct = menu.addAction(QStringLiteral("ビデオエフェクト..."));
     QAction *ccAct = menu.addAction(QStringLiteral("色補正 / グレーディング..."));
+    menu.addSeparator();
+    QAction *snsFitAct = menu.addAction(QStringLiteral("SNS: 幅フィット中央(全表示)"));
+    QAction *snsFillAct = menu.addAction(QStringLiteral("SNS: 全画面に戻す"));
 
     QAction *chosen = menu.exec(globalPos);
     if (!chosen) return;
+    auto applySnsFitMode = [&](bool enabled) {
+        QVector<ClipInfo> clips = track->clips();
+        if (clipIndex < 0 || clipIndex >= clips.size())
+            return;
+        ClipInfo &clip = clips[clipIndex];
+        clip.fitContain = enabled;
+        clip.videoScale = 1.0;
+        clip.videoDx = 0.0;
+        clip.videoDy = 0.0;
+        clip.rotation2DDegrees = 0.0;
+        track->setClips(clips);
+        saveUndoState(enabled
+            ? QStringLiteral("SNS width fit center")
+            : QStringLiteral("SNS restore fullscreen"));
+        emitSequenceChangedNow();
+        emit positionChanged(m_playheadPos);
+    };
     if (chosen == cutAct) cutSelectedClip();
     else if (chosen == copyAct) copySelectedClip();
     else if (chosen == deleteAct) deleteSelectedClip();
     else if (chosen == unlinkAct) unlinkClipGroup(linkGroup);
     else if (chosen == relinkAct) relinkClipAt(track, clipIndex);
+    else if (chosen == snsFitAct) applySnsFitMode(true);
+    else if (chosen == snsFillAct) applySnsFitMode(false);
     else if (chosen == xdAct) {
         Transition t;
         t.type = TransitionType::CrossDissolve;
@@ -5230,6 +5252,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         double videoDy = 0.0;
         double rotation2DDegrees = 0.0;
         double opacity = 1.0;
+        bool fitContain = false;
         clipcolor::ColorMeta colorMeta;
         double volume = 1.0;
         QVector<AudioGainPoint> volumeEnvelope;
@@ -5272,6 +5295,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
                 iv.videoDy = c.videoDy;
                 iv.rotation2DDegrees = c.rotation2DDegrees;
                 iv.opacity = c.opacity;
+                iv.fitContain = c.fitContain;
                 iv.colorMeta = c.colorMeta;
                 iv.volume = c.volume;
                 iv.volumeEnvelope = c.volumeEnvelope;
@@ -5405,6 +5429,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         e.videoDy = iv.videoDy;
         e.rotation2DDegrees = iv.rotation2DDegrees;
         e.opacity = iv.opacity;
+        e.fitContain = iv.fitContain;
         e.colorMeta = iv.colorMeta;
         e.volume = iv.volume;
         e.volumeEnvelope = iv.volumeEnvelope;

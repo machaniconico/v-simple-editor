@@ -1780,6 +1780,21 @@ void MainWindow::setupMenuBar()
     m_menuHelpEntries.append({addVTrack,
         QStringLiteral("映像を重ねるための「段」を増やします。上の段ほど手前（前面）に表示されます。")});
 
+    auto *addSnsBgTrack = trackMenu->addAction(QStringLiteral("SNS: 背景トラックを追加"));
+    connect(addSnsBgTrack, &QAction::triggered, this, [this]() {
+        if (!m_timeline)
+            return;
+        const bool created = m_timeline->videoTrackCount() < 2;
+        if (created)
+            m_timeline->addVideoTrack();
+        statusBar()->showMessage(created
+            ? QStringLiteral("SNS背景: V2を追加しました。画像/動画をV2にドロップしてください。")
+            : QStringLiteral("SNS背景: V2は既にあります。画像/動画をV2にドロップしてください。"),
+            5000);
+    });
+    m_menuHelpEntries.append({addSnsBgTrack,
+        QStringLiteral("SNS縦動画用の背景段としてV2を用意します。背景素材は手動でV2へ配置します。")});
+
     auto *addATrack = trackMenu->addAction("オーディオトラックを追加(&A)");
     connect(addATrack, &QAction::triggered, this, &MainWindow::addAudioTrack);
     m_menuHelpEntries.append({addATrack,

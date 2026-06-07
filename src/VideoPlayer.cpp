@@ -12,6 +12,7 @@
 #include "playback/hdroverlay_flag.h"
 #include "playback/idtgpu_flag.h"   // Stage9-GPU-IDT Story2: VEDITOR_HDR_IDT_GPU
 #include "playback/PixFmtDepth.h"   // pixfmtdepth::bitDepthFromPixFmt (null-safe per-component depth)
+#include "playback/SnsFit.h"
 #include "playback/TlrCompose16.h"
 #include "playback/HdrCompositeMath.h"
 #include "color/ClipColorTransform.h"
@@ -3326,6 +3327,8 @@ void VideoPlayer::refreshDisplayedFrame()
                 layer.rotation2DDegrees = e.rotation2DDegrees;
                 layer.sourceTrack = e.sourceTrack;
                 layer.sequenceIdx = m_activeEntry;
+                layer.fitContain = e.fitContain;
+                layer.rgb = snsfit::maybeContain(layer.rgb, layer.fitContain, m_projectOutputSize);
                 QVector<DecodedLayer> singleLayer;
                 singleLayer.append(layer);
                 composeMultiTrackFrameInto(canvas, singleLayer);
@@ -3904,6 +3907,7 @@ void VideoPlayer::handlePlaybackTick()
                     layer.rotation2DDegrees = e.rotation2DDegrees;
                     layer.sourceTrack = e.sourceTrack;
                     layer.sequenceIdx = idx;
+                    layer.fitContain = e.fitContain;
                     // STAGE4B: carry the live track-matte assignment from the
                     // PlaybackEntry. matteTypeOrdinal MIRRORS TrackMatteType
                     // ordinals (0=None..4=LumaInverted); matteSourceClipId is the
@@ -3995,6 +3999,7 @@ void VideoPlayer::handlePlaybackTick()
                 layer.rotation2DDegrees = e.rotation2DDegrees;
                 layer.sourceTrack = e.sourceTrack;
                 layer.sequenceIdx = idx;
+                layer.fitContain = e.fitContain;
                 // STAGE4B: mirror the threaded active-layer path and
                 // finalizeOverlayFromDecoder so serial ticks carry matte data too.
                 layer.matteType = static_cast<TrackMatteType>(e.matteTypeOrdinal);
@@ -4019,6 +4024,8 @@ void VideoPlayer::handlePlaybackTick()
         // sub-assertion in main.cpp exercises the SAME comparator — a
         // re-inversion breaks the selftest.
         std::stable_sort(layers.begin(), layers.end(), clipstack::layerPaintOrderLess);
+        for (DecodedLayer &L : layers)
+            L.rgb = snsfit::maybeContain(L.rgb, L.fitContain, m_projectOutputSize);
         if (overlayPresent || m_projectOutputSize.isValid()) {
             // Reuse a canvas-sized scratch buffer so we don't allocate
             // ~8MB (1080p ARGB) every tick. Re-allocates only when the
@@ -5506,6 +5513,7 @@ bool VideoPlayer::finalizeOverlayFromDecoder(const PlaybackEntry &e, int seqIdx,
     out->rotation2DDegrees  = e.rotation2DDegrees;
     out->sourceTrack        = e.sourceTrack;
     out->sequenceIdx        = seqIdx;
+    out->fitContain         = e.fitContain;
     // STAGE4B: carry the live track-matte assignment (see V1 build site). Ordinal
     // mirrors TrackMatteType; matteSourceIndex resolved later in
     // tryGpuComposeLayers against the final inputs vector.
