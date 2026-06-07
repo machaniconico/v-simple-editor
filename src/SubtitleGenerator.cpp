@@ -230,6 +230,8 @@ void SubtitleGenerator::runWhisper(const QString &audioPath, const WhisperConfig
         // whisper.cpp main binary
         args << "-f" << audioPath;
         args << "--output-json";
+        if (config.wordTimestamps)
+            args << "--output-json-full";
         args << "-of" << (m_tempDir + "/result");
         if (!config.modelPath.isEmpty())
             args << "-m" << config.modelPath;
@@ -409,6 +411,33 @@ QVector<SubtitleSegment> SubtitleGenerator::parseWhisperOutput(const QString &js
             // Convert log probability to rough 0-1 confidence
             double logprob = obj["avg_logprob"].toDouble();
             seg.confidence = qBound(0.0, std::exp(logprob), 1.0);
+        }
+
+        if (obj.contains("words") && obj["words"].isArray()) {
+            QJsonArray words = obj["words"].toArray();
+            for (const QJsonValue &wordVal : words) {
+                QJsonObject wordObj = wordVal.toObject();
+                const bool hasText = wordObj.contains("word") || wordObj.contains("text");
+                const bool hasStart = wordObj.contains("start") || wordObj.contains("t0");
+                const bool hasEnd = wordObj.contains("end") || wordObj.contains("t1");
+                if (!hasText || !hasStart || !hasEnd)
+                    continue;
+
+                SubtitleWord word;
+                word.text = wordObj.contains("word")
+                    ? wordObj["word"].toString().trimmed()
+                    : wordObj["text"].toString().trimmed();
+                if (word.text.isEmpty())
+                    continue;
+
+                word.startTime = wordObj.contains("start")
+                    ? wordObj["start"].toDouble()
+                    : wordObj["t0"].toDouble();
+                word.endTime = wordObj.contains("end")
+                    ? wordObj["end"].toDouble()
+                    : wordObj["t1"].toDouble();
+                seg.words.append(word);
+            }
         }
 
         if (!seg.text.isEmpty())

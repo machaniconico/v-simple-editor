@@ -38,6 +38,8 @@ CaptionEditorDialog::CaptionEditorDialog(QWidget* parent)
 
     m_track = caption::Track{};
     m_style = caption::defaultStyle();
+    m_subtitleStyle = SubtitleStyle{};
+    syncSubtitleStyleFromCaptionStyle();
 
     // ===================== 左パネル =====================
     // クリップテーブル
@@ -147,6 +149,13 @@ CaptionEditorDialog::CaptionEditorDialog(QWidget* parent)
     bgRow->addWidget(m_bgCheck);
     bgRow->addWidget(m_bgColorButton, 1);
 
+    m_karaokeCheck = new QCheckBox(tr("カラオケ強調（現在の語をハイライト）"), this);
+    m_karaokeColorButton = new QPushButton(this);
+
+    auto* karaokeRow = new QHBoxLayout;
+    karaokeRow->addWidget(m_karaokeCheck);
+    karaokeRow->addWidget(m_karaokeColorButton, 1);
+
     m_anchorCombo = new QComboBox(this);
     m_anchorCombo->addItems(caption::anchorNames());
 
@@ -157,6 +166,7 @@ CaptionEditorDialog::CaptionEditorDialog(QWidget* parent)
     styleForm->addRow(tr("文字色:"),        m_textColorButton);
     styleForm->addRow(tr("縁取り色/太さ:"), outlineRow);
     styleForm->addRow(tr("背景:"),          bgRow);
+    styleForm->addRow(tr("カラオケ:"),      karaokeRow);
     styleForm->addRow(tr("位置:"),          m_anchorCombo);
 
     auto* styleGroup = new QGroupBox(tr("スタイル"), this);
@@ -206,6 +216,7 @@ CaptionEditorDialog::CaptionEditorDialog(QWidget* parent)
     connect(m_outlineWidthSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
             this, [this](double) { onStyleChanged(); });
     connect(m_bgCheck,    &QCheckBox::toggled, this, [this](bool) { onStyleChanged(); });
+    connect(m_karaokeCheck, &QCheckBox::toggled, this, [this](bool) { onStyleChanged(); });
     connect(m_anchorCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, [this](int) { onStyleChanged(); });
 
@@ -237,8 +248,22 @@ CaptionEditorDialog::CaptionEditorDialog(QWidget* parent)
             onStyleChanged();
         }
     });
+    connect(m_karaokeColorButton, &QPushButton::clicked, this, [this]() {
+        QColor c = QColorDialog::getColor(m_subtitleStyle.karaokeHighlightColor,
+                                          this,
+                                          tr("カラオケ強調色を選択"));
+        if (c.isValid()) {
+            m_subtitleStyle.karaokeHighlightColor = c;
+            m_karaokeColorButton->setStyleSheet(
+                QStringLiteral("background-color: %1").arg(c.name()));
+            onStyleChanged();
+        }
+    });
 
-    connect(m_buttonBox, &QDialogButtonBox::accepted, this, &QDialog::accept);
+    connect(m_buttonBox, &QDialogButtonBox::accepted, this, [this]() {
+        onStyleChanged();
+        accept();
+    });
     connect(m_buttonBox, &QDialogButtonBox::rejected, this, &QDialog::reject);
 
     // 初期状態
@@ -269,14 +294,43 @@ caption::Track CaptionEditorDialog::track() const
 void CaptionEditorDialog::setStyle(const caption::Style& style)
 {
     m_style = style;
+    syncSubtitleStyleFromCaptionStyle();
     updateStyleControls();
     updatePreview();
     emit styleChanged(m_style);
+    emit subtitleStyleChanged(m_subtitleStyle);
 }
 
 caption::Style CaptionEditorDialog::style() const
 {
     return m_style;
+}
+
+void CaptionEditorDialog::setSubtitleStyle(const SubtitleStyle& style)
+{
+    m_subtitleStyle = style;
+
+    m_style.fontFamily = style.font.family();
+    const int pointSize = style.font.pointSize();
+    if (pointSize > 0)
+        m_style.fontSizePt = pointSize;
+    m_style.bold = style.font.bold();
+    m_style.italic = style.font.italic();
+    m_style.textColor = style.color;
+    m_style.outlineColor = style.outlineColor;
+    m_style.outlineThickness = style.outlineWidth;
+    m_style.background = style.boxEnabled;
+    m_style.backgroundColor = style.boxColor;
+
+    updateStyleControls();
+    updatePreview();
+    emit styleChanged(m_style);
+    emit subtitleStyleChanged(m_subtitleStyle);
+}
+
+SubtitleStyle CaptionEditorDialog::subtitleStyle() const
+{
+    return m_subtitleStyle;
 }
 
 // ---------------------------------------------------------------------------
@@ -490,8 +544,12 @@ void CaptionEditorDialog::onStyleChanged()
     m_style.background       = m_bgCheck->isChecked();
     m_style.anchor           = caption::anchorFromString(m_anchorCombo->currentText());
 
+    syncSubtitleStyleFromCaptionStyle();
+    m_subtitleStyle.karaokeEnabled = m_karaokeCheck->isChecked();
+
     updatePreview();
     emit styleChanged(m_style);
+    emit subtitleStyleChanged(m_subtitleStyle);
 }
 
 // ---------------------------------------------------------------------------
@@ -559,6 +617,8 @@ void CaptionEditorDialog::updateStyleControls()
     QSignalBlocker b5(m_outlineWidthSpin);
     QSignalBlocker b6(m_bgCheck);
     QSignalBlocker b7(m_anchorCombo);
+    QSignalBlocker b8(m_karaokeCheck);
+    QSignalBlocker b9(m_karaokeColorButton);
 
     QFont f(m_style.fontFamily);
     m_fontCombo->setCurrentFont(f);
@@ -567,6 +627,7 @@ void CaptionEditorDialog::updateStyleControls()
     m_italicCheck->setChecked(m_style.italic);
     m_outlineWidthSpin->setValue(m_style.outlineThickness);
     m_bgCheck->setChecked(m_style.background);
+    m_karaokeCheck->setChecked(m_subtitleStyle.karaokeEnabled);
 
     const QString anchorStr = caption::anchorToString(m_style.anchor);
     const int anchorIdx = m_anchorCombo->findText(anchorStr);
@@ -579,6 +640,22 @@ void CaptionEditorDialog::updateStyleControls()
         QStringLiteral("background-color: %1").arg(m_style.outlineColor.name()));
     m_bgColorButton->setStyleSheet(
         QStringLiteral("background-color: %1").arg(m_style.backgroundColor.name()));
+    m_karaokeColorButton->setStyleSheet(
+        QStringLiteral("background-color: %1").arg(m_subtitleStyle.karaokeHighlightColor.name()));
+}
+
+void CaptionEditorDialog::syncSubtitleStyleFromCaptionStyle()
+{
+    QFont font(m_style.fontFamily, m_style.fontSizePt);
+    font.setBold(m_style.bold);
+    font.setItalic(m_style.italic);
+
+    m_subtitleStyle.font = font;
+    m_subtitleStyle.color = m_style.textColor;
+    m_subtitleStyle.outlineColor = m_style.outlineColor;
+    m_subtitleStyle.outlineWidth = m_style.outlineThickness;
+    m_subtitleStyle.boxEnabled = m_style.background;
+    m_subtitleStyle.boxColor = m_style.backgroundColor;
 }
 
 // ---------------------------------------------------------------------------
