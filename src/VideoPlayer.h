@@ -577,6 +577,7 @@ private:
     int m_canvasWidth = 1920;
     int m_canvasHeight = 1080;
     QSize m_projectOutputSize;
+    bool m_pendingSizeRefresh = false;
     double m_playbackSpeed = 1.0;
     QImage m_currentFrameImage;
     int m_pendingSeekMs = -1;

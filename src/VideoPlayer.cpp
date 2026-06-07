@@ -906,7 +906,10 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
             << "m_activeEntry(before)=" << m_activeEntry;
 
     if (needFileSwitch) {
+        const bool prevRetain = m_retainLastFrameAcrossLoad;
+        m_retainLastFrameAcrossLoad = true;   // preserve m_lastV1RawFrame during undo file-switch
         loadFile(target.filePath);  // resets decoder, clears m_playing
+        m_retainLastFrameAcrossLoad = prevRetain;
         if (wasPlaying)
             m_playing = true;
     }
@@ -1514,7 +1517,17 @@ void VideoPlayer::setCanvasSize(int width, int height)
         m_videoDisplay->setText(QString("%1x%2 %3\nDrop a video file or use File > Open")
             .arg(width).arg(height).arg(orientation));
     } else {
-        refreshDisplayedFrame();
+        if (m_projectOutputSize.isValid()) {
+            if (!m_pendingSizeRefresh) {
+                m_pendingSizeRefresh = true;
+                QTimer::singleShot(0, this, [this]() {
+                    m_pendingSizeRefresh = false;
+                    refreshDisplayedFrame();
+                });
+            }
+        } else {
+            refreshDisplayedFrame();   // default project: synchronous, bit-identical
+        }
     }
 }
 
@@ -1528,7 +1541,17 @@ void VideoPlayer::setProjectOutputSize(const QSize &size)
         m_glPreview->setDisplayAspectRatio(
             m_projectOutputSize.isValid() ? effectiveDisplayAspectRatio()
                                           : m_displayAspectRatio);
-    refreshDisplayedFrame();
+    if (m_projectOutputSize.isValid()) {
+        if (!m_pendingSizeRefresh) {
+            m_pendingSizeRefresh = true;
+            QTimer::singleShot(0, this, [this]() {
+                m_pendingSizeRefresh = false;
+                refreshDisplayedFrame();
+            });
+        }
+    } else {
+        refreshDisplayedFrame();   // default project: synchronous, bit-identical
+    }
 }
 
 void VideoPlayer::play()
@@ -3464,6 +3487,16 @@ void VideoPlayer::refreshDisplayedFrame()
         m_lastSourceFrame = m_lastSourceFrame.scaled(
             m_canvasWidth, m_canvasHeight,
             Qt::IgnoreAspectRatio, Qt::FastTransformation);
+    }
+    // Defensive: if the conform branch above was skipped by any guard and m_lastSourceFrame
+    // is not yet project-sized, conforming via displaySeekFrameConformed prevents
+    // non-isotropic stretch in vertical projects.
+    // project-sized composite proxies (size == m_projectOutputSize) are not touched.
+    if (m_projectOutputSize.isValid()
+        && !m_lastSourceFrame.isNull()
+        && m_lastSourceFrame.size() != m_projectOutputSize) {
+        displaySeekFrameConformed(m_lastSourceFrame);
+        return;
     }
     // This path displays a non-baked frame.
     m_lastFrameOdtApplied = false;
