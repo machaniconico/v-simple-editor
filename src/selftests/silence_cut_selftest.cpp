@@ -281,6 +281,78 @@ int runSilenceCutSelftest()
                   .arg(badRateSilence.size()));
     }
 
+    {
+        ClipInfo src;
+        src.inPoint = 0.0;
+        src.outPoint = 0.0;
+        src.duration = 10.0;
+        src.speed = 1.0;
+        src.filePath = QStringLiteral("test.mp4");
+        const QVector<silencecut::Segment> keeps = { { 1.0, 3.0 }, { 5.0, 8.0 } };
+        const QVector<ClipInfo> subs = silencecut::planKeepClips(src, keeps);
+        check("G10 planKeepClips basic",
+              subs.size() == 2
+                  && subs[0].inPoint == 1.0
+                  && subs[0].outPoint == 3.0
+                  && subs[1].inPoint == 5.0
+                  && subs[1].outPoint == 8.0
+                  && subs[0].filePath == src.filePath
+                  && subs[0].speed == src.speed,
+              QStringLiteral("subCount=%1 first=[%2,%3] second=[%4,%5] fileCopied=%6 speedCopied=%7")
+                  .arg(subs.size())
+                  .arg(subs.size() > 0 ? subs[0].inPoint : -1.0, 0, 'f', 6)
+                  .arg(subs.size() > 0 ? subs[0].outPoint : -1.0, 0, 'f', 6)
+                  .arg(subs.size() > 1 ? subs[1].inPoint : -1.0, 0, 'f', 6)
+                  .arg(subs.size() > 1 ? subs[1].outPoint : -1.0, 0, 'f', 6)
+                  .arg(subs.size() > 0 && subs[0].filePath == src.filePath)
+                  .arg(subs.size() > 0 && subs[0].speed == src.speed));
+    }
+
+    {
+        ClipInfo src2;
+        src2.inPoint = 2.0;
+        src2.outPoint = 12.0;
+        src2.duration = 20.0;
+        src2.speed = 1.0;
+        src2.filePath = QStringLiteral("test2.mp4");
+        const QVector<silencecut::Segment> keeps2 = { { 0.0, 3.0 } };
+        const QVector<ClipInfo> subs2 = silencecut::planKeepClips(src2, keeps2);
+        check("G11 planKeepClips applies inPoint offset",
+              subs2.size() == 1
+                  && subs2[0].inPoint == 2.0
+                  && subs2[0].outPoint == 5.0,
+              QStringLiteral("subCount=%1 first=[%2,%3]")
+                  .arg(subs2.size())
+                  .arg(subs2.size() > 0 ? subs2[0].inPoint : -1.0, 0, 'f', 6)
+                  .arg(subs2.size() > 0 ? subs2[0].outPoint : -1.0, 0, 'f', 6));
+    }
+
+    {
+        ClipInfo src3;
+        src3.inPoint = 0.0;
+        src3.outPoint = 5.0;
+        src3.duration = 10.0;
+        src3.speed = 1.0;
+        src3.filePath = QStringLiteral("test3.mp4");
+        const QVector<silencecut::Segment> outOfRange = { { 6.0, 8.0 } };
+        const QVector<ClipInfo> subs3 = silencecut::planKeepClips(src3, outOfRange);
+        const QVector<ClipInfo> subs4 = silencecut::planKeepClips(src3, {});
+        const QVector<silencecut::Segment> overrun = { { 3.0, 9.0 } };
+        const QVector<ClipInfo> subs5 = silencecut::planKeepClips(src3, overrun);
+        check("G12 planKeepClips clamps and discards empty ranges",
+              subs3.isEmpty()
+                  && subs4.isEmpty()
+                  && subs5.size() == 1
+                  && subs5[0].inPoint == 3.0
+                  && subs5[0].outPoint == 5.0,
+              QStringLiteral("outOfRange=%1 empty=%2 overrunCount=%3 overrun=[%4,%5]")
+                  .arg(subs3.size())
+                  .arg(subs4.size())
+                  .arg(subs5.size())
+                  .arg(subs5.size() > 0 ? subs5[0].inPoint : -1.0, 0, 'f', 6)
+                  .arg(subs5.size() > 0 ? subs5[0].outPoint : -1.0, 0, 'f', 6));
+    }
+
     qInfo().noquote() << "[silence-cut] selftest done: passed=" << passed
                       << "failed=" << failed;
     return failed == 0 ? 0 : 1;

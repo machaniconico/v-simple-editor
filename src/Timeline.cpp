@@ -1,4 +1,5 @@
 #include "Timeline.h"
+#include "SilenceCut.h"
 #include "ThreePointEdit.h"
 #include "TrimOps.h"
 #include "TrackMatteKey.h"
@@ -6,12 +7,14 @@
 #include "UndoManager.h"
 #include "AudioMixer.h"
 #include "OverlayDialogs.h"
+#include "WaveformGenerator.h"
 #include "color/ClipColor.h"
 #include "playback/HdrIngestProbe.h"
 #include "playback/hdringest_flag.h"
 #include "playback/PixFmtDepth.h"
 
 #include <algorithm>
+#include <QMessageBox>
 
 // STAGE4B: PlaybackEntry::matteTypeOrdinal stores TrackMatteType as a plain int
 // (PlaybackTypes.h must stay MaskSystem.h-free). This is the SSOT populate site
@@ -3644,6 +3647,7 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     QAction *cutAct = menu.addAction(QStringLiteral("カット"));
     QAction *copyAct = menu.addAction(QStringLiteral("コピー"));
     QAction *deleteAct = menu.addAction(QStringLiteral("削除"));
+    QAction *silenceCutAct = menu.addAction(QStringLiteral("無音を自動カット..."));
     menu.addSeparator();
     QAction *unlinkAct = menu.addAction(QStringLiteral("同期を切る"));
     unlinkAct->setEnabled(linkGroup > 0);
@@ -3764,6 +3768,71 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     if (chosen == cutAct) cutSelectedClip();
     else if (chosen == copyAct) copySelectedClip();
     else if (chosen == deleteAct) deleteSelectedClip();
+    else if (chosen == silenceCutAct) {
+        QVector<ClipInfo> clips = track->clips();
+        if (clipIndex < 0 || clipIndex >= clips.size()) return;
+        const ClipInfo& src = clips[clipIndex];
+
+        QVector<float> samples;
+        int sr = 0;
+        if (!WaveformGenerator::decodeAudio(src.filePath, samples, sr) || samples.isEmpty() || sr <= 0) {
+            QMessageBox::warning(nullptr, QStringLiteral("無音カット"),
+                                 QStringLiteral("音声のデコードに失敗しました。"));
+            return;
+        }
+
+        // The current full-buffer helper returns no samples; the FFmpeg decode
+        // paths in WaveformGenerator resample to mono when samples are produced.
+        const double srcOut = (src.outPoint > 0.0) ? src.outPoint : src.duration;
+        const double totalSec = static_cast<double>(samples.size()) / sr;
+        const double activeStart = std::max(src.inPoint, 0.0);
+        const double activeEnd   = std::min(srcOut, totalSec);
+        if (activeEnd <= activeStart) {
+            QMessageBox::information(nullptr, QStringLiteral("無音カット"),
+                                     QStringLiteral("有効な範囲がありません。"));
+            return;
+        }
+        const int startSample = static_cast<int>(activeStart * sr);
+        const int endSample   = static_cast<int>(activeEnd   * sr);
+        QVector<float> activeSamples = samples.mid(startSample, endSample - startSample);
+
+        QVector<silencecut::Segment> keeps =
+            silencecut::detectKeepSegments(activeSamples, sr, silencecut::Config{});
+
+        QVector<ClipInfo> subClips = silencecut::planKeepClips(src, keeps);
+
+        if (subClips.isEmpty()) {
+            QMessageBox::information(nullptr, QStringLiteral("無音カット"),
+                                     QStringLiteral("カットする無音が見つかりませんでした。"));
+            return;
+        }
+        if (subClips.size() == 1
+            && qAbs(subClips[0].inPoint  - src.inPoint) < 0.01
+            && qAbs(subClips[0].outPoint - srcOut)      < 0.01) {
+            QMessageBox::information(nullptr, QStringLiteral("無音カット"),
+                                     QStringLiteral("カットする無音がありません。"));
+            return;
+        }
+
+        const int silenceCount = keeps.isEmpty() ? 0
+                                 : static_cast<int>(keeps.size()) - 1;
+        const QString msg = QStringLiteral("%1 箇所の無音を除去し、%2 個のクリップに分割します。実行しますか?")
+                                .arg(silenceCount < 0 ? 0 : silenceCount)
+                                .arg(subClips.size());
+        if (QMessageBox::question(nullptr, QStringLiteral("無音カット"), msg)
+                != QMessageBox::Yes)
+            return;
+
+        QVector<ClipInfo> newClips = clips;
+        newClips.removeAt(clipIndex);
+        for (int i = 0; i < subClips.size(); ++i)
+            newClips.insert(clipIndex + i, subClips[i]);
+
+        track->setClips(newClips);
+        saveUndoState(QStringLiteral("Silence auto-cut"));
+        emitSequenceChangedNow();
+        emit positionChanged(m_playheadPos);
+    }
     else if (chosen == unlinkAct) unlinkClipGroup(linkGroup);
     else if (chosen == relinkAct) relinkClipAt(track, clipIndex);
     else if (chosen == snsFitAct) applySnsFitMode(true, false, QStringLiteral("SNS width fit center"));

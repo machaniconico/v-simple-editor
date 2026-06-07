@@ -113,6 +113,31 @@ QVector<Segment> finalKeepSegments(const QVector<float>& samples, int sampleRate
 
 } // namespace
 
+QVector<ClipInfo> planKeepClips(const ClipInfo& src,
+                                const QVector<Segment>& keepsActiveSec)
+{
+    if (keepsActiveSec.isEmpty())
+        return {};
+
+    const double srcOut = (src.outPoint > 0.0) ? src.outPoint : src.duration;
+    QVector<ClipInfo> result;
+    result.reserve(keepsActiveSec.size());
+
+    for (const Segment& k : keepsActiveSec) {
+        double absIn  = src.inPoint + k.startSec;
+        double absOut = src.inPoint + k.endSec;
+        absIn  = std::max(absIn,  src.inPoint);
+        absOut = std::min(absOut, srcOut);
+        if (absOut <= absIn)
+            continue;
+        ClipInfo c = src;
+        c.inPoint  = absIn;
+        c.outPoint = absOut;
+        result.append(c);
+    }
+    return result;
+}
+
 QVector<Segment> detectKeepSegments(const QVector<float>& samples, int sampleRate, const Config& cfg)
 {
     return finalKeepSegments(samples, sampleRate, cfg);
