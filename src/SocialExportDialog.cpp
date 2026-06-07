@@ -118,7 +118,7 @@ SocialExportDialog::SocialExportDialog(QWidget* parent)
     // -----------------------------------------------------------------------
     m_buttonBox = new QDialogButtonBox(
         QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
-    m_buttonBox->button(QDialogButtonBox::Ok)->setText(tr("エクスポート…"));
+    m_buttonBox->button(QDialogButtonBox::Ok)->setText(tr("プロジェクトに適用"));
 
     // -----------------------------------------------------------------------
     // メインレイアウト

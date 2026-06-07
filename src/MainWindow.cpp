@@ -9238,32 +9238,86 @@ void MainWindow::onShowCredentialDialog()
     m_credentialDialog->activateWindow();
 }
 
-// US-SC2-B: Sprint 13 — open / raise the SNS 向けエクスポート dialog
-// (modeless; preset と reframe 設定をユーザが行い、exportRequested 受信で
-//  実 export 連携は後続スプリントで実装予定)。
+// US-SC2-B/S3 — open / raise the SNS 向けプロジェクト適用 dialog.
 void MainWindow::openSocialExportDialog()
 {
     if (!m_socialExportDialog) {
         m_socialExportDialog = new SocialExportDialog(this);
         m_socialExportDialog->setObjectName(QStringLiteral("socialExportDialog"));
-        // TODO: 現在の preview frame (GLPreview / VideoPlayer) との連携は
-        //       後続スプリント。getCurrentFrame() 等が整備され次第
-        //       m_socialExportDialog->setSampleFrame(sample) を呼ぶ。
         connect(m_socialExportDialog, &SocialExportDialog::exportRequested,
                 this, [this](const social::Preset& preset,
                              const reframe::ReframeParams& reframeParams) {
-                    // 暫定: ログ出力 + status bar 通知のみ。実 export 連携は今後。
+                    Q_UNUSED(reframeParams);
+
+                    const QSize targetSize = preset.resolution;
+                    if (targetSize.width() <= 0 || targetSize.height() <= 0) {
+                        QMessageBox::warning(
+                            this,
+                            QStringLiteral("SNS プリセット"),
+                            QStringLiteral("選択されたプリセットの解像度が不正です。"));
+                        return;
+                    }
+
+                    ProjectConfig config = m_projectConfig;
+                    config.width = targetSize.width();
+                    config.height = targetSize.height();
+                    config.explicitOutputResolution = true;
+                    applyProjectConfig(config);
+
+                    int fitClipCount = 0;
+                    bool changedV1 = false;
+                    if (m_timeline && !m_timeline->videoTracks().isEmpty()) {
+                        TimelineTrack *v1 = m_timeline->videoTracks().value(0, nullptr);
+                        if (v1) {
+                            QVector<ClipInfo> clips = v1->clips();
+                            for (ClipInfo &clip : clips) {
+                                ++fitClipCount;
+                                if (!clip.fitContain
+                                    || !qFuzzyCompare(clip.videoScale, 1.0)
+                                    || !qFuzzyIsNull(clip.videoDx)
+                                    || !qFuzzyIsNull(clip.videoDy)
+                                    || !qFuzzyIsNull(clip.rotation2DDegrees)) {
+                                    changedV1 = true;
+                                }
+                                clip.fitContain = true;
+                                clip.videoScale = 1.0;
+                                clip.videoDx = 0.0;
+                                clip.videoDy = 0.0;
+                                clip.rotation2DDegrees = 0.0;
+                            }
+                            if (changedV1)
+                                v1->setClips(clips);
+                        }
+                    }
+
+                    bool addedV2 = false;
+                    if (m_timeline) {
+                        if (m_timeline->videoTrackCount() < 2) {
+                            addVideoTrack();
+                            addedV2 = true;
+                        }
+                        m_timeline->refreshPlaybackSequence();
+                    }
+
+                    setWindowModified(true);
                     qInfo().noquote() << QStringLiteral(
-                        "SocialExport requested: preset=%1 res=%2x%3 mode=%4")
+                        "Social preset applied: preset=%1 res=%2x%3 fitV1Clips=%4 v2Added=%5")
                         .arg(preset.displayName)
-                        .arg(preset.resolution.width())
-                        .arg(preset.resolution.height())
-                        .arg(reframe::modeDisplayName(reframeParams.mode));
+                        .arg(targetSize.width())
+                        .arg(targetSize.height())
+                        .arg(fitClipCount)
+                        .arg(addedV2);
+
+                    const QString guidance = QStringLiteral(
+                        "プロジェクトを %1x%2 に設定しました。書き出しは通常の書き出しでOKです。V2トラックに背景素材をドロップしてください。")
+                        .arg(targetSize.width())
+                        .arg(targetSize.height());
+                    QMessageBox::information(
+                        this,
+                        QStringLiteral("SNS プリセット"),
+                        guidance);
                     if (statusBar()) {
-                        statusBar()->showMessage(
-                            QStringLiteral("%1 へエクスポート (近日実装予定)")
-                                .arg(preset.displayName),
-                            5000);
+                        statusBar()->showMessage(guidance, 7000);
                     }
                 });
     }
