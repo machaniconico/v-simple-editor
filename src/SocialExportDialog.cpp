@@ -4,10 +4,7 @@
 #include <QDialogButtonBox>
 #include <QFormLayout>
 #include <QGroupBox>
-#include <QHBoxLayout>
 #include <QLabel>
-#include <QPalette>
-#include <QPixmap>
 #include <QPushButton>
 #include <QSlider>
 #include <QVBoxLayout>
@@ -20,7 +17,7 @@ SocialExportDialog::SocialExportDialog(QWidget* parent)
 {
     setObjectName(QStringLiteral("socialExportDialog"));
     setWindowTitle(tr("SNS 向けエクスポート"));
-    resize(720, 540);
+    resize(560, 360);
 
     // -----------------------------------------------------------------------
     // プリセット選択
@@ -74,46 +71,6 @@ SocialExportDialog::SocialExportDialog(QWidget* parent)
     reframeForm->addRow(QString(),       m_zoomLabel);
 
     // -----------------------------------------------------------------------
-    // プレビュー (左: 元動画、右: 出力)
-    // -----------------------------------------------------------------------
-    auto* srcColumn = new QVBoxLayout;
-    auto* srcTitle = new QLabel(tr("元動画"), this);
-    srcTitle->setAlignment(Qt::AlignCenter);
-    m_sourcePreviewLabel = new QLabel(tr("プレビューなし"), this);
-    m_sourcePreviewLabel->setFixedSize(320, 180);
-    m_sourcePreviewLabel->setAlignment(Qt::AlignCenter);
-    {
-        QPalette pp = m_sourcePreviewLabel->palette();
-        pp.setColor(QPalette::Window, Qt::black);
-        pp.setColor(QPalette::WindowText, Qt::white);
-        m_sourcePreviewLabel->setPalette(pp);
-        m_sourcePreviewLabel->setAutoFillBackground(true);
-    }
-    srcColumn->addWidget(srcTitle);
-    srcColumn->addWidget(m_sourcePreviewLabel);
-
-    auto* outColumn = new QVBoxLayout;
-    auto* outTitle = new QLabel(tr("出力"), this);
-    outTitle->setAlignment(Qt::AlignCenter);
-    m_previewLabel = new QLabel(tr("プレビューなし"), this);
-    m_previewLabel->setFixedSize(200, 356);
-    m_previewLabel->setAlignment(Qt::AlignCenter);
-    {
-        QPalette pp = m_previewLabel->palette();
-        pp.setColor(QPalette::Window, Qt::black);
-        pp.setColor(QPalette::WindowText, Qt::white);
-        m_previewLabel->setPalette(pp);
-        m_previewLabel->setAutoFillBackground(true);
-    }
-    outColumn->addWidget(outTitle);
-    outColumn->addWidget(m_previewLabel);
-
-    auto* previewRow = new QHBoxLayout;
-    previewRow->addLayout(srcColumn);
-    previewRow->addStretch();
-    previewRow->addLayout(outColumn);
-
-    // -----------------------------------------------------------------------
     // ボタン
     // -----------------------------------------------------------------------
     m_buttonBox = new QDialogButtonBox(
@@ -126,7 +83,6 @@ SocialExportDialog::SocialExportDialog(QWidget* parent)
     auto* mainLayout = new QVBoxLayout(this);
     mainLayout->addLayout(presetForm);
     mainLayout->addWidget(m_reframeGroup);
-    mainLayout->addLayout(previewRow);
     mainLayout->addWidget(m_buttonBox);
 
     // -----------------------------------------------------------------------
@@ -155,21 +111,6 @@ SocialExportDialog::SocialExportDialog(QWidget* parent)
     // -----------------------------------------------------------------------
     onPresetChanged(0);
     onReframeModeChanged(0);
-}
-
-// ---------------------------------------------------------------------------
-// setSampleFrame
-// ---------------------------------------------------------------------------
-void SocialExportDialog::setSampleFrame(const QImage& sample)
-{
-    m_sample = sample;
-    if (!sample.isNull()) {
-        const QImage thumb = sample.scaled(
-            m_sourcePreviewLabel->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation);
-        m_sourcePreviewLabel->setPixmap(QPixmap::fromImage(thumb));
-        m_sourcePreviewLabel->setText(QString());
-    }
-    updatePreview();
 }
 
 // ---------------------------------------------------------------------------
@@ -216,8 +157,6 @@ void SocialExportDialog::onPresetChanged(int index)
             .arg(preset.maxDurationSec));
 
     m_reframeGroup->setVisible(preset.requiresVerticalReframe);
-
-    updatePreview();
 }
 
 // ---------------------------------------------------------------------------
@@ -226,7 +165,6 @@ void SocialExportDialog::onPresetChanged(int index)
 void SocialExportDialog::onReframeModeChanged(int /*index*/)
 {
     updateReframeControlsEnabled();
-    updatePreview();
 }
 
 // ---------------------------------------------------------------------------
@@ -235,7 +173,6 @@ void SocialExportDialog::onReframeModeChanged(int /*index*/)
 void SocialExportDialog::onManualOffsetXChanged(int value)
 {
     m_manualXLabel->setText(QString(tr("X: %1%")).arg(value));
-    updatePreview();
 }
 
 // ---------------------------------------------------------------------------
@@ -244,7 +181,6 @@ void SocialExportDialog::onManualOffsetXChanged(int value)
 void SocialExportDialog::onManualOffsetYChanged(int value)
 {
     m_manualYLabel->setText(QString(tr("Y: %1%")).arg(value));
-    updatePreview();
 }
 
 // ---------------------------------------------------------------------------
@@ -253,7 +189,6 @@ void SocialExportDialog::onManualOffsetYChanged(int value)
 void SocialExportDialog::onZoomChanged(int value)
 {
     m_zoomLabel->setText(QString(tr("%1%")).arg(value));
-    updatePreview();
 }
 
 // ---------------------------------------------------------------------------
@@ -263,42 +198,6 @@ void SocialExportDialog::onExportClicked()
 {
     emit exportRequested(selectedPreset(), reframeParams());
     accept();
-}
-
-// ---------------------------------------------------------------------------
-// updatePreview
-// ---------------------------------------------------------------------------
-void SocialExportDialog::updatePreview()
-{
-    if (m_sample.isNull()) {
-        m_previewLabel->setText(tr("プレビューなし"));
-        m_previewLabel->setPixmap(QPixmap());
-        return;
-    }
-
-    // 元動画サムネ
-    {
-        const QImage thumb = m_sample.scaled(
-            m_sourcePreviewLabel->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation);
-        m_sourcePreviewLabel->setPixmap(QPixmap::fromImage(thumb));
-        m_sourcePreviewLabel->setText(QString());
-    }
-
-    // 出力プレビュー
-    const reframe::ReframeResult result = reframe::applyReframe(m_sample, reframeParams());
-
-    if (!result.success) {
-        m_previewLabel->setPixmap(QPixmap());
-        m_previewLabel->setText(tr("プレビュー生成失敗: %1").arg(result.error));
-        return;
-    }
-
-    const QPixmap px = QPixmap::fromImage(result.previewImage)
-                           .scaled(m_previewLabel->size(),
-                                   Qt::KeepAspectRatio,
-                                   Qt::SmoothTransformation);
-    m_previewLabel->setPixmap(px);
-    m_previewLabel->setText(QString());
 }
 
 // ---------------------------------------------------------------------------
