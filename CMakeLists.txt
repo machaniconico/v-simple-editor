@@ -163,10 +163,12 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/AudioBusRouting.h
     src/AudioBusRouting.cpp
     src/SilenceCut.cpp
+    src/BeatDetect.cpp
     src/AudioBusPanel.cpp
     src/selftests/audio_bus_selftest.cpp
     src/selftests/atempo_resolve_selftest.cpp
     src/selftests/silence_cut_selftest.cpp
+    src/selftests/beat_detect_selftest.cpp
     src/selftests/safe_zone_selftest.cpp
     src/SafeZone.h
     src/SafeZone.cpp
