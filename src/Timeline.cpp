@@ -5737,6 +5737,13 @@ void Timeline::saveUndoState(const QString &description)
     m_undoManager->saveState(currentState(), description);
 }
 
+void Timeline::setProjectOutputConfig(int width, int height, bool explicitOutput)
+{
+    m_projectWidth = width;
+    m_projectHeight = height;
+    m_projectExplicitOutput = explicitOutput;
+}
+
 TimelineState Timeline::currentState() const
 {
     TimelineState state;
@@ -5775,6 +5782,10 @@ TimelineState Timeline::currentState() const
         for (int i = 0; i < n; ++i)
             state.audioTrackGains[i] = m_audioMixer->trackGain(i);
     }
+
+    state.projectWidth = m_projectWidth;
+    state.projectHeight = m_projectHeight;
+    state.projectExplicitOutput = m_projectExplicitOutput;
 
     return state;
 }
@@ -5865,6 +5876,19 @@ void Timeline::restoreState(const TimelineState &state)
         const int n = qMin(state.audioTrackGains.size(), audioTrackCount());
         for (int i = 0; i < n; ++i)
             m_audioMixer->setTrackGain(i, state.audioTrackGains[i]);
+    }
+
+    // スナップショットに捕捉されたプロジェクト出力ジオメトリ(サイズ)を復元する。
+    // SNS プリセットのリサイズを undo したとき、プロジェクトサイズも一緒に戻して
+    // 縦伸びを断つ。projectWidth <= 0 のレガシー/空スナップショットはスキップ
+    // (現在サイズを壊さない)。scheduleEmitSequenceChanged の前に行い、サイズ更新後の
+    // シーケンス再構築でプレビューが新サイズで合成されるようにする。
+    if (state.projectWidth > 0 && state.projectHeight > 0) {
+        m_projectWidth = state.projectWidth;
+        m_projectHeight = state.projectHeight;
+        m_projectExplicitOutput = state.projectExplicitOutput;
+        emit projectOutputConfigRestored(state.projectWidth, state.projectHeight,
+                                         state.projectExplicitOutput);
     }
 
     // setClips bypasses the modified() signal path; trigger explicitly so the

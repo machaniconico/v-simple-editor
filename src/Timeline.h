@@ -642,6 +642,11 @@ public:
 
     UndoManager *undoManager() const { return m_undoManager; }
 
+    // Timeline 側のプロジェクト出力ジオメトリ複製を最新に保つ。currentState() が
+    // undo スナップショットへ捕捉できるよう、MainWindow がプロジェクト設定変更時
+    // (applyProjectConfig / プロジェクト読込)に呼ぶ。
+    void setProjectOutputConfig(int width, int height, bool explicitOutput);
+
     // Multi-clip playback: flatten all video tracks into a sorted, gap-aware
     // schedule with topmost-track-wins resolution (Premiere V1/V2 semantics).
     QVector<PlaybackEntry> computePlaybackSequence() const;
@@ -689,6 +694,10 @@ signals:
     void positionChanged(double seconds);
     void sequenceChanged(const QVector<PlaybackEntry> &entries);
     void audioSequenceChanged(const QVector<PlaybackEntry> &entries);
+    // restoreState が、プロジェクト出力ジオメトリを持つ undo/redo スナップショットを
+    // 復元したときに発火。MainWindow が canvas + 出力サイズを再適用し、SNS プリセット
+    // のリサイズを undo した後にプレビューが縦伸びしないようにする。
+    void projectOutputConfigRestored(int width, int height, bool explicitOutput);
     // Per-track audio state updates that don't fit cleanly into the
     // PlaybackEntry struct. AudioMixer applies them via setTrackSolo on
     // receipt; mute and per-clip volume already ride on PlaybackEntry.
@@ -781,6 +790,11 @@ private:
     void refreshTextStrip();
     QLabel *m_infoLabel;
     double m_playheadPos = 0.0;
+    // プロジェクト出力ジオメトリの複製 (SSOT は MainWindow::m_projectConfig)。
+    // currentState() で undo スナップショットへ捕捉する。-1 = 未設定。
+    int m_projectWidth = -1;
+    int m_projectHeight = -1;
+    bool m_projectExplicitOutput = false;
     double m_markIn = -1.0;
     double m_markOut = -1.0;
     double m_zoomLevel = 10.0; // pixels per second (double so we can go sub-1 for long clips)

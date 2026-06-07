@@ -922,6 +922,22 @@ MainWindow::MainWindow(QWidget *parent)
     });
     connect(m_timeline->undoManager(), &UndoManager::stateJumpRequested,
             m_timeline, &Timeline::restoreState);
+    // undo/redo/履歴ジャンプでプロジェクト出力ジオメトリが復元されたら、canvas +
+    // 出力サイズを applyProjectConfig と同じ規則で再適用する。これが無いと SNS
+    // プリセット(プロジェクトを 9:16 にリサイズ)を undo してもサイズが 9:16 のまま
+    // 残り、元アスペクトのクリップが充填されて縦伸びする。
+    connect(m_timeline, &Timeline::projectOutputConfigRestored, this,
+            [this](int width, int height, bool explicitOutput) {
+        m_projectConfig.width = width;
+        m_projectConfig.height = height;
+        m_projectConfig.explicitOutputResolution = explicitOutput;
+        if (m_player) {
+            m_player->setCanvasSize(width, height);
+            m_player->setProjectOutputSize(explicitOutput ? QSize(width, height)
+                                                          : QSize());
+        }
+        updateTitle();
+    });
 
     // Show welcome screen initially
     showWelcomeScreen();
@@ -4171,6 +4187,10 @@ void MainWindow::applyProjectConfig(const ProjectConfig &config)
             ? QSize(config.width, config.height)
             : QSize());
     }
+    // undo スナップショットがプロジェクトサイズを捕捉できるよう Timeline の複製を同期。
+    if (m_timeline)
+        m_timeline->setProjectOutputConfig(config.width, config.height,
+                                           config.explicitOutputResolution);
     updateTitle();
     statusBar()->showMessage(QString("Project: %1 — %2 %3fps")
         .arg(config.name).arg(config.resolutionLabel()).arg(config.fps));
@@ -4894,6 +4914,12 @@ void MainWindow::applyLoadedProjectData(const ProjectData &data, const QString &
     // 読み込んだ全クリップが消える(縦動画プリセット適用→直 undo でクリップ全消失の
     // 真因)。restoreFromProject は setClips するだけで undo を積まないため、ここで
     // 履歴をリセットし、Ctrl+Z が読み込み済みプロジェクトより前へ戻れないようにする。
+    // 読み込んだプロジェクトサイズを Timeline 複製へ同期してから "Project loaded"
+    // ベースラインを積む。これで開いた直後のサイズが undo スナップショットに入り、
+    // 後の SNS プリセット undo で元サイズへ正しく戻る。
+    if (m_timeline)
+        m_timeline->setProjectOutputConfig(data.config.width, data.config.height,
+                                           data.config.explicitOutputResolution);
     if (m_timeline && m_timeline->undoManager()) {
         m_timeline->undoManager()->clear();
         m_timeline->undoManager()->saveState(m_timeline->currentState(),
