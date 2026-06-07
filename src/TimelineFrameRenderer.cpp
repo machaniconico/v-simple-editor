@@ -17,6 +17,7 @@
 #include "playback/clipidt_flag.h"
 #include "playback/hdrmatte16_flag.h"
 #include "playback/hdrexport16_flag.h"
+#include "playback/SnsFit.h"
 #include "playback/swsmatrix_flag.h"
 #include "color/ClipColor.h"    // HDR Stage1 — per-clip color metadata plumbing
 #include "color/ClipColorTransform.h"
@@ -716,6 +717,10 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
         // through exactly where the mask cuts. No-op when the clip has no mask,
         // so a lone V1 clip stays byte-identical to S2/S3/S4/S5/S6.
         const QImage v1Native = applyClipMask(v1Fx, v1Clip, v1SourceSec);
+        const bool contained =
+            snsfit::shouldContain(v1Clip.fitContain, outSize, v1Native.size());
+        const QImage v1Contained =
+            snsfit::maybeContain(v1Native, v1Clip.fitContain, outSize);
 
         // Base canvas placement — V1 clip transform applied via clipgeom SSOT.
         // Fast path (byte-identical to S2, MSE=0 preserved): when the V1 clip
@@ -731,11 +736,11 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
             v1Clip.videoDx          == 0.0 &&
             v1Clip.videoDy          == 0.0 &&
             v1Clip.rotation2DDegrees == 0.0;
-        base = v1TransformIsDefault
-            ? v1Native.scaled(outSize, Qt::IgnoreAspectRatio,
-                              Qt::SmoothTransformation)
+        base = v1TransformIsDefault && !contained
+            ? v1Contained.scaled(outSize, Qt::IgnoreAspectRatio,
+                                 Qt::SmoothTransformation)
             : clipgeom::renderLayer(
-                  v1Native,
+                  v1Contained,
                   clipgeom::ClipTransform{v1Clip.videoScale, v1Clip.videoDx,
                                           v1Clip.videoDy, v1Clip.rotation2DDegrees},
                   outSize, /*smooth=*/true);
@@ -806,8 +811,9 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
         // overlay is SourceOver-composited and the layers beneath show
         // through (same CC -> LUT -> FX -> MASK per-clip order as V1). No-op
         // for un-masked overlays, so S3's multi-track MSE stays ~0.
-        const QImage native = applyClipMask(
+        QImage native = applyClipMask(
             applyClipFxPack(gradeClipNativeFrame(nativeRaw, c), c), c, srcSec);
+        native = snsfit::maybeContain(native, c.fitContain, outSize);
         RenderLayer renderLayer;
         renderLayer.clipId = renderClipId(t, idx);
         renderLayer.colorMeta = c.colorMeta;

@@ -101,6 +101,11 @@ struct ClipInfo {
     // compositor lands in a follow-up iteration.
     double opacity = 1.0;
 
+    // SNS vertical fit: when true and the project output aspect differs from
+    // this clip's native frame, export/previews may pre-contain the frame into
+    // a transparent same-aspect intermediate canvas before clipgeom placement.
+    bool fitContain = false;
+
     // HDR Stage1: per-clip input color metadata. Default SDR is deliberately
     // inert and is omitted from project JSON to preserve old files byte-for-byte.
     clipcolor::ColorMeta colorMeta;

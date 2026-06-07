@@ -7,6 +7,7 @@ namespace snsfit {
 namespace {
 
 constexpr double kAspectEps = 1e-6;
+constexpr double kShouldContainAspectEps = 1e-4;
 
 bool isValidSourceSize(const QSize& size)
 {
@@ -65,6 +66,31 @@ QImage containInAspectCanvas(const QImage& src, double canvasAspect, bool smooth
     painter.end();
 
     return out;
+}
+
+bool shouldContain(bool fitContain, QSize projOutSize, QSize srcSize)
+{
+    if (!fitContain)
+        return false;
+    if (!projOutSize.isValid() || projOutSize.isEmpty())
+        return false;
+    if (!isValidSourceSize(srcSize))
+        return false;
+
+    const double canvasAspect =
+        projOutSize.width() / static_cast<double>(projOutSize.height());
+    const double srcAspect = srcSize.width() / static_cast<double>(srcSize.height());
+    return std::fabs(srcAspect - canvasAspect) >= kShouldContainAspectEps;
+}
+
+QImage maybeContain(const QImage& src, bool fitContain, QSize projOutSize)
+{
+    if (!shouldContain(fitContain, projOutSize, src.size()))
+        return src;
+
+    const double canvasAspect =
+        projOutSize.width() / static_cast<double>(projOutSize.height());
+    return containInAspectCanvas(src, canvasAspect);
 }
 
 } // namespace snsfit

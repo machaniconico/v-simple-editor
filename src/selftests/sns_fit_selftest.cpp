@@ -209,6 +209,34 @@ int runSnsFitSelftest()
     pass("G8 contain->clipgeom preserves content aspect (skipped)");
 #endif
 
+    {
+        const QSize src16x9(1920, 1080);
+        check("G9 shouldContain false unless every gate is satisfied",
+              !snsfit::shouldContain(true, QSize(), src16x9)
+                  && !snsfit::shouldContain(true, QSize(0, 1920), src16x9)
+                  && !snsfit::shouldContain(false, QSize(1080, 1920), src16x9)
+                  && !snsfit::shouldContain(true, QSize(1920, 1080), src16x9),
+              QStringLiteral("invalid=%1 empty=%2 fitFalse=%3 aspectMatch=%4")
+                  .arg(snsfit::shouldContain(true, QSize(), src16x9))
+                  .arg(snsfit::shouldContain(true, QSize(0, 1920), src16x9))
+                  .arg(snsfit::shouldContain(false, QSize(1080, 1920), src16x9))
+                  .arg(snsfit::shouldContain(true, QSize(1920, 1080), src16x9)));
+    }
+
+    {
+        check("G10 shouldContain true when all gates are satisfied",
+              snsfit::shouldContain(true, QSize(1080, 1920), QSize(1920, 1080)),
+              QStringLiteral("expected true for fitContain=true, valid 9:16 canvas, 16:9 src"));
+    }
+
+    {
+        const QImage src = makePatternImage(QSize(16, 9), QImage::Format_RGBA8888);
+        const QImage out = snsfit::maybeContain(src, false, QSize(1080, 1920));
+        check("G11 maybeContain identity when shouldContain is false",
+              imageBytesEqual(src, out),
+              QStringLiteral("identityEqual=%1").arg(imageBytesEqual(src, out)));
+    }
+
     qInfo().noquote() << "[sns-fit] selftest done: passed=" << passed
                       << "failed=" << failed;
     return failed == 0 ? 0 : 1;
