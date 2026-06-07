@@ -2053,6 +2053,50 @@ bool VideoPlayer::canUseInteropFastPath(const AVFrame *frame) const
     return false;
 }
 
+void VideoPlayer::displaySeekFrameConformed(const QImage &v1Image)
+{
+    if (!m_projectOutputSize.isValid()) {
+        displayFrame(v1Image);
+        return;
+    }
+
+    QImage canvas(m_projectOutputSize, QImage::Format_ARGB32_Premultiplied);
+    canvas.fill(Qt::black);
+
+    const PlaybackEntry *entry = nullptr;
+    if (sequenceActive()
+        && m_activeEntry >= 0
+        && m_activeEntry < m_sequence.size()) {
+        entry = &m_sequence[m_activeEntry];
+    }
+
+    const bool fitContain = entry ? entry->fitContain : false;
+    QImage conformed = snsfit::maybeContain(v1Image, fitContain, m_projectOutputSize);
+
+    DecodedLayer layer;
+    layer.rgb = conformed;
+    layer.opacity = 1.0;
+    if (entry) {
+        layer.colorMeta = entry->colorMeta;
+        layer.videoScale = entry->videoScale;
+        layer.videoDx = entry->videoDx;
+        layer.videoDy = entry->videoDy;
+        layer.rotation2DDegrees = entry->rotation2DDegrees;
+        layer.sequenceIdx = m_activeEntry;
+    }
+    layer.sourceTrack = 0;
+    layer.fitContain = fitContain;
+    layer.isFresh = true;
+
+    QVector<DecodedLayer> singleLayer;
+    singleLayer.append(layer);
+    composeMultiTrackFrameInto(canvas, singleLayer);
+    if (m_glPreview)
+        m_glPreview->setCompositeBakedMode(true);
+    m_lastFrameOdtApplied = false;
+    displayFrame(canvas);
+}
+
 void VideoPlayer::displayFrame(const QImage &image)
 {
     m_lastSourceFrame = image;
@@ -3010,7 +3054,7 @@ bool VideoPlayer::seekInternal(int64_t positionUs, bool displayFrame, bool preci
             return false;
         // This path displays a non-baked frame.
         m_lastFrameOdtApplied = false;
-        this->displayFrame(image);
+        this->displaySeekFrameConformed(image);
         m_currentPositionUs = targetUs;
         updatePositionUi();
         return true;
@@ -3080,7 +3124,7 @@ bool VideoPlayer::presentDecodedFrame(AVFrame *frame, bool displayFrameRequested
         // is intentionally NOT updated here; pause/resize during fast path
         // shows whatever was last cached by the legacy path. Acceptable for
         // V1-only narrow conditions; revisit if user reports staleness.
-        if (canUseInteropFastPath(frame)) {
+        if (canUseInteropFastPath(frame) && !m_projectOutputSize.isValid()) {
             D3D11FrameRef ref;
             if (extractD3D11FrameRef(frame, &ref)) {
                 static bool loggedFastPathEngage = false;
@@ -3113,7 +3157,7 @@ bool VideoPlayer::presentDecodedFrame(AVFrame *frame, bool displayFrameRequested
         if (!m_deferDisplayThisTick) {
             // This path displays a non-baked frame.
             m_lastFrameOdtApplied = false;
-            displayFrame(image);
+            displaySeekFrameConformed(image);
         }
         updatePositionUi();
     }

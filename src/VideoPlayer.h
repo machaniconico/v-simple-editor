@@ -336,6 +336,7 @@ private:
     void handlePlaybackTick();
     void updatePlayButton();
     void displayFrame(const QImage &image);
+    void displaySeekFrameConformed(const QImage &v1Image);
 
     // Sequence helpers (Phase A/B). When m_sequence is empty, the player runs
     // in single-file legacy mode and these are unused.
