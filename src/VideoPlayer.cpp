@@ -379,6 +379,9 @@ void VideoPlayer::setupUI()
 
     m_glPreview = new GLPreview(this);
     m_glPreview->setMinimumSize(240, 135);
+    // PV-B: プレビュー右クリック → VideoPlayer 経由で MainWindow へ転送。
+    connect(m_glPreview, &GLPreview::contextMenuRequested,
+            this, &VideoPlayer::previewContextMenuRequested);
     connect(m_glPreview, &GLPreview::textRectRequested,
             this, &VideoPlayer::textRectRequested);
     connect(m_glPreview, &GLPreview::textInlineCommitted,

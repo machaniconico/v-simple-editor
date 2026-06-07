@@ -3529,6 +3529,184 @@ void Timeline::relinkClipAt(TimelineTrack *track, int clipIndex)
     updateInfoLabel();
 }
 
+// PV-B SSOT: クリップ操作をプレビュー右クリックメニューと共有するため公開
+// メソッドへ抽出。showClipContextMenu の各分岐と同一ロジック(挙動不変)。
+void Timeline::applySnsFitToClip(TimelineTrack *track, int clipIndex,
+                                 bool contain, bool cover, const QString &undoLabel)
+{
+    if (!track) return;
+    QVector<ClipInfo> clips = track->clips();
+    if (clipIndex < 0 || clipIndex >= clips.size())
+        return;
+    ClipInfo &clip = clips[clipIndex];
+    clip.fitContain = contain;
+    clip.fitCover = cover;
+    clip.videoScale = 1.0;
+    clip.videoDx = 0.0;
+    clip.videoDy = 0.0;
+    clip.rotation2DDegrees = 0.0;
+    track->setClips(clips);
+    saveUndoState(undoLabel);
+    emitSequenceChangedNow();
+    emit positionChanged(m_playheadPos);
+}
+
+void Timeline::applySilenceCutToClip(TimelineTrack *track, int clipIndex)
+{
+    if (!track) return;
+    QVector<ClipInfo> clips = track->clips();
+    if (clipIndex < 0 || clipIndex >= clips.size()) return;
+    const ClipInfo &src = clips[clipIndex];
+
+    QVector<float> samples;
+    int sr = 0;
+    if (!WaveformGenerator::decodeAudio(src.filePath, samples, sr) || samples.isEmpty() || sr <= 0) {
+        QMessageBox::warning(nullptr, QStringLiteral("無音カット"),
+                             QStringLiteral("音声のデコードに失敗しました。"));
+        return;
+    }
+
+    const double srcOut = (src.outPoint > 0.0) ? src.outPoint : src.duration;
+    const double totalSec = static_cast<double>(samples.size()) / sr;
+    const double activeStart = std::max(src.inPoint, 0.0);
+    const double activeEnd   = std::min(srcOut, totalSec);
+    if (activeEnd <= activeStart) {
+        QMessageBox::information(nullptr, QStringLiteral("無音カット"),
+                                 QStringLiteral("有効な範囲がありません。"));
+        return;
+    }
+    const int startSample = static_cast<int>(activeStart * sr);
+    const int endSample   = static_cast<int>(activeEnd   * sr);
+    QVector<float> activeSamples = samples.mid(startSample, endSample - startSample);
+
+    QVector<silencecut::Segment> keeps =
+        silencecut::detectKeepSegments(activeSamples, sr, silencecut::Config{});
+    QVector<ClipInfo> subClips = silencecut::planKeepClips(src, keeps);
+
+    if (subClips.isEmpty()) {
+        QMessageBox::information(nullptr, QStringLiteral("無音カット"),
+                                 QStringLiteral("カットする無音が見つかりませんでした。"));
+        return;
+    }
+    if (subClips.size() == 1
+        && qAbs(subClips[0].inPoint  - src.inPoint) < 0.01
+        && qAbs(subClips[0].outPoint - srcOut)      < 0.01) {
+        QMessageBox::information(nullptr, QStringLiteral("無音カット"),
+                                 QStringLiteral("カットする無音がありません。"));
+        return;
+    }
+
+    const int silenceCount = keeps.isEmpty() ? 0
+                             : static_cast<int>(keeps.size()) - 1;
+    const QString msg = QStringLiteral("%1 箇所の無音を除去し、%2 個のクリップに分割します。実行しますか?")
+                            .arg(silenceCount < 0 ? 0 : silenceCount)
+                            .arg(subClips.size());
+    if (QMessageBox::question(nullptr, QStringLiteral("無音カット"), msg)
+            != QMessageBox::Yes)
+        return;
+
+    QVector<ClipInfo> newClips = clips;
+    newClips.removeAt(clipIndex);
+    for (int i = 0; i < subClips.size(); ++i)
+        newClips.insert(clipIndex + i, subClips[i]);
+
+    track->setClips(newClips);
+    saveUndoState(QStringLiteral("Silence auto-cut"));
+    emitSequenceChangedNow();
+    emit positionChanged(m_playheadPos);
+}
+
+void Timeline::applyBeatMarkersToClip(TimelineTrack *track, int clipIndex)
+{
+    if (!track) return;
+    const QVector<ClipInfo> clips = track->clips();
+    if (clipIndex < 0 || clipIndex >= clips.size()) return;
+    const ClipInfo &src = clips[clipIndex];
+
+    QVector<float> samples;
+    int sr = 0;
+    if (!WaveformGenerator::decodeAudio(src.filePath, samples, sr) || samples.isEmpty() || sr <= 0) {
+        QMessageBox::warning(nullptr, QStringLiteral("ビートマーカー"),
+                             QStringLiteral("音声のデコードに失敗しました。"));
+        return;
+    }
+
+    const double srcOut = (src.outPoint > 0.0) ? src.outPoint : src.duration;
+    const double totalSec = static_cast<double>(samples.size()) / sr;
+    const double activeStart = std::max(src.inPoint, 0.0);
+    const double activeEnd   = std::min(srcOut, totalSec);
+    if (activeEnd <= activeStart) {
+        QMessageBox::information(nullptr, QStringLiteral("ビートマーカー"),
+                                 QStringLiteral("有効な範囲がありません。"));
+        return;
+    }
+    const int startSample = static_cast<int>(activeStart * sr);
+    const int endSample   = static_cast<int>(activeEnd   * sr);
+    const QVector<float> activeSamples = samples.mid(startSample, endSample - startSample);
+
+    const beatdetect::Result beats =
+        beatdetect::detectBeats(activeSamples, sr, beatdetect::Config{});
+    if (beats.beatTimesSec.isEmpty()) {
+        QMessageBox::information(nullptr, QStringLiteral("ビートマーカー"),
+                                 QStringLiteral("ビートが検出されませんでした。"));
+        return;
+    }
+
+    double clipStartSec = 0.0;
+    for (int i = 0; i < clipIndex && i < clips.size(); ++i)
+        clipStartSec += clips[i].leadInSec + clips[i].effectiveDuration();
+    clipStartSec += src.leadInSec;
+    const double speed = (src.speed > 0.0) ? src.speed : 1.0;
+
+    const QString msg = QStringLiteral("%1 個のビート (推定 %2 BPM) をマーカーとして追加しますか?")
+                            .arg(beats.beatTimesSec.size())
+                            .arg(beats.bpm, 0, 'f', 1);
+    if (QMessageBox::question(nullptr, QStringLiteral("ビートマーカー"), msg)
+            != QMessageBox::Yes)
+        return;
+
+    const QColor beatColor(QStringLiteral("#39c0ff"));
+    int added = 0;
+    for (double b : beats.beatTimesSec) {
+        const double sourceSec = activeStart + b;
+        const double timelineSec = clipStartSec + (sourceSec - src.inPoint) / speed;
+        if (timelineSec < 0.0)
+            continue;
+        const qint64 timelineUs = static_cast<qint64>(timelineSec * 1.0e6);
+        addMarker(timelineUs, QStringLiteral("Beat %1").arg(added + 1), beatColor);
+        ++added;
+    }
+    saveUndoState(QStringLiteral("Beat markers"));
+    if (added > 0)
+        emit positionChanged(m_playheadPos);
+}
+
+// 再生ヘッド直下の V1(最初の動画トラック)クリップを解決。見つかれば true。
+bool Timeline::clipUnderPlayhead(TimelineTrack *&outTrack, int &outClipIndex) const
+{
+    outTrack = nullptr;
+    outClipIndex = -1;
+    if (m_videoTracks.isEmpty())
+        return false;
+    TimelineTrack *v1 = m_videoTracks.value(0, nullptr);
+    if (!v1)
+        return false;
+    const QVector<ClipInfo> &clips = v1->clips();
+    const double playSec = m_playheadPos;
+    double start = 0.0;
+    for (int i = 0; i < clips.size(); ++i) {
+        const double clipStart = start + clips[i].leadInSec;
+        const double clipEnd = clipStart + clips[i].effectiveDuration();
+        if (playSec >= clipStart && playSec < clipEnd) {
+            outTrack = v1;
+            outClipIndex = i;
+            return true;
+        }
+        start = clipEnd;
+    }
+    return false;
+}
+
 void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QPoint &globalPos)
 {
     if (!track || clipIndex < 0 || clipIndex >= track->clips().size()) return;
@@ -3751,163 +3929,16 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
 
     QAction *chosen = menu.exec(globalPos);
     if (!chosen) return;
-    auto applySnsFitMode = [&](bool contain, bool cover, const QString &undoLabel) {
-        QVector<ClipInfo> clips = track->clips();
-        if (clipIndex < 0 || clipIndex >= clips.size())
-            return;
-        ClipInfo &clip = clips[clipIndex];
-        clip.fitContain = contain;
-        clip.fitCover = cover;
-        clip.videoScale = 1.0;
-        clip.videoDx = 0.0;
-        clip.videoDy = 0.0;
-        clip.rotation2DDegrees = 0.0;
-        track->setClips(clips);
-        saveUndoState(undoLabel);
-        emitSequenceChangedNow();
-        emit positionChanged(m_playheadPos);
-    };
     if (chosen == cutAct) cutSelectedClip();
     else if (chosen == copyAct) copySelectedClip();
     else if (chosen == deleteAct) deleteSelectedClip();
-    else if (chosen == silenceCutAct) {
-        QVector<ClipInfo> clips = track->clips();
-        if (clipIndex < 0 || clipIndex >= clips.size()) return;
-        const ClipInfo& src = clips[clipIndex];
-
-        QVector<float> samples;
-        int sr = 0;
-        if (!WaveformGenerator::decodeAudio(src.filePath, samples, sr) || samples.isEmpty() || sr <= 0) {
-            QMessageBox::warning(nullptr, QStringLiteral("無音カット"),
-                                 QStringLiteral("音声のデコードに失敗しました。"));
-            return;
-        }
-
-        // The current full-buffer helper returns no samples; the FFmpeg decode
-        // paths in WaveformGenerator resample to mono when samples are produced.
-        const double srcOut = (src.outPoint > 0.0) ? src.outPoint : src.duration;
-        const double totalSec = static_cast<double>(samples.size()) / sr;
-        const double activeStart = std::max(src.inPoint, 0.0);
-        const double activeEnd   = std::min(srcOut, totalSec);
-        if (activeEnd <= activeStart) {
-            QMessageBox::information(nullptr, QStringLiteral("無音カット"),
-                                     QStringLiteral("有効な範囲がありません。"));
-            return;
-        }
-        const int startSample = static_cast<int>(activeStart * sr);
-        const int endSample   = static_cast<int>(activeEnd   * sr);
-        QVector<float> activeSamples = samples.mid(startSample, endSample - startSample);
-
-        QVector<silencecut::Segment> keeps =
-            silencecut::detectKeepSegments(activeSamples, sr, silencecut::Config{});
-
-        QVector<ClipInfo> subClips = silencecut::planKeepClips(src, keeps);
-
-        if (subClips.isEmpty()) {
-            QMessageBox::information(nullptr, QStringLiteral("無音カット"),
-                                     QStringLiteral("カットする無音が見つかりませんでした。"));
-            return;
-        }
-        if (subClips.size() == 1
-            && qAbs(subClips[0].inPoint  - src.inPoint) < 0.01
-            && qAbs(subClips[0].outPoint - srcOut)      < 0.01) {
-            QMessageBox::information(nullptr, QStringLiteral("無音カット"),
-                                     QStringLiteral("カットする無音がありません。"));
-            return;
-        }
-
-        const int silenceCount = keeps.isEmpty() ? 0
-                                 : static_cast<int>(keeps.size()) - 1;
-        const QString msg = QStringLiteral("%1 箇所の無音を除去し、%2 個のクリップに分割します。実行しますか?")
-                                .arg(silenceCount < 0 ? 0 : silenceCount)
-                                .arg(subClips.size());
-        if (QMessageBox::question(nullptr, QStringLiteral("無音カット"), msg)
-                != QMessageBox::Yes)
-            return;
-
-        QVector<ClipInfo> newClips = clips;
-        newClips.removeAt(clipIndex);
-        for (int i = 0; i < subClips.size(); ++i)
-            newClips.insert(clipIndex + i, subClips[i]);
-
-        track->setClips(newClips);
-        saveUndoState(QStringLiteral("Silence auto-cut"));
-        emitSequenceChangedNow();
-        emit positionChanged(m_playheadPos);
-    }
-    else if (chosen == beatMarkerAct) {
-        const QVector<ClipInfo> clips = track->clips();
-        if (clipIndex < 0 || clipIndex >= clips.size()) return;
-        const ClipInfo& src = clips[clipIndex];
-
-        QVector<float> samples;
-        int sr = 0;
-        if (!WaveformGenerator::decodeAudio(src.filePath, samples, sr) || samples.isEmpty() || sr <= 0) {
-            QMessageBox::warning(nullptr, QStringLiteral("ビートマーカー"),
-                                 QStringLiteral("音声のデコードに失敗しました。"));
-            return;
-        }
-
-        const double srcOut = (src.outPoint > 0.0) ? src.outPoint : src.duration;
-        const double totalSec = static_cast<double>(samples.size()) / sr;
-        const double activeStart = std::max(src.inPoint, 0.0);
-        const double activeEnd   = std::min(srcOut, totalSec);
-        if (activeEnd <= activeStart) {
-            QMessageBox::information(nullptr, QStringLiteral("ビートマーカー"),
-                                     QStringLiteral("有効な範囲がありません。"));
-            return;
-        }
-        const int startSample = static_cast<int>(activeStart * sr);
-        const int endSample   = static_cast<int>(activeEnd   * sr);
-        const QVector<float> activeSamples = samples.mid(startSample, endSample - startSample);
-
-        const beatdetect::Result beats =
-            beatdetect::detectBeats(activeSamples, sr, beatdetect::Config{});
-        if (beats.beatTimesSec.isEmpty()) {
-            QMessageBox::information(nullptr, QStringLiteral("ビートマーカー"),
-                                     QStringLiteral("ビートが検出されませんでした。"));
-            return;
-        }
-
-        // クリップのタイムライン開始秒 (ギャップレス配置: 先行クリップの
-        // leadInSec + effectiveDuration を累積 + 自身の leadInSec)。
-        double clipStartSec = 0.0;
-        for (int i = 0; i < clipIndex && i < clips.size(); ++i)
-            clipStartSec += clips[i].leadInSec + clips[i].effectiveDuration();
-        clipStartSec += src.leadInSec;
-        const double speed = (src.speed > 0.0) ? src.speed : 1.0;
-
-        const QString msg = QStringLiteral("%1 個のビート (推定 %2 BPM) をマーカーとして追加しますか?")
-                                .arg(beats.beatTimesSec.size())
-                                .arg(beats.bpm, 0, 'f', 1);
-        if (QMessageBox::question(nullptr, QStringLiteral("ビートマーカー"), msg)
-                != QMessageBox::Yes)
-            return;
-
-        // activeSamples は activeStart からの相対なので、ソース秒 = activeStart + b。
-        // タイムライン秒 = clipStartSec + (ソース秒 - src.inPoint)/speed。
-        const QColor beatColor(QStringLiteral("#39c0ff"));
-        int added = 0;
-        for (double b : beats.beatTimesSec) {
-            const double sourceSec = activeStart + b;
-            const double timelineSec = clipStartSec + (sourceSec - src.inPoint) / speed;
-            if (timelineSec < 0.0)
-                continue;
-            const qint64 timelineUs = static_cast<qint64>(timelineSec * 1.0e6);
-            addMarker(timelineUs,
-                      QStringLiteral("Beat %1").arg(added + 1),
-                      beatColor);
-            ++added;
-        }
-        saveUndoState(QStringLiteral("Beat markers"));
-        if (added > 0)
-            emit positionChanged(m_playheadPos);
-    }
+    else if (chosen == silenceCutAct) applySilenceCutToClip(track, clipIndex);
+    else if (chosen == beatMarkerAct) applyBeatMarkersToClip(track, clipIndex);
     else if (chosen == unlinkAct) unlinkClipGroup(linkGroup);
     else if (chosen == relinkAct) relinkClipAt(track, clipIndex);
-    else if (chosen == snsFitAct) applySnsFitMode(true, false, QStringLiteral("SNS width fit center"));
-    else if (chosen == snsCoverAct) applySnsFitMode(false, true, QStringLiteral("SNS width fill crop"));
-    else if (chosen == snsFillAct) applySnsFitMode(false, false, QStringLiteral("SNS restore fullscreen"));
+    else if (chosen == snsFitAct) applySnsFitToClip(track, clipIndex, true, false, QStringLiteral("SNS width fit center"));
+    else if (chosen == snsCoverAct) applySnsFitToClip(track, clipIndex, false, true, QStringLiteral("SNS width fill crop"));
+    else if (chosen == snsFillAct) applySnsFitToClip(track, clipIndex, false, false, QStringLiteral("SNS restore fullscreen"));
     else if (chosen == xdAct) {
         Transition t;
         t.type = TransitionType::CrossDissolve;

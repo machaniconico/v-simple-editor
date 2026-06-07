@@ -277,8 +277,12 @@ signals:
     // US-T34 — emitted while the user drags or resizes the video source so
     // VideoPlayer / MainWindow can persist the transform across sessions.
     void videoSourceTransformChanged(double scale, double dx, double dy);
+    // PV-B: プレビュー上で右クリックされた(グローバル座標)。VideoPlayer が
+    // 受けて previewContextMenuRequested に再 emit する。
+    void contextMenuRequested(const QPoint &globalPos);
 
 protected:
+    void contextMenuEvent(QContextMenuEvent *event) override;
     void initializeGL() override;
     void resizeGL(int w, int h) override;
     void paintGL() override;

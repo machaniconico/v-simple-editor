@@ -299,6 +299,9 @@ signals:
     // Iteration 15 — emitted when the user clicks the maximize button or
     // when MainWindow's Esc shortcut calls setPreviewMaximized(false).
     void previewMaximizeChanged(bool maximized);
+    // PV-B — プレビュー上で右クリックされた(グローバル座標)。MainWindow が
+    // 受けて表示トグル+現クリップ操作メニューを構築する。
+    void previewContextMenuRequested(const QPoint &globalPos);
 
 protected:
     void resizeEvent(QResizeEvent *event) override;

@@ -1085,6 +1085,82 @@ void MainWindow::setupUI()
     m_player = new VideoPlayer(this);
     connect(m_player, &VideoPlayer::proxySettingsRequested,
             this, &MainWindow::openProxySettings);
+    // PV-B: プレビュー右クリックメニュー (表示トグル + 再生ヘッド直下クリップ操作)。
+    connect(m_player, &VideoPlayer::previewContextMenuRequested,
+            this, [this](const QPoint &gp) {
+        QMenu menu;
+
+        // --- 表示系トグル (すべて表示専用・書き出し非変更) ---
+        QMenu *szMenu = menu.addMenu(QStringLiteral("SNS セーフゾーン"));
+        const QPair<QString, safezone::Platform> szItems[] = {
+            { QStringLiteral("なし"),               safezone::Platform::None },
+            { QStringLiteral("TikTok"),             safezone::Platform::TikTok },
+            { QStringLiteral("Instagram Reels"),    safezone::Platform::InstagramReels },
+            { QStringLiteral("YouTube Shorts"),     safezone::Platform::YouTubeShorts },
+            { QStringLiteral("汎用"),               safezone::Platform::Generic },
+        };
+        for (const auto &it : szItems) {
+            const safezone::Platform p = it.second;
+            connect(szMenu->addAction(it.first), &QAction::triggered, this,
+                    [this, p]() { if (m_player) m_player->setSafeZonePlatform(p); });
+        }
+
+        QMenu *aidMenu = menu.addMenu(QStringLiteral("モニタリング (露出/フォーカス)"));
+        const QPair<QString, exposureaid::AidMode> aidItems[] = {
+            { QStringLiteral("オフ"),               exposureaid::AidMode::None },
+            { QStringLiteral("フォルスカラー"),     exposureaid::AidMode::FalseColor },
+            { QStringLiteral("ゼブラ"),             exposureaid::AidMode::Zebra },
+            { QStringLiteral("フォーカスピーキング"), exposureaid::AidMode::FocusPeaking },
+        };
+        for (const auto &it : aidItems) {
+            const exposureaid::AidMode m = it.second;
+            connect(aidMenu->addAction(it.first), &QAction::triggered, this,
+                    [this, m]() { if (m_player) m_player->setExposureAidMode(m); });
+        }
+
+        QMenu *pqMenu = menu.addMenu(QStringLiteral("再生プレビュー品質"));
+        const QPair<QString, int> pqItems[] = {
+            { QStringLiteral("フル解像度 (1x)"), 1 },
+            { QStringLiteral("1/2 解像度 (2x)"), 2 },
+            { QStringLiteral("1/4 解像度 (4x)"), 4 },
+        };
+        for (const auto &it : pqItems) {
+            const int div = it.second;
+            connect(pqMenu->addAction(it.first), &QAction::triggered, this,
+                    [this, div]() { if (m_player) m_player->setProxyDivisor(div); });
+        }
+
+        // --- 再生ヘッド直下の V1 クリップ操作 ---
+        menu.addSeparator();
+        TimelineTrack *clipTrack = nullptr;
+        int clipIdx = -1;
+        if (m_timeline && m_timeline->clipUnderPlayhead(clipTrack, clipIdx) && clipTrack) {
+            connect(menu.addAction(QStringLiteral("無音を自動カット...")), &QAction::triggered,
+                    this, [this, clipTrack, clipIdx]() {
+                        if (m_timeline) m_timeline->applySilenceCutToClip(clipTrack, clipIdx); });
+            connect(menu.addAction(QStringLiteral("ビートでマーカー...")), &QAction::triggered,
+                    this, [this, clipTrack, clipIdx]() {
+                        if (m_timeline) m_timeline->applyBeatMarkersToClip(clipTrack, clipIdx); });
+            menu.addSeparator();
+            connect(menu.addAction(QStringLiteral("SNS: 幅フィット中央(全表示)")), &QAction::triggered,
+                    this, [this, clipTrack, clipIdx]() {
+                        if (m_timeline) m_timeline->applySnsFitToClip(clipTrack, clipIdx, true, false,
+                            QStringLiteral("SNS width fit center")); });
+            connect(menu.addAction(QStringLiteral("SNS: 幅埋め(クロップ・歪みなし)")), &QAction::triggered,
+                    this, [this, clipTrack, clipIdx]() {
+                        if (m_timeline) m_timeline->applySnsFitToClip(clipTrack, clipIdx, false, true,
+                            QStringLiteral("SNS width fill crop")); });
+            connect(menu.addAction(QStringLiteral("SNS: フィット解除(全画面)")), &QAction::triggered,
+                    this, [this, clipTrack, clipIdx]() {
+                        if (m_timeline) m_timeline->applySnsFitToClip(clipTrack, clipIdx, false, false,
+                            QStringLiteral("SNS restore fullscreen")); });
+        } else {
+            QAction *noClip = menu.addAction(QStringLiteral("(再生ヘッド下に V1 クリップなし)"));
+            noClip->setEnabled(false);
+        }
+
+        menu.exec(gp);
+    });
     m_timeline = new Timeline(this);
     // US-INT-1: hand the Timeline to GLPreview so paintGL can compose any
     // adjustment layers covering the current timeline position.

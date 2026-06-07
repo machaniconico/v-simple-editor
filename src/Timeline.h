@@ -452,6 +452,15 @@ public:
     // from a future markers-panel UI without churn. Spec acceptance #1-4.
     int addMarker(qint64 timelineUs, const QString &label,
                   QColor color = QColor(QStringLiteral("#ff5050")));
+
+    // PV-B: クリップ操作の公開エントリ(クリップ右クリックメニューと
+    // プレビュー右クリックメニューで共有する SSOT)。
+    void applySnsFitToClip(TimelineTrack *track, int clipIndex,
+                           bool contain, bool cover, const QString &undoLabel);
+    void applySilenceCutToClip(TimelineTrack *track, int clipIndex);
+    void applyBeatMarkersToClip(TimelineTrack *track, int clipIndex);
+    // 再生ヘッド直下の V1 クリップを解決(見つかれば true)。
+    bool clipUnderPlayhead(TimelineTrack *&outTrack, int &outClipIndex) const;
     bool removeMarker(int id);
     bool updateMarker(int id, const Marker &updated);
     // MK-1: turn a point marker into a span (duration) marker, or back to a

@@ -22,6 +22,7 @@
 #include <QPainter>
 #include <QPen>
 #include <QMouseEvent>
+#include <QContextMenuEvent>
 #include <QKeyEvent>
 #include <QFocusEvent>
 #include <QFontMetrics>
@@ -2553,6 +2554,18 @@ void GLPreview::setVideoContentInset(double fw, double fh)
     m_contentInsetFw = nextFw;
     m_contentInsetFh = nextFh;
     update();
+}
+
+void GLPreview::contextMenuEvent(QContextMenuEvent *event)
+{
+    // PV-B: ドラッグ中(左ボタン変形操作)でなければプレビュー右クリック
+    // メニュー要求を発火。実際のメニュー構築は MainWindow 側。
+    if (m_videoDragMode != VideoDragNone) {
+        event->ignore();
+        return;
+    }
+    emit contextMenuRequested(event->globalPos());
+    event->accept();
 }
 
 void GLPreview::resetVideoSourceTransform()
