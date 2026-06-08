@@ -14,6 +14,7 @@
 #include "playback/HdrIngestProbe.h"
 #include "playback/hdringest_flag.h"
 #include "playback/PixFmtDepth.h"
+#include "playback/SnsFit.h"
 
 #include <algorithm>
 #include <QMessageBox>
@@ -2946,6 +2947,10 @@ void Timeline::addClip(const QString &filePath)
     int capturedTrc = 0;
     int capturedBitDepth = 8;
     bool capturedHasHdrMeta = false;
+    // ソース映像の素のピクセル寸法 (アスペクト既定フィット判定用)。probe ループで
+    // 最初の映像ストリームから捕捉する。0 = 未取得 (probe 失敗/静止画非対応など)。
+    int srcVideoW = 0;
+    int srcVideoH = 0;
     if (avformat_open_input(&fmt, filePath.toUtf8().constData(), nullptr, nullptr) == 0) {
         if (avformat_find_stream_info(fmt, nullptr) >= 0 && fmt->duration > 0)
             duration = static_cast<double>(fmt->duration) / AV_TIME_BASE;
@@ -2957,6 +2962,8 @@ void Timeline::addClip(const QString &filePath)
             const int w = st->codecpar->width;
             const int h = st->codecpar->height;
             videoStreamFound = true;
+            srcVideoW = w;
+            srcVideoH = h;
             const hdringest::ColorInputs colorInputs =
                 hdringest::captureColorInputs(st->codecpar);
             capturedPrimaries = colorInputs.primaries;
@@ -3120,6 +3127,21 @@ void Timeline::addClip(const QString &filePath)
             wfGen->deleteLater();
         });
     wfGen->generateAsync(filePath);
+
+    // Premiere 準拠の既定フィット: アスペクトの異なるクリップを explicit 出力
+    // (SNS 縦動画プリセット等で確定したサイズ) のプロジェクトへ追加したとき、
+    // 既定 (fit=none) だと renderLayer の IgnoreAspectRatio 充填で縦/横に
+    // 引き伸ばされる。Premiere は決してアスペクトを歪めないため、ここで contain
+    // (レターボックス) を既定にする。判定は render 時と同一述語 snsfit::shouldContain
+    // をそのまま使う (アスペクト差 < 1e-4 のマッチクリップは false=フラグ未設定で
+    // byte-identical、render SSOT は不変)。explicit 出力でないプロジェクトは従来どおり
+    // none のまま (挙動不変)。cover やフィット解除へはクリップ右クリックで上書き可能。
+    if (videoStreamFound && m_projectExplicitOutput
+        && srcVideoW > 0 && srcVideoH > 0) {
+        const QSize projOut(m_projectWidth, m_projectHeight);
+        if (snsfit::shouldContain(true, projOut, QSize(srcVideoW, srcVideoH)))
+            clip.fitContain = true;
+    }
 
     if (videoTrackIdx >= 0 && videoTrackIdx < m_videoTracks.size())
         m_videoTracks[videoTrackIdx]->addClip(clip);
