@@ -5018,6 +5018,17 @@ void MainWindow::newProject()
     ProjectSettingsDialog dialog(this);
     if (dialog.exec() == QDialog::Accepted) {
         applyProjectConfig(dialog.config());
+        // Undo ベースラインを実プロジェクトサイズで張り直す。Timeline 構築時の
+        // "Initial state" は projectWidth=-1 で積まれており、これを唯一のベースラインの
+        // まま残すと、新規プロジェクトで(クリップ追加前に)いきなり解像度を変更→undo
+        // したとき、restoreState の projectWidth>0 ガードでサイズ復元がスキップされ
+        // プロジェクトが新サイズ(縦長)のまま戻らない。プロジェクト読込(applyLoadedProjectData)
+        // と同じ clear()+saveState 規律で、サイズ入りのベースラインへ置き換える。
+        if (m_timeline && m_timeline->undoManager()) {
+            m_timeline->undoManager()->clear();
+            m_timeline->undoManager()->saveState(m_timeline->currentState(),
+                                                 QStringLiteral("新規プロジェクト"));
+        }
         hideWelcomeScreen();
         updateStatusInfo();
     }
@@ -5027,7 +5038,53 @@ void MainWindow::editProjectSettings()
 {
     SequenceSettingsDialog dialog(m_projectConfig, this);
     if (dialog.exec() == QDialog::Accepted) {
-        applyProjectConfig(dialog.config());
+        const QSize oldSize(m_projectConfig.width, m_projectConfig.height);
+        const ProjectConfig newConfig = dialog.config();
+        const bool sizeChanged =
+            newConfig.width != oldSize.width() || newConfig.height != oldSize.height();
+        applyProjectConfig(newConfig);
+
+        // 出力サイズ(アスペクト)が変わったときだけクリップ再フィット + undo 記録を行う。
+        // fps やプロジェクト名だけ変えて OK したときに重複 undo エントリを積んだり
+        // none クリップを勝手に contain 化したりしないよう、サイズ変更でゲートする。
+        if (sizeChanged && m_timeline && newConfig.explicitOutputResolution) {
+            // プロジェクト解像度を変えると renderLayer の SSOT 契約
+            // (identity = IgnoreAspectRatio 充填) により、まだフィット指定のない
+            // (none=引き伸ばし)クリップが新アスペクトへ非等方に引き伸ばされる。
+            // Premiere は決して歪めないため、それらを contain (レターボックス) へ
+            // 再フィットして引き伸ばしを止める(none→contain は意図的な描画変更)。
+            // ユーザーが明示的に選んだ cover/contain は保持。マッチアスペクトの
+            // クリップは render 時に snsfit::shouldContain がゲートするので黒帯は
+            // 出ない。SNS プリセット経路(openSocialExportDialog)と同じ規律。
+            const auto videoTracks = m_timeline->videoTracks();
+            for (TimelineTrack *track : videoTracks) {
+                if (!track) continue;
+                QVector<ClipInfo> clips = track->clips();
+                bool changed = false;
+                for (ClipInfo &clip : clips) {
+                    if (!clip.fitContain && !clip.fitCover) {
+                        clip.fitContain = true;
+                        changed = true;
+                    }
+                }
+                if (changed)
+                    track->setClips(clips);
+            }
+            m_timeline->refreshPlaybackSequence();
+        }
+
+        // 解像度変更を undo 可能にする。これが無いと editProjectSettings は
+        // saveState を一切積まず、「プロジェクトを縦長に変更 → 元に戻す」を押しても
+        // プロジェクトサイズが縦長のまま戻らない(undo スタックに乗らない)。変更後の
+        // 状態(新サイズ + 再フィット済みクリップ)を snapshot として積むと、直前の
+        // スナップショット(変更前サイズ + 旧 fit)へ undo で正しく戻れる。サイズは
+        // 35a3dd2 で TimelineState に含まれているので projectOutputConfigRestored
+        // 経由で canvas/出力サイズも復元される。サイズ未変更時は積まない(no-op)。
+        if (sizeChanged && m_timeline && m_timeline->undoManager())
+            m_timeline->undoManager()->saveState(
+                m_timeline->currentState(),
+                QStringLiteral("プロジェクト設定変更"));
+
         updateStatusInfo();
     }
 }
