@@ -72,6 +72,7 @@ int runMobileSelftest();
 int runMographSelftest();
 int runMultiCamSelftest();
 int runObsSelftest();
+int runOnionSkinSelftest();
 int runParitySelftest();
 int runPlanarSelftest();
 #if __has_include("PlanarTrackerPreset.h")
@@ -245,6 +246,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "BeatDetect energy-flux onset detection + median-interval BPM estimate (7 gates)" },
     { "safe-zone",        "VEDITOR_SAFE_ZONE_SELFTEST",           runSafeZoneSelftest,           false,
       "SafeZone: SNS platform UI guide rects + apply display-local overlay (9 gates)" },
+    { "onion-skin",       "VEDITOR_ONION_SKIN_SELFTEST",          runOnionSkinSelftest,          false,
+      "OnionSkin: disabled/empty/opacity-zero no-op + display blend invariant (4 gates)" },
     { "subtitle-karaoke", "VEDITOR_SUBTITLE_KARAOKE_SELFTEST",    runSubtitleKaraokeSelftest,    false,
       "SubtitleKaraoke: active word half-open interval + spoken count boundaries (8 gates)" },
     { "sns-fit",          "VEDITOR_SNS_FIT_SELFTEST",            runSnsFitSelftest,             false,

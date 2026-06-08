@@ -1,6 +1,8 @@
 #include "VideoPlayer.h"
 #include <QSet>
 #include "GLPreview.h"
+#include "TimelineFrameRenderer.h"
+#include "Timeline.h"
 #include "UndoTrace.h"
 #include "ProxyManager.h"
 #include "TextOverlayBake.h"   // textbake::bakeOverlays (shared text baker SSOT)
@@ -2283,19 +2285,67 @@ void VideoPlayer::displayFrame(const QImage &image)
     if (m_exposureAidMode != exposureaid::AidMode::None && !display.isNull()) {
         display = exposureaid::apply(display, m_exposureAidMode, m_exposureAidConfig);
     }
-    // PV-C: プレビュー最大解像度キャップ。エイド適用後の display 専用コピーにだけ
-    // 縮小を掛け、GL アップロード/描画/スコープ前段の負荷を軽くする。
-    // m_currentFrameImage / frameComposited (上で full res 送出済) と書き出し
-    // (renderFrameAt 系=この経路を通らない) は不変。0=無制限で従来ビット同一。
-    if (m_previewMaxLongSide > 0 && !display.isNull()
-        && qMax(display.width(), display.height()) > m_previewMaxLongSide) {
-        display = (display.width() >= display.height())
-            ? display.scaledToWidth(m_previewMaxLongSide, Qt::SmoothTransformation)
-            : display.scaledToHeight(m_previewMaxLongSide, Qt::SmoothTransformation);
-    }
-    // SAFE-ZONE: SNS セーフゾーンオーバーレイ。display-local 適用のみ。export 非通過。
-    if (m_safeZonePlatform != safezone::Platform::None && !display.isNull()) {
-        display = safezone::apply(display, m_safeZonePlatform);
+    auto applyPreviewCap = [this](const QImage &src) {
+        if (m_previewMaxLongSide > 0 && !src.isNull()
+            && qMax(src.width(), src.height()) > m_previewMaxLongSide) {
+            return (src.width() >= src.height())
+                ? src.scaledToWidth(m_previewMaxLongSide, Qt::SmoothTransformation)
+                : src.scaledToHeight(m_previewMaxLongSide, Qt::SmoothTransformation);
+        }
+        return src;
+    };
+
+    if (m_onionSkin.enabled && !display.isNull()) {
+        // SAFE-ZONE: onion skin 有効時はユーザー指定どおり full-res の表示用コピーへ
+        // セーフゾーンを先に焼き、ghost 合成後に PV-C 縮小する。書き出しは非通過。
+        if (m_safeZonePlatform != safezone::Platform::None)
+            display = safezone::apply(display, m_safeZonePlatform);
+
+        // ONION-SKIN: renderFrameAt は独立した libav decoder を開く SSOT 経路。
+        // 再生中は重い前後フレーム decode を避け、通常のプレビュー描画だけ継続する。
+        if (!m_playing) {
+            QVector<QImage> before;
+            QVector<QImage> after;
+            const Timeline *tl = m_glPreview ? m_glPreview->timeline() : nullptr;
+            const qint64 durationUs = (m_sequenceDurationUs > 0)
+                ? m_sequenceDurationUs
+                : (tl ? static_cast<qint64>(tl->totalDuration() * AV_TIME_BASE) : 0);
+            const qint64 frameUs = (m_frameDurationUs > 0)
+                ? m_frameDurationUs
+                : (AV_TIME_BASE / 30);
+            const qint64 posUs = sequenceActive() ? m_timelinePositionUs : m_currentPositionUs;
+
+            auto collectGhosts = [&](int count, int direction, QVector<QImage> *out) {
+                if (!tl || !out || count <= 0 || durationUs <= 0 || frameUs <= 0)
+                    return;
+                for (int k = 1; k <= count; ++k) {
+                    const qint64 targetUs = posUs + static_cast<qint64>(direction) * frameUs * k;
+                    if (targetUs < 0 || targetUs > durationUs)
+                        continue;
+                    const QImage ghost = tlrender::renderFrameAt(tl, targetUs, display.size());
+                    if (!ghost.isNull())
+                        out->append(ghost);
+                }
+            };
+            collectGhosts(qMax(0, m_onionSkin.framesBefore), -1, &before);
+            collectGhosts(qMax(0, m_onionSkin.framesAfter), 1, &after);
+            if (!before.isEmpty() || !after.isEmpty())
+                display = onionskin::compose(display, before, after, m_onionSkin);
+        }
+
+        // PV-C: プレビュー最大解像度キャップ。onion skin 合成後の display 専用コピーにだけ
+        // 縮小を掛け、GL アップロード/描画/スコープ前段の負荷を軽くする。
+        display = applyPreviewCap(display);
+    } else {
+        // PV-C: プレビュー最大解像度キャップ。エイド適用後の display 専用コピーにだけ
+        // 縮小を掛け、GL アップロード/描画/スコープ前段の負荷を軽くする。
+        // m_currentFrameImage / frameComposited (上で full res 送出済) と書き出し
+        // (renderFrameAt 系=この経路を通らない) は不変。0=無制限で従来ビット同一。
+        display = applyPreviewCap(display);
+        // SAFE-ZONE: SNS セーフゾーンオーバーレイ。display-local 適用のみ。export 非通過。
+        if (m_safeZonePlatform != safezone::Platform::None && !display.isNull()) {
+            display = safezone::apply(display, m_safeZonePlatform);
+        }
     }
 
     if (m_useGL && m_glPreview) {
@@ -2587,6 +2637,21 @@ void VideoPlayer::setSafeZonePlatform(safezone::Platform p)
     if (m_safeZonePlatform == p)
         return;
     m_safeZonePlatform = p;
+    refreshDisplayedFrame();
+}
+
+void VideoPlayer::setOnionSkinConfig(const onionskin::Config &cfg)
+{
+    // ONION-SKIN: 前後フレームの半透明オーバーレイを切り替える。表示用 QImage の
+    // 一時コピーだけを加工し、renderFrameAt / Exporter / RenderQueue には焼き込まない。
+    const bool same = m_onionSkin.enabled == cfg.enabled
+        && m_onionSkin.framesBefore == cfg.framesBefore
+        && m_onionSkin.framesAfter == cfg.framesAfter
+        && std::abs(m_onionSkin.opacity - cfg.opacity) < 1e-9
+        && m_onionSkin.tintColors == cfg.tintColors;
+    if (same)
+        return;
+    m_onionSkin = cfg;
     refreshDisplayedFrame();
 }
 

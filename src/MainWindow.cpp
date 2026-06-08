@@ -238,6 +238,7 @@ void exporter_setAcesPipeline(const aces::AcesPipeline &pipeline);
 #include <QActionGroup>
 #include "ExposureAids.h"  // EXP-AID: 露出/フォーカス確認エイド (プレビュー表示専用)
 #include "SafeZone.h"      // SAFE-ZONE: SNS セーフゾーンオーバーレイ (プレビュー表示専用)
+#include "OnionSkin.h"     // ONION-SKIN: 前後フレーム半透明オーバーレイ (プレビュー表示専用)
 #include <QSignalBlocker>
 #include <QStackedWidget>
 #include <QLineEdit>
@@ -324,6 +325,51 @@ struct VideoSourceInfo {
     double durationSeconds = 0.0;
     QSize frameSize;
 };
+
+enum class OnionSkinPreset {
+    Off,
+    OneBeforeAfter,
+    TwoBeforeAfter,
+};
+
+onionskin::Config onionSkinConfigForPreset(onionskin::Config cfg, OnionSkinPreset preset)
+{
+    switch (preset) {
+    case OnionSkinPreset::Off:
+        cfg.enabled = false;
+        break;
+    case OnionSkinPreset::OneBeforeAfter:
+        cfg.enabled = true;
+        cfg.framesBefore = 1;
+        cfg.framesAfter = 1;
+        break;
+    case OnionSkinPreset::TwoBeforeAfter:
+        cfg.enabled = true;
+        cfg.framesBefore = 2;
+        cfg.framesAfter = 2;
+        break;
+    }
+    return cfg;
+}
+
+bool onionSkinPresetMatches(const onionskin::Config &cfg, OnionSkinPreset preset)
+{
+    switch (preset) {
+    case OnionSkinPreset::Off:
+        return !cfg.enabled;
+    case OnionSkinPreset::OneBeforeAfter:
+        return cfg.enabled && cfg.framesBefore == 1 && cfg.framesAfter == 1;
+    case OnionSkinPreset::TwoBeforeAfter:
+        return cfg.enabled && cfg.framesBefore == 2 && cfg.framesAfter == 2;
+    }
+    return false;
+}
+
+QString onionSkinOpacityText(const onionskin::Config &cfg)
+{
+    const int pct = qRound(qBound(0.0, cfg.opacity, 1.0) * 100.0);
+    return QStringLiteral("不透明度... (%1%)").arg(pct);
+}
 
 QString findFfmpegBinary()
 {
@@ -1169,6 +1215,48 @@ void MainWindow::setupUI()
                     [this, m]() { if (m_player) m_player->setExposureAidMode(m); });
         }
 
+        QMenu *onionMenu = menu.addMenu(QStringLiteral("オニオンスキン"));
+        auto *onionGroup = new QActionGroup(&menu);
+        onionGroup->setExclusive(true);
+        const onionskin::Config currentOnion = m_player
+            ? m_player->onionSkinConfig()
+            : onionskin::Config{};
+        const QPair<QString, OnionSkinPreset> onionItems[] = {
+            { QStringLiteral("オフ"),     OnionSkinPreset::Off },
+            { QStringLiteral("前1後1"),   OnionSkinPreset::OneBeforeAfter },
+            { QStringLiteral("前2後2"),   OnionSkinPreset::TwoBeforeAfter },
+        };
+        for (const auto &it : onionItems) {
+            const OnionSkinPreset preset = it.second;
+            QAction *act = onionMenu->addAction(it.first);
+            act->setCheckable(true);
+            act->setChecked(onionSkinPresetMatches(currentOnion, preset));
+            onionGroup->addAction(act);
+            connect(act, &QAction::triggered, this, [this, preset]() {
+                if (!m_player)
+                    return;
+                m_player->setOnionSkinConfig(
+                    onionSkinConfigForPreset(m_player->onionSkinConfig(), preset));
+            });
+        }
+        onionMenu->addSeparator();
+        QAction *opacityAct = onionMenu->addAction(onionSkinOpacityText(currentOnion));
+        connect(opacityAct, &QAction::triggered, this, [this]() {
+            if (!m_player)
+                return;
+            onionskin::Config cfg = m_player->onionSkinConfig();
+            bool ok = false;
+            const double pct = QInputDialog::getDouble(
+                this, QStringLiteral("オニオンスキン"),
+                QStringLiteral("不透明度 (%):"),
+                qBound(0.0, cfg.opacity, 1.0) * 100.0,
+                0.0, 100.0, 0, &ok);
+            if (!ok)
+                return;
+            cfg.opacity = qBound(0.0, pct / 100.0, 1.0);
+            m_player->setOnionSkinConfig(cfg);
+        });
+
         QMenu *pqMenu = menu.addMenu(QStringLiteral("再生プレビュー品質"));
         auto *pqGroup = new QActionGroup(&menu);
         pqGroup->setExclusive(true);
@@ -1945,6 +2033,76 @@ void MainWindow::setupMenuBar()
         });
         m_menuHelpEntries.append({szAct, QString::fromUtf8(szEntry.help)});
     }
+
+    // ONION-SKIN: 前後フレームを半透明で重ねるプレビュー表示専用オーバーレイ。
+    // renderFrameAt で取得した ghost は displayFrame 内でのみ使い、書き出しには焼き込まない。
+    viewMenu->addSeparator();
+    auto *onionMenu = viewMenu->addMenu(QStringLiteral("オニオンスキン(&O)"));
+    auto *onionGroup = new QActionGroup(this);
+    onionGroup->setExclusive(true);
+    QAction *onionOffAct = onionMenu->addAction(QStringLiteral("オフ"));
+    QAction *onionOneAct = onionMenu->addAction(QStringLiteral("前1後1"));
+    QAction *onionTwoAct = onionMenu->addAction(QStringLiteral("前2後2"));
+    for (QAction *act : {onionOffAct, onionOneAct, onionTwoAct}) {
+        act->setCheckable(true);
+        onionGroup->addAction(act);
+    }
+    onionOffAct->setChecked(true);  // 既定 OFF。displayFrame は compose を呼ばない。
+    onionMenu->addSeparator();
+    QAction *onionOpacityAct = onionMenu->addAction(
+        onionSkinOpacityText(m_player ? m_player->onionSkinConfig() : onionskin::Config{}));
+
+    auto syncOnionMenu = [this, onionOffAct, onionOneAct, onionTwoAct, onionOpacityAct]() {
+        const onionskin::Config cfg = m_player
+            ? m_player->onionSkinConfig()
+            : onionskin::Config{};
+        onionOffAct->setChecked(onionSkinPresetMatches(cfg, OnionSkinPreset::Off));
+        onionOneAct->setChecked(onionSkinPresetMatches(cfg, OnionSkinPreset::OneBeforeAfter));
+        onionTwoAct->setChecked(onionSkinPresetMatches(cfg, OnionSkinPreset::TwoBeforeAfter));
+        onionOpacityAct->setText(onionSkinOpacityText(cfg));
+    };
+    connect(onionMenu, &QMenu::aboutToShow, this, syncOnionMenu);
+    connect(onionOffAct, &QAction::triggered, this, [this]() {
+        if (m_player)
+            m_player->setOnionSkinConfig(
+                onionSkinConfigForPreset(m_player->onionSkinConfig(), OnionSkinPreset::Off));
+    });
+    connect(onionOneAct, &QAction::triggered, this, [this]() {
+        if (m_player)
+            m_player->setOnionSkinConfig(
+                onionSkinConfigForPreset(m_player->onionSkinConfig(), OnionSkinPreset::OneBeforeAfter));
+    });
+    connect(onionTwoAct, &QAction::triggered, this, [this]() {
+        if (m_player)
+            m_player->setOnionSkinConfig(
+                onionSkinConfigForPreset(m_player->onionSkinConfig(), OnionSkinPreset::TwoBeforeAfter));
+    });
+    connect(onionOpacityAct, &QAction::triggered, this,
+            [this, onionOpacityAct, syncOnionMenu]() {
+        if (!m_player)
+            return;
+        onionskin::Config cfg = m_player->onionSkinConfig();
+        bool ok = false;
+        const double pct = QInputDialog::getDouble(
+            this, QStringLiteral("オニオンスキン"),
+            QStringLiteral("不透明度 (%):"),
+            qBound(0.0, cfg.opacity, 1.0) * 100.0,
+            0.0, 100.0, 0, &ok);
+        if (!ok)
+            return;
+        cfg.opacity = qBound(0.0, pct / 100.0, 1.0);
+        m_player->setOnionSkinConfig(cfg);
+        onionOpacityAct->setText(onionSkinOpacityText(cfg));
+        syncOnionMenu();
+    });
+    m_menuHelpEntries.append({onionOffAct,
+        QStringLiteral("オニオンスキンを使わない通常表示に戻します。書き出しには影響しません。")});
+    m_menuHelpEntries.append({onionOneAct,
+        QStringLiteral("現在フレームの前後 1 フレームを半透明で重ね、動きのつながりを確認します。")});
+    m_menuHelpEntries.append({onionTwoAct,
+        QStringLiteral("現在フレームの前後 2 フレームを半透明で重ねます。古い ghost ほど薄く表示します。")});
+    m_menuHelpEntries.append({onionOpacityAct,
+        QStringLiteral("オニオンスキンの ghost 表示濃度を調整します。")});
 
     // PV-C: プレビュー最大解像度。重い高解像度素材で GL アップロード/描画/
     // スコープ負荷を下げる display 専用キャップ(書き出し非変更)。QSettings 永続。

@@ -24,6 +24,7 @@
 #include "AcesColor.h"  // AR-2: ACES シーンリファード色管理パイプライン (SSOT は MainWindow)
 #include "ExposureAids.h"  // EXP-AID: 露出/フォーカス確認エイド (プレビュー表示専用)
 #include "SafeZone.h"      // SAFE-ZONE: SNS セーフゾーンオーバーレイ (プレビュー表示専用)
+#include "OnionSkin.h"     // ONION-SKIN: 前後フレーム半透明オーバーレイ (プレビュー表示専用)
 #include "playback/CompositeFrameCache.h"     // ADAPTIVE-1: 合成フレーム LRU キャッシュ
 #include "playback/PlaybackQualityPolicy.h"   // ADAPTIVE-1: 再生品質ヒステリシスポリシー
 #include "playback/GpuLayerCompositor.h"      // STAGE3-GPU: マルチトラック GPU 合成 (既定 OFF)
@@ -131,6 +132,8 @@ public:
     void setExposureAidMode(exposureaid::AidMode mode);
     void setExposureAidConfig(const exposureaid::AidConfig &cfg);
     void setSafeZonePlatform(safezone::Platform p);  // SAFE-ZONE
+    void setOnionSkinConfig(const onionskin::Config &cfg);
+    onionskin::Config onionSkinConfig() const { return m_onionSkin; }
     // PV-C: プレビュー表示の長辺上限(px)。0=無制限。display専用(書き出し非変更)。
     void setPreviewMaxLongSide(int px);
     int previewMaxLongSide() const { return m_previewMaxLongSide; }
@@ -680,6 +683,7 @@ private:
     // 保持フレーム / 書き出しには非適用)。
     exposureaid::AidMode m_exposureAidMode = exposureaid::AidMode::None;
     safezone::Platform m_safeZonePlatform = safezone::Platform::None;  // SAFE-ZONE
+    onionskin::Config m_onionSkin;  // ONION-SKIN: display-only、既定 OFF。
     int m_previewMaxLongSide = 0;  // PV-C: 0=無制限。display専用の長辺上限。
     exposureaid::AidConfig m_exposureAidConfig;
 

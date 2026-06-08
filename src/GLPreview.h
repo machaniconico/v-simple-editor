@@ -167,6 +167,7 @@ public:
     // composeAdjustmentLayersAt(timelineUs) in paintGL. nullptr → no-op
     // (preview is bit-identical to pre-INT-1 baseline).
     void setTimeline(Timeline *t) { m_timeline = t; }
+    const Timeline *timeline() const { return m_timeline; }
 
     // Phase 1e — true only when VEDITOR_GL_INTEROP=1 AND WGL_NV_DX_interop2
     // is supported AND all 6 wglDX*NV procs resolved during initializeGL().
