@@ -18,6 +18,7 @@
 #include "playback/clipidt_flag.h"
 #include "playback/hdrmatte16_flag.h"
 #include "playback/hdrexport16_flag.h"
+#include "playback/motionblur_flag.h"
 #include "playback/SnsFit.h"
 #include "playback/swsmatrix_flag.h"
 #include "color/ClipColor.h"    // HDR Stage1 — per-clip color metadata plumbing
@@ -640,7 +641,7 @@ QImage renderOverlayLayerImage(const QImage &rgb, double videoScale,
 
 } // namespace
 
-QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
+QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize outSize)
 {
     if (!timeline || outSize.isEmpty())
         return QImage();
@@ -1138,6 +1139,34 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
     // parity exactly.
     const QImage adj = applyAdjustmentLayers(stacked, timeline, usec);
     return applyTextOverlays(adj, timeline, usec, &v1Clip);
+}
+
+QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
+{
+    return detail::renderFrameAtSingle(timeline, usec, outSize);
+}
+
+QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize,
+                     double frameDurationUs)
+{
+    if (!motionblur::enabledFromEnv() || frameDurationUs <= 0.0)
+        return detail::renderFrameAtSingle(timeline, usec, outSize);
+
+    const int n = motionblur::sampleCountFromEnv();
+    const double shutterAngle = motionblur::shutterAngleFromEnv();
+    const double windowUs = (shutterAngle / 360.0) * frameDurationUs;
+
+    QVector<QImage> samples;
+    samples.reserve(n);
+    for (int k = 0; k < n; ++k) {
+        const double centered =
+            static_cast<double>(k) - (static_cast<double>(n - 1) / 2.0);
+        const qint64 sampleUsec =
+            usec + qRound64(centered * windowUs / static_cast<double>(n));
+        samples.append(detail::renderFrameAtSingle(timeline, sampleUsec, outSize));
+    }
+
+    return motionblur::averagePremultiplied(samples);
 }
 
 namespace detail {

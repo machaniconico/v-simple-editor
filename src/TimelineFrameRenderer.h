@@ -51,8 +51,14 @@ class Timeline;
 namespace tlrender {
 
 QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize);
+QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize,
+                     double frameDurationUs);
 
 namespace detail {
+// Internal single-sample renderer. Public renderFrameAt overloads must route
+// through this directly when motion blur is disabled.
+QImage renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize outSize);
+
 // Test-only seam (used by main.cpp's S3 parity stage). Decodes a single
 // clip's frame at the given SOURCE-second position and returns it as a
 // NATIVE-resolution Format_RGBA8888 QImage — the exact same libav + sws

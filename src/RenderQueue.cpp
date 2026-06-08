@@ -889,7 +889,7 @@ void RenderQueue::startRenderPipe(int jobIndex)
 
                 const qint64 usec =
                     startUsec + static_cast<qint64>(f * usecPerFrame);
-                QImage frame = tlrender::renderFrameAt(tl, usec, outSize);
+                QImage frame = tlrender::renderFrameAt(tl, usec, outSize, usecPerFrame);
                 if (frame.isNull()) {
                     failMsg = QStringLiteral(
                         "renderFrameAt returned a null image at frame ")
@@ -1274,7 +1274,7 @@ void RenderQueue::startRenderPipeSubprocess(int jobIndex)
 
                 const qint64 usec =
                     startUsec + static_cast<qint64>(f * usecPerFrame);
-                QImage frame = tlrender::renderFrameAt(tl, usec, outSize);
+                QImage frame = tlrender::renderFrameAt(tl, usec, outSize, usecPerFrame);
                 if (frame.isNull()) {
                     proc->kill();
                     proc->waitForFinished(3000);
