@@ -308,17 +308,21 @@ QImage gradeClipNativeFrame(const QImage &native, const ClipInfo &clip)
 // RGB888 round-trip it implies — is skipped, returning the input UNTOUCHED,
 // whenever the clip has no effects, so a plain V1/overlay clip stays
 // byte-identical to the S2/S3/S4 path (no format conversion, no rounding).
-QImage applyClipFxPack(const QImage &graded, const ClipInfo &clip)
+QImage applyClipFxPack(const QImage &graded, const ClipInfo &clip,
+                       double clipLocalSeconds)
 {
     if (clip.effects.isEmpty())
         return graded;                       // strict no-op == S2/S3/S4 byte path
+
+    const QVector<VideoEffect> effects =
+        clipanim::effectiveEffectsAt(clip, clipLocalSeconds);
 
     // Genuine FX SSOT. Default ColorCorrection -> applyEffectStack's internal
     // applyColorCorrection is a strict no-op (VideoEffect.cpp:158), so this is
     // purely the effect stack applied in ClipInfo order — identical to the
     // Exporter call at Exporter.cpp:494 minus the (already-done) CC.
     const QImage out = VideoEffectProcessor::applyEffectStack(
-        graded, ColorCorrection(), clip.effects);
+        graded, ColorCorrection(), effects);
 
     // applyEffectStack emits Format_RGB888; restore the decoder's RGBA8888 so
     // downstream scale/composite is unchanged (same contract gradeClipNativeFrame
@@ -717,7 +721,7 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
         // GLPreview.cpp:910-916), so FX comes strictly after CC -> LUT. No-op when
         // the clip carries no effects, so a lone V1 clip stays byte-identical to
         // S2/S3/S4.
-        const QImage v1Fx = applyClipFxPack(v1Graded, v1Clip);
+        const QImage v1Fx = applyClipFxPack(v1Graded, v1Clip, v1LocalSec);
 
         // S7: apply the V1 clip's per-clip compositing mask (motion-tracker
         // animated) on the GRADED+FX'd native frame, BEFORE it is scaled onto
@@ -829,7 +833,8 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
         // through (same CC -> LUT -> FX -> MASK per-clip order as V1). No-op
         // for un-masked overlays, so S3's multi-track MSE stays ~0.
         QImage native = applyClipMask(
-            applyClipFxPack(gradeClipNativeFrame(nativeRaw, c), c), c, srcSec);
+            applyClipFxPack(gradeClipNativeFrame(nativeRaw, c), c, localSec),
+            c, srcSec);
         native = snsfit::maybeFit(native, c.fitContain, c.fitCover, outSize);
         RenderLayer renderLayer;
         renderLayer.clipId = renderClipId(t, idx);

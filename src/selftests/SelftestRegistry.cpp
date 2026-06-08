@@ -53,6 +53,7 @@ int runE2eSelftest();
 int runEasingSelftest();
 int runExposureAidsSelftest();
 int runExportAuditSelftest();
+int runEffectKeyframeParitySelftest();
 int runFcpxmlSelftest();
 int runFrameIoSelftest();
 int runHdrRoutingSelftest();
@@ -286,6 +287,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Preview vs export pixel-parity (S1-S11, framediff::mse, 10-bit HDR10)" },
     { "keyframe-anim-parity", "VEDITOR_KEYFRAME_ANIM_PARITY_SELFTEST", runKeyframeAnimParitySelftest, true,
       "Render-time per-clip motion/opacity keyframe evaluation parity (5 gates, byte-identical no-keyframe guard)" },
+    { "effect-keyframe-parity", "VEDITOR_EFFECT_KEYFRAME_PARITY_SELFTEST", runEffectKeyframeParitySelftest, true,
+      "Render-time per-clip effect parameter keyframe evaluation parity (4 gates, byte-identical no-keyframe guard)" },
     { "e2e",               "VEDITOR_E2E_SELFTEST",                runE2eSelftest,                true,
       "Real-media end-to-end smoke (ColorMatch decode + deHum + processAll)" },
     { "trackmatte-parity", "VEDITOR_TRACKMATTE_PARITY_SELFTEST",  runTrackMatteParitySelftest,   true,

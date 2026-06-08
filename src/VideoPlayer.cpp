@@ -3,6 +3,7 @@
 #include "GLPreview.h"
 #include "TimelineFrameRenderer.h"
 #include "Timeline.h"
+#include "EffectParamSchema.h"
 #include "UndoTrace.h"
 #include "ProxyManager.h"
 #include "TextOverlayBake.h"   // textbake::bakeOverlays (shared text baker SSOT)
@@ -123,6 +124,124 @@ const ClipInfo *clipForPlaybackEntry(const Timeline *timeline, const PlaybackEnt
     if (entry.sourceClipIndex < 0 || entry.sourceClipIndex >= clips.size())
         return nullptr;
     return &clips[entry.sourceClipIndex];
+}
+
+bool trackHasKeyframes(const KeyframeManager &keyframes, const QString &trackName)
+{
+    if (!keyframes.hasTrack(trackName))
+        return false;
+    const KeyframeTrack *track = keyframes.track(trackName);
+    return track && track->count() > 0;
+}
+
+bool hasAnyEffectKeyframes(const ClipInfo &clip)
+{
+    for (const KeyframeTrack &track : clip.keyframes.tracks()) {
+        if (track.propertyName().startsWith(QStringLiteral("effect."))
+            && track.count() > 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool sameEffectValue(const VideoEffect &a, const VideoEffect &b)
+{
+    return a.type == b.type
+        && a.enabled == b.enabled
+        && a.param1 == b.param1
+        && a.param2 == b.param2
+        && a.param3 == b.param3
+        && a.keyColor == b.keyColor;
+}
+
+QVector<int> resolvePreviewEffectSourceIndices(const QVector<VideoEffect> &source,
+                                               const QVector<VideoEffect> &preview)
+{
+    QVector<int> indices;
+    indices.reserve(preview.size());
+
+    int searchFrom = 0;
+    for (const VideoEffect &effect : preview) {
+        int found = -1;
+        for (int i = searchFrom; i < source.size(); ++i) {
+            if (sameEffectValue(source[i], effect)) {
+                found = i;
+                break;
+            }
+        }
+        if (found < 0) {
+            for (int i = searchFrom; i < source.size(); ++i) {
+                if (source[i].type == effect.type) {
+                    found = i;
+                    break;
+                }
+            }
+        }
+        indices.append(found);
+        if (found >= 0)
+            searchFrom = found + 1;
+    }
+
+    return indices;
+}
+
+QVector<VideoEffect> effectivePreviewEffectsAt(
+    const QVector<VideoEffect> &staticEffects,
+    const Timeline *timeline,
+    const QVector<PlaybackEntry> &sequence,
+    qint64 timelineUsec)
+{
+    if (staticEffects.isEmpty() || !timeline)
+        return staticEffects;
+
+    const int selectedClip = timeline->selectedVideoClipIndex();
+    if (selectedClip < 0)
+        return staticEffects;
+
+    const PlaybackEntry *entry = nullptr;
+    for (const PlaybackEntry &candidate : sequence) {
+        if (candidate.sourceTrack == 0
+            && candidate.sourceClipIndex == selectedClip) {
+            entry = &candidate;
+            break;
+        }
+    }
+    if (!entry)
+        return staticEffects;
+
+    const ClipInfo *clip = clipForPlaybackEntry(timeline, *entry);
+    if (!clip || !hasAnyEffectKeyframes(*clip))
+        return staticEffects;
+
+    QVector<VideoEffect> effects = staticEffects;
+    const QVector<int> sourceIndices =
+        resolvePreviewEffectSourceIndices(clip->effects, staticEffects);
+    const double clipLocalSec =
+        (static_cast<double>(timelineUsec) - entry->timelineStart * 1'000'000.0)
+        / 1'000'000.0;
+
+    for (int i = 0; i < effects.size() && i < sourceIndices.size(); ++i) {
+        const int sourceIndex = sourceIndices[i];
+        if (sourceIndex < 0)
+            continue;
+
+        const auto schema = effectctrl::paramSchemaFor(effects[i].type);
+        for (const auto &def : schema) {
+            const QString trackName =
+                QStringLiteral("effect.%1.%2").arg(sourceIndex).arg(def.name);
+            if (!trackHasKeyframes(clip->keyframes, trackName))
+                continue;
+
+            const double currentValue =
+                effectctrl::paramValue(effects[i], def.name);
+            const double value =
+                clip->keyframes.valueAt(trackName, clipLocalSec, currentValue);
+            effectctrl::setParamValue(effects[i], def.name, value);
+        }
+    }
+
+    return effects;
 }
 
 void applyLayerMotionOpacity(const Timeline *timeline,
@@ -2471,16 +2590,24 @@ QImage VideoPlayer::composeFrameWithOverlays(const QImage &source) const
 
     const bool applyPreviewFx = !m_previewEffects.isEmpty()
                                 && (m_previewEffectsLive || !m_playing);
+    const qint64 previewTimelineUsec =
+        sequenceActive() ? m_timelinePositionUs : m_currentPositionUs;
+    const QVector<VideoEffect> previewEffects = applyPreviewFx
+        ? effectivePreviewEffectsAt(m_previewEffects,
+                                    m_glPreview ? m_glPreview->timeline() : nullptr,
+                                    m_sequence,
+                                    previewTimelineUsec)
+        : QVector<VideoEffect>();
 
     // Preview proxy: only shrink during playback, keep paused frames full-res.
     const int proxy = (applyPreviewFx && m_playing) ? qMax(1, m_proxyDivisor) : 1;
-    auto runProxy = [proxy, this](const QImage &img) {
+    auto runProxy = [proxy, &previewEffects](const QImage &img) {
         if (proxy <= 1)
-            return VideoEffectProcessor::applyEffectStack(img, {}, m_previewEffects);
+            return VideoEffectProcessor::applyEffectStack(img, {}, previewEffects);
         const QImage small = img.scaled(img.width() / proxy, img.height() / proxy,
                                         Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
         const QImage processed = VideoEffectProcessor::applyEffectStack(
-            small, {}, m_previewEffects);
+            small, {}, previewEffects);
         return processed.scaled(img.width(), img.height(),
                                 Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
     };
@@ -2490,8 +2617,7 @@ QImage VideoPlayer::composeFrameWithOverlays(const QImage &source) const
         return runProxy(source);
     }
 
-    const double nowSec = static_cast<double>(
-        sequenceActive() ? m_timelinePositionUs : m_currentPositionUs) / AV_TIME_BASE;
+    const double nowSec = static_cast<double>(previewTimelineUsec) / AV_TIME_BASE;
 
     // US-T32 WYSIWYG: the inline text tool draws at the literal pointSize
     // in widget coordinates. When compose bakes overlays into the source

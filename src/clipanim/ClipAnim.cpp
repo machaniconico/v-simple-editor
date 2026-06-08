@@ -1,5 +1,6 @@
 #include "ClipAnim.h"
 
+#include "../EffectParamSchema.h"
 #include "../Keyframe.h"
 #include "../Timeline.h"
 
@@ -27,6 +28,17 @@ bool hasAnyMotionKeyframes(const ClipInfo& clip)
         || trackHasKeyframes(clip.keyframes, kPosYTrack)
         || trackHasKeyframes(clip.keyframes, kRotationTrack)
         || trackHasKeyframes(clip.keyframes, kOpacityTrack);
+}
+
+bool hasAnyEffectKeyframes(const ClipInfo& clip)
+{
+    for (const KeyframeTrack &track : clip.keyframes.tracks()) {
+        if (track.propertyName().startsWith(QStringLiteral("effect."))
+            && track.count() > 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 } // namespace
@@ -72,6 +84,34 @@ double effectiveOpacityAt(const ClipInfo& clip, double clipLocalSeconds,
     if (!trackHasKeyframes(clip.keyframes, kOpacityTrack))
         return staticOpacity;
     return clip.keyframes.valueAt(kOpacityTrack, clipLocalSeconds, staticOpacity);
+}
+
+QVector<VideoEffect> effectiveEffectsAt(const ClipInfo& clip,
+                                        double clipLocalSeconds)
+{
+    // Hot path: most clips have no effect-parameter keyframes. Return before
+    // copying/mapping parameters so the static FX path keeps legacy values
+    // byte-for-byte.
+    if (!hasAnyEffectKeyframes(clip))
+        return clip.effects;
+
+    QVector<VideoEffect> effects = clip.effects;
+    for (int i = 0; i < effects.size(); ++i) {
+        const auto schema = effectctrl::paramSchemaFor(effects[i].type);
+        for (const auto &def : schema) {
+            const QString trackName =
+                QStringLiteral("effect.%1.%2").arg(i).arg(def.name);
+            if (!trackHasKeyframes(clip.keyframes, trackName))
+                continue;
+
+            const double currentValue =
+                effectctrl::paramValue(effects[i], def.name);
+            const double value =
+                clip.keyframes.valueAt(trackName, clipLocalSeconds, currentValue);
+            effectctrl::setParamValue(effects[i], def.name, value);
+        }
+    }
+    return effects;
 }
 
 } // namespace clipanim

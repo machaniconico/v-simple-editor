@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../ClipGeometry.h"
+#include "../VideoEffect.h"
 
 struct ClipInfo;
 
@@ -16,5 +17,11 @@ clipgeom::ClipTransform effectiveTransformAt(const ClipInfo& clip,
 // staticOpacity unchanged.
 double effectiveOpacityAt(const ClipInfo& clip, double clipLocalSeconds,
                           double staticOpacity);
+
+// Returns effective effect parameters at clip-local time.
+// If no effect.* keyframe tracks exist, returns the static effect stack
+// unchanged.
+QVector<VideoEffect> effectiveEffectsAt(const ClipInfo& clip,
+                                        double clipLocalSeconds);
 
 } // namespace clipanim
