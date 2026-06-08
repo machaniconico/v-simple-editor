@@ -61,6 +61,7 @@ int runHwPerfSelftest();
 int runImportIngestSelftest();
 int runImportSelftest();
 int runInstagramSelftest();
+int runKeyframeAnimParitySelftest();
 int runLibavcoreDecodeSelftest();
 int runLibavcoreEncodeSelftest();
 int runLiveMatteResolveSelftest();
@@ -283,6 +284,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     // QApplication-required (needsQApplication=true) ----------------------
     { "parity",            "VEDITOR_PARITY_SELFTEST",             runParitySelftest,             true,
       "Preview vs export pixel-parity (S1-S11, framediff::mse, 10-bit HDR10)" },
+    { "keyframe-anim-parity", "VEDITOR_KEYFRAME_ANIM_PARITY_SELFTEST", runKeyframeAnimParitySelftest, true,
+      "Render-time per-clip motion/opacity keyframe evaluation parity (5 gates, byte-identical no-keyframe guard)" },
     { "e2e",               "VEDITOR_E2E_SELFTEST",                runE2eSelftest,                true,
       "Real-media end-to-end smoke (ColorMatch decode + deHum + processAll)" },
     { "trackmatte-parity", "VEDITOR_TRACKMATTE_PARITY_SELFTEST",  runTrackMatteParitySelftest,   true,

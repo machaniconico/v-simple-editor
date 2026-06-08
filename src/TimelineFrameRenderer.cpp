@@ -10,6 +10,7 @@
 #include "MotionTracker.h"      // S7 — genuine TrackingResult::positionAtTime
 #include "TrackMatteBake.h"     // TM-3 — shared SSOT track-matte compositor
 #include "ClipGeometry.h"       // G3 — canonical clip-placement SSOT (clipgeom)
+#include "clipanim/ClipAnim.h"  // S1 — motion/opacity keyframe evaluation
 #include "TrackMatteKey.h"      // RM-1.1 — single shared clip-key formula
 #include "playback/TrackMatteCompose16.h"
 #include "playback/TlrCompose16.h"
@@ -665,6 +666,7 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
     ClipInfo hiddenV1Clip{};
     hiddenV1Clip.opacity = 0.0;
     const ClipInfo *v1ClipPtr = &hiddenV1Clip;
+    double v1EffectiveOpacity = 0.0;
     int v1Idx = -1;
     double v1Start = 0.0;
     QImage base;
@@ -689,6 +691,14 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
         // (consistent with effectiveDuration() in Timeline.h:124-127).
         const double v1LocalSec = targetSec - v1Start;            // >= 0
         const double v1SourceSec = v1Clip.inPoint + v1LocalSec * v1Clip.speed;
+        const bool v1HasKeyframes = v1Clip.keyframes.hasAnyKeyframes();
+        const clipgeom::ClipTransform v1Transform = v1HasKeyframes
+            ? clipanim::effectiveTransformAt(v1Clip, v1LocalSec)
+            : clipgeom::ClipTransform{v1Clip.videoScale, v1Clip.videoDx,
+                                      v1Clip.videoDy, v1Clip.rotation2DDegrees};
+        v1EffectiveOpacity = v1HasKeyframes
+            ? clipanim::effectiveOpacityAt(v1Clip, v1LocalSec, v1Clip.opacity)
+            : v1Clip.opacity;
 
         const QImage v1NativeRaw = decodeClipFrameNative(v1Clip.filePath, v1SourceSec);
         if (v1NativeRaw.isNull())
@@ -732,17 +742,16 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
         // rotate, motion-track) routes through clipgeom::renderLayer so export
         // matches the GLPreview transform — closing the edit≠export gap for V1.
         const bool v1TransformIsDefault =
-            v1Clip.videoScale       == 1.0 &&
-            v1Clip.videoDx          == 0.0 &&
-            v1Clip.videoDy          == 0.0 &&
-            v1Clip.rotation2DDegrees == 0.0;
+            v1Transform.videoScale == 1.0 &&
+            v1Transform.videoDx == 0.0 &&
+            v1Transform.videoDy == 0.0 &&
+            v1Transform.rotationDeg == 0.0;
         base = v1TransformIsDefault && !contained
             ? v1Contained.scaled(outSize, Qt::IgnoreAspectRatio,
                                  Qt::SmoothTransformation)
             : clipgeom::renderLayer(
                   v1Contained,
-                  clipgeom::ClipTransform{v1Clip.videoScale, v1Clip.videoDx,
-                                          v1Clip.videoDy, v1Clip.rotation2DDegrees},
+                  v1Transform,
                   outSize, /*smooth=*/true);
     }
     const ClipInfo &v1Clip = *v1ClipPtr;
@@ -771,8 +780,8 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
         baseLayer.image = base;
         baseLayer.colorMeta = v1Clip.colorMeta;
         baseLayer.layer.name = v1Clip.displayName;
-        baseLayer.layer.visible = v1Clip.opacity > 0.001;
-        baseLayer.layer.opacity = qBound(0.0, v1Clip.opacity, 1.0);
+        baseLayer.layer.visible = v1EffectiveOpacity > 0.001;
+        baseLayer.layer.opacity = qBound(0.0, v1EffectiveOpacity, 1.0);
         baseLayer.layer.blendMode = BlendMode::Normal;
         baseLayer.layer.zOrder = 0;
         baseLayer.layer.inPoint = v1Start;
@@ -796,6 +805,14 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
         const ClipInfo &c = clips[idx];
         const double localSec = targetSec - start;            // >= 0
         const double srcSec = c.inPoint + localSec * c.speed;
+        const bool cHasKeyframes = c.keyframes.hasAnyKeyframes();
+        const clipgeom::ClipTransform cTransform = cHasKeyframes
+            ? clipanim::effectiveTransformAt(c, localSec)
+            : clipgeom::ClipTransform{c.videoScale, c.videoDx,
+                                      c.videoDy, c.rotation2DDegrees};
+        const double cOpacity = cHasKeyframes
+            ? clipanim::effectiveOpacityAt(c, localSec, c.opacity)
+            : c.opacity;
         const QImage nativeRaw = decodeClipFrameNative(c.filePath, srcSec);
         if (nativeRaw.isNull())
             continue;
@@ -827,17 +844,17 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
         // layer fill at VideoPlayer.cpp:3656/3734).
         OverlayLayer overlay;
         overlay.rgb = rgb;
-        overlay.opacity = c.opacity;
-        overlay.videoScale = c.videoScale;
-        overlay.videoDx = c.videoDx;
-        overlay.videoDy = c.videoDy;
-        overlay.rotationDeg = c.rotation2DDegrees;   // G3: carry clip rotation
+        overlay.opacity = cOpacity;
+        overlay.videoScale = cTransform.videoScale;
+        overlay.videoDx = cTransform.videoDx;
+        overlay.videoDy = cTransform.videoDy;
+        overlay.rotationDeg = cTransform.rotationDeg;   // G3: carry clip rotation
         overlay.colorMeta = c.colorMeta;
         overlays.append(overlay);
 
         renderLayer.layer.name = c.displayName;
-        renderLayer.layer.visible = c.opacity > 0.001;
-        renderLayer.layer.opacity = qBound(0.0, c.opacity, 1.0);
+        renderLayer.layer.visible = cOpacity > 0.001;
+        renderLayer.layer.opacity = qBound(0.0, cOpacity, 1.0);
         renderLayer.layer.blendMode = BlendMode::Normal;
         renderLayer.layer.zOrder = t;
         renderLayer.layer.inPoint = start;
@@ -847,8 +864,8 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
         // including rotation, so trackmatte::composite receives correctly
         // placed layers. The matte/blend math in composite() is untouched.
         renderLayer.image = renderOverlayLayerImage(
-            rgb, c.videoScale, c.videoDx, c.videoDy,
-            c.rotation2DDegrees, outSize);
+            rgb, cTransform.videoScale, cTransform.videoDx, cTransform.videoDy,
+            cTransform.rotationDeg, outSize);
         renderLayers.append(renderLayer);
     }
 
@@ -964,7 +981,7 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
                 opacities.append(qBound(0.0, L.opacity, 1.0));
             }
 
-            const double v1Opacity = qBound(0.0, v1Clip.opacity, 1.0);
+            const double v1Opacity = qBound(0.0, v1EffectiveOpacity, 1.0);
             if (v1Opacity > 0.001) {
                 QImage v1Base = base;
                 if (odtEnabled)
@@ -1013,7 +1030,7 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
         }
         // V1 base painted last → on top. `base` is already placed at outSize
         // via the V1 clip transform (fast-path scaled() or clipgeom).
-        const double v1Opacity = qBound(0.0, v1Clip.opacity, 1.0);
+        const double v1Opacity = qBound(0.0, v1EffectiveOpacity, 1.0);
         if (v1Opacity > 0.001) {
             p.setOpacity(v1Opacity);
             p.drawImage(0, 0, base);

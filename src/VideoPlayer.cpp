@@ -7,6 +7,7 @@
 #include "ProxyManager.h"
 #include "TextOverlayBake.h"   // textbake::bakeOverlays (shared text baker SSOT)
 #include "ClipGeometry.h"      // clipgeom::renderLayer (shared clip-placement SSOT)
+#include "clipanim/ClipAnim.h" // S1 — motion/opacity keyframe evaluation
 #include "TrackMatteKey.h"     // STAGE4B: trackMatteClipKey (canonical matte clip key)
 #include "playback/LiveMatteResolve.h" // STAGE4B: clipstack::resolveLiveMatteSources
 #include "playback/clipidt_flag.h"
@@ -108,6 +109,52 @@ inline int playbackProxyDivisor()
     if (g_playbackProxyPref.compare_exchange_strong(expected, v, std::memory_order_relaxed))
         return v;
     return expected;
+}
+
+const ClipInfo *clipForPlaybackEntry(const Timeline *timeline, const PlaybackEntry &entry)
+{
+    if (!timeline)
+        return nullptr;
+    const auto &tracks = timeline->videoTracks();
+    const auto *track = tracks.value(entry.sourceTrack, nullptr);
+    if (!track)
+        return nullptr;
+    const auto &clips = track->clips();
+    if (entry.sourceClipIndex < 0 || entry.sourceClipIndex >= clips.size())
+        return nullptr;
+    return &clips[entry.sourceClipIndex];
+}
+
+void applyLayerMotionOpacity(const Timeline *timeline,
+                             const PlaybackEntry &entry,
+                             qint64 timelineUsec,
+                             double staticOpacity,
+                             VideoPlayer::DecodedLayer *layer)
+{
+    if (!layer)
+        return;
+
+    layer->opacity = staticOpacity;
+    layer->videoScale = entry.videoScale;
+    layer->videoDx = entry.videoDx;
+    layer->videoDy = entry.videoDy;
+    layer->rotation2DDegrees = entry.rotation2DDegrees;
+
+    const ClipInfo *clip = clipForPlaybackEntry(timeline, entry);
+    if (!clip || !clip->keyframes.hasAnyKeyframes())
+        return;
+
+    const double clipLocalSec =
+        (static_cast<double>(timelineUsec) - entry.timelineStart * 1'000'000.0)
+        / 1'000'000.0;
+    const clipgeom::ClipTransform transform =
+        clipanim::effectiveTransformAt(*clip, clipLocalSec);
+    layer->opacity =
+        clipanim::effectiveOpacityAt(*clip, clipLocalSec, staticOpacity);
+    layer->videoScale = transform.videoScale;
+    layer->videoDx = transform.videoDx;
+    layer->videoDy = transform.videoDy;
+    layer->rotation2DDegrees = transform.rotationDeg;
 }
 
 // Phase 1e Win #9 — canvas proxy divisor for the multi-track compose path.
@@ -2156,10 +2203,8 @@ void VideoPlayer::displaySeekFrameConformed(const QImage &v1Image)
     layer.opacity = 1.0;
     if (entry) {
         layer.colorMeta = entry->colorMeta;
-        layer.videoScale = entry->videoScale;
-        layer.videoDx = entry->videoDx;
-        layer.videoDy = entry->videoDy;
-        layer.rotation2DDegrees = entry->rotation2DDegrees;
+        applyLayerMotionOpacity(m_glPreview ? m_glPreview->timeline() : nullptr,
+                                *entry, m_timelinePositionUs, layer.opacity, &layer);
         layer.sequenceIdx = m_activeEntry;
     }
     layer.sourceTrack = 0;
@@ -3551,12 +3596,9 @@ void VideoPlayer::refreshDisplayedFrame()
                 DecodedLayer layer;
                 layer.rgb = m_lastV1RawFrame;
                 layer.isFresh = true;
-                layer.opacity = e.opacity;
                 layer.colorMeta = e.colorMeta;
-                layer.videoScale = e.videoScale;
-                layer.videoDx = e.videoDx;
-                layer.videoDy = e.videoDy;
-                layer.rotation2DDegrees = e.rotation2DDegrees;
+                applyLayerMotionOpacity(m_glPreview ? m_glPreview->timeline() : nullptr,
+                                        e, m_timelinePositionUs, e.opacity, &layer);
                 layer.sourceTrack = e.sourceTrack;
                 layer.sequenceIdx = m_activeEntry;
                 layer.fitContain = e.fitContain;
@@ -4141,12 +4183,9 @@ void VideoPlayer::handlePlaybackTick()
                     DecodedLayer layer;
                     layer.rgb = m_lastV1RawFrame;
                     layer.isFresh = true;
-                    layer.opacity = e.opacity;
                     layer.colorMeta = e.colorMeta;
-                    layer.videoScale = e.videoScale;
-                    layer.videoDx = e.videoDx;
-                    layer.videoDy = e.videoDy;
-                    layer.rotation2DDegrees = e.rotation2DDegrees;
+                    applyLayerMotionOpacity(m_glPreview ? m_glPreview->timeline() : nullptr,
+                                            e, m_timelinePositionUs, e.opacity, &layer);
                     layer.sourceTrack = e.sourceTrack;
                     layer.sequenceIdx = idx;
                     layer.fitContain = e.fitContain;
@@ -4234,12 +4273,9 @@ void VideoPlayer::handlePlaybackTick()
                     if (!harvestOverlayLayer(e, idx, &layer))
                         continue;
                 }
-                layer.opacity = e.opacity;
                 layer.colorMeta = e.colorMeta;
-                layer.videoScale = e.videoScale;
-                layer.videoDx = e.videoDx;
-                layer.videoDy = e.videoDy;
-                layer.rotation2DDegrees = e.rotation2DDegrees;
+                applyLayerMotionOpacity(m_glPreview ? m_glPreview->timeline() : nullptr,
+                                        e, m_timelinePositionUs, e.opacity, &layer);
                 layer.sourceTrack = e.sourceTrack;
                 layer.sequenceIdx = idx;
                 layer.fitContain = e.fitContain;
@@ -5758,12 +5794,9 @@ bool VideoPlayer::finalizeOverlayFromDecoder(const PlaybackEntry &e, int seqIdx,
             return false;
     }
 
-    out->opacity            = e.opacity;
     out->colorMeta          = e.colorMeta;
-    out->videoScale         = e.videoScale;
-    out->videoDx            = e.videoDx;
-    out->videoDy            = e.videoDy;
-    out->rotation2DDegrees  = e.rotation2DDegrees;
+    applyLayerMotionOpacity(m_glPreview ? m_glPreview->timeline() : nullptr,
+                            e, m_timelinePositionUs, e.opacity, out);
     out->sourceTrack        = e.sourceTrack;
     out->sequenceIdx        = seqIdx;
     out->fitContain         = e.fitContain;

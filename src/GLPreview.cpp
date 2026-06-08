@@ -5,6 +5,7 @@
 #include "UndoTrace.h"
 #include "AdjustmentLayer.h"
 #include "Camera3D.h"
+#include "clipanim/ClipAnim.h"
 #include "SurfaceTool.h"
 #include <algorithm>
 #include <cmath>
@@ -133,7 +134,8 @@ QImage applyPlanarRotation(const QImage &image, double degrees)
     return rotated;
 }
 
-PreviewClipMotion makePreviewMotion(const ClipInfo &clip, int trackIdx, int clipIdx)
+PreviewClipMotion makePreviewMotion(const ClipInfo &clip, int trackIdx, int clipIdx,
+                                    double clipLocalSeconds)
 {
     PreviewClipMotion motion;
     motion.valid = true;
@@ -146,6 +148,16 @@ PreviewClipMotion makePreviewMotion(const ClipInfo &clip, int trackIdx, int clip
     motion.opacity = clip.opacity;
     motion.is3DLayer = clip.is3DLayer;
     motion.layer3D = clip.is3DLayer ? clip.layer3D : Layer3DTransform{};
+    if (clip.keyframes.hasAnyKeyframes()) {
+        const clipgeom::ClipTransform transform =
+            clipanim::effectiveTransformAt(clip, clipLocalSeconds);
+        motion.scale = transform.videoScale;
+        motion.dx = transform.videoDx;
+        motion.dy = transform.videoDy;
+        motion.rotation2D = transform.rotationDeg;
+        motion.opacity =
+            clipanim::effectiveOpacityAt(clip, clipLocalSeconds, clip.opacity);
+    }
     return motion;
 }
 
@@ -160,6 +172,7 @@ PreviewClipMotion resolvePreviewClipMotion(const Timeline *timeline, double time
         int trackIdx = -1;
         int clipIdx = -1;
         const ClipInfo *clip = nullptr;
+        double timelineStartSec = 0.0;
     };
 
     QVector<ActiveClipRef> activeClips;
@@ -180,7 +193,7 @@ PreviewClipMotion resolvePreviewClipMotion(const Timeline *timeline, double time
             if (durationSec > 0.0
                 && timelineSec >= startSec - 1e-6
                 && timelineSec <= endSec + 1e-6) {
-                activeClips.append(ActiveClipRef{trackIdx, clipIdx, &clip});
+                activeClips.append(ActiveClipRef{trackIdx, clipIdx, &clip, startSec});
                 break;
             }
             accumSec = endSec;
@@ -194,7 +207,8 @@ PreviewClipMotion resolvePreviewClipMotion(const Timeline *timeline, double time
     if (activeClips.size() == 1)
         return makePreviewMotion(*activeClips.first().clip,
                                  activeClips.first().trackIdx,
-                                 activeClips.first().clipIdx);
+                                 activeClips.first().clipIdx,
+                                 timelineSec - activeClips.first().timelineStartSec);
 
     for (int trackIdx = 0; trackIdx < videoTracks.size(); ++trackIdx) {
         const auto *track = videoTracks[trackIdx];
@@ -205,21 +219,26 @@ PreviewClipMotion resolvePreviewClipMotion(const Timeline *timeline, double time
             continue;
         for (const ActiveClipRef &ref : activeClips) {
             if (ref.trackIdx == trackIdx && ref.clipIdx == selectedClipIdx)
-                return makePreviewMotion(*ref.clip, ref.trackIdx, ref.clipIdx);
+                return makePreviewMotion(*ref.clip, ref.trackIdx, ref.clipIdx,
+                                         timelineSec - ref.timelineStartSec);
         }
     }
 
     for (const ActiveClipRef &ref : activeClips) {
-        if (fuzzyMatchMotionValue(ref.clip->videoScale, currentScale)
-            && fuzzyMatchMotionValue(ref.clip->videoDx, currentDx)
-            && fuzzyMatchMotionValue(ref.clip->videoDy, currentDy)) {
-            return makePreviewMotion(*ref.clip, ref.trackIdx, ref.clipIdx);
+        const PreviewClipMotion motion =
+            makePreviewMotion(*ref.clip, ref.trackIdx, ref.clipIdx,
+                              timelineSec - ref.timelineStartSec);
+        if (fuzzyMatchMotionValue(motion.scale, currentScale)
+            && fuzzyMatchMotionValue(motion.dx, currentDx)
+            && fuzzyMatchMotionValue(motion.dy, currentDy)) {
+            return motion;
         }
     }
 
     return makePreviewMotion(*activeClips.first().clip,
                              activeClips.first().trackIdx,
-                             activeClips.first().clipIdx);
+                             activeClips.first().clipIdx,
+                             timelineSec - activeClips.first().timelineStartSec);
 }
 } // namespace
 
