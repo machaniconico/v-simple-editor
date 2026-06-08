@@ -596,7 +596,7 @@ void KeyframeDialog::onSelectionChanged()
 void KeyframeDialog::refreshList()
 {
     m_kfList->clear();
-    static const char* interpNames[] = {"Linear", "EaseIn", "EaseOut", "EaseInOut", "Hold"};
+    static const char* interpNames[] = {"Linear", "EaseIn", "EaseOut", "EaseInOut", "Hold", "Bezier"};
     for (const auto &kf : m_track.keyframes()) {
         m_kfList->addItem(QString("%1s = %2 (%3)")
             .arg(kf.time, 0, 'f', 2)

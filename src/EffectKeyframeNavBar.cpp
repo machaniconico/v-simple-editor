@@ -1,5 +1,6 @@
 #include "EffectKeyframeNavBar.h"
 
+#include "EasingCurveEditorDialog.h"
 #include "Keyframe.h"
 
 #include <QActionGroup>
@@ -344,6 +345,49 @@ void EffectKeyframeNavBar::showDiamondContextMenu(int index, const QPoint &globa
     addInterpolationAction(QStringLiteral("EaseOut"), KeyframePoint::EaseOut);
     addInterpolationAction(QStringLiteral("EaseInOut"), KeyframePoint::EaseInOut);
     addInterpolationAction(QStringLiteral("Hold"), KeyframePoint::Hold);
+
+    interpolationMenu->addSeparator();
+    QAction *editCurveAction = interpolationMenu->addAction(QStringLiteral("イージングカーブを編集…"));
+    connect(editCurveAction, &QAction::triggered, this, [this, index]() {
+        if (!m_track) {
+            return;
+        }
+
+        auto &kfs = mutableKeyframes(m_track);
+        if (index < 0 || index >= kfs.size()) {
+            return;
+        }
+
+        EasingCurveEditorDialog dialog(this);
+        if (kfs[index].interpolation == KeyframePoint::Bezier) {
+            dialog.setInitialCurve(kfs[index].bezX1, kfs[index].bezY1,
+                                   kfs[index].bezX2, kfs[index].bezY2);
+        } else {
+            dialog.setInitialCurve(0.0, 0.0, 1.0, 1.0);
+        }
+
+        if (dialog.exec() != QDialog::Accepted) {
+            return;
+        }
+
+        double x1 = 0.0;
+        double y1 = 0.0;
+        double x2 = 1.0;
+        double y2 = 1.0;
+        dialog.getCurve(x1, y1, x2, y2);
+
+        auto &updatedKfs = mutableKeyframes(m_track);
+        if (index < 0 || index >= updatedKfs.size()) {
+            return;
+        }
+        updatedKfs[index].interpolation = KeyframePoint::Bezier;
+        updatedKfs[index].bezX1 = x1;
+        updatedKfs[index].bezY1 = y1;
+        updatedKfs[index].bezX2 = x2;
+        updatedKfs[index].bezY2 = y2;
+        update();
+        emit trackChanged();
+    });
 
     connect(deleteAction, &QAction::triggered, this, [this, index]() {
         if (!m_track) {

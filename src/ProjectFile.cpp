@@ -1480,11 +1480,7 @@ QJsonObject ProjectFile::keyframeTrackToJson(const KeyframeTrack &track)
 
     QJsonArray kfArr;
     for (const auto &kf : track.keyframes()) {
-        QJsonObject kfObj;
-        kfObj["time"] = kf.time;
-        kfObj["value"] = kf.value;
-        kfObj["interpolation"] = static_cast<int>(kf.interpolation);
-        kfArr.append(kfObj);
+        kfArr.append(keyframePointToJson(kf));
     }
     obj["keyframes"] = kfArr;
     return obj;
@@ -1494,11 +1490,9 @@ KeyframeTrack ProjectFile::keyframeTrackFromJson(const QJsonObject &obj)
 {
     KeyframeTrack track(obj["property"].toString(), obj["defaultValue"].toDouble());
     for (const auto &v : obj["keyframes"].toArray()) {
-        QJsonObject kfObj = v.toObject();
-        track.addKeyframe(
-            kfObj["time"].toDouble(),
-            kfObj["value"].toDouble(),
-            static_cast<KeyframePoint::Interpolation>(kfObj["interpolation"].toInt()));
+        const KeyframePoint kf = keyframePointFromJson(v.toObject());
+        track.addKeyframe(kf.time, kf.value, kf.interpolation,
+                          kf.bezX1, kf.bezY1, kf.bezX2, kf.bezY2);
     }
     return track;
 }

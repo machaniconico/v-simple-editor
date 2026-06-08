@@ -1,19 +1,57 @@
 #include "Keyframe.h"
+#include "EasingCurveModel.h"
+
 #include <algorithm>
 #include <cmath>
+
+namespace {
+
+constexpr double kIdentityBezX1 = 0.0;
+constexpr double kIdentityBezY1 = 0.0;
+constexpr double kIdentityBezX2 = 1.0;
+constexpr double kIdentityBezY2 = 1.0;
+
+bool hasNonIdentityBezier(const KeyframePoint &kf)
+{
+    return kf.bezX1 != kIdentityBezX1
+        || kf.bezY1 != kIdentityBezY1
+        || kf.bezX2 != kIdentityBezX2
+        || kf.bezY2 != kIdentityBezY2;
+}
+
+KeyframePoint::Interpolation interpolationFromJson(const QJsonObject &obj)
+{
+    if (obj[QStringLiteral("interp")].toString() == QStringLiteral("Bezier")) {
+        return KeyframePoint::Bezier;
+    }
+    return static_cast<KeyframePoint::Interpolation>(
+        obj[QStringLiteral("interpolation")].toInt(0));
+}
+
+} // namespace
 
 // --- KeyframeTrack ---
 
 KeyframeTrack::KeyframeTrack(const QString &property, double defaultValue)
     : m_property(property), m_defaultValue(defaultValue) {}
 
-void KeyframeTrack::addKeyframe(double time, double value, KeyframePoint::Interpolation interp)
+void KeyframeTrack::addKeyframe(double time,
+                                double value,
+                                KeyframePoint::Interpolation interp,
+                                double bezX1,
+                                double bezY1,
+                                double bezX2,
+                                double bezY2)
 {
     // Remove existing keyframe at same time
     for (int i = 0; i < m_keyframes.size(); ++i) {
         if (std::abs(m_keyframes[i].time - time) < 0.001) {
             m_keyframes[i].value = value;
             m_keyframes[i].interpolation = interp;
+            m_keyframes[i].bezX1 = bezX1;
+            m_keyframes[i].bezY1 = bezY1;
+            m_keyframes[i].bezX2 = bezX2;
+            m_keyframes[i].bezY2 = bezY2;
             return;
         }
     }
@@ -22,6 +60,10 @@ void KeyframeTrack::addKeyframe(double time, double value, KeyframePoint::Interp
     kf.time = time;
     kf.value = value;
     kf.interpolation = interp;
+    kf.bezX1 = bezX1;
+    kf.bezY1 = bezY1;
+    kf.bezX2 = bezX2;
+    kf.bezY2 = bezY2;
     m_keyframes.append(kf);
 
     // Keep sorted by time
@@ -66,14 +108,19 @@ double KeyframeTrack::valueAt(double time) const
         const auto &b = m_keyframes[i + 1];
         if (time >= a.time && time <= b.time) {
             double t = (time - a.time) / (b.time - a.time);
-            return interpolate(a.value, b.value, t, a.interpolation);
+            return interpolate(a.value, b.value, t, a.interpolation,
+                               a.bezX1, a.bezY1, a.bezX2, a.bezY2);
         }
     }
     return m_defaultValue;
 }
 
 double KeyframeTrack::interpolate(double from, double to, double t,
-                                   KeyframePoint::Interpolation interp)
+                                   KeyframePoint::Interpolation interp,
+                                   double bezX1,
+                                   double bezY1,
+                                   double bezX2,
+                                   double bezY2)
 {
     switch (interp) {
     case KeyframePoint::Linear:
@@ -86,6 +133,11 @@ double KeyframeTrack::interpolate(double from, double to, double t,
         return from + (to - from) * easeInOut(t);
     case KeyframePoint::Hold:
         return from; // stay at 'from' until next keyframe
+    case KeyframePoint::Bezier: {
+        const easing::CubicBezier bez{bezX1, bezY1, bezX2, bezY2};
+        const double easedT = easing::evaluate(easing::EasingType::CubicBezier, t, bez);
+        return from + (to - from) * easedT;
+    }
     }
     return from + (to - from) * t;
 }
@@ -135,6 +187,37 @@ QString KeyframeTrack::stringValueAt(double time) const
 
     // Before first keyframe: return empty (no text before first keyframe)
     return QString();
+}
+
+QJsonObject keyframePointToJson(const KeyframePoint &kf)
+{
+    QJsonObject kfObj;
+    kfObj[QStringLiteral("time")] = kf.time;
+    kfObj[QStringLiteral("value")] = kf.value;
+    kfObj[QStringLiteral("interpolation")] = static_cast<int>(kf.interpolation);
+    if (kf.interpolation == KeyframePoint::Bezier) {
+        kfObj[QStringLiteral("interp")] = QStringLiteral("Bezier");
+        if (hasNonIdentityBezier(kf)) {
+            kfObj[QStringLiteral("bezX1")] = kf.bezX1;
+            kfObj[QStringLiteral("bezY1")] = kf.bezY1;
+            kfObj[QStringLiteral("bezX2")] = kf.bezX2;
+            kfObj[QStringLiteral("bezY2")] = kf.bezY2;
+        }
+    }
+    return kfObj;
+}
+
+KeyframePoint keyframePointFromJson(const QJsonObject &obj)
+{
+    KeyframePoint kf;
+    kf.time = obj[QStringLiteral("time")].toDouble();
+    kf.value = obj[QStringLiteral("value")].toDouble();
+    kf.interpolation = interpolationFromJson(obj);
+    kf.bezX1 = obj[QStringLiteral("bezX1")].toDouble(kIdentityBezX1);
+    kf.bezY1 = obj[QStringLiteral("bezY1")].toDouble(kIdentityBezY1);
+    kf.bezX2 = obj[QStringLiteral("bezX2")].toDouble(kIdentityBezX2);
+    kf.bezY2 = obj[QStringLiteral("bezY2")].toDouble(kIdentityBezY2);
+    return kf;
 }
 
 // --- StringKeyframeTrack ---
@@ -313,11 +396,7 @@ QJsonObject KeyframeManager::toJson() const
 
         QJsonArray keyframesArray;
         for (const auto &kf : track.keyframes()) {
-            QJsonObject kfObj;
-            kfObj[QStringLiteral("time")] = kf.time;
-            kfObj[QStringLiteral("value")] = kf.value;
-            kfObj[QStringLiteral("interpolation")] = static_cast<int>(kf.interpolation);
-            keyframesArray.append(kfObj);
+            keyframesArray.append(keyframePointToJson(kf));
         }
         trackObj[QStringLiteral("keyframes")] = keyframesArray;
         tracksArray.append(trackObj);
@@ -361,11 +440,9 @@ void KeyframeManager::fromJson(const QJsonObject &obj)
         KeyframeTrack track(property, defaultValue);
         QJsonArray keyframesArray = trackObj[QStringLiteral("keyframes")].toArray();
         for (const auto &kfVal : keyframesArray) {
-            QJsonObject kfObj = kfVal.toObject();
-            double time = kfObj[QStringLiteral("time")].toDouble();
-            double value = kfObj[QStringLiteral("value")].toDouble();
-            auto interp = static_cast<KeyframePoint::Interpolation>(kfObj[QStringLiteral("interpolation")].toInt(0));
-            track.addKeyframe(time, value, interp);
+            const KeyframePoint kf = keyframePointFromJson(kfVal.toObject());
+            track.addKeyframe(kf.time, kf.value, kf.interpolation,
+                              kf.bezX1, kf.bezY1, kf.bezX2, kf.bezY2);
         }
         m_tracks.append(track);
     }

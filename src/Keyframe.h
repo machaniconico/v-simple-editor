@@ -10,8 +10,12 @@ struct KeyframePoint {
     double time = 0.0;   // seconds
     double value = 0.0;
 
-    enum Interpolation { Linear, EaseIn, EaseOut, EaseInOut, Hold };
+    enum Interpolation { Linear, EaseIn, EaseOut, EaseInOut, Hold, Bezier };
     Interpolation interpolation = Linear;
+    double bezX1 = 0.0;
+    double bezY1 = 0.0;
+    double bezX2 = 1.0;
+    double bezY2 = 1.0;
 };
 
 struct StringKeyframePoint {
@@ -29,7 +33,11 @@ public:
     double defaultValue() const { return m_defaultValue; }
 
     void addKeyframe(double time, double value,
-                     KeyframePoint::Interpolation interp = KeyframePoint::Linear);
+                     KeyframePoint::Interpolation interp = KeyframePoint::Linear,
+                     double bezX1 = 0.0,
+                     double bezY1 = 0.0,
+                     double bezX2 = 1.0,
+                     double bezY2 = 1.0);
     void removeKeyframe(int index);
     void setKeyframeValue(int index, double value);
     void setKeyframeTime(int index, double time);
@@ -47,7 +55,11 @@ public:
 
 private:
     static double interpolate(double from, double to, double t,
-                              KeyframePoint::Interpolation interp);
+                              KeyframePoint::Interpolation interp,
+                              double bezX1 = 0.0,
+                              double bezY1 = 0.0,
+                              double bezX2 = 1.0,
+                              double bezY2 = 1.0);
     static double easeIn(double t);
     static double easeOut(double t);
     static double easeInOut(double t);
@@ -57,6 +69,9 @@ private:
     QVector<KeyframePoint> m_keyframes; // sorted by time
     QVector<KeyframePoint> m_variantKeyframes; // sorted by time, uses interpolation=Hold for discrete
 };
+
+QJsonObject keyframePointToJson(const KeyframePoint &kf);
+KeyframePoint keyframePointFromJson(const QJsonObject &obj);
 
 // US-AETEXT-4: String keyframe track for Source Text animation
 class StringKeyframeTrack

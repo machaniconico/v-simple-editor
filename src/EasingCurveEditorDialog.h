@@ -41,6 +41,9 @@ class EasingCurveEditorDialog : public QDialog {
 public:
     explicit EasingCurveEditorDialog(QWidget *parent = nullptr);
 
+    void setInitialCurve(double x1, double y1, double x2, double y2);
+    void getCurve(double &x1, double &y1, double &x2, double &y2) const;
+
 private slots:
     void onPresetChanged(int index);
     void onCurveEdited();

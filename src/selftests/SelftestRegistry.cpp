@@ -31,6 +31,7 @@ int runAudioRestoreSelftest();
 int runAutoClipGenSelftest();
 int runAutoMatteSelftest();
 int runBatchExportSelftest();
+int runBezierEasingSelftest();
 int runBlenderSelftest();
 int runBroadcastCaptionSelftest();
 int runCaptionSelftest();
@@ -210,6 +211,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "AudioBusRouting: bus/submix/aux-send gain resolution + cycle guard" },
     { "atempo-resolve",    "VEDITOR_ATEMPO_RESOLVE_SELFTEST",     runAtempoResolveSelftest,      false,
       "Audio atempo enable resolver truth table: env force OR per-clip flag" },
+    { "bezier-easing",     "VEDITOR_BEZIER_EASING_SELFTEST",      runBezierEasingSelftest,       false,
+      "Per-keyframe cubic-bezier easing: legacy invariance, identity curve, ease-in, JSON round-trip (4 gates)" },
     { "spectral-edit",     "VEDITOR_SPECTRAL_EDIT_SELFTEST",      runSpectralEditSelftest,       false,
       "SpectralEngine: FFT/STFT/iSTFT round-trip + region attenuation" },
     { "sws-color",         "VEDITOR_SWS_COLOR_SELFTEST",          runSwsColorSelftest,           false,
