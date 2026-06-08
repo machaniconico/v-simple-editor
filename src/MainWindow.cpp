@@ -953,6 +953,22 @@ MainWindow::MainWindow(QWidget *parent)
 
     rebuildAudioMeters();
 
+    // 起動時のデフォルトプロジェクト(newProject ダイアログを通さず、ウェルカム画面から
+    // 直接クリップをドロップする経路)でも Timeline がプロジェクト出力サイズを把握できる
+    // よう、既定 config を同期する。これが無いと Timeline::m_projectWidth は -1 のままで、
+    // クリップ追加時の undo スナップショットが projectWidth=-1 で積まれる。その後 SNS
+    // プリセットで 9:16 にリサイズ → undo すると、restoreState の projectWidth>0 ガード
+    // (Timeline.cpp)でサイズ復元がスキップされ、プロジェクトが 9:16 のまま残って元
+    // アスペクトのクリップが縦伸びする(実機既知バグ)。newProject / applyLoadedProjectData
+    // と同じ applyProjectConfig + clear + saveState 規律でベースラインをサイズ入りに
+    // 張り直し、以降の全スナップショットが有効な projectWidth を持つようにする。
+    applyProjectConfig(m_projectConfig);
+    if (m_timeline && m_timeline->undoManager()) {
+        m_timeline->undoManager()->clear();
+        m_timeline->undoManager()->saveState(m_timeline->currentState(),
+                                             QStringLiteral("Initial state"));
+    }
+
     nodelib::registerBuiltinNodes();
     m_activeNodeGraph = new NodeGraph();
     m_nodeEvaluator = new NodeEvaluator();

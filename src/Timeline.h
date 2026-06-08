@@ -791,9 +791,15 @@ private:
     QLabel *m_infoLabel;
     double m_playheadPos = 0.0;
     // プロジェクト出力ジオメトリの複製 (SSOT は MainWindow::m_projectConfig)。
-    // currentState() で undo スナップショットへ捕捉する。-1 = 未設定。
-    int m_projectWidth = -1;
-    int m_projectHeight = -1;
+    // currentState() で undo スナップショットへ捕捉する。
+    // 既定は ProjectConfig の既定サイズ(1920x1080, 非明示出力)に合わせる。これにより
+    // undo スナップショットが projectWidth=-1 を持たない不変条件を保証し、SNS プリセット
+    // 適用前にサイズ同期(applyProjectConfig)を通らなかった経路でも、undo で元の
+    // プロジェクトサイズへ正しく戻れる(restoreState の projectWidth>0 ガード)。
+    // explicit=false のため addClip の auto-contain 判定(m_projectExplicitOutput ゲート)
+    // は不変。
+    int m_projectWidth = 1920;
+    int m_projectHeight = 1080;
     bool m_projectExplicitOutput = false;
     double m_markIn = -1.0;
     double m_markOut = -1.0;
