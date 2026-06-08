@@ -13,8 +13,59 @@
 #include <QPushButton>
 #include <QColorDialog>
 #include <QStyle>
+#include <QValidator>
 
 namespace effectctrl {
+namespace {
+
+class UnlimitedDoubleSpinBox : public QDoubleSpinBox
+{
+public:
+    explicit UnlimitedDoubleSpinBox(QWidget *parent = nullptr)
+        : QDoubleSpinBox(parent)
+    {
+    }
+
+protected:
+    QString textFromValue(double value) const override
+    {
+        if (value <= minimum())
+            return QString();
+        return QDoubleSpinBox::textFromValue(value);
+    }
+
+    double valueFromText(const QString &text) const override
+    {
+        if (text.trimmed().isEmpty())
+            return minimum();
+        return QDoubleSpinBox::valueFromText(text);
+    }
+
+    QValidator::State validate(QString &input, int &pos) const override
+    {
+        if (input.trimmed().isEmpty())
+            return QValidator::Acceptable;
+        return QDoubleSpinBox::validate(input, pos);
+    }
+};
+
+double normalizedTimingValue(double value)
+{
+    return value < 0.0 ? -1.0 : value;
+}
+
+QDoubleSpinBox *createTimingSpinBox(QWidget *parent, double value)
+{
+    auto *spin = new UnlimitedDoubleSpinBox(parent);
+    spin->setRange(-1.0, 999999.0);
+    spin->setDecimals(3);
+    spin->setSingleStep(1.0);
+    spin->setValue(normalizedTimingValue(value));
+    spin->setToolTip(QStringLiteral("空欄または -1 で無制限"));
+    return spin;
+}
+
+} // namespace
 
 EffectRowWidget::EffectRowWidget(QWidget *parent)
     : QWidget(parent)
@@ -40,6 +91,57 @@ VideoEffect EffectRowWidget::currentEffect() const
 void EffectRowWidget::buildRows(const QVector<ParamDef> &schema)
 {
     auto *layout = qobject_cast<QVBoxLayout *>(this->layout());
+
+    auto *timingContainer = new QWidget(this);
+    auto *timingLayout = new QHBoxLayout(timingContainer);
+    timingLayout->setContentsMargins(2, 1, 2, 1);
+    timingLayout->setSpacing(4);
+
+    auto *startLabel = new QLabel(QStringLiteral("開始(秒)"), timingContainer);
+    startLabel->setMinimumWidth(64);
+    auto *startSpin = createTimingSpinBox(timingContainer, m_effect.startSec);
+    auto *endLabel = new QLabel(QStringLiteral("終了(秒)"), timingContainer);
+    endLabel->setMinimumWidth(64);
+    auto *endSpin = createTimingSpinBox(timingContainer, m_effect.endSec);
+    auto *resetButton = new QPushButton(timingContainer);
+    resetButton->setIcon(style()->standardIcon(QStyle::SP_BrowserReload));
+    resetButton->setFixedSize(20, 20);
+    resetButton->setToolTip(QStringLiteral("有効区間を無制限に戻す"));
+
+    auto emitTimingValue = [this](const QString &paramName, QDoubleSpinBox *spin, double value) {
+        const double normalized = normalizedTimingValue(value);
+        if (normalized != value) {
+            spin->blockSignals(true);
+            spin->setValue(normalized);
+            spin->blockSignals(false);
+        }
+        emit paramChanged(paramName, QVariant(normalized));
+    };
+
+    connect(startSpin, qOverload<double>(&QDoubleSpinBox::valueChanged), this,
+            [emitTimingValue, startSpin](double value) {
+                emitTimingValue(QStringLiteral("__effectStartSec"), startSpin, value);
+            });
+    connect(endSpin, qOverload<double>(&QDoubleSpinBox::valueChanged), this,
+            [emitTimingValue, endSpin](double value) {
+                emitTimingValue(QStringLiteral("__effectEndSec"), endSpin, value);
+            });
+    connect(resetButton, &QPushButton::clicked, this, [this, startSpin, endSpin]() {
+        startSpin->blockSignals(true);
+        endSpin->blockSignals(true);
+        startSpin->setValue(-1.0);
+        endSpin->setValue(-1.0);
+        startSpin->blockSignals(false);
+        endSpin->blockSignals(false);
+        emit paramChanged(QStringLiteral("__effectTimingReset"), QVariant(true));
+    });
+
+    timingLayout->addWidget(startLabel);
+    timingLayout->addWidget(startSpin, 1);
+    timingLayout->addWidget(endLabel);
+    timingLayout->addWidget(endSpin, 1);
+    timingLayout->addWidget(resetButton);
+    layout->addWidget(timingContainer);
 
     for (const auto &def : schema) {
         RowWidgets row;

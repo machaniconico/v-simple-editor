@@ -72,6 +72,8 @@ struct VideoEffect {
     double param2 = 0.0;
     double param3 = 0.0;
     QColor keyColor = QColor(0, 255, 0); // ChromaKey only
+    double startSec = -1.0; // clip-local seconds; -1 == no start limit
+    double endSec = -1.0;   // clip-local seconds; -1 == no end limit
 
     static QString typeName(VideoEffectType t);
     static QVector<VideoEffectType> allTypes();

@@ -41,6 +41,24 @@ bool hasAnyEffectKeyframes(const ClipInfo& clip)
     return false;
 }
 
+bool hasAnyEffectTiming(const ClipInfo& clip)
+{
+    for (const VideoEffect &effect : clip.effects) {
+        if (effect.startSec >= 0.0 || effect.endSec >= 0.0)
+            return true;
+    }
+    return false;
+}
+
+bool effectActiveAt(const VideoEffect& effect, double clipLocalSeconds)
+{
+    if (effect.startSec >= 0.0 && clipLocalSeconds < effect.startSec)
+        return false;
+    if (effect.endSec >= 0.0 && clipLocalSeconds > effect.endSec)
+        return false;
+    return true;
+}
+
 } // namespace
 
 clipgeom::ClipTransform effectiveTransformAt(const ClipInfo& clip,
@@ -92,11 +110,15 @@ QVector<VideoEffect> effectiveEffectsAt(const ClipInfo& clip,
     // Hot path: most clips have no effect-parameter keyframes. Return before
     // copying/mapping parameters so the static FX path keeps legacy values
     // byte-for-byte.
-    if (!hasAnyEffectKeyframes(clip))
+    const bool hasEffectKeyframes = hasAnyEffectKeyframes(clip);
+    const bool hasEffectTiming = hasAnyEffectTiming(clip);
+    if (!hasEffectKeyframes && !hasEffectTiming)
         return clip.effects;
 
     QVector<VideoEffect> effects = clip.effects;
     for (int i = 0; i < effects.size(); ++i) {
+        if (!hasEffectKeyframes)
+            continue;
         const auto schema = effectctrl::paramSchemaFor(effects[i].type);
         for (const auto &def : schema) {
             const QString trackName =
@@ -110,6 +132,15 @@ QVector<VideoEffect> effectiveEffectsAt(const ClipInfo& clip,
                 clip.keyframes.valueAt(trackName, clipLocalSeconds, currentValue);
             effectctrl::setParamValue(effects[i], def.name, value);
         }
+    }
+    if (hasEffectTiming) {
+        QVector<VideoEffect> filtered;
+        filtered.reserve(effects.size());
+        for (const VideoEffect &effect : effects) {
+            if (effectActiveAt(effect, clipLocalSeconds))
+                filtered.append(effect);
+        }
+        return filtered;
     }
     return effects;
 }

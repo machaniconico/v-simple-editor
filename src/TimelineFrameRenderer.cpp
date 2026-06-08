@@ -316,6 +316,8 @@ QImage applyClipFxPack(const QImage &graded, const ClipInfo &clip,
 
     const QVector<VideoEffect> effects =
         clipanim::effectiveEffectsAt(clip, clipLocalSeconds);
+    if (effects.isEmpty())
+        return graded;
 
     // Genuine FX SSOT. Default ColorCorrection -> applyEffectStack's internal
     // applyColorCorrection is a strict no-op (VideoEffect.cpp:158), so this is

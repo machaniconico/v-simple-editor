@@ -296,6 +296,25 @@ void EffectControlsPanel::onParamChanged(int effectIndex, const QString &paramNa
         return;
     }
 
+    if (paramName == QStringLiteral("__effectStartSec")) {
+        const double value = newValue.toDouble();
+        m_effects[effectIndex].startSec = value < 0.0 ? -1.0 : value;
+        emit effectsChanged(m_effects);
+        return;
+    }
+    if (paramName == QStringLiteral("__effectEndSec")) {
+        const double value = newValue.toDouble();
+        m_effects[effectIndex].endSec = value < 0.0 ? -1.0 : value;
+        emit effectsChanged(m_effects);
+        return;
+    }
+    if (paramName == QStringLiteral("__effectTimingReset")) {
+        m_effects[effectIndex].startSec = -1.0;
+        m_effects[effectIndex].endSec = -1.0;
+        emit effectsChanged(m_effects);
+        return;
+    }
+
     if (newValue.canConvert<double>()) {
         setParamValue(m_effects[effectIndex], paramName, newValue.toDouble());
     } else if (newValue.userType() == qMetaTypeId<QColor>()) {
@@ -346,6 +365,8 @@ void EffectControlsPanel::onResetRequested(int idx)
     for (const auto &def : schema) {
         setParamValue(m_effects[idx], def.name, def.defaultVal);
     }
+    m_effects[idx].startSec = -1.0;
+    m_effects[idx].endSec = -1.0;
     emit effectsChanged(m_effects);
     persistAndRebuild();
 }

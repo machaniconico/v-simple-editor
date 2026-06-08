@@ -55,6 +55,7 @@ int runEasingSelftest();
 int runExposureAidsSelftest();
 int runExportAuditSelftest();
 int runEffectKeyframeParitySelftest();
+int runEffectTimingSelftest();
 int runFcpxmlSelftest();
 int runFrameIoSelftest();
 int runHdrRoutingSelftest();
@@ -292,6 +293,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Render-time per-clip motion/opacity keyframe evaluation parity (5 gates, byte-identical no-keyframe guard)" },
     { "effect-keyframe-parity", "VEDITOR_EFFECT_KEYFRAME_PARITY_SELFTEST", runEffectKeyframeParitySelftest, true,
       "Render-time per-clip effect parameter keyframe evaluation parity (4 gates, byte-identical no-keyframe guard)" },
+    { "effect-timing", "VEDITOR_EFFECT_TIMING_SELFTEST", runEffectTimingSelftest, true,
+      "Clip-local VideoEffect active range filtering + ProjectFile JSON round-trip (4 gates)" },
     { "e2e",               "VEDITOR_E2E_SELFTEST",                runE2eSelftest,                true,
       "Real-media end-to-end smoke (ColorMatch decode + deHum + processAll)" },
     { "trackmatte-parity", "VEDITOR_TRACKMATTE_PARITY_SELFTEST",  runTrackMatteParitySelftest,   true,

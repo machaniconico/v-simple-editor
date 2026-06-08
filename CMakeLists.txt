@@ -81,6 +81,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/parity_matte_selftests.cpp
     src/selftests/keyframe_anim_parity_selftest.cpp
     src/selftests/effect_keyframe_parity_selftest.cpp
+    src/selftests/effect_timing_selftest.cpp
     src/selftests/bezier_easing_selftest.cpp
 
     # PRD-SPLIT-MAIN-3 Phase 3-A: libavcore-backed selftests (moved from src/main.cpp).
