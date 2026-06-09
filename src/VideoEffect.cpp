@@ -6,12 +6,33 @@
 #include <QRandomGenerator>
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 
 // --- Helpers ---
 
 static inline int clamp255(int v) { return qBound(0, v, 255); }
 static inline int clamp255d(double v) { return qBound(0, static_cast<int>(std::round(v)), 255); }
 static inline double luma709(int r, int g, int b) { return 0.2126 * r + 0.7152 * g + 0.0722 * b; }
+
+static inline QRgb sampleArgbPixel(const QImage &img, int x, int y)
+{
+    const int sx = qBound(0, x, img.width() - 1);
+    const int sy = qBound(0, y, img.height() - 1);
+    const QRgb *line = reinterpret_cast<const QRgb*>(img.constScanLine(sy));
+    return line[sx];
+}
+
+static inline std::uint32_t glitchHash(int row, int seed)
+{
+    std::uint32_t x = static_cast<std::uint32_t>(row) * 0x45d9f3bu
+                    ^ static_cast<std::uint32_t>(seed) * 0x9e3779b9u;
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
 
 static inline void addRgbSample(const QImage &img, int x, int y,
                                 double &rSum, double &gSum, double &bSum)
@@ -104,6 +125,10 @@ QString VideoEffect::typeName(VideoEffectType t)
     case VideoEffectType::BlackWhite: return "白黒";
     case VideoEffectType::Exposure: return "露出";
     case VideoEffectType::HueSaturation: return "色相/彩度";
+    case VideoEffectType::RGBSplit: return "RGBスプリット";
+    case VideoEffectType::WaveWarp: return "波形ワープ";
+    case VideoEffectType::Ripple: return "リップル";
+    case VideoEffectType::GlitchVHS: return "グリッチ(VHS)";
     }
     return "Unknown";
 }
@@ -120,7 +145,9 @@ QVector<VideoEffectType> VideoEffect::allTypes()
              VideoEffectType::Posterize, VideoEffectType::Threshold,
              VideoEffectType::Solarize, VideoEffectType::Levels,
              VideoEffectType::Tint, VideoEffectType::BlackWhite,
-             VideoEffectType::Exposure, VideoEffectType::HueSaturation };
+             VideoEffectType::Exposure, VideoEffectType::HueSaturation,
+             VideoEffectType::RGBSplit, VideoEffectType::WaveWarp,
+             VideoEffectType::Ripple, VideoEffectType::GlitchVHS };
 }
 
 VideoEffect VideoEffect::createBlur(double r)
@@ -173,6 +200,14 @@ VideoEffect VideoEffect::createExposure(double s)
     { VideoEffect e; e.type = VideoEffectType::Exposure; e.param1 = s; return e; }
 VideoEffect VideoEffect::createHueSaturation(double h, double s, double l)
     { VideoEffect e; e.type = VideoEffectType::HueSaturation; e.param1 = h; e.param2 = s; e.param3 = l; return e; }
+VideoEffect VideoEffect::createRGBSplit(double x, double y)
+    { VideoEffect e; e.type = VideoEffectType::RGBSplit; e.param1 = x; e.param2 = y; return e; }
+VideoEffect VideoEffect::createWaveWarp(double a, double w, double p)
+    { VideoEffect e; e.type = VideoEffectType::WaveWarp; e.param1 = a; e.param2 = w; e.param3 = p; return e; }
+VideoEffect VideoEffect::createRipple(double a, double w, double p)
+    { VideoEffect e; e.type = VideoEffectType::Ripple; e.param1 = a; e.param2 = w; e.param3 = p; return e; }
+VideoEffect VideoEffect::createGlitchVHS(double i, double b, double s)
+    { VideoEffect e; e.type = VideoEffectType::GlitchVHS; e.param1 = i; e.param2 = b; e.param3 = s; return e; }
 
 // ===== EffectParamSchema helper accessors =====
 
@@ -251,6 +286,28 @@ double paramValue(const VideoEffect &effect, const QString &paramName)
             if (paramName == "saturation" && effect.type == VideoEffectType::HueSaturation)
                 return effect.param2;
             if (paramName == "lightness" && effect.type == VideoEffectType::HueSaturation)
+                return effect.param3;
+            if (paramName == "offsetX" && effect.type == VideoEffectType::RGBSplit)
+                return effect.param1;
+            if (paramName == "offsetY" && effect.type == VideoEffectType::RGBSplit)
+                return effect.param2;
+            if (paramName == "amplitude" && effect.type == VideoEffectType::WaveWarp)
+                return effect.param1;
+            if (paramName == "wavelength" && effect.type == VideoEffectType::WaveWarp)
+                return effect.param2;
+            if (paramName == "phase" && effect.type == VideoEffectType::WaveWarp)
+                return effect.param3;
+            if (paramName == "amplitude" && effect.type == VideoEffectType::Ripple)
+                return effect.param1;
+            if (paramName == "wavelength" && effect.type == VideoEffectType::Ripple)
+                return effect.param2;
+            if (paramName == "phase" && effect.type == VideoEffectType::Ripple)
+                return effect.param3;
+            if (paramName == "intensity" && effect.type == VideoEffectType::GlitchVHS)
+                return effect.param1;
+            if (paramName == "blockHeight" && effect.type == VideoEffectType::GlitchVHS)
+                return effect.param2;
+            if (paramName == "seed" && effect.type == VideoEffectType::GlitchVHS)
                 return effect.param3;
             return def.defaultVal;
         }
@@ -364,6 +421,39 @@ void setParamValue(VideoEffect &effect, const QString &paramName, double value)
                 effect.param2 = value; return;
             }
             if (paramName == "lightness" && effect.type == VideoEffectType::HueSaturation) {
+                effect.param3 = value; return;
+            }
+            if (paramName == "offsetX" && effect.type == VideoEffectType::RGBSplit) {
+                effect.param1 = value; return;
+            }
+            if (paramName == "offsetY" && effect.type == VideoEffectType::RGBSplit) {
+                effect.param2 = value; return;
+            }
+            if (paramName == "amplitude" && effect.type == VideoEffectType::WaveWarp) {
+                effect.param1 = value; return;
+            }
+            if (paramName == "wavelength" && effect.type == VideoEffectType::WaveWarp) {
+                effect.param2 = value; return;
+            }
+            if (paramName == "phase" && effect.type == VideoEffectType::WaveWarp) {
+                effect.param3 = value; return;
+            }
+            if (paramName == "amplitude" && effect.type == VideoEffectType::Ripple) {
+                effect.param1 = value; return;
+            }
+            if (paramName == "wavelength" && effect.type == VideoEffectType::Ripple) {
+                effect.param2 = value; return;
+            }
+            if (paramName == "phase" && effect.type == VideoEffectType::Ripple) {
+                effect.param3 = value; return;
+            }
+            if (paramName == "intensity" && effect.type == VideoEffectType::GlitchVHS) {
+                effect.param1 = value; return;
+            }
+            if (paramName == "blockHeight" && effect.type == VideoEffectType::GlitchVHS) {
+                effect.param2 = value; return;
+            }
+            if (paramName == "seed" && effect.type == VideoEffectType::GlitchVHS) {
                 effect.param3 = value; return;
             }
             return;
@@ -625,6 +715,10 @@ QImage VideoEffectProcessor::applyEffect(const QImage &input, const VideoEffect 
     case VideoEffectType::BlackWhite: return applyBlackWhite(input, effect.param1, effect.param2, effect.param3);
     case VideoEffectType::Exposure: return applyExposureEffect(input, effect.param1);
     case VideoEffectType::HueSaturation: return applyHueSaturation(input, effect.param1, effect.param2, effect.param3);
+    case VideoEffectType::RGBSplit: return applyRGBSplit(input, effect.param1, effect.param2);
+    case VideoEffectType::WaveWarp: return applyWaveWarp(input, effect.param1, effect.param2, effect.param3);
+    case VideoEffectType::Ripple: return applyRipple(input, effect.param1, effect.param2, effect.param3);
+    case VideoEffectType::GlitchVHS: return applyGlitchVHS(input, effect.param1, effect.param2, effect.param3);
     default: return input;
     }
 }
@@ -1475,6 +1569,133 @@ QImage VideoEffectProcessor::applyHueSaturation(const QImage &input, double hueD
             hslL = static_cast<float>(qBound(0.0, static_cast<double>(hslL) + lightShift, 1.0));
             const QColor out = QColor::fromHslF(hslH, hslS, hslL, hslA);
             dstLine[x] = qRgba(out.red(), out.green(), out.blue(), qAlpha(px));
+        }
+    }
+
+    return result;
+}
+
+QImage VideoEffectProcessor::applyRGBSplit(const QImage &input, double offsetX, double offsetY)
+{
+    const int dx = qBound(-50, static_cast<int>(std::round(offsetX)), 50);
+    const int dy = qBound(-50, static_cast<int>(std::round(offsetY)), 50);
+    if (dx == 0 && dy == 0)
+        return input;
+
+    QImage src = input.convertToFormat(QImage::Format_ARGB32);
+    const int w = src.width();
+    const int h = src.height();
+    QImage result(w, h, QImage::Format_ARGB32);
+
+    for (int y = 0; y < h; ++y) {
+        QRgb *dstLine = reinterpret_cast<QRgb*>(result.scanLine(y));
+        for (int x = 0; x < w; ++x) {
+            const QRgb rPx = sampleArgbPixel(src, x + dx, y + dy);
+            const QRgb gPx = sampleArgbPixel(src, x, y);
+            const QRgb bPx = sampleArgbPixel(src, x - dx, y - dy);
+            dstLine[x] = qRgba(qRed(rPx), qGreen(gPx), qBlue(bPx), qAlpha(gPx));
+        }
+    }
+
+    return result;
+}
+
+QImage VideoEffectProcessor::applyWaveWarp(const QImage &input, double amplitude,
+                                           double wavelength, double phaseDegrees)
+{
+    const double amp = qBound(0.0, amplitude, 100.0);
+    if (amp <= 0.0)
+        return input;
+
+    QImage src = input.convertToFormat(QImage::Format_ARGB32);
+    const int w = src.width();
+    const int h = src.height();
+    QImage result(w, h, QImage::Format_ARGB32);
+    const double wave = qBound(1.0, wavelength, 500.0);
+    const double phase = qBound(0.0, phaseDegrees, 360.0) * M_PI / 180.0;
+    const double frequency = 2.0 * M_PI / wave;
+
+    for (int y = 0; y < h; ++y) {
+        QRgb *dstLine = reinterpret_cast<QRgb*>(result.scanLine(y));
+        for (int x = 0; x < w; ++x) {
+            const double hOffset = std::sin(y * frequency + phase) * amp;
+            const double vOffset = std::sin(x * frequency + phase) * amp;
+            const int sx = static_cast<int>(std::round(x + hOffset));
+            const int sy = static_cast<int>(std::round(y + vOffset));
+            dstLine[x] = sampleArgbPixel(src, sx, sy);
+        }
+    }
+
+    return result;
+}
+
+QImage VideoEffectProcessor::applyRipple(const QImage &input, double amplitude,
+                                         double wavelength, double phaseDegrees)
+{
+    const double amp = qBound(0.0, amplitude, 100.0);
+    if (amp <= 0.0)
+        return input;
+
+    QImage src = input.convertToFormat(QImage::Format_ARGB32);
+    const int w = src.width();
+    const int h = src.height();
+    QImage result(w, h, QImage::Format_ARGB32);
+    const double wave = qBound(1.0, wavelength, 500.0);
+    const double phase = qBound(0.0, phaseDegrees, 360.0) * M_PI / 180.0;
+    const double frequency = 2.0 * M_PI / wave;
+    const double cx = (w - 1) * 0.5;
+    const double cy = (h - 1) * 0.5;
+
+    for (int y = 0; y < h; ++y) {
+        QRgb *dstLine = reinterpret_cast<QRgb*>(result.scanLine(y));
+        for (int x = 0; x < w; ++x) {
+            const double vx = x - cx;
+            const double vy = y - cy;
+            const double dist = std::sqrt(vx * vx + vy * vy);
+            if (dist <= 1e-9) {
+                dstLine[x] = sampleArgbPixel(src, x, y);
+                continue;
+            }
+
+            const double shift = std::sin(dist * frequency + phase) * amp;
+            const int sx = static_cast<int>(std::round(x + (vx / dist) * shift));
+            const int sy = static_cast<int>(std::round(y + (vy / dist) * shift));
+            dstLine[x] = sampleArgbPixel(src, sx, sy);
+        }
+    }
+
+    return result;
+}
+
+QImage VideoEffectProcessor::applyGlitchVHS(const QImage &input, double intensity,
+                                            double blockHeight, double seed)
+{
+    const double amount = qBound(0.0, intensity, 1.0);
+    if (amount <= 0.0)
+        return input;
+
+    QImage src = input.convertToFormat(QImage::Format_ARGB32);
+    const int w = src.width();
+    const int h = src.height();
+    QImage result(w, h, QImage::Format_ARGB32);
+    const int block = qBound(4, static_cast<int>(std::round(blockHeight)), 64);
+    const int seedValue = qBound(0, static_cast<int>(std::round(seed)), 1000);
+    const int maxShift = qMax(1, static_cast<int>(std::round(w * 0.25 * amount)));
+    const int channelShift = qMax(1, static_cast<int>(std::round(3.0 * amount)));
+
+    for (int y = 0; y < h; ++y) {
+        const int blockIndex = y / block;
+        const std::uint32_t hash = glitchHash(blockIndex, seedValue);
+        const int shiftRange = maxShift * 2 + 1;
+        const int blockShift = static_cast<int>(hash % static_cast<std::uint32_t>(shiftRange)) - maxShift;
+        QRgb *dstLine = reinterpret_cast<QRgb*>(result.scanLine(y));
+
+        for (int x = 0; x < w; ++x) {
+            const int sx = x + blockShift;
+            const QRgb center = sampleArgbPixel(src, sx, y);
+            const QRgb rPx = sampleArgbPixel(src, sx + channelShift, y);
+            const QRgb bPx = sampleArgbPixel(src, sx - channelShift, y);
+            dstLine[x] = qRgba(qRed(rPx), qGreen(center), qBlue(bPx), qAlpha(center));
         }
     }
 

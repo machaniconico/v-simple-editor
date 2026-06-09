@@ -65,7 +65,11 @@ enum class VideoEffectType {
     Tint,
     BlackWhite,
     Exposure,
-    HueSaturation
+    HueSaturation,
+    RGBSplit,
+    WaveWarp,
+    Ripple,
+    GlitchVHS
 };
 
 struct VideoEffect {
@@ -96,6 +100,10 @@ struct VideoEffect {
     //   BlackWhite: p1=redWeight, p2=greenWeight, p3=blueWeight
     //   Exposure: p1=stops(-5..5)
     //   HueSaturation: p1=hueDegrees(-180..180), p2=saturation(-100..100), p3=lightness(-100..100)
+    //   RGBSplit: p1=offsetX(-50..50), p2=offsetY(-50..50)
+    //   WaveWarp: p1=amplitude(0..100), p2=wavelength(1..500), p3=phase(0..360)
+    //   Ripple: p1=amplitude(0..100), p2=wavelength(1..500), p3=phase(0..360)
+    //   GlitchVHS: p1=intensity(0..1), p2=blockHeight(4..64), p3=seed(0..1000)
     double param1 = 0.0;
     double param2 = 0.0;
     double param3 = 0.0;
@@ -132,6 +140,10 @@ struct VideoEffect {
     static VideoEffect createBlackWhite(double redWeight = 0.299, double greenWeight = 0.587, double blueWeight = 0.114);
     static VideoEffect createExposure(double stops = 0.0);
     static VideoEffect createHueSaturation(double hueDegrees = 0.0, double saturation = 0.0, double lightness = 0.0);
+    static VideoEffect createRGBSplit(double offsetX = 6.0, double offsetY = 0.0);
+    static VideoEffect createWaveWarp(double amplitude = 12.0, double wavelength = 80.0, double phaseDegrees = 0.0);
+    static VideoEffect createRipple(double amplitude = 12.0, double wavelength = 80.0, double phaseDegrees = 0.0);
+    static VideoEffect createGlitchVHS(double intensity = 0.5, double blockHeight = 12.0, double seed = 1.0);
 };
 
 // --- Processor ---
@@ -179,4 +191,8 @@ private:
     static QImage applyBlackWhite(const QImage &img, double redWeight, double greenWeight, double blueWeight);
     static QImage applyExposureEffect(const QImage &img, double stops);
     static QImage applyHueSaturation(const QImage &img, double hueDegrees, double saturation, double lightness);
+    static QImage applyRGBSplit(const QImage &img, double offsetX, double offsetY);
+    static QImage applyWaveWarp(const QImage &img, double amplitude, double wavelength, double phaseDegrees);
+    static QImage applyRipple(const QImage &img, double amplitude, double wavelength, double phaseDegrees);
+    static QImage applyGlitchVHS(const QImage &img, double intensity, double blockHeight, double seed);
 };

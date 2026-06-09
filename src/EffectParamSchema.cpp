@@ -110,6 +110,33 @@ QVector<ParamDef> paramSchemaFor(VideoEffectType type)
             { "lightness", "Lightness", ParamType::Float, -100.0, 100.0, 0.0 }
         };
 
+    case VideoEffectType::RGBSplit:
+        return {
+            { "offsetX", "Offset X", ParamType::Float, -50.0, 50.0, 6.0 },
+            { "offsetY", "Offset Y", ParamType::Float, -50.0, 50.0, 0.0 }
+        };
+
+    case VideoEffectType::WaveWarp:
+        return {
+            { "amplitude", "Amplitude", ParamType::Float, 0.0, 100.0, 12.0 },
+            { "wavelength", "Wavelength", ParamType::Float, 1.0, 500.0, 80.0 },
+            { "phase", "Phase", ParamType::Float, 0.0, 360.0, 0.0 }
+        };
+
+    case VideoEffectType::Ripple:
+        return {
+            { "amplitude", "Amplitude", ParamType::Float, 0.0, 100.0, 12.0 },
+            { "wavelength", "Wavelength", ParamType::Float, 1.0, 500.0, 80.0 },
+            { "phase", "Phase", ParamType::Float, 0.0, 360.0, 0.0 }
+        };
+
+    case VideoEffectType::GlitchVHS:
+        return {
+            { "intensity", "Intensity", ParamType::Float, 0.0, 1.0, 0.5 },
+            { "blockHeight", "Block Height", ParamType::Int, 4.0, 64.0, 12.0 },
+            { "seed", "Seed", ParamType::Int, 0.0, 1000.0, 1.0 }
+        };
+
     case VideoEffectType::None:
     default:
         return {};
