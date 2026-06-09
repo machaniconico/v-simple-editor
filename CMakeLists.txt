@@ -108,6 +108,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/SequenceSettingsDialog.h
     src/SequenceSettingsDialog.cpp
     src/ExportDialog.cpp
+    src/ExportRange.h
+    src/ExportRange.cpp
     src/Exporter.cpp
     src/FrameDiff.cpp
     src/TimelineFrameRenderer.cpp
@@ -177,6 +179,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/AudioBusPanel.cpp
     src/selftests/audio_bus_selftest.cpp
     src/selftests/StereoPanSelftest.cpp
+    src/selftests/ExportRangeSelftest.cpp
     src/selftests/atempo_resolve_selftest.cpp
     src/selftests/silence_cut_selftest.cpp
     src/selftests/beat_detect_selftest.cpp

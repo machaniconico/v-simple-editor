@@ -2,6 +2,7 @@
 #include "TimelineFrameRenderer.h"
 #include "ProjectFile.h"
 #include "Timeline.h"
+#include "ExportRange.h"
 #include "TrackMatteKey.h"
 #include "CodecDetector.h"
 #include "AcesColor.h"  // AC: production export 経路への ACES 適用 (8bit のみ)
@@ -730,16 +731,37 @@ void RenderQueue::startRenderPipe(int jobIndex)
     // Iterate from 0 to the timeline duration at the project fps.
     // usec-per-frame = 1e6 / fps (the renderFrameAt time unit).
     const double durationSec = tl->totalDuration();
-    qint64 totalFrames = static_cast<qint64>(durationSec * fps + 0.5);
-    if (jobCopy.endUs > 0 && jobCopy.endUs > jobCopy.startUs) {
+    const qint64 timelineTotalFrames =
+        static_cast<qint64>(durationSec * fps + 0.5);
+    const double usecPerFrame = 1'000'000.0 / fps;
+    qint64 totalFrames = timelineTotalFrames;
+    qint64 startUsec = jobCopy.startUs > 0 ? jobCopy.startUs : 0;
+    bool markedRangeApplied = false;
+    const bool exportMarkedRangeOnly =
+        cfg.value("exportMarkedRangeOnly").toBool(false);
+    if (exportMarkedRangeOnly) {
+        const ExportFrameRange range = computeExportRange(
+            tl->markedIn(),
+            tl->markedOut(),
+            fps,
+            timelineTotalFrames,
+            true,
+            tl->hasMarkedRange());
+        totalFrames = range.frameCount();
+        markedRangeApplied = range.usedMarkedRange;
+        startUsec = markedRangeApplied
+            ? static_cast<qint64>(tl->markedIn() * 1'000'000.0)
+            : static_cast<qint64>(
+                static_cast<double>(range.startFrame) * usecPerFrame);
+    } else if (jobCopy.endUs > 0 && jobCopy.endUs > jobCopy.startUs) {
         const double rangeSec =
             static_cast<double>(jobCopy.endUs - jobCopy.startUs) / 1'000'000.0;
         totalFrames = static_cast<qint64>(rangeSec * fps + 0.5);
     }
     if (totalFrames <= 0)
         totalFrames = 1;
-    const qint64 startUsec = jobCopy.startUs > 0 ? jobCopy.startUs : 0;
-    const double usecPerFrame = 1'000'000.0 / fps;
+    const bool trimAudioToMarkedRange =
+        markedRangeApplied && startUsec > 0;
 
     // Audio mux input: the original source file's audio stream. FrameEncoder
     // handles this via audioSourcePath, preserving the render-pipe's optional
@@ -845,8 +867,11 @@ void RenderQueue::startRenderPipe(int jobIndex)
 
     const bool haveAudio = !audioInputPath.isEmpty()
         && QFile::exists(audioInputPath);
-    if (haveAudio)
+    if (haveAudio) {
         request.audioSourcePath = audioInputPath.toUtf8().toStdString();
+        if (trimAudioToMarkedRange)
+            request.audioStartUs = startUsec;
+    }
 
     request.encoderAvailableHook = [](const std::string &name) {
         return CodecDetector::isEncoderAvailable(QString::fromStdString(name));
@@ -1084,16 +1109,37 @@ void RenderQueue::startRenderPipeSubprocess(int jobIndex)
         fps = 30.0;
 
     const double durationSec = tl->totalDuration();
-    qint64 totalFrames = static_cast<qint64>(durationSec * fps + 0.5);
-    if (jobCopy.endUs > 0 && jobCopy.endUs > jobCopy.startUs) {
+    const qint64 timelineTotalFrames =
+        static_cast<qint64>(durationSec * fps + 0.5);
+    const double usecPerFrame = 1'000'000.0 / fps;
+    qint64 totalFrames = timelineTotalFrames;
+    qint64 startUsec = jobCopy.startUs > 0 ? jobCopy.startUs : 0;
+    bool markedRangeApplied = false;
+    const bool exportMarkedRangeOnly =
+        cfg.value("exportMarkedRangeOnly").toBool(false);
+    if (exportMarkedRangeOnly) {
+        const ExportFrameRange range = computeExportRange(
+            tl->markedIn(),
+            tl->markedOut(),
+            fps,
+            timelineTotalFrames,
+            true,
+            tl->hasMarkedRange());
+        totalFrames = range.frameCount();
+        markedRangeApplied = range.usedMarkedRange;
+        startUsec = markedRangeApplied
+            ? static_cast<qint64>(tl->markedIn() * 1'000'000.0)
+            : static_cast<qint64>(
+                static_cast<double>(range.startFrame) * usecPerFrame);
+    } else if (jobCopy.endUs > 0 && jobCopy.endUs > jobCopy.startUs) {
         const double rangeSec =
             static_cast<double>(jobCopy.endUs - jobCopy.startUs) / 1'000'000.0;
         totalFrames = static_cast<qint64>(rangeSec * fps + 0.5);
     }
     if (totalFrames <= 0)
         totalFrames = 1;
-    const qint64 startUsec = jobCopy.startUs > 0 ? jobCopy.startUs : 0;
-    const double usecPerFrame = 1'000'000.0 / fps;
+    const bool trimAudioToMarkedRange =
+        markedRangeApplied && startUsec > 0;
 
     // Audio mux input — identical resolution to the in-process branch's
     // audioSourcePath: the job's source media, falling back to the V1 clip's
@@ -1150,8 +1196,16 @@ void RenderQueue::startRenderPipeSubprocess(int jobIndex)
     // Input 1: the original media — used ONLY for its audio stream.
     const bool haveAudio = !audioInputPath.isEmpty()
         && QFile::exists(audioInputPath);
-    if (haveAudio)
+    if (haveAudio) {
+        if (trimAudioToMarkedRange) {
+            args << QStringLiteral("-ss")
+                 << QString::number(
+                        static_cast<double>(startUsec) / 1'000'000.0,
+                        'f',
+                        6);
+        }
         args << QStringLiteral("-i") << audioInputPath;
+    }
 
     args << QStringLiteral("-map") << QStringLiteral("0:v:0");
     if (haveAudio)

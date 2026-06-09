@@ -5674,6 +5674,7 @@ void MainWindow::exportVideo()
     // チャプター生成 (US-6F-2) と Premiere XML エクスポートが実 export 経路で
     // 実データを参照できるようにする。
     dialog.setClips(m_timeline->videoClips());
+    dialog.setMarkedRangeAvailable(m_timeline && m_timeline->hasMarkedRange());
     if (dialog.exec() != QDialog::Accepted) return;
 
     ExportConfig exportCfg = dialog.config();
@@ -5727,6 +5728,7 @@ void MainWindow::exportVideo()
     cfg["videoBitrate"] = exportCfg.videoBitrate;   // kbps
     cfg["audioCodec"]   = exportCfg.audioCodec;
     cfg["audioBitrate"] = exportCfg.audioBitrate;
+    cfg["exportMarkedRangeOnly"] = exportCfg.exportMarkedRangeOnly;
     const bool isHdrExport =
         exportCfg.hdr10 || exportCfg.hdrSettings.mode != QStringLiteral("sdr");
     if (isHdrExport) {

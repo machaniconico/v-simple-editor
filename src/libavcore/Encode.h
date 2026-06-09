@@ -54,6 +54,7 @@ struct EncodeRequest {
     int64_t videoBitrateBits = 0;       // Video bitrate in bits per second (caller multiplies kbps×1000)
     std::string outputPath;             // UTF-8
     std::string audioSourcePath;        // Optional UTF-8 source for stream-copy audio muxing
+    int64_t audioStartUs = 0;            // Optional stream-copy audio trim start; 0 preserves legacy behavior
     // Re-encode caller-pushed audio frames as AAC. Takes priority over
     // audioSourcePath passthrough when both are set.
     bool audioEncode = false;
@@ -186,6 +187,7 @@ private:
     int m_audioInStreamIndex = -1;
     int m_fpsNum = 30;                     // effective fps numerator captured in open()
     int m_fpsDen = 1;                      // effective fps denominator captured in open()
+    int64_t m_audioStartUs = 0;
     int64_t m_audioNextPts = 0;
     bool m_audioPtsInitialized = false;
     bool m_audioEncode = false;

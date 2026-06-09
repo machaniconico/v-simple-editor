@@ -989,6 +989,12 @@ void FrameEncoder::muxAudioPassthroughPackets()
         baseOffset = m_audioInStream->start_time;
         baseOffsetResolved = true;
     }
+    const int64_t trimStartInTb =
+        m_audioStartUs > 0
+            ? av_rescale_q(m_audioStartUs,
+                           AVRational{1, AV_TIME_BASE},
+                           m_audioInStream->time_base)
+            : 0;
 
     // Audio tracks passed here are short, pre-rendered assets. Copying them
     // after the video encoder flush is sufficient for this workflow; the muxer
@@ -1002,11 +1008,25 @@ void FrameEncoder::muxAudioPassthroughPackets()
                 baseOffsetResolved = true;
             }
 
+            int64_t normPts = 0;
+            if (pkt->pts != AV_NOPTS_VALUE) {
+                normPts = pkt->pts - baseOffset;
+                if (normPts < 0) normPts = 0;
+            }
+            if (trimStartInTb > 0 && pkt->pts != AV_NOPTS_VALUE) {
+                const int64_t pktDuration =
+                    pkt->duration > 0 ? pkt->duration : 0;
+                if (normPts + pktDuration <= trimStartInTb) {
+                    av_packet_unref(pkt);
+                    continue;
+                }
+            }
+
             // -shortest cap: stop once a packet's normalized presentation time
             // (in seconds, input time_base) reaches the video duration. The
             // remaining source packets are intentionally not written.
             if (capEnabled && pkt->pts != AV_NOPTS_VALUE) {
-                int64_t normPtsForCap = pkt->pts - baseOffset;
+                int64_t normPtsForCap = normPts - trimStartInTb;
                 if (normPtsForCap < 0) normPtsForCap = 0;
                 const double ptsSec =
                     static_cast<double>(normPtsForCap)
@@ -1021,11 +1041,11 @@ void FrameEncoder::muxAudioPassthroughPackets()
             // (e.g. edit-list lead-in) to 0, then rescale to the output
             // stream time_base.
             if (pkt->pts != AV_NOPTS_VALUE) {
-                pkt->pts -= baseOffset;
+                pkt->pts -= baseOffset + trimStartInTb;
                 if (pkt->pts < 0) pkt->pts = 0;
             }
             if (pkt->dts != AV_NOPTS_VALUE) {
-                pkt->dts -= baseOffset;
+                pkt->dts -= baseOffset + trimStartInTb;
                 if (pkt->dts < 0) pkt->dts = 0;
             }
             av_packet_rescale_ts(pkt,
@@ -1062,6 +1082,7 @@ std::optional<std::string> FrameEncoder::open(const EncodeRequest& req)
     // muxAudioPassthroughPackets() (-shortest equivalent). Validated > 0 above.
     m_fpsNum = fps.num;
     m_fpsDen = fps.den;
+    m_audioStartUs = req.audioStartUs > 0 ? req.audioStartUs : 0;
 
     if (avformat_alloc_output_context2(&m_outFmt, nullptr, nullptr,
                                        req.outputPath.c_str()) < 0 || !m_outFmt) {

@@ -54,6 +54,7 @@ struct ExportConfig {
     bool hdr10 = false;  // 10-bit BT.2020/PQ output when true (preserved for backward compat)
     int proresProfile = -1;  // -1 = not ProRes; 0..5 = Proxy/LT/SQ/HQ/4444/4444XQ
     HDRSettings hdrSettings; // extended HDR metadata
+    bool exportMarkedRangeOnly = false;
 
     QString codecDisplayName() const;
 };
@@ -67,6 +68,7 @@ public:
 
     ExportConfig config() const { return m_config; }
     void setSourceIsHdr(bool hdr);
+    void setMarkedRangeAvailable(bool hasRange);
 
     // clips を渡すと Premiere XML export / YouTube チャプター生成時に
     // highlight list を構築する。clips が空ならチャプター生成 checkbox を
@@ -88,6 +90,7 @@ private slots:
 private:
     void setupUI();
     void updateSummary();
+    void updateMarkedRangeCheckboxEnabled();
     void regenerateChapters();
     QString defaultExtension() const;
 
@@ -105,6 +108,9 @@ private:
     QLineEdit *m_outputEdit;
     QLabel *m_summaryLabel;
     QLabel *m_hdrWarningLabel = nullptr;
+    QCheckBox *m_markedRangeCheckbox = nullptr;
+    bool m_markedRangeStateKnown = false;
+    bool m_markedRangeAvailable = false;
     bool m_sourceIsHdr = false;
 
     QCheckBox *m_chapterCheckbox = nullptr;

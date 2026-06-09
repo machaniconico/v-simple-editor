@@ -212,6 +212,11 @@ void ExportDialog::setupUI()
     outputLayout->addWidget(browseBtn);
     mainLayout->addWidget(outputGroup);
 
+    // Marked range
+    m_markedRangeCheckbox = new QCheckBox(tr("マークした In/Out 範囲のみ書き出す"), this);
+    m_markedRangeCheckbox->setChecked(false);
+    mainLayout->addWidget(m_markedRangeCheckbox);
+
     // Summary
     m_summaryLabel = new QLabel(this);
     m_summaryLabel->setStyleSheet("color: #666; font-size: 12px; padding: 4px;");
@@ -270,6 +275,7 @@ void ExportDialog::setupUI()
     });
 
     onPresetChanged(0);
+    updateMarkedRangeCheckboxEnabled();
     updateSummary();
 }
 
@@ -375,6 +381,7 @@ void ExportDialog::onExportTypeChanged(int index)
     if (m_videoBitrateSpin) m_videoBitrateSpin->setEnabled(isVideo);
     if (m_audioBitrateSpin) m_audioBitrateSpin->setEnabled(isVideo);
     if (m_hwEncoderCombo) m_hwEncoderCombo->setEnabled(isVideo);
+    updateMarkedRangeCheckboxEnabled();
 }
 
 void ExportDialog::onBrowseOutput()
@@ -450,6 +457,8 @@ void ExportDialog::onExport()
     m_config.width = m_projectConfig.width;
     m_config.height = m_projectConfig.height;
     m_config.fps = m_projectConfig.fps;
+    m_config.exportMarkedRangeOnly =
+        m_markedRangeCheckbox && m_markedRangeCheckbox->isChecked();
 
     const auto presetList = presets();
     int idx = m_presetCombo->currentIndex();
@@ -463,6 +472,36 @@ void ExportDialog::onExport()
     }
 
     accept();
+}
+
+void ExportDialog::setMarkedRangeAvailable(bool hasRange)
+{
+    m_markedRangeStateKnown = true;
+    m_markedRangeAvailable = hasRange;
+    if (!hasRange && m_markedRangeCheckbox)
+        m_markedRangeCheckbox->setChecked(false);
+    updateMarkedRangeCheckboxEnabled();
+}
+
+void ExportDialog::updateMarkedRangeCheckboxEnabled()
+{
+    if (!m_markedRangeCheckbox)
+        return;
+
+    bool isVideo = true;
+    if (m_exportTypeCombo) {
+        const auto type =
+            static_cast<ExportType>(m_exportTypeCombo->currentData().toInt());
+        isVideo = (type == ExportType::Video);
+    }
+
+    const bool rangeSelectable =
+        !m_markedRangeStateKnown || m_markedRangeAvailable;
+    m_markedRangeCheckbox->setEnabled(isVideo && rangeSelectable);
+    m_markedRangeCheckbox->setToolTip(
+        rangeSelectable
+            ? QString()
+            : tr("有効な In/Out 範囲がマークされていません"));
 }
 
 QString ExportDialog::defaultExtension() const
