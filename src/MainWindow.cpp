@@ -31,6 +31,7 @@ void exporter_setAcesPipeline(const aces::AcesPipeline &pipeline);
 #include "RenderQueueDialog.h"
 #include "SceneDetector.h"
 #include "MotionStabilizer.h"
+#include "MotionPreset.h"
 #include "AdjustmentLayer.h"
 #include "SpeedRampData.h"
 #include "ProxyManager.h"
@@ -269,7 +270,6 @@ void exporter_setAcesPipeline(const aces::AcesPipeline &pipeline);
 #include "TextMaskReveal.h"
 #include "VariableFontAxis.h"
 #include "MographText.h"
-#include "TextAnimPresets.h"
 #include "Keyframe.h"
 #include "SmartReframe.h"
 #include "SmartReframeDialog.h"
@@ -13772,15 +13772,52 @@ void MainWindow::addSourceTextKeyframe()
 
 void MainWindow::addAnimationPreset()
 {
-    QStringList presets = TextAnimPresets::presetNames();
+    if (!m_timeline || !m_timeline->hasSelection()) {
+        QMessageBox::information(this, "アニメーションプリセット",
+            "クリップを先に選択してください。");
+        return;
+    }
+
+    const int clipIdx = m_timeline->selectedVideoClipIndex();
+    const auto &clips = m_timeline->videoClips();
+    if (clipIdx < 0 || clipIdx >= clips.size()) {
+        QMessageBox::information(this, "アニメーションプリセット",
+            "V1 のクリップを選択してください。");
+        return;
+    }
+
+    const QStringList ids = motionpreset::presetIds();
+    QStringList presets;
+    for (const QString &id : ids)
+        presets.append(motionpreset::displayName(id));
+    if (presets.isEmpty()) {
+        QMessageBox::information(this, "アニメーションプリセット",
+            "利用できるプリセットがありません。");
+        return;
+    }
+
     bool ok;
     QString preset = QInputDialog::getItem(this, "アニメーションプリセット",
         "プリセットを選択:", presets, 0, false, &ok);
     if (!ok)
         return;
 
-    statusBar()->showMessage(QString("アニメーションプリセット適用: %1 — %2")
-        .arg(preset).arg(TextAnimPresets::presetDescription(preset)));
+    const QString presetId = motionpreset::presetIdForDisplayName(preset);
+    if (presetId.isEmpty()) {
+        QMessageBox::warning(this, "アニメーションプリセット",
+            QString("未対応のプリセットです: %1").arg(preset));
+        return;
+    }
+
+    const ClipInfo &clip = clips[clipIdx];
+    KeyframeManager km = clip.keyframes;
+    motionpreset::applyPreset(km, presetId, 0.0, clip.effectiveDuration());
+    m_timeline->setClipKeyframes(km);
+    m_timeline->refreshPlaybackSequence();
+    updateEditActions();
+
+    statusBar()->showMessage(QString("アニメーションプリセット適用: %1")
+        .arg(motionpreset::displayName(presetId)), 4000);
 }
 
 void MainWindow::add3DText()

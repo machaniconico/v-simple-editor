@@ -86,6 +86,7 @@ int runMediaPoolSelftest();
 int runMobileSelftest();
 int runMographSelftest();
 int runMotionBlurParitySelftest();
+int runMotionPresetSelftest();
 int runMultiCamSelftest();
 int runObsSelftest();
 int runOnionSkinSelftest();
@@ -235,6 +236,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Audio atempo enable resolver truth table: env force OR per-clip flag" },
     { "bezier-easing",     "VEDITOR_BEZIER_EASING_SELFTEST",      runBezierEasingSelftest,       false,
       "Per-keyframe cubic-bezier easing: legacy invariance, identity curve, ease-in, JSON round-trip (4 gates)" },
+    { "motion-preset",     "VEDITOR_MOTION_PRESET_SELFTEST",       runMotionPresetSelftest,       false,
+      "Motion preset library: built-in ids, generated motion keyframes, deterministic replacement (6 gates)" },
     { "spectral-edit",     "VEDITOR_SPECTRAL_EDIT_SELFTEST",      runSpectralEditSelftest,       false,
       "SpectralEngine: FFT/STFT/iSTFT round-trip + region attenuation" },
     { "sws-color",         "VEDITOR_SWS_COLOR_SELFTEST",          runSwsColorSelftest,           false,
