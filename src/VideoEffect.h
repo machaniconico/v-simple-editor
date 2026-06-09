@@ -74,7 +74,13 @@ enum class VideoEffectType {
     Fill,
     Bloom,
     Scanlines,
-    Halftone
+    Halftone,
+    Curves,
+    ChannelMixer,
+    Vibrance,
+    PhotoFilter,
+    Tritone,
+    BrightnessContrast
 };
 
 struct VideoEffect {
@@ -114,10 +120,16 @@ struct VideoEffect {
     //   Bloom: p1=threshold, p2=radius, p3=intensity
     //   Scanlines: p1=lineSpacing(2..20), p2=darkness(0..1), p3=opacity(0..1)
     //   Halftone: p1=dotSize(2..30), p2=angleDegrees
+    //   Curves: p1=shadows(-100..100), p2=highlights(-100..100), p3=midContrast(-100..100)
+    //   ChannelMixer: p1=redFromRed%(0..200), p2=greenFromGreen%(0..200), p3=blueFromBlue%(0..200)
+    //   Vibrance: p1=vibrance(-100..100)
+    //   PhotoFilter: p1=density(0..100), keyColor=filter color
+    //   Tritone: p1=blend(0..1), keyColor=shadow color
+    //   BrightnessContrast: p1=brightness(-100..100), p2=contrast(-100..100)
     double param1 = 0.0;
     double param2 = 0.0;
     double param3 = 0.0;
-    QColor keyColor = QColor(0, 255, 0); // ChromaKey / Tint / GradientRamp / Fill
+    QColor keyColor = QColor(0, 255, 0); // ChromaKey / Tint / GradientRamp / Fill / PhotoFilter / Tritone
     double startSec = -1.0; // clip-local seconds; -1 == no start limit
     double endSec = -1.0;   // clip-local seconds; -1 == no end limit
 
@@ -159,6 +171,12 @@ struct VideoEffect {
     static VideoEffect createBloom(double threshold = 128.0, double radius = 20.0, double intensity = 1.0);
     static VideoEffect createScanlines(double lineSpacing = 4.0, double darkness = 0.5, double opacity = 1.0);
     static VideoEffect createHalftone(double dotSize = 8.0, double angleDegrees = 45.0);
+    static VideoEffect createCurves(double shadows = 0.0, double highlights = 0.0, double midContrast = 0.0);
+    static VideoEffect createChannelMixer(double redFromRed = 100.0, double greenFromGreen = 100.0, double blueFromBlue = 100.0);
+    static VideoEffect createVibrance(double vibrance = 0.0);
+    static VideoEffect createPhotoFilter(QColor filterColor = QColor(236, 138, 0), double density = 0.0);
+    static VideoEffect createTritone(QColor shadowColor = QColor(0, 0, 0), double blend = 0.0);
+    static VideoEffect createBrightnessContrast(double brightness = 0.0, double contrast = 0.0);
 };
 
 // --- Processor ---
@@ -215,4 +233,10 @@ private:
     static QImage applyBloom(const QImage &img, double threshold, double radius, double intensity);
     static QImage applyScanlines(const QImage &img, double lineSpacing, double darkness, double opacity);
     static QImage applyHalftone(const QImage &img, double dotSize, double angleDegrees);
+    static QImage applyCurves(const QImage &img, double shadows, double highlights, double midContrast);
+    static QImage applyChannelMixer(const QImage &img, double redFromRed, double greenFromGreen, double blueFromBlue);
+    static QImage applyVibrance(const QImage &img, double vibrance);
+    static QImage applyPhotoFilter(const QImage &img, QColor filterColor, double density);
+    static QImage applyTritone(const QImage &img, QColor shadowColor, double blend);
+    static QImage applyBrightnessContrastEffect(const QImage &img, double brightness, double contrast);
 };

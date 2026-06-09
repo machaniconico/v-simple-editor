@@ -13,6 +13,18 @@
 static inline int clamp255(int v) { return qBound(0, v, 255); }
 static inline int clamp255d(double v) { return qBound(0, static_cast<int>(std::round(v)), 255); }
 static inline double luma709(int r, int g, int b) { return 0.2126 * r + 0.7152 * g + 0.0722 * b; }
+static inline double smoothstep(double t)
+{
+    t = qBound(0.0, t, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
+
+static inline double rgbSaturation01(int r, int g, int b)
+{
+    const int maxC = std::max({ r, g, b });
+    const int minC = std::min({ r, g, b });
+    return static_cast<double>(maxC - minC) / 255.0;
+}
 
 static inline QRgb sampleArgbPixel(const QImage &img, int x, int y)
 {
@@ -134,6 +146,12 @@ QString VideoEffect::typeName(VideoEffectType t)
     case VideoEffectType::Bloom: return "ブルーム";
     case VideoEffectType::Scanlines: return "走査線(CRT)";
     case VideoEffectType::Halftone: return "ハーフトーン";
+    case VideoEffectType::Curves: return "カーブ";
+    case VideoEffectType::ChannelMixer: return "チャンネルミキサー";
+    case VideoEffectType::Vibrance: return "自然な彩度";
+    case VideoEffectType::PhotoFilter: return "フォトフィルター";
+    case VideoEffectType::Tritone: return "トライトーン";
+    case VideoEffectType::BrightnessContrast: return "明るさ・コントラスト";
     }
     return "Unknown";
 }
@@ -155,7 +173,10 @@ QVector<VideoEffectType> VideoEffect::allTypes()
              VideoEffectType::Ripple, VideoEffectType::GlitchVHS,
              VideoEffectType::GradientRamp, VideoEffectType::Fill,
              VideoEffectType::Bloom, VideoEffectType::Scanlines,
-             VideoEffectType::Halftone };
+             VideoEffectType::Halftone, VideoEffectType::Curves,
+             VideoEffectType::ChannelMixer, VideoEffectType::Vibrance,
+             VideoEffectType::PhotoFilter, VideoEffectType::Tritone,
+             VideoEffectType::BrightnessContrast };
 }
 
 VideoEffect VideoEffect::createBlur(double r)
@@ -226,6 +247,18 @@ VideoEffect VideoEffect::createScanlines(double s, double d, double o)
     { VideoEffect e; e.type = VideoEffectType::Scanlines; e.param1 = s; e.param2 = d; e.param3 = o; return e; }
 VideoEffect VideoEffect::createHalftone(double s, double a)
     { VideoEffect e; e.type = VideoEffectType::Halftone; e.param1 = s; e.param2 = a; return e; }
+VideoEffect VideoEffect::createCurves(double s, double h, double m)
+    { VideoEffect e; e.type = VideoEffectType::Curves; e.param1 = s; e.param2 = h; e.param3 = m; return e; }
+VideoEffect VideoEffect::createChannelMixer(double r, double g, double b)
+    { VideoEffect e; e.type = VideoEffectType::ChannelMixer; e.param1 = r; e.param2 = g; e.param3 = b; return e; }
+VideoEffect VideoEffect::createVibrance(double v)
+    { VideoEffect e; e.type = VideoEffectType::Vibrance; e.param1 = v; return e; }
+VideoEffect VideoEffect::createPhotoFilter(QColor c, double d)
+    { VideoEffect e; e.type = VideoEffectType::PhotoFilter; e.keyColor = c; e.param1 = d; return e; }
+VideoEffect VideoEffect::createTritone(QColor c, double b)
+    { VideoEffect e; e.type = VideoEffectType::Tritone; e.keyColor = c; e.param1 = b; return e; }
+VideoEffect VideoEffect::createBrightnessContrast(double b, double c)
+    { VideoEffect e; e.type = VideoEffectType::BrightnessContrast; e.param1 = b; e.param2 = c; return e; }
 
 // ===== EffectParamSchema helper accessors =====
 
@@ -350,6 +383,28 @@ double paramValue(const VideoEffect &effect, const QString &paramName)
             if (paramName == "dotSize" && effect.type == VideoEffectType::Halftone)
                 return effect.param1;
             if (paramName == "angle" && effect.type == VideoEffectType::Halftone)
+                return effect.param2;
+            if (paramName == "shadows" && effect.type == VideoEffectType::Curves)
+                return effect.param1;
+            if (paramName == "highlights" && effect.type == VideoEffectType::Curves)
+                return effect.param2;
+            if (paramName == "midContrast" && effect.type == VideoEffectType::Curves)
+                return effect.param3;
+            if (paramName == "redFromRed" && effect.type == VideoEffectType::ChannelMixer)
+                return effect.param1;
+            if (paramName == "greenFromGreen" && effect.type == VideoEffectType::ChannelMixer)
+                return effect.param2;
+            if (paramName == "blueFromBlue" && effect.type == VideoEffectType::ChannelMixer)
+                return effect.param3;
+            if (paramName == "vibrance" && effect.type == VideoEffectType::Vibrance)
+                return effect.param1;
+            if (paramName == "density" && effect.type == VideoEffectType::PhotoFilter)
+                return effect.param1;
+            if (paramName == "blend" && effect.type == VideoEffectType::Tritone)
+                return effect.param1;
+            if (paramName == "brightness" && effect.type == VideoEffectType::BrightnessContrast)
+                return effect.param1;
+            if (paramName == "contrast" && effect.type == VideoEffectType::BrightnessContrast)
                 return effect.param2;
             return def.defaultVal;
         }
@@ -534,6 +589,39 @@ void setParamValue(VideoEffect &effect, const QString &paramName, double value)
             if (paramName == "angle" && effect.type == VideoEffectType::Halftone) {
                 effect.param2 = value; return;
             }
+            if (paramName == "shadows" && effect.type == VideoEffectType::Curves) {
+                effect.param1 = value; return;
+            }
+            if (paramName == "highlights" && effect.type == VideoEffectType::Curves) {
+                effect.param2 = value; return;
+            }
+            if (paramName == "midContrast" && effect.type == VideoEffectType::Curves) {
+                effect.param3 = value; return;
+            }
+            if (paramName == "redFromRed" && effect.type == VideoEffectType::ChannelMixer) {
+                effect.param1 = value; return;
+            }
+            if (paramName == "greenFromGreen" && effect.type == VideoEffectType::ChannelMixer) {
+                effect.param2 = value; return;
+            }
+            if (paramName == "blueFromBlue" && effect.type == VideoEffectType::ChannelMixer) {
+                effect.param3 = value; return;
+            }
+            if (paramName == "vibrance" && effect.type == VideoEffectType::Vibrance) {
+                effect.param1 = value; return;
+            }
+            if (paramName == "density" && effect.type == VideoEffectType::PhotoFilter) {
+                effect.param1 = value; return;
+            }
+            if (paramName == "blend" && effect.type == VideoEffectType::Tritone) {
+                effect.param1 = value; return;
+            }
+            if (paramName == "brightness" && effect.type == VideoEffectType::BrightnessContrast) {
+                effect.param1 = value; return;
+            }
+            if (paramName == "contrast" && effect.type == VideoEffectType::BrightnessContrast) {
+                effect.param2 = value; return;
+            }
             return;
         }
     }
@@ -549,6 +637,10 @@ QColor colorParamValue(const VideoEffect &effect, const QString &paramName)
         return effect.keyColor;
     if ((paramName == "keyColor" || paramName == "color") && effect.type == VideoEffectType::Fill)
         return effect.keyColor;
+    if ((paramName == "keyColor" || paramName == "color") && effect.type == VideoEffectType::PhotoFilter)
+        return effect.keyColor;
+    if ((paramName == "keyColor" || paramName == "color") && effect.type == VideoEffectType::Tritone)
+        return effect.keyColor;
     return QColor();
 }
 
@@ -561,6 +653,10 @@ void setColorParam(VideoEffect &effect, const QString &paramName, QColor color)
     if ((paramName == "keyColor" || paramName == "color") && effect.type == VideoEffectType::GradientRamp)
         effect.keyColor = color;
     if ((paramName == "keyColor" || paramName == "color") && effect.type == VideoEffectType::Fill)
+        effect.keyColor = color;
+    if ((paramName == "keyColor" || paramName == "color") && effect.type == VideoEffectType::PhotoFilter)
+        effect.keyColor = color;
+    if ((paramName == "keyColor" || paramName == "color") && effect.type == VideoEffectType::Tritone)
         effect.keyColor = color;
 }
 
@@ -810,6 +906,12 @@ QImage VideoEffectProcessor::applyEffect(const QImage &input, const VideoEffect 
     case VideoEffectType::Bloom: return applyBloom(input, effect.param1, effect.param2, effect.param3);
     case VideoEffectType::Scanlines: return applyScanlines(input, effect.param1, effect.param2, effect.param3);
     case VideoEffectType::Halftone: return applyHalftone(input, effect.param1, effect.param2);
+    case VideoEffectType::Curves: return applyCurves(input, effect.param1, effect.param2, effect.param3);
+    case VideoEffectType::ChannelMixer: return applyChannelMixer(input, effect.param1, effect.param2, effect.param3);
+    case VideoEffectType::Vibrance: return applyVibrance(input, effect.param1);
+    case VideoEffectType::PhotoFilter: return applyPhotoFilter(input, effect.keyColor, effect.param1);
+    case VideoEffectType::Tritone: return applyTritone(input, effect.keyColor, effect.param1);
+    case VideoEffectType::BrightnessContrast: return applyBrightnessContrastEffect(input, effect.param1, effect.param2);
     default: return input;
     }
 }
@@ -2025,6 +2127,270 @@ QImage VideoEffectProcessor::applyHalftone(const QImage &input, double dotSize,
             const double radius = std::sqrt(qBound(0.0, darkness, 1.0)) * maxRadius;
             const int value = dist <= radius ? 0 : 255;
             dstLine[x] = qRgba(value, value, value, qAlpha(px));
+        }
+    }
+
+    return result;
+}
+
+QImage VideoEffectProcessor::applyCurves(const QImage &input, double shadows,
+                                         double highlights, double midContrast)
+{
+    const double shadowAdjust = qBound(-100.0, shadows, 100.0) / 100.0;
+    const double highlightAdjust = qBound(-100.0, highlights, 100.0) / 100.0;
+    const double midAdjust = qBound(-100.0, midContrast, 100.0) / 100.0;
+    if (shadowAdjust == 0.0 && highlightAdjust == 0.0 && midAdjust == 0.0)
+        return input;
+
+    QImage src = input.convertToFormat(QImage::Format_ARGB32);
+    const int w = src.width();
+    const int h = src.height();
+    QImage result(w, h, QImage::Format_ARGB32);
+    const double contrastFactor = std::pow(2.0, midAdjust);
+
+    auto curve = [&](int value) -> int {
+        const double v = value / 255.0;
+        double out = v;
+        const double shadowWeight = 1.0 - smoothstep(v);
+        const double highlightWeight = smoothstep(v);
+        out += shadowAdjust * 0.35 * shadowWeight * (1.0 - v);
+        out += highlightAdjust * 0.35 * highlightWeight * v;
+        out = 0.5 + (out - 0.5) * contrastFactor;
+        return clamp255d(qBound(0.0, out, 1.0) * 255.0);
+    };
+
+    for (int y = 0; y < h; ++y) {
+        const QRgb *srcLine = reinterpret_cast<const QRgb*>(src.constScanLine(y));
+        QRgb *dstLine = reinterpret_cast<QRgb*>(result.scanLine(y));
+        for (int x = 0; x < w; ++x) {
+            const QRgb px = srcLine[x];
+            dstLine[x] = qRgba(curve(qRed(px)),
+                               curve(qGreen(px)),
+                               curve(qBlue(px)),
+                               qAlpha(px));
+        }
+    }
+
+    return result;
+}
+
+QImage VideoEffectProcessor::applyChannelMixer(const QImage &input, double redFromRed,
+                                               double greenFromGreen, double blueFromBlue)
+{
+    const double redGain = qBound(0.0, redFromRed, 200.0) / 100.0;
+    const double greenGain = qBound(0.0, greenFromGreen, 200.0) / 100.0;
+    const double blueGain = qBound(0.0, blueFromBlue, 200.0) / 100.0;
+    if (redGain == 1.0 && greenGain == 1.0 && blueGain == 1.0)
+        return input;
+
+    QImage src = input.convertToFormat(QImage::Format_ARGB32);
+    const int w = src.width();
+    const int h = src.height();
+    QImage result(w, h, QImage::Format_ARGB32);
+
+    for (int y = 0; y < h; ++y) {
+        const QRgb *srcLine = reinterpret_cast<const QRgb*>(src.constScanLine(y));
+        QRgb *dstLine = reinterpret_cast<QRgb*>(result.scanLine(y));
+        for (int x = 0; x < w; ++x) {
+            const QRgb px = srcLine[x];
+            dstLine[x] = qRgba(clamp255d(qRed(px) * redGain),
+                               clamp255d(qGreen(px) * greenGain),
+                               clamp255d(qBlue(px) * blueGain),
+                               qAlpha(px));
+        }
+    }
+
+    return result;
+}
+
+QImage VideoEffectProcessor::applyVibrance(const QImage &input, double vibrance)
+{
+    const double amount = qBound(-100.0, vibrance, 100.0) / 100.0;
+    if (amount == 0.0)
+        return input;
+
+    QImage src = input.convertToFormat(QImage::Format_ARGB32);
+    const int w = src.width();
+    const int h = src.height();
+    QImage result(w, h, QImage::Format_ARGB32);
+
+    auto hueDegrees = [](int r, int g, int b) -> double {
+        const double rd = r / 255.0;
+        const double gd = g / 255.0;
+        const double bd = b / 255.0;
+        const double maxC = std::max({ rd, gd, bd });
+        const double minC = std::min({ rd, gd, bd });
+        const double chroma = maxC - minC;
+        if (chroma <= 1e-9)
+            return 0.0;
+        double hue = 0.0;
+        if (maxC == rd) {
+            hue = 60.0 * std::fmod((gd - bd) / chroma, 6.0);
+        } else if (maxC == gd) {
+            hue = 60.0 * (((bd - rd) / chroma) + 2.0);
+        } else {
+            hue = 60.0 * (((rd - gd) / chroma) + 4.0);
+        }
+        if (hue < 0.0)
+            hue += 360.0;
+        return hue;
+    };
+
+    for (int y = 0; y < h; ++y) {
+        const QRgb *srcLine = reinterpret_cast<const QRgb*>(src.constScanLine(y));
+        QRgb *dstLine = reinterpret_cast<QRgb*>(result.scanLine(y));
+        for (int x = 0; x < w; ++x) {
+            const QRgb px = srcLine[x];
+            const int r = qRed(px);
+            const int g = qGreen(px);
+            const int b = qBlue(px);
+            const double saturation = rgbSaturation01(r, g, b);
+            const double hue = hueDegrees(r, g, b);
+            const bool skinHue = hue >= 15.0 && hue <= 55.0 && r > g && g >= b
+                && saturation > 0.08 && saturation < 0.75;
+            const double skinProtect = skinHue ? 0.45 : 1.0;
+            const double boost = amount > 0.0
+                ? amount * (1.0 - saturation) * 1.25 * skinProtect
+                : amount * (0.6 + 0.4 * (1.0 - saturation));
+            const double factor = qMax(0.0, 1.0 + boost);
+            const double lum = luma709(r, g, b);
+            dstLine[x] = qRgba(clamp255d(lum + (r - lum) * factor),
+                               clamp255d(lum + (g - lum) * factor),
+                               clamp255d(lum + (b - lum) * factor),
+                               qAlpha(px));
+        }
+    }
+
+    return result;
+}
+
+QImage VideoEffectProcessor::applyPhotoFilter(const QImage &input, QColor filterColor,
+                                              double density)
+{
+    const double amount = qBound(0.0, density, 100.0) / 100.0;
+    if (amount <= 0.0)
+        return input;
+
+    QImage src = input.convertToFormat(QImage::Format_ARGB32);
+    const int w = src.width();
+    const int h = src.height();
+    QImage result(w, h, QImage::Format_ARGB32);
+    const double fr = filterColor.red();
+    const double fg = filterColor.green();
+    const double fb = filterColor.blue();
+    const double filterLum = luma709(filterColor.red(), filterColor.green(), filterColor.blue());
+
+    for (int y = 0; y < h; ++y) {
+        const QRgb *srcLine = reinterpret_cast<const QRgb*>(src.constScanLine(y));
+        QRgb *dstLine = reinterpret_cast<QRgb*>(result.scanLine(y));
+        for (int x = 0; x < w; ++x) {
+            const QRgb px = srcLine[x];
+            const double lum = luma709(qRed(px), qGreen(px), qBlue(px));
+            double tr = lum;
+            double tg = lum;
+            double tb = lum;
+            if (filterLum > 1e-9) {
+                const double scale = lum / filterLum;
+                tr = qBound(0.0, fr * scale, 255.0);
+                tg = qBound(0.0, fg * scale, 255.0);
+                tb = qBound(0.0, fb * scale, 255.0);
+            }
+            double outR = qRed(px) + amount * (tr - qRed(px));
+            double outG = qGreen(px) + amount * (tg - qGreen(px));
+            double outB = qBlue(px) + amount * (tb - qBlue(px));
+            const double lumaDelta = lum - luma709(clamp255d(outR), clamp255d(outG), clamp255d(outB));
+            outR += lumaDelta;
+            outG += lumaDelta;
+            outB += lumaDelta;
+            dstLine[x] = qRgba(clamp255d(outR),
+                               clamp255d(outG),
+                               clamp255d(outB),
+                               qAlpha(px));
+        }
+    }
+
+    return result;
+}
+
+QImage VideoEffectProcessor::applyTritone(const QImage &input, QColor shadowColor,
+                                          double blend)
+{
+    const double amount = qBound(0.0, blend, 1.0);
+    if (amount <= 0.0)
+        return input;
+
+    QImage src = input.convertToFormat(QImage::Format_ARGB32);
+    const int w = src.width();
+    const int h = src.height();
+    QImage result(w, h, QImage::Format_ARGB32);
+    const double sr = shadowColor.red();
+    const double sg = shadowColor.green();
+    const double sb = shadowColor.blue();
+
+    for (int y = 0; y < h; ++y) {
+        const QRgb *srcLine = reinterpret_cast<const QRgb*>(src.constScanLine(y));
+        QRgb *dstLine = reinterpret_cast<QRgb*>(result.scanLine(y));
+        for (int x = 0; x < w; ++x) {
+            const QRgb px = srcLine[x];
+            const double lum = luma709(qRed(px), qGreen(px), qBlue(px)) / 255.0;
+            double tr = 128.0;
+            double tg = 128.0;
+            double tb = 128.0;
+            if (lum <= 0.5) {
+                const double t = smoothstep(lum / 0.5);
+                tr = sr + t * (128.0 - sr);
+                tg = sg + t * (128.0 - sg);
+                tb = sb + t * (128.0 - sb);
+            } else {
+                const double t = smoothstep((lum - 0.5) / 0.5);
+                tr = 128.0 + t * 127.0;
+                tg = 128.0 + t * 127.0;
+                tb = 128.0 + t * 127.0;
+            }
+            dstLine[x] = qRgba(clamp255d(qRed(px) + amount * (tr - qRed(px))),
+                               clamp255d(qGreen(px) + amount * (tg - qGreen(px))),
+                               clamp255d(qBlue(px) + amount * (tb - qBlue(px))),
+                               qAlpha(px));
+        }
+    }
+
+    return result;
+}
+
+QImage VideoEffectProcessor::applyBrightnessContrastEffect(const QImage &input,
+                                                           double brightness,
+                                                           double contrast)
+{
+    const double b = qBound(-100.0, brightness, 100.0);
+    const double c = qBound(-100.0, contrast, 100.0);
+    if (b == 0.0 && c == 0.0)
+        return input;
+
+    const double brightnessOffset = b * 2.55;
+    double contrastFactor = (100.0 + c) / 100.0;
+    contrastFactor *= contrastFactor;
+
+    uint8_t lut[256];
+    for (int i = 0; i < 256; ++i) {
+        double v = i + brightnessOffset;
+        v = ((v / 255.0 - 0.5) * contrastFactor + 0.5) * 255.0;
+        lut[i] = static_cast<uint8_t>(clamp255d(v));
+    }
+
+    QImage src = input.convertToFormat(QImage::Format_ARGB32);
+    const int w = src.width();
+    const int h = src.height();
+    QImage result(w, h, QImage::Format_ARGB32);
+
+    for (int y = 0; y < h; ++y) {
+        const QRgb *srcLine = reinterpret_cast<const QRgb*>(src.constScanLine(y));
+        QRgb *dstLine = reinterpret_cast<QRgb*>(result.scanLine(y));
+        for (int x = 0; x < w; ++x) {
+            const QRgb px = srcLine[x];
+            dstLine[x] = qRgba(lut[qRed(px)],
+                               lut[qGreen(px)],
+                               lut[qBlue(px)],
+                               qAlpha(px));
         }
     }
 

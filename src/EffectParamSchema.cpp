@@ -171,6 +171,41 @@ QVector<ParamDef> paramSchemaFor(VideoEffectType type)
             { "angle", "角度", ParamType::Float, 0.0, 360.0, 45.0 }
         };
 
+    case VideoEffectType::Curves:
+        return {
+            { "shadows", "シャドウ", ParamType::Float, -100.0, 100.0, 0.0 },
+            { "highlights", "ハイライト", ParamType::Float, -100.0, 100.0, 0.0 },
+            { "midContrast", "中間コントラスト", ParamType::Float, -100.0, 100.0, 0.0 }
+        };
+
+    case VideoEffectType::ChannelMixer:
+        return {
+            { "redFromRed", "Red From Red (%)", ParamType::Float, 0.0, 200.0, 100.0 },
+            { "greenFromGreen", "Green From Green (%)", ParamType::Float, 0.0, 200.0, 100.0 },
+            { "blueFromBlue", "Blue From Blue (%)", ParamType::Float, 0.0, 200.0, 100.0 }
+        };
+
+    case VideoEffectType::Vibrance:
+        return { { "vibrance", "自然な彩度", ParamType::Float, -100.0, 100.0, 0.0 } };
+
+    case VideoEffectType::PhotoFilter:
+        return {
+            { "density", "濃度", ParamType::Float, 0.0, 100.0, 0.0 },
+            { "keyColor", "Key Color", ParamType::Color, 0.0, 0.0, 0.0 }
+        };
+
+    case VideoEffectType::Tritone:
+        return {
+            { "blend", "ブレンド", ParamType::Float, 0.0, 1.0, 0.0 },
+            { "keyColor", "Key Color", ParamType::Color, 0.0, 0.0, 0.0 }
+        };
+
+    case VideoEffectType::BrightnessContrast:
+        return {
+            { "brightness", "明るさ", ParamType::Float, -100.0, 100.0, 0.0 },
+            { "contrast", "コントラスト", ParamType::Float, -100.0, 100.0, 0.0 }
+        };
+
     case VideoEffectType::None:
     default:
         return {};

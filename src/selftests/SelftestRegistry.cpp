@@ -21,6 +21,7 @@ int runAIHighlightSelftest();
 int runAcesColorSelftest();
 int runAeFxBlurSelftest();
 int runAeFxColorSelftest();
+int runAeFxColor2Selftest();
 int runAeFxDistortSelftest();
 int runAeFxGenerateSelftest();
 int runAeFxStylizeSelftest();
@@ -262,6 +263,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "AE-FX-1 Blur Family: Gaussian, directional, radial implementation gates (G1-G6)" },
     { "ae-fx-color",       "VEDITOR_AE_FX_COLOR_SELFTEST",        runAeFxColorSelftest,          false,
       "AE-FX-3 Color Family: levels, tint, blackwhite, exposure, hue/saturation gates (G1-G6)" },
+    { "ae-fx-color2",      "VEDITOR_AE_FX_COLOR2_SELFTEST",       runAeFxColor2Selftest,         false,
+      "AE-FX-6 Color/Channel Family: curves, mixer, vibrance, filter, tritone, brightness/contrast gates (G1-G6)" },
     { "ae-fx-distort",     "VEDITOR_AE_FX_DISTORT_SELFTEST",      runAeFxDistortSelftest,        false,
       "AE-FX-4 Distort & Glitch Family: RGB split, wave warp, ripple, VHS glitch gates (G1-G6)" },
     { "ae-fx-generate",    "VEDITOR_AE_FX_GENERATE_SELFTEST",     runAeFxGenerateSelftest,       false,
