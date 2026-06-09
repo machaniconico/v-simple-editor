@@ -1527,7 +1527,9 @@ KeyframeTrack ProjectFile::keyframeTrackFromJson(const QJsonObject &obj)
     for (const auto &v : obj["keyframes"].toArray()) {
         const KeyframePoint kf = keyframePointFromJson(v.toObject());
         track.addKeyframe(kf.time, kf.value, kf.interpolation,
-                          kf.bezX1, kf.bezY1, kf.bezX2, kf.bezY2);
+                          kf.bezX1, kf.bezY1, kf.bezX2, kf.bezY2,
+                          kf.hasSpatialTangent, kf.spatialOutX,
+                          kf.spatialOutY, kf.spatialInX, kf.spatialInY);
     }
     return track;
 }

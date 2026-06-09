@@ -3,9 +3,17 @@
 #include "../ClipGeometry.h"
 #include "../VideoEffect.h"
 
+#include <QPointF>
+
 struct ClipInfo;
 
 namespace clipanim {
+
+// Returns effective 2D position at clip-local time.
+// If the surrounding position segment has no spatial tangents, this is the
+// same independent per-axis keyframe result used by effectiveTransformAt().
+QPointF effectivePositionAt(const ClipInfo& clip,
+                            double clipLocalSeconds);
 
 // Returns effective transform at clip-local time.
 // If no keyframe track exists for a property, uses the static ClipInfo value.

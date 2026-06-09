@@ -116,6 +116,7 @@ int runSmartEditSelftest();
 int runSnsCoverSelftest();
 int runSnsFitSelftest();
 int runSocialSelftest();
+int runSpatialPathSelftest();
 int runSpectralEditSelftest();
 int runStereoPanSelftest();
 int runSubtitleCpsSelftest();
@@ -241,6 +242,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Elastic/Bounce/Back keyframe easing presets: math, overshoot, legacy invariance, JSON round-trip (6 gates)" },
     { "motion-preset",     "VEDITOR_MOTION_PRESET_SELFTEST",       runMotionPresetSelftest,       false,
       "Motion preset library: built-in ids, generated motion keyframes, deterministic replacement (6 gates)" },
+    { "spatial-path",      "VEDITOR_SPATIAL_PATH_SELFTEST",        runSpatialPathSelftest,        false,
+      "AE-ANIM-2 spatial Bezier position path: no-handle invariance, curve, endpoints, JSON, degenerate guards (5 gates)" },
     { "spectral-edit",     "VEDITOR_SPECTRAL_EDIT_SELFTEST",      runSpectralEditSelftest,       false,
       "SpectralEngine: FFT/STFT/iSTFT round-trip + region attenuation" },
     { "sws-color",         "VEDITOR_SWS_COLOR_SELFTEST",          runSwsColorSelftest,           false,

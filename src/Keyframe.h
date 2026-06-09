@@ -16,6 +16,11 @@ struct KeyframePoint {
     double bezY1 = 0.0;
     double bezX2 = 1.0;
     double bezY2 = 1.0;
+    bool hasSpatialTangent = false;
+    double spatialOutX = 0.0;
+    double spatialOutY = 0.0;
+    double spatialInX = 0.0;
+    double spatialInY = 0.0;
 };
 
 struct StringKeyframePoint {
@@ -37,7 +42,12 @@ public:
                      double bezX1 = 0.0,
                      double bezY1 = 0.0,
                      double bezX2 = 1.0,
-                     double bezY2 = 1.0);
+                     double bezY2 = 1.0,
+                     bool hasSpatialTangent = false,
+                     double spatialOutX = 0.0,
+                     double spatialOutY = 0.0,
+                     double spatialInX = 0.0,
+                     double spatialInY = 0.0);
     void removeKeyframe(int index);
     void setKeyframeValue(int index, double value);
     void setKeyframeTime(int index, double time);

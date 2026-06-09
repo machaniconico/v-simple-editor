@@ -41,7 +41,12 @@ void KeyframeTrack::addKeyframe(double time,
                                 double bezX1,
                                 double bezY1,
                                 double bezX2,
-                                double bezY2)
+                                double bezY2,
+                                bool hasSpatialTangent,
+                                double spatialOutX,
+                                double spatialOutY,
+                                double spatialInX,
+                                double spatialInY)
 {
     // Remove existing keyframe at same time
     for (int i = 0; i < m_keyframes.size(); ++i) {
@@ -52,6 +57,11 @@ void KeyframeTrack::addKeyframe(double time,
             m_keyframes[i].bezY1 = bezY1;
             m_keyframes[i].bezX2 = bezX2;
             m_keyframes[i].bezY2 = bezY2;
+            m_keyframes[i].hasSpatialTangent = hasSpatialTangent;
+            m_keyframes[i].spatialOutX = spatialOutX;
+            m_keyframes[i].spatialOutY = spatialOutY;
+            m_keyframes[i].spatialInX = spatialInX;
+            m_keyframes[i].spatialInY = spatialInY;
             return;
         }
     }
@@ -64,6 +74,11 @@ void KeyframeTrack::addKeyframe(double time,
     kf.bezY1 = bezY1;
     kf.bezX2 = bezX2;
     kf.bezY2 = bezY2;
+    kf.hasSpatialTangent = hasSpatialTangent;
+    kf.spatialOutX = spatialOutX;
+    kf.spatialOutY = spatialOutY;
+    kf.spatialInX = spatialInX;
+    kf.spatialInY = spatialInY;
     m_keyframes.append(kf);
 
     // Keep sorted by time
@@ -210,6 +225,12 @@ QJsonObject keyframePointToJson(const KeyframePoint &kf)
             kfObj[QStringLiteral("bezY2")] = kf.bezY2;
         }
     }
+    if (kf.hasSpatialTangent) {
+        kfObj[QStringLiteral("spatialOutX")] = kf.spatialOutX;
+        kfObj[QStringLiteral("spatialOutY")] = kf.spatialOutY;
+        kfObj[QStringLiteral("spatialInX")] = kf.spatialInX;
+        kfObj[QStringLiteral("spatialInY")] = kf.spatialInY;
+    }
     return kfObj;
 }
 
@@ -223,6 +244,14 @@ KeyframePoint keyframePointFromJson(const QJsonObject &obj)
     kf.bezY1 = obj[QStringLiteral("bezY1")].toDouble(kIdentityBezY1);
     kf.bezX2 = obj[QStringLiteral("bezX2")].toDouble(kIdentityBezX2);
     kf.bezY2 = obj[QStringLiteral("bezY2")].toDouble(kIdentityBezY2);
+    kf.hasSpatialTangent = obj.contains(QStringLiteral("spatialOutX"))
+        || obj.contains(QStringLiteral("spatialOutY"))
+        || obj.contains(QStringLiteral("spatialInX"))
+        || obj.contains(QStringLiteral("spatialInY"));
+    kf.spatialOutX = obj[QStringLiteral("spatialOutX")].toDouble(0.0);
+    kf.spatialOutY = obj[QStringLiteral("spatialOutY")].toDouble(0.0);
+    kf.spatialInX = obj[QStringLiteral("spatialInX")].toDouble(0.0);
+    kf.spatialInY = obj[QStringLiteral("spatialInY")].toDouble(0.0);
     return kf;
 }
 
@@ -448,7 +477,9 @@ void KeyframeManager::fromJson(const QJsonObject &obj)
         for (const auto &kfVal : keyframesArray) {
             const KeyframePoint kf = keyframePointFromJson(kfVal.toObject());
             track.addKeyframe(kf.time, kf.value, kf.interpolation,
-                              kf.bezX1, kf.bezY1, kf.bezX2, kf.bezY2);
+                              kf.bezX1, kf.bezY1, kf.bezX2, kf.bezY2,
+                              kf.hasSpatialTangent, kf.spatialOutX,
+                              kf.spatialOutY, kf.spatialInX, kf.spatialInY);
         }
         m_tracks.append(track);
     }
