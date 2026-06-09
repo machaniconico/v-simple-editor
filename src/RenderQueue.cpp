@@ -5,6 +5,7 @@
 #include "ExportRange.h"
 #include "TrackMatteKey.h"
 #include "CodecDetector.h"
+#include "SmartRender.h"
 #include "AcesColor.h"  // AC: production export 経路への ACES 適用 (8bit のみ)
 #include "color/ClipOdt.h"
 #include "playback/hdrexport16_flag.h"
@@ -844,6 +845,73 @@ void RenderQueue::startRenderPipe(int jobIndex)
             videoCodec = QString::fromStdString(*probed);
         else
             videoCodec = QStringLiteral("libx265");
+    }
+
+    if (smartrender::enabledFromEnv()) {
+        // T4 staged hook only: the current render pipe produces RGB frames and
+        // hands them to FrameEncoder, so compressed-packet stream-copy muxing
+        // needs a separate real-export verification pass. Keep this branch
+        // observational until the mux path can be proven without touching the
+        // default export flow.
+        int segmentIndex = 0;
+        const QHash<QString, TimelineTrackMatteEntry> matteEntries =
+            tl->trackMatteEntries();
+        const QVector<TimelineTrack*> tracks = tl->videoTracks();
+        for (int trackIdx = 0; trackIdx < tracks.size(); ++trackIdx) {
+            const TimelineTrack *track = tracks[trackIdx];
+            if (!track)
+                continue;
+            const QVector<ClipInfo> &clips = track->clips();
+            for (int clipIdx = 0; clipIdx < clips.size(); ++clipIdx) {
+                const ClipInfo &clip = clips[clipIdx];
+                const QString matteKey = trackMatteClipKey(trackIdx, clipIdx);
+                const auto matteIt = matteEntries.constFind(matteKey);
+                const bool hasTrackMatte =
+                    matteIt != matteEntries.cend()
+                    && matteIt.value().matteType != TrackMatteType::None;
+                const bool hasTransitions =
+                    clip.leadIn.type != TransitionType::None
+                    || clip.trailOut.type != TransitionType::None;
+                const bool hasSpeedChange =
+                    !clip.speedRamp.isIdentity()
+                    || std::fabs(clip.speed - 1.0) > 0.000001;
+                const bool hasTransform =
+                    std::fabs(clip.videoScale - 1.0) > 0.000001
+                    || std::fabs(clip.videoDx) > 0.000001
+                    || std::fabs(clip.videoDy) > 0.000001
+                    || std::fabs(clip.rotation2DDegrees) > 0.000001;
+                const smartrender::SegmentEligibility eligibility =
+                    smartrender::canStreamCopy(clip,
+                                               videoCodec,
+                                               outW,
+                                               outH,
+                                               fps,
+                                               !clip.effects.isEmpty(),
+                                               !clip.colorCorrection.isDefault(),
+                                               hasTransform,
+                                               hasTransitions,
+                                               hasSpeedChange,
+                                               clip.keyframes.hasAnyKeyframes(),
+                                               !clip.layerStyle.isIdentity(),
+                                               hasTrackMatte,
+                                               trackIdx > 0);
+                if (eligibility.eligible) {
+                    qInfo().noquote()
+                        << "[smart-render] would stream-copy segment"
+                        << segmentIndex
+                        << "track=" << trackIdx
+                        << "clip=" << clipIdx
+                        << "file=" << clip.filePath;
+                } else {
+                    qInfo().noquote()
+                        << "[smart-render] segment"
+                        << segmentIndex
+                        << "not stream-copy eligible:"
+                        << eligibility.reason;
+                }
+                ++segmentIndex;
+            }
+        }
     }
 
     request.videoBitrateBits = jobCopy.bitrateBps;

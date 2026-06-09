@@ -115,6 +115,7 @@ int runSilenceCutSelftest();
 int runBeatDetectSelftest();
 int runSafeZoneSelftest();
 int runSmartEditSelftest();
+int runSmartRenderSelftest();
 int runSnsCoverSelftest();
 int runSnsFitSelftest();
 int runSocialSelftest();
@@ -351,6 +352,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "LayerStyle: identity fast path, drop shadow, stroke, and project JSON omission/round-trip" },
     { "layer-style-ui",     "VEDITOR_LAYER_STYLE_UI_SELFTEST",     runLayerStyleUiSelftest,       false,
       "Layer Style UI: default identity, JSON round-trip, enabled-flag identity, and optional Timeline setter/getter gate" },
+    { "smart-render",       "VEDITOR_SMART_RENDER_SELFTEST",       runSmartRenderSelftest,        false,
+      "Smart Render T4: conservative stream-copy eligibility predicate + env gate" },
     // QApplication-required (needsQApplication=true) ----------------------
     { "parity",            "VEDITOR_PARITY_SELFTEST",             runParitySelftest,             true,
       "Preview vs export pixel-parity (S1-S11, framediff::mse, 10-bit HDR10)" },

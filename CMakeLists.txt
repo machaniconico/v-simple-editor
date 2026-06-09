@@ -89,6 +89,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/bezier_easing_selftest.cpp
     src/selftests/EasingPresetsSelftest.cpp
     src/selftests/SpatialPathSelftest.cpp
+    src/selftests/SmartRenderSelftest.cpp
 
     # PRD-SPLIT-MAIN-3 Phase 3-A: libavcore-backed selftests (moved from src/main.cpp).
     src/selftests/libavcore_selftests.cpp
@@ -125,6 +126,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/Exporter.cpp
     src/FrameDiff.cpp
     src/TimelineFrameRenderer.cpp
+    src/SmartRender.h
+    src/SmartRender.cpp
     src/TextOverlayBake.h
     src/TextOverlayBake.cpp
     src/TrackMatteBake.h
@@ -192,6 +195,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/AudioBusRouting.h
     src/AudioBusRouting.cpp
     src/playback/AudioPan.h
+    src/playback/smartrender_flag.h
     src/SilenceCut.cpp
     src/BeatDetect.cpp
     src/AudioBusPanel.cpp
