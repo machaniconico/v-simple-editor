@@ -10,6 +10,7 @@
 #include <QStringList>
 
 int runRgbParadeSelftest();
+int runWbEyedropperSelftest();
 
 namespace selftests {
 

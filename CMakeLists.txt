@@ -130,6 +130,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/Overlay.cpp
     src/OverlayDialogs.cpp
     src/VideoEffect.cpp
+    src/WbPick.h
+    src/WbPick.cpp
     src/FractalNoise.h
     src/FractalNoise.cpp
     src/EffectParamSchema.h
@@ -181,6 +183,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/StereoPanSelftest.cpp
     src/selftests/ExportRangeSelftest.cpp
     src/selftests/CapcutCaptionSelftest.cpp
+    src/selftests/WbEyedropperSelftest.cpp
     src/selftests/SubtitleCpsSelftest.cpp
     src/selftests/RgbParadeSelftest.cpp
     src/selftests/atempo_resolve_selftest.cpp

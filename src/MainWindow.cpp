@@ -3547,6 +3547,28 @@ void MainWindow::setupMenuBar()
             return;
         m_player->glPreview()->setWhiteBalance(r, g, b);
     });
+    connect(m_colorGradingPanel, &ColorGradingPanel::whiteBalancePickModeRequested,
+            this, [this](bool enabled) {
+        if (!m_player || !m_colorGradingPanel)
+            return;
+        if (!enabled) {
+            m_player->exitWbEyedropperMode();
+            return;
+        }
+        if (!m_timeline || !m_timeline->hasSelection()) {
+            m_colorGradingPanel->setWhiteBalancePickModeActive(false);
+            return;
+        }
+        QPointer<ColorGradingPanel> panel = m_colorGradingPanel;
+        m_player->enterWbEyedropperMode([panel](QColor color) {
+            if (!panel)
+                return;
+            if (color.isValid())
+                panel->applyWhiteBalancePick(color);
+            else
+                panel->setWhiteBalancePickModeActive(false);
+        });
+    });
 
     // US-CG-3: wire ColorGradingPanel Vignette sliders → GLPreview uVig*.
     // Applied AFTER curves (US-CG-1) and BEFORE the .cube LUT (US-WIRE-1).

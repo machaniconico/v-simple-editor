@@ -542,6 +542,49 @@ private:
     QRect m_currentRect;
 };
 
+class WbEyedropperOverlay : public QWidget
+{
+public:
+    using Callback = std::function<void(QPoint)>;
+
+    explicit WbEyedropperOverlay(QWidget *parent)
+        : QWidget(parent)
+    {
+        setMouseTracking(true);
+        setFocusPolicy(Qt::StrongFocus);
+        setCursor(Qt::CrossCursor);
+        setAttribute(Qt::WA_NoSystemBackground, true);
+        setAttribute(Qt::WA_TranslucentBackground, true);
+        hide();
+    }
+
+    void setCallback(Callback cb) { m_callback = std::move(cb); }
+
+protected:
+    void mousePressEvent(QMouseEvent *e) override
+    {
+        if (e->button() == Qt::LeftButton && m_callback) {
+            m_callback(e->pos());
+            e->accept();
+            return;
+        }
+        QWidget::mousePressEvent(e);
+    }
+
+    void keyPressEvent(QKeyEvent *e) override
+    {
+        if (e->key() == Qt::Key_Escape && m_callback) {
+            m_callback(QPoint(-1, -1));
+            e->accept();
+            return;
+        }
+        QWidget::keyPressEvent(e);
+    }
+
+private:
+    Callback m_callback;
+};
+
 
 // VEDITOR_TICK_TRACE=1 turns on per-tick wall-time accumulators that print a
 // 30-tick rollup line to qInfo. Default off — read once per process so the
@@ -644,6 +687,10 @@ VideoPlayer::~VideoPlayer()
     if (m_regionPickerOverlay) {
         m_regionPickerOverlay->deleteLater();
         m_regionPickerOverlay = nullptr;
+    }
+    if (m_wbEyedropperOverlay) {
+        m_wbEyedropperOverlay->deleteLater();
+        m_wbEyedropperOverlay = nullptr;
     }
     resetDecoder();
     // Tear down V2+ decoder pool after the legacy V1 decoder is gone, then
@@ -2795,6 +2842,7 @@ void VideoPlayer::setHiddenTextOverlayIndex(int index)
 // receives the QRect in source-frame pixel coordinates.
 void VideoPlayer::enterRegionPickerMode(std::function<void(QRect)> callback)
 {
+    exitWbEyedropperMode();
     exitRegionPickerMode();
     if (!callback || !m_glPreview) return;
     m_regionPickerCallback = std::move(callback);
@@ -2853,6 +2901,64 @@ void VideoPlayer::exitRegionPickerMode()
     if (m_regionPickerOverlay) {
         m_regionPickerOverlay->deleteLater();
         m_regionPickerOverlay = nullptr;
+    }
+}
+
+void VideoPlayer::enterWbEyedropperMode(std::function<void(QColor)> callback)
+{
+    exitRegionPickerMode();
+    exitWbEyedropperMode();
+    if (!callback || !m_glPreview)
+        return;
+
+    m_wbEyedropperCallback = std::move(callback);
+    m_wbEyedropperActive = true;
+
+    QStackedWidget *stack = qobject_cast<QStackedWidget *>(m_glPreview->parentWidget());
+    const QRect overlayGeo = stack ? stack->geometry() : m_glPreview->geometry();
+
+    auto *picker = new WbEyedropperOverlay(this);
+    m_wbEyedropperOverlay = picker;
+    m_wbEyedropperOverlay->setGeometry(overlayGeo);
+
+    picker->setCallback([this](QPoint widgetPos) {
+        if (!m_wbEyedropperCallback)
+            return;
+
+        QColor sampled;
+        if (widgetPos.x() >= 0 && widgetPos.y() >= 0
+            && m_glPreview && !m_currentFrameImage.isNull()) {
+            const QRectF lb = m_glPreview->letterboxRect();
+            if (lb.width() > 1.0 && lb.height() > 1.0
+                && lb.contains(QPointF(widgetPos))) {
+                const int srcW = m_currentFrameImage.width();
+                const int srcH = m_currentFrameImage.height();
+                const double sx = static_cast<double>(srcW) / lb.width();
+                const double sy = static_cast<double>(srcH) / lb.height();
+                const int px = qBound(0, static_cast<int>((widgetPos.x() - lb.x()) * sx), srcW - 1);
+                const int py = qBound(0, static_cast<int>((widgetPos.y() - lb.y()) * sy), srcH - 1);
+                sampled = m_currentFrameImage.pixelColor(px, py);
+            }
+        }
+
+        auto cb = std::move(m_wbEyedropperCallback);
+        m_wbEyedropperCallback = nullptr;
+        exitWbEyedropperMode();
+        cb(sampled);
+    });
+
+    m_wbEyedropperOverlay->show();
+    m_wbEyedropperOverlay->raise();
+    m_wbEyedropperOverlay->setFocus();
+}
+
+void VideoPlayer::exitWbEyedropperMode()
+{
+    m_wbEyedropperActive = false;
+    m_wbEyedropperCallback = nullptr;
+    if (m_wbEyedropperOverlay) {
+        m_wbEyedropperOverlay->deleteLater();
+        m_wbEyedropperOverlay = nullptr;
     }
 }
 
@@ -3914,6 +4020,10 @@ void VideoPlayer::resizeEvent(QResizeEvent *event)
     if (m_regionPickerOverlay && m_glPreview) {
         QStackedWidget *stack = qobject_cast<QStackedWidget *>(m_glPreview->parentWidget());
         m_regionPickerOverlay->setGeometry(stack ? stack->geometry() : m_glPreview->geometry());
+    }
+    if (m_wbEyedropperOverlay && m_glPreview) {
+        QStackedWidget *stack = qobject_cast<QStackedWidget *>(m_glPreview->parentWidget());
+        m_wbEyedropperOverlay->setGeometry(stack ? stack->geometry() : m_glPreview->geometry());
     }
     refreshDisplayedFrame();
 }

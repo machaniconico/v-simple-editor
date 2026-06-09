@@ -2,12 +2,14 @@
 #include "ColorWheelWidget.h"
 #include "CurveEditor.h"
 #include "HueVsSatEditor.h"
+#include "WbPick.h"
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QGridLayout>
 #include <QGroupBox>
 #include <QScrollArea>
 #include <QColorDialog>
+#include <QSignalBlocker>
 #include <algorithm>
 #include <cmath>
 
@@ -507,9 +509,15 @@ ColorGradingPanel::ColorGradingPanel(QWidget *parent)
     m_hue        = addSlider(basicLayout, tr("色相"),         -180, 180, 0);
     m_temperature= addSlider(basicLayout, tr("色温度"),       -100, 100, 0);
     m_tint       = addSlider(basicLayout, tr("色かぶり"),     -100, 100, 0);
+    m_wbPickButton = new QPushButton(tr("WB スポイト"));
+    m_wbPickButton->setCheckable(true);
+    m_wbPickButton->setToolTip(tr("プレビューでニュートラルにしたい画素をクリック"));
+    basicLayout->addWidget(m_wbPickButton);
     m_gamma      = addSlider(basicLayout, tr("ガンマ"),        10, 300, 100, 100);
 
     mainLayout->addWidget(basicGroup);
+    connect(m_wbPickButton, &QPushButton::toggled,
+            this, &ColorGradingPanel::onWhiteBalancePickToggled);
 
     // --- LUT Section ---
     auto *lutGroup = new QGroupBox(tr("LUT"));
@@ -730,6 +738,28 @@ void ColorGradingPanel::setColorCorrection(const ColorCorrection &cc)
     m_gainWheel->setColor(cc.gainR, cc.gainG, cc.gainB);
     updateSlidersFromCC();
     m_updating = false;
+}
+
+void ColorGradingPanel::applyWhiteBalancePick(const QColor &pixel)
+{
+    setWhiteBalancePickModeActive(false);
+    if (!pixel.isValid())
+        return;
+
+    const wbpick::TempTintCorrection correction =
+        wbpick::tempTintForNeutral(pixel);
+    m_cc.temperature = correction.temperature;
+    m_cc.tint = correction.tint;
+    updateSlidersFromCC();
+    emit colorCorrectionChanged(m_cc);
+}
+
+void ColorGradingPanel::setWhiteBalancePickModeActive(bool active)
+{
+    if (!m_wbPickButton)
+        return;
+    QSignalBlocker blocker(m_wbPickButton);
+    m_wbPickButton->setChecked(active);
 }
 
 void ColorGradingPanel::updateSlidersFromCC()
@@ -1004,6 +1034,8 @@ void ColorGradingPanel::onResetClicked()
         if (m_wbTemperatureLabel) m_wbTemperatureLabel->setText(tr("5500K"));
         if (m_wbTintLabel) m_wbTintLabel->setText(tr("+0"));
     }
+    if (m_wbPickButton && m_wbPickButton->isChecked())
+        m_wbPickButton->setChecked(false);
 
     // US-CG-3: reset vignette sliders to identity (amount=0 → free no-op,
     // midpoint=70 / roundness=0 / feather=30 are the spec defaults).
@@ -1225,6 +1257,11 @@ void ColorGradingPanel::onWhiteBalanceChanged()
     emit whiteBalanceChanged(static_cast<float>(rGain),
                              static_cast<float>(gGain),
                              static_cast<float>(bGain));
+}
+
+void ColorGradingPanel::onWhiteBalancePickToggled(bool enabled)
+{
+    emit whiteBalancePickModeRequested(enabled);
 }
 
 void ColorGradingPanel::onVignetteChanged()

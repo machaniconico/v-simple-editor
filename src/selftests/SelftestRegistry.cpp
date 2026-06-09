@@ -128,6 +128,7 @@ int runVfxSelftest();
 int runVideostabDeshakeSelftest();
 int runVimeoSelftest();
 int runWatermarkSelftest();
+int runWbEyedropperSelftest();
 int runWhisperTranscribeSelftest();
 int runWorkflowSelftest();
 int runWorkspaceSelftest();
@@ -271,6 +272,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "OnionSkin: disabled/empty/opacity-zero no-op + display blend invariant (4 gates)" },
     { "capcut-caption",   "VEDITOR_CAPCUT_CAPTION_SELFTEST",      runCapcutCaptionSelftest,      false,
       "CapCut-style caption presets: shape, uniqueness, distinction, background semantics, non-default" },
+    { "wb-eyedropper",    "VEDITOR_WB_EYEDROPPER_SELFTEST",       runWbEyedropperSelftest,       false,
+      "WB eyedropper inverse temperature/tint helper + closed-loop VideoEffect forward proof" },
     { "subtitle-cps",     "VEDITOR_SUBTITLE_CPS_SELFTEST",        runSubtitleCpsSelftest,        false,
       "Subtitle CPS readability helper: visible character counting, zero-duration sentinel, strict threshold" },
     { "subtitle-karaoke", "VEDITOR_SUBTITLE_KARAOKE_SELFTEST",    runSubtitleKaraokeSelftest,    false,

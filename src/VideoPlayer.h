@@ -3,6 +3,7 @@
 #include <QWidget>
 #include <QLabel>
 #include <QImage>
+#include <QColor>
 #include <QPushButton>
 #include <QSlider>
 #include <QTimer>
@@ -232,6 +233,9 @@ public:
     // into ColorGradingPanel::setMaskRect or GLPreview::setMask directly.
     void enterMaskEditMode(std::function<void(QRectF)> callback);
     void exitMaskEditMode();
+    void enterWbEyedropperMode(std::function<void(QColor)> callback);
+    void exitWbEyedropperMode();
+    bool isWbEyedropperActive() const { return m_wbEyedropperActive; }
 
     // Test-only seam for the PARITY S3 selftest (src/main.cpp
     // runParitySelftest). composeMultiTrackFrame + the DecodedLayer struct
@@ -641,6 +645,9 @@ private:
     bool m_regionPickerActive = false;
     std::function<void(QRect)> m_regionPickerCallback;
     QWidget *m_regionPickerOverlay = nullptr;
+    bool m_wbEyedropperActive = false;
+    std::function<void(QColor)> m_wbEyedropperCallback;
+    QWidget *m_wbEyedropperOverlay = nullptr;
     QVector<EnhancedTextOverlay> m_textOverlays;
     // Cached raw source of the most recent frame. Needed so
     // setHiddenTextOverlayIndex can re-compose while paused (the cached

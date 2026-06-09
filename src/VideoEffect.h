@@ -101,12 +101,12 @@ public:
     static QImage applyEffect(const QImage &input, const VideoEffect &effect);
     static QImage applyEffectStack(const QImage &input, const ColorCorrection &cc,
                                    const QVector<VideoEffect> &effects);
+    static void adjustTemperatureTint(QImage &img, double temperature, double tint);
 
 private:
     static void adjustBrightnessContrast(QImage &img, double brightness, double contrast);
     static void adjustSaturation(QImage &img, double saturation);
     static void adjustHue(QImage &img, double hue);
-    static void adjustTemperatureTint(QImage &img, double temperature, double tint);
     static void adjustGamma(QImage &img, double gamma);
     static void adjustHighlightsShadows(QImage &img, double highlights, double shadows);
     static void adjustExposure(QImage &img, double exposure);
