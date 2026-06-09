@@ -29,6 +29,7 @@ int runAudioBusSelftest();
 int runAudioMixerSelftest();
 int runAudioRestoreSelftest();
 int runAutoClipGenSelftest();
+int runAutoColorSelftest();
 int runAutoMatteSelftest();
 int runBatchExportSelftest();
 int runBezierEasingSelftest();
@@ -272,6 +273,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "OnionSkin: disabled/empty/opacity-zero no-op + display blend invariant (4 gates)" },
     { "capcut-caption",   "VEDITOR_CAPCUT_CAPTION_SELFTEST",      runCapcutCaptionSelftest,      false,
       "CapCut-style caption presets: shape, uniqueness, distinction, background semantics, non-default" },
+    { "auto-color",       "VEDITOR_AUTO_COLOR_SELFTEST",          runAutoColorSelftest,          false,
+      "AutoColor: frame stats + gray-world WB + brightness/contrast closed-loop proof" },
     { "wb-eyedropper",    "VEDITOR_WB_EYEDROPPER_SELFTEST",       runWbEyedropperSelftest,       false,
       "WB eyedropper inverse temperature/tint helper + closed-loop VideoEffect forward proof" },
     { "subtitle-cps",     "VEDITOR_SUBTITLE_CPS_SELFTEST",        runSubtitleCpsSelftest,        false,

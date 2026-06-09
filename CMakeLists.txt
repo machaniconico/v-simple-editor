@@ -129,6 +129,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/UndoManager.cpp
     src/Overlay.cpp
     src/OverlayDialogs.cpp
+    src/AutoColor.h
+    src/AutoColor.cpp
     src/VideoEffect.cpp
     src/WbPick.h
     src/WbPick.cpp
@@ -183,6 +185,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/StereoPanSelftest.cpp
     src/selftests/ExportRangeSelftest.cpp
     src/selftests/CapcutCaptionSelftest.cpp
+    src/selftests/AutoColorSelftest.cpp
     src/selftests/WbEyedropperSelftest.cpp
     src/selftests/SubtitleCpsSelftest.cpp
     src/selftests/RgbParadeSelftest.cpp

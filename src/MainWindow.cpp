@@ -2,6 +2,7 @@
 #include "VideoPlayer.h"
 #include "Timeline.h"
 #include "UndoTrace.h"
+#include "AutoColor.h"
 
 // AR-2: レガシー Exporter 経路へ ACES 色管理パイプラインを渡すフリー関数。実体は
 // Exporter.cpp に TU ローカル状態とともに定義 (Exporter.h は touchedFiles 外のため
@@ -1600,7 +1601,8 @@ void MainWindow::setupUI()
             m_player->setPreviewMaximized(false);
         }
     });
-    connect(m_player, &VideoPlayer::frameComposited, this, [this](const QImage &) {
+    connect(m_player, &VideoPlayer::frameComposited, this, [this](const QImage &image) {
+        m_lastCompositedFrame = image;
         if (!m_player || m_player->isPlaying() || !m_timeline || !m_player->glPreview())
             return;
 
@@ -2613,6 +2615,11 @@ void MainWindow::setupMenuBar()
     connect(ccAction, &QAction::triggered, this, &MainWindow::colorCorrection);
     m_menuHelpEntries.append({ccAction,
         QStringLiteral("映像の明るさ・色合い・コントラストを整えます。映画風の色味に寄せることもできます。")});
+
+    auto *autoColorAction = effectsMenu->addAction(QStringLiteral("自動カラー"));
+    connect(autoColorAction, &QAction::triggered, this, &MainWindow::autoColorSelectedClip);
+    m_menuHelpEntries.append({autoColorAction,
+        QStringLiteral("表示中のフレームを解析し、選択中クリップのホワイトバランスと明るさ・コントラストを自動補正します。")});
 
     auto *fxAction = effectsMenu->addAction("ビデオエフェクト(&V)...");
     fxAction->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_F));
@@ -6954,12 +6961,15 @@ void MainWindow::colorCorrection()
 
     // サブメニュー: 旧ダイアログ or 新パネル
     QMenu menu(this);
+    auto *autoAction = menu.addAction(QStringLiteral("自動カラー"));
     auto *dialogAction = menu.addAction("色補正ダイアログ (クラシック)...");
     auto *panelAction  = menu.addAction("カラーグレーディングパネル");
     auto *chosen = menu.exec(QCursor::pos());
     if (!chosen) return;
 
-    if (chosen == panelAction) {
+    if (chosen == autoAction) {
+        autoColorSelectedClip();
+    } else if (chosen == panelAction) {
         // 新パネルを表示
         m_colorGradingPanel->setColorCorrection(m_timeline->clipColorCorrection());
         m_colorGradingPanel->show();
@@ -6987,6 +6997,27 @@ void MainWindow::colorCorrection()
             m_player->setColorCorrection(originalCC);
         }
     }
+}
+
+void MainWindow::autoColorSelectedClip()
+{
+    if (!m_timeline || !m_timeline->hasSelection()) {
+        QMessageBox::information(this, "Color Correction", "Select a clip first.");
+        return;
+    }
+    if (m_lastCompositedFrame.isNull()) {
+        statusBar()->showMessage(QStringLiteral("自動カラー: 表示中のフレームがありません"), 3000);
+        return;
+    }
+
+    const autocolor::FrameStats stats = autocolor::analyzeFrame(m_lastCompositedFrame);
+    const ColorCorrection cc = autocolor::autoCorrection(stats);
+    m_timeline->setClipColorCorrection(cc);
+    if (m_player)
+        m_player->setColorCorrection(cc);
+    if (m_colorGradingPanel)
+        m_colorGradingPanel->setColorCorrection(cc);
+    statusBar()->showMessage(QStringLiteral("自動カラーを適用しました"), 3000);
 }
 
 void MainWindow::videoEffects()

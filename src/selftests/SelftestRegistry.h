@@ -9,6 +9,7 @@
 #include <QString>
 #include <QStringList>
 
+int runAutoColorSelftest();
 int runRgbParadeSelftest();
 int runWbEyedropperSelftest();
 

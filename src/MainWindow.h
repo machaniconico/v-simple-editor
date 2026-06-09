@@ -14,6 +14,7 @@
 #include <QLabel>
 #include <QShowEvent>
 #include <QColor>
+#include <QImage>
 #include <QHash>
 #include <QVector>
 #include <QPair>
@@ -281,6 +282,7 @@ private slots:
     void toggleMute();
     void toggleSolo();
     void colorCorrection();
+    void autoColorSelectedClip();
     void videoEffects();
     void pluginEffects();
     void trackMotion(); // US-FEAT-D: motion tracking UI
@@ -677,6 +679,7 @@ private:
     class ColorGradingPanel *m_colorGradingPanel = nullptr;
     effectctrl::EffectControlsPanel *m_effectControlsPanel = nullptr;
     VfxControlsPanel *m_vfxControlsPanel = nullptr;
+    QImage m_lastCompositedFrame;
     QStringList m_supportedFormats;
     ProjectConfig m_projectConfig;
     QVector<BrushAnimationEntry> m_brushAnimationEntries;
