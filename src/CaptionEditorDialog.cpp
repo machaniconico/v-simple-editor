@@ -1,8 +1,10 @@
 #include "CaptionEditorDialog.h"
+#include "CaptionCps.h"
 #include "SubtitleIO.h"
 #include "SpeechRecognizer.h"
 
 #include <QApplication>
+#include <QBrush>
 #include <QCheckBox>
 #include <QColorDialog>
 #include <QComboBox>
@@ -26,6 +28,51 @@
 #include <QTextEdit>
 #include <QVBoxLayout>
 
+namespace {
+
+constexpr int kClipColumnCount = 5;
+constexpr int kStartMsColumn = 0;
+constexpr int kEndMsColumn = 1;
+constexpr int kTextColumn = 2;
+constexpr int kCpsColumn = 3;
+constexpr int kActorColumn = 4;
+
+QString formatCps(double cps)
+{
+    return QStringLiteral("%1 CPS").arg(cps, 0, 'f', 1);
+}
+
+QTableWidgetItem* ensureTableItem(QTableWidget* table, int row, int column)
+{
+    QTableWidgetItem* item = table->item(row, column);
+    if (!item) {
+        item = new QTableWidgetItem;
+        table->setItem(row, column, item);
+    }
+    return item;
+}
+
+void updateCpsItem(QTableWidgetItem* item, const caption::Clip& clip)
+{
+    const double durationSeconds = static_cast<double>(clip.durationMs()) / 1000.0;
+    const double currentCps = captioncps::cps(clip.text, durationSeconds);
+    const QString cpsText = formatCps(currentCps);
+
+    item->setText(cpsText);
+    item->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    item->setFlags(item->flags() & ~Qt::ItemIsEditable);
+
+    if (captioncps::exceeds(clip.text, durationSeconds)) {
+        item->setForeground(QBrush(QColor(Qt::red)));
+        item->setToolTip(QStringLiteral("読み速度が速すぎます (%1 CPS)").arg(currentCps, 0, 'f', 1));
+    } else {
+        item->setForeground(QBrush());
+        item->setToolTip(cpsText);
+    }
+}
+
+} // namespace
+
 // ---------------------------------------------------------------------------
 // コンストラクタ
 // ---------------------------------------------------------------------------
@@ -44,8 +91,9 @@ CaptionEditorDialog::CaptionEditorDialog(QWidget* parent)
     // ===================== 左パネル =====================
     // クリップテーブル
     m_clipTable = new QTableWidget(this);
-    m_clipTable->setColumnCount(4);
-    m_clipTable->setHorizontalHeaderLabels({tr("開始(ms)"), tr("終了(ms)"), tr("テキスト"), tr("話者")});
+    m_clipTable->setColumnCount(kClipColumnCount);
+    m_clipTable->setHorizontalHeaderLabels(
+        {tr("開始(ms)"), tr("終了(ms)"), tr("テキスト"), tr("CPS"), tr("話者")});
     m_clipTable->setSelectionBehavior(QAbstractItemView::SelectRows);
     m_clipTable->setSelectionMode(QAbstractItemView::SingleSelection);
     m_clipTable->setAlternatingRowColors(true);
@@ -563,18 +611,20 @@ void CaptionEditorDialog::rebuildClipTable()
         QSignalBlocker blocker(m_clipTable);
 
         m_clipTable->setRowCount(0);
-        m_clipTable->setColumnCount(4);
+        m_clipTable->setColumnCount(kClipColumnCount);
         m_clipTable->setHorizontalHeaderLabels(
-            {tr("開始(ms)"), tr("終了(ms)"), tr("テキスト"), tr("話者")});
+            {tr("開始(ms)"), tr("終了(ms)"), tr("テキスト"), tr("CPS"), tr("話者")});
 
         m_clipTable->setRowCount(count);
 
         for (int i = 0; i < count; ++i) {
             const caption::Clip& clip = m_track.clipAt(i);
-            m_clipTable->setItem(i, 0, new QTableWidgetItem(QString::number(clip.startMs)));
-            m_clipTable->setItem(i, 1, new QTableWidgetItem(QString::number(clip.endMs)));
-            m_clipTable->setItem(i, 2, new QTableWidgetItem(clip.text));
-            m_clipTable->setItem(i, 3, new QTableWidgetItem(clip.actor));
+            m_clipTable->setItem(i, kStartMsColumn, new QTableWidgetItem(QString::number(clip.startMs)));
+            m_clipTable->setItem(i, kEndMsColumn, new QTableWidgetItem(QString::number(clip.endMs)));
+            m_clipTable->setItem(i, kTextColumn, new QTableWidgetItem(clip.text));
+            m_clipTable->setItem(i, kCpsColumn, new QTableWidgetItem);
+            m_clipTable->setItem(i, kActorColumn, new QTableWidgetItem(clip.actor));
+            updateCpsItem(m_clipTable->item(i, kCpsColumn), clip);
         }
 
         m_currentRow = -1;
@@ -599,10 +649,11 @@ void CaptionEditorDialog::refreshClipRow(int row)
     const caption::Clip& clip = m_track.clipAt(row);
 
     QSignalBlocker blocker(m_clipTable);
-    m_clipTable->item(row, 0)->setText(QString::number(clip.startMs));
-    m_clipTable->item(row, 1)->setText(QString::number(clip.endMs));
-    m_clipTable->item(row, 2)->setText(clip.text);
-    m_clipTable->item(row, 3)->setText(clip.actor);
+    ensureTableItem(m_clipTable, row, kStartMsColumn)->setText(QString::number(clip.startMs));
+    ensureTableItem(m_clipTable, row, kEndMsColumn)->setText(QString::number(clip.endMs));
+    ensureTableItem(m_clipTable, row, kTextColumn)->setText(clip.text);
+    updateCpsItem(ensureTableItem(m_clipTable, row, kCpsColumn), clip);
+    ensureTableItem(m_clipTable, row, kActorColumn)->setText(clip.actor);
 }
 
 // ---------------------------------------------------------------------------

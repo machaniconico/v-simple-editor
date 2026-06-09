@@ -105,6 +105,7 @@ int runSnsFitSelftest();
 int runSocialSelftest();
 int runSpectralEditSelftest();
 int runStereoPanSelftest();
+int runSubtitleCpsSelftest();
 int runSubtitleKaraokeSelftest();
 int runSubXlatSelftest();
 int runSwsColorSelftest();
@@ -264,6 +265,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "SafeZone: SNS platform UI guide rects + apply display-local overlay (9 gates)" },
     { "onion-skin",       "VEDITOR_ONION_SKIN_SELFTEST",          runOnionSkinSelftest,          false,
       "OnionSkin: disabled/empty/opacity-zero no-op + display blend invariant (4 gates)" },
+    { "subtitle-cps",     "VEDITOR_SUBTITLE_CPS_SELFTEST",        runSubtitleCpsSelftest,        false,
+      "Subtitle CPS readability helper: visible character counting, zero-duration sentinel, strict threshold" },
     { "subtitle-karaoke", "VEDITOR_SUBTITLE_KARAOKE_SELFTEST",    runSubtitleKaraokeSelftest,    false,
       "SubtitleKaraoke: active word half-open interval + spoken count boundaries (8 gates)" },
     { "sns-fit",          "VEDITOR_SNS_FIT_SELFTEST",            runSnsFitSelftest,             false,

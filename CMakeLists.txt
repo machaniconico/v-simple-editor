@@ -180,6 +180,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/audio_bus_selftest.cpp
     src/selftests/StereoPanSelftest.cpp
     src/selftests/ExportRangeSelftest.cpp
+    src/selftests/SubtitleCpsSelftest.cpp
     src/selftests/atempo_resolve_selftest.cpp
     src/selftests/silence_cut_selftest.cpp
     src/selftests/beat_detect_selftest.cpp
@@ -387,6 +388,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/MagneticTimeline.cpp
     src/CaptionTrack.h
     src/CaptionTrack.cpp
+    src/CaptionCps.h
     src/CaptionStyle.h
     src/CaptionStyle.cpp
     src/SubtitleIO.h
