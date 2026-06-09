@@ -878,6 +878,12 @@ void RenderQueue::startRenderPipe(int jobIndex)
             const std::optional<std::string> copyError =
                 libavcore::concatCopy({srcPathUtf8}, outputPathUtf8);
             if (!copyError.has_value()) {
+                if (m_cancelRequested) {
+                    QFile::remove(jobCopy.outputPath);
+                    delete owned;
+                    finishCurrentJob(false, QStringLiteral("cancelled"));
+                    return;
+                }
                 qInfo().noquote()
                     << "[smart-render] stream-copied whole timeline"
                     << "source=" << srcPath

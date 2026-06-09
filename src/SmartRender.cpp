@@ -31,6 +31,8 @@ struct SourceSignature {
     int height = 0;
     double fps = 0.0;
     QString pixFmt;
+    bool hasAudio = false;
+    QString audioCodec;
 };
 
 bool nearlyEqual(double a, double b)
@@ -102,6 +104,9 @@ SourceSignature parseSourceSignature(const QString& text)
     sig.height = query.queryItemValue(QStringLiteral("height")).toInt();
     sig.fps = query.queryItemValue(QStringLiteral("fps")).toDouble();
     sig.pixFmt = query.queryItemValue(QStringLiteral("pixfmt")).trimmed().toLower();
+    sig.audioCodec =
+        query.queryItemValue(QStringLiteral("audio")).trimmed().toLower();
+    sig.hasAudio = !sig.audioCodec.isEmpty();
     return sig;
 }
 
@@ -166,7 +171,7 @@ std::optional<SourceSignature> probedSourceSignature(
     const std::string sourcePath = clip.filePath.toUtf8().toStdString();
     libavcore::MediaDecoder decoder;
     if (const std::optional<std::string> err =
-            decoder.open(sourcePath, false)) {
+            decoder.open(sourcePath, true)) {
         if (reason) {
             *reason = QStringLiteral("source stream metadata probe failed: ")
                 + QString::fromStdString(*err);
@@ -190,6 +195,11 @@ std::optional<SourceSignature> probedSourceSignature(
     const char* pixFmtName = av_get_pix_fmt_name(props.pixelFormat);
     if (pixFmtName)
         sig.pixFmt = QString::fromLatin1(pixFmtName).toLower();
+    if (decoder.hasAudio()) {
+        sig.hasAudio = true;
+        sig.audioCodec = QString::fromStdString(
+            decoder.audioProps().codecName).trimmed().toLower();
+    }
 
     return sig;
 }
@@ -297,6 +307,46 @@ bool containerAllowsCodec(const QString& outputPath, const QString& sourceCodec)
     if (ext == QLatin1String("webm"))
         return family == QLatin1String("vp9")
             || family == QLatin1String("av1");
+
+    return false;
+}
+
+bool containerAllowsAudioCodec(const QString& outputPath,
+                               const SourceSignature& source)
+{
+    if (!source.hasAudio)
+        return true;
+
+    const QString ext = QFileInfo(outputPath).suffix().toLower();
+    const QString audio = source.audioCodec;
+    if (ext.isEmpty() || audio.isEmpty())
+        return false;
+
+    if (ext == QLatin1String("mp4") || ext == QLatin1String("m4v"))
+        return audio == QLatin1String("aac")
+            || audio == QLatin1String("mp3")
+            || audio == QLatin1String("ac3")
+            || audio == QLatin1String("eac3")
+            || audio == QLatin1String("alac");
+    if (ext == QLatin1String("mov"))
+        return audio == QLatin1String("aac")
+            || audio == QLatin1String("mp3")
+            || audio == QLatin1String("alac")
+            || audio == QLatin1String("pcm_s16le")
+            || audio == QLatin1String("pcm_s24le");
+    if (ext == QLatin1String("mkv"))
+        return audio == QLatin1String("aac")
+            || audio == QLatin1String("mp3")
+            || audio == QLatin1String("ac3")
+            || audio == QLatin1String("eac3")
+            || audio == QLatin1String("opus")
+            || audio == QLatin1String("vorbis")
+            || audio == QLatin1String("flac")
+            || audio == QLatin1String("pcm_s16le")
+            || audio == QLatin1String("pcm_s24le");
+    if (ext == QLatin1String("webm"))
+        return audio == QLatin1String("opus")
+            || audio == QLatin1String("vorbis");
 
     return false;
 }
@@ -506,6 +556,12 @@ PassThroughEligibility timelinePassThrough(
     if (!containerAllowsCodec(request.outputPath, source->codec)) {
         return passReject(QStringLiteral(
             "output container is not safe for source codec %1").arg(source->codec));
+    }
+    if (!containerAllowsAudioCodec(request.outputPath, *source)) {
+        return passReject(QStringLiteral(
+            "output container is not safe for source audio codec %1")
+            .arg(source->audioCodec.isEmpty()
+                ? QStringLiteral("unknown") : source->audioCodec));
     }
     if (sameExistingFile(clip.filePath, request.outputPath))
         return passReject(QStringLiteral("output path is the source file"));

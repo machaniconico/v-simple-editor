@@ -465,6 +465,26 @@ int runSmartRenderSelftest()
               result.eligible);
     }
 
+    {
+        ClipInfo clip = pristineClip();
+        clip.filePath = QStringLiteral(
+            "smartrender://clip?codec=h264&width=1920&height=1080&fps=30"
+            "&pixfmt=yuv420p&audio=pcm_s16le");
+        checkPassThroughRejected(23,
+                                 "timelinePassThrough rejects unsafe audio codec for mp4",
+                                 passThroughRequest(clip));
+    }
+    {
+        ClipInfo clip = pristineClip();
+        clip.filePath = QStringLiteral(
+            "smartrender://clip?codec=h264&width=1920&height=1080&fps=30"
+            "&pixfmt=yuv420p&audio=aac");
+        const smartrender::PassThroughEligibility result =
+            smartrender::timelinePassThrough(passThroughRequest(clip));
+        check(24, "timelinePassThrough accepts safe aac audio in mp4",
+              result.eligible);
+    }
+
     std::printf("[smart-render] summary: passed=%d failed=%d\n",
                 passed, failed);
     return failed == 0 ? 0 : 1;
