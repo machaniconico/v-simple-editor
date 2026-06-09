@@ -74,6 +74,7 @@ void exporter_setAcesPipeline(const aces::AcesPipeline &pipeline);
 #include "ClipGeometry.h"
 #include "SourceMonitorDock.h"
 #include "AudioBusPanel.h"   // AB-5: オーディオ バス パネル ドック
+#include "util/RcPause.h"
 
 // US-INT-1: Sprint 16 — モバイルエクスポート + 取り込みハブ (optional includes)
 #if __has_include("MobileExportDialog.h")
@@ -1168,7 +1169,25 @@ void MainWindow::setupUI()
     // PV-B: プレビュー右クリックメニュー (表示トグル + 再生ヘッド直下クリップ操作)。
     connect(m_player, &VideoPlayer::previewContextMenuRequested,
             this, [this](const QPoint &gp) {
+        if (QSettings("VSimpleEditor", "Preferences")
+                .value(rcpause::pauseOnRightClickKey(),
+                       rcpause::kDefaultPauseOnRightClick).toBool()) {
+            if (m_player)
+                m_player->pause();
+        }
+
         QMenu menu;
+        QAction *pauseOnRightClickAct = menu.addAction(QStringLiteral("右クリックで一時停止"));
+        pauseOnRightClickAct->setCheckable(true);
+        pauseOnRightClickAct->setChecked(
+            QSettings("VSimpleEditor", "Preferences")
+                .value(rcpause::pauseOnRightClickKey(),
+                       rcpause::kDefaultPauseOnRightClick).toBool());
+        connect(pauseOnRightClickAct, &QAction::toggled, this, [](bool checked) {
+            QSettings("VSimpleEditor", "Preferences")
+                .setValue(rcpause::pauseOnRightClickKey(), checked);
+        });
+        menu.addSeparator();
 
         // --- 表示系トグル (すべて表示専用・書き出し非変更) ---
         QMenu *szMenu = menu.addMenu(QStringLiteral("SNS セーフゾーン"));

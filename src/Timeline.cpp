@@ -1,4 +1,5 @@
 #include "Timeline.h"
+#include "VideoPlayer.h"
 #include "SilenceCut.h"
 #include "BeatDetect.h"
 #include "ThreePointEdit.h"
@@ -15,6 +16,7 @@
 #include "playback/hdringest_flag.h"
 #include "playback/PixFmtDepth.h"
 #include "playback/SnsFit.h"
+#include "util/RcPause.h"
 
 #include <algorithm>
 #include <QMessageBox>
@@ -3754,6 +3756,15 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     // expect "right click acts on the thing under the cursor".
     if (!track->isClipSelected(clipIndex))
         track->setSelectedClip(clipIndex);
+
+    if (QSettings("VSimpleEditor", "Preferences")
+            .value(rcpause::pauseOnRightClickKey(),
+                   rcpause::kDefaultPauseOnRightClick).toBool()) {
+        if (QWidget *topLevel = window()) {
+            if (auto *player = topLevel->findChild<VideoPlayer *>())
+                player->pause();
+        }
+    }
 
     // Audio-track context menu — visual transitions don't apply, so we
     // show a simplified menu with just the audio-relevant transitions

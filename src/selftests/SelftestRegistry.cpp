@@ -97,6 +97,7 @@ int runProjectPresetSelftest();
 int runProxySelftestV2();
 int runRenderQueueAcesDecisionSelftest();
 int runRenderQueueFpsRationalSelftest();
+int runRightclickPausePrefSelftest();
 int runRgbParadeSelftest();
 int runShortcutSelftest();
 int runSilenceCutSelftest();
@@ -289,6 +290,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "CompositeFrameCache: LRU eviction + key hashing + hit/miss accounting" },
     { "playback-quality-policy", "VEDITOR_PLAYBACK_QUALITY_POLICY_SELFTEST", runPlaybackQualityPolicySelftest, false,
       "PlaybackQualityPolicy: adaptive quality level selection + drop-frame heuristics" },
+    { "rightclick-pause-pref", "VEDITOR_RIGHTCLICK_PAUSE_PREF_SELFTEST", runRightclickPausePrefSelftest, false,
+      "Right-click pause preference resolver: default, booleans, numeric strings, invalid fallback" },
     { "gpu-composite-flag", "VEDITOR_GPU_COMPOSITE_FLAG_SELFTEST", runGpuCompositeFlagSelftest, false,
       "GPU合成フラグ解決(env OR settings)の純粋リゾルバ検証" },
     { "gpu-composite-math", "VEDITOR_GPU_COMPOSITE_MATH_SELFTEST", runGpuCompositeMathSelftest, false,

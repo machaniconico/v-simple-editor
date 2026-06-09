@@ -100,6 +100,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/main.cpp
     src/util/CrashHandler.cpp
     src/util/Logger.cpp
+    src/util/RcPause.h
     src/MainWindow.cpp
     src/VideoPlayer.cpp
     src/Timeline.cpp
@@ -186,6 +187,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/ExportRangeSelftest.cpp
     src/selftests/CapcutCaptionSelftest.cpp
     src/selftests/AutoColorSelftest.cpp
+    src/selftests/RightclickPausePrefSelftest.cpp
     src/selftests/WbEyedropperSelftest.cpp
     src/selftests/SubtitleCpsSelftest.cpp
     src/selftests/RgbParadeSelftest.cpp
