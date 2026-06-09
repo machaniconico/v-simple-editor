@@ -10,6 +10,7 @@
 #include "color/ClipOdt.h"
 #include "playback/hdrexport16_flag.h"
 #include "playback/hdrmatte16_flag.h"
+#include "libavcore/Concat.h"
 #include "libavcore/Encode.h"
 #include "libavcore/Probe.h"
 #include <QByteArray>
@@ -848,69 +849,54 @@ void RenderQueue::startRenderPipe(int jobIndex)
     }
 
     if (smartrender::enabledFromEnv()) {
-        // T4 staged hook only: the current render pipe produces RGB frames and
-        // hands them to FrameEncoder, so compressed-packet stream-copy muxing
-        // needs a separate real-export verification pass. Keep this branch
-        // observational until the mux path can be proven without touching the
-        // default export flow.
-        int segmentIndex = 0;
-        const QHash<QString, TimelineTrackMatteEntry> matteEntries =
-            tl->trackMatteEntries();
-        const QVector<TimelineTrack*> tracks = tl->videoTracks();
-        for (int trackIdx = 0; trackIdx < tracks.size(); ++trackIdx) {
-            const TimelineTrack *track = tracks[trackIdx];
-            if (!track)
-                continue;
-            const QVector<ClipInfo> &clips = track->clips();
-            for (int clipIdx = 0; clipIdx < clips.size(); ++clipIdx) {
-                const ClipInfo &clip = clips[clipIdx];
-                const QString matteKey = trackMatteClipKey(trackIdx, clipIdx);
-                const auto matteIt = matteEntries.constFind(matteKey);
-                const bool hasTrackMatte =
-                    matteIt != matteEntries.cend()
-                    && matteIt.value().matteType != TrackMatteType::None;
-                const bool hasTransitions =
-                    clip.leadIn.type != TransitionType::None
-                    || clip.trailOut.type != TransitionType::None;
-                const bool hasSpeedChange =
-                    !clip.speedRamp.isIdentity()
-                    || std::fabs(clip.speed - 1.0) > 0.000001;
-                const bool hasTransform =
-                    std::fabs(clip.videoScale - 1.0) > 0.000001
-                    || std::fabs(clip.videoDx) > 0.000001
-                    || std::fabs(clip.videoDy) > 0.000001
-                    || std::fabs(clip.rotation2DDegrees) > 0.000001;
-                const smartrender::SegmentEligibility eligibility =
-                    smartrender::canStreamCopy(clip,
-                                               videoCodec,
-                                               outW,
-                                               outH,
-                                               fps,
-                                               !clip.effects.isEmpty(),
-                                               !clip.colorCorrection.isDefault(),
-                                               hasTransform,
-                                               hasTransitions,
-                                               hasSpeedChange,
-                                               clip.keyframes.hasAnyKeyframes(),
-                                               !clip.layerStyle.isIdentity(),
-                                               hasTrackMatte,
-                                               trackIdx > 0);
-                if (eligibility.eligible) {
-                    qInfo().noquote()
-                        << "[smart-render] would stream-copy segment"
-                        << segmentIndex
-                        << "track=" << trackIdx
-                        << "clip=" << clipIdx
-                        << "file=" << clip.filePath;
-                } else {
-                    qInfo().noquote()
-                        << "[smart-render] segment"
-                        << segmentIndex
-                        << "not stream-copy eligible:"
-                        << eligibility.reason;
-                }
-                ++segmentIndex;
+        if (m_cancelRequested) {
+            delete owned;
+            finishCurrentJob(false, QStringLiteral("cancelled"));
+            return;
+        }
+
+        const smartrender::PassThroughEligibility passThrough =
+            smartrender::timelinePassThrough(tl,
+                                             jobCopy.outputPath,
+                                             videoCodec,
+                                             outW,
+                                             outH,
+                                             fps,
+                                             jobCopy.startUs,
+                                             jobCopy.endUs,
+                                             exportMarkedRangeOnly,
+                                             clipodt::enabledFromEnv(),
+                                             hdrexport16::enabledFromEnv(),
+                                             hdrmatte16::enabledFromEnv(),
+                                             isHdr10,
+                                             isHlg);
+        if (passThrough.eligible) {
+            const QString srcPath = tl->videoTracks().first()->clips().first().filePath;
+            const std::string srcPathUtf8 = srcPath.toUtf8().toStdString();
+            const std::string outputPathUtf8 =
+                jobCopy.outputPath.toUtf8().toStdString();
+            const std::optional<std::string> copyError =
+                libavcore::concatCopy({srcPathUtf8}, outputPathUtf8);
+            if (!copyError.has_value()) {
+                qInfo().noquote()
+                    << "[smart-render] stream-copied whole timeline"
+                    << "source=" << srcPath
+                    << "output=" << jobCopy.outputPath;
+                delete owned;
+                finishCurrentJob(true, QString());
+                return;
             }
+
+            const QString reason = QString::fromStdString(*copyError);
+            qWarning().noquote()
+                << QStringLiteral(
+                       "[smart-render] stream copy failed (%1), falling back to encode")
+                       .arg(reason);
+            QFile::remove(jobCopy.outputPath);
+        } else {
+            qInfo().noquote()
+                << "[smart-render] whole timeline not stream-copy eligible:"
+                << passThrough.reason;
         }
     }
 
