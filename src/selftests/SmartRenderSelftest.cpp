@@ -13,6 +13,7 @@
 #include <QTemporaryDir>
 #include <QtGlobal>
 
+#include "../ClipGeometry.h"
 #include "../SmartRender.h"
 #include "../libavcore/Concat.h"
 #include "../libavcore/Encode.h"
@@ -389,6 +390,79 @@ int runSmartRenderSelftest()
                         error.toUtf8().constData());
         check(12, "concatCopy single-input remux preserves codec and duration",
               ok);
+    }
+    {
+        auto request = passThroughRequest();
+        request.videoTracks = {{}, {pristineClip()}};
+        checkPassThroughRejected(13, "timelinePassThrough rejects clip off track 0",
+                                 request);
+    }
+    {
+        auto request = passThroughRequest();
+        request.audioTracks = {{pristineClip()}};
+        checkPassThroughRejected(14, "timelinePassThrough rejects separate audio clips",
+                                 request);
+    }
+    {
+        ClipInfo clip = pristineClip();
+        EnhancedTextOverlay overlay;
+        overlay.text = QStringLiteral("subtitle");
+        clip.textManager.addOverlay(overlay);
+        checkPassThroughRejected(15, "timelinePassThrough rejects text overlays",
+                                 passThroughRequest(clip));
+    }
+    {
+        auto request = passThroughRequest();
+        request.hasAdjustmentLayers = true;
+        checkPassThroughRejected(16, "timelinePassThrough rejects adjustment layers",
+                                 request);
+    }
+    {
+        auto request = passThroughRequest();
+        TimelineTrackMatteEntry entry;
+        entry.matteType = TrackMatteType::AlphaMatte;
+        entry.matteSourceClipId = trackMatteClipKey(1, 0);
+        request.trackMatteEntries.insert(trackMatteClipKey(0, 0), entry);
+        checkPassThroughRejected(17, "timelinePassThrough rejects track matte entries",
+                                 request);
+    }
+    {
+        auto request = passThroughRequest(pristineClip(QStringLiteral("vp9")));
+        request.outputPath = QStringLiteral("smart-render-output.mp4");
+        request.outputCodec = QStringLiteral("vp9");
+        checkPassThroughRejected(18, "timelinePassThrough rejects unsafe container/codec",
+                                 request);
+    }
+    {
+        auto request = passThroughRequest();
+        request.hdrExport16Enabled = true;
+        checkPassThroughRejected(19, "timelinePassThrough rejects HDR export flags",
+                                 request);
+    }
+    {
+        ClipInfo clip = pristineClip();
+        clip.filePath = clipgeom::nullObjectFilePath();
+        checkPassThroughRejected(20, "timelinePassThrough rejects generated null objects",
+                                 passThroughRequest(clip));
+    }
+    {
+        auto request = passThroughRequest();
+        request.exportMarkedRangeOnly = true;
+        request.hasMarkedRange = true;
+        request.markedIn = 0.25;
+        request.markedOut = 0.75;
+        checkPassThroughRejected(21, "timelinePassThrough rejects marked partial range",
+                                 request);
+    }
+    {
+        auto request = passThroughRequest();
+        request.hasMarkedRange = true;
+        request.markedIn = 0.25;
+        request.markedOut = 0.75;
+        const smartrender::PassThroughEligibility result =
+            smartrender::timelinePassThrough(request);
+        check(22, "timelinePassThrough ignores inactive marked range",
+              result.eligible);
     }
 
     std::printf("[smart-render] summary: passed=%d failed=%d\n",

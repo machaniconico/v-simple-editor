@@ -1,5 +1,6 @@
 #include "SmartRender.h"
 
+#include "ClipGeometry.h"
 #include "TrackMatteKey.h"
 #include "libavcore/Decode.h"
 #include "libavcore/Probe.h"
@@ -259,7 +260,7 @@ bool isPartialRange(const smartrender::PassThroughTimelineRequest& request,
     if (request.jobEndUs > 0
         && std::llabs(request.jobEndUs - timelineDurationUs) > toleranceUs)
         return true;
-    if (request.hasMarkedRange) {
+    if (request.exportMarkedRangeOnly && request.hasMarkedRange) {
         const int64_t markedInUs =
             static_cast<int64_t>(std::llround(request.markedIn * 1'000'000.0));
         const int64_t markedOutUs =
@@ -324,6 +325,8 @@ bool hasAudioProcessing(const ClipInfo& clip, bool trackMuted)
 
 QString specialOverlayReasonForClip(const ClipInfo& clip)
 {
+    if (clipgeom::isNullObjectFilePath(clip.filePath))
+        return QStringLiteral("clip is a generated/special null object");
     if (!clip.visible)
         return QStringLiteral("clip visibility is disabled");
     if (!nearlyOne(clip.opacity))
