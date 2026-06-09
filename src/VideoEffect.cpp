@@ -152,6 +152,12 @@ QString VideoEffect::typeName(VideoEffectType t)
     case VideoEffectType::PhotoFilter: return "フォトフィルター";
     case VideoEffectType::Tritone: return "トライトーン";
     case VideoEffectType::BrightnessContrast: return "明るさ・コントラスト";
+    case VideoEffectType::Bulge: return "バルジ(球面)";
+    case VideoEffectType::Twirl: return "ツイスト(渦)";
+    case VideoEffectType::Mirror: return "ミラー";
+    case VideoEffectType::PolarCoordinates: return "極座標";
+    case VideoEffectType::MotionTile: return "モーションタイル";
+    case VideoEffectType::CornerPinSimple: return "コーナーピン(簡易)";
     }
     return "Unknown";
 }
@@ -176,7 +182,10 @@ QVector<VideoEffectType> VideoEffect::allTypes()
              VideoEffectType::Halftone, VideoEffectType::Curves,
              VideoEffectType::ChannelMixer, VideoEffectType::Vibrance,
              VideoEffectType::PhotoFilter, VideoEffectType::Tritone,
-             VideoEffectType::BrightnessContrast };
+             VideoEffectType::BrightnessContrast, VideoEffectType::Bulge,
+             VideoEffectType::Twirl, VideoEffectType::Mirror,
+             VideoEffectType::PolarCoordinates, VideoEffectType::MotionTile,
+             VideoEffectType::CornerPinSimple };
 }
 
 VideoEffect VideoEffect::createBlur(double r)
@@ -259,6 +268,18 @@ VideoEffect VideoEffect::createTritone(QColor c, double b)
     { VideoEffect e; e.type = VideoEffectType::Tritone; e.keyColor = c; e.param1 = b; return e; }
 VideoEffect VideoEffect::createBrightnessContrast(double b, double c)
     { VideoEffect e; e.type = VideoEffectType::BrightnessContrast; e.param1 = b; e.param2 = c; return e; }
+VideoEffect VideoEffect::createBulge(double a, double r)
+    { VideoEffect e; e.type = VideoEffectType::Bulge; e.param1 = a; e.param2 = r; return e; }
+VideoEffect VideoEffect::createTwirl(double a, double r)
+    { VideoEffect e; e.type = VideoEffectType::Twirl; e.param1 = a; e.param2 = r; return e; }
+VideoEffect VideoEffect::createMirror(int m)
+    { VideoEffect e; e.type = VideoEffectType::Mirror; e.param1 = static_cast<double>(m); return e; }
+VideoEffect VideoEffect::createPolarCoordinates(int t, double a)
+    { VideoEffect e; e.type = VideoEffectType::PolarCoordinates; e.param1 = static_cast<double>(t); e.param2 = a; return e; }
+VideoEffect VideoEffect::createMotionTile(int x, int y, bool m)
+    { VideoEffect e; e.type = VideoEffectType::MotionTile; e.param1 = static_cast<double>(x); e.param2 = static_cast<double>(y); e.param3 = m ? 1.0 : 0.0; return e; }
+VideoEffect VideoEffect::createCornerPinSimple(double h, double v)
+    { VideoEffect e; e.type = VideoEffectType::CornerPinSimple; e.param1 = h; e.param2 = v; return e; }
 
 // ===== EffectParamSchema helper accessors =====
 
@@ -405,6 +426,30 @@ double paramValue(const VideoEffect &effect, const QString &paramName)
             if (paramName == "brightness" && effect.type == VideoEffectType::BrightnessContrast)
                 return effect.param1;
             if (paramName == "contrast" && effect.type == VideoEffectType::BrightnessContrast)
+                return effect.param2;
+            if (paramName == "amount" && effect.type == VideoEffectType::Bulge)
+                return effect.param1;
+            if (paramName == "radius" && effect.type == VideoEffectType::Bulge)
+                return effect.param2;
+            if (paramName == "angle" && effect.type == VideoEffectType::Twirl)
+                return effect.param1;
+            if (paramName == "radius" && effect.type == VideoEffectType::Twirl)
+                return effect.param2;
+            if (paramName == "mode" && effect.type == VideoEffectType::Mirror)
+                return effect.param1;
+            if (paramName == "type" && effect.type == VideoEffectType::PolarCoordinates)
+                return effect.param1;
+            if (paramName == "amount" && effect.type == VideoEffectType::PolarCoordinates)
+                return effect.param2;
+            if (paramName == "tilesX" && effect.type == VideoEffectType::MotionTile)
+                return effect.param1;
+            if (paramName == "tilesY" && effect.type == VideoEffectType::MotionTile)
+                return effect.param2;
+            if (paramName == "mirrorEdges" && effect.type == VideoEffectType::MotionTile)
+                return effect.param3;
+            if (paramName == "horizontalTilt" && effect.type == VideoEffectType::CornerPinSimple)
+                return effect.param1;
+            if (paramName == "verticalTilt" && effect.type == VideoEffectType::CornerPinSimple)
                 return effect.param2;
             return def.defaultVal;
         }
@@ -620,6 +665,42 @@ void setParamValue(VideoEffect &effect, const QString &paramName, double value)
                 effect.param1 = value; return;
             }
             if (paramName == "contrast" && effect.type == VideoEffectType::BrightnessContrast) {
+                effect.param2 = value; return;
+            }
+            if (paramName == "amount" && effect.type == VideoEffectType::Bulge) {
+                effect.param1 = value; return;
+            }
+            if (paramName == "radius" && effect.type == VideoEffectType::Bulge) {
+                effect.param2 = value; return;
+            }
+            if (paramName == "angle" && effect.type == VideoEffectType::Twirl) {
+                effect.param1 = value; return;
+            }
+            if (paramName == "radius" && effect.type == VideoEffectType::Twirl) {
+                effect.param2 = value; return;
+            }
+            if (paramName == "mode" && effect.type == VideoEffectType::Mirror) {
+                effect.param1 = value; return;
+            }
+            if (paramName == "type" && effect.type == VideoEffectType::PolarCoordinates) {
+                effect.param1 = value; return;
+            }
+            if (paramName == "amount" && effect.type == VideoEffectType::PolarCoordinates) {
+                effect.param2 = value; return;
+            }
+            if (paramName == "tilesX" && effect.type == VideoEffectType::MotionTile) {
+                effect.param1 = value; return;
+            }
+            if (paramName == "tilesY" && effect.type == VideoEffectType::MotionTile) {
+                effect.param2 = value; return;
+            }
+            if (paramName == "mirrorEdges" && effect.type == VideoEffectType::MotionTile) {
+                effect.param3 = value; return;
+            }
+            if (paramName == "horizontalTilt" && effect.type == VideoEffectType::CornerPinSimple) {
+                effect.param1 = value; return;
+            }
+            if (paramName == "verticalTilt" && effect.type == VideoEffectType::CornerPinSimple) {
                 effect.param2 = value; return;
             }
             return;
@@ -912,6 +993,15 @@ QImage VideoEffectProcessor::applyEffect(const QImage &input, const VideoEffect 
     case VideoEffectType::PhotoFilter: return applyPhotoFilter(input, effect.keyColor, effect.param1);
     case VideoEffectType::Tritone: return applyTritone(input, effect.keyColor, effect.param1);
     case VideoEffectType::BrightnessContrast: return applyBrightnessContrastEffect(input, effect.param1, effect.param2);
+    case VideoEffectType::Bulge: return applyBulge(input, effect.param1, effect.param2);
+    case VideoEffectType::Twirl: return applyTwirl(input, effect.param1, effect.param2);
+    case VideoEffectType::Mirror: return applyMirror(input, static_cast<int>(std::round(effect.param1)));
+    case VideoEffectType::PolarCoordinates: return applyPolarCoordinates(input, static_cast<int>(std::round(effect.param1)), effect.param2);
+    case VideoEffectType::MotionTile: return applyMotionTile(input,
+                                                             static_cast<int>(std::round(effect.param1)),
+                                                             static_cast<int>(std::round(effect.param2)),
+                                                             std::round(effect.param3) != 0.0);
+    case VideoEffectType::CornerPinSimple: return applyCornerPinSimple(input, effect.param1, effect.param2);
     default: return input;
     }
 }
@@ -2391,6 +2481,243 @@ QImage VideoEffectProcessor::applyBrightnessContrastEffect(const QImage &input,
                                lut[qGreen(px)],
                                lut[qBlue(px)],
                                qAlpha(px));
+        }
+    }
+
+    return result;
+}
+
+QImage VideoEffectProcessor::applyBulge(const QImage &input, double amount, double radius)
+{
+    const double strength = qBound(-100.0, amount, 100.0) / 100.0;
+    const double normRadius = qBound(0.0, radius, 1.0);
+    if (strength == 0.0 || normRadius <= 0.0)
+        return input;
+
+    QImage src = input.convertToFormat(QImage::Format_ARGB32);
+    const int w = src.width();
+    const int h = src.height();
+    QImage result(w, h, QImage::Format_ARGB32);
+    const double cx = (w - 1) * 0.5;
+    const double cy = (h - 1) * 0.5;
+    const double effectRadius = qMax(1e-9, qMin(w, h) * 0.5 * normRadius);
+
+    for (int y = 0; y < h; ++y) {
+        QRgb *dstLine = reinterpret_cast<QRgb*>(result.scanLine(y));
+        for (int x = 0; x < w; ++x) {
+            const double vx = x - cx;
+            const double vy = y - cy;
+            const double dist = std::sqrt(vx * vx + vy * vy);
+            if (dist > effectRadius || dist <= 1e-9) {
+                dstLine[x] = sampleArgbPixel(src, x, y);
+                continue;
+            }
+
+            const double falloff = 1.0 - dist / effectRadius;
+            const double scale = qMax(0.05, 1.0 - strength * falloff * falloff * 0.75);
+            const int sx = static_cast<int>(std::round(cx + vx * scale));
+            const int sy = static_cast<int>(std::round(cy + vy * scale));
+            dstLine[x] = sampleArgbPixel(src, sx, sy);
+        }
+    }
+
+    return result;
+}
+
+QImage VideoEffectProcessor::applyTwirl(const QImage &input, double angleDegrees, double radius)
+{
+    const double angle = angleDegrees * M_PI / 180.0;
+    const double normRadius = qBound(0.0, radius, 1.0);
+    if (angle == 0.0 || normRadius <= 0.0)
+        return input;
+
+    QImage src = input.convertToFormat(QImage::Format_ARGB32);
+    const int w = src.width();
+    const int h = src.height();
+    QImage result(w, h, QImage::Format_ARGB32);
+    const double cx = (w - 1) * 0.5;
+    const double cy = (h - 1) * 0.5;
+    const double effectRadius = qMax(1e-9, qMin(w, h) * 0.5 * normRadius);
+
+    for (int y = 0; y < h; ++y) {
+        QRgb *dstLine = reinterpret_cast<QRgb*>(result.scanLine(y));
+        for (int x = 0; x < w; ++x) {
+            const double vx = x - cx;
+            const double vy = y - cy;
+            const double dist = std::sqrt(vx * vx + vy * vy);
+            if (dist > effectRadius || dist <= 1e-9) {
+                dstLine[x] = sampleArgbPixel(src, x, y);
+                continue;
+            }
+
+            const double falloff = smoothstep(1.0 - dist / effectRadius);
+            const double a = angle * falloff;
+            const double ca = std::cos(a);
+            const double sa = std::sin(a);
+            const int sx = static_cast<int>(std::round(cx + vx * ca - vy * sa));
+            const int sy = static_cast<int>(std::round(cy + vx * sa + vy * ca));
+            dstLine[x] = sampleArgbPixel(src, sx, sy);
+        }
+    }
+
+    return result;
+}
+
+QImage VideoEffectProcessor::applyMirror(const QImage &input, int mode)
+{
+    // Mirror has no neutral mode: adding it intentionally transforms the frame.
+    // Negative modes are reserved as an explicit no-op for callers/tests.
+    if (mode < 0)
+        return input;
+
+    QImage src = input.convertToFormat(QImage::Format_ARGB32);
+    const int w = src.width();
+    const int h = src.height();
+    QImage result(w, h, QImage::Format_ARGB32);
+
+    for (int y = 0; y < h; ++y) {
+        QRgb *dstLine = reinterpret_cast<QRgb*>(result.scanLine(y));
+        for (int x = 0; x < w; ++x) {
+            int sx = x;
+            int sy = y;
+            switch (mode) {
+            case 0:
+                if (x >= w / 2)
+                    sx = w - 1 - x;
+                break;
+            case 1:
+                if (x < w / 2)
+                    sx = w - 1 - x;
+                break;
+            case 2:
+                if (y >= h / 2)
+                    sy = h - 1 - y;
+                break;
+            case 3:
+                if (y < h / 2)
+                    sy = h - 1 - y;
+                break;
+            default:
+                return input;
+            }
+            dstLine[x] = sampleArgbPixel(src, sx, sy);
+        }
+    }
+
+    return result;
+}
+
+QImage VideoEffectProcessor::applyPolarCoordinates(const QImage &input, int type, double amount)
+{
+    const double blend = qBound(0.0, amount, 1.0);
+    if (blend <= 0.0)
+        return input;
+
+    QImage src = input.convertToFormat(QImage::Format_ARGB32);
+    const int w = src.width();
+    const int h = src.height();
+    QImage result(w, h, QImage::Format_ARGB32);
+    const double cx = (w - 1) * 0.5;
+    const double cy = (h - 1) * 0.5;
+    const double denomX = qMax(1, w - 1);
+    const double denomY = qMax(1, h - 1);
+    const double maxRadius = qMax(1e-9, qMin(w, h) * 0.5);
+
+    for (int y = 0; y < h; ++y) {
+        QRgb *dstLine = reinterpret_cast<QRgb*>(result.scanLine(y));
+        for (int x = 0; x < w; ++x) {
+            double mappedX = x;
+            double mappedY = y;
+            if (type == 0) {
+                const double theta = (static_cast<double>(x) / denomX) * 2.0 * M_PI - M_PI;
+                const double r = (static_cast<double>(y) / denomY) * maxRadius;
+                mappedX = cx + std::cos(theta) * r;
+                mappedY = cy + std::sin(theta) * r;
+            } else {
+                const double nx = (static_cast<double>(x) - cx) / maxRadius;
+                const double ny = (static_cast<double>(y) - cy) / maxRadius;
+                const double r = qBound(0.0, std::sqrt(nx * nx + ny * ny), 1.0);
+                const double theta = std::atan2(ny, nx);
+                mappedX = ((theta + M_PI) / (2.0 * M_PI)) * denomX;
+                mappedY = r * denomY;
+            }
+
+            const int sx = static_cast<int>(std::round(x + blend * (mappedX - x)));
+            const int sy = static_cast<int>(std::round(y + blend * (mappedY - y)));
+            dstLine[x] = sampleArgbPixel(src, sx, sy);
+        }
+    }
+
+    return result;
+}
+
+QImage VideoEffectProcessor::applyMotionTile(const QImage &input, int tilesX, int tilesY, bool mirrorEdges)
+{
+    const int tx = qBound(1, tilesX, 10);
+    const int ty = qBound(1, tilesY, 10);
+    // MotionTile becomes a true transform once either tile count exceeds one;
+    // the 1x1 setting is the explicit neutral case.
+    if (tx == 1 && ty == 1)
+        return input;
+
+    QImage src = input.convertToFormat(QImage::Format_ARGB32);
+    const int w = src.width();
+    const int h = src.height();
+    QImage result(w, h, QImage::Format_ARGB32);
+
+    auto tileCoord = [mirrorEdges](int pos, int size, int tiles) -> int {
+        if (size <= 1)
+            return 0;
+        const int scaled = pos * tiles;
+        const int segment = scaled / size;
+        int local = scaled % size;
+        if (local < 0)
+            local += size;
+        if (mirrorEdges && (segment % 2) != 0)
+            local = size - 1 - local;
+        return qBound(0, local, size - 1);
+    };
+
+    for (int y = 0; y < h; ++y) {
+        QRgb *dstLine = reinterpret_cast<QRgb*>(result.scanLine(y));
+        const int sy = tileCoord(y, h, ty);
+        for (int x = 0; x < w; ++x) {
+            const int sx = tileCoord(x, w, tx);
+            dstLine[x] = sampleArgbPixel(src, sx, sy);
+        }
+    }
+
+    return result;
+}
+
+QImage VideoEffectProcessor::applyCornerPinSimple(const QImage &input,
+                                                  double horizontalTilt,
+                                                  double verticalTilt)
+{
+    const double hTilt = qBound(-100.0, horizontalTilt, 100.0) / 200.0;
+    const double vTilt = qBound(-100.0, verticalTilt, 100.0) / 200.0;
+    if (hTilt == 0.0 && vTilt == 0.0)
+        return input;
+
+    QImage src = input.convertToFormat(QImage::Format_ARGB32);
+    const int w = src.width();
+    const int h = src.height();
+    QImage result(w, h, QImage::Format_ARGB32);
+    const double cx = (w - 1) * 0.5;
+    const double cy = (h - 1) * 0.5;
+    const double halfW = qMax(0.5, (w - 1) * 0.5);
+    const double halfH = qMax(0.5, (h - 1) * 0.5);
+
+    for (int y = 0; y < h; ++y) {
+        QRgb *dstLine = reinterpret_cast<QRgb*>(result.scanLine(y));
+        const double ny = (static_cast<double>(y) - cy) / halfH;
+        for (int x = 0; x < w; ++x) {
+            const double nx = (static_cast<double>(x) - cx) / halfW;
+            const double scaleX = qMax(0.25, 1.0 + hTilt * ny);
+            const double scaleY = qMax(0.25, 1.0 + vTilt * nx);
+            const int sx = static_cast<int>(std::round(cx + (x - cx) / scaleX));
+            const int sy = static_cast<int>(std::round(cy + (y - cy) / scaleY));
+            dstLine[x] = sampleArgbPixel(src, sx, sy);
         }
     }
 

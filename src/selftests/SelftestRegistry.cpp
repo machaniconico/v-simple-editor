@@ -23,6 +23,7 @@ int runAeFxBlurSelftest();
 int runAeFxColorSelftest();
 int runAeFxColor2Selftest();
 int runAeFxDistortSelftest();
+int runAeFxDistort2Selftest();
 int runAeFxGenerateSelftest();
 int runAeFxStylizeSelftest();
 int runAffinitySelftest();
@@ -267,6 +268,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "AE-FX-6 Color/Channel Family: curves, mixer, vibrance, filter, tritone, brightness/contrast gates (G1-G6)" },
     { "ae-fx-distort",     "VEDITOR_AE_FX_DISTORT_SELFTEST",      runAeFxDistortSelftest,        false,
       "AE-FX-4 Distort & Glitch Family: RGB split, wave warp, ripple, VHS glitch gates (G1-G6)" },
+    { "ae-fx-distort2",    "VEDITOR_AE_FX_DISTORT2_SELFTEST",     runAeFxDistort2Selftest,       false,
+      "AE-FX-7 Distort/Transform Family: bulge, twirl, mirror, polar, motion tile, corner pin gates (G1-G7)" },
     { "ae-fx-generate",    "VEDITOR_AE_FX_GENERATE_SELFTEST",     runAeFxGenerateSelftest,       false,
       "AE-FX-5 Generate Family: gradient ramp, fill, bloom, scanlines, halftone gates (G1-G6)" },
     { "ae-fx-stylize",     "VEDITOR_AE_FX_STYLIZE_SELFTEST",      runAeFxStylizeSelftest,        false,

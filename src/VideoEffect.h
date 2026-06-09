@@ -80,7 +80,13 @@ enum class VideoEffectType {
     Vibrance,
     PhotoFilter,
     Tritone,
-    BrightnessContrast
+    BrightnessContrast,
+    Bulge,
+    Twirl,
+    Mirror,
+    PolarCoordinates,
+    MotionTile,
+    CornerPinSimple
 };
 
 struct VideoEffect {
@@ -126,6 +132,12 @@ struct VideoEffect {
     //   PhotoFilter: p1=density(0..100), keyColor=filter color
     //   Tritone: p1=blend(0..1), keyColor=shadow color
     //   BrightnessContrast: p1=brightness(-100..100), p2=contrast(-100..100)
+    //   Bulge: p1=amount(-100..100), p2=radius(0..1)
+    //   Twirl: p1=angleDegrees, p2=radius(0..1)
+    //   Mirror: p1=mode(0=left->right,1=right->left,2=top->bottom,3=bottom->top). No neutral mode; mode<0 is no-op.
+    //   PolarCoordinates: p1=type(0=rect->polar,1=polar->rect), p2=amount(0..1)
+    //   MotionTile: p1=tilesX(1..10), p2=tilesY(1..10), p3=mirrorEdges(0/1). 1x1 is no-op.
+    //   CornerPinSimple: p1=horizontalTilt(-100..100), p2=verticalTilt(-100..100)
     double param1 = 0.0;
     double param2 = 0.0;
     double param3 = 0.0;
@@ -177,6 +189,12 @@ struct VideoEffect {
     static VideoEffect createPhotoFilter(QColor filterColor = QColor(236, 138, 0), double density = 0.0);
     static VideoEffect createTritone(QColor shadowColor = QColor(0, 0, 0), double blend = 0.0);
     static VideoEffect createBrightnessContrast(double brightness = 0.0, double contrast = 0.0);
+    static VideoEffect createBulge(double amount = 0.0, double radius = 0.5);
+    static VideoEffect createTwirl(double angleDegrees = 0.0, double radius = 0.5);
+    static VideoEffect createMirror(int mode = 0);
+    static VideoEffect createPolarCoordinates(int type = 0, double amount = 0.0);
+    static VideoEffect createMotionTile(int tilesX = 1, int tilesY = 1, bool mirrorEdges = false);
+    static VideoEffect createCornerPinSimple(double horizontalTilt = 0.0, double verticalTilt = 0.0);
 };
 
 // --- Processor ---
@@ -239,4 +257,10 @@ private:
     static QImage applyPhotoFilter(const QImage &img, QColor filterColor, double density);
     static QImage applyTritone(const QImage &img, QColor shadowColor, double blend);
     static QImage applyBrightnessContrastEffect(const QImage &img, double brightness, double contrast);
+    static QImage applyBulge(const QImage &img, double amount, double radius);
+    static QImage applyTwirl(const QImage &img, double angleDegrees, double radius);
+    static QImage applyMirror(const QImage &img, int mode);
+    static QImage applyPolarCoordinates(const QImage &img, int type, double amount);
+    static QImage applyMotionTile(const QImage &img, int tilesX, int tilesY, bool mirrorEdges);
+    static QImage applyCornerPinSimple(const QImage &img, double horizontalTilt, double verticalTilt);
 };

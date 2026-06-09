@@ -206,6 +206,40 @@ QVector<ParamDef> paramSchemaFor(VideoEffectType type)
             { "contrast", "コントラスト", ParamType::Float, -100.0, 100.0, 0.0 }
         };
 
+    case VideoEffectType::Bulge:
+        return {
+            { "amount", "量", ParamType::Float, -100.0, 100.0, 0.0 },
+            { "radius", "半径", ParamType::Float, 0.0, 1.0, 0.5 }
+        };
+
+    case VideoEffectType::Twirl:
+        return {
+            { "angle", "角度", ParamType::Float, -720.0, 720.0, 0.0 },
+            { "radius", "半径", ParamType::Float, 0.0, 1.0, 0.5 }
+        };
+
+    case VideoEffectType::Mirror:
+        return { { "mode", "モード", ParamType::Int, 0.0, 3.0, 0.0 } };
+
+    case VideoEffectType::PolarCoordinates:
+        return {
+            { "type", "タイプ", ParamType::Int, 0.0, 1.0, 0.0 },
+            { "amount", "量", ParamType::Float, 0.0, 1.0, 0.0 }
+        };
+
+    case VideoEffectType::MotionTile:
+        return {
+            { "tilesX", "横タイル", ParamType::Int, 1.0, 10.0, 1.0 },
+            { "tilesY", "縦タイル", ParamType::Int, 1.0, 10.0, 1.0 },
+            { "mirrorEdges", "ミラーエッジ", ParamType::Bool, 0.0, 1.0, 0.0 }
+        };
+
+    case VideoEffectType::CornerPinSimple:
+        return {
+            { "horizontalTilt", "水平チルト", ParamType::Float, -100.0, 100.0, 0.0 },
+            { "verticalTilt", "垂直チルト", ParamType::Float, -100.0, 100.0, 0.0 }
+        };
+
     case VideoEffectType::None:
     default:
         return {};
