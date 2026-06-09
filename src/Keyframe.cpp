@@ -1,6 +1,8 @@
 #include "Keyframe.h"
 #include "EasingCurveModel.h"
 
+#include <QJsonValue>
+
 #include <algorithm>
 #include <cmath>
 
@@ -26,6 +28,99 @@ KeyframePoint::Interpolation interpolationFromJson(const QJsonObject &obj)
     }
     return static_cast<KeyframePoint::Interpolation>(
         obj[QStringLiteral("interpolation")].toInt(0));
+}
+
+QString loopModeToJsonValue(LoopMode mode)
+{
+    switch (mode) {
+    case LoopMode::None:
+        break;
+    case LoopMode::Cycle:
+        return QStringLiteral("Cycle");
+    case LoopMode::PingPong:
+        return QStringLiteral("PingPong");
+    case LoopMode::Continue:
+        return QStringLiteral("Continue");
+    }
+    return QString();
+}
+
+LoopMode loopModeFromJsonValue(const QJsonValue &value)
+{
+    if (value.isDouble()) {
+        switch (value.toInt(static_cast<int>(LoopMode::None))) {
+        case static_cast<int>(LoopMode::Cycle):
+            return LoopMode::Cycle;
+        case static_cast<int>(LoopMode::PingPong):
+            return LoopMode::PingPong;
+        case static_cast<int>(LoopMode::Continue):
+            return LoopMode::Continue;
+        default:
+            return LoopMode::None;
+        }
+    }
+
+    const QString mode = value.toString();
+    if (mode.compare(QStringLiteral("Cycle"), Qt::CaseInsensitive) == 0)
+        return LoopMode::Cycle;
+    if (mode.compare(QStringLiteral("PingPong"), Qt::CaseInsensitive) == 0)
+        return LoopMode::PingPong;
+    if (mode.compare(QStringLiteral("Continue"), Qt::CaseInsensitive) == 0)
+        return LoopMode::Continue;
+    return LoopMode::None;
+}
+
+double positiveModulo(double value, double period)
+{
+    double phase = std::fmod(value, period);
+    if (phase < 0.0)
+        phase += period;
+    return phase;
+}
+
+double loopedTrackValueAt(const KeyframeTrack &track, LoopMode mode, double time)
+{
+    if (mode == LoopMode::None)
+        return track.valueAt(time);
+
+    const QVector<KeyframePoint> &keyframes = track.keyframes();
+    if (keyframes.size() < 2)
+        return track.valueAt(time);
+
+    const KeyframePoint &first = keyframes.first();
+    const KeyframePoint &last = keyframes.last();
+    if (time <= last.time)
+        return track.valueAt(time);
+
+    const double range = last.time - first.time;
+    if (!std::isfinite(range) || range <= 0.0)
+        return track.valueAt(time);
+
+    switch (mode) {
+    case LoopMode::None:
+        return track.valueAt(time);
+    case LoopMode::Cycle: {
+        const double phase = positiveModulo(time - first.time, range);
+        return track.valueAt(first.time + phase);
+    }
+    case LoopMode::PingPong: {
+        const double phase = positiveModulo(time - first.time, 2.0 * range);
+        const double foldedTime = phase > range
+            ? last.time - (phase - range)
+            : first.time + phase;
+        return track.valueAt(foldedTime);
+    }
+    case LoopMode::Continue: {
+        const KeyframePoint &prev = keyframes.at(keyframes.size() - 2);
+        const double dt = last.time - prev.time;
+        if (!std::isfinite(dt) || dt <= 0.0)
+            return track.valueAt(time);
+        const double slope = (last.value - prev.value) / dt;
+        return last.value + slope * (time - last.time);
+    }
+    }
+
+    return track.valueAt(time);
 }
 
 } // namespace
@@ -334,6 +429,7 @@ void KeyframeManager::removeTrack(const QString &propertyName)
         std::remove_if(m_tracks.begin(), m_tracks.end(),
             [&](const KeyframeTrack &t) { return t.propertyName() == propertyName; }),
         m_tracks.end());
+    m_loopOutModes.remove(propertyName);
 }
 
 KeyframeTrack *KeyframeManager::track(const QString &propertyName)
@@ -365,7 +461,13 @@ bool KeyframeManager::hasAnyKeyframes() const
 double KeyframeManager::valueAt(const QString &propertyName, double time, double defaultVal) const
 {
     const auto *t = track(propertyName);
-    return t ? t->valueAt(time) : defaultVal;
+    if (!t)
+        return defaultVal;
+
+    const LoopMode mode = loopOutMode(propertyName);
+    if (mode == LoopMode::None)
+        return t->valueAt(time);
+    return loopedTrackValueAt(*t, mode, time);
 }
 
 QString KeyframeManager::stringValueAt(const QString &propertyName, double time, const QString &defaultVal) const
@@ -416,6 +518,20 @@ bool KeyframeManager::hasStringTrack(const QString &propertyName) const
     return stringTrack(propertyName) != nullptr;
 }
 
+void KeyframeManager::setLoopOutMode(const QString &propertyName, LoopMode mode)
+{
+    if (mode == LoopMode::None) {
+        m_loopOutModes.remove(propertyName);
+        return;
+    }
+    m_loopOutModes.insert(propertyName, mode);
+}
+
+LoopMode KeyframeManager::loopOutMode(const QString &propertyName) const
+{
+    return m_loopOutModes.value(propertyName, LoopMode::None);
+}
+
 // --- US-AETEXT-4: KeyframeManager serialisation ---
 
 QJsonObject KeyframeManager::toJson() const
@@ -434,6 +550,10 @@ QJsonObject KeyframeManager::toJson() const
             keyframesArray.append(keyframePointToJson(kf));
         }
         trackObj[QStringLiteral("keyframes")] = keyframesArray;
+        const LoopMode loopOut = loopOutMode(track.propertyName());
+        if (loopOut != LoopMode::None) {
+            trackObj[QStringLiteral("loopOut")] = loopModeToJsonValue(loopOut);
+        }
         tracksArray.append(trackObj);
     }
     obj[QStringLiteral("tracks")] = tracksArray;
@@ -464,6 +584,7 @@ void KeyframeManager::fromJson(const QJsonObject &obj)
 {
     m_tracks.clear();
     m_stringTracks.clear();
+    m_loopOutModes.clear();
 
     // Numeric tracks
     QJsonArray tracksArray = obj[QStringLiteral("tracks")].toArray();
@@ -481,6 +602,10 @@ void KeyframeManager::fromJson(const QJsonObject &obj)
                               kf.hasSpatialTangent, kf.spatialOutX,
                               kf.spatialOutY, kf.spatialInX, kf.spatialInY);
         }
+        const LoopMode loopOut =
+            loopModeFromJsonValue(trackObj.value(QStringLiteral("loopOut")));
+        if (loopOut != LoopMode::None)
+            m_loopOutModes.insert(property, loopOut);
         m_tracks.append(track);
     }
 

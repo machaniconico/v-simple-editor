@@ -75,6 +75,7 @@ int runImportIngestSelftest();
 int runImportSelftest();
 int runInstagramSelftest();
 int runKeyframeAnimParitySelftest();
+int runKeyframeLoopSelftest();
 int runLayerStyleSelftest();
 int runLayerStyleUiSelftest();
 int runLibavcoreDecodeSelftest();
@@ -240,6 +241,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Per-keyframe cubic-bezier easing: legacy invariance, identity curve, ease-in, JSON round-trip (4 gates)" },
     { "easing-presets",    "VEDITOR_EASING_PRESETS_SELFTEST",     runEasingPresetsSelftest,      false,
       "Elastic/Bounce/Back keyframe easing presets: math, overshoot, legacy invariance, JSON round-trip (6 gates)" },
+    { "keyframe-loop",     "VEDITOR_KEYFRAME_LOOP_SELFTEST",       runKeyframeLoopSelftest,       false,
+      "AE-ANIM-3 loopOut motion keyframes: None/Cycle/PingPong/Continue sampling + JSON omission (6 gates)" },
     { "motion-preset",     "VEDITOR_MOTION_PRESET_SELFTEST",       runMotionPresetSelftest,       false,
       "Motion preset library: built-in ids, generated motion keyframes, deterministic replacement (6 gates)" },
     { "spatial-path",      "VEDITOR_SPATIAL_PATH_SELFTEST",        runSpatialPathSelftest,        false,

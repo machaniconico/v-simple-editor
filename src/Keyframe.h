@@ -3,8 +3,16 @@
 #include <QVariant>
 #include <QString>
 #include <QVector>
+#include <QHash>
 #include <QJsonObject>
 #include <QJsonArray>
+
+enum class LoopMode {
+    None = 0,
+    Cycle,
+    PingPong,
+    Continue
+};
 
 struct KeyframePoint {
     double time = 0.0;   // seconds
@@ -124,6 +132,11 @@ public:
     QVector<KeyframeTrack> &tracks() { return m_tracks; }
     const QVector<KeyframeTrack> &tracks() const { return m_tracks; }
 
+    // AE-ANIM-3: engine/JSON support only. The editor combo box is deferred
+    // so the default None path remains byte-identical for existing projects.
+    void setLoopOutMode(const QString &propertyName, LoopMode mode);
+    LoopMode loopOutMode(const QString &propertyName) const;
+
     // US-AETEXT-4: String track management (routes source-text keyframes through StringKeyframeTrack)
     void addStringTrack(const StringKeyframeTrack &track);
     void removeStringTrack(const QString &propertyName);
@@ -147,6 +160,7 @@ public:
 private:
     QVector<KeyframeTrack> m_tracks;
     QVector<StringKeyframeTrack> m_stringTracks; // US-AETEXT-4: dedicated string-typed tracks
+    QHash<QString, LoopMode> m_loopOutModes;
 };
 
 // US-BRUSH-5: idempotent helper — adds a 'brush_progress' KeyframeTrack
