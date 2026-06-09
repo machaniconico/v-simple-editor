@@ -120,6 +120,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/TrackMatteBake.cpp
     src/ClipGeometry.h
     src/ClipGeometry.cpp
+    src/LayerStyle.h
+    src/LayerStyle.cpp
     src/clipanim/ClipAnim.h
     src/clipanim/ClipAnim.cpp
     src/TrackMatteKey.h
@@ -187,6 +189,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/ExportRangeSelftest.cpp
     src/selftests/CapcutCaptionSelftest.cpp
     src/selftests/AutoColorSelftest.cpp
+    src/selftests/LayerStyleSelftest.cpp
     src/selftests/RightclickPausePrefSelftest.cpp
     src/selftests/WbEyedropperSelftest.cpp
     src/selftests/SubtitleCpsSelftest.cpp

@@ -10,6 +10,7 @@
 #include <QStringList>
 
 int runAutoColorSelftest();
+int runLayerStyleSelftest();
 int runRgbParadeSelftest();
 int runWbEyedropperSelftest();
 

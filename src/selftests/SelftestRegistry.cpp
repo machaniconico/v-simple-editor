@@ -69,6 +69,7 @@ int runImportIngestSelftest();
 int runImportSelftest();
 int runInstagramSelftest();
 int runKeyframeAnimParitySelftest();
+int runLayerStyleSelftest();
 int runLibavcoreDecodeSelftest();
 int runLibavcoreEncodeSelftest();
 int runLiveMatteResolveSelftest();
@@ -314,6 +315,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "ExposureAids: luma709 oracle + False Color zones + Zebra stripe period + Focus Peaking edge/threshold + dimension/OOB safety (11 gates)" },
     { "import-ingest",      "VEDITOR_IMPORT_INGEST_SELFTEST",      runImportIngestSelftest,        false,
       "ImportHub ingest previews: mesh wireframe determinism + empty placeholder (QApplication-free)" },
+    { "layer-style",        "VEDITOR_LAYER_STYLE_SELFTEST",        runLayerStyleSelftest,          false,
+      "LayerStyle: identity fast path, drop shadow, stroke, and project JSON omission/round-trip" },
     // QApplication-required (needsQApplication=true) ----------------------
     { "parity",            "VEDITOR_PARITY_SELFTEST",             runParitySelftest,             true,
       "Preview vs export pixel-parity (S1-S11, framediff::mse, 10-bit HDR10)" },

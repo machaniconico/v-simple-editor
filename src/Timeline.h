@@ -22,6 +22,7 @@
 #include "SnapEngine.h"
 #include "MarkerData.h"
 #include "SpeedRampData.h"
+#include "LayerStyle.h"
 #include "color/ClipColor.h"
 #include "AdjustmentLayer.h"
 #include "MotionStabilizer.h"
@@ -112,6 +113,11 @@ struct ClipInfo {
     // HDR Stage1: per-clip input color metadata. Default SDR is deliberately
     // inert and is omitted from project JSON to preserve old files byte-for-byte.
     clipcolor::ColorMeta colorMeta;
+
+    // Photoshop/AE-style layer style applied to the rendered clip layer after
+    // placement and before compositing. Default identity is strict OFF and is
+    // omitted from project JSON to keep the render/serialization hot path inert.
+    LayerStyle layerStyle;
 
     // Phase 3: Color correction, effects, keyframes
     ColorCorrection colorCorrection;

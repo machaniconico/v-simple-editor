@@ -10,6 +10,7 @@
 #include "MotionTracker.h"      // S7 — genuine TrackingResult::positionAtTime
 #include "TrackMatteBake.h"     // TM-3 — shared SSOT track-matte compositor
 #include "ClipGeometry.h"       // G3 — canonical clip-placement SSOT (clipgeom)
+#include "LayerStyle.h"         // Per-clip layer style at the rendered-layer seam
 #include "clipanim/ClipAnim.h"  // S1 — motion/opacity keyframe evaluation
 #include "TrackMatteKey.h"      // RM-1.1 — single shared clip-key formula
 #include "playback/TrackMatteCompose16.h"
@@ -798,6 +799,7 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
         QImage image;      // already transformed to outSize
         QImage sourceRgb;  // canvas/fitted source before placement
         clipgeom::ClipTransform transform;
+        LayerStyle layerStyle;
         bool nullObject = false;
         clipcolor::ColorMeta colorMeta;
     };
@@ -809,6 +811,7 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
         double videoDx = 0.0;
         double videoDy = 0.0;
         double rotationDeg = 0.0;   // G3: == ClipInfo::rotation2DDegrees
+        LayerStyle layerStyle;
         clipcolor::ColorMeta colorMeta;
     };
     QVector<RenderLayer> renderLayers;
@@ -819,6 +822,7 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
         baseLayer.image = base;
         baseLayer.sourceRgb = v1LayerSource;
         baseLayer.transform = v1Transform;
+        baseLayer.layerStyle = v1Clip.layerStyle;
         baseLayer.nullObject = v1NullObject;
         baseLayer.colorMeta = v1Clip.colorMeta;
         baseLayer.layer.name = v1Clip.displayName;
@@ -861,6 +865,7 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
             renderLayer.clipId = renderClipId(t, idx);
             renderLayer.colorMeta = c.colorMeta;
             renderLayer.transform = cTransform;
+            renderLayer.layerStyle = c.layerStyle;
             renderLayer.nullObject = true;
             renderLayer.layer.name = c.displayName;
             renderLayer.layer.visible = false;
@@ -897,12 +902,29 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
         renderLayer.clipId = renderClipId(t, idx);
         renderLayer.colorMeta = c.colorMeta;
         renderLayer.transform = cTransform;
+        renderLayer.layerStyle = c.layerStyle;
         // Scale the overlay source to the shared canvas grid first; the
         // compositor's videoScale then sizes the dst rect relative to the
         // canvas exactly as composeMultiTrackFrame does for L.rgb.
         const QImage rgb = native.scaled(outSize, Qt::IgnoreAspectRatio,
                                          Qt::SmoothTransformation);
         renderLayer.sourceRgb = rgb;
+        renderLayer.layer.name = c.displayName;
+        renderLayer.layer.visible = cOpacity > 0.001;
+        renderLayer.layer.opacity = qBound(0.0, cOpacity, 1.0);
+        renderLayer.layer.blendMode = BlendMode::Normal;
+        renderLayer.layer.zOrder = t;
+        renderLayer.layer.inPoint = start;
+        renderLayer.layer.outPoint = start + c.effectiveDuration();
+        // G3: the matte path's per-layer image is placed via the same
+        // clipgeom SSOT (renderOverlayLayerImage now delegates to it),
+        // including rotation, so trackmatte::composite receives correctly
+        // placed layers. Layer style is applied at the actual compositor
+        // boundary below; identity clips skip the call.
+        renderLayer.image = renderOverlayLayerImage(
+            rgb, cTransform.videoScale, cTransform.videoDx, cTransform.videoDy,
+            cTransform.rotationDeg, outSize);
+
         // Straight ClipInfo -> layer copy, identical to the preview harvest
         // (src/VideoPlayer.cpp:4848-4850 finalizeOverlayFromDecoder and the
         // layer fill at VideoPlayer.cpp:3656/3734).
@@ -914,23 +936,10 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
         overlay.videoDx = cTransform.videoDx;
         overlay.videoDy = cTransform.videoDy;
         overlay.rotationDeg = cTransform.rotationDeg;   // G3: carry clip rotation
+        overlay.layerStyle = c.layerStyle;
         overlay.colorMeta = c.colorMeta;
         overlays.append(overlay);
 
-        renderLayer.layer.name = c.displayName;
-        renderLayer.layer.visible = cOpacity > 0.001;
-        renderLayer.layer.opacity = qBound(0.0, cOpacity, 1.0);
-        renderLayer.layer.blendMode = BlendMode::Normal;
-        renderLayer.layer.zOrder = t;
-        renderLayer.layer.inPoint = start;
-        renderLayer.layer.outPoint = start + c.effectiveDuration();
-        // G3: the matte path's per-layer image is placed via the same
-        // clipgeom SSOT (renderOverlayLayerImage now delegates to it),
-        // including rotation, so trackmatte::composite receives correctly
-        // placed layers. The matte/blend math in composite() is untouched.
-        renderLayer.image = renderOverlayLayerImage(
-            rgb, cTransform.videoScale, cTransform.videoDx, cTransform.videoDy,
-            cTransform.rotationDeg, outSize);
         renderLayers.append(renderLayer);
     }
 
@@ -1001,8 +1010,9 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
                 || sameTransform(rawTransforms[i], effective)) {
                 continue;
             }
-            renderLayers[i].image = clipgeom::renderLayer(
+            QImage placed = clipgeom::renderLayer(
                 renderLayers[i].sourceRgb, effective, outSize, /*smooth=*/true);
+            renderLayers[i].image = placed;
             if (i == 0)
                 base = renderLayers[i].image;
         }
@@ -1057,7 +1067,10 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
     // to S2/S3/S4/S5 — applyAdjustmentLayers/applyTextOverlays return the
     // input UNTOUCHED in that case, no QPainter, no convert).
     if (!hasOverlayLayers && !hasTrackMatteLayer) {
-        const QImage adj = applyAdjustmentLayers(base, timeline, usec);
+        QImage styledBase = base;
+        if (!v1Clip.layerStyle.isIdentity())
+            styledBase = layerstyle::apply(styledBase, v1Clip.layerStyle);
+        const QImage adj = applyAdjustmentLayers(styledBase, timeline, usec);
         return applyTextOverlays(adj, timeline, usec, &v1Clip);
     }
 
@@ -1112,6 +1125,8 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
                                                 L.videoDy, L.rotationDeg};
                 QImage placed =
                     clipgeom::renderLayer(L.rgb, t, canvas, /*smooth=*/true);
+                if (!L.layerStyle.isIdentity())
+                    placed = layerstyle::apply(placed, L.layerStyle);
                 if (odtEnabled)
                     placed = clipcolor::toLinearWorking(placed, L.colorMeta);
                 else if (idtEnabled)
@@ -1123,6 +1138,8 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
             const double v1Opacity = qBound(0.0, v1EffectiveOpacity, 1.0);
             if (v1Opacity > 0.001) {
                 QImage v1Base = base;
+                if (!v1Clip.layerStyle.isIdentity())
+                    v1Base = layerstyle::apply(v1Base, v1Clip.layerStyle);
                 if (odtEnabled)
                     v1Base = clipcolor::toLinearWorking(v1Base, v1Clip.colorMeta);
                 else if (idtEnabled)
@@ -1162,8 +1179,10 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
                 continue;
             const clipgeom::ClipTransform t{L.videoScale, L.videoDx,
                                             L.videoDy, L.rotationDeg};
-            const QImage placed =
+            QImage placed =
                 clipgeom::renderLayer(L.rgb, t, canvas, /*smooth=*/true);
+            if (!L.layerStyle.isIdentity())
+                placed = layerstyle::apply(placed, L.layerStyle);
             p.setOpacity(qBound(0.0, L.opacity, 1.0));
             p.drawImage(0, 0, placed);
         }
@@ -1171,8 +1190,11 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
         // via the V1 clip transform (fast-path scaled() or clipgeom).
         const double v1Opacity = qBound(0.0, v1EffectiveOpacity, 1.0);
         if (v1Opacity > 0.001) {
+            QImage v1Base = base;
+            if (!v1Clip.layerStyle.isIdentity())
+                v1Base = layerstyle::apply(v1Base, v1Clip.layerStyle);
             p.setOpacity(v1Opacity);
-            p.drawImage(0, 0, base);
+            p.drawImage(0, 0, v1Base);
         }
         p.end();
 
@@ -1198,7 +1220,10 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
         layerImages.reserve(renderLayers.size());
         for (const RenderLayer &renderLayer : renderLayers) {
             layers.append(renderLayer.layer);
-            layerImages.append(renderLayer.image);
+            QImage layerImage = renderLayer.image;
+            if (!renderLayer.layerStyle.isIdentity())
+                layerImage = layerstyle::apply(layerImage, renderLayer.layerStyle);
+            layerImages.append(layerImage);
         }
 
         if (hdrmatte16::enabledFromEnv()) {
@@ -1225,6 +1250,8 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
                 descs.append(d);
 
                 QImage img = rl.image;
+                if (!rl.layerStyle.isIdentity())
+                    img = layerstyle::apply(img, rl.layerStyle);
                 if (odtEnabled)
                     img = clipcolor::toLinearWorking(img, rl.colorMeta);
                 else if (idtEnabled)

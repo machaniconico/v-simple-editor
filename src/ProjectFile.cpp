@@ -1343,6 +1343,8 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
         obj["colorCorrection"] = colorCorrectionToJson(clip.colorCorrection);
     if (!clip.colorMeta.isDefault())
         obj["colorMeta"] = clipcolor::toJson(clip.colorMeta);
+    if (!clip.layerStyle.isIdentity())
+        obj["layerStyle"] = clip.layerStyle.toJson();
 
     if (!clip.effects.isEmpty()) {
         QJsonArray fxArr;
@@ -1414,6 +1416,8 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
     clip.colorMeta = obj.contains("colorMeta")
         ? clipcolor::fromJson(obj["colorMeta"].toObject())
         : clipcolor::defaultSdr();
+    if (obj.contains("layerStyle"))
+        clip.layerStyle = LayerStyle::fromJson(obj["layerStyle"].toObject());
 
     if (obj.contains("effects")) {
         for (const auto &v : obj["effects"].toArray())
