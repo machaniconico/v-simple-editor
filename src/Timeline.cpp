@@ -4407,6 +4407,17 @@ void Timeline::setClipColorCorrection(const ColorCorrection &cc)
     saveUndoState("Color correction");
 }
 
+void Timeline::setClipLayerStyle(const LayerStyle &style)
+{
+    int sel = m_videoTrack->selectedClip();
+    if (sel < 0) return;
+    auto clips = m_videoTrack->clips();
+    clips[sel].layerStyle = style;
+    m_videoTrack->setClips(clips);
+    saveUndoState("Layer style");
+    scheduleEmitSequenceChanged();
+}
+
 void Timeline::applyTransitionToSelected(const Transition &t)
 {
     int sel = m_videoTrack->selectedClip();
@@ -4609,6 +4620,13 @@ ColorCorrection Timeline::clipColorCorrection() const
     int sel = m_videoTrack->selectedClip();
     if (sel < 0 || sel >= m_videoTrack->clips().size()) return {};
     return m_videoTrack->clips()[sel].colorCorrection;
+}
+
+LayerStyle Timeline::clipLayerStyle() const
+{
+    int sel = m_videoTrack->selectedClip();
+    if (sel < 0 || sel >= m_videoTrack->clips().size()) return {};
+    return m_videoTrack->clips()[sel].layerStyle;
 }
 
 QVector<VideoEffect> Timeline::clipEffects() const

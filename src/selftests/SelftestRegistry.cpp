@@ -70,6 +70,7 @@ int runImportSelftest();
 int runInstagramSelftest();
 int runKeyframeAnimParitySelftest();
 int runLayerStyleSelftest();
+int runLayerStyleUiSelftest();
 int runLibavcoreDecodeSelftest();
 int runLibavcoreEncodeSelftest();
 int runLiveMatteResolveSelftest();
@@ -317,6 +318,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "ImportHub ingest previews: mesh wireframe determinism + empty placeholder (QApplication-free)" },
     { "layer-style",        "VEDITOR_LAYER_STYLE_SELFTEST",        runLayerStyleSelftest,          false,
       "LayerStyle: identity fast path, drop shadow, stroke, and project JSON omission/round-trip" },
+    { "layer-style-ui",     "VEDITOR_LAYER_STYLE_UI_SELFTEST",     runLayerStyleUiSelftest,       false,
+      "Layer Style UI: default identity, JSON round-trip, enabled-flag identity, and optional Timeline setter/getter gate" },
     // QApplication-required (needsQApplication=true) ----------------------
     { "parity",            "VEDITOR_PARITY_SELFTEST",             runParitySelftest,             true,
       "Preview vs export pixel-parity (S1-S11, framediff::mse, 10-bit HDR10)" },

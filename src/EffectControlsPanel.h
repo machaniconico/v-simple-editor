@@ -7,11 +7,18 @@
 #include <QVector>
 #include <QWidget>
 #include <QVariant>
+#include <QColor>
 #include "VideoEffect.h"
 #include "MotionSectionWidget.h"
+#include "LayerStyle.h"
 
 class Timeline;
 class MainWindow;
+class QCheckBox;
+class QDoubleSpinBox;
+class QPushButton;
+class QSlider;
+class QSpinBox;
 
 namespace effectctrl {
 class EffectRowWidget;
@@ -62,12 +69,34 @@ private:
     void createKeyframeTrack(const QString &trackName, double value);
     void removeKeyframeTrack(const QString &trackName, const QString &displayName);
     void persistAndRebuild();
+    void buildLayerStyleGroup();
+    void setLayerStyleControls(const LayerStyle &style, bool hasClip);
+    LayerStyle layerStyleFromControls() const;
+    void updateLayerStyleControlAvailability(bool hasClip);
+    void updateLayerStyleColorButton(QPushButton *button, const QColor &color);
+    void persistLayerStyleFromControls();
+    void chooseShadowColor();
+    void chooseStrokeColor();
 
     Timeline *m_timeline = nullptr;
     MainWindow *m_mainWindow = nullptr;
     ClipKey m_currentClipKey;
     QVector<VideoEffect> m_effects;
     MotionSectionWidget *m_motionWidget = nullptr;
+    QGroupBox *m_layerStyleGroup = nullptr;
+    QCheckBox *m_shadowEnable = nullptr;
+    QPushButton *m_shadowColorButton = nullptr;
+    QDoubleSpinBox *m_shadowOffsetX = nullptr;
+    QDoubleSpinBox *m_shadowOffsetY = nullptr;
+    QDoubleSpinBox *m_shadowBlurRadius = nullptr;
+    QSlider *m_shadowOpacitySlider = nullptr;
+    QSpinBox *m_shadowOpacitySpin = nullptr;
+    QCheckBox *m_strokeEnable = nullptr;
+    QPushButton *m_strokeColorButton = nullptr;
+    QDoubleSpinBox *m_strokeWidth = nullptr;
+    QColor m_shadowColor = QColor(0, 0, 0, 128);
+    QColor m_strokeColor = QColor(Qt::white);
+    bool m_blockLayerStyleUi = false;
 
     QLabel *m_emptyStateLabel = nullptr;
     QScrollArea *m_scrollArea = nullptr;

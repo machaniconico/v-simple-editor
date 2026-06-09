@@ -190,6 +190,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/CapcutCaptionSelftest.cpp
     src/selftests/AutoColorSelftest.cpp
     src/selftests/LayerStyleSelftest.cpp
+    src/selftests/LayerStyleUiSelftest.cpp
     src/selftests/RightclickPausePrefSelftest.cpp
     src/selftests/WbEyedropperSelftest.cpp
     src/selftests/SubtitleCpsSelftest.cpp

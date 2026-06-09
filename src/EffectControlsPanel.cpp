@@ -8,8 +8,17 @@
 #include "Timeline.h"
 #include <QVBoxLayout>
 #include <QHBoxLayout>
+#include <QCheckBox>
+#include <QColorDialog>
+#include <QDoubleSpinBox>
+#include <QFormLayout>
+#include <QPushButton>
 #include <QScrollBar>
+#include <QSignalBlocker>
+#include <QSlider>
+#include <QSpinBox>
 #include <QMessageBox>
+#include <cmath>
 
 namespace effectctrl {
 
@@ -79,6 +88,7 @@ EffectControlsPanel::EffectControlsPanel(QWidget *parent)
     m_motionWidget = new MotionSectionWidget(m_scrollContent);
     m_motionWidget->setEnabled(false);
     m_scrollLayout->addWidget(m_motionWidget);
+    buildLayerStyleGroup();
     m_scrollLayout->addStretch();
     m_scrollArea->setWidget(m_scrollContent);
 
@@ -100,6 +110,106 @@ EffectControlsPanel::EffectControlsPanel(QWidget *parent)
 
     setWidget(centralWidget);
     setMinimumWidth(280);
+}
+
+void EffectControlsPanel::buildLayerStyleGroup()
+{
+    m_layerStyleGroup = new QGroupBox(QStringLiteral("レイヤースタイル"), m_scrollContent);
+    auto *form = new QFormLayout(m_layerStyleGroup);
+    form->setContentsMargins(4, 4, 4, 4);
+    form->setSpacing(4);
+
+    m_shadowEnable = new QCheckBox(QStringLiteral("ドロップシャドウ"), m_layerStyleGroup);
+    form->addRow(m_shadowEnable);
+
+    m_shadowColorButton = new QPushButton(QStringLiteral("色"), m_layerStyleGroup);
+    m_shadowColorButton->setMinimumWidth(64);
+    form->addRow(QStringLiteral("影の色"), m_shadowColorButton);
+
+    auto *offsetRow = new QHBoxLayout();
+    m_shadowOffsetX = new QDoubleSpinBox(m_layerStyleGroup);
+    m_shadowOffsetX->setRange(-500.0, 500.0);
+    m_shadowOffsetX->setDecimals(1);
+    m_shadowOffsetX->setSingleStep(1.0);
+    m_shadowOffsetY = new QDoubleSpinBox(m_layerStyleGroup);
+    m_shadowOffsetY->setRange(-500.0, 500.0);
+    m_shadowOffsetY->setDecimals(1);
+    m_shadowOffsetY->setSingleStep(1.0);
+    offsetRow->addWidget(m_shadowOffsetX);
+    offsetRow->addWidget(m_shadowOffsetY);
+    form->addRow(QStringLiteral("オフセット X/Y"), offsetRow);
+
+    m_shadowBlurRadius = new QDoubleSpinBox(m_layerStyleGroup);
+    m_shadowBlurRadius->setRange(0.0, 200.0);
+    m_shadowBlurRadius->setDecimals(1);
+    m_shadowBlurRadius->setSingleStep(1.0);
+    form->addRow(QStringLiteral("ぼかし半径"), m_shadowBlurRadius);
+
+    auto *opacityRow = new QHBoxLayout();
+    m_shadowOpacitySlider = new QSlider(Qt::Horizontal, m_layerStyleGroup);
+    m_shadowOpacitySlider->setRange(0, 100);
+    m_shadowOpacitySpin = new QSpinBox(m_layerStyleGroup);
+    m_shadowOpacitySpin->setRange(0, 100);
+    m_shadowOpacitySpin->setSuffix(QStringLiteral("%"));
+    opacityRow->addWidget(m_shadowOpacitySlider, 1);
+    opacityRow->addWidget(m_shadowOpacitySpin);
+    form->addRow(QStringLiteral("不透明度"), opacityRow);
+
+    m_strokeEnable = new QCheckBox(QStringLiteral("ストローク(縁取り)"), m_layerStyleGroup);
+    form->addRow(m_strokeEnable);
+
+    m_strokeColorButton = new QPushButton(QStringLiteral("色"), m_layerStyleGroup);
+    m_strokeColorButton->setMinimumWidth(64);
+    form->addRow(QStringLiteral("縁取り色"), m_strokeColorButton);
+
+    m_strokeWidth = new QDoubleSpinBox(m_layerStyleGroup);
+    m_strokeWidth->setRange(0.0, 200.0);
+    m_strokeWidth->setDecimals(1);
+    m_strokeWidth->setSingleStep(1.0);
+    form->addRow(QStringLiteral("幅"), m_strokeWidth);
+
+    connect(m_shadowEnable, &QCheckBox::toggled, this, [this](bool) {
+        if (m_blockLayerStyleUi)
+            return;
+        updateLayerStyleControlAvailability(m_currentClipKey.valid());
+        persistLayerStyleFromControls();
+    });
+    connect(m_shadowColorButton, &QPushButton::clicked,
+            this, &EffectControlsPanel::chooseShadowColor);
+    connect(m_shadowOffsetX, qOverload<double>(&QDoubleSpinBox::valueChanged),
+            this, [this](double) { persistLayerStyleFromControls(); });
+    connect(m_shadowOffsetY, qOverload<double>(&QDoubleSpinBox::valueChanged),
+            this, [this](double) { persistLayerStyleFromControls(); });
+    connect(m_shadowBlurRadius, qOverload<double>(&QDoubleSpinBox::valueChanged),
+            this, [this](double) { persistLayerStyleFromControls(); });
+    connect(m_shadowOpacitySlider, &QSlider::valueChanged, this, [this](int value) {
+        if (m_blockLayerStyleUi)
+            return;
+        QSignalBlocker blocker(m_shadowOpacitySpin);
+        m_shadowOpacitySpin->setValue(value);
+        persistLayerStyleFromControls();
+    });
+    connect(m_shadowOpacitySpin, qOverload<int>(&QSpinBox::valueChanged),
+            this, [this](int value) {
+        if (m_blockLayerStyleUi)
+            return;
+        QSignalBlocker blocker(m_shadowOpacitySlider);
+        m_shadowOpacitySlider->setValue(value);
+        persistLayerStyleFromControls();
+    });
+    connect(m_strokeEnable, &QCheckBox::toggled, this, [this](bool) {
+        if (m_blockLayerStyleUi)
+            return;
+        updateLayerStyleControlAvailability(m_currentClipKey.valid());
+        persistLayerStyleFromControls();
+    });
+    connect(m_strokeColorButton, &QPushButton::clicked,
+            this, &EffectControlsPanel::chooseStrokeColor);
+    connect(m_strokeWidth, qOverload<double>(&QDoubleSpinBox::valueChanged),
+            this, [this](double) { persistLayerStyleFromControls(); });
+
+    m_scrollLayout->addWidget(m_layerStyleGroup);
+    setLayerStyleControls(LayerStyle{}, false);
 }
 
 void EffectControlsPanel::setTimeline(Timeline *timeline)
@@ -175,6 +285,7 @@ void EffectControlsPanel::refreshFromCurrentClip()
         clip.layer3D.rotationY,
         clip.layer3D.rotationZ
     });
+    setLayerStyleControls(clip.layerStyle, true);
 
     // Restore motion keyframe toggle states
     for (const auto &prop : motionTrackNames()) {
@@ -206,6 +317,7 @@ void EffectControlsPanel::buildEmptyState(const QString &message)
     clearContent();
     m_motionWidget->setEnabled(false);
     m_motionWidget->setMotion(MotionState{});
+    setLayerStyleControls(LayerStyle{}, false);
     for (const auto &prop : motionTrackNames()) {
         m_motionWidget->setPropHasTrack(prop, false);
         m_motionWidget->setPropKeyframeTrack(prop, nullptr, 0.0, currentPlayheadSeconds());
@@ -217,8 +329,108 @@ void EffectControlsPanel::buildEmptyState(const QString &message)
         m_emptyStateLabel->setStyleSheet("color: #888; padding: 20px;");
     }
     m_emptyStateLabel->setText(message);
-    m_scrollLayout->insertWidget(1, m_emptyStateLabel);
+    m_scrollLayout->insertWidget(m_scrollLayout->count() - 1, m_emptyStateLabel);
     m_emptyStateLabel->show();
+}
+
+void EffectControlsPanel::setLayerStyleControls(const LayerStyle &style, bool hasClip)
+{
+    m_blockLayerStyleUi = true;
+
+    const bool identity = style.isIdentity();
+    const bool showShadowValues = hasClip && style.dropShadowEnabled && !identity;
+    const bool showStrokeValues = hasClip && style.strokeEnabled && !identity;
+
+    m_shadowEnable->setChecked(showShadowValues);
+    m_shadowColor = showShadowValues ? style.shadowColor : QColor(0, 0, 0, 128);
+    m_shadowOffsetX->setValue(showShadowValues ? style.shadowOffset.x() : 0.0);
+    m_shadowOffsetY->setValue(showShadowValues ? style.shadowOffset.y() : 0.0);
+    m_shadowBlurRadius->setValue(showShadowValues ? style.shadowBlurRadius : 0.0);
+    const int opacityPercent = showShadowValues
+        ? qBound(0, static_cast<int>(std::round(style.shadowOpacity * 100.0)), 100)
+        : 0;
+    m_shadowOpacitySlider->setValue(opacityPercent);
+    m_shadowOpacitySpin->setValue(opacityPercent);
+
+    m_strokeEnable->setChecked(showStrokeValues);
+    m_strokeColor = showStrokeValues ? style.strokeColor : QColor(Qt::white);
+    m_strokeWidth->setValue(showStrokeValues ? style.strokeWidth : 0.0);
+
+    updateLayerStyleColorButton(m_shadowColorButton, m_shadowColor);
+    updateLayerStyleColorButton(m_strokeColorButton, m_strokeColor);
+
+    m_blockLayerStyleUi = false;
+    updateLayerStyleControlAvailability(hasClip);
+}
+
+LayerStyle EffectControlsPanel::layerStyleFromControls() const
+{
+    LayerStyle style;
+    style.dropShadowEnabled = m_shadowEnable->isChecked();
+    style.shadowColor = m_shadowColor;
+    style.shadowOffset = QPointF(m_shadowOffsetX->value(), m_shadowOffsetY->value());
+    style.shadowBlurRadius = m_shadowBlurRadius->value();
+    style.shadowOpacity = static_cast<double>(m_shadowOpacitySpin->value()) / 100.0;
+    style.strokeEnabled = m_strokeEnable->isChecked();
+    style.strokeColor = m_strokeColor;
+    style.strokeWidth = m_strokeWidth->value();
+    return style;
+}
+
+void EffectControlsPanel::updateLayerStyleControlAvailability(bool hasClip)
+{
+    if (!m_layerStyleGroup)
+        return;
+
+    m_layerStyleGroup->setEnabled(hasClip);
+    const bool shadowEnabled = hasClip && m_shadowEnable->isChecked();
+    m_shadowColorButton->setEnabled(shadowEnabled);
+    m_shadowOffsetX->setEnabled(shadowEnabled);
+    m_shadowOffsetY->setEnabled(shadowEnabled);
+    m_shadowBlurRadius->setEnabled(shadowEnabled);
+    m_shadowOpacitySlider->setEnabled(shadowEnabled);
+    m_shadowOpacitySpin->setEnabled(shadowEnabled);
+
+    const bool strokeEnabled = hasClip && m_strokeEnable->isChecked();
+    m_strokeColorButton->setEnabled(strokeEnabled);
+    m_strokeWidth->setEnabled(strokeEnabled);
+}
+
+void EffectControlsPanel::updateLayerStyleColorButton(QPushButton *button, const QColor &color)
+{
+    if (!button)
+        return;
+    button->setStyleSheet(QStringLiteral("background-color: %1;")
+                              .arg(color.name(QColor::HexRgb)));
+}
+
+void EffectControlsPanel::persistLayerStyleFromControls()
+{
+    if (m_blockLayerStyleUi || !m_timeline || !m_currentClipKey.valid())
+        return;
+    m_timeline->setClipLayerStyle(layerStyleFromControls());
+}
+
+void EffectControlsPanel::chooseShadowColor()
+{
+    const QColor chosen = QColorDialog::getColor(
+        m_shadowColor, this, QStringLiteral("影の色"), QColorDialog::ShowAlphaChannel);
+    if (!chosen.isValid())
+        return;
+    m_shadowColor = chosen;
+    updateLayerStyleColorButton(m_shadowColorButton, m_shadowColor);
+    persistLayerStyleFromControls();
+}
+
+void EffectControlsPanel::chooseStrokeColor()
+{
+    const QColor chosen = QColorDialog::getColor(
+        m_strokeColor, this, QStringLiteral("縁取り色"), QColorDialog::ShowAlphaChannel);
+    if (!chosen.isValid())
+        return;
+    m_strokeColor = chosen;
+    updateLayerStyleColorButton(m_strokeColorButton, m_strokeColor);
+    persistLayerStyleFromControls();
 }
 
 void EffectControlsPanel::buildEffectGroups(const QVector<VideoEffect> &effects)
@@ -285,7 +497,7 @@ void EffectControlsPanel::buildEffectGroups(const QVector<VideoEffect> &effects)
             m_emptyStateLabel->setStyleSheet("color: #888; padding: 20px;");
         }
         m_emptyStateLabel->setText(QStringLiteral("No effects on this clip"));
-        m_scrollLayout->insertWidget(1, m_emptyStateLabel);
+        m_scrollLayout->insertWidget(m_scrollLayout->count() - 1, m_emptyStateLabel);
         m_emptyStateLabel->show();
     }
 }
@@ -333,8 +545,8 @@ void EffectControlsPanel::clearContent()
         m_emptyStateLabel = nullptr;
     }
 
-    auto children = m_scrollContent->findChildren<QGroupBox *>();
-    for (auto *gb : children) {
+    const auto groups = m_effectGroupBoxes;
+    for (auto *gb : groups) {
         m_scrollLayout->removeWidget(gb);
         gb->deleteLater();
     }
