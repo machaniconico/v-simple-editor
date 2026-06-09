@@ -34,6 +34,7 @@ int runBatchExportSelftest();
 int runBezierEasingSelftest();
 int runBlenderSelftest();
 int runBroadcastCaptionSelftest();
+int runCapcutCaptionSelftest();
 int runCaptionSelftest();
 int runChromaSelftest();
 int runClipColorSelftest();
@@ -268,6 +269,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "SafeZone: SNS platform UI guide rects + apply display-local overlay (9 gates)" },
     { "onion-skin",       "VEDITOR_ONION_SKIN_SELFTEST",          runOnionSkinSelftest,          false,
       "OnionSkin: disabled/empty/opacity-zero no-op + display blend invariant (4 gates)" },
+    { "capcut-caption",   "VEDITOR_CAPCUT_CAPTION_SELFTEST",      runCapcutCaptionSelftest,      false,
+      "CapCut-style caption presets: shape, uniqueness, distinction, background semantics, non-default" },
     { "subtitle-cps",     "VEDITOR_SUBTITLE_CPS_SELFTEST",        runSubtitleCpsSelftest,        false,
       "Subtitle CPS readability helper: visible character counting, zero-duration sentinel, strict threshold" },
     { "subtitle-karaoke", "VEDITOR_SUBTITLE_KARAOKE_SELFTEST",    runSubtitleKaraokeSelftest,    false,

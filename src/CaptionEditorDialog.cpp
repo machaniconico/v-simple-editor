@@ -167,6 +167,17 @@ CaptionEditorDialog::CaptionEditorDialog(QWidget* parent)
     // スタイル GroupBox
     m_fontCombo = new QFontComboBox(this);
 
+    m_presetCombo = new QComboBox(this);
+    const QVector<caption::StylePreset> presets = caption::capCutStylePresets();
+    for (const caption::StylePreset& preset : presets)
+        m_presetCombo->addItem(preset.displayName);
+
+    m_applyPresetButton = new QPushButton(tr("適用"), this);
+
+    auto* presetRow = new QHBoxLayout;
+    presetRow->addWidget(m_presetCombo, 1);
+    presetRow->addWidget(m_applyPresetButton);
+
     m_fontSizeSpin = new QSpinBox(this);
     m_fontSizeSpin->setRange(8, 72);
 
@@ -205,9 +216,19 @@ CaptionEditorDialog::CaptionEditorDialog(QWidget* parent)
     karaokeRow->addWidget(m_karaokeColorButton, 1);
 
     m_anchorCombo = new QComboBox(this);
-    m_anchorCombo->addItems(caption::anchorNames());
+    const QStringList anchorLabels = caption::anchorNames();
+    m_anchorCombo->addItem(anchorLabels.value(0), caption::anchorToString(caption::Anchor::TopLeft));
+    m_anchorCombo->addItem(anchorLabels.value(1), caption::anchorToString(caption::Anchor::TopCenter));
+    m_anchorCombo->addItem(anchorLabels.value(2), caption::anchorToString(caption::Anchor::TopRight));
+    m_anchorCombo->addItem(anchorLabels.value(3), caption::anchorToString(caption::Anchor::MiddleLeft));
+    m_anchorCombo->addItem(anchorLabels.value(4), caption::anchorToString(caption::Anchor::MiddleCenter));
+    m_anchorCombo->addItem(anchorLabels.value(5), caption::anchorToString(caption::Anchor::MiddleRight));
+    m_anchorCombo->addItem(anchorLabels.value(6), caption::anchorToString(caption::Anchor::BottomLeft));
+    m_anchorCombo->addItem(anchorLabels.value(7), caption::anchorToString(caption::Anchor::BottomCenter));
+    m_anchorCombo->addItem(anchorLabels.value(8), caption::anchorToString(caption::Anchor::BottomRight));
 
     auto* styleForm = new QFormLayout;
+    styleForm->addRow(tr("CapCut スタイル:"), presetRow);
     styleForm->addRow(tr("フォント:"),      m_fontCombo);
     styleForm->addRow(tr("サイズ:"),        m_fontSizeSpin);
     styleForm->addRow(tr("スタイル:"),      boldItalicRow);
@@ -255,6 +276,7 @@ CaptionEditorDialog::CaptionEditorDialog(QWidget* parent)
     connect(m_importButton,     &QPushButton::clicked, this, &CaptionEditorDialog::onImportClicked);
     connect(m_exportButton,     &QPushButton::clicked, this, &CaptionEditorDialog::onExportClicked);
     connect(m_recognizeButton,  &QPushButton::clicked, this, &CaptionEditorDialog::onRecognizeClicked);
+    connect(m_applyPresetButton, &QPushButton::clicked, this, &CaptionEditorDialog::onApplyPresetClicked);
 
     // スタイルコントロール → onStyleChanged
     connect(m_fontCombo,    &QFontComboBox::currentFontChanged, this, [this](const QFont&) { onStyleChanged(); });
@@ -590,7 +612,9 @@ void CaptionEditorDialog::onStyleChanged()
     m_style.italic           = m_italicCheck->isChecked();
     m_style.outlineThickness = m_outlineWidthSpin->value();
     m_style.background       = m_bgCheck->isChecked();
-    m_style.anchor           = caption::anchorFromString(m_anchorCombo->currentText());
+    const QString anchorValue = m_anchorCombo->currentData().toString();
+    m_style.anchor           = caption::anchorFromString(
+        anchorValue.isEmpty() ? m_anchorCombo->currentText() : anchorValue);
 
     syncSubtitleStyleFromCaptionStyle();
     m_subtitleStyle.karaokeEnabled = m_karaokeCheck->isChecked();
@@ -598,6 +622,22 @@ void CaptionEditorDialog::onStyleChanged()
     updatePreview();
     emit styleChanged(m_style);
     emit subtitleStyleChanged(m_subtitleStyle);
+}
+
+void CaptionEditorDialog::onApplyPresetClicked()
+{
+    if (!m_presetCombo)
+        return;
+
+    const QVector<caption::StylePreset> presets = caption::capCutStylePresets();
+    const int index = m_presetCombo->currentIndex();
+    if (index < 0 || index >= presets.size())
+        return;
+
+    m_style = presets.at(index).style;
+    syncSubtitleStyleFromCaptionStyle();
+    updateStyleControls();
+    onStyleChanged();
 }
 
 // ---------------------------------------------------------------------------
@@ -681,7 +721,9 @@ void CaptionEditorDialog::updateStyleControls()
     m_karaokeCheck->setChecked(m_subtitleStyle.karaokeEnabled);
 
     const QString anchorStr = caption::anchorToString(m_style.anchor);
-    const int anchorIdx = m_anchorCombo->findText(anchorStr);
+    int anchorIdx = m_anchorCombo->findData(anchorStr);
+    if (anchorIdx < 0)
+        anchorIdx = m_anchorCombo->findText(anchorStr);
     if (anchorIdx >= 0)
         m_anchorCombo->setCurrentIndex(anchorIdx);
 

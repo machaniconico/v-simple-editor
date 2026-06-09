@@ -44,6 +44,7 @@ private slots:
     void onClipTextEdited();
     void onClipTimeEdited();
     void onStyleChanged();
+    void onApplyPresetClicked();
 
 private:
     void rebuildClipTable();
@@ -62,6 +63,8 @@ private:
     QSpinBox*        m_endMsSpin        = nullptr;
 
     QFontComboBox*   m_fontCombo        = nullptr;
+    QComboBox*       m_presetCombo      = nullptr;
+    QPushButton*     m_applyPresetButton = nullptr;
     QSpinBox*        m_fontSizeSpin     = nullptr;
     QCheckBox*       m_boldCheck        = nullptr;
     QCheckBox*       m_italicCheck      = nullptr;

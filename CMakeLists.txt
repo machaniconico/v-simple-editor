@@ -180,6 +180,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/audio_bus_selftest.cpp
     src/selftests/StereoPanSelftest.cpp
     src/selftests/ExportRangeSelftest.cpp
+    src/selftests/CapcutCaptionSelftest.cpp
     src/selftests/SubtitleCpsSelftest.cpp
     src/selftests/RgbParadeSelftest.cpp
     src/selftests/atempo_resolve_selftest.cpp

@@ -3,6 +3,7 @@
 #include <QColor>
 #include <QPointF>
 #include <QStringList>
+#include <QVector>
 
 namespace caption {
 
@@ -29,7 +30,13 @@ struct Style {
     double  maxWidthNormalized  = 0.8;                    // 横幅 80% 以内
 };
 
+struct StylePreset {
+    QString displayName;
+    Style style;
+};
+
 Style       defaultStyle();
+QVector<StylePreset> capCutStylePresets();
 QStringList anchorNames();                           // 9 個の display name
 QString     anchorToString(Anchor a);
 Anchor      anchorFromString(const QString& s);
