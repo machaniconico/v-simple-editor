@@ -181,6 +181,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/StereoPanSelftest.cpp
     src/selftests/ExportRangeSelftest.cpp
     src/selftests/SubtitleCpsSelftest.cpp
+    src/selftests/RgbParadeSelftest.cpp
     src/selftests/atempo_resolve_selftest.cpp
     src/selftests/silence_cut_selftest.cpp
     src/selftests/beat_detect_selftest.cpp

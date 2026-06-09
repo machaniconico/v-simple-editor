@@ -9,6 +9,8 @@
 #include <QString>
 #include <QStringList>
 
+int runRgbParadeSelftest();
+
 namespace selftests {
 
 // Central dispatch entry: one row per selftest in kArgvSelftests[].

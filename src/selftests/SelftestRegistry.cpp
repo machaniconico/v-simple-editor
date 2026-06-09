@@ -95,6 +95,7 @@ int runProjectPresetSelftest();
 int runProxySelftestV2();
 int runRenderQueueAcesDecisionSelftest();
 int runRenderQueueFpsRationalSelftest();
+int runRgbParadeSelftest();
 int runShortcutSelftest();
 int runSilenceCutSelftest();
 int runBeatDetectSelftest();
@@ -227,6 +228,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "SpectralEngine: FFT/STFT/iSTFT round-trip + region attenuation" },
     { "sws-color",         "VEDITOR_SWS_COLOR_SELFTEST",          runSwsColorSelftest,           false,
       "swscale color matrix helper: colorspace/range/tag resolution + coefficient proof (8 gates)" },
+    { "rgb-parade",        "VEDITOR_RGB_PARADE_SELFTEST",         runRgbParadeSelftest,          false,
+      "RGB Parade scope: per-column R/G/B channel distribution and offscreen render dimensions (4 gates)" },
     { "aces-color",        "VEDITOR_ACES_COLOR_SELFTEST",         runAcesColorSelftest,          false,
       "AcesColor: primaries matrices, Bradford, IDT/RRT/ODT round-trip" },
     { "dolby-vision",      "VEDITOR_DOLBY_VISION_SELFTEST",       runDolbyVisionSelftest,        false,

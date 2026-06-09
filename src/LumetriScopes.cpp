@@ -43,6 +43,115 @@ inline QImage downsampleForVector(const QImage &src) {
 
 } // namespace
 
+RgbParadeData computeRgbParadeData(const QImage &frame)
+{
+    RgbParadeData data;
+    const QImage src = downsampleToBudget(frame).convertToFormat(QImage::Format_RGB32);
+    if (src.isNull() || src.width() <= 0 || src.height() <= 0)
+        return data;
+
+    data.sourceHeight = src.height();
+    for (auto &channel : data.channels) {
+        channel.resize(src.width());
+        for (auto &bins : channel)
+            bins.fill(0);
+    }
+
+    for (int y = 0; y < src.height(); ++y) {
+        const QRgb *line = reinterpret_cast<const QRgb *>(src.constScanLine(y));
+        for (int x = 0; x < src.width(); ++x) {
+            const QRgb px = line[x];
+            ++data.channels[0][x][qRed(px)];
+            ++data.channels[1][x][qGreen(px)];
+            ++data.channels[2][x][qBlue(px)];
+        }
+    }
+
+    return data;
+}
+
+namespace {
+
+void paintRgbParadeData(QPainter &p, const QRect &target, const RgbParadeData &data)
+{
+    p.fillRect(target, QColor(20, 20, 22));
+
+    const int W = target.width();
+    const int H = target.height();
+    if (W <= 0 || H <= 0)
+        return;
+
+    const QColor panelBg[3] = {
+        QColor(32, 20, 20),
+        QColor(20, 30, 22),
+        QColor(20, 22, 34),
+    };
+    const QColor trace[3] = {
+        QColor(235, 80, 80, 150),
+        QColor(80, 225, 95, 150),
+        QColor(95, 135, 245, 150),
+    };
+
+    for (int c = 0; c < 3; ++c) {
+        const int panelLeft = target.left() + (c * W) / 3;
+        const int panelRight = target.left() + ((c + 1) * W) / 3;
+        const QRect panel(panelLeft, target.top(), panelRight - panelLeft, H);
+        if (panel.width() <= 0)
+            continue;
+
+        p.fillRect(panel, panelBg[c]);
+        if (c > 0) {
+            p.setPen(QPen(QColor(90, 90, 95, 140), 1));
+            p.drawLine(panel.left(), panel.top(), panel.left(), panel.bottom());
+        }
+
+        if (!data.isEmpty()) {
+            const double xs = static_cast<double>(panel.width())
+                              / static_cast<double>(data.width());
+            const double ys = H > 1 ? static_cast<double>(H - 1) / 255.0 : 0.0;
+            p.setPen(QPen(trace[c], 1));
+            for (int x = 0; x < data.width(); ++x) {
+                const int sx = panel.left()
+                               + qMin(panel.width() - 1, static_cast<int>(x * xs));
+                const auto &bins = data.channels[c][x];
+                for (int intensity = 0; intensity < 256; ++intensity) {
+                    const int count = bins[intensity];
+                    if (count <= 0)
+                        continue;
+                    const int sy = target.top() + H - 1
+                                   - static_cast<int>(intensity * ys);
+                    for (int i = 0; i < count; ++i)
+                        p.drawPoint(sx, sy);
+                }
+            }
+        }
+
+        // Reference lines at 0 / 50 / 100 IRE, matching the waveform scope.
+        const double ys = H > 1 ? static_cast<double>(H - 1) / 255.0 : 0.0;
+        p.setPen(QPen(QColor(120, 120, 120, 120), 1, Qt::DashLine));
+        p.drawLine(panel.left(), target.top() + H - 1, panel.right(), target.top() + H - 1);
+        p.drawLine(panel.left(),
+                   target.top() + H - 1 - static_cast<int>(128 * ys),
+                   panel.right(),
+                   target.top() + H - 1 - static_cast<int>(128 * ys));
+        p.drawLine(panel.left(), target.top(), panel.right(), target.top());
+    }
+}
+
+} // namespace
+
+QImage renderRgbParadeImage(const RgbParadeData &data, int width, int height)
+{
+    if (width <= 0 || height <= 0)
+        return QImage();
+
+    QImage image(width, height, QImage::Format_ARGB32_Premultiplied);
+    image.fill(QColor(20, 20, 22));
+    QPainter p(&image);
+    paintRgbParadeData(p, QRect(0, 0, width, height), data);
+    return image;
+}
+
 // ----- HistogramScope ------------------------------------------------------
 
 class HistogramScope : public IScope
@@ -149,6 +258,49 @@ public:
 private:
     QImage m_src;
     bool m_enabled = true;
+};
+
+// ----- RgbParadeScope ------------------------------------------------------
+
+class RgbParadeScope : public IScope
+{
+public:
+    RgbParadeScope() = default;
+
+    QString name() const override { return QStringLiteral("RGB Parade"); }
+    bool isEnabled() const override { return m_enabled; }
+    void setEnabled(bool e) override { m_enabled = e; }
+
+    void updateFromFrame(const QImage &frame) override {
+        m_data = computeRgbParadeData(frame);
+    }
+
+    void paint(QPainter &p, const QRect &target) override {
+        paintRgbParadeData(p, target, m_data);
+
+        const int W = target.width();
+        if (W <= 0 || target.height() <= 0)
+            return;
+
+        p.setPen(QColor(180, 180, 180));
+        p.drawText(4, 12, "RGB Parade");
+
+        const QColor label[3] = {
+            QColor(235, 80, 80),
+            QColor(80, 225, 95),
+            QColor(95, 135, 245),
+        };
+        static const char *name[3] = {"R", "G", "B"};
+        for (int c = 0; c < 3; ++c) {
+            const int panelLeft = target.left() + (c * W) / 3;
+            p.setPen(label[c]);
+            p.drawText(panelLeft + 4, 26, QString::fromLatin1(name[c]));
+        }
+    }
+
+private:
+    RgbParadeData m_data;
+    bool m_enabled = false;
 };
 
 // ----- VectorscopeScope ----------------------------------------------------
@@ -321,6 +473,7 @@ LumetriScopes::LumetriScopes(QWidget *parent) : QWidget(parent)
     m_scopes.push_back(std::make_unique<HistogramScope>());
     m_scopes.push_back(std::make_unique<WaveformScope>());
     m_scopes.push_back(std::make_unique<VectorscopeScope>());
+    m_scopes.push_back(std::make_unique<RgbParadeScope>());
 
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(2, 2, 2, 2);
