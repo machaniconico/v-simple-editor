@@ -1307,8 +1307,11 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
 QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize,
                      double frameDurationUs)
 {
-    if (!motionblur::enabledFromEnv() || frameDurationUs <= 0.0)
+    const bool envMotionBlur = motionblur::enabledFromEnv();
+    if (!motionblur::activeForTimeline(timeline, envMotionBlur)
+        || frameDurationUs <= 0.0) {
         return detail::renderFrameAtSingle(timeline, usec, outSize);
+    }
 
     const int n = motionblur::sampleCountFromEnv();
     const double shutterAngle = motionblur::shutterAngleFromEnv();

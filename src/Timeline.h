@@ -97,6 +97,7 @@ struct ClipInfo {
     double rotation2DDegrees = 0.0;
     bool is3DLayer = false;
     Layer3DTransform layer3D;
+    bool motionBlurEnabled = false;
 
     // Future multi-track compositing groundwork. 1.0 = opaque (current
     // V1-wins behaviour). <1.0 values are placeholders until the layered

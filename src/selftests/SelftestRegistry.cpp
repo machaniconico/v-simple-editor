@@ -87,6 +87,7 @@ int runMatte16ParitySelftest();
 int runMediaPoolSelftest();
 int runMobileSelftest();
 int runMographSelftest();
+int runMotionBlurP2Selftest();
 int runMotionBlurParitySelftest();
 int runMotionPresetSelftest();
 int runMultiCamSelftest();
@@ -352,6 +353,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Preview vs export pixel-parity (S1-S11, framediff::mse, 10-bit HDR10)" },
     { "keyframe-anim-parity", "VEDITOR_KEYFRAME_ANIM_PARITY_SELFTEST", runKeyframeAnimParitySelftest, true,
       "Render-time per-clip motion/opacity keyframe evaluation parity (5 gates, byte-identical no-keyframe guard)" },
+    { "motion-blur-p2", "VEDITOR_MOTION_BLUR_P2_SELFTEST", runMotionBlurP2Selftest, true,
+      "Motion blur P2 activation: env force OR per-clip opt-in + ProjectFile true-only persistence (5 gates)" },
     { "motion-blur-parity", "VEDITOR_MOTION_BLUR_PARITY_SELFTEST", runMotionBlurParitySelftest, true,
       "Export SSOT motion blur OFF-path parity + premultiplied temporal averaging helper (3 gates)" },
     { "effect-keyframe-parity", "VEDITOR_EFFECT_KEYFRAME_PARITY_SELFTEST", runEffectKeyframeParitySelftest, true,

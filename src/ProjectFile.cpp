@@ -1323,6 +1323,8 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
     obj["opacity"] = clip.opacity;
     obj["is3DLayer"] = clip.is3DLayer;
     obj["layer3D"] = clip.layer3D.toJson();
+    if (clip.motionBlurEnabled)
+        obj["motionBlurEnabled"] = true;
     if (clip.fitContain)
         obj["fitContain"] = true;
     if (clip.fitCover)
@@ -1392,6 +1394,7 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
     clip.layer3D = obj.contains("layer3D")
         ? Layer3DTransform::fromJson(obj["layer3D"].toObject())
         : Layer3DTransform{};
+    clip.motionBlurEnabled = obj["motionBlurEnabled"].toBool(false);
     clip.fitContain = obj["fitContain"].toBool(false);
     clip.fitCover = obj["fitCover"].toBool(false);
     if (!clip.is3DLayer)

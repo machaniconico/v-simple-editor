@@ -6,6 +6,8 @@
 #include <QtGlobal>
 #include <QVector>
 
+#include "../Timeline.h"
+
 namespace motionblur {
 
 inline bool enabledFromEnv()
@@ -27,6 +29,27 @@ inline int sampleCountFromEnv()
     const int value =
         QString::fromLatin1(qgetenv("VEDITOR_MOTION_BLUR_SAMPLES")).toInt(&ok);
     return qMax(1, ok ? value : 8);
+}
+
+inline bool activeForTimeline(const Timeline *timeline, bool envFlag)
+{
+    if (envFlag)
+        return true;
+    if (!timeline)
+        return false;
+
+    // T5/P2 semantic gate: the existing renderer can only accumulate whole
+    // timeline samples. A per-clip opt-in therefore acts as a second activation
+    // trigger for the current pass; true selective per-layer blur is left to P3.
+    for (const TimelineTrack *track : timeline->videoTracks()) {
+        if (!track)
+            continue;
+        for (const ClipInfo &clip : track->clips()) {
+            if (clip.motionBlurEnabled)
+                return true;
+        }
+    }
+    return false;
 }
 
 inline QImage averagePremultiplied(const QVector<QImage>& samples)
