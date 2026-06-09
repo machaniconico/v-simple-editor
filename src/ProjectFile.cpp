@@ -311,6 +311,12 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
             matteArr.append(trackMatteClipEntryToJson(entry));
         root["trackMatteClipEntries"] = matteArr;
     }
+    if (!data.clipParentEntries.isEmpty()) {
+        QJsonArray parentArr;
+        for (const auto &entry : data.clipParentEntries)
+            parentArr.append(clipParentEntryToJson(entry));
+        root["clipParentEntries"] = parentArr;
+    }
     root["vfxState"] = vfxStateToJson(data.vfxState);
 
     // US-3D-11: motion-graphics sprint persistence
@@ -581,6 +587,11 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
     if (root.contains("trackMatteClipEntries")) {
         for (const auto &v : root["trackMatteClipEntries"].toArray())
             data.trackMatteClipEntries.append(trackMatteClipEntryFromJson(v.toObject()));
+    }
+    data.clipParentEntries.clear();
+    if (root.contains("clipParentEntries")) {
+        for (const auto &v : root["clipParentEntries"].toArray())
+            data.clipParentEntries.append(clipParentEntryFromJson(v.toObject()));
     }
     data.vfxState = root.contains("vfxState")
         ? vfxStateFromJson(root["vfxState"].toObject())
@@ -865,6 +876,12 @@ QString ProjectFile::toJsonString(const ProjectData &data)
             matteArr.append(trackMatteClipEntryToJson(entry));
         root["trackMatteClipEntries"] = matteArr;
     }
+    if (!data.clipParentEntries.isEmpty()) {
+        QJsonArray parentArr;
+        for (const auto &entry : data.clipParentEntries)
+            parentArr.append(clipParentEntryToJson(entry));
+        root["clipParentEntries"] = parentArr;
+    }
     root["vfxState"] = vfxStateToJson(data.vfxState);
 
     // US-3D-11: motion-graphics sprint persistence
@@ -1125,6 +1142,11 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
     if (root.contains("trackMatteClipEntries")) {
         for (const auto &v : root["trackMatteClipEntries"].toArray())
             data.trackMatteClipEntries.append(trackMatteClipEntryFromJson(v.toObject()));
+    }
+    data.clipParentEntries.clear();
+    if (root.contains("clipParentEntries")) {
+        for (const auto &v : root["clipParentEntries"].toArray())
+            data.clipParentEntries.append(clipParentEntryFromJson(v.toObject()));
     }
     data.vfxState = root.contains("vfxState")
         ? vfxStateFromJson(root["vfxState"].toObject())
@@ -1963,6 +1985,22 @@ TrackMatteClipEntry ProjectFile::trackMatteClipEntryFromJson(const QJsonObject &
     entry.clipId = obj["clipId"].toString();
     entry.matteType = static_cast<TrackMatteType>(obj["matteType"].toInt(static_cast<int>(TrackMatteType::None)));
     entry.matteSourceClipId = obj["matteSourceClipId"].toString();
+    return entry;
+}
+
+QJsonObject ProjectFile::clipParentEntryToJson(const ClipParentEntry &entry)
+{
+    QJsonObject obj;
+    obj["clipId"] = entry.clipId;
+    obj["parentClipId"] = entry.parentClipId;
+    return obj;
+}
+
+ClipParentEntry ProjectFile::clipParentEntryFromJson(const QJsonObject &obj)
+{
+    ClipParentEntry entry;
+    entry.clipId = obj["clipId"].toString();
+    entry.parentClipId = obj["parentClipId"].toString();
     return entry;
 }
 

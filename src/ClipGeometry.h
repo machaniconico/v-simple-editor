@@ -2,6 +2,7 @@
 
 #include <QImage>
 #include <QSize>
+#include <QString>
 #include <QTransform>
 
 namespace clipgeom {
@@ -41,6 +42,13 @@ struct ClipTransform {
 // into its placed position, anchored at the canvas center, applying
 // translate -> rotate -> scale in that exact order.
 QTransform resolveTransform(const ClipTransform& t, QSize canvasSize);
+
+ClipTransform composeParented(const ClipTransform& child,
+                              const ClipTransform& parent,
+                              QSize canvasSize);
+
+QString nullObjectFilePath();
+bool isNullObjectFilePath(const QString& filePath);
 
 // Returns a QImage(canvasSize, Format_ARGB32_Premultiplied) filled
 // Qt::transparent with `src` drawn through resolveTransform(). `src` may be

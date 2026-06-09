@@ -37,6 +37,7 @@ int runBroadcastCaptionSelftest();
 int runCaptionSelftest();
 int runChromaSelftest();
 int runClipColorSelftest();
+int runClipParentParitySelftest();
 int runClipIdtSelftest();
 int runClipOdtSelftest();
 int runCloudRenderSelftest();
@@ -243,6 +244,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "AscCdlExport: ASC CDL v1.01 .cc/.ccc/.cdl XML + LGG->SOP mapping + 6-decimal format + guards (13 gates)" },
     { "clip-color",       "VEDITOR_CLIP_COLOR_SELFTEST",         runClipColorSelftest,          false,
       "ClipColor: per-clip 色メタデータ模型 — defaultSdr / JSON round-trip / token 逆写像 / describe / codec transfer mapping (14 gates)" },
+    { "clip-parent-parity", "VEDITOR_CLIP_PARENT_PARITY_SELFTEST", runClipParentParitySelftest, true,
+      "Clip parenting: render parity, composeParented math, cycle/self/null guards" },
     { "clip-idt",         "VEDITOR_CLIP_IDT_SELFTEST",           runClipIdtSelftest,            false,
       "Clip IDT: per-clip RGBA64 premul input color transform into common 16bit blend space (13 gates)" },
     { "clip-odt",         "VEDITOR_CLIP_ODT_SELFTEST",           runClipOdtSelftest,            false,

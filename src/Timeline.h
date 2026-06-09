@@ -100,6 +100,7 @@ struct ClipInfo {
     // V1-wins behaviour). <1.0 values are placeholders until the layered
     // compositor lands in a follow-up iteration.
     double opacity = 1.0;
+    bool visible = true;
 
     // SNS vertical fit: when true and the project output aspect differs from
     // this clip's native frame, export/previews may pre-contain the frame into
@@ -647,6 +648,13 @@ public:
     // (applyProjectConfig / プロジェクト読込)に呼ぶ。
     void setProjectOutputConfig(int width, int height, bool explicitOutput);
 
+    void setClipParentEntries(const QHash<QString, QString> &entries);
+    void setClipParent(const QString& childKey, const QString& parentKey);
+    void clearClipParent(const QString& childKey);
+    QHash<QString,QString> clipParentEntries() const {
+        return m_clipParentEntries;
+    }
+
     // Multi-clip playback: flatten all video tracks into a sorted, gap-aware
     // schedule with topmost-track-wins resolution (Premiere V1/V2 semantics).
     QVector<PlaybackEntry> computePlaybackSequence() const;
@@ -713,6 +721,8 @@ signals:
     void transitionDialogRequested();
     void videoEffectsDialogRequested();
     void colorCorrectionRequested();
+    void clipParentDialogRequested();
+    void nullObjectRequested();
     // Emitted from applyTransitionToSelected when the requested duration
     // could not be honored against the available source handles. Carries
     // the asked vs effective duration in seconds so MainWindow can show
@@ -773,6 +783,7 @@ private:
     // TM-8: track-matte wiring carried by the Timeline (see
     // setTrackMatteEntries). Keyed by "trackIdx:clipIdx".
     QHash<QString, TimelineTrackMatteEntry> m_trackMatteEntries;
+    QHash<QString, QString> m_clipParentEntries;
     QScrollArea *m_scrollArea;
     QWidget *m_tracksWidget;
     QVBoxLayout *m_tracksLayout;

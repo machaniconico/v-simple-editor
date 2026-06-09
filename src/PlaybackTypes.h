@@ -64,6 +64,7 @@ struct PlaybackEntry {
     // ("trackIdx:clipIdx") of the matte SOURCE clip; empty == none.
     int matteTypeOrdinal = 0;
     QString matteSourceClipId;
+    QString parentClipId;
     // Edge-attached transitions (FadeIn/FadeOut/CrossDissolve/...). Copied
     // from ClipInfo::leadIn / trailOut so VideoPlayer can window the alpha
     // (and AudioMixer the gain) over the duration without reading Timeline.

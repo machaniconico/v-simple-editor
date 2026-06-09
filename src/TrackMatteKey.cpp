@@ -158,3 +158,27 @@ void remapTimelineCarrierAfterMutation(
     }
     carrier = rebuilt;
 }
+
+void remapClipParentEntriesAfterMutation(
+    Timeline *timeline,
+    QHash<QString, QString> &entries,
+    const TrackClipSnapshot &before)
+{
+    if (!timeline || entries.isEmpty())
+        return;
+    const QHash<QString, QString> oldToNew = buildOldToNewMap(timeline, before);
+    QHash<QString, QString> rebuilt;
+    rebuilt.reserve(entries.size());
+    for (auto it = entries.cbegin(); it != entries.cend(); ++it) {
+        const auto childIt = oldToNew.constFind(it.key());
+        if (childIt == oldToNew.cend())
+            continue;
+        const auto parentIt = oldToNew.constFind(it.value());
+        if (parentIt == oldToNew.cend())
+            continue;
+        if (childIt.value() == parentIt.value())
+            continue;
+        rebuilt.insert(childIt.value(), parentIt.value());
+    }
+    entries = rebuilt;
+}

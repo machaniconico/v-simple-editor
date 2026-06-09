@@ -1556,6 +1556,15 @@ Timeline *RenderQueue::resolveTimeline(const RenderJob &job,
         matteEntries.insert(canonicalKey(entry.clipId), e);
     }
     tl->setTrackMatteEntries(matteEntries);
+    QHash<QString, QString> parentEntries;
+    parentEntries.reserve(data.clipParentEntries.size());
+    for (const ClipParentEntry &entry : data.clipParentEntries) {
+        const QString child = canonicalKey(entry.clipId);
+        const QString parent = canonicalKey(entry.parentClipId);
+        if (!child.isEmpty() && !parent.isEmpty() && child != parent)
+            parentEntries.insert(child, parent);
+    }
+    tl->setClipParentEntries(parentEntries);
 
     if (ownedOut)
         *ownedOut = tl;

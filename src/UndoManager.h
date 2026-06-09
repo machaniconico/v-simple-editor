@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QObject>
+#include <QHash>
 #include <QVector>
 #include <QStack>
 #include <QStringList>
@@ -30,6 +31,7 @@ struct TimelineState {
     int selectedAudioClipIndex = -1;
     double playheadPos = 0.0;
     QVector<double> audioTrackGains;
+    QHash<QString, QString> clipParentEntries;
     // スナップショット時のプロジェクト出力ジオメトリ。SNS プリセット(プロジェクトを
     // 9:16 にリサイズする)適用後の Ctrl+Z が、クリップの fit だけでなく**元の
     // プロジェクトサイズも**復元できるよう捕捉する。これが無いと undo は fit を戻すが

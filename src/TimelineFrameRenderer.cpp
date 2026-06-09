@@ -35,6 +35,7 @@
 #include <QPainter>
 #include <QRectF>
 #include <QVector>
+#include <functional>
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -621,6 +622,22 @@ QHash<QString, TimelineTrackMatteEntry> trackMatteClipEntriesForTimeline(const T
     return timeline->trackMatteEntries();
 }
 
+QHash<QString, QString> clipParentEntriesForTimeline(const Timeline *timeline)
+{
+    if (!timeline)
+        return {};
+    return timeline->clipParentEntries();
+}
+
+bool sameTransform(const clipgeom::ClipTransform &a,
+                   const clipgeom::ClipTransform &b)
+{
+    return a.videoScale == b.videoScale
+        && a.videoDx == b.videoDx
+        && a.videoDy == b.videoDy
+        && a.rotationDeg == b.rotationDeg;
+}
+
 // G3: per-layer placement now delegates to the canonical clipgeom SSOT
 // (src/ClipGeometry.h). videoDx/videoDy stay NORMALIZED fractions of the
 // canvas, the anchor stays the canvas centre, and — unlike the prior inline
@@ -677,6 +694,9 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
     int v1Idx = -1;
     double v1Start = 0.0;
     QImage base;
+    QImage v1LayerSource;
+    clipgeom::ClipTransform v1Transform;
+    bool v1NullObject = false;
     if (v1Hidden) {
         base = QImage(outSize, QImage::Format_RGBA8888);
         base.fill(Qt::transparent);
@@ -699,13 +719,19 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
         const double v1LocalSec = targetSec - v1Start;            // >= 0
         const double v1SourceSec = v1Clip.inPoint + v1LocalSec * v1Clip.speed;
         const bool v1HasKeyframes = v1Clip.keyframes.hasAnyKeyframes();
-        const clipgeom::ClipTransform v1Transform = v1HasKeyframes
+        v1Transform = v1HasKeyframes
             ? clipanim::effectiveTransformAt(v1Clip, v1LocalSec)
             : clipgeom::ClipTransform{v1Clip.videoScale, v1Clip.videoDx,
                                       v1Clip.videoDy, v1Clip.rotation2DDegrees};
         v1EffectiveOpacity = v1HasKeyframes
             ? clipanim::effectiveOpacityAt(v1Clip, v1LocalSec, v1Clip.opacity)
             : v1Clip.opacity;
+        v1NullObject = clipgeom::isNullObjectFilePath(v1Clip.filePath);
+        if (v1NullObject) {
+            v1EffectiveOpacity = 0.0;
+            base = QImage(outSize, QImage::Format_RGBA8888);
+            base.fill(Qt::transparent);
+        } else {
 
         const QImage v1NativeRaw = decodeClipFrameNative(v1Clip.filePath, v1SourceSec);
         if (v1NativeRaw.isNull())
@@ -738,6 +764,7 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
             snsfit::shouldFit(v1Clip.fitContain, v1Clip.fitCover, outSize, v1Native.size());
         const QImage v1Contained =
             snsfit::maybeFit(v1Native, v1Clip.fitContain, v1Clip.fitCover, outSize);
+        v1LayerSource = v1Contained;
 
         // Base canvas placement — V1 clip transform applied via clipgeom SSOT.
         // Fast path (byte-identical to S2, MSE=0 preserved): when the V1 clip
@@ -760,6 +787,7 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
                   v1Contained,
                   v1Transform,
                   outSize, /*smooth=*/true);
+        }
     }
     const ClipInfo &v1Clip = *v1ClipPtr;
 
@@ -768,9 +796,13 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
         CompositeLayer layer;
         QString clipId;
         QImage image;      // already transformed to outSize
+        QImage sourceRgb;  // canvas/fitted source before placement
+        clipgeom::ClipTransform transform;
+        bool nullObject = false;
         clipcolor::ColorMeta colorMeta;
     };
     struct OverlayLayer {
+        QString clipId;
         QImage rgb;        // already scaled to outSize (the shared canvas grid)
         double opacity = 1.0;
         double videoScale = 1.0;
@@ -785,9 +817,12 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
         RenderLayer baseLayer;
         baseLayer.clipId = renderClipId(0, v1Idx);
         baseLayer.image = base;
+        baseLayer.sourceRgb = v1LayerSource;
+        baseLayer.transform = v1Transform;
+        baseLayer.nullObject = v1NullObject;
         baseLayer.colorMeta = v1Clip.colorMeta;
         baseLayer.layer.name = v1Clip.displayName;
-        baseLayer.layer.visible = v1EffectiveOpacity > 0.001;
+        baseLayer.layer.visible = !v1NullObject && v1EffectiveOpacity > 0.001;
         baseLayer.layer.opacity = qBound(0.0, v1EffectiveOpacity, 1.0);
         baseLayer.layer.blendMode = BlendMode::Normal;
         baseLayer.layer.zOrder = 0;
@@ -820,6 +855,25 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
         const double cOpacity = cHasKeyframes
             ? clipanim::effectiveOpacityAt(c, localSec, c.opacity)
             : c.opacity;
+        const bool cNullObject = clipgeom::isNullObjectFilePath(c.filePath);
+        if (cNullObject) {
+            RenderLayer renderLayer;
+            renderLayer.clipId = renderClipId(t, idx);
+            renderLayer.colorMeta = c.colorMeta;
+            renderLayer.transform = cTransform;
+            renderLayer.nullObject = true;
+            renderLayer.layer.name = c.displayName;
+            renderLayer.layer.visible = false;
+            renderLayer.layer.opacity = 0.0;
+            renderLayer.layer.blendMode = BlendMode::Normal;
+            renderLayer.layer.zOrder = t;
+            renderLayer.layer.inPoint = start;
+            renderLayer.layer.outPoint = start + c.effectiveDuration();
+            renderLayer.image = QImage(outSize, QImage::Format_ARGB32_Premultiplied);
+            renderLayer.image.fill(Qt::transparent);
+            renderLayers.append(renderLayer);
+            continue;
+        }
         const QImage nativeRaw = decodeClipFrameNative(c.filePath, srcSec);
         if (nativeRaw.isNull())
             continue;
@@ -842,15 +896,18 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
         RenderLayer renderLayer;
         renderLayer.clipId = renderClipId(t, idx);
         renderLayer.colorMeta = c.colorMeta;
+        renderLayer.transform = cTransform;
         // Scale the overlay source to the shared canvas grid first; the
         // compositor's videoScale then sizes the dst rect relative to the
         // canvas exactly as composeMultiTrackFrame does for L.rgb.
         const QImage rgb = native.scaled(outSize, Qt::IgnoreAspectRatio,
                                          Qt::SmoothTransformation);
+        renderLayer.sourceRgb = rgb;
         // Straight ClipInfo -> layer copy, identical to the preview harvest
         // (src/VideoPlayer.cpp:4848-4850 finalizeOverlayFromDecoder and the
         // layer fill at VideoPlayer.cpp:3656/3734).
         OverlayLayer overlay;
+        overlay.clipId = renderLayer.clipId;
         overlay.rgb = rgb;
         overlay.opacity = cOpacity;
         overlay.videoScale = cTransform.videoScale;
@@ -875,6 +932,80 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
             rgb, cTransform.videoScale, cTransform.videoDx, cTransform.videoDy,
             cTransform.rotationDeg, outSize);
         renderLayers.append(renderLayer);
+    }
+
+    if (const QHash<QString, QString> parentEntries =
+            clipParentEntriesForTimeline(timeline);
+        !parentEntries.isEmpty()) {
+        QHash<QString, int> indexByClipId;
+        for (int i = 0; i < renderLayers.size(); ++i)
+            indexByClipId.insert(renderLayers[i].clipId, i);
+
+        QVector<clipgeom::ClipTransform> rawTransforms;
+        QVector<clipgeom::ClipTransform> effectiveTransforms(renderLayers.size());
+        QVector<char> resolved(renderLayers.size(), 0);
+        rawTransforms.reserve(renderLayers.size());
+        for (const RenderLayer &layer : renderLayers)
+            rawTransforms.append(layer.transform);
+
+        std::function<bool(int, int, QVector<int>&)> resolve =
+            [&](int idx, int depth, QVector<int> &stack) -> bool {
+                if (idx < 0 || idx >= renderLayers.size() || depth > 8)
+                    return false;
+                if (resolved[idx])
+                    return true;
+                if (stack.contains(idx))
+                    return false;
+
+                stack.append(idx);
+                clipgeom::ClipTransform effective = rawTransforms[idx];
+                const auto it = parentEntries.constFind(renderLayers[idx].clipId);
+                if (it != parentEntries.cend() && !it.value().isEmpty()) {
+                    const int parentIdx = indexByClipId.value(it.value(), -1);
+                    if (parentIdx <= 0 || parentIdx == idx) {
+                        stack.removeLast();
+                        return false;
+                    }
+                    if (!resolve(parentIdx, depth + 1, stack)) {
+                        stack.removeLast();
+                        return false;
+                    }
+                    effective = clipgeom::composeParented(
+                        rawTransforms[idx], effectiveTransforms[parentIdx], outSize);
+                }
+                effectiveTransforms[idx] = effective;
+                resolved[idx] = 1;
+                stack.removeLast();
+                return true;
+            };
+
+        QHash<QString, int> overlayIndexByClipId;
+        for (int i = 0; i < overlays.size(); ++i)
+            overlayIndexByClipId.insert(overlays[i].clipId, i);
+
+        for (int i = 0; i < renderLayers.size(); ++i) {
+            QVector<int> stack;
+            if (!resolve(i, 0, stack))
+                continue;
+            const clipgeom::ClipTransform effective = effectiveTransforms[i];
+            renderLayers[i].transform = effective;
+            if (const int overlayIdx = overlayIndexByClipId.value(renderLayers[i].clipId, -1);
+                overlayIdx >= 0) {
+                overlays[overlayIdx].videoScale = effective.videoScale;
+                overlays[overlayIdx].videoDx = effective.videoDx;
+                overlays[overlayIdx].videoDy = effective.videoDy;
+                overlays[overlayIdx].rotationDeg = effective.rotationDeg;
+            }
+            if (renderLayers[i].nullObject
+                || renderLayers[i].sourceRgb.isNull()
+                || sameTransform(rawTransforms[i], effective)) {
+                continue;
+            }
+            renderLayers[i].image = clipgeom::renderLayer(
+                renderLayers[i].sourceRgb, effective, outSize, /*smooth=*/true);
+            if (i == 0)
+                base = renderLayers[i].image;
+        }
     }
 
     // RM-3: bind the carrier snapshot to a LOCAL value (Timeline::

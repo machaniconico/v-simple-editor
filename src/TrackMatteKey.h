@@ -75,3 +75,8 @@ void remapTimelineCarrierAfterMutation(
     Timeline *timeline,
     QHash<QString, TimelineTrackMatteEntry> &carrier,
     const TrackClipSnapshot &before);
+
+void remapClipParentEntriesAfterMutation(
+    Timeline *timeline,
+    QHash<QString, QString> &entries,
+    const TrackClipSnapshot &before);

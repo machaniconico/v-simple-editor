@@ -449,10 +449,12 @@ public:
         double videoDy = 0.0;
         double rotation2DDegrees = 0.0;
         int sourceTrack = 0;
+        int sourceClipIndex = -1;
         int sequenceIdx = -1;
         bool fitContain = false;
         bool fitCover = false;
         bool isFresh = true;
+        bool isNullObject = false;
         // STAGE4B (live GPU track-matte): consumed by tryGpuComposeLayers when
         // VEDITOR_GPU_COMPOSITE is ON and GL is available (else matte-free).
         // matteType + matteSourceClipId are copied from the PlaybackEntry; the
@@ -464,6 +466,8 @@ public:
         TrackMatteType matteType = TrackMatteType::None;
         QString matteSourceClipId;
         int matteSourceIndex = -1;
+        QString parentClipId;
+        int parentSourceIndex = -1;
     };
 
 private:

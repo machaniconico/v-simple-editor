@@ -143,6 +143,11 @@ struct TrackMatteClipEntry {
     QString matteSourceClipId;
 };
 
+struct ClipParentEntry {
+    QString clipId;
+    QString parentClipId;
+};
+
 // US-3D-11: per-clip 3D extruded-text layer config. `config` is a
 // Text3DLayer::toJson() blob (Text3DLayer is a non-copyable QObject so we
 // stash the serialized form rather than the object).
@@ -260,6 +265,7 @@ struct ProjectData {
     QVector<RotoClipEntry> rotoClipEntries;
     QVector<TimeRemapClipEntry> timeRemapClipEntries;
     QVector<TrackMatteClipEntry> trackMatteClipEntries;
+    QVector<ClipParentEntry> clipParentEntries;
     ProjectVfxState vfxState;
 
     // US-3D-11: motion-graphics sprint persistence
@@ -391,6 +397,8 @@ private:
     static TimeRemapClipEntry timeRemapClipEntryFromJson(const QJsonObject &obj);
     static QJsonObject trackMatteClipEntryToJson(const TrackMatteClipEntry &entry);
     static TrackMatteClipEntry trackMatteClipEntryFromJson(const QJsonObject &obj);
+    static QJsonObject clipParentEntryToJson(const ClipParentEntry &entry);
+    static ClipParentEntry clipParentEntryFromJson(const QJsonObject &obj);
     static QJsonObject vfxStateToJson(const ProjectVfxState &state);
     static ProjectVfxState vfxStateFromJson(const QJsonObject &obj);
 

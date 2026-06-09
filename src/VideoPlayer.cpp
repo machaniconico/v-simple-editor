@@ -126,6 +126,125 @@ const ClipInfo *clipForPlaybackEntry(const Timeline *timeline, const PlaybackEnt
     return &clips[entry.sourceClipIndex];
 }
 
+bool isNullObjectPath(const QString &path)
+{
+    return clipgeom::isNullObjectFilePath(path);
+}
+
+bool isNullObjectEntry(const PlaybackEntry &entry)
+{
+    return isNullObjectPath(entry.filePath);
+}
+
+bool parentingEnabled()
+{
+    const QByteArray v = qgetenv("VEDITOR_PARENTING");
+    return v.isEmpty() || v != "0";
+}
+
+clipgeom::ClipTransform transformForLayer(const VideoPlayer::DecodedLayer &layer)
+{
+    return clipgeom::ClipTransform{layer.videoScale, layer.videoDx,
+                                   layer.videoDy, layer.rotation2DDegrees};
+}
+
+QString clipIdForLayer(const VideoPlayer::DecodedLayer &layer)
+{
+    if (layer.sourceTrack < 0 || layer.sourceClipIndex < 0)
+        return QString();
+    return trackMatteClipKey(layer.sourceTrack, layer.sourceClipIndex);
+}
+
+void resolveDecodedLayerParentSources(QVector<VideoPlayer::DecodedLayer> &layers)
+{
+    QVector<int> order;
+    order.reserve(layers.size());
+    for (int i = 0; i < layers.size(); ++i)
+        order.append(i);
+    std::stable_sort(order.begin(), order.end(),
+                     [&](int a, int b) {
+                         return layers.at(a).sourceTrack < layers.at(b).sourceTrack;
+                     });
+
+    QHash<QString, int> canonicalByClipId;
+    QVector<int> canonicalByActual(layers.size(), -1);
+    QVector<int> actualByCanonical(layers.size(), -1);
+    for (int ci = 0; ci < order.size(); ++ci) {
+        const int actual = order.at(ci);
+        canonicalByActual[actual] = ci;
+        actualByCanonical[ci] = actual;
+        const QString clipId = clipIdForLayer(layers[actual]);
+        if (!clipId.isEmpty())
+            canonicalByClipId.insert(clipId, ci);
+        layers[actual].parentSourceIndex = -1;
+    }
+
+    for (int actual = 0; actual < layers.size(); ++actual) {
+        if (layers[actual].parentClipId.isEmpty())
+            continue;
+        const int parentCanonical =
+            canonicalByClipId.value(layers[actual].parentClipId, -1);
+        const int childCanonical = canonicalByActual.value(actual, -1);
+        if (parentCanonical <= 0 || parentCanonical == childCanonical)
+            continue;
+        const int parentActual = actualByCanonical.value(parentCanonical, -1);
+        if (parentActual >= 0 && parentActual != actual)
+            layers[actual].parentSourceIndex = parentActual;
+    }
+}
+
+QVector<clipgeom::ClipTransform> effectiveLayerTransforms(
+    const QVector<VideoPlayer::DecodedLayer> &layers,
+    QSize canvas)
+{
+    QVector<clipgeom::ClipTransform> effective;
+    effective.reserve(layers.size());
+    for (const auto &layer : layers)
+        effective.append(transformForLayer(layer));
+
+    QVector<int> state(layers.size(), 0);
+    QVector<char> valid(layers.size(), 1);
+
+    std::function<bool(int, int)> resolve = [&](int idx, int depth) -> bool {
+        if (idx < 0 || idx >= layers.size())
+            return false;
+        if (state[idx] == 2)
+            return valid[idx] != 0;
+        if (state[idx] == 1 || depth >= 8) {
+            valid[idx] = 0;
+            effective[idx] = transformForLayer(layers[idx]);
+            state[idx] = 2;
+            return false;
+        }
+
+        state[idx] = 1;
+        const int parentIdx = layers[idx].parentSourceIndex;
+        if (parentIdx < 0 || parentIdx >= layers.size()
+            || parentIdx == idx || layers[parentIdx].sourceTrack <= 0) {
+            effective[idx] = transformForLayer(layers[idx]);
+            valid[idx] = 1;
+            state[idx] = 2;
+            return true;
+        }
+        if (!resolve(parentIdx, depth + 1)) {
+            effective[idx] = transformForLayer(layers[idx]);
+            valid[idx] = 0;
+            state[idx] = 2;
+            return false;
+        }
+
+        effective[idx] = clipgeom::composeParented(
+            transformForLayer(layers[idx]), effective[parentIdx], canvas);
+        valid[idx] = 1;
+        state[idx] = 2;
+        return true;
+    };
+
+    for (int i = 0; i < layers.size(); ++i)
+        resolve(i, 0);
+    return effective;
+}
+
 bool trackHasKeyframes(const KeyframeManager &keyframes, const QString &trackName)
 {
     if (!keyframes.hasTrack(trackName))
@@ -274,6 +393,22 @@ void applyLayerMotionOpacity(const Timeline *timeline,
     layer->videoDx = transform.videoDx;
     layer->videoDy = transform.videoDy;
     layer->rotation2DDegrees = transform.rotationDeg;
+}
+
+void populateLayerMetadata(const PlaybackEntry &entry, int seqIdx,
+                           VideoPlayer::DecodedLayer *layer)
+{
+    if (!layer)
+        return;
+    layer->sourceTrack = entry.sourceTrack;
+    layer->sourceClipIndex = entry.sourceClipIndex;
+    layer->sequenceIdx = seqIdx;
+    layer->fitContain = entry.fitContain;
+    layer->fitCover = entry.fitCover;
+    layer->matteType = static_cast<TrackMatteType>(entry.matteTypeOrdinal);
+    layer->matteSourceClipId = entry.matteSourceClipId;
+    layer->parentClipId = entry.parentClipId;
+    layer->isNullObject = isNullObjectEntry(entry);
 }
 
 // Phase 1e Win #9 — canvas proxy divisor for the multi-track compose path.
@@ -2324,9 +2459,8 @@ void VideoPlayer::displaySeekFrameConformed(const QImage &v1Image)
         layer.colorMeta = entry->colorMeta;
         applyLayerMotionOpacity(m_glPreview ? m_glPreview->timeline() : nullptr,
                                 *entry, m_timelinePositionUs, layer.opacity, &layer);
-        layer.sequenceIdx = m_activeEntry;
+        populateLayerMetadata(*entry, m_activeEntry, &layer);
     }
-    layer.sourceTrack = 0;
     layer.fitContain = fitContain;
     layer.fitCover = fitCover;
     layer.isFresh = true;
@@ -3725,10 +3859,7 @@ void VideoPlayer::refreshDisplayedFrame()
                 layer.colorMeta = e.colorMeta;
                 applyLayerMotionOpacity(m_glPreview ? m_glPreview->timeline() : nullptr,
                                         e, m_timelinePositionUs, e.opacity, &layer);
-                layer.sourceTrack = e.sourceTrack;
-                layer.sequenceIdx = m_activeEntry;
-                layer.fitContain = e.fitContain;
-                layer.fitCover = e.fitCover;
+                populateLayerMetadata(e, m_activeEntry, &layer);
                 {
                     double insetFw = 1.0, insetFh = 1.0;
                     if (layer.fitContain && !layer.fitCover) {
@@ -4303,6 +4434,17 @@ void VideoPlayer::handlePlaybackTick()
                 // is then always false so the old skip never fired then
                 // anyway — no perf regression from removing it here.)
                 const auto &e = m_sequence[idx];
+                if (isNullObjectEntry(e)) {
+                    DecodedLayer layer;
+                    layer.colorMeta = e.colorMeta;
+                    applyLayerMotionOpacity(m_glPreview ? m_glPreview->timeline() : nullptr,
+                                            e, m_timelinePositionUs, e.opacity, &layer);
+                    populateLayerMetadata(e, idx, &layer);
+                    layers.append(layer);
+                    if (e.sourceTrack > 0)
+                        overlayPresent = true;
+                    continue;
+                }
                 if (idx == m_activeEntry) {
                     if (m_lastV1RawFrame.isNull())
                         continue;
@@ -4312,19 +4454,7 @@ void VideoPlayer::handlePlaybackTick()
                     layer.colorMeta = e.colorMeta;
                     applyLayerMotionOpacity(m_glPreview ? m_glPreview->timeline() : nullptr,
                                             e, m_timelinePositionUs, e.opacity, &layer);
-                    layer.sourceTrack = e.sourceTrack;
-                    layer.sequenceIdx = idx;
-                    layer.fitContain = e.fitContain;
-                    layer.fitCover = e.fitCover;
-                    // STAGE4B: carry the live track-matte assignment from the
-                    // PlaybackEntry. matteTypeOrdinal MIRRORS TrackMatteType
-                    // ordinals (0=None..4=LumaInverted); matteSourceClipId is the
-                    // trackMatteClipKey of the matte SOURCE clip. Consumed ONLY by
-                    // tryGpuComposeLayers when VEDITOR_GPU_COMPOSITE is ON and the
-                    // GPU path is taken; matteSourceIndex stays -1 here (resolved
-                    // there against the final inputs vector).
-                    layer.matteType = static_cast<TrackMatteType>(e.matteTypeOrdinal);
-                    layer.matteSourceClipId = e.matteSourceClipId;
+                    populateLayerMetadata(e, idx, &layer);
                     layers.append(layer);
                     if (e.sourceTrack > 0)
                         overlayPresent = true;
@@ -4390,7 +4520,9 @@ void VideoPlayer::handlePlaybackTick()
                 // overlay scenes.
                 const auto &e = m_sequence[idx];
                 DecodedLayer layer;
-                if (idx == m_activeEntry) {
+                if (isNullObjectEntry(e)) {
+                    layer.isFresh = true;
+                } else if (idx == m_activeEntry) {
                     if (m_lastV1RawFrame.isNull())
                         continue;
                     layer.rgb = m_lastV1RawFrame;
@@ -4402,14 +4534,7 @@ void VideoPlayer::handlePlaybackTick()
                 layer.colorMeta = e.colorMeta;
                 applyLayerMotionOpacity(m_glPreview ? m_glPreview->timeline() : nullptr,
                                         e, m_timelinePositionUs, e.opacity, &layer);
-                layer.sourceTrack = e.sourceTrack;
-                layer.sequenceIdx = idx;
-                layer.fitContain = e.fitContain;
-                layer.fitCover = e.fitCover;
-                // STAGE4B: mirror the threaded active-layer path and
-                // finalizeOverlayFromDecoder so serial ticks carry matte data too.
-                layer.matteType = static_cast<TrackMatteType>(e.matteTypeOrdinal);
-                layer.matteSourceClipId = e.matteSourceClipId;
+                populateLayerMetadata(e, idx, &layer);
                 layers.append(layer);
                 if (e.sourceTrack > 0)
                     overlayPresent = true;
@@ -4430,6 +4555,8 @@ void VideoPlayer::handlePlaybackTick()
         // sub-assertion in main.cpp exercises the SAME comparator — a
         // re-inversion breaks the selftest.
         std::stable_sort(layers.begin(), layers.end(), clipstack::layerPaintOrderLess);
+        if (parentingEnabled())
+            resolveDecodedLayerParentSources(layers);
         for (DecodedLayer &L : layers) {
             {
                 double insetFw = 1.0, insetFh = 1.0;
@@ -4893,7 +5020,7 @@ VideoPlayer::TrackDecoder *VideoPlayer::acquireDecoderForClip(const PlaybackEntr
     // than V1 so m_sequence sorts V2 first; m_activeEntry tracks V2 even
     // while V1 overlaps) — goes through the pool so V1 can still paint
     // last in V1-wins ordering.
-    if (entry.filePath.isEmpty())
+    if (isNullObjectEntry(entry))
         return nullptr;
 
     const TrackKey key{entry.filePath, qRound64(entry.clipIn * 1000.0),
@@ -5309,14 +5436,19 @@ QImage VideoPlayer::composeMultiTrackFrame(const QImage &v1Frame,
     // absorbed by the PARITY S3 MSE tolerance; the geometry is exact.
     const bool kSmooth = false;
     const QSize canvas(composed.width(), composed.height());
-    for (const DecodedLayer &L : overlayLayers) {
-        if (L.rgb.isNull() || L.opacity <= 0.001)
+    const QVector<clipgeom::ClipTransform> effectiveTransforms =
+        parentingEnabled()
+            ? effectiveLayerTransforms(overlayLayers, canvas)
+            : QVector<clipgeom::ClipTransform>{};
+    for (int i = 0; i < overlayLayers.size(); ++i) {
+        const DecodedLayer &L = overlayLayers[i];
+        if (L.isNullObject || L.rgb.isNull() || L.opacity <= 0.001)
             continue;
+        const clipgeom::ClipTransform t = effectiveTransforms.isEmpty()
+            ? transformForLayer(L)
+            : effectiveTransforms.value(i, transformForLayer(L));
         const QImage placed = clipgeom::renderLayer(
-            L.rgb,
-            clipgeom::ClipTransform{L.videoScale, L.videoDx, L.videoDy,
-                                    L.rotation2DDegrees},
-            canvas, kSmooth);
+            L.rgb, t, canvas, kSmooth);
         p.setOpacity(qBound(0.0, L.opacity, 1.0));
         p.drawImage(0, 0, placed);
     }
@@ -5381,14 +5513,19 @@ void VideoPlayer::composeMultiTrackFrameInto(QImage &canvas,
     // MSE tolerance.
     const bool kSmooth = false;
     const QSize cs(canvas.width(), canvas.height());
-    for (const DecodedLayer &L : overlayLayers) {
-        if (L.rgb.isNull() || L.opacity <= 0.001)
+    const QVector<clipgeom::ClipTransform> effectiveTransforms =
+        parentingEnabled()
+            ? effectiveLayerTransforms(overlayLayers, cs)
+            : QVector<clipgeom::ClipTransform>{};
+    for (int i = 0; i < overlayLayers.size(); ++i) {
+        const DecodedLayer &L = overlayLayers[i];
+        if (L.isNullObject || L.rgb.isNull() || L.opacity <= 0.001)
             continue;
+        const clipgeom::ClipTransform t = effectiveTransforms.isEmpty()
+            ? transformForLayer(L)
+            : effectiveTransforms.value(i, transformForLayer(L));
         const QImage placed = clipgeom::renderLayer(
-            L.rgb,
-            clipgeom::ClipTransform{L.videoScale, L.videoDx, L.videoDy,
-                                    L.rotation2DDegrees},
-            cs, kSmooth);
+            L.rgb, t, cs, kSmooth);
         p.setOpacity(qBound(0.0, L.opacity, 1.0));
         p.drawImage(0, 0, placed);
     }
@@ -5447,6 +5584,10 @@ QImage VideoPlayer::tryGpuComposeLayers(const QVector<DecodedLayer> &layers,
     const bool hasMatte = std::any_of(
         layers.cbegin(), layers.cend(),
         [](const DecodedLayer &L) { return L.matteType != TrackMatteType::None; });
+    const QVector<clipgeom::ClipTransform> effectiveTransforms =
+        parentingEnabled()
+            ? effectiveLayerTransforms(layers, canvas)
+            : QVector<clipgeom::ClipTransform>{};
 
     if (!m_gpuCompositor)
         m_gpuCompositor = std::make_unique<GpuLayerCompositor>();
@@ -5483,22 +5624,26 @@ QImage VideoPlayer::tryGpuComposeLayers(const QVector<DecodedLayer> &layers,
     QVector<GpuLayerInput> inputs;
     inputs.reserve(layers.size());
     for (int oi = 0; oi < order.size(); ++oi) {
-        const DecodedLayer &L = layers.at(order.at(oi));
+        const int layerIdx = order.at(oi);
+        const DecodedLayer &L = layers.at(layerIdx);
         // マット無し経路のみ事前スキップ (Stage3 とビット同一)。マット有り経路は
         // インデックス整合のため 1:1 構築し、スキップ判定は composite() 内部に委ねる。
-        if (!hasMatte && (L.rgb.isNull() || L.opacity <= 0.001))
+        if (!hasMatte && (L.isNullObject || L.rgb.isNull() || L.opacity <= 0.001))
             continue;  // CPU 経路と同じスキップ条件
+        const clipgeom::ClipTransform t = effectiveTransforms.isEmpty()
+            ? transformForLayer(L)
+            : effectiveTransforms.value(layerIdx, transformForLayer(L));
         GpuLayerInput in;
         in.image = L.rgb;
         in.colorMeta = L.colorMeta;
         in.desc.sourceTrack        = L.sourceTrack;
         in.desc.srcSize            = L.rgb.size();
         in.desc.opacity            = L.opacity;
-        in.desc.videoScale         = L.videoScale;
-        in.desc.videoDx            = L.videoDx;
-        in.desc.videoDy            = L.videoDy;
-        in.desc.rotation2DDegrees  = L.rotation2DDegrees;
-        in.desc.visible            = true;
+        in.desc.videoScale         = t.videoScale;
+        in.desc.videoDx            = t.videoDx;
+        in.desc.videoDy            = t.videoDy;
+        in.desc.rotation2DDegrees  = t.rotationDeg;
+        in.desc.visible            = !L.isNullObject;
         in.desc.matteSourceIndex   = -1;  // 既定 matte-free; マット有り経路で後段解決
         // TrackMatteType ordinal == gpucomposite::MatteType ordinal
         // (0=None,1=Alpha,2=AlphaInverted,3=Luma/Luminance,4=LumaInverted)。
@@ -5923,15 +6068,7 @@ bool VideoPlayer::finalizeOverlayFromDecoder(const PlaybackEntry &e, int seqIdx,
     out->colorMeta          = e.colorMeta;
     applyLayerMotionOpacity(m_glPreview ? m_glPreview->timeline() : nullptr,
                             e, m_timelinePositionUs, e.opacity, out);
-    out->sourceTrack        = e.sourceTrack;
-    out->sequenceIdx        = seqIdx;
-    out->fitContain         = e.fitContain;
-    out->fitCover           = e.fitCover;
-    // STAGE4B: carry the live track-matte assignment (see V1 build site). Ordinal
-    // mirrors TrackMatteType; matteSourceIndex resolved later in
-    // tryGpuComposeLayers against the final inputs vector.
-    out->matteType          = static_cast<TrackMatteType>(e.matteTypeOrdinal);
-    out->matteSourceClipId  = e.matteSourceClipId;
+    populateLayerMetadata(e, seqIdx, out);
     return true;
 }
 

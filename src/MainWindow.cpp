@@ -1415,6 +1415,10 @@ void MainWindow::setupUI()
             this, &MainWindow::videoEffects);
     connect(m_timeline, &Timeline::colorCorrectionRequested,
             this, &MainWindow::colorCorrection);
+    connect(m_timeline, &Timeline::clipParentDialogRequested,
+            this, &MainWindow::configureClipParent);
+    connect(m_timeline, &Timeline::nullObjectRequested,
+            this, &MainWindow::createNullObjectForSelection);
     connect(m_timeline, &Timeline::transitionShortened,
             this, [this](const QString &name, double askedSec, double effSec) {
                 statusBar()->showMessage(
@@ -4758,6 +4762,17 @@ void MainWindow::populateProjectData(ProjectData &data)
         data.trackMatteClipEntries.append(it.value());
     std::sort(data.trackMatteClipEntries.begin(), data.trackMatteClipEntries.end(),
               [](const TrackMatteClipEntry &a, const TrackMatteClipEntry &b) { return a.clipId < b.clipId; });
+    data.clipParentEntries.clear();
+    const QHash<QString, QString> parentEntries = m_timeline ? m_timeline->clipParentEntries()
+                                                             : QHash<QString, QString>{};
+    for (auto it = parentEntries.cbegin(); it != parentEntries.cend(); ++it) {
+        ClipParentEntry entry;
+        entry.clipId = it.key();
+        entry.parentClipId = it.value();
+        data.clipParentEntries.append(entry);
+    }
+    std::sort(data.clipParentEntries.begin(), data.clipParentEntries.end(),
+              [](const ClipParentEntry &a, const ClipParentEntry &b) { return a.clipId < b.clipId; });
 
     // US-3D-11: motion-graphics sprint sidecars
     data.text3DClipEntries.clear();
@@ -4939,6 +4954,15 @@ void MainWindow::applyLoadedProjectData(const ProjectData &data, const QString &
     // TM-8: push the freshly-loaded matte wiring onto the Timeline so the
     // SSOT renderer (preview AND export) sources it from the Timeline.
     syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+    QHash<QString, QString> parentEntries;
+    for (const auto &entry : data.clipParentEntries) {
+        if (!entry.clipId.isEmpty() && !entry.parentClipId.isEmpty()
+            && entry.clipId != entry.parentClipId) {
+            parentEntries.insert(entry.clipId, entry.parentClipId);
+        }
+    }
+    if (m_timeline)
+        m_timeline->setClipParentEntries(parentEntries);
     // US-3D-11: motion-graphics sprint sidecars
     m_text3DClipConfigs.clear();
     for (const auto &entry : data.text3DClipEntries) {
@@ -9089,6 +9113,139 @@ void MainWindow::configureTrackMatte()
     statusBar()->showMessage(QStringLiteral("%1 に %2 を設定しました")
                                  .arg(targetClip.displayName, trackMatteTypeLabel(matteType)),
                              4000);
+}
+
+void MainWindow::configureClipParent()
+{
+    if (!m_timeline) {
+        QMessageBox::information(this, QStringLiteral("ペアレント"),
+                                 QStringLiteral("タイムラインの初期化が完了していません。"));
+        return;
+    }
+
+    int targetTrackIdx = -1;
+    int targetClipIdx = -1;
+    ClipInfo targetClip;
+    if (!selectedVideoClipRef(targetTrackIdx, targetClipIdx, &targetClip)) {
+        QMessageBox::information(this, QStringLiteral("ペアレント"),
+                                 QStringLiteral("先にビデオクリップを選択してください。"));
+        return;
+    }
+
+    struct ClipOption {
+        QString id;
+        QString label;
+    };
+    QVector<ClipOption> candidates;
+    for (int trackIdx = 0; trackIdx < m_timeline->videoTracks().size(); ++trackIdx) {
+        const auto *track = m_timeline->videoTracks().value(trackIdx, nullptr);
+        if (!track)
+            continue;
+        const auto &clips = track->clips();
+        for (int clipIdx = 0; clipIdx < clips.size(); ++clipIdx) {
+            if (trackIdx == targetTrackIdx && clipIdx == targetClipIdx)
+                continue;
+            const QString clipId = brushClipId(trackIdx, clipIdx);
+            const QString name = clips[clipIdx].displayName.isEmpty()
+                ? QStringLiteral("(無題)")
+                : clips[clipIdx].displayName;
+            candidates.append({clipId,
+                               QStringLiteral("V%1 #%2 - %3")
+                                   .arg(trackIdx + 1)
+                                   .arg(clipIdx + 1)
+                                   .arg(name)});
+        }
+    }
+
+    QDialog dialog(this);
+    dialog.setWindowTitle(QStringLiteral("ペアレント設定"));
+    auto *layout = new QFormLayout(&dialog);
+    auto *parentCombo = new QComboBox(&dialog);
+    parentCombo->addItem(QStringLiteral("なし"), QString{});
+    for (const auto &candidate : candidates)
+        parentCombo->addItem(candidate.label, candidate.id);
+
+    const QString targetClipId = brushClipId(targetTrackIdx, targetClipIdx);
+    const QHash<QString, QString> parentEntries = m_timeline->clipParentEntries();
+    const int existingIndex = parentCombo->findData(parentEntries.value(targetClipId));
+    if (existingIndex >= 0)
+        parentCombo->setCurrentIndex(existingIndex);
+
+    layout->addRow(QStringLiteral("親クリップ:"), parentCombo);
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    layout->addRow(buttons);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+
+    if (dialog.exec() != QDialog::Accepted)
+        return;
+
+    const QString parentId = parentCombo->currentData().toString();
+    m_timeline->setClipParent(targetClipId, parentId);
+    if (m_timeline->undoManager())
+        m_timeline->undoManager()->saveState(m_timeline->currentState(),
+                                             parentId.isEmpty()
+                                                 ? QStringLiteral("Clear clip parent")
+                                                 : QStringLiteral("Set clip parent"));
+    m_timeline->refreshPlaybackSequence();
+    refreshSpecialClipPreview();
+    statusBar()->showMessage(parentId.isEmpty()
+                                 ? QStringLiteral("ペアレントを解除しました")
+                                 : QStringLiteral("ペアレントを設定しました"),
+                             3000);
+}
+
+void MainWindow::createNullObjectForSelection()
+{
+    if (!m_timeline) {
+        QMessageBox::information(this, QStringLiteral("ヌルオブジェクト"),
+                                 QStringLiteral("タイムラインの初期化が完了していません。"));
+        return;
+    }
+
+    int targetTrackIdx = -1;
+    int targetClipIdx = -1;
+    ClipInfo targetClip;
+    if (!selectedVideoClipRef(targetTrackIdx, targetClipIdx, &targetClip)) {
+        QMessageBox::information(this, QStringLiteral("ヌルオブジェクト"),
+                                 QStringLiteral("先にビデオクリップを選択してください。"));
+        return;
+    }
+
+    const double targetStart = clipTimelineStartSeconds(targetTrackIdx, targetClipIdx);
+    const double duration = qMax(0.1, targetClip.effectiveDuration());
+
+    ClipInfo nullClip;
+    nullClip.filePath = clipgeom::nullObjectFilePath();
+    nullClip.displayName = QStringLiteral("Null Object");
+    nullClip.duration = duration;
+    nullClip.inPoint = 0.0;
+    nullClip.outPoint = duration;
+    nullClip.leadInSec = qMax(0.0, targetStart);
+    nullClip.opacity = 0.0;
+    nullClip.visible = false;
+    nullClip.videoScale = 1.0;
+    nullClip.videoDx = 0.0;
+    nullClip.videoDy = 0.0;
+    nullClip.rotation2DDegrees = 0.0;
+
+    m_timeline->addVideoTrack();
+    const int nullTrackIdx = m_timeline->videoTracks().size() - 1;
+    TimelineTrack *nullTrack = m_timeline->videoTracks().value(nullTrackIdx, nullptr);
+    if (!nullTrack)
+        return;
+    nullTrack->addClip(nullClip);
+    nullTrack->setSelectedClip(-1);
+
+    const QString childId = brushClipId(targetTrackIdx, targetClipIdx);
+    const QString parentId = brushClipId(nullTrackIdx, 0);
+    m_timeline->setClipParent(childId, parentId);
+    if (m_timeline->undoManager())
+        m_timeline->undoManager()->saveState(m_timeline->currentState(),
+                                             QStringLiteral("Create null object"));
+    m_timeline->refreshPlaybackSequence();
+    refreshSpecialClipPreview();
+    statusBar()->showMessage(QStringLiteral("ヌルオブジェクトを作成し、ペアレントに設定しました"), 4000);
 }
 
 // ──────────────────────────────────────────────────────────────────────────
