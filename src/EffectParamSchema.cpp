@@ -55,6 +55,31 @@ QVector<ParamDef> paramSchemaFor(VideoEffectType type)
             { "mode", "Mode", ParamType::Int, 0.0, 1.0, 0.0 }
         };
 
+    case VideoEffectType::Glow:
+        return {
+            { "threshold", "Threshold", ParamType::Int, 0.0, 255.0, 128.0 },
+            { "radius", "Radius", ParamType::Float, 0.0, 50.0, 10.0 },
+            { "intensity", "Intensity", ParamType::Float, 0.0, 3.0, 1.0 }
+        };
+
+    case VideoEffectType::FindEdges:
+        return { { "intensity", "Intensity", ParamType::Float, 0.0, 2.0, 1.0 } };
+
+    case VideoEffectType::Emboss:
+        return {
+            { "angle", "Angle", ParamType::Float, 0.0, 360.0, 45.0 },
+            { "amount", "Amount", ParamType::Float, 0.0, 5.0, 2.0 }
+        };
+
+    case VideoEffectType::Posterize:
+        return { { "levels", "Levels", ParamType::Int, 2.0, 32.0, 4.0 } };
+
+    case VideoEffectType::Threshold:
+        return { { "level", "Level", ParamType::Int, 0.0, 255.0, 128.0 } };
+
+    case VideoEffectType::Solarize:
+        return { { "threshold", "Threshold", ParamType::Int, 0.0, 255.0, 128.0 } };
+
     case VideoEffectType::None:
     default:
         return {};

@@ -54,7 +54,13 @@ enum class VideoEffectType {
     FractalNoiseGen,
     GaussianBlur,
     DirectionalBlur,
-    RadialBlur
+    RadialBlur,
+    Glow,
+    FindEdges,
+    Emboss,
+    Posterize,
+    Threshold,
+    Solarize
 };
 
 struct VideoEffect {
@@ -74,6 +80,12 @@ struct VideoEffect {
     //   GaussianBlur: p1=radius/sigma
     //   DirectionalBlur: p1=angleDegrees, p2=lengthPx
     //   RadialBlur: p1=amount, p2=mode(0=spin,1=zoom)
+    //   Glow: p1=threshold, p2=radius, p3=intensity
+    //   FindEdges: p1=intensity
+    //   Emboss: p1=angleDegrees, p2=amount
+    //   Posterize: p1=levels
+    //   Threshold: p1=level
+    //   Solarize: p1=threshold
     double param1 = 0.0;
     double param2 = 0.0;
     double param3 = 0.0;
@@ -99,6 +111,12 @@ struct VideoEffect {
     static VideoEffect createGaussianBlur(double radius = 5.0);
     static VideoEffect createDirectionalBlur(double angleDegrees = 0.0, double lengthPx = 20.0);
     static VideoEffect createRadialBlur(double amount = 10.0, int mode = 0);
+    static VideoEffect createGlow(double threshold = 128.0, double radius = 10.0, double intensity = 1.0);
+    static VideoEffect createFindEdges(double intensity = 1.0);
+    static VideoEffect createEmboss(double angleDegrees = 45.0, double amount = 2.0);
+    static VideoEffect createPosterize(double levels = 4.0);
+    static VideoEffect createThreshold(double level = 128.0);
+    static VideoEffect createSolarize(double threshold = 128.0);
 };
 
 // --- Processor ---
@@ -135,4 +153,10 @@ private:
     static QImage applyGaussianBlur(const QImage &img, double radius);
     static QImage applyDirectionalBlur(const QImage &img, double angleDegrees, double lengthPx);
     static QImage applyRadialBlur(const QImage &img, double amount, int mode);
+    static QImage applyGlow(const QImage &img, double threshold, double radius, double intensity);
+    static QImage applyFindEdges(const QImage &img, double intensity);
+    static QImage applyEmboss(const QImage &img, double angleDegrees, double amount);
+    static QImage applyPosterize(const QImage &img, double levels);
+    static QImage applyThreshold(const QImage &img, double level);
+    static QImage applySolarize(const QImage &img, double threshold);
 };
