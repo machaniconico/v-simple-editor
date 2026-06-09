@@ -69,7 +69,12 @@ enum class VideoEffectType {
     RGBSplit,
     WaveWarp,
     Ripple,
-    GlitchVHS
+    GlitchVHS,
+    GradientRamp,
+    Fill,
+    Bloom,
+    Scanlines,
+    Halftone
 };
 
 struct VideoEffect {
@@ -104,10 +109,15 @@ struct VideoEffect {
     //   WaveWarp: p1=amplitude(0..100), p2=wavelength(1..500), p3=phase(0..360)
     //   Ripple: p1=amplitude(0..100), p2=wavelength(1..500), p3=phase(0..360)
     //   GlitchVHS: p1=intensity(0..1), p2=blockHeight(4..64), p3=seed(0..1000)
+    //   GradientRamp: p1=type(0=linear,1=radial), p2=angleDegrees, p3=opacity(0..1), keyColor=start color
+    //   Fill: p1=opacity(0..1), keyColor=fill color
+    //   Bloom: p1=threshold, p2=radius, p3=intensity
+    //   Scanlines: p1=lineSpacing(2..20), p2=darkness(0..1), p3=opacity(0..1)
+    //   Halftone: p1=dotSize(2..30), p2=angleDegrees
     double param1 = 0.0;
     double param2 = 0.0;
     double param3 = 0.0;
-    QColor keyColor = QColor(0, 255, 0); // ChromaKey / Tint
+    QColor keyColor = QColor(0, 255, 0); // ChromaKey / Tint / GradientRamp / Fill
     double startSec = -1.0; // clip-local seconds; -1 == no start limit
     double endSec = -1.0;   // clip-local seconds; -1 == no end limit
 
@@ -144,6 +154,11 @@ struct VideoEffect {
     static VideoEffect createWaveWarp(double amplitude = 12.0, double wavelength = 80.0, double phaseDegrees = 0.0);
     static VideoEffect createRipple(double amplitude = 12.0, double wavelength = 80.0, double phaseDegrees = 0.0);
     static VideoEffect createGlitchVHS(double intensity = 0.5, double blockHeight = 12.0, double seed = 1.0);
+    static VideoEffect createGradientRamp(int type = 0, double angleDegrees = 0.0, double opacity = 1.0, QColor startColor = QColor(255, 255, 255));
+    static VideoEffect createFill(QColor fillColor = QColor(255, 255, 255), double opacity = 1.0);
+    static VideoEffect createBloom(double threshold = 128.0, double radius = 20.0, double intensity = 1.0);
+    static VideoEffect createScanlines(double lineSpacing = 4.0, double darkness = 0.5, double opacity = 1.0);
+    static VideoEffect createHalftone(double dotSize = 8.0, double angleDegrees = 45.0);
 };
 
 // --- Processor ---
@@ -195,4 +210,9 @@ private:
     static QImage applyWaveWarp(const QImage &img, double amplitude, double wavelength, double phaseDegrees);
     static QImage applyRipple(const QImage &img, double amplitude, double wavelength, double phaseDegrees);
     static QImage applyGlitchVHS(const QImage &img, double intensity, double blockHeight, double seed);
+    static QImage applyGradientRamp(const QImage &img, int type, double angleDegrees, double opacity, QColor startColor);
+    static QImage applyFill(const QImage &img, QColor fillColor, double opacity);
+    static QImage applyBloom(const QImage &img, double threshold, double radius, double intensity);
+    static QImage applyScanlines(const QImage &img, double lineSpacing, double darkness, double opacity);
+    static QImage applyHalftone(const QImage &img, double dotSize, double angleDegrees);
 };

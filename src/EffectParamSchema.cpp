@@ -137,6 +137,40 @@ QVector<ParamDef> paramSchemaFor(VideoEffectType type)
             { "seed", "Seed", ParamType::Int, 0.0, 1000.0, 1.0 }
         };
 
+    case VideoEffectType::GradientRamp:
+        return {
+            { "type", "タイプ", ParamType::Int, 0.0, 1.0, 0.0 },
+            { "angle", "角度", ParamType::Float, 0.0, 360.0, 0.0 },
+            { "opacity", "不透明度", ParamType::Float, 0.0, 1.0, 1.0 },
+            { "keyColor", "Key Color", ParamType::Color, 0.0, 0.0, 0.0 }
+        };
+
+    case VideoEffectType::Fill:
+        return {
+            { "opacity", "不透明度", ParamType::Float, 0.0, 1.0, 1.0 },
+            { "keyColor", "Key Color", ParamType::Color, 0.0, 0.0, 0.0 }
+        };
+
+    case VideoEffectType::Bloom:
+        return {
+            { "threshold", "しきい値", ParamType::Int, 0.0, 255.0, 128.0 },
+            { "radius", "半径", ParamType::Float, 0.0, 80.0, 20.0 },
+            { "intensity", "強度", ParamType::Float, 0.0, 2.0, 1.0 }
+        };
+
+    case VideoEffectType::Scanlines:
+        return {
+            { "lineSpacing", "間隔", ParamType::Int, 2.0, 20.0, 4.0 },
+            { "darkness", "暗さ", ParamType::Float, 0.0, 1.0, 0.5 },
+            { "opacity", "不透明度", ParamType::Float, 0.0, 1.0, 1.0 }
+        };
+
+    case VideoEffectType::Halftone:
+        return {
+            { "dotSize", "ドットサイズ", ParamType::Int, 2.0, 30.0, 8.0 },
+            { "angle", "角度", ParamType::Float, 0.0, 360.0, 45.0 }
+        };
+
     case VideoEffectType::None:
     default:
         return {};

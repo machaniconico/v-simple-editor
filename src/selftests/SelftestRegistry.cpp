@@ -22,6 +22,7 @@ int runAcesColorSelftest();
 int runAeFxBlurSelftest();
 int runAeFxColorSelftest();
 int runAeFxDistortSelftest();
+int runAeFxGenerateSelftest();
 int runAeFxStylizeSelftest();
 int runAffinitySelftest();
 int runAscCdlExportSelftest();
@@ -248,6 +249,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "AE-FX-3 Color Family: levels, tint, blackwhite, exposure, hue/saturation gates (G1-G6)" },
     { "ae-fx-distort",     "VEDITOR_AE_FX_DISTORT_SELFTEST",      runAeFxDistortSelftest,        false,
       "AE-FX-4 Distort & Glitch Family: RGB split, wave warp, ripple, VHS glitch gates (G1-G6)" },
+    { "ae-fx-generate",    "VEDITOR_AE_FX_GENERATE_SELFTEST",     runAeFxGenerateSelftest,       false,
+      "AE-FX-5 Generate Family: gradient ramp, fill, bloom, scanlines, halftone gates (G1-G6)" },
     { "ae-fx-stylize",     "VEDITOR_AE_FX_STYLIZE_SELFTEST",      runAeFxStylizeSelftest,        false,
       "AE-FX-2 Stylize Family: glow, edges, emboss, posterize, threshold, solarize gates (G1-G7)" },
     { "dolby-vision",      "VEDITOR_DOLBY_VISION_SELFTEST",       runDolbyVisionSelftest,        false,
