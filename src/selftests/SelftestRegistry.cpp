@@ -60,6 +60,7 @@ int runDvTimelineSelftest();
 int runEdlExportSelftest();
 int runE2eSelftest();
 int runEasingSelftest();
+int runEasingPresetsSelftest();
 int runExposureAidsSelftest();
 int runExportAuditSelftest();
 int runExportRangeSelftest();
@@ -236,6 +237,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Audio atempo enable resolver truth table: env force OR per-clip flag" },
     { "bezier-easing",     "VEDITOR_BEZIER_EASING_SELFTEST",      runBezierEasingSelftest,       false,
       "Per-keyframe cubic-bezier easing: legacy invariance, identity curve, ease-in, JSON round-trip (4 gates)" },
+    { "easing-presets",    "VEDITOR_EASING_PRESETS_SELFTEST",     runEasingPresetsSelftest,      false,
+      "Elastic/Bounce/Back keyframe easing presets: math, overshoot, legacy invariance, JSON round-trip (6 gates)" },
     { "motion-preset",     "VEDITOR_MOTION_PRESET_SELFTEST",       runMotionPresetSelftest,       false,
       "Motion preset library: built-in ids, generated motion keyframes, deterministic replacement (6 gates)" },
     { "spectral-edit",     "VEDITOR_SPECTRAL_EDIT_SELFTEST",      runSpectralEditSelftest,       false,

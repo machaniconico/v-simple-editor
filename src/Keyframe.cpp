@@ -138,6 +138,12 @@ double KeyframeTrack::interpolate(double from, double to, double t,
         const double easedT = easing::evaluate(easing::EasingType::CubicBezier, t, bez);
         return from + (to - from) * easedT;
     }
+    case KeyframePoint::ElasticOut:
+        return from + (to - from) * easing::elasticOut(t);
+    case KeyframePoint::BounceOut:
+        return from + (to - from) * easing::bounceOut(t);
+    case KeyframePoint::BackOut:
+        return from + (to - from) * easing::backOut(t);
     }
     return from + (to - from) * t;
 }

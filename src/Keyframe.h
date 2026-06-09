@@ -10,7 +10,7 @@ struct KeyframePoint {
     double time = 0.0;   // seconds
     double value = 0.0;
 
-    enum Interpolation { Linear, EaseIn, EaseOut, EaseInOut, Hold, Bezier };
+    enum Interpolation { Linear, EaseIn, EaseOut, EaseInOut, Hold, Bezier, ElasticOut, BounceOut, BackOut };
     Interpolation interpolation = Linear;
     double bezX1 = 0.0;
     double bezY1 = 0.0;
