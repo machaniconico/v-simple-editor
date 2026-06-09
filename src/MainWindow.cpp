@@ -4538,6 +4538,9 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
     const QSize canvasSize = (m_projectConfig.width > 0 && m_projectConfig.height > 0)
         ? QSize(m_projectConfig.width, m_projectConfig.height)
         : QSize(1920, 1080);
+    const int text3DProxyThreshold = QSettings(QStringLiteral("VSimpleEditor"), QStringLiteral("Preferences"))
+        .value(QStringLiteral("preview/text3dProxyThreshold"), 1280)
+        .toInt();
 
     struct ActiveLayer {
         CompositeLayer layer;
@@ -4611,7 +4614,10 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
                 t3It != m_text3DClipConfigs.cend() && !t3It.value().isEmpty()) {
                 Text3DLayer text3D;
                 text3D.fromJson(t3It.value());
-                const QImage textImage = text3D.renderFrame(frame.size(), localSeconds, Camera3D{});
+                const Camera3D &textCamera = text3D.camera();
+                const QImage textImage = shouldUseText3DPreviewProxy(text3D, frame.size(), text3DProxyThreshold)
+                    ? renderText3DProxy(text3D, frame.size(), localSeconds, textCamera)
+                    : text3D.renderFrame(frame.size(), localSeconds, textCamera);
                 if (!textImage.isNull()) {
                     QImage base = frame.convertToFormat(QImage::Format_ARGB32);
                     QPainter painter(&base);

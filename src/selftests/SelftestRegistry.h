@@ -12,6 +12,7 @@
 int runAutoColorSelftest();
 int runLayerStyleSelftest();
 int runRgbParadeSelftest();
+int runText3dPreviewSelftest();
 int runWbEyedropperSelftest();
 
 namespace selftests {

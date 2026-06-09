@@ -126,6 +126,7 @@ int runSubtitleKaraokeSelftest();
 int runSubXlatSelftest();
 int runSwsColorSelftest();
 int runTextBasedEditSelftest();
+int runText3dPreviewSelftest();
 int runTextExportSelftest();
 int runThreePointEditSelftest();
 int runTrackMatteExportIntegrationSelftest();
@@ -280,6 +281,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "WorkspaceManager: named layout CRUD + base64 blob JSON round-trip" },
     { "text-based-edit",   "VEDITOR_TEXT_BASED_EDIT_SELFTEST",    runTextBasedEditSelftest,      false,
       "TextBasedEdit: transcript search + deletion range merge + kept complement" },
+    { "text3d-preview",    "VEDITOR_TEXT3D_PREVIEW_SELFTEST",     runText3dPreviewSelftest,      false,
+      "Text3D preview camera persistence and proxy policy gates" },
     { "transcript-highlighter-offline", "VEDITOR_TRANSCRIPT_HIGHLIGHTER_OFFLINE_SELFTEST", runTranscriptHighlighterOfflineSelftest, false,
       "TranscriptHighlighter offline deterministic scorer (headless, 8 gates)" },
     { "pptx-export",      "VEDITOR_PPTX_EXPORT_SELFTEST",        runPptxExportSelftest,         false,
