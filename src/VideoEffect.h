@@ -60,7 +60,12 @@ enum class VideoEffectType {
     Emboss,
     Posterize,
     Threshold,
-    Solarize
+    Solarize,
+    Levels,
+    Tint,
+    BlackWhite,
+    Exposure,
+    HueSaturation
 };
 
 struct VideoEffect {
@@ -86,10 +91,15 @@ struct VideoEffect {
     //   Posterize: p1=levels
     //   Threshold: p1=level
     //   Solarize: p1=threshold
+    //   Levels: p1=inputBlack(0..255), p2=inputWhite(0..255), p3=gamma(0.1..5.0)
+    //   Tint: p1=amount(0..1), keyColor=highlight tint
+    //   BlackWhite: p1=redWeight, p2=greenWeight, p3=blueWeight
+    //   Exposure: p1=stops(-5..5)
+    //   HueSaturation: p1=hueDegrees(-180..180), p2=saturation(-100..100), p3=lightness(-100..100)
     double param1 = 0.0;
     double param2 = 0.0;
     double param3 = 0.0;
-    QColor keyColor = QColor(0, 255, 0); // ChromaKey only
+    QColor keyColor = QColor(0, 255, 0); // ChromaKey / Tint
     double startSec = -1.0; // clip-local seconds; -1 == no start limit
     double endSec = -1.0;   // clip-local seconds; -1 == no end limit
 
@@ -117,6 +127,11 @@ struct VideoEffect {
     static VideoEffect createPosterize(double levels = 4.0);
     static VideoEffect createThreshold(double level = 128.0);
     static VideoEffect createSolarize(double threshold = 128.0);
+    static VideoEffect createLevels(double inputBlack = 0.0, double inputWhite = 255.0, double gamma = 1.0);
+    static VideoEffect createTint(double amount = 1.0, QColor highlightTint = QColor(255, 255, 255));
+    static VideoEffect createBlackWhite(double redWeight = 0.299, double greenWeight = 0.587, double blueWeight = 0.114);
+    static VideoEffect createExposure(double stops = 0.0);
+    static VideoEffect createHueSaturation(double hueDegrees = 0.0, double saturation = 0.0, double lightness = 0.0);
 };
 
 // --- Processor ---
@@ -159,4 +174,9 @@ private:
     static QImage applyPosterize(const QImage &img, double levels);
     static QImage applyThreshold(const QImage &img, double level);
     static QImage applySolarize(const QImage &img, double threshold);
+    static QImage applyLevels(const QImage &img, double inputBlack, double inputWhite, double gamma);
+    static QImage applyTint(const QImage &img, double amount, QColor highlightTint);
+    static QImage applyBlackWhite(const QImage &img, double redWeight, double greenWeight, double blueWeight);
+    static QImage applyExposureEffect(const QImage &img, double stops);
+    static QImage applyHueSaturation(const QImage &img, double hueDegrees, double saturation, double lightness);
 };

@@ -20,6 +20,7 @@
 int runAIHighlightSelftest();
 int runAcesColorSelftest();
 int runAeFxBlurSelftest();
+int runAeFxColorSelftest();
 int runAeFxStylizeSelftest();
 int runAffinitySelftest();
 int runAscCdlExportSelftest();
@@ -242,6 +243,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "AcesColor: primaries matrices, Bradford, IDT/RRT/ODT round-trip" },
     { "ae-fx-blur",        "VEDITOR_AE_FX_BLUR_SELFTEST",         runAeFxBlurSelftest,           false,
       "AE-FX-1 Blur Family: Gaussian, directional, radial implementation gates (G1-G6)" },
+    { "ae-fx-color",       "VEDITOR_AE_FX_COLOR_SELFTEST",        runAeFxColorSelftest,          false,
+      "AE-FX-3 Color Family: levels, tint, blackwhite, exposure, hue/saturation gates (G1-G6)" },
     { "ae-fx-stylize",     "VEDITOR_AE_FX_STYLIZE_SELFTEST",      runAeFxStylizeSelftest,        false,
       "AE-FX-2 Stylize Family: glow, edges, emboss, posterize, threshold, solarize gates (G1-G7)" },
     { "dolby-vision",      "VEDITOR_DOLBY_VISION_SELFTEST",       runDolbyVisionSelftest,        false,

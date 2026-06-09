@@ -99,6 +99,11 @@ QString VideoEffect::typeName(VideoEffectType t)
     case VideoEffectType::Posterize: return "ポスタリゼーション";
     case VideoEffectType::Threshold: return "2階調(しきい値)";
     case VideoEffectType::Solarize: return "ソラリゼーション";
+    case VideoEffectType::Levels: return "レベル補正";
+    case VideoEffectType::Tint: return "色合い(Tint)";
+    case VideoEffectType::BlackWhite: return "白黒";
+    case VideoEffectType::Exposure: return "露出";
+    case VideoEffectType::HueSaturation: return "色相/彩度";
     }
     return "Unknown";
 }
@@ -113,7 +118,9 @@ QVector<VideoEffectType> VideoEffect::allTypes()
              VideoEffectType::RadialBlur, VideoEffectType::Glow,
              VideoEffectType::FindEdges, VideoEffectType::Emboss,
              VideoEffectType::Posterize, VideoEffectType::Threshold,
-             VideoEffectType::Solarize };
+             VideoEffectType::Solarize, VideoEffectType::Levels,
+             VideoEffectType::Tint, VideoEffectType::BlackWhite,
+             VideoEffectType::Exposure, VideoEffectType::HueSaturation };
 }
 
 VideoEffect VideoEffect::createBlur(double r)
@@ -156,6 +163,16 @@ VideoEffect VideoEffect::createThreshold(double l)
     { VideoEffect e; e.type = VideoEffectType::Threshold; e.param1 = l; return e; }
 VideoEffect VideoEffect::createSolarize(double t)
     { VideoEffect e; e.type = VideoEffectType::Solarize; e.param1 = t; return e; }
+VideoEffect VideoEffect::createLevels(double b, double w, double g)
+    { VideoEffect e; e.type = VideoEffectType::Levels; e.param1 = b; e.param2 = w; e.param3 = g; return e; }
+VideoEffect VideoEffect::createTint(double a, QColor c)
+    { VideoEffect e; e.type = VideoEffectType::Tint; e.param1 = a; e.keyColor = c; return e; }
+VideoEffect VideoEffect::createBlackWhite(double r, double g, double b)
+    { VideoEffect e; e.type = VideoEffectType::BlackWhite; e.param1 = r; e.param2 = g; e.param3 = b; return e; }
+VideoEffect VideoEffect::createExposure(double s)
+    { VideoEffect e; e.type = VideoEffectType::Exposure; e.param1 = s; return e; }
+VideoEffect VideoEffect::createHueSaturation(double h, double s, double l)
+    { VideoEffect e; e.type = VideoEffectType::HueSaturation; e.param1 = h; e.param2 = s; e.param3 = l; return e; }
 
 // ===== EffectParamSchema helper accessors =====
 
@@ -213,6 +230,28 @@ double paramValue(const VideoEffect &effect, const QString &paramName)
                 return effect.param1;
             if (paramName == "threshold" && effect.type == VideoEffectType::Solarize)
                 return effect.param1;
+            if (paramName == "inputBlack" && effect.type == VideoEffectType::Levels)
+                return effect.param1;
+            if (paramName == "inputWhite" && effect.type == VideoEffectType::Levels)
+                return effect.param2;
+            if (paramName == "gamma" && effect.type == VideoEffectType::Levels)
+                return effect.param3;
+            if (paramName == "amount" && effect.type == VideoEffectType::Tint)
+                return effect.param1;
+            if (paramName == "redWeight" && effect.type == VideoEffectType::BlackWhite)
+                return effect.param1;
+            if (paramName == "greenWeight" && effect.type == VideoEffectType::BlackWhite)
+                return effect.param2;
+            if (paramName == "blueWeight" && effect.type == VideoEffectType::BlackWhite)
+                return effect.param3;
+            if (paramName == "stops" && effect.type == VideoEffectType::Exposure)
+                return effect.param1;
+            if (paramName == "hueDegrees" && effect.type == VideoEffectType::HueSaturation)
+                return effect.param1;
+            if (paramName == "saturation" && effect.type == VideoEffectType::HueSaturation)
+                return effect.param2;
+            if (paramName == "lightness" && effect.type == VideoEffectType::HueSaturation)
+                return effect.param3;
             return def.defaultVal;
         }
     }
@@ -294,6 +333,39 @@ void setParamValue(VideoEffect &effect, const QString &paramName, double value)
             if (paramName == "threshold" && effect.type == VideoEffectType::Solarize) {
                 effect.param1 = value; return;
             }
+            if (paramName == "inputBlack" && effect.type == VideoEffectType::Levels) {
+                effect.param1 = value; return;
+            }
+            if (paramName == "inputWhite" && effect.type == VideoEffectType::Levels) {
+                effect.param2 = value; return;
+            }
+            if (paramName == "gamma" && effect.type == VideoEffectType::Levels) {
+                effect.param3 = value; return;
+            }
+            if (paramName == "amount" && effect.type == VideoEffectType::Tint) {
+                effect.param1 = value; return;
+            }
+            if (paramName == "redWeight" && effect.type == VideoEffectType::BlackWhite) {
+                effect.param1 = value; return;
+            }
+            if (paramName == "greenWeight" && effect.type == VideoEffectType::BlackWhite) {
+                effect.param2 = value; return;
+            }
+            if (paramName == "blueWeight" && effect.type == VideoEffectType::BlackWhite) {
+                effect.param3 = value; return;
+            }
+            if (paramName == "stops" && effect.type == VideoEffectType::Exposure) {
+                effect.param1 = value; return;
+            }
+            if (paramName == "hueDegrees" && effect.type == VideoEffectType::HueSaturation) {
+                effect.param1 = value; return;
+            }
+            if (paramName == "saturation" && effect.type == VideoEffectType::HueSaturation) {
+                effect.param2 = value; return;
+            }
+            if (paramName == "lightness" && effect.type == VideoEffectType::HueSaturation) {
+                effect.param3 = value; return;
+            }
             return;
         }
     }
@@ -303,12 +375,16 @@ QColor colorParamValue(const VideoEffect &effect, const QString &paramName)
 {
     if (paramName == "color" && effect.type == VideoEffectType::ChromaKey)
         return effect.keyColor;
+    if ((paramName == "keyColor" || paramName == "color") && effect.type == VideoEffectType::Tint)
+        return effect.keyColor;
     return QColor();
 }
 
 void setColorParam(VideoEffect &effect, const QString &paramName, QColor color)
 {
     if (paramName == "color" && effect.type == VideoEffectType::ChromaKey)
+        effect.keyColor = color;
+    if ((paramName == "keyColor" || paramName == "color") && effect.type == VideoEffectType::Tint)
         effect.keyColor = color;
 }
 
@@ -544,6 +620,11 @@ QImage VideoEffectProcessor::applyEffect(const QImage &input, const VideoEffect 
     case VideoEffectType::Posterize: return applyPosterize(input, effect.param1);
     case VideoEffectType::Threshold: return applyThreshold(input, effect.param1);
     case VideoEffectType::Solarize: return applySolarize(input, effect.param1);
+    case VideoEffectType::Levels: return applyLevels(input, effect.param1, effect.param2, effect.param3);
+    case VideoEffectType::Tint: return applyTint(input, effect.param1, effect.keyColor);
+    case VideoEffectType::BlackWhite: return applyBlackWhite(input, effect.param1, effect.param2, effect.param3);
+    case VideoEffectType::Exposure: return applyExposureEffect(input, effect.param1);
+    case VideoEffectType::HueSaturation: return applyHueSaturation(input, effect.param1, effect.param2, effect.param3);
     default: return input;
     }
 }
@@ -1228,6 +1309,172 @@ QImage VideoEffectProcessor::applySolarize(const QImage &input, double threshold
             } else {
                 dstLine[x] = px;
             }
+        }
+    }
+
+    return result;
+}
+
+QImage VideoEffectProcessor::applyLevels(const QImage &input, double inputBlack, double inputWhite, double gamma)
+{
+    if (inputBlack <= 0.0 && inputWhite >= 255.0 && gamma == 1.0)
+        return input;
+
+    int black = qBound(0, static_cast<int>(std::round(inputBlack)), 255);
+    int white = qBound(0, static_cast<int>(std::round(inputWhite)), 255);
+    if (white <= black) {
+        if (black >= 255)
+            black = 254;
+        white = black + 1;
+    }
+    const double g = qBound(0.1, gamma, 5.0);
+    const double scale = 1.0 / (white - black);
+
+    QImage src = input.convertToFormat(QImage::Format_ARGB32);
+    const int w = src.width();
+    const int h = src.height();
+    QImage result(w, h, QImage::Format_ARGB32);
+
+    auto remap = [&](int value) -> int {
+        if (value <= black)
+            return 0;
+        if (value >= white)
+            return 255;
+        const double normalized = (value - black) * scale;
+        return clamp255d(std::pow(normalized, g) * 255.0);
+    };
+
+    for (int y = 0; y < h; ++y) {
+        const QRgb *srcLine = reinterpret_cast<const QRgb*>(src.constScanLine(y));
+        QRgb *dstLine = reinterpret_cast<QRgb*>(result.scanLine(y));
+        for (int x = 0; x < w; ++x) {
+            const QRgb px = srcLine[x];
+            dstLine[x] = qRgba(remap(qRed(px)),
+                               remap(qGreen(px)),
+                               remap(qBlue(px)),
+                               qAlpha(px));
+        }
+    }
+
+    return result;
+}
+
+QImage VideoEffectProcessor::applyTint(const QImage &input, double amount, QColor highlightTint)
+{
+    const double tintAmount = qBound(0.0, amount, 1.0);
+    if (tintAmount <= 0.0)
+        return input;
+
+    QImage src = input.convertToFormat(QImage::Format_ARGB32);
+    const int w = src.width();
+    const int h = src.height();
+    QImage result(w, h, QImage::Format_ARGB32);
+    const int kr = highlightTint.red();
+    const int kg = highlightTint.green();
+    const int kb = highlightTint.blue();
+
+    for (int y = 0; y < h; ++y) {
+        const QRgb *srcLine = reinterpret_cast<const QRgb*>(src.constScanLine(y));
+        QRgb *dstLine = reinterpret_cast<QRgb*>(result.scanLine(y));
+        for (int x = 0; x < w; ++x) {
+            const QRgb px = srcLine[x];
+            const double gray = luma709(qRed(px), qGreen(px), qBlue(px)) / 255.0;
+            const double tr = kr * gray;
+            const double tg = kg * gray;
+            const double tb = kb * gray;
+            dstLine[x] = qRgba(clamp255d(qRed(px) + tintAmount * (tr - qRed(px))),
+                               clamp255d(qGreen(px) + tintAmount * (tg - qGreen(px))),
+                               clamp255d(qBlue(px) + tintAmount * (tb - qBlue(px))),
+                               qAlpha(px));
+        }
+    }
+
+    return result;
+}
+
+QImage VideoEffectProcessor::applyBlackWhite(const QImage &input, double redWeight,
+                                             double greenWeight, double blueWeight)
+{
+    QImage src = input.convertToFormat(QImage::Format_ARGB32);
+    const int w = src.width();
+    const int h = src.height();
+    QImage result(w, h, QImage::Format_ARGB32);
+
+    for (int y = 0; y < h; ++y) {
+        const QRgb *srcLine = reinterpret_cast<const QRgb*>(src.constScanLine(y));
+        QRgb *dstLine = reinterpret_cast<QRgb*>(result.scanLine(y));
+        for (int x = 0; x < w; ++x) {
+            const QRgb px = srcLine[x];
+            const int gray = clamp255d(qRed(px) * redWeight
+                                     + qGreen(px) * greenWeight
+                                     + qBlue(px) * blueWeight);
+            dstLine[x] = qRgba(gray, gray, gray, qAlpha(px));
+        }
+    }
+
+    return result;
+}
+
+QImage VideoEffectProcessor::applyExposureEffect(const QImage &input, double stops)
+{
+    if (stops == 0.0)
+        return input;
+
+    const double gain = std::pow(2.0, qBound(-5.0, stops, 5.0));
+    QImage src = input.convertToFormat(QImage::Format_ARGB32);
+    const int w = src.width();
+    const int h = src.height();
+    QImage result(w, h, QImage::Format_ARGB32);
+
+    for (int y = 0; y < h; ++y) {
+        const QRgb *srcLine = reinterpret_cast<const QRgb*>(src.constScanLine(y));
+        QRgb *dstLine = reinterpret_cast<QRgb*>(result.scanLine(y));
+        for (int x = 0; x < w; ++x) {
+            const QRgb px = srcLine[x];
+            dstLine[x] = qRgba(clamp255d(qRed(px) * gain),
+                               clamp255d(qGreen(px) * gain),
+                               clamp255d(qBlue(px) * gain),
+                               qAlpha(px));
+        }
+    }
+
+    return result;
+}
+
+QImage VideoEffectProcessor::applyHueSaturation(const QImage &input, double hueDegrees,
+                                                double saturation, double lightness)
+{
+    if (hueDegrees == 0.0 && saturation == 0.0 && lightness == 0.0)
+        return input;
+
+    const double hueShift = qBound(-180.0, hueDegrees, 180.0) / 360.0;
+    const double satFactor = (qBound(-100.0, saturation, 100.0) + 100.0) / 100.0;
+    const double lightShift = qBound(-100.0, lightness, 100.0) / 100.0;
+    QImage src = input.convertToFormat(QImage::Format_ARGB32);
+    const int w = src.width();
+    const int h = src.height();
+    QImage result(w, h, QImage::Format_ARGB32);
+
+    for (int y = 0; y < h; ++y) {
+        const QRgb *srcLine = reinterpret_cast<const QRgb*>(src.constScanLine(y));
+        QRgb *dstLine = reinterpret_cast<QRgb*>(result.scanLine(y));
+        for (int x = 0; x < w; ++x) {
+            const QRgb px = srcLine[x];
+            QColor color(qRed(px), qGreen(px), qBlue(px), qAlpha(px));
+            float hslH = 0.0f;
+            float hslS = 0.0f;
+            float hslL = 0.0f;
+            float hslA = 1.0f;
+            color.getHslF(&hslH, &hslS, &hslL, &hslA);
+            if (hslH < 0.0f)
+                hslH = 0.0f;
+            hslH = static_cast<float>(std::fmod(static_cast<double>(hslH) + hueShift, 1.0));
+            if (hslH < 0.0f)
+                hslH += 1.0f;
+            hslS = static_cast<float>(qBound(0.0, static_cast<double>(hslS) * satFactor, 1.0));
+            hslL = static_cast<float>(qBound(0.0, static_cast<double>(hslL) + lightShift, 1.0));
+            const QColor out = QColor::fromHslF(hslH, hslS, hslL, hslA);
+            dstLine[x] = qRgba(out.red(), out.green(), out.blue(), qAlpha(px));
         }
     }
 

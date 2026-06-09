@@ -80,6 +80,36 @@ QVector<ParamDef> paramSchemaFor(VideoEffectType type)
     case VideoEffectType::Solarize:
         return { { "threshold", "Threshold", ParamType::Int, 0.0, 255.0, 128.0 } };
 
+    case VideoEffectType::Levels:
+        return {
+            { "inputBlack", "Input Black", ParamType::Int, 0.0, 255.0, 0.0 },
+            { "inputWhite", "Input White", ParamType::Int, 0.0, 255.0, 255.0 },
+            { "gamma", "Gamma", ParamType::Float, 0.1, 5.0, 1.0 }
+        };
+
+    case VideoEffectType::Tint:
+        return {
+            { "amount", "Amount", ParamType::Float, 0.0, 1.0, 1.0 },
+            { "keyColor", "Key Color", ParamType::Color, 0.0, 0.0, 0.0 }
+        };
+
+    case VideoEffectType::BlackWhite:
+        return {
+            { "redWeight", "Red Weight", ParamType::Float, 0.0, 1.0, 0.299 },
+            { "greenWeight", "Green Weight", ParamType::Float, 0.0, 1.0, 0.587 },
+            { "blueWeight", "Blue Weight", ParamType::Float, 0.0, 1.0, 0.114 }
+        };
+
+    case VideoEffectType::Exposure:
+        return { { "stops", "Stops", ParamType::Float, -5.0, 5.0, 0.0 } };
+
+    case VideoEffectType::HueSaturation:
+        return {
+            { "hueDegrees", "Hue", ParamType::Float, -180.0, 180.0, 0.0 },
+            { "saturation", "Saturation", ParamType::Float, -100.0, 100.0, 0.0 },
+            { "lightness", "Lightness", ParamType::Float, -100.0, 100.0, 0.0 }
+        };
+
     case VideoEffectType::None:
     default:
         return {};
