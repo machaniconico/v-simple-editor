@@ -12,6 +12,17 @@
 static inline int clamp255(int v) { return qBound(0, v, 255); }
 static inline int clamp255d(double v) { return qBound(0, static_cast<int>(std::round(v)), 255); }
 
+static inline void addRgbSample(const QImage &img, int x, int y,
+                                double &rSum, double &gSum, double &bSum)
+{
+    const int sx = qBound(0, x, img.width() - 1);
+    const int sy = qBound(0, y, img.height() - 1);
+    const uint8_t *line = img.constScanLine(sy);
+    rSum += line[sx * 3];
+    gSum += line[sx * 3 + 1];
+    bSum += line[sx * 3 + 2];
+}
+
 // --- VideoEffect factory ---
 
 QString VideoEffect::typeName(VideoEffectType t)
@@ -29,6 +40,9 @@ QString VideoEffect::typeName(VideoEffectType t)
     case VideoEffectType::Noise:          return "Noise";
     case VideoEffectType::DisplacementMap: return "Displacement Map";
     case VideoEffectType::FractalNoiseGen: return "Fractal Noise";
+    case VideoEffectType::GaussianBlur: return "ガウスブラー";
+    case VideoEffectType::DirectionalBlur: return "方向ブラー";
+    case VideoEffectType::RadialBlur: return "放射ブラー";
     }
     return "Unknown";
 }
@@ -38,7 +52,9 @@ QVector<VideoEffectType> VideoEffect::allTypes()
     return { VideoEffectType::Blur, VideoEffectType::Sharpen, VideoEffectType::Mosaic,
              VideoEffectType::ChromaKey, VideoEffectType::Vignette, VideoEffectType::Sepia,
              VideoEffectType::Grayscale, VideoEffectType::Invert, VideoEffectType::Noise,
-             VideoEffectType::DisplacementMap, VideoEffectType::FractalNoiseGen };
+             VideoEffectType::DisplacementMap, VideoEffectType::FractalNoiseGen,
+             VideoEffectType::GaussianBlur, VideoEffectType::DirectionalBlur,
+             VideoEffectType::RadialBlur };
 }
 
 VideoEffect VideoEffect::createBlur(double r)
@@ -63,6 +79,12 @@ VideoEffect VideoEffect::createDisplacementMap(double h, double v, int m)
     { VideoEffect e; e.type = VideoEffectType::DisplacementMap; e.param1 = h; e.param2 = v; e.param3 = static_cast<double>(m); return e; }
 VideoEffect VideoEffect::createFractalNoise(double s, int o, double evol)
     { VideoEffect effect; effect.type = VideoEffectType::FractalNoiseGen; effect.param1 = s; effect.param2 = static_cast<double>(o); effect.param3 = evol; return effect; }
+VideoEffect VideoEffect::createGaussianBlur(double r)
+    { VideoEffect e; e.type = VideoEffectType::GaussianBlur; e.param1 = r; return e; }
+VideoEffect VideoEffect::createDirectionalBlur(double a, double l)
+    { VideoEffect e; e.type = VideoEffectType::DirectionalBlur; e.param1 = a; e.param2 = l; return e; }
+VideoEffect VideoEffect::createRadialBlur(double a, int m)
+    { VideoEffect e; e.type = VideoEffectType::RadialBlur; e.param1 = a; e.param2 = static_cast<double>(m); return e; }
 
 // ===== EffectParamSchema helper accessors =====
 
@@ -92,6 +114,16 @@ double paramValue(const VideoEffect &effect, const QString &paramName)
                 return effect.param1;
             if (paramName == "amount" && effect.type == VideoEffectType::Noise)
                 return effect.param1;
+            if (paramName == "radius" && effect.type == VideoEffectType::GaussianBlur)
+                return effect.param1;
+            if (paramName == "angle" && effect.type == VideoEffectType::DirectionalBlur)
+                return effect.param1;
+            if (paramName == "length" && effect.type == VideoEffectType::DirectionalBlur)
+                return effect.param2;
+            if (paramName == "amount" && effect.type == VideoEffectType::RadialBlur)
+                return effect.param1;
+            if (paramName == "mode" && effect.type == VideoEffectType::RadialBlur)
+                return effect.param2;
             return def.defaultVal;
         }
     }
@@ -130,6 +162,21 @@ void setParamValue(VideoEffect &effect, const QString &paramName, double value)
             }
             if (paramName == "amount" && effect.type == VideoEffectType::Noise) {
                 effect.param1 = value; return;
+            }
+            if (paramName == "radius" && effect.type == VideoEffectType::GaussianBlur) {
+                effect.param1 = value; return;
+            }
+            if (paramName == "angle" && effect.type == VideoEffectType::DirectionalBlur) {
+                effect.param1 = value; return;
+            }
+            if (paramName == "length" && effect.type == VideoEffectType::DirectionalBlur) {
+                effect.param2 = value; return;
+            }
+            if (paramName == "amount" && effect.type == VideoEffectType::RadialBlur) {
+                effect.param1 = value; return;
+            }
+            if (paramName == "mode" && effect.type == VideoEffectType::RadialBlur) {
+                effect.param2 = value; return;
             }
             return;
         }
@@ -372,6 +419,9 @@ QImage VideoEffectProcessor::applyEffect(const QImage &input, const VideoEffect 
     case VideoEffectType::Noise:          return applyNoise(input, effect.param1);
     case VideoEffectType::DisplacementMap: return applyDisplacementMap(input, effect.param1, effect.param2, static_cast<int>(effect.param3));
     case VideoEffectType::FractalNoiseGen: return applyFractalNoise(input, effect.param1, static_cast<int>(effect.param2), effect.param3);
+    case VideoEffectType::GaussianBlur: return applyGaussianBlur(input, effect.param1);
+    case VideoEffectType::DirectionalBlur: return applyDirectionalBlur(input, effect.param1, effect.param2);
+    case VideoEffectType::RadialBlur: return applyRadialBlur(input, effect.param1, static_cast<int>(effect.param2));
     default: return input;
     }
 }
@@ -694,4 +744,167 @@ QImage VideoEffectProcessor::applyFractalNoise(const QImage &input, double scale
     // Render as grayscale (matches FractalNoise::render output)
     QImage noiseImg = FractalNoise::render(QSize(w, h), evolution, p, true);
     return noiseImg.convertToFormat(QImage::Format_RGB888);
+}
+
+QImage VideoEffectProcessor::applyGaussianBlur(const QImage &input, double radius)
+{
+    const double sigma = qBound(0.0, radius, 50.0);
+    if (sigma <= 0.0)
+        return input;
+
+    QImage src = input.convertToFormat(QImage::Format_RGB888);
+    const int w = src.width();
+    const int h = src.height();
+    QImage result(w, h, QImage::Format_RGB888);
+    QVector<double> tmp(w * h * 3, 0.0);
+
+    const int kernelRadius = qMax(1, static_cast<int>(std::ceil(sigma * 3.0)));
+    QVector<double> kernel(kernelRadius * 2 + 1);
+    double kernelSum = 0.0;
+    const double denom = 2.0 * sigma * sigma;
+    for (int i = -kernelRadius; i <= kernelRadius; ++i) {
+        const double weight = std::exp(-(i * i) / denom);
+        kernel[i + kernelRadius] = weight;
+        kernelSum += weight;
+    }
+    for (double &weight : kernel)
+        weight /= kernelSum;
+
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            double rSum = 0.0, gSum = 0.0, bSum = 0.0;
+            for (int k = -kernelRadius; k <= kernelRadius; ++k) {
+                const int sx = qBound(0, x + k, w - 1);
+                const uint8_t *srcLine = src.constScanLine(y);
+                const double weight = kernel[k + kernelRadius];
+                rSum += srcLine[sx * 3] * weight;
+                gSum += srcLine[sx * 3 + 1] * weight;
+                bSum += srcLine[sx * 3 + 2] * weight;
+            }
+            const int idx = (y * w + x) * 3;
+            tmp[idx] = rSum;
+            tmp[idx + 1] = gSum;
+            tmp[idx + 2] = bSum;
+        }
+    }
+
+    double rErr = 0.0;
+    double gErr = 0.0;
+    double bErr = 0.0;
+    for (int y = 0; y < h; ++y) {
+        uint8_t *dst = result.scanLine(y);
+        for (int x = 0; x < w; ++x) {
+            double rSum = 0.0, gSum = 0.0, bSum = 0.0;
+            for (int k = -kernelRadius; k <= kernelRadius; ++k) {
+                const int sy = qBound(0, y + k, h - 1);
+                const int srcIdx = (sy * w + x) * 3;
+                const double weight = kernel[k + kernelRadius];
+                rSum += tmp[srcIdx] * weight;
+                gSum += tmp[srcIdx + 1] * weight;
+                bSum += tmp[srcIdx + 2] * weight;
+            }
+            const double rQuant = rSum + rErr;
+            const double gQuant = gSum + gErr;
+            const double bQuant = bSum + bErr;
+            dst[x * 3] = clamp255d(rQuant);
+            dst[x * 3 + 1] = clamp255d(gQuant);
+            dst[x * 3 + 2] = clamp255d(bQuant);
+            rErr = rQuant - dst[x * 3];
+            gErr = gQuant - dst[x * 3 + 1];
+            bErr = bQuant - dst[x * 3 + 2];
+        }
+    }
+
+    return result;
+}
+
+QImage VideoEffectProcessor::applyDirectionalBlur(const QImage &input, double angleDegrees, double lengthPx)
+{
+    const int steps = qBound(0, static_cast<int>(std::round(lengthPx)), 100);
+    if (steps <= 0)
+        return input;
+
+    QImage src = input.convertToFormat(QImage::Format_RGB888);
+    const int w = src.width();
+    const int h = src.height();
+    QImage result(w, h, QImage::Format_RGB888);
+    const double angle = angleDegrees * M_PI / 180.0;
+    const double dx = std::cos(angle);
+    const double dy = std::sin(angle);
+    const double sampleCount = static_cast<double>(steps * 2 + 1);
+
+    for (int y = 0; y < h; ++y) {
+        uint8_t *dst = result.scanLine(y);
+        for (int x = 0; x < w; ++x) {
+            double rSum = 0.0, gSum = 0.0, bSum = 0.0;
+            for (int i = -steps; i <= steps; ++i) {
+                const int sx = static_cast<int>(std::round(x + dx * i));
+                const int sy = static_cast<int>(std::round(y + dy * i));
+                addRgbSample(src, sx, sy, rSum, gSum, bSum);
+            }
+            dst[x * 3] = clamp255d(rSum / sampleCount);
+            dst[x * 3 + 1] = clamp255d(gSum / sampleCount);
+            dst[x * 3 + 2] = clamp255d(bSum / sampleCount);
+        }
+    }
+
+    return result;
+}
+
+QImage VideoEffectProcessor::applyRadialBlur(const QImage &input, double amount, int mode)
+{
+    const int steps = qBound(0, static_cast<int>(std::round(amount)), 50);
+    if (steps <= 0)
+        return input;
+
+    QImage src = input.convertToFormat(QImage::Format_RGB888);
+    const int w = src.width();
+    const int h = src.height();
+    QImage result(w, h, QImage::Format_RGB888);
+    const double cx = w * 0.5;
+    const double cy = h * 0.5;
+
+    if (mode == 1) {
+        const double sampleCount = static_cast<double>(steps + 1);
+        for (int y = 0; y < h; ++y) {
+            uint8_t *dst = result.scanLine(y);
+            for (int x = 0; x < w; ++x) {
+                double rSum = 0.0, gSum = 0.0, bSum = 0.0;
+                for (int i = 0; i <= steps; ++i) {
+                    const double t = static_cast<double>(i) / steps;
+                    const int sx = static_cast<int>(std::round(cx + (x - cx) * t));
+                    const int sy = static_cast<int>(std::round(cy + (y - cy) * t));
+                    addRgbSample(src, sx, sy, rSum, gSum, bSum);
+                }
+                dst[x * 3] = clamp255d(rSum / sampleCount);
+                dst[x * 3 + 1] = clamp255d(gSum / sampleCount);
+                dst[x * 3 + 2] = clamp255d(bSum / sampleCount);
+            }
+        }
+        return result;
+    }
+
+    const double arc = amount * M_PI / 180.0;
+    const double sampleCount = static_cast<double>(steps * 2 + 1);
+    for (int y = 0; y < h; ++y) {
+        uint8_t *dst = result.scanLine(y);
+        for (int x = 0; x < w; ++x) {
+            const double vx = x - cx;
+            const double vy = y - cy;
+            const double radius = std::sqrt(vx * vx + vy * vy);
+            const double baseAngle = std::atan2(vy, vx);
+            double rSum = 0.0, gSum = 0.0, bSum = 0.0;
+            for (int i = -steps; i <= steps; ++i) {
+                const double a = baseAngle + arc * static_cast<double>(i) / steps;
+                const int sx = static_cast<int>(std::round(cx + std::cos(a) * radius));
+                const int sy = static_cast<int>(std::round(cy + std::sin(a) * radius));
+                addRgbSample(src, sx, sy, rSum, gSum, bSum);
+            }
+            dst[x * 3] = clamp255d(rSum / sampleCount);
+            dst[x * 3 + 1] = clamp255d(gSum / sampleCount);
+            dst[x * 3 + 2] = clamp255d(bSum / sampleCount);
+        }
+    }
+
+    return result;
 }

@@ -51,7 +51,10 @@ enum class VideoEffectType {
     Invert,
     Noise,
     DisplacementMap,
-    FractalNoiseGen
+    FractalNoiseGen,
+    GaussianBlur,
+    DirectionalBlur,
+    RadialBlur
 };
 
 struct VideoEffect {
@@ -68,6 +71,9 @@ struct VideoEffect {
     //   Noise: p1=amount(0-100)
     //   DisplacementMap: p1=hAmount(-200..200), p2=vAmount(-200..200), p3=mapMode(0=fractal,1=luminance)
     //   FractalNoiseGen: p1=scale/frequency, p2=octaves(1..8), p3=evolution(time offset)
+    //   GaussianBlur: p1=radius/sigma
+    //   DirectionalBlur: p1=angleDegrees, p2=lengthPx
+    //   RadialBlur: p1=amount, p2=mode(0=spin,1=zoom)
     double param1 = 0.0;
     double param2 = 0.0;
     double param3 = 0.0;
@@ -90,6 +96,9 @@ struct VideoEffect {
     static VideoEffect createNoise(double amount = 20.0);
     static VideoEffect createDisplacementMap(double hAmount = 50.0, double vAmount = 0.0, int mapMode = 0);
     static VideoEffect createFractalNoise(double scale = 4.0, int octaves = 5, double evolution = 0.0);
+    static VideoEffect createGaussianBlur(double radius = 5.0);
+    static VideoEffect createDirectionalBlur(double angleDegrees = 0.0, double lengthPx = 20.0);
+    static VideoEffect createRadialBlur(double amount = 10.0, int mode = 0);
 };
 
 // --- Processor ---
@@ -123,4 +132,7 @@ private:
     static QImage applyNoise(const QImage &img, double amount);
     static QImage applyDisplacementMap(const QImage &img, double hAmt, double vAmt, int mode);
     static QImage applyFractalNoise(const QImage &img, double scale, int octaves, double evolution);
+    static QImage applyGaussianBlur(const QImage &img, double radius);
+    static QImage applyDirectionalBlur(const QImage &img, double angleDegrees, double lengthPx);
+    static QImage applyRadialBlur(const QImage &img, double amount, int mode);
 };

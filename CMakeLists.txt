@@ -90,6 +90,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
 
     # PRD-SPLIT-MAIN-3 Phase 3-B: effects selftests (moved from src/main.cpp).
     src/selftests/effects_selftests.cpp
+    src/selftests/AeFxBlurSelftest.cpp
 
     # PRD-SPLIT-MAIN-3 Phase 3-C: Sprint 11-22 サービス selftests (moved from src/main.cpp).
     src/selftests/sprint_selftests.cpp

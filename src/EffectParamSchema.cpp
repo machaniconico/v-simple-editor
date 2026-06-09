@@ -40,6 +40,21 @@ QVector<ParamDef> paramSchemaFor(VideoEffectType type)
     case VideoEffectType::Noise:
         return { { "amount", "Amount", ParamType::Float, 0.0, 100.0, 20.0 } };
 
+    case VideoEffectType::GaussianBlur:
+        return { { "radius", "Radius", ParamType::Float, 0.0, 50.0, 5.0 } };
+
+    case VideoEffectType::DirectionalBlur:
+        return {
+            { "angle", "Angle", ParamType::Float, 0.0, 360.0, 0.0 },
+            { "length", "Length", ParamType::Float, 0.0, 100.0, 20.0 }
+        };
+
+    case VideoEffectType::RadialBlur:
+        return {
+            { "amount", "Amount", ParamType::Float, 0.0, 50.0, 10.0 },
+            { "mode", "Mode", ParamType::Int, 0.0, 1.0, 0.0 }
+        };
+
     case VideoEffectType::None:
     default:
         return {};

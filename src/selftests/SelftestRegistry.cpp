@@ -19,6 +19,7 @@
 // ---------------------------------------------------------------------------
 int runAIHighlightSelftest();
 int runAcesColorSelftest();
+int runAeFxBlurSelftest();
 int runAffinitySelftest();
 int runAscCdlExportSelftest();
 int runAtempoResolveSelftest();
@@ -238,6 +239,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "RGB Parade scope: per-column R/G/B channel distribution and offscreen render dimensions (4 gates)" },
     { "aces-color",        "VEDITOR_ACES_COLOR_SELFTEST",         runAcesColorSelftest,          false,
       "AcesColor: primaries matrices, Bradford, IDT/RRT/ODT round-trip" },
+    { "ae-fx-blur",        "VEDITOR_AE_FX_BLUR_SELFTEST",         runAeFxBlurSelftest,           false,
+      "AE-FX-1 Blur Family: Gaussian, directional, radial implementation gates (G1-G6)" },
     { "dolby-vision",      "VEDITOR_DOLBY_VISION_SELFTEST",       runDolbyVisionSelftest,        false,
       "DolbyVision: PQ ST.2084 math + metadata + DV XML generation" },
     { "dv-timeline",       "VEDITOR_DV_TIMELINE_SELFTEST",         runDvTimelineSelftest,         false,
