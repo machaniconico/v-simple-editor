@@ -1,4 +1,5 @@
 #include "AudioMixer.h"
+#include "playback/AudioPan.h"
 
 #include <QElapsedTimer>
 #include <QtGlobal>
@@ -1199,6 +1200,10 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
         // prevGain is intentionally NOT reset on seek/setSequence — the click is
         // between two fragments of the OS sink callback, not within the entry's
         // data lifecycle.
+        const bool panActive = e->entry.pan != 0.0;
+        const audiopan::BalanceGains panGains = panActive
+            ? audiopan::balanceGains(e->entry.pan)
+            : audiopan::BalanceGains{};
         const int rampLen = qMin(copySamples, 240);
         const double gainStep = (rampLen > 0) ? (gain - e->prevGain) / static_cast<double>(rampLen) : 0.0;
 
@@ -1228,7 +1233,9 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
                     z[ch] = w;
                 }
                 s *= preampLin;
-                const double sampleVal = s * g;
+                double sampleVal = s * g;
+                if (panActive)
+                    sampleVal *= audiopan::gainForChannel(panGains, ch);
                 if (tla) {
                     const double norm = sampleVal / 32768.0;
                     const double absNorm = std::abs(norm);
@@ -1255,7 +1262,9 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
                     z[ch] = w;
                 }
                 s *= preampLin;
-                const double sampleVal = s * gain;
+                double sampleVal = s * gain;
+                if (panActive)
+                    sampleVal *= audiopan::gainForChannel(panGains, ch);
                 if (tla) {
                     const double norm = sampleVal / 32768.0;
                     const double absNorm = std::abs(norm);
@@ -1277,11 +1286,13 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
             auto *tla = (trackIdx >= 0) ? &m_mixer->m_trackLevelAccum[trackIdx] : nullptr;
             for (int i = 0; i < rampLen; ++i) {
                 const double g = e->prevGain + gainStep * static_cast<double>(i);
-                const double sampleVal = static_cast<double>(src[i]) * g;
+                const int ch = i & 1;
+                double sampleVal = static_cast<double>(src[i]) * g;
+                if (panActive)
+                    sampleVal *= audiopan::gainForChannel(panGains, ch);
                 if (tla) {
                     const double norm = sampleVal / 32768.0;
                     const double absNorm = std::abs(norm);
-                    const int ch = i & 1;
                     if (ch == 0) {
                         if (absNorm > tla->peakL) tla->peakL = static_cast<float>(absNorm);
                         tla->sumSqL += norm * norm;
@@ -1294,11 +1305,13 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
                 accum[i] += static_cast<int32_t>(sampleVal);
             }
             for (int i = rampLen; i < copySamples; ++i) {
-                const double sampleVal = static_cast<double>(src[i]) * gain;
+                const int ch = i & 1;
+                double sampleVal = static_cast<double>(src[i]) * gain;
+                if (panActive)
+                    sampleVal *= audiopan::gainForChannel(panGains, ch);
                 if (tla) {
                     const double norm = sampleVal / 32768.0;
                     const double absNorm = std::abs(norm);
-                    const int ch = i & 1;
                     if (ch == 0) {
                         if (absNorm > tla->peakL) tla->peakL = static_cast<float>(absNorm);
                         tla->sumSqL += norm * norm;

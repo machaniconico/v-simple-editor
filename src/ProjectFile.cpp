@@ -1314,6 +1314,8 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
     obj["outPoint"] = clip.outPoint;
     obj["speed"] = clip.speed;
     obj["volume"] = clip.volume;
+    if (clip.pan != 0.0)
+        obj["pan"] = clip.pan;
     obj["videoScale"] = clip.videoScale;
     obj["videoDx"] = clip.videoDx;
     obj["videoDy"] = clip.videoDy;
@@ -1378,6 +1380,7 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
     clip.outPoint = obj["outPoint"].toDouble();
     clip.speed = obj["speed"].toDouble(1.0);
     clip.volume = obj["volume"].toDouble(1.0);
+    clip.pan = obj["pan"].toDouble(0.0);
     clip.videoScale = obj["videoScale"].toDouble(1.0);
     clip.videoDx = obj["videoDx"].toDouble(0.0);
     clip.videoDy = obj["videoDy"].toDouble(0.0);

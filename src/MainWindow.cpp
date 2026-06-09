@@ -2287,6 +2287,11 @@ void MainWindow::setupMenuBar()
     m_menuHelpEntries.append({volumeAction,
         QStringLiteral("選んだ音声クリップの大きさや、フェードイン・フェードアウトを調整します。")});
 
+    auto *panAction = audioMenu->addAction("パンを設定...");
+    connect(panAction, &QAction::triggered, this, &MainWindow::setClipPan);
+    m_menuHelpEntries.append({panAction,
+        QStringLiteral("選んだ音声クリップの左右バランスを調整します。")});
+
     auto *bgmAction = audioMenu->addAction("BGM / 音声ファイルを追加...");
     connect(bgmAction, &QAction::triggered, this, &MainWindow::addBgm);
     m_menuHelpEntries.append({bgmAction,
@@ -6074,6 +6079,19 @@ void MainWindow::setClipVolume()
     }
 }
 
+void MainWindow::setClipPan()
+{
+    if (!m_timeline->hasSelection()) return;
+    bool ok;
+    double pan = QInputDialog::getDouble(this, QStringLiteral("Set Clip Pan"),
+        QStringLiteral("パン (-1.0 = L, 0.0 = C, +1.0 = R):"),
+        0.0, -1.0, 1.0, 2, &ok);
+    if (ok) {
+        m_timeline->setClipPan(pan);
+        statusBar()->showMessage(QString("Pan: %1").arg(pan, 0, 'f', 2));
+    }
+}
+
 void MainWindow::addBgm()
 {
     QString filter = "Audio Files (*.mp3 *.wav *.aac *.ogg *.flac *.m4a);;All Files (*)";
@@ -9666,6 +9684,14 @@ void MainWindow::openAudioClipEditorDialog()
         auto *editor = new AudioClipEditor(m_audioClipEditorDialog);
         editor->setObjectName(QStringLiteral("audioClipEditor"));
         editor->setClipDuration(10000); // demo: 10sec
+        connect(editor, &AudioClipEditor::volumeChanged, this, [this](double volume) {
+            if (m_timeline && m_timeline->hasSelection())
+                m_timeline->setClipVolume(volume);
+        });
+        connect(editor, &AudioClipEditor::panChanged, this, [this](double pan) {
+            if (m_timeline && m_timeline->hasSelection())
+                m_timeline->setClipPan(pan);
+        });
         layout->addWidget(editor);
         m_audioClipEditorDialog->resize(640, 240);
     }

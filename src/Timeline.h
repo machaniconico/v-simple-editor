@@ -77,6 +77,7 @@ struct ClipInfo {
     double leadInSec = 0.0; // leading gap before the clip on the timeline, grows on left-trim to keep the right edge fixed
     double speed = 1.0;   // 0.25x - 4.0x
     double volume = 1.0;  // 0.0 - 2.0 (0=mute, 1=normal, 2=boost)
+    double pan = 0.0;     // -1.0..+1.0 balance pan (-1=L, 0=center, +1=R)
     // Pro-NLE "rubber band" volume automation. Each point is (clip-local
     // seconds, gain). Empty vector = static `volume` for the whole clip.
     // Sorted by .time; AudioMixer evaluates via linear interpolation.
@@ -538,6 +539,7 @@ public:
     // Clip speed & volume
     void setClipSpeed(double speed);
     void setClipVolume(double volume);
+    void setClipPan(double pan);
 
     // Per-clip speed-ramp (variable speed curve). Operates on V1 by clip
     // index. Returns the identity ramp for invalid indices so callers can

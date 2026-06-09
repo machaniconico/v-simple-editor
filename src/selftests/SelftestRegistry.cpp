@@ -103,6 +103,7 @@ int runSnsCoverSelftest();
 int runSnsFitSelftest();
 int runSocialSelftest();
 int runSpectralEditSelftest();
+int runStereoPanSelftest();
 int runSubtitleKaraokeSelftest();
 int runSubXlatSelftest();
 int runSwsColorSelftest();
@@ -212,6 +213,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "TrimOps engine: ripple/roll/slip/slide + bounds" },
     { "audio-bus",         "VEDITOR_AUDIO_BUS_SELFTEST",          runAudioBusSelftest,           false,
       "AudioBusRouting: bus/submix/aux-send gain resolution + cycle guard" },
+    { "stereo-pan",        "VEDITOR_STEREO_PAN_SELFTEST",         runStereoPanSelftest,          false,
+      "Per-clip stereo balance pan: identity, L/R attenuation, half pan, ProjectFile round-trip" },
     { "atempo-resolve",    "VEDITOR_ATEMPO_RESOLVE_SELFTEST",     runAtempoResolveSelftest,      false,
       "Audio atempo enable resolver truth table: env force OR per-clip flag" },
     { "bezier-easing",     "VEDITOR_BEZIER_EASING_SELFTEST",      runBezierEasingSelftest,       false,

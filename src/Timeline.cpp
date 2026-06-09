@@ -4370,6 +4370,20 @@ void Timeline::setClipVolume(double volume)
     scheduleEmitSequenceChanged();
 }
 
+void Timeline::setClipPan(double pan)
+{
+    int sel = m_videoTrack->selectedClip();
+    if (sel < 0) return;
+    pan = qMax(-1.0, qMin(1.0, pan));
+    auto audioClips = m_audioTrack->clips();
+    if (sel < audioClips.size()) {
+        audioClips[sel].pan = pan;
+        m_audioTrack->setClips(audioClips);
+    }
+    saveUndoState(QString("Set pan %1").arg(pan, 0, 'f', 2));
+    scheduleEmitSequenceChanged();
+}
+
 // --- Phase 3: Color correction, effects, keyframes ---
 
 void Timeline::setClipColorCorrection(const ColorCorrection &cc)
@@ -5492,6 +5506,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         bool fitCover = false;
         clipcolor::ColorMeta colorMeta;
         double volume = 1.0;
+        double pan = 0.0;
         QVector<AudioGainPoint> volumeEnvelope;
         int clipIdx = -1;
         TransitionType leadInType = TransitionType::None;
@@ -5536,6 +5551,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
                 iv.fitCover = c.fitCover;
                 iv.colorMeta = c.colorMeta;
                 iv.volume = c.volume;
+                iv.pan = c.pan;
                 iv.volumeEnvelope = c.volumeEnvelope;
                 iv.clipIdx = ci;
                 iv.leadInType = c.leadIn.type;
@@ -5671,6 +5687,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         e.fitCover = iv.fitCover;
         e.colorMeta = iv.colorMeta;
         e.volume = iv.volume;
+        e.pan = iv.pan;
         e.volumeEnvelope = iv.volumeEnvelope;
         e.sourceClipIndex = iv.clipIdx;
         e.leadInType = iv.leadInType;
@@ -5749,6 +5766,7 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
             e.sourceTrack = t;
             e.audioMuted = trackMuted;
             e.volume = c.volume;
+            e.pan = c.pan;
             e.volumeEnvelope = c.volumeEnvelope;
             e.sourceClipIndex = ci;
             e.leadInType = c.leadIn.type;

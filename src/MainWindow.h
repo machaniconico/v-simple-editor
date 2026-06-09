@@ -276,6 +276,7 @@ private slots:
     void addImageOverlay();
     void addPip();
     void setClipVolume();
+    void setClipPan();
     void addBgm();
     void toggleMute();
     void toggleSolo();

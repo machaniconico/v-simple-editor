@@ -49,6 +49,7 @@ struct PlaybackEntry {
     bool fitCover = false;       // SNS cover fit, propagated from ClipInfo::fitCover
     clipcolor::ColorMeta colorMeta; // Per-clip input color metadata (Stage1 storage only)
     double volume = 1.0;         // Per-clip audio gain (0.0-2.0), propagated from ClipInfo::volume
+    double pan = 0.0;            // Per-clip balance pan (-1.0..+1.0), propagated from ClipInfo::pan
     int sourceClipIndex = -1;    // Index into TimelineTrack::m_clips
 
     // STAGE4B (live GPU track-matte): carries the matte assignment from the

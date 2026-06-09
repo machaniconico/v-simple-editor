@@ -5,8 +5,13 @@
 #include <QBrush>
 #include <QMouseEvent>
 #include <QContextMenuEvent>
+#include <QDoubleSpinBox>
+#include <QHBoxLayout>
+#include <QLabel>
 #include <QMenu>
 #include <QPaintEvent>
+#include <QResizeEvent>
+#include <QSlider>
 #include <QtMath>
 #include <algorithm>
 
@@ -25,7 +30,66 @@ AudioClipEditor::AudioClipEditor(QWidget* parent)
     m_durationMs = 10000;
     m_points     = { {0, 0.0}, {10000, 0.0} };
 
-    setMinimumSize(400, 120);
+    m_controlPanel = new QWidget(this);
+    auto* row = new QHBoxLayout(m_controlPanel);
+    row->setContentsMargins(8, 4, 8, 4);
+    row->setSpacing(8);
+
+    auto* volumeLabel = new QLabel(QStringLiteral("音量"), m_controlPanel);
+    m_volumeSlider = new QSlider(Qt::Horizontal, m_controlPanel);
+    m_volumeSlider->setRange(0, 200);
+    m_volumeSlider->setValue(100);
+    m_volumeSlider->setFixedWidth(150);
+    m_volumeSpin = new QDoubleSpinBox(m_controlPanel);
+    m_volumeSpin->setRange(0.0, 2.0);
+    m_volumeSpin->setDecimals(2);
+    m_volumeSpin->setSingleStep(0.01);
+    m_volumeSpin->setValue(1.0);
+
+    m_panLabel = new QLabel(QStringLiteral("パン (L/C/R)"), m_controlPanel);
+    m_panSlider = new QSlider(Qt::Horizontal, m_controlPanel);
+    m_panSlider->setRange(-100, 100);
+    m_panSlider->setValue(0);
+    m_panSlider->setFixedWidth(150);
+    m_panSpin = new QDoubleSpinBox(m_controlPanel);
+    m_panSpin->setRange(-1.0, 1.0);
+    m_panSpin->setDecimals(2);
+    m_panSpin->setSingleStep(0.01);
+    m_panSpin->setValue(0.0);
+
+    row->addWidget(volumeLabel);
+    row->addWidget(m_volumeSlider);
+    row->addWidget(m_volumeSpin);
+    row->addSpacing(12);
+    row->addWidget(m_panLabel);
+    row->addWidget(m_panSlider);
+    row->addWidget(m_panSpin);
+    row->addStretch();
+
+    connect(m_volumeSlider, &QSlider::valueChanged, this, [this](int value) {
+        if (m_updatingControls) return;
+        setVolume(static_cast<double>(value) / 100.0);
+        emit volumeChanged(m_volume);
+    });
+    connect(m_volumeSpin, qOverload<double>(&QDoubleSpinBox::valueChanged),
+            this, [this](double value) {
+        if (m_updatingControls) return;
+        setVolume(value);
+        emit volumeChanged(m_volume);
+    });
+    connect(m_panSlider, &QSlider::valueChanged, this, [this](int value) {
+        if (m_updatingControls) return;
+        setPan(static_cast<double>(value) / 100.0);
+        emit panChanged(m_pan);
+    });
+    connect(m_panSpin, qOverload<double>(&QDoubleSpinBox::valueChanged),
+            this, [this](double value) {
+        if (m_updatingControls) return;
+        setPan(value);
+        emit panChanged(m_pan);
+    });
+
+    setMinimumSize(560, 160);
     setFocusPolicy(Qt::ClickFocus);
     setMouseTracking(true);
 }
@@ -102,12 +166,40 @@ double AudioClipEditor::evaluateAt(qint64 timeMs) const
     return m_points.last().dB;
 }
 
+void AudioClipEditor::setVolume(double volume)
+{
+    m_volume = qBound(0.0, volume, 2.0);
+    m_updatingControls = true;
+    if (m_volumeSlider) m_volumeSlider->setValue(qRound(m_volume * 100.0));
+    if (m_volumeSpin) m_volumeSpin->setValue(m_volume);
+    m_updatingControls = false;
+}
+
+double AudioClipEditor::volume() const
+{
+    return m_volume;
+}
+
+void AudioClipEditor::setPan(double pan)
+{
+    m_pan = qBound(-1.0, pan, 1.0);
+    m_updatingControls = true;
+    if (m_panSlider) m_panSlider->setValue(qRound(m_pan * 100.0));
+    if (m_panSpin) m_panSpin->setValue(m_pan);
+    m_updatingControls = false;
+}
+
+double AudioClipEditor::pan() const
+{
+    return m_pan;
+}
+
 // ─── private helpers ─────────────────────────────────────────────────────────
 
 QPointF AudioClipEditor::pointToPixel(const VolumeEnvelopePoint& p) const
 {
     const double w = width()  - kMarginLeft - kMarginRight;
-    const double h = height() - kMarginTop  - kMarginBottom;
+    const double h = height() - kControlsHeight - kMarginTop - kMarginBottom;
 
     const double xRatio = (m_durationMs > 0)
                           ? static_cast<double>(p.timeMs) / static_cast<double>(m_durationMs)
@@ -115,17 +207,17 @@ QPointF AudioClipEditor::pointToPixel(const VolumeEnvelopePoint& p) const
     const double yRatio = (p.dB - kDbMin) / (kDbMax - kDbMin);  // 0=bottom, 1=top
 
     const double px = kMarginLeft + xRatio * w;
-    const double py = kMarginTop  + (1.0 - yRatio) * h;  // invert: top = +12 dB
+    const double py = kControlsHeight + kMarginTop + (1.0 - yRatio) * h;  // invert: top = +12 dB
     return { px, py };
 }
 
 VolumeEnvelopePoint AudioClipEditor::pixelToPoint(const QPointF& px) const
 {
     const double w = width()  - kMarginLeft - kMarginRight;
-    const double h = height() - kMarginTop  - kMarginBottom;
+    const double h = height() - kControlsHeight - kMarginTop - kMarginBottom;
 
     const double xRatio = (w > 0.0) ? (px.x() - kMarginLeft) / w : 0.0;
-    const double yRatio = (h > 0.0) ? (px.y() - kMarginTop)  / h : 0.0;  // 0=top
+    const double yRatio = (h > 0.0) ? (px.y() - kControlsHeight - kMarginTop) / h : 0.0;  // 0=top
 
     const double tMs = qBound(0.0, xRatio * static_cast<double>(m_durationMs),
                               static_cast<double>(m_durationMs));
@@ -161,6 +253,13 @@ void AudioClipEditor::emitChanged()
 
 // ─── paint ───────────────────────────────────────────────────────────────────
 
+void AudioClipEditor::resizeEvent(QResizeEvent* e)
+{
+    QWidget::resizeEvent(e);
+    if (m_controlPanel)
+        m_controlPanel->setGeometry(0, 0, width(), kControlsHeight);
+}
+
 void AudioClipEditor::paintEvent(QPaintEvent*)
 {
     QPainter p(this);
@@ -179,7 +278,7 @@ void AudioClipEditor::paintEvent(QPaintEvent*)
         p.setPen(QPen(QColor(0x40, 0x40, 0x40), 1));
         for (double frac : { 0.25, 0.50, 0.75 }) {
             const int x = kMarginLeft + static_cast<int>(frac * (W - kMarginLeft - kMarginRight));
-            p.drawLine(x, kMarginTop, x, H - kMarginBottom);
+            p.drawLine(x, kControlsHeight + kMarginTop, x, H - kMarginBottom);
         }
     }
 
@@ -244,6 +343,7 @@ void AudioClipEditor::paintEvent(QPaintEvent*)
 void AudioClipEditor::mousePressEvent(QMouseEvent* e)
 {
     if (e->button() != Qt::LeftButton) return;
+    if (e->position().y() < kControlsHeight) return;
     const int idx = hitTest(e->position());
     if (idx >= 0) {
         m_dragIndex = idx;
@@ -283,6 +383,7 @@ void AudioClipEditor::mouseReleaseEvent(QMouseEvent* e)
 void AudioClipEditor::mouseDoubleClickEvent(QMouseEvent* e)
 {
     if (e->button() != Qt::LeftButton) return;
+    if (e->position().y() < kControlsHeight) return;
     if (hitTest(e->position()) >= 0) return;  // hit existing point — ignore
 
     VolumeEnvelopePoint np = pixelToPoint(e->position());
@@ -296,6 +397,7 @@ void AudioClipEditor::mouseDoubleClickEvent(QMouseEvent* e)
 
 void AudioClipEditor::contextMenuEvent(QContextMenuEvent* e)
 {
+    if (e->pos().y() < kControlsHeight) return;
     const int idx = hitTest(QPointF(e->pos()));
     if (idx < 0) return;
 
