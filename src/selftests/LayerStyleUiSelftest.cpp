@@ -1,11 +1,18 @@
 #include "../LayerStyle.h"
 #include "../Timeline.h"
+#include "../ClipGeometry.h"
+#include "../VideoPlayer.h"
 
 #include <QApplication>
+#include <QImage>
+#include <QPainter>
 #include <QPointF>
+#include <QRect>
+#include <QSize>
 #include <QVector>
 
 #include <cmath>
+#include <cstring>
 #include <cstdio>
 
 namespace {
@@ -54,6 +61,83 @@ ClipInfo basicClip()
     clip.duration = 1.0;
     clip.outPoint = 1.0;
     return clip;
+}
+
+bool imagesByteEqual(const QImage &a, const QImage &b)
+{
+    if (a.size() != b.size() || a.format() != b.format())
+        return false;
+    if (a.format() != QImage::Format_ARGB32_Premultiplied)
+        return false;
+
+    const int rowBytes = a.width() * 4;
+    for (int y = 0; y < a.height(); ++y) {
+        if (std::memcmp(a.constScanLine(y), b.constScanLine(y),
+                        static_cast<std::size_t>(rowBytes)) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+QImage g6BaseFrame(const QSize &size)
+{
+    QImage img(size, QImage::Format_ARGB32_Premultiplied);
+    for (int y = 0; y < size.height(); ++y) {
+        for (int x = 0; x < size.width(); ++x) {
+            img.setPixelColor(x, y, QColor(24 + (x % 37),
+                                           44 + (y % 31),
+                                           76 + ((x + y) % 43),
+                                           255));
+        }
+    }
+    return img;
+}
+
+QImage g6OverlayFrame(const QSize &size)
+{
+    QImage img(size, QImage::Format_ARGB32_Premultiplied);
+    img.fill(Qt::transparent);
+
+    QPainter p(&img);
+    p.setCompositionMode(QPainter::CompositionMode_SourceOver);
+    p.fillRect(QRect(size.width() / 3,
+                     size.height() / 3,
+                     size.width() / 3,
+                     size.height() / 3),
+               QColor(232, 84, 32, 210));
+    p.fillRect(QRect(size.width() / 2 - 5,
+                     size.height() / 2 - 13,
+                     10,
+                     26),
+               QColor(255, 240, 88, 180));
+    p.end();
+
+    return img;
+}
+
+QImage g6OracleComposite(const QImage &v1Frame,
+                         const VideoPlayer::DecodedLayer &v2Layer,
+                         const LayerStyle &style)
+{
+    QImage expected =
+        v1Frame.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+    const QSize canvas(expected.width(), expected.height());
+    const clipgeom::ClipTransform t{v2Layer.videoScale,
+                                    v2Layer.videoDx,
+                                    v2Layer.videoDy,
+                                    v2Layer.rotation2DDegrees};
+    QImage placed = clipgeom::renderLayer(v2Layer.rgb, t, canvas,
+                                          /*smooth=*/false);
+    placed = layerstyle::apply(placed, style);
+
+    QPainter p(&expected);
+    p.setCompositionMode(QPainter::CompositionMode_SourceOver);
+    p.setOpacity(qBound(0.0, v2Layer.opacity, 1.0));
+    p.drawImage(0, 0, placed);
+    p.end();
+
+    return expected;
 }
 
 } // namespace
@@ -170,6 +254,71 @@ int runLayerStyleUiSelftest()
                           "V2 style must land on V2 only, V1 stays identity, OOB is a no-op",
                           passed, failed);
             }
+        }
+    }
+
+    {
+        if (!qApp) {
+            printSkip("G6 PREVIEW/EXPORT PARITY",
+                      "VideoPlayer is a QWidget and cannot be constructed before QApplication",
+                      skipped);
+        } else {
+            const QSize canvas(96, 64);
+            const QImage v1Frame = g6BaseFrame(canvas);
+            const QImage v2Frame = g6OverlayFrame(canvas);
+
+            LayerStyle style;
+            style.dropShadowEnabled = true;
+            style.shadowColor = QColor(0, 0, 0, 210);
+            style.shadowOffset = QPointF(5.0, 3.0);
+            style.shadowBlurRadius = 3.0;
+            style.shadowOpacity = 0.70;
+            style.strokeEnabled = true;
+            style.strokeColor = QColor(32, 214, 255, 230);
+            style.strokeWidth = 3.0;
+
+            VideoPlayer::DecodedLayer v2Layer;
+            v2Layer.rgb = v2Frame;
+            v2Layer.opacity = 0.86;
+            v2Layer.videoScale = 0.78;
+            v2Layer.videoDx = 0.10;
+            v2Layer.videoDy = -0.07;
+            v2Layer.rotation2DDegrees = 0.0;
+            v2Layer.sourceTrack = 1;
+            v2Layer.sourceClipIndex = 0;
+            v2Layer.sequenceIdx = 1;
+
+            VideoPlayer player(nullptr);
+            const QImage preview =
+                player.composeMultiTrackFrameForTest(
+                    v1Frame,
+                    {v2Frame},
+                    {v2Layer.opacity},
+                    {v2Layer.videoScale},
+                    {v2Layer.videoDx},
+                    {v2Layer.videoDy},
+                    {v2Layer.rotation2DDegrees},
+                    {style});
+            const QImage expected = g6OracleComposite(v1Frame, v2Layer, style);
+
+            const QImage noStyle =
+                player.composeMultiTrackFrameForTest(
+                    v1Frame,
+                    {v2Frame},
+                    {v2Layer.opacity},
+                    {v2Layer.videoScale},
+                    {v2Layer.videoDx},
+                    {v2Layer.videoDy},
+                    {v2Layer.rotation2DDegrees});
+            const QImage expectedNoStyle =
+                g6OracleComposite(v1Frame, v2Layer, LayerStyle{});
+
+            printGate("G6 PREVIEW/EXPORT PARITY",
+                      imagesByteEqual(preview, expected)
+                          && imagesByteEqual(noStyle, expectedNoStyle)
+                          && !imagesByteEqual(preview, noStyle),
+                      "preview compositor must match styled export output, keep no-style output byte-identical, and differ when style is enabled",
+                      passed, failed);
         }
     }
 

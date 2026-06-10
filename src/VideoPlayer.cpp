@@ -3,6 +3,7 @@
 #include "GLPreview.h"
 #include "TimelineFrameRenderer.h"
 #include "Timeline.h"
+#include "LayerStyle.h"
 #include "EffectParamSchema.h"
 #include "UndoTrace.h"
 #include "ProxyManager.h"
@@ -415,7 +416,8 @@ void applyLayerMotionOpacity(const Timeline *timeline,
     layer->rotation2DDegrees = transform.rotationDeg;
 }
 
-void populateLayerMetadata(const PlaybackEntry &entry, int seqIdx,
+void populateLayerMetadata(const Timeline *timeline,
+                           const PlaybackEntry &entry, int seqIdx,
                            VideoPlayer::DecodedLayer *layer)
 {
     if (!layer)
@@ -423,6 +425,11 @@ void populateLayerMetadata(const PlaybackEntry &entry, int seqIdx,
     layer->sourceTrack = entry.sourceTrack;
     layer->sourceClipIndex = entry.sourceClipIndex;
     layer->sequenceIdx = seqIdx;
+    layer->layerStyle = entry.layerStyle;
+    if (layer->layerStyle.isIdentity()) {
+        if (const ClipInfo *clip = clipForPlaybackEntry(timeline, entry))
+            layer->layerStyle = clip->layerStyle;
+    }
     layer->fitContain = entry.fitContain;
     layer->fitCover = entry.fitCover;
     layer->matteType = static_cast<TrackMatteType>(entry.matteTypeOrdinal);
@@ -1157,6 +1164,14 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
     }
 
     m_sequence = entries;
+    if (const Timeline *timeline = m_glPreview ? m_glPreview->timeline() : nullptr) {
+        for (PlaybackEntry &entry : m_sequence) {
+            if (!entry.layerStyle.isIdentity())
+                continue;
+            if (const ClipInfo *clip = clipForPlaybackEntry(timeline, entry))
+                entry.layerStyle = clip->layerStyle;
+        }
+    }
     m_sequenceDurationUs = totalUs;
 
     // Phase 1d pool reconciliation. For every active V2+ TrackDecoder, drop
@@ -2526,7 +2541,8 @@ void VideoPlayer::displaySeekFrameConformed(const QImage &v1Image)
         layer.colorMeta = entry->colorMeta;
         applyLayerMotionOpacity(m_glPreview ? m_glPreview->timeline() : nullptr,
                                 *entry, m_timelinePositionUs, layer.opacity, &layer);
-        populateLayerMetadata(*entry, m_activeEntry, &layer);
+        populateLayerMetadata(m_glPreview ? m_glPreview->timeline() : nullptr,
+                              *entry, m_activeEntry, &layer);
     }
     layer.fitContain = fitContain;
     layer.fitCover = fitCover;
@@ -3987,7 +4003,8 @@ void VideoPlayer::refreshDisplayedFrame()
                 layer.colorMeta = e.colorMeta;
                 applyLayerMotionOpacity(m_glPreview ? m_glPreview->timeline() : nullptr,
                                         e, m_timelinePositionUs, e.opacity, &layer);
-                populateLayerMetadata(e, m_activeEntry, &layer);
+                populateLayerMetadata(m_glPreview ? m_glPreview->timeline() : nullptr,
+                                      e, m_activeEntry, &layer);
                 {
                     double insetFw = 1.0, insetFh = 1.0;
                     if (layer.fitContain && !layer.fitCover) {
@@ -4571,7 +4588,8 @@ void VideoPlayer::handlePlaybackTick()
                     layer.colorMeta = e.colorMeta;
                     applyLayerMotionOpacity(m_glPreview ? m_glPreview->timeline() : nullptr,
                                             e, m_timelinePositionUs, e.opacity, &layer);
-                    populateLayerMetadata(e, idx, &layer);
+                    populateLayerMetadata(m_glPreview ? m_glPreview->timeline() : nullptr,
+                                          e, idx, &layer);
                     layers.append(layer);
                     if (e.sourceTrack > 0)
                         overlayPresent = true;
@@ -4586,7 +4604,8 @@ void VideoPlayer::handlePlaybackTick()
                     layer.colorMeta = e.colorMeta;
                     applyLayerMotionOpacity(m_glPreview ? m_glPreview->timeline() : nullptr,
                                             e, m_timelinePositionUs, e.opacity, &layer);
-                    populateLayerMetadata(e, idx, &layer);
+                    populateLayerMetadata(m_glPreview ? m_glPreview->timeline() : nullptr,
+                                          e, idx, &layer);
                     layers.append(layer);
                     if (e.sourceTrack > 0)
                         overlayPresent = true;
@@ -4666,7 +4685,8 @@ void VideoPlayer::handlePlaybackTick()
                 layer.colorMeta = e.colorMeta;
                 applyLayerMotionOpacity(m_glPreview ? m_glPreview->timeline() : nullptr,
                                         e, m_timelinePositionUs, e.opacity, &layer);
-                populateLayerMetadata(e, idx, &layer);
+                populateLayerMetadata(m_glPreview ? m_glPreview->timeline() : nullptr,
+                                      e, idx, &layer);
                 layers.append(layer);
                 if (e.sourceTrack > 0)
                     overlayPresent = true;
@@ -4700,7 +4720,12 @@ void VideoPlayer::handlePlaybackTick()
             }
             L.rgb = snsfit::maybeFit(L.rgb, L.fitContain, L.fitCover, m_projectOutputSize);
         }
-        if (overlayPresent || m_projectOutputSize.isValid()) {
+        const bool layerStylePresent =
+            std::any_of(layers.cbegin(), layers.cend(),
+                        [](const DecodedLayer &L) {
+                            return !L.layerStyle.isIdentity();
+                        });
+        if (overlayPresent || m_projectOutputSize.isValid() || layerStylePresent) {
             // Reuse a canvas-sized scratch buffer so we don't allocate
             // ~8MB (1080p ARGB) every tick. Re-allocates only when the
             // canvas size or format changes; otherwise we just refill it
@@ -5579,8 +5604,10 @@ QImage VideoPlayer::composeMultiTrackFrame(const QImage &v1Frame,
         const clipgeom::ClipTransform t = effectiveTransforms.isEmpty()
             ? transformForLayer(L)
             : effectiveTransforms.value(i, transformForLayer(L));
-        const QImage placed = clipgeom::renderLayer(
+        QImage placed = clipgeom::renderLayer(
             L.rgb, t, canvas, kSmooth);
+        if (!L.layerStyle.isIdentity())
+            placed = layerstyle::apply(placed, L.layerStyle);
         p.setOpacity(qBound(0.0, L.opacity, 1.0));
         p.drawImage(0, 0, placed);
     }
@@ -5599,7 +5626,8 @@ QImage VideoPlayer::composeMultiTrackFrameForTest(
     const QVector<double> &overlayScale,
     const QVector<double> &overlayDx,
     const QVector<double> &overlayDy,
-    const QVector<double> &overlayRotationDeg) const
+    const QVector<double> &overlayRotationDeg,
+    const QVector<LayerStyle> &overlayStyle) const
 {
     QVector<DecodedLayer> layers;
     layers.reserve(overlayRgb.size());
@@ -5611,6 +5639,7 @@ QImage VideoPlayer::composeMultiTrackFrameForTest(
         L.videoDx          = overlayDx.value(i, 0.0);
         L.videoDy          = overlayDy.value(i, 0.0);
         L.rotation2DDegrees = overlayRotationDeg.value(i, 0.0);
+        L.layerStyle       = overlayStyle.value(i, LayerStyle{});
         layers.append(L);
     }
     return composeMultiTrackFrame(v1Frame, layers);
@@ -5656,8 +5685,10 @@ void VideoPlayer::composeMultiTrackFrameInto(QImage &canvas,
         const clipgeom::ClipTransform t = effectiveTransforms.isEmpty()
             ? transformForLayer(L)
             : effectiveTransforms.value(i, transformForLayer(L));
-        const QImage placed = clipgeom::renderLayer(
+        QImage placed = clipgeom::renderLayer(
             L.rgb, t, cs, kSmooth);
+        if (!L.layerStyle.isIdentity())
+            placed = layerstyle::apply(placed, L.layerStyle);
         p.setOpacity(qBound(0.0, L.opacity, 1.0));
         p.drawImage(0, 0, placed);
     }
@@ -5716,6 +5747,12 @@ QImage VideoPlayer::tryGpuComposeLayers(const QVector<DecodedLayer> &layers,
     const bool hasMatte = std::any_of(
         layers.cbegin(), layers.cend(),
         [](const DecodedLayer &L) { return L.matteType != TrackMatteType::None; });
+    if (std::any_of(layers.cbegin(), layers.cend(),
+                    [](const DecodedLayer &L) {
+                        return !L.layerStyle.isIdentity();
+                    })) {
+        return QImage();
+    }
     const QVector<clipgeom::ClipTransform> effectiveTransforms =
         parentingEnabled()
             ? effectiveLayerTransforms(layers, canvas)
@@ -6200,7 +6237,8 @@ bool VideoPlayer::finalizeOverlayFromDecoder(const PlaybackEntry &e, int seqIdx,
     out->colorMeta          = e.colorMeta;
     applyLayerMotionOpacity(m_glPreview ? m_glPreview->timeline() : nullptr,
                             e, m_timelinePositionUs, e.opacity, out);
-    populateLayerMetadata(e, seqIdx, out);
+    populateLayerMetadata(m_glPreview ? m_glPreview->timeline() : nullptr,
+                          e, seqIdx, out);
     return true;
 }
 

@@ -5,6 +5,7 @@
 #include <QVector>
 #include "Overlay.h"
 #include "MotionStabilizer.h"
+#include "LayerStyle.h"
 #include "color/ClipColor.h"
 
 // Volume automation point.
@@ -48,6 +49,7 @@ struct PlaybackEntry {
     bool fitContain = false;     // SNS vertical fit, propagated from ClipInfo::fitContain
     bool fitCover = false;       // SNS cover fit, propagated from ClipInfo::fitCover
     clipcolor::ColorMeta colorMeta; // Per-clip input color metadata (Stage1 storage only)
+    LayerStyle layerStyle;       // Per-clip layer style for preview/export parity; identity == no-op
     double volume = 1.0;         // Per-clip audio gain (0.0-2.0), propagated from ClipInfo::volume
     double pan = 0.0;            // Per-clip balance pan (-1.0..+1.0), propagated from ClipInfo::pan
     int sourceClipIndex = -1;    // Index into TimelineTrack::m_clips

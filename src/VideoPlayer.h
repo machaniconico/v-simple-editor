@@ -251,7 +251,8 @@ public:
         const QVector<double> &overlayScale,
         const QVector<double> &overlayDx,
         const QVector<double> &overlayDy,
-        const QVector<double> &overlayRotationDeg = {}) const;
+        const QVector<double> &overlayRotationDeg = {},
+        const QVector<LayerStyle> &overlayStyle = {}) const;
 
     // NOTE: the genuine text baker is now the free function
     // textbake::bakeOverlays (src/TextOverlayBake.h), extracted verbatim from
@@ -455,6 +456,7 @@ public:
         int sourceTrack = 0;
         int sourceClipIndex = -1;
         int sequenceIdx = -1;
+        LayerStyle layerStyle;
         bool fitContain = false;
         bool fitCover = false;
         bool isFresh = true;
