@@ -4,6 +4,8 @@
 #include "TrackMatteKey.h"
 #include "libavcore/Decode.h"
 #include "libavcore/Probe.h"
+#include "playback/HdrIngestProbe.h"
+#include "playback/motionblur_flag.h"
 
 #include <QFileInfo>
 #include <QUrl>
@@ -11,6 +13,7 @@
 #include <QtGlobal>
 
 extern "C" {
+#include <libavformat/avformat.h>
 #include <libavutil/pixdesc.h>
 }
 
@@ -33,6 +36,7 @@ struct SourceSignature {
     QString pixFmt;
     bool hasAudio = false;
     QString audioCodec;
+    bool isHdr = false;
 };
 
 bool nearlyEqual(double a, double b)
@@ -107,13 +111,24 @@ SourceSignature parseSourceSignature(const QString& text)
     sig.audioCodec =
         query.queryItemValue(QStringLiteral("audio")).trimmed().toLower();
     sig.hasAudio = !sig.audioCodec.isEmpty();
+    const QString hdr =
+        query.queryItemValue(QStringLiteral("hdr")).trimmed().toLower();
+    sig.isHdr = hdr == QLatin1String("1") || hdr == QLatin1String("true");
     return sig;
+}
+
+bool smartRenderTestSeamEnabled()
+{
+    return QString::fromLatin1(qgetenv("VEDITOR_SMARTRENDER_TEST_SEAM"))
+        == QStringLiteral("1");
 }
 
 SourceSignature sourceSignatureFor(const ClipInfo& clip)
 {
     SourceSignature sig = parseSourceSignature(clip.filePath);
     if (sig.present)
+        return sig;
+    if (!smartRenderTestSeamEnabled())
         return sig;
     return parseSourceSignature(clip.displayName);
 }
@@ -149,8 +164,43 @@ QString signatureUrlFor(const SourceSignature& sig)
     query.addQueryItem(QStringLiteral("height"), QString::number(sig.height));
     query.addQueryItem(QStringLiteral("fps"), QString::number(sig.fps, 'f', 6));
     query.addQueryItem(QStringLiteral("pixfmt"), sig.pixFmt);
+    if (sig.isHdr)
+        query.addQueryItem(QStringLiteral("hdr"), QStringLiteral("1"));
     url.setQuery(query);
     return url.toString();
+}
+
+std::optional<bool> probedSourceIsHdr(const QString& path)
+{
+    AVFormatContext* fmt = nullptr;
+    if (avformat_open_input(&fmt, path.toUtf8().constData(), nullptr, nullptr) < 0)
+        return std::nullopt;
+
+    if (avformat_find_stream_info(fmt, nullptr) < 0) {
+        avformat_close_input(&fmt);
+        return std::nullopt;
+    }
+
+    for (unsigned i = 0; i < fmt->nb_streams; ++i) {
+        const AVStream* stream = fmt->streams[i];
+        if (!stream || !stream->codecpar
+            || stream->codecpar->codec_type != AVMEDIA_TYPE_VIDEO) {
+            continue;
+        }
+
+        const hdringest::ColorInputs inputs =
+            hdringest::captureColorInputs(stream->codecpar);
+        const clipcolor::ColorMeta meta =
+            clipcolor::fromCodecParams(inputs.primaries,
+                                       inputs.trc,
+                                       inputs.bitDepth,
+                                       inputs.hasHdrMeta);
+        avformat_close_input(&fmt);
+        return meta.isHdr;
+    }
+
+    avformat_close_input(&fmt);
+    return std::nullopt;
 }
 
 std::optional<SourceSignature> probedSourceSignature(
@@ -195,6 +245,8 @@ std::optional<SourceSignature> probedSourceSignature(
     const char* pixFmtName = av_get_pix_fmt_name(props.pixelFormat);
     if (pixFmtName)
         sig.pixFmt = QString::fromLatin1(pixFmtName).toLower();
+    if (const std::optional<bool> isHdr = probedSourceIsHdr(clip.filePath))
+        sig.isHdr = *isHdr;
     if (decoder.hasAudio()) {
         sig.hasAudio = true;
         sig.audioCodec = QString::fromStdString(
@@ -453,6 +505,8 @@ SegmentEligibility canStreamCopy(const ClipInfo& clip,
     const SourceSignature source = sourceSignatureFor(clip);
     if (!source.present)
         return reject(QStringLiteral("source stream metadata is unavailable on ClipInfo"));
+    if (clip.colorMeta.isHdr || source.isHdr)
+        return reject(QStringLiteral("clip source is HDR"));
 
     const QString sourceFamily = normalizedCodecFamily(source.codec);
     if (sourceFamily.isEmpty())
@@ -492,6 +546,9 @@ SegmentEligibility canStreamCopy(const ClipInfo& clip,
 PassThroughEligibility timelinePassThrough(
     const PassThroughTimelineRequest& request)
 {
+    if (request.applyAces)
+        return passReject(QStringLiteral("ACES export tonemap is enabled"));
+
     if (request.clipOdtEnabled
         || request.hdrExport16Enabled
         || request.hdrMatte16Enabled
@@ -499,6 +556,9 @@ PassThroughEligibility timelinePassThrough(
         || request.hlg) {
         return passReject(QStringLiteral("HDR/ODT export flags are enabled"));
     }
+
+    if (motionblur::enabledFromEnv())
+        return passReject(QStringLiteral("timeline motion blur is enabled"));
 
     int videoClipCount = 0;
     int onlyTrack = -1;
@@ -552,6 +612,8 @@ PassThroughEligibility timelinePassThrough(
         return passReject(probeReason.isEmpty()
             ? QStringLiteral("source stream metadata is unavailable")
             : probeReason);
+    if (source->isHdr)
+        return passReject(QStringLiteral("clip source is HDR"));
 
     if (!containerAllowsCodec(request.outputPath, source->codec)) {
         return passReject(QStringLiteral(
@@ -646,6 +708,7 @@ PassThroughEligibility timelinePassThrough(const Timeline* timeline,
                                            bool clipOdtEnabled,
                                            bool hdrExport16Enabled,
                                            bool hdrMatte16Enabled,
+                                           bool applyAces,
                                            bool hdr10,
                                            bool hlg)
 {
@@ -685,6 +748,7 @@ PassThroughEligibility timelinePassThrough(const Timeline* timeline,
     request.clipOdtEnabled = clipOdtEnabled;
     request.hdrExport16Enabled = hdrExport16Enabled;
     request.hdrMatte16Enabled = hdrMatte16Enabled;
+    request.applyAces = applyAces;
     request.hdr10 = hdr10;
     request.hlg = hlg;
     return timelinePassThrough(request);

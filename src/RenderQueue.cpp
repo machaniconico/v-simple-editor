@@ -868,6 +868,7 @@ void RenderQueue::startRenderPipe(int jobIndex)
                                              clipodt::enabledFromEnv(),
                                              hdrexport16::enabledFromEnv(),
                                              hdrmatte16::enabledFromEnv(),
+                                             applyAces,
                                              isHdr10,
                                              isHlg);
         if (passThrough.eligible) {

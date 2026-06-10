@@ -44,6 +44,7 @@ struct PassThroughTimelineRequest {
     bool clipOdtEnabled = false;
     bool hdrExport16Enabled = false;
     bool hdrMatte16Enabled = false;
+    bool applyAces = false;
     bool hdr10 = false;
     bool hlg = false;
 };
@@ -78,6 +79,7 @@ PassThroughEligibility timelinePassThrough(const Timeline* timeline,
                                            bool clipOdtEnabled,
                                            bool hdrExport16Enabled,
                                            bool hdrMatte16Enabled,
+                                           bool applyAces,
                                            bool hdr10,
                                            bool hlg);
 
