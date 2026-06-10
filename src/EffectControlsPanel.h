@@ -66,6 +66,7 @@ private:
     void setPlayheadOnVisibleNavBars(double seconds);
     void persistEditedKeyframes();
     double currentPlayheadSeconds() const;
+    double currentClipLocalPlayheadSeconds() const;
     void createKeyframeTrack(const QString &trackName, double value);
     void removeKeyframeTrack(const QString &trackName, const QString &displayName);
     void persistAndRebuild();

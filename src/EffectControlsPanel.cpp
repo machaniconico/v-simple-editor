@@ -59,6 +59,45 @@ ClipInfo *selectedClipForKey(const Timeline *timeline, const ClipKey &key)
     return &const_cast<ClipInfo &>(clips[key.clipIdx]);
 }
 
+double clipTimelineStartSeconds(const Timeline *timeline, const ClipKey &key)
+{
+    if (!timeline || !key.valid()) {
+        return 0.0;
+    }
+
+    const auto &videoTracks = timeline->videoTracks();
+    if (key.trackIdx < 0 || key.trackIdx >= videoTracks.size() || !videoTracks[key.trackIdx]) {
+        return 0.0;
+    }
+
+    const auto &clips = videoTracks[key.trackIdx]->clips();
+    if (key.clipIdx < 0 || key.clipIdx >= clips.size()) {
+        return 0.0;
+    }
+
+    double cursor = 0.0;
+    for (int i = 0; i < key.clipIdx; ++i) {
+        const double clipStart = cursor + clips[i].leadInSec;
+        cursor = clipStart + clips[i].effectiveDuration();
+    }
+    return cursor + clips[key.clipIdx].leadInSec;
+}
+
+constexpr double boundedClipLocalSeconds(double playheadSeconds,
+                                         double clipStartSeconds,
+                                         double clipDurationSeconds)
+{
+    if (clipDurationSeconds <= 0.0 || playheadSeconds <= clipStartSeconds) {
+        return 0.0;
+    }
+
+    const double localSeconds = playheadSeconds - clipStartSeconds;
+    return localSeconds >= clipDurationSeconds ? clipDurationSeconds : localSeconds;
+}
+
+static_assert(boundedClipLocalSeconds(7.0, 5.0, 10.0) == 2.0,
+              "initial keyframe time must be clip-local seconds");
+
 } // namespace
 
 EffectControlsPanel::EffectControlsPanel(QWidget *parent)
@@ -233,8 +272,8 @@ void EffectControlsPanel::setMainWindow(MainWindow *mw)
     }
 
     connect(m_mainWindow, &MainWindow::playheadSecondsChanged, this,
-            [this](double seconds) { setPlayheadOnVisibleNavBars(seconds); });
-    setPlayheadOnVisibleNavBars(currentPlayheadSeconds());
+            [this](double) { setPlayheadOnVisibleNavBars(currentClipLocalPlayheadSeconds()); });
+    setPlayheadOnVisibleNavBars(currentClipLocalPlayheadSeconds());
 }
 
 void EffectControlsPanel::refreshFromCurrentClip()
@@ -270,8 +309,8 @@ void EffectControlsPanel::refreshFromCurrentClip()
 
     auto &clip = const_cast<ClipInfo &>(clips[clipIdx]);
     const double clipDurationSeconds = clip.effectiveDuration();
-    const double playheadSeconds = currentPlayheadSeconds();
     m_currentClipKey = {trackIdx, clipIdx};
+    const double playheadSeconds = currentClipLocalPlayheadSeconds();
     m_motionWidget->setEnabled(true);
     m_motionWidget->setMotion(MotionState{
         clip.videoScale,
@@ -320,7 +359,7 @@ void EffectControlsPanel::buildEmptyState(const QString &message)
     setLayerStyleControls(LayerStyle{}, false);
     for (const auto &prop : motionTrackNames()) {
         m_motionWidget->setPropHasTrack(prop, false);
-        m_motionWidget->setPropKeyframeTrack(prop, nullptr, 0.0, currentPlayheadSeconds());
+        m_motionWidget->setPropKeyframeTrack(prop, nullptr, 0.0, 0.0);
     }
 
     if (!m_emptyStateLabel) {
@@ -643,6 +682,18 @@ double EffectControlsPanel::currentPlayheadSeconds() const
     return 0.0;
 }
 
+double EffectControlsPanel::currentClipLocalPlayheadSeconds() const
+{
+    const ClipInfo *clip = selectedClipForKey(m_timeline, m_currentClipKey);
+    if (!clip) {
+        return 0.0;
+    }
+
+    return boundedClipLocalSeconds(currentPlayheadSeconds(),
+                                   clipTimelineStartSeconds(m_timeline, m_currentClipKey),
+                                   clip->effectiveDuration());
+}
+
 void EffectControlsPanel::createKeyframeTrack(const QString &trackName, double value)
 {
     ClipInfo *clip = selectedClipForKey(m_timeline, m_currentClipKey);
@@ -650,7 +701,7 @@ void EffectControlsPanel::createKeyframeTrack(const QString &trackName, double v
         return;
     }
 
-    const double t = qBound(0.0, currentPlayheadSeconds(), clip->effectiveDuration());
+    const double t = currentClipLocalPlayheadSeconds();
 
     KeyframeTrack track(trackName, value);
     track.addKeyframe(t, value);
