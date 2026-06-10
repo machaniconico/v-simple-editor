@@ -245,25 +245,6 @@ QVector<clipgeom::ClipTransform> effectiveLayerTransforms(
     return effective;
 }
 
-bool trackHasKeyframes(const KeyframeManager &keyframes, const QString &trackName)
-{
-    if (!keyframes.hasTrack(trackName))
-        return false;
-    const KeyframeTrack *track = keyframes.track(trackName);
-    return track && track->count() > 0;
-}
-
-bool hasAnyEffectKeyframes(const ClipInfo &clip)
-{
-    for (const KeyframeTrack &track : clip.keyframes.tracks()) {
-        if (track.propertyName().startsWith(QStringLiteral("effect."))
-            && track.count() > 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
 bool sameEffectValue(const VideoEffect &a, const VideoEffect &b)
 {
     return a.type == b.type
@@ -305,6 +286,27 @@ QVector<int> resolvePreviewEffectSourceIndices(const QVector<VideoEffect> &sourc
     return indices;
 }
 
+KeyframeTrack remapKeyframeTrack(const KeyframeTrack &sourceTrack,
+                                 const QString &propertyName)
+{
+    KeyframeTrack remapped(propertyName, sourceTrack.defaultValue());
+    for (const KeyframePoint &kf : sourceTrack.keyframes()) {
+        remapped.addKeyframe(kf.time,
+                             kf.value,
+                             kf.interpolation,
+                             kf.bezX1,
+                             kf.bezY1,
+                             kf.bezX2,
+                             kf.bezY2,
+                             kf.hasSpatialTangent,
+                             kf.spatialOutX,
+                             kf.spatialOutY,
+                             kf.spatialInX,
+                             kf.spatialInY);
+    }
+    return remapped;
+}
+
 QVector<VideoEffect> effectivePreviewEffectsAt(
     const QVector<VideoEffect> &staticEffects,
     const Timeline *timeline,
@@ -330,37 +332,55 @@ QVector<VideoEffect> effectivePreviewEffectsAt(
         return staticEffects;
 
     const ClipInfo *clip = clipForPlaybackEntry(timeline, *entry);
-    if (!clip || !hasAnyEffectKeyframes(*clip))
+    if (!clip)
         return staticEffects;
 
-    QVector<VideoEffect> effects = staticEffects;
     const QVector<int> sourceIndices =
         resolvePreviewEffectSourceIndices(clip->effects, staticEffects);
     const double clipLocalSec =
         (static_cast<double>(timelineUsec) - entry->timelineStart * 1'000'000.0)
         / 1'000'000.0;
 
-    for (int i = 0; i < effects.size() && i < sourceIndices.size(); ++i) {
-        const int sourceIndex = sourceIndices[i];
-        if (sourceIndex < 0)
-            continue;
+    ClipInfo previewClip = *clip;
+    previewClip.effects.clear();
+    previewClip.keyframes = KeyframeManager();
 
-        const auto schema = effectctrl::paramSchemaFor(effects[i].type);
+    for (int i = 0; i < staticEffects.size() && i < sourceIndices.size(); ++i) {
+        const int sourceIndex = sourceIndices[i];
+        if (sourceIndex < 0 || sourceIndex >= clip->effects.size()) {
+            VideoEffect unmapped = staticEffects[i];
+            unmapped.startSec = -1.0;
+            unmapped.endSec = -1.0;
+            previewClip.effects.append(unmapped);
+            continue;
+        }
+
+        VideoEffect effect = staticEffects[i];
+        effect.startSec = clip->effects[sourceIndex].startSec;
+        effect.endSec = clip->effects[sourceIndex].endSec;
+
+        const int previewIndex = previewClip.effects.size();
+        previewClip.effects.append(effect);
+        const auto schema = effectctrl::paramSchemaFor(effect.type);
         for (const auto &def : schema) {
-            const QString trackName =
+            const QString sourceTrackName =
                 QStringLiteral("effect.%1.%2").arg(sourceIndex).arg(def.name);
-            if (!trackHasKeyframes(clip->keyframes, trackName))
+            const KeyframeTrack *sourceTrack = clip->keyframes.track(sourceTrackName);
+            if (!sourceTrack || sourceTrack->count() <= 0)
                 continue;
 
-            const double currentValue =
-                effectctrl::paramValue(effects[i], def.name);
-            const double value =
-                clip->keyframes.valueAt(trackName, clipLocalSec, currentValue);
-            effectctrl::setParamValue(effects[i], def.name, value);
+            const QString previewTrackName =
+                QStringLiteral("effect.%1.%2").arg(previewIndex).arg(def.name);
+            previewClip.keyframes.addTrack(
+                remapKeyframeTrack(*sourceTrack, previewTrackName));
+
+            const LoopMode loopMode = clip->keyframes.loopOutMode(sourceTrackName);
+            if (loopMode != LoopMode::None)
+                previewClip.keyframes.setLoopOutMode(previewTrackName, loopMode);
         }
     }
 
-    return effects;
+    return clipanim::effectiveEffectsAt(previewClip, clipLocalSec);
 }
 
 void applyLayerMotionOpacity(const Timeline *timeline,
@@ -2769,16 +2789,17 @@ QImage VideoPlayer::composeFrameWithOverlays(const QImage &source) const
     if (source.isNull())
         return source;
 
-    const bool applyPreviewFx = !m_previewEffects.isEmpty()
+    const bool wantsPreviewFx = !m_previewEffects.isEmpty()
                                 && (m_previewEffectsLive || !m_playing);
     const qint64 previewTimelineUsec =
         sequenceActive() ? m_timelinePositionUs : m_currentPositionUs;
-    const QVector<VideoEffect> previewEffects = applyPreviewFx
+    const QVector<VideoEffect> previewEffects = wantsPreviewFx
         ? effectivePreviewEffectsAt(m_previewEffects,
                                     m_glPreview ? m_glPreview->timeline() : nullptr,
                                     m_sequence,
                                     previewTimelineUsec)
         : QVector<VideoEffect>();
+    const bool applyPreviewFx = !previewEffects.isEmpty();
 
     // Preview proxy: only shrink during playback, keep paused frames full-res.
     const int proxy = (applyPreviewFx && m_playing) ? qMax(1, m_proxyDivisor) : 1;
@@ -3092,8 +3113,9 @@ void VideoPlayer::setPreviewEffects(const QVector<VideoEffect> &effects, bool li
             e.type == VideoEffectType::Grayscale ||
             e.type == VideoEffectType::Invert    ||
             e.type == VideoEffectType::Vignette;
-        if (gpuEnabled && gpuCapable) gpu.append(e);
-        else                          cpu.append(e);
+        const bool hasTiming = e.startSec >= 0.0 || e.endSec >= 0.0;
+        if (gpuEnabled && gpuCapable && !hasTiming) gpu.append(e);
+        else                                        cpu.append(e);
     }
 
     m_previewEffects = cpu;
