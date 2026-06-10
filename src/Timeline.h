@@ -559,6 +559,7 @@ public:
     // Phase 3: Color correction, effects, keyframes
     void setClipColorCorrection(const ColorCorrection &cc);
     void setClipLayerStyle(const LayerStyle &style);
+    void setClipLayerStyle(int trackIdx, int clipIdx, const LayerStyle &style);
     // Attach a transition to the currently selected clip. FadeIn writes to
     // the clip's leadIn slot (start-of-clip); every other type writes to
     // trailOut (end-of-clip / boundary to next clip).
@@ -569,6 +570,7 @@ public:
     void setClipKeyframes(const KeyframeManager &km);
     ColorCorrection clipColorCorrection() const;
     LayerStyle clipLayerStyle() const;
+    LayerStyle clipLayerStyle(int trackIdx, int clipIdx) const;
     QVector<VideoEffect> clipEffects() const;
     KeyframeManager clipKeyframes() const;
     double selectedClipDuration() const;

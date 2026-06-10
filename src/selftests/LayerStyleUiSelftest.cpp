@@ -135,6 +135,44 @@ int runLayerStyleUiSelftest()
         }
     }
 
+    {
+        if (!qApp) {
+            printSkip("G5 TRACK-AWARE SET/GET",
+                      "Timeline is a QWidget and cannot be constructed before QApplication",
+                      skipped);
+        } else {
+            Timeline timeline;
+            timeline.addVideoTrack();
+            const auto &tracks = timeline.videoTracks();
+            if (tracks.size() < 2 || !tracks[0] || !tracks[1]) {
+                printSkip("G5 TRACK-AWARE SET/GET",
+                          "Timeline could not provide V1+V2 video tracks",
+                          skipped);
+            } else {
+                tracks[0]->setClips(QVector<ClipInfo>{basicClip()});
+                tracks[0]->setSelectedClip(0);
+                tracks[1]->setClips(QVector<ClipInfo>{basicClip()});
+
+                LayerStyle v2Style;
+                v2Style.dropShadowEnabled = true;
+                v2Style.shadowBlurRadius = 9.0;
+                timeline.setClipLayerStyle(1, 0, v2Style);
+
+                const bool v2Saved = sameStyle(timeline.clipLayerStyle(1, 0), v2Style);
+                const bool v1Clean = timeline.clipLayerStyle(0, 0).isIdentity();
+                // out-of-range writes must be silent no-ops
+                timeline.setClipLayerStyle(5, 0, v2Style);
+                timeline.setClipLayerStyle(1, 7, v2Style);
+                const bool boundsOk = timeline.clipLayerStyle(5, 0).isIdentity()
+                                   && timeline.clipLayerStyle(1, 7).isIdentity();
+                printGate("G5 TRACK-AWARE SET/GET",
+                          v2Saved && v1Clean && boundsOk,
+                          "V2 style must land on V2 only, V1 stays identity, OOB is a no-op",
+                          passed, failed);
+            }
+        }
+    }
+
     std::printf("[layer-style-ui] summary passed=%d skipped=%d failed=%d\n",
                 passed, skipped, failed);
     return failed == 0 ? 0 : 1;

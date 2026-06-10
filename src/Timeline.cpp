@@ -4410,10 +4410,23 @@ void Timeline::setClipColorCorrection(const ColorCorrection &cc)
 void Timeline::setClipLayerStyle(const LayerStyle &style)
 {
     int sel = m_videoTrack->selectedClip();
-    if (sel < 0) return;
-    auto clips = m_videoTrack->clips();
-    clips[sel].layerStyle = style;
-    m_videoTrack->setClips(clips);
+    setClipLayerStyle(0, sel, style);
+}
+
+void Timeline::setClipLayerStyle(int trackIdx, int clipIdx, const LayerStyle &style)
+{
+    if (trackIdx < 0 || trackIdx >= m_videoTracks.size())
+        return;
+    auto *track = m_videoTracks[trackIdx];
+    if (!track)
+        return;
+
+    auto clips = track->clips();
+    if (clipIdx < 0 || clipIdx >= clips.size())
+        return;
+
+    clips[clipIdx].layerStyle = style;
+    track->setClips(clips);
     saveUndoState("Layer style");
     scheduleEmitSequenceChanged();
 }
@@ -4625,8 +4638,20 @@ ColorCorrection Timeline::clipColorCorrection() const
 LayerStyle Timeline::clipLayerStyle() const
 {
     int sel = m_videoTrack->selectedClip();
-    if (sel < 0 || sel >= m_videoTrack->clips().size()) return {};
-    return m_videoTrack->clips()[sel].layerStyle;
+    return clipLayerStyle(0, sel);
+}
+
+LayerStyle Timeline::clipLayerStyle(int trackIdx, int clipIdx) const
+{
+    if (trackIdx < 0 || trackIdx >= m_videoTracks.size())
+        return {};
+    const auto *track = m_videoTracks[trackIdx];
+    if (!track)
+        return {};
+    const auto &clips = track->clips();
+    if (clipIdx < 0 || clipIdx >= clips.size())
+        return {};
+    return clips[clipIdx].layerStyle;
 }
 
 QVector<VideoEffect> Timeline::clipEffects() const

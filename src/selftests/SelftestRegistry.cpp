@@ -356,8 +356,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "ImportHub ingest previews: mesh wireframe determinism + empty placeholder (QApplication-free)" },
     { "layer-style",        "VEDITOR_LAYER_STYLE_SELFTEST",        runLayerStyleSelftest,          false,
       "LayerStyle: identity fast path, drop shadow, stroke, and project JSON omission/round-trip" },
-    { "layer-style-ui",     "VEDITOR_LAYER_STYLE_UI_SELFTEST",     runLayerStyleUiSelftest,       false,
-      "Layer Style UI: default identity, JSON round-trip, enabled-flag identity, and optional Timeline setter/getter gate" },
+    { "layer-style-ui",     "VEDITOR_LAYER_STYLE_UI_SELFTEST",     runLayerStyleUiSelftest,       true,
+      "Layer Style UI: default identity, JSON round-trip, enabled-flag identity, and Timeline setter/getter gates (V1 legacy + track-aware)" },
     { "smart-render",       "VEDITOR_SMART_RENDER_SELFTEST",       runSmartRenderSelftest,        false,
       "Smart Render T4: conservative stream-copy eligibility predicate + env gate" },
     // QApplication-required (needsQApplication=true) ----------------------

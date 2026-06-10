@@ -447,7 +447,9 @@ void EffectControlsPanel::persistLayerStyleFromControls()
 {
     if (m_blockLayerStyleUi || !m_timeline || !m_currentClipKey.valid())
         return;
-    m_timeline->setClipLayerStyle(layerStyleFromControls());
+    m_timeline->setClipLayerStyle(m_currentClipKey.trackIdx,
+                                  m_currentClipKey.clipIdx,
+                                  layerStyleFromControls());
 }
 
 void EffectControlsPanel::chooseShadowColor()
