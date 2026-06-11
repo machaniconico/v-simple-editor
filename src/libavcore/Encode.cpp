@@ -1014,9 +1014,11 @@ void FrameEncoder::muxAudioPassthroughPackets()
                 if (normPts < 0) normPts = 0;
             }
             if (trimStartInTb > 0 && pkt->pts != AV_NOPTS_VALUE) {
-                const int64_t pktDuration =
-                    pkt->duration > 0 ? pkt->duration : 0;
-                if (normPts + pktDuration <= trimStartInTb) {
+                const bool packetEndsBeforeTrim =
+                    (pkt->duration > 0)
+                        ? (normPts + pkt->duration <= trimStartInTb)
+                        : (normPts < trimStartInTb);
+                if (packetEndsBeforeTrim) {
                     av_packet_unref(pkt);
                     continue;
                 }

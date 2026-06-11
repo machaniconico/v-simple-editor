@@ -1,5 +1,9 @@
 #include "Concat.h"
 
+#include <QByteArray>
+#include <QtGlobal>
+
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <limits>
@@ -44,6 +48,11 @@ std::string concatError(std::string msg)
     return msg;
 }
 
+bool concatTestReadErrorEnabled()
+{
+    return qgetenv("VEDITOR_CONCAT_TEST_READ_ERROR") == QByteArray("1");
+}
+
 } // namespace
 
 std::optional<std::string> concatCopy(const std::vector<std::string>& inputPaths,
@@ -55,6 +64,7 @@ std::optional<std::string> concatCopy(const std::vector<std::string>& inputPaths
     if (outputPath.empty()) {
         return concatError("concatCopy: output path is empty");
     }
+    const bool injectReadError = concatTestReadErrorEnabled();
 
     // ----- allocate the output muxer (container inferred from extension) -----
     AVFormatContext* outFmt = nullptr;
@@ -66,14 +76,11 @@ std::optional<std::string> concatCopy(const std::vector<std::string>& inputPaths
             + outputPath + "'");
     }
 
-    // Per-output-stream cumulative duration, expressed in that stream's
+    // Shared cumulative timeline position, expressed once per output stream's
     // time_base. Each subsequent input's packets are shifted by this offset so
-    // timestamps increase monotonically across joins. Maps 1:1 onto the output
-    // streams created from the first input.
+    // timestamps increase monotonically across joins while all streams start
+    // from the same per-file boundary.
     std::vector<int64_t> nextStreamOffset;
-    // Highest (end) timestamp seen so far on each output stream, in its
-    // time_base — used to derive the offset applied to the *next* input.
-    std::vector<int64_t> streamEndTs;
     // codec_type per output stream (for AV_NOPTS / duration heuristics).
     std::vector<AVMediaType> streamType;
     // Last DTS actually handed to the muxer on each output stream, in that
@@ -170,7 +177,6 @@ std::optional<std::string> concatCopy(const std::vector<std::string>& inputPaths
             }
 
             nextStreamOffset.assign(outFmt->nb_streams, 0);
-            streamEndTs.assign(outFmt->nb_streams, AV_NOPTS_VALUE);
             streamType.assign(outFmt->nb_streams, AVMEDIA_TYPE_UNKNOWN);
             lastWrittenDts.assign(outFmt->nb_streams, AV_NOPTS_VALUE);
             for (unsigned i = 0; i < inGuard.ctx->nb_streams; ++i) {
@@ -244,17 +250,85 @@ std::optional<std::string> concatCopy(const std::vector<std::string>& inputPaths
         // Per-input running maximum end-timestamp, in output time_base, used
         // to advance nextStreamOffset for the input that follows this one.
         std::vector<int64_t> inputEndTs(outFmt->nb_streams, AV_NOPTS_VALUE);
-        // Per-input, per-output-stream origin: the timestamp of the first
-        // packet observed on that stream (in output time_base, after rescale,
-        // before any join offset). Subtracted from every packet of this input
-        // so each input is normalised to a 0 origin — this cancels the input's
-        // own start_time / encoder-delay offset (e.g. a clip extracted from the
-        // middle of a longer file) that would otherwise leave a gap or overlap
-        // at the join boundary. AV_NOPTS_VALUE = no packet seen yet.
-        std::vector<int64_t> inputOrigin(outFmt->nb_streams, AV_NOPTS_VALUE);
+        // Per-input common origin: the earliest packet timestamp across all
+        // mapped streams. Subtracting the same origin from every stream
+        // preserves real A/V lead/lag inside the input while still cancelling
+        // container/file start offsets.
+        int64_t inputOriginTs = 0;
+        AVRational inputOriginTimeBase{1, AV_TIME_BASE};
+        bool inputOriginResolved = false;
+
+        int readRc = 0;
+        while ((readRc = av_read_frame(inGuard.ctx, pkt)) >= 0) {
+            const int srcIdx = pkt->stream_index;
+            if (srcIdx >= 0
+                && static_cast<unsigned>(srcIdx) < streamMap.size()
+                && streamMap[srcIdx] >= 0) {
+                AVStream* inStream = inGuard.ctx->streams[srcIdx];
+                if (inStream) {
+                    const int64_t ts =
+                        (pkt->pts != AV_NOPTS_VALUE) ? pkt->pts : pkt->dts;
+                    if (ts != AV_NOPTS_VALUE) {
+                        if (!inputOriginResolved
+                            || av_compare_ts(ts, inStream->time_base,
+                                             inputOriginTs,
+                                             inputOriginTimeBase) < 0) {
+                            inputOriginTs = ts;
+                            inputOriginTimeBase = inStream->time_base;
+                            inputOriginResolved = true;
+                        }
+                    }
+                }
+            }
+            av_packet_unref(pkt);
+        }
+        if (readRc != AVERROR_EOF) {
+            av_packet_free(&pkt);
+            teardown();
+            return concatError(
+                std::string("concatCopy: failed to read input '") + inPath
+                + "': " + ffmpegErrorString(readRc));
+        }
+        if (!inputOriginResolved) {
+            inputOriginTs = 0;
+            inputOriginTimeBase = AVRational{1, AV_TIME_BASE};
+        }
+
+        avformat_close_input(&inGuard.ctx);
+        rc = avformat_open_input(&inGuard.ctx, inPath.c_str(),
+                                 nullptr, nullptr);
+        if (rc < 0) {
+            av_packet_free(&pkt);
+            teardown();
+            return concatError(
+                std::string("concatCopy: cannot reopen input '") + inPath
+                + "': " + ffmpegErrorString(rc));
+        }
+        rc = avformat_find_stream_info(inGuard.ctx, nullptr);
+        if (rc < 0) {
+            av_packet_free(&pkt);
+            teardown();
+            return concatError(
+                std::string("concatCopy: cannot reread stream info for '")
+                + inPath + "': " + ffmpegErrorString(rc));
+        }
+        if (inGuard.ctx->nb_streams != streamMap.size()) {
+            av_packet_free(&pkt);
+            teardown();
+            return concatError(
+                std::string("concatCopy: reopened input '") + inPath
+                + "' changed stream layout");
+        }
 
         // ----- copy every packet, shifted into the joined timeline -----
-        while (av_read_frame(inGuard.ctx, pkt) >= 0) {
+        readRc = 0;
+        int injectedReadPackets = 0;
+        while ((readRc = av_read_frame(inGuard.ctx, pkt)) >= 0) {
+            if (injectReadError && ++injectedReadPackets >= 5) {
+                av_packet_unref(pkt);
+                readRc = AVERROR(EIO);
+                break;
+            }
             const int srcIdx = pkt->stream_index;
             if (srcIdx < 0
                 || static_cast<unsigned>(srcIdx) >= streamMap.size()
@@ -271,19 +345,9 @@ std::optional<std::string> concatCopy(const std::vector<std::string>& inputPaths
             av_packet_rescale_ts(pkt, inStream->time_base,
                                  outStream->time_base);
 
-            // Capture this input's per-stream origin from the first packet
-            // seen, then normalise every packet to a 0 origin so the input's
-            // own start_time / encoder delay does not bleed into the join.
-            if (inputOrigin[outIdx] == AV_NOPTS_VALUE) {
-                if (pkt->pts != AV_NOPTS_VALUE) {
-                    inputOrigin[outIdx] = pkt->pts;
-                } else if (pkt->dts != AV_NOPTS_VALUE) {
-                    inputOrigin[outIdx] = pkt->dts;
-                }
-            }
-            const int64_t origin = (inputOrigin[outIdx] != AV_NOPTS_VALUE)
-                                       ? inputOrigin[outIdx]
-                                       : 0;
+            const int64_t origin =
+                av_rescale_q(inputOriginTs, inputOriginTimeBase,
+                             outStream->time_base);
 
             // Append after every earlier input: shift by (offset - origin) so
             // this input is 0-origin and then placed at the cumulative offset.
@@ -341,13 +405,35 @@ std::optional<std::string> concatCopy(const std::vector<std::string>& inputPaths
                     + inPath + "': " + ffmpegErrorString(wrc));
             }
         }
+        if (readRc != AVERROR_EOF) {
+            av_packet_free(&pkt);
+            teardown();
+            return concatError(
+                std::string("concatCopy: failed to read input '") + inPath
+                + "': " + ffmpegErrorString(readRc));
+        }
 
         // Advance the cumulative offset for every stream so the next input
         // is placed immediately after the longest stream of this input.
+        int64_t nextInputStartUs = AV_NOPTS_VALUE;
         for (unsigned s = 0; s < outFmt->nb_streams; ++s) {
             if (inputEndTs[s] != AV_NOPTS_VALUE) {
-                nextStreamOffset[s] = inputEndTs[s];
-                streamEndTs[s] = inputEndTs[s];
+                const int64_t endUs =
+                    av_rescale_q(inputEndTs[s],
+                                 outFmt->streams[s]->time_base,
+                                 AVRational{1, AV_TIME_BASE});
+                if (nextInputStartUs == AV_NOPTS_VALUE
+                    || endUs > nextInputStartUs) {
+                    nextInputStartUs = endUs;
+                }
+            }
+        }
+        if (nextInputStartUs != AV_NOPTS_VALUE) {
+            for (unsigned s = 0; s < outFmt->nb_streams; ++s) {
+                nextStreamOffset[s] =
+                    av_rescale_q(nextInputStartUs,
+                                 AVRational{1, AV_TIME_BASE},
+                                 outFmt->streams[s]->time_base);
             }
         }
     }
