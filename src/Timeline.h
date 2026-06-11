@@ -545,8 +545,8 @@ public:
 
     // Clip speed & volume
     void setClipSpeed(double speed);
-    void setClipVolume(double volume);
-    void setClipPan(double pan);
+    void setClipVolume(double volume, bool recordUndo = true);
+    void setClipPan(double pan, bool recordUndo = true);
 
     // Per-clip speed-ramp (variable speed curve). Operates on V1 by clip
     // index. Returns the identity ramp for invalid indices so callers can

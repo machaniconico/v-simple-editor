@@ -34,6 +34,7 @@ public:
     double volume() const;
     void setPan(double pan);
     double pan() const;
+    static bool isSliderDragUndoSuppressed();
 
 signals:
     void envelopeChanged(const QList<VolumeEnvelopePoint>& points);
@@ -56,6 +57,10 @@ private:
     double m_volume = 1.0;
     double m_pan = 0.0;
     bool m_updatingControls = false;
+    bool m_volumeSliderDragging = false;
+    bool m_panSliderDragging = false;
+    int m_volumeSliderDragStartValue = 100;
+    int m_panSliderDragStartValue = 0;
 
     QWidget* m_controlPanel = nullptr;
     QSlider* m_volumeSlider = nullptr;
@@ -70,6 +75,8 @@ private:
     int hitTest(const QPointF& px, double hitRadiusPx = 8.0) const;  // 既存点インデックス or -1
     void sortPoints();
     void emitChanged();
+    void emitVolumeChangedForUndo(bool recordUndo);
+    void emitPanChangedForUndo(bool recordUndo);
 
     // 描画余白
     static constexpr int kMarginLeft   = 30;

@@ -15,6 +15,17 @@
 #include <QtMath>
 #include <algorithm>
 
+namespace {
+thread_local int s_sliderDragUndoSuppressionDepth = 0;
+
+// RAII guard so a throwing slot chain (e.g. bad_alloc in saveState) cannot
+// leave the suppression depth stuck >0 and silently kill undo recording.
+struct SliderDragUndoSuppressionScope {
+    SliderDragUndoSuppressionScope() { ++s_sliderDragUndoSuppressionDepth; }
+    ~SliderDragUndoSuppressionScope() { --s_sliderDragUndoSuppressionDepth; }
+};
+}
+
 // ─── helpers ────────────────────────────────────────────────────────────────
 
 static inline double lerp(double a, double b, double t)
@@ -66,27 +77,51 @@ AudioClipEditor::AudioClipEditor(QWidget* parent)
     row->addWidget(m_panSpin);
     row->addStretch();
 
+    connect(m_volumeSlider, &QSlider::sliderPressed, this, [this]() {
+        m_volumeSliderDragging = true;
+        m_volumeSliderDragStartValue = m_volumeSlider ? m_volumeSlider->value() : 100;
+    });
+    connect(m_volumeSlider, &QSlider::sliderReleased, this, [this]() {
+        if (!m_volumeSliderDragging) return;
+        const bool changed = m_volumeSlider
+            && m_volumeSlider->value() != m_volumeSliderDragStartValue;
+        m_volumeSliderDragging = false;
+        if (changed)
+            emitVolumeChangedForUndo(true);
+    });
     connect(m_volumeSlider, &QSlider::valueChanged, this, [this](int value) {
         if (m_updatingControls) return;
         setVolume(static_cast<double>(value) / 100.0);
-        emit volumeChanged(m_volume);
+        emitVolumeChangedForUndo(!m_volumeSliderDragging);
     });
     connect(m_volumeSpin, qOverload<double>(&QDoubleSpinBox::valueChanged),
             this, [this](double value) {
         if (m_updatingControls) return;
         setVolume(value);
-        emit volumeChanged(m_volume);
+        emitVolumeChangedForUndo(true);
+    });
+    connect(m_panSlider, &QSlider::sliderPressed, this, [this]() {
+        m_panSliderDragging = true;
+        m_panSliderDragStartValue = m_panSlider ? m_panSlider->value() : 0;
+    });
+    connect(m_panSlider, &QSlider::sliderReleased, this, [this]() {
+        if (!m_panSliderDragging) return;
+        const bool changed = m_panSlider
+            && m_panSlider->value() != m_panSliderDragStartValue;
+        m_panSliderDragging = false;
+        if (changed)
+            emitPanChangedForUndo(true);
     });
     connect(m_panSlider, &QSlider::valueChanged, this, [this](int value) {
         if (m_updatingControls) return;
         setPan(static_cast<double>(value) / 100.0);
-        emit panChanged(m_pan);
+        emitPanChangedForUndo(!m_panSliderDragging);
     });
     connect(m_panSpin, qOverload<double>(&QDoubleSpinBox::valueChanged),
             this, [this](double value) {
         if (m_updatingControls) return;
         setPan(value);
-        emit panChanged(m_pan);
+        emitPanChangedForUndo(true);
     });
 
     setMinimumSize(560, 160);
@@ -194,7 +229,34 @@ double AudioClipEditor::pan() const
     return m_pan;
 }
 
+bool AudioClipEditor::isSliderDragUndoSuppressed()
+{
+    return s_sliderDragUndoSuppressionDepth > 0;
+}
+
 // ─── private helpers ─────────────────────────────────────────────────────────
+
+void AudioClipEditor::emitVolumeChangedForUndo(bool recordUndo)
+{
+    if (recordUndo) {
+        emit volumeChanged(m_volume);
+        return;
+    }
+
+    const SliderDragUndoSuppressionScope suppress;
+    emit volumeChanged(m_volume);
+}
+
+void AudioClipEditor::emitPanChangedForUndo(bool recordUndo)
+{
+    if (recordUndo) {
+        emit panChanged(m_pan);
+        return;
+    }
+
+    const SliderDragUndoSuppressionScope suppress;
+    emit panChanged(m_pan);
+}
 
 QPointF AudioClipEditor::pointToPixel(const VolumeEnvelopePoint& p) const
 {

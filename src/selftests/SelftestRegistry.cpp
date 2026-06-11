@@ -6,11 +6,14 @@
 #include "SelftestRegistry.h"
 
 #include <cstring>
+#include <cmath>
 #include <iostream>
 #include <QString>
 #include <QStringList>
 #include <QCoreApplication>
 #include <QDebug>
+#include "../Timeline.h"
+#include "../UndoManager.h"
 #include "../util/Logger.h"
 
 // ---------------------------------------------------------------------------
@@ -33,6 +36,7 @@ int runOAuthMockE2eSelftest();
 int runOAuthRefreshE2eSelftest();
 int runAnimExportSelftest();
 int runAudioBusSelftest();
+int runAudioClipDragUndoSelftest();
 int runAudioMixerSelftest();
 int runAudioRestoreSelftest();
 int runAutoClipGenSelftest();
@@ -170,6 +174,138 @@ int runGpuIdtParitySelftest();
 int runGpuIdtMatteParitySelftest();
 int runHdrCompositeParitySelftest();
 int runPreview16PolicySelftest();
+
+namespace {
+
+bool audioClipDragUndoRequire(bool condition,
+                              const char *gate,
+                              const QString &message,
+                              int &passed,
+                              int &failed)
+{
+    if (condition) {
+        ++passed;
+        std::cout << "[audio-clip-drag-undo] PASS " << gate << '\n';
+        return true;
+    }
+
+    ++failed;
+    std::cerr << "[audio-clip-drag-undo] FAIL " << gate << ": "
+              << message.toStdString() << '\n';
+    return false;
+}
+
+bool nearlyEqual(double a, double b)
+{
+    return std::fabs(a - b) <= 1e-9;
+}
+
+ClipInfo makeAudioClipDragUndoClip()
+{
+    ClipInfo clip;
+    clip.filePath = QStringLiteral("audio-clip-drag-undo.wav");
+    clip.displayName = QStringLiteral("audio-clip-drag-undo");
+    clip.duration = 10.0;
+    return clip;
+}
+
+double selectedAudioPan(const Timeline &timeline)
+{
+    const auto &tracks = timeline.audioTracks();
+    if (tracks.isEmpty() || !tracks[0] || tracks[0]->clips().isEmpty())
+        return 0.0;
+    return tracks[0]->clips()[0].pan;
+}
+
+double selectedAudioVolume(const Timeline &timeline)
+{
+    const auto &tracks = timeline.audioTracks();
+    if (tracks.isEmpty() || !tracks[0] || tracks[0]->clips().isEmpty())
+        return 0.0;
+    return tracks[0]->clips()[0].volume;
+}
+
+} // namespace
+
+int runAudioClipDragUndoSelftest()
+{
+    std::cout << "[audio-clip-drag-undo] selftest start\n";
+    int passed = 0;
+    int failed = 0;
+
+    Timeline timeline;
+    const ClipInfo clip = makeAudioClipDragUndoClip();
+    timeline.videoTracks()[0]->addClip(clip);
+    timeline.audioTracks()[0]->addClip(clip);
+    // Select the video clip only — Timeline's non-additive selection handler
+    // clears every other track, so selecting the audio clip afterwards would
+    // deselect V1 and setClipVolume/setClipPan (keyed to V1's selection)
+    // would early-return without mutating anything.
+    timeline.videoTracks()[0]->setSelectedClip(0);
+
+    UndoManager *undo = timeline.undoManager();
+    const int baseIndex = undo ? undo->currentIndex() : -1;
+
+    timeline.setClipPan(-0.25, false);
+    timeline.setClipPan(0.40, false);
+    timeline.setClipPan(0.75, false);
+    audioClipDragUndoRequire(undo && undo->currentIndex() == baseIndex,
+                             "G1 drag pan ticks do not record undo",
+                             QStringLiteral("expected undo index %1, got %2")
+                                 .arg(baseIndex).arg(undo ? undo->currentIndex() : -1),
+                             passed, failed);
+    audioClipDragUndoRequire(nearlyEqual(selectedAudioPan(timeline), 0.75),
+                             "G2 drag pan ticks remain live",
+                             QStringLiteral("expected live pan 0.75, got %1")
+                                 .arg(selectedAudioPan(timeline), 0, 'f', 6),
+                             passed, failed);
+
+    timeline.setClipPan(0.75, true);
+    const int afterDragIndex = baseIndex + 1;
+    audioClipDragUndoRequire(undo && undo->currentIndex() == afterDragIndex,
+                             "G3 drag pan release records one undo",
+                             QStringLiteral("expected undo index %1, got %2")
+                                 .arg(afterDragIndex).arg(undo ? undo->currentIndex() : -1),
+                             passed, failed);
+
+    timeline.setClipPan(-0.10);
+    audioClipDragUndoRequire(undo && undo->currentIndex() == afterDragIndex + 1,
+                             "G4 keyboard/default pan records one undo",
+                             QStringLiteral("expected undo index %1, got %2")
+                                 .arg(afterDragIndex + 1).arg(undo ? undo->currentIndex() : -1),
+                             passed, failed);
+    audioClipDragUndoRequire(nearlyEqual(selectedAudioPan(timeline), -0.10),
+                             "G5 keyboard/default pan remains live",
+                             QStringLiteral("expected pan -0.10, got %1")
+                                 .arg(selectedAudioPan(timeline), 0, 'f', 6),
+                             passed, failed);
+
+    const int beforeVolumeDragIndex = undo ? undo->currentIndex() : -1;
+    timeline.setClipVolume(0.50, false);
+    timeline.setClipVolume(1.20, false);
+    audioClipDragUndoRequire(undo && undo->currentIndex() == beforeVolumeDragIndex,
+                             "G6 drag volume ticks do not record undo",
+                             QStringLiteral("expected undo index %1, got %2")
+                                 .arg(beforeVolumeDragIndex).arg(undo ? undo->currentIndex() : -1),
+                             passed, failed);
+    audioClipDragUndoRequire(nearlyEqual(selectedAudioVolume(timeline), 1.20),
+                             "G7 drag volume ticks remain live",
+                             QStringLiteral("expected live volume 1.20, got %1")
+                                 .arg(selectedAudioVolume(timeline), 0, 'f', 6),
+                             passed, failed);
+
+    timeline.setClipVolume(1.20, true);
+    audioClipDragUndoRequire(undo && undo->currentIndex() == beforeVolumeDragIndex + 1,
+                             "G8 drag volume release records one undo",
+                             QStringLiteral("expected undo index %1, got %2")
+                                 .arg(beforeVolumeDragIndex + 1)
+                                 .arg(undo ? undo->currentIndex() : -1),
+                             passed, failed);
+
+    std::cout << "[audio-clip-drag-undo] summary: "
+              << passed << " passed, " << failed << " failed\n";
+    return failed == 0 ? 0 : 1;
+}
 
 namespace selftests {
 
@@ -483,6 +619,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Text overlay export pipeline smoke (MSE threshold, AE-text parity)" },
     { "workflow",          "VEDITOR_WORKFLOW_SELFTEST",           runWorkflowSelftest,           true,
       "Workflow / scripting module smoke (macro record + replay pipeline)" },
+    { "audio-clip-drag-undo", "VEDITOR_AUDIO_CLIP_DRAG_UNDO_SELFTEST", runAudioClipDragUndoSelftest, true,
+      "AudioClipEditor drag ticks live-update without filling undo; release/default calls record once" },
     { "audiomixer",        "VEDITOR_AUDIOMIXER_SELFTEST",         runAudioMixerSelftest,         true,
       "Audio mixer module smoke (Sprint-23 bus routing + send/return stubs)" },
     { "oauth-mock-e2e",   "VEDITOR_OAUTH_MOCK_SELFTEST",        runOAuthMockE2eSelftest,       true,

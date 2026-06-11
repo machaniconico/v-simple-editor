@@ -1,4 +1,5 @@
 #include "Timeline.h"
+#include "AudioClipEditor.h"
 #include "VideoPlayer.h"
 #include "SilenceCut.h"
 #include "BeatDetect.h"
@@ -4365,7 +4366,7 @@ void Timeline::setClipSpeed(double speed)
     updateInfoLabel();
 }
 
-void Timeline::setClipVolume(double volume)
+void Timeline::setClipVolume(double volume, bool recordUndo)
 {
     int sel = m_videoTrack->selectedClip();
     if (sel < 0) return;
@@ -4375,13 +4376,14 @@ void Timeline::setClipVolume(double volume)
         audioClips[sel].volume = volume;
         m_audioTrack->setClips(audioClips);
     }
-    saveUndoState(QString("Set volume %1%").arg(static_cast<int>(volume * 100)));
+    if (recordUndo && !AudioClipEditor::isSliderDragUndoSuppressed())
+        saveUndoState(QString("Set volume %1%").arg(static_cast<int>(volume * 100)));
     // Re-emit so AudioMixer picks up the new per-clip volume for the
     // matching PlaybackEntry on its next setSequence call.
     scheduleEmitSequenceChanged();
 }
 
-void Timeline::setClipPan(double pan)
+void Timeline::setClipPan(double pan, bool recordUndo)
 {
     int sel = m_videoTrack->selectedClip();
     if (sel < 0) return;
@@ -4391,7 +4393,8 @@ void Timeline::setClipPan(double pan)
         audioClips[sel].pan = pan;
         m_audioTrack->setClips(audioClips);
     }
-    saveUndoState(QString("Set pan %1").arg(pan, 0, 'f', 2));
+    if (recordUndo && !AudioClipEditor::isSliderDragUndoSuppressed())
+        saveUndoState(QString("Set pan %1").arg(pan, 0, 'f', 2));
     scheduleEmitSequenceChanged();
 }
 
