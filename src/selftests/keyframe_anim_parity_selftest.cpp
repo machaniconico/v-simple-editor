@@ -238,6 +238,34 @@ int runKeyframeAnimParitySelftest()
                   .arg(at1, 0, 'g', 12));
     }
 
+    // G6: discrete effect parameters clamp easing overshoot into schema range.
+    {
+        ClipInfo clip = makeClip(clipPath);
+        clip.effects.append(VideoEffect::createMirror(0));
+
+        const QString trackName = QStringLiteral("effect.0.mode");
+        KeyframeTrack mirrorMode(trackName, 0.0);
+        mirrorMode.addKeyframe(0.0, 0.0, KeyframePoint::ElasticOut);
+        mirrorMode.addKeyframe(1.0, 3.0);
+        clip.keyframes.addTrack(mirrorMode);
+
+        const double sampleTime = 0.15;
+        const double rawValue = clip.keyframes.valueAt(trackName, sampleTime, 0.0);
+        const QVector<VideoEffect> effects =
+            clipanim::effectiveEffectsAt(clip, sampleTime);
+        const double effectiveMode =
+            effects.isEmpty() ? -1.0 : effects.first().param1;
+        check(6, "ElasticOut enum/int effect keyframes clamp to valid range",
+              rawValue > 3.0
+                  && effects.size() == 1
+                  && effectiveMode >= 0.0
+                  && effectiveMode <= 3.0
+                  && near(effectiveMode, 3.0, 1e-9),
+              QStringLiteral("raw=%1 effective=%2")
+                  .arg(rawValue, 0, 'g', 12)
+                  .arg(effectiveMode, 0, 'g', 12));
+    }
+
     qInfo().noquote()
         << QStringLiteral("KEYFRAME-ANIM-PARITY: %1/%2 PASS")
                .arg(passed)

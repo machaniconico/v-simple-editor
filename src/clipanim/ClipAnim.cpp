@@ -193,6 +193,52 @@ QPointF cubicPoint(const QPointF& p0,
                    a * p0.y() + b * c1.y() + c * c2.y() + d * p1.y());
 }
 
+bool spatialLoopApplies(const ClipInfo& clip, const QString& trackName)
+{
+    const LoopMode mode = clip.keyframes.loopOutMode(trackName);
+    const KeyframeTrack *track = clip.keyframes.track(trackName);
+    return (mode == LoopMode::Cycle || mode == LoopMode::PingPong)
+        && track
+        && track->count() >= 2;
+}
+
+double spatialPathLocalSeconds(const ClipInfo& clip, double clipLocalSeconds)
+{
+    if (spatialLoopApplies(clip, kPosXTrack))
+        return clip.keyframes.loopedTimeForTrack(kPosXTrack, clipLocalSeconds);
+    if (spatialLoopApplies(clip, kPosYTrack))
+        return clip.keyframes.loopedTimeForTrack(kPosYTrack, clipLocalSeconds);
+    return clipLocalSeconds;
+}
+
+double clampedAnimatedParamValue(const effectctrl::ParamDef& def, double value)
+{
+    if (def.type != effectctrl::ParamType::Int
+        && def.type != effectctrl::ParamType::Choice) {
+        return value;
+    }
+
+    if (!std::isfinite(value))
+        return def.defaultVal;
+
+    double minValue = def.minVal;
+    double maxValue = def.maxVal;
+    if ((!std::isfinite(minValue)
+         || !std::isfinite(maxValue)
+         || maxValue < minValue)
+        && !def.choices.isEmpty()) {
+        minValue = 0.0;
+        maxValue = static_cast<double>(def.choices.size() - 1);
+    }
+
+    if (std::isfinite(minValue)
+        && std::isfinite(maxValue)
+        && maxValue >= minValue) {
+        return std::max(minValue, std::min(maxValue, value));
+    }
+    return value;
+}
+
 bool spatialPositionAt(const ClipInfo& clip,
                        double clipLocalSeconds,
                        QPointF *position)
@@ -203,10 +249,11 @@ bool spatialPositionAt(const ClipInfo& clip,
     if (times.size() < 2)
         return false;
 
+    const double pathSeconds = spatialPathLocalSeconds(clip, clipLocalSeconds);
     int segment = -1;
     for (int i = 0; i < times.size() - 1; ++i) {
-        if (clipLocalSeconds + kKeyTimeEpsilon >= times[i]
-            && clipLocalSeconds - kKeyTimeEpsilon <= times[i + 1]) {
+        if (pathSeconds + kKeyTimeEpsilon >= times[i]
+            && pathSeconds - kKeyTimeEpsilon <= times[i + 1]) {
             segment = i;
             break;
         }
@@ -245,7 +292,7 @@ bool spatialPositionAt(const ClipInfo& clip,
     if (!finitePoint(c1) || !finitePoint(c2))
         return false;
 
-    double u = (clipLocalSeconds - startTime) / (endTime - startTime);
+    double u = (pathSeconds - startTime) / (endTime - startTime);
     u = std::max(0.0, std::min(1.0, u));
     const KeyframePoint *easeKeyframe = xStart ? xStart : yStart;
     u = easedProgress(u, easeKeyframe);
@@ -353,8 +400,9 @@ QVector<VideoEffect> effectiveEffectsAt(const ClipInfo& clip,
 
             const double currentValue =
                 effectctrl::paramValue(effects[i], def.name);
-            const double value =
+            const double interpolated =
                 clip.keyframes.valueAt(trackName, clipLocalSeconds, currentValue);
+            const double value = clampedAnimatedParamValue(def, interpolated);
             effectctrl::setParamValue(effects[i], def.name, value);
         }
     }

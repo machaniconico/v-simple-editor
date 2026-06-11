@@ -78,46 +78,66 @@ double positiveModulo(double value, double period)
     return phase;
 }
 
+double loopedTrackTimeAt(const KeyframeTrack &track, LoopMode mode, double time)
+{
+    if (mode == LoopMode::None || mode == LoopMode::Continue)
+        return time;
+
+    const QVector<KeyframePoint> &keyframes = track.keyframes();
+    if (keyframes.size() < 2)
+        return time;
+
+    const KeyframePoint &first = keyframes.first();
+    const KeyframePoint &last = keyframes.last();
+    if (time <= last.time)
+        return time;
+
+    const double range = last.time - first.time;
+    if (!std::isfinite(range) || range <= 0.0)
+        return time;
+
+    switch (mode) {
+    case LoopMode::None:
+    case LoopMode::Continue:
+        return time;
+    case LoopMode::Cycle: {
+        const double phase = positiveModulo(time - first.time, range);
+        return first.time + phase;
+    }
+    case LoopMode::PingPong: {
+        const double phase = positiveModulo(time - first.time, 2.0 * range);
+        return phase > range
+            ? last.time - (phase - range)
+            : first.time + phase;
+    }
+    }
+
+    return time;
+}
+
 double loopedTrackValueAt(const KeyframeTrack &track, LoopMode mode, double time)
 {
     if (mode == LoopMode::None)
         return track.valueAt(time);
 
-    const QVector<KeyframePoint> &keyframes = track.keyframes();
-    if (keyframes.size() < 2)
-        return track.valueAt(time);
+    if (mode == LoopMode::Cycle || mode == LoopMode::PingPong)
+        return track.valueAt(loopedTrackTimeAt(track, mode, time));
 
-    const KeyframePoint &first = keyframes.first();
-    const KeyframePoint &last = keyframes.last();
-    if (time <= last.time)
-        return track.valueAt(time);
+    if (mode == LoopMode::Continue) {
+        const QVector<KeyframePoint> &keyframes = track.keyframes();
+        if (keyframes.size() < 2)
+            return track.valueAt(time);
 
-    const double range = last.time - first.time;
-    if (!std::isfinite(range) || range <= 0.0)
-        return track.valueAt(time);
+        const KeyframePoint &last = keyframes.last();
+        if (time <= last.time)
+            return track.valueAt(time);
 
-    switch (mode) {
-    case LoopMode::None:
-        return track.valueAt(time);
-    case LoopMode::Cycle: {
-        const double phase = positiveModulo(time - first.time, range);
-        return track.valueAt(first.time + phase);
-    }
-    case LoopMode::PingPong: {
-        const double phase = positiveModulo(time - first.time, 2.0 * range);
-        const double foldedTime = phase > range
-            ? last.time - (phase - range)
-            : first.time + phase;
-        return track.valueAt(foldedTime);
-    }
-    case LoopMode::Continue: {
         const KeyframePoint &prev = keyframes.at(keyframes.size() - 2);
         const double dt = last.time - prev.time;
         if (!std::isfinite(dt) || dt <= 0.0)
             return track.valueAt(time);
         const double slope = (last.value - prev.value) / dt;
         return last.value + slope * (time - last.time);
-    }
     }
 
     return track.valueAt(time);
@@ -468,6 +488,14 @@ double KeyframeManager::valueAt(const QString &propertyName, double time, double
     if (mode == LoopMode::None)
         return t->valueAt(time);
     return loopedTrackValueAt(*t, mode, time);
+}
+
+double KeyframeManager::loopedTimeForTrack(const QString &propertyName, double time) const
+{
+    const auto *t = track(propertyName);
+    if (!t)
+        return time;
+    return loopedTrackTimeAt(*t, loopOutMode(propertyName), time);
 }
 
 QString KeyframeManager::stringValueAt(const QString &propertyName, double time, const QString &defaultVal) const

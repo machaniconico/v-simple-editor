@@ -149,6 +149,7 @@ public:
 
     // Convenience: get value at time for a named property, returns defaultVal if no track
     double valueAt(const QString &propertyName, double time, double defaultVal = 0.0) const;
+    double loopedTimeForTrack(const QString &propertyName, double time) const;
 
     // US-AETEXT-4: get string value at time for a named property (uses StringKeyframeTrack)
     QString stringValueAt(const QString &propertyName, double time, const QString &defaultVal = QString()) const;

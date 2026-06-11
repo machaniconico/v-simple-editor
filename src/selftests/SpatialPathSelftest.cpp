@@ -29,7 +29,7 @@ bool near(double a, double b, double eps = 1e-9)
     return std::abs(a - b) <= eps;
 }
 
-bool finite(double value)
+bool isFiniteValue(double value)
 {
     return std::isfinite(value);
 }
@@ -42,6 +42,26 @@ ClipInfo makeClip()
     clip.outPoint = 1.0;
     clip.videoDx = 0.0;
     clip.videoDy = 0.0;
+    return clip;
+}
+
+ClipInfo makeLoopedSpatialClip(LoopMode mode)
+{
+    ClipInfo clip = makeClip();
+    KeyframeTrack x(kPosXTrack, 0.0);
+    x.addKeyframe(0.0, 0.0, KeyframePoint::Linear,
+                  0.0, 0.0, 1.0, 1.0,
+                  true, 0.25, 0.75, 0.0, 0.0);
+    x.addKeyframe(1.0, 1.0, KeyframePoint::Linear,
+                  0.0, 0.0, 1.0, 1.0,
+                  true, 0.0, 0.0, -0.25, 0.75);
+    KeyframeTrack y(kPosYTrack, 0.0);
+    y.addKeyframe(0.0, 0.0);
+    y.addKeyframe(1.0, 0.0);
+    clip.keyframes.addTrack(x);
+    clip.keyframes.addTrack(y);
+    clip.keyframes.setLoopOutMode(kPosXTrack, mode);
+    clip.keyframes.setLoopOutMode(kPosYTrack, mode);
     return clip;
 }
 
@@ -144,7 +164,7 @@ int runSpatialPathSelftest()
 
         const QPointF pos = clipanim::effectivePositionAt(clip, 0.5);
         check(2, "Bezier midpoint bows off straight line",
-              finite(pos.y()) && std::abs(pos.y()) > 0.1,
+              isFiniteValue(pos.y()) && std::abs(pos.y()) > 0.1,
               QStringLiteral("mid=(%1,%2)")
                   .arg(pos.x(), 0, 'g', 12)
                   .arg(pos.y(), 0, 'g', 12));
@@ -266,14 +286,14 @@ int runSpatialPathSelftest()
         const double expectedInvalidY = invalid.keyframes.valueAt(kPosYTrack, 0.5, invalid.videoDy);
 
         check(5, "one-sided/degenerate/invalid tangents are finite and sensible",
-              finite(oneSidedMid.x())
-                  && finite(oneSidedMid.y())
-                  && finite(degenerateMid.x())
-                  && finite(degenerateMid.y())
+              isFiniteValue(oneSidedMid.x())
+                  && isFiniteValue(oneSidedMid.y())
+                  && isFiniteValue(degenerateMid.x())
+                  && isFiniteValue(degenerateMid.y())
                   && exactly(degenerateMid.x(), 0.5)
                   && exactly(degenerateMid.y(), 0.0)
-                  && finite(invalidMid.x())
-                  && finite(invalidMid.y())
+                  && isFiniteValue(invalidMid.x())
+                  && isFiniteValue(invalidMid.y())
                   && exactly(invalidMid.x(), expectedInvalidX)
                   && exactly(invalidMid.y(), expectedInvalidY),
               QStringLiteral("one-sided=(%1,%2) degenerate=(%3,%4) invalid=(%5,%6)")
@@ -283,6 +303,54 @@ int runSpatialPathSelftest()
                   .arg(degenerateMid.y(), 0, 'g', 12)
                   .arg(invalidMid.x(), 0, 'g', 12)
                   .arg(invalidMid.y(), 0, 'g', 12));
+    }
+
+    // G6: loopOut Cycle keeps spatial path evaluation on the curved path.
+    {
+        ClipInfo clip = makeLoopedSpatialClip(LoopMode::Cycle);
+        const QPointF firstCycle = clipanim::effectivePositionAt(clip, 0.5);
+        const QPointF secondCycle = clipanim::effectivePositionAt(clip, 1.5);
+        const clipgeom::ClipTransform secondTransform =
+            clipanim::effectiveTransformAt(clip, 1.5);
+        check(6, "Cycle loop keeps Bezier spatial path on second cycle",
+              isFiniteValue(secondCycle.x())
+                  && isFiniteValue(secondCycle.y())
+                  && near(secondCycle.x(), firstCycle.x())
+                  && near(secondCycle.y(), firstCycle.y())
+                  && near(secondTransform.videoDx, firstCycle.x())
+                  && near(secondTransform.videoDy, firstCycle.y())
+                  && std::abs(secondCycle.y()) > 0.1,
+              QStringLiteral("first=(%1,%2) second=(%3,%4) transform=(%5,%6)")
+                  .arg(firstCycle.x(), 0, 'g', 12)
+                  .arg(firstCycle.y(), 0, 'g', 12)
+                  .arg(secondCycle.x(), 0, 'g', 12)
+                  .arg(secondCycle.y(), 0, 'g', 12)
+                  .arg(secondTransform.videoDx, 0, 'g', 12)
+                  .arg(secondTransform.videoDy, 0, 'g', 12));
+    }
+
+    // G7: loopOut PingPong folds reversed phases before spatial segment lookup.
+    {
+        ClipInfo clip = makeLoopedSpatialClip(LoopMode::PingPong);
+        const QPointF inRange = clipanim::effectivePositionAt(clip, 0.75);
+        const QPointF pingPong = clipanim::effectivePositionAt(clip, 1.25);
+        const clipgeom::ClipTransform pingPongTransform =
+            clipanim::effectiveTransformAt(clip, 1.25);
+        check(7, "PingPong loop keeps Bezier spatial path on reversed cycle",
+              isFiniteValue(pingPong.x())
+                  && isFiniteValue(pingPong.y())
+                  && near(pingPong.x(), inRange.x())
+                  && near(pingPong.y(), inRange.y())
+                  && near(pingPongTransform.videoDx, inRange.x())
+                  && near(pingPongTransform.videoDy, inRange.y())
+                  && std::abs(pingPong.y()) > 0.1,
+              QStringLiteral("in-range=(%1,%2) pingpong=(%3,%4) transform=(%5,%6)")
+                  .arg(inRange.x(), 0, 'g', 12)
+                  .arg(inRange.y(), 0, 'g', 12)
+                  .arg(pingPong.x(), 0, 'g', 12)
+                  .arg(pingPong.y(), 0, 'g', 12)
+                  .arg(pingPongTransform.videoDx, 0, 'g', 12)
+                  .arg(pingPongTransform.videoDy, 0, 'g', 12));
     }
 
     std::printf("[spatial-path] summary: %d PASS, %d FAIL\n", passed, failed);
