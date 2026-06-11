@@ -6,6 +6,8 @@
 #include <QtGlobal>
 #include <QVector>
 
+#include <cmath>
+
 #include "../Timeline.h"
 
 namespace motionblur {
@@ -18,9 +20,10 @@ inline bool enabledFromEnv()
 inline double shutterAngleFromEnv()
 {
     bool ok = false;
-    const double value =
+    const double parsed =
         QString::fromLatin1(qgetenv("VEDITOR_MOTION_BLUR_SHUTTER")).toDouble(&ok);
-    return ok ? value : 180.0;
+    const double value = ok && std::isfinite(parsed) ? parsed : 180.0;
+    return qBound(0.0, value, 720.0);
 }
 
 inline int sampleCountFromEnv()
@@ -54,20 +57,40 @@ inline bool activeForTimeline(const Timeline *timeline, bool envFlag)
 
 inline QImage averagePremultiplied(const QVector<QImage>& samples)
 {
-    if (samples.isEmpty() || samples.first().isNull())
+    if (samples.isEmpty())
         return QImage();
 
-    const QSize size = samples.first().size();
-    QVector<QImage> premultiplied;
-    premultiplied.reserve(samples.size());
+    QSize size;
+    QVector<QImage> validSamples;
+    validSamples.reserve(samples.size());
     for (const QImage& sample : samples) {
-        if (sample.isNull() || sample.size() != size)
-            return QImage();
+        if (sample.isNull())
+            continue;
+        if (size.isEmpty())
+            size = sample.size();
+        if (sample.size() != size)
+            continue;
+        validSamples.append(sample);
+    }
+
+    if (validSamples.isEmpty())
+        return QImage();
+    if (validSamples.size() == 1) {
+        const QImage& only = validSamples.first();
+        return only.format() == QImage::Format_RGBA8888
+            ? only
+            : only.convertToFormat(QImage::Format_RGBA8888);
+    }
+
+    QVector<QImage> premultiplied;
+    premultiplied.reserve(validSamples.size());
+    for (const QImage& sample : validSamples) {
         premultiplied.append(sample.convertToFormat(QImage::Format_ARGB32_Premultiplied));
     }
 
     QImage averaged(size, QImage::Format_ARGB32_Premultiplied);
     const int n = premultiplied.size();
+    const quint64 half = static_cast<quint64>(n) / 2;
     for (int y = 0; y < size.height(); ++y) {
         QRgb* dst = reinterpret_cast<QRgb*>(averaged.scanLine(y));
         for (int x = 0; x < size.width(); ++x) {
@@ -83,10 +106,10 @@ inline QImage averagePremultiplied(const QVector<QImage>& samples)
                 g += qGreen(px);
                 b += qBlue(px);
             }
-            dst[x] = qRgba(static_cast<int>(r / n),
-                           static_cast<int>(g / n),
-                           static_cast<int>(b / n),
-                           static_cast<int>(a / n));
+            dst[x] = qRgba(static_cast<int>((r + half) / n),
+                           static_cast<int>((g + half) / n),
+                           static_cast<int>((b + half) / n),
+                           static_cast<int>((a + half) / n));
         }
     }
 

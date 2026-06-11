@@ -125,9 +125,27 @@ ClipInfo makeClip(const QString& path)
     return clip;
 }
 
+ClipInfo makeNullClip(double duration)
+{
+    ClipInfo clip;
+    clip.displayName = QStringLiteral("motion_blur_null_base");
+    clip.duration = duration;
+    clip.outPoint = duration;
+    clip.motionBlurEnabled = true;
+    return clip;
+}
+
 void setTimelineClip(Timeline& timeline, const ClipInfo& clip)
 {
     timeline.videoTracks().first()->setClips(QVector<ClipInfo>{clip});
+}
+
+void setTwoTrackTimeline(Timeline& timeline, const ClipInfo& v1Clip, const ClipInfo& v2Clip)
+{
+    while (timeline.videoTracks().size() < 2)
+        timeline.addVideoTrack();
+    timeline.videoTracks()[0]->setClips(QVector<ClipInfo>{v1Clip});
+    timeline.videoTracks()[1]->setClips(QVector<ClipInfo>{v2Clip});
 }
 
 bool bytesEqual(const QImage& a, const QImage& b)
@@ -259,6 +277,110 @@ int runMotionBlurParitySelftest()
         check(3, "representative OFF 3-arg and 4-arg render bytes match",
               mse == 0.0 && bytesEqual(threeArg, fourArgZero),
               QStringLiteral("MSE=%1").arg(mse, 0, 'g', 12));
+    }
+
+    // G4: shutter angle env parsing clamps to the supported export range.
+    {
+        qputenv("VEDITOR_MOTION_BLUR_SHUTTER", "-12.5");
+        const double low = motionblur::shutterAngleFromEnv();
+        qputenv("VEDITOR_MOTION_BLUR_SHUTTER", "900");
+        const double high = motionblur::shutterAngleFromEnv();
+        qputenv("VEDITOR_MOTION_BLUR_SHUTTER", "not-a-number");
+        const double fallback = motionblur::shutterAngleFromEnv();
+        qunsetenv("VEDITOR_MOTION_BLUR_SHUTTER");
+
+        check(4, "shutter angle env clamps to [0,720]",
+              low == 0.0 && high == 720.0 && fallback == 180.0,
+              QStringLiteral("low=%1 high=%2 fallback=%3").arg(low).arg(high).arg(fallback));
+    }
+
+    // G5: a null temporal sample is skipped, not escalated to a failed frame.
+    {
+        qputenv("VEDITOR_MOTION_BLUR", "1");
+        qputenv("VEDITOR_MOTION_BLUR_SAMPLES", "3");
+        qputenv("VEDITOR_MOTION_BLUR_SHUTTER", "720");
+
+        Timeline timeline;
+        setTimelineClip(timeline, makeClip(clipPath));
+        const QSize outSize(48, 32);
+        const QImage blurred =
+            tlrender::renderFrameAt(&timeline, 800000, outSize, 300000.0);
+
+        QImage valid(QSize(1, 1), QImage::Format_RGBA8888);
+        QImage mismatched(QSize(2, 1), QImage::Format_RGBA8888);
+        valid.fill(QColor(4, 6, 8, 255));
+        mismatched.fill(QColor(200, 210, 220, 255));
+        QVector<QImage> invalidSamples;
+        invalidSamples.append(valid);
+        invalidSamples.append(QImage());
+        invalidSamples.append(mismatched);
+        const QImage averagedInvalid =
+            motionblur::averagePremultiplied(invalidSamples);
+        const QColor averagedInvalidPx =
+            averagedInvalid.isNull() ? QColor() : averagedInvalid.pixelColor(0, 0);
+
+        qunsetenv("VEDITOR_MOTION_BLUR");
+        qunsetenv("VEDITOR_MOTION_BLUR_SAMPLES");
+        qunsetenv("VEDITOR_MOTION_BLUR_SHUTTER");
+
+        check(5, "motion blur skips null/mismatched temporal samples",
+              !blurred.isNull()
+                  && blurred.size() == outSize
+                  && averagedInvalid.size() == valid.size()
+                  && averagedInvalidPx == QColor(4, 6, 8, 255),
+              QStringLiteral("null=%1 size=%2x%3")
+                  .arg(blurred.isNull())
+                  .arg(blurred.width())
+                  .arg(blurred.height()));
+    }
+
+    // G6: channel averaging rounds to nearest instead of truncating dark.
+    {
+        QImage black(QSize(1, 1), QImage::Format_RGBA8888);
+        QImage nearBlack(QSize(1, 1), QImage::Format_RGBA8888);
+        black.fill(QColor(0, 0, 0, 255));
+        nearBlack.fill(QColor(1, 1, 1, 255));
+        QVector<QImage> samples;
+        samples.append(black);
+        samples.append(nearBlack);
+
+        const QColor px = motionblur::averagePremultiplied(samples).pixelColor(0, 0);
+        check(6, "averagePremultiplied rounds half-up",
+              px.red() == 1 && px.green() == 1 && px.blue() == 1 && px.alpha() == 255,
+              QStringLiteral("rgba=%1,%2,%3,%4")
+                  .arg(px.red())
+                  .arg(px.green())
+                  .arg(px.blue())
+                  .arg(px.alpha()));
+    }
+
+    // G7: shutter angle zero takes the exact single-frame path, with no
+    // premultiplied conversion round-trip on semi-transparent composites.
+    {
+        qputenv("VEDITOR_MOTION_BLUR", "1");
+        qputenv("VEDITOR_MOTION_BLUR_SAMPLES", "5");
+        qputenv("VEDITOR_MOTION_BLUR_SHUTTER", "0");
+
+        ClipInfo overlay = makeClip(clipPath);
+        overlay.opacity = 0.5;
+
+        Timeline timeline;
+        setTwoTrackTimeline(timeline, makeNullClip(overlay.duration), overlay);
+        const QSize outSize(48, 32);
+        const qint64 usec = 250000;
+        const QImage single = tlrender::renderFrameAt(&timeline, usec, outSize);
+        const QImage zeroShutter =
+            tlrender::renderFrameAt(&timeline, usec, outSize, 1000000.0 / kFps);
+
+        qunsetenv("VEDITOR_MOTION_BLUR");
+        qunsetenv("VEDITOR_MOTION_BLUR_SAMPLES");
+        qunsetenv("VEDITOR_MOTION_BLUR_SHUTTER");
+
+        check(7, "zero shutter is byte-identical to single-frame render",
+              !single.isNull() && bytesEqual(single, zeroShutter),
+              QStringLiteral("singleNull=%1 zeroNull=%2")
+                  .arg(single.isNull())
+                  .arg(zeroShutter.isNull()));
     }
 
     qInfo().noquote()

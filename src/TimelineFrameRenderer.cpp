@@ -1315,6 +1315,9 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize,
 
     const int n = motionblur::sampleCountFromEnv();
     const double shutterAngle = motionblur::shutterAngleFromEnv();
+    if (shutterAngle <= 0.0)
+        return detail::renderFrameAtSingle(timeline, usec, outSize);
+
     const double windowUs = (shutterAngle / 360.0) * frameDurationUs;
 
     QVector<QImage> samples;
@@ -1327,7 +1330,10 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize,
         samples.append(detail::renderFrameAtSingle(timeline, sampleUsec, outSize));
     }
 
-    return motionblur::averagePremultiplied(samples);
+    const QImage averaged = motionblur::averagePremultiplied(samples);
+    return averaged.isNull()
+        ? detail::renderFrameAtSingle(timeline, usec, outSize)
+        : averaged;
 }
 
 namespace detail {
