@@ -72,6 +72,10 @@ extern "C" void *veditor_avHwDeviceCtxToD3D11Device(AVBufferRef *ref);
 #include <cmath>
 #include <limits>
 
+namespace veditor {
+bool parentingEnabledFromEnv();
+}
+
 namespace {
 
 // Phase 1e — playback preview divisor for the playback decode path.
@@ -135,12 +139,6 @@ bool isNullObjectPath(const QString &path)
 bool isNullObjectEntry(const PlaybackEntry &entry)
 {
     return isNullObjectPath(entry.filePath);
-}
-
-bool parentingEnabled()
-{
-    const QByteArray v = qgetenv("VEDITOR_PARENTING");
-    return v.isEmpty() || v != "0";
 }
 
 clipgeom::ClipTransform transformForLayer(const VideoPlayer::DecodedLayer &layer)
@@ -209,13 +207,17 @@ QVector<clipgeom::ClipTransform> effectiveLayerTransforms(
     std::function<bool(int, int)> resolve = [&](int idx, int depth) -> bool {
         if (idx < 0 || idx >= layers.size())
             return false;
-        if (state[idx] == 2)
-            return valid[idx] != 0;
-        if (state[idx] == 1 || depth >= 8) {
+        if (state[idx] == 1) {
             valid[idx] = 0;
             effective[idx] = transformForLayer(layers[idx]);
             state[idx] = 2;
             return false;
+        }
+        if (state[idx] == 2)
+            return valid[idx] != 0;
+        if (depth > 8) {
+            effective[idx] = transformForLayer(layers[idx]);
+            return true;
         }
 
         state[idx] = 1;
@@ -4707,7 +4709,7 @@ void VideoPlayer::handlePlaybackTick()
         // sub-assertion in main.cpp exercises the SAME comparator — a
         // re-inversion breaks the selftest.
         std::stable_sort(layers.begin(), layers.end(), clipstack::layerPaintOrderLess);
-        if (parentingEnabled())
+        if (veditor::parentingEnabledFromEnv())
             resolveDecodedLayerParentSources(layers);
         for (DecodedLayer &L : layers) {
             {
@@ -5594,7 +5596,7 @@ QImage VideoPlayer::composeMultiTrackFrame(const QImage &v1Frame,
     const bool kSmooth = false;
     const QSize canvas(composed.width(), composed.height());
     const QVector<clipgeom::ClipTransform> effectiveTransforms =
-        parentingEnabled()
+        veditor::parentingEnabledFromEnv()
             ? effectiveLayerTransforms(overlayLayers, canvas)
             : QVector<clipgeom::ClipTransform>{};
     for (int i = 0; i < overlayLayers.size(); ++i) {
@@ -5675,7 +5677,7 @@ void VideoPlayer::composeMultiTrackFrameInto(QImage &canvas,
     const bool kSmooth = false;
     const QSize cs(canvas.width(), canvas.height());
     const QVector<clipgeom::ClipTransform> effectiveTransforms =
-        parentingEnabled()
+        veditor::parentingEnabledFromEnv()
             ? effectiveLayerTransforms(overlayLayers, cs)
             : QVector<clipgeom::ClipTransform>{};
     for (int i = 0; i < overlayLayers.size(); ++i) {
@@ -5754,7 +5756,7 @@ QImage VideoPlayer::tryGpuComposeLayers(const QVector<DecodedLayer> &layers,
         return QImage();
     }
     const QVector<clipgeom::ClipTransform> effectiveTransforms =
-        parentingEnabled()
+        veditor::parentingEnabledFromEnv()
             ? effectiveLayerTransforms(layers, canvas)
             : QVector<clipgeom::ClipTransform>{};
 

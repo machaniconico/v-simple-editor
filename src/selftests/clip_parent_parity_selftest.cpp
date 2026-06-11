@@ -2,12 +2,15 @@
 // --selftest=clip-parent-parity
 
 #include <QDebug>
+#include <QByteArray>
 #include <QFile>
 #include <QImage>
 #include <QProcess>
 #include <QTemporaryDir>
+#include <QtGlobal>
 
 #include <cmath>
+#include <functional>
 
 #include "../ClipGeometry.h"
 #include "../FrameDiff.h"
@@ -17,7 +20,7 @@
 
 namespace {
 
-constexpr int kGateCount = 5;
+constexpr int kGateCount = 7;
 
 bool near(double a, double b, double eps = 1e-10)
 {
@@ -95,6 +98,105 @@ void addClip(Timeline &tl, int trackIdx, const ClipInfo &clip)
     TimelineTrack *track = tl.videoTracks().value(trackIdx, nullptr);
     if (track)
         track->addClip(clip);
+}
+
+QVector<clipgeom::ClipTransform> previewEffectiveTransforms(
+    const QVector<clipgeom::ClipTransform> &raw,
+    const QVector<int> &parentByIndex,
+    QSize canvas)
+{
+    QVector<clipgeom::ClipTransform> effective = raw;
+    QVector<int> state(raw.size(), 0);
+    QVector<char> valid(raw.size(), 1);
+
+    std::function<bool(int, int)> resolve = [&](int idx, int depth) -> bool {
+        if (idx < 0 || idx >= raw.size())
+            return false;
+        if (state[idx] == 1) {
+            valid[idx] = 0;
+            effective[idx] = raw[idx];
+            state[idx] = 2;
+            return false;
+        }
+        if (state[idx] == 2)
+            return valid[idx] != 0;
+        if (depth > 8) {
+            effective[idx] = raw[idx];
+            return true;
+        }
+
+        state[idx] = 1;
+        const int parentIdx = parentByIndex.value(idx, -1);
+        if (parentIdx < 0 || parentIdx >= raw.size() || parentIdx == idx) {
+            effective[idx] = raw[idx];
+            valid[idx] = 1;
+            state[idx] = 2;
+            return true;
+        }
+        if (!resolve(parentIdx, depth + 1)) {
+            effective[idx] = raw[idx];
+            valid[idx] = 0;
+            state[idx] = 2;
+            return false;
+        }
+
+        effective[idx] = clipgeom::composeParented(raw[idx], effective[parentIdx], canvas);
+        valid[idx] = 1;
+        state[idx] = 2;
+        return true;
+    };
+
+    for (int i = 0; i < raw.size(); ++i)
+        resolve(i, 0);
+    return effective;
+}
+
+clipgeom::ClipTransform previewLeafTransformForChain(
+    const QVector<clipgeom::ClipTransform> &rootToLeaf,
+    QSize canvas)
+{
+    QVector<clipgeom::ClipTransform> raw;
+    QVector<int> parents;
+    raw.reserve(rootToLeaf.size());
+    parents.reserve(rootToLeaf.size());
+    for (int i = rootToLeaf.size() - 1; i >= 0; --i) {
+        raw.append(rootToLeaf[i]);
+        parents.append(raw.size());
+    }
+    if (!parents.isEmpty())
+        parents[parents.size() - 1] = -1;
+
+    const QVector<clipgeom::ClipTransform> effective =
+        previewEffectiveTransforms(raw, parents, canvas);
+    return effective.value(0);
+}
+
+void populateDirectChainTimeline(Timeline &direct,
+                                 const QString &redPath,
+                                 const QVector<clipgeom::ClipTransform> &parentTransforms,
+                                 const clipgeom::ClipTransform &leafTransform)
+{
+    addClip(direct, 0, makeNullClip(QStringLiteral("base")));
+    for (int i = 0; i < parentTransforms.size(); ++i) {
+        addClip(direct, i + 1,
+                makeNullClip(QStringLiteral("parent-%1").arg(i), parentTransforms[i]));
+    }
+    addClip(direct, parentTransforms.size() + 1,
+            makeClip(redPath, QStringLiteral("child"), leafTransform));
+}
+
+void populateParentedChainTimeline(Timeline &parented,
+                                   const QString &redPath,
+                                   const QVector<clipgeom::ClipTransform> &parentTransforms,
+                                   const clipgeom::ClipTransform &leafTransform)
+{
+    populateDirectChainTimeline(parented, redPath, parentTransforms, leafTransform);
+    const int childTrack = parentTransforms.size() + 1;
+    parented.setClipParent(trackMatteClipKey(childTrack, 0),
+                           trackMatteClipKey(childTrack - 1, 0));
+    for (int track = childTrack - 1; track > 1; --track)
+        parented.setClipParent(trackMatteClipKey(track, 0),
+                               trackMatteClipKey(track - 1, 0));
 }
 
 double frameMse(const QImage &a, const QImage &b)
@@ -269,6 +371,128 @@ int runClipParentParitySelftest()
               QStringLiteral("alphaSum=%1 mse=%2")
                   .arg(alphaSum(nullFrame))
                   .arg(mse, 0, 'g', 17));
+    }
+
+    {
+        const bool hadParentingEnv = qEnvironmentVariableIsSet("VEDITOR_PARENTING");
+        const QByteArray oldParentingEnv = qgetenv("VEDITOR_PARENTING");
+        qputenv("VEDITOR_PARENTING", QByteArray("0"));
+
+        const clipgeom::ClipTransform parentT{1.0, 0.25, 0.0, 0.0};
+        const clipgeom::ClipTransform childT{0.75, -0.1, 0.0, 0.0};
+        Timeline parented;
+        addClip(parented, 0, makeNullClip(QStringLiteral("base")));
+        addClip(parented, 1, makeNullClip(QStringLiteral("parent"), parentT));
+        addClip(parented, 2, makeClip(redPath, QStringLiteral("child"), childT));
+        parented.setClipParent(trackMatteClipKey(2, 0), trackMatteClipKey(1, 0));
+
+        Timeline unparented;
+        addClip(unparented, 0, makeNullClip(QStringLiteral("base")));
+        addClip(unparented, 1, makeNullClip(QStringLiteral("parent"), parentT));
+        addClip(unparented, 2, makeClip(redPath, QStringLiteral("child"), childT));
+
+        const QImage parentedFrame = tlrender::renderFrameAt(&parented, 0, canvas);
+        const QImage unparentedFrame = tlrender::renderFrameAt(&unparented, 0, canvas);
+        const double mse = frameMse(parentedFrame, unparentedFrame);
+
+        if (hadParentingEnv)
+            qputenv("VEDITOR_PARENTING", oldParentingEnv);
+        else
+            qunsetenv("VEDITOR_PARENTING");
+
+        check(passed, failed,
+              "G6 VEDITOR_PARENTING=0 disables preview/export parenting",
+              mse == 0.0, QStringLiteral("mse=%1").arg(mse, 0, 'g', 17));
+    }
+
+    {
+        auto chainMse = [&](int parentCount) {
+            QVector<clipgeom::ClipTransform> parents;
+            parents.reserve(parentCount);
+            for (int i = 0; i < parentCount; ++i)
+                parents.append(clipgeom::ClipTransform{1.0, 0.01, 0.0, 0.0});
+
+            const clipgeom::ClipTransform childT{0.7, -0.05, 0.0, 0.0};
+            QVector<clipgeom::ClipTransform> rootToLeaf = parents;
+            rootToLeaf.append(childT);
+            const clipgeom::ClipTransform previewEffective =
+                previewLeafTransformForChain(rootToLeaf, canvas);
+
+            Timeline parented;
+            populateParentedChainTimeline(parented, redPath, parents, childT);
+            Timeline direct;
+            populateDirectChainTimeline(direct, redPath, parents, previewEffective);
+            return frameMse(tlrender::renderFrameAt(&parented, 0, canvas),
+                            tlrender::renderFrameAt(&direct, 0, canvas));
+        };
+
+        auto sharedAncestorMse = [&]() {
+            Timeline parented;
+            Timeline direct;
+            addClip(parented, 0, makeNullClip(QStringLiteral("base")));
+            addClip(direct, 0, makeNullClip(QStringLiteral("base")));
+
+            const clipgeom::ClipTransform rootT{1.0, 0.18, 0.0, 0.0};
+            const clipgeom::ClipTransform sharedT{1.0, 0.04, 0.0, 0.0};
+            const clipgeom::ClipTransform childT{0.7, -0.05, 0.0, 0.0};
+            addClip(parented, 1, makeNullClip(QStringLiteral("root"), rootT));
+            addClip(direct, 1, makeNullClip(QStringLiteral("root"), rootT));
+            addClip(parented, 2, makeNullClip(QStringLiteral("shared"), sharedT));
+            addClip(direct, 2, makeNullClip(QStringLiteral("shared"), sharedT));
+            addClip(parented, 3, makeClip(redPath, QStringLiteral("child"), childT));
+
+            QVector<clipgeom::ClipTransform> previewRaw;
+            QVector<int> previewParents;
+            for (int track = 11; track >= 4; --track) {
+                const clipgeom::ClipTransform t{1.0, 0.005, 0.0, 0.0};
+                addClip(parented, track,
+                        makeNullClip(QStringLiteral("bridge-%1").arg(track), t));
+                addClip(direct, track,
+                        makeNullClip(QStringLiteral("bridge-%1").arg(track), t));
+                previewRaw.append(t);
+                previewParents.append(previewRaw.size());
+            }
+            const int lastBridgePreviewIdx = previewRaw.size() - 1;
+
+            parented.setClipParent(trackMatteClipKey(2, 0), trackMatteClipKey(1, 0));
+            parented.setClipParent(trackMatteClipKey(3, 0), trackMatteClipKey(11, 0));
+            for (int track = 11; track > 4; --track)
+                parented.setClipParent(trackMatteClipKey(track, 0),
+                                       trackMatteClipKey(track - 1, 0));
+            parented.setClipParent(trackMatteClipKey(4, 0), trackMatteClipKey(2, 0));
+
+            previewRaw.append(childT);
+            previewParents.append(0);
+            previewRaw.append(sharedT);
+            previewParents.append(previewRaw.size());
+            previewRaw.append(rootT);
+            previewParents.append(-1);
+            const int childPreviewIdx = previewRaw.size() - 3;
+            previewParents[childPreviewIdx] = 0;
+            const int sharedPreviewIdx = previewRaw.size() - 2;
+            previewParents[sharedPreviewIdx] = previewRaw.size() - 1;
+            previewParents[lastBridgePreviewIdx] = sharedPreviewIdx;
+
+            const QVector<clipgeom::ClipTransform> previewEffective =
+                previewEffectiveTransforms(previewRaw, previewParents, canvas);
+            addClip(direct, 3,
+                    makeClip(redPath, QStringLiteral("child"),
+                             previewEffective.value(childPreviewIdx)));
+
+            return frameMse(tlrender::renderFrameAt(&parented, 0, canvas),
+                            tlrender::renderFrameAt(&direct, 0, canvas));
+        };
+
+        const double depth8Mse = chainMse(8);
+        const double depth9Mse = chainMse(9);
+        const double sharedMse = sharedAncestorMse();
+        check(passed, failed,
+              "G7 depth-discipline preview/export parity",
+              depth8Mse == 0.0 && depth9Mse == 0.0 && sharedMse == 0.0,
+              QStringLiteral("depth8=%1 depth9=%2 shared=%3")
+                  .arg(depth8Mse, 0, 'g', 17)
+                  .arg(depth9Mse, 0, 'g', 17)
+                  .arg(sharedMse, 0, 'g', 17));
     }
 
     qInfo().noquote().nospace()

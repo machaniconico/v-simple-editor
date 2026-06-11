@@ -32,6 +32,7 @@
                                 // worker-thread QWidget deref — C1+C2 fixed).
 
 #include <QtGlobal>
+#include <QByteArray>
 #include <QHash>
 #include <QPainter>
 #include <QRectF>
@@ -44,6 +45,14 @@ extern "C" {
 #include <libavutil/opt.h>
 #include <libswscale/swscale.h>
 }
+
+namespace veditor {
+bool parentingEnabledFromEnv()
+{
+    const QByteArray v = qgetenv("VEDITOR_PARENTING");
+    return v.isEmpty() || v != "0";
+}
+} // namespace veditor
 
 namespace tlrender {
 namespace {
@@ -943,78 +952,84 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
         renderLayers.append(renderLayer);
     }
 
-    if (const QHash<QString, QString> parentEntries =
-            clipParentEntriesForTimeline(timeline);
-        !parentEntries.isEmpty()) {
-        QHash<QString, int> indexByClipId;
-        for (int i = 0; i < renderLayers.size(); ++i)
-            indexByClipId.insert(renderLayers[i].clipId, i);
+    if (veditor::parentingEnabledFromEnv()) {
+        if (const QHash<QString, QString> parentEntries =
+                clipParentEntriesForTimeline(timeline);
+            !parentEntries.isEmpty()) {
+            QHash<QString, int> indexByClipId;
+            for (int i = 0; i < renderLayers.size(); ++i)
+                indexByClipId.insert(renderLayers[i].clipId, i);
 
-        QVector<clipgeom::ClipTransform> rawTransforms;
-        QVector<clipgeom::ClipTransform> effectiveTransforms(renderLayers.size());
-        QVector<char> resolved(renderLayers.size(), 0);
-        rawTransforms.reserve(renderLayers.size());
-        for (const RenderLayer &layer : renderLayers)
-            rawTransforms.append(layer.transform);
+            QVector<clipgeom::ClipTransform> rawTransforms;
+            QVector<clipgeom::ClipTransform> effectiveTransforms(renderLayers.size());
+            QVector<char> resolved(renderLayers.size(), 0);
+            rawTransforms.reserve(renderLayers.size());
+            for (const RenderLayer &layer : renderLayers)
+                rawTransforms.append(layer.transform);
 
-        std::function<bool(int, int, QVector<int>&)> resolve =
-            [&](int idx, int depth, QVector<int> &stack) -> bool {
-                if (idx < 0 || idx >= renderLayers.size() || depth > 8)
-                    return false;
-                if (resolved[idx])
+            std::function<bool(int, int, QVector<int>&)> resolve =
+                [&](int idx, int depth, QVector<int> &stack) -> bool {
+                    if (idx < 0 || idx >= renderLayers.size())
+                        return false;
+                    if (stack.contains(idx))
+                        return false;
+                    if (resolved[idx])
+                        return true;
+                    if (depth > 8) {
+                        effectiveTransforms[idx] = rawTransforms[idx];
+                        return true;
+                    }
+
+                    stack.append(idx);
+                    clipgeom::ClipTransform effective = rawTransforms[idx];
+                    const auto it = parentEntries.constFind(renderLayers[idx].clipId);
+                    if (it != parentEntries.cend() && !it.value().isEmpty()) {
+                        const int parentIdx = indexByClipId.value(it.value(), -1);
+                        if (parentIdx <= 0 || parentIdx == idx) {
+                            stack.removeLast();
+                            return false;
+                        }
+                        if (!resolve(parentIdx, depth + 1, stack)) {
+                            stack.removeLast();
+                            return false;
+                        }
+                        effective = clipgeom::composeParented(
+                            rawTransforms[idx], effectiveTransforms[parentIdx], outSize);
+                    }
+                    effectiveTransforms[idx] = effective;
+                    resolved[idx] = 1;
+                    stack.removeLast();
                     return true;
-                if (stack.contains(idx))
-                    return false;
+                };
 
-                stack.append(idx);
-                clipgeom::ClipTransform effective = rawTransforms[idx];
-                const auto it = parentEntries.constFind(renderLayers[idx].clipId);
-                if (it != parentEntries.cend() && !it.value().isEmpty()) {
-                    const int parentIdx = indexByClipId.value(it.value(), -1);
-                    if (parentIdx <= 0 || parentIdx == idx) {
-                        stack.removeLast();
-                        return false;
-                    }
-                    if (!resolve(parentIdx, depth + 1, stack)) {
-                        stack.removeLast();
-                        return false;
-                    }
-                    effective = clipgeom::composeParented(
-                        rawTransforms[idx], effectiveTransforms[parentIdx], outSize);
+            QHash<QString, int> overlayIndexByClipId;
+            for (int i = 0; i < overlays.size(); ++i)
+                overlayIndexByClipId.insert(overlays[i].clipId, i);
+
+            for (int i = 0; i < renderLayers.size(); ++i) {
+                QVector<int> stack;
+                if (!resolve(i, 0, stack))
+                    continue;
+                const clipgeom::ClipTransform effective = effectiveTransforms[i];
+                renderLayers[i].transform = effective;
+                if (const int overlayIdx = overlayIndexByClipId.value(renderLayers[i].clipId, -1);
+                    overlayIdx >= 0) {
+                    overlays[overlayIdx].videoScale = effective.videoScale;
+                    overlays[overlayIdx].videoDx = effective.videoDx;
+                    overlays[overlayIdx].videoDy = effective.videoDy;
+                    overlays[overlayIdx].rotationDeg = effective.rotationDeg;
                 }
-                effectiveTransforms[idx] = effective;
-                resolved[idx] = 1;
-                stack.removeLast();
-                return true;
-            };
-
-        QHash<QString, int> overlayIndexByClipId;
-        for (int i = 0; i < overlays.size(); ++i)
-            overlayIndexByClipId.insert(overlays[i].clipId, i);
-
-        for (int i = 0; i < renderLayers.size(); ++i) {
-            QVector<int> stack;
-            if (!resolve(i, 0, stack))
-                continue;
-            const clipgeom::ClipTransform effective = effectiveTransforms[i];
-            renderLayers[i].transform = effective;
-            if (const int overlayIdx = overlayIndexByClipId.value(renderLayers[i].clipId, -1);
-                overlayIdx >= 0) {
-                overlays[overlayIdx].videoScale = effective.videoScale;
-                overlays[overlayIdx].videoDx = effective.videoDx;
-                overlays[overlayIdx].videoDy = effective.videoDy;
-                overlays[overlayIdx].rotationDeg = effective.rotationDeg;
+                if (renderLayers[i].nullObject
+                    || renderLayers[i].sourceRgb.isNull()
+                    || sameTransform(rawTransforms[i], effective)) {
+                    continue;
+                }
+                QImage placed = clipgeom::renderLayer(
+                    renderLayers[i].sourceRgb, effective, outSize, /*smooth=*/true);
+                renderLayers[i].image = placed;
+                if (i == 0)
+                    base = renderLayers[i].image;
             }
-            if (renderLayers[i].nullObject
-                || renderLayers[i].sourceRgb.isNull()
-                || sameTransform(rawTransforms[i], effective)) {
-                continue;
-            }
-            QImage placed = clipgeom::renderLayer(
-                renderLayers[i].sourceRgb, effective, outSize, /*smooth=*/true);
-            renderLayers[i].image = placed;
-            if (i == 0)
-                base = renderLayers[i].image;
         }
     }
 
