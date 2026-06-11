@@ -25,6 +25,9 @@ constexpr double kExtrudeSpinDegPerSec = 90.0;
 // Glyph-contour flattening tolerance passed to mesh3d::glyphContours().
 constexpr double kExtrudeFlatness = 0.5;
 constexpr int kPreviewProxyLongEdge = 640;
+constexpr double kPi = 3.14159265358979323846;
+constexpr double kDegToRad = kPi / 180.0;
+constexpr double kRadToDeg = 180.0 / kPi;
 
 struct ProjectedVertex {
     QPointF screen;
@@ -102,6 +105,39 @@ QMatrix4x4 buildProjectionMatrix(const Camera3DState &state, const QSize &size)
     const float farPlane = static_cast<float>(std::max(nearPlane + 1.0, state.farPlane));
     projection.perspective(fov, aspect, nearPlane, farPlane);
     return projection;
+}
+
+void foldCameraIntoExtrudeOrbit(const Camera3D &camera, double time,
+                                double &yaw, double &pitch, double &cameraDistance)
+{
+    if (cameraEqualsDefault(camera))
+        return;
+
+    const Camera3DState state = cameraStateAtTime(camera, time);
+    const QVector3D forward = safeForwardVector(state);
+    const double forwardX = static_cast<double>(forward.x());
+    const double forwardY = std::clamp(static_cast<double>(forward.y()), -1.0, 1.0);
+    const double forwardZ = static_cast<double>(forward.z());
+
+    const double cameraYaw = std::atan2(-forwardX, -forwardZ) * kRadToDeg;
+    const double cameraPitch = std::asin(forwardY) * kRadToDeg;
+    if (std::isfinite(cameraYaw))
+        yaw += cameraYaw;
+    if (std::isfinite(cameraPitch))
+        pitch += cameraPitch;
+
+    const QVector3D cameraSpan = state.target - state.position;
+    const double spanLength = std::sqrt(static_cast<double>(cameraSpan.lengthSquared()));
+    if (std::isfinite(spanLength) && spanLength > 1.0e-6)
+        cameraDistance *= spanLength;
+
+    if (std::isfinite(state.fov) && state.fov > 0.001) {
+        const double fov = std::clamp(state.fov, 1.0, 179.0);
+        const double fovScale = std::tan(fov * kDegToRad * 0.5)
+            / std::tan(60.0 * kDegToRad * 0.5);
+        if (std::isfinite(fovScale) && fovScale > 0.0)
+            cameraDistance *= fovScale;
+    }
 }
 
 ProjectedVertex projectVertex(const QVector3D &worldPoint,
@@ -319,7 +355,7 @@ double Text3DLayer::characterProgress(int characterIndex, double time) const
 QImage Text3DLayer::renderFrame(QSize size, double time, const Camera3D &cam) const
 {
     if (m_extrudeEnabled)
-        return renderFrameExtruded(size, time);
+        return renderFrameExtruded(size, time, cam);
     return renderFrameQuads(size, time, cam);
 }
 
@@ -553,7 +589,7 @@ void Text3DLayer::ensureExtrudedMesh() const
     ++m_meshBuildCount;
 }
 
-QImage Text3DLayer::renderFrameExtruded(QSize size, double time) const
+QImage Text3DLayer::renderFrameExtruded(QSize size, double time, const Camera3D &cam) const
 {
     QSize outSize = size;
     if (!outSize.isValid() || outSize.width() <= 0)
@@ -569,9 +605,9 @@ QImage Text3DLayer::renderFrameExtruded(QSize size, double time) const
 
     ensureExtrudedMesh();
 
-    const double yaw = m_extrudeBaseYaw
+    double yaw = m_extrudeBaseYaw
         + static_cast<double>(m_rotationAnimAxis.y()) * time * kExtrudeSpinDegPerSec;
-    const double pitch = m_extrudeBasePitch
+    double pitch = m_extrudeBasePitch
         + static_cast<double>(m_rotationAnimAxis.x()) * time * kExtrudeSpinDegPerSec;
 
     softras::RenderParams rp;
@@ -583,6 +619,11 @@ QImage Text3DLayer::renderFrameExtruded(QSize size, double time) const
     rp.wireframe = false;
 
     double camDist = m_cameraDistance;
+    if (!std::isfinite(camDist) || camDist <= 0.0)
+        camDist = 3.0;
+
+    const Camera3D &activeCamera = cameraEqualsDefault(cam) ? m_camera : cam;
+    foldCameraIntoExtrudeOrbit(activeCamera, time, yaw, pitch, camDist);
     if (!std::isfinite(camDist) || camDist <= 0.0)
         camDist = 3.0;
 

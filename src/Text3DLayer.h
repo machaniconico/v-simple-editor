@@ -74,7 +74,7 @@ public:
 private:
     double characterProgress(int characterIndex, double time) const;
     QImage renderFrameQuads(QSize size, double time, const Camera3D &cam) const;
-    QImage renderFrameExtruded(QSize size, double time) const;
+    QImage renderFrameExtruded(QSize size, double time, const Camera3D &cam) const;
     void ensureExtrudedMesh() const;
 
     QString m_text;

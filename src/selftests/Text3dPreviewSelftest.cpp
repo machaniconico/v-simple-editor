@@ -1,18 +1,30 @@
 #include "Camera3D.h"
+#include "Text3DExtrusionDialog.h"
 #include "Text3DLayer.h"
 
+#include <QApplication>
 #include <QByteArray>
+#include <QJsonDocument>
 #include <QJsonObject>
 #include <QSize>
 #include <QString>
 #include <QVector3D>
+#include <QtGlobal>
+#include <cstddef>
+#include <cstring>
 #include <cstdio>
+#include <memory>
 
 namespace {
 
 bool cameraEquals(const Camera3D &a, const Camera3D &b)
 {
     return a.toJson() == b.toJson();
+}
+
+bool cameraEqualsDefault(const Camera3D &camera)
+{
+    return cameraEquals(camera, Camera3D{});
 }
 
 Camera3D makeNonDefaultCamera()
@@ -27,6 +39,26 @@ Camera3D makeNonDefaultCamera()
     state.roll = 7.0;
     camera.setCamera(state);
     return camera;
+}
+
+void configureExtrudedLayerForRenderGate(Text3DLayer &layer)
+{
+    layer.setText(QStringLiteral("FIX09"), QFont(QStringLiteral("Arial"), 72));
+    layer.setExtrudeEnabled(true);
+    layer.setExtrude(0.35, 0.03, 0.03, 2);
+    // The extruded mesh is normalized to unit scale, but m_cameraDistance
+    // defaults to 400 (quad-path pixel units) — without an orbit-scale
+    // distance the text subtends <1px and renders fully transparent.
+    layer.setCameraDistance(3.0);
+}
+
+bool imageBytesEqual(const QImage &a, const QImage &b)
+{
+    return a.size() == b.size()
+        && a.format() == b.format()
+        && a.sizeInBytes() == b.sizeInBytes()
+        && (a.sizeInBytes() == 0
+            || std::memcmp(a.constBits(), b.constBits(), static_cast<std::size_t>(a.sizeInBytes())) == 0);
 }
 
 void printGate(int gate, bool ok, const QString &reason, int &passed, int &failed)
@@ -129,6 +161,109 @@ int runText3dPreviewSelftest()
         const bool ok = cameraEquals(layer.camera(), Camera3D{});
         const QString reason = QStringLiteral("missing camera field did not reset to Camera3D{}");
         printGate(4, ok, reason, passed, failed);
+    }
+
+    // G5/G6 construct a QDialog and rasterize glyphs, so this selftest is
+    // registered with needsQApplication=true. The deployed Windows build ships
+    // only the "windows" platform plugin, so a hand-rolled offscreen
+    // QApplication cannot initialize here (it pops the fatal plugin dialog).
+    if (!QApplication::instance()) {
+        printGate(5, false, QStringLiteral("QApplication missing — must dispatch post-QApplication"), passed, failed);
+        printGate(6, false, QStringLiteral("QApplication missing — must dispatch post-QApplication"), passed, failed);
+        std::printf("text3d-preview: %d passed, %d failed\n", passed, failed);
+        return failed;
+    }
+
+    // G5: dialog resave preserves camera JSON.
+    {
+        QString reason;
+        bool ok = true;
+
+        Text3DLayer src;
+        src.setText(QStringLiteral("Camera"), QFont(QStringLiteral("Arial"), 72));
+        src.setExtrudeEnabled(true);
+        src.setCamera(makeNonDefaultCamera());
+
+        Text3DExtrusionDialog dialog;
+        dialog.setLayer(src);
+        std::unique_ptr<Text3DLayer> out(dialog.layer(nullptr));
+
+        if (!out) {
+            ok = false;
+            reason = QStringLiteral("dialog.layer(nullptr) returned null");
+        } else if (QJsonDocument(out->camera().toJson()) != QJsonDocument(src.camera().toJson())) {
+            ok = false;
+            reason = QStringLiteral("dialog resave changed non-default camera JSON");
+        }
+
+        if (ok) {
+            Text3DLayer defaultSrc;
+            defaultSrc.setText(QStringLiteral("Default"), QFont(QStringLiteral("Arial"), 72));
+            defaultSrc.setExtrudeEnabled(true);
+
+            Text3DExtrusionDialog defaultDialog;
+            defaultDialog.setLayer(defaultSrc);
+            std::unique_ptr<Text3DLayer> defaultOut(defaultDialog.layer(nullptr));
+
+            if (!defaultOut) {
+                ok = false;
+                reason = QStringLiteral("dialog.layer(nullptr) returned null for default camera");
+            } else if (!cameraEqualsDefault(defaultOut->camera())) {
+                ok = false;
+                reason = QStringLiteral("default camera did not round-trip through dialog as Camera3D{}");
+            } else if (defaultOut->toJson().value(QStringLiteral("camera")).isObject()) {
+                ok = false;
+                reason = QStringLiteral("dialog resave emitted a spurious default camera object");
+            }
+        }
+
+        printGate(5, ok, reason, passed, failed);
+    }
+
+    // G6: non-default camera affects extrude render, while default-camera output stays byte-identical.
+    {
+        QString reason;
+        bool ok = true;
+        const QSize size(192, 128);
+
+        Text3DLayer defaultLayer;
+        configureExtrudedLayerForRenderGate(defaultLayer);
+        const QImage a = defaultLayer.renderFrame(size, 0.0, Camera3D{});
+
+        Text3DLayer cameraLayer;
+        configureExtrudedLayerForRenderGate(cameraLayer);
+        cameraLayer.setCamera(makeNonDefaultCamera());
+        const QImage b = cameraLayer.renderFrame(size, 0.0, Camera3D{});
+
+        Text3DLayer defaultLayer2;
+        configureExtrudedLayerForRenderGate(defaultLayer2);
+        const QImage a2 = defaultLayer2.renderFrame(size, 0.0, Camera3D{});
+
+        auto opaquePixels = [](const QImage &img) {
+            qint64 n = 0;
+            for (int y = 0; y < img.height(); ++y) {
+                const QRgb *line = reinterpret_cast<const QRgb *>(img.constScanLine(y));
+                for (int x = 0; x < img.width(); ++x)
+                    if (qAlpha(line[x]) != 0)
+                        ++n;
+            }
+            return n;
+        };
+
+        if (a.isNull() || b.isNull() || a2.isNull()) {
+            ok = false;
+            reason = QStringLiteral("extrude render returned a null image");
+        } else if (imageBytesEqual(a, b)) {
+            ok = false;
+            reason = QStringLiteral("non-default camera did not change extrude render output")
+                + QStringLiteral(" (opaque px: default=%1 camera=%2)")
+                      .arg(opaquePixels(a)).arg(opaquePixels(b));
+        } else if (!imageBytesEqual(a, a2)) {
+            ok = false;
+            reason = QStringLiteral("default camera extrude render was not byte-identical");
+        }
+
+        printGate(6, ok, reason, passed, failed);
     }
 
     std::printf("text3d-preview: %d passed, %d failed\n", passed, failed);
