@@ -18,6 +18,7 @@
 #include <QSlider>
 #include <QSpinBox>
 #include <QMessageBox>
+#include <algorithm>
 #include <cmath>
 
 namespace effectctrl {
@@ -38,6 +39,168 @@ const QStringList &motionTrackNames()
         QStringLiteral("motion.rotation.z"),
     };
     return names;
+}
+
+struct EffectTrackRef {
+    QString trackName;
+    QString paramName;
+    int effectIndex = -1;
+};
+
+bool parseEffectTrackName(const QString &trackName, int *effectIndex, QString *paramName)
+{
+    static const QString prefix = QStringLiteral("effect.");
+    if (!trackName.startsWith(prefix)) {
+        return false;
+    }
+
+    const int indexStart = prefix.size();
+    const int dotPos = trackName.indexOf(QLatin1Char('.'), indexStart);
+    if (dotPos <= indexStart) {
+        return false;
+    }
+
+    bool ok = false;
+    const int parsedIndex = trackName.mid(indexStart, dotPos - indexStart).toInt(&ok);
+    if (!ok || parsedIndex < 0) {
+        return false;
+    }
+
+    if (effectIndex) {
+        *effectIndex = parsedIndex;
+    }
+    if (paramName) {
+        *paramName = trackName.mid(dotPos + 1);
+    }
+    return true;
+}
+
+QString effectTrackName(int effectIndex, const QString &paramName)
+{
+    return QStringLiteral("effect.%1.%2").arg(effectIndex).arg(paramName);
+}
+
+QVector<EffectTrackRef> effectKeyframeTracksAt(const KeyframeManager &keyframes, int effectIndex)
+{
+    QVector<EffectTrackRef> refs;
+    for (const auto &track : keyframes.tracks()) {
+        int parsedIndex = -1;
+        QString paramName;
+        if (parseEffectTrackName(track.propertyName(), &parsedIndex, &paramName)
+            && parsedIndex == effectIndex) {
+            refs.append(EffectTrackRef{track.propertyName(), paramName, parsedIndex});
+        }
+    }
+    return refs;
+}
+
+QVector<EffectTrackRef> effectKeyframeTracksFrom(const KeyframeManager &keyframes, int firstEffectIndex)
+{
+    QVector<EffectTrackRef> refs;
+    for (const auto &track : keyframes.tracks()) {
+        int parsedIndex = -1;
+        QString paramName;
+        if (parseEffectTrackName(track.propertyName(), &parsedIndex, &paramName)
+            && parsedIndex >= firstEffectIndex) {
+            refs.append(EffectTrackRef{track.propertyName(), paramName, parsedIndex});
+        }
+    }
+    return refs;
+}
+
+QString uniqueTemporaryTrackName(const KeyframeManager &keyframes,
+                                 int effectIndex,
+                                 const QString &paramName)
+{
+    QString candidate = QStringLiteral("__effect_keyframe_remap_tmp.%1.%2")
+                            .arg(effectIndex)
+                            .arg(paramName);
+    while (keyframes.hasTrack(candidate)) {
+        candidate.append(QLatin1Char('_'));
+    }
+    return candidate;
+}
+
+bool copyKeyframeTrack(KeyframeManager &keyframes,
+                       const QString &sourceTrackName,
+                       const QString &targetTrackName)
+{
+    const KeyframeTrack *source = keyframes.track(sourceTrackName);
+    if (!source) {
+        return false;
+    }
+
+    KeyframeTrack copy = *source;
+    copy.setPropertyName(targetTrackName);
+    keyframes.addTrack(copy);
+    keyframes.setLoopOutMode(targetTrackName, keyframes.loopOutMode(sourceTrackName));
+    return true;
+}
+
+void shiftEffectKeyframeTracks(KeyframeManager &keyframes, int firstEffectIndex, int delta)
+{
+    auto refs = effectKeyframeTracksFrom(keyframes, firstEffectIndex);
+    std::sort(refs.begin(), refs.end(),
+              [delta](const EffectTrackRef &a, const EffectTrackRef &b) {
+                  if (a.effectIndex == b.effectIndex) {
+                      return a.paramName < b.paramName;
+                  }
+                  return delta > 0
+                      ? a.effectIndex > b.effectIndex
+                      : a.effectIndex < b.effectIndex;
+              });
+
+    for (const auto &ref : refs) {
+        keyframes.renameTrack(ref.trackName,
+                              effectTrackName(ref.effectIndex + delta, ref.paramName));
+    }
+}
+
+void swapEffectKeyframeTracks(KeyframeManager &keyframes, int firstEffectIndex, int secondEffectIndex)
+{
+    if (firstEffectIndex == secondEffectIndex) {
+        return;
+    }
+    if (firstEffectIndex > secondEffectIndex) {
+        std::swap(firstEffectIndex, secondEffectIndex);
+    }
+
+    const auto firstRefs = effectKeyframeTracksAt(keyframes, firstEffectIndex);
+    const auto secondRefs = effectKeyframeTracksAt(keyframes, secondEffectIndex);
+    QVector<EffectTrackRef> temporaryRefs;
+
+    for (const auto &ref : firstRefs) {
+        const QString tempName = uniqueTemporaryTrackName(keyframes, ref.effectIndex, ref.paramName);
+        if (keyframes.renameTrack(ref.trackName, tempName)) {
+            temporaryRefs.append(EffectTrackRef{tempName, ref.paramName, ref.effectIndex});
+        }
+    }
+    for (const auto &ref : secondRefs) {
+        keyframes.renameTrack(ref.trackName, effectTrackName(firstEffectIndex, ref.paramName));
+    }
+    for (const auto &ref : temporaryRefs) {
+        keyframes.renameTrack(ref.trackName, effectTrackName(secondEffectIndex, ref.paramName));
+    }
+}
+
+void removeEffectKeyframeTracks(KeyframeManager &keyframes, int removedEffectIndex)
+{
+    const auto removedRefs = effectKeyframeTracksAt(keyframes, removedEffectIndex);
+    for (const auto &ref : removedRefs) {
+        keyframes.removeTrack(ref.trackName);
+    }
+    shiftEffectKeyframeTracks(keyframes, removedEffectIndex + 1, -1);
+}
+
+void duplicateEffectKeyframeTracks(KeyframeManager &keyframes, int sourceEffectIndex)
+{
+    const auto sourceRefs = effectKeyframeTracksAt(keyframes, sourceEffectIndex);
+    const int insertedEffectIndex = sourceEffectIndex + 1;
+    shiftEffectKeyframeTracks(keyframes, insertedEffectIndex, 1);
+    for (const auto &ref : sourceRefs) {
+        copyKeyframeTrack(keyframes, ref.trackName,
+                          effectTrackName(insertedEffectIndex, ref.paramName));
+    }
 }
 
 ClipInfo *selectedClipForKey(const Timeline *timeline, const ClipKey &key)
@@ -627,34 +790,70 @@ void EffectControlsPanel::onResetRequested(int idx)
 void EffectControlsPanel::onDuplicateRequested(int idx)
 {
     if (idx < 0 || idx >= m_effects.size()) return;
+    if (!m_timeline) return;
+    const ClipInfo *clip = selectedClipForKey(m_timeline, m_currentClipKey);
+    if (!clip) return;
+
+    KeyframeManager keyframes = clip->keyframes;
+    duplicateEffectKeyframeTracks(keyframes, idx);
     VideoEffect copy = m_effects[idx];
     m_effects.insert(idx + 1, copy);
-    emit effectsChanged(m_effects);
-    persistAndRebuild();
+    m_timeline->setClipEffectsAndKeyframes(m_currentClipKey.trackIdx,
+                                           m_currentClipKey.clipIdx,
+                                           m_effects,
+                                           keyframes);
+    buildEffectGroups(m_effects);
 }
 
 void EffectControlsPanel::onRemoveRequested(int idx)
 {
     if (idx < 0 || idx >= m_effects.size()) return;
+    if (!m_timeline) return;
+    const ClipInfo *clip = selectedClipForKey(m_timeline, m_currentClipKey);
+    if (!clip) return;
+
+    KeyframeManager keyframes = clip->keyframes;
+    removeEffectKeyframeTracks(keyframes, idx);
     m_effects.remove(idx);
-    emit effectsChanged(m_effects);
-    persistAndRebuild();
+    m_timeline->setClipEffectsAndKeyframes(m_currentClipKey.trackIdx,
+                                           m_currentClipKey.clipIdx,
+                                           m_effects,
+                                           keyframes);
+    buildEffectGroups(m_effects);
 }
 
 void EffectControlsPanel::onMoveUpRequested(int idx)
 {
     if (idx <= 0 || idx >= m_effects.size()) return;
+    if (!m_timeline) return;
+    const ClipInfo *clip = selectedClipForKey(m_timeline, m_currentClipKey);
+    if (!clip) return;
+
+    KeyframeManager keyframes = clip->keyframes;
+    swapEffectKeyframeTracks(keyframes, idx, idx - 1);
     m_effects.swapItemsAt(idx, idx - 1);
-    emit effectsChanged(m_effects);
-    persistAndRebuild();
+    m_timeline->setClipEffectsAndKeyframes(m_currentClipKey.trackIdx,
+                                           m_currentClipKey.clipIdx,
+                                           m_effects,
+                                           keyframes);
+    buildEffectGroups(m_effects);
 }
 
 void EffectControlsPanel::onMoveDownRequested(int idx)
 {
     if (idx < 0 || idx >= m_effects.size() - 1) return;
+    if (!m_timeline) return;
+    const ClipInfo *clip = selectedClipForKey(m_timeline, m_currentClipKey);
+    if (!clip) return;
+
+    KeyframeManager keyframes = clip->keyframes;
+    swapEffectKeyframeTracks(keyframes, idx, idx + 1);
     m_effects.swapItemsAt(idx, idx + 1);
-    emit effectsChanged(m_effects);
-    persistAndRebuild();
+    m_timeline->setClipEffectsAndKeyframes(m_currentClipKey.trackIdx,
+                                           m_currentClipKey.clipIdx,
+                                           m_effects,
+                                           keyframes);
+    buildEffectGroups(m_effects);
 }
 
 void EffectControlsPanel::onAddEffectRequested(VideoEffectType type)

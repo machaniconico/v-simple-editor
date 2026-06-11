@@ -44,6 +44,7 @@ public:
 
     const QString &propertyName() const { return m_property; }
     double defaultValue() const { return m_defaultValue; }
+    void setPropertyName(const QString &propertyName);
 
     void addKeyframe(double time, double value,
                      KeyframePoint::Interpolation interp = KeyframePoint::Linear,
@@ -124,6 +125,7 @@ class KeyframeManager
 public:
     void addTrack(const KeyframeTrack &track);
     void removeTrack(const QString &propertyName);
+    bool renameTrack(const QString &oldPropertyName, const QString &newPropertyName);
     KeyframeTrack *track(const QString &propertyName);
     const KeyframeTrack *track(const QString &propertyName) const;
     bool hasTrack(const QString &propertyName) const;

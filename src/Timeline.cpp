@@ -4618,6 +4618,27 @@ void Timeline::setClipEffects(const QVector<VideoEffect> &effects)
     saveUndoState("Video effects");
 }
 
+void Timeline::setClipEffectsAndKeyframes(int trackIdx, int clipIdx,
+                                          const QVector<VideoEffect> &effects,
+                                          const KeyframeManager &km)
+{
+    if (trackIdx < 0 || trackIdx >= m_videoTracks.size())
+        return;
+    auto *track = m_videoTracks[trackIdx];
+    if (!track)
+        return;
+
+    auto clips = track->clips();
+    if (clipIdx < 0 || clipIdx >= clips.size())
+        return;
+
+    clips[clipIdx].effects = effects;
+    clips[clipIdx].keyframes = km;
+    track->setClips(clips);
+    saveUndoState("Video effects");
+    scheduleEmitSequenceChanged();
+}
+
 void Timeline::setClipKeyframes(const KeyframeManager &km)
 {
     int sel = m_videoTrack->selectedClip();

@@ -567,6 +567,9 @@ public:
     // Reset both leadIn and trailOut on the selected clip back to None.
     void clearTransitionsOnSelected();
     void setClipEffects(const QVector<VideoEffect> &effects);
+    void setClipEffectsAndKeyframes(int trackIdx, int clipIdx,
+                                    const QVector<VideoEffect> &effects,
+                                    const KeyframeManager &km);
     void setClipKeyframes(const KeyframeManager &km);
     ColorCorrection clipColorCorrection() const;
     LayerStyle clipLayerStyle() const;

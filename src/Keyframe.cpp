@@ -150,6 +150,11 @@ double loopedTrackValueAt(const KeyframeTrack &track, LoopMode mode, double time
 KeyframeTrack::KeyframeTrack(const QString &property, double defaultValue)
     : m_property(property), m_defaultValue(defaultValue) {}
 
+void KeyframeTrack::setPropertyName(const QString &propertyName)
+{
+    m_property = propertyName;
+}
+
 void KeyframeTrack::addKeyframe(double time,
                                 double value,
                                 KeyframePoint::Interpolation interp,
@@ -450,6 +455,43 @@ void KeyframeManager::removeTrack(const QString &propertyName)
             [&](const KeyframeTrack &t) { return t.propertyName() == propertyName; }),
         m_tracks.end());
     m_loopOutModes.remove(propertyName);
+}
+
+bool KeyframeManager::renameTrack(const QString &oldPropertyName, const QString &newPropertyName)
+{
+    if (oldPropertyName == newPropertyName) {
+        return hasTrack(oldPropertyName);
+    }
+
+    int sourceIndex = -1;
+    int targetIndex = -1;
+    for (int i = 0; i < m_tracks.size(); ++i) {
+        if (m_tracks[i].propertyName() == oldPropertyName) {
+            sourceIndex = i;
+        } else if (m_tracks[i].propertyName() == newPropertyName) {
+            targetIndex = i;
+        }
+    }
+    if (sourceIndex < 0) {
+        return false;
+    }
+
+    if (targetIndex >= 0) {
+        m_tracks.removeAt(targetIndex);
+        if (targetIndex < sourceIndex) {
+            --sourceIndex;
+        }
+    }
+
+    const bool hasLoopOutMode = m_loopOutModes.contains(oldPropertyName);
+    const LoopMode loopOutMode = m_loopOutModes.value(oldPropertyName, LoopMode::None);
+    m_tracks[sourceIndex].setPropertyName(newPropertyName);
+    m_loopOutModes.remove(oldPropertyName);
+    m_loopOutModes.remove(newPropertyName);
+    if (hasLoopOutMode) {
+        m_loopOutModes.insert(newPropertyName, loopOutMode);
+    }
+    return true;
 }
 
 KeyframeTrack *KeyframeManager::track(const QString &propertyName)
