@@ -19,6 +19,7 @@ struct FrameStats {
 };
 
 FrameStats analyzeFrame(const QImage &image);
+ColorCorrection autoCorrection(const FrameStats &stats, const ColorCorrection &existing);
 ColorCorrection autoCorrection(const FrameStats &stats);
 
 } // namespace autocolor

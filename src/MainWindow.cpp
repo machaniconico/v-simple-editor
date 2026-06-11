@@ -367,6 +367,14 @@ bool onionSkinPresetMatches(const onionskin::Config &cfg, OnionSkinPreset preset
     return false;
 }
 
+bool pauseOnRightClickFromSettings()
+{
+    const QSettings settings(QStringLiteral("VSimpleEditor"), QStringLiteral("Preferences"));
+    return rcpause::resolvePauseOnRightClick(
+        settings.value(rcpause::pauseOnRightClickKey()).toString(),
+        rcpause::kDefaultPauseOnRightClick);
+}
+
 QString onionSkinOpacityText(const onionskin::Config &cfg)
 {
     const int pct = qRound(qBound(0.0, cfg.opacity, 1.0) * 100.0);
@@ -1169,9 +1177,7 @@ void MainWindow::setupUI()
     // PV-B: プレビュー右クリックメニュー (表示トグル + 再生ヘッド直下クリップ操作)。
     connect(m_player, &VideoPlayer::previewContextMenuRequested,
             this, [this](const QPoint &gp) {
-        if (QSettings("VSimpleEditor", "Preferences")
-                .value(rcpause::pauseOnRightClickKey(),
-                       rcpause::kDefaultPauseOnRightClick).toBool()) {
+        if (pauseOnRightClickFromSettings()) {
             if (m_player)
                 m_player->pause();
         }
@@ -1179,10 +1185,7 @@ void MainWindow::setupUI()
         QMenu menu;
         QAction *pauseOnRightClickAct = menu.addAction(QStringLiteral("右クリックで一時停止"));
         pauseOnRightClickAct->setCheckable(true);
-        pauseOnRightClickAct->setChecked(
-            QSettings("VSimpleEditor", "Preferences")
-                .value(rcpause::pauseOnRightClickKey(),
-                       rcpause::kDefaultPauseOnRightClick).toBool());
+        pauseOnRightClickAct->setChecked(pauseOnRightClickFromSettings());
         connect(pauseOnRightClickAct, &QAction::toggled, this, [](bool checked) {
             QSettings("VSimpleEditor", "Preferences")
                 .setValue(rcpause::pauseOnRightClickKey(), checked);
@@ -7036,7 +7039,7 @@ void MainWindow::autoColorSelectedClip()
     }
 
     const autocolor::FrameStats stats = autocolor::analyzeFrame(m_lastCompositedFrame);
-    const ColorCorrection cc = autocolor::autoCorrection(stats);
+    const ColorCorrection cc = autocolor::autoCorrection(stats, m_timeline->clipColorCorrection());
     m_timeline->setClipColorCorrection(cc);
     if (m_player)
         m_player->setColorCorrection(cc);
@@ -9756,6 +9759,31 @@ void MainWindow::showMotionTrackerDialog()
 
 void MainWindow::openAudioClipEditorDialog()
 {
+    if (!m_timeline || !m_timeline->hasSelection()) {
+        QMessageBox::information(this, "Audio Clip Editor", "Select a clip first.");
+        return;
+    }
+
+    int trackIdx = -1;
+    int clipIdx = -1;
+    ClipInfo selectedClip;
+    if (!selectedVideoClipRef(trackIdx, clipIdx, &selectedClip)) {
+        QMessageBox::information(this, "Audio Clip Editor", "Select a clip first.");
+        return;
+    }
+
+    double selectedVolume = selectedClip.volume;
+    double selectedPan = selectedClip.pan;
+    const auto &audioTracks = m_timeline->audioTracks();
+    const auto *audioTrack = audioTracks.value(0, nullptr);
+    if (audioTrack && clipIdx >= 0 && clipIdx < audioTrack->clips().size()) {
+        const ClipInfo audioClip = audioTrack->clips().at(clipIdx);
+        selectedVolume = audioClip.volume;
+        selectedPan = audioClip.pan;
+    }
+    const qint64 selectedDurationMs = qMax<qint64>(
+        1, qRound64(qMax(0.0, selectedClip.effectiveDuration()) * 1000.0));
+
     if (!m_audioClipEditorDialog) {
         m_audioClipEditorDialog = new QDialog(this);
         m_audioClipEditorDialog->setWindowTitle(QStringLiteral("クリップボリュームエンベロープ"));
@@ -9763,7 +9791,12 @@ void MainWindow::openAudioClipEditorDialog()
         auto *layout = new QVBoxLayout(m_audioClipEditorDialog);
         auto *editor = new AudioClipEditor(m_audioClipEditorDialog);
         editor->setObjectName(QStringLiteral("audioClipEditor"));
-        editor->setClipDuration(10000); // demo: 10sec
+        {
+            const QSignalBlocker blocker(editor);
+            editor->setClipDuration(selectedDurationMs);
+            editor->setVolume(selectedVolume);
+            editor->setPan(selectedPan);
+        }
         connect(editor, &AudioClipEditor::volumeChanged, this, [this](double volume) {
             if (m_timeline && m_timeline->hasSelection())
                 m_timeline->setClipVolume(volume);
@@ -9775,6 +9808,15 @@ void MainWindow::openAudioClipEditorDialog()
         layout->addWidget(editor);
         m_audioClipEditorDialog->resize(640, 240);
     }
+
+    auto *editor = m_audioClipEditorDialog->findChild<AudioClipEditor *>(QStringLiteral("audioClipEditor"));
+    if (editor) {
+        const QSignalBlocker blocker(editor);
+        editor->setClipDuration(selectedDurationMs);
+        editor->setVolume(selectedVolume);
+        editor->setPan(selectedPan);
+    }
+
     m_audioClipEditorDialog->show();
     m_audioClipEditorDialog->raise();
     m_audioClipEditorDialog->activateWindow();

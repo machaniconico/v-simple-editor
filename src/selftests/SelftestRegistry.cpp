@@ -12,6 +12,7 @@
 #include <QStringList>
 #include <QCoreApplication>
 #include <QDebug>
+#include "../AutoColor.h"
 #include "../Timeline.h"
 #include "../UndoManager.h"
 #include "../util/Logger.h"
@@ -41,6 +42,7 @@ int runAudioMixerSelftest();
 int runAudioRestoreSelftest();
 int runAutoClipGenSelftest();
 int runAutoColorSelftest();
+int runAutoColorPreserveGradeSelftest();
 int runAutoMatteSelftest();
 int runBatchExportSelftest();
 int runBezierEasingSelftest();
@@ -225,7 +227,93 @@ double selectedAudioVolume(const Timeline &timeline)
     return tracks[0]->clips()[0].volume;
 }
 
+bool sameDouble(double a, double b)
+{
+    return std::fabs(a - b) <= 1e-9;
+}
+
 } // namespace
+
+int runAutoColorPreserveGradeSelftest()
+{
+    const int legacyResult = runAutoColorSelftest();
+
+    int passed = 0;
+    int failed = 0;
+    autocolor::FrameStats stats;
+    stats.r = {80, 120, 100.0};
+    stats.g = {90, 130, 110.0};
+    stats.b = {130, 170, 150.0};
+
+    ColorCorrection existing;
+    existing.brightness = -71.0;
+    existing.contrast = -62.0;
+    existing.temperature = -53.0;
+    existing.tint = -44.0;
+    existing.saturation = 24.0;
+    existing.hue = -17.0;
+    existing.gamma = 1.35;
+    existing.highlights = -12.0;
+    existing.shadows = 18.0;
+    existing.exposure = 0.75;
+    existing.liftR = -0.11;
+    existing.liftG = 0.12;
+    existing.liftB = -0.13;
+    existing.gammaR = 0.21;
+    existing.gammaG = -0.22;
+    existing.gammaB = 0.23;
+    existing.gainR = -0.31;
+    existing.gainG = 0.32;
+    existing.gainB = -0.33;
+
+    const ColorCorrection expectedAutoFields = autocolor::autoCorrection(stats);
+    const ColorCorrection corrected = autocolor::autoCorrection(stats, existing);
+    const bool preservesManualGrade =
+        sameDouble(corrected.saturation, existing.saturation)
+        && sameDouble(corrected.hue, existing.hue)
+        && sameDouble(corrected.gamma, existing.gamma)
+        && sameDouble(corrected.highlights, existing.highlights)
+        && sameDouble(corrected.shadows, existing.shadows)
+        && sameDouble(corrected.exposure, existing.exposure)
+        && sameDouble(corrected.liftR, existing.liftR)
+        && sameDouble(corrected.liftG, existing.liftG)
+        && sameDouble(corrected.liftB, existing.liftB)
+        && sameDouble(corrected.gammaR, existing.gammaR)
+        && sameDouble(corrected.gammaG, existing.gammaG)
+        && sameDouble(corrected.gammaB, existing.gammaB)
+        && sameDouble(corrected.gainR, existing.gainR)
+        && sameDouble(corrected.gainG, existing.gainG)
+        && sameDouble(corrected.gainB, existing.gainB);
+
+    if (preservesManualGrade) {
+        ++passed;
+        std::cout << "[auto-color] G7 preserve manual grade fields: PASS\n";
+    } else {
+        ++failed;
+        std::cerr << "[auto-color] G7 preserve manual grade fields: FAIL\n";
+    }
+
+    const bool overwritesAutoFields =
+        sameDouble(corrected.temperature, expectedAutoFields.temperature)
+        && sameDouble(corrected.tint, expectedAutoFields.tint)
+        && sameDouble(corrected.contrast, expectedAutoFields.contrast)
+        && sameDouble(corrected.brightness, expectedAutoFields.brightness)
+        && (!sameDouble(corrected.temperature, existing.temperature)
+            || !sameDouble(corrected.tint, existing.tint)
+            || !sameDouble(corrected.contrast, existing.contrast)
+            || !sameDouble(corrected.brightness, existing.brightness));
+    if (overwritesAutoFields) {
+        ++passed;
+        std::cout << "[auto-color] G8 overwrite auto-owned fields: PASS\n";
+    } else {
+        ++failed;
+        std::cerr << "[auto-color] G8 overwrite auto-owned fields: FAIL\n";
+    }
+
+    std::cout << "[auto-color] FIX-07 preservation summary: "
+              << passed << " passed, " << failed << " failed\n";
+    return legacyResult == 0 && failed == 0 ? 0 : 1;
+}
 
 int runAudioClipDragUndoSelftest()
 {
@@ -450,8 +538,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "OnionSkin: disabled/empty/opacity-zero no-op + display blend invariant (4 gates)" },
     { "capcut-caption",   "VEDITOR_CAPCUT_CAPTION_SELFTEST",      runCapcutCaptionSelftest,      false,
       "CapCut-style caption presets: shape, uniqueness, distinction, background semantics, non-default" },
-    { "auto-color",       "VEDITOR_AUTO_COLOR_SELFTEST",          runAutoColorSelftest,          false,
-      "AutoColor: frame stats + gray-world WB + brightness/contrast closed-loop proof" },
+    { "auto-color",       "VEDITOR_AUTO_COLOR_SELFTEST",          runAutoColorPreserveGradeSelftest, false,
+      "AutoColor: frame stats + gray-world WB + brightness/contrast closed-loop proof + manual grade preservation" },
     { "wb-eyedropper",    "VEDITOR_WB_EYEDROPPER_SELFTEST",       runWbEyedropperSelftest,       false,
       "WB eyedropper inverse temperature/tint helper + closed-loop VideoEffect forward proof" },
     { "subtitle-cps",     "VEDITOR_SUBTITLE_CPS_SELFTEST",        runSubtitleCpsSelftest,        false,

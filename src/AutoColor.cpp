@@ -85,9 +85,9 @@ FrameStats analyzeFrame(const QImage &image)
     };
 }
 
-ColorCorrection autoCorrection(const FrameStats &stats)
+ColorCorrection autoCorrection(const FrameStats &stats, const ColorCorrection &existing)
 {
-    ColorCorrection cc;
+    ColorCorrection cc = existing;
 
     const QColor neutral(
         clampByteFromMean(stats.r.mean),
@@ -96,6 +96,7 @@ ColorCorrection autoCorrection(const FrameStats &stats)
     const wbpick::TempTintCorrection wb = wbpick::tempTintForNeutral(neutral);
     cc.temperature = wb.temperature;
     cc.tint = wb.tint;
+    cc.contrast = 0.0;
 
     const double lumaMin = luma(stats.r.minV, stats.g.minV, stats.b.minV);
     const double lumaMax = luma(stats.r.maxV, stats.g.maxV, stats.b.maxV);
@@ -120,6 +121,11 @@ ColorCorrection autoCorrection(const FrameStats &stats)
         cc.contrast = 0.0;
 
     return cc;
+}
+
+ColorCorrection autoCorrection(const FrameStats &stats)
+{
+    return autoCorrection(stats, ColorCorrection{});
 }
 
 } // namespace autocolor
