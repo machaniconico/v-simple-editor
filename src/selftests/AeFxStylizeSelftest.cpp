@@ -361,6 +361,63 @@ int runAeFxStylizeSelftest()
                   passed, failed);
     }
 
+    {
+        QImage transparentSource(21, 21, QImage::Format_ARGB32);
+        transparentSource.fill(qRgba(0, 0, 0, 255));
+        transparentSource.setPixel(10, 10, qRgba(255, 255, 255, 0));
+        const QImage transparentGlow = VideoEffectProcessor::applyEffect(
+            transparentSource, VideoEffect::createGlow(200.0, 1.0, 1.0));
+        const QImage transparentBloom = VideoEffectProcessor::applyEffect(
+            transparentSource, VideoEffect::createBloom(200.0, 1.0, 1.0));
+
+        QImage opaqueSource(21, 21, QImage::Format_ARGB32);
+        opaqueSource.fill(qRgba(0, 0, 0, 255));
+        opaqueSource.setPixel(10, 10, qRgba(255, 255, 255, 255));
+        const QImage opaqueGlow = VideoEffectProcessor::applyEffect(
+            opaqueSource, VideoEffect::createGlow(200.0, 1.0, 1.0));
+        const QImage opaqueBloom = VideoEffectProcessor::applyEffect(
+            opaqueSource, VideoEffect::createBloom(200.0, 1.0, 1.0));
+
+        QImage semiSource(21, 21, QImage::Format_ARGB32);
+        semiSource.fill(qRgba(0, 0, 0, 255));
+        semiSource.setPixel(10, 10, qRgba(255, 255, 255, 128));
+        const QImage semiGlow = VideoEffectProcessor::applyEffect(
+            semiSource, VideoEffect::createGlow(200.0, 1.0, 1.0));
+        const QImage semiBloom = VideoEffectProcessor::applyEffect(
+            semiSource, VideoEffect::createBloom(200.0, 1.0, 1.0));
+
+        const int transparentGlowHalo = lumaAt(transparentGlow, 11, 10);
+        const int transparentBloomHalo = lumaAt(transparentBloom, 11, 10);
+        const int semiGlowHalo = lumaAt(semiGlow, 11, 10);
+        const int semiBloomHalo = lumaAt(semiBloom, 11, 10);
+        const int opaqueGlowHalo = lumaAt(opaqueGlow, 11, 10);
+        const int opaqueBloomHalo = lumaAt(opaqueBloom, 11, 10);
+
+        printGate("G8",
+                  transparentGlowHalo == 0
+                      && transparentBloomHalo == 0
+                      && semiGlowHalo > 0
+                      && semiGlowHalo < opaqueGlowHalo
+                      && semiBloomHalo > 0
+                      && semiBloomHalo < opaqueBloomHalo,
+                  "Glow/Bloom transparent halo rejection or alpha weighting failed",
+                  passed, failed);
+    }
+
+    {
+        const QImage pattern = makePatternImage(12, 12);
+        const QImage tinyFindEdges = VideoEffectProcessor::applyEffect(
+            pattern, VideoEffect::createFindEdges(0.01));
+        const QImage tinyEmboss = VideoEffectProcessor::applyEffect(
+            pattern, VideoEffect::createEmboss(45.0, 0.01));
+
+        printGate("G9",
+                  allPixelsWithin(pattern, tinyFindEdges, 4)
+                      && allPixelsWithin(pattern, tinyEmboss, 4),
+                  "FindEdges/Emboss near-zero continuity failed",
+                  passed, failed);
+    }
+
     std::printf("ae-fx-stylize summary passed=%d failed=%d\n", passed, failed);
     return failed == 0 ? 0 : 1;
 }

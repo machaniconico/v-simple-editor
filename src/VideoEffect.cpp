@@ -46,15 +46,40 @@ static inline std::uint32_t glitchHash(int row, int seed)
     return x;
 }
 
-static inline void addRgbSample(const QImage &img, int x, int y,
-                                double &rSum, double &gSum, double &bSum)
+static inline void addPremultipliedArgbSample(const QImage &img, int x, int y,
+                                              double &rSum, double &gSum,
+                                              double &bSum, double &aSum)
 {
-    const int sx = qBound(0, x, img.width() - 1);
-    const int sy = qBound(0, y, img.height() - 1);
-    const uint8_t *line = img.constScanLine(sy);
-    rSum += line[sx * 3];
-    gSum += line[sx * 3 + 1];
-    bSum += line[sx * 3 + 2];
+    const QRgb px = sampleArgbPixel(img, x, y);
+    const double alpha = static_cast<double>(qAlpha(px));
+    const double alphaWeight = alpha / 255.0;
+    rSum += qRed(px) * alphaWeight;
+    gSum += qGreen(px) * alphaWeight;
+    bSum += qBlue(px) * alphaWeight;
+    aSum += alpha;
+}
+
+static inline QRgb rgbaFromPremultipliedAverages(double r, double g,
+                                                 double b, double a)
+{
+    if (a <= 0.0)
+        return qRgba(0, 0, 0, 0);
+
+    const double invAlpha = 255.0 / a;
+    return qRgba(clamp255d(r * invAlpha),
+                 clamp255d(g * invAlpha),
+                 clamp255d(b * invAlpha),
+                 clamp255d(a));
+}
+
+static inline QRgb rgbaFromPremultipliedSums(double rSum, double gSum,
+                                             double bSum, double aSum,
+                                             double sampleCount)
+{
+    return rgbaFromPremultipliedAverages(rSum / sampleCount,
+                                         gSum / sampleCount,
+                                         bSum / sampleCount,
+                                         aSum / sampleCount);
 }
 
 static QVector<double> boxBlurRgbBuffer(const QVector<double> &src, int w, int h, int radius)
@@ -1332,11 +1357,11 @@ QImage VideoEffectProcessor::applyGaussianBlur(const QImage &input, double radiu
     if (sigma <= 0.0)
         return input;
 
-    QImage src = input.convertToFormat(QImage::Format_RGB888);
+    QImage src = input.convertToFormat(QImage::Format_ARGB32);
     const int w = src.width();
     const int h = src.height();
-    QImage result(w, h, QImage::Format_RGB888);
-    QVector<double> tmp(w * h * 3, 0.0);
+    QImage result(w, h, QImage::Format_ARGB32);
+    QVector<double> tmp(w * h * 4, 0.0);
 
     const int kernelRadius = qMax(1, static_cast<int>(std::ceil(sigma * 3.0)));
     QVector<double> kernel(kernelRadius * 2 + 1);
@@ -1351,20 +1376,25 @@ QImage VideoEffectProcessor::applyGaussianBlur(const QImage &input, double radiu
         weight /= kernelSum;
 
     for (int y = 0; y < h; ++y) {
+        const QRgb *srcLine = reinterpret_cast<const QRgb*>(src.constScanLine(y));
         for (int x = 0; x < w; ++x) {
-            double rSum = 0.0, gSum = 0.0, bSum = 0.0;
+            double rSum = 0.0, gSum = 0.0, bSum = 0.0, aSum = 0.0;
             for (int k = -kernelRadius; k <= kernelRadius; ++k) {
                 const int sx = qBound(0, x + k, w - 1);
-                const uint8_t *srcLine = src.constScanLine(y);
                 const double weight = kernel[k + kernelRadius];
-                rSum += srcLine[sx * 3] * weight;
-                gSum += srcLine[sx * 3 + 1] * weight;
-                bSum += srcLine[sx * 3 + 2] * weight;
+                const QRgb px = srcLine[sx];
+                const double alpha = static_cast<double>(qAlpha(px));
+                const double alphaWeight = alpha / 255.0;
+                rSum += qRed(px) * alphaWeight * weight;
+                gSum += qGreen(px) * alphaWeight * weight;
+                bSum += qBlue(px) * alphaWeight * weight;
+                aSum += alpha * weight;
             }
-            const int idx = (y * w + x) * 3;
+            const int idx = (y * w + x) * 4;
             tmp[idx] = rSum;
             tmp[idx + 1] = gSum;
             tmp[idx + 2] = bSum;
+            tmp[idx + 3] = aSum;
         }
     }
 
@@ -1372,26 +1402,35 @@ QImage VideoEffectProcessor::applyGaussianBlur(const QImage &input, double radiu
     double gErr = 0.0;
     double bErr = 0.0;
     for (int y = 0; y < h; ++y) {
-        uint8_t *dst = result.scanLine(y);
+        QRgb *dst = reinterpret_cast<QRgb*>(result.scanLine(y));
         for (int x = 0; x < w; ++x) {
-            double rSum = 0.0, gSum = 0.0, bSum = 0.0;
+            double rSum = 0.0, gSum = 0.0, bSum = 0.0, aSum = 0.0;
             for (int k = -kernelRadius; k <= kernelRadius; ++k) {
                 const int sy = qBound(0, y + k, h - 1);
-                const int srcIdx = (sy * w + x) * 3;
+                const int srcIdx = (sy * w + x) * 4;
                 const double weight = kernel[k + kernelRadius];
                 rSum += tmp[srcIdx] * weight;
                 gSum += tmp[srcIdx + 1] * weight;
                 bSum += tmp[srcIdx + 2] * weight;
+                aSum += tmp[srcIdx + 3] * weight;
             }
-            const double rQuant = rSum + rErr;
-            const double gQuant = gSum + gErr;
-            const double bQuant = bSum + bErr;
-            dst[x * 3] = clamp255d(rQuant);
-            dst[x * 3 + 1] = clamp255d(gQuant);
-            dst[x * 3 + 2] = clamp255d(bQuant);
-            rErr = rQuant - dst[x * 3];
-            gErr = gQuant - dst[x * 3 + 1];
-            bErr = bQuant - dst[x * 3 + 2];
+            if (aSum <= 0.0) {
+                dst[x] = qRgba(0, 0, 0, 0);
+                rErr = gErr = bErr = 0.0;
+                continue;
+            }
+
+            const double invAlpha = 255.0 / aSum;
+            const double rQuant = rSum * invAlpha + rErr;
+            const double gQuant = gSum * invAlpha + gErr;
+            const double bQuant = bSum * invAlpha + bErr;
+            dst[x] = qRgba(clamp255d(rQuant),
+                           clamp255d(gQuant),
+                           clamp255d(bQuant),
+                           clamp255d(aSum));
+            rErr = rQuant - qRed(dst[x]);
+            gErr = gQuant - qGreen(dst[x]);
+            bErr = bQuant - qBlue(dst[x]);
         }
     }
 
@@ -1404,27 +1443,25 @@ QImage VideoEffectProcessor::applyDirectionalBlur(const QImage &input, double an
     if (steps <= 0)
         return input;
 
-    QImage src = input.convertToFormat(QImage::Format_RGB888);
+    QImage src = input.convertToFormat(QImage::Format_ARGB32);
     const int w = src.width();
     const int h = src.height();
-    QImage result(w, h, QImage::Format_RGB888);
+    QImage result(w, h, QImage::Format_ARGB32);
     const double angle = angleDegrees * M_PI / 180.0;
     const double dx = std::cos(angle);
     const double dy = std::sin(angle);
     const double sampleCount = static_cast<double>(steps * 2 + 1);
 
     for (int y = 0; y < h; ++y) {
-        uint8_t *dst = result.scanLine(y);
+        QRgb *dst = reinterpret_cast<QRgb*>(result.scanLine(y));
         for (int x = 0; x < w; ++x) {
-            double rSum = 0.0, gSum = 0.0, bSum = 0.0;
+            double rSum = 0.0, gSum = 0.0, bSum = 0.0, aSum = 0.0;
             for (int i = -steps; i <= steps; ++i) {
                 const int sx = static_cast<int>(std::round(x + dx * i));
                 const int sy = static_cast<int>(std::round(y + dy * i));
-                addRgbSample(src, sx, sy, rSum, gSum, bSum);
+                addPremultipliedArgbSample(src, sx, sy, rSum, gSum, bSum, aSum);
             }
-            dst[x * 3] = clamp255d(rSum / sampleCount);
-            dst[x * 3 + 1] = clamp255d(gSum / sampleCount);
-            dst[x * 3 + 2] = clamp255d(bSum / sampleCount);
+            dst[x] = rgbaFromPremultipliedSums(rSum, gSum, bSum, aSum, sampleCount);
         }
     }
 
@@ -1433,56 +1470,55 @@ QImage VideoEffectProcessor::applyDirectionalBlur(const QImage &input, double an
 
 QImage VideoEffectProcessor::applyRadialBlur(const QImage &input, double amount, int mode)
 {
-    const int steps = qBound(0, static_cast<int>(std::round(amount)), 50);
-    if (steps <= 0)
+    const double blurAmount = qBound(0.0, amount, 50.0);
+    if (blurAmount <= 0.0)
         return input;
+    const int steps = qBound(1, static_cast<int>(std::ceil(blurAmount)), 50);
 
-    QImage src = input.convertToFormat(QImage::Format_RGB888);
+    QImage src = input.convertToFormat(QImage::Format_ARGB32);
     const int w = src.width();
     const int h = src.height();
-    QImage result(w, h, QImage::Format_RGB888);
+    QImage result(w, h, QImage::Format_ARGB32);
     const double cx = w * 0.5;
     const double cy = h * 0.5;
 
     if (mode == 1) {
         const double sampleCount = static_cast<double>(steps + 1);
+        const double maxZoom = blurAmount / 50.0;
         for (int y = 0; y < h; ++y) {
-            uint8_t *dst = result.scanLine(y);
+            QRgb *dst = reinterpret_cast<QRgb*>(result.scanLine(y));
             for (int x = 0; x < w; ++x) {
-                double rSum = 0.0, gSum = 0.0, bSum = 0.0;
+                double rSum = 0.0, gSum = 0.0, bSum = 0.0, aSum = 0.0;
                 for (int i = 0; i <= steps; ++i) {
                     const double t = static_cast<double>(i) / steps;
-                    const int sx = static_cast<int>(std::round(cx + (x - cx) * t));
-                    const int sy = static_cast<int>(std::round(cy + (y - cy) * t));
-                    addRgbSample(src, sx, sy, rSum, gSum, bSum);
+                    const double scale = 1.0 - maxZoom * t;
+                    const int sx = static_cast<int>(std::round(cx + (x - cx) * scale));
+                    const int sy = static_cast<int>(std::round(cy + (y - cy) * scale));
+                    addPremultipliedArgbSample(src, sx, sy, rSum, gSum, bSum, aSum);
                 }
-                dst[x * 3] = clamp255d(rSum / sampleCount);
-                dst[x * 3 + 1] = clamp255d(gSum / sampleCount);
-                dst[x * 3 + 2] = clamp255d(bSum / sampleCount);
+                dst[x] = rgbaFromPremultipliedSums(rSum, gSum, bSum, aSum, sampleCount);
             }
         }
         return result;
     }
 
-    const double arc = amount * M_PI / 180.0;
+    const double arc = blurAmount * M_PI / 180.0;
     const double sampleCount = static_cast<double>(steps * 2 + 1);
     for (int y = 0; y < h; ++y) {
-        uint8_t *dst = result.scanLine(y);
+        QRgb *dst = reinterpret_cast<QRgb*>(result.scanLine(y));
         for (int x = 0; x < w; ++x) {
             const double vx = x - cx;
             const double vy = y - cy;
             const double radius = std::sqrt(vx * vx + vy * vy);
             const double baseAngle = std::atan2(vy, vx);
-            double rSum = 0.0, gSum = 0.0, bSum = 0.0;
+            double rSum = 0.0, gSum = 0.0, bSum = 0.0, aSum = 0.0;
             for (int i = -steps; i <= steps; ++i) {
                 const double a = baseAngle + arc * static_cast<double>(i) / steps;
                 const int sx = static_cast<int>(std::round(cx + std::cos(a) * radius));
                 const int sy = static_cast<int>(std::round(cy + std::sin(a) * radius));
-                addRgbSample(src, sx, sy, rSum, gSum, bSum);
+                addPremultipliedArgbSample(src, sx, sy, rSum, gSum, bSum, aSum);
             }
-            dst[x * 3] = clamp255d(rSum / sampleCount);
-            dst[x * 3 + 1] = clamp255d(gSum / sampleCount);
-            dst[x * 3 + 2] = clamp255d(bSum / sampleCount);
+            dst[x] = rgbaFromPremultipliedSums(rSum, gSum, bSum, aSum, sampleCount);
         }
     }
 
@@ -1505,14 +1541,18 @@ QImage VideoEffectProcessor::applyGlow(const QImage &input, double threshold, do
     for (int y = 0; y < h; ++y) {
         const QRgb *line = reinterpret_cast<const QRgb*>(src.constScanLine(y));
         for (int x = 0; x < w; ++x) {
+            const int a = qAlpha(line[x]);
+            if (a <= 0)
+                continue;
             const int r = qRed(line[x]);
             const int g = qGreen(line[x]);
             const int b = qBlue(line[x]);
             if (luma709(r, g, b) > t) {
                 const int idx = (y * w + x) * 3;
-                bright[idx] = r;
-                bright[idx + 1] = g;
-                bright[idx + 2] = b;
+                const double alphaWeight = static_cast<double>(a) / 255.0;
+                bright[idx] = r * alphaWeight;
+                bright[idx + 1] = g * alphaWeight;
+                bright[idx + 2] = b * alphaWeight;
             }
         }
     }
@@ -1564,8 +1604,13 @@ QImage VideoEffectProcessor::applyFindEdges(const QImage &input, double intensit
             const double gy =
                 -sampleLuma(x - 1, y - 1) - 2.0 * sampleLuma(x, y - 1) - sampleLuma(x + 1, y - 1)
                 + sampleLuma(x - 1, y + 1) + 2.0 * sampleLuma(x, y + 1) + sampleLuma(x + 1, y + 1);
-            const int edge = clamp255d(std::sqrt(gx * gx + gy * gy) * edgeIntensity);
-            dstLine[x] = qRgba(edge, edge, edge, qAlpha(srcLine[x]));
+            const double edge = qBound(0.0, std::sqrt(gx * gx + gy * gy) * edgeIntensity, 255.0);
+            const double blend = qBound(0.0, edgeIntensity, 1.0);
+            const double invBlend = 1.0 - blend;
+            dstLine[x] = qRgba(clamp255d(qRed(srcLine[x]) * invBlend + edge * blend),
+                               clamp255d(qGreen(srcLine[x]) * invBlend + edge * blend),
+                               clamp255d(qBlue(srcLine[x]) * invBlend + edge * blend),
+                               qAlpha(srcLine[x]));
         }
     }
 
@@ -1601,8 +1646,13 @@ QImage VideoEffectProcessor::applyEmboss(const QImage &input, double angleDegree
         for (int x = 0; x < w; ++x) {
             const double hi = sampleLuma(x + dx, y + dy);
             const double lo = sampleLuma(x - dx, y - dy);
-            const int relief = clamp255d(128.0 + (hi - lo) * embossAmount);
-            dstLine[x] = qRgba(relief, relief, relief, qAlpha(srcLine[x]));
+            const double relief = qBound(0.0, 128.0 + (hi - lo) * embossAmount, 255.0);
+            const double blend = qBound(0.0, embossAmount, 1.0);
+            const double invBlend = 1.0 - blend;
+            dstLine[x] = qRgba(clamp255d(qRed(srcLine[x]) * invBlend + relief * blend),
+                               clamp255d(qGreen(srcLine[x]) * invBlend + relief * blend),
+                               clamp255d(qBlue(srcLine[x]) * invBlend + relief * blend),
+                               qAlpha(srcLine[x]));
         }
     }
 
@@ -2097,14 +2147,18 @@ QImage VideoEffectProcessor::applyBloom(const QImage &input, double threshold,
     for (int y = 0; y < h; ++y) {
         const QRgb *line = reinterpret_cast<const QRgb*>(src.constScanLine(y));
         for (int x = 0; x < w; ++x) {
+            const int a = qAlpha(line[x]);
+            if (a <= 0)
+                continue;
             const int r = qRed(line[x]);
             const int g = qGreen(line[x]);
             const int b = qBlue(line[x]);
             if (luma709(r, g, b) > t) {
                 const int idx = (y * w + x) * 3;
-                bright[idx] = r;
-                bright[idx + 1] = g;
-                bright[idx + 2] = b;
+                const double alphaWeight = static_cast<double>(a) / 255.0;
+                bright[idx] = r * alphaWeight;
+                bright[idx + 1] = g * alphaWeight;
+                bright[idx + 2] = b * alphaWeight;
             }
         }
     }
@@ -2619,7 +2673,7 @@ QImage VideoEffectProcessor::applyPolarCoordinates(const QImage &input, int type
     QImage result(w, h, QImage::Format_ARGB32);
     const double cx = (w - 1) * 0.5;
     const double cy = (h - 1) * 0.5;
-    const double denomX = qMax(1, w - 1);
+    const double denomX = qMax(1, w);
     const double denomY = qMax(1, h - 1);
     const double maxRadius = qMax(1e-9, qMin(w, h) * 0.5);
 

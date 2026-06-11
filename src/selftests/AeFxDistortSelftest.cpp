@@ -318,6 +318,24 @@ int runAeFxDistortSelftest()
                   passed, failed);
     }
 
+    {
+        QImage image(64, 64, QImage::Format_RGB888);
+        for (int y = 0; y < image.height(); ++y) {
+            for (int x = 0; x < image.width(); ++x) {
+                const int value = qBound(0, y * 4, 255);
+                image.setPixelColor(x, y, QColor(value, value, value));
+            }
+        }
+
+        const QImage polar = VideoEffectProcessor::applyEffect(
+            image, VideoEffect::createPolarCoordinates(0, 1.0));
+
+        printGate("G7",
+                  lumaAt(polar, 0, 63) != lumaAt(polar, 63, 63),
+                  "PolarCoordinates rect-to-polar endpoint columns still overlap",
+                  passed, failed);
+    }
+
     std::printf("ae-fx-distort summary passed=%d failed=%d\n", passed, failed);
     return failed == 0 ? 0 : 1;
 }

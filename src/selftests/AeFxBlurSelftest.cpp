@@ -29,6 +29,11 @@ int lumaAt(const QImage &image, int x, int y)
                                      + 0.0722 * c.blue()));
 }
 
+int alphaAt(const QImage &image, int x, int y)
+{
+    return qAlpha(image.pixel(x, y));
+}
+
 double lumaSum(const QImage &image)
 {
     double sum = 0.0;
@@ -182,8 +187,16 @@ int runAeFxBlurSelftest()
         zoomImage.fill(Qt::black);
         zoomImage.setPixelColor(32, 32, Qt::white);
 
-        const QImage zoomBlurred = VideoEffectProcessor::applyEffect(
-            zoomImage, VideoEffect::createRadialBlur(10.0, 1));
+        const QImage zoomSmall = VideoEffectProcessor::applyEffect(
+            zoomImage, VideoEffect::createRadialBlur(1.0, 1));
+
+        QImage zoomRange(64, 64, QImage::Format_RGB888);
+        zoomRange.fill(Qt::black);
+        zoomRange.setPixelColor(20, 32, Qt::white);
+        const QImage zoomLow = VideoEffectProcessor::applyEffect(
+            zoomRange, VideoEffect::createRadialBlur(5.0, 1));
+        const QImage zoomHigh = VideoEffectProcessor::applyEffect(
+            zoomRange, VideoEffect::createRadialBlur(20.0, 1));
 
         QImage spinImage(64, 64, QImage::Format_RGB888);
         spinImage.fill(Qt::black);
@@ -195,12 +208,13 @@ int runAeFxBlurSelftest()
         const int spinSource = lumaAt(spinBlurred, 42, 32);
         const int spinNeighbor = lumaAt(spinBlurred, 42, 31);
         printGate("G4",
-                  lumaAt(zoomBlurred, 32, 32) > 200
-                      && lumaAt(zoomBlurred, 4, 4) > 0
+                  lumaAt(zoomSmall, 32, 32) > 200
+                      && lumaAt(zoomSmall, 4, 4) == 0
+                      && lumaAt(zoomHigh, 12, 32) > lumaAt(zoomLow, 12, 32)
                       && lumaAt(spinBlurred, 32, 32) > 200
                       && spinSource > 0 && spinSource < 255
                       && spinNeighbor > 0,
-                  "RadialBlur zoom center/corner or spin smear failed",
+                  "RadialBlur zoom amount scaling or spin smear failed",
                   passed, failed);
     }
 
@@ -254,6 +268,48 @@ int runAeFxBlurSelftest()
                       && allPixelsWithin(image, radial, 1)
                       && allPixelsExact(image, noneOut),
                   "identity checks failed",
+                  passed, failed);
+    }
+
+    {
+        QImage hiddenRgb(33, 33, QImage::Format_ARGB32);
+        hiddenRgb.fill(qRgba(0, 0, 0, 0));
+        hiddenRgb.setPixel(16, 16, qRgba(255, 255, 255, 0));
+        const QImage gaussianHidden = VideoEffectProcessor::applyEffect(
+            hiddenRgb, VideoEffect::createGaussianBlur(4.0));
+        const QImage directionalHidden = VideoEffectProcessor::applyEffect(
+            hiddenRgb, VideoEffect::createDirectionalBlur(0.0, 8.0));
+        const QImage radialHidden = VideoEffectProcessor::applyEffect(
+            hiddenRgb, VideoEffect::createRadialBlur(20.0, 0));
+
+        QImage alphaSpot(33, 33, QImage::Format_ARGB32);
+        alphaSpot.fill(qRgba(0, 0, 0, 0));
+        alphaSpot.setPixel(16, 16, qRgba(255, 255, 255, 255));
+        const QImage gaussianAlpha = VideoEffectProcessor::applyEffect(
+            alphaSpot, VideoEffect::createGaussianBlur(3.0));
+        const QImage directionalAlpha = VideoEffectProcessor::applyEffect(
+            alphaSpot, VideoEffect::createDirectionalBlur(0.0, 4.0));
+
+        QImage radialSpot(64, 64, QImage::Format_ARGB32);
+        radialSpot.fill(qRgba(0, 0, 0, 0));
+        radialSpot.setPixel(42, 32, qRgba(255, 255, 255, 255));
+        const QImage radialAlpha = VideoEffectProcessor::applyEffect(
+            radialSpot, VideoEffect::createRadialBlur(10.0, 0));
+
+        const QImage tinyZoom = VideoEffectProcessor::applyEffect(
+            makePatternImage(24, 24), VideoEffect::createRadialBlur(0.01, 1));
+
+        printGate("G7",
+                  alphaAt(gaussianHidden, 16, 16) == 0
+                      && alphaAt(directionalHidden, 16, 16) == 0
+                      && alphaAt(radialHidden, 16, 16) == 0
+                      && alphaAt(gaussianAlpha, 17, 16) > 0
+                      && alphaAt(gaussianAlpha, 17, 16) < 255
+                      && alphaAt(directionalAlpha, 20, 16) > 0
+                      && alphaAt(directionalAlpha, 20, 16) < 255
+                      && alphaAt(radialAlpha, 42, 31) > 0
+                      && allPixelsWithin(makePatternImage(24, 24), tinyZoom, 1),
+                  "blur alpha preservation or tiny RadialBlur continuity failed",
                   passed, failed);
     }
 
