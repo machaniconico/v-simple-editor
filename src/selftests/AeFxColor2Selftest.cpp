@@ -1,5 +1,7 @@
 #include "../EffectParamSchema.h"
+#include "../Timeline.h"
 #include "../VideoEffect.h"
+#include "../clipanim/ClipAnim.h"
 
 #include <QColor>
 #include <QImage>
@@ -168,6 +170,74 @@ bool keyColorRoundTrips(VideoEffectType type, const QColor &color)
     return effect.keyColor == color
         && effectctrl::colorParamValue(effect, "keyColor") == color
         && closeEnough(effectctrl::paramValue(effect, "keyColor"), encodedRgb(color));
+}
+
+KeyframeTrack twoPointTrack(const QString &name,
+                            double firstValue,
+                            double secondValue)
+{
+    KeyframeTrack track(name, firstValue);
+    track.addKeyframe(0.0, firstValue);
+    track.addKeyframe(1.0, secondValue);
+    return track;
+}
+
+ClipInfo clipWithEffect(const VideoEffect &effect)
+{
+    ClipInfo clip;
+    clip.duration = 1.0;
+    clip.effects.append(effect);
+    return clip;
+}
+
+bool sameEffectState(const VideoEffect &a, const VideoEffect &b)
+{
+    return a.type == b.type
+        && a.enabled == b.enabled
+        && closeEnough(a.param1, b.param1)
+        && closeEnough(a.param2, b.param2)
+        && closeEnough(a.param3, b.param3)
+        && a.keyColor == b.keyColor
+        && closeEnough(a.startSec, b.startSec)
+        && closeEnough(a.endSec, b.endSec);
+}
+
+bool noTrackEffectsStayIdentical()
+{
+    const VideoEffect original = VideoEffect::createPhotoFilter(QColor(12, 34, 56), 40.0);
+    const ClipInfo clip = clipWithEffect(original);
+    const QVector<VideoEffect> evaluated = clipanim::effectiveEffectsAt(clip, 0.5);
+    return evaluated.size() == 1 && sameEffectState(evaluated.first(), original);
+}
+
+bool keyColorChannelsInterpolate()
+{
+    ClipInfo clip = clipWithEffect(
+        VideoEffect::createPhotoFilter(QColor(10, 20, 30), 40.0));
+    clip.keyframes.addTrack(twoPointTrack(QStringLiteral("effect.0.keyColor.r"),
+                                          10.0, 110.0));
+    clip.keyframes.addTrack(twoPointTrack(QStringLiteral("effect.0.keyColor.g"),
+                                          20.0, 120.0));
+    clip.keyframes.addTrack(twoPointTrack(QStringLiteral("effect.0.keyColor.b"),
+                                          30.0, 130.0));
+
+    const QVector<VideoEffect> evaluated = clipanim::effectiveEffectsAt(clip, 0.5);
+    return evaluated.size() == 1
+        && effectctrl::colorParamValue(evaluated.first(), "keyColor") == QColor(60, 70, 80)
+        && closeEnough(effectctrl::paramValue(evaluated.first(), "density"), 40.0);
+}
+
+bool legacyPackedKeyColorTrackStaysInactive()
+{
+    const VideoEffect original = VideoEffect::createPhotoFilter(QColor(12, 34, 56), 40.0);
+    ClipInfo clip = clipWithEffect(original);
+    KeyframeTrack legacy(QStringLiteral("effect.0.keyColor"), 0.0);
+    legacy.addKeyframe(0.0, 0.0);
+    legacy.addKeyframe(1.0, 0.0);
+    clip.keyframes.addTrack(legacy);
+
+    const QVector<VideoEffect> evaluated = clipanim::effectiveEffectsAt(clip, 0.5);
+    return evaluated.size() == 1 && sameEffectState(evaluated.first(), original);
 }
 
 } // namespace
@@ -391,6 +461,15 @@ int runAeFxColor2Selftest()
                       && keyColorRoundTrips(VideoEffectType::GradientRamp, custom)
                       && keyColorRoundTrips(VideoEffectType::Fill, custom),
                   "packed RGB keyColor set/read round-trip failed",
+                  passed, failed);
+    }
+
+    {
+        printGate("G10",
+                  keyColorChannelsInterpolate()
+                      && noTrackEffectsStayIdentical()
+                      && legacyPackedKeyColorTrackStaysInactive(),
+                  "ClipAnim keyColor channel tracks, no-track identity, or legacy packed inactivity failed",
                   passed, failed);
     }
 

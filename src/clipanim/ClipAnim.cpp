@@ -5,6 +5,8 @@
 #include "../Keyframe.h"
 #include "../Timeline.h"
 
+#include <QColor>
+
 #include <algorithm>
 #include <cmath>
 
@@ -18,6 +20,8 @@ const QString kRotationTrack = QStringLiteral("motion.rotation");
 const QString kOpacityTrack = QStringLiteral("motion.opacity");
 
 constexpr double kKeyTimeEpsilon = 1e-6;
+constexpr double kColorChannelMin = 0.0;
+constexpr double kColorChannelMax = 255.0;
 
 bool trackHasKeyframes(const KeyframeManager& keyframes, const QString& trackName)
 {
@@ -239,6 +243,70 @@ double clampedAnimatedParamValue(const effectctrl::ParamDef& def, double value)
     return value;
 }
 
+QString effectParamTrackName(int effectIndex, const QString& paramName)
+{
+    return QStringLiteral("effect.%1.%2").arg(effectIndex).arg(paramName);
+}
+
+QString effectColorChannelTrackName(int effectIndex,
+                                    const QString& paramName,
+                                    const QString& channel)
+{
+    return QStringLiteral("effect.%1.%2.%3")
+        .arg(effectIndex)
+        .arg(paramName)
+        .arg(channel);
+}
+
+int clampedColorChannel(double value, int defaultValue)
+{
+    if (!std::isfinite(value))
+        return defaultValue;
+    const double clamped = std::max(kColorChannelMin,
+                                    std::min(kColorChannelMax, value));
+    return static_cast<int>(std::lround(clamped));
+}
+
+int colorChannelValueAt(const ClipInfo& clip,
+                        const QString& trackName,
+                        double clipLocalSeconds,
+                        int currentValue)
+{
+    if (!trackHasKeyframes(clip.keyframes, trackName))
+        return currentValue;
+    return clampedColorChannel(
+        clip.keyframes.valueAt(trackName, clipLocalSeconds, currentValue),
+        currentValue);
+}
+
+bool applyAnimatedColorParam(VideoEffect& effect,
+                             const effectctrl::ParamDef& def,
+                             const ClipInfo& clip,
+                             int effectIndex,
+                             double clipLocalSeconds)
+{
+    const QString rTrack = effectColorChannelTrackName(
+        effectIndex, def.name, QStringLiteral("r"));
+    const QString gTrack = effectColorChannelTrackName(
+        effectIndex, def.name, QStringLiteral("g"));
+    const QString bTrack = effectColorChannelTrackName(
+        effectIndex, def.name, QStringLiteral("b"));
+    if (!trackHasKeyframes(clip.keyframes, rTrack)
+        && !trackHasKeyframes(clip.keyframes, gTrack)
+        && !trackHasKeyframes(clip.keyframes, bTrack)) {
+        return false;
+    }
+
+    const QColor current = effectctrl::colorParamValue(effect, def.name);
+    const QColor animated(
+        colorChannelValueAt(clip, rTrack, clipLocalSeconds, current.red()),
+        colorChannelValueAt(clip, gTrack, clipLocalSeconds, current.green()),
+        colorChannelValueAt(clip, bTrack, clipLocalSeconds, current.blue()),
+        current.alpha());
+    effectctrl::setColorParam(effect, def.name, animated);
+    return true;
+}
+
 bool spatialPositionAt(const ClipInfo& clip,
                        double clipLocalSeconds,
                        QPointF *position)
@@ -393,13 +461,11 @@ QVector<VideoEffect> effectiveEffectsAt(const ClipInfo& clip,
             continue;
         const auto schema = effectctrl::paramSchemaFor(effects[i].type);
         for (const auto &def : schema) {
-            // Color params are not scalar-animatable; legacy projects may carry
-            // stray color tracks (toggled when setParamValue was a Color no-op).
-            // Skip them so they can never reset a saved color at render time.
-            if (def.type == effectctrl::ParamType::Color)
+            if (def.type == effectctrl::ParamType::Color) {
+                applyAnimatedColorParam(effects[i], def, clip, i, clipLocalSeconds);
                 continue;
-            const QString trackName =
-                QStringLiteral("effect.%1.%2").arg(i).arg(def.name);
+            }
+            const QString trackName = effectParamTrackName(i, def.name);
             if (!trackHasKeyframes(clip.keyframes, trackName))
                 continue;
 
