@@ -4,14 +4,17 @@
 
 #include <QAbstractItemView>
 #include <QBrush>
+#include <QComboBox>
 #include <QFontMetrics>
 #include <QHash>
+#include <QHBoxLayout>
 #include <QLabel>
 #include <QListWidget>
 #include <QListWidgetItem>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPainterPath>
+#include <QPushButton>
 #include <QScrollArea>
 #include <QSplitter>
 #include <QVBoxLayout>
@@ -208,6 +211,10 @@ class GraphEditorCurveView : public QWidget
 {
 public:
     using EditCallback = std::function<void(const QVector<GraphEditorCurveTrack> &curves, bool commitUndo)>;
+    enum class GraphMode {
+        Value,
+        Speed,
+    };
 
     explicit GraphEditorCurveView(QWidget *parent = nullptr)
         : QWidget(parent)
@@ -219,6 +226,47 @@ public:
     void setEditCallback(EditCallback callback)
     {
         m_editCallback = std::move(callback);
+    }
+
+    void setGraphMode(GraphMode mode)
+    {
+        if (m_graphMode == mode)
+            return;
+        m_graphMode = mode;
+        clearDragState();
+        update();
+    }
+
+    bool hasSelectedKeyframe() const
+    {
+        return m_selectedCurveIndex >= 0
+            && m_selectedCurveIndex < m_curves.size()
+            && m_selectedKeyframeIndex >= 0
+            && m_selectedKeyframeIndex
+                < m_curves[m_selectedCurveIndex].track.keyframes().size();
+    }
+
+    bool applyInterpolationToSelected(KeyframePoint::Interpolation interpolation)
+    {
+        if (!hasSelectedKeyframe())
+            return false;
+
+        auto &curve = m_curves[m_selectedCurveIndex];
+        const QVector<KeyframePoint> &keyframes = curve.track.keyframes();
+        KeyframePoint edited = keyframes[m_selectedKeyframeIndex];
+        if (edited.interpolation == interpolation) {
+            update();
+            return true;
+        }
+
+        edited.interpolation = interpolation;
+        KeyframeTrack editedTrack = curve.track;
+        editedTrack.setKeyframePoint(m_selectedKeyframeIndex, edited);
+        curve.track = editedTrack;
+        if (m_editCallback)
+            m_editCallback(m_curves, true);
+        update();
+        return true;
     }
 
     void setCurves(const QVector<GraphEditorCurveTrack> &curves,
@@ -267,6 +315,11 @@ protected:
         painter.drawText(QRect(kGraphLeft, 4, graphWidth, 18),
                          Qt::AlignRight | Qt::AlignVCenter,
                          QStringLiteral("%1s").arg(duration, 0, 'f', 2));
+        painter.drawText(QRect(kGraphLeft, 4, graphWidth, 18),
+                         Qt::AlignHCenter | Qt::AlignVCenter,
+                         m_graphMode == GraphMode::Speed
+                             ? QStringLiteral("Speed Graph")
+                             : QStringLiteral("Value Graph"));
 
         const int playheadX = kGraphLeft + qRound(qBound(0.0, m_localPlayheadSeconds, duration)
                                            / duration * graphWidth);
@@ -294,7 +347,8 @@ protected:
             QPainterPath path;
             for (int x = 0; x <= graphWidth; ++x) {
                 const double t = duration * static_cast<double>(x) / graphWidth;
-                const QPointF point(laneRect.left() + x, yForValue(metrics, curve.track.valueAt(t)));
+                const QPointF point(laneRect.left() + x,
+                                    yForValue(metrics, graphValueAt(curve.track, t)));
                 if (x == 0)
                     path.moveTo(point);
                 else
@@ -305,50 +359,52 @@ protected:
 
             const auto &keyframes = curve.track.keyframes();
             painter.setBrush(curve.color.lighter(130));
-            for (int k = 0; k + 1 < keyframes.size(); ++k) {
-                if (keyframes[k].interpolation != KeyframePoint::Bezier)
-                    continue;
+            if (m_graphMode == GraphMode::Value) {
+                for (int k = 0; k + 1 < keyframes.size(); ++k) {
+                    if (keyframes[k].interpolation != KeyframePoint::Bezier)
+                        continue;
 
-                QPointF outHandle;
-                QPointF inHandle;
-                if (!bezierHandlePoint(metrics, keyframes, k, true, &outHandle)
-                    || !bezierHandlePoint(metrics, keyframes, k, false, &inHandle)) {
-                    continue;
+                    QPointF outHandle;
+                    QPointF inHandle;
+                    if (!bezierHandlePoint(metrics, keyframes, k, true, &outHandle)
+                        || !bezierHandlePoint(metrics, keyframes, k, false, &inHandle)) {
+                        continue;
+                    }
+
+                    const QPointF start = keyframePoint(metrics, keyframes[k]);
+                    const QPointF end = keyframePoint(metrics, keyframes[k + 1]);
+                    const bool selectedSegment = i == m_selectedCurveIndex && k == m_selectedKeyframeIndex;
+                    const bool outSelected = selectedSegment;
+                    const bool inSelected = selectedSegment
+                        || (i == m_selectedCurveIndex && k + 1 == m_selectedKeyframeIndex);
+                    outHandle = visibleBezierHandlePoint(metrics, keyframes, k, true, outSelected);
+                    inHandle = visibleBezierHandlePoint(metrics, keyframes, k, false, inSelected);
+
+                    painter.setPen(QPen(outSelected ? palette().color(QPalette::HighlightedText)
+                                                    : curve.color.lighter(135),
+                                        outSelected ? 1.8 : 1.0));
+                    painter.drawLine(start, outHandle);
+                    painter.setPen(QPen(inSelected ? palette().color(QPalette::HighlightedText)
+                                                   : curve.color.lighter(135),
+                                        inSelected ? 1.8 : 1.0));
+                    painter.drawLine(end, inHandle);
+
+                    auto drawHandle = [&](const QPointF &point, bool selected) {
+                        painter.setBrush(selected ? palette().color(QPalette::Highlight)
+                                                  : curve.color.lighter(130));
+                        painter.setPen(QPen(palette().color(QPalette::Window), selected ? 1.4 : 1.0));
+                        painter.drawEllipse(point, selected ? 5.0 : 4.0, selected ? 5.0 : 4.0);
+                    };
+                    drawHandle(outHandle, outSelected);
+                    drawHandle(inHandle, inSelected);
                 }
-
-                const QPointF start = keyframePoint(metrics, keyframes[k]);
-                const QPointF end = keyframePoint(metrics, keyframes[k + 1]);
-                const bool selectedSegment = i == m_selectedCurveIndex && k == m_selectedKeyframeIndex;
-                const bool outSelected = selectedSegment;
-                const bool inSelected = selectedSegment
-                    || (i == m_selectedCurveIndex && k + 1 == m_selectedKeyframeIndex);
-                outHandle = visibleBezierHandlePoint(metrics, keyframes, k, true, outSelected);
-                inHandle = visibleBezierHandlePoint(metrics, keyframes, k, false, inSelected);
-
-                painter.setPen(QPen(outSelected ? palette().color(QPalette::HighlightedText)
-                                                : curve.color.lighter(135),
-                                    outSelected ? 1.8 : 1.0));
-                painter.drawLine(start, outHandle);
-                painter.setPen(QPen(inSelected ? palette().color(QPalette::HighlightedText)
-                                               : curve.color.lighter(135),
-                                    inSelected ? 1.8 : 1.0));
-                painter.drawLine(end, inHandle);
-
-                auto drawHandle = [&](const QPointF &point, bool selected) {
-                    painter.setBrush(selected ? palette().color(QPalette::Highlight)
-                                              : curve.color.lighter(130));
-                    painter.setPen(QPen(palette().color(QPalette::Window), selected ? 1.4 : 1.0));
-                    painter.drawEllipse(point, selected ? 5.0 : 4.0, selected ? 5.0 : 4.0);
-                };
-                drawHandle(outHandle, outSelected);
-                drawHandle(inHandle, inSelected);
             }
 
             painter.setBrush(curve.color);
             painter.setPen(QPen(palette().color(QPalette::Window), 1));
             for (int k = 0; k < keyframes.size(); ++k) {
                 const auto &kf = keyframes[k];
-                const QPointF center = keyframePoint(metrics, kf);
+                const QPointF center = graphKeyframePoint(metrics, curve.track, k);
                 const int kx = qRound(center.x());
                 const int ky = qRound(center.y());
                 QPolygonF diamond;
@@ -358,7 +414,8 @@ protected:
                         << QPointF(kx - 5, ky);
                 painter.drawPolygon(diamond);
 
-                if (kf.interpolation == KeyframePoint::Bezier) {
+                if (m_graphMode == GraphMode::Value
+                    && kf.interpolation == KeyframePoint::Bezier) {
                     painter.setPen(QPen(curve.color.lighter(135), 1));
                     painter.drawEllipse(QPointF(kx, ky), 7, 7);
                     painter.setPen(QPen(palette().color(QPalette::Window), 1));
@@ -385,9 +442,7 @@ protected:
                              QStringLiteral("%1 kf").arg(curve.track.count()));
             painter.drawText(QRect(8, y + 44, kGraphLeft - 18, 18),
                              Qt::AlignLeft | Qt::AlignVCenter,
-                             QStringLiteral("%1..%2")
-                                 .arg(metrics.minValue, 0, 'g', 4)
-                                 .arg(metrics.maxValue, 0, 'g', 4));
+                             graphRangeLabel(metrics));
         }
 
         painter.setPen(QPen(QColor(QStringLiteral("#ff4d4f")), 1.5));
@@ -411,6 +466,18 @@ protected:
 
         const HitResult hit = hitTest(event->position().toPoint());
         if (hit.kind == DragKind::None) {
+            QWidget::mousePressEvent(event);
+            return;
+        }
+
+        if (m_graphMode == GraphMode::Speed) {
+            if (hit.kind == DragKind::Keyframe) {
+                m_selectedCurveIndex = hit.curveIndex;
+                m_selectedKeyframeIndex = hit.keyframeIndex;
+                event->accept();
+                update();
+                return;
+            }
             QWidget::mousePressEvent(event);
             return;
         }
@@ -440,7 +507,7 @@ protected:
 
         const HitResult hit = hitTest(pos);
         if (hit.kind == DragKind::Keyframe)
-            setCursor(Qt::SizeAllCursor);
+            setCursor(m_graphMode == GraphMode::Speed ? Qt::PointingHandCursor : Qt::SizeAllCursor);
         else if (hit.kind == DragKind::BezierOut || hit.kind == DragKind::BezierIn)
             setCursor(Qt::CrossCursor);
         else
@@ -502,29 +569,33 @@ private:
         metrics.valid = true;
         metrics.laneRect = QRect(kGraphLeft, y, graphWidth, kLaneHeight);
         metrics.duration = qMax(1.0, m_durationSeconds);
-        metrics.minValue = curve.track.defaultValue();
-        metrics.maxValue = curve.track.defaultValue();
+        metrics.minValue = graphValueAt(curve.track, 0.0);
+        metrics.maxValue = metrics.minValue;
 
         auto includeValue = [&metrics](double value) {
             metrics.minValue = qMin(metrics.minValue, value);
             metrics.maxValue = qMax(metrics.maxValue, value);
         };
+        if (m_graphMode == GraphMode::Speed)
+            includeValue(0.0);
 
         const int sampleCount = qMax(24, qMin(240, graphWidth));
         for (int s = 0; s <= sampleCount; ++s) {
             const double t = metrics.duration * static_cast<double>(s) / sampleCount;
-            includeValue(curve.track.valueAt(t));
+            includeValue(graphValueAt(curve.track, t));
         }
 
         const auto &keyframes = curve.track.keyframes();
-        for (const auto &kf : keyframes)
-            includeValue(kf.value);
-        for (int i = 0; i + 1 < keyframes.size(); ++i) {
-            if (keyframes[i].interpolation != KeyframePoint::Bezier)
-                continue;
-            const double deltaValue = keyframes[i + 1].value - keyframes[i].value;
-            includeValue(keyframes[i].value + keyframes[i].bezY1 * deltaValue);
-            includeValue(keyframes[i].value + keyframes[i].bezY2 * deltaValue);
+        for (int i = 0; i < keyframes.size(); ++i)
+            includeValue(graphKeyframeValue(curve.track, i));
+        if (m_graphMode == GraphMode::Value) {
+            for (int i = 0; i + 1 < keyframes.size(); ++i) {
+                if (keyframes[i].interpolation != KeyframePoint::Bezier)
+                    continue;
+                const double deltaValue = keyframes[i + 1].value - keyframes[i].value;
+                includeValue(keyframes[i].value + keyframes[i].bezY1 * deltaValue);
+                includeValue(keyframes[i].value + keyframes[i].bezY2 * deltaValue);
+            }
         }
 
         if (qFuzzyCompare(metrics.minValue, metrics.maxValue)) {
@@ -564,6 +635,91 @@ private:
     QPointF keyframePoint(const LaneMetrics &metrics, const KeyframePoint &keyframe) const
     {
         return QPointF(xForTime(metrics, keyframe.time), yForValue(metrics, keyframe.value));
+    }
+
+    QString graphRangeLabel(const LaneMetrics &metrics) const
+    {
+        const QString suffix = m_graphMode == GraphMode::Speed
+            ? QStringLiteral("/s")
+            : QString();
+        return QStringLiteral("%1..%2%3")
+            .arg(metrics.minValue, 0, 'g', 4)
+            .arg(metrics.maxValue, 0, 'g', 4)
+            .arg(suffix);
+    }
+
+    int segmentIndexForTime(const QVector<KeyframePoint> &keyframes, double time) const
+    {
+        if (keyframes.size() < 2)
+            return -1;
+        if (time < keyframes.first().time || time > keyframes.last().time)
+            return -1;
+
+        for (int i = 0; i + 1 < keyframes.size(); ++i) {
+            if (time >= keyframes[i].time && time <= keyframes[i + 1].time)
+                return i;
+        }
+        return -1;
+    }
+
+    double speedAtTime(const KeyframeTrack &track, double time) const
+    {
+        const QVector<KeyframePoint> &keyframes = track.keyframes();
+        const int segmentIndex = segmentIndexForTime(keyframes, time);
+        if (segmentIndex < 0)
+            return 0.0;
+
+        const KeyframePoint &from = keyframes[segmentIndex];
+        const KeyframePoint &to = keyframes[segmentIndex + 1];
+        const double segmentDuration = to.time - from.time;
+        if (!std::isfinite(segmentDuration) || segmentDuration <= 1e-9
+            || from.interpolation == KeyframePoint::Hold) {
+            return 0.0;
+        }
+
+        const double step = qMax(0.00001, segmentDuration / 1000.0);
+        double lo = qMax(from.time, time - step);
+        double hi = qMin(to.time, time + step);
+        if (hi - lo <= 1e-9) {
+            if (time <= from.time + 1e-9) {
+                lo = from.time;
+                hi = qMin(to.time, from.time + step);
+            } else {
+                lo = qMax(from.time, to.time - step);
+                hi = to.time;
+            }
+        }
+        if (hi - lo <= 1e-9)
+            return 0.0;
+        return (track.valueAt(hi) - track.valueAt(lo)) / (hi - lo);
+    }
+
+    double graphValueAt(const KeyframeTrack &track, double time) const
+    {
+        return m_graphMode == GraphMode::Speed
+            ? speedAtTime(track, time)
+            : track.valueAt(time);
+    }
+
+    double graphKeyframeValue(const KeyframeTrack &track, int keyframeIndex) const
+    {
+        const QVector<KeyframePoint> &keyframes = track.keyframes();
+        if (keyframeIndex < 0 || keyframeIndex >= keyframes.size())
+            return 0.0;
+        return m_graphMode == GraphMode::Speed
+            ? speedAtTime(track, keyframes[keyframeIndex].time)
+            : keyframes[keyframeIndex].value;
+    }
+
+    QPointF graphKeyframePoint(const LaneMetrics &metrics,
+                               const KeyframeTrack &track,
+                               int keyframeIndex) const
+    {
+        const QVector<KeyframePoint> &keyframes = track.keyframes();
+        if (keyframeIndex < 0 || keyframeIndex >= keyframes.size())
+            return {};
+        return QPointF(xForTime(metrics, keyframes[keyframeIndex].time),
+                       yForValue(metrics, graphKeyframeValue(track, keyframeIndex)));
     }
 
     bool bezierHandlePoint(const LaneMetrics &metrics,
@@ -654,6 +810,9 @@ private:
 
     HitResult selectedBezierHandleHit(const QPoint &pos) const
     {
+        if (m_graphMode != GraphMode::Value)
+            return {};
+
         constexpr double kHandleRadius = 8.0;
         if (m_selectedCurveIndex < 0 || m_selectedCurveIndex >= m_curves.size()
             || m_selectedKeyframeIndex < 0) {
@@ -705,11 +864,14 @@ private:
             const LaneMetrics metrics = laneMetricsForCurve(curveIndex);
             const auto &keyframes = m_curves[curveIndex].track.keyframes();
             for (int keyframeIndex = 0; keyframeIndex < keyframes.size(); ++keyframeIndex) {
-                const QPointF center = keyframePoint(metrics, keyframes[keyframeIndex]);
+                const QPointF center = graphKeyframePoint(metrics, m_curves[curveIndex].track, keyframeIndex);
                 if (pointHitsHandle(pos, center, kKeyframeRadius))
                     return {DragKind::Keyframe, curveIndex, keyframeIndex};
             }
         }
+
+        if (m_graphMode != GraphMode::Value)
+            return {};
 
         for (int curveIndex = 0; curveIndex < m_curves.size(); ++curveIndex) {
             const LaneMetrics metrics = laneMetricsForCurve(curveIndex);
@@ -735,6 +897,9 @@ private:
 
     void applyDrag(const QPoint &pos, Qt::KeyboardModifiers modifiers)
     {
+        if (m_graphMode != GraphMode::Value)
+            return;
+
         if (m_dragCurveIndex < 0 || m_dragCurveIndex >= m_curves.size()
             || !m_dragMetrics.valid) {
             return;
@@ -825,6 +990,7 @@ private:
     QVector<GraphEditorCurveTrack> m_curves;
     double m_durationSeconds = 1.0;
     double m_localPlayheadSeconds = 0.0;
+    GraphMode m_graphMode = GraphMode::Value;
     DragKind m_dragKind = DragKind::None;
     int m_dragCurveIndex = -1;
     int m_dragKeyframeIndex = -1;
@@ -850,6 +1016,42 @@ GraphEditorPanel::GraphEditorPanel(QWidget *parent)
     m_statusLabel = new QLabel(QStringLiteral("No clip selected"), root);
     m_statusLabel->setWordWrap(true);
     layout->addWidget(m_statusLabel);
+
+    auto *controlsLayout = new QHBoxLayout;
+    controlsLayout->setContentsMargins(0, 0, 0, 0);
+    controlsLayout->setSpacing(6);
+
+    auto *graphModeLabel = new QLabel(QStringLiteral("Graph"), root);
+    auto *graphModeCombo = new QComboBox(root);
+    graphModeCombo->addItem(QStringLiteral("Value Graph"),
+                            static_cast<int>(GraphEditorCurveView::GraphMode::Value));
+    graphModeCombo->addItem(QStringLiteral("Speed Graph"),
+                            static_cast<int>(GraphEditorCurveView::GraphMode::Speed));
+
+    auto *presetLabel = new QLabel(QStringLiteral("Preset"), root);
+    auto *presetCombo = new QComboBox(root);
+    auto addPreset = [presetCombo](const QString &label, KeyframePoint::Interpolation interpolation) {
+        presetCombo->addItem(label, static_cast<int>(interpolation));
+    };
+    addPreset(QStringLiteral("Linear"), KeyframePoint::Linear);
+    addPreset(QStringLiteral("Ease In"), KeyframePoint::EaseIn);
+    addPreset(QStringLiteral("Ease Out"), KeyframePoint::EaseOut);
+    addPreset(QStringLiteral("Ease In/Out"), KeyframePoint::EaseInOut);
+    addPreset(QStringLiteral("Hold"), KeyframePoint::Hold);
+    addPreset(QStringLiteral("Elastic Out"), KeyframePoint::ElasticOut);
+    addPreset(QStringLiteral("Bounce Out"), KeyframePoint::BounceOut);
+    addPreset(QStringLiteral("Back Out"), KeyframePoint::BackOut);
+
+    auto *applyPresetButton = new QPushButton(QStringLiteral("Apply"), root);
+
+    controlsLayout->addWidget(graphModeLabel);
+    controlsLayout->addWidget(graphModeCombo);
+    controlsLayout->addSpacing(8);
+    controlsLayout->addWidget(presetLabel);
+    controlsLayout->addWidget(presetCombo);
+    controlsLayout->addWidget(applyPresetButton);
+    controlsLayout->addStretch(1);
+    layout->addLayout(controlsLayout);
 
     auto *splitter = new QSplitter(Qt::Horizontal, root);
     m_trackList = new QListWidget(splitter);
@@ -888,6 +1090,27 @@ GraphEditorPanel::GraphEditorPanel(QWidget *parent)
                                                    keyframes);
             rebuildForSelection();
         }
+    });
+
+    connect(graphModeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, [this, graphModeCombo](int) {
+                if (!m_curveView)
+                    return;
+                const auto mode = static_cast<GraphEditorCurveView::GraphMode>(
+                    graphModeCombo->currentData().toInt());
+                m_curveView->setGraphMode(mode);
+            });
+    connect(applyPresetButton, &QPushButton::clicked, this, [this, presetCombo]() {
+        if (!m_curveView || !m_statusLabel)
+            return;
+        const auto interpolation = static_cast<KeyframePoint::Interpolation>(
+            presetCombo->currentData().toInt());
+        if (!m_curveView->applyInterpolationToSelected(interpolation)) {
+            m_statusLabel->setText(QStringLiteral("Select a keyframe before applying an easing preset."));
+            return;
+        }
+        m_statusLabel->setText(QStringLiteral("Applied %1 to the selected keyframe.")
+                                   .arg(presetCombo->currentText()));
     });
     scrollArea->setWidget(m_curveView);
 
