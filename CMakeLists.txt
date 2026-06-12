@@ -360,6 +360,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/EffectControlsPanel.cpp
     src/GraphEditorPanel.h
     src/GraphEditorPanel.cpp
+    src/selftests/GraphEditorSelftest.cpp
     src/MotionSectionWidget.h
     src/MotionSectionWidget.cpp
     src/MotionPreset.h
