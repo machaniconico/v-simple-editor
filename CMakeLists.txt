@@ -358,6 +358,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/CredentialStore.cpp
     src/EffectControlsPanel.h
     src/EffectControlsPanel.cpp
+    src/GraphEditorPanel.h
+    src/GraphEditorPanel.cpp
     src/MotionSectionWidget.h
     src/MotionSectionWidget.cpp
     src/MotionPreset.h

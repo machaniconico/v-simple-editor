@@ -16,6 +16,7 @@ void exporter_setAcesPipeline(const aces::AcesPipeline &pipeline);
 #include "EffectPlugin.h"
 #include "ColorGradingPanel.h"
 #include "EffectControlsPanel.h"
+#include "GraphEditorPanel.h"
 #include "LumetriScopes.h"
 #include "EffectClipboard.h"
 #include "PasteAttributesDialog.h"
@@ -3700,6 +3701,23 @@ void MainWindow::setupMenuBar()
         m_timeline->setClipEffects(effects);
     });
 
+    auto *graphEditorPanel = new GraphEditorPanel(this);
+    graphEditorPanel->setTimeline(m_timeline);
+    addDockWidget(Qt::RightDockWidgetArea, graphEditorPanel);
+    graphEditorPanel->setVisible(false);
+    connect(m_timeline, &Timeline::clipSelectedOnTrack,
+            graphEditorPanel, &GraphEditorPanel::setSelectedClip);
+    connect(m_timeline, &Timeline::positionChanged,
+            graphEditorPanel, &GraphEditorPanel::setPlayheadSeconds);
+    connect(m_timeline, &Timeline::scrubPositionChanged,
+            graphEditorPanel, &GraphEditorPanel::setPlayheadSeconds);
+    connect(this, &MainWindow::playheadSecondsChanged,
+            graphEditorPanel, &GraphEditorPanel::setPlayheadSeconds);
+    connect(m_timeline, &Timeline::sequenceChanged,
+            graphEditorPanel, &GraphEditorPanel::refreshFromTimeline);
+    connect(m_timeline->undoManager(), &UndoManager::stateChanged,
+            graphEditorPanel, &GraphEditorPanel::refreshFromTimeline);
+
     m_vfxControlsPanel = new VfxControlsPanel(this);
     m_vfxControlsDock = new QDockWidget(QStringLiteral("VFX コントロール"), this);
     m_vfxControlsDock->setObjectName(QStringLiteral("VfxControlsDock"));
@@ -3780,6 +3798,13 @@ void MainWindow::setupMenuBar()
     connect(m_effectControlsPanel, &QDockWidget::visibilityChanged, effectControlsAction, &QAction::setChecked);
     m_menuHelpEntries.append({effectControlsAction,
         QStringLiteral("選んだクリップに付いているエフェクトの設定値を編集するパネルを出し入れします。")});
+
+    auto *graphEditorAction = viewMenu->addAction(QStringLiteral("Graph Editor"));
+    graphEditorAction->setCheckable(true);
+    connect(graphEditorAction, &QAction::toggled, graphEditorPanel, &QDockWidget::setVisible);
+    connect(graphEditorPanel, &QDockWidget::visibilityChanged, graphEditorAction, &QAction::setChecked);
+    m_menuHelpEntries.append({graphEditorAction,
+        QStringLiteral("選択中クリップのキーフレームトラックと値カーブを読み取り専用で表示します。")});
 
     m_vfxControlsAction = viewMenu->addAction(QStringLiteral("VFX コントロール"));
     m_vfxControlsAction->setCheckable(true);
