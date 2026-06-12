@@ -118,6 +118,11 @@ bool closeEnough(double a, double b)
     return std::abs(a - b) <= 1e-9;
 }
 
+double encodedRgb(const QColor &color)
+{
+    return color.isValid() ? static_cast<double>(color.rgb()) : 0.0;
+}
+
 bool allTypesContain(VideoEffectType type)
 {
     const auto types = VideoEffect::allTypes();
@@ -141,6 +146,28 @@ bool schemaMatches(VideoEffectType type, const QVector<ExpectedParam> &expected)
         }
     }
     return true;
+}
+
+VideoEffect effectFromGuiAddPath(VideoEffectType type)
+{
+    VideoEffect effect;
+    effect.type = type;
+    const auto schema = effectctrl::paramSchemaFor(type);
+    for (const auto &def : schema) {
+        effectctrl::setParamValue(effect, def.name, def.defaultVal);
+    }
+    return effect;
+}
+
+bool keyColorRoundTrips(VideoEffectType type, const QColor &color)
+{
+    VideoEffect effect;
+    effect.type = type;
+    effectctrl::setColorParam(effect, "keyColor", color);
+    effectctrl::setParamValue(effect, "keyColor", encodedRgb(color));
+    return effect.keyColor == color
+        && effectctrl::colorParamValue(effect, "keyColor") == color
+        && closeEnough(effectctrl::paramValue(effect, "keyColor"), encodedRgb(color));
 }
 
 } // namespace
@@ -286,10 +313,10 @@ int runAeFxColor2Selftest()
                           { "vibrance", effectctrl::ParamType::Float, -100.0, 100.0, 0.0 } })
                       && schemaMatches(VideoEffectType::PhotoFilter, QVector<ExpectedParam>{
                           { "density", effectctrl::ParamType::Float, 0.0, 100.0, 0.0 },
-                          { "keyColor", effectctrl::ParamType::Color, 0.0, 0.0, 0.0 } })
+                          { "keyColor", effectctrl::ParamType::Color, 0.0, 0.0, encodedRgb(QColor(236, 138, 0)) } })
                       && schemaMatches(VideoEffectType::Tritone, QVector<ExpectedParam>{
                           { "blend", effectctrl::ParamType::Float, 0.0, 1.0, 0.0 },
-                          { "keyColor", effectctrl::ParamType::Color, 0.0, 0.0, 0.0 } })
+                          { "keyColor", effectctrl::ParamType::Color, 0.0, 0.0, encodedRgb(QColor(0, 0, 0)) } })
                       && schemaMatches(VideoEffectType::BrightnessContrast, QVector<ExpectedParam>{
                           { "brightness", effectctrl::ParamType::Float, -100.0, 100.0, 0.0 },
                           { "contrast", effectctrl::ParamType::Float, -100.0, 100.0, 0.0 } })
@@ -332,6 +359,38 @@ int runAeFxColor2Selftest()
                       && closeEnough(brightnessContrast.param1, -15.0)
                       && closeEnough(brightnessContrast.param2, 40.0),
                   "None identity, schema, type registration, names, or param round-trip failed",
+                  passed, failed);
+    }
+
+    {
+        const VideoEffect photoFilter = effectFromGuiAddPath(VideoEffectType::PhotoFilter);
+        const VideoEffect tritone = effectFromGuiAddPath(VideoEffectType::Tritone);
+        const VideoEffect chromaKey = effectFromGuiAddPath(VideoEffectType::ChromaKey);
+        const VideoEffect fill = effectFromGuiAddPath(VideoEffectType::Fill);
+        const VideoEffect tint = effectFromGuiAddPath(VideoEffectType::Tint);
+        const VideoEffect gradientRamp = effectFromGuiAddPath(VideoEffectType::GradientRamp);
+
+        printGate("G8",
+                  effectctrl::colorParamValue(photoFilter, "keyColor") == QColor(236, 138, 0)
+                      && effectctrl::colorParamValue(tritone, "keyColor") == QColor(0, 0, 0)
+                      && effectctrl::colorParamValue(chromaKey, "color") == QColor(0, 255, 0)
+                      && effectctrl::colorParamValue(fill, "keyColor") == QColor(255, 255, 255)
+                      && effectctrl::colorParamValue(tint, "keyColor") == QColor(255, 255, 255)
+                      && effectctrl::colorParamValue(gradientRamp, "keyColor") == QColor(255, 255, 255),
+                  "GUI-add color defaults did not match effect design defaults",
+                  passed, failed);
+    }
+
+    {
+        const QColor custom(12, 34, 56);
+
+        printGate("G9",
+                  keyColorRoundTrips(VideoEffectType::PhotoFilter, custom)
+                      && keyColorRoundTrips(VideoEffectType::Tritone, custom)
+                      && keyColorRoundTrips(VideoEffectType::Tint, custom)
+                      && keyColorRoundTrips(VideoEffectType::GradientRamp, custom)
+                      && keyColorRoundTrips(VideoEffectType::Fill, custom),
+                  "packed RGB keyColor set/read round-trip failed",
                   passed, failed);
     }
 

@@ -393,6 +393,11 @@ QVector<VideoEffect> effectiveEffectsAt(const ClipInfo& clip,
             continue;
         const auto schema = effectctrl::paramSchemaFor(effects[i].type);
         for (const auto &def : schema) {
+            // Color params are not scalar-animatable; legacy projects may carry
+            // stray color tracks (toggled when setParamValue was a Color no-op).
+            // Skip them so they can never reset a saved color at render time.
+            if (def.type == effectctrl::ParamType::Color)
+                continue;
             const QString trackName =
                 QStringLiteral("effect.%1.%2").arg(i).arg(def.name);
             if (!trackHasKeyframes(clip.keyframes, trackName))

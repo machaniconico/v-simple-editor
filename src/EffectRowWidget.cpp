@@ -14,9 +14,21 @@
 #include <QColorDialog>
 #include <QStyle>
 #include <QValidator>
+#include <cmath>
 
 namespace effectctrl {
 namespace {
+
+// ParamDef::defaultVal for Color params carries a packed QRgb (QColor::rgb()
+// encoded as double); 0.0 means "no schema default" and keeps the legacy black.
+QColor decodeColorDefault(double encodedDefault)
+{
+    if (encodedDefault != 0.0) {
+        const auto rgb = static_cast<QRgb>(static_cast<unsigned int>(std::llround(encodedDefault)));
+        return QColor::fromRgb(rgb);
+    }
+    return QColor(0, 0, 0);
+}
 
 class UnlimitedDoubleSpinBox : public QDoubleSpinBox
 {
@@ -157,11 +169,20 @@ void EffectRowWidget::buildRows(const QVector<ParamDef> &schema)
         rowLayout->setContentsMargins(2, 1, 2, 1);
         rowLayout->setSpacing(4);
 
-        row.kfToggle = new EffectKeyframeToggle(row.container);
-        connect(row.kfToggle, &EffectKeyframeToggle::toggled, this, [this, def](bool now) {
-            emit keyframeToggled(def.name, now);
-        });
-        rowLayout->addWidget(row.kfToggle);
+        // Color params have no scalar keyframe representation: a toggled track
+        // would record getParamValueByName()'s 0.0 and reset the user's color to
+        // the design default on every render. Keep a spacer for row alignment.
+        if (def.type != ParamType::Color) {
+            row.kfToggle = new EffectKeyframeToggle(row.container);
+            connect(row.kfToggle, &EffectKeyframeToggle::toggled, this, [this, def](bool now) {
+                emit keyframeToggled(def.name, now);
+            });
+            rowLayout->addWidget(row.kfToggle);
+        } else {
+            auto *kfSpacer = new QWidget(row.container);
+            kfSpacer->setFixedSize(20, 20);
+            rowLayout->addWidget(kfSpacer);
+        }
 
         row.label = new QLabel(def.displayLabel, row.container);
         row.label->setMinimumWidth(80);
@@ -217,7 +238,7 @@ void EffectRowWidget::buildRows(const QVector<ParamDef> &schema)
         }
         case ParamType::Color: {
             row.colorButton = new QPushButton(row.container);
-            QColor initColor = QColor::fromRgbF(def.defaultVal, def.defaultVal, def.defaultVal);
+            QColor initColor = decodeColorDefault(def.defaultVal);
             if (def.name.contains("color", Qt::CaseInsensitive) || def.name.contains("Color")) {
                 initColor = m_effect.keyColor;
             }
@@ -288,7 +309,7 @@ void EffectRowWidget::buildRows(const QVector<ParamDef> &schema)
                 emit paramChanged(def.name, QVariant(def.defaultVal != 0.0));
                 break;
             case ParamType::Color: {
-                QColor defaultColor = QColor::fromRgbF(def.defaultVal, def.defaultVal, def.defaultVal);
+                QColor defaultColor = decodeColorDefault(def.defaultVal);
                 if (row.colorButton) {
                     row.colorButton->setStyleSheet(QString("background-color: %1; border: 1px solid #555; border-radius: 3px;")
                                                    .arg(defaultColor.name()));

@@ -3,6 +3,11 @@
 
 namespace effectctrl {
 
+static double encodedColorDefault(const QColor &color)
+{
+    return color.isValid() ? static_cast<double>(color.rgb()) : 0.0;
+}
+
 QVector<ParamDef> paramSchemaFor(VideoEffectType type)
 {
     switch (type) {
@@ -19,7 +24,7 @@ QVector<ParamDef> paramSchemaFor(VideoEffectType type)
         return {
             { "tolerance", "Tolerance", ParamType::Float, 0.0, 100.0, 40.0 },
             { "softness", "Softness", ParamType::Float, 0.0, 50.0, 10.0 },
-            { "color", "Key Color", ParamType::Color, 0.0, 0.0, 0.0 }
+            { "color", "Key Color", ParamType::Color, 0.0, 0.0, encodedColorDefault(QColor(0, 255, 0)) }
         };
 
     case VideoEffectType::Vignette:
@@ -90,7 +95,7 @@ QVector<ParamDef> paramSchemaFor(VideoEffectType type)
     case VideoEffectType::Tint:
         return {
             { "amount", "Amount", ParamType::Float, 0.0, 1.0, 1.0 },
-            { "keyColor", "Key Color", ParamType::Color, 0.0, 0.0, 0.0 }
+            { "keyColor", "Key Color", ParamType::Color, 0.0, 0.0, encodedColorDefault(QColor(255, 255, 255)) }
         };
 
     case VideoEffectType::BlackWhite:
@@ -142,13 +147,13 @@ QVector<ParamDef> paramSchemaFor(VideoEffectType type)
             { "type", "タイプ", ParamType::Int, 0.0, 1.0, 0.0 },
             { "angle", "角度", ParamType::Float, 0.0, 360.0, 0.0 },
             { "opacity", "不透明度", ParamType::Float, 0.0, 1.0, 1.0 },
-            { "keyColor", "Key Color", ParamType::Color, 0.0, 0.0, 0.0 }
+            { "keyColor", "Key Color", ParamType::Color, 0.0, 0.0, encodedColorDefault(QColor(255, 255, 255)) }
         };
 
     case VideoEffectType::Fill:
         return {
             { "opacity", "不透明度", ParamType::Float, 0.0, 1.0, 1.0 },
-            { "keyColor", "Key Color", ParamType::Color, 0.0, 0.0, 0.0 }
+            { "keyColor", "Key Color", ParamType::Color, 0.0, 0.0, encodedColorDefault(QColor(255, 255, 255)) }
         };
 
     case VideoEffectType::Bloom:
@@ -191,13 +196,13 @@ QVector<ParamDef> paramSchemaFor(VideoEffectType type)
     case VideoEffectType::PhotoFilter:
         return {
             { "density", "濃度", ParamType::Float, 0.0, 100.0, 0.0 },
-            { "keyColor", "Key Color", ParamType::Color, 0.0, 0.0, 0.0 }
+            { "keyColor", "Key Color", ParamType::Color, 0.0, 0.0, encodedColorDefault(QColor(236, 138, 0)) }
         };
 
     case VideoEffectType::Tritone:
         return {
             { "blend", "ブレンド", ParamType::Float, 0.0, 1.0, 0.0 },
-            { "keyColor", "Key Color", ParamType::Color, 0.0, 0.0, 0.0 }
+            { "keyColor", "Key Color", ParamType::Color, 0.0, 0.0, encodedColorDefault(QColor(0, 0, 0)) }
         };
 
     case VideoEffectType::BrightnessContrast:

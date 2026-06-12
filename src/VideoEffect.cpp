@@ -310,12 +310,41 @@ VideoEffect VideoEffect::createCornerPinSimple(double h, double v)
 
 namespace effectctrl {
 
+static double encodedColorValue(const QColor &color)
+{
+    return color.isValid() ? static_cast<double>(color.rgb()) : 0.0;
+}
+
+static QColor defaultColorForParam(const VideoEffect &effect, const QString &paramName, double encodedDefault)
+{
+    if (encodedDefault != 0.0) {
+        const auto rgb = static_cast<QRgb>(static_cast<unsigned int>(std::llround(encodedDefault)));
+        return QColor::fromRgb(rgb);
+    }
+
+    if (paramName == QStringLiteral("color") && effect.type == VideoEffectType::ChromaKey)
+        return QColor(0, 255, 0);
+    if ((paramName == QStringLiteral("keyColor") || paramName == QStringLiteral("color"))
+        && effect.type == VideoEffectType::PhotoFilter)
+        return QColor(236, 138, 0);
+    if ((paramName == QStringLiteral("keyColor") || paramName == QStringLiteral("color"))
+        && effect.type == VideoEffectType::Tritone)
+        return QColor(0, 0, 0);
+    if ((paramName == QStringLiteral("keyColor") || paramName == QStringLiteral("color"))
+        && (effect.type == VideoEffectType::Tint
+            || effect.type == VideoEffectType::GradientRamp
+            || effect.type == VideoEffectType::Fill))
+        return QColor(255, 255, 255);
+
+    return effect.keyColor;
+}
+
 double paramValue(const VideoEffect &effect, const QString &paramName)
 {
     auto schema = paramSchemaFor(effect.type);
     for (const auto &def : schema) {
         if (def.name == paramName) {
-            if (def.type == ParamType::Color) return 0.0;
+            if (def.type == ParamType::Color) return encodedColorValue(colorParamValue(effect, paramName));
             if (paramName == "radius" && effect.type == VideoEffectType::Blur)
                 return effect.param1;
             if (paramName == "amount" && effect.type == VideoEffectType::Sharpen)
@@ -487,7 +516,10 @@ void setParamValue(VideoEffect &effect, const QString &paramName, double value)
     auto schema = paramSchemaFor(effect.type);
     for (const auto &def : schema) {
         if (def.name == paramName) {
-            if (def.type == ParamType::Color) return;
+            if (def.type == ParamType::Color) {
+                setColorParam(effect, paramName, defaultColorForParam(effect, paramName, value));
+                return;
+            }
             if (paramName == "radius" && effect.type == VideoEffectType::Blur) {
                 effect.param1 = value; return;
             }
