@@ -60,6 +60,7 @@ public:
     void removeKeyframe(int index);
     void setKeyframeValue(int index, double value);
     void setKeyframeTime(int index, double time);
+    void setKeyframePoint(int index, const KeyframePoint &keyframe);
 
     double valueAt(double time) const;
     bool hasKeyframes() const { return !m_keyframes.isEmpty(); }

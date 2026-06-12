@@ -227,6 +227,15 @@ void KeyframeTrack::setKeyframeTime(int index, double time)
     }
 }
 
+void KeyframeTrack::setKeyframePoint(int index, const KeyframePoint &keyframe)
+{
+    if (index >= 0 && index < m_keyframes.size()) {
+        m_keyframes[index] = keyframe;
+        std::sort(m_keyframes.begin(), m_keyframes.end(),
+            [](const KeyframePoint &a, const KeyframePoint &b) { return a.time < b.time; });
+    }
+}
+
 double KeyframeTrack::valueAt(double time) const
 {
     if (m_keyframes.isEmpty()) return m_defaultValue;
