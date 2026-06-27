@@ -7,15 +7,21 @@
 #include <QOpenGLBuffer>
 #include <QOpenGLVertexArrayObject>
 #include <QImage>
+#include <QVector>
 #include <QPoint>
 #include <QRectF>
 #include <QString>
 #include <QTimer>
 #include <QFont>
 #include <QColor>
+#include <array>
 #include "VideoEffect.h"
 #include "LutImporter.h"
-#include "CurveEditor.h"
+#include "MotionStabilizer.h"
+
+class Timeline;
+class SurfaceTool;
+class BrushAnimation;
 
 class GLPreview : public QOpenGLWidget, protected QOpenGLFunctions
 {
@@ -26,6 +32,9 @@ public:
     ~GLPreview();
 
     void displayFrame(const QImage &frame);
+    void setBrushAnimation(BrushAnimation *animation);
+    void clearBrushAnimation();
+    void setBrushAnimationProgress(double progress);
     void setDisplayAspectRatio(double aspectRatio);
     void setColorCorrection(const ColorCorrection &cc);
     // 0 = none (SDR sRGB), 1 = PQ (SMPTE ST 2084), 2 = HLG (ARIB STD-B67)
@@ -38,10 +47,126 @@ public:
     void setLut(const LutData &lut);
     // US-FEAT-B: LUT 3D-texture blend — upload QImage grid as GL_TEXTURE_3D
     void setLutTexture(const QImage &lutGrid, float intensity);
+    void setLutIntensity(double intensity);
     void clearLut();
-    // RGB Curves (US-CG-1): 256x4 RGBA float texture, GL_TEXTURE3
-    void setRgbCurves(const RgbCurveData &curves);
-    bool curvesEnabled() const { return m_curvesEnabled; }
+    // US-WIRE-2: Lift/Gamma/Gain color wheels from ColorGradingPanel
+    void setLiftGammaGain(const std::array<std::array<double,4>,3> &values);
+    // US-CG-1: RGB curves editor — 4 channels (R, G, B, Luma) of 256 ints
+    // each in [0,255]. Uploaded as a 256x4 GL_RGBA8 texture and applied
+    // in the fragment shader after Lift/Gamma/Gain and before the .cube LUT.
+    void setRgbCurves(const QVector<QVector<int>> &curves);
+    // US-CG-2: White-balance gain triple. Multiplied into c.rgb at the very
+    // top of the grade chain — BEFORE LGG, RGB curves, and the .cube LUT.
+    // Identity = (1, 1, 1) → no-op.
+    void setWhiteBalance(float r, float g, float b);
+    // US-CG-3: Radial vignette / Power Window. Applied AFTER RGB curves and
+    // BEFORE the .cube LUT. Identity (amount=0) is a free no-op.
+    //   amount    : -1..+1   (negative = darken, positive = lighten)
+    //   midpoint  :  0..1    (radius % of frame, 0.7 = default)
+    //   roundness : -1..+1   (0 = circular, ±1 = squareness)
+    //   feather   :  0..1    (edge softness, 0.3 = default)
+    void setVignette(float amount, float midpoint, float roundness, float feather);
+    // US-EF-1: Chroma Key (Premiere Ultra Key / Resolve 3D Keyer simplified).
+    // Applied at the very TOP of the compose path — BEFORE WB / LGG / curves /
+    // vignette / .cube LUT — so the key gates raw frame colour. enabled=false
+    // is a free no-op (shader test guards the whole stage). All scalars are
+    // already normalized to [0..1] by ColorGradingPanel.
+    //   keyH/S/L   : key colour in HSL space ([0..1] each)
+    //   hueTol     : hue tolerance fraction (degrees / 180)
+    //   satTol     : sat tolerance fraction (percent / 100)
+    //   lumTol     : lum tolerance fraction (percent / 100)
+    //   spill      : spill desaturation strength [0..1]
+    //   softness   : edge smoothstep half-width [0..1]
+    void setChromaKey(bool enabled, float keyH, float keyS, float keyL,
+                      float hueTol, float satTol, float lumTol,
+                      float spill, float softness);
+    // US-EF-2: Mask Animation (DaVinci Power Window simplified). Wraps the
+    // entire grade chain (chroma key → WB → LGG → curves → vignette → LUT)
+    // so the colour grade applies INSIDE the mask region; outside stays raw
+    // (or vice versa when invert=true). enabled=false is a free no-op (the
+    // shader test branches around the mix() so the previous output is
+    // returned unchanged).
+    //   ellipse  : false=Rect, true=Ellipse
+    //   invert   : flip the mask weight
+    //   feather  : edge softness in [0..1]
+    //   normalizedRect : (x, y, w, h) in vTexCoord space, all in [0..1]
+    void setMask(bool enabled, bool ellipse, bool invert, float feather,
+                 QRectF normalizedRect);
+
+    // US-EF-3: HSL Qualifier (DaVinci Resolve secondary grading). Isolates
+    // a hue/sat/luma range and applies a SECONDARY lift/gamma/gain ONLY
+    // inside the qualified region. Different from chroma key (which masks
+    // for transparency); this is selective COLOUR ADJUSTMENT — e.g. "make
+    // skin tones warmer" or "desaturate everything except the red flowers".
+    // Sits AFTER chroma key and BEFORE WB so the qualifier acts on raw
+    // colour. enabled=false is a free no-op.
+    //   hueCenter   degrees [0..360]
+    //   hueRange    degrees [0..180]
+    //   satMin/Max  percent [0..100]
+    //   lumaMin/Max percent [0..100]
+    //   softness    [0..50] (degrees / percent edge slop)
+    //   lift        per-channel additive offset (-0.5..+0.5 typical)
+    //   gamma       per-channel gamma (>0; identity 1.0)
+    //   gain        per-channel multiplier (identity 1.0)
+    void setHslQualifier(bool enabled,
+                         float hueCenter, float hueRange,
+                         float satMin, float satMax,
+                         float lumaMin, float lumaMax,
+                         float softness,
+                         float liftR, float liftG, float liftB,
+                         float gammaR, float gammaG, float gammaB,
+                         float gainR, float gainG, float gainB);
+
+    // US-CG-4: Hue vs Saturation curve (DaVinci Resolve color page parity).
+    // Uploads a 256x1 R32F texture; sampler in the fragment shader looks up
+    // the saturation multiplier by the pixel's HSL hue. Default = identity
+    // (lut[i] == 1.0 ∀ i) keeps the stage a free no-op. Pass an empty
+    // vector to disable.
+    void setHueVsSatLut(const QVector<float> &lut);
+
+    // US-EF-4: Effects shader pack — Sharpen / Gaussian Blur / Lens Distortion.
+    // All three stages live in the same fragment shader as the rest of the
+    // grade chain. Lens distortion is a TEXTURE COORDINATE TRANSFORM applied
+    // at the very TOP of main() (before the texture sample), while blur and
+    // sharpen are POST stages applied at the END of main() — after the
+    // entire grade chain (chroma key → HSL Q → WB → exposure → ... → LGG →
+    // curves → vignette → LUT → mask wrap).
+    //   sharpen   : 0..200 (% × 0.01 inside the shader, identity at 0)
+    //   blur      : 0..50 px radius (identity at 0)
+    //   lens      : -100..+100, scaled by 0.01 inside the shader (identity 0;
+    //               negative = barrel, positive = pincushion)
+    void setSharpen(float amount);
+    void setBlur(float radiusPx);
+    void setLensDistortion(float amount);
+    void setGlow(bool enabled, float threshold, float radius, float intensity);
+    void setBloom(bool enabled, float threshold, float intensity, float spread);
+    void setChromaticAberration(bool enabled, float amount, float radialFalloff);
+    void setLightWrap(bool enabled, float amount, float radius);
+
+    // US-3D: 3-axis rotation + perspective foreshortening (Premiere "Basic 3D"
+    // / Resolve "Transform" 3D rotation parity). Implemented in the fragment
+    // shader as an inverse texture-coordinate warp at the very TOP of main()
+    // (composed AFTER lens distortion, BEFORE the texture sample). Identity
+    // (xDeg=yDeg=zDeg=0, perspectiveDist≥0.1) is a free no-op — the shader
+    // detects the identity matrix and skips the stage. perspectiveDist is the
+    // inverse FOV (smaller = stronger perspective); 0.1..10.0 is the UI range
+    // (default 2.0). Out-of-bounds samples render black so the rotated quad
+    // letterboxes against the canvas.
+    void setRotation3D(float xDeg, float yDeg, float zDeg, float perspectiveDist);
+
+    // US-INT-4: per-clip stabilizer keyframes + per-frame source time. The
+    // setter copies the keyframe vector (sorted by timeUs); the time hook
+    // does a std::lower_bound on every paintGL to pick the active keyframe
+    // (or interpolates between two) and bakes the inverse 2D affine into
+    // a uStab uniform that runs BEFORE the existing 3D-rotate stage so the
+    // user 3D-rotate matrix is preserved (transforms compose by stacking).
+    void setStabilizerKeyframes(const QVector<StabilizerKeyframe> &kfs);
+    void setStabilizerSourceTimeUs(qint64 sourceUs);
+
+    // US-INT-1: non-owning Timeline pointer used to query
+    // composeAdjustmentLayersAt(timelineUs) in paintGL. nullptr → no-op
+    // (preview is bit-identical to pre-INT-1 baseline).
+    void setTimeline(Timeline *t) { m_timeline = t; }
 
     // Phase 1e — true only when VEDITOR_GL_INTEROP=1 AND WGL_NV_DX_interop2
     // is supported AND all 6 wglDX*NV procs resolved during initializeGL().
@@ -127,6 +252,9 @@ public:
     // it pull from farther away. MainWindow persists via QSettings.
     void setSnapStrength(double pixels) { m_snapStrength = qMax(0.0, pixels); }
     double snapStrength() const { return m_snapStrength; }
+    // US-MOCHA-3: SurfaceTool integration — installs a 4-corner pin gizmo
+    // that draws on top of the GLPreview and intercepts mouse events when enabled.
+    void installSurfaceTool(SurfaceTool *tool);
 
 signals:
     void textRectRequested(const QRectF &normalizedRect);
@@ -178,6 +306,8 @@ private:
     QOpenGLVertexArrayObject m_vao;
 
     QImage m_currentFrame;
+    BrushAnimation *m_brushAnimation = nullptr;
+    double m_brushAnimationProgress = 0.0;
     ColorCorrection m_cc;
     bool m_effectsEnabled = true;
     bool m_needsUpload = false;
@@ -270,6 +400,7 @@ private:
     int m_locExposure = -1;
     int m_locEffectsEnabled = -1;
     int m_locHdrTransfer = -1;
+    int m_locClipOpacity = -1;
     int m_hdrTransfer = 0;  // 0=none, 1=PQ, 2=HLG
 
     QVector<VideoEffect> m_videoEffects;
@@ -285,10 +416,14 @@ private:
     int m_locFxTime = -1;
     QImage::Format m_textureFormat = QImage::Format_Invalid;
 
-    // Lift/Gamma/Gain uniform locations
-    int m_locLiftR = -1, m_locLiftG = -1, m_locLiftB = -1;
-    int m_locGammaR = -1, m_locGammaG = -1, m_locGammaB = -1;
-    int m_locGainR = -1, m_locGainG = -1, m_locGainB = -1;
+    // Lift/Gamma/Gain uniform locations (vec4: xyz=RGB, w=Luma)
+    int m_locLift = -1, m_locLggGamma = -1, m_locGain = -1;
+    // Identity: lift=(0,0,0,0), gamma=(1,1,1,1), gain=(1,1,1,1)
+    std::array<std::array<double,4>,3> m_liftGammaGain = {{
+        {0.0, 0.0, 0.0, 0.0},
+        {1.0, 1.0, 1.0, 1.0},
+        {1.0, 1.0, 1.0, 1.0}
+    }};
 
     // LUT uniform locations and texture
     int m_locLut3D = -1;
@@ -298,12 +433,169 @@ private:
     float m_lutIntensity = 1.0f;
     bool m_lutEnabled = false;
 
-    // RGB Curves (US-CG-1): raw GL texture at GL_TEXTURE3
-    GLuint m_curvesTexture = 0;
-    bool m_curvesEnabled = false;
+    // US-CG-1: RGB Curves LUT (256x4 RGBA8 — rows R/G/B/Luma).
+    // Sampled in the fragment shader between LGG and the .cube LUT.
     int m_locCurveLut = -1;
     int m_locCurvesEnabled = -1;
-    void uploadCurvesTexture(const RgbCurveData &c);
+    QOpenGLTexture *m_curveLutTex = nullptr;
+    bool m_curvesEnabled = false;
+    QVector<QVector<int>> m_pendingCurves;   // queued upload (set before initializeGL)
+    bool m_curvesNeedUpload = false;
+
+    // US-CG-2: White-balance gain triple — applied at the very top of the
+    // grade chain. Identity is (1, 1, 1) so existing pipelines keep working
+    // until ColorGradingPanel emits a non-identity value.
+    int m_locWb = -1;
+    std::array<float, 3> m_wb = {1.0f, 1.0f, 1.0f};
+
+    // US-CG-3: Radial vignette / Power Window — applied between curves and
+    // the .cube LUT. amount=0 is identity (factor==1.0 → no-op).
+    int m_locVigAmount = -1;
+    int m_locVigMid = -1;
+    int m_locVigRound = -1;
+    int m_locVigFeather = -1;
+    float m_vigAmount = 0.0f;
+    float m_vigMid = 0.7f;
+    float m_vigRound = 0.0f;
+    float m_vigFeather = 0.3f;
+
+    // US-EF-1: Chroma Key (HSL gating + spill suppression). Applied at the
+    // very TOP of the compose path — BEFORE WB / LGG / curves / vignette /
+    // .cube LUT. uChromaEnabled=false is a free no-op.
+    int m_locChromaEnabled = -1;
+    int m_locChromaKeyHsl  = -1;
+    int m_locChromaTol     = -1;
+    int m_locChromaSpill   = -1;
+    int m_locChromaSoft    = -1;
+    bool m_chromaEnabled = false;
+    float m_chromaKeyH = 1.0f / 3.0f;  // pure green default (120°/360°)
+    float m_chromaKeyS = 1.0f;
+    float m_chromaKeyL = 0.5f;
+    float m_chromaHueTol = 30.0f / 180.0f;
+    float m_chromaSatTol = 0.6f;
+    float m_chromaLumTol = 0.6f;
+    float m_chromaSpillStrength = 0.4f;
+    float m_chromaSoftness = 0.1f;
+
+    // US-EF-3: HSL Qualifier (DaVinci-style secondary grading). Lives between
+    // chroma key and WB. uHslqEnabled=false is a free no-op (entire stage is
+    // skipped).
+    int m_locHslqEnabled    = -1;
+    int m_locHslqHueCenter  = -1;
+    int m_locHslqHueRange   = -1;
+    int m_locHslqSatRange   = -1;
+    int m_locHslqLumaRange  = -1;
+    int m_locHslqSoftness   = -1;
+    int m_locHslqLift       = -1;
+    int m_locHslqGamma      = -1;
+    int m_locHslqGain       = -1;
+    bool  m_hslqEnabled     = false;
+    float m_hslqHueCenter   = 30.0f;          // skin tone default
+    float m_hslqHueRange    = 30.0f;
+    float m_hslqSatMin      = 0.30f;
+    float m_hslqSatMax      = 1.00f;
+    float m_hslqLumaMin     = 0.30f;
+    float m_hslqLumaMax     = 0.80f;
+    float m_hslqSoftness    = 10.0f;          // degrees / percent edge slop
+    float m_hslqLift[3]     = {0.0f, 0.0f, 0.0f};
+    float m_hslqGamma[3]    = {1.0f, 1.0f, 1.0f};
+    float m_hslqGain[3]     = {1.0f, 1.0f, 1.0f};
+
+    // US-CG-4: Hue vs Saturation curve. 256x1 R32F texture sampled in the
+    // fragment shader; lookup is keyed on the HSL hue of the pixel and the
+    // returned scalar is multiplied into the saturation channel before
+    // converting back to RGB. uHueVsSatEnabled=false is a free no-op.
+    int m_locHueVsSatEnabled = -1;
+    int m_locHueVsSatLut     = -1;
+    QOpenGLTexture *m_hueVsSatTex = nullptr;
+    bool m_hueVsSatEnabled = false;
+    QVector<float> m_pendingHueVsSatLut;
+    bool m_hueVsSatNeedUpload = false;
+
+    // US-EF-2: Mask Animation (Power Window simplified). uMaskEnabled=false
+    // skips the entire wrap stage so the unmodified pre-mask `color` is
+    // returned, preserving bit-identical output for the disabled state.
+    int m_locMaskEnabled = -1;
+    int m_locMaskEllipse = -1;
+    int m_locMaskInvert  = -1;
+    int m_locMaskFeather = -1;
+    int m_locMaskRect    = -1;
+    bool  m_maskEnabled  = false;
+    bool  m_maskEllipse  = false;
+    bool  m_maskInvert   = false;
+    float m_maskFeather  = 0.10f;
+    // (x, y, w, h) normalized to [0..1] in vTexCoord space.
+    float m_maskRect[4]  = {0.25f, 0.25f, 0.50f, 0.50f};
+
+    // US-EF-4: Effects shader pack — Sharpen / Gaussian Blur / Lens Distortion.
+    // All three default to identity (no-op) so the stage is free until the
+    // user touches the エフェクト sliders in ColorGradingPanel.
+    int   m_locSharpenAmount  = -1;
+    int   m_locBlurRadius     = -1;
+    int   m_locLensDistortion = -1;
+    int   m_locGlowEnabled    = -1;
+    int   m_locGlowThreshold  = -1;
+    int   m_locGlowRadius     = -1;
+    int   m_locGlowIntensity  = -1;
+    int   m_locBloomEnabled   = -1;
+    int   m_locBloomThreshold = -1;
+    int   m_locBloomIntensity = -1;
+    int   m_locBloomSpread    = -1;
+    int   m_locChromAbEnabled = -1;
+    int   m_locChromAbAmount  = -1;
+    int   m_locChromAbFalloff = -1;
+    int   m_locLightWrapEnabled = -1;
+    int   m_locLightWrapAmount  = -1;
+    int   m_locLightWrapRadius  = -1;
+    float m_sharpenAmount  = 0.0f;
+    float m_blurRadius     = 0.0f;
+    float m_lensDistortion = 0.0f;
+    bool  m_glowEnabled    = false;
+    float m_glowThreshold  = 0.8f;
+    float m_glowRadius     = 0.0f;
+    float m_glowIntensity  = 0.0f;
+    bool  m_bloomEnabled   = false;
+    float m_bloomThreshold = 0.8f;
+    float m_bloomIntensity = 0.0f;
+    float m_bloomSpread    = 0.0f;
+    bool  m_chromAbEnabled = false;
+    float m_chromAbAmount  = 0.0f;
+    float m_chromAbFalloff = 2.0f;
+    bool  m_lightWrapEnabled = false;
+    float m_lightWrapAmount  = 0.0f;
+    float m_lightWrapRadius  = 0.0f;
+
+    // US-3D: 3-axis rotation + perspective foreshortening. The CPU side
+    // builds a 3x3 rotation matrix from XYZ Euler angles (intrinsic
+    // Tait-Bryan, R = Rx * Ry * Rz) and ships it to the fragment shader,
+    // which warps the texture-coord sample at the top of main(). Identity
+    // matrix (uRot3DEnabled=false) is a free no-op.
+    int   m_locRot3DEnabled    = -1;
+    int   m_locRot3D           = -1;
+    int   m_locPerspectiveDist = -1;
+    float m_rot3DMatrix[9]     = {1.0f, 0.0f, 0.0f,
+                                  0.0f, 1.0f, 0.0f,
+                                  0.0f, 0.0f, 1.0f};
+    float m_perspectiveDist    = 2.0f;
+    bool  m_rot3DEnabled       = false;
+
+    // US-INT-4: per-clip stabilizer state. Keyframes are kept sorted by
+    // timeUs; setStabilizerSourceTimeUs picks the active sample via
+    // std::lower_bound and bakes the inverse 2D affine into m_stabMatrix.
+    // Identity (m_stabEnabled=false) is a free no-op shader path.
+    int   m_locStabEnabled = -1;
+    int   m_locStab        = -1;
+    float m_stabMatrix[9]  = {1.0f, 0.0f, 0.0f,
+                              0.0f, 1.0f, 0.0f,
+                              0.0f, 0.0f, 1.0f};
+    bool  m_stabEnabled    = false;
+    QVector<StabilizerKeyframe> m_stabKeyframes;
+    qint64 m_stabSourceUs  = 0;
+    int   m_stabFrameW     = 0;
+    int   m_stabFrameH     = 0;
+
+    // US-INT-1: non-owning Timeline pointer for adjustment-layer composition.
+    Timeline *m_timeline = nullptr;
 
     // Phase 1e — m_interopDevice holds the wglDXOpenDeviceNV HANDLE once
     // Section B opens it lazily in paintGL; void* avoids leaking windows.h.
@@ -322,4 +614,7 @@ private:
     QOpenGLShaderProgram *m_nv12Program = nullptr;
     int m_locNv12TexY = -1;
     int m_locNv12TexUV = -1;
+
+    // US-MOCHA-3: SurfaceTool for 4-corner planar tracking gizmo.
+    SurfaceTool *m_surfaceTool = nullptr;
 };
