@@ -1,5 +1,6 @@
 #include "MediaPoolDock.h"
 
+#include <QAbstractItemView>
 #include <QWidget>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -9,8 +10,10 @@
 #include <QTreeWidgetItem>
 #include <QListWidget>
 #include <QListWidgetItem>
+#include <QMimeData>
 #include <QPushButton>
 #include <QInputDialog>
+#include <QUrl>
 #include <QVariant>
 #include <QSize>
 
@@ -24,6 +27,43 @@ constexpr int kAssetPathRole = Qt::UserRole + 1;
 // QTreeWidgetItem に bin id を持たせるための role。
 constexpr int kBinIdRole     = Qt::UserRole;
 } // namespace
+
+MediaPoolAssetListWidget::MediaPoolAssetListWidget(QWidget *parent)
+    : QListWidget(parent)
+{
+}
+
+QStringList MediaPoolAssetListWidget::mimeTypes() const
+{
+    return { QStringLiteral("text/uri-list") };
+}
+
+QMimeData *MediaPoolAssetListWidget::mimeData(const QList<QListWidgetItem *> &items) const
+{
+    return createMimeDataForItems(items);
+}
+
+QMimeData *MediaPoolAssetListWidget::createMimeDataForItems(const QList<QListWidgetItem *> &items) const
+{
+    QList<QUrl> urls;
+    urls.reserve(items.size());
+
+    for (const QListWidgetItem *item : items) {
+        if (!item) {
+            continue;
+        }
+        const QString filePath = item->data(kAssetPathRole).toString();
+        if (!filePath.isEmpty()) {
+            urls.push_back(QUrl::fromLocalFile(filePath));
+        }
+    }
+
+    QMimeData *data = new QMimeData;
+    if (!urls.isEmpty()) {
+        data->setUrls(urls);
+    }
+    return data;
+}
 
 MediaPoolDock::MediaPoolDock(QWidget *parent)
     : QDockWidget(tr("メディアプール"), parent)
@@ -48,13 +88,18 @@ MediaPoolDock::MediaPoolDock(QWidget *parent)
     m_binTree->setHeaderHidden(true);
     m_binTree->setColumnCount(1);
 
-    m_assetList = new QListWidget(splitter);
+    m_assetList = new MediaPoolAssetListWidget(splitter);
+    m_assetList->setObjectName(QStringLiteral("MediaPoolAssetList"));
     m_assetList->setViewMode(QListView::IconMode);
     m_assetList->setResizeMode(QListView::Adjust);
     m_assetList->setMovement(QListView::Static);
     m_assetList->setIconSize(QSize(64, 64));
     m_assetList->setGridSize(QSize(96, 96));
     m_assetList->setWordWrap(true);
+    m_assetList->setSelectionMode(QAbstractItemView::ExtendedSelection);
+    m_assetList->setDragEnabled(true);
+    m_assetList->setDragDropMode(QAbstractItemView::DragOnly);
+    m_assetList->setDefaultDropAction(Qt::CopyAction);
 
     splitter->addWidget(m_binTree);
     splitter->addWidget(m_assetList);

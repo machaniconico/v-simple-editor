@@ -6,15 +6,29 @@
 // 表示対象を指すだけ (pool=nullptr のときは安全に no-op)。
 
 #include <QDockWidget>
+#include <QListWidget>
+#include <QStringList>
 
 #include "MediaPool.h"
 
 class QTreeWidget;
 class QTreeWidgetItem;
-class QListWidget;
 class QListWidgetItem;
 class QLineEdit;
+class QMimeData;
 class QPushButton;
+
+class MediaPoolAssetListWidget : public QListWidget
+{
+public:
+    explicit MediaPoolAssetListWidget(QWidget *parent = nullptr);
+
+    QMimeData *createMimeDataForItems(const QList<QListWidgetItem *> &items) const;
+
+protected:
+    QStringList mimeTypes() const override;
+    QMimeData *mimeData(const QList<QListWidgetItem *> &items) const override;
+};
 
 class MediaPoolDock : public QDockWidget
 {

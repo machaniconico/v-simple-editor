@@ -102,6 +102,7 @@ int runLiveMatteResolveSelftest();
 int runLoudnessSelftest();
 int runLowerThirdSelftest();
 int runMatte16ParitySelftest();
+int runMediaPoolDragSelftest();
 int runMediaPoolSelftest();
 int runMobileSelftest();
 int runMographSelftest();
@@ -625,6 +626,10 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Render-time per-clip effect parameter keyframe evaluation parity (4 gates, byte-identical no-keyframe guard)" },
     { "effect-timing", "VEDITOR_EFFECT_TIMING_SELFTEST", runEffectTimingSelftest, true,
       "Clip-local VideoEffect active range filtering + ProjectFile JSON round-trip (4 gates)" },
+    { "mediapool-drag", "VEDITOR_MEDIAPOOL_DRAG_SELFTEST", runMediaPoolDragSelftest, true,
+      "MediaPool drag&drop: single/multi selection mimeData file URL generation" },
+    { "text-spacing", "VEDITOR_TEXT_SPACING_SELFTEST", runTextSpacingSelftest, true,
+      "Text letter/line spacing: default byte-identical, spacing widens render, toJson/fromJson roundtrip" },
     { "grade-wheel-wiring", "VEDITOR_GRADE_WHEEL_WIRING_SELFTEST", runGradeWheelWiringSelftest, true,
       "LGG wheels + WB -> per-clip ColorCorrection wiring: value mapping, restore, render reflection" },
     { "graph-editor", "VEDITOR_GRAPH_EDITOR_SELFTEST", runGraphEditorSelftest, true,
