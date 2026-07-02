@@ -43,6 +43,7 @@ int runAudioRestoreSelftest();
 int runAutoClipGenSelftest();
 int runAutoColorSelftest();
 int runAutoColorPreserveGradeSelftest();
+int runAutoDuckingSelftest();
 int runAutoMatteSelftest();
 int runBatchExportSelftest();
 int runBezierEasingSelftest();
@@ -467,6 +468,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Per-clip stereo balance pan: identity, L/R attenuation, half pan, ProjectFile round-trip" },
     { "atempo-resolve",    "VEDITOR_ATEMPO_RESOLVE_SELFTEST",     runAtempoResolveSelftest,      false,
       "Audio atempo enable resolver truth table: env force OR per-clip flag" },
+    { "auto-ducking",      "VEDITOR_AUTO_DUCKING_SELFTEST",        runAutoDuckingSelftest,        false,
+      "AutoDucking: thresholded VO envelope + non-destructive BGM gain keyframes" },
     { "bezier-easing",     "VEDITOR_BEZIER_EASING_SELFTEST",      runBezierEasingSelftest,       false,
       "Per-keyframe cubic-bezier easing: legacy invariance, identity curve, ease-in, JSON round-trip (4 gates)" },
     { "easing-presets",    "VEDITOR_EASING_PRESETS_SELFTEST",     runEasingPresetsSelftest,      false,

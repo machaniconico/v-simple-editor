@@ -196,12 +196,15 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     # AB (オーディオバス): Fairlight 風バス/サブミックス/AUXセンドの純粋エンジン。
     src/AudioBusRouting.h
     src/AudioBusRouting.cpp
+    src/audio/AutoDucking.h
+    src/audio/AutoDucking.cpp
     src/playback/AudioPan.h
     src/playback/smartrender_flag.h
     src/SilenceCut.cpp
     src/BeatDetect.cpp
     src/AudioBusPanel.cpp
     src/selftests/audio_bus_selftest.cpp
+    src/selftests/AutoDuckingSelftest.cpp
     src/selftests/StereoPanSelftest.cpp
     src/selftests/ExportRangeSelftest.cpp
     src/selftests/CapcutCaptionSelftest.cpp
