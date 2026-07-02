@@ -70,11 +70,12 @@ int runEdlExportSelftest();
 int runE2eSelftest();
 int runEasingSelftest();
 int runEasingPresetsSelftest();
+int runEffectKeyframeParitySelftest();
+int runEffectPresetSelftest();
+int runEffectTimingSelftest();
 int runExposureAidsSelftest();
 int runExportAuditSelftest();
 int runExportRangeSelftest();
-int runEffectKeyframeParitySelftest();
-int runEffectTimingSelftest();
 int runFcpxmlSelftest();
 int runFrameIoSelftest();
 int runGraphEditorSelftest();
@@ -502,6 +503,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "AE-FX-5 Generate Family: gradient ramp, fill, bloom, scanlines, halftone gates (G1-G6)" },
     { "ae-fx-stylize",     "VEDITOR_AE_FX_STYLIZE_SELFTEST",      runAeFxStylizeSelftest,        false,
       "AE-FX-2 Stylize Family: glow, edges, emboss, posterize, threshold, solarize gates (G1-G7)" },
+    { "effect-preset", "VEDITOR_EFFECT_PRESET_SELFTEST", runEffectPresetSelftest, false,
+      "FXP-1 effect preset stack JSON save/load/apply with optional effect keyframes (5 gates)" },
     { "dolby-vision",      "VEDITOR_DOLBY_VISION_SELFTEST",       runDolbyVisionSelftest,        false,
       "DolbyVision: PQ ST.2084 math + metadata + DV XML generation" },
     { "dv-timeline",       "VEDITOR_DV_TIMELINE_SELFTEST",         runDvTimelineSelftest,         false,

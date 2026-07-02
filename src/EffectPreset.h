@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Keyframe.h"
 #include "VideoEffect.h"
 
 #include <QString>
@@ -14,6 +15,8 @@
 
 // --- Effect Preset ---
 
+struct ClipInfo;
+
 struct EffectPreset {
     QString name;
     QString description;
@@ -22,15 +25,22 @@ struct EffectPreset {
 
     ColorCorrection colorCorrection;
     QVector<VideoEffect> effects;
+    KeyframeManager keyframes; // effect.* tracks only when includesKeyframes is true
 
     QImage thumbnail;        // optional preview image
 
     QDateTime createdAt;
     QDateTime modifiedAt;
     bool isBuiltIn = false;  // true for factory presets
+    bool includesKeyframes = false;
 
     QJsonObject toJson() const;
     static EffectPreset fromJson(const QJsonObject &obj);
+
+    static EffectPreset fromClipStack(const QString &name,
+                                      const ClipInfo &clip,
+                                      bool includeKeyframes);
+    void applyToClipStack(ClipInfo &clip, bool applyKeyframes = true) const;
 };
 
 // --- Preset Library (singleton) ---
@@ -54,6 +64,16 @@ public:
     // Import / Export single preset JSON
     bool importPreset(const QString &filePath);
     bool exportPreset(const QString &name, const QString &filePath) const;
+
+    // Named effect-stack JSON presets in the settings directory.
+    bool saveClipStackPreset(const QString &name, const ClipInfo &clip,
+                             bool includeKeyframes, QString *savedPath = nullptr);
+    bool loadClipStackPreset(const QString &name, EffectPreset *preset) const;
+    bool applyClipStackPreset(const QString &name, ClipInfo &clip,
+                              bool applyKeyframes = true) const;
+
+    static QString presetDirectory();
+    static QString presetFilePath(const QString &name);
 
     // Persist entire library to ~/.veditor/presets.json
     bool saveLibrary() const;

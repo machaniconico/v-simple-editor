@@ -85,6 +85,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/motion_blur_parity_selftest.cpp
     src/selftests/MotionBlurP2Selftest.cpp
     src/selftests/effect_keyframe_parity_selftest.cpp
+    src/selftests/EffectPresetSelftest.cpp
     src/selftests/effect_timing_selftest.cpp
     src/selftests/bezier_easing_selftest.cpp
     src/selftests/EasingPresetsSelftest.cpp
