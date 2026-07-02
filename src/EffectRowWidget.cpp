@@ -66,6 +66,37 @@ double normalizedTimingValue(double value)
     return value < 0.0 ? -1.0 : value;
 }
 
+bool splitColorChannelParam(const QString &paramName, QString *baseParamName, QString *channel)
+{
+    const int dotPos = paramName.lastIndexOf(QLatin1Char('.'));
+    if (dotPos <= 0 || dotPos == paramName.size() - 1)
+        return false;
+
+    const QString suffix = paramName.mid(dotPos + 1);
+    if (suffix != QStringLiteral("r")
+        && suffix != QStringLiteral("g")
+        && suffix != QStringLiteral("b")) {
+        return false;
+    }
+
+    if (baseParamName)
+        *baseParamName = paramName.left(dotPos);
+    if (channel)
+        *channel = suffix;
+    return true;
+}
+
+double colorChannelValue(const QColor &color, const QString &channel)
+{
+    if (channel == QStringLiteral("r"))
+        return color.red();
+    if (channel == QStringLiteral("g"))
+        return color.green();
+    if (channel == QStringLiteral("b"))
+        return color.blue();
+    return 0.0;
+}
+
 QDoubleSpinBox *createTimingSpinBox(QWidget *parent, double value)
 {
     auto *spin = new UnlimitedDoubleSpinBox(parent);
@@ -169,20 +200,11 @@ void EffectRowWidget::buildRows(const QVector<ParamDef> &schema)
         rowLayout->setContentsMargins(2, 1, 2, 1);
         rowLayout->setSpacing(4);
 
-        // Color params have no scalar keyframe representation: a toggled track
-        // would record getParamValueByName()'s 0.0 and reset the user's color to
-        // the design default on every render. Keep a spacer for row alignment.
-        if (def.type != ParamType::Color) {
-            row.kfToggle = new EffectKeyframeToggle(row.container);
-            connect(row.kfToggle, &EffectKeyframeToggle::toggled, this, [this, def](bool now) {
-                emit keyframeToggled(def.name, now);
-            });
-            rowLayout->addWidget(row.kfToggle);
-        } else {
-            auto *kfSpacer = new QWidget(row.container);
-            kfSpacer->setFixedSize(20, 20);
-            rowLayout->addWidget(kfSpacer);
-        }
+        row.kfToggle = new EffectKeyframeToggle(row.container);
+        connect(row.kfToggle, &EffectKeyframeToggle::toggled, this, [this, def](bool now) {
+            emit keyframeToggled(def.name, now);
+        });
+        rowLayout->addWidget(row.kfToggle);
 
         row.label = new QLabel(def.displayLabel, row.container);
         row.label->setMinimumWidth(80);
@@ -257,6 +279,7 @@ void EffectRowWidget::buildRows(const QVector<ParamDef> &schema)
                 if (newColor.isValid()) {
                     row.colorButton->setStyleSheet(QString("background-color: %1; border: 1px solid #555; border-radius: 3px;")
                                                    .arg(newColor.name()));
+                    setColorParam(m_effect, def.name, newColor);
                     emit paramChanged(def.name, QVariant(newColor));
                 }
             });
@@ -314,6 +337,7 @@ void EffectRowWidget::buildRows(const QVector<ParamDef> &schema)
                     row.colorButton->setStyleSheet(QString("background-color: %1; border: 1px solid #555; border-radius: 3px;")
                                                    .arg(defaultColor.name()));
                 }
+                setColorParam(m_effect, def.name, defaultColor);
                 emit paramChanged(def.name, QVariant(defaultColor));
                 break;
             }
@@ -383,8 +407,16 @@ bool EffectRowWidget::paramHasTrack(const QString &paramName) const
 
 double EffectRowWidget::getParamValueByName(const QString &paramName) const
 {
+    QString baseParamName;
+    QString channel;
+    const bool colorChannel = splitColorChannelParam(paramName, &baseParamName, &channel);
+    const QString lookupName = colorChannel ? baseParamName : paramName;
+
     for (int i = 0; i < m_rows.size(); ++i) {
-        if (m_rows[i].paramName == paramName) {
+        if (m_rows[i].paramName == lookupName) {
+            if (colorChannel && m_rows[i].colorButton) {
+                return colorChannelValue(colorParamValue(m_effect, lookupName), channel);
+            }
             return getParamValue(i);
         }
     }

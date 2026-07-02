@@ -48,6 +48,26 @@ bool parseEffectTrackName(const QString &trackName, int *effectIndex, QString *p
     return true;
 }
 
+bool splitColorChannelParam(const QString &paramName, QString *baseParamName, QString *channel)
+{
+    const int dotPos = paramName.lastIndexOf(QLatin1Char('.'));
+    if (dotPos <= 0 || dotPos == paramName.size() - 1)
+        return false;
+
+    const QString suffix = paramName.mid(dotPos + 1);
+    if (suffix != QStringLiteral("r")
+        && suffix != QStringLiteral("g")
+        && suffix != QStringLiteral("b")) {
+        return false;
+    }
+
+    if (baseParamName)
+        *baseParamName = paramName.left(dotPos);
+    if (channel)
+        *channel = suffix;
+    return true;
+}
+
 QString motionTrackLabel(const QString &propertyName)
 {
     static const QHash<QString, QString> labels = [] {
@@ -74,6 +94,12 @@ QString displayNameForTrack(const KeyframeTrack &track, const QVector<VideoEffec
         const QString effectName = (effectIndex >= 0 && effectIndex < effects.size())
             ? VideoEffect::typeName(effects[effectIndex].type)
             : QStringLiteral("Effect %1").arg(effectIndex + 1);
+        QString baseParamName;
+        QString channel;
+        if (splitColorChannelParam(paramName, &baseParamName, &channel)) {
+            return QStringLiteral("%1: %2 %3")
+                .arg(effectName, baseParamName, channel.toUpper());
+        }
         return QStringLiteral("%1: %2").arg(effectName, paramName);
     }
     return motionTrackLabel(track.propertyName());
@@ -113,6 +139,24 @@ QColor curveColor(int index)
         QColor(QStringLiteral("#f0abfc")),
     };
     return palette[index % palette.size()];
+}
+
+QColor curveColorForTrack(const QString &propertyName, int index)
+{
+    int effectIndex = -1;
+    QString paramName;
+    QString baseParamName;
+    QString channel;
+    if (parseEffectTrackName(propertyName, &effectIndex, &paramName)
+        && splitColorChannelParam(paramName, &baseParamName, &channel)) {
+        if (channel == QStringLiteral("r"))
+            return QColor(QStringLiteral("#ef4444"));
+        if (channel == QStringLiteral("g"))
+            return QColor(QStringLiteral("#22c55e"));
+        if (channel == QStringLiteral("b"))
+            return QColor(QStringLiteral("#3b82f6"));
+    }
+    return curveColor(index);
 }
 
 double curveDurationFor(const QVector<GraphEditorCurveTrack> &curves, double clipDuration)
@@ -1195,7 +1239,7 @@ void GraphEditorPanel::rebuildForSelection()
         curve.propertyName = kfTrack.propertyName();
         curve.displayName = displayNameForTrack(kfTrack, clip.effects);
         curve.track = kfTrack;
-        curve.color = curveColor(colorIndex++);
+        curve.color = curveColorForTrack(kfTrack.propertyName(), colorIndex++);
         m_tracks.append(curve);
     }
 

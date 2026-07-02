@@ -1,5 +1,7 @@
 #include "../EffectParamSchema.h"
+#include "../ProjectFile.h"
 #include "../Timeline.h"
+#include "../UndoManager.h"
 #include "../VideoEffect.h"
 #include "../clipanim/ClipAnim.h"
 
@@ -7,6 +9,7 @@
 #include <QImage>
 #include <QString>
 #include <QStringList>
+#include <QTemporaryDir>
 #include <QVector>
 
 #include <algorithm>
@@ -182,6 +185,88 @@ KeyframeTrack twoPointTrack(const QString &name,
     return track;
 }
 
+QString colorChannelTrackName(int effectIndex,
+                              const QString &paramName,
+                              const char *channel)
+{
+    return QStringLiteral("effect.%1.%2.%3")
+        .arg(effectIndex)
+        .arg(paramName)
+        .arg(QString::fromLatin1(channel));
+}
+
+void addSingleKeyframeTrack(KeyframeManager &manager,
+                            const QString &trackName,
+                            double value)
+{
+    KeyframeTrack track(trackName, value);
+    track.addKeyframe(0.25, value);
+    manager.addTrack(track);
+}
+
+void addColorChannelTracks(KeyframeManager &manager,
+                           int effectIndex,
+                           const QString &paramName,
+                           const QColor &color)
+{
+    addSingleKeyframeTrack(manager,
+                           colorChannelTrackName(effectIndex, paramName, "r"),
+                           color.red());
+    addSingleKeyframeTrack(manager,
+                           colorChannelTrackName(effectIndex, paramName, "g"),
+                           color.green());
+    addSingleKeyframeTrack(manager,
+                           colorChannelTrackName(effectIndex, paramName, "b"),
+                           color.blue());
+}
+
+KeyframeManager colorChannelManager(int effectIndex,
+                                    const QString &paramName,
+                                    const QColor &color)
+{
+    KeyframeManager manager;
+    addColorChannelTracks(manager, effectIndex, paramName, color);
+    return manager;
+}
+
+bool trackHasSingleValue(const KeyframeManager &manager,
+                         const QString &trackName,
+                         double value)
+{
+    const KeyframeTrack *track = manager.track(trackName);
+    return manager.hasTrack(trackName)
+        && track
+        && track->count() == 1
+        && closeEnough(track->keyframes().first().time, 0.25)
+        && closeEnough(track->keyframes().first().value, value)
+        && closeEnough(manager.valueAt(trackName, 0.5, -1.0), value);
+}
+
+bool colorChannelTracksEvaluate(const KeyframeManager &manager,
+                                int effectIndex,
+                                const QString &paramName,
+                                const QColor &color)
+{
+    return trackHasSingleValue(manager,
+                               colorChannelTrackName(effectIndex, paramName, "r"),
+                               color.red())
+        && trackHasSingleValue(manager,
+                               colorChannelTrackName(effectIndex, paramName, "g"),
+                               color.green())
+        && trackHasSingleValue(manager,
+                               colorChannelTrackName(effectIndex, paramName, "b"),
+                               color.blue());
+}
+
+bool colorChannelTracksGone(const KeyframeManager &manager,
+                            int effectIndex,
+                            const QString &paramName)
+{
+    return !manager.hasTrack(colorChannelTrackName(effectIndex, paramName, "r"))
+        && !manager.hasTrack(colorChannelTrackName(effectIndex, paramName, "g"))
+        && !manager.hasTrack(colorChannelTrackName(effectIndex, paramName, "b"));
+}
+
 ClipInfo clipWithEffect(const VideoEffect &effect)
 {
     ClipInfo clip;
@@ -238,6 +323,111 @@ bool legacyPackedKeyColorTrackStaysInactive()
 
     const QVector<VideoEffect> evaluated = clipanim::effectiveEffectsAt(clip, 0.5);
     return evaluated.size() == 1 && sameEffectState(evaluated.first(), original);
+}
+
+bool threeChannelTrackCreationGate()
+{
+    const QColor expected(17, 34, 51);
+    const KeyframeManager manager = colorChannelManager(0, QStringLiteral("keyColor"), expected);
+
+    ClipInfo clip = clipWithEffect(VideoEffect::createPhotoFilter(QColor(0, 0, 0), 25.0));
+    clip.keyframes = manager;
+    const QVector<VideoEffect> evaluated = clipanim::effectiveEffectsAt(clip, 0.5);
+
+    return colorChannelTracksEvaluate(manager, 0, QStringLiteral("keyColor"), expected)
+        && evaluated.size() == 1
+        && effectctrl::colorParamValue(evaluated.first(), "keyColor") == expected;
+}
+
+bool timelineUndoRestoresColorChannelTracks()
+{
+    Timeline timeline;
+    if (timeline.videoTracks().isEmpty() || !timeline.videoTracks().first())
+        return false;
+
+    ClipInfo original = clipWithEffect(
+        VideoEffect::createPhotoFilter(QColor(3, 5, 7), 40.0));
+    addSingleKeyframeTrack(original.keyframes,
+                           QStringLiteral("effect.0.density"),
+                           40.0);
+
+    timeline.videoTracks().first()->setClips(QVector<ClipInfo>{ original });
+    timeline.videoTracks().first()->setSelectedClip(0);
+    timeline.undoManager()->saveState(timeline.currentState(), QStringLiteral("baseline"));
+    const int beforeIndex = timeline.undoManager()->currentIndex();
+
+    KeyframeManager editedKeyframes = original.keyframes;
+    addColorChannelTracks(editedKeyframes,
+                          0,
+                          QStringLiteral("keyColor"),
+                          QColor(90, 100, 110));
+    timeline.setClipEffectsAndKeyframes(0, 0, original.effects, editedKeyframes);
+    const int afterIndex = timeline.undoManager()->currentIndex();
+
+    const auto &editedClips = timeline.videoTracks().first()->clips();
+    const bool editedHasChannels = editedClips.size() == 1
+        && colorChannelTracksEvaluate(editedClips.first().keyframes,
+                                      0,
+                                      QStringLiteral("keyColor"),
+                                      QColor(90, 100, 110));
+
+    if (!timeline.canUndo())
+        return false;
+    timeline.undo();
+
+    const auto &restoredClips = timeline.videoTracks().first()->clips();
+    const bool restored = restoredClips.size() == 1
+        && restoredClips.first().effects.size() == original.effects.size()
+        && sameEffectState(restoredClips.first().effects.first(), original.effects.first())
+        && restoredClips.first().keyframes.tracks().size() == original.keyframes.tracks().size()
+        && trackHasSingleValue(restoredClips.first().keyframes,
+                               QStringLiteral("effect.0.density"),
+                               40.0)
+        && colorChannelTracksGone(restoredClips.first().keyframes,
+                                  0,
+                                  QStringLiteral("keyColor"));
+
+    return editedHasChannels
+        && afterIndex - beforeIndex == 1
+        && restored;
+}
+
+bool projectFileRoundTripsColorChannelTracks()
+{
+    const QColor expected(121, 132, 143);
+    ClipInfo clip = clipWithEffect(
+        VideoEffect::createPhotoFilter(QColor(1, 2, 3), 55.0));
+    clip.keyframes = colorChannelManager(0, QStringLiteral("keyColor"), expected);
+
+    ProjectData saveData;
+    saveData.videoTracks.append(QVector<ClipInfo>{ clip });
+
+    QTemporaryDir tempDir;
+    if (!tempDir.isValid())
+        return false;
+
+    const QString projectPath = tempDir.filePath(QStringLiteral("ae_fx_color2_rgb.veditor"));
+    ProjectData loadedData;
+    if (!ProjectFile::save(projectPath, saveData)
+        || !ProjectFile::load(projectPath, loadedData)) {
+        return false;
+    }
+
+    if (loadedData.videoTracks.size() != 1
+        || loadedData.videoTracks.first().size() != 1) {
+        return false;
+    }
+
+    const ClipInfo &loadedClip = loadedData.videoTracks.first().first();
+    const QVector<VideoEffect> evaluated = clipanim::effectiveEffectsAt(loadedClip, 0.5);
+
+    return loadedClip.keyframes.tracks().size() == 3
+        && colorChannelTracksEvaluate(loadedClip.keyframes,
+                                      0,
+                                      QStringLiteral("keyColor"),
+                                      expected)
+        && evaluated.size() == 1
+        && effectctrl::colorParamValue(evaluated.first(), "keyColor") == expected;
 }
 
 } // namespace
@@ -473,6 +663,28 @@ int runAeFxColor2Selftest()
                   passed, failed);
     }
 
-    std::printf("ae-fx-color2 summary passed=%d failed=%d\n", passed, failed);
+    {
+        printGate("G11",
+                  threeChannelTrackCreationGate(),
+                  "3-channel keyColor track creation or evaluation failed",
+                  passed, failed);
+    }
+
+    {
+        printGate("G12",
+                  timelineUndoRestoresColorChannelTracks(),
+                  "Timeline setClipEffectsAndKeyframes undo did not restore prior color-track state",
+                  passed, failed);
+    }
+
+    {
+        printGate("G13",
+                  projectFileRoundTripsColorChannelTracks(),
+                  "ProjectFile save/load did not preserve keyColor r/g/b tracks",
+                  passed, failed);
+    }
+
+    std::printf("ae-fx-color2 summary gates=%d passed=%d failed=%d\n",
+                passed + failed, passed, failed);
     return failed == 0 ? 0 : 1;
 }

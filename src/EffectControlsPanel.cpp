@@ -80,6 +80,69 @@ QString effectTrackName(int effectIndex, const QString &paramName)
     return QStringLiteral("effect.%1.%2").arg(effectIndex).arg(paramName);
 }
 
+const QStringList &colorChannelNames()
+{
+    static const QStringList names = {
+        QStringLiteral("r"),
+        QStringLiteral("g"),
+        QStringLiteral("b"),
+    };
+    return names;
+}
+
+QString effectColorChannelTrackName(int effectIndex,
+                                    const QString &paramName,
+                                    const QString &channel)
+{
+    return QStringLiteral("effect.%1.%2.%3")
+        .arg(effectIndex)
+        .arg(paramName)
+        .arg(channel);
+}
+
+bool isColorParam(VideoEffectType type, const QString &paramName)
+{
+    const auto schema = paramSchemaFor(type);
+    for (const auto &def : schema) {
+        if (def.name == paramName)
+            return def.type == ParamType::Color;
+    }
+    return false;
+}
+
+bool hasColorChannelTrack(const KeyframeManager &keyframes,
+                          int effectIndex,
+                          const QString &paramName)
+{
+    for (const QString &channel : colorChannelNames()) {
+        if (keyframes.hasTrack(effectColorChannelTrackName(effectIndex, paramName, channel)))
+            return true;
+    }
+    return false;
+}
+
+KeyframeTrack *firstColorChannelTrack(KeyframeManager &keyframes,
+                                      int effectIndex,
+                                      const QString &paramName)
+{
+    for (const QString &channel : colorChannelNames()) {
+        if (auto *track = keyframes.track(effectColorChannelTrackName(effectIndex, paramName, channel)))
+            return track;
+    }
+    return nullptr;
+}
+
+double colorChannelValue(const QColor &color, const QString &channel)
+{
+    if (channel == QStringLiteral("r"))
+        return color.red();
+    if (channel == QStringLiteral("g"))
+        return color.green();
+    if (channel == QStringLiteral("b"))
+        return color.blue();
+    return 0.0;
+}
+
 QVector<EffectTrackRef> effectKeyframeTracksAt(const KeyframeManager &keyframes, int effectIndex)
 {
     QVector<EffectTrackRef> refs;
@@ -503,10 +566,16 @@ void EffectControlsPanel::refreshFromCurrentClip()
     for (int i = 0; i < m_effectRowWidgets.size() && i < m_effects.size(); ++i) {
         auto schema = paramSchemaFor(m_effects[i].type);
         for (const auto &def : schema) {
-            QString trackName = QStringLiteral("effect.%1.%2").arg(i).arg(def.name);
+            const bool isColor = def.type == ParamType::Color;
+            QString trackName = effectTrackName(i, def.name);
             bool has = clip.keyframes.hasTrack(trackName);
+            KeyframeTrack *track = clip.keyframes.track(trackName);
+            if (isColor) {
+                has = hasColorChannelTrack(clip.keyframes, i, def.name);
+                track = firstColorChannelTrack(clip.keyframes, i, def.name);
+            }
             m_effectRowWidgets[i]->setParamHasTrack(def.name, has);
-            m_effectRowWidgets[i]->setParamKeyframeTrack(def.name, clip.keyframes.track(trackName),
+            m_effectRowWidgets[i]->setParamKeyframeTrack(def.name, track,
                                                          clipDurationSeconds, playheadSeconds);
         }
     }
@@ -939,8 +1008,58 @@ void EffectControlsPanel::onEffectKeyframeToggled(int effectIndex, const QString
 {
     if (effectIndex < 0 || effectIndex >= m_effects.size()) return;
 
-    QString trackName = QStringLiteral("effect.%1.%2").arg(effectIndex).arg(paramName);
+    QString trackName = effectTrackName(effectIndex, paramName);
     QString displayName = QStringLiteral("%1: %2").arg(VideoEffect::typeName(m_effects[effectIndex].type)).arg(paramName);
+
+    if (isColorParam(m_effects[effectIndex].type, paramName)) {
+        const ClipInfo *clip = selectedClipForKey(m_timeline, m_currentClipKey);
+        if (!clip) {
+            refreshFromCurrentClip();
+            return;
+        }
+
+        KeyframeManager keyframes = clip->keyframes;
+        if (now) {
+            QColor color = colorParamValue(m_effects[effectIndex], paramName);
+            if (!color.isValid())
+                color = QColor(0, 0, 0);
+
+            const double t = currentClipLocalPlayheadSeconds();
+            for (const QString &channel : colorChannelNames()) {
+                const QString channelTrackName =
+                    effectColorChannelTrackName(effectIndex, paramName, channel);
+                const double value = colorChannelValue(color, channel);
+                KeyframeTrack channelTrack(channelTrackName, value);
+                channelTrack.addKeyframe(t, value);
+                keyframes.addTrack(channelTrack);
+            }
+            m_timeline->setClipEffectsAndKeyframes(m_currentClipKey.trackIdx,
+                                                   m_currentClipKey.clipIdx,
+                                                   m_effects,
+                                                   keyframes);
+        } else {
+            auto result = QMessageBox::question(
+                this,
+                QStringLiteral("Remove Keyframes"),
+                QStringLiteral("Remove all keyframes for %1 RGB?").arg(displayName),
+                QMessageBox::Yes | QMessageBox::No,
+                QMessageBox::No);
+            if (result != QMessageBox::Yes) {
+                refreshFromCurrentClip();
+                return;
+            }
+
+            for (const QString &channel : colorChannelNames()) {
+                keyframes.removeTrack(effectColorChannelTrackName(effectIndex, paramName, channel));
+            }
+            m_timeline->setClipEffectsAndKeyframes(m_currentClipKey.trackIdx,
+                                                   m_currentClipKey.clipIdx,
+                                                   m_effects,
+                                                   keyframes);
+        }
+        refreshFromCurrentClip();
+        return;
+    }
 
     if (now) {
         double value = 0.0;
