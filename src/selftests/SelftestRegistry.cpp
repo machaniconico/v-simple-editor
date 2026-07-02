@@ -76,6 +76,7 @@ int runEffectTimingSelftest();
 int runExposureAidsSelftest();
 int runExportAuditSelftest();
 int runExportRangeSelftest();
+int runFrameExportSelftest();
 int runFcpxmlSelftest();
 int runFrameIoSelftest();
 int runGraphEditorSelftest();
@@ -592,6 +593,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "smart-render",       "VEDITOR_SMART_RENDER_SELFTEST",       runSmartRenderSelftest,        false,
       "Smart Render T4: conservative stream-copy eligibility predicate + env gate" },
     // QApplication-required (needsQApplication=true) ----------------------
+    { "frame-export",      "VEDITOR_FRAME_EXPORT_SELFTEST",        runFrameExportSelftest,        true,
+      "Still-frame export: renderFrameAt SSOT -> PNG/JPEG save engine + PNG pixel-identical reread" },
     { "parity",            "VEDITOR_PARITY_SELFTEST",             runParitySelftest,             true,
       "Preview vs export pixel-parity (S1-S11, framediff::mse, 10-bit HDR10)" },
     { "keyframe-anim-parity", "VEDITOR_KEYFRAME_ANIM_PARITY_SELFTEST", runKeyframeAnimParitySelftest, true,

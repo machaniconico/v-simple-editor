@@ -91,6 +91,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/EasingPresetsSelftest.cpp
     src/selftests/SpatialPathSelftest.cpp
     src/selftests/SmartRenderSelftest.cpp
+    src/selftests/FrameExportSelftest.cpp
 
     # PRD-SPLIT-MAIN-3 Phase 3-A: libavcore-backed selftests (moved from src/main.cpp).
     src/selftests/libavcore_selftests.cpp
@@ -128,6 +129,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/ExportRange.cpp
     src/Exporter.cpp
     src/FrameDiff.cpp
+    src/FrameExport.h
+    src/FrameExport.cpp
     src/TimelineFrameRenderer.cpp
     src/SmartRender.h
     src/SmartRender.cpp

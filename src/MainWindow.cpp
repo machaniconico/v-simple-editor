@@ -10,6 +10,7 @@
 void exporter_setAcesPipeline(const aces::AcesPipeline &pipeline);
 #include "TrimOps.h"
 #include "ExportDialog.h"
+#include "FrameExport.h"
 #include "UndoManager.h"
 #include "OverlayDialogs.h"
 #include "VideoEffectDialogs.h"
@@ -47,6 +48,7 @@ void exporter_setAcesPipeline(const aces::AcesPipeline &pipeline);
 #include "playback/dvxml_flag.h"
 #include "BroadcastCaptionDialog.h"  // CC-4: 放送CC (CEA-608/708) ダイアログ
 #include "ProjectCollectorDialog.h"
+#include "TimelineFrameRenderer.h"
 #include "SequenceSettingsDialog.h"
 #include "HDRSettingsDialog.h"
 #include "AIProcessingDialog.h"
@@ -2156,6 +2158,67 @@ void MainWindow::setupMenuBar()
     connect(exportAction, &QAction::triggered, this, &MainWindow::exportVideo);
     m_menuHelpEntries.append({exportAction,
         QStringLiteral("完成した動画を mp4 などの 1 本の動画ファイルに書き出します。")});
+
+    auto *frameExportAction = fileMenu->addAction(QStringLiteral("現在フレームを書き出し..."));
+    frameExportAction->setObjectName(QStringLiteral("action_frame_export"));
+    frameExportAction->setShortcut(QKeySequence(Qt::CTRL | Qt::ALT | Qt::Key_E));
+    connect(frameExportAction, &QAction::triggered, this, [this]() {
+        if (!m_timeline) {
+            QMessageBox::warning(this, QStringLiteral("現在フレームを書き出し"),
+                                 QStringLiteral("タイムラインがありません。"));
+            return;
+        }
+
+        const qint64 usec = qMax<qint64>(
+            0, qRound64(currentPlayheadSeconds() * 1000000.0));
+        const int width = qMax(1, m_projectConfig.width);
+        const int height = qMax(1, m_projectConfig.height);
+        QImage frame = tlrender::renderFrameAt(m_timeline, usec, QSize(width, height));
+        if (frame.isNull()) {
+            QMessageBox::warning(this, QStringLiteral("現在フレームを書き出し"),
+                                 QStringLiteral("現在位置の合成フレームをレンダリングできませんでした。"));
+            return;
+        }
+        frame = frame.convertToFormat(QImage::Format_RGBA8888);
+
+        const QString picturesDir = QStandardPaths::writableLocation(
+            QStandardPaths::PicturesLocation);
+        const QString baseDir = picturesDir.isEmpty()
+            ? QDir::homePath()
+            : picturesDir;
+        const QString initialPath = QDir(baseDir).filePath(
+            frameexport::defaultFileName(usec, qMax(1, m_projectConfig.fps)));
+
+        QString selectedFilter = QStringLiteral("PNG Image (*.png)");
+        QString path = QFileDialog::getSaveFileName(
+            this,
+            QStringLiteral("現在フレームを書き出し"),
+            initialPath,
+            frameexport::fileDialogFilter(),
+            &selectedFilter);
+        if (path.isEmpty())
+            return;
+
+        const frameexport::ImageFormat selectedFormat =
+            selectedFilter.contains(QStringLiteral("JPEG"), Qt::CaseInsensitive)
+                ? frameexport::ImageFormat::Jpeg
+                : frameexport::ImageFormat::Png;
+        const frameexport::ImageFormat format =
+            frameexport::formatFromPathOrDefault(path, selectedFormat);
+        path = frameexport::ensureExtensionForFormat(path, format);
+
+        QString error;
+        if (!frameexport::saveFrameImage(frame, path, format, &error)) {
+            QMessageBox::warning(this, QStringLiteral("現在フレームを書き出し"),
+                                 QStringLiteral("保存に失敗しました:\n%1").arg(error));
+            return;
+        }
+
+        statusBar()->showMessage(
+            QStringLiteral("現在フレームを書き出しました: %1").arg(path), 5000);
+    });
+    m_menuHelpEntries.append({frameExportAction,
+        QStringLiteral("再生ヘッド位置の合成済みフレームを PNG / JPEG の静止画として保存します。")});
 
     auto *remotionAction = fileMenu->addAction("Remotion形式でエクスポート(&R)...");
     connect(remotionAction, &QAction::triggered, this, &MainWindow::exportToRemotion);
