@@ -396,6 +396,432 @@ QString findFfmpegBinary()
     return QStandardPaths::findExecutable(QStringLiteral("ffmpeg"), searchPaths);
 }
 
+QString ffmpegNumber(double value)
+{
+    if (!std::isfinite(value))
+        value = 0.0;
+    return QString::number(value, 'f', 6);
+}
+
+double dbToLinear(double db)
+{
+    return std::pow(10.0, db / 20.0);
+}
+
+double evaluateAudioGainAt(const QVector<AudioGainPoint> &env,
+                           double timeSeconds,
+                           double fallbackGain)
+{
+    if (env.isEmpty())
+        return fallbackGain;
+    if (timeSeconds <= env.first().time)
+        return env.first().gain;
+    if (timeSeconds >= env.last().time)
+        return env.last().gain;
+    for (int i = 0; i + 1 < env.size(); ++i) {
+        const double aT = env[i].time;
+        const double bT = env[i + 1].time;
+        if (timeSeconds >= aT && timeSeconds <= bT) {
+            const double span = bT - aT;
+            if (span <= 0.0)
+                return env[i + 1].gain;
+            const double u = (timeSeconds - aT) / span;
+            return env[i].gain + (env[i + 1].gain - env[i].gain) * u;
+        }
+    }
+    return fallbackGain;
+}
+
+QVector<AudioGainPoint> sortedDedupedEnvelope(QVector<AudioGainPoint> env)
+{
+    std::sort(env.begin(), env.end(),
+              [](const AudioGainPoint &a, const AudioGainPoint &b) {
+                  return a.time < b.time;
+              });
+    QVector<AudioGainPoint> out;
+    out.reserve(env.size());
+    for (const AudioGainPoint &point : env) {
+        AudioGainPoint p;
+        p.time = qMax(0.0, point.time);
+        p.gain = qBound(0.0, point.gain, 2.0);
+        if (!out.isEmpty() && std::abs(out.last().time - p.time) <= 0.001) {
+            out.last().gain = qMin(out.last().gain, p.gain);
+        } else {
+            out.append(p);
+        }
+    }
+    return out;
+}
+
+bool envelopesNearlyEqual(const QVector<AudioGainPoint> &a,
+                          const QVector<AudioGainPoint> &b)
+{
+    if (a.size() != b.size())
+        return false;
+    for (int i = 0; i < a.size(); ++i) {
+        if (std::abs(a[i].time - b[i].time) > 0.001)
+            return false;
+        if (std::abs(a[i].gain - b[i].gain) > 0.0001)
+            return false;
+    }
+    return true;
+}
+
+struct DuckingRange {
+    double start = 0.0;
+    double end = 0.0;
+};
+
+QVector<DuckingRange> collectVoiceRanges(TimelineTrack *track,
+                                         double thresholdLinear)
+{
+    QVector<DuckingRange> ranges;
+    if (!track)
+        return ranges;
+
+    double cursor = 0.0;
+    for (const ClipInfo &clip : track->clips()) {
+        cursor += qMax(0.0, clip.leadInSec);
+        const double duration = clip.effectiveDuration();
+        if (duration > 0.0 && clip.volume > thresholdLinear)
+            ranges.append({cursor, cursor + duration});
+        cursor += duration;
+    }
+    return ranges;
+}
+
+double duckingActivityAt(const QVector<DuckingRange> &voiceRanges,
+                         double timelineSeconds,
+                         double attackSeconds,
+                         double releaseSeconds)
+{
+    double activity = 0.0;
+    for (const DuckingRange &range : voiceRanges) {
+        if (timelineSeconds >= range.start && timelineSeconds <= range.end) {
+            activity = 1.0;
+        } else if (attackSeconds > 0.0
+                   && timelineSeconds >= range.start - attackSeconds
+                   && timelineSeconds < range.start) {
+            const double u = (timelineSeconds - (range.start - attackSeconds))
+                             / attackSeconds;
+            activity = qMax(activity, qBound(0.0, u, 1.0));
+        } else if (releaseSeconds > 0.0
+                   && timelineSeconds > range.end
+                   && timelineSeconds <= range.end + releaseSeconds) {
+            const double u = 1.0 - (timelineSeconds - range.end)
+                                   / releaseSeconds;
+            activity = qMax(activity, qBound(0.0, u, 1.0));
+        }
+    }
+    return qBound(0.0, activity, 1.0);
+}
+
+QVector<AudioGainPoint> buildDuckingEnvelopeForClip(const ClipInfo &clip,
+                                                    double clipTimelineStart,
+                                                    const QVector<DuckingRange> &voiceRanges,
+                                                    const DuckingParams &params,
+                                                    double keyframeIntervalSeconds)
+{
+    QVector<AudioGainPoint> env;
+    const double duration = clip.effectiveDuration();
+    if (duration <= 0.0)
+        return env;
+
+    keyframeIntervalSeconds = qMax(0.010, keyframeIntervalSeconds);
+    const double attackSeconds = qMax(0.0, params.attackMs / 1000.0);
+    const double releaseSeconds = qMax(0.0, params.releaseMs / 1000.0);
+    const double duckDb = qMin(0.0, params.targetReductionDb);
+    const double baseGain = qBound(0.0, clip.volume, 2.0);
+    bool hasDucking = false;
+
+    auto appendAt = [&](double localSeconds) {
+        localSeconds = qBound(0.0, localSeconds, duration);
+        const double activity = duckingActivityAt(voiceRanges,
+                                                  clipTimelineStart + localSeconds,
+                                                  attackSeconds,
+                                                  releaseSeconds);
+        if (activity > 0.000001)
+            hasDucking = true;
+        const double gain = baseGain * dbToLinear(duckDb * activity);
+        env.append({localSeconds, qBound(0.0, gain, 2.0)});
+    };
+
+    for (double t = 0.0; t < duration; t += keyframeIntervalSeconds)
+        appendAt(t);
+    if (env.isEmpty() || std::abs(env.last().time - duration) > 0.001)
+        appendAt(duration);
+
+    if (!hasDucking)
+        env.clear();
+    return sortedDedupedEnvelope(env);
+}
+
+QVector<AudioGainPoint> mergeDuckingEnvelope(const QVector<AudioGainPoint> &existing,
+                                             const QVector<AudioGainPoint> &ducking,
+                                             double fallbackGain)
+{
+    if (ducking.isEmpty())
+        return existing;
+    if (existing.isEmpty())
+        return ducking;
+
+    QVector<AudioGainPoint> merged = existing;
+    merged.reserve(existing.size() + ducking.size());
+    for (const AudioGainPoint &point : ducking) {
+        const double existingGain = evaluateAudioGainAt(existing,
+                                                        point.time,
+                                                        fallbackGain);
+        merged.append({point.time, qMin(existingGain, point.gain)});
+    }
+    return sortedDedupedEnvelope(merged);
+}
+
+bool applyDuckingToTimeline(Timeline *timeline,
+                            int voiceTrackIndex,
+                            const QSet<int> &targetTrackIndexes,
+                            const DuckingParams &params,
+                            QString *message)
+{
+    if (!timeline)
+        return false;
+    const auto &tracks = timeline->audioTracks();
+    if (voiceTrackIndex < 0 || voiceTrackIndex >= tracks.size())
+        return false;
+
+    const double thresholdLinear = dbToLinear(params.thresholdDb);
+    const QVector<DuckingRange> voiceRanges =
+        collectVoiceRanges(tracks[voiceTrackIndex], thresholdLinear);
+    if (voiceRanges.isEmpty()) {
+        if (message)
+            *message = QStringLiteral("閾値を超える voice クリップがありません。");
+        return false;
+    }
+
+    bool anyChanged = false;
+    int changedClips = 0;
+    constexpr double kDuckingKeyframeIntervalSeconds = 0.050;
+
+    for (int trackIndex = 0; trackIndex < tracks.size(); ++trackIndex) {
+        if (trackIndex == voiceTrackIndex || !targetTrackIndexes.contains(trackIndex))
+            continue;
+        TimelineTrack *track = tracks[trackIndex];
+        if (!track)
+            continue;
+
+        QVector<ClipInfo> clips = track->clips();
+        bool trackChanged = false;
+        double cursor = 0.0;
+        for (ClipInfo &clip : clips) {
+            cursor += qMax(0.0, clip.leadInSec);
+            const double clipStart = cursor;
+            const double clipDuration = clip.effectiveDuration();
+            QVector<AudioGainPoint> ducking = buildDuckingEnvelopeForClip(
+                clip,
+                clipStart,
+                voiceRanges,
+                params,
+                kDuckingKeyframeIntervalSeconds);
+            if (!ducking.isEmpty()) {
+                QVector<AudioGainPoint> merged = mergeDuckingEnvelope(
+                    clip.volumeEnvelope,
+                    ducking,
+                    clip.volume);
+                if (!envelopesNearlyEqual(clip.volumeEnvelope, merged)) {
+                    clip.volumeEnvelope = merged;
+                    trackChanged = true;
+                    anyChanged = true;
+                    ++changedClips;
+                }
+            }
+            cursor += clipDuration;
+        }
+
+        if (trackChanged)
+            track->setClips(clips);
+    }
+
+    if (!anyChanged) {
+        if (message)
+            *message = QStringLiteral("対象トラックに重なる BGM クリップがありません。");
+        return false;
+    }
+
+    timeline->undoManager()->saveState(
+        timeline->currentState(),
+        QStringLiteral("Auto ducking"));
+    timeline->refreshPlaybackSequence();
+    timeline->repaintAudioTracks();
+    if (message) {
+        *message = QStringLiteral("%1 個の BGM クリップへダッキングを適用しました。")
+            .arg(changedClips);
+    }
+    return true;
+}
+
+bool timelineHasVolumeEnvelope(Timeline *timeline)
+{
+    if (!timeline)
+        return false;
+    for (TimelineTrack *track : timeline->audioTracks()) {
+        if (!track)
+            continue;
+        for (const ClipInfo &clip : track->clips()) {
+            if (!clip.volumeEnvelope.isEmpty())
+                return true;
+        }
+    }
+    return false;
+}
+
+QString volumeExpressionForEntry(const PlaybackEntry &entry)
+{
+    QVector<AudioGainPoint> env = sortedDedupedEnvelope(entry.volumeEnvelope);
+    if (env.isEmpty())
+        return ffmpegNumber(qBound(0.0, entry.volume, 2.0));
+
+    auto linearExpr = [](const AudioGainPoint &a,
+                         const AudioGainPoint &b) {
+        const double span = b.time - a.time;
+        if (span <= 0.000001)
+            return ffmpegNumber(b.gain);
+        return QStringLiteral("(%1+(%2-%1)*(t-%3)/%4)")
+            .arg(ffmpegNumber(a.gain),
+                 ffmpegNumber(b.gain),
+                 ffmpegNumber(a.time),
+                 ffmpegNumber(span));
+    };
+
+    QString expr = ffmpegNumber(env.last().gain);
+    for (int i = env.size() - 2; i >= 0; --i) {
+        const QString segment = linearExpr(env[i], env[i + 1]);
+        expr = QStringLiteral("if(lt(t,%1),%2,%3)")
+            .arg(ffmpegNumber(env[i + 1].time), segment, expr);
+    }
+    expr = QStringLiteral("if(lt(t,%1),%2,%3)")
+        .arg(ffmpegNumber(env.first().time),
+             ffmpegNumber(env.first().gain),
+             expr);
+    return expr;
+}
+
+QString nextExportAudioMixPath()
+{
+    static int serial = 0;
+    const QString dirPath = QDir::tempPath()
+        + QStringLiteral("/v-simple-editor-audio-mix");
+    QDir().mkpath(dirPath);
+    return dirPath
+        + QStringLiteral("/ducking_mix_%1_%2.m4a")
+              .arg(QDateTime::currentMSecsSinceEpoch())
+              .arg(++serial);
+}
+
+bool runFfmpegForAudioMix(const QStringList &args, QString *error)
+{
+    const QString ffmpeg = findFfmpegBinary();
+    if (ffmpeg.isEmpty()) {
+        if (error)
+            *error = QStringLiteral("ffmpeg が見つからないため、ダッキング済み audio mix を作成できません。");
+        return false;
+    }
+
+    QProcess process;
+    process.start(ffmpeg, args);
+    if (!process.waitForStarted(5000)) {
+        if (error)
+            *error = QStringLiteral("ffmpeg を起動できませんでした。");
+        return false;
+    }
+    process.waitForFinished(-1);
+    if (process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
+        if (error) {
+            *error = QStringLiteral("audio mix の作成に失敗しました。\n%1")
+                .arg(QString::fromUtf8(process.readAllStandardError()));
+        }
+        return false;
+    }
+    return true;
+}
+
+QString prepareTimelineAudioMixForExport(Timeline *timeline, QString *error)
+{
+    if (!timelineHasVolumeEnvelope(timeline))
+        return {};
+
+    const QVector<PlaybackEntry> entries = timeline->computeAudioPlaybackSequence();
+    const double durationSeconds = qMax(0.001, timeline->totalDuration());
+    const QString outputPath = nextExportAudioMixPath();
+
+    QStringList args;
+    args << QStringLiteral("-y");
+
+    QVector<PlaybackEntry> validEntries;
+    validEntries.reserve(entries.size());
+    for (const PlaybackEntry &entry : entries) {
+        if (entry.audioMuted)
+            continue;
+        if (entry.timelineEnd <= entry.timelineStart)
+            continue;
+        if (entry.clipOut <= entry.clipIn)
+            continue;
+        if (!QFileInfo::exists(entry.filePath))
+            continue;
+        validEntries.append(entry);
+        args << QStringLiteral("-i") << entry.filePath;
+    }
+
+    if (validEntries.isEmpty()) {
+        args << QStringLiteral("-f") << QStringLiteral("lavfi")
+             << QStringLiteral("-i")
+             << QStringLiteral("anullsrc=channel_layout=stereo:sample_rate=48000")
+             << QStringLiteral("-t") << ffmpegNumber(durationSeconds)
+             << QStringLiteral("-vn")
+             << QStringLiteral("-c:a") << QStringLiteral("aac")
+             << QStringLiteral("-b:a") << QStringLiteral("192k")
+             << QStringLiteral("-movflags") << QStringLiteral("+faststart")
+             << outputPath;
+        return runFfmpegForAudioMix(args, error) ? outputPath : QString();
+    }
+
+    QStringList chains;
+    QStringList mixInputs;
+    for (int i = 0; i < validEntries.size(); ++i) {
+        const PlaybackEntry &entry = validEntries[i];
+        const int delayMs = qMax(0, qRound(entry.timelineStart * 1000.0));
+        QString chain = QStringLiteral("[%1:a]"
+                                       "atrim=start=%2:end=%3,"
+                                       "asetpts=PTS-STARTPTS,"
+                                       "aresample=48000,"
+                                       "aformat=sample_fmts=fltp:channel_layouts=stereo,"
+                                       "volume='%4':eval=frame")
+            .arg(i)
+            .arg(ffmpegNumber(entry.clipIn),
+                 ffmpegNumber(entry.clipOut),
+                 volumeExpressionForEntry(entry));
+        if (delayMs > 0)
+            chain += QStringLiteral(",adelay=%1:all=1").arg(delayMs);
+        chain += QStringLiteral("[a%1]").arg(i);
+        chains << chain;
+        mixInputs << QStringLiteral("[a%1]").arg(i);
+    }
+
+    chains << QStringLiteral("%1amix=inputs=%2:normalize=0:duration=longest,"
+                             "atrim=duration=%3,"
+                             "asetpts=PTS-STARTPTS[aout]")
+        .arg(mixInputs.join(QString()), QString::number(validEntries.size()),
+             ffmpegNumber(durationSeconds));
+
+    args << QStringLiteral("-filter_complex") << chains.join(QStringLiteral(";"))
+         << QStringLiteral("-map") << QStringLiteral("[aout]")
+         << QStringLiteral("-vn")
+         << QStringLiteral("-c:a") << QStringLiteral("aac")
+         << QStringLiteral("-b:a") << QStringLiteral("192k")
+         << QStringLiteral("-movflags") << QStringLiteral("+faststart")
+         << outputPath;
+
+    return runFfmpegForAudioMix(args, error) ? outputPath : QString();
+}
+
 QGroupBox *findVfxGroup(VfxControlsPanel *panel, const QString &title)
 {
     if (!panel)
@@ -2461,35 +2887,28 @@ void MainWindow::setupMenuBar()
             const int ti = i;
             connect(act, &QAction::triggered, this, [this, ti]() {
                 if (!m_timeline) return;
-                auto *mixer = m_player ? m_player->audioMixer() : nullptr;
-                if (mixer) {
-                    const auto &ad = mixer->autoDuckParams();
-                    const double duckGain = std::pow(10.0, ad.thresholdDb / 20.0);
-                    const double attackSec = ad.attackMs / 1000.0;
-                    const double releaseSec = ad.releaseMs / 1000.0;
-                    m_timeline->applyDuckingFromTrack(ti, duckGain, attackSec, releaseSec);
-                } else {
-                    m_timeline->applyDuckingFromTrack(ti);
+                QSet<int> targets;
+                for (int track = 0; track < m_timeline->audioTrackCount(); ++track) {
+                    if (track != ti)
+                        targets.insert(track);
                 }
-                statusBar()->showMessage(
-                    QString("A%1 を voice 扱いして他オーディオトラックをダッキングしました").arg(ti + 1),
-                    4000);
+                QString message;
+                if (applyDuckingToTimeline(m_timeline, ti, targets,
+                                           m_duckingParams, &message)) {
+                    m_duckingEnabled = true;
+                    statusBar()->showMessage(message, 4000);
+                } else if (!message.isEmpty()) {
+                    statusBar()->showMessage(message, 4000);
+                }
             });
         }
     });
 
-    auto *duckSettingsAction = audioMenu->addAction("オートダック設定 (AudioMixer)...");
-    duckSettingsAction->setObjectName("action_auto_duck_mixer");
-    connect(duckSettingsAction, &QAction::triggered, this, &MainWindow::openAutoDuckSettings);
-    m_menuHelpEntries.append({duckSettingsAction,
-        QStringLiteral("ナレーションが入っている間だけ BGM を自動で小さくする「自動ダッキング」の細かい設定です。")});
-
-    // US-HW-10: project-level sidechain ducking parameters (AudioDuckingDialog).
-    auto *duckingSettingsAction = audioMenu->addAction("オーディオダッキング設定 (プロジェクト)...");
+    auto *duckingSettingsAction = audioMenu->addAction("自動ダッキングを適用...");
     duckingSettingsAction->setObjectName("action_audio_ducking_settings");
     connect(duckingSettingsAction, &QAction::triggered, this, &MainWindow::onAudioDuckingSettings);
     m_menuHelpEntries.append({duckingSettingsAction,
-        QStringLiteral("サイドチェイン音声に応じて BGM を自動で下げるダッキング設定を編集する。")});
+        QStringLiteral("対象トラック、閾値、attack/release、duck量を指定して、BGM クリップのボリュームエンベロープへ自動ダッキングを適用します。")});
 
     audioMenu->addSeparator();
 
@@ -5778,12 +6197,22 @@ void MainWindow::exportVideo()
 
     RenderJob job;
     job.name = QFileInfo(exportCfg.outputPath).fileName();
+    QString audioMixError;
+    const QString preparedAudioMixPath =
+        prepareTimelineAudioMixForExport(m_timeline, &audioMixError);
+    if (!audioMixError.isEmpty()) {
+        QMessageBox::warning(this, QStringLiteral("Export"),
+                             audioMixError);
+        return;
+    }
     // projectFilePath doubles as RenderQueue's audio-mux source. When a saved
     // project path exists use it; the in-memory timeline seam below carries
     // the actual edit graph (LUT/mask/tracking are NOT serialized), and
     // RenderQueue falls back to the V1 clip's source file for audio when this
     // is a .veditor / empty path (RenderQueue.cpp:551-563).
-    job.projectFilePath = m_projectFilePath;
+    job.projectFilePath = preparedAudioMixPath.isEmpty()
+        ? m_projectFilePath
+        : preparedAudioMixPath;
     job.outputPath = exportCfg.outputPath;
     job.width   = exportCfg.width  > 0 ? exportCfg.width  : 1920;
     job.height  = exportCfg.height > 0 ? exportCfg.height : 1080;
@@ -9646,23 +10075,146 @@ void MainWindow::onSceneCutDetect()
     }
 }
 
-// US-HW-10: Sprint 9 — sidechain ducking dialog entry.
-//
-// Opens AudioDuckingDialog seeded with the project's persisted m_duckingParams.
-// On Accept, copies dialog state into the project members; persistence happens
-// the next time the project is saved through populateProjectData → ProjectFile.
 void MainWindow::onAudioDuckingSettings()
 {
-    AudioDuckingDialog dlg(m_duckingParams, this);
-    if (dlg.exec() != QDialog::Accepted)
+    if (!m_timeline || m_timeline->audioTrackCount() < 2) {
+        QMessageBox::information(this,
+                                 QStringLiteral("自動ダッキング"),
+                                 QStringLiteral("voice と BGM 用にオーディオトラックを 2 本以上用意してください。"));
         return;
-    m_duckingParams  = dlg.params();
-    m_duckingEnabled = dlg.duckingEnabled();
-    statusBar()->showMessage(
-        m_duckingEnabled
-            ? QStringLiteral("オーディオダッキング設定を更新しました (有効)")
-            : QStringLiteral("オーディオダッキング設定を更新しました (無効)"),
-        4000);
+    }
+
+    QDialog dialog(this);
+    dialog.setWindowTitle(QStringLiteral("自動ダッキングを適用"));
+    auto *layout = new QVBoxLayout(&dialog);
+    auto *form = new QFormLayout();
+    layout->addLayout(form);
+
+    auto *voiceCombo = new QComboBox(&dialog);
+    const int audioTrackCount = m_timeline->audioTrackCount();
+    for (int i = 0; i < audioTrackCount; ++i)
+        voiceCombo->addItem(QStringLiteral("A%1").arg(i + 1), i);
+    form->addRow(QStringLiteral("voice トラック:"), voiceCombo);
+
+    auto *targetWidget = new QWidget(&dialog);
+    auto *targetLayout = new QVBoxLayout(targetWidget);
+    targetLayout->setContentsMargins(0, 0, 0, 0);
+    QVector<QCheckBox *> targetChecks;
+    targetChecks.reserve(audioTrackCount);
+    for (int i = 0; i < audioTrackCount; ++i) {
+        auto *check = new QCheckBox(QStringLiteral("A%1").arg(i + 1), targetWidget);
+        check->setChecked(i != 0);
+        targetLayout->addWidget(check);
+        targetChecks.append(check);
+    }
+    form->addRow(QStringLiteral("BGM 対象:"), targetWidget);
+
+    auto makeSpin = [&dialog](double min, double max, double value,
+                              int decimals, const QString &suffix) {
+        auto *spin = new QDoubleSpinBox(&dialog);
+        spin->setRange(min, max);
+        spin->setDecimals(decimals);
+        spin->setSingleStep(decimals == 0 ? 10.0 : 1.0);
+        spin->setSuffix(suffix);
+        spin->setValue(value);
+        return spin;
+    };
+
+    auto *thresholdSpin = makeSpin(-60.0, 0.0, m_duckingParams.thresholdDb,
+                                   1, QStringLiteral(" dB"));
+    auto *attackSpin = makeSpin(0.0, 5000.0, m_duckingParams.attackMs,
+                                1, QStringLiteral(" ms"));
+    auto *releaseSpin = makeSpin(1.0, 10000.0, m_duckingParams.releaseMs,
+                                 0, QStringLiteral(" ms"));
+    auto *duckSpin = makeSpin(-40.0, 0.0, m_duckingParams.targetReductionDb,
+                              1, QStringLiteral(" dB"));
+    form->addRow(QStringLiteral("閾値:"), thresholdSpin);
+    form->addRow(QStringLiteral("Attack:"), attackSpin);
+    form->addRow(QStringLiteral("Release:"), releaseSpin);
+    form->addRow(QStringLiteral("Duck 量:"), duckSpin);
+
+    auto *preview = new QLabel(&dialog);
+    preview->setWordWrap(true);
+    preview->setFrameShape(QFrame::StyledPanel);
+    preview->setMinimumHeight(72);
+    layout->addWidget(preview);
+
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel,
+                                         &dialog);
+    buttons->button(QDialogButtonBox::Ok)->setText(QStringLiteral("適用"));
+    layout->addWidget(buttons);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+
+    auto updatePreview = [&]() {
+        const int voiceTrack = voiceCombo->currentData().toInt();
+        QStringList targets;
+        for (int i = 0; i < targetChecks.size(); ++i) {
+            const bool isVoice = i == voiceTrack;
+            targetChecks[i]->setEnabled(!isVoice);
+            if (isVoice)
+                targetChecks[i]->setChecked(false);
+            if (!isVoice && targetChecks[i]->isChecked())
+                targets << QStringLiteral("A%1").arg(i + 1);
+        }
+
+        buttons->button(QDialogButtonBox::Ok)->setEnabled(!targets.isEmpty());
+        preview->setText(QStringLiteral(
+            "Preview: A%1 を voice として検出し、%2 に %3 dB のゲインエンベロープを "
+            "%4 ms attack / %5 ms release で書き込みます。export は同じエンベロープを含む audio mix を使用します。")
+            .arg(voiceTrack + 1)
+            .arg(targets.isEmpty() ? QStringLiteral("(対象なし)") : targets.join(QStringLiteral(", ")))
+            .arg(duckSpin->value(), 0, 'f', 1)
+            .arg(attackSpin->value(), 0, 'f', 1)
+            .arg(releaseSpin->value(), 0, 'f', 0));
+    };
+
+    connect(voiceCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            &dialog, [&]() {
+                const int voiceTrack = voiceCombo->currentData().toInt();
+                for (int i = 0; i < targetChecks.size(); ++i)
+                    targetChecks[i]->setChecked(i != voiceTrack);
+                updatePreview();
+            });
+    for (auto *check : targetChecks)
+        connect(check, &QCheckBox::toggled, &dialog, updatePreview);
+    connect(thresholdSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+            &dialog, updatePreview);
+    connect(attackSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+            &dialog, updatePreview);
+    connect(releaseSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+            &dialog, updatePreview);
+    connect(duckSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+            &dialog, updatePreview);
+    updatePreview();
+
+    if (dialog.exec() != QDialog::Accepted)
+        return;
+
+    m_duckingParams.thresholdDb = thresholdSpin->value();
+    m_duckingParams.attackMs = attackSpin->value();
+    m_duckingParams.releaseMs = releaseSpin->value();
+    m_duckingParams.targetReductionDb = duckSpin->value();
+
+    const int voiceTrack = voiceCombo->currentData().toInt();
+    QSet<int> targets;
+    for (int i = 0; i < targetChecks.size(); ++i) {
+        if (i != voiceTrack && targetChecks[i]->isChecked())
+            targets.insert(i);
+    }
+
+    QString message;
+    if (applyDuckingToTimeline(m_timeline, voiceTrack, targets,
+                               m_duckingParams, &message)) {
+        m_duckingEnabled = true;
+        statusBar()->showMessage(message, 5000);
+    } else {
+        QMessageBox::information(this,
+                                 QStringLiteral("自動ダッキング"),
+                                 message.isEmpty()
+                                     ? QStringLiteral("ダッキングを適用できませんでした。")
+                                     : message);
+    }
 }
 
 // US-HW-10: Sprint 9 — Collect Files entry.

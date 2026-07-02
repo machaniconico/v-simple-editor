@@ -95,6 +95,35 @@ double lastTimeAtOrBelow(const std::vector<audio::autoducking::GainKeyframe> &ke
     return last;
 }
 
+bool sameKeyframes(const std::vector<audio::autoducking::GainKeyframe> &a,
+                   const std::vector<audio::autoducking::GainKeyframe> &b)
+{
+    if (a.size() != b.size())
+        return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (std::abs(a[i].timeSeconds - b[i].timeSeconds) > 0.000001)
+            return false;
+        if (std::abs(a[i].gainDb - b[i].gainDb) > 0.000001)
+            return false;
+    }
+    return true;
+}
+
+struct FakeBgmClip {
+    std::vector<audio::autoducking::GainKeyframe> volumeEnvelope;
+};
+
+bool applyDuckingAsOneUndo(FakeBgmClip &clip,
+                           const std::vector<audio::autoducking::GainKeyframe> &keyframes,
+                           std::vector<FakeBgmClip> &undoStack)
+{
+    if (keyframes.empty())
+        return false;
+    undoStack.push_back(clip);
+    clip.volumeEnvelope = keyframes;
+    return true;
+}
+
 } // namespace
 
 int runAutoDuckingSelftest()
@@ -175,6 +204,47 @@ int runAutoDuckingSelftest()
     requireGate(voice == originalVoice && bgm == originalBgm,
                 "G10 non-destructive buffers",
                 "VO or BGM source samples were modified",
+                passed,
+                failed);
+
+    const std::size_t intervalFrames = static_cast<std::size_t>(
+        std::max(1.0, std::round(config.keyframeIntervalSeconds * config.sampleRate)));
+    const std::size_t maxExpectedKeyframes = frameCount / intervalFrames + 2;
+    requireGate(result.bgmGainKeyframes.size() <= maxExpectedKeyframes,
+                "G11 keyframes are interval-decimated",
+                "BGM curve kept per-sample keyframes instead of interval-spaced GainKeyframes",
+                passed,
+                failed);
+
+    FakeBgmClip clip;
+    const FakeBgmClip beforeApply = clip;
+    std::vector<FakeBgmClip> undoStack;
+    const bool applied = applyDuckingAsOneUndo(clip, result.bgmGainKeyframes, undoStack);
+    requireGate(applied && undoStack.size() == 1,
+                "G12 apply records one undo snapshot",
+                "expected one logical undo snapshot for one ducking apply operation",
+                passed,
+                failed);
+    if (!undoStack.empty())
+        clip = undoStack.back();
+    requireGate(sameKeyframes(clip.volumeEnvelope, beforeApply.volumeEnvelope),
+                "G13 one undo restores pre-apply envelope",
+                "expected one undo restore to remove the applied BGM envelope",
+                passed,
+                failed);
+
+    std::vector<float> silentVoice(frameCount, 0.0f);
+    const std::vector<float> silentVoiceOriginal = silentVoice;
+    const std::vector<float> silentBgmOriginal = bgm;
+    const AutoDuckingResult unused = generateDuckingGainCurve(silentVoice, 1, bgm, 2, config);
+    requireGate(unused.bgmGainKeyframes.empty(),
+                "G14 unused path stores no unity keyframes",
+                "silent sidechain should not create no-op BGM envelope data",
+                passed,
+                failed);
+    requireGate(silentVoice == silentVoiceOriginal && bgm == silentBgmOriginal,
+                "G15 unused path is byte-identical",
+                "silent-sidechain analysis changed input buffers",
                 passed,
                 failed);
 

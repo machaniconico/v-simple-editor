@@ -78,6 +78,14 @@ double envelopeValueAt(const std::vector<EnvelopePoint> &envelope,
     return clamp01(prev.value + (next.value - prev.value) * t);
 }
 
+bool allUnityGain(const std::vector<GainKeyframe> &keyframes)
+{
+    return std::all_of(keyframes.begin(), keyframes.end(),
+                       [](const GainKeyframe &keyframe) {
+                           return std::abs(keyframe.gainDb) <= 1.0e-9;
+                       });
+}
+
 } // namespace
 
 std::vector<EnvelopePoint> detectVoiceEnvelope(const float *interleavedVoice,
@@ -126,6 +134,9 @@ std::vector<GainKeyframe> buildBgmGainKeyframes(const std::vector<EnvelopePoint>
     const double durationSeconds = static_cast<double>(bgmFrameCount) / config.sampleRate;
     if (keyframes.empty() || keyframes.back().timeSeconds < durationSeconds)
         addKeyframe(bgmFrameCount - 1, durationSeconds);
+
+    if (allUnityGain(keyframes))
+        keyframes.clear();
 
     return keyframes;
 }
