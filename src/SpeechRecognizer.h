@@ -6,11 +6,19 @@
 
 namespace speech {
 
+struct Word {
+    qint64 startMs = 0;
+    qint64 endMs = 0;
+    QString text;
+    double confidence = 1.0;
+};
+
 struct Segment {
     qint64 startMs = 0;
     qint64 endMs = 0;
     QString text;
     double confidence = 1.0;
+    QList<Word> words; // optional per-word timing (empty = segment-level only)
 };
 
 struct RecognizeParams {

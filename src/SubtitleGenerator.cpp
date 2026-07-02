@@ -1,4 +1,5 @@
 #include "SubtitleGenerator.h"
+#include "WhisperTranscriber.h"
 
 #include <QDir>
 #include <QFile>
@@ -223,14 +224,16 @@ void SubtitleGenerator::runWhisper(const QString &audioPath, const WhisperConfig
         return;
     }
 
-    bool isWhisperCpp = whisperBin.contains("main") || whisperBin.contains("whisper-cpp");
+    bool isWhisperCpp = whisperBin.contains("main")
+        || whisperBin.contains("whisper-cpp")
+        || whisperBin.contains("whisper-cli");
 
     QStringList args;
     if (isWhisperCpp) {
         // whisper.cpp main binary
         args << "-f" << audioPath;
         args << "--output-json";
-        if (config.wordTimestamps)
+        if (config.wordTimestamps || whisperBin.contains("whisper-cli"))
             args << "--output-json-full";
         args << "-of" << (m_tempDir + "/result");
         if (!config.modelPath.isEmpty())
@@ -315,6 +318,10 @@ QString SubtitleGenerator::findWhisperBinary()
     if (!mainPath.isEmpty())
         return mainPath;
 
+    mainPath = QStandardPaths::findExecutable("whisper-cli");
+    if (!mainPath.isEmpty())
+        return mainPath;
+
     mainPath = QStandardPaths::findExecutable("main", {"/usr/local/bin", "/opt/homebrew/bin"});
     if (!mainPath.isEmpty()) {
         // Verify it's actually whisper.cpp by checking --help
@@ -340,7 +347,9 @@ QStringList SubtitleGenerator::availableModels()
     if (whisperBin.isEmpty())
         return models;
 
-    bool isWhisperCpp = whisperBin.contains("main") || whisperBin.contains("whisper-cpp");
+    bool isWhisperCpp = whisperBin.contains("main")
+        || whisperBin.contains("whisper-cpp")
+        || whisperBin.contains("whisper-cli");
 
     if (!isWhisperCpp) {
         // openai-whisper standard model names
@@ -391,10 +400,31 @@ QVector<SubtitleSegment> SubtitleGenerator::parseWhisperOutput(const QString &js
         return segments;
 
     QJsonObject root = doc.object();
+    if (!root.value(QStringLiteral("segments")).isArray()
+        && root.value(QStringLiteral("transcription")).isArray()) {
+        QString lang;
+        QString error;
+        const QList<speech::Segment> speechSegments =
+            whisper::WhisperTranscriber::parseWhisperJsonSegments(doc.toJson(QJsonDocument::Compact), &lang, &error);
+        if (error.isEmpty())
+            return whisper::WhisperTranscriber::toSubtitleSegments(speechSegments, lang);
+    }
 
     // Both openai-whisper and whisper.cpp use "segments" array
     QJsonArray segs = root["segments"].toArray();
     QString lang = root["language"].toString();
+    for (const QJsonValue &val : segs) {
+        const QJsonObject obj = val.toObject();
+        if (obj.value(QStringLiteral("tokens")).isArray()) {
+            QString detectedLang = lang;
+            QString error;
+            const QList<speech::Segment> speechSegments =
+                whisper::WhisperTranscriber::parseWhisperJsonSegments(doc.toJson(QJsonDocument::Compact), &detectedLang, &error);
+            if (error.isEmpty())
+                return whisper::WhisperTranscriber::toSubtitleSegments(speechSegments, detectedLang);
+            break;
+        }
+    }
 
     for (const auto &val : segs) {
         QJsonObject obj = val.toObject();

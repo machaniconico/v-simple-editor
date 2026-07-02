@@ -162,6 +162,7 @@ int runVimeoSelftest();
 int runWatermarkSelftest();
 int runWbEyedropperSelftest();
 int runWhisperTranscribeSelftest();
+int runWhisperWordTimingSelftest();
 int runWorkflowSelftest();
 int runWorkspaceSelftest();
 int runXUploadSelftest();
@@ -655,6 +656,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Caption/subtitle module smoke (SRT/VTT parse, burn-in, track model)" },
     { "whisper-transcribe", "VEDITOR_WHISPER_TRANSCRIBE_SELFTEST", runWhisperTranscribeSelftest,  true,
       "Whisper transcription service scaffold smoke" },
+    { "whisper-word-timing", "VEDITOR_WHISPER_WORD_TIMING_SELFTEST", runWhisperWordTimingSelftest, false,
+      "Whisper word-level timestamps: JSON full parse -> speech::Word -> SubtitleWord monotonic/boundary gates" },
     { "transcript-highlighter", "VEDITOR_TRANSCRIPT_HIGHLIGHTER_SELFTEST", runTranscriptHighlighterSelftest, true,
       "Transcript highlighter scaffold smoke" },
     { "auto-clip-gen",     "VEDITOR_AUTO_CLIP_GEN_SELFTEST",      runAutoClipGenSelftest,        true,
