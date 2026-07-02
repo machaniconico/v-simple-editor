@@ -3,15 +3,20 @@
 #include "EffectKeyframeToggle.h"
 #include "EffectRowWidget.h"
 #include "EffectParamSchema.h"
+#include "EffectPreset.h"
 #include "Keyframe.h"
 #include "MainWindow.h"
 #include "Timeline.h"
+#include <QAction>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QCheckBox>
 #include <QColorDialog>
 #include <QDoubleSpinBox>
 #include <QFormLayout>
+#include <QInputDialog>
+#include <QLineEdit>
+#include <QMenu>
 #include <QPushButton>
 #include <QScrollBar>
 #include <QSignalBlocker>
@@ -336,10 +341,202 @@ EffectControlsPanel::EffectControlsPanel(QWidget *parent)
     mainLayout->setContentsMargins(4, 4, 4, 4);
     mainLayout->setSpacing(0);
 
-    m_panelToolbar = new EffectControlsPanelToolbar(centralWidget);
+    auto *toolbarRow = new QWidget(centralWidget);
+    auto *toolbarLayout = new QHBoxLayout(toolbarRow);
+    toolbarLayout->setContentsMargins(0, 0, 0, 0);
+    toolbarLayout->setSpacing(4);
+
+    m_panelToolbar = new EffectControlsPanelToolbar(toolbarRow);
     connect(m_panelToolbar, &EffectControlsPanelToolbar::addEffectRequested,
             this, &EffectControlsPanel::onAddEffectRequested);
-    mainLayout->addWidget(m_panelToolbar);
+    toolbarLayout->addWidget(m_panelToolbar, 1);
+
+    auto *presetButton = new QPushButton(QStringLiteral("Presets"), toolbarRow);
+    auto *presetMenu = new QMenu(presetButton);
+    presetButton->setMenu(presetMenu);
+    toolbarLayout->addWidget(presetButton);
+    mainLayout->addWidget(toolbarRow);
+
+    const auto saveCurrentPreset = [this]() {
+        ClipInfo *clip = selectedClipForKey(m_timeline, m_currentClipKey);
+        if (!clip) {
+            QMessageBox::information(this,
+                                     QStringLiteral("Effect Presets"),
+                                     QStringLiteral("Select a clip before saving a preset."));
+            return;
+        }
+
+        bool ok = false;
+        const QString name = QInputDialog::getText(this,
+                                                   QStringLiteral("Save Effect Preset"),
+                                                   QStringLiteral("Preset name:"),
+                                                   QLineEdit::Normal,
+                                                   QStringLiteral("My Preset"),
+                                                   &ok).trimmed();
+        if (!ok || name.isEmpty())
+            return;
+
+        const EffectPreset existing = PresetLibrary::instance().findByName(name);
+        if (!existing.name.isEmpty()) {
+            if (existing.isBuiltIn) {
+                QMessageBox::warning(this,
+                                     QStringLiteral("Effect Presets"),
+                                     QStringLiteral("Built-in presets cannot be overwritten."));
+                return;
+            }
+            const auto overwrite = QMessageBox::question(
+                this,
+                QStringLiteral("Overwrite Preset"),
+                QStringLiteral("Overwrite \"%1\"?").arg(name),
+                QMessageBox::Yes | QMessageBox::No,
+                QMessageBox::No);
+            if (overwrite != QMessageBox::Yes)
+                return;
+        }
+
+        const bool includeKeyframes = QMessageBox::question(
+            this,
+            QStringLiteral("Save Effect Preset"),
+            QStringLiteral("Include effect keyframes in this preset?"),
+            QMessageBox::Yes | QMessageBox::No,
+            QMessageBox::Yes) == QMessageBox::Yes;
+
+        QString savedPath;
+        if (!PresetLibrary::instance().saveClipStackPreset(name, *clip, includeKeyframes, &savedPath)) {
+            QMessageBox::warning(this,
+                                 QStringLiteral("Effect Presets"),
+                                 QStringLiteral("Could not save the preset."));
+            return;
+        }
+    };
+
+    const auto applyPreset = [this](const QString &name) {
+        ClipInfo *clip = selectedClipForKey(m_timeline, m_currentClipKey);
+        if (!clip || !m_timeline) {
+            QMessageBox::information(this,
+                                     QStringLiteral("Effect Presets"),
+                                     QStringLiteral("Select a clip before applying a preset."));
+            return;
+        }
+
+        EffectPreset preset;
+        if (!PresetLibrary::instance().loadClipStackPreset(name, &preset)) {
+            QMessageBox::warning(this,
+                                 QStringLiteral("Effect Presets"),
+                                 QStringLiteral("Could not load the preset."));
+            return;
+        }
+
+        ClipInfo applied = *clip;
+        preset.applyToClipStack(applied, true);
+
+        clip->colorCorrection = applied.colorCorrection;
+        m_effects = applied.effects;
+        m_timeline->setClipEffectsAndKeyframes(m_currentClipKey.trackIdx,
+                                               m_currentClipKey.clipIdx,
+                                               applied.effects,
+                                               applied.keyframes);
+        refreshFromCurrentClip();
+    };
+
+    const auto renamePreset = [this](const QString &oldName) {
+        EffectPreset preset;
+        if (!PresetLibrary::instance().loadClipStackPreset(oldName, &preset) || preset.isBuiltIn) {
+            QMessageBox::warning(this,
+                                 QStringLiteral("Effect Presets"),
+                                 QStringLiteral("This preset cannot be renamed."));
+            return;
+        }
+
+        bool ok = false;
+        const QString newName = QInputDialog::getText(this,
+                                                      QStringLiteral("Rename Effect Preset"),
+                                                      QStringLiteral("New preset name:"),
+                                                      QLineEdit::Normal,
+                                                      oldName,
+                                                      &ok).trimmed();
+        if (!ok || newName.isEmpty() || newName == oldName)
+            return;
+
+        if (!PresetLibrary::instance().findByName(newName).name.isEmpty()) {
+            QMessageBox::warning(this,
+                                 QStringLiteral("Effect Presets"),
+                                 QStringLiteral("A preset with that name already exists."));
+            return;
+        }
+
+        preset.name = newName;
+        preset.isBuiltIn = false;
+        if (!PresetLibrary::instance().updatePreset(oldName, preset)) {
+            QMessageBox::warning(this,
+                                 QStringLiteral("Effect Presets"),
+                                 QStringLiteral("Could not rename the preset."));
+        }
+    };
+
+    const auto deletePreset = [this](const QString &name) {
+        const auto result = QMessageBox::question(
+            this,
+            QStringLiteral("Delete Effect Preset"),
+            QStringLiteral("Delete \"%1\"?").arg(name),
+            QMessageBox::Yes | QMessageBox::No,
+            QMessageBox::No);
+        if (result != QMessageBox::Yes)
+            return;
+
+        if (!PresetLibrary::instance().removePreset(name)) {
+            QMessageBox::warning(this,
+                                 QStringLiteral("Effect Presets"),
+                                 QStringLiteral("Could not delete the preset."));
+        }
+    };
+
+    connect(presetMenu, &QMenu::aboutToShow, this,
+            [this, presetMenu, saveCurrentPreset, applyPreset, renamePreset, deletePreset]() {
+        presetMenu->clear();
+
+        QAction *saveAction = presetMenu->addAction(QStringLiteral("Save Current..."));
+        connect(saveAction, &QAction::triggered, this, saveCurrentPreset);
+        presetMenu->addSeparator();
+
+        QMenu *applyMenu = presetMenu->addMenu(QStringLiteral("Apply"));
+        QMenu *manageMenu = presetMenu->addMenu(QStringLiteral("Manage"));
+
+        const QVector<EffectPreset> presets = PresetLibrary::instance().allPresets();
+        if (presets.isEmpty()) {
+            QAction *emptyApply = applyMenu->addAction(QStringLiteral("No presets available"));
+            emptyApply->setEnabled(false);
+        }
+
+        bool hasUserPreset = false;
+        for (const EffectPreset &preset : presets) {
+            const QString label = preset.category.isEmpty()
+                ? preset.name
+                : QStringLiteral("%1 [%2]").arg(preset.name, preset.category);
+
+            QAction *applyAction = applyMenu->addAction(label);
+            applyAction->setEnabled(m_currentClipKey.valid());
+            connect(applyAction, &QAction::triggered, this,
+                    [applyPreset, name = preset.name]() { applyPreset(name); });
+
+            if (preset.isBuiltIn)
+                continue;
+
+            hasUserPreset = true;
+            QMenu *presetManageMenu = manageMenu->addMenu(preset.name);
+            QAction *renameAction = presetManageMenu->addAction(QStringLiteral("Rename..."));
+            connect(renameAction, &QAction::triggered, this,
+                    [renamePreset, name = preset.name]() { renamePreset(name); });
+            QAction *deleteAction = presetManageMenu->addAction(QStringLiteral("Delete"));
+            connect(deleteAction, &QAction::triggered, this,
+                    [deletePreset, name = preset.name]() { deletePreset(name); });
+        }
+
+        if (!hasUserPreset) {
+            QAction *emptyManage = manageMenu->addAction(QStringLiteral("No user presets"));
+            emptyManage->setEnabled(false);
+        }
+    });
 
     m_scrollArea = new QScrollArea(centralWidget);
     m_scrollArea->setWidgetResizable(true);

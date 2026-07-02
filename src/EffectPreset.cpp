@@ -133,6 +133,83 @@ bool isEffectKeyframeTrack(const QString &propertyName)
     return propertyName.startsWith(QString::fromLatin1(kEffectTrackPrefix));
 }
 
+QString presetDirectoryPath(bool create)
+{
+    QString dir;
+    const QByteArray overrideDir = qgetenv(kPresetDirEnv);
+    if (!overrideDir.isEmpty()) {
+        dir = QString::fromLocal8Bit(overrideDir);
+    } else {
+        dir = QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
+        if (dir.isEmpty())
+            dir = QDir::homePath() + QStringLiteral("/.veditor");
+        dir += QStringLiteral("/effect-presets");
+    }
+    if (create)
+        QDir().mkpath(dir);
+    return dir;
+}
+
+int presetIndexByName(const QVector<EffectPreset> &presets, const QString &name)
+{
+    for (int i = 0; i < presets.size(); ++i) {
+        if (presets[i].name == name)
+            return i;
+    }
+    return -1;
+}
+
+bool readPresetJsonFile(const QString &filePath, EffectPreset *preset)
+{
+    if (!preset)
+        return false;
+
+    QFile file(filePath);
+    if (!file.open(QIODevice::ReadOnly))
+        return false;
+
+    QJsonParseError err;
+    const QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &err);
+    if (err.error != QJsonParseError::NoError || !doc.isObject())
+        return false;
+
+    EffectPreset loaded = EffectPreset::fromJson(doc.object());
+    if (loaded.name.isEmpty())
+        return false;
+
+    loaded.isBuiltIn = false;
+    *preset = loaded;
+    return true;
+}
+
+bool writePresetJsonFile(const QString &filePath, const EffectPreset &preset)
+{
+    QFile file(filePath);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate))
+        return false;
+
+    const QByteArray json = QJsonDocument(preset.toJson()).toJson(QJsonDocument::Indented);
+    if (file.write(json) != json.size())
+        return false;
+    file.close();
+    return file.error() == QFile::NoError;
+}
+
+void mergeUserPreset(QVector<EffectPreset> &presets, EffectPreset preset)
+{
+    if (preset.name.isEmpty())
+        return;
+
+    preset.isBuiltIn = false;
+    const int existingIndex = presetIndexByName(presets, preset.name);
+    if (existingIndex < 0) {
+        presets.append(preset);
+        return;
+    }
+    if (!presets[existingIndex].isBuiltIn)
+        presets[existingIndex] = preset;
+}
+
 KeyframeManager effectKeyframesOnly(const KeyframeManager &source)
 {
     KeyframeManager filtered;
@@ -334,7 +411,11 @@ bool PresetLibrary::removePreset(const QString &name)
     for (int i = 0; i < m_presets.size(); ++i) {
         if (m_presets[i].name == name) {
             if (m_presets[i].isBuiltIn) return false;   // cannot remove factory presets
+            const QString filePath = presetFilePath(name);
+            if (!filePath.isEmpty() && QFile::exists(filePath) && !QFile::remove(filePath))
+                return false;
             m_presets.removeAt(i);
+            saveLibrary();
             return true;
         }
     }
@@ -343,18 +424,41 @@ bool PresetLibrary::removePreset(const QString &name)
 
 bool PresetLibrary::updatePreset(const QString &name, const EffectPreset &preset)
 {
-    for (auto &p : m_presets) {
-        if (p.name == name) {
-            if (p.isBuiltIn) return false;   // cannot modify factory presets
-            p = preset;
-            p.modifiedAt = QDateTime::currentDateTime();
-            return true;
-        }
-    }
-    return false;
-}
+    const int index = presetIndexByName(m_presets, name);
+    if (index < 0 || m_presets[index].isBuiltIn)
+        return false;   // cannot modify factory presets
 
-// --- Import / Export ---
+    EffectPreset updated = preset;
+    updated.name = updated.name.trimmed();
+    if (updated.name.isEmpty())
+        return false;
+
+    const int targetIndex = presetIndexByName(m_presets, updated.name);
+    if (targetIndex >= 0 && targetIndex != index)
+        return false;
+
+    if (!m_presets[index].createdAt.isValid() && !updated.createdAt.isValid())
+        updated.createdAt = QDateTime::currentDateTime();
+    else if (!updated.createdAt.isValid())
+        updated.createdAt = m_presets[index].createdAt;
+    updated.modifiedAt = QDateTime::currentDateTime();
+    updated.isBuiltIn = false;
+
+    const QString newPath = presetFilePath(updated.name);
+    if (newPath.isEmpty() || !writePresetJsonFile(newPath, updated))
+        return false;
+
+    const QString oldPath = presetFilePath(name);
+    if (oldPath != newPath && !oldPath.isEmpty() && QFile::exists(oldPath)
+        && !QFile::remove(oldPath)) {
+        QFile::remove(newPath);
+        return false;
+    }
+
+    m_presets[index] = updated;
+    saveLibrary();
+    return true;
+}
 
 bool PresetLibrary::importPreset(const QString &filePath)
 {
@@ -399,18 +503,7 @@ bool PresetLibrary::saveClipStackPreset(const QString &name, const ClipInfo &cli
 
     EffectPreset preset = EffectPreset::fromClipStack(trimmedName, clip, includeKeyframes);
     const QString filePath = presetFilePath(trimmedName);
-    if (filePath.isEmpty())
-        return false;
-
-    QFile file(filePath);
-    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate))
-        return false;
-
-    const QByteArray json = QJsonDocument(preset.toJson()).toJson(QJsonDocument::Indented);
-    if (file.write(json) != json.size())
-        return false;
-    file.close();
-    if (file.error() != QFile::NoError)
+    if (filePath.isEmpty() || !writePresetJsonFile(filePath, preset))
         return false;
 
     bool updated = false;
@@ -428,6 +521,8 @@ bool PresetLibrary::saveClipStackPreset(const QString &name, const ClipInfo &cli
         *savedPath = filePath;
     return true;
 }
+
+// --- Named effect-stack JSON presets ---
 
 bool PresetLibrary::loadClipStackPreset(const QString &name, EffectPreset *preset) const
 {
@@ -471,18 +566,7 @@ bool PresetLibrary::applyClipStackPreset(const QString &name, ClipInfo &clip,
 
 QString PresetLibrary::presetDirectory()
 {
-    QString dir;
-    const QByteArray overrideDir = qgetenv(kPresetDirEnv);
-    if (!overrideDir.isEmpty()) {
-        dir = QString::fromLocal8Bit(overrideDir);
-    } else {
-        dir = QStandardPaths::writableLocation(QStandardPaths::AppConfigLocation);
-        if (dir.isEmpty())
-            dir = QDir::homePath() + QStringLiteral("/.veditor");
-        dir += QStringLiteral("/effect-presets");
-    }
-    QDir().mkpath(dir);
-    return dir;
+    return presetDirectoryPath(true);
 }
 
 QString PresetLibrary::presetFilePath(const QString &name)
@@ -519,26 +603,40 @@ bool PresetLibrary::saveLibrary() const
 bool PresetLibrary::loadLibrary()
 {
     QFile file(libraryPath());
-    if (!file.exists()) return true;       // first run — nothing to load
-    if (!file.open(QIODevice::ReadOnly)) return false;
+    if (file.exists()) {
+        if (!file.open(QIODevice::ReadOnly)) return false;
 
-    QJsonParseError err;
-    QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &err);
-    if (err.error != QJsonParseError::NoError) return false;
+        QJsonParseError err;
+        QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &err);
+        if (err.error != QJsonParseError::NoError) return false;
 
-    const QJsonArray arr = doc.array();
-    for (const auto &v : arr) {
-        EffectPreset preset = EffectPreset::fromJson(v.toObject());
-        if (preset.name.isEmpty()) continue;
+        const QJsonArray arr = doc.array();
+        for (const auto &v : arr) {
+            EffectPreset preset = EffectPreset::fromJson(v.toObject());
+            if (preset.name.isEmpty()) continue;
 
-        // Skip if a built-in with the same name already exists
-        bool exists = false;
-        for (const auto &p : m_presets) {
-            if (p.name == preset.name) { exists = true; break; }
+            // Skip if a built-in with the same name already exists
+            bool exists = false;
+            for (const auto &p : m_presets) {
+                if (p.name == preset.name) { exists = true; break; }
+            }
+            if (!exists)
+                m_presets.append(preset);
         }
-        if (!exists)
-            m_presets.append(preset);
     }
+
+    const QDir presetDir(presetDirectoryPath(false));
+    if (presetDir.exists()) {
+        const QStringList files = presetDir.entryList(QStringList() << QStringLiteral("*.json"),
+                                                      QDir::Files | QDir::Readable,
+                                                      QDir::Name);
+        for (const QString &fileName : files) {
+            EffectPreset preset;
+            if (readPresetJsonFile(presetDir.filePath(fileName), &preset))
+                mergeUserPreset(m_presets, preset);
+        }
+    }
+
     return true;
 }
 
