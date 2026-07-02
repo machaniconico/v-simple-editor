@@ -1,13 +1,77 @@
 #include "ColorMatchDialog.h"
 
+#include "Timeline.h"
+
+#include <QApplication>
 #include <QComboBox>
+#include <QDateTime>
+#include <QDir>
+#include <QFile>
 #include <QFileDialog>
+#include <QFileInfo>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QMessageBox>
 #include <QPixmap>
 #include <QPushButton>
+#include <QRegularExpression>
+#include <QVariant>
 #include <QVBoxLayout>
+
+bool applyColorMatchLutToSelectedTimelineClip(Timeline *timeline,
+                                              const QString &lutPath,
+                                              double lutIntensity,
+                                              QString *errorMessage);
+
+namespace {
+
+QString sanitizedFileStem(QString stem)
+{
+    stem = stem.trimmed();
+    if (stem.isEmpty())
+        stem = QStringLiteral("Untitled");
+    stem.replace(QRegularExpression(QStringLiteral("[^A-Za-z0-9._-]+")),
+                 QStringLiteral("_"));
+    stem.replace(QRegularExpression(QStringLiteral("_+")),
+                 QStringLiteral("_"));
+    stem = stem.left(80).trimmed();
+    return stem.isEmpty() ? QStringLiteral("Untitled") : stem;
+}
+
+QString projectPathFromObject(const QObject *object)
+{
+    if (!object)
+        return {};
+
+    const QVariant projectFilePath = object->property("projectFilePath");
+    if (projectFilePath.isValid() && !projectFilePath.toString().isEmpty())
+        return projectFilePath.toString();
+
+    const QVariant currentProjectFilePath = object->property("currentProjectFilePath");
+    if (currentProjectFilePath.isValid() && !currentProjectFilePath.toString().isEmpty())
+        return currentProjectFilePath.toString();
+
+    if (const auto *widget = qobject_cast<const QWidget *>(object)) {
+        const QString windowPath = widget->windowFilePath();
+        if (!windowPath.isEmpty())
+            return windowPath;
+    }
+
+    return {};
+}
+
+Timeline *timelineFromParentChain(QObject *object)
+{
+    for (QObject *cursor = object; cursor; cursor = cursor->parent()) {
+        if (auto *timeline = cursor->findChild<Timeline *>())
+            return timeline;
+    }
+    return (qApp && qApp->activeWindow())
+        ? qApp->activeWindow()->findChild<Timeline *>()
+        : nullptr;
+}
+
+} // namespace
 
 // ---------------------------------------------------------------------------
 // ctor
@@ -70,11 +134,14 @@ ColorMatchDialog::ColorMatchDialog(QWidget *parent)
 
     m_btnGenerate = new QPushButton(tr("Generate && Export LUT..."), this);
     m_btnGenerate->setEnabled(false);
+    m_btnApply = new QPushButton(tr("選択クリップへ適用"), this);
+    m_btnApply->setEnabled(false);
 
     auto *ctrlRow = new QHBoxLayout;
     ctrlRow->addWidget(lblSize);
     ctrlRow->addWidget(m_cbLutSize);
     ctrlRow->addStretch();
+    ctrlRow->addWidget(m_btnApply);
     ctrlRow->addWidget(m_btnGenerate);
 
     // ---- assemble ----
@@ -88,6 +155,12 @@ ColorMatchDialog::ColorMatchDialog(QWidget *parent)
     connect(m_btnReference, &QPushButton::clicked, this, &ColorMatchDialog::onSelectReference);
     connect(m_btnTarget,    &QPushButton::clicked, this, &ColorMatchDialog::onSelectTarget);
     connect(m_btnGenerate,  &QPushButton::clicked, this, &ColorMatchDialog::onGenerate);
+    connect(m_btnApply,     &QPushButton::clicked, this, &ColorMatchDialog::onApplyToSelectedClip);
+}
+
+void ColorMatchDialog::setProjectFilePath(const QString &path)
+{
+    m_projectFilePath = path;
 }
 
 // ---------------------------------------------------------------------------
@@ -131,16 +204,8 @@ void ColorMatchDialog::onGenerate()
 {
     if (m_refImage.isNull() || m_tgtImage.isNull()) return;
 
-    const int lutSize = m_cbLutSize->currentData().toInt();
-
-    const colormatch::analyze::ColorStats refStats =
-        colormatch::analyze::analyzeImage(m_refImage);
-    const colormatch::analyze::ColorStats tgtStats =
-        colormatch::analyze::analyzeImage(m_tgtImage);
-
-    // Generate LUT: transforms target stats → reference stats
-    const colormatch::lut::Lut3D lut =
-        colormatch::lut::generateMatchLut(tgtStats, refStats, lutSize);
+    colormatch::lut::Lut3D lut;
+    if (!generateCurrentLut(&lut)) return;
 
     const QString savePath = QFileDialog::getSaveFileName(
         this, tr("Export LUT"), QStringLiteral("ColorMatchLUT.cube"),
@@ -157,12 +222,58 @@ void ColorMatchDialog::onGenerate()
     emit lutGenerated(savePath);
 }
 
+void ColorMatchDialog::onApplyToSelectedClip()
+{
+    if (m_refImage.isNull() || m_tgtImage.isNull()) return;
+
+    Timeline *timeline = timelineFromParentChain(this);
+    if (!timeline) {
+        QMessageBox::warning(this, tr("Apply Failed"),
+                             tr("No timeline is available."));
+        return;
+    }
+
+    colormatch::lut::Lut3D lut;
+    if (!generateCurrentLut(&lut)) return;
+
+    const QString savePath = automaticLutPath();
+    const QDir outDir = QFileInfo(savePath).absoluteDir();
+    if (!outDir.exists() && !QDir().mkpath(outDir.absolutePath())) {
+        QMessageBox::warning(this, tr("Apply Failed"),
+                             tr("Could not create LUT directory:\n%1")
+                                 .arg(outDir.absolutePath()));
+        return;
+    }
+
+    if (!colormatch::lut::exportCube(lut, savePath)) {
+        QMessageBox::warning(this, tr("Apply Failed"),
+                             tr("Could not write LUT file:\n%1").arg(savePath));
+        return;
+    }
+
+    QString error;
+    if (!applyColorMatchLutToSelectedTimelineClip(timeline, savePath, 1.0, &error)) {
+        QFile::remove(savePath);
+        QMessageBox::warning(this, tr("Apply Failed"),
+                             error.isEmpty()
+                                 ? tr("Could not apply LUT to the selected clip.")
+                                 : error);
+        return;
+    }
+
+    emit lutGenerated(savePath);
+    emit lutAppliedToSelectedClip(savePath);
+}
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
 void ColorMatchDialog::updateGenerateButton()
 {
-    m_btnGenerate->setEnabled(!m_refImage.isNull() && !m_tgtImage.isNull());
+    const bool ready = !m_refImage.isNull() && !m_tgtImage.isNull();
+    m_btnGenerate->setEnabled(ready);
+    if (m_btnApply)
+        m_btnApply->setEnabled(ready);
 }
 
 void ColorMatchDialog::updatePreview()
@@ -186,6 +297,70 @@ void ColorMatchDialog::updatePreview()
             QPixmap::fromImage(preview).scaled(
                 200, 150, Qt::KeepAspectRatio, Qt::SmoothTransformation));
     }
+}
+
+bool ColorMatchDialog::generateCurrentLut(colormatch::lut::Lut3D *lut) const
+{
+    if (!lut || m_refImage.isNull() || m_tgtImage.isNull())
+        return false;
+
+    const int lutSize = m_cbLutSize->currentData().toInt();
+
+    const colormatch::analyze::ColorStats refStats =
+        colormatch::analyze::analyzeImage(m_refImage);
+    const colormatch::analyze::ColorStats tgtStats =
+        colormatch::analyze::analyzeImage(m_tgtImage);
+
+    *lut = colormatch::lut::generateMatchLut(tgtStats, refStats, lutSize);
+    return lut->size > 0 && !lut->data.isEmpty();
+}
+
+QString ColorMatchDialog::projectAdjacentLutDirectory() const
+{
+    QString projectPath = m_projectFilePath;
+    if (projectPath.isEmpty()) {
+        for (const QObject *cursor = this; cursor; cursor = cursor->parent()) {
+            projectPath = projectPathFromObject(cursor);
+            if (!projectPath.isEmpty())
+                break;
+        }
+    }
+    if (projectPath.isEmpty() && qApp && qApp->activeWindow())
+        projectPath = projectPathFromObject(qApp->activeWindow());
+
+    if (!projectPath.isEmpty()) {
+        const QFileInfo projectInfo(projectPath);
+        const QString stem = sanitizedFileStem(projectInfo.completeBaseName());
+        return QDir(projectInfo.absolutePath())
+            .filePath(stem + QStringLiteral("_ColorMatchLUTs"));
+    }
+
+    return QDir(QDir::currentPath()).filePath(QStringLiteral("ColorMatchLUTs"));
+}
+
+QString ColorMatchDialog::automaticLutPath() const
+{
+    QString projectPath = m_projectFilePath;
+    if (projectPath.isEmpty()) {
+        for (const QObject *cursor = this; cursor; cursor = cursor->parent()) {
+            projectPath = projectPathFromObject(cursor);
+            if (!projectPath.isEmpty())
+                break;
+        }
+    }
+    if (projectPath.isEmpty() && qApp && qApp->activeWindow())
+        projectPath = projectPathFromObject(qApp->activeWindow());
+
+    const QString base = projectPath.isEmpty()
+        ? QStringLiteral("Untitled")
+        : QFileInfo(projectPath).completeBaseName();
+    const QString stamp =
+        QDateTime::currentDateTimeUtc().toString(QStringLiteral("yyyyMMdd_HHmmss_zzz"));
+    return QDir(projectAdjacentLutDirectory())
+        .filePath(sanitizedFileStem(base)
+                  + QStringLiteral("_ColorMatch_")
+                  + stamp
+                  + QStringLiteral(".cube"));
 }
 
 // static

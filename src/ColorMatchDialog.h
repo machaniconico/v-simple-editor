@@ -15,17 +15,23 @@ class ColorMatchDialog : public QDialog {
     Q_OBJECT
 public:
     explicit ColorMatchDialog(QWidget *parent = nullptr);
+    void setProjectFilePath(const QString &path);
 
 signals:
     void lutGenerated(const QString &path);
+    void lutAppliedToSelectedClip(const QString &path);
 
 private slots:
     void onSelectReference();
     void onSelectTarget();
     void onGenerate();
+    void onApplyToSelectedClip();
 
 private:
     static QImage applyLutToImage(const QImage &img, const colormatch::lut::Lut3D &lut);
+    bool generateCurrentLut(colormatch::lut::Lut3D *lut) const;
+    QString projectAdjacentLutDirectory() const;
+    QString automaticLutPath() const;
     void updatePreview();
     void updateGenerateButton();
 
@@ -37,7 +43,9 @@ private:
     QLabel      *m_lblAfter     = nullptr;
     QComboBox   *m_cbLutSize    = nullptr;
     QPushButton *m_btnGenerate  = nullptr;
+    QPushButton *m_btnApply     = nullptr;
 
     QImage m_refImage;
     QImage m_tgtImage;
+    QString m_projectFilePath;
 };

@@ -20,6 +20,7 @@
 #include "util/RcPause.h"
 
 #include <algorithm>
+#include <QFileInfo>
 #include <QMessageBox>
 #include <QStringList>
 
@@ -106,6 +107,71 @@ QAction *addAudioChannelModeAction(QMenu *menu,
     return act;
 }
 } // namespace
+
+bool applyColorMatchLutToSelectedTimelineClip(Timeline *timeline,
+                                              const QString &lutPath,
+                                              double lutIntensity,
+                                              QString *errorMessage)
+{
+    auto fail = [&](const QString &message) {
+        if (errorMessage)
+            *errorMessage = message;
+        return false;
+    };
+
+    if (!timeline)
+        return fail(QStringLiteral("Timeline is not available."));
+    if (lutPath.isEmpty() || !QFileInfo::exists(lutPath))
+        return fail(QStringLiteral("LUT file does not exist."));
+
+    const QVector<TimelineTrack *> &tracks = timeline->videoTracks();
+    if (tracks.isEmpty())
+        return fail(QStringLiteral("No video track is available."));
+
+    const TimelineState state = timeline->currentState();
+    int trackIdx = state.selectedVideoTrackIndex;
+    int clipIdx = state.selectedVideoClipIndex;
+
+    if (trackIdx < 0 || trackIdx >= tracks.size() || !tracks[trackIdx]
+        || clipIdx < 0 || clipIdx >= tracks[trackIdx]->clipCount()) {
+        trackIdx = -1;
+        clipIdx = -1;
+        for (int i = 0; i < tracks.size(); ++i) {
+            TimelineTrack *track = tracks[i];
+            if (!track)
+                continue;
+            const int selected = track->selectedClip();
+            if (selected >= 0 && selected < track->clipCount()) {
+                trackIdx = i;
+                clipIdx = selected;
+                break;
+            }
+        }
+    }
+
+    if (trackIdx < 0 || clipIdx < 0)
+        return fail(QStringLiteral("No video clip is selected."));
+
+    TimelineTrack *track = tracks[trackIdx];
+    QVector<ClipInfo> clips = track->clips();
+    if (clipIdx >= clips.size())
+        return fail(QStringLiteral("Selected clip is no longer available."));
+
+    const double intensity = qBound(0.0, lutIntensity, 1.0);
+    ClipInfo &clip = clips[clipIdx];
+    if (clip.lutFilePath == lutPath && qFuzzyCompare(clip.lutIntensity + 1.0, intensity + 1.0))
+        return true;
+
+    clip.lutFilePath = lutPath;
+    clip.lutIntensity = intensity;
+    track->setClips(clips);
+
+    if (UndoManager *undo = timeline->undoManager())
+        undo->saveState(timeline->currentState(),
+                        QStringLiteral("Apply color match LUT"));
+    timeline->refreshPlaybackSequence();
+    return true;
+}
 
 QString exportAudioChannelPanFilterForMode(AudioChannelMode mode)
 {

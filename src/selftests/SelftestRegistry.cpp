@@ -61,6 +61,7 @@ int runClipIdtSelftest();
 int runClipOdtSelftest();
 int runCloudRenderSelftest();
 int runCollabSelftest();
+int runColorMatchApplySelftest();
 int runColorMatchSelftest();
 int runCommandSearchSelftest();
 int runCredAuditLogSelftest();
@@ -610,6 +611,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Still-frame export: renderFrameAt SSOT -> PNG/JPEG save engine + PNG pixel-identical reread" },
     { "clip-lut",          "VEDITOR_CLIP_LUT_SELFTEST",            runClipLutSelftest,            true,
       "Clip LUT: per-clip ProjectFile round-trip + renderFrameAt LUT reflection + no-LUT byte-identical gate" },
+    { "colormatch-apply",  "VEDITOR_COLORMATCH_APPLY_SELFTEST",    runColorMatchApplySelftest,    true,
+      "ColorMatch apply: generated .cube -> selected clip LUT fields + undo + renderFrameAt reflection" },
     { "parity",            "VEDITOR_PARITY_SELFTEST",             runParitySelftest,             true,
       "Preview vs export pixel-parity (S1-S11, framediff::mse, 10-bit HDR10)" },
     { "keyframe-anim-parity", "VEDITOR_KEYFRAME_ANIM_PARITY_SELFTEST", runKeyframeAnimParitySelftest, true,
