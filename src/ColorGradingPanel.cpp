@@ -42,6 +42,7 @@ ColorGradingPanel::ColorGradingPanel(QWidget *parent)
         tempLbl->setMinimumWidth(70);
         tempRow->addWidget(tempLbl);
         m_wbTemperature = new QSlider(Qt::Horizontal);
+        m_wbTemperature->setObjectName(QStringLiteral("wbTemperature"));
         m_wbTemperature->setRange(-100, 100);
         m_wbTemperature->setValue(0);
         tempRow->addWidget(m_wbTemperature, 1);
@@ -56,6 +57,7 @@ ColorGradingPanel::ColorGradingPanel(QWidget *parent)
         tintLbl->setMinimumWidth(70);
         tintRow->addWidget(tintLbl);
         m_wbTint = new QSlider(Qt::Horizontal);
+        m_wbTint->setObjectName(QStringLiteral("wbTint"));
         m_wbTint->setRange(-100, 100);
         m_wbTint->setValue(0);
         tintRow->addWidget(m_wbTint, 1);
@@ -697,6 +699,14 @@ ColorGradingPanel::WheelSliderGroup ColorGradingPanel::addWheelSliders(QGroupBox
     auto [bSlider, bLabel] = makeRow(tr("B:"));
     auto [lSlider, lLabel] = makeRow(tr("Luma:"));
 
+    const QString prefix = (type == LiftWheel)
+        ? QStringLiteral("lggLift")
+        : (type == GammaWheel ? QStringLiteral("lggGamma") : QStringLiteral("lggGain"));
+    rSlider->setObjectName(prefix + QStringLiteral("R"));
+    gSlider->setObjectName(prefix + QStringLiteral("G"));
+    bSlider->setObjectName(prefix + QStringLiteral("B"));
+    lSlider->setObjectName(prefix + QStringLiteral("Luma"));
+
     connect(rSlider, &QSlider::valueChanged, this, &ColorGradingPanel::onWheelSliderChanged);
     connect(gSlider, &QSlider::valueChanged, this, &ColorGradingPanel::onWheelSliderChanged);
     connect(bSlider, &QSlider::valueChanged, this, &ColorGradingPanel::onWheelSliderChanged);
@@ -707,16 +717,24 @@ ColorGradingPanel::WheelSliderGroup ColorGradingPanel::addWheelSliders(QGroupBox
 
 double ColorGradingPanel::sliderToGamma(int v)
 {
-    double t = v / 100.0;
-    return 0.1 * std::pow(40.0, t);
+    if (v <= 50) {
+        const double t = std::clamp(v / 50.0, 0.0, 1.0);
+        return 0.1 * std::pow(10.0, t);
+    }
+    const double t = std::clamp((v - 50) / 50.0, 0.0, 1.0);
+    return std::pow(4.0, t);
 }
 
 int ColorGradingPanel::gammaToSlider(double g)
 {
     if (g <= 0.1) return 0;
     if (g >= 4.0) return 100;
-    double t = std::log(g / 0.1) / std::log(40.0);
-    return static_cast<int>(std::round(t * 100.0));
+    if (g <= 1.0) {
+        const double t = std::log(g / 0.1) / std::log(10.0);
+        return static_cast<int>(std::round(t * 50.0));
+    }
+    const double t = std::log(g) / std::log(4.0);
+    return 50 + static_cast<int>(std::round(t * 50.0));
 }
 
 double ColorGradingPanel::sliderToLiftGain(int v)
@@ -729,14 +747,97 @@ int ColorGradingPanel::liftGainToSlider(double v)
     return static_cast<int>(std::round(v * 100.0));
 }
 
+double ColorGradingPanel::wheelGammaToCorrection(double g)
+{
+    return std::log2(std::max(g, 1e-6));
+}
+
+double ColorGradingPanel::correctionGammaToWheel(double g)
+{
+    return std::pow(2.0, g);
+}
+
+ColorWheels ColorGradingPanel::wheelsFromColorCorrection(const ColorCorrection &cc)
+{
+    ColorWheels cw;
+    cw.lift = QVector3D(static_cast<float>(cc.liftR),
+                        static_cast<float>(cc.liftG),
+                        static_cast<float>(cc.liftB));
+    cw.gamma = QVector3D(static_cast<float>(correctionGammaToWheel(cc.gammaR)),
+                         static_cast<float>(correctionGammaToWheel(cc.gammaG)),
+                         static_cast<float>(correctionGammaToWheel(cc.gammaB)));
+    cw.gain = QVector3D(static_cast<float>(cc.gainR),
+                        static_cast<float>(cc.gainG),
+                        static_cast<float>(cc.gainB));
+    cw.liftLuma = 0.0;
+    cw.gammaLuma = 1.0;
+    cw.gainLuma = 0.0;
+    return cw;
+}
+
+void ColorGradingPanel::syncColorCorrectionFromWheels(const ColorWheels &cw)
+{
+    m_cc.liftR = static_cast<double>(cw.lift.x()) + cw.liftLuma;
+    m_cc.liftG = static_cast<double>(cw.lift.y()) + cw.liftLuma;
+    m_cc.liftB = static_cast<double>(cw.lift.z()) + cw.liftLuma;
+
+    m_cc.gammaR = wheelGammaToCorrection(static_cast<double>(cw.gamma.x()) * cw.gammaLuma);
+    m_cc.gammaG = wheelGammaToCorrection(static_cast<double>(cw.gamma.y()) * cw.gammaLuma);
+    m_cc.gammaB = wheelGammaToCorrection(static_cast<double>(cw.gamma.z()) * cw.gammaLuma);
+
+    m_cc.gainR = static_cast<double>(cw.gain.x()) + cw.gainLuma;
+    m_cc.gainG = static_cast<double>(cw.gain.y()) + cw.gainLuma;
+    m_cc.gainB = static_cast<double>(cw.gain.z()) + cw.gainLuma;
+}
+
+void ColorGradingPanel::updateBasicTemperatureTintFromCC()
+{
+    if (!m_temperature.slider || !m_tint.slider)
+        return;
+    QSignalBlocker bt(m_temperature.slider);
+    QSignalBlocker bi(m_tint.slider);
+    m_temperature.slider->setValue(static_cast<int>(std::round(m_cc.temperature)));
+    m_tint.slider->setValue(static_cast<int>(std::round(m_cc.tint)));
+    m_temperature.valueLabel->setText(QString::number(static_cast<int>(m_cc.temperature)));
+    m_tint.valueLabel->setText(QString::number(static_cast<int>(m_cc.tint)));
+}
+
+void ColorGradingPanel::updateWhiteBalanceControlsFromCC()
+{
+    if (!m_wbTemperature || !m_wbTint)
+        return;
+    QSignalBlocker bt(m_wbTemperature);
+    QSignalBlocker bi(m_wbTint);
+    const int tempSlider = static_cast<int>(std::round(m_cc.temperature));
+    const int tintSlider = static_cast<int>(std::round(m_cc.tint));
+    m_wbTemperature->setValue(tempSlider);
+    m_wbTint->setValue(tintSlider);
+    const double K = 5500.0 + static_cast<double>(tempSlider) * 30.0;
+    if (m_wbTemperatureLabel)
+        m_wbTemperatureLabel->setText(QString::number(static_cast<int>(K)) + "K");
+    if (m_wbTintLabel)
+        m_wbTintLabel->setText((tintSlider >= 0 ? QStringLiteral("+") : QString())
+                               + QString::number(tintSlider));
+}
+
+void ColorGradingPanel::updateGraphicalWheelsFromCC()
+{
+    if (m_liftWheel)
+        m_liftWheel->setColor(m_cc.liftR, m_cc.liftG, m_cc.liftB);
+    if (m_gammaWheel)
+        m_gammaWheel->setColor(m_cc.gammaR, m_cc.gammaG, m_cc.gammaB);
+    if (m_gainWheel)
+        m_gainWheel->setColor(m_cc.gainR, m_cc.gainG, m_cc.gainB);
+}
+
 void ColorGradingPanel::setColorCorrection(const ColorCorrection &cc)
 {
     m_cc = cc;
     m_updating = true;
-    m_liftWheel->setColor(cc.liftR, cc.liftG, cc.liftB);
-    m_gammaWheel->setColor(cc.gammaR, cc.gammaG, cc.gammaB);
-    m_gainWheel->setColor(cc.gainR, cc.gainG, cc.gainB);
+    updateGraphicalWheelsFromCC();
     updateSlidersFromCC();
+    updateWhiteBalanceControlsFromCC();
+    setWheels(wheelsFromColorCorrection(m_cc));
     m_updating = false;
 }
 
@@ -751,6 +852,7 @@ void ColorGradingPanel::applyWhiteBalancePick(const QColor &pixel)
     m_cc.temperature = correction.temperature;
     m_cc.tint = correction.tint;
     updateSlidersFromCC();
+    updateWhiteBalanceControlsFromCC();
     emit colorCorrectionChanged(m_cc);
 }
 
@@ -810,7 +912,8 @@ void ColorGradingPanel::onLiftChanged(double r, double g, double b)
     m_cc.liftR = r;
     m_cc.liftG = g;
     m_cc.liftB = b;
-    emit colorCorrectionChanged(m_cc);
+    setWheels(wheelsFromColorCorrection(m_cc));
+    m_wheelDebounce->start();
 }
 
 void ColorGradingPanel::onGammaWheelChanged(double r, double g, double b)
@@ -819,7 +922,8 @@ void ColorGradingPanel::onGammaWheelChanged(double r, double g, double b)
     m_cc.gammaR = r;
     m_cc.gammaG = g;
     m_cc.gammaB = b;
-    emit colorCorrectionChanged(m_cc);
+    setWheels(wheelsFromColorCorrection(m_cc));
+    m_wheelDebounce->start();
 }
 
 void ColorGradingPanel::onGainChanged(double r, double g, double b)
@@ -828,7 +932,8 @@ void ColorGradingPanel::onGainChanged(double r, double g, double b)
     m_cc.gainR = r;
     m_cc.gainG = g;
     m_cc.gainB = b;
-    emit colorCorrectionChanged(m_cc);
+    setWheels(wheelsFromColorCorrection(m_cc));
+    m_wheelDebounce->start();
 }
 
 void ColorGradingPanel::onSliderChanged()
@@ -857,6 +962,7 @@ void ColorGradingPanel::onSliderChanged()
     m_temperature.valueLabel->setText(QString::number(static_cast<int>(m_cc.temperature)));
     m_tint.valueLabel->setText(QString::number(static_cast<int>(m_cc.tint)));
     m_gamma.valueLabel->setText(QString::number(m_cc.gamma, 'f', 2));
+    updateWhiteBalanceControlsFromCC();
 
     emit colorCorrectionChanged(m_cc);
 }
@@ -893,6 +999,8 @@ void ColorGradingPanel::onWheelSliderChanged()
     m_wheels.gammaLuma = gammaLuma;
     m_wheels.gain = gainVec;
     m_wheels.gainLuma = gainLuma;
+    syncColorCorrectionFromWheels(m_wheels);
+    updateGraphicalWheelsFromCC();
 
     // Update labels
     auto fmtLiftGain = [](double v) { return QString::number(v, 'f', 2); };
@@ -929,6 +1037,7 @@ ColorWheels ColorGradingPanel::currentWheels() const
 void ColorGradingPanel::setWheels(const ColorWheels &cw)
 {
     m_wheels = cw;
+    syncColorCorrectionFromWheels(cw);
 
     QSignalBlocker b1(m_liftSliders.r);
     QSignalBlocker b2(m_liftSliders.g);
@@ -973,6 +1082,7 @@ void ColorGradingPanel::setWheels(const ColorWheels &cw)
     m_gainSliders.gLabel->setText(QString::number(static_cast<double>(cw.gain.y()), 'f', 2));
     m_gainSliders.bLabel->setText(QString::number(static_cast<double>(cw.gain.z()), 'f', 2));
     m_gainSliders.lumaLabel->setText(QString::number(cw.gainLuma, 'f', 2));
+    updateGraphicalWheelsFromCC();
 }
 
 void ColorGradingPanel::setLutList(const QVector<LutData> &luts)
@@ -1232,6 +1342,9 @@ void ColorGradingPanel::onWhiteBalanceChanged()
 
     const int tempSlider = m_wbTemperature->value();
     const int tintSlider = m_wbTint->value();
+    m_cc.temperature = tempSlider;
+    m_cc.tint = tintSlider;
+    updateBasicTemperatureTintFromCC();
 
     // Temperature: slider -100..+100 maps to K = 5500 + slider*30
     // → range 2500..8500 (cool→warm). Higher K = cooler input compensation

@@ -664,15 +664,19 @@ QJsonObject PresetLibrary::colorCorrectionToJson(const ColorCorrection &cc)
     obj["highlights"]  = cc.highlights;
     obj["shadows"]     = cc.shadows;
     obj["exposure"]    = cc.exposure;
-    obj["liftR"]       = cc.liftR;
-    obj["liftG"]       = cc.liftG;
-    obj["liftB"]       = cc.liftB;
-    obj["gammaR"]      = cc.gammaR;
-    obj["gammaG"]      = cc.gammaG;
-    obj["gammaB"]      = cc.gammaB;
-    obj["gainR"]       = cc.gainR;
-    obj["gainG"]       = cc.gainG;
-    obj["gainB"]       = cc.gainB;
+    auto addIfNonZero = [&obj](const QString &key, double value) {
+        if (value != 0.0)
+            obj[key] = value;
+    };
+    addIfNonZero(QStringLiteral("liftR"), cc.liftR);
+    addIfNonZero(QStringLiteral("liftG"), cc.liftG);
+    addIfNonZero(QStringLiteral("liftB"), cc.liftB);
+    addIfNonZero(QStringLiteral("gammaR"), cc.gammaR);
+    addIfNonZero(QStringLiteral("gammaG"), cc.gammaG);
+    addIfNonZero(QStringLiteral("gammaB"), cc.gammaB);
+    addIfNonZero(QStringLiteral("gainR"), cc.gainR);
+    addIfNonZero(QStringLiteral("gainG"), cc.gainG);
+    addIfNonZero(QStringLiteral("gainB"), cc.gainB);
     return obj;
 }
 

@@ -225,6 +225,13 @@ private:
     static int gammaToSlider(double g);
     static double sliderToLiftGain(int v);
     static int liftGainToSlider(double v);
+    static double wheelGammaToCorrection(double g);
+    static double correctionGammaToWheel(double g);
+    static ColorWheels wheelsFromColorCorrection(const ColorCorrection &cc);
+    void syncColorCorrectionFromWheels(const ColorWheels &cw);
+    void updateWhiteBalanceControlsFromCC();
+    void updateBasicTemperatureTintFromCC();
+    void updateGraphicalWheelsFromCC();
 
     ColorCorrection m_cc;
     ColorWheels m_wheels;

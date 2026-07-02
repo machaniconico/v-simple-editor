@@ -4022,10 +4022,70 @@ void MainWindow::setupMenuBar()
     m_colorGradingPanel->setLutList(LutLibrary::instance().allLuts());
     m_colorGradingPanel->close(); // 初期非表示を確実にする
 
+    auto sameColorCorrection = [](const ColorCorrection &a, const ColorCorrection &b) {
+        auto near = [](double x, double y) { return std::abs(x - y) <= 1e-9; };
+        return near(a.brightness, b.brightness)
+            && near(a.contrast, b.contrast)
+            && near(a.saturation, b.saturation)
+            && near(a.hue, b.hue)
+            && near(a.temperature, b.temperature)
+            && near(a.tint, b.tint)
+            && near(a.gamma, b.gamma)
+            && near(a.highlights, b.highlights)
+            && near(a.shadows, b.shadows)
+            && near(a.exposure, b.exposure)
+            && near(a.liftR, b.liftR)
+            && near(a.liftG, b.liftG)
+            && near(a.liftB, b.liftB)
+            && near(a.gammaR, b.gammaR)
+            && near(a.gammaG, b.gammaG)
+            && near(a.gammaB, b.gammaB)
+            && near(a.gainR, b.gainR)
+            && near(a.gainG, b.gainG)
+            && near(a.gainB, b.gainB);
+    };
+    auto writeSelectedClipColorCorrection = [this, sameColorCorrection](const ColorCorrection &cc) {
+        if (!m_timeline || !m_timeline->hasSelection())
+            return false;
+        if (sameColorCorrection(m_timeline->clipColorCorrection(), cc))
+            return false;
+        m_timeline->setClipColorCorrection(cc);
+        return true;
+    };
+    auto applyColorWheelsToPreview = [this](const ColorWheels &cw) {
+        if (!m_player || !m_player->glPreview())
+            return;
+        std::array<std::array<double,4>,3> values;
+        values[0] = {static_cast<double>(cw.lift.x()),
+                     static_cast<double>(cw.lift.y()),
+                     static_cast<double>(cw.lift.z()),
+                     cw.liftLuma};
+        values[1] = {static_cast<double>(cw.gamma.x()),
+                     static_cast<double>(cw.gamma.y()),
+                     static_cast<double>(cw.gamma.z()),
+                     cw.gammaLuma};
+        values[2] = {static_cast<double>(cw.gain.x()),
+                     static_cast<double>(cw.gain.y()),
+                     static_cast<double>(cw.gain.z()),
+                     cw.gainLuma};
+        m_player->glPreview()->setLiftGammaGain(values);
+    };
+    auto applyWhiteBalanceToPreview = [this](const ColorCorrection &cc) {
+        if (!m_player || !m_player->glPreview())
+            return;
+        const double K = 5500.0 + cc.temperature * 30.0;
+        const double rGain = std::clamp(1.0 + (5500.0 - K) / 3000.0, 0.5, 2.0);
+        const double bGain = std::clamp(1.0 + (K - 5500.0) / 3000.0, 0.5, 2.0);
+        const double gGain = 1.0 - (cc.tint / 100.0) * 0.4;
+        m_player->glPreview()->setWhiteBalance(static_cast<float>(rGain),
+                                               static_cast<float>(gGain),
+                                               static_cast<float>(bGain));
+    };
+
     connect(m_colorGradingPanel, &ColorGradingPanel::colorCorrectionChanged,
-            this, [this](const ColorCorrection &cc) {
+            this, [this, writeSelectedClipColorCorrection](const ColorCorrection &cc) {
         if (m_timeline->hasSelection()) {
-            m_timeline->setClipColorCorrection(cc);
+            writeSelectedClipColorCorrection(cc);
             m_player->setColorCorrection(cc);
         }
     });
@@ -4104,33 +4164,29 @@ void MainWindow::setupMenuBar()
         }
     });
     connect(m_colorGradingPanel, &ColorGradingPanel::resetRequested,
-            this, [this]() {
+            this, [this, writeSelectedClipColorCorrection]() {
         if (m_timeline->hasSelection()) {
             ColorCorrection cc;
-            m_timeline->setClipColorCorrection(cc);
+            writeSelectedClipColorCorrection(cc);
             m_player->setColorCorrection(cc);
             m_player->glPreview()->clearLut();
         }
     });
+    connect(m_timeline, &Timeline::clipSelectedOnTrack,
+            this, [this, applyColorWheelsToPreview, applyWhiteBalanceToPreview](int /*trackIdx*/, int /*clipIdx*/) {
+        if (!m_colorGradingPanel || !m_timeline || !m_timeline->hasSelection())
+            return;
+        const ColorCorrection cc = m_timeline->clipColorCorrection();
+        m_colorGradingPanel->setColorCorrection(cc);
+        applyColorWheelsToPreview(m_colorGradingPanel->currentWheels());
+        applyWhiteBalanceToPreview(cc);
+    });
     // US-WIRE-2: wire ColorGradingPanel wheels → GLPreview shader
     connect(m_colorGradingPanel, &ColorGradingPanel::colorWheelsChanged,
-            this, [this](const ColorWheels &cw) {
-        if (!m_player || !m_player->glPreview())
-            return;
-        std::array<std::array<double,4>,3> values;
-        values[0] = {static_cast<double>(cw.lift.x()),
-                     static_cast<double>(cw.lift.y()),
-                     static_cast<double>(cw.lift.z()),
-                     cw.liftLuma};
-        values[1] = {static_cast<double>(cw.gamma.x()),
-                     static_cast<double>(cw.gamma.y()),
-                     static_cast<double>(cw.gamma.z()),
-                     cw.gammaLuma};
-        values[2] = {static_cast<double>(cw.gain.x()),
-                     static_cast<double>(cw.gain.y()),
-                     static_cast<double>(cw.gain.z()),
-                     cw.gainLuma};
-        m_player->glPreview()->setLiftGammaGain(values);
+            this, [this, writeSelectedClipColorCorrection, applyColorWheelsToPreview](const ColorWheels &cw) {
+        applyColorWheelsToPreview(cw);
+        if (m_colorGradingPanel)
+            writeSelectedClipColorCorrection(m_colorGradingPanel->colorCorrection());
     });
 
     // US-CG-1: wire ColorGradingPanel RGB Curves → GLPreview shader.
@@ -4145,10 +4201,12 @@ void MainWindow::setupMenuBar()
     // US-CG-2: wire ColorGradingPanel White-Balance sliders → GLPreview uWb.
     // Sits at the very top of the grade chain (BEFORE LGG / curves / LUT).
     connect(m_colorGradingPanel, &ColorGradingPanel::whiteBalanceChanged,
-            this, [this](float r, float g, float b) {
+            this, [this, writeSelectedClipColorCorrection](float r, float g, float b) {
         if (!m_player || !m_player->glPreview())
             return;
         m_player->glPreview()->setWhiteBalance(r, g, b);
+        if (m_colorGradingPanel)
+            writeSelectedClipColorCorrection(m_colorGradingPanel->colorCorrection());
     });
     connect(m_colorGradingPanel, &ColorGradingPanel::whiteBalancePickModeRequested,
             this, [this](bool enabled) {
