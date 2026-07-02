@@ -147,6 +147,7 @@ int runSubtitleKaraokeSelftest();
 int runSubXlatSelftest();
 int runSwsColorSelftest();
 int runTextBasedEditSelftest();
+int runTextSpacingSelftest();
 int runText3dPreviewSelftest();
 int runTextExportSelftest();
 int runThreePointEditSelftest();

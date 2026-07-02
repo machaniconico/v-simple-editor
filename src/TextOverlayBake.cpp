@@ -7,12 +7,103 @@
 #include <QRadialGradient>
 #include <QPen>
 #include <QFontMetrics>
+#include <QTextLayout>
+#include <QTextOption>
 #include <QThread>
 #include <QtGlobal>
 #include <QtMath>
 #include <atomic>
 #include <algorithm>
 #include <cmath>
+
+namespace {
+
+struct BakeTextLine {
+    QString text;
+    qreal width = 0.0;
+};
+
+QFont bakeFontForOverlay(const EnhancedTextOverlay &ov, double fontScale)
+{
+    QFont font = ov.font;
+    font.setPointSizeF(qMax(1.0, font.pointSizeF() * fontScale));
+    if (ov.letterSpacing != 0.0)
+        font.setLetterSpacing(QFont::AbsoluteSpacing,
+                              ov.letterSpacing * fontScale);
+    return font;
+}
+
+QVector<BakeTextLine> layoutBakeTextLines(const QString &text, const QFont &font,
+                                          qreal maxWidth, bool wordWrap)
+{
+    QVector<BakeTextLine> lines;
+    QTextLayout layout(text, font);
+    QTextOption option;
+    option.setWrapMode(wordWrap ? QTextOption::WordWrap : QTextOption::NoWrap);
+    layout.setTextOption(option);
+    layout.beginLayout();
+    const qreal lineWidth = qMax<qreal>(1.0, maxWidth);
+    while (true) {
+        QTextLine line = layout.createLine();
+        if (!line.isValid())
+            break;
+        line.setLineWidth(lineWidth);
+        QString lineText = text.mid(line.textStart(), line.textLength());
+        lineText.remove(QChar::LineSeparator);
+        lineText.remove(QLatin1Char('\n'));
+        lineText.remove(QLatin1Char('\r'));
+        lines.append({lineText, line.naturalTextWidth()});
+    }
+    layout.endLayout();
+    if (lines.isEmpty() && !text.isEmpty()) {
+        const QFontMetrics fm(font);
+        lines.append({text, static_cast<qreal>(fm.horizontalAdvance(text))});
+    }
+    return lines;
+}
+
+QSize spacedBakeTextSize(const QString &text, const QFont &font, double lineSpacing)
+{
+    const QVector<BakeTextLine> lines =
+        layoutBakeTextLines(text, font, 1'000'000.0, false);
+    const QFontMetrics fm(font);
+    qreal maxWidth = 0.0;
+    for (const BakeTextLine &line : lines)
+        maxWidth = qMax(maxWidth, line.width);
+    const int lineCount = qMax(1, lines.size());
+    const double lineAdvance = qMax(1.0, static_cast<double>(fm.height()) + lineSpacing);
+    const double totalHeight =
+        fm.height() + qMax(0, lineCount - 1) * lineAdvance;
+    return QSize(static_cast<int>(std::ceil(maxWidth)),
+                 static_cast<int>(std::ceil(qMax(1.0, totalHeight))));
+}
+
+QPainterPath spacedBakeTextPath(const QString &text, const QRect &box,
+                                const QFont &font, double lineSpacing)
+{
+    QPainterPath path;
+    const QVector<BakeTextLine> lines =
+        layoutBakeTextLines(text, font, box.width(), true);
+    if (lines.isEmpty())
+        return path;
+
+    const QFontMetrics fm(font);
+    const double lineAdvance = qMax(1.0, static_cast<double>(fm.height()) + lineSpacing);
+    const int lineCount = lines.size();
+    const double totalHeight =
+        fm.height() + qMax(0, lineCount - 1) * lineAdvance;
+    double baselineY = box.top() + (box.height() - totalHeight) * 0.5 + fm.ascent();
+    for (const BakeTextLine &line : lines) {
+        if (!line.text.isEmpty()) {
+            const double x = box.left() + (box.width() - line.width) * 0.5;
+            path.addText(x, baselineY, font, line.text);
+        }
+        baselineY += lineAdvance;
+    }
+    return path;
+}
+
+} // namespace
 
 // The body below is the EXACT text-baking code that used to live inline in
 // VideoPlayer::composeFrameWithOverlays (the authoritative preview baker).
@@ -81,15 +172,16 @@ QImage bakeOverlays(const QImage &source,
         const double end   = (ov.endTime > 0.0) ? ov.endTime : 1e18;
         if (nowSec < start || nowSec >= end) continue;
 
-        QFont font = ov.font;
-        font.setPointSizeF(qMax(1.0, font.pointSizeF() * fontScale));
+        QFont font = bakeFontForOverlay(ov, fontScale);
         p.setFont(font);
 
         const QFontMetrics fm(font);
         int boxW = qMax(1, static_cast<int>(ov.width  * W));
         int boxH = qMax(1, static_cast<int>(ov.height * H));
         if (ov.width <= 0.0 || ov.height <= 0.0) {
-            const QSize textSize = fm.boundingRect(ov.text).size();
+            const QSize textSize = (ov.lineSpacing == 0.0)
+                ? fm.boundingRect(ov.text).size()
+                : spacedBakeTextSize(ov.text, font, ov.lineSpacing * fontScale);
             boxW = textSize.width() + 16;
             boxH = textSize.height() + 8;
         }
@@ -128,12 +220,17 @@ QImage bakeOverlays(const QImage &source,
         // internally; horizontalAdvance + fm.height() drifts by 1-2 px on
         // certain glyph runs because horizontalAdvance includes right-side
         // bearing while the visual glyph rect doesn't).
-        const QRect textRect = fm.boundingRect(
-            box, Qt::AlignCenter | Qt::TextWordWrap, ov.text);
-        const int baselineX = textRect.left();
-        const int baselineY = textRect.top() + fm.ascent();
         QPainterPath path;
-        path.addText(baselineX, baselineY, font, ov.text);
+        if (ov.lineSpacing == 0.0) {
+            const QRect textRect = fm.boundingRect(
+                box, Qt::AlignCenter | Qt::TextWordWrap, ov.text);
+            const int baselineX = textRect.left();
+            const int baselineY = textRect.top() + fm.ascent();
+            path.addText(baselineX, baselineY, font, ov.text);
+        } else {
+            path = spacedBakeTextPath(ov.text, box, font,
+                                      ov.lineSpacing * fontScale);
+        }
 
         if (ov.outlineWidth > 0 && ov.outlineColor.alpha() > 0) {
             QPen outline(ov.outlineColor);

@@ -4,6 +4,8 @@
 #include <QFontMetrics>
 #include <QFile>
 #include <QTextStream>
+#include <QTextLayout>
+#include <QTextOption>
 #include <QJsonDocument>
 #include <QStandardPaths>
 #include <QDir>
@@ -409,6 +411,10 @@ QJsonArray TextManager::toJson(const QVector<EnhancedTextOverlay> &overlays) {
         obj["fontBold"] = o.font.bold();
         obj["color"] = o.color.name(QColor::HexArgb);
         obj["bgColor"] = o.backgroundColor.name(QColor::HexArgb);
+        if (o.letterSpacing != 0.0)
+            obj["letterSpacing"] = o.letterSpacing;
+        if (o.lineSpacing != 0.0)
+            obj["lineSpacing"] = o.lineSpacing;
         obj["x"] = o.x; obj["y"] = o.y;
         obj["width"] = o.width; obj["height"] = o.height;
         obj["rotation"] = o.rotation;
@@ -494,6 +500,8 @@ QVector<EnhancedTextOverlay> TextManager::fromJson(const QJsonArray &arr) {
                         obj["fontBold"].toBool(true) ? QFont::Bold : QFont::Normal);
         o.color = QColor(obj["color"].toString("#ffffffff"));
         o.backgroundColor = QColor(obj["bgColor"].toString("#a0000000"));
+        o.letterSpacing = obj["letterSpacing"].toDouble(0.0);
+        o.lineSpacing = obj["lineSpacing"].toDouble(0.0);
         o.x = obj["x"].toDouble(0.5); o.y = obj["y"].toDouble(0.85);
         o.width = obj["width"].toDouble(); o.height = obj["height"].toDouble();
         o.rotation = obj["rotation"].toDouble();
@@ -570,6 +578,86 @@ QVector<EnhancedTextOverlay> TextManager::fromJson(const QJsonArray &arr) {
 
 // ===== Enhanced Text Renderer =====
 
+namespace {
+
+struct SpacedTextLine {
+    QString text;
+    qreal width = 0.0;
+};
+
+QVector<SpacedTextLine> layoutSpacedTextLines(const QString &text, const QFont &font,
+                                              qreal maxWidth, bool wordWrap)
+{
+    QVector<SpacedTextLine> lines;
+    QTextLayout layout(text, font);
+    QTextOption option;
+    option.setWrapMode(wordWrap ? QTextOption::WordWrap : QTextOption::NoWrap);
+    layout.setTextOption(option);
+    layout.beginLayout();
+    const qreal lineWidth = qMax<qreal>(1.0, maxWidth);
+    while (true) {
+        QTextLine line = layout.createLine();
+        if (!line.isValid())
+            break;
+        line.setLineWidth(lineWidth);
+        QString lineText = text.mid(line.textStart(), line.textLength());
+        lineText.remove(QChar::LineSeparator);
+        lineText.remove(QLatin1Char('\n'));
+        lineText.remove(QLatin1Char('\r'));
+        lines.append({lineText, line.naturalTextWidth()});
+    }
+    layout.endLayout();
+    if (lines.isEmpty() && !text.isEmpty()) {
+        const QFontMetrics fm(font);
+        lines.append({text, static_cast<qreal>(fm.horizontalAdvance(text))});
+    }
+    return lines;
+}
+
+QPainterPath spacedTextPath(const QVector<SpacedTextLine> &lines, const QRect &rect,
+                            const QFont &font, int alignment, double lineSpacing)
+{
+    QPainterPath path;
+    if (lines.isEmpty())
+        return path;
+
+    const QFontMetrics fm(font);
+    const double lineAdvance = qMax(1.0, static_cast<double>(fm.height()) + lineSpacing);
+    double baselineY = rect.top() + fm.ascent();
+    for (const SpacedTextLine &line : lines) {
+        if (!line.text.isEmpty()) {
+            double x = rect.left();
+            if (alignment & Qt::AlignRight)
+                x = rect.right() + 1.0 - line.width;
+            else if (alignment & Qt::AlignHCenter)
+                x = rect.left() + (rect.width() - line.width) * 0.5;
+            path.addText(x, baselineY, font, line.text);
+        }
+        baselineY += lineAdvance;
+    }
+    return path;
+}
+
+QRect spacedTextBounds(const QString &text, const QFont &font, int maxWidth,
+                       bool wordWrap, double lineSpacing)
+{
+    const QVector<SpacedTextLine> lines =
+        layoutSpacedTextLines(text, font, qMax(1, maxWidth), wordWrap);
+    const QFontMetrics fm(font);
+    qreal maxLineWidth = 0.0;
+    for (const SpacedTextLine &line : lines)
+        maxLineWidth = qMax(maxLineWidth, line.width);
+    const int lineCount = qMax(1, lines.size());
+    const double lineAdvance = qMax(1.0, static_cast<double>(fm.height()) + lineSpacing);
+    const double totalHeight =
+        fm.height() + qMax(0, lineCount - 1) * lineAdvance;
+    return QRect(0, 0,
+                 static_cast<int>(std::ceil(maxLineWidth)),
+                 static_cast<int>(std::ceil(qMax(1.0, totalHeight))));
+}
+
+} // namespace
+
 void EnhancedTextRenderer::render(QImage &frame, const EnhancedTextOverlay &overlay, double currentTime)
 {
     if (!overlay.visible || overlay.text.isEmpty()) return;
@@ -637,12 +725,18 @@ void EnhancedTextRenderer::render(QImage &frame, const EnhancedTextOverlay &over
     }
 
     scaledFont.setPointSizeF(overlay.font.pointSizeF() * animScale);
+    if (overlay.letterSpacing != 0.0)
+        scaledFont.setLetterSpacing(QFont::AbsoluteSpacing,
+                                    overlay.letterSpacing * animScale);
     painter.setFont(scaledFont);
     QFontMetrics fm(scaledFont);
 
     QString displayText = overlay.text.left(visibleChars);
     int flags = overlay.alignment | (overlay.wordWrap ? Qt::TextWordWrap : 0);
-    QRect textBounds = fm.boundingRect(QRect(0, 0, frame.width() - 40, 0), flags, displayText);
+    QRect textBounds = (overlay.lineSpacing == 0.0)
+        ? fm.boundingRect(QRect(0, 0, frame.width() - 40, 0), flags, displayText)
+        : spacedTextBounds(displayText, scaledFont, frame.width() - 40,
+                           overlay.wordWrap, overlay.lineSpacing * animScale);
 
     int px = static_cast<int>((posX + animX) * frame.width()) - textBounds.width() / 2;
     int py = static_cast<int>((posY + animY) * frame.height()) - textBounds.height() / 2;
@@ -672,12 +766,32 @@ void EnhancedTextRenderer::render(QImage &frame, const EnhancedTextOverlay &over
     if (overlay.glow.enabled)
         renderGlow(painter, displayText, drawRect, overlay);
 
-    // Outline (second/outer first, then inner)
-    renderOutline(painter, displayText, drawRect, overlay);
+    if (overlay.lineSpacing != 0.0) {
+        const QVector<SpacedTextLine> lines =
+            layoutSpacedTextLines(displayText, scaledFont, drawRect.width(), overlay.wordWrap);
+        const QPainterPath path =
+            spacedTextPath(lines, drawRect, scaledFont, overlay.alignment,
+                           overlay.lineSpacing * animScale);
 
-    // Main text
-    painter.setPen(overlay.color);
-    painter.drawText(drawRect, flags, displayText);
+        if (overlay.outline2Width > 0 && overlay.outline2Color.alpha() > 0) {
+            painter.setPen(QPen(overlay.outline2Color,
+                                overlay.outlineWidth + overlay.outline2Width * 2));
+            painter.drawPath(path);
+        }
+        if (overlay.outlineWidth > 0) {
+            painter.setPen(QPen(overlay.outlineColor, overlay.outlineWidth));
+            painter.drawPath(path);
+        }
+
+        painter.fillPath(path, overlay.color);
+    } else {
+        // Outline (second/outer first, then inner)
+        renderOutline(painter, displayText, drawRect, overlay);
+
+        // Main text
+        painter.setPen(overlay.color);
+        painter.drawText(drawRect, flags, displayText);
+    }
 
     // Ruby/Furigana
     if (!overlay.rubyAnnotations.isEmpty())

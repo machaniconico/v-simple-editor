@@ -324,6 +324,19 @@ extern "C" {
 
 namespace {
 
+constexpr const char *kTextToolLetterSpacingSpinName = "textToolLetterSpacingSpin";
+constexpr const char *kTextToolLineSpacingSpinName = "textToolLineSpacingSpin";
+
+double textToolDoubleSpinValue(const QObject *root, const char *objectName,
+                               double fallback)
+{
+    if (!root)
+        return fallback;
+    const auto *spin = root->findChild<QDoubleSpinBox *>(
+        QString::fromLatin1(objectName));
+    return spin ? spin->value() : fallback;
+}
+
 QString lutPathForClipExport(const LutData &lut)
 {
     if (!lut.isValid())
@@ -6890,6 +6903,28 @@ void MainWindow::setupToolPropertyPanel()
             this, [this](int) { pushTextToolStyleToPreview(); });
     form->addRow("サイズ", m_textToolSizeSpin);
 
+    auto *letterSpacingSpin = new QDoubleSpinBox(textPage);
+    letterSpacingSpin->setObjectName(QString::fromLatin1(kTextToolLetterSpacingSpinName));
+    letterSpacingSpin->setRange(-20.0, 200.0);
+    letterSpacingSpin->setDecimals(1);
+    letterSpacingSpin->setSingleStep(0.5);
+    letterSpacingSpin->setSuffix(" px");
+    letterSpacingSpin->setValue(0.0);
+    connect(letterSpacingSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+            this, [this](double) { pushTextToolStyleToPreview(); });
+    form->addRow("字間", letterSpacingSpin);
+
+    auto *lineSpacingSpin = new QDoubleSpinBox(textPage);
+    lineSpacingSpin->setObjectName(QString::fromLatin1(kTextToolLineSpacingSpinName));
+    lineSpacingSpin->setRange(-20.0, 200.0);
+    lineSpacingSpin->setDecimals(1);
+    lineSpacingSpin->setSingleStep(0.5);
+    lineSpacingSpin->setSuffix(" px");
+    lineSpacingSpin->setValue(0.0);
+    connect(lineSpacingSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+            this, [this](double) { pushTextToolStyleToPreview(); });
+    form->addRow("行間", lineSpacingSpin);
+
     m_textToolColor = Qt::white;
     m_textToolColorButton = new QPushButton(textPage);
     m_textToolColorButton->setText("色を選択...");
@@ -7266,6 +7301,10 @@ void MainWindow::pushTextToolStyleToPreview()
     QFont f("Arial");
     f.setPointSize(m_textToolSizeSpin ? m_textToolSizeSpin->value() : 32);
     f.setBold(true);
+    const double letterSpacing =
+        textToolDoubleSpinValue(m_toolPropertyStack, kTextToolLetterSpacingSpinName, 0.0);
+    if (letterSpacing != 0.0)
+        f.setLetterSpacing(QFont::AbsoluteSpacing, letterSpacing);
     m_player->setTextToolStyle(f, m_textToolColor);
 }
 
@@ -7294,6 +7333,12 @@ void MainWindow::applyTextToolOverlay()
     overlay.text = m_textToolLineEdit->text();
     QFont font = overlay.font;
     font.setPointSize(m_textToolSizeSpin ? m_textToolSizeSpin->value() : 32);
+    overlay.letterSpacing =
+        textToolDoubleSpinValue(m_toolPropertyStack, kTextToolLetterSpacingSpinName, 0.0);
+    overlay.lineSpacing =
+        textToolDoubleSpinValue(m_toolPropertyStack, kTextToolLineSpacingSpinName, 0.0);
+    if (overlay.letterSpacing != 0.0)
+        font.setLetterSpacing(QFont::AbsoluteSpacing, overlay.letterSpacing);
     overlay.font = font;
     overlay.color = m_textToolColor;
     // Transparent background by default — the user explicitly asked for it
