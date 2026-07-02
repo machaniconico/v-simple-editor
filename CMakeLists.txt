@@ -293,6 +293,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/AscCdlExportDialog.cpp
     src/selftests/asc_cdl_export_selftest.cpp
     src/selftests/clip_color_selftest.cpp
+    src/selftests/ClipLutSelftest.cpp
     src/selftests/clip_idt_selftest.cpp
     src/selftests/clip_odt_selftest.cpp
     src/selftests/sws_color_selftest.cpp

@@ -54,6 +54,7 @@ int runCapcutCaptionSelftest();
 int runCaptionSelftest();
 int runChromaSelftest();
 int runClipColorSelftest();
+int runClipLutSelftest();
 int runClipParentParitySelftest();
 int runClipIdtSelftest();
 int runClipOdtSelftest();
@@ -602,6 +603,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Adjustment clip model: V1-wins z-order, behind-only effect stack, byte-identical off path, JSON true-only persistence" },
     { "frame-export",      "VEDITOR_FRAME_EXPORT_SELFTEST",        runFrameExportSelftest,        true,
       "Still-frame export: renderFrameAt SSOT -> PNG/JPEG save engine + PNG pixel-identical reread" },
+    { "clip-lut",          "VEDITOR_CLIP_LUT_SELFTEST",            runClipLutSelftest,            true,
+      "Clip LUT: per-clip ProjectFile round-trip + renderFrameAt LUT reflection + no-LUT byte-identical gate" },
     { "parity",            "VEDITOR_PARITY_SELFTEST",             runParitySelftest,             true,
       "Preview vs export pixel-parity (S1-S11, framediff::mse, 10-bit HDR10)" },
     { "keyframe-anim-parity", "VEDITOR_KEYFRAME_ANIM_PARITY_SELFTEST", runKeyframeAnimParitySelftest, true,

@@ -324,6 +324,45 @@ extern "C" {
 
 namespace {
 
+QString lutPathForClipExport(const LutData &lut)
+{
+    if (!lut.isValid())
+        return QString();
+    if (!lut.filePath.isEmpty())
+        return lut.filePath;
+
+    QString baseDir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    if (baseDir.isEmpty())
+        baseDir = QDir::homePath() + QStringLiteral("/.veditor");
+    const QString dirPath = QDir(baseDir).filePath(QStringLiteral("generated-luts"));
+    if (!QDir().mkpath(dirPath))
+        return QString();
+
+    QString safeName;
+    safeName.reserve(lut.name.size());
+    for (const QChar ch : lut.name) {
+        safeName.append(ch.isLetterOrNumber() ? ch.toLower() : QLatin1Char('_'));
+    }
+    if (safeName.isEmpty())
+        safeName = QStringLiteral("builtin_lut");
+
+    const QString path = QDir(dirPath).filePath(safeName + QStringLiteral(".cube"));
+    QFile file(path);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Text))
+        return QString();
+
+    QTextStream out(&file);
+    out.setRealNumberNotation(QTextStream::FixedNotation);
+    out.setRealNumberPrecision(9);
+    out << "TITLE \"" << lut.name << "\"\n";
+    out << "LUT_3D_SIZE " << lut.size << "\n";
+    out << "DOMAIN_MIN 0 0 0\n";
+    out << "DOMAIN_MAX 1 1 1\n";
+    for (const QVector3D &rgb : lut.table)
+        out << rgb.x() << ' ' << rgb.y() << ' ' << rgb.z() << '\n';
+    return path;
+}
+
 struct VideoSourceInfo {
     double fps = 30.0;
     int frameCount = 0;
@@ -3990,25 +4029,77 @@ void MainWindow::setupMenuBar()
             m_player->setColorCorrection(cc);
         }
     });
+    auto writeSelectedClipLut = [this](const QString &lutPath, double intensity) -> bool {
+        if (!m_timeline)
+            return false;
+
+        int trackIdx = -1;
+        int clipIdx = -1;
+        ClipInfo selected;
+        if (!selectedVideoClipRef(trackIdx, clipIdx, &selected))
+            return false;
+
+        TimelineTrack *track = m_timeline->videoTracks().value(trackIdx, nullptr);
+        if (!track)
+            return false;
+
+        QVector<ClipInfo> clips = track->clips();
+        if (clipIdx < 0 || clipIdx >= clips.size())
+            return false;
+
+        const double clampedIntensity = lutPath.isEmpty()
+            ? 1.0
+            : qBound(0.0, intensity, 1.0);
+        ClipInfo &clip = clips[clipIdx];
+        if (clip.lutFilePath == lutPath
+            && std::abs(clip.lutIntensity - clampedIntensity) <= 1e-9) {
+            return true;
+        }
+
+        clip.lutFilePath = lutPath;
+        clip.lutIntensity = clampedIntensity;
+        track->setClips(clips);
+
+        if (m_timeline->undoManager())
+            m_timeline->undoManager()->saveState(
+                m_timeline->currentState(), QStringLiteral("Clip LUT"));
+        m_timeline->refreshPlaybackSequence();
+        return true;
+    };
     connect(m_colorGradingPanel, &ColorGradingPanel::lutSelected,
-            this, [this](const QString &name) {
+            this, [this, writeSelectedClipLut](const QString &name) {
         if (name.isEmpty()) {
+            writeSelectedClipLut(QString(), m_colorGradingPanel->lutIntensity());
             m_player->glPreview()->clearLut();
             return;
         }
         LutData lut = LutLibrary::instance().findByName(name);
         if (lut.isValid()) {
             lut.intensity = m_colorGradingPanel->lutIntensity();
+            const QString clipLutPath = lutPathForClipExport(lut);
+            if (clipLutPath.isEmpty()) {
+                statusBar()->showMessage("Could not prepare LUT for clip/export", 3000);
+                return;
+            }
+            if (!writeSelectedClipLut(clipLutPath, lut.intensity))
+                statusBar()->showMessage("Select a clip to apply LUT", 3000);
             m_player->glPreview()->setLut(lut);
         }
     });
     connect(m_colorGradingPanel, &ColorGradingPanel::lutIntensityChanged,
-            this, [this](double intensity) {
+            this, [this, writeSelectedClipLut](double intensity) {
         QString name = m_colorGradingPanel->selectedLutName();
         if (name.isEmpty()) return;
         LutData lut = LutLibrary::instance().findByName(name);
         if (lut.isValid()) {
             lut.intensity = intensity;
+            const QString clipLutPath = lutPathForClipExport(lut);
+            if (clipLutPath.isEmpty()) {
+                statusBar()->showMessage("Could not prepare LUT for clip/export", 3000);
+                return;
+            }
+            if (!writeSelectedClipLut(clipLutPath, intensity))
+                statusBar()->showMessage("Select a clip to apply LUT", 3000);
             m_player->glPreview()->setLut(lut);
         }
     });

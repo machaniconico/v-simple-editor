@@ -1331,6 +1331,10 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
         obj["fitContain"] = true;
     if (clip.fitCover)
         obj["fitCover"] = true;
+    if (!clip.lutFilePath.isEmpty()) {
+        obj["lutFilePath"] = clip.lutFilePath;
+        obj["lutIntensity"] = clip.lutIntensity;
+    }
 
     if (!clip.volumeEnvelope.isEmpty()) {
         QJsonArray envArr;
@@ -1400,6 +1404,10 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
     clip.motionBlurEnabled = obj["motionBlurEnabled"].toBool(false);
     clip.fitContain = obj["fitContain"].toBool(false);
     clip.fitCover = obj["fitCover"].toBool(false);
+    clip.lutFilePath = obj["lutFilePath"].toString();
+    clip.lutIntensity = qBound(0.0, obj["lutIntensity"].toDouble(1.0), 1.0);
+    if (clip.lutFilePath.isEmpty())
+        clip.lutIntensity = 1.0;
     if (!clip.is3DLayer)
         clip.layer3D.reset();
 
