@@ -232,9 +232,12 @@ int runColorMatchApplySelftest()
     // NOTE: renderFrameAt of this encoded synthetic clip is not byte-stable
     // across calls (decoder-level noise; eqRerender=0 observed even for
     // identical timeline state), so these gates use mean-abs-diff thresholds:
-    // the LUT shift is large (>2.0/ch), decoder noise is tiny (<0.5/ch).
+    // the LUT shift is large (~80/ch); decoder noise reached ~1.5/ch under
+    // system load; per-run noise reached ~8/ch. Fixed thresholds are unstable,
+    // so G8 is RELATIVE: restored means 4x closer to baseline than to the
+    // LUT-applied frame (scale-free; flips decisively if the LUT survived).
     check(7, "renderFrameAt reflects generated LUT",
-          !appliedFrame.isNull() && meanAbsDiff(appliedFrame, baselineFrame) > 2.0,
+          !appliedFrame.isNull() && meanAbsDiff(appliedFrame, baselineFrame) > 20.0,
           QStringLiteral("mae=%1").arg(meanAbsDiff(appliedFrame, baselineFrame)));
 
     timeline.undo();
@@ -245,7 +248,7 @@ int runColorMatchApplySelftest()
               && undoClips.first().lutFilePath.isEmpty()
               && std::abs(undoClips.first().lutIntensity - 1.0) <= 1e-9
               && !undoFrame.isNull()
-              && meanAbsDiff(undoFrame, baselineFrame) < 0.5,
+              && meanAbsDiff(undoFrame, baselineFrame) * 4.0 < meanAbsDiff(undoFrame, appliedFrame),
           QStringLiteral("clips=%1 lutPath='%2' intensity=%3 maeVsBaseline=%4 maeVsApplied=%5")
               .arg(undoClips.size())
               .arg(undoClips.isEmpty() ? QStringLiteral("-") : undoClips.first().lutFilePath)
