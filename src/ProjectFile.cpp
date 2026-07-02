@@ -1460,6 +1460,20 @@ QJsonObject ProjectFile::colorCorrectionToJson(const ColorCorrection &cc)
     obj["highlights"] = cc.highlights;
     obj["shadows"] = cc.shadows;
     obj["exposure"] = cc.exposure;
+
+    auto addIfNonZero = [&obj](const QString &key, double value) {
+        if (value != 0.0)
+            obj[key] = value;
+    };
+    addIfNonZero(QStringLiteral("liftR"), cc.liftR);
+    addIfNonZero(QStringLiteral("liftG"), cc.liftG);
+    addIfNonZero(QStringLiteral("liftB"), cc.liftB);
+    addIfNonZero(QStringLiteral("gammaR"), cc.gammaR);
+    addIfNonZero(QStringLiteral("gammaG"), cc.gammaG);
+    addIfNonZero(QStringLiteral("gammaB"), cc.gammaB);
+    addIfNonZero(QStringLiteral("gainR"), cc.gainR);
+    addIfNonZero(QStringLiteral("gainG"), cc.gainG);
+    addIfNonZero(QStringLiteral("gainB"), cc.gainB);
     return obj;
 }
 
@@ -1476,6 +1490,15 @@ ColorCorrection ProjectFile::colorCorrectionFromJson(const QJsonObject &obj)
     cc.highlights = obj["highlights"].toDouble();
     cc.shadows = obj["shadows"].toDouble();
     cc.exposure = obj["exposure"].toDouble();
+    cc.liftR = obj["liftR"].toDouble(0.0);
+    cc.liftG = obj["liftG"].toDouble(0.0);
+    cc.liftB = obj["liftB"].toDouble(0.0);
+    cc.gammaR = obj["gammaR"].toDouble(0.0);
+    cc.gammaG = obj["gammaG"].toDouble(0.0);
+    cc.gammaB = obj["gammaB"].toDouble(0.0);
+    cc.gainR = obj["gainR"].toDouble(0.0);
+    cc.gainG = obj["gainG"].toDouble(0.0);
+    cc.gainB = obj["gainB"].toDouble(0.0);
     return cc;
 }
 

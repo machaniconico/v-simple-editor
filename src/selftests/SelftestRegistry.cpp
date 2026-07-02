@@ -81,6 +81,7 @@ int runFrameExportSelftest();
 int runFcpxmlSelftest();
 int runFrameIoSelftest();
 int runGraphEditorSelftest();
+int runGradeLggSerializationSelftest();
 int runHdrRoutingSelftest();
 int runHdrSelftest();
 int runHwPerfSelftest();
@@ -444,6 +445,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
 #endif
     { "project-preset",    "VEDITOR_PROJECT_PRESET_SELFTEST",     runProjectPresetSelftest,      false,
       "Tracker preset state persistence in ProjectFile save/load cycle (10 gates)" },
+    { "grade-lgg-serialization", "VEDITOR_GRADE_LGG_SERIALIZATION_SELFTEST", runGradeLggSerializationSelftest, false,
+      "ColorCorrection LGG 9-field project serialization round-trip/default-omit/backward-compat gates" },
     { "aihighlight",       "VEDITOR_AIHIGHLIGHT_SELFTEST",        runAIHighlightSelftest,        false,
       "AIHighlight config defaults / Highlight struct helpers (singleton-free, 6 gates)" },
     { "videostab-deshake", "VEDITOR_VIDEOSTAB_DESHAKE_SELFTEST",  runVideostabDeshakeSelftest,   false,
