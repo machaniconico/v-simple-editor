@@ -821,7 +821,7 @@ void TimelineTrack::moveClip(int fromIndex, int toIndex)
     emit clipMoved(fromIndex, toIndex); emit modified();
 }
 
-void TimelineTrack::splitClipAt(int index, double localSeconds)
+void TimelineTrack::splitClipAt(int index, double localSeconds, bool notify)
 {
     if (index < 0 || index >= m_clips.size()) return;
     ClipInfo &original = m_clips[index];
@@ -836,7 +836,9 @@ void TimelineTrack::splitClipAt(int index, double localSeconds)
     secondHalf.leadInSec = 0.0;
     original.outPoint = splitPoint;
     m_clips.insert(index + 1, secondHalf);
-    updateMinimumWidth(); update(); emit modified();
+    if (notify) {
+        updateMinimumWidth(); update(); emit modified();
+    }
 }
 
 bool TimelineTrack::applyTrim(int clipIndex, trimops::TrimType type,
@@ -861,7 +863,7 @@ void TimelineTrack::applyDragMove(int clipIdx, double leadIn, double nextLeadIn)
     update();
 }
 
-void TimelineTrack::removeClipPreservingDownstream(int index)
+void TimelineTrack::removeClipPreservingDownstream(int index, bool notify)
 {
     if (index < 0 || index >= m_clips.size()) return;
     const double absorbed = m_clips[index].leadInSec + m_clips[index].effectiveDuration();
@@ -877,9 +879,11 @@ void TimelineTrack::removeClipPreservingDownstream(int index)
     }
     m_selectedClips = newSel;
     const int primary = m_selectedClips.isEmpty() ? -1 : m_selectedClips.last();
-    updateMinimumWidth(); update();
-    emit selectionChanged(primary, false);
-    emit modified();
+    if (notify) {
+        updateMinimumWidth(); update();
+        emit selectionChanged(primary, false);
+        emit modified();
+    }
 }
 
 void TimelineTrack::insertClipPreservingDownstream(int index, const ClipInfo &clip, double leadInSec)
@@ -936,7 +940,7 @@ void TimelineTrack::overwriteClip3Point(double timelineStartSec, const ClipInfo 
     // 各プリミティブが update() / emit modified() を内包しているので追加処理は不要。
 }
 
-bool TimelineTrack::rippleDeleteTimeRange(double startSec, double endSec)
+bool TimelineTrack::rippleDeleteTimeRange(double startSec, double endSec, bool notify)
 {
     // TB-3: タイムラインの [startSec, endSec) を削除し、後続クリップを左へ詰める。
     // 既存の split/remove プリミティブだけで構成し、時間↔leadInSec モデルは
@@ -965,7 +969,7 @@ bool TimelineTrack::rippleDeleteTimeRange(double startSec, double endSec)
             const double clipEnd = clipStart + m_clips[i].effectiveDuration();
             if (t > clipStart + kEps && t < clipEnd - kEps) {
                 const int beforeCount = m_clips.size();
-                splitClipAt(i, t - clipStart);   // clip-local 秒
+                splitClipAt(i, t - clipStart, notify);   // clip-local 秒
                 if (m_clips.size() != beforeCount)
                     changed = true;
                 return;
@@ -995,7 +999,7 @@ bool TimelineTrack::rippleDeleteTimeRange(double startSec, double endSec)
     if (!toRemove.isEmpty())
         changed = true;
     for (int j = toRemove.size() - 1; j >= 0; --j)
-        removeClipPreservingDownstream(toRemove[j]);
+        removeClipPreservingDownstream(toRemove[j], notify);
 
     // (3) リップル: 削除区間ぶん後続クリップを左へ詰める。削除区間の直後に
     //     位置するクリップ (タイムライン開始が startSec 以降の最初のクリップ) の
@@ -1019,7 +1023,9 @@ bool TimelineTrack::rippleDeleteTimeRange(double startSec, double endSec)
 
     if (!changed)
         return false;
-    updateMinimumWidth(); update(); emit modified();
+    updateMinimumWidth(); update();
+    if (notify)
+        emit modified();
     return true;
 }
 
@@ -1521,8 +1527,12 @@ void TimelineTrack::mousePressEvent(QMouseEvent *event)
     const int clipIndex = clipAtX(event->pos().x());
     if (tryHitEnvelopeKeyframe(event, clipIndex)) return;
     const bool additive = event->modifiers() & (Qt::ShiftModifier | Qt::ControlModifier);
-    if (event->button() == Qt::RightButton && clipIndex >= 0) {
-        emit clipContextMenuRequested(clipIndex, event->globalPosition().toPoint());
+    if (event->button() == Qt::RightButton) {
+        if (clipIndex >= 0)
+            emit clipContextMenuRequested(clipIndex, event->globalPosition().toPoint());
+        else
+            emit gapContextMenuRequested(qMax(0.0, xToSeconds(event->pos().x())),
+                                         event->globalPosition().toPoint());
         event->accept(); return;
     }
     QRectF clipRect;
@@ -3239,8 +3249,215 @@ void Timeline::deleteSelectedClip()
     }
 }
 
-void Timeline::rippleDeleteSelectedClip() { deleteSelectedClip(); }
-bool Timeline::hasSelection() const { return m_videoTrack->selectedClip() >= 0; }
+namespace {
+
+bool trackClipTimeRangeAt(const TimelineTrack *track, int clipIndex,
+                          double *outStart, double *outEnd)
+{
+    if (!track || clipIndex < 0 || clipIndex >= track->clipCount())
+        return false;
+    const auto &clips = track->clips();
+    double cursor = 0.0;
+    for (int i = 0; i < clips.size(); ++i) {
+        const double clipStart = cursor + clips[i].leadInSec;
+        const double clipEnd = clipStart + clips[i].effectiveDuration();
+        if (i == clipIndex) {
+            if (outStart) *outStart = clipStart;
+            if (outEnd) *outEnd = clipEnd;
+            return clipEnd > clipStart;
+        }
+        cursor = clipEnd;
+    }
+    return false;
+}
+
+bool trackRangeOverlapsClip(const TimelineTrack *track, double startSec, double endSec)
+{
+    if (!track)
+        return false;
+    constexpr double kEps = 1e-6;
+    const auto &clips = track->clips();
+    double cursor = 0.0;
+    for (const ClipInfo &clip : clips) {
+        const double clipStart = cursor + clip.leadInSec;
+        const double clipEnd = clipStart + clip.effectiveDuration();
+        if (clipStart < endSec - kEps && clipEnd > startSec + kEps)
+            return true;
+        cursor = clipEnd;
+    }
+    return false;
+}
+
+} // namespace
+
+QVector<Timeline::TimeRangeSec> Timeline::selectedClipTimeRanges() const
+{
+    QVector<TimeRangeSec> ranges;
+    auto collect = [&](const QVector<TimelineTrack *> &tracks) {
+        for (const auto *track : tracks) {
+            if (!track)
+                continue;
+            for (int clipIndex : track->selectedClips()) {
+                double start = 0.0;
+                double end = 0.0;
+                if (trackClipTimeRangeAt(track, clipIndex, &start, &end)
+                    && end > start) {
+                    ranges.append(TimeRangeSec{start, end});
+                }
+            }
+        }
+    };
+    collect(m_videoTracks);
+    collect(m_audioTracks);
+    return ranges;
+}
+
+bool Timeline::gapTimeRangeAt(TimelineTrack *track, double timeSec, TimeRangeSec *outRange) const
+{
+    if (!track)
+        return false;
+    constexpr double kEps = 1e-6;
+    timeSec = qMax(0.0, timeSec);
+    const auto &clips = track->clips();
+    double cursor = 0.0;
+    for (const ClipInfo &clip : clips) {
+        const double clipStart = cursor + clip.leadInSec;
+        if (clipStart - cursor > kEps
+            && timeSec >= cursor - kEps
+            && timeSec < clipStart - kEps) {
+            if (outRange)
+                *outRange = TimeRangeSec{cursor, clipStart};
+            return true;
+        }
+        cursor = clipStart + clip.effectiveDuration();
+    }
+    return false;
+}
+
+bool Timeline::applyRippleDeleteTimeRangesToAllTracks(QVector<TimeRangeSec> ranges,
+                                                      const QString &undoLabel)
+{
+    constexpr double kEps = 1e-6;
+    QVector<TimeRangeSec> valid;
+    valid.reserve(ranges.size());
+    for (const TimeRangeSec &range : ranges) {
+        if (range.endSec - range.startSec > kEps)
+            valid.append(range);
+    }
+    if (valid.isEmpty())
+        return false;
+
+    std::sort(valid.begin(), valid.end(), [&](const TimeRangeSec &a, const TimeRangeSec &b) {
+        if (qAbs(a.startSec - b.startSec) > kEps)
+            return a.startSec < b.startSec;
+        return a.endSec < b.endSec;
+    });
+
+    QVector<TimeRangeSec> merged;
+    for (const TimeRangeSec &range : valid) {
+        if (merged.isEmpty() || range.startSec > merged.last().endSec + kEps) {
+            merged.append(range);
+        } else {
+            merged.last().endSec = qMax(merged.last().endSec, range.endSec);
+        }
+    }
+
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    bool changed = false;
+    for (int i = merged.size() - 1; i >= 0; --i) {
+        const TimeRangeSec range = merged[i];
+        for (auto *track : m_videoTracks) {
+            if (track)
+                changed = track->rippleDeleteTimeRange(range.startSec, range.endSec, false) || changed;
+        }
+        for (auto *track : m_audioTracks) {
+            if (track)
+                changed = track->rippleDeleteTimeRange(range.startSec, range.endSec, false) || changed;
+        }
+    }
+
+    if (!changed)
+        return false;
+
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+    saveUndoState(undoLabel);
+    if (!hasAnySelection()) {
+        m_activeVideoTrackIndex = -1;
+        emit clipSelected(-1);
+        emit clipSelectedOnTrack(-1, -1);
+    }
+    ensureSequenceFitsViewport();
+    scheduleEmitSequenceChanged();
+    scheduleEmitSequenceChanged();
+    updateInfoLabel();
+    return true;
+}
+
+void Timeline::rippleDeleteSelectedClip()
+{
+    applyRippleDeleteTimeRangesToAllTracks(selectedClipTimeRanges(),
+                                           QStringLiteral("リップル削除"));
+}
+
+bool Timeline::closeGapAt(TimelineTrack *track, double timeSec)
+{
+    TimeRangeSec gap;
+    if (!gapTimeRangeAt(track, timeSec, &gap))
+        return false;
+
+    for (const auto *t : m_videoTracks) {
+        if (trackRangeOverlapsClip(t, gap.startSec, gap.endSec))
+            return false;
+    }
+    for (const auto *t : m_audioTracks) {
+        if (trackRangeOverlapsClip(t, gap.startSec, gap.endSec))
+            return false;
+    }
+
+    QVector<TimeRangeSec> ranges;
+    ranges.append(gap);
+    return applyRippleDeleteTimeRangesToAllTracks(ranges,
+                                                  QStringLiteral("ギャップを詰める"));
+}
+
+void Timeline::showGapContextMenu(TimelineTrack *track, double timeSec, const QPoint &globalPos)
+{
+    TimeRangeSec gap;
+    if (!gapTimeRangeAt(track, timeSec, &gap))
+        return;
+
+    bool blockedByClip = false;
+    for (const auto *t : m_videoTracks)
+        blockedByClip = blockedByClip || trackRangeOverlapsClip(t, gap.startSec, gap.endSec);
+    for (const auto *t : m_audioTracks)
+        blockedByClip = blockedByClip || trackRangeOverlapsClip(t, gap.startSec, gap.endSec);
+
+    QMenu menu;
+    QAction *closeGapAct = menu.addAction(QStringLiteral("ギャップを詰める"));
+    closeGapAct->setEnabled(!blockedByClip);
+    QAction *chosen = menu.exec(globalPos);
+    if (chosen == closeGapAct && closeGapAct->isEnabled())
+        closeGapAt(track, timeSec);
+}
+
+bool Timeline::hasSelection() const
+{
+    return m_videoTrack && m_videoTrack->selectedClip() >= 0;
+}
+
+bool Timeline::hasAnySelection() const
+{
+    for (const auto *track : m_videoTracks) {
+        if (track && track->selectedClip() >= 0)
+            return true;
+    }
+    for (const auto *track : m_audioTracks) {
+        if (track && track->selectedClip() >= 0)
+            return true;
+    }
+    return false;
+}
 
 bool Timeline::addTextOverlayToFirstVideoClip(const EnhancedTextOverlay &overlay)
 {
@@ -5250,6 +5467,10 @@ void Timeline::wireTrackSelection(TimelineTrack *track)
         [this, track](int clipIndex, const QPoint &globalPos) {
             showClipContextMenu(track, clipIndex, globalPos);
         });
+    connect(track, &TimelineTrack::gapContextMenuRequested, this,
+        [this, track](double timeSec, const QPoint &globalPos) {
+            showGapContextMenu(track, timeSec, globalPos);
+        });
     connect(track, &TimelineTrack::linkedDragStarted, this,
         [this, track](int clipIdx) {
             captureLinkedDragPartners(track, clipIdx);
@@ -6008,6 +6229,13 @@ void Timeline::restoreState(const TimelineState &state)
     clearAllSelections();
     m_activeVideoTrackIndex = -1;
 
+    const bool legacySelectionState =
+        state.selectedVideoTrackIndex < 0
+        && state.selectedVideoClipIndex < 0
+        && state.selectedAudioTrackIndex < 0
+        && state.selectedAudioClipIndex < 0
+        && state.selectedClip >= 0;
+
     bool videoSelSet = false;
     if (state.selectedVideoTrackIndex >= 0
         && state.selectedVideoTrackIndex < m_videoTracks.size()) {
@@ -6018,9 +6246,9 @@ void Timeline::restoreState(const TimelineState &state)
             videoSelSet = true;
         }
     }
-    // Fallback to legacy V1-relative selection for undo entries that
-    // predate the V2 track-aware fields (selectedVideoTrackIndex == -1).
-    if (!videoSelSet) {
+    // Restore explicit "no video selection" snapshots too; only mirror V1 to
+    // A1 for genuinely legacy snapshots that predate the track-aware fields.
+    if (!videoSelSet && (legacySelectionState || state.selectedVideoTrackIndex < 0)) {
         const bool vWas = m_videoTrack->blockSignals(true);
         m_videoTrack->setSelectedClip(state.selectedClip);
         m_videoTrack->blockSignals(vWas);
@@ -6042,11 +6270,9 @@ void Timeline::restoreState(const TimelineState &state)
             at->setSelectedClip(state.selectedAudioClipIndex);
             at->blockSignals(aWas);
         }
-    } else if (state.selectedAudioTrackIndex < 0) {
+    } else if (legacySelectionState) {
         // Legacy fallback: old undo entries predating the V2 track-aware
-        // fields restore selection on A1 the same as V1. If
-        // selectedAudioTrackIndex >= 0 but the track no longer exists,
-        // clear selection silently (no fallback).
+        // fields restore selection on A1 the same as V1.
         const bool aWas = m_audioTrack->blockSignals(true);
         m_audioTrack->setSelectedClip(state.selectedClip);
         m_audioTrack->blockSignals(aWas);

@@ -231,7 +231,7 @@ public:
     void insertClip(int index, const ClipInfo &clip);
     void removeClip(int index);
     void moveClip(int fromIndex, int toIndex);
-    void splitClipAt(int index, double localSeconds);
+    void splitClipAt(int index, double localSeconds, bool notify = true);
     // TR-3: 純粋エンジン trimops::applyTrim を clip[clipIndex] に適用する。
     // 成功時は split/insert と同じ後処理 (updateMinimumWidth/update/emit
     // modified) を行い true を返す。失敗 (不正 index / 境界違反) 時は
@@ -258,7 +258,7 @@ public:
     // Remove clip[index] and push its freed time (leadInSec + effectiveDur)
     // into clip[index+1]'s leadInSec so downstream clips keep their absolute
     // timeline positions. Used by cross-track drag.
-    void removeClipPreservingDownstream(int index);
+    void removeClipPreservingDownstream(int index, bool notify = true);
     // Insert clip at (index), with a specific leadInSec, then subtract the
     // inserted clip's footprint from clip[index+1]'s leadInSec so downstream
     // clips don't slide right. Caller must have verified the plan fits.
@@ -279,7 +279,7 @@ public:
     // 空 / 範囲外 / startSec>=endSec は安全に no-op。既存の点/挿入/上書き挙動は
     // 壊さず、insertClip3Point/overwriteClip3Point と同じプリミティブを再利用する。
     // 戻り値はトラック内容または leadInSec が実際に変わったか。
-    bool rippleDeleteTimeRange(double startSec, double endSec);
+    bool rippleDeleteTimeRange(double startSec, double endSec, bool notify = true);
 
     struct DropPlan {
         bool valid = false;
@@ -346,6 +346,7 @@ signals:
     void seekRequested(double seconds);
     void rowHeightChanged(int newHeight);
     void clipContextMenuRequested(int clipIndex, const QPoint &globalPos);
+    void gapContextMenuRequested(double timeSec, const QPoint &globalPos);
     void linkedDragStarted(int clipIndex);
     void linkedDragDelta(int clipIndex, double deltaSec);
     void linkedDragCancelled();
@@ -423,7 +424,9 @@ public:
     void splitAtPlayhead();
     void deleteSelectedClip();
     void rippleDeleteSelectedClip();
+    bool closeGapAt(TimelineTrack *track, double timeSec);
     bool hasSelection() const;
+    bool hasAnySelection() const;
 
     // Copy / Paste
     void copySelectedClip();
@@ -767,6 +770,11 @@ private slots:
     void onPlayheadAutoScrollTick();
 
 private:
+    struct TimeRangeSec {
+        double startSec = 0.0;
+        double endSec = 0.0;
+    };
+
     void setupUI();
     void saveUndoState(const QString &description);
 public:
@@ -780,6 +788,11 @@ private:
     void notifyMutationsChanged();
     void wireTrackSelection(TimelineTrack *track);
     void clearAllSelections();
+    QVector<TimeRangeSec> selectedClipTimeRanges() const;
+    bool gapTimeRangeAt(TimelineTrack *track, double timeSec, TimeRangeSec *outRange) const;
+    bool applyRippleDeleteTimeRangesToAllTracks(QVector<TimeRangeSec> ranges,
+                                                const QString &undoLabel);
+    void showGapContextMenu(TimelineTrack *track, double timeSec, const QPoint &globalPos);
     void captureZoomAnchor();
     void clearZoomAnchor();
     // Coalesces sequenceChanged + audioSequenceChanged emissions across

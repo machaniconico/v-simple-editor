@@ -4900,8 +4900,9 @@ void MainWindow::setupToolBar()
 void MainWindow::updateEditActions()
 {
     bool hasSel = m_timeline->hasSelection();
+    bool hasAnySel = m_timeline->hasAnySelection();
     m_deleteAction->setEnabled(hasSel);
-    m_rippleDeleteAction->setEnabled(hasSel);
+    m_rippleDeleteAction->setEnabled(hasAnySel);
     m_copyAction->setEnabled(hasSel);
     m_pasteAction->setEnabled(m_timeline->hasClipboard());
     m_undoAction->setEnabled(m_timeline->canUndo());
@@ -6419,7 +6420,7 @@ void MainWindow::deleteClip()
 
 void MainWindow::rippleDelete()
 {
-    if (!m_timeline->hasSelection()) return;
+    if (!m_timeline->hasAnySelection()) return;
     // RM-1.2: same as deleteClip — Timeline reindexes, matte keys must follow.
     TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
     m_timeline->rippleDeleteSelectedClip();

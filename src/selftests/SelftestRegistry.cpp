@@ -122,6 +122,7 @@ int runProxySelftestV2();
 int runRenderQueueAcesDecisionSelftest();
 int runRenderQueueFpsRationalSelftest();
 int runRightclickPausePrefSelftest();
+int runRippleDeleteSelftest();
 int runRgbParadeSelftest();
 int runShortcutSelftest();
 int runSilenceCutSelftest();
@@ -612,6 +613,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Clip-local VideoEffect active range filtering + ProjectFile JSON round-trip (4 gates)" },
     { "graph-editor", "VEDITOR_GRAPH_EDITOR_SELFTEST", runGraphEditorSelftest, true,
       "GraphEditor model roundtrip, panel-edit undo restore, and ClipAnim evaluation parity" },
+    { "ripple-delete", "VEDITOR_RIPPLE_DELETE_SELFTEST", runRippleDeleteSelftest, true,
+      "Ripple delete and gap close: all-track time-range ripple, one-step undo, and no-selection no-op" },
     { "e2e",               "VEDITOR_E2E_SELFTEST",                runE2eSelftest,                true,
       "Real-media end-to-end smoke (ColorMatch decode + deHum + processAll)" },
     { "trackmatte-parity", "VEDITOR_TRACKMATTE_PARITY_SELFTEST",  runTrackMatteParitySelftest,   true,

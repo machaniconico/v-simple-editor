@@ -369,6 +369,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/GraphEditorPanel.h
     src/GraphEditorPanel.cpp
     src/selftests/GraphEditorSelftest.cpp
+    src/selftests/RippleDeleteSelftest.cpp
     src/MotionSectionWidget.h
     src/MotionSectionWidget.cpp
     src/MotionPreset.h
