@@ -92,6 +92,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/SpatialPathSelftest.cpp
     src/selftests/SmartRenderSelftest.cpp
     src/selftests/FrameExportSelftest.cpp
+    src/selftests/AdjustmentLayerSelftest.cpp
 
     # PRD-SPLIT-MAIN-3 Phase 3-A: libavcore-backed selftests (moved from src/main.cpp).
     src/selftests/libavcore_selftests.cpp

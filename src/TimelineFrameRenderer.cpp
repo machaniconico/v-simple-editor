@@ -344,6 +344,33 @@ QImage applyClipFxPack(const QImage &graded, const ClipInfo &clip,
     return out.convertToFormat(QImage::Format_RGBA8888);
 }
 
+struct ActiveAdjustmentClip {
+    int trackIndex = 0;
+    const ClipInfo *clip = nullptr;
+    double localSec = 0.0;
+};
+
+QImage applyAdjustmentClipStack(const QImage &lowerComposite,
+                                const ActiveAdjustmentClip &adjustment)
+{
+    if (lowerComposite.isNull() || !adjustment.clip)
+        return lowerComposite;
+    const QImage adjusted = applyClipFxPack(lowerComposite, *adjustment.clip,
+                                            adjustment.localSec);
+    if (adjusted.isNull() || adjusted.size() != lowerComposite.size())
+        return adjusted;
+
+    QImage out = adjusted.convertToFormat(QImage::Format_ARGB32);
+    const QImage alphaSource = lowerComposite.convertToFormat(QImage::Format_ARGB32);
+    for (int y = 0; y < out.height(); ++y) {
+        QRgb *dst = reinterpret_cast<QRgb *>(out.scanLine(y));
+        const QRgb *src = reinterpret_cast<const QRgb *>(alphaSource.constScanLine(y));
+        for (int x = 0; x < out.width(); ++x)
+            dst[x] = qRgba(qRed(dst[x]), qGreen(dst[x]), qBlue(dst[x]), qAlpha(src[x]));
+    }
+    return out.convertToFormat(QImage::Format_RGBA8888);
+}
+
 // S7 — PER-CLIP MASK stage (driven by motion-tracker data for animation).
 // Apply the clip's genuine AE/Premiere-style compositing mask to its
 // already-graded+FX'd NATIVE frame, BEFORE the frame is scaled onto the
@@ -678,15 +705,14 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
     // overlay track (V2, V3, ...). Per Timeline::computePlaybackSequence
     // (src/Timeline.cpp:4871-4875) every visible track contributes its full
     // clip intervals with NO mutual subtraction — the compositor stacks them.
-    // The actual preview paint (src/VideoPlayer.cpp:3833) calls
-    // composeMultiTrackFrame(m_canvasBase /*V1*/, layers /*V2+*/) so visually
-    // V1 is the BASE and higher tracks paint ON TOP via SourceOver, i.e.
-    // ascending track index == bottom-to-top draw order.
+    // PlaybackTypes.h defines the canonical V1-wins model: higher-index tracks
+    // are painted first as the back layers, and V1 is painted last/frontmost.
     const QVector<TimelineTrack *> &tracks = timeline->videoTracks();
     if (tracks.isEmpty())
         return QImage();
 
     const double targetSec = static_cast<double>(usec) / 1'000'000.0;
+    QVector<ActiveAdjustmentClip> activeAdjustments;
 
     // ── Resolve + decode the V1 base layer ──────────────────────────────────
     // Single-track byte-identity with S2: V1 alone with a default transform
@@ -736,8 +762,14 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
         v1EffectiveOpacity = v1HasKeyframes
             ? clipanim::effectiveOpacityAt(v1Clip, v1LocalSec, v1Clip.opacity)
             : v1Clip.opacity;
-        v1NullObject = clipgeom::isNullObjectFilePath(v1Clip.filePath);
-        if (v1NullObject) {
+        v1NullObject = v1Clip.isAdjustment
+            || clipgeom::isNullObjectFilePath(v1Clip.filePath);
+        if (v1Clip.isAdjustment) {
+            activeAdjustments.append(ActiveAdjustmentClip{0, &v1Clip, v1LocalSec});
+            v1EffectiveOpacity = 0.0;
+            base = QImage(outSize, QImage::Format_RGBA8888);
+            base.fill(Qt::transparent);
+        } else if (v1NullObject) {
             v1EffectiveOpacity = 0.0;
             base = QImage(outSize, QImage::Format_RGBA8888);
             base.fill(Qt::transparent);
@@ -805,6 +837,7 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
     struct RenderLayer {
         CompositeLayer layer;
         QString clipId;
+        int trackIndex = 0;
         QImage image;      // already transformed to outSize
         QImage sourceRgb;  // canvas/fitted source before placement
         clipgeom::ClipTransform transform;
@@ -814,6 +847,7 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
     };
     struct OverlayLayer {
         QString clipId;
+        int trackIndex = 0;
         QImage rgb;        // already scaled to outSize (the shared canvas grid)
         double opacity = 1.0;
         double videoScale = 1.0;
@@ -828,6 +862,7 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
     {
         RenderLayer baseLayer;
         baseLayer.clipId = renderClipId(0, v1Idx);
+        baseLayer.trackIndex = 0;
         baseLayer.image = base;
         baseLayer.sourceRgb = v1LayerSource;
         baseLayer.transform = v1Transform;
@@ -868,10 +903,15 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
         const double cOpacity = cHasKeyframes
             ? clipanim::effectiveOpacityAt(c, localSec, c.opacity)
             : c.opacity;
+        if (c.isAdjustment) {
+            activeAdjustments.append(ActiveAdjustmentClip{t, &c, localSec});
+            continue;
+        }
         const bool cNullObject = clipgeom::isNullObjectFilePath(c.filePath);
         if (cNullObject) {
             RenderLayer renderLayer;
             renderLayer.clipId = renderClipId(t, idx);
+            renderLayer.trackIndex = t;
             renderLayer.colorMeta = c.colorMeta;
             renderLayer.transform = cTransform;
             renderLayer.layerStyle = c.layerStyle;
@@ -909,6 +949,7 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
         native = snsfit::maybeFit(native, c.fitContain, c.fitCover, outSize);
         RenderLayer renderLayer;
         renderLayer.clipId = renderClipId(t, idx);
+        renderLayer.trackIndex = t;
         renderLayer.colorMeta = c.colorMeta;
         renderLayer.transform = cTransform;
         renderLayer.layerStyle = c.layerStyle;
@@ -939,6 +980,7 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
         // layer fill at VideoPlayer.cpp:3656/3734).
         OverlayLayer overlay;
         overlay.clipId = renderLayer.clipId;
+        overlay.trackIndex = t;
         overlay.rgb = rgb;
         overlay.opacity = cOpacity;
         overlay.videoScale = cTransform.videoScale;
@@ -1075,13 +1117,26 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
         }
     }
 
+    auto applyAdjustmentClipsAtTrack =
+        [&](const QImage &input, int trackIndex) -> QImage {
+            QImage out = input;
+            for (const ActiveAdjustmentClip &adjustment : activeAdjustments) {
+                if (adjustment.trackIndex != trackIndex)
+                    continue;
+                out = applyAdjustmentClipStack(
+                    out.convertToFormat(QImage::Format_RGBA8888),
+                    adjustment);
+            }
+            return out;
+        };
+
     // No overlays -> the multi-track stack reduces to the V1 base. S6 still
     // runs the adjustment-layer grade + text-overlay bake on it (both strict
     // no-ops when the timeline has no adjustment layer / the V1 clip has no
     // text, so a lone V1 clip with a default transform stays byte-identical
     // to S2/S3/S4/S5 — applyAdjustmentLayers/applyTextOverlays return the
     // input UNTOUCHED in that case, no QPainter, no convert).
-    if (!hasOverlayLayers && !hasTrackMatteLayer) {
+    if (!hasOverlayLayers && !hasTrackMatteLayer && activeAdjustments.isEmpty()) {
         QImage styledBase = base;
         if (!v1Clip.layerStyle.isIdentity())
             styledBase = layerstyle::apply(styledBase, v1Clip.layerStyle);
@@ -1111,6 +1166,74 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
     // then SourceOver-composited at the clip's opacity exactly as before.
     QImage stacked;
     if (!hasTrackMatteLayer) {
+        if (!activeAdjustments.isEmpty()) {
+            QImage composed(base.size(), QImage::Format_ARGB32_Premultiplied);
+            composed.fill(Qt::transparent);
+            const QSize canvas(composed.width(), composed.height());
+
+            auto paintPlacedLayer = [&](const QImage &placed, double opacity) {
+                if (placed.isNull() || opacity <= 0.001)
+                    return;
+                QPainter p(&composed);
+                p.setRenderHint(QPainter::SmoothPixmapTransform, false);
+                p.setCompositionMode(QPainter::CompositionMode_SourceOver);
+                p.setOpacity(qBound(0.0, opacity, 1.0));
+                p.drawImage(0, 0, placed);
+            };
+
+            auto paintOverlayTrack = [&](int trackIndex) {
+                for (const OverlayLayer &L : overlays) {
+                    if (L.trackIndex != trackIndex)
+                        continue;
+                    const clipgeom::ClipTransform tr{L.videoScale, L.videoDx,
+                                                     L.videoDy, L.rotationDeg};
+                    QImage placed =
+                        clipgeom::renderLayer(L.rgb, tr, canvas, /*smooth=*/true);
+                    if (!L.layerStyle.isIdentity())
+                        placed = layerstyle::apply(placed, L.layerStyle);
+                    paintPlacedLayer(placed, L.opacity);
+                }
+            };
+
+            auto hasAdjustmentAtTrack = [&](int trackIndex) -> bool {
+                for (const ActiveAdjustmentClip &adjustment : activeAdjustments) {
+                    if (adjustment.trackIndex == trackIndex)
+                        return true;
+                }
+                return false;
+            };
+
+            auto applyAdjustmentTrack = [&](int trackIndex) {
+                if (!hasAdjustmentAtTrack(trackIndex))
+                    return;
+                QImage adjusted = applyAdjustmentClipsAtTrack(
+                    composed.convertToFormat(QImage::Format_RGBA8888), trackIndex);
+                composed = adjusted.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+            };
+
+            // V1-wins stacking: paint highest track first (backmost), then walk
+            // toward V1. An adjustment clip applies at its own z position to the
+            // partial composite already painted behind it; lower-index/front
+            // tracks are painted afterwards and are therefore unaffected.
+            for (int t = tracks.size() - 1; t >= 1; --t) {
+                paintOverlayTrack(t);
+                applyAdjustmentTrack(t);
+            }
+
+            if (v1Clip.isAdjustment) {
+                applyAdjustmentTrack(0);
+            } else {
+                const double v1Opacity = qBound(0.0, v1EffectiveOpacity, 1.0);
+                if (v1Opacity > 0.001) {
+                    QImage v1Base = base;
+                    if (!v1Clip.layerStyle.isIdentity())
+                        v1Base = layerstyle::apply(v1Base, v1Clip.layerStyle);
+                    paintPlacedLayer(v1Base, v1Opacity);
+                }
+            }
+
+            stacked = composed.convertToFormat(QImage::Format_RGBA8888);
+        } else {
         // V1-wins stacking (PlaybackTypes.h:34): V1 (the base layer) paints
         // LAST so it ends up ON TOP; the overlay tracks (V2, V3, …) paint
         // UNDERNEATH it. `overlays` is collected ascending by track (V2 first,
@@ -1215,6 +1338,7 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
 
         stacked = composed.convertToFormat(QImage::Format_RGBA8888);
         }
+        }
     } else {
         // Track-matte timelines: the matte ADJACENCY contract ("the clip above
         // provides the matte'd clip's alpha") is encoded as array-index links
@@ -1299,6 +1423,11 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
             const QImage composed = trackmatte::composite(layers, layerImages, outSize);
             stacked = composed.convertToFormat(QImage::Format_RGBA8888);
         }
+    }
+
+    if (hasTrackMatteLayer && !activeAdjustments.isEmpty()) {
+        for (int t = 1; t < tracks.size(); ++t)
+            stacked = applyAdjustmentClipsAtTrack(stacked, t);
     }
 
     // Public contract: Format_RGBA8888 at outSize (Timeline.h header / S2).

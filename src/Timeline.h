@@ -104,6 +104,7 @@ struct ClipInfo {
     // compositor lands in a follow-up iteration.
     double opacity = 1.0;
     bool visible = true;
+    bool isAdjustment = false; // effect-only clip; applies its stack to lower composited layers
 
     // SNS vertical fit: when true and the project output aspect differs from
     // this clip's native frame, export/previews may pre-contain the frame into

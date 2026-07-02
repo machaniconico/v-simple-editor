@@ -30,6 +30,7 @@ int runAeFxDistortSelftest();
 int runAeFxDistort2Selftest();
 int runAeFxGenerateSelftest();
 int runAeFxStylizeSelftest();
+int runAdjustmentLayerSelftest();
 int runAffinitySelftest();
 int runAscCdlExportSelftest();
 int runAtempoResolveSelftest();
@@ -593,6 +594,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "smart-render",       "VEDITOR_SMART_RENDER_SELFTEST",       runSmartRenderSelftest,        false,
       "Smart Render T4: conservative stream-copy eligibility predicate + env gate" },
     // QApplication-required (needsQApplication=true) ----------------------
+    { "adjustment-layer", "VEDITOR_ADJUSTMENT_LAYER_SELFTEST", runAdjustmentLayerSelftest, true,
+      "Adjustment clip model: V1-wins z-order, behind-only effect stack, byte-identical off path, JSON true-only persistence" },
     { "frame-export",      "VEDITOR_FRAME_EXPORT_SELFTEST",        runFrameExportSelftest,        true,
       "Still-frame export: renderFrameAt SSOT -> PNG/JPEG save engine + PNG pixel-identical reread" },
     { "parity",            "VEDITOR_PARITY_SELFTEST",             runParitySelftest,             true,

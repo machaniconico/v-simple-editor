@@ -1321,6 +1321,8 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
     obj["videoDy"] = clip.videoDy;
     obj["rotation2DDegrees"] = clip.rotation2DDegrees;
     obj["opacity"] = clip.opacity;
+    if (clip.isAdjustment)
+        obj["isAdjustment"] = true;
     obj["is3DLayer"] = clip.is3DLayer;
     obj["layer3D"] = clip.layer3D.toJson();
     if (clip.motionBlurEnabled)
@@ -1390,6 +1392,7 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
     clip.videoDy = obj["videoDy"].toDouble(0.0);
     clip.rotation2DDegrees = obj["rotation2DDegrees"].toDouble(0.0);
     clip.opacity = obj["opacity"].toDouble(1.0);
+    clip.isAdjustment = obj["isAdjustment"].toBool(false);
     clip.is3DLayer = obj["is3DLayer"].toBool(false);
     clip.layer3D = obj.contains("layer3D")
         ? Layer3DTransform::fromJson(obj["layer3D"].toObject())
