@@ -141,6 +141,221 @@ bool isNullObjectEntry(const PlaybackEntry &entry)
     return isNullObjectPath(entry.filePath);
 }
 
+bool isAdjustmentEntry(const Timeline *timeline, const PlaybackEntry &entry)
+{
+    const ClipInfo *clip = clipForPlaybackEntry(timeline, entry);
+    return clip && clip->isAdjustment;
+}
+
+int previewPrimaryEntryIndexAt(const Timeline *timeline,
+                               const QVector<PlaybackEntry> &sequence,
+                               int preferredIdx,
+                               qint64 timelineUsec)
+{
+    auto usableMediaEntry = [&](int idx) {
+        return idx >= 0 && idx < sequence.size()
+            && !isAdjustmentEntry(timeline, sequence.at(idx))
+            && !isNullObjectEntry(sequence.at(idx));
+    };
+    if (usableMediaEntry(preferredIdx))
+        return preferredIdx;
+
+    const double tSec = static_cast<double>(timelineUsec) / AV_TIME_BASE;
+    int bestIdx = -1;
+    for (int i = 0; i < sequence.size(); ++i) {
+        const PlaybackEntry &entry = sequence.at(i);
+        if (tSec < entry.timelineStart || tSec >= entry.timelineEnd)
+            continue;
+        if (!usableMediaEntry(i))
+            continue;
+        if (bestIdx < 0 || entry.sourceTrack < sequence.at(bestIdx).sourceTrack)
+            bestIdx = i;
+    }
+    return bestIdx >= 0 ? bestIdx : preferredIdx;
+}
+
+double entryClipLocalSeconds(const PlaybackEntry &entry, qint64 timelineUsec)
+{
+    return (static_cast<double>(timelineUsec) - entry.timelineStart * 1'000'000.0)
+        / 1'000'000.0;
+}
+
+struct ActivePreviewAdjustmentClip {
+    int trackIndex = 0;
+    const ClipInfo *clip = nullptr;
+    double localSec = 0.0;
+};
+
+bool appendPreviewAdjustmentClip(const Timeline *timeline,
+                                 const PlaybackEntry &entry,
+                                 qint64 timelineUsec,
+                                 QVector<ActivePreviewAdjustmentClip> *out)
+{
+    if (!out)
+        return false;
+    const ClipInfo *clip = clipForPlaybackEntry(timeline, entry);
+    if (!clip || !clip->isAdjustment)
+        return false;
+    out->append(ActivePreviewAdjustmentClip{
+        entry.sourceTrack, clip, entryClipLocalSeconds(entry, timelineUsec)});
+    return true;
+}
+
+QImage applyPreviewAdjustmentClipStack(
+    const QImage &lowerComposite,
+    const ActivePreviewAdjustmentClip &adjustment)
+{
+    if (lowerComposite.isNull() || !adjustment.clip)
+        return lowerComposite;
+    if (adjustment.clip->effects.isEmpty())
+        return lowerComposite;
+
+    const QVector<VideoEffect> effects =
+        clipanim::effectiveEffectsAt(*adjustment.clip, adjustment.localSec);
+    if (effects.isEmpty())
+        return lowerComposite;
+
+    const QImage adjusted = VideoEffectProcessor::applyEffectStack(
+        lowerComposite, ColorCorrection(), effects);
+    if (adjusted.isNull() || adjusted.size() != lowerComposite.size())
+        return adjusted;
+
+    QImage out = adjusted.convertToFormat(QImage::Format_ARGB32);
+    const QImage alphaSource =
+        lowerComposite.convertToFormat(QImage::Format_ARGB32);
+    for (int y = 0; y < out.height(); ++y) {
+        QRgb *dst = reinterpret_cast<QRgb *>(out.scanLine(y));
+        const QRgb *src =
+            reinterpret_cast<const QRgb *>(alphaSource.constScanLine(y));
+        for (int x = 0; x < out.width(); ++x)
+            dst[x] = qRgba(qRed(dst[x]), qGreen(dst[x]), qBlue(dst[x]), qAlpha(src[x]));
+    }
+    return out.convertToFormat(QImage::Format_RGBA8888);
+}
+
+QImage applyPreviewAdjustmentClipsAtTrack(
+    const QImage &input,
+    const QVector<ActivePreviewAdjustmentClip> &adjustments,
+    int trackIndex)
+{
+    QImage out = input;
+    for (const ActivePreviewAdjustmentClip &adjustment : adjustments) {
+        if (adjustment.trackIndex != trackIndex)
+            continue;
+        out = applyPreviewAdjustmentClipStack(
+            out.convertToFormat(QImage::Format_RGBA8888),
+            adjustment);
+    }
+    return out;
+}
+
+bool hasPreviewAdjustmentAtTrack(
+    const QVector<ActivePreviewAdjustmentClip> &adjustments,
+    int trackIndex)
+{
+    for (const ActivePreviewAdjustmentClip &adjustment : adjustments) {
+        if (adjustment.trackIndex == trackIndex)
+            return true;
+    }
+    return false;
+}
+
+bool hasDecodedTrackMatte(const QVector<VideoPlayer::DecodedLayer> &layers)
+{
+    return std::any_of(
+        layers.cbegin(), layers.cend(),
+        [](const VideoPlayer::DecodedLayer &layer) {
+            return layer.matteType != TrackMatteType::None;
+        });
+}
+
+clipgeom::ClipTransform transformForLayer(const VideoPlayer::DecodedLayer &layer);
+QVector<clipgeom::ClipTransform> effectiveLayerTransforms(
+    const QVector<VideoPlayer::DecodedLayer> &layers,
+    QSize canvas);
+
+void composePreviewFrameWithAdjustmentClips(
+    QImage &canvas,
+    const QVector<VideoPlayer::DecodedLayer> &layers,
+    const QVector<ActivePreviewAdjustmentClip> &adjustments)
+{
+    if (canvas.isNull())
+        return;
+    if (adjustments.isEmpty())
+        return;
+
+    Q_ASSERT(canvas.format() == QImage::Format_ARGB32_Premultiplied);
+    if (canvas.format() != QImage::Format_ARGB32_Premultiplied)
+        return;
+
+    canvas.fill(Qt::transparent);
+    const QSize cs(canvas.width(), canvas.height());
+    const QVector<clipgeom::ClipTransform> effectiveTransforms =
+        veditor::parentingEnabledFromEnv()
+            ? effectiveLayerTransforms(layers, cs)
+            : QVector<clipgeom::ClipTransform>{};
+
+    auto paintTrack = [&](int trackIndex) {
+        QPainter p(&canvas);
+        p.setCompositionMode(QPainter::CompositionMode_SourceOver);
+        const bool kSmooth = false;
+        for (int i = 0; i < layers.size(); ++i) {
+            const VideoPlayer::DecodedLayer &L = layers.at(i);
+            if (L.sourceTrack != trackIndex)
+                continue;
+            if (L.isNullObject || L.rgb.isNull() || L.opacity <= 0.001)
+                continue;
+            const clipgeom::ClipTransform t = effectiveTransforms.isEmpty()
+                ? transformForLayer(L)
+                : effectiveTransforms.value(i, transformForLayer(L));
+            QImage placed = clipgeom::renderLayer(L.rgb, t, cs, kSmooth);
+            if (!L.layerStyle.isIdentity())
+                placed = layerstyle::apply(placed, L.layerStyle);
+            p.setOpacity(qBound(0.0, L.opacity, 1.0));
+            p.drawImage(0, 0, placed);
+        }
+    };
+
+    auto applyAdjustmentTrack = [&](int trackIndex) {
+        if (!hasPreviewAdjustmentAtTrack(adjustments, trackIndex))
+            return;
+        QImage adjusted = applyPreviewAdjustmentClipsAtTrack(
+            canvas.convertToFormat(QImage::Format_RGBA8888),
+            adjustments,
+            trackIndex);
+        canvas = adjusted.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+    };
+
+    int maxTrack = 0;
+    for (const VideoPlayer::DecodedLayer &layer : layers)
+        maxTrack = qMax(maxTrack, layer.sourceTrack);
+    for (const ActivePreviewAdjustmentClip &adjustment : adjustments)
+        maxTrack = qMax(maxTrack, adjustment.trackIndex);
+
+    for (int track = maxTrack; track >= 1; --track) {
+        paintTrack(track);
+        applyAdjustmentTrack(track);
+    }
+
+    if (hasPreviewAdjustmentAtTrack(adjustments, 0))
+        applyAdjustmentTrack(0);
+    else
+        paintTrack(0);
+}
+
+QImage applyPreviewAdjustmentClipsAfterMatte(
+    const QImage &input,
+    const QVector<ActivePreviewAdjustmentClip> &adjustments)
+{
+    QImage out = input;
+    int maxTrack = 0;
+    for (const ActivePreviewAdjustmentClip &adjustment : adjustments)
+        maxTrack = qMax(maxTrack, adjustment.trackIndex);
+    for (int track = 1; track <= maxTrack; ++track)
+        out = applyPreviewAdjustmentClipsAtTrack(out, adjustments, track);
+    return out;
+}
+
 clipgeom::ClipTransform transformForLayer(const VideoPlayer::DecodedLayer &layer)
 {
     return clipgeom::ClipTransform{layer.videoScale, layer.videoDx,
@@ -1166,7 +1381,8 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
     }
 
     m_sequence = entries;
-    if (const Timeline *timeline = m_glPreview ? m_glPreview->timeline() : nullptr) {
+    const Timeline *timeline = m_glPreview ? m_glPreview->timeline() : nullptr;
+    if (timeline) {
         for (PlaybackEntry &entry : m_sequence) {
             if (!entry.layerStyle.isIdentity())
                 continue;
@@ -1308,6 +1524,7 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
         const qint64 cEnd   = static_cast<qint64>(chosen.timelineEnd   * AV_TIME_BASE);
         clamped = qBound(cStart, clamped, cEnd);
     }
+    desiredIdx = previewPrimaryEntryIndexAt(timeline, m_sequence, desiredIdx, clamped);
 
     const auto &target = m_sequence[desiredIdx];
     const bool needFileSwitch = (target.filePath != m_loadedFilePath) || !m_formatCtx;
@@ -1584,6 +1801,12 @@ bool VideoPlayer::seekToTimelineUs(int64_t timelineUs, bool precise)
     int idx = findActiveEntryAt(timelineUs);
     if (idx < 0) idx = 0;
     if (idx >= m_sequence.size()) return false;
+    idx = previewPrimaryEntryIndexAt(
+        m_glPreview ? m_glPreview->timeline() : nullptr,
+        m_sequence,
+        idx,
+        timelineUs);
+    if (idx < 0 || idx >= m_sequence.size()) return false;
 
     const auto &e = m_sequence[idx];
     const bool needSwitch = (e.filePath != m_loadedFilePath) || !m_formatCtx;
@@ -1652,6 +1875,15 @@ bool VideoPlayer::seekToTimelineUs(int64_t timelineUs, bool precise)
 
 bool VideoPlayer::advanceToEntry(int newEntryIdx)
 {
+    if (newEntryIdx < 0 || newEntryIdx >= m_sequence.size())
+        return false;
+    const qint64 nextTimelineUs =
+        static_cast<qint64>(m_sequence.at(newEntryIdx).timelineStart * AV_TIME_BASE);
+    newEntryIdx = previewPrimaryEntryIndexAt(
+        m_glPreview ? m_glPreview->timeline() : nullptr,
+        m_sequence,
+        newEntryIdx,
+        nextTimelineUs);
     if (newEntryIdx < 0 || newEntryIdx >= m_sequence.size())
         return false;
 
@@ -4268,6 +4500,7 @@ void VideoPlayer::handlePlaybackTick()
     // with V2+ overlays. When yes, presentDecodedFrame caches the V1 frame
     // into m_lastSourceFrame but skips displayFrame so the compositor step
     // below can blend the overlays before pushing the final image.
+    const Timeline *previewTimeline = m_glPreview ? m_glPreview->timeline() : nullptr;
     const QVector<int> activeForComposite = findActiveEntriesAt(m_timelinePositionUs);
     const bool forceProjectOutputComposite =
         m_projectOutputSize.isValid() && !activeForComposite.isEmpty();
@@ -4340,6 +4573,8 @@ void VideoPlayer::handlePlaybackTick()
             if (idx == m_activeEntry)
                 continue;  // V1 main path handles itself.
             const auto &e = m_sequence[idx];
+            if (isAdjustmentEntry(previewTimeline, e))
+                continue;
             if (e.sourceTrack <= 0)
                 continue;  // Only V2+ overlays go through pool path.
             TrackDecoder *d = acquireDecoderForClip(e);
@@ -4488,6 +4723,8 @@ void VideoPlayer::handlePlaybackTick()
             sectionMark = tickTimer.nsecsElapsed();
         QVector<DecodedLayer> layers;
         layers.reserve(activeIdxs.size());
+        QVector<ActivePreviewAdjustmentClip> activeAdjustments;
+        activeAdjustments.reserve(activeIdxs.size());
         bool overlayPresent = false;
 
         // VEDITOR_THREADED_POOL_DISABLE (Phase 1e Sprint US-3, default-on per
@@ -4505,7 +4742,8 @@ void VideoPlayer::handlePlaybackTick()
         int nonV1Count = 0;
         if (threadedPool) {
             for (int idx : activeIdxs) {
-                if (idx >= 0 && idx < m_sequence.size() && idx != m_activeEntry)
+                if (idx >= 0 && idx < m_sequence.size() && idx != m_activeEntry
+                    && !isAdjustmentEntry(previewTimeline, m_sequence.at(idx)))
                     ++nonV1Count;
             }
         }
@@ -4585,12 +4823,18 @@ void VideoPlayer::handlePlaybackTick()
                 // is then always false so the old skip never fired then
                 // anyway — no perf regression from removing it here.)
                 const auto &e = m_sequence[idx];
+                if (appendPreviewAdjustmentClip(
+                        previewTimeline, e, m_timelinePositionUs, &activeAdjustments)) {
+                    if (e.sourceTrack > 0)
+                        overlayPresent = true;
+                    continue;
+                }
                 if (isNullObjectEntry(e)) {
                     DecodedLayer layer;
                     layer.colorMeta = e.colorMeta;
-                    applyLayerMotionOpacity(m_glPreview ? m_glPreview->timeline() : nullptr,
+                    applyLayerMotionOpacity(previewTimeline,
                                             e, m_timelinePositionUs, e.opacity, &layer);
-                    populateLayerMetadata(m_glPreview ? m_glPreview->timeline() : nullptr,
+                    populateLayerMetadata(previewTimeline,
                                           e, idx, &layer);
                     layers.append(layer);
                     if (e.sourceTrack > 0)
@@ -4604,9 +4848,9 @@ void VideoPlayer::handlePlaybackTick()
                     layer.rgb = m_lastV1RawFrame;
                     layer.isFresh = true;
                     layer.colorMeta = e.colorMeta;
-                    applyLayerMotionOpacity(m_glPreview ? m_glPreview->timeline() : nullptr,
+                    applyLayerMotionOpacity(previewTimeline,
                                             e, m_timelinePositionUs, e.opacity, &layer);
-                    populateLayerMetadata(m_glPreview ? m_glPreview->timeline() : nullptr,
+                    populateLayerMetadata(previewTimeline,
                                           e, idx, &layer);
                     layers.append(layer);
                     if (e.sourceTrack > 0)
@@ -4672,6 +4916,12 @@ void VideoPlayer::handlePlaybackTick()
                 // this skip was a preview≠export divergence on opaque V1 +
                 // overlay scenes.
                 const auto &e = m_sequence[idx];
+                if (appendPreviewAdjustmentClip(
+                        previewTimeline, e, m_timelinePositionUs, &activeAdjustments)) {
+                    if (e.sourceTrack > 0)
+                        overlayPresent = true;
+                    continue;
+                }
                 DecodedLayer layer;
                 if (isNullObjectEntry(e)) {
                     layer.isFresh = true;
@@ -4685,9 +4935,9 @@ void VideoPlayer::handlePlaybackTick()
                         continue;
                 }
                 layer.colorMeta = e.colorMeta;
-                applyLayerMotionOpacity(m_glPreview ? m_glPreview->timeline() : nullptr,
+                applyLayerMotionOpacity(previewTimeline,
                                         e, m_timelinePositionUs, e.opacity, &layer);
-                populateLayerMetadata(m_glPreview ? m_glPreview->timeline() : nullptr,
+                populateLayerMetadata(previewTimeline,
                                       e, idx, &layer);
                 layers.append(layer);
                 if (e.sourceTrack > 0)
@@ -4793,16 +5043,27 @@ void VideoPlayer::handlePlaybackTick()
                 // (GL 失敗) / flag OFF / 単一トラックなら gpuComposed は null となり、
                 // 従来 CPU 経路へそのままフォールバックする (displayFrame は依然 1 回)。
                 // m_canvasBase.size() を canvas として渡すので CPU と同じ適応縮小解像度。
-                const QImage gpuComposed = tryGpuComposeLayers(layers, m_canvasBase.size());
+                const bool adjustmentClipPresent = !activeAdjustments.isEmpty();
+                const bool trackMattePresent = hasDecodedTrackMatte(layers);
+                const bool canTryGpuComposite =
+                    !adjustmentClipPresent || trackMattePresent;
+                const QImage gpuComposed = canTryGpuComposite
+                    ? tryGpuComposeLayers(layers, m_canvasBase.size())
+                    : QImage();
                 if (!gpuComposed.isNull()) {
+                    const QImage displayedComposite =
+                        adjustmentClipPresent && trackMattePresent
+                            ? applyPreviewAdjustmentClipsAfterMatte(
+                                  gpuComposed, activeAdjustments)
+                            : gpuComposed;
                     if (traceTick)
                         m_tickTraceComposeNs += tickTimer.nsecsElapsed() - sectionMark;
                     // CPU 経路と同じ baked-mode: paintGL が m_videoSourceScale を
                     // 二重適用しないよう viewport を identity 扱いにする。
                     if (m_glPreview)
                         m_glPreview->setCompositeBakedMode(true);
-                    cachePreviewComposite(gpuComposed);  // CPU 経路と同じキーで put
-                    displayFrame(gpuComposed);           // 1 tick = 最大 1 displayFrame
+                    cachePreviewComposite(displayedComposite);  // CPU 経路と同じキーで put
+                    displayFrame(displayedComposite);           // 1 tick = 最大 1 displayFrame
                 } else {
                 // Phase 1e Win #7 — in-place compose. Default ON; opt out
                 // via VEDITOR_INPLACE_COMPOSE_DISABLE=1 to fall back to the
@@ -4812,7 +5073,16 @@ void VideoPlayer::handlePlaybackTick()
                 // tick).
                 static const bool inplaceComposeEnabled =
                     qEnvironmentVariableIntValue("VEDITOR_INPLACE_COMPOSE_DISABLE") == 0;
-                if (inplaceComposeEnabled) {
+                if (adjustmentClipPresent) {
+                    composePreviewFrameWithAdjustmentClips(
+                        m_canvasBase, layers, activeAdjustments);
+                    if (traceTick)
+                        m_tickTraceComposeNs += tickTimer.nsecsElapsed() - sectionMark;
+                    if (m_glPreview)
+                        m_glPreview->setCompositeBakedMode(true);
+                    cachePreviewComposite(m_canvasBase);
+                    displayFrame(m_canvasBase);
+                } else if (inplaceComposeEnabled) {
                     composeMultiTrackFrameInto(m_canvasBase, layers);
                     if (traceTick)
                         m_tickTraceComposeNs += tickTimer.nsecsElapsed() - sectionMark;
