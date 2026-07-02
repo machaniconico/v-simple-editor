@@ -12,6 +12,8 @@
 #include <QHash>
 #include <QMenu>
 #include <QElapsedTimer>
+#include <QString>
+#include <cstdint>
 #include "VideoEffect.h"
 #include "Keyframe.h"
 #include "WaveformGenerator.h"
@@ -69,6 +71,34 @@ class QTimer;
 // 前方宣言し、シグネチャに使う (Timeline.cpp 側で TrimOps.h を実 include)。
 namespace trimops { enum class TrimType; }
 
+enum class AudioChannelMode {
+    Stereo = 0,
+    FillLeft = 1,
+    FillRight = 2,
+    Swap = 3,
+    Mono = 4
+};
+
+struct AudioChannelModePlaybackBinding {
+    qint64 clipInMs = 0;
+    int sourceTrack = 0;
+    int sourceClipIndex = -1;
+    AudioChannelMode mode = AudioChannelMode::Stereo;
+};
+
+void setAudioChannelModePlaybackBindings(const QVector<AudioChannelModePlaybackBinding> &bindings);
+AudioChannelMode audioChannelModeForPlaybackEntry(const PlaybackEntry &entry);
+void applyAudioChannelModeToInterleavedStereoS16(int16_t *samples,
+                                                int frameCount,
+                                                AudioChannelMode mode);
+QString exportAudioChannelPanFilterForMode(AudioChannelMode mode);
+QString buildExportAudioMixEntryFilterChain(int inputIndex,
+                                            const QString &clipIn,
+                                            const QString &clipOut,
+                                            int delayMs,
+                                            const QString &volumeExpression,
+                                            AudioChannelMode mode);
+
 struct ClipInfo {
     QString filePath;
     QString displayName;
@@ -79,6 +109,7 @@ struct ClipInfo {
     double speed = 1.0;   // 0.25x - 4.0x
     double volume = 1.0;  // 0.0 - 2.0 (0=mute, 1=normal, 2=boost)
     double pan = 0.0;     // -1.0..+1.0 balance pan (-1=L, 0=center, +1=R)
+    AudioChannelMode audioChannelMode = AudioChannelMode::Stereo;
     // Pro-NLE "rubber band" volume automation. Each point is (clip-local
     // seconds, gain). Empty vector = static `volume` for the whole clip.
     // Sorted by .time; AudioMixer evaluates via linear interpolation.

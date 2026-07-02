@@ -149,6 +149,52 @@ static void migrateClipOffsetsToNormalized(ProjectData &data, int storedVersion)
     migrateTracks(data.audioTracks);
 }
 
+static QString audioChannelModeToProjectString(AudioChannelMode mode)
+{
+    switch (mode) {
+    case AudioChannelMode::Stereo:
+        return QStringLiteral("Stereo");
+    case AudioChannelMode::FillLeft:
+        return QStringLiteral("FillLeft");
+    case AudioChannelMode::FillRight:
+        return QStringLiteral("FillRight");
+    case AudioChannelMode::Swap:
+        return QStringLiteral("Swap");
+    case AudioChannelMode::Mono:
+        return QStringLiteral("Mono");
+    }
+    return QStringLiteral("Stereo");
+}
+
+static AudioChannelMode audioChannelModeFromProjectValue(const QJsonValue &value)
+{
+    if (value.isDouble()) {
+        switch (value.toInt(static_cast<int>(AudioChannelMode::Stereo))) {
+        case static_cast<int>(AudioChannelMode::FillLeft):
+            return AudioChannelMode::FillLeft;
+        case static_cast<int>(AudioChannelMode::FillRight):
+            return AudioChannelMode::FillRight;
+        case static_cast<int>(AudioChannelMode::Swap):
+            return AudioChannelMode::Swap;
+        case static_cast<int>(AudioChannelMode::Mono):
+            return AudioChannelMode::Mono;
+        default:
+            return AudioChannelMode::Stereo;
+        }
+    }
+
+    const QString s = value.toString(QStringLiteral("Stereo"));
+    if (s == QLatin1String("FillLeft") || s == QLatin1String("fill_left"))
+        return AudioChannelMode::FillLeft;
+    if (s == QLatin1String("FillRight") || s == QLatin1String("fill_right"))
+        return AudioChannelMode::FillRight;
+    if (s == QLatin1String("Swap") || s == QLatin1String("swap"))
+        return AudioChannelMode::Swap;
+    if (s == QLatin1String("Mono") || s == QLatin1String("mono"))
+        return AudioChannelMode::Mono;
+    return AudioChannelMode::Stereo;
+}
+
 bool ProjectFile::save(const QString &filePath, const ProjectData &data)
 {
     QJsonObject root;
@@ -1316,6 +1362,8 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
     obj["volume"] = clip.volume;
     if (clip.pan != 0.0)
         obj["pan"] = clip.pan;
+    if (clip.audioChannelMode != AudioChannelMode::Stereo)
+        obj["audioChannelMode"] = audioChannelModeToProjectString(clip.audioChannelMode);
     obj["videoScale"] = clip.videoScale;
     obj["videoDx"] = clip.videoDx;
     obj["videoDy"] = clip.videoDy;
@@ -1391,6 +1439,9 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
     clip.speed = obj["speed"].toDouble(1.0);
     clip.volume = obj["volume"].toDouble(1.0);
     clip.pan = obj["pan"].toDouble(0.0);
+    clip.audioChannelMode = obj.contains("audioChannelMode")
+        ? audioChannelModeFromProjectValue(obj["audioChannelMode"])
+        : AudioChannelMode::Stereo;
     clip.videoScale = obj["videoScale"].toDouble(1.0);
     clip.videoDx = obj["videoDx"].toDouble(0.0);
     clip.videoDy = obj["videoDy"].toDouble(0.0);

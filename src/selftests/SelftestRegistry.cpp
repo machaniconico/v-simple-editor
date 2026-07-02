@@ -36,6 +36,7 @@ int runAscCdlExportSelftest();
 int runAtempoResolveSelftest();
 int runOAuthMockE2eSelftest();
 int runOAuthRefreshE2eSelftest();
+int runAudioChannelMapSelftest();
 int runAnimExportSelftest();
 int runAudioBusSelftest();
 int runAudioClipDragUndoSelftest();
@@ -474,6 +475,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "TrimOps engine: ripple/roll/slip/slide + bounds" },
     { "audio-bus",         "VEDITOR_AUDIO_BUS_SELFTEST",          runAudioBusSelftest,           false,
       "AudioBusRouting: bus/submix/aux-send gain resolution + cycle guard" },
+    { "audio-channel-map", "VEDITOR_AUDIO_CHANNEL_MAP_SELFTEST",  runAudioChannelMapSelftest,    false,
+      "Per-clip audio channel mapping: Stereo byte identity, Fill L/R, swap, mono, ProjectFile round-trip, export pan chain" },
     { "stereo-pan",        "VEDITOR_STEREO_PAN_SELFTEST",         runStereoPanSelftest,          false,
       "Per-clip stereo balance pan: identity, L/R attenuation, half pan, ProjectFile round-trip" },
     { "atempo-resolve",    "VEDITOR_ATEMPO_RESOLVE_SELFTEST",     runAtempoResolveSelftest,      false,

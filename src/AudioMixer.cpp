@@ -1,4 +1,5 @@
 #include "AudioMixer.h"
+#include "Timeline.h"
 #include "playback/AudioPan.h"
 
 #include <QElapsedTimer>
@@ -32,6 +33,7 @@ extern "C" {
 // stereo, ready for direct memcpy / accumulate from MixerIODevice::readData.
 struct AudioDecoderEntry {
     PlaybackEntry entry;
+    AudioChannelMode channelMode = AudioChannelMode::Stereo;
     AVFormatContext *fmtCtx = nullptr;
     AVCodecContext *codecCtx = nullptr;
     SwrContext *swrCtx = nullptr;
@@ -159,6 +161,51 @@ inline bool audioAtempoEnvForceCached() {
 }
 constexpr int kRingCompactThreshold = 32 * 1024;
 
+struct AudioChannelModeKey {
+    qint64 clipInMs = 0;
+    int sourceTrack = 0;
+    int sourceClipIndex = -1;
+
+    bool operator==(const AudioChannelModeKey &other) const noexcept {
+        return clipInMs == other.clipInMs
+            && sourceTrack == other.sourceTrack
+            && sourceClipIndex == other.sourceClipIndex;
+    }
+};
+
+uint qHash(const AudioChannelModeKey &key, uint seed = 0) noexcept
+{
+    uint h = ::qHash(key.clipInMs, seed);
+    h ^= ::qHash(key.sourceTrack, seed) + 0x9e3779b9u + (h << 6) + (h >> 2);
+    h ^= ::qHash(key.sourceClipIndex, seed) + 0x9e3779b9u + (h << 6) + (h >> 2);
+    return h;
+}
+
+QMutex g_audioChannelModeMutex;
+QHash<AudioChannelModeKey, AudioChannelMode> g_audioChannelModes;
+
+inline AudioChannelMode sanitizeAudioChannelMode(AudioChannelMode mode)
+{
+    switch (mode) {
+    case AudioChannelMode::Stereo:
+    case AudioChannelMode::FillLeft:
+    case AudioChannelMode::FillRight:
+    case AudioChannelMode::Swap:
+    case AudioChannelMode::Mono:
+        return mode;
+    }
+    return AudioChannelMode::Stereo;
+}
+
+inline AudioChannelModeKey audioChannelModeKeyForEntry(const PlaybackEntry &entry)
+{
+    return {
+        qRound64(entry.clipIn * 1000.0),
+        entry.sourceTrack,
+        entry.sourceClipIndex
+    };
+}
+
 // Linear-interpolate the per-clip volume envelope at a given clip-local
 // time (seconds, 0.0 == clip start on the timeline). Empty envelope falls
 // back to the static `volume` field so existing behaviour is preserved
@@ -182,6 +229,70 @@ inline double evaluateVolumeEnvelope(const QVector<AudioGainPoint> &env,
     return fallbackGain;
 }
 } // namespace
+
+void setAudioChannelModePlaybackBindings(const QVector<AudioChannelModePlaybackBinding> &bindings)
+{
+    QHash<AudioChannelModeKey, AudioChannelMode> next;
+    next.reserve(bindings.size());
+    for (const auto &binding : bindings) {
+        const AudioChannelModeKey key{
+            binding.clipInMs,
+            binding.sourceTrack,
+            binding.sourceClipIndex
+        };
+        next.insert(key, sanitizeAudioChannelMode(binding.mode));
+    }
+
+    QMutexLocker lock(&g_audioChannelModeMutex);
+    g_audioChannelModes = std::move(next);
+}
+
+AudioChannelMode audioChannelModeForPlaybackEntry(const PlaybackEntry &entry)
+{
+    QMutexLocker lock(&g_audioChannelModeMutex);
+    return g_audioChannelModes.value(audioChannelModeKeyForEntry(entry),
+                                     AudioChannelMode::Stereo);
+}
+
+void applyAudioChannelModeToInterleavedStereoS16(int16_t *samples,
+                                                int frameCount,
+                                                AudioChannelMode mode)
+{
+    if (!samples || frameCount <= 0)
+        return;
+
+    mode = sanitizeAudioChannelMode(mode);
+    if (mode == AudioChannelMode::Stereo)
+        return;
+
+    for (int i = 0; i < frameCount; ++i) {
+        int16_t &left = samples[i * 2];
+        int16_t &right = samples[i * 2 + 1];
+        const int16_t l = left;
+        const int16_t r = right;
+        switch (mode) {
+        case AudioChannelMode::FillLeft:
+            right = l;
+            break;
+        case AudioChannelMode::FillRight:
+            left = r;
+            break;
+        case AudioChannelMode::Swap:
+            left = r;
+            right = l;
+            break;
+        case AudioChannelMode::Mono: {
+            const int16_t mono = static_cast<int16_t>(
+                (static_cast<int>(l) + static_cast<int>(r)) / 2);
+            left = mono;
+            right = mono;
+            break;
+        }
+        case AudioChannelMode::Stereo:
+            break;
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // RBJ biquad cookbook — coefficient calculation for per-track realtime EQ.
@@ -1664,6 +1775,7 @@ void AudioMixer::setSequence(const QVector<PlaybackEntry> &entries) {
                 e.sourceTrack,
                 e.sourceClipIndex
             };
+            const AudioChannelMode channelMode = audioChannelModeForPlaybackEntry(e);
             if (e.sourceTrack > maxTrack) maxTrack = e.sourceTrack;
 
             // Defensive: if the same key appears twice in one batch the
@@ -1687,9 +1799,12 @@ void AudioMixer::setSequence(const QVector<PlaybackEntry> &entries) {
                 // Same key reappears — update mutable timeline metadata only.
                 const auto oldStart = de->entry.timelineStart;
                 const auto oldEnd = de->entry.timelineEnd;
+                const bool channelModeChanged = de->channelMode != channelMode;
                 de->entry = e;
+                de->channelMode = channelMode;
                 if (!qFuzzyCompare(oldStart, e.timelineStart)
-                    || !qFuzzyCompare(oldEnd, e.timelineEnd)) {
+                    || !qFuzzyCompare(oldEnd, e.timelineEnd)
+                    || channelModeChanged) {
                     // [P2-M3] Use the shared resetAtempoState helper for the
                     // pre-seek atempo field invalidation (atempoSrcFrameCarry,
                     // seekPending) so this site and R10-a's removed-key loop
@@ -1706,6 +1821,7 @@ void AudioMixer::setSequence(const QVector<PlaybackEntry> &entries) {
             } else {
                 de = new AudioDecoderEntry;
                 de->entry = e;
+                de->channelMode = channelMode;
                 if (!openEntry(de)) {
                     pendingErrors << QStringLiteral("AudioMixer: failed to open audio: %1").arg(e.filePath);
                     closeEntry(de);
@@ -2955,6 +3071,10 @@ void AudioMixer::resampleAndAppend(AudioDecoderEntry *e) {
     // and ringHead on drain.
     if (got > 0) {
         e->ring.resize(prevSize + got * AudioMixer::kBytesPerFrame);
+        applyAudioChannelModeToInterleavedStereoS16(
+            reinterpret_cast<int16_t *>(e->ring.data() + prevSize),
+            got,
+            e->channelMode);
     } else {
         e->ring.resize(prevSize);
     }

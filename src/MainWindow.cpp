@@ -699,7 +699,7 @@ bool applyDuckingToTimeline(Timeline *timeline,
     return true;
 }
 
-bool timelineHasVolumeEnvelope(Timeline *timeline)
+bool timelineNeedsAudioMixForExport(Timeline *timeline)
 {
     if (!timeline)
         return false;
@@ -708,6 +708,8 @@ bool timelineHasVolumeEnvelope(Timeline *timeline)
             continue;
         for (const ClipInfo &clip : track->clips()) {
             if (!clip.volumeEnvelope.isEmpty())
+                return true;
+            if (clip.audioChannelMode != AudioChannelMode::Stereo)
                 return true;
         }
     }
@@ -757,6 +759,20 @@ QString nextExportAudioMixPath()
               .arg(++serial);
 }
 
+QString exportAudioFilterChainForEntry(int inputIndex,
+                                       const PlaybackEntry &entry,
+                                       AudioChannelMode channelMode)
+{
+    const int delayMs = qMax(0, qRound(entry.timelineStart * 1000.0));
+    return buildExportAudioMixEntryFilterChain(
+        inputIndex,
+        ffmpegNumber(entry.clipIn),
+        ffmpegNumber(entry.clipOut),
+        delayMs,
+        volumeExpressionForEntry(entry),
+        channelMode);
+}
+
 bool runFfmpegForAudioMix(const QStringList &args, QString *error)
 {
     const QString ffmpeg = findFfmpegBinary();
@@ -786,7 +802,7 @@ bool runFfmpegForAudioMix(const QStringList &args, QString *error)
 
 QString prepareTimelineAudioMixForExport(Timeline *timeline, QString *error)
 {
-    if (!timelineHasVolumeEnvelope(timeline))
+    if (!timelineNeedsAudioMixForExport(timeline))
         return {};
 
     const QVector<PlaybackEntry> entries = timeline->computeAudioPlaybackSequence();
@@ -828,21 +844,10 @@ QString prepareTimelineAudioMixForExport(Timeline *timeline, QString *error)
     QStringList mixInputs;
     for (int i = 0; i < validEntries.size(); ++i) {
         const PlaybackEntry &entry = validEntries[i];
-        const int delayMs = qMax(0, qRound(entry.timelineStart * 1000.0));
-        QString chain = QStringLiteral("[%1:a]"
-                                       "atrim=start=%2:end=%3,"
-                                       "asetpts=PTS-STARTPTS,"
-                                       "aresample=48000,"
-                                       "aformat=sample_fmts=fltp:channel_layouts=stereo,"
-                                       "volume='%4':eval=frame")
-            .arg(i)
-            .arg(ffmpegNumber(entry.clipIn),
-                 ffmpegNumber(entry.clipOut),
-                 volumeExpressionForEntry(entry));
-        if (delayMs > 0)
-            chain += QStringLiteral(",adelay=%1:all=1").arg(delayMs);
-        chain += QStringLiteral("[a%1]").arg(i);
-        chains << chain;
+        chains << exportAudioFilterChainForEntry(
+            i,
+            entry,
+            audioChannelModeForPlaybackEntry(entry));
         mixInputs << QStringLiteral("[a%1]").arg(i);
     }
 

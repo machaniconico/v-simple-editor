@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <QMessageBox>
+#include <QStringList>
 
 // STAGE4B: PlaybackEntry::matteTypeOrdinal stores TrackMatteType as a plain int
 // (PlaybackTypes.h must stay MaskSystem.h-free). This is the SSOT populate site
@@ -77,7 +78,79 @@ inline double envelopeYToGain(double y, int rowHeight) {
     const double t = qBound(0.0, 1.0 - y / static_cast<double>(rowHeight), 1.0);
     return t * kEnvelopeMaxGain;
 }
+
+QString audioChannelModeMenuLabel(AudioChannelMode mode)
+{
+    switch (mode) {
+    case AudioChannelMode::Stereo:
+        return QStringLiteral("Stereo");
+    case AudioChannelMode::FillLeft:
+        return QStringLiteral("Fill Left (L→LR)");
+    case AudioChannelMode::FillRight:
+        return QStringLiteral("Fill Right (R→LR)");
+    case AudioChannelMode::Swap:
+        return QStringLiteral("LRスワップ");
+    case AudioChannelMode::Mono:
+        return QStringLiteral("モノ化");
+    }
+    return QStringLiteral("Stereo");
+}
+
+QAction *addAudioChannelModeAction(QMenu *menu,
+                                   AudioChannelMode current,
+                                   AudioChannelMode mode)
+{
+    QAction *act = menu->addAction(audioChannelModeMenuLabel(mode));
+    act->setCheckable(true);
+    act->setChecked(current == mode);
+    return act;
+}
 } // namespace
+
+QString exportAudioChannelPanFilterForMode(AudioChannelMode mode)
+{
+    switch (mode) {
+    case AudioChannelMode::Stereo:
+        return {};
+    case AudioChannelMode::FillLeft:
+        return QStringLiteral("pan=stereo|c0=c0|c1=c0");
+    case AudioChannelMode::FillRight:
+        return QStringLiteral("pan=stereo|c0=c1|c1=c1");
+    case AudioChannelMode::Swap:
+        return QStringLiteral("pan=stereo|c0=c1|c1=c0");
+    case AudioChannelMode::Mono:
+        return QStringLiteral("pan=stereo|c0=0.5*c0+0.5*c1|c1=0.5*c0+0.5*c1");
+    }
+    return {};
+}
+
+QString buildExportAudioMixEntryFilterChain(int inputIndex,
+                                            const QString &clipIn,
+                                            const QString &clipOut,
+                                            int delayMs,
+                                            const QString &volumeExpression,
+                                            AudioChannelMode mode)
+{
+    QStringList filters;
+    filters << QStringLiteral("atrim=start=%1:end=%2")
+                   .arg(clipIn, clipOut)
+            << QStringLiteral("asetpts=PTS-STARTPTS")
+            << QStringLiteral("aresample=48000")
+            << QStringLiteral("aformat=sample_fmts=fltp:channel_layouts=stereo");
+
+    const QString panFilter = exportAudioChannelPanFilterForMode(mode);
+    if (!panFilter.isEmpty())
+        filters << panFilter;
+
+    filters << QStringLiteral("volume='%1':eval=frame").arg(volumeExpression);
+
+    if (delayMs > 0)
+        filters << QStringLiteral("adelay=%1:all=1").arg(delayMs);
+
+    return QStringLiteral("[%1:a]%2[a%1]")
+        .arg(inputIndex)
+        .arg(filters.join(QLatin1Char(',')));
+}
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -4006,6 +4079,18 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
         aMenu.addSeparator();
         QAction *aNormalize = aMenu.addAction(QStringLiteral("ノーマライズ"));
         aMenu.addSeparator();
+        QMenu *aChannelMenu = aMenu.addMenu(QStringLiteral("チャンネルマッピング"));
+        QAction *aStereoAct = addAudioChannelModeAction(aChannelMenu, aClip.audioChannelMode,
+                                                        AudioChannelMode::Stereo);
+        QAction *aFillLeftAct = addAudioChannelModeAction(aChannelMenu, aClip.audioChannelMode,
+                                                          AudioChannelMode::FillLeft);
+        QAction *aFillRightAct = addAudioChannelModeAction(aChannelMenu, aClip.audioChannelMode,
+                                                           AudioChannelMode::FillRight);
+        QAction *aSwapAct = addAudioChannelModeAction(aChannelMenu, aClip.audioChannelMode,
+                                                      AudioChannelMode::Swap);
+        QAction *aMonoAct = addAudioChannelModeAction(aChannelMenu, aClip.audioChannelMode,
+                                                      AudioChannelMode::Mono);
+        aMenu.addSeparator();
         QMenu *atMenu = aMenu.addMenu(QStringLiteral("音声トランジション"));
         QAction *aXdAct = atMenu->addAction(QStringLiteral("クロスフェード (1.0s)"));
         QAction *aFiAct = atMenu->addAction(QStringLiteral("フェードイン (0.5s)"));
@@ -4051,6 +4136,15 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
                 .arg(Transition::typeName(type)));
             scheduleEmitSequenceChanged();
         };
+        auto applyAudioChannelMode = [&](AudioChannelMode mode) {
+            auto clips = track->clips();
+            if (clipIndex >= clips.size()) return;
+            if (clips[clipIndex].audioChannelMode == mode) return;
+            clips[clipIndex].audioChannelMode = mode;
+            track->setClips(clips);
+            saveUndoState(QStringLiteral("Set audio channel mapping"));
+            scheduleEmitSequenceChanged();
+        };
         if (aChosen == aCut) cutSelectedClip();
         else if (aChosen == aCopy) copySelectedClip();
         else if (aChosen == aDel) deleteSelectedClip();
@@ -4059,6 +4153,11 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
             const int trackIdx = m_audioTracks.indexOf(track);
             normalizeAudioClipPeak(trackIdx, clipIndex);
         }
+        else if (aChosen == aStereoAct) applyAudioChannelMode(AudioChannelMode::Stereo);
+        else if (aChosen == aFillLeftAct) applyAudioChannelMode(AudioChannelMode::FillLeft);
+        else if (aChosen == aFillRightAct) applyAudioChannelMode(AudioChannelMode::FillRight);
+        else if (aChosen == aSwapAct) applyAudioChannelMode(AudioChannelMode::Swap);
+        else if (aChosen == aMonoAct) applyAudioChannelMode(AudioChannelMode::Mono);
         else if (aChosen == aXdAct) applyAudioOnly(TransitionType::CrossDissolve, 1.0);
         else if (aChosen == aFiAct) applyAudioOnly(TransitionType::FadeIn, 0.5);
         else if (aChosen == aFoAct) applyAudioOnly(TransitionType::FadeOut, 0.5);
@@ -4089,6 +4188,19 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     const int linkGroup = clipInfo.linkGroup;
     const bool hasTransition = clipInfo.leadIn.type != TransitionType::None
                             || clipInfo.trailOut.type != TransitionType::None;
+    auto currentLinkedAudioChannelMode = [&]() {
+        if (linkGroup > 0) {
+            for (const auto *audioTrack : m_audioTracks) {
+                if (!audioTrack) continue;
+                const auto &audioClips = audioTrack->clips();
+                for (const auto &audioClip : audioClips) {
+                    if (audioClip.linkGroup == linkGroup)
+                        return audioClip.audioChannelMode;
+                }
+            }
+        }
+        return clipInfo.audioChannelMode;
+    };
 
     QMenu menu;
     QAction *cutAct = menu.addAction(QStringLiteral("カット"));
@@ -4102,6 +4214,19 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     QAction *relinkAct = menu.addAction(QStringLiteral("再同期"));
     relinkAct->setEnabled(linkGroup == 0);
 
+    menu.addSeparator();
+    const AudioChannelMode currentChannelMode = currentLinkedAudioChannelMode();
+    QMenu *channelMenu = menu.addMenu(QStringLiteral("チャンネルマッピング"));
+    QAction *stereoAct = addAudioChannelModeAction(channelMenu, currentChannelMode,
+                                                   AudioChannelMode::Stereo);
+    QAction *fillLeftAct = addAudioChannelModeAction(channelMenu, currentChannelMode,
+                                                     AudioChannelMode::FillLeft);
+    QAction *fillRightAct = addAudioChannelModeAction(channelMenu, currentChannelMode,
+                                                      AudioChannelMode::FillRight);
+    QAction *swapAct = addAudioChannelModeAction(channelMenu, currentChannelMode,
+                                                 AudioChannelMode::Swap);
+    QAction *monoAct = addAudioChannelModeAction(channelMenu, currentChannelMode,
+                                                 AudioChannelMode::Mono);
     menu.addSeparator();
     QMenu *transitionMenu = menu.addMenu(QStringLiteral("トランジション"));
     QAction *xdAct = transitionMenu->addAction(QStringLiteral("クロスディゾルブ (1.0s)"));
@@ -4197,6 +4322,39 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     QAction *snsCoverAct = menu.addAction(QStringLiteral("SNS: 幅埋め(クロップ・歪みなし)"));
     QAction *snsFillAct = menu.addAction(QStringLiteral("SNS: フィット解除(全画面)"));
 
+    auto applyLinkedAudioChannelMode = [&](AudioChannelMode mode) {
+        bool changed = false;
+        auto applyToTrackClip = [&](TimelineTrack *targetTrack, int targetClipIndex) {
+            if (!targetTrack || targetClipIndex < 0
+                || targetClipIndex >= targetTrack->clips().size()) {
+                return;
+            }
+            auto clips = targetTrack->clips();
+            if (clips[targetClipIndex].audioChannelMode == mode)
+                return;
+            clips[targetClipIndex].audioChannelMode = mode;
+            targetTrack->setClips(clips);
+            changed = true;
+        };
+
+        applyToTrackClip(track, clipIndex);
+        if (linkGroup > 0) {
+            for (auto *audioTrack : m_audioTracks) {
+                if (!audioTrack) continue;
+                const auto audioClips = audioTrack->clips();
+                for (int i = 0; i < audioClips.size(); ++i) {
+                    if (audioClips[i].linkGroup == linkGroup)
+                        applyToTrackClip(audioTrack, i);
+                }
+            }
+        }
+
+        if (changed) {
+            saveUndoState(QStringLiteral("Set audio channel mapping"));
+            scheduleEmitSequenceChanged();
+        }
+    };
+
     QAction *chosen = menu.exec(globalPos);
     if (!chosen) return;
     if (chosen == cutAct) cutSelectedClip();
@@ -4206,6 +4364,11 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     else if (chosen == beatMarkerAct) applyBeatMarkersToClip(track, clipIndex);
     else if (chosen == unlinkAct) unlinkClipGroup(linkGroup);
     else if (chosen == relinkAct) relinkClipAt(track, clipIndex);
+    else if (chosen == stereoAct) applyLinkedAudioChannelMode(AudioChannelMode::Stereo);
+    else if (chosen == fillLeftAct) applyLinkedAudioChannelMode(AudioChannelMode::FillLeft);
+    else if (chosen == fillRightAct) applyLinkedAudioChannelMode(AudioChannelMode::FillRight);
+    else if (chosen == swapAct) applyLinkedAudioChannelMode(AudioChannelMode::Swap);
+    else if (chosen == monoAct) applyLinkedAudioChannelMode(AudioChannelMode::Mono);
     else if (chosen == snsFitAct) applySnsFitToClip(track, clipIndex, true, false, QStringLiteral("SNS width fit center"));
     else if (chosen == snsCoverAct) applySnsFitToClip(track, clipIndex, false, true, QStringLiteral("SNS width fill crop"));
     else if (chosen == snsFillAct) applySnsFitToClip(track, clipIndex, false, false, QStringLiteral("SNS restore fullscreen"));
@@ -6041,8 +6204,11 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
     // mixer keys decoders by (filePath, clipIn, sourceTrack, sourceClipIndex)
     // to reuse open file contexts across re-emits.
     QVector<PlaybackEntry> result;
-    if (m_audioTracks.isEmpty())
+    QVector<AudioChannelModePlaybackBinding> channelModeBindings;
+    if (m_audioTracks.isEmpty()) {
+        setAudioChannelModePlaybackBindings(channelModeBindings);
         return result;
+    }
 
     for (int t = 0; t < m_audioTracks.size(); ++t) {
         auto *track = m_audioTracks[t];
@@ -6075,6 +6241,12 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
             e.trailOutDuration = c.trailOut.duration;
             e.trailOutEasing = c.trailOut.easing;
             result.append(e);
+            channelModeBindings.append({
+                qRound64(e.clipIn * 1000.0),
+                e.sourceTrack,
+                e.sourceClipIndex,
+                c.audioChannelMode
+            });
             accum += clipDur;
         }
     }
@@ -6088,6 +6260,7 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
                       return a.timelineStart < b.timelineStart;
                   return a.sourceTrack < b.sourceTrack;
               });
+    setAudioChannelModePlaybackBindings(channelModeBindings);
     return result;
 }
 
