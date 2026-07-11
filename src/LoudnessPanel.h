@@ -20,18 +20,22 @@ public:
     // Update the four readout labels from a measurement pass.
     void setMeasurement(double integratedLUFS, double momentaryLUFS,
                         double shortTermLUFS, double truePeakDBTP);
+    void setMeasuring(bool measuring);
 
     // Return the LUFS target for the currently selected delivery preset,
     // or the custom spin value when 'Custom' is active.
     double selectedTargetLUFS() const;
 
 signals:
+    void measurementRequested();
+
     // Emitted once per click of the normalize button. gainDb ==
     // selectedTargetLUFS() - lastIntegratedLUFS. If no measurement has
     // been set yet the signal is NOT emitted and a hint label is shown.
     void normalizeRequested(double targetLUFS, double gainDb);
 
 private slots:
+    void onMeasureClicked();
     void onNormalizeClicked();
     void onDeliveryTargetChanged(int index);
 
@@ -41,6 +45,7 @@ private:
     void updateHint();
 
     bool m_hasMeasurement = false;
+    bool m_isMeasuring = false;
     double m_integratedLUFS = 0.0;
 
     QLabel *m_integratedLabel = nullptr;
@@ -51,6 +56,7 @@ private:
     QComboBox *m_deliveryTarget = nullptr;
     QDoubleSpinBox *m_customSpin = nullptr;
 
+    QPushButton *m_measureBtn = nullptr;
     QPushButton *m_normalizeBtn = nullptr;
 
     QProgressBar *m_gauge = nullptr;

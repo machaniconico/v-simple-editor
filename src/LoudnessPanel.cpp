@@ -32,6 +32,7 @@ LoudnessPanel::LoudnessPanel(QWidget *parent) : QWidget(parent) {
 
 void LoudnessPanel::setMeasurement(double integratedLUFS, double momentaryLUFS,
                                     double shortTermLUFS, double truePeakDBTP) {
+    setMeasuring(false);
     m_hasMeasurement = true;
     m_integratedLUFS = integratedLUFS;
 
@@ -49,6 +50,19 @@ void LoudnessPanel::setMeasurement(double integratedLUFS, double momentaryLUFS,
             QStringLiteral("%1 dBTP").arg(truePeakDBTP, 0, 'f', 1));
 
     updateGauge();
+    updateHint();
+}
+
+void LoudnessPanel::setMeasuring(bool measuring) {
+    m_isMeasuring = measuring;
+    if (m_measureBtn) {
+        m_measureBtn->setEnabled(!measuring);
+        m_measureBtn->setText(measuring
+            ? QStringLiteral("\u6E2C\u5B9A\u4E2D...")
+            : QStringLiteral("\u6E2C\u5B9A"));
+    }
+    if (m_normalizeBtn)
+        m_normalizeBtn->setEnabled(!measuring);
     updateHint();
 }
 
@@ -115,7 +129,10 @@ void LoudnessPanel::buildUi() {
     customRow->addWidget(m_customSpin, 1);
     root->addLayout(customRow);
 
-    // --- Normalize button ---
+    // --- Measurement / normalize buttons ---
+    m_measureBtn = new QPushButton(QStringLiteral("\u6E2C\u5B9A"));
+    root->addWidget(m_measureBtn);
+
     m_normalizeBtn = new QPushButton(
         QStringLiteral("\u30BF\u30FC\u30B2\u30C3\u30C8\u306B\u6B63\u898F\u5316"));
     root->addWidget(m_normalizeBtn);
@@ -134,12 +151,20 @@ void LoudnessPanel::buildUi() {
     root->addWidget(m_hintLabel);
 
     // --- Signals ---
+    connect(m_measureBtn, &QPushButton::clicked,
+            this, &LoudnessPanel::onMeasureClicked);
     connect(m_normalizeBtn, &QPushButton::clicked,
             this, &LoudnessPanel::onNormalizeClicked);
     connect(m_deliveryTarget, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, &LoudnessPanel::onDeliveryTargetChanged);
 
     updateHint();
+}
+
+void LoudnessPanel::onMeasureClicked() {
+    if (m_isMeasuring)
+        return;
+    emit measurementRequested();
 }
 
 void LoudnessPanel::onNormalizeClicked() {
@@ -183,6 +208,10 @@ void LoudnessPanel::updateGauge() {
 
 void LoudnessPanel::updateHint() {
     if (!m_hintLabel) return;
+    if (m_isMeasuring) {
+        m_hintLabel->setText(QStringLiteral("\u30E9\u30A6\u30C9\u30CD\u30B9\u3092\u6E2C\u5B9A\u4E2D..."));
+        return;
+    }
     if (m_hasMeasurement) {
         const double target = selectedTargetLUFS();
         const double gainDb = target - m_integratedLUFS;

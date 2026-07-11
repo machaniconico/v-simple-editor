@@ -192,6 +192,9 @@ public slots:
     // US-SNS-7: Render subtitle track from existing segments
     void renderSubtitleTrack();
 
+    // US-SNS-7: Measure timeline master loudness from the dock panel.
+    void measureLoudness();
+
     // US-SNS-7: Loudness normalization slot
     void applyLoudnessNormalize(double targetLUFS, double gainDb);
 
@@ -564,6 +567,7 @@ private:
     SubtitleStyle m_subtitleStyle;
     LoudnessPanel *m_loudnessPanel = nullptr;
     QDockWidget *m_loudnessDock = nullptr;
+    bool m_loudnessMeasureRunning = false;
     QDockWidget *m_vfxControlsDock = nullptr;
     LayerCompositor m_layerCompositor;
     PrecomposeManager m_precomposeManager;

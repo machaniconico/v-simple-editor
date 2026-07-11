@@ -203,6 +203,7 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QDir>
+#include <QThread>
 #include <algorithm>
 #include <cmath>
 #include <array>
@@ -258,6 +259,7 @@
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
+#include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
 }
 
@@ -660,6 +662,279 @@ QVector<fcpx::xml::ClipEntry> buildFcpxmlExportClips(const Timeline *timeline)
     return entries;
 }
 #endif
+
+constexpr int kLoudnessSampleRate = 48000;
+constexpr int kLoudnessChannels = 2;
+constexpr int kLoudnessBlockFrames = 4096;
+
+struct LoudnessMeasureResult {
+    bool ok = false;
+    QString error;
+    double integrated = 0.0;
+    double momentary = 0.0;
+    double shortTerm = 0.0;
+    double truePeak = 0.0;
+    int mixedEntries = 0;
+};
+
+struct LoudnessDecodeCtx {
+    AVFormatContext *fmt = nullptr;
+    AVCodecContext *codec = nullptr;
+    SwrContext *swr = nullptr;
+    AVPacket *pkt = nullptr;
+    AVFrame *frame = nullptr;
+    int stream = -1;
+
+    ~LoudnessDecodeCtx() {
+        if (frame) av_frame_free(&frame);
+        if (pkt) av_packet_free(&pkt);
+        if (swr) swr_free(&swr);
+        if (codec) avcodec_free_context(&codec);
+        if (fmt) avformat_close_input(&fmt);
+    }
+
+    bool open(const QString &path) {
+        if (avformat_open_input(&fmt, path.toUtf8().constData(), nullptr, nullptr) < 0)
+            return false;
+        if (avformat_find_stream_info(fmt, nullptr) < 0)
+            return false;
+
+        stream = av_find_best_stream(fmt, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+        if (stream < 0)
+            return false;
+
+        AVCodecParameters *par = fmt->streams[stream]->codecpar;
+        const AVCodec *decoder = avcodec_find_decoder(par->codec_id);
+        if (!decoder)
+            return false;
+
+        codec = avcodec_alloc_context3(decoder);
+        if (!codec)
+            return false;
+        if (avcodec_parameters_to_context(codec, par) < 0)
+            return false;
+        if (avcodec_open2(codec, decoder, nullptr) < 0)
+            return false;
+        if (codec->sample_rate <= 0 || codec->ch_layout.nb_channels <= 0)
+            return false;
+
+        AVChannelLayout outLayout = AV_CHANNEL_LAYOUT_STEREO;
+        if (swr_alloc_set_opts2(&swr,
+                &outLayout, AV_SAMPLE_FMT_FLT, kLoudnessSampleRate,
+                &codec->ch_layout, codec->sample_fmt, codec->sample_rate,
+                0, nullptr) < 0) {
+            return false;
+        }
+        if (!swr || swr_init(swr) < 0)
+            return false;
+
+        pkt = av_packet_alloc();
+        frame = av_frame_alloc();
+        return pkt && frame;
+    }
+};
+
+using LoudnessBlockMap = QHash<qint64, QVector<float>>;
+
+double envelopeGainAt(const PlaybackEntry &entry, double localTimelineSec)
+{
+    if (entry.volumeEnvelope.isEmpty())
+        return entry.volume;
+
+    const auto &points = entry.volumeEnvelope;
+    if (localTimelineSec <= points.first().time)
+        return entry.volume * points.first().gain;
+    if (localTimelineSec >= points.last().time)
+        return entry.volume * points.last().gain;
+
+    for (int i = 1; i < points.size(); ++i) {
+        const auto &prev = points[i - 1];
+        const auto &next = points[i];
+        if (localTimelineSec > next.time)
+            continue;
+        const double span = next.time - prev.time;
+        const double t = (span > 0.0) ? (localTimelineSec - prev.time) / span : 0.0;
+        return entry.volume * (prev.gain + (next.gain - prev.gain) * qBound(0.0, t, 1.0));
+    }
+    return entry.volume;
+}
+
+double transitionGainAt(const PlaybackEntry &entry, double localTimelineSec)
+{
+    double gain = 1.0;
+    if (entry.leadInType == TransitionType::FadeIn && entry.leadInDuration > 0.0)
+        gain *= qBound(0.0, localTimelineSec / entry.leadInDuration, 1.0);
+
+    const double duration = qMax(0.0, entry.timelineEnd - entry.timelineStart);
+    const double fadeOutStart = duration - entry.trailOutDuration;
+    if (entry.trailOutType == TransitionType::FadeOut
+        && entry.trailOutDuration > 0.0
+        && localTimelineSec >= fadeOutStart) {
+        gain *= qBound(0.0, (duration - localTimelineSec) / entry.trailOutDuration, 1.0);
+    }
+    return gain;
+}
+
+void mixLoudnessSample(LoudnessBlockMap &blocks, qint64 frame, float left, float right)
+{
+    if (frame < 0)
+        return;
+
+    const qint64 blockIndex = frame / kLoudnessBlockFrames;
+    const int offset = static_cast<int>(frame % kLoudnessBlockFrames) * kLoudnessChannels;
+    QVector<float> &block = blocks[blockIndex];
+    if (block.isEmpty())
+        block.resize(kLoudnessBlockFrames * kLoudnessChannels);
+    block[offset] += left;
+    block[offset + 1] += right;
+}
+
+bool decodeEntryForLoudness(const PlaybackEntry &entry,
+                            LoudnessBlockMap &blocks,
+                            QString *error)
+{
+    if (entry.audioMuted || entry.filePath.isEmpty())
+        return false;
+
+    const double speed = (entry.speed > 0.0) ? entry.speed : 1.0;
+    const double clipOut = (entry.clipOut > entry.clipIn) ? entry.clipOut : entry.clipIn;
+    const double timelineDuration = qMax(0.0, entry.timelineEnd - entry.timelineStart);
+    if (clipOut <= entry.clipIn || timelineDuration <= 0.0)
+        return false;
+
+    LoudnessDecodeCtx dec;
+    if (!dec.open(entry.filePath)) {
+        if (error)
+            *error = QStringLiteral("音声を開けません: %1").arg(QFileInfo(entry.filePath).fileName());
+        return false;
+    }
+
+    const double timeBase = av_q2d(dec.fmt->streams[dec.stream]->time_base);
+    const int64_t seekTs = static_cast<int64_t>(entry.clipIn / timeBase);
+    av_seek_frame(dec.fmt, dec.stream, seekTs, AVSEEK_FLAG_BACKWARD);
+    avcodec_flush_buffers(dec.codec);
+
+    bool mixedAny = false;
+    double fallbackSourceSec = entry.clipIn;
+
+    auto receiveFrames = [&]() {
+        while (avcodec_receive_frame(dec.codec, dec.frame) >= 0) {
+            int64_t pts = dec.frame->best_effort_timestamp;
+            if (pts == AV_NOPTS_VALUE)
+                pts = dec.frame->pts;
+
+            const double frameSourceStart =
+                (pts != AV_NOPTS_VALUE) ? static_cast<double>(pts) * timeBase : fallbackSourceSec;
+            fallbackSourceSec = frameSourceStart
+                + static_cast<double>(dec.frame->nb_samples) / qMax(1, dec.codec->sample_rate);
+
+            const int outSamples = swr_get_out_samples(dec.swr, dec.frame->nb_samples);
+            if (outSamples <= 0) {
+                av_frame_unref(dec.frame);
+                continue;
+            }
+
+            QVector<float> converted(outSamples * kLoudnessChannels);
+            uint8_t *outData =
+                reinterpret_cast<uint8_t *>(converted.data());
+            const int got = swr_convert(dec.swr,
+                                        &outData,
+                                        outSamples,
+                                        const_cast<const uint8_t **>(dec.frame->extended_data),
+                                        dec.frame->nb_samples);
+            if (got <= 0) {
+                av_frame_unref(dec.frame);
+                continue;
+            }
+
+            for (int i = 0; i < got; ++i) {
+                const double sourceSec =
+                    frameSourceStart + static_cast<double>(i) / kLoudnessSampleRate;
+                if (sourceSec < entry.clipIn)
+                    continue;
+                if (sourceSec >= clipOut)
+                    break;
+
+                const double localTimelineSec = (sourceSec - entry.clipIn) / speed;
+                if (localTimelineSec < 0.0 || localTimelineSec >= timelineDuration)
+                    continue;
+
+                const double gain =
+                    envelopeGainAt(entry, localTimelineSec)
+                    * transitionGainAt(entry, localTimelineSec);
+                if (gain == 0.0)
+                    continue;
+
+                const qint64 destFrame = static_cast<qint64>(
+                    std::llround((entry.timelineStart + localTimelineSec) * kLoudnessSampleRate));
+                const int src = i * kLoudnessChannels;
+                mixLoudnessSample(blocks, destFrame,
+                                  static_cast<float>(converted[src] * gain),
+                                  static_cast<float>(converted[src + 1] * gain));
+                mixedAny = true;
+            }
+            av_frame_unref(dec.frame);
+        }
+    };
+
+    while (av_read_frame(dec.fmt, dec.pkt) >= 0) {
+        if (dec.pkt->stream_index != dec.stream) {
+            av_packet_unref(dec.pkt);
+            continue;
+        }
+        const int sendRc = avcodec_send_packet(dec.codec, dec.pkt);
+        av_packet_unref(dec.pkt);
+        if (sendRc < 0)
+            continue;
+        receiveFrames();
+    }
+
+    avcodec_send_packet(dec.codec, nullptr);
+    receiveFrames();
+    return mixedAny;
+}
+
+LoudnessMeasureResult measureTimelineLoudness(const QVector<PlaybackEntry> &entries)
+{
+    LoudnessBlockMap blocks;
+    QString lastError;
+    int mixedEntries = 0;
+
+    for (const PlaybackEntry &entry : entries) {
+        if (decodeEntryForLoudness(entry, blocks, &lastError))
+            ++mixedEntries;
+    }
+
+    if (blocks.isEmpty()) {
+        LoudnessMeasureResult result;
+        result.error = lastError.isEmpty()
+            ? QStringLiteral("測定できる音声がありません。")
+            : lastError;
+        return result;
+    }
+
+    QVector<qint64> keys;
+    keys.reserve(blocks.size());
+    for (auto it = blocks.constBegin(); it != blocks.constEnd(); ++it)
+        keys.append(it.key());
+    std::sort(keys.begin(), keys.end());
+
+    LoudnessAnalyzer analyzer;
+    analyzer.setSampleRate(kLoudnessSampleRate);
+    for (qint64 key : keys) {
+        const QVector<float> &block = blocks[key];
+        analyzer.processBlock(block.constData(), block.size() / kLoudnessChannels, kLoudnessChannels);
+    }
+
+    LoudnessMeasureResult result;
+    result.ok = true;
+    result.integrated = analyzer.integratedLUFS();
+    result.momentary = analyzer.momentaryLUFS();
+    result.shortTerm = analyzer.shortTermLUFS();
+    result.truePeak = analyzer.truePeakDBTP();
+    result.mixedEntries = mixedEntries;
+    return result;
+}
 
 } // namespace
 
@@ -2433,6 +2708,8 @@ void MainWindow::setupMenuBar()
     m_loudnessDock->setWidget(m_loudnessPanel);
     addDockWidget(Qt::RightDockWidgetArea, m_loudnessDock);
     m_loudnessDock->setVisible(false);
+    connect(m_loudnessPanel, &LoudnessPanel::measurementRequested,
+            this, &MainWindow::measureLoudness);
     connect(m_loudnessPanel, &LoudnessPanel::normalizeRequested,
             this, &MainWindow::applyLoudnessNormalize);
 
@@ -10454,6 +10731,71 @@ void MainWindow::renderSubtitleTrack()
     statusBar()->showMessage(
         QString("字幕トラック: %1 セグメントをレンダリング").arg(m_subtitleSegments.size()),
         4000);
+}
+
+void MainWindow::measureLoudness()
+{
+    if (m_loudnessMeasureRunning)
+        return;
+
+    if (!m_timeline || !m_loudnessPanel) {
+        statusBar()->showMessage(QStringLiteral("ラウドネス測定: タイムラインを準備できません。"), 4000);
+        return;
+    }
+
+    QVector<PlaybackEntry> entries = m_timeline->computeAudioPlaybackSequence();
+    auto &proxyManager = ProxyManager::instance();
+    for (PlaybackEntry &entry : entries)
+        entry.filePath = proxyManager.getProxyPath(entry.filePath);
+
+    entries.erase(std::remove_if(entries.begin(), entries.end(),
+        [](const PlaybackEntry &entry) {
+            return entry.audioMuted
+                || entry.filePath.isEmpty()
+                || entry.timelineEnd <= entry.timelineStart
+                || entry.clipOut <= entry.clipIn;
+        }), entries.end());
+
+    if (entries.isEmpty()) {
+        statusBar()->showMessage(QStringLiteral("ラウドネス測定: 測定できる音声がありません。"), 4000);
+        return;
+    }
+
+    m_loudnessMeasureRunning = true;
+    m_loudnessPanel->setMeasuring(true);
+    statusBar()->showMessage(QStringLiteral("ラウドネスを測定中..."));
+
+    QPointer<MainWindow> self(this);
+    QThread *worker = QThread::create([self, entries]() {
+        const LoudnessMeasureResult result = measureTimelineLoudness(entries);
+
+        QMetaObject::invokeMethod(qApp, [self, result]() {
+            if (!self)
+                return;
+
+            self->m_loudnessMeasureRunning = false;
+            if (!self->m_loudnessPanel)
+                return;
+
+            if (!result.ok) {
+                self->m_loudnessPanel->setMeasuring(false);
+                self->statusBar()->showMessage(
+                    QStringLiteral("ラウドネス測定: %1").arg(result.error), 5000);
+                return;
+            }
+
+            self->m_loudnessPanel->setMeasurement(result.integrated,
+                                                  result.momentary,
+                                                  result.shortTerm,
+                                                  result.truePeak);
+            self->statusBar()->showMessage(
+                QStringLiteral("ラウドネス測定完了: %1 LUFS")
+                    .arg(result.integrated, 0, 'f', 1),
+                4000);
+        }, Qt::QueuedConnection);
+    });
+    connect(worker, &QThread::finished, worker, &QObject::deleteLater);
+    worker->start();
 }
 
 // US-SNS-7: Loudness normalization slot
