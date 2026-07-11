@@ -5,7 +5,15 @@
 #include "SubtitleTrackRenderer.h"
 #include <QFileInfo>
 #include <QPainter>
+#include <algorithm>
+#include <cstdint>
 #include <cmath>
+
+extern "C" {
+#include <libavutil/audio_fifo.h>
+#include <libavutil/channel_layout.h>
+#include <libavutil/samplefmt.h>
+}
 
 // ---------------------------------------------------------------------------
 // Helper: build x265-params HDR10 metadata string (BT.2020 primaries / D65).
@@ -34,6 +42,184 @@ static QByteArray buildX265Hdr10Params(const HDRSettings& hdr)
     s.append(QByteArray::number(hdr.maxFall));
     return s;
 }
+
+static AVSampleFormat selectAudioSampleFormat(const AVCodec *codec)
+{
+    if (!codec || !codec->sample_fmts)
+        return AV_SAMPLE_FMT_FLTP;
+
+    for (const AVSampleFormat *fmt = codec->sample_fmts; *fmt != AV_SAMPLE_FMT_NONE; ++fmt) {
+        if (*fmt == AV_SAMPLE_FMT_FLTP)
+            return *fmt;
+    }
+
+    return codec->sample_fmts[0];
+}
+
+static int selectAudioSampleRate(const AVCodec *codec, int preferredRate)
+{
+    if (preferredRate <= 0)
+        preferredRate = 48000;
+    if (!codec || !codec->supported_samplerates)
+        return preferredRate;
+
+    int best = codec->supported_samplerates[0];
+    int bestDiff = std::abs(best - preferredRate);
+    for (const int *rate = codec->supported_samplerates; *rate; ++rate) {
+        const int diff = std::abs(*rate - preferredRate);
+        if (diff < bestDiff) {
+            best = *rate;
+            bestDiff = diff;
+        }
+    }
+    return best;
+}
+
+static bool probeFirstAudioStream(const QVector<ClipInfo> &clips, int &sampleRate)
+{
+    sampleRate = 48000;
+    for (const auto &clip : clips) {
+        AVFormatContext *fmt = nullptr;
+        if (avformat_open_input(&fmt, clip.filePath.toUtf8().constData(), nullptr, nullptr) < 0)
+            continue;
+
+        bool found = false;
+        if (avformat_find_stream_info(fmt, nullptr) >= 0) {
+            const int idx = av_find_best_stream(fmt, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+            if (idx >= 0) {
+                AVCodecParameters *par = fmt->streams[idx]->codecpar;
+                if (par->sample_rate > 0)
+                    sampleRate = par->sample_rate;
+                found = true;
+            }
+        }
+        avformat_close_input(&fmt);
+        if (found)
+            return true;
+    }
+    return false;
+}
+
+static void fillOpaqueAlphaPlane(AVFrame *frame)
+{
+    if (!frame || frame->format != AV_PIX_FMT_YUVA444P10LE || !frame->data[3])
+        return;
+
+    for (int y = 0; y < frame->height; ++y) {
+        auto *row = reinterpret_cast<uint16_t *>(frame->data[3] + y * frame->linesize[3]);
+        std::fill(row, row + frame->width, static_cast<uint16_t>(1023));
+    }
+}
+
+static void applyAudioGain(uint8_t **data, AVSampleFormat fmt, int channels, int samples, double gain)
+{
+    if (!data || channels <= 0 || samples <= 0 || std::abs(gain - 1.0) < 0.000001)
+        return;
+
+    const bool planar = av_sample_fmt_is_planar(fmt);
+    const AVSampleFormat packedFmt = av_get_packed_sample_fmt(fmt);
+    const int planes = planar ? channels : 1;
+    const int samplesPerPlane = planar ? samples : samples * channels;
+
+    for (int plane = 0; plane < planes; ++plane) {
+        if (!data[plane])
+            continue;
+
+        switch (packedFmt) {
+        case AV_SAMPLE_FMT_FLT: {
+            auto *dst = reinterpret_cast<float *>(data[plane]);
+            for (int i = 0; i < samplesPerPlane; ++i)
+                dst[i] = static_cast<float>(dst[i] * gain);
+            break;
+        }
+        case AV_SAMPLE_FMT_DBL: {
+            auto *dst = reinterpret_cast<double *>(data[plane]);
+            for (int i = 0; i < samplesPerPlane; ++i)
+                dst[i] *= gain;
+            break;
+        }
+        case AV_SAMPLE_FMT_S16: {
+            auto *dst = reinterpret_cast<int16_t *>(data[plane]);
+            for (int i = 0; i < samplesPerPlane; ++i) {
+                const int scaled = static_cast<int>(std::lrint(dst[i] * gain));
+                dst[i] = static_cast<int16_t>(std::clamp(scaled, -32768, 32767));
+            }
+            break;
+        }
+        case AV_SAMPLE_FMT_S32: {
+            auto *dst = reinterpret_cast<int32_t *>(data[plane]);
+            for (int i = 0; i < samplesPerPlane; ++i) {
+                const double scaled = dst[i] * gain;
+                dst[i] = static_cast<int32_t>(std::clamp(scaled,
+                                                        static_cast<double>(INT32_MIN),
+                                                        static_cast<double>(INT32_MAX)));
+            }
+            break;
+        }
+        default:
+            break;
+        }
+    }
+}
+
+static bool writeAudioPackets(AVFormatContext *outFmt, AVCodecContext *encCtx, AVStream *stream)
+{
+    AVPacket *packet = av_packet_alloc();
+    if (!packet)
+        return false;
+
+    bool ok = true;
+    while (avcodec_receive_packet(encCtx, packet) == 0) {
+        av_packet_rescale_ts(packet, encCtx->time_base, stream->time_base);
+        packet->stream_index = stream->index;
+        if (av_interleaved_write_frame(outFmt, packet) < 0)
+            ok = false;
+        av_packet_unref(packet);
+    }
+
+    av_packet_free(&packet);
+    return ok;
+}
+
+static bool encodeAudioFifo(AVFormatContext *outFmt, AVCodecContext *encCtx, AVStream *stream,
+                            AVAudioFifo *fifo, bool drainAll, int64_t &audioPts)
+{
+    if (!outFmt || !encCtx || !stream || !fifo)
+        return false;
+
+    const int frameSize = encCtx->frame_size > 0 ? encCtx->frame_size : 1024;
+    bool ok = true;
+
+    while (av_audio_fifo_size(fifo) >= frameSize || (drainAll && av_audio_fifo_size(fifo) > 0)) {
+        const int samples = drainAll ? qMin(av_audio_fifo_size(fifo), frameSize) : frameSize;
+        AVFrame *frame = av_frame_alloc();
+        if (!frame)
+            return false;
+
+        frame->nb_samples = samples;
+        frame->format = encCtx->sample_fmt;
+        frame->sample_rate = encCtx->sample_rate;
+        av_channel_layout_copy(&frame->ch_layout, &encCtx->ch_layout);
+
+        if (av_frame_get_buffer(frame, 0) < 0
+            || av_audio_fifo_read(fifo, reinterpret_cast<void **>(frame->data), samples) < samples) {
+            av_frame_free(&frame);
+            return false;
+        }
+
+        frame->pts = audioPts;
+        audioPts += samples;
+
+        if (avcodec_send_frame(encCtx, frame) == 0)
+            ok = writeAudioPackets(outFmt, encCtx, stream) && ok;
+        else
+            ok = false;
+
+        av_frame_free(&frame);
+    }
+
+    return ok;
+}
 } // namespace
 
 Exporter::Exporter(QObject *parent)
@@ -58,12 +244,12 @@ void Exporter::setLoudnessGainDb(double gainDb)
 
 void Exporter::cancel()
 {
-    m_cancelled = true;
+    m_cancelled.store(true);
 }
 
 void Exporter::startExport(const ExportConfig &config, const QVector<ClipInfo> &clips)
 {
-    m_cancelled = false;
+    m_cancelled.store(false);
     m_thread = QThread::create([this, config, clips]() {
         doExport(config, clips);
     });
@@ -212,6 +398,23 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
     }
     if (!CodecDetector::isEncoderAvailable(resolvedAudioCodec)) {
         resolvedAudioCodec = "aac"; // final fallback
+    }
+    int audioSourceSampleRate = 48000;
+    const bool hasSourceAudio = probeFirstAudioStream(clips, audioSourceSampleRate);
+    const AVCodec *audioEncoder = nullptr;
+    AVCodecContext *audioEncCtx = nullptr;
+    AVStream *audioStream = nullptr;
+    if (hasSourceAudio) {
+        audioEncoder = avcodec_find_encoder_by_name(resolvedAudioCodec.toUtf8().constData());
+        if (!audioEncoder) {
+            resolvedAudioCodec = "aac";
+            audioEncoder = avcodec_find_encoder_by_name(resolvedAudioCodec.toUtf8().constData());
+        }
+        if (!audioEncoder) {
+            avformat_free_context(outFmt);
+            emit exportFinished(false, "Audio encoder not found");
+            return;
+        }
     }
 
     // Create output stream
@@ -375,9 +578,48 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
     avcodec_parameters_from_context(outStream->codecpar, encCtx);
     outStream->time_base = encCtx->time_base;
 
+    if (audioEncoder) {
+        audioStream = avformat_new_stream(outFmt, nullptr);
+        if (!audioStream) {
+            avcodec_free_context(&encCtx);
+            avformat_free_context(outFmt);
+            emit exportFinished(false, "Failed to create audio output stream");
+            return;
+        }
+
+        audioEncCtx = avcodec_alloc_context3(audioEncoder);
+        if (!audioEncCtx) {
+            avcodec_free_context(&encCtx);
+            avformat_free_context(outFmt);
+            emit exportFinished(false, "Failed to create audio encoder context");
+            return;
+        }
+
+        AVChannelLayout stereoLayout = AV_CHANNEL_LAYOUT_STEREO;
+        audioEncCtx->sample_rate = selectAudioSampleRate(audioEncoder, audioSourceSampleRate);
+        audioEncCtx->sample_fmt = selectAudioSampleFormat(audioEncoder);
+        audioEncCtx->bit_rate = static_cast<int64_t>(config.audioBitrate) * 1000;
+        audioEncCtx->time_base = {1, audioEncCtx->sample_rate};
+        av_channel_layout_copy(&audioEncCtx->ch_layout, &stereoLayout);
+        if (outFmt->oformat->flags & AVFMT_GLOBALHEADER)
+            audioEncCtx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+
+        if (avcodec_open2(audioEncCtx, audioEncoder, nullptr) < 0) {
+            avcodec_free_context(&audioEncCtx);
+            avcodec_free_context(&encCtx);
+            avformat_free_context(outFmt);
+            emit exportFinished(false, "Failed to open audio encoder");
+            return;
+        }
+
+        avcodec_parameters_from_context(audioStream->codecpar, audioEncCtx);
+        audioStream->time_base = audioEncCtx->time_base;
+    }
+
     // Open output file
     if (!(outFmt->oformat->flags & AVFMT_NOFILE)) {
         if (avio_open(&outFmt->pb, config.outputPath.toUtf8().constData(), AVIO_FLAG_WRITE) < 0) {
+            if (audioEncCtx) avcodec_free_context(&audioEncCtx);
             avcodec_free_context(&encCtx);
             avformat_free_context(outFmt);
             emit exportFinished(false, "Failed to open output file");
@@ -386,6 +628,9 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
     }
 
     if (avformat_write_header(outFmt, nullptr) < 0) {
+        if (!(outFmt->oformat->flags & AVFMT_NOFILE))
+            avio_closep(&outFmt->pb);
+        if (audioEncCtx) avcodec_free_context(&audioEncCtx);
         avcodec_free_context(&encCtx);
         avformat_free_context(outFmt);
         emit exportFinished(false, "Failed to write header");
@@ -397,7 +642,7 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
     int64_t globalPts = 0;
     double processedDuration = 0.0;
 
-    for (int clipIdx = 0; clipIdx < clips.size() && !m_cancelled; ++clipIdx) {
+    for (int clipIdx = 0; clipIdx < clips.size() && !m_cancelled.load(); ++clipIdx) {
         const auto &clip = clips[clipIdx];
 
         AVFormatContext *inFmt = nullptr;
@@ -436,7 +681,123 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
         }
         av_frame_get_buffer(outFrame, 0);
 
-        while (av_read_frame(inFmt, packet) >= 0 && !m_cancelled) {
+        bool clipFinished = false;
+        auto processVideoFrame = [&](AVFrame *decodedFrame) {
+            // Check time bounds
+            AVStream *inStream = inFmt->streams[videoIdx];
+            double framePts = static_cast<double>(decodedFrame->best_effort_timestamp) * av_q2d(inStream->time_base);
+            if (framePts < clip.inPoint)
+                return true;
+            if (framePts >= clipEnd) {
+                clipFinished = true;
+                return false;
+            }
+
+            // Scale frame
+            swsCtx = sws_getCachedContext(
+                swsCtx,
+                decodedFrame->width, decodedFrame->height, decCtx->pix_fmt,
+                config.width, config.height, targetPixFmt,
+                SWS_BILINEAR, nullptr, nullptr, nullptr);
+            if (!swsCtx)
+                return true;
+
+            av_frame_make_writable(outFrame);
+
+            // 10-bit outputs (HDR10 / HLG / ProRes) bypass the 8-bit RGB24 effect round-trip.
+            const bool tenBitPath = isHdr10Mode || isHlgMode || config.proresProfile >= 0;
+            bool hasEffects = !tenBitPath
+                              && (!clip.colorCorrection.isDefault() || !clip.effects.isEmpty());
+            bool needsRgbPass = hasEffects
+                                || (m_smartReframe != nullptr)
+                                || (m_subtitleRenderer != nullptr);
+            if (needsRgbPass) {
+                QImage workingImage;
+                if (hasEffects) {
+                    // Decode to RGB for effect processing
+                    workingImage = QImage(config.width, config.height, QImage::Format_RGB888);
+                    SwsContext *toRgbCtx = sws_getContext(
+                        decodedFrame->width, decodedFrame->height, decCtx->pix_fmt,
+                        config.width, config.height, AV_PIX_FMT_RGB24,
+                        SWS_BILINEAR, nullptr, nullptr, nullptr);
+                    uint8_t *rgbDest[1] = { workingImage.bits() };
+                    int rgbLinesize[1] = { static_cast<int>(workingImage.bytesPerLine()) };
+                    sws_scale(toRgbCtx, decodedFrame->data, decodedFrame->linesize, 0, decodedFrame->height,
+                              rgbDest, rgbLinesize);
+                    sws_freeContext(toRgbCtx);
+
+                    // Apply effects
+                    workingImage = VideoEffectProcessor::applyEffectStack(
+                        workingImage, clip.colorCorrection, clip.effects);
+                } else {
+                    // No traditional effects, but reframe/subtitles need RGB.
+                    // Scale to output size first.
+                    workingImage = QImage(config.width, config.height, QImage::Format_RGB888);
+                    SwsContext *toRgbCtx = sws_getContext(
+                        decodedFrame->width, decodedFrame->height, decCtx->pix_fmt,
+                        config.width, config.height, AV_PIX_FMT_RGB24,
+                        SWS_BILINEAR, nullptr, nullptr, nullptr);
+                    uint8_t *rgbDest[1] = { workingImage.bits() };
+                    int rgbLinesize[1] = { static_cast<int>(workingImage.bytesPerLine()) };
+                    sws_scale(toRgbCtx, decodedFrame->data, decodedFrame->linesize, 0, decodedFrame->height,
+                              rgbDest, rgbLinesize);
+                    sws_freeContext(toRgbCtx);
+                }
+
+                // SmartReframe: crop/pan to target aspect
+                if (m_smartReframe != nullptr) {
+                    workingImage = m_smartReframe->applyReframe(
+                        workingImage, framePts - clip.inPoint,
+                        QSize(config.width, config.height));
+                }
+
+                // Subtitle burn-in
+                if (m_subtitleRenderer != nullptr) {
+                    QPainter painter(&workingImage);
+                    m_subtitleRenderer->paintOnto(
+                        painter,
+                        QRectF(0, 0, workingImage.width(), workingImage.height()),
+                        framePts - clip.inPoint);
+                }
+
+                // Convert processed RGB back to the actual encoder pixel format.
+                SwsContext *toYuvCtx = sws_getContext(
+                    workingImage.width(), workingImage.height(), AV_PIX_FMT_RGB24,
+                    config.width, config.height, targetPixFmt,
+                    SWS_BILINEAR, nullptr, nullptr, nullptr);
+                const uint8_t *rgbSrc[1] = { workingImage.constBits() };
+                int rgbSrcLinesize[1] = { static_cast<int>(workingImage.bytesPerLine()) };
+                sws_scale(toYuvCtx, rgbSrc, rgbSrcLinesize, 0, workingImage.height(),
+                          outFrame->data, outFrame->linesize);
+                sws_freeContext(toYuvCtx);
+                fillOpaqueAlphaPlane(outFrame);
+            } else {
+                sws_scale(swsCtx, decodedFrame->data, decodedFrame->linesize, 0, decodedFrame->height,
+                          outFrame->data, outFrame->linesize);
+            }
+
+            outFrame->pts = globalPts++;
+
+            // Encode
+            if (avcodec_send_frame(encCtx, outFrame) == 0) {
+                AVPacket *encPkt = av_packet_alloc();
+                while (avcodec_receive_packet(encCtx, encPkt) == 0) {
+                    av_packet_rescale_ts(encPkt, encCtx->time_base, outStream->time_base);
+                    encPkt->stream_index = outStream->index;
+                    av_interleaved_write_frame(outFmt, encPkt);
+                    av_packet_unref(encPkt);
+                }
+                av_packet_free(&encPkt);
+            }
+
+            // Update progress
+            double currentTime = framePts - clip.inPoint;
+            int percent = static_cast<int>((processedDuration + currentTime) / totalDuration * 100.0);
+            emit progressChanged(qMin(percent, 99));
+            return true;
+        };
+
+        while (av_read_frame(inFmt, packet) >= 0 && !m_cancelled.load() && !clipFinished) {
             if (packet->stream_index != videoIdx) {
                 av_packet_unref(packet);
                 continue;
@@ -447,128 +808,181 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
                 continue;
             }
 
-            while (avcodec_receive_frame(decCtx, frame) == 0 && !m_cancelled) {
-                // Check time bounds
-                AVStream *inStream = inFmt->streams[videoIdx];
-                double framePts = static_cast<double>(frame->pts) * av_q2d(inStream->time_base);
-                if (framePts < clip.inPoint) continue;
-                if (framePts >= clipEnd) goto clip_done;
-
-                // Scale frame
-                if (!swsCtx || sws_getContext(
-                    frame->width, frame->height, decCtx->pix_fmt,
-                    config.width, config.height, targetPixFmt,
-                    SWS_BILINEAR, nullptr, nullptr, nullptr) != swsCtx) {
-                    if (swsCtx) sws_freeContext(swsCtx);
-                    swsCtx = sws_getContext(
-                        frame->width, frame->height, decCtx->pix_fmt,
-                        config.width, config.height, targetPixFmt,
-                        SWS_BILINEAR, nullptr, nullptr, nullptr);
-                }
-
-                av_frame_make_writable(outFrame);
-
-                // 10-bit outputs (HDR10 / HLG / ProRes) bypass the 8-bit RGB24 effect round-trip.
-                const bool tenBitPath = isHdr10Mode || isHlgMode || config.proresProfile >= 0;
-                bool hasEffects = !tenBitPath
-                                  && (!clip.colorCorrection.isDefault() || !clip.effects.isEmpty());
-                bool needsRgbPass = hasEffects
-                                    || (m_smartReframe != nullptr)
-                                    || (m_subtitleRenderer != nullptr);
-                if (needsRgbPass) {
-                    QImage workingImage;
-                    if (hasEffects) {
-                        // Decode to RGB for effect processing
-                        workingImage = QImage(config.width, config.height, QImage::Format_RGB888);
-                        SwsContext *toRgbCtx = sws_getContext(
-                            frame->width, frame->height, decCtx->pix_fmt,
-                            config.width, config.height, AV_PIX_FMT_RGB24,
-                            SWS_BILINEAR, nullptr, nullptr, nullptr);
-                        uint8_t *rgbDest[1] = { workingImage.bits() };
-                        int rgbLinesize[1] = { static_cast<int>(workingImage.bytesPerLine()) };
-                        sws_scale(toRgbCtx, frame->data, frame->linesize, 0, frame->height,
-                                  rgbDest, rgbLinesize);
-                        sws_freeContext(toRgbCtx);
-
-                        // Apply effects
-                        workingImage = VideoEffectProcessor::applyEffectStack(
-                            workingImage, clip.colorCorrection, clip.effects);
-                    } else {
-                        // No traditional effects, but reframe/subtitles need RGB.
-                        // Scale to output size first.
-                        workingImage = QImage(config.width, config.height, QImage::Format_RGB888);
-                        SwsContext *toRgbCtx = sws_getContext(
-                            frame->width, frame->height, decCtx->pix_fmt,
-                            config.width, config.height, AV_PIX_FMT_RGB24,
-                            SWS_BILINEAR, nullptr, nullptr, nullptr);
-                        uint8_t *rgbDest[1] = { workingImage.bits() };
-                        int rgbLinesize[1] = { static_cast<int>(workingImage.bytesPerLine()) };
-                        sws_scale(toRgbCtx, frame->data, frame->linesize, 0, frame->height,
-                                  rgbDest, rgbLinesize);
-                        sws_freeContext(toRgbCtx);
-                    }
-
-                    // SmartReframe: crop/pan to target aspect
-                    if (m_smartReframe != nullptr) {
-                        workingImage = m_smartReframe->applyReframe(
-                            workingImage, framePts - clip.inPoint,
-                            QSize(config.width, config.height));
-                    }
-
-                    // Subtitle burn-in
-                    if (m_subtitleRenderer != nullptr) {
-                        QPainter painter(&workingImage);
-                        m_subtitleRenderer->paintOnto(
-                            painter,
-                            QRectF(0, 0, workingImage.width(), workingImage.height()),
-                            framePts - clip.inPoint);
-                    }
-
-                    // Convert processed RGB back to YUV420P
-                    SwsContext *toYuvCtx = sws_getContext(
-                        workingImage.width(), workingImage.height(), AV_PIX_FMT_RGB24,
-                        config.width, config.height, AV_PIX_FMT_YUV420P,
-                        SWS_BILINEAR, nullptr, nullptr, nullptr);
-                    const uint8_t *rgbSrc[1] = { workingImage.constBits() };
-                    int rgbSrcLinesize[1] = { static_cast<int>(workingImage.bytesPerLine()) };
-                    sws_scale(toYuvCtx, rgbSrc, rgbSrcLinesize, 0, workingImage.height(),
-                              outFrame->data, outFrame->linesize);
-                    sws_freeContext(toYuvCtx);
-                } else {
-                    sws_scale(swsCtx, frame->data, frame->linesize, 0, frame->height,
-                              outFrame->data, outFrame->linesize);
-                }
-
-                outFrame->pts = globalPts++;
-
-                // Encode
-                if (avcodec_send_frame(encCtx, outFrame) == 0) {
-                    AVPacket *encPkt = av_packet_alloc();
-                    while (avcodec_receive_packet(encCtx, encPkt) == 0) {
-                        av_packet_rescale_ts(encPkt, encCtx->time_base, outStream->time_base);
-                        encPkt->stream_index = outStream->index;
-                        av_interleaved_write_frame(outFmt, encPkt);
-                        av_packet_unref(encPkt);
-                    }
-                    av_packet_free(&encPkt);
-                }
-
-                // Update progress
-                double currentTime = framePts - clip.inPoint;
-                int percent = static_cast<int>((processedDuration + currentTime) / totalDuration * 100.0);
-                emit progressChanged(qMin(percent, 99));
-            }
+            while (avcodec_receive_frame(decCtx, frame) == 0 && !m_cancelled.load() && !clipFinished)
+                processVideoFrame(frame);
 
             av_packet_unref(packet);
         }
 
-clip_done:
+        if (!m_cancelled.load() && !clipFinished) {
+            avcodec_send_packet(decCtx, nullptr);
+            while (avcodec_receive_frame(decCtx, frame) == 0 && !m_cancelled.load() && !clipFinished)
+                processVideoFrame(frame);
+        }
+
         processedDuration += clip.effectiveDuration();
         av_frame_free(&frame);
         av_frame_free(&outFrame);
         av_packet_free(&packet);
         avcodec_free_context(&decCtx);
         avformat_close_input(&inFmt);
+    }
+
+    if (audioEncCtx && audioStream && !m_cancelled.load()) {
+        const int audioChannels = audioEncCtx->ch_layout.nb_channels;
+        const int fifoInitialSize = audioEncCtx->frame_size > 0 ? audioEncCtx->frame_size : 1024;
+        AVAudioFifo *audioFifo = av_audio_fifo_alloc(audioEncCtx->sample_fmt, audioChannels, fifoInitialSize);
+        int64_t audioPts = 0;
+
+        for (const auto &clip : clips) {
+            if (m_cancelled.load() || !audioFifo)
+                break;
+
+            AVFormatContext *audioFmt = nullptr;
+            if (avformat_open_input(&audioFmt, clip.filePath.toUtf8().constData(), nullptr, nullptr) < 0)
+                continue;
+            if (avformat_find_stream_info(audioFmt, nullptr) < 0) {
+                avformat_close_input(&audioFmt);
+                continue;
+            }
+
+            const int audioIdx = av_find_best_stream(audioFmt, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+            if (audioIdx < 0) {
+                avformat_close_input(&audioFmt);
+                continue;
+            }
+
+            AVStream *audioInStream = audioFmt->streams[audioIdx];
+            const AVCodec *audioDecoder = avcodec_find_decoder(audioInStream->codecpar->codec_id);
+            if (!audioDecoder) {
+                avformat_close_input(&audioFmt);
+                continue;
+            }
+
+            AVCodecContext *audioDecCtx = avcodec_alloc_context3(audioDecoder);
+            if (!audioDecCtx) {
+                avformat_close_input(&audioFmt);
+                continue;
+            }
+            if (avcodec_parameters_to_context(audioDecCtx, audioInStream->codecpar) < 0
+                || avcodec_open2(audioDecCtx, audioDecoder, nullptr) < 0
+                || audioDecCtx->ch_layout.nb_channels <= 0
+                || audioDecCtx->sample_rate <= 0) {
+                avcodec_free_context(&audioDecCtx);
+                avformat_close_input(&audioFmt);
+                continue;
+            }
+
+            if (clip.inPoint > 0.0) {
+                const int64_t seekTarget = static_cast<int64_t>(clip.inPoint / av_q2d(audioInStream->time_base));
+                av_seek_frame(audioFmt, audioIdx, seekTarget, AVSEEK_FLAG_BACKWARD);
+                avcodec_flush_buffers(audioDecCtx);
+            }
+
+            SwrContext *swrCtx = nullptr;
+            if (swr_alloc_set_opts2(&swrCtx,
+                    &audioEncCtx->ch_layout, audioEncCtx->sample_fmt, audioEncCtx->sample_rate,
+                    &audioDecCtx->ch_layout, audioDecCtx->sample_fmt, audioDecCtx->sample_rate,
+                    0, nullptr) < 0
+                || !swrCtx
+                || swr_init(swrCtx) < 0) {
+                if (swrCtx) swr_free(&swrCtx);
+                avcodec_free_context(&audioDecCtx);
+                avformat_close_input(&audioFmt);
+                continue;
+            }
+
+            AVPacket *audioPacket = av_packet_alloc();
+            AVFrame *audioFrame = av_frame_alloc();
+            if (!audioPacket || !audioFrame) {
+                if (audioPacket) av_packet_free(&audioPacket);
+                if (audioFrame) av_frame_free(&audioFrame);
+                swr_free(&swrCtx);
+                avcodec_free_context(&audioDecCtx);
+                avformat_close_input(&audioFmt);
+                continue;
+            }
+
+            const double clipEnd = (clip.outPoint > 0.0) ? clip.outPoint : clip.duration;
+            const double gain = clip.volume * std::pow(10.0, m_loudnessGainDb / 20.0);
+            bool audioClipFinished = false;
+
+            auto queueAudioFrame = [&](AVFrame *decodedFrame) {
+                const double frameTime = static_cast<double>(decodedFrame->best_effort_timestamp)
+                                         * av_q2d(audioInStream->time_base);
+                if (frameTime < clip.inPoint)
+                    return true;
+                if (frameTime >= clipEnd) {
+                    audioClipFinished = true;
+                    return false;
+                }
+
+                const int outCapacity = static_cast<int>(av_rescale_rnd(
+                    swr_get_delay(swrCtx, audioDecCtx->sample_rate) + decodedFrame->nb_samples,
+                    audioEncCtx->sample_rate,
+                    audioDecCtx->sample_rate,
+                    AV_ROUND_UP));
+                if (outCapacity <= 0)
+                    return true;
+
+                uint8_t **converted = nullptr;
+                if (av_samples_alloc_array_and_samples(&converted, nullptr, audioChannels,
+                                                       outCapacity, audioEncCtx->sample_fmt, 0) < 0)
+                    return false;
+
+                const int convertedSamples = swr_convert(
+                    swrCtx, converted, outCapacity,
+                    const_cast<const uint8_t **>(decodedFrame->extended_data),
+                    decodedFrame->nb_samples);
+                if (convertedSamples > 0) {
+                    applyAudioGain(converted, audioEncCtx->sample_fmt, audioChannels, convertedSamples, gain);
+                    if (av_audio_fifo_realloc(audioFifo, av_audio_fifo_size(audioFifo) + convertedSamples) >= 0
+                        && av_audio_fifo_write(audioFifo, reinterpret_cast<void **>(converted), convertedSamples) == convertedSamples) {
+                        encodeAudioFifo(outFmt, audioEncCtx, audioStream, audioFifo, false, audioPts);
+                    }
+                }
+
+                av_freep(&converted[0]);
+                av_freep(&converted);
+                return !audioClipFinished;
+            };
+
+            while (av_read_frame(audioFmt, audioPacket) >= 0 && !m_cancelled.load() && !audioClipFinished) {
+                if (audioPacket->stream_index != audioIdx) {
+                    av_packet_unref(audioPacket);
+                    continue;
+                }
+
+                if (avcodec_send_packet(audioDecCtx, audioPacket) == 0) {
+                    while (avcodec_receive_frame(audioDecCtx, audioFrame) == 0
+                           && !m_cancelled.load()
+                           && !audioClipFinished) {
+                        queueAudioFrame(audioFrame);
+                    }
+                }
+                av_packet_unref(audioPacket);
+            }
+
+            if (!m_cancelled.load() && !audioClipFinished) {
+                avcodec_send_packet(audioDecCtx, nullptr);
+                while (avcodec_receive_frame(audioDecCtx, audioFrame) == 0 && !m_cancelled.load())
+                    queueAudioFrame(audioFrame);
+            }
+
+            av_frame_free(&audioFrame);
+            av_packet_free(&audioPacket);
+            swr_free(&swrCtx);
+            avcodec_free_context(&audioDecCtx);
+            avformat_close_input(&audioFmt);
+        }
+
+        if (audioFifo) {
+            encodeAudioFifo(outFmt, audioEncCtx, audioStream, audioFifo, true, audioPts);
+            av_audio_fifo_free(audioFifo);
+        }
+
+        avcodec_send_frame(audioEncCtx, nullptr);
+        writeAudioPackets(outFmt, audioEncCtx, audioStream);
     }
 
     // Flush encoder
@@ -585,12 +999,13 @@ clip_done:
     av_write_trailer(outFmt);
 
     if (swsCtx) sws_freeContext(swsCtx);
+    if (audioEncCtx) avcodec_free_context(&audioEncCtx);
     avcodec_free_context(&encCtx);
     if (!(outFmt->oformat->flags & AVFMT_NOFILE))
         avio_closep(&outFmt->pb);
     avformat_free_context(outFmt);
 
-    if (m_cancelled) {
+    if (m_cancelled.load()) {
         emit exportFinished(false, "Export cancelled");
     } else {
         emit progressChanged(100);
