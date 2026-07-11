@@ -100,6 +100,8 @@ QJsonObject CompositeLayer::toJson() const
 
     obj["inPoint"]  = inPoint;
     obj["outPoint"] = outPoint;
+    obj["matteType"] = static_cast<int>(matteType);
+    obj["matteSourceLayerIndex"] = matteSourceLayerIndex;
 
     return obj;
 }
@@ -129,6 +131,9 @@ CompositeLayer CompositeLayer::fromJson(const QJsonObject &obj)
 
     l.inPoint  = obj["inPoint"].toDouble(0.0);
     l.outPoint = obj["outPoint"].toDouble(0.0);
+    l.matteType = static_cast<TrackMatteType>(
+        obj["matteType"].toInt(static_cast<int>(TrackMatteType::None)));
+    l.matteSourceLayerIndex = obj["matteSourceLayerIndex"].toInt(-1);
 
     return l;
 }

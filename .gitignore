@@ -84,3 +84,8 @@ remotion_export/
 
 # User settings (optional - uncomment to ignore)
 # settings.ini
+
+# OMC runtime state (operational artifacts — never commit; .omc/skills would be the only committable exception)
+.omc/
+src/.omc/
+build_*.log

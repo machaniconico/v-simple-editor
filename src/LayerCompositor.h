@@ -10,6 +10,8 @@
 #include <QJsonObject>
 #include <QJsonArray>
 
+#include "MaskSystem.h"
+
 // --- Blend Modes ---
 
 enum class BlendMode {
@@ -61,6 +63,9 @@ struct CompositeLayer {
 
     double inPoint  = 0.0;         // seconds — time range start
     double outPoint = 0.0;         // seconds — time range end (0 = until end)
+
+    TrackMatteType matteType = TrackMatteType::None;
+    int matteSourceLayerIndex = -1;
 
     QJsonObject toJson() const;
     static CompositeLayer fromJson(const QJsonObject &obj);
