@@ -42,12 +42,18 @@ QPointF ColorWheelWidget::colorToPos() const
     QRectF wr = wheelRect();
     QPointF center = wr.center();
     double rad = wheelRadius();
-    // Map R/G/B to 2D position using color-opponent encoding:
-    // x-axis: red-cyan (R component)
-    // y-axis: blue-yellow (B component, inverted for natural feel)
-    // Green is inferred from the diagonal
-    double x = center.x() + (m_r - m_b * 0.5) * rad * 0.8;
-    double y = center.y() - (m_g - m_b * 0.5) * rad * 0.8;
+    double dx = m_r;
+    double dy = m_g;
+    double dist = qSqrt(dx * dx + dy * dy);
+    if (dist > 1.0) {
+        dx /= dist;
+        dy /= dist;
+    }
+
+    // Keep this as the exact inverse of updateFromPos() for representable
+    // wheel colors so the indicator stays under the cursor while dragging.
+    double x = center.x() + dx * rad * 0.8;
+    double y = center.y() - dy * rad * 0.8;
     return QPointF(x, y);
 }
 

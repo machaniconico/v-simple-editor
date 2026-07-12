@@ -50,6 +50,98 @@ ClipInfo *selectedClipForKey(const Timeline *timeline, const ClipKey &key)
     return &const_cast<ClipInfo &>(clips[key.clipIdx]);
 }
 
+bool splitEffectTrackName(const QString &trackName, int &effectIndex, QString &paramName)
+{
+    static const QString prefix = QStringLiteral("effect.");
+    if (!trackName.startsWith(prefix)) {
+        return false;
+    }
+
+    const int indexStart = prefix.size();
+    const int dot = trackName.indexOf(QLatin1Char('.'), indexStart);
+    if (dot <= indexStart || dot == trackName.size() - 1) {
+        return false;
+    }
+
+    bool ok = false;
+    const int parsedIndex = trackName.mid(indexStart, dot - indexStart).toInt(&ok);
+    if (!ok || parsedIndex < 0) {
+        return false;
+    }
+
+    effectIndex = parsedIndex;
+    paramName = trackName.mid(dot + 1);
+    return true;
+}
+
+QString effectTrackName(int effectIndex, const QString &paramName)
+{
+    return QStringLiteral("effect.%1.%2").arg(effectIndex).arg(paramName);
+}
+
+KeyframeTrack renamedTrack(const KeyframeTrack &track, const QString &newName)
+{
+    KeyframeTrack renamed(newName, track.defaultValue());
+    for (const auto &kf : track.keyframes()) {
+        renamed.addKeyframe(kf.time, kf.value, kf.interpolation);
+    }
+    return renamed;
+}
+
+bool remapEffectKeyframeTracks(ClipInfo *clip, const QVector<int> &oldToNew,
+                               int duplicateFrom = -1, int duplicateTo = -1)
+{
+    if (!clip || oldToNew.isEmpty()) {
+        return false;
+    }
+
+    const QVector<KeyframeTrack> originalTracks = clip->keyframes.tracks();
+    QVector<KeyframeTrack> remappedTracks;
+    remappedTracks.reserve(originalTracks.size());
+    bool changed = false;
+
+    for (const auto &track : originalTracks) {
+        int effectIndex = -1;
+        QString paramName;
+        if (!splitEffectTrackName(track.propertyName(), effectIndex, paramName)
+            || effectIndex >= oldToNew.size()) {
+            remappedTracks.append(track);
+            continue;
+        }
+
+        const int newIndex = oldToNew[effectIndex];
+        if (newIndex < 0) {
+            changed = true;
+            continue;
+        }
+
+        const QString newName = effectTrackName(newIndex, paramName);
+        if (newName == track.propertyName()) {
+            remappedTracks.append(track);
+        } else {
+            remappedTracks.append(renamedTrack(track, newName));
+            changed = true;
+        }
+    }
+
+    if (duplicateFrom >= 0 && duplicateTo >= 0) {
+        for (const auto &track : originalTracks) {
+            int effectIndex = -1;
+            QString paramName;
+            if (splitEffectTrackName(track.propertyName(), effectIndex, paramName)
+                && effectIndex == duplicateFrom) {
+                remappedTracks.append(renamedTrack(track, effectTrackName(duplicateTo, paramName)));
+                changed = true;
+            }
+        }
+    }
+
+    if (changed) {
+        clip->keyframes.tracks() = remappedTracks;
+    }
+    return changed;
+}
+
 } // namespace
 
 EffectControlsPanel::EffectControlsPanel(QWidget *parent)
@@ -353,8 +445,18 @@ void EffectControlsPanel::onResetRequested(int idx)
 void EffectControlsPanel::onDuplicateRequested(int idx)
 {
     if (idx < 0 || idx >= m_effects.size()) return;
+    const int oldCount = m_effects.size();
+    QVector<int> oldToNew(oldCount);
+    for (int i = 0; i < oldCount; ++i) {
+        oldToNew[i] = i > idx ? i + 1 : i;
+    }
     VideoEffect copy = m_effects[idx];
     m_effects.insert(idx + 1, copy);
+    if (ClipInfo *clip = selectedClipForKey(m_timeline, m_currentClipKey)) {
+        if (remapEffectKeyframeTracks(clip, oldToNew, idx, idx + 1)) {
+            m_timeline->setClipKeyframes(clip->keyframes);
+        }
+    }
     emit effectsChanged(m_effects);
     persistAndRebuild();
 }
@@ -362,7 +464,17 @@ void EffectControlsPanel::onDuplicateRequested(int idx)
 void EffectControlsPanel::onRemoveRequested(int idx)
 {
     if (idx < 0 || idx >= m_effects.size()) return;
+    const int oldCount = m_effects.size();
+    QVector<int> oldToNew(oldCount);
+    for (int i = 0; i < oldCount; ++i) {
+        oldToNew[i] = i == idx ? -1 : (i > idx ? i - 1 : i);
+    }
     m_effects.remove(idx);
+    if (ClipInfo *clip = selectedClipForKey(m_timeline, m_currentClipKey)) {
+        if (remapEffectKeyframeTracks(clip, oldToNew)) {
+            m_timeline->setClipKeyframes(clip->keyframes);
+        }
+    }
     emit effectsChanged(m_effects);
     persistAndRebuild();
 }
@@ -370,7 +482,18 @@ void EffectControlsPanel::onRemoveRequested(int idx)
 void EffectControlsPanel::onMoveUpRequested(int idx)
 {
     if (idx <= 0 || idx >= m_effects.size()) return;
+    QVector<int> oldToNew(m_effects.size());
+    for (int i = 0; i < oldToNew.size(); ++i) {
+        oldToNew[i] = i;
+    }
+    oldToNew[idx] = idx - 1;
+    oldToNew[idx - 1] = idx;
     m_effects.swapItemsAt(idx, idx - 1);
+    if (ClipInfo *clip = selectedClipForKey(m_timeline, m_currentClipKey)) {
+        if (remapEffectKeyframeTracks(clip, oldToNew)) {
+            m_timeline->setClipKeyframes(clip->keyframes);
+        }
+    }
     emit effectsChanged(m_effects);
     persistAndRebuild();
 }
@@ -378,7 +501,18 @@ void EffectControlsPanel::onMoveUpRequested(int idx)
 void EffectControlsPanel::onMoveDownRequested(int idx)
 {
     if (idx < 0 || idx >= m_effects.size() - 1) return;
+    QVector<int> oldToNew(m_effects.size());
+    for (int i = 0; i < oldToNew.size(); ++i) {
+        oldToNew[i] = i;
+    }
+    oldToNew[idx] = idx + 1;
+    oldToNew[idx + 1] = idx;
     m_effects.swapItemsAt(idx, idx + 1);
+    if (ClipInfo *clip = selectedClipForKey(m_timeline, m_currentClipKey)) {
+        if (remapEffectKeyframeTracks(clip, oldToNew)) {
+            m_timeline->setClipKeyframes(clip->keyframes);
+        }
+    }
     emit effectsChanged(m_effects);
     persistAndRebuild();
 }
