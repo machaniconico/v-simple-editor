@@ -98,10 +98,12 @@ collab::CommentTrack FrameIoImporter::parseFrameIoJson(const QJsonArray &arr,
         // body
         comment.body = obj.value(QStringLiteral("body")).toString();
 
-        // timestamp (seconds) → timecodeMs (milliseconds)
-        const double timestampSec =
+        // Frame.io timestamps are frame numbers; convert to milliseconds.
+        const double timestampFrames =
             obj.value(QStringLiteral("timestamp")).toDouble(0.0);
-        comment.timecodeMs = static_cast<qint64>(std::round(timestampSec * 1000.0));
+        const double safeFps = (fps > 0.0) ? fps : 30.0;
+        comment.timecodeMs = static_cast<qint64>(
+            std::round(timestampFrames * 1000.0 / safeFps));
 
         // author.name → authorId
         const QJsonObject authorObj =

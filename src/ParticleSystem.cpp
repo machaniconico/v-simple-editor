@@ -40,6 +40,9 @@ static double lerp(double a, double b, double t)
 
 namespace {
 
+constexpr double kFallbackCanvasWidth = 1920.0;
+constexpr double kFallbackCanvasHeight = 1080.0;
+
 double valueNoise2D(double x, double y)
 {
     int ix = static_cast<int>(std::floor(x));
@@ -96,8 +99,8 @@ void ParticleSystem::reset()
 
 void ParticleSystem::stepParticles(double deltaTime, const QSize &canvasSize)
 {
-    double cw = canvasSize.width() > 1 ? static_cast<double>(canvasSize.width()) : 1920.0;
-    double ch = canvasSize.height() > 1 ? static_cast<double>(canvasSize.height()) : 1080.0;
+    double cw = canvasSize.width() > 1 ? static_cast<double>(canvasSize.width()) : kFallbackCanvasWidth;
+    double ch = canvasSize.height() > 1 ? static_cast<double>(canvasSize.height()) : kFallbackCanvasHeight;
 
     bool hasForceFields = !m_config.forceFields.isEmpty();
     bool hasTurbulence = m_config.turbulenceAmount > 0.0;
@@ -181,8 +184,8 @@ void ParticleSystem::spawnParticle(const QSize &canvasSize)
     double hw = m_config.emitAreaSize.width() * 0.5;
     double hh = m_config.emitAreaSize.height() * 0.5;
 
-    double w = canvasSize.width() > 1 ? canvasSize.width() : 1920.0;
-    double h = canvasSize.height() > 1 ? canvasSize.height() : 1080.0;
+    double w = canvasSize.width() > 1 ? canvasSize.width() : kFallbackCanvasWidth;
+    double h = canvasSize.height() > 1 ? canvasSize.height() : kFallbackCanvasHeight;
 
     p.position.setX((cx + randDouble(-hw, hw)) * w);
     p.position.setY((cy + randDouble(-hh, hh)) * h);
@@ -225,8 +228,8 @@ void ParticleSystem::spawnParticle(const QSize &canvasSize)
 QPointF ParticleSystem::evaluateForceFields(const QPointF &normPos, const QSize &canvasSize) const
 {
     QPointF accel(0.0, 0.0);
-    double cw = canvasSize.width() > 1 ? static_cast<double>(canvasSize.width()) : 1920.0;
-    double ch = canvasSize.height() > 1 ? static_cast<double>(canvasSize.height()) : 1080.0;
+    double cw = canvasSize.width() > 1 ? static_cast<double>(canvasSize.width()) : kFallbackCanvasWidth;
+    double ch = canvasSize.height() > 1 ? static_cast<double>(canvasSize.height()) : kFallbackCanvasHeight;
 
     for (const ForceField &ff : m_config.forceFields) {
         double dx = normPos.x() - ff.position.x();
@@ -375,8 +378,18 @@ QImage ParticleSystem::renderFrame(const QSize &canvasSize, double time)
     QPainter painter(&image);
     painter.setRenderHint(QPainter::Antialiasing, true);
 
-    for (const Particle &p : m_particles)
-        renderParticle(painter, p, m_config);
+    const double sx = canvasSize.width() > 1
+        ? static_cast<double>(canvasSize.width()) / kFallbackCanvasWidth
+        : 1.0;
+    const double sy = canvasSize.height() > 1
+        ? static_cast<double>(canvasSize.height()) / kFallbackCanvasHeight
+        : 1.0;
+
+    for (const Particle &p : m_particles) {
+        Particle mapped = p;
+        mapped.position = QPointF(p.position.x() * sx, p.position.y() * sy);
+        renderParticle(painter, mapped, m_config);
+    }
 
     painter.end();
     return image;
@@ -429,7 +442,16 @@ QVector<QImage> ParticleSystem::renderParticleSequence(const QSize &canvasSize,
 
         stepParticles(dt, canvasSize);
 
-        frames.append(renderFrame(canvasSize, currentTime));
+        QImage image(canvasSize, QImage::Format_ARGB32_Premultiplied);
+        image.fill(Qt::transparent);
+
+        QPainter painter(&image);
+        painter.setRenderHint(QPainter::Antialiasing, true);
+        for (const Particle &p : m_particles)
+            renderParticle(painter, p, m_config);
+        painter.end();
+
+        frames.append(image);
     }
 
     return frames;

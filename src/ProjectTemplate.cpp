@@ -77,13 +77,21 @@ QByteArray TemplateLibrary::createProjectFromTemplate(const QString &templateId)
     const QVector<TemplateMeta> all = allTemplates();
     for (const TemplateMeta &m : all) {
         if (m.id == templateId) {
+            QJsonObject config;
+            config[QStringLiteral("name")]   = m.name;
+            config[QStringLiteral("width")]  = m.width;
+            config[QStringLiteral("height")] = m.height;
+            config[QStringLiteral("fps")]    = m.fps;
+
             QJsonObject obj;
             obj[QStringLiteral("version")] = 1;
-            obj[QStringLiteral("width")]   = m.width;
-            obj[QStringLiteral("height")]  = m.height;
-            obj[QStringLiteral("fps")]     = m.fps;
-            obj[QStringLiteral("name")]    = m.name;
-            obj[QStringLiteral("tracks")]  = QJsonArray{};
+            obj[QStringLiteral("config")] = config;
+            obj[QStringLiteral("videoTracks")] = QJsonArray{};
+            obj[QStringLiteral("audioTracks")] = QJsonArray{};
+            obj[QStringLiteral("playheadPos")] = 0.0;
+            obj[QStringLiteral("markIn")] = -1.0;
+            obj[QStringLiteral("markOut")] = -1.0;
+            obj[QStringLiteral("zoomLevel")] = 10;
             return QJsonDocument(obj).toJson(QJsonDocument::Compact);
         }
     }

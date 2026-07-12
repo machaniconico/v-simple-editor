@@ -12,6 +12,8 @@
 #include <QMutex>
 #include <QMutexLocker>
 #include <QPainter>
+#include <algorithm>
+#include <cstdint>
 #include <cmath>
 
 // AR-2: ACES 色管理パイプラインを Exporter (LEGACY パス) へ渡す手段。Exporter.h は
@@ -29,6 +31,21 @@ aces::AcesPipeline exporterAcesPipelineSnapshot()
 {
     QMutexLocker locker(&g_exporterAcesPipelineMutex);
     return g_exporterAcesPipeline;
+}
+
+// US-104: ProRes4444 (YUVA444P10LE) の alpha プレーンを不透明で初期化する。
+// libswscale がアルファなしソースから YUVA へスケールする際に alpha プレーンを
+// 埋めないケースがあり、そのままだと ProRes4444 出力の透過がゴミになる。対象
+// フォーマット以外では no-op。
+void fillOpaqueAlphaPlane(AVFrame *frame)
+{
+    if (!frame || frame->format != AV_PIX_FMT_YUVA444P10LE || !frame->data[3])
+        return;
+
+    for (int y = 0; y < frame->height; ++y) {
+        auto *row = reinterpret_cast<uint16_t *>(frame->data[3] + y * frame->linesize[3]);
+        std::fill(row, row + frame->width, static_cast<uint16_t>(1023));
+    }
 }
 }
 
@@ -509,6 +526,7 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
             } else {
                 sws_scale(swsCtx, frame->data, frame->linesize, 0, frame->height,
                           outFrame->data, outFrame->linesize);
+                fillOpaqueAlphaPlane(outFrame);
             }
 
             // Encode via libavcore helper (handles send_frame+packet drain).

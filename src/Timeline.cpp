@@ -973,7 +973,13 @@ void TimelineTrack::splitClipAt(int index, double localSeconds, bool notify)
     secondHalf.inPoint = splitPoint;
     secondHalf.outPoint = effectiveEnd;
     secondHalf.leadInSec = 0.0;
+    // The cut creates a hard edge between the halves: the right half's left
+    // edge is no longer the original's leadIn, and the left half's right edge
+    // is no longer the original's trailOut. Reset those so neither transition
+    // is duplicated onto both halves.
+    secondHalf.leadIn = Transition{};
     original.outPoint = splitPoint;
+    original.trailOut = Transition{};
     m_clips.insert(index + 1, secondHalf);
     if (notify) {
         updateMinimumWidth(); update(); emit modified();
@@ -2092,18 +2098,23 @@ void TimelineTrack::mouseMoveEvent(QMouseEvent *event)
         int dx = snappedX - m_dragStartX;
         double deltaSec = static_cast<double>(dx) / m_pixelsPerSecond;
         ClipInfo &clip = m_clips[m_dragClipIndex];
+        // deltaSec is a TIMELINE delta; inPoint/outPoint live in SOURCE time.
+        // For a speed-scaled clip the source moves speed× as fast as the
+        // timeline, so convert timeline→source with *speed (and back with
+        // /speed for leadInSec, which is a timeline quantity).
+        const double speed = qMax(0.001, clip.speed);
         if (m_dragMode == DragMode::TrimLeft) {
-            double newIn = qMax(0.0, m_dragOriginalValue + deltaSec);
+            double newIn = qMax(0.0, m_dragOriginalValue + deltaSec * speed);
             double maxIn = (clip.outPoint > 0 ? clip.outPoint : clip.duration) - 0.1;
             clip.inPoint = qMin(newIn, maxIn);
             // Keep the clip's right edge anchored by shifting its leadInSec by
-            // the same amount the inPoint changed. inPoint+ → leadInSec+
+            // the same timeline amount the inPoint changed. inPoint+ → leadInSec+
             // (clip slides right), inPoint− → leadInSec− (clip slides left,
             // clamped at 0 so it can't cross its neighbor).
-            const double inPointDelta = clip.inPoint - m_dragOriginalValue;
-            clip.leadInSec = qMax(0.0, m_dragOriginalLeadIn + inPointDelta);
+            const double timelineDelta = (clip.inPoint - m_dragOriginalValue) / speed;
+            clip.leadInSec = qMax(0.0, m_dragOriginalLeadIn + timelineDelta);
         } else {
-            double newOut = qMin(clip.duration, m_dragOriginalValue + deltaSec);
+            double newOut = qMin(clip.duration, m_dragOriginalValue + deltaSec * speed);
             clip.outPoint = qMax(newOut, clip.inPoint + 0.1);
         }
         updateMinimumWidth(); update(); return;
@@ -3782,8 +3793,18 @@ void Timeline::pasteClip()
     if (insertAt <= 0) insertAt = m_videoTrack->clipCount();
     const int maxIndex = qMin(m_videoTrack->clipCount(), m_audioTrack->clipCount());
     insertAt = qBound(0, insertAt, maxIndex);
-    m_videoTrack->insertClip(insertAt, m_clipboard.value());
-    m_audioTrack->insertClip(insertAt, m_clipboard.value());
+    // Give the pasted V/A pair a fresh linkGroup so it forms its own link
+    // instead of aliasing the source clip's group (which would drag/select the
+    // original together with the copy).
+    ClipInfo pastedVideo = m_clipboard.value();
+    ClipInfo pastedAudio = m_clipboard.value();
+    if (pastedVideo.linkGroup > 0) {
+        const int freshGroup = allocateLinkGroup();
+        pastedVideo.linkGroup = freshGroup;
+        pastedAudio.linkGroup = freshGroup;
+    }
+    m_videoTrack->insertClip(insertAt, pastedVideo);
+    m_audioTrack->insertClip(insertAt, pastedAudio);
     m_videoTrack->setSelectedClip(insertAt);
     m_audioTrack->setSelectedClip(insertAt);
     remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
@@ -5289,33 +5310,61 @@ void Timeline::insertAudioClipAtPlayhead(const QString &wavPath, int trackIdx)
     TimelineTrack *target = m_audioTracks[targetIndex];
     if (!target) return;
 
-    // Insert at the playhead position: find the clip index where playhead falls
-    double playheadSec = m_playheadPos;
-    double accumulatedTime = 0.0;
-    int insertIdx = 0;
+    // Insert at the playhead position while keeping later material stable
+    // when there is enough gap, and splice the occupied clip when there isn't.
+    const double playheadSec = qMax(0.0, m_playheadPos);
+    double cursor = 0.0;
     const auto &clips = target->clips();
     for (int i = 0; i < clips.size(); ++i) {
-        double clipEnd = accumulatedTime + clips[i].leadInSec + clips[i].effectiveDuration();
-        if (playheadSec < clipEnd) {
-            // Playhead is within or before this clip
-            if (playheadSec < accumulatedTime + clips[i].leadInSec) {
-                // In the lead-in gap before this clip
-                insertIdx = i;
-            } else {
-                // Inside the clip — insert after it
-                insertIdx = i + 1;
-            }
-            break;
+        const double clipStart = cursor + clips[i].leadInSec;
+        const double clipEnd = clipStart + clips[i].effectiveDuration();
+        if (playheadSec < clipStart - 1e-6) {
+            // Playhead sits in the gap before this clip — drop it there and
+            // let downstream clips keep their absolute positions.
+            target->insertClipPreservingDownstream(i, clip, playheadSec - cursor);
+            saveUndoState("Insert voice-over");
+            updateInfoLabel();
+            scheduleEmitSequenceChanged();
+            return;
         }
-        accumulatedTime = clipEnd;
-        insertIdx = i + 1;
+        if (playheadSec < clipEnd - 1e-6) {
+            // Playhead is inside this clip. If it falls well inside, splice the
+            // clip into two around the inserted clip; otherwise snap to the
+            // nearer edge.
+            const double localTimelineSec = playheadSec - clipStart;
+            const double effectiveStart = clips[i].inPoint;
+            const double effectiveEnd = (clips[i].outPoint > 0.0)
+                ? clips[i].outPoint : clips[i].duration;
+            const double splitPoint = effectiveStart + localTimelineSec * clips[i].speed;
+            if (splitPoint > effectiveStart + 0.1 && splitPoint < effectiveEnd - 0.1) {
+                QVector<ClipInfo> updated = clips;
+                ClipInfo rightHalf = updated[i];
+                rightHalf.inPoint = splitPoint;
+                rightHalf.outPoint = effectiveEnd;
+                rightHalf.leadInSec = 0.0;
+                rightHalf.leadIn = Transition{};
+                updated[i].outPoint = splitPoint;
+                updated[i].trailOut = Transition{};
+                clip.leadInSec = 0.0;
+                updated.insert(i + 1, clip);
+                updated.insert(i + 2, rightHalf);
+                target->setClips(updated);
+            } else if (playheadSec - clipStart < clipEnd - playheadSec) {
+                target->insertClipPreservingDownstream(i, clip, playheadSec - cursor);
+            } else {
+                target->insertClipPreservingDownstream(i + 1, clip, 0.0);
+            }
+            saveUndoState("Insert voice-over");
+            updateInfoLabel();
+            scheduleEmitSequenceChanged();
+            return;
+        }
+        cursor = clipEnd;
     }
 
-    // Set leadInSec so the clip starts at the playhead position
-    clip.leadInSec = playheadSec - accumulatedTime;
-    if (clip.leadInSec < 0.0) clip.leadInSec = 0.0;
-
-    target->insertClip(insertIdx, clip);
+    // Playhead is past every clip — append with a lead-in gap that lands it at
+    // the playhead position.
+    target->insertClipPreservingDownstream(clips.size(), clip, playheadSec - cursor);
     saveUndoState("Insert voice-over");
     updateInfoLabel();
     scheduleEmitSequenceChanged();
@@ -6568,22 +6617,26 @@ void Timeline::restoreFromProject(const QVector<QVector<ClipInfo>> &videoTracks,
                                    const QVector<QVector<ClipInfo>> &audioTracks,
                                    double playhead, double markInVal, double markOutVal, int zoom)
 {
-    // Set first video/audio track clips
-    if (!videoTracks.isEmpty())
-        m_videoTrack->setClips(videoTracks[0]);
-    if (!audioTracks.isEmpty())
-        m_audioTrack->setClips(audioTracks[0]);
+    // Grow to fit the incoming track counts, then rewrite EVERY existing
+    // track. Tracks beyond the incoming set are cleared (empty clips) so
+    // leftovers from a previously loaded project don't linger.
+    while (m_videoTracks.size() < videoTracks.size()) addVideoTrack();
+    while (m_audioTracks.size() < audioTracks.size()) addAudioTrack();
 
-    // Add extra video tracks
-    for (int i = 1; i < videoTracks.size(); ++i) {
-        if (i >= m_videoTracks.size()) addVideoTrack();
-        m_videoTracks[i]->setClips(videoTracks[i]);
+    for (int i = 0; i < m_videoTracks.size(); ++i) {
+        if (!m_videoTracks[i]) continue;
+        const auto &clips = (i < videoTracks.size())
+                            ? videoTracks[i]
+                            : QVector<ClipInfo>{};
+        m_videoTracks[i]->setClips(clips);
     }
 
-    // Add extra audio tracks
-    for (int i = 1; i < audioTracks.size(); ++i) {
-        if (i >= m_audioTracks.size()) addAudioTrack();
-        m_audioTracks[i]->setClips(audioTracks[i]);
+    for (int i = 0; i < m_audioTracks.size(); ++i) {
+        if (!m_audioTracks[i]) continue;
+        const auto &clips = (i < audioTracks.size())
+                            ? audioTracks[i]
+                            : QVector<ClipInfo>{};
+        m_audioTracks[i]->setClips(clips);
     }
 
     m_playheadPos = playhead;

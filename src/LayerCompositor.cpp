@@ -101,7 +101,6 @@ QJsonObject CompositeLayer::toJson() const
 
     obj["inPoint"]  = inPoint;
     obj["outPoint"] = outPoint;
-
     obj["matteType"]             = static_cast<int>(matteType);
     obj["matteSourceLayerIndex"] = matteSourceLayerIndex;
 
@@ -133,8 +132,8 @@ CompositeLayer CompositeLayer::fromJson(const QJsonObject &obj)
 
     l.inPoint  = obj["inPoint"].toDouble(0.0);
     l.outPoint = obj["outPoint"].toDouble(0.0);
-
-    l.matteType             = static_cast<TrackMatteType>(obj["matteType"].toInt(0));
+    l.matteType = static_cast<TrackMatteType>(
+        obj["matteType"].toInt(static_cast<int>(TrackMatteType::None)));
     l.matteSourceLayerIndex = obj["matteSourceLayerIndex"].toInt(-1);
 
     return l;
@@ -290,9 +289,9 @@ QRgb LayerCompositor::blendPixel(QRgb base, QRgb top, BlendMode mode, double opa
     if (outA <= 0.0)
         return qRgba(0, 0, 0, 0);
 
-    double outR = (blendR * topA + baseR * baseA * (1.0 - topA)) / outA;
-    double outG = (blendG * topA + baseG * baseA * (1.0 - topA)) / outA;
-    double outB = (blendB * topA + baseB * baseA * (1.0 - topA)) / outA;
+    double outR = (topA * ((1.0 - baseA) * topR + baseA * blendR) + baseR * baseA * (1.0 - topA)) / outA;
+    double outG = (topA * ((1.0 - baseA) * topG + baseA * blendG) + baseG * baseA * (1.0 - topA)) / outA;
+    double outB = (topA * ((1.0 - baseA) * topB + baseA * blendB) + baseB * baseA * (1.0 - topA)) / outA;
 
     return qRgba(
         qBound(0, static_cast<int>(outR * 255.0 + 0.5), 255),

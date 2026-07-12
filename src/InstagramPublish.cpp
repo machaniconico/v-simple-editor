@@ -75,6 +75,8 @@ void Publisher::publish(const PublishJob &job, const IgConfig &config) {
     createBody.addQueryItem(QStringLiteral("media_type"), QStringLiteral("REELS"));
     createBody.addQueryItem(QStringLiteral("video_url"),  job.videoUrl.trimmed());
     createBody.addQueryItem(QStringLiteral("caption"),    job.caption);
+    createBody.addQueryItem(QStringLiteral("share_to_feed"),
+                            job.shareToFeed ? QStringLiteral("true") : QStringLiteral("false"));
     createBody.addQueryItem(QStringLiteral("access_token"), config.accessToken);
 
     QNetworkReply *createReply = m_nam->post(createReq, createBody.toString(QUrl::FullyEncoded).toUtf8());

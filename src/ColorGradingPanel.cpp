@@ -1351,8 +1351,8 @@ void ColorGradingPanel::onWhiteBalanceChanged()
     // so we boost red and cut blue when slider > 0 (warm look) and the
     // reverse when slider < 0.
     const double K = 5500.0 + static_cast<double>(tempSlider) * 30.0;
-    double rGain = 1.0 + (5500.0 - K) / 3000.0;
-    double bGain = 1.0 + (K - 5500.0) / 3000.0;
+    double rGain = 1.0 + (K - 5500.0) / 3000.0;
+    double bGain = 1.0 + (5500.0 - K) / 3000.0;
     rGain = std::clamp(rGain, 0.5, 2.0);
     bGain = std::clamp(bGain, 0.5, 2.0);
 

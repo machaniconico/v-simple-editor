@@ -125,6 +125,11 @@ QVector<SceneChange> AutoEdit::detectSceneChanges(const QString &filePath,
         decCtx->width, decCtx->height, decCtx->pix_fmt,
         cmpW, cmpH, AV_PIX_FMT_GRAY8,
         SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
+    if (!swsCtx) {
+        avcodec_free_context(&decCtx);
+        avformat_close_input(&fmtCtx);
+        return changes;
+    }
 
     AVPacket *packet = av_packet_alloc();
     AVFrame *frame = av_frame_alloc();

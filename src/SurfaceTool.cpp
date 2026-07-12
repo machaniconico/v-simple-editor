@@ -182,7 +182,7 @@ bool SurfaceTool::handleMousePress(const QPoint &widgetPos, Qt::MouseButton butt
                 m_preview->update();
             emit cornersChanged(currentQuad());
         });
-        m_contextMenu->popup(widgetPos);
+        m_contextMenu->popup(m_preview->mapToGlobal(widgetPos));
         return true;
     }
 

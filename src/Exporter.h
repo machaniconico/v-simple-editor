@@ -2,6 +2,7 @@
 
 #include <QObject>
 #include <QThread>
+#include <atomic>
 #include "ExportDialog.h"
 #include "PremiereXmlExporter.h"
 #include "Timeline.h"
@@ -66,7 +67,7 @@ private:
     bool transcodeClip(const ClipInfo &clip, AVFormatContext *outFmt, AVCodecContext *encCtx,
                        AVStream *outStream, SwsContext *swsCtx, int64_t &pts);
 
-    bool m_cancelled = false;
+    std::atomic_bool m_cancelled = false;
     QThread *m_thread = nullptr;
 
     SmartReframe *m_smartReframe = nullptr;

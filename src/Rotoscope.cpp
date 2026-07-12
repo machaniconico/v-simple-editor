@@ -199,6 +199,11 @@ RotoPath Rotoscope::interpolatePaths(const RotoPath &pathA, const RotoPath &path
     if (maxCount == 0)
         return result;
 
+    if (countA == 0)
+        return pathB;
+    if (countB == 0)
+        return pathA;
+
     result.points.reserve(maxCount);
 
     for (int i = 0; i < maxCount; ++i) {

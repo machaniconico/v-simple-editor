@@ -7,9 +7,43 @@
 #include <QImage>
 #include <QPainter>
 #include <QPixmap>
+#include <QSet>
 #include <QTransform>
 
 namespace watermark {
+
+namespace {
+
+QString normalizedPathKey(const QString &path)
+{
+    return QDir::cleanPath(QFileInfo(path).absoluteFilePath()).toCaseFolded();
+}
+
+QString nonCollidingOutputPath(const QDir &dir, const QFileInfo &sourceInfo,
+                               const QSet<QString> &reservedPaths)
+{
+    const QString base = sourceInfo.completeBaseName();
+    const QString suffix = sourceInfo.suffix();
+    const QString extension = suffix.isEmpty() ? QString() : QStringLiteral(".") + suffix;
+
+    for (int attempt = 0; ; ++attempt) {
+        QString fileName;
+        if (attempt == 0) {
+            fileName = sourceInfo.fileName();
+        } else if (attempt == 1) {
+            fileName = base + QStringLiteral("_watermarked") + extension;
+        } else {
+            fileName = base + QStringLiteral("_watermarked_") + QString::number(attempt) + extension;
+        }
+
+        const QString candidate = dir.filePath(fileName);
+        if (!reservedPaths.contains(normalizedPathKey(candidate)) && !QFileInfo::exists(candidate)) {
+            return candidate;
+        }
+    }
+}
+
+} // namespace
 
 // ---------------------------------------------------------------------------
 // buildWatermarkPixmap
@@ -151,6 +185,11 @@ int batchApply(const QStringList &inputPaths, const QString &outDir, const WmCon
 {
     int count = 0;
     const QDir dir(outDir);
+    QSet<QString> reservedPaths;
+
+    for (const QString &path : inputPaths) {
+        reservedPaths.insert(normalizedPathKey(path));
+    }
 
     for (const QString &path : inputPaths) {
         QImage img(path);
@@ -158,9 +197,9 @@ int batchApply(const QStringList &inputPaths, const QString &outDir, const WmCon
             continue;
         }
         const QImage watermarked = applyWatermark(img, cfg);
-        const QString baseName   = QFileInfo(path).fileName();
-        const QString outPath    = dir.filePath(baseName);
+        const QString outPath = nonCollidingOutputPath(dir, QFileInfo(path), reservedPaths);
         if (watermarked.save(outPath)) {
+            reservedPaths.insert(normalizedPathKey(outPath));
             ++count;
         }
     }

@@ -40,10 +40,15 @@ void SceneCutScanner::scanFile(const QString& path, double threshold, int minSce
     m_frameRate = 0.0;
     m_totalFrames = 0;
 
-    m_thread = QThread::create([this, path, threshold, minSceneFrames]() {
+    QThread* thread = QThread::create([this, path, threshold, minSceneFrames]() {
         doScan(path, threshold, minSceneFrames);
     });
-    connect(m_thread, &QThread::finished, m_thread, &QThread::deleteLater);
+    m_thread = thread;
+    connect(thread, &QThread::destroyed, this, [this, thread]() {
+        if (m_thread == thread)
+            m_thread = nullptr;
+    });
+    connect(thread, &QThread::finished, thread, &QThread::deleteLater);
     m_thread->start();
 }
 

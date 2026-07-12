@@ -1,8 +1,10 @@
 #include "PythonScript.h"
 
 #include <QColor>
+#include <QCoreApplication>
 #include <QDialogButtonBox>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -21,6 +23,12 @@
 #include <QToolBar>
 #include <QTreeWidget>
 #include <QVBoxLayout>
+
+namespace {
+constexpr qint64 kScriptExecutionTimeoutMs = 5 * 60 * 1000;
+QProcess *g_activeScriptProcess = nullptr;
+bool g_scriptStopRequested = false;
+}
 
 // ============================================================================
 // PythonSyntaxHighlighter
@@ -376,9 +384,13 @@ ScriptResult ScriptEngine::runViaProcess(const QString &code, const QString & /*
     QProcess proc;
     proc.setProgram(m_pythonExe);
     proc.setArguments({"-u", m_helperScriptPath});
+    g_activeScriptProcess = &proc;
+    g_scriptStopRequested = false;
     proc.start();
 
     if (!proc.waitForStarted(5000)) {
+        if (g_activeScriptProcess == &proc)
+            g_activeScriptProcess = nullptr;
         result.success = false;
         result.error = "Failed to start Python process.";
         emit errorOccurred(result.error);
@@ -395,12 +407,32 @@ ScriptResult ScriptEngine::runViaProcess(const QString &code, const QString & /*
     QString allOutput;
     QString allError;
     bool gotResult = false;
+    QElapsedTimer timer;
+    timer.start();
 
     // Read lines until the result message arrives or process finishes
     while (!gotResult) {
-        if (!proc.waitForReadyRead(10000)) {
+        if (g_scriptStopRequested) {
+            if (proc.state() != QProcess::NotRunning)
+                proc.kill();
+            result.success = false;
+            result.error = "Script stopped.";
+            break;
+        }
+
+        if (timer.elapsed() > kScriptExecutionTimeoutMs) {
+            if (proc.state() != QProcess::NotRunning)
+                proc.kill();
+            result.success = false;
+            result.error = "Script timed out.";
+            break;
+        }
+
+        if (!proc.waitForReadyRead(100)) {
+            QCoreApplication::processEvents();
             if (proc.state() == QProcess::NotRunning)
                 break;
+            continue;
         }
 
         while (proc.canReadLine()) {
@@ -445,16 +477,29 @@ ScriptResult ScriptEngine::runViaProcess(const QString &code, const QString & /*
                 gotResult = true;
             }
         }
+        QCoreApplication::processEvents();
     }
 
     // Tell the helper to exit cleanly
-    QJsonObject quit;
-    quit["type"] = "quit";
-    proc.write(QJsonDocument(quit).toJson(QJsonDocument::Compact) + "\n");
-    proc.waitForFinished(3000);
+    if (proc.state() != QProcess::NotRunning) {
+        QJsonObject quit;
+        quit["type"] = "quit";
+        proc.write(QJsonDocument(quit).toJson(QJsonDocument::Compact) + "\n");
+        if (!proc.waitForFinished(3000)) {
+            proc.kill();
+            proc.waitForFinished(1000);
+        }
+    } else if (!gotResult && result.error.isEmpty()) {
+        result.error = "Python process exited before returning a result.";
+    }
+
+    if (g_activeScriptProcess == &proc)
+        g_activeScriptProcess = nullptr;
+    g_scriptStopRequested = false;
 
     result.output = allOutput;
-    result.error  = allError;
+    if (!allError.isEmpty() || result.error.isEmpty())
+        result.error = allError;
 
     if (!result.error.isEmpty())
         emit errorOccurred(result.error);
@@ -835,9 +880,10 @@ void ScriptConsole::onRun()
 
 void ScriptConsole::onStop()
 {
-    // Process mode: killing is handled by QProcess going out of scope.
-    // In a full implementation this would signal the running process.
-    appendOutput("--- Stop requested (process will exit after current operation) ---\n");
+    g_scriptStopRequested = true;
+    if (g_activeScriptProcess && g_activeScriptProcess->state() != QProcess::NotRunning)
+        g_activeScriptProcess->kill();
+    appendOutput("--- Stop requested ---\n");
     m_stopAction->setEnabled(false);
 }
 

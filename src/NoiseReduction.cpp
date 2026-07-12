@@ -1,7 +1,15 @@
 #include "NoiseReduction.h"
+#include <QHash>
+#include <QMetaObject>
+#include <QMutex>
+#include <QMutexLocker>
+#include <QPointer>
 #include <QThread>
 #include <QFileInfo>
+#include <atomic>
 #include <cmath>
+#include <functional>
+#include <memory>
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -15,14 +23,121 @@ extern "C" {
 #include <libswresample/swresample.h>
 }
 
+namespace {
+
+QMutex g_runStateMutex;
+QHash<const NoiseReduction *, QThread *> g_runningThreads;
+QHash<const NoiseReduction *, std::shared_ptr<std::atomic_bool>> g_cancelFlags;
+
+int findStreamIndexLocal(AVFormatContext *fmtCtx, int mediaType)
+{
+    for (unsigned i = 0; i < fmtCtx->nb_streams; i++) {
+        if (fmtCtx->streams[i]->codecpar->codec_type == mediaType)
+            return static_cast<int>(i);
+    }
+    return -1;
+}
+
+void postProgress(const QPointer<NoiseReduction> &receiver, int percent)
+{
+    if (!receiver)
+        return;
+    QMetaObject::invokeMethod(receiver.data(), [receiver, percent]() {
+        if (receiver)
+            emit receiver->progressChanged(percent);
+    }, Qt::QueuedConnection);
+}
+
+void postComplete(const QPointer<NoiseReduction> &receiver, bool success, const QString &message)
+{
+    if (!receiver)
+        return;
+    QMetaObject::invokeMethod(receiver.data(), [receiver, success, message]() {
+        if (receiver)
+            emit receiver->denoiseComplete(success, message);
+    }, Qt::QueuedConnection);
+}
+
+void cleanupRunState(const NoiseReduction *owner, QThread *thread)
+{
+    QMutexLocker locker(&g_runStateMutex);
+    if (g_runningThreads.value(owner) == thread) {
+        g_runningThreads.remove(owner);
+        g_cancelFlags.remove(owner);
+    }
+}
+
+bool startDenoiseWorker(NoiseReduction *owner,
+                        QThread *&memberThread,
+                        const QString &inputPath,
+                        const QString &outputPath,
+                        const QString &audioFilter,
+                        const QString &videoFilter,
+                        const std::function<bool(const QString &, const QString &,
+                                                 const QString &, const QString &,
+                                                 const std::shared_ptr<std::atomic_bool> &,
+                                                 const QPointer<NoiseReduction> &)> &worker)
+{
+    {
+        QMutexLocker locker(&g_runStateMutex);
+        QThread *running = g_runningThreads.value(owner, nullptr);
+        if (running && running->isRunning())
+            return false;
+    }
+
+    auto cancelled = std::make_shared<std::atomic_bool>(false);
+    QPointer<NoiseReduction> receiver(owner);
+    QThread *thread = QThread::create([worker, inputPath, outputPath,
+                                       audioFilter, videoFilter, cancelled, receiver]() {
+        worker(inputPath, outputPath, audioFilter, videoFilter, cancelled, receiver);
+    });
+
+    {
+        QMutexLocker locker(&g_runStateMutex);
+        g_runningThreads.insert(owner, thread);
+        g_cancelFlags.insert(owner, cancelled);
+    }
+
+    memberThread = thread;
+    QObject::connect(thread, &QThread::finished, owner, [owner, thread, &memberThread]() {
+        cleanupRunState(owner, thread);
+        if (memberThread == thread)
+            memberThread = nullptr;
+    });
+    QObject::connect(thread, &QThread::finished, thread, &QThread::deleteLater);
+    thread->start();
+    return true;
+}
+
+} // namespace
+
 NoiseReduction::NoiseReduction(QObject *parent)
     : QObject(parent)
 {
+    connect(this, &QObject::destroyed, [owner = this]() {
+        std::shared_ptr<std::atomic_bool> cancelled;
+        QThread *thread = nullptr;
+        {
+            QMutexLocker locker(&g_runStateMutex);
+            cancelled = g_cancelFlags.value(owner);
+            thread = g_runningThreads.value(owner, nullptr);
+            g_cancelFlags.remove(owner);
+            g_runningThreads.remove(owner);
+        }
+        if (cancelled)
+            cancelled->store(true);
+        if (thread && thread->isRunning())
+            thread->wait();
+    });
 }
 
 void NoiseReduction::cancel()
 {
     m_cancelled = true;
+    QMutexLocker locker(&g_runStateMutex);
+    auto cancelled = g_cancelFlags.value(this);
+    if (cancelled)
+        cancelled->store(true);
 }
 
 // --- Filter description builders ---
@@ -83,32 +198,32 @@ int NoiseReduction::findStreamIndex(AVFormatContext *fmtCtx, int mediaType)
 
 // --- Core filter-graph processing ---
 
-bool NoiseReduction::processWithFilter(const QString &inputPath, const QString &outputPath,
-                                       const QString &audioFilter, const QString &videoFilter)
+static bool processWithFilterImpl(const QString &inputPath, const QString &outputPath,
+                                  const QString &audioFilter, const QString &videoFilter,
+                                  const std::shared_ptr<std::atomic_bool> &cancelled,
+                                  const QPointer<NoiseReduction> &receiver)
 {
-    m_cancelled = false;
-
     // Open input
     AVFormatContext *inFmtCtx = nullptr;
     if (avformat_open_input(&inFmtCtx, inputPath.toUtf8().constData(), nullptr, nullptr) < 0) {
-        emit denoiseComplete(false, "Failed to open input file");
+        postComplete(receiver, false, "Failed to open input file");
         return false;
     }
     if (avformat_find_stream_info(inFmtCtx, nullptr) < 0) {
         avformat_close_input(&inFmtCtx);
-        emit denoiseComplete(false, "Failed to read stream info");
+        postComplete(receiver, false, "Failed to read stream info");
         return false;
     }
 
-    int audioIdx = findStreamIndex(inFmtCtx, AVMEDIA_TYPE_AUDIO);
-    int videoIdx = findStreamIndex(inFmtCtx, AVMEDIA_TYPE_VIDEO);
+    int audioIdx = findStreamIndexLocal(inFmtCtx, AVMEDIA_TYPE_AUDIO);
+    int videoIdx = findStreamIndexLocal(inFmtCtx, AVMEDIA_TYPE_VIDEO);
 
     bool hasAudioFilter = !audioFilter.isEmpty() && audioIdx >= 0;
     bool hasVideoFilter = !videoFilter.isEmpty() && videoIdx >= 0;
 
     if (!hasAudioFilter && !hasVideoFilter) {
         avformat_close_input(&inFmtCtx);
-        emit denoiseComplete(false, "No applicable streams for filtering");
+        postComplete(receiver, false, "No applicable streams for filtering");
         return false;
     }
 
@@ -148,7 +263,7 @@ bool NoiseReduction::processWithFilter(const QString &inputPath, const QString &
         if (audioDecCtx) avcodec_free_context(&audioDecCtx);
         if (videoDecCtx) avcodec_free_context(&videoDecCtx);
         avformat_close_input(&inFmtCtx);
-        emit denoiseComplete(false, "Failed to open decoders");
+        postComplete(receiver, false, "Failed to open decoders");
         return false;
     }
 
@@ -253,7 +368,7 @@ bool NoiseReduction::processWithFilter(const QString &inputPath, const QString &
         if (audioDecCtx) avcodec_free_context(&audioDecCtx);
         if (videoDecCtx) avcodec_free_context(&videoDecCtx);
         avformat_close_input(&inFmtCtx);
-        emit denoiseComplete(false, "Failed to build filter graphs");
+        postComplete(receiver, false, "Failed to build filter graphs");
         return false;
     }
 
@@ -266,7 +381,7 @@ bool NoiseReduction::processWithFilter(const QString &inputPath, const QString &
         if (audioDecCtx) avcodec_free_context(&audioDecCtx);
         if (videoDecCtx) avcodec_free_context(&videoDecCtx);
         avformat_close_input(&inFmtCtx);
-        emit denoiseComplete(false, "Failed to create output context");
+        postComplete(receiver, false, "Failed to create output context");
         return false;
     }
 
@@ -276,12 +391,32 @@ bool NoiseReduction::processWithFilter(const QString &inputPath, const QString &
     AVCodecContext *videoEncCtx = nullptr;
     AVStream *outVideoStream = nullptr;
 
+    auto cleanupOutputSetup = [&]() {
+        if (audioEncCtx) avcodec_free_context(&audioEncCtx);
+        if (videoEncCtx) avcodec_free_context(&videoEncCtx);
+        if (audioGraph) avfilter_graph_free(&audioGraph);
+        if (videoGraph) avfilter_graph_free(&videoGraph);
+        if (audioDecCtx) avcodec_free_context(&audioDecCtx);
+        if (videoDecCtx) avcodec_free_context(&videoDecCtx);
+        if (outFmtCtx) {
+            if (!(outFmtCtx->oformat->flags & AVFMT_NOFILE) && outFmtCtx->pb)
+                avio_closep(&outFmtCtx->pb);
+            avformat_free_context(outFmtCtx);
+        }
+        avformat_close_input(&inFmtCtx);
+    };
+
     if (hasAudioFilter) {
         const AVCodec *enc = avcodec_find_encoder(inFmtCtx->streams[audioIdx]->codecpar->codec_id);
         if (!enc) enc = avcodec_find_encoder(AV_CODEC_ID_AAC);
         if (enc) {
             outAudioStream = avformat_new_stream(outFmtCtx, nullptr);
             audioEncCtx = avcodec_alloc_context3(enc);
+            if (!outAudioStream || !audioEncCtx) {
+                cleanupOutputSetup();
+                postComplete(receiver, false, "Failed to create audio encoder");
+                return false;
+            }
             audioEncCtx->sample_rate = audioDecCtx->sample_rate;
             av_channel_layout_copy(&audioEncCtx->ch_layout, &audioDecCtx->ch_layout);
             audioEncCtx->sample_fmt = enc->sample_fmts ? enc->sample_fmts[0] : AV_SAMPLE_FMT_FLTP;
@@ -289,9 +424,21 @@ bool NoiseReduction::processWithFilter(const QString &inputPath, const QString &
             audioEncCtx->time_base = {1, audioDecCtx->sample_rate};
             if (outFmtCtx->oformat->flags & AVFMT_GLOBALHEADER)
                 audioEncCtx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-            avcodec_open2(audioEncCtx, enc, nullptr);
+            if (avcodec_open2(audioEncCtx, enc, nullptr) < 0) {
+                cleanupOutputSetup();
+                postComplete(receiver, false, "Failed to open audio encoder");
+                return false;
+            }
+            if (audioEncCtx->frame_size > 0 &&
+                !(audioEncCtx->codec->capabilities & AV_CODEC_CAP_VARIABLE_FRAME_SIZE)) {
+                av_buffersink_set_frame_size(abufferSinkCtx, audioEncCtx->frame_size);
+            }
             avcodec_parameters_from_context(outAudioStream->codecpar, audioEncCtx);
             outAudioStream->time_base = audioEncCtx->time_base;
+        } else {
+            cleanupOutputSetup();
+            postComplete(receiver, false, "Failed to find audio encoder");
+            return false;
         }
     }
 
@@ -301,6 +448,11 @@ bool NoiseReduction::processWithFilter(const QString &inputPath, const QString &
         if (enc) {
             outVideoStream = avformat_new_stream(outFmtCtx, nullptr);
             videoEncCtx = avcodec_alloc_context3(enc);
+            if (!outVideoStream || !videoEncCtx) {
+                cleanupOutputSetup();
+                postComplete(receiver, false, "Failed to create video encoder");
+                return false;
+            }
             videoEncCtx->width = videoDecCtx->width;
             videoEncCtx->height = videoDecCtx->height;
             videoEncCtx->pix_fmt = videoDecCtx->pix_fmt;
@@ -319,9 +471,17 @@ bool NoiseReduction::processWithFilter(const QString &inputPath, const QString &
             if (outFmtCtx->oformat->flags & AVFMT_GLOBALHEADER)
                 videoEncCtx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
             av_opt_set(videoEncCtx->priv_data, "preset", "medium", 0);
-            avcodec_open2(videoEncCtx, enc, nullptr);
+            if (avcodec_open2(videoEncCtx, enc, nullptr) < 0) {
+                cleanupOutputSetup();
+                postComplete(receiver, false, "Failed to open video encoder");
+                return false;
+            }
             avcodec_parameters_from_context(outVideoStream->codecpar, videoEncCtx);
             outVideoStream->time_base = videoEncCtx->time_base;
+        } else {
+            cleanupOutputSetup();
+            postComplete(receiver, false, "Failed to find video encoder");
+            return false;
         }
     }
 
@@ -353,22 +513,81 @@ bool NoiseReduction::processWithFilter(const QString &inputPath, const QString &
             if (videoDecCtx) avcodec_free_context(&videoDecCtx);
             avformat_free_context(outFmtCtx);
             avformat_close_input(&inFmtCtx);
-            emit denoiseComplete(false, "Failed to open output file");
+            postComplete(receiver, false, "Failed to open output file");
             return false;
         }
     }
 
-    avformat_write_header(outFmtCtx, nullptr);
+    if (avformat_write_header(outFmtCtx, nullptr) < 0) {
+        cleanupOutputSetup();
+        postComplete(receiver, false, "Failed to write output header");
+        return false;
+    }
 
     // --- Processing loop ---
     AVPacket *packet = av_packet_alloc();
     AVFrame *frame = av_frame_alloc();
     AVFrame *filtFrame = av_frame_alloc();
+    if (!packet || !frame || !filtFrame) {
+        av_frame_free(&filtFrame);
+        av_frame_free(&frame);
+        av_packet_free(&packet);
+        cleanupOutputSetup();
+        postComplete(receiver, false, "Failed to allocate processing frames");
+        return false;
+    }
+
+    bool processingError = false;
+    QString processingErrorMessage;
+    auto failProcessing = [&](const QString &message) {
+        if (!processingError) {
+            processingError = true;
+            processingErrorMessage = message;
+        }
+    };
+
+    auto drainEncoderPackets = [&](AVCodecContext *encCtx, AVStream *outStream) {
+        AVPacket *encPkt = av_packet_alloc();
+        if (!encPkt) {
+            failProcessing("Failed to allocate encoded packet");
+            return false;
+        }
+        bool ok = true;
+        while (!processingError) {
+            int ret = avcodec_receive_packet(encCtx, encPkt);
+            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+                break;
+            if (ret < 0) {
+                failProcessing("Failed to receive encoded packet");
+                ok = false;
+                break;
+            }
+            encPkt->stream_index = outStream->index;
+            av_packet_rescale_ts(encPkt, encCtx->time_base, outStream->time_base);
+            if (av_interleaved_write_frame(outFmtCtx, encPkt) < 0) {
+                failProcessing("Failed to write encoded packet");
+                ok = false;
+                break;
+            }
+        }
+        av_packet_free(&encPkt);
+        return ok;
+    };
+
+    auto encodeFrame = [&](AVCodecContext *encCtx, AVStream *outStream, AVFrame *srcFrame,
+                           const QString &streamName) {
+        int ret = avcodec_send_frame(encCtx, srcFrame);
+        if (ret < 0) {
+            failProcessing(QString("Failed to encode %1 frame").arg(streamName));
+            return false;
+        }
+        return drainEncoderPackets(encCtx, outStream);
+    };
 
     int64_t totalDurationUs = inFmtCtx->duration > 0 ? inFmtCtx->duration : 1;
     int lastProgress = 0;
 
-    while (av_read_frame(inFmtCtx, packet) >= 0 && !m_cancelled) {
+    while (av_read_frame(inFmtCtx, packet) >= 0 && !cancelled->load() && !processingError) {
         int pktIdx = packet->stream_index;
 
         // Progress based on packet DTS
@@ -378,123 +597,97 @@ bool NoiseReduction::processWithFilter(const QString &inputPath, const QString &
             progress = qBound(0, progress, 99);
             if (progress > lastProgress) {
                 lastProgress = progress;
-                emit progressChanged(progress);
+                postProgress(receiver, progress);
             }
         }
 
         // Audio filtering
         if (pktIdx == audioIdx && hasAudioFilter && audioDecCtx && audioEncCtx) {
-            if (avcodec_send_packet(audioDecCtx, packet) == 0) {
-                while (avcodec_receive_frame(audioDecCtx, frame) == 0) {
-                    if (av_buffersrc_add_frame(abufferSrcCtx, frame) >= 0) {
-                        while (av_buffersink_get_frame(abufferSinkCtx, filtFrame) >= 0) {
-                            filtFrame->pts = filtFrame->pts;
-                            avcodec_send_frame(audioEncCtx, filtFrame);
-                            AVPacket *encPkt = av_packet_alloc();
-                            while (avcodec_receive_packet(audioEncCtx, encPkt) == 0) {
-                                encPkt->stream_index = outAudioStream->index;
-                                av_packet_rescale_ts(encPkt, audioEncCtx->time_base,
-                                                     outAudioStream->time_base);
-                                av_interleaved_write_frame(outFmtCtx, encPkt);
-                            }
-                            av_packet_free(&encPkt);
-                            av_frame_unref(filtFrame);
-                        }
+            int ret = avcodec_send_packet(audioDecCtx, packet);
+            if (ret < 0)
+                failProcessing("Failed to decode audio packet");
+            while (!processingError && avcodec_receive_frame(audioDecCtx, frame) == 0) {
+                if (av_buffersrc_add_frame(abufferSrcCtx, frame) < 0) {
+                    failProcessing("Failed to feed audio filter");
+                } else {
+                    while (!processingError && av_buffersink_get_frame(abufferSinkCtx, filtFrame) >= 0) {
+                        filtFrame->pts = filtFrame->pts;
+                        encodeFrame(audioEncCtx, outAudioStream, filtFrame, "audio");
+                        av_frame_unref(filtFrame);
                     }
-                    av_frame_unref(frame);
                 }
+                av_frame_unref(frame);
             }
         }
         // Video filtering
         else if (pktIdx == videoIdx && hasVideoFilter && videoDecCtx && videoEncCtx) {
-            if (avcodec_send_packet(videoDecCtx, packet) == 0) {
-                while (avcodec_receive_frame(videoDecCtx, frame) == 0) {
-                    if (av_buffersrc_add_frame(vbufferSrcCtx, frame) >= 0) {
-                        while (av_buffersink_get_frame(vbufferSinkCtx, filtFrame) >= 0) {
-                            filtFrame->pts = filtFrame->pts;
-                            avcodec_send_frame(videoEncCtx, filtFrame);
-                            AVPacket *encPkt = av_packet_alloc();
-                            while (avcodec_receive_packet(videoEncCtx, encPkt) == 0) {
-                                encPkt->stream_index = outVideoStream->index;
-                                av_packet_rescale_ts(encPkt, videoEncCtx->time_base,
-                                                     outVideoStream->time_base);
-                                av_interleaved_write_frame(outFmtCtx, encPkt);
-                            }
-                            av_packet_free(&encPkt);
-                            av_frame_unref(filtFrame);
-                        }
+            int ret = avcodec_send_packet(videoDecCtx, packet);
+            if (ret < 0)
+                failProcessing("Failed to decode video packet");
+            while (!processingError && avcodec_receive_frame(videoDecCtx, frame) == 0) {
+                if (av_buffersrc_add_frame(vbufferSrcCtx, frame) < 0) {
+                    failProcessing("Failed to feed video filter");
+                } else {
+                    while (!processingError && av_buffersink_get_frame(vbufferSinkCtx, filtFrame) >= 0) {
+                        filtFrame->pts = filtFrame->pts;
+                        encodeFrame(videoEncCtx, outVideoStream, filtFrame, "video");
+                        av_frame_unref(filtFrame);
                     }
-                    av_frame_unref(frame);
                 }
+                av_frame_unref(frame);
             }
         }
         // Pass-through for non-filtered streams
         else if (pktIdx >= 0 && pktIdx < streamMapping.size() && streamMapping[pktIdx] >= 0) {
             packet->stream_index = streamMapping[pktIdx];
-            av_interleaved_write_frame(outFmtCtx, packet);
+            if (av_interleaved_write_frame(outFmtCtx, packet) < 0)
+                failProcessing("Failed to write copied packet");
         }
 
         av_packet_unref(packet);
     }
 
     // Flush decoders and filter graphs
-    if (hasAudioFilter && audioDecCtx && audioEncCtx) {
-        avcodec_send_packet(audioDecCtx, nullptr);
-        while (avcodec_receive_frame(audioDecCtx, frame) == 0) {
-            av_buffersrc_add_frame(abufferSrcCtx, frame);
+    if (!processingError && hasAudioFilter && audioDecCtx && audioEncCtx) {
+        if (avcodec_send_packet(audioDecCtx, nullptr) < 0) {
+            failProcessing("Failed to flush audio decoder");
+        }
+        while (!processingError && avcodec_receive_frame(audioDecCtx, frame) == 0) {
+            if (av_buffersrc_add_frame(abufferSrcCtx, frame) < 0)
+                failProcessing("Failed to flush audio filter");
             av_frame_unref(frame);
         }
-        av_buffersrc_add_frame(abufferSrcCtx, nullptr);
-        while (av_buffersink_get_frame(abufferSinkCtx, filtFrame) >= 0) {
-            avcodec_send_frame(audioEncCtx, filtFrame);
-            AVPacket *encPkt = av_packet_alloc();
-            while (avcodec_receive_packet(audioEncCtx, encPkt) == 0) {
-                encPkt->stream_index = outAudioStream->index;
-                av_packet_rescale_ts(encPkt, audioEncCtx->time_base, outAudioStream->time_base);
-                av_interleaved_write_frame(outFmtCtx, encPkt);
-            }
-            av_packet_free(&encPkt);
+        if (!processingError && av_buffersrc_add_frame(abufferSrcCtx, nullptr) < 0)
+            failProcessing("Failed to finish audio filter");
+        while (!processingError && av_buffersink_get_frame(abufferSinkCtx, filtFrame) >= 0) {
+            encodeFrame(audioEncCtx, outAudioStream, filtFrame, "audio");
             av_frame_unref(filtFrame);
         }
-        avcodec_send_frame(audioEncCtx, nullptr);
-        AVPacket *flushPkt = av_packet_alloc();
-        while (avcodec_receive_packet(audioEncCtx, flushPkt) == 0) {
-            flushPkt->stream_index = outAudioStream->index;
-            av_packet_rescale_ts(flushPkt, audioEncCtx->time_base, outAudioStream->time_base);
-            av_interleaved_write_frame(outFmtCtx, flushPkt);
-        }
-        av_packet_free(&flushPkt);
+        if (!processingError)
+            encodeFrame(audioEncCtx, outAudioStream, nullptr, "audio");
     }
 
-    if (hasVideoFilter && videoDecCtx && videoEncCtx) {
-        avcodec_send_packet(videoDecCtx, nullptr);
-        while (avcodec_receive_frame(videoDecCtx, frame) == 0) {
-            av_buffersrc_add_frame(vbufferSrcCtx, frame);
+    if (!processingError && hasVideoFilter && videoDecCtx && videoEncCtx) {
+        if (avcodec_send_packet(videoDecCtx, nullptr) < 0) {
+            failProcessing("Failed to flush video decoder");
+        }
+        while (!processingError && avcodec_receive_frame(videoDecCtx, frame) == 0) {
+            if (av_buffersrc_add_frame(vbufferSrcCtx, frame) < 0)
+                failProcessing("Failed to flush video filter");
             av_frame_unref(frame);
         }
-        av_buffersrc_add_frame(vbufferSrcCtx, nullptr);
-        while (av_buffersink_get_frame(vbufferSinkCtx, filtFrame) >= 0) {
-            avcodec_send_frame(videoEncCtx, filtFrame);
-            AVPacket *encPkt = av_packet_alloc();
-            while (avcodec_receive_packet(videoEncCtx, encPkt) == 0) {
-                encPkt->stream_index = outVideoStream->index;
-                av_packet_rescale_ts(encPkt, videoEncCtx->time_base, outVideoStream->time_base);
-                av_interleaved_write_frame(outFmtCtx, encPkt);
-            }
-            av_packet_free(&encPkt);
+        if (!processingError && av_buffersrc_add_frame(vbufferSrcCtx, nullptr) < 0)
+            failProcessing("Failed to finish video filter");
+        while (!processingError && av_buffersink_get_frame(vbufferSinkCtx, filtFrame) >= 0) {
+            encodeFrame(videoEncCtx, outVideoStream, filtFrame, "video");
             av_frame_unref(filtFrame);
         }
-        avcodec_send_frame(videoEncCtx, nullptr);
-        AVPacket *flushPkt = av_packet_alloc();
-        while (avcodec_receive_packet(videoEncCtx, flushPkt) == 0) {
-            flushPkt->stream_index = outVideoStream->index;
-            av_packet_rescale_ts(flushPkt, videoEncCtx->time_base, outVideoStream->time_base);
-            av_interleaved_write_frame(outFmtCtx, flushPkt);
-        }
-        av_packet_free(&flushPkt);
+        if (!processingError)
+            encodeFrame(videoEncCtx, outVideoStream, nullptr, "video");
     }
 
-    av_write_trailer(outFmtCtx);
+    if (!processingError && av_write_trailer(outFmtCtx) < 0)
+        failProcessing("Failed to write output trailer");
 
     // --- Cleanup ---
     av_frame_free(&filtFrame);
@@ -513,15 +706,29 @@ bool NoiseReduction::processWithFilter(const QString &inputPath, const QString &
     avformat_free_context(outFmtCtx);
     avformat_close_input(&inFmtCtx);
 
-    if (m_cancelled) {
-        emit progressChanged(0);
-        emit denoiseComplete(false, "Cancelled");
+    if (cancelled->load()) {
+        postProgress(receiver, 0);
+        postComplete(receiver, false, "Cancelled");
         return false;
     }
 
-    emit progressChanged(100);
-    emit denoiseComplete(true, "Denoise complete");
+    if (processingError) {
+        postComplete(receiver, false, processingErrorMessage);
+        return false;
+    }
+
+    postProgress(receiver, 100);
+    postComplete(receiver, true, "Denoise complete");
     return true;
+}
+
+bool NoiseReduction::processWithFilter(const QString &inputPath, const QString &outputPath,
+                                       const QString &audioFilter, const QString &videoFilter)
+{
+    m_cancelled = false;
+    auto cancelled = std::make_shared<std::atomic_bool>(false);
+    return processWithFilterImpl(inputPath, outputPath, audioFilter, videoFilter,
+                                 cancelled, QPointer<NoiseReduction>(this));
 }
 
 // --- Public API ---
@@ -530,22 +737,20 @@ void NoiseReduction::denoiseAudio(const QString &inputPath, const QString &outpu
                                   const AudioDenoiseConfig &config)
 {
     m_cancelled = false;
-    m_thread = QThread::create([this, inputPath, outputPath, config]() {
-        processWithFilter(inputPath, outputPath, buildAudioFilterDesc(config), QString());
-    });
-    connect(m_thread, &QThread::finished, m_thread, &QThread::deleteLater);
-    m_thread->start();
+    if (!startDenoiseWorker(this, m_thread, inputPath, outputPath,
+                            buildAudioFilterDesc(config), QString(), processWithFilterImpl)) {
+        emit denoiseComplete(false, "Denoise already in progress");
+    }
 }
 
 void NoiseReduction::denoiseVideo(const QString &inputPath, const QString &outputPath,
                                   const VideoDenoiseConfig &config)
 {
     m_cancelled = false;
-    m_thread = QThread::create([this, inputPath, outputPath, config]() {
-        processWithFilter(inputPath, outputPath, QString(), buildVideoFilterDesc(config));
-    });
-    connect(m_thread, &QThread::finished, m_thread, &QThread::deleteLater);
-    m_thread->start();
+    if (!startDenoiseWorker(this, m_thread, inputPath, outputPath,
+                            QString(), buildVideoFilterDesc(config), processWithFilterImpl)) {
+        emit denoiseComplete(false, "Denoise already in progress");
+    }
 }
 
 void NoiseReduction::denoiseAll(const QString &inputPath, const QString &outputPath,
@@ -553,13 +758,11 @@ void NoiseReduction::denoiseAll(const QString &inputPath, const QString &outputP
                                 const VideoDenoiseConfig &videoConfig)
 {
     m_cancelled = false;
-    m_thread = QThread::create([this, inputPath, outputPath, audioConfig, videoConfig]() {
-        processWithFilter(inputPath, outputPath,
-                          buildAudioFilterDesc(audioConfig),
-                          buildVideoFilterDesc(videoConfig));
-    });
-    connect(m_thread, &QThread::finished, m_thread, &QThread::deleteLater);
-    m_thread->start();
+    if (!startDenoiseWorker(this, m_thread, inputPath, outputPath,
+                            buildAudioFilterDesc(audioConfig),
+                            buildVideoFilterDesc(videoConfig), processWithFilterImpl)) {
+        emit denoiseComplete(false, "Denoise already in progress");
+    }
 }
 
 // --- Noise level measurement ---

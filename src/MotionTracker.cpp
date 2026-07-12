@@ -1,5 +1,8 @@
 #include "MotionTracker.h"
 #include <QThread>
+#include <QMutex>
+#include <QMutexLocker>
+#include <QSet>
 #include <QFile>
 #include <QDebug>
 #include <QJsonDocument>
@@ -12,6 +15,26 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libswscale/swscale.h>
+}
+
+namespace {
+QMutex g_runningTrackersMutex;
+QSet<const MotionTracker *> g_runningTrackers;
+
+bool markTrackerRunning(const MotionTracker *tracker)
+{
+    QMutexLocker locker(&g_runningTrackersMutex);
+    if (g_runningTrackers.contains(tracker))
+        return false;
+    g_runningTrackers.insert(tracker);
+    return true;
+}
+
+void markTrackerStopped(const MotionTracker *tracker)
+{
+    QMutexLocker locker(&g_runningTrackersMutex);
+    g_runningTrackers.remove(tracker);
+}
 }
 
 // ---------------------------------------------------------------------------
@@ -379,6 +402,9 @@ double MotionTracker::medianOfRecent() const
 
 void MotionTracker::startTracking(const QString &filePath, const QRect &initialRect)
 {
+    if (!markTrackerRunning(this))
+        return;
+
     m_result = TrackingResult{};
     m_cancelRequested = false;
     // US-MT-2: clear Kalman filter for a fresh tracking run so the next
@@ -387,13 +413,15 @@ void MotionTracker::startTracking(const QString &filePath, const QRect &initialR
 
     // US-MT-3 / US-FIX-1: reset occlusion FSM state so a previous run's
     // occlusion history can't leak into this one. Centralized in
-    // resetOcclusionState() so startTracking, cancel, and cleanup share
-    // exactly the same reset semantics.
+    // resetOcclusionState() so startTracking and cleanup share exactly the
+    // same reset semantics.
     resetOcclusionState();
 
     auto *thread = QThread::create([this, filePath, initialRect]() {
         decodeAndTrack(filePath, initialRect);
-        emit trackingComplete(m_result);
+        TrackingResult result = m_result;
+        markTrackerStopped(this);
+        emit trackingComplete(result);
     });
     connect(thread, &QThread::finished, thread, &QThread::deleteLater);
     thread->start();
@@ -402,7 +430,6 @@ void MotionTracker::startTracking(const QString &filePath, const QRect &initialR
 void MotionTracker::cancel()
 {
     m_cancelRequested = true;
-    resetOcclusionState();
 }
 
 void MotionTracker::resetOcclusionState()
@@ -702,6 +729,239 @@ bool MotionTracker::decodeAndTrack(const QString &filePath, const QRect &initial
     int frameCount = 0;
     bool firstFrame = true;
 
+    auto processDecodedFrame = [&]() -> bool {
+        if (m_cancelRequested)
+            return false;
+
+        // Convert to QImage
+        QImage qimg(frameW, frameH, QImage::Format_RGB32);
+        uint8_t *dest[1] = { qimg.bits() };
+        int destLinesize[1] = { static_cast<int>(qimg.bytesPerLine()) };
+        sws_scale(swsCtx, frame->data, frame->linesize, 0,
+                  frameH, dest, destLinesize);
+
+        if (firstFrame) {
+            // Extract template from initial rectangle
+            QRect clamped = initialRect.intersected(qimg.rect());
+            if (clamped.isEmpty()) {
+                // Bad initial rect — abort
+                return false;
+            }
+            templateImage = qimg.copy(clamped);
+            lastRect = clamped;
+
+            // US-MT-3: seed last-confident template cache with the
+            // user-picked region. Confidence is by definition 1.0 on
+            // the seed frame, so this also pre-loads peakScore.
+            m_lastConfidentTemplate = templateImage;
+            m_lastConfidentTemplateFrame = 0;
+
+            TrackingRegion region;
+            region.rect = clamped;
+            region.confidence = 1.0;
+            region.frameNumber = 0;
+            // US-MT-2: seed Kalman with the user-picked center so the
+            // first measurement on frame 1 has a valid prior state.
+            if (m_kalmanEnabled) {
+                QPointF seedCenter(clamped.x() + clamped.width() / 2.0,
+                                   clamped.y() + clamped.height() / 2.0);
+                QPointF smoothed = kalmanSmooth(seedCenter, 1.0);
+                region.subPixelCenter = smoothed;
+            }
+            m_result.regions.append(region);
+
+            firstFrame = false;
+        } else {
+            // US-MT-3: stop appending regions for the rest of the
+            // timeline once trackingLost has fired. Still drain
+            // decoder + advance frame counter so cleanup is clean.
+            if (m_trackingLostEmitted) {
+                frameCount++;
+                int pct = static_cast<int>(100.0 * frameCount / totalFrames);
+                emit progressChanged(qMin(pct, 100));
+                return true;
+            }
+
+            // US-MT-3: build search area using the live (possibly
+            // occlusion-expanded) margin. m_currentSearchMargin ==
+            // m_baseSearchMargin in the no-occlusion path so behaviour
+            // is bit-identical to US-MT-2 when occlusion never fires.
+            const int searchMargin = m_currentSearchMargin;
+            QRect search(
+                lastRect.x() - searchMargin,
+                lastRect.y() - searchMargin,
+                lastRect.width() + 2 * searchMargin,
+                lastRect.height() + 2 * searchMargin);
+
+            // US-MT-3: while occluded, match against the last-confident
+            // template (cached when score > 0.85 * peakScore). This
+            // prevents the live template from drifting onto the
+            // occluder. When NOT occluded, use the live template
+            // (identity with US-MT-2).
+            const QImage &activeTemplate =
+                (m_occluded && !m_lastConfidentTemplate.isNull())
+                    ? m_lastConfidentTemplate
+                    : templateImage;
+
+            TrackingRegion region = trackFrame(qimg, activeTemplate, search);
+            region.frameNumber = frameCount;
+
+            if (region.confidence >= m_minConfidence) {
+                lastRect = region.rect;
+            } else {
+                // Low confidence — keep last known position
+                region.rect = lastRect;
+            }
+
+            // ----- US-MT-3: occlusion FSM ----------------------------
+            // Snapshot peak/median BEFORE this frame so threshold
+            // checks use the prior running max. We do NOT update
+            // m_peakScoreSeenSoFar here — that update is owned by
+            // kalmanSmooth (US-MT-2 invariant). Only the median
+            // ring is touched here. When kalmanSmooth is bypassed
+            // (occluded path uses predict-only), the peak simply
+            // does not grow with the occluder's garbage matches —
+            // which is exactly the desired semantic.
+            const double matchScore = region.confidence;
+            const double peakBefore = m_peakScoreSeenSoFar;
+            const double medianBefore = medianOfRecent();
+            pushRecentScore(matchScore);
+
+            // Cache last-confident template ONLY when this match is
+            // close enough to the running peak. Crop from the match
+            // rectangle (clamped to frame bounds for safety). Skip
+            // when occluded — we don't want the cache to contaminate
+            // with the occluder.
+            if (!m_occluded && peakBefore > 0.0 &&
+                matchScore > 0.85 * peakBefore)
+            {
+                QRect cacheRect = region.rect.intersected(qimg.rect());
+                if (!cacheRect.isEmpty()) {
+                    m_lastConfidentTemplate = qimg.copy(cacheRect);
+                    m_lastConfidentTemplateFrame = frameCount;
+                }
+            }
+
+            if (!m_occluded) {
+                // --- Occlusion onset detection -----------------------
+                // Rule A default: matchScore < 0.3 * peakScore for 1 frame.
+                // Rule B default: matchScore < 0.5 * median for 2 consecutive frames.
+                const double peakOnsetThreshold =
+                    qBound(0.0, 0.6 * m_occlusionThreshold, 1.0);
+                const double medianOnsetThreshold = m_occlusionThreshold;
+                bool ruleA = (peakBefore > 0.0 &&
+                              matchScore < peakOnsetThreshold * peakBefore);
+                bool ruleB = false;
+                if (medianBefore > 0.0 &&
+                    matchScore < medianOnsetThreshold * medianBefore) {
+                    m_consecLowScoreFrames++;
+                    if (m_consecLowScoreFrames >= 2)
+                        ruleB = true;
+                } else {
+                    m_consecLowScoreFrames = 0;
+                }
+
+                if (ruleA || ruleB) {
+                    // Occlusion onset.
+                    m_occluded = true;
+                    m_occludedSince = frameCount;
+                    m_consecOccludedFrames = 1;
+                    m_consecLowScoreFrames = 0;
+                    // Expand search radius to min(max(base, 96), srcDim/2).
+                    // srcDim = min(frameW, frameH) is the conservative bound.
+                    const int srcDim = qMin(frameW, frameH);
+                    m_currentSearchMargin = qMin(qMax(m_searchRadius, 96), srcDim / 2);
+                    if (m_currentSearchMargin < m_baseSearchMargin)
+                        m_currentSearchMargin = m_baseSearchMargin;
+                }
+            } else {
+                // --- Occluded: count frames + check re-acquire -------
+                m_consecOccludedFrames++;
+
+                // Hard-fail at 60 consecutive occluded frames.
+                if (m_consecOccludedFrames >= 60 && !m_trackingLostEmitted) {
+                    m_trackingLostEmitted = true;
+                    emit trackingLost(frameCount);
+                    // Don't append this frame's region — we're done.
+                    frameCount++;
+                    int pct = static_cast<int>(100.0 * frameCount / totalFrames);
+                    emit progressChanged(qMin(pct, 100));
+                    return true;
+                }
+
+                // Re-acquire default: score recovers to > 0.7 * peak.
+                const double reacquireThreshold =
+                    qBound(0.0, m_occlusionThreshold + 0.2, 1.0);
+                if (peakBefore > 0.0 &&
+                    matchScore > reacquireThreshold * peakBefore) {
+                    m_occluded = false;
+                    m_occludedSince = -1;
+                    m_consecOccludedFrames = 0;
+                    // One-shot R reset: R = baseline * 2.0 for this
+                    // single frame so the smoothed track interpolates
+                    // gradually toward the recovered measurement
+                    // instead of snapping to it. The next call to
+                    // kalmanSmooth (below, since !m_occluded now)
+                    // multiplies its rDiag by m_oneShotRMultiplier
+                    // and resets it back to 1.0. Adaptive R inside
+                    // kalmanSmooth picks baseline (1.0) for this
+                    // frame because matchScore > 0.7 * peakBefore,
+                    // so final R = 1.0 * 2.0 = 2.0 as specified.
+                    m_oneShotRMultiplier = 2.0;
+                    m_postReacquireRamp = 8;
+                }
+            }
+
+            // --- Search-margin contraction ramp (post re-acquire) ---
+            if (m_postReacquireRamp > 0 && !m_occluded) {
+                // Linear contract from current → base over 8 frames.
+                // ramp counts down: 8,7,6,5,4,3,2,1, then back to base.
+                int rampLeft = m_postReacquireRamp;
+                const int srcDim = qMin(frameW, frameH);
+                const int expanded = qMax(m_baseSearchMargin,
+                                          qMin(qMax(m_searchRadius, 96), srcDim / 2));
+                const int delta = expanded - m_baseSearchMargin;
+                // After this frame's lerp, decrement so next frame
+                // shrinks further. At rampLeft==1 we set to base
+                // exactly.
+                m_currentSearchMargin = m_baseSearchMargin
+                    + (delta * (rampLeft - 1)) / 8;
+                m_postReacquireRamp--;
+                if (m_postReacquireRamp == 0)
+                    m_currentSearchMargin = m_baseSearchMargin;
+            }
+            // --- end FSM --------------------------------------------
+
+            // US-MT-2 + US-MT-3: smooth the sub-pixel center.
+            // While occluded, advance state via predict-only so the
+            // Kalman track coasts at the previously-estimated velocity
+            // instead of being yanked by the (possibly garbage) match.
+            // When NOT occluded, behaviour is identical to US-MT-2.
+            if (m_kalmanEnabled) {
+                if (m_occluded) {
+                    QPointF predicted = kalmanPredictOnly();
+                    region.subPixelCenter = predicted;
+                } else {
+                    QPointF measurement = region.subPixelCenter.isNull()
+                        ? QPointF(region.rect.x() + region.rect.width() / 2.0,
+                                  region.rect.y() + region.rect.height() / 2.0)
+                        : region.subPixelCenter;
+                    QPointF smoothed = kalmanSmooth(measurement, region.confidence);
+                    region.subPixelCenter = smoothed;
+                }
+            }
+
+            m_result.regions.append(region);
+        }
+
+        frameCount++;
+
+        // Report progress
+        int pct = static_cast<int>(100.0 * frameCount / totalFrames);
+        emit progressChanged(qMin(pct, 100));
+        return true;
+    };
+
     while (av_read_frame(fmtCtx, packet) >= 0) {
         if (m_cancelRequested) {
             av_packet_unref(packet);
@@ -714,236 +974,18 @@ bool MotionTracker::decodeAndTrack(const QString &filePath, const QRect &initial
 
         if (avcodec_send_packet(decCtx, packet) == 0) {
             while (avcodec_receive_frame(decCtx, frame) == 0) {
-                // Convert to QImage
-                QImage qimg(frameW, frameH, QImage::Format_RGB32);
-                uint8_t *dest[1] = { qimg.bits() };
-                int destLinesize[1] = { static_cast<int>(qimg.bytesPerLine()) };
-                sws_scale(swsCtx, frame->data, frame->linesize, 0,
-                          frameH, dest, destLinesize);
-
-                if (firstFrame) {
-                    // Extract template from initial rectangle
-                    QRect clamped = initialRect.intersected(qimg.rect());
-                    if (clamped.isEmpty()) {
-                        // Bad initial rect — abort
-                        av_packet_unref(packet);
-                        goto cleanup;
-                    }
-                    templateImage = qimg.copy(clamped);
-                    lastRect = clamped;
-
-                    // US-MT-3: seed last-confident template cache with the
-                    // user-picked region. Confidence is by definition 1.0 on
-                    // the seed frame, so this also pre-loads peakScore.
-                    m_lastConfidentTemplate = templateImage;
-                    m_lastConfidentTemplateFrame = 0;
-
-                    TrackingRegion region;
-                    region.rect = clamped;
-                    region.confidence = 1.0;
-                    region.frameNumber = 0;
-                    // US-MT-2: seed Kalman with the user-picked center so the
-                    // first measurement on frame 1 has a valid prior state.
-                    if (m_kalmanEnabled) {
-                        QPointF seedCenter(clamped.x() + clamped.width() / 2.0,
-                                           clamped.y() + clamped.height() / 2.0);
-                        QPointF smoothed = kalmanSmooth(seedCenter, 1.0);
-                        region.subPixelCenter = smoothed;
-                    }
-                    m_result.regions.append(region);
-
-                    firstFrame = false;
-                } else {
-                    // US-MT-3: stop appending regions for the rest of the
-                    // timeline once trackingLost has fired. Still drain
-                    // decoder + advance frame counter so cleanup is clean.
-                    if (m_trackingLostEmitted) {
-                        frameCount++;
-                        int pct = static_cast<int>(100.0 * frameCount / totalFrames);
-                        emit progressChanged(qMin(pct, 100));
-                        continue;
-                    }
-
-                    // US-MT-3: build search area using the live (possibly
-                    // occlusion-expanded) margin. m_currentSearchMargin ==
-                    // m_baseSearchMargin in the no-occlusion path so behaviour
-                    // is bit-identical to US-MT-2 when occlusion never fires.
-                    const int searchMargin = m_currentSearchMargin;
-                    QRect search(
-                        lastRect.x() - searchMargin,
-                        lastRect.y() - searchMargin,
-                        lastRect.width() + 2 * searchMargin,
-                        lastRect.height() + 2 * searchMargin);
-
-                    // US-MT-3: while occluded, match against the last-confident
-                    // template (cached when score > 0.85 * peakScore). This
-                    // prevents the live template from drifting onto the
-                    // occluder. When NOT occluded, use the live template
-                    // (identity with US-MT-2).
-                    const QImage &activeTemplate =
-                        (m_occluded && !m_lastConfidentTemplate.isNull())
-                            ? m_lastConfidentTemplate
-                            : templateImage;
-
-                    TrackingRegion region = trackFrame(qimg, activeTemplate, search);
-                    region.frameNumber = frameCount;
-
-                    if (region.confidence >= m_minConfidence) {
-                        lastRect = region.rect;
-                    } else {
-                        // Low confidence — keep last known position
-                        region.rect = lastRect;
-                    }
-
-                    // ----- US-MT-3: occlusion FSM ----------------------------
-                    // Snapshot peak/median BEFORE this frame so threshold
-                    // checks use the prior running max. We do NOT update
-                    // m_peakScoreSeenSoFar here — that update is owned by
-                    // kalmanSmooth (US-MT-2 invariant). Only the median
-                    // ring is touched here. When kalmanSmooth is bypassed
-                    // (occluded path uses predict-only), the peak simply
-                    // does not grow with the occluder's garbage matches —
-                    // which is exactly the desired semantic.
-                    const double matchScore = region.confidence;
-                    const double peakBefore = m_peakScoreSeenSoFar;
-                    const double medianBefore = medianOfRecent();
-                    pushRecentScore(matchScore);
-
-                    // Cache last-confident template ONLY when this match is
-                    // close enough to the running peak. Crop from the match
-                    // rectangle (clamped to frame bounds for safety). Skip
-                    // when occluded — we don't want the cache to contaminate
-                    // with the occluder.
-                    if (!m_occluded && peakBefore > 0.0 &&
-                        matchScore > 0.85 * peakBefore)
-                    {
-                        QRect cacheRect = region.rect.intersected(qimg.rect());
-                        if (!cacheRect.isEmpty()) {
-                            m_lastConfidentTemplate = qimg.copy(cacheRect);
-                            m_lastConfidentTemplateFrame = frameCount;
-                        }
-                    }
-
-                    if (!m_occluded) {
-                        // --- Occlusion onset detection -----------------------
-                        // Rule A default: matchScore < 0.3 * peakScore for 1 frame.
-                        // Rule B default: matchScore < 0.5 * median for 2 consecutive frames.
-                        const double peakOnsetThreshold =
-                            qBound(0.0, 0.6 * m_occlusionThreshold, 1.0);
-                        const double medianOnsetThreshold = m_occlusionThreshold;
-                        bool ruleA = (peakBefore > 0.0 &&
-                                      matchScore < peakOnsetThreshold * peakBefore);
-                        bool ruleB = false;
-                        if (medianBefore > 0.0 &&
-                            matchScore < medianOnsetThreshold * medianBefore) {
-                            m_consecLowScoreFrames++;
-                            if (m_consecLowScoreFrames >= 2)
-                                ruleB = true;
-                        } else {
-                            m_consecLowScoreFrames = 0;
-                        }
-
-                        if (ruleA || ruleB) {
-                            // Occlusion onset.
-                            m_occluded = true;
-                            m_occludedSince = frameCount;
-                            m_consecOccludedFrames = 1;
-                            m_consecLowScoreFrames = 0;
-                            // Expand search radius to min(max(base, 96), srcDim/2).
-                            // srcDim = min(frameW, frameH) is the conservative bound.
-                            const int srcDim = qMin(frameW, frameH);
-                            m_currentSearchMargin = qMin(qMax(m_searchRadius, 96), srcDim / 2);
-                            if (m_currentSearchMargin < m_baseSearchMargin)
-                                m_currentSearchMargin = m_baseSearchMargin;
-                        }
-                    } else {
-                        // --- Occluded: count frames + check re-acquire -------
-                        m_consecOccludedFrames++;
-
-                        // Hard-fail at 60 consecutive occluded frames.
-                        if (m_consecOccludedFrames >= 60 && !m_trackingLostEmitted) {
-                            m_trackingLostEmitted = true;
-                            emit trackingLost(frameCount);
-                            // Don't append this frame's region — we're done.
-                            frameCount++;
-                            int pct = static_cast<int>(100.0 * frameCount / totalFrames);
-                            emit progressChanged(qMin(pct, 100));
-                            continue;
-                        }
-
-                        // Re-acquire default: score recovers to > 0.7 * peak.
-                        const double reacquireThreshold =
-                            qBound(0.0, m_occlusionThreshold + 0.2, 1.0);
-                        if (peakBefore > 0.0 &&
-                            matchScore > reacquireThreshold * peakBefore) {
-                            m_occluded = false;
-                            m_occludedSince = -1;
-                            m_consecOccludedFrames = 0;
-                            // One-shot R reset: R = baseline * 2.0 for this
-                            // single frame so the smoothed track interpolates
-                            // gradually toward the recovered measurement
-                            // instead of snapping to it. The next call to
-                            // kalmanSmooth (below, since !m_occluded now)
-                            // multiplies its rDiag by m_oneShotRMultiplier
-                            // and resets it back to 1.0. Adaptive R inside
-                            // kalmanSmooth picks baseline (1.0) for this
-                            // frame because matchScore > 0.7 * peakBefore,
-                            // so final R = 1.0 * 2.0 = 2.0 as specified.
-                            m_oneShotRMultiplier = 2.0;
-                            m_postReacquireRamp = 8;
-                        }
-                    }
-
-                    // --- Search-margin contraction ramp (post re-acquire) ---
-                    if (m_postReacquireRamp > 0 && !m_occluded) {
-                        // Linear contract from current → base over 8 frames.
-                        // ramp counts down: 8,7,6,5,4,3,2,1, then back to base.
-                        int rampLeft = m_postReacquireRamp;
-                        const int srcDim = qMin(frameW, frameH);
-                        const int expanded = qMax(m_baseSearchMargin,
-                                                  qMin(qMax(m_searchRadius, 96), srcDim / 2));
-                        const int delta = expanded - m_baseSearchMargin;
-                        // After this frame's lerp, decrement so next frame
-                        // shrinks further. At rampLeft==1 we set to base
-                        // exactly.
-                        m_currentSearchMargin = m_baseSearchMargin
-                            + (delta * (rampLeft - 1)) / 8;
-                        m_postReacquireRamp--;
-                        if (m_postReacquireRamp == 0)
-                            m_currentSearchMargin = m_baseSearchMargin;
-                    }
-                    // --- end FSM --------------------------------------------
-
-                    // US-MT-2 + US-MT-3: smooth the sub-pixel center.
-                    // While occluded, advance state via predict-only so the
-                    // Kalman track coasts at the previously-estimated velocity
-                    // instead of being yanked by the (possibly garbage) match.
-                    // When NOT occluded, behaviour is identical to US-MT-2.
-                    if (m_kalmanEnabled) {
-                        if (m_occluded) {
-                            QPointF predicted = kalmanPredictOnly();
-                            region.subPixelCenter = predicted;
-                        } else {
-                            QPointF measurement = region.subPixelCenter.isNull()
-                                ? QPointF(region.rect.x() + region.rect.width() / 2.0,
-                                          region.rect.y() + region.rect.height() / 2.0)
-                                : region.subPixelCenter;
-                            QPointF smoothed = kalmanSmooth(measurement, region.confidence);
-                            region.subPixelCenter = smoothed;
-                        }
-                    }
-
-                    m_result.regions.append(region);
-                }
-
-                frameCount++;
-
-                // Report progress
-                int pct = static_cast<int>(100.0 * frameCount / totalFrames);
-                emit progressChanged(qMin(pct, 100));
+                if (!processDecodedFrame())
+                    goto cleanup;
             }
         }
         av_packet_unref(packet);
+    }
+
+    if (!m_cancelRequested && avcodec_send_packet(decCtx, nullptr) == 0) {
+        while (avcodec_receive_frame(decCtx, frame) == 0) {
+            if (!processDecodedFrame())
+                goto cleanup;
+        }
     }
 
 cleanup:

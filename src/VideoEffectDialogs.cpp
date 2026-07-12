@@ -1,6 +1,7 @@
 #include "VideoEffectDialogs.h"
 #include <QDialogButtonBox>
 #include <QMessageBox>
+#include <QSignalBlocker>
 
 // ===== ColorCorrectionDialog =====
 
@@ -285,6 +286,12 @@ void VideoEffectDialog::onEffectSelected(int row)
 
 void VideoEffectDialog::updateParamUI(int index)
 {
+    QSignalBlocker enabledBlocker(m_enabledCheck);
+    QSignalBlocker param1Blocker(m_param1Spin);
+    QSignalBlocker param2Blocker(m_param2Spin);
+    QSignalBlocker param3Blocker(m_param3Spin);
+    QSignalBlocker mapSourceBlocker(m_mapSourceCombo);
+
     bool valid = index >= 0 && index < m_effects.size();
     m_param1Label->setVisible(false); m_param1Spin->setVisible(false);
     m_param2Label->setVisible(false); m_param2Spin->setVisible(false);
@@ -296,11 +303,6 @@ void VideoEffectDialog::updateParamUI(int index)
 
     const auto &e = m_effects[index];
     m_enabledCheck->setChecked(e.enabled);
-
-    // Block signals during UI update
-    m_param1Spin->blockSignals(true);
-    m_param2Spin->blockSignals(true);
-    m_param3Spin->blockSignals(true);
 
     // Reset decimals and singleStep to defaults before per-type config
     m_param1Spin->setDecimals(1); m_param1Spin->setSingleStep(1.0);
@@ -376,10 +378,6 @@ void VideoEffectDialog::updateParamUI(int index)
     default:
         break; // Grayscale, Invert: no params
     }
-
-    m_param1Spin->blockSignals(false);
-    m_param2Spin->blockSignals(false);
-    m_param3Spin->blockSignals(false);
 }
 
 void VideoEffectDialog::onParamChanged()

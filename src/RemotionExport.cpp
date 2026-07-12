@@ -17,6 +17,20 @@
 #include <QtMath>
 #include <algorithm>
 
+namespace {
+
+QString tsStringLiteralContent(QString value)
+{
+    value.replace("\\", "\\\\");
+    value.replace("\"", "\\\"");
+    value.replace("\r", "\\r");
+    value.replace("\n", "\\n");
+    value.replace("\t", "\\t");
+    return value;
+}
+
+} // namespace
+
 // ---------------------------------------------------------------------------
 // RemotionExporter
 // ---------------------------------------------------------------------------
@@ -37,7 +51,11 @@ bool RemotionExporter::exportProject(const RemotionExportConfig &config, const P
         return false;
     }
 
-    const QString base    = config.outputDir + "/" + config.projectName;
+    RemotionExportConfig effectiveConfig = config;
+    if (effectiveConfig.durationInFrames <= 0)
+        effectiveConfig.durationInFrames = calculateDurationInFrames(data, effectiveConfig.fps);
+
+    const QString base    = effectiveConfig.outputDir + "/" + effectiveConfig.projectName;
     const QString srcDir  = base + "/src";
     const QString compDir = srcDir + "/components";
     const QString libDir  = srcDir + "/lib";
@@ -46,26 +64,31 @@ bool RemotionExporter::exportProject(const RemotionExportConfig &config, const P
     emit exportProgress(0);
 
     // 1. Directory structure
-    if (!createDirectoryStructure(base, config.projectName)) return false;
+    if (!createDirectoryStructure(base, effectiveConfig.projectName)) return false;
     emit exportProgress(5);
 
     // 2. Root config files
-    if (config.generatePackageJson) {
-        if (!writePackageJson(base, config)) return false;
+    if (effectiveConfig.generatePackageJson) {
+        if (!writePackageJson(base, effectiveConfig)) return false;
     }
     if (!writeTsConfig(base)) return false;
     emit exportProgress(15);
 
     // 3. src/Root.tsx
-    if (!writeRootTsx(srcDir, config)) return false;
+    if (!writeRootTsx(srcDir, effectiveConfig)) return false;
+    if (!writeFile(srcDir + "/index.ts",
+                   "import { registerRoot } from 'remotion';\n"
+                   "import { RemotionRoot } from './Root';\n"
+                   "\n"
+                   "registerRoot(RemotionRoot);\n")) return false;
     emit exportProgress(25);
 
     // 4. src/Video.tsx
-    if (!writeVideoTsx(srcDir, config, data)) return false;
+    if (!writeVideoTsx(srcDir, effectiveConfig, data)) return false;
     emit exportProgress(40);
 
     // 5. src/lib/timeline.ts
-    if (!writeTimelineTs(libDir, config, data)) return false;
+    if (!writeTimelineTs(libDir, effectiveConfig, data)) return false;
     emit exportProgress(50);
 
     // 6. Components
@@ -78,7 +101,7 @@ bool RemotionExporter::exportProject(const RemotionExportConfig &config, const P
     emit exportProgress(75);
 
     // 7. Assets
-    if (config.includeAssets) {
+    if (effectiveConfig.includeAssets) {
         if (!copyAssets(assetDir, data)) return false;
     }
     emit exportProgress(95);
@@ -195,13 +218,11 @@ bool RemotionExporter::writeTsConfig(const QString &base)
 bool RemotionExporter::writeRootTsx(const QString &srcDir,
                                      const RemotionExportConfig &config)
 {
-    const int dur = (config.durationInFrames > 0)
-                  ? config.durationInFrames
-                  : 300; // placeholder; real value comes from timeline.ts
-
     const QString content = QString(
+        "import React from 'react';\n"
         "import { Composition } from 'remotion';\n"
         "import { VideoComposition } from './Video';\n"
+        "import { DURATION_IN_FRAMES } from './lib/timeline';\n"
         "\n"
         "export const RemotionRoot: React.FC = () => {\n"
         "  return (\n"
@@ -209,15 +230,15 @@ bool RemotionExporter::writeRootTsx(const QString &srcDir,
         "      <Composition\n"
         "        id=\"VideoComposition\"\n"
         "        component={VideoComposition}\n"
-        "        durationInFrames={%1}\n"
-        "        fps={%2}\n"
-        "        width={%3}\n"
-        "        height={%4}\n"
+        "        durationInFrames={DURATION_IN_FRAMES}\n"
+        "        fps={%1}\n"
+        "        width={%2}\n"
+        "        height={%3}\n"
         "      />\n"
         "    </>\n"
         "  );\n"
         "};\n"
-    ).arg(dur).arg(config.fps).arg(config.width).arg(config.height);
+    ).arg(config.fps).arg(config.width).arg(config.height);
     return writeFile(srcDir + "/Root.tsx", content);
 }
 
@@ -349,7 +370,7 @@ QString RemotionExporter::generateVideoCompositionBody(const RemotionExportConfi
                 const int ovDur   = ovEnd - ovStart;
                 s << "          <Sequence from={" << ovStart << "} durationInFrames={" << ovDur << "}>\n";
                 s << "            <TextOverlay\n";
-                s << "              text={" << "\"" << QString(ov.text).replace("\"", "\\\"") << "\"}\n";
+                s << "              text={" << "\"" << tsStringLiteralContent(ov.text) << "\"}\n";
                 s << "              x={" << ov.x << "}\n";
                 s << "              y={" << ov.y << "}\n";
                 s << "              opacity={" << ov.opacity << "}\n";
@@ -648,7 +669,7 @@ QString RemotionExporter::generateTimelineData(const RemotionExportConfig &confi
                                       ? static_cast<int>(std::round(ov.endTime * fps))
                                       : durFrames;
                     s << "          {\n";
-                    s << "            text: \"" << QString(ov.text).replace("\"", "\\\"") << "\",\n";
+                    s << "            text: \"" << tsStringLiteralContent(ov.text) << "\",\n";
                     s << "            startFrame: " << ovStart << ",\n";
                     s << "            durationInFrames: " << (ovEnd - ovStart) << ",\n";
                     s << "            x: " << ov.x << ",\n";

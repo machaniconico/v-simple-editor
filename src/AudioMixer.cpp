@@ -1761,14 +1761,18 @@ void AudioMixer::setSequence(const QVector<PlaybackEntry> &entries) {
         for (const auto &e : entries) {
             // Cap on UNIQUE source tracks, not total entry count, so a
             // single track with many clips doesn't get its trailing entries
-            // silently dropped.
-            uniqueTracks.insert(e.sourceTrack);
-            if (uniqueTracks.size() > kMaxAudioTracks
-                && !uniqueTracks.contains(e.sourceTrack)) {
+            // silently dropped. Check membership BEFORE inserting: the old
+            // insert-then-`!contains` order made the guard a dead branch
+            // (contains is always true right after insert), so the cap never
+            // triggered.
+            const bool knownTrack = uniqueTracks.contains(e.sourceTrack);
+            if (!knownTrack && uniqueTracks.size() >= kMaxAudioTracks) {
                 pendingErrors << QStringLiteral("AudioMixer: exceeded MAX_AUDIO_TRACKS=%1, dropping track %2 entry %3")
                                   .arg(kMaxAudioTracks).arg(e.sourceTrack).arg(e.filePath);
                 continue;
             }
+            if (!knownTrack)
+                uniqueTracks.insert(e.sourceTrack);
             AudioTrackKey key{
                 e.filePath,
                 qRound64(e.clipIn * 1000.0),

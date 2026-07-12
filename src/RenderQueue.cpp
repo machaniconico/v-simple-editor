@@ -175,8 +175,12 @@ RenderQueue::~RenderQueue()
     {
         QMutexLocker locker(&m_processMutex);
         process = m_process;
-        if (process)
+        if (process) {
+            // US-101: drop the finished/readyRead handlers before killing so a
+            // queued completion lambda cannot run against a half-destroyed queue.
+            QObject::disconnect(process, nullptr, this, nullptr);
             process->kill();
+        }
     }
     if (process)
         process->waitForFinished(3000);
@@ -301,9 +305,9 @@ void RenderQueue::start()
 
 void RenderQueue::stop()
 {
-    cancelCurrent();
     m_running = false;
     m_paused = false;
+    cancelCurrent();
 }
 
 void RenderQueue::clearCompleted()
@@ -322,7 +326,10 @@ void RenderQueue::clearCompleted()
 
 void RenderQueue::clearAll()
 {
-    if (m_running)
+    const bool hadRunningJob = m_running;
+    m_running = false;
+    m_paused = false;
+    if (hadRunningJob)
         cancelCurrent();
 
     m_jobs.clear();
@@ -360,7 +367,9 @@ void RenderQueue::resumeQueue()
 
 void RenderQueue::cancelCurrent()
 {
-    if (m_currentJobIndex < 0)
+    // US-101: guard the upper bound too, so a stale index cannot index m_jobs
+    // out of range after the queue was cleared.
+    if (m_currentJobIndex < 0 || m_currentJobIndex >= m_jobs.size())
         return;
 
     // Signal the S8 render-pipe worker (if running) to stop encoding frames;
@@ -371,17 +380,26 @@ void RenderQueue::cancelCurrent()
     // US-MF-6: if the 10-bit HDR subprocess branch is mid-encode, kill the
     // ffmpeg.exe process so a worker blocked inside a stdin write/flush
     // unblocks immediately rather than waiting for the next frame boundary.
+    // Access m_process only under the mutex (it may be null for the in-process
+    // render path, and a worker thread may reassign it).
     {
         QMutexLocker locker(&m_processMutex);
         if (m_process)
             m_process->kill();
     }
 
+    // US-101: only flip a job to Cancelled when it is genuinely mid-render, and
+    // notify listeners. No `!m_process` early-return: HEAD cancels the
+    // in-process render-pipe worker via m_cancelRequested even when no ffmpeg
+    // subprocess exists.
     RenderJob &j = m_jobs[m_currentJobIndex];
-    j.status = RenderJobStatus::Cancelled;
-    j.endTime = QDateTime::currentDateTime();
-    j.errorMessage = "Cancelled by user";
-    j.error = j.errorMessage;
+    if (j.status == RenderJobStatus::Rendering) {
+        j.status = RenderJobStatus::Cancelled;
+        j.endTime = QDateTime::currentDateTime();
+        j.errorMessage = "Cancelled by user";
+        j.error = j.errorMessage;
+        emit jobsChanged();
+    }
 
     // Don't auto-advance; let the render-pipe completion handler deal with it
 }
@@ -582,6 +600,11 @@ bool RenderQueue::loadQueue(const QString &filePath)
 
 void RenderQueue::startNextJob()
 {
+    if (!m_running) {
+        m_currentJobIndex = -1;
+        return;
+    }
+
     if (m_paused) {
         m_running = false;
         return;

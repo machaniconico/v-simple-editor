@@ -4609,6 +4609,25 @@ void VideoPlayer::handlePlaybackTick()
         }
     }
 
+    const auto waitForV2Prefetch = [&](const char *site) {
+        if (!v2PrefetchFuture.isStarted())
+            return;
+        QElapsedTimer waitTimer;
+        if (stallTraceEnabled())
+            waitTimer.start();
+        v2PrefetchFuture.waitForFinished();
+        if (stallTraceEnabled() && waitTimer.isValid()) {
+            const qint64 elapsedMs = waitTimer.elapsed();
+            if (elapsedMs >= kStallThresholdWaitMs) {
+                qWarning().noquote()
+                    << QStringLiteral("[stall>=%1ms] v2PrefetchFuture.waitForFinished %2ms site=%3")
+                           .arg(kStallThresholdWaitMs)
+                           .arg(elapsedMs)
+                           .arg(QString::fromLatin1(site));
+            }
+        }
+    };
+
     bool advanced = false;
     if (m_playbackSpeed >= 0.0) {
         // Drift correction runs BEFORE the display decode so the frame the
@@ -4660,20 +4679,7 @@ void VideoPlayer::handlePlaybackTick()
     if (advanced && willComposite && !m_lastV1RawFrame.isNull()) {
         // Phase 1e Win #6: wait for V2 prefetch to finish before the
         // compositor branch reads pool-decoder state.
-        if (v2PrefetchFuture.isStarted()) {
-            QElapsedTimer waitTimer;
-            if (stallTraceEnabled())
-                waitTimer.start();
-            v2PrefetchFuture.waitForFinished();
-            if (stallTraceEnabled() && waitTimer.isValid()) {
-                const qint64 elapsedMs = waitTimer.elapsed();
-                if (elapsedMs >= kStallThresholdWaitMs) {
-                    qWarning().noquote()
-                        << QStringLiteral("[stall>=%1ms] v2PrefetchFuture.waitForFinished %2ms site=compositor-entry")
-                               .arg(kStallThresholdWaitMs).arg(elapsedMs);
-                }
-            }
-        }
+        waitForV2Prefetch("compositor-entry");
         // ADAPTIVE-1: 合成キャッシュ参照。同一 (timelineRevision, playhead, size,
         // tier, useProxy) の最終合成が既にあれば再合成 (overlay decode + compose) を
         // スキップし、キャッシュ画像を 1 回だけ displayFrame する。prefetch-wait は
@@ -5264,6 +5270,11 @@ void VideoPlayer::handlePlaybackTick()
                 const auto &nextE = m_sequence[nextIdx];
                 const bool isOverlayRotation =
                     (nextE.sourceTrack != active.sourceTrack);
+                // Boundary advances can promote/reseek pool decoders. Fence
+                // the tick-local V2 worker before touching that pool so the
+                // decoder wrapper and FFmpeg contexts cannot be moved/deleted
+                // while the worker still holds them.
+                waitForV2Prefetch("boundary-advance");
                 QElapsedTimer advTimer;
                 if (stallTraceEnabled())
                     advTimer.start();
@@ -5297,6 +5308,7 @@ void VideoPlayer::handlePlaybackTick()
                 }
             } else {
                 // End of sequence.
+                waitForV2Prefetch("boundary-end");
                 m_timelinePositionUs = m_sequenceDurationUs;
                 m_currentPositionUs = entryEndLocalUs;
                 updatePositionUi();
@@ -5324,20 +5336,7 @@ void VideoPlayer::handlePlaybackTick()
     // inserted into handlePlaybackTick. Do NOT add a return between the
     // prefetch dispatch and this wait without porting the wait to the new
     // return site.
-    if (v2PrefetchFuture.isStarted()) {
-        QElapsedTimer waitTimer;
-        if (stallTraceEnabled())
-            waitTimer.start();
-        v2PrefetchFuture.waitForFinished();
-        if (stallTraceEnabled() && waitTimer.isValid()) {
-            const qint64 elapsedMs = waitTimer.elapsed();
-            if (elapsedMs >= kStallThresholdWaitMs) {
-                qWarning().noquote()
-                    << QStringLiteral("[stall>=%1ms] v2PrefetchFuture.waitForFinished %2ms site=tick-exit")
-                           .arg(kStallThresholdWaitMs).arg(elapsedMs);
-            }
-        }
-    }
+    waitForV2Prefetch("tick-exit");
     Q_ASSERT(!v2PrefetchFuture.isStarted() || v2PrefetchFuture.isFinished());
 
     if (!advanced) {

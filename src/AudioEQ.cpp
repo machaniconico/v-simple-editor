@@ -3,7 +3,48 @@
 #include <QRegularExpression>
 #include <QStandardPaths>
 #include <QFileInfo>
+#include <QHash>
+#include <QMutex>
+#include <QMutexLocker>
+#include <QSharedPointer>
 #include <cmath>
+#include <atomic>
+
+namespace {
+
+struct EQJobState {
+    std::atomic_bool running { false };
+    std::atomic_bool cancelled { false };
+};
+
+QMutex g_eqJobStatesMutex;
+QHash<AudioEQProcessor *, QSharedPointer<EQJobState>> g_eqJobStates;
+
+QSharedPointer<EQJobState> eqJobState(AudioEQProcessor *processor)
+{
+    QMutexLocker lock(&g_eqJobStatesMutex);
+    auto it = g_eqJobStates.find(processor);
+    if (it != g_eqJobStates.end())
+        return it.value();
+
+    auto state = QSharedPointer<EQJobState>::create();
+    g_eqJobStates.insert(processor, state);
+    return state;
+}
+
+QSharedPointer<EQJobState> existingEqJobState(AudioEQProcessor *processor)
+{
+    QMutexLocker lock(&g_eqJobStatesMutex);
+    return g_eqJobStates.value(processor);
+}
+
+void removeEqJobState(QObject *processor)
+{
+    QMutexLocker lock(&g_eqJobStatesMutex);
+    g_eqJobStates.remove(static_cast<AudioEQProcessor *>(processor));
+}
+
+}
 
 // --- AudioEffect helpers ---
 
@@ -104,11 +145,14 @@ AudioEffect AudioEffect::createVoiceEnhance(double clarity)
 AudioEQProcessor::AudioEQProcessor(QObject *parent)
     : QObject(parent)
 {
+    connect(this, &QObject::destroyed, this, &removeEqJobState);
 }
 
 void AudioEQProcessor::cancel()
 {
     m_cancelled = true;
+    if (auto state = existingEqJobState(this))
+        state->cancelled.store(true, std::memory_order_release);
 }
 
 // --- FFmpeg binary lookup ---
@@ -165,32 +209,33 @@ bool AudioEQProcessor::runFFmpeg(const QStringList &args)
     if (ffmpegBin.isEmpty())
         return false;
 
-    m_process = new QProcess();
+    auto state = eqJobState(this);
+    QProcess process;
 
-    connect(m_process, &QProcess::readyReadStandardError, this, [this]() {
-        QString output = m_process->readAllStandardError();
+    connect(&process, &QProcess::readyReadStandardError, &process, [this, &process]() {
+        QString output = process.readAllStandardError();
         parseProgress(output);
     });
 
-    m_process->start(ffmpegBin, args);
-    m_process->waitForStarted();
+    process.start(ffmpegBin, args);
+    if (!process.waitForStarted())
+        return false;
 
     // Poll for completion or cancellation
-    while (!m_process->waitForFinished(200)) {
-        if (m_cancelled) {
-            m_process->kill();
-            m_process->waitForFinished(3000);
-            m_process->deleteLater();
-            m_process = nullptr;
+    while (!process.waitForFinished(200)) {
+        if (state->cancelled.load(std::memory_order_acquire)) {
+            process.kill();
+            process.waitForFinished(3000);
             return false;
         }
     }
 
-    bool success = (m_process->exitStatus() == QProcess::NormalExit
-                    && m_process->exitCode() == 0);
+    const QString tail = process.readAllStandardError();
+    if (!tail.isEmpty())
+        parseProgress(tail);
 
-    m_process->deleteLater();
-    m_process = nullptr;
+    bool success = (process.exitStatus() == QProcess::NormalExit
+                    && process.exitCode() == 0);
     return success;
 }
 
@@ -401,42 +446,63 @@ void AudioEQProcessor::applyChain(const QString &inputPath, const QString &outpu
                                    const AudioEQConfig &eqConfig,
                                    const QVector<AudioEffect> &effects)
 {
+    auto state = eqJobState(this);
+    bool expected = false;
+    if (!state->running.compare_exchange_strong(expected, true,
+                                                std::memory_order_acq_rel,
+                                                std::memory_order_acquire)) {
+        emit processComplete(false, "Audio processing already in progress");
+        return;
+    }
+
     m_cancelled = false;
     m_totalDuration = 0.0;
+    state->cancelled.store(false, std::memory_order_release);
 
-    QThread *thread = QThread::create([this, inputPath, outputPath, eqConfig, effects]() {
+    QThread *thread = QThread::create([this, inputPath, outputPath, eqConfig, effects, state]() {
         emit progressChanged(0);
+
+        bool success = false;
+        QString message;
 
         // Validate input
         if (!QFileInfo::exists(inputPath)) {
-            emit processComplete(false, "Input file not found: " + inputPath);
-            return;
+            message = "Input file not found: " + inputPath;
+        } else {
+            // Build combined filter string
+            QString filterStr = buildFilterString(eqConfig, effects);
+            if (filterStr.isEmpty()) {
+                message = "No filters to apply";
+            } else {
+                // Build FFmpeg args: input -> audio filter -> output
+                QStringList args;
+                args << "-y"                    // overwrite output
+                     << "-i" << inputPath
+                     << "-af" << filterStr
+                     << "-vn"                   // no video (audio processing only)
+                     << outputPath;
+
+                success = runFFmpeg(args);
+                if (state->cancelled.load(std::memory_order_acquire)) {
+                    success = false;
+                    message = "Processing cancelled";
+                } else if (success) {
+                    emit progressChanged(100);
+                    message = "Audio processing complete";
+                } else {
+                    message = "FFmpeg audio processing failed";
+                }
+            }
         }
 
-        // Build combined filter string
-        QString filterStr = buildFilterString(eqConfig, effects);
-        if (filterStr.isEmpty()) {
-            emit processComplete(false, "No filters to apply");
-            return;
-        }
-
-        // Build FFmpeg args: input -> audio filter -> output
-        QStringList args;
-        args << "-y"                    // overwrite output
-             << "-i" << inputPath
-             << "-af" << filterStr
-             << "-vn"                   // no video (audio processing only)
-             << outputPath;
-
-        bool success = runFFmpeg(args);
-
-        if (m_cancelled) {
+        state->running.store(false, std::memory_order_release);
+        if (state->cancelled.load(std::memory_order_acquire)
+            && message != "Processing cancelled") {
             emit processComplete(false, "Processing cancelled");
         } else if (success) {
-            emit progressChanged(100);
-            emit processComplete(true, "Audio processing complete");
+            emit processComplete(true, message);
         } else {
-            emit processComplete(false, "FFmpeg audio processing failed");
+            emit processComplete(false, message);
         }
     });
 

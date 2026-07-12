@@ -227,7 +227,7 @@ void ProjectCollector::doCollect(ProjectData dataCopy,
 
         const QString basename = resolveDestBasename(src, srcToBasename,
                                                      basenameToSrc, mediaSubdir);
-        const QString destPath = mediaSubdir + QLatin1Char('/') + basename;
+        const QString destPath = QDir(mediaSubdir).absoluteFilePath(basename);
 
         if (!QFile::exists(destPath)) {
             QFile srcFile(src);
@@ -282,8 +282,8 @@ void ProjectCollector::doCollect(ProjectData dataCopy,
             ++copiedFiles;
         }
 
-        // Rewrite the field to destDir-relative path.
-        *ps.field = QStringLiteral("media/") + basename;
+        // The loader opens filePath as-is, so avoid CWD-dependent collected projects.
+        *ps.field = QDir::cleanPath(destPath);
     }
 
     if (m_cancelled) {

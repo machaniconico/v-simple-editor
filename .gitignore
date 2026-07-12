@@ -85,8 +85,9 @@ remotion_export/
 # User settings (optional - uncomment to ignore)
 # settings.ini
 
-# OMC orchestration state
+# OMC runtime state (operational artifacts — never commit; .omc/skills would be the only committable exception)
 .omc/
+src/.omc/
 .claude/worktrees/
 
 # Out-of-tree / scratch build dirs (the canonical one is build/, see top)
@@ -96,6 +97,7 @@ build-*/
 /CMakeFiles/
 build_*.txt
 build_out.txt
+build_*.log
 
 # Scratch harnesses / probes / dumps
 /_*
