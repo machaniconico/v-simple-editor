@@ -289,15 +289,14 @@ TriMesh buildExtrudedMesh(const QVector<QPolygonF> &contours, const ExtrudeParam
     {
         const quint32 base = layerOffsets[0];
         for (const auto &rd : rings) {
-            const int n = rd.capVerts.size() - 1; // exclude centroid
             for (int t = 0; t < rd.triIndices.size(); t += 3) {
                 quint32 i0 = rd.triIndices[t];
                 quint32 i1 = rd.triIndices[t + 1];
                 quint32 i2 = rd.triIndices[t + 2];
                 // Convert to global
-                mesh.indices.append(base + i0);
-                mesh.indices.append(base + i1);
-                mesh.indices.append(base + i2);
+                mesh.indices.append(base + rd.vertOffset + i0);
+                mesh.indices.append(base + rd.vertOffset + i1);
+                mesh.indices.append(base + rd.vertOffset + i2);
             }
         }
     }
@@ -309,15 +308,14 @@ TriMesh buildExtrudedMesh(const QVector<QPolygonF> &contours, const ExtrudeParam
         const int lastLayerIdx = layers.size() - 1;
         const quint32 base = layerOffsets[lastLayerIdx];
         for (const auto &rd : rings) {
-            const int n = rd.capVerts.size() - 1;
             for (int t = 0; t < rd.triIndices.size(); t += 3) {
                 quint32 i0 = rd.triIndices[t];
                 quint32 i1 = rd.triIndices[t + 1];
                 quint32 i2 = rd.triIndices[t + 2];
                 // Reverse winding: swap i1 and i2
-                mesh.indices.append(base + i0);
-                mesh.indices.append(base + i2);
-                mesh.indices.append(base + i1);
+                mesh.indices.append(base + rd.vertOffset + i0);
+                mesh.indices.append(base + rd.vertOffset + i2);
+                mesh.indices.append(base + rd.vertOffset + i1);
             }
         }
     }

@@ -9,6 +9,8 @@
 #include <QRegularExpression>
 #include <QStandardPaths>
 #include <QThread>
+#include <QMutex>
+#include <QMutexLocker>
 #include <QtGlobal>
 #include <QDir>
 
@@ -29,6 +31,12 @@ bool isPlanarFrameIndexValid(const planartrack::PlanarTrack *track, int frameInd
     return track != nullptr
         && frameIndex >= 0
         && frameIndex < static_cast<int>(track->frames.size());
+}
+
+QMutex &processStateMutex()
+{
+    static QMutex mutex;
+    return mutex;
 }
 
 }
@@ -327,32 +335,48 @@ bool VideoStabilizer::runFFmpeg(const QStringList &args, int progressBase, int p
     if (ffmpegBin.isEmpty())
         return false;
 
-    m_process = new QProcess();
+    QProcess *process = new QProcess();
+    {
+        QMutexLocker locker(&processStateMutex());
+        m_process = process;
+    }
 
-    connect(m_process, &QProcess::readyReadStandardError, this, [this, progressBase, progressSpan]() {
-        QString output = m_process->readAllStandardError();
+    connect(process, &QProcess::readyReadStandardError, process, [this, process, progressBase, progressSpan]() {
+        QString output = QString::fromLocal8Bit(process->readAllStandardError());
         parseProgress(output, progressBase, progressSpan);
     });
 
-    m_process->start(ffmpegBin, args);
-    m_process->waitForStarted();
+    process->start(ffmpegBin, args);
+    process->waitForStarted();
+
+    auto isCancelled = [this]() {
+        QMutexLocker locker(&processStateMutex());
+        return m_cancelled;
+    };
+
+    auto cleanupProcess = [this, process]() {
+        {
+            QMutexLocker locker(&processStateMutex());
+            if (m_process == process)
+                m_process = nullptr;
+        }
+        delete process;
+    };
 
     // Poll for completion or cancellation
-    while (!m_process->waitForFinished(200)) {
-        if (m_cancelled) {
-            m_process->kill();
-            m_process->waitForFinished(3000);
-            m_process->deleteLater();
-            m_process = nullptr;
+    while (!process->waitForFinished(200)) {
+        if (isCancelled()) {
+            process->kill();
+            process->waitForFinished(3000);
+            cleanupProcess();
             return false;
         }
     }
 
-    bool success = (m_process->exitStatus() == QProcess::NormalExit
-                    && m_process->exitCode() == 0);
+    bool success = (process->exitStatus() == QProcess::NormalExit
+                    && process->exitCode() == 0);
 
-    m_process->deleteLater();
-    m_process = nullptr;
+    cleanupProcess();
     return success;
 }
 
@@ -387,14 +411,18 @@ bool VideoStabilizer::stabilizePlanarInversion(const QString &inputPath, const Q
     if (!decoder.waitForStarted(5000))
         return false;
 
-    m_process = new QProcess();
-    m_process->setProcessChannelMode(QProcess::SeparateChannels);
-    connect(m_process, &QProcess::readyReadStandardError, this, [this]() {
-        const QString output = QString::fromLocal8Bit(m_process->readAllStandardError());
+    QProcess *encoder = new QProcess();
+    {
+        QMutexLocker locker(&processStateMutex());
+        m_process = encoder;
+    }
+    encoder->setProcessChannelMode(QProcess::SeparateChannels);
+    connect(encoder, &QProcess::readyReadStandardError, encoder, [this, encoder]() {
+        const QString output = QString::fromLocal8Bit(encoder->readAllStandardError());
         parseProgress(output, 0, 100);
     });
 
-    m_process->start(ffmpegBin, QStringList{
+    encoder->start(ffmpegBin, QStringList{
         QStringLiteral("-y"),
         QStringLiteral("-hide_banner"),
         QStringLiteral("-f"), QStringLiteral("rawvideo"),
@@ -408,11 +436,15 @@ bool VideoStabilizer::stabilizePlanarInversion(const QString &inputPath, const Q
         QStringLiteral("-c:a"), QStringLiteral("copy"),
         outputPath
     });
-    if (!m_process->waitForStarted(5000)) {
+    if (!encoder->waitForStarted(5000)) {
         decoder.kill();
         decoder.waitForFinished(3000);
-        m_process->deleteLater();
-        m_process = nullptr;
+        {
+            QMutexLocker locker(&processStateMutex());
+            if (m_process == encoder)
+                m_process = nullptr;
+        }
+        delete encoder;
         return false;
     }
 
@@ -424,22 +456,29 @@ bool VideoStabilizer::stabilizePlanarInversion(const QString &inputPath, const Q
         ? static_cast<int>(m_planarTrack->frames.size())
         : 0;
 
-    auto cleanupProcesses = [this, &decoder]() {
-        if (m_process) {
-            m_process->deleteLater();
-            m_process = nullptr;
+    auto isCancelled = [this]() {
+        QMutexLocker locker(&processStateMutex());
+        return m_cancelled;
+    };
+
+    auto cleanupProcesses = [this, &decoder, encoder]() {
+        {
+            QMutexLocker locker(&processStateMutex());
+            if (m_process == encoder)
+                m_process = nullptr;
+        }
+        if (encoder) {
+            delete encoder;
         }
         decoder.closeReadChannel(QProcess::StandardOutput);
     };
 
     while (true) {
-        if (m_cancelled) {
+        if (isCancelled()) {
             decoder.kill();
             decoder.waitForFinished(3000);
-            if (m_process) {
-                m_process->kill();
-                m_process->waitForFinished(3000);
-            }
+            encoder->kill();
+            encoder->waitForFinished(3000);
             cleanupProcesses();
             return false;
         }
@@ -469,22 +508,22 @@ bool VideoStabilizer::stabilizePlanarInversion(const QString &inputPath, const Q
         qsizetype remaining = static_cast<qsizetype>(stabilized.bytesPerLine())
             * static_cast<qsizetype>(stabilized.height());
         while (remaining > 0) {
-            const qint64 written = m_process->write(framePtr, remaining);
+            const qint64 written = encoder->write(framePtr, remaining);
             if (written <= 0) {
                 decoder.kill();
                 decoder.waitForFinished(3000);
-                m_process->kill();
-                m_process->waitForFinished(3000);
+                encoder->kill();
+                encoder->waitForFinished(3000);
                 cleanupProcesses();
                 return false;
             }
             framePtr += written;
             remaining -= written;
-            if (remaining > 0 && !m_process->waitForBytesWritten(5000)) {
+            if (remaining > 0 && !encoder->waitForBytesWritten(5000)) {
                 decoder.kill();
                 decoder.waitForFinished(3000);
-                m_process->kill();
-                m_process->waitForFinished(3000);
+                encoder->kill();
+                encoder->waitForFinished(3000);
                 cleanupProcesses();
                 return false;
             }
@@ -499,15 +538,12 @@ bool VideoStabilizer::stabilizePlanarInversion(const QString &inputPath, const Q
     }
 
     decoder.waitForFinished(5000);
-    if (m_process) {
-        m_process->closeWriteChannel();
-        m_process->waitForFinished(-1);
-    }
+    encoder->closeWriteChannel();
+    encoder->waitForFinished(-1);
 
     const bool decodeOk = decoder.exitStatus() == QProcess::NormalExit && decoder.exitCode() == 0;
-    const bool encodeOk = m_process
-        && m_process->exitStatus() == QProcess::NormalExit
-        && m_process->exitCode() == 0;
+    const bool encodeOk = encoder->exitStatus() == QProcess::NormalExit
+        && encoder->exitCode() == 0;
 
     cleanupProcesses();
     if (decodeOk && encodeOk)
@@ -520,16 +556,24 @@ bool VideoStabilizer::stabilizePlanarInversion(const QString &inputPath, const Q
 void VideoStabilizer::stabilize(const QString &inputPath, const QString &outputPath,
                                 const StabilizerConfig &config)
 {
-    m_cancelled = false;
+    {
+        QMutexLocker locker(&processStateMutex());
+        m_cancelled = false;
+    }
     m_totalDuration = 0.0;
 
     QThread *thread = QThread::create([this, inputPath, outputPath, config]() {
+        auto isCancelled = [this]() {
+            QMutexLocker locker(&processStateMutex());
+            return m_cancelled;
+        };
+
         if (m_model == Model::PlanarInversion && m_planarTrack != nullptr) {
             const bool ok = stabilizePlanarInversion(inputPath, outputPath);
-            if (!ok || m_cancelled) {
+            if (!ok || isCancelled()) {
                 QFile::remove(outputPath);
                 emit stabilizeComplete(false,
-                    m_cancelled ? "Stabilization cancelled" : "Planar inversion stabilization failed");
+                    isCancelled() ? "Stabilization cancelled" : "Planar inversion stabilization failed");
                 return;
             }
 
@@ -552,10 +596,10 @@ void VideoStabilizer::stabilize(const QString &inputPath, const QString &outputP
 
         bool pass1Ok = runFFmpeg(pass1Args, 0, 45);  // 0-45% for pass 1
 
-        if (!pass1Ok || m_cancelled) {
+        if (!pass1Ok || isCancelled()) {
             QFile::remove(trfPath);
             emit stabilizeComplete(false,
-                m_cancelled ? "Stabilization cancelled" : "Analysis pass failed");
+                isCancelled() ? "Stabilization cancelled" : "Analysis pass failed");
             return;
         }
 
@@ -582,10 +626,10 @@ void VideoStabilizer::stabilize(const QString &inputPath, const QString &outputP
         // Clean up .trf file
         QFile::remove(trfPath);
 
-        if (!pass2Ok || m_cancelled) {
+        if (!pass2Ok || isCancelled()) {
             QFile::remove(outputPath);
             emit stabilizeComplete(false,
-                m_cancelled ? "Stabilization cancelled" : "Transform pass failed");
+                isCancelled() ? "Stabilization cancelled" : "Transform pass failed");
             return;
         }
 
@@ -599,10 +643,18 @@ void VideoStabilizer::stabilize(const QString &inputPath, const QString &outputP
 
 void VideoStabilizer::analyzeOnly(const QString &inputPath, const StabilizerConfig &config)
 {
-    m_cancelled = false;
+    {
+        QMutexLocker locker(&processStateMutex());
+        m_cancelled = false;
+    }
     m_totalDuration = 0.0;
 
     QThread *thread = QThread::create([this, inputPath, config]() {
+        auto isCancelled = [this]() {
+            QMutexLocker locker(&processStateMutex());
+            return m_cancelled;
+        };
+
         // Create temp .trf file
         QString baseName = QFileInfo(inputPath).completeBaseName();
         QString trfPath = QDir::tempPath() + "/" + baseName + "_transforms.trf";
@@ -618,10 +670,10 @@ void VideoStabilizer::analyzeOnly(const QString &inputPath, const StabilizerConf
 
         bool ok = runFFmpeg(args, 0, 100);
 
-        if (!ok || m_cancelled) {
+        if (!ok || isCancelled()) {
             QFile::remove(trfPath);
             emit stabilizeComplete(false,
-                m_cancelled ? "Analysis cancelled" : "Analysis failed");
+                isCancelled() ? "Analysis cancelled" : "Analysis failed");
             return;
         }
 
@@ -640,8 +692,6 @@ void VideoStabilizer::analyzeOnly(const QString &inputPath, const StabilizerConf
 
 void VideoStabilizer::cancel()
 {
+    QMutexLocker locker(&processStateMutex());
     m_cancelled = true;
-    if (m_process) {
-        m_process->kill();
-    }
 }

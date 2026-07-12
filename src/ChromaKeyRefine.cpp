@@ -28,6 +28,8 @@ static double hsvDistance(const QColor &a, const QColor &b)
     a.getHsvF(&ahf, &asf, &avf);
     b.getHsvF(&bhf, &bsf, &bvf);
     double ah = ahf, as_ = asf, bh = bhf, bs = bsf;
+    if (ah < 0.0) ah = 0.0;
+    if (bh < 0.0) bh = 0.0;
 
     // Hue is circular; compute shortest arc [0, 0.5]
     double dh = std::abs(ah - bh);
