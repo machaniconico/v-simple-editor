@@ -5,6 +5,7 @@
 #include <QBuffer>
 #include <QFile>
 #include <QJsonDocument>
+#include <QSaveFile>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -528,11 +529,15 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
     }
 
     QJsonDocument doc(root);
-    QFile file(filePath);
+    QSaveFile file(filePath);
     if (!file.open(QIODevice::WriteOnly))
         return false;
-    file.write(doc.toJson(QJsonDocument::Indented));
-    return true;
+    const QByteArray json = doc.toJson(QJsonDocument::Indented);
+    if (file.write(json) != json.size()) {
+        file.cancelWriting();
+        return false;
+    }
+    return file.commit();
 }
 
 bool ProjectFile::load(const QString &filePath, ProjectData &data)
@@ -1305,6 +1310,10 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
     obj["duration"] = clip.duration;
     obj["inPoint"] = clip.inPoint;
     obj["outPoint"] = clip.outPoint;
+    if (clip.leadInSec != 0.0)
+        obj["leadInSec"] = clip.leadInSec;
+    if (clip.linkGroup != 0)
+        obj["linkGroup"] = clip.linkGroup;
     obj["speed"] = clip.speed;
     obj["volume"] = clip.volume;
     obj["videoScale"] = clip.videoScale;
@@ -1339,6 +1348,9 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
     if (clip.keyframes.hasAnyKeyframes())
         obj["keyframes"] = keyframeManagerToJson(clip.keyframes);
 
+    if (clip.textManager.count() > 0)
+        obj["textManager"] = TextManager::toJson(clip.textManager.overlays());
+
     if (clip.leadIn.type != TransitionType::None)
         obj["leadIn"] = transitionToJson(clip.leadIn);
     if (clip.trailOut.type != TransitionType::None)
@@ -1362,6 +1374,8 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
     clip.duration = obj["duration"].toDouble();
     clip.inPoint = obj["inPoint"].toDouble();
     clip.outPoint = obj["outPoint"].toDouble();
+    clip.leadInSec = obj["leadInSec"].toDouble(0.0);
+    clip.linkGroup = obj["linkGroup"].toInt(0);
     clip.speed = obj["speed"].toDouble(1.0);
     clip.volume = obj["volume"].toDouble(1.0);
     clip.videoScale = obj["videoScale"].toDouble(1.0);
@@ -1401,6 +1415,9 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
     if (obj.contains("keyframes"))
         clip.keyframes = keyframeManagerFromJson(obj["keyframes"].toObject());
 
+    if (obj.contains("textManager"))
+        clip.textManager.setOverlays(TextManager::fromJson(obj["textManager"].toArray()));
+
     if (obj.contains("leadIn"))
         clip.leadIn = transitionFromJson(obj["leadIn"].toObject());
     if (obj.contains("trailOut"))
@@ -1427,6 +1444,15 @@ QJsonObject ProjectFile::colorCorrectionToJson(const ColorCorrection &cc)
     obj["highlights"] = cc.highlights;
     obj["shadows"] = cc.shadows;
     obj["exposure"] = cc.exposure;
+    obj["liftR"] = cc.liftR;
+    obj["liftG"] = cc.liftG;
+    obj["liftB"] = cc.liftB;
+    obj["gammaR"] = cc.gammaR;
+    obj["gammaG"] = cc.gammaG;
+    obj["gammaB"] = cc.gammaB;
+    obj["gainR"] = cc.gainR;
+    obj["gainG"] = cc.gainG;
+    obj["gainB"] = cc.gainB;
     return obj;
 }
 
@@ -1443,6 +1469,15 @@ ColorCorrection ProjectFile::colorCorrectionFromJson(const QJsonObject &obj)
     cc.highlights = obj["highlights"].toDouble();
     cc.shadows = obj["shadows"].toDouble();
     cc.exposure = obj["exposure"].toDouble();
+    cc.liftR = obj["liftR"].toDouble();
+    cc.liftG = obj["liftG"].toDouble();
+    cc.liftB = obj["liftB"].toDouble();
+    cc.gammaR = obj["gammaR"].toDouble();
+    cc.gammaG = obj["gammaG"].toDouble();
+    cc.gammaB = obj["gammaB"].toDouble();
+    cc.gainR = obj["gainR"].toDouble();
+    cc.gainG = obj["gainG"].toDouble();
+    cc.gainB = obj["gainB"].toDouble();
     return cc;
 }
 
