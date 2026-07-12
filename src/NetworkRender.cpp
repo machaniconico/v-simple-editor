@@ -174,34 +174,42 @@ void NetworkRenderServer::distributeJobs()
     if (idleNodes.isEmpty())
         return;
 
-    // For each pending job, split into segments and assign
-    for (RenderJobNet &job : m_jobs) {
-        if (job.status != NetworkJobStatus::Pending)
+    // For each pending job present at entry, split into segments and assign.
+    const int jobCount = m_jobs.size();
+    for (int i = 0; i < jobCount; ++i) {
+        if (m_jobs[i].status != NetworkJobStatus::Pending)
             continue;
         if (idleNodes.isEmpty())
             break;
 
-        int totalFrames = job.endFrame - job.startFrame + 1;
+        const QString masterJobId = m_jobs[i].jobId;
+        const QString projectFilePath = m_jobs[i].projectFilePath;
+        const QString outputPath = m_jobs[i].outputPath;
+        const QString exportPreset = m_jobs[i].exportPreset;
+        const int startFrame = m_jobs[i].startFrame;
+        const int endFrame = m_jobs[i].endFrame;
+
+        int totalFrames = endFrame - startFrame + 1;
         if (totalFrames <= m_segmentSize) {
             // Single segment – assign directly
             const QString &nodeId = idleNodes.takeFirst();
-            assignJobToNode(job.jobId, nodeId);
+            assignJobToNode(masterJobId, nodeId);
         } else {
             // Split into segments
             QStringList segIds;
-            int frame = job.startFrame;
-            while (frame <= job.endFrame) {
-                int segEnd = qMin(frame + m_segmentSize - 1, job.endFrame);
+            int frame = startFrame;
+            while (frame <= endFrame) {
+                int segEnd = qMin(frame + m_segmentSize - 1, endFrame);
 
                 RenderJobNet seg;
                 seg.jobId           = QUuid::createUuid().toString(QUuid::WithoutBraces);
-                seg.projectFilePath = job.projectFilePath;
+                seg.projectFilePath = projectFilePath;
                 seg.startFrame      = frame;
                 seg.endFrame        = segEnd;
-                seg.exportPreset    = job.exportPreset;
+                seg.exportPreset    = exportPreset;
 
                 // Segment output gets a suffix so we can concat later
-                QFileInfo fi(job.outputPath);
+                QFileInfo fi(outputPath);
                 seg.outputPath = fi.dir().filePath(
                     fi.baseName() + QString("_seg%1.").arg(segIds.size()) + fi.completeSuffix());
 
@@ -209,14 +217,16 @@ void NetworkRenderServer::distributeJobs()
                 m_jobs.append(seg);
                 segIds.append(seg.jobId);
 
-                m_segmentParent[seg.jobId] = job.jobId;
+                m_segmentParent[seg.jobId] = masterJobId;
                 frame = segEnd + 1;
             }
 
-            m_segmentMap[job.jobId] = segIds;
+            m_segmentMap[masterJobId] = segIds;
 
             // Mark master job as Assigned (it waits for segments)
-            job.status = NetworkJobStatus::Assigned;
+            RenderJobNet *master = findJob(masterJobId);
+            if (master)
+                master->status = NetworkJobStatus::Assigned;
 
             // Assign segments to available nodes
             for (const QString &segId : segIds) {
@@ -580,13 +590,14 @@ void NetworkRenderServer::assembleSegments(const QString &masterJobId)
     QString outputPath = master->outputPath;
     QString masterJobIdCopy = masterJobId;
 
-    connect(proc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
-            this, [this, proc, master, masterJobIdCopy, outputPath, concatFile]
-            (int exitCode, QProcess::ExitStatus exitStatus) {
-        // master pointer may be invalid if m_jobs was modified; use findJob
+    auto finalize = [this, proc, masterJobIdCopy, outputPath, concatFile](bool succeeded) {
+        if (proc->property("networkRenderFinalized").toBool())
+            return;
+        proc->setProperty("networkRenderFinalized", true);
+
         RenderJobNet *m = findJob(masterJobIdCopy);
         if (m) {
-            if (exitStatus == QProcess::NormalExit && exitCode == 0) {
+            if (succeeded) {
                 m->status   = NetworkJobStatus::Complete;
                 m->progress = 100.0;
                 emit jobComplete(masterJobIdCopy, outputPath);
@@ -597,6 +608,17 @@ void NetworkRenderServer::assembleSegments(const QString &masterJobId)
         QFile::remove(concatFile);
         checkAllComplete();
         proc->deleteLater();
+    };
+
+    connect(proc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+            this, [finalize](int exitCode, QProcess::ExitStatus exitStatus) {
+        finalize(exitStatus == QProcess::NormalExit && exitCode == 0);
+    });
+
+    connect(proc, &QProcess::errorOccurred,
+            this, [finalize](QProcess::ProcessError error) {
+        if (error == QProcess::FailedToStart)
+            finalize(false);
     });
 
     QStringList args;

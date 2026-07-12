@@ -350,11 +350,7 @@ void NodeCanvasWidget::onAddNode(const QString &typeName)
     GraphNode *node = m_graph->node(id);
     if (!node) return;
 
-    auto *item = new NodeItem(node);
-    item->setPos(node->canvasPos);
-    m_scene->addItem(item);
-    m_nodeItems.insert(id, item);
-
+    rebuildScene();
     emit graphChanged();
 }
 
@@ -363,23 +359,35 @@ void NodeCanvasWidget::onDeleteSelected()
     if (!m_graph) return;
 
     auto selectedItems = m_scene->selectedItems();
+    QVector<NodeConnection> connectionsToRemove;
+    QVector<int> nodesToRemove;
+
     for (auto *item : selectedItems) {
         if (auto *connItem = qgraphicsitem_cast<ConnectionItem *>(item)) {
-            m_graph->disconnect(connItem->toNodeId(), connItem->toPortIndex());
-            m_scene->removeItem(connItem);
-            delete connItem;
-            emit graphChanged();
+            connectionsToRemove.append(NodeConnection{-1, -1, connItem->toNodeId(),
+                                                      connItem->toPortIndex()});
         } else if (auto *nodeItem = qgraphicsitem_cast<NodeItem *>(item)) {
-            int nodeId = nodeItem->node()->id;
-            m_graph->removeNode(nodeId);
-            m_nodeItems.remove(nodeId);
-            m_scene->removeItem(nodeItem);
-            delete nodeItem;
-            emit graphChanged();
+            GraphNode *node = nodeItem->node();
+            if (node) {
+                nodesToRemove.append(node->id);
+            }
         }
     }
 
+    bool changed = false;
+    for (const NodeConnection &connection : connectionsToRemove) {
+        m_graph->disconnect(connection.toNodeId, connection.toPortIndex);
+        changed = true;
+    }
+    for (int nodeId : nodesToRemove) {
+        m_graph->removeNode(nodeId);
+        changed = true;
+    }
+
     rebuildScene();
+    if (changed) {
+        emit graphChanged();
+    }
 }
 
 void NodeCanvasWidget::onPortDragStarted(QPointF outputPortScenePos)
@@ -460,10 +468,7 @@ void NodeCanvasWidget::onCanvasContextMenuRequested(QPointF scenePos, QPoint glo
                 GraphNode *node = m_graph->node(id);
                 if (node) {
                     node->canvasPos = scenePos;
-                    auto *item = new NodeItem(node);
-                    item->setPos(scenePos);
-                    m_scene->addItem(item);
-                    m_nodeItems.insert(id, item);
+                    rebuildScene();
                     emit graphChanged();
                 }
             }

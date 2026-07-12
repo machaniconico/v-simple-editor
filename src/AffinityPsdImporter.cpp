@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 
 // ---------------------------------------------------------------------------
 // PSD reference: https://www.adobe.com/devnet-apps/photoshop/fileformatashtml/
@@ -144,17 +145,30 @@ QByteArray readChannelPlane(QIODevice& dev, qint64 channelDataLen,
         skipBytes(dev, channelDataLen);
         return {};
     }
+    const qint64 planeBytes64 = qint64(width) * qint64(height);
+    if (planeBytes64 <= 0 || planeBytes64 > std::numeric_limits<int>::max()) {
+        skipBytes(dev, channelDataLen);
+        return {};
+    }
     quint16 comp = 0;
     if (!readU16(dev, comp)) return {};
     qint64 remaining = channelDataLen - 2;
-    const int planeBytes = width * height;
+    if (!dev.isSequential() && remaining > dev.size() - dev.pos()) {
+        qWarning() << "[psd] Channel declares" << remaining
+                   << "bytes but only" << (dev.size() - dev.pos())
+                   << "remain; skipping channel.";
+        skipBytes(dev, std::max<qint64>(0, dev.size() - dev.pos()));
+        return {};
+    }
+    const int planeBytes = static_cast<int>(planeBytes64);
     QByteArray plane;
 
     if (comp == 0) {
         // Raw bytes
-        QByteArray raw(remaining, '\0');
-        if (!readBytes(dev, raw.data(), remaining)) return {};
-        plane = raw.left(planeBytes);
+        const qint64 bytesToRead = std::min<qint64>(remaining, planeBytes);
+        plane.resize(static_cast<int>(bytesToRead));
+        if (bytesToRead > 0 && !readBytes(dev, plane.data(), bytesToRead)) return {};
+        if (!skipBytes(dev, remaining - bytesToRead)) return {};
         if (plane.size() < planeBytes) plane.append(planeBytes - plane.size(), '\0');
     } else if (comp == 1) {
         // PackBits RLE — first 2*height bytes are per-row byte counts.

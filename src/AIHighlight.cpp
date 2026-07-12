@@ -1,5 +1,10 @@
 #include "AIHighlight.h"
 #include "WaveformGenerator.h"
+#include <QHash>
+#include <QMetaObject>
+#include <QMutex>
+#include <QMutexLocker>
+#include <QPointer>
 #include <QThread>
 #include <QTemporaryFile>
 #include <QProcess>
@@ -16,6 +21,85 @@ extern "C" {
 #include <libavutil/channel_layout.h>
 }
 
+namespace {
+
+QMutex g_aiHighlightThreadsMutex;
+QHash<const QObject*, QVector<QThread*>> g_aiHighlightThreads;
+
+bool aiHighlightInterrupted()
+{
+    QThread *thread = QThread::currentThread();
+    return thread && thread->isInterruptionRequested();
+}
+
+void unregisterAIHighlightThread(const QObject *owner, QThread *thread)
+{
+    QMutexLocker locker(&g_aiHighlightThreadsMutex);
+    auto it = g_aiHighlightThreads.find(owner);
+    if (it == g_aiHighlightThreads.end())
+        return;
+
+    it->removeAll(thread);
+    if (it->isEmpty())
+        g_aiHighlightThreads.erase(it);
+}
+
+void trackAIHighlightThread(AIHighlight *owner, QThread *thread)
+{
+    {
+        QMutexLocker locker(&g_aiHighlightThreadsMutex);
+        g_aiHighlightThreads[owner].append(thread);
+    }
+
+    QObject::connect(thread, &QThread::finished, [owner, thread]() {
+        unregisterAIHighlightThread(owner, thread);
+    });
+    QObject::connect(owner, &QObject::destroyed, thread, [owner, thread]() {
+        thread->requestInterruption();
+        thread->wait();
+        unregisterAIHighlightThread(owner, thread);
+    }, Qt::DirectConnection);
+    QObject::connect(thread, &QThread::finished, thread, &QThread::deleteLater);
+}
+
+void postProgressChanged(const QPointer<AIHighlight> &owner, int percent)
+{
+    AIHighlight *target = owner.data();
+    if (!target)
+        return;
+
+    QMetaObject::invokeMethod(target, [owner, percent]() {
+        if (owner)
+            emit owner->progressChanged(percent);
+    }, Qt::QueuedConnection);
+}
+
+void postAnalysisComplete(const QPointer<AIHighlight> &owner, const QVector<Highlight> &highlights)
+{
+    AIHighlight *target = owner.data();
+    if (!target)
+        return;
+
+    QMetaObject::invokeMethod(target, [owner, highlights]() {
+        if (owner)
+            emit owner->analysisComplete(highlights);
+    }, Qt::QueuedConnection);
+}
+
+void postExportComplete(const QPointer<AIHighlight> &owner, bool success, const QString &message)
+{
+    AIHighlight *target = owner.data();
+    if (!target)
+        return;
+
+    QMetaObject::invokeMethod(target, [owner, success, message]() {
+        if (owner)
+            emit owner->exportComplete(success, message);
+    }, Qt::QueuedConnection);
+}
+
+}
+
 // ---------------------------------------------------------------------------
 // Constructor
 // ---------------------------------------------------------------------------
@@ -28,29 +112,38 @@ AIHighlight::AIHighlight(QObject *parent) : QObject(parent) {}
 
 void AIHighlight::analyze(const QString &filePath, const HighlightConfig &config)
 {
-    auto *thread = QThread::create([this, filePath, config]() {
-        emit progressChanged(0);
+    QPointer<AIHighlight> owner(this);
+    auto *thread = QThread::create([owner, filePath, config]() {
+        postProgressChanged(owner, 0);
 
         // Pass 1: Audio energy (0-30%)
         auto audioScores = analyzeAudioEnergy(filePath, config);
-        emit progressChanged(30);
+        if (aiHighlightInterrupted())
+            return;
+        postProgressChanged(owner, 30);
 
         // Pass 2: Motion activity (30-60%)
         auto motionScores = analyzeMotionActivity(filePath, config);
-        emit progressChanged(60);
+        if (aiHighlightInterrupted())
+            return;
+        postProgressChanged(owner, 60);
 
         // Pass 3: Scene changes (60-80%)
         auto sceneScores = analyzeSceneChanges(filePath, config);
-        emit progressChanged(80);
+        if (aiHighlightInterrupted())
+            return;
+        postProgressChanged(owner, 80);
 
         // Combine and select (80-100%)
         auto allHighlights = combineScores(audioScores, motionScores, sceneScores, config);
         auto selected = selectTopHighlights(allHighlights, config);
-        emit progressChanged(100);
+        if (aiHighlightInterrupted())
+            return;
+        postProgressChanged(owner, 100);
 
-        emit analysisComplete(selected);
+        postAnalysisComplete(owner, selected);
     });
-    connect(thread, &QThread::finished, thread, &QThread::deleteLater);
+    trackAIHighlightThread(this, thread);
     thread->start();
 }
 
@@ -141,6 +234,11 @@ QVector<ScoredSegment> AIHighlight::analyzeMotionActivity(const QString &filePat
         decCtx->width, decCtx->height, decCtx->pix_fmt,
         cmpW, cmpH, AV_PIX_FMT_GRAY8,
         SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
+    if (!swsCtx) {
+        avcodec_free_context(&decCtx);
+        avformat_close_input(&fmtCtx);
+        return scores;
+    }
 
     AVPacket *packet = av_packet_alloc();
     AVFrame *frame = av_frame_alloc();
@@ -157,14 +255,14 @@ QVector<ScoredSegment> AIHighlight::analyzeMotionActivity(const QString &filePat
     int skipInterval = qMax(1, static_cast<int>(fps / config.motionSampleFps));
     int frameCount = 0;
 
-    while (av_read_frame(fmtCtx, packet) >= 0) {
+    while (!aiHighlightInterrupted() && av_read_frame(fmtCtx, packet) >= 0) {
         if (packet->stream_index != videoIdx) {
             av_packet_unref(packet);
             continue;
         }
 
         if (avcodec_send_packet(decCtx, packet) == 0) {
-            while (avcodec_receive_frame(decCtx, frame) == 0) {
+            while (!aiHighlightInterrupted() && avcodec_receive_frame(decCtx, frame) == 0) {
                 frameCount++;
                 if (frameCount % skipInterval != 0) continue;
 
@@ -253,6 +351,11 @@ QVector<ScoredSegment> AIHighlight::analyzeSceneChanges(const QString &filePath,
         decCtx->width, decCtx->height, decCtx->pix_fmt,
         cmpW, cmpH, AV_PIX_FMT_GRAY8,
         SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
+    if (!swsCtx) {
+        avcodec_free_context(&decCtx);
+        avformat_close_input(&fmtCtx);
+        return scores;
+    }
 
     AVPacket *packet = av_packet_alloc();
     AVFrame *frame = av_frame_alloc();
@@ -266,14 +369,14 @@ QVector<ScoredSegment> AIHighlight::analyzeSceneChanges(const QString &filePath,
     // Check every 5 frames (same as AutoEdit default)
     int checkInterval = 5;
 
-    while (av_read_frame(fmtCtx, packet) >= 0) {
+    while (!aiHighlightInterrupted() && av_read_frame(fmtCtx, packet) >= 0) {
         if (packet->stream_index != videoIdx) {
             av_packet_unref(packet);
             continue;
         }
 
         if (avcodec_send_packet(decCtx, packet) == 0) {
-            while (avcodec_receive_frame(decCtx, frame) == 0) {
+            while (!aiHighlightInterrupted() && avcodec_receive_frame(decCtx, frame) == 0) {
                 frameCount++;
                 if (frameCount % checkInterval != 0) continue;
 
@@ -529,9 +632,10 @@ QVector<Highlight> AIHighlight::selectTopHighlights(const QVector<Highlight> &al
 void AIHighlight::exportHighlightReel(const QString &inputPath, const QString &outputPath,
                                        const QVector<Highlight> &highlights)
 {
-    auto *thread = QThread::create([this, inputPath, outputPath, highlights]() {
+    QPointer<AIHighlight> owner(this);
+    auto *thread = QThread::create([owner, inputPath, outputPath, highlights]() {
         if (highlights.isEmpty()) {
-            emit exportComplete(false, "No highlights to export");
+            postExportComplete(owner, false, "No highlights to export");
             return;
         }
 
@@ -540,7 +644,7 @@ void AIHighlight::exportHighlightReel(const QString &inputPath, const QString &o
         QTemporaryFile concatFile;
         concatFile.setAutoRemove(true);
         if (!concatFile.open()) {
-            emit exportComplete(false, "Failed to create temporary file");
+            postExportComplete(owner, false, "Failed to create temporary file");
             return;
         }
 
@@ -590,20 +694,26 @@ void AIHighlight::exportHighlightReel(const QString &inputPath, const QString &o
         ffmpeg.start("ffmpeg", args);
 
         if (!ffmpeg.waitForStarted(5000)) {
-            emit exportComplete(false, "Failed to start ffmpeg");
+            postExportComplete(owner, false, "Failed to start ffmpeg");
             return;
         }
 
-        ffmpeg.waitForFinished(-1); // wait indefinitely
+        while (!ffmpeg.waitForFinished(100)) {
+            if (aiHighlightInterrupted()) {
+                ffmpeg.kill();
+                ffmpeg.waitForFinished(5000);
+                return;
+            }
+        }
 
         bool success = (ffmpeg.exitCode() == 0);
         QString message = success
             ? QString("Highlight reel exported: %1").arg(outputPath)
             : QString("Export failed: %1").arg(QString::fromUtf8(ffmpeg.readAllStandardError()));
 
-        emit exportComplete(success, message);
+        postExportComplete(owner, success, message);
     });
-    connect(thread, &QThread::finished, thread, &QThread::deleteLater);
+    trackAIHighlightThread(this, thread);
     thread->start();
 }
 

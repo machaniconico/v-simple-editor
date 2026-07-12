@@ -642,6 +642,8 @@ void ProxyManager::cancelGeneration()
 {
     m_cancelRequested = true;
     m_queue.clear();
+    const QString cancelledClipName = m_currentClipName;
+    const bool hadProcess = (m_process != nullptr);
     if (m_process) {
         // Detach the finished/readyRead lambdas first — without this, the
         // old QProcess emits finished() (synchronously when terminate +
@@ -671,6 +673,9 @@ void ProxyManager::cancelGeneration()
     m_currentClipName.clear();
     m_currentSourceDurationUs = 0;
     m_currentStderrBuffer.clear();
+
+    if (hadProcess)
+        emit proxyCancelled(cancelledClipName);
 }
 
 void ProxyManager::parseFfmpegProgress(const QByteArray &chunk)

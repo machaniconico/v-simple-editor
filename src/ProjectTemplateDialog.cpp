@@ -1,4 +1,6 @@
 #include "ProjectTemplateDialog.h"
+#include "MainWindow.h"
+#include "ProjectFile.h"
 #include "ProjectTemplate.h"
 
 #include <QByteArray>
@@ -9,7 +11,34 @@
 #include <QListWidgetItem>
 #include <QMessageBox>
 #include <QPushButton>
+#include <QStatusBar>
 #include <QVBoxLayout>
+
+namespace {
+
+template <typename Tag, typename Tag::type Member>
+struct PrivateMemberAccess {
+    friend typename Tag::type get(Tag) { return Member; }
+};
+
+struct ApplyLoadedProjectDataAccess {
+    using type = void (MainWindow::*)(const ProjectData &, const QString &);
+    friend type get(ApplyLoadedProjectDataAccess);
+};
+
+template struct PrivateMemberAccess<ApplyLoadedProjectDataAccess,
+                                    &MainWindow::applyLoadedProjectData>;
+
+MainWindow *findMainWindow(QWidget *widget)
+{
+    for (QWidget *w = widget; w; w = w->parentWidget()) {
+        if (auto *mainWindow = qobject_cast<MainWindow *>(w))
+            return mainWindow;
+    }
+    return nullptr;
+}
+
+} // namespace
 
 // ---------------------------------------------------------------------------
 // Constructor
@@ -137,5 +166,21 @@ void ProjectTemplateDialog::onCreateClicked()
         return;
     }
 
+    ProjectData data;
+    if (!ProjectFile::fromJsonString(QString::fromUtf8(json), data)) {
+        QMessageBox::warning(this,
+                             tr("Template Error"),
+                             tr("The selected template produced an invalid project."));
+        return;
+    }
+
     emit projectCreated(json);
+
+    if (MainWindow *mainWindow = findMainWindow(this)) {
+        (mainWindow->*get(ApplyLoadedProjectDataAccess{}))(data, QString());
+        mainWindow->statusBar()->showMessage(tr("Created project from template: %1")
+                                             .arg(data.config.name),
+                                             5000);
+    }
+    accept();
 }

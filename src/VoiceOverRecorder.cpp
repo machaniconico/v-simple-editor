@@ -92,7 +92,24 @@ void VoiceOverRecorder::startRecording(const QString &outPath, const QAudioDevic
                             err = QStringLiteral("Audio error occurred.");
                             break;
                         }
-                        stopRecording();
+                        {
+                            QMutexLocker locker(&m_mutex);
+                            if (!m_recording)
+                                return;
+                            m_recording = false;
+                        }
+
+                        m_levelTimer.stop();
+                        if (m_audioSource) {
+                            m_audioSource->stop();
+                            QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents, 100);
+                            delete m_audioSource;
+                            m_audioSource = nullptr;
+                            m_inputDevice = nullptr;
+                        }
+
+                        finalizeWavHeader();
+                        m_outputFile.close();
                         emit recordingFailed(err);
                     }
                 }

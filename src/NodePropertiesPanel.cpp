@@ -14,6 +14,28 @@
 #include <QSpinBox>
 #include <QVBoxLayout>
 
+namespace {
+
+void deleteLayoutItemTree(QLayoutItem *item)
+{
+    if (!item) {
+        return;
+    }
+
+    if (QWidget *widget = item->widget()) {
+        widget->hide();
+        widget->deleteLater();
+    } else if (QLayout *layout = item->layout()) {
+        while (QLayoutItem *child = layout->takeAt(0)) {
+            deleteLayoutItemTree(child);
+        }
+    }
+
+    delete item;
+}
+
+} // namespace
+
 NodePropertiesPanel::NodePropertiesPanel(QWidget *parent)
     : QScrollArea(parent)
 {
@@ -53,11 +75,7 @@ void NodePropertiesPanel::setSelection(NodeGraph *graph, int nodeId)
 void NodePropertiesPanel::clearForm()
 {
     while (m_layout->count() > 0) {
-        QLayoutItem *item = m_layout->takeAt(0);
-        if (item->widget()) {
-            item->widget()->deleteLater();
-        }
-        delete item;
+        deleteLayoutItemTree(m_layout->takeAt(0));
     }
 }
 

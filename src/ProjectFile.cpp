@@ -5,8 +5,209 @@
 #include <QBuffer>
 #include <QFile>
 #include <QJsonDocument>
+#include <QSaveFile>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+
+namespace {
+
+void appendPngU32(QByteArray &bytes, quint32 value)
+{
+    bytes.append(static_cast<char>((value >> 24) & 0xff));
+    bytes.append(static_cast<char>((value >> 16) & 0xff));
+    bytes.append(static_cast<char>((value >> 8) & 0xff));
+    bytes.append(static_cast<char>(value & 0xff));
+}
+
+quint32 readPngU32(const uchar *data)
+{
+    return (static_cast<quint32>(data[0]) << 24)
+        | (static_cast<quint32>(data[1]) << 16)
+        | (static_cast<quint32>(data[2]) << 8)
+        | static_cast<quint32>(data[3]);
+}
+
+quint32 pngCrc32(const QByteArray &bytes)
+{
+    quint32 crc = 0xffffffffu;
+    for (uchar byte : bytes) {
+        crc ^= byte;
+        for (int bit = 0; bit < 8; ++bit) {
+            const quint32 mask = -(crc & 1u);
+            crc = (crc >> 1) ^ (0xedb88320u & mask);
+        }
+    }
+    return crc ^ 0xffffffffu;
+}
+
+void appendPngChunk(QByteArray &png, const char type[4], const QByteArray &payload)
+{
+    appendPngU32(png, static_cast<quint32>(payload.size()));
+    const int chunkStart = png.size();
+    png.append(type, 4);
+    png.append(payload);
+    appendPngU32(png, pngCrc32(png.mid(chunkStart, 4 + payload.size())));
+}
+
+QImage normalizedGrayscale8(const QImage &image)
+{
+    QImage gray = image.format() == QImage::Format_Grayscale8
+        ? image
+        : image.convertToFormat(QImage::Format_Grayscale8);
+    if (gray.isNull())
+        return {};
+
+    QImage compact(gray.width(), gray.height(), QImage::Format_Grayscale8);
+    for (int y = 0; y < gray.height(); ++y) {
+        std::copy_n(gray.constScanLine(y), gray.width(), compact.scanLine(y));
+    }
+    return compact;
+}
+
+QByteArray encodeGrayscalePngFallback(const QImage &image)
+{
+    const QImage gray = normalizedGrayscale8(image);
+    if (gray.isNull() || gray.width() <= 0 || gray.height() <= 0)
+        return {};
+
+    QByteArray raw;
+    raw.reserve((gray.width() + 1) * gray.height());
+    for (int y = 0; y < gray.height(); ++y) {
+        raw.append('\0');
+        raw.append(reinterpret_cast<const char *>(gray.constScanLine(y)), gray.width());
+    }
+
+    QByteArray ihdr;
+    appendPngU32(ihdr, static_cast<quint32>(gray.width()));
+    appendPngU32(ihdr, static_cast<quint32>(gray.height()));
+    ihdr.append(char(8)); // bit depth
+    ihdr.append(char(0)); // grayscale
+    ihdr.append(char(0)); // deflate
+    ihdr.append(char(0)); // adaptive filters
+    ihdr.append(char(0)); // no interlace
+
+    QByteArray idat = qCompress(raw, 9);
+    if (idat.size() <= 4)
+        return {};
+    idat.remove(0, 4);
+
+    QByteArray png;
+    png.append("\x89PNG\r\n\x1a\n", 8);
+    appendPngChunk(png, "IHDR", ihdr);
+    appendPngChunk(png, "IDAT", idat);
+    appendPngChunk(png, "IEND", QByteArray());
+    return png;
+}
+
+int paethPredictor(int left, int above, int upperLeft)
+{
+    const int p = left + above - upperLeft;
+    const int pa = std::abs(p - left);
+    const int pb = std::abs(p - above);
+    const int pc = std::abs(p - upperLeft);
+    if (pa <= pb && pa <= pc)
+        return left;
+    if (pb <= pc)
+        return above;
+    return upperLeft;
+}
+
+QImage decodeGrayscalePngFallback(const QByteArray &png)
+{
+    static constexpr uchar signature[] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'};
+    if (png.size() < 8 || std::memcmp(png.constData(), signature, sizeof(signature)) != 0)
+        return {};
+
+    int width = 0;
+    int height = 0;
+    int bitDepth = 0;
+    int colorType = -1;
+    int compression = -1;
+    int filterMethod = -1;
+    int interlace = -1;
+    QByteArray idat;
+
+    int offset = 8;
+    while (offset + 12 <= png.size()) {
+        const uchar *chunk = reinterpret_cast<const uchar *>(png.constData() + offset);
+        const quint32 length = readPngU32(chunk);
+        if (length > static_cast<quint32>(png.size() - offset - 12))
+            return {};
+        const QByteArray type = png.mid(offset + 4, 4);
+        const QByteArray payload = png.mid(offset + 8, static_cast<int>(length));
+        if (type == "IHDR") {
+            if (payload.size() != 13)
+                return {};
+            const uchar *ihdr = reinterpret_cast<const uchar *>(payload.constData());
+            width = static_cast<int>(readPngU32(ihdr));
+            height = static_cast<int>(readPngU32(ihdr + 4));
+            bitDepth = ihdr[8];
+            colorType = ihdr[9];
+            compression = ihdr[10];
+            filterMethod = ihdr[11];
+            interlace = ihdr[12];
+        } else if (type == "IDAT") {
+            idat.append(payload);
+        } else if (type == "IEND") {
+            break;
+        }
+        offset += 12 + static_cast<int>(length);
+    }
+
+    if (width <= 0 || height <= 0 || bitDepth != 8 || colorType != 0
+        || compression != 0 || filterMethod != 0 || interlace != 0
+        || width > 100000000 / std::max(1, height)) {
+        return {};
+    }
+
+    const int stride = width + 1;
+    const int expectedSize = stride * height;
+    QByteArray compressedWithSize;
+    appendPngU32(compressedWithSize, static_cast<quint32>(expectedSize));
+    compressedWithSize.append(idat);
+    const QByteArray raw = qUncompress(compressedWithSize);
+    if (raw.size() != expectedSize)
+        return {};
+
+    QImage image(width, height, QImage::Format_Grayscale8);
+    QByteArray previous(width, '\0');
+    for (int y = 0; y < height; ++y) {
+        const uchar filter = static_cast<uchar>(raw[y * stride]);
+        const uchar *src = reinterpret_cast<const uchar *>(raw.constData() + y * stride + 1);
+        uchar *dst = image.scanLine(y);
+        for (int x = 0; x < width; ++x) {
+            const int left = x > 0 ? dst[x - 1] : 0;
+            const int above = static_cast<uchar>(previous[x]);
+            const int upperLeft = x > 0 ? static_cast<uchar>(previous[x - 1]) : 0;
+            int predictor = 0;
+            switch (filter) {
+            case 0:
+                predictor = 0;
+                break;
+            case 1:
+                predictor = left;
+                break;
+            case 2:
+                predictor = above;
+                break;
+            case 3:
+                predictor = (left + above) / 2;
+                break;
+            case 4:
+                predictor = paethPredictor(left, above, upperLeft);
+                break;
+            default:
+                return {};
+            }
+            dst[x] = static_cast<uchar>((src[x] + predictor) & 0xff);
+        }
+        previous = QByteArray(reinterpret_cast<const char *>(dst), width);
+    }
+    return image;
+}
+
+}
 
 // --- Timeline marker serialization (Premiere/Resolve parity) ---
 // Free, externally-linked helpers so a follow-up story can wire MainWindow
@@ -52,13 +253,11 @@ QByteArray imageToPngBase64(const QImage &image)
     QBuffer buffer(&pngBytes);
     if (!buffer.open(QIODevice::WriteOnly))
         return {};
-    QImage encoded = image;
-    if (encoded.format() != QImage::Format_Grayscale8
-        && encoded.format() != QImage::Format_Alpha8) {
-        encoded = encoded.convertToFormat(QImage::Format_Grayscale8);
-    }
-    if (!encoded.save(&buffer, "PNG"))
+    QImage encoded = normalizedGrayscale8(image);
+    if (encoded.isNull())
         return {};
+    if (!encoded.save(&buffer, "PNG"))
+        pngBytes = encodeGrayscalePngFallback(encoded);
     return pngBytes.toBase64();
 }
 
@@ -69,7 +268,9 @@ QImage imageFromPngBase64(const QString &encoded)
     const QByteArray pngBytes = QByteArray::fromBase64(encoded.toUtf8());
     QImage image;
     image.loadFromData(pngBytes, "PNG");
-    return image.isNull() ? QImage() : image.convertToFormat(QImage::Format_Grayscale8);
+    if (image.isNull())
+        image = decodeGrayscalePngFallback(pngBytes);
+    return image.isNull() ? QImage() : normalizedGrayscale8(image);
 }
 
 static const int PROJECT_FORMAT_VERSION = 1;
@@ -328,11 +529,15 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
     }
 
     QJsonDocument doc(root);
-    QFile file(filePath);
+    QSaveFile file(filePath);
     if (!file.open(QIODevice::WriteOnly))
         return false;
-    file.write(doc.toJson(QJsonDocument::Indented));
-    return true;
+    const QByteArray json = doc.toJson(QJsonDocument::Indented);
+    if (file.write(json) != json.size()) {
+        file.cancelWriting();
+        return false;
+    }
+    return file.commit();
 }
 
 bool ProjectFile::load(const QString &filePath, ProjectData &data)
@@ -1105,6 +1310,10 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
     obj["duration"] = clip.duration;
     obj["inPoint"] = clip.inPoint;
     obj["outPoint"] = clip.outPoint;
+    if (clip.leadInSec != 0.0)
+        obj["leadInSec"] = clip.leadInSec;
+    if (clip.linkGroup != 0)
+        obj["linkGroup"] = clip.linkGroup;
     obj["speed"] = clip.speed;
     obj["volume"] = clip.volume;
     obj["videoScale"] = clip.videoScale;
@@ -1139,6 +1348,9 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
     if (clip.keyframes.hasAnyKeyframes())
         obj["keyframes"] = keyframeManagerToJson(clip.keyframes);
 
+    if (clip.textManager.count() > 0)
+        obj["textManager"] = TextManager::toJson(clip.textManager.overlays());
+
     if (clip.leadIn.type != TransitionType::None)
         obj["leadIn"] = transitionToJson(clip.leadIn);
     if (clip.trailOut.type != TransitionType::None)
@@ -1162,6 +1374,8 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
     clip.duration = obj["duration"].toDouble();
     clip.inPoint = obj["inPoint"].toDouble();
     clip.outPoint = obj["outPoint"].toDouble();
+    clip.leadInSec = obj["leadInSec"].toDouble(0.0);
+    clip.linkGroup = obj["linkGroup"].toInt(0);
     clip.speed = obj["speed"].toDouble(1.0);
     clip.volume = obj["volume"].toDouble(1.0);
     clip.videoScale = obj["videoScale"].toDouble(1.0);
@@ -1201,6 +1415,9 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
     if (obj.contains("keyframes"))
         clip.keyframes = keyframeManagerFromJson(obj["keyframes"].toObject());
 
+    if (obj.contains("textManager"))
+        clip.textManager.setOverlays(TextManager::fromJson(obj["textManager"].toArray()));
+
     if (obj.contains("leadIn"))
         clip.leadIn = transitionFromJson(obj["leadIn"].toObject());
     if (obj.contains("trailOut"))
@@ -1227,6 +1444,15 @@ QJsonObject ProjectFile::colorCorrectionToJson(const ColorCorrection &cc)
     obj["highlights"] = cc.highlights;
     obj["shadows"] = cc.shadows;
     obj["exposure"] = cc.exposure;
+    obj["liftR"] = cc.liftR;
+    obj["liftG"] = cc.liftG;
+    obj["liftB"] = cc.liftB;
+    obj["gammaR"] = cc.gammaR;
+    obj["gammaG"] = cc.gammaG;
+    obj["gammaB"] = cc.gammaB;
+    obj["gainR"] = cc.gainR;
+    obj["gainG"] = cc.gainG;
+    obj["gainB"] = cc.gainB;
     return obj;
 }
 
@@ -1243,6 +1469,15 @@ ColorCorrection ProjectFile::colorCorrectionFromJson(const QJsonObject &obj)
     cc.highlights = obj["highlights"].toDouble();
     cc.shadows = obj["shadows"].toDouble();
     cc.exposure = obj["exposure"].toDouble();
+    cc.liftR = obj["liftR"].toDouble();
+    cc.liftG = obj["liftG"].toDouble();
+    cc.liftB = obj["liftB"].toDouble();
+    cc.gammaR = obj["gammaR"].toDouble();
+    cc.gammaG = obj["gammaG"].toDouble();
+    cc.gammaB = obj["gammaB"].toDouble();
+    cc.gainR = obj["gainR"].toDouble();
+    cc.gainG = obj["gainG"].toDouble();
+    cc.gainB = obj["gainB"].toDouble();
     return cc;
 }
 

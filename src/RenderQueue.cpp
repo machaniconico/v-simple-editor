@@ -20,6 +20,7 @@ RenderQueue::RenderQueue(QObject *parent)
 RenderQueue::~RenderQueue()
 {
     if (m_process) {
+        QObject::disconnect(m_process, nullptr, this, nullptr);
         m_process->kill();
         m_process->waitForFinished(3000);
         delete m_process;
@@ -130,9 +131,9 @@ void RenderQueue::start()
 
 void RenderQueue::stop()
 {
-    cancelCurrent();
     m_running = false;
     m_paused = false;
+    cancelCurrent();
 }
 
 void RenderQueue::clearCompleted()
@@ -151,7 +152,10 @@ void RenderQueue::clearCompleted()
 
 void RenderQueue::clearAll()
 {
-    if (m_running)
+    const bool hadRunningJob = m_running;
+    m_running = false;
+    m_paused = false;
+    if (hadRunningJob)
         cancelCurrent();
 
     m_jobs.clear();
@@ -189,17 +193,23 @@ void RenderQueue::resumeQueue()
 
 void RenderQueue::cancelCurrent()
 {
-    if (!m_process || m_currentJobIndex < 0)
+    if (!m_process || m_currentJobIndex < 0 || m_currentJobIndex >= m_jobs.size())
         return;
 
-    m_process->kill();
-    m_process->waitForFinished(3000);
-
     RenderJob &j = m_jobs[m_currentJobIndex];
-    j.status = RenderJobStatus::Cancelled;
-    j.endTime = QDateTime::currentDateTime();
-    j.errorMessage = "Cancelled by user";
-    j.error = j.errorMessage;
+    if (j.status == RenderJobStatus::Rendering) {
+        j.status = RenderJobStatus::Cancelled;
+        j.endTime = QDateTime::currentDateTime();
+        j.errorMessage = "Cancelled by user";
+        j.error = j.errorMessage;
+        emit jobsChanged();
+    }
+
+    QProcess *process = m_process;
+    if (process->state() != QProcess::NotRunning) {
+        process->kill();
+        process->waitForFinished(3000);
+    }
 
     // Don't auto-advance; let the process finished handler deal with it
 }
@@ -400,6 +410,11 @@ bool RenderQueue::loadQueue(const QString &filePath)
 
 void RenderQueue::startNextJob()
 {
+    if (!m_running) {
+        m_currentJobIndex = -1;
+        return;
+    }
+
     if (m_paused) {
         m_running = false;
         return;
@@ -440,24 +455,33 @@ void RenderQueue::startNextJob()
     }
 
     m_process = new QProcess(this);
-    m_process->setProcessChannelMode(QProcess::MergedChannels);
+    QProcess *process = m_process;
+    process->setProcessChannelMode(QProcess::MergedChannels);
 
-    connect(m_process, &QProcess::readyReadStandardOutput, this, [this]() {
-        while (m_process->canReadLine()) {
-            QString line = QString::fromUtf8(m_process->readLine()).trimmed();
+    connect(process, &QProcess::readyReadStandardOutput, this, [this, process]() {
+        if (process != m_process)
+            return;
+        while (process->canReadLine()) {
+            QString line = QString::fromUtf8(process->readLine()).trimmed();
             parseFFmpegOutput(line);
         }
     });
 
-    connect(m_process, &QProcess::readyReadStandardError, this, [this]() {
-        while (m_process->canReadLine()) {
-            QString line = QString::fromUtf8(m_process->readLine()).trimmed();
+    connect(process, &QProcess::readyReadStandardError, this, [this, process]() {
+        if (process != m_process)
+            return;
+        while (process->canReadLine()) {
+            QString line = QString::fromUtf8(process->readLine()).trimmed();
             parseFFmpegOutput(line);
         }
     });
 
-    connect(m_process, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
-            this, [this](int exitCode, QProcess::ExitStatus exitStatus) {
+    connect(process, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+            this, [this, process](int exitCode, QProcess::ExitStatus exitStatus) {
+        if (process == m_process)
+            m_process = nullptr;
+        process->deleteLater();
+
         if (m_currentJobIndex < 0 || m_currentJobIndex >= m_jobs.size())
             return;
 
@@ -493,12 +517,13 @@ void RenderQueue::startNextJob()
         if (total > 0)
             emit queueProgress(done * 100 / total);
 
-        // Advance to next job
-        startNextJob();
+        // Advance to next job only while the queue is still running.
+        if (m_running)
+            startNextJob();
     });
 
-    m_process->start("ffmpeg", args);
-    if (!m_process->waitForStarted(5000)) {
+    process->start("ffmpeg", args);
+    if (!process->waitForStarted(5000)) {
         job.status = RenderJobStatus::Failed;
         job.endTime = QDateTime::currentDateTime();
         job.errorMessage = "Failed to start ffmpeg process";
@@ -506,7 +531,11 @@ void RenderQueue::startNextJob()
         emit jobFailed(job.id, job.errorMessage);
         emit jobCompletedUuid(job.uuid, false, job.errorMessage);
         emit jobsChanged();
-        startNextJob();
+        if (process == m_process)
+            m_process = nullptr;
+        process->deleteLater();
+        if (m_running)
+            startNextJob();
     }
 }
 
@@ -572,13 +601,8 @@ QStringList RenderQueue::buildFFmpegArgs(const RenderJob &job) const
         args << "-quality" << "good" << "-cpu-used" << "4";
     }
 
-    // 2-pass VBR support — when job.passes==2 the first pass writes to a
-    // null muxer, the second pass is what produces the final file. Here we
-    // just hint the encoder; orchestrating both runs is left to the caller
-    // / future work (the legacy single-pass path stays the default).
-    if (job.passes == 2 && !isProRes) {
-        args << "-pass" << "2";
-    }
+    // RenderQueue launches one ffmpeg process per job, so encoder two-pass mode
+    // would lack first-pass stats and fail every time.
 
     // Progress reporting
     args << "-progress" << "pipe:1";

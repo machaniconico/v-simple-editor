@@ -1,5 +1,7 @@
 #include "CodecDetector.h"
 
+#include <algorithm>
+
 bool CodecDetector::isEncoderAvailable(const QString &name)
 {
     const AVCodec *codec = avcodec_find_encoder_by_name(name.toUtf8().constData());
@@ -28,6 +30,12 @@ QVector<CodecOption> CodecDetector::availableVideoEncoders()
 
     for (auto &enc : encoders)
         enc.available = isEncoderAvailable(enc.ffmpegName);
+    encoders.erase(std::remove_if(encoders.begin(), encoders.end(),
+                                  [](const CodecOption &enc) {
+                                      return enc.ffmpegName.contains("av1")
+                                             && !enc.available;
+                                  }),
+                   encoders.end());
 
     return encoders;
 }
@@ -79,7 +87,8 @@ QString CodecDetector::bestVideoEncoder(const QString &codecFamily)
         if (isEncoderAvailable("av1_nvenc"))  return "av1_nvenc";
         if (isEncoderAvailable("av1_qsv"))    return "av1_qsv";
         if (isEncoderAvailable("av1_amf"))    return "av1_amf";
-        return "libsvtav1";
+        if (isEncoderAvailable("libsvtav1"))  return "libsvtav1";
+        return bestVideoEncoder("h264");
     }
     if (codecFamily == "vp9") {
         return "libvpx-vp9";

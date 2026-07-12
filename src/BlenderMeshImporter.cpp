@@ -16,6 +16,7 @@
 #include <QtGlobal>
 
 #include <cstring>
+#include <limits>
 
 #if __has_include(<assimp/Importer.hpp>)
 #  include <assimp/Importer.hpp>
@@ -237,19 +238,30 @@ QByteArray readAccessorBytes(const QJsonObject &gltf,
     if (bufferIdx < 0 || bufferIdx >= buffers.data.size()) return {};
 
     const QByteArray &buf = buffers.data[bufferIdx];
-    const int needed = count * compCount * compSize;
-    const int start  = viewByteOff + accByteOff;
-    if (start < 0 || needed <= 0 || start + needed > buf.size()
-        || needed > viewByteLen) {
-        // viewByteLen 0 is technically valid for some files; allow it if the
-        // accessor itself fits inside the buffer.
-        if (start + needed > buf.size()) return {};
+    const qint64 needed = qint64(count) * compCount * compSize;
+    const qint64 start  = qint64(viewByteOff) + accByteOff;
+    if (start < 0 || needed <= 0
+        || needed > std::numeric_limits<qsizetype>::max()
+        || start > buf.size()
+        || needed > qint64(buf.size()) - start) {
+        return {};
     }
+    Q_UNUSED(viewByteLen);
 
     if (outCount)          *outCount = count;
     if (outComponentType)  *outComponentType = compType;
     if (outComponentCount) *outComponentCount = compCount;
-    return QByteArray(buf.constData() + start, needed);
+    return QByteArray(buf.constData() + static_cast<qsizetype>(start),
+                      static_cast<qsizetype>(needed));
+}
+
+bool checkedAccessorElementCount(int count, int componentCount, int *out)
+{
+    if (count <= 0 || componentCount <= 0) return false;
+    const qint64 total = qint64(count) * componentCount;
+    if (total > std::numeric_limits<int>::max()) return false;
+    if (out) *out = static_cast<int>(total);
+    return true;
 }
 
 QVector<float> decodeFloats(const QByteArray &raw, int compType, int count)
@@ -397,11 +409,14 @@ MeshData parseGltfDocument(const QJsonObject &gltf, const QString &path,
     if (posAcc >= 0) {
         int count = 0, ct = 0, cc = 0;
         const QByteArray raw = readAccessorBytes(gltf, buffers, posAcc, &count, &ct, &cc);
-        if (!raw.isEmpty() && cc == 3) {
-            const QVector<float> f = decodeFloats(raw, ct, count * cc);
-            out.vertices.reserve(count);
-            for (int i = 0; i < count; ++i) {
-                out.vertices.append(QVector3D(f[i * 3 + 0], f[i * 3 + 1], f[i * 3 + 2]));
+        int elementCount = 0;
+        if (!raw.isEmpty() && cc == 3 && checkedAccessorElementCount(count, cc, &elementCount)) {
+            const QVector<float> f = decodeFloats(raw, ct, elementCount);
+            if (f.size() == elementCount) {
+                out.vertices.reserve(count);
+                for (int i = 0; i < count; ++i) {
+                    out.vertices.append(QVector3D(f[i * 3 + 0], f[i * 3 + 1], f[i * 3 + 2]));
+                }
             }
         }
     }
@@ -409,11 +424,14 @@ MeshData parseGltfDocument(const QJsonObject &gltf, const QString &path,
     if (normAcc >= 0) {
         int count = 0, ct = 0, cc = 0;
         const QByteArray raw = readAccessorBytes(gltf, buffers, normAcc, &count, &ct, &cc);
-        if (!raw.isEmpty() && cc == 3) {
-            const QVector<float> f = decodeFloats(raw, ct, count * cc);
-            out.normals.reserve(count);
-            for (int i = 0; i < count; ++i) {
-                out.normals.append(QVector3D(f[i * 3 + 0], f[i * 3 + 1], f[i * 3 + 2]));
+        int elementCount = 0;
+        if (!raw.isEmpty() && cc == 3 && checkedAccessorElementCount(count, cc, &elementCount)) {
+            const QVector<float> f = decodeFloats(raw, ct, elementCount);
+            if (f.size() == elementCount) {
+                out.normals.reserve(count);
+                for (int i = 0; i < count; ++i) {
+                    out.normals.append(QVector3D(f[i * 3 + 0], f[i * 3 + 1], f[i * 3 + 2]));
+                }
             }
         }
     }
@@ -421,11 +439,14 @@ MeshData parseGltfDocument(const QJsonObject &gltf, const QString &path,
     if (uvAcc >= 0) {
         int count = 0, ct = 0, cc = 0;
         const QByteArray raw = readAccessorBytes(gltf, buffers, uvAcc, &count, &ct, &cc);
-        if (!raw.isEmpty() && cc == 2) {
-            const QVector<float> f = decodeFloats(raw, ct, count * cc);
-            out.uvs.reserve(count);
-            for (int i = 0; i < count; ++i) {
-                out.uvs.append(QVector2D(f[i * 2 + 0], f[i * 2 + 1]));
+        int elementCount = 0;
+        if (!raw.isEmpty() && cc == 2 && checkedAccessorElementCount(count, cc, &elementCount)) {
+            const QVector<float> f = decodeFloats(raw, ct, elementCount);
+            if (f.size() == elementCount) {
+                out.uvs.reserve(count);
+                for (int i = 0; i < count; ++i) {
+                    out.uvs.append(QVector2D(f[i * 2 + 0], f[i * 2 + 1]));
+                }
             }
         }
     }
@@ -485,7 +506,7 @@ MeshData loadGltf(const QString &path)
 
         // GLB: 12-byte header + chunk(JSON) + optional chunk(BIN).
         if (bytes.size() < 12) return empty;
-        auto rd32 = [&](int offset) {
+        auto rd32 = [&](qsizetype offset) {
             quint32 v;
             std::memcpy(&v, bytes.constData() + offset, 4);
             return qFromLittleEndian(v);
@@ -495,20 +516,25 @@ MeshData loadGltf(const QString &path)
         const quint32 totalLen = rd32(8);
         Q_UNUSED(totalLen);
 
-        int cursor = 12;
+        qsizetype cursor = 12;
         QByteArray jsonBytes;
         QByteArray binBytes;
-        while (cursor + 8 <= bytes.size()) {
+        while (cursor <= bytes.size() - 8) {
             const quint32 chunkLen  = rd32(cursor);
             const quint32 chunkType = rd32(cursor + 4);
             cursor += 8;
-            if (cursor + static_cast<int>(chunkLen) > bytes.size()) break;
-            if (chunkType == kGlbChunkJson) {
-                jsonBytes = QByteArray(bytes.constData() + cursor, chunkLen);
-            } else if (chunkType == kGlbChunkBin) {
-                binBytes = QByteArray(bytes.constData() + cursor, chunkLen);
+            const qint64 chunkLen64 = chunkLen;
+            if (chunkLen64 > std::numeric_limits<qsizetype>::max()
+                || chunkLen64 > qint64(bytes.size()) - cursor) {
+                break;
             }
-            cursor += chunkLen;
+            const qsizetype chunkSize = static_cast<qsizetype>(chunkLen64);
+            if (chunkType == kGlbChunkJson) {
+                jsonBytes = QByteArray(bytes.constData() + cursor, chunkSize);
+            } else if (chunkType == kGlbChunkBin) {
+                binBytes = QByteArray(bytes.constData() + cursor, chunkSize);
+            }
+            cursor += chunkSize;
         }
         if (jsonBytes.isEmpty()) return empty;
 

@@ -6,9 +6,21 @@
 #include <QRegularExpression>
 #include <QFileInfo>
 #include <QFile>
+#include <QMutex>
+#include <QMutexLocker>
 #include <QTextStream>
 #include <algorithm>
 #include <cmath>
+
+namespace {
+
+QMutex &processStateMutex()
+{
+    static QMutex mutex;
+    return mutex;
+}
+
+} // namespace
 
 SpeedRamp::SpeedRamp(QObject *parent)
     : QObject(parent)
@@ -255,32 +267,48 @@ bool SpeedRamp::runFFmpeg(const QStringList &args, int progressBase, int progres
     if (ffmpegBin.isEmpty())
         return false;
 
-    m_process = new QProcess();
+    QProcess *process = new QProcess();
+    {
+        QMutexLocker locker(&processStateMutex());
+        m_process = process;
+    }
 
-    connect(m_process, &QProcess::readyReadStandardError, this, [this, progressBase, progressSpan]() {
-        QString output = m_process->readAllStandardError();
+    connect(process, &QProcess::readyReadStandardError, process, [this, process, progressBase, progressSpan]() {
+        QString output = QString::fromLocal8Bit(process->readAllStandardError());
         parseProgress(output, progressBase, progressSpan);
     });
 
-    m_process->start(ffmpegBin, args);
-    m_process->waitForStarted();
+    process->start(ffmpegBin, args);
+    process->waitForStarted();
+
+    auto isCancelled = [this]() {
+        QMutexLocker locker(&processStateMutex());
+        return m_cancelled;
+    };
+
+    auto cleanupProcess = [this, process]() {
+        {
+            QMutexLocker locker(&processStateMutex());
+            if (m_process == process)
+                m_process = nullptr;
+        }
+        delete process;
+    };
 
     // Poll for completion or cancellation
-    while (!m_process->waitForFinished(200)) {
-        if (m_cancelled) {
-            m_process->kill();
-            m_process->waitForFinished(3000);
-            m_process->deleteLater();
-            m_process = nullptr;
+    while (!process->waitForFinished(200)) {
+        if (isCancelled()) {
+            process->kill();
+            process->waitForFinished(3000);
+            cleanupProcess();
             return false;
         }
     }
 
-    bool success = (m_process->exitStatus() == QProcess::NormalExit
-                    && m_process->exitCode() == 0);
+    bool success = (process->exitStatus() == QProcess::NormalExit
+                    && process->exitCode() == 0);
 
-    m_process->deleteLater();
-    m_process = nullptr;
+    cleanupProcess();
     return success;
 }
 
@@ -289,10 +317,18 @@ bool SpeedRamp::runFFmpeg(const QStringList &args, int progressBase, int progres
 void SpeedRamp::applySpeedRamp(const QString &inputPath, const QString &outputPath,
                                const SpeedRampConfig &config)
 {
-    m_cancelled = false;
+    {
+        QMutexLocker locker(&processStateMutex());
+        m_cancelled = false;
+    }
     m_totalDuration = 0.0;
 
     QThread *thread = QThread::create([this, inputPath, outputPath, config]() {
+        auto isCancelled = [this]() {
+            QMutexLocker locker(&processStateMutex());
+            return m_cancelled;
+        };
+
         emit progressChanged(0);
 
         if (config.points.isEmpty()) {
@@ -325,10 +361,10 @@ void SpeedRamp::applySpeedRamp(const QString &inputPath, const QString &outputPa
 
             bool ok = runFFmpeg(args, 0, 100);
 
-            if (!ok || m_cancelled) {
+            if (!ok || isCancelled()) {
                 QFile::remove(outputPath);
                 emit rampComplete(false,
-                    m_cancelled ? "Speed ramp cancelled" : "FFmpeg processing failed");
+                    isCancelled() ? "Speed ramp cancelled" : "FFmpeg processing failed");
                 return;
             }
 
@@ -386,7 +422,7 @@ void SpeedRamp::applySpeedRamp(const QString &inputPath, const QString &outputPa
         QString concatListPath = tempDir.path() + "/concat_list.txt";
 
         for (int i = 0; i < totalSegments; ++i) {
-            if (m_cancelled) {
+            if (isCancelled()) {
                 emit rampComplete(false, "Speed ramp cancelled");
                 return;
             }
@@ -413,9 +449,9 @@ void SpeedRamp::applySpeedRamp(const QString &inputPath, const QString &outputPa
             m_totalDuration = 0.0;
 
             bool ok = runFFmpeg(args, progressBase, progressSpan);
-            if (!ok || m_cancelled) {
+            if (!ok || isCancelled()) {
                 emit rampComplete(false,
-                    m_cancelled ? "Speed ramp cancelled"
+                    isCancelled() ? "Speed ramp cancelled"
                                 : QString("Failed to process segment %1").arg(i + 1));
                 return;
             }
@@ -451,10 +487,10 @@ void SpeedRamp::applySpeedRamp(const QString &inputPath, const QString &outputPa
 
         bool concatOk = runFFmpeg(concatArgs, 85, 15);
 
-        if (!concatOk || m_cancelled) {
+        if (!concatOk || isCancelled()) {
             QFile::remove(outputPath);
             emit rampComplete(false,
-                m_cancelled ? "Speed ramp cancelled" : "Concatenation failed");
+                isCancelled() ? "Speed ramp cancelled" : "Concatenation failed");
             return;
         }
 
@@ -468,8 +504,6 @@ void SpeedRamp::applySpeedRamp(const QString &inputPath, const QString &outputPa
 
 void SpeedRamp::cancel()
 {
+    QMutexLocker locker(&processStateMutex());
     m_cancelled = true;
-    if (m_process) {
-        m_process->kill();
-    }
 }
