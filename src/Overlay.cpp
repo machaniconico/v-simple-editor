@@ -297,6 +297,7 @@ QImage OverlayRenderer::applyTransition(const QImage &from, const QImage &to,
     int w = qMax(from.width(), to.width());
     int h = qMax(from.height(), to.height());
     QImage result(w, h, QImage::Format_RGB888);
+    result.fill(Qt::black);
     QPainter painter(&result);
 
     QImage fromScaled = from.scaled(w, h, Qt::KeepAspectRatio, Qt::SmoothTransformation);

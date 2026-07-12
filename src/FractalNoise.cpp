@@ -121,9 +121,9 @@ static double noise3D(double x, double y, double z, const PermTable &perm)
 //  Public API
 // ---------------------------------------------------------------------------
 
-double sample(double x, double y, double evolution, const Params &p)
+static double sampleWithPerm(double x, double y, double evolution, const Params &p,
+                             const Detail::PermTable &perm)
 {
-    Detail::PermTable perm = Detail::buildPermTable(p.seed);
     double freq = p.frequency;
     double amp  = 1.0;
     double maxVal = 0.0;
@@ -163,6 +163,12 @@ double sample(double x, double y, double evolution, const Params &p)
     return value;
 }
 
+double sample(double x, double y, double evolution, const Params &p)
+{
+    const Detail::PermTable perm = Detail::buildPermTable(p.seed);
+    return sampleWithPerm(x, y, evolution, p, perm);
+}
+
 QImage render(const QSize &size, double evolution, const Params &p, bool grayscale)
 {
     if (size.isEmpty())
@@ -173,6 +179,7 @@ QImage render(const QSize &size, double evolution, const Params &p, bool graysca
 
     const int w = size.width();
     const int h = size.height();
+    const Detail::PermTable perm = Detail::buildPermTable(p.seed);
 
     if (grayscale) {
         for (int y = 0; y < h; ++y) {
@@ -180,7 +187,7 @@ QImage render(const QSize &size, double evolution, const Params &p, bool graysca
             for (int x = 0; x < w; ++x) {
                 double nx = static_cast<double>(x) / static_cast<double>(w);
                 double ny = static_cast<double>(y) / static_cast<double>(h);
-                double v = sample(nx, ny, evolution, p);
+                double v = sampleWithPerm(nx, ny, evolution, p, perm);
                 // Clamp to [0,1] then quantise — matches sample()'s pre-quantization value
                 if (v < 0.0) v = 0.0;
                 if (v > 1.0) v = 1.0;
@@ -200,7 +207,7 @@ QImage render(const QSize &size, double evolution, const Params &p, bool graysca
             for (int x = 0; x < w; ++x) {
                 double nx = static_cast<double>(x) / static_cast<double>(w);
                 double ny = static_cast<double>(y) / static_cast<double>(h);
-                double v = sample(nx, ny, evolution, p);
+                double v = sampleWithPerm(nx, ny, evolution, p, perm);
                 if (v < 0.0) v = 0.0;
                 if (v > 1.0) v = 1.0;
 
