@@ -1,11 +1,19 @@
 #include "LoudnessMaster.h"
 
+#include <QDebug>
 #include <QFile>
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <limits>
+
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavutil/channel_layout.h>
+#include <libswresample/swresample.h>
+}
 
 namespace loudness {
 
@@ -35,6 +43,8 @@ double presetTargetLufs(LoudnessPreset p)
 // ---------------------------------------------------------------------------
 namespace {
 
+const double kMeasurementFailed = std::numeric_limits<double>::quiet_NaN();
+
 // Direct-form-I biquad. ITU-R BS.1770-4 K-weighting (a0 normalized to 1).
 struct Biquad {
     double b0, b1, b2, a1, a2;
@@ -50,6 +60,141 @@ struct Biquad {
         return y;
     }
 };
+
+struct DecodeContext {
+    AVFormatContext *fmt = nullptr;
+    AVCodecContext *codec = nullptr;
+    SwrContext *swr = nullptr;
+    AVPacket *packet = nullptr;
+    AVFrame *frame = nullptr;
+    int streamIndex = -1;
+
+    ~DecodeContext()
+    {
+        if (frame) {
+            av_frame_free(&frame);
+        }
+        if (packet) {
+            av_packet_free(&packet);
+        }
+        if (swr) {
+            swr_free(&swr);
+        }
+        if (codec) {
+            avcodec_free_context(&codec);
+        }
+        if (fmt) {
+            avformat_close_input(&fmt);
+        }
+    }
+};
+
+bool appendDecodedFrames(DecodeContext &ctx, QVector<float> &mono)
+{
+    QVector<float> converted;
+    bool decodedAny = false;
+
+    while (avcodec_receive_frame(ctx.codec, ctx.frame) == 0) {
+        const int outSamples = swr_get_out_samples(ctx.swr, ctx.frame->nb_samples);
+        if (outSamples <= 0) {
+            av_frame_unref(ctx.frame);
+            continue;
+        }
+
+        converted.resize(outSamples);
+        uint8_t *outData = reinterpret_cast<uint8_t *>(converted.data());
+        const int got = swr_convert(ctx.swr,
+                                    &outData,
+                                    outSamples,
+                                    const_cast<const uint8_t **>(ctx.frame->extended_data),
+                                    ctx.frame->nb_samples);
+        av_frame_unref(ctx.frame);
+        if (got <= 0) {
+            continue;
+        }
+
+        const int oldSize = mono.size();
+        mono.resize(oldSize + got);
+        std::copy(converted.constData(), converted.constData() + got, mono.data() + oldSize);
+        decodedAny = true;
+    }
+
+    return decodedAny;
+}
+
+bool decodeAudioFileToMono(const QString &audioPath, QVector<float> &mono, int &sampleRate)
+{
+    DecodeContext ctx;
+    if (avformat_open_input(&ctx.fmt, audioPath.toUtf8().constData(), nullptr, nullptr) < 0) {
+        return false;
+    }
+    if (avformat_find_stream_info(ctx.fmt, nullptr) < 0) {
+        return false;
+    }
+
+    ctx.streamIndex = av_find_best_stream(ctx.fmt, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+    if (ctx.streamIndex < 0) {
+        return false;
+    }
+
+    AVCodecParameters *params = ctx.fmt->streams[ctx.streamIndex]->codecpar;
+    const AVCodec *decoder = avcodec_find_decoder(params->codec_id);
+    if (!decoder) {
+        return false;
+    }
+
+    ctx.codec = avcodec_alloc_context3(decoder);
+    if (!ctx.codec || avcodec_parameters_to_context(ctx.codec, params) < 0) {
+        return false;
+    }
+    if (ctx.codec->ch_layout.nb_channels <= 0 && params->ch_layout.nb_channels > 0) {
+        av_channel_layout_copy(&ctx.codec->ch_layout, &params->ch_layout);
+    }
+    if (avcodec_open2(ctx.codec, decoder, nullptr) < 0) {
+        return false;
+    }
+    if (ctx.codec->sample_rate <= 0 || ctx.codec->ch_layout.nb_channels <= 0) {
+        return false;
+    }
+
+    AVChannelLayout monoLayout = AV_CHANNEL_LAYOUT_MONO;
+    if (swr_alloc_set_opts2(&ctx.swr,
+                            &monoLayout,
+                            AV_SAMPLE_FMT_FLT,
+                            ctx.codec->sample_rate,
+                            &ctx.codec->ch_layout,
+                            ctx.codec->sample_fmt,
+                            ctx.codec->sample_rate,
+                            0,
+                            nullptr) < 0) {
+        return false;
+    }
+    if (!ctx.swr || swr_init(ctx.swr) < 0) {
+        return false;
+    }
+
+    ctx.packet = av_packet_alloc();
+    ctx.frame = av_frame_alloc();
+    if (!ctx.packet || !ctx.frame) {
+        return false;
+    }
+
+    bool decodedAny = false;
+    while (av_read_frame(ctx.fmt, ctx.packet) >= 0) {
+        if (ctx.packet->stream_index == ctx.streamIndex &&
+            avcodec_send_packet(ctx.codec, ctx.packet) == 0) {
+            decodedAny = appendDecodedFrames(ctx, mono) || decodedAny;
+        }
+        av_packet_unref(ctx.packet);
+    }
+
+    if (avcodec_send_packet(ctx.codec, nullptr) == 0) {
+        decodedAny = appendDecodedFrames(ctx, mono) || decodedAny;
+    }
+
+    sampleRate = ctx.codec->sample_rate;
+    return decodedAny && !mono.isEmpty();
+}
 
 } // namespace
 
@@ -180,12 +325,15 @@ double measureIntegratedLufs(const QString &audioPath)
         return -23.0;
     }
 
-    // Compressed/container decoding is not wired here; a later integration
-    // story routes this through the project's decoder facilities.
-    qWarning("loudness::measureIntegratedLufs: audio decoding not wired for "
-             "'%s'; returning broadcast fallback (-23.0 LUFS)",
-             qUtf8Printable(audioPath));
-    return -23.0;
+    QVector<float> mono;
+    int sampleRate = 0;
+    if (!decodeAudioFileToMono(audioPath, mono, sampleRate)) {
+        qWarning("loudness::measureIntegratedLufs: failed to decode '%s'",
+                 qUtf8Printable(audioPath));
+        return kMeasurementFailed;
+    }
+
+    return measureIntegratedLufsFromSamples(mono, sampleRate);
 }
 
 } // namespace loudness

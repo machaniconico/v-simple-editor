@@ -1,5 +1,6 @@
 #include "LoudnessAnalyzer.h"
 
+#include <QHash>
 #include <QJsonArray>
 
 #include <algorithm>
@@ -13,6 +14,53 @@ constexpr double kNoSignalDbtp = -120.0;
 constexpr int kMomentarySteps = 4;   // 400 ms with 100 ms hop size.
 constexpr int kShortTermSteps = 30;  // 3 s with 100 ms hop size.
 constexpr double kPi = 3.14159265358979323846;
+constexpr int kTruePeakFirRadius = 4;
+constexpr int kTruePeakFirTaps = kTruePeakFirRadius * 2;
+
+struct TruePeakHistory {
+    std::array<double, kTruePeakFirTaps> samples{};
+    int filled = 0;
+};
+
+QHash<const LoudnessAnalyzer *, QVector<TruePeakHistory>> &truePeakHistories()
+{
+    static QHash<const LoudnessAnalyzer *, QVector<TruePeakHistory>> histories;
+    return histories;
+}
+
+double sinc(double x)
+{
+    if (std::abs(x) < 1.0e-12) {
+        return 1.0;
+    }
+    const double pix = kPi * x;
+    return std::sin(pix) / pix;
+}
+
+double lanczosKernel(double distance)
+{
+    const double x = std::abs(distance);
+    if (x >= static_cast<double>(kTruePeakFirRadius)) {
+        return 0.0;
+    }
+    return sinc(distance) * sinc(distance / static_cast<double>(kTruePeakFirRadius));
+}
+
+double estimateTruePeakBetweenDelayedSamples(const TruePeakHistory &history, double fraction)
+{
+    double value = 0.0;
+    double weightSum = 0.0;
+    for (int i = 0; i < kTruePeakFirTaps; ++i) {
+        const double sampleTime = static_cast<double>(kTruePeakFirRadius - i);
+        const double weight = lanczosKernel(fraction - sampleTime);
+        value += history.samples[i] * weight;
+        weightSum += weight;
+    }
+    if (std::abs(weightSum) > 1.0e-12) {
+        value /= weightSum;
+    }
+    return value;
+}
 
 double absoluteGateEnergy()
 {
@@ -113,6 +161,7 @@ void LoudnessAnalyzer::reset()
     m_currentStepEnergySum = 0.0;
     m_currentStepFrameCount = 0;
     m_maxTruePeakLinear = 0.0;
+    truePeakHistories().remove(this);
     m_channelStates.clear();
     m_recentStepEnergies.clear();
     m_blockEnergies.clear();
@@ -238,6 +287,8 @@ QJsonObject LoudnessAnalyzer::toJson() const
 
 void LoudnessAnalyzer::fromJson(const QJsonObject &json)
 {
+    truePeakHistories().remove(this);
+
     const int sampleRate = json.value(QStringLiteral("sampleRate")).toInt(m_sampleRate);
     if (sampleRate > 0 && sampleRate != m_sampleRate) {
         m_sampleRate = sampleRate;
@@ -438,10 +489,38 @@ void LoudnessAnalyzer::updateTruePeak(double sample, ChannelState &state)
     const double absSample = std::abs(sample);
     m_maxTruePeakLinear = std::max(m_maxTruePeakLinear, absSample);
 
-    if (state.hasLastRawSample) {
-        constexpr std::array<double, 4> fractions{0.25, 0.5, 0.75, 1.0};
+    int channelIndex = -1;
+    if (!m_channelStates.isEmpty()) {
+        const ChannelState *first = m_channelStates.constData();
+        const ChannelState *last = first + m_channelStates.size();
+        if (&state >= first && &state < last) {
+            channelIndex = static_cast<int>(&state - first);
+        }
+    }
+
+    if (channelIndex >= 0) {
+        QVector<TruePeakHistory> &histories = truePeakHistories()[this];
+        if (histories.size() < m_channelStates.size()) {
+            histories.resize(m_channelStates.size());
+        }
+
+        TruePeakHistory &history = histories[channelIndex];
+        if (!state.hasLastRawSample) {
+            history = {};
+        }
+
+        for (int i = kTruePeakFirTaps - 1; i > 0; --i) {
+            history.samples[i] = history.samples[i - 1];
+        }
+        history.samples[0] = sample;
+        history.filled = std::min(history.filled + 1, kTruePeakFirTaps);
+
+        constexpr std::array<double, 3> fractions{0.25, 0.5, 0.75};
         for (double fraction : fractions) {
-            const double interpolated = state.lastRawSample + (sample - state.lastRawSample) * fraction;
+            if (history.filled < kTruePeakFirTaps) {
+                break;
+            }
+            const double interpolated = estimateTruePeakBetweenDelayedSamples(history, fraction);
             m_maxTruePeakLinear = std::max(m_maxTruePeakLinear, std::abs(interpolated));
         }
     }
