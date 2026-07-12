@@ -1,0 +1,107 @@
+[
+ {
+  "file": "src/ProjectFile.cpp",
+  "line": 334,
+  "summary": "ProjectFile::save() opens the existing .veditor with WriteOnly (truncating it), ignores the return value of file.write(), and unconditionally returns true — a failed or partial write silently reports success and destroys the previous good save (no QSaveFile / atomic replace).",
+  "failure_scenario": "Disk becomes full (or the file is on a network share that drops mid-write) while the user hits Save → QFile::open truncates the old project file, write() returns -1 or a short count, save() still returns true → the app reports a successful save, the user closes the editor, and the project file on disk is a 0-byte/truncated JSON that ProjectFile::load() rejects — the entire project is lost.",
+  "severity": "high",
+  "confidence": "high",
+  "category": "data-loss",
+  "i": 19,
+  "v1": {
+   "isReal": true,
+   "reason": "ProjectFile.cpp:331-335 で確認: QFile を WriteOnly で open(QFile では Truncate 含意=既存の正常な保存内容を即破壊)し、file.write() の戻り値と flush/エラーを一切確認せず無条件に true を返す。QSaveFile/temp+rename 不使用。GUI 保存経路 MainWindow::saveProject() (MainWindow.cpp:4171) はこの戻り値だけで「Saved:」を表示しタイトルの変更マークを消すため、ディスクフル/ネットワーク切断時に truncate 済み・部分書き込みのファイルが「保存成功」と報告される。load() (ProjectFile.cpp:344-348) は壊れた JSON を doc.isNull()/version 欠落で拒否するため再読込不能。緩和候補の AutoSave は既定 OFF (MainWindow.cpp:3017 の autoSaveEnabled 既定 false) かつ起動時リカバリファイルをハンドラが黙って削除 (MainWindow.cpp:735-741) するので、既定構成では故障シナリオがそのまま成立する。",
+   "severity": "high",
+   "manualCheck": "保存済みの .veditor ファイルを残り容量ほぼゼロのドライブ(ほぼ満杯のUSBメモリ等)に置いてそのプロジェクトを開き Ctrl+S で上書き保存すると、ステータスバーに「Saved:」と成功表示されるのに、アプリを閉じて同ファイルを再度開くと「Open Failed」になりファイルが0バイト/途中で切れたJSONになっていることで確認できる。"
+  },
+  "v2": {
+   "isReal": true,
+   "reason": "Confirmed at ProjectFile.cpp:530-536 (candidate's line 334 drifted; code matches verbatim): QFile opened WriteOnly (implies Truncate, destroying the previous good save at open), file.write() return value ignored, no flush()/error() check, unconditional return true. Fully reachable from routine UI: Ctrl+S / File menu / toolbar Save button → MainWindow::saveProject() (MainWindow.cpp:4438) → ProjectFile::save() (4448); on the false-positive true it shows \"Saved:\" and clears the dirty title marker, so a disk-full/network-drop/USB-removal mid-write is reported as success. load() (ProjectFile.cpp:538-548) rejects the truncated file (doc.isNull()/missing \"version\"), making the project unrecoverable in-app. Mitigations absent by default: autoSaveEnabled defaults false (MainWindow.cpp:3294, 9227), and even when enabled the recoveryAvailable handler silently deletes recovery files at startup (1010-1016). No QSaveFile/temp+rename anywhere. Trigger requires only an ordinary environmental failure during a normal Ctrl+S — real, not theoretical.",
+   "severity": "high",
+   "manualCheck": "Create and save a project onto a nearly-full filesystem (e.g., a small tmpfs/loop mount: `mount -t tmpfs -o size=64k tmpfs /mnt/tiny`), make edits, press Ctrl+S. Expected buggy behavior: status bar shows \"Saved: ...\" and the title's modified marker clears, but the .veditor file on disk is 0-byte/truncated; File > Open on it then fails with \"Could not load project file.\" Fix verification: after switching to QSaveFile (or temp+rename with checked write/commit), the same operation must show the \"Save Failed\" dialog and leave the previous file intact."
+  }
+ },
+ {
+  "file": "src/ProjectFile.cpp",
+  "line": 1107,
+  "summary": "ClipInfo::leadInSec (the leading gap that positions every clip on its track; used by all Timeline layout/paint/drag math at Timeline.cpp:843/948/1024) is never written in clipToJson nor read in clipFromJson, so all timeline gaps collapse to 0 on load.",
+  "failure_scenario": "User left-trims a clip or drags clips apart to leave gaps (leadInSec > 0), saves the project, reopens it → every clip snaps flush-left against its predecessor; clip start times shift, overlays/subtitles/audio on other tracks no longer line up with the video. Silent layout corruption on every save/load round-trip of any project containing a gap.",
+  "severity": "high",
+  "confidence": "high",
+  "category": "persistence-asymmetry",
+  "i": 28,
+  "v1": {
+   "isReal": true,
+   "reason": "確認済みコードパス: GUIの左トリム/ドラッグで leadInSec>0 が生成され (Timeline.cpp:1709/1766)、保存は MainWindow.cpp:3770 → tracksToJson → clipToJson (ProjectFile.cpp:1100-1155) だが leadInSec キーを一切書かず (書くのは別フィールドの遷移 leadIn のみ、grep で ProjectFile.cpp/h に leadInSec ゼロ件)、読込側 clipFromJson (1157-1213) も設定しないため構造体既定値 0.0 (Timeline.h:66) のまま。restoreFromProject (Timeline.cpp:5313) → setClips (866) は単純代入で他フィールドからの再計算も無く、代替のギャップ永続化も存在しない。よって保存→再読込で全ギャップが 0 に潰れ、指摘どおりのサイレントなレイアウト破壊が必ず起こる。",
+   "severity": "high",
+   "manualCheck": "タイムライン上でクリップを右へドラッグ(または左トリム)して手前に隙間を作り、プロジェクトを保存して開き直すと、隙間が消えてクリップが左詰めに戻ることを確認する。"
+  },
+  "v2": {
+   "isReal": true,
+   "reason": "Reachable via ordinary UI operations and confirmed end-to-end in the call graph. Gap creation: TimelineTrack::mouseMoveEvent positional drag (Timeline.cpp:1709; last clip on a track has no upper clamp since m_dragOriginalLeadInNext=-1, so dragging right freely creates leadInSec>0) and left-trim (Timeline.cpp:1766). Save: Ctrl+S -> MainWindow::saveProject (MainWindow.cpp:4438) -> populateProjectData -> data.videoTracks = m_timeline->allVideoTracks() (4047) -> ProjectFile::save -> tracksToJson -> clipToJson (ProjectFile.cpp:1300), which writes ~15 fields but never leadInSec (the \"leadIn\" key at 1342 is the TransitionType field) and writes no absolute-position field, so nothing exists to reconstruct gaps. Load: clipFromJson (1357) never sets leadInSec (default 0.0, Timeline.h:66) -> Timeline::restoreFromProject (Timeline.cpp:5313) -> setClips, a plain m_clips=clips assignment with no recomputation. Both save/load serializer variants share the same clipToJson/clipFromJson. Result: every gap collapses to 0 on reload; all layout/start-time math accumulates leadInSec (Timeline.cpp:843/948/1024, MainWindow.cpp:3738), so clips shift left and cross-track overlays/subtitles/audio desync silently, irreversibly once saved.",
+   "severity": "high",
+   "manualCheck": "Launch the editor, add two clips to a video track, drag the second clip to the right to open a visible gap (or left-trim a clip so it slides right). Save the project (Ctrl+S), close and reopen the .veditor file: the gap is gone and the clips sit flush against each other; any overlay/subtitle/audio on other tracks no longer lines up. Optionally inspect the saved JSON: each clip object contains inPoint/outPoint/etc. but no leadInSec or any position field."
+  }
+ },
+ {
+  "file": "src/ProjectFile.cpp",
+  "line": 1217,
+  "summary": "colorCorrectionToJson/colorCorrectionFromJson omit the 9 Lift/Gamma/Gain color-wheel fields (liftR..gainB, VideoEffect.h:23-25) that ColorGradingPanel edits, even though ColorCorrection::isDefault() includes them, so wheel grading is silently dropped on save.",
+  "failure_scenario": "User grades a clip using only the Resolve-style Lift/Gamma/Gain wheels (isDefault()==false so a colorCorrection object IS written, just without the wheel keys), saves, reloads → all wheel values read back as 0.0 and the grade is gone, while sliders like brightness survive, so the loss is easy to miss until export.",
+  "severity": "high",
+  "confidence": "high",
+  "category": "persistence-asymmetry",
+  "i": 29,
+  "v1": {
+   "isReal": true,
+   "reason": "全経路をコードで確認: ColorGradingPanel.cpp:777-802 がホイール値を m_cc.liftR..gainB に格納し colorCorrectionChanged(m_cc) を emit → MainWindow.cpp:2554-2559 → Timeline::setClipColorCorrection (Timeline.cpp:3919-3925) が clips[sel].colorCorrection に保存。保存時 ProjectFile.cpp:1129 の isDefault() ゲート (VideoEffect.h:27-35) はホイール9項目を含むため colorCorrection オブジェクトは書き出されるが、colorCorrectionToJson (ProjectFile.cpp:1217-1231) はスライダー10項目のみ書き、liftR..gainB を欠落。colorCorrectionFromJson (1233-1247) も同じ10項目のみ読み、ホイールは 0.0 に戻る。ホイールは VideoEffect.cpp:177-205 の CPU 描画/エクスポート経路にも効くため、再読込後のグレード消失は実際にユーザー可視。指摘どおり再現する。",
+   "severity": "high",
+   "manualCheck": "クリップを選択して色補正パネルの Lift/Gamma/Gain ホイールだけを動かして映像の色が変わったことを確認した後、プロジェクトを保存してアプリを再起動して同じプロジェクトを開き直すと、ホイールが中央(0)に戻りグレーディングが消えている(明るさ等のスライダー値は残る)ことを確認する。"
+  },
+  "v2": {
+   "isReal": true,
+   "reason": "Reachable via normal UI operation, verified at every hop: ColorGradingPanel's three ColorWheelWidget wheels (ColorGradingPanel.cpp:480-494) → onLiftChanged/onGammaWheelChanged/onGainChanged write m_cc.liftR..gainB and emit colorCorrectionChanged (777-802) → MainWindow.cpp:2831-2835 → Timeline::setClipColorCorrection stores on selected clip (Timeline.cpp:3919-3927). On Ctrl+S, clipToJson's isDefault() gate (VideoEffect.h includes all 9 wheel fields) correctly writes a colorCorrection object, but colorCorrectionToJson (ProjectFile.cpp:1417-1431) serializes only the 10 slider fields and colorCorrectionFromJson (1433-1447) reads only those 10, so liftR..gainB silently reload as 0.0. The wheels have real render effect (VideoEffect.cpp:177-205 CPU/export path and preview via m_player->setColorCorrection), so the lost grade is user-visible. No fallback or migration path compensates.",
+   "severity": "high",
+   "manualCheck": "1) Launch the editor, add a clip to the timeline and select it. 2) In the color grading panel, drag any Lift/Gamma/Gain color wheel to a clearly non-neutral value (preview should visibly shift). 3) Save the project (Ctrl+S) and inspect the .veditor JSON: the clip's colorCorrection object exists but contains no liftR/gammaR/gainR keys. 4) Reopen the project: the wheels display neutral (0.0) and the preview/export no longer shows the grade, while slider adjustments (e.g. brightness) made in the same session survive."
+  }
+ },
+ {
+  "file": "src/ProjectFile.cpp",
+  "line": 1153,
+  "summary": "ClipInfo::textManager (per-clip enhanced text overlays added via the text tool, MainWindow.cpp:5113/5947) is not serialized in clipToJson/clipFromJson, and the alternative ProjectData.overlays field that ProjectFile does persist is never populated by populateProjectData (only ProjectCollector touches it), so text overlays have no persistence path at all.",
+  "failure_scenario": "User adds text overlays with the T text tool (stored in clips[0].textManager), saves the project, reopens → textManager.count()==0, every text overlay is gone. Meanwhile save() faithfully writes an always-empty \"overlays\" array, masking the loss.",
+  "severity": "high",
+  "confidence": "high",
+  "category": "persistence-asymmetry",
+  "i": 31,
+  "v1": {
+   "isReal": true,
+   "reason": "保存パス: populateProjectData (MainWindow.cpp:3767) は timeline のトラックを data.videoTracks にコピーし ProjectFile::clipToJson (ProjectFile.cpp:1100-1155) で直列化するが、clipToJson/clipFromJson は textManager を一切読み書きしない (ProjectFile.cpp/.h に TextManager への言及ゼロ)。代替の ProjectData.overlays は save() で JSON 化される (ProjectFile.cpp:113/622) が populateProjectData は data.overlays を設定せず (MainWindow.cpp 全体に代入なし、ProjectCollector.cpp:87 は既存エントリのパス書換のみ)、常に空配列が保存される。読み込み側 applyLoadedProjectData (MainWindow.cpp:3928) も overlayFromJson の結果を timeline に適用しない。一方テキストツール/SRTインポート/字幕適用 (Timeline.cpp:3005, MainWindow.cpp:5113/5947) は clips[0].textManager に格納するため、保存→再オープンでテキストオーバーレイが全損する故障シナリオはコードパス上で完全に成立する。",
+   "severity": "high",
+   "manualCheck": "タイムラインにクリップを配置してテキストツール(テキスト追加)で文字を載せた後、プロジェクトを保存して一度閉じ、同じプロジェクトファイルを開き直すと追加したテキストオーバーレイがすべて消えていることを確認する。"
+  },
+  "v2": {
+   "isReal": true,
+   "reason": "Reachable via ordinary UI: T text tool (MainWindow.cpp:3644) → commit handler → Timeline::addTextOverlayToFirstVideoClip (Timeline.cpp:2997-3010) stores the overlay in clips[0].textManager with real write-back (track->setClips), rendered in preview and consumed by RemotionExport — a live feature. Save path (Ctrl+S → saveProject:4438 → populateProjectData:4044 → ProjectFile::clipToJson:1300-1355) serializes no textManager field, and ProjectFile.cpp/.h contain zero TextManager references; data.overlays is never populated by populateProjectData so an empty overlays array is written. Load path (applyLoadedProjectData:4205 → restoreFromProject with clipFromJson:1357 clips) leaves textManager empty and applies nothing from overlays/subtitleSegments. Therefore save→reopen silently destroys every user-added text overlay. Not theoretical: three UI entry points feed textManager (T tool, text template apply at MainWindow.cpp:9915, subtitle apply), and the T-tool path alone completes the failure. Side note: importSubtitles (5386) and subtitle-gen apply (6224) mutate a copy without write-back, so those two paths lose text even before saving — a related but separate defect.",
+   "severity": "high",
+   "manualCheck": "Build and run the app; add a video clip to the timeline; activate the T text tool, drag a box on the preview, type text, commit (text appears over video); Ctrl+S to save the project file; close and reopen the project. Expected bug: the text overlay is gone (preview shows no text; the Text Overlays info dialog reports 0 overlays; the saved JSON contains an empty \"overlays\" array and no text fields inside any clip object)."
+  }
+ },
+ {
+  "file": "src/ProjectFile.cpp",
+  "line": 1109,
+  "summary": "ClipInfo::linkGroup (non-zero groups keep V/A clips selected/dragged/deleted together, Timeline.cpp:1697) is not serialized in clipToJson/clipFromJson, so all A/V links dissolve on load.",
+  "failure_scenario": "User imports a video whose audio is linked (linkGroup>0), saves, reloads, then drags the video clip → its audio clip no longer follows because linkGroup reloaded as 0, producing silent audio/video desync that only shows up on playback/export.",
+  "severity": "medium",
+  "confidence": "high",
+  "category": "persistence-asymmetry",
+  "i": 63,
+  "v1": {
+   "isReal": true,
+   "reason": "clipToJson (ProjectFile.cpp:1300-1354) と clipFromJson (1357-1413) はどちらも linkGroup を扱わず、ProjectFile.cpp/h に link 情報の別経路シリアライズも無い。ロードは MainWindow::applyLoadedProjectData → Timeline::restoreFromProject (Timeline.cpp:5313) → setClips のみで再リンク補正が無いため、インポート時に allocateLinkGroup (Timeline.cpp:2794/4175/4199) で付与された V/A リンクは再読込で全て linkGroup=0 に落ちる。ドラッグ追従 (Timeline.cpp:1697)・選択同期 (4572)・連動削除 (4641) はすべて linkGroup>0 が条件のため、故障シナリオ(再読込後にビデオをドラッグしても音声が追従せず A/V デシンク)はコードパス上確実に発生する。severity は medium が妥当: クラッシュやファイル破壊は無く右クリック「再同期」で手動復旧可能だが、コア編集の不変条件がサイレントに壊れ書き出しで顕在化する。",
+   "severity": "medium",
+   "manualCheck": "音声付き動画をタイムラインに読み込んでプロジェクトを保存し、アプリを再起動して開き直した後にビデオクリップをドラッグすると、保存前は追従していた音声クリップが動かない(かつ右クリックメニューの「リンク解除」がグレーアウトしている)ことを確認する。"
+  },
+  "v2": null
+ }
+]

@@ -1,0 +1,1055 @@
+{
+ "confirmed": [
+  {
+   "finder": "G01",
+   "file": "src/MainWindow.cpp",
+   "line": 4552,
+   "lens": "③スレッド競合・Qt lifetime (シグナル接続の蓄積→dangling capture)",
+   "severity": "high",
+   "summary": "exportVideo() が呼ばれるたびに Exporter::exportFinished へ新しいラムダ (receiver=this, deleteLater 済み QProgressDialog を capture) を connect し、切断しないため、2 回目以降のエクスポート完了時に旧ラムダが解放済み progress を dereference して UAF する",
+   "failure_scenario": "1回目のエクスポート完了時にラムダが progress->close(); progress->deleteLater() を実行するが、m_exporter への接続 (receiver=this) は残る。ユーザーが2回目の Ctrl+E エクスポートを実行し完了すると、exportFinished が旧ラムダも起動し、削除済み QProgressDialog に対して progress->close() を呼び UAF/クラッシュ。成功/失敗ダイアログも回数分重複表示される。同一パターンが onMobileExport() 内 line 8267 の exportFinished 接続にも存在。progressChanged 側 (receiver=progress) は自動切断されるが exportFinished 側は残る。generateProxies() (line 6714) では同じ問題を disconnect + Qt::SingleShotConnection で明示的に回避しており、このパスだけ未対策であることがコード内コメントからも裏付けられる",
+   "v1": {
+    "refuted": false,
+    "reason": "成立する。m_exporter は MainWindow.cpp:974 で一度だけ生成される長寿命メンバで、exportVideo() (4533-4564) は exportFinished に receiver=this のラムダを disconnect/UniqueConnection/SingleShotConnection なしで毎回 connect する。sender (m_exporter) も context (this=MainWindow) もアプリ寿命なので Qt の自動切断は働かず、接続が蓄積する。1回目完了でラムダが progress->deleteLater() "
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "成立を確認。m_exporter は MainWindow.cpp:974 で一度だけ生成される長寿命メンバで、exportVideo() (4552) は呼ばれるたびに receiver=this のラムダを exportFinished へ追加接続し、どこにも disconnect が無い (grep で m_exporter への disconnect ゼロ)。ラムダは raw pointer で progress を capture し、初回完了時に progress->deleteLater() で破棄。context が this (生存) なので接続は自動切断されず、2回目のエク"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G01",
+   "file": "src/MainWindow.cpp",
+   "line": 5979,
+   "lens": "③スレッド競合・Qt lifetime (Qt::UniqueConnection はラムダに無効)",
+   "severity": "high",
+   "summary": "trackMotion() の MotionTracker::trackingComplete への接続はラムダ+receiver=this のため Qt::UniqueConnection が効かず呼ぶたびに蓄積し、旧ラムダが deleteLater 済み QProgressDialog を capture したまま実行されて UAF する",
+   "failure_scenario": "Track Motion を1回実行し完了 → ラムダ1が progress1->close(); deleteLater() するが接続は残存 (Qt::UniqueConnection は member-function pointer 接続のみ有効で functor には効かない)。2回目の Track Motion で領域を選択し完了すると trackingComplete がラムダ1→ラムダ2の順で配送され、ラムダ1が解放済み progress1 に progress->close() を呼びクラッシュ。クラッシュしない場合でも「トラッキング結果を適用」ダイアログが実行回数分重複して開く。generateProxies() のコメント (line 6708) が『Qt::UniqueConnection は distinct lambda を dedupe しない』と明記しており、このパスは未修正",
+   "v1": {
+    "refuted": false,
+    "reason": "シナリオは成立する。src/MainWindow.cpp:5946-5947 で m_motionTracker は一度生成後に再利用され、5979 の trackingComplete 接続は context=this + 新規ラムダ + Qt::UniqueConnection。UniqueConnection は functor/ラムダを dedupe しない(distinct closure は QSlotObjectBase::compare で不一致)ため実行ごとに接続が蓄積する。同ファイル generateProxies() (~6706-6712) のコメントがこの Qt 意味"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "成立する。src/MainWindow.cpp:5979 の connect はラムダ (functor) + context=this のため Qt::UniqueConnection が無効 (Qt 仕様: PMF 接続のみ dedupe。同ファイル generateProxies の 6711-6714 コメント+upfront disconnect がこの制約を自認) で、trackMotion 実行のたびに接続が蓄積する。m_motionTracker は一度生成後 MainWindow 寿命まで生存し (5946-5947)、MainWindow.cpp 全体に m_motionT"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G01",
+   "file": "src/MainWindow.cpp",
+   "line": 5431,
+   "lens": "⑥データ損失・エラー握りつぶし (結果を捨てる呼び出し)",
+   "severity": "medium",
+   "summary": "importSubtitles() は videoClips() の値コピー (auto clips = ...) の textManager に字幕を追加するだけで Timeline に書き戻さないため、SRT/VTT インポートが完全な no-op なのに『Imported N subtitle(s)』と成功報告する",
+   "failure_scenario": "ユーザーが 挿入→字幕をインポート で .srt を選ぶと、TextManager::importSRT は成功し overlays が得られるが、`auto clips = m_timeline->videoClips()` は const ref (Timeline.h:470) からのデタッチされたコピーで、`clips[0].textManager.addOverlay(o)` はコピーのみ変更。コメント『// Update via timeline』の実装 (setClips / addTextOverlayToFirstVideoClip 呼び出し) が欠落しているため、プレビューにもタイムラインにも保存データにも字幕は一切現れないまま status bar は成功件数を表示する",
+   "v1": {
+    "refuted": false,
+    "reason": "成立を確認。Timeline.h:470 の videoClips() は const QVector<ClipInfo>& を返し、MainWindow.cpp:5431 の `auto clips = ...` は値コピー。非 const clips[0] で QVector がデタッチし、TextManager は QVector<EnhancedTextOverlay> を値メンバ保持(TextManager.h:221)で addOverlay は append のみ(TextManager.cpp:79)のため、変更はローカルコピーに閉じて関数末尾で破棄される。コメント『// Up"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "成立を確認。videoClips() は const QVector<ClipInfo>& (Timeline.h:470) で、`auto clips = ...` (MainWindow.cpp:5431) は値コピー。非 const の clips[0] で QVector は detach するため、clips[0].textManager.addOverlay(o) はデタッチ済みローカルコピーのみ変更する。ClipInfo::textManager は値メンバ (Timeline.h:109)、TextManager も m_overlays を値保持 (TextManager.h"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G01",
+   "file": "src/MainWindow.cpp",
+   "line": 6265,
+   "lens": "⑥データ損失・エラー握りつぶし",
+   "severity": "medium",
+   "summary": "generateSubtitles() の『Apply to clip as text overlays』も videoClips() のデタッチコピーに addOverlay するだけで書き戻さず、Whisper で生成した字幕が全て破棄される。さらに m_subtitleSegments に結果を保存しないため renderSubtitleTrack() の自動チェーンも恒久的に失敗する",
+   "failure_scenario": "数分かかる Whisper 認識完了後に『Apply to clip as text overlays』を選ぶと、line 6265-6269 で `auto clips = m_timeline->videoClips();` のコピーにのみ overlay が追加され破棄。『Applied N subtitle overlay(s)』と表示されるが動画には何も付かない。また generationComplete ハンドラは m_subtitleSegments を更新しないので、配信向け→字幕トラックを生成 (renderSubtitleTrack, line 10763) は generateSubtitles() を呼んだ直後 (非同期完了前かつ完了後も空のまま) に『字幕セグメントがありません』で常に終了する。m_subtitleSegments への代入はプロジェクトロード時 (line 4327) のみ",
+   "v1": {
+    "refuted": false,
+    "reason": "成立を確認。(1) Timeline.h:470 の videoClips() は const QVector<ClipInfo>& を返すが、MainWindow.cpp:6265 の `auto clips = ...` は値コピー (auto は参照を剥がす)。非 const `clips[0]` で detach し、textManager (ClipInfo に値保持、TextManager.h:221 の m_overlays も値保持) への addOverlay はローカルコピーのみ変更、書き戻しは無く lambda 終了で破棄。Timeline.h:487-490 には「se"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "成立を確認。(1) Timeline.h:470 で videoClips() は const QVector<ClipInfo>& を返すが、MainWindow.cpp:6265 の `auto clips = ...` は値コピーに推論される。ClipInfo::textManager は値メンバ (Timeline.h:109)、TextManager は QVector<EnhancedTextOverlay> を値保持 (TextManager.h:222) でポインタ間接なし。非 const の clips[0] アクセスで COW detach し、addOverlay (Te"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G01",
+   "file": "src/MainWindow.cpp",
+   "line": 2120,
+   "lens": "⑤ロジック欠陥 (パラメータの意味取り違え)",
+   "severity": "medium",
+   "summary": "BGM 自動ダッキングメニューが AutoDuckParams の検出しきい値 thresholdDb をダッキング量として使用 (duckGain = 10^(thresholdDb/20)) しており、ratio は未使用。しきい値を下げるほど BGM が過剰に減衰する",
+   "failure_scenario": "AudioMixer::AutoDuckParams.thresholdDb は Auto-Duck Settings ダイアログ (line 9594-9600) で『Threshold』(-60..0 dB、ボイス検出レベル) としてユーザーが編集する値。しかしメニューハンドラ (line 2120) はこれを減衰ゲインに変換して Timeline::applyDuckingFromTrack に渡す。既定 -20dB でも BGM は 0.1 倍 (-20dB) に落ち、コメントの『-12 dB envelope (Premiere defaults)』と不一致。ユーザーが小声も検出しようと threshold を -60dB にすると duckGain=0.001 で BGM がほぼ無音化する。減衰量を決めるべき ratio フィールドはこのパスで一切参照されない",
+   "v1": {
+    "refuted": false,
+    "reason": "成立を確認。MainWindow.cpp:2117-2126 で mixer が存在する通常経路は duckGain=10^(thresholdDb/20) を Timeline::applyDuckingFromTrack に渡す。thresholdDb は設定ダイアログ (9593-9609) で「Threshold -60..0 dB」として編集される検出しきい値であり、同一コードベースの正規実装 AudioDucking.h/cpp では thresholdDb=検出レベル・targetReductionDb=-12dB=減衰量と明確に分離されている。AutoDuckParams.ra"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "成立を確認。MainWindow.cpp:2120 は autoDuckParams().thresholdDb (Auto-Duck Settings ダイアログ line 9594-9600 で -60..0 dB の「Threshold」として編集・setAutoDuckParams で -60..0 に clamp) を duckGain=10^(thresholdDb/20) に変換し Timeline::applyDuckingFromTrack (Timeline.cpp:2587) へ渡す。同関数は qBound(0.0, duckGain, 2.0) のみで 0.001 をそ"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G01",
+   "file": "src/MainWindow.cpp",
+   "line": 7880,
+   "lens": "⑤ロジック欠陥 (座標系/単位不一致)",
+   "severity": "medium",
+   "summary": "onSceneCutDetect() はソースファイル先頭基準のカット時刻 (ms) を clip.inPoint と clip.speed を無視して timelineSec = clipStartSec + ms/1000 でタイムラインへ写像するため、トリム済み/速度変更済みクリップではマーカー・分割位置がずれる",
+   "failure_scenario": "SceneCutScanner::scanFile はファイル全体を 0 秒からスキャンし acceptedCutTimestampsMs はソース時刻を返す。inPoint=10s にトリムしたクリップでソース 12s にカットがある場合、正しくは clipStart+(12-10)/speed = clipStart+2s だが、コードは clipStart+12s にマーカー/分割を置く (AddMarkers: line 7878-7885, SplitClip: line 7899-7904)。トリムした全クリップで検出位置が inPoint 分後ろへずれ、クリップ範囲外への分割やマーカー配置になる",
+   "v1": {
+    "refuted": false,
+    "reason": "成立。SceneCutScanner::doScan はファイル先頭 (frame 0) から全フレームをデコードし、SceneDetector が timeUs = frameIndex*1e6/fps を発行するためタイムスタンプは純粋なソース時刻 (SceneCutScanner.cpp:83-318, SceneDetector.cpp:84)。SceneCutDialog は (clipPath, fps) しか受け取らず acceptedCutTimestampsMs() は us/1000 を無変換で返す (SceneCutDialog.cpp:206) ので inPoint/s"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "成立を確認。SceneDetector.cpp:84 が timeUs=frameIndex*1e6/fps でファイル先頭基準の時刻を生成し、SceneCutScanner::doScan はファイル全体を frame 0 から走査(inPoint への seek なし)、SceneCutDialog::acceptedCutTimestampsMs は us/1000 のみで補正なし。MainWindow.cpp:7879-7880/7900-7901 は timelineSec = clipStartSec + ms/1000 で inPoint と speed を両方無視する。Clip"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G01",
+   "file": "src/MainWindow.cpp",
+   "line": 7292,
+   "lens": "⑦GUI フリーズ",
+   "severity": "medium",
+   "summary": "addParticleEffect() が GUI スレッドでパーティクル全フレームのレンダリング・PNG 書き出しに続けて ffmpeg.waitForFinished(-1) を呼び、エンコード完了まで UI を無期限にブロックする",
+   "failure_scenario": "コンポジション→パーティクルエフェクト追加 で長いクリップを選択していると durationSec = クリップ実効長 (上限なし) となり、renderParticleSequence で数百〜数千フレームを同期レンダリング→各フレームを PNG 保存→QProcess::waitForFinished(-1) (line 7292) で ffmpeg エンコードを無期限待機。この間イベントループが止まりウィンドウは『応答なし』になる。キャンセル手段もない。さらに line 7262 の tempDir.setAutoRemove(false) により連番 PNG と mp4 が一時ディレクトリに永久残留する",
+   "v1": {
+    "refuted": false,
+    "reason": "成立を確認。addParticleEffect() の唯一の呼び出し元は GUI スレッドの QAction (MainWindow.cpp:2790)。durationSec は clips[selectedIdx].effectiveDuration() (=(out-inPoint)/speed、上限なし・slow-motion で更に増大) を qMax(0.5, ...) で下限のみ制限 (7237-7238)。renderParticleSequence (ParticleSystem.cpp:398-458) は frameCount=(endTime-startTime)*fp"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "成立を確認 (反証失敗)。(1) 呼び出し元は MainWindow.cpp:2790 の QAction::triggered→addParticleEffect のみで GUI スレッド実行が確定。(2) line 7238 durationSec=qMax(0.5, effectiveDuration()) は下限のみで上限なし (Timeline.h:124 の (out-in)/speed)。(3) ParticleSystem::renderParticleSequence (ParticleSystem.cpp:398-458) は frameCount=(end-start)*"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G01",
+   "file": "src/MainWindow.cpp",
+   "line": 10742,
+   "lens": "⑤ロジック欠陥 + 未初期化データ (結果が export に流入)",
+   "severity": "medium",
+   "summary": "openSmartReframe() は未初期化の QImage (fill なしの Format_RGB888) を analyzeFrame に渡して『解析完了』と報告し、そのゴミ由来のクロップトラックを m_exporter->setSmartReframe で実エクスポートに接続する",
+   "failure_scenario": "配信向け→スマートリフレーム を実行すると、line 10742 の `QImage dummyFrame(w, h, Format_RGB888)` は QImage コンストラクタがピクセルを初期化しないため未初期化ヒープの内容がフレームとして SmartReframe::analyzeFrame に渡る (コメント自身が dummy と明記)。motionWeight に基づく被写体追跡は未定義メモリに反応してクロップ矩形が実行ごとに不定に動き、m_exporter->setSmartReframe(&m_smartReframe) (line 10749) 経由で次回エクスポートの縦動画クロップに適用される。ユーザーには『N フレーム解析完了 (crop@0s: ...)』と成功表示されるため、書き出し結果の不定なフレーミングの原因が判別できない。ループ内の m_player->seek + processEvents (line 10738-10739) も実フレームを取得しない無意味な GUI 操作",
+   "v1": {
+    "refuted": false,
+    "reason": "反証失敗 — 成立経路をコードで全リンク確認した。(1) 到達性: MainWindow.cpp:2762-2763 で streamMenu「スマートリフレーム (縦/正方形)...」→ openSmartReframe() に接続済みで、ダイアログ Accept + タイムラインにクリップ有りだけで line 10735-10744 のループに到達する。(2) 未初期化読み取りは実在: line 10742 の QImage(w,h,Format_RGB888) は Qt 仕様でピクセル未初期化のまま、fill は一切呼ばれず、analyzeFrame (SmartReframe.cpp:"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "成立を確認。MainWindow.cpp:10742 の QImage(w,h,Format_RGB888) は fill なし=Qt 仕様でピクセル未初期化のまま、10743 で SmartReframe::analyzeFrame に渡る(コメント自身が dummy と明記)。SmartReframe.cpp:287 のガードは isNull() のみで、サイズ有効な未初期化画像は素通りし、laplacian+motion saliency がバッファ内容からクロップ矩形を生成して m_rawTrack に積む。ループ内の m_player->seek + processEvents (1"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G02",
+   "file": "src/Timeline.cpp",
+   "line": 3922,
+   "severity": "high",
+   "lens": "⑤ロジック欠陥/②OOBインデックス",
+   "summary": "setClipSpeed/setClipColorCorrection(3954)/setClipEffects(4141)/setClipKeyframes(4151) は selectedClip() の上限チェックなしで clips[sel] に書き込むが、restoreFromProject() (5364-5397) は restoreState() (5286 clearAllSelections) と異なり選択をクリアせず、TimelineTrack::setClips() (869) も m_selectedClips を再マップしないため、プロジェクト読込後に残存した旧選択インデックスで QVector 範囲外書込みが起きる。",
+   "failure_scenario": "プロジェクトA (V1 に 5 クリップ) でクリップ5 (index 4) を選択したまま File>Open でプロジェクトB (V1 に 1 クリップ) を読込 → restoreFromProject は setClips でクリップ配列を 1 件に差し替えるが m_selectedClips={4} が残り hasSelection()=true (Timeline.h:159 は m_selectedClips.last() を返すだけ)。メニュー「クリップ速度」(MainWindow.cpp:4785 は hasSelection のみ確認) → Timeline::setClipSpeed が guard 'sel < 0' だけで videoClips[4].speed=… を実行 → サイズ1の QVector への範囲外書込み (release ビルドでは UB=ヒープ破壊/クラッシュ)。色補正・エフェクト・キーフレーム設定も同一パターン。copySelectedClip(3188) 等は上限チェック済みで、この4関数だけ欠落している。",
+   "v1": {
+    "refuted": false,
+    "reason": "成立経路を全リンク実コードで確認: openProject→applyLoadedProjectData (MainWindow.cpp:4249, Timeline選択は一切クリアしない)→restoreFromProject (Timeline.cpp:5364-5397, restoreState:5286と異なり clearAllSelections() を呼ばない)→TimelineTrack::setClips (869, m_clips差し替えのみで m_selectedClips 非再マップ)→selectedClip() は m_selectedClips.last() を無"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "反証失敗。全経路を実コードで確認した結果、シナリオは成立する。(1) setClipSpeed (Timeline.cpp:3916)/setClipColorCorrection (3952)/setClipEffects (4139)/setClipKeyframes (4149) は 'sel < 0' のみで上限チェックなしに clips[sel] へ書込む。(2) openProject (MainWindow.cpp:4509)→applyLoadedProjectData (4249)→restoreFromProject (Timeline.cpp:5364) の経路に選択クリ"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G02",
+   "file": "src/Timeline.cpp",
+   "line": 4411,
+   "severity": "medium",
+   "lens": "⑦GUIフリーズ",
+   "summary": "normalizeAudioClipPeak のデコードループはクリップ窓終端 (frameTimeSec >= fileOutSec) に達しても break せず continue でソースファイル末尾まで全デコードする。しかも窓外フレームは line 4411-4413 の continue が processEvents (4472-4476) の手前で抜けるため、窓通過後はキャンセルボタンも一切処理されない。",
+   "failure_scenario": "2時間の音声ファイルから inPoint/outPoint で切り出した 5 秒クリップを音声トラックの右クリックメニュー「ノーマライズ」で実行 (showClipContextMenu:3423→normalizeAudioClipPeak)。searchLenSec=5s≦60s なのでプログレスダイアログすら出ず、GUI スレッドが残り約 2 時間分の av_read_frame/avcodec_receive_frame 完了までフリーズ。60 秒超のクリップでも fileOutSec 通過後は progress が 100 のまま processEvents が呼ばれずダイアログ固化・キャンセル不能。窓終端での早期 break が欠落している。",
+   "v1": {
+    "refuted": false,
+    "reason": "シナリオは成立する。src/Timeline.cpp:4381 の外側ループ while(av_read_frame>=0) の終了条件は EOF とキャンセル break(4387)のみで、frameTimeSec>=fileOutSec 到達時は 4411-4413 の continue で内側ループを回すだけ。窓終端での早期 break が欠落しており、ソース末尾まで全パケット read+全音声デコードが GUI スレッド(呼び出し元 3423-3425 showClipContextMenu は GUI スレッド直呼び)で走る。searchLenSec≦60s では progress="
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "成立する。Timeline.cpp:4381 の while (av_read_frame>=0) ループの出口は EOF と progress->wasCanceled() (4387) のみで、窓終端 (frameTimeSec >= fileOutSec) での break は存在しない — 4411-4413 は inner receive ループの continue で frame を捨てるだけ。av_seek_frame (4363) は開始側しか束縛せず、NormalizeDecoderCtx にも duration 上限はないため、inPoint からファイル物理末尾まで全 d"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G02",
+   "file": "src/Timeline.cpp",
+   "line": 2948,
+   "severity": "medium",
+   "lens": "⑤ロジック欠陥",
+   "summary": "splitAtPlayhead は TimelineTrack::splitClipAt (768) が 0.1 秒ガード (775) で分割を silent に拒否したことを検出せず (前後のクリップ数比較なし)、分割成功前提で updated[i+1] — 実際には隣の無関係クリップ — の linkGroup を新規グループに書き換え、anySplit=true で無変更の undo エントリ「Split clip」も積む。",
+   "failure_scenario": "速度 1.0x のクリップでプレイヘッドがクリップ先頭から 0.05〜0.1 秒 (splitTrack の 0.05 ガード:2945 は通るが splitClipAt:775 の 0.1 ソース秒ガードで return) の位置で分割を実行。選択クリップがビデオのみ (同期切断済みクリップや静止画で音声トラック側に選択なし) の場合、V トラックの次のクリップ updated[i+1] の linkGroup だけが oldGroupToNewGroup 経由の新グループへ書き換わり (2950-2956)、その AV ペアの音声側は旧グループのまま → 以後そのペアのリンクドラッグ/リンク削除/リンク選択 (wireTrackSelection:4627 は linkGroup 一致で同期) が V/A 非同期になり音ズレ編集が発生。分割成否は updated.size() 比較で検出可能なのに行っていない。",
+   "v1": {
+    "refuted": false,
+    "reason": "Scenario confirmed by code reading. (1) Reachable guard gap: splitTrack (Timeline.cpp:2944-2946) uses 0.05s timeline-second margins, but splitClipAt:775 rejects in source seconds (splitPoint = inPoint + localSeconds*speed <= effectiveStart + 0.1), so at speed 1.0 a playhead 0.05-0.1s into the clip p"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "Scenario confirmed by code reading. (1) Guard mismatch exists: splitAtPlayhead (Timeline.cpp:2945) allows playhead offsets >0.05s timeline-seconds, but splitClipAt (Timeline.cpp:775) silently returns for splitPoint within 0.1 source-seconds of either edge (splitPoint = inPoint + localSeconds*speed);"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G02",
+   "file": "src/AutoSave.cpp",
+   "line": 70,
+   "severity": "medium",
+   "lens": "⑥データ損失・エラー握りつぶし",
+   "summary": "performAutoSave は file.write(json.toUtf8()) の戻り値 (部分書込み/失敗) を確認せずに成功扱いで autoSaved を emit し、直後の cleanOldBackups() が古い正常バックアップを maxBackups 超過分から削除するため、書込み失敗が続くと正常な復旧ポイントが壊れたファイルに置換されていく。",
+   "failure_scenario": "ディスクフル (または書込みエラー) 状態でオートセーブタイマーが発火 → QFile::open は成功するが write() が途中失敗し切詰められた JSON が project_autosave_*.veditor として保存される。戻り値未確認のため成功として cleanOldBackups() が走り、QDir::Time ソートで最古の「正常な」バックアップを削除 (86-88)。インターバル毎にこれが繰り返されると maxBackups 世代すべてが破損ファイルで埋まり、クラッシュ後の recoveryAvailable → recoverFromFile が返す JSON はパース不能で復旧が全滅する。書込みバイト数の検証と失敗時の当該ファイル削除 (+cleanOldBackups スキップ) が必要。",
+   "v1": {
+    "refuted": false,
+    "reason": "成立を確認。src/AutoSave.cpp:69-75 は open() 成功後、write()/close() の戻り値も file.error() も一切検査せず、無条件に cleanOldBackups() を実行し autoSaved を emit する。QSaveFile や temp→rename、書込み後検証、失敗ファイル削除は皆無。ディスクフルでは新規タイムスタンプファイルの open は通常成功し write が途中失敗して切詰め JSON が残る (プロジェクト全体の JSON は QFile バッファより大きく短書込みは現実的。なお QFile はバッファードなので一部"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "シナリオはコード上成立する。AutoSave.cpp:70-75 で open() 成功後は write() 戻り値・flush・file.error() を一切確認せず、無条件に cleanOldBackups() 実行と autoSaved emit を行う。ディスクフル時 open(O_CREAT) はメタデータ領域で成功しデータ書込みだけ失敗するのは ext4/NTFS で典型的挙動であり、切詰め/空の project_autosave_*.veditor が「最新」ファイルとして残る。cleanOldBackups (83-88行) は内容検証ゼロで QDir::Time 降順の末尾"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G03",
+   "file": "src/AffinityPsdImporter.cpp",
+   "line": 90,
+   "severity": "high",
+   "lens": "②integer/未検証入力",
+   "summary": "readUnicodeString が untrusted な luni ブロックの count(uint32)を検証せず QByteArray buf(static_cast<int>(count)*2) を確保する。int キャストと *2 で符号オーバーフローし、また巨大 count で読み取り前に約1〜4GB を確保する。",
+   "failure_scenario": "細工した .psd/.afphoto をインポート (loadPsd→追加レイヤ情報ループ line 437 で k==\"luni\" のとき readUnicodeString 呼び出し)。luni ブロックが count=0x20000000 を宣言すると readBytes 前に QByteArray(≈1GB) 確保で bad_alloc/DoS。count>=0x40000000 では static_cast<int>(count)*2 が int オーバーフローし負サイズになり QByteArray 構築が未定義/クラッシュ。aLen とは独立に読むため aLen が小さくても到達可能。既知#85(readChannelPlane line155 のチャネル長)とは別フィールド・別箇所。",
+   "v1": {
+    "refuted": false,
+    "reason": "Scenario holds. Exploit surface confirmed: ImportHubDialog::onAffinityBrowseClicked (src/ImportHubDialog.cpp:311-330) opens a user-selected .psd via QFileDialog and calls affinity::psd::loadPsd on untrusted bytes. In loadPsd the additional-layer-info loop (line 428) reads asig/akey/aLen and, when ak"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "Scenario holds. readUnicodeString (src/AffinityPsdImporter.cpp:86-104) reads a fully attacker-controlled uint32 `count` directly from the file (line 88) with no upper bound, then at line 90 does `QByteArray buf(static_cast<int>(count) * 2, '\\0')` BEFORE any read (line 91). Reachable: loadPsd is call"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G03",
+   "file": "src/Precompose.cpp",
+   "line": 265,
+   "severity": "medium",
+   "lens": "⑤ロジック欠陥/⑦フリーズ",
+   "summary": "renderCompositionInternal がサブコンポジションを2回レンダリングする。第1ループ(line256-289)の renderCompositionInternal 結果 subImage は Q_UNUSED で完全に破棄され、第2ループ(line295-315)で同じサブコンポを再度レンダリングして使用する。ネスト深さに対し O(2^depth) の無駄な計算になる。",
+   "failure_scenario": "複数レベルにネストしたコンポジション(comp A が comp B を含み B が comp C を含む…)を renderComposition すると、各サブコンポが親の第1ループで一度レンダリング(破棄)され第2ループで再レンダリングされる。各再帰呼び出しも同じ二重構造を持つため、深さ D で約 2^D 回の LayerCompositor::compositeFrame が走る。数レベルのネストでプレビューが顕著にジャンク、深いネストで GUI が数秒〜フリーズ。第1パスの結果は 100% 捨てられており cycle 管理(visited add/remove)は第2パスでも行うため純粋な無駄。",
+   "v1": {
+    "refuted": false,
+    "reason": "成立経路を確認: src/Precompose.cpp renderCompositionInternal は第1ループ(line 256-289)で line 265 の再帰結果 subImage を line 280 の Q_UNUSED で完全破棄し(resolvedLayers に積むのは元の comp-ref レイヤーであり描画結果ではない)、第2ループ(line 295-315)の line 309 で同一 subCompId・同一 localTime を再レンダリングして使用する。visited ガードは line 252 append / line 324 removeOne "
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "シナリオは成立する。src/Precompose.cpp の第1ループ (line 265) で renderCompositionInternal した subImage は line 280 の Q_UNUSED で完全破棄され、第2ループ (line 309) で同一 subCompId・同一 localTime を再レンダリングして使用する。visited は line 252 で append / line 324 で removeOne と対称なので、第1パスの再帰終了時点でガードは解除済みであり第2パスを防護しない。各再帰も同じ二重構造を持つため深さ D で T(D)=2·T(D"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G03",
+   "file": "src/BatchExportDialog.cpp",
+   "line": 146,
+   "severity": "medium",
+   "lens": "⑤ロジック欠陥/⑥エラー握りつぶし",
+   "summary": "onRemoveClicked が m_queue->removeTask(id) の後に無条件で m_table->removeRow(row) する。BatchExportQueue::removeTask は state==Running のとき早期 return で削除しない(BatchExportQueue.cpp:55-56)ため、実行中タスクの行だけが UI から消え、キュー側ではジョブが走り続ける。",
+   "failure_scenario": "エクスポート実行中(Running)のタスクを選択して Remove を押すと、removeTask は no-op でジョブは継続するのに table の行は削除される。以後その id の taskStateChanged/taskProgress シグナルは rowForId(id)==-1 で握りつぶされ(onTaskStateChanged/onTaskProgress が黙って return)、Done/Failed 状態も進捗も一切表示されない。実行中エクスポートがUIから消え、出力ファイルは書かれ続けるが完了/失敗をユーザーが知る手段が無くなる。",
+   "v1": {
+    "refuted": false,
+    "reason": "成立を確認。onRemoveClicked (BatchExportDialog.cpp:134-147) は task state を一切確認せず、removeTask(id) の後に無条件で m_table->removeRow(row) を実行する (removeTask は void 返しで拒否を通知できず、行145のコメント自体が \"no-op if Running\" と認めている)。Queue::removeTask (BatchExportQueue.cpp:55-56) は Running のとき削除せず早期 return し、200ms タイマー (同 10-33行) がその"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "シナリオはコード上成立する。BatchExportDialog.cpp:134-147 の onRemoveClicked はタスク状態を確認せず removeTask(id) 後に無条件で m_table->removeRow(row) を実行し、Remove ボタンの disable 等の防護も無い。BatchExportQueue.cpp:51-61 の removeTask は state==Running で早期 return(戻り値 void で失敗検知不可)し、m_currentId とタイマーは継続。以後の taskProgress/taskStateChanged は row"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G03",
+   "file": "src/VideoPlayer.cpp",
+   "line": 1741,
+   "severity": "medium",
+   "lens": "⑤ロジック欠陥(単位/座標系不一致)",
+   "summary": "stop() がシーケンスモードでも seekInternal(0,true,true)(=ロード中ファイルのファイルローカル0)を呼ぶだけで、m_activeEntry もタイムライン位置もタイムライン先頭へ戻さない。一方 m_mixer->seekTo(0) は音声をタイムライン0へ戻すため映像と音声が乖離する。",
+   "failure_scenario": "複数クリップのシーケンスでクリップ2(m_activeEntry=1, clipIn>0, 別ファイル)を再生中に Stop を押すと、seekInternal(0) はクリップ2のファイルを 0 へシーク(clipIn より前の内容=本来クリップ範囲外のフレームを表示)。updatePositionUi の再射影で m_timelinePositionUs はクリップ2の timelineStart になり、シークバーはタイムライン先頭(0)でなくクリップ2開始位置を指す。音声は seekTo(0) でタイムライン0に戻るため映像/音声/シークバーが不一致。以後 play() すると Fix L/M 再アンカーで現クリップ先頭から再開し、Stop が「タイムライン先頭へ戻る」ではなく「現クリップを頭出し」になる。",
+   "v1": {
+    "refuted": false,
+    "reason": "Confirmed by code reading. stop() (VideoPlayer.cpp:1738-1746) has no sequenceActive() branch: it calls seekInternal(0,true,true), which seeks the currently loaded active-entry file to FILE-LOCAL 0 with no clipIn clamp (seekInternal L2891-2933 clamps only to [0,m_durationUs]), leaving m_activeEntry u"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "成立を確認。stop() (src/VideoPlayer.cpp:1738-1746) にシーケンスモードのガードはなく、stopボタン直結(447行・常時有効)。seekInternal(0) は純ファイルローカルシークで clipIn を無視し、ロード中クリップ2のファイル先頭(クリップ範囲外)フレームを表示。updatePositionUi (2838行) の再射影は US-VFF-003 ガード (2860行、バイパス条件 m_seekInProgress/m_pendingSeekMs は通常 false/-1) により大抵拒否され m_timelinePositionUs は停止"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G03",
+   "file": "src/AnimatedExportDialog.cpp",
+   "line": 102,
+   "severity": "medium",
+   "lens": "⑦GUIフリーズ",
+   "summary": "onExportClicked がフォルダ内の連番画像を全て QVector<QImage> frames に同期ロード(line104-108)し、続けて animexport::exportFrames を GUI スレッドで同期実行(line135)する。ワーカースレッドも進捗表示も無い。",
+   "failure_scenario": "「連番画像のフォルダ」に数百〜数千枚の高解像度 PNG/JPG が入っている状態でエクスポートを押すと、全画像をメモリへ一括デコード(大量メモリ使用・場合により bad_alloc)し、その後 GIF/WebP エンコードまで GUI スレッド上で完了するまでブロックする。イベントループが止まりウィンドウが数秒〜数分応答不能(進捗・キャンセル不可)になる。他のエクスポート系(QProcess/スレッド利用)と挙動が非一貫。",
+   "v1": {
+    "refuted": false,
+    "reason": "シナリオは成立する。経路確認済み: Tools メニュー (MainWindow.cpp:2707-2711) → openAnimExportDialog (8910, HAVE_ANIMATED_EXPORT_DIALOG は __has_include+CMakeLists.txt:448-449 で有効) → onExportClicked (AnimatedExportDialog.cpp:75)。(1) 枚数・解像度の上限ガード無しで entryList の全ファイルをフル解像度で同期デコードし QVector<QImage> に蓄積 (102-108行、縮小は encode 段ま"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "成立経路を確認: AnimatedExportDialog::onExportClicked (src/AnimatedExportDialog.cpp:75) はボタン clicked の直接接続スロットとして GUI スレッドで実行され、line 104-108 で dir.entryList の全連番画像(上限なし)をフル解像度で QVector<QImage> に一括デコード、line 135 で animexport::exportFrames を同期呼び出しする。exportFrames (src/AnimatedExport.cpp:500) 内の writeGif/writeW"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G04",
+   "file": "src/EffectPreset.cpp",
+   "line": 287,
+   "lens": "⑥データ損失・⑤ロジック欠陥",
+   "severity": "high",
+   "summary": "プリセットの effect type 名がシリアライズ往復で不一致: 保存は VideoEffect::typeName() の \"Chroma Key\"/\"Displacement Map\"/\"Fractal Noise\"(スペース入り) を書くが、videoEffectFromJson は \"ChromaKey\" のみ照合し Displacement Map/Fractal Noise は分岐自体が無いため、これらのエフェクトは読み込み時に全て VideoEffectType::None に化ける",
+   "failure_scenario": "クリップに Chroma Key を掛けて MainWindow::saveEffectPreset (MainWindow.cpp:6346-6353) でプリセット保存 → toJson (EffectPreset.cpp:261) が obj[\"type\"]=\"Chroma Key\" (VideoEffect.cpp:24) を ~/.veditor/presets.json に書く。アプリ再起動時 PresetLibrary コンストラクタ (EffectPreset.cpp:65) の loadLibrary → videoEffectFromJson (283-293行) は \"ChromaKey\"(スペース無し) としか比較しないため type=None・keyColor 未復元となり、プリセット適用 (applyPreset) してもキーイングが一切効かない無効エフェクトになる。Displacement Map / Fractal Noise 入りプリセットも同様に None 化し、ユーザーの保存済みプリセットが無警告で壊れる",
+   "v1": {
+    "refuted": false,
+    "reason": "Report is correct. Writer EffectPreset.cpp:261 serializes VideoEffect::typeName() output — \"Chroma Key\"/\"Displacement Map\"/\"Fractal Noise\" (VideoEffect.cpp:24,30,31, all with spaces) — while reader videoEffectFromJson (EffectPreset.cpp:283-293) matches only spaceless \"ChromaKey\" and has no branch at"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "反証不能・バグ成立を確認。保存側 videoEffectToJson (EffectPreset.cpp:261) は VideoEffect::typeName() の \"Chroma Key\"/\"Displacement Map\"/\"Fractal Noise\" (VideoEffect.cpp:24,30,31, スペース入り) を書くが、読み込み側 videoEffectFromJson (EffectPreset.cpp:283-293) は \"ChromaKey\"(スペース無し) のみ照合し、Displacement Map/Fractal Noise の分岐は存在しないため、これ"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G04",
+   "file": "src/GLPreview.cpp",
+   "line": 3260,
+   "lens": "②整数演算/OOB・④未検証入力",
+   "severity": "high",
+   "summary": "GLPreview::setLut が 1D LUT (LutType::Cube1D) を無検証で 3D LUT として扱い、size 個しか無い table から size^3 テクセル分を GL にアップロードさせるためヒープ範囲外読み出し (最悪クラッシュ) になる",
+   "failure_scenario": "LUT_1D_SIZE 64 を宣言した正規の 1D .cube ファイル (LutImporter::loadCubeFile は 60-64行で Cube1D として受理し、93行の検証も table.size()==size=64 で通過、LutData::isValid() は type を見ない) を MainWindow::applyLut / loadLutCubeFile (MainWindow.cpp:6431/6466) で読み込むと、setLut は 3245行で setSize(64,64,64)=262144 テクセルの 3D テクスチャを確保し、3253-3261行で 64 エントリ (768 バイト) しか無い data バッファから setData が 64^3*3*4≒3MB を読み出す → ヒープ OOB リードで segfault またはゴミ LUT。LUT_1D_SIZE 4096 のシェイパー LUT なら 4096^3 テクセルの確保要求で GL OUT_OF_MEMORY/クラッシュ。CPU 側 applyLut (LutImporter.cpp:159) は type==Cube3D を確認しているが GL パスだけ検査が無い",
+   "v1": {
+    "refuted": false,
+    "reason": "成立経路を確認: LutImporter::loadCubeFile (LutImporter.cpp:60-64) は LUT_1D_SIZE を Cube1D/size=N として受理し、86-98行の検証は 1D なら table.size()==size で通過。LutData::isValid() (LutImporter.h) は type を見ない。MainWindow.cpp:6431/6466 (applyLut ダイアログ/loadLutCubeFile) と ColorGradingPanel 経由 (2890/2900、LutLibrary::addLut も無フィルタ"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "成立する。LutImporter::loadCubeFile (LutImporter.cpp:60-64, 92-97) は LUT_1D_SIZE N の 1D .cube を type=Cube1D, size=N, table.size()==N で正常受理し、LutData::isValid() (LutImporter.h:27) は size>0 && !table.isEmpty() のみで type を見ない。GLPreview::setLut (GLPreview.cpp:3229-3268) は isValid() 以外のガード無しで Target3D テクスチャを se"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G04",
+   "file": "src/VoiceOverRecorder.cpp",
+   "line": 138,
+   "lens": "⑥エラー握りつぶし (成功偽装)",
+   "severity": "medium",
+   "summary": "録音中のファイル書き込み失敗 (written<0) パスが stopRecording() を queue するだけで、stopRecording は無条件に recordingFinished(wavPath, elapsed) を emit するため、ディスクフル等の書き込みエラーが「録音成功」としてシグナル通知され recordingFailed は一切発火しない",
+   "failure_scenario": "録音先ドライブが録音途中でディスクフルになると readyRead ラムダ (129-155行) の m_outputFile.write が -1 を返し、136-141行が qWarning + QMetaObject::invokeMethod で stopRecording() を呼ぶ。stopRecording (162-189行) はエラー文脈を知らないため finalizeWavHeader 後に recordingFinished を emit。VoiceOverDialog は recordingFinished を成功ハンドラ onRecordingFinished に接続している (VoiceOverDialog.cpp:33-34) ので、途中で切れた不完全 WAV がそのまま正常録音としてタイムライン挿入フローに渡り、ユーザーは収録が壊れたことに気づけない (既知の :95 デバイスエラー経路は修正済みだが、この write 失敗分岐は未修正の別経路)",
+   "v1": {
+    "refuted": false,
+    "reason": "成立を確認。src/VoiceOverRecorder.cpp:136-141 の written<0 分岐は Qt::QueuedConnection で stopRecording() を queue し、mutex は解放済み・m_recording は true のままなので queued 呼び出しは確実に実行される。stopRecording (162-189) はエラー文脈を持つメンバ/引数が一切なく、finalizeWavHeader + close 後に無条件で recordingFinished(wavPath, elapsedMs) を emit (188行)。record"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "成立する。VoiceOverRecorder.cpp:135-141 の write 失敗 (written<0) パスは qWarning + QueuedConnection で stopRecording() を呼ぶだけでエラーフラグを一切残さず、stopRecording() (162-189行) は finalizeWavHeader 後に無条件で recordingFinished(wavPath, elapsedMs) を emit する。録音中に recordingFailed を出せる唯一の経路は QAudioSource::stateChanged のデバイスエラーハンドラ"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G04",
+   "file": "src/EffectPreset.cpp",
+   "line": 226,
+   "lens": "⑥データ損失",
+   "severity": "medium",
+   "summary": "PresetLibrary::colorCorrectionToJson / colorCorrectionFromJson が ColorCorrection の Lift/Gamma/Gain カラーホイール 9 フィールド (liftR..gainB, VideoEffect.h:23-25) を一切シリアライズしないため、エフェクトプリセットに保存したカラーホイールグレーディングが再起動/エクスポートで消失する (既知の ProjectFile.cpp:1217 と同型だが別ファイル・別機能の独立した欠落)",
+   "failure_scenario": "ColorGradingPanel でクリップの Lift/Gamma/Gain ホイールを調整 → MainWindow::saveEffectPreset (MainWindow.cpp:6349) が m_timeline->clipColorCorrection() をプリセットに格納し saveLibrary で presets.json に書くが、colorCorrectionToJson (226-240行) は brightness〜exposure の 10 フィールドしか書かない。再起動後に loadLibrary → colorCorrectionFromJson (242-256行) で復元されたプリセットを適用すると liftR..gainB は全てデフォルト 0 になり、ホイール調整だけが黙って失われる。exportPreset/importPreset でプリセットを共有した場合も同様に欠落する",
+   "v1": {
+    "refuted": false,
+    "reason": "シナリオは成立する。成立経路を全リンク確認済み: (1) ColorCorrection は liftR..gainB の 9 ホイールフィールドを持つ (src/VideoEffect.h:22-25、isDefault() にも含まれる=正式な状態の一部)。(2) ColorGradingPanel のホイール操作は m_cc.liftR.. 等に書き込み colorCorrectionChanged を emit し、MainWindow.cpp:2874-2877 で m_timeline->setClipColorCorrection(cc) に流れる=ホイール値はクリップの Col"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "反証失敗 — 報告どおり成立する。成立経路を全リンクで実コード確認済み: (1) ColorGradingPanel.cpp:777-802 の onLiftChanged/onGammaWheelChanged/onGainChanged が m_cc.liftR..gainB を書いて colorCorrectionChanged(m_cc) を emit。(2) MainWindow.cpp:2874-2880 がそれを m_timeline->setClipColorCorrection(cc) に接続 → クリップの ColorCorrection にホイール値が乗る。(3) Mai"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G05",
+   "file": "src/SpeedRamp.cpp",
+   "line": 326,
+   "summary": "applySpeedRamp の QThread::create ワーカーが this を捕捉するが、SpeedRamp にデストラクタ (join/cancel) も実行中ガードもなく、破棄後の UAF と二重起動時のデータ競合が起きる",
+   "failure_scenario": "MainWindow::setSpeedRamp (MainWindow.cpp:6936) は m_speedRamp (MainWindow が親) を再利用して applySpeedRamp を呼ぶ。可変速ランプは動画をセグメント毎に ffmpeg で処理するため数分走る (SpeedRamp.cpp:424-460)。この間にアプリを閉じると MainWindow のデストラクタが m_speedRamp を破棄するが、ワーカーは while(!process->waitForFinished(200)) ループ (299行) で継続し、isCancelled() が解放済み m_cancelled を読み、parseProgress が解放済み m_totalDuration (SpeedRamp.h:109, 非同期化なしの plain double) に書き込み、破棄済み QObject へ emit progressChanged する→終了時クラッシュ/UB。さらに実行中に再度メニューから速度ランプを実行すると 2 本のワーカーが m_totalDuration (GUI スレッドの 324 行でも 0.0 書込) と m_process を無同期で書き合い、cancel() は全ワーカー共通の 1 フラグしかない (なお m_speedRamp->cancel() の呼び出し元は 0 件で停止手段自体が無い)",
+   "severity": "high",
+   "lens": "スレッド競合・Qt lifetime",
+   "v1": {
+    "refuted": false,
+    "reason": "成立経路を確認: (1) UAF — main.cpp:3551 で MainWindow はスタック確保、closeEvent (MainWindow.cpp:9389) はランプの停止/待機を一切せず、~MainWindow は未定義。m_speedRamp は MainWindow の子 (MainWindow.cpp:6914) なので閉じると即破棄されるが、ワーカーは SpeedRamp.cpp:299 の while(!waitForFinished(200)) で数分継続し、解放済み m_cancelled 読み (mutex は無名 namespace の関数ローカル stat"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "成立する。(1) UAF 経路確認: SpeedRamp にデストラクタ無し (SpeedRamp.h:35-110 / SpeedRamp.cpp 全 509 行に定義無し)、QThread::create ワーカー (SpeedRamp.cpp:326) は this を捕捉しスレッドポインタはどこにも保持されない=join 不能。m_speedRamp は MainWindow の子 (MainWindow.cpp:6914)、MainWindow は main.cpp:3551 でスタック生成、closeEvent (MainWindow.cpp:9389-9396) は設定保存のみで"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G05",
+   "file": "src/SmartEditDialog.cpp",
+   "line": 138,
+   "summary": "Analyze ボタンが smartedit::Assistant::analyze() を GUI スレッドで同期実行し、動画ファイル全体の FFmpeg デコード 2 パス (無音検出+シーン検出) の間 UI が完全フリーズする",
+   "failure_scenario": "SmartEditDialog::onAnalyzeClicked (138行) は m_assistant->analyze(path) を直接呼ぶ。Assistant::analyze (SmartEditAssistant.cpp:145-190) は AutoEdit::detectSilenceFromFile と AutoEdit::detectSceneChanges を同期呼び出しし、それぞれ入力ファイル全フレーム/全サンプルをデコードする。10分の 4K mp4 を選んで Analyze を押すと GUI スレッドがデコード完了まで数分ブロックし、m_progressBar->setValue へ direct 接続される analysisProgress も再描画されない (イベントループ停止) ため、ウィンドウ全体が「応答なし」になる。ダイアログは非モーダル (setModal(false)) だがメインウィンドウ含め全 UI が固まる",
+   "severity": "medium",
+   "lens": "GUIフリーズ",
+   "v1": {
+    "refuted": false,
+    "reason": "成立を確認。SmartEditDialog::onAnalyzeClicked (SmartEditDialog.cpp:138) は GUI スレッド上で m_assistant->analyze(path) を直接同期呼び出しする。m_assistant はダイアログの子 QObject (line 48) で、SmartEdit 系 4 ファイルに QThread/QtConcurrent/moveToThread は一切ない (grep 0 件)。Assistant::analyze (SmartEditAssistant.cpp:145-189) は AutoEdit::detect"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "Confirmed. SmartEditDialog.cpp:138 calls m_assistant->analyze(path) synchronously on the GUI thread (Assistant is parented to the dialog, created in MainWindow::openSmartEditDialog on the GUI thread; zero QThread/QtConcurrent/moveToThread/QFuture usage in SmartEditDialog.cpp, SmartEditAssistant.cpp,"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G05",
+   "file": "src/SmartEditDialog.cpp",
+   "line": 163,
+   "summary": "「Apply to Timeline」ボタンが完全な no-op — qInfo ログを出すだけで、シグナルも宣言されておらず提案をタイムラインへ適用する経路が存在しない",
+   "failure_scenario": "onApplyToTimelineClicked (161-165行) は qInfo() << \"Apply to Timeline requested\" のみ。SmartEditDialog.h にはシグナル宣言が一切なく (signals セクション自体が無い)、MainWindow::openSmartEditDialog (MainWindow.cpp:8727-8736) も show()/raise() するだけで何も接続しない。ユーザーが解析を実行し提案テーブルを確認して「Apply to Timeline」を押しても、カット提案は一切タイムラインへ反映されず、エラーも通知もない (解析結果が黙って捨てられる)",
+   "severity": "medium",
+   "lens": "ロジック欠陥・エラー握りつぶし",
+   "v1": {
+    "refuted": false,
+    "reason": "報告は正確。SmartEditDialog::onApplyToTimelineClicked (src/SmartEditDialog.cpp:161-165) は qInfo ログのみで emit/タイムライン操作が皆無。SmartEditDialog.h に signals セクション自体が存在せず、クラスはタイムライン/プロジェクト参照も持たない。唯一の生成元 MainWindow::openSmartEditDialog (MainWindow.cpp:8727-8741) は show()/raise()/activateWindow() のみで connect ゼロ。全リポジトリ"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "報告は完全に成立する。onApplyToTimelineClicked (src/SmartEditDialog.cpp:161-165) は qInfo ログ1文のみで、emit も timeline 操作も通知も無い。SmartEditDialog.h には signals セクションが存在せず、m_suggestions は private でアクセサも無いため外部から解析結果を取得する手段が皆無。MainWindow::openSmartEditDialog (MainWindow.cpp:8727-8741) は生成+show/raise/activateWindow のみで con"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G05",
+   "file": "src/SpeedRamp.cpp",
+   "line": 397,
+   "summary": "可変速ランプのセグメント分割が先頭ポイント以前と最終ポイント以降の映像を出力から黙って欠落させる (定速パスはファイル全体を処理するため挙動が非一貫)",
+   "failure_scenario": "セグメントは sortedPoints[i]〜[i+1] 間のみ生成され (397-412行)、-ss/-t で切り出して concat する (437-486行) ため、出力は [firstPoint.time, lastPoint.time] に切り詰められる。speedAtTime (104-106行) は端点外で速度を保持する仕様なのに、出力からは区間外が丸ごと消える。唯一の呼び出し元 MainWindow::setSpeedRamp (MainWindow.cpp:6926) は points を {0, effectiveDuration} で渡すが、effectiveDuration=(outPoint-inPoint)/speed (Timeline.h:124-127) はトリム済み/速度変更済みクリップではソースファイル実長より短い。例: 60秒のファイルをタイムラインで 10 秒にトリムしたクリップに開始1x/終了2x のランプを適用すると、出力 mp4 はファイル先頭 10 秒分のみになり残り 50 秒が無警告で消える (同条件で開始=終了速度なら定速パスが 60 秒全部を出力する)",
+   "severity": "medium",
+   "lens": "ロジック欠陥・データ損失",
+   "v1": {
+    "refuted": false,
+    "reason": "シナリオは成立する。唯一の呼び出し元 MainWindow::setSpeedRamp (MainWindow.cpp:6921-6936) は points を {0.0, effectiveDuration()} で構築し、ソースファイル全体のパスを applySpeedRamp に渡す。effectiveDuration=(outPoint-inPoint)/speed (Timeline.h:124-127) はトリム済み/速度変更済みクリップでソース実長より短い。可変速パス (SpeedRamp.cpp:397-412) はセグメントを sortedPoints[i]〜[i+1] 間"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "成立を確認。唯一の呼び出し元 MainWindow::setSpeedRamp (MainWindow.cpp:6926-6936) はソースファイル実体 (clips.first().filePath) を入力に渡しつつ、終端ポイント時刻に effectiveDuration=(outPoint-inPoint)/speed (Timeline.h:124-127) を使う。可変速パス (SpeedRamp.cpp:397-412) はソート済みポイント間のみセグメント化し、各セグメントを入力オプション -ss/-t で切り出して concat する (437-445, 479-486) た"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G05",
+   "file": "src/VSTHost.cpp",
+   "line": 576,
+   "summary": "VSTHostManager::loadPlugin が読み込んだプラグインインスタンスをシングルトンの m_loadedPlugins に蓄積し続け、unloadPlugin の呼び出し元が 0 件のため dlopen/LoadLibrary ハンドルとインスタンスがアプリ終了まで解放されない",
+   "failure_scenario": "VSTPluginDialog::onLoadClicked (970行) は Load Plugin クリック毎に VSTHostManager::instance().loadPlugin() を呼び、VST3PluginInstance::loadPlugin (89行) が LOAD_LIB (dlopen/LoadLibraryW) を実行、成功インスタンスは m_loadedPlugins << instance (576行) で共有ポインタ保持される。unloadPlugin (586行) は宣言・定義のみで呼び出し元がリポジトリ内に存在せず、ダイアログ側も m_loadedInstance を上書きするだけ。同じプラグインを 10 回 Load すると 10 個のインスタンスと 10 回分のライブラリ参照カウントが永続蓄積し、FREE_LIB を呼ぶデストラクタ (74-79行) はプロセス終了まで走らない",
+   "severity": "medium",
+   "lens": "エラーパス資源リーク",
+   "v1": {
+    "refuted": false,
+    "reason": "成立を確認。VSTPluginDialog::onLoadClicked (VSTHost.cpp:970) はクリック毎に VSTHostManager::loadPlugin を無条件に呼び、成功インスタンスは m_loadedPlugins << instance (576) でシングルトン(関数内 static、537)に蓄積される。unloadPlugin (586) の呼び出し元はリポジトリ全体 grep で 0 件、m_loadedPlugins を clear/remove する経路も存在しない(576 追加・583 getter・588 は死んだ unloadPlugin 内"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "成立を確認。(1) VSTPluginDialog::onLoadClicked (src/VSTHost.cpp:966-980) はクリック毎に無条件で VSTHostManager::instance().loadPlugin() を呼び、重複ロードのガードも前インスタンスの unload もない。(2) VSTHostManager::loadPlugin (555-579) は成功インスタンスを毎回 m_loadedPlugins に append (576) し、シングルトンは関数ローカル static (535-539) なのでプロセス終了まで shared_ptr を保持する。"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G06",
+   "file": "src/EffectControlsPanel.cpp",
+   "line": 644,
+   "summary": "persistAndRebuild() が buildEffectGroups() 後にキーフレームトグル状態を復元しないため、既存トラックが「未設定」表示になり、ユーザーがトグルを再点灯すると createKeyframeTrack→KeyframeManager::addTrack (Keyframe.cpp:201 の Replace if exists) が既存の複数キーフレームトラックを単一キーフレームで上書き破壊する",
+   "failure_scenario": "クリップのエフェクトパラメータ (例: effect.0.strength) に複数キーフレームを打つ→エフェクトの追加/削除/複製/上下移動のいずれかを実行→persistAndRebuild() は buildEffectGroups(m_effects) のみ呼び、refreshFromCurrentClip() の 282-291 行にある setParamHasTrack/setParamKeyframeTrack 復元を通らないため、トグルが消灯・ナビバーが消える。ユーザーが消灯トグルをクリックして「有効化」すると onEffectKeyframeToggled(now=true)→createKeyframeTrack が同名 KeyframeTrack を新規作成し addTrack が既存トラックを置換 (t=track で丸ごと差し替え)→打ち込んだ全キーフレームが警告なしで消失し、保存すると恒久的に失われる",
+   "severity": "high",
+   "lens": "⑤ロジック欠陥/⑥データ損失",
+   "v1": {
+    "refuted": false,
+    "reason": "成立を確認。persistAndRebuild() (EffectControlsPanel.cpp:639-645) は buildEffectGroups のみ呼び、refreshFromCurrentClip() 282-291 行のトグル復元 (setParamHasTrack/setParamKeyframeTrack) を通らない。refreshFromCurrentClip の外部トリガーは Timeline::clipSelectedOnTrack のみ (クリック/undo/選択解除時に emit) で、setClipEffects→setClips は選択シグナルを出さない"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "成立経路をコードで完全に確認。(1) persistAndRebuild (EffectControlsPanel.cpp:639-645) は setClipEffects + buildEffectGroups のみで、refreshFromCurrentClip 内 282-291 行のトグル復元ループを通らない。(2) buildEffectGroups が生成する新規 EffectKeyframeToggle はコンストラクタで unchecked/m_hasTrack=false (EffectKeyframeToggle.cpp:9-21)、ナビバーも hasTrack() 必須"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G06",
+   "file": "src/EffectRowWidget.cpp",
+   "line": 75,
+   "summary": "buildRows() が数値/Bool/Choice の全コントロールをスキーマ既定値 (def.defaultVal) で初期化し、m_effect に格納された実パラメータ値 (effectctrl::paramValue) を一切読まないため、Effect Controls パネルがクリップの実際のエフェクト設定と食い違う値を表示する",
+   "failure_scenario": "クリップにエフェクトを適用しパラメータを変更 (例: 強度 0.8)→別クリップを選択→元クリップを再選択すると refreshFromCurrentClip→buildEffectGroups→setEffect→buildRows がスピンボックス/スライダー/チェックボックスに def.defaultVal を設定 (75/81-82/109 行。grep で paramValue() 呼び出しは keyColor 以外ゼロを確認)。パネルは既定値 (0.5 等) を表示し、ユーザーがその誤表示を基準にスライダーを 1px 動かすと paramChanged がスライダー位置由来の値を emit し、保存済みの 0.8 が既定値近傍の値で上書きされる",
+   "severity": "medium",
+   "lens": "⑤ロジック欠陥",
+   "v1": {
+    "refuted": false,
+    "reason": "成立を確認。buildRows() は数値 (EffectRowWidget.cpp:75 spinBox, 81-82 slider)・Bool (109)・Choice (147-149) を全て def.defaultVal で初期化し、effectctrl::paramValue() の呼び出しは UI コードにゼロ (唯一の呼び出し元は EffectParamSchema.cpp の self-test。m_effect から読むのは keyColor のみ)。実値の永続化経路も実在: onParamChanged→setParamValue (VideoEffect.cpp:101"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "シナリオは成立する。(1) 実値は保存される: paramChanged→onParamChanged→setParamValue(VideoEffect.cpp:101, param1/2/3 に Blur radius/ChromaKey tolerance 等9パラメータをマップ)→effectsChanged→MainWindow.cpp:3047→setClipEffects でクリップに永続化。(2) 再選択時の rebuild は既定値を表示: clipSelectedOnTrack→refreshFromCurrentClip→buildEffectGroups→setEffe"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G06",
+   "file": "src/NetworkRender.cpp",
+   "line": 787,
+   "summary": "サーバーの cancelJob() が送る \"CANCEL_JOB\" メッセージを NetworkRenderClient::handleMessage が処理しない (MSG_ASSIGN_JOB のみ) ため、レンダーノード側のジョブ中断が不可能で、さらにサーバーはノードを即 Idle に戻すため同一ノードに二重にジョブが割り当てられる",
+   "failure_scenario": "ネットワークレンダー実行中にダイアログの Cancel Job を押す→cancelJob (140-163 行) が socket へ {type:\"CANCEL_JOB\"} を送信するが、クライアント handleMessage (783-792 行) は type==MSG_ASSIGN_JOB しか分岐がなく黙って捨てる→ノードは旧ジョブを最後までレンダリングし続ける。同時にサーバー側は node->status=Idle にしたため、onHeartbeatTimeout/handleHello 経由の distributeJobs が同ノードへ次のジョブを ASSIGN_JOB し、実際にはビジー状態のノードに 2 ジョブが並走。完了時に旧ジョブの JOB_COMPLETE が届くと Failed 扱いだったジョブが handleJobComplete (441 行) で Complete に戻る",
+   "severity": "medium",
+   "lens": "⑤ロジック欠陥",
+   "v1": {
+    "refuted": false,
+    "reason": "成立する。全主張をコードで確認: (1) cancelJob (NetworkRender.cpp:140-163) は生文字列 \"CANCEL_JOB\" を送信するが、クライアント handleMessage (783-792) の分岐は MSG_ASSIGN_JOB のみで CANCEL_JOB は黙って破棄される (MSG_CANCEL_JOB 定数自体が未定義、他の中断経路も無い)。(2) cancelJob は node->status=Idle (157行) にする一方 job->assignedNode をクリアしない。(3) m_autoDistribute は既定 true "
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "シナリオは成立する。(1) クライアント NetworkRenderClient::handleMessage (src/NetworkRender.cpp:783-792) は MSG_ASSIGN_JOB のみ分岐し、サーバー cancelJob (140-163) が送る \"CANCEL_JOB\" (151行、定数も未定義) は黙って破棄される=ノード側中断は不可能。(2) cancelJob はノードを即 Idle に戻すため、autoDistribute 下の distributeJobs (addRenderJob:134 / onHeartbeatTimeout:342) や t"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G06",
+   "file": "src/NetworkRender.cpp",
+   "line": 162,
+   "summary": "分割済みマスタージョブへの cancelJob() は status=Failed を立てるだけでセグメントを一切キャンセルせず、全セグメント完了時に assembleSegments() がマスターを Rendering→Complete に戻して jobComplete を emit するため、キャンセルしたレンダリングが完走・成功扱いになる",
+   "failure_scenario": "segmentSize より長いジョブを追加 (distributeJobs 197-238 行でセグメント分割、マスターの assignedNode は空のまま)→マスター行を選んで Cancel Job→cancelJob は assignedNode が空なので CANCEL_JOB 送信もセグメント状態変更もせず master->status=Failed のみ設定→各ノードはセグメントを継続し、最後のセグメントの handleJobComplete (463 行) が allDone を検出して assembleSegments(masterId) を実行→632 行で master->status=Rendering に上書き、ffmpeg 成功後 601-603 行で Complete + jobComplete(masterId) 発火。ユーザーのキャンセル操作が完全に無効化され、出力ファイルも生成される",
+   "severity": "medium",
+   "lens": "⑤ロジック欠陥",
+   "v1": {
+    "refuted": false,
+    "reason": "成立経路を確認: distributeJobs (197-238行) は分割時にマスターへ assignedNode を設定しないため、cancelJob (140-163行) の 147行ガード `!job->assignedNode.isEmpty()` が偽となり、CANCEL_JOB 送信もセグメント状態変更も行わず master->status=Failed のみ設定する。セグメントは無関係に継続し、handleJobComplete (431-476行) の allDone 判定 (455-462行) はセグメント状態のみ見てマスターの Failed を参照せず、さらに 467-4"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "成立を確認。distributeJobs (197-238行) で分割されたマスターは assignJobToNode を通らないため assignedNode が空のまま。cancelJob (140-163行) の CANCEL_JOB 送信とノード解放は `!assignedNode.isEmpty()` ガード内なので分割マスターでは丸ごとスキップされ、status=Failed を立てるだけでセグメント状態・m_segmentMap は無変更 (Pending セグメントは tryAssignPendingJob 541-546行で以後も割当継続)。UI 側は refreshJobs"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G06",
+   "file": "src/SpeechRecognizer.cpp",
+   "line": 190,
+   "summary": "WhisperCliRecognizer::recognize() が proc.waitForFinished(5*60*1000) で最大 5 分間同期ブロックし、呼び出し元 CaptionEditorDialog::onRecognizeClicked (CaptionEditorDialog.cpp:454) が GUI スレッドから直接呼ぶため、音声認識中アプリ全体がフリーズする",
+   "failure_scenario": "字幕エディタで「認識」ボタン→音声/動画ファイル選択→onRecognizeClicked が recognizer->recognize(params) を GUI スレッドで同期実行。recognize 内は isAvailable() の waitForStarted/waitForFinished (各 1.5 秒) に加え、本体の waitForFinished(300000) が whisper-cli の文字起こし完了まで GUI イベントループを停止させる。数分の音声ファイルでは CPU 環境次第で分単位のフリーズとなり、OS が「応答なし」表示、WaitCursor 以外の描画・再生・操作がすべて停止する",
+   "severity": "medium",
+   "lens": "⑦GUIフリーズ",
+   "v1": {
+    "refuted": false,
+    "reason": "成立経路を確認: MainWindow.cpp:8226 で CaptionEditorDialog を生成、CaptionEditorDialog.cpp:199 で recognize ボタンが onRecognizeClicked に直接接続 (GUI スレッド)。onRecognizeClicked (453-455行) は WaitCursor を立てるだけで recognizer->recognize(params) を同期呼び出しし、スレッド/QtConcurrent/processEvents は一切ない。whisper-cli が PATH にあれば availableRec"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "成立を確認。CaptionEditorDialog.cpp:199 で recognize ボタンの clicked がダイアログのスロット onRecognizeClicked に直接接続され GUI スレッドで実行。onRecognizeClicked (431–478行) は 454行で recognizer->recognize(params) を完全同期で呼び、両ファイルに QThread/QtConcurrent/QFutureWatcher/processEvents 等の防護は皆無。whisper-cli 導入環境ではコンボに WhisperCliRecognizer が入り選"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G06",
+   "file": "src/MultiCamSyncDialog.cpp",
+   "line": 156,
+   "summary": "onSyncClicked() が MultiCamSync::syncByAudio() を GUI スレッドで同期実行し、syncByAudio は全カメラファイルの音声を WaveformGenerator::generate で全長デコードするため、長尺素材では GUI が長時間フリーズし進捗バーも描画されない",
+   "failure_scenario": "Multi-Camera Sync ダイアログでカメラを 2 台以上追加し「Sync By Audio」をクリック→onSyncClicked が m_sync->syncByAudio() を直接呼ぶ。MultiCamSync.cpp の syncByAudio は各ソースに対し WaveformGenerator::generate(filePath, 50) で FFmpeg 全長デコード+相互相関 estimateOffsetMs を同期実行するため、1 時間素材×3 カメラなら分単位で GUI イベントループが停止。syncProgress→m_progress->setValue はイベントループが回らないため画面に反映されず、ユーザーにはハングと区別がつかない",
+   "severity": "medium",
+   "lens": "⑦GUIフリーズ",
+   "v1": {
+    "refuted": false,
+    "reason": "成立を確認。MultiCamSyncDialog.cpp:156 の onSyncClicked() は GUI スレッド上の m_sync (dialog を parent に生成、moveToThread なし) の syncByAudio() を直接同期呼び出しする。MultiCamSync.cpp:94-132 は各ソースに対し静的な WaveformGenerator::generate(filePath, 50) を for ループで同期実行し、WaveformGenerator.cpp:56 の generate() は avformat_open_input + while(a"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "成立経路を確認: onSyncClicked (MultiCamSyncDialog.cpp:153-157) は GUI スレッドで m_sync->syncByAudio() を直接同期呼び出しし、syncByAudio (MultiCamSync.cpp:94-132) は各ソースに対し静的な WaveformGenerator::generate(filePath, 50) を同期実行する。generate (WaveformGenerator.cpp:56-256) は av_read_frame/avcodec_receive_frame でファイル全長をデマックス+デコードし、早"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G06",
+   "file": "src/NetworkRender.cpp",
+   "line": 582,
+   "summary": "assembleSegments() の ffmpeg concat リスト生成が f.write(\"file '%1'\") でセグメントパスのシングルクォートをエスケープしないため、出力ファイル名にアポストロフィを含むと concat 解析が壊れ、全セグメントレンダリング完了後の結合が必ず失敗する",
+   "failure_scenario": "onAddJob で出力先に「John's video.mp4」のようにアポストロフィを含むパスを指定→distributeJobs (213-214 行) がセグメント出力を同じ basename から生成 (John's video_seg0.mp4 等)→全セグメント完了後 assembleSegments が concat ファイルに file 'D:/out/John's video_seg0.mp4' と書き込む→ffmpeg の concat demuxer はクォート内エスケープ ('\\'' 形式) を要求するため途中の ' で文字列が終端しパースエラー→exitCode!=0 で finalize(false)→分散レンダリング全体の成果 (全セグメント) が最終結合段階で失われ master が Failed になる",
+   "severity": "medium",
+   "lens": "④未検証入力",
+   "v1": {
+    "refuted": false,
+    "reason": "成立する。経路: onAddJob (NetworkRender.cpp:995) が QFileDialog の出力パスを無検査で job.outputPath に格納 → distributeJobs (212-214行) がセグメント出力パスを master の baseName から生成しアポストロフィを継承 → 全セグメント完了時 handleJobComplete (464行) が assembleSegments を呼び、582行の f.write(QString(\"file '%1'\\n\")...) がシングルクォート未エスケープで concat リストに書き込む。ffmpeg"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "成立経路を確認: onAddJob (NetworkRender.cpp:987) の QFileDialog::getSaveFileName はアポストロフィを含むパスを無検査で受け付け、distributeJobs (213-214) が fi.baseName() 経由でアポストロフィをそのまま全セグメントパスに継承する（baseName はドットで切るだけ）。全セグメント完了時 (464行) に assembleSegments が呼ばれ、582行の f.write(QString(\"file '%1'\\n\")) はシングルクォートを一切エスケープしない。ffmpeg concat "
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G07",
+   "file": "src/ProjectFile.cpp",
+   "line": 1545,
+   "lens": "⑥データ損失",
+   "severity": "high",
+   "summary": "ProjectFile::keyframeManagerToJson/FromJson が StringKeyframeTrack (stringTracks) を一切シリアライズせず、さらに clipToJson の書き出しゲート hasAnyKeyframes() (ProjectFile.cpp:1348 → Keyframe.cpp:240) も数値トラックしか見ないため、クリップのソーステキスト keyframe が保存/読込で完全に消失する",
+   "failure_scenario": "ユーザーが MainWindow::addSourceTextKeyframe (MainWindow.cpp:10496-10518) で「ソーステキスト keyframe」を追加すると StringKeyframeTrack \"source_text\" が clip.keyframes に格納され、TextAnimator::stringValueAt (TextAnimator.cpp:386) がレンダリングに使用する。しかしプロジェクト保存時、ProjectFile::keyframeManagerToJson (1545-1553) は km.tracks() (数値トラック) のみ書き出し、Keyframe.cpp:303 の KeyframeManager::toJson が持つ stringTracks 出力を欠く。string トラックしか無いクリップでは hasAnyKeyframes()==false のため \"keyframes\" キー自体が書かれない。→ .veditor を保存して開き直すとテキストキーフレームが無言で消える (数値キーフレームは残るので気付きにくい)",
+   "v1": {
+    "refuted": false,
+    "reason": "反証失敗 — 報告どおり成立する。成立経路を全リンク実コードで確認した: (1) MainWindow::addSourceTextKeyframe (MainWindow.cpp:10496-10518) は StringKeyframeTrack(\"source_text\") を km.addStringTrack で追加し m_timeline->setClipKeyframes(km) を呼ぶ。(2) Timeline::setClipKeyframes (Timeline.cpp:4146-4154) は clips[sel].keyframes = km で ClipInfo::k"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "成立を確認。ソーステキスト keyframe は実在のメニュー経路 (MainWindow.cpp:1942→10496-10518→Timeline.cpp:4151) で ClipInfo::keyframes の StringKeyframeTrack に格納され、TextAnimator::stringValueAt (TextAnimator.cpp:386→Keyframe.cpp:253-259) がレンダリングに使用する実データ。しかし保存経路 ProjectFile::save→tracksToJson→clipToJson は (1) ゲート hasAnyKeyframes"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G07",
+   "file": "src/SubtitleGenerator.cpp",
+   "line": 255,
+   "lens": "③Qt lifetime/多重実行",
+   "severity": "medium",
+   "summary": "SubtitleGenerator::generate/runWhisper に実行中ガードが無く、whisper 実行中の再実行で m_process/m_tempDir が上書きされ、先行プロセスの finished ハンドラが後発の実行中 QProcess を deleteLater して m_process を null 化 → 後発ジョブ強制終了+queued readyReadStandardError での null デリファレンス",
+   "failure_scenario": "字幕生成 (whisper は数分かかる) 実行中に MainWindow::generateSubtitles (MainWindow.cpp:6292、実行中でもメニューは無効化されない) をもう一度実行すると、runWhisper (255) が m_process を新プロセスで上書き。1本目の whisper が終了すると finished ラムダ (269-299) はメンバ m_process (=2本目) に対して readAllStandardError/parseWhisperOutput を行い (m_tempDir も2本目のものを参照)、297 で実行中の2本目を deleteLater して m_process=nullptr にする。2本目の QProcess は実行中破棄で kill され生成失敗、さらに null 化から実際の削除までの間に届く readyReadStandardError ラムダ (257-258) が m_process->readAllStandardError() を null デリファレンスしてクラッシュし得る",
+   "v1": {
+    "refuted": false,
+    "reason": "シナリオは成立する。SubtitleGenerator::generate() (SubtitleGenerator.cpp:28-50) / runWhisper() (255行) に実行中ガードは無く、MainWindow::generateSubtitles() (MainWindow.cpp:6214) 側もメニュー無効化・busy チェック無し (加えて renderSubtitleTrack() 10765行からのチェーン呼び出し経路もある)。whisper 実行は start() 後非同期でイベントループが生きているため再実行は容易に到達可能で、m_tempDir (37行) と"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "成立する。ガードはどの層にも無い: MainWindow::generateSubtitles (MainWindow.cpp:6214) はクリップ有無と whisper 有無のみ確認し busy フラグ/アクション無効化なし (Qt::UniqueConnection は接続重複防止のみで再実行は防がない)。さらに MainWindow.cpp:10765 からも連鎖呼び出しされる。SubtitleGenerator::generate/generateFromAudio/runWhisper も m_process の実行中チェックなしで、runWhisper:255 が無条件に m_p"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G07",
+   "file": "src/AudioEQ.cpp",
+   "line": 462,
+   "lens": "③スレッド競合・Qt lifetime",
+   "severity": "medium",
+   "summary": "AudioEQProcessor::applyChain の QThread::create ワーカー (this をキャプチャ) がデストラクタで cancel/join されず、destroyed フックは g_eqJobStates のエントリ削除のみのため、破棄後にワーカーが解放済みオブジェクトへ emit する use-after-free",
+   "failure_scenario": "EQ/オーディオエフェクト書き出し (ffmpeg は数分かかり得る) 実行中にアプリを閉じると、MainWindow 子の m_audioEQ (MainWindow.cpp:6963) が破棄される。AudioEQ.cpp:148 の destroyed 接続は removeEqJobState でハッシュを消すだけで、462 で起動したワーカースレッドは waitForFinished(200) ポーリングを続行し、runFFmpeg 内の parseProgress→emit progressChanged (199) や完了時の emit processComplete (501-505) を解放済み this に対して実行して UAF クラッシュ。同一パターンを NoiseReduction.cpp:117-131 は destroyed フックで cancel+thread->wait() して修正済みだが AudioEQ には移植されていない",
+   "v1": {
+    "refuted": false,
+    "reason": "シナリオは成立する。AudioEQ.cpp:462 のワーカーラムダは this を生捕捉し、runFFmpeg (非static、225行の waitForFinished(200) ポーリング) → parseProgress の m_totalDuration 書き込み + emit progressChanged (199)、完了時 emit processComplete (501-505) を this に対して実行する。破棄時防護は constructor (148) の destroyed→removeEqJobState のみで g_eqJobStates のエントリ削除だけ"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "成立経路を確認: AudioEQ.cpp:462 の QThread::create ワーカーは生 this をキャプチャし、runFFmpeg→parseProgress で m_totalDuration の読み書きと emit progressChanged(199)、完了時 emit processComplete(501-505) を this に対して実行する。AudioEQ.cpp:148 の destroyed フックは removeEqJobState(g_eqJobStates のエントリ削除のみ、41-45)で、cancelled フラグもセットせずスレッドも join "
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G07",
+   "file": "src/VideoStabilizer.cpp",
+   "line": 565,
+   "lens": "③スレッド競合・Qt lifetime",
+   "severity": "medium",
+   "summary": "VideoStabilizer::stabilize/analyzeOnly が this をキャプチャした detached QThread を起動するがデストラクタでの cancel/join が無く、破棄後もワーカーが emit stabilizeComplete/progressChanged を解放済みオブジェクトに配送する use-after-free (加えて実行中ガードが無く二重起動で m_process を相互に上書き)",
+   "failure_scenario": "手ぶれ補正 (vidstab 2パスの ffmpeg で長時間) 実行中にアプリを終了すると、MainWindow 子の m_stabilizer (MainWindow.cpp:6392) が破棄されるが、565 の QThread::create ワーカーは走り続け、runFFmpeg のポーリング後に emit progressChanged (325)・emit stabilizeComplete (631-637) を解放済み this に対して実行し UAF。また stabilize() に実行中ガードが無いため 2 回起動すると両ワーカーが m_process (340-342) と m_totalDuration (563) を相互に上書きし、cancel() は後発のプロセスしか kill できず先発 ffmpeg が孤児化する",
+   "v1": {
+    "refuted": false,
+    "reason": "成立する。VideoStabilizer にはデストラクタ・スレッドハンドル・join が一切無く (src/VideoStabilizer.h)、stabilize()/analyzeOnly() (src/VideoStabilizer.cpp:565/652) は this をキャプチャした QThread::create を finished→deleteLater で放流するだけ。m_stabilizer は MainWindow の子 (MainWindow.cpp:6392、MainWindow は main.cpp:3551 でスタック生成) で、closeEvent (Mai"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "成立する。VideoStabilizer にはデストラクタ自体が存在せず (grep で ~VideoStabilizer なし)、565/652 の QThread::create ワーカーは this をキャプチャして finished→deleteLater で完全に detached。cancel() はアプリ内のどこからも呼ばれず、MainWindow::closeEvent (9389-9396) も stabilizer を一切扱わないため、終了時に停止経路がゼロ。m_stabilizer は MainWindow の子 (6392) なので ~MainWindow で解放される"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G08",
+   "file": "src/Exporter.cpp",
+   "line": 779,
+   "summary": "doExport はフレームレート変換を一切行わず、デコードした入力フレーム1枚ごとに outFrame->pts = globalPts++ (time_base 1/config.fps) を割り当てるため、ソース fps ≠ 出力 fps だと映像の長さが伸縮し音声と大幅にずれる",
+   "failure_scenario": "60fps のクリップ10秒を config.fps=30 でエクスポートすると、映像ループ (800-821行) は約600フレーム全てをエンコードし pts は 1/30 刻みで割り当てられるので映像は20秒になる。一方音声パス (837-977行) は同じ in/out 範囲の実サンプルをそのまま書くので10秒。結果、出力 mp4 は映像が半速・音声と完全にずれた壊れた成果物になる (フレーム間引き/複製やソース time_base ベースの pts 計算がどこにもない)",
+   "severity": "medium",
+   "lens": "⑤ロジック欠陥 (単位不一致: 入力フレーム番号を出力 time_base の pts として使用)",
+   "v1": {
+    "refuted": false,
+    "reason": "成立する。encCtx->time_base={1,config.fps} (Exporter.cpp:432) のまま、processVideoFrame はソース時間範囲 [inPoint, clipEnd) 内の全デコードフレームに outFrame->pts = globalPts++ (779行) を無条件に割り当て、間引き・複製・ソース time_base ベースの pts 計算は 640-829 行のどこにも存在しない。60fps/10s ソース + config.fps=30 なら約600フレームが pts 0..599 (1/30s 刻み) でエンコードされ映像は20秒。一方"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "成立を確認。src/Exporter.cpp の映像パスにフレームレート変換が一切存在しない: processVideoFrame (685-798) は framePts が [inPoint, clipEnd) に入るかだけを判定し、範囲内の全デコードフレームに outFrame->pts = globalPts++ (779行、time_base 1/config.fps、432/520行) を割り当ててエンコードする。間引き・複製・ソース time_base ベースの pts 計算・fps フィルタはファイル内に皆無 (grep で確認)。よって 60fps ソース10秒を confi"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G08",
+   "file": "src/Exporter.cpp",
+   "line": 764,
+   "summary": "エフェクト適用後の workingImage を無条件に AV_PIX_FMT_RGB24 として sws_scale に渡すが、VideoEffectProcessor::applyChromaKey (VideoEffect.cpp:505) は Format_ARGB32 を返すため、Chroma Key がスタック末尾にあるとエクスポート映像全体が色化けする",
+   "failure_scenario": "クリップに Chroma Key エフェクトを (単独または最後に) 付けてエクスポートすると、applyEffectStack の戻りは 4byte/px の ARGB32。Exporter.cpp:764-771 は toYuvCtx を RGB24 で作り linesize=bytesPerLine(w*4) を渡すので、sws は各行を 3byte/px として読み、全ピクセルの色チャネルがずれた崩壊映像 (BGRA バイト列を RGB として解釈) がエンコードされる。プレビュー (VideoPlayer.cpp:2072 は QImage 表示なので正常) との差で必ず露見する。なお ChromaKey の後に別エフェクトが続く場合は RGB888 への convertToFormat でアルファが捨てられ、キーが完全無効になる",
+   "severity": "medium",
+   "lens": "⑤ロジック欠陥 (ピクセルフォーマット不一致)",
+   "v1": {
+    "refuted": false,
+    "reason": "成立経路を確認: (1) MainWindow::applyChromaKeyEffect (MainWindow.cpp:9428) がタイムラインクリップの effects 末尾に ChromaKey を追加し、exportVideo (4540/4563) が同じ ClipInfo (Timeline.h:60) を Exporter に渡す。(2) 8bit 通常エクスポートでは Exporter.cpp:709-710 の hasEffects が真になり RGB パスへ。(3) applyEffectStack (VideoEffect.cpp:379-386) は最後のエフェクト"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "成立経路を確認: (1) ChromaKey はユーザーが通常UIで追加可能 (VideoEffectDialogs.cpp:227, VideoEffect.cpp:39) で clip.effects の末尾に置ける。(2) applyEffectStack (VideoEffect.cpp:379-386) は末尾エフェクトの出力を無変換で返し、applyChromaKey (VideoEffect.cpp:505) は Format_ARGB32 (4byte/px BGRA) を返す。(3) Exporter.cpp には convertToFormat / format() チェッ"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G08",
+   "file": "src/Exporter.cpp",
+   "line": 850,
+   "summary": "音声パスは音声ストリームを持たないクリップを無音挿入なしで continue するため、以降の全クリップの音声がそのクリップの長さぶん前にずれる (映像パスはそのクリップを含む)",
+   "failure_scenario": "タイムラインが [A(音声あり), B(マイクなし画面録画=音声ストリームなし), C(音声あり)] の場合、映像は A,B,C を連結するが、音声ループは B で av_find_best_stream<0 → continue (849-853行) して A の直後に C の音声を FIFO へ詰める。結果、B の映像の間に C の音声が再生され、以降ずっと B の長さぶん A/V がずれた出力になる。逆に映像ストリームの無いファイルでは映像パス (652行) だけがスキップされ同様のずれが起きる",
+   "severity": "medium",
+   "lens": "⑤ロジック欠陥 / ⑥データ破損 (成果物のA/V同期崩壊)",
+   "v1": {
+    "refuted": false,
+    "reason": "成立を確認。映像パスは openInputFile (Exporter.cpp:274-284) が VIDEO ストリームのみ要求するため音声なしクリップ B の映像を globalPts++ (行779) で全て符号化する一方、音声パスは行849-853 で av_find_best_stream(AUDIO)<0 → continue し無音挿入なし。音声 PTS は encodeAudioFifo (行210-211) の frame->pts = audioPts; audioPts += samples という累積サンプル数のみでタイムラインにアンカーされないため、C の音声が A"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "Scenario confirmed by code reading of src/Exporter.cpp. (1) With [A(audio), B(no-audio), C(audio)], probeFirstAudioStream (L403) returns true, so the audio mux path is active. (2) The video loop (L645-829) includes B because openInputFile (L274-284) only requires a video stream, and stamps frames wi"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G08",
+   "file": "src/Expression.cpp",
+   "line": 567,
+   "summary": "noiseHash1D のハッシュが1ラウンドのみで上位ビットに雪崩がなく、値域が実質定数 (~0.3090±1e-5) になるため、式関数 noise(t)/fbm(t,oct) が常にほぼ 0.309 を返しアニメーションしない",
+   "failure_scenario": "ユーザーがプロパティ式に noise(time) や fbm(time,4) を書くと、noiseHash1D は h=(n^0x7FFFFFFF)*2654435761 (64bit で桁あふれしない) を UINT64_MAX で割るため、n=0..20 で出力スプレッドが 3.6e-9、n=0..100000 でも 2.3e-5 (数値検証済み)。格子値がほぼ同一なので valueNoise/fbmNoise は定数となり、期待したランダム揺れが一切出ない。2D 版 noiseHash2D はミックス2ラウンドで乗算がラップして正常なため、1D だけが壊れている",
+   "severity": "medium",
+   "lens": "②整数演算 / ⑤ロジック欠陥 (ハッシュの雪崩不足で常に同値)",
+   "v1": {
+    "refuted": false,
+    "reason": "Confirmed by direct code reading and a compiled numerical replica. noise(t)/fbm(t,oct) in Expression.cpp:436/449 route unguarded to valueNoise/fbmNoise, which lattice-sample noiseHash1D (line 565). For n in [0,2^31), (n^0x7FFFFFFF)*2654435761 = (2147483647-n)*2654435761 <= 5.7e18 < 2^64, so the mult"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "シナリオは成立する。報告のコードを逐語コンパイルして数値検証した結果、noiseHash1D は n=0..20 でスプレッド 3.59e-9、n=0..100000 で 2.29e-5、全て 0.30902 近傍(報告値と一致)。構造的原因も確認: 非負 int n では (n^0x7FFFFFFF)<2^31 かつ 2^31*2654435761≈5.7e18<2^64 で乗算が絶対にラップせず、ハッシュは定数項 0x7FFFFFFF*2654435761≈0.309*2^64 に支配されるほぼ線形関数。最終の h^=h>>16 は下位48ビット(フルスケールの~1.5e-5)しか撹拌しな"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G09",
+   "file": "src/ScreenRecorder.cpp",
+   "line": 220,
+   "summary": "QProcess::finished ハンドラが exitCode/exitStatus を無視して無条件に recordingStopped(outputPath) を emit するため、ffmpeg が失敗終了した録画も「保存成功」として報告される",
+   "failure_scenario": "Windows で captureAudio=true のまま録画開始すると buildFFmpegArgs (119-123行) が『-f dshow -i audio=virtual-audio-capturer』を追加する。このサードパーティドライバが未導入の環境では ffmpeg は起動直後に exit code 1 で正常終了 (CrashExit ではない) するため errorOccurred は発火せず recordingError も出ない。finished ハンドラ (208-221行) は exitCode を Q_UNUSED で捨てて recordingStopped(outputPath) を emit し、MainWindow.cpp:7117 のハンドラがステータスバーに『Recording saved: <path>』と表示する。実際には出力ファイルは空/存在せず、ユーザーは録画できたと誤認して収録機会を失う (pulse 不在の Linux でも同様)。",
+   "severity": "medium",
+   "lens": "⑥データ損失・エラー握りつぶし",
+   "v1": {
+    "refuted": false,
+    "reason": "成立を確認。(1) src/ScreenRecorder.cpp:119-123 で Windows+captureAudio 時に \"-f dshow -i audio=virtual-audio-capturer\" を追加(Linux は 124-128 で pulse)。デバイス未導入だと ffmpeg はプロセス起動後に入力オープンで失敗し exit code 1 の NormalExit で終了。(2) ffmpeg バイナリ自体は起動するため waitForStarted(5000) (行225) は true を返し m_recording=true・recordingStart"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "成立経路を確認: Windows+captureAudio=true で buildFFmpegArgs (ScreenRecorder.cpp:119-123) が dshow 'audio=virtual-audio-capturer' を無条件追加。ドライバ未導入だと ffmpeg は起動成功後に exit code 1 の NormalExit で終了するため、Qt の仕様上 errorOccurred (FailedToStart/Crashed 等のみ) は発火せず recordingError は出ない。waitForStarted(5000) (225行) はプロセス起動自体は"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G09",
+   "file": "src/ScreenRecorder.cpp",
+   "line": 258,
+   "summary": "stopRecording() が GUI スレッドで waitForFinished(5000)→kill()→waitForFinished(3000) を同期実行し、最長8秒の UI フリーズと kill 時の MP4 破損 (録画全体の損失) を起こす",
+   "failure_scenario": "MainWindow::stopScreenRecording (MainWindow.cpp:7134) は GUI スレッドから ScreenRecorder::stopRecording() を直接呼ぶ。stopRecording は 'q' 送信後に m_process->waitForFinished(5000) でブロックし、長時間録画や低速ディスクで ffmpeg の finalize (moov atom 書き出し・バッファフラッシュ) が5秒を超えると kill() + waitForFinished(3000) に進む。この間メインウィンドウは最長約8秒完全に無応答になり、さらに kill された場合 -movflags +faststart 無しの MP4 は moov が書かれず再生不能ファイルになる=録画セッション全体が失われる。",
+   "severity": "medium",
+   "lens": "⑦GUIフリーズ",
+   "v1": {
+    "refuted": false,
+    "reason": "Confirmed. ScreenRecorder lives on the GUI thread (new ScreenRecorder(this) at MainWindow.cpp:7102, no moveToThread/QThread anywhere), and stopScreenRecording (MainWindow.cpp:7134) is invoked from QAction::triggered, so stopRecording()'s waitForFinished(5000) -> kill() -> waitForFinished(3000) (Scre"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "成立経路を確認: ScreenRecorder は MainWindow 親の GUI スレッドオブジェクト (MainWindow.cpp:7102、moveToThread なし)。メニュー QAction (MainWindow.cpp:2446) → stopScreenRecording (7128) → stopRecording() (ScreenRecorder.cpp:244) が GUI スレッドで同期実行され、waitForFinished(5000)→kill()→waitForFinished(3000) がイベントループを回さず最長約8秒ブロックする。ガードは皆無 "
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G09",
+   "file": "src/ProxyManager.cpp",
+   "line": 719,
+   "summary": "processNextInQueue() がクリップ毎に GUI スレッド上で同期 ffprobe を2回 (probeDurationUs / probeSourceCodec、各 waitForStarted 2s + waitForFinished 5s) 実行し、バッチプロキシ生成中に UI が繰り返し固まる",
+   "failure_scenario": "Timeline.cpp:2881 の generateProxy / MainWindow.cpp:6789 の generateAllProxies はどちらも GUI スレッドで呼ばれ、processNextInQueue が同期実行される。719-720行で probeDurationUs (1152-1162行: waitForStarted(2000)+waitForFinished(5000)) と probeSourceCodec (1202-1212行: 同様) を連続実行するため、NAS やスピンダウンした外付け HDD 上のクリップでは1クリップあたり最長約14秒 GUI がブロックする。さらに各ジョブ完了時の finished ラムダ (1049行) が同じ GUI スレッドで processNextInQueue を再入呼び出しするので、10クリップのバッチでは全クリップ間でフリーズが繰り返される (キャッシュは path 単位なので新規クリップ毎に必ず発生)。",
+   "severity": "medium",
+   "lens": "⑦GUIフリーズ",
+   "v1": {
+    "refuted": false,
+    "reason": "成立する。ProxyManager はシングルトンで自身のヘッダ (ProxyManager.h:44-56) が非 static メソッドを MAIN-THREAD ONLY と明記し、moveToThread/ワーカースレッドは存在しない。Timeline.cpp:2881 と MainWindow.cpp:6789 は GUI スレッドから generateProxy/generateAllProxies を直接呼び、両者は processNextInQueue() を同期呼び出しする (ProxyManager.cpp:162,196)。719-720 行で probeDuration"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "Scenario confirmed. processNextInQueue() (ProxyManager.cpp:719-720) synchronously runs probeDurationUs and probeSourceCodec, each blocking via waitForStarted(2000)+waitForFinished(5000) with no event-loop pumping (no processEvents/moveToThread/QtConcurrent in the file), and the block happens before "
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G09",
+   "file": "src/SubtitleTranslator.cpp",
+   "line": 180,
+   "summary": "DeepL への form-urlencoded ボディを QUrlQuery::toString(QUrl::FullyEncoded) で生成しており '+' がパーセントエンコードされないため、字幕テキスト中の '+' がサーバ側で空白に化けて翻訳される",
+   "failure_scenario": "translateDeepL (172-180行) は addQueryItem した字幕テキストを query.toString(QUrl::FullyEncoded).toUtf8() で application/x-www-form-urlencoded ボディとして POST する。Qt の QUrlQuery は RFC 3986 準拠で '+' を query の有効文字としてそのまま残す (Qt ドキュメント明記の落とし穴) が、DeepL はフォームエンコード規約で '+' を空白に復号する。例: 字幕『C++の講座』を DeepL 翻訳すると送信テキストが『C  の講座』として解釈され、訳文から『++』が消える。'&' や '=' はエンコードされるため被害は '+' を含むテキストに限定されるが、該当キャプションは常に破損する。",
+   "severity": "medium",
+   "lens": "④未検証入力 (エンコーディング欠落)",
+   "v1": {
+    "refuted": false,
+    "reason": "シナリオは成立する。src/SubtitleTranslator.cpp:180 は QUrlQuery::toString(QUrl::FullyEncoded).toUtf8() を application/x-www-form-urlencoded ボディとして POST しており、QUrlQuery は RFC 3986 準拠で '+' を query の有効文字としてエンコードしない (Qt ドキュメント「Handling of spaces and plus」に明記の既知の落とし穴)。一方フォームデコード側 (WHATWG urlencoded パーサ) は '+' を空白に復号す"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "成立する。src/SubtitleTranslator.cpp:172-180 は SRT 由来の生の字幕テキストを addQueryItem し、query.toString(QUrl::FullyEncoded).toUtf8() を Content-Type: application/x-www-form-urlencoded (169-170行) で POST する。Qt の QUrlQuery は文書化された仕様として全エンコードモードで '+' をそのまま残す(スペースは %20、'+' は as-is)一方、form-urlencoded パーサ(DeepL 側)は '+' をス"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G09",
+   "file": "src/InstagramPublish.cpp",
+   "line": 123,
+   "summary": "コンテナ処理のポーリング上限が kMaxPolls=10 × 2秒 = 約20秒しかなく、通常の Reels 動画 (処理に数十秒〜数分かかる) のアップロードがほぼ確実に『Timed out』で失敗する",
+   "failure_scenario": "startPollLoop (122-134行) は 2000ms 間隔の QTimer::singleShot を最大10回しか回さないため、Phase1 のコンテナ作成成功から約20秒 (+HTTP往復) 以内に status_code が FINISHED にならないと publishFailed(\"Timed out waiting for media container to finish processing\") を emit して打ち切る。Instagram Graph API の動画コンテナ処理は 60 秒級の Reels で普通に 30 秒〜数分かかるため、実運用サイズの動画では Phase3 の media_publish に到達できず投稿が常に失敗する (コンテナ自体はサーバ側で完成するが公開されない)。",
+   "severity": "medium",
+   "lens": "⑤ロジック欠陥 (タイムアウト設計)",
+   "v1": {
+    "refuted": false,
+    "reason": "シナリオは成立する。src/InstagramPublish.cpp:123-134 で kMaxPolls=10 と 2000ms の QTimer::singleShot がハードコードされ、pollCount は値渡しで単調増加のみ・リセット経路なし。10回 IN_PROGRESS を受けると総待機 ~20-30秒 (20秒+HTTP往復×10) で publishFailed(\"Timed out...\") を emit して打ち切る。呼び出し元 InstagramPublishDialog::onFailed はエラー表示のみでリトライ・継続ポーリングの防護は皆無、IgConfig "
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "成立する。startPollLoop (InstagramPublish.cpp:122-187) は container 作成成功後に pollCount=0 で入り、各イテレーションが QTimer::singleShot(2000ms)→status GET→非 FINISHED なら pollCount+1 で再帰。11回目の突入 (pollCount=10 >= kMaxPolls=10) で publishFailed(\"Timed out...\") を emit して恒久的に打ち切るため、実効ウィンドウは約 20 秒+HTTP 往復のみ。kMaxPolls/2000ms はハード"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G10",
+   "file": "src/AIHighlight.cpp",
+   "line": 463,
+   "lens": "②整数演算 / ④未検証入力",
+   "severity": "high",
+   "summary": "combineScores() が動画フレームの pts 由来の maxTime を検証なしで int にキャストして gridSize を作るため、壊れた pts を持つファイルで整数オーバーフロー→負サイズ/巨大 QVector 確保でクラッシュ・OOM する",
+   "failure_scenario": "AIHighlight::analyzeMotionActivity/analyzeSceneChanges は `double time = frame->pts * av_q2d(stream->time_base)` (283行/403行) を無検証で ScoredSegment.time に格納し、combineScores() が `int gridSize = static_cast<int>(std::ceil(maxTime)) + 1` (463行) → `QVector<double> audioGrid(gridSize)` ×3本を確保する。pts が破損した MP4 (例: 末尾フレームの pts が 10^12) を AI ハイライト解析にかけると maxTime が INT_MAX 超になり、double→int キャストは UB (x86 では INT_MIN) で gridSize が負になり QVector コンストラクタで即クラッシュ、中程度に大きい pts (数億秒) でも数 GB の確保で OOM する。時間値の上限クランプが一切ない。",
+   "v1": {
+    "refuted": false,
+    "reason": "成立を確認。AIHighlight.cpp:283/403 は frame->pts を AV_NOPTS_VALUE チェック・duration クランプ一切なしで time に格納（motion 経路 283-287 はサンプリングした全フレームで無条件 append なので巨大 pts フレーム1枚で汚染される）。combineScores の唯一のガードは `maxTime <= 0.0`（461行）で巨大正値は素通りし、463行 `static_cast<int>(std::ceil(maxTime)) + 1` は maxTime > INT_MAX で UB（x86-64 では "
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "報告通り成立する。AIHighlight.cpp 283/403行は frame->pts * av_q2d(time_base) を AV_NOPTS_VALUE チェックも上限クランプもなく ScoredSegment.time に格納し、combineScores (456-463行) は下限ガード (maxTime <= 0.0) のみで `static_cast<int>(std::ceil(maxTime)) + 1` を実行。maxTime > INT_MAX で double→int 変換は UB (x86 では INT_MIN → gridSize 負 → QVector 負"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G10",
+   "file": "src/MotionStabilizer.cpp",
+   "line": 423,
+   "lens": "⑦GUIフリーズ",
+   "severity": "medium",
+   "summary": "analyzeFile() が動画全フレームの同期デコード+フレーム毎 441 回の全画面 NCC 計算を行い、MainWindow::runMotionStabilizer (MainWindow.cpp:10196) から GUI スレッドで直接呼ばれるため、実尺クリップで数分間 UI が完全フリーズする",
+   "failure_scenario": "編集メニューの「スタビライズ」を実行すると MainWindow.cpp:10196 で `stab.analyzeFile(target.filePath)` が GUI スレッドで同期実行される。analyzeFile は av_read_frame ループ (469行) で全フレームをデコードし、フレーム毎に estimateTranslation → computeShiftedNCC を (2*kSearchRadius+1)^2=441 回、各回 320x180 画素の 2 パス走査 (約 5,000 万画素演算/フレーム) を行う。ループ内に processEvents や進捗コールバックへの譲歩はなく、1 分の 30fps クリップ (1800 フレーム) で数分間ウィンドウが「応答なし」になる。中断手段もない。",
+   "v1": {
+    "refuted": false,
+    "reason": "シナリオは成立する。MainWindow.cpp:1801 で QAction::triggered が runMotionStabilizer に直結 (GUIスレッド)、10196 で analyzeFile を同期呼び出し。processEvents は解析開始前の 10192 の1回のみで、解析ループ中にイベントループへの譲歩・キャンセル手段・フレーム上限は一切ない。analyzeFile (MotionStabilizer.cpp:469-) は av_read_frame で全フレームを同期デコードし processFrame へ渡す。さらに実コストは報告より悪い: kSearch"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "反証失敗 — シナリオはコード上完全に成立し、報告はむしろ深刻度を過小評価している。成立経路: (1) MainWindow.cpp:1800-1801 で編集メニュー「スタビライズ (手ブレ補正)...」の triggered が MainWindow::runMotionStabilizer に direct connect され、GUI スレッドで実行される。(2) runMotionStabilizer (MainWindow.cpp:10173-10205) はクリップ存在チェックと QInputDialog の後、10192 で processEvents を一度呼ぶだけで、101"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G10",
+   "file": "src/CaptionEditorDialog.cpp",
+   "line": 454,
+   "lens": "⑦GUIフリーズ",
+   "severity": "medium",
+   "summary": "字幕エディタの「音声認識実行」が recognizer->recognize() を GUI スレッドで同期呼び出しし、WhisperCliRecognizer は waitForFinished(5分) でブロックするため、書き起こし中 UI が最大 5 分フリーズする",
+   "failure_scenario": "CaptionEditorDialog::onRecognizeClicked (431-478行) は QApplication::setOverrideCursor の後、453-455行で `recognizer->recognize(params)` を GUI スレッドでそのまま実行する。WhisperCliRecognizer::recognize は SpeechRecognizer.cpp:190 で `proc.waitForFinished(5 * 60 * 1000)` により whisper-cli の完了まで同期ブロックする。数分の音声ファイルを選ぶと書き起こしが終わるまで (最大 5 分) メインウィンドウ全体が再描画不能・操作不能になり、キャンセルもできない。ワーカースレッド化も QProgressDialog もない。",
+   "v1": {
+    "refuted": false,
+    "reason": "成立経路を確認: CaptionEditorDialog.cpp:199 で recognize ボタンは GUI スレッドの onRecognizeClicked に直接接続され、453-455行で setOverrideCursor → recognizer->recognize(params) を同期呼び出し → restoreOverrideCursor のみ。ワーカースレッド・QtConcurrent・QProgressDialog・processEvents・キャンセル手段は一切ない。m_recognizerCombo は availableRecognizers() (Speec"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "成立を確認。CaptionEditorDialog.cpp:199 で m_recognizeButton の clicked が直接接続 (direct connection) されており onRecognizeClicked は GUI スレッドで実行。454行で recognizer->recognize(params) を同期呼び出しし、WhisperCliRecognizer::recognize (SpeechRecognizer.cpp:154, waitForFinished は同 191行付近) が proc.waitForFinished(5*60*1000) で whis"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G10",
+   "file": "src/RemotionExport.cpp",
+   "line": 321,
+   "lens": "⑤ロジック欠陥",
+   "severity": "medium",
+   "summary": "Remotion エクスポートのクリップ配置計算が ClipInfo::leadInSec (クリップ前のギャップ) を完全に無視して offset += effectiveDuration() のみで累積するため、ギャップのあるタイムラインは全クリップが前詰めされ A/V 同期・タイミングが崩れた動画が生成される",
+   "failure_scenario": "Timeline はクリップ開始位置を `cursor + leadInSec` で計算する (Timeline.cpp:846) が、generateVideoCompositionBody (318-321行, 389行) と generateTimelineData (612-614行, 689行)、calculateDurationInFrames (253-258行) はいずれも `offset += clip.effectiveDuration()` だけで leadInSec を加算しない。クリップ間に 5 秒のギャップがある(またはトラック先頭にギャップがある)プロジェクトを Remotion エクスポートすると、生成された Video.tsx / timeline.ts の Sequence from= が全て実際より早くなり、ビデオとオーディオトラックのギャップ量が異なる場合は A/V がずれた成果物がレンダリングされる。DURATION_IN_FRAMES も短く計算され末尾が欠ける。",
+   "v1": {
+    "refuted": false,
+    "reason": "成立を確認。エクスポート経路 exportToRemotion → populateProjectData (MainWindow.cpp:4091) → Timeline::allVideoTracks/allAudioTracks (Timeline.cpp:5348) は生の ClipInfo (leadInSec 込み) を無加工でコピーし、RemotionExportDialog は const 参照 m_data をそのまま exportProject に渡す (RemotionExport.cpp:1448)。RemotionExport.cpp/h に leadInSec への"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "成立を確認。タイムラインの正準レイアウトは clipStart = cursor + leadInSec (Timeline.cpp:846) で、leadInSec はドロップ (planDrop→insertClipPreservingDownstream)、位置ドラッグ (Timeline.cpp:1712)、gap保存削除 (800-805)、左トリム (1770) で日常的に非ゼロになり、ProjectFile で永続化もされる。エクスポート経路 MainWindow.cpp:9077 populateProjectData → Timeline::allVideoTracks/al"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G10",
+   "file": "src/RemotionExport.cpp",
+   "line": 350,
+   "lens": "④未検証入力 (生成コードへのエスケープ欠落)",
+   "severity": "medium",
+   "summary": "生成 TSX/TS にクリップの filePath と fi.baseName() を無エスケープで文字列リテラル埋め込みしており (tsStringLiteralContent はテキストのみに適用)、Windows パスのバックスラッシュや引用符入りファイル名で生成コードが壊れる",
+   "failure_scenario": "「Copy media files to assets/」を外してエクスポートすると assetSrc = clip.filePath がそのまま `src={\"C:\\Users\\me\\video.mp4\"}` として Video.tsx (350行, 421行) と timeline.ts (633行, 717行) に書き込まれる。JS 文字列内の \\U・\\m は不正/無意味なエスケープとして解釈され、パスが壊れて Remotion のレンダリングが 'ファイルが見つからない' で失敗する (\\videos の \\v は垂直タブ化)。また 347行の `name=\"\" << fi.baseName()` は Linux/macOS で合法な `\"` 入りファイル名で JSX 属性を破壊する。既知の 352行の修正 (tsStringLiteralContent) はオーバーレイテキストにのみ適用されておりパスには未適用。",
+   "v1": {
+    "refuted": false,
+    "reason": "Scenario holds. RemotionExport.cpp embeds assetSrc raw at lines 350/421 (Video.tsx) and 633/717 (timeline.ts), and fi.baseName() raw at line 347; tsStringLiteralContent() is applied only to overlay text (373/672). The 'Copy media files to assets/' checkbox (line 1291) is uncheckable, making assetSrc"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "成立する。src/RemotionExport.cpp の 4 サイト (Video.tsx 生成 350/421 行、timeline.ts 生成 633/717 行) で assetSrc/src を JS 文字列リテラルへ無エスケープ埋め込みしており、includeAssets=false 時は assetSrc = clip.filePath がそのまま出る。includeAssets はダイアログの素のチェックボックス (1291/1440行、既定 ON だが自由に OFF 可) でガード無し。tsStringLiteralContent (22-30行) は ov.text (37"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G10",
+   "file": "src/RemotionExport.cpp",
+   "line": 1140,
+   "lens": "⑥データ損失・エラー握りつぶし",
+   "severity": "medium",
+   "summary": "copyAssets() が出力名を basename のみで決め、既存同名ファイルはコピーをスキップするため、異なるディレクトリの同名メディアが 1 つに統合され、片方のクリップが黙って別の映像を参照する",
+   "failure_scenario": "タイムラインに /shoot1/intro.mp4 と /shoot2/intro.mp4 (別内容・同名) を含むプロジェクトを includeAssets=true でエクスポートすると、copyAssets (1133-1149行) は 1 本目を assets/intro.mp4 にコピーし、2 本目は `if (!QFile::exists(dest))` (1140行) が偽になるためコピーされず、エラーも警告も出ない。生成コード側 (330行, 623行) は両クリップとも \"./assets/intro.mp4\" を参照するため、レンダリング結果では 2 本目のクリップが 1 本目の映像に差し替わった動画が黙って生成される。ProjectCollector.cpp の resolveDestBasename (_2 サフィックス) と同等の衝突回避が存在しない。",
+   "v1": {
+    "refuted": false,
+    "reason": "成立を確認。copyAssets (src/RemotionExport.cpp:1129-1154) は dest を assetsDir + \"/\" + fi.fileName() (basename のみ、1139行) で決め、1140行の `if (!QFile::exists(dest))` により同名既存ファイルへのコピーを黙ってスキップする (内容比較・サフィックス・警告・exportError いずれも無し)。一方、生成コード側 (330/410/623/713行) は includeAssets 時に \"./assets/<basename>\" を参照するため、/shoot1"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "シナリオは成立する。copyAssets (src/RemotionExport.cpp:1139) は dest を basename のみで決定し、1140行の QFile::exists(dest) チェックで既存同名ファイルへのコピーを警告なしにスキップする。内容比較・canonicalFilePath 判定・_2 サフィックス等の衝突回避はファイル全体に存在しない (grep で確認)。一方、生成コード側の 4 箇所 (329, 409, 622, 712行) はすべて includeAssets 時に \"./assets/<basename>\" を参照するため、/shoot1/in"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "G10",
+   "file": "src/RemotionExport.cpp",
+   "line": 1497,
+   "lens": "⑦GUIフリーズ",
+   "severity": "medium",
+   "summary": "runNpmInstall() が GUI スレッド上で QProcess::waitForFinished(60000) を実行するため、「Run npm install after export」を有効にすると npm install 完了まで最大 60 秒 UI がフリーズする",
+   "failure_scenario": "RemotionExportDialog::onExportComplete (1462-1481行) は m_runNpmCheck が ON のとき runNpmInstall(outputDir) を呼び、1496-1497行で `npm.start(\"npm\", ...); npm.waitForFinished(60000)` を GUI スレッドで同期実行する。Remotion の依存 (react/remotion/@remotion/cli) の初回インストールは通常 30 秒〜数分かかるため、その間ダイアログとメインウィンドウが応答なしになり、60 秒でタイムアウトした場合は npm が走行中のまま waitForFinished だけが偽を返して「npm install failed」と誤報告する (プロセスの kill もしない)。1493行の setText(\"Running npm install...\") もブロック中は再描画されない。",
+   "v1": {
+    "refuted": false,
+    "reason": "成立を確認。RemotionExportDialog は MainWindow::exportToRemotion() (MainWindow.cpp:9079) で GUI スレッド上に生成・exec() され、m_exporter は同ダイアログの子 QObject (RemotionExport.cpp:1224) で QThread/moveToThread は一切なし。exportComplete (line 110 emit → line 1235 direct connection) は GUI スレッドで onExportComplete を同期呼び出しし、m_runNpmCh"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "成立経路を確認済み。反証不能。(1) MainWindow.cpp:9079 の exportToRemotion() が GUI スレッドで RemotionExportDialog::exec() を実行。(2) onExport() (RemotionExport.cpp:1448) が m_exporter->exportProject() を同期呼び出し — RemotionExport.cpp/.h に QThread/moveToThread/QtConcurrent は一切なく (grep 0件)、exporter はワーカースレッドに居ない。(3) exportProject"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "SEC",
+   "file": "src/AffinityPsdImporter.cpp",
+   "line": 239,
+   "severity": "high",
+   "lens": "importer/parser OOB (untrusted PSD)",
+   "summary": "buildLayerImage() は QImage(width,height,Format_ARGB32) を構築後 isNull() を確認せず img.scanLine(y) を書き込むため、レイヤ境界(width/height)が過大な悪意ある .psd で QImage の確保が失敗して null 画像になると、null の scanLine ポインタへ dst[x]=qRgba(...) を書き込み NULL ポインタ書き込みでクラッシュする。",
+   "failure_scenario": "loadPsd() のレイヤ矩形を right-left=40000 / bottom-top=40000 に細工し、そのレイヤの nChan=0(チャンネル無し=readChannelPlane 経路を回避)にした .psd を開く。line 494-495 で w=40000,h=40000(積 1.6e9 < INT_MAX なので早期 return せず)、line 509 の w>0&&h>0 を満たし buildLayerImage(40000,40000, 空planes) を呼ぶ。line 225 の QImage(40000,40000,ARGB32) は約6.4GBを要求し確保失敗で null(isNull()==true)を返すが、line 238-239 のループで img.scanLine(0) が nullptr を返し、line 246 dst[x]=qRgba(...) が null+x へ書き込み → SEGV。QImage 構築後の null チェックが無いのが原因。",
+   "v1": {
+    "refuted": false,
+    "reason": "Scenario holds. Layer bounds L.left/right/top/bottom are attacker-controlled S32 values (readS32, lines 385-386) with no upper clamp anywhere (grep confirms only std::max(0,...) lower clamps at 467-468/494-495). They flow into buildLayerImage(w,h,...) at line 510, guarded only by w>0&&h>0. Line 225 "
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "Scenario holds as written. Trace confirmed: layer rect is read raw via readS32 (lines 385-386) with no upper-bound/canvas clamp anywhere; with nChan=0 the channel loop (465-477) never calls readChannelPlane, leaving layerPlanes[i] empty and bypassing its size guards. Line 509 gates only on w>0 && h>"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "DATA",
+   "file": "src/MainWindow.cpp",
+   "line": 9389,
+   "summary": "closeEvent が未保存変更の確認プロンプト無しで終了し、さらに markCleanShutdown() でクリーンシャットダウンマーカーを書くため、次回起動時の自動保存復元プロンプトまで抑止される（変更追跡フラグ自体がコードベースに存在しない）",
+   "failure_scenario": "プロジェクトを編集して保存せずにウィンドウの×を押すと、closeEvent (MainWindow.cpp:9389-9396) は saveWindowState() → m_autoSave->markCleanShutdown() → shortcutManager 保存のみ実行して即終了する。isWindowModified/projectModified 系の変更フラグは grep でヒット0件で「保存しますか?」の分岐が一切なく、未保存編集が全て消える。自動保存 ON の場合でも markCleanShutdown() が ~/.veditor/.clean_shutdown を書くため、次回起動時 recoveryAvailable ハンドラ (MainWindow.cpp:1013) が cleanShutdownBeforeAutoSaveStart=true で return し、直前セッションの autosave バックアップからの復元が案内されない。",
+   "severity": "high",
+   "lens": "close-data-loss",
+   "v1": {
+    "refuted": false,
+    "reason": "成立経路を確認: (1) MainWindow::closeEvent (src/MainWindow.cpp:9389-9396) は saveWindowState()→markCleanShutdown()→shortcutManager->saveToSettings()→QMainWindow::closeEvent のみで、QMessageBox も event->ignore() 経路も無く無条件に閉じる。(2) 変更追跡フラグは全grepでヒット0 (SmartReframe::m_analysisDirty は解析キャッシュで無関係)。saveWindowState はジオメ"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "成立を確認。closeEvent (src/MainWindow.cpp:9389-9396) は saveWindowState()(QSettings のジオメトリ/テーマのみ、プロジェクト非保存)→ markCleanShutdown() → shortcut 保存 → 基底 closeEvent で無条件に閉じ、未保存確認の分岐・event->ignore() 経路が皆無。変更追跡フラグは src 全体 grep で不存在(SmartReframe::m_analysisDirty のみで無関係)。さらに終了メニュー (1667-1671) は qApp->quit() 直結で、そのツ"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "DATA",
+   "file": "src/ProjectFile.cpp",
+   "line": 1305,
+   "summary": "ClipInfo::stabilizerKeyframes（編集>スタビライズでベイクした補正キーフレーム）が clipToJson/clipFromJson で一切シリアライズされず、保存/読込ラウンドトリップで消失する",
+   "failure_scenario": "編集>スタビライズを実行すると MotionStabilizer::analyzeFile の結果が m_timeline->setClipStabilizerKeyframes(0, kfs) (MainWindow.cpp:10202, Timeline.cpp:5671) でクリップに格納され、再生時は buildPlaybackEntries 経由で GLPreview に適用される (Timeline.cpp:4993/5122, VideoPlayer.cpp:2006)。しかし ProjectFile::clipToJson (1305-1366) と clipFromJson (1369-1429) には stabilizerKeyframes の書出し/読込が無い（ファイル内に \"stabiliz\" は0ヒット）。プロジェクトを保存して開き直すと解析済みスタビライズが黙って失われ、再生・書き出しとも未補正映像に戻る。",
+   "severity": "medium",
+   "lens": "save-load-roundtrip",
+   "v1": {
+    "refuted": false,
+    "reason": "成立を確認。ClipInfo::stabilizerKeyframes (Timeline.h:122) は Edit>スタビライズ (MainWindow.cpp:10202 → Timeline.cpp:5679) で第1ビデオトラックの ClipInfo に格納され、buildPlaybackEntries (Timeline.cpp:4993/5122) → VideoPlayer.cpp:2006 → GLPreview の uStab プリワープ (GLPreview.cpp:2248) で実際に描画へ効く実データ。一方、保存/読込は tracksToJson/FromJson ("
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "シナリオは全リンク成立。(1) 編集メニュー「スタビライズ」が MainWindow.cpp:1800-1801 で runMotionStabilizer に配線済み。(2) 解析結果は setClipStabilizerKeyframes(0,kfs) (MainWindow.cpp:10202 → Timeline.cpp:5679) でインメモリの ClipInfo::stabilizerKeyframes (Timeline.h:122) にのみ格納され、ベイクやサイドカー等の代替永続化は無い。(3) buildPlaybackEntries (Timeline.cpp:4993/5"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "DATA",
+   "file": "src/MainWindow.cpp",
+   "line": 4323,
+   "summary": "Exporter に渡した SmartReframe/SubtitleTrackRenderer ポインタがプロジェクト切替でクリアされず、別プロジェクトのエクスポートに前プロジェクトのクロップトラック/字幕が適用され、保存ファイルにも設定が混入する",
+   "failure_scenario": "プロジェクトAでスマートリフレームを実行 (MainWindow.cpp:10749 setSmartReframe(&m_smartReframe)) するか、リフレーム保存済みのAを開く (4325) と、Exporter::m_smartReframe が非 null になる。setSmartReframe(nullptr) の呼び出しは repo 全体に存在せず、applyLoadedProjectData は data.smartReframe が空のとき m_smartReframe をリセットしない (4323 の if (!data.smartReframe.isEmpty()) ガードのみ、SmartReframe に reset/clear API 無し)。その後「新規プロジェクト」または smartReframe キーの無い別プロジェクトBを開いてエクスポートすると、Exporter.cpp:712 で needsRgbPass が強制 true になり 748 行で A の cropTrack が全フレームに適用され、出力が黙って誤クロップされる。さらに populateProjectData:4158 が無条件に m_smartReframe.toJson() を書くため、Bを保存すると A のリフレーム設定が B の .veditor に永続混入する。renderSubtitleTrack が渡す SubtitleTrackRenderer (10783) も同様にクリアされず、旧プロジェクトの字幕が焼き込まれる。",
+   "severity": "medium",
+   "lens": "export-state-leak",
+   "v1": {
+    "refuted": false,
+    "reason": "成立を確認。(1) Exporter は MainWindow ctor で一度だけ生成され (MainWindow.cpp:974) セッション中使い回し。newProject() は applyProjectConfig のみで m_smartReframe/Exporter ポインタを一切リセットせず、openProject も同一ウィンドウで applyLoadedProjectData を呼ぶだけ。(2) repo 全体で setSmartReframe(nullptr)/setSubtitleRenderer(nullptr) は不存在 (呼び出しは 4325/10749/1078"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "成立経路を確認: (1) setSmartReframe の呼び出しは MainWindow.cpp:4325/10749 の2箇所のみで、nullptr でのクリアは repo 全体に存在せず、setSubtitleRenderer も 10783 の1箇所のみ。(2) applyLoadedProjectData:4323 は if (!data.smartReframe.isEmpty()) ガードのみで else 節が無く、ProjectFile.cpp:642/1132 はキー欠落時に空 QJsonObject を返すため、smartReframe キーの無いプロジェクトBを開いても"
+   },
+   "status": "confirmed"
+  },
+  {
+   "finder": "DATA",
+   "file": "src/BatchExportQueue.cpp",
+   "line": 21,
+   "summary": "バッチエクスポートキューは 200ms 毎に progress+=20 するだけのタイマーシミュレーションで、実際のエクスポート処理を一切呼ばずに約1秒で Done/\"Export complete\" を報告し、出力ファイルは生成されない",
+   "failure_scenario": "メニューから Batch Export Queue を開き (MainWindow.cpp:2685→8859)、実在の .veditor と出力先 .mp4、プリセットを指定して Start を押す (BatchExportDialog.cpp:94-152)。Queue::processNext (BatchExportQueue.cpp:81) はタスクを Running にして QTimer を起動するだけで、timeout ラムダ (10-33) は task.progress += 20 を繰り返し 100% 到達で state=Done / message=\"Export complete\" を emit する。Exporter/ffmpeg/ファイル書出しはファイル内に一切存在せず、projectPath/outputPath/preset は保持されるだけで未使用。UI には Done と表示されるが出力先には何も作られず、ユーザーがエクスポート完了と誤認して素材を破棄すると実質的なデータ損失につながる。",
+   "severity": "medium",
+   "lens": "export-fake-success",
+   "v1": {
+    "refuted": false,
+    "reason": "成立を確認。src/BatchExportQueue.cpp の timeout ラムダ (10-33行) は 200ms 毎に progress+=20 するだけで、100% 到達時に state=Done / message=\"Export complete\" を emit する純粋なタイマーシミュレーション。projectPath/outputPath/preset は addTask (36-49行) で保存されるのみで一切読まれず、ファイル内に Exporter/ffmpeg/QFile 等の実出力処理は皆無。経路も実在: CMakeLists.txt 432-435行で無条件ビルド"
+   },
+   "v2": {
+    "refuted": false,
+    "reason": "報告は完全に成立する。BatchExportQueue.cpp を全行読んだ結果、processNext() は state=Running にして 200ms QTimer を起動するだけで、timeout ラムダ (10-33行) は progress+=20 を5回繰り返して約1秒で state=Done / message=\"Export complete\" を emit する。Exporter/ffmpeg/QProcess/ファイル書出しはファイル内に一切なく、projectPath/outputPath/preset は ExportTask に保持されるだけで未使用。反証候補を"
+   },
+   "status": "confirmed"
+  }
+ ],
+ "split": [],
+ "stats": {
+  "raw": 66,
+  "fresh": 60,
+  "confirmed": 58,
+  "split": 0
+ }
+}

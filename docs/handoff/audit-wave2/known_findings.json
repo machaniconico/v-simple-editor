@@ -1,0 +1,497 @@
+[
+ {
+  "file": "src/Exporter.cpp",
+  "line": 458,
+  "summary": "Per-frame SwsContext leak: `sws_getContext(...) != swsCtx` allocates a brand-new context every frame just for pointer comparison (always unequal), leaks it, the"
+ },
+ {
+  "file": "src/RenderQueue.cpp",
+  "line": 196,
+  "summary": "cancelCurrent() calls kill()+waitForFinished(), which synchronously re-enters the QProcess::finished lambda: the job is still Rendering (Cancelled is set only a"
+ },
+ {
+  "file": "src/NetworkRender.cpp",
+  "line": 209,
+  "summary": "distributeJobs() appends segment jobs to m_jobs (QVector) while range-iterating the same vector by reference, invalidating the loop iterators and the `job` refe"
+ },
+ {
+  "file": "src/NodeCanvasWidget.cpp",
+  "line": 349,
+  "summary": "NodeItem stores a raw GraphNode* pointing into NodeGraph::nodes (QVector<GraphNode>); onAddNode/onCanvasContextMenuRequested append to that vector and onDeleteS"
+ },
+ {
+  "file": "src/MainWindow.cpp",
+  "line": 739,
+  "summary": "AutoSave recovery path deletes all backups instead of restoring: the recoveryAvailable handler silently QFile::remove()s every autosave file, AutoSave::recoverF"
+ },
+ {
+  "file": "src/VideoPlayer.cpp",
+  "line": 3991,
+  "summary": "handlePlaybackTick's clip-boundary block (reachedEntryEnd -> seekToTimelineUs/advanceToEntry, with early `return` after scheduleNextFrame) executes BEFORE the t"
+ },
+ {
+  "file": "src/Exporter.cpp",
+  "line": 530,
+  "summary": "RGB post-process path converts back to hardcoded AV_PIX_FMT_YUV420P instead of targetPixFmt, writing 8-bit 4:2:0 data into the 10-bit outFrame on HDR10/HLG/ProR"
+ },
+ {
+  "file": "src/ExtrudedMesh.cpp",
+  "line": 298,
+  "summary": "Front/back cap triangle emission ignores each ring's vertex offset within the layer (`rd.vertOffset` is computed but unused; indices are `base + i0` instead of "
+ },
+ {
+  "file": "src/Exporter.cpp",
+  "line": 209,
+  "summary": "Audio is never encoded or muxed: resolvedAudioCodec is computed and discarded, only one video stream is created, and no audio packets are read/written anywhere "
+ },
+ {
+  "file": "src/SceneCutScanner.cpp",
+  "line": 46,
+  "summary": "m_thread is connected to deleteLater() on finished but the raw pointer is never nulled, so after a scan completes the destructor and any subsequent scanFile() d"
+ },
+ {
+  "file": "src/RenderQueue.cpp",
+  "line": 133,
+  "summary": "stop() cannot stop the queue: cancelCurrent()'s synchronous waitForFinished delivers the finished handler which calls startNextJob() and launches the next pendi"
+ },
+ {
+  "file": "src/ShaderEffect.cpp",
+  "line": 1127,
+  "summary": "renderChain() + the Gaussian Blur two-pass path create an OpenGL feedback loop: render() always uses m_fbo[0] as the H-pass intermediate, but renderChain also u"
+ },
+ {
+  "file": "src/RenderQueue.cpp",
+  "line": 580,
+  "summary": "Selecting 2-pass adds only `-pass 2` to the ffmpeg args without ever running pass 1, so the encoder cannot find the ffmpeg2pass stats/log file and the job alway"
+ },
+ {
+  "file": "src/ChromaKeyRefine.cpp",
+  "line": 33,
+  "summary": "hsvDistance does not handle Qt's achromatic hue sentinel (-1), producing a negative hue distance so all white/gray/black pixels are treated as matching the gree"
+ },
+ {
+  "file": "src/BlenderMeshImporter.cpp",
+  "line": 246,
+  "summary": "readAccessorBytes' bounds guard is broken: when the outer check fires for start<0 or needed<=0 (int overflow), the inner block only re-tests 'start + needed > b"
+ },
+ {
+  "file": "src/BlenderMeshImporter.cpp",
+  "line": 505,
+  "summary": "GLB chunk parsing casts the untrusted 32-bit chunkLen to int for the bounds check but passes the original quint32 to QByteArray, so a chunkLen >= 2^31 bypasses "
+ },
+ {
+  "file": "src/ProxyManager.cpp",
+  "line": 652,
+  "summary": "cancelGeneration() disconnects the QProcess finished-lambda before terminating ffmpeg, so proxyCancelled/proxyFinished are never emitted on user cancel — the on"
+ },
+ {
+  "file": "src/RemotionExport.cpp",
+  "line": 200,
+  "summary": "writeRootTsx hardcodes durationInFrames=300 whenever config.durationInFrames==0, and the dialog never sets durationInFrames (onExport at line 1403 omits it), so"
+ },
+ {
+  "file": "src/RemotionExport.cpp",
+  "line": 147,
+  "summary": "The exporter never generates src/index.ts (no registerRoot() entry point anywhere), yet package.json's render script and RemotionPreview::launchRender (line 117"
+ },
+ {
+  "file": "src/ProjectFile.cpp",
+  "line": 334,
+  "summary": "ProjectFile::save() opens the existing .veditor with WriteOnly (truncating it), ignores the return value of file.write(), and unconditionally returns true — a f"
+ },
+ {
+  "file": "src/PythonScript.cpp",
+  "line": 400,
+  "summary": "ScriptEngine::runViaProcess runs a synchronous read loop on the GUI thread with no timeout escape while the python process is alive ('while (!gotResult)' only b"
+ },
+ {
+  "file": "src/ParticleSystem.cpp",
+  "line": 162,
+  "summary": "ParticleSystem::update() simulates and spawns particles in a hard-coded 1920x1080 fallback space (passes QSize(1,1) to stepParticles/spawnParticle, which treats"
+ },
+ {
+  "file": "src/NodePropertiesPanel.cpp",
+  "line": 57,
+  "summary": "clearForm() only deleteLater()s items that are widgets; the QFormLayout inserted by buildForm() is a layout item, and deleting a QLayout does not delete or hide"
+ },
+ {
+  "file": "src/MotionTracker.cpp",
+  "line": 334,
+  "summary": "cancel() runs on the GUI thread and calls resetOcclusionState(), which reassigns m_lastConfidentTemplate (QImage) and clears m_recentScores (QVector) while the "
+ },
+ {
+  "file": "src/FcpxmlExporter.cpp",
+  "line": 82,
+  "summary": "buildXml() writes clip names, project name, and file URLs into XML attributes with no escaping of &, <, >, or double quotes, producing malformed FCPXML."
+ },
+ {
+  "file": "src/TextManager.cpp",
+  "line": 151,
+  "summary": "TextManager::removeTemplate は再保存時に各テンプレートの \"name\" フィールドのみ書き出す（コメント通り \"minimal re-save\"）ため、残存テンプレートのフォント・色・アウトライン・シャドウ・アニメ設定が全て text_templates.json から消える。"
+ },
+ {
+  "file": "src/BlenderMeshImporter.cpp",
+  "line": 240,
+  "summary": "Integer overflow in glTF accessor size computation bypasses the buffer bounds check, enabling a large out-of-bounds read."
+ },
+ {
+  "file": "src/LutImporter.cpp",
+  "line": 112,
+  "summary": "A .cube LUT with size 1 passes isValid() but produces negative / out-of-bounds table indices in trilinearInterpolate (and the 1D path)."
+ },
+ {
+  "file": "src/ProjectFile.cpp",
+  "line": 1107,
+  "summary": "ClipInfo::leadInSec (the leading gap that positions every clip on its track; used by all Timeline layout/paint/drag math at Timeline.cpp:843/948/1024) is never "
+ },
+ {
+  "file": "src/ProjectFile.cpp",
+  "line": 1217,
+  "summary": "colorCorrectionToJson/colorCorrectionFromJson omit the 9 Lift/Gamma/Gain color-wheel fields (liftR..gainB, VideoEffect.h:23-25) that ColorGradingPanel edits, ev"
+ },
+ {
+  "file": "src/ProjectCollector.cpp",
+  "line": 286,
+  "summary": "ProjectCollector rewrites clip.filePath to the relative string \"media/<basename>\" and saves the .veditor, but no load-path code (ProjectFile::load, applyLoadedP"
+ },
+ {
+  "file": "src/ProjectFile.cpp",
+  "line": 1153,
+  "summary": "ClipInfo::textManager (per-clip enhanced text overlays added via the text tool, MainWindow.cpp:5113/5947) is not serialized in clipToJson/clipFromJson, and the "
+ },
+ {
+  "file": "src/VideoStabilizer.cpp",
+  "line": 101,
+  "summary": "probeVideoStream's size regex (\\d+)x(\\d+) matches the MP4 stream id \"[0x1]\" (or codec tag \"0x31637661\") before the real resolution, so width parses as 0 and pla"
+ },
+ {
+  "file": "src/YoutubeUploadManager.cpp",
+  "line": 361,
+  "summary": "pause()/cancel() of the active job never abort the in-flight chunk PUT, and onCompleted() lacks the state guard that onChunkUploaded has, so the old job's compl"
+ },
+ {
+  "file": "src/Timeline.cpp",
+  "line": 5324,
+  "summary": "restoreFromProject never clears video/audio tracks beyond the loaded project's track count, so stale clips from the previous project survive a File>Open and get"
+ },
+ {
+  "file": "src/Timeline.cpp",
+  "line": 776,
+  "summary": "TimelineTrack::splitClipAt copies the original clip wholesale into the second half, so the right half inherits leadInSec (and leadIn/trailOut transitions), inse"
+ },
+ {
+  "file": "src/AudioEQ.cpp",
+  "line": 172,
+  "summary": "readyReadStandardError lambda (queued to the GUI thread) dereferences m_process, which the worker thread sets to nullptr right after deleteLater — null-pointer "
+ },
+ {
+  "file": "src/AudioMixer.cpp",
+  "line": 385,
+  "summary": "Late-drop path advances ringHead by usToBytes(clampedLateUs) without rounding to the 4-byte frame size, permanently misaligning the s16-stereo ring and turning "
+ },
+ {
+  "file": "src/AffinityVectorImporter.cpp",
+  "line": 3,
+  "summary": "Unguarded #include <QtSvg/QSvgRenderer> and QSvgRenderer usage in loadSvg() although CMakeLists treats Qt6Svg as optional (find_package QUIET + conditional link"
+ },
+ {
+  "file": "src/RenderQueue.cpp",
+  "line": 438,
+  "summary": "The QProcess::finished handler (lambda at line 459) calls startNextJob() at line 497, and startNextJob does `delete m_process` (line 438) — deleting the emittin"
+ },
+ {
+  "file": "src/VideoEffectDialogs.cpp",
+  "line": 298,
+  "summary": "VideoEffectDialog::updateParamUI() sets m_enabledCheck->setChecked(e.enabled) (and m_mapSourceCombo->setCurrentIndex at line 360) BEFORE the spinboxes are recon"
+ },
+ {
+  "file": "src/MainWindow.cpp",
+  "line": 6127,
+  "summary": "MainWindow::applyLut() is a silent no-op: it prompts for a LUT and intensity, then discards the LutData without calling glPreview()->setLut() or storing it on t"
+ },
+ {
+  "file": "src/BlenderMeshImporter.cpp",
+  "line": 401,
+  "summary": "parseGltfDocument indexes decodeFloats' result by count without checking its size; decodeFloats returns an empty vector for componentTypes it doesn't handle (51"
+ },
+ {
+  "file": "src/NoiseReduction.cpp",
+  "line": 392,
+  "summary": "Audio re-encode path never calls av_buffersink_set_frame_size() to match the encoder's frame_size, and ignores the return codes of avcodec_open2()/avcodec_send_"
+ },
+ {
+  "file": "src/FrameIoImporter.cpp",
+  "line": 104,
+  "summary": "parseFrameIoJson() treats the Frame.io comment 'timestamp' field as seconds and multiplies by 1000, while its fps parameter (declared with default 30.0 in Frame"
+ },
+ {
+  "file": "src/SpeedRamp.cpp",
+  "line": 260,
+  "summary": "runFFmpeg はワーカースレッド (QThread::create のラムダ内) で m_process を生成し、readyReadStandardError を GUI スレッド所属の this へ queued 接続する。ffmpeg 終了直前の stderr 出力で queued されたハンドラが GUI"
+ },
+ {
+  "file": "src/SpeechRecognizer.cpp",
+  "line": 116,
+  "summary": "WhisperCliRecognizer::recognize は whisper.cpp の whisper-cli に存在しない引数 (--output-format json、--model <名前>) を渡し、さらに JSON を stdout から読もうとする。whisper-cli の実引数は -oj/--"
+ },
+ {
+  "file": "src/VideoStabilizer.cpp",
+  "line": 333,
+  "summary": "m_process is created/nulled on the worker thread while the queued readyReadStandardError lambda runs on the main thread and dereferences m_process without a nul"
+ },
+ {
+  "file": "src/VideoPlayer.cpp",
+  "line": 4011,
+  "summary": "The entry-boundary block (lines 3877-4025) runs advanceToEntry()/seekToTimelineUs() — which promote/reseek pool TrackDecoders via tryPromotePoolDecoderTo — and "
+ },
+ {
+  "file": "src/MotionTracker.cpp",
+  "line": 311,
+  "summary": "startTracking() has no is-running guard: it resets m_result = TrackingResult{} and Kalman/occlusion state on the GUI thread and spawns a new detached worker whi"
+ },
+ {
+  "file": "src/NoiseReduction.cpp",
+  "line": 292,
+  "summary": "Audio re-encode chain ignores every failure: avcodec_open2 (292, video at 322), avformat_write_header (361), and avcodec_send_frame (392) return values are all "
+ },
+ {
+  "file": "src/EffectControlsPanel.cpp",
+  "line": 365,
+  "summary": "Keyframe tracks are named by effect index (\"effect.%1.%2\") but onRemoveRequested/onMoveUpRequested/onMoveDownRequested/onDuplicateRequested reorder m_effects wi"
+ },
+ {
+  "file": "src/ColorWheelWidget.cpp",
+  "line": 49,
+  "summary": "colorToPos() and updateFromPos() use inconsistent inverse mappings (colorToPos offsets by m_b*0.5 on both axes; updateFromPos sets m_r=dx, m_g=dy, m_b=-(dx+dy)/"
+ },
+ {
+  "file": "src/ColorGradingPanel.cpp",
+  "line": 1209,
+  "summary": "White-balance temperature gains are inverted relative to the documented intent: slider>0 (higher K, labelled warm) cuts red and boosts blue, producing a cooler "
+ },
+ {
+  "file": "src/ProjectTemplateDialog.cpp",
+  "line": 140,
+  "summary": "The projectCreated(json) signal has zero receivers anywhere in the codebase (MainWindow::openProjectTemplateDialog only show()s the dialog and never connects it"
+ },
+ {
+  "file": "src/Precompose.cpp",
+  "line": 246,
+  "summary": "renderCompositionInternal returns QImage(canvasSize, Format_ARGB32) without fill() on the circular-reference and missing-composition paths — QImage's constructo"
+ },
+ {
+  "file": "src/RemotionExport.cpp",
+  "line": 352,
+  "summary": "Text overlay content is embedded into generated TSX string literals escaping only double quotes (replace('\"','\\\\\"')) — backslashes are not escaped first and new"
+ },
+ {
+  "file": "src/NodeLibrary.cpp",
+  "line": 366,
+  "summary": "Missing-input placeholders are constructed as QImage(outputSize, ...) without fill(), and QImage's pixel data is uninitialized; evaluateBlend substitutes such a"
+ },
+ {
+  "file": "src/MotionTracker.cpp",
+  "line": 847,
+  "summary": "decodeAndTrack() never flushes the decoder at EOF (no avcodec_send_packet(decCtx, nullptr) + drain loop after av_read_frame returns <0), so frames still buffere"
+ },
+ {
+  "file": "src/InstagramPublish.cpp",
+  "line": 80,
+  "summary": "Publisher::publish() never sends PublishJob.shareToFeed — the container-creation POST only includes media_type/video_url/caption/access_token, so the dialog's '"
+ },
+ {
+  "file": "src/FractalNoise.cpp",
+  "line": 126,
+  "summary": "sample() rebuilds the 512-entry permutation table (256-step Fisher-Yates shuffle + duplication) on every call, and render() calls sample() once per pixel, makin"
+ },
+ {
+  "file": "src/SurfaceTool.cpp",
+  "line": 185,
+  "summary": "QMenu::popup() はグローバル座標を要求するのに、SurfaceTool::handleMousePress はウィジェットローカル座標 (GLPreview の event->pos() がそのまま渡る) を popup(widgetPos) に渡している。mapToGlobal が欠落。"
+ },
+ {
+  "file": "src/TextManager.cpp",
+  "line": 882,
+  "summary": "EnhancedTextRenderer::renderOutline は QPainterPath::addText で文字列全体を 1 行として rect 左端に配置するが、本体テキストは drawText(rect, alignment|TextWordWrap) で折り返し・整列描画される。改行/折り返し/中央"
+ },
+ {
+  "file": "src/ProjectFile.cpp",
+  "line": 1109,
+  "summary": "ClipInfo::linkGroup (non-zero groups keep V/A clips selected/dragged/deleted together, Timeline.cpp:1697) is not serialized in clipToJson/clipFromJson, so all A"
+ },
+ {
+  "file": "src/WarpDistortion.cpp",
+  "line": 550,
+  "summary": "applyMeshWarp validates only the row count (controlPoints.size() < mesh.rows) but never each row's column count, while MeshGrid::fromJson trusts the JSON \"rows\""
+ },
+ {
+  "file": "src/VoiceOverRecorder.cpp",
+  "line": 95,
+  "summary": "The QAudioSource error handler calls stopRecording() — which emits recordingFinished(wavPath, elapsed) — before emitting recordingFailed, so a device failure is"
+ },
+ {
+  "file": "src/Timeline.cpp",
+  "line": 3177,
+  "summary": "pasteClip inserts the clipboard clip with its original linkGroup instead of allocating a fresh one, so the pasted V/A pair becomes hard-linked to the source cli"
+ },
+ {
+  "file": "src/Timeline.cpp",
+  "line": 2994,
+  "summary": "rippleDeleteSelectedClip() is a plain alias of deleteSelectedClip(), which uses removeClipPreservingDownstream — so 'ripple delete' preserves the gap instead of"
+ },
+ {
+  "file": "src/Timeline.cpp",
+  "line": 4237,
+  "summary": "insertAudioClipAtPlayhead computes the new clip's leadInSec relative to the end of the clip BEFORE the one containing the playhead (accumulatedTime is not advan"
+ },
+ {
+  "file": "src/AIHighlight.cpp",
+  "line": 31,
+  "summary": "analyze()/exportHighlightReel() spawn detached QThread lambdas capturing `this` with no ownership/join in the destructor — use-after-free when AIHighlight is de"
+ },
+ {
+  "file": "src/AudioMixer.cpp",
+  "line": 1444,
+  "summary": "kMaxAudioTracks cap in setSequence is dead code: e.sourceTrack is inserted into uniqueTracks immediately before the guard tests !uniqueTracks.contains(e.sourceT"
+ },
+ {
+  "file": "src/main.cpp",
+  "line": 3266,
+  "summary": "The VEDITOR_BRUSH_SELFTEST block is bit-rotted against the current BrushAnimation API: it calls brush.setText(\"Hello World\") but the only signature is setText(c"
+ },
+ {
+  "file": "src/CodecDetector.cpp",
+  "line": 82,
+  "summary": "The classic/modern edition split is only enforced in ProxyManager.cpp (VEDITOR_AV1); ExportDialog still unconditionally offers the 'YouTube (AV1 高圧縮)' preset (E"
+ },
+ {
+  "file": "src/MainWindow.cpp",
+  "line": 6149,
+  "summary": "LutLibrary::savePaths() has zero callers anywhere in the repo, so user-imported LUT paths are never written to ~/.veditor/luts.json even though loadPaths() read"
+ },
+ {
+  "file": "src/MainWindow.cpp",
+  "line": 2432,
+  "summary": "LoudnessPanel::setMeasurement() is never called from anywhere (grep across src/ finds only its declaration/definition), so the loudness dock's Integrated/Moment"
+ },
+ {
+  "file": "src/LoudnessAnalyzer.cpp",
+  "line": 443,
+  "summary": "updateTruePeak()'s inter-sample interpolation loop is mathematically a no-op: linear interpolation between two samples is always bounded by the endpoint magnitu"
+ },
+ {
+  "file": "src/LayerCompositor.cpp",
+  "line": 291,
+  "summary": "blendPixel() applies the blended colour weighted only by topA, omitting the standard as*(1-ab)*Cs source-over term, so non-Normal blend modes composited over a "
+ },
+ {
+  "file": "src/LoudnessMaster.cpp",
+  "line": 188,
+  "summary": "measureIntegratedLufs() returns a hardcoded -23.0 LUFS for every non-.raw/.pcm file (decoding not wired), but LoudnessMasterDialog's file filter offers *.wav *."
+ },
+ {
+  "file": "src/Exporter.cpp",
+  "line": 439,
+  "summary": "doExport never flushes the video decoder (no avcodec_send_packet(decCtx, nullptr) before clip cleanup), so frames still buffered in the decoder at av_read_frame"
+ },
+ {
+  "file": "src/Exporter.cpp",
+  "line": 388,
+  "summary": "avformat_write_header failure path frees encCtx and outFmt but never calls avio_closep(&outFmt->pb), leaking the output file handle opened by avio_open at line "
+ },
+ {
+  "file": "src/ColorMatchAnalyzer.cpp",
+  "line": 227,
+  "summary": "analyzeFrameRange never flushes the decoder (no avcodec_send_packet(decCtx, nullptr) after EOF), so frames buffered by the codec's reorder delay are never analy"
+ },
+ {
+  "file": "src/Rotoscope.cpp",
+  "line": 206,
+  "summary": "interpolatePaths() pads the shorter path with points.last() without checking for emptiness, so interpolating between an empty-path keyframe and a non-empty one "
+ },
+ {
+  "file": "src/RotoToolsDialog.cpp",
+  "line": 99,
+  "summary": "RotoCanvasWidget::renderToImage() paints into a frame-sized image but paintCanvas() applies the widget-space letterbox transform (scale/offset computed from wid"
+ },
+ {
+  "file": "src/AutoEdit.cpp",
+  "line": 152,
+  "summary": "detectSceneChanges never checks sws_getContext's return value before calling sws_scale, so a null SwsContext (e.g. codec opens but width/height/pix_fmt are 0/in"
+ },
+ {
+  "file": "src/BlenderBpyBridge.cpp",
+  "line": 77,
+  "summary": "convertBlendToGltf hardcodes a POSIX temp path '/tmp/veditor_bpy_XXXXXX.py' as the QTemporaryFile template; on the app's target platform (Windows) this resolves"
+ },
+ {
+  "file": "src/Overlay.cpp",
+  "line": 299,
+  "summary": "applyTransition() allocates QImage result(w,h,Format_RGB888) without filling it, where w/h are the max of the two inputs and both inputs are scaled with Qt::Kee"
+ },
+ {
+  "file": "src/NoiseReduction.cpp",
+  "line": 533,
+  "summary": "denoiseAudio/denoiseVideo/denoiseAll spawn a QThread::create worker whose lambda captures `this`, but NoiseReduction has no destructor that cancels/waits for th"
+ },
+ {
+  "file": "src/MotionTracker.cpp",
+  "line": 778,
+  "summary": "m_peakScoreSeenSoFar is only ever updated inside kalmanSmooth(), so with setKalmanEnabled(false) the peak stays 0.0; occlusion onset rule B (median-based) can s"
+ },
+ {
+  "file": "src/NetworkRender.cpp",
+  "line": 611,
+  "summary": "assembleSegments() starts `ffmpeg` via QProcess with only a finished() handler; QProcess::errorOccurred (FailedToStart) is unhandled, and finished() is never em"
+ },
+ {
+  "file": "src/MaskSystem.cpp",
+  "line": 459,
+  "summary": "generateMaskImage() lets the first mask replace the canvas unconditionally, ignoring its MaskMode — the `result.fill(255)` base is dead code — so a first mask i"
+ },
+ {
+  "file": "src/SmartReframeDialog.cpp",
+  "line": 200,
+  "summary": "アスペクト比プリセットで「16:9 (landscape)」を選ぶと出力解像度コンボが自動で index 3 = 720x1280（縦長 9:16）に設定される。SmartReframe::applyReframe は 16:9 のクロップ矩形を outputSize 全面に drawImage するため、横長クロップ"
+ },
+ {
+  "file": "src/BlenderMeshImporter.cpp",
+  "line": 438,
+  "summary": "Decoded glTF triangle indices are never validated against the vertex count before being stored for downstream mesh consumers."
+ },
+ {
+  "file": "src/AffinityPsdImporter.cpp",
+  "line": 155,
+  "summary": "A layer channel's declared length (attacker-controlled uint32) drives an unchecked allocation of up to ~4GB before any read, causing an uncaught bad_alloc / DoS"
+ },
+ {
+  "file": "src/WatermarkOverlay.cpp",
+  "line": 159,
+  "summary": "batchApply writes each output as outDir/<input basename> with no self-overwrite or name-collision check, so it can silently destroy source images."
+ },
+ {
+  "file": "src/Timeline.cpp",
+  "line": 1758,
+  "summary": "TrimLeft/TrimRight apply the pixel-derived timeline-seconds delta directly to inPoint/outPoint, which are source-time values, without multiplying by clip speed;"
+ },
+ {
+  "file": "src/AudioEQ.cpp",
+  "line": 168,
+  "summary": "m_process/m_cancelled/m_totalDuration are shared unsynchronized across overlapping applyChain worker threads — a second apply while one is running stomps m_proc"
+ },
+ {
+  "file": "src/Exporter.h",
+  "line": 43,
+  "summary": "Cancel flag `bool m_cancelled` is written by Exporter::cancel() on the GUI thread (wired to QProgressDialog::canceled, MainWindow.cpp:4239/7948) and polled by t"
+ },
+ {
+  "file": "src/AIHighlight.cpp",
+  "line": 174,
+  "summary": "sws_scale is called with a potentially null SwsContext: sws_getContext at line 140 (and 252 for the second analyzer, used at 282) is never null-checked, even th"
+ },
+ {
+  "file": "src/NetworkRender.cpp",
+  "line": 303,
+  "summary": "onSocketDisconnected() removes m_nodes[nodeId] and m_nodeToSocket[nodeId] keyed only by nodeId without checking that the disconnecting socket is still the node'"
+ }
+]
