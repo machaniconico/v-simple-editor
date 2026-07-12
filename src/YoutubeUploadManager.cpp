@@ -365,6 +365,8 @@ void Manager::onCompleted(const QString& videoId)
 
     const QString id = m_currentJobId;
     Job& job = m_jobs[id];
+    if (job.state != State::Uploading) return;
+
     job.uploadedBytes = job.totalSize;
     job.state         = State::Completed;
     emit jobStateChanged(id, State::Completed);
