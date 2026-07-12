@@ -3263,10 +3263,12 @@ int main(int argc, char *argv[])
     {
         qDebug() << "=== VEDITOR_BRUSH_SELFTEST: BrushAnimation synthetic self-test ===";
         BrushAnimation brush;
-        brush.setText("Hello World");
+        brush.setText(QStringLiteral("Hello World"), QFont(QStringLiteral("Sans Serif"), 72),
+                      QPointF(120.0, 180.0));
+        const QSize brushCanvasSize(1920, 1080);
 
         brush.setProgress(0.0);
-        QImage frame0 = brush.renderFrame(1920, 1080);
+        QImage frame0 = brush.renderFrame(brushCanvasSize, 0.0);
         int pixels0 = 0;
         for (int y = 0; y < frame0.height(); ++y)
             for (int x = 0; x < frame0.width(); ++x)
@@ -3274,7 +3276,7 @@ int main(int argc, char *argv[])
         qDebug() << "  progress=0.0  non-transparent pixels:" << pixels0;
 
         brush.setProgress(0.5);
-        QImage frame5 = brush.renderFrame(1920, 1080);
+        QImage frame5 = brush.renderFrame(brushCanvasSize, 0.5);
         int pixels5 = 0;
         for (int y = 0; y < frame5.height(); ++y)
             for (int x = 0; x < frame5.width(); ++x)
@@ -3282,7 +3284,7 @@ int main(int argc, char *argv[])
         qDebug() << "  progress=0.5  non-transparent pixels:" << pixels5;
 
         brush.setProgress(1.0);
-        QImage frame1 = brush.renderFrame(1920, 1080);
+        QImage frame1 = brush.renderFrame(brushCanvasSize, 1.0);
         int pixels1 = 0;
         for (int y = 0; y < frame1.height(); ++y)
             for (int x = 0; x < frame1.width(); ++x)
