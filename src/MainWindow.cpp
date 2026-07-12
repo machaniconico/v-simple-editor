@@ -1007,12 +1007,55 @@ MainWindow::MainWindow(QWidget *parent)
     connect(m_autoSave, &AutoSave::autoSaved, this, [this](const QString &path) {
         statusBar()->showMessage("Auto-saved: " + QFileInfo(path).fileName(), 3000);
     });
-    connect(m_autoSave, &AutoSave::recoveryAvailable, this, [](const QStringList &files) {
-        // Crash Recovery dialog suppressed per user preference — silently
-        // clean up stale recovery files on startup so the prompt never
-        // blocks the app opening.
-        for (const QString &path : files)
-            QFile::remove(path);
+    connect(m_autoSave, &AutoSave::recoveryAvailable, this, [this](const QStringList &files) {
+        if (files.isEmpty())
+            return;
+        if (m_autoSave && m_autoSave->property("cleanShutdownBeforeAutoSaveStart").toBool())
+            return;
+
+        QMessageBox prompt(this);
+        prompt.setIcon(QMessageBox::Question);
+        prompt.setWindowTitle("自動保存の復元");
+        prompt.setText("自動保存されたプロジェクトが見つかりました。復元しますか？");
+        prompt.setInformativeText("復元しない場合も、自動保存ファイルは削除されません。");
+        QPushButton *restoreButton = prompt.addButton("復元", QMessageBox::AcceptRole);
+        prompt.addButton("後で", QMessageBox::RejectRole);
+        prompt.exec();
+        if (prompt.clickedButton() != restoreButton)
+            return;
+
+        QStringList labels;
+        labels.reserve(files.size());
+        for (const QString &path : files) {
+            const QFileInfo info(path);
+            labels << QString("%1 (%2)")
+                .arg(info.fileName(), info.lastModified().toString("yyyy-MM-dd HH:mm:ss"));
+        }
+
+        bool ok = true;
+        QString selected = labels.first();
+        if (labels.size() > 1) {
+            selected = QInputDialog::getItem(this, "自動保存の復元",
+                "復元するバックアップ:", labels, 0, false, &ok);
+            if (!ok)
+                return;
+        }
+
+        const int selectedIndex = labels.indexOf(selected);
+        if (selectedIndex < 0 || selectedIndex >= files.size())
+            return;
+
+        const QString json = AutoSave::recoverFromFile(files.at(selectedIndex));
+        ProjectData data;
+        if (json.isEmpty() || !ProjectFile::fromJsonString(json, data)) {
+            QMessageBox::warning(this, "自動保存の復元",
+                "自動保存ファイルを読み込めませんでした。");
+            return;
+        }
+
+        applyLoadedProjectData(data, QString());
+        statusBar()->showMessage("自動保存から復元しました: "
+            + QFileInfo(files.at(selectedIndex)).fileName(), 5000);
     });
     // Apply dark theme by default
     ThemeManager::instance().applyTheme(ThemeType::Dark, this);
@@ -3302,6 +3345,7 @@ void MainWindow::setupMenuBar()
             AutoSaveConfig cfg;
             cfg.enabled = true;
             cfg.interval = prefSettings.value("autoSaveIntervalSec", 1800).toInt();
+            m_autoSave->setProperty("cleanShutdownBeforeAutoSaveStart", AutoSave::wasCleanShutdown());
             m_autoSave->start(cfg);
             statusBar()->showMessage(QString("自動保存 ON (%1分ごと)").arg(cfg.interval / 60));
         } else {
@@ -6390,6 +6434,9 @@ void MainWindow::applyLut()
             return;
         }
         LutLibrary::instance().addLut(path);
+        LutLibrary::instance().savePaths();
+        if (m_colorGradingPanel)
+            m_colorGradingPanel->setLutList(LutLibrary::instance().allLuts());
     } else {
         auto found = LutLibrary::instance().findByName(selected);
         if (!found.isValid()) return;
@@ -6400,6 +6447,11 @@ void MainWindow::applyLut()
         "Intensity (0.0-1.0):", 1.0, 0.0, 1.0, 2, &ok);
     if (!ok) return;
     lut.intensity = intensity;
+
+    if (m_player)
+        m_player->glPreview()->setLut(lut);
+    if (m_lutIntensitySlider)
+        m_lutIntensitySlider->setValue(static_cast<int>(intensity * 100.0));
 
     statusBar()->showMessage(QString("Applied LUT: %1 (intensity %2)")
         .arg(lut.name).arg(intensity, 0, 'f', 1));
@@ -6424,6 +6476,7 @@ void MainWindow::loadLutCubeFile()
         m_lutIntensitySlider->setValue(100);
 
     LutLibrary::instance().addLut(path);
+    LutLibrary::instance().savePaths();
     if (m_colorGradingPanel)
         m_colorGradingPanel->setLutList(LutLibrary::instance().allLuts());
 
@@ -9230,6 +9283,7 @@ void MainWindow::showEvent(QShowEvent *event)
             AutoSaveConfig cfg;
             cfg.enabled = true;
             cfg.interval = prefSettings.value("autoSaveIntervalSec", 1800).toInt();
+            m_autoSave->setProperty("cleanShutdownBeforeAutoSaveStart", AutoSave::wasCleanShutdown());
             m_autoSave->start(cfg);
         });
     }
