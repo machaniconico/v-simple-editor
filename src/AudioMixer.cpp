@@ -348,6 +348,9 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
         return us * AudioMixer::kSampleRateHz * AudioMixer::kBytesPerFrame
                / 1'000'000LL;
     };
+    auto alignBytesToFrame = [](qint64 bytes) -> qint64 {
+        return bytes - (bytes % AudioMixer::kBytesPerFrame);
+    };
 
     bool anyMixed = false;
     // Set when an entry is active at the current cursor but its ring has no
@@ -382,8 +385,8 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
             // desync self-corrects over the next few readData fragments.
             constexpr int64_t kMaxLateDropUs = 2'000;
             const int64_t clampedLateUs = qMin(lateUs, kMaxLateDropUs);
-            const qint64 lateB = usToBytes(clampedLateUs);
-            const qint64 dropBytes = qMin<qint64>(lateB, liveBytes(*e));
+            const qint64 lateB = alignBytesToFrame(usToBytes(clampedLateUs));
+            const qint64 dropBytes = alignBytesToFrame(qMin<qint64>(lateB, liveBytes(*e)));
             if (dropBytes > 0) {
                 e->ringHead += static_cast<int>(dropBytes);
                 e->ringStartTlUs += bytesToUs(dropBytes);
@@ -1440,13 +1443,14 @@ void AudioMixer::setSequence(const QVector<PlaybackEntry> &entries) {
             // Cap on UNIQUE source tracks, not total entry count, so a
             // single track with many clips doesn't get its trailing entries
             // silently dropped.
-            uniqueTracks.insert(e.sourceTrack);
-            if (uniqueTracks.size() > kMaxAudioTracks
-                && !uniqueTracks.contains(e.sourceTrack)) {
+            const bool knownTrack = uniqueTracks.contains(e.sourceTrack);
+            if (!knownTrack && uniqueTracks.size() >= kMaxAudioTracks) {
                 pendingErrors << QStringLiteral("AudioMixer: exceeded MAX_AUDIO_TRACKS=%1, dropping track %2 entry %3")
                                   .arg(kMaxAudioTracks).arg(e.sourceTrack).arg(e.filePath);
                 continue;
             }
+            if (!knownTrack)
+                uniqueTracks.insert(e.sourceTrack);
             AudioTrackKey key{
                 e.filePath,
                 qRound64(e.clipIn * 1000.0),
