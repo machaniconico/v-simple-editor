@@ -3,12 +3,50 @@
 #include <QtGlobal>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 
 extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/imgutils.h>
 #include <libswscale/swscale.h>
+}
+
+namespace {
+
+bool scaleFrameToQImagePadded(SwsContext *ctx,
+                              const AVFrame *frame,
+                              AVPixelFormat dstPixFmt,
+                              QImage &image)
+{
+    if (!ctx || !frame || image.isNull())
+        return false;
+
+    const int rowBytes = av_image_get_linesize(dstPixFmt, image.width(), 0);
+    if (rowBytes <= 0 || rowBytes > image.bytesPerLine())
+        return false;
+
+    uint8_t *tmpData[4] = { nullptr, nullptr, nullptr, nullptr };
+    int tmpStride[4] = { 0, 0, 0, 0 };
+    if (av_image_alloc(tmpData, tmpStride, image.width(), image.height(),
+                       dstPixFmt, 64) < 0)
+        return false;
+
+    const int scaledRows = sws_scale(ctx, frame->data, frame->linesize, 0, frame->height,
+                                     tmpData, tmpStride);
+    if (scaledRows != image.height()) {
+        av_freep(&tmpData[0]);
+        return false;
+    }
+
+    for (int y = 0; y < image.height(); ++y) {
+        std::memcpy(image.scanLine(y), tmpData[0] + y * tmpStride[0],
+                    static_cast<std::size_t>(rowBytes));
+    }
+    av_freep(&tmpData[0]);
+    return true;
+}
+
 }
 
 // ---------------------------------------------------------------------------
@@ -489,23 +527,20 @@ QVector<StabilizerKeyframe> MotionStabilizer::analyzeFile(const QString &filePat
                 }
                 if (sws) {
                     QImage img(frame->width, frame->height, QImage::Format_RGB888);
-                    uint8_t *dst[1] = { img.bits() };
-                    int dstStride[1] = { static_cast<int>(img.bytesPerLine()) };
-                    sws_scale(sws, frame->data, frame->linesize, 0, frame->height,
-                              dst, dstStride);
-
-                    qint64 ptsUs = 0;
-                    if (frame->best_effort_timestamp != AV_NOPTS_VALUE) {
-                        const AVRational tb = vs->time_base;
-                        ptsUs = av_rescale_q(frame->best_effort_timestamp,
-                                             tb,
-                                             AVRational{1, 1000000});
-                    } else {
-                        ptsUs = frameIndex * 1000000LL / 30;
+                    if (scaleFrameToQImagePadded(sws, frame, AV_PIX_FMT_RGB24, img)) {
+                        qint64 ptsUs = 0;
+                        if (frame->best_effort_timestamp != AV_NOPTS_VALUE) {
+                            const AVRational tb = vs->time_base;
+                            ptsUs = av_rescale_q(frame->best_effort_timestamp,
+                                                 tb,
+                                                 AVRational{1, 1000000});
+                        } else {
+                            ptsUs = frameIndex * 1000000LL / 30;
+                        }
+                        frameTimesUs.append(ptsUs);
+                        processFrame(frameIndex, img);
+                        ++frameIndex;
                     }
-                    frameTimesUs.append(ptsUs);
-                    processFrame(frameIndex, img);
-                    ++frameIndex;
                 }
                 av_frame_unref(frame);
             }
@@ -527,21 +562,19 @@ QVector<StabilizerKeyframe> MotionStabilizer::analyzeFile(const QString &filePat
             }
             if (sws) {
                 QImage img(frame->width, frame->height, QImage::Format_RGB888);
-                uint8_t *dst[1] = { img.bits() };
-                int dstStride[1] = { static_cast<int>(img.bytesPerLine()) };
-                sws_scale(sws, frame->data, frame->linesize, 0, frame->height,
-                          dst, dstStride);
-                qint64 ptsUs = 0;
-                if (frame->best_effort_timestamp != AV_NOPTS_VALUE) {
-                    ptsUs = av_rescale_q(frame->best_effort_timestamp,
-                                         vs->time_base,
-                                         AVRational{1, 1000000});
-                } else {
-                    ptsUs = frameIndex * 1000000LL / 30;
+                if (scaleFrameToQImagePadded(sws, frame, AV_PIX_FMT_RGB24, img)) {
+                    qint64 ptsUs = 0;
+                    if (frame->best_effort_timestamp != AV_NOPTS_VALUE) {
+                        ptsUs = av_rescale_q(frame->best_effort_timestamp,
+                                             vs->time_base,
+                                             AVRational{1, 1000000});
+                    } else {
+                        ptsUs = frameIndex * 1000000LL / 30;
+                    }
+                    frameTimesUs.append(ptsUs);
+                    processFrame(frameIndex, img);
+                    ++frameIndex;
                 }
-                frameTimesUs.append(ptsUs);
-                processFrame(frameIndex, img);
-                ++frameIndex;
             }
         }
         av_frame_unref(frame);
