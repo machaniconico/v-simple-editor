@@ -1,12 +1,15 @@
 #include "ClipMask.h"
 
 #include "../MaskSystem.h"
+#include "../PlanarTracker.h"
 
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonParseError>
 #include <QJsonValue>
 #include <QImage>
+#include <QList>
+#include <QMap>
 #include <QRgba64>
 #include <QtGlobal>
 
@@ -195,6 +198,96 @@ QVector<QPointF> flattenBezier(const clipmask::BezierMask &mask)
     }
 
     return flattened;
+}
+
+QPointF transformPoint(const planartrack::Homography &homography,
+                       const QPointF &point)
+{
+    const double x = point.x();
+    const double y = point.y();
+    const double w = homography[6] * x + homography[7] * y + homography[8];
+    if (std::abs(w) < kEpsilon)
+        return point;
+
+    return QPointF((homography[0] * x + homography[1] * y + homography[2]) / w,
+                   (homography[3] * x + homography[4] * y + homography[5]) / w);
+}
+
+clipmask::BezierPoint transformBezierPoint(
+    const clipmask::BezierPoint &source,
+    const planar::Homography &homography)
+{
+    clipmask::BezierPoint point;
+    point.vertex = planar::transformPoint(source.vertex, homography);
+    if (!pointNearlyEqual(source.inTangent, QPointF()))
+        point.inTangent = planar::transformPoint(source.vertex + source.inTangent,
+                                                 homography) - point.vertex;
+    if (!pointNearlyEqual(source.outTangent, QPointF()))
+        point.outTangent = planar::transformPoint(source.vertex + source.outTangent,
+                                                  homography) - point.vertex;
+    return point;
+}
+
+clipmask::BezierPoint transformBezierPoint(
+    const clipmask::BezierPoint &source,
+    const planartrack::Homography &homography)
+{
+    clipmask::BezierPoint point;
+    point.vertex = transformPoint(homography, source.vertex);
+    if (!pointNearlyEqual(source.inTangent, QPointF()))
+        point.inTangent = transformPoint(homography,
+                                         source.vertex + source.inTangent) - point.vertex;
+    if (!pointNearlyEqual(source.outTangent, QPointF()))
+        point.outTangent = transformPoint(homography,
+                                          source.vertex + source.outTangent) - point.vertex;
+    return point;
+}
+
+clipmask::BezierMask transformMask(const clipmask::BezierMask &source,
+                                   const planar::Homography &homography)
+{
+    clipmask::BezierMask mask = source;
+    mask.points.clear();
+    mask.points.reserve(source.points.size());
+    for (const clipmask::BezierPoint &point : source.points)
+        mask.points.append(transformBezierPoint(point, homography));
+    return mask;
+}
+
+clipmask::BezierMask transformMask(const clipmask::BezierMask &source,
+                                   const planartrack::Homography &homography)
+{
+    clipmask::BezierMask mask = source;
+    mask.points.clear();
+    mask.points.reserve(source.points.size());
+    for (const clipmask::BezierPoint &point : source.points)
+        mask.points.append(transformBezierPoint(point, homography));
+    return mask;
+}
+
+clipmask::ClipMaskStack transformStack(const clipmask::ClipMaskStack &source,
+                                       const planar::Homography &homography)
+{
+    clipmask::ClipMaskStack stack;
+    stack.masks.reserve(source.masks.size());
+    for (const clipmask::BezierMask &mask : source.masks)
+        stack.masks.append(transformMask(mask, homography));
+    return stack;
+}
+
+clipmask::ClipMaskStack transformStack(const clipmask::ClipMaskStack &source,
+                                       const planartrack::Homography &homography)
+{
+    clipmask::ClipMaskStack stack;
+    stack.masks.reserve(source.masks.size());
+    for (const clipmask::BezierMask &mask : source.masks)
+        stack.masks.append(transformMask(mask, homography));
+    return stack;
+}
+
+bool containsKey(const QMap<int, clipmask::ClipMaskStack> &keyframes, int frameIndex)
+{
+    return keyframes.constFind(frameIndex) != keyframes.constEnd();
 }
 
 } // namespace
@@ -425,6 +518,55 @@ QJsonObject maskSystemToJson(const MaskSystem &system)
 MaskSystem maskSystemFromJson(const QJsonObject &obj)
 {
     return toMaskSystem(fromJson(obj));
+}
+
+ClipMaskStack applyPlanarCornerPinToMaskPath(const ClipMaskStack &stack,
+                                             const planar::CornerSet &referenceCorners,
+                                             const planar::CornerSet &trackedCorners)
+{
+    if (stack.isDefault() || !referenceCorners.isValid() || !trackedCorners.isValid())
+        return stack;
+
+    return transformStack(stack,
+                          planar::homographyFromCorners(referenceCorners,
+                                                        trackedCorners));
+}
+
+QMap<int, ClipMaskStack> bakePlanarTrackToMaskPathKeyframes(
+    const ClipMaskStack &stack,
+    const planar::CornerSet &referenceCorners,
+    const QList<planar::Frame> &frames)
+{
+    QMap<int, ClipMaskStack> keyframes;
+    if (stack.isDefault() || !referenceCorners.isValid())
+        return keyframes;
+
+    for (const planar::Frame &frame : frames) {
+        if (!frame.corners.isValid())
+            continue;
+        keyframes.insert(frame.frameIndex,
+                         applyPlanarCornerPinToMaskPath(stack,
+                                                        referenceCorners,
+                                                        frame.corners));
+    }
+
+    if (!containsKey(keyframes, 0))
+        keyframes.insert(0, stack);
+    return keyframes;
+}
+
+QMap<int, ClipMaskStack> bakePlanarTrackToMaskPathKeyframes(
+    const ClipMaskStack &stack,
+    const planartrack::PlanarTrack &track)
+{
+    QMap<int, ClipMaskStack> keyframes;
+    if (stack.isDefault())
+        return keyframes;
+
+    keyframes.insert(track.refFrameIndex, stack);
+    for (const planartrack::FrameResult &frame : track.frames)
+        keyframes.insert(frame.frameIndex, transformStack(stack, frame.H));
+    return keyframes;
 }
 
 QImage applyRasterAlphaMask(const QImage &sourceImage, const QVector<Mask> &masks)

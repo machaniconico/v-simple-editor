@@ -1,8 +1,36 @@
 #include "../ProjectFile.h"
+#include "../MaskSystem.h"
+#include "../PlanarTracker.h"
 #include "../Timeline.h"
 #include "../mask/ClipMask.h"
 
+#include <QImage>
+#include <QMap>
+#include <QPainter>
+#include <QPen>
+#include <QPoint>
+#include <QRect>
+#include <QSize>
+
+#include <cmath>
 #include <cstdio>
+
+namespace clipmask {
+
+ClipMaskStack applyPlanarCornerPinToMaskPath(const ClipMaskStack &stack,
+                                             const planar::CornerSet &referenceCorners,
+                                             const planar::CornerSet &trackedCorners);
+
+QMap<int, ClipMaskStack> bakePlanarTrackToMaskPathKeyframes(
+    const ClipMaskStack &stack,
+    const planar::CornerSet &referenceCorners,
+    const QList<planar::Frame> &frames);
+
+QMap<int, ClipMaskStack> bakePlanarTrackToMaskPathKeyframes(
+    const ClipMaskStack &stack,
+    const planartrack::PlanarTrack &track);
+
+} // namespace clipmask
 
 namespace {
 
@@ -115,6 +143,60 @@ bool sameMaskFields(const Mask &a, const Mask &b)
         && a.points == b.points;
 }
 
+clipmask::ClipMaskStack makePlanarBakeStack()
+{
+    clipmask::BezierMask mask;
+    mask.name = QStringLiteral("planar-follow");
+    mask.mode = clipmask::CombineMode::Add;
+    mask.closed = true;
+    mask.points = {
+        bezierPoint(28.0, 30.0),
+        bezierPoint(36.0, 30.0),
+        bezierPoint(36.0, 38.0),
+        bezierPoint(28.0, 38.0)
+    };
+
+    clipmask::ClipMaskStack stack;
+    stack.masks = {mask};
+    return stack;
+}
+
+QImage makePlanarTrackingFrame(const QPoint &shift)
+{
+    QImage frame(88, 72, QImage::Format_ARGB32);
+    frame.fill(Qt::black);
+
+    const QPoint origin(24 + shift.x(), 24 + shift.y());
+    for (int y = 0; y < 18; ++y) {
+        for (int x = 0; x < 24; ++x) {
+            const int value = 35 + ((x * 19 + y * 31) % 205);
+            frame.setPixel(origin.x() + x, origin.y() + y,
+                           qRgb(value, value, value));
+        }
+    }
+
+    QPainter painter(&frame);
+    painter.setPen(QPen(Qt::white, 1));
+    painter.drawRect(QRect(origin, QSize(23, 17)));
+    painter.end();
+    return frame;
+}
+
+int matteValueAt(const clipmask::ClipMaskStack &stack, const QPoint &point)
+{
+    const MaskSystem system = clipmask::toMaskSystem(stack);
+    const QImage matte = MaskSystem::generateMaskImage(system.masks(), QSize(88, 72));
+    if (matte.isNull() || !QRect(QPoint(0, 0), matte.size()).contains(point))
+        return 0;
+    return qGray(matte.pixel(point));
+}
+
+bool pointClose(const QPointF &a, const QPointF &b, double tolerance = 1.25)
+{
+    return std::abs(a.x() - b.x()) <= tolerance
+        && std::abs(a.y() - b.y()) <= tolerance;
+}
+
 } // namespace
 
 int runClipMaskSelftest()
@@ -182,6 +264,73 @@ int runClipMaskSelftest()
         && sameMaskFields(masked.maskSystem.masks()[1], loadedMasks[1]);
     check(6, "ProjectFile mask fields round-trip through ClipInfo maskSystem",
           projectRoundtripOk);
+
+    const clipmask::ClipMaskStack bakeStack = makePlanarBakeStack();
+    const planar::CornerSet referenceCorners =
+        planar::CornerSet::rectangle(QRectF(24.0, 24.0, 24.0, 18.0));
+    planar::TrackParams params;
+    params.searchRadiusPx = 10.0;
+    params.patchSizePx = 12.0;
+    params.dampingFactor = 1.0;
+    planar::Tracker tracker;
+    tracker.setParams(params);
+    const QList<QImage> frames = {
+        makePlanarTrackingFrame(QPoint(0, 0)),
+        makePlanarTrackingFrame(QPoint(6, 4)),
+        makePlanarTrackingFrame(QPoint(12, 8))
+    };
+    const QList<planar::Frame> trackFrames =
+        tracker.trackSequence(frames, referenceCorners, 33);
+    const bool trackerMovedOk = trackFrames.size() == 3
+        && pointClose(trackFrames.last().corners.tl, QPointF(36.0, 32.0), 1.5)
+        && pointClose(trackFrames.last().corners.br, QPointF(60.0, 50.0), 1.5);
+    check(7, "synthetic planar tracker follows translated feature",
+          trackerMovedOk);
+
+    const QMap<int, clipmask::ClipMaskStack> bakedKeyframes =
+        clipmask::bakePlanarTrackToMaskPathKeyframes(bakeStack,
+                                                     referenceCorners,
+                                                     trackFrames);
+    const clipmask::ClipMaskStack bakedLast = bakedKeyframes.value(2);
+    const bool maskFollowsTrack = trackerMovedOk
+        && bakedKeyframes.size() == 3
+        && matteValueAt(bakedLast, QPoint(44, 42)) > 220
+        && matteValueAt(bakedLast, QPoint(32, 34)) < 20;
+    check(8, "planar track bakes mask path keyframes that follow the feature",
+          maskFollowsTrack);
+
+    const planar::CornerSet pinnedCorners = planar::CornerSet::rectangle(
+        QRectF(36.0, 30.0, 30.0, 24.0));
+    const clipmask::ClipMaskStack cornerPinned =
+        clipmask::applyPlanarCornerPinToMaskPath(bakeStack,
+                                                 referenceCorners,
+                                                 pinnedCorners);
+    const bool cornerPinOk = !cornerPinned.masks.isEmpty()
+        && cornerPinned.masks.first().points.size() == 4
+        && pointClose(cornerPinned.masks.first().points[0].vertex,
+                      QPointF(41.0, 38.0), 0.25)
+        && pointClose(cornerPinned.masks.first().points[2].vertex,
+                      QPointF(51.0, 48.6666666667), 0.25);
+    check(9, "corner-pin conversion transforms mask vertices per keyframe",
+          cornerPinOk);
+
+    planartrack::PlanarTrack persistedTrack;
+    persistedTrack.refFrameIndex = 0;
+    planartrack::FrameResult persistedFrame;
+    persistedFrame.frameIndex = 3;
+    persistedFrame.H = {1.0, 0.0, 5.0,
+                        0.0, 1.0, -2.0,
+                        0.0, 0.0, 1.0};
+    persistedTrack.frames.push_back(persistedFrame);
+    const QMap<int, clipmask::ClipMaskStack> persistedBaked =
+        clipmask::bakePlanarTrackToMaskPathKeyframes(bakeStack,
+                                                     persistedTrack);
+    const bool persistedOk = persistedBaked.contains(0)
+        && persistedBaked.contains(3)
+        && pointClose(persistedBaked.value(3).masks.first().points.first().vertex,
+                      QPointF(33.0, 28.0), 0.01);
+    check(10, "persisted planar homography results bake to mask path keyframes",
+          persistedOk);
 
     std::printf("[clip-mask] summary: passed=%d failed=%d\n", passed, failed);
     return failed == 0 ? 0 : 1;
