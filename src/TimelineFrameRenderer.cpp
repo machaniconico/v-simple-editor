@@ -13,6 +13,7 @@
 #include "LayerStyle.h"         // Per-clip layer style at the rendered-layer seam
 #include "clipanim/ClipAnim.h"  // S1 — motion/opacity keyframe evaluation
 #include "TrackMatteKey.h"      // RM-1.1 — single shared clip-key formula
+#include <cstring>              // std::memcpy (decode row copy)
 #include "playback/TrackMatteCompose16.h"
 #include "playback/TlrCompose16.h"
 #include "playback/HdrCompositeMath.h"
@@ -43,6 +44,7 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/opt.h>
+#include <libavutil/imgutils.h>
 #include <libswscale/swscale.h>
 }
 
@@ -173,10 +175,24 @@ QImage decodeClipFrameNative(const QString &filePath, double sourceSec)
                 }
             }
         }
-        uint8_t *dst[1] = { rgba.bits() };
-        int dstStride[1] = { static_cast<int>(rgba.bytesPerLine()) };
+        // sws_scale's SIMD paths write in aligned chunks and can run past the
+        // end of an unpadded destination row — QImage::bits() has no padding,
+        // so scaling directly into it corrupts the heap for small frames
+        // (detonates later as STATUS_HEAP_CORRUPTION, e.g. 40x24 in the
+        // clip-lut selftest). Scale into a 64-byte-aligned padded buffer from
+        // av_image_alloc, then row-copy the visible bytes into the QImage.
+        uint8_t *tmpData[4] = { nullptr, nullptr, nullptr, nullptr };
+        int tmpStride[4] = { 0, 0, 0, 0 };
+        if (av_image_alloc(tmpData, tmpStride, decCtx->width, decCtx->height,
+                           AV_PIX_FMT_RGBA, 64) < 0)
+            return;
         sws_scale(swsCtx, src->data, src->linesize, 0, decCtx->height,
-                  dst, dstStride);
+                  tmpData, tmpStride);
+        for (int y = 0; y < decCtx->height; ++y) {
+            std::memcpy(rgba.scanLine(y), tmpData[0] + y * tmpStride[0],
+                        static_cast<std::size_t>(decCtx->width) * 4);
+        }
+        av_freep(&tmpData[0]);
         result = rgba;
     };
 
@@ -197,9 +213,12 @@ QImage decodeClipFrameNative(const QString &filePath, double sourceSec)
                 static_cast<double>(frame->pts) * av_q2d(vStream->time_base);
             // Same gate Exporter applies: skip frames before the wanted
             // source position; take the first frame at-or-after it.
-            if (framePts + 1e-6 < sourceSec)
+            if (framePts + 1e-6 < sourceSec) {
+                av_frame_unref(frame);
                 continue;
+            }
             buildResult(frame);
+            av_frame_unref(frame);
             decoded = true;
             break;
         }
@@ -211,6 +230,7 @@ QImage decodeClipFrameNative(const QString &filePath, double sourceSec)
         avcodec_send_packet(decCtx, nullptr);
         while (avcodec_receive_frame(decCtx, frame) == 0) {
             buildResult(frame);
+            av_frame_unref(frame);
             decoded = true;
             break;
         }
