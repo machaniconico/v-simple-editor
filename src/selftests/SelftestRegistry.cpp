@@ -91,6 +91,7 @@ int runGraphEditorSelftest();
 int runGradeLggSerializationSelftest();
 int runHdrRoutingSelftest();
 int runHdrSelftest();
+int runHslSecondarySelftest();
 int runHwPerfSelftest();
 int runImportIngestSelftest();
 int runImportSelftest();
@@ -627,6 +628,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Freeze Frame: split at playhead, one-key hold curve, renderFrameAt export hold, save/load sync, one-step undo" },
     { "clip-curves",       "VEDITOR_CLIP_CURVES_SELFTEST",         runClipCurvesSelftest,         true,
       "Clip RGB/Luma curves: unset/identity byte identity, renderFrameAt reflection, ProjectFile round-trip" },
+    { "hsl-secondary",     "VEDITOR_HSL_SECONDARY_SELFTEST",       runHslSecondarySelftest,       true,
+      "HSL secondary qualifier: per-clip ProjectFile round-trip + renderFrameAt reflection + off-path byte identity" },
     { "clip-lut",          "VEDITOR_CLIP_LUT_SELFTEST",            runClipLutSelftest,            true,
       "Clip LUT: per-clip ProjectFile round-trip + renderFrameAt LUT reflection + no-LUT byte-identical gate" },
     { "colormatch-apply",  "VEDITOR_COLORMATCH_APPLY_SELFTEST",    runColorMatchApplySelftest,    true,

@@ -60,6 +60,29 @@ struct ClipCurveData {
     static QVector<QVector<QPointF>> identityEditorPoints();
 };
 
+// Per-clip HSL secondary qualifier. Disabled/default state is a strict no-op
+// and is omitted from project JSON so unused clips stay byte-identical.
+struct HslSecondaryGrade {
+    bool enabled = false;
+
+    double hueCenter = 30.0;   // degrees [0..360]
+    double hueRange = 30.0;    // degrees [0..180]
+    double satMin = 0.30;      // [0..1]
+    double satMax = 1.00;      // [0..1]
+    double lumaMin = 0.30;     // [0..1]
+    double lumaMax = 0.80;     // [0..1]
+    double softness = 10.0;    // degrees / percent edge slop
+
+    double liftR = 0.0, liftG = 0.0, liftB = 0.0;
+    double gammaR = 1.0, gammaG = 1.0, gammaB = 1.0;
+    double gainR = 1.0, gainG = 1.0, gainB = 1.0;
+
+    bool hasAdjustment() const;
+    bool isActive() const { return enabled && hasAdjustment(); }
+    bool isDefault() const;
+    void reset() { *this = HslSecondaryGrade{}; }
+};
+
 // --- Video Effects ---
 
 enum class VideoEffectType {
@@ -226,6 +249,7 @@ class VideoEffectProcessor
 {
 public:
     static QImage applyColorCorrection(const QImage &input, const ColorCorrection &cc);
+    static QImage applyHslSecondary(const QImage &input, const HslSecondaryGrade &hsl);
     static QImage applyRgbLumaCurves(const QImage &input, const ClipCurveData &curves);
     static QImage applyRgbLumaCurves(const QImage &input, const QVector<QVector<int>> &curves);
     static QImage applyEffect(const QImage &input, const VideoEffect &effect);

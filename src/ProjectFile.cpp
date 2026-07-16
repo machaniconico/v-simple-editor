@@ -454,6 +454,52 @@ static ClipCurveData clipCurvesFromJson(const QJsonObject &obj)
     return curves;
 }
 
+static QJsonObject hslSecondaryToJson(const HslSecondaryGrade &hsl)
+{
+    QJsonObject obj;
+    obj[QStringLiteral("enabled")] = hsl.enabled;
+    obj[QStringLiteral("hueCenter")] = hsl.hueCenter;
+    obj[QStringLiteral("hueRange")] = hsl.hueRange;
+    obj[QStringLiteral("satMin")] = hsl.satMin;
+    obj[QStringLiteral("satMax")] = hsl.satMax;
+    obj[QStringLiteral("lumaMin")] = hsl.lumaMin;
+    obj[QStringLiteral("lumaMax")] = hsl.lumaMax;
+    obj[QStringLiteral("softness")] = hsl.softness;
+    obj[QStringLiteral("liftR")] = hsl.liftR;
+    obj[QStringLiteral("liftG")] = hsl.liftG;
+    obj[QStringLiteral("liftB")] = hsl.liftB;
+    obj[QStringLiteral("gammaR")] = hsl.gammaR;
+    obj[QStringLiteral("gammaG")] = hsl.gammaG;
+    obj[QStringLiteral("gammaB")] = hsl.gammaB;
+    obj[QStringLiteral("gainR")] = hsl.gainR;
+    obj[QStringLiteral("gainG")] = hsl.gainG;
+    obj[QStringLiteral("gainB")] = hsl.gainB;
+    return obj;
+}
+
+static HslSecondaryGrade hslSecondaryFromJson(const QJsonObject &obj)
+{
+    HslSecondaryGrade hsl;
+    hsl.enabled = obj.value(QStringLiteral("enabled")).toBool(false);
+    hsl.hueCenter = obj.value(QStringLiteral("hueCenter")).toDouble(30.0);
+    hsl.hueRange = obj.value(QStringLiteral("hueRange")).toDouble(30.0);
+    hsl.satMin = obj.value(QStringLiteral("satMin")).toDouble(0.30);
+    hsl.satMax = obj.value(QStringLiteral("satMax")).toDouble(1.00);
+    hsl.lumaMin = obj.value(QStringLiteral("lumaMin")).toDouble(0.30);
+    hsl.lumaMax = obj.value(QStringLiteral("lumaMax")).toDouble(0.80);
+    hsl.softness = obj.value(QStringLiteral("softness")).toDouble(10.0);
+    hsl.liftR = obj.value(QStringLiteral("liftR")).toDouble(0.0);
+    hsl.liftG = obj.value(QStringLiteral("liftG")).toDouble(0.0);
+    hsl.liftB = obj.value(QStringLiteral("liftB")).toDouble(0.0);
+    hsl.gammaR = obj.value(QStringLiteral("gammaR")).toDouble(1.0);
+    hsl.gammaG = obj.value(QStringLiteral("gammaG")).toDouble(1.0);
+    hsl.gammaB = obj.value(QStringLiteral("gammaB")).toDouble(1.0);
+    hsl.gainR = obj.value(QStringLiteral("gainR")).toDouble(1.0);
+    hsl.gainG = obj.value(QStringLiteral("gainG")).toDouble(1.0);
+    hsl.gainB = obj.value(QStringLiteral("gainB")).toDouble(1.0);
+    return hsl;
+}
+
 struct SequenceStoreExtraction {
     QVector<ClipParentEntry> normalClipParentEntries;
     QJsonObject sequenceStore;
@@ -1737,6 +1783,8 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
         obj["colorCorrection"] = colorCorrectionToJson(clip.colorCorrection);
     if (clip.colorCurves.hasCurves())
         obj["colorCurves"] = clipCurvesToJson(clip.colorCurves);
+    if (!clip.hslSecondary.isDefault())
+        obj["hslSecondary"] = hslSecondaryToJson(clip.hslSecondary);
     if (!clip.colorMeta.isDefault())
         obj["colorMeta"] = clipcolor::toJson(clip.colorMeta);
     if (!clip.layerStyle.isIdentity())
@@ -1830,6 +1878,8 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
         clip.colorCorrection = colorCorrectionFromJson(obj["colorCorrection"].toObject());
     if (obj.contains("colorCurves"))
         clip.colorCurves = clipCurvesFromJson(obj["colorCurves"].toObject());
+    if (obj.contains("hslSecondary"))
+        clip.hslSecondary = hslSecondaryFromJson(obj["hslSecondary"].toObject());
     clip.colorMeta = obj.contains("colorMeta")
         ? clipcolor::fromJson(obj["colorMeta"].toObject())
         : clipcolor::defaultSdr();

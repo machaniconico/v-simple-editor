@@ -255,29 +255,34 @@ QImage decodeClipFrameNative(const QString &filePath, double sourceSec)
 // whenever a colour-corrected / LUT'd clip is on screen.
 //
 // PIPELINE ORDER — proven against the preview fragment shader in GLPreview.cpp:
-//   1. Colour correction: the shader runs exposure -> brightness/contrast ->
+//   1. HSL secondary: the shader applies HSL qualifier secondary LGG before
+//      the primary grade, while the pixels are still raw-but-keyed. This
+//      CPU path mirrors that mask + lift/gamma/gain math through
+//      VideoEffectProcessor::applyHslSecondary.
+//   2. Colour correction: the shader runs exposure -> brightness/contrast ->
 //      highlights/shadows -> saturation -> hue -> temperature/tint -> gamma
 //      -> Lift/Gamma/Gain (src/GLPreview.cpp:813-831). That is byte-for-byte
 //      the SAME sequence VideoEffectProcessor::applyColorCorrection executes
 //      on the CPU (src/VideoEffect.cpp:161-214) — the shader comment at
 //      GLPreview.cpp:812 even states "same order as CPU". So we call the real
 //      applyColorCorrection (no re-implementation) for stage 1.
-//   2. RGB/Luma curves: after colour correction/LGG, GLPreview remaps R/G/B
+//   3. RGB/Luma curves: after colour correction/LGG, GLPreview remaps R/G/B
 //      independently, then remaps perceptual luma and redistributes the luma
 //      delta across RGB (src/GLPreview.cpp:856-867). The CPU twin is
 //      VideoEffectProcessor::applyRgbLumaCurves.
-//   3. 3D LUT: after curves/vignette the shader does
+//   4. 3D LUT: after curves/vignette the shader does
 //      `lutColor = texture(uLut3D, clamp(color,0,1)); color = mix(color,
 //      lutColor, uLutIntensity)` (src/GLPreview.cpp:864-867). The genuine CPU
 //      analogue is LutImporter::applyLutWithIntensity (trilinear sample +
 //      intensity mix, src/LutImporter.cpp:151-225). So colour-correction and
 //      curves run BEFORE the LUT, never after.
-//   (Vignette / HSLq / white-balance are still panel/global-only here; this
-//    per-clip SSOT consumes only state carried by ClipInfo.)
+//   (Vignette / white-balance panel globals remain outside this per-clip
+//    SSOT; this consumes only state carried by ClipInfo.)
 //
 // GATING mirrors Exporter (src/Exporter.cpp:473-474): skip the work — and
-// return the input UNTOUCHED — when the clip's colour correction is default,
-// has no curves, AND has no LUT, so a plain V1/overlay clip stays
+// return the input UNTOUCHED — when the clip's HSL secondary is inactive,
+// colour correction is default, has no curves, AND has no LUT, so a plain
+// V1/overlay clip stays
 // byte-identical to the S2/S3 decode path (no format round-trip, no rounding).
 //
 // FORMAT: applyColorCorrection / applyLut both emit Format_RGB888. The rest of
@@ -287,25 +292,31 @@ QImage decodeClipFrameNative(const QString &filePath, double sourceSec)
 QImage gradeClipNativeFrame(const QImage &native, const ClipInfo &clip)
 {
     const bool hasColor = !clip.colorCorrection.isDefault();
+    const bool hasHsl = clip.hslSecondary.isActive();
     const bool hasCurves = clip.colorCurves.hasCurves();
     const bool hasLut   = clip.hasLut();
-    if (!hasColor && !hasCurves && !hasLut)
+    if (!hasHsl && !hasColor && !hasCurves && !hasLut)
         return native;                       // strict no-op == S2/S3 byte path
 
-    // Stage 1 — colour correction via the genuine CPU SSOT (the very function
+    // Stage 1 — HSL secondary via the CPU twin of GLPreview's uHslq* shader
+    // block. Runs before the primary grade, matching the preview order.
+    QImage img = native;
+    if (hasHsl)
+        img = VideoEffectProcessor::applyHslSecondary(img, clip.hslSecondary);
+
+    // Stage 2 — colour correction via the genuine CPU SSOT (the very function
     // the task names as the comparator). isDefault() short-circuits inside
     // applyColorCorrection too, but the hasColor guard keeps the RGB888
     // round-trip out of the LUT-only path.
-    QImage img = native;
     if (hasColor)
         img = VideoEffectProcessor::applyColorCorrection(img, clip.colorCorrection);
 
-    // Stage 2 — RGB/Luma curves via the CPU twin of GLPreview's uCurveLut
+    // Stage 3 — RGB/Luma curves via the CPU twin of GLPreview's uCurveLut
     // shader math. Runs on colour-graded pixels and before the .cube LUT.
     if (hasCurves)
         img = VideoEffectProcessor::applyRgbLumaCurves(img, clip.colorCurves);
 
-    // Stage 3 — 3D LUT via the genuine CPU SSOT, applied to the colour-graded
+    // Stage 4 — 3D LUT via the genuine CPU SSOT, applied to the colour-graded
     // and curve-remapped pixels. Parse the .cube the same way the preview
     // does (LutImporter::loadCubeFile feeds GLPreview::setLut).
     if (hasLut) {

@@ -173,6 +173,10 @@ struct ClipInfo {
     // COLOR-4: per-clip RGB/Luma curves. Empty/default identity is OFF and is
     // omitted from project JSON so clips with no curves stay byte-identical.
     ClipCurveData colorCurves;
+    // COLOR-6: per-clip HSL secondary qualifier. Default disabled state is
+    // OFF and omitted from project JSON; renderFrameAt mirrors GLPreview's
+    // HSL mask + secondary LGG math before the primary grade.
+    HslSecondaryGrade hslSecondary;
     QVector<VideoEffect> effects;
     KeyframeManager keyframes;
 

@@ -124,6 +124,41 @@ ClipCurveData clipCurvesAt(Timeline *timeline, int trackIdx, int clipIdx)
     return clips[clipIdx].colorCurves;
 }
 
+HslSecondaryGrade clipHslSecondaryAt(Timeline *timeline, int trackIdx, int clipIdx)
+{
+    if (!timeline)
+        return {};
+    const QVector<TimelineTrack *> &tracks = timeline->videoTracks();
+    if (trackIdx < 0 || trackIdx >= tracks.size() || !tracks[trackIdx])
+        return {};
+    const QVector<ClipInfo> &clips = tracks[trackIdx]->clips();
+    if (clipIdx < 0 || clipIdx >= clips.size())
+        return {};
+    return clips[clipIdx].hslSecondary;
+}
+
+bool sameHslSecondary(const HslSecondaryGrade &a, const HslSecondaryGrade &b)
+{
+    auto near = [](double x, double y) { return std::abs(x - y) <= 1e-9; };
+    return a.enabled == b.enabled
+        && near(a.hueCenter, b.hueCenter)
+        && near(a.hueRange, b.hueRange)
+        && near(a.satMin, b.satMin)
+        && near(a.satMax, b.satMax)
+        && near(a.lumaMin, b.lumaMin)
+        && near(a.lumaMax, b.lumaMax)
+        && near(a.softness, b.softness)
+        && near(a.liftR, b.liftR)
+        && near(a.liftG, b.liftG)
+        && near(a.liftB, b.liftB)
+        && near(a.gammaR, b.gammaR)
+        && near(a.gammaG, b.gammaG)
+        && near(a.gammaB, b.gammaB)
+        && near(a.gainR, b.gainR)
+        && near(a.gainG, b.gainG)
+        && near(a.gainB, b.gainB);
+}
+
 bool writeCurvesToSelectedClip(Timeline *timeline,
                                const QVector<QVector<QPointF>> &editorPoints)
 {
@@ -151,6 +186,33 @@ bool writeCurvesToSelectedClip(Timeline *timeline,
     track->setClips(clips);
     if (UndoManager *undo = timeline->undoManager())
         undo->saveState(timeline->currentState(), QStringLiteral("Clip RGB curves"));
+    timeline->refreshPlaybackSequence();
+    return true;
+}
+
+bool writeHslSecondaryToSelectedClip(Timeline *timeline,
+                                     const HslSecondaryGrade &hsl)
+{
+    int trackIdx = -1;
+    int clipIdx = -1;
+    if (!selectedClipIndex(timeline, &trackIdx, &clipIdx))
+        return false;
+
+    TimelineTrack *track = timeline->videoTracks().value(trackIdx, nullptr);
+    if (!track)
+        return false;
+
+    QVector<ClipInfo> clips = track->clips();
+    if (clipIdx < 0 || clipIdx >= clips.size())
+        return false;
+
+    if (sameHslSecondary(clips[clipIdx].hslSecondary, hsl))
+        return true;
+
+    clips[clipIdx].hslSecondary = hsl;
+    track->setClips(clips);
+    if (UndoManager *undo = timeline->undoManager())
+        undo->saveState(timeline->currentState(), QStringLiteral("Clip HSL secondary"));
     timeline->refreshPlaybackSequence();
     return true;
 }
@@ -506,6 +568,167 @@ ColorGradingPanel::ColorGradingPanel(QWidget *parent)
         }
         connect(m_hslqEnabled, &QCheckBox::toggled,
                 this, &ColorGradingPanel::onHslQualifierChanged);
+
+        auto sliderFromDouble =
+            [](double value, int minValue, int maxValue) {
+                return qBound(minValue,
+                              static_cast<int>(std::round(value)),
+                              maxValue);
+            };
+        auto sliderFromFraction =
+            [sliderFromDouble](double value) {
+                return sliderFromDouble(value * 100.0, 0, 100);
+            };
+        auto sliderFromLift =
+            [sliderFromDouble](double value) {
+                return sliderFromDouble(value * 100.0, -50, 50);
+            };
+        auto sliderFromGammaGain =
+            [sliderFromDouble](double value) {
+                const double safe = std::max(value, 1e-6);
+                return sliderFromDouble(std::log2(safe) * 50.0, -100, 100);
+            };
+
+        auto restoreHslSecondaryForClip =
+            [this, sliderFromDouble, sliderFromFraction, sliderFromLift,
+             sliderFromGammaGain](Timeline *timeline, int trackIdx, int clipIdx) {
+                if (trackIdx < 0 || clipIdx < 0) {
+                    if (!selectedClipIndex(timeline, &trackIdx, &clipIdx))
+                        return;
+                }
+                const HslSecondaryGrade hsl =
+                    clipHslSecondaryAt(timeline, trackIdx, clipIdx);
+                if (!m_hslqEnabled || !m_hslqHueCenter || !m_hslqHueRange
+                    || !m_hslqSatMin || !m_hslqSatMax || !m_hslqLumaMin
+                    || !m_hslqLumaMax || !m_hslqSoftness
+                    || !m_hslqLiftR || !m_hslqLiftG || !m_hslqLiftB
+                    || !m_hslqGammaR || !m_hslqGammaG || !m_hslqGammaB
+                    || !m_hslqGainR || !m_hslqGainG || !m_hslqGainB) {
+                    return;
+                }
+
+                const bool wasUpdating = m_updating;
+                m_updating = true;
+                QSignalBlocker be(m_hslqEnabled);
+                QSignalBlocker bhc(m_hslqHueCenter);
+                QSignalBlocker bhr(m_hslqHueRange);
+                QSignalBlocker bsmn(m_hslqSatMin);
+                QSignalBlocker bsmx(m_hslqSatMax);
+                QSignalBlocker blmn(m_hslqLumaMin);
+                QSignalBlocker blmx(m_hslqLumaMax);
+                QSignalBlocker bsf(m_hslqSoftness);
+                QSignalBlocker blr(m_hslqLiftR);
+                QSignalBlocker blg(m_hslqLiftG);
+                QSignalBlocker blb(m_hslqLiftB);
+                QSignalBlocker bgr(m_hslqGammaR);
+                QSignalBlocker bgg(m_hslqGammaG);
+                QSignalBlocker bgb(m_hslqGammaB);
+                QSignalBlocker bnr(m_hslqGainR);
+                QSignalBlocker bng(m_hslqGainG);
+                QSignalBlocker bnb(m_hslqGainB);
+
+                const int hueCenter = sliderFromDouble(hsl.hueCenter, 0, 360);
+                const int hueRange = sliderFromDouble(hsl.hueRange, 0, 180);
+                const int satMin = sliderFromFraction(hsl.satMin);
+                const int satMax = sliderFromFraction(hsl.satMax);
+                const int lumaMin = sliderFromFraction(hsl.lumaMin);
+                const int lumaMax = sliderFromFraction(hsl.lumaMax);
+                const int softness = sliderFromDouble(hsl.softness, 0, 50);
+                const int liftR = sliderFromLift(hsl.liftR);
+                const int liftG = sliderFromLift(hsl.liftG);
+                const int liftB = sliderFromLift(hsl.liftB);
+                const int gammaR = sliderFromGammaGain(hsl.gammaR);
+                const int gammaG = sliderFromGammaGain(hsl.gammaG);
+                const int gammaB = sliderFromGammaGain(hsl.gammaB);
+                const int gainR = sliderFromGammaGain(hsl.gainR);
+                const int gainG = sliderFromGammaGain(hsl.gainG);
+                const int gainB = sliderFromGammaGain(hsl.gainB);
+
+                m_hslqEnabled->setChecked(hsl.enabled);
+                m_hslqHueCenter->setValue(hueCenter);
+                m_hslqHueRange->setValue(hueRange);
+                m_hslqSatMin->setValue(satMin);
+                m_hslqSatMax->setValue(satMax);
+                m_hslqLumaMin->setValue(lumaMin);
+                m_hslqLumaMax->setValue(lumaMax);
+                m_hslqSoftness->setValue(softness);
+                m_hslqLiftR->setValue(liftR);
+                m_hslqLiftG->setValue(liftG);
+                m_hslqLiftB->setValue(liftB);
+                m_hslqGammaR->setValue(gammaR);
+                m_hslqGammaG->setValue(gammaG);
+                m_hslqGammaB->setValue(gammaB);
+                m_hslqGainR->setValue(gainR);
+                m_hslqGainG->setValue(gainG);
+                m_hslqGainB->setValue(gainB);
+
+                if (m_hslqHueCenterLabel)
+                    m_hslqHueCenterLabel->setText(QString::number(hueCenter) + QStringLiteral("°"));
+                if (m_hslqHueRangeLabel)
+                    m_hslqHueRangeLabel->setText(QString::number(hueRange) + QStringLiteral("°"));
+                if (m_hslqSatMinLabel)
+                    m_hslqSatMinLabel->setText(QString::number(satMin) + QStringLiteral("%"));
+                if (m_hslqSatMaxLabel)
+                    m_hslqSatMaxLabel->setText(QString::number(satMax) + QStringLiteral("%"));
+                if (m_hslqLumaMinLabel)
+                    m_hslqLumaMinLabel->setText(QString::number(lumaMin) + QStringLiteral("%"));
+                if (m_hslqLumaMaxLabel)
+                    m_hslqLumaMaxLabel->setText(QString::number(lumaMax) + QStringLiteral("%"));
+                if (m_hslqSoftnessLabel)
+                    m_hslqSoftnessLabel->setText(QString::number(softness));
+                if (m_hslqLiftRLabel)  m_hslqLiftRLabel->setText(QString::number(liftR));
+                if (m_hslqLiftGLabel)  m_hslqLiftGLabel->setText(QString::number(liftG));
+                if (m_hslqLiftBLabel)  m_hslqLiftBLabel->setText(QString::number(liftB));
+                if (m_hslqGammaRLabel) m_hslqGammaRLabel->setText(QString::number(gammaR));
+                if (m_hslqGammaGLabel) m_hslqGammaGLabel->setText(QString::number(gammaG));
+                if (m_hslqGammaBLabel) m_hslqGammaBLabel->setText(QString::number(gammaB));
+                if (m_hslqGainRLabel)  m_hslqGainRLabel->setText(QString::number(gainR));
+                if (m_hslqGainGLabel)  m_hslqGainGLabel->setText(QString::number(gainG));
+                if (m_hslqGainBLabel)  m_hslqGainBLabel->setText(QString::number(gainB));
+
+                m_updating = wasUpdating;
+                emit hslQualifierChanged(hsl.enabled,
+                                         static_cast<float>(hsl.hueCenter),
+                                         static_cast<float>(hsl.hueRange),
+                                         static_cast<float>(hsl.satMin),
+                                         static_cast<float>(hsl.satMax),
+                                         static_cast<float>(hsl.lumaMin),
+                                         static_cast<float>(hsl.lumaMax),
+                                         static_cast<float>(hsl.softness),
+                                         static_cast<float>(hsl.liftR),
+                                         static_cast<float>(hsl.liftG),
+                                         static_cast<float>(hsl.liftB),
+                                         static_cast<float>(hsl.gammaR),
+                                         static_cast<float>(hsl.gammaG),
+                                         static_cast<float>(hsl.gammaB),
+                                         static_cast<float>(hsl.gainR),
+                                         static_cast<float>(hsl.gainG),
+                                         static_cast<float>(hsl.gainB));
+            };
+
+        auto bindTimelineForHslSecondary = [this, restoreHslSecondaryForClip]() {
+            Timeline *timeline = findTimelineForColorPanel(this);
+            if (!timeline)
+                return;
+            if (!property("_clipHslSecondarySelectionBound").toBool()) {
+                setProperty("_clipHslSecondarySelectionBound", true);
+                connect(timeline, &Timeline::clipSelectedOnTrack,
+                        this, [this, timeline, restoreHslSecondaryForClip](int trackIdx, int clipIdx) {
+                    restoreHslSecondaryForClip(timeline, trackIdx, clipIdx);
+                });
+            }
+            int trackIdx = -1;
+            int clipIdx = -1;
+            if (selectedClipIndex(timeline, &trackIdx, &clipIdx))
+                restoreHslSecondaryForClip(timeline, trackIdx, clipIdx);
+        };
+
+        QTimer::singleShot(0, this, bindTimelineForHslSecondary);
+        connect(this, &QDockWidget::visibilityChanged,
+                this, [bindTimelineForHslSecondary](bool visible) {
+            if (visible)
+                bindTimelineForHslSecondary();
+        });
     }
 
     // --- US-EF-4: Effects shader pack — Sharpen / Gaussian Blur / Lens
@@ -1487,6 +1710,8 @@ void ColorGradingPanel::onResetClicked()
     m_updating = false;
     writeCurvesToSelectedClip(findTimelineForColorPanel(this),
                               ClipCurveData::identityEditorPoints());
+    writeHslSecondaryToSelectedClip(findTimelineForColorPanel(this),
+                                    HslSecondaryGrade{});
 
     m_lutCombo->setCurrentIndex(0);
     m_lutIntensitySlider->setValue(100);
@@ -1782,14 +2007,43 @@ void ColorGradingPanel::onHslQualifierChanged()
     const float gainG     = std::pow(2.0f, gainGV  / 50.0f);
     const float gainB     = std::pow(2.0f, gainBV  / 50.0f);
 
-    emit hslQualifierChanged(enabled,
-                             hueCenter, hueRange,
-                             satMin, satMax,
-                             lumaMin, lumaMax,
-                             softness,
-                             liftR, liftG, liftB,
-                             gammaR, gammaG, gammaB,
-                             gainR, gainG, gainB);
+    HslSecondaryGrade hsl;
+    hsl.enabled = enabled;
+    hsl.hueCenter = hueCenter;
+    hsl.hueRange = hueRange;
+    hsl.satMin = satMin;
+    hsl.satMax = satMax;
+    hsl.lumaMin = lumaMin;
+    hsl.lumaMax = lumaMax;
+    hsl.softness = softness;
+    hsl.liftR = liftR;
+    hsl.liftG = liftG;
+    hsl.liftB = liftB;
+    hsl.gammaR = gammaR;
+    hsl.gammaG = gammaG;
+    hsl.gammaB = gammaB;
+    hsl.gainR = gainR;
+    hsl.gainG = gainG;
+    hsl.gainB = gainB;
+    writeHslSecondaryToSelectedClip(findTimelineForColorPanel(this), hsl);
+
+    emit hslQualifierChanged(hsl.enabled,
+                             static_cast<float>(hsl.hueCenter),
+                             static_cast<float>(hsl.hueRange),
+                             static_cast<float>(hsl.satMin),
+                             static_cast<float>(hsl.satMax),
+                             static_cast<float>(hsl.lumaMin),
+                             static_cast<float>(hsl.lumaMax),
+                             static_cast<float>(hsl.softness),
+                             static_cast<float>(hsl.liftR),
+                             static_cast<float>(hsl.liftG),
+                             static_cast<float>(hsl.liftB),
+                             static_cast<float>(hsl.gammaR),
+                             static_cast<float>(hsl.gammaG),
+                             static_cast<float>(hsl.gammaB),
+                             static_cast<float>(hsl.gainR),
+                             static_cast<float>(hsl.gainG),
+                             static_cast<float>(hsl.gainB));
 }
 
 // US-EF-4: any Effects (Sharpen / Blur / Lens Distortion) slider changed.

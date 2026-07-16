@@ -19,9 +19,42 @@ static inline double smoothstep(double t)
     return t * t * (3.0 - 2.0 * t);
 }
 
+static inline double smoothstepEdges(double edge0, double edge1, double x)
+{
+    if (edge1 <= edge0)
+        return x < edge0 ? 0.0 : 1.0;
+    return smoothstep((x - edge0) / (edge1 - edge0));
+}
+
 static inline bool nearPointValue(double a, double b)
 {
     return std::abs(a - b) <= 1e-9;
+}
+
+static inline bool nearUnitValue(double a, double b)
+{
+    return std::abs(a - b) <= 1e-9;
+}
+
+static inline void rgbToHsl01(double r, double g, double b,
+                              double &h, double &s, double &l)
+{
+    const double maxC = std::max({ r, g, b });
+    const double minC = std::min({ r, g, b });
+    l = (maxC + minC) * 0.5;
+    h = 0.0;
+    s = 0.0;
+    if (maxC > minC) {
+        const double d = maxC - minC;
+        s = (l > 0.5) ? d / (2.0 - maxC - minC) : d / (maxC + minC);
+        if (maxC == r)
+            h = (g - b) / d + (g < b ? 6.0 : 0.0);
+        else if (maxC == g)
+            h = (b - r) / d + 2.0;
+        else
+            h = (r - g) / d + 4.0;
+        h /= 6.0;
+    }
 }
 
 static inline double rgbSaturation01(int r, int g, int b)
@@ -333,6 +366,29 @@ QVector<QVector<int>> ClipCurveData::toLuts() const
     for (int i = 0; i < ChannelCount; ++i)
         out.append(buildCurveLut(i < pts.size() ? pts[i] : identityPoints()));
     return out;
+}
+
+bool HslSecondaryGrade::hasAdjustment() const
+{
+    return !nearUnitValue(liftR, 0.0) || !nearUnitValue(liftG, 0.0)
+        || !nearUnitValue(liftB, 0.0) || !nearUnitValue(gammaR, 1.0)
+        || !nearUnitValue(gammaG, 1.0) || !nearUnitValue(gammaB, 1.0)
+        || !nearUnitValue(gainR, 1.0) || !nearUnitValue(gainG, 1.0)
+        || !nearUnitValue(gainB, 1.0);
+}
+
+bool HslSecondaryGrade::isDefault() const
+{
+    const HslSecondaryGrade d;
+    return enabled == d.enabled
+        && nearUnitValue(hueCenter, d.hueCenter)
+        && nearUnitValue(hueRange, d.hueRange)
+        && nearUnitValue(satMin, d.satMin)
+        && nearUnitValue(satMax, d.satMax)
+        && nearUnitValue(lumaMin, d.lumaMin)
+        && nearUnitValue(lumaMax, d.lumaMax)
+        && nearUnitValue(softness, d.softness)
+        && !hasAdjustment();
 }
 
 // --- VideoEffect factory ---
@@ -1066,6 +1122,69 @@ QImage VideoEffectProcessor::applyColorCorrection(const QImage &input, const Col
         }
     }
 
+    return img;
+}
+
+QImage VideoEffectProcessor::applyHslSecondary(const QImage &input,
+                                               const HslSecondaryGrade &hsl)
+{
+    if (!hsl.isActive())
+        return input;
+
+    QImage img = input.convertToFormat(QImage::Format_RGBA8888);
+    const double hueCenter = std::fmod(std::fmod(hsl.hueCenter, 360.0) + 360.0, 360.0);
+    const double hueRange = std::clamp(hsl.hueRange, 0.0, 180.0);
+    const double softness = std::clamp(hsl.softness, 0.0, 50.0);
+    const double satMin = std::clamp(hsl.satMin, 0.0, 1.0);
+    const double satMax = std::clamp(hsl.satMax, 0.0, 1.0);
+    const double lumaMin = std::clamp(hsl.lumaMin, 0.0, 1.0);
+    const double lumaMax = std::clamp(hsl.lumaMax, 0.0, 1.0);
+    const double satEdge = softness * 0.01;
+
+    for (int y = 0; y < img.height(); ++y) {
+        uchar *line = img.scanLine(y);
+        for (int x = 0; x < img.width(); ++x) {
+            uchar *px = line + x * 4;
+            const double r0 = px[0] / 255.0;
+            const double g0 = px[1] / 255.0;
+            const double b0 = px[2] / 255.0;
+
+            double hh = 0.0;
+            double ss = 0.0;
+            double ll = 0.0;
+            rgbToHsl01(r0, g0, b0, hh, ss, ll);
+
+            double hDist = std::abs(hh * 360.0 - hueCenter);
+            hDist = std::min(hDist, 360.0 - hDist);
+            const double hWeight = 1.0 - smoothstepEdges(hueRange - softness,
+                                                         hueRange + softness,
+                                                         hDist);
+            const double sWeight = smoothstepEdges(satMin - satEdge, satMin, ss)
+                * (1.0 - smoothstepEdges(satMax, satMax + satEdge, ss));
+            const double lWeight = smoothstepEdges(lumaMin - satEdge, lumaMin, ll)
+                * (1.0 - smoothstepEdges(lumaMax, lumaMax + satEdge, ll));
+            const double qMask = std::clamp(hWeight * sWeight * lWeight, 0.0, 1.0);
+            if (qMask <= 0.0)
+                continue;
+
+            double r = r0 + hsl.liftR;
+            double g = g0 + hsl.liftG;
+            double b = b0 + hsl.liftB;
+            r = std::pow(std::max(r, 0.0), 1.0 / std::max(hsl.gammaR, 1e-3));
+            g = std::pow(std::max(g, 0.0), 1.0 / std::max(hsl.gammaG, 1e-3));
+            b = std::pow(std::max(b, 0.0), 1.0 / std::max(hsl.gammaB, 1e-3));
+            r *= hsl.gainR;
+            g *= hsl.gainG;
+            b *= hsl.gainB;
+
+            const double outR = r0 + (r - r0) * qMask;
+            const double outG = g0 + (g - g0) * qMask;
+            const double outB = b0 + (b - b0) * qMask;
+            px[0] = static_cast<uchar>(clamp255d(outR * 255.0));
+            px[1] = static_cast<uchar>(clamp255d(outG * 255.0));
+            px[2] = static_cast<uchar>(clamp255d(outB * 255.0));
+        }
+    }
     return img;
 }
 
