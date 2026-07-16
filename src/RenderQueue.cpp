@@ -97,6 +97,135 @@ FpsRational deriveFpsRational(double fps)
 
     return {static_cast<int>(std::round(fps)), 1};
 }
+
+constexpr double kLoudnessGainEpsilonDb = 0.0005;
+
+double sanitizeLoudnessGainDb(double gainDb)
+{
+    return std::isfinite(gainDb) ? gainDb : 0.0;
+}
+
+bool hasLoudnessGain(double gainDb)
+{
+    return std::fabs(sanitizeLoudnessGainDb(gainDb)) > kLoudnessGainEpsilonDb;
+}
+
+double configuredLoudnessGainDb(const QJsonObject &cfg, double fallbackGainDb)
+{
+    if (cfg.contains(QStringLiteral("loudnessGainDb"))) {
+        return sanitizeLoudnessGainDb(
+            cfg.value(QStringLiteral("loudnessGainDb")).toDouble(0.0));
+    }
+    return sanitizeLoudnessGainDb(fallbackGainDb);
+}
+
+QString ffmpegDbLiteral(double gainDb)
+{
+    QString out = QString::number(sanitizeLoudnessGainDb(gainDb), 'f', 6);
+    while (out.contains(QLatin1Char('.')) && out.endsWith(QLatin1Char('0')))
+        out.chop(1);
+    if (out.endsWith(QLatin1Char('.')))
+        out.chop(1);
+    if (out == QLatin1String("-0"))
+        out = QStringLiteral("0");
+    return out;
+}
+
+QString loudnessPostprocessTempPath(const QString &outputPath)
+{
+    const QFileInfo info(outputPath);
+    QString suffix = info.suffix();
+    if (suffix.isEmpty())
+        suffix = QStringLiteral("tmp");
+    const QString fileName = QStringLiteral("%1.loudness.%2.%3.%4")
+        .arg(info.completeBaseName(),
+             QString::number(QCoreApplication::applicationPid()),
+             QString::number(QDateTime::currentMSecsSinceEpoch()),
+             suffix);
+    return info.dir().filePath(fileName);
+}
+
+bool runLoudnessAudioPostprocess(const QString &ffmpegBin,
+                                 const QString &outputPath,
+                                 double gainDb,
+                                 const QString &audioCodec,
+                                 int audioBitrateKbps,
+                                 QString *error)
+{
+    const QStringList filterArgs =
+        RenderQueue::buildLoudnessAudioFilterArgs(gainDb);
+    if (filterArgs.isEmpty())
+        return true;
+
+    if (ffmpegBin.isEmpty()) {
+        if (error) {
+            *error = QStringLiteral(
+                "loudness normalization requires ffmpeg in PATH or alongside the app");
+        }
+        return false;
+    }
+
+    QString codec = audioCodec.trimmed();
+    if (codec.isEmpty() || codec == QLatin1String("copy"))
+        codec = QStringLiteral("aac");
+    if (audioBitrateKbps <= 0)
+        audioBitrateKbps = 192;
+
+    const QString tempPath = loudnessPostprocessTempPath(outputPath);
+    QStringList args;
+    args << QStringLiteral("-y")
+         << QStringLiteral("-hide_banner")
+         << QStringLiteral("-i") << outputPath
+         << QStringLiteral("-map") << QStringLiteral("0:v:0")
+         << QStringLiteral("-map") << QStringLiteral("0:a?")
+         << QStringLiteral("-c:v") << QStringLiteral("copy")
+         << QStringLiteral("-c:a") << codec
+         << QStringLiteral("-b:a")
+         << QStringLiteral("%1k").arg(audioBitrateKbps);
+    args << filterArgs;
+    args << tempPath;
+
+    QProcess proc;
+    proc.setProcessChannelMode(QProcess::SeparateChannels);
+    proc.start(ffmpegBin, args);
+    if (!proc.waitForStarted(15000)) {
+        if (error)
+            *error = QStringLiteral("failed to start ffmpeg: ") + proc.errorString();
+        QFile::remove(tempPath);
+        return false;
+    }
+    proc.waitForFinished(-1);
+    const QByteArray stderrBytes = proc.readAllStandardError();
+    const bool ok = proc.exitStatus() == QProcess::NormalExit
+        && proc.exitCode() == 0
+        && QFileInfo::exists(tempPath);
+    if (!ok) {
+        if (error) {
+            *error = QStringLiteral("ffmpeg loudness normalization failed: ")
+                + QString::fromUtf8(stderrBytes);
+        }
+        QFile::remove(tempPath);
+        return false;
+    }
+
+    const QString backupPath = tempPath + QStringLiteral(".orig");
+    QFile::remove(backupPath);
+    if (!QFile::rename(outputPath, backupPath)) {
+        if (error)
+            *error = QStringLiteral("failed to replace unnormalized export");
+        QFile::remove(tempPath);
+        return false;
+    }
+    if (!QFile::rename(tempPath, outputPath)) {
+        QFile::rename(backupPath, outputPath);
+        if (error)
+            *error = QStringLiteral("failed to move normalized export into place");
+        QFile::remove(tempPath);
+        return false;
+    }
+    QFile::remove(backupPath);
+    return true;
+}
 } // namespace
 
 int runRenderQueueAcesDecisionSelftest()
@@ -201,6 +330,23 @@ void RenderQueue::setAcesPipeline(const aces::AcesPipeline &p)
     m_acesPipeline = p;
 }
 
+void RenderQueue::setLoudnessGainDb(double gainDb)
+{
+    m_loudnessGainDb = sanitizeLoudnessGainDb(gainDb);
+}
+
+QStringList RenderQueue::buildLoudnessAudioFilterArgs(double gainDb)
+{
+    if (!hasLoudnessGain(gainDb))
+        return {};
+
+    return {
+        QStringLiteral("-af"),
+        QStringLiteral("volume=%1dB,alimiter=limit=0.98")
+            .arg(ffmpegDbLiteral(gainDb))
+    };
+}
+
 int RenderQueue::addJob(const QString &name, const QString &projectFilePath,
                         const QString &outputPath, const QJsonObject &exportConfig)
 {
@@ -211,6 +357,10 @@ int RenderQueue::addJob(const QString &name, const QString &projectFilePath,
     job.projectFilePath = projectFilePath;
     job.outputPath = outputPath;
     job.exportConfig = exportConfig;
+    job.loudnessGainDb = configuredLoudnessGainDb(
+        job.exportConfig, m_loudnessGainDb);
+    if (hasLoudnessGain(job.loudnessGainDb))
+        job.exportConfig[QStringLiteral("loudnessGainDb")] = job.loudnessGainDb;
     job.status = RenderJobStatus::Pending;
     job.progress = 0;
     job.progressPercent = 0;
@@ -243,12 +393,21 @@ void RenderQueue::addJob(const RenderJob &job)
     // Mirror flat fields into exportConfig so the render-pipe encoder picks
     // them up without a separate code path.
     QJsonObject cfg = copy.exportConfig;
+    const bool hadLoudnessGain =
+        cfg.contains(QStringLiteral("loudnessGainDb"));
+    copy.loudnessGainDb = configuredLoudnessGainDb(
+        cfg,
+        hasLoudnessGain(copy.loudnessGainDb)
+            ? copy.loudnessGainDb
+            : m_loudnessGainDb);
     cfg["width"] = copy.width;
     cfg["height"] = copy.height;
     cfg["videoCodec"] = mapCodecToEncoderName(copy.codec);
     cfg["videoBitrate"] = copy.bitrateBps / 1000;  // legacy config stores kbps
     if (!copy.preset.isEmpty())
         cfg["preset"] = copy.preset;
+    if (hadLoudnessGain || hasLoudnessGain(copy.loudnessGainDb))
+        cfg[QStringLiteral("loudnessGainDb")] = copy.loudnessGainDb;
     copy.exportConfig = cfg;
 
     m_jobs.append(copy);
@@ -520,6 +679,7 @@ bool RenderQueue::saveQueue(const QString &filePath) const
         obj["endUs"] = static_cast<qint64>(job.endUs);
         obj["passes"] = job.passes;
         obj["exportConfig"] = job.exportConfig;
+        obj["loudnessGainDb"] = job.loudnessGainDb;
         obj["status"] = static_cast<int>(job.status);
         obj["statusString"] = job.statusString();
         obj["progressPercent"] = job.progressPercent;
@@ -580,6 +740,9 @@ bool RenderQueue::loadQueue(const QString &filePath)
         job.endUs = static_cast<qint64>(obj["endUs"].toDouble(0));
         job.passes = obj["passes"].toInt(1);
         job.exportConfig = obj["exportConfig"].toObject();
+        job.loudnessGainDb = configuredLoudnessGainDb(
+            job.exportConfig,
+            obj.value(QStringLiteral("loudnessGainDb")).toDouble(0.0));
         job.status = static_cast<RenderJobStatus>(obj["status"].toInt());
         job.progressPercent = obj["progressPercent"].toInt(obj["progress"].toInt());
         job.progress = job.progressPercent;
@@ -741,6 +904,9 @@ void RenderQueue::startRenderPipe(int jobIndex)
     }
 
     const QJsonObject &cfg = jobCopy.exportConfig;
+    const double loudnessGainDb = configuredLoudnessGainDb(
+        cfg, jobCopy.loudnessGainDb);
+    const bool applyLoudnessFilter = hasLoudnessGain(loudnessGainDb);
     int outW = cfg.value("width").toInt(jobCopy.width > 0 ? jobCopy.width : 1920);
     int outH = cfg.value("height").toInt(jobCopy.height > 0 ? jobCopy.height : 1080);
     if (outW <= 0) outW = 1920;
@@ -871,7 +1037,7 @@ void RenderQueue::startRenderPipe(int jobIndex)
             videoCodec = QStringLiteral("libx265");
     }
 
-    if (smartrender::enabledFromEnv()) {
+    if (smartrender::enabledFromEnv() && !applyLoudnessFilter) {
         if (m_cancelRequested) {
             delete owned;
             finishCurrentJob(false, QStringLiteral("cancelled"));
@@ -956,6 +1122,8 @@ void RenderQueue::startRenderPipe(int jobIndex)
         if (trimAudioToMarkedRange)
             request.audioStartUs = startUsec;
     }
+    const QString loudnessAudioCodec = cfg.value("audioCodec").toString();
+    const int loudnessAudioBitrateKbps = cfg.value("audioBitrate").toInt(192);
 
     request.encoderAvailableHook = [](const std::string &name) {
         return CodecDetector::isEncoderAvailable(QString::fromStdString(name));
@@ -963,7 +1131,9 @@ void RenderQueue::startRenderPipe(int jobIndex)
 
     m_renderThread = QThread::create(
         [this, jobCopy, tl, owned, request, outW, outH,
-         totalFrames, startUsec, usecPerFrame, applyAces, acesPipe]() {
+         totalFrames, startUsec, usecPerFrame, applyAces, acesPipe,
+         haveAudio, loudnessGainDb, loudnessAudioCodec,
+         loudnessAudioBitrateKbps]() {
         QString failMsg;
         // Delete the heap Timeline (only set when loaded from a project
         // file). It is a QWidget created on the GUI thread; QObject deletion
@@ -1078,6 +1248,20 @@ void RenderQueue::startRenderPipe(int jobIndex)
                 encodeOk = false;
             }
 
+            if (encodeOk && haveAudio && hasLoudnessGain(loudnessGainDb)) {
+                QString loudnessError;
+                if (!runLoudnessAudioPostprocess(
+                        findFFmpegBinary(),
+                        jobCopy.outputPath,
+                        loudnessGainDb,
+                        loudnessAudioCodec,
+                        loudnessAudioBitrateKbps,
+                        &loudnessError)) {
+                    failMsg = loudnessError;
+                    encodeOk = false;
+                }
+            }
+
             if (cancelled || m_cancelRequested)
                 return false;
             return encodeOk;
@@ -1181,6 +1365,10 @@ void RenderQueue::startRenderPipeSubprocess(int jobIndex)
     }
 
     const QJsonObject &cfg = jobCopy.exportConfig;
+    const double loudnessGainDb = configuredLoudnessGainDb(
+        cfg, jobCopy.loudnessGainDb);
+    const QStringList loudnessAudioFilterArgs =
+        buildLoudnessAudioFilterArgs(loudnessGainDb);
     int outW = cfg.value("width").toInt(jobCopy.width > 0 ? jobCopy.width : 1920);
     int outH = cfg.value("height").toInt(jobCopy.height > 0 ? jobCopy.height : 1080);
     if (outW <= 0) outW = 1920;
@@ -1364,6 +1552,7 @@ void RenderQueue::startRenderPipeSubprocess(int jobIndex)
         const int audioBitrate = cfg.value("audioBitrate").toInt(192);
         args << QStringLiteral("-b:a")
              << QStringLiteral("%1k").arg(audioBitrate);
+        args << loudnessAudioFilterArgs;
         // Stop at the shorter of rendered video / source audio so a longer
         // audio track doesn't pad black frames past the timeline.
         args << QStringLiteral("-shortest");

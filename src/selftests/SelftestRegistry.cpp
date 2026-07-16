@@ -102,6 +102,7 @@ int runLayerStyleUiSelftest();
 int runLibavcoreDecodeSelftest();
 int runLibavcoreEncodeSelftest();
 int runLiveMatteResolveSelftest();
+int runLoudnessExportWireSelftest();
 int runLoudnessSelftest();
 int runLowerThirdSelftest();
 int runMatte16ParitySelftest();
@@ -446,6 +447,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "RenderQueue ACES/ODT ownership decision for 8-bit vs 16-bit tonemap paths (2 gates)" },
     { "renderqueue-fps-rational", "VEDITOR_RENDERQUEUE_FPS_RATIONAL_SELFTEST", runRenderQueueFpsRationalSelftest, false,
       "RenderQueue in-process export fps rational derivation (6 gates)" },
+    { "loudness-export-wire", "VEDITOR_LOUDNESS_EXPORT_WIRE_SELFTEST", runLoudnessExportWireSelftest, false,
+      "RenderQueue loudness gain to ffmpeg audio filter argument wiring (4 gates)" },
     { "versioned-save",   "VEDITOR_VERSIONED_SAVE_SELFTEST",    runVersionedSaveSelftest,      false,
       "Increment and Save filename resolver: numbered suffix, unnumbered v002, collision skip, digit width" },
     { "export-range",      "VEDITOR_EXPORT_RANGE_SELFTEST",       runExportRangeSelftest,       false,

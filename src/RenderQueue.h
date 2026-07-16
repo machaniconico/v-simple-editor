@@ -2,6 +2,7 @@
 
 #include <QObject>
 #include <QString>
+#include <QStringList>
 #include <QVector>
 #include <QDateTime>
 #include <QJsonObject>
@@ -49,6 +50,7 @@ struct RenderJob {
 
     // Legacy fields (still populated for backwards compatibility).
     QJsonObject exportConfig;
+    double loudnessGainDb = 0.0;
     QString dolbyVisionXml;
     int progress = 0;
     QDateTime startTime;
@@ -113,6 +115,9 @@ public:
     // m_acesPipeline を start() 前に push する想定 (UI スレッドから呼ばれる)。
     // enabled=false (既定) のときレンダーワーカーは一切適用せずビット同一。
     void setAcesPipeline(const aces::AcesPipeline &p);
+    void setLoudnessGainDb(double gainDb);
+
+    static QStringList buildLoudnessAudioFilterArgs(double gainDb);
 
     static QVector<RenderPreset> availablePresets();
     static RenderJob jobFromPreset(const RenderPreset &preset,
@@ -239,4 +244,6 @@ private:
     // 設定とスナップショット取得を m_acesMutex で保護する (Exporter の前例に倣う)。
     mutable QMutex m_acesMutex;
     aces::AcesPipeline m_acesPipeline;
+
+    double m_loudnessGainDb = 0.0;
 };

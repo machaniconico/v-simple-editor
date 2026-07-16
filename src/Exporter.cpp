@@ -31,11 +31,19 @@ extern "C" {
 namespace {
 QMutex g_exporterAcesPipelineMutex;
 aces::AcesPipeline g_exporterAcesPipeline;
+QMutex g_exporterLoudnessMutex;
+double g_exporterLoudnessGainDb = 0.0;
 
 aces::AcesPipeline exporterAcesPipelineSnapshot()
 {
     QMutexLocker locker(&g_exporterAcesPipelineMutex);
     return g_exporterAcesPipeline;
+}
+
+double exporterLoudnessGainSnapshot()
+{
+    QMutexLocker locker(&g_exporterLoudnessMutex);
+    return g_exporterLoudnessGainDb;
 }
 
 // US-104: ProRes4444 (YUVA444P10LE) の alpha プレーンを不透明で初期化する。
@@ -89,6 +97,11 @@ void exporter_setAcesPipeline(const aces::AcesPipeline &pipeline)
     g_exporterAcesPipeline = pipeline;
 }
 
+double exporter_loudnessGainDb()
+{
+    return exporterLoudnessGainSnapshot();
+}
+
 Exporter::Exporter(QObject *parent)
     : QObject(parent)
 {
@@ -106,7 +119,9 @@ void Exporter::setSubtitleRenderer(SubtitleTrackRenderer *renderer)
 
 void Exporter::setLoudnessGainDb(double gainDb)
 {
-    m_loudnessGainDb = gainDb;
+    m_loudnessGainDb = std::isfinite(gainDb) ? gainDb : 0.0;
+    QMutexLocker locker(&g_exporterLoudnessMutex);
+    g_exporterLoudnessGainDb = m_loudnessGainDb;
 }
 
 void Exporter::cancel()
@@ -117,6 +132,12 @@ void Exporter::cancel()
 void Exporter::startExport(const ExportConfig &config, const QVector<ClipInfo> &clips)
 {
     m_cancelled = false;
+    const double loudnessGainDb = m_loudnessGainDb;
+    {
+        QMutexLocker locker(&g_exporterLoudnessMutex);
+        g_exporterLoudnessGainDb = std::isfinite(loudnessGainDb)
+            ? loudnessGainDb : 0.0;
+    }
     m_thread = QThread::create([this, config, clips]() {
         doExport(config, clips);
     });
@@ -176,6 +197,11 @@ bool Exporter::openInputFile(const QString &path, AVFormatContext **fmtCtx, AVCo
 void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &clips)
 {
     const aces::AcesPipeline exporterAcesPipeline = exporterAcesPipelineSnapshot();
+    const double loudnessGainDb = exporterLoudnessGainSnapshot();
+    if (std::fabs(loudnessGainDb) > 0.0005) {
+        qInfo() << "Exporter legacy path received loudness gain"
+                << loudnessGainDb << "dB";
+    }
 
     if (clips.isEmpty()) {
         emit exportFinished(false, "No clips to export");

@@ -91,6 +91,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/EasingPresetsSelftest.cpp
     src/selftests/SpatialPathSelftest.cpp
     src/selftests/SmartRenderSelftest.cpp
+    src/selftests/LoudnessExportWireSelftest.cpp
     src/selftests/FrameExportSelftest.cpp
     src/selftests/AdjustmentLayerSelftest.cpp
     src/selftests/ClipMaskSelftest.cpp

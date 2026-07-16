@@ -9,6 +9,7 @@
 // Exporter.cpp に TU ローカル状態とともに定義 (Exporter.h は touchedFiles 外のため
 // ヘッダを変更せずに済む設計)。aces::AcesPipeline は MainWindow.h 経由で可視。
 void exporter_setAcesPipeline(const aces::AcesPipeline &pipeline);
+double exporter_loudnessGainDb();
 #include "TrimOps.h"
 #include "ExportDialog.h"
 #include "FrameExport.h"
@@ -8051,6 +8052,9 @@ void MainWindow::exportVideo()
     cfg["audioCodec"]   = exportCfg.audioCodec;
     cfg["audioBitrate"] = exportCfg.audioBitrate;
     cfg["exportMarkedRangeOnly"] = exportCfg.exportMarkedRangeOnly;
+    const double loudnessGainDb = exporter_loudnessGainDb();
+    job.loudnessGainDb = loudnessGainDb;
+    cfg["loudnessGainDb"] = loudnessGainDb;
     const bool isHdrExport =
         exportCfg.hdr10 || exportCfg.hdrSettings.mode != QStringLiteral("sdr");
     if (isHdrExport) {
@@ -8135,6 +8139,7 @@ void MainWindow::exportVideo()
     // legacy Exporter には openColorManagement / load で既に push 済み。
     // RenderQueue は 8bit 経路でのみ適用し、enabled=false 時はビット同一。
     m_renderQueue->setAcesPipeline(m_acesPipeline);
+    m_renderQueue->setLoudnessGainDb(loudnessGainDb);
     statusBar()->showMessage("Exporting: " + exportCfg.outputPath);
     m_renderQueue->addJob(job);
     m_renderQueue->start();
@@ -13052,6 +13057,9 @@ void MainWindow::onMobileExport()
                     jcfg["videoBitrate"] = cfg.videoBitrate;
                     jcfg["audioCodec"]   = cfg.audioCodec;
                     jcfg["audioBitrate"] = cfg.audioBitrate;
+                    const double loudnessGainDb = exporter_loudnessGainDb();
+                    job.loudnessGainDb = loudnessGainDb;
+                    jcfg["loudnessGainDb"] = loudnessGainDb;
                     if (cfg.hdr10 ||
                         cfg.hdrSettings.mode != QStringLiteral("sdr")) {
                         jcfg["hdr10"]   = true;
@@ -13096,6 +13104,7 @@ void MainWindow::onMobileExport()
                     // AC: production export 経路に ACES SSOT を push (start()
                     // 前)。8bit 経路のみ適用、enabled=false 時はビット同一。
                     m_renderQueue->setAcesPipeline(m_acesPipeline);
+                    m_renderQueue->setLoudnessGainDb(loudnessGainDb);
                     statusBar()->showMessage(
                         QStringLiteral("モバイル書き出し: ") + cfg.outputPath);
                     m_renderQueue->addJob(job);
@@ -15812,6 +15821,8 @@ void MainWindow::openRenderQueueDialog()
         // carry the live edit-graph instead of resolving to nullptr.
         m_renderQueueDialog->setLiveTimeline(m_timeline);
     }
+    if (m_renderQueueDialog->queue())
+        m_renderQueueDialog->queue()->setLoudnessGainDb(exporter_loudnessGainDb());
     // RM-1.4/RM-1.3: keep the live Timeline's matte carrier current so a
     // "current project" queue job exports the same track matte the GUI
     // preview shows (the dialog has no save step before submitting).
@@ -16697,6 +16708,10 @@ void MainWindow::applyLoudnessNormalize(double targetLUFS, double gainDb)
 
     // Pass gain to exporter for render-time normalization.
     m_exporter->setLoudnessGainDb(gainDb);
+    if (m_renderQueue)
+        m_renderQueue->setLoudnessGainDb(gainDb);
+    if (m_renderQueueDialog && m_renderQueueDialog->queue())
+        m_renderQueueDialog->queue()->setLoudnessGainDb(gainDb);
 
     statusBar()->showMessage(
         QString("ラウドネス正規化: target=%1 LUFS, gain=%2 dB")
