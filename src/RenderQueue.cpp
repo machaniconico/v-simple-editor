@@ -61,6 +61,33 @@ bool shouldApplyExportAces(bool acesEnabled,
     return acesEnabled && !isHdr10 && !isHlg && !isProRes && !odtOwnsTonemap;
 }
 
+bool tracksContainSequenceReference(const QVector<QVector<ClipInfo>> &tracks)
+{
+    for (const QVector<ClipInfo> &track : tracks) {
+        for (const ClipInfo &clip : track) {
+            if (clip.isSequenceReference())
+                return true;
+        }
+    }
+    return false;
+}
+
+bool timelineHasSequenceRenderModel(const Timeline *timeline)
+{
+    if (!timeline)
+        return false;
+
+    if (tracksContainSequenceReference(timeline->allVideoTracks())
+        || tracksContainSequenceReference(timeline->allAudioTracks())) {
+        return true;
+    }
+
+    // A non-empty sequence model serializes through clipParentEntries as a
+    // sequence-store carrier. Keep smart-render out of that graph even when
+    // the active sequence currently contains a single ordinary media clip.
+    return !timeline->sequences().isEmpty();
+}
+
 struct FpsRational {
     int num = 30;
     int den = 1;
@@ -253,7 +280,31 @@ int runRenderQueueAcesDecisionSelftest()
               && !shouldApplyExportAces(true, false, false, false, odtOwnsTonemap));
     }
 
-    std::printf("[renderqueue-aces] summary: gates=2 passed=%d failed=%d\n",
+    {
+        ClipInfo clip;
+        clip.duration = 1.0;
+        clip.outPoint = 1.0;
+        clip.sequenceRefId = QStringLiteral("precomp-1");
+        clip.filePath = timeline_nesting::sequenceClipFilePath(clip.sequenceRefId);
+        QVector<QVector<ClipInfo>> tracks;
+        tracks.append(QVector<ClipInfo>{clip});
+        check(3, "sequenceRef clips trip the smart-render nest guard",
+              tracksContainSequenceReference(tracks));
+    }
+
+    {
+        ClipInfo clip;
+        clip.duration = 1.0;
+        clip.outPoint = 1.0;
+        clip.filePath =
+            timeline_nesting::sequenceClipFilePath(QStringLiteral("precomp-2"));
+        QVector<QVector<ClipInfo>> tracks;
+        tracks.append(QVector<ClipInfo>{clip});
+        check(4, "sequence URI clips trip the smart-render nest guard",
+              tracksContainSequenceReference(tracks));
+    }
+
+    std::printf("[renderqueue-aces] summary: gates=4 passed=%d failed=%d\n",
                 passed, failed);
     return failed == 0 ? 0 : 1;
 }
@@ -1037,7 +1088,11 @@ void RenderQueue::startRenderPipe(int jobIndex)
             videoCodec = QStringLiteral("libx265");
     }
 
-    if (smartrender::enabledFromEnv() && !applyLoudnessFilter) {
+    const bool blockSmartRenderForSequences =
+        timelineHasSequenceRenderModel(tl);
+    if (smartrender::enabledFromEnv()
+        && !applyLoudnessFilter
+        && !blockSmartRenderForSequences) {
         if (m_cancelRequested) {
             delete owned;
             finishCurrentJob(false, QStringLiteral("cancelled"));
@@ -1094,6 +1149,12 @@ void RenderQueue::startRenderPipe(int jobIndex)
                 << "[smart-render] whole timeline not stream-copy eligible:"
                 << passThrough.reason;
         }
+    } else if (smartrender::enabledFromEnv()
+               && !applyLoudnessFilter
+               && blockSmartRenderForSequences) {
+        qInfo().noquote()
+            << "[smart-render] whole timeline not stream-copy eligible:"
+            << "timeline contains nested sequence state";
     }
 
     request.videoBitrateBits = jobCopy.bitrateBps;

@@ -693,6 +693,28 @@ QString renderClipId(int trackIdx, int clipIdx)
     return trackMatteClipKey(trackIdx, clipIdx);
 }
 
+QString renderScopedClipId(int trackIdx,
+                           int clipIdx,
+                           int sequenceDepth,
+                           const QVector<QString> &sequenceStack)
+{
+    const QString localId = renderClipId(trackIdx, clipIdx);
+    if (sequenceDepth <= 0 || sequenceStack.isEmpty())
+        return localId;
+
+    QString scope;
+    for (const QString &id : sequenceStack) {
+        if (id.isEmpty())
+            continue;
+        if (!scope.isEmpty())
+            scope += QLatin1Char('/');
+        scope += id;
+    }
+    return scope.isEmpty()
+        ? localId
+        : QStringLiteral("sequence:%1:%2").arg(scope, localId);
+}
+
 // TM-8: the track-matte wiring is now intrinsic to the Timeline. Both
 // producers populate it: MainWindow on every m_trackMatteClipEntries
 // mutation (GUI preview path), and RenderQueue::resolveTimeline after
@@ -1051,7 +1073,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
     QVector<OverlayLayer> overlays;
     {
         RenderLayer baseLayer;
-        baseLayer.clipId = renderClipId(0, v1Idx);
+        baseLayer.clipId =
+            renderScopedClipId(0, v1Idx, sequenceDepth, sequenceStack);
         baseLayer.trackIndex = 0;
         baseLayer.image = base;
         baseLayer.sourceRgb = v1LayerSource;
@@ -1100,7 +1123,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         const bool cNullObject = clipgeom::isNullObjectFilePath(c.filePath);
         if (cNullObject) {
             RenderLayer renderLayer;
-            renderLayer.clipId = renderClipId(t, idx);
+            renderLayer.clipId =
+                renderScopedClipId(t, idx, sequenceDepth, sequenceStack);
             renderLayer.trackIndex = t;
             renderLayer.colorMeta = c.colorMeta;
             renderLayer.transform = cTransform;
@@ -1144,7 +1168,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         QImage native = applyClipMask(nativeForMask, c, srcSec);
         native = snsfit::maybeFit(native, c.fitContain, c.fitCover, outSize);
         RenderLayer renderLayer;
-        renderLayer.clipId = renderClipId(t, idx);
+        renderLayer.clipId =
+            renderScopedClipId(t, idx, sequenceDepth, sequenceStack);
         renderLayer.trackIndex = t;
         renderLayer.colorMeta = c.colorMeta;
         renderLayer.transform = cTransform;
