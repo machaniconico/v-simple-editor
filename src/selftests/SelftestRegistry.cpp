@@ -56,6 +56,7 @@ int runCaptionSelftest();
 int runChromaSelftest();
 int runClipColorSelftest();
 int runClipLutSelftest();
+int runClipMaskSelftest();
 int runClipParentParitySelftest();
 int runClipIdtSelftest();
 int runClipOdtSelftest();
@@ -544,6 +545,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "AscCdlExport: ASC CDL v1.01 .cc/.ccc/.cdl XML + LGG->SOP mapping + 6-decimal format + guards (13 gates)" },
     { "clip-color",       "VEDITOR_CLIP_COLOR_SELFTEST",         runClipColorSelftest,          false,
       "ClipColor: per-clip 色メタデータ模型 — defaultSdr / JSON round-trip / token 逆写像 / describe / codec transfer mapping (14 gates)" },
+    { "clip-mask",        "VEDITOR_CLIP_MASK_SELFTEST",          runClipMaskSelftest,           false,
+      "Bezier clip masks: model JSON, ProjectFile default omission, per-clip maskSystem round-trip" },
     { "clip-parent-parity", "VEDITOR_CLIP_PARENT_PARITY_SELFTEST", runClipParentParitySelftest, true,
       "Clip parenting: render parity, composeParented math, cycle/self/null guards" },
     { "clip-idt",         "VEDITOR_CLIP_IDT_SELFTEST",           runClipIdtSelftest,            false,

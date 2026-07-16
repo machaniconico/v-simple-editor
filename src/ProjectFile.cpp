@@ -3,6 +3,7 @@
 #include "MarkerData.h"
 #include "AdjustmentLayer.h"
 #include "color/ClipColor.h"
+#include "mask/ClipMask.h"
 #include <QBuffer>
 #include <QFile>
 #include <QJsonDocument>
@@ -1615,6 +1616,8 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
         obj["colorMeta"] = clipcolor::toJson(clip.colorMeta);
     if (!clip.layerStyle.isIdentity())
         obj["layerStyle"] = clip.layerStyle.toJson();
+    if (!clipmask::isDefault(clip.maskSystem))
+        obj["clipMasks"] = clipmask::maskSystemToJson(clip.maskSystem);
 
     if (!clip.effects.isEmpty()) {
         QJsonArray fxArr;
@@ -1702,6 +1705,8 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
         : clipcolor::defaultSdr();
     if (obj.contains("layerStyle"))
         clip.layerStyle = LayerStyle::fromJson(obj["layerStyle"].toObject());
+    if (obj.contains("clipMasks"))
+        clip.maskSystem = clipmask::maskSystemFromJson(obj["clipMasks"].toObject());
 
     if (obj.contains("effects")) {
         for (const auto &v : obj["effects"].toArray())

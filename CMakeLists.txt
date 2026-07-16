@@ -93,6 +93,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/SmartRenderSelftest.cpp
     src/selftests/FrameExportSelftest.cpp
     src/selftests/AdjustmentLayerSelftest.cpp
+    src/selftests/ClipMaskSelftest.cpp
     src/selftests/GradeLggSerializationSelftest.cpp
     src/selftests/GradeWheelWiringSelftest.cpp
     src/selftests/MediaPoolDragSelftest.cpp
@@ -145,6 +146,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/TrackMatteBake.cpp
     src/ClipGeometry.h
     src/ClipGeometry.cpp
+    src/mask/ClipMask.h
+    src/mask/ClipMask.cpp
     src/LayerStyle.h
     src/LayerStyle.cpp
     src/clipanim/ClipAnim.h
