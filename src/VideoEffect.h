@@ -4,6 +4,7 @@
 #include <QColor>
 #include <QVector>
 #include <QString>
+#include <QPointF>
 
 // --- Color Correction / Grading ---
 
@@ -35,6 +36,28 @@ struct ColorCorrection {
     }
 
     void reset() { *this = ColorCorrection{}; }
+};
+
+// Per-clip RGB/Luma curves. Empty points mean "unset" and must be treated as
+// a strict no-op so clips without curve data remain byte-identical.
+struct ClipCurveData {
+    static constexpr int ChannelR = 0;
+    static constexpr int ChannelG = 1;
+    static constexpr int ChannelB = 2;
+    static constexpr int ChannelLuma = 3;
+    static constexpr int ChannelCount = 4;
+
+    QVector<QVector<QPointF>> points;
+
+    bool isIdentity() const;
+    bool hasCurves() const { return !points.isEmpty() && !isIdentity(); }
+    void reset() { points.clear(); }
+    void setPoints(const QVector<QVector<QPointF>> &editorPoints);
+    QVector<QVector<QPointF>> editorPointsOrIdentity() const;
+    QVector<QVector<int>> toLuts() const;
+
+    static QVector<QPointF> identityPoints();
+    static QVector<QVector<QPointF>> identityEditorPoints();
 };
 
 // --- Video Effects ---
@@ -203,6 +226,8 @@ class VideoEffectProcessor
 {
 public:
     static QImage applyColorCorrection(const QImage &input, const ColorCorrection &cc);
+    static QImage applyRgbLumaCurves(const QImage &input, const ClipCurveData &curves);
+    static QImage applyRgbLumaCurves(const QImage &input, const QVector<QVector<int>> &curves);
     static QImage applyEffect(const QImage &input, const VideoEffect &effect);
     static QImage applyEffectStack(const QImage &input, const ColorCorrection &cc,
                                    const QVector<VideoEffect> &effects);

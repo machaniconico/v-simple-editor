@@ -400,6 +400,60 @@ static AudioChannelMode audioChannelModeFromProjectValue(const QJsonValue &value
     return AudioChannelMode::Stereo;
 }
 
+static QJsonArray curvePointListToJson(const QVector<QPointF> &points)
+{
+    QJsonArray arr;
+    for (const QPointF &p : points) {
+        QJsonArray pt;
+        pt.append(p.x());
+        pt.append(p.y());
+        arr.append(pt);
+    }
+    return arr;
+}
+
+static QVector<QPointF> curvePointListFromJson(const QJsonArray &arr)
+{
+    QVector<QPointF> points;
+    points.reserve(arr.size());
+    for (const QJsonValue &v : arr) {
+        const QJsonArray pt = v.toArray();
+        if (pt.size() < 2)
+            continue;
+        points.append(QPointF(pt.at(0).toDouble(), pt.at(1).toDouble()));
+    }
+    return points;
+}
+
+static QJsonObject clipCurvesToJson(const ClipCurveData &curves)
+{
+    QJsonObject obj;
+    if (!curves.hasCurves())
+        return obj;
+
+    QJsonArray channels;
+    const QVector<QVector<QPointF>> points = curves.editorPointsOrIdentity();
+    for (int ch = 0; ch < ClipCurveData::ChannelCount; ++ch)
+        channels.append(curvePointListToJson(points.value(ch)));
+    obj[QStringLiteral("channels")] = channels;
+    return obj;
+}
+
+static ClipCurveData clipCurvesFromJson(const QJsonObject &obj)
+{
+    ClipCurveData curves;
+    const QJsonArray channels = obj.value(QStringLiteral("channels")).toArray();
+    QVector<QVector<QPointF>> points;
+    points.reserve(ClipCurveData::ChannelCount);
+    for (int ch = 0; ch < ClipCurveData::ChannelCount; ++ch) {
+        const QJsonArray channel =
+            ch < channels.size() ? channels.at(ch).toArray() : QJsonArray{};
+        points.append(curvePointListFromJson(channel));
+    }
+    curves.setPoints(points);
+    return curves;
+}
+
 bool ProjectFile::save(const QString &filePath, const ProjectData &data)
 {
     QJsonObject root;
@@ -1612,6 +1666,8 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
 
     if (!clip.colorCorrection.isDefault())
         obj["colorCorrection"] = colorCorrectionToJson(clip.colorCorrection);
+    if (clip.colorCurves.hasCurves())
+        obj["colorCurves"] = clipCurvesToJson(clip.colorCurves);
     if (!clip.colorMeta.isDefault())
         obj["colorMeta"] = clipcolor::toJson(clip.colorMeta);
     if (!clip.layerStyle.isIdentity())
@@ -1700,6 +1756,8 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
 
     if (obj.contains("colorCorrection"))
         clip.colorCorrection = colorCorrectionFromJson(obj["colorCorrection"].toObject());
+    if (obj.contains("colorCurves"))
+        clip.colorCurves = clipCurvesFromJson(obj["colorCurves"].toObject());
     clip.colorMeta = obj.contains("colorMeta")
         ? clipcolor::fromJson(obj["colorMeta"].toObject())
         : clipcolor::defaultSdr();

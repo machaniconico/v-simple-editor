@@ -154,6 +154,9 @@ struct ClipInfo {
 
     // Phase 3: Color correction, effects, keyframes
     ColorCorrection colorCorrection;
+    // COLOR-4: per-clip RGB/Luma curves. Empty/default identity is OFF and is
+    // omitted from project JSON so clips with no curves stay byte-identical.
+    ClipCurveData colorCurves;
     QVector<VideoEffect> effects;
     KeyframeManager keyframes;
 

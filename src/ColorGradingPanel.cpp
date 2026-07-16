@@ -3,15 +3,159 @@
 #include "CurveEditor.h"
 #include "HueVsSatEditor.h"
 #include "WbPick.h"
+#include "Timeline.h"
+#include "UndoManager.h"
+#include <QApplication>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QGridLayout>
 #include <QGroupBox>
 #include <QScrollArea>
 #include <QColorDialog>
+#include <QJsonArray>
+#include <QJsonObject>
 #include <QSignalBlocker>
 #include <algorithm>
 #include <cmath>
+
+namespace {
+
+QJsonArray curvePointListToJson(const QVector<QPointF> &points)
+{
+    QJsonArray arr;
+    for (const QPointF &p : points) {
+        QJsonArray pt;
+        pt.append(p.x());
+        pt.append(p.y());
+        arr.append(pt);
+    }
+    return arr;
+}
+
+QVector<QPointF> curvePointListFromJson(const QJsonArray &arr)
+{
+    QVector<QPointF> points;
+    points.reserve(arr.size());
+    for (const QJsonValue &v : arr) {
+        const QJsonArray pt = v.toArray();
+        if (pt.size() < 2)
+            continue;
+        points.append(QPointF(pt.at(0).toDouble(), pt.at(1).toDouble()));
+    }
+    return points;
+}
+
+QJsonObject curveDataToJson(const ClipCurveData &curves, int srcWidth, int srcHeight)
+{
+    QJsonObject obj;
+    obj[QStringLiteral("srcWidth")] = srcWidth;
+    obj[QStringLiteral("srcHeight")] = srcHeight;
+    if (!curves.hasCurves())
+        return obj;
+
+    QJsonArray channels;
+    const QVector<QVector<QPointF>> points = curves.editorPointsOrIdentity();
+    for (int ch = 0; ch < ClipCurveData::ChannelCount; ++ch)
+        channels.append(curvePointListToJson(points.value(ch)));
+    obj[QStringLiteral("channels")] = channels;
+    return obj;
+}
+
+ClipCurveData curveDataFromJson(const QJsonObject &obj)
+{
+    ClipCurveData curves;
+    const QJsonArray channels = obj.value(QStringLiteral("channels")).toArray();
+    QVector<QVector<QPointF>> points;
+    points.reserve(ClipCurveData::ChannelCount);
+    for (int ch = 0; ch < ClipCurveData::ChannelCount; ++ch) {
+        const QJsonArray channel =
+            ch < channels.size() ? channels.at(ch).toArray() : QJsonArray{};
+        points.append(curvePointListFromJson(channel));
+    }
+    curves.setPoints(points);
+    return curves;
+}
+
+Timeline *findTimelineForColorPanel(QObject *panel)
+{
+    for (QObject *p = panel; p; p = p->parent()) {
+        if (Timeline *timeline = p->findChild<Timeline *>())
+            return timeline;
+    }
+    const auto topLevels = QApplication::topLevelWidgets();
+    for (QWidget *w : topLevels) {
+        if (Timeline *timeline = w->findChild<Timeline *>())
+            return timeline;
+    }
+    return nullptr;
+}
+
+bool selectedClipIndex(Timeline *timeline, int *trackIdx, int *clipIdx)
+{
+    if (!timeline)
+        return false;
+    const QVector<TimelineTrack *> &tracks = timeline->videoTracks();
+    for (int t = 0; t < tracks.size(); ++t) {
+        const TimelineTrack *track = tracks[t];
+        if (!track)
+            continue;
+        const int selected = track->selectedClip();
+        if (selected < 0 || selected >= track->clips().size())
+            continue;
+        if (trackIdx)
+            *trackIdx = t;
+        if (clipIdx)
+            *clipIdx = selected;
+        return true;
+    }
+    return false;
+}
+
+ClipCurveData clipCurvesAt(Timeline *timeline, int trackIdx, int clipIdx)
+{
+    if (!timeline)
+        return {};
+    const QVector<TimelineTrack *> &tracks = timeline->videoTracks();
+    if (trackIdx < 0 || trackIdx >= tracks.size() || !tracks[trackIdx])
+        return {};
+    const QVector<ClipInfo> &clips = tracks[trackIdx]->clips();
+    if (clipIdx < 0 || clipIdx >= clips.size())
+        return {};
+    return clips[clipIdx].colorCurves;
+}
+
+bool writeCurvesToSelectedClip(Timeline *timeline,
+                               const QVector<QVector<QPointF>> &editorPoints)
+{
+    int trackIdx = -1;
+    int clipIdx = -1;
+    if (!selectedClipIndex(timeline, &trackIdx, &clipIdx))
+        return false;
+
+    TimelineTrack *track = timeline->videoTracks().value(trackIdx, nullptr);
+    if (!track)
+        return false;
+
+    QVector<ClipInfo> clips = track->clips();
+    if (clipIdx < 0 || clipIdx >= clips.size())
+        return false;
+
+    ClipCurveData curves;
+    curves.setPoints(editorPoints);
+    if (clips[clipIdx].colorCurves.editorPointsOrIdentity()
+        == curves.editorPointsOrIdentity()) {
+        return true;
+    }
+
+    clips[clipIdx].colorCurves = curves;
+    track->setClips(clips);
+    if (UndoManager *undo = timeline->undoManager())
+        undo->saveState(timeline->currentState(), QStringLiteral("Clip RGB curves"));
+    timeline->refreshPlaybackSequence();
+    return true;
+}
+
+} // namespace
 
 ColorGradingPanel::ColorGradingPanel(QWidget *parent)
     : QDockWidget(tr("カラーグレーディング"), parent)
@@ -576,6 +720,52 @@ ColorGradingPanel::ColorGradingPanel(QWidget *parent)
 
         connect(m_curveEditor, &CurveEditor::curvesChanged,
                 this, &ColorGradingPanel::curvesChanged);
+        connect(m_curveEditor, &CurveEditor::curvesChanged,
+                this, [this](const QVector<QVector<int>> &) {
+            if (m_updating || !m_curveEditor)
+                return;
+            writeCurvesToSelectedClip(findTimelineForColorPanel(this),
+                                      m_curveEditor->allPoints());
+        });
+
+        auto restoreCurveEditorForClip =
+            [this](Timeline *timeline, int trackIdx, int clipIdx) {
+                if (!m_curveEditor)
+                    return;
+                if (trackIdx < 0 || clipIdx < 0) {
+                    if (!selectedClipIndex(timeline, &trackIdx, &clipIdx))
+                        return;
+                }
+                const ClipCurveData curves = clipCurvesAt(timeline, trackIdx, clipIdx);
+                const bool wasUpdating = m_updating;
+                m_updating = true;
+                m_curveEditor->setAllPoints(curves.editorPointsOrIdentity());
+                m_updating = wasUpdating;
+            };
+
+        auto bindTimelineForCurves = [this, restoreCurveEditorForClip]() {
+            Timeline *timeline = findTimelineForColorPanel(this);
+            if (!timeline)
+                return;
+            if (!property("_clipCurveSelectionBound").toBool()) {
+                setProperty("_clipCurveSelectionBound", true);
+                connect(timeline, &Timeline::clipSelectedOnTrack,
+                        this, [this, timeline, restoreCurveEditorForClip](int trackIdx, int clipIdx) {
+                    restoreCurveEditorForClip(timeline, trackIdx, clipIdx);
+                });
+            }
+            int trackIdx = -1;
+            int clipIdx = -1;
+            if (selectedClipIndex(timeline, &trackIdx, &clipIdx))
+                restoreCurveEditorForClip(timeline, trackIdx, clipIdx);
+        };
+
+        QTimer::singleShot(0, this, bindTimelineForCurves);
+        connect(this, &QDockWidget::visibilityChanged,
+                this, [bindTimelineForCurves](bool visible) {
+            if (visible)
+                bindTimelineForCurves();
+        });
     }
 
     // --- US-CG-4: Hue vs Saturation Curve Editor ---
@@ -1107,6 +1297,25 @@ double ColorGradingPanel::lutIntensity() const
     return m_lutIntensitySlider->value() / 100.0;
 }
 
+QJsonObject ColorGradingPanel::curvesToJson(int srcWidth, int srcHeight) const
+{
+    ClipCurveData curves;
+    if (m_curveEditor)
+        curves.setPoints(m_curveEditor->allPoints());
+    return curveDataToJson(curves, srcWidth, srcHeight);
+}
+
+void ColorGradingPanel::curvesFromJson(const QJsonObject &obj, int, int)
+{
+    if (!m_curveEditor)
+        return;
+    const ClipCurveData curves = curveDataFromJson(obj);
+    const bool wasUpdating = m_updating;
+    m_updating = true;
+    m_curveEditor->setAllPoints(curves.editorPointsOrIdentity());
+    m_updating = wasUpdating;
+}
+
 void ColorGradingPanel::onLutComboChanged(int index)
 {
     if (index <= 0)
@@ -1272,7 +1481,12 @@ void ColorGradingPanel::onResetClicked()
         if (m_hslqGainBLabel)  m_hslqGainBLabel->setText(QStringLiteral("0"));
     }
 
+    if (m_curveEditor)
+        m_curveEditor->setAllPoints(ClipCurveData::identityEditorPoints());
+
     m_updating = false;
+    writeCurvesToSelectedClip(findTimelineForColorPanel(this),
+                              ClipCurveData::identityEditorPoints());
 
     m_lutCombo->setCurrentIndex(0);
     m_lutIntensitySlider->setValue(100);

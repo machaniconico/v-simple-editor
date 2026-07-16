@@ -19,6 +19,11 @@ static inline double smoothstep(double t)
     return t * t * (3.0 - 2.0 * t);
 }
 
+static inline bool nearPointValue(double a, double b)
+{
+    return std::abs(a - b) <= 1e-9;
+}
+
 static inline double rgbSaturation01(int r, int g, int b)
 {
     const int maxC = std::max({ r, g, b });
@@ -129,6 +134,205 @@ static QVector<double> boxBlurRgbBuffer(const QVector<double> &src, int w, int h
     }
 
     return dst;
+}
+
+static QVector<QPointF> sanitizedCurvePoints(const QVector<QPointF> &input)
+{
+    QVector<QPointF> pts = input;
+    if (pts.size() < 2)
+        return ClipCurveData::identityPoints();
+
+    std::sort(pts.begin(), pts.end(),
+              [](const QPointF &a, const QPointF &b) { return a.x() < b.x(); });
+    pts.first().setX(0.0);
+    pts.last().setX(255.0);
+    for (QPointF &p : pts) {
+        p.setX(std::clamp(p.x(), 0.0, 255.0));
+        p.setY(std::clamp(p.y(), 0.0, 255.0));
+    }
+    return pts;
+}
+
+static QVector<int> buildCurveLut(const QVector<QPointF> &input)
+{
+    QVector<int> out(256);
+    const QVector<QPointF> pts = sanitizedCurvePoints(input);
+    if (pts.size() < 2) {
+        for (int x = 0; x < 256; ++x)
+            out[x] = x;
+        return out;
+    }
+
+    auto getPoint = [&](int idx) -> QPointF {
+        const int n = pts.size();
+        if (idx < 0)
+            return QPointF(2.0 * pts[0].x() - pts[1].x(),
+                           2.0 * pts[0].y() - pts[1].y());
+        if (idx >= n)
+            return QPointF(2.0 * pts[n - 1].x() - pts[n - 2].x(),
+                           2.0 * pts[n - 1].y() - pts[n - 2].y());
+        return pts[idx];
+    };
+
+    auto evalSegment = [&](int seg, double t) -> QPointF {
+        const QPointF p0 = getPoint(seg - 1);
+        const QPointF p1 = getPoint(seg);
+        const QPointF p2 = getPoint(seg + 1);
+        const QPointF p3 = getPoint(seg + 2);
+        const double t2 = t * t;
+        const double t3 = t2 * t;
+        const double xv = 0.5 * ((2.0 * p1.x())
+            + (-p0.x() + p2.x()) * t
+            + (2.0 * p0.x() - 5.0 * p1.x() + 4.0 * p2.x() - p3.x()) * t2
+            + (-p0.x() + 3.0 * p1.x() - 3.0 * p2.x() + p3.x()) * t3);
+        const double yv = 0.5 * ((2.0 * p1.y())
+            + (-p0.y() + p2.y()) * t
+            + (2.0 * p0.y() - 5.0 * p1.y() + 4.0 * p2.y() - p3.y()) * t2
+            + (-p0.y() + 3.0 * p1.y() - 3.0 * p2.y() + p3.y()) * t3);
+        return QPointF(xv, yv);
+    };
+
+    constexpr int samplesPerSeg = 64;
+    const int nSeg = pts.size() - 1;
+    QVector<QPointF> samples;
+    samples.reserve(nSeg * samplesPerSeg + 1);
+    for (int s = 0; s < nSeg; ++s) {
+        for (int i = 0; i < samplesPerSeg; ++i)
+            samples.append(evalSegment(s, static_cast<double>(i) / samplesPerSeg));
+    }
+    samples.append(pts.last());
+
+    std::sort(samples.begin(), samples.end(),
+              [](const QPointF &a, const QPointF &b) { return a.x() < b.x(); });
+
+    int sIdx = 0;
+    for (int x = 0; x < 256; ++x) {
+        const double xd = static_cast<double>(x);
+        while (sIdx + 1 < samples.size() - 1 && samples[sIdx + 1].x() < xd)
+            ++sIdx;
+        double y = samples[sIdx].y();
+        if (sIdx + 1 < samples.size() && samples[sIdx + 1].x() > samples[sIdx].x()) {
+            double t = (xd - samples[sIdx].x())
+                       / (samples[sIdx + 1].x() - samples[sIdx].x());
+            t = std::clamp(t, 0.0, 1.0);
+            y = samples[sIdx].y() + t * (samples[sIdx + 1].y() - samples[sIdx].y());
+        }
+        out[x] = std::clamp(static_cast<int>(std::lround(y)), 0, 255);
+    }
+    out[0] = std::clamp(static_cast<int>(std::lround(pts.first().y())), 0, 255);
+    out[255] = std::clamp(static_cast<int>(std::lround(pts.last().y())), 0, 255);
+    return out;
+}
+
+static bool isIdentityPointSet(const QVector<QPointF> &pts)
+{
+    const QVector<QPointF> clean = sanitizedCurvePoints(pts);
+    return clean.size() == 2
+        && nearPointValue(clean[0].x(), 0.0)
+        && nearPointValue(clean[0].y(), 0.0)
+        && nearPointValue(clean[1].x(), 255.0)
+        && nearPointValue(clean[1].y(), 255.0);
+}
+
+static bool isIdentityLut(const QVector<int> &lut)
+{
+    if (lut.size() != 256)
+        return false;
+    for (int i = 0; i < 256; ++i) {
+        if (lut[i] != i)
+            return false;
+    }
+    return true;
+}
+
+static double sampleCurveLutLinear(const QVector<int> &lut, double coord01)
+{
+    if (lut.size() != 256)
+        return std::clamp(coord01, 0.0, 1.0);
+
+    const double texel = std::clamp(coord01, 0.0, 1.0) * 256.0 - 0.5;
+    if (texel <= 0.0)
+        return std::clamp(lut[0] / 255.0, 0.0, 1.0);
+    if (texel >= 255.0)
+        return std::clamp(lut[255] / 255.0, 0.0, 1.0);
+
+    const int i0 = std::clamp(static_cast<int>(std::floor(texel)), 0, 255);
+    const int i1 = std::clamp(i0 + 1, 0, 255);
+    const double t = texel - i0;
+    const double v0 = std::clamp(lut[i0] / 255.0, 0.0, 1.0);
+    const double v1 = std::clamp(lut[i1] / 255.0, 0.0, 1.0);
+    return v0 + (v1 - v0) * t;
+}
+
+// --- Per-clip RGB/Luma curve data ---
+
+QVector<QPointF> ClipCurveData::identityPoints()
+{
+    return { QPointF(0.0, 0.0), QPointF(255.0, 255.0) };
+}
+
+QVector<QVector<QPointF>> ClipCurveData::identityEditorPoints()
+{
+    QVector<QVector<QPointF>> out;
+    out.reserve(ChannelCount);
+    for (int i = 0; i < ChannelCount; ++i)
+        out.append(identityPoints());
+    return out;
+}
+
+bool ClipCurveData::isIdentity() const
+{
+    if (points.isEmpty())
+        return true;
+    for (int i = 0; i < ChannelCount; ++i) {
+        if (i >= points.size()) {
+            continue;
+        }
+        if (!isIdentityPointSet(points[i]))
+            return false;
+    }
+    return true;
+}
+
+void ClipCurveData::setPoints(const QVector<QVector<QPointF>> &editorPoints)
+{
+    QVector<QVector<QPointF>> clean;
+    clean.reserve(ChannelCount);
+    for (int i = 0; i < ChannelCount; ++i) {
+        if (i < editorPoints.size())
+            clean.append(sanitizedCurvePoints(editorPoints[i]));
+        else
+            clean.append(identityPoints());
+    }
+    points = clean;
+    if (isIdentity())
+        points.clear();
+}
+
+QVector<QVector<QPointF>> ClipCurveData::editorPointsOrIdentity() const
+{
+    if (points.isEmpty())
+        return identityEditorPoints();
+
+    QVector<QVector<QPointF>> clean;
+    clean.reserve(ChannelCount);
+    for (int i = 0; i < ChannelCount; ++i) {
+        if (i < points.size())
+            clean.append(sanitizedCurvePoints(points[i]));
+        else
+            clean.append(identityPoints());
+    }
+    return clean;
+}
+
+QVector<QVector<int>> ClipCurveData::toLuts() const
+{
+    const QVector<QVector<QPointF>> pts = editorPointsOrIdentity();
+    QVector<QVector<int>> out;
+    out.reserve(ChannelCount);
+    for (int i = 0; i < ChannelCount; ++i)
+        out.append(buildCurveLut(i < pts.size() ? pts[i] : identityPoints()));
+    return out;
 }
 
 // --- VideoEffect factory ---
@@ -862,6 +1066,55 @@ QImage VideoEffectProcessor::applyColorCorrection(const QImage &input, const Col
         }
     }
 
+    return img;
+}
+
+QImage VideoEffectProcessor::applyRgbLumaCurves(const QImage &input,
+                                                const ClipCurveData &curves)
+{
+    if (!curves.hasCurves())
+        return input;
+    return applyRgbLumaCurves(input, curves.toLuts());
+}
+
+QImage VideoEffectProcessor::applyRgbLumaCurves(const QImage &input,
+                                                const QVector<QVector<int>> &curves)
+{
+    if (curves.size() < ClipCurveData::ChannelCount)
+        return input;
+    if (isIdentityLut(curves[ClipCurveData::ChannelR])
+        && isIdentityLut(curves[ClipCurveData::ChannelG])
+        && isIdentityLut(curves[ClipCurveData::ChannelB])
+        && isIdentityLut(curves[ClipCurveData::ChannelLuma])) {
+        return input;
+    }
+
+    QImage img = input.convertToFormat(QImage::Format_RGBA8888);
+    for (int y = 0; y < img.height(); ++y) {
+        uchar *line = img.scanLine(y);
+        for (int x = 0; x < img.width(); ++x) {
+            uchar *px = line + x * 4;
+            double r = sampleCurveLutLinear(curves[ClipCurveData::ChannelR],
+                                            px[0] / 255.0);
+            double g = sampleCurveLutLinear(curves[ClipCurveData::ChannelG],
+                                            px[1] / 255.0);
+            double b = sampleCurveLutLinear(curves[ClipCurveData::ChannelB],
+                                            px[2] / 255.0);
+
+            const double y709 = std::clamp(0.299 * r + 0.587 * g + 0.114 * b,
+                                           0.0, 1.0);
+            const double yCurved =
+                sampleCurveLutLinear(curves[ClipCurveData::ChannelLuma], y709);
+            const double dy = yCurved - y709;
+            r += dy;
+            g += dy;
+            b += dy;
+
+            px[0] = static_cast<uchar>(clamp255d(r * 255.0));
+            px[1] = static_cast<uchar>(clamp255d(g * 255.0));
+            px[2] = static_cast<uchar>(clamp255d(b * 255.0));
+        }
+    }
     return img;
 }
 
