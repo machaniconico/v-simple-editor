@@ -3,6 +3,8 @@
 #include "../MaskSystem.h"
 
 #include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonParseError>
 #include <QJsonValue>
 #include <QImage>
 #include <QRgba64>
@@ -15,6 +17,7 @@ namespace {
 constexpr double kEpsilon = 1e-9;
 constexpr double kEllipseKappa = 0.5522847498307936;
 constexpr int kBezierSegments = 16;
+constexpr const char *kBezierMetadataMarker = "\n#VEDITOR_MASK_BEZIER:";
 
 bool nearlyEqual(double a, double b)
 {
@@ -82,6 +85,42 @@ clipmask::BezierPoint makePoint(const QPointF &vertex,
     point.inTangent = inTangent;
     point.outTangent = outTangent;
     return point;
+}
+
+bool decodeBezierMetadata(const QString &name, QVector<clipmask::BezierPoint> *points)
+{
+    if (!points)
+        return false;
+    const QString marker = QString::fromLatin1(kBezierMetadataMarker);
+    const int markerAt = name.indexOf(marker);
+    if (markerAt < 0)
+        return false;
+
+    const QByteArray payload = name.mid(markerAt + marker.size()).trimmed().toLatin1();
+    const QByteArray json = QByteArray::fromBase64(payload);
+    QJsonParseError parseError;
+    const QJsonDocument doc = QJsonDocument::fromJson(json, &parseError);
+    if (parseError.error != QJsonParseError::NoError || !doc.isArray())
+        return false;
+
+    QVector<clipmask::BezierPoint> decoded;
+    const QJsonArray arr = doc.array();
+    decoded.reserve(arr.size());
+    for (const QJsonValue &value : arr) {
+        const QJsonObject obj = value.toObject();
+        decoded.append(makePoint(
+            QPointF(obj.value(QStringLiteral("x")).toDouble(),
+                    obj.value(QStringLiteral("y")).toDouble()),
+            QPointF(obj.value(QStringLiteral("inX")).toDouble(0.0),
+                    obj.value(QStringLiteral("inY")).toDouble(0.0)),
+            QPointF(obj.value(QStringLiteral("outX")).toDouble(0.0),
+                    obj.value(QStringLiteral("outY")).toDouble(0.0))));
+    }
+    if (decoded.size() < 3)
+        return false;
+
+    *points = decoded;
+    return true;
 }
 
 QVector<clipmask::BezierPoint> rectToBezier(const QRectF &rect)
@@ -326,6 +365,13 @@ ClipMaskStack fromMaskSystem(const MaskSystem &system)
         mask.expansion = source.expansion;
         mask.inverted = source.inverted;
         mask.opacity = source.opacity;
+
+        QVector<BezierPoint> storedBezier;
+        if (decodeBezierMetadata(source.name, &storedBezier)) {
+            mask.points = storedBezier;
+            stack.masks.append(mask);
+            continue;
+        }
 
         switch (source.shape) {
         case MaskShape::Rectangle:

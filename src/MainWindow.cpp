@@ -258,6 +258,7 @@ void exporter_setAcesPipeline(const aces::AcesPipeline &pipeline);
 #include <QInputDialog>
 #include <QStandardPaths>
 #include <QJsonDocument>
+#include <QJsonParseError>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QDir>
@@ -295,6 +296,10 @@ void exporter_setAcesPipeline(const aces::AcesPipeline &pipeline);
 #include <QColorDialog>
 #include <QFormLayout>
 #include <QLabel>
+#include <QListWidget>
+#include <QMouseEvent>
+#include <QKeyEvent>
+#include <QPainterPath>
 #include <QStandardItemModel>
 #include <QSet>
 #include <QTemporaryDir>
@@ -302,6 +307,8 @@ void exporter_setAcesPipeline(const aces::AcesPipeline &pipeline);
 #include <QFutureWatcher>
 #include <QtConcurrent>
 #include <numeric>
+#include <functional>
+#include <memory>
 #include "NodeGraph.h"
 #include "NodeEvaluator.h"
 #include "NodeLibrary.h"
@@ -1003,6 +1010,888 @@ QString trackMatteTypeLabel(TrackMatteType type)
     }
     return QStringLiteral("なし");
 }
+
+constexpr const char *kMaskBezierMetadataMarker = "\n#VEDITOR_MASK_BEZIER:";
+constexpr double kMaskEditorEpsilon = 1e-6;
+constexpr double kMaskEllipseKappa = 0.5522847498307936;
+constexpr int kMaskEditorBezierSegments = 16;
+constexpr double kMaskEditorHitRadiusPx = 8.0;
+constexpr double kMaskEditorDefaultHandlePx = 34.0;
+
+struct MaskEditorPoint {
+    QPointF vertex;
+    QPointF inTangent;
+    QPointF outTangent;
+};
+
+struct MaskEditorClipState {
+    bool valid = false;
+    MaskSystem masks;
+    QSize sourceSize;
+};
+
+bool maskPointNearlyZero(const QPointF &p)
+{
+    return std::abs(p.x()) <= kMaskEditorEpsilon
+        && std::abs(p.y()) <= kMaskEditorEpsilon;
+}
+
+QPointF maskCubicAt(const QPointF &p0, const QPointF &p1,
+                    const QPointF &p2, const QPointF &p3,
+                    double t)
+{
+    const double u = 1.0 - t;
+    return p0 * (u * u * u)
+        + p1 * (3.0 * u * u * t)
+        + p2 * (3.0 * u * t * t)
+        + p3 * (t * t * t);
+}
+
+QString maskVisibleName(const QString &name)
+{
+    const QString marker = QString::fromLatin1(kMaskBezierMetadataMarker);
+    const int markerAt = name.indexOf(marker);
+    return (markerAt >= 0 ? name.left(markerAt) : name).trimmed();
+}
+
+bool decodeMaskBezierMetadata(const QString &name, QVector<MaskEditorPoint> *points)
+{
+    if (!points)
+        return false;
+    const QString marker = QString::fromLatin1(kMaskBezierMetadataMarker);
+    const int markerAt = name.indexOf(marker);
+    if (markerAt < 0)
+        return false;
+
+    const QByteArray payload = name.mid(markerAt + marker.size()).trimmed().toLatin1();
+    const QByteArray json = QByteArray::fromBase64(payload);
+    QJsonParseError parseError;
+    const QJsonDocument doc = QJsonDocument::fromJson(json, &parseError);
+    if (parseError.error != QJsonParseError::NoError || !doc.isArray())
+        return false;
+
+    QVector<MaskEditorPoint> decoded;
+    const QJsonArray arr = doc.array();
+    decoded.reserve(arr.size());
+    for (const QJsonValue &value : arr) {
+        const QJsonObject obj = value.toObject();
+        MaskEditorPoint p;
+        p.vertex = QPointF(obj.value(QStringLiteral("x")).toDouble(),
+                           obj.value(QStringLiteral("y")).toDouble());
+        p.inTangent = QPointF(obj.value(QStringLiteral("inX")).toDouble(0.0),
+                              obj.value(QStringLiteral("inY")).toDouble(0.0));
+        p.outTangent = QPointF(obj.value(QStringLiteral("outX")).toDouble(0.0),
+                               obj.value(QStringLiteral("outY")).toDouble(0.0));
+        decoded.append(p);
+    }
+    if (decoded.size() < 3)
+        return false;
+
+    *points = decoded;
+    return true;
+}
+
+QString encodeMaskNameWithBezier(const QString &name, const QVector<MaskEditorPoint> &points)
+{
+    QJsonArray arr;
+    for (const MaskEditorPoint &p : points) {
+        QJsonObject obj;
+        obj[QStringLiteral("x")] = p.vertex.x();
+        obj[QStringLiteral("y")] = p.vertex.y();
+        if (!maskPointNearlyZero(p.inTangent)) {
+            obj[QStringLiteral("inX")] = p.inTangent.x();
+            obj[QStringLiteral("inY")] = p.inTangent.y();
+        }
+        if (!maskPointNearlyZero(p.outTangent)) {
+            obj[QStringLiteral("outX")] = p.outTangent.x();
+            obj[QStringLiteral("outY")] = p.outTangent.y();
+        }
+        arr.append(obj);
+    }
+
+    QString visible = maskVisibleName(name);
+    if (visible.isEmpty())
+        visible = QStringLiteral("Mask");
+    const QByteArray payload =
+        QJsonDocument(arr).toJson(QJsonDocument::Compact).toBase64();
+    return visible + QString::fromLatin1(kMaskBezierMetadataMarker)
+        + QString::fromLatin1(payload);
+}
+
+MaskEditorPoint makeMaskEditorPoint(const QPointF &vertex,
+                                    const QPointF &inTangent = QPointF(),
+                                    const QPointF &outTangent = QPointF())
+{
+    MaskEditorPoint point;
+    point.vertex = vertex;
+    point.inTangent = inTangent;
+    point.outTangent = outTangent;
+    return point;
+}
+
+QVector<MaskEditorPoint> rectMaskEditorPoints(const QRectF &rect)
+{
+    QVector<MaskEditorPoint> points;
+    if (!rect.isValid() || rect.isNull())
+        return points;
+    points.reserve(4);
+    points.append(makeMaskEditorPoint(rect.topLeft()));
+    points.append(makeMaskEditorPoint(rect.topRight()));
+    points.append(makeMaskEditorPoint(rect.bottomRight()));
+    points.append(makeMaskEditorPoint(rect.bottomLeft()));
+    return points;
+}
+
+QVector<MaskEditorPoint> ellipseMaskEditorPoints(const QRectF &rect)
+{
+    QVector<MaskEditorPoint> points;
+    if (!rect.isValid() || rect.isNull())
+        return points;
+
+    const QPointF center = rect.center();
+    const double rx = rect.width() * 0.5;
+    const double ry = rect.height() * 0.5;
+    const double hx = rx * kMaskEllipseKappa;
+    const double hy = ry * kMaskEllipseKappa;
+
+    points.reserve(4);
+    points.append(makeMaskEditorPoint(QPointF(center.x() + rx, center.y()),
+                                      QPointF(0.0, -hy), QPointF(0.0, hy)));
+    points.append(makeMaskEditorPoint(QPointF(center.x(), center.y() + ry),
+                                      QPointF(hx, 0.0), QPointF(-hx, 0.0)));
+    points.append(makeMaskEditorPoint(QPointF(center.x() - rx, center.y()),
+                                      QPointF(0.0, hy), QPointF(0.0, -hy)));
+    points.append(makeMaskEditorPoint(QPointF(center.x(), center.y() - ry),
+                                      QPointF(-hx, 0.0), QPointF(hx, 0.0)));
+    return points;
+}
+
+QVector<MaskEditorPoint> editorPointsFromMask(const Mask &mask)
+{
+    QVector<MaskEditorPoint> points;
+    if (decodeMaskBezierMetadata(mask.name, &points))
+        return points;
+
+    switch (mask.shape) {
+    case MaskShape::Rectangle:
+        points = rectMaskEditorPoints(mask.rect);
+        break;
+    case MaskShape::Ellipse:
+        points = ellipseMaskEditorPoints(mask.rect);
+        break;
+    case MaskShape::Polygon:
+    case MaskShape::Path:
+        points.reserve(mask.points.size());
+        for (const QPointF &point : mask.points)
+            points.append(makeMaskEditorPoint(point));
+        break;
+    }
+    if (points.isEmpty() && mask.rect.isValid() && !mask.rect.isNull())
+        points = rectMaskEditorPoints(mask.rect);
+    return points;
+}
+
+QVector<QPointF> flattenMaskEditorPoints(const QVector<MaskEditorPoint> &points)
+{
+    QVector<QPointF> flattened;
+    if (points.isEmpty())
+        return flattened;
+
+    flattened.reserve(points.size() * 4);
+    flattened.append(points.first().vertex);
+    for (int i = 0; i < points.size(); ++i) {
+        const int next = (i + 1) % points.size();
+        const MaskEditorPoint &a = points[i];
+        const MaskEditorPoint &b = points[next];
+        const bool curved =
+            !maskPointNearlyZero(a.outTangent) || !maskPointNearlyZero(b.inTangent);
+        if (!curved) {
+            if (next != 0)
+                flattened.append(b.vertex);
+            continue;
+        }
+        const QPointF p0 = a.vertex;
+        const QPointF p1 = a.vertex + a.outTangent;
+        const QPointF p2 = b.vertex + b.inTangent;
+        const QPointF p3 = b.vertex;
+        for (int step = 1; step <= kMaskEditorBezierSegments; ++step) {
+            if (next == 0 && step == kMaskEditorBezierSegments)
+                continue;
+            flattened.append(maskCubicAt(
+                p0, p1, p2, p3,
+                static_cast<double>(step) / kMaskEditorBezierSegments));
+        }
+    }
+    return flattened;
+}
+
+QRectF maskPointsBoundingRect(const QVector<QPointF> &points)
+{
+    if (points.isEmpty())
+        return QRectF();
+    double minX = points.first().x();
+    double maxX = minX;
+    double minY = points.first().y();
+    double maxY = minY;
+    for (const QPointF &point : points) {
+        minX = qMin(minX, point.x());
+        maxX = qMax(maxX, point.x());
+        minY = qMin(minY, point.y());
+        maxY = qMax(maxY, point.y());
+    }
+    return QRectF(QPointF(minX, minY), QPointF(maxX, maxY)).normalized();
+}
+
+Mask maskWithEditorPoints(Mask mask, const QVector<MaskEditorPoint> &points)
+{
+    const QVector<QPointF> flattened = flattenMaskEditorPoints(points);
+    mask.shape = MaskShape::Path;
+    mask.points = flattened;
+    mask.rect = maskPointsBoundingRect(flattened);
+    mask.name = encodeMaskNameWithBezier(mask.name, points);
+    return mask;
+}
+
+MaskSystem maskSystemWithReplacedMask(const MaskSystem &system, int index, const Mask &mask)
+{
+    MaskSystem out;
+    const QVector<Mask> &masks = system.masks();
+    for (int i = 0; i < masks.size(); ++i)
+        out.addMask(i == index ? mask : masks[i]);
+    return out;
+}
+
+MaskSystem maskSystemWithRemovedMask(const MaskSystem &system, int index)
+{
+    MaskSystem out;
+    const QVector<Mask> &masks = system.masks();
+    for (int i = 0; i < masks.size(); ++i) {
+        if (i != index)
+            out.addMask(masks[i]);
+    }
+    return out;
+}
+
+MaskSystem maskSystemWithAppendedMask(const MaskSystem &system, const Mask &mask)
+{
+    MaskSystem out;
+    for (const Mask &existing : system.masks())
+        out.addMask(existing);
+    out.addMask(mask);
+    return out;
+}
+
+QSize sanitizedMaskSourceSize(QSize size)
+{
+    if (size.width() <= 0 || size.height() <= 0)
+        return QSize(1920, 1080);
+    return size;
+}
+
+double distanceToSegmentPx(const QPointF &p, const QPointF &a, const QPointF &b)
+{
+    const QPointF ab = b - a;
+    const double len2 = ab.x() * ab.x() + ab.y() * ab.y();
+    if (len2 <= kMaskEditorEpsilon)
+        return std::hypot(p.x() - a.x(), p.y() - a.y());
+    const QPointF ap = p - a;
+    const double t = qBound(0.0, (ap.x() * ab.x() + ap.y() * ab.y()) / len2, 1.0);
+    const QPointF closest = a + ab * t;
+    return std::hypot(p.x() - closest.x(), p.y() - closest.y());
+}
+
+class MaskPathOverlay : public QWidget
+{
+public:
+    using StateProvider = std::function<MaskEditorClipState()>;
+    using IndexGetter = std::function<int()>;
+    using CommitCallback = std::function<void(const MaskSystem &, const QString &)>;
+
+    explicit MaskPathOverlay(GLPreview *preview, QWidget *parent = nullptr)
+        : QWidget(parent ? parent : preview)
+        , m_preview(preview)
+    {
+        setObjectName(QStringLiteral("MaskPathOverlay"));
+        setAttribute(Qt::WA_NoSystemBackground, true);
+        setAttribute(Qt::WA_TranslucentBackground, true);
+        setMouseTracking(true);
+        setFocusPolicy(Qt::StrongFocus);
+        setEditorEnabled(false);
+        if (m_preview)
+            m_preview->installEventFilter(this);
+        syncGeometry();
+    }
+
+    ~MaskPathOverlay() override
+    {
+        if (m_preview)
+            m_preview->removeEventFilter(this);
+    }
+
+    void setCallbacks(StateProvider stateProvider,
+                      IndexGetter indexGetter,
+                      CommitCallback commitCallback)
+    {
+        m_stateProvider = std::move(stateProvider);
+        m_indexGetter = std::move(indexGetter);
+        m_commitCallback = std::move(commitCallback);
+    }
+
+    void setEditorEnabled(bool enabled)
+    {
+        m_editorEnabled = enabled;
+        setAttribute(Qt::WA_TransparentForMouseEvents, !enabled);
+        if (!enabled) {
+            m_dragging = false;
+            hide();
+            return;
+        }
+        refresh();
+    }
+
+    void setSelectedPoint(int index)
+    {
+        m_selectedPoint = index;
+        update();
+    }
+
+    void refresh()
+    {
+        syncGeometry();
+        if (!m_editorEnabled || !hasEditableMask()) {
+            hide();
+            return;
+        }
+        show();
+        raise();
+        update();
+    }
+
+protected:
+    bool eventFilter(QObject *watched, QEvent *event) override
+    {
+        if (watched == m_preview
+            && (event->type() == QEvent::Resize
+                || event->type() == QEvent::Move
+                || event->type() == QEvent::Show)) {
+            syncGeometry();
+            update();
+        }
+        return QWidget::eventFilter(watched, event);
+    }
+
+    void paintEvent(QPaintEvent *) override
+    {
+        MaskEditorClipState state = stateForPaint();
+        const int maskIdx = activeMaskIndex(state.masks);
+        if (!state.valid || maskIdx < 0)
+            return;
+
+        const QVector<Mask> masks = state.masks.masks();
+        if (maskIdx >= masks.size())
+            return;
+        const QVector<MaskEditorPoint> points = editorPointsFromMask(masks[maskIdx]);
+        if (points.size() < 2)
+            return;
+
+        if (m_selectedPoint >= points.size())
+            m_selectedPoint = -1;
+
+        QPainter painter(this);
+        painter.setRenderHint(QPainter::Antialiasing, true);
+
+        QPainterPath path = widgetPathForPoints(points, state.sourceSize);
+        painter.setPen(QPen(QColor(0, 190, 255, 230), 2.0));
+        painter.setBrush(QColor(0, 190, 255, 35));
+        painter.drawPath(path);
+
+        painter.setBrush(Qt::NoBrush);
+        for (int i = 0; i < points.size(); ++i) {
+            const bool selected = i == m_selectedPoint;
+            const QPointF vertex = toWidget(points[i].vertex, state.sourceSize);
+            drawHandlePair(painter, points, i, state.sourceSize, selected);
+
+            const QRectF knob(vertex.x() - 4.5, vertex.y() - 4.5, 9.0, 9.0);
+            painter.setPen(QPen(selected ? QColor(255, 230, 80) : QColor(245, 245, 245), 1.5));
+            painter.setBrush(selected ? QColor(255, 210, 40) : QColor(35, 35, 35, 230));
+            painter.drawEllipse(knob);
+        }
+    }
+
+    void mousePressEvent(QMouseEvent *event) override
+    {
+        if (!m_editorEnabled || event->button() != Qt::LeftButton) {
+            QWidget::mousePressEvent(event);
+            return;
+        }
+
+        MaskEditorClipState state = currentState();
+        const int maskIdx = activeMaskIndex(state.masks);
+        if (!state.valid || maskIdx < 0) {
+            QWidget::mousePressEvent(event);
+            return;
+        }
+
+        const Hit hit = hitTest(event->pos(), state);
+        if ((event->modifiers() & Qt::AltModifier) && hit.kind == HitKind::Vertex) {
+            deletePoint(hit.point);
+            event->accept();
+            return;
+        }
+
+        if (hit.kind == HitKind::Vertex
+            || hit.kind == HitKind::InHandle
+            || hit.kind == HitKind::OutHandle
+            || hit.kind == HitKind::Body) {
+            m_selectedPoint = hit.point;
+            if (hit.kind == HitKind::Body && m_selectedPoint < 0)
+                m_selectedPoint = 0;
+            m_dragging = true;
+            m_dragChanged = false;
+            m_dragHit = hit;
+            m_dragMaskIndex = maskIdx;
+            m_dragStartSource = fromWidget(event->pos(), state.sourceSize);
+            m_dragSourceSize = sanitizedMaskSourceSize(state.sourceSize);
+            m_workingSystem = state.masks;
+            const QVector<Mask> masks = state.masks.masks();
+            m_dragStartPoints = editorPointsFromMask(masks[maskIdx]);
+            setFocus();
+            update();
+            event->accept();
+            return;
+        }
+
+        if (hit.kind == HitKind::Segment)
+            m_selectedPoint = qBound(0, hit.segment, qMax(0, editorPointsFromMask(
+                state.masks.masks().value(maskIdx)).size() - 1));
+        update();
+        event->accept();
+    }
+
+    void mouseMoveEvent(QMouseEvent *event) override
+    {
+        if (!m_editorEnabled) {
+            QWidget::mouseMoveEvent(event);
+            return;
+        }
+
+        if (m_dragging) {
+            applyDrag(event->pos(), event->modifiers());
+            event->accept();
+            return;
+        }
+
+        const Hit hit = hitTest(event->pos(), currentState());
+        switch (hit.kind) {
+        case HitKind::Vertex:
+        case HitKind::InHandle:
+        case HitKind::OutHandle:
+            setCursor(Qt::SizeAllCursor);
+            break;
+        case HitKind::Body:
+            setCursor(Qt::OpenHandCursor);
+            break;
+        case HitKind::Segment:
+            setCursor(Qt::CrossCursor);
+            break;
+        case HitKind::None:
+            unsetCursor();
+            break;
+        }
+        QWidget::mouseMoveEvent(event);
+    }
+
+    void mouseReleaseEvent(QMouseEvent *event) override
+    {
+        if (m_dragging && event->button() == Qt::LeftButton) {
+            if (m_dragChanged && m_commitCallback)
+                m_commitCallback(m_workingSystem, QStringLiteral("Edit mask path"));
+            m_dragging = false;
+            m_dragChanged = false;
+            unsetCursor();
+            refresh();
+            event->accept();
+            return;
+        }
+        QWidget::mouseReleaseEvent(event);
+    }
+
+    void mouseDoubleClickEvent(QMouseEvent *event) override
+    {
+        if (m_editorEnabled && event->button() == Qt::LeftButton) {
+            addPointAt(event->pos());
+            event->accept();
+            return;
+        }
+        QWidget::mouseDoubleClickEvent(event);
+    }
+
+    void keyPressEvent(QKeyEvent *event) override
+    {
+        if (m_editorEnabled
+            && (event->key() == Qt::Key_Delete || event->key() == Qt::Key_Backspace)) {
+            deletePoint(m_selectedPoint);
+            event->accept();
+            return;
+        }
+        QWidget::keyPressEvent(event);
+    }
+
+private:
+    enum class HitKind {
+        None,
+        Vertex,
+        InHandle,
+        OutHandle,
+        Segment,
+        Body
+    };
+
+    struct Hit {
+        HitKind kind = HitKind::None;
+        int point = -1;
+        int segment = -1;
+    };
+
+    MaskEditorClipState currentState() const
+    {
+        return m_stateProvider ? m_stateProvider() : MaskEditorClipState{};
+    }
+
+    MaskEditorClipState stateForPaint() const
+    {
+        MaskEditorClipState state = currentState();
+        if (m_dragging)
+            state.masks = m_workingSystem;
+        return state;
+    }
+
+    int activeMaskIndex(const MaskSystem &system) const
+    {
+        const int count = system.masks().size();
+        if (count <= 0)
+            return -1;
+        const int idx = m_indexGetter ? m_indexGetter() : 0;
+        return qBound(0, idx, count - 1);
+    }
+
+    bool hasEditableMask() const
+    {
+        const MaskEditorClipState state = currentState();
+        return state.valid && activeMaskIndex(state.masks) >= 0;
+    }
+
+    void syncGeometry()
+    {
+        if (!m_preview || !parentWidget())
+            return;
+        const QPoint topLeft = m_preview->mapTo(parentWidget(), QPoint(0, 0));
+        setGeometry(QRect(topLeft, m_preview->size()));
+    }
+
+    QRectF letterboxRect() const
+    {
+        if (!m_preview)
+            return QRectF(rect());
+        QRectF lb = m_preview->letterboxRect();
+        if (lb.width() <= 1.0 || lb.height() <= 1.0)
+            lb = QRectF(QPointF(0.0, 0.0), QSizeF(width(), height()));
+        return lb;
+    }
+
+    QPointF toWidget(const QPointF &source, QSize sourceSize) const
+    {
+        sourceSize = sanitizedMaskSourceSize(sourceSize);
+        const QRectF lb = letterboxRect();
+        return QPointF(lb.x() + source.x() * lb.width() / sourceSize.width(),
+                       lb.y() + source.y() * lb.height() / sourceSize.height());
+    }
+
+    QPointF fromWidget(const QPointF &widget, QSize sourceSize) const
+    {
+        sourceSize = sanitizedMaskSourceSize(sourceSize);
+        const QRectF lb = letterboxRect();
+        if (lb.width() <= 1.0 || lb.height() <= 1.0)
+            return QPointF();
+        const double x = (widget.x() - lb.x()) * sourceSize.width() / lb.width();
+        const double y = (widget.y() - lb.y()) * sourceSize.height() / lb.height();
+        return QPointF(qBound(0.0, x, static_cast<double>(sourceSize.width())),
+                       qBound(0.0, y, static_cast<double>(sourceSize.height())));
+    }
+
+    QPointF defaultHandleSource(const MaskEditorPoint &point, bool incoming,
+                                QSize sourceSize) const
+    {
+        sourceSize = sanitizedMaskSourceSize(sourceSize);
+        const QRectF lb = letterboxRect();
+        const double sourceDx = (lb.width() > 1.0)
+            ? kMaskEditorDefaultHandlePx * sourceSize.width() / lb.width()
+            : kMaskEditorDefaultHandlePx;
+        return point.vertex + QPointF(incoming ? -sourceDx : sourceDx, 0.0);
+    }
+
+    QPointF handleSourcePoint(const QVector<MaskEditorPoint> &points, int index,
+                              bool incoming, QSize sourceSize, bool forceDefault) const
+    {
+        const MaskEditorPoint &point = points[index];
+        const QPointF tangent = incoming ? point.inTangent : point.outTangent;
+        if (!maskPointNearlyZero(tangent))
+            return point.vertex + tangent;
+        return forceDefault ? defaultHandleSource(point, incoming, sourceSize)
+                            : point.vertex;
+    }
+
+    QPainterPath widgetPathForPoints(const QVector<MaskEditorPoint> &points,
+                                     QSize sourceSize) const
+    {
+        QPainterPath path;
+        if (points.isEmpty())
+            return path;
+        path.moveTo(toWidget(points.first().vertex, sourceSize));
+        for (int i = 0; i < points.size(); ++i) {
+            const int next = (i + 1) % points.size();
+            const MaskEditorPoint &a = points[i];
+            const MaskEditorPoint &b = points[next];
+            const bool curved =
+                !maskPointNearlyZero(a.outTangent) || !maskPointNearlyZero(b.inTangent);
+            if (curved) {
+                path.cubicTo(toWidget(a.vertex + a.outTangent, sourceSize),
+                             toWidget(b.vertex + b.inTangent, sourceSize),
+                             toWidget(b.vertex, sourceSize));
+            } else {
+                path.lineTo(toWidget(b.vertex, sourceSize));
+            }
+        }
+        path.closeSubpath();
+        return path;
+    }
+
+    void drawHandlePair(QPainter &painter,
+                        const QVector<MaskEditorPoint> &points,
+                        int index,
+                        QSize sourceSize,
+                        bool selected) const
+    {
+        const MaskEditorPoint &point = points[index];
+        const bool showIn = selected || !maskPointNearlyZero(point.inTangent);
+        const bool showOut = selected || !maskPointNearlyZero(point.outTangent);
+        if (!showIn && !showOut)
+            return;
+
+        const QPointF vertex = toWidget(point.vertex, sourceSize);
+        painter.setPen(QPen(QColor(255, 210, 80, 180), 1.0, Qt::DashLine));
+        painter.setBrush(QColor(255, 210, 80, 230));
+        auto drawOne = [&](bool incoming) {
+            const QPointF hp = toWidget(handleSourcePoint(points, index, incoming,
+                                                          sourceSize, selected),
+                                        sourceSize);
+            painter.drawLine(vertex, hp);
+            painter.drawRect(QRectF(hp.x() - 3.5, hp.y() - 3.5, 7.0, 7.0));
+        };
+        if (showIn)
+            drawOne(true);
+        if (showOut)
+            drawOne(false);
+    }
+
+    Hit hitTest(const QPoint &widgetPos, const MaskEditorClipState &state) const
+    {
+        Hit none;
+        const int maskIdx = activeMaskIndex(state.masks);
+        if (!state.valid || maskIdx < 0)
+            return none;
+        const QVector<Mask> masks = state.masks.masks();
+        if (maskIdx >= masks.size())
+            return none;
+        const QVector<MaskEditorPoint> points = editorPointsFromMask(masks[maskIdx]);
+        if (points.isEmpty())
+            return none;
+
+        const QPointF pos(widgetPos);
+        for (int i = 0; i < points.size(); ++i) {
+            const bool showHandles = i == m_selectedPoint
+                || !maskPointNearlyZero(points[i].inTangent)
+                || !maskPointNearlyZero(points[i].outTangent);
+            if (!showHandles)
+                continue;
+            const QPointF inHandle = toWidget(
+                handleSourcePoint(points, i, true, state.sourceSize, i == m_selectedPoint),
+                state.sourceSize);
+            if (std::hypot(pos.x() - inHandle.x(), pos.y() - inHandle.y())
+                <= kMaskEditorHitRadiusPx) {
+                return {HitKind::InHandle, i, -1};
+            }
+            const QPointF outHandle = toWidget(
+                handleSourcePoint(points, i, false, state.sourceSize, i == m_selectedPoint),
+                state.sourceSize);
+            if (std::hypot(pos.x() - outHandle.x(), pos.y() - outHandle.y())
+                <= kMaskEditorHitRadiusPx) {
+                return {HitKind::OutHandle, i, -1};
+            }
+        }
+
+        for (int i = 0; i < points.size(); ++i) {
+            const QPointF vertex = toWidget(points[i].vertex, state.sourceSize);
+            if (std::hypot(pos.x() - vertex.x(), pos.y() - vertex.y())
+                <= kMaskEditorHitRadiusPx) {
+                return {HitKind::Vertex, i, -1};
+            }
+        }
+
+        Hit segmentHit = hitTestSegment(pos, points, state.sourceSize);
+        if (segmentHit.kind != HitKind::None)
+            return segmentHit;
+
+        const QPainterPath path = widgetPathForPoints(points, state.sourceSize);
+        if (path.contains(pos))
+            return {HitKind::Body, m_selectedPoint, -1};
+        return none;
+    }
+
+    Hit hitTestSegment(const QPointF &pos,
+                       const QVector<MaskEditorPoint> &points,
+                       QSize sourceSize) const
+    {
+        for (int i = 0; i < points.size(); ++i) {
+            const int next = (i + 1) % points.size();
+            const MaskEditorPoint &a = points[i];
+            const MaskEditorPoint &b = points[next];
+            QPointF previous = toWidget(a.vertex, sourceSize);
+            const bool curved =
+                !maskPointNearlyZero(a.outTangent) || !maskPointNearlyZero(b.inTangent);
+            const int steps = curved ? kMaskEditorBezierSegments : 1;
+            for (int step = 1; step <= steps; ++step) {
+                const double t = static_cast<double>(step) / steps;
+                const QPointF source = curved
+                    ? maskCubicAt(a.vertex, a.vertex + a.outTangent,
+                                  b.vertex + b.inTangent, b.vertex, t)
+                    : b.vertex;
+                const QPointF current = toWidget(source, sourceSize);
+                if (distanceToSegmentPx(pos, previous, current) <= kMaskEditorHitRadiusPx)
+                    return {HitKind::Segment, -1, i};
+                previous = current;
+            }
+        }
+        return {};
+    }
+
+    void applyDrag(const QPoint &widgetPos, Qt::KeyboardModifiers modifiers)
+    {
+        if (m_dragMaskIndex < 0 || m_dragStartPoints.isEmpty())
+            return;
+
+        QVector<MaskEditorPoint> points = m_dragStartPoints;
+        const QPointF source = fromWidget(widgetPos, m_dragSourceSize);
+        const QPointF delta = source - m_dragStartSource;
+        if (std::hypot(delta.x(), delta.y()) <= 0.25)
+            return;
+
+        if (m_dragHit.kind == HitKind::Body) {
+            for (MaskEditorPoint &point : points) {
+                point.vertex += delta;
+                point.vertex.setX(qBound(0.0, point.vertex.x(),
+                                         static_cast<double>(m_dragSourceSize.width())));
+                point.vertex.setY(qBound(0.0, point.vertex.y(),
+                                         static_cast<double>(m_dragSourceSize.height())));
+            }
+        } else if (m_dragHit.point >= 0 && m_dragHit.point < points.size()) {
+            MaskEditorPoint &point = points[m_dragHit.point];
+            if (m_dragHit.kind == HitKind::Vertex) {
+                point.vertex += delta;
+                point.vertex.setX(qBound(0.0, point.vertex.x(),
+                                         static_cast<double>(m_dragSourceSize.width())));
+                point.vertex.setY(qBound(0.0, point.vertex.y(),
+                                         static_cast<double>(m_dragSourceSize.height())));
+            } else if (m_dragHit.kind == HitKind::InHandle) {
+                point.inTangent = source - point.vertex;
+                if (!(modifiers & Qt::ControlModifier))
+                    point.outTangent = QPointF(-point.inTangent.x(), -point.inTangent.y());
+            } else if (m_dragHit.kind == HitKind::OutHandle) {
+                point.outTangent = source - point.vertex;
+                if (!(modifiers & Qt::ControlModifier))
+                    point.inTangent = QPointF(-point.outTangent.x(), -point.outTangent.y());
+            }
+        }
+
+        const QVector<Mask> masks = m_workingSystem.masks();
+        if (m_dragMaskIndex < masks.size()) {
+            const Mask updated = maskWithEditorPoints(masks[m_dragMaskIndex], points);
+            m_workingSystem = maskSystemWithReplacedMask(m_workingSystem,
+                                                         m_dragMaskIndex,
+                                                         updated);
+            m_selectedPoint = qBound(0, m_dragHit.point, points.size() - 1);
+            m_dragChanged = true;
+            update();
+        }
+    }
+
+    void addPointAt(const QPoint &widgetPos)
+    {
+        MaskEditorClipState state = currentState();
+        const int maskIdx = activeMaskIndex(state.masks);
+        if (!state.valid || maskIdx < 0 || !m_commitCallback)
+            return;
+        const QVector<Mask> masks = state.masks.masks();
+        if (maskIdx >= masks.size())
+            return;
+
+        QVector<MaskEditorPoint> points = editorPointsFromMask(masks[maskIdx]);
+        if (points.size() < 2)
+            return;
+
+        const Hit hit = hitTest(widgetPos, state);
+        const int insertAt = (hit.kind == HitKind::Segment)
+            ? qBound(0, hit.segment + 1, points.size())
+            : points.size();
+        MaskEditorPoint point;
+        point.vertex = fromWidget(widgetPos, state.sourceSize);
+        points.insert(insertAt, point);
+
+        const Mask updated = maskWithEditorPoints(masks[maskIdx], points);
+        m_selectedPoint = insertAt;
+        m_commitCallback(maskSystemWithReplacedMask(state.masks, maskIdx, updated),
+                         QStringLiteral("Add mask point"));
+        refresh();
+    }
+
+    void deletePoint(int pointIndex)
+    {
+        MaskEditorClipState state = currentState();
+        const int maskIdx = activeMaskIndex(state.masks);
+        if (!state.valid || maskIdx < 0 || !m_commitCallback)
+            return;
+        const QVector<Mask> masks = state.masks.masks();
+        if (maskIdx >= masks.size())
+            return;
+
+        QVector<MaskEditorPoint> points = editorPointsFromMask(masks[maskIdx]);
+        if (pointIndex < 0 || pointIndex >= points.size() || points.size() <= 3)
+            return;
+
+        points.removeAt(pointIndex);
+        const Mask updated = maskWithEditorPoints(masks[maskIdx], points);
+        m_selectedPoint = qBound(0, pointIndex, points.size() - 1);
+        m_commitCallback(maskSystemWithReplacedMask(state.masks, maskIdx, updated),
+                         QStringLiteral("Delete mask point"));
+        refresh();
+    }
+
+    GLPreview *m_preview = nullptr;
+    StateProvider m_stateProvider;
+    IndexGetter m_indexGetter;
+    CommitCallback m_commitCallback;
+    bool m_editorEnabled = false;
+    mutable int m_selectedPoint = -1;
+
+    bool m_dragging = false;
+    bool m_dragChanged = false;
+    Hit m_dragHit;
+    int m_dragMaskIndex = -1;
+    QPointF m_dragStartSource;
+    QSize m_dragSourceSize;
+    QVector<MaskEditorPoint> m_dragStartPoints;
+    MaskSystem m_workingSystem;
+};
 
 bool openVideoDecoder(const QString &filePath,
                       AVFormatContext **fmtCtx,
@@ -4844,6 +5733,232 @@ void MainWindow::setupMenuBar()
     connect(m_vfxControlsDock, &QDockWidget::visibilityChanged, m_vfxControlsAction, &QAction::setChecked);
     m_menuHelpEntries.append({m_vfxControlsAction,
         QStringLiteral("グロー（光らせる）やにじみなどの特殊効果を調整するパネルを出し入れします。")});
+
+    auto *maskPathDock = new QDockWidget(QStringLiteral("マスクパス"), this);
+    maskPathDock->setObjectName(QStringLiteral("MaskPathEditorDock"));
+    auto *maskPathWidget = new QWidget(maskPathDock);
+    auto *maskPathLayout = new QVBoxLayout(maskPathWidget);
+    maskPathLayout->setContentsMargins(8, 8, 8, 8);
+    maskPathLayout->setSpacing(6);
+    auto *maskList = new QListWidget(maskPathWidget);
+    maskList->setObjectName(QStringLiteral("MaskPathList"));
+    maskPathLayout->addWidget(maskList, 1);
+    auto *maskButtonRow = new QHBoxLayout();
+    auto *addRectMaskButton = new QPushButton(QStringLiteral("矩形"), maskPathWidget);
+    auto *addEllipseMaskButton = new QPushButton(QStringLiteral("楕円"), maskPathWidget);
+    auto *addPathMaskButton = new QPushButton(QStringLiteral("パス"), maskPathWidget);
+    auto *deleteMaskButton = new QPushButton(QStringLiteral("削除"), maskPathWidget);
+    maskButtonRow->addWidget(addRectMaskButton);
+    maskButtonRow->addWidget(addEllipseMaskButton);
+    maskButtonRow->addWidget(addPathMaskButton);
+    maskButtonRow->addWidget(deleteMaskButton);
+    maskPathLayout->addLayout(maskButtonRow);
+    maskPathDock->setWidget(maskPathWidget);
+    addDockWidget(Qt::RightDockWidgetArea, maskPathDock);
+    maskPathDock->setVisible(false);
+
+    auto activeMaskIndex = std::make_shared<int>(0);
+    auto sourceSizeCache = std::make_shared<QHash<QString, QSize>>();
+    auto maskOverlay = m_player && m_player->glPreview()
+        ? new MaskPathOverlay(m_player->glPreview(), m_player)
+        : nullptr;
+    auto resolveMaskClipState = [this, sourceSizeCache]() -> MaskEditorClipState {
+        MaskEditorClipState state;
+        int trackIdx = -1;
+        int clipIdx = -1;
+        ClipInfo clip;
+        if (!selectedVideoClipRef(trackIdx, clipIdx, &clip))
+            return state;
+
+        state.valid = true;
+        state.masks = clip.maskSystem;
+        state.sourceSize = QSize(qMax(1, m_projectConfig.width),
+                                 qMax(1, m_projectConfig.height));
+        if (!clip.filePath.isEmpty()) {
+            const QString probePath = ProxyManager::instance().getProxyPath(clip.filePath);
+            const QString cacheKey = probePath.isEmpty() ? clip.filePath : probePath;
+            QSize cached = sourceSizeCache->value(cacheKey);
+            if (!cached.isValid() || cached.width() <= 0 || cached.height() <= 0) {
+                cached = probeVideoSourceInfo(cacheKey, qMax(1, m_projectConfig.fps)).frameSize;
+                if (cached.isValid() && cached.width() > 0 && cached.height() > 0)
+                    sourceSizeCache->insert(cacheKey, cached);
+            }
+            if (cached.isValid() && cached.width() > 0 && cached.height() > 0)
+                state.sourceSize = cached;
+        }
+        return state;
+    };
+
+    auto refreshMaskUi = std::make_shared<std::function<void()>>();
+    auto commitMaskSystem = [this, activeMaskIndex, refreshMaskUi](
+            const MaskSystem &maskSystem, const QString &undoLabel) {
+        int trackIdx = -1;
+        int clipIdx = -1;
+        ClipInfo selected;
+        if (!selectedVideoClipRef(trackIdx, clipIdx, &selected))
+            return;
+        TimelineTrack *track = m_timeline
+            ? m_timeline->videoTracks().value(trackIdx, nullptr)
+            : nullptr;
+        if (!track)
+            return;
+        QVector<ClipInfo> clips = track->clips();
+        if (clipIdx < 0 || clipIdx >= clips.size())
+            return;
+
+        clips[clipIdx].maskSystem = maskSystem;
+        track->setClips(clips);
+        *activeMaskIndex = qBound(0, *activeMaskIndex,
+                                  qMax(0, maskSystem.masks().size() - 1));
+
+        if (m_timeline && m_timeline->undoManager())
+            m_timeline->undoManager()->saveState(m_timeline->currentState(), undoLabel);
+        if (m_timeline)
+            m_timeline->refreshPlaybackSequence();
+        if (m_player)
+            m_player->previewSeek(qRound(currentPlayheadSeconds() * 1000.0));
+        if (refreshMaskUi && *refreshMaskUi)
+            (*refreshMaskUi)();
+    };
+
+    if (maskOverlay) {
+        maskOverlay->setCallbacks(resolveMaskClipState,
+                                  [activeMaskIndex]() { return *activeMaskIndex; },
+                                  commitMaskSystem);
+    }
+
+    *refreshMaskUi = [=]() {
+        const MaskEditorClipState state = resolveMaskClipState();
+        const bool hasClip = state.valid;
+        const int count = state.masks.masks().size();
+        {
+            QSignalBlocker blocker(maskList);
+            maskList->clear();
+            if (!hasClip) {
+                auto *item = new QListWidgetItem(QStringLiteral("クリップ未選択"));
+                item->setFlags(Qt::NoItemFlags);
+                maskList->addItem(item);
+            } else if (count == 0) {
+                auto *item = new QListWidgetItem(QStringLiteral("マスクなし"));
+                item->setFlags(Qt::NoItemFlags);
+                maskList->addItem(item);
+            } else {
+                for (int i = 0; i < count; ++i) {
+                    QString label = maskVisibleName(state.masks.masks().at(i).name);
+                    if (label.isEmpty())
+                        label = QStringLiteral("Mask %1").arg(i + 1);
+                    maskList->addItem(label);
+                }
+                *activeMaskIndex = qBound(0, *activeMaskIndex, count - 1);
+                maskList->setCurrentRow(*activeMaskIndex);
+            }
+        }
+        addRectMaskButton->setEnabled(hasClip);
+        addEllipseMaskButton->setEnabled(hasClip);
+        addPathMaskButton->setEnabled(hasClip);
+        deleteMaskButton->setEnabled(hasClip && count > 0);
+        if (maskOverlay)
+            maskOverlay->refresh();
+    };
+
+    auto appendDefaultMask = [=](MaskShape shape) {
+        const MaskEditorClipState state = resolveMaskClipState();
+        if (!state.valid) {
+            statusBar()->showMessage(QStringLiteral("マスクを追加するクリップを選択してください"), 3000);
+            return;
+        }
+
+        const QSize sourceSize = sanitizedMaskSourceSize(state.sourceSize);
+        const QRectF rect(sourceSize.width() * 0.25,
+                          sourceSize.height() * 0.25,
+                          sourceSize.width() * 0.50,
+                          sourceSize.height() * 0.50);
+        QVector<MaskEditorPoint> points;
+        if (shape == MaskShape::Ellipse)
+            points = ellipseMaskEditorPoints(rect);
+        else if (shape == MaskShape::Polygon)
+            points = {
+                makeMaskEditorPoint(QPointF(rect.center().x(), rect.top())),
+                makeMaskEditorPoint(rect.bottomRight()),
+                makeMaskEditorPoint(rect.bottomLeft())
+            };
+        else
+            points = rectMaskEditorPoints(rect);
+
+        Mask mask;
+        mask.shape = MaskShape::Path;
+        mask.mode = MaskMode::Add;
+        mask.opacity = 1.0;
+        mask.name = QStringLiteral("Mask %1").arg(state.masks.masks().size() + 1);
+        mask = maskWithEditorPoints(mask, points);
+
+        *activeMaskIndex = state.masks.masks().size();
+        if (maskOverlay)
+            maskOverlay->setSelectedPoint(-1);
+        commitMaskSystem(maskSystemWithAppendedMask(state.masks, mask),
+                         QStringLiteral("Add mask"));
+        maskPathDock->show();
+        maskPathDock->raise();
+    };
+
+    connect(addRectMaskButton, &QPushButton::clicked, maskPathDock,
+            [appendDefaultMask]() { appendDefaultMask(MaskShape::Rectangle); });
+    connect(addEllipseMaskButton, &QPushButton::clicked, maskPathDock,
+            [appendDefaultMask]() { appendDefaultMask(MaskShape::Ellipse); });
+    connect(addPathMaskButton, &QPushButton::clicked, maskPathDock,
+            [appendDefaultMask]() { appendDefaultMask(MaskShape::Polygon); });
+    connect(deleteMaskButton, &QPushButton::clicked, maskPathDock, [=]() {
+        const MaskEditorClipState state = resolveMaskClipState();
+        if (!state.valid || state.masks.masks().isEmpty())
+            return;
+        const int idx = qBound(0, *activeMaskIndex, state.masks.masks().size() - 1);
+        *activeMaskIndex = qMax(0, idx - 1);
+        if (maskOverlay)
+            maskOverlay->setSelectedPoint(-1);
+        commitMaskSystem(maskSystemWithRemovedMask(state.masks, idx),
+                         QStringLiteral("Delete mask"));
+    });
+    connect(maskList, &QListWidget::currentRowChanged, maskPathDock, [=](int row) {
+        const MaskEditorClipState state = resolveMaskClipState();
+        if (row >= 0 && row < state.masks.masks().size()) {
+            *activeMaskIndex = row;
+            if (maskOverlay)
+                maskOverlay->setSelectedPoint(-1);
+        }
+        if (maskOverlay)
+            maskOverlay->refresh();
+    });
+    connect(maskPathDock, &QDockWidget::visibilityChanged, maskPathDock, [=](bool visible) {
+        if (maskOverlay)
+            maskOverlay->setEditorEnabled(visible);
+        if (visible && refreshMaskUi && *refreshMaskUi)
+            (*refreshMaskUi)();
+    });
+    connect(m_timeline, &Timeline::clipSelectedOnTrack, maskPathDock,
+            [=](int, int) {
+        *activeMaskIndex = 0;
+        if (maskOverlay)
+            maskOverlay->setSelectedPoint(-1);
+        if (refreshMaskUi && *refreshMaskUi)
+            (*refreshMaskUi)();
+    });
+    connect(m_timeline->undoManager(), &UndoManager::stateChanged, maskPathDock,
+            [=]() {
+        if (refreshMaskUi && *refreshMaskUi)
+            (*refreshMaskUi)();
+    });
+    connect(m_timeline, &Timeline::sequenceChanged, maskPathDock,
+            [=](const QVector<PlaybackEntry> &) {
+        if (maskPathDock->isVisible() && refreshMaskUi && *refreshMaskUi)
+            (*refreshMaskUi)();
+    });
+
+    auto *maskPathAction = viewMenu->addAction(QStringLiteral("マスクパス編集"));
+    maskPathAction->setCheckable(true);
+    connect(maskPathAction, &QAction::toggled, maskPathDock, &QDockWidget::setVisible);
+    connect(maskPathDock, &QDockWidget::visibilityChanged, maskPathAction, &QAction::setChecked);
+    m_menuHelpEntries.append({maskPathAction,
+        QStringLiteral("選択中クリップのマスク一覧を表示し、プレビュー上で頂点とベジェハンドルを編集します。")});
 
     // Lumetri Scopes dock — Histogram + Luma Waveform + Vectorscope. Off
     // by default so first-run users aren't paying CPU on scope math; the
@@ -11098,12 +12213,15 @@ void MainWindow::editTransformKeyframes()
 
 void MainWindow::addMask()
 {
-    if (!m_timeline->hasSelection()) {
+    int trackIdx = -1;
+    int clipIdx = -1;
+    ClipInfo clip;
+    if (!selectedVideoClipRef(trackIdx, clipIdx, &clip)) {
         QMessageBox::information(this, "Mask", "Select a clip first.");
         return;
     }
 
-    QStringList shapes = {"Rectangle", "Ellipse", "Polygon"};
+    QStringList shapes = {"Rectangle", "Ellipse", "Path"};
     bool ok;
     QString selected = QInputDialog::getItem(this, "Add Mask",
         "Mask shape:", shapes, 0, false, &ok);
@@ -11113,6 +12231,64 @@ void MainWindow::addMask()
         "Feather amount (pixels):", 10.0, 0.0, 100.0, 1, &ok);
     if (!ok) return;
 
+    TimelineTrack *track = m_timeline
+        ? m_timeline->videoTracks().value(trackIdx, nullptr)
+        : nullptr;
+    if (!track)
+        return;
+    QVector<ClipInfo> clips = track->clips();
+    if (clipIdx < 0 || clipIdx >= clips.size())
+        return;
+
+    QSize sourceSize(qMax(1, m_projectConfig.width), qMax(1, m_projectConfig.height));
+    if (!clip.filePath.isEmpty()) {
+        const QString probePath = ProxyManager::instance().getProxyPath(clip.filePath);
+        const QSize probed = probeVideoSourceInfo(
+            probePath.isEmpty() ? clip.filePath : probePath,
+            qMax(1, m_projectConfig.fps)).frameSize;
+        if (probed.isValid() && probed.width() > 0 && probed.height() > 0)
+            sourceSize = probed;
+    }
+
+    const QRectF rect(sourceSize.width() * 0.25,
+                      sourceSize.height() * 0.25,
+                      sourceSize.width() * 0.50,
+                      sourceSize.height() * 0.50);
+    QVector<MaskEditorPoint> points;
+    if (selected == QLatin1String("Ellipse")) {
+        points = ellipseMaskEditorPoints(rect);
+    } else if (selected == QLatin1String("Path")) {
+        points = {
+            makeMaskEditorPoint(QPointF(rect.center().x(), rect.top())),
+            makeMaskEditorPoint(rect.bottomRight()),
+            makeMaskEditorPoint(rect.bottomLeft())
+        };
+    } else {
+        points = rectMaskEditorPoints(rect);
+    }
+
+    Mask mask;
+    mask.shape = MaskShape::Path;
+    mask.mode = MaskMode::Add;
+    mask.feather.amount = feather;
+    mask.opacity = 1.0;
+    mask.name = QStringLiteral("Mask %1").arg(clips[clipIdx].maskSystem.masks().size() + 1);
+    mask = maskWithEditorPoints(mask, points);
+
+    clips[clipIdx].maskSystem = maskSystemWithAppendedMask(clips[clipIdx].maskSystem, mask);
+    track->setClips(clips);
+    if (m_timeline && m_timeline->undoManager())
+        m_timeline->undoManager()->saveState(m_timeline->currentState(),
+                                             QStringLiteral("Add mask"));
+    if (m_timeline)
+        m_timeline->refreshPlaybackSequence();
+    if (m_player)
+        m_player->previewSeek(qRound(currentPlayheadSeconds() * 1000.0));
+
+    if (auto *dock = findChild<QDockWidget *>(QStringLiteral("MaskPathEditorDock"))) {
+        dock->show();
+        dock->raise();
+    }
     statusBar()->showMessage(QString("Added %1 mask (feather: %2px)").arg(selected).arg(feather));
 }
 
