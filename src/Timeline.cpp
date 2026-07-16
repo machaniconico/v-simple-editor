@@ -21,6 +21,7 @@
 #include "util/RcPause.h"
 
 #include <algorithm>
+#include <functional>
 #include <QFileInfo>
 #include <QFont>
 #include <QJsonArray>
@@ -6536,6 +6537,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         bool fitContain = false;
         bool fitCover = false;
         clipcolor::ColorMeta colorMeta;
+        LayerStyle layerStyle;
         double volume = 1.0;
         double pan = 0.0;
         QVector<AudioGainPoint> volumeEnvelope;
@@ -6560,16 +6562,22 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         return nullptr;
     };
 
-    auto appendSequenceIntervals = [&](const ClipInfo &parentClip,
-                                       double parentTimelineStart,
-                                       int parentTrackIdx,
-                                       int parentClipIdx,
-                                       QVector<Interval> &out) -> bool {
+    std::function<bool(const ClipInfo &, double, int, int, QVector<Interval> &,
+                       int, QVector<QString> &)> appendSequenceIntervals;
+    appendSequenceIntervals = [&](const ClipInfo &parentClip,
+                                  double parentTimelineStart,
+                                  int parentTrackIdx,
+                                  int parentClipIdx,
+                                  QVector<Interval> &out,
+                                  int depth,
+                                  QVector<QString> &sequenceStack) -> bool {
         const QString refId = resolveSequenceRefId(parentClip);
-        const TimelineSequence *sequence = findSequence(refId);
         if (refId.isEmpty())
             return false;
-        if (!sequence || refId == m_activeSequenceId)
+        if (depth > 8 || sequenceStack.contains(refId))
+            return true;
+        const TimelineSequence *sequence = findSequence(refId);
+        if (!sequence)
             return true;
 
         const double parentSpeed = (parentClip.speed > 0.0) ? parentClip.speed : 1.0;
@@ -6580,6 +6588,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         if (sourceOut <= sourceIn)
             return true;
 
+        sequenceStack.append(refId);
         for (const QVector<ClipInfo> &track : sequence->videoTracks) {
             double childAccum = 0.0;
             for (int childIdx = 0; childIdx < track.size(); ++childIdx) {
@@ -6600,9 +6609,26 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
                 const double childSpeed = (child.speed > 0.0) ? child.speed : 1.0;
                 const double localIn = overlapStart - childAccum;
                 const double localOut = overlapEnd - childAccum;
+                const double childTimelineStart =
+                    parentTimelineStart + (overlapStart - sourceIn) / parentSpeed;
+
+                if (child.isSequenceReference()) {
+                    ClipInfo nested = child;
+                    nested.inPoint = child.inPoint + localIn * childSpeed;
+                    nested.outPoint = child.inPoint + localOut * childSpeed;
+                    nested.speed = childSpeed * parentSpeed;
+                    nested.opacity = child.opacity * parentClip.opacity;
+                    nested.volume = child.volume * parentClip.volume;
+                    nested.pan = qBound(-1.0, child.pan + parentClip.pan, 1.0);
+                    appendSequenceIntervals(nested, childTimelineStart,
+                                            parentTrackIdx, parentClipIdx,
+                                            out, depth + 1, sequenceStack);
+                    childAccum += childDur;
+                    continue;
+                }
 
                 Interval iv;
-                iv.timelineStart = parentTimelineStart + (overlapStart - sourceIn) / parentSpeed;
+                iv.timelineStart = childTimelineStart;
                 iv.timelineEnd = parentTimelineStart + (overlapEnd - sourceIn) / parentSpeed;
                 iv.clipIn = child.inPoint + localIn * childSpeed;
                 iv.clipOut = child.inPoint + localOut * childSpeed;
@@ -6617,6 +6643,11 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
                     iv.speed = 1.0e-9;
                 }
                 iv.filePath = child.filePath;
+                // Nested sequences render as one parent-layer image in the
+                // CPU SSOT. The flattened PlaybackEntry keeps the parent clip
+                // identity for decoder timing, edit-target stability, and
+                // audio routing; nested visual track fidelity is not derived
+                // from this flattened track index.
                 iv.trackIdx = parentTrackIdx;
                 iv.videoScale = child.videoScale;
                 iv.videoDx = child.videoDx;
@@ -6626,6 +6657,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
                 iv.fitContain = child.fitContain;
                 iv.fitCover = child.fitCover;
                 iv.colorMeta = child.colorMeta;
+                iv.layerStyle = child.layerStyle;
                 iv.volume = child.volume * parentClip.volume;
                 iv.pan = qBound(-1.0, child.pan + parentClip.pan, 1.0);
                 iv.volumeEnvelope = child.volumeEnvelope;
@@ -6644,6 +6676,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
                 childAccum += childDur;
             }
         }
+        sequenceStack.removeLast();
         return true;
     };
 
@@ -6661,8 +6694,12 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
                 accum += qMax(0.0, c.leadInSec); // leading gap before this clip
                 const double clipDur = c.effectiveDuration();
                 if (clipDur <= 0.0) continue;
+                QVector<QString> sequenceStack;
+                if (!m_activeSequenceId.isEmpty())
+                    sequenceStack.append(m_activeSequenceId);
                 if (c.isSequenceReference()
-                    && appendSequenceIntervals(c, accum, t, ci, ivs)) {
+                    && appendSequenceIntervals(c, accum, t, ci, ivs,
+                                               /*depth=*/0, sequenceStack)) {
                     accum += clipDur;
                     continue;
                 }
@@ -6691,6 +6728,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
                 iv.fitContain = c.fitContain;
                 iv.fitCover = c.fitCover;
                 iv.colorMeta = c.colorMeta;
+                iv.layerStyle = c.layerStyle;
                 iv.volume = c.volume;
                 iv.pan = c.pan;
                 iv.volumeEnvelope = c.volumeEnvelope;
@@ -6827,6 +6865,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         e.fitContain = iv.fitContain;
         e.fitCover = iv.fitCover;
         e.colorMeta = iv.colorMeta;
+        e.layerStyle = iv.layerStyle;
         e.volume = iv.volume;
         e.pan = iv.pan;
         e.volumeEnvelope = iv.volumeEnvelope;
@@ -6898,16 +6937,22 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
         return nullptr;
     };
 
-    auto appendSequenceAudioEntries = [&](const ClipInfo &parentClip,
-                                          double parentTimelineStart,
-                                          int parentTrackIdx,
-                                          int parentClipIdx,
-                                          bool trackMuted) -> bool {
+    std::function<bool(const ClipInfo &, double, int, int, bool, int,
+                       QVector<QString> &)> appendSequenceAudioEntries;
+    appendSequenceAudioEntries = [&](const ClipInfo &parentClip,
+                                     double parentTimelineStart,
+                                     int parentTrackIdx,
+                                     int parentClipIdx,
+                                     bool trackMuted,
+                                     int depth,
+                                     QVector<QString> &sequenceStack) -> bool {
         const QString refId = resolveSequenceRefId(parentClip);
-        const TimelineSequence *sequence = findSequence(refId);
         if (refId.isEmpty())
             return false;
-        if (!sequence || refId == m_activeSequenceId)
+        if (depth > 8 || sequenceStack.contains(refId))
+            return true;
+        const TimelineSequence *sequence = findSequence(refId);
+        if (!sequence)
             return true;
 
         const double parentSpeed = (parentClip.speed > 0.0) ? parentClip.speed : 1.0;
@@ -6918,9 +6963,11 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
         if (sourceOut <= sourceIn)
             return true;
 
+        sequenceStack.append(refId);
         for (const QVector<ClipInfo> &track : sequence->audioTracks) {
             double childAccum = 0.0;
-            for (const ClipInfo &child : track) {
+            for (int childIdx = 0; childIdx < track.size(); ++childIdx) {
+                const ClipInfo &child = track[childIdx];
                 childAccum += qMax(0.0, child.leadInSec);
                 const double childDur = child.effectiveDuration();
                 if (childDur <= 0.0)
@@ -6936,14 +6983,34 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
                 const double childSpeed = (child.speed > 0.0) ? child.speed : 1.0;
                 const double localIn = overlapStart - childAccum;
                 const double localOut = overlapEnd - childAccum;
+                const double childTimelineStart =
+                    parentTimelineStart + (overlapStart - sourceIn) / parentSpeed;
+
+                if (child.isSequenceReference()) {
+                    ClipInfo nested = child;
+                    nested.inPoint = child.inPoint + localIn * childSpeed;
+                    nested.outPoint = child.inPoint + localOut * childSpeed;
+                    nested.speed = childSpeed * parentSpeed;
+                    nested.volume = child.volume * parentClip.volume;
+                    nested.pan = qBound(-1.0, child.pan + parentClip.pan, 1.0);
+                    appendSequenceAudioEntries(nested, childTimelineStart,
+                                               parentTrackIdx, parentClipIdx,
+                                               trackMuted, depth + 1,
+                                               sequenceStack);
+                    childAccum += childDur;
+                    continue;
+                }
 
                 PlaybackEntry e;
                 e.filePath = child.filePath;
                 e.clipIn = child.inPoint + localIn * childSpeed;
                 e.clipOut = child.inPoint + localOut * childSpeed;
-                e.timelineStart = parentTimelineStart + (overlapStart - sourceIn) / parentSpeed;
+                e.timelineStart = childTimelineStart;
                 e.timelineEnd = parentTimelineStart + (overlapEnd - sourceIn) / parentSpeed;
                 e.speed = childSpeed * parentSpeed;
+                // Audio flattening also keeps parent identity so sequence
+                // clips added as linked V/A references route as one parent
+                // timeline item while recursively exposing the leaf media.
                 e.sourceTrack = parentTrackIdx;
                 e.audioMuted = trackMuted;
                 e.volume = child.volume * parentClip.volume;
@@ -6967,6 +7034,7 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
                 childAccum += childDur;
             }
         }
+        sequenceStack.removeLast();
         return true;
     };
 
@@ -6981,8 +7049,12 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
             accum += qMax(0.0, c.leadInSec);
             const double clipDur = c.effectiveDuration();
             if (clipDur <= 0.0) continue;
+            QVector<QString> sequenceStack;
+            if (!m_activeSequenceId.isEmpty())
+                sequenceStack.append(m_activeSequenceId);
             if (c.isSequenceReference()
-                && appendSequenceAudioEntries(c, accum, t, ci, trackMuted)) {
+                && appendSequenceAudioEntries(c, accum, t, ci, trackMuted,
+                                              /*depth=*/0, sequenceStack)) {
                 accum += clipDur;
                 continue;
             }
@@ -7220,9 +7292,10 @@ bool Timeline::addSequenceClip(const QString &sequenceId, int videoTrackIndex)
 {
     if (sequenceById(sequenceId) == nullptr)
         return false;
-    while (m_videoTracks.size() <= videoTrackIndex)
+    const int targetTrackIndex = qMax(0, videoTrackIndex);
+    while (m_videoTracks.size() <= targetTrackIndex)
         addVideoTrack();
-    TimelineTrack *track = m_videoTracks.value(videoTrackIndex, nullptr);
+    TimelineTrack *track = m_videoTracks.value(targetTrackIndex, nullptr);
     if (!track)
         return false;
 
@@ -7230,6 +7303,12 @@ bool Timeline::addSequenceClip(const QString &sequenceId, int videoTrackIndex)
     if (clip.duration <= 0.0)
         return false;
     track->addClip(clip);
+
+    while (m_audioTracks.size() <= targetTrackIndex)
+        addAudioTrack();
+    if (TimelineTrack *audioTrack = m_audioTracks.value(targetTrackIndex, nullptr))
+        audioTrack->addClip(clip);
+
     saveUndoState(QStringLiteral("Add sequence clip"));
     scheduleEmitSequenceChanged();
     return true;

@@ -184,6 +184,36 @@ bool isAdjustmentEntry(const Timeline *timeline, const PlaybackEntry &entry)
     return clip && clip->isAdjustment;
 }
 
+bool trackHasActiveSequenceReference(const QVector<ClipInfo> &clips, double targetSec)
+{
+    if (clips.isEmpty())
+        return false;
+
+    double cursor = 0.0;
+    for (const ClipInfo &clip : clips) {
+        const double clipStart = cursor + qMax(0.0, clip.leadInSec);
+        const double clipEnd = clipStart + clip.effectiveDuration();
+        if (targetSec >= clipStart && targetSec < clipEnd)
+            return clip.isSequenceReference();
+        cursor = clipEnd;
+    }
+    return targetSec <= 0.0 && clips.first().isSequenceReference();
+}
+
+bool timelineHasActiveSequenceReference(const Timeline *timeline, qint64 timelineUsec)
+{
+    if (!timeline)
+        return false;
+    const double targetSec = static_cast<double>(timelineUsec) / AV_TIME_BASE;
+    for (const TimelineTrack *track : timeline->videoTracks()) {
+        if (!track || track->isHidden())
+            continue;
+        if (trackHasActiveSequenceReference(track->clips(), targetSec))
+            return true;
+    }
+    return false;
+}
+
 int previewPrimaryEntryIndexAt(const Timeline *timeline,
                                const QVector<PlaybackEntry> &sequence,
                                int preferredIdx,
@@ -4665,13 +4695,18 @@ void VideoPlayer::handlePlaybackTick()
     // below can blend the overlays before pushing the final image.
     const Timeline *previewTimeline = m_glPreview ? m_glPreview->timeline() : nullptr;
     const QVector<int> activeForComposite = findActiveEntriesAt(m_timelinePositionUs);
+    const bool nestedSequenceActive =
+        m_playbackSpeed >= 0.0
+        && sequenceActive()
+        && timelineHasActiveSequenceReference(previewTimeline, m_timelinePositionUs);
     const bool forceProjectOutputComposite =
         m_projectOutputSize.isValid() && !activeForComposite.isEmpty();
     const bool willComposite = m_playbackSpeed >= 0.0
                                && sequenceActive()
                                && !m_seekInProgress
                                && (hasOverlayActive(activeForComposite)
-                                   || forceProjectOutputComposite);
+                                   || forceProjectOutputComposite
+                                   || nestedSequenceActive);
     m_deferDisplayThisTick = willComposite;
 
     // When leaving the compositor path, restore the active entry's
@@ -4728,7 +4763,8 @@ void VideoPlayer::handlePlaybackTick()
     };
     QVector<V2PrefetchJob> v2PrefetchJobs;
     QFuture<void> v2PrefetchFuture;
-    if (prefetchV2Enabled && willComposite && m_playbackSpeed >= 0.0) {
+    if (prefetchV2Enabled && willComposite && !nestedSequenceActive
+        && m_playbackSpeed >= 0.0) {
         const QVector<int> prefetchIdxs = findActiveEntriesAt(m_timelinePositionUs);
         for (int idx : prefetchIdxs) {
             if (idx < 0 || idx >= m_sequence.size())
@@ -4839,7 +4875,30 @@ void VideoPlayer::handlePlaybackTick()
     // in a preview seek. V1-only timelines short-circuit via hasOverlayActive
     // (overlays.isEmpty -> displayFrame is bypassed entirely on the legacy
     // path because m_deferDisplayThisTick was false above).
-    if (advanced && willComposite && !m_lastV1RawFrame.isNull()) {
+    bool servedByNestedSequenceSsot = false;
+    if (advanced && willComposite && nestedSequenceActive && previewTimeline) {
+        waitForV2Prefetch("nested-sequence-ssot");
+        QSize renderSize = m_projectOutputSize.isValid()
+            ? m_projectOutputSize
+            : QSize(m_canvasWidth, m_canvasHeight);
+        if (renderSize.isEmpty() && !m_lastV1RawFrame.isNull())
+            renderSize = m_lastV1RawFrame.size();
+        if (!renderSize.isEmpty()) {
+            const QImage ssotFrame =
+                tlrender::renderFrameAt(previewTimeline,
+                                        m_timelinePositionUs,
+                                        renderSize);
+            if (!ssotFrame.isNull()) {
+                if (m_glPreview)
+                    m_glPreview->setCompositeBakedMode(true);
+                cachePreviewComposite(ssotFrame);
+                displayFrame(ssotFrame);
+                servedByNestedSequenceSsot = true;
+            }
+        }
+    }
+    if (!servedByNestedSequenceSsot
+        && advanced && willComposite && !m_lastV1RawFrame.isNull()) {
         // Phase 1e Win #6: wait for V2 prefetch to finish before the
         // compositor branch reads pool-decoder state.
         waitForV2Prefetch("compositor-entry");

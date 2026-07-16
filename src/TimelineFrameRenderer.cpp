@@ -606,7 +606,8 @@ QImage applyAdjustmentLayers(const QImage &composited, const Timeline *timeline,
 QImage applyTextOverlays(const QImage &composited, const Timeline *timeline,
                          qint64 usec, const ClipInfo *v1Clip)
 {
-    if (!timeline || !v1Clip)
+    Q_UNUSED(timeline);
+    if (!v1Clip)
         return composited;
     const TextManager &mgr = v1Clip->textManager;
     if (mgr.count() <= 0)
@@ -734,12 +735,142 @@ QImage renderOverlayLayerImage(const QImage &rgb, double videoScale,
     return clipgeom::renderLayer(rgb, t, canvasSize, /*smooth=*/true);
 }
 
-} // namespace
+struct RenderTrackSnapshot {
+    QVector<ClipInfo> clips;
+    bool hidden = false;
+};
 
-QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize outSize)
+constexpr int kMaxNestedSequenceDepth = 8;
+
+QImage transparentFrame(QSize size)
+{
+    if (size.isEmpty())
+        return QImage();
+    QImage image(size, QImage::Format_RGBA8888);
+    image.fill(Qt::transparent);
+    return image;
+}
+
+const TimelineSequence *findSequenceById(const QVector<TimelineSequence> &sequences,
+                                         const QString &id)
+{
+    for (const TimelineSequence &sequence : sequences) {
+        if (sequence.id == id)
+            return &sequence;
+    }
+    return nullptr;
+}
+
+QVector<RenderTrackSnapshot> snapshotsFromTimeline(const Timeline *timeline)
+{
+    QVector<RenderTrackSnapshot> snapshots;
+    if (!timeline)
+        return snapshots;
+    const QVector<TimelineTrack *> &tracks = timeline->videoTracks();
+    snapshots.reserve(tracks.size());
+    for (const TimelineTrack *track : tracks) {
+        RenderTrackSnapshot snapshot;
+        if (track) {
+            snapshot.clips = track->clips();
+            snapshot.hidden = track->isHidden();
+        }
+        snapshots.append(snapshot);
+    }
+    return snapshots;
+}
+
+QVector<RenderTrackSnapshot> snapshotsFromSequence(const TimelineSequence &sequence)
+{
+    QVector<RenderTrackSnapshot> snapshots;
+    snapshots.reserve(sequence.videoTracks.size());
+    for (const QVector<ClipInfo> &trackClips : sequence.videoTracks) {
+        RenderTrackSnapshot snapshot;
+        snapshot.clips = trackClips;
+        snapshots.append(snapshot);
+    }
+    return snapshots;
+}
+
+QImage renderFrameFromTracks(const Timeline *timeline,
+                             const QVector<RenderTrackSnapshot> &tracks,
+                             qint64 usec,
+                             QSize outSize,
+                             int sequenceDepth,
+                             QVector<QString> &sequenceStack,
+                             bool applyTimelineGlobals);
+
+QString resolveSequenceRefIdForRender(const ClipInfo &clip)
+{
+    if (!clip.sequenceRefId.isEmpty())
+        return clip.sequenceRefId;
+    return timeline_nesting::sequenceIdFromClipFilePath(clip.filePath);
+}
+
+QImage renderSequenceReferenceFrame(const Timeline *timeline,
+                                    const ClipInfo &clip,
+                                    double sourceSec,
+                                    QSize outSize,
+                                    int sequenceDepth,
+                                    QVector<QString> &sequenceStack)
 {
     if (!timeline || outSize.isEmpty())
         return QImage();
+
+    const QString refId = resolveSequenceRefIdForRender(clip);
+    if (refId.isEmpty())
+        return QImage();
+
+    if (sequenceDepth + 1 > kMaxNestedSequenceDepth
+        || sequenceStack.contains(refId)) {
+        return transparentFrame(outSize);
+    }
+
+    const QVector<TimelineSequence> sequences = timeline->sequences();
+    const TimelineSequence *sequence = findSequenceById(sequences, refId);
+    if (!sequence)
+        return transparentFrame(outSize);
+
+    sequenceStack.append(refId);
+    const qint64 childUsec = qMax<qint64>(
+        0, qRound64(qMax(0.0, sourceSec) * 1'000'000.0));
+    const QImage rendered = renderFrameFromTracks(
+        timeline,
+        snapshotsFromSequence(*sequence),
+        childUsec,
+        outSize,
+        sequenceDepth + 1,
+        sequenceStack,
+        /*applyTimelineGlobals=*/false);
+    sequenceStack.removeLast();
+
+    return rendered.isNull() ? transparentFrame(outSize) : rendered;
+}
+
+QImage renderClipSourceFrame(const Timeline *timeline,
+                             const ClipInfo &clip,
+                             double sourceSec,
+                             QSize outSize,
+                             int sequenceDepth,
+                             QVector<QString> &sequenceStack)
+{
+    if (clip.isSequenceReference())
+        return renderSequenceReferenceFrame(
+            timeline, clip, sourceSec, outSize, sequenceDepth, sequenceStack);
+    return decodeClipFrameNative(clip.filePath, sourceSec);
+}
+
+QImage renderFrameFromTracks(const Timeline *timeline,
+                             const QVector<RenderTrackSnapshot> &tracks,
+                             qint64 usec,
+                             QSize outSize,
+                             int sequenceDepth,
+                             QVector<QString> &sequenceStack,
+                             bool applyTimelineGlobals)
+{
+    if (outSize.isEmpty())
+        return QImage();
+    if (sequenceDepth > kMaxNestedSequenceDepth)
+        return transparentFrame(outSize);
 
     // ── Gather every video track's clip list ────────────────────────────────
     // m_videoTracks[0] is V1 (alias m_videoTrack); each subsequent index is an
@@ -748,7 +879,6 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
     // clip intervals with NO mutual subtraction — the compositor stacks them.
     // PlaybackTypes.h defines the canonical V1-wins model: higher-index tracks
     // are painted first as the back layers, and V1 is painted last/frontmost.
-    const QVector<TimelineTrack *> &tracks = timeline->videoTracks();
     if (tracks.isEmpty())
         return QImage();
 
@@ -760,10 +890,8 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
     // must produce the SAME pixels S2 returned (decode native -> scale to
     // outSize, NO QPainter / format conversion). The overlay path below only
     // runs when an upper track actually has an active clip.
-    TimelineTrack *v1 = tracks.first();
-    if (!v1)
-        return QImage();
-    const bool v1Hidden = v1->isHidden();
+    const RenderTrackSnapshot &v1 = tracks.first();
+    const bool v1Hidden = v1.hidden;
     ClipInfo hiddenV1Clip{};
     hiddenV1Clip.opacity = 0.0;
     const ClipInfo *v1ClipPtr = &hiddenV1Clip;
@@ -778,7 +906,7 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
         base = QImage(outSize, QImage::Format_RGBA8888);
         base.fill(Qt::transparent);
     } else {
-        const QVector<ClipInfo> &v1Clips = v1->clips();
+        const QVector<ClipInfo> &v1Clips = v1.clips;
         if (v1Clips.isEmpty())
             return QImage();
 
@@ -815,7 +943,8 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
             base.fill(Qt::transparent);
         } else {
 
-        const QImage v1NativeRaw = decodeClipFrameNative(v1Clip.filePath, v1SourceSec);
+        const QImage v1NativeRaw = renderClipSourceFrame(
+            timeline, v1Clip, v1SourceSec, outSize, sequenceDepth, sequenceStack);
         if (v1NativeRaw.isNull())
             return QImage();
 
@@ -925,10 +1054,10 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
     }
 
     for (int t = 1; t < tracks.size(); ++t) {
-        TimelineTrack *trk = tracks[t];
-        if (!trk || trk->isHidden())
+        const RenderTrackSnapshot &trk = tracks[t];
+        if (trk.hidden)
             continue;
-        const QVector<ClipInfo> &clips = trk->clips();
+        const QVector<ClipInfo> &clips = trk.clips;
         double start = 0.0;
         // Overlay tracks do NOT clamp-to-first: an upper track only
         // contributes where it genuinely has a clip under the playhead
@@ -973,7 +1102,8 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
             renderLayers.append(renderLayer);
             continue;
         }
-        const QImage nativeRaw = decodeClipFrameNative(c.filePath, srcSec);
+        const QImage nativeRaw = renderClipSourceFrame(
+            timeline, c, srcSec, outSize, sequenceDepth, sequenceStack);
         if (nativeRaw.isNull())
             continue;
         // S4: grade each overlay clip in native resolution too (same per-clip
@@ -1043,7 +1173,7 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
         renderLayers.append(renderLayer);
     }
 
-    if (veditor::parentingEnabledFromEnv()) {
+    if (applyTimelineGlobals && veditor::parentingEnabledFromEnv()) {
         if (const QHash<QString, QString> parentEntries =
                 clipParentEntriesForTimeline(timeline);
             !parentEntries.isEmpty()) {
@@ -1127,28 +1257,30 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
     // RM-3: bind the carrier snapshot to a LOCAL value (Timeline::
     // trackMatteEntries() now returns by value) so this worker thread
     // never aliases a hash the GUI thread may be reassigning.
-    if (const QHash<QString, TimelineTrackMatteEntry> trackMatteEntries =
-            trackMatteClipEntriesForTimeline(timeline);
-        !trackMatteEntries.isEmpty()) {
-        QHash<QString, int> indexByClipId;
-        for (int i = 0; i < renderLayers.size(); ++i)
-            indexByClipId.insert(renderLayers[i].clipId, i);
+    if (applyTimelineGlobals) {
+        if (const QHash<QString, TimelineTrackMatteEntry> trackMatteEntries =
+                trackMatteClipEntriesForTimeline(timeline);
+            !trackMatteEntries.isEmpty()) {
+            QHash<QString, int> indexByClipId;
+            for (int i = 0; i < renderLayers.size(); ++i)
+                indexByClipId.insert(renderLayers[i].clipId, i);
 
-        for (int i = 0; i < renderLayers.size(); ++i) {
-            const auto it = trackMatteEntries.constFind(renderLayers[i].clipId);
-            if (it == trackMatteEntries.cend())
-                continue;
-            const int srcIdx =
-                indexByClipId.value(it.value().matteSourceClipId, -1);
-            // RM-3: renderLayers[0] is the V1 base. A malformed / hand-
-            // edited matteSourceClipId that resolves to the base (or to
-            // this same layer, or to nothing) must be IGNORED — leave the
-            // layer matte-free so it composites normally rather than
-            // matte'ing against the base and blanking the frame.
-            if (srcIdx <= 0 || srcIdx == i)
-                continue;
-            renderLayers[i].layer.matteType = it.value().matteType;
-            renderLayers[i].layer.matteSourceLayerIndex = srcIdx;
+            for (int i = 0; i < renderLayers.size(); ++i) {
+                const auto it = trackMatteEntries.constFind(renderLayers[i].clipId);
+                if (it == trackMatteEntries.cend())
+                    continue;
+                const int srcIdx =
+                    indexByClipId.value(it.value().matteSourceClipId, -1);
+                // RM-3: renderLayers[0] is the V1 base. A malformed / hand-
+                // edited matteSourceClipId that resolves to the base (or to
+                // this same layer, or to nothing) must be IGNORED — leave the
+                // layer matte-free so it composites normally rather than
+                // matte'ing against the base and blanking the frame.
+                if (srcIdx <= 0 || srcIdx == i)
+                    continue;
+                renderLayers[i].layer.matteType = it.value().matteType;
+                renderLayers[i].layer.matteSourceLayerIndex = srcIdx;
+            }
         }
     }
 
@@ -1189,7 +1321,9 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
         QImage styledBase = base;
         if (!v1Clip.layerStyle.isIdentity())
             styledBase = layerstyle::apply(styledBase, v1Clip.layerStyle);
-        const QImage adj = applyAdjustmentLayers(styledBase, timeline, usec);
+        const QImage adj = applyTimelineGlobals
+            ? applyAdjustmentLayers(styledBase, timeline, usec)
+            : styledBase;
         return applyTextOverlays(adj, timeline, usec, &v1Clip);
     }
 
@@ -1488,8 +1622,29 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
     // @VideoPlayer.cpp:1911). Both are strict no-ops when the timeline has no
     // adjustment layer / the V1 clip has no text, preserving S3 multi-track
     // parity exactly.
-    const QImage adj = applyAdjustmentLayers(stacked, timeline, usec);
+    const QImage adj = applyTimelineGlobals
+        ? applyAdjustmentLayers(stacked, timeline, usec)
+        : stacked;
     return applyTextOverlays(adj, timeline, usec, &v1Clip);
+}
+
+} // namespace
+
+QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize outSize)
+{
+    if (!timeline)
+        return QImage();
+    QVector<QString> sequenceStack;
+    const QString activeId = timeline->activeSequenceId();
+    if (!activeId.isEmpty())
+        sequenceStack.append(activeId);
+    return renderFrameFromTracks(timeline,
+                                 snapshotsFromTimeline(timeline),
+                                 usec,
+                                 outSize,
+                                 /*sequenceDepth=*/0,
+                                 sequenceStack,
+                                 /*applyTimelineGlobals=*/true);
 }
 
 QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)

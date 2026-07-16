@@ -114,6 +114,7 @@ int runMotionBlurP2Selftest();
 int runMotionBlurParitySelftest();
 int runMotionPresetSelftest();
 int runMultiCamSelftest();
+int runNestSequenceSelftest();
 int runObsSelftest();
 int runOnionSkinSelftest();
 int runParitySelftest();
@@ -650,6 +651,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "LGG wheels + WB -> per-clip ColorCorrection wiring: value mapping, restore, render reflection" },
     { "graph-editor", "VEDITOR_GRAPH_EDITOR_SELFTEST", runGraphEditorSelftest, true,
       "GraphEditor model roundtrip, panel-edit undo restore, and ClipAnim evaluation parity" },
+    { "nest-sequence", "VEDITOR_NEST_SEQUENCE_SELFTEST", runNestSequenceSelftest, true,
+      "Nested sequences: recursive render, cycle/depth guards, audio flatten, store roundtrip, no-nest byte identity" },
     { "ripple-delete", "VEDITOR_RIPPLE_DELETE_SELFTEST", runRippleDeleteSelftest, true,
       "Ripple delete and gap close: all-track time-range ripple, one-step undo, and no-selection no-op" },
     { "e2e",               "VEDITOR_E2E_SELFTEST",                runE2eSelftest,                true,
