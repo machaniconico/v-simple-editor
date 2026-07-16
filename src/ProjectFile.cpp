@@ -454,8 +454,66 @@ static ClipCurveData clipCurvesFromJson(const QJsonObject &obj)
     return curves;
 }
 
+struct SequenceStoreExtraction {
+    QVector<ClipParentEntry> normalClipParentEntries;
+    QJsonObject sequenceStore;
+};
+
+static SequenceStoreExtraction extractSequenceStoreEntries(const QVector<ClipParentEntry> &entries)
+{
+    SequenceStoreExtraction extracted;
+    extracted.normalClipParentEntries.reserve(entries.size());
+    const QString storeKey = timeline_nesting::sequenceStoreParentKey();
+    for (const ClipParentEntry &entry : entries) {
+        if (entry.clipId == storeKey) {
+            const QJsonObject store =
+                timeline_nesting::decodeSequenceStoreObject(entry.parentClipId);
+            if (!store.value(QStringLiteral("sequences")).toArray().isEmpty())
+                extracted.sequenceStore = store;
+            continue;
+        }
+        extracted.normalClipParentEntries.append(entry);
+    }
+    return extracted;
+}
+
+static void writeSequenceStoreToRoot(QJsonObject &root, const QJsonObject &store)
+{
+    const QJsonArray sequences = store.value(QStringLiteral("sequences")).toArray();
+    if (sequences.isEmpty())
+        return;
+
+    root[QStringLiteral("sequences")] = sequences;
+    const QString activeSequenceId = store.value(QStringLiteral("activeSequenceId")).toString();
+    if (!activeSequenceId.isEmpty())
+        root[QStringLiteral("activeSequenceId")] = activeSequenceId;
+}
+
+static void appendSequenceStoreEntryFromRoot(const QJsonObject &root,
+                                             QVector<ClipParentEntry> &entries)
+{
+    const QJsonArray sequences = root.value(QStringLiteral("sequences")).toArray();
+    if (sequences.isEmpty())
+        return;
+
+    QJsonObject store;
+    store[QStringLiteral("version")] = 1;
+    store[QStringLiteral("activeSequenceId")] =
+        root.value(QStringLiteral("activeSequenceId")).toString();
+    store[QStringLiteral("sequences")] = sequences;
+
+    ClipParentEntry entry;
+    entry.clipId = timeline_nesting::sequenceStoreParentKey();
+    entry.parentClipId = timeline_nesting::encodeSequenceStoreObject(store);
+    if (!entry.parentClipId.isEmpty())
+        entries.append(entry);
+}
+
 bool ProjectFile::save(const QString &filePath, const ProjectData &data)
 {
+    const SequenceStoreExtraction sequenceStore =
+        extractSequenceStoreEntries(data.clipParentEntries);
+
     QJsonObject root;
     root["version"] = PROJECT_FORMAT_VERSION;
     root["config"] = configToJson(data.config);
@@ -618,10 +676,12 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
     }
     if (!data.clipParentEntries.isEmpty()) {
         QJsonArray parentArr;
-        for (const auto &entry : data.clipParentEntries)
+        for (const auto &entry : sequenceStore.normalClipParentEntries)
             parentArr.append(clipParentEntryToJson(entry));
-        root["clipParentEntries"] = parentArr;
+        if (!parentArr.isEmpty())
+            root["clipParentEntries"] = parentArr;
     }
+    writeSequenceStoreToRoot(root, sequenceStore.sequenceStore);
     root["vfxState"] = vfxStateToJson(data.vfxState);
 
     // US-3D-11: motion-graphics sprint persistence
@@ -904,6 +964,7 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
         for (const auto &v : root["clipParentEntries"].toArray())
             data.clipParentEntries.append(clipParentEntryFromJson(v.toObject()));
     }
+    appendSequenceStoreEntryFromRoot(root, data.clipParentEntries);
     data.vfxState = root.contains("vfxState")
         ? vfxStateFromJson(root["vfxState"].toObject())
         : ProjectVfxState{};
@@ -1036,6 +1097,9 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
 
 QString ProjectFile::toJsonString(const ProjectData &data)
 {
+    const SequenceStoreExtraction sequenceStore =
+        extractSequenceStoreEntries(data.clipParentEntries);
+
     QJsonObject root;
     root["version"] = PROJECT_FORMAT_VERSION;
     root["config"] = configToJson(data.config);
@@ -1189,10 +1253,12 @@ QString ProjectFile::toJsonString(const ProjectData &data)
     }
     if (!data.clipParentEntries.isEmpty()) {
         QJsonArray parentArr;
-        for (const auto &entry : data.clipParentEntries)
+        for (const auto &entry : sequenceStore.normalClipParentEntries)
             parentArr.append(clipParentEntryToJson(entry));
-        root["clipParentEntries"] = parentArr;
+        if (!parentArr.isEmpty())
+            root["clipParentEntries"] = parentArr;
     }
+    writeSequenceStoreToRoot(root, sequenceStore.sequenceStore);
     root["vfxState"] = vfxStateToJson(data.vfxState);
 
     // US-3D-11: motion-graphics sprint persistence
@@ -1459,6 +1525,7 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
         for (const auto &v : root["clipParentEntries"].toArray())
             data.clipParentEntries.append(clipParentEntryFromJson(v.toObject()));
     }
+    appendSequenceStoreEntryFromRoot(root, data.clipParentEntries);
     data.vfxState = root.contains("vfxState")
         ? vfxStateFromJson(root["vfxState"].toObject())
         : ProjectVfxState{};
@@ -1620,6 +1687,8 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
     QJsonObject obj;
     obj["filePath"] = clip.filePath;
     obj["displayName"] = clip.displayName;
+    if (!clip.sequenceRefId.isEmpty())
+        obj["sequenceRefId"] = clip.sequenceRefId;
     obj["duration"] = clip.duration;
     obj["inPoint"] = clip.inPoint;
     obj["outPoint"] = clip.outPoint;
@@ -1709,6 +1778,9 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
     ClipInfo clip;
     clip.filePath = obj["filePath"].toString();
     clip.displayName = obj["displayName"].toString();
+    clip.sequenceRefId = obj["sequenceRefId"].toString();
+    if (clip.sequenceRefId.isEmpty())
+        clip.sequenceRefId = timeline_nesting::sequenceIdFromClipFilePath(clip.filePath);
     clip.duration = obj["duration"].toDouble();
     clip.inPoint = obj["inPoint"].toDouble();
     clip.outPoint = obj["outPoint"].toDouble();

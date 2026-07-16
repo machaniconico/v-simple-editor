@@ -13,6 +13,7 @@
 #include <QMenu>
 #include <QElapsedTimer>
 #include <QString>
+#include <QJsonObject>
 #include <cstdint>
 #include "VideoEffect.h"
 #include "Keyframe.h"
@@ -72,6 +73,15 @@ class QTimer;
 // 前方宣言し、シグネチャに使う (Timeline.cpp 側で TrimOps.h を実 include)。
 namespace trimops { enum class TrimType; }
 
+namespace timeline_nesting {
+QString sequenceClipFilePath(const QString &sequenceId);
+bool isSequenceClipFilePath(const QString &filePath);
+QString sequenceIdFromClipFilePath(const QString &filePath);
+QString sequenceStoreParentKey();
+QString encodeSequenceStoreObject(const QJsonObject &store);
+QJsonObject decodeSequenceStoreObject(const QString &encoded);
+}
+
 enum class AudioChannelMode {
     Stereo = 0,
     FillLeft = 1,
@@ -103,6 +113,11 @@ QString buildExportAudioMixEntryFilterChain(int inputIndex,
 struct ClipInfo {
     QString filePath;
     QString displayName;
+    // EPIC-7/NEST-1: empty for normal media clips. When populated, this clip
+    // is a timeline reference to a named sequence stored in Timeline's
+    // sequence model; filePath uses a veditor://sequence/<id> URI only as a
+    // human/debug-friendly sentinel and is not decoded as media.
+    QString sequenceRefId;
     double duration;
     double inPoint = 0.0;
     double outPoint = 0.0;
@@ -236,6 +251,32 @@ struct ClipInfo {
     double effectiveDuration() const {
         double out = (outPoint > 0.0) ? outPoint : duration;
         return (out - inPoint) / speed;
+    }
+
+    bool isSequenceReference() const {
+        return !sequenceRefId.isEmpty()
+            || timeline_nesting::isSequenceClipFilePath(filePath);
+    }
+};
+
+struct TimelineSequence {
+    QString id;
+    QString name;
+    QVector<QVector<ClipInfo>> videoTracks;
+    QVector<QVector<ClipInfo>> audioTracks;
+
+    double duration() const {
+        auto tracksDuration = [](const QVector<QVector<ClipInfo>> &tracks) {
+            double maxEnd = 0.0;
+            for (const auto &track : tracks) {
+                double t = 0.0;
+                for (const ClipInfo &clip : track)
+                    t += qMax(0.0, clip.leadInSec) + clip.effectiveDuration();
+                maxEnd = qMax(maxEnd, t);
+            }
+            return maxEnd;
+        };
+        return qMax(tracksDuration(videoTracks), tracksDuration(audioTracks));
     }
 };
 
@@ -496,6 +537,19 @@ public:
     const QVector<TimelineTrack *> &videoTracks() const { return m_videoTracks; }
     const QVector<TimelineTrack *> &audioTracks() const { return m_audioTracks; }
 
+    // EPIC-7/NEST-1: multiple named sequences in a project. The active
+    // sequence remains mirrored into the legacy video/audio track arrays so
+    // single-sequence projects and old readers stay compatible.
+    QVector<TimelineSequence> sequences() const;
+    QString activeSequenceId() const { return m_activeSequenceId; }
+    void setSequences(const QVector<TimelineSequence> &sequences,
+                      const QString &activeSequenceId = QString());
+    bool addSequence(const TimelineSequence &sequence);
+    bool setActiveSequence(const QString &sequenceId);
+    ClipInfo makeSequenceClip(const QString &sequenceId,
+                              const QString &displayName = QString()) const;
+    bool addSequenceClip(const QString &sequenceId, int videoTrackIndex = 0);
+
     // Marker integration
     void setMarkerManager(MarkerManager *mm) { m_markerManager = mm; }
     MarkerManager *markerManager() const { return m_markerManager; }
@@ -712,9 +766,7 @@ public:
     void setClipParentEntries(const QHash<QString, QString> &entries);
     void setClipParent(const QString& childKey, const QString& parentKey);
     void clearClipParent(const QString& childKey);
-    QHash<QString,QString> clipParentEntries() const {
-        return m_clipParentEntries;
-    }
+    QHash<QString,QString> clipParentEntries() const;
 
     // Multi-clip playback: flatten all video tracks into a sorted, gap-aware
     // schedule with topmost-track-wins resolution (Premiere V1/V2 semantics).
@@ -836,6 +888,12 @@ private:
     void showGapContextMenu(TimelineTrack *track, double timeSec, const QPoint &globalPos);
     void captureZoomAnchor();
     void clearZoomAnchor();
+    TimelineSequence currentSequenceSnapshot(const QString &id,
+                                             const QString &name) const;
+    void upsertSequenceSnapshot(const TimelineSequence &sequence);
+    void syncActiveSequenceFromCurrentTracks();
+    TimelineSequence *sequenceById(const QString &sequenceId);
+    const TimelineSequence *sequenceById(const QString &sequenceId) const;
     // Coalesces sequenceChanged + audioSequenceChanged emissions across
     // rapid mutations (drag-scrub, batch import, linked-drag stream). Each
     // call restarts a 50 ms single-shot timer; on timeout both signals fire
@@ -855,6 +913,9 @@ private:
     // setTrackMatteEntries). Keyed by "trackIdx:clipIdx".
     QHash<QString, TimelineTrackMatteEntry> m_trackMatteEntries;
     QHash<QString, QString> m_clipParentEntries;
+    QVector<TimelineSequence> m_sequences;
+    QString m_activeSequenceId;
+    bool m_sequenceModelEnabled = false;
     QScrollArea *m_scrollArea;
     QWidget *m_tracksWidget;
     QVBoxLayout *m_tracksLayout;

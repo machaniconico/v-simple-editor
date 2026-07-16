@@ -11,6 +11,7 @@
 #include "UndoManager.h"
 #include "AudioMixer.h"
 #include "OverlayDialogs.h"
+#include "ProjectFile.h"
 #include "WaveformGenerator.h"
 #include "color/ClipColor.h"
 #include "playback/HdrIngestProbe.h"
@@ -22,6 +23,9 @@
 #include <algorithm>
 #include <QFileInfo>
 #include <QFont>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonValue>
 #include <QMessageBox>
 #include <QStringList>
 
@@ -198,6 +202,218 @@ QAction *addAudioChannelModeAction(QMenu *menu,
     act->setCheckable(true);
     act->setChecked(current == mode);
     return act;
+}
+} // namespace
+
+namespace timeline_nesting {
+namespace {
+constexpr char kSequenceClipPrefix[] = "veditor://sequence/";
+constexpr char kSequenceStoreParentKey[] = "__veditor_sequence_store__";
+}
+
+QString sequenceClipFilePath(const QString &sequenceId)
+{
+    return QString::fromLatin1(kSequenceClipPrefix) + sequenceId;
+}
+
+bool isSequenceClipFilePath(const QString &filePath)
+{
+    return filePath.startsWith(QLatin1String(kSequenceClipPrefix));
+}
+
+QString sequenceIdFromClipFilePath(const QString &filePath)
+{
+    return isSequenceClipFilePath(filePath)
+        ? filePath.mid(int(sizeof(kSequenceClipPrefix) - 1))
+        : QString();
+}
+
+QString sequenceStoreParentKey()
+{
+    return QString::fromLatin1(kSequenceStoreParentKey);
+}
+
+QString encodeSequenceStoreObject(const QJsonObject &store)
+{
+    if (store.isEmpty())
+        return {};
+    const QByteArray json = QJsonDocument(store).toJson(QJsonDocument::Compact);
+    return QString::fromLatin1(json.toBase64());
+}
+
+QJsonObject decodeSequenceStoreObject(const QString &encoded)
+{
+    if (encoded.isEmpty())
+        return {};
+    QJsonDocument doc = QJsonDocument::fromJson(QByteArray::fromBase64(encoded.toLatin1()));
+    if (doc.isNull())
+        doc = QJsonDocument::fromJson(encoded.toUtf8());
+    return doc.isObject() ? doc.object() : QJsonObject{};
+}
+} // namespace timeline_nesting
+
+namespace {
+constexpr int kSequenceStoreVersion = 1;
+constexpr char kDefaultSequenceId[] = "main";
+
+QString fallbackSequenceId(int index)
+{
+    return index == 0
+        ? QString::fromLatin1(kDefaultSequenceId)
+        : QStringLiteral("sequence-%1").arg(index + 1);
+}
+
+bool hasSequenceId(const QVector<TimelineSequence> &sequences, const QString &id)
+{
+    return std::any_of(sequences.cbegin(), sequences.cend(),
+                       [&id](const TimelineSequence &s) { return s.id == id; });
+}
+
+QString uniqueSequenceId(const QVector<TimelineSequence> &sequences,
+                         const QString &preferred,
+                         int index)
+{
+    QString base = preferred.trimmed();
+    if (base.isEmpty())
+        base = fallbackSequenceId(index);
+    QString candidate = base;
+    int suffix = 2;
+    while (hasSequenceId(sequences, candidate))
+        candidate = QStringLiteral("%1-%2").arg(base).arg(suffix++);
+    return candidate;
+}
+
+QString resolveSequenceRefId(const ClipInfo &clip)
+{
+    if (!clip.sequenceRefId.isEmpty())
+        return clip.sequenceRefId;
+    return timeline_nesting::sequenceIdFromClipFilePath(clip.filePath);
+}
+
+void upsertSequence(QVector<TimelineSequence> &sequences,
+                    const TimelineSequence &sequence)
+{
+    if (sequence.id.isEmpty())
+        return;
+    for (TimelineSequence &existing : sequences) {
+        if (existing.id == sequence.id) {
+            existing = sequence;
+            return;
+        }
+    }
+    sequences.append(sequence);
+}
+
+QVector<TimelineSequence> normalizeSequences(const QVector<TimelineSequence> &input,
+                                             QString *activeSequenceId)
+{
+    QVector<TimelineSequence> normalized;
+    normalized.reserve(input.size());
+    for (int i = 0; i < input.size(); ++i) {
+        TimelineSequence seq = input[i];
+        seq.id = uniqueSequenceId(normalized, seq.id, i);
+        if (seq.name.trimmed().isEmpty())
+            seq.name = QStringLiteral("Sequence %1").arg(i + 1);
+        normalized.append(seq);
+    }
+
+    if (normalized.isEmpty()) {
+        if (activeSequenceId)
+            activeSequenceId->clear();
+        return normalized;
+    }
+
+    if (activeSequenceId) {
+        if (!hasSequenceId(normalized, *activeSequenceId))
+            *activeSequenceId = normalized.first().id;
+    }
+    return normalized;
+}
+
+QJsonObject sequenceToStoreJson(const TimelineSequence &sequence)
+{
+    ProjectData data;
+    data.videoTracks = sequence.videoTracks;
+    data.audioTracks = sequence.audioTracks;
+
+    QJsonObject project =
+        QJsonDocument::fromJson(ProjectFile::toJsonString(data).toUtf8()).object();
+
+    QJsonObject obj;
+    obj[QStringLiteral("id")] = sequence.id;
+    obj[QStringLiteral("name")] = sequence.name;
+    obj[QStringLiteral("videoTracks")] = project.value(QStringLiteral("videoTracks")).toArray();
+    obj[QStringLiteral("audioTracks")] = project.value(QStringLiteral("audioTracks")).toArray();
+    return obj;
+}
+
+TimelineSequence sequenceFromStoreJson(const QJsonObject &obj)
+{
+    TimelineSequence sequence;
+    sequence.id = obj.value(QStringLiteral("id")).toString();
+    sequence.name = obj.value(QStringLiteral("name")).toString();
+
+    QJsonObject project;
+    project[QStringLiteral("version")] = 2;
+    project[QStringLiteral("config")] = QJsonObject{};
+    project[QStringLiteral("videoTracks")] = obj.value(QStringLiteral("videoTracks")).toArray();
+    project[QStringLiteral("audioTracks")] = obj.value(QStringLiteral("audioTracks")).toArray();
+    project[QStringLiteral("playheadPos")] = 0.0;
+    project[QStringLiteral("markIn")] = -1.0;
+    project[QStringLiteral("markOut")] = -1.0;
+    project[QStringLiteral("zoomLevel")] = 10;
+
+    ProjectData data;
+    if (ProjectFile::fromJsonString(QString::fromUtf8(
+            QJsonDocument(project).toJson(QJsonDocument::Compact)), data)) {
+        sequence.videoTracks = data.videoTracks;
+        sequence.audioTracks = data.audioTracks;
+    }
+    return sequence;
+}
+
+QJsonObject sequenceStoreToJson(const QVector<TimelineSequence> &sequences,
+                                const QString &activeSequenceId)
+{
+    if (sequences.isEmpty())
+        return {};
+
+    QJsonArray arr;
+    for (const TimelineSequence &sequence : sequences)
+        arr.append(sequenceToStoreJson(sequence));
+
+    QJsonObject store;
+    store[QStringLiteral("version")] = kSequenceStoreVersion;
+    store[QStringLiteral("activeSequenceId")] = activeSequenceId;
+    store[QStringLiteral("sequences")] = arr;
+    return store;
+}
+
+bool sequencesFromStoreJson(const QJsonObject &store,
+                            QVector<TimelineSequence> *sequencesOut,
+                            QString *activeSequenceIdOut)
+{
+    const QJsonArray arr = store.value(QStringLiteral("sequences")).toArray();
+    if (arr.isEmpty())
+        return false;
+
+    QVector<TimelineSequence> sequences;
+    sequences.reserve(arr.size());
+    for (const QJsonValue &value : arr) {
+        TimelineSequence sequence = sequenceFromStoreJson(value.toObject());
+        if (!sequence.id.isEmpty())
+            sequences.append(sequence);
+    }
+    QString active = store.value(QStringLiteral("activeSequenceId")).toString();
+    sequences = normalizeSequences(sequences, &active);
+    if (sequences.isEmpty())
+        return false;
+
+    if (sequencesOut)
+        *sequencesOut = sequences;
+    if (activeSequenceIdOut)
+        *activeSequenceIdOut = active;
+    return true;
 }
 } // namespace
 
@@ -6335,6 +6551,102 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         QVector<StabilizerKeyframe> stabilizerKeyframes;
     };
 
+    const QVector<TimelineSequence> sequenceSnapshot = sequences();
+    auto findSequence = [&sequenceSnapshot](const QString &id) -> const TimelineSequence * {
+        for (const TimelineSequence &sequence : sequenceSnapshot) {
+            if (sequence.id == id)
+                return &sequence;
+        }
+        return nullptr;
+    };
+
+    auto appendSequenceIntervals = [&](const ClipInfo &parentClip,
+                                       double parentTimelineStart,
+                                       int parentTrackIdx,
+                                       int parentClipIdx,
+                                       QVector<Interval> &out) -> bool {
+        const QString refId = resolveSequenceRefId(parentClip);
+        const TimelineSequence *sequence = findSequence(refId);
+        if (refId.isEmpty())
+            return false;
+        if (!sequence || refId == m_activeSequenceId)
+            return true;
+
+        const double parentSpeed = (parentClip.speed > 0.0) ? parentClip.speed : 1.0;
+        const double sourceIn = qMax(0.0, parentClip.inPoint);
+        const double sourceOut = (parentClip.outPoint > 0.0)
+            ? parentClip.outPoint
+            : qMax(parentClip.duration, sequence->duration());
+        if (sourceOut <= sourceIn)
+            return true;
+
+        for (const QVector<ClipInfo> &track : sequence->videoTracks) {
+            double childAccum = 0.0;
+            for (int childIdx = 0; childIdx < track.size(); ++childIdx) {
+                const ClipInfo &child = track[childIdx];
+                childAccum += qMax(0.0, child.leadInSec);
+                const double childDur = child.effectiveDuration();
+                if (childDur <= 0.0) {
+                    continue;
+                }
+
+                const double overlapStart = qMax(sourceIn, childAccum);
+                const double overlapEnd = qMin(sourceOut, childAccum + childDur);
+                if (overlapEnd <= overlapStart) {
+                    childAccum += childDur;
+                    continue;
+                }
+
+                const double childSpeed = (child.speed > 0.0) ? child.speed : 1.0;
+                const double localIn = overlapStart - childAccum;
+                const double localOut = overlapEnd - childAccum;
+
+                Interval iv;
+                iv.timelineStart = parentTimelineStart + (overlapStart - sourceIn) / parentSpeed;
+                iv.timelineEnd = parentTimelineStart + (overlapEnd - sourceIn) / parentSpeed;
+                iv.clipIn = child.inPoint + localIn * childSpeed;
+                iv.clipOut = child.inPoint + localOut * childSpeed;
+                iv.speed = childSpeed * parentSpeed;
+                if (child.timeRemapCurve.keys.size() == 1) {
+                    const double childSourceOut = (child.outPoint > 0.0) ? child.outPoint : child.duration;
+                    const double holdSource =
+                        qBound(child.inPoint,
+                               child.inPoint + qMax(0.0, child.timeRemapCurve.keys.first().srcTime),
+                               childSourceOut);
+                    iv.clipIn = holdSource;
+                    iv.speed = 1.0e-9;
+                }
+                iv.filePath = child.filePath;
+                iv.trackIdx = parentTrackIdx;
+                iv.videoScale = child.videoScale;
+                iv.videoDx = child.videoDx;
+                iv.videoDy = child.videoDy;
+                iv.rotation2DDegrees = child.rotation2DDegrees;
+                iv.opacity = child.opacity * parentClip.opacity;
+                iv.fitContain = child.fitContain;
+                iv.fitCover = child.fitCover;
+                iv.colorMeta = child.colorMeta;
+                iv.volume = child.volume * parentClip.volume;
+                iv.pan = qBound(-1.0, child.pan + parentClip.pan, 1.0);
+                iv.volumeEnvelope = child.volumeEnvelope;
+                iv.clipIdx = parentClipIdx;
+                iv.leadInType = child.leadIn.type;
+                iv.leadInDuration = child.leadIn.duration;
+                iv.leadInAlignment = child.leadIn.alignment;
+                iv.leadInEasing = child.leadIn.easing;
+                iv.trailOutType = child.trailOut.type;
+                iv.trailOutDuration = child.trailOut.duration;
+                iv.trailOutAlignment = child.trailOut.alignment;
+                iv.trailOutEasing = child.trailOut.easing;
+                iv.stabilizerKeyframes = child.stabilizerKeyframes;
+                out.append(iv);
+
+                childAccum += childDur;
+            }
+        }
+        return true;
+    };
+
     QVector<QVector<Interval>> trackIntervals;
     trackIntervals.reserve(m_videoTracks.size());
     for (int t = 0; t < m_videoTracks.size(); ++t) {
@@ -6349,6 +6661,11 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
                 accum += qMax(0.0, c.leadInSec); // leading gap before this clip
                 const double clipDur = c.effectiveDuration();
                 if (clipDur <= 0.0) continue;
+                if (c.isSequenceReference()
+                    && appendSequenceIntervals(c, accum, t, ci, ivs)) {
+                    accum += clipDur;
+                    continue;
+                }
                 Interval iv;
                 iv.timelineStart = accum;
                 iv.timelineEnd = accum + clipDur;
@@ -6572,6 +6889,87 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
         return result;
     }
 
+    const QVector<TimelineSequence> sequenceSnapshot = sequences();
+    auto findSequence = [&sequenceSnapshot](const QString &id) -> const TimelineSequence * {
+        for (const TimelineSequence &sequence : sequenceSnapshot) {
+            if (sequence.id == id)
+                return &sequence;
+        }
+        return nullptr;
+    };
+
+    auto appendSequenceAudioEntries = [&](const ClipInfo &parentClip,
+                                          double parentTimelineStart,
+                                          int parentTrackIdx,
+                                          int parentClipIdx,
+                                          bool trackMuted) -> bool {
+        const QString refId = resolveSequenceRefId(parentClip);
+        const TimelineSequence *sequence = findSequence(refId);
+        if (refId.isEmpty())
+            return false;
+        if (!sequence || refId == m_activeSequenceId)
+            return true;
+
+        const double parentSpeed = (parentClip.speed > 0.0) ? parentClip.speed : 1.0;
+        const double sourceIn = qMax(0.0, parentClip.inPoint);
+        const double sourceOut = (parentClip.outPoint > 0.0)
+            ? parentClip.outPoint
+            : qMax(parentClip.duration, sequence->duration());
+        if (sourceOut <= sourceIn)
+            return true;
+
+        for (const QVector<ClipInfo> &track : sequence->audioTracks) {
+            double childAccum = 0.0;
+            for (const ClipInfo &child : track) {
+                childAccum += qMax(0.0, child.leadInSec);
+                const double childDur = child.effectiveDuration();
+                if (childDur <= 0.0)
+                    continue;
+
+                const double overlapStart = qMax(sourceIn, childAccum);
+                const double overlapEnd = qMin(sourceOut, childAccum + childDur);
+                if (overlapEnd <= overlapStart) {
+                    childAccum += childDur;
+                    continue;
+                }
+
+                const double childSpeed = (child.speed > 0.0) ? child.speed : 1.0;
+                const double localIn = overlapStart - childAccum;
+                const double localOut = overlapEnd - childAccum;
+
+                PlaybackEntry e;
+                e.filePath = child.filePath;
+                e.clipIn = child.inPoint + localIn * childSpeed;
+                e.clipOut = child.inPoint + localOut * childSpeed;
+                e.timelineStart = parentTimelineStart + (overlapStart - sourceIn) / parentSpeed;
+                e.timelineEnd = parentTimelineStart + (overlapEnd - sourceIn) / parentSpeed;
+                e.speed = childSpeed * parentSpeed;
+                e.sourceTrack = parentTrackIdx;
+                e.audioMuted = trackMuted;
+                e.volume = child.volume * parentClip.volume;
+                e.pan = qBound(-1.0, child.pan + parentClip.pan, 1.0);
+                e.volumeEnvelope = child.volumeEnvelope;
+                e.sourceClipIndex = parentClipIdx;
+                e.leadInType = child.leadIn.type;
+                e.leadInDuration = child.leadIn.duration;
+                e.leadInEasing = child.leadIn.easing;
+                e.trailOutType = child.trailOut.type;
+                e.trailOutDuration = child.trailOut.duration;
+                e.trailOutEasing = child.trailOut.easing;
+                result.append(e);
+                channelModeBindings.append({
+                    qRound64(e.clipIn * 1000.0),
+                    e.sourceTrack,
+                    e.sourceClipIndex,
+                    child.audioChannelMode
+                });
+
+                childAccum += childDur;
+            }
+        }
+        return true;
+    };
+
     for (int t = 0; t < m_audioTracks.size(); ++t) {
         auto *track = m_audioTracks[t];
         if (!track || track->isHidden()) continue;
@@ -6583,6 +6981,11 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
             accum += qMax(0.0, c.leadInSec);
             const double clipDur = c.effectiveDuration();
             if (clipDur <= 0.0) continue;
+            if (c.isSequenceReference()
+                && appendSequenceAudioEntries(c, accum, t, ci, trackMuted)) {
+                accum += clipDur;
+                continue;
+            }
             PlaybackEntry e;
             e.filePath = c.filePath;
             e.clipIn = c.inPoint;
@@ -6649,13 +7052,231 @@ void Timeline::setProjectOutputConfig(int width, int height, bool explicitOutput
     m_projectExplicitOutput = explicitOutput;
 }
 
+TimelineSequence Timeline::currentSequenceSnapshot(const QString &id,
+                                                   const QString &name) const
+{
+    TimelineSequence sequence;
+    sequence.id = id;
+    sequence.name = name;
+    sequence.videoTracks.reserve(m_videoTracks.size());
+    for (const TimelineTrack *track : m_videoTracks)
+        sequence.videoTracks.append(track ? track->clips() : QVector<ClipInfo>{});
+    sequence.audioTracks.reserve(m_audioTracks.size());
+    for (const TimelineTrack *track : m_audioTracks)
+        sequence.audioTracks.append(track ? track->clips() : QVector<ClipInfo>{});
+    return sequence;
+}
+
+void Timeline::upsertSequenceSnapshot(const TimelineSequence &sequence)
+{
+    upsertSequence(m_sequences, sequence);
+}
+
+TimelineSequence *Timeline::sequenceById(const QString &sequenceId)
+{
+    for (TimelineSequence &sequence : m_sequences) {
+        if (sequence.id == sequenceId)
+            return &sequence;
+    }
+    return nullptr;
+}
+
+const TimelineSequence *Timeline::sequenceById(const QString &sequenceId) const
+{
+    for (const TimelineSequence &sequence : m_sequences) {
+        if (sequence.id == sequenceId)
+            return &sequence;
+    }
+    return nullptr;
+}
+
+void Timeline::syncActiveSequenceFromCurrentTracks()
+{
+    if (!m_sequenceModelEnabled)
+        return;
+    if (m_activeSequenceId.isEmpty())
+        m_activeSequenceId = QString::fromLatin1(kDefaultSequenceId);
+
+    QString name = QStringLiteral("Sequence 1");
+    if (const TimelineSequence *existing = sequenceById(m_activeSequenceId)) {
+        if (!existing->name.isEmpty())
+            name = existing->name;
+    }
+    upsertSequenceSnapshot(currentSequenceSnapshot(m_activeSequenceId, name));
+}
+
+QVector<TimelineSequence> Timeline::sequences() const
+{
+    if (!m_sequenceModelEnabled)
+        return {};
+
+    QVector<TimelineSequence> snapshot = m_sequences;
+    QString active = m_activeSequenceId;
+    if (active.isEmpty())
+        active = QString::fromLatin1(kDefaultSequenceId);
+
+    QString name = QStringLiteral("Sequence 1");
+    for (const TimelineSequence &sequence : snapshot) {
+        if (sequence.id == active && !sequence.name.isEmpty()) {
+            name = sequence.name;
+            break;
+        }
+    }
+    upsertSequence(snapshot, currentSequenceSnapshot(active, name));
+    return snapshot;
+}
+
+void Timeline::setSequences(const QVector<TimelineSequence> &sequences,
+                            const QString &activeSequenceId)
+{
+    QString active = activeSequenceId;
+    m_sequences = normalizeSequences(sequences, &active);
+    m_sequenceModelEnabled = !m_sequences.isEmpty();
+    m_activeSequenceId = m_sequenceModelEnabled ? active : QString();
+
+    const TimelineSequence *sequence = sequenceById(m_activeSequenceId);
+    if (!sequence)
+        return;
+
+    restoreFromProject(sequence->videoTracks, sequence->audioTracks,
+                       m_playheadPos, m_markIn, m_markOut, int(m_zoomLevel));
+    m_activeSequenceId = sequence->id;
+    m_sequenceModelEnabled = true;
+    syncActiveSequenceFromCurrentTracks();
+}
+
+bool Timeline::addSequence(const TimelineSequence &sequence)
+{
+    if (!m_sequenceModelEnabled) {
+        m_sequenceModelEnabled = true;
+        m_activeSequenceId = QString::fromLatin1(kDefaultSequenceId);
+        upsertSequenceSnapshot(currentSequenceSnapshot(m_activeSequenceId,
+                                                       QStringLiteral("Sequence 1")));
+    }
+
+    TimelineSequence normalized = sequence;
+    QVector<TimelineSequence> existing = m_sequences;
+    normalized.id = uniqueSequenceId(existing, normalized.id, existing.size());
+    if (normalized.name.trimmed().isEmpty())
+        normalized.name = QStringLiteral("Sequence %1").arg(existing.size() + 1);
+    upsertSequenceSnapshot(normalized);
+    return true;
+}
+
+bool Timeline::setActiveSequence(const QString &sequenceId)
+{
+    if (sequenceId.isEmpty())
+        return false;
+    if (!m_sequenceModelEnabled)
+        return false;
+    const TimelineSequence *target = sequenceById(sequenceId);
+    if (!target)
+        return false;
+    if (sequenceId == m_activeSequenceId)
+        return true;
+
+    syncActiveSequenceFromCurrentTracks();
+    target = sequenceById(sequenceId);
+    if (!target)
+        return false;
+
+    const TimelineSequence targetCopy = *target;
+    m_activeSequenceId = sequenceId;
+    restoreFromProject(targetCopy.videoTracks, targetCopy.audioTracks,
+                       m_playheadPos, m_markIn, m_markOut, int(m_zoomLevel));
+    m_activeSequenceId = sequenceId;
+    m_sequenceModelEnabled = true;
+    syncActiveSequenceFromCurrentTracks();
+    return true;
+}
+
+ClipInfo Timeline::makeSequenceClip(const QString &sequenceId,
+                                    const QString &displayName) const
+{
+    ClipInfo clip;
+    clip.sequenceRefId = sequenceId;
+    clip.filePath = timeline_nesting::sequenceClipFilePath(sequenceId);
+    clip.displayName = displayName;
+
+    const QVector<TimelineSequence> snapshot = sequences();
+    for (const TimelineSequence &sequence : snapshot) {
+        if (sequence.id == sequenceId) {
+            if (clip.displayName.isEmpty())
+                clip.displayName = sequence.name.isEmpty() ? sequence.id : sequence.name;
+            clip.duration = sequence.duration();
+            clip.outPoint = clip.duration;
+            return clip;
+        }
+    }
+
+    if (clip.displayName.isEmpty())
+        clip.displayName = sequenceId;
+    clip.duration = 0.0;
+    clip.outPoint = 0.0;
+    return clip;
+}
+
+bool Timeline::addSequenceClip(const QString &sequenceId, int videoTrackIndex)
+{
+    if (sequenceById(sequenceId) == nullptr)
+        return false;
+    while (m_videoTracks.size() <= videoTrackIndex)
+        addVideoTrack();
+    TimelineTrack *track = m_videoTracks.value(videoTrackIndex, nullptr);
+    if (!track)
+        return false;
+
+    ClipInfo clip = makeSequenceClip(sequenceId);
+    if (clip.duration <= 0.0)
+        return false;
+    track->addClip(clip);
+    saveUndoState(QStringLiteral("Add sequence clip"));
+    scheduleEmitSequenceChanged();
+    return true;
+}
+
 void Timeline::setClipParentEntries(const QHash<QString, QString> &entries)
 {
     m_clipParentEntries.clear();
+    bool decodedSequenceStore = false;
     for (auto it = entries.cbegin(); it != entries.cend(); ++it) {
+        if (it.key() == timeline_nesting::sequenceStoreParentKey()) {
+            QVector<TimelineSequence> sequences;
+            QString activeSequenceId;
+            if (sequencesFromStoreJson(
+                    timeline_nesting::decodeSequenceStoreObject(it.value()),
+                    &sequences,
+                    &activeSequenceId)) {
+                m_sequences = sequences;
+                m_activeSequenceId = activeSequenceId;
+                m_sequenceModelEnabled = true;
+                decodedSequenceStore = true;
+            }
+            continue;
+        }
         if (!it.key().isEmpty() && !it.value().isEmpty() && it.key() != it.value())
             m_clipParentEntries.insert(it.key(), it.value());
     }
+    if (!decodedSequenceStore) {
+        m_sequences.clear();
+        m_activeSequenceId.clear();
+        m_sequenceModelEnabled = false;
+    }
+}
+
+QHash<QString, QString> Timeline::clipParentEntries() const
+{
+    QHash<QString, QString> entries = m_clipParentEntries;
+    if (m_sequenceModelEnabled) {
+        const QString active = m_activeSequenceId.isEmpty()
+            ? QString::fromLatin1(kDefaultSequenceId)
+            : m_activeSequenceId;
+        const QJsonObject store = sequenceStoreToJson(sequences(), active);
+        const QString encoded = timeline_nesting::encodeSequenceStoreObject(store);
+        if (!encoded.isEmpty())
+            entries.insert(timeline_nesting::sequenceStoreParentKey(), encoded);
+    }
+    return entries;
 }
 
 void Timeline::setClipParent(const QString& childKey, const QString& parentKey)
@@ -6712,7 +7333,7 @@ TimelineState Timeline::currentState() const
     }
 
     state.playheadPos = m_playheadPos;
-    state.clipParentEntries = m_clipParentEntries;
+    state.clipParentEntries = clipParentEntries();
 
     if (m_audioMixer) {
         const int n = audioTrackCount();
@@ -6885,6 +7506,9 @@ void Timeline::restoreFromProject(const QVector<QVector<ClipInfo>> &videoTracks,
                             : QVector<ClipInfo>{};
         m_audioTracks[i]->setClips(clips);
     }
+
+    if (m_sequenceModelEnabled)
+        syncActiveSequenceFromCurrentTracks();
 
     m_playheadPos = playhead;
     m_markIn = markInVal;
