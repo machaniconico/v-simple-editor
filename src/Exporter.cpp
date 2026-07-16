@@ -14,7 +14,12 @@
 #include <QPainter>
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <cmath>
+
+extern "C" {
+#include <libavutil/imgutils.h>
+}
 
 // AR-2: ACES 色管理パイプラインを Exporter (LEGACY パス) へ渡す手段。Exporter.h は
 // 本ストーリーの touchedFiles 外なので、ヘッダを変更せずに済むよう TU ローカルの
@@ -46,6 +51,34 @@ void fillOpaqueAlphaPlane(AVFrame *frame)
         auto *row = reinterpret_cast<uint16_t *>(frame->data[3] + y * frame->linesize[3]);
         std::fill(row, row + frame->width, static_cast<uint16_t>(1023));
     }
+}
+
+bool scaleFrameToQImagePadded(SwsContext *ctx,
+                              const AVFrame *frame,
+                              AVPixelFormat dstPixFmt,
+                              QImage &image)
+{
+    if (!ctx || !frame || image.isNull())
+        return false;
+
+    const int rowBytes = av_image_get_linesize(dstPixFmt, image.width(), 0);
+    if (rowBytes <= 0 || rowBytes > image.bytesPerLine())
+        return false;
+
+    uint8_t *tmpData[4] = { nullptr, nullptr, nullptr, nullptr };
+    int tmpStride[4] = { 0, 0, 0, 0 };
+    if (av_image_alloc(tmpData, tmpStride, image.width(), image.height(),
+                       dstPixFmt, 64) < 0)
+        return false;
+
+    sws_scale(ctx, frame->data, frame->linesize, 0, frame->height,
+              tmpData, tmpStride);
+    for (int y = 0; y < image.height(); ++y) {
+        std::memcpy(image.scanLine(y), tmpData[0] + y * tmpStride[0],
+                    static_cast<std::size_t>(rowBytes));
+    }
+    av_freep(&tmpData[0]);
+    return true;
 }
 }
 
@@ -394,10 +427,13 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
                             }
                         }
                     }
-                    uint8_t *rgbDest[1] = { workingImage.bits() };
-                    int rgbLinesize[1] = { static_cast<int>(workingImage.bytesPerLine()) };
-                    sws_scale(toRgbCtx, frame->data, frame->linesize, 0, frame->height,
-                              rgbDest, rgbLinesize);
+                    if (!scaleFrameToQImagePadded(toRgbCtx, frame, AV_PIX_FMT_RGB24,
+                                                  workingImage)) {
+                        if (toRgbCtx)
+                            sws_freeContext(toRgbCtx);
+                        m_cancelled = true;
+                        return;
+                    }
                     sws_freeContext(toRgbCtx);
 
                     // Apply effects
@@ -444,10 +480,13 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
                             }
                         }
                     }
-                    uint8_t *rgbDest[1] = { workingImage.bits() };
-                    int rgbLinesize[1] = { static_cast<int>(workingImage.bytesPerLine()) };
-                    sws_scale(toRgbCtx, frame->data, frame->linesize, 0, frame->height,
-                              rgbDest, rgbLinesize);
+                    if (!scaleFrameToQImagePadded(toRgbCtx, frame, AV_PIX_FMT_RGB24,
+                                                  workingImage)) {
+                        if (toRgbCtx)
+                            sws_freeContext(toRgbCtx);
+                        m_cancelled = true;
+                        return;
+                    }
                     sws_freeContext(toRgbCtx);
                 }
 

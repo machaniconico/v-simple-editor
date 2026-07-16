@@ -70,7 +70,12 @@ extern "C" void *veditor_avHwDeviceCtxToD3D11Device(AVBufferRef *ref);
 #include <QFontMetrics>
 #include <atomic>
 #include <cmath>
+#include <cstring>
 #include <limits>
+
+extern "C" {
+#include <libavutil/imgutils.h>
+}
 
 namespace veditor {
 bool parentingEnabledFromEnv();
@@ -115,6 +120,34 @@ inline int playbackProxyDivisor()
     if (g_playbackProxyPref.compare_exchange_strong(expected, v, std::memory_order_relaxed))
         return v;
     return expected;
+}
+
+bool scaleFrameToQImagePadded(SwsContext *ctx,
+                              const AVFrame *frame,
+                              AVPixelFormat dstPixFmt,
+                              QImage &image)
+{
+    if (!ctx || !frame || image.isNull())
+        return false;
+
+    const int rowBytes = av_image_get_linesize(dstPixFmt, image.width(), 0);
+    if (rowBytes <= 0 || rowBytes > image.bytesPerLine())
+        return false;
+
+    uint8_t *tmpData[4] = { nullptr, nullptr, nullptr, nullptr };
+    int tmpStride[4] = { 0, 0, 0, 0 };
+    if (av_image_alloc(tmpData, tmpStride, image.width(), image.height(),
+                       dstPixFmt, 64) < 0)
+        return false;
+
+    sws_scale(ctx, frame->data, frame->linesize, 0, frame->height,
+              tmpData, tmpStride);
+    for (int y = 0; y < image.height(); ++y) {
+        std::memcpy(image.scanLine(y), tmpData[0] + y * tmpStride[0],
+                    static_cast<std::size_t>(rowBytes));
+    }
+    av_freep(&tmpData[0]);
+    return true;
 }
 
 const ClipInfo *clipForPlaybackEntry(const Timeline *timeline, const PlaybackEntry &entry)
@@ -4108,9 +4141,10 @@ QImage VideoPlayer::frameToImage(const AVFrame *frame)
         return {};
     }
 
-    uint8_t *dest[4] = { image.bits(), nullptr, nullptr, nullptr };
-    int destLinesize[4] = { static_cast<int>(image.bytesPerLine()), 0, 0, 0 };
-    sws_scale(m_swsCtx, frame->data, frame->linesize, 0, frame->height, dest, destLinesize);
+    if (!scaleFrameToQImagePadded(m_swsCtx, frame, dstPixFmt, image)) {
+        qWarning() << "frameToImage: padded sws_scale failed";
+        return {};
+    }
     return image;
 }
 
@@ -6375,10 +6409,8 @@ bool VideoPlayer::decodePoolFrame(TrackDecoder *d, bool ensureRgb)
         if (image.isNull())
             return false;
 
-        uint8_t *dest[4] = { image.bits(), nullptr, nullptr, nullptr };
-        int destLinesize[4] = { static_cast<int>(image.bytesPerLine()), 0, 0, 0 };
-        sws_scale(d->swsCtx, displayable->data, displayable->linesize, 0,
-                  displayable->height, dest, destLinesize);
+        if (!scaleFrameToQImagePadded(d->swsCtx, displayable, dstPixFmt, image))
+            return false;
 
         // Commit position + frame only after the full pipeline succeeded.
         d->currentPositionUs = positionUs;

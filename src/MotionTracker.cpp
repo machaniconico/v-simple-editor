@@ -10,10 +10,12 @@
 #include <QJsonArray>
 #include <cmath>
 #include <algorithm>
+#include <cstring>
 
 extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
+#include <libavutil/imgutils.h>
 #include <libswscale/swscale.h>
 }
 
@@ -34,6 +36,34 @@ void markTrackerStopped(const MotionTracker *tracker)
 {
     QMutexLocker locker(&g_runningTrackersMutex);
     g_runningTrackers.remove(tracker);
+}
+
+bool scaleFrameToQImagePadded(SwsContext *ctx,
+                              const AVFrame *frame,
+                              AVPixelFormat dstPixFmt,
+                              QImage &image)
+{
+    if (!ctx || !frame || image.isNull())
+        return false;
+
+    const int rowBytes = av_image_get_linesize(dstPixFmt, image.width(), 0);
+    if (rowBytes <= 0 || rowBytes > image.bytesPerLine())
+        return false;
+
+    uint8_t *tmpData[4] = { nullptr, nullptr, nullptr, nullptr };
+    int tmpStride[4] = { 0, 0, 0, 0 };
+    if (av_image_alloc(tmpData, tmpStride, image.width(), image.height(),
+                       dstPixFmt, 64) < 0)
+        return false;
+
+    sws_scale(ctx, frame->data, frame->linesize, 0, frame->height,
+              tmpData, tmpStride);
+    for (int y = 0; y < image.height(); ++y) {
+        std::memcpy(image.scanLine(y), tmpData[0] + y * tmpStride[0],
+                    static_cast<std::size_t>(rowBytes));
+    }
+    av_freep(&tmpData[0]);
+    return true;
 }
 }
 
@@ -735,10 +765,8 @@ bool MotionTracker::decodeAndTrack(const QString &filePath, const QRect &initial
 
         // Convert to QImage
         QImage qimg(frameW, frameH, QImage::Format_RGB32);
-        uint8_t *dest[1] = { qimg.bits() };
-        int destLinesize[1] = { static_cast<int>(qimg.bytesPerLine()) };
-        sws_scale(swsCtx, frame->data, frame->linesize, 0,
-                  frameH, dest, destLinesize);
+        if (!scaleFrameToQImagePadded(swsCtx, frame, AV_PIX_FMT_RGB32, qimg))
+            return false;
 
         if (firstFrame) {
             // Extract template from initial rectangle

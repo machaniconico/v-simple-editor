@@ -12,10 +12,12 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <optional>
 #include <string>
 
 extern "C" {
+#include <libavutil/imgutils.h>
 #include <libswscale/swscale.h>
 }
 
@@ -34,6 +36,34 @@ bool isPlanarFrameIndexValid(const planartrack::PlanarTrack *track, int frameInd
     return track != nullptr
         && frameIndex >= 0
         && frameIndex < static_cast<int>(track->frames.size());
+}
+
+bool scaleFrameToQImagePadded(SwsContext *ctx,
+                              const AVFrame *frame,
+                              AVPixelFormat dstPixFmt,
+                              QImage &image)
+{
+    if (!ctx || !frame || image.isNull())
+        return false;
+
+    const int rowBytes = av_image_get_linesize(dstPixFmt, image.width(), 0);
+    if (rowBytes <= 0 || rowBytes > image.bytesPerLine())
+        return false;
+
+    uint8_t *tmpData[4] = { nullptr, nullptr, nullptr, nullptr };
+    int tmpStride[4] = { 0, 0, 0, 0 };
+    if (av_image_alloc(tmpData, tmpStride, image.width(), image.height(),
+                       dstPixFmt, 64) < 0)
+        return false;
+
+    sws_scale(ctx, frame->data, frame->linesize, 0, frame->height,
+              tmpData, tmpStride);
+    for (int y = 0; y < image.height(); ++y) {
+        std::memcpy(image.scanLine(y), tmpData[0] + y * tmpStride[0],
+                    static_cast<std::size_t>(rowBytes));
+    }
+    av_freep(&tmpData[0]);
+    return true;
 }
 
 }
@@ -417,10 +447,10 @@ bool VideoStabilizer::stabilizePlanarInversion(const QString &inputPath, const Q
         }
 
         QImage rawFrame(vprops.width, vprops.height, QImage::Format_RGBA8888);
-        uint8_t *rgbaDest[1] = { rawFrame.bits() };
-        int rgbaLinesize[1] = { static_cast<int>(rawFrame.bytesPerLine()) };
-        sws_scale(toRgbaCtx, frame->data, frame->linesize, 0, frame->height,
-                  rgbaDest, rgbaLinesize);
+        if (!scaleFrameToQImagePadded(toRgbaCtx, frame, AV_PIX_FMT_RGBA, rawFrame)) {
+            encodeFailed = true;
+            break;
+        }
 
         // Per-frame homography processing.
         // h264 output carries no alpha plane: the transparent crop frame

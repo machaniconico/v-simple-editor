@@ -316,10 +316,12 @@ void exporter_setAcesPipeline(const aces::AcesPipeline &pipeline);
 #include "ExtrudedMesh.h"
 #include "SoftRaster3D.h"
 #include <QPainter>
+#include <cstring>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
+#include <libavutil/imgutils.h>
 #include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
 }
@@ -1107,6 +1109,34 @@ playback::AutoProxyClip probeAutoProxyClipMetadata(const QString &filePath)
     return clip;
 }
 
+bool scaleFrameToQImagePadded(SwsContext *ctx,
+                              const AVFrame *frame,
+                              AVPixelFormat dstPixFmt,
+                              QImage &image)
+{
+    if (!ctx || !frame || image.isNull())
+        return false;
+
+    const int rowBytes = av_image_get_linesize(dstPixFmt, image.width(), 0);
+    if (rowBytes <= 0 || rowBytes > image.bytesPerLine())
+        return false;
+
+    uint8_t *tmpData[4] = { nullptr, nullptr, nullptr, nullptr };
+    int tmpStride[4] = { 0, 0, 0, 0 };
+    if (av_image_alloc(tmpData, tmpStride, image.width(), image.height(),
+                       dstPixFmt, 64) < 0)
+        return false;
+
+    sws_scale(ctx, frame->data, frame->linesize, 0, frame->height,
+              tmpData, tmpStride);
+    for (int y = 0; y < image.height(); ++y) {
+        std::memcpy(image.scanLine(y), tmpData[0] + y * tmpStride[0],
+                    static_cast<std::size_t>(rowBytes));
+    }
+    av_freep(&tmpData[0]);
+    return true;
+}
+
 QImage avFrameToQImage(const AVFrame *frame, AVCodecContext *decCtx)
 {
     if (!frame || !decCtx)
@@ -1119,9 +1149,10 @@ QImage avFrameToQImage(const AVFrame *frame, AVCodecContext *decCtx)
         return {};
 
     QImage image(frame->width, frame->height, QImage::Format_RGBA8888);
-    uint8_t *dest[4] = { image.bits(), nullptr, nullptr, nullptr };
-    int linesize[4] = { static_cast<int>(image.bytesPerLine()), 0, 0, 0 };
-    sws_scale(toRgbCtx, frame->data, frame->linesize, 0, frame->height, dest, linesize);
+    if (!scaleFrameToQImagePadded(toRgbCtx, frame, AV_PIX_FMT_RGBA, image)) {
+        sws_freeContext(toRgbCtx);
+        return {};
+    }
     sws_freeContext(toRgbCtx);
     return image;
 }
