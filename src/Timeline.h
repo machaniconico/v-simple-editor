@@ -32,6 +32,7 @@
 #include "MotionSectionWidget.h"
 #include "MaskSystem.h"      // S7: per-clip mask container (additive seam)
 #include "MotionTracker.h"   // S7: per-clip tracker data animating the mask
+#include "TimeRemap.h"
 
 // Where Timeline::addClip drops a freshly-imported clip. Persisted via
 // QSettings('VSimpleEditor','Preferences')/importPlacement; the MainWindow
@@ -220,6 +221,11 @@ struct ClipInfo {
     // comment for the integration sites.
     speedramp::SpeedRamp speedRamp = speedramp::SpeedRamp::identity();
     bool atempoEnabled = false;
+
+    // Per-clip time-remap curve. Empty keys == OFF/identity. Freeze Frame uses
+    // the existing one-key constant behavior on the split hold segment.
+    timeremap::TimeRemapCurve timeRemapCurve;
+    bool hasTimeRemap() const { return !timeRemapCurve.keys.isEmpty(); }
 
     // US-INT-4: per-frame stabilization transform keyframes baked by the
     // 編集 > スタビライズ slot. Empty = identity (no stabilization). GLPreview
@@ -456,6 +462,7 @@ public:
 
     void addClip(const QString &filePath);
     void splitAtPlayhead();
+    bool freezeFrameAtPlayhead(TimelineTrack *track = nullptr, int clipIndex = -1);
     void deleteSelectedClip();
     void rippleDeleteSelectedClip();
     bool closeGapAt(TimelineTrack *track, double timeSec);

@@ -657,6 +657,19 @@ int activeClipOnTrack(const QVector<ClipInfo> &clips, double targetSec,
     return -1;
 }
 
+double sourceSecondForClipAtLocalTime(const ClipInfo &clip, double localSec)
+{
+    const double sourceOut = (clip.outPoint > 0.0) ? clip.outPoint : clip.duration;
+    if (clip.timeRemapCurve.keys.isEmpty())
+        return clip.inPoint + localSec * clip.speed;
+
+    const double remappedLocal =
+        qMax(0.0, clip.timeRemapCurve.srcTimeAt(qMax(0.0, localSec)));
+    if (sourceOut <= clip.inPoint)
+        return clip.inPoint;
+    return qBound(clip.inPoint, clip.inPoint + remappedLocal, sourceOut);
+}
+
 QString renderClipId(int trackIdx, int clipIdx)
 {
     // RM-1.1: same shared formula as MainWindow::brushClipId and
@@ -776,12 +789,11 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
 
         const ClipInfo &v1Clip = v1Clips[v1Idx];
         v1ClipPtr = &v1Clip;
-        // Timeline-second -> source-second mapping. Mirrors Exporter
-        // (src/Exporter.cpp:413-455): playback begins at clip.inPoint and walks
-        // forward; clip.speed scales clip-local time onto the source timeline
-        // (consistent with effectiveDuration() in Timeline.h:124-127).
+        // Timeline-second -> source-second mapping. Empty time-remap curves keep
+        // the legacy inPoint + local*speed path; one-key curves resolve to the
+        // constant held source time used by computePlaybackSequence.
         const double v1LocalSec = targetSec - v1Start;            // >= 0
-        const double v1SourceSec = v1Clip.inPoint + v1LocalSec * v1Clip.speed;
+        const double v1SourceSec = sourceSecondForClipAtLocalTime(v1Clip, v1LocalSec);
         const bool v1HasKeyframes = v1Clip.keyframes.hasAnyKeyframes();
         v1Transform = v1HasKeyframes
             ? clipanim::effectiveTransformAt(v1Clip, v1LocalSec)
@@ -927,7 +939,7 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
             continue;
         const ClipInfo &c = clips[idx];
         const double localSec = targetSec - start;            // >= 0
-        const double srcSec = c.inPoint + localSec * c.speed;
+        const double srcSec = sourceSecondForClipAtLocalTime(c, localSec);
         const bool cHasKeyframes = c.keyframes.hasAnyKeyframes();
         const clipgeom::ClipTransform cTransform = cHasKeyframes
             ? clipanim::effectiveTransformAt(c, localSec)

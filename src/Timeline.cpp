@@ -3478,6 +3478,77 @@ void Timeline::splitAtPlayhead()
     }
 }
 
+bool Timeline::freezeFrameAtPlayhead(TimelineTrack *track, int clipIndex)
+{
+    if (!track) {
+        if (!clipUnderPlayhead(track, clipIndex))
+            return false;
+    }
+    if (!track || m_videoTracks.indexOf(track) < 0 || track->isLocked())
+        return false;
+    if (clipIndex < 0 || clipIndex >= track->clips().size())
+        return false;
+
+    constexpr double kEps = 1e-6;
+    const QVector<ClipInfo> beforeClips = track->clips();
+    double cursor = 0.0;
+    double clipStart = 0.0;
+    double clipEnd = 0.0;
+    bool found = false;
+    for (int i = 0; i < beforeClips.size(); ++i) {
+        const ClipInfo &clip = beforeClips[i];
+        const double start = cursor + qMax(0.0, clip.leadInSec);
+        const double end = start + clip.effectiveDuration();
+        if (i == clipIndex) {
+            clipStart = start;
+            clipEnd = end;
+            found = true;
+            break;
+        }
+        cursor = end;
+    }
+    if (!found || clipEnd - clipStart <= kEps)
+        return false;
+    if (m_playheadPos < clipStart - kEps || m_playheadPos >= clipEnd - kEps)
+        return false;
+
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    int holdIndex = clipIndex;
+    const double localSeconds = qBound(0.0, m_playheadPos - clipStart, clipEnd - clipStart);
+    if (localSeconds > kEps) {
+        const int beforeCount = track->clipCount();
+        track->splitClipAt(clipIndex, localSeconds, false);
+        if (track->clipCount() != beforeCount + 1)
+            return false;
+        holdIndex = clipIndex + 1;
+    }
+
+    QVector<ClipInfo> updated = track->clips();
+    if (holdIndex < 0 || holdIndex >= updated.size())
+        return false;
+
+    timeremap::TimeRemapCurve holdCurve;
+    holdCurve.blendMode = timeremap::FrameBlendMode::NearestFrame;
+    const bool hadTimeRemap = updated[holdIndex].hasTimeRemap();
+    holdCurve.sourceFps = hadTimeRemap && updated[holdIndex].timeRemapCurve.sourceFps > 0.0
+        ? updated[holdIndex].timeRemapCurve.sourceFps
+        : 0.0;
+    holdCurve.addKey(0.0, 0.0);
+    updated[holdIndex].timeRemapCurve = holdCurve;
+    track->setClips(updated);
+    track->setSelectedClip(holdIndex);
+
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+    saveUndoState(QStringLiteral("Freeze frame"));
+    ensureSequenceFitsViewport();
+    scheduleEmitSequenceChanged();
+    scheduleEmitSequenceChanged();
+    updateInfoLabel();
+    emit positionChanged(m_playheadPos);
+    return true;
+}
+
 void Timeline::deleteSelectedClip()
 {
     // RM-5: snapshot carrier keys BEFORE the delete so we can remap after.
@@ -4415,6 +4486,20 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     QAction *cutAct = menu.addAction(QStringLiteral("カット"));
     QAction *copyAct = menu.addAction(QStringLiteral("コピー"));
     QAction *deleteAct = menu.addAction(QStringLiteral("削除"));
+    QAction *freezeFrameAct = menu.addAction(QStringLiteral("フリーズフレームを追加"));
+    auto playheadInsideClickedClip = [&]() {
+        const auto &clips = track->clips();
+        double cursor = 0.0;
+        for (int i = 0; i < clips.size(); ++i) {
+            const double start = cursor + qMax(0.0, clips[i].leadInSec);
+            const double end = start + clips[i].effectiveDuration();
+            if (i == clipIndex)
+                return m_playheadPos >= start - 1e-6 && m_playheadPos < end - 1e-6;
+            cursor = end;
+        }
+        return false;
+    };
+    freezeFrameAct->setEnabled(playheadInsideClickedClip());
     QAction *silenceCutAct = menu.addAction(QStringLiteral("無音を自動カット..."));
     QAction *beatMarkerAct = menu.addAction(QStringLiteral("ビートでマーカー..."));
     menu.addSeparator();
@@ -4570,6 +4655,7 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     if (chosen == cutAct) cutSelectedClip();
     else if (chosen == copyAct) copySelectedClip();
     else if (chosen == deleteAct) deleteSelectedClip();
+    else if (chosen == freezeFrameAct) freezeFrameAtPlayhead(track, clipIndex);
     else if (chosen == silenceCutAct) applySilenceCutToClip(track, clipIndex);
     else if (chosen == beatMarkerAct) applyBeatMarkersToClip(track, clipIndex);
     else if (chosen == unlinkAct) unlinkClipGroup(linkGroup);
@@ -6269,6 +6355,15 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
                 iv.clipIn = c.inPoint;
                 iv.clipOut = (c.outPoint > 0.0) ? c.outPoint : c.duration;
                 iv.speed = (c.speed > 0.0) ? c.speed : 1.0;
+                if (c.timeRemapCurve.keys.size() == 1) {
+                    const double sourceOut = (c.outPoint > 0.0) ? c.outPoint : c.duration;
+                    const double holdSource =
+                        qBound(c.inPoint,
+                               c.inPoint + qMax(0.0, c.timeRemapCurve.keys.first().srcTime),
+                               sourceOut);
+                    iv.clipIn = holdSource;
+                    iv.speed = 1.0e-9;
+                }
                 iv.filePath = c.filePath;
                 iv.trackIdx = t;
                 iv.videoScale = c.videoScale;

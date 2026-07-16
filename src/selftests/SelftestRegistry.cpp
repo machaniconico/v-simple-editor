@@ -84,6 +84,7 @@ int runExportAuditSelftest();
 int runExportRangeSelftest();
 int runFrameExportSelftest();
 int runFcpxmlSelftest();
+int runFreezeFrameSelftest();
 int runFrameIoSelftest();
 int runGradeWheelWiringSelftest();
 int runGraphEditorSelftest();
@@ -618,6 +619,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Adjustment clip model: V1-wins z-order, behind-only effect stack, byte-identical off path, JSON true-only persistence" },
     { "frame-export",      "VEDITOR_FRAME_EXPORT_SELFTEST",        runFrameExportSelftest,        true,
       "Still-frame export: renderFrameAt SSOT -> PNG/JPEG save engine + PNG pixel-identical reread" },
+    { "freeze-frame",      "VEDITOR_FREEZE_FRAME_SELFTEST",        runFreezeFrameSelftest,        true,
+      "Freeze Frame: split at playhead, one-key hold curve, renderFrameAt export hold, save/load sync, one-step undo" },
     { "clip-curves",       "VEDITOR_CLIP_CURVES_SELFTEST",         runClipCurvesSelftest,         true,
       "Clip RGB/Luma curves: unset/identity byte identity, renderFrameAt reflection, ProjectFile round-trip" },
     { "clip-lut",          "VEDITOR_CLIP_LUT_SELFTEST",            runClipLutSelftest,            true,

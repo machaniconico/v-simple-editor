@@ -994,6 +994,21 @@ double clipEffectiveSourceFps(const VideoSourceInfo &info, double fallback)
     return (info.fps > 0.0) ? info.fps : qMax(1.0, fallback);
 }
 
+bool timelineHasClipTimeRemap(const Timeline *timeline)
+{
+    if (!timeline)
+        return false;
+    for (const auto *track : timeline->videoTracks()) {
+        if (!track)
+            continue;
+        for (const ClipInfo &clip : track->clips()) {
+            if (clip.hasTimeRemap())
+                return true;
+        }
+    }
+    return false;
+}
+
 QString trackMatteTypeLabel(TrackMatteType type)
 {
     switch (type) {
@@ -2271,6 +2286,39 @@ void syncTrackMatteEntriesToTimeline(
     timeline->setTrackMatteEntries(out);
 }
 
+void syncTimeRemapEntriesToTimelineImpl(
+    Timeline *timeline,
+    const QHash<QString, TimeRemapClipEntry> &source)
+{
+    if (!timeline)
+        return;
+
+    bool anyChanged = false;
+    const QVector<TimelineTrack *> tracks = timeline->videoTracks();
+    for (int trackIdx = 0; trackIdx < tracks.size(); ++trackIdx) {
+        TimelineTrack *track = tracks[trackIdx];
+        if (!track)
+            continue;
+        QVector<ClipInfo> clips = track->clips();
+        bool trackChanged = false;
+        for (int clipIdx = 0; clipIdx < clips.size(); ++clipIdx) {
+            const QString clipId = trackMatteClipKey(trackIdx, clipIdx);
+            const auto it = source.constFind(clipId);
+            if (it == source.cend())
+                continue;
+            clips[clipIdx].timeRemapCurve = it.value().curve;
+            trackChanged = true;
+        }
+        if (trackChanged) {
+            track->setClips(clips);
+            anyChanged = true;
+        }
+    }
+
+    if (anyChanged)
+        timeline->refreshPlaybackSequence();
+}
+
 // RM-1.2 / RM-4: snapshotTrackClips and remapTrackMatteEntriesAfterMutation
 // are defined in TrackMatteKey.cpp (hoisted for testability). The types
 // ClipKeyId and TrackClipSnapshot are declared in TrackMatteKey.h.
@@ -2549,6 +2597,13 @@ LoudnessMeasureResult measureTimelineLoudness(const QVector<PlaybackEntry> &entr
 }
 
 } // namespace
+
+void syncTimeRemapEntriesToTimeline(
+    Timeline *timeline,
+    const QHash<QString, TimeRemapClipEntry> &source)
+{
+    syncTimeRemapEntriesToTimelineImpl(timeline, source);
+}
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
@@ -6750,6 +6805,7 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
             hasActiveSpecialData = hasActiveSpecialData
                 || m_rotoClipEntries.contains(clipId)
                 || m_timeRemapClipEntries.contains(clipId)
+                || clip.hasTimeRemap()
                 || m_trackMatteClipEntries.contains(clipId)
                 || m_text3DClipConfigs.contains(clipId)
                 || m_clipExpressionBindings.contains(clipId)
@@ -6763,8 +6819,10 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
             QImage frame;
             int sourceFrameIndex = 0;
             auto trIt = m_timeRemapClipEntries.constFind(clipId);
-            if (trIt != m_timeRemapClipEntries.cend()) {
-                timeremap::TimeRemapCurve curve = trIt.value().curve;
+            if (trIt != m_timeRemapClipEntries.cend() || clip.hasTimeRemap()) {
+                timeremap::TimeRemapCurve curve = (trIt != m_timeRemapClipEntries.cend())
+                    ? trIt.value().curve
+                    : clip.timeRemapCurve;
                 if (curve.sourceFps <= 0.0)
                     curve.sourceFps = fps;
                 sourceFrameIndex = qMax(0, static_cast<int>(std::llround(
@@ -6951,6 +7009,7 @@ void MainWindow::refreshSpecialClipPreview()
         if (it.value().enabled) { anyWiggleEnabled = true; break; }
     }
     if (m_rotoClipEntries.isEmpty() && m_timeRemapClipEntries.isEmpty()
+        && !timelineHasClipTimeRemap(m_timeline)
         && m_trackMatteClipEntries.isEmpty() && m_text3DClipConfigs.isEmpty()
         && m_clipExpressionBindings.isEmpty() && !anyWiggleEnabled) {
         if (!m_player->isPlaying()) {
@@ -6989,8 +7048,28 @@ void MainWindow::populateProjectData(ProjectData &data)
     std::sort(data.rotoClipEntries.begin(), data.rotoClipEntries.end(),
               [](const RotoClipEntry &a, const RotoClipEntry &b) { return a.clipId < b.clipId; });
     data.timeRemapClipEntries.clear();
-    for (auto it = m_timeRemapClipEntries.cbegin(); it != m_timeRemapClipEntries.cend(); ++it)
+    QHash<QString, bool> exportedTimeRemapIds;
+    for (auto it = m_timeRemapClipEntries.cbegin(); it != m_timeRemapClipEntries.cend(); ++it) {
         data.timeRemapClipEntries.append(it.value());
+        exportedTimeRemapIds.insert(it.key(), true);
+    }
+    const auto &videoTracks = data.videoTracks;
+    for (int trackIdx = 0; trackIdx < videoTracks.size(); ++trackIdx) {
+        const auto &clips = videoTracks[trackIdx];
+        for (int clipIdx = 0; clipIdx < clips.size(); ++clipIdx) {
+            const ClipInfo &clip = clips[clipIdx];
+            if (!clip.hasTimeRemap())
+                continue;
+            const QString clipId = brushClipId(trackIdx, clipIdx);
+            if (exportedTimeRemapIds.contains(clipId))
+                continue;
+            TimeRemapClipEntry entry;
+            entry.clipId = clipId;
+            entry.curve = clip.timeRemapCurve;
+            data.timeRemapClipEntries.append(entry);
+            exportedTimeRemapIds.insert(clipId, true);
+        }
+    }
     std::sort(data.timeRemapClipEntries.begin(), data.timeRemapClipEntries.end(),
               [](const TimeRemapClipEntry &a, const TimeRemapClipEntry &b) { return a.clipId < b.clipId; });
     data.trackMatteClipEntries.clear();
@@ -7238,9 +7317,11 @@ void MainWindow::applyLoadedProjectData(const ProjectData &data, const QString &
             ? QSize(data.config.width, data.config.height)
             : QSize());
     }
-    if (m_timeline)
+    if (m_timeline) {
         m_timeline->restoreFromProject(data.videoTracks, data.audioTracks,
                                        data.playheadPos, data.markIn, data.markOut, data.zoomLevel);
+        syncTimeRemapEntriesToTimeline(m_timeline, m_timeRemapClipEntries);
+    }
 
     rebuildAudioMeters();
     applyAudioState(data);
@@ -11308,6 +11389,8 @@ void MainWindow::openTimeRemapDialog()
     const QString clipId = brushClipId(trackIdx, clipIdx);
     TimeRemapClipEntry entry = m_timeRemapClipEntries.value(clipId);
     entry.clipId = clipId;
+    if (entry.curve.keys.isEmpty() && clip.hasTimeRemap())
+        entry.curve = clip.timeRemapCurve;
     if (entry.curve.sourceFps <= 0.0)
         entry.curve.sourceFps = fps;
 
@@ -11326,6 +11409,7 @@ void MainWindow::openTimeRemapDialog()
     if (entry.curve.sourceFps <= 0.0)
         entry.curve.sourceFps = fps;
     m_timeRemapClipEntries.insert(clipId, entry);
+    syncTimeRemapEntriesToTimeline(m_timeline, m_timeRemapClipEntries);
 
     refreshSpecialClipPreview();
     statusBar()->showMessage(QStringLiteral("タイムリマップを %1 に保存しました").arg(clip.displayName), 4000);
