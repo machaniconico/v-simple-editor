@@ -12422,9 +12422,223 @@ void MainWindow::editExpressions()
     statusBar()->showMessage(QString("Expression set: %1 = %2").arg(propName, code));
 }
 
+namespace {
+
+constexpr double kPrecomposeEps = 1.0e-6;
+
+struct PrecomposeSpan {
+    int index = -1;
+    double startSec = 0.0;
+    double endSec = 0.0;
+    ClipInfo clip;
+};
+
+struct PositionedClip {
+    double startSec = 0.0;
+    int order = 0;
+    ClipInfo clip;
+};
+
+struct PrecomposeSelection {
+    bool hasVideo = false;
+    bool hasAudio = false;
+    int firstVideoTrack = -1;
+    int firstAudioTrack = -1;
+    double startSec = std::numeric_limits<double>::max();
+    double endSec = 0.0;
+};
+
+QVector<PrecomposeSpan> precomposeSpansForTrack(const TimelineTrack *track)
+{
+    QVector<PrecomposeSpan> spans;
+    if (!track)
+        return spans;
+
+    const QVector<ClipInfo> &clips = track->clips();
+    spans.reserve(clips.size());
+    double cursor = 0.0;
+    for (int i = 0; i < clips.size(); ++i) {
+        const ClipInfo &clip = clips[i];
+        cursor += qMax(0.0, clip.leadInSec);
+        const double dur = qMax(0.0, clip.effectiveDuration());
+        PrecomposeSpan span;
+        span.index = i;
+        span.startSec = cursor;
+        span.endSec = cursor + dur;
+        span.clip = clip;
+        spans.append(span);
+        cursor = span.endSec;
+    }
+    return spans;
+}
+
+void extendPrecomposeSelection(const QVector<TimelineTrack *> &tracks,
+                               bool video,
+                               PrecomposeSelection &selection)
+{
+    for (int trackIndex = 0; trackIndex < tracks.size(); ++trackIndex) {
+        const TimelineTrack *track = tracks[trackIndex];
+        if (!track)
+            continue;
+
+        const QList<int> selected = track->selectedClips();
+        if (selected.isEmpty())
+            continue;
+
+        const QVector<PrecomposeSpan> spans = precomposeSpansForTrack(track);
+        for (int selectedIndex : selected) {
+            for (const PrecomposeSpan &span : spans) {
+                if (span.index != selectedIndex)
+                    continue;
+                if (span.endSec <= span.startSec + kPrecomposeEps)
+                    continue;
+                if (video) {
+                    selection.hasVideo = true;
+                    if (selection.firstVideoTrack < 0)
+                        selection.firstVideoTrack = trackIndex;
+                } else {
+                    selection.hasAudio = true;
+                    if (selection.firstAudioTrack < 0)
+                        selection.firstAudioTrack = trackIndex;
+                }
+                selection.startSec = qMin(selection.startSec, span.startSec);
+                selection.endSec = qMax(selection.endSec, span.endSec);
+                break;
+            }
+        }
+    }
+}
+
+bool precomposeIntersects(double aStart, double aEnd, double bStart, double bEnd)
+{
+    return aStart < bEnd - kPrecomposeEps && aEnd > bStart + kPrecomposeEps;
+}
+
+ClipInfo precomposeSliceClip(const ClipInfo &clip,
+                             double clipStartSec,
+                             double keepStartSec,
+                             double keepEndSec)
+{
+    ClipInfo sliced = clip;
+    const double speed = qMax(0.001, clip.speed);
+    const double sourceStart = clip.inPoint;
+    const double sourceEnd = (clip.outPoint > 0.0) ? clip.outPoint : clip.duration;
+    const double localStart = qMax(0.0, keepStartSec - clipStartSec);
+    const double localEnd = qMax(localStart, keepEndSec - clipStartSec);
+    sliced.inPoint = qBound(sourceStart, sourceStart + localStart * speed, sourceEnd);
+    sliced.outPoint = qBound(sliced.inPoint, sourceStart + localEnd * speed, sourceEnd);
+    sliced.leadInSec = 0.0;
+    if (localStart > kPrecomposeEps)
+        sliced.leadIn = Transition{};
+    if (localEnd < clip.effectiveDuration() - kPrecomposeEps)
+        sliced.trailOut = Transition{};
+    return sliced;
+}
+
+QVector<ClipInfo> precomposeClipsFromPositioned(QVector<PositionedClip> positioned)
+{
+    std::sort(positioned.begin(), positioned.end(),
+              [](const PositionedClip &a, const PositionedClip &b) {
+                  if (!qFuzzyCompare(a.startSec + 1.0, b.startSec + 1.0))
+                      return a.startSec < b.startSec;
+                  return a.order < b.order;
+              });
+
+    QVector<ClipInfo> clips;
+    clips.reserve(positioned.size());
+    double cursor = 0.0;
+    for (const PositionedClip &item : positioned) {
+        ClipInfo clip = item.clip;
+        clip.leadInSec = qMax(0.0, item.startSec - cursor);
+        clips.append(clip);
+        cursor = qMax(cursor, item.startSec) + qMax(0.0, clip.effectiveDuration());
+    }
+    return clips;
+}
+
+struct PrecomposeTrackResult {
+    QVector<ClipInfo> parentClips;
+    QVector<ClipInfo> nestedClips;
+    bool extracted = false;
+};
+
+PrecomposeTrackResult precomposeTrack(const TimelineTrack *track,
+                                      bool extractRange,
+                                      bool insertNestedClip,
+                                      const ClipInfo &nestedClip,
+                                      double rangeStartSec,
+                                      double rangeEndSec)
+{
+    QVector<PositionedClip> parent;
+    QVector<PositionedClip> nested;
+    int order = 0;
+
+    const QVector<PrecomposeSpan> spans = precomposeSpansForTrack(track);
+    parent.reserve(spans.size() + (insertNestedClip ? 1 : 0));
+    nested.reserve(spans.size());
+
+    for (const PrecomposeSpan &span : spans) {
+        if (!extractRange
+            || !precomposeIntersects(span.startSec, span.endSec,
+                                     rangeStartSec, rangeEndSec)) {
+            parent.append({span.startSec, order++, span.clip});
+            continue;
+        }
+
+        const double overlapStart = qMax(span.startSec, rangeStartSec);
+        const double overlapEnd = qMin(span.endSec, rangeEndSec);
+        if (overlapEnd > overlapStart + kPrecomposeEps) {
+            nested.append({overlapStart - rangeStartSec,
+                           order++,
+                           precomposeSliceClip(span.clip, span.startSec,
+                                               overlapStart, overlapEnd)});
+        }
+
+        if (span.startSec < rangeStartSec - kPrecomposeEps) {
+            parent.append({span.startSec,
+                           order++,
+                           precomposeSliceClip(span.clip, span.startSec,
+                                               span.startSec, rangeStartSec)});
+        }
+        if (span.endSec > rangeEndSec + kPrecomposeEps) {
+            parent.append({rangeEndSec,
+                           order++,
+                           precomposeSliceClip(span.clip, span.startSec,
+                                               rangeEndSec, span.endSec)});
+        }
+    }
+
+    if (insertNestedClip)
+        parent.append({rangeStartSec, order++, nestedClip});
+
+    PrecomposeTrackResult result;
+    result.parentClips = precomposeClipsFromPositioned(parent);
+    result.nestedClips = precomposeClipsFromPositioned(nested);
+    result.extracted = !nested.isEmpty();
+    return result;
+}
+
+QString uniquePrecomposeSequenceId(Timeline *timeline)
+{
+    QSet<QString> used;
+    if (timeline) {
+        for (const TimelineSequence &sequence : timeline->sequences())
+            used.insert(sequence.id);
+    }
+
+    for (int i = 1; i < 100000; ++i) {
+        const QString id = QStringLiteral("precomp-%1").arg(i);
+        if (!used.contains(id))
+            return id;
+    }
+    return QStringLiteral("precomp-%1").arg(QDateTime::currentMSecsSinceEpoch());
+}
+
+} // namespace
+
 void MainWindow::precomposeSelected()
 {
-    if (!m_timeline->hasSelection()) {
+    if (!m_timeline || !m_timeline->hasAnySelection()) {
         QMessageBox::information(this, "Pre-Compose", "Select clips first.");
         return;
     }
@@ -12432,12 +12646,126 @@ void MainWindow::precomposeSelected()
     bool ok;
     QString name = QInputDialog::getText(this, "Pre-Compose",
         "Composition name:", QLineEdit::Normal, "Comp 1", &ok);
+    name = name.trimmed();
     if (!ok || name.isEmpty()) return;
 
-    int compId = m_precomposeManager.createComposition(name,
-        m_projectConfig.width, m_projectConfig.height,
-        m_projectConfig.fps, 10.0);
-    statusBar()->showMessage(QString("Created composition: %1 (ID: %2)").arg(name).arg(compId));
+    PrecomposeSelection selection;
+    extendPrecomposeSelection(m_timeline->videoTracks(), true, selection);
+    extendPrecomposeSelection(m_timeline->audioTracks(), false, selection);
+    if ((!selection.hasVideo && !selection.hasAudio)
+        || selection.endSec <= selection.startSec + kPrecomposeEps) {
+        QMessageBox::information(this, "Pre-Compose", "Select a non-empty range first.");
+        return;
+    }
+
+    const QString sequenceId = uniquePrecomposeSequenceId(m_timeline);
+    TimelineSequence sequence;
+    sequence.id = sequenceId;
+    sequence.name = name;
+
+    const int videoTrackCount = m_timeline->videoTrackCount();
+    const int audioTrackCount = m_timeline->audioTrackCount();
+    sequence.videoTracks.resize(videoTrackCount);
+    sequence.audioTracks.resize(audioTrackCount);
+
+    const double rangeDuration = selection.endSec - selection.startSec;
+    ClipInfo nestedClip;
+    nestedClip.sequenceRefId = sequenceId;
+    nestedClip.filePath = timeline_nesting::sequenceClipFilePath(sequenceId);
+    nestedClip.displayName = name;
+    nestedClip.duration = rangeDuration;
+    nestedClip.outPoint = rangeDuration;
+    nestedClip.speed = 1.0;
+    nestedClip.volume = 1.0;
+    nestedClip.opacity = 1.0;
+
+    QVector<QVector<ClipInfo>> parentVideoTracks;
+    QVector<QVector<ClipInfo>> parentAudioTracks;
+    parentVideoTracks.reserve(videoTrackCount);
+    parentAudioTracks.reserve(audioTrackCount);
+
+    bool extractedAny = false;
+    for (int i = 0; i < videoTrackCount; ++i) {
+        const PrecomposeTrackResult result = precomposeTrack(
+            m_timeline->videoTracks().value(i, nullptr),
+            selection.hasVideo,
+            selection.hasVideo && i == selection.firstVideoTrack,
+            nestedClip,
+            selection.startSec,
+            selection.endSec);
+        parentVideoTracks.append(result.parentClips);
+        sequence.videoTracks[i] = result.nestedClips;
+        extractedAny = extractedAny || result.extracted;
+    }
+
+    for (int i = 0; i < audioTrackCount; ++i) {
+        const PrecomposeTrackResult result = precomposeTrack(
+            m_timeline->audioTracks().value(i, nullptr),
+            selection.hasAudio,
+            selection.hasAudio && i == selection.firstAudioTrack,
+            nestedClip,
+            selection.startSec,
+            selection.endSec);
+        parentAudioTracks.append(result.parentClips);
+        sequence.audioTracks[i] = result.nestedClips;
+        extractedAny = extractedAny || result.extracted;
+    }
+
+    if (!extractedAny) {
+        QMessageBox::information(this, "Pre-Compose", "No clips were found in the selected range.");
+        return;
+    }
+
+    if (!m_timeline->addSequence(sequence)) {
+        QMessageBox::warning(this, "Pre-Compose", "Could not create a nested sequence.");
+        return;
+    }
+
+    for (int i = 0; i < parentVideoTracks.size(); ++i) {
+        if (TimelineTrack *track = m_timeline->videoTracks().value(i, nullptr))
+            track->setClips(parentVideoTracks[i]);
+    }
+    for (int i = 0; i < parentAudioTracks.size(); ++i) {
+        if (TimelineTrack *track = m_timeline->audioTracks().value(i, nullptr))
+            track->setClips(parentAudioTracks[i]);
+    }
+
+    auto clearSelections = [](const QVector<TimelineTrack *> &tracks) {
+        for (TimelineTrack *track : tracks) {
+            if (track)
+                track->clearClipSelection();
+        }
+    };
+    auto selectNestedClip = [&sequenceId](TimelineTrack *track) {
+        if (!track)
+            return;
+        const QVector<ClipInfo> &clips = track->clips();
+        for (int i = 0; i < clips.size(); ++i) {
+            if (clips[i].sequenceRefId == sequenceId
+                || timeline_nesting::sequenceIdFromClipFilePath(clips[i].filePath) == sequenceId) {
+                track->setSelectedClip(i);
+                return;
+            }
+        }
+    };
+    clearSelections(m_timeline->videoTracks());
+    clearSelections(m_timeline->audioTracks());
+    if (selection.hasVideo)
+        selectNestedClip(m_timeline->videoTracks().value(selection.firstVideoTrack, nullptr));
+    else if (selection.hasAudio)
+        selectNestedClip(m_timeline->audioTracks().value(selection.firstAudioTrack, nullptr));
+
+    if (m_timeline->undoManager())
+        m_timeline->undoManager()->saveState(
+            m_timeline->currentState(),
+            QStringLiteral("Pre-compose: %1").arg(name));
+
+    m_timeline->refreshPlaybackSequence();
+    setWindowModified(true);
+    statusBar()->showMessage(
+        QStringLiteral("Pre-composed %1 into nested sequence '%2'")
+            .arg(QString::number(rangeDuration, 'f', 2) + QStringLiteral("s"), name),
+        5000);
 }
 
 void MainWindow::showResourceGuide()

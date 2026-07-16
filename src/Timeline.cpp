@@ -28,6 +28,9 @@
 #include <QJsonDocument>
 #include <QJsonValue>
 #include <QMessageBox>
+#include <QPushButton>
+#include <QSizePolicy>
+#include <QSpacerItem>
 #include <QStringList>
 
 // STAGE4B: PlaybackEntry::matteTypeOrdinal stores TrackMatteType as a plain int
@@ -415,6 +418,103 @@ bool sequencesFromStoreJson(const QJsonObject &store,
     if (activeSequenceIdOut)
         *activeSequenceIdOut = active;
     return true;
+}
+
+constexpr char kBreadcrumbBarObjectName[] = "TimelineBreadcrumbBar";
+constexpr char kBreadcrumbPathProperty[] = "_veditor_breadcrumb_path";
+
+QString sequenceNameForBreadcrumb(const Timeline *timeline, const QString &sequenceId)
+{
+    if (!timeline)
+        return sequenceId;
+    for (const TimelineSequence &sequence : timeline->sequences()) {
+        if (sequence.id == sequenceId) {
+            if (!sequence.name.trimmed().isEmpty())
+                return sequence.name;
+            break;
+        }
+    }
+    if (sequenceId == QLatin1String(kDefaultSequenceId))
+        return QStringLiteral("Main");
+    return sequenceId;
+}
+
+QStringList breadcrumbPathForTimeline(const Timeline *timeline)
+{
+    return timeline
+        ? timeline->property(kBreadcrumbPathProperty).toStringList()
+        : QStringList{};
+}
+
+void setBreadcrumbPathForTimeline(Timeline *timeline, const QStringList &path)
+{
+    if (timeline)
+        timeline->setProperty(kBreadcrumbPathProperty, path);
+}
+
+void rebuildTimelineBreadcrumbBar(Timeline *timeline)
+{
+    if (!timeline)
+        return;
+    QWidget *bar = timeline->findChild<QWidget *>(
+        QString::fromLatin1(kBreadcrumbBarObjectName));
+    if (!bar || !bar->layout())
+        return;
+
+    QString active = timeline->activeSequenceId();
+    QStringList path = breadcrumbPathForTimeline(timeline);
+    if (active.isEmpty()) {
+        path.clear();
+    } else if (path.isEmpty()) {
+        path.append(active);
+    } else if (path.last() != active) {
+        const int existing = path.indexOf(active);
+        if (existing >= 0)
+            path = path.mid(0, existing + 1);
+        else
+            path.append(active);
+    }
+    setBreadcrumbPathForTimeline(timeline, path);
+
+    QLayout *layout = bar->layout();
+    while (QLayoutItem *item = layout->takeAt(0)) {
+        if (QWidget *widget = item->widget())
+            delete widget;
+        delete item;
+    }
+
+    bar->setVisible(path.size() > 1);
+    if (path.size() <= 1)
+        return;
+
+    for (int i = 0; i < path.size(); ++i) {
+        if (i > 0) {
+            auto *sep = new QLabel(QStringLiteral(">"), bar);
+            sep->setStyleSheet(QStringLiteral("color: #888; padding: 0 2px;"));
+            layout->addWidget(sep);
+        }
+
+        const QString sequenceId = path[i];
+        auto *button = new QPushButton(sequenceNameForBreadcrumb(timeline, sequenceId), bar);
+        button->setFlat(true);
+        button->setCursor(Qt::PointingHandCursor);
+        button->setStyleSheet(
+            QStringLiteral("QPushButton { background: transparent; color: #d8e6ff; border: none; padding: 1px 4px; }"
+                           "QPushButton:hover { color: white; text-decoration: underline; }"));
+        button->setEnabled(i + 1 < path.size());
+        QObject::connect(button, &QPushButton::clicked, timeline,
+                         [timeline, sequenceId, i]() {
+            if (!timeline || !timeline->setActiveSequence(sequenceId))
+                return;
+            QStringList newPath = breadcrumbPathForTimeline(timeline);
+            if (newPath.size() > i + 1)
+                newPath = newPath.mid(0, i + 1);
+            setBreadcrumbPathForTimeline(timeline, newPath);
+            rebuildTimelineBreadcrumbBar(timeline);
+        });
+        layout->addWidget(button);
+    }
+    layout->addItem(new QSpacerItem(0, 0, QSizePolicy::Expanding, QSizePolicy::Minimum));
 }
 } // namespace
 
@@ -2729,7 +2829,16 @@ void Timeline::setupUI()
     auto *infoRow = new QHBoxLayout();
     m_infoLabel = new QLabel("Timeline", this);
     m_infoLabel->setStyleSheet("font-weight: bold; color: #ccc;");
-    infoRow->addWidget(m_infoLabel, 1);
+    infoRow->addWidget(m_infoLabel);
+
+    auto *breadcrumbBar = new QWidget(this);
+    breadcrumbBar->setObjectName(QString::fromLatin1(kBreadcrumbBarObjectName));
+    breadcrumbBar->setVisible(false);
+    breadcrumbBar->setStyleSheet(QStringLiteral("background: transparent;"));
+    auto *breadcrumbLayout = new QHBoxLayout(breadcrumbBar);
+    breadcrumbLayout->setContentsMargins(4, 0, 4, 0);
+    breadcrumbLayout->setSpacing(2);
+    infoRow->addWidget(breadcrumbBar, 1);
 
     // Track row-height controls. The minus/plus buttons let the user resize
     // every track in 10 px steps (clamped to 30..200) for dense or expanded
@@ -2755,6 +2864,7 @@ void Timeline::setupUI()
     infoRow->addWidget(rowPlus);
 
     layout->addLayout(infoRow);
+    rebuildTimelineBreadcrumbBar(this);
 
     // Horizontal split: [frozen header column | scrollable tracks area].
     // Track headers (mute/hide buttons + label) live in the header column on
@@ -6104,6 +6214,50 @@ void Timeline::onTrackClipClicked(int index)
 
 bool Timeline::eventFilter(QObject *watched, QEvent *event)
 {
+    if (event->type() == QEvent::MouseButtonDblClick) {
+        auto *track = qobject_cast<TimelineTrack *>(watched);
+        auto *me = static_cast<QMouseEvent *>(event);
+        if (track && me->button() == Qt::LeftButton) {
+            const int clipIndex = track->clipAtX(me->position().toPoint().x());
+            const QVector<ClipInfo> &clips = track->clips();
+            if (clipIndex >= 0 && clipIndex < clips.size()
+                && clips[clipIndex].isSequenceReference()) {
+                const QString sequenceId = resolveSequenceRefId(clips[clipIndex]);
+                if (!sequenceId.isEmpty() && sequenceById(sequenceId)) {
+                    QStringList path = breadcrumbPathForTimeline(this);
+                    QString active = m_activeSequenceId;
+                    if (active.isEmpty())
+                        active = QString::fromLatin1(kDefaultSequenceId);
+                    if (path.isEmpty())
+                        path.append(active);
+                    const int existing = path.indexOf(sequenceId);
+                    if (existing >= 0)
+                        path = path.mid(0, existing + 1);
+                    else
+                        path.append(sequenceId);
+                    setBreadcrumbPathForTimeline(this, path);
+                    if (setActiveSequence(sequenceId)) {
+                        rebuildTimelineBreadcrumbBar(this);
+                        emit statusMessageRequested(
+                            QStringLiteral("Opened nested sequence: %1")
+                                .arg(sequenceNameForBreadcrumb(this, sequenceId)),
+                            3000);
+                        return true;
+                    }
+                }
+                emit statusMessageRequested(
+                    QStringLiteral("Nested sequence is missing."),
+                    3000);
+                return true;
+            }
+        }
+    }
+
+    if (qobject_cast<TimelineTrack *>(watched)
+        && event->type() == QEvent::MouseButtonPress) {
+        return QWidget::eventFilter(watched, event);
+    }
+
     if (event->type() == QEvent::MouseButtonPress) {
         auto *me = static_cast<QMouseEvent *>(event);
         if (me->button() == Qt::RightButton && m_videoTrack) {
@@ -6137,6 +6291,9 @@ bool Timeline::eventFilter(QObject *watched, QEvent *event)
 
 void Timeline::wireTrackSelection(TimelineTrack *track)
 {
+    if (track)
+        track->installEventFilter(this);
+
     connect(track, &TimelineTrack::selectionChanged, this, [this, track](int index, bool additive) {
         if (m_inLinkedSelectionSync) return;
         m_inLinkedSelectionSync = true;
@@ -7254,11 +7411,37 @@ bool Timeline::setActiveSequence(const QString &sequenceId)
 
     const TimelineSequence targetCopy = *target;
     m_activeSequenceId = sequenceId;
-    restoreFromProject(targetCopy.videoTracks, targetCopy.audioTracks,
-                       m_playheadPos, m_markIn, m_markOut, int(m_zoomLevel));
+    while (m_videoTracks.size() < targetCopy.videoTracks.size())
+        addVideoTrack();
+    while (m_audioTracks.size() < targetCopy.audioTracks.size())
+        addAudioTrack();
+
+    for (int i = 0; i < m_videoTracks.size(); ++i) {
+        if (!m_videoTracks[i])
+            continue;
+        const QVector<ClipInfo> clips = (i < targetCopy.videoTracks.size())
+            ? targetCopy.videoTracks[i]
+            : QVector<ClipInfo>{};
+        m_videoTracks[i]->setClips(clips);
+    }
+    for (int i = 0; i < m_audioTracks.size(); ++i) {
+        if (!m_audioTracks[i])
+            continue;
+        const QVector<ClipInfo> clips = (i < targetCopy.audioTracks.size())
+            ? targetCopy.audioTracks[i]
+            : QVector<ClipInfo>{};
+        m_audioTracks[i]->setClips(clips);
+    }
+
     m_activeSequenceId = sequenceId;
     m_sequenceModelEnabled = true;
+    clearAllSelections();
     syncActiveSequenceFromCurrentTracks();
+    updateInfoLabel();
+    ensureSequenceFitsViewport();
+    scheduleEmitSequenceChanged();
+    scheduleEmitSequenceChanged();
+    rebuildTimelineBreadcrumbBar(this);
     return true;
 }
 
@@ -7341,6 +7524,7 @@ void Timeline::setClipParentEntries(const QHash<QString, QString> &entries)
         m_activeSequenceId.clear();
         m_sequenceModelEnabled = false;
     }
+    rebuildTimelineBreadcrumbBar(this);
 }
 
 QHash<QString, QString> Timeline::clipParentEntries() const
@@ -7455,6 +7639,7 @@ void Timeline::restoreState(const TimelineState &state)
         m_audioTracks[i]->update();
     }
     setClipParentEntries(state.clipParentEntries);
+    rebuildTimelineBreadcrumbBar(this);
 
     // Clear every track's UI selection (via blockSignals so we don't emit
     // a cascade of intermediate selectionChanged signals from stale tracks).
