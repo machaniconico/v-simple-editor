@@ -86,6 +86,7 @@ int runFrameExportSelftest();
 int runFcpxmlSelftest();
 int runFreezeFrameSelftest();
 int runFrameIoSelftest();
+int runGradeKeyframeSelftest();
 int runGradeWheelWiringSelftest();
 int runGraphEditorSelftest();
 int runGradeLggSerializationSelftest();
@@ -652,6 +653,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Text letter/line spacing: default byte-identical, spacing widens render, toJson/fromJson roundtrip" },
     { "grade-wheel-wiring", "VEDITOR_GRADE_WHEEL_WIRING_SELFTEST", runGradeWheelWiringSelftest, true,
       "LGG wheels + WB -> per-clip ColorCorrection wiring: value mapping, restore, render reflection" },
+    { "grade-keyframe", "VEDITOR_GRADE_KEYFRAME_SELFTEST", runGradeKeyframeSelftest, true,
+      "ColorCorrection grade.* keyframes: render evaluation, byte identity, undo, and roundtrip" },
     { "graph-editor", "VEDITOR_GRAPH_EDITOR_SELFTEST", runGraphEditorSelftest, true,
       "GraphEditor model roundtrip, panel-edit undo restore, and ClipAnim evaluation parity" },
     { "nest-sequence", "VEDITOR_NEST_SEQUENCE_SELFTEST", runNestSequenceSelftest, true,

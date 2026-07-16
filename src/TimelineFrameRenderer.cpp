@@ -289,9 +289,13 @@ QImage decodeClipFrameNative(const QString &filePath, double sourceSec)
 // renderFrameAt (scale + ARGB32_Premultiplied composite) expects the same
 // Format_RGBA8888 the decoder produced, so the graded result is converted back
 // to RGBA8888 before return — keeping the contract S2/S3 rely on.
-QImage gradeClipNativeFrame(const QImage &native, const ClipInfo &clip)
+QImage gradeClipNativeFrame(const QImage &native,
+                            const ClipInfo &clip,
+                            double clipLocalSeconds)
 {
-    const bool hasColor = !clip.colorCorrection.isDefault();
+    const ColorCorrection effectiveColor =
+        clipanim::effectiveColorCorrectionAt(clip, clipLocalSeconds);
+    const bool hasColor = !effectiveColor.isDefault();
     const bool hasHsl = clip.hslSecondary.isActive();
     const bool hasCurves = clip.colorCurves.hasCurves();
     const bool hasLut   = clip.hasLut();
@@ -309,7 +313,7 @@ QImage gradeClipNativeFrame(const QImage &native, const ClipInfo &clip)
     // applyColorCorrection too, but the hasColor guard keeps the RGB888
     // round-trip out of the LUT-only path.
     if (hasColor)
-        img = VideoEffectProcessor::applyColorCorrection(img, clip.colorCorrection);
+        img = VideoEffectProcessor::applyColorCorrection(img, effectiveColor);
 
     // Stage 3 — RGB/Luma curves via the CPU twin of GLPreview's uCurveLut
     // shader math. Runs on colour-graded pixels and before the .cube LUT.
@@ -964,7 +968,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         // grading happens per source pixel, independent of canvas scale. For a
         // clip with default colour and no LUT this is a strict no-op so a lone V1
         // clip stays byte-identical to S2.
-        const QImage v1Graded = gradeClipNativeFrame(v1NativeRaw, v1Clip);
+        const QImage v1Graded =
+            gradeClipNativeFrame(v1NativeRaw, v1Clip, v1LocalSec);
 
         // S5: apply the V1 clip's FX pack on the GRADED native frame — the preview
         // shader runs the FX uniforms AFTER the CC+LUT block closes
@@ -1130,7 +1135,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         // through (same CC -> LUT -> FX -> MASK per-clip order as V1). No-op
         // for un-masked overlays, so S3's multi-track MSE stays ~0.
         QImage nativeForMask =
-            applyClipFxPack(gradeClipNativeFrame(nativeRaw, c), c, localSec);
+            applyClipFxPack(gradeClipNativeFrame(nativeRaw, c, localSec),
+                            c, localSec);
         if (c.hasMask()
             && (hdrexport16::enabledFromEnv() || hdrmatte16::enabledFromEnv())) {
             nativeForMask = nativeForMask.convertToFormat(QImage::Format_RGBA64);

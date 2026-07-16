@@ -97,6 +97,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/AdjustmentLayerSelftest.cpp
     src/selftests/ClipMaskSelftest.cpp
     src/selftests/GradeLggSerializationSelftest.cpp
+    src/selftests/GradeKeyframeSelftest.cpp
     src/selftests/GradeWheelWiringSelftest.cpp
     src/selftests/MediaPoolDragSelftest.cpp
     src/selftests/TextSpacingSelftest.cpp

@@ -32,4 +32,10 @@ double effectiveOpacityAt(const ClipInfo& clip, double clipLocalSeconds,
 QVector<VideoEffect> effectiveEffectsAt(const ClipInfo& clip,
                                         double clipLocalSeconds);
 
+// Returns effective per-clip color correction at clip-local time.
+// If no grade.* keyframe tracks exist, returns the static ColorCorrection
+// unchanged.
+ColorCorrection effectiveColorCorrectionAt(const ClipInfo& clip,
+                                           double clipLocalSeconds);
+
 } // namespace clipanim

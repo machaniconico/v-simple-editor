@@ -18,6 +18,20 @@ const QString kPosXTrack = QStringLiteral("motion.position.x");
 const QString kPosYTrack = QStringLiteral("motion.position.y");
 const QString kRotationTrack = QStringLiteral("motion.rotation");
 const QString kOpacityTrack = QStringLiteral("motion.opacity");
+const QString kGradeBrightnessTrack = QStringLiteral("grade.brightness");
+const QString kGradeContrastTrack = QStringLiteral("grade.contrast");
+const QString kGradeSaturationTrack = QStringLiteral("grade.saturation");
+const QString kGradeExposureTrack = QStringLiteral("grade.exposure");
+const QString kGradeTemperatureTrack = QStringLiteral("grade.temperature");
+const QString kGradeLiftRTrack = QStringLiteral("grade.liftR");
+const QString kGradeLiftGTrack = QStringLiteral("grade.liftG");
+const QString kGradeLiftBTrack = QStringLiteral("grade.liftB");
+const QString kGradeGammaRTrack = QStringLiteral("grade.gammaR");
+const QString kGradeGammaGTrack = QStringLiteral("grade.gammaG");
+const QString kGradeGammaBTrack = QStringLiteral("grade.gammaB");
+const QString kGradeGainRTrack = QStringLiteral("grade.gainR");
+const QString kGradeGainGTrack = QStringLiteral("grade.gainG");
+const QString kGradeGainBTrack = QStringLiteral("grade.gainB");
 
 constexpr double kKeyTimeEpsilon = 1e-6;
 constexpr double kColorChannelMin = 0.0;
@@ -49,6 +63,24 @@ bool hasAnyEffectKeyframes(const ClipInfo& clip)
         }
     }
     return false;
+}
+
+bool hasAnyGradeKeyframes(const ClipInfo& clip)
+{
+    return trackHasKeyframes(clip.keyframes, kGradeBrightnessTrack)
+        || trackHasKeyframes(clip.keyframes, kGradeContrastTrack)
+        || trackHasKeyframes(clip.keyframes, kGradeSaturationTrack)
+        || trackHasKeyframes(clip.keyframes, kGradeExposureTrack)
+        || trackHasKeyframes(clip.keyframes, kGradeTemperatureTrack)
+        || trackHasKeyframes(clip.keyframes, kGradeLiftRTrack)
+        || trackHasKeyframes(clip.keyframes, kGradeLiftGTrack)
+        || trackHasKeyframes(clip.keyframes, kGradeLiftBTrack)
+        || trackHasKeyframes(clip.keyframes, kGradeGammaRTrack)
+        || trackHasKeyframes(clip.keyframes, kGradeGammaGTrack)
+        || trackHasKeyframes(clip.keyframes, kGradeGammaBTrack)
+        || trackHasKeyframes(clip.keyframes, kGradeGainRTrack)
+        || trackHasKeyframes(clip.keyframes, kGradeGainGTrack)
+        || trackHasKeyframes(clip.keyframes, kGradeGainBTrack);
 }
 
 bool hasAnyEffectTiming(const ClipInfo& clip)
@@ -126,6 +158,16 @@ double trackValueAt(const KeyframeTrack *track, double time, double defaultValue
     if (!track || track->count() == 0)
         return defaultValue;
     return track->valueAt(time);
+}
+
+void applyGradeTrackValue(const ClipInfo& clip,
+                          const QString& trackName,
+                          double clipLocalSeconds,
+                          double& value)
+{
+    if (!trackHasKeyframes(clip.keyframes, trackName))
+        return;
+    value = clip.keyframes.valueAt(trackName, clipLocalSeconds, value);
 }
 
 double easedProgress(double t, const KeyframePoint *kf)
@@ -487,6 +529,47 @@ QVector<VideoEffect> effectiveEffectsAt(const ClipInfo& clip,
         return filtered;
     }
     return effects;
+}
+
+ColorCorrection effectiveColorCorrectionAt(const ClipInfo& clip,
+                                           double clipLocalSeconds)
+{
+    // Hot path: static grade clips keep the exact existing ColorCorrection
+    // values and avoid valueAt() entirely.
+    if (!hasAnyGradeKeyframes(clip))
+        return clip.colorCorrection;
+
+    ColorCorrection cc = clip.colorCorrection;
+    applyGradeTrackValue(clip, kGradeBrightnessTrack,
+                         clipLocalSeconds, cc.brightness);
+    applyGradeTrackValue(clip, kGradeContrastTrack,
+                         clipLocalSeconds, cc.contrast);
+    applyGradeTrackValue(clip, kGradeSaturationTrack,
+                         clipLocalSeconds, cc.saturation);
+    applyGradeTrackValue(clip, kGradeExposureTrack,
+                         clipLocalSeconds, cc.exposure);
+    applyGradeTrackValue(clip, kGradeTemperatureTrack,
+                         clipLocalSeconds, cc.temperature);
+
+    applyGradeTrackValue(clip, kGradeLiftRTrack,
+                         clipLocalSeconds, cc.liftR);
+    applyGradeTrackValue(clip, kGradeLiftGTrack,
+                         clipLocalSeconds, cc.liftG);
+    applyGradeTrackValue(clip, kGradeLiftBTrack,
+                         clipLocalSeconds, cc.liftB);
+    applyGradeTrackValue(clip, kGradeGammaRTrack,
+                         clipLocalSeconds, cc.gammaR);
+    applyGradeTrackValue(clip, kGradeGammaGTrack,
+                         clipLocalSeconds, cc.gammaG);
+    applyGradeTrackValue(clip, kGradeGammaBTrack,
+                         clipLocalSeconds, cc.gammaB);
+    applyGradeTrackValue(clip, kGradeGainRTrack,
+                         clipLocalSeconds, cc.gainR);
+    applyGradeTrackValue(clip, kGradeGainGTrack,
+                         clipLocalSeconds, cc.gainG);
+    applyGradeTrackValue(clip, kGradeGainBTrack,
+                         clipLocalSeconds, cc.gainB);
+    return cc;
 }
 
 } // namespace clipanim
