@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <QFileInfo>
+#include <QFont>
 #include <QMessageBox>
 #include <QStringList>
 
@@ -66,6 +67,8 @@ bool g_envelopeEditMode = false;
 constexpr int kEnvelopePointRadiusPx = 5;
 constexpr double kEnvelopeMaxGain = 2.0;     // matches ClipInfo::volume cap
 constexpr double kEnvelopeHitRadiusPx = 5.0; // mouse hit radius for points
+constexpr qint64 kDefaultAdjustmentLayerDurationUs = 5LL * 1000000LL;
+constexpr int kAdjustmentLayerMinPaintWidthPx = 42;
 
 // Map a clip-local time + gain to widget pixel coords. The clipRect's top
 // row is gain=2.0 (max), the bottom row is gain=0.0; gain=1.0 sits at the
@@ -78,6 +81,96 @@ inline double envelopeYToGain(double y, int rowHeight) {
     if (rowHeight <= 0) return 1.0;
     const double t = qBound(0.0, 1.0 - y / static_cast<double>(rowHeight), 1.0);
     return t * kEnvelopeMaxGain;
+}
+
+int adjustmentLayerTrackIndex(const Timeline *timeline, const TimelineTrack *track)
+{
+    if (!timeline || !track || track->isAudioTrack())
+        return -1;
+    return timeline->videoTracks().indexOf(const_cast<TimelineTrack *>(track));
+}
+
+void paintAdjustmentLayersForTrack(QPainter &painter,
+                                   const Timeline *timeline,
+                                   const TimelineTrack *track,
+                                   const QRect &visibleRect,
+                                   double pixelsPerSecond,
+                                   int rowHeight)
+{
+    if (!timeline || !track || pixelsPerSecond <= 0.0 || rowHeight <= 0)
+        return;
+    const int trackIndex = adjustmentLayerTrackIndex(timeline, track);
+    if (trackIndex < 0)
+        return;
+
+    const QVector<AdjustmentLayer> &layers = timeline->adjustmentLayers();
+    if (layers.isEmpty())
+        return;
+
+    const int bandTop = qBound(3, rowHeight / 5, 10);
+    const int bandHeight = qMax(18, qMin(32, rowHeight - bandTop - 6));
+    const QColor fill(174, 126, 255, 190);
+    const QColor stroke(232, 215, 255, 230);
+    const QColor accent(255, 219, 95, 235);
+
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing, true);
+
+    for (const AdjustmentLayer &layer : layers) {
+        if (layer.trackIndex != trackIndex || layer.timelineEndUs <= layer.timelineStartUs)
+            continue;
+
+        const double startSec = static_cast<double>(layer.timelineStartUs) / 1.0e6;
+        const double endSec = static_cast<double>(layer.timelineEndUs) / 1.0e6;
+        const int startX = qMax(0, static_cast<int>(startSec * pixelsPerSecond));
+        const int endX = qMax(startX + 1, static_cast<int>(endSec * pixelsPerSecond));
+        if (endX < visibleRect.left() || startX > visibleRect.right())
+            continue;
+
+        QRect rect(startX, bandTop,
+                   qMax(kAdjustmentLayerMinPaintWidthPx, endX - startX),
+                   bandHeight);
+        painter.setPen(QPen(stroke, 1));
+        painter.setBrush(fill);
+        painter.drawRoundedRect(rect.adjusted(0, 0, -1, -1), 4, 4);
+
+        const int iconLeft = rect.left() + 7;
+        const int iconCenterY = rect.center().y();
+        painter.setPen(QPen(accent, 2));
+        painter.drawLine(iconLeft, iconCenterY, iconLeft + 12, iconCenterY);
+        painter.drawLine(iconLeft + 6, iconCenterY - 6, iconLeft + 6, iconCenterY + 6);
+        painter.setBrush(accent);
+        painter.drawEllipse(QPointF(iconLeft + 6, iconCenterY), 3.0, 3.0);
+
+        QRect textRect = rect.adjusted(25, 0, -6, 0);
+        if (textRect.width() > 8) {
+            painter.setPen(Qt::white);
+            painter.setFont(QFont(QStringLiteral("Arial"), 8, QFont::Bold));
+            const QString baseName = layer.name.isEmpty()
+                ? QStringLiteral("Adjustment Layer")
+                : layer.name;
+            const QString label = QStringLiteral("ADJ  %1").arg(baseName);
+            painter.drawText(textRect, Qt::AlignVCenter | Qt::AlignLeft,
+                             painter.fontMetrics().elidedText(label, Qt::ElideRight,
+                                                              textRect.width()));
+        }
+    }
+
+    painter.restore();
+}
+
+AdjustmentLayer makeAdjustmentLayer(double startSec, double endSec, int trackIndex)
+{
+    AdjustmentLayer layer;
+    const double safeStartSec = qMax(0.0, startSec);
+    const double safeEndSec = qMax(safeStartSec, endSec);
+    layer.timelineStartUs = static_cast<qint64>(safeStartSec * 1.0e6);
+    layer.timelineEndUs = static_cast<qint64>(safeEndSec * 1.0e6);
+    if (layer.timelineEndUs <= layer.timelineStartUs)
+        layer.timelineEndUs = layer.timelineStartUs + kDefaultAdjustmentLayerDurationUs;
+    layer.trackIndex = qMax(0, trackIndex);
+    layer.name = QStringLiteral("Adjustment Layer");
+    return layer;
 }
 
 QString audioChannelModeMenuLabel(AudioChannelMode mode)
@@ -1330,6 +1423,18 @@ void TimelineTrack::updateMinimumWidth()
             static_cast<qint64>(c.effectiveDuration() * m_pixelsPerSecond));
         totalWidth += w;
     }
+    if (m_timeline && !m_isAudioTrack) {
+        const int trackIndex = adjustmentLayerTrackIndex(m_timeline, this);
+        if (trackIndex >= 0) {
+            for (const AdjustmentLayer &layer : m_timeline->adjustmentLayers()) {
+                if (layer.trackIndex != trackIndex || layer.timelineEndUs <= 0)
+                    continue;
+                const double endSec = static_cast<double>(layer.timelineEndUs) / 1.0e6;
+                totalWidth = qMax(totalWidth,
+                                  static_cast<qint64>(endSec * m_pixelsPerSecond));
+            }
+        }
+    }
     // Qt widget width is int; cap to a sane upper bound. Large widgets break
     // backing-store allocation and painter clipping, but we need to allow
     // multi-clip sequences to span well past the original ~5h cap. Timeline's
@@ -1617,6 +1722,9 @@ void TimelineTrack::paintEvent(QPaintEvent *event)
         }
         x += clipWidth;
     }
+
+    paintAdjustmentLayersForTrack(painter, m_timeline, this, visibleRect,
+                                  m_pixelsPerSecond, m_rowHeight);
 
     // Cross-track drop preview. Cyan bar = valid drop, red bar = overlap.
     if (m_dropIndicatorX >= 0) {
@@ -3574,21 +3682,35 @@ bool Timeline::closeGapAt(TimelineTrack *track, double timeSec)
 void Timeline::showGapContextMenu(TimelineTrack *track, double timeSec, const QPoint &globalPos)
 {
     TimeRangeSec gap;
-    if (!gapTimeRangeAt(track, timeSec, &gap))
-        return;
+    const bool hasGap = gapTimeRangeAt(track, timeSec, &gap);
 
     bool blockedByClip = false;
-    for (const auto *t : m_videoTracks)
-        blockedByClip = blockedByClip || trackRangeOverlapsClip(t, gap.startSec, gap.endSec);
-    for (const auto *t : m_audioTracks)
-        blockedByClip = blockedByClip || trackRangeOverlapsClip(t, gap.startSec, gap.endSec);
+    if (hasGap) {
+        for (const auto *t : m_videoTracks)
+            blockedByClip = blockedByClip || trackRangeOverlapsClip(t, gap.startSec, gap.endSec);
+        for (const auto *t : m_audioTracks)
+            blockedByClip = blockedByClip || trackRangeOverlapsClip(t, gap.startSec, gap.endSec);
+    }
 
     QMenu menu;
     QAction *closeGapAct = menu.addAction(QStringLiteral("ギャップを詰める"));
-    closeGapAct->setEnabled(!blockedByClip);
+    closeGapAct->setEnabled(hasGap && !blockedByClip);
+    menu.addSeparator();
+    QAction *addAdjustmentAct = menu.addAction(QStringLiteral("調整レイヤーを作成"));
+    addAdjustmentAct->setEnabled(!m_videoTracks.isEmpty());
     QAction *chosen = menu.exec(globalPos);
     if (chosen == closeGapAct && closeGapAct->isEnabled())
         closeGapAt(track, timeSec);
+    else if (chosen == addAdjustmentAct && addAdjustmentAct->isEnabled()) {
+        int trackIndex = m_videoTracks.indexOf(track);
+        if (trackIndex < 0)
+            trackIndex = (m_activeVideoTrackIndex >= 0) ? m_activeVideoTrackIndex : 0;
+        const double startSec = qMax(0.0, timeSec);
+        addAdjustmentLayer(makeAdjustmentLayer(
+            startSec,
+            startSec + static_cast<double>(kDefaultAdjustmentLayerDurationUs) / 1.0e6,
+            trackIndex));
+    }
 }
 
 bool Timeline::hasSelection() const
@@ -4398,6 +4520,7 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
 
     QAction *fxAct = menu.addAction(QStringLiteral("ビデオエフェクト..."));
     QAction *ccAct = menu.addAction(QStringLiteral("色補正 / グレーディング..."));
+    QAction *adjustmentAct = menu.addAction(QStringLiteral("調整レイヤーを作成"));
     QAction *parentAct = menu.addAction(QStringLiteral("ペアレント..."));
     QAction *nullAct = menu.addAction(QStringLiteral("ヌルオブジェクトを作成"));
     menu.addSeparator();
@@ -4577,6 +4700,14 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     else if (transClearAct && chosen == transClearAct) clearTransitionsOnSelected();
     else if (chosen == fxAct) emit videoEffectsDialogRequested();
     else if (chosen == ccAct) emit colorCorrectionRequested();
+    else if (chosen == adjustmentAct) {
+        double startSec = m_playheadPos;
+        double endSec = m_playheadPos
+            + static_cast<double>(kDefaultAdjustmentLayerDurationUs) / 1.0e6;
+        trackClipTimeRangeAt(track, clipIndex, &startSec, &endSec);
+        addAdjustmentLayer(makeAdjustmentLayer(startSec, endSec,
+                                               m_videoTracks.indexOf(track)));
+    }
     else if (chosen == parentAct) emit clipParentDialogRequested();
     else if (chosen == nullAct) emit nullObjectRequested();
     else {
@@ -5672,6 +5803,27 @@ bool Timeline::eventFilter(QObject *watched, QEvent *event)
 {
     if (event->type() == QEvent::MouseButtonPress) {
         auto *me = static_cast<QMouseEvent *>(event);
+        if (me->button() == Qt::RightButton && m_videoTrack) {
+            int contentX = me->position().toPoint().x();
+            if (watched == m_scrollArea->viewport()) {
+                if (QScrollBar *hbar = m_scrollArea->horizontalScrollBar())
+                    contentX += hbar->value();
+            } else if (auto *w = qobject_cast<QWidget *>(watched)) {
+                contentX = m_tracksWidget
+                    ? m_tracksWidget->mapFromGlobal(
+                          w->mapToGlobal(me->position().toPoint())).x()
+                    : contentX;
+            }
+
+            const int targetIndex = (m_activeVideoTrackIndex >= 0)
+                ? m_activeVideoTrackIndex
+                : 0;
+            TimelineTrack *targetTrack = m_videoTracks.value(targetIndex, m_videoTrack);
+            showGapContextMenu(targetTrack,
+                               qMax(0.0, m_videoTrack->xToSeconds(qMax(0, contentX))),
+                               me->globalPosition().toPoint());
+            return true;
+        }
         if (me->button() == Qt::LeftButton
             && !(me->modifiers() & (Qt::ShiftModifier | Qt::ControlModifier))) {
             clearAllSelections();
@@ -6806,8 +6958,13 @@ int Timeline::addAdjustmentLayer(const AdjustmentLayer &layer)
     // Defensive: clamp negative timestamps and keep start <= end.
     copy.timelineStartUs = qMax<qint64>(0, copy.timelineStartUs);
     copy.timelineEndUs   = qMax<qint64>(copy.timelineStartUs, copy.timelineEndUs);
+    const int maxTrackIndex = qMax(0, static_cast<int>(m_videoTracks.size()) - 1);
+    copy.trackIndex = qBound(0, copy.trackIndex, maxTrackIndex);
     m_adjustmentLayers.append(copy);
+    for (auto *track : m_videoTracks)
+        if (track) track->setPixelsPerSecond(m_zoomLevel);
     emit adjustmentLayersChanged();
+    scheduleEmitSequenceChanged();
     return copy.id;
 }
 
@@ -6816,7 +6973,10 @@ bool Timeline::removeAdjustmentLayer(int id)
     for (int i = 0; i < m_adjustmentLayers.size(); ++i) {
         if (m_adjustmentLayers[i].id == id) {
             m_adjustmentLayers.removeAt(i);
+            for (auto *track : m_videoTracks)
+                if (track) track->setPixelsPerSecond(m_zoomLevel);
             emit adjustmentLayersChanged();
+            scheduleEmitSequenceChanged();
             return true;
         }
     }
@@ -6832,8 +6992,13 @@ bool Timeline::updateAdjustmentLayer(int id, const AdjustmentLayer &layer)
             copy.id = id;
             copy.timelineStartUs = qMax<qint64>(0, copy.timelineStartUs);
             copy.timelineEndUs   = qMax<qint64>(copy.timelineStartUs, copy.timelineEndUs);
+            const int maxTrackIndex = qMax(0, static_cast<int>(m_videoTracks.size()) - 1);
+            copy.trackIndex = qBound(0, copy.trackIndex, maxTrackIndex);
             m_adjustmentLayers[i] = copy;
+            for (auto *track : m_videoTracks)
+                if (track) track->setPixelsPerSecond(m_zoomLevel);
             emit adjustmentLayersChanged();
+            scheduleEmitSequenceChanged();
             return true;
         }
     }
@@ -6853,9 +7018,18 @@ void Timeline::setAdjustmentLayers(const QVector<AdjustmentLayer> &layers)
     // Restore the monotonic id counter so newly-added layers don't collide
     // with serialized ids from a loaded project.
     int maxId = 0;
-    for (const auto &l : m_adjustmentLayers) maxId = qMax(maxId, l.id);
+    const int maxTrackIndex = qMax(0, static_cast<int>(m_videoTracks.size()) - 1);
+    for (AdjustmentLayer &l : m_adjustmentLayers) {
+        l.timelineStartUs = qMax<qint64>(0, l.timelineStartUs);
+        l.timelineEndUs = qMax<qint64>(l.timelineStartUs, l.timelineEndUs);
+        l.trackIndex = qBound(0, l.trackIndex, maxTrackIndex);
+        maxId = qMax(maxId, l.id);
+    }
     m_nextAdjustmentLayerId = maxId + 1;
+    for (auto *track : m_videoTracks)
+        if (track) track->setPixelsPerSecond(m_zoomLevel);
     emit adjustmentLayersChanged();
+    scheduleEmitSequenceChanged();
 }
 
 void Timeline::onPlayheadAutoScrollTick()
