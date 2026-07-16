@@ -81,6 +81,10 @@ namespace veditor {
 bool parentingEnabledFromEnv();
 }
 
+namespace clipmask {
+QImage applyRasterAlphaMask(const QImage &sourceImage, const QVector<Mask> &masks);
+}
+
 namespace {
 
 // Phase 1e — playback preview divisor for the playback decode path.
@@ -211,6 +215,93 @@ double entryClipLocalSeconds(const PlaybackEntry &entry, qint64 timelineUsec)
 {
     return (static_cast<double>(timelineUsec) - entry.timelineStart * 1'000'000.0)
         / 1'000'000.0;
+}
+
+QPointF previewMaskTrackDelta(const ClipInfo &clip, double sourceSec)
+{
+    const TrackingResult &trk = clip.maskTrackingData;
+    if (trk.isEmpty())
+        return QPointF();
+
+    const QRect now0 = trk.positionAtTime(sourceSec);
+    const QRect base0 = trk.regions.first().rect;
+    if (now0.isNull() || base0.isNull())
+        return QPointF();
+
+    const QPointF nowC(now0.x() + now0.width() / 2.0,
+                       now0.y() + now0.height() / 2.0);
+    const QPointF baseC(base0.x() + base0.width() / 2.0,
+                        base0.y() + base0.height() / 2.0);
+    return nowC - baseC;
+}
+
+void translateMask(Mask &mask, const QPointF &delta)
+{
+    if (delta.isNull())
+        return;
+    mask.rect.translate(delta);
+    for (QPointF &point : mask.points)
+        point += delta;
+}
+
+void scaleMask(Mask &mask, double sx, double sy)
+{
+    if (qFuzzyCompare(sx, 1.0) && qFuzzyCompare(sy, 1.0))
+        return;
+    mask.rect = QRectF(mask.rect.x() * sx,
+                       mask.rect.y() * sy,
+                       mask.rect.width() * sx,
+                       mask.rect.height() * sy);
+    for (QPointF &point : mask.points)
+        point = QPointF(point.x() * sx, point.y() * sy);
+}
+
+QVector<Mask> previewMasksForFrame(const ClipInfo &clip,
+                                   double sourceSec,
+                                   QSize sourceSize,
+                                   QSize frameSize)
+{
+    QVector<Mask> masks = clip.maskSystem.masks();
+    if (masks.isEmpty())
+        return masks;
+
+    const QPointF delta = previewMaskTrackDelta(clip, sourceSec);
+    for (Mask &mask : masks)
+        translateMask(mask, delta);
+
+    if (sourceSize.width() > 0 && sourceSize.height() > 0
+        && frameSize.width() > 0 && frameSize.height() > 0
+        && sourceSize != frameSize) {
+        const double sx = static_cast<double>(frameSize.width())
+            / static_cast<double>(sourceSize.width());
+        const double sy = static_cast<double>(frameSize.height())
+            / static_cast<double>(sourceSize.height());
+        if (std::isfinite(sx) && std::isfinite(sy) && sx > 0.0 && sy > 0.0) {
+            for (Mask &mask : masks)
+                scaleMask(mask, sx, sy);
+        }
+    }
+
+    return masks;
+}
+
+QImage applyPreviewClipMask(const QImage &frame,
+                            const Timeline *timeline,
+                            const PlaybackEntry &entry,
+                            double sourceSec,
+                            QSize sourceSize)
+{
+    if (frame.isNull())
+        return frame;
+    const ClipInfo *clip = clipForPlaybackEntry(timeline, entry);
+    if (!clip || !clip->hasMask())
+        return frame;
+
+    const QVector<Mask> masks =
+        previewMasksForFrame(*clip, sourceSec, sourceSize, frame.size());
+    if (masks.isEmpty())
+        return frame;
+    return clipmask::applyRasterAlphaMask(frame, masks);
 }
 
 struct ActivePreviewAdjustmentClip {
@@ -3955,8 +4046,20 @@ bool VideoPlayer::seekInternal(int64_t positionUs, bool displayFrame, bool preci
         if (image.isNull())
             return false;
         // This path displays a non-baked frame.
+        QImage displayImage = image;
+        if (sequenceActive()
+            && m_activeEntry >= 0
+            && m_activeEntry < m_sequence.size()) {
+            const auto &entry = m_sequence[m_activeEntry];
+            displayImage = applyPreviewClipMask(
+                image,
+                m_glPreview ? m_glPreview->timeline() : nullptr,
+                entry,
+                static_cast<double>(targetUs) / AV_TIME_BASE,
+                QSize(displayable->width, displayable->height));
+        }
         m_lastFrameOdtApplied = false;
-        this->displaySeekFrameConformed(image);
+        this->displaySeekFrameConformed(displayImage);
         m_currentPositionUs = targetUs;
         updatePositionUi();
         return true;
@@ -4057,9 +4160,25 @@ bool VideoPlayer::presentDecodedFrame(AVFrame *frame, bool displayFrameRequested
         m_lastV1RawFrame = image;
         m_lastSourceFrame = image;
         if (!m_deferDisplayThisTick) {
+            QImage displayImage = image;
+            if (sequenceActive()
+                && m_activeEntry >= 0
+                && m_activeEntry < m_sequence.size()) {
+                const auto &entry = m_sequence[m_activeEntry];
+                const double sourceSec =
+                    static_cast<double>(
+                        entryLocalPositionUs(m_activeEntry, m_timelinePositionUs))
+                    / AV_TIME_BASE;
+                displayImage = applyPreviewClipMask(
+                    image,
+                    m_glPreview ? m_glPreview->timeline() : nullptr,
+                    entry,
+                    sourceSec,
+                    QSize(displayable->width, displayable->height));
+            }
             // This path displays a non-baked frame.
             m_lastFrameOdtApplied = false;
-            displaySeekFrameConformed(image);
+            displaySeekFrameConformed(displayImage);
         }
         updatePositionUi();
     }
@@ -4266,13 +4385,23 @@ void VideoPlayer::refreshDisplayedFrame()
             if (!canvas.isNull()) {
                 canvas.fill(Qt::black);
                 DecodedLayer layer;
-                layer.rgb = m_lastV1RawFrame;
+                const Timeline *previewTimeline =
+                    m_glPreview ? m_glPreview->timeline() : nullptr;
+                const QSize sourceSize =
+                    (m_codecCtx && m_codecCtx->width > 0 && m_codecCtx->height > 0)
+                        ? QSize(m_codecCtx->width, m_codecCtx->height)
+                        : m_lastV1RawFrame.size();
+                const double sourceSec =
+                    static_cast<double>(
+                        entryLocalPositionUs(m_activeEntry, m_timelinePositionUs))
+                    / AV_TIME_BASE;
+                layer.rgb = applyPreviewClipMask(
+                    m_lastV1RawFrame, previewTimeline, e, sourceSec, sourceSize);
                 layer.isFresh = true;
                 layer.colorMeta = e.colorMeta;
-                applyLayerMotionOpacity(m_glPreview ? m_glPreview->timeline() : nullptr,
+                applyLayerMotionOpacity(previewTimeline,
                                         e, m_timelinePositionUs, e.opacity, &layer);
-                populateLayerMetadata(m_glPreview ? m_glPreview->timeline() : nullptr,
-                                      e, m_activeEntry, &layer);
+                populateLayerMetadata(previewTimeline, e, m_activeEntry, &layer);
                 {
                     double insetFw = 1.0, insetFh = 1.0;
                     if (layer.fitContain && !layer.fitCover) {
@@ -4885,7 +5014,16 @@ void VideoPlayer::handlePlaybackTick()
                     if (m_lastV1RawFrame.isNull())
                         continue;
                     DecodedLayer layer;
-                    layer.rgb = m_lastV1RawFrame;
+                    const QSize sourceSize =
+                        (m_codecCtx && m_codecCtx->width > 0 && m_codecCtx->height > 0)
+                            ? QSize(m_codecCtx->width, m_codecCtx->height)
+                            : m_lastV1RawFrame.size();
+                    const double sourceSec =
+                        static_cast<double>(
+                            entryLocalPositionUs(idx, m_timelinePositionUs))
+                        / AV_TIME_BASE;
+                    layer.rgb = applyPreviewClipMask(
+                        m_lastV1RawFrame, previewTimeline, e, sourceSec, sourceSize);
                     layer.isFresh = true;
                     layer.colorMeta = e.colorMeta;
                     applyLayerMotionOpacity(previewTimeline,
@@ -4968,7 +5106,16 @@ void VideoPlayer::handlePlaybackTick()
                 } else if (idx == m_activeEntry) {
                     if (m_lastV1RawFrame.isNull())
                         continue;
-                    layer.rgb = m_lastV1RawFrame;
+                    const QSize sourceSize =
+                        (m_codecCtx && m_codecCtx->width > 0 && m_codecCtx->height > 0)
+                            ? QSize(m_codecCtx->width, m_codecCtx->height)
+                            : m_lastV1RawFrame.size();
+                    const double sourceSec =
+                        static_cast<double>(
+                            entryLocalPositionUs(idx, m_timelinePositionUs))
+                        / AV_TIME_BASE;
+                    layer.rgb = applyPreviewClipMask(
+                        m_lastV1RawFrame, previewTimeline, e, sourceSec, sourceSize);
                     layer.isFresh = true;
                 } else {
                     if (!harvestOverlayLayer(e, idx, &layer))
@@ -5069,7 +5216,21 @@ void VideoPlayer::handlePlaybackTick()
                 }
                 if (traceTick)
                     m_tickTraceDecodeNs += tickTimer.nsecsElapsed() - sectionMark;
-                displayFrame(m_lastV1RawFrame);
+                QImage fallbackFrame = m_lastV1RawFrame;
+                if (m_activeEntry >= 0 && m_activeEntry < m_sequence.size()) {
+                    const auto &entry = m_sequence[m_activeEntry];
+                    const QSize sourceSize =
+                        (m_codecCtx && m_codecCtx->width > 0 && m_codecCtx->height > 0)
+                            ? QSize(m_codecCtx->width, m_codecCtx->height)
+                            : m_lastV1RawFrame.size();
+                    const double sourceSec =
+                        static_cast<double>(
+                            entryLocalPositionUs(m_activeEntry, m_timelinePositionUs))
+                        / AV_TIME_BASE;
+                    fallbackFrame = applyPreviewClipMask(
+                        m_lastV1RawFrame, previewTimeline, entry, sourceSec, sourceSize);
+                }
+                displayFrame(fallbackFrame);
             } else {
                 if (traceTick) {
                     m_tickTraceDecodeNs += tickTimer.nsecsElapsed() - sectionMark;
@@ -5184,7 +5345,21 @@ void VideoPlayer::handlePlaybackTick()
             }
             if (traceTick)
                 m_tickTraceDecodeNs += tickTimer.nsecsElapsed() - sectionMark;
-            displayFrame(m_lastV1RawFrame);
+            QImage fallbackFrame = m_lastV1RawFrame;
+            if (m_activeEntry >= 0 && m_activeEntry < m_sequence.size()) {
+                const auto &entry = m_sequence[m_activeEntry];
+                const QSize sourceSize =
+                    (m_codecCtx && m_codecCtx->width > 0 && m_codecCtx->height > 0)
+                        ? QSize(m_codecCtx->width, m_codecCtx->height)
+                        : m_lastV1RawFrame.size();
+                const double sourceSec =
+                    static_cast<double>(
+                        entryLocalPositionUs(m_activeEntry, m_timelinePositionUs))
+                    / AV_TIME_BASE;
+                fallbackFrame = applyPreviewClipMask(
+                    m_lastV1RawFrame, previewTimeline, entry, sourceSec, sourceSize);
+            }
+            displayFrame(fallbackFrame);
         }
       } // ADAPTIVE-1: close `if (!servedFromCache)`
     }
@@ -6510,9 +6685,12 @@ bool VideoPlayer::finalizeOverlayFromDecoder(const PlaybackEntry &e, int seqIdx,
     if (!out || !d)
         return false;
 
+    QSize sourceSize;
     if (!d->lastFrameRgb.isNull()) {
         out->rgb     = d->lastFrameRgb;
         out->isFresh = decodedOk;
+        if (d->codecCtx && d->codecCtx->width > 0 && d->codecCtx->height > 0)
+            sourceSize = QSize(d->codecCtx->width, d->codecCtx->height);
     } else {
         // Fresh decoder with no successful decode yet — try the eviction
         // grace pool for the same identity. Match the TrackKey contract
@@ -6530,6 +6708,8 @@ bool VideoPlayer::finalizeOverlayFromDecoder(const PlaybackEntry &e, int seqIdx,
                 && !g->lastFrameRgb.isNull()) {
                 out->rgb     = g->lastFrameRgb;
                 out->isFresh = false;
+                if (g->codecCtx && g->codecCtx->width > 0 && g->codecCtx->height > 0)
+                    sourceSize = QSize(g->codecCtx->width, g->codecCtx->height);
                 break;
             }
         }
@@ -6537,11 +6717,20 @@ bool VideoPlayer::finalizeOverlayFromDecoder(const PlaybackEntry &e, int seqIdx,
             return false;
     }
 
+    if (sourceSize.width() <= 0 || sourceSize.height() <= 0)
+        sourceSize = out->rgb.size();
+    const Timeline *previewTimeline = m_glPreview ? m_glPreview->timeline() : nullptr;
+    if (seqIdx >= 0 && seqIdx < m_sequence.size()) {
+        const double sourceSec =
+            static_cast<double>(entryLocalPositionUs(seqIdx, m_timelinePositionUs))
+            / AV_TIME_BASE;
+        out->rgb = applyPreviewClipMask(
+            out->rgb, previewTimeline, e, sourceSec, sourceSize);
+    }
+
     out->colorMeta          = e.colorMeta;
-    applyLayerMotionOpacity(m_glPreview ? m_glPreview->timeline() : nullptr,
-                            e, m_timelinePositionUs, e.opacity, out);
-    populateLayerMetadata(m_glPreview ? m_glPreview->timeline() : nullptr,
-                          e, seqIdx, out);
+    applyLayerMotionOpacity(previewTimeline, e, m_timelinePositionUs, e.opacity, out);
+    populateLayerMetadata(previewTimeline, e, seqIdx, out);
     return true;
 }
 

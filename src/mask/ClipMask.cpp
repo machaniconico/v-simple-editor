@@ -4,6 +4,8 @@
 
 #include <QJsonArray>
 #include <QJsonValue>
+#include <QImage>
+#include <QRgba64>
 #include <QtGlobal>
 
 #include <cmath>
@@ -377,6 +379,55 @@ QJsonObject maskSystemToJson(const MaskSystem &system)
 MaskSystem maskSystemFromJson(const QJsonObject &obj)
 {
     return toMaskSystem(fromJson(obj));
+}
+
+QImage applyRasterAlphaMask(const QImage &sourceImage, const QVector<Mask> &masks)
+{
+    if (sourceImage.isNull() || masks.isEmpty())
+        return sourceImage;
+
+    const QImage matte = MaskSystem::generateMaskImage(masks, sourceImage.size());
+    if (matte.isNull())
+        return sourceImage;
+
+    const bool rgba64 = sourceImage.format() == QImage::Format_RGBA64
+        || sourceImage.format() == QImage::Format_RGBA64_Premultiplied;
+    if (!rgba64)
+        return MaskSystem::applyMask(sourceImage, matte);
+
+    QImage src = sourceImage.convertToFormat(QImage::Format_RGBA64_Premultiplied);
+    QImage mask = matte;
+    if (mask.format() != QImage::Format_Grayscale8)
+        mask = mask.convertToFormat(QImage::Format_Grayscale8);
+    if (mask.size() != src.size())
+        mask = mask.scaled(src.size(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation)
+                   .convertToFormat(QImage::Format_Grayscale8);
+
+    QImage result(src.size(), QImage::Format_RGBA64_Premultiplied);
+    const int w = src.width();
+    const int h = src.height();
+    auto scale16 = [](quint16 value, quint16 alpha) -> quint16 {
+        return static_cast<quint16>(
+            (static_cast<quint32>(value) * static_cast<quint32>(alpha)) / 65535u);
+    };
+
+    for (int y = 0; y < h; ++y) {
+        const QRgba64 *srcRow =
+            reinterpret_cast<const QRgba64 *>(src.constScanLine(y));
+        const uchar *maskRow = mask.constScanLine(y);
+        QRgba64 *dstRow = reinterpret_cast<QRgba64 *>(result.scanLine(y));
+        for (int x = 0; x < w; ++x) {
+            const quint16 a = static_cast<quint16>(
+                static_cast<quint16>(maskRow[x]) * 257u);
+            const QRgba64 px = srcRow[x];
+            dstRow[x] = qRgba64(scale16(px.red(), a),
+                                scale16(px.green(), a),
+                                scale16(px.blue(), a),
+                                scale16(px.alpha(), a));
+        }
+    }
+
+    return result;
 }
 
 } // namespace clipmask

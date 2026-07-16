@@ -56,6 +56,10 @@ bool parentingEnabledFromEnv()
 }
 } // namespace veditor
 
+namespace clipmask {
+QImage applyRasterAlphaMask(const QImage &sourceImage, const QVector<Mask> &masks);
+}
+
 namespace tlrender {
 namespace {
 
@@ -484,18 +488,14 @@ QImage applyClipMask(const QImage &frame, const ClipInfo &clip, double sourceSec
         }
     }
 
-    // Stage 1 — genuine mask rasterisation (the very function the mask
-    // system uses everywhere; NOT re-implemented here).
-    const QImage matte =
-        MaskSystem::generateMaskImage(masks, canvasSize);
-    if (matte.isNull())
-        return frame;                        // nothing rasterised -> untouched
-
-    // Stage 2 — genuine matte application (multiplies layer RGB+alpha by the
-    // matte). applyMask emits ARGB32_Premultiplied; restore the decoder's
-    // RGBA8888 so downstream scale/composite is unchanged (same contract
-    // gradeClipNativeFrame/applyClipFxPack preserve for S2..S6).
-    const QImage masked = MaskSystem::applyMask(frame, matte);
+    // Genuine rasterise + alpha application. The helper delegates the 8-bit
+    // raster SSOT to MaskSystem and preserves RGBA64_Premultiplied when the
+    // HDR/16-bit renderer asks for a 16-bit layer.
+    const QImage masked = clipmask::applyRasterAlphaMask(frame, masks);
+    if (masked.isNull())
+        return frame;
+    if (tlrcompose16::isRgba64Format(masked.format()))
+        return masked;
     return masked.convertToFormat(QImage::Format_RGBA8888);
 }
 
@@ -821,7 +821,12 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
         // composite (src/VideoPlayer.cpp:4558-4579), so a lower track shows
         // through exactly where the mask cuts. No-op when the clip has no mask,
         // so a lone V1 clip stays byte-identical to S2/S3/S4/S5/S6.
-        const QImage v1Native = applyClipMask(v1Fx, v1Clip, v1SourceSec);
+        QImage v1MaskInput = v1Fx;
+        if (v1Clip.hasMask()
+            && (hdrexport16::enabledFromEnv() || hdrmatte16::enabledFromEnv())) {
+            v1MaskInput = v1MaskInput.convertToFormat(QImage::Format_RGBA64);
+        }
+        const QImage v1Native = applyClipMask(v1MaskInput, v1Clip, v1SourceSec);
         const bool contained =
             snsfit::shouldFit(v1Clip.fitContain, v1Clip.fitCover, outSize, v1Native.size());
         const QImage v1Contained =
@@ -963,9 +968,13 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
         // overlay is SourceOver-composited and the layers beneath show
         // through (same CC -> LUT -> FX -> MASK per-clip order as V1). No-op
         // for un-masked overlays, so S3's multi-track MSE stays ~0.
-        QImage native = applyClipMask(
-            applyClipFxPack(gradeClipNativeFrame(nativeRaw, c), c, localSec),
-            c, srcSec);
+        QImage nativeForMask =
+            applyClipFxPack(gradeClipNativeFrame(nativeRaw, c), c, localSec);
+        if (c.hasMask()
+            && (hdrexport16::enabledFromEnv() || hdrmatte16::enabledFromEnv())) {
+            nativeForMask = nativeForMask.convertToFormat(QImage::Format_RGBA64);
+        }
+        QImage native = applyClipMask(nativeForMask, c, srcSec);
         native = snsfit::maybeFit(native, c.fitContain, c.fitCover, outSize);
         RenderLayer renderLayer;
         renderLayer.clipId = renderClipId(t, idx);
