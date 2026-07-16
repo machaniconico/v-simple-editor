@@ -3,6 +3,7 @@
 #include "Timeline.h"
 #include "UndoTrace.h"
 #include "AutoColor.h"
+#include "VersionedSave.h"
 
 // AR-2: レガシー Exporter 経路へ ACES 色管理パイプラインを渡すフリー関数。実体は
 // Exporter.cpp に TU ローカル状態とともに定義 (Exporter.h は touchedFiles 外のため
@@ -2538,6 +2539,37 @@ void MainWindow::setupMenuBar()
     connect(saveAsAction, &QAction::triggered, this, &MainWindow::saveProjectAs);
     m_menuHelpEntries.append({saveAsAction,
         QStringLiteral("別名でプロジェクトを保存します。元のファイルを残したまま別バージョンを作りたいときに使います。")});
+
+    auto *versionedSaveAction = fileMenu->addAction(QStringLiteral("インクリメンタル保存(&I)"));
+    versionedSaveAction->setObjectName(QStringLiteral("action_versioned_save"));
+    versionedSaveAction->setShortcut(QKeySequence(Qt::CTRL | Qt::ALT | Qt::SHIFT | Qt::Key_S));
+    connect(versionedSaveAction, &QAction::triggered, this, [this]() {
+        if (m_projectFilePath.isEmpty()) {
+            saveProjectAs();
+            return;
+        }
+
+        const QString targetPath = versionedsave::nextVersionedPath(m_projectFilePath);
+        if (targetPath.isEmpty()) {
+            QMessageBox::critical(this, QStringLiteral("Save Failed"),
+                                  QStringLiteral("Could not create an incremented project file name."));
+            return;
+        }
+
+        ProjectData data;
+        populateProjectData(data);
+        if (!ProjectFile::save(targetPath, data)) {
+            QMessageBox::critical(this, QStringLiteral("Save Failed"),
+                                  QStringLiteral("Could not save project file."));
+            return;
+        }
+
+        m_projectFilePath = targetPath;
+        statusBar()->showMessage(QStringLiteral("Saved: ") + m_projectFilePath);
+        updateTitle();
+    });
+    m_menuHelpEntries.append({versionedSaveAction,
+        QStringLiteral("現在のプロジェクト名の末尾番号を 1 つ進めた別ファイルとして保存します。")});
 
     fileMenu->addSeparator();
 

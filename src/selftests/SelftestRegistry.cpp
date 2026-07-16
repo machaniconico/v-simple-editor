@@ -163,6 +163,7 @@ int runTrackerPresetSelftest();
 int runTrimOpsSelftest();
 int runTwitchSelftest();
 int runVfxSelftest();
+int runVersionedSaveSelftest();
 int runVideostabDeshakeSelftest();
 int runVimeoSelftest();
 int runWatermarkSelftest();
@@ -443,6 +444,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "RenderQueue ACES/ODT ownership decision for 8-bit vs 16-bit tonemap paths (2 gates)" },
     { "renderqueue-fps-rational", "VEDITOR_RENDERQUEUE_FPS_RATIONAL_SELFTEST", runRenderQueueFpsRationalSelftest, false,
       "RenderQueue in-process export fps rational derivation (6 gates)" },
+    { "versioned-save",   "VEDITOR_VERSIONED_SAVE_SELFTEST",    runVersionedSaveSelftest,      false,
+      "Increment and Save filename resolver: numbered suffix, unnumbered v002, collision skip, digit width" },
     { "export-range",      "VEDITOR_EXPORT_RANGE_SELFTEST",       runExportRangeSelftest,       false,
       "Marked In/Out export frame-range helper (5 gates)" },
     { "tracker-preset",    "VEDITOR_TRACKER_PRESET_SELFTEST",     runTrackerPresetSelftest,      false,
