@@ -72,20 +72,20 @@ bool tracksContainSequenceReference(const QVector<QVector<ClipInfo>> &tracks)
     return false;
 }
 
+bool timelineHasSequenceRenderModel(const QVector<QVector<ClipInfo>> &videoTracks,
+                                    const QVector<QVector<ClipInfo>> &audioTracks)
+{
+    return tracksContainSequenceReference(videoTracks)
+        || tracksContainSequenceReference(audioTracks);
+}
+
 bool timelineHasSequenceRenderModel(const Timeline *timeline)
 {
     if (!timeline)
         return false;
 
-    if (tracksContainSequenceReference(timeline->allVideoTracks())
-        || tracksContainSequenceReference(timeline->allAudioTracks())) {
-        return true;
-    }
-
-    // A non-empty sequence model serializes through clipParentEntries as a
-    // sequence-store carrier. Keep smart-render out of that graph even when
-    // the active sequence currently contains a single ordinary media clip.
-    return !timeline->sequences().isEmpty();
+    return timelineHasSequenceRenderModel(timeline->allVideoTracks(),
+                                          timeline->allAudioTracks());
 }
 
 struct FpsRational {
@@ -304,7 +304,29 @@ int runRenderQueueAcesDecisionSelftest()
               tracksContainSequenceReference(tracks));
     }
 
-    std::printf("[renderqueue-aces] summary: gates=4 passed=%d failed=%d\n",
+    {
+        ClipInfo clip;
+        clip.duration = 1.0;
+        clip.outPoint = 1.0;
+        clip.filePath = QStringLiteral("plain-source.mp4");
+        QVector<QVector<ClipInfo>> videoTracks;
+        videoTracks.append(QVector<ClipInfo>{clip});
+        QVector<QVector<ClipInfo>> audioTracks;
+
+        TimelineSequence active;
+        active.id = QStringLiteral("main");
+        active.name = QStringLiteral("Main");
+        active.videoTracks = videoTracks;
+        active.audioTracks = audioTracks;
+        const QVector<TimelineSequence> sequenceStore{active};
+        const bool sequenceModelEnabled = !sequenceStore.isEmpty();
+
+        check(5, "enabled sequence model without sequenceRef clips leaves smart-render guard open",
+              sequenceModelEnabled
+              && !timelineHasSequenceRenderModel(videoTracks, audioTracks));
+    }
+
+    std::printf("[renderqueue-aces] summary: gates=5 passed=%d failed=%d\n",
                 passed, failed);
     return failed == 0 ? 0 : 1;
 }

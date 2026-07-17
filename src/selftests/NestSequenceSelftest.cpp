@@ -1,5 +1,6 @@
 #include "../Timeline.h"
 #include "../TimelineFrameRenderer.h"
+#include "../UndoManager.h"
 #include "../libavcore/Encode.h"
 
 #include <cstddef>
@@ -155,6 +156,231 @@ bool containsSequenceId(const QJsonObject &store, const QString &id)
     return false;
 }
 
+bool containsSequenceId(const QVector<TimelineSequence> &sequences, const QString &id)
+{
+    for (const TimelineSequence &sequence : sequences) {
+        if (sequence.id == id)
+            return true;
+    }
+    return false;
+}
+
+QString uniquePrecomposeSequenceIdForTest(const Timeline &timeline)
+{
+    const QVector<TimelineSequence> sequences = timeline.sequences();
+    for (int i = 1; i < 100000; ++i) {
+        const QString candidate = QStringLiteral("precomp-%1").arg(i);
+        if (!containsSequenceId(sequences, candidate))
+            return candidate;
+    }
+    return QStringLiteral("precomp-overflow");
+}
+
+QString firstPrecomposeSequenceId(const QVector<TimelineSequence> &sequences)
+{
+    for (const TimelineSequence &sequence : sequences) {
+        if (sequence.id.startsWith(QStringLiteral("precomp-")))
+            return sequence.id;
+    }
+    return {};
+}
+
+TimelineSequence snapshotActiveTracksAsSequence(const Timeline &timeline,
+                                                const QString &id,
+                                                const QString &name)
+{
+    TimelineSequence sequence;
+    sequence.id = id;
+    sequence.name = name;
+    sequence.videoTracks.reserve(timeline.videoTracks().size());
+    for (const TimelineTrack *track : timeline.videoTracks())
+        sequence.videoTracks.append(track ? track->clips() : QVector<ClipInfo>{});
+    sequence.audioTracks.reserve(timeline.audioTracks().size());
+    for (const TimelineTrack *track : timeline.audioTracks())
+        sequence.audioTracks.append(track ? track->clips() : QVector<ClipInfo>{});
+    return sequence;
+}
+
+void replaceParentTracksWithSequenceRef(Timeline &timeline, const ClipInfo &sequenceClip)
+{
+    for (int i = 0; i < timeline.videoTracks().size(); ++i) {
+        if (TimelineTrack *track = timeline.videoTracks().value(i, nullptr))
+            track->setClips(i == 0 ? QVector<ClipInfo>{sequenceClip}
+                                   : QVector<ClipInfo>{});
+    }
+    for (int i = 0; i < timeline.audioTracks().size(); ++i) {
+        if (TimelineTrack *track = timeline.audioTracks().value(i, nullptr))
+            track->setClips(i == 0 ? QVector<ClipInfo>{sequenceClip}
+                                   : QVector<ClipInfo>{});
+    }
+}
+
+bool simulatePrecomposeAndSave(Timeline &timeline,
+                               const QString &name,
+                               QString *sequenceIdOut,
+                               QString *detail)
+{
+    if (!timeline.undoManager()) {
+        if (detail)
+            *detail = QStringLiteral("undo manager unavailable");
+        return false;
+    }
+
+    const QString sequenceId = uniquePrecomposeSequenceIdForTest(timeline);
+    TimelineSequence sequence =
+        snapshotActiveTracksAsSequence(timeline, sequenceId, name);
+    if (!timeline.addSequence(sequence)) {
+        if (detail)
+            *detail = QStringLiteral("addSequence failed for %1").arg(sequenceId);
+        return false;
+    }
+
+    const QVector<TimelineSequence> afterAdd = timeline.sequences();
+    if (!containsSequenceId(afterAdd, sequenceId)) {
+        if (detail)
+            *detail = QStringLiteral("addSequence did not retain %1").arg(sequenceId);
+        return false;
+    }
+
+    ClipInfo sequenceClip = timeline.makeSequenceClip(sequenceId, name);
+    if (sequenceClip.duration <= 0.0) {
+        if (detail)
+            *detail = QStringLiteral("sequence clip %1 has non-positive duration").arg(sequenceId);
+        return false;
+    }
+    replaceParentTracksWithSequenceRef(timeline, sequenceClip);
+
+    timeline.undoManager()->saveState(
+        timeline.currentState(),
+        QStringLiteral("Pre-compose selftest: %1").arg(name));
+    if (sequenceIdOut)
+        *sequenceIdOut = sequenceId;
+    return true;
+}
+
+bool preparePrecomposeUndoTimeline(Timeline &timeline,
+                                   const ClipInfo &media,
+                                   int *baselineCount,
+                                   QString *detail)
+{
+    const TimelineSequence main =
+        makeSequence(QStringLiteral("main"), oneTrack(media), oneTrack(media));
+    timeline.setSequences(QVector<TimelineSequence>{main}, QStringLiteral("main"));
+
+    const QVector<TimelineSequence> baselineSequences = timeline.sequences();
+    const QString leaked = firstPrecomposeSequenceId(baselineSequences);
+    if (!leaked.isEmpty()) {
+        if (detail)
+            *detail = QStringLiteral("baseline unexpectedly contains %1").arg(leaked);
+        return false;
+    }
+    if (baselineSequences.isEmpty()) {
+        if (detail)
+            *detail = QStringLiteral("sequence-model baseline is empty");
+        return false;
+    }
+
+    if (!timeline.undoManager()) {
+        if (detail)
+            *detail = QStringLiteral("undo manager unavailable");
+        return false;
+    }
+    timeline.undoManager()->clear();
+    timeline.undoManager()->saveState(timeline.currentState(),
+                                      QStringLiteral("precompose undo baseline"));
+    if (baselineCount)
+        *baselineCount = baselineSequences.size();
+    return true;
+}
+
+bool assertNoPrecomposeStoreLeak(const Timeline &timeline,
+                                 int baselineCount,
+                                 QString *detail)
+{
+    const QVector<TimelineSequence> restored = timeline.sequences();
+    if (restored.size() != baselineCount) {
+        if (detail) {
+            *detail = QStringLiteral("sequence count after undo is %1, expected %2")
+                .arg(restored.size())
+                .arg(baselineCount);
+        }
+        return false;
+    }
+
+    const QString leaked = firstPrecomposeSequenceId(restored);
+    if (!leaked.isEmpty()) {
+        if (detail)
+            *detail = QStringLiteral("%1 remained after undo").arg(leaked);
+        return false;
+    }
+    return true;
+}
+
+bool singlePrecomposeUndoClearsSequenceStore(const ClipInfo &media, QString *detail)
+{
+    Timeline timeline;
+    int baselineCount = 0;
+    if (!preparePrecomposeUndoTimeline(timeline, media, &baselineCount, detail))
+        return false;
+
+    QString sequenceId;
+    if (!simulatePrecomposeAndSave(timeline,
+                                   QStringLiteral("Comp 1"),
+                                   &sequenceId,
+                                   detail)) {
+        return false;
+    }
+    if (!containsSequenceId(timeline.sequences(), sequenceId)) {
+        if (detail)
+            *detail = QStringLiteral("%1 missing before undo").arg(sequenceId);
+        return false;
+    }
+
+    timeline.undo();
+    return assertNoPrecomposeStoreLeak(timeline, baselineCount, detail);
+}
+
+bool doublePrecomposeUndoClearsSequenceStore(const ClipInfo &media, QString *detail)
+{
+    Timeline timeline;
+    int baselineCount = 0;
+    if (!preparePrecomposeUndoTimeline(timeline, media, &baselineCount, detail))
+        return false;
+
+    QString firstSequenceId;
+    if (!simulatePrecomposeAndSave(timeline,
+                                   QStringLiteral("Comp 1"),
+                                   &firstSequenceId,
+                                   detail)) {
+        return false;
+    }
+
+    QString secondSequenceId;
+    if (!simulatePrecomposeAndSave(timeline,
+                                   QStringLiteral("Comp 2"),
+                                   &secondSequenceId,
+                                   detail)) {
+        return false;
+    }
+    if (firstSequenceId == secondSequenceId) {
+        if (detail)
+            *detail = QStringLiteral("second precompose reused %1").arg(firstSequenceId);
+        return false;
+    }
+    if (!containsSequenceId(timeline.sequences(), firstSequenceId)
+        || !containsSequenceId(timeline.sequences(), secondSequenceId)) {
+        if (detail) {
+            *detail = QStringLiteral("precompose sequences missing before undo: %1, %2")
+                .arg(firstSequenceId, secondSequenceId);
+        }
+        return false;
+    }
+
+    timeline.undo();
+    timeline.undo();
+    return assertNoPrecomposeStoreLeak(timeline, baselineCount, detail);
+}
+
 } // namespace
 
 int runNestSequenceSelftest()
@@ -292,6 +518,16 @@ int runNestSequenceSelftest()
             .scaled(outSize, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
     check(12, "legacy no-nest render remains decode-byte-identical",
           !direct.isNull() && equalRgbaBytes(direct, decoded));
+
+    QString precomposeUndoDetail;
+    check(13, "single precompose undo clears sequence store",
+          singlePrecomposeUndoClearsSequenceStore(media, &precomposeUndoDetail),
+          precomposeUndoDetail);
+
+    precomposeUndoDetail.clear();
+    check(14, "double precompose two undos clear sequence store",
+          doublePrecomposeUndoClearsSequenceStore(media, &precomposeUndoDetail),
+          precomposeUndoDetail);
 
     qInfo().noquote() << QStringLiteral("[nest-sequence] summary: %1 PASS, %2 FAIL")
         .arg(passed).arg(failed);

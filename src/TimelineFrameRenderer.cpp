@@ -833,6 +833,7 @@ QImage renderFrameFromTracks(const Timeline *timeline,
                              qint64 usec,
                              QSize outSize,
                              int sequenceDepth,
+                             const QVector<TimelineSequence> &sequenceSnapshot,
                              QVector<QString> &sequenceStack,
                              bool applyTimelineGlobals);
 
@@ -848,6 +849,7 @@ QImage renderSequenceReferenceFrame(const Timeline *timeline,
                                     double sourceSec,
                                     QSize outSize,
                                     int sequenceDepth,
+                                    const QVector<TimelineSequence> &sequenceSnapshot,
                                     QVector<QString> &sequenceStack)
 {
     if (!timeline || outSize.isEmpty())
@@ -862,8 +864,7 @@ QImage renderSequenceReferenceFrame(const Timeline *timeline,
         return transparentFrame(outSize);
     }
 
-    const QVector<TimelineSequence> sequences = timeline->sequences();
-    const TimelineSequence *sequence = findSequenceById(sequences, refId);
+    const TimelineSequence *sequence = findSequenceById(sequenceSnapshot, refId);
     if (!sequence)
         return transparentFrame(outSize);
 
@@ -876,6 +877,7 @@ QImage renderSequenceReferenceFrame(const Timeline *timeline,
         childUsec,
         outSize,
         sequenceDepth + 1,
+        sequenceSnapshot,
         sequenceStack,
         /*applyTimelineGlobals=*/false);
     sequenceStack.removeLast();
@@ -888,11 +890,13 @@ QImage renderClipSourceFrame(const Timeline *timeline,
                              double sourceSec,
                              QSize outSize,
                              int sequenceDepth,
+                             const QVector<TimelineSequence> &sequenceSnapshot,
                              QVector<QString> &sequenceStack)
 {
     if (clip.isSequenceReference())
         return renderSequenceReferenceFrame(
-            timeline, clip, sourceSec, outSize, sequenceDepth, sequenceStack);
+            timeline, clip, sourceSec, outSize, sequenceDepth, sequenceSnapshot,
+            sequenceStack);
     return decodeClipFrameNative(clip.filePath, sourceSec);
 }
 
@@ -901,6 +905,7 @@ QImage renderFrameFromTracks(const Timeline *timeline,
                              qint64 usec,
                              QSize outSize,
                              int sequenceDepth,
+                             const QVector<TimelineSequence> &sequenceSnapshot,
                              QVector<QString> &sequenceStack,
                              bool applyTimelineGlobals)
 {
@@ -981,7 +986,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         } else {
 
         const QImage v1NativeRaw = renderClipSourceFrame(
-            timeline, v1Clip, v1SourceSec, outSize, sequenceDepth, sequenceStack);
+            timeline, v1Clip, v1SourceSec, outSize, sequenceDepth,
+            sequenceSnapshot, sequenceStack);
         if (v1NativeRaw.isNull())
             return QImage();
 
@@ -1143,7 +1149,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
             continue;
         }
         const QImage nativeRaw = renderClipSourceFrame(
-            timeline, c, srcSec, outSize, sequenceDepth, sequenceStack);
+            timeline, c, srcSec, outSize, sequenceDepth, sequenceSnapshot,
+            sequenceStack);
         if (nativeRaw.isNull())
             continue;
         // S4: grade each overlay clip in native resolution too (same per-clip
@@ -1670,9 +1677,11 @@ QImage renderFrameFromTracks(const Timeline *timeline,
     return applyTextOverlays(adj, timeline, usec, &v1Clip);
 }
 
-} // namespace
-
-QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize outSize)
+QImage renderFrameAtSingleWithSequenceSnapshot(
+    const Timeline *timeline,
+    qint64 usec,
+    QSize outSize,
+    const QVector<TimelineSequence> &sequenceSnapshot)
 {
     if (!timeline)
         return QImage();
@@ -1685,8 +1694,20 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
                                  usec,
                                  outSize,
                                  /*sequenceDepth=*/0,
+                                 sequenceSnapshot,
                                  sequenceStack,
                                  /*applyTimelineGlobals=*/true);
+}
+
+} // namespace
+
+QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize outSize)
+{
+    if (!timeline)
+        return QImage();
+    const QVector<TimelineSequence> sequenceSnapshot = timeline->sequences();
+    return renderFrameAtSingleWithSequenceSnapshot(timeline, usec, outSize,
+                                                   sequenceSnapshot);
 }
 
 QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
@@ -1708,6 +1729,8 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize,
     if (shutterAngle <= 0.0)
         return detail::renderFrameAtSingle(timeline, usec, outSize);
 
+    const QVector<TimelineSequence> sequenceSnapshot =
+        timeline ? timeline->sequences() : QVector<TimelineSequence>();
     const double windowUs = (shutterAngle / 360.0) * frameDurationUs;
 
     QVector<QImage> samples;
@@ -1717,12 +1740,14 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize,
             static_cast<double>(k) - (static_cast<double>(n - 1) / 2.0);
         const qint64 sampleUsec =
             usec + qRound64(centered * windowUs / static_cast<double>(n));
-        samples.append(detail::renderFrameAtSingle(timeline, sampleUsec, outSize));
+        samples.append(renderFrameAtSingleWithSequenceSnapshot(
+            timeline, sampleUsec, outSize, sequenceSnapshot));
     }
 
     const QImage averaged = motionblur::averagePremultiplied(samples);
     return averaged.isNull()
-        ? detail::renderFrameAtSingle(timeline, usec, outSize)
+        ? renderFrameAtSingleWithSequenceSnapshot(timeline, usec, outSize,
+                                                  sequenceSnapshot)
         : averaged;
 }
 
