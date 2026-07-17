@@ -1655,6 +1655,7 @@ void GLPreview::setDisplayAspectRatio(double aspectRatio)
 void GLPreview::setColorCorrection(const ColorCorrection &cc)
 {
     m_cc = cc;
+    ++m_colorCorrectionSetCountForTest;
     update();
 }
 

@@ -6,17 +6,23 @@
 #include "../TimelineFrameRenderer.h"
 #include "../UndoManager.h"
 #include "../VideoEffect.h"
+#include "../VideoPlayer.h"
+#include "../GLPreview.h"
 #include "../libavcore/Encode.h"
 
 #include <cmath>
 #include <cstdio>
 
+#include <QApplication>
 #include <QByteArray>
 #include <QColor>
+#include <QEventLoop>
 #include <QImage>
+#include <QSettings>
 #include <QSize>
 #include <QString>
 #include <QTemporaryDir>
+#include <QVariant>
 #include <QVector>
 
 namespace {
@@ -174,6 +180,52 @@ bool sameKeyframes(const KeyframeManager &a, const KeyframeManager &b)
     return true;
 }
 
+bool sameColorCorrection(const ColorCorrection &a, const ColorCorrection &b)
+{
+    return near(a.brightness, b.brightness)
+        && near(a.contrast, b.contrast)
+        && near(a.saturation, b.saturation)
+        && near(a.hue, b.hue)
+        && near(a.temperature, b.temperature)
+        && near(a.tint, b.tint)
+        && near(a.gamma, b.gamma)
+        && near(a.highlights, b.highlights)
+        && near(a.shadows, b.shadows)
+        && near(a.exposure, b.exposure)
+        && near(a.liftR, b.liftR)
+        && near(a.liftG, b.liftG)
+        && near(a.liftB, b.liftB)
+        && near(a.gammaR, b.gammaR)
+        && near(a.gammaG, b.gammaG)
+        && near(a.gammaB, b.gammaB)
+        && near(a.gainR, b.gainR)
+        && near(a.gainG, b.gainG)
+        && near(a.gainB, b.gainB);
+}
+
+bool glPreviewInitializes(QString *detail)
+{
+    if (!qApp) {
+        if (detail)
+            *detail = QStringLiteral("no QApplication instance");
+        return false;
+    }
+
+    GLPreview probe;
+    probe.resize(64, 48);
+    probe.show();
+    for (int i = 0; i < 8; ++i) {
+        QApplication::processEvents(QEventLoop::AllEvents, 25);
+        probe.grabFramebuffer();
+        if (probe.context() && probe.context()->isValid())
+            return true;
+    }
+
+    if (detail)
+        *detail = QStringLiteral("no usable QOpenGLWidget context");
+    return false;
+}
+
 ProjectData makeProjectWithClip(const ClipInfo &clip)
 {
     ProjectData data;
@@ -187,6 +239,7 @@ ProjectData makeProjectWithClip(const ClipInfo &clip)
 int runGradeKeyframeSelftest()
 {
     int passed = 0;
+    int skipped = 0;
     int failed = 0;
 
     auto check = [&](int gate, const char *name, bool ok,
@@ -199,6 +252,14 @@ int runGradeKeyframeSelftest()
                     detail.isEmpty() ? "" : " - ",
                     detail.isEmpty() ? "" : detailUtf8.constData());
         ok ? ++passed : ++failed;
+    };
+    auto skip = [&](int gate, const char *name, const QString &detail) {
+        const QByteArray detailUtf8 = detail.toUtf8();
+        std::printf("[grade-keyframe] SKIP G%d %s - %s\n",
+                    gate,
+                    name,
+                    detailUtf8.constData());
+        ++skipped;
     };
 
     QTemporaryDir tempDir;
@@ -402,6 +463,119 @@ int runGradeKeyframeSelftest()
                                      : QStringLiteral("false")));
     }
 
-    std::printf("[grade-keyframe] summary: %d PASS, %d FAIL\n", passed, failed);
+    // G7: GPU preview pushes the playhead-evaluated grade to GLPreview, while
+    // composite-baked mode and disabled GPU effects leave the current GL grade
+    // untouched.
+    {
+        QString glSkipDetail;
+        if (!glPreviewInitializes(&glSkipDetail)) {
+            skip(7, "GPU preview grade keyframe wiring", glSkipDetail);
+        } else {
+            ClipInfo clip = makeClip(clipPath);
+            clip.keyframes = makeGradeKeyframes();
+
+            Timeline timeline;
+            setTimelineClip(timeline, clip);
+
+            PlaybackEntry entry;
+            entry.filePath = clipPath;
+            entry.clipIn = 0.0;
+            entry.clipOut = clip.duration;
+            entry.timelineStart = 0.0;
+            entry.timelineEnd = clip.duration;
+            entry.speed = 1.0;
+            entry.sourceTrack = 0;
+            entry.sourceClipIndex = 0;
+
+            VideoPlayer player;
+            player.resize(160, 120);
+            player.glPreview()->setTimeline(&timeline);
+            player.glPreview()->setCompositeBakedMode(false);
+            player.setSequence(QVector<PlaybackEntry>{entry});
+
+            QSettings prefs("VSimpleEditor", "Preferences");
+            const bool hadGpuEffectsPref = prefs.contains("gpuEffectsEnabled");
+            const QVariant savedGpuEffectsPref = prefs.value("gpuEffectsEnabled");
+            prefs.setValue("gpuEffectsEnabled", true);
+            prefs.sync();
+
+            GLPreview *preview = player.glPreview();
+            const int beforeAnimatedPush = preview->colorCorrectionSetCountForTest();
+            const bool animatedPushed =
+                player.pushActiveClipColorCorrectionToGlPreviewForTest(500000);
+            const int afterAnimatedPush = preview->colorCorrectionSetCountForTest();
+            const ColorCorrection expectedAnimated =
+                clipanim::effectiveColorCorrectionAt(clip, 0.5);
+            const bool animatedOk =
+                animatedPushed
+                && afterAnimatedPush == beforeAnimatedPush + 1
+                && sameColorCorrection(preview->colorCorrectionForTest(),
+                                       expectedAnimated);
+
+            preview->setCompositeBakedMode(true);
+            const int beforeBakedGuard = preview->colorCorrectionSetCountForTest();
+            const bool bakedPushed =
+                player.pushActiveClipColorCorrectionToGlPreviewForTest(500000);
+            const int afterBakedGuard = preview->colorCorrectionSetCountForTest();
+            preview->setCompositeBakedMode(false);
+            const bool bakedGuardOk =
+                !bakedPushed && afterBakedGuard == beforeBakedGuard;
+
+            prefs.setValue("gpuEffectsEnabled", false);
+            prefs.sync();
+            const int beforeDisabledGuard = preview->colorCorrectionSetCountForTest();
+            const bool disabledPushed =
+                player.pushActiveClipColorCorrectionToGlPreviewForTest(500000);
+            const int afterDisabledGuard = preview->colorCorrectionSetCountForTest();
+            const bool shaderStillEnabled = preview->effectsEnabled();
+            prefs.setValue("gpuEffectsEnabled", true);
+            prefs.sync();
+            const bool disabledGuardOk =
+                !disabledPushed
+                && afterDisabledGuard == beforeDisabledGuard
+                && shaderStillEnabled;
+
+            ClipInfo staticClip = makeClip(clipPath);
+            staticClip.colorCorrection.brightness = 6.0;
+            staticClip.colorCorrection.contrast = -4.0;
+            staticClip.colorCorrection.saturation = 8.0;
+            staticClip.colorCorrection.exposure = 0.125;
+            staticClip.colorCorrection.temperature = 12.0;
+            staticClip.colorCorrection.liftR = 0.05;
+            staticClip.colorCorrection.gammaG = -0.10;
+            staticClip.colorCorrection.gainB = 0.15;
+            setTimelineClip(timeline, staticClip);
+
+            const int beforeStaticPush = preview->colorCorrectionSetCountForTest();
+            const bool staticPushed =
+                player.pushActiveClipColorCorrectionToGlPreviewForTest(500000);
+            const int afterStaticPush = preview->colorCorrectionSetCountForTest();
+            const bool staticNoopOk =
+                staticPushed
+                && afterStaticPush == beforeStaticPush + 1
+                && sameColorCorrection(preview->colorCorrectionForTest(),
+                                       staticClip.colorCorrection);
+
+            const bool ok = animatedOk && bakedGuardOk
+                && disabledGuardOk && staticNoopOk;
+            check(7, "GPU preview grade keyframe wiring",
+                  ok,
+                  QStringLiteral("animated=%1 bakedGuard=%2 disabledGuard=%3 staticNoop=%4 shaderStillEnabled=%5")
+                      .arg(animatedOk ? QStringLiteral("true") : QStringLiteral("false"))
+                      .arg(bakedGuardOk ? QStringLiteral("true") : QStringLiteral("false"))
+                      .arg(disabledGuardOk ? QStringLiteral("true") : QStringLiteral("false"))
+                      .arg(staticNoopOk ? QStringLiteral("true") : QStringLiteral("false"))
+                      .arg(shaderStillEnabled ? QStringLiteral("true") : QStringLiteral("false")));
+
+            if (hadGpuEffectsPref)
+                prefs.setValue("gpuEffectsEnabled", savedGpuEffectsPref);
+            else
+                prefs.remove("gpuEffectsEnabled");
+            prefs.sync();
+        }
+    }
+
+    std::printf("[grade-keyframe] summary: %d PASS, %d SKIP, %d FAIL\n",
+                passed, skipped, failed);
     return failed == 0 ? 0 : 1;
 }

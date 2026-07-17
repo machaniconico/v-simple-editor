@@ -253,6 +253,8 @@ public:
         const QVector<double> &overlayDy,
         const QVector<double> &overlayRotationDeg = {},
         const QVector<LayerStyle> &overlayStyle = {}) const;
+    // Test-only seam for grade-keyframe GPU-preview wiring.
+    bool pushActiveClipColorCorrectionToGlPreviewForTest(qint64 timelineUsec);
 
     // NOTE: the genuine text baker is now the free function
     // textbake::bakeOverlays (src/TextOverlayBake.h), extracted verbatim from
@@ -328,6 +330,7 @@ private:
     void scheduleNextFrame();
     void performPendingSeek();
     void updatePositionUi();
+    bool pushActiveClipColorCorrectionToGlPreview();
     // Like updatePositionUi() but does NOT reproject m_timelinePositionUs
     // from m_currentPositionUs. Used by stepForward/Backward when they need
     // the seekbar / time label / positionChanged signal to honour the

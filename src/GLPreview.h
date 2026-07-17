@@ -37,6 +37,9 @@ public:
     void setBrushAnimationProgress(double progress);
     void setDisplayAspectRatio(double aspectRatio);
     void setColorCorrection(const ColorCorrection &cc);
+    // Test-only seam for selftests that verify VideoPlayer -> GLPreview wiring.
+    ColorCorrection colorCorrectionForTest() const { return m_cc; }
+    int colorCorrectionSetCountForTest() const { return m_colorCorrectionSetCountForTest; }
     // 0 = none (SDR sRGB), 1 = PQ (SMPTE ST 2084), 2 = HLG (ARIB STD-B67)
     void setHdrTransfer(int transfer);
     int hdrTransfer() const { return m_hdrTransfer; }
@@ -315,6 +318,7 @@ private:
     BrushAnimation *m_brushAnimation = nullptr;
     double m_brushAnimationProgress = 0.0;
     ColorCorrection m_cc;
+    int m_colorCorrectionSetCountForTest = 0;
     bool m_effectsEnabled = true;
     bool m_needsUpload = false;
     double m_displayAspectRatio = 0.0;

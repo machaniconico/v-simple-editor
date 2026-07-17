@@ -2945,6 +2945,47 @@ void VideoPlayer::displaySeekFrameConformed(const QImage &v1Image)
     displayFrame(canvas);
 }
 
+bool VideoPlayer::pushActiveClipColorCorrectionToGlPreview()
+{
+    // Baked/composited frames already include per-clip grade. When the
+    // user disables GPU preview effects, keep GLPreview's shader state
+    // unchanged so static grade remains available through the legacy path.
+    if (!m_useGL || !m_glPreview)
+        return false;
+    if (!QSettings("VSimpleEditor", "Preferences")
+             .value("gpuEffectsEnabled", true).toBool()) {
+        return false;
+    }
+    if (m_glPreview->compositeBakedMode())
+        return false;
+    if (!sequenceActive()
+        || m_activeEntry < 0
+        || m_activeEntry >= m_sequence.size()) {
+        return false;
+    }
+
+    const Timeline *timeline = m_glPreview->timeline();
+    const PlaybackEntry &entry = m_sequence[m_activeEntry];
+    const ClipInfo *clip = clipForPlaybackEntry(timeline, entry);
+    if (!clip)
+        return false;
+
+    const double clipLocalSec = entryClipLocalSeconds(entry, m_timelinePositionUs);
+    const ColorCorrection effective =
+        clipanim::effectiveColorCorrectionAt(*clip, clipLocalSec);
+    m_glPreview->setColorCorrection(effective);
+    return true;
+}
+
+bool VideoPlayer::pushActiveClipColorCorrectionToGlPreviewForTest(qint64 timelineUsec)
+{
+    const qint64 previousTimelineUsec = m_timelinePositionUs;
+    m_timelinePositionUs = timelineUsec;
+    const bool pushed = pushActiveClipColorCorrectionToGlPreview();
+    m_timelinePositionUs = previousTimelineUsec;
+    return pushed;
+}
+
 void VideoPlayer::displayFrame(const QImage &image)
 {
     undotrace::log("displayFrame:enter");
@@ -3144,6 +3185,7 @@ void VideoPlayer::displayFrame(const QImage &image)
         } else {
             m_glPreview->setStabilizerKeyframes({});
         }
+        pushActiveClipColorCorrectionToGlPreview();
         undotrace::log("displayFrame:beforeGL");
         m_glPreview->displayFrame(display);
         undotrace::log("displayFrame:afterGL");
@@ -3503,9 +3545,9 @@ void VideoPlayer::setPreviewEffects(const QVector<VideoEffect> &effects, bool li
 {
     m_previewEffectsLive = live;
 
-    const bool gpuEnabled = QSettings("VSimpleEditor", "Preferences")
-                                .value("gpuEffectsEnabled", true).toBool()
-                            && m_useGL && m_glPreview;
+    const bool gpuEffectsEnabled = QSettings("VSimpleEditor", "Preferences")
+                                       .value("gpuEffectsEnabled", true).toBool();
+    const bool gpuEnabled = gpuEffectsEnabled && m_useGL && m_glPreview;
 
     QVector<VideoEffect> gpu;
     QVector<VideoEffect> cpu;
