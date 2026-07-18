@@ -127,6 +127,7 @@ int runPlanarPresetSelftest();
 #endif
 int runPlatformMockE2eSelftest();
 int runPptxExportSelftest();
+int runPrecomposeE2ESelftest();
 int runProExtSelftest();
 int runProSelftest();
 int runProjTmplSelftest();
@@ -659,6 +660,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "GraphEditor model roundtrip, panel-edit undo restore, and ClipAnim evaluation parity" },
     { "nest-sequence", "VEDITOR_NEST_SEQUENCE_SELFTEST", runNestSequenceSelftest, true,
       "Nested sequences: recursive render, cycle/depth guards, audio flatten, store roundtrip, no-nest byte identity" },
+    { "precompose-e2e", "VEDITOR_PRECOMPOSE_E2E_SELFTEST", runPrecomposeE2ESelftest, true,
+      "MainWindow precompose UI-flow backend: sequence ref replacement plus single/double undo store cleanup" },
     { "ripple-delete", "VEDITOR_RIPPLE_DELETE_SELFTEST", runRippleDeleteSelftest, true,
       "Ripple delete and gap close: all-track time-range ripple, one-step undo, and no-selection no-op" },
     { "e2e",               "VEDITOR_E2E_SELFTEST",                runE2eSelftest,                true,

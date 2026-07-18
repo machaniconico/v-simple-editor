@@ -212,6 +212,18 @@ class MainWindow : public QMainWindow
 public:
     explicit MainWindow(QWidget *parent = nullptr);
 
+    struct PrecomposeResult {
+        bool success = false;
+        QString failureReason;
+        bool warning = false;
+        QString sequenceId;
+    };
+
+    // Non-interactive pre-compose entry point used by selftests and other
+    // programmatic callers. Returns success=false with failureReason populated
+    // instead of showing dialogs.
+    PrecomposeResult precomposeSelectionWithName(const QString &name);
+
 public slots:
     // Used by main.cpp when the app is launched with a file argument.
     // Loads the given file as a media clip (same code path as File > Open).

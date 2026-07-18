@@ -94,6 +94,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/LoudnessExportWireSelftest.cpp
     src/selftests/FrameExportSelftest.cpp
     src/selftests/NestSequenceSelftest.cpp
+    src/selftests/PrecomposeE2ESelftest.cpp
     src/selftests/AdjustmentLayerSelftest.cpp
     src/selftests/ClipMaskSelftest.cpp
     src/selftests/GradeLggSerializationSelftest.cpp

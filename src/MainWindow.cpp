@@ -12638,26 +12638,28 @@ QString uniquePrecomposeSequenceId(Timeline *timeline)
 
 } // namespace
 
-void MainWindow::precomposeSelected()
+MainWindow::PrecomposeResult MainWindow::precomposeSelectionWithName(const QString &requestedName)
 {
+    PrecomposeResult outcome;
+
     if (!m_timeline || !m_timeline->hasAnySelection()) {
-        QMessageBox::information(this, "Pre-Compose", "Select clips first.");
-        return;
+        outcome.failureReason = QStringLiteral("Select clips first.");
+        return outcome;
     }
 
-    bool ok;
-    QString name = QInputDialog::getText(this, "Pre-Compose",
-        "Composition name:", QLineEdit::Normal, "Comp 1", &ok);
-    name = name.trimmed();
-    if (!ok || name.isEmpty()) return;
+    const QString name = requestedName.trimmed();
+    if (name.isEmpty()) {
+        outcome.failureReason = QStringLiteral("Composition name is empty.");
+        return outcome;
+    }
 
     PrecomposeSelection selection;
     extendPrecomposeSelection(m_timeline->videoTracks(), true, selection);
     extendPrecomposeSelection(m_timeline->audioTracks(), false, selection);
     if ((!selection.hasVideo && !selection.hasAudio)
         || selection.endSec <= selection.startSec + kPrecomposeEps) {
-        QMessageBox::information(this, "Pre-Compose", "Select a non-empty range first.");
-        return;
+        outcome.failureReason = QStringLiteral("Select a non-empty range first.");
+        return outcome;
     }
 
     const QString sequenceId = uniquePrecomposeSequenceId(m_timeline);
@@ -12714,13 +12716,14 @@ void MainWindow::precomposeSelected()
     }
 
     if (!extractedAny) {
-        QMessageBox::information(this, "Pre-Compose", "No clips were found in the selected range.");
-        return;
+        outcome.failureReason = QStringLiteral("No clips were found in the selected range.");
+        return outcome;
     }
 
     if (!m_timeline->addSequence(sequence)) {
-        QMessageBox::warning(this, "Pre-Compose", "Could not create a nested sequence.");
-        return;
+        outcome.failureReason = QStringLiteral("Could not create a nested sequence.");
+        outcome.warning = true;
+        return outcome;
     }
 
     for (int i = 0; i < parentVideoTracks.size(); ++i) {
@@ -12768,6 +12771,33 @@ void MainWindow::precomposeSelected()
         QStringLiteral("Pre-composed %1 into nested sequence '%2'")
             .arg(QString::number(rangeDuration, 'f', 2) + QStringLiteral("s"), name),
         5000);
+    outcome.success = true;
+    outcome.sequenceId = sequenceId;
+    return outcome;
+}
+
+void MainWindow::precomposeSelected()
+{
+    if (!m_timeline || !m_timeline->hasAnySelection()) {
+        QMessageBox::information(this, "Pre-Compose", "Select clips first.");
+        return;
+    }
+
+    bool ok = false;
+    QString name = QInputDialog::getText(this, "Pre-Compose",
+        "Composition name:", QLineEdit::Normal, "Comp 1", &ok);
+    name = name.trimmed();
+    if (!ok || name.isEmpty()) return;
+
+    const PrecomposeResult result = precomposeSelectionWithName(name);
+    if (result.success)
+        return;
+
+    if (result.warning) {
+        QMessageBox::warning(this, "Pre-Compose", result.failureReason);
+    } else {
+        QMessageBox::information(this, "Pre-Compose", result.failureReason);
+    }
 }
 
 void MainWindow::showResourceGuide()
