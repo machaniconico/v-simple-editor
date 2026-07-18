@@ -6289,6 +6289,8 @@ void MainWindow::setupMenuBar()
     }
     connect(gpuEffectsAction, &QAction::toggled, this, [this](bool on) {
         QSettings("VSimpleEditor", "Preferences").setValue("gpuEffectsEnabled", on);
+        if (m_player)
+            m_player->setGpuEffectsEnabled(on);
         if (m_player && m_timeline && m_timeline->hasSelection())
             m_player->setPreviewEffects(m_timeline->clipEffects(), /*live=*/true);
         else if (m_player)

@@ -498,6 +498,7 @@ int runGradeKeyframeSelftest()
             const QVariant savedGpuEffectsPref = prefs.value("gpuEffectsEnabled");
             prefs.setValue("gpuEffectsEnabled", true);
             prefs.sync();
+            player.setGpuEffectsEnabled(true);
 
             GLPreview *preview = player.glPreview();
             const int beforeAnimatedPush = preview->colorCorrectionSetCountForTest();
@@ -523,6 +524,7 @@ int runGradeKeyframeSelftest()
 
             prefs.setValue("gpuEffectsEnabled", false);
             prefs.sync();
+            player.setGpuEffectsEnabled(false);
             const int beforeDisabledGuard = preview->colorCorrectionSetCountForTest();
             const bool disabledPushed =
                 player.pushActiveClipColorCorrectionToGlPreviewForTest(500000);
@@ -530,6 +532,7 @@ int runGradeKeyframeSelftest()
             const bool shaderStillEnabled = preview->effectsEnabled();
             prefs.setValue("gpuEffectsEnabled", true);
             prefs.sync();
+            player.setGpuEffectsEnabled(true);
             const bool disabledGuardOk =
                 !disabledPushed
                 && afterDisabledGuard == beforeDisabledGuard

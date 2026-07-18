@@ -1047,6 +1047,8 @@ void setPlaybackProxyDivisorPreference(int div)
 
 VideoPlayer::VideoPlayer(QWidget *parent)
     : QWidget(parent)
+    , m_gpuEffectsEnabled(QSettings("VSimpleEditor", "Preferences")
+                              .value("gpuEffectsEnabled", true).toBool())
 {
     qInfo() << "VideoPlayer::ctor";
     setupUI();
@@ -2952,8 +2954,7 @@ bool VideoPlayer::pushActiveClipColorCorrectionToGlPreview()
     // unchanged so static grade remains available through the legacy path.
     if (!m_useGL || !m_glPreview)
         return false;
-    if (!QSettings("VSimpleEditor", "Preferences")
-             .value("gpuEffectsEnabled", true).toBool()) {
+    if (!m_gpuEffectsEnabled) {
         return false;
     }
     if (m_glPreview->compositeBakedMode())
@@ -3545,9 +3546,7 @@ void VideoPlayer::setPreviewEffects(const QVector<VideoEffect> &effects, bool li
 {
     m_previewEffectsLive = live;
 
-    const bool gpuEffectsEnabled = QSettings("VSimpleEditor", "Preferences")
-                                       .value("gpuEffectsEnabled", true).toBool();
-    const bool gpuEnabled = gpuEffectsEnabled && m_useGL && m_glPreview;
+    const bool gpuEnabled = m_gpuEffectsEnabled && m_useGL && m_glPreview;
 
     QVector<VideoEffect> gpu;
     QVector<VideoEffect> cpu;
@@ -3569,6 +3568,13 @@ void VideoPlayer::setPreviewEffects(const QVector<VideoEffect> &effects, bool li
         m_glPreview->setVideoEffects(gpu);
 
     refreshDisplayedFrame();
+}
+
+void VideoPlayer::setGpuEffectsEnabled(bool enabled)
+{
+    if (m_gpuEffectsEnabled == enabled)
+        return;
+    m_gpuEffectsEnabled = enabled;
 }
 
 void VideoPlayer::setGLAcceleration(bool enabled)

@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <limits>
 #include <memory>
+#include <cstring>
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -21,6 +22,8 @@ extern "C" {
 #include <libswresample/swresample.h>
 #include <libavutil/avutil.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/imgutils.h>
+#include <libavutil/mem.h>
 #include <libavutil/samplefmt.h>
 }
 
@@ -43,6 +46,36 @@ struct SwrContextDeleter {
 };
 
 using SwrContextPtr = std::unique_ptr<SwrContext, SwrContextDeleter>;
+
+struct AvImageBuffer {
+    uint8_t *data[4] = { nullptr, nullptr, nullptr, nullptr };
+    int linesize[4] = { 0, 0, 0, 0 };
+
+    ~AvImageBuffer()
+    {
+        av_freep(&data[0]);
+    }
+
+    AvImageBuffer() = default;
+    AvImageBuffer(const AvImageBuffer&) = delete;
+    AvImageBuffer& operator=(const AvImageBuffer&) = delete;
+
+    bool allocateGray8(int width, int height)
+    {
+        return av_image_alloc(data, linesize, width, height,
+                              AV_PIX_FMT_GRAY8, 64) >= 0;
+    }
+};
+
+static void copyVisibleGray8Rows(const uint8_t *src,
+                                 int srcLinesize,
+                                 int width,
+                                 int height,
+                                 uint8_t *dst)
+{
+    for (int y = 0; y < height; ++y)
+        std::memcpy(dst + y * width, src + y * srcLinesize, width);
+}
 
 struct ChannelLayoutGuard {
     AVChannelLayout layout = {};
@@ -368,6 +401,15 @@ QVector<ScoredSegment> AIHighlight::analyzeMotionActivity(const QString &filePat
 
     QVector<uint8_t> prevFrame(cmpW * cmpH, 0);
     QVector<uint8_t> currFrame(cmpW * cmpH, 0);
+    AvImageBuffer paddedFrame;
+    if (!paddedFrame.allocateGray8(cmpW, cmpH)) {
+        av_frame_free(&frame);
+        av_packet_free(&packet);
+        sws_freeContext(swsCtx);
+        avcodec_free_context(&decCtx);
+        avformat_close_input(&fmtCtx);
+        return scores;
+    }
     bool hasPrev = false;
 
     AVStream *stream = fmtCtx->streams[videoIdx];
@@ -390,10 +432,12 @@ QVector<ScoredSegment> AIHighlight::analyzeMotionActivity(const QString &filePat
                 if (frameCount % skipInterval != 0) continue;
 
                 // Scale to grayscale
-                uint8_t *dest[1] = { currFrame.data() };
-                int destLinesize[1] = { cmpW };
                 sws_scale(swsCtx, frame->data, frame->linesize, 0,
-                          frame->height, dest, destLinesize);
+                          frame->height, paddedFrame.data, paddedFrame.linesize);
+                copyVisibleGray8Rows(paddedFrame.data[0],
+                                     paddedFrame.linesize[0],
+                                     cmpW, cmpH,
+                                     currFrame.data());
 
                 if (hasPrev) {
                     // Compute mean absolute pixel difference
@@ -485,6 +529,15 @@ QVector<ScoredSegment> AIHighlight::analyzeSceneChanges(const QString &filePath,
 
     QVector<uint8_t> prevFrame(cmpW * cmpH, 0);
     QVector<uint8_t> currFrame(cmpW * cmpH, 0);
+    AvImageBuffer paddedFrame;
+    if (!paddedFrame.allocateGray8(cmpW, cmpH)) {
+        av_frame_free(&frame);
+        av_packet_free(&packet);
+        sws_freeContext(swsCtx);
+        avcodec_free_context(&decCtx);
+        avformat_close_input(&fmtCtx);
+        return scores;
+    }
     bool hasPrev = false;
     int frameCount = 0;
 
@@ -503,10 +556,12 @@ QVector<ScoredSegment> AIHighlight::analyzeSceneChanges(const QString &filePath,
                 frameCount++;
                 if (frameCount % checkInterval != 0) continue;
 
-                uint8_t *dest[1] = { currFrame.data() };
-                int destLinesize[1] = { cmpW };
                 sws_scale(swsCtx, frame->data, frame->linesize, 0,
-                          frame->height, dest, destLinesize);
+                          frame->height, paddedFrame.data, paddedFrame.linesize);
+                copyVisibleGray8Rows(paddedFrame.data[0],
+                                     paddedFrame.linesize[0],
+                                     cmpW, cmpH,
+                                     currFrame.data());
 
                 if (hasPrev) {
                     double totalDiff = 0.0;

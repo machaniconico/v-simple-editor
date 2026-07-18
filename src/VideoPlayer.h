@@ -146,6 +146,7 @@ public:
     // live=false (default) is pause-only — used during dialog editing so
     // heavy per-frame work doesn't stutter slider drags.
     void setPreviewEffects(const QVector<VideoEffect> &effects, bool live = false);
+    void setGpuEffectsEnabled(bool enabled);
     bool isGLAccelerated() const { return m_useGL; }
     void setGLAcceleration(bool enabled);
 
@@ -678,6 +679,7 @@ private:
     // default/committed state.
     QVector<VideoEffect> m_previewEffects;
     bool m_previewEffectsLive = false;
+    bool m_gpuEffectsEnabled = true;
     // Preview proxy divisor (1=Full, 2=1/2, 4=1/4, 8=1/8). Applied only when
     // CPU-path effects are active during playback, so heavy Sharpen/Mosaic/
     // ChromaKey stay smooth. Persisted via QSettings "proxyDivisor".
