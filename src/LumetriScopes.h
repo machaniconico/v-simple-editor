@@ -4,6 +4,7 @@
 #include <QWidget>
 #include <QElapsedTimer>
 #include <QtMath>
+#include <array>
 #include <memory>
 #include <vector>
 #include <QHash>
@@ -31,6 +32,19 @@ inline void rgbToYCbCr709(int r, int g, int b, int &y, int &cb, int &cr)
 }
 } // namespace LumetriColor
 
+struct RgbParadeData {
+    using ColumnHistogram = std::array<int, 256>;
+
+    std::array<std::vector<ColumnHistogram>, 3> channels;
+    int sourceHeight = 0;
+
+    int width() const { return static_cast<int>(channels[0].size()); }
+    bool isEmpty() const { return channels[0].empty(); }
+};
+
+RgbParadeData computeRgbParadeData(const QImage &frame);
+QImage renderRgbParadeImage(const RgbParadeData &data, int width, int height);
+
 // Abstract interface for a measurement scope (Histogram, Waveform,
 // Vectorscope, ...). Each scope implements its own data-accumulation
 // and painting logic so adding a fourth scope only requires one new
@@ -46,7 +60,7 @@ public:
 };
 
 // Lumetri-style measurement scopes (RGB Histogram + Luma Waveform +
-// Vectorscope). Three scopes share a single container widget that
+// Vectorscope + RGB Parade). Scopes share a single container widget that
 // exposes a setFrame() slot.  Frame ingestion is throttled to ~10 fps
 // so a 60 fps preview doesn't burn the GUI thread on histogram math.
 class LumetriScopes : public QWidget

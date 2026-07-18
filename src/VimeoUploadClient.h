@@ -29,6 +29,9 @@ public:
                           QObject* parent = nullptr);
     ~UploadClient() override;
 
+    static void setApiBaseUrl(const QString& url);
+    static QString apiBaseUrl();
+
     void setAccessToken(const QString& accessToken);
     QString accessToken() const { return m_accessToken; }
 

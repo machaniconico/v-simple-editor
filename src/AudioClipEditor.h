@@ -3,6 +3,11 @@
 #include <QWidget>
 #include <QList>
 
+class QDoubleSpinBox;
+class QLabel;
+class QResizeEvent;
+class QSlider;
+
 struct VolumeEnvelopePoint {
     qint64 timeMs = 0;  // クリップ内相対時刻
     double dB = 0.0;    // -60 .. +12 dB
@@ -25,10 +30,19 @@ public:
     // 評価: 任意時刻 t での補間 dB (linear)。範囲外は端点を返す
     double evaluateAt(qint64 timeMs) const;
 
+    void setVolume(double volume);
+    double volume() const;
+    void setPan(double pan);
+    double pan() const;
+    static bool isSliderDragUndoSuppressed();
+
 signals:
     void envelopeChanged(const QList<VolumeEnvelopePoint>& points);
+    void volumeChanged(double volume);
+    void panChanged(double pan);
 
 protected:
+    void resizeEvent(QResizeEvent* e) override;
     void paintEvent(QPaintEvent* e) override;
     void mousePressEvent(QMouseEvent* e) override;
     void mouseMoveEvent(QMouseEvent* e) override;
@@ -40,6 +54,20 @@ private:
     qint64 m_durationMs = 10000;
     QList<VolumeEnvelopePoint> m_points;
     int m_dragIndex = -1;
+    double m_volume = 1.0;
+    double m_pan = 0.0;
+    bool m_updatingControls = false;
+    bool m_volumeSliderDragging = false;
+    bool m_panSliderDragging = false;
+    int m_volumeSliderDragStartValue = 100;
+    int m_panSliderDragStartValue = 0;
+
+    QWidget* m_controlPanel = nullptr;
+    QSlider* m_volumeSlider = nullptr;
+    QDoubleSpinBox* m_volumeSpin = nullptr;
+    QSlider* m_panSlider = nullptr;
+    QDoubleSpinBox* m_panSpin = nullptr;
+    QLabel* m_panLabel = nullptr;
 
     // 座標変換
     QPointF pointToPixel(const VolumeEnvelopePoint& p) const;
@@ -47,12 +75,15 @@ private:
     int hitTest(const QPointF& px, double hitRadiusPx = 8.0) const;  // 既存点インデックス or -1
     void sortPoints();
     void emitChanged();
+    void emitVolumeChangedForUndo(bool recordUndo);
+    void emitPanChangedForUndo(bool recordUndo);
 
     // 描画余白
     static constexpr int kMarginLeft   = 30;
     static constexpr int kMarginRight  = 10;
     static constexpr int kMarginTop    = 10;
     static constexpr int kMarginBottom = 10;
+    static constexpr int kControlsHeight = 44;
 
     static constexpr double kDbMin = -60.0;
     static constexpr double kDbMax =  12.0;

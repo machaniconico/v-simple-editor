@@ -18,9 +18,6 @@ class SocialExportDialog : public QDialog {
 public:
     explicit SocialExportDialog(QWidget* parent = nullptr);
 
-    // 元動画から 1 フレームをサンプルとして渡す (プレビュー用)
-    void setSampleFrame(const QImage& sample);
-
     // 現在の選択を取得
     social::Preset      selectedPreset() const;
     reframe::ReframeParams reframeParams() const;
@@ -38,7 +35,6 @@ private slots:
     void onExportClicked();
 
 private:
-    void updatePreview();
     void updateReframeControlsEnabled();
 
     QImage m_sample;
@@ -54,9 +50,6 @@ private:
     QLabel*           m_manualXLabel     = nullptr;
     QLabel*           m_manualYLabel     = nullptr;
     QLabel*           m_zoomLabel        = nullptr;
-
-    QLabel*           m_previewLabel     = nullptr;
-    QLabel*           m_sourcePreviewLabel = nullptr;
 
     QDialogButtonBox* m_buttonBox        = nullptr;
 };

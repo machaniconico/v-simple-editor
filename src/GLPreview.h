@@ -37,6 +37,9 @@ public:
     void setBrushAnimationProgress(double progress);
     void setDisplayAspectRatio(double aspectRatio);
     void setColorCorrection(const ColorCorrection &cc);
+    // Test-only seam for selftests that verify VideoPlayer -> GLPreview wiring.
+    ColorCorrection colorCorrectionForTest() const { return m_cc; }
+    int colorCorrectionSetCountForTest() const { return m_colorCorrectionSetCountForTest; }
     // 0 = none (SDR sRGB), 1 = PQ (SMPTE ST 2084), 2 = HLG (ARIB STD-B67)
     void setHdrTransfer(int transfer);
     int hdrTransfer() const { return m_hdrTransfer; }
@@ -167,6 +170,7 @@ public:
     // composeAdjustmentLayersAt(timelineUs) in paintGL. nullptr → no-op
     // (preview is bit-identical to pre-INT-1 baseline).
     void setTimeline(Timeline *t) { m_timeline = t; }
+    const Timeline *timeline() const { return m_timeline; }
 
     // Phase 1e — true only when VEDITOR_GL_INTEROP=1 AND WGL_NV_DX_interop2
     // is supported AND all 6 wglDX*NV procs resolved during initializeGL().
@@ -233,6 +237,7 @@ public:
     double videoSourceScale() const { return m_videoSourceScale; }
     double videoSourceDx()    const { return m_videoSourceDx; }
     double videoSourceDy()    const { return m_videoSourceDy; }
+    void setVideoContentInset(double fw, double fh);
     void resetVideoSourceTransform();
     // V3 sprint — Timeline-driven selection arms the handle-draw gate
     // (m_videoTransformSelected) without requiring a separate preview click.
@@ -276,8 +281,12 @@ signals:
     // US-T34 — emitted while the user drags or resizes the video source so
     // VideoPlayer / MainWindow can persist the transform across sessions.
     void videoSourceTransformChanged(double scale, double dx, double dy);
+    // PV-B: プレビュー上で右クリックされた(グローバル座標)。VideoPlayer が
+    // 受けて previewContextMenuRequested に再 emit する。
+    void contextMenuRequested(const QPoint &globalPos);
 
 protected:
+    void contextMenuEvent(QContextMenuEvent *event) override;
     void initializeGL() override;
     void resizeGL(int w, int h) override;
     void paintGL() override;
@@ -309,6 +318,7 @@ private:
     BrushAnimation *m_brushAnimation = nullptr;
     double m_brushAnimationProgress = 0.0;
     ColorCorrection m_cc;
+    int m_colorCorrectionSetCountForTest = 0;
     bool m_effectsEnabled = true;
     bool m_needsUpload = false;
     double m_displayAspectRatio = 0.0;
@@ -359,6 +369,8 @@ private:
     double m_videoSourceScale = 1.0;
     double m_videoSourceDx = 0.0;
     double m_videoSourceDy = 0.0;
+    double m_contentInsetFw = 1.0;
+    double m_contentInsetFh = 1.0;
     bool m_compositeBakedMode = false;
     double m_snapStrength = 12.0;
     bool m_videoTransformSelected = false;

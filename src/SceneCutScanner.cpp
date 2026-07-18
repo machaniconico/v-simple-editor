@@ -3,14 +3,50 @@
 
 #include <QThread>
 #include <QImage>
+#include <cstring>
 
 extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
 #include <libavutil/avutil.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/mem.h>
 #include <libswscale/swscale.h>
 }
+
+namespace {
+
+struct AvImageBuffer {
+    uint8_t* data[4] = { nullptr, nullptr, nullptr, nullptr };
+    int linesize[4] = { 0, 0, 0, 0 };
+
+    ~AvImageBuffer()
+    {
+        av_freep(&data[0]);
+    }
+
+    AvImageBuffer() = default;
+    AvImageBuffer(const AvImageBuffer&) = delete;
+    AvImageBuffer& operator=(const AvImageBuffer&) = delete;
+
+    bool allocateGray8(int width, int height)
+    {
+        return av_image_alloc(data, linesize, width, height,
+                              AV_PIX_FMT_GRAY8, 64) >= 0;
+    }
+};
+
+static void copyVisibleGray8Rows(const uint8_t* src,
+                                 int srcLinesize,
+                                 int width,
+                                 int height,
+                                 uint8_t* dst)
+{
+    for (int y = 0; y < height; ++y)
+        std::memcpy(dst + y * width, src + y * srcLinesize, width);
+}
+
+} // namespace
 
 SceneCutScanner::SceneCutScanner(QObject* parent)
     : QObject(parent)
@@ -199,8 +235,14 @@ void SceneCutScanner::doScan(QString path, double threshold, int minSceneFrames)
     // Allocate a persistent output buffer for the scaled frame.
     const int bufSize = av_image_get_buffer_size(AV_PIX_FMT_GRAY8, dstW, dstH, 1);
     QVector<uint8_t> scaleBuf(bufSize);
-    uint8_t* dstData[4] = { scaleBuf.data(), nullptr, nullptr, nullptr };
-    int      dstLinesize[4] = { dstW, 0, 0, 0 };
+    AvImageBuffer paddedScaleBuf;
+    if (swsCtx && !paddedScaleBuf.allocateGray8(dstW, dstH)) {
+        sws_freeContext(swsCtx);
+        avcodec_free_context(&decCtx);
+        avformat_close_input(&fmtCtx);
+        emit finished(false, QStringLiteral("failed to allocate scale buffer"));
+        return;
+    }
 
     AVPacket* packet = av_packet_alloc();
     AVFrame*  frame  = av_frame_alloc();
@@ -239,11 +281,15 @@ void SceneCutScanner::doScan(QString path, double threshold, int minSceneFrames)
                 sws_scale(swsCtx,
                           frame->data, frame->linesize,
                           0, frame->height,
-                          dstData, dstLinesize);
+                          paddedScaleBuf.data, paddedScaleBuf.linesize);
+                copyVisibleGray8Rows(paddedScaleBuf.data[0],
+                                     paddedScaleBuf.linesize[0],
+                                     dstW, dstH,
+                                     scaleBuf.data());
 
                 // Wrap into QImage (no copy — the buffer lives for the call duration).
-                QImage img(dstData[0], dstW, dstH,
-                           dstLinesize[0], QImage::Format_Grayscale8);
+                QImage img(scaleBuf.data(), dstW, dstH,
+                           dstW, QImage::Format_Grayscale8);
 
                 detector.processFrame(frameIndex, img, m_frameRate);
             }
@@ -279,9 +325,13 @@ void SceneCutScanner::doScan(QString path, double threshold, int minSceneFrames)
                 sws_scale(swsCtx,
                           frame->data, frame->linesize,
                           0, frame->height,
-                          dstData, dstLinesize);
-                QImage img(dstData[0], dstW, dstH,
-                           dstLinesize[0], QImage::Format_Grayscale8);
+                          paddedScaleBuf.data, paddedScaleBuf.linesize);
+                copyVisibleGray8Rows(paddedScaleBuf.data[0],
+                                     paddedScaleBuf.linesize[0],
+                                     dstW, dstH,
+                                     scaleBuf.data());
+                QImage img(scaleBuf.data(), dstW, dstH,
+                           dstW, QImage::Format_Grayscale8);
                 detector.processFrame(frameIndex, img, m_frameRate);
             }
             ++frameIndex;

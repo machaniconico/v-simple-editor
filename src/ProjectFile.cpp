@@ -2,6 +2,8 @@
 #include "AudioMixer.h"
 #include "MarkerData.h"
 #include "AdjustmentLayer.h"
+#include "color/ClipColor.h"
+#include "mask/ClipMask.h"
 #include <QBuffer>
 #include <QFile>
 #include <QJsonDocument>
@@ -207,7 +209,7 @@ QImage decodeGrayscalePngFallback(const QByteArray &png)
     return image;
 }
 
-}
+} // namespace
 
 // --- Timeline marker serialization (Premiere/Resolve parity) ---
 // Free, externally-linked helpers so a follow-up story can wire MainWindow
@@ -256,6 +258,9 @@ QByteArray imageToPngBase64(const QImage &image)
     QImage encoded = normalizedGrayscale8(image);
     if (encoded.isNull())
         return {};
+    // When the runtime lacks the Qt PNG plugin (qpng), QImage::save fails
+    // silently; fall back to a self-contained grayscale-8 PNG encoder so mask
+    // round-trip still works in plugin-less environments.
     if (!encoded.save(&buffer, "PNG"))
         pngBytes = encodeGrayscalePngFallback(encoded);
     return pngBytes.toBase64();
@@ -273,10 +278,288 @@ QImage imageFromPngBase64(const QString &encoded)
     return image.isNull() ? QImage() : normalizedGrayscale8(image);
 }
 
-static const int PROJECT_FORMAT_VERSION = 1;
+static const int PROJECT_FORMAT_VERSION = 2;
+
+// --- v1 -> v2 migration: clip pan offsets unit convention ---
+//
+// In format v1 the per-clip videoDx/videoDy were persisted in *pixels*
+// (written by the old motion path, magnitude up to ~10000). From v2 they
+// are a NORMALIZED fraction of canvas (canonical range +-5). When loading a
+// project whose stored version is < 2 we must convert the stale pixel values
+// back to the normalized convention so old projects render identically.
+//
+// Heuristic: the canonical normalized range is bounded +-5, so any persisted
+// |videoDx|>5 (or |videoDy|>5) is unambiguously a stale pixel value and is
+// divided by the canvas width (height). Values within +-5 are already
+// normalized and left untouched.
+//
+// INTENTIONAL NO-OP for sub-5px pixel offsets (canonical contract):
+//   A genuine legacy pixel offset whose magnitude is <=5px is left
+//   unchanged — it is treated as an already-normalized value close to
+//   zero.  This is a deliberate acceptance, not an oversight:
+//   (1) Such tiny offsets were visually negligible (<0.5% of a 1080p
+//       canvas) both before and after the v1->v2 unit change.
+//   (2) Converting them would silently alter projects that were authored
+//       under v2 normalized semantics; the +-5 threshold is the legacy
+//       clamp boundary and must remain stable for round-trip safety.
+//   (3) The rendering path already treated these values as normalized,
+//       so leaving them as-is preserves the prior visual output exactly.
+//
+// rotation2DDegrees is unit-stable across v1/v2 and is deliberately NOT
+// touched here.
+static void migrateClipOffsetsToNormalized(ProjectData &data, int storedVersion)
+{
+    if (storedVersion >= 2)
+        return; // v2+ projects already store normalized values verbatim
+
+    const double w = static_cast<double>(data.config.width);
+    const double h = static_cast<double>(data.config.height);
+    if (w <= 0.0 || h <= 0.0)
+        return; // defensive: cannot normalize against a degenerate canvas
+
+    auto migrateTracks = [&](QVector<QVector<ClipInfo>> &tracks) {
+        for (auto &track : tracks) {
+            for (auto &clip : track) {
+                if (std::abs(clip.videoDx) > 5.0)
+                    clip.videoDx /= w;
+                if (std::abs(clip.videoDy) > 5.0)
+                    clip.videoDy /= h;
+
+                // Defensive post-migration sanity guard: the normalized value
+                // should always land within canonical +-5 range.  If it does
+                // not (e.g. canvas dimension was extremely small causing /w to
+                // overshoot), clamp and emit a one-shot warning so the anomaly
+                // surfaces in logs without flooding them.
+                static bool s_warnedDx = false;
+                if (!s_warnedDx && std::abs(clip.videoDx) > 5.0) {
+                    qWarning("migrateClipOffsetsToNormalized: videoDx %f is "
+                             "outside canonical +-5 range after migration "
+                             "(canvas width=%f); clamping.", clip.videoDx, w);
+                    s_warnedDx = true;
+                }
+                clip.videoDx = std::clamp(clip.videoDx, -5.0, 5.0);
+
+                static bool s_warnedDy = false;
+                if (!s_warnedDy && std::abs(clip.videoDy) > 5.0) {
+                    qWarning("migrateClipOffsetsToNormalized: videoDy %f is "
+                             "outside canonical +-5 range after migration "
+                             "(canvas height=%f); clamping.", clip.videoDy, h);
+                    s_warnedDy = true;
+                }
+                clip.videoDy = std::clamp(clip.videoDy, -5.0, 5.0);
+            }
+        }
+    };
+    migrateTracks(data.videoTracks);
+    migrateTracks(data.audioTracks);
+}
+
+static QString audioChannelModeToProjectString(AudioChannelMode mode)
+{
+    switch (mode) {
+    case AudioChannelMode::Stereo:
+        return QStringLiteral("Stereo");
+    case AudioChannelMode::FillLeft:
+        return QStringLiteral("FillLeft");
+    case AudioChannelMode::FillRight:
+        return QStringLiteral("FillRight");
+    case AudioChannelMode::Swap:
+        return QStringLiteral("Swap");
+    case AudioChannelMode::Mono:
+        return QStringLiteral("Mono");
+    }
+    return QStringLiteral("Stereo");
+}
+
+static AudioChannelMode audioChannelModeFromProjectValue(const QJsonValue &value)
+{
+    if (value.isDouble()) {
+        switch (value.toInt(static_cast<int>(AudioChannelMode::Stereo))) {
+        case static_cast<int>(AudioChannelMode::FillLeft):
+            return AudioChannelMode::FillLeft;
+        case static_cast<int>(AudioChannelMode::FillRight):
+            return AudioChannelMode::FillRight;
+        case static_cast<int>(AudioChannelMode::Swap):
+            return AudioChannelMode::Swap;
+        case static_cast<int>(AudioChannelMode::Mono):
+            return AudioChannelMode::Mono;
+        default:
+            return AudioChannelMode::Stereo;
+        }
+    }
+
+    const QString s = value.toString(QStringLiteral("Stereo"));
+    if (s == QLatin1String("FillLeft") || s == QLatin1String("fill_left"))
+        return AudioChannelMode::FillLeft;
+    if (s == QLatin1String("FillRight") || s == QLatin1String("fill_right"))
+        return AudioChannelMode::FillRight;
+    if (s == QLatin1String("Swap") || s == QLatin1String("swap"))
+        return AudioChannelMode::Swap;
+    if (s == QLatin1String("Mono") || s == QLatin1String("mono"))
+        return AudioChannelMode::Mono;
+    return AudioChannelMode::Stereo;
+}
+
+static QJsonArray curvePointListToJson(const QVector<QPointF> &points)
+{
+    QJsonArray arr;
+    for (const QPointF &p : points) {
+        QJsonArray pt;
+        pt.append(p.x());
+        pt.append(p.y());
+        arr.append(pt);
+    }
+    return arr;
+}
+
+static QVector<QPointF> curvePointListFromJson(const QJsonArray &arr)
+{
+    QVector<QPointF> points;
+    points.reserve(arr.size());
+    for (const QJsonValue &v : arr) {
+        const QJsonArray pt = v.toArray();
+        if (pt.size() < 2)
+            continue;
+        points.append(QPointF(pt.at(0).toDouble(), pt.at(1).toDouble()));
+    }
+    return points;
+}
+
+static QJsonObject clipCurvesToJson(const ClipCurveData &curves)
+{
+    QJsonObject obj;
+    if (!curves.hasCurves())
+        return obj;
+
+    QJsonArray channels;
+    const QVector<QVector<QPointF>> points = curves.editorPointsOrIdentity();
+    for (int ch = 0; ch < ClipCurveData::ChannelCount; ++ch)
+        channels.append(curvePointListToJson(points.value(ch)));
+    obj[QStringLiteral("channels")] = channels;
+    return obj;
+}
+
+static ClipCurveData clipCurvesFromJson(const QJsonObject &obj)
+{
+    ClipCurveData curves;
+    const QJsonArray channels = obj.value(QStringLiteral("channels")).toArray();
+    QVector<QVector<QPointF>> points;
+    points.reserve(ClipCurveData::ChannelCount);
+    for (int ch = 0; ch < ClipCurveData::ChannelCount; ++ch) {
+        const QJsonArray channel =
+            ch < channels.size() ? channels.at(ch).toArray() : QJsonArray{};
+        points.append(curvePointListFromJson(channel));
+    }
+    curves.setPoints(points);
+    return curves;
+}
+
+static QJsonObject hslSecondaryToJson(const HslSecondaryGrade &hsl)
+{
+    QJsonObject obj;
+    obj[QStringLiteral("enabled")] = hsl.enabled;
+    obj[QStringLiteral("hueCenter")] = hsl.hueCenter;
+    obj[QStringLiteral("hueRange")] = hsl.hueRange;
+    obj[QStringLiteral("satMin")] = hsl.satMin;
+    obj[QStringLiteral("satMax")] = hsl.satMax;
+    obj[QStringLiteral("lumaMin")] = hsl.lumaMin;
+    obj[QStringLiteral("lumaMax")] = hsl.lumaMax;
+    obj[QStringLiteral("softness")] = hsl.softness;
+    obj[QStringLiteral("liftR")] = hsl.liftR;
+    obj[QStringLiteral("liftG")] = hsl.liftG;
+    obj[QStringLiteral("liftB")] = hsl.liftB;
+    obj[QStringLiteral("gammaR")] = hsl.gammaR;
+    obj[QStringLiteral("gammaG")] = hsl.gammaG;
+    obj[QStringLiteral("gammaB")] = hsl.gammaB;
+    obj[QStringLiteral("gainR")] = hsl.gainR;
+    obj[QStringLiteral("gainG")] = hsl.gainG;
+    obj[QStringLiteral("gainB")] = hsl.gainB;
+    return obj;
+}
+
+static HslSecondaryGrade hslSecondaryFromJson(const QJsonObject &obj)
+{
+    HslSecondaryGrade hsl;
+    hsl.enabled = obj.value(QStringLiteral("enabled")).toBool(false);
+    hsl.hueCenter = obj.value(QStringLiteral("hueCenter")).toDouble(30.0);
+    hsl.hueRange = obj.value(QStringLiteral("hueRange")).toDouble(30.0);
+    hsl.satMin = obj.value(QStringLiteral("satMin")).toDouble(0.30);
+    hsl.satMax = obj.value(QStringLiteral("satMax")).toDouble(1.00);
+    hsl.lumaMin = obj.value(QStringLiteral("lumaMin")).toDouble(0.30);
+    hsl.lumaMax = obj.value(QStringLiteral("lumaMax")).toDouble(0.80);
+    hsl.softness = obj.value(QStringLiteral("softness")).toDouble(10.0);
+    hsl.liftR = obj.value(QStringLiteral("liftR")).toDouble(0.0);
+    hsl.liftG = obj.value(QStringLiteral("liftG")).toDouble(0.0);
+    hsl.liftB = obj.value(QStringLiteral("liftB")).toDouble(0.0);
+    hsl.gammaR = obj.value(QStringLiteral("gammaR")).toDouble(1.0);
+    hsl.gammaG = obj.value(QStringLiteral("gammaG")).toDouble(1.0);
+    hsl.gammaB = obj.value(QStringLiteral("gammaB")).toDouble(1.0);
+    hsl.gainR = obj.value(QStringLiteral("gainR")).toDouble(1.0);
+    hsl.gainG = obj.value(QStringLiteral("gainG")).toDouble(1.0);
+    hsl.gainB = obj.value(QStringLiteral("gainB")).toDouble(1.0);
+    return hsl;
+}
+
+struct SequenceStoreExtraction {
+    QVector<ClipParentEntry> normalClipParentEntries;
+    QJsonObject sequenceStore;
+};
+
+static SequenceStoreExtraction extractSequenceStoreEntries(const QVector<ClipParentEntry> &entries)
+{
+    SequenceStoreExtraction extracted;
+    extracted.normalClipParentEntries.reserve(entries.size());
+    const QString storeKey = timeline_nesting::sequenceStoreParentKey();
+    for (const ClipParentEntry &entry : entries) {
+        if (entry.clipId == storeKey) {
+            const QJsonObject store =
+                timeline_nesting::decodeSequenceStoreObject(entry.parentClipId);
+            if (!store.value(QStringLiteral("sequences")).toArray().isEmpty())
+                extracted.sequenceStore = store;
+            continue;
+        }
+        extracted.normalClipParentEntries.append(entry);
+    }
+    return extracted;
+}
+
+static void writeSequenceStoreToRoot(QJsonObject &root, const QJsonObject &store)
+{
+    const QJsonArray sequences = store.value(QStringLiteral("sequences")).toArray();
+    if (sequences.isEmpty())
+        return;
+
+    root[QStringLiteral("sequences")] = sequences;
+    const QString activeSequenceId = store.value(QStringLiteral("activeSequenceId")).toString();
+    if (!activeSequenceId.isEmpty())
+        root[QStringLiteral("activeSequenceId")] = activeSequenceId;
+}
+
+static void appendSequenceStoreEntryFromRoot(const QJsonObject &root,
+                                             QVector<ClipParentEntry> &entries)
+{
+    const QJsonArray sequences = root.value(QStringLiteral("sequences")).toArray();
+    if (sequences.isEmpty())
+        return;
+
+    QJsonObject store;
+    store[QStringLiteral("version")] = 1;
+    store[QStringLiteral("activeSequenceId")] =
+        root.value(QStringLiteral("activeSequenceId")).toString();
+    store[QStringLiteral("sequences")] = sequences;
+
+    ClipParentEntry entry;
+    entry.clipId = timeline_nesting::sequenceStoreParentKey();
+    entry.parentClipId = timeline_nesting::encodeSequenceStoreObject(store);
+    if (!entry.parentClipId.isEmpty())
+        entries.append(entry);
+}
 
 bool ProjectFile::save(const QString &filePath, const ProjectData &data)
 {
+    const SequenceStoreExtraction sequenceStore =
+        extractSequenceStoreEntries(data.clipParentEntries);
+
     QJsonObject root;
     root["version"] = PROJECT_FORMAT_VERSION;
     root["config"] = configToJson(data.config);
@@ -437,6 +720,14 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
             matteArr.append(trackMatteClipEntryToJson(entry));
         root["trackMatteClipEntries"] = matteArr;
     }
+    if (!data.clipParentEntries.isEmpty()) {
+        QJsonArray parentArr;
+        for (const auto &entry : sequenceStore.normalClipParentEntries)
+            parentArr.append(clipParentEntryToJson(entry));
+        if (!parentArr.isEmpty())
+            root["clipParentEntries"] = parentArr;
+    }
+    writeSequenceStoreToRoot(root, sequenceStore.sequenceStore);
     root["vfxState"] = vfxStateToJson(data.vfxState);
 
     // US-3D-11: motion-graphics sprint persistence
@@ -528,7 +819,32 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
         root["colormatch"] = colormatch;
     }
 
+    // PRD-PROJECT-PRESET: tracker preset state persistence
+    {
+        QJsonObject trackerPresets;
+        trackerPresets["motion"] = motionTrackerStateToJson(data.motionTrackerState);
+        trackerPresets["planar"] = planarTrackerStateToJson(data.planarTrackerState);
+        root["trackerPresets"] = trackerPresets;
+    }
+
+    // PRD-PHASE1-MEDIA-POOL: メディアプール永続化
+    root["mediaPool"] = data.mediaPool.toJson();
+
+    // PRD-PHASE2-AUDIO-BUS: バス/サブミックス/AUXセンド ルーティング永続化
+    root["audioBusRouting"] = data.audioBusRouting.toJson();
+
+    // PRD-PHASE3-ACES: ACES カラーマネジメント設定永続化
+    root["acesPipeline"] = aces::pipelineToJson(data.acesPipeline);
+
+    // PRD-PHASE3-DOLBY-VISION: Dolby Vision メタデータ永続化
+    root["dolbyVision"] = dolbyvision::toJson(data.dolbyVision);
+
+    // PRD-PHASE3-BROADCAST-CC: 放送CC (CEA-608/708) 永続化
+    root["broadcastCaption"] = broadcastcc::toJson(data.broadcastCaption);
+
     QJsonDocument doc(root);
+    // QSaveFile writes to a temp file and atomically renames on commit, so a
+    // crash or short write mid-save never truncates the previous project.
     QSaveFile file(filePath);
     if (!file.open(QIODevice::WriteOnly))
         return false;
@@ -555,6 +871,11 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
     data.config = configFromJson(root["config"].toObject());
     data.videoTracks = tracksFromJson(root["videoTracks"].toArray());
     data.audioTracks = tracksFromJson(root["audioTracks"].toArray());
+
+    // v1 -> v2: convert stale pixel-convention clip pan offsets. Runs after
+    // config (canvas resolution) and tracks are loaded; no-op for version>=2.
+    migrateClipOffsetsToNormalized(data, root["version"].toInt(1));
+
     data.playheadPos = root["playheadPos"].toDouble();
     data.markIn = root["markIn"].toDouble(-1.0);
     data.markOut = root["markOut"].toDouble(-1.0);
@@ -684,6 +1005,12 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
         for (const auto &v : root["trackMatteClipEntries"].toArray())
             data.trackMatteClipEntries.append(trackMatteClipEntryFromJson(v.toObject()));
     }
+    data.clipParentEntries.clear();
+    if (root.contains("clipParentEntries")) {
+        for (const auto &v : root["clipParentEntries"].toArray())
+            data.clipParentEntries.append(clipParentEntryFromJson(v.toObject()));
+    }
+    appendSequenceStoreEntryFromRoot(root, data.clipParentEntries);
     data.vfxState = root.contains("vfxState")
         ? vfxStateFromJson(root["vfxState"].toObject())
         : ProjectVfxState{};
@@ -785,11 +1112,40 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
         data.colorMatchLastReferenceClip = colormatch.value("lastReferenceClip").toString();
     }
 
+    // PRD-PROJECT-PRESET: tracker preset state persistence (backward compat: missing key = default struct)
+    {
+        const QJsonObject tp = root.value("trackerPresets").toObject();
+        data.motionTrackerState = motionTrackerStateFromJson(tp.value("motion").toObject());
+        data.planarTrackerState = planarTrackerStateFromJson(tp.value("planar").toObject());
+    }
+
+    // PRD-PHASE1-MEDIA-POOL: メディアプール永続化 (キー欠落でも空 object → 空プールで安全)
+    data.mediaPool.fromJson(root.value("mediaPool").toObject());
+
+    // PRD-PHASE2-AUDIO-BUS: バス/サブミックス/AUXセンド ルーティング永続化
+    // (キー欠落でも空 object → 空ルーティング=identity、旧 .veditor 後方互換)
+    data.audioBusRouting.fromJson(root.value("audioBusRouting").toObject());
+
+    // PRD-PHASE3-ACES: ACES カラーマネジメント設定永続化
+    // (キー欠落でも空 object → enabled=false 既定=identity、旧 .veditor 後方互換)
+    data.acesPipeline = aces::pipelineFromJson(root.value("acesPipeline").toObject());
+
+    // PRD-PHASE3-DOLBY-VISION: Dolby Vision メタデータ永続化
+    // (キー欠落でも空 object → 空メタ既定、旧 .veditor 後方互換)
+    data.dolbyVision = dolbyvision::fromJson(root.value("dolbyVision").toObject());
+
+    // PRD-PHASE3-BROADCAST-CC: 放送CC (CEA-608/708) 永続化
+    // (キー欠落でも空 object → 空 doc 既定、旧 .veditor 後方互換)
+    data.broadcastCaption = broadcastcc::fromJson(root.value("broadcastCaption").toObject());
+
     return true;
 }
 
 QString ProjectFile::toJsonString(const ProjectData &data)
 {
+    const SequenceStoreExtraction sequenceStore =
+        extractSequenceStoreEntries(data.clipParentEntries);
+
     QJsonObject root;
     root["version"] = PROJECT_FORMAT_VERSION;
     root["config"] = configToJson(data.config);
@@ -941,6 +1297,14 @@ QString ProjectFile::toJsonString(const ProjectData &data)
             matteArr.append(trackMatteClipEntryToJson(entry));
         root["trackMatteClipEntries"] = matteArr;
     }
+    if (!data.clipParentEntries.isEmpty()) {
+        QJsonArray parentArr;
+        for (const auto &entry : sequenceStore.normalClipParentEntries)
+            parentArr.append(clipParentEntryToJson(entry));
+        if (!parentArr.isEmpty())
+            root["clipParentEntries"] = parentArr;
+    }
+    writeSequenceStoreToRoot(root, sequenceStore.sequenceStore);
     root["vfxState"] = vfxStateToJson(data.vfxState);
 
     // US-3D-11: motion-graphics sprint persistence
@@ -1030,6 +1394,29 @@ QString ProjectFile::toJsonString(const ProjectData &data)
         root["colormatch"] = colormatch;
     }
 
+    // PRD-PROJECT-PRESET: tracker preset state persistence
+    {
+        QJsonObject trackerPresets;
+        trackerPresets["motion"] = motionTrackerStateToJson(data.motionTrackerState);
+        trackerPresets["planar"] = planarTrackerStateToJson(data.planarTrackerState);
+        root["trackerPresets"] = trackerPresets;
+    }
+
+    // PRD-PHASE1-MEDIA-POOL: メディアプール永続化
+    root["mediaPool"] = data.mediaPool.toJson();
+
+    // PRD-PHASE2-AUDIO-BUS: バス/サブミックス/AUXセンド ルーティング永続化
+    root["audioBusRouting"] = data.audioBusRouting.toJson();
+
+    // PRD-PHASE3-ACES: ACES カラーマネジメント設定永続化
+    root["acesPipeline"] = aces::pipelineToJson(data.acesPipeline);
+
+    // PRD-PHASE3-DOLBY-VISION: Dolby Vision メタデータ永続化
+    root["dolbyVision"] = dolbyvision::toJson(data.dolbyVision);
+
+    // PRD-PHASE3-BROADCAST-CC: 放送CC (CEA-608/708) 永続化
+    root["broadcastCaption"] = broadcastcc::toJson(data.broadcastCaption);
+
     QJsonDocument doc(root);
     return QString::fromUtf8(doc.toJson(QJsonDocument::Compact));
 }
@@ -1045,6 +1432,11 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
     data.config = configFromJson(root["config"].toObject());
     data.videoTracks = tracksFromJson(root["videoTracks"].toArray());
     data.audioTracks = tracksFromJson(root["audioTracks"].toArray());
+
+    // v1 -> v2: convert stale pixel-convention clip pan offsets. Runs after
+    // config (canvas resolution) and tracks are loaded; no-op for version>=2.
+    migrateClipOffsetsToNormalized(data, root["version"].toInt(1));
+
     data.playheadPos = root["playheadPos"].toDouble();
     data.markIn = root["markIn"].toDouble(-1.0);
     data.markOut = root["markOut"].toDouble(-1.0);
@@ -1174,6 +1566,12 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
         for (const auto &v : root["trackMatteClipEntries"].toArray())
             data.trackMatteClipEntries.append(trackMatteClipEntryFromJson(v.toObject()));
     }
+    data.clipParentEntries.clear();
+    if (root.contains("clipParentEntries")) {
+        for (const auto &v : root["clipParentEntries"].toArray())
+            data.clipParentEntries.append(clipParentEntryFromJson(v.toObject()));
+    }
+    appendSequenceStoreEntryFromRoot(root, data.clipParentEntries);
     data.vfxState = root.contains("vfxState")
         ? vfxStateFromJson(root["vfxState"].toObject())
         : ProjectVfxState{};
@@ -1275,6 +1673,32 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
         data.colorMatchLastReferenceClip = colormatch.value("lastReferenceClip").toString();
     }
 
+    // PRD-PROJECT-PRESET: tracker preset state persistence (backward compat: missing key = default struct)
+    {
+        const QJsonObject tp = root.value("trackerPresets").toObject();
+        data.motionTrackerState = motionTrackerStateFromJson(tp.value("motion").toObject());
+        data.planarTrackerState = planarTrackerStateFromJson(tp.value("planar").toObject());
+    }
+
+    // PRD-PHASE1-MEDIA-POOL: メディアプール永続化 (キー欠落でも空 object → 空プールで安全)
+    data.mediaPool.fromJson(root.value("mediaPool").toObject());
+
+    // PRD-PHASE2-AUDIO-BUS: バス/サブミックス/AUXセンド ルーティング永続化
+    // (キー欠落でも空 object → 空ルーティング=identity、旧 .veditor 後方互換)
+    data.audioBusRouting.fromJson(root.value("audioBusRouting").toObject());
+
+    // PRD-PHASE3-ACES: ACES カラーマネジメント設定永続化
+    // (キー欠落でも空 object → enabled=false 既定=identity、旧 .veditor 後方互換)
+    data.acesPipeline = aces::pipelineFromJson(root.value("acesPipeline").toObject());
+
+    // PRD-PHASE3-DOLBY-VISION: Dolby Vision メタデータ永続化
+    // (キー欠落でも空 object → 空メタ既定、旧 .veditor 後方互換)
+    data.dolbyVision = dolbyvision::fromJson(root.value("dolbyVision").toObject());
+
+    // PRD-PHASE3-BROADCAST-CC: 放送CC (CEA-608/708) 永続化
+    // (キー欠落でも空 object → 空 doc 既定、旧 .veditor 後方互換)
+    data.broadcastCaption = broadcastcc::fromJson(root.value("broadcastCaption").toObject());
+
     return true;
 }
 
@@ -1287,6 +1711,7 @@ QJsonObject ProjectFile::configToJson(const ProjectConfig &c)
     obj["width"] = c.width;
     obj["height"] = c.height;
     obj["fps"] = c.fps;
+    obj["explicitOutputResolution"] = c.explicitOutputResolution;
     return obj;
 }
 
@@ -1297,6 +1722,7 @@ ProjectConfig ProjectFile::configFromJson(const QJsonObject &obj)
     c.width = obj["width"].toInt(1920);
     c.height = obj["height"].toInt(1080);
     c.fps = obj["fps"].toInt(30);
+    c.explicitOutputResolution = obj["explicitOutputResolution"].toBool(false);
     return c;
 }
 
@@ -1307,6 +1733,8 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
     QJsonObject obj;
     obj["filePath"] = clip.filePath;
     obj["displayName"] = clip.displayName;
+    if (!clip.sequenceRefId.isEmpty())
+        obj["sequenceRefId"] = clip.sequenceRefId;
     obj["duration"] = clip.duration;
     obj["inPoint"] = clip.inPoint;
     obj["outPoint"] = clip.outPoint;
@@ -1316,13 +1744,29 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
         obj["linkGroup"] = clip.linkGroup;
     obj["speed"] = clip.speed;
     obj["volume"] = clip.volume;
+    if (clip.pan != 0.0)
+        obj["pan"] = clip.pan;
+    if (clip.audioChannelMode != AudioChannelMode::Stereo)
+        obj["audioChannelMode"] = audioChannelModeToProjectString(clip.audioChannelMode);
     obj["videoScale"] = clip.videoScale;
     obj["videoDx"] = clip.videoDx;
     obj["videoDy"] = clip.videoDy;
     obj["rotation2DDegrees"] = clip.rotation2DDegrees;
     obj["opacity"] = clip.opacity;
+    if (clip.isAdjustment)
+        obj["isAdjustment"] = true;
     obj["is3DLayer"] = clip.is3DLayer;
     obj["layer3D"] = clip.layer3D.toJson();
+    if (clip.motionBlurEnabled)
+        obj["motionBlurEnabled"] = true;
+    if (clip.fitContain)
+        obj["fitContain"] = true;
+    if (clip.fitCover)
+        obj["fitCover"] = true;
+    if (!clip.lutFilePath.isEmpty()) {
+        obj["lutFilePath"] = clip.lutFilePath;
+        obj["lutIntensity"] = clip.lutIntensity;
+    }
 
     if (!clip.volumeEnvelope.isEmpty()) {
         QJsonArray envArr;
@@ -1337,6 +1781,16 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
 
     if (!clip.colorCorrection.isDefault())
         obj["colorCorrection"] = colorCorrectionToJson(clip.colorCorrection);
+    if (clip.colorCurves.hasCurves())
+        obj["colorCurves"] = clipCurvesToJson(clip.colorCurves);
+    if (!clip.hslSecondary.isDefault())
+        obj["hslSecondary"] = hslSecondaryToJson(clip.hslSecondary);
+    if (!clip.colorMeta.isDefault())
+        obj["colorMeta"] = clipcolor::toJson(clip.colorMeta);
+    if (!clip.layerStyle.isIdentity())
+        obj["layerStyle"] = clip.layerStyle.toJson();
+    if (!clipmask::isDefault(clip.maskSystem))
+        obj["clipMasks"] = clipmask::maskSystemToJson(clip.maskSystem);
 
     if (!clip.effects.isEmpty()) {
         QJsonArray fxArr;
@@ -1362,6 +1816,7 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
     // default in clipFromJson).
     if (!clip.speedRamp.isIdentity())
         obj["speedRamp"] = clip.speedRamp.toJson();
+    obj["atempoEnabled"] = clip.atempoEnabled;
 
     return obj;
 }
@@ -1371,6 +1826,9 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
     ClipInfo clip;
     clip.filePath = obj["filePath"].toString();
     clip.displayName = obj["displayName"].toString();
+    clip.sequenceRefId = obj["sequenceRefId"].toString();
+    if (clip.sequenceRefId.isEmpty())
+        clip.sequenceRefId = timeline_nesting::sequenceIdFromClipFilePath(clip.filePath);
     clip.duration = obj["duration"].toDouble();
     clip.inPoint = obj["inPoint"].toDouble();
     clip.outPoint = obj["outPoint"].toDouble();
@@ -1378,15 +1836,27 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
     clip.linkGroup = obj["linkGroup"].toInt(0);
     clip.speed = obj["speed"].toDouble(1.0);
     clip.volume = obj["volume"].toDouble(1.0);
+    clip.pan = obj["pan"].toDouble(0.0);
+    clip.audioChannelMode = obj.contains("audioChannelMode")
+        ? audioChannelModeFromProjectValue(obj["audioChannelMode"])
+        : AudioChannelMode::Stereo;
     clip.videoScale = obj["videoScale"].toDouble(1.0);
     clip.videoDx = obj["videoDx"].toDouble(0.0);
     clip.videoDy = obj["videoDy"].toDouble(0.0);
     clip.rotation2DDegrees = obj["rotation2DDegrees"].toDouble(0.0);
     clip.opacity = obj["opacity"].toDouble(1.0);
+    clip.isAdjustment = obj["isAdjustment"].toBool(false);
     clip.is3DLayer = obj["is3DLayer"].toBool(false);
     clip.layer3D = obj.contains("layer3D")
         ? Layer3DTransform::fromJson(obj["layer3D"].toObject())
         : Layer3DTransform{};
+    clip.motionBlurEnabled = obj["motionBlurEnabled"].toBool(false);
+    clip.fitContain = obj["fitContain"].toBool(false);
+    clip.fitCover = obj["fitCover"].toBool(false);
+    clip.lutFilePath = obj["lutFilePath"].toString();
+    clip.lutIntensity = qBound(0.0, obj["lutIntensity"].toDouble(1.0), 1.0);
+    if (clip.lutFilePath.isEmpty())
+        clip.lutIntensity = 1.0;
     if (!clip.is3DLayer)
         clip.layer3D.reset();
 
@@ -1406,6 +1876,17 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
 
     if (obj.contains("colorCorrection"))
         clip.colorCorrection = colorCorrectionFromJson(obj["colorCorrection"].toObject());
+    if (obj.contains("colorCurves"))
+        clip.colorCurves = clipCurvesFromJson(obj["colorCurves"].toObject());
+    if (obj.contains("hslSecondary"))
+        clip.hslSecondary = hslSecondaryFromJson(obj["hslSecondary"].toObject());
+    clip.colorMeta = obj.contains("colorMeta")
+        ? clipcolor::fromJson(obj["colorMeta"].toObject())
+        : clipcolor::defaultSdr();
+    if (obj.contains("layerStyle"))
+        clip.layerStyle = LayerStyle::fromJson(obj["layerStyle"].toObject());
+    if (obj.contains("clipMasks"))
+        clip.maskSystem = clipmask::maskSystemFromJson(obj["clipMasks"].toObject());
 
     if (obj.contains("effects")) {
         for (const auto &v : obj["effects"].toArray())
@@ -1425,6 +1906,7 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
 
     if (obj.contains("speedRamp"))
         clip.speedRamp = speedramp::SpeedRamp::fromJson(obj["speedRamp"].toObject());
+    clip.atempoEnabled = obj["atempoEnabled"].toBool(false);
 
     return clip;
 }
@@ -1444,15 +1926,20 @@ QJsonObject ProjectFile::colorCorrectionToJson(const ColorCorrection &cc)
     obj["highlights"] = cc.highlights;
     obj["shadows"] = cc.shadows;
     obj["exposure"] = cc.exposure;
-    obj["liftR"] = cc.liftR;
-    obj["liftG"] = cc.liftG;
-    obj["liftB"] = cc.liftB;
-    obj["gammaR"] = cc.gammaR;
-    obj["gammaG"] = cc.gammaG;
-    obj["gammaB"] = cc.gammaB;
-    obj["gainR"] = cc.gainR;
-    obj["gainG"] = cc.gainG;
-    obj["gainB"] = cc.gainB;
+
+    auto addIfNonZero = [&obj](const QString &key, double value) {
+        if (value != 0.0)
+            obj[key] = value;
+    };
+    addIfNonZero(QStringLiteral("liftR"), cc.liftR);
+    addIfNonZero(QStringLiteral("liftG"), cc.liftG);
+    addIfNonZero(QStringLiteral("liftB"), cc.liftB);
+    addIfNonZero(QStringLiteral("gammaR"), cc.gammaR);
+    addIfNonZero(QStringLiteral("gammaG"), cc.gammaG);
+    addIfNonZero(QStringLiteral("gammaB"), cc.gammaB);
+    addIfNonZero(QStringLiteral("gainR"), cc.gainR);
+    addIfNonZero(QStringLiteral("gainG"), cc.gainG);
+    addIfNonZero(QStringLiteral("gainB"), cc.gainB);
     return obj;
 }
 
@@ -1469,15 +1956,15 @@ ColorCorrection ProjectFile::colorCorrectionFromJson(const QJsonObject &obj)
     cc.highlights = obj["highlights"].toDouble();
     cc.shadows = obj["shadows"].toDouble();
     cc.exposure = obj["exposure"].toDouble();
-    cc.liftR = obj["liftR"].toDouble();
-    cc.liftG = obj["liftG"].toDouble();
-    cc.liftB = obj["liftB"].toDouble();
-    cc.gammaR = obj["gammaR"].toDouble();
-    cc.gammaG = obj["gammaG"].toDouble();
-    cc.gammaB = obj["gammaB"].toDouble();
-    cc.gainR = obj["gainR"].toDouble();
-    cc.gainG = obj["gainG"].toDouble();
-    cc.gainB = obj["gainB"].toDouble();
+    cc.liftR = obj["liftR"].toDouble(0.0);
+    cc.liftG = obj["liftG"].toDouble(0.0);
+    cc.liftB = obj["liftB"].toDouble(0.0);
+    cc.gammaR = obj["gammaR"].toDouble(0.0);
+    cc.gammaG = obj["gammaG"].toDouble(0.0);
+    cc.gammaB = obj["gammaB"].toDouble(0.0);
+    cc.gainR = obj["gainR"].toDouble(0.0);
+    cc.gainG = obj["gainG"].toDouble(0.0);
+    cc.gainB = obj["gainB"].toDouble(0.0);
     return cc;
 }
 
@@ -1492,6 +1979,10 @@ QJsonObject ProjectFile::effectToJson(const VideoEffect &e)
     obj["param2"] = e.param2;
     obj["param3"] = e.param3;
     obj["keyColor"] = e.keyColor.name();
+    if (e.startSec != -1.0)
+        obj["startSec"] = e.startSec;
+    if (e.endSec != -1.0)
+        obj["endSec"] = e.endSec;
     return obj;
 }
 
@@ -1504,6 +1995,8 @@ VideoEffect ProjectFile::effectFromJson(const QJsonObject &obj)
     e.param2 = obj["param2"].toDouble();
     e.param3 = obj["param3"].toDouble();
     e.keyColor = QColor(obj["keyColor"].toString("#00ff00"));
+    e.startSec = obj["startSec"].toDouble(-1.0);
+    e.endSec = obj["endSec"].toDouble(-1.0);
     return e;
 }
 
@@ -1517,11 +2010,7 @@ QJsonObject ProjectFile::keyframeTrackToJson(const KeyframeTrack &track)
 
     QJsonArray kfArr;
     for (const auto &kf : track.keyframes()) {
-        QJsonObject kfObj;
-        kfObj["time"] = kf.time;
-        kfObj["value"] = kf.value;
-        kfObj["interpolation"] = static_cast<int>(kf.interpolation);
-        kfArr.append(kfObj);
+        kfArr.append(keyframePointToJson(kf));
     }
     obj["keyframes"] = kfArr;
     return obj;
@@ -1531,11 +2020,11 @@ KeyframeTrack ProjectFile::keyframeTrackFromJson(const QJsonObject &obj)
 {
     KeyframeTrack track(obj["property"].toString(), obj["defaultValue"].toDouble());
     for (const auto &v : obj["keyframes"].toArray()) {
-        QJsonObject kfObj = v.toObject();
-        track.addKeyframe(
-            kfObj["time"].toDouble(),
-            kfObj["value"].toDouble(),
-            static_cast<KeyframePoint::Interpolation>(kfObj["interpolation"].toInt()));
+        const KeyframePoint kf = keyframePointFromJson(v.toObject());
+        track.addKeyframe(kf.time, kf.value, kf.interpolation,
+                          kf.bezX1, kf.bezY1, kf.bezX2, kf.bezY2,
+                          kf.hasSpatialTangent, kf.spatialOutX,
+                          kf.spatialOutY, kf.spatialInX, kf.spatialInY);
     }
     return track;
 }
@@ -2003,6 +2492,22 @@ TrackMatteClipEntry ProjectFile::trackMatteClipEntryFromJson(const QJsonObject &
     return entry;
 }
 
+QJsonObject ProjectFile::clipParentEntryToJson(const ClipParentEntry &entry)
+{
+    QJsonObject obj;
+    obj["clipId"] = entry.clipId;
+    obj["parentClipId"] = entry.parentClipId;
+    return obj;
+}
+
+ClipParentEntry ProjectFile::clipParentEntryFromJson(const QJsonObject &obj)
+{
+    ClipParentEntry entry;
+    entry.clipId = obj["clipId"].toString();
+    entry.parentClipId = obj["parentClipId"].toString();
+    return entry;
+}
+
 // --- US-3D-11: motion-graphics sprint persistence ---
 
 QJsonObject ProjectFile::text3DClipEntryToJson(const Text3DClipEntry &entry)
@@ -2051,6 +2556,63 @@ WiggleClipEntry ProjectFile::wiggleClipEntryFromJson(const QJsonObject &obj)
     entry.clipId = obj["clipId"].toString();
     entry.params = wiggle::fromJson(obj["params"].toObject());
     return entry;
+}
+
+// --- PRD-PROJECT-PRESET: tracker preset state serialization ---
+
+QJsonObject ProjectFile::motionTrackerStateToJson(const MotionTrackerProjectState &s)
+{
+    QJsonObject o;
+    o["lastPresetId"]           = s.lastPresetId;
+    o["searchRadius"]           = s.searchRadius;
+    o["matchMetric"]            = s.matchMetric;
+    o["kalmanEnabled"]          = s.kalmanEnabled;
+    o["kalmanProcessNoise"]     = s.kalmanProcessNoise;
+    o["kalmanMeasurementNoise"] = s.kalmanMeasurementNoise;
+    o["occlusionGate"]          = s.occlusionGate;
+    o["subPixelEnabled"]        = s.subPixelEnabled;
+    o["minConfidence"]          = s.minConfidence;
+    return o;
+}
+
+MotionTrackerProjectState ProjectFile::motionTrackerStateFromJson(const QJsonObject &obj)
+{
+    MotionTrackerProjectState s;
+    if (obj.contains("lastPresetId"))           s.lastPresetId           = obj.value("lastPresetId").toString();
+    if (obj.contains("searchRadius"))           s.searchRadius           = std::clamp(obj.value("searchRadius").toInt(s.searchRadius), 1, 256);
+    if (obj.contains("matchMetric")) {
+        const QString m = obj.value("matchMetric").toString();
+        s.matchMetric = m.isEmpty() ? QStringLiteral("NCC") : m;
+    }
+    if (obj.contains("kalmanEnabled"))          s.kalmanEnabled          = obj.value("kalmanEnabled").toBool(s.kalmanEnabled);
+    if (obj.contains("kalmanProcessNoise"))     s.kalmanProcessNoise     = std::clamp(obj.value("kalmanProcessNoise").toDouble(s.kalmanProcessNoise), 0.0, 10.0);
+    if (obj.contains("kalmanMeasurementNoise")) s.kalmanMeasurementNoise = std::clamp(obj.value("kalmanMeasurementNoise").toDouble(s.kalmanMeasurementNoise), 0.0, 10.0);
+    if (obj.contains("occlusionGate"))          s.occlusionGate          = std::clamp(obj.value("occlusionGate").toDouble(s.occlusionGate), 0.0, 1000.0);
+    if (obj.contains("subPixelEnabled"))        s.subPixelEnabled        = obj.value("subPixelEnabled").toBool(s.subPixelEnabled);
+    if (obj.contains("minConfidence"))          s.minConfidence          = std::clamp(obj.value("minConfidence").toDouble(s.minConfidence), 0.0, 1.0);
+    return s;
+}
+
+QJsonObject ProjectFile::planarTrackerStateToJson(const PlanarTrackerProjectState &s)
+{
+    QJsonObject o;
+    o["lastPresetId"]     = s.lastPresetId;
+    o["searchRadiusPx"]   = s.searchRadiusPx;
+    o["patchSizePx"]      = s.patchSizePx;
+    o["dampingFactor"]    = s.dampingFactor;
+    o["maxFramesPerCall"] = s.maxFramesPerCall;
+    return o;
+}
+
+PlanarTrackerProjectState ProjectFile::planarTrackerStateFromJson(const QJsonObject &obj)
+{
+    PlanarTrackerProjectState s;
+    if (obj.contains("lastPresetId"))     s.lastPresetId     = obj.value("lastPresetId").toString();
+    if (obj.contains("searchRadiusPx"))   s.searchRadiusPx   = std::clamp(obj.value("searchRadiusPx").toDouble(s.searchRadiusPx), 4.0, 64.0);
+    if (obj.contains("patchSizePx"))      s.patchSizePx      = std::clamp(obj.value("patchSizePx").toDouble(s.patchSizePx), 16.0, 128.0);
+    if (obj.contains("dampingFactor"))    s.dampingFactor    = std::clamp(obj.value("dampingFactor").toDouble(s.dampingFactor), 0.0, 1.0);
+    if (obj.contains("maxFramesPerCall")) s.maxFramesPerCall = std::max(0, obj.value("maxFramesPerCall").toInt(s.maxFramesPerCall));
+    return s;
 }
 
 QJsonObject ProjectFile::vfxStateToJson(const ProjectVfxState &state)

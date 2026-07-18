@@ -69,6 +69,7 @@ signals:
     // US-CG-1: re-emit of CurveEditor::curvesChanged so MainWindow can
     // forward the 4x256 RGB curves LUT to GLPreview::setRgbCurves.
     void curvesChanged(const QVector<QVector<int>> &curves);
+    void whiteBalancePickModeRequested(bool enabled);
     // US-CG-4: re-emit of HueVsSatEditor::hueVsSatChanged so MainWindow can
     // forward the 256-entry sat-multiplier LUT to GLPreview::setHueVsSatLut.
     void hueVsSatChanged(const QVector<float> &lut);
@@ -147,6 +148,8 @@ signals:
     void rotation3DChanged(float xDeg, float yDeg, float zDeg, float perspectiveDist);
 
 public slots:
+    void applyWhiteBalancePick(const QColor &pixel);
+    void setWhiteBalancePickModeActive(bool active);
     // US-EF-2: callback target — VideoPlayer's mask-edit overlay forwards the
     // normalized rect here, which updates the panel labels and re-emits
     // maskChanged so GLPreview picks up the new geometry.
@@ -165,6 +168,7 @@ private slots:
     // US-CG-2: WB Temperature/Tint sliders changed → recompute (r,g,b) gain
     // triple, update labels, emit whiteBalanceChanged.
     void onWhiteBalanceChanged();
+    void onWhiteBalancePickToggled(bool enabled);
     // US-CG-3: Vignette sliders changed → normalize to [-1..+1] / [0..1]
     // ranges, update labels, emit vignetteChanged.
     void onVignetteChanged();
@@ -221,6 +225,13 @@ private:
     static int gammaToSlider(double g);
     static double sliderToLiftGain(int v);
     static int liftGainToSlider(double v);
+    static double wheelGammaToCorrection(double g);
+    static double correctionGammaToWheel(double g);
+    static ColorWheels wheelsFromColorCorrection(const ColorCorrection &cc);
+    void syncColorCorrectionFromWheels(const ColorWheels &cw);
+    void updateWhiteBalanceControlsFromCC();
+    void updateBasicTemperatureTintFromCC();
+    void updateGraphicalWheelsFromCC();
 
     ColorCorrection m_cc;
     ColorWheels m_wheels;
@@ -249,6 +260,7 @@ private:
     QSlider *m_wbTint = nullptr;
     QLabel  *m_wbTemperatureLabel = nullptr;
     QLabel  *m_wbTintLabel = nullptr;
+    QPushButton *m_wbPickButton = nullptr;
 
     // US-CG-3: Vignette / Power Window sliders. These drive the GLPreview
     // uVigAmount/uVigMid/uVigRound/uVigFeather uniforms. Identity =

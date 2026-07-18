@@ -3,11 +3,15 @@
 #include <QDialog>
 #include <QImage>
 #include <QList>
+#include <QMetaType>
 #include <QPointF>
 #include <QWidget>
 
 #include "PlanarTracker.h"
+#include "PlanarTrackerPreset.h"
+#include "ProjectFile.h"
 
+class QComboBox;
 class QDialogButtonBox;
 class QLabel;
 class QProgressBar;
@@ -70,10 +74,24 @@ public:
     // Result after tracking
     QList<planar::Frame> trackResult() const;
 
+    // PRD-PROJECT-PRESET US-PP-4: project-state persistence hooks
+    void setInitialState(const PlanarTrackerProjectState& s);
+    PlanarTrackerProjectState currentState() const;
+
+public slots:
+    void accept() override;
+
 signals:
     void trackComputed(const QList<planar::Frame>& frames);
+    void presetApplied(planar_tracker_preset::PlanarTrackerPreset);
 
 private slots:
+    void onPresetSelectionChanged(int index);
+    void onSaveCustomPreset();
+    void onDeleteSelectedPreset();
+    void onResetPresetToDefaults();
+    void onExportPreset();
+    void onImportPreset();
     void onResetCorners();
     void onTrackClicked();
     void onPatchSizeChanged(int value);
@@ -81,6 +99,12 @@ private slots:
     void onDampingChanged(int value);
 
 private:
+    planar_tracker_preset::PlanarTrackerPreset selectedPreset() const;
+    void rebuildPresetCombo(const QString& selectedId = QString());
+    void applyPresetToWidgets(const planar_tracker_preset::PlanarTrackerPreset& preset);
+    void setPresetWidgetSignalsBlocked(bool blocked);
+    void updateDeletePresetButton();
+    int currentPresetIndex() const;
     void rebuildSummary();
 
     QImage               m_reference;
@@ -89,6 +113,13 @@ private:
     QList<planar::Frame> m_result;
     planar::TrackParams  m_params;
 
+    QLabel*             m_descriptionLabel       = nullptr;
+    QComboBox*          m_presetCombo            = nullptr;
+    QPushButton*        m_saveCustomPresetButton = nullptr;
+    QPushButton*        m_deletePresetBtn        = nullptr;
+    QPushButton*        m_resetPresetButton      = nullptr;
+    QPushButton*        m_exportPresetButton     = nullptr;
+    QPushButton*        m_importPresetButton     = nullptr;
     PlanarCornerWidget* m_cornerWidget      = nullptr;
     QSpinBox*           m_patchSizeSpin     = nullptr;  // px, 16..128
     QSpinBox*           m_searchRadiusSpin  = nullptr;  // px, 4..64
@@ -98,4 +129,8 @@ private:
     QProgressBar*       m_progress          = nullptr;
     QLabel*             m_summaryLabel      = nullptr;
     QDialogButtonBox*   m_buttonBox         = nullptr;
+
+    QList<planar_tracker_preset::PlanarTrackerPreset> m_presets;
 };
+
+Q_DECLARE_METATYPE(planar_tracker_preset::PlanarTrackerPreset)

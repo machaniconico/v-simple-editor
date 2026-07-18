@@ -7,7 +7,15 @@
 #include <QProgressBar>
 #include <QPushButton>
 #include <QLabel>
+#include <QCheckBox>
+#include <QPlainTextEdit>
 #include "ProjectSettings.h"
+#include "Timeline.h"
+
+enum class ExportType {
+    Video,       // 既存 video encode (preset/codec 設定を使う)
+    PremiereXml, // Premiere Pro XML (FCP7) — PremiereXmlExporter を呼出
+};
 
 struct ExportPreset {
     QString name;
@@ -46,6 +54,7 @@ struct ExportConfig {
     bool hdr10 = false;  // 10-bit BT.2020/PQ output when true (preserved for backward compat)
     int proresProfile = -1;  // -1 = not ProRes; 0..5 = Proxy/LT/SQ/HQ/4444/4444XQ
     HDRSettings hdrSettings; // extended HDR metadata
+    bool exportMarkedRangeOnly = false;
 
     QString codecDisplayName() const;
 };
@@ -59,22 +68,37 @@ public:
 
     ExportConfig config() const { return m_config; }
     void setSourceIsHdr(bool hdr);
+    void setMarkedRangeAvailable(bool hasRange);
+
+    // clips を渡すと Premiere XML export / YouTube チャプター生成時に
+    // highlight list を構築する。clips が空ならチャプター生成 checkbox を
+    // 無効化する (空タイムラインでは生成不能のため)。
+    void setClips(const QVector<ClipInfo> &clips) {
+        m_clips = clips;
+        if (m_chapterCheckbox)
+            m_chapterCheckbox->setEnabled(!m_clips.isEmpty());
+    }
 
     static QVector<ExportPreset> presets();
 
 private slots:
     void onPresetChanged(int index);
+    void onExportTypeChanged(int index);
     void onBrowseOutput();
     void onExport();
 
 private:
     void setupUI();
     void updateSummary();
+    void updateMarkedRangeCheckboxEnabled();
+    void regenerateChapters();
     QString defaultExtension() const;
 
     ExportConfig m_config;
     ProjectConfig m_projectConfig;
+    QVector<ClipInfo> m_clips;
 
+    QComboBox *m_exportTypeCombo = nullptr;
     QComboBox *m_presetCombo;
     QComboBox *m_videoCodecCombo;
     QComboBox *m_audioCodecCombo;
@@ -84,5 +108,12 @@ private:
     QLineEdit *m_outputEdit;
     QLabel *m_summaryLabel;
     QLabel *m_hdrWarningLabel = nullptr;
+    QCheckBox *m_markedRangeCheckbox = nullptr;
+    bool m_markedRangeStateKnown = false;
+    bool m_markedRangeAvailable = false;
     bool m_sourceIsHdr = false;
+
+    QCheckBox *m_chapterCheckbox = nullptr;
+    QPlainTextEdit *m_chapterText = nullptr;
+    QPushButton *m_chapterCopyBtn = nullptr;
 };

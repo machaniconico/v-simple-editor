@@ -1,17 +1,23 @@
 #include "LoudnessMaster.h"
 
-#include <QDebug>
+#include "libavcore/Decode.h"
+
 #include <QFile>
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cstdint>
 #include <limits>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
+#include <libavutil/avutil.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/error.h>
+#include <libavutil/mathematics.h>
+#include <libavutil/samplefmt.h>
 #include <libswresample/swresample.h>
 }
 
@@ -43,8 +49,6 @@ double presetTargetLufs(LoudnessPreset p)
 // ---------------------------------------------------------------------------
 namespace {
 
-const double kMeasurementFailed = std::numeric_limits<double>::quiet_NaN();
-
 // Direct-form-I biquad. ITU-R BS.1770-4 K-weighting (a0 normalized to 1).
 struct Biquad {
     double b0, b1, b2, a1, a2;
@@ -61,139 +65,499 @@ struct Biquad {
     }
 };
 
-struct DecodeContext {
-    AVFormatContext *fmt = nullptr;
-    AVCodecContext *codec = nullptr;
-    SwrContext *swr = nullptr;
-    AVPacket *packet = nullptr;
-    AVFrame *frame = nullptr;
-    int streamIndex = -1;
+QString avErrorString(int err)
+{
+    char buf[AV_ERROR_MAX_STRING_SIZE] = {};
+    if (av_strerror(err, buf, sizeof(buf)) < 0)
+        return QString::number(err);
+    return QString::fromUtf8(buf);
+}
 
-    ~DecodeContext()
+struct SwrGuard {
+    SwrContext *ctx = nullptr;
+
+    ~SwrGuard()
     {
-        if (frame) {
-            av_frame_free(&frame);
-        }
-        if (packet) {
-            av_packet_free(&packet);
-        }
-        if (swr) {
-            swr_free(&swr);
-        }
-        if (codec) {
-            avcodec_free_context(&codec);
-        }
-        if (fmt) {
-            avformat_close_input(&fmt);
-        }
+        if (ctx)
+            swr_free(&ctx);
     }
 };
 
-bool appendDecodedFrames(DecodeContext &ctx, QVector<float> &mono)
-{
-    QVector<float> converted;
-    bool decodedAny = false;
+struct FormatGuard {
+    AVFormatContext *ctx = nullptr;
 
-    while (avcodec_receive_frame(ctx.codec, ctx.frame) == 0) {
-        const int outSamples = swr_get_out_samples(ctx.swr, ctx.frame->nb_samples);
-        if (outSamples <= 0) {
-            av_frame_unref(ctx.frame);
-            continue;
-        }
+    ~FormatGuard()
+    {
+        if (ctx)
+            avformat_close_input(&ctx);
+    }
+};
 
-        converted.resize(outSamples);
-        uint8_t *outData = reinterpret_cast<uint8_t *>(converted.data());
-        const int got = swr_convert(ctx.swr,
-                                    &outData,
-                                    outSamples,
-                                    const_cast<const uint8_t **>(ctx.frame->extended_data),
-                                    ctx.frame->nb_samples);
-        av_frame_unref(ctx.frame);
-        if (got <= 0) {
-            continue;
-        }
+struct CodecGuard {
+    AVCodecContext *ctx = nullptr;
 
-        const int oldSize = mono.size();
-        mono.resize(oldSize + got);
-        std::copy(converted.constData(), converted.constData() + got, mono.data() + oldSize);
-        decodedAny = true;
+    ~CodecGuard()
+    {
+        if (ctx)
+            avcodec_free_context(&ctx);
+    }
+};
+
+struct PacketGuard {
+    AVPacket *pkt = nullptr;
+
+    PacketGuard()
+        : pkt(av_packet_alloc())
+    {
     }
 
-    return decodedAny;
+    ~PacketGuard()
+    {
+        if (pkt)
+            av_packet_free(&pkt);
+    }
+};
+
+struct FrameGuard {
+    AVFrame *frame = nullptr;
+
+    FrameGuard()
+        : frame(av_frame_alloc())
+    {
+    }
+
+    ~FrameGuard()
+    {
+        if (frame)
+            av_frame_free(&frame);
+    }
+};
+
+struct ChannelLayoutGuard {
+    AVChannelLayout layout = {};
+
+    ~ChannelLayoutGuard()
+    {
+        av_channel_layout_uninit(&layout);
+    }
+};
+
+bool copyOrDefaultChannelLayout(ChannelLayoutGuard &dst,
+                                const AVChannelLayout &src,
+                                int channels)
+{
+    if (src.nb_channels > 0)
+        return av_channel_layout_copy(&dst.layout, &src) >= 0;
+
+    if (channels <= 0)
+        return false;
+    av_channel_layout_default(&dst.layout, channels);
+    return dst.layout.nb_channels > 0;
 }
 
-bool decodeAudioFileToMono(const QString &audioPath, QVector<float> &mono, int &sampleRate)
+bool appendResampledMonoFloat(SwrContext *swr,
+                              int inSampleRate,
+                              int outSampleRate,
+                              const uint8_t *const *inData,
+                              int inSamples,
+                              QVector<float> &mono,
+                              QString *error)
 {
-    DecodeContext ctx;
-    if (avformat_open_input(&ctx.fmt, audioPath.toUtf8().constData(), nullptr, nullptr) < 0) {
-        return false;
-    }
-    if (avformat_find_stream_info(ctx.fmt, nullptr) < 0) {
-        return false;
-    }
-
-    ctx.streamIndex = av_find_best_stream(ctx.fmt, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
-    if (ctx.streamIndex < 0) {
+    if (!swr || inSampleRate <= 0 || outSampleRate <= 0 || inSamples < 0) {
+        if (error)
+            *error = QStringLiteral("invalid resampler state");
         return false;
     }
 
-    AVCodecParameters *params = ctx.fmt->streams[ctx.streamIndex]->codecpar;
-    const AVCodec *decoder = avcodec_find_decoder(params->codec_id);
-    if (!decoder) {
+    const int64_t delay = swr_get_delay(swr, inSampleRate);
+    const int64_t outSamples64 = av_rescale_rnd(
+        delay + inSamples,
+        outSampleRate,
+        inSampleRate,
+        AV_ROUND_UP);
+    if (outSamples64 < 0
+        || outSamples64 > std::numeric_limits<int>::max()) {
+        if (error)
+            *error = QStringLiteral("resampler output is too large");
         return false;
     }
 
-    ctx.codec = avcodec_alloc_context3(decoder);
-    if (!ctx.codec || avcodec_parameters_to_context(ctx.codec, params) < 0) {
+    const int outSamples = static_cast<int>(outSamples64);
+    if (outSamples == 0)
+        return true;
+
+    QVector<float> chunk(outSamples);
+    uint8_t *outData = reinterpret_cast<uint8_t*>(chunk.data());
+    const int converted = swr_convert(
+        swr,
+        &outData,
+        outSamples,
+        inData,
+        inSamples);
+    if (converted < 0) {
+        if (error)
+            *error = QStringLiteral("audio resample failed: %1")
+                         .arg(avErrorString(converted));
         return false;
     }
-    if (ctx.codec->ch_layout.nb_channels <= 0 && params->ch_layout.nb_channels > 0) {
-        av_channel_layout_copy(&ctx.codec->ch_layout, &params->ch_layout);
-    }
-    if (avcodec_open2(ctx.codec, decoder, nullptr) < 0) {
-        return false;
-    }
-    if (ctx.codec->sample_rate <= 0 || ctx.codec->ch_layout.nb_channels <= 0) {
+    if (converted == 0)
+        return true;
+    if (mono.size() > std::numeric_limits<int>::max() - converted) {
+        if (error)
+            *error = QStringLiteral("decoded audio is too large");
         return false;
     }
 
-    AVChannelLayout monoLayout = AV_CHANNEL_LAYOUT_MONO;
-    if (swr_alloc_set_opts2(&ctx.swr,
-                            &monoLayout,
-                            AV_SAMPLE_FMT_FLT,
-                            ctx.codec->sample_rate,
-                            &ctx.codec->ch_layout,
-                            ctx.codec->sample_fmt,
-                            ctx.codec->sample_rate,
-                            0,
-                            nullptr) < 0) {
+    const int oldSize = mono.size();
+    mono.resize(oldSize + converted);
+    std::memcpy(mono.data() + oldSize,
+                chunk.constData(),
+                static_cast<size_t>(converted) * sizeof(float));
+    return true;
+}
+
+bool decodeAudioWithMediaDecoder(const QString &audioPath,
+                                 QVector<float> &mono,
+                                 int &sampleRate,
+                                 QString *error)
+{
+    libavcore::MediaDecoder decoder;
+    if (auto openError = decoder.open(audioPath.toUtf8().constData(), true)) {
+        if (error)
+            *error = QString::fromStdString(*openError);
         return false;
     }
-    if (!ctx.swr || swr_init(ctx.swr) < 0) {
+    if (!decoder.hasAudio()) {
+        if (error)
+            *error = QStringLiteral("input has no audio stream");
         return false;
     }
 
-    ctx.packet = av_packet_alloc();
-    ctx.frame = av_frame_alloc();
-    if (!ctx.packet || !ctx.frame) {
+    const libavcore::AudioStreamProps props = decoder.audioProps();
+    if (props.sampleRate <= 0 || props.channels <= 0
+        || props.sampleFormat == AV_SAMPLE_FMT_NONE) {
+        if (error)
+            *error = QStringLiteral("decoder reported invalid audio properties");
         return false;
     }
 
-    bool decodedAny = false;
-    while (av_read_frame(ctx.fmt, ctx.packet) >= 0) {
-        if (ctx.packet->stream_index == ctx.streamIndex &&
-            avcodec_send_packet(ctx.codec, ctx.packet) == 0) {
-            decodedAny = appendDecodedFrames(ctx, mono) || decodedAny;
+    ChannelLayoutGuard inputLayout;
+    if (!copyOrDefaultChannelLayout(inputLayout,
+                                    props.channelLayout,
+                                    props.channels)) {
+        if (error)
+            *error = QStringLiteral("failed to resolve input channel layout");
+        return false;
+    }
+
+    ChannelLayoutGuard outputLayout;
+    const AVChannelLayout monoLayout = AV_CHANNEL_LAYOUT_MONO;
+    if (av_channel_layout_copy(&outputLayout.layout, &monoLayout) < 0) {
+        if (error)
+            *error = QStringLiteral("failed to create mono output layout");
+        return false;
+    }
+
+    SwrGuard swr;
+    int rc = swr_alloc_set_opts2(
+        &swr.ctx,
+        &outputLayout.layout,
+        AV_SAMPLE_FMT_FLT,
+        props.sampleRate,
+        &inputLayout.layout,
+        props.sampleFormat,
+        props.sampleRate,
+        0,
+        nullptr);
+    if (rc < 0 || !swr.ctx) {
+        if (error)
+            *error = QStringLiteral("failed to allocate audio resampler: %1")
+                         .arg(rc < 0 ? avErrorString(rc)
+                                     : QStringLiteral("unknown error"));
+        return false;
+    }
+
+    rc = swr_init(swr.ctx);
+    if (rc < 0) {
+        if (error)
+            *error = QStringLiteral("failed to initialize audio resampler: %1")
+                         .arg(avErrorString(rc));
+        return false;
+    }
+
+    sampleRate = props.sampleRate;
+    while (!decoder.audioEnded()) {
+        AVFrame *frame = decoder.nextAudioFrame();
+        if (!frame)
+            break;
+        if (frame->nb_samples <= 0)
+            continue;
+
+        const uint8_t **inData =
+            const_cast<const uint8_t**>(frame->extended_data);
+        if (!appendResampledMonoFloat(swr.ctx,
+                                      props.sampleRate,
+                                      props.sampleRate,
+                                      inData,
+                                      frame->nb_samples,
+                                      mono,
+                                      error)) {
+            return false;
         }
-        av_packet_unref(ctx.packet);
     }
 
-    if (avcodec_send_packet(ctx.codec, nullptr) == 0) {
-        decodedAny = appendDecodedFrames(ctx, mono) || decodedAny;
+    while (swr_get_delay(swr.ctx, props.sampleRate) > 0) {
+        const int before = mono.size();
+        if (!appendResampledMonoFloat(swr.ctx,
+                                      props.sampleRate,
+                                      props.sampleRate,
+                                      nullptr,
+                                      0,
+                                      mono,
+                                      error)) {
+            return false;
+        }
+        if (mono.size() == before)
+            break;
     }
 
-    sampleRate = ctx.codec->sample_rate;
-    return decodedAny && !mono.isEmpty();
+    if (mono.isEmpty()) {
+        if (error)
+            *error = QStringLiteral("audio decode produced no samples");
+        return false;
+    }
+    return true;
+}
+
+bool decodeAudioWithLibav(const QString &audioPath,
+                          QVector<float> &mono,
+                          int &sampleRate,
+                          QString *error)
+{
+    FormatGuard input;
+    int rc = avformat_open_input(&input.ctx,
+                                 audioPath.toUtf8().constData(),
+                                 nullptr,
+                                 nullptr);
+    if (rc < 0) {
+        if (error)
+            *error = QStringLiteral("cannot open input: %1")
+                         .arg(avErrorString(rc));
+        return false;
+    }
+
+    rc = avformat_find_stream_info(input.ctx, nullptr);
+    if (rc < 0) {
+        if (error)
+            *error = QStringLiteral("cannot read stream info: %1")
+                         .arg(avErrorString(rc));
+        return false;
+    }
+
+    int audioStreamIndex = -1;
+    for (unsigned i = 0; i < input.ctx->nb_streams; ++i) {
+        AVStream *stream = input.ctx->streams[i];
+        if (stream && stream->codecpar
+            && stream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+            audioStreamIndex = static_cast<int>(i);
+            break;
+        }
+    }
+    if (audioStreamIndex < 0) {
+        if (error)
+            *error = QStringLiteral("input has no audio stream");
+        return false;
+    }
+
+    AVStream *audioStream = input.ctx->streams[audioStreamIndex];
+    AVCodecParameters *codecpar = audioStream->codecpar;
+    const AVCodec *codec = avcodec_find_decoder(codecpar->codec_id);
+    if (!codec) {
+        if (error)
+            *error = QStringLiteral("no decoder for audio codec '%1'")
+                         .arg(QString::fromUtf8(
+                             avcodec_get_name(codecpar->codec_id)));
+        return false;
+    }
+
+    CodecGuard decoder;
+    decoder.ctx = avcodec_alloc_context3(codec);
+    if (!decoder.ctx) {
+        if (error)
+            *error = QStringLiteral("failed to allocate audio decoder");
+        return false;
+    }
+
+    rc = avcodec_parameters_to_context(decoder.ctx, codecpar);
+    if (rc < 0) {
+        if (error)
+            *error = QStringLiteral("failed to copy audio codec parameters: %1")
+                         .arg(avErrorString(rc));
+        return false;
+    }
+    decoder.ctx->pkt_timebase = audioStream->time_base;
+
+    rc = avcodec_open2(decoder.ctx, codec, nullptr);
+    if (rc < 0) {
+        if (error)
+            *error = QStringLiteral("failed to open audio decoder: %1")
+                         .arg(avErrorString(rc));
+        return false;
+    }
+    if (decoder.ctx->sample_rate <= 0
+        || decoder.ctx->sample_fmt == AV_SAMPLE_FMT_NONE) {
+        if (error)
+            *error = QStringLiteral("audio decoder reported invalid properties");
+        return false;
+    }
+
+    ChannelLayoutGuard inputLayout;
+    if (!copyOrDefaultChannelLayout(inputLayout,
+                                    decoder.ctx->ch_layout,
+                                    decoder.ctx->ch_layout.nb_channels)) {
+        if (error)
+            *error = QStringLiteral("failed to resolve input channel layout");
+        return false;
+    }
+
+    ChannelLayoutGuard outputLayout;
+    const AVChannelLayout monoLayout = AV_CHANNEL_LAYOUT_MONO;
+    if (av_channel_layout_copy(&outputLayout.layout, &monoLayout) < 0) {
+        if (error)
+            *error = QStringLiteral("failed to create mono output layout");
+        return false;
+    }
+
+    SwrGuard swr;
+    rc = swr_alloc_set_opts2(
+        &swr.ctx,
+        &outputLayout.layout,
+        AV_SAMPLE_FMT_FLT,
+        decoder.ctx->sample_rate,
+        &inputLayout.layout,
+        decoder.ctx->sample_fmt,
+        decoder.ctx->sample_rate,
+        0,
+        nullptr);
+    if (rc < 0 || !swr.ctx) {
+        if (error)
+            *error = QStringLiteral("failed to allocate audio resampler: %1")
+                         .arg(rc < 0 ? avErrorString(rc)
+                                     : QStringLiteral("unknown error"));
+        return false;
+    }
+
+    rc = swr_init(swr.ctx);
+    if (rc < 0) {
+        if (error)
+            *error = QStringLiteral("failed to initialize audio resampler: %1")
+                         .arg(avErrorString(rc));
+        return false;
+    }
+
+    PacketGuard packet;
+    FrameGuard frame;
+    if (!packet.pkt || !frame.frame) {
+        if (error)
+            *error = QStringLiteral("failed to allocate decode buffers");
+        return false;
+    }
+
+    sampleRate = decoder.ctx->sample_rate;
+    bool gotSamples = false;
+    auto receiveFrames = [&]() -> bool {
+        while (true) {
+            const int receiveRc =
+                avcodec_receive_frame(decoder.ctx, frame.frame);
+            if (receiveRc == AVERROR(EAGAIN) || receiveRc == AVERROR_EOF)
+                return true;
+            if (receiveRc < 0) {
+                if (error)
+                    *error = QStringLiteral("audio decode failed: %1")
+                                 .arg(avErrorString(receiveRc));
+                return false;
+            }
+
+            const uint8_t **inData =
+                const_cast<const uint8_t**>(frame.frame->extended_data);
+            const bool ok = appendResampledMonoFloat(swr.ctx,
+                                                     decoder.ctx->sample_rate,
+                                                     decoder.ctx->sample_rate,
+                                                     inData,
+                                                     frame.frame->nb_samples,
+                                                     mono,
+                                                     error);
+            av_frame_unref(frame.frame);
+            if (!ok)
+                return false;
+            gotSamples = true;
+        }
+    };
+
+    while ((rc = av_read_frame(input.ctx, packet.pkt)) >= 0) {
+        if (packet.pkt->stream_index != audioStreamIndex) {
+            av_packet_unref(packet.pkt);
+            continue;
+        }
+
+        rc = avcodec_send_packet(decoder.ctx, packet.pkt);
+        if (rc == AVERROR(EAGAIN)) {
+            if (!receiveFrames()) {
+                av_packet_unref(packet.pkt);
+                return false;
+            }
+            rc = avcodec_send_packet(decoder.ctx, packet.pkt);
+        }
+        av_packet_unref(packet.pkt);
+        if (rc < 0) {
+            if (error)
+                *error = QStringLiteral("failed to send audio packet: %1")
+                             .arg(avErrorString(rc));
+            return false;
+        }
+        if (!receiveFrames())
+            return false;
+    }
+    av_packet_unref(packet.pkt);
+
+    if (rc != AVERROR_EOF) {
+        if (error)
+            *error = QStringLiteral("failed while reading input audio: %1")
+                         .arg(avErrorString(rc));
+        return false;
+    }
+
+    rc = avcodec_send_packet(decoder.ctx, nullptr);
+    if (rc < 0 && rc != AVERROR_EOF) {
+        if (error)
+            *error = QStringLiteral("failed to flush audio decoder: %1")
+                         .arg(avErrorString(rc));
+        return false;
+    }
+    if (!receiveFrames())
+        return false;
+
+    while (swr_get_delay(swr.ctx, decoder.ctx->sample_rate) > 0) {
+        const int before = mono.size();
+        if (!appendResampledMonoFloat(swr.ctx,
+                                      decoder.ctx->sample_rate,
+                                      decoder.ctx->sample_rate,
+                                      nullptr,
+                                      0,
+                                      mono,
+                                      error)) {
+            return false;
+        }
+        if (mono.size() == before)
+            break;
+    }
+
+    if (!gotSamples || mono.isEmpty()) {
+        if (error)
+            *error = QStringLiteral("audio decode produced no samples");
+        return false;
+    }
+    return true;
 }
 
 } // namespace
@@ -322,15 +686,35 @@ double measureIntegratedLufs(const QString &audioPath)
         }
         qWarning("loudness::measureIntegratedLufs: failed to read raw PCM '%s'",
                  qUtf8Printable(audioPath));
-        return -23.0;
+        return std::numeric_limits<double>::quiet_NaN();
     }
 
     QVector<float> mono;
     int sampleRate = 0;
-    if (!decodeAudioFileToMono(audioPath, mono, sampleRate)) {
-        qWarning("loudness::measureIntegratedLufs: failed to decode '%s'",
+    QString error;
+    if (!decodeAudioWithMediaDecoder(audioPath, mono, sampleRate, &error)) {
+        const QString mediaDecoderError = error;
+        mono.clear();
+        sampleRate = 0;
+        error.clear();
+        if (!decodeAudioWithLibav(audioPath, mono, sampleRate, &error)) {
+            qWarning("loudness::measureIntegratedLufs: MediaDecoder failed for "
+                     "'%s': %s",
+                     qUtf8Printable(audioPath),
+                     qUtf8Printable(mediaDecoderError));
+            qWarning("loudness::measureIntegratedLufs: audio decode failed for "
+                     "'%s': %s",
+                     qUtf8Printable(audioPath),
+                     qUtf8Printable(error));
+            return std::numeric_limits<double>::quiet_NaN();
+        }
+    }
+
+    if (mono.isEmpty() || sampleRate <= 0) {
+        qWarning("loudness::measureIntegratedLufs: decoded no audio samples "
+                 "from '%s'",
                  qUtf8Printable(audioPath));
-        return kMeasurementFailed;
+        return std::numeric_limits<double>::quiet_NaN();
     }
 
     return measureIntegratedLufsFromSamples(mono, sampleRate);

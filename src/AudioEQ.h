@@ -135,7 +135,6 @@ private:
     // Find FFmpeg binary
     static QString findFFmpegBinary();
 
-    QProcess *m_process = nullptr;
     bool m_cancelled = false;
     double m_totalDuration = 0.0;
 };

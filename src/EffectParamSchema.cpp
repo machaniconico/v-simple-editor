@@ -3,6 +3,11 @@
 
 namespace effectctrl {
 
+static double encodedColorDefault(const QColor &color)
+{
+    return color.isValid() ? static_cast<double>(color.rgb()) : 0.0;
+}
+
 QVector<ParamDef> paramSchemaFor(VideoEffectType type)
 {
     switch (type) {
@@ -19,7 +24,7 @@ QVector<ParamDef> paramSchemaFor(VideoEffectType type)
         return {
             { "tolerance", "Tolerance", ParamType::Float, 0.0, 100.0, 40.0 },
             { "softness", "Softness", ParamType::Float, 0.0, 50.0, 10.0 },
-            { "color", "Key Color", ParamType::Color, 0.0, 0.0, 0.0 }
+            { "color", "Key Color", ParamType::Color, 0.0, 0.0, encodedColorDefault(QColor(0, 255, 0)) }
         };
 
     case VideoEffectType::Vignette:
@@ -39,6 +44,206 @@ QVector<ParamDef> paramSchemaFor(VideoEffectType type)
 
     case VideoEffectType::Noise:
         return { { "amount", "Amount", ParamType::Float, 0.0, 100.0, 20.0 } };
+
+    case VideoEffectType::GaussianBlur:
+        return { { "radius", "Radius", ParamType::Float, 0.0, 50.0, 5.0 } };
+
+    case VideoEffectType::DirectionalBlur:
+        return {
+            { "angle", "Angle", ParamType::Float, 0.0, 360.0, 0.0 },
+            { "length", "Length", ParamType::Float, 0.0, 100.0, 20.0 }
+        };
+
+    case VideoEffectType::RadialBlur:
+        return {
+            { "amount", "Amount", ParamType::Float, 0.0, 50.0, 10.0 },
+            { "mode", "Mode", ParamType::Int, 0.0, 1.0, 0.0 }
+        };
+
+    case VideoEffectType::Glow:
+        return {
+            { "threshold", "Threshold", ParamType::Int, 0.0, 255.0, 128.0 },
+            { "radius", "Radius", ParamType::Float, 0.0, 50.0, 10.0 },
+            { "intensity", "Intensity", ParamType::Float, 0.0, 3.0, 1.0 }
+        };
+
+    case VideoEffectType::FindEdges:
+        return { { "intensity", "Intensity", ParamType::Float, 0.0, 2.0, 1.0 } };
+
+    case VideoEffectType::Emboss:
+        return {
+            { "angle", "Angle", ParamType::Float, 0.0, 360.0, 45.0 },
+            { "amount", "Amount", ParamType::Float, 0.0, 5.0, 2.0 }
+        };
+
+    case VideoEffectType::Posterize:
+        return { { "levels", "Levels", ParamType::Int, 2.0, 32.0, 4.0 } };
+
+    case VideoEffectType::Threshold:
+        return { { "level", "Level", ParamType::Int, 0.0, 255.0, 128.0 } };
+
+    case VideoEffectType::Solarize:
+        return { { "threshold", "Threshold", ParamType::Int, 0.0, 255.0, 128.0 } };
+
+    case VideoEffectType::Levels:
+        return {
+            { "inputBlack", "Input Black", ParamType::Int, 0.0, 255.0, 0.0 },
+            { "inputWhite", "Input White", ParamType::Int, 0.0, 255.0, 255.0 },
+            { "gamma", "Gamma", ParamType::Float, 0.1, 5.0, 1.0 }
+        };
+
+    case VideoEffectType::Tint:
+        return {
+            { "amount", "Amount", ParamType::Float, 0.0, 1.0, 1.0 },
+            { "keyColor", "Key Color", ParamType::Color, 0.0, 0.0, encodedColorDefault(QColor(255, 255, 255)) }
+        };
+
+    case VideoEffectType::BlackWhite:
+        return {
+            { "redWeight", "Red Weight", ParamType::Float, 0.0, 1.0, 0.299 },
+            { "greenWeight", "Green Weight", ParamType::Float, 0.0, 1.0, 0.587 },
+            { "blueWeight", "Blue Weight", ParamType::Float, 0.0, 1.0, 0.114 }
+        };
+
+    case VideoEffectType::Exposure:
+        return { { "stops", "Stops", ParamType::Float, -5.0, 5.0, 0.0 } };
+
+    case VideoEffectType::HueSaturation:
+        return {
+            { "hueDegrees", "Hue", ParamType::Float, -180.0, 180.0, 0.0 },
+            { "saturation", "Saturation", ParamType::Float, -100.0, 100.0, 0.0 },
+            { "lightness", "Lightness", ParamType::Float, -100.0, 100.0, 0.0 }
+        };
+
+    case VideoEffectType::RGBSplit:
+        return {
+            { "offsetX", "Offset X", ParamType::Float, -50.0, 50.0, 6.0 },
+            { "offsetY", "Offset Y", ParamType::Float, -50.0, 50.0, 0.0 }
+        };
+
+    case VideoEffectType::WaveWarp:
+        return {
+            { "amplitude", "Amplitude", ParamType::Float, 0.0, 100.0, 12.0 },
+            { "wavelength", "Wavelength", ParamType::Float, 1.0, 500.0, 80.0 },
+            { "phase", "Phase", ParamType::Float, 0.0, 360.0, 0.0 }
+        };
+
+    case VideoEffectType::Ripple:
+        return {
+            { "amplitude", "Amplitude", ParamType::Float, 0.0, 100.0, 12.0 },
+            { "wavelength", "Wavelength", ParamType::Float, 1.0, 500.0, 80.0 },
+            { "phase", "Phase", ParamType::Float, 0.0, 360.0, 0.0 }
+        };
+
+    case VideoEffectType::GlitchVHS:
+        return {
+            { "intensity", "Intensity", ParamType::Float, 0.0, 1.0, 0.5 },
+            { "blockHeight", "Block Height", ParamType::Int, 4.0, 64.0, 12.0 },
+            { "seed", "Seed", ParamType::Int, 0.0, 1000.0, 1.0 }
+        };
+
+    case VideoEffectType::GradientRamp:
+        return {
+            { "type", "タイプ", ParamType::Int, 0.0, 1.0, 0.0 },
+            { "angle", "角度", ParamType::Float, 0.0, 360.0, 0.0 },
+            { "opacity", "不透明度", ParamType::Float, 0.0, 1.0, 1.0 },
+            { "keyColor", "Key Color", ParamType::Color, 0.0, 0.0, encodedColorDefault(QColor(255, 255, 255)) }
+        };
+
+    case VideoEffectType::Fill:
+        return {
+            { "opacity", "不透明度", ParamType::Float, 0.0, 1.0, 1.0 },
+            { "keyColor", "Key Color", ParamType::Color, 0.0, 0.0, encodedColorDefault(QColor(255, 255, 255)) }
+        };
+
+    case VideoEffectType::Bloom:
+        return {
+            { "threshold", "しきい値", ParamType::Int, 0.0, 255.0, 128.0 },
+            { "radius", "半径", ParamType::Float, 0.0, 80.0, 20.0 },
+            { "intensity", "強度", ParamType::Float, 0.0, 2.0, 1.0 }
+        };
+
+    case VideoEffectType::Scanlines:
+        return {
+            { "lineSpacing", "間隔", ParamType::Int, 2.0, 20.0, 4.0 },
+            { "darkness", "暗さ", ParamType::Float, 0.0, 1.0, 0.5 },
+            { "opacity", "不透明度", ParamType::Float, 0.0, 1.0, 1.0 }
+        };
+
+    case VideoEffectType::Halftone:
+        return {
+            { "dotSize", "ドットサイズ", ParamType::Int, 2.0, 30.0, 8.0 },
+            { "angle", "角度", ParamType::Float, 0.0, 360.0, 45.0 }
+        };
+
+    case VideoEffectType::Curves:
+        return {
+            { "shadows", "シャドウ", ParamType::Float, -100.0, 100.0, 0.0 },
+            { "highlights", "ハイライト", ParamType::Float, -100.0, 100.0, 0.0 },
+            { "midContrast", "中間コントラスト", ParamType::Float, -100.0, 100.0, 0.0 }
+        };
+
+    case VideoEffectType::ChannelMixer:
+        return {
+            { "redFromRed", "Red From Red (%)", ParamType::Float, 0.0, 200.0, 100.0 },
+            { "greenFromGreen", "Green From Green (%)", ParamType::Float, 0.0, 200.0, 100.0 },
+            { "blueFromBlue", "Blue From Blue (%)", ParamType::Float, 0.0, 200.0, 100.0 }
+        };
+
+    case VideoEffectType::Vibrance:
+        return { { "vibrance", "自然な彩度", ParamType::Float, -100.0, 100.0, 0.0 } };
+
+    case VideoEffectType::PhotoFilter:
+        return {
+            { "density", "濃度", ParamType::Float, 0.0, 100.0, 0.0 },
+            { "keyColor", "Key Color", ParamType::Color, 0.0, 0.0, encodedColorDefault(QColor(236, 138, 0)) }
+        };
+
+    case VideoEffectType::Tritone:
+        return {
+            { "blend", "ブレンド", ParamType::Float, 0.0, 1.0, 0.0 },
+            { "keyColor", "Key Color", ParamType::Color, 0.0, 0.0, encodedColorDefault(QColor(0, 0, 0)) }
+        };
+
+    case VideoEffectType::BrightnessContrast:
+        return {
+            { "brightness", "明るさ", ParamType::Float, -100.0, 100.0, 0.0 },
+            { "contrast", "コントラスト", ParamType::Float, -100.0, 100.0, 0.0 }
+        };
+
+    case VideoEffectType::Bulge:
+        return {
+            { "amount", "量", ParamType::Float, -100.0, 100.0, 0.0 },
+            { "radius", "半径", ParamType::Float, 0.0, 1.0, 0.5 }
+        };
+
+    case VideoEffectType::Twirl:
+        return {
+            { "angle", "角度", ParamType::Float, -720.0, 720.0, 0.0 },
+            { "radius", "半径", ParamType::Float, 0.0, 1.0, 0.5 }
+        };
+
+    case VideoEffectType::Mirror:
+        return { { "mode", "モード", ParamType::Int, 0.0, 3.0, 0.0 } };
+
+    case VideoEffectType::PolarCoordinates:
+        return {
+            { "type", "タイプ", ParamType::Int, 0.0, 1.0, 0.0 },
+            { "amount", "量", ParamType::Float, 0.0, 1.0, 0.0 }
+        };
+
+    case VideoEffectType::MotionTile:
+        return {
+            { "tilesX", "横タイル", ParamType::Int, 1.0, 10.0, 1.0 },
+            { "tilesY", "縦タイル", ParamType::Int, 1.0, 10.0, 1.0 },
+            { "mirrorEdges", "ミラーエッジ", ParamType::Bool, 0.0, 1.0, 0.0 }
+        };
+
+    case VideoEffectType::CornerPinSimple:
+        return {
+            { "horizontalTilt", "水平チルト", ParamType::Float, -100.0, 100.0, 0.0 },
+            { "verticalTilt", "垂直チルト", ParamType::Float, -100.0, 100.0, 0.0 }
+        };
 
     case VideoEffectType::None:
     default:

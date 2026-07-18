@@ -45,6 +45,8 @@ class MotionTracker : public QObject
     Q_OBJECT
 
 public:
+    enum class MatchMetric { NCC, SSD, ZNCC };
+
     explicit MotionTracker(QObject *parent = nullptr);
 
     // Configuration
@@ -53,6 +55,29 @@ public:
 
     void setMinConfidence(double conf); // minimum NCC to accept a match
     double minConfidence() const { return m_minConfidence; }
+
+    // Preset configuration. Numeric setters clamp with qBound and only emit
+    // debug logs for out-of-range values; no exceptions are thrown.
+    //
+    // Search radius in pixels, default 24. Range [0, 128], where 0 disables
+    // expansion beyond the last known rectangle.
+    void setSearchRadius(int radius);
+
+    // Match scoring metric, default NCC. Unsupported enum values fall back to
+    // NCC with a debug log.
+    void setMatchMetric(MatchMetric m);
+
+    // Occlusion onset threshold, default 0.5. Range [0.0, 1.0].
+    void setOcclusionThreshold(double v);
+
+    // Sub-pixel parabolic refinement gate, default true.
+    void setSubPixelPrecision(bool enabled);
+
+    // Kalman process noise preset value, default 0.1. Range [0.0, 1.0].
+    void setKalmanProcessNoise(double q);
+
+    // Kalman measurement noise baseline, default 1.0. Range [0.0, 10.0].
+    void setKalmanMeasurementNoise(double r);
 
     // Start tracking: extract frames via FFmpeg and track the object in initialRect
     void startTracking(const QString &filePath, const QRect &initialRect);
@@ -96,9 +121,18 @@ private:
     // Decode video frames via FFmpeg and run tracking loop
     bool decodeAndTrack(const QString &filePath, const QRect &initialRect);
 
+    // Match scoring on grayscale data. Scores are higher-is-better so the
+    // existing confidence and sub-pixel peak logic can share the same path.
+    double computeMatchScore(const QImage &frame, const QImage &templ,
+                             int offsetX, int offsetY) const;
+
     // Normalized cross-correlation on grayscale data
     static double computeNCC(const QImage &frame, const QImage &templ,
                              int offsetX, int offsetY);
+    static double computeSSD(const QImage &frame, const QImage &templ,
+                             int offsetX, int offsetY);
+    static double computeZNCC(const QImage &frame, const QImage &templ,
+                              int offsetX, int offsetY);
 
     // Convert QImage region to grayscale
     static QImage toGrayscale(const QImage &image);
@@ -137,9 +171,16 @@ private:
     void resetOcclusionState();
 
     TrackingResult m_result;
-    int m_searchMargin = 50;       // pixel margin around last known position
+    int m_searchMargin = 24;       // legacy alias for pixel search radius
     double m_minConfidence = 0.5;  // minimum NCC score to accept
     std::atomic<bool> m_cancelRequested{false};
+
+    int m_searchRadius = 24;                       // default 24, clamped [0,128]
+    MatchMetric m_matchMetric = MatchMetric::NCC;  // default NCC
+    double m_occlusionThreshold = 0.5;             // default 0.5, clamped [0,1]
+    bool m_subPixelEnabled = true;                 // default true
+    double m_kalmanProcessNoise = 0.1;             // default 0.1, clamped [0,1]
+    double m_kalmanMeasurementNoise = 1.0;         // default 1.0, clamped [0,10]
 
     // US-MT-2: constant-velocity Kalman state [x, y, vx, vy] in source-frame
     // pixel coordinates. m_kalmanInitialized tracks whether the next call
@@ -180,8 +221,8 @@ private:
     int m_consecLowScoreFrames = 0;
     int m_consecOccludedFrames = 0;
     int m_postReacquireRamp = 0;
-    int m_baseSearchMargin = 50;
-    int m_currentSearchMargin = 50;
+    int m_baseSearchMargin = 24;
+    int m_currentSearchMargin = 24;
     QImage m_lastConfidentTemplate;
     int m_lastConfidentTemplateFrame = -1;
     QVector<double> m_recentScores;

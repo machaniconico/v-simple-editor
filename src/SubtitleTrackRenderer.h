@@ -23,6 +23,8 @@ struct SubtitleStyle {
     double verticalPos = 0.85;       // 0..1 from top
     double maxWidthFraction = 0.8;   // fraction of canvas width
     int alignment = Qt::AlignHCenter;
+    bool karaokeEnabled = false;
+    QColor karaokeHighlightColor = QColor(255, 210, 0);
 };
 
 class SubtitleTrackRenderer : public QObject
@@ -55,6 +57,7 @@ public:
 private:
     // Word-wrap text to fit within maxWidth pixels, returning list of lines.
     static QStringList wrapText(const QString &text, const QFont &font, int maxWidth);
+    const SubtitleSegment* activeSegmentAt(double timeSec) const;
 
     QVector<SubtitleSegment> m_segments;
     SubtitleStyle m_style;

@@ -25,6 +25,7 @@ class QLabel;
 class QComboBox;
 class QLineEdit;
 class QSpinBox;
+class Timeline;
 
 class RenderQueueDialog : public QDialog
 {
@@ -43,6 +44,15 @@ public:
     // Default timeline range used by the "Add Job" sub-dialog when the
     // caller doesn't supply one. 0..0 means "whole timeline".
     void setDefaultTimelineRange(qint64 startUs, qint64 endUs);
+
+    // RM-1.4: the live edit-graph Timeline used for queue entries whose
+    // source path is left blank (the "(現在開いているプロジェクト)" /
+    // "current project" case). Without it, a blank-source job has an
+    // empty projectFilePath → RenderQueue::resolveTimeline returns
+    // nullptr → the entire render (and every track matte) is silently
+    // dropped. The caller (MainWindow) must keep this Timeline's matte
+    // carrier synced before the dialog submits jobs. Not owned.
+    void setLiveTimeline(Timeline *timeline) { m_liveTimeline = timeline; }
 
 private slots:
     void onAddJobClicked();
@@ -65,6 +75,7 @@ private:
     bool               m_ownsQueue      = true;
     qint64             m_defaultStartUs = 0;
     qint64             m_defaultEndUs   = 0;
+    Timeline          *m_liveTimeline   = nullptr;   // RM-1.4, not owned
 
     QTableWidget      *m_table          = nullptr;
     QPushButton       *m_addBtn         = nullptr;

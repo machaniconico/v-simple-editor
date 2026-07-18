@@ -2,6 +2,7 @@
 
 #include <QMainWindow>
 #include <QMenuBar>
+#include <QActionGroup>  // WS-3: ワークスペース切替アクションの排他グループ
 #include <QToolBar>
 #include <QStatusBar>
 #include <QSplitter>
@@ -13,9 +14,11 @@
 #include <QLabel>
 #include <QShowEvent>
 #include <QColor>
+#include <QImage>
 #include <QHash>
 #include <QVector>
 #include <QPair>
+#include <QPointer>
 #include <QRectF>
 #include <QString>
 #include "ProjectSettings.h"
@@ -24,6 +27,7 @@
 #include "AutoEdit.h"
 #include "ThemeManager.h"
 #include "MultiCam.h"
+#include "WorkspaceManager.h"  // WS-3: 名前付きワークスペース (ドックレイアウト) モデル SSOT
 #include "MotionTracker.h"
 #include "NoiseReduction.h"
 #include "SubtitleGenerator.h"
@@ -32,6 +36,9 @@
 #include "AutoSave.h"
 #include "LutImporter.h"
 #include "ProxyManager.h"
+#include "playback/AutoProxyPolicy.h"  // マルチトラック自動プロキシ判定エンジン (プレビュー専用)
+#include <QSet>
+#include "PlaybackTypes.h"
 #include "VideoStabilizer.h"
 #include "SpeedRamp.h"
 #include "AudioEQ.h"
@@ -68,15 +75,27 @@
 #include "RemotionExport.h"
 #include "WelcomeWidget.h"
 #include "HistoryDockWidget.h"
+#include "CommandSearch.h"
 #include "SmartReframe.h"
 #include "LoudnessAnalyzer.h"
 #include "SubtitleTrackRenderer.h"
 #include "AudioDucking.h"
 #include "ExportDialog.h"          // brings in HDRSettings
 #include "AIProcessingDialog.h"    // brings in AIProcessingSettings
+#include "MotionTrackerDialog.h"   // US-TP-6: motion tracker preset dialog
+#include "TrackerPreset.h"         // US-TP-6: tracker preset apply helper
+#include "MediaPool.h"             // MP-5: メディアプール SSOT モデル
+#include "MediaPoolDock.h"         // MP-5: メディアプール UI ドック
+#include "MarkerPanelDock.h"       // MK-2: マーカー パネル UI ドック
+#include "AudioBusRouting.h"       // AB-5: オーディオ バス ルーティング SSOT モデル
+#include "AcesColor.h"             // AC-4: ACES カラーマネジメント パイプライン SSOT
+#include "DolbyVisionMetadata.h"   // DV-4: Dolby Vision メタデータ SSOT
+#include "BroadcastCaption.h"      // CC-4: 放送CC (CEA-608/708) メタデータ SSOT
 
 class VideoPlayer;
 class Timeline;
+class SourceMonitorDock;
+class AudioBusPanel;
 class ExportDialog;
 class BrushAnimation;
 class RotoToolsDialog;
@@ -87,6 +106,9 @@ class ExpressionBindingDialog;
 class CameraMotionDialog;
 class SceneCutDialog;
 class AudioDuckingDialog;
+class ColorManagementDialog;   // AC-4: ACES カラーマネジメント ダイアログ
+class DolbyVisionDialog;       // DV-4: Dolby Vision メタデータ ダイアログ
+class BroadcastCaptionDialog;  // CC-4: 放送CC (CEA-608/708) ダイアログ
 class ProjectCollectorDialog;
 class HDRSettingsDialog;
 class AIProcessingDialog;
@@ -97,12 +119,24 @@ class AudioClipEditor;
 class ShortcutCustomizeDialog;
 class SocialExportDialog;
 class CaptionEditorDialog;
+class WhisperTranscribeDialog;
+class TranscriptHighlightDialog;
+class TextBasedEditDialog;
+class PptxExportDialog;   // PPTX (PowerPoint 資料書き出し) ダイアログ
+class AscCdlExportDialog; // ASC CDL (.cc/.ccc/.cdl カラー書き出し) ダイアログ
+class AutoClipDialog;
+class CommandPaletteDialog;
 class MobileExportDialog;
 class ImportHubDialog;
 class VimeoUploadDialog;
 class TwitchStreamDialog;
 class CloudRenderDialog;
+class CredentialDialog;
 class SmartEditDialog;
+
+namespace threepoint {
+struct SourceSelection;
+}
 
 // US-INT-2: Sprint 21 — platform expansion / mastering / batch export.
 class XVideoDialog;
@@ -178,6 +212,18 @@ class MainWindow : public QMainWindow
 public:
     explicit MainWindow(QWidget *parent = nullptr);
 
+    struct PrecomposeResult {
+        bool success = false;
+        QString failureReason;
+        bool warning = false;
+        QString sequenceId;
+    };
+
+    // Non-interactive pre-compose entry point used by selftests and other
+    // programmatic callers. Returns success=false with failureReason populated
+    // instead of showing dialogs.
+    PrecomposeResult precomposeSelectionWithName(const QString &name);
+
 public slots:
     // Used by main.cpp when the app is launched with a file argument.
     // Loads the given file as a media clip (same code path as File > Open).
@@ -210,6 +256,7 @@ private slots:
     void newProject();
     void editProjectSettings();
     void openFile();
+    void importVideoFromUrl();
     void saveProject();
     void saveProjectAs();
     void openProject();
@@ -224,6 +271,11 @@ private slots:
     void toggleSnap();
     void zoomIn();
     void zoomOut();
+    // WS-3: ワークスペース (ドックレイアウト) の保存/切替/削除/メニュー再構築
+    void saveCurrentWorkspace();
+    void switchWorkspace(const QString &name);
+    void deleteWorkspace();
+    void rebuildWorkspaceMenu();
     void addVideoTrack();
     void addAudioTrack();
     void markIn();
@@ -240,10 +292,12 @@ private slots:
     void addImageOverlay();
     void addPip();
     void setClipVolume();
+    void setClipPan();
     void addBgm();
     void toggleMute();
     void toggleSolo();
     void colorCorrection();
+    void autoColorSelectedClip();
     void videoEffects();
     void pluginEffects();
     void trackMotion(); // US-FEAT-D: motion tracking UI
@@ -278,6 +332,11 @@ private slots:
     void manageLuts();
     void toggleProxyMode();
     void generateProxies();
+    // マルチトラック自動プロキシ (プレビュー専用) の有効/無効を切り替える。
+    // QSettings("VSimpleEditor","Preferences")/"autoMultitrackProxy" に永続化し、
+    // メニュー action とプロキシ設定ダイアログのチェックを同期し、現在の
+    // sequence を即再解決して反映する。
+    void setAutoMultitrackProxy(bool enabled);
     // Modal dialog driving the seekbar-left proxy button. Lets the user
     // flip ProxyManager's proxy-mode flag and pick the preview divisor
     // from the same place. Replaces the divisor-only cycle handler that
@@ -348,6 +407,26 @@ private slots:
     void jumpToNextMarker();
     void jumpToPrevMarker();
 
+    // TR-4: プロ NLE トリムツール (再生ヘッド駆動)。選択クリップの先頭/末尾/
+    // 編集点を再生ヘッドへ合わせる Ripple/Roll と、秒入力で行う Slip/Slide。
+    // いずれも m_timeline->applyTrimActive(type, delta) に委譲し、結果を
+    // ステータスバーに表示する。マウスドラッグのトリムモードは別スコープ。
+    void rippleTrimInToPlayhead();
+    void rippleTrimOutToPlayhead();
+    void rollEditToPlayhead();
+    void slipSelectedClip();
+    void slideSelectedClip();
+
+    // MK-2: マーカー パネル ドック関連スロット。
+    // Timeline のマーカーが増減したら setMarkers() で表示を同期する。
+    void refreshMarkerPanel();
+    // パネルの行ダブルクリック → 再生ヘッドをその時刻 (マイクロ秒) へ移動。
+    void onMarkerPanelJump(qint64 timelineUs);
+    // パネルのノート列編集 → Timeline 側マーカーの note を更新。
+    void onMarkerPanelNoteEdited(int markerId, const QString &note);
+    // パネルの削除ボタン → Timeline からマーカーを削除して再同期。
+    void onMarkerPanelDeleteRequested(int markerId);
+
     // US-AETEXT-12: MainWindow Text menu integration
     void addPathText();
     void addRangeSelector();
@@ -363,6 +442,8 @@ private slots:
     void openRotoToolsDialog();
     void openTimeRemapDialog();
     void configureTrackMatte();
+    void configureClipParent();
+    void createNullObjectForSelection();
 
     // US-3D-11: motion-graphics sprint — 4 new menu actions
     void open3DExtrudedText();
@@ -388,14 +469,54 @@ private slots:
     // US-PT-B: Sprint 15 — Planar (4-corner) tracker dialog
     void openPlanarTrackerDialog();
 
+    // US-TP-6: PRD-TP — モーショントラッカー preset 適用ダイアログ
+    void showMotionTrackerDialog();
+
     // US-SC-B: Sprint 12 — ショートカット設定ダイアログ
     void openShortcutCustomizeDialog();
+    void onShowCredentialDialog();
 
     // US-SC2-B: Sprint 13 — SNS 向けエクスポートダイアログ
     void openSocialExportDialog();
 
     // US-CAP-B: Sprint 14 — 字幕エディタダイアログ
     void openCaptionEditorDialog();
+    // Phase 6 Wave 2 (US-6B-4): 動画→Whisper 文字起こし Dialog を開く
+    void openWhisperTranscribeDialog();
+    // Phase 6 Wave 3 (US-6C-4): 文字起こしからハイライト検出 Dialog を開く
+    void openTranscriptHighlightDialog();
+    // Phase 6 Wave 4 (US-6D-4): ハイライトから自動カット Dialog を開く
+    void openAutoClipDialog();
+    // TB-4: テキストベース編集 Dialog を開く。文字起こし結果を一覧表示し、
+    // 削除対象に選んだセグメントの区間をタイムラインからリップル削除する。
+    void openTextBasedEdit();
+    // PPTX: PowerPoint 資料書き出し Dialog を開く。文字起こし / マーカー / タイトルから
+    // pptxexport::Deck を組み立て、.pptx を書き出す (生成は純粋エンジンに委譲)。
+    void openPptxExport();
+    void exportAscCdl();   // ASC CDL (.cc/.ccc/.cdl) 書き出しダイアログを開く
+    // US-CP-4: コマンドパレット (Ctrl+Shift+P) を開く。全メニュー QAction を
+    // index 化し、CommandPaletteDialog で検索・実行する。
+    void openCommandPalette();
+
+    // MP-5: メディアプールへファイルを取り込む (QFileDialog 複数選択 → MediaAsset 化)
+    void importToMediaPool();
+    // MP-5: メディアプールの素材ダブルクリックでタイムラインに取り込む
+    void onMediaPoolAssetActivated(const QString &filePath);
+
+    // SM-5: ソースモニター + 3点編集。メディアプールのダブルクリックは
+    // 直接タイムラインへ取り込まず、いったんソースモニターへロードして
+    // マークイン/アウト → 挿入/上書きの 3 点編集ワークフローに乗せる。
+    void openInSourceMonitor(const QString &filePath);
+    // ソースモニターの「挿入 (Insert)」押下。選択範囲を検証して
+    // insertClip3PointActive で再生ヘッド位置へリップル挿入する。
+    void onSourceInsertRequested(const threepoint::SourceSelection &sel);
+    // ソースモニターの「上書き (Overwrite)」押下。選択範囲を検証して
+    // overwriteClip3PointActive で再生ヘッド位置から上書きする。
+    void onSourceOverwriteRequested(const threepoint::SourceSelection &sel);
+
+    // AB-5: オーディオ バス パネルでルーティングが変更されたとき。SSOT である
+    // m_audioBusRouting を AudioMixer::setBusRouting で反映する。
+    void onAudioBusRoutingChanged();
 
     // US-INT-1: Sprint 16 — モバイルデバイス向けエクスポートダイアログ
     void onMobileExport();
@@ -415,6 +536,9 @@ private slots:
     void openFrameIoImportDialog();
     void openDavinciExportDialog();
     void openFcpxmlExportDialog();
+    // ED-3: CMX3600 EDL 書き出し。V1 クリップ列を edl::fromClips → toCmx3600 で
+    // *.edl テキストへ直列化する純粋エンジン経由のエクスポート。
+    void exportEdl();
     void openSmartEditDialog();
     void openCloudRenderDialog();
 
@@ -436,6 +560,31 @@ private slots:
     void openSubtitleTranslatorDialog();
     void openLowerThirdDialog();
     void openWatermarkDialog();
+
+    // SP-4: スペクトル音声修復 (iZotope RX 風オフライン処理)。
+    void openSpectralRepair();
+
+    // AC-4: ACES カラーマネジメント設定ダイアログを開く。SSOT である
+    // m_acesPipeline を編集し、OK で確定する (永続化は project save/load 経由)。
+    void openColorManagement();
+
+    // DV-4: Dolby Vision メタデータ設定ダイアログを開く。SSOT である
+    // m_dolbyVision を編集し、OK で確定する (永続化は project save/load 経由)。
+    // ダイアログの「XML をエクスポート...」から DV XML をファイル書き出しする。
+    void openDolbyVision();
+
+    // CC-4: 放送用クローズドキャプション (CEA-608/708) 設定ダイアログを開く。
+    // SSOT である m_broadcastCaption を編集し、OK で確定する (永続化は
+    // project save/load 経由)。既存字幕があれば cue 源として充填し、ダイアログの
+    // 「SCC をエクスポート...」から SCC サイドカーをファイル書き出しする。
+    void openBroadcastCaption();
+
+    // AM-4: 自動背景除去 / マッティング ダイアログを開く。現在の選択クリップから
+    // 1 フレームを取得 (取れなければ QFileDialog で画像を開く) して
+    // AutoMatteDialog へ渡し、適用されたら生成マット (透過 PNG) / 合成結果を
+    // ファイルへ書き出してステータスバーへ通知する。
+    // TODO: クリップエフェクトとしての毎フレーム適用は次段スコープ。
+    void openAutoMatte();
 
     // User-customizable "お気に入り" menu — opens FavoritesEditDialog, then
     // persists the chosen action ids to QSettings and rebuilds the menu.
@@ -461,15 +610,23 @@ private:
     // re-appends a separator + the 「お気に入りを編集...」 action at the bottom.
     void rebuildFavoritesMenu();
     void setupToolBar();
+    // US-CP-4: menuBar() の全トップメニューを再帰的に辿り、実行可能な QAction
+    // (separator/サブメニュー親を除く) を cmdsearch::CommandEntry に変換して返す。
+    // 同時に m_commandActions を id→QAction で再構築する。
+    QVector<cmdsearch::CommandEntry> buildCommandEntries();
     void setupUI();
     void setupRecentFiles();
     void setupStatusBarWidgets();
     void saveWindowState();
     void restoreWindowState();
+    // WS-3: m_workspaces (toJson) を QSettings に永続化 / 起動時に復元する。
+    void saveWorkspacesToSettings();
+    void loadWorkspacesFromSettings();
     void showWelcomeScreen();
     void hideWelcomeScreen();
     void loadMediaFile(const QString &filePath, bool addToTimeline, const QString &statusPrefix);
     void updateStatusInfo();
+    void updateAcesUiState();
     void updateEditActions();
     void applyProjectConfig(const ProjectConfig &config);
     void updateTitle();
@@ -485,6 +642,21 @@ private:
     QImage decodeClipFrameAtSourceTime(const ClipInfo &clip, double sourceTimeSeconds) const;
     QImage decodeClipFrameByIndex(const ClipInfo &clip, int sourceFrameIndex, double sourceFps) const;
     void refreshSpecialClipPreview();
+
+    // プレビュー用 sequence のプロキシ解決を 1 箇所に集約する (プレビュー専用)。
+    // 手動 isProxyMode と マルチトラック自動プロキシ (多トラック かつ
+    // 重コーデック/高解像度) の両方をここで適用する。自動判定は各 PlaybackEntry を
+    // playback::AutoProxyClip に変換し playback::AutoProxyPolicy::decide で行い、
+    // metadata は非同期 probe キャッシュから読み、UI スレッドでは同期 probe しない。
+    // plan.useProxyFor の原本パスは proxy mode に関係なく差し替え、plan.generateFor は
+    // generateAllProxies で非ブロック生成キューに積む (Ready/Generating/今セッションで
+    // 要求済みは二重起動しない)。audio 側は再判定せず映像側の useSet を使う。
+    // 各エントリは高々 1 回だけ差し替え (二重変換防止)。
+    // 書き出し経路には一切影響しない (export 用 sequence はこの関数を通らない)。
+    // entries は in-place で書き換える。
+    void resolvePreviewProxies(QVector<PlaybackEntry> &entries, bool allowAutoPlanning);
+    void queueAutoProxyProbe(const QString &filePath);
+
     QImage buildSpecialClipComposite(double timelineSeconds) const;
     QImage applyStoredRotoData(const QString &clipId, const QImage &frame, int sourceFrameIndex) const;
     void setBrushAnimationEntries(const QVector<BrushAnimationEntry> &entries);
@@ -495,10 +667,34 @@ private:
 
     VideoPlayer *m_player;
     Timeline *m_timeline;
+
+    // マルチトラック自動プロキシ (プレビュー専用)。QSettings
+    // "autoMultitrackProxy" 連動フラグ (既定 ON)。OFF のとき
+    // resolvePreviewProxies は自動判定をスキップし従来挙動 (手動 isProxyMode のみ) に戻る。
+    bool m_autoMultitrackProxy = true;
+    // 非同期 metadata probe の結果キャッシュ (原本パス→判定用 clip 情報)。
+    // resolvePreviewProxies から同期 probe しないためのプレビュー専用キャッシュ。
+    QHash<QString, playback::AutoProxyClip> m_autoProxyProbeCache;
+    QSet<QString> m_autoProxyProbePending;
+    // 映像 sequence 側で最後に判定した「自動プロキシを使う原本パス」集合。
+    // audio sequence 側は再 probe/generate せず、この集合だけを参照して差し替える。
+    QSet<QString> m_autoProxyUseSet;
+    // 今セッションで generateProxy を要求済みの原本パス。sequence 再発行のたびに
+    // 再キューしないためのガード (Ready 化後は useProxyFor に回るため二重生成は
+    // 起きないが、生成中の連続再発行に備える)。
+    QSet<QString> m_autoProxyRequested;
+    bool m_autoProxyRefreshPending = false;
+    // メニュー「マルチトラック自動プロキシ」のトグル action。プロキシ設定
+    // ダイアログのチェックと setAutoMultitrackProxy 経由で双方向同期する。
+    QAction *m_autoMultitrackProxyAction = nullptr;
+    QMetaObject::Connection m_generateProxiesAllReadyConnection;
+    QMetaObject::Connection m_generateProxiesProgressConnection;
+
     class ProxyProgressDialog *m_proxyDialog = nullptr;
     class ColorGradingPanel *m_colorGradingPanel = nullptr;
     effectctrl::EffectControlsPanel *m_effectControlsPanel = nullptr;
     VfxControlsPanel *m_vfxControlsPanel = nullptr;
+    QImage m_lastCompositedFrame;
     QStringList m_supportedFormats;
     ProjectConfig m_projectConfig;
     QVector<BrushAnimationEntry> m_brushAnimationEntries;
@@ -546,6 +742,7 @@ private:
     QAction *m_undoAction;
     QAction *m_redoAction;
     QAction *m_snapAction;
+    QAction *m_colorManagementAction = nullptr;
     Exporter *m_exporter;
     QString m_projectFilePath; // current .veditor file
     MultiCamSession *m_multiCam = nullptr;
@@ -560,6 +757,10 @@ private:
     RenderQueue *m_renderQueue = nullptr;
     ScreenRecorder *m_screenRecorder = nullptr;
     AIHighlight *m_aiHighlight = nullptr;
+    // Phase 6 Wave 4 (US-6D-4): 直近の文字起こしハイライト検出結果。
+    // openTranscriptHighlightDialog() の detect 成功時に保存し、
+    // openAutoClipDialog() で自動カット範囲の計算ソースに使う。
+    QVector<Highlight> m_lastHighlights;
 
     // US-SNS-7: SNS pack members
     SmartReframe m_smartReframe;
@@ -568,6 +769,49 @@ private:
     LoudnessPanel *m_loudnessPanel = nullptr;
     QDockWidget *m_loudnessDock = nullptr;
     bool m_loudnessMeasureRunning = false;
+
+    // WS-3: ワークスペース (名前付きドックレイアウト)。m_workspaces が SSOT、
+    // m_workspaceMenu が「表示」配下のサブメニュー (rebuildWorkspaceMenu で動的再構築)。
+    workspace::WorkspaceManager m_workspaces;
+    QMenu *m_workspaceMenu = nullptr;
+    QActionGroup *m_workspaceActionGroup = nullptr;  // 切替アクションの排他グループ
+
+    // MP-5: メディアプール (NLE のビン/素材管理)。m_mediaPool が SSOT モデル、
+    // m_mediaPoolDock が左ドックの UI。プロジェクト保存/読込で ProjectData
+    // 経由に永続化する。
+    mediapool::MediaPool m_mediaPool;
+    MediaPoolDock *m_mediaPoolDock = nullptr;
+
+    // MK-2: マーカー パネル ドック (右側)。Timeline を所有せず、markersChanged
+    // を受けて setMarkers() で内容を同期するビュー。
+    MarkerPanelDock *m_markerPanelDock = nullptr;
+
+    // SM-5: ソースモニター ドック (右側)。素材を VideoPlayer でプレビューし、
+    // マークイン/アウト後に insertRequested/overwriteRequested で 3 点編集する。
+    SourceMonitorDock *m_sourceMonitorDock = nullptr;
+
+    // AB-5: オーディオ バス パネル ドック (右側)。m_audioBusRouting が SSOT で、
+    // パネルはそれをポインタで指すビュー。routingChanged を受けて AudioMixer へ
+    // setBusRouting で反映し、プロジェクト保存/読込で ProjectData::audioBusRouting
+    // 経由に永続化する。
+    AudioBusPanel *m_audioBusPanel = nullptr;
+    audiobus::AudioBusRouting m_audioBusRouting;
+
+    // AC-4: ACES カラーマネジメント パイプライン設定の SSOT。
+    // ColorManagementDialog で編集し、プロジェクト保存/読込で
+    // ProjectData::acesPipeline 経由に永続化する。
+    // TODO: レンダーパイプライン (プレビュー/エクスポート) への ACES 適用は後続。
+    aces::AcesPipeline m_acesPipeline;
+
+    // DV-4: Dolby Vision メタデータの SSOT。DolbyVisionDialog で編集し、
+    // プロジェクト保存/読込で ProjectData::dolbyVision 経由に永続化する。
+    dolbyvision::DolbyVisionMetadata m_dolbyVision;
+
+    // CC-4: 放送用クローズドキャプション (CEA-608/708) の SSOT。
+    // BroadcastCaptionDialog で編集し、プロジェクト保存/読込で
+    // ProjectData::broadcastCaption 経由に永続化する。
+    broadcastcc::BroadcastCaptionDoc m_broadcastCaption;
+
     QDockWidget *m_vfxControlsDock = nullptr;
     LayerCompositor m_layerCompositor;
     PrecomposeManager m_precomposeManager;
@@ -586,6 +830,7 @@ private:
     QLabel *m_statusFps = nullptr;
     QLabel *m_statusDuration = nullptr;
     QLabel *m_statusTheme = nullptr;
+    QLabel *m_statusAces = nullptr;
     bool m_hasContent = false;
     bool m_autoSaveStarted = false;
 
@@ -653,6 +898,11 @@ private:
     // "メニューの説明を表示" preference.
     QVector<QPair<QAction *, QString>> m_menuHelpEntries;
 
+    // US-CP-4: コマンドパレットの id→QAction マップ。openCommandPalette() の
+    // たびに buildCommandEntries() で再構築され、commandTriggered(id) を受けて
+    // 対応する QAction を trigger() する。
+    QHash<QString, QAction *> m_commandActions;
+
     // User-customizable "お気に入り" menu support.
     // FavoritableAction::id is a STABLE string (e.g. "file.new", "edit.split")
     // — never the translated text — so the persisted favorites list survives
@@ -689,9 +939,14 @@ private:
     // is a lightweight QDialog wrapper around an AudioClipEditor widget.
     class AIMaskDialog *m_aiMaskDialog = nullptr;
     class QDialog *m_audioClipEditorDialog = nullptr;
+    QPointer<CredentialDialog> m_credentialDialog = nullptr;
 
     // US-PT-B: Sprint 15 — Planar (4-corner) tracker dialog, kept alive between invocations.
     PlanarTrackerDialog *m_planarTrackerDialog = nullptr;
+
+    // PRD-PROJECT-PRESET US-PP-4: tracker dialog state persistence across project save/load.
+    MotionTrackerProjectState  m_motionTrackerState;
+    PlanarTrackerProjectState  m_planarTrackerState;
 
     // US-SC-B: Sprint 12 — ショートカット管理 (preset/カスタムバインド)。
     // m_shortcutManager は registerAction で登録した QAction* の弱参照を保ち、

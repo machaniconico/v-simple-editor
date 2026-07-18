@@ -88,4 +88,22 @@ remotion_export/
 # OMC runtime state (operational artifacts — never commit; .omc/skills would be the only committable exception)
 .omc/
 src/.omc/
+.claude/worktrees/
+
+# Out-of-tree / scratch build dirs (the canonical one is build/, see top)
+build_*/
+build-*/
+/CMakeCache.txt
+/CMakeFiles/
+build_*.txt
+build_out.txt
 build_*.log
+
+# Scratch harnesses / probes / dumps
+/_*
+/NUL
+/progress.txt
+*.diff
+
+# Test fixtures (kept local, not versioned)
+test_assets/

@@ -40,7 +40,7 @@ void Manager::cancelJob(const QString &jobId)
         if (m_clients.contains(jobId)) {
             vimeo::upload::UploadClient *client = m_clients.take(jobId);
             client->cancel();
-            delete client;
+            client->deleteLater();
         }
 
         info.state     = JobState::Failed;
@@ -58,9 +58,7 @@ void Manager::retryJob(const QString &jobId)
             continue;
 
         // Remove any stale client
-        if (m_clients.contains(jobId)) {
-            delete m_clients.take(jobId);
-        }
+        if (auto *c = m_clients.take(jobId)) c->deleteLater();
 
         info.state          = JobState::Idle;
         info.progressPercent = 0;
@@ -183,9 +181,7 @@ void Manager::onClientFinished(const QString &jobId, const QString &videoUri)
         }
     }
 
-    if (m_clients.contains(jobId)) {
-        delete m_clients.take(jobId);
-    }
+    if (auto *c = m_clients.take(jobId)) c->deleteLater();
 
     emit jobStateChanged(jobId, JobState::Complete);
     emit jobFinished(jobId, true, videoUri);
@@ -203,9 +199,7 @@ void Manager::onClientFailed(const QString &jobId, const QString &err)
         }
     }
 
-    if (m_clients.contains(jobId)) {
-        delete m_clients.take(jobId);
-    }
+    if (auto *c = m_clients.take(jobId)) c->deleteLater();
 
     emit jobStateChanged(jobId, JobState::Failed);
     emit jobFinished(jobId, false, err);

@@ -1,5 +1,7 @@
 #include "NetworkRender.h"
 
+#include "libavcore/Concat.h"
+
 #include <QCoreApplication>
 #include <QHostAddress>
 #include <QHostInfo>
@@ -7,10 +9,8 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonArray>
-#include <QFile>
 #include <QFileInfo>
 #include <QDir>
-#include <QProcess>
 #include <QThread>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -566,71 +566,37 @@ void NetworkRenderServer::assembleSegments(const QString &masterJobId)
 
     const QStringList &segs = m_segmentMap.value(masterJobId);
 
-    // Write ffmpeg concat list file
-    QFileInfo fi(master->outputPath);
-    QString concatFile = fi.dir().filePath(fi.baseName() + "_concat.txt");
-
-    QFile f(concatFile);
-    if (!f.open(QIODevice::WriteOnly | QIODevice::Text)) {
-        master->status = NetworkJobStatus::Failed;
-        return;
-    }
-
+    // Collect the ordered segment paths — same order the concat list used:
+    // m_segmentMap stores segment jobIds in distributeJobs() append order.
+    std::vector<std::string> segmentPaths;
+    segmentPaths.reserve(static_cast<size_t>(segs.size()));
     for (const QString &sid : segs) {
         const RenderJobNet *seg = findJob(sid);
         if (seg)
-            f.write(QString("file '%1'\n").arg(seg->outputPath).toUtf8());
+            segmentPaths.push_back(seg->outputPath.toStdString());
     }
-    f.close();
-
-    // Run ffmpeg concat demuxer
-    QProcess *proc = new QProcess(this);
-    proc->setProcessChannelMode(QProcess::MergedChannels);
 
     QString outputPath = master->outputPath;
-    QString masterJobIdCopy = masterJobId;
-
-    auto finalize = [this, proc, masterJobIdCopy, outputPath, concatFile](bool succeeded) {
-        if (proc->property("networkRenderFinalized").toBool())
-            return;
-        proc->setProperty("networkRenderFinalized", true);
-
-        RenderJobNet *m = findJob(masterJobIdCopy);
-        if (m) {
-            if (succeeded) {
-                m->status   = NetworkJobStatus::Complete;
-                m->progress = 100.0;
-                emit jobComplete(masterJobIdCopy, outputPath);
-            } else {
-                m->status = NetworkJobStatus::Failed;
-            }
-        }
-        QFile::remove(concatFile);
-        checkAllComplete();
-        proc->deleteLater();
-    };
-
-    connect(proc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
-            this, [finalize](int exitCode, QProcess::ExitStatus exitStatus) {
-        finalize(exitStatus == QProcess::NormalExit && exitCode == 0);
-    });
-
-    connect(proc, &QProcess::errorOccurred,
-            this, [finalize](QProcess::ProcessError error) {
-        if (error == QProcess::FailedToStart)
-            finalize(false);
-    });
-
-    QStringList args;
-    args << "-y"
-         << "-f"  << "concat"
-         << "-safe" << "0"
-         << "-i"  << concatFile
-         << "-c"  << "copy"
-         << master->outputPath;
 
     master->status = NetworkJobStatus::Rendering;
-    proc->start("ffmpeg", args);
+
+    // In-process concat-demuxer-equivalent packet-copy remux (replaces the
+    // "ffmpeg -f concat -safe 0 -i list.txt -c copy -y out" subprocess).
+    std::optional<std::string> err =
+        libavcore::concatCopy(segmentPaths, outputPath.toStdString());
+
+    // master pointer may be invalid if m_jobs was modified; re-resolve.
+    RenderJobNet *m = findJob(masterJobId);
+    if (m) {
+        if (!err) {
+            m->status   = NetworkJobStatus::Complete;
+            m->progress = 100.0;
+            emit jobComplete(masterJobId, outputPath);
+        } else {
+            m->status = NetworkJobStatus::Failed;
+        }
+    }
+    checkAllComplete();
 }
 
 QString NetworkRenderServer::nodeIdForSocket(QTcpSocket *socket) const

@@ -9,6 +9,12 @@
 class QPushButton;
 class QTableWidget;
 
+namespace vimeo {
+namespace oauth {
+class AuthClient;
+} // namespace oauth
+} // namespace vimeo
+
 // ---------------------------------------------------------------------------
 // VimeoUploadDialog — Sprint 20 US-VIM-2
 // Modeless dialog for managing Vimeo upload jobs via vimeo::manager::Manager.
@@ -37,6 +43,7 @@ private:
     int rowForJobId(const QString &jobId) const;
 
     QPointer<vimeo::manager::Manager> m_manager;
+    vimeo::oauth::AuthClient *m_oauth = nullptr;
 
     QTableWidget *m_table     = nullptr;
     QPushButton  *m_addBtn    = nullptr;

@@ -65,8 +65,7 @@ const QStringList &propNames()
     return kNames;
 }
 
-// Interpolation display names, matching KeyframePoint::Interpolation enum order:
-// Linear=0, EaseIn=1, EaseOut=2, EaseInOut=3, Hold=4
+// Interpolation display names, matching KeyframePoint::Interpolation enum order.
 const QStringList &interpNames()
 {
     static const QStringList kInterp = {
@@ -74,7 +73,11 @@ const QStringList &interpNames()
         QStringLiteral("EaseIn"),
         QStringLiteral("EaseOut"),
         QStringLiteral("EaseInOut"),
-        QStringLiteral("Hold")
+        QStringLiteral("Hold"),
+        QStringLiteral("Bezier"),
+        QStringLiteral("エラスティック"),
+        QStringLiteral("バウンス"),
+        QStringLiteral("バック(オーバーシュート)")
     };
     return kInterp;
 }
@@ -142,7 +145,7 @@ Camera3D CameraMotionDialog::camera() const
         KeyframePoint::Interpolation interp = KeyframePoint::Linear;
         if (interpCombo) {
             int iIdx = interpCombo->currentIndex();
-            if (iIdx >= 0 && iIdx <= static_cast<int>(KeyframePoint::Hold))
+            if (iIdx >= 0 && iIdx <= static_cast<int>(KeyframePoint::BackOut))
                 interp = static_cast<KeyframePoint::Interpolation>(iIdx);
         }
 

@@ -1,15 +1,28 @@
 #include "PlanarTrackerDialog.h"
 
+#include "PlanarTrackerPresetRegistry.h"
+
+#include <algorithm>
+
 #include <QApplication>
+#include <QComboBox>
 #include <QDialogButtonBox>
 #include <QEventLoop>
+#include <QFile>
+#include <QFileDialog>
 #include <QFont>
 #include <QFormLayout>
+#include <QHash>
 #include <QHBoxLayout>
+#include <QInputDialog>
+#include <QJsonDocument>
+#include <QJsonParseError>
 #include <QLabel>
+#include <QLineEdit>
 #include <QMessageBox>
 #include <QMouseEvent>
 #include <QPainter>
+#include <QPalette>
 #include <QPolygonF>
 #include <QProgressBar>
 #include <QPushButton>
@@ -18,6 +31,39 @@
 #include <QSpinBox>
 #include <QVBoxLayout>
 #include <QtMath>
+
+namespace {
+
+QString makeUserPresetId(const QString& name)
+{
+    QString slug;
+    bool lastWasDash = false;
+    const QString lower = name.trimmed().toLower();
+    for (const QChar ch : lower) {
+        const ushort u = ch.unicode();
+        const bool isAsciiLetter = (u >= 'a' && u <= 'z');
+        const bool isAsciiDigit = (u >= '0' && u <= '9');
+        if (isAsciiLetter || isAsciiDigit) {
+            slug.append(ch);
+            lastWasDash = false;
+        } else if (!lastWasDash) {
+            slug.append(QLatin1Char('-'));
+            lastWasDash = true;
+        }
+    }
+
+    while (slug.startsWith(QLatin1Char('-')))
+        slug.remove(0, 1);
+    while (slug.endsWith(QLatin1Char('-')))
+        slug.chop(1);
+    if (slug.isEmpty())
+        slug = QStringLiteral("preset");
+
+    const QString hash = QString::number(static_cast<qulonglong>(qHash(name)), 16);
+    return QStringLiteral("user-%1-%2").arg(slug, hash);
+}
+
+} // namespace
 
 // ============================================================================
 // PlanarCornerWidget
@@ -225,6 +271,20 @@ PlanarTrackerDialog::PlanarTrackerDialog(QWidget* parent)
     setObjectName(QStringLiteral("planarTrackerDialog"));
     resize(880, 640);
 
+    planar_tracker_preset::Registry::instance().reloadFromSettings();
+
+    m_presetCombo = new QComboBox(this);
+
+    m_descriptionLabel = new QLabel(this);
+    m_descriptionLabel->setWordWrap(true);
+    m_descriptionLabel->setMinimumHeight(40);
+    {
+        QPalette p = m_descriptionLabel->palette();
+        p.setColor(QPalette::WindowText, p.color(QPalette::Disabled, QPalette::WindowText));
+        m_descriptionLabel->setPalette(p);
+    }
+    m_descriptionLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+
     // --- Corner widget (left ~60%) ---
     m_cornerWidget = new PlanarCornerWidget(this);
 
@@ -243,6 +303,13 @@ PlanarTrackerDialog::PlanarTrackerDialog(QWidget* parent)
     m_dampingSpin->setRange(0, 100);
     m_dampingSpin->setValue(30);
     m_dampingSpin->setSuffix(tr(" %"));
+
+    m_saveCustomPresetButton = new QPushButton(tr("カスタム preset 保存"), this);
+    m_deletePresetBtn = new QPushButton(tr("選択中の preset を削除"), this);
+    m_resetPresetButton = new QPushButton(tr("Reset to defaults"), this);
+    m_exportPresetButton = new QPushButton(tr("Preset を JSON エクスポート"), this);
+    m_importPresetButton = new QPushButton(tr("Preset を JSON インポート"), this);
+    m_deletePresetBtn->setEnabled(false);
 
     m_resetButton = new QPushButton(tr("リセット"), this);
     m_trackButton = new QPushButton(tr("追跡実行"), this);
@@ -263,7 +330,20 @@ PlanarTrackerDialog::PlanarTrackerDialog(QWidget* parent)
     form->addRow(tr("探索半径:"),        m_searchRadiusSpin);
     form->addRow(tr("ダンピング:"),      m_dampingSpin);
 
+    auto* presetButtonsTop = new QHBoxLayout;
+    presetButtonsTop->addWidget(m_saveCustomPresetButton);
+    presetButtonsTop->addWidget(m_deletePresetBtn);
+    presetButtonsTop->addWidget(m_resetPresetButton);
+
+    auto* presetButtonsBottom = new QHBoxLayout;
+    presetButtonsBottom->addWidget(m_exportPresetButton);
+    presetButtonsBottom->addWidget(m_importPresetButton);
+
     auto* rightLayout = new QVBoxLayout;
+    rightLayout->addWidget(m_presetCombo);
+    rightLayout->addWidget(m_descriptionLabel);
+    rightLayout->addLayout(presetButtonsTop);
+    rightLayout->addLayout(presetButtonsBottom);
     rightLayout->addLayout(form);
     rightLayout->addWidget(m_resetButton);
     rightLayout->addWidget(m_trackButton);
@@ -284,6 +364,19 @@ PlanarTrackerDialog::PlanarTrackerDialog(QWidget* parent)
                 rebuildSummary();
             });
 
+    connect(m_presetCombo, &QComboBox::currentIndexChanged,
+            this, &PlanarTrackerDialog::onPresetSelectionChanged);
+    connect(m_saveCustomPresetButton, &QPushButton::clicked,
+            this, &PlanarTrackerDialog::onSaveCustomPreset);
+    connect(m_deletePresetBtn, &QPushButton::clicked,
+            this, &PlanarTrackerDialog::onDeleteSelectedPreset);
+    connect(m_resetPresetButton, &QPushButton::clicked,
+            this, &PlanarTrackerDialog::onResetPresetToDefaults);
+    connect(m_exportPresetButton, &QPushButton::clicked,
+            this, &PlanarTrackerDialog::onExportPreset);
+    connect(m_importPresetButton, &QPushButton::clicked,
+            this, &PlanarTrackerDialog::onImportPreset);
+
     connect(m_resetButton, &QPushButton::clicked,
             this, &PlanarTrackerDialog::onResetCorners);
     connect(m_trackButton, &QPushButton::clicked,
@@ -296,8 +389,10 @@ PlanarTrackerDialog::PlanarTrackerDialog(QWidget* parent)
     connect(m_dampingSpin, QOverload<int>::of(&QSpinBox::valueChanged),
             this, &PlanarTrackerDialog::onDampingChanged);
 
-    connect(m_buttonBox, &QDialogButtonBox::accepted, this, &QDialog::accept);
+    connect(m_buttonBox, &QDialogButtonBox::accepted, this, &PlanarTrackerDialog::accept);
     connect(m_buttonBox, &QDialogButtonBox::rejected, this, &QDialog::reject);
+
+    rebuildPresetCombo();
 
     // Sync params with initial spin values
     m_params.patchSizePx    = m_patchSizeSpin->value();
@@ -341,6 +436,329 @@ void PlanarTrackerDialog::setCorners(const planar::CornerSet& corners)
 QList<planar::Frame> PlanarTrackerDialog::trackResult() const
 {
     return m_result;
+}
+
+// ---------------------------------------------------------------------------
+planar_tracker_preset::PlanarTrackerPreset PlanarTrackerDialog::selectedPreset() const
+{
+    planar_tracker_preset::PlanarTrackerPreset preset;
+    const int index = currentPresetIndex();
+    if (index >= 0) {
+        preset = m_presets.at(index);
+    } else {
+        preset.id = QStringLiteral("custom");
+        preset.displayName = tr("Custom");
+    }
+
+    preset.patchSizePx = static_cast<double>(m_patchSizeSpin->value());
+    preset.searchRadiusPx = static_cast<double>(m_searchRadiusSpin->value());
+    preset.dampingFactor = m_dampingSpin->value() / 100.0;
+    return preset;
+}
+
+// ---------------------------------------------------------------------------
+// PRD-PROJECT-PRESET US-PP-4: restore dialog widgets from persisted project state.
+void PlanarTrackerDialog::setInitialState(const PlanarTrackerProjectState& s)
+{
+    // Restore last-used preset selection by id
+    if (!s.lastPresetId.isEmpty() && m_presetCombo) {
+        for (int i = 0; i < m_presets.size(); ++i) {
+            if (m_presets.at(i).id == s.lastPresetId) {
+                m_presetCombo->setCurrentIndex(i);
+                break;
+            }
+        }
+    }
+
+    // Restore widget values without triggering change signals
+    setPresetWidgetSignalsBlocked(true);
+
+    if (m_patchSizeSpin)
+        m_patchSizeSpin->setValue(static_cast<int>(s.patchSizePx));
+    if (m_searchRadiusSpin)
+        m_searchRadiusSpin->setValue(static_cast<int>(s.searchRadiusPx));
+    if (m_dampingSpin)
+        m_dampingSpin->setValue(static_cast<int>(s.dampingFactor * 100.0));
+
+    setPresetWidgetSignalsBlocked(false);
+}
+
+// ---------------------------------------------------------------------------
+// PRD-PROJECT-PRESET US-PP-4: snapshot current dialog widget state for persistence.
+PlanarTrackerProjectState PlanarTrackerDialog::currentState() const
+{
+    PlanarTrackerProjectState s;
+
+    const int idx = currentPresetIndex();
+    if (idx >= 0 && idx < m_presets.size())
+        s.lastPresetId = m_presets.at(idx).id;
+
+    if (m_patchSizeSpin)
+        s.patchSizePx = static_cast<double>(m_patchSizeSpin->value());
+    if (m_searchRadiusSpin)
+        s.searchRadiusPx = static_cast<double>(m_searchRadiusSpin->value());
+    if (m_dampingSpin)
+        s.dampingFactor = m_dampingSpin->value() / 100.0;
+
+    return s;
+}
+
+// ---------------------------------------------------------------------------
+void PlanarTrackerDialog::accept()
+{
+    emit presetApplied(selectedPreset());
+    QDialog::accept();
+}
+
+// ---------------------------------------------------------------------------
+void PlanarTrackerDialog::onPresetSelectionChanged(int index)
+{
+    updateDeletePresetButton();
+
+    bool ok = false;
+    const int presetIndex = m_presetCombo->itemData(index).toInt(&ok);
+    if (!ok || presetIndex < 0 || presetIndex >= m_presets.size()) {
+        if (m_descriptionLabel)
+            m_descriptionLabel->setText(tr("説明: なし"));
+        return;
+    }
+
+    const planar_tracker_preset::PlanarTrackerPreset& preset = m_presets.at(presetIndex);
+    if (m_descriptionLabel) {
+        m_descriptionLabel->setText(
+            preset.description.isEmpty() ? tr("説明: なし") : preset.description);
+    }
+    applyPresetToWidgets(preset);
+}
+
+// ---------------------------------------------------------------------------
+void PlanarTrackerDialog::onSaveCustomPreset()
+{
+    bool ok = false;
+    const QString name = QInputDialog::getText(this,
+                                               tr("カスタム preset 保存"),
+                                               tr("名前:"),
+                                               QLineEdit::Normal,
+                                               QString(),
+                                               &ok).trimmed();
+    if (!ok || name.isEmpty())
+        return;
+
+    planar_tracker_preset::PlanarTrackerPreset preset = selectedPreset();
+    preset.id = makeUserPresetId(name);
+    preset.displayName = name;
+
+    if (planar_tracker_preset::Registry::instance().saveUserPreset(preset))
+        rebuildPresetCombo(preset.id);
+}
+
+// ---------------------------------------------------------------------------
+void PlanarTrackerDialog::onDeleteSelectedPreset()
+{
+    const int index = currentPresetIndex();
+    if (index < 0)
+        return;
+
+    const planar_tracker_preset::PlanarTrackerPreset preset = m_presets.at(index);
+    if (planar_tracker_preset::findBuiltin(preset.id).has_value())
+        return;
+
+    const QMessageBox::StandardButton answer =
+        QMessageBox::question(this,
+                              tr("選択中の preset を削除"),
+                              tr("「%1」を削除しますか?").arg(preset.displayName),
+                              QMessageBox::Yes | QMessageBox::No,
+                              QMessageBox::No);
+    if (answer != QMessageBox::Yes)
+        return;
+
+    if (planar_tracker_preset::Registry::instance().removeUserPreset(preset.id))
+        rebuildPresetCombo();
+}
+
+// ---------------------------------------------------------------------------
+void PlanarTrackerDialog::onResetPresetToDefaults()
+{
+    const int index = currentPresetIndex();
+    if (index < 0)
+        return;
+
+    const planar_tracker_preset::PlanarTrackerPreset& preset = m_presets.at(index);
+    applyPresetToWidgets(preset);
+    if (m_descriptionLabel) {
+        m_descriptionLabel->setText(
+            preset.description.isEmpty() ? tr("説明: なし") : preset.description);
+    }
+    updateDeletePresetButton();
+}
+
+// ---------------------------------------------------------------------------
+void PlanarTrackerDialog::onExportPreset()
+{
+    QString fileName = QFileDialog::getSaveFileName(this,
+                                                    tr("Preset を JSON エクスポート"),
+                                                    QString(),
+                                                    tr("Planar Tracker Preset JSON (*.json)"));
+    if (fileName.isEmpty())
+        return;
+    if (!fileName.endsWith(QStringLiteral(".json"), Qt::CaseInsensitive))
+        fileName.append(QStringLiteral(".json"));
+
+    QFile file(fileName);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        QMessageBox::warning(this,
+                             tr("Preset を JSON エクスポート"),
+                             tr("JSON ファイルを書き込めませんでした。"));
+        return;
+    }
+
+    const QJsonObject obj = planar_tracker_preset::toJson(selectedPreset());
+    const QByteArray json = QJsonDocument(obj).toJson(QJsonDocument::Indented);
+    if (file.write(json) != json.size()) {
+        QMessageBox::warning(this,
+                             tr("Preset を JSON エクスポート"),
+                             tr("JSON ファイルを書き込めませんでした。"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+void PlanarTrackerDialog::onImportPreset()
+{
+    const QString fileName = QFileDialog::getOpenFileName(
+        this,
+        tr("Preset を JSON インポート"),
+        QString(),
+        tr("Planar Tracker Preset JSON (*.json)"));
+    if (fileName.isEmpty())
+        return;
+
+    QFile file(fileName);
+    if (!file.open(QIODevice::ReadOnly)) {
+        QMessageBox::warning(this,
+                             tr("Preset を JSON インポート"),
+                             tr("JSON ファイルを読み込めませんでした。"));
+        return;
+    }
+
+    QJsonParseError parseError{};
+    const QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &parseError);
+    if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
+        QMessageBox::warning(this,
+                             tr("Preset を JSON インポート"),
+                             tr("JSON が不正です"));
+        return;
+    }
+
+    auto imported = planar_tracker_preset::fromJson(doc.object());
+    if (!imported) {
+        QMessageBox::warning(this,
+                             tr("Preset を JSON インポート"),
+                             tr("JSON が不正です"));
+        return;
+    }
+
+    imported->id = makeUserPresetId(imported->displayName);
+    if (!planar_tracker_preset::Registry::instance().saveUserPreset(*imported)) {
+        QMessageBox::warning(this,
+                             tr("Preset を JSON インポート"),
+                             tr("Preset を保存できませんでした。"));
+        return;
+    }
+
+    rebuildPresetCombo(imported->id);
+}
+
+// ---------------------------------------------------------------------------
+void PlanarTrackerDialog::rebuildPresetCombo(const QString& selectedId)
+{
+    m_presets = planar_tracker_preset::Registry::instance().allPresets();
+    std::sort(m_presets.begin(), m_presets.end(),
+              [](const planar_tracker_preset::PlanarTrackerPreset& lhs,
+                 const planar_tracker_preset::PlanarTrackerPreset& rhs) {
+                  const int byName = QString::localeAwareCompare(lhs.displayName, rhs.displayName);
+                  if (byName != 0)
+                      return byName < 0;
+                  return lhs.id < rhs.id;
+              });
+
+    const bool comboWasBlocked = m_presetCombo->blockSignals(true);
+    m_presetCombo->clear();
+
+    int selectedIndex = m_presets.isEmpty() ? -1 : 0;
+    for (int i = 0; i < m_presets.size(); ++i) {
+        const planar_tracker_preset::PlanarTrackerPreset& preset = m_presets.at(i);
+        m_presetCombo->addItem(preset.displayName, i);
+        if (!selectedId.isEmpty() && preset.id == selectedId)
+            selectedIndex = i;
+    }
+
+    m_presetCombo->setCurrentIndex(selectedIndex);
+    m_presetCombo->blockSignals(comboWasBlocked);
+
+    if (selectedIndex >= 0) {
+        const planar_tracker_preset::PlanarTrackerPreset& preset = m_presets.at(selectedIndex);
+        applyPresetToWidgets(preset);
+        if (m_descriptionLabel) {
+            m_descriptionLabel->setText(
+                preset.description.isEmpty() ? tr("説明: なし") : preset.description);
+        }
+    } else {
+        if (m_descriptionLabel)
+            m_descriptionLabel->setText(tr("説明: なし"));
+    }
+    updateDeletePresetButton();
+}
+
+// ---------------------------------------------------------------------------
+void PlanarTrackerDialog::applyPresetToWidgets(
+    const planar_tracker_preset::PlanarTrackerPreset& preset)
+{
+    setPresetWidgetSignalsBlocked(true);
+
+    m_patchSizeSpin->setValue(qRound(preset.patchSizePx));
+    m_searchRadiusSpin->setValue(qRound(preset.searchRadiusPx));
+    m_dampingSpin->setValue(qRound(preset.dampingFactor * 100.0));
+
+    setPresetWidgetSignalsBlocked(false);
+
+    m_params.patchSizePx = static_cast<double>(m_patchSizeSpin->value());
+    m_params.searchRadiusPx = static_cast<double>(m_searchRadiusSpin->value());
+    m_params.dampingFactor = m_dampingSpin->value() / 100.0;
+    m_params.maxFramesPerCall = preset.maxFramesPerCall;
+}
+
+// ---------------------------------------------------------------------------
+void PlanarTrackerDialog::setPresetWidgetSignalsBlocked(bool blocked)
+{
+    m_patchSizeSpin->blockSignals(blocked);
+    m_searchRadiusSpin->blockSignals(blocked);
+    m_dampingSpin->blockSignals(blocked);
+}
+
+// ---------------------------------------------------------------------------
+void PlanarTrackerDialog::updateDeletePresetButton()
+{
+    if (!m_deletePresetBtn)
+        return;
+
+    const int index = currentPresetIndex();
+    if (index < 0) {
+        m_deletePresetBtn->setEnabled(false);
+        return;
+    }
+
+    m_deletePresetBtn->setEnabled(
+        !planar_tracker_preset::findBuiltin(m_presets.at(index).id).has_value());
+}
+
+// ---------------------------------------------------------------------------
+int PlanarTrackerDialog::currentPresetIndex() const
+{
+    bool ok = false;
+    const int index = m_presetCombo->currentData().toInt(&ok);
+    if (!ok || index < 0 || index >= m_presets.size())
+        return -1;
+    return index;
 }
 
 // ---------------------------------------------------------------------------

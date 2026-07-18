@@ -5,6 +5,8 @@
 #include <QVector>
 #include "Overlay.h"
 #include "MotionStabilizer.h"
+#include "LayerStyle.h"
+#include "color/ClipColor.h"
 
 // Volume automation point.
 //   time = clip-local TIMELINE-display seconds (0.0 == the entry's
@@ -39,9 +41,33 @@ struct PlaybackEntry {
     double videoScale = 1.0;
     double videoDx = 0.0;
     double videoDy = 0.0;
+    double rotation2DDegrees = 0.0; // == ClipInfo::rotation2DDegrees, carried so
+                                    // the compositor can place layers via the
+                                    // clipgeom SSOT (rotate step) identically
+                                    // to the export path.
     double opacity = 1.0;        // PiP alpha, propagated from ClipInfo::opacity
+    bool fitContain = false;     // SNS vertical fit, propagated from ClipInfo::fitContain
+    bool fitCover = false;       // SNS cover fit, propagated from ClipInfo::fitCover
+    clipcolor::ColorMeta colorMeta; // Per-clip input color metadata (Stage1 storage only)
+    LayerStyle layerStyle;       // Per-clip layer style for preview/export parity; identity == no-op
     double volume = 1.0;         // Per-clip audio gain (0.0-2.0), propagated from ClipInfo::volume
+    double pan = 0.0;            // Per-clip balance pan (-1.0..+1.0), propagated from ClipInfo::pan
     int sourceClipIndex = -1;    // Index into TimelineTrack::m_clips
+
+    // STAGE4B (live GPU track-matte): carries the matte assignment from the
+    // timeline to VideoPlayer so the live preview can apply it on the GPU the
+    // same way the export path does. matteTypeOrdinal MIRRORS the
+    // TrackMatteType enum ordinals (src/MaskSystem.h): 0=None, 1=AlphaMatte,
+    // 2=AlphaInvertedMatte, 3=LumaMatte, 4=LumaInvertedMatte. Stored as a plain
+    // int (NOT the enum) because PlaybackTypes.h is deliberately lean — it must
+    // not pull in MaskSystem.h's QImage/QJsonObject UI weight (see the struct
+    // comment above). The ordinal correspondence is enforced by a static_assert
+    // in Timeline.cpp (the populating site, which already includes MaskSystem.h).
+    // 0 (None) == no matte. matteSourceClipId is the trackMatteClipKey
+    // ("trackIdx:clipIdx") of the matte SOURCE clip; empty == none.
+    int matteTypeOrdinal = 0;
+    QString matteSourceClipId;
+    QString parentClipId;
     // Edge-attached transitions (FadeIn/FadeOut/CrossDissolve/...). Copied
     // from ClipInfo::leadIn / trailOut so VideoPlayer can window the alpha
     // (and AudioMixer the gain) over the duration without reading Timeline.

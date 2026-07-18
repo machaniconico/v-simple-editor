@@ -238,11 +238,7 @@ QJsonObject TransformAnimator::toJson() const
 
         QJsonArray kfArr;
         for (const auto &kf : track.keyframes()) {
-            QJsonObject kfObj;
-            kfObj[QStringLiteral("time")] = kf.time;
-            kfObj[QStringLiteral("value")] = kf.value;
-            kfObj[QStringLiteral("interpolation")] = static_cast<int>(kf.interpolation);
-            kfArr.append(kfObj);
+            kfArr.append(keyframePointToJson(kf));
         }
         trackObj[QStringLiteral("keyframes")] = kfArr;
         tracksArr.append(trackObj);
@@ -268,12 +264,9 @@ void TransformAnimator::fromJson(const QJsonObject &obj)
 
         QJsonArray kfArr = trackObj[QStringLiteral("keyframes")].toArray();
         for (const auto &kfVal : kfArr) {
-            QJsonObject kfObj = kfVal.toObject();
-            double time = kfObj[QStringLiteral("time")].toDouble();
-            double value = kfObj[QStringLiteral("value")].toDouble();
-            auto interp = static_cast<KeyframePoint::Interpolation>(
-                kfObj[QStringLiteral("interpolation")].toInt(0));
-            m_tracks[idx].addKeyframe(time, value, interp);
+            const KeyframePoint kf = keyframePointFromJson(kfVal.toObject());
+            m_tracks[idx].addKeyframe(kf.time, kf.value, kf.interpolation,
+                                      kf.bezX1, kf.bezY1, kf.bezX2, kf.bezY2);
         }
     }
 }

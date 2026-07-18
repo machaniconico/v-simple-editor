@@ -10,11 +10,12 @@
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
-#include <QSettings>
 #include <QTimer>
 #include <QUrl>
 #include <QUrlQuery>
 #include <QtGlobal>
+
+#include "CredentialStore.h"
 
 namespace x {
 namespace upload {
@@ -26,23 +27,11 @@ namespace upload {
 XUploadConfig XUploadConfig::defaultConfig() {
     XUploadConfig cfg;
 
-    // 1) environment variable
-    const QByteArray envToken = qgetenv("VEDITOR_X_BEARER_TOKEN");
-    if (!envToken.isEmpty()) {
-        cfg.bearerToken = QString::fromUtf8(envToken).trimmed();
-        return cfg;
-    }
-
-    // 2) QSettings
-    QSettings settings;
-    const QString settingsToken =
-        settings.value(QStringLiteral("x_oauth/bearer")).toString().trimmed();
-    if (!settingsToken.isEmpty()) {
-        cfg.bearerToken = settingsToken;
-        return cfg;
-    }
-
-    qWarning("X bearer token not set; upload will be a no-op");
+    cfg.bearerToken = creds::CredentialStore::get(
+        "VEDITOR_X_BEARER_TOKEN",
+        QStringLiteral("x_video/bearer_token"),
+        QString(),
+        /*emitWarning=*/true);
     return cfg;
 }
 
@@ -202,11 +191,12 @@ void UploadClient::doAppend(const XUploadConfig &cfg, const QString &mediaId,
     multiPart->append(mediaPart);
 
     QNetworkReply *reply = m_nam->post(req, multiPart);
-    multiPart->setParent(reply);   // reply takes ownership
     if (!reply) {
+        multiPart->deleteLater();
         emit uploadFailed(QStringLiteral("failed to dispatch APPEND request"));
         return;
     }
+    multiPart->setParent(reply);   // reply takes ownership
 
     const qint64 nextOffset   = offset + static_cast<qint64>(chunk.size());
     const int    nextSegment  = segmentIndex + 1;
@@ -295,7 +285,14 @@ void UploadClient::doFinalize(const XUploadConfig &cfg, const QString &mediaId,
 // ---------------------------------------------------------------------------
 
 void UploadClient::doStatusPoll(const XUploadConfig &cfg, const QString &mediaId,
-                                 const UploadJob &job) {
+                                 const UploadJob &job, int attempt) {
+    if (attempt >= kMaxStatusPolls) {
+        emit uploadFailed(
+            QStringLiteral("X media processing timed out after %1 status polls")
+                .arg(kMaxStatusPolls));
+        return;
+    }
+
     if (!m_nam) {
         m_nam = new QNetworkAccessManager(this);
     }
@@ -317,7 +314,7 @@ void UploadClient::doStatusPoll(const XUploadConfig &cfg, const QString &mediaId
     }
 
     connect(reply, &QNetworkReply::finished,
-            this, [this, reply, cfg, mediaId, job]() {
+            this, [this, reply, cfg, mediaId, job, attempt]() {
         reply->deleteLater();
         if (reply->error() != QNetworkReply::NoError) {
             emit uploadFailed(
@@ -355,8 +352,8 @@ void UploadClient::doStatusPoll(const XUploadConfig &cfg, const QString &mediaId
         // Still in_progress — respect check_after_secs
         const int checkAfterSecs = procInfo.value(QStringLiteral("check_after_secs")).toInt(5);
         const int delayMs = qMax(1, checkAfterSecs) * 1000;
-        QTimer::singleShot(delayMs, this, [this, cfg, mediaId, job]() {
-            doStatusPoll(cfg, mediaId, job);
+        QTimer::singleShot(delayMs, this, [this, cfg, mediaId, job, attempt]() {
+            doStatusPoll(cfg, mediaId, job, attempt + 1);
         });
     });
 }

@@ -1,8 +1,8 @@
 #include "Text3DExtrusionDialog.h"
 #include "Camera3D.h"
 
+#include <QByteArray>
 #include <QColorDialog>
-#include <QJsonObject>
 #include <QDialogButtonBox>
 #include <QDoubleSpinBox>
 #include <QFontDialog>
@@ -10,17 +10,26 @@
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QImage>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
 #include <QPixmap>
 #include <QPushButton>
 #include <QSlider>
 #include <QSpinBox>
+#include <QVariant>
 #include <QVBoxLayout>
 
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr const char *kSourceCameraProperty = "vseText3DSourceCamera";
+
+} // namespace
 
 static void setButtonColor(QPushButton *btn, const QColor &c)
 {
@@ -298,6 +307,8 @@ void Text3DExtrusionDialog::setLayer(const Text3DLayer &src)
     // Serialise once — Text3DLayer exposes text/font/cameraDistance/rotAxis
     // only through JSON (no direct getters for those fields).
     const QJsonObject jo = src.toJson();
+    setProperty(kSourceCameraProperty,
+                QJsonDocument(src.camera().toJson()).toJson(QJsonDocument::Compact));
 
     // Text
     m_textEdit->setText(jo.value(QStringLiteral("text")).toString());
@@ -406,6 +417,14 @@ void Text3DExtrusionDialog::buildLayer(Text3DLayer &out) const
     // Spin speed via rotationAnimAxis — only .y() is used by extrude path
     const QVector3D spinAxis(0.0f, static_cast<float>(m_spinSpeedSpin->value()), 0.0f);
     out.setRotationAnimAxis(spinAxis);
+
+    const QByteArray cameraJson = property(kSourceCameraProperty).toByteArray();
+    const QJsonDocument cameraDoc = QJsonDocument::fromJson(cameraJson);
+    if (cameraDoc.isObject()) {
+        Camera3D camera;
+        camera.fromJson(cameraDoc.object());
+        out.setCamera(camera);
+    }
 }
 
 Text3DLayer *Text3DExtrusionDialog::layer(QObject *layerParent) const
@@ -522,4 +541,3 @@ void Text3DExtrusionDialog::onPreviewSliderChanged()
     updatePreview();
     // Slider movement alone does not alter layer state; no layerChanged() here
 }
-

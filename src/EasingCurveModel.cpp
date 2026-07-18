@@ -5,6 +5,8 @@ namespace easing {
 
 namespace {
 
+constexpr double kPi = 3.14159265358979323846;
+
 inline double clamp01(double v) {
     if (v < 0.0) return 0.0;
     if (v > 1.0) return 1.0;
@@ -69,6 +71,39 @@ double solveBezierParam(double x, double x1, double x2) {
 }
 
 } // namespace
+
+double elasticOut(double t) {
+    if (t == 0.0)
+        return 0.0;
+    if (t == 1.0)
+        return 1.0;
+    return std::pow(2.0, -10.0 * t) * std::sin((t * 10.0 - 0.75) * (2.0 * kPi / 3.0)) + 1.0;
+}
+
+double bounceOut(double t) {
+    constexpr double n1 = 7.5625;
+    constexpr double d1 = 2.75;
+
+    if (t < 1.0 / d1) {
+        return n1 * t * t;
+    } else if (t < 2.0 / d1) {
+        t -= 1.5 / d1;
+        return n1 * t * t + 0.75;
+    } else if (t < 2.5 / d1) {
+        t -= 2.25 / d1;
+        return n1 * t * t + 0.9375;
+    }
+
+    t -= 2.625 / d1;
+    return n1 * t * t + 0.984375;
+}
+
+double backOut(double t) {
+    constexpr double c1 = 1.70158;
+    constexpr double c3 = c1 + 1.0;
+    const double u = t - 1.0;
+    return 1.0 + c3 * std::pow(u, 3.0) + c1 * std::pow(u, 2.0);
+}
 
 double evaluate(EasingType type, double t, const CubicBezier &bez) {
     switch (type) {

@@ -96,6 +96,8 @@ struct EnhancedTextOverlay {
     QFont font = QFont("Arial", 32, QFont::Bold);
     QColor color = Qt::white;
     QColor backgroundColor = QColor(0, 0, 0, 160);
+    double letterSpacing = 0.0; // QFont absolute spacing in pixels; 0 = legacy metrics
+    double lineSpacing = 0.0;   // extra leading in pixels between laid-out lines; 0 = legacy metrics
 
     // Position & transform
     double x = 0.5;          // 0.0-1.0 normalized

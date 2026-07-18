@@ -33,6 +33,10 @@ struct CubicBezier {
 // fallback), then return bezierY(u).
 double evaluate(EasingType type, double t, const CubicBezier &bez = {});
 
+double elasticOut(double t);
+double bounceOut(double t);
+double backOut(double t);
+
 // A named cubic-bezier preset (CSS-style control points).
 struct NamedCurve {
     QString     name;

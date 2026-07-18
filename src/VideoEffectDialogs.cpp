@@ -541,6 +541,9 @@ KeyframeDialog::KeyframeDialog(const KeyframeTrack &track, double clipDuration, 
     m_interpCombo->addItem("Ease Out", static_cast<int>(KeyframePoint::EaseOut));
     m_interpCombo->addItem("Ease In/Out", static_cast<int>(KeyframePoint::EaseInOut));
     m_interpCombo->addItem("Hold", static_cast<int>(KeyframePoint::Hold));
+    m_interpCombo->addItem("エラスティック", static_cast<int>(KeyframePoint::ElasticOut));
+    m_interpCombo->addItem("バウンス", static_cast<int>(KeyframePoint::BounceOut));
+    m_interpCombo->addItem("バック(オーバーシュート)", static_cast<int>(KeyframePoint::BackOut));
     addLayout->addWidget(m_interpCombo);
 
     mainLayout->addLayout(addLayout);
@@ -587,14 +590,24 @@ void KeyframeDialog::onSelectionChanged()
         const auto &kf = m_track.keyframes()[row];
         m_timeSpin->setValue(kf.time);
         m_valueSpin->setValue(kf.value);
-        m_interpCombo->setCurrentIndex(static_cast<int>(kf.interpolation));
+        m_interpCombo->setCurrentIndex(m_interpCombo->findData(static_cast<int>(kf.interpolation)));
     }
 }
 
 void KeyframeDialog::refreshList()
 {
     m_kfList->clear();
-    static const char* interpNames[] = {"Linear", "EaseIn", "EaseOut", "EaseInOut", "Hold"};
+    static const char* interpNames[] = {
+        "Linear",
+        "EaseIn",
+        "EaseOut",
+        "EaseInOut",
+        "Hold",
+        "Bezier",
+        "ElasticOut",
+        "BounceOut",
+        "BackOut"
+    };
     for (const auto &kf : m_track.keyframes()) {
         m_kfList->addItem(QString("%1s = %2 (%3)")
             .arg(kf.time, 0, 'f', 2)

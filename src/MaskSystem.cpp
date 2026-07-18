@@ -512,24 +512,37 @@ QImage MaskSystem::applyMask(const QImage &sourceImage, const QImage &maskImage)
 //  MaskSystem — track matte
 // ============================================================
 
+static int trackMatteLumaRec601(QRgb pixel)
+{
+    // AE/Premiere luma matte uses Rec.601 (ref: Adobe AE Luma Matte / Premiere Matte Luma docs; ITU-R BT.601-7 Sec. 2.5.1).
+    return static_cast<int>(0.299 * qRed(pixel)
+                          + 0.587 * qGreen(pixel)
+                          + 0.114 * qBlue(pixel));
+}
+
 QImage MaskSystem::applyTrackMatte(const QImage &sourceImage,
                                    const QImage &matteImage,
                                    TrackMatteType matteType)
 {
-    if (matteType == TrackMatteType::None)
+    if (matteType == TrackMatteType::None || sourceImage.isNull() || matteImage.isNull())
         return sourceImage;
+
+    QImage src = sourceImage;
+    if (src.format() != QImage::Format_ARGB32_Premultiplied)
+        src = src.convertToFormat(QImage::Format_ARGB32_Premultiplied);
 
     QImage matte = matteImage;
     if (matte.format() != QImage::Format_ARGB32_Premultiplied)
         matte = matte.convertToFormat(QImage::Format_ARGB32_Premultiplied);
 
-    // Scale matte to match source if dimensions differ
-    QImage src = sourceImage;
-    if (src.format() != QImage::Format_ARGB32_Premultiplied)
-        src = src.convertToFormat(QImage::Format_ARGB32_Premultiplied);
-
     if (matte.size() != src.size())
         matte = matte.scaled(src.size(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+
+    QImage matteRgb;
+    const bool useLuma = matteType == TrackMatteType::LumaMatte
+                      || matteType == TrackMatteType::LumaInvertedMatte;
+    if (useLuma)
+        matteRgb = matte.convertToFormat(QImage::Format_ARGB32);
 
     const int w = src.width();
     const int h = src.height();
@@ -539,6 +552,9 @@ QImage MaskSystem::applyTrackMatte(const QImage &sourceImage,
 
     for (int y = 0; y < h; ++y) {
         const QRgb *matteRow = reinterpret_cast<const QRgb *>(matte.constScanLine(y));
+        const QRgb *matteRgbRow = useLuma
+            ? reinterpret_cast<const QRgb *>(matteRgb.constScanLine(y))
+            : nullptr;
         uchar *maskRow = matteMask.scanLine(y);
 
         for (int x = 0; x < w; ++x) {
@@ -552,15 +568,10 @@ QImage MaskSystem::applyTrackMatte(const QImage &sourceImage,
                 val = 255 - qAlpha(matteRow[x]);
                 break;
             case TrackMatteType::LumaMatte:
-                // ITU-R BT.709 luminance
-                val = static_cast<int>(0.2126 * qRed(matteRow[x])
-                                     + 0.7152 * qGreen(matteRow[x])
-                                     + 0.0722 * qBlue(matteRow[x]));
+                val = trackMatteLumaRec601(matteRgbRow[x]);
                 break;
             case TrackMatteType::LumaInvertedMatte:
-                val = 255 - static_cast<int>(0.2126 * qRed(matteRow[x])
-                                           + 0.7152 * qGreen(matteRow[x])
-                                           + 0.0722 * qBlue(matteRow[x]));
+                val = 255 - trackMatteLumaRec601(matteRgbRow[x]);
                 break;
             case TrackMatteType::None:
                 val = 255;

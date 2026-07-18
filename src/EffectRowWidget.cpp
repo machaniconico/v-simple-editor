@@ -13,8 +13,102 @@
 #include <QPushButton>
 #include <QColorDialog>
 #include <QStyle>
+#include <QValidator>
+#include <cmath>
 
 namespace effectctrl {
+namespace {
+
+// ParamDef::defaultVal for Color params carries a packed QRgb (QColor::rgb()
+// encoded as double); 0.0 means "no schema default" and keeps the legacy black.
+QColor decodeColorDefault(double encodedDefault)
+{
+    if (encodedDefault != 0.0) {
+        const auto rgb = static_cast<QRgb>(static_cast<unsigned int>(std::llround(encodedDefault)));
+        return QColor::fromRgb(rgb);
+    }
+    return QColor(0, 0, 0);
+}
+
+class UnlimitedDoubleSpinBox : public QDoubleSpinBox
+{
+public:
+    explicit UnlimitedDoubleSpinBox(QWidget *parent = nullptr)
+        : QDoubleSpinBox(parent)
+    {
+    }
+
+protected:
+    QString textFromValue(double value) const override
+    {
+        if (value <= minimum())
+            return QString();
+        return QDoubleSpinBox::textFromValue(value);
+    }
+
+    double valueFromText(const QString &text) const override
+    {
+        if (text.trimmed().isEmpty())
+            return minimum();
+        return QDoubleSpinBox::valueFromText(text);
+    }
+
+    QValidator::State validate(QString &input, int &pos) const override
+    {
+        if (input.trimmed().isEmpty())
+            return QValidator::Acceptable;
+        return QDoubleSpinBox::validate(input, pos);
+    }
+};
+
+double normalizedTimingValue(double value)
+{
+    return value < 0.0 ? -1.0 : value;
+}
+
+bool splitColorChannelParam(const QString &paramName, QString *baseParamName, QString *channel)
+{
+    const int dotPos = paramName.lastIndexOf(QLatin1Char('.'));
+    if (dotPos <= 0 || dotPos == paramName.size() - 1)
+        return false;
+
+    const QString suffix = paramName.mid(dotPos + 1);
+    if (suffix != QStringLiteral("r")
+        && suffix != QStringLiteral("g")
+        && suffix != QStringLiteral("b")) {
+        return false;
+    }
+
+    if (baseParamName)
+        *baseParamName = paramName.left(dotPos);
+    if (channel)
+        *channel = suffix;
+    return true;
+}
+
+double colorChannelValue(const QColor &color, const QString &channel)
+{
+    if (channel == QStringLiteral("r"))
+        return color.red();
+    if (channel == QStringLiteral("g"))
+        return color.green();
+    if (channel == QStringLiteral("b"))
+        return color.blue();
+    return 0.0;
+}
+
+QDoubleSpinBox *createTimingSpinBox(QWidget *parent, double value)
+{
+    auto *spin = new UnlimitedDoubleSpinBox(parent);
+    spin->setRange(-1.0, 999999.0);
+    spin->setDecimals(3);
+    spin->setSingleStep(1.0);
+    spin->setValue(normalizedTimingValue(value));
+    spin->setToolTip(QStringLiteral("空欄または -1 で無制限"));
+    return spin;
+}
+
+} // namespace
 
 EffectRowWidget::EffectRowWidget(QWidget *parent)
     : QWidget(parent)
@@ -40,6 +134,57 @@ VideoEffect EffectRowWidget::currentEffect() const
 void EffectRowWidget::buildRows(const QVector<ParamDef> &schema)
 {
     auto *layout = qobject_cast<QVBoxLayout *>(this->layout());
+
+    auto *timingContainer = new QWidget(this);
+    auto *timingLayout = new QHBoxLayout(timingContainer);
+    timingLayout->setContentsMargins(2, 1, 2, 1);
+    timingLayout->setSpacing(4);
+
+    auto *startLabel = new QLabel(QStringLiteral("開始(秒)"), timingContainer);
+    startLabel->setMinimumWidth(64);
+    auto *startSpin = createTimingSpinBox(timingContainer, m_effect.startSec);
+    auto *endLabel = new QLabel(QStringLiteral("終了(秒)"), timingContainer);
+    endLabel->setMinimumWidth(64);
+    auto *endSpin = createTimingSpinBox(timingContainer, m_effect.endSec);
+    auto *resetButton = new QPushButton(timingContainer);
+    resetButton->setIcon(style()->standardIcon(QStyle::SP_BrowserReload));
+    resetButton->setFixedSize(20, 20);
+    resetButton->setToolTip(QStringLiteral("有効区間を無制限に戻す"));
+
+    auto emitTimingValue = [this](const QString &paramName, QDoubleSpinBox *spin, double value) {
+        const double normalized = normalizedTimingValue(value);
+        if (normalized != value) {
+            spin->blockSignals(true);
+            spin->setValue(normalized);
+            spin->blockSignals(false);
+        }
+        emit paramChanged(paramName, QVariant(normalized));
+    };
+
+    connect(startSpin, qOverload<double>(&QDoubleSpinBox::valueChanged), this,
+            [emitTimingValue, startSpin](double value) {
+                emitTimingValue(QStringLiteral("__effectStartSec"), startSpin, value);
+            });
+    connect(endSpin, qOverload<double>(&QDoubleSpinBox::valueChanged), this,
+            [emitTimingValue, endSpin](double value) {
+                emitTimingValue(QStringLiteral("__effectEndSec"), endSpin, value);
+            });
+    connect(resetButton, &QPushButton::clicked, this, [this, startSpin, endSpin]() {
+        startSpin->blockSignals(true);
+        endSpin->blockSignals(true);
+        startSpin->setValue(-1.0);
+        endSpin->setValue(-1.0);
+        startSpin->blockSignals(false);
+        endSpin->blockSignals(false);
+        emit paramChanged(QStringLiteral("__effectTimingReset"), QVariant(true));
+    });
+
+    timingLayout->addWidget(startLabel);
+    timingLayout->addWidget(startSpin, 1);
+    timingLayout->addWidget(endLabel);
+    timingLayout->addWidget(endSpin, 1);
+    timingLayout->addWidget(resetButton);
+    layout->addWidget(timingContainer);
 
     for (const auto &def : schema) {
         RowWidgets row;
@@ -115,7 +260,7 @@ void EffectRowWidget::buildRows(const QVector<ParamDef> &schema)
         }
         case ParamType::Color: {
             row.colorButton = new QPushButton(row.container);
-            QColor initColor = QColor::fromRgbF(def.defaultVal, def.defaultVal, def.defaultVal);
+            QColor initColor = decodeColorDefault(def.defaultVal);
             if (def.name.contains("color", Qt::CaseInsensitive) || def.name.contains("Color")) {
                 initColor = m_effect.keyColor;
             }
@@ -134,6 +279,7 @@ void EffectRowWidget::buildRows(const QVector<ParamDef> &schema)
                 if (newColor.isValid()) {
                     row.colorButton->setStyleSheet(QString("background-color: %1; border: 1px solid #555; border-radius: 3px;")
                                                    .arg(newColor.name()));
+                    setColorParam(m_effect, def.name, newColor);
                     emit paramChanged(def.name, QVariant(newColor));
                 }
             });
@@ -186,11 +332,12 @@ void EffectRowWidget::buildRows(const QVector<ParamDef> &schema)
                 emit paramChanged(def.name, QVariant(def.defaultVal != 0.0));
                 break;
             case ParamType::Color: {
-                QColor defaultColor = QColor::fromRgbF(def.defaultVal, def.defaultVal, def.defaultVal);
+                QColor defaultColor = decodeColorDefault(def.defaultVal);
                 if (row.colorButton) {
                     row.colorButton->setStyleSheet(QString("background-color: %1; border: 1px solid #555; border-radius: 3px;")
                                                    .arg(defaultColor.name()));
                 }
+                setColorParam(m_effect, def.name, defaultColor);
                 emit paramChanged(def.name, QVariant(defaultColor));
                 break;
             }
@@ -260,8 +407,16 @@ bool EffectRowWidget::paramHasTrack(const QString &paramName) const
 
 double EffectRowWidget::getParamValueByName(const QString &paramName) const
 {
+    QString baseParamName;
+    QString channel;
+    const bool colorChannel = splitColorChannelParam(paramName, &baseParamName, &channel);
+    const QString lookupName = colorChannel ? baseParamName : paramName;
+
     for (int i = 0; i < m_rows.size(); ++i) {
-        if (m_rows[i].paramName == paramName) {
+        if (m_rows[i].paramName == lookupName) {
+            if (colorChannel && m_rows[i].colorButton) {
+                return colorChannelValue(colorParamValue(m_effect, lookupName), channel);
+            }
             return getParamValue(i);
         }
     }

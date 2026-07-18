@@ -4,10 +4,28 @@
 #include <QThread>
 #include <atomic>
 #include "ExportDialog.h"
+#include "PremiereXmlExporter.h"
 #include "Timeline.h"
 
 class SmartReframe;
 class SubtitleTrackRenderer;
+
+// ===========================================================================
+// LEGACY — bypasses the SSOT edit graph; do not use for new code.
+//
+// Exporter::doExport is a CPU-only ffmpeg transcode that applies a hard-coded
+// subset of effects via applyEffectStack (~11 effect types) and SKIPS the
+// graph entirely for the 10-bit/HDR/ProRes path (see Exporter.cpp tenBitPath).
+// It does NOT reproduce the GLPreview composite.
+//
+// Production video export goes RenderQueue -> tlrender::renderFrameAt (S8),
+// which renders the FULL preview edit graph pixel-for-pixel. As of S12 every
+// UI-reachable export entry point (File->Export Ctrl+E, Mobile Export, Batch
+// Export, Render Queue) routes through RenderQueue; Exporter is retained only
+// for ABI/source compatibility and is no longer wired to any UI action.
+//
+// See progress.txt "### S12 single-path audit".
+// ===========================================================================
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -30,6 +48,14 @@ public:
     void setSmartReframe(SmartReframe *reframe);
     void setSubtitleRenderer(SubtitleTrackRenderer *renderer);
     void setLoudnessGainDb(double gainDb);
+
+    // Premiere Pro XML (FCP7) export dispatcher.
+    // Converts clips to PremiereHighlight list and calls PremiereXmlExporter::generateCombinedXml.
+    // Returns true on success; false on failure (caller should show QMessageBox::warning).
+    static bool exportAsPremiereXml(const QVector<ClipInfo> &clips,
+                                    const ExportConfig &config,
+                                    const QString &outputPath,
+                                    const QString &projectName = QStringLiteral("v-simple-editor Project"));
 
 signals:
     void progressChanged(int percent);

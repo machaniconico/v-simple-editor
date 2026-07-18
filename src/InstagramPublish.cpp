@@ -5,11 +5,12 @@
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
-#include <QSettings>
 #include <QTimer>
 #include <QUrl>
 #include <QUrlQuery>
 #include <QtGlobal>
+
+#include "CredentialStore.h"
 
 namespace instagram {
 namespace publish {
@@ -21,22 +22,16 @@ namespace publish {
 IgConfig IgConfig::defaultConfig() {
     IgConfig cfg;
 
-    // access token: env first, then QSettings
-    cfg.accessToken = QString::fromLocal8Bit(qgetenv("VEDITOR_IG_ACCESS_TOKEN")).trimmed();
-    if (cfg.accessToken.isEmpty()) {
-        QSettings settings;
-        cfg.accessToken = settings.value(QStringLiteral("instagram/access_token")).toString().trimmed();
-    }
+    cfg.accessToken = creds::CredentialStore::get(
+        "VEDITOR_IG_ACCESS_TOKEN",
+        QStringLiteral("instagram/access_token"));
     if (cfg.accessToken.isEmpty()) {
         qWarning("InstagramPublish: VEDITOR_IG_ACCESS_TOKEN not set and no QSettings fallback found");
     }
 
-    // ig user id: env first, then QSettings
-    cfg.igUserId = QString::fromLocal8Bit(qgetenv("VEDITOR_IG_USER_ID")).trimmed();
-    if (cfg.igUserId.isEmpty()) {
-        QSettings settings;
-        cfg.igUserId = settings.value(QStringLiteral("instagram/ig_user_id")).toString().trimmed();
-    }
+    cfg.igUserId = creds::CredentialStore::get(
+        "VEDITOR_IG_USER_ID",
+        QStringLiteral("instagram/ig_user_id"));
 
     return cfg;
 }
@@ -174,13 +169,14 @@ void Publisher::startPollLoop(const QString &creationId, const IgConfig &config,
                 return;
             }
 
-            if (statusCode == QStringLiteral("FINISHED")) {
+            if (statusCode == QStringLiteral("FINISHED")
+                || statusCode == QStringLiteral("PUBLISHED")) {
                 // Phase 3: publish the container
                 doMediaPublish(creationId, config);
                 return;
             }
 
-            // Still IN_PROGRESS or PUBLISHED — keep polling
+            // Still IN_PROGRESS — keep polling
             startPollLoop(creationId, config, pollCount + 1);
         });
     });

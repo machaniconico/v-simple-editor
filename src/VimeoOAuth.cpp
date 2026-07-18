@@ -9,30 +9,28 @@
 #include <QUrlQuery>
 #include <QtGlobal>
 
+#include "CredentialAuditLog.h"
+#include "CredentialStore.h"
+
 namespace vimeo {
 namespace oauth {
 
 namespace {
 
-constexpr const char* kAuthorizeUrl = "https://api.vimeo.com/oauth/authorize";
-constexpr const char* kClientCredentialsUrl = "https://api.vimeo.com/oauth/authorize/client";
-constexpr const char* kAccessTokenUrl = "https://api.vimeo.com/oauth/access_token";
+QString resolvedBase(const QString& configBase) {
+    return configBase.isEmpty() ? QStringLiteral("https://api.vimeo.com") : configBase;
+}
 
-QString configValue(const char* envName,
-                    const QString& settingsKey,
-                    const QString& dummyValue) {
-    QString value = qEnvironmentVariable(envName).trimmed();
-    if (value.isEmpty()) {
-        QSettings settings;
-        value = settings.value(settingsKey).toString().trimmed();
-    }
-    if (value.isEmpty()) {
-        qWarning().noquote()
-            << QStringLiteral("Vimeo OAuth missing %1 / %2, using dummy value.")
-                   .arg(QString::fromLatin1(envName), settingsKey);
-        value = dummyValue;
-    }
-    return value;
+QString authorizeUrl(const QString& configBase) {
+    return resolvedBase(configBase) + QStringLiteral("/oauth/authorize");
+}
+
+QString clientCredentialsUrl(const QString& configBase) {
+    return resolvedBase(configBase) + QStringLiteral("/oauth/authorize/client");
+}
+
+QString accessTokenUrl(const QString& configBase) {
+    return resolvedBase(configBase) + QStringLiteral("/oauth/access_token");
 }
 
 QString jsonErrorString(const QByteArray& payload) {
@@ -66,30 +64,55 @@ QString jsonErrorString(const QByteArray& payload) {
 
 VimeoOAuthConfig VimeoOAuthConfig::defaultConfig() {
     VimeoOAuthConfig config;
-    config.clientId = configValue("VEDITOR_VIMEO_CLIENT_ID",
-                                  QStringLiteral("vimeo_oauth/client_id"),
-                                  QStringLiteral("dummy-vimeo-client-id"));
-    config.clientSecret = configValue("VEDITOR_VIMEO_CLIENT_SECRET",
-                                      QStringLiteral("vimeo_oauth/client_secret"),
-                                      QStringLiteral("dummy-vimeo-client-secret"));
+    config.clientId = creds::CredentialStore::get(
+        "VEDITOR_VIMEO_CLIENT_ID",
+        QStringLiteral("vimeo_oauth/client_id"),
+        QString(),
+        true);
+    config.clientSecret = creds::CredentialStore::get(
+        "VEDITOR_VIMEO_CLIENT_SECRET",
+        QStringLiteral("vimeo_oauth/client_secret"),
+        QString(),
+        true);
     config.scope = QStringLiteral("private public video_files");
+    config.baseUrl = QString();
     config.redirectUri = QStringLiteral("http://localhost:8080/vimeo/callback");
 
     QSettings settings;
     config.accessToken = settings.value(QStringLiteral("vimeo_oauth/access_token")).toString();
     config.refreshToken = settings.value(QStringLiteral("vimeo_oauth/refresh_token")).toString();
+    config.expiresAt = creds::CredentialStore::getExpiry(QStringLiteral("vimeo_oauth/access_token"));
+    creds::CredentialAuditLog::logEvent(
+        creds::CredentialAuditLog::EventType::AccessTokenLoaded,
+        QStringLiteral("Vimeo"),
+        QStringLiteral("vimeo_oauth/access_token"),
+        QStringLiteral("config loaded from QSettings"));
+    const int purged = creds::CredentialAuditLog::purgeOlderThanDays(30);
+    if (purged > 0) {
+        qDebug() << "[Vimeo OAuth] audit log purged" << purged << "old entries (>30 days)";
+    }
     return config;
 }
 
 AuthClient::AuthClient(const VimeoOAuthConfig& config, QObject* parent)
     : QObject(parent)
     , m_config(config)
-    , m_nam(new QNetworkAccessManager(this)) {}
+    , m_nam(new QNetworkAccessManager(this)) {
+    // Phase 5G: auto-refresh on construction if loaded config is expired
+    if (refreshIfExpired()) {
+        qDebug() << "[Vimeo OAuth] auto-refresh fired on ctor";
+        creds::CredentialAuditLog::logEvent(
+            creds::CredentialAuditLog::EventType::RefreshFired,
+            QStringLiteral("Vimeo"),
+            QStringLiteral("vimeo_oauth/access_token"),
+            QStringLiteral("auto-refresh on ctor"));
+    }
+}
 
 AuthClient::~AuthClient() = default;
 
 QUrl AuthClient::authorizationUrl(const QString& redirectUri, const QString& state) const {
-    QUrl url(QString::fromLatin1(kAuthorizeUrl));
+    QUrl url(authorizeUrl(m_config.baseUrl));
     QUrlQuery query;
     query.addQueryItem(QStringLiteral("response_type"), QStringLiteral("code"));
     query.addQueryItem(QStringLiteral("client_id"), m_config.clientId);
@@ -114,7 +137,7 @@ void AuthClient::requestClientCredentialsToken() {
     if (!m_config.scope.isEmpty()) {
         form.addQueryItem(QStringLiteral("scope"), m_config.scope);
     }
-    dispatchTokenRequest(QUrl(QString::fromLatin1(kClientCredentialsUrl)),
+    dispatchTokenRequest(QUrl(clientCredentialsUrl(m_config.baseUrl)),
                          form.toString(QUrl::FullyEncoded).toUtf8(),
                          PendingGrant::ClientCredentials);
 }
@@ -131,7 +154,7 @@ void AuthClient::exchangeAuthorizationCode(const QString& authorizationCode,
     form.addQueryItem(QStringLiteral("code"), authorizationCode.trimmed());
     form.addQueryItem(QStringLiteral("redirect_uri"),
                       redirectUri.isEmpty() ? m_config.redirectUri : redirectUri);
-    dispatchTokenRequest(QUrl(QString::fromLatin1(kAccessTokenUrl)),
+    dispatchTokenRequest(QUrl(accessTokenUrl(m_config.baseUrl)),
                          form.toString(QUrl::FullyEncoded).toUtf8(),
                          PendingGrant::AuthorizationCode);
 }
@@ -145,9 +168,25 @@ void AuthClient::refreshAccessToken() {
     QUrlQuery form;
     form.addQueryItem(QStringLiteral("grant_type"), QStringLiteral("refresh_token"));
     form.addQueryItem(QStringLiteral("refresh_token"), m_config.refreshToken.trimmed());
-    dispatchTokenRequest(QUrl(QString::fromLatin1(kAccessTokenUrl)),
+    dispatchTokenRequest(QUrl(accessTokenUrl(m_config.baseUrl)),
                          form.toString(QUrl::FullyEncoded).toUtf8(),
                          PendingGrant::RefreshToken);
+}
+
+bool AuthClient::refreshIfExpired(int leewaySec) {
+    if (m_config.refreshToken.trimmed().isEmpty()) {
+        return false;  // refresh_token 無し → refresh 不可
+    }
+    // expiresAt が有効 かつ now + leeway < expiresAt → まだ十分有効
+    if (m_config.expiresAt.isValid()) {
+        const QDateTime now = QDateTime::currentDateTimeUtc();
+        if (now.addSecs(leewaySec) < m_config.expiresAt) {
+            return false;  // expiry まで余裕あり、refresh 不要
+        }
+    }
+    // expired or expiry 未知 → refresh fire (既存 method を呼ぶ)
+    refreshAccessToken();
+    return true;
 }
 
 void AuthClient::setAccessToken(const QString& accessToken) {
@@ -205,6 +244,11 @@ void AuthClient::onReplyFinished() {
     reply->deleteLater();
 
     if (networkError != QNetworkReply::NoError || status >= 400) {
+        creds::CredentialAuditLog::logEvent(
+            creds::CredentialAuditLog::EventType::RefreshFailed,
+            QStringLiteral("Vimeo"),
+            QStringLiteral("vimeo_oauth/access_token"),
+            networkMessage);
         QString detail = jsonErrorString(payload);
         if (detail.isEmpty()) {
             detail = networkMessage;
@@ -219,6 +263,7 @@ void AuthClient::onReplyFinished() {
 }
 
 void AuthClient::applyTokenPayload(const QByteArray& payload, PendingGrant grant) {
+    const QString previousAccess = m_config.accessToken;
     const QJsonDocument doc = QJsonDocument::fromJson(payload);
     if (!doc.isObject()) {
         emit authError(QStringLiteral("Vimeo OAuth response was not JSON"));
@@ -234,6 +279,7 @@ void AuthClient::applyTokenPayload(const QByteArray& payload, PendingGrant grant
 
     const QString refreshToken = obj.value(QStringLiteral("refresh_token")).toString().trimmed();
     const QString scope = obj.value(QStringLiteral("scope")).toString().trimmed();
+    const int expiresIn = obj.value(QStringLiteral("expires_in")).toInt(0);
 
     m_config.accessToken = accessToken;
     if (!refreshToken.isEmpty() || grant != PendingGrant::RefreshToken) {
@@ -242,12 +288,32 @@ void AuthClient::applyTokenPayload(const QByteArray& payload, PendingGrant grant
     if (!scope.isEmpty()) {
         m_config.scope = scope;
     }
+    if (expiresIn > 0) {
+        m_config.expiresAt = QDateTime::currentDateTimeUtc().addSecs(expiresIn);
+    } else {
+        m_config.expiresAt = QDateTime();
+    }
+    const bool isRefresh = (grant == PendingGrant::RefreshToken);
+    if (isRefresh && previousAccess != m_config.accessToken) {
+        creds::CredentialAuditLog::logEvent(
+            creds::CredentialAuditLog::EventType::CredentialRotated,
+            QStringLiteral("Vimeo"),
+            QStringLiteral("vimeo_oauth/access_token"),
+            QStringLiteral("access_token rotated via refresh"));
+    }
+    creds::CredentialAuditLog::logEvent(
+        isRefresh ? creds::CredentialAuditLog::EventType::RefreshSucceeded
+                  : creds::CredentialAuditLog::EventType::AccessTokenSet,
+        QStringLiteral("Vimeo"),
+        QStringLiteral("vimeo_oauth/access_token"),
+        QStringLiteral("expiresAt=%1").arg(m_config.expiresAt.toString(Qt::ISODate)));
 
     QSettings settings;
     settings.setValue(QStringLiteral("vimeo_oauth/access_token"), m_config.accessToken);
     if (!m_config.refreshToken.isEmpty()) {
         settings.setValue(QStringLiteral("vimeo_oauth/refresh_token"), m_config.refreshToken);
     }
+    creds::CredentialStore::setExpiry(QStringLiteral("vimeo_oauth/access_token"), m_config.expiresAt);
 
     emit tokenReceived(m_config.accessToken);
     emit tokensUpdated(m_config.accessToken, m_config.refreshToken);

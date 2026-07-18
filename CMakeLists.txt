@@ -50,30 +50,350 @@ if(WIN32)
 endif()
 
 add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
+    # PRD-B ④ — libavcore shared helpers (Probe + Encode + Concat + Decode + VideoFilterGraph).
+    src/libavcore/Probe.h
+    src/libavcore/Probe.cpp
+    src/libavcore/Encode.h
+    src/libavcore/Encode.cpp
+    src/libavcore/Concat.h
+    src/libavcore/Concat.cpp
+    src/libavcore/Decode.h
+    src/libavcore/Decode.cpp
+    src/libavcore/VideoFilterGraph.h
+    src/libavcore/VideoFilterGraph.cpp
+    src/libavcore/AudioExtract.h
+    src/libavcore/AudioExtract.cpp
+
+    # PRD-SPLIT-MAIN-1: selftest registry (table + dispatch helpers).
+    src/selftests/SelftestRegistry.h
+    src/selftests/SelftestRegistry.cpp
+
+    # PRD-PHASE5B-OAUTH-MOCK-HARNESS: localhost OAuth/upload mock server for e2e selftests.
+    src/selftests/oauth_mock_server.h
+    src/selftests/oauth_mock_server.cpp
+    src/selftests/oauth_refresh_e2e_selftest.cpp
+    src/selftests/cred_audit_log_selftest.cpp
+
+    # PRD-SPLIT-MAIN-2 Phase 1: preset selftests (moved from src/main.cpp).
+    src/selftests/preset_selftests.cpp
+
+    # PRD-SPLIT-MAIN-2 Phase 2: parity + track-matte selftests (moved from src/main.cpp).
+    src/selftests/parity_matte_selftests.cpp
+    src/selftests/keyframe_anim_parity_selftest.cpp
+    src/selftests/KeyframeLoopSelftest.cpp
+    src/selftests/MotionPresetSelftest.cpp
+    src/selftests/motion_blur_parity_selftest.cpp
+    src/selftests/MotionBlurP2Selftest.cpp
+    src/selftests/effect_keyframe_parity_selftest.cpp
+    src/selftests/EffectPresetSelftest.cpp
+    src/selftests/effect_timing_selftest.cpp
+    src/selftests/bezier_easing_selftest.cpp
+    src/selftests/EasingPresetsSelftest.cpp
+    src/selftests/SpatialPathSelftest.cpp
+    src/selftests/SmartRenderSelftest.cpp
+    src/selftests/LoudnessExportWireSelftest.cpp
+    src/selftests/FrameExportSelftest.cpp
+    src/selftests/NestSequenceSelftest.cpp
+    src/selftests/PrecomposeE2ESelftest.cpp
+    src/selftests/AdjustmentLayerSelftest.cpp
+    src/selftests/ClipMaskSelftest.cpp
+    src/selftests/GradeLggSerializationSelftest.cpp
+    src/selftests/GradeKeyframeSelftest.cpp
+    src/selftests/GradeWheelWiringSelftest.cpp
+    src/selftests/MediaPoolDragSelftest.cpp
+    src/selftests/TextSpacingSelftest.cpp
+    src/selftests/VersionedSaveSelftest.cpp
+
+    # PRD-SPLIT-MAIN-3 Phase 3-A: libavcore-backed selftests (moved from src/main.cpp).
+    src/selftests/libavcore_selftests.cpp
+
+    # PRD-SPLIT-MAIN-3 Phase 3-B: effects selftests (moved from src/main.cpp).
+    src/selftests/effects_selftests.cpp
+    src/selftests/Text3dPreviewSelftest.cpp
+    src/selftests/AeFxBlurSelftest.cpp
+    src/selftests/AeFxColorSelftest.cpp
+    src/selftests/AeFxColor2Selftest.cpp
+    src/selftests/AeFxDistortSelftest.cpp
+    src/selftests/AeFxDistort2Selftest.cpp
+    src/selftests/AeFxGenerateSelftest.cpp
+    src/selftests/AeFxStylizeSelftest.cpp
+
+    # PRD-SPLIT-MAIN-3 Phase 3-C: Sprint 11-22 サービス selftests (moved from src/main.cpp).
+    src/selftests/sprint_selftests.cpp
+
+    # PRD-SPLIT-MAIN-3 Phase 3-D: misc selftests (moved from src/main.cpp, final phase).
+    src/selftests/misc_selftests.cpp
+
     src/main.cpp
+    src/util/CrashHandler.cpp
+    src/util/Logger.cpp
+    src/util/RcPause.h
     src/MainWindow.cpp
     src/VideoPlayer.cpp
     src/Timeline.cpp
     src/SnapEngine.cpp
     src/ProjectSettings.cpp
+    src/SequenceSettingsDialog.h
+    src/SequenceSettingsDialog.cpp
     src/ExportDialog.cpp
+    src/ExportRange.h
+    src/ExportRange.cpp
     src/Exporter.cpp
+    src/FrameDiff.cpp
+    src/FrameExport.h
+    src/FrameExport.cpp
+    src/TimelineFrameRenderer.cpp
+    src/SmartRender.h
+    src/SmartRender.cpp
+    src/TextOverlayBake.h
+    src/TextOverlayBake.cpp
+    src/TrackMatteBake.h
+    src/TrackMatteBake.cpp
+    src/ClipGeometry.h
+    src/ClipGeometry.cpp
+    src/mask/ClipMask.h
+    src/mask/ClipMask.cpp
+    src/LayerStyle.h
+    src/LayerStyle.cpp
+    src/clipanim/ClipAnim.h
+    src/clipanim/ClipAnim.cpp
+    src/TrackMatteKey.h
+    src/TrackMatteKey.cpp
     src/CodecDetector.cpp
+    src/UndoTrace.h
+    src/UndoTrace.cpp
+    src/VersionedSave.h
+    src/VersionedSave.cpp
     src/UndoManager.cpp
     src/Overlay.cpp
     src/OverlayDialogs.cpp
+    src/AutoColor.h
+    src/AutoColor.cpp
     src/VideoEffect.cpp
+    src/WbPick.h
+    src/WbPick.cpp
     src/FractalNoise.h
     src/FractalNoise.cpp
     src/EffectParamSchema.h
     src/EffectParamSchema.cpp
     src/VideoEffectDialogs.cpp
-    src/ColorWheelWidget.cpp
     src/ColorGradingPanel.cpp
+    src/ColorWheelWidget.cpp
+    src/CredentialDialog.cpp
+    src/CredentialVault.h
+    src/CredentialVault.cpp
+    src/CredentialAuditLog.h
+    src/CredentialAuditLog.cpp
+    src/PremiereXmlExporter.h
+    src/PremiereXmlExporter.cpp
+    src/YtdlpDownloadDialog.h
+    src/YtdlpDownloadDialog.cpp
+    src/YtdlpDownloader.h
+    src/YtdlpDownloader.cpp
+    src/YoutubeChapterGen.h
+    src/YoutubeChapterGen.cpp
+    src/selftests/ytdlp_downloader_selftest.cpp
+    src/selftests/premiere_xml_selftest.cpp
+    src/selftests/youtube_chapter_selftest.cpp
+    src/selftests/auto_clip_gen_selftest.cpp
+    src/selftests/command_search_selftest.cpp
+    src/selftests/import_ingest_selftest.cpp
+    src/selftests/media_pool_selftest.cpp
+    src/selftests/three_point_edit_selftest.cpp
+    src/selftests/trim_ops_selftest.cpp
+    src/CommandSearch.h
+    src/CommandSearch.cpp
+    src/MediaPool.h
+    src/MediaPool.cpp
+    src/MediaPoolDock.cpp
+    # SM (ソースモニター3点編集): 純粋エンジン + ドック (SM-2 で本体実装)。
+    src/ThreePointEdit.h
+    src/ThreePointEdit.cpp
+    # TR (トリムツール): Ripple/Roll/Slip/Slide の純粋計算エンジン。
+    src/TrimOps.h
+    src/TrimOps.cpp
+    # AB (オーディオバス): Fairlight 風バス/サブミックス/AUXセンドの純粋エンジン。
+    src/AudioBusRouting.h
+    src/AudioBusRouting.cpp
+    src/audio/AutoDucking.h
+    src/audio/AutoDucking.cpp
+    src/playback/AudioPan.h
+    src/playback/smartrender_flag.h
+    src/SilenceCut.cpp
+    src/BeatDetect.cpp
+    src/AudioBusPanel.cpp
+    src/selftests/audio_bus_selftest.cpp
+    src/selftests/AutoDuckingSelftest.cpp
+    src/selftests/AudioChannelMapSelftest.cpp
+    src/selftests/StereoPanSelftest.cpp
+    src/selftests/ExportRangeSelftest.cpp
+    src/selftests/CapcutCaptionSelftest.cpp
+    src/selftests/AutoColorSelftest.cpp
+    src/selftests/LayerStyleSelftest.cpp
+    src/selftests/LayerStyleUiSelftest.cpp
+    src/selftests/RightclickPausePrefSelftest.cpp
+    src/selftests/WbEyedropperSelftest.cpp
+    src/selftests/SubtitleCpsSelftest.cpp
+    src/selftests/RgbParadeSelftest.cpp
+    src/selftests/atempo_resolve_selftest.cpp
+    src/selftests/silence_cut_selftest.cpp
+    src/selftests/beat_detect_selftest.cpp
+    src/selftests/safe_zone_selftest.cpp
+    src/selftests/onion_skin_selftests.cpp
+    src/SafeZone.h
+    src/SafeZone.cpp
+    src/OnionSkin.h
+    src/OnionSkin.cpp
+    src/selftests/subtitle_karaoke_selftest.cpp
+    # SP (スペクトル編集): iZotope RX 風 STFT/iSTFT 純粋エンジン + スペクトログラム UI。
+    src/SpectralEngine.h
+    src/SpectralEngine.cpp
+    src/SpectrogramWidget.cpp
+    src/SpectralEditDialog.cpp
+    src/selftests/spectral_edit_selftest.cpp
+    # AC (ACES シーンリファード色管理): 自前行列 ACES 中核変換 + 色管理 Dialog。
+    src/AcesColor.h
+    src/AcesColor.cpp
+    src/ColorManagementDialog.cpp
+    src/selftests/aces_color_selftest.cpp
+    # DV (Dolby Vision): PQ ST.2084 + 動的メタデータモデル + Dolby Vision XML 生成 + Dialog。
+    src/DolbyVisionMetadata.h
+    src/DolbyVisionMetadata.cpp
+    src/color/DvTimelineBuilder.h
+    src/color/DvTimelineBuilder.cpp
+    src/DolbyVisionDialog.cpp
+    src/selftests/dolby_vision_selftest.cpp
+    src/selftests/dv_timeline_selftest.cpp
+    # CC (放送 CC): CEA-608/708 + SCC サイドカー純粋エンジン + 編集 Dialog。
+    src/BroadcastCaption.h
+    src/BroadcastCaption.cpp
+    src/BroadcastCaptionDialog.cpp
+    src/selftests/broadcast_caption_selftest.cpp
+    # AM (AutoMatte): グリーンバック不要の自動マッティング純粋エンジン + 編集 Dialog。
+    src/AutoMatte.h
+    src/AutoMatte.cpp
+    src/AutoMatteDialog.cpp
+    src/selftests/auto_matte_selftest.cpp
+    # ED (EDL エクスポート): CMX3600 EDL の純粋書き出しエンジン (放送/Avid/DaVinci 互換)。
+    src/EdlExport.h
+    src/EdlExport.cpp
+    src/selftests/edl_export_selftest.cpp
+    # WS (ワークスペース): 名前付きドックレイアウトの純粋モデル (Premiere/Resolve 相当)。
+    src/WorkspaceManager.h
+    src/WorkspaceManager.cpp
+    src/selftests/workspace_selftest.cpp
+    # TB (テキストベース編集): 文字起こし駆動編集の純粋エンジン (Premiere/Descript 相当)。
+    src/TextBasedEdit.h
+    src/TextBasedEdit.cpp
+    src/TextBasedEditDialog.cpp
+    src/selftests/text_based_edit_selftest.cpp
+    # PPTX (スライド書き出し): OOXML パートツリー + store-ZIP の純粋エンジン。
+    src/PptxExport.h
+    src/PptxExport.cpp
+    src/PptxExportDialog.cpp
+    src/selftests/pptx_export_selftest.cpp
+    # ASC CDL (.cc/.ccc/.cdl 書き出し): ASC CDL v1.01 SOP/Sat の純粋エンジン。
+    src/colorexport/AscCdlExport.h
+    src/colorexport/AscCdlExport.cpp
+    src/color/ClipColor.h
+    src/color/ClipColor.cpp
+    src/color/ClipColorTransform.h
+    src/color/ClipColorTransform.cpp
+    src/color/ClipOdt.h
+    src/color/ClipOdt.cpp
+    src/color/SwsColorParams.h
+    src/color/SwsColorParams.cpp
+    src/AscCdlExportDialog.h
+    src/AscCdlExportDialog.cpp
+    src/selftests/asc_cdl_export_selftest.cpp
+    src/selftests/clip_color_selftest.cpp
+    src/selftests/ClipCurvesSelftest.cpp
+    src/selftests/HslSecondarySelftest.cpp
+    src/selftests/ClipLutSelftest.cpp
+    src/selftests/ColorMatchApplySelftest.cpp
+    src/selftests/clip_idt_selftest.cpp
+    src/selftests/clip_odt_selftest.cpp
+    src/selftests/sws_color_selftest.cpp
+    # Playback quality/cache (マルチトラック再生強化): CompositeFrameCache + PlaybackQualityPolicy。
+    src/playback/CompositeFrameCache.h
+    src/playback/CompositeFrameCache.cpp
+    src/playback/PlaybackQualityPolicy.h
+    src/playback/PlaybackQualityPolicy.cpp
+    src/playback/SnsFit.h
+    src/playback/SnsFit.cpp
+    src/selftests/composite_frame_cache_selftests.cpp
+    src/selftests/playback_quality_policy_selftests.cpp
+    src/selftests/sns_fit_selftest.cpp
+    src/selftests/clip_parent_parity_selftest.cpp
+    src/playback/AutoProxyPolicy.h
+    src/playback/AutoProxyPolicy.cpp
+    src/selftests/auto_proxy_policy_selftests.cpp
+    # EA (露出/フォーカス確認エイド): False Color / Zebra / Focus Peaking のプレビュー専用純粋エンジン。
+    src/ExposureAids.h
+    src/ExposureAids.cpp
+    src/selftests/exposure_aids_selftests.cpp
+    # GPU compositor math (Stage 1 dormant pure engine + headless selftest)。
+    src/selftests/gpu_composite_flag_selftest.cpp
+    src/playback/GpuCompositeMath.h
+    src/playback/GpuCompositeMath.cpp
+    src/selftests/gpu_composite_math_selftests.cpp
+    # HDR 16-bit compositor math (dormant pure reference engine + headless selftest)。
+    src/playback/HdrCompositeMath.h
+    src/playback/HdrCompositeMath.cpp
+    src/selftests/hdr_composite_math_selftests.cpp
+    src/playback/hdrexport16_flag.h
+    src/playback/motionblur_flag.h
+    src/playback/hdroverlay_flag.h
+    src/playback/clipidt_flag.h
+    src/playback/idtgpu_flag.h
+    src/playback/dvxml_flag.h
+    src/playback/TlrCompose16.h
+    src/playback/TlrCompose16.cpp
+    # Stage10: ingest-time ColorMeta auto-populate (flag) + pixfmt bit-depth helper
+    src/playback/hdringest_flag.h
+    src/playback/PixFmtDepth.h
+    src/playback/PixFmtDepth.cpp
+    src/playback/HdrIngestProbe.cpp
+    src/selftests/hdr_export16_selftest.cpp
+    src/selftests/hdr_ingest_colormeta_selftest.cpp
+    src/selftests/hdr_overlay_policy_selftest.cpp
+    src/selftests/preview16_policy_selftest.cpp
+    # Stage7: 16-bit RGBA64 track-matte compositor + parity selftest
+    src/playback/hdrmatte16_flag.h
+    src/playback/swsmatrix_flag.h
+    src/playback/TrackMatteCompose16.h
+    src/playback/TrackMatteCompose16.cpp
+    src/selftests/matte16_parity_selftests.cpp
+    # GPU layer compositor (Stage 2 offscreen-FBO compositor + GPU/CPU parity selftest)。
+    src/playback/GpuLayerCompositor.h
+    src/playback/GpuLayerCompositor.cpp
+    src/selftests/gpu_composite_parity_selftests.cpp
+    # Stage8: GPU 16-bit track-matte (composite16Matte) + parity
+    src/selftests/gpu_composite_parity16_matte_selftest.cpp
+    # Stage9: GPU IDT matte parity shares the GPU IDT parity translation unit
+    src/selftests/gpu_idt_parity_selftest.cpp
+    # GPU RGBA16 (16-bit HDR) compositor parity selftest (Stage4C HDR-2: composite16 vs HdrCompositeMath oracle)。
+    src/selftests/hdr_composite_parity_selftests.cpp
+    # Live track-matte index resolver (STAGE4B data plumbing + headless selftest)。
+    src/playback/LiveMatteResolve.h
+    src/playback/LiveMatteResolve.cpp
+    src/selftests/live_matte_resolve_selftests.cpp
+    src/SourceMonitorDock.cpp
+    src/MarkerPanelDock.cpp
+    src/CommandPaletteDialog.h
+    src/CommandPaletteDialog.cpp
+    src/CredentialStore.cpp
     src/EffectControlsPanel.h
     src/EffectControlsPanel.cpp
+    src/GraphEditorPanel.h
+    src/GraphEditorPanel.cpp
+    src/selftests/GraphEditorSelftest.cpp
+    src/selftests/RippleDeleteSelftest.cpp
+    src/selftests/FreezeFrameSelftest.cpp
     src/MotionSectionWidget.h
     src/MotionSectionWidget.cpp
+    src/MotionPreset.h
+    src/MotionPreset.cpp
     src/EffectRowWidget.h
     src/EffectRowWidget.cpp
     src/EffectKeyframeNavBar.h
@@ -125,23 +445,48 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/GradientStopBar.cpp
     src/EffectPreset.cpp
     src/SubtitleGenerator.cpp
+    src/SubtitleKaraoke.h
+    src/SubtitleKaraoke.cpp
     src/SubtitleTrackRenderer.h
     src/SubtitleTrackRenderer.cpp
     src/MagneticTimeline.h
     src/MagneticTimeline.cpp
     src/CaptionTrack.h
     src/CaptionTrack.cpp
+    src/CaptionCps.h
     src/CaptionStyle.h
     src/CaptionStyle.cpp
     src/SubtitleIO.h
     src/SubtitleIO.cpp
     src/CaptionEditorDialog.h
     src/CaptionEditorDialog.cpp
+    src/TranscriptHighlighter.h
+    src/TranscriptHighlighter.cpp
+    src/TranscriptHighlightDialog.h
+    src/TranscriptHighlightDialog.cpp
     src/SpeechRecognizer.h
     src/SpeechRecognizer.cpp
+    src/WhisperTranscriber.h
+    src/WhisperTranscriber.cpp
+    src/selftests/WhisperWordTimingSelftest.cpp
+    src/WhisperTranscribeDialog.h
+    src/WhisperTranscribeDialog.cpp
+    src/selftests/whisper_transcribe_selftest.cpp
+    src/selftests/transcript_highlighter_selftest.cpp
+    src/selftests/transcript_highlighter_offline_selftest.cpp
     src/MotionTracker.cpp
+    src/MotionTrackerDialog.h
+    src/MotionTrackerDialog.cpp
     src/MotionStabilizer.cpp
     src/TrackerLink.cpp
+    src/TrackerPreset.h
+    src/TrackerPreset.cpp
+    src/PlanarTrackerPreset.h
+    src/PlanarTrackerPreset.cpp
+    src/PlanarTrackerPresetRegistry.h
+    src/PlanarTrackerPresetRegistry.cpp
+    src/TrackerPresetRegistry.h
+    src/TrackerPresetRegistry.cpp
     src/NoiseReduction.cpp
     src/ResourceGuide.cpp
     src/AutoSave.cpp
@@ -196,6 +541,10 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/VoiceOverDialog.h
     src/VoiceOverDialog.cpp
     src/AIHighlight.cpp
+    src/AutoClipGenerator.h
+    src/AutoClipGenerator.cpp
+    src/AutoClipDialog.h
+    src/AutoClipDialog.cpp
     src/AIMask.h
     src/AIMask.cpp
     src/AIMaskDialog.h
@@ -347,6 +696,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     # Sprint 16 — Unified import hub (US-INT-1)
     src/ImportHubDialog.h
     src/ImportHubDialog.cpp
+    src/ImportIngest.h
+    src/ImportIngest.cpp
 
     # Sprint 18 — Collaboration (US-COL-1 / US-COL-2 / US-COL-4)
     src/CollaborationModel.h
@@ -508,12 +859,13 @@ endif()
 if(WIN32)
     # opengl32 — needed for wglGetCurrentDC and the WGL_NV_DX_interop2 entry
     # points (Phase 1e). Qt6::OpenGL is the Qt wrapper, not the system GL.
-    target_link_libraries(${PROJECT_NAME} PRIVATE dbghelp opengl32)
+    target_link_libraries(${PROJECT_NAME} PRIVATE dbghelp opengl32 advapi32)
 endif()
 
 target_compile_definitions(${PROJECT_NAME} PRIVATE
     APP_VERSION="${PROJECT_VERSION}"
     VEDITOR_EDITION="${VEDITOR_EDITION}"
+    VEDITOR_LIBAVCORE_WITH_QIMAGE=1
     $<$<BOOL:${VEDITOR_PLANAR_TRACKER_SELFTEST}>:VEDITOR_PLANAR_TRACKER_SELFTEST=1>
     $<$<BOOL:${VEDITOR_EFFECT_PARAM_SCHEMA_SELFTEST}>:VEDITOR_EFFECT_PARAM_SCHEMA_SELFTEST=1>
     $<$<BOOL:${VEDITOR_BRUSH_SELFTEST}>:VEDITOR_BRUSH_SELFTEST=1>

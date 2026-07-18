@@ -20,6 +20,7 @@ struct ProjectConfig {
     int width = 1920;
     int height = 1080;
     int fps = 60;
+    bool explicitOutputResolution = false;
 
     double aspectRatio() const { return static_cast<double>(width) / height; }
     QString resolutionLabel() const { return QString("%1x%2").arg(width).arg(height); }

@@ -6,6 +6,12 @@
 #include <QProcess>
 #include "TextManager.h"
 
+struct SubtitleWord {
+    QString text;
+    double startTime = 0.0; // seconds
+    double endTime = 0.0;
+};
+
 // Single subtitle segment from speech recognition
 struct SubtitleSegment {
     double startTime = 0.0;   // seconds
@@ -13,6 +19,7 @@ struct SubtitleSegment {
     QString text;
     QString language;
     double confidence = 0.0;  // 0.0-1.0
+    QVector<SubtitleWord> words; // optional per-word timing (empty = segment-level only)
 };
 
 // Whisper configuration

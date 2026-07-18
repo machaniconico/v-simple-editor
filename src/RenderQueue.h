@@ -6,7 +6,13 @@
 #include <QVector>
 #include <QDateTime>
 #include <QJsonObject>
-#include <QProcess>
+#include <QMutex>
+
+#include "AcesColor.h"  // AC: ACES カラーマネジメント パイプライン (production export 配線)
+
+class QThread;
+class QProcess;
+class Timeline;
 
 enum class RenderJobStatus {
     Pending,
@@ -44,10 +50,24 @@ struct RenderJob {
 
     // Legacy fields (still populated for backwards compatibility).
     QJsonObject exportConfig;
+    double loudnessGainDb = 0.0;
+    QString dolbyVisionXml;
     int progress = 0;
     QDateTime startTime;
     QDateTime endTime;
     QString errorMessage;
+
+    // S8 (NLE-parity): additive, NON-persisted in-memory render seam. When a
+    // caller already holds a live edit-graph Timeline (the parity selftest, or
+    // any in-process exporter), it can point this at it so RenderQueue renders
+    // THAT timeline through tlrender::renderFrameAt directly. Mirrors the exact
+    // additive pattern ClipInfo::lutFilePath / ClipInfo::maskSystem use
+    // (Timeline.h:108-138): saveQueue/loadQueue and the JSON round-trip never
+    // touch it. When null (every production / dialog caller — RenderQueueDialog
+    // leaves it unset), RenderQueue loads `projectFilePath` into a Timeline via
+    // the genuine ProjectFile::load + Timeline::restoreFromProject path. NOT
+    // owned by RenderJob; the caller guarantees the pointee outlives the job.
+    Timeline *timeline = nullptr;
 
     // Convenience accessor — returns the spec's lowercase status string.
     QString statusString() const {
@@ -89,6 +109,15 @@ public:
     bool isRunning() const { return m_running; }
     void start();   // process pending jobs sequentially
     void stop();    // cancel current and stop queue
+
+    // AC: production export 経路 (RenderQueue→tlrender::renderFrameAt) に適用する
+    // ACES カラーマネジメント パイプラインを設定する。MainWindow の SSOT
+    // m_acesPipeline を start() 前に push する想定 (UI スレッドから呼ばれる)。
+    // enabled=false (既定) のときレンダーワーカーは一切適用せずビット同一。
+    void setAcesPipeline(const aces::AcesPipeline &p);
+    void setLoudnessGainDb(double gainDb);
+
+    static QStringList buildLoudnessAudioFilterArgs(double gainDb);
 
     static QVector<RenderPreset> availablePresets();
     static RenderJob jobFromPreset(const RenderPreset &preset,
@@ -139,18 +168,82 @@ signals:
 
 private:
     void startNextJob();
-    QStringList buildFFmpegArgs(const RenderJob &job) const;
-    void parseFFmpegOutput(const QString &line);
+    // S8/US-MF-5: the SSOT render-pipe. Renders every output frame of `job`
+    // through tlrender::renderFrameAt and feeds flattened RGB24 frames into
+    // libavcore::FrameEncoder in-process. Runs on a worker QThread so the
+    // queue stays responsive; emits jobProgress per frame and finishes via
+    // finishCurrentJob().
+    //
+    // US-MF-6 / US-B3-7: startRenderPipe is a 3-way dispatcher.
+    //   1) 8-bit jobs (H.264 / H.265 / ProRes / AV1) → in-process
+    //      libavcore::FrameEncoder path (unchanged from US-MF-5).
+    //   2) 10-bit HDR (HDR10 / HLG) AND the loaded avcodec DLL exposes a
+    //      10-bit HEVC encoder (libavcore::tenBitHevcEncoderAvailable
+    //      returns true) → in-process FrameEncoder path with
+    //      videoCodecName overridden to libavcore::firstTenBitHevcEncoder()
+    //      and isHdr10/isHlg + hdrMaster* populated. FrameEncoder writes
+    //      a genuine 10-bit HEVC yuv420p10le stream with BT.2020/PQ|HLG
+    //      colour signalling.
+    //   3) 10-bit HDR but the DLL has no 10-bit HEVC encoder (the bundled
+    //      avcodec-62.dll: libx264/libx265 absent, h264_mf/hevc_mf 8-bit
+    //      only) → startRenderPipeSubprocess fallback (ffmpeg.exe QProcess
+    //      encode, rawvideo rgb24 stdin → libx265 yuv420p10le + the genuine
+    //      BT.2020/PQ|HLG HDR metadata). Drop-in replacing the bundled DLL
+    //      with a libx265-enabled build flips HDR jobs to the in-process
+    //      path automatically — no recompile needed.
+    void startRenderPipe(int jobIndex);
+    // US-MF-6 / US-B3-7: ffmpeg.exe subprocess encode for 10-bit HDR
+    // (HDR10 / HLG) jobs — reached only when no 10-bit HEVC encoder is
+    // available in the loaded avcodec DLL. A worker QThread renders every
+    // frame via tlrender::renderFrameAt and streams flattened rgb24 to
+    // ffmpeg's stdin; ffmpeg encodes libx265 main10 yuv420p10le with the
+    // HDR10/HLG colour signalling + master-display / MaxCLL params (sourced
+    // from libavcore::hdr10MasterDisplayString — the SSOT shared with the
+    // in-process FrameEncoder), muxing the source audio. Finishes via
+    // finishCurrentJob().
+    void startRenderPipeSubprocess(int jobIndex);
+    void finishCurrentJob(bool success, const QString &errorMsg);
     int findJobIndex(int id) const;
     int findJobIndexByUuid(const QString &uuid) const;
-    static QString mapCodecToFFmpeg(const QString &codec);
+    static QString mapCodecToEncoderName(const QString &codec);
     static QString defaultContainerFor(const QString &codec);
+    // US-MF-6 / US-B3-7: locate the ffmpeg.exe binary for the HDR subprocess
+    // fallback branch. PATH first, then app dir, %LOCALAPPDATA%\Microsoft\
+    // WinGet\Links, C:\ffmpeg\bin, and the macOS/Linux install dirs.
+    static QString findFFmpegBinary();
+    // Resolve the Timeline a job renders: the in-memory job.timeline seam if
+    // set, otherwise ProjectFile::load(projectFilePath) -> a freshly built
+    // Timeline via Timeline::restoreFromProject. `*ownedOut` receives a
+    // heap Timeline the caller must delete (only when loaded from file);
+    // null when job.timeline was used.
+    static Timeline *resolveTimeline(const RenderJob &job, Timeline **ownedOut);
 
     QVector<RenderJob> m_jobs;
-    QProcess *m_process = nullptr;
     int m_nextId = 1;
     int m_currentJobIndex = -1;
     bool m_running = false;
     bool m_paused = false;
-    double m_currentDuration = 0.0;  // total duration in seconds for progress parsing
+
+    // S8 render-pipe worker state. m_renderThread runs the synchronous
+    // frame-render + in-process encode loop; m_cancelRequested is the cross-thread
+    // cancellation flag (mirrors VideoStabilizer::m_cancelled).
+    QThread *m_renderThread = nullptr;
+    bool m_cancelRequested = false;
+
+    // US-MF-6: ffmpeg.exe subprocess handle for the 10-bit HDR (HDR10/HLG)
+    // render branch. Only the HDR subprocess path sets this; the in-process
+    // FrameEncoder path leaves it null. m_processMutex guards it so
+    // cancelCurrent() / ~RenderQueue() can kill the encoder from the queue
+    // thread while the worker thread owns it.
+    QMutex m_processMutex;
+    QProcess *m_process = nullptr;
+
+    // AC: production export 経路に適用する ACES パイプライン (SSOT は MainWindow
+    // の m_acesPipeline)。setAcesPipeline は UI スレッドから start() 前に呼ばれ、
+    // レンダーワーカーはフレームループ開始前に 1 度だけスナップショットを取る。
+    // 設定とスナップショット取得を m_acesMutex で保護する (Exporter の前例に倣う)。
+    mutable QMutex m_acesMutex;
+    aces::AcesPipeline m_acesPipeline;
+
+    double m_loudnessGainDb = 0.0;
 };

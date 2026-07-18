@@ -1,106 +1,56 @@
 #include "Exporter.h"
 #include "CodecDetector.h"
+#include "PremiereXmlExporter.h"
 #include "VideoEffect.h"
 #include "SmartReframe.h"
 #include "SubtitleTrackRenderer.h"
+#include "AcesColor.h"  // AR-2: ACES シーンリファード色管理パイプライン
+#include "libavcore/Encode.h"
+#include "color/SwsColorParams.h"
+#include "playback/swsmatrix_flag.h"
 #include <QFileInfo>
+#include <QMutex>
+#include <QMutexLocker>
 #include <QPainter>
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <cmath>
 
 extern "C" {
-#include <libavutil/audio_fifo.h>
-#include <libavutil/channel_layout.h>
-#include <libavutil/samplefmt.h>
+#include <libavutil/imgutils.h>
 }
 
-// ---------------------------------------------------------------------------
-// Helper: build x265-params HDR10 metadata string (BT.2020 primaries / D65).
-// Primaries per Rec.2020 (ITU-R BT.2020) × 50000 (x265 unit = 0.00002):
-//   R (0.708, 0.292) → (35400, 14600)
-//   G (0.170, 0.797) → ( 8500, 39850)
-//   B (0.131, 0.046) → ( 6550,  2300)
-//   WP D65 (0.3127, 0.3290) → (15635, 16450)
-// ---------------------------------------------------------------------------
+// AR-2: ACES 色管理パイプラインを Exporter (LEGACY パス) へ渡す手段。Exporter.h は
+// 本ストーリーの touchedFiles 外なので、ヘッダを変更せずに済むよう TU ローカルの
+// グローバルとフリー関数セッターで受け取る。setter は UI thread、doExport は
+// worker thread で走るため、読み書きは mutex で保護し、export 開始時に snapshot
+// して以後はローカルコピーだけを読む。
+// 既定 enabled=false のため、未設定/無効時はエクスポート出力が従来とビット同一
+// (回帰ゼロ)。
 namespace {
-static QByteArray buildX265Hdr10Params(const HDRSettings& hdr)
+QMutex g_exporterAcesPipelineMutex;
+aces::AcesPipeline g_exporterAcesPipeline;
+QMutex g_exporterLoudnessMutex;
+double g_exporterLoudnessGainDb = 0.0;
+
+aces::AcesPipeline exporterAcesPipelineSnapshot()
 {
-    const int maxLumX10000 = static_cast<int>(std::round(hdr.masterDisplayLuminanceMax * 10000));
-    const int minLumX10000 = static_cast<int>(std::round(hdr.masterDisplayLuminanceMin * 10000));
-    QByteArray s;
-    s.append("hdr10=1:repeat-headers=1:colorprim=bt2020:"
-             "transfer=smpte2084:colormatrix=bt2020nc:range=limited:"
-             "master-display=G(8500,39850)B(6550,2300)R(35400,14600)"
-             "WP(15635,16450)L(");
-    s.append(QByteArray::number(maxLumX10000));
-    s.append(',');
-    s.append(QByteArray::number(minLumX10000));
-    s.append("):max-cll=");
-    s.append(QByteArray::number(hdr.maxCll));
-    s.append(',');
-    s.append(QByteArray::number(hdr.maxFall));
-    return s;
+    QMutexLocker locker(&g_exporterAcesPipelineMutex);
+    return g_exporterAcesPipeline;
 }
 
-static AVSampleFormat selectAudioSampleFormat(const AVCodec *codec)
+double exporterLoudnessGainSnapshot()
 {
-    if (!codec || !codec->sample_fmts)
-        return AV_SAMPLE_FMT_FLTP;
-
-    for (const AVSampleFormat *fmt = codec->sample_fmts; *fmt != AV_SAMPLE_FMT_NONE; ++fmt) {
-        if (*fmt == AV_SAMPLE_FMT_FLTP)
-            return *fmt;
-    }
-
-    return codec->sample_fmts[0];
+    QMutexLocker locker(&g_exporterLoudnessMutex);
+    return g_exporterLoudnessGainDb;
 }
 
-static int selectAudioSampleRate(const AVCodec *codec, int preferredRate)
-{
-    if (preferredRate <= 0)
-        preferredRate = 48000;
-    if (!codec || !codec->supported_samplerates)
-        return preferredRate;
-
-    int best = codec->supported_samplerates[0];
-    int bestDiff = std::abs(best - preferredRate);
-    for (const int *rate = codec->supported_samplerates; *rate; ++rate) {
-        const int diff = std::abs(*rate - preferredRate);
-        if (diff < bestDiff) {
-            best = *rate;
-            bestDiff = diff;
-        }
-    }
-    return best;
-}
-
-static bool probeFirstAudioStream(const QVector<ClipInfo> &clips, int &sampleRate)
-{
-    sampleRate = 48000;
-    for (const auto &clip : clips) {
-        AVFormatContext *fmt = nullptr;
-        if (avformat_open_input(&fmt, clip.filePath.toUtf8().constData(), nullptr, nullptr) < 0)
-            continue;
-
-        bool found = false;
-        if (avformat_find_stream_info(fmt, nullptr) >= 0) {
-            const int idx = av_find_best_stream(fmt, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
-            if (idx >= 0) {
-                AVCodecParameters *par = fmt->streams[idx]->codecpar;
-                if (par->sample_rate > 0)
-                    sampleRate = par->sample_rate;
-                found = true;
-            }
-        }
-        avformat_close_input(&fmt);
-        if (found)
-            return true;
-    }
-    return false;
-}
-
-static void fillOpaqueAlphaPlane(AVFrame *frame)
+// US-104: ProRes4444 (YUVA444P10LE) の alpha プレーンを不透明で初期化する。
+// libswscale がアルファなしソースから YUVA へスケールする際に alpha プレーンを
+// 埋めないケースがあり、そのままだと ProRes4444 出力の透過がゴミになる。対象
+// フォーマット以外では no-op。
+void fillOpaqueAlphaPlane(AVFrame *frame)
 {
     if (!frame || frame->format != AV_PIX_FMT_YUVA444P10LE || !frame->data[3])
         return;
@@ -111,116 +61,46 @@ static void fillOpaqueAlphaPlane(AVFrame *frame)
     }
 }
 
-static void applyAudioGain(uint8_t **data, AVSampleFormat fmt, int channels, int samples, double gain)
+bool scaleFrameToQImagePadded(SwsContext *ctx,
+                              const AVFrame *frame,
+                              AVPixelFormat dstPixFmt,
+                              QImage &image)
 {
-    if (!data || channels <= 0 || samples <= 0 || std::abs(gain - 1.0) < 0.000001)
-        return;
-
-    const bool planar = av_sample_fmt_is_planar(fmt);
-    const AVSampleFormat packedFmt = av_get_packed_sample_fmt(fmt);
-    const int planes = planar ? channels : 1;
-    const int samplesPerPlane = planar ? samples : samples * channels;
-
-    for (int plane = 0; plane < planes; ++plane) {
-        if (!data[plane])
-            continue;
-
-        switch (packedFmt) {
-        case AV_SAMPLE_FMT_FLT: {
-            auto *dst = reinterpret_cast<float *>(data[plane]);
-            for (int i = 0; i < samplesPerPlane; ++i)
-                dst[i] = static_cast<float>(dst[i] * gain);
-            break;
-        }
-        case AV_SAMPLE_FMT_DBL: {
-            auto *dst = reinterpret_cast<double *>(data[plane]);
-            for (int i = 0; i < samplesPerPlane; ++i)
-                dst[i] *= gain;
-            break;
-        }
-        case AV_SAMPLE_FMT_S16: {
-            auto *dst = reinterpret_cast<int16_t *>(data[plane]);
-            for (int i = 0; i < samplesPerPlane; ++i) {
-                const int scaled = static_cast<int>(std::lrint(dst[i] * gain));
-                dst[i] = static_cast<int16_t>(std::clamp(scaled, -32768, 32767));
-            }
-            break;
-        }
-        case AV_SAMPLE_FMT_S32: {
-            auto *dst = reinterpret_cast<int32_t *>(data[plane]);
-            for (int i = 0; i < samplesPerPlane; ++i) {
-                const double scaled = dst[i] * gain;
-                dst[i] = static_cast<int32_t>(std::clamp(scaled,
-                                                        static_cast<double>(INT32_MIN),
-                                                        static_cast<double>(INT32_MAX)));
-            }
-            break;
-        }
-        default:
-            break;
-        }
-    }
-}
-
-static bool writeAudioPackets(AVFormatContext *outFmt, AVCodecContext *encCtx, AVStream *stream)
-{
-    AVPacket *packet = av_packet_alloc();
-    if (!packet)
+    if (!ctx || !frame || image.isNull())
         return false;
 
-    bool ok = true;
-    while (avcodec_receive_packet(encCtx, packet) == 0) {
-        av_packet_rescale_ts(packet, encCtx->time_base, stream->time_base);
-        packet->stream_index = stream->index;
-        if (av_interleaved_write_frame(outFmt, packet) < 0)
-            ok = false;
-        av_packet_unref(packet);
-    }
-
-    av_packet_free(&packet);
-    return ok;
-}
-
-static bool encodeAudioFifo(AVFormatContext *outFmt, AVCodecContext *encCtx, AVStream *stream,
-                            AVAudioFifo *fifo, bool drainAll, int64_t &audioPts)
-{
-    if (!outFmt || !encCtx || !stream || !fifo)
+    const int rowBytes = av_image_get_linesize(dstPixFmt, image.width(), 0);
+    if (rowBytes <= 0 || rowBytes > image.bytesPerLine())
         return false;
 
-    const int frameSize = encCtx->frame_size > 0 ? encCtx->frame_size : 1024;
-    bool ok = true;
+    uint8_t *tmpData[4] = { nullptr, nullptr, nullptr, nullptr };
+    int tmpStride[4] = { 0, 0, 0, 0 };
+    if (av_image_alloc(tmpData, tmpStride, image.width(), image.height(),
+                       dstPixFmt, 64) < 0)
+        return false;
 
-    while (av_audio_fifo_size(fifo) >= frameSize || (drainAll && av_audio_fifo_size(fifo) > 0)) {
-        const int samples = drainAll ? qMin(av_audio_fifo_size(fifo), frameSize) : frameSize;
-        AVFrame *frame = av_frame_alloc();
-        if (!frame)
-            return false;
-
-        frame->nb_samples = samples;
-        frame->format = encCtx->sample_fmt;
-        frame->sample_rate = encCtx->sample_rate;
-        av_channel_layout_copy(&frame->ch_layout, &encCtx->ch_layout);
-
-        if (av_frame_get_buffer(frame, 0) < 0
-            || av_audio_fifo_read(fifo, reinterpret_cast<void **>(frame->data), samples) < samples) {
-            av_frame_free(&frame);
-            return false;
-        }
-
-        frame->pts = audioPts;
-        audioPts += samples;
-
-        if (avcodec_send_frame(encCtx, frame) == 0)
-            ok = writeAudioPackets(outFmt, encCtx, stream) && ok;
-        else
-            ok = false;
-
-        av_frame_free(&frame);
+    sws_scale(ctx, frame->data, frame->linesize, 0, frame->height,
+              tmpData, tmpStride);
+    for (int y = 0; y < image.height(); ++y) {
+        std::memcpy(image.scanLine(y), tmpData[0] + y * tmpStride[0],
+                    static_cast<std::size_t>(rowBytes));
     }
-
-    return ok;
+    av_freep(&tmpData[0]);
+    return true;
 }
-} // namespace
+}
+
+// MainWindow.cpp から extern 宣言で参照される。
+void exporter_setAcesPipeline(const aces::AcesPipeline &pipeline)
+{
+    QMutexLocker locker(&g_exporterAcesPipelineMutex);
+    g_exporterAcesPipeline = pipeline;
+}
+
+double exporter_loudnessGainDb()
+{
+    return exporterLoudnessGainSnapshot();
+}
 
 Exporter::Exporter(QObject *parent)
     : QObject(parent)
@@ -239,17 +119,25 @@ void Exporter::setSubtitleRenderer(SubtitleTrackRenderer *renderer)
 
 void Exporter::setLoudnessGainDb(double gainDb)
 {
-    m_loudnessGainDb = gainDb;
+    m_loudnessGainDb = std::isfinite(gainDb) ? gainDb : 0.0;
+    QMutexLocker locker(&g_exporterLoudnessMutex);
+    g_exporterLoudnessGainDb = m_loudnessGainDb;
 }
 
 void Exporter::cancel()
 {
-    m_cancelled.store(true);
+    m_cancelled = true;
 }
 
 void Exporter::startExport(const ExportConfig &config, const QVector<ClipInfo> &clips)
 {
-    m_cancelled.store(false);
+    m_cancelled = false;
+    const double loudnessGainDb = m_loudnessGainDb;
+    {
+        QMutexLocker locker(&g_exporterLoudnessMutex);
+        g_exporterLoudnessGainDb = std::isfinite(loudnessGainDb)
+            ? loudnessGainDb : 0.0;
+    }
     m_thread = QThread::create([this, config, clips]() {
         doExport(config, clips);
     });
@@ -301,8 +189,20 @@ bool Exporter::openInputFile(const QString &path, AVFormatContext **fmtCtx, AVCo
     return true;
 }
 
+// LEGACY — bypasses the SSOT edit graph; do not use for new code.
+// Production export goes RenderQueue -> tlrender::renderFrameAt (S8). This
+// CPU-only transcode applies a hard-coded effect subset and skips the graph
+// for 10-bit/HDR/ProRes. No UI action reaches this as of S12 (File->Export
+// and Mobile Export now route through RenderQueue). See progress.txt S12.
 void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &clips)
 {
+    const aces::AcesPipeline exporterAcesPipeline = exporterAcesPipelineSnapshot();
+    const double loudnessGainDb = exporterLoudnessGainSnapshot();
+    if (std::fabs(loudnessGainDb) > 0.0005) {
+        qInfo() << "Exporter legacy path received loudness gain"
+                << loudnessGainDb << "dB";
+    }
+
     if (clips.isEmpty()) {
         emit exportFinished(false, "No clips to export");
         return;
@@ -318,256 +218,74 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
         return;
     }
 
-    // Open output
-    AVFormatContext *outFmt = nullptr;
-    if (avformat_alloc_output_context2(&outFmt, nullptr, nullptr, config.outputPath.toUtf8().constData()) < 0) {
-        emit exportFinished(false, "Failed to create output context");
-        return;
-    }
+    // Resolve effective HDR mode: legacy config.hdr10 flag maps to "hdr10"
+    const bool isHdr10Mode = (config.hdrSettings.mode == "hdr10" || config.hdr10);
+    const bool isHlgMode   = (config.hdrSettings.mode == "hlg");
 
-    // Find encoder — use best available if requested isn't found
+    // Pre-resolve the requested encoder name (best-of-family fallback) so the
+    // helper sees a registered name. This mirrors Exporter's prior behaviour
+    // when config.videoCodec is a family alias like "h264".
     QString resolvedCodec = config.videoCodec;
-    const AVCodec *encoder = avcodec_find_encoder_by_name(resolvedCodec.toUtf8().constData());
-    if (!encoder) {
-        // Auto-detect best encoder for this codec family
+    if (!avcodec_find_encoder_by_name(resolvedCodec.toUtf8().constData())) {
         if (resolvedCodec.contains("264")) resolvedCodec = CodecDetector::bestVideoEncoder("h264");
         else if (resolvedCodec.contains("265") || resolvedCodec.contains("hevc")) resolvedCodec = CodecDetector::bestVideoEncoder("h265");
         else if (resolvedCodec.contains("av1")) resolvedCodec = CodecDetector::bestVideoEncoder("av1");
         else if (resolvedCodec.contains("vp9")) resolvedCodec = CodecDetector::bestVideoEncoder("vp9");
         else resolvedCodec = "libx264";
-        encoder = avcodec_find_encoder_by_name(resolvedCodec.toUtf8().constData());
-    }
-    if (!encoder) {
-        avformat_free_context(outFmt);
-        emit exportFinished(false, "Video encoder not found");
-        return;
     }
 
-    // HW encoder resolution: try hardware path when useHardwareAccel or hwEncoder is set
-    // hwEncoder == "none" forces software only; "" or "auto" means auto-detect
-    bool wantHW = (config.useHardwareAccel || !config.hwEncoder.isEmpty())
-                  && config.hwEncoder != "none";
-    bool isH264Family = (config.videoCodec == "libx264"
-                         || config.videoCodec.contains("264"));
-    bool isH265Family = (config.videoCodec == "libx265"
-                         || config.videoCodec.contains("265")
-                         || config.videoCodec.contains("hevc"));
-    QString hwVendor = config.hwEncoder.toLower(); // "nvenc", "qsv", "amf", "auto", ""
-
-    const AVCodec *hwEncoder = nullptr;
-    QString hwEncoderName;
-
-    if (wantHW && (isH264Family || isH265Family)) {
-        // Build candidate list based on codec family and vendor hint
-        QVector<QString> candidates;
-        if (isH264Family) {
-            if (hwVendor == "nvenc") candidates = {"h264_nvenc"};
-            else if (hwVendor == "qsv") candidates = {"h264_qsv"};
-            else if (hwVendor == "amf") candidates = {"h264_amf"};
-            else candidates = {"h264_nvenc", "h264_qsv", "h264_amf"}; // auto
-        } else {
-            if (hwVendor == "nvenc") candidates = {"hevc_nvenc"};
-            else if (hwVendor == "qsv") candidates = {"hevc_qsv"};
-            else if (hwVendor == "amf") candidates = {"hevc_amf"};
-            else candidates = {"hevc_nvenc", "hevc_qsv", "hevc_amf"}; // auto
-        }
-        for (const QString &candidateName : candidates) {
-            if (CodecDetector::isEncoderAvailable(candidateName)) {
-                hwEncoder = avcodec_find_encoder_by_name(candidateName.toUtf8().constData());
-                if (hwEncoder) {
-                    hwEncoderName = candidateName;
-                    break;
-                }
-            }
-        }
-        if (hwEncoder) {
-            encoder = hwEncoder;
-            resolvedCodec = hwEncoderName;
-            qInfo() << "Exporter: HW encoder selected:" << hwEncoderName;
-        } else {
-            qInfo() << "Exporter: no HW encoder available, falling back to SW encoder";
-        }
-    }
-
-    qInfo() << "Exporter: using encoder" << encoder->name;
-
-    // Resolve audio encoder — auto-detect best AAC if needed
+    // [P1-MINOR-2] Audio mux is NYI in this CPU path — libavcore::Encode does
+    // not yet support audio streams. resolvedAudioCodec is computed for parity
+    // with the previous Exporter behaviour (and so we keep one place where the
+    // best-of-family AAC detection lives) but it is intentionally unused
+    // downstream until audio mux is wired into the libavcore helper.
+#if 0  // parity-only; TODO: enable when libavcore::Encode supports audio
     QString resolvedAudioCodec = config.audioCodec;
     if (resolvedAudioCodec == "aac" || resolvedAudioCodec.isEmpty()) {
         resolvedAudioCodec = CodecDetector::bestAACEncoder();
     }
     if (!CodecDetector::isEncoderAvailable(resolvedAudioCodec)) {
-        resolvedAudioCodec = "aac"; // final fallback
+        resolvedAudioCodec = "aac";
     }
-    int audioSourceSampleRate = 48000;
-    const bool hasSourceAudio = probeFirstAudioStream(clips, audioSourceSampleRate);
-    const AVCodec *audioEncoder = nullptr;
-    AVCodecContext *audioEncCtx = nullptr;
-    AVStream *audioStream = nullptr;
-    if (hasSourceAudio) {
-        audioEncoder = avcodec_find_encoder_by_name(resolvedAudioCodec.toUtf8().constData());
-        if (!audioEncoder) {
-            resolvedAudioCodec = "aac";
-            audioEncoder = avcodec_find_encoder_by_name(resolvedAudioCodec.toUtf8().constData());
-        }
-        if (!audioEncoder) {
-            avformat_free_context(outFmt);
-            emit exportFinished(false, "Audio encoder not found");
-            return;
-        }
-    }
+#endif
 
-    // Create output stream
-    AVStream *outStream = avformat_new_stream(outFmt, nullptr);
-    if (!outStream) {
-        avformat_free_context(outFmt);
-        emit exportFinished(false, "Failed to create output stream");
+    // Open the encoder session via the libavcore helper (HW>SW fallback inside).
+    libavcore::EncodeRequest req;
+    req.width = config.width;
+    req.height = config.height;
+    req.fps = config.fps;
+    req.videoBitrateBits = static_cast<int64_t>(config.videoBitrate) * 1000;
+    req.outputPath = config.outputPath.toUtf8().toStdString();
+    req.videoCodecName = resolvedCodec.toUtf8().toStdString();
+    req.hwVendorHint = config.hwEncoder.toLower().toUtf8().toStdString();
+    req.useHardwareAccel = config.useHardwareAccel;
+    req.isHdr10 = isHdr10Mode;
+    req.isHlg = isHlgMode;
+    req.proresProfile = config.proresProfile;
+    req.hdrMasterMaxNits = config.hdrSettings.masterDisplayLuminanceMax;
+    req.hdrMasterMinNits = config.hdrSettings.masterDisplayLuminanceMin;
+    req.hdrMaxCll = config.hdrSettings.maxCll;
+    req.hdrMaxFall = config.hdrSettings.maxFall;
+
+    // [P1-M1] Restore the legacy Exporter.cpp HW candidate functional probe
+    // (CodecDetector::isEncoderAvailable) that was dropped during the
+    // libavcore refactor. libavcore::FrameEncoder's HW candidate loop now
+    // calls this hook BEFORE avcodec_find_encoder_by_name so a stub-registered
+    // encoder without a working runtime (e.g. NVENC on a non-NVIDIA host) is
+    // skipped exactly like the legacy code path. Qt-side hook keeps the
+    // libavcore header Qt-free.
+    req.encoderAvailableHook = [](const std::string& name) {
+        return CodecDetector::isEncoderAvailable(QString::fromStdString(name));
+    };
+
+    libavcore::FrameEncoder encoderSession;
+    if (auto err = encoderSession.open(req)) {
+        emit exportFinished(false, QString::fromStdString(*err));
         return;
     }
 
-    // Setup encoder context
-    AVCodecContext *encCtx = avcodec_alloc_context3(encoder);
-    encCtx->width = config.width;
-    encCtx->height = config.height;
-    encCtx->time_base = {1, config.fps};
-    encCtx->framerate = {config.fps, 1};
-    // Resolve effective HDR mode: legacy config.hdr10 flag maps to "hdr10"
-    const bool isHdr10Mode = (config.hdrSettings.mode == "hdr10" || config.hdr10);
-    const bool isHlgMode   = (config.hdrSettings.mode == "hlg");
-
-    AVPixelFormat targetPixFmt = AV_PIX_FMT_YUV420P;
-    if (config.proresProfile >= 4) {
-        targetPixFmt = AV_PIX_FMT_YUVA444P10LE;
-    } else if (config.proresProfile >= 0) {
-        targetPixFmt = AV_PIX_FMT_YUV422P10LE;
-    } else if (isHdr10Mode || isHlgMode) {
-        targetPixFmt = AV_PIX_FMT_YUV420P10LE;
-    }
-    encCtx->pix_fmt = targetPixFmt;
-    encCtx->bit_rate = static_cast<int64_t>(config.videoBitrate) * 1000;
-
-    if (isHdr10Mode) {
-        encCtx->color_primaries = AVCOL_PRI_BT2020;
-        encCtx->color_trc = AVCOL_TRC_SMPTE2084;
-        encCtx->colorspace = AVCOL_SPC_BT2020_NCL;
-        encCtx->color_range = AVCOL_RANGE_MPEG;
-    } else if (isHlgMode) {
-        encCtx->color_primaries = AVCOL_PRI_BT2020;
-        encCtx->color_trc = AVCOL_TRC_ARIB_STD_B67;
-        encCtx->colorspace = AVCOL_SPC_BT2020_NCL;
-        encCtx->color_range = AVCOL_RANGE_MPEG;
-    }
-
-    if (outFmt->oformat->flags & AVFMT_GLOBALHEADER)
-        encCtx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-
-    // Codec-specific options
-    AVDictionary *opts = nullptr;
-    if (resolvedCodec == "h264_nvenc" || resolvedCodec == "hevc_nvenc") {
-        av_dict_set(&opts, "preset", "p4", 0);
-        av_dict_set(&opts, "rc", "vbr", 0);
-        av_dict_set(&opts, "cq", "23", 0);
-    } else if (resolvedCodec == "h264_qsv" || resolvedCodec == "hevc_qsv") {
-        av_dict_set(&opts, "preset", "medium", 0);
-    } else if (resolvedCodec == "h264_amf" || resolvedCodec == "hevc_amf") {
-        av_dict_set(&opts, "quality", "balanced", 0);
-    } else if (config.videoCodec == "libx264" || config.videoCodec == "libx265") {
-        av_dict_set(&opts, "preset", "medium", 0);
-        av_dict_set(&opts, "crf", "23", 0);
-        if (config.videoCodec == "libx265") {
-            if (isHdr10Mode) {
-                av_dict_set(&opts, "profile", "main10", 0);
-                const QByteArray x265p = buildX265Hdr10Params(config.hdrSettings);
-                av_dict_set(&opts, "x265-params", x265p.constData(), 0);
-            } else if (isHlgMode) {
-                av_dict_set(&opts, "profile", "main10", 0);
-                av_dict_set(&opts,
-                            "x265-params",
-                            "repeat-headers=1:colorprim=bt2020:"
-                            "transfer=arib-std-b67:colormatrix=bt2020nc",
-                            0);
-            }
-        }
-    } else if (config.videoCodec == "libsvtav1") {
-        av_dict_set(&opts, "preset", "8", 0);
-        av_dict_set(&opts, "crf", "30", 0);
-    } else if (config.videoCodec == "libvpx-vp9") {
-        av_dict_set(&opts, "quality", "good", 0);
-        av_dict_set(&opts, "cpu-used", "4", 0);
-    } else if (config.videoCodec.startsWith("prores") && config.proresProfile >= 0) {
-        const QByteArray profileStr = QByteArray::number(config.proresProfile);
-        av_dict_set(&opts, "profile", profileStr.constData(), 0);
-    }
-
-    if (avcodec_open2(encCtx, encoder, &opts) < 0) {
-        av_dict_free(&opts);
-        avcodec_free_context(&encCtx);
-
-        // HW encoder open failed — fall back to SW encoder (libx264/libx265)
-        if (hwEncoder) {
-            qInfo() << "Exporter: HW encoder open failed, falling back to SW encoder";
-            QString swCodec = isH265Family ? "libx265" : "libx264";
-            encoder = avcodec_find_encoder_by_name(swCodec.toUtf8().constData());
-            resolvedCodec = swCodec;
-            if (!encoder) {
-                avformat_free_context(outFmt);
-                emit exportFinished(false, "Video encoder not found (SW fallback failed)");
-                return;
-            }
-            encCtx = avcodec_alloc_context3(encoder);
-            encCtx->width = config.width;
-            encCtx->height = config.height;
-            encCtx->time_base = {1, config.fps};
-            encCtx->framerate = {config.fps, 1};
-            encCtx->pix_fmt = targetPixFmt;
-            encCtx->bit_rate = static_cast<int64_t>(config.videoBitrate) * 1000;
-            if (isHdr10Mode) {
-                encCtx->color_primaries = AVCOL_PRI_BT2020;
-                encCtx->color_trc = AVCOL_TRC_SMPTE2084;
-                encCtx->colorspace = AVCOL_SPC_BT2020_NCL;
-                encCtx->color_range = AVCOL_RANGE_MPEG;
-            } else if (isHlgMode) {
-                encCtx->color_primaries = AVCOL_PRI_BT2020;
-                encCtx->color_trc = AVCOL_TRC_ARIB_STD_B67;
-                encCtx->colorspace = AVCOL_SPC_BT2020_NCL;
-                encCtx->color_range = AVCOL_RANGE_MPEG;
-            }
-            if (outFmt->oformat->flags & AVFMT_GLOBALHEADER)
-                encCtx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-            AVDictionary *swOpts = nullptr;
-            av_dict_set(&swOpts, "preset", "medium", 0);
-            av_dict_set(&swOpts, "crf", "23", 0);
-            if (swCodec == "libx265") {
-                if (isHdr10Mode) {
-                    av_dict_set(&swOpts, "profile", "main10", 0);
-                    const QByteArray x265p = buildX265Hdr10Params(config.hdrSettings);
-                    av_dict_set(&swOpts, "x265-params", x265p.constData(), 0);
-                } else if (isHlgMode) {
-                    av_dict_set(&swOpts, "profile", "main10", 0);
-                    av_dict_set(&swOpts,
-                                "x265-params",
-                                "repeat-headers=1:colorprim=bt2020:"
-                                "transfer=arib-std-b67:colormatrix=bt2020nc",
-                                0);
-                }
-            }
-            if (avcodec_open2(encCtx, encoder, &swOpts) < 0) {
-                av_dict_free(&swOpts);
-                avcodec_free_context(&encCtx);
-                avformat_free_context(outFmt);
-                emit exportFinished(false, "Failed to open SW fallback encoder");
-                return;
-            }
-            av_dict_free(&swOpts);
-            qInfo() << "Exporter: using encoder" << encoder->name;
-        } else {
-            avformat_free_context(outFmt);
-            emit exportFinished(false, "Failed to open encoder");
-            return;
-        }
-    } else {
-        av_dict_free(&opts);
-    }
+    const AVPixelFormat targetPixFmt = encoderSession.outputPixelFormat();
+    qInfo() << "Exporter: using encoder" << QString::fromStdString(encoderSession.activeEncoderName());
 
     if (isHdr10Mode || isHlgMode) {
         qInfo() << "HDR mode:" << config.hdrSettings.mode
@@ -575,74 +293,12 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
                 << "MaxFALL=" << config.hdrSettings.maxFall;
     }
 
-    avcodec_parameters_from_context(outStream->codecpar, encCtx);
-    outStream->time_base = encCtx->time_base;
-
-    if (audioEncoder) {
-        audioStream = avformat_new_stream(outFmt, nullptr);
-        if (!audioStream) {
-            avcodec_free_context(&encCtx);
-            avformat_free_context(outFmt);
-            emit exportFinished(false, "Failed to create audio output stream");
-            return;
-        }
-
-        audioEncCtx = avcodec_alloc_context3(audioEncoder);
-        if (!audioEncCtx) {
-            avcodec_free_context(&encCtx);
-            avformat_free_context(outFmt);
-            emit exportFinished(false, "Failed to create audio encoder context");
-            return;
-        }
-
-        AVChannelLayout stereoLayout = AV_CHANNEL_LAYOUT_STEREO;
-        audioEncCtx->sample_rate = selectAudioSampleRate(audioEncoder, audioSourceSampleRate);
-        audioEncCtx->sample_fmt = selectAudioSampleFormat(audioEncoder);
-        audioEncCtx->bit_rate = static_cast<int64_t>(config.audioBitrate) * 1000;
-        audioEncCtx->time_base = {1, audioEncCtx->sample_rate};
-        av_channel_layout_copy(&audioEncCtx->ch_layout, &stereoLayout);
-        if (outFmt->oformat->flags & AVFMT_GLOBALHEADER)
-            audioEncCtx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-
-        if (avcodec_open2(audioEncCtx, audioEncoder, nullptr) < 0) {
-            avcodec_free_context(&audioEncCtx);
-            avcodec_free_context(&encCtx);
-            avformat_free_context(outFmt);
-            emit exportFinished(false, "Failed to open audio encoder");
-            return;
-        }
-
-        avcodec_parameters_from_context(audioStream->codecpar, audioEncCtx);
-        audioStream->time_base = audioEncCtx->time_base;
-    }
-
-    // Open output file
-    if (!(outFmt->oformat->flags & AVFMT_NOFILE)) {
-        if (avio_open(&outFmt->pb, config.outputPath.toUtf8().constData(), AVIO_FLAG_WRITE) < 0) {
-            if (audioEncCtx) avcodec_free_context(&audioEncCtx);
-            avcodec_free_context(&encCtx);
-            avformat_free_context(outFmt);
-            emit exportFinished(false, "Failed to open output file");
-            return;
-        }
-    }
-
-    if (avformat_write_header(outFmt, nullptr) < 0) {
-        if (!(outFmt->oformat->flags & AVFMT_NOFILE))
-            avio_closep(&outFmt->pb);
-        if (audioEncCtx) avcodec_free_context(&audioEncCtx);
-        avcodec_free_context(&encCtx);
-        avformat_free_context(outFmt);
-        emit exportFinished(false, "Failed to write header");
-        return;
-    }
-
     // Process each clip
     SwsContext *swsCtx = nullptr;
     int64_t globalPts = 0;
     double processedDuration = 0.0;
 
-    for (int clipIdx = 0; clipIdx < clips.size() && !m_cancelled.load(); ++clipIdx) {
+    for (int clipIdx = 0; clipIdx < clips.size() && !m_cancelled; ++clipIdx) {
         const auto &clip = clips[clipIdx];
 
         AVFormatContext *inFmt = nullptr;
@@ -681,26 +337,66 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
         }
         av_frame_get_buffer(outFrame, 0);
 
-        bool clipFinished = false;
-        auto processVideoFrame = [&](AVFrame *decodedFrame) {
-            // Check time bounds
-            AVStream *inStream = inFmt->streams[videoIdx];
-            double framePts = static_cast<double>(decodedFrame->best_effort_timestamp) * av_q2d(inStream->time_base);
-            if (framePts < clip.inPoint)
-                return true;
-            if (framePts >= clipEnd) {
-                clipFinished = true;
-                return false;
-            }
-
+        auto processDecodedFrame = [&](double framePts) {
             // Scale frame
             swsCtx = sws_getCachedContext(
                 swsCtx,
-                decodedFrame->width, decodedFrame->height, decCtx->pix_fmt,
+                frame->width, frame->height, decCtx->pix_fmt,
                 config.width, config.height, targetPixFmt,
                 SWS_BILINEAR, nullptr, nullptr, nullptr);
-            if (!swsCtx)
-                return true;
+            if (swscolor::matrixEnabledFromEnv() && swsCtx) {
+                // Direct YUV->YUV path (consumed only when needsRgbPass is
+                // false): transcode the SOURCE matrix to the OUTPUT matrix so
+                // the pixels match the stream colour tag the encoder applies
+                // (sdrTagsFor / HDR). Same-matrix cases are an identity. The
+                // RGB-roundtrip branches below configure their own contexts;
+                // this set is harmless (unused) on those frames.
+                const AVColorSpace srcCs = swscolor::resolveColorspace(
+                    frame->colorspace != AVCOL_SPC_UNSPECIFIED
+                        ? frame->colorspace
+                        : decCtx->colorspace,
+                    decCtx->width, decCtx->height);
+                const AVColorRange srcRng = swscolor::resolveRange(
+                    frame->color_range != AVCOL_RANGE_UNSPECIFIED
+                        ? frame->color_range
+                        : decCtx->color_range);
+                AVColorSpace dstCs = AVCOL_SPC_UNSPECIFIED;
+                AVColorRange dstRng = AVCOL_RANGE_UNSPECIFIED;
+                if (isHdr10Mode || isHlgMode) {
+                    dstCs = swscolor::resolveColorspace(
+                        outFrame->colorspace, config.width, config.height);
+                    dstRng = swscolor::resolveRange(outFrame->color_range);
+                } else {
+                    const swscolor::SdrTags t =
+                        swscolor::sdrTagsFor(config.width, config.height);
+                    dstCs = t.spc;
+                    dstRng = t.range;
+                }
+                int *currentInvTable = nullptr;
+                int *currentTable = nullptr;
+                int currentSrcRange = 0;
+                int currentDstRange = 0;
+                int brightness = 0;
+                int contrast = 0;
+                int saturation = 0;
+                if (sws_getColorspaceDetails(swsCtx, &currentInvTable,
+                                              &currentSrcRange, &currentTable,
+                                              &currentDstRange, &brightness,
+                                              &contrast, &saturation) >= 0) {
+                    const int *srcCoeffs =
+                        sws_getCoefficients(swscolor::swsCoeffsId(srcCs));
+                    const int *dstCoeffs =
+                        sws_getCoefficients(swscolor::swsCoeffsId(dstCs));
+                    if (srcCoeffs && dstCoeffs) {
+                        (void)sws_setColorspaceDetails(
+                            swsCtx, srcCoeffs,
+                            srcRng == AVCOL_RANGE_JPEG ? 1 : 0,
+                            dstCoeffs,
+                            dstRng == AVCOL_RANGE_JPEG ? 1 : 0,
+                            brightness, contrast, saturation);
+                    }
+                }
+            }
 
             av_frame_make_writable(outFrame);
 
@@ -708,7 +404,11 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
             const bool tenBitPath = isHdr10Mode || isHlgMode || config.proresProfile >= 0;
             bool hasEffects = !tenBitPath
                               && (!clip.colorCorrection.isDefault() || !clip.effects.isEmpty());
+            // AR-2: ACES が有効なら 8-bit RGB ラウンドトリップが必要。10-bit/HDR/
+            // ProRes 経路 (tenBitPath) では適用しない (ACES 出力は 8-bit RGB)。
+            const bool acesActive = exporterAcesPipeline.enabled && !tenBitPath;
             bool needsRgbPass = hasEffects
+                                || acesActive
                                 || (m_smartReframe != nullptr)
                                 || (m_subtitleRenderer != nullptr);
             if (needsRgbPass) {
@@ -717,13 +417,49 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
                     // Decode to RGB for effect processing
                     workingImage = QImage(config.width, config.height, QImage::Format_RGB888);
                     SwsContext *toRgbCtx = sws_getContext(
-                        decodedFrame->width, decodedFrame->height, decCtx->pix_fmt,
+                        frame->width, frame->height, decCtx->pix_fmt,
                         config.width, config.height, AV_PIX_FMT_RGB24,
                         SWS_BILINEAR, nullptr, nullptr, nullptr);
-                    uint8_t *rgbDest[1] = { workingImage.bits() };
-                    int rgbLinesize[1] = { static_cast<int>(workingImage.bytesPerLine()) };
-                    sws_scale(toRgbCtx, decodedFrame->data, decodedFrame->linesize, 0, decodedFrame->height,
-                              rgbDest, rgbLinesize);
+                    if (swscolor::matrixEnabledFromEnv() && toRgbCtx) {
+                        const AVColorSpace cs = swscolor::resolveColorspace(
+                            frame->colorspace != AVCOL_SPC_UNSPECIFIED
+                                ? frame->colorspace
+                                : decCtx->colorspace,
+                            decCtx->width, decCtx->height);
+                        const AVColorRange rng = swscolor::resolveRange(
+                            frame->color_range != AVCOL_RANGE_UNSPECIFIED
+                                ? frame->color_range
+                                : decCtx->color_range);
+                        int *currentInvTable = nullptr;
+                        int *currentTable = nullptr;
+                        int currentSrcRange = 0;
+                        int currentDstRange = 0;
+                        int brightness = 0;
+                        int contrast = 0;
+                        int saturation = 0;
+                        if (sws_getColorspaceDetails(toRgbCtx, &currentInvTable,
+                                                      &currentSrcRange, &currentTable,
+                                                      &currentDstRange, &brightness,
+                                                      &contrast, &saturation) >= 0) {
+                            const int *srcCoeffs =
+                                sws_getCoefficients(swscolor::swsCoeffsId(cs));
+                            const int *dstCoeffs = sws_getCoefficients(SWS_CS_DEFAULT);
+                            if (srcCoeffs && dstCoeffs) {
+                                (void)sws_setColorspaceDetails(
+                                    toRgbCtx, srcCoeffs,
+                                    rng == AVCOL_RANGE_JPEG ? 1 : 0,
+                                    dstCoeffs, 1, brightness, contrast,
+                                    saturation);
+                            }
+                        }
+                    }
+                    if (!scaleFrameToQImagePadded(toRgbCtx, frame, AV_PIX_FMT_RGB24,
+                                                  workingImage)) {
+                        if (toRgbCtx)
+                            sws_freeContext(toRgbCtx);
+                        m_cancelled = true;
+                        return;
+                    }
                     sws_freeContext(toRgbCtx);
 
                     // Apply effects
@@ -734,13 +470,49 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
                     // Scale to output size first.
                     workingImage = QImage(config.width, config.height, QImage::Format_RGB888);
                     SwsContext *toRgbCtx = sws_getContext(
-                        decodedFrame->width, decodedFrame->height, decCtx->pix_fmt,
+                        frame->width, frame->height, decCtx->pix_fmt,
                         config.width, config.height, AV_PIX_FMT_RGB24,
                         SWS_BILINEAR, nullptr, nullptr, nullptr);
-                    uint8_t *rgbDest[1] = { workingImage.bits() };
-                    int rgbLinesize[1] = { static_cast<int>(workingImage.bytesPerLine()) };
-                    sws_scale(toRgbCtx, decodedFrame->data, decodedFrame->linesize, 0, decodedFrame->height,
-                              rgbDest, rgbLinesize);
+                    if (swscolor::matrixEnabledFromEnv() && toRgbCtx) {
+                        const AVColorSpace cs = swscolor::resolveColorspace(
+                            frame->colorspace != AVCOL_SPC_UNSPECIFIED
+                                ? frame->colorspace
+                                : decCtx->colorspace,
+                            decCtx->width, decCtx->height);
+                        const AVColorRange rng = swscolor::resolveRange(
+                            frame->color_range != AVCOL_RANGE_UNSPECIFIED
+                                ? frame->color_range
+                                : decCtx->color_range);
+                        int *currentInvTable = nullptr;
+                        int *currentTable = nullptr;
+                        int currentSrcRange = 0;
+                        int currentDstRange = 0;
+                        int brightness = 0;
+                        int contrast = 0;
+                        int saturation = 0;
+                        if (sws_getColorspaceDetails(toRgbCtx, &currentInvTable,
+                                                      &currentSrcRange, &currentTable,
+                                                      &currentDstRange, &brightness,
+                                                      &contrast, &saturation) >= 0) {
+                            const int *srcCoeffs =
+                                sws_getCoefficients(swscolor::swsCoeffsId(cs));
+                            const int *dstCoeffs = sws_getCoefficients(SWS_CS_DEFAULT);
+                            if (srcCoeffs && dstCoeffs) {
+                                (void)sws_setColorspaceDetails(
+                                    toRgbCtx, srcCoeffs,
+                                    rng == AVCOL_RANGE_JPEG ? 1 : 0,
+                                    dstCoeffs, 1, brightness, contrast,
+                                    saturation);
+                            }
+                        }
+                    }
+                    if (!scaleFrameToQImagePadded(toRgbCtx, frame, AV_PIX_FMT_RGB24,
+                                                  workingImage)) {
+                        if (toRgbCtx)
+                            sws_freeContext(toRgbCtx);
+                        m_cancelled = true;
+                        return;
+                    }
                     sws_freeContext(toRgbCtx);
                 }
 
@@ -760,44 +532,79 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
                         framePts - clip.inPoint);
                 }
 
-                // Convert processed RGB back to the actual encoder pixel format.
+                // AR-2: ACES シーンリファード色管理を最終 RGB フレームへ適用する。
+                // enabled=false (既定) のときは一切呼ばず、従来出力とビット同一を維持
+                // (回帰ゼロ)。applyPipelineToImage は RGBA8888 を返すため、後段の
+                // RGB24->YUV420P 変換に合わせて RGB888 へ戻す。プレビューは
+                // VideoPlayer::displayFrame でのみ適用するので二重適用しない。
+                if (acesActive && !workingImage.isNull()) {
+                    QImage acesOut = aces::applyPipelineToImage(
+                        workingImage, exporterAcesPipeline);
+                    workingImage = acesOut.convertToFormat(QImage::Format_RGB888);
+                }
+
+                // Convert processed RGB back to YUV420P
                 SwsContext *toYuvCtx = sws_getContext(
                     workingImage.width(), workingImage.height(), AV_PIX_FMT_RGB24,
-                    config.width, config.height, targetPixFmt,
+                    config.width, config.height, AV_PIX_FMT_YUV420P,
                     SWS_BILINEAR, nullptr, nullptr, nullptr);
+                if (swscolor::matrixEnabledFromEnv() && toYuvCtx) {
+                    AVColorSpace dstCs = AVCOL_SPC_UNSPECIFIED;
+                    AVColorRange dstRange = AVCOL_RANGE_UNSPECIFIED;
+                    if (isHdr10Mode || isHlgMode) {
+                        dstCs = swscolor::resolveColorspace(
+                            outFrame->colorspace, config.width, config.height);
+                        dstRange = swscolor::resolveRange(outFrame->color_range);
+                    } else {
+                        const swscolor::SdrTags t =
+                            swscolor::sdrTagsFor(config.width, config.height);
+                        dstCs = t.spc;
+                        dstRange = t.range;
+                    }
+                    int *currentInvTable = nullptr;
+                    int *currentTable = nullptr;
+                    int currentSrcRange = 0;
+                    int currentDstRange = 0;
+                    int brightness = 0;
+                    int contrast = 0;
+                    int saturation = 0;
+                    if (sws_getColorspaceDetails(toYuvCtx, &currentInvTable,
+                                                  &currentSrcRange, &currentTable,
+                                                  &currentDstRange, &brightness,
+                                                  &contrast, &saturation) >= 0) {
+                        const int *srcCoeffs = sws_getCoefficients(SWS_CS_DEFAULT);
+                        const int *dstCoeffs =
+                            sws_getCoefficients(swscolor::swsCoeffsId(dstCs));
+                        if (srcCoeffs && dstCoeffs) {
+                            (void)sws_setColorspaceDetails(
+                                toYuvCtx, srcCoeffs, 1, dstCoeffs,
+                                dstRange == AVCOL_RANGE_JPEG ? 1 : 0,
+                                brightness, contrast, saturation);
+                        }
+                    }
+                }
                 const uint8_t *rgbSrc[1] = { workingImage.constBits() };
                 int rgbSrcLinesize[1] = { static_cast<int>(workingImage.bytesPerLine()) };
                 sws_scale(toYuvCtx, rgbSrc, rgbSrcLinesize, 0, workingImage.height(),
                           outFrame->data, outFrame->linesize);
                 sws_freeContext(toYuvCtx);
-                fillOpaqueAlphaPlane(outFrame);
             } else {
-                sws_scale(swsCtx, decodedFrame->data, decodedFrame->linesize, 0, decodedFrame->height,
+                sws_scale(swsCtx, frame->data, frame->linesize, 0, frame->height,
                           outFrame->data, outFrame->linesize);
+                fillOpaqueAlphaPlane(outFrame);
             }
 
-            outFrame->pts = globalPts++;
-
-            // Encode
-            if (avcodec_send_frame(encCtx, outFrame) == 0) {
-                AVPacket *encPkt = av_packet_alloc();
-                while (avcodec_receive_packet(encCtx, encPkt) == 0) {
-                    av_packet_rescale_ts(encPkt, encCtx->time_base, outStream->time_base);
-                    encPkt->stream_index = outStream->index;
-                    av_interleaved_write_frame(outFmt, encPkt);
-                    av_packet_unref(encPkt);
-                }
-                av_packet_free(&encPkt);
-            }
+            // Encode via libavcore helper (handles send_frame+packet drain).
+            encoderSession.pushFrameNative(outFrame, globalPts++);
 
             // Update progress
             double currentTime = framePts - clip.inPoint;
             int percent = static_cast<int>((processedDuration + currentTime) / totalDuration * 100.0);
             emit progressChanged(qMin(percent, 99));
-            return true;
         };
 
-        while (av_read_frame(inFmt, packet) >= 0 && !m_cancelled.load() && !clipFinished) {
+        int readRet = 0;
+        while (!m_cancelled && (readRet = av_read_frame(inFmt, packet)) >= 0) {
             if (packet->stream_index != videoIdx) {
                 av_packet_unref(packet);
                 continue;
@@ -808,18 +615,30 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
                 continue;
             }
 
-            while (avcodec_receive_frame(decCtx, frame) == 0 && !m_cancelled.load() && !clipFinished)
-                processVideoFrame(frame);
+            while (avcodec_receive_frame(decCtx, frame) == 0 && !m_cancelled) {
+                // Check time bounds
+                AVStream *inStream = inFmt->streams[videoIdx];
+                double framePts = static_cast<double>(frame->pts) * av_q2d(inStream->time_base);
+                if (framePts < clip.inPoint) continue;
+                if (framePts >= clipEnd) goto clip_done;
+                processDecodedFrame(framePts);
+            }
 
             av_packet_unref(packet);
         }
 
-        if (!m_cancelled.load() && !clipFinished) {
+        if (!m_cancelled && readRet < 0) {
             avcodec_send_packet(decCtx, nullptr);
-            while (avcodec_receive_frame(decCtx, frame) == 0 && !m_cancelled.load() && !clipFinished)
-                processVideoFrame(frame);
+            while (avcodec_receive_frame(decCtx, frame) == 0 && !m_cancelled) {
+                AVStream *inStream = inFmt->streams[videoIdx];
+                double framePts = static_cast<double>(frame->pts) * av_q2d(inStream->time_base);
+                if (framePts < clip.inPoint) continue;
+                if (framePts >= clipEnd) break;
+                processDecodedFrame(framePts);
+            }
         }
 
+clip_done:
         processedDuration += clip.effectiveDuration();
         av_frame_free(&frame);
         av_frame_free(&outFrame);
@@ -828,189 +647,18 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
         avformat_close_input(&inFmt);
     }
 
-    if (audioEncCtx && audioStream && !m_cancelled.load()) {
-        const int audioChannels = audioEncCtx->ch_layout.nb_channels;
-        const int fifoInitialSize = audioEncCtx->frame_size > 0 ? audioEncCtx->frame_size : 1024;
-        AVAudioFifo *audioFifo = av_audio_fifo_alloc(audioEncCtx->sample_fmt, audioChannels, fifoInitialSize);
-        int64_t audioPts = 0;
-
-        for (const auto &clip : clips) {
-            if (m_cancelled.load() || !audioFifo)
-                break;
-
-            AVFormatContext *audioFmt = nullptr;
-            if (avformat_open_input(&audioFmt, clip.filePath.toUtf8().constData(), nullptr, nullptr) < 0)
-                continue;
-            if (avformat_find_stream_info(audioFmt, nullptr) < 0) {
-                avformat_close_input(&audioFmt);
-                continue;
-            }
-
-            const int audioIdx = av_find_best_stream(audioFmt, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
-            if (audioIdx < 0) {
-                avformat_close_input(&audioFmt);
-                continue;
-            }
-
-            AVStream *audioInStream = audioFmt->streams[audioIdx];
-            const AVCodec *audioDecoder = avcodec_find_decoder(audioInStream->codecpar->codec_id);
-            if (!audioDecoder) {
-                avformat_close_input(&audioFmt);
-                continue;
-            }
-
-            AVCodecContext *audioDecCtx = avcodec_alloc_context3(audioDecoder);
-            if (!audioDecCtx) {
-                avformat_close_input(&audioFmt);
-                continue;
-            }
-            if (avcodec_parameters_to_context(audioDecCtx, audioInStream->codecpar) < 0
-                || avcodec_open2(audioDecCtx, audioDecoder, nullptr) < 0
-                || audioDecCtx->ch_layout.nb_channels <= 0
-                || audioDecCtx->sample_rate <= 0) {
-                avcodec_free_context(&audioDecCtx);
-                avformat_close_input(&audioFmt);
-                continue;
-            }
-
-            if (clip.inPoint > 0.0) {
-                const int64_t seekTarget = static_cast<int64_t>(clip.inPoint / av_q2d(audioInStream->time_base));
-                av_seek_frame(audioFmt, audioIdx, seekTarget, AVSEEK_FLAG_BACKWARD);
-                avcodec_flush_buffers(audioDecCtx);
-            }
-
-            SwrContext *swrCtx = nullptr;
-            if (swr_alloc_set_opts2(&swrCtx,
-                    &audioEncCtx->ch_layout, audioEncCtx->sample_fmt, audioEncCtx->sample_rate,
-                    &audioDecCtx->ch_layout, audioDecCtx->sample_fmt, audioDecCtx->sample_rate,
-                    0, nullptr) < 0
-                || !swrCtx
-                || swr_init(swrCtx) < 0) {
-                if (swrCtx) swr_free(&swrCtx);
-                avcodec_free_context(&audioDecCtx);
-                avformat_close_input(&audioFmt);
-                continue;
-            }
-
-            AVPacket *audioPacket = av_packet_alloc();
-            AVFrame *audioFrame = av_frame_alloc();
-            if (!audioPacket || !audioFrame) {
-                if (audioPacket) av_packet_free(&audioPacket);
-                if (audioFrame) av_frame_free(&audioFrame);
-                swr_free(&swrCtx);
-                avcodec_free_context(&audioDecCtx);
-                avformat_close_input(&audioFmt);
-                continue;
-            }
-
-            const double clipEnd = (clip.outPoint > 0.0) ? clip.outPoint : clip.duration;
-            const double gain = clip.volume * std::pow(10.0, m_loudnessGainDb / 20.0);
-            bool audioClipFinished = false;
-
-            auto queueAudioFrame = [&](AVFrame *decodedFrame) {
-                const double frameTime = static_cast<double>(decodedFrame->best_effort_timestamp)
-                                         * av_q2d(audioInStream->time_base);
-                if (frameTime < clip.inPoint)
-                    return true;
-                if (frameTime >= clipEnd) {
-                    audioClipFinished = true;
-                    return false;
-                }
-
-                const int outCapacity = static_cast<int>(av_rescale_rnd(
-                    swr_get_delay(swrCtx, audioDecCtx->sample_rate) + decodedFrame->nb_samples,
-                    audioEncCtx->sample_rate,
-                    audioDecCtx->sample_rate,
-                    AV_ROUND_UP));
-                if (outCapacity <= 0)
-                    return true;
-
-                uint8_t **converted = nullptr;
-                if (av_samples_alloc_array_and_samples(&converted, nullptr, audioChannels,
-                                                       outCapacity, audioEncCtx->sample_fmt, 0) < 0)
-                    return false;
-
-                const int convertedSamples = swr_convert(
-                    swrCtx, converted, outCapacity,
-                    const_cast<const uint8_t **>(decodedFrame->extended_data),
-                    decodedFrame->nb_samples);
-                if (convertedSamples > 0) {
-                    applyAudioGain(converted, audioEncCtx->sample_fmt, audioChannels, convertedSamples, gain);
-                    if (av_audio_fifo_realloc(audioFifo, av_audio_fifo_size(audioFifo) + convertedSamples) >= 0
-                        && av_audio_fifo_write(audioFifo, reinterpret_cast<void **>(converted), convertedSamples) == convertedSamples) {
-                        encodeAudioFifo(outFmt, audioEncCtx, audioStream, audioFifo, false, audioPts);
-                    }
-                }
-
-                av_freep(&converted[0]);
-                av_freep(&converted);
-                return !audioClipFinished;
-            };
-
-            while (av_read_frame(audioFmt, audioPacket) >= 0 && !m_cancelled.load() && !audioClipFinished) {
-                if (audioPacket->stream_index != audioIdx) {
-                    av_packet_unref(audioPacket);
-                    continue;
-                }
-
-                if (avcodec_send_packet(audioDecCtx, audioPacket) == 0) {
-                    while (avcodec_receive_frame(audioDecCtx, audioFrame) == 0
-                           && !m_cancelled.load()
-                           && !audioClipFinished) {
-                        queueAudioFrame(audioFrame);
-                    }
-                }
-                av_packet_unref(audioPacket);
-            }
-
-            if (!m_cancelled.load() && !audioClipFinished) {
-                avcodec_send_packet(audioDecCtx, nullptr);
-                while (avcodec_receive_frame(audioDecCtx, audioFrame) == 0 && !m_cancelled.load())
-                    queueAudioFrame(audioFrame);
-            }
-
-            av_frame_free(&audioFrame);
-            av_packet_free(&audioPacket);
-            swr_free(&swrCtx);
-            avcodec_free_context(&audioDecCtx);
-            avformat_close_input(&audioFmt);
-        }
-
-        if (audioFifo) {
-            encodeAudioFifo(outFmt, audioEncCtx, audioStream, audioFifo, true, audioPts);
-            av_audio_fifo_free(audioFifo);
-        }
-
-        avcodec_send_frame(audioEncCtx, nullptr);
-        writeAudioPackets(outFmt, audioEncCtx, audioStream);
-    }
-
-    // Flush encoder
-    avcodec_send_frame(encCtx, nullptr);
-    AVPacket *flushPkt = av_packet_alloc();
-    while (avcodec_receive_packet(encCtx, flushPkt) == 0) {
-        av_packet_rescale_ts(flushPkt, encCtx->time_base, outStream->time_base);
-        flushPkt->stream_index = outStream->index;
-        av_interleaved_write_frame(outFmt, flushPkt);
-        av_packet_unref(flushPkt);
-    }
-    av_packet_free(&flushPkt);
-
-    av_write_trailer(outFmt);
+    // Flush + trailer via helper (drains remaining packets, writes trailer,
+    // closes file). FrameEncoder dtor cleans the rest of the libav state.
+    encoderSession.finalize();
 
     if (swsCtx) sws_freeContext(swsCtx);
-    if (audioEncCtx) avcodec_free_context(&audioEncCtx);
-    avcodec_free_context(&encCtx);
-    if (!(outFmt->oformat->flags & AVFMT_NOFILE))
-        avio_closep(&outFmt->pb);
-    avformat_free_context(outFmt);
 
-    if (m_cancelled.load()) {
+    if (m_cancelled) {
         emit exportFinished(false, "Export cancelled");
     } else {
         emit progressChanged(100);
         emit exportFinished(true, QString("Exported via %1 to %2")
-                                      .arg(QString::fromUtf8(encoder->name))
+                                      .arg(QString::fromStdString(encoderSession.activeEncoderName()))
                                       .arg(config.outputPath));
     }
 }
@@ -1020,4 +668,30 @@ bool Exporter::transcodeClip(const ClipInfo &, AVFormatContext *, AVCodecContext
 {
     // Handled inline in doExport for now
     return true;
+}
+
+// static
+bool Exporter::exportAsPremiereXml(const QVector<ClipInfo> &clips,
+                                   const ExportConfig &config,
+                                   const QString &outputPath,
+                                   const QString &projectName)
+{
+    QList<PremiereHighlight> highlights;
+    for (const auto &clip : clips) {
+        PremiereHighlight h;
+        h.filePath = clip.filePath;
+        h.title    = clip.displayName.isEmpty()
+                         ? QFileInfo(clip.filePath).baseName()
+                         : clip.displayName;
+        h.startSec = clip.inPoint;
+        h.endSec   = (clip.outPoint > 0.0) ? clip.outPoint : clip.duration;
+        highlights.append(h);
+    }
+
+    PremiereVideoInfo info;
+    info.width  = config.width;
+    info.height = config.height;
+    info.fps    = static_cast<double>(config.fps);
+
+    return PremiereXmlExporter::generateCombinedXml(highlights, info, outputPath, projectName);
 }

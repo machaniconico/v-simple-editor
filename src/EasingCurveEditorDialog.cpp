@@ -5,6 +5,7 @@
 #include <QMouseEvent>
 #include <QPaintEvent>
 #include <QComboBox>
+#include <QDialogButtonBox>
 #include <QLabel>
 #include <QVBoxLayout>
 #include <QPen>
@@ -144,7 +145,7 @@ void CurveWidget::mouseReleaseEvent(QMouseEvent * /*event*/) {
 EasingCurveEditorDialog::EasingCurveEditorDialog(QWidget *parent)
     : QDialog(parent) {
     setWindowTitle(tr("Easing Curve Editor"));
-    setModal(false); // modeless
+    setModal(false); // modeless unless the caller uses exec()
 
     auto *layout = new QVBoxLayout(this);
 
@@ -161,15 +162,35 @@ EasingCurveEditorDialog::EasingCurveEditorDialog(QWidget *parent)
     m_valueLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
     layout->addWidget(m_valueLabel);
 
+    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel,
+                                         this);
+    layout->addWidget(buttons);
+
     connect(m_presetCombo,
             QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, &EasingCurveEditorDialog::onPresetChanged);
     connect(m_curve, &CurveWidget::curveChanged,
             this, &EasingCurveEditorDialog::onCurveEdited);
+    connect(buttons, &QDialogButtonBox::accepted, this, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
 
     if (!ps.isEmpty())
         m_curve->setBezier(ps.front().bez);
     onPresetChanged(m_presetCombo->currentIndex());
+}
+
+void EasingCurveEditorDialog::setInitialCurve(double x1, double y1, double x2, double y2) {
+    m_presetCombo->setCurrentIndex(-1);
+    m_curve->setBezier(easing::CubicBezier{x1, y1, x2, y2});
+    updateValueLabel();
+}
+
+void EasingCurveEditorDialog::getCurve(double &x1, double &y1, double &x2, double &y2) const {
+    const easing::CubicBezier b = m_curve->bezier();
+    x1 = b.x1;
+    y1 = b.y1;
+    x2 = b.x2;
+    y2 = b.y2;
 }
 
 void EasingCurveEditorDialog::onPresetChanged(int index) {

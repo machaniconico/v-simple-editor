@@ -2,14 +2,222 @@
 #include "ColorWheelWidget.h"
 #include "CurveEditor.h"
 #include "HueVsSatEditor.h"
+#include "WbPick.h"
+#include "Timeline.h"
+#include "UndoManager.h"
+#include <QApplication>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QGridLayout>
 #include <QGroupBox>
 #include <QScrollArea>
 #include <QColorDialog>
+#include <QJsonArray>
+#include <QJsonObject>
+#include <QSignalBlocker>
 #include <algorithm>
 #include <cmath>
+
+namespace {
+
+QJsonArray curvePointListToJson(const QVector<QPointF> &points)
+{
+    QJsonArray arr;
+    for (const QPointF &p : points) {
+        QJsonArray pt;
+        pt.append(p.x());
+        pt.append(p.y());
+        arr.append(pt);
+    }
+    return arr;
+}
+
+QVector<QPointF> curvePointListFromJson(const QJsonArray &arr)
+{
+    QVector<QPointF> points;
+    points.reserve(arr.size());
+    for (const QJsonValue &v : arr) {
+        const QJsonArray pt = v.toArray();
+        if (pt.size() < 2)
+            continue;
+        points.append(QPointF(pt.at(0).toDouble(), pt.at(1).toDouble()));
+    }
+    return points;
+}
+
+QJsonObject curveDataToJson(const ClipCurveData &curves, int srcWidth, int srcHeight)
+{
+    QJsonObject obj;
+    obj[QStringLiteral("srcWidth")] = srcWidth;
+    obj[QStringLiteral("srcHeight")] = srcHeight;
+    if (!curves.hasCurves())
+        return obj;
+
+    QJsonArray channels;
+    const QVector<QVector<QPointF>> points = curves.editorPointsOrIdentity();
+    for (int ch = 0; ch < ClipCurveData::ChannelCount; ++ch)
+        channels.append(curvePointListToJson(points.value(ch)));
+    obj[QStringLiteral("channels")] = channels;
+    return obj;
+}
+
+ClipCurveData curveDataFromJson(const QJsonObject &obj)
+{
+    ClipCurveData curves;
+    const QJsonArray channels = obj.value(QStringLiteral("channels")).toArray();
+    QVector<QVector<QPointF>> points;
+    points.reserve(ClipCurveData::ChannelCount);
+    for (int ch = 0; ch < ClipCurveData::ChannelCount; ++ch) {
+        const QJsonArray channel =
+            ch < channels.size() ? channels.at(ch).toArray() : QJsonArray{};
+        points.append(curvePointListFromJson(channel));
+    }
+    curves.setPoints(points);
+    return curves;
+}
+
+Timeline *findTimelineForColorPanel(QObject *panel)
+{
+    for (QObject *p = panel; p; p = p->parent()) {
+        if (Timeline *timeline = p->findChild<Timeline *>())
+            return timeline;
+    }
+    const auto topLevels = QApplication::topLevelWidgets();
+    for (QWidget *w : topLevels) {
+        if (Timeline *timeline = w->findChild<Timeline *>())
+            return timeline;
+    }
+    return nullptr;
+}
+
+bool selectedClipIndex(Timeline *timeline, int *trackIdx, int *clipIdx)
+{
+    if (!timeline)
+        return false;
+    const QVector<TimelineTrack *> &tracks = timeline->videoTracks();
+    for (int t = 0; t < tracks.size(); ++t) {
+        const TimelineTrack *track = tracks[t];
+        if (!track)
+            continue;
+        const int selected = track->selectedClip();
+        if (selected < 0 || selected >= track->clips().size())
+            continue;
+        if (trackIdx)
+            *trackIdx = t;
+        if (clipIdx)
+            *clipIdx = selected;
+        return true;
+    }
+    return false;
+}
+
+ClipCurveData clipCurvesAt(Timeline *timeline, int trackIdx, int clipIdx)
+{
+    if (!timeline)
+        return {};
+    const QVector<TimelineTrack *> &tracks = timeline->videoTracks();
+    if (trackIdx < 0 || trackIdx >= tracks.size() || !tracks[trackIdx])
+        return {};
+    const QVector<ClipInfo> &clips = tracks[trackIdx]->clips();
+    if (clipIdx < 0 || clipIdx >= clips.size())
+        return {};
+    return clips[clipIdx].colorCurves;
+}
+
+HslSecondaryGrade clipHslSecondaryAt(Timeline *timeline, int trackIdx, int clipIdx)
+{
+    if (!timeline)
+        return {};
+    const QVector<TimelineTrack *> &tracks = timeline->videoTracks();
+    if (trackIdx < 0 || trackIdx >= tracks.size() || !tracks[trackIdx])
+        return {};
+    const QVector<ClipInfo> &clips = tracks[trackIdx]->clips();
+    if (clipIdx < 0 || clipIdx >= clips.size())
+        return {};
+    return clips[clipIdx].hslSecondary;
+}
+
+bool sameHslSecondary(const HslSecondaryGrade &a, const HslSecondaryGrade &b)
+{
+    auto near = [](double x, double y) { return std::abs(x - y) <= 1e-9; };
+    return a.enabled == b.enabled
+        && near(a.hueCenter, b.hueCenter)
+        && near(a.hueRange, b.hueRange)
+        && near(a.satMin, b.satMin)
+        && near(a.satMax, b.satMax)
+        && near(a.lumaMin, b.lumaMin)
+        && near(a.lumaMax, b.lumaMax)
+        && near(a.softness, b.softness)
+        && near(a.liftR, b.liftR)
+        && near(a.liftG, b.liftG)
+        && near(a.liftB, b.liftB)
+        && near(a.gammaR, b.gammaR)
+        && near(a.gammaG, b.gammaG)
+        && near(a.gammaB, b.gammaB)
+        && near(a.gainR, b.gainR)
+        && near(a.gainG, b.gainG)
+        && near(a.gainB, b.gainB);
+}
+
+bool writeCurvesToSelectedClip(Timeline *timeline,
+                               const QVector<QVector<QPointF>> &editorPoints)
+{
+    int trackIdx = -1;
+    int clipIdx = -1;
+    if (!selectedClipIndex(timeline, &trackIdx, &clipIdx))
+        return false;
+
+    TimelineTrack *track = timeline->videoTracks().value(trackIdx, nullptr);
+    if (!track)
+        return false;
+
+    QVector<ClipInfo> clips = track->clips();
+    if (clipIdx < 0 || clipIdx >= clips.size())
+        return false;
+
+    ClipCurveData curves;
+    curves.setPoints(editorPoints);
+    if (clips[clipIdx].colorCurves.editorPointsOrIdentity()
+        == curves.editorPointsOrIdentity()) {
+        return true;
+    }
+
+    clips[clipIdx].colorCurves = curves;
+    track->setClips(clips);
+    if (UndoManager *undo = timeline->undoManager())
+        undo->saveState(timeline->currentState(), QStringLiteral("Clip RGB curves"));
+    timeline->refreshPlaybackSequence();
+    return true;
+}
+
+bool writeHslSecondaryToSelectedClip(Timeline *timeline,
+                                     const HslSecondaryGrade &hsl)
+{
+    int trackIdx = -1;
+    int clipIdx = -1;
+    if (!selectedClipIndex(timeline, &trackIdx, &clipIdx))
+        return false;
+
+    TimelineTrack *track = timeline->videoTracks().value(trackIdx, nullptr);
+    if (!track)
+        return false;
+
+    QVector<ClipInfo> clips = track->clips();
+    if (clipIdx < 0 || clipIdx >= clips.size())
+        return false;
+
+    if (sameHslSecondary(clips[clipIdx].hslSecondary, hsl))
+        return true;
+
+    clips[clipIdx].hslSecondary = hsl;
+    track->setClips(clips);
+    if (UndoManager *undo = timeline->undoManager())
+        undo->saveState(timeline->currentState(), QStringLiteral("Clip HSL secondary"));
+    timeline->refreshPlaybackSequence();
+    return true;
+}
+
+} // namespace
 
 ColorGradingPanel::ColorGradingPanel(QWidget *parent)
     : QDockWidget(tr("カラーグレーディング"), parent)
@@ -40,6 +248,7 @@ ColorGradingPanel::ColorGradingPanel(QWidget *parent)
         tempLbl->setMinimumWidth(70);
         tempRow->addWidget(tempLbl);
         m_wbTemperature = new QSlider(Qt::Horizontal);
+        m_wbTemperature->setObjectName(QStringLiteral("wbTemperature"));
         m_wbTemperature->setRange(-100, 100);
         m_wbTemperature->setValue(0);
         tempRow->addWidget(m_wbTemperature, 1);
@@ -54,6 +263,7 @@ ColorGradingPanel::ColorGradingPanel(QWidget *parent)
         tintLbl->setMinimumWidth(70);
         tintRow->addWidget(tintLbl);
         m_wbTint = new QSlider(Qt::Horizontal);
+        m_wbTint->setObjectName(QStringLiteral("wbTint"));
         m_wbTint->setRange(-100, 100);
         m_wbTint->setValue(0);
         tintRow->addWidget(m_wbTint, 1);
@@ -358,6 +568,167 @@ ColorGradingPanel::ColorGradingPanel(QWidget *parent)
         }
         connect(m_hslqEnabled, &QCheckBox::toggled,
                 this, &ColorGradingPanel::onHslQualifierChanged);
+
+        auto sliderFromDouble =
+            [](double value, int minValue, int maxValue) {
+                return qBound(minValue,
+                              static_cast<int>(std::round(value)),
+                              maxValue);
+            };
+        auto sliderFromFraction =
+            [sliderFromDouble](double value) {
+                return sliderFromDouble(value * 100.0, 0, 100);
+            };
+        auto sliderFromLift =
+            [sliderFromDouble](double value) {
+                return sliderFromDouble(value * 100.0, -50, 50);
+            };
+        auto sliderFromGammaGain =
+            [sliderFromDouble](double value) {
+                const double safe = std::max(value, 1e-6);
+                return sliderFromDouble(std::log2(safe) * 50.0, -100, 100);
+            };
+
+        auto restoreHslSecondaryForClip =
+            [this, sliderFromDouble, sliderFromFraction, sliderFromLift,
+             sliderFromGammaGain](Timeline *timeline, int trackIdx, int clipIdx) {
+                if (trackIdx < 0 || clipIdx < 0) {
+                    if (!selectedClipIndex(timeline, &trackIdx, &clipIdx))
+                        return;
+                }
+                const HslSecondaryGrade hsl =
+                    clipHslSecondaryAt(timeline, trackIdx, clipIdx);
+                if (!m_hslqEnabled || !m_hslqHueCenter || !m_hslqHueRange
+                    || !m_hslqSatMin || !m_hslqSatMax || !m_hslqLumaMin
+                    || !m_hslqLumaMax || !m_hslqSoftness
+                    || !m_hslqLiftR || !m_hslqLiftG || !m_hslqLiftB
+                    || !m_hslqGammaR || !m_hslqGammaG || !m_hslqGammaB
+                    || !m_hslqGainR || !m_hslqGainG || !m_hslqGainB) {
+                    return;
+                }
+
+                const bool wasUpdating = m_updating;
+                m_updating = true;
+                QSignalBlocker be(m_hslqEnabled);
+                QSignalBlocker bhc(m_hslqHueCenter);
+                QSignalBlocker bhr(m_hslqHueRange);
+                QSignalBlocker bsmn(m_hslqSatMin);
+                QSignalBlocker bsmx(m_hslqSatMax);
+                QSignalBlocker blmn(m_hslqLumaMin);
+                QSignalBlocker blmx(m_hslqLumaMax);
+                QSignalBlocker bsf(m_hslqSoftness);
+                QSignalBlocker blr(m_hslqLiftR);
+                QSignalBlocker blg(m_hslqLiftG);
+                QSignalBlocker blb(m_hslqLiftB);
+                QSignalBlocker bgr(m_hslqGammaR);
+                QSignalBlocker bgg(m_hslqGammaG);
+                QSignalBlocker bgb(m_hslqGammaB);
+                QSignalBlocker bnr(m_hslqGainR);
+                QSignalBlocker bng(m_hslqGainG);
+                QSignalBlocker bnb(m_hslqGainB);
+
+                const int hueCenter = sliderFromDouble(hsl.hueCenter, 0, 360);
+                const int hueRange = sliderFromDouble(hsl.hueRange, 0, 180);
+                const int satMin = sliderFromFraction(hsl.satMin);
+                const int satMax = sliderFromFraction(hsl.satMax);
+                const int lumaMin = sliderFromFraction(hsl.lumaMin);
+                const int lumaMax = sliderFromFraction(hsl.lumaMax);
+                const int softness = sliderFromDouble(hsl.softness, 0, 50);
+                const int liftR = sliderFromLift(hsl.liftR);
+                const int liftG = sliderFromLift(hsl.liftG);
+                const int liftB = sliderFromLift(hsl.liftB);
+                const int gammaR = sliderFromGammaGain(hsl.gammaR);
+                const int gammaG = sliderFromGammaGain(hsl.gammaG);
+                const int gammaB = sliderFromGammaGain(hsl.gammaB);
+                const int gainR = sliderFromGammaGain(hsl.gainR);
+                const int gainG = sliderFromGammaGain(hsl.gainG);
+                const int gainB = sliderFromGammaGain(hsl.gainB);
+
+                m_hslqEnabled->setChecked(hsl.enabled);
+                m_hslqHueCenter->setValue(hueCenter);
+                m_hslqHueRange->setValue(hueRange);
+                m_hslqSatMin->setValue(satMin);
+                m_hslqSatMax->setValue(satMax);
+                m_hslqLumaMin->setValue(lumaMin);
+                m_hslqLumaMax->setValue(lumaMax);
+                m_hslqSoftness->setValue(softness);
+                m_hslqLiftR->setValue(liftR);
+                m_hslqLiftG->setValue(liftG);
+                m_hslqLiftB->setValue(liftB);
+                m_hslqGammaR->setValue(gammaR);
+                m_hslqGammaG->setValue(gammaG);
+                m_hslqGammaB->setValue(gammaB);
+                m_hslqGainR->setValue(gainR);
+                m_hslqGainG->setValue(gainG);
+                m_hslqGainB->setValue(gainB);
+
+                if (m_hslqHueCenterLabel)
+                    m_hslqHueCenterLabel->setText(QString::number(hueCenter) + QStringLiteral("°"));
+                if (m_hslqHueRangeLabel)
+                    m_hslqHueRangeLabel->setText(QString::number(hueRange) + QStringLiteral("°"));
+                if (m_hslqSatMinLabel)
+                    m_hslqSatMinLabel->setText(QString::number(satMin) + QStringLiteral("%"));
+                if (m_hslqSatMaxLabel)
+                    m_hslqSatMaxLabel->setText(QString::number(satMax) + QStringLiteral("%"));
+                if (m_hslqLumaMinLabel)
+                    m_hslqLumaMinLabel->setText(QString::number(lumaMin) + QStringLiteral("%"));
+                if (m_hslqLumaMaxLabel)
+                    m_hslqLumaMaxLabel->setText(QString::number(lumaMax) + QStringLiteral("%"));
+                if (m_hslqSoftnessLabel)
+                    m_hslqSoftnessLabel->setText(QString::number(softness));
+                if (m_hslqLiftRLabel)  m_hslqLiftRLabel->setText(QString::number(liftR));
+                if (m_hslqLiftGLabel)  m_hslqLiftGLabel->setText(QString::number(liftG));
+                if (m_hslqLiftBLabel)  m_hslqLiftBLabel->setText(QString::number(liftB));
+                if (m_hslqGammaRLabel) m_hslqGammaRLabel->setText(QString::number(gammaR));
+                if (m_hslqGammaGLabel) m_hslqGammaGLabel->setText(QString::number(gammaG));
+                if (m_hslqGammaBLabel) m_hslqGammaBLabel->setText(QString::number(gammaB));
+                if (m_hslqGainRLabel)  m_hslqGainRLabel->setText(QString::number(gainR));
+                if (m_hslqGainGLabel)  m_hslqGainGLabel->setText(QString::number(gainG));
+                if (m_hslqGainBLabel)  m_hslqGainBLabel->setText(QString::number(gainB));
+
+                m_updating = wasUpdating;
+                emit hslQualifierChanged(hsl.enabled,
+                                         static_cast<float>(hsl.hueCenter),
+                                         static_cast<float>(hsl.hueRange),
+                                         static_cast<float>(hsl.satMin),
+                                         static_cast<float>(hsl.satMax),
+                                         static_cast<float>(hsl.lumaMin),
+                                         static_cast<float>(hsl.lumaMax),
+                                         static_cast<float>(hsl.softness),
+                                         static_cast<float>(hsl.liftR),
+                                         static_cast<float>(hsl.liftG),
+                                         static_cast<float>(hsl.liftB),
+                                         static_cast<float>(hsl.gammaR),
+                                         static_cast<float>(hsl.gammaG),
+                                         static_cast<float>(hsl.gammaB),
+                                         static_cast<float>(hsl.gainR),
+                                         static_cast<float>(hsl.gainG),
+                                         static_cast<float>(hsl.gainB));
+            };
+
+        auto bindTimelineForHslSecondary = [this, restoreHslSecondaryForClip]() {
+            Timeline *timeline = findTimelineForColorPanel(this);
+            if (!timeline)
+                return;
+            if (!property("_clipHslSecondarySelectionBound").toBool()) {
+                setProperty("_clipHslSecondarySelectionBound", true);
+                connect(timeline, &Timeline::clipSelectedOnTrack,
+                        this, [this, timeline, restoreHslSecondaryForClip](int trackIdx, int clipIdx) {
+                    restoreHslSecondaryForClip(timeline, trackIdx, clipIdx);
+                });
+            }
+            int trackIdx = -1;
+            int clipIdx = -1;
+            if (selectedClipIndex(timeline, &trackIdx, &clipIdx))
+                restoreHslSecondaryForClip(timeline, trackIdx, clipIdx);
+        };
+
+        QTimer::singleShot(0, this, bindTimelineForHslSecondary);
+        connect(this, &QDockWidget::visibilityChanged,
+                this, [bindTimelineForHslSecondary](bool visible) {
+            if (visible)
+                bindTimelineForHslSecondary();
+        });
     }
 
     // --- US-EF-4: Effects shader pack — Sharpen / Gaussian Blur / Lens
@@ -507,9 +878,15 @@ ColorGradingPanel::ColorGradingPanel(QWidget *parent)
     m_hue        = addSlider(basicLayout, tr("色相"),         -180, 180, 0);
     m_temperature= addSlider(basicLayout, tr("色温度"),       -100, 100, 0);
     m_tint       = addSlider(basicLayout, tr("色かぶり"),     -100, 100, 0);
+    m_wbPickButton = new QPushButton(tr("WB スポイト"));
+    m_wbPickButton->setCheckable(true);
+    m_wbPickButton->setToolTip(tr("プレビューでニュートラルにしたい画素をクリック"));
+    basicLayout->addWidget(m_wbPickButton);
     m_gamma      = addSlider(basicLayout, tr("ガンマ"),        10, 300, 100, 100);
 
     mainLayout->addWidget(basicGroup);
+    connect(m_wbPickButton, &QPushButton::toggled,
+            this, &ColorGradingPanel::onWhiteBalancePickToggled);
 
     // --- LUT Section ---
     auto *lutGroup = new QGroupBox(tr("LUT"));
@@ -566,6 +943,52 @@ ColorGradingPanel::ColorGradingPanel(QWidget *parent)
 
         connect(m_curveEditor, &CurveEditor::curvesChanged,
                 this, &ColorGradingPanel::curvesChanged);
+        connect(m_curveEditor, &CurveEditor::curvesChanged,
+                this, [this](const QVector<QVector<int>> &) {
+            if (m_updating || !m_curveEditor)
+                return;
+            writeCurvesToSelectedClip(findTimelineForColorPanel(this),
+                                      m_curveEditor->allPoints());
+        });
+
+        auto restoreCurveEditorForClip =
+            [this](Timeline *timeline, int trackIdx, int clipIdx) {
+                if (!m_curveEditor)
+                    return;
+                if (trackIdx < 0 || clipIdx < 0) {
+                    if (!selectedClipIndex(timeline, &trackIdx, &clipIdx))
+                        return;
+                }
+                const ClipCurveData curves = clipCurvesAt(timeline, trackIdx, clipIdx);
+                const bool wasUpdating = m_updating;
+                m_updating = true;
+                m_curveEditor->setAllPoints(curves.editorPointsOrIdentity());
+                m_updating = wasUpdating;
+            };
+
+        auto bindTimelineForCurves = [this, restoreCurveEditorForClip]() {
+            Timeline *timeline = findTimelineForColorPanel(this);
+            if (!timeline)
+                return;
+            if (!property("_clipCurveSelectionBound").toBool()) {
+                setProperty("_clipCurveSelectionBound", true);
+                connect(timeline, &Timeline::clipSelectedOnTrack,
+                        this, [this, timeline, restoreCurveEditorForClip](int trackIdx, int clipIdx) {
+                    restoreCurveEditorForClip(timeline, trackIdx, clipIdx);
+                });
+            }
+            int trackIdx = -1;
+            int clipIdx = -1;
+            if (selectedClipIndex(timeline, &trackIdx, &clipIdx))
+                restoreCurveEditorForClip(timeline, trackIdx, clipIdx);
+        };
+
+        QTimer::singleShot(0, this, bindTimelineForCurves);
+        connect(this, &QDockWidget::visibilityChanged,
+                this, [bindTimelineForCurves](bool visible) {
+            if (visible)
+                bindTimelineForCurves();
+        });
     }
 
     // --- US-CG-4: Hue vs Saturation Curve Editor ---
@@ -689,6 +1112,14 @@ ColorGradingPanel::WheelSliderGroup ColorGradingPanel::addWheelSliders(QGroupBox
     auto [bSlider, bLabel] = makeRow(tr("B:"));
     auto [lSlider, lLabel] = makeRow(tr("Luma:"));
 
+    const QString prefix = (type == LiftWheel)
+        ? QStringLiteral("lggLift")
+        : (type == GammaWheel ? QStringLiteral("lggGamma") : QStringLiteral("lggGain"));
+    rSlider->setObjectName(prefix + QStringLiteral("R"));
+    gSlider->setObjectName(prefix + QStringLiteral("G"));
+    bSlider->setObjectName(prefix + QStringLiteral("B"));
+    lSlider->setObjectName(prefix + QStringLiteral("Luma"));
+
     connect(rSlider, &QSlider::valueChanged, this, &ColorGradingPanel::onWheelSliderChanged);
     connect(gSlider, &QSlider::valueChanged, this, &ColorGradingPanel::onWheelSliderChanged);
     connect(bSlider, &QSlider::valueChanged, this, &ColorGradingPanel::onWheelSliderChanged);
@@ -699,16 +1130,24 @@ ColorGradingPanel::WheelSliderGroup ColorGradingPanel::addWheelSliders(QGroupBox
 
 double ColorGradingPanel::sliderToGamma(int v)
 {
-    double t = v / 100.0;
-    return 0.1 * std::pow(40.0, t);
+    if (v <= 50) {
+        const double t = std::clamp(v / 50.0, 0.0, 1.0);
+        return 0.1 * std::pow(10.0, t);
+    }
+    const double t = std::clamp((v - 50) / 50.0, 0.0, 1.0);
+    return std::pow(4.0, t);
 }
 
 int ColorGradingPanel::gammaToSlider(double g)
 {
     if (g <= 0.1) return 0;
     if (g >= 4.0) return 100;
-    double t = std::log(g / 0.1) / std::log(40.0);
-    return static_cast<int>(std::round(t * 100.0));
+    if (g <= 1.0) {
+        const double t = std::log(g / 0.1) / std::log(10.0);
+        return static_cast<int>(std::round(t * 50.0));
+    }
+    const double t = std::log(g) / std::log(4.0);
+    return 50 + static_cast<int>(std::round(t * 50.0));
 }
 
 double ColorGradingPanel::sliderToLiftGain(int v)
@@ -721,15 +1160,121 @@ int ColorGradingPanel::liftGainToSlider(double v)
     return static_cast<int>(std::round(v * 100.0));
 }
 
+double ColorGradingPanel::wheelGammaToCorrection(double g)
+{
+    return std::log2(std::max(g, 1e-6));
+}
+
+double ColorGradingPanel::correctionGammaToWheel(double g)
+{
+    return std::pow(2.0, g);
+}
+
+ColorWheels ColorGradingPanel::wheelsFromColorCorrection(const ColorCorrection &cc)
+{
+    ColorWheels cw;
+    cw.lift = QVector3D(static_cast<float>(cc.liftR),
+                        static_cast<float>(cc.liftG),
+                        static_cast<float>(cc.liftB));
+    cw.gamma = QVector3D(static_cast<float>(correctionGammaToWheel(cc.gammaR)),
+                         static_cast<float>(correctionGammaToWheel(cc.gammaG)),
+                         static_cast<float>(correctionGammaToWheel(cc.gammaB)));
+    cw.gain = QVector3D(static_cast<float>(cc.gainR),
+                        static_cast<float>(cc.gainG),
+                        static_cast<float>(cc.gainB));
+    cw.liftLuma = 0.0;
+    cw.gammaLuma = 1.0;
+    cw.gainLuma = 0.0;
+    return cw;
+}
+
+void ColorGradingPanel::syncColorCorrectionFromWheels(const ColorWheels &cw)
+{
+    m_cc.liftR = static_cast<double>(cw.lift.x()) + cw.liftLuma;
+    m_cc.liftG = static_cast<double>(cw.lift.y()) + cw.liftLuma;
+    m_cc.liftB = static_cast<double>(cw.lift.z()) + cw.liftLuma;
+
+    m_cc.gammaR = wheelGammaToCorrection(static_cast<double>(cw.gamma.x()) * cw.gammaLuma);
+    m_cc.gammaG = wheelGammaToCorrection(static_cast<double>(cw.gamma.y()) * cw.gammaLuma);
+    m_cc.gammaB = wheelGammaToCorrection(static_cast<double>(cw.gamma.z()) * cw.gammaLuma);
+
+    m_cc.gainR = static_cast<double>(cw.gain.x()) + cw.gainLuma;
+    m_cc.gainG = static_cast<double>(cw.gain.y()) + cw.gainLuma;
+    m_cc.gainB = static_cast<double>(cw.gain.z()) + cw.gainLuma;
+}
+
+void ColorGradingPanel::updateBasicTemperatureTintFromCC()
+{
+    if (!m_temperature.slider || !m_tint.slider)
+        return;
+    QSignalBlocker bt(m_temperature.slider);
+    QSignalBlocker bi(m_tint.slider);
+    m_temperature.slider->setValue(static_cast<int>(std::round(m_cc.temperature)));
+    m_tint.slider->setValue(static_cast<int>(std::round(m_cc.tint)));
+    m_temperature.valueLabel->setText(QString::number(static_cast<int>(m_cc.temperature)));
+    m_tint.valueLabel->setText(QString::number(static_cast<int>(m_cc.tint)));
+}
+
+void ColorGradingPanel::updateWhiteBalanceControlsFromCC()
+{
+    if (!m_wbTemperature || !m_wbTint)
+        return;
+    QSignalBlocker bt(m_wbTemperature);
+    QSignalBlocker bi(m_wbTint);
+    const int tempSlider = static_cast<int>(std::round(m_cc.temperature));
+    const int tintSlider = static_cast<int>(std::round(m_cc.tint));
+    m_wbTemperature->setValue(tempSlider);
+    m_wbTint->setValue(tintSlider);
+    const double K = 5500.0 + static_cast<double>(tempSlider) * 30.0;
+    if (m_wbTemperatureLabel)
+        m_wbTemperatureLabel->setText(QString::number(static_cast<int>(K)) + "K");
+    if (m_wbTintLabel)
+        m_wbTintLabel->setText((tintSlider >= 0 ? QStringLiteral("+") : QString())
+                               + QString::number(tintSlider));
+}
+
+void ColorGradingPanel::updateGraphicalWheelsFromCC()
+{
+    if (m_liftWheel)
+        m_liftWheel->setColor(m_cc.liftR, m_cc.liftG, m_cc.liftB);
+    if (m_gammaWheel)
+        m_gammaWheel->setColor(m_cc.gammaR, m_cc.gammaG, m_cc.gammaB);
+    if (m_gainWheel)
+        m_gainWheel->setColor(m_cc.gainR, m_cc.gainG, m_cc.gainB);
+}
+
 void ColorGradingPanel::setColorCorrection(const ColorCorrection &cc)
 {
     m_cc = cc;
     m_updating = true;
-    m_liftWheel->setColor(cc.liftR, cc.liftG, cc.liftB);
-    m_gammaWheel->setColor(cc.gammaR, cc.gammaG, cc.gammaB);
-    m_gainWheel->setColor(cc.gainR, cc.gainG, cc.gainB);
+    updateGraphicalWheelsFromCC();
     updateSlidersFromCC();
+    updateWhiteBalanceControlsFromCC();
+    setWheels(wheelsFromColorCorrection(m_cc));
     m_updating = false;
+}
+
+void ColorGradingPanel::applyWhiteBalancePick(const QColor &pixel)
+{
+    setWhiteBalancePickModeActive(false);
+    if (!pixel.isValid())
+        return;
+
+    const wbpick::TempTintCorrection correction =
+        wbpick::tempTintForNeutral(pixel);
+    m_cc.temperature = correction.temperature;
+    m_cc.tint = correction.tint;
+    updateSlidersFromCC();
+    updateWhiteBalanceControlsFromCC();
+    emit colorCorrectionChanged(m_cc);
+}
+
+void ColorGradingPanel::setWhiteBalancePickModeActive(bool active)
+{
+    if (!m_wbPickButton)
+        return;
+    QSignalBlocker blocker(m_wbPickButton);
+    m_wbPickButton->setChecked(active);
 }
 
 void ColorGradingPanel::updateSlidersFromCC()
@@ -780,7 +1325,8 @@ void ColorGradingPanel::onLiftChanged(double r, double g, double b)
     m_cc.liftR = r;
     m_cc.liftG = g;
     m_cc.liftB = b;
-    emit colorCorrectionChanged(m_cc);
+    setWheels(wheelsFromColorCorrection(m_cc));
+    m_wheelDebounce->start();
 }
 
 void ColorGradingPanel::onGammaWheelChanged(double r, double g, double b)
@@ -789,7 +1335,8 @@ void ColorGradingPanel::onGammaWheelChanged(double r, double g, double b)
     m_cc.gammaR = r;
     m_cc.gammaG = g;
     m_cc.gammaB = b;
-    emit colorCorrectionChanged(m_cc);
+    setWheels(wheelsFromColorCorrection(m_cc));
+    m_wheelDebounce->start();
 }
 
 void ColorGradingPanel::onGainChanged(double r, double g, double b)
@@ -798,7 +1345,8 @@ void ColorGradingPanel::onGainChanged(double r, double g, double b)
     m_cc.gainR = r;
     m_cc.gainG = g;
     m_cc.gainB = b;
-    emit colorCorrectionChanged(m_cc);
+    setWheels(wheelsFromColorCorrection(m_cc));
+    m_wheelDebounce->start();
 }
 
 void ColorGradingPanel::onSliderChanged()
@@ -827,6 +1375,7 @@ void ColorGradingPanel::onSliderChanged()
     m_temperature.valueLabel->setText(QString::number(static_cast<int>(m_cc.temperature)));
     m_tint.valueLabel->setText(QString::number(static_cast<int>(m_cc.tint)));
     m_gamma.valueLabel->setText(QString::number(m_cc.gamma, 'f', 2));
+    updateWhiteBalanceControlsFromCC();
 
     emit colorCorrectionChanged(m_cc);
 }
@@ -863,6 +1412,8 @@ void ColorGradingPanel::onWheelSliderChanged()
     m_wheels.gammaLuma = gammaLuma;
     m_wheels.gain = gainVec;
     m_wheels.gainLuma = gainLuma;
+    syncColorCorrectionFromWheels(m_wheels);
+    updateGraphicalWheelsFromCC();
 
     // Update labels
     auto fmtLiftGain = [](double v) { return QString::number(v, 'f', 2); };
@@ -899,6 +1450,7 @@ ColorWheels ColorGradingPanel::currentWheels() const
 void ColorGradingPanel::setWheels(const ColorWheels &cw)
 {
     m_wheels = cw;
+    syncColorCorrectionFromWheels(cw);
 
     QSignalBlocker b1(m_liftSliders.r);
     QSignalBlocker b2(m_liftSliders.g);
@@ -943,6 +1495,7 @@ void ColorGradingPanel::setWheels(const ColorWheels &cw)
     m_gainSliders.gLabel->setText(QString::number(static_cast<double>(cw.gain.y()), 'f', 2));
     m_gainSliders.bLabel->setText(QString::number(static_cast<double>(cw.gain.z()), 'f', 2));
     m_gainSliders.lumaLabel->setText(QString::number(cw.gainLuma, 'f', 2));
+    updateGraphicalWheelsFromCC();
 }
 
 void ColorGradingPanel::setLutList(const QVector<LutData> &luts)
@@ -965,6 +1518,25 @@ QString ColorGradingPanel::selectedLutName() const
 double ColorGradingPanel::lutIntensity() const
 {
     return m_lutIntensitySlider->value() / 100.0;
+}
+
+QJsonObject ColorGradingPanel::curvesToJson(int srcWidth, int srcHeight) const
+{
+    ClipCurveData curves;
+    if (m_curveEditor)
+        curves.setPoints(m_curveEditor->allPoints());
+    return curveDataToJson(curves, srcWidth, srcHeight);
+}
+
+void ColorGradingPanel::curvesFromJson(const QJsonObject &obj, int, int)
+{
+    if (!m_curveEditor)
+        return;
+    const ClipCurveData curves = curveDataFromJson(obj);
+    const bool wasUpdating = m_updating;
+    m_updating = true;
+    m_curveEditor->setAllPoints(curves.editorPointsOrIdentity());
+    m_updating = wasUpdating;
 }
 
 void ColorGradingPanel::onLutComboChanged(int index)
@@ -1004,6 +1576,8 @@ void ColorGradingPanel::onResetClicked()
         if (m_wbTemperatureLabel) m_wbTemperatureLabel->setText(tr("5500K"));
         if (m_wbTintLabel) m_wbTintLabel->setText(tr("+0"));
     }
+    if (m_wbPickButton && m_wbPickButton->isChecked())
+        m_wbPickButton->setChecked(false);
 
     // US-CG-3: reset vignette sliders to identity (amount=0 → free no-op,
     // midpoint=70 / roundness=0 / feather=30 are the spec defaults).
@@ -1130,7 +1704,14 @@ void ColorGradingPanel::onResetClicked()
         if (m_hslqGainBLabel)  m_hslqGainBLabel->setText(QStringLiteral("0"));
     }
 
+    if (m_curveEditor)
+        m_curveEditor->setAllPoints(ClipCurveData::identityEditorPoints());
+
     m_updating = false;
+    writeCurvesToSelectedClip(findTimelineForColorPanel(this),
+                              ClipCurveData::identityEditorPoints());
+    writeHslSecondaryToSelectedClip(findTimelineForColorPanel(this),
+                                    HslSecondaryGrade{});
 
     m_lutCombo->setCurrentIndex(0);
     m_lutIntensitySlider->setValue(100);
@@ -1200,6 +1781,9 @@ void ColorGradingPanel::onWhiteBalanceChanged()
 
     const int tempSlider = m_wbTemperature->value();
     const int tintSlider = m_wbTint->value();
+    m_cc.temperature = tempSlider;
+    m_cc.tint = tintSlider;
+    updateBasicTemperatureTintFromCC();
 
     // Temperature: slider -100..+100 maps to K = 5500 + slider*30
     // → range 2500..8500 (cool→warm). Higher K = cooler input compensation
@@ -1225,6 +1809,11 @@ void ColorGradingPanel::onWhiteBalanceChanged()
     emit whiteBalanceChanged(static_cast<float>(rGain),
                              static_cast<float>(gGain),
                              static_cast<float>(bGain));
+}
+
+void ColorGradingPanel::onWhiteBalancePickToggled(bool enabled)
+{
+    emit whiteBalancePickModeRequested(enabled);
 }
 
 void ColorGradingPanel::onVignetteChanged()
@@ -1418,14 +2007,43 @@ void ColorGradingPanel::onHslQualifierChanged()
     const float gainG     = std::pow(2.0f, gainGV  / 50.0f);
     const float gainB     = std::pow(2.0f, gainBV  / 50.0f);
 
-    emit hslQualifierChanged(enabled,
-                             hueCenter, hueRange,
-                             satMin, satMax,
-                             lumaMin, lumaMax,
-                             softness,
-                             liftR, liftG, liftB,
-                             gammaR, gammaG, gammaB,
-                             gainR, gainG, gainB);
+    HslSecondaryGrade hsl;
+    hsl.enabled = enabled;
+    hsl.hueCenter = hueCenter;
+    hsl.hueRange = hueRange;
+    hsl.satMin = satMin;
+    hsl.satMax = satMax;
+    hsl.lumaMin = lumaMin;
+    hsl.lumaMax = lumaMax;
+    hsl.softness = softness;
+    hsl.liftR = liftR;
+    hsl.liftG = liftG;
+    hsl.liftB = liftB;
+    hsl.gammaR = gammaR;
+    hsl.gammaG = gammaG;
+    hsl.gammaB = gammaB;
+    hsl.gainR = gainR;
+    hsl.gainG = gainG;
+    hsl.gainB = gainB;
+    writeHslSecondaryToSelectedClip(findTimelineForColorPanel(this), hsl);
+
+    emit hslQualifierChanged(hsl.enabled,
+                             static_cast<float>(hsl.hueCenter),
+                             static_cast<float>(hsl.hueRange),
+                             static_cast<float>(hsl.satMin),
+                             static_cast<float>(hsl.satMax),
+                             static_cast<float>(hsl.lumaMin),
+                             static_cast<float>(hsl.lumaMax),
+                             static_cast<float>(hsl.softness),
+                             static_cast<float>(hsl.liftR),
+                             static_cast<float>(hsl.liftG),
+                             static_cast<float>(hsl.liftB),
+                             static_cast<float>(hsl.gammaR),
+                             static_cast<float>(hsl.gammaG),
+                             static_cast<float>(hsl.gammaB),
+                             static_cast<float>(hsl.gainR),
+                             static_cast<float>(hsl.gainG),
+                             static_cast<float>(hsl.gainB));
 }
 
 // US-EF-4: any Effects (Sharpen / Blur / Lens Distortion) slider changed.

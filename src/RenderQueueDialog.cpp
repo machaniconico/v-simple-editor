@@ -395,6 +395,22 @@ void RenderQueueDialog::onAddJobClicked()
         return;
     }
 
+    // RM-1.4: blank source path == the "(現在開いているプロジェクト)"
+    // placeholder. Previously this produced an empty projectFilePath →
+    // RenderQueue::resolveTimeline returned nullptr → the whole render,
+    // and every track matte, was silently dropped. Carry the live
+    // Timeline instead (its matte carrier is kept synced by the owner).
+    if (j.projectFilePath.isEmpty()) {
+        if (!m_liveTimeline) {
+            QMessageBox::warning(this,
+                QStringLiteral("プロジェクト未指定"),
+                QStringLiteral("ソースを空にする場合は現在のプロジェクトが"
+                               "必要です。プロジェクトファイルを指定してください。"));
+            return;
+        }
+        j.timeline = m_liveTimeline;
+    }
+
     m_queue->addJob(j);
 }
 

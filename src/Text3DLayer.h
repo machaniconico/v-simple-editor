@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Camera3D.h"
 #include "ExtrudedMesh.h"
 
 #include <QColor>
@@ -11,8 +12,6 @@
 #include <QSize>
 #include <QString>
 #include <QVector3D>
-
-class Camera3D;
 
 class Text3DLayer : public QObject
 {
@@ -27,6 +26,8 @@ public:
     void setPerCharScale(QVector3D scaleAmount);
     void setCameraDistance(double distance);
     void setRotationAnimAxis(QVector3D tumbleAxis);
+    void setCamera(const Camera3D &camera);
+    const Camera3D &camera() const;
 
     // --- True extrusion mode (US-3D-3) ---
     // When extrude is enabled, renderFrame() ignores the 2D-quad path and
@@ -73,7 +74,7 @@ public:
 private:
     double characterProgress(int characterIndex, double time) const;
     QImage renderFrameQuads(QSize size, double time, const Camera3D &cam) const;
-    QImage renderFrameExtruded(QSize size, double time) const;
+    QImage renderFrameExtruded(QSize size, double time, const Camera3D &cam) const;
     void ensureExtrudedMesh() const;
 
     QString m_text;
@@ -82,6 +83,7 @@ private:
     QVector3D m_perCharPosition;
     QVector3D m_perCharScale;
     double m_cameraDistance = 400.0;
+    Camera3D m_camera;
     QVector3D m_rotationAnimAxis;
     double m_staggerDelay = 0.08;
     double m_staggerDuration = 0.6;
@@ -105,3 +107,7 @@ private:
     mutable bool m_cacheValid = false;
     mutable int m_meshBuildCount = 0;
 };
+
+QSize text3DPreviewProxySize(QSize fullSize);
+bool shouldUseText3DPreviewProxy(const Text3DLayer &layer, QSize frameSize, int threshold);
+QImage renderText3DProxy(const Text3DLayer &layer, QSize fullSize, double time, const Camera3D &cam);

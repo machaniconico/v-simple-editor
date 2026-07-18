@@ -1,0 +1,24 @@
+# S4 parity test LUT — identity-plus-tint, 2x2x2 3D cube.
+# Generated for the NLE-parity campaign story S4 (color + 3D LUT in the
+# tlrender::renderFrameAt SSOT). No .cube existed in the repo, so this
+# minimal valid grid is checked in as a test asset.
+#
+# Transform: R' = clamp(R + 0.06, 0, 1); G' = G; B' = clamp(B - 0.06, 0, 1)
+# (a mild warm push) — non-identity so the LUT measurably changes pixels,
+# yet a smooth trilinear map so LutImporter parses/interpolates it cleanly.
+#
+# Data order is .cube standard: R fastest, then G, then B
+# (index = r + g*size + b*size*size — matches
+# LutImporter::trilinearInterpolate's indexing).
+TITLE "S4 Identity+Tint"
+LUT_3D_SIZE 2
+DOMAIN_MIN 0.0 0.0 0.0
+DOMAIN_MAX 1.0 1.0 1.0
+0.060000 0.000000 0.000000
+1.000000 0.000000 0.000000
+0.060000 1.000000 0.000000
+1.000000 1.000000 0.000000
+0.060000 0.000000 0.940000
+1.000000 0.000000 0.940000
+0.060000 1.000000 0.940000
+1.000000 1.000000 0.940000

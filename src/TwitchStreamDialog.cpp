@@ -8,6 +8,7 @@
 #include <QDialog>
 #include <QFormLayout>
 #include <QHBoxLayout>
+#include <QLabel>
 #include <QLineEdit>
 #include <QPlainTextEdit>
 #include <QPushButton>
@@ -81,6 +82,11 @@ TwitchStreamDialog::TwitchStreamDialog(QWidget *parent)
 
     // ---- assemble -----------------------------------------------------------
     auto *mainLayout = new QVBoxLayout(this);
+    auto *setupHint = new QLabel(
+        tr("Twitch のストリームキー (RTMP) を配信設定に入力してください。"),
+        this);
+    setupHint->setWordWrap(true);
+    mainLayout->addWidget(setupHint);
     mainLayout->addLayout(formLayout);
     mainLayout->addLayout(btnLayout);
     mainLayout->addWidget(m_commandView);

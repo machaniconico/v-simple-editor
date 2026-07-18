@@ -279,7 +279,7 @@ void lzwCompress(const QVector<quint8> &indices, int minCodeSize, QByteArray &ou
             if (nextCode < 4096) {
                 dict.insert(key, nextCode);
                 ++nextCode;
-                if (nextCode == (1 << codeSize) && codeSize < 12)
+                if (nextCode > (1 << codeSize) && codeSize < 12)
                     ++codeSize;
             } else {
                 // Dictionary full: emit clear and restart.

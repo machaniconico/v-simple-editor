@@ -1,4 +1,5 @@
 #include "MultiCamDialog.h"
+#include "MultiCamSync.h"
 
 #include <QDialogButtonBox>
 #include <QFileDialog>
@@ -286,13 +287,69 @@ void MultiCamDialog::onRemoveAngle()
 
 void MultiCamDialog::onSync()
 {
-    // Simplified sync: every angle aligns to timeline time 0. (Audio
-    // waveform / clap-board sync deferred to follow-up story — NIT.)
-    for (MultiCamAngle &a : m_project.angles)
-        a.syncOffsetUs = 0;
+    const int angleCount = m_project.angles.size();
+    if (angleCount < 2) {
+        for (MultiCamAngle &a : m_project.angles)
+            a.syncOffsetUs = 0;
+        QMessageBox::information(
+            this, tr("Multi-camera"),
+            tr("Audio waveform sync needs at least two angles; offsets remain 0."));
+        return;
+    }
+
+    const int peaksPerSecond = 50;
+    const double envHopMs = 1000.0 / static_cast<double>(peaksPerSecond);
+
+    QVector<QVector<float>> envelopes;
+    envelopes.reserve(angleCount);
+    for (const MultiCamAngle &a : m_project.angles) {
+        const QString path = a.sourcePath.trimmed();
+        if (path.isEmpty() || !QFileInfo::exists(path)) {
+            envelopes.append(QVector<float>());
+            continue;
+        }
+
+        const WaveformData wf =
+            WaveformGenerator::generate(path, peaksPerSecond);
+        envelopes.append(wf.peaks);
+    }
+
+    bool hasUsableComparison =
+        !envelopes.isEmpty() && !envelopes.first().isEmpty();
+    if (hasUsableComparison) {
+        hasUsableComparison = false;
+        for (int i = 1; i < envelopes.size(); ++i) {
+            if (!envelopes[i].isEmpty()) {
+                hasUsableComparison = true;
+                break;
+            }
+        }
+    }
+
+    const QVector<qint64> offsetsUs =
+        multicam::MultiCamSync::computeAngleOffsetsUs(envelopes, envHopMs);
+
+    QString offsetSummary;
+    for (int i = 0; i < angleCount; ++i) {
+        m_project.angles[i].syncOffsetUs =
+            i < offsetsUs.size() ? offsetsUs[i] : 0;
+
+        if (!offsetSummary.isEmpty())
+            offsetSummary += QLatin1Char('\n');
+        offsetSummary += tr("%1: %2 ms")
+            .arg(m_project.angles[i].label.isEmpty()
+                     ? tr("Angle %1").arg(i + 1)
+                     : m_project.angles[i].label)
+            .arg(static_cast<double>(m_project.angles[i].syncOffsetUs)
+                 / 1000.0,
+                 0, 'f', 1);
+    }
+
     QMessageBox::information(
         this, tr("Multi-camera"),
-        tr("All angles aligned to timeline start (0 s)."));
+        hasUsableComparison
+            ? tr("Audio waveform sync complete.\n%1").arg(offsetSummary)
+            : tr("Audio waveform sync complete; usable offsets were not detected, so offsets remain 0."));
 }
 
 void MultiCamDialog::onPlayheadChanged(int valueMs)

@@ -17,6 +17,9 @@
 #include <QByteArray>
 #include <QtGlobal>
 
+#include "CredentialAuditLog.h"
+#include "CredentialStore.h"
+
 namespace youtube {
 namespace oauth {
 
@@ -25,10 +28,15 @@ namespace oauth {
 // ─────────────────────────────────────────────
 YoutubeOAuthConfig YoutubeOAuthConfig::defaultConfig() {
     YoutubeOAuthConfig c;
-    c.clientId     = QString();
-    c.clientSecret = QString();
+    c.clientId     = creds::CredentialStore::get(
+        "VEDITOR_YOUTUBE_CLIENT_ID",
+        QStringLiteral("youtube_oauth/client_id"));
+    c.clientSecret = creds::CredentialStore::get(
+        "VEDITOR_YOUTUBE_CLIENT_SECRET",
+        QStringLiteral("youtube_oauth/client_secret"));
     c.redirectUri  = QStringLiteral("http://localhost:8080/callback");
     c.scope        = QStringLiteral("https://www.googleapis.com/auth/youtube.upload");
+    c.baseUrl      = QString();
     return c;
 }
 
@@ -208,7 +216,10 @@ QString AuthClient::launchAuthFlow() {
         redirect.setPort(m_callbackPort);
     }
 
-    QUrl authUrl(QStringLiteral("https://accounts.google.com/o/oauth2/v2/auth"));
+    const QString authBase = m_config.baseUrl.isEmpty()
+        ? QStringLiteral("https://accounts.google.com")
+        : m_config.baseUrl;
+    QUrl authUrl(authBase + QStringLiteral("/o/oauth2/v2/auth"));
     QUrlQuery q;
     q.addQueryItem(QStringLiteral("client_id"),             m_config.clientId);
     q.addQueryItem(QStringLiteral("redirect_uri"),          redirect.toString());
@@ -267,7 +278,10 @@ void AuthClient::postToTokenEndpoint(const QByteArray& formBody, bool isRefresh)
     if (!m_nam) {
         m_nam = new QNetworkAccessManager(this);
     }
-    QNetworkRequest req(QUrl(QStringLiteral("https://oauth2.googleapis.com/token")));
+    const QString tokenBase = m_config.baseUrl.isEmpty()
+        ? QStringLiteral("https://oauth2.googleapis.com")
+        : m_config.baseUrl;
+    QNetworkRequest req(QUrl(tokenBase + QStringLiteral("/token")));
     req.setHeader(QNetworkRequest::ContentTypeHeader,
                   QStringLiteral("application/x-www-form-urlencoded"));
     req.setRawHeader("Accept", "application/json");
@@ -284,17 +298,26 @@ void AuthClient::onTokenReplyFinished() {
         emit authError(QStringLiteral("Token reply has no sender"));
         return;
     }
+    m_pendingReply.clear();
+    const QNetworkReply::NetworkError err = reply->error();
+    const QString errStr = reply->errorString();
+    const QByteArray body = reply->readAll();
     reply->deleteLater();
-    if (reply->error() != QNetworkReply::NoError) {
-        const QByteArray body = reply->readAll();
+    if (err != QNetworkReply::NoError) {
+        creds::CredentialAuditLog::logEvent(
+            creds::CredentialAuditLog::EventType::RefreshFailed,
+            QStringLiteral("YouTube"),
+            QStringLiteral("youtube_oauth/access_token"),
+            errStr);
         emit authError(QStringLiteral("Token endpoint error: %1 (%2)")
-                       .arg(reply->errorString(), QString::fromUtf8(body)));
+                       .arg(errStr, QString::fromUtf8(body)));
         return;
     }
-    parseTokenJson(reply->readAll(), m_pendingIsRefresh);
+    parseTokenJson(body, m_pendingIsRefresh);
 }
 
 void AuthClient::parseTokenJson(const QByteArray& json, bool isRefresh) {
+    const QString previousAccess = m_token.accessToken;
     QJsonParseError perr{};
     const QJsonDocument doc = QJsonDocument::fromJson(json, &perr);
     if (perr.error != QJsonParseError::NoError || !doc.isObject()) {
@@ -326,7 +349,20 @@ void AuthClient::parseTokenJson(const QByteArray& json, bool isRefresh) {
     }
 
     m_token = t;
-    Q_UNUSED(isRefresh);
+    saveToken();  // Phase 5F: refresh_token + expiresAt を persist
+    if (isRefresh && previousAccess != m_token.accessToken) {
+        creds::CredentialAuditLog::logEvent(
+            creds::CredentialAuditLog::EventType::CredentialRotated,
+            QStringLiteral("YouTube"),
+            QStringLiteral("youtube_oauth/access_token"),
+            QStringLiteral("access_token rotated via refresh"));
+    }
+    creds::CredentialAuditLog::logEvent(
+        isRefresh ? creds::CredentialAuditLog::EventType::RefreshSucceeded
+                  : creds::CredentialAuditLog::EventType::AccessTokenSet,
+        QStringLiteral("YouTube"),
+        QStringLiteral("youtube_oauth/access_token"),
+        QStringLiteral("expiresAt=%1").arg(m_token.expiresAt.toString(Qt::ISODate)));
     emit tokensReceived(m_token);
 }
 
@@ -335,10 +371,12 @@ void AuthClient::saveToken() const {
     QSettings s;
     if (m_token.refreshToken.isEmpty()) {
         s.remove(QStringLiteral("youtube_oauth/refresh_token"));
-        return;
+    } else {
+        const QByteArray b64 = m_token.refreshToken.toUtf8().toBase64();
+        s.setValue(QStringLiteral("youtube_oauth/refresh_token"), QString::fromLatin1(b64));
     }
-    const QByteArray b64 = m_token.refreshToken.toUtf8().toBase64();
-    s.setValue(QStringLiteral("youtube_oauth/refresh_token"), QString::fromLatin1(b64));
+    // Phase 5F: access_token expiry を persist (access_token 本体は揮発)
+    creds::CredentialStore::setExpiry(QStringLiteral("youtube_oauth/access_token"), m_token.expiresAt);
 }
 
 bool AuthClient::loadToken() {
@@ -348,9 +386,28 @@ bool AuthClient::loadToken() {
     const QByteArray decoded = QByteArray::fromBase64(stored.toLatin1());
     if (decoded.isEmpty()) return false;
     m_token.refreshToken = QString::fromUtf8(decoded);
-    // access_token は揮発。refresh_token のみ復元 → 必要なら refreshIfExpired() を呼ぶ。
     m_token.accessToken.clear();
-    m_token.expiresAt = QDateTime();
+    // Phase 5F: 永続化された expiry を読み戻す
+    m_token.expiresAt = creds::CredentialStore::getExpiry(QStringLiteral("youtube_oauth/access_token"));
+    // Phase 5G: auto-refresh if expired
+    const bool fired = refreshIfExpired();
+    if (fired) {
+        qDebug() << "[YT OAuth] auto-refresh fired on loadToken";
+        creds::CredentialAuditLog::logEvent(
+            creds::CredentialAuditLog::EventType::RefreshFired,
+            QStringLiteral("YouTube"),
+            QStringLiteral("youtube_oauth/access_token"),
+            QStringLiteral("auto-refresh on loadToken"));
+    }
+    creds::CredentialAuditLog::logEvent(
+        creds::CredentialAuditLog::EventType::AccessTokenLoaded,
+        QStringLiteral("YouTube"),
+        QStringLiteral("youtube_oauth/access_token"),
+        QStringLiteral("refresh_token restored from QSettings"));
+    const int purged = creds::CredentialAuditLog::purgeOlderThanDays(30);
+    if (purged > 0) {
+        qDebug() << "[YT OAuth] audit log purged" << purged << "old entries (>30 days)";
+    }
     return true;
 }
 

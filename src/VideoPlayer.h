@@ -3,6 +3,7 @@
 #include <QWidget>
 #include <QLabel>
 #include <QImage>
+#include <QColor>
 #include <QPushButton>
 #include <QSlider>
 #include <QTimer>
@@ -17,8 +18,18 @@
 #include <functional>
 #include "VideoEffect.h"
 #include "PlaybackTypes.h"
+#include "color/ClipColor.h"
+#include "MaskSystem.h"  // STAGE4B: TrackMatteType for DecodedLayer matte fields
 #include "TextManager.h"
 #include "DecoderSlotManager.h"
+#include "AcesColor.h"  // AR-2: ACES シーンリファード色管理パイプライン (SSOT は MainWindow)
+#include "ExposureAids.h"  // EXP-AID: 露出/フォーカス確認エイド (プレビュー表示専用)
+#include "SafeZone.h"      // SAFE-ZONE: SNS セーフゾーンオーバーレイ (プレビュー表示専用)
+#include "OnionSkin.h"     // ONION-SKIN: 前後フレーム半透明オーバーレイ (プレビュー表示専用)
+#include "playback/CompositeFrameCache.h"     // ADAPTIVE-1: 合成フレーム LRU キャッシュ
+#include "playback/PlaybackQualityPolicy.h"   // ADAPTIVE-1: 再生品質ヒステリシスポリシー
+#include "playback/GpuLayerCompositor.h"      // STAGE3-GPU: マルチトラック GPU 合成 (既定 OFF)
+#include <memory>                             // STAGE3-GPU: m_gpuCompositor 遅延生成用
 
 // Identifies a per-clip decoder in the V2+ pool. Keyed on
 // (filePath, clipInMs, sourceTrack, sourceClipIndex) so:
@@ -69,6 +80,8 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 
+void setPlaybackProxyDivisorPreference(int div);
+
 class VideoPlayer : public QWidget
 {
     Q_OBJECT
@@ -101,13 +114,39 @@ public:
     void setMuted(bool muted);
     bool isMuted() const { return m_muted; }
     void setCanvasSize(int width, int height);
+    void setProjectOutputSize(const QSize &size);
+    QSize projectOutputSize() const { return m_projectOutputSize; }
     void setColorCorrection(const ColorCorrection &cc);
+    // AR-2: ACES シーンリファード色管理。MainWindow の SSOT (m_acesPipeline) を
+    // プレビューへ反映する。enabled=true のときのみ displayFrame の最終合成結果へ
+    // aces::applyPipelineToImage を適用し、enabled=false なら一切呼ばず従来出力と
+    // ビット同一を維持する (回帰ゼロ)。セット時に表示中フレームを即再描画する。
+    void setAcesPipeline(const aces::AcesPipeline &pipeline);
+    // EXP-AID: 露出/フォーカス確認エイド (フォルスカラー / ゼブラ / フォーカスピーキング)。
+    // これは「画面確認専用」のオーバーレイで、displayFrame が GL / ラベルへ渡す直前に
+    // 表示用 QImage の一時コピーへのみ適用する。m_currentFrameImage・frameComposited
+    // のペイロード・合成キャッシュ (cachePreviewComposite) には素のフレームが入るので
+    // 汚染しない。書き出し (renderFrameAt / TimelineFrameRenderer / RenderQueue /
+    // Exporter) には一切関与せず、エイドは書き出し画には焼き込まれない。
+    // mode == None (既定) のときは一切呼ばず従来パスとビット同一。set 時に表示中
+    // フレームを即再描画する。
+    void setExposureAidMode(exposureaid::AidMode mode);
+    void setExposureAidConfig(const exposureaid::AidConfig &cfg);
+    void setSafeZonePlatform(safezone::Platform p);  // SAFE-ZONE
+    void setOnionSkinConfig(const onionskin::Config &cfg);
+    onionskin::Config onionSkinConfig() const { return m_onionSkin; }
+    // PV-C: プレビュー表示の長辺上限(px)。0=無制限。display専用(書き出し非変更)。
+    void setPreviewMaxLongSide(int px);
+    int previewMaxLongSide() const { return m_previewMaxLongSide; }
+    exposureaid::AidMode exposureAidMode() const { return m_exposureAidMode; }
+    safezone::Platform safeZonePlatform() const { return m_safeZonePlatform; }
     // Transient effect stack applied on top of every composed frame (live dialog preview).
     // Empty vector disables the path. Does not mutate timeline state.
     // live=true keeps CPU effects active during playback (committed state).
     // live=false (default) is pause-only — used during dialog editing so
     // heavy per-frame work doesn't stutter slider drags.
     void setPreviewEffects(const QVector<VideoEffect> &effects, bool live = false);
+    void setGpuEffectsEnabled(bool enabled);
     bool isGLAccelerated() const { return m_useGL; }
     void setGLAcceleration(bool enabled);
 
@@ -136,6 +175,7 @@ public:
     // internals directly.
     int proxyDivisor() const { return m_proxyDivisor; }
     void setProxyDivisor(int divisor);
+    void applyPlaybackQualityChanged();
     GLPreview *glPreview() const { return m_glPreview; }
     // Phase 1e — returns the ID3D11Device* the FFmpeg HW context owns so
     // GLPreview can hand it to wglDXOpenDeviceNV. nullptr when no D3D11VA
@@ -194,6 +234,37 @@ public:
     // into ColorGradingPanel::setMaskRect or GLPreview::setMask directly.
     void enterMaskEditMode(std::function<void(QRectF)> callback);
     void exitMaskEditMode();
+    void enterWbEyedropperMode(std::function<void(QColor)> callback);
+    void exitWbEyedropperMode();
+    bool isWbEyedropperActive() const { return m_wbEyedropperActive; }
+
+    // Test-only seam for the PARITY S3 selftest (src/main.cpp
+    // runParitySelftest). composeMultiTrackFrame + the DecodedLayer struct
+    // are private; this thin public forwarder builds DecodedLayer entries
+    // from primitive overlay params and invokes the REAL private
+    // composeMultiTrackFrame so the selftest's reference is the genuine
+    // authoritative compositor (not a copy) without exposing private types.
+    // Production code must keep using composeMultiTrackFrame directly.
+    QImage composeMultiTrackFrameForTest(
+        const QImage &v1Frame,
+        const QVector<QImage> &overlayRgb,
+        const QVector<double> &overlayOpacity,
+        const QVector<double> &overlayScale,
+        const QVector<double> &overlayDx,
+        const QVector<double> &overlayDy,
+        const QVector<double> &overlayRotationDeg = {},
+        const QVector<LayerStyle> &overlayStyle = {}) const;
+    // Test-only seam for grade-keyframe GPU-preview wiring.
+    bool pushActiveClipColorCorrectionToGlPreviewForTest(qint64 timelineUsec);
+
+    // NOTE: the genuine text baker is now the free function
+    // textbake::bakeOverlays (src/TextOverlayBake.h), extracted verbatim from
+    // composeFrameWithOverlays so the SSOT renderer's worker-thread export
+    // path can bake text WITHOUT constructing a VideoPlayer (a QWidget) off
+    // the GUI thread. composeFrameWithOverlays delegates to it; the S6 parity
+    // selftest calls it directly. The old composeFrameWithOverlaysForTest
+    // QWidget seam was removed (it forced off-GUI-thread QWidget construction
+    // in the export path — Qt undefined behaviour).
 
 public slots:
     void play();
@@ -243,6 +314,9 @@ signals:
     // Iteration 15 — emitted when the user clicks the maximize button or
     // when MainWindow's Esc shortcut calls setPreviewMaximized(false).
     void previewMaximizeChanged(bool maximized);
+    // PV-B — プレビュー上で右クリックされた(グローバル座標)。MainWindow が
+    // 受けて表示トグル+現クリップ操作メニューを構築する。
+    void previewContextMenuRequested(const QPoint &globalPos);
 
 protected:
     void resizeEvent(QResizeEvent *event) override;
@@ -257,6 +331,7 @@ private:
     void scheduleNextFrame();
     void performPendingSeek();
     void updatePositionUi();
+    bool pushActiveClipColorCorrectionToGlPreview();
     // Like updatePositionUi() but does NOT reproject m_timelinePositionUs
     // from m_currentPositionUs. Used by stepForward/Backward when they need
     // the seekbar / time label / positionChanged signal to honour the
@@ -282,6 +357,7 @@ private:
     void handlePlaybackTick();
     void updatePlayButton();
     void displayFrame(const QImage &image);
+    void displaySeekFrameConformed(const QImage &v1Image);
 
     // Sequence helpers (Phase A/B). When m_sequence is empty, the player runs
     // in single-file legacy mode and these are unused.
@@ -348,6 +424,9 @@ private:
         QImage lastFrameRgb;
         int64_t lastFramePresentedTimelineUs = -1;
         bool firstFrameDecoded = false;
+        // HDR Stage4: write-once in openTrackDecoder from clip HDR metadata
+        // and VEDITOR_HDR_OVERLAY. Default false keeps the RGB888 path.
+        bool wantRgba64Overlay = false;
         // > 0 means this decoder has been moved into the eviction grace
         // pool. Decremented per playback tick; reaches 0 → safe to free
         // (deferred outside decode loop).
@@ -357,22 +436,51 @@ private:
     TrackDecoder *acquireDecoderForClip(const PlaybackEntry &entry);
     void releaseDecoderForClip(const TrackKey &key);
 
+public:
     // ---- Phase 1d software compositor ---------------------------------------
     // One overlay layer harvested from a V2+ TrackDecoder for the current
     // tick. composeMultiTrackFrame paints these on top of the V1 frame in
     // m_sequence order (V1 base + V2/V3/... above), with isFresh=false
     // entries falling back to the previous decoded frame from the eviction
     // grace pool when a re-seek hasn't caught up yet.
+    //
+    // Public so that clipstack::layerPaintOrderLess (the sort comparator
+    // extracted for testability) can be declared as a free function below
+    // (inside namespace clipstack) and used in the S3-STACK predicate
+    // sub-assertion in src/main.cpp without exposing the full private
+    // compositor surface.
     struct DecodedLayer {
         QImage rgb;
         double opacity = 1.0;
+        clipcolor::ColorMeta colorMeta;
         double videoScale = 1.0;
         double videoDx = 0.0;
         double videoDy = 0.0;
+        double rotation2DDegrees = 0.0;
         int sourceTrack = 0;
+        int sourceClipIndex = -1;
         int sequenceIdx = -1;
+        LayerStyle layerStyle;
+        bool fitContain = false;
+        bool fitCover = false;
         bool isFresh = true;
+        bool isNullObject = false;
+        // STAGE4B (live GPU track-matte): consumed by tryGpuComposeLayers when
+        // VEDITOR_GPU_COMPOSITE is ON and GL is available (else matte-free).
+        // matteType + matteSourceClipId are copied from the PlaybackEntry; the
+        // matteSourceClipId is the trackMatteClipKey ("trackIdx:clipIdx") of the
+        // matte SOURCE clip. matteSourceIndex is the RESOLVED index into the
+        // final composite() inputs vector, computed by
+        // clipstack::resolveLiveMatteSources (-1 == composite normally / no
+        // matte). Default values == today's matte-free live preview.
+        TrackMatteType matteType = TrackMatteType::None;
+        QString matteSourceClipId;
+        int matteSourceIndex = -1;
+        QString parentClipId;
+        int parentSourceIndex = -1;
     };
+
+private:
 
     QImage composeMultiTrackFrame(const QImage &v1Frame,
                                   const QVector<DecodedLayer> &overlayLayers) const;
@@ -485,6 +593,8 @@ private:
     bool m_retainLastFrameAcrossLoad = false;
     int m_canvasWidth = 1920;
     int m_canvasHeight = 1080;
+    QSize m_projectOutputSize;
+    bool m_pendingSizeRefresh = false;
     double m_playbackSpeed = 1.0;
     QImage m_currentFrameImage;
     int m_pendingSeekMs = -1;
@@ -541,6 +651,9 @@ private:
     bool m_regionPickerActive = false;
     std::function<void(QRect)> m_regionPickerCallback;
     QWidget *m_regionPickerOverlay = nullptr;
+    bool m_wbEyedropperActive = false;
+    std::function<void(QColor)> m_wbEyedropperCallback;
+    QWidget *m_wbEyedropperOverlay = nullptr;
     QVector<EnhancedTextOverlay> m_textOverlays;
     // Cached raw source of the most recent frame. Needed so
     // setHiddenTextOverlayIndex can re-compose while paused (the cached
@@ -566,6 +679,7 @@ private:
     // default/committed state.
     QVector<VideoEffect> m_previewEffects;
     bool m_previewEffectsLive = false;
+    bool m_gpuEffectsEnabled = true;
     // Preview proxy divisor (1=Full, 2=1/2, 4=1/4, 8=1/8). Applied only when
     // CPU-path effects are active during playback, so heavy Sharpen/Mosaic/
     // ChromaKey stay smooth. Persisted via QSettings "proxyDivisor".
@@ -574,6 +688,82 @@ private:
     // -1 = follow m_activeEntry (legacy)。 >= 0 = explicit sequence index。
     // 再生用の m_activeEntry とは独立。setSequence でリセット。
     int m_editTargetEntry = -1;
+
+    // AR-2: ACES 色管理パイプライン (MainWindow SSOT のコピー)。既定 enabled=false。
+    // displayFrame は enabled=true のときだけ最終合成結果へ適用するので、既定状態では
+    // 既存のプレビュー出力とビット同一 (回帰ゼロ)。
+    aces::AcesPipeline m_acesPipeline;
+    bool m_lastFrameOdtApplied{false};
+
+    // EXP-AID: 露出/フォーカス確認エイド。既定 None なので displayFrame は apply を
+    // 一切呼ばず従来出力とビット同一 (性能無影響・回帰ゼロ)。None 以外のときだけ
+    // displayFrame 内の 1 箇所で表示用 QImage の一時コピーへ適用する (キャッシュ /
+    // 保持フレーム / 書き出しには非適用)。
+    exposureaid::AidMode m_exposureAidMode = exposureaid::AidMode::None;
+    safezone::Platform m_safeZonePlatform = safezone::Platform::None;  // SAFE-ZONE
+    onionskin::Config m_onionSkin;  // ONION-SKIN: display-only、既定 OFF。
+    int m_previewMaxLongSide = 0;  // PV-C: 0=無制限。display専用の長辺上限。
+    exposureaid::AidConfig m_exposureAidConfig;
+
+    // ---- ADAPTIVE-1: アダプティブプレビュー (品質ポリシー + 合成キャッシュ) --------
+    // プレビュー再生パス専用。書き出し (RenderQueue / Exporter / renderFrameAt) は
+    // 一切経由しないので、編集↔書き出しピクセル一致 (SSOT) は不変。
+    //
+    // m_qualityPolicy: 直近 tick の合成ウォール時間とフレーム予算を比べ、ヒステリシス
+    //   付きで 1.0 → 0.5 → minScale の品質ラダーを上下する。停止時は reset() で 1.0。
+    // m_frameCache: (timelineRevision, timeMs, w, h, tier, useProxy) をキーに最終
+    //   合成 QImage を LRU 保持。同一プレイヘッド・同一編集状態での再描画
+    //   (停止フリッカー修正で残った previewSeek 再描画 / リサイズ再描画) を
+    //   再合成なしで返すための純キャッシュ。再生 tick の displayFrame 発火回数は
+    //   増やさない (cache hit でも 1 tick = 最大 1 displayFrame を厳守)。
+    // m_timelineRevision: 編集 / undo / クリップ変更で単調増加。setSequence で ++ し
+    //   invalidateRevision を呼んで古い世代のキャッシュを破棄する。
+    // m_lastTickRenderMs: 直近 tick の合成ウォール時間 (ms)。次 tick の policy 入力。
+    // m_adaptiveCanvasDivisor: policy が返した scaleFactor 由来の追加キャンバス縮小
+    //   係数 (1 / 2 / 4)。既存 canvasProxyDivisor() に乗算して合成解像度を下げる。
+    // m_adaptivePreviewEnabled: 既定 ON。VEDITOR_ADAPTIVE_PREVIEW_DISABLE=1 で OFF
+    //   (scaleFactor 強制 1.0 + キャッシュバイパス)。
+    playback::PlaybackQualityPolicy m_qualityPolicy;
+    playback::CompositeFrameCache   m_frameCache;
+    quint64 m_timelineRevision = 1;
+    double  m_lastTickRenderMs = 0.0;
+    int     m_adaptiveCanvasDivisor = 1;
+    bool    m_adaptivePreviewEnabled = true;
+    // 直近の cache 採用 tier (qualityTier キー用)。scaleFactor を整数化したもの。
+    int     m_adaptiveQualityTier = 0;
+    // ADAPTIVE-1: tick 冒頭で policy に相談し m_adaptiveCanvasDivisor /
+    // m_adaptiveQualityTier を更新する。停止/シーク経路では呼ばず policy.reset() を使う。
+    void updateAdaptiveQuality();
+    // ADAPTIVE-1: 合成済みプレビューフレームを現在の (timelineRevision, playhead,
+    // size, tier) キーでキャッシュへ put する純ヘルパー。displayFrame は呼ばない。
+    // m_adaptivePreviewEnabled=false 時は no-op。
+    void cachePreviewComposite(const QImage &composed);
+
+    // ---- STAGE3-GPU: マルチトラックプレビュー GPU 合成 (既定 OFF) -------------
+    // 既定 (VEDITOR_GPU_COMPOSITE 未設定 or "1"以外) では m_gpuCompositeEnabled=false
+    // となり、handlePlaybackTick の合成は従来 CPU 経路 (composeMultiTrackFrameInto
+    // / composeMultiTrackFrame) を一切変えずに通る = 出力ビット同一。
+    //
+    // ON 時 (=="1") かつ 多トラック (overlay layers >= 2) かつ マット無し
+    // (このプレビュー tick の DecodedLayer はマットフィールドを持たず常に matte-free)
+    // かつ compositor.isAvailable() のとき、CPU と同じ layers / 同じ canvas サイズ
+    // (適応縮小後) を GpuLayerInput に詰めて GpuLayerCompositor::composite() で
+    // GPU 合成する。GPU が空 QImage を返したら (GL 失敗) 同 tick 内で CPU 経路へ
+    // フォールバックするので、表示の displayFrame は経路に関わらず常に最大 1 回。
+    //
+    // UI スレッド専用 (GpuLayerCompositor は同一スレッド・非リエントラント契約)。
+    // VideoPlayer は UI スレッドなので OK。書き出しパス (RenderQueue / Exporter /
+    // renderFrameAt) は一切経由しない = 編集↔書き出しピクセル一致 (SSOT) は不変。
+    bool                                m_gpuCompositeChecked = false;
+    bool                                m_gpuCompositeEnabled = false;
+    std::unique_ptr<GpuLayerCompositor> m_gpuCompositor;  // 遅延生成 (初回 GPU 合成時)
+    // 初回 tick で VEDITOR_GPU_COMPOSITE / QSettings を 1 回だけ読み
+    // m_gpuCompositeEnabled をキャッシュする。
+    void ensureGpuCompositeFlag();
+    // GPU 合成を試みる純ヘルパー。成功時に canvas-final な合成 QImage を返す。
+    // 失敗 / 非対象 (flag OFF / 単一トラック / GL 不可) のときは null QImage を返し、
+    // 呼び出し側は従来 CPU 経路へフォールバックする。displayFrame は呼ばない。
+    QImage tryGpuComposeLayers(const QVector<DecodedLayer> &layers, QSize canvas);
 
     // ---- Per-clip decoder pool state (V2+ only) -----------------------------
     // Active V2+ decoders, keyed on TrackKey. V1 never lives here — it
@@ -613,3 +803,18 @@ private:
     int m_tickTraceCount = 0;
     void recordTickTrace(qint64 workNs);
 };
+
+// Free comparator used by the production sort (std::stable_sort in
+// handlePlaybackTick) AND directly exercised by the S3-STACK predicate
+// sub-assertion in src/main.cpp. Extracted from the inline lambda so a
+// re-inversion of the comparator breaks the selftest loudly.
+// Contract (V1-wins stacking, PlaybackTypes.h:34): V1 (sourceTrack==0) sorts
+// AFTER higher tracks, so the compositor paints the highest track first
+// (backmost) and V1 LAST (frontmost, ON TOP) — descending order matches
+// renderFrameAt / trackmatte::composite / buildSpecialClipComposite.
+// Wrapped in namespace clipstack to avoid GLOBAL-namespace ODR/symbol
+// pollution; all call sites must qualify as clipstack::layerPaintOrderLess.
+namespace clipstack {
+bool layerPaintOrderLess(const VideoPlayer::DecodedLayer &a,
+                         const VideoPlayer::DecodedLayer &b);
+} // namespace clipstack

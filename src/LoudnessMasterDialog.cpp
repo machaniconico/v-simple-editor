@@ -1,5 +1,7 @@
 #include "LoudnessMasterDialog.h"
 
+#include <cmath>
+
 #include <QComboBox>
 #include <QFileDialog>
 #include <QFormLayout>
@@ -90,6 +92,13 @@ void LoudnessMasterDialog::onMeasureClicked()
     m_measuredLufs = loudness::measureIntegratedLufs(path);
     m_hasMeasured  = true;
 
+    if (std::isnan(m_measuredLufs)) {
+        m_measuredLabel->setText(tr("Measured: --- LUFS"));
+        m_gainLabel->setText(
+            tr("計測不可: .raw/.pcm のみ対応 (このファイルはデコード未対応)"));
+        return;
+    }
+
     m_measuredLabel->setText(
         tr("Measured: %1 LUFS").arg(m_measuredLufs, 0, 'f', 1));
 
@@ -110,6 +119,12 @@ void LoudnessMasterDialog::onPresetChanged(int index)
 
     if (!m_hasMeasured)
         return;
+
+    if (std::isnan(m_measuredLufs)) {
+        m_gainLabel->setText(
+            tr("計測不可: .raw/.pcm のみ対応 (このファイルはデコード未対応)"));
+        return;
+    }
 
     // Re-derive the recommended gain for the newly selected preset.
     const auto preset = static_cast<loudness::LoudnessPreset>(

@@ -2,6 +2,7 @@
 #include <QDialog>
 #include "CaptionTrack.h"
 #include "CaptionStyle.h"
+#include "SubtitleTrackRenderer.h"
 
 class QTableWidget;
 class QTextEdit;
@@ -25,9 +26,13 @@ public:
     void setStyle(const caption::Style& style);
     caption::Style style() const;
 
+    void setSubtitleStyle(const SubtitleStyle& style);
+    SubtitleStyle subtitleStyle() const;
+
 signals:
     void trackChanged(const caption::Track& track);
     void styleChanged(const caption::Style& style);
+    void subtitleStyleChanged(const SubtitleStyle& style);
 
 private slots:
     void onAddClipClicked();
@@ -39,15 +44,18 @@ private slots:
     void onClipTextEdited();
     void onClipTimeEdited();
     void onStyleChanged();
+    void onApplyPresetClicked();
 
 private:
     void rebuildClipTable();
     void refreshClipRow(int row);
     void updateStyleControls();
     void updatePreview();
+    void syncSubtitleStyleFromCaptionStyle();
 
     caption::Track m_track;
     caption::Style m_style;
+    SubtitleStyle m_subtitleStyle;
 
     QTableWidget*    m_clipTable        = nullptr;
     QTextEdit*       m_textEdit         = nullptr;
@@ -55,6 +63,8 @@ private:
     QSpinBox*        m_endMsSpin        = nullptr;
 
     QFontComboBox*   m_fontCombo        = nullptr;
+    QComboBox*       m_presetCombo      = nullptr;
+    QPushButton*     m_applyPresetButton = nullptr;
     QSpinBox*        m_fontSizeSpin     = nullptr;
     QCheckBox*       m_boldCheck        = nullptr;
     QCheckBox*       m_italicCheck      = nullptr;
@@ -63,6 +73,8 @@ private:
     QDoubleSpinBox*  m_outlineWidthSpin = nullptr;
     QCheckBox*       m_bgCheck          = nullptr;
     QPushButton*     m_bgColorButton    = nullptr;
+    QCheckBox*       m_karaokeCheck     = nullptr;
+    QPushButton*     m_karaokeColorButton = nullptr;
     QComboBox*       m_anchorCombo      = nullptr;
 
     QLabel*          m_previewLabel     = nullptr;

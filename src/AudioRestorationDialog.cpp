@@ -3,11 +3,14 @@
 
 #include <QCheckBox>
 #include <QComboBox>
+#include <QDoubleSpinBox>
 #include <QFileDialog>
 #include <QFormLayout>
 #include <QHBoxLayout>
 #include <QLineEdit>
 #include <QPushButton>
+#include <QSignalBlocker>
+#include <QSlider>
 #include <QVBoxLayout>
 #include <QVector>
 #include <QtGlobal>
@@ -45,6 +48,33 @@ AudioRestorationDialog::AudioRestorationDialog(QWidget *parent)
     m_gateCheck = new QCheckBox(tr("Spectral noise gate"), this);
     m_gateCheck->setChecked(true);
 
+    // --- Noise reduction strength ------------------------------------------
+    m_nrStrengthSlider = new QSlider(Qt::Horizontal, this);
+    m_nrStrengthSlider->setRange(0, 200);
+    m_nrStrengthSlider->setSingleStep(5);
+    m_nrStrengthSlider->setPageStep(10);
+    m_nrStrengthSlider->setValue(100);
+
+    m_nrStrengthSpin = new QDoubleSpinBox(this);
+    m_nrStrengthSpin->setRange(0.0, 2.0);
+    m_nrStrengthSpin->setDecimals(2);
+    m_nrStrengthSpin->setSingleStep(0.05);
+    m_nrStrengthSpin->setValue(1.0);
+
+    connect(m_nrStrengthSlider, &QSlider::valueChanged, this, [this](int value) {
+        const QSignalBlocker blocker(m_nrStrengthSpin);
+        m_nrStrengthSpin->setValue(static_cast<double>(value) / 100.0);
+    });
+    connect(m_nrStrengthSpin, qOverload<double>(&QDoubleSpinBox::valueChanged),
+            this, [this](double value) {
+        const QSignalBlocker blocker(m_nrStrengthSlider);
+        m_nrStrengthSlider->setValue(qRound(value * 100.0));
+    });
+    connect(m_gateCheck, &QCheckBox::toggled, this, [this](bool enabled) {
+        m_nrStrengthSlider->setEnabled(enabled);
+        m_nrStrengthSpin->setEnabled(enabled);
+    });
+
     // --- Hum fundamental ----------------------------------------------------
     m_humFreqCombo = new QComboBox(this);
     m_humFreqCombo->addItem(tr("50 Hz (EU/Asia)"), 50.0);
@@ -61,6 +91,10 @@ AudioRestorationDialog::AudioRestorationDialog(QWidget *parent)
     form->addRow(m_declickCheck);
     form->addRow(m_dehumCheck);
     form->addRow(m_gateCheck);
+    auto *nrRow = new QHBoxLayout;
+    nrRow->addWidget(m_nrStrengthSlider, 1);
+    nrRow->addWidget(m_nrStrengthSpin);
+    form->addRow(tr("NR strength:"), nrRow);
     form->addRow(tr("Hum freq:"), m_humFreqCombo);
 
     auto *mainLayout = new QVBoxLayout(this);
@@ -88,6 +122,7 @@ void AudioRestorationDialog::onApplyClicked()
     cfg.doDehum     = m_dehumCheck->isChecked();
     cfg.doNoiseGate = m_gateCheck->isChecked();
     cfg.dehumFreq   = m_humFreqCombo->currentData().toDouble();
+    cfg.noiseReductionStrength = m_nrStrengthSpin->value();
 
     // NOTE / DOCUMENTED SIMPLIFICATION:
     // This editor build does not expose a synchronous PCM decode API to this
@@ -114,13 +149,14 @@ void AudioRestorationDialog::onApplyClicked()
 
     qWarning("AudioRestorationDialog: no synchronous decode path available; "
              "running pipeline on synthetic %d-sample test buffer "
-             "(file='%s', declick=%d dehum=%d gate=%d humHz=%.0f).",
+             "(file='%s', declick=%d dehum=%d gate=%d humHz=%.0f nrStrength=%.2f).",
              nSamples,
              qPrintable(m_fileEdit->text()),
              static_cast<int>(cfg.doDeclick),
              static_cast<int>(cfg.doDehum),
              static_cast<int>(cfg.doNoiseGate),
-             cfg.dehumFreq);
+             cfg.dehumFreq,
+             cfg.noiseReductionStrength);
 
     const QVector<float> restored =
         audiorestore::processAll(buffer, sampleRate, cfg);
@@ -139,5 +175,5 @@ void AudioRestorationDialog::onApplyClicked()
     const double after  = rmsOf(restored);
     qWarning("AudioRestorationDialog: pipeline done. RMS %.5f -> %.5f "
              "(%d samples out).",
-             before, after, restored.size());
+             before, after, static_cast<int>(restored.size()));
 }

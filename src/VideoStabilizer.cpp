@@ -1,21 +1,25 @@
 #include "VideoStabilizer.h"
 #include "WarpDistortion.h"
+#include "libavcore/VideoFilterGraph.h"
 
 #include <QFile>
 #include <QFileInfo>
 #include <QImage>
 #include <QPainter>
-#include <QProcess>
-#include <QRegularExpression>
-#include <QStandardPaths>
 #include <QThread>
-#include <QMutex>
-#include <QMutexLocker>
 #include <QtGlobal>
 #include <QDir>
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <optional>
+#include <string>
+
+extern "C" {
+#include <libavutil/imgutils.h>
+#include <libswscale/swscale.h>
+}
 
 namespace {
 
@@ -25,6 +29,7 @@ constexpr planartrack::Homography kIdentityHomography = {
     0.0, 1.0, 0.0,
     0.0, 0.0, 1.0
 };
+thread_local std::optional<std::string> s_lastDeshakeError;
 
 bool isPlanarFrameIndexValid(const planartrack::PlanarTrack *track, int frameIndex)
 {
@@ -33,10 +38,32 @@ bool isPlanarFrameIndexValid(const planartrack::PlanarTrack *track, int frameInd
         && frameIndex < static_cast<int>(track->frames.size());
 }
 
-QMutex &processStateMutex()
+bool scaleFrameToQImagePadded(SwsContext *ctx,
+                              const AVFrame *frame,
+                              AVPixelFormat dstPixFmt,
+                              QImage &image)
 {
-    static QMutex mutex;
-    return mutex;
+    if (!ctx || !frame || image.isNull())
+        return false;
+
+    const int rowBytes = av_image_get_linesize(dstPixFmt, image.width(), 0);
+    if (rowBytes <= 0 || rowBytes > image.bytesPerLine())
+        return false;
+
+    uint8_t *tmpData[4] = { nullptr, nullptr, nullptr, nullptr };
+    int tmpStride[4] = { 0, 0, 0, 0 };
+    if (av_image_alloc(tmpData, tmpStride, image.width(), image.height(),
+                       dstPixFmt, 64) < 0)
+        return false;
+
+    sws_scale(ctx, frame->data, frame->linesize, 0, frame->height,
+              tmpData, tmpStride);
+    for (int y = 0; y < image.height(); ++y) {
+        std::memcpy(image.scanLine(y), tmpData[0] + y * tmpStride[0],
+                    static_cast<std::size_t>(rowBytes));
+    }
+    av_freep(&tmpData[0]);
+    return true;
 }
 
 }
@@ -78,56 +105,17 @@ void VideoStabilizer::setOutputCropPercent(double percent)
 
 QImage VideoStabilizer::stabilizeFrame(const QImage &source, int frameIndex) const
 {
-    if (source.isNull())
+    if (source.isNull()) {
+        qWarning() << "VideoStabilizer::stabilizeFrame: null source image at frame" << frameIndex;
         return QImage();
-
-    if (m_model != Model::PlanarInversion || m_planarTrack == nullptr)
-        return source;
-
-    return applyPlanarInversion(source, frameIndex);
-}
-
-VideoStabilizer::VideoStreamInfo VideoStabilizer::probeVideoStream(const QString &inputPath)
-{
-    VideoStreamInfo info;
-    const QString ffmpegBin = findFFmpegBinary();
-    if (ffmpegBin.isEmpty())
-        return info;
-
-    QProcess probe;
-    probe.start(ffmpegBin, QStringList{QStringLiteral("-hide_banner"),
-                                       QStringLiteral("-i"),
-                                       inputPath});
-    if (!probe.waitForStarted(3000))
-        return info;
-
-    probe.closeWriteChannel();
-    probe.waitForFinished(5000);
-
-    const QString stderrOutput = QString::fromLocal8Bit(probe.readAllStandardError());
-    const QStringList lines = stderrOutput.split(QLatin1Char('\n'));
-    static const QRegularExpression sizeRe(R"((\d+)x(\d+))");
-    static const QRegularExpression fpsRe(R"((\d+(?:\.\d+)?)\s+fps)");
-
-    for (const QString &line : lines) {
-        if (!line.contains(QStringLiteral("Video:")))
-            continue;
-
-        const QRegularExpressionMatch sizeMatch = sizeRe.match(line);
-        if (sizeMatch.hasMatch()) {
-            info.width = sizeMatch.captured(1).toInt();
-            info.height = sizeMatch.captured(2).toInt();
-        }
-
-        const QRegularExpressionMatch fpsMatch = fpsRe.match(line);
-        if (fpsMatch.hasMatch())
-            info.fps = fpsMatch.captured(1).toDouble();
-
-        if (info.width > 0 && info.height > 0 && info.fps > 0.0)
-            break;
     }
 
-    return info;
+    if (m_model != Model::PlanarInversion || m_planarTrack == nullptr) {
+        qDebug() << "VideoStabilizer::stabilizeFrame: no planar track, returning source unchanged at frame" << frameIndex;
+        return source;
+    }
+
+    return applyPlanarInversion(source, frameIndex);
 }
 
 planartrack::Homography VideoStabilizer::invertHomographyWithFallback(
@@ -253,280 +241,230 @@ void VideoStabilizer::applyTransparentCrop(QImage &image, double cropPercent)
     }
 }
 
-// --- Filter builders ---
+// --- Filter builder ---
 
-QString VideoStabilizer::buildDetectFilter(const StabilizerConfig &config,
-                                           const QString &trfPath)
+// Build deshake filter string for the in-process libavfilter path (US-B3).
+//
+// deshake is a single-pass filter (no .trf file). Compared to the vidstab
+// two-pass approach it has fewer tuning knobs, so some StabilizerConfig
+// fields cannot be expressed and are intentionally ignored:
+//   - smoothing:     deshake has no explicit smoothing-window parameter
+//                    (it implicitly smooths over the entire clip); ignored.
+//   - zoom:          deshake has no zoom parameter; ignored.
+//   - interpolation: deshake uses a fixed internal interpolation; ignored.
+//
+// Mapping rationale (approved trade-offs, values clamped to libavfilter limits):
+//   shakiness (1-10) → rx / ry (search-range, 0-64):
+//     Larger shakiness means larger expected motion, so we widen the block-
+//     search range proportionally: rx = ry = clamp(shakiness * 6, 8, 64).
+//     Factor 6 gives range [6,60], then clamped to [8,64].
+//
+//   accuracy (1-15) → search + blocksize:
+//     Higher accuracy requests exhaustive search (search=0) and a finer
+//     block grid (smaller blocksize). Below accuracy 8 we use the "less"
+//     search method (search=1) for speed.
+//     blocksize = clamp(64 - accuracy * 3, 8, 128)
+//     accuracy=1  → blocksize=61, search=1  (fast, coarse)
+//     accuracy=8  → blocksize=40, search=0  (accurate)
+//     accuracy=15 → blocksize=19, search=0  (most accurate)
+//
+//   cropMode → edge (border-fill mode):
+//     Keep  → edge=1 (fill with original pixels, no black border)
+//     Crop  → edge=0 (fill with blank/black — caller is expected to crop)
+
+QString VideoStabilizer::buildDeshakeFilter(const StabilizerConfig &config)
 {
-    // vidstabdetect: shakiness, accuracy, result (output .trf file)
-    return QString("vidstabdetect=shakiness=%1:accuracy=%2:result='%3'")
-               .arg(config.shakiness)
-               .arg(config.accuracy)
-               .arg(trfPath);
+    // rx / ry: search range derived from shakiness.
+    // libavfilter deshake REQUIRES rx and ry to be a multiple of 16
+    // (range [0, 64]); a non-multiple value triggers
+    // "rx must be a multiple of 16" / "Not yet implemented" errors at graph
+    // build time. We round shakiness*6 to the nearest multiple of 16 and
+    // clamp into [16, 64] so the search range scales monotonically with
+    // shakiness while satisfying the filter's quantization constraint.
+    const int rxryRounded = ((config.shakiness * 6 + 8) / 16) * 16;
+    const int rxry = qBound(16, rxryRounded, 64);
+
+    // search: 0=exhaustive (accurate), 1=less (fast)
+    const int search = (config.accuracy >= 8) ? 0 : 1;
+
+    // blocksize: finer blocks for higher accuracy. deshake accepts [4, 128];
+    // we round to the nearest power-of-2-ish even value within range to avoid
+    // edge-case rejections in motion estimation.
+    const int blocksizeRaw = qBound(8, 64 - config.accuracy * 3, 128);
+    const int blocksize = (blocksizeRaw / 2) * 2;
+
+    // edge: border-fill mode
+    // 0=blank, 1=original, 2=clamp, 3=mirror
+    const int edge = (config.cropMode == StabCropMode::Crop) ? 0 : 1;
+
+    return QString("deshake=rx=%1:ry=%2:edge=%3:blocksize=%4:search=%5")
+               .arg(rxry)
+               .arg(rxry)
+               .arg(edge)
+               .arg(blocksize)
+               .arg(search);
 }
 
-QString VideoStabilizer::buildTransformFilter(const StabilizerConfig &config,
-                                              const QString &trfPath)
+// --- Translation path: deshake single-pass via libavcore::VideoFilterGraph ---
+//
+// PRD-B3 US-B3-3: the previous Translation path ran vidstabdetect followed by
+// vidstabtransform as two ffmpeg.exe subprocess passes. Those filters require
+// libvidstab, but the bundled avfilter-11.dll is built with libvidstab disabled
+// and autodetect off — so vidstab is absent from the in-process libav. To fully
+// eliminate QProcess(ffmpeg.exe) from VideoStabilizer, we switched to the
+// single-pass deshake filter, which is included in the standard libavfilter
+// build. deshake performs whole-clip smoothing implicitly and is qualitatively
+// inferior to vidstab for large camera shake (no separate detection / smoothing
+// budget, no zoom, fixed interpolation) — this is an approved trade-off
+// documented at the top of buildDeshakeFilter().
+bool VideoStabilizer::stabilizeDeshake(const QString &inputPath,
+                                       const QString &outputPath,
+                                       const StabilizerConfig &config)
 {
-    // vidstabtransform: smoothing, crop, zoom, interpol, input (.trf file)
-    QString crop = (config.cropMode == StabCropMode::Crop) ? "black" : "keep";
-    QString interpol = (config.interpolation == StabInterpolation::Bilinear)
-                           ? "bilinear" : "bicubic";
+    libavcore::VideoFilterRequest request;
+    request.inputPath = inputPath.toStdString();
+    request.outputPath = outputPath.toStdString();
+    request.filterDescription = buildDeshakeFilter(config).toStdString();
+    // videoCodecName="libx264" lets VideoFilterGraph's encoder fallback chain
+    // resolve to h264_mf on Windows (PRD-B-MF). copyAudio=true passes the
+    // source audio stream through unchanged (equivalent to the old vidstab
+    // pass-2 audio-copy behaviour, now handled in-process).
+    request.videoCodecName = "libx264";
+    request.copyAudio = true;
 
-    return QString("vidstabtransform=smoothing=%1:crop=%2:zoom=%3:interpol=%4:input='%5'")
-               .arg(config.smoothing)
-               .arg(crop)
-               .arg(config.zoom, 0, 'f', 1)
-               .arg(interpol)
-               .arg(trfPath);
-}
+    emit progressChanged(0);
 
-// --- FFmpeg binary lookup ---
+    s_lastDeshakeError.reset();
 
-QString VideoStabilizer::findFFmpegBinary()
-{
-    QString path = QStandardPaths::findExecutable("ffmpeg");
-    if (!path.isEmpty())
-        return path;
-
-    // Common macOS / Linux locations
-    QStringList searchPaths = {"/usr/local/bin", "/opt/homebrew/bin", "/usr/bin"};
-    path = QStandardPaths::findExecutable("ffmpeg", searchPaths);
-    return path;
-}
-
-// --- Progress parsing from FFmpeg stderr ---
-
-void VideoStabilizer::parseProgress(const QString &output, int progressBase, int progressSpan)
-{
-    // Parse total duration: "Duration: HH:MM:SS.ms"
-    if (m_totalDuration <= 0.0) {
-        static QRegularExpression durRe(R"(Duration:\s+(\d+):(\d+):(\d+)\.(\d+))");
-        auto match = durRe.match(output);
-        if (match.hasMatch()) {
-            m_totalDuration = match.captured(1).toDouble() * 3600.0
-                            + match.captured(2).toDouble() * 60.0
-                            + match.captured(3).toDouble()
-                            + match.captured(4).toDouble() / 100.0;
-        }
-    }
-
-    // Parse current position: "time=HH:MM:SS.ms"
-    if (m_totalDuration > 0.0) {
-        static QRegularExpression timeRe(R"(time=(\d+):(\d+):(\d+)\.(\d+))");
-        auto match = timeRe.match(output);
-        if (match.hasMatch()) {
-            double currentTime = match.captured(1).toDouble() * 3600.0
-                               + match.captured(2).toDouble() * 60.0
-                               + match.captured(3).toDouble()
-                               + match.captured(4).toDouble() / 100.0;
-            double ratio = qBound(0.0, currentTime / m_totalDuration, 1.0);
-            int pct = progressBase + static_cast<int>(ratio * progressSpan);
+    libavcore::VideoFilterGraph graph;
+    auto err = graph.run(
+        request,
+        [this](int pct) {
             emit progressChanged(qBound(0, pct, 100));
-        }
-    }
-}
+        },
+        [this]() {
+            return m_cancelled;
+        });
 
-// --- Run FFmpeg process synchronously (called from worker thread) ---
-
-bool VideoStabilizer::runFFmpeg(const QStringList &args, int progressBase, int progressSpan)
-{
-    QString ffmpegBin = findFFmpegBinary();
-    if (ffmpegBin.isEmpty())
+    if (err.has_value() || m_cancelled) {
+        if (err.has_value())
+            s_lastDeshakeError = *err;
+        QFile::remove(outputPath);
         return false;
-
-    QProcess *process = new QProcess();
-    {
-        QMutexLocker locker(&processStateMutex());
-        m_process = process;
     }
 
-    connect(process, &QProcess::readyReadStandardError, process, [this, process, progressBase, progressSpan]() {
-        QString output = QString::fromLocal8Bit(process->readAllStandardError());
-        parseProgress(output, progressBase, progressSpan);
-    });
-
-    process->start(ffmpegBin, args);
-    process->waitForStarted();
-
-    auto isCancelled = [this]() {
-        QMutexLocker locker(&processStateMutex());
-        return m_cancelled;
-    };
-
-    auto cleanupProcess = [this, process]() {
-        {
-            QMutexLocker locker(&processStateMutex());
-            if (m_process == process)
-                m_process = nullptr;
-        }
-        delete process;
-    };
-
-    // Poll for completion or cancellation
-    while (!process->waitForFinished(200)) {
-        if (isCancelled()) {
-            process->kill();
-            process->waitForFinished(3000);
-            cleanupProcess();
-            return false;
-        }
-    }
-
-    bool success = (process->exitStatus() == QProcess::NormalExit
-                    && process->exitCode() == 0);
-
-    cleanupProcess();
-    return success;
+    emit progressChanged(100);
+    return true;
 }
 
 bool VideoStabilizer::stabilizePlanarInversion(const QString &inputPath, const QString &outputPath)
 {
-    const QString ffmpegBin = findFFmpegBinary();
-    if (ffmpegBin.isEmpty())
+    // PRD-B2 US-B2-5: this PlanarInversion path is fully in-process. Decoding
+    // uses libavcore::MediaDecoder and encoding uses libavcore::FrameEncoder
+    // (no ffmpeg.exe subprocess). The Translation path now runs deshake
+    // single-pass through libavcore::VideoFilterGraph (PRD-B3 US-B3-3).
+    const std::string inputUtf8 = inputPath.toStdString();
+    const std::string outputUtf8 = outputPath.toStdString();
+
+    // --- Decoder: replaces the "source -> rawvideo rgba pipe" ffmpeg process ---
+    libavcore::MediaDecoder decoder;
+    if (decoder.open(inputUtf8, /*wantAudio=*/false).has_value())
+        return false;
+    if (!decoder.hasVideo())
         return false;
 
-    const VideoStreamInfo info = probeVideoStream(inputPath);
-    if (info.width <= 0 || info.height <= 0)
+    const libavcore::VideoStreamProps vprops = decoder.videoProps();
+    if (vprops.width <= 0 || vprops.height <= 0)
         return false;
 
-    const double fps = info.fps > 0.0 ? info.fps : 30.0;
-    const qsizetype frameBytes = static_cast<qsizetype>(info.width)
-        * static_cast<qsizetype>(info.height) * 4;
-    if (frameBytes <= 0)
-        return false;
+    const double fpsValue = vprops.frameRate.den > 0 && vprops.frameRate.num > 0
+        ? av_q2d(vprops.frameRate)
+        : 30.0;
+    const int fpsRounded = std::max(1, static_cast<int>(std::lround(fpsValue)));
 
-    QProcess decoder;
-    decoder.setProcessChannelMode(QProcess::SeparateChannels);
-    decoder.start(ffmpegBin, QStringList{
-        QStringLiteral("-hide_banner"),
-        QStringLiteral("-loglevel"), QStringLiteral("error"),
-        QStringLiteral("-i"), inputPath,
-        QStringLiteral("-map"), QStringLiteral("0:v:0"),
-        QStringLiteral("-vsync"), QStringLiteral("0"),
-        QStringLiteral("-f"), QStringLiteral("rawvideo"),
-        QStringLiteral("-pix_fmt"), QStringLiteral("rgba"),
-        QStringLiteral("-")
-    });
-    if (!decoder.waitForStarted(5000))
-        return false;
+    // --- Encoder: in-process FrameEncoder (PRD-B2 US-B2-5).
+    // videoCodecName="libx264" lets FrameEncoder's fallback chain resolve to
+    // h264_mf on Windows; audioSourcePath=inputPath copies the source audio
+    // stream unchanged (in-process equivalent of the old subprocess audio
+    // passthrough).
+    libavcore::EncodeRequest request;
+    request.width = vprops.width;
+    request.height = vprops.height;
+    request.fps = fpsRounded;
+    request.outputPath = outputUtf8;
+    request.audioSourcePath = inputUtf8;
+    request.videoCodecName = "libx264";
 
-    QProcess *encoder = new QProcess();
-    {
-        QMutexLocker locker(&processStateMutex());
-        m_process = encoder;
-    }
-    encoder->setProcessChannelMode(QProcess::SeparateChannels);
-    connect(encoder, &QProcess::readyReadStandardError, encoder, [this, encoder]() {
-        const QString output = QString::fromLocal8Bit(encoder->readAllStandardError());
-        parseProgress(output, 0, 100);
-    });
-
-    encoder->start(ffmpegBin, QStringList{
-        QStringLiteral("-y"),
-        QStringLiteral("-hide_banner"),
-        QStringLiteral("-f"), QStringLiteral("rawvideo"),
-        QStringLiteral("-pix_fmt"), QStringLiteral("rgba"),
-        QStringLiteral("-s:v"), QStringLiteral("%1x%2").arg(info.width).arg(info.height),
-        QStringLiteral("-r"), QString::number(fps, 'f', 6),
-        QStringLiteral("-i"), QStringLiteral("-"),
-        QStringLiteral("-i"), inputPath,
-        QStringLiteral("-map"), QStringLiteral("0:v:0"),
-        QStringLiteral("-map"), QStringLiteral("1:a?"),
-        QStringLiteral("-c:a"), QStringLiteral("copy"),
-        outputPath
-    });
-    if (!encoder->waitForStarted(5000)) {
-        decoder.kill();
-        decoder.waitForFinished(3000);
-        {
-            QMutexLocker locker(&processStateMutex());
-            if (m_process == encoder)
-                m_process = nullptr;
-        }
-        delete encoder;
+    libavcore::FrameEncoder encoder;
+    if (encoder.open(request).has_value())
         return false;
-    }
 
     emit progressChanged(0);
-    QByteArray buffer;
-    buffer.reserve(frameBytes * 2);
+
     int frameIndex = 0;
     const int totalFrames = m_planarTrack != nullptr
         ? static_cast<int>(m_planarTrack->frames.size())
         : 0;
 
-    auto isCancelled = [this]() {
-        QMutexLocker locker(&processStateMutex());
-        return m_cancelled;
-    };
+    // Reusable swscale context for AVFrame (decoder pix_fmt) -> RGBA8888.
+    SwsContext *toRgbaCtx = nullptr;
+    int swsSrcW = 0;
+    int swsSrcH = 0;
+    int swsSrcFmt = AV_PIX_FMT_NONE;
 
-    auto cleanupProcesses = [this, &decoder, encoder]() {
-        {
-            QMutexLocker locker(&processStateMutex());
-            if (m_process == encoder)
-                m_process = nullptr;
-        }
-        if (encoder) {
-            delete encoder;
-        }
-        decoder.closeReadChannel(QProcess::StandardOutput);
-    };
+    bool encodeFailed = false;
 
     while (true) {
-        if (isCancelled()) {
-            decoder.kill();
-            decoder.waitForFinished(3000);
-            encoder->kill();
-            encoder->waitForFinished(3000);
-            cleanupProcesses();
+        if (m_cancelled) {
+            if (toRgbaCtx)
+                sws_freeContext(toRgbaCtx);
             return false;
         }
 
-        buffer.append(decoder.readAllStandardOutput());
-        while (buffer.size() < frameBytes && decoder.state() != QProcess::NotRunning) {
-            if (!decoder.waitForReadyRead(200))
+        AVFrame *frame = decoder.nextVideoFrame();
+        if (frame == nullptr)
+            break;  // EOF or decode error
+
+        // (Re)build the swscale context if frame geometry/format changed.
+        if (toRgbaCtx == nullptr
+            || frame->width != swsSrcW
+            || frame->height != swsSrcH
+            || frame->format != swsSrcFmt) {
+            if (toRgbaCtx)
+                sws_freeContext(toRgbaCtx);
+            toRgbaCtx = sws_getContext(
+                frame->width, frame->height,
+                static_cast<AVPixelFormat>(frame->format),
+                vprops.width, vprops.height, AV_PIX_FMT_RGBA,
+                SWS_BILINEAR, nullptr, nullptr, nullptr);
+            if (toRgbaCtx == nullptr) {
+                encodeFailed = true;
                 break;
-            buffer.append(decoder.readAllStandardOutput());
-        }
-        buffer.append(decoder.readAllStandardOutput());
-
-        if (buffer.size() < frameBytes) {
-            if (decoder.state() == QProcess::NotRunning)
-                break;
-            continue;
+            }
+            swsSrcW = frame->width;
+            swsSrcH = frame->height;
+            swsSrcFmt = frame->format;
         }
 
-        QByteArray frameData = buffer.left(frameBytes);
-        buffer.remove(0, frameBytes);
+        QImage rawFrame(vprops.width, vprops.height, QImage::Format_RGBA8888);
+        if (!scaleFrameToQImagePadded(toRgbaCtx, frame, AV_PIX_FMT_RGBA, rawFrame)) {
+            encodeFailed = true;
+            break;
+        }
 
-        const QImage rawFrame(reinterpret_cast<const uchar *>(frameData.constData()),
-                              info.width, info.height, QImage::Format_RGBA8888);
-        const QImage stabilized = stabilizeFrame(rawFrame.copy(), frameIndex)
-                                      .convertToFormat(QImage::Format_RGBA8888);
-        const char *framePtr = reinterpret_cast<const char *>(stabilized.constBits());
-        qsizetype remaining = static_cast<qsizetype>(stabilized.bytesPerLine())
-            * static_cast<qsizetype>(stabilized.height());
-        while (remaining > 0) {
-            const qint64 written = encoder->write(framePtr, remaining);
-            if (written <= 0) {
-                decoder.kill();
-                decoder.waitForFinished(3000);
-                encoder->kill();
-                encoder->waitForFinished(3000);
-                cleanupProcesses();
-                return false;
-            }
-            framePtr += written;
-            remaining -= written;
-            if (remaining > 0 && !encoder->waitForBytesWritten(5000)) {
-                decoder.kill();
-                decoder.waitForFinished(3000);
-                encoder->kill();
-                encoder->waitForFinished(3000);
-                cleanupProcesses();
-                return false;
-            }
+        // Per-frame homography processing.
+        // h264 output carries no alpha plane: the transparent crop frame
+        // (applyTransparentCrop) and any area left uncovered by a non-identity
+        // homography are flattened to black here. This is parity with the
+        // behaviour before PRD-B2 (h264 mux, no alpha), not a regression.
+        // The explicit RGB888 conversion makes that flattening visible at the
+        // call site rather than relying on pushFrame()'s hidden internal one.
+        const QImage stabilized = stabilizeFrame(rawFrame, frameIndex)
+                                      .convertToFormat(QImage::Format_RGB888);
+
+        if (!encoder.pushFrame(stabilized, frameIndex)) {
+            encodeFailed = true;
+            break;
         }
 
         ++frameIndex;
@@ -537,18 +475,50 @@ bool VideoStabilizer::stabilizePlanarInversion(const QString &inputPath, const Q
         }
     }
 
-    decoder.waitForFinished(5000);
-    encoder->closeWriteChannel();
-    encoder->waitForFinished(-1);
+    if (toRgbaCtx)
+        sws_freeContext(toRgbaCtx);
 
-    const bool decodeOk = decoder.exitStatus() == QProcess::NormalExit && decoder.exitCode() == 0;
-    const bool encodeOk = encoder->exitStatus() == QProcess::NormalExit
-        && encoder->exitCode() == 0;
+    if (encodeFailed) {
+        encoder.finalize();
+        QFile::remove(outputPath);
+        return false;
+    }
 
-    cleanupProcesses();
-    if (decodeOk && encodeOk)
+    // Decode-failure detection. libavcore::MediaDecoder::nextVideoFrame()
+    // returns nullptr for BOTH a clean EOF and a fatal mid-stream decode
+    // error, and videoEnded() does not distinguish them — so a corrupt input
+    // would otherwise break the loop, finalize() cleanly and report success
+    // with a truncated output file. We guard against this with a
+    // frameIndex-based sanity check: zero frames decoded from a video stream,
+    // or a large shortfall vs. the expected frame count, signals a mid-stream
+    // abort and causes the output to be discarded.
+    bool decodeFailed = false;
+    if (frameIndex == 0) {
+        // Not a single frame decoded from a stream that reported video.
+        decodeFailed = true;
+    } else if (totalFrames > 0) {
+        // m_planarTrack->frames.size() is the authoritative frame count used
+        // as totalFrames for progress. Minor drift (±a few frames) between
+        // the track and the actual decode is tolerated; a large shortfall
+        // means the decoder aborted mid-stream.
+        const int shortfallTolerance =
+            std::max(8, static_cast<int>(std::lround(totalFrames * 0.02)));
+        if (frameIndex < totalFrames - shortfallTolerance)
+            decodeFailed = true;
+    }
+
+    if (decodeFailed) {
+        encoder.finalize();
+        QFile::remove(outputPath);
+        return false;
+    }
+
+    const bool encodeOk = !encoder.finalize().has_value();
+    if (encodeOk)
         emit progressChanged(100);
-    return decodeOk && encodeOk;
+    else
+        QFile::remove(outputPath);
+    return encodeOk;
 }
 
 // --- Public API ---
@@ -556,24 +526,15 @@ bool VideoStabilizer::stabilizePlanarInversion(const QString &inputPath, const Q
 void VideoStabilizer::stabilize(const QString &inputPath, const QString &outputPath,
                                 const StabilizerConfig &config)
 {
-    {
-        QMutexLocker locker(&processStateMutex());
-        m_cancelled = false;
-    }
-    m_totalDuration = 0.0;
+    m_cancelled = false;
 
     QThread *thread = QThread::create([this, inputPath, outputPath, config]() {
-        auto isCancelled = [this]() {
-            QMutexLocker locker(&processStateMutex());
-            return m_cancelled;
-        };
-
         if (m_model == Model::PlanarInversion && m_planarTrack != nullptr) {
             const bool ok = stabilizePlanarInversion(inputPath, outputPath);
-            if (!ok || isCancelled()) {
+            if (!ok || m_cancelled) {
                 QFile::remove(outputPath);
                 emit stabilizeComplete(false,
-                    isCancelled() ? "Stabilization cancelled" : "Planar inversion stabilization failed");
+                    m_cancelled ? "Stabilization cancelled" : "Planar inversion stabilization failed");
                 return;
             }
 
@@ -581,109 +542,24 @@ void VideoStabilizer::stabilize(const QString &inputPath, const QString &outputP
             return;
         }
 
-        // Create temp .trf file in system temp dir
-        QString trfPath = QDir::tempPath() + "/vstab_transforms.trf";
-
-        emit progressChanged(0);
-
-        // --- Pass 1: Analyze with vidstabdetect ---
-        QString detectFilter = buildDetectFilter(config, trfPath);
-        QStringList pass1Args = {
-            "-y", "-i", inputPath,
-            "-vf", detectFilter,
-            "-f", "null", "-"
-        };
-
-        bool pass1Ok = runFFmpeg(pass1Args, 0, 45);  // 0-45% for pass 1
-
-        if (!pass1Ok || isCancelled()) {
-            QFile::remove(trfPath);
-            emit stabilizeComplete(false,
-                isCancelled() ? "Stabilization cancelled" : "Analysis pass failed");
-            return;
-        }
-
-        // Verify .trf file was created
-        if (!QFileInfo::exists(trfPath)) {
-            emit stabilizeComplete(false, "Transform file was not generated");
-            return;
-        }
-
-        emit progressChanged(50);
-        m_totalDuration = 0.0;  // reset for pass 2 parsing
-
-        // --- Pass 2: Apply with vidstabtransform ---
-        QString transformFilter = buildTransformFilter(config, trfPath);
-        QStringList pass2Args = {
-            "-y", "-i", inputPath,
-            "-vf", transformFilter,
-            "-c:a", "copy",
-            outputPath
-        };
-
-        bool pass2Ok = runFFmpeg(pass2Args, 50, 50);  // 50-100% for pass 2
-
-        // Clean up .trf file
-        QFile::remove(trfPath);
-
-        if (!pass2Ok || isCancelled()) {
+        // Translation path: in-process deshake single-pass via
+        // libavcore::VideoFilterGraph (PRD-B3 US-B3-3). No QProcess/ffmpeg.exe.
+        const bool ok = stabilizeDeshake(inputPath, outputPath, config);
+        if (!ok || m_cancelled) {
             QFile::remove(outputPath);
-            emit stabilizeComplete(false,
-                isCancelled() ? "Stabilization cancelled" : "Transform pass failed");
+            const auto err = s_lastDeshakeError;
+            if (m_cancelled) {
+                emit stabilizeComplete(false, tr("スタビライズを中断しました"));
+            } else if (err.has_value()) {
+                emit stabilizeComplete(false,
+                    tr("スタビライズに失敗しました: %1").arg(QString::fromStdString(*err)));
+            } else {
+                emit stabilizeComplete(false, tr("スタビライズに失敗しました: %1").arg(tr("不明なエラー")));
+            }
             return;
         }
 
-        emit progressChanged(100);
-        emit stabilizeComplete(true, "Stabilization complete");
-    });
-
-    connect(thread, &QThread::finished, thread, &QThread::deleteLater);
-    thread->start();
-}
-
-void VideoStabilizer::analyzeOnly(const QString &inputPath, const StabilizerConfig &config)
-{
-    {
-        QMutexLocker locker(&processStateMutex());
-        m_cancelled = false;
-    }
-    m_totalDuration = 0.0;
-
-    QThread *thread = QThread::create([this, inputPath, config]() {
-        auto isCancelled = [this]() {
-            QMutexLocker locker(&processStateMutex());
-            return m_cancelled;
-        };
-
-        // Create temp .trf file
-        QString baseName = QFileInfo(inputPath).completeBaseName();
-        QString trfPath = QDir::tempPath() + "/" + baseName + "_transforms.trf";
-
-        emit progressChanged(0);
-
-        QString detectFilter = buildDetectFilter(config, trfPath);
-        QStringList args = {
-            "-y", "-i", inputPath,
-            "-vf", detectFilter,
-            "-f", "null", "-"
-        };
-
-        bool ok = runFFmpeg(args, 0, 100);
-
-        if (!ok || isCancelled()) {
-            QFile::remove(trfPath);
-            emit stabilizeComplete(false,
-                isCancelled() ? "Analysis cancelled" : "Analysis failed");
-            return;
-        }
-
-        if (!QFileInfo::exists(trfPath)) {
-            emit stabilizeComplete(false, "Transform file was not generated");
-            return;
-        }
-
-        emit progressChanged(100);
-        emit analysisComplete(trfPath);
+        emit stabilizeComplete(true, tr("スタビライズが完了しました"));
     });
 
     connect(thread, &QThread::finished, thread, &QThread::deleteLater);
@@ -692,6 +568,9 @@ void VideoStabilizer::analyzeOnly(const QString &inputPath, const StabilizerConf
 
 void VideoStabilizer::cancel()
 {
-    QMutexLocker locker(&processStateMutex());
+    // VideoFilterGraph polls the cancelCheck callback we passed in
+    // stabilizeDeshake(); stabilizePlanarInversion() polls m_cancelled at the
+    // top of its decode loop. Both paths read this flag from the worker
+    // thread, so a plain assign is sufficient.
     m_cancelled = true;
 }

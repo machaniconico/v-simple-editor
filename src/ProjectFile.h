@@ -19,6 +19,11 @@
 #include "AudioDucking.h"
 #include "ExportDialog.h"           // HDRSettings struct
 #include "AIProcessingDialog.h"     // AIProcessingSettings struct
+#include "MediaPool.h"              // PRD-PHASE1-MEDIA-POOL: mediapool::MediaPool
+#include "AudioBusRouting.h"        // PRD-PHASE2-AUDIO-BUS: audiobus::AudioBusRouting
+#include "AcesColor.h"              // PRD-PHASE3-ACES: aces::AcesPipeline
+#include "DolbyVisionMetadata.h"    // PRD-PHASE3-DOLBY-VISION: dolbyvision::DolbyVisionMetadata
+#include "BroadcastCaption.h"       // PRD-PHASE3-BROADCAST-CC: broadcastcc::BroadcastCaptionDoc
 
 // --- Audio mixer serialization sub-types ---
 
@@ -138,6 +143,11 @@ struct TrackMatteClipEntry {
     QString matteSourceClipId;
 };
 
+struct ClipParentEntry {
+    QString clipId;
+    QString parentClipId;
+};
+
 // US-3D-11: per-clip 3D extruded-text layer config. `config` is a
 // Text3DLayer::toJson() blob (Text3DLayer is a non-copyable QObject so we
 // stash the serialized form rather than the object).
@@ -191,6 +201,27 @@ struct ProjectVfxState {
     ProjectLightWrapState lightWrap;
 };
 
+// PRD-PROJECT-PRESET: tracker preset persistence — value-only structs (no TrackerPreset.h / PlanarTrackerPreset.h dependency)
+struct MotionTrackerProjectState {
+    QString lastPresetId;
+    int searchRadius = 16;
+    QString matchMetric = "NCC";
+    bool kalmanEnabled = false;
+    double kalmanProcessNoise = 0.01;
+    double kalmanMeasurementNoise = 0.1;
+    double occlusionGate = 30.0;
+    bool subPixelEnabled = true;
+    double minConfidence = 0.5;
+};
+
+struct PlanarTrackerProjectState {
+    QString lastPresetId;
+    double searchRadiusPx = 16.0;
+    double patchSizePx = 32.0;
+    double dampingFactor = 0.3;
+    int maxFramesPerCall = 0;
+};
+
 // Full project state for serialization
 struct ProjectData {
     ProjectConfig config;
@@ -234,6 +265,7 @@ struct ProjectData {
     QVector<RotoClipEntry> rotoClipEntries;
     QVector<TimeRemapClipEntry> timeRemapClipEntries;
     QVector<TrackMatteClipEntry> trackMatteClipEntries;
+    QVector<ClipParentEntry> clipParentEntries;
     ProjectVfxState vfxState;
 
     // US-3D-11: motion-graphics sprint persistence
@@ -271,6 +303,25 @@ struct ProjectData {
 
     // US-INT-3: Sprint 19 — Auto color match memory. Persisted under root["colormatch"].
     QString colorMatchLastReferenceClip;
+
+    // PRD-PROJECT-PRESET: tracker preset persistence
+    MotionTrackerProjectState motionTrackerState;
+    PlanarTrackerProjectState planarTrackerState;
+
+    // PRD-PHASE1-MEDIA-POOL: メディアプール永続化
+    mediapool::MediaPool mediaPool;
+
+    // PRD-PHASE2-AUDIO-BUS: バス/サブミックス/AUXセンド ルーティング永続化
+    audiobus::AudioBusRouting audioBusRouting;
+
+    // PRD-PHASE3-ACES: ACES カラーマネジメント設定永続化
+    aces::AcesPipeline acesPipeline;
+
+    // PRD-PHASE3-DOLBY-VISION: Dolby Vision メタデータ永続化
+    dolbyvision::DolbyVisionMetadata dolbyVision;
+
+    // PRD-PHASE3-BROADCAST-CC: 放送CC (CEA-608/708) 永続化
+    broadcastcc::BroadcastCaptionDoc broadcastCaption;
 };
 
 class ProjectFile
@@ -283,6 +334,12 @@ public:
     static bool fromJsonString(const QString &json, ProjectData &data);
 
     static const QString fileFilter() { return "V Editor Project (*.veditor);;All Files (*)"; }
+
+    // PRD-PROJECT-PRESET: tracker preset state serialization helpers (public for selftest access)
+    static QJsonObject motionTrackerStateToJson(const MotionTrackerProjectState &s);
+    static MotionTrackerProjectState motionTrackerStateFromJson(const QJsonObject &obj);
+    static QJsonObject planarTrackerStateToJson(const PlanarTrackerProjectState &s);
+    static PlanarTrackerProjectState planarTrackerStateFromJson(const QJsonObject &obj);
 
 private:
     // Serialization helpers
@@ -340,6 +397,8 @@ private:
     static TimeRemapClipEntry timeRemapClipEntryFromJson(const QJsonObject &obj);
     static QJsonObject trackMatteClipEntryToJson(const TrackMatteClipEntry &entry);
     static TrackMatteClipEntry trackMatteClipEntryFromJson(const QJsonObject &obj);
+    static QJsonObject clipParentEntryToJson(const ClipParentEntry &entry);
+    static ClipParentEntry clipParentEntryFromJson(const QJsonObject &obj);
     static QJsonObject vfxStateToJson(const ProjectVfxState &state);
     static ProjectVfxState vfxStateFromJson(const QJsonObject &obj);
 

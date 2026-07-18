@@ -1,6 +1,14 @@
 #include "ProxyManager.h"
 
+#include "libavcore/Decode.h"
+#include "libavcore/Encode.h"
+#include "libavcore/Probe.h"
+
+#include <algorithm>
 #include <atomic>
+#include <cmath>
+#include <cstdint>
+#include <optional>
 
 #include <QDateTime>
 #include <QDir>
@@ -17,13 +25,16 @@
 #include <QSettings>
 #include <QMutex>
 #include <QMutexLocker>
+#include <QMetaObject>
+
+extern "C" {
+#include <libavutil/avutil.h>
+#include <libavutil/frame.h>
+#include <libavutil/imgutils.h>
+#include <libavutil/mathematics.h>
+}
 
 namespace {
-// Shared between probeDurationUs and probeSourceCodec — once we learn
-// ffprobe is missing from PATH, every subsequent probe (regardless of which
-// helper) skips its 2 s waitForStarted timeout.
-bool g_ffprobeMissing = false;
-
 // proxyDir() used to QSettings + QFileInfo + isDir() on every call, which
 // landed in hot paths (proxyFilePath → getProxyPath at preview time). The
 // revision counter is bumped by setProxyStorageDir(); proxyDir() can then
@@ -39,6 +50,272 @@ int g_cachedProxyDirRevision = -1;
 // 2026-04-25). proxyDir() is static so we can't rely on instance-level
 // scheduling — defend at the data instead.
 QMutex g_proxyDirMutex;
+
+struct ProxyTranscodeJob {
+    QString originalPath;
+    QString proxyPath;
+    QString clipName;
+    ProxyConfig config;
+    QualityPreset preset = QualityPreset::Medium;
+    qint64 durationUs = 0;
+};
+
+struct ProxyTranscodeResult {
+    bool success = false;
+    bool cancelled = false;
+    QString error;
+    QString activeEncoderName;
+    int framesEncoded = 0;
+};
+
+bool proxyEncoderAvailableForInProcess(const std::string &name)
+{
+    // The bundled libavcodec build exposes only Media Foundation H.264 on
+    // Windows and software libx264 elsewhere; NVENC/QSV/AMF GPU encoders are
+    // not in the registry. Reject them up-front so a stale user override does
+    // not propagate into an unavailable encoder request to FrameEncoder.
+    if (name == "h264_nvenc" || name == "h264_qsv" || name == "h264_amf")
+        return false;
+    // Prefer the in-process Media Foundation path when present; libx264 is
+    // only a non-Windows/developer fallback for builds without h264_mf.
+    if (name == "libx264" && libavcore::encoderAvailable("h264_mf"))
+        return false;
+    return libavcore::encoderAvailable(name);
+}
+
+QString inProcessH264FallbackEncoderName()
+{
+    static const char *const kOrder[] = {
+        "h264_mf",
+        "libx264",
+        "mpeg4",
+    };
+    for (const char *name : kOrder) {
+        if (proxyEncoderAvailableForInProcess(name))
+            return QString::fromLatin1(name);
+    }
+    return QStringLiteral("libx264");
+}
+
+int fpsFromRational(AVRational rate)
+{
+    if (rate.num <= 0 || rate.den <= 0)
+        return 30;
+    const double fps = av_q2d(rate);
+    if (!std::isfinite(fps) || fps <= 0.0)
+        return 30;
+    return std::clamp(static_cast<int>(std::lround(fps)), 1, 240);
+}
+
+int64_t proxyVideoBitrateBits(const ProxyConfig &config,
+                              QualityPreset preset,
+                              int fps)
+{
+    const double bitsPerPixel =
+        (preset == QualityPreset::High) ? 0.18 :
+        (preset == QualityPreset::Low)  ? 0.07 : 0.11;
+    const int safeFps = std::clamp(fps, 1, 240);
+    const double target =
+        static_cast<double>(std::max(1, config.proxyWidth))
+        * static_cast<double>(std::max(1, config.proxyHeight))
+        * static_cast<double>(safeFps)
+        * bitsPerPixel;
+
+    const int64_t floor =
+        (preset == QualityPreset::High) ? 1'200'000 :
+        (preset == QualityPreset::Low)  ?   400'000 : 800'000;
+    return std::max<int64_t>(floor, static_cast<int64_t>(target));
+}
+
+void postProxyProgress(ProxyManager *manager,
+                       const QString &clipName,
+                       int percent)
+{
+    QMetaObject::invokeMethod(manager,
+                              "proxyProgress",
+                              Qt::QueuedConnection,
+                              Q_ARG(QString, clipName),
+                              Q_ARG(int, percent));
+}
+
+ProxyTranscodeResult runProxyTranscode(const ProxyTranscodeJob &job,
+                                       std::atomic_bool &cancelRequested)
+{
+    ProxyTranscodeResult result;
+
+    QFile::remove(job.proxyPath);
+
+    libavcore::MediaDecoder decoder;
+    if (auto err = decoder.open(job.originalPath.toUtf8().constData(), false)) {
+        result.error = QString::fromStdString(*err);
+        return result;
+    }
+
+    const libavcore::VideoStreamProps props = decoder.videoProps();
+    const int fps = fpsFromRational(props.frameRate);
+
+    libavcore::EncodeRequest request;
+    request.width = job.config.proxyWidth;
+    request.height = job.config.proxyHeight;
+    request.fps = fps;
+    request.videoBitrateBits =
+        proxyVideoBitrateBits(job.config, job.preset, fps);
+    request.outputPath = job.proxyPath.toUtf8().constData();
+    request.audioSourcePath = job.originalPath.toUtf8().constData();
+    // Seed the request with the encoder the in-process fallback chain would
+    // actually resolve to (h264_mf on Windows, libx264 elsewhere). A bare
+    // "libx264" here would be self-contradictory: encoderAvailableHook below
+    // reports it unavailable whenever h264_mf is registered. FrameEncoder
+    // re-runs its own fallback chain regardless, but starting from the real
+    // candidate keeps the request internally consistent and the diagnostics
+    // accurate.
+    request.videoCodecName =
+        inProcessH264FallbackEncoderName().toUtf8().constData();
+    request.encoderAvailableHook = proxyEncoderAvailableForInProcess;
+
+    {
+        libavcore::FrameEncoder encoder;
+        if (auto err = encoder.open(request)) {
+            result.error = QString::fromStdString(*err);
+            QFile::remove(job.proxyPath);
+            return result;
+        }
+        result.activeEncoderName =
+            QString::fromStdString(encoder.activeEncoderName());
+
+        AVFrame *scaledFrame = av_frame_alloc();
+        SwsContext *sws = nullptr;
+        if (!scaledFrame) {
+            result.error = QStringLiteral("Failed to allocate proxy frame");
+        } else {
+            const AVPixelFormat dstFmt = encoder.outputPixelFormat();
+            scaledFrame->format = dstFmt;
+            scaledFrame->width = job.config.proxyWidth;
+            scaledFrame->height = job.config.proxyHeight;
+            int rc = av_frame_get_buffer(scaledFrame, 32);
+            if (rc < 0) {
+                result.error =
+                    QStringLiteral("Failed to allocate proxy frame buffer");
+            }
+
+            int64_t nextPts = 0;
+            int lastProgress = -1;
+            const AVRational usTimeBase{1, AV_TIME_BASE};
+            AVFrame *frame = nullptr;
+
+            while (result.error.isEmpty()
+                   && (frame = decoder.nextVideoFrame())) {
+                if (cancelRequested.load(std::memory_order_acquire)) {
+                    result.cancelled = true;
+                    break;
+                }
+
+                const AVPixelFormat srcFmt =
+                    static_cast<AVPixelFormat>(frame->format);
+                sws = sws_getCachedContext(sws,
+                                           frame->width,
+                                           frame->height,
+                                           srcFmt,
+                                           job.config.proxyWidth,
+                                           job.config.proxyHeight,
+                                           dstFmt,
+                                           SWS_BILINEAR,
+                                           nullptr,
+                                           nullptr,
+                                           nullptr);
+                if (!sws) {
+                    result.error =
+                        QStringLiteral("Failed to create proxy scaler");
+                    break;
+                }
+
+                rc = av_frame_make_writable(scaledFrame);
+                if (rc < 0) {
+                    result.error =
+                        QStringLiteral("Proxy frame buffer is not writable");
+                    break;
+                }
+
+                sws_scale(sws,
+                          frame->data,
+                          frame->linesize,
+                          0,
+                          frame->height,
+                          scaledFrame->data,
+                          scaledFrame->linesize);
+
+                scaledFrame->color_primaries = frame->color_primaries;
+                scaledFrame->color_trc = frame->color_trc;
+                scaledFrame->colorspace = frame->colorspace;
+                scaledFrame->color_range = frame->color_range;
+
+                if (!encoder.pushFrameNative(scaledFrame, nextPts++)) {
+                    result.error =
+                        QStringLiteral("Encoder rejected proxy frame");
+                    break;
+                }
+                ++result.framesEncoded;
+
+                if (job.durationUs > 0) {
+                    int64_t elapsedUs = AV_NOPTS_VALUE;
+                    const int64_t ts =
+                        (frame->best_effort_timestamp != AV_NOPTS_VALUE)
+                            ? frame->best_effort_timestamp
+                            : frame->pts;
+                    if (ts != AV_NOPTS_VALUE && props.timeBase.num > 0
+                        && props.timeBase.den > 0) {
+                        elapsedUs = av_rescale_q(ts,
+                                                 props.timeBase,
+                                                 usTimeBase);
+                    } else {
+                        elapsedUs = av_rescale_q(result.framesEncoded,
+                                                 AVRational{1, fps},
+                                                 usTimeBase);
+                    }
+
+                    if (elapsedUs != AV_NOPTS_VALUE) {
+                        const int percent = std::clamp<int>(
+                            static_cast<int>((elapsedUs * 100)
+                                             / job.durationUs),
+                            0,
+                            100);
+                        if (percent != lastProgress) {
+                            lastProgress = percent;
+                            postProxyProgress(&ProxyManager::instance(),
+                                              job.clipName,
+                                              percent);
+                        }
+                    }
+                }
+            }
+        }
+
+        if (cancelRequested.load(std::memory_order_acquire))
+            result.cancelled = true;
+
+        if (!result.cancelled && result.error.isEmpty()) {
+            if (result.framesEncoded <= 0) {
+                result.error = QStringLiteral("No video frames decoded");
+            } else if (auto err = encoder.finalize()) {
+                result.error = QString::fromStdString(*err);
+            } else {
+                result.success = QFile::exists(job.proxyPath);
+            }
+        }
+
+        if (sws)
+            sws_freeContext(sws);
+        av_frame_free(&scaledFrame);
+    }
+
+    if (!result.success)
+        QFile::remove(job.proxyPath);
+
+    if (!result.success && result.error.isEmpty() && !result.cancelled)
+        result.error = QStringLiteral("Proxy encode failed");
+
+    return result;
+}
 }
 
 ProxyManager &ProxyManager::instance()
@@ -85,47 +362,18 @@ QString ProxyManager::computeConfigFingerprint(const ProxyConfig &cfg,
                                        QString::number(cfg.proxyHeight));
 }
 
-int ProxyManager::qualityValueForEncoder(const QString &encoder, QualityPreset preset)
-{
-    // Backend-specific tables — CRF and QP scales aren't equivalent across
-    // encoders, so a single magic 28 would over- or under-quantize on three
-    // of the four backends. Values picked from Codex review.
-    if (encoder == "libx264") {
-        switch (preset) {
-            case QualityPreset::High:   return 22;
-            case QualityPreset::Medium: return 28;
-            case QualityPreset::Low:    return 35;
-        }
-    }
-    if (encoder == "h264_nvenc" || encoder == "h264_amf") {
-        switch (preset) {
-            case QualityPreset::High:   return 24;
-            case QualityPreset::Medium: return 28;
-            case QualityPreset::Low:    return 34;
-        }
-    }
-    if (encoder == "h264_qsv") {
-        switch (preset) {
-            case QualityPreset::High:   return 20;
-            case QualityPreset::Medium: return 26;
-            case QualityPreset::Low:    return 32;
-        }
-    }
-    return 28;
-}
-
 ProxyManager::~ProxyManager()
 {
-    if (m_process) {
-        m_process->kill();
-        m_process->waitForFinished(3000);
-        delete m_process;
-    }
     if (m_thread) {
-        m_thread->quit();
-        m_thread->wait(3000);
+        m_cancelRequested.store(true, std::memory_order_release);
+        m_thread->wait();
         delete m_thread;
+        m_thread = nullptr;
     }
+    // At process teardown the event loop is gone, so the worker's queued
+    // completion lambda (which normally clears this) will never run. Reset
+    // it here so the in-flight guard reflects reality during destruction.
+    m_workerInFlight = false;
 }
 
 void ProxyManager::setConfig(const ProxyConfig &config)
@@ -159,7 +407,7 @@ void ProxyManager::generateProxy(const QString &originalFilePath)
     m_totalQueued = m_queue.size();
     m_completed = 0;
 
-    if (!m_process)
+    if (!m_thread)
         processNextInQueue();
 }
 
@@ -193,14 +441,19 @@ void ProxyManager::generateAllProxies(const QStringList &filePaths)
     }
 
     m_totalQueued = m_queue.size();
-    if (m_totalQueued > 0 && !m_process)
+    if (m_totalQueued > 0 && !m_thread)
         processNextInQueue();
 }
 
 QString ProxyManager::getProxyPath(const QString &originalPath) const
 {
+    return getProxyPath(originalPath, false);
+}
+
+QString ProxyManager::getProxyPath(const QString &originalPath, bool forceProxy) const
+{
     const QString key = normalizePath(originalPath);
-    if (m_proxyMode && !key.isEmpty() && m_entries.contains(key)) {
+    if ((m_proxyMode || forceProxy) && !key.isEmpty() && m_entries.contains(key)) {
         const auto &entry = m_entries[key];
         if (entry.status == ProxyStatus::Ready
             && !isEntryStale(entry)
@@ -221,70 +474,18 @@ bool ProxyManager::hasProxy(const QString &originalPath) const
         && QFile::exists(entry.proxyPath);
 }
 
-// Single source of truth for the GPU H.264 priority chain. Both
-// chosenGpuH264Encoder() and pickRuntimeEncoder() walk this list — keeping
-// it in one place stops the two from drifting (Codex review, 2026-04-25).
-static const QStringList &gpuH264Priority()
+bool ProxyManager::isGenerating(const QString &originalPath) const
 {
-    static const QStringList kOrder = {
-        QStringLiteral("h264_nvenc"),
-        QStringLiteral("h264_qsv"),
-        QStringLiteral("h264_amf")
-    };
-    return kOrder;
-}
-
-QString ProxyManager::pickRuntimeEncoder(const QString &proposed) const
-{
-    if (proposed.isEmpty())
-        return QString();
-    if (!m_runtimeFailedEncoders.contains(proposed))
-        return proposed;
-
-    for (const QString &candidate : gpuH264Priority()) {
-        if (candidate == proposed)
-            continue;
-        if (m_runtimeFailedEncoders.contains(candidate))
-            continue;
-        if (ffmpegHasEncoder(candidate))
-            return candidate;
-    }
-    return QString();
+    const QString key = normalizePath(originalPath);
+    if (key.isEmpty() || !m_entries.contains(key))
+        return false;
+    return m_entries[key].status == ProxyStatus::Generating;
 }
 
 QString ProxyManager::currentEffectiveEncoder() const
 {
-    static const QStringList kValid = {
-        "h264_nvenc", "h264_qsv", "h264_amf", "libx264"
-    };
-    QString gpu;
-    if (!m_encoderOverride.isEmpty() && kValid.contains(m_encoderOverride)) {
-        if (m_encoderOverride == "libx264")
-            return QStringLiteral("libx264");
-        gpu = m_encoderOverride;
-    } else {
-        gpu = chosenGpuH264Encoder();
-    }
-    // Mirror processNextInQueue: it pipes the proposed GPU encoder through
-    // pickRuntimeEncoder() to respect the runtime-failed blocklist. If we
-    // skipped that here, an entry generated under the active fallback
-    // (e.g. libx264 because h264_nvenc has been blocklisted) would carry
-    // fingerprint "libx264|..." while this method still returns
-    // "h264_nvenc|..." — every such entry would show as stale forever
-    // until the app is restarted (Codex review, 2026-04-25).
-    gpu = pickRuntimeEncoder(gpu);
-    if (!gpu.isEmpty())
-        return gpu;
-    // Mirror the #if VEDITOR_AV1 branch in processNextInQueue: when no GPU
-    // encoder is available and override is empty, that path falls through
-    // to libsvtav1 in the modern edition. Otherwise every modern-edition
-    // proxy would carry a libsvtav1 fingerprint while currentEffectiveEncoder
-    // returns libx264, marking every entry permanently stale.
-#if defined(VEDITOR_AV1)
-    if (m_encoderOverride.isEmpty() && ffmpegHasEncoder("libsvtav1"))
-        return QStringLiteral("libsvtav1");
-#endif
-    return QStringLiteral("libx264");
+    Q_UNUSED(m_encoderOverride);
+    return inProcessH264FallbackEncoderName();
 }
 
 bool ProxyManager::isEntryStale(const ProxyEntry &entry) const
@@ -640,67 +841,67 @@ void ProxyManager::saveIndex()
 
 void ProxyManager::cancelGeneration()
 {
-    m_cancelRequested = true;
+    qInfo().noquote() << QStringLiteral("[ProxyManager] cancellation requested by user");
+    m_cancelRequested.store(true, std::memory_order_release);
     m_queue.clear();
-    const QString cancelledClipName = m_currentClipName;
-    const bool hadProcess = (m_process != nullptr);
-    if (m_process) {
-        // Detach the finished/readyRead lambdas first — without this, the
-        // old QProcess emits finished() (synchronously when terminate +
-        // waitForFinished succeed, asynchronously after kill) and re-enters
-        // processNextInQueue() against a m_process pointer the next
-        // generateAllProxies has already overwritten with a new QProcess.
-        // That ghost lambda is the regenerate crash.
-        disconnect(m_process, nullptr, this, nullptr);
-        m_process->terminate();
-        if (!m_process->waitForFinished(2000))
-            m_process->kill();
-        m_process->waitForFinished(1000);
-        m_process->deleteLater();
-        m_process = nullptr;
-    }
-    // The disconnect above prevents the finished-lambda from running, so any
-    // entry still marked Generating will never be reset by that lambda.
-    // Reset them explicitly here so generateAllProxies can queue them again.
+
+    // The worker observes m_cancelRequested inside its decode loop. Reset
+    // entries immediately so a later generateAllProxies call can queue them
+    // again after the worker has marshalled its cancellation completion.
     for (auto it = m_entries.begin(); it != m_entries.end(); ++it) {
         if (it.value().status == ProxyStatus::Generating)
             it.value().status = ProxyStatus::None;
     }
 
-    // Reset synchronously so a follow-up generateAllProxies on the same
-    // call stack doesn't see leftover cancel state.
-    m_cancelRequested = false;
-    m_currentClipName.clear();
-    m_currentSourceDurationUs = 0;
-    m_currentStderrBuffer.clear();
+    if (m_thread) {
+        // Synchronously join the worker before returning. Callers depend on
+        // this: MainWindow's regenerate path deletes the proxy file the
+        // instant cancelGeneration() returns, and the worker's libavcore
+        // FrameEncoder still holds that file open until run() unwinds —
+        // unlinking it mid-encode crashes the app. Without the join the
+        // worker could also still be alive when the next generateAllProxies
+        // arrives, allowing two overlapping transcodes.
+        //
+        // No deadlock: the worker's run() body finishes runProxyTranscode()
+        // (which exits its decode loop as soon as it sees m_cancelRequested)
+        // and then only POSTs the completion lambda via Qt::QueuedConnection
+        // before returning, so wait() on the main thread unblocks promptly.
+        //
+        // We deliberately do NOT delete the thread here. The completion
+        // lambda was already posted and will run later on the main thread;
+        // it calls workerThread->wait() (idempotent — a second wait() on a
+        // finished thread is safe) and owns the deleteLater(). Deleting the
+        // QThread here would leave that queued lambda dereferencing freed
+        // memory. m_thread therefore stays non-null until the lambda runs.
+        m_thread->wait();
+    }
 
-    if (hadProcess)
-        emit proxyCancelled(cancelledClipName);
-}
-
-void ProxyManager::parseFfmpegProgress(const QByteArray &chunk)
-{
-    // ffmpeg -progress pipe:1 emits key=value lines. We care about
-    // out_time_ms (presentation time in microseconds).
-    const QList<QByteArray> lines = chunk.split('\n');
-    for (const QByteArray &line : lines) {
-        const int eq = line.indexOf('=');
-        if (eq < 0) continue;
-        const QByteArray key = line.left(eq).trimmed();
-        const QByteArray val = line.mid(eq + 1).trimmed();
-        if (key != "out_time_ms" && key != "out_time_us") continue;
-        bool ok = false;
-        const qint64 us = val.toLongLong(&ok);
-        if (!ok || m_currentSourceDurationUs <= 0) continue;
-        qint64 pct = us * 100 / m_currentSourceDurationUs;
-        if (pct < 0) pct = 0;
-        if (pct > 100) pct = 100;
-        emit proxyProgress(m_currentClipName, static_cast<int>(pct));
+    // m_cancelRequested is left set while a worker is still in flight; the
+    // completion lambda is the single authority that clears it (and clears
+    // m_workerInFlight) once it has finished marshalling the cancelled
+    // result. Clearing it here would let the flag race a not-yet-delivered
+    // completion. When no worker exists there is nothing to wait on, so
+    // reset the per-job state immediately.
+    if (!m_thread && !m_workerInFlight) {
+        m_cancelRequested.store(false, std::memory_order_release);
+        m_currentClipName.clear();
+        m_currentSourceDurationUs = 0;
     }
 }
 
 void ProxyManager::processNextInQueue()
 {
+    // Refuse to start a second worker while one is still in flight. m_thread
+    // is checked too, but it alone is insufficient: the completion lambda
+    // nulls m_thread before this function is re-entered, so a re-entrant
+    // caller (e.g. generateAllProxies arriving between worker run() returning
+    // and the queued completion lambda executing) could see m_thread ==
+    // nullptr and start an overlapping transcode. m_workerInFlight stays true
+    // for the whole worker lifetime — from start() until the completion
+    // lambda clears it — and closes that gap.
+    if (m_thread || m_workerInFlight)
+        return;
+
     if (m_queue.isEmpty()) {
         emit allProxiesReady();
         return;
@@ -718,8 +919,7 @@ void ProxyManager::processNextInQueue()
     m_currentClipName = QFileInfo(originalPath).fileName();
     m_currentSourceDurationUs = probeDurationUs(originalPath);
     const QString srcCodec = probeSourceCodec(originalPath);
-    m_cancelRequested = false;
-    m_currentStderrBuffer.clear();
+    m_cancelRequested.store(false, std::memory_order_release);
     emit proxyStarted(m_currentClipName);
     if (m_currentSourceDurationUs <= 0) {
         // Probe failed or input has no duration (image, broken file). Push
@@ -727,519 +927,215 @@ void ProxyManager::processNextInQueue()
         emit proxyProgress(m_currentClipName, -1);
     }
 
-    // Resolve the encoder we'll actually invoke for this job and log it. The
-    // decision mirrors the priority chain in the args composition below.
-    // Manual override (US-1): if the user pinned a specific encoder via the
-    // settings dialog, use that instead of the auto-detect chain. We accept
-    // only the four whitelisted names; anything else falls through to Auto
-    // so a stale QSettings value can't wedge proxy generation.
-    QString jobGpuEnc;
-    static const QStringList kValidEncoders = {
-        "h264_nvenc", "h264_qsv", "h264_amf", "libx264"
-    };
-    if (!m_encoderOverride.isEmpty() && kValidEncoders.contains(m_encoderOverride)) {
-        if (m_encoderOverride != "libx264")
-            jobGpuEnc = m_encoderOverride;
-        // libx264 override → leave jobGpuEnc empty so the software branch runs
-    } else {
-        jobGpuEnc = chosenGpuH264Encoder();
-    }
-    // Honour the runtime-failed blocklist: if a previous job for this
-    // session already learned that e.g. h264_nvenc can't actually open a
-    // device on this machine, don't keep retrying the same encoder.
-    jobGpuEnc = pickRuntimeEncoder(jobGpuEnc);
-    QString jobEncoder = jobGpuEnc;
-    if (jobEncoder.isEmpty()) {
-#if defined(VEDITOR_AV1)
-        if (m_encoderOverride.isEmpty() && ffmpegHasEncoder("libsvtav1"))
-            jobEncoder = "libsvtav1";
-        else
-#endif
-            jobEncoder = "libx264";
-    }
-
-    // Pick the matching hardware decoder for this source codec when the
-    // encoder branch is GPU. -hwaccel <api> alone tells ffmpeg "you may use
-    // <api>" but doesn't override the decoder selection — AV1 sources still
-    // route through libdav1d unless we explicitly say -c:v av1_cuvid. The
-    // helpers fall back to QString() when probe fails or the decoder isn't
-    // built into ffmpeg, in which case we don't inject anything and let
-    // ffmpeg's default decoder run (no regression vs Phase 3).
-    //
-    // Known cuvid limitations (consumer NVDEC silently rejects these):
-    //  - h264_cuvid: H.264 Hi10P (10-bit) and High 4:4:4 Predictive
-    //  - hevc_cuvid: HEVC Main 4:4:4 and some HDR10+ streams
-    //  - av1_cuvid:  AV1 8/10-bit OK on Ampere+; 12-bit profiles unsupported
-    // ffmpeg exits non-zero in those cases; the proxy job is marked Error,
-    // partial output is removed, and the queue continues with the next clip.
-    auto resolveHwDecoder = [&srcCodec](const char *suffix) -> QString {
-        if (srcCodec.isEmpty()) return QString();
-        static const QStringList supported = {"av1", "h264", "hevc", "vp9"};
-        if (!supported.contains(srcCodec)) return QString();
-        const QString candidate = srcCodec + QLatin1Char('_') + QLatin1String(suffix);
-        return ffmpegHasDecoder(candidate) ? candidate : QString();
-    };
-    const QString cuvidDec = (jobGpuEnc == "h264_nvenc") ? resolveHwDecoder("cuvid") : QString();
-    const QString qsvDec   = (jobGpuEnc == "h264_qsv")   ? resolveHwDecoder("qsv")   : QString();
-    const QString jobDecoder =
-        !cuvidDec.isEmpty() ? cuvidDec :
-        !qsvDec.isEmpty()   ? qsvDec   :
-        srcCodec.isEmpty()  ? QStringLiteral("<probe-failed>") :
-                              QStringLiteral("<default>");
-
-    const int qualVal = qualityValueForEncoder(jobEncoder, m_qualityPreset);
+    const QString plannedEncoder = currentEffectiveEncoder();
     const char *presetTag = "M";
     switch (m_qualityPreset) {
         case QualityPreset::High:   presetTag = "H"; break;
         case QualityPreset::Medium: presetTag = "M"; break;
         case QualityPreset::Low:    presetTag = "L"; break;
     }
-    appendEncoderLog(QString("[%1] job source=%2 encoder=%3 decoder=%4 quality=%5 preset=%6")
+    // bitrate is an ESTIMATE: the real source fps is only known once the
+    // worker opens the decoder, so this main-thread log uses a nominal
+    // 30 fps. The encoder still scales the bitrate to the actual fps via
+    // proxyVideoBitrateBits() inside runProxyTranscode(); only this
+    // diagnostic line is approximate.
+    appendEncoderLog(QString("[%1] job source=%2 encoder=%3 decoder=%4 bitrate~=%5(est@30fps) preset=%6")
                      .arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate),
                           m_currentClipName,
-                          jobEncoder,
-                          jobDecoder,
-                          QString::number(qualVal),
+                          plannedEncoder,
+                          srcCodec.isEmpty() ? QStringLiteral("<probe-failed>")
+                                             : srcCodec,
+                          QString::number(proxyVideoBitrateBits(
+                              m_config, m_qualityPreset, 30)),
                           QString::fromLatin1(presetTag)));
 
-    m_process = new QProcess(this);
+    ProxyTranscodeJob job;
+    job.originalPath = originalPath;
+    job.proxyPath = entry.proxyPath;
+    job.clipName = m_currentClipName;
+    job.config = m_config;
+    job.preset = m_qualityPreset;
+    job.durationUs = m_currentSourceDurationUs;
 
-    // Encoder priority: GPU H.264 (~5-10x faster than CPU) → AV1 software
-    // (smaller, accurate seek; Modern build only) → libx264 software.
-    // We probe the actual ffmpeg binary (not the linked libavcodec) because
-    // the two can disagree when ffmpeg is on PATH but built independently.
-    // Each branch owns its full input chain: GPU encoders need -hwaccel
-    // before -i so that decode and scale stay on-card and CPU stays idle.
-    QStringList args;
-    args << "-y";
+    // Mark the worker in flight BEFORE start() so any re-entrant
+    // processNextInQueue() (or a generateAllProxies racing the queued
+    // completion lambda) is structurally blocked from launching a second
+    // transcode. Cleared only by the completion lambda below.
+    m_workerInFlight = true;
 
-    const QString gpuEnc = jobGpuEnc;
-    const QString scaleSize = QString("%1:%2").arg(m_config.proxyWidth).arg(m_config.proxyHeight);
-    // Pre-resolve quality (US-2 + US-8). For the libx264 / libsvtav1 paths
-    // this is also recomputed inline since they use different scales.
-    const QString qStr = QString::number(qualityValueForEncoder(jobEncoder, m_qualityPreset));
-
-    if (gpuEnc == "h264_nvenc") {
-        // Full CUDA pipeline: NVDEC decode → scale_cuda → NVENC encode, no
-        // VRAM↔RAM round-trips. Crucial on long sources where software decode
-        // and scale would dominate wall-clock even with NVENC encode.
-        // The cuvid decoder must be named explicitly: -hwaccel cuda alone
-        // doesn't override decoder selection, so AV1/HEVC/VP9 sources would
-        // otherwise fall back to libdav1d / libx265 / libvpx.
-        args << "-hwaccel" << "cuda"
-             << "-hwaccel_output_format" << "cuda";
-        if (!cuvidDec.isEmpty())
-            args << "-c:v" << cuvidDec;
-        args << "-i" << originalPath
-             << "-vf" << QString("scale_cuda=%1").arg(scaleSize)
-             << "-c:v" << "h264_nvenc"
-             << "-preset" << "p1"
-             << "-rc" << "constqp" << "-qp" << qStr
-             << "-c:a" << "aac"
-             << "-b:a" << "128k"
-             << "-movflags" << "+faststart"
-             << entry.proxyPath;
-    } else if (gpuEnc == "h264_qsv") {
-        // Full QSV pipeline: Intel hardware decode → scale_qsv → QSV encode.
-        // Per-source qsv decoder is needed for the same reason as cuvid.
-        args << "-hwaccel" << "qsv"
-             << "-hwaccel_output_format" << "qsv";
-        if (!qsvDec.isEmpty())
-            args << "-c:v" << qsvDec;
-        args << "-i" << originalPath
-             << "-vf" << QString("scale_qsv=%1").arg(scaleSize)
-             << "-c:v" << "h264_qsv"
-             << "-preset" << "veryfast"
-             << "-global_quality" << qStr
-             << "-c:a" << "aac"
-             << "-b:a" << "128k"
-             << "-movflags" << "+faststart"
-             << entry.proxyPath;
-    } else if (gpuEnc == "h264_amf") {
-        // AMF doesn't expose a clean GPU scale chain in ffmpeg, so we run
-        // d3d11va decode and let the scale fall back to CPU. Still better
-        // than full software because decode is the bigger half.
-        args << "-hwaccel" << "d3d11va"
-             << "-i" << originalPath
-             << "-vf" << QString("scale=%1").arg(scaleSize)
-             << "-c:v" << "h264_amf"
-             << "-quality" << "speed"
-             << "-rc" << "cqp" << "-qp_i" << qStr << "-qp_p" << qStr
-             << "-pix_fmt" << "yuv420p"
-             << "-c:a" << "aac"
-             << "-b:a" << "128k"
-             << "-movflags" << "+faststart"
-             << entry.proxyPath;
-    }
-#if defined(VEDITOR_AV1)
-    else if (m_encoderOverride.isEmpty() && ffmpegHasEncoder("libsvtav1")) {
-        // preset 12: near-fastest SVT-AV1 — proxies trade quality for speed.
-        args << "-i" << originalPath
-             << "-vf" << QString("scale=%1").arg(scaleSize)
-             << "-c:v" << "libsvtav1"
-             << "-preset" << "12"
-             << "-crf" << "35"
-             << "-g" << "120"
-             << "-pix_fmt" << "yuv420p"
-             << "-c:a" << "aac"
-             << "-b:a" << "128k"
-             << "-movflags" << "+faststart+frag_keyframe+empty_moov+default_base_moof"
-             << entry.proxyPath;
-    }
-#endif
-    else {
-        // Last-resort software H.264 — slowest but always available. -g 120
-        // forces keyframes every ~4 s so the seekbar stays accurate.
-        const QString libQ = QString::number(
-            qualityValueForEncoder("libx264", m_qualityPreset));
-        args << "-i" << originalPath
-             << "-vf" << QString("scale=%1").arg(scaleSize)
-             << "-c:v" << "libx264"
-             << "-crf" << libQ
-             << "-g" << "120"
-             << "-c:a" << "aac"
-             << "-b:a" << "128k"
-             << "-movflags" << "+faststart"
-             << entry.proxyPath;
-    }
-
-    // ffmpeg's -progress pipe:1 emits key=value progress lines on stdout
-    // (out_time_us, frame, fps, ...) which feed proxyProgress for the UI.
-    args.prepend("pipe:1");
-    args.prepend("-progress");
-
-    // Capture the process pointer so a late-firing readyRead from a
-    // previous job (queued in the event loop after we've already torn
-    // down its QProcess and started a new one) reads from its own
-    // process and bails out instead of writing the previous job's
-    // stderr into the current job's buffer (Gemini review,
-    // 2026-04-25).
-    QProcess *proc = m_process;
-    connect(proc, &QProcess::readyReadStandardOutput, this, [this, proc]() {
-        if (m_process != proc) return; // stale signal from a torn-down job
-        parseFfmpegProgress(proc->readAllStandardOutput());
-    });
-
-    // Buffer stderr so the finished lambda can pattern-match against
-    // device-unavailable strings (`Cannot load nvcuda.dll`, `Failed to
-    // initialize MFX library`, `[AMF] no devices`) and retry with the
-    // next encoder instead of surfacing the failure to the user.
-    connect(proc, &QProcess::readyReadStandardError, this, [this, proc]() {
-        if (m_process != proc) return; // stale signal from a torn-down job
-        m_currentStderrBuffer.append(proc->readAllStandardError());
-    });
-
-    connect(proc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
-            this, [this, originalPath, jobEncoder, jobGpuEnc, proc](int exitCode, QProcess::ExitStatus exitStatus) {
-
-        // Drain whatever stderr is still queued before we pattern-match.
-        // QProcess does not guarantee a readyReadStandardError fires for
-        // every chunk before finished — the device-error line we care
-        // about (e.g. "Cannot load nvcuda.dll" right before exit) is
-        // exactly the kind of trailing output that gets left behind, and
-        // missing it would silently drop the runtime fallback path
-        // (Codex review, 2026-04-25).
-        if (m_process == proc)
-            m_currentStderrBuffer.append(proc->readAllStandardError());
-
-        const bool wasCancelled = m_cancelRequested;
-        const bool success = !wasCancelled
-            && (exitCode == 0 && exitStatus == QProcess::NormalExit);
-        const QString clipName = m_currentClipName;
-
-        // GPU device-unavailable retry. Only fires when:
-        //   - we ran a GPU encoder (jobGpuEnc not empty),
-        //   - the job actually failed (not a clean cancel),
-        //   - the captured stderr matches a known driver/device error.
-        // On match: blocklist the failed encoder for the rest of this
-        // session, requeue this clip at the front, and tail-call into
-        // processNextInQueue. The retry will hit pickRuntimeEncoder and
-        // pick the next backend (or libx264).
-        if (!wasCancelled && !success && !jobGpuEnc.isEmpty()) {
-            static const QHash<QString, QStringList> kDeviceErrors = {
-                {QStringLiteral("h264_nvenc"), {
-                    QStringLiteral("Cannot load nvcuda.dll"),
-                    QStringLiteral("Failed loading nvcuda.dll"),
-                    QStringLiteral("OpenEncodeSessionEx failed"),
-                    QStringLiteral("No NVENC capable devices found"),
-                    QStringLiteral("Cannot load nvEncodeAPI"),
-                }},
-                {QStringLiteral("h264_qsv"), {
-                    QStringLiteral("Failed to initialize MFX library"),
-                    QStringLiteral("Error opening QSV"),
-                    QStringLiteral("Error initializing an MFX session"),
-                    QStringLiteral("MFX session"),
-                }},
-                {QStringLiteral("h264_amf"), {
-                    QStringLiteral("[AMF] no devices"),
-                    QStringLiteral("AMF Failed to initialize"),
-                    QStringLiteral("AMFCreateContext"),
-                    QStringLiteral("DLL libmfx"),
-                }},
-            };
-            const QStringList patterns = kDeviceErrors.value(jobGpuEnc);
-            bool deviceUnavailable = false;
-            for (const QString &pat : patterns) {
-                if (m_currentStderrBuffer.contains(pat.toUtf8())) {
-                    deviceUnavailable = true;
-                    break;
+    m_thread = QThread::create([this, originalPath, job]() {
+        ProxyTranscodeResult result =
+            runProxyTranscode(job, m_cancelRequested);
+        QThread *workerThread = QThread::currentThread();
+        QMetaObject::invokeMethod(
+            this,
+            [this, originalPath, job, result, workerThread]() {
+                if (m_thread == workerThread) {
+                    workerThread->wait();
+                    m_thread = nullptr;
+                    workerThread->deleteLater();
                 }
-            }
-            if (deviceUnavailable) {
-                appendEncoderLog(QString("[%1] runtime fallback: %2 device unavailable for %3 (exit=%4) — re-queueing")
-                    .arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate),
-                         jobGpuEnc, clipName, QString::number(exitCode)));
-                m_runtimeFailedEncoders.insert(jobGpuEnc);
+                // The worker is fully retired (run() returned, thread
+                // joined). Drop the in-flight guard now so the
+                // processNextInQueue() call below — and any external caller
+                // — can launch the next job.
+                m_workerInFlight = false;
+
+                const bool wasCancelled =
+                    result.cancelled
+                    || m_cancelRequested.load(std::memory_order_acquire);
+                const bool success = result.success && !wasCancelled;
+                const QString clipName = job.clipName;
+                const QString activeEncoder =
+                    result.activeEncoderName.isEmpty()
+                        ? currentEffectiveEncoder()
+                        : result.activeEncoderName;
 
                 if (m_entries.contains(originalPath)) {
                     auto &entry = m_entries[originalPath];
-                    QFile::remove(entry.proxyPath);
-                    entry.status = ProxyStatus::None;
+                    if (success && QFile::exists(entry.proxyPath)) {
+                        entry.status = ProxyStatus::Ready;
+                        entry.configFingerprint = computeConfigFingerprint(
+                            m_config, activeEncoder, m_qualityPreset);
+                        entry.sourceMtimeMs =
+                            QFileInfo(originalPath).lastModified()
+                                .toMSecsSinceEpoch();
+                        saveIndex();
+                        emit proxyGenerated(originalPath, entry.proxyPath);
+                    } else {
+                        entry.status = wasCancelled ? ProxyStatus::None
+                                                    : ProxyStatus::Error;
+                        QFile::remove(entry.proxyPath);
+                    }
                 }
-                m_queue.prepend(originalPath);
 
-                m_process->deleteLater();
-                m_process = nullptr;
+                m_completed++;
+                if (m_totalQueued > 0) {
+                    int percent =
+                        static_cast<int>(m_completed * 100 / m_totalQueued);
+                    emit progressChanged(percent);
+                }
+
+                if (wasCancelled)
+                    emit proxyCancelled(clipName);
+                else
+                    emit proxyFinished(clipName, success);
+
+                if (!success && !wasCancelled && !result.error.isEmpty()) {
+                    appendEncoderLog(QString("[%1] failed source=%2 error=%3")
+                        .arg(QDateTime::currentDateTimeUtc()
+                                 .toString(Qt::ISODate),
+                             clipName,
+                             result.error));
+                }
+
                 m_currentClipName.clear();
                 m_currentSourceDurationUs = 0;
-                m_currentStderrBuffer.clear();
+                m_cancelRequested.store(false, std::memory_order_release);
+
+                if (wasCancelled) {
+                    if (!m_queue.isEmpty())
+                        processNextInQueue();
+                    return;
+                }
+
                 processNextInQueue();
-                return;
-            }
-        }
-
-        if (m_entries.contains(originalPath)) {
-            auto &entry = m_entries[originalPath];
-            if (success && QFile::exists(entry.proxyPath)) {
-                entry.status = ProxyStatus::Ready;
-                entry.configFingerprint = computeConfigFingerprint(
-                    m_config, jobEncoder, m_qualityPreset);
-                entry.sourceMtimeMs =
-                    QFileInfo(originalPath).lastModified().toMSecsSinceEpoch();
-                saveIndex();
-                emit proxyGenerated(originalPath, entry.proxyPath);
-            } else {
-                entry.status = ProxyStatus::Error;
-                QFile::remove(entry.proxyPath);
-            }
-        }
-
-        m_completed++;
-        if (m_totalQueued > 0) {
-            int percent = static_cast<int>(m_completed * 100 / m_totalQueued);
-            emit progressChanged(percent);
-        }
-
-        if (wasCancelled)
-            emit proxyCancelled(clipName);
-        else
-            emit proxyFinished(clipName, success);
-
-        m_process->deleteLater();
-        m_process = nullptr;
-        m_currentClipName.clear();
-        m_currentSourceDurationUs = 0;
-        m_currentStderrBuffer.clear();
-
-        if (wasCancelled) {
-            m_cancelRequested = false;
-            return; // queue was cleared in cancelGeneration().
-        }
-
-        processNextInQueue();
+            },
+            Qt::QueuedConnection);
     });
-
-    m_process->start("ffmpeg", args);
+    m_thread->start();
 }
 
 bool ProxyManager::ffmpegHasEncoder(const QString &encoderName)
 {
-    // Cache per encoder name — ffmpeg's encoder list doesn't change at
-    // runtime so a one-shot probe is enough.
     static QHash<QString, bool> cache;
-    static bool probeBroken = false;
+    static QMutex mutex;
 
-    auto it = cache.constFind(encoderName);
-    if (it != cache.constEnd())
-        return it.value();
-
-    // If a previous probe couldn't even spawn ffmpeg, don't keep retrying —
-    // the user has bigger problems and we should fall back to libx264.
-    if (probeBroken)
-        return false;
-
-    QProcess probe;
-    probe.start("ffmpeg", QStringList() << "-hide_banner" << "-encoders");
-    if (!probe.waitForStarted(2000)) {
-        probeBroken = true;
-        return false;
-    }
-    if (!probe.waitForFinished(5000)) {
-        probe.kill();
-        probeBroken = true;
-        return false;
+    {
+        QMutexLocker lock(&mutex);
+        auto it = cache.constFind(encoderName);
+        if (it != cache.constEnd())
+            return it.value();
     }
 
-    // `ffmpeg -encoders` output lists one encoder per line, e.g.
-    //   V..... libsvtav1            SVT-AV1 encoder (codec av1)
-    // A simple substring search on the encoder name is sufficient because
-    // ffmpeg never emits the encoder identifier outside its own column.
-    const QByteArray out = probe.readAllStandardOutput()
-                         + probe.readAllStandardError();
-    const bool has = out.contains(encoderName.toUtf8());
-    cache.insert(encoderName, has);
+    const bool has =
+        libavcore::encoderAvailable(encoderName.toStdString());
+    {
+        QMutexLocker lock(&mutex);
+        cache.insert(encoderName, has);
+    }
     return has;
 }
 
 bool ProxyManager::ffmpegHasDecoder(const QString &decoderName)
 {
-    // Same shape as ffmpegHasEncoder — decoders also can't appear or vanish
-    // mid-process, so a one-shot probe per name is sufficient.
     static QHash<QString, bool> cache;
-    static bool probeBroken = false;
+    static QMutex mutex;
 
-    auto it = cache.constFind(decoderName);
-    if (it != cache.constEnd())
-        return it.value();
-
-    if (probeBroken)
-        return false;
-
-    QProcess probe;
-    probe.start("ffmpeg", QStringList() << "-hide_banner" << "-decoders");
-    if (!probe.waitForStarted(2000)) {
-        probeBroken = true;
-        return false;
-    }
-    if (!probe.waitForFinished(5000)) {
-        probe.kill();
-        probeBroken = true;
-        return false;
+    {
+        QMutexLocker lock(&mutex);
+        auto it = cache.constFind(decoderName);
+        if (it != cache.constEnd())
+            return it.value();
     }
 
-    // `ffmpeg -decoders` lists one entry per line, e.g.
-    //   V..... av1_cuvid            Nvidia CUVID AV1 decoder (codec av1)
-    // Substring containment on the decoder name is enough: ffmpeg never
-    // emits the decoder identifier outside its own column.
-    const QByteArray out = probe.readAllStandardOutput()
-                         + probe.readAllStandardError();
-    const bool has = out.contains(decoderName.toUtf8());
-    cache.insert(decoderName, has);
+    const bool has =
+        libavcore::decoderAvailable(decoderName.toStdString());
+    {
+        QMutexLocker lock(&mutex);
+        cache.insert(decoderName, has);
+    }
     return has;
 }
 
 qint64 ProxyManager::probeDurationUs(const QString &path)
 {
-    // Cache per source path — same file may be re-queued (settings change,
-    // user toggles proxy mode, etc.) and ffprobe spawn is ~200 ms.
     static QHash<QString, qint64> cache;
-    // ffprobe-missing flag is shared with probeSourceCodec (file-scope
-    // namespace above) so the second helper doesn't re-pay the 2 s spawn
-    // timeout on the same machine.
-    if (g_ffprobeMissing)
-        return 0;
+    static QMutex mutex;
 
-    auto it = cache.constFind(path);
-    if (it != cache.constEnd())
-        return it.value();
-
-    QProcess probe;
-    QStringList args;
-    args << "-v" << "error"
-         << "-show_entries" << "format=duration"
-         << "-of" << "default=noprint_wrappers=1:nokey=1"
-         << path;
-    probe.start("ffprobe", args);
-    if (!probe.waitForStarted(2000)) {
-        g_ffprobeMissing = true;
-        cache.insert(path, 0);
-        return 0;
-    }
-    if (!probe.waitForFinished(5000)) {
-        probe.kill();
-        cache.insert(path, 0);
-        return 0;
-    }
-    if (probe.exitCode() != 0) {
-        cache.insert(path, 0);
-        return 0;
+    {
+        QMutexLocker lock(&mutex);
+        auto it = cache.constFind(path);
+        if (it != cache.constEnd())
+            return it.value();
     }
 
-    const QByteArray out = probe.readAllStandardOutput().trimmed();
-    bool ok = false;
-    const double seconds = out.toDouble(&ok);
-    if (!ok || seconds <= 0.0) {
-        cache.insert(path, 0);
-        return 0;
+    const std::string pathUtf8 = path.toUtf8().constData();
+    const std::optional<int64_t> probed =
+        libavcore::probeDurationMicroseconds(pathUtf8);
+    const qint64 us = (probed && *probed > 0)
+        ? static_cast<qint64>(*probed)
+        : 0;
+    {
+        QMutexLocker lock(&mutex);
+        cache.insert(path, us);
     }
-
-    const qint64 us = static_cast<qint64>(seconds * 1'000'000.0);
-    cache.insert(path, us);
     return us;
 }
 
 QString ProxyManager::probeSourceCodec(const QString &path)
 {
-    // Same caching shape as probeDurationUs — re-queues are common (settings
-    // change, proxy mode toggle, etc.) and an ffprobe spawn is ~200 ms.
     static QHash<QString, QString> cache;
-    // Share the ffprobe-missing flag with probeDurationUs so we don't
-    // re-burn the 2 s waitForStarted on a machine without ffprobe.
-    if (g_ffprobeMissing)
-        return QString();
+    static QMutex mutex;
 
-    auto it = cache.constFind(path);
-    if (it != cache.constEnd())
-        return it.value();
-
-    QProcess probe;
-    QStringList args;
-    args << "-v" << "error"
-         << "-select_streams" << "v:0"
-         << "-show_entries" << "stream=codec_name"
-         << "-of" << "default=noprint_wrappers=1:nokey=1"
-         << path;
-    probe.start("ffprobe", args);
-    if (!probe.waitForStarted(2000)) {
-        g_ffprobeMissing = true;
-        cache.insert(path, QString());
-        return QString();
-    }
-    if (!probe.waitForFinished(5000)) {
-        probe.kill();
-        cache.insert(path, QString());
-        return QString();
-    }
-    if (probe.exitCode() != 0) {
-        cache.insert(path, QString());
-        return QString();
+    {
+        QMutexLocker lock(&mutex);
+        auto it = cache.constFind(path);
+        if (it != cache.constEnd())
+            return it.value();
     }
 
-    const QString codec = QString::fromUtf8(
-        probe.readAllStandardOutput().trimmed()).toLower();
-    cache.insert(path, codec);
+    const std::string pathUtf8 = path.toUtf8().constData();
+    const std::optional<std::string> probed =
+        libavcore::probeVideoCodecName(pathUtf8);
+    const QString codec = probed
+        ? QString::fromStdString(*probed).toLower()
+        : QString();
+    {
+        QMutexLocker lock(&mutex);
+        cache.insert(path, codec);
+    }
     return codec;
-}
-
-QString ProxyManager::chosenGpuH264Encoder()
-{
-    static QString cached;
-    static bool probed = false;
-    if (probed)
-        return cached;
-    probed = true;
-
-    for (const QString &candidate : gpuH264Priority()) {
-        if (ffmpegHasEncoder(candidate)) {
-            cached = candidate;
-            break;
-        }
-    }
-
-    appendEncoderLog(QString("[%1] chosen=%2")
-                     .arg(QDateTime::currentDateTimeUtc().toString(Qt::ISODate),
-                          cached.isEmpty() ? QStringLiteral("<software-fallback>") : cached));
-    return cached;
 }
 
 void ProxyManager::appendEncoderLog(const QString &line)

@@ -9,21 +9,31 @@
 #include <QPainter>
 #include <QFileInfo>
 #include <QVector>
+#include <QHash>
 #include <QMenu>
 #include <QElapsedTimer>
+#include <QString>
+#include <QJsonObject>
+#include <cstdint>
 #include "VideoEffect.h"
 #include "Keyframe.h"
 #include "WaveformGenerator.h"
 #include "TextManager.h"
 #include "PlaybackTypes.h"
 #include "Overlay.h"
+#include "TrackMatteKey.h"
 #include "SnapEngine.h"
 #include "MarkerData.h"
 #include "SpeedRampData.h"
+#include "LayerStyle.h"
+#include "color/ClipColor.h"
 #include "AdjustmentLayer.h"
 #include "MotionStabilizer.h"
 #include "Camera3D.h"
 #include "MotionSectionWidget.h"
+#include "MaskSystem.h"      // S7: per-clip mask container (additive seam)
+#include "MotionTracker.h"   // S7: per-clip tracker data animating the mask
+#include "TimeRemap.h"
 
 // Where Timeline::addClip drops a freshly-imported clip. Persisted via
 // QSettings('VSimpleEditor','Preferences')/importPlacement; the MainWindow
@@ -57,15 +67,65 @@ class QDragLeaveEvent;
 class QDropEvent;
 class QTimer;
 
+// TR-3: トリム種別。実体は src/TrimOps.h。TrimOps.h は ClipInfo のために
+// この Timeline.h を #include するので、ここで逆 include すると循環参照に
+// なる。enum class は前方宣言できないため namespace + enum 種別だけを
+// 前方宣言し、シグネチャに使う (Timeline.cpp 側で TrimOps.h を実 include)。
+namespace trimops { enum class TrimType; }
+
+namespace timeline_nesting {
+QString sequenceClipFilePath(const QString &sequenceId);
+bool isSequenceClipFilePath(const QString &filePath);
+QString sequenceIdFromClipFilePath(const QString &filePath);
+QString sequenceStoreParentKey();
+QString encodeSequenceStoreObject(const QJsonObject &store);
+QJsonObject decodeSequenceStoreObject(const QString &encoded);
+}
+
+enum class AudioChannelMode {
+    Stereo = 0,
+    FillLeft = 1,
+    FillRight = 2,
+    Swap = 3,
+    Mono = 4
+};
+
+struct AudioChannelModePlaybackBinding {
+    qint64 clipInMs = 0;
+    int sourceTrack = 0;
+    int sourceClipIndex = -1;
+    AudioChannelMode mode = AudioChannelMode::Stereo;
+};
+
+void setAudioChannelModePlaybackBindings(const QVector<AudioChannelModePlaybackBinding> &bindings);
+AudioChannelMode audioChannelModeForPlaybackEntry(const PlaybackEntry &entry);
+void applyAudioChannelModeToInterleavedStereoS16(int16_t *samples,
+                                                int frameCount,
+                                                AudioChannelMode mode);
+QString exportAudioChannelPanFilterForMode(AudioChannelMode mode);
+QString buildExportAudioMixEntryFilterChain(int inputIndex,
+                                            const QString &clipIn,
+                                            const QString &clipOut,
+                                            int delayMs,
+                                            const QString &volumeExpression,
+                                            AudioChannelMode mode);
+
 struct ClipInfo {
     QString filePath;
     QString displayName;
+    // EPIC-7/NEST-1: empty for normal media clips. When populated, this clip
+    // is a timeline reference to a named sequence stored in Timeline's
+    // sequence model; filePath uses a veditor://sequence/<id> URI only as a
+    // human/debug-friendly sentinel and is not decoded as media.
+    QString sequenceRefId;
     double duration;
     double inPoint = 0.0;
     double outPoint = 0.0;
     double leadInSec = 0.0; // leading gap before the clip on the timeline, grows on left-trim to keep the right edge fixed
     double speed = 1.0;   // 0.25x - 4.0x
     double volume = 1.0;  // 0.0 - 2.0 (0=mute, 1=normal, 2=boost)
+    double pan = 0.0;     // -1.0..+1.0 balance pan (-1=L, 0=center, +1=R)
+    AudioChannelMode audioChannelMode = AudioChannelMode::Stereo;
     // Pro-NLE "rubber band" volume automation. Each point is (clip-local
     // seconds, gain). Empty vector = static `volume` for the whole clip.
     // Sorted by .time; AudioMixer evaluates via linear interpolation.
@@ -84,16 +144,81 @@ struct ClipInfo {
     double rotation2DDegrees = 0.0;
     bool is3DLayer = false;
     Layer3DTransform layer3D;
+    bool motionBlurEnabled = false;
 
     // Future multi-track compositing groundwork. 1.0 = opaque (current
     // V1-wins behaviour). <1.0 values are placeholders until the layered
     // compositor lands in a follow-up iteration.
     double opacity = 1.0;
+    bool visible = true;
+    bool isAdjustment = false; // effect-only clip; applies its stack to lower composited layers
+
+    // SNS vertical fit: when true and the project output aspect differs from
+    // this clip's native frame, export/previews may pre-contain the frame into
+    // a transparent same-aspect intermediate canvas before clipgeom placement.
+    bool fitContain = false;
+    bool fitCover = false;
+
+    // HDR Stage1: per-clip input color metadata. Default SDR is deliberately
+    // inert and is omitted from project JSON to preserve old files byte-for-byte.
+    clipcolor::ColorMeta colorMeta;
+
+    // Photoshop/AE-style layer style applied to the rendered clip layer after
+    // placement and before compositing. Default identity is strict OFF and is
+    // omitted from project JSON to keep the render/serialization hot path inert.
+    LayerStyle layerStyle;
 
     // Phase 3: Color correction, effects, keyframes
     ColorCorrection colorCorrection;
+    // COLOR-4: per-clip RGB/Luma curves. Empty/default identity is OFF and is
+    // omitted from project JSON so clips with no curves stay byte-identical.
+    ClipCurveData colorCurves;
+    // COLOR-6: per-clip HSL secondary qualifier. Default disabled state is
+    // OFF and omitted from project JSON; renderFrameAt mirrors GLPreview's
+    // HSL mask + secondary LGG math before the primary grade.
+    HslSecondaryGrade hslSecondary;
     QVector<VideoEffect> effects;
     KeyframeManager keyframes;
+
+    // S4 (NLE-parity SSOT): per-clip 3D-LUT reference. The GPU preview's LUT
+    // (GLPreview::setLut, src/GLPreview.cpp:3229) is a single global texture,
+    // but renderFrameAt must grade every clip independently so an export
+    // pixel-matches the preview when a graded clip is on screen. There was no
+    // per-clip LUT storage anywhere (verified: zero ClipInfo / Timeline /
+    // ProjectFile references), so this is the minimal purely-additive seam:
+    // both members default to "no LUT" (empty path) and are read ONLY by the
+    // SSOT renderer + the S4 selftest — no existing code path changes.
+    QString lutFilePath;          // empty == no LUT on this clip
+    double  lutIntensity = 1.0;   // 0.0 = original, 1.0 = full LUT (matches
+                                  // GLPreview uLutIntensity / LutData::intensity)
+
+    // True when this clip carries a 3D LUT to apply. Mirrors the
+    // ColorCorrection::isDefault() gating idiom Exporter uses
+    // (src/Exporter.cpp:473-474) so the SSOT renderer can cheaply skip
+    // un-graded clips and stay byte-identical to S2/S3.
+    bool hasLut() const { return !lutFilePath.isEmpty(); }
+
+    // S7 (NLE-parity SSOT): per-clip compositing mask + the motion-tracker
+    // data that animates it. This is the SAME minimal purely-additive seam
+    // pattern as the S4 lutFilePath member above: there was NO per-clip mask
+    // storage anywhere (verified — zero ClipInfo / Timeline / ProjectFile
+    // references to a per-clip MaskSystem), and the GPU preview's US-EF-2
+    // "Power Window" is a single GLOBAL grade-localisation uniform set
+    // (GLPreview::setMask, src/GLPreview.cpp:3427), not a per-clip alpha
+    // matte. But renderFrameAt must apply each clip's genuine AE/Premiere-
+    // style compositing mask (MaskSystem::applyMask — multiplies the layer's
+    // alpha) independently so an export pixel-matches a masked clip. Both
+    // members default to "no mask" (empty MaskSystem / empty TrackingResult)
+    // and are read ONLY by the SSOT renderer + the S7 selftest. ProjectFile
+    // clipToJson/clipFromJson never touch them (exactly like lutFilePath),
+    // so on-disk project serialisation is byte-identical.
+    MaskSystem    maskSystem;        // empty masks() == no mask on this clip
+    TrackingResult maskTrackingData; // empty == static mask (no animation)
+
+    // True when this clip carries at least one mask. Mirrors the hasLut()
+    // gating idiom so the SSOT renderer can cheaply skip un-masked clips
+    // and stay byte-identical to S2..S6.
+    bool hasMask() const { return !maskSystem.masks().isEmpty(); }
 
     // Phase 5: Waveform
     WaveformData waveform;
@@ -114,6 +239,12 @@ struct ClipInfo {
     // source PTS. Consumer wiring is deferred — see SpeedRampData.h header
     // comment for the integration sites.
     speedramp::SpeedRamp speedRamp = speedramp::SpeedRamp::identity();
+    bool atempoEnabled = false;
+
+    // Per-clip time-remap curve. Empty keys == OFF/identity. Freeze Frame uses
+    // the existing one-key constant behavior on the split hold segment.
+    timeremap::TimeRemapCurve timeRemapCurve;
+    bool hasTimeRemap() const { return !timeRemapCurve.keys.isEmpty(); }
 
     // US-INT-4: per-frame stabilization transform keyframes baked by the
     // 編集 > スタビライズ slot. Empty = identity (no stabilization). GLPreview
@@ -125,6 +256,32 @@ struct ClipInfo {
         double out = (outPoint > 0.0) ? outPoint : duration;
         return (out - inPoint) / speed;
     }
+
+    bool isSequenceReference() const {
+        return !sequenceRefId.isEmpty()
+            || timeline_nesting::isSequenceClipFilePath(filePath);
+    }
+};
+
+struct TimelineSequence {
+    QString id;
+    QString name;
+    QVector<QVector<ClipInfo>> videoTracks;
+    QVector<QVector<ClipInfo>> audioTracks;
+
+    double duration() const {
+        auto tracksDuration = [](const QVector<QVector<ClipInfo>> &tracks) {
+            double maxEnd = 0.0;
+            for (const auto &track : tracks) {
+                double t = 0.0;
+                for (const ClipInfo &clip : track)
+                    t += qMax(0.0, clip.leadInSec) + clip.effectiveDuration();
+                maxEnd = qMax(maxEnd, t);
+            }
+            return maxEnd;
+        };
+        return qMax(tracksDuration(videoTracks), tracksDuration(audioTracks));
+    }
 };
 
 enum class DragMode {
@@ -134,6 +291,18 @@ enum class DragMode {
     MoveClip,
     TransitionLeadInResize,
     TransitionTrailOutResize
+};
+
+// TM-8: intrinsic track-matte wiring carried BY the Timeline so the SSOT
+// renderFrameAt (src/TimelineFrameRenderer.cpp) no longer reaches into a
+// live MainWindow off the worker thread for matte data. This mirrors the
+// 2 fields the consumer actually reads (matteType + matteSourceClipId);
+// it is deliberately NOT ProjectFile.h's TrackMatteClipEntry because
+// ProjectFile.h #includes Timeline.h (a cycle would form). TrackMatteType
+// is already visible here via the existing MaskSystem.h include above.
+struct TimelineTrackMatteEntry {
+    TrackMatteType matteType = TrackMatteType::None;
+    QString matteSourceClipId;   // "trackIdx:clipIdx" of the matte source clip
 };
 
 class TimelineTrack : public QWidget
@@ -147,7 +316,13 @@ public:
     void insertClip(int index, const ClipInfo &clip);
     void removeClip(int index);
     void moveClip(int fromIndex, int toIndex);
-    void splitClipAt(int index, double localSeconds);
+    void splitClipAt(int index, double localSeconds, bool notify = true);
+    // TR-3: 純粋エンジン trimops::applyTrim を clip[clipIndex] に適用する。
+    // 成功時は split/insert と同じ後処理 (updateMinimumWidth/update/emit
+    // modified) を行い true を返す。失敗 (不正 index / 境界違反) 時は
+    // m_clips 不変で false を返し、errorOut に日本語の理由を書き込む。
+    bool applyTrim(int clipIndex, trimops::TrimType type, double deltaSec,
+                   QString *errorOut = nullptr);
     int clipCount() const { return m_clips.size(); }
     const QVector<ClipInfo> &clips() const { return m_clips; }
     void setClips(const QVector<ClipInfo> &clips);
@@ -168,11 +343,28 @@ public:
     // Remove clip[index] and push its freed time (leadInSec + effectiveDur)
     // into clip[index+1]'s leadInSec so downstream clips keep their absolute
     // timeline positions. Used by cross-track drag.
-    void removeClipPreservingDownstream(int index);
+    void removeClipPreservingDownstream(int index, bool notify = true);
     // Insert clip at (index), with a specific leadInSec, then subtract the
     // inserted clip's footprint from clip[index+1]'s leadInSec so downstream
     // clips don't slide right. Caller must have verified the plan fits.
     void insertClipPreservingDownstream(int index, const ClipInfo &clip, double leadInSec);
+
+    // SM-3: ソースモニター3点編集の実行口。純粋エンジン threepoint:: の計算結果を
+    // 既存の split/remove/insert プリミティブで適用する。
+    // Insert = 既存クリップを右へ押し出して timelineStartSec に割り込む (ripple)。
+    void insertClip3Point(double timelineStartSec, const ClipInfo &clip);
+    // Overwrite = [T, T+L) を上書きし、跨ぐクリップを分割・収まるクリップを削除して
+    // 新クリップを T 開始に配置する。
+    void overwriteClip3Point(double timelineStartSec, const ClipInfo &clip);
+
+    // TB-3: タイムラインの時間範囲 [startSec, endSec) をリップル削除する。
+    // 範囲境界で splitClipAt して跨ぐクリップを分割し、範囲内に完全に収まる
+    // クリップを削除した後、後続クリップ全体を削除長ぶん左へ詰める (ripple)。
+    // 文字起こし駆動編集 (textedit::deletionRanges) の各削除区間を適用する口。
+    // 空 / 範囲外 / startSec>=endSec は安全に no-op。既存の点/挿入/上書き挙動は
+    // 壊さず、insertClip3Point/overwriteClip3Point と同じプリミティブを再利用する。
+    // 戻り値はトラック内容または leadInSec が実際に変わったか。
+    bool rippleDeleteTimeRange(double startSec, double endSec, bool notify = true);
 
     struct DropPlan {
         bool valid = false;
@@ -239,6 +431,7 @@ signals:
     void seekRequested(double seconds);
     void rowHeightChanged(int newHeight);
     void clipContextMenuRequested(int clipIndex, const QPoint &globalPos);
+    void gapContextMenuRequested(double timeSec, const QPoint &globalPos);
     void linkedDragStarted(int clipIndex);
     void linkedDragDelta(int clipIndex, double deltaSec);
     void linkedDragCancelled();
@@ -314,9 +507,12 @@ public:
 
     void addClip(const QString &filePath);
     void splitAtPlayhead();
+    bool freezeFrameAtPlayhead(TimelineTrack *track = nullptr, int clipIndex = -1);
     void deleteSelectedClip();
     void rippleDeleteSelectedClip();
+    bool closeGapAt(TimelineTrack *track, double timeSec);
     bool hasSelection() const;
+    bool hasAnySelection() const;
 
     // Copy / Paste
     void copySelectedClip();
@@ -345,6 +541,19 @@ public:
     const QVector<TimelineTrack *> &videoTracks() const { return m_videoTracks; }
     const QVector<TimelineTrack *> &audioTracks() const { return m_audioTracks; }
 
+    // EPIC-7/NEST-1: multiple named sequences in a project. The active
+    // sequence remains mirrored into the legacy video/audio track arrays so
+    // single-sequence projects and old readers stay compatible.
+    QVector<TimelineSequence> sequences() const;
+    QString activeSequenceId() const { return m_activeSequenceId; }
+    void setSequences(const QVector<TimelineSequence> &sequences,
+                      const QString &activeSequenceId = QString());
+    bool addSequence(const TimelineSequence &sequence);
+    bool setActiveSequence(const QString &sequenceId);
+    ClipInfo makeSequenceClip(const QString &sequenceId,
+                              const QString &displayName = QString()) const;
+    bool addSequenceClip(const QString &sequenceId, int videoTrackIndex = 0);
+
     // Marker integration
     void setMarkerManager(MarkerManager *mm) { m_markerManager = mm; }
     MarkerManager *markerManager() const { return m_markerManager; }
@@ -355,8 +564,22 @@ public:
     // from a future markers-panel UI without churn. Spec acceptance #1-4.
     int addMarker(qint64 timelineUs, const QString &label,
                   QColor color = QColor(QStringLiteral("#ff5050")));
+
+    // PV-B: クリップ操作の公開エントリ(クリップ右クリックメニューと
+    // プレビュー右クリックメニューで共有する SSOT)。
+    void applySnsFitToClip(TimelineTrack *track, int clipIndex,
+                           bool contain, bool cover, const QString &undoLabel);
+    void applySilenceCutToClip(TimelineTrack *track, int clipIndex);
+    void applyBeatMarkersToClip(TimelineTrack *track, int clipIndex);
+    // 再生ヘッド直下の V1 クリップを解決(見つかれば true)。
+    bool clipUnderPlayhead(TimelineTrack *&outTrack, int &outClipIndex) const;
     bool removeMarker(int id);
     bool updateMarker(int id, const Marker &updated);
+    // MK-1: turn a point marker into a span (duration) marker, or back to a
+    // point (durationUs == 0). Premiere "duration marker" parity. Finds the
+    // marker by id, writes durationUs, repaints the lane and emits
+    // markersChanged(). No-op if no marker with that id exists.
+    void setMarkerDuration(int markerId, qint64 durationUs);
     Marker markerById(int id) const;
     const QVector<Marker> &markers() const { return m_markersData; }
     QVector<Marker> markersInRange(qint64 startUs, qint64 endUs) const;
@@ -425,7 +648,8 @@ public:
 
     // Clip speed & volume
     void setClipSpeed(double speed);
-    void setClipVolume(double volume);
+    void setClipVolume(double volume, bool recordUndo = true);
+    void setClipPan(double pan, bool recordUndo = true);
 
     // Per-clip speed-ramp (variable speed curve). Operates on V1 by clip
     // index. Returns the identity ramp for invalid indices so callers can
@@ -437,6 +661,8 @@ public:
 
     // Phase 3: Color correction, effects, keyframes
     void setClipColorCorrection(const ColorCorrection &cc);
+    void setClipLayerStyle(const LayerStyle &style);
+    void setClipLayerStyle(int trackIdx, int clipIdx, const LayerStyle &style);
     // Attach a transition to the currently selected clip. FadeIn writes to
     // the clip's leadIn slot (start-of-clip); every other type writes to
     // trailOut (end-of-clip / boundary to next clip).
@@ -444,13 +670,38 @@ public:
     // Reset both leadIn and trailOut on the selected clip back to None.
     void clearTransitionsOnSelected();
     void setClipEffects(const QVector<VideoEffect> &effects);
+    void setClipEffectsAndKeyframes(int trackIdx, int clipIdx,
+                                    const QVector<VideoEffect> &effects,
+                                    const KeyframeManager &km);
     void setClipKeyframes(const KeyframeManager &km);
     ColorCorrection clipColorCorrection() const;
+    LayerStyle clipLayerStyle() const;
+    LayerStyle clipLayerStyle(int trackIdx, int clipIdx) const;
     QVector<VideoEffect> clipEffects() const;
     KeyframeManager clipKeyframes() const;
     double selectedClipDuration() const;
     // Index of the selected clip on V1 (delegates to m_videoTrack); -1 if none.
     int selectedVideoClipIndex() const;
+
+    // SM-3: アクティブ動画トラック (先頭 V1) へ委譲する 3点編集ラッパー。
+    // ソースモニターから組み立てた ClipInfo を timelineStartSec に Insert / Overwrite で
+    // 配置し、saveUndoState で 1 操作 = 1 Undo にまとめる。
+    void insertClip3PointActive(double timelineStartSec, const ClipInfo &clip);
+    void overwriteClip3PointActive(double timelineStartSec, const ClipInfo &clip);
+
+    // TB-3: アクティブ動画トラック (m_activeVideoTrackIndex、無ければ先頭 V1) の
+    // タイムライン時間範囲 [startSec, endSec) をリップル削除する薄いラッパー。
+    // 文字起こし駆動編集ダイアログが複数の削除区間を適用する際は、インデックス/
+    // 時刻ズレを避けるため呼び出し側が降順 (後ろの区間から) で呼ぶ前提でよいが、
+    // 単一区間の正しさはここで保証する。1 操作 = 1 Undo (saveUndoState)。
+    void rippleDeleteTimeRangeActive(double startSec, double endSec);
+
+    // TR-3: アクティブ動画トラックの現在選択中クリップへ trimops の
+    // トリムを適用する薄いラッパー。Roll は選択クリップとその次クリップの編集点
+    // として扱う。成功時は 1 操作 = 1 Undo (saveUndoState) でまとめ true を返す。
+    // 選択無し / 動画トラック無し / 境界違反なら false + errorOut に日本語理由。
+    bool applyTrimActive(trimops::TrimType type, double deltaSec,
+                         QString *errorOut = nullptr);
 
     // Audio
     void addAudioFile(const QString &filePath);
@@ -511,6 +762,16 @@ public:
 
     UndoManager *undoManager() const { return m_undoManager; }
 
+    // Timeline 側のプロジェクト出力ジオメトリ複製を最新に保つ。currentState() が
+    // undo スナップショットへ捕捉できるよう、MainWindow がプロジェクト設定変更時
+    // (applyProjectConfig / プロジェクト読込)に呼ぶ。
+    void setProjectOutputConfig(int width, int height, bool explicitOutput);
+
+    void setClipParentEntries(const QHash<QString, QString> &entries);
+    void setClipParent(const QString& childKey, const QString& parentKey);
+    void clearClipParent(const QString& childKey);
+    QHash<QString,QString> clipParentEntries() const;
+
     // Multi-clip playback: flatten all video tracks into a sorted, gap-aware
     // schedule with topmost-track-wins resolution (Premiere V1/V2 semantics).
     QVector<PlaybackEntry> computePlaybackSequence() const;
@@ -530,6 +791,24 @@ public:
                             const QVector<QVector<ClipInfo>> &audioTracks,
                             double playhead, double markIn, double markOut, int zoom);
 
+    // TM-8: track-matte wiring SSOT. Producers (MainWindow on every
+    // m_trackMatteClipEntries mutation; RenderQueue::resolveTimeline after
+    // rebuilding a parentless Timeline from a loaded project) push the
+    // QHash here keyed by "trackIdx:clipIdx" (== MainWindow::brushClipId ==
+    // tlrender::renderClipId). renderFrameAt reads ONLY this — never a live
+    // MainWindow off the worker thread (kills the C2 data race + C1
+    // edit≠export divergence on the queue/file export path).
+    void setTrackMatteEntries(const QHash<QString, TimelineTrackMatteEntry> &entries) {
+        m_trackMatteEntries = entries;
+    }
+    // RM-3: return BY VALUE (a cheap Qt copy-on-write snapshot), NOT a
+    // const reference. The RenderQueue worker thread reads this while the
+    // GUI thread may call setTrackMatteEntries(); handing back a reference
+    // let a reader observe a half-reassigned QHash (data race). A value
+    // return atomically detaches a stable snapshot for the reader.
+    QHash<QString, TimelineTrackMatteEntry> trackMatteEntries() const {
+        return m_trackMatteEntries;
+    }
 signals:
     void clipSelected(int index);
     // V3 sprint — track-aware overload. emitted alongside the int-only
@@ -540,6 +819,10 @@ signals:
     void positionChanged(double seconds);
     void sequenceChanged(const QVector<PlaybackEntry> &entries);
     void audioSequenceChanged(const QVector<PlaybackEntry> &entries);
+    // restoreState が、プロジェクト出力ジオメトリを持つ undo/redo スナップショットを
+    // 復元したときに発火。MainWindow が canvas + 出力サイズを再適用し、SNS プリセット
+    // のリサイズを undo した後にプレビューが縦伸びしないようにする。
+    void projectOutputConfigRestored(int width, int height, bool explicitOutput);
     // Per-track audio state updates that don't fit cleanly into the
     // PlaybackEntry struct. AudioMixer applies them via setTrackSolo on
     // receipt; mute and per-clip volume already ride on PlaybackEntry.
@@ -555,6 +838,8 @@ signals:
     void transitionDialogRequested();
     void videoEffectsDialogRequested();
     void colorCorrectionRequested();
+    void clipParentDialogRequested();
+    void nullObjectRequested();
     // Emitted from applyTransitionToSelected when the requested duration
     // could not be honored against the available source handles. Carries
     // the asked vs effective duration in seconds so MainWindow can show
@@ -582,6 +867,11 @@ private slots:
     void onPlayheadAutoScrollTick();
 
 private:
+    struct TimeRangeSec {
+        double startSec = 0.0;
+        double endSec = 0.0;
+    };
+
     void setupUI();
     void saveUndoState(const QString &description);
 public:
@@ -595,8 +885,19 @@ private:
     void notifyMutationsChanged();
     void wireTrackSelection(TimelineTrack *track);
     void clearAllSelections();
+    QVector<TimeRangeSec> selectedClipTimeRanges() const;
+    bool gapTimeRangeAt(TimelineTrack *track, double timeSec, TimeRangeSec *outRange) const;
+    bool applyRippleDeleteTimeRangesToAllTracks(QVector<TimeRangeSec> ranges,
+                                                const QString &undoLabel);
+    void showGapContextMenu(TimelineTrack *track, double timeSec, const QPoint &globalPos);
     void captureZoomAnchor();
     void clearZoomAnchor();
+    TimelineSequence currentSequenceSnapshot(const QString &id,
+                                             const QString &name) const;
+    void upsertSequenceSnapshot(const TimelineSequence &sequence);
+    void syncActiveSequenceFromCurrentTracks();
+    TimelineSequence *sequenceById(const QString &sequenceId);
+    const TimelineSequence *sequenceById(const QString &sequenceId) const;
     // Coalesces sequenceChanged + audioSequenceChanged emissions across
     // rapid mutations (drag-scrub, batch import, linked-drag stream). Each
     // call restarts a 50 ms single-shot timer; on timeout both signals fire
@@ -611,6 +912,14 @@ private:
     QVector<TimelineTrack*> m_audioTracks;
     TimelineTrack *m_videoTrack = nullptr; // alias for m_videoTracks[0]
     TimelineTrack *m_audioTrack = nullptr; // alias for m_audioTracks[0]
+    int m_activeVideoTrackIndex = -1; // last video row that originated selection
+    // TM-8: track-matte wiring carried by the Timeline (see
+    // setTrackMatteEntries). Keyed by "trackIdx:clipIdx".
+    QHash<QString, TimelineTrackMatteEntry> m_trackMatteEntries;
+    QHash<QString, QString> m_clipParentEntries;
+    QVector<TimelineSequence> m_sequences;
+    QString m_activeSequenceId;
+    bool m_sequenceModelEnabled = false;
     QScrollArea *m_scrollArea;
     QWidget *m_tracksWidget;
     QVBoxLayout *m_tracksLayout;
@@ -628,6 +937,17 @@ private:
     void refreshTextStrip();
     QLabel *m_infoLabel;
     double m_playheadPos = 0.0;
+    // プロジェクト出力ジオメトリの複製 (SSOT は MainWindow::m_projectConfig)。
+    // currentState() で undo スナップショットへ捕捉する。
+    // 既定は ProjectConfig の既定サイズ(1920x1080, 非明示出力)に合わせる。これにより
+    // undo スナップショットが projectWidth=-1 を持たない不変条件を保証し、SNS プリセット
+    // 適用前にサイズ同期(applyProjectConfig)を通らなかった経路でも、undo で元の
+    // プロジェクトサイズへ正しく戻れる(restoreState の projectWidth>0 ガード)。
+    // explicit=false のため addClip の auto-contain 判定(m_projectExplicitOutput ゲート)
+    // は不変。
+    int m_projectWidth = 1920;
+    int m_projectHeight = 1080;
+    bool m_projectExplicitOutput = false;
     double m_markIn = -1.0;
     double m_markOut = -1.0;
     double m_zoomLevel = 10.0; // pixels per second (double so we can go sub-1 for long clips)

@@ -10,6 +10,8 @@ namespace x {
 namespace upload {
 
 struct XUploadConfig {
+    //   bearerToken 取得経路: env (VEDITOR_X_BEARER_TOKEN) → QSettings (x_video/bearer_token)
+    //                      → 空 (creds::CredentialStore)
     QString bearerToken;
     QString apiBase       = QStringLiteral("https://upload.twitter.com/1.1");
     QString tweetApiBase  = QStringLiteral("https://api.twitter.com/2");
@@ -43,13 +45,16 @@ private:
     void doFinalize(const XUploadConfig &cfg, const QString &mediaId,
                     const UploadJob &job);
     void doStatusPoll(const XUploadConfig &cfg, const QString &mediaId,
-                      const UploadJob &job);
+                      const UploadJob &job, int attempt = 0);
     void doCreateTweet(const XUploadConfig &cfg, const QString &mediaId,
                        const QString &tweetText);
 
     QPointer<QNetworkAccessManager> m_nam;
 
     static constexpr qint64 kChunkSize = 5LL * 1024LL * 1024LL;
+    // STATUS poll は in_progress の間 check_after_secs 間隔で再帰する。
+    // succeeded/failed 以外 (空 state 含む) が続くと無限ループになるため上限を設ける。
+    static constexpr int kMaxStatusPolls = 60;
 };
 
 } // namespace upload

@@ -1,6 +1,9 @@
 #include "WaveformGenerator.h"
+#include "libavcore/AudioExtract.h"
+#include <QFile>
 #include <QMetaObject>
 #include <QPointer>
+#include <QTemporaryFile>
 #include <QThread>
 #include <QDebug>
 #include <cmath>
@@ -257,9 +260,63 @@ WaveformData WaveformGenerator::generate(const QString &filePath, int peaksPerSe
 
 // Legacy helpers kept as no-ops for API compatibility — unused by the
 // streaming generate() above.
-bool WaveformGenerator::decodeAudio(const QString &, QVector<float> &, int &)
+bool WaveformGenerator::decodeAudio(const QString &filePath, QVector<float> &samples, int &sampleRate)
 {
-    return false;
+    QTemporaryFile tempWav;
+    tempWav.setAutoRemove(false);
+    if (!tempWav.open())
+        return false;
+
+    const QString wavPath = tempWav.fileName();
+    tempWav.close();
+
+    QString err;
+    if (!libavcore::extractAudioToWav(filePath, wavPath, 16000, &err)) {
+        QFile::remove(wavPath);
+        return false;
+    }
+
+    QFile wavFile(wavPath);
+    if (!wavFile.open(QIODevice::ReadOnly)) {
+        QFile::remove(wavPath);
+        return false;
+    }
+
+    const QByteArray wavData = wavFile.readAll();
+    wavFile.close();
+    QFile::remove(wavPath);
+
+    const int dataTagOffset = wavData.indexOf("data");
+    if (dataTagOffset < 0)
+        return false;
+    if (dataTagOffset > wavData.size() - 8)
+        return false;
+
+    const int dataSizeOffset = dataTagOffset + 4;
+    const quint32 declaredDataSize =
+        static_cast<quint32>(static_cast<quint8>(wavData.at(dataSizeOffset)))
+        | (static_cast<quint32>(static_cast<quint8>(wavData.at(dataSizeOffset + 1))) << 8)
+        | (static_cast<quint32>(static_cast<quint8>(wavData.at(dataSizeOffset + 2))) << 16)
+        | (static_cast<quint32>(static_cast<quint8>(wavData.at(dataSizeOffset + 3))) << 24);
+
+    const int dataOffset = dataTagOffset + 8;
+    if (dataOffset > wavData.size())
+        return false;
+
+    const int availableBytes = wavData.size() - dataOffset;
+    const int dataBytes = qMin<qint64>(declaredDataSize, availableBytes);
+    samples.clear();
+    samples.reserve(dataBytes / 2);
+    for (int offset = 0; offset + 1 < dataBytes; offset += 2) {
+        const int byteOffset = dataOffset + offset;
+        const quint16 pcm =
+            static_cast<quint16>(static_cast<quint8>(wavData.at(byteOffset)))
+            | (static_cast<quint16>(static_cast<quint8>(wavData.at(byteOffset + 1))) << 8);
+        samples.append(static_cast<qint16>(pcm) / 32768.0f);
+    }
+
+    sampleRate = 16000;
+    return true;
 }
 
 WaveformData WaveformGenerator::buildPeaks(const QVector<float> &, int, double, int)

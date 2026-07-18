@@ -26,11 +26,16 @@ public:
     // Generate async
     void generateAsync(const QString &filePath, int peaksPerSecond = 50);
 
+    // Legacy full-buffer decoder. Current implementation returns false and
+    // does not populate samples, so it has no runtime channel layout today.
+    // The class's FFmpeg decode paths resample to mono float PCM when samples
+    // are produced.
+    static bool decodeAudio(const QString &filePath, QVector<float> &samples, int &sampleRate);
+
 signals:
     void waveformReady(const QString &filePath, const WaveformData &data);
 
 private:
-    static bool decodeAudio(const QString &filePath, QVector<float> &samples, int &sampleRate);
     static WaveformData buildPeaks(const QVector<float> &samples, int sampleRate,
                                     double duration, int peaksPerSecond);
 };

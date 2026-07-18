@@ -1,6 +1,7 @@
 #include "MultiCamSync.h"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 
 namespace multicam {
@@ -85,6 +86,32 @@ double MultiCamSync::estimateOffsetMs(const QVector<float> &refEnv,
     }
 
     return static_cast<double>(bestLag) * envHopMs;
+}
+
+QVector<qint64> MultiCamSync::computeAngleOffsetsUs(
+    const QVector<QVector<float>> &angleEnvelopes,
+    double envHopMs)
+{
+    QVector<qint64> offsetsUs(angleEnvelopes.size(), 0);
+    if (angleEnvelopes.size() < 2 || envHopMs <= 0.0)
+        return offsetsUs;
+
+    const QVector<float> &refEnv = angleEnvelopes.first();
+    if (refEnv.isEmpty())
+        return offsetsUs;
+
+    for (int i = 1; i < angleEnvelopes.size(); ++i) {
+        const QVector<float> &otherEnv = angleEnvelopes[i];
+        if (otherEnv.isEmpty()) {
+            offsetsUs[i] = 0;
+            continue;
+        }
+
+        const double offsetMs = estimateOffsetMs(refEnv, otherEnv, envHopMs);
+        offsetsUs[i] = static_cast<qint64>(std::llround(offsetMs * 1000.0));
+    }
+
+    return offsetsUs;
 }
 
 // ---------------------------------------------------------------------------

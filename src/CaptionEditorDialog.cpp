@@ -1,8 +1,10 @@
 #include "CaptionEditorDialog.h"
+#include "CaptionCps.h"
 #include "SubtitleIO.h"
 #include "SpeechRecognizer.h"
 
 #include <QApplication>
+#include <QBrush>
 #include <QCheckBox>
 #include <QColorDialog>
 #include <QComboBox>
@@ -26,6 +28,51 @@
 #include <QTextEdit>
 #include <QVBoxLayout>
 
+namespace {
+
+constexpr int kClipColumnCount = 5;
+constexpr int kStartMsColumn = 0;
+constexpr int kEndMsColumn = 1;
+constexpr int kTextColumn = 2;
+constexpr int kCpsColumn = 3;
+constexpr int kActorColumn = 4;
+
+QString formatCps(double cps)
+{
+    return QStringLiteral("%1 CPS").arg(cps, 0, 'f', 1);
+}
+
+QTableWidgetItem* ensureTableItem(QTableWidget* table, int row, int column)
+{
+    QTableWidgetItem* item = table->item(row, column);
+    if (!item) {
+        item = new QTableWidgetItem;
+        table->setItem(row, column, item);
+    }
+    return item;
+}
+
+void updateCpsItem(QTableWidgetItem* item, const caption::Clip& clip)
+{
+    const double durationSeconds = static_cast<double>(clip.durationMs()) / 1000.0;
+    const double currentCps = captioncps::cps(clip.text, durationSeconds);
+    const QString cpsText = formatCps(currentCps);
+
+    item->setText(cpsText);
+    item->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    item->setFlags(item->flags() & ~Qt::ItemIsEditable);
+
+    if (captioncps::exceeds(clip.text, durationSeconds)) {
+        item->setForeground(QBrush(QColor(Qt::red)));
+        item->setToolTip(QStringLiteral("読み速度が速すぎます (%1 CPS)").arg(currentCps, 0, 'f', 1));
+    } else {
+        item->setForeground(QBrush());
+        item->setToolTip(cpsText);
+    }
+}
+
+} // namespace
+
 // ---------------------------------------------------------------------------
 // コンストラクタ
 // ---------------------------------------------------------------------------
@@ -38,12 +85,15 @@ CaptionEditorDialog::CaptionEditorDialog(QWidget* parent)
 
     m_track = caption::Track{};
     m_style = caption::defaultStyle();
+    m_subtitleStyle = SubtitleStyle{};
+    syncSubtitleStyleFromCaptionStyle();
 
     // ===================== 左パネル =====================
     // クリップテーブル
     m_clipTable = new QTableWidget(this);
-    m_clipTable->setColumnCount(4);
-    m_clipTable->setHorizontalHeaderLabels({tr("開始(ms)"), tr("終了(ms)"), tr("テキスト"), tr("話者")});
+    m_clipTable->setColumnCount(kClipColumnCount);
+    m_clipTable->setHorizontalHeaderLabels(
+        {tr("開始(ms)"), tr("終了(ms)"), tr("テキスト"), tr("CPS"), tr("話者")});
     m_clipTable->setSelectionBehavior(QAbstractItemView::SelectRows);
     m_clipTable->setSelectionMode(QAbstractItemView::SingleSelection);
     m_clipTable->setAlternatingRowColors(true);
@@ -117,6 +167,17 @@ CaptionEditorDialog::CaptionEditorDialog(QWidget* parent)
     // スタイル GroupBox
     m_fontCombo = new QFontComboBox(this);
 
+    m_presetCombo = new QComboBox(this);
+    const QVector<caption::StylePreset> presets = caption::capCutStylePresets();
+    for (const caption::StylePreset& preset : presets)
+        m_presetCombo->addItem(preset.displayName);
+
+    m_applyPresetButton = new QPushButton(tr("適用"), this);
+
+    auto* presetRow = new QHBoxLayout;
+    presetRow->addWidget(m_presetCombo, 1);
+    presetRow->addWidget(m_applyPresetButton);
+
     m_fontSizeSpin = new QSpinBox(this);
     m_fontSizeSpin->setRange(8, 72);
 
@@ -147,16 +208,34 @@ CaptionEditorDialog::CaptionEditorDialog(QWidget* parent)
     bgRow->addWidget(m_bgCheck);
     bgRow->addWidget(m_bgColorButton, 1);
 
+    m_karaokeCheck = new QCheckBox(tr("カラオケ強調（現在の語をハイライト）"), this);
+    m_karaokeColorButton = new QPushButton(this);
+
+    auto* karaokeRow = new QHBoxLayout;
+    karaokeRow->addWidget(m_karaokeCheck);
+    karaokeRow->addWidget(m_karaokeColorButton, 1);
+
     m_anchorCombo = new QComboBox(this);
-    m_anchorCombo->addItems(caption::anchorNames());
+    const QStringList anchorLabels = caption::anchorNames();
+    m_anchorCombo->addItem(anchorLabels.value(0), caption::anchorToString(caption::Anchor::TopLeft));
+    m_anchorCombo->addItem(anchorLabels.value(1), caption::anchorToString(caption::Anchor::TopCenter));
+    m_anchorCombo->addItem(anchorLabels.value(2), caption::anchorToString(caption::Anchor::TopRight));
+    m_anchorCombo->addItem(anchorLabels.value(3), caption::anchorToString(caption::Anchor::MiddleLeft));
+    m_anchorCombo->addItem(anchorLabels.value(4), caption::anchorToString(caption::Anchor::MiddleCenter));
+    m_anchorCombo->addItem(anchorLabels.value(5), caption::anchorToString(caption::Anchor::MiddleRight));
+    m_anchorCombo->addItem(anchorLabels.value(6), caption::anchorToString(caption::Anchor::BottomLeft));
+    m_anchorCombo->addItem(anchorLabels.value(7), caption::anchorToString(caption::Anchor::BottomCenter));
+    m_anchorCombo->addItem(anchorLabels.value(8), caption::anchorToString(caption::Anchor::BottomRight));
 
     auto* styleForm = new QFormLayout;
+    styleForm->addRow(tr("CapCut スタイル:"), presetRow);
     styleForm->addRow(tr("フォント:"),      m_fontCombo);
     styleForm->addRow(tr("サイズ:"),        m_fontSizeSpin);
     styleForm->addRow(tr("スタイル:"),      boldItalicRow);
     styleForm->addRow(tr("文字色:"),        m_textColorButton);
     styleForm->addRow(tr("縁取り色/太さ:"), outlineRow);
     styleForm->addRow(tr("背景:"),          bgRow);
+    styleForm->addRow(tr("カラオケ:"),      karaokeRow);
     styleForm->addRow(tr("位置:"),          m_anchorCombo);
 
     auto* styleGroup = new QGroupBox(tr("スタイル"), this);
@@ -197,6 +276,7 @@ CaptionEditorDialog::CaptionEditorDialog(QWidget* parent)
     connect(m_importButton,     &QPushButton::clicked, this, &CaptionEditorDialog::onImportClicked);
     connect(m_exportButton,     &QPushButton::clicked, this, &CaptionEditorDialog::onExportClicked);
     connect(m_recognizeButton,  &QPushButton::clicked, this, &CaptionEditorDialog::onRecognizeClicked);
+    connect(m_applyPresetButton, &QPushButton::clicked, this, &CaptionEditorDialog::onApplyPresetClicked);
 
     // スタイルコントロール → onStyleChanged
     connect(m_fontCombo,    &QFontComboBox::currentFontChanged, this, [this](const QFont&) { onStyleChanged(); });
@@ -206,6 +286,7 @@ CaptionEditorDialog::CaptionEditorDialog(QWidget* parent)
     connect(m_outlineWidthSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
             this, [this](double) { onStyleChanged(); });
     connect(m_bgCheck,    &QCheckBox::toggled, this, [this](bool) { onStyleChanged(); });
+    connect(m_karaokeCheck, &QCheckBox::toggled, this, [this](bool) { onStyleChanged(); });
     connect(m_anchorCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, [this](int) { onStyleChanged(); });
 
@@ -237,8 +318,22 @@ CaptionEditorDialog::CaptionEditorDialog(QWidget* parent)
             onStyleChanged();
         }
     });
+    connect(m_karaokeColorButton, &QPushButton::clicked, this, [this]() {
+        QColor c = QColorDialog::getColor(m_subtitleStyle.karaokeHighlightColor,
+                                          this,
+                                          tr("カラオケ強調色を選択"));
+        if (c.isValid()) {
+            m_subtitleStyle.karaokeHighlightColor = c;
+            m_karaokeColorButton->setStyleSheet(
+                QStringLiteral("background-color: %1").arg(c.name()));
+            onStyleChanged();
+        }
+    });
 
-    connect(m_buttonBox, &QDialogButtonBox::accepted, this, &QDialog::accept);
+    connect(m_buttonBox, &QDialogButtonBox::accepted, this, [this]() {
+        onStyleChanged();
+        accept();
+    });
     connect(m_buttonBox, &QDialogButtonBox::rejected, this, &QDialog::reject);
 
     // 初期状態
@@ -269,14 +364,43 @@ caption::Track CaptionEditorDialog::track() const
 void CaptionEditorDialog::setStyle(const caption::Style& style)
 {
     m_style = style;
+    syncSubtitleStyleFromCaptionStyle();
     updateStyleControls();
     updatePreview();
     emit styleChanged(m_style);
+    emit subtitleStyleChanged(m_subtitleStyle);
 }
 
 caption::Style CaptionEditorDialog::style() const
 {
     return m_style;
+}
+
+void CaptionEditorDialog::setSubtitleStyle(const SubtitleStyle& style)
+{
+    m_subtitleStyle = style;
+
+    m_style.fontFamily = style.font.family();
+    const int pointSize = style.font.pointSize();
+    if (pointSize > 0)
+        m_style.fontSizePt = pointSize;
+    m_style.bold = style.font.bold();
+    m_style.italic = style.font.italic();
+    m_style.textColor = style.color;
+    m_style.outlineColor = style.outlineColor;
+    m_style.outlineThickness = style.outlineWidth;
+    m_style.background = style.boxEnabled;
+    m_style.backgroundColor = style.boxColor;
+
+    updateStyleControls();
+    updatePreview();
+    emit styleChanged(m_style);
+    emit subtitleStyleChanged(m_subtitleStyle);
+}
+
+SubtitleStyle CaptionEditorDialog::subtitleStyle() const
+{
+    return m_subtitleStyle;
 }
 
 // ---------------------------------------------------------------------------
@@ -488,10 +612,32 @@ void CaptionEditorDialog::onStyleChanged()
     m_style.italic           = m_italicCheck->isChecked();
     m_style.outlineThickness = m_outlineWidthSpin->value();
     m_style.background       = m_bgCheck->isChecked();
-    m_style.anchor           = caption::anchorFromString(m_anchorCombo->currentText());
+    const QString anchorValue = m_anchorCombo->currentData().toString();
+    m_style.anchor           = caption::anchorFromString(
+        anchorValue.isEmpty() ? m_anchorCombo->currentText() : anchorValue);
+
+    syncSubtitleStyleFromCaptionStyle();
+    m_subtitleStyle.karaokeEnabled = m_karaokeCheck->isChecked();
 
     updatePreview();
     emit styleChanged(m_style);
+    emit subtitleStyleChanged(m_subtitleStyle);
+}
+
+void CaptionEditorDialog::onApplyPresetClicked()
+{
+    if (!m_presetCombo)
+        return;
+
+    const QVector<caption::StylePreset> presets = caption::capCutStylePresets();
+    const int index = m_presetCombo->currentIndex();
+    if (index < 0 || index >= presets.size())
+        return;
+
+    m_style = presets.at(index).style;
+    syncSubtitleStyleFromCaptionStyle();
+    updateStyleControls();
+    onStyleChanged();
 }
 
 // ---------------------------------------------------------------------------
@@ -505,18 +651,20 @@ void CaptionEditorDialog::rebuildClipTable()
         QSignalBlocker blocker(m_clipTable);
 
         m_clipTable->setRowCount(0);
-        m_clipTable->setColumnCount(4);
+        m_clipTable->setColumnCount(kClipColumnCount);
         m_clipTable->setHorizontalHeaderLabels(
-            {tr("開始(ms)"), tr("終了(ms)"), tr("テキスト"), tr("話者")});
+            {tr("開始(ms)"), tr("終了(ms)"), tr("テキスト"), tr("CPS"), tr("話者")});
 
         m_clipTable->setRowCount(count);
 
         for (int i = 0; i < count; ++i) {
             const caption::Clip& clip = m_track.clipAt(i);
-            m_clipTable->setItem(i, 0, new QTableWidgetItem(QString::number(clip.startMs)));
-            m_clipTable->setItem(i, 1, new QTableWidgetItem(QString::number(clip.endMs)));
-            m_clipTable->setItem(i, 2, new QTableWidgetItem(clip.text));
-            m_clipTable->setItem(i, 3, new QTableWidgetItem(clip.actor));
+            m_clipTable->setItem(i, kStartMsColumn, new QTableWidgetItem(QString::number(clip.startMs)));
+            m_clipTable->setItem(i, kEndMsColumn, new QTableWidgetItem(QString::number(clip.endMs)));
+            m_clipTable->setItem(i, kTextColumn, new QTableWidgetItem(clip.text));
+            m_clipTable->setItem(i, kCpsColumn, new QTableWidgetItem);
+            m_clipTable->setItem(i, kActorColumn, new QTableWidgetItem(clip.actor));
+            updateCpsItem(m_clipTable->item(i, kCpsColumn), clip);
         }
 
         m_currentRow = -1;
@@ -541,10 +689,11 @@ void CaptionEditorDialog::refreshClipRow(int row)
     const caption::Clip& clip = m_track.clipAt(row);
 
     QSignalBlocker blocker(m_clipTable);
-    m_clipTable->item(row, 0)->setText(QString::number(clip.startMs));
-    m_clipTable->item(row, 1)->setText(QString::number(clip.endMs));
-    m_clipTable->item(row, 2)->setText(clip.text);
-    m_clipTable->item(row, 3)->setText(clip.actor);
+    ensureTableItem(m_clipTable, row, kStartMsColumn)->setText(QString::number(clip.startMs));
+    ensureTableItem(m_clipTable, row, kEndMsColumn)->setText(QString::number(clip.endMs));
+    ensureTableItem(m_clipTable, row, kTextColumn)->setText(clip.text);
+    updateCpsItem(ensureTableItem(m_clipTable, row, kCpsColumn), clip);
+    ensureTableItem(m_clipTable, row, kActorColumn)->setText(clip.actor);
 }
 
 // ---------------------------------------------------------------------------
@@ -559,6 +708,8 @@ void CaptionEditorDialog::updateStyleControls()
     QSignalBlocker b5(m_outlineWidthSpin);
     QSignalBlocker b6(m_bgCheck);
     QSignalBlocker b7(m_anchorCombo);
+    QSignalBlocker b8(m_karaokeCheck);
+    QSignalBlocker b9(m_karaokeColorButton);
 
     QFont f(m_style.fontFamily);
     m_fontCombo->setCurrentFont(f);
@@ -567,9 +718,12 @@ void CaptionEditorDialog::updateStyleControls()
     m_italicCheck->setChecked(m_style.italic);
     m_outlineWidthSpin->setValue(m_style.outlineThickness);
     m_bgCheck->setChecked(m_style.background);
+    m_karaokeCheck->setChecked(m_subtitleStyle.karaokeEnabled);
 
     const QString anchorStr = caption::anchorToString(m_style.anchor);
-    const int anchorIdx = m_anchorCombo->findText(anchorStr);
+    int anchorIdx = m_anchorCombo->findData(anchorStr);
+    if (anchorIdx < 0)
+        anchorIdx = m_anchorCombo->findText(anchorStr);
     if (anchorIdx >= 0)
         m_anchorCombo->setCurrentIndex(anchorIdx);
 
@@ -579,6 +733,22 @@ void CaptionEditorDialog::updateStyleControls()
         QStringLiteral("background-color: %1").arg(m_style.outlineColor.name()));
     m_bgColorButton->setStyleSheet(
         QStringLiteral("background-color: %1").arg(m_style.backgroundColor.name()));
+    m_karaokeColorButton->setStyleSheet(
+        QStringLiteral("background-color: %1").arg(m_subtitleStyle.karaokeHighlightColor.name()));
+}
+
+void CaptionEditorDialog::syncSubtitleStyleFromCaptionStyle()
+{
+    QFont font(m_style.fontFamily, m_style.fontSizePt);
+    font.setBold(m_style.bold);
+    font.setItalic(m_style.italic);
+
+    m_subtitleStyle.font = font;
+    m_subtitleStyle.color = m_style.textColor;
+    m_subtitleStyle.outlineColor = m_style.outlineColor;
+    m_subtitleStyle.outlineWidth = m_style.outlineThickness;
+    m_subtitleStyle.boxEnabled = m_style.background;
+    m_subtitleStyle.boxColor = m_style.backgroundColor;
 }
 
 // ---------------------------------------------------------------------------

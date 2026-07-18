@@ -2,8 +2,10 @@
 #include "Overlay.h"
 #include "Timeline.h"
 #include "VideoPlayer.h"
+#include "UndoTrace.h"
 #include "AdjustmentLayer.h"
 #include "Camera3D.h"
+#include "clipanim/ClipAnim.h"
 #include "SurfaceTool.h"
 #include <algorithm>
 #include <cmath>
@@ -22,6 +24,7 @@
 #include <QPainter>
 #include <QPen>
 #include <QMouseEvent>
+#include <QContextMenuEvent>
 #include <QKeyEvent>
 #include <QFocusEvent>
 #include <QFontMetrics>
@@ -131,7 +134,8 @@ QImage applyPlanarRotation(const QImage &image, double degrees)
     return rotated;
 }
 
-PreviewClipMotion makePreviewMotion(const ClipInfo &clip, int trackIdx, int clipIdx)
+PreviewClipMotion makePreviewMotion(const ClipInfo &clip, int trackIdx, int clipIdx,
+                                    double clipLocalSeconds)
 {
     PreviewClipMotion motion;
     motion.valid = true;
@@ -144,6 +148,16 @@ PreviewClipMotion makePreviewMotion(const ClipInfo &clip, int trackIdx, int clip
     motion.opacity = clip.opacity;
     motion.is3DLayer = clip.is3DLayer;
     motion.layer3D = clip.is3DLayer ? clip.layer3D : Layer3DTransform{};
+    if (clip.keyframes.hasAnyKeyframes()) {
+        const clipgeom::ClipTransform transform =
+            clipanim::effectiveTransformAt(clip, clipLocalSeconds);
+        motion.scale = transform.videoScale;
+        motion.dx = transform.videoDx;
+        motion.dy = transform.videoDy;
+        motion.rotation2D = transform.rotationDeg;
+        motion.opacity =
+            clipanim::effectiveOpacityAt(clip, clipLocalSeconds, clip.opacity);
+    }
     return motion;
 }
 
@@ -158,6 +172,7 @@ PreviewClipMotion resolvePreviewClipMotion(const Timeline *timeline, double time
         int trackIdx = -1;
         int clipIdx = -1;
         const ClipInfo *clip = nullptr;
+        double timelineStartSec = 0.0;
     };
 
     QVector<ActiveClipRef> activeClips;
@@ -178,7 +193,7 @@ PreviewClipMotion resolvePreviewClipMotion(const Timeline *timeline, double time
             if (durationSec > 0.0
                 && timelineSec >= startSec - 1e-6
                 && timelineSec <= endSec + 1e-6) {
-                activeClips.append(ActiveClipRef{trackIdx, clipIdx, &clip});
+                activeClips.append(ActiveClipRef{trackIdx, clipIdx, &clip, startSec});
                 break;
             }
             accumSec = endSec;
@@ -192,7 +207,8 @@ PreviewClipMotion resolvePreviewClipMotion(const Timeline *timeline, double time
     if (activeClips.size() == 1)
         return makePreviewMotion(*activeClips.first().clip,
                                  activeClips.first().trackIdx,
-                                 activeClips.first().clipIdx);
+                                 activeClips.first().clipIdx,
+                                 timelineSec - activeClips.first().timelineStartSec);
 
     for (int trackIdx = 0; trackIdx < videoTracks.size(); ++trackIdx) {
         const auto *track = videoTracks[trackIdx];
@@ -203,21 +219,26 @@ PreviewClipMotion resolvePreviewClipMotion(const Timeline *timeline, double time
             continue;
         for (const ActiveClipRef &ref : activeClips) {
             if (ref.trackIdx == trackIdx && ref.clipIdx == selectedClipIdx)
-                return makePreviewMotion(*ref.clip, ref.trackIdx, ref.clipIdx);
+                return makePreviewMotion(*ref.clip, ref.trackIdx, ref.clipIdx,
+                                         timelineSec - ref.timelineStartSec);
         }
     }
 
     for (const ActiveClipRef &ref : activeClips) {
-        if (fuzzyMatchMotionValue(ref.clip->videoScale, currentScale)
-            && fuzzyMatchMotionValue(ref.clip->videoDx, currentDx)
-            && fuzzyMatchMotionValue(ref.clip->videoDy, currentDy)) {
-            return makePreviewMotion(*ref.clip, ref.trackIdx, ref.clipIdx);
+        const PreviewClipMotion motion =
+            makePreviewMotion(*ref.clip, ref.trackIdx, ref.clipIdx,
+                              timelineSec - ref.timelineStartSec);
+        if (fuzzyMatchMotionValue(motion.scale, currentScale)
+            && fuzzyMatchMotionValue(motion.dx, currentDx)
+            && fuzzyMatchMotionValue(motion.dy, currentDy)) {
+            return motion;
         }
     }
 
     return makePreviewMotion(*activeClips.first().clip,
                              activeClips.first().trackIdx,
-                             activeClips.first().clipIdx);
+                             activeClips.first().clipIdx,
+                             timelineSec - activeClips.first().timelineStartSec);
 }
 } // namespace
 
@@ -1122,7 +1143,9 @@ void GLPreview::cleanupGL()
     if (!context())
         return;
 
+    undotrace::log("gl:beforeMakeCurrent");
     makeCurrent();
+    undotrace::log("gl:afterMakeCurrent");
     releaseRegisteredTexturesLocked();
 #if defined(Q_OS_WIN)
     if (m_interopDevice) {
@@ -1300,7 +1323,9 @@ void GLPreview::setSharedD3D11Device(void *d3d11Device)
     // next paint reopens against the new device. close on the GL thread.
     if (m_interopDevice && d3d11Device != m_currentInteropD3D11Device) {
         if (context() && QOpenGLContext::currentContext() != context()) {
+            undotrace::log("gl:beforeMakeCurrent");
             makeCurrent();
+            undotrace::log("gl:afterMakeCurrent");
             releaseRegisteredTexturesLocked();
             if (gWglDXCloseDeviceNV)
                 gWglDXCloseDeviceNV(static_cast<HANDLE>(m_interopDevice));
@@ -1342,7 +1367,9 @@ void GLPreview::flushInteropCache()
 #if defined(Q_OS_WIN)
     if (!context())
         return;
+    undotrace::log("gl:beforeMakeCurrent");
     makeCurrent();
+    undotrace::log("gl:afterMakeCurrent");
     releaseRegisteredTexturesLocked();
     doneCurrent();
     m_pendingD3D11Texture = nullptr;
@@ -1554,8 +1581,10 @@ void GLPreview::resizeGL(int w, int h)
 
 void GLPreview::displayFrame(const QImage &frame)
 {
+    undotrace::log("gl:displayFrame:enter");
     if (frame.isNull()) {
         qWarning() << "GLPreview::displayFrame called with null image";
+        undotrace::log("gl:displayFrame:exit");
         return;
     }
     // US-INT-4: cache the source-frame dimensions so the stabilizer matrix
@@ -1607,12 +1636,14 @@ void GLPreview::displayFrame(const QImage &frame)
     }
     if (m_currentFrame.isNull()) {
         qWarning() << "GLPreview: convertToFormat returned null";
+        undotrace::log("gl:displayFrame:exit");
         return;
     }
     if (m_displayAspectRatio <= 0.0 && m_currentFrame.height() > 0)
         m_displayAspectRatio = static_cast<double>(m_currentFrame.width()) / m_currentFrame.height();
     m_needsUpload = true;
     update();
+    undotrace::log("gl:displayFrame:exit");
 }
 
 void GLPreview::setDisplayAspectRatio(double aspectRatio)
@@ -1624,6 +1655,7 @@ void GLPreview::setDisplayAspectRatio(double aspectRatio)
 void GLPreview::setColorCorrection(const ColorCorrection &cc)
 {
     m_cc = cc;
+    ++m_colorCorrectionSetCountForTest;
     update();
 }
 
@@ -1798,6 +1830,7 @@ void GLPreview::renderPendingD3D11Frame()
 
 void GLPreview::paintGL()
 {
+    undotrace::log("gl:paintGL:enter");
     static int paintCount = 0;
     if (++paintCount <= 5 || (paintCount % 100) == 0) {
         qInfo() << "GLPreview::paintGL #" << paintCount
@@ -1817,11 +1850,15 @@ void GLPreview::paintGL()
 
     if (m_pendingD3D11Texture && m_interopAvailable) {
         renderPendingD3D11Frame();
+        undotrace::log("gl:paintGL:exit");
         return;
     }
 #endif
 
-    if (m_currentFrame.isNull()) return;
+    if (m_currentFrame.isNull()) {
+        undotrace::log("gl:paintGL:exit");
+        return;
+    }
 
     // glViewport expects PHYSICAL pixels, but QWidget::width()/height() are
     // LOGICAL (device-independent) pixels. On a high-DPI display with DPR=1.5
@@ -1934,6 +1971,7 @@ void GLPreview::paintGL()
         const int fh = uploadFrame.height();
         if (fw <= 0 || fh <= 0) {
             m_needsUpload = false;
+            undotrace::log("gl:paintGL:exit");
             return;
         }
 
@@ -2001,12 +2039,17 @@ void GLPreview::paintGL()
         const QOpenGLTexture::PixelType upPixType = is16
             ? QOpenGLTexture::UInt16
             : QOpenGLTexture::UInt8;
+        undotrace::log("gl:beforeUpload");
         m_texture->setData(0, 0, upPixFormat, upPixType,
                            static_cast<const void*>(uploadFrame.constBits()));
+        undotrace::log("gl:afterUpload");
         m_needsUpload = false;
     }
 
-    if (!m_texture || !m_program) return;
+    if (!m_texture || !m_program) {
+        undotrace::log("gl:paintGL:exit");
+        return;
+    }
 
     m_program->bind();
     m_texture->bind();
@@ -2503,6 +2546,7 @@ void GLPreview::paintGL()
         spainter.setRenderHint(QPainter::Antialiasing, true);
         m_surfaceTool->paintOverlay(spainter, letterboxRect());
     }
+    undotrace::log("gl:paintGL:exit");
 }
 
 QRectF GLPreview::letterboxRect() const
@@ -2544,6 +2588,29 @@ void GLPreview::setVideoSourceTransform(double scale, double dx, double dy)
     update();
 }
 
+void GLPreview::setVideoContentInset(double fw, double fh)
+{
+    const double nextFw = qBound(0.01, fw, 1.0);
+    const double nextFh = qBound(0.01, fh, 1.0);
+    if (m_contentInsetFw == nextFw && m_contentInsetFh == nextFh)
+        return;
+    m_contentInsetFw = nextFw;
+    m_contentInsetFh = nextFh;
+    update();
+}
+
+void GLPreview::contextMenuEvent(QContextMenuEvent *event)
+{
+    // PV-B: ドラッグ中(左ボタン変形操作)でなければプレビュー右クリック
+    // メニュー要求を発火。実際のメニュー構築は MainWindow 側。
+    if (m_videoDragMode != VideoDragNone) {
+        event->ignore();
+        return;
+    }
+    emit contextMenuRequested(event->globalPos());
+    event->accept();
+}
+
 void GLPreview::resetVideoSourceTransform()
 {
     m_videoSourceScale = 1.0;
@@ -2574,8 +2641,9 @@ void GLPreview::setCompositeBakedMode(bool enabled)
 QRectF GLPreview::videoDisplayRectFor(double scale, double dx, double dy) const
 {
     const QRectF lb = letterboxRect();
-    const double w = lb.width() * scale;
-    const double h = lb.height() * scale;
+    // fw=fh=1: identical to original full-letterbox transform rect.
+    const double w = lb.width() * scale * m_contentInsetFw;
+    const double h = lb.height() * scale * m_contentInsetFh;
     const double cx = lb.x() + lb.width() / 2.0 + dx * lb.width();
     const double cy = lb.y() + lb.height() / 2.0 + dy * lb.height();
     return QRectF(cx - w / 2.0, cy - h / 2.0, w, h);
@@ -2956,15 +3024,18 @@ void GLPreview::mouseMoveEvent(QMouseEvent *event)
                 }
                 const double mouseDX = qAbs(event->pos().x() - anchor.x());
                 const double mouseDY = qAbs(event->pos().y() - anchor.y());
-                const double scaleFromX = mouseDX / lbw;
-                const double scaleFromY = mouseDY / lbh;
+                const double fw = qMax(0.01, m_contentInsetFw);
+                const double fh = qMax(0.01, m_contentInsetFh);
+                // fw=fh=1: identical to original mouseDX/lbw scale and lbw*scale size math.
+                const double scaleFromX = mouseDX / (lbw * fw);
+                const double scaleFromY = mouseDY / (lbh * fh);
                 double newScale = m_videoDragStartScale;
                 if (driveX && driveY) newScale = qMax(scaleFromX, scaleFromY);
                 else if (driveX)      newScale = scaleFromX;
                 else if (driveY)      newScale = scaleFromY;
                 newScale = qBound(0.1, newScale, 10.0);
-                const double newWpx = lbw * newScale;
-                const double newHpx = lbh * newScale;
+                const double newWpx = lbw * fw * newScale;
+                const double newHpx = lbh * fh * newScale;
                 QPointF newCenter = anchor;
                 switch (m_videoDragHandle) {
                     case HandleTL: newCenter = QPointF(anchor.x() - newWpx / 2.0, anchor.y() - newHpx / 2.0); break;
@@ -3233,7 +3304,9 @@ void GLPreview::setLut(const LutData &lut)
         return;
     }
 
+    undotrace::log("gl:beforeMakeCurrent");
     makeCurrent();
+    undotrace::log("gl:afterMakeCurrent");
 
     if (m_lutTexture) {
         delete m_lutTexture;
@@ -3318,7 +3391,9 @@ void GLPreview::setLutTexture(const QImage &lutGrid, float intensity)
         }
     }
 
+    undotrace::log("gl:beforeMakeCurrent");
     makeCurrent();
+    undotrace::log("gl:afterMakeCurrent");
 
     if (m_lutTexture) {
         delete m_lutTexture;
@@ -3691,7 +3766,9 @@ void GLPreview::setLiftGammaGain(const std::array<std::array<double,4>,3> &value
 
 void GLPreview::clearLut()
 {
+    undotrace::log("gl:beforeMakeCurrent");
     makeCurrent();
+    undotrace::log("gl:afterMakeCurrent");
     if (m_lutTexture) {
         delete m_lutTexture;
         m_lutTexture = nullptr;

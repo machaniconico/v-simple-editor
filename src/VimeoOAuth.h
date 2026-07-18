@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QByteArray>
+#include <QDateTime>
 #include <QObject>
 #include <QPointer>
 #include <QString>
@@ -16,9 +17,13 @@ struct VimeoOAuthConfig {
     QString clientId;
     QString clientSecret;
     QString scope;
+    // mock server / staging 経由のテスト用に endpoint base を override する。
+    // 空ならハードコードされた https://api.vimeo.com を使う。
+    QString baseUrl;
     QString accessToken;
     QString refreshToken;
     QString redirectUri;
+    QDateTime expiresAt;  // Phase 5F: access_token expiry UTC、無効なら expiry 未知
 
     static VimeoOAuthConfig defaultConfig();
 };
@@ -43,6 +48,9 @@ public:
     void exchangeAuthorizationCode(const QString& authorizationCode,
                                    const QString& redirectUri = QString());
     void refreshAccessToken();
+    // expiresAt - now < leeway なら refresh_token で更新を試みる。
+    // refreshToken 未設定なら何もしない (false 返す)。非同期完了は tokensUpdated signal。
+    bool refreshIfExpired(int leewaySec = 60);
 
     void setAccessToken(const QString& accessToken);
     void setRefreshToken(const QString& refreshToken);

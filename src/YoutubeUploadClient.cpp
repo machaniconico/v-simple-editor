@@ -14,9 +14,14 @@ namespace upload {
 
 namespace {
 
-constexpr const char* kInitiateUrl =
-    "https://www.googleapis.com/upload/youtube/v3/videos"
-    "?uploadType=resumable&part=snippet,status";
+static QString g_apiBaseUrl;
+
+QString initiateUrl() {
+    const QString base = g_apiBaseUrl.isEmpty()
+        ? QStringLiteral("https://www.googleapis.com")
+        : g_apiBaseUrl;
+    return base + QStringLiteral("/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status");
+}
 
 // snippet + status を JSON にシリアライズ。
 QByteArray buildMetadataJson(const UploadMetadata& m) {
@@ -84,6 +89,14 @@ qint64 Client::parseRangeHeaderEnd(const QByteArray& rangeHeaderValue) {
     return endByte;
 }
 
+void Client::setApiBaseUrl(const QString& url) {
+    g_apiBaseUrl = url;
+}
+
+QString Client::apiBaseUrl() {
+    return g_apiBaseUrl;
+}
+
 // ---------------------------------------------------------------------------
 // ctor / dtor
 // ---------------------------------------------------------------------------
@@ -117,7 +130,7 @@ void Client::initiateSession(const youtube::oauth::Token& token,
 
     const QByteArray body = buildMetadataJson(metadata);
 
-    QNetworkRequest req((QUrl(QString::fromLatin1(kInitiateUrl))));
+    QNetworkRequest req((QUrl(initiateUrl())));
     req.setRawHeader("Authorization",
                      "Bearer " + token.accessToken.toUtf8());
     req.setHeader(QNetworkRequest::ContentTypeHeader,

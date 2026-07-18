@@ -15,6 +15,7 @@
 
 #include "PlaybackTypes.h"
 #include "AudioEQ.h"
+#include "AudioBusRouting.h"
 
 // AudioMixer — sums up to MAX_AUDIO_TRACKS independent FFmpeg-decoded
 // audio streams into a single 48 kHz s16 stereo output via QAudioSink in
@@ -62,6 +63,12 @@ inline uint qHash(const AudioTrackKey &k, uint seed = 0) noexcept {
     return h;
 }
 
+inline constexpr bool resolveAudioAtempoEnabled(bool envForce,
+                                                bool perClipFlag) noexcept
+{
+    return envForce || perClipFlag;
+}
+
 class AudioMixer : public QObject {
     Q_OBJECT
 public:
@@ -92,6 +99,9 @@ public:
     void setSequence(const QVector<PlaybackEntry> &entries);
     // Parallel speed-ramp array aligned to setSequence entries.
     void setSpeedRamps(const QVector<speedramp::SpeedRamp> &ramps);
+    // Parallel per-entry atempo opt-in flags aligned to setSequence entries.
+    // Env VEDITOR_AUDIO_ATEMPO still globally forces the feature on.
+    void setAtempoFlags(const QVector<bool> &flags);
 
     // Jump the audible playhead. Resyncs FFmpeg seek inside every active
     // entry (lazily on next refill) and flushes ring buffers so the next
@@ -120,6 +130,16 @@ public:
     void setTrackSolo(int trackIdx, bool solo);
     void setTrackGain(int trackIdx, double gain);
     double trackGain(int trackIdx) const;
+
+    // Bus / submix / aux-send routing (AB-4). Replaces the per-track →
+    // master bus-gain map consulted in the mix loop. The routing object is
+    // a pure value engine (audiobus::AudioBusRouting); setBusRouting swaps
+    // the whole snapshot under m_controlMutex so the audio worker thread
+    // always reads a coherent copy. When no buses are defined and no track
+    // is assigned, resolveTrackToMasterGain returns 1.0 for every track, so
+    // the mix is bit-identical to the pre-AB-4 path (identity guarantee).
+    void setBusRouting(const audiobus::AudioBusRouting &r);
+    audiobus::AudioBusRouting busRouting() const;
 
     // Per-track realtime EQ (3-band biquad, applied before effectiveGain).
     void setTrackEqConfig(int trackIdx, const AudioEQConfig &cfg);
@@ -340,6 +360,27 @@ private:
     // the existing public API stays QVector-shaped (Phase A compat).
     QVector<AudioTrackKey> m_speedRampKeyOrder;
     QHash<AudioTrackKey, speedramp::SpeedRamp> m_speedRampByKey;
+    QVector<bool> m_atempoFlags;  // parallel to setSequence entries
+    QHash<AudioTrackKey, bool> m_atempoByKey;
+    // PRD-B / US-FIX-7 R10: monotonically increasing generation counter, bumped
+    // under m_controlMutex inside setSpeedRamps each time m_speedRampByKey is
+    // rebuilt. Decision sites that consult m_speedRampByKey (the readData
+    // atempo path and the seekEntryToTimeline R8 gate) capture the generation
+    // on entry; if a later compare under-lock observes a mismatch the
+    // ramp-dependent branch is silently dropped (no audio side-effect, no
+    // log spam) so an in-flight decision based on a stale snapshot cannot
+    // commit. Atomic so non-locked observers (e.g. defense-in-depth peek)
+    // can still read it lock-free; production decision sites compare under
+    // m_controlMutex so the relaxed memory order is sufficient.
+    //
+    // CRITICAL: this counter is only CONSULTED on the opt-in atempo /
+    // non-1x path. The default editor preview (atempo OFF, speed==1.0, no
+    // ramp) never enters either consulting branch (env and per-clip atempo
+    // both resolve false, and m_speedRampByKey is empty), so byte-identity
+    // vs R7/R8/R9 is preserved by construction. The counter itself
+    // increments unconditionally inside setSpeedRamps — that is a write to a
+    // private atomic with no audible side-effect.
+    std::atomic<uint64_t> m_speedRampGeneration{0};
 
     // 4-band parametric EQ — separate path from TrackState's legacy 3-band.
     // Per-track config + per-channel biquad history (4 bands x 2 channels x
@@ -445,6 +486,14 @@ private:
     // read by ducking menu handler (GUI thread) to drive Timeline's
     // envelope-based applyDuckingFromTrack.
     AutoDuckParams m_autoDuckParams;
+
+    // Bus / submix / aux-send routing (AB-4). Set from the GUI thread via
+    // setBusRouting under m_controlMutex; the audio worker thread reads it
+    // inside MixerIODevice::readData under the same mutex (resolveTrack-
+    // ToMasterGain is a cheap O(bus-count) double accumulation). Default-
+    // constructed = no buses, no assignments → resolveTrackToMasterGain
+    // returns 1.0 for every track, so the mix path is unchanged (identity).
+    audiobus::AudioBusRouting m_busRouting;
 
     // Master loudness normalizer state. Atomics are touched from the GUI
     // thread (setters) and the audio worker thread (readData). The mutable

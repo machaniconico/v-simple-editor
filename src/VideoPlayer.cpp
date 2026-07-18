@@ -1,7 +1,48 @@
 #include "VideoPlayer.h"
 #include <QSet>
 #include "GLPreview.h"
+#include "TimelineFrameRenderer.h"
+#include "Timeline.h"
+#include "LayerStyle.h"
+#include "EffectParamSchema.h"
+#include "UndoTrace.h"
 #include "ProxyManager.h"
+#include "TextOverlayBake.h"   // textbake::bakeOverlays (shared text baker SSOT)
+#include "ClipGeometry.h"      // clipgeom::renderLayer (shared clip-placement SSOT)
+#include "clipanim/ClipAnim.h" // S1 — motion/opacity keyframe evaluation
+#include "TrackMatteKey.h"     // STAGE4B: trackMatteClipKey (canonical matte clip key)
+#include "playback/LiveMatteResolve.h" // STAGE4B: clipstack::resolveLiveMatteSources
+#include "playback/clipidt_flag.h"
+#include "playback/hdrexport16_flag.h"
+#include "playback/hdrmatte16_flag.h"
+#include "playback/hdroverlay_flag.h"
+#include "playback/idtgpu_flag.h"   // Stage9-GPU-IDT Story2: VEDITOR_HDR_IDT_GPU
+#include "playback/PixFmtDepth.h"   // pixfmtdepth::bitDepthFromPixFmt (null-safe per-component depth)
+#include "playback/SnsFit.h"
+#include "playback/TlrCompose16.h"
+#include "playback/HdrCompositeMath.h"
+#include "color/ClipColorTransform.h"
+#include "color/ClipOdt.h"
+#include "gpucomposite_flag.h"
+#include <algorithm>           // std::stable_sort
+
+// Free comparator for the production layer sort. Extracted from the inline
+// lambda in handlePlaybackTick so the S3-STACK predicate sub-assertion in
+// main.cpp can exercise the EXACT same comparator and catch a re-inversion.
+// Returns true when `a` should paint BEFORE `b` (i.e. is deeper in the stack).
+// V1-wins stacking (PlaybackTypes.h:34): V1 (sourceTrack 0) paints LAST so it
+// ends up ON TOP; the highest track (largest sourceTrack) paints FIRST so it is
+// the backmost layer. SourceOver draws the last image frontmost, so to make V1
+// frontmost the comparator sorts DESCENDING by sourceTrack (V_max first → back,
+// V1 last → front).
+// Lives in namespace clipstack to avoid GLOBAL-namespace ODR/symbol pollution.
+namespace clipstack {
+bool layerPaintOrderLess(const VideoPlayer::DecodedLayer &a,
+                         const VideoPlayer::DecodedLayer &b)
+{
+    return a.sourceTrack > b.sourceTrack;
+}
+} // namespace clipstack
 
 #if defined(_WIN32)
 // Phase 1e — d3d11.h pulls in WinSDK 10.0.26100 headers that fight Qt's
@@ -27,31 +68,745 @@ extern "C" void *veditor_avHwDeviceCtxToD3D11Device(AVBufferRef *ref);
 #include <QRadialGradient>
 #include <QPen>
 #include <QFontMetrics>
+#include <atomic>
 #include <cmath>
+#include <cstring>
 #include <limits>
+
+extern "C" {
+#include <libavutil/imgutils.h>
+}
+
+namespace veditor {
+bool parentingEnabledFromEnv();
+}
+
+namespace clipmask {
+QImage applyRasterAlphaMask(const QImage &sourceImage, const QVector<Mask> &masks);
+}
 
 namespace {
 
-// Phase 1e — VEDITOR_PLAYBACK_PROXY divisor for the playback decode path.
+// Phase 1e — playback preview divisor for the playback decode path.
 // Default 2 (half-res preview) so playback at 1440p / 4K sources hits the
 // frame budget on systems where HW transfer + sws_scale is the bottleneck.
-// VEDITOR_PLAYBACK_PROXY=1 forces full resolution; =4/=8 push further.
+// QSettings controls it at runtime; VEDITOR_PLAYBACK_PROXY is used only as
+// the first-run seed when no saved preference exists.
 // Pause and export stay at full resolution because they bypass these
 // decode wrappers — the user only sees aliasing during active playback.
+std::atomic<int> g_playbackProxyPref{-1};
+
+inline int normalizePlaybackProxyDivisor(int v)
+{
+    if (v != 1 && v != 2 && v != 4 && v != 8)
+        return 2;
+    return v;
+}
+
 inline int playbackProxyDivisor()
 {
-    static const int kDivisor = []() {
-        const QByteArray raw = qgetenv("VEDITOR_PLAYBACK_PROXY");
-        if (raw.isEmpty())
-            return 2; // default half-res preview during playback
-        bool ok = false;
-        int v = raw.toInt(&ok);
-        if (!ok || v < 1) v = 1;
-        if (v > 8) v = 8;
-        if (v != 1 && v != 2 && v != 4 && v != 8) v = 1;
+    int v = g_playbackProxyPref.load(std::memory_order_relaxed);
+    if (v != -1)
         return v;
-    }();
-    return kDivisor;
+
+    QSettings prefs("VSimpleEditor", "Preferences");
+    if (prefs.contains("playbackProxyDivisor")) {
+        v = prefs.value("playbackProxyDivisor", 2).toInt();
+    } else {
+        const QByteArray raw = qgetenv("VEDITOR_PLAYBACK_PROXY");
+        bool ok = false;
+        const int envDivisor = raw.toInt(&ok);
+        v = ok ? envDivisor : 2;
+    }
+
+    v = normalizePlaybackProxyDivisor(v);
+    int expected = -1;
+    if (g_playbackProxyPref.compare_exchange_strong(expected, v, std::memory_order_relaxed))
+        return v;
+    return expected;
+}
+
+bool scaleFrameToQImagePadded(SwsContext *ctx,
+                              const AVFrame *frame,
+                              AVPixelFormat dstPixFmt,
+                              QImage &image)
+{
+    if (!ctx || !frame || image.isNull())
+        return false;
+
+    const int rowBytes = av_image_get_linesize(dstPixFmt, image.width(), 0);
+    if (rowBytes <= 0 || rowBytes > image.bytesPerLine())
+        return false;
+
+    uint8_t *tmpData[4] = { nullptr, nullptr, nullptr, nullptr };
+    int tmpStride[4] = { 0, 0, 0, 0 };
+    if (av_image_alloc(tmpData, tmpStride, image.width(), image.height(),
+                       dstPixFmt, 64) < 0)
+        return false;
+
+    sws_scale(ctx, frame->data, frame->linesize, 0, frame->height,
+              tmpData, tmpStride);
+    for (int y = 0; y < image.height(); ++y) {
+        std::memcpy(image.scanLine(y), tmpData[0] + y * tmpStride[0],
+                    static_cast<std::size_t>(rowBytes));
+    }
+    av_freep(&tmpData[0]);
+    return true;
+}
+
+const ClipInfo *clipForPlaybackEntry(const Timeline *timeline, const PlaybackEntry &entry)
+{
+    if (!timeline)
+        return nullptr;
+    const auto &tracks = timeline->videoTracks();
+    const auto *track = tracks.value(entry.sourceTrack, nullptr);
+    if (!track)
+        return nullptr;
+    const auto &clips = track->clips();
+    if (entry.sourceClipIndex < 0 || entry.sourceClipIndex >= clips.size())
+        return nullptr;
+    return &clips[entry.sourceClipIndex];
+}
+
+bool isNullObjectPath(const QString &path)
+{
+    return clipgeom::isNullObjectFilePath(path);
+}
+
+bool isNullObjectEntry(const PlaybackEntry &entry)
+{
+    return isNullObjectPath(entry.filePath);
+}
+
+bool isAdjustmentEntry(const Timeline *timeline, const PlaybackEntry &entry)
+{
+    const ClipInfo *clip = clipForPlaybackEntry(timeline, entry);
+    return clip && clip->isAdjustment;
+}
+
+bool trackHasActiveSequenceReference(const QVector<ClipInfo> &clips, double targetSec)
+{
+    if (clips.isEmpty())
+        return false;
+
+    double cursor = 0.0;
+    for (const ClipInfo &clip : clips) {
+        const double clipStart = cursor + qMax(0.0, clip.leadInSec);
+        const double clipEnd = clipStart + clip.effectiveDuration();
+        if (targetSec >= clipStart && targetSec < clipEnd)
+            return clip.isSequenceReference();
+        cursor = clipEnd;
+    }
+    return targetSec <= 0.0 && clips.first().isSequenceReference();
+}
+
+bool timelineHasActiveSequenceReference(const Timeline *timeline, qint64 timelineUsec)
+{
+    if (!timeline)
+        return false;
+    const double targetSec = static_cast<double>(timelineUsec) / AV_TIME_BASE;
+    for (const TimelineTrack *track : timeline->videoTracks()) {
+        if (!track || track->isHidden())
+            continue;
+        if (trackHasActiveSequenceReference(track->clips(), targetSec))
+            return true;
+    }
+    return false;
+}
+
+int previewPrimaryEntryIndexAt(const Timeline *timeline,
+                               const QVector<PlaybackEntry> &sequence,
+                               int preferredIdx,
+                               qint64 timelineUsec)
+{
+    auto usableMediaEntry = [&](int idx) {
+        return idx >= 0 && idx < sequence.size()
+            && !isAdjustmentEntry(timeline, sequence.at(idx))
+            && !isNullObjectEntry(sequence.at(idx));
+    };
+    if (usableMediaEntry(preferredIdx))
+        return preferredIdx;
+
+    const double tSec = static_cast<double>(timelineUsec) / AV_TIME_BASE;
+    int bestIdx = -1;
+    for (int i = 0; i < sequence.size(); ++i) {
+        const PlaybackEntry &entry = sequence.at(i);
+        if (tSec < entry.timelineStart || tSec >= entry.timelineEnd)
+            continue;
+        if (!usableMediaEntry(i))
+            continue;
+        if (bestIdx < 0 || entry.sourceTrack < sequence.at(bestIdx).sourceTrack)
+            bestIdx = i;
+    }
+    return bestIdx >= 0 ? bestIdx : preferredIdx;
+}
+
+double entryClipLocalSeconds(const PlaybackEntry &entry, qint64 timelineUsec)
+{
+    return (static_cast<double>(timelineUsec) - entry.timelineStart * 1'000'000.0)
+        / 1'000'000.0;
+}
+
+QPointF previewMaskTrackDelta(const ClipInfo &clip, double sourceSec)
+{
+    const TrackingResult &trk = clip.maskTrackingData;
+    if (trk.isEmpty())
+        return QPointF();
+
+    const QRect now0 = trk.positionAtTime(sourceSec);
+    const QRect base0 = trk.regions.first().rect;
+    if (now0.isNull() || base0.isNull())
+        return QPointF();
+
+    const QPointF nowC(now0.x() + now0.width() / 2.0,
+                       now0.y() + now0.height() / 2.0);
+    const QPointF baseC(base0.x() + base0.width() / 2.0,
+                        base0.y() + base0.height() / 2.0);
+    return nowC - baseC;
+}
+
+void translateMask(Mask &mask, const QPointF &delta)
+{
+    if (delta.isNull())
+        return;
+    mask.rect.translate(delta);
+    for (QPointF &point : mask.points)
+        point += delta;
+}
+
+void scaleMask(Mask &mask, double sx, double sy)
+{
+    if (qFuzzyCompare(sx, 1.0) && qFuzzyCompare(sy, 1.0))
+        return;
+    mask.rect = QRectF(mask.rect.x() * sx,
+                       mask.rect.y() * sy,
+                       mask.rect.width() * sx,
+                       mask.rect.height() * sy);
+    for (QPointF &point : mask.points)
+        point = QPointF(point.x() * sx, point.y() * sy);
+}
+
+QVector<Mask> previewMasksForFrame(const ClipInfo &clip,
+                                   double sourceSec,
+                                   QSize sourceSize,
+                                   QSize frameSize)
+{
+    QVector<Mask> masks = clip.maskSystem.masks();
+    if (masks.isEmpty())
+        return masks;
+
+    const QPointF delta = previewMaskTrackDelta(clip, sourceSec);
+    for (Mask &mask : masks)
+        translateMask(mask, delta);
+
+    if (sourceSize.width() > 0 && sourceSize.height() > 0
+        && frameSize.width() > 0 && frameSize.height() > 0
+        && sourceSize != frameSize) {
+        const double sx = static_cast<double>(frameSize.width())
+            / static_cast<double>(sourceSize.width());
+        const double sy = static_cast<double>(frameSize.height())
+            / static_cast<double>(sourceSize.height());
+        if (std::isfinite(sx) && std::isfinite(sy) && sx > 0.0 && sy > 0.0) {
+            for (Mask &mask : masks)
+                scaleMask(mask, sx, sy);
+        }
+    }
+
+    return masks;
+}
+
+QImage applyPreviewClipMask(const QImage &frame,
+                            const Timeline *timeline,
+                            const PlaybackEntry &entry,
+                            double sourceSec,
+                            QSize sourceSize)
+{
+    if (frame.isNull())
+        return frame;
+    const ClipInfo *clip = clipForPlaybackEntry(timeline, entry);
+    if (!clip || !clip->hasMask())
+        return frame;
+
+    const QVector<Mask> masks =
+        previewMasksForFrame(*clip, sourceSec, sourceSize, frame.size());
+    if (masks.isEmpty())
+        return frame;
+    return clipmask::applyRasterAlphaMask(frame, masks);
+}
+
+struct ActivePreviewAdjustmentClip {
+    int trackIndex = 0;
+    const ClipInfo *clip = nullptr;
+    double localSec = 0.0;
+};
+
+bool appendPreviewAdjustmentClip(const Timeline *timeline,
+                                 const PlaybackEntry &entry,
+                                 qint64 timelineUsec,
+                                 QVector<ActivePreviewAdjustmentClip> *out)
+{
+    if (!out)
+        return false;
+    const ClipInfo *clip = clipForPlaybackEntry(timeline, entry);
+    if (!clip || !clip->isAdjustment)
+        return false;
+    out->append(ActivePreviewAdjustmentClip{
+        entry.sourceTrack, clip, entryClipLocalSeconds(entry, timelineUsec)});
+    return true;
+}
+
+QImage applyPreviewAdjustmentClipStack(
+    const QImage &lowerComposite,
+    const ActivePreviewAdjustmentClip &adjustment)
+{
+    if (lowerComposite.isNull() || !adjustment.clip)
+        return lowerComposite;
+    if (adjustment.clip->effects.isEmpty())
+        return lowerComposite;
+
+    const QVector<VideoEffect> effects =
+        clipanim::effectiveEffectsAt(*adjustment.clip, adjustment.localSec);
+    if (effects.isEmpty())
+        return lowerComposite;
+
+    const QImage adjusted = VideoEffectProcessor::applyEffectStack(
+        lowerComposite, ColorCorrection(), effects);
+    if (adjusted.isNull() || adjusted.size() != lowerComposite.size())
+        return adjusted;
+
+    QImage out = adjusted.convertToFormat(QImage::Format_ARGB32);
+    const QImage alphaSource =
+        lowerComposite.convertToFormat(QImage::Format_ARGB32);
+    for (int y = 0; y < out.height(); ++y) {
+        QRgb *dst = reinterpret_cast<QRgb *>(out.scanLine(y));
+        const QRgb *src =
+            reinterpret_cast<const QRgb *>(alphaSource.constScanLine(y));
+        for (int x = 0; x < out.width(); ++x)
+            dst[x] = qRgba(qRed(dst[x]), qGreen(dst[x]), qBlue(dst[x]), qAlpha(src[x]));
+    }
+    return out.convertToFormat(QImage::Format_RGBA8888);
+}
+
+QImage applyPreviewAdjustmentClipsAtTrack(
+    const QImage &input,
+    const QVector<ActivePreviewAdjustmentClip> &adjustments,
+    int trackIndex)
+{
+    QImage out = input;
+    for (const ActivePreviewAdjustmentClip &adjustment : adjustments) {
+        if (adjustment.trackIndex != trackIndex)
+            continue;
+        out = applyPreviewAdjustmentClipStack(
+            out.convertToFormat(QImage::Format_RGBA8888),
+            adjustment);
+    }
+    return out;
+}
+
+bool hasPreviewAdjustmentAtTrack(
+    const QVector<ActivePreviewAdjustmentClip> &adjustments,
+    int trackIndex)
+{
+    for (const ActivePreviewAdjustmentClip &adjustment : adjustments) {
+        if (adjustment.trackIndex == trackIndex)
+            return true;
+    }
+    return false;
+}
+
+bool hasDecodedTrackMatte(const QVector<VideoPlayer::DecodedLayer> &layers)
+{
+    return std::any_of(
+        layers.cbegin(), layers.cend(),
+        [](const VideoPlayer::DecodedLayer &layer) {
+            return layer.matteType != TrackMatteType::None;
+        });
+}
+
+clipgeom::ClipTransform transformForLayer(const VideoPlayer::DecodedLayer &layer);
+QVector<clipgeom::ClipTransform> effectiveLayerTransforms(
+    const QVector<VideoPlayer::DecodedLayer> &layers,
+    QSize canvas);
+
+void composePreviewFrameWithAdjustmentClips(
+    QImage &canvas,
+    const QVector<VideoPlayer::DecodedLayer> &layers,
+    const QVector<ActivePreviewAdjustmentClip> &adjustments)
+{
+    if (canvas.isNull())
+        return;
+    if (adjustments.isEmpty())
+        return;
+
+    Q_ASSERT(canvas.format() == QImage::Format_ARGB32_Premultiplied);
+    if (canvas.format() != QImage::Format_ARGB32_Premultiplied)
+        return;
+
+    canvas.fill(Qt::transparent);
+    const QSize cs(canvas.width(), canvas.height());
+    const QVector<clipgeom::ClipTransform> effectiveTransforms =
+        veditor::parentingEnabledFromEnv()
+            ? effectiveLayerTransforms(layers, cs)
+            : QVector<clipgeom::ClipTransform>{};
+
+    auto paintTrack = [&](int trackIndex) {
+        QPainter p(&canvas);
+        p.setCompositionMode(QPainter::CompositionMode_SourceOver);
+        const bool kSmooth = false;
+        for (int i = 0; i < layers.size(); ++i) {
+            const VideoPlayer::DecodedLayer &L = layers.at(i);
+            if (L.sourceTrack != trackIndex)
+                continue;
+            if (L.isNullObject || L.rgb.isNull() || L.opacity <= 0.001)
+                continue;
+            const clipgeom::ClipTransform t = effectiveTransforms.isEmpty()
+                ? transformForLayer(L)
+                : effectiveTransforms.value(i, transformForLayer(L));
+            QImage placed = clipgeom::renderLayer(L.rgb, t, cs, kSmooth);
+            if (!L.layerStyle.isIdentity())
+                placed = layerstyle::apply(placed, L.layerStyle);
+            p.setOpacity(qBound(0.0, L.opacity, 1.0));
+            p.drawImage(0, 0, placed);
+        }
+    };
+
+    auto applyAdjustmentTrack = [&](int trackIndex) {
+        if (!hasPreviewAdjustmentAtTrack(adjustments, trackIndex))
+            return;
+        QImage adjusted = applyPreviewAdjustmentClipsAtTrack(
+            canvas.convertToFormat(QImage::Format_RGBA8888),
+            adjustments,
+            trackIndex);
+        canvas = adjusted.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+    };
+
+    int maxTrack = 0;
+    for (const VideoPlayer::DecodedLayer &layer : layers)
+        maxTrack = qMax(maxTrack, layer.sourceTrack);
+    for (const ActivePreviewAdjustmentClip &adjustment : adjustments)
+        maxTrack = qMax(maxTrack, adjustment.trackIndex);
+
+    for (int track = maxTrack; track >= 1; --track) {
+        paintTrack(track);
+        applyAdjustmentTrack(track);
+    }
+
+    if (hasPreviewAdjustmentAtTrack(adjustments, 0))
+        applyAdjustmentTrack(0);
+    else
+        paintTrack(0);
+}
+
+QImage applyPreviewAdjustmentClipsAfterMatte(
+    const QImage &input,
+    const QVector<ActivePreviewAdjustmentClip> &adjustments)
+{
+    QImage out = input;
+    int maxTrack = 0;
+    for (const ActivePreviewAdjustmentClip &adjustment : adjustments)
+        maxTrack = qMax(maxTrack, adjustment.trackIndex);
+    for (int track = 1; track <= maxTrack; ++track)
+        out = applyPreviewAdjustmentClipsAtTrack(out, adjustments, track);
+    return out;
+}
+
+clipgeom::ClipTransform transformForLayer(const VideoPlayer::DecodedLayer &layer)
+{
+    return clipgeom::ClipTransform{layer.videoScale, layer.videoDx,
+                                   layer.videoDy, layer.rotation2DDegrees};
+}
+
+QString clipIdForLayer(const VideoPlayer::DecodedLayer &layer)
+{
+    if (layer.sourceTrack < 0 || layer.sourceClipIndex < 0)
+        return QString();
+    return trackMatteClipKey(layer.sourceTrack, layer.sourceClipIndex);
+}
+
+void resolveDecodedLayerParentSources(QVector<VideoPlayer::DecodedLayer> &layers)
+{
+    QVector<int> order;
+    order.reserve(layers.size());
+    for (int i = 0; i < layers.size(); ++i)
+        order.append(i);
+    std::stable_sort(order.begin(), order.end(),
+                     [&](int a, int b) {
+                         return layers.at(a).sourceTrack < layers.at(b).sourceTrack;
+                     });
+
+    QHash<QString, int> canonicalByClipId;
+    QVector<int> canonicalByActual(layers.size(), -1);
+    QVector<int> actualByCanonical(layers.size(), -1);
+    for (int ci = 0; ci < order.size(); ++ci) {
+        const int actual = order.at(ci);
+        canonicalByActual[actual] = ci;
+        actualByCanonical[ci] = actual;
+        const QString clipId = clipIdForLayer(layers[actual]);
+        if (!clipId.isEmpty())
+            canonicalByClipId.insert(clipId, ci);
+        layers[actual].parentSourceIndex = -1;
+    }
+
+    for (int actual = 0; actual < layers.size(); ++actual) {
+        if (layers[actual].parentClipId.isEmpty())
+            continue;
+        const int parentCanonical =
+            canonicalByClipId.value(layers[actual].parentClipId, -1);
+        const int childCanonical = canonicalByActual.value(actual, -1);
+        if (parentCanonical <= 0 || parentCanonical == childCanonical)
+            continue;
+        const int parentActual = actualByCanonical.value(parentCanonical, -1);
+        if (parentActual >= 0 && parentActual != actual)
+            layers[actual].parentSourceIndex = parentActual;
+    }
+}
+
+QVector<clipgeom::ClipTransform> effectiveLayerTransforms(
+    const QVector<VideoPlayer::DecodedLayer> &layers,
+    QSize canvas)
+{
+    QVector<clipgeom::ClipTransform> effective;
+    effective.reserve(layers.size());
+    for (const auto &layer : layers)
+        effective.append(transformForLayer(layer));
+
+    QVector<int> state(layers.size(), 0);
+    QVector<char> valid(layers.size(), 1);
+
+    std::function<bool(int, int)> resolve = [&](int idx, int depth) -> bool {
+        if (idx < 0 || idx >= layers.size())
+            return false;
+        if (state[idx] == 1) {
+            valid[idx] = 0;
+            effective[idx] = transformForLayer(layers[idx]);
+            state[idx] = 2;
+            return false;
+        }
+        if (state[idx] == 2)
+            return valid[idx] != 0;
+        if (depth > 8) {
+            effective[idx] = transformForLayer(layers[idx]);
+            return true;
+        }
+
+        state[idx] = 1;
+        const int parentIdx = layers[idx].parentSourceIndex;
+        if (parentIdx < 0 || parentIdx >= layers.size()
+            || parentIdx == idx || layers[parentIdx].sourceTrack <= 0) {
+            effective[idx] = transformForLayer(layers[idx]);
+            valid[idx] = 1;
+            state[idx] = 2;
+            return true;
+        }
+        if (!resolve(parentIdx, depth + 1)) {
+            effective[idx] = transformForLayer(layers[idx]);
+            valid[idx] = 0;
+            state[idx] = 2;
+            return false;
+        }
+
+        effective[idx] = clipgeom::composeParented(
+            transformForLayer(layers[idx]), effective[parentIdx], canvas);
+        valid[idx] = 1;
+        state[idx] = 2;
+        return true;
+    };
+
+    for (int i = 0; i < layers.size(); ++i)
+        resolve(i, 0);
+    return effective;
+}
+
+bool sameEffectValue(const VideoEffect &a, const VideoEffect &b)
+{
+    return a.type == b.type
+        && a.enabled == b.enabled
+        && a.param1 == b.param1
+        && a.param2 == b.param2
+        && a.param3 == b.param3
+        && a.keyColor == b.keyColor;
+}
+
+QVector<int> resolvePreviewEffectSourceIndices(const QVector<VideoEffect> &source,
+                                               const QVector<VideoEffect> &preview)
+{
+    QVector<int> indices;
+    indices.reserve(preview.size());
+
+    int searchFrom = 0;
+    for (const VideoEffect &effect : preview) {
+        int found = -1;
+        for (int i = searchFrom; i < source.size(); ++i) {
+            if (sameEffectValue(source[i], effect)) {
+                found = i;
+                break;
+            }
+        }
+        if (found < 0) {
+            for (int i = searchFrom; i < source.size(); ++i) {
+                if (source[i].type == effect.type) {
+                    found = i;
+                    break;
+                }
+            }
+        }
+        indices.append(found);
+        if (found >= 0)
+            searchFrom = found + 1;
+    }
+
+    return indices;
+}
+
+KeyframeTrack remapKeyframeTrack(const KeyframeTrack &sourceTrack,
+                                 const QString &propertyName)
+{
+    KeyframeTrack remapped(propertyName, sourceTrack.defaultValue());
+    for (const KeyframePoint &kf : sourceTrack.keyframes()) {
+        remapped.addKeyframe(kf.time,
+                             kf.value,
+                             kf.interpolation,
+                             kf.bezX1,
+                             kf.bezY1,
+                             kf.bezX2,
+                             kf.bezY2,
+                             kf.hasSpatialTangent,
+                             kf.spatialOutX,
+                             kf.spatialOutY,
+                             kf.spatialInX,
+                             kf.spatialInY);
+    }
+    return remapped;
+}
+
+QVector<VideoEffect> effectivePreviewEffectsAt(
+    const QVector<VideoEffect> &staticEffects,
+    const Timeline *timeline,
+    const QVector<PlaybackEntry> &sequence,
+    qint64 timelineUsec)
+{
+    if (staticEffects.isEmpty() || !timeline)
+        return staticEffects;
+
+    const int selectedClip = timeline->selectedVideoClipIndex();
+    if (selectedClip < 0)
+        return staticEffects;
+
+    const PlaybackEntry *entry = nullptr;
+    for (const PlaybackEntry &candidate : sequence) {
+        if (candidate.sourceTrack == 0
+            && candidate.sourceClipIndex == selectedClip) {
+            entry = &candidate;
+            break;
+        }
+    }
+    if (!entry)
+        return staticEffects;
+
+    const ClipInfo *clip = clipForPlaybackEntry(timeline, *entry);
+    if (!clip)
+        return staticEffects;
+
+    const QVector<int> sourceIndices =
+        resolvePreviewEffectSourceIndices(clip->effects, staticEffects);
+    const double clipLocalSec =
+        (static_cast<double>(timelineUsec) - entry->timelineStart * 1'000'000.0)
+        / 1'000'000.0;
+
+    ClipInfo previewClip = *clip;
+    previewClip.effects.clear();
+    previewClip.keyframes = KeyframeManager();
+
+    for (int i = 0; i < staticEffects.size() && i < sourceIndices.size(); ++i) {
+        const int sourceIndex = sourceIndices[i];
+        if (sourceIndex < 0 || sourceIndex >= clip->effects.size()) {
+            VideoEffect unmapped = staticEffects[i];
+            unmapped.startSec = -1.0;
+            unmapped.endSec = -1.0;
+            previewClip.effects.append(unmapped);
+            continue;
+        }
+
+        VideoEffect effect = staticEffects[i];
+        effect.startSec = clip->effects[sourceIndex].startSec;
+        effect.endSec = clip->effects[sourceIndex].endSec;
+
+        const int previewIndex = previewClip.effects.size();
+        previewClip.effects.append(effect);
+        const auto schema = effectctrl::paramSchemaFor(effect.type);
+        for (const auto &def : schema) {
+            const QString sourceTrackName =
+                QStringLiteral("effect.%1.%2").arg(sourceIndex).arg(def.name);
+            const KeyframeTrack *sourceTrack = clip->keyframes.track(sourceTrackName);
+            if (!sourceTrack || sourceTrack->count() <= 0)
+                continue;
+
+            const QString previewTrackName =
+                QStringLiteral("effect.%1.%2").arg(previewIndex).arg(def.name);
+            previewClip.keyframes.addTrack(
+                remapKeyframeTrack(*sourceTrack, previewTrackName));
+
+            const LoopMode loopMode = clip->keyframes.loopOutMode(sourceTrackName);
+            if (loopMode != LoopMode::None)
+                previewClip.keyframes.setLoopOutMode(previewTrackName, loopMode);
+        }
+    }
+
+    return clipanim::effectiveEffectsAt(previewClip, clipLocalSec);
+}
+
+void applyLayerMotionOpacity(const Timeline *timeline,
+                             const PlaybackEntry &entry,
+                             qint64 timelineUsec,
+                             double staticOpacity,
+                             VideoPlayer::DecodedLayer *layer)
+{
+    if (!layer)
+        return;
+
+    layer->opacity = staticOpacity;
+    layer->videoScale = entry.videoScale;
+    layer->videoDx = entry.videoDx;
+    layer->videoDy = entry.videoDy;
+    layer->rotation2DDegrees = entry.rotation2DDegrees;
+
+    const ClipInfo *clip = clipForPlaybackEntry(timeline, entry);
+    if (!clip || !clip->keyframes.hasAnyKeyframes())
+        return;
+
+    const double clipLocalSec =
+        (static_cast<double>(timelineUsec) - entry.timelineStart * 1'000'000.0)
+        / 1'000'000.0;
+    const clipgeom::ClipTransform transform =
+        clipanim::effectiveTransformAt(*clip, clipLocalSec);
+    layer->opacity =
+        clipanim::effectiveOpacityAt(*clip, clipLocalSec, staticOpacity);
+    layer->videoScale = transform.videoScale;
+    layer->videoDx = transform.videoDx;
+    layer->videoDy = transform.videoDy;
+    layer->rotation2DDegrees = transform.rotationDeg;
+}
+
+void populateLayerMetadata(const Timeline *timeline,
+                           const PlaybackEntry &entry, int seqIdx,
+                           VideoPlayer::DecodedLayer *layer)
+{
+    if (!layer)
+        return;
+    layer->sourceTrack = entry.sourceTrack;
+    layer->sourceClipIndex = entry.sourceClipIndex;
+    layer->sequenceIdx = seqIdx;
+    layer->layerStyle = entry.layerStyle;
+    if (layer->layerStyle.isIdentity()) {
+        if (const ClipInfo *clip = clipForPlaybackEntry(timeline, entry))
+            layer->layerStyle = clip->layerStyle;
+    }
+    layer->fitContain = entry.fitContain;
+    layer->fitCover = entry.fitCover;
+    layer->matteType = static_cast<TrackMatteType>(entry.matteTypeOrdinal);
+    layer->matteSourceClipId = entry.matteSourceClipId;
+    layer->parentClipId = entry.parentClipId;
+    layer->isNullObject = isNullObjectEntry(entry);
 }
 
 // Phase 1e Win #9 — canvas proxy divisor for the multi-track compose path.
@@ -185,6 +940,49 @@ private:
     QRect m_currentRect;
 };
 
+class WbEyedropperOverlay : public QWidget
+{
+public:
+    using Callback = std::function<void(QPoint)>;
+
+    explicit WbEyedropperOverlay(QWidget *parent)
+        : QWidget(parent)
+    {
+        setMouseTracking(true);
+        setFocusPolicy(Qt::StrongFocus);
+        setCursor(Qt::CrossCursor);
+        setAttribute(Qt::WA_NoSystemBackground, true);
+        setAttribute(Qt::WA_TranslucentBackground, true);
+        hide();
+    }
+
+    void setCallback(Callback cb) { m_callback = std::move(cb); }
+
+protected:
+    void mousePressEvent(QMouseEvent *e) override
+    {
+        if (e->button() == Qt::LeftButton && m_callback) {
+            m_callback(e->pos());
+            e->accept();
+            return;
+        }
+        QWidget::mousePressEvent(e);
+    }
+
+    void keyPressEvent(QKeyEvent *e) override
+    {
+        if (e->key() == Qt::Key_Escape && m_callback) {
+            m_callback(QPoint(-1, -1));
+            e->accept();
+            return;
+        }
+        QWidget::keyPressEvent(e);
+    }
+
+private:
+    Callback m_callback;
+};
+
 
 // VEDITOR_TICK_TRACE=1 turns on per-tick wall-time accumulators that print a
 // 30-tick rollup line to qInfo. Default off — read once per process so the
@@ -240,8 +1038,17 @@ QString formatTimestamp(int64_t positionUs)
 
 }
 
+void setPlaybackProxyDivisorPreference(int div)
+{
+    div = normalizePlaybackProxyDivisor(div);
+    g_playbackProxyPref.store(div, std::memory_order_relaxed);
+    QSettings("VSimpleEditor", "Preferences").setValue("playbackProxyDivisor", div);
+}
+
 VideoPlayer::VideoPlayer(QWidget *parent)
     : QWidget(parent)
+    , m_gpuEffectsEnabled(QSettings("VSimpleEditor", "Preferences")
+                              .value("gpuEffectsEnabled", true).toBool())
 {
     qInfo() << "VideoPlayer::ctor";
     setupUI();
@@ -262,6 +1069,11 @@ VideoPlayer::VideoPlayer(QWidget *parent)
     m_mixer = new AudioMixer(this);
     connect(m_mixer, &AudioMixer::decoderError, this,
             [](const QString &msg) { qWarning() << "AudioMixer:" << msg; });
+
+    // ADAPTIVE-1: 既定 ON。VEDITOR_ADAPTIVE_PREVIEW_DISABLE=1 で完全バイパス
+    // (scaleFactor 強制 1.0 + キャッシュ無効) → 従来挙動とビット同一。
+    m_adaptivePreviewEnabled =
+        qEnvironmentVariableIntValue("VEDITOR_ADAPTIVE_PREVIEW_DISABLE") == 0;
 }
 
 VideoPlayer::~VideoPlayer()
@@ -275,6 +1087,10 @@ VideoPlayer::~VideoPlayer()
     if (m_regionPickerOverlay) {
         m_regionPickerOverlay->deleteLater();
         m_regionPickerOverlay = nullptr;
+    }
+    if (m_wbEyedropperOverlay) {
+        m_wbEyedropperOverlay->deleteLater();
+        m_wbEyedropperOverlay = nullptr;
     }
     resetDecoder();
     // Tear down V2+ decoder pool after the legacy V1 decoder is gone, then
@@ -314,6 +1130,9 @@ void VideoPlayer::setupUI()
 
     m_glPreview = new GLPreview(this);
     m_glPreview->setMinimumSize(240, 135);
+    // PV-B: プレビュー右クリック → VideoPlayer 経由で MainWindow へ転送。
+    connect(m_glPreview, &GLPreview::contextMenuRequested,
+            this, &VideoPlayer::previewContextMenuRequested);
     connect(m_glPreview, &GLPreview::textRectRequested,
             this, &VideoPlayer::textRectRequested);
     connect(m_glPreview, &GLPreview::textInlineCommitted,
@@ -478,8 +1297,16 @@ void VideoPlayer::setProxyDivisor(int divisor)
     refreshDisplayedFrame();
 }
 
+void VideoPlayer::applyPlaybackQualityChanged()
+{
+    ++m_timelineRevision;
+    m_frameCache.invalidateRevision(m_timelineRevision);
+    refreshDisplayedFrame();
+}
+
 void VideoPlayer::loadFile(const QString &filePath)
 {
+    undotrace::log("loadFile:enter");
     qInfo() << "VideoPlayer::loadFile BEGIN" << filePath;
     // Audio is now driven by the independent A-track schedule via
     // setAudioSequence -> AudioMixer. loadFile only reloads the FFmpeg
@@ -495,16 +1322,20 @@ void VideoPlayer::loadFile(const QString &filePath)
     if (avformat_open_input(&m_formatCtx, pathUtf8.constData(), nullptr, nullptr) != 0) {
         qWarning() << "avformat_open_input failed for" << filePath;
         m_videoDisplay->setText("Failed to open file");
+        undotrace::log("loadFile:exit");
         return;
     }
     qInfo() << "  avformat_open_input ok";
 
+    undotrace::log("loadFile:beforeFindStream");
     if (avformat_find_stream_info(m_formatCtx, nullptr) < 0) {
         qWarning() << "avformat_find_stream_info failed";
         resetDecoder();
         m_videoDisplay->setText("Failed to read stream info");
+        undotrace::log("loadFile:exit");
         return;
     }
+    undotrace::log("loadFile:afterFindStream");
     qInfo() << "  avformat_find_stream_info ok, nb_streams=" << m_formatCtx->nb_streams;
 
     m_videoStreamIndex = -1;
@@ -518,6 +1349,7 @@ void VideoPlayer::loadFile(const QString &filePath)
     if (m_videoStreamIndex < 0) {
         resetDecoder();
         m_videoDisplay->setText("No video stream found");
+        undotrace::log("loadFile:exit");
         return;
     }
 
@@ -526,6 +1358,7 @@ void VideoPlayer::loadFile(const QString &filePath)
     if (!codec) {
         resetDecoder();
         m_videoDisplay->setText("Unsupported codec");
+        undotrace::log("loadFile:exit");
         return;
     }
 
@@ -533,8 +1366,11 @@ void VideoPlayer::loadFile(const QString &filePath)
     m_hdrInfo.primaries = codecpar->color_primaries;
     m_hdrInfo.trc = codecpar->color_trc;
     m_hdrInfo.colorspace = codecpar->color_space;
-    m_hdrInfo.bitDepth = std::max(8, av_get_bits_per_pixel(av_pix_fmt_desc_get(
-        static_cast<AVPixelFormat>(codecpar->format))) / 3);
+    // Per-component (luma) depth — null-safe and subsampling-correct.
+    // av_get_bits_per_pixel(desc)/3 collapsed 10/12-bit 4:2:0 HDR to 8-bit and
+    // would deref a null descriptor for unknown formats; pixfmtdepth reads
+    // comp[0].depth directly. Mirrors Timeline::addClip's ingest probe.
+    m_hdrInfo.bitDepth = pixfmtdepth::bitDepthFromPixFmt(codecpar->format);
     m_hdrInfo.isHdr = (codecpar->color_trc == AVCOL_TRC_SMPTE2084
                        || codecpar->color_trc == AVCOL_TRC_ARIB_STD_B67);
 
@@ -542,6 +1378,7 @@ void VideoPlayer::loadFile(const QString &filePath)
     if (!m_codecCtx || avcodec_parameters_to_context(m_codecCtx, codecpar) < 0) {
         resetDecoder();
         m_videoDisplay->setText("Failed to initialize codec");
+        undotrace::log("loadFile:exit");
         return;
     }
 
@@ -550,9 +1387,11 @@ void VideoPlayer::loadFile(const QString &filePath)
     // process-global and stateless between clips. Recreating it every
     // switch added ~22 ms of main-thread block per loadFile (debugger
     // breakdown of the 120 ms freeze on track switch).
+    undotrace::log("loadFile:beforeHwDevice");
     const bool hwDeviceReady = m_hwDeviceCtx
         || av_hwdevice_ctx_create(&m_hwDeviceCtx, AV_HWDEVICE_TYPE_D3D11VA,
                                    nullptr, nullptr, 0) >= 0;
+    undotrace::log("loadFile:afterHwDevice");
     if (hwDeviceReady) {
         for (int i = 0;; i++) {
             const AVCodecHWConfig *cfg = avcodec_get_hw_config(codec, i);
@@ -586,6 +1425,7 @@ void VideoPlayer::loadFile(const QString &filePath)
     if (avcodec_open2(m_codecCtx, codec, nullptr) < 0) {
         resetDecoder();
         m_videoDisplay->setText("Failed to open codec");
+        undotrace::log("loadFile:exit");
         return;
     }
 
@@ -595,6 +1435,7 @@ void VideoPlayer::loadFile(const QString &filePath)
     if (!m_packet || !m_frame || !m_swFrame) {
         resetDecoder();
         m_videoDisplay->setText("Failed to allocate decode buffers");
+        undotrace::log("loadFile:exit");
         return;
     }
     qInfo() << "  packet/frame allocated";
@@ -612,7 +1453,9 @@ void VideoPlayer::loadFile(const QString &filePath)
     qInfo() << "  duration=" << m_durationUs << "frameDur=" << m_frameDurationUs
             << "aspect=" << m_displayAspectRatio;
     if (m_glPreview)
-        m_glPreview->setDisplayAspectRatio(m_displayAspectRatio);
+        m_glPreview->setDisplayAspectRatio(
+            m_projectOutputSize.isValid() ? effectiveDisplayAspectRatio()
+                                          : m_displayAspectRatio);
     if (!m_suppressUiUpdates) {
         m_seekBar->setRange(0, sliderPositionForUs(m_durationUs));
         emit durationChanged(static_cast<double>(m_durationUs) / AV_TIME_BASE);
@@ -623,6 +1466,7 @@ void VideoPlayer::loadFile(const QString &filePath)
         qWarning() << "seekInternal(0) failed";
         resetDecoder();
         m_videoDisplay->setText("Failed to decode first frame");
+        undotrace::log("loadFile:exit");
         return;
     }
     qInfo() << "  seekInternal(0) ok";
@@ -640,11 +1484,19 @@ void VideoPlayer::loadFile(const QString &filePath)
 
     updatePositionUi();
     qInfo() << "VideoPlayer::loadFile END";
+    undotrace::log("loadFile:exit");
 }
 
 void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
 {
+    undotrace::log("setSeq:enter");
     qInfo() << "VideoPlayer::setSequence count=" << entries.size();
+    // ADAPTIVE-1: タイムライン編集 / undo / クリップ変更はすべて setSequence に
+    // 集約される (sequenceChanged → MainWindow → setSequence)。世代カウンタを進め、
+    // 旧世代の合成キャッシュを破棄する。これにより編集後に同一プレイヘッドへ戻った
+    // 際に古い (編集前の) 合成フレームが誤って serve されることを防ぐ。
+    ++m_timelineRevision;
+    m_frameCache.invalidateRevision(m_timelineRevision);
     m_loggedCullState = false; // re-emit [cull] diagnostic for the new project
     // Phase 1e Win #16 (Iteration 9) — invalidate any pending preroll
     // de-dup. The new sequence may renumber entries, so the cached
@@ -685,6 +1537,15 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
     }
 
     m_sequence = entries;
+    const Timeline *timeline = m_glPreview ? m_glPreview->timeline() : nullptr;
+    if (timeline) {
+        for (PlaybackEntry &entry : m_sequence) {
+            if (!entry.layerStyle.isIdentity())
+                continue;
+            if (const ClipInfo *clip = clipForPlaybackEntry(timeline, entry))
+                entry.layerStyle = clip->layerStyle;
+        }
+    }
     m_sequenceDurationUs = totalUs;
 
     // Phase 1d pool reconciliation. For every active V2+ TrackDecoder, drop
@@ -735,7 +1596,19 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
         // at the previous position.
         m_activeEntry = -1;
         if (m_playing) pause();
-        m_seekBar->setRange(0, 0);
+        // V3 sprint visibility-toggle fix (part 2): block the seek bar's
+        // valueChanged → seek(0) side effect. Shrinking the range to (0,0)
+        // forces the slider value to 0, and the valueChanged handler
+        // (ctor) would otherwise call seek(0) — which emits positionChanged(0)
+        // (snapping the Timeline playhead/timebar back to the start) AND
+        // overwrites m_timelinePositionUs to 0, defeating the position
+        // preservation intended above so re-showing the only video track no
+        // longer resumes at the prior playhead. Mirrors the QSignalBlocker
+        // already guarding setValue() in updatePositionUi()/seek-commit.
+        {
+            const QSignalBlocker seekBarBlocker(m_seekBar);
+            m_seekBar->setRange(0, 0);
+        }
         emit durationChanged(0.0);
         // US-T35 clear any OBS-style transform so a fresh import starts at
         // identity instead of inheriting the last clip's scale/offset.
@@ -746,6 +1619,26 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
         // around and the first compositor tick on the new clip flashes
         // the stale picture (paired with resetDecoder's clear).
         m_lastV1RawFrame = QImage();
+        // Defect-2 fix: 空タイムラインは黒プレビューでなければならない。
+        // 以前は m_lastSourceFrame が残り、GL プレビューも最後にアップロードした
+        // テクスチャを保持したままだった。直前の resetVideoSourceTransform() が
+        // アスペクト/コンテンツインセット補正を外すため、その stale テクスチャが
+        // アスペクト無視で引き伸ばし描画され、「undo で全クリップが消えたのに縦伸び
+        // 映像が再生され続ける」残像になっていた。source キャッシュをクリアし
+        // (refreshDisplayedFrame の null ガードで再描画を抑止)、GL プレビューを
+        // 黒フレームで上書きして stale 表示を断つ。可視トラックを全 OFF にした
+        // ケースでも「非表示 = 黒」で正しく、m_timelinePositionUs は不変。
+        m_lastSourceFrame = QImage();
+        if (m_glPreview) {
+            const QSize blankSize = m_projectOutputSize.isValid()
+                ? m_projectOutputSize
+                : QSize(m_canvasWidth  > 0 ? m_canvasWidth  : 16,
+                        m_canvasHeight > 0 ? m_canvasHeight : 16);
+            QImage blank(blankSize, QImage::Format_ARGB32_Premultiplied);
+            blank.fill(Qt::black);
+            m_glPreview->displayFrame(blank);
+        }
+        undotrace::log("setSeq:exit");
         return;
     }
 
@@ -787,6 +1680,7 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
         const qint64 cEnd   = static_cast<qint64>(chosen.timelineEnd   * AV_TIME_BASE);
         clamped = qBound(cStart, clamped, cEnd);
     }
+    desiredIdx = previewPrimaryEntryIndexAt(timeline, m_sequence, desiredIdx, clamped);
 
     const auto &target = m_sequence[desiredIdx];
     const bool needFileSwitch = (target.filePath != m_loadedFilePath) || !m_formatCtx;
@@ -808,7 +1702,12 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
             << "m_activeEntry(before)=" << m_activeEntry;
 
     if (needFileSwitch) {
+        const bool prevRetain = m_retainLastFrameAcrossLoad;
+        m_retainLastFrameAcrossLoad = true;   // preserve m_lastV1RawFrame during undo file-switch
+        undotrace::log("setSeq:beforeLoadFile");
         loadFile(target.filePath);  // resets decoder, clears m_playing
+        undotrace::log("setSeq:afterLoadFile");
+        m_retainLastFrameAcrossLoad = prevRetain;
         if (wasPlaying)
             m_playing = true;
     }
@@ -818,7 +1717,9 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
 
     if (entryStructurallyChanged) {
         const int64_t localUs = entryLocalPositionUs(desiredIdx, clamped);
+        undotrace::log("setSeq:beforeSeek");
         seekInternal(localUs, true, true);
+        undotrace::log("setSeq:afterSeek");
     }
 
     // If a sequenceChanged arrived mid-playback (e.g. a linked-clip drag was
@@ -874,6 +1775,7 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
             if (!m_playing && !m_sequence.isEmpty()) play();
         });
     }
+    undotrace::log("setSeq:exit");
 }
 
 void VideoPlayer::setAudioSequence(const QVector<PlaybackEntry> &entries)
@@ -1055,6 +1957,12 @@ bool VideoPlayer::seekToTimelineUs(int64_t timelineUs, bool precise)
     int idx = findActiveEntryAt(timelineUs);
     if (idx < 0) idx = 0;
     if (idx >= m_sequence.size()) return false;
+    idx = previewPrimaryEntryIndexAt(
+        m_glPreview ? m_glPreview->timeline() : nullptr,
+        m_sequence,
+        idx,
+        timelineUs);
+    if (idx < 0 || idx >= m_sequence.size()) return false;
 
     const auto &e = m_sequence[idx];
     const bool needSwitch = (e.filePath != m_loadedFilePath) || !m_formatCtx;
@@ -1123,6 +2031,15 @@ bool VideoPlayer::seekToTimelineUs(int64_t timelineUs, bool precise)
 
 bool VideoPlayer::advanceToEntry(int newEntryIdx)
 {
+    if (newEntryIdx < 0 || newEntryIdx >= m_sequence.size())
+        return false;
+    const qint64 nextTimelineUs =
+        static_cast<qint64>(m_sequence.at(newEntryIdx).timelineStart * AV_TIME_BASE);
+    newEntryIdx = previewPrimaryEntryIndexAt(
+        m_glPreview ? m_glPreview->timeline() : nullptr,
+        m_sequence,
+        newEntryIdx,
+        nextTimelineUs);
     if (newEntryIdx < 0 || newEntryIdx >= m_sequence.size())
         return false;
 
@@ -1351,9 +2268,9 @@ bool VideoPlayer::tryPromotePoolDecoderTo(int newEntryIdx)
         m_hdrInfo.primaries = codecpar->color_primaries;
         m_hdrInfo.trc = codecpar->color_trc;
         m_hdrInfo.colorspace = codecpar->color_space;
-        const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(
-            static_cast<AVPixelFormat>(codecpar->format));
-        m_hdrInfo.bitDepth = desc ? std::max(8, av_get_bits_per_pixel(desc) / 3) : 8;
+        // Per-component (luma) depth — see loadFile note. pixfmtdepth is
+        // null-safe and subsampling-correct (was av_get_bits_per_pixel/3).
+        m_hdrInfo.bitDepth = pixfmtdepth::bitDepthFromPixFmt(codecpar->format);
         m_hdrInfo.isHdr = (codecpar->color_trc == AVCOL_TRC_SMPTE2084
                            || codecpar->color_trc == AVCOL_TRC_ARIB_STD_B67);
     }
@@ -1370,7 +2287,9 @@ bool VideoPlayer::tryPromotePoolDecoderTo(int newEntryIdx)
         }
     }
     if (m_glPreview) {
-        m_glPreview->setDisplayAspectRatio(m_displayAspectRatio);
+        m_glPreview->setDisplayAspectRatio(
+            m_projectOutputSize.isValid() ? effectiveDisplayAspectRatio()
+                                          : m_displayAspectRatio);
         // Architect NIT-1: route GLPreview to the device backing the NEW
         // primary (pool D3D11Device*), not sharedD3D11Device()'s default
         // preference for legacy m_hwDeviceCtx. Without this override the
@@ -1414,7 +2333,40 @@ void VideoPlayer::setCanvasSize(int width, int height)
         m_videoDisplay->setText(QString("%1x%2 %3\nDrop a video file or use File > Open")
             .arg(width).arg(height).arg(orientation));
     } else {
-        refreshDisplayedFrame();
+        if (m_projectOutputSize.isValid()) {
+            if (!m_pendingSizeRefresh) {
+                m_pendingSizeRefresh = true;
+                QTimer::singleShot(0, this, [this]() {
+                    m_pendingSizeRefresh = false;
+                    refreshDisplayedFrame();
+                });
+            }
+        } else {
+            refreshDisplayedFrame();   // default project: synchronous, bit-identical
+        }
+    }
+}
+
+void VideoPlayer::setProjectOutputSize(const QSize &size)
+{
+    const QSize normalized = size.isValid() ? size : QSize();
+    if (m_projectOutputSize == normalized)
+        return;
+    m_projectOutputSize = normalized;
+    if (m_glPreview)
+        m_glPreview->setDisplayAspectRatio(
+            m_projectOutputSize.isValid() ? effectiveDisplayAspectRatio()
+                                          : m_displayAspectRatio);
+    if (m_projectOutputSize.isValid()) {
+        if (!m_pendingSizeRefresh) {
+            m_pendingSizeRefresh = true;
+            QTimer::singleShot(0, this, [this]() {
+                m_pendingSizeRefresh = false;
+                refreshDisplayedFrame();
+            });
+        }
+    } else {
+        refreshDisplayedFrame();   // default project: synchronous, bit-identical
     }
 }
 
@@ -1431,6 +2383,15 @@ void VideoPlayer::play()
 
     if (m_playing)
         return;
+
+    // ADAPTIVE-1: 新しい再生セッションはフル品質から開始する。前回の再生で
+    // 下がった scaleFactor を引き継がないよう policy をリセットする (guard 通過後
+    // = 実際に再生を開始するときだけ。debounce/既再生の早期 return では触らない)。
+    // 以降の tick が updateAdaptiveQuality() で実測に応じて再度ラダーを下げる。
+    m_qualityPolicy.reset();
+    m_adaptiveCanvasDivisor = 1;
+    m_adaptiveQualityTier = 0;
+    m_lastTickRenderMs = 0.0;
 
     // Phase 1e Win #12 — Fix J: collapse rapid play() bursts. The
     // scheduleNextFrame !advanced safety-net (line 2911-2923) auto-pauses
@@ -1738,7 +2699,36 @@ void VideoPlayer::forceTimelineUiToCurrent()
 void VideoPlayer::stop()
 {
     pause();
-    seekInternal(0, true, true);
+    // ADAPTIVE-1: 停止は静止画フル品質提示。品質ポリシーを 1.0 にリセットし、
+    // 続く sequence-aware seek (performPendingSeek → seekInternal → displayFrame)
+    // がフル解像度で 1 回だけ再描画されるようにする。新たな displayFrame 呼び出しや
+    // 再描画ループはここでは起こさない (停止フリッカー修正の不変条件を維持)。
+    m_qualityPolicy.reset();
+    m_adaptiveCanvasDivisor = 1;
+    m_adaptiveQualityTier = 0;
+    m_lastTickRenderMs = 0.0;
+    if (m_seekTimer)
+        m_seekTimer->stop();
+    // Rewind to the head. In sequence (timeline) mode the head is TIMELINE 0,
+    // which MUST go through the sequence-aware seek path (seekToTimelineUs via
+    // performPendingSeek). A raw file-local seekInternal(0) leaves the timeline
+    // position projection stale — updatePositionUi() then rejects the large
+    // delta, so the seek bar never returns to 0 and the preview can desync to a
+    // black frame. Run the seek synchronously here exactly once.
+    if (sequenceActive()) {
+        m_pendingSeekMs = 0;
+        m_pendingSeekPrecise = true;
+        performPendingSeek();
+    } else {
+        seekInternal(0, true, true);
+    }
+    // Discard any deferred scrub/preview seek left armed so it can't repaint
+    // over the head frame after this returns (defence against the post-stop
+    // repaint loop).
+    if (m_seekTimer)
+        m_seekTimer->stop();
+    m_pendingSeekMs = -1;
+    m_pendingSeekPrecise = false;
     if (m_mixer) {
         m_mixer->stop();
         m_mixer->seekTo(0);
@@ -1905,8 +2895,101 @@ bool VideoPlayer::canUseInteropFastPath(const AVFrame *frame) const
     return false;
 }
 
+void VideoPlayer::displaySeekFrameConformed(const QImage &v1Image)
+{
+    if (!m_projectOutputSize.isValid()) {
+        displayFrame(v1Image);
+        return;
+    }
+
+    QImage canvas(m_projectOutputSize, QImage::Format_ARGB32_Premultiplied);
+    canvas.fill(Qt::black);
+
+    const PlaybackEntry *entry = nullptr;
+    if (sequenceActive()
+        && m_activeEntry >= 0
+        && m_activeEntry < m_sequence.size()) {
+        entry = &m_sequence[m_activeEntry];
+    }
+
+    const bool fitContain = entry ? entry->fitContain : false;
+    const bool fitCover = entry ? entry->fitCover : false;
+    {
+        double insetFw = 1.0, insetFh = 1.0;
+        if (fitContain && !fitCover) {
+            snsfit::containContentInset(v1Image.size(), m_projectOutputSize, insetFw, insetFh);
+        }
+        if (m_glPreview)
+            m_glPreview->setVideoContentInset(insetFw, insetFh);
+    }
+    QImage conformed = snsfit::maybeFit(v1Image, fitContain, fitCover, m_projectOutputSize);
+
+    DecodedLayer layer;
+    layer.rgb = conformed;
+    layer.opacity = 1.0;
+    if (entry) {
+        layer.colorMeta = entry->colorMeta;
+        applyLayerMotionOpacity(m_glPreview ? m_glPreview->timeline() : nullptr,
+                                *entry, m_timelinePositionUs, layer.opacity, &layer);
+        populateLayerMetadata(m_glPreview ? m_glPreview->timeline() : nullptr,
+                              *entry, m_activeEntry, &layer);
+    }
+    layer.fitContain = fitContain;
+    layer.fitCover = fitCover;
+    layer.isFresh = true;
+
+    QVector<DecodedLayer> singleLayer;
+    singleLayer.append(layer);
+    composeMultiTrackFrameInto(canvas, singleLayer);
+    if (m_glPreview)
+        m_glPreview->setCompositeBakedMode(true);
+    m_lastFrameOdtApplied = false;
+    displayFrame(canvas);
+}
+
+bool VideoPlayer::pushActiveClipColorCorrectionToGlPreview()
+{
+    // Baked/composited frames already include per-clip grade. When the
+    // user disables GPU preview effects, keep GLPreview's shader state
+    // unchanged so static grade remains available through the legacy path.
+    if (!m_useGL || !m_glPreview)
+        return false;
+    if (!m_gpuEffectsEnabled) {
+        return false;
+    }
+    if (m_glPreview->compositeBakedMode())
+        return false;
+    if (!sequenceActive()
+        || m_activeEntry < 0
+        || m_activeEntry >= m_sequence.size()) {
+        return false;
+    }
+
+    const Timeline *timeline = m_glPreview->timeline();
+    const PlaybackEntry &entry = m_sequence[m_activeEntry];
+    const ClipInfo *clip = clipForPlaybackEntry(timeline, entry);
+    if (!clip)
+        return false;
+
+    const double clipLocalSec = entryClipLocalSeconds(entry, m_timelinePositionUs);
+    const ColorCorrection effective =
+        clipanim::effectiveColorCorrectionAt(*clip, clipLocalSec);
+    m_glPreview->setColorCorrection(effective);
+    return true;
+}
+
+bool VideoPlayer::pushActiveClipColorCorrectionToGlPreviewForTest(qint64 timelineUsec)
+{
+    const qint64 previousTimelineUsec = m_timelinePositionUs;
+    m_timelinePositionUs = timelineUsec;
+    const bool pushed = pushActiveClipColorCorrectionToGlPreview();
+    m_timelinePositionUs = previousTimelineUsec;
+    return pushed;
+}
+
 void VideoPlayer::displayFrame(const QImage &image)
 {
+    undotrace::log("displayFrame:enter");
     m_lastSourceFrame = image;
     QImage composed = composeFrameWithOverlays(image);
 
@@ -1986,8 +3069,96 @@ void VideoPlayer::displayFrame(const QImage &image)
         }
     }
 
+    // AR-2: ACES シーンリファード色管理を最終フレームへ適用する。enabled=false の
+    // ときは一切呼ばず (applyPipelineToImage 自体も enabled=false なら no-op だが、
+    // 関数呼び出しと QImage 共有コピーすら避けて従来パスとビット同一を厳守する)。
+    // レガシー Exporter は Exporter 側でのみ適用するため、composeFrameWithOverlays /
+    // renderFrameAt の共通コアには ACES を入れていない (二重適用回避)。
+    if (m_acesPipeline.enabled && !composed.isNull() && !m_lastFrameOdtApplied) {
+        composed = aces::applyPipelineToImage(composed, m_acesPipeline);
+    }
+
     m_currentFrameImage = composed;
     emit frameComposited(composed);
+
+    // EXP-AID: 露出/フォーカス確認エイド (フォルスカラー / ゼブラ / フォーカスピーキング)。
+    // これは画面確認専用のオーバーレイなので「表示用の一時コピー」にだけ適用し、
+    // m_currentFrameImage / frameComposited のペイロード / 合成キャッシュ
+    // (cachePreviewComposite は displayFrame より前で素のフレームを put 済み) は
+    // 一切汚さない。mode == None (既定) のときは apply を呼ばず composed をそのまま
+    // 使うので従来パスとビット同一・性能無影響。書き出し (renderFrameAt /
+    // TimelineFrameRenderer / RenderQueue / Exporter) はこの経路を通らないため、
+    // エイドが書き出し画に焼き込まれることはない。displayFrame 1 回あたりの画像
+    // 加工が 1 つ増えるだけで、displayFrame の発火回数は不変 (1 tick = 最大 1 frame)。
+    // 精度が必要なエッジ/輝度判定のためエイドは PV-C 縮小前の full res に適用し、
+    // aid=None + cap=0 の既定パスは従来どおり composed をそのまま表示へ渡す。
+    QImage display = composed;
+    if (m_exposureAidMode != exposureaid::AidMode::None && !display.isNull()) {
+        display = exposureaid::apply(display, m_exposureAidMode, m_exposureAidConfig);
+    }
+    auto applyPreviewCap = [this](const QImage &src) {
+        if (m_previewMaxLongSide > 0 && !src.isNull()
+            && qMax(src.width(), src.height()) > m_previewMaxLongSide) {
+            return (src.width() >= src.height())
+                ? src.scaledToWidth(m_previewMaxLongSide, Qt::SmoothTransformation)
+                : src.scaledToHeight(m_previewMaxLongSide, Qt::SmoothTransformation);
+        }
+        return src;
+    };
+
+    if (m_onionSkin.enabled && !display.isNull()) {
+        // SAFE-ZONE: onion skin 有効時はユーザー指定どおり full-res の表示用コピーへ
+        // セーフゾーンを先に焼き、ghost 合成後に PV-C 縮小する。書き出しは非通過。
+        if (m_safeZonePlatform != safezone::Platform::None)
+            display = safezone::apply(display, m_safeZonePlatform);
+
+        // ONION-SKIN: renderFrameAt は独立した libav decoder を開く SSOT 経路。
+        // 再生中は重い前後フレーム decode を避け、通常のプレビュー描画だけ継続する。
+        if (!m_playing) {
+            QVector<QImage> before;
+            QVector<QImage> after;
+            const Timeline *tl = m_glPreview ? m_glPreview->timeline() : nullptr;
+            const qint64 durationUs = (m_sequenceDurationUs > 0)
+                ? m_sequenceDurationUs
+                : (tl ? static_cast<qint64>(tl->totalDuration() * AV_TIME_BASE) : 0);
+            const qint64 frameUs = (m_frameDurationUs > 0)
+                ? m_frameDurationUs
+                : (AV_TIME_BASE / 30);
+            const qint64 posUs = sequenceActive() ? m_timelinePositionUs : m_currentPositionUs;
+
+            auto collectGhosts = [&](int count, int direction, QVector<QImage> *out) {
+                if (!tl || !out || count <= 0 || durationUs <= 0 || frameUs <= 0)
+                    return;
+                for (int k = 1; k <= count; ++k) {
+                    const qint64 targetUs = posUs + static_cast<qint64>(direction) * frameUs * k;
+                    if (targetUs < 0 || targetUs > durationUs)
+                        continue;
+                    const QImage ghost = tlrender::renderFrameAt(tl, targetUs, display.size());
+                    if (!ghost.isNull())
+                        out->append(ghost);
+                }
+            };
+            collectGhosts(qMax(0, m_onionSkin.framesBefore), -1, &before);
+            collectGhosts(qMax(0, m_onionSkin.framesAfter), 1, &after);
+            if (!before.isEmpty() || !after.isEmpty())
+                display = onionskin::compose(display, before, after, m_onionSkin);
+        }
+
+        // PV-C: プレビュー最大解像度キャップ。onion skin 合成後の display 専用コピーにだけ
+        // 縮小を掛け、GL アップロード/描画/スコープ前段の負荷を軽くする。
+        display = applyPreviewCap(display);
+    } else {
+        // PV-C: プレビュー最大解像度キャップ。エイド適用後の display 専用コピーにだけ
+        // 縮小を掛け、GL アップロード/描画/スコープ前段の負荷を軽くする。
+        // m_currentFrameImage / frameComposited (上で full res 送出済) と書き出し
+        // (renderFrameAt 系=この経路を通らない) は不変。0=無制限で従来ビット同一。
+        display = applyPreviewCap(display);
+        // SAFE-ZONE: SNS セーフゾーンオーバーレイ。display-local 適用のみ。export 非通過。
+        if (m_safeZonePlatform != safezone::Platform::None && !display.isNull()) {
+            display = safezone::apply(display, m_safeZonePlatform);
+        }
+    }
+
     if (m_useGL && m_glPreview) {
         m_glPreview->setDisplayAspectRatio(effectiveDisplayAspectRatio());
         int hdrTransfer = 0;
@@ -2015,10 +3186,13 @@ void VideoPlayer::displayFrame(const QImage &image)
         } else {
             m_glPreview->setStabilizerKeyframes({});
         }
-        m_glPreview->displayFrame(composed);
+        pushActiveClipColorCorrectionToGlPreview();
+        undotrace::log("displayFrame:beforeGL");
+        m_glPreview->displayFrame(display);
+        undotrace::log("displayFrame:afterGL");
     } else {
         const QSize targetSize = fittedDisplaySize(m_videoDisplay->size());
-        const QPixmap pixmap = QPixmap::fromImage(composed);
+        const QPixmap pixmap = QPixmap::fromImage(display);
         m_videoDisplay->setPixmap(pixmap.scaled(targetSize, Qt::IgnoreAspectRatio, Qt::SmoothTransformation));
     }
 }
@@ -2062,18 +3236,27 @@ QImage VideoPlayer::composeFrameWithOverlays(const QImage &source) const
     if (source.isNull())
         return source;
 
-    const bool applyPreviewFx = !m_previewEffects.isEmpty()
+    const bool wantsPreviewFx = !m_previewEffects.isEmpty()
                                 && (m_previewEffectsLive || !m_playing);
+    const qint64 previewTimelineUsec =
+        sequenceActive() ? m_timelinePositionUs : m_currentPositionUs;
+    const QVector<VideoEffect> previewEffects = wantsPreviewFx
+        ? effectivePreviewEffectsAt(m_previewEffects,
+                                    m_glPreview ? m_glPreview->timeline() : nullptr,
+                                    m_sequence,
+                                    previewTimelineUsec)
+        : QVector<VideoEffect>();
+    const bool applyPreviewFx = !previewEffects.isEmpty();
 
     // Preview proxy: only shrink during playback, keep paused frames full-res.
     const int proxy = (applyPreviewFx && m_playing) ? qMax(1, m_proxyDivisor) : 1;
-    auto runProxy = [proxy, this](const QImage &img) {
+    auto runProxy = [proxy, &previewEffects](const QImage &img) {
         if (proxy <= 1)
-            return VideoEffectProcessor::applyEffectStack(img, {}, m_previewEffects);
+            return VideoEffectProcessor::applyEffectStack(img, {}, previewEffects);
         const QImage small = img.scaled(img.width() / proxy, img.height() / proxy,
                                         Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
         const QImage processed = VideoEffectProcessor::applyEffectStack(
-            small, {}, m_previewEffects);
+            small, {}, previewEffects);
         return processed.scaled(img.width(), img.height(),
                                 Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
     };
@@ -2083,163 +3266,33 @@ QImage VideoPlayer::composeFrameWithOverlays(const QImage &source) const
         return runProxy(source);
     }
 
-    const double nowSec = static_cast<double>(
-        sequenceActive() ? m_timelinePositionUs : m_currentPositionUs) / AV_TIME_BASE;
+    const double nowSec = static_cast<double>(previewTimelineUsec) / AV_TIME_BASE;
 
-    QImage composed = source.convertToFormat(QImage::Format_ARGB32_Premultiplied);
-    QPainter p(&composed);
-    p.setRenderHint(QPainter::Antialiasing, true);
-    p.setRenderHint(QPainter::TextAntialiasing, true);
-
-    const int W = composed.width();
-    const int H = composed.height();
     // US-T32 WYSIWYG: the inline text tool draws at the literal pointSize
     // in widget coordinates. When compose bakes overlays into the source
     // image at (W,H) and GLPreview later scales it to the current letterbox
     // for display, the display scale is letterboxH/H. To land at the same
     // visible pointSize we inverse-scale by H/letterboxH so the committed
-    // text matches the inline input size 1:1 on screen.
-    double letterboxH = static_cast<double>(H);
+    // text matches the inline input size 1:1 on screen. (Headless / export:
+    // m_glPreview is null -> letterboxH = H -> fontScale = 1.0, which is
+    // exactly what the SSOT renderer passes textbake::bakeOverlays directly.)
+    const double H = static_cast<double>(source.height());
+    double letterboxH = H;
     if (m_glPreview) {
         const QRectF lb = m_glPreview->letterboxRect();
         if (lb.height() > 0.0 && std::isfinite(lb.height()))
             letterboxH = lb.height();
     }
-    const double fontScale = (letterboxH > 0.0)
-        ? (static_cast<double>(H) / letterboxH)
-        : 1.0;
-    for (int i = 0; i < m_textOverlays.size(); ++i) {
-        if (i == m_hiddenTextOverlayIndex) continue;
-        const auto &ov = m_textOverlays[i];
-        if (!ov.visible || ov.text.isEmpty()) continue;
-        const double start = ov.startTime;
-        const double end   = (ov.endTime > 0.0) ? ov.endTime : 1e18;
-        if (nowSec < start || nowSec >= end) continue;
+    const double fontScale = (letterboxH > 0.0) ? (H / letterboxH) : 1.0;
 
-        QFont font = ov.font;
-        font.setPointSizeF(qMax(1.0, font.pointSizeF() * fontScale));
-        p.setFont(font);
-
-        const QFontMetrics fm(font);
-        int boxW = qMax(1, static_cast<int>(ov.width  * W));
-        int boxH = qMax(1, static_cast<int>(ov.height * H));
-        if (ov.width <= 0.0 || ov.height <= 0.0) {
-            const QSize textSize = fm.boundingRect(ov.text).size();
-            boxW = textSize.width() + 16;
-            boxH = textSize.height() + 8;
-        }
-        double ovX = ov.x;
-        double ovY = ov.y;
-        const double ovRelTime = nowSec - ov.startTime;
-        if (!ov.positionKeyframes.isEmpty()) {
-            const auto &kfs = ov.positionKeyframes;
-            if (ovRelTime <= kfs.first().time) {
-                ovX = kfs.first().cx;
-                ovY = kfs.first().cy;
-            } else if (ovRelTime >= kfs.last().time) {
-                ovX = kfs.last().cx;
-                ovY = kfs.last().cy;
-            } else {
-                for (int k = 0; k < kfs.size() - 1; ++k) {
-                    if (ovRelTime >= kfs[k].time && ovRelTime <= kfs[k + 1].time) {
-                        double t = (ovRelTime - kfs[k].time) / (kfs[k + 1].time - kfs[k].time);
-                        ovX = kfs[k].cx + (kfs[k + 1].cx - kfs[k].cx) * t;
-                        ovY = kfs[k].cy + (kfs[k + 1].cy - kfs[k].cy) * t;
-                        break;
-                    }
-                }
-            }
-        }
-        const int cx = static_cast<int>(ovX * W);
-        const int cy = static_cast<int>(ovY * H);
-        QRect box(cx - boxW / 2, cy - boxH / 2, boxW, boxH);
-
-        if (ov.backgroundColor.alpha() > 0)
-            p.fillRect(box, ov.backgroundColor);
-
-        // Match QPainter::drawText(rect, AlignCenter|TextWordWrap, text) so
-        // the committed render lands at the exact same position as the inline
-        // text tool (widget-space drawText uses fm.boundingRect(rect,flags)
-        // internally; horizontalAdvance + fm.height() drifts by 1-2 px on
-        // certain glyph runs because horizontalAdvance includes right-side
-        // bearing while the visual glyph rect doesn't).
-        const QRect textRect = fm.boundingRect(
-            box, Qt::AlignCenter | Qt::TextWordWrap, ov.text);
-        const int baselineX = textRect.left();
-        const int baselineY = textRect.top() + fm.ascent();
-        QPainterPath path;
-        path.addText(baselineX, baselineY, font, ov.text);
-
-        if (ov.outlineWidth > 0 && ov.outlineColor.alpha() > 0) {
-            QPen outline(ov.outlineColor);
-            outline.setWidthF(ov.outlineWidth * fontScale);
-            outline.setJoinStyle(Qt::RoundJoin);
-            outline.setCapStyle(Qt::RoundCap);
-            p.strokePath(path, outline);
-        }
-
-        if (ov.gradientEnabled) {
-            const QRectF bb = path.boundingRect();
-            const QPointF center = bb.center();
-
-            // Build the effective stop list. Prefer multi-stop gradientStops;
-            // fall back to the legacy 2-stop (+ midpoint) on empty.
-            QVector<GradientStop> stops;
-            if (ov.gradientStops.size() >= 2) {
-                stops = ov.gradientStops;
-            } else {
-                const QColor a = ov.gradientReverse ? ov.gradientEnd   : ov.gradientStart;
-                const QColor b = ov.gradientReverse ? ov.gradientStart : ov.gradientEnd;
-                GradientStop s0, s1;
-                s0.position = 0.0; s0.color = a; s0.opacity = a.alphaF();
-                s1.position = 1.0; s1.color = b; s1.opacity = b.alphaF();
-                stops = { s0, s1 };
-                const double midT = qBound(0.01, ov.gradientMidpoint / 100.0, 0.99);
-                GradientStop sm;
-                sm.position = midT;
-                sm.color = QColor(
-                    (a.red()   + b.red())   / 2,
-                    (a.green() + b.green()) / 2,
-                    (a.blue()  + b.blue())  / 2,
-                    (a.alpha() + b.alpha()) / 2);
-                sm.opacity = 0.5 * (a.alphaF() + b.alphaF());
-                stops.insert(1, sm);
-            }
-            if (ov.gradientReverse && !ov.gradientStops.isEmpty()) {
-                for (auto &s : stops) s.position = 1.0 - s.position;
-                std::sort(stops.begin(), stops.end(),
-                          [](const GradientStop &a, const GradientStop &b){ return a.position < b.position; });
-            }
-            auto applyStops = [&](QGradient &g) {
-                for (const auto &s : stops) {
-                    QColor c = s.color;
-                    c.setAlphaF(qBound(0.0, s.opacity, 1.0));
-                    g.setColorAt(qBound(0.0, s.position, 1.0), c);
-                }
-            };
-
-            if (ov.gradientType == 1) {
-                // Radial: center the gradient on the text bbox, radius = half diagonal
-                const double r = 0.5 * std::hypot(bb.width(), bb.height());
-                QRadialGradient grad(center, r);
-                applyStops(grad);
-                p.fillPath(path, grad);
-            } else {
-                // Linear: project bbox onto angle so colors hit bbox edges exactly
-                const double rad = qDegreesToRadians(ov.gradientAngle);
-                const double dx = std::cos(rad);
-                const double dy = std::sin(rad);
-                const double halfSpan = 0.5 * (std::abs(bb.width() * dx) + std::abs(bb.height() * dy));
-                const QPointF offset(dx * halfSpan, dy * halfSpan);
-                QLinearGradient grad(center - offset, center + offset);
-                applyStops(grad);
-                p.fillPath(path, grad);
-            }
-        } else {
-            p.fillPath(path, ov.color);
-        }
-    }
-    p.end();
+    // The actual fonts/keyframe/outline/gradient bake is the SINGLE shared
+    // implementation textbake::bakeOverlays (extracted verbatim from this
+    // function). The SSOT renderer's worker-thread export path calls the
+    // SAME function directly (no VideoPlayer / no QWidget off the GUI
+    // thread), so an exported frame's text pixel-matches this preview bake
+    // by construction.
+    const QImage composed = textbake::bakeOverlays(
+        source, m_textOverlays, nowSec, m_hiddenTextOverlayIndex, fontScale);
     if (applyPreviewFx)
         return runProxy(composed);
     return composed;
@@ -2257,6 +3310,7 @@ void VideoPlayer::setHiddenTextOverlayIndex(int index)
 // receives the QRect in source-frame pixel coordinates.
 void VideoPlayer::enterRegionPickerMode(std::function<void(QRect)> callback)
 {
+    exitWbEyedropperMode();
     exitRegionPickerMode();
     if (!callback || !m_glPreview) return;
     m_regionPickerCallback = std::move(callback);
@@ -2318,6 +3372,64 @@ void VideoPlayer::exitRegionPickerMode()
     }
 }
 
+void VideoPlayer::enterWbEyedropperMode(std::function<void(QColor)> callback)
+{
+    exitRegionPickerMode();
+    exitWbEyedropperMode();
+    if (!callback || !m_glPreview)
+        return;
+
+    m_wbEyedropperCallback = std::move(callback);
+    m_wbEyedropperActive = true;
+
+    QStackedWidget *stack = qobject_cast<QStackedWidget *>(m_glPreview->parentWidget());
+    const QRect overlayGeo = stack ? stack->geometry() : m_glPreview->geometry();
+
+    auto *picker = new WbEyedropperOverlay(this);
+    m_wbEyedropperOverlay = picker;
+    m_wbEyedropperOverlay->setGeometry(overlayGeo);
+
+    picker->setCallback([this](QPoint widgetPos) {
+        if (!m_wbEyedropperCallback)
+            return;
+
+        QColor sampled;
+        if (widgetPos.x() >= 0 && widgetPos.y() >= 0
+            && m_glPreview && !m_currentFrameImage.isNull()) {
+            const QRectF lb = m_glPreview->letterboxRect();
+            if (lb.width() > 1.0 && lb.height() > 1.0
+                && lb.contains(QPointF(widgetPos))) {
+                const int srcW = m_currentFrameImage.width();
+                const int srcH = m_currentFrameImage.height();
+                const double sx = static_cast<double>(srcW) / lb.width();
+                const double sy = static_cast<double>(srcH) / lb.height();
+                const int px = qBound(0, static_cast<int>((widgetPos.x() - lb.x()) * sx), srcW - 1);
+                const int py = qBound(0, static_cast<int>((widgetPos.y() - lb.y()) * sy), srcH - 1);
+                sampled = m_currentFrameImage.pixelColor(px, py);
+            }
+        }
+
+        auto cb = std::move(m_wbEyedropperCallback);
+        m_wbEyedropperCallback = nullptr;
+        exitWbEyedropperMode();
+        cb(sampled);
+    });
+
+    m_wbEyedropperOverlay->show();
+    m_wbEyedropperOverlay->raise();
+    m_wbEyedropperOverlay->setFocus();
+}
+
+void VideoPlayer::exitWbEyedropperMode()
+{
+    m_wbEyedropperActive = false;
+    m_wbEyedropperCallback = nullptr;
+    if (m_wbEyedropperOverlay) {
+        m_wbEyedropperOverlay->deleteLater();
+        m_wbEyedropperOverlay = nullptr;
+    }
+}
+
 // US-EF-2: enter mask drawing mode. Reuses the US-WIRE-3 region picker
 // overlay (same drag-rect UX) but the callback receives a normalized
 // QRectF in [0..1] vTexCoord space — derived from the source-frame pixel
@@ -2361,13 +3473,80 @@ void VideoPlayer::setColorCorrection(const ColorCorrection &cc)
         m_glPreview->setColorCorrection(cc);
 }
 
+void VideoPlayer::setAcesPipeline(const aces::AcesPipeline &pipeline)
+{
+    // AR-2: MainWindow SSOT (m_acesPipeline) をプレビューへ反映する。displayFrame は
+    // enabled=true のときだけ最終合成結果へ aces::applyPipelineToImage を適用するので、
+    // ここでは設定を保持し、表示中フレームを即再描画して反映するだけでよい。
+    // refreshDisplayedFrame は m_lastSourceFrame (合成前の生フレーム) から
+    // composeFrameWithOverlays を再実行 → displayFrame へ流すため、新しい
+    // ACES 設定が即座に効く。null キャッシュ時は次の通常 tick / seek で反映される。
+    m_acesPipeline = pipeline;
+    refreshDisplayedFrame();
+}
+
+void VideoPlayer::setExposureAidMode(exposureaid::AidMode mode)
+{
+    // EXP-AID: 露出/フォーカス確認エイドのモードを切り替える。値を保持するだけで、
+    // 実際の加工は displayFrame が表示直前に「表示用 QImage の一時コピー」へ行う
+    // (キャッシュ / 保持フレーム / 書き出しには非適用)。refreshDisplayedFrame は
+    // m_lastSourceFrame (合成前の生フレーム) から composeFrameWithOverlays を
+    // 再実行 → displayFrame へ流すので、一時停止中でも即座に反映される。
+    if (m_exposureAidMode == mode)
+        return;
+    m_exposureAidMode = mode;
+    refreshDisplayedFrame();
+}
+
+void VideoPlayer::setPreviewMaxLongSide(int px)
+{
+    // PV-C: 0=無制限。負値は 0 に丸める。変化時のみ現在フレームを再描画。
+    const int next = (px > 0) ? px : 0;
+    if (m_previewMaxLongSide == next)
+        return;
+    m_previewMaxLongSide = next;
+    refreshDisplayedFrame();
+}
+
+void VideoPlayer::setSafeZonePlatform(safezone::Platform p)
+{
+    // SAFE-ZONE: SNS セーフゾーンオーバーレイのプラットフォームを切り替える。
+    // 実際の描画は displayFrame が表示直前に「表示用 QImage の一時コピー」へ行う
+    // (キャッシュ / 保持フレーム / 書き出しには非適用)。
+    if (m_safeZonePlatform == p)
+        return;
+    m_safeZonePlatform = p;
+    refreshDisplayedFrame();
+}
+
+void VideoPlayer::setOnionSkinConfig(const onionskin::Config &cfg)
+{
+    // ONION-SKIN: 前後フレームの半透明オーバーレイを切り替える。表示用 QImage の
+    // 一時コピーだけを加工し、renderFrameAt / Exporter / RenderQueue には焼き込まない。
+    const bool same = m_onionSkin.enabled == cfg.enabled
+        && m_onionSkin.framesBefore == cfg.framesBefore
+        && m_onionSkin.framesAfter == cfg.framesAfter
+        && std::abs(m_onionSkin.opacity - cfg.opacity) < 1e-9
+        && m_onionSkin.tintColors == cfg.tintColors;
+    if (same)
+        return;
+    m_onionSkin = cfg;
+    refreshDisplayedFrame();
+}
+
+void VideoPlayer::setExposureAidConfig(const exposureaid::AidConfig &cfg)
+{
+    // EXP-AID: しきい値・縞幅・感度・色などのパラメータを更新する。モードと同じく
+    // 表示直前の一時加工にしか使われない。
+    m_exposureAidConfig = cfg;
+    refreshDisplayedFrame();
+}
+
 void VideoPlayer::setPreviewEffects(const QVector<VideoEffect> &effects, bool live)
 {
     m_previewEffectsLive = live;
 
-    const bool gpuEnabled = QSettings("VSimpleEditor", "Preferences")
-                                .value("gpuEffectsEnabled", true).toBool()
-                            && m_useGL && m_glPreview;
+    const bool gpuEnabled = m_gpuEffectsEnabled && m_useGL && m_glPreview;
 
     QVector<VideoEffect> gpu;
     QVector<VideoEffect> cpu;
@@ -2379,8 +3558,9 @@ void VideoPlayer::setPreviewEffects(const QVector<VideoEffect> &effects, bool li
             e.type == VideoEffectType::Grayscale ||
             e.type == VideoEffectType::Invert    ||
             e.type == VideoEffectType::Vignette;
-        if (gpuEnabled && gpuCapable) gpu.append(e);
-        else                          cpu.append(e);
+        const bool hasTiming = e.startSec >= 0.0 || e.endSec >= 0.0;
+        if (gpuEnabled && gpuCapable && !hasTiming) gpu.append(e);
+        else                                        cpu.append(e);
     }
 
     m_previewEffects = cpu;
@@ -2388,6 +3568,13 @@ void VideoPlayer::setPreviewEffects(const QVector<VideoEffect> &effects, bool li
         m_glPreview->setVideoEffects(gpu);
 
     refreshDisplayedFrame();
+}
+
+void VideoPlayer::setGpuEffectsEnabled(bool enabled)
+{
+    if (m_gpuEffectsEnabled == enabled)
+        return;
+    m_gpuEffectsEnabled = enabled;
 }
 
 void VideoPlayer::setGLAcceleration(bool enabled)
@@ -2820,6 +4007,16 @@ void VideoPlayer::performPendingSeek()
     // correct file-local position for the new playhead.
     m_postSeekResyncRequested = true;
 
+    // ADAPTIVE-1: シーク確定 (scrub 終了 / 明示シーク) は静止画提示でもある。
+    // 品質ポリシーを 1.0 にリセットし、次 tick / 静止再描画がフル解像度で合成される
+    // ようにする (停止画くっきり)。seekInternal/seekToTimelineUs が既に displayFrame
+    // を 1 回呼んでいるので、ここでは新たな displayFrame / 再描画ループは起こさない
+    // (フリッカー再発防止: 1 経路 = 最大 1 frame を維持)。
+    m_qualityPolicy.reset();
+    m_adaptiveCanvasDivisor = 1;
+    m_adaptiveQualityTier = 0;
+    m_lastTickRenderMs = 0.0;
+
     if (m_pendingSeekMs >= 0) {
         if (m_seekTimer)
             m_seekTimer->start();
@@ -2890,6 +4087,7 @@ void VideoPlayer::updatePositionUi()
 
 bool VideoPlayer::seekInternal(int64_t positionUs, bool displayFrame, bool precise)
 {
+    undotrace::log("seek:enter");
     if (!m_formatCtx || !m_codecCtx || m_videoStreamIndex < 0)
         return false;
 
@@ -2909,11 +4107,14 @@ bool VideoPlayer::seekInternal(int64_t positionUs, bool displayFrame, bool preci
     }
 
     bool foundFrame = false;
+    undotrace::log("seek:beforeDecodeLoop");
     while (decodeNextFrame(false)) {
+        undotrace::log("seek:decodeIter");
         foundFrame = true;
         if (!precise || m_currentPositionUs >= targetUs)
             break;
     }
+    undotrace::log("seek:afterDecodeLoop");
 
     if (foundFrame && m_frame) {
         AVFrame *displayable = ensureSwFrame(m_frame);
@@ -2922,7 +4123,21 @@ bool VideoPlayer::seekInternal(int64_t positionUs, bool displayFrame, bool preci
         const QImage image = frameToImage(displayable);
         if (image.isNull())
             return false;
-        this->displayFrame(image);
+        // This path displays a non-baked frame.
+        QImage displayImage = image;
+        if (sequenceActive()
+            && m_activeEntry >= 0
+            && m_activeEntry < m_sequence.size()) {
+            const auto &entry = m_sequence[m_activeEntry];
+            displayImage = applyPreviewClipMask(
+                image,
+                m_glPreview ? m_glPreview->timeline() : nullptr,
+                entry,
+                static_cast<double>(targetUs) / AV_TIME_BASE,
+                QSize(displayable->width, displayable->height));
+        }
+        m_lastFrameOdtApplied = false;
+        this->displaySeekFrameConformed(displayImage);
         m_currentPositionUs = targetUs;
         updatePositionUi();
         return true;
@@ -2992,7 +4207,7 @@ bool VideoPlayer::presentDecodedFrame(AVFrame *frame, bool displayFrameRequested
         // is intentionally NOT updated here; pause/resize during fast path
         // shows whatever was last cached by the legacy path. Acceptable for
         // V1-only narrow conditions; revisit if user reports staleness.
-        if (canUseInteropFastPath(frame)) {
+        if (canUseInteropFastPath(frame) && !m_projectOutputSize.isValid()) {
             D3D11FrameRef ref;
             if (extractD3D11FrameRef(frame, &ref)) {
                 static bool loggedFastPathEngage = false;
@@ -3022,8 +4237,27 @@ bool VideoPlayer::presentDecodedFrame(AVFrame *frame, bool displayFrameRequested
         // into m_lastSourceFrame later in the pipeline.
         m_lastV1RawFrame = image;
         m_lastSourceFrame = image;
-        if (!m_deferDisplayThisTick)
-            displayFrame(image);
+        if (!m_deferDisplayThisTick) {
+            QImage displayImage = image;
+            if (sequenceActive()
+                && m_activeEntry >= 0
+                && m_activeEntry < m_sequence.size()) {
+                const auto &entry = m_sequence[m_activeEntry];
+                const double sourceSec =
+                    static_cast<double>(
+                        entryLocalPositionUs(m_activeEntry, m_timelinePositionUs))
+                    / AV_TIME_BASE;
+                displayImage = applyPreviewClipMask(
+                    image,
+                    m_glPreview ? m_glPreview->timeline() : nullptr,
+                    entry,
+                    sourceSec,
+                    QSize(displayable->width, displayable->height));
+            }
+            // This path displays a non-baked frame.
+            m_lastFrameOdtApplied = false;
+            displaySeekFrameConformed(displayImage);
+        }
         updatePositionUi();
     }
 
@@ -3104,9 +4338,10 @@ QImage VideoPlayer::frameToImage(const AVFrame *frame)
         return {};
     }
 
-    uint8_t *dest[4] = { image.bits(), nullptr, nullptr, nullptr };
-    int destLinesize[4] = { static_cast<int>(image.bytesPerLine()), 0, 0, 0 };
-    sws_scale(m_swsCtx, frame->data, frame->linesize, 0, frame->height, dest, destLinesize);
+    if (!scaleFrameToQImagePadded(m_swsCtx, frame, dstPixFmt, image)) {
+        qWarning() << "frameToImage: padded sws_scale failed";
+        return {};
+    }
     return image;
 }
 
@@ -3175,6 +4410,9 @@ double VideoPlayer::streamDisplayAspectRatio() const
 
 double VideoPlayer::effectiveDisplayAspectRatio() const
 {
+    if (m_projectOutputSize.isValid() && m_projectOutputSize.height() > 0)
+        return static_cast<double>(m_projectOutputSize.width()) / m_projectOutputSize.height();
+
     if (m_displayAspectRatio > 0.0 && std::isfinite(m_displayAspectRatio))
         return m_displayAspectRatio;
 
@@ -3205,12 +4443,63 @@ QSize VideoPlayer::fittedDisplaySize(const QSize &bounds) const
 
 void VideoPlayer::refreshDisplayedFrame()
 {
+    undotrace::log("refresh:enter");
     // Use the raw source cache, NOT m_currentFrameImage — the latter is
     // already composited, so re-running composeFrameWithOverlays on it
     // would burn the overlays in twice (visible as duplicated text when
     // an existing overlay is selected and setTextOverlays re-pushes).
     if (m_lastSourceFrame.isNull())
         return;
+    undotrace::log("refresh:conform");
+    if (m_projectOutputSize.isValid()
+        && sequenceActive()
+        && !m_lastV1RawFrame.isNull()
+        && m_activeEntry >= 0
+        && m_activeEntry < m_sequence.size()) {
+        const QVector<int> activeIdxs = findActiveEntriesAt(m_timelinePositionUs);
+        const auto &e = m_sequence[m_activeEntry];
+        if (!hasOverlayActive(activeIdxs) && e.sourceTrack == 0) {
+            QImage canvas(m_projectOutputSize, QImage::Format_ARGB32_Premultiplied);
+            if (!canvas.isNull()) {
+                canvas.fill(Qt::black);
+                DecodedLayer layer;
+                const Timeline *previewTimeline =
+                    m_glPreview ? m_glPreview->timeline() : nullptr;
+                const QSize sourceSize =
+                    (m_codecCtx && m_codecCtx->width > 0 && m_codecCtx->height > 0)
+                        ? QSize(m_codecCtx->width, m_codecCtx->height)
+                        : m_lastV1RawFrame.size();
+                const double sourceSec =
+                    static_cast<double>(
+                        entryLocalPositionUs(m_activeEntry, m_timelinePositionUs))
+                    / AV_TIME_BASE;
+                layer.rgb = applyPreviewClipMask(
+                    m_lastV1RawFrame, previewTimeline, e, sourceSec, sourceSize);
+                layer.isFresh = true;
+                layer.colorMeta = e.colorMeta;
+                applyLayerMotionOpacity(previewTimeline,
+                                        e, m_timelinePositionUs, e.opacity, &layer);
+                populateLayerMetadata(previewTimeline, e, m_activeEntry, &layer);
+                {
+                    double insetFw = 1.0, insetFh = 1.0;
+                    if (layer.fitContain && !layer.fitCover) {
+                        snsfit::containContentInset(layer.rgb.size(), m_projectOutputSize, insetFw, insetFh);
+                    }
+                    if (m_glPreview)
+                        m_glPreview->setVideoContentInset(insetFw, insetFh);
+                }
+                layer.rgb = snsfit::maybeFit(layer.rgb, layer.fitContain, layer.fitCover, m_projectOutputSize);
+                QVector<DecodedLayer> singleLayer;
+                singleLayer.append(layer);
+                composeMultiTrackFrameInto(canvas, singleLayer);
+                if (m_glPreview)
+                    m_glPreview->setCompositeBakedMode(true);
+                m_lastFrameOdtApplied = false;
+                displayFrame(canvas);
+                return;
+            }
+        }
+    }
     // Phase 1e Win #9 — m_lastSourceFrame may hold a canvas-proxy
     // smaller image cached during multi-track playback (when
     // m_textOverlays was empty at compose time, the canvas was sized
@@ -3233,6 +4522,9 @@ void VideoPlayer::refreshDisplayedFrame()
             m_canvasWidth, m_canvasHeight,
             Qt::IgnoreAspectRatio, Qt::FastTransformation);
     }
+    // This path displays a non-baked frame.
+    m_lastFrameOdtApplied = false;
+    undotrace::log("refresh:fallthrough");
     displayFrame(m_lastSourceFrame);
 }
 
@@ -3242,6 +4534,10 @@ void VideoPlayer::resizeEvent(QResizeEvent *event)
     if (m_regionPickerOverlay && m_glPreview) {
         QStackedWidget *stack = qobject_cast<QStackedWidget *>(m_glPreview->parentWidget());
         m_regionPickerOverlay->setGeometry(stack ? stack->geometry() : m_glPreview->geometry());
+    }
+    if (m_wbEyedropperOverlay && m_glPreview) {
+        QStackedWidget *stack = qobject_cast<QStackedWidget *>(m_glPreview->parentWidget());
+        m_wbEyedropperOverlay->setGeometry(stack ? stack->geometry() : m_glPreview->geometry());
     }
     refreshDisplayedFrame();
 }
@@ -3268,16 +4564,88 @@ void VideoPlayer::recordTickTrace(qint64 workNs)
     m_tickTraceSkipped = 0;
 }
 
+void VideoPlayer::updateAdaptiveQuality()
+{
+    // ADAPTIVE-1: 直近 tick の合成ウォール時間とフレーム予算を policy に相談し、
+    // 次 tick で使うキャンバス縮小係数 (m_adaptiveCanvasDivisor) と
+    // 品質 tier (m_adaptiveQualityTier) を決める。書き出し経路には一切触れない。
+    if (!m_adaptivePreviewEnabled) {
+        m_adaptiveCanvasDivisor = 1;
+        m_adaptiveQualityTier = 0;
+        return;
+    }
+
+    playback::PlaybackMetrics metrics;
+    metrics.trackCount = m_sequence.size();
+    metrics.activeClipCount =
+        findActiveEntriesAt(m_timelinePositionUs).size();
+    metrics.lastFrameRenderMs = m_lastTickRenderMs;
+    const int64_t baseFrameUs =
+        (m_frameDurationUs > 0) ? m_frameDurationUs : (AV_TIME_BASE / 30);
+    const double absSpeed = qMax(0.25, std::abs(m_playbackSpeed));
+    // フレーム予算 = 1 フレーム間隔 (ms)。倍速再生時は予算も縮む。
+    metrics.targetFrameMs =
+        qMax(1.0, (static_cast<double>(baseFrameUs) / 1000.0) / absSpeed);
+    metrics.isPlaying = m_playing;
+    // プロキシ候補判定: 再生用プレビュープロキシ divisor (環境設定
+    // / シークバー左のプロキシボタン m_proxyDivisor) のいずれかが等倍 (1) 以外なら
+    // 「プロキシ的な縮小が利用可能」と見なす。ProxyManager のグローバルトグル状態は
+    // ここでは参照せず、VideoPlayer 内で確定している縮小設定だけで判定する
+    // (依存を最小化し、判定が外部状態に左右されないようにするため)。
+    metrics.proxyAvailable = (playbackProxyDivisor() > 1) || (m_proxyDivisor > 1);
+
+    const playback::PlaybackQualityDecision d = m_qualityPolicy.decide(metrics);
+
+    // scaleFactor (1.0 / 0.5 / minScale=0.25) を整数キャンバス縮小係数へ。
+    // 1.0→1, 0.5→2, それ未満→4。最低 1px は canvasW/H 側で qMax 済み。
+    int divisor = 1;
+    if (d.scaleFactor >= 0.99)      divisor = 1;
+    else if (d.scaleFactor >= 0.49) divisor = 2;
+    else                            divisor = 4;
+    m_adaptiveCanvasDivisor = divisor;
+    // qualityTier はキャッシュキーの一部。同一プレイヘッドでも tier が違えば別物。
+    m_adaptiveQualityTier = divisor;
+}
+
+void VideoPlayer::cachePreviewComposite(const QImage &composed)
+{
+    if (!m_adaptivePreviewEnabled || composed.isNull())
+        return;
+    playback::CompositeFrameKey key;
+    key.timelineRevision = m_timelineRevision;
+    key.timeMs       = m_timelinePositionUs / 1000;
+    key.width        = composed.width();
+    key.height       = composed.height();
+    key.qualityTier  = m_adaptiveQualityTier;
+    key.useProxy     = (m_proxyDivisor > 1) || (playbackProxyDivisor() > 1);
+    m_frameCache.put(key, composed);
+}
+
 void VideoPlayer::handlePlaybackTick()
 {
     if (!m_playing)
         return;
+
+    m_lastFrameOdtApplied = false;
 
     // Anchor the tick body so scheduleNextFrame can fire the next tick at
     // tickWallStart + frameInterval (constant cadence) rather than
     // bodyEnd + frameInterval (sliding cadence that drifts ~body_time
     // slower than real time).
     m_tickWallStart.start();
+
+    // ADAPTIVE-1: 直前 tick の合成時間に基づき今 tick のプレビュー品質を確定する。
+    // policy はヒステリシス付きなので毎 tick で振動しない。停止/シーク時は
+    // updateAdaptiveQuality を呼ばず (この関数は再生 tick からのみ)、停止経路は
+    // policy.reset() 相当 (m_lastTickRenderMs を 0 に戻すのは stop()/seek 側) に委ねる。
+    updateAdaptiveQuality();
+    // 今 tick の合成ウォール時間を実測するタイマー。displayFrame までを測る。
+    QElapsedTimer adaptiveRenderTimer;
+    adaptiveRenderTimer.start();
+    auto recordAdaptiveRenderTime = [&]() {
+        m_lastTickRenderMs = static_cast<double>(adaptiveRenderTimer.nsecsElapsed())
+                             / 1000000.0;
+    };
 
     QElapsedTimer tickTimer;
     const bool traceTick = tickTraceEnabled();
@@ -3373,10 +4741,20 @@ void VideoPlayer::handlePlaybackTick()
     // with V2+ overlays. When yes, presentDecodedFrame caches the V1 frame
     // into m_lastSourceFrame but skips displayFrame so the compositor step
     // below can blend the overlays before pushing the final image.
+    const Timeline *previewTimeline = m_glPreview ? m_glPreview->timeline() : nullptr;
+    const QVector<int> activeForComposite = findActiveEntriesAt(m_timelinePositionUs);
+    const bool nestedSequenceActive =
+        m_playbackSpeed >= 0.0
+        && sequenceActive()
+        && timelineHasActiveSequenceReference(previewTimeline, m_timelinePositionUs);
+    const bool forceProjectOutputComposite =
+        m_projectOutputSize.isValid() && !activeForComposite.isEmpty();
     const bool willComposite = m_playbackSpeed >= 0.0
                                && sequenceActive()
                                && !m_seekInProgress
-                               && hasOverlayActive(findActiveEntriesAt(m_timelinePositionUs));
+                               && (hasOverlayActive(activeForComposite)
+                                   || forceProjectOutputComposite
+                                   || nestedSequenceActive);
     m_deferDisplayThisTick = willComposite;
 
     // When leaving the compositor path, restore the active entry's
@@ -3433,7 +4811,8 @@ void VideoPlayer::handlePlaybackTick()
     };
     QVector<V2PrefetchJob> v2PrefetchJobs;
     QFuture<void> v2PrefetchFuture;
-    if (prefetchV2Enabled && willComposite && m_playbackSpeed >= 0.0) {
+    if (prefetchV2Enabled && willComposite && !nestedSequenceActive
+        && m_playbackSpeed >= 0.0) {
         const QVector<int> prefetchIdxs = findActiveEntriesAt(m_timelinePositionUs);
         for (int idx : prefetchIdxs) {
             if (idx < 0 || idx >= m_sequence.size())
@@ -3441,6 +4820,8 @@ void VideoPlayer::handlePlaybackTick()
             if (idx == m_activeEntry)
                 continue;  // V1 main path handles itself.
             const auto &e = m_sequence[idx];
+            if (isAdjustmentEntry(previewTimeline, e))
+                continue;
             if (e.sourceTrack <= 0)
                 continue;  // Only V2+ overlays go through pool path.
             TrackDecoder *d = acquireDecoderForClip(e);
@@ -3474,6 +4855,7 @@ void VideoPlayer::handlePlaybackTick()
             });
         }
     }
+
     const auto waitForV2Prefetch = [&](const char *site) {
         if (!v2PrefetchFuture.isStarted())
             return;
@@ -3541,10 +4923,67 @@ void VideoPlayer::handlePlaybackTick()
     // in a preview seek. V1-only timelines short-circuit via hasOverlayActive
     // (overlays.isEmpty -> displayFrame is bypassed entirely on the legacy
     // path because m_deferDisplayThisTick was false above).
-    if (advanced && willComposite && !m_lastV1RawFrame.isNull()) {
+    bool servedByNestedSequenceSsot = false;
+    if (advanced && willComposite && nestedSequenceActive && previewTimeline) {
+        waitForV2Prefetch("nested-sequence-ssot");
+        QSize renderSize = m_projectOutputSize.isValid()
+            ? m_projectOutputSize
+            : QSize(m_canvasWidth, m_canvasHeight);
+        if (renderSize.isEmpty() && !m_lastV1RawFrame.isNull())
+            renderSize = m_lastV1RawFrame.size();
+        if (!renderSize.isEmpty()) {
+            const QImage ssotFrame =
+                tlrender::renderFrameAt(previewTimeline,
+                                        m_timelinePositionUs,
+                                        renderSize);
+            if (!ssotFrame.isNull()) {
+                if (m_glPreview)
+                    m_glPreview->setCompositeBakedMode(true);
+                cachePreviewComposite(ssotFrame);
+                displayFrame(ssotFrame);
+                servedByNestedSequenceSsot = true;
+            }
+        }
+    }
+    if (!servedByNestedSequenceSsot
+        && advanced && willComposite && !m_lastV1RawFrame.isNull()) {
         // Phase 1e Win #6: wait for V2 prefetch to finish before the
         // compositor branch reads pool-decoder state.
         waitForV2Prefetch("compositor-entry");
+        // ADAPTIVE-1: 合成キャッシュ参照。同一 (timelineRevision, playhead, size,
+        // tier, useProxy) の最終合成が既にあれば再合成 (overlay decode + compose) を
+        // スキップし、キャッシュ画像を 1 回だけ displayFrame する。prefetch-wait は
+        // 上で既に通過済みなのでワーカー寿命は tick 内に収まる。再生中は playhead が
+        // 毎 tick 進むため通常 miss (= decode/compose を従来どおり実行); ポーズ中の
+        // 再 tick や同一位置反復でのみ hit する純最適化。displayFrame 発火回数は不変
+        // (この tick も最大 1 frame)。テキストオーバーレイ時は合成解像度が等倍なので
+        // size キーもそれに合わせる。
+        bool servedFromCache = false;
+        if (m_adaptivePreviewEnabled) {
+            const int cacheProxy = m_textOverlays.isEmpty()
+                ? (canvasProxyDivisor() * m_adaptiveCanvasDivisor) : 1;
+            const QSize cacheCanvasBase = m_projectOutputSize.isValid()
+                ? m_projectOutputSize
+                : QSize(m_canvasWidth, m_canvasHeight);
+            playback::CompositeFrameKey hitKey;
+            hitKey.timelineRevision = m_timelineRevision;
+            hitKey.timeMs       = m_timelinePositionUs / 1000;
+            hitKey.width        = qMax(2, cacheCanvasBase.width()  / cacheProxy);
+            hitKey.height       = qMax(2, cacheCanvasBase.height() / cacheProxy);
+            hitKey.qualityTier  = m_adaptiveQualityTier;
+            hitKey.useProxy     = (m_proxyDivisor > 1) || (playbackProxyDivisor() > 1);
+            QImage cached;
+            if (m_frameCache.tryGet(hitKey, cached)
+                && !cached.isNull()
+                && cached.size() == QSize(hitKey.width, hitKey.height)) {
+                if (m_glPreview)
+                    m_glPreview->setCompositeBakedMode(true);
+                // Cache hits can re-serve ODT-baked frames; without a cached baked flag, paused same-playhead hits can double-apply ACES.
+                displayFrame(cached);
+                servedFromCache = true;
+            }
+        }
+      if (!servedFromCache) {
         const QVector<int> activeIdxs = findActiveEntriesAt(m_timelinePositionUs);
         // GL viewport's setVideoSourceTransform is normally driven by the
         // active entry's videoScale/Dx/Dy in advanceToEntry. When we hand
@@ -3560,6 +4999,8 @@ void VideoPlayer::handlePlaybackTick()
             sectionMark = tickTimer.nsecsElapsed();
         QVector<DecodedLayer> layers;
         layers.reserve(activeIdxs.size());
+        QVector<ActivePreviewAdjustmentClip> activeAdjustments;
+        activeAdjustments.reserve(activeIdxs.size());
         bool overlayPresent = false;
 
         // VEDITOR_THREADED_POOL_DISABLE (Phase 1e Sprint US-3, default-on per
@@ -3577,14 +5018,16 @@ void VideoPlayer::handlePlaybackTick()
         int nonV1Count = 0;
         if (threadedPool) {
             for (int idx : activeIdxs) {
-                if (idx >= 0 && idx < m_sequence.size() && idx != m_activeEntry)
+                if (idx >= 0 && idx < m_sequence.size() && idx != m_activeEntry
+                    && !isAdjustmentEntry(previewTimeline, m_sequence.at(idx)))
                     ++nonV1Count;
             }
         }
 
         // Phase 1e occlusion culling: V1 is drawn last (on top) under the
-        // V_max -> V1 sort, so when V1 is fully opaque AND fills the canvas
-        // (scale=1, dx=dy=0) every V2+ overlay underneath it is invisible.
+        // descending V_max -> V1 sort (V1-wins stacking), so when V1 is fully
+        // opaque AND fills the canvas (scale=1, dx=dy=0) every V2+ overlay
+        // underneath it is invisible.
         // Skip the V2+ decode loop entirely in that case — it dominates the
         // multi-track stutter cost (decodeMs ~1685ms / 30 ticks).
         // Default ON because the cull is logically conservative: the math
@@ -3648,21 +5091,52 @@ void VideoPlayer::handlePlaybackTick()
             for (int idx : activeIdxs) {
                 if (idx < 0 || idx >= m_sequence.size())
                     continue;
-                if (v1FullyCoversCanvas && idx != m_activeEntry)
-                    continue; // V1 hides V2+ entirely — skip overlay decode
+                // v1FullyCoversCanvas occlusion-cull removed: export always
+                // composites V2+ over V1 regardless of V1 opacity/scale, so
+                // skipping overlay decode here created a preview≠export
+                // divergence on opaque V1 + PiP/title overlay scenes.
+                // (nonV1Count==0 means only V1 is active; idx!=m_activeEntry
+                // is then always false so the old skip never fired then
+                // anyway — no perf regression from removing it here.)
                 const auto &e = m_sequence[idx];
+                if (appendPreviewAdjustmentClip(
+                        previewTimeline, e, m_timelinePositionUs, &activeAdjustments)) {
+                    if (e.sourceTrack > 0)
+                        overlayPresent = true;
+                    continue;
+                }
+                if (isNullObjectEntry(e)) {
+                    DecodedLayer layer;
+                    layer.colorMeta = e.colorMeta;
+                    applyLayerMotionOpacity(previewTimeline,
+                                            e, m_timelinePositionUs, e.opacity, &layer);
+                    populateLayerMetadata(previewTimeline,
+                                          e, idx, &layer);
+                    layers.append(layer);
+                    if (e.sourceTrack > 0)
+                        overlayPresent = true;
+                    continue;
+                }
                 if (idx == m_activeEntry) {
                     if (m_lastV1RawFrame.isNull())
                         continue;
                     DecodedLayer layer;
-                    layer.rgb = m_lastV1RawFrame;
+                    const QSize sourceSize =
+                        (m_codecCtx && m_codecCtx->width > 0 && m_codecCtx->height > 0)
+                            ? QSize(m_codecCtx->width, m_codecCtx->height)
+                            : m_lastV1RawFrame.size();
+                    const double sourceSec =
+                        static_cast<double>(
+                            entryLocalPositionUs(idx, m_timelinePositionUs))
+                        / AV_TIME_BASE;
+                    layer.rgb = applyPreviewClipMask(
+                        m_lastV1RawFrame, previewTimeline, e, sourceSec, sourceSize);
                     layer.isFresh = true;
-                    layer.opacity = e.opacity;
-                    layer.videoScale = e.videoScale;
-                    layer.videoDx = e.videoDx;
-                    layer.videoDy = e.videoDy;
-                    layer.sourceTrack = e.sourceTrack;
-                    layer.sequenceIdx = idx;
+                    layer.colorMeta = e.colorMeta;
+                    applyLayerMotionOpacity(previewTimeline,
+                                            e, m_timelinePositionUs, e.opacity, &layer);
+                    populateLayerMetadata(previewTimeline,
+                                          e, idx, &layer);
                     layers.append(layer);
                     if (e.sourceTrack > 0)
                         overlayPresent = true;
@@ -3722,40 +5196,82 @@ void VideoPlayer::handlePlaybackTick()
             for (int idx : activeIdxs) {
                 if (idx < 0 || idx >= m_sequence.size())
                     continue;
-                if (v1FullyCoversCanvas && idx != m_activeEntry)
-                    continue; // V1 hides V2+ entirely — skip overlay decode
+                // v1FullyCoversCanvas occlusion-cull removed (same reasoning
+                // as parallel path above): export always composites V2+, so
+                // this skip was a preview≠export divergence on opaque V1 +
+                // overlay scenes.
                 const auto &e = m_sequence[idx];
+                if (appendPreviewAdjustmentClip(
+                        previewTimeline, e, m_timelinePositionUs, &activeAdjustments)) {
+                    if (e.sourceTrack > 0)
+                        overlayPresent = true;
+                    continue;
+                }
                 DecodedLayer layer;
-                if (idx == m_activeEntry) {
+                if (isNullObjectEntry(e)) {
+                    layer.isFresh = true;
+                } else if (idx == m_activeEntry) {
                     if (m_lastV1RawFrame.isNull())
                         continue;
-                    layer.rgb = m_lastV1RawFrame;
+                    const QSize sourceSize =
+                        (m_codecCtx && m_codecCtx->width > 0 && m_codecCtx->height > 0)
+                            ? QSize(m_codecCtx->width, m_codecCtx->height)
+                            : m_lastV1RawFrame.size();
+                    const double sourceSec =
+                        static_cast<double>(
+                            entryLocalPositionUs(idx, m_timelinePositionUs))
+                        / AV_TIME_BASE;
+                    layer.rgb = applyPreviewClipMask(
+                        m_lastV1RawFrame, previewTimeline, e, sourceSec, sourceSize);
                     layer.isFresh = true;
                 } else {
                     if (!harvestOverlayLayer(e, idx, &layer))
                         continue;
                 }
-                layer.opacity = e.opacity;
-                layer.videoScale = e.videoScale;
-                layer.videoDx = e.videoDx;
-                layer.videoDy = e.videoDy;
-                layer.sourceTrack = e.sourceTrack;
-                layer.sequenceIdx = idx;
+                layer.colorMeta = e.colorMeta;
+                applyLayerMotionOpacity(previewTimeline,
+                                        e, m_timelinePositionUs, e.opacity, &layer);
+                populateLayerMetadata(previewTimeline,
+                                      e, idx, &layer);
                 layers.append(layer);
                 if (e.sourceTrack > 0)
                     overlayPresent = true;
             }
         }
-        // V1-wins paint order: higher sourceTrack = back, V1 (sourceTrack 0)
-        // = front. Sort DESCENDING by sourceTrack so V_max paints first into
-        // the canvas and V1 paints last on top — V1 covers V2 wherever V1
-        // has opaque pixels, V2 fills V1's gaps and shows through V1's
-        // per-clip opacity.
-        std::sort(layers.begin(), layers.end(),
-                  [](const DecodedLayer &a, const DecodedLayer &b) {
-                      return a.sourceTrack > b.sourceTrack;
-                  });
-        if (overlayPresent) {
+        // Export-matching paint order (V1-wins stacking, PlaybackTypes.h:34):
+        // V1 (sourceTrack 0) paints LAST so it ends up ON TOP; higher tracks
+        // (V2, V3, …) paint UNDERNEATH it — DESCENDING by sourceTrack so the
+        // highest track is drawn first (backmost) and V1 last (frontmost).
+        // This mirrors renderFrameAt (TimelineFrameRenderer.cpp matte-free
+        // branch paints overlays first then V1 base last), so an opaque V1
+        // occludes V2 in preview exactly as in export.
+        // stable_sort: deterministic tie-break for same-sourceTrack clips
+        // (preserves input order for equal keys); behaviour-identical to sort
+        // for the common distinct-track case.
+        // clipstack::layerPaintOrderLess is a named free function (declared
+        // in VideoPlayer.h, namespace clipstack) so the S3-STACK predicate
+        // sub-assertion in main.cpp exercises the SAME comparator — a
+        // re-inversion breaks the selftest.
+        std::stable_sort(layers.begin(), layers.end(), clipstack::layerPaintOrderLess);
+        if (veditor::parentingEnabledFromEnv())
+            resolveDecodedLayerParentSources(layers);
+        for (DecodedLayer &L : layers) {
+            {
+                double insetFw = 1.0, insetFh = 1.0;
+                if (L.fitContain && !L.fitCover) {
+                    snsfit::containContentInset(L.rgb.size(), m_projectOutputSize, insetFw, insetFh);
+                }
+                if (m_glPreview)
+                    m_glPreview->setVideoContentInset(insetFw, insetFh);
+            }
+            L.rgb = snsfit::maybeFit(L.rgb, L.fitContain, L.fitCover, m_projectOutputSize);
+        }
+        const bool layerStylePresent =
+            std::any_of(layers.cbegin(), layers.cend(),
+                        [](const DecodedLayer &L) {
+                            return !L.layerStyle.isIdentity();
+                        });
+        if (overlayPresent || m_projectOutputSize.isValid() || layerStylePresent) {
             // Reuse a canvas-sized scratch buffer so we don't allocate
             // ~8MB (1080p ARGB) every tick. Re-allocates only when the
             // canvas size or format changes; otherwise we just refill it
@@ -3766,10 +5282,19 @@ void VideoPlayer::handlePlaybackTick()
             // in canvasProxyDivisor() at top of file). m_textOverlays
             // runtime gate keeps text overlays on the full-res path so
             // composeFrameWithOverlays paints text at correct coords.
+            // ADAPTIVE-1: 既存の env ベース canvasProxyDivisor() に policy が決めた
+            // 追加縮小係数 (m_adaptiveCanvasDivisor: 1/2/4) を乗算する。テキスト
+            // オーバーレイがある場合は座標ずれ回避のため従来どおり等倍 (1) 固定。
+            // m_adaptivePreviewEnabled=false 時は m_adaptiveCanvasDivisor=1 なので
+            // 従来挙動とビット同一。
             const int canvasProxy = m_textOverlays.isEmpty()
-                                    ? canvasProxyDivisor() : 1;
-            const int canvasW = qMax(2, m_canvasWidth  / canvasProxy);
-            const int canvasH = qMax(2, m_canvasHeight / canvasProxy);
+                                    ? (canvasProxyDivisor() * m_adaptiveCanvasDivisor)
+                                    : 1;
+            const QSize outputCanvasBase = m_projectOutputSize.isValid()
+                ? m_projectOutputSize
+                : QSize(m_canvasWidth, m_canvasHeight);
+            const int canvasW = qMax(2, outputCanvasBase.width()  / canvasProxy);
+            const int canvasH = qMax(2, outputCanvasBase.height() / canvasProxy);
             if (m_canvasBase.size() != QSize(canvasW, canvasH)
                 || m_canvasBase.format() != QImage::Format_ARGB32_Premultiplied) {
                 m_canvasBase = QImage(canvasW, canvasH,
@@ -3798,13 +5323,56 @@ void VideoPlayer::handlePlaybackTick()
                 }
                 if (traceTick)
                     m_tickTraceDecodeNs += tickTimer.nsecsElapsed() - sectionMark;
-                displayFrame(m_lastV1RawFrame);
+                QImage fallbackFrame = m_lastV1RawFrame;
+                if (m_activeEntry >= 0 && m_activeEntry < m_sequence.size()) {
+                    const auto &entry = m_sequence[m_activeEntry];
+                    const QSize sourceSize =
+                        (m_codecCtx && m_codecCtx->width > 0 && m_codecCtx->height > 0)
+                            ? QSize(m_codecCtx->width, m_codecCtx->height)
+                            : m_lastV1RawFrame.size();
+                    const double sourceSec =
+                        static_cast<double>(
+                            entryLocalPositionUs(m_activeEntry, m_timelinePositionUs))
+                        / AV_TIME_BASE;
+                    fallbackFrame = applyPreviewClipMask(
+                        m_lastV1RawFrame, previewTimeline, entry, sourceSec, sourceSize);
+                }
+                displayFrame(fallbackFrame);
             } else {
                 if (traceTick) {
                     m_tickTraceDecodeNs += tickTimer.nsecsElapsed() - sectionMark;
                     sectionMark = tickTimer.nsecsElapsed();
                 }
                 m_canvasBase.fill(Qt::black);
+                // STAGE3-GPU: 既定 OFF。VEDITOR_GPU_COMPOSITE="1" の時だけ多トラック
+                // (matte-free) を GpuLayerCompositor で GPU 合成する。成功時はこの分岐
+                // 1 本で「合成 → baked mode → cache → displayFrame (1 回)」を完結し、
+                // 下の CPU 経路 (in-place / legacy) はスキップする。GPU が空を返す
+                // (GL 失敗) / flag OFF / 単一トラックなら gpuComposed は null となり、
+                // 従来 CPU 経路へそのままフォールバックする (displayFrame は依然 1 回)。
+                // m_canvasBase.size() を canvas として渡すので CPU と同じ適応縮小解像度。
+                const bool adjustmentClipPresent = !activeAdjustments.isEmpty();
+                const bool trackMattePresent = hasDecodedTrackMatte(layers);
+                const bool canTryGpuComposite =
+                    !adjustmentClipPresent || trackMattePresent;
+                const QImage gpuComposed = canTryGpuComposite
+                    ? tryGpuComposeLayers(layers, m_canvasBase.size())
+                    : QImage();
+                if (!gpuComposed.isNull()) {
+                    const QImage displayedComposite =
+                        adjustmentClipPresent && trackMattePresent
+                            ? applyPreviewAdjustmentClipsAfterMatte(
+                                  gpuComposed, activeAdjustments)
+                            : gpuComposed;
+                    if (traceTick)
+                        m_tickTraceComposeNs += tickTimer.nsecsElapsed() - sectionMark;
+                    // CPU 経路と同じ baked-mode: paintGL が m_videoSourceScale を
+                    // 二重適用しないよう viewport を identity 扱いにする。
+                    if (m_glPreview)
+                        m_glPreview->setCompositeBakedMode(true);
+                    cachePreviewComposite(displayedComposite);  // CPU 経路と同じキーで put
+                    displayFrame(displayedComposite);           // 1 tick = 最大 1 displayFrame
+                } else {
                 // Phase 1e Win #7 — in-place compose. Default ON; opt out
                 // via VEDITOR_INPLACE_COMPOSE_DISABLE=1 to fall back to the
                 // legacy composeMultiTrackFrame path that allocates a
@@ -3813,7 +5381,16 @@ void VideoPlayer::handlePlaybackTick()
                 // tick).
                 static const bool inplaceComposeEnabled =
                     qEnvironmentVariableIntValue("VEDITOR_INPLACE_COMPOSE_DISABLE") == 0;
-                if (inplaceComposeEnabled) {
+                if (adjustmentClipPresent) {
+                    composePreviewFrameWithAdjustmentClips(
+                        m_canvasBase, layers, activeAdjustments);
+                    if (traceTick)
+                        m_tickTraceComposeNs += tickTimer.nsecsElapsed() - sectionMark;
+                    if (m_glPreview)
+                        m_glPreview->setCompositeBakedMode(true);
+                    cachePreviewComposite(m_canvasBase);
+                    displayFrame(m_canvasBase);
+                } else if (inplaceComposeEnabled) {
                     composeMultiTrackFrameInto(m_canvasBase, layers);
                     if (traceTick)
                         m_tickTraceComposeNs += tickTimer.nsecsElapsed() - sectionMark;
@@ -3827,6 +5404,13 @@ void VideoPlayer::handlePlaybackTick()
                     // during multi-track playback.
                     if (m_glPreview)
                         m_glPreview->setCompositeBakedMode(true);
+                    // ADAPTIVE-1: 合成結果を (timelineRevision, playhead, size, tier)
+                    // でキャッシュ。再生は毎 tick playhead が進むのでキーは毎回変わり、
+                    // ライブ再生で hit することはない (= decode をスキップしないので
+                    // A/V sync を壊さない)。同一プレイヘッドの再描画 (リサイズ /
+                    // scrub 戻り) でのみ将来 hit する純キャッシュ。displayFrame の
+                    // 発火回数は不変 (1 tick = 最大 1 frame)。
+                    cachePreviewComposite(m_canvasBase);
                     displayFrame(m_canvasBase);
                 } else {
                     // Legacy path (VEDITOR_INPLACE_COMPOSE_DISABLE=1): allocates
@@ -3840,8 +5424,10 @@ void VideoPlayer::handlePlaybackTick()
                         m_tickTraceComposeNs += tickTimer.nsecsElapsed() - sectionMark;
                     if (m_glPreview)
                         m_glPreview->setCompositeBakedMode(true);
+                    cachePreviewComposite(composed); // ADAPTIVE-1: 上の in-place 分岐と同旨
                     displayFrame(composed);
                 }
+                } // STAGE3-GPU: close `else` (CPU フォールバック経路)
             }
         } else {
             // Every overlay bailed (decoder open failed, slot exhausted).
@@ -3866,8 +5452,23 @@ void VideoPlayer::handlePlaybackTick()
             }
             if (traceTick)
                 m_tickTraceDecodeNs += tickTimer.nsecsElapsed() - sectionMark;
-            displayFrame(m_lastV1RawFrame);
+            QImage fallbackFrame = m_lastV1RawFrame;
+            if (m_activeEntry >= 0 && m_activeEntry < m_sequence.size()) {
+                const auto &entry = m_sequence[m_activeEntry];
+                const QSize sourceSize =
+                    (m_codecCtx && m_codecCtx->width > 0 && m_codecCtx->height > 0)
+                        ? QSize(m_codecCtx->width, m_codecCtx->height)
+                        : m_lastV1RawFrame.size();
+                const double sourceSec =
+                    static_cast<double>(
+                        entryLocalPositionUs(m_activeEntry, m_timelinePositionUs))
+                    / AV_TIME_BASE;
+                fallbackFrame = applyPreviewClipMask(
+                    m_lastV1RawFrame, previewTimeline, entry, sourceSec, sourceSize);
+            }
+            displayFrame(fallbackFrame);
         }
+      } // ADAPTIVE-1: close `if (!servedFromCache)`
     }
 
     // A/V sync: video owns m_currentPositionUs via the FFmpeg decoder;
@@ -4013,6 +5614,7 @@ void VideoPlayer::handlePlaybackTick()
                     }
                 }
                 if (advanced) {
+                    recordAdaptiveRenderTime();
                     updatePositionUi();
                     if (traceTick)
                         recordTickTrace(tickTimer.nsecsElapsed());
@@ -4035,6 +5637,12 @@ void VideoPlayer::handlePlaybackTick()
             }
         }
     }
+
+    // ADAPTIVE-1: 今 tick の合成ウォール時間 (decode+compose+display) を記録し、
+    // 次 tick の updateAdaptiveQuality() が品質ラダー判定に使う。早期 return する
+    // 経路 (end-of-sequence で pause→return する分岐) は再生停止なので測定不要
+    // (停止後は updateAdaptiveQuality が呼ばれず、stop()/play() が状態を整える)。
+    recordAdaptiveRenderTime();
 
     // Phase 1e Win #6 — safety-net: every exit path of handlePlaybackTick MUST
     // pass through this wait so worker lifetime is bounded by the tick.
@@ -4156,7 +5764,7 @@ VideoPlayer::TrackDecoder *VideoPlayer::acquireDecoderForClip(const PlaybackEntr
     // than V1 so m_sequence sorts V2 first; m_activeEntry tracks V2 even
     // while V1 overlaps) — goes through the pool so V1 can still paint
     // last in V1-wins ordering.
-    if (entry.filePath.isEmpty())
+    if (isNullObjectEntry(entry))
         return nullptr;
 
     const TrackKey key{entry.filePath, qRound64(entry.clipIn * 1000.0),
@@ -4304,6 +5912,8 @@ VideoPlayer::TrackDecoder *VideoPlayer::openTrackDecoder(const PlaybackEntry &en
     if (stallTraceEnabled())
         stallTimer.start();
     auto *d = new TrackDecoder();
+    d->wantRgba64Overlay =
+        hdroverlay::wantRgba64(hdroverlay::enabledFromEnv(), entry.colorMeta.isHdr);
     d->sourceClipIndex = entry.sourceClipIndex;
     d->sourceTrack = entry.sourceTrack;
     d->filePath = entry.filePath;
@@ -4527,11 +6137,14 @@ enum AVPixelFormat VideoPlayer::poolGetHwFormatCallback(AVCodecContext *ctx, con
 
 // ---- Phase 1d software compositor ------------------------------------------
 //
-// composeMultiTrackFrame paints overlay layers (V2+) on top of the V1 base
-// using QPainter::CompositionMode_SourceOver against an ARGB32_Premultiplied
-// canvas. Each layer's videoScale/videoDx/videoDy follows the OBS-style
-// transform convention used elsewhere in the player: dx/dy in canvas-relative
-// 0..1 units, scale around the canvas center.
+// composeMultiTrackFrame paints the supplied layer stack onto the canvas in
+// vector order using QPainter::CompositionMode_SourceOver against an
+// ARGB32_Premultiplied canvas. The caller (handlePlaybackTick) sorts layers
+// DESCENDING by sourceTrack (clipstack::layerPaintOrderLess), so the highest
+// track is painted first (backmost) and V1 last (frontmost) — V1-wins
+// stacking per PlaybackTypes.h:34. Each layer's videoScale/videoDx/videoDy
+// follows the OBS-style transform convention used elsewhere in the player:
+// dx/dy in canvas-relative 0..1 units, scale around the canvas center.
 //
 // V1-only timeline regression safety: when overlayLayers is empty we return
 // v1Frame unchanged so the legacy displayFrame path (composeFrameWithOverlays
@@ -4555,28 +6168,68 @@ QImage VideoPlayer::composeMultiTrackFrame(const QImage &v1Frame,
     // 100% opaque base layer paints over the canvas just like GL does.
     QImage composed = v1Frame.convertToFormat(QImage::Format_ARGB32_Premultiplied);
     QPainter p(&composed);
-    // Nearest-neighbor sampling. Software bilinear (the prior default) is
-    // ~5-10x more expensive at 1080p+ and was the dominant contributor to
-    // the multi-track "video heavy" regression. The user-visible aliasing
-    // for live preview is acceptable; the export path can re-enable smooth
-    // sampling if higher quality is needed there.
-    p.setRenderHint(QPainter::SmoothPixmapTransform, false);
     p.setCompositionMode(QPainter::CompositionMode_SourceOver);
 
+    // Per-layer placement now goes through the clipgeom SSOT so live preview
+    // geometry (translate -> rotate -> scale, normalized dx/dy, canvas-center
+    // anchor) is byte-identical to every export path — and rotation is no
+    // longer dropped. Nearest-neighbor sampling (smooth=false) is retained
+    // for live perf: software bilinear is ~5-10x more expensive at 1080p+ and
+    // was the dominant contributor to the multi-track "video heavy"
+    // regression. The sampling-only difference vs. the smooth export is
+    // absorbed by the PARITY S3 MSE tolerance; the geometry is exact.
+    const bool kSmooth = false;
     const QSize canvas(composed.width(), composed.height());
-    for (const DecodedLayer &L : overlayLayers) {
-        if (L.rgb.isNull() || L.opacity <= 0.001)
+    const QVector<clipgeom::ClipTransform> effectiveTransforms =
+        veditor::parentingEnabledFromEnv()
+            ? effectiveLayerTransforms(overlayLayers, canvas)
+            : QVector<clipgeom::ClipTransform>{};
+    for (int i = 0; i < overlayLayers.size(); ++i) {
+        const DecodedLayer &L = overlayLayers[i];
+        if (L.isNullObject || L.rgb.isNull() || L.opacity <= 0.001)
             continue;
-        const double w  = canvas.width()  * L.videoScale;
-        const double h  = canvas.height() * L.videoScale;
-        const double cx = canvas.width()  * 0.5 + L.videoDx * canvas.width();
-        const double cy = canvas.height() * 0.5 + L.videoDy * canvas.height();
-        const QRectF dst(cx - w * 0.5, cy - h * 0.5, w, h);
+        const clipgeom::ClipTransform t = effectiveTransforms.isEmpty()
+            ? transformForLayer(L)
+            : effectiveTransforms.value(i, transformForLayer(L));
+        QImage placed = clipgeom::renderLayer(
+            L.rgb, t, canvas, kSmooth);
+        if (!L.layerStyle.isIdentity())
+            placed = layerstyle::apply(placed, L.layerStyle);
         p.setOpacity(qBound(0.0, L.opacity, 1.0));
-        p.drawImage(dst, L.rgb);
+        p.drawImage(0, 0, placed);
     }
     p.end();
     return composed;
+}
+
+// Test-only forwarder (declared public in VideoPlayer.h). Repackages
+// primitive overlay params into the private DecodedLayer struct and calls
+// the REAL composeMultiTrackFrame above so the PARITY S3 selftest measures
+// the genuine authoritative compositor. No compositing math is duplicated.
+QImage VideoPlayer::composeMultiTrackFrameForTest(
+    const QImage &v1Frame,
+    const QVector<QImage> &overlayRgb,
+    const QVector<double> &overlayOpacity,
+    const QVector<double> &overlayScale,
+    const QVector<double> &overlayDx,
+    const QVector<double> &overlayDy,
+    const QVector<double> &overlayRotationDeg,
+    const QVector<LayerStyle> &overlayStyle) const
+{
+    QVector<DecodedLayer> layers;
+    layers.reserve(overlayRgb.size());
+    for (int i = 0; i < overlayRgb.size(); ++i) {
+        DecodedLayer L;
+        L.rgb              = overlayRgb.value(i);
+        L.opacity          = overlayOpacity.value(i, 1.0);
+        L.videoScale       = overlayScale.value(i, 1.0);
+        L.videoDx          = overlayDx.value(i, 0.0);
+        L.videoDy          = overlayDy.value(i, 0.0);
+        L.rotation2DDegrees = overlayRotationDeg.value(i, 0.0);
+        L.layerStyle       = overlayStyle.value(i, LayerStyle{});
+        layers.append(L);
+    }
+    return composeMultiTrackFrame(v1Frame, layers);
 }
 
 // Phase 1e Win #7 — in-place variant. Same paint logic as
@@ -4600,22 +6253,337 @@ void VideoPlayer::composeMultiTrackFrameInto(QImage &canvas,
     if (canvas.format() != QImage::Format_ARGB32_Premultiplied)
         return;
     QPainter p(&canvas);
-    p.setRenderHint(QPainter::SmoothPixmapTransform, false);
     p.setCompositionMode(QPainter::CompositionMode_SourceOver);
 
+    // Same clipgeom SSOT placement as composeMultiTrackFrame (geometry exact,
+    // rotation included); smooth=false preserved from the legacy live-preview
+    // setting for perf — the sampling-only delta vs. export is inside S3's
+    // MSE tolerance.
+    const bool kSmooth = false;
     const QSize cs(canvas.width(), canvas.height());
-    for (const DecodedLayer &L : overlayLayers) {
-        if (L.rgb.isNull() || L.opacity <= 0.001)
+    const QVector<clipgeom::ClipTransform> effectiveTransforms =
+        veditor::parentingEnabledFromEnv()
+            ? effectiveLayerTransforms(overlayLayers, cs)
+            : QVector<clipgeom::ClipTransform>{};
+    for (int i = 0; i < overlayLayers.size(); ++i) {
+        const DecodedLayer &L = overlayLayers[i];
+        if (L.isNullObject || L.rgb.isNull() || L.opacity <= 0.001)
             continue;
-        const double w  = cs.width()  * L.videoScale;
-        const double h  = cs.height() * L.videoScale;
-        const double cx = cs.width()  * 0.5 + L.videoDx * cs.width();
-        const double cy = cs.height() * 0.5 + L.videoDy * cs.height();
-        const QRectF dst(cx - w * 0.5, cy - h * 0.5, w, h);
+        const clipgeom::ClipTransform t = effectiveTransforms.isEmpty()
+            ? transformForLayer(L)
+            : effectiveTransforms.value(i, transformForLayer(L));
+        QImage placed = clipgeom::renderLayer(
+            L.rgb, t, cs, kSmooth);
+        if (!L.layerStyle.isIdentity())
+            placed = layerstyle::apply(placed, L.layerStyle);
         p.setOpacity(qBound(0.0, L.opacity, 1.0));
-        p.drawImage(dst, L.rgb);
+        p.drawImage(0, 0, placed);
     }
     p.end();
+}
+
+// STAGE3-GPU: マルチトラックプレビュー GPU 合成のフラグを 1 回だけ解決する。
+// 既定 (VEDITOR_GPU_COMPOSITE 未設定 or "1"以外) は false → 従来 CPU 経路を
+// 一切変えずに通る (ビット同一)。QSettings "gpuComposite" による任意のメニュー
+// 切替も尊重するが、env が明示されていればそちらを優先する (テスト容易性)。
+void VideoPlayer::ensureGpuCompositeFlag()
+{
+    if (m_gpuCompositeChecked)
+        return;
+    m_gpuCompositeChecked = true;
+    const QByteArray env = qgetenv("VEDITOR_GPU_COMPOSITE");
+    QSettings settings;
+    m_gpuCompositeEnabled = resolveGpuCompositeEnabled(
+        !env.isEmpty(),
+        env,
+        settings.value(QStringLiteral("gpuComposite"), false).toBool());
+    if (m_gpuCompositeEnabled)
+        qInfo() << "[gpu-composite] enabled (preview multi-track GPU compositing ON)";
+}
+
+// STAGE3-GPU: GPU 合成を試みる。対象外 (flag OFF / 単一トラック / GL 不可) や
+// 失敗時は null QImage を返し、呼び出し側は従来 CPU 経路へフォールバックする。
+// displayFrame は一切呼ばない (表示は呼び出し側の共通 1 箇所が担う)。
+// canvas は CPU 経路と同じ適応縮小後サイズ。layers は CPU 経路と同じ
+// (V1 base + overlays、paint order ソート済) DecodedLayer 群。
+QImage VideoPlayer::tryGpuComposeLayers(const QVector<DecodedLayer> &layers,
+                                        QSize canvas)
+{
+    m_lastFrameOdtApplied = false;
+    ensureGpuCompositeFlag();  // 初回 tick で 1 回だけ env/QSettings を解決
+    if (!m_gpuCompositeEnabled)
+        return QImage();
+    // 多トラックのみ対象 (overlay が無いと CPU 経路と同じ単層描画で意味が無い)。
+    if (layers.size() < 2 || canvas.isEmpty())
+        return QImage();
+
+    // STAGE4B: ライブ・トラックマット (フラグ ON 時のみ到達)。
+    //   - マット無しシーン: 従来 Stage3 の高速経路をビット同一で維持 (matteType
+    //     を None に固定し、null/透明レイヤーは事前スキップ)。共通ホットパス。
+    //   - マット有りシーン: GpuLayerInput を sorted layers と 1:1 に構築する
+    //     (事前スキップ禁止)。composite() は内部で gpucomposite::isLayerComposited
+    //     により描画対象外を弾くが、マット SOURCE レイヤーは画像 (alpha/luma) が
+    //     消費されるため inputs に必ず残す必要があり、かつ matteSourceIndex は
+    //     composite() が走査する vector のインデックスでなければならない
+    //     (INDEX-SPACE 安全性)。よって 1:1 構築でインデックスを末端まで保つ。
+    //   GL 不可時 (isAvailable()==false) は null を返し CPU フォールバック
+    //   (matte-free) が走る。すなわちライブ・マットプレビューには GL が必須であり、
+    //   GL 不在環境ではフラグ ON でもマットは適用されない (= フラグ OFF と同等)。
+    //   これは実験的 opt-in フラグの許容される劣化であり、本タスクでは CPU 側の
+    //   ライブ・マット合成は追加しない。
+    const bool hasMatte = std::any_of(
+        layers.cbegin(), layers.cend(),
+        [](const DecodedLayer &L) { return L.matteType != TrackMatteType::None; });
+    if (std::any_of(layers.cbegin(), layers.cend(),
+                    [](const DecodedLayer &L) {
+                        return !L.layerStyle.isIdentity();
+                    })) {
+        return QImage();
+    }
+    const QVector<clipgeom::ClipTransform> effectiveTransforms =
+        veditor::parentingEnabledFromEnv()
+            ? effectiveLayerTransforms(layers, canvas)
+            : QVector<clipgeom::ClipTransform>{};
+
+    if (!m_gpuCompositor)
+        m_gpuCompositor = std::make_unique<GpuLayerCompositor>();
+    if (!m_gpuCompositor->isAvailable())
+        return QImage();  // GL 不可 → CPU フォールバック
+
+    // GpuLayerInput を構築する順序 (order) を決める。
+    //   - マット無し: 受領順 (paintOrder 降順) のまま (Stage3 とビット同一)。
+    //   - マット有り: V1-FIRST (sourceTrack 昇順) に並べ替える【C1 修正】。
+    // 理由: matteSourceIndex の検証規則 (index 0 == V1 base、srcIdx>0 && srcIdx!=i
+    // のみ採用) は export 経路 (TimelineFrameRenderer の renderLayers = V1 先頭・
+    // track 昇順) と同一の index 空間を前提とする。受領した layers は paintOrder 用に
+    // sourceTrack 降順 (V1 が末尾) へソート済みのため、そのまま 1:1 で詰めると index 0
+    // が最上位トラックになり、正当なマット源 (通常は被マット層より上のトラック) が
+    // srcIdx==0 で誤って弾かれてマットが黙って無効化される。composite() は内部で
+    // gpucomposite::paintOrder により描画順を再導出するので inputs の並びは出力順に
+    // 影響せず index 空間のみを決める。よってマット時のみ V1 先頭昇順へ整列し、export
+    // と index 規約を一致させる (preview≡export を担保)。
+    QVector<int> order;
+    order.reserve(layers.size());
+    for (int i = 0; i < layers.size(); ++i)
+        order.append(i);
+    if (hasMatte) {
+        std::stable_sort(order.begin(), order.end(),
+                         [&](int a, int b) {
+                             // V1 (sourceTrack 0) を先頭へ。安定ソートで同一トラックの
+                             // 相対順は保持 (実際は tick あたり 1 トラック 1 クリップ)。
+                             return layers.at(a).sourceTrack < layers.at(b).sourceTrack;
+                         });
+    }
+
+    // CPU の composeMultiTrackFrameInto が渡すのと同じ layers を GpuLayerInput に
+    // 詰める。フィールドは DecodedLayer → gpucomposite::LayerDesc に 1:1 写像。
+    QVector<GpuLayerInput> inputs;
+    inputs.reserve(layers.size());
+    for (int oi = 0; oi < order.size(); ++oi) {
+        const int layerIdx = order.at(oi);
+        const DecodedLayer &L = layers.at(layerIdx);
+        // マット無し経路のみ事前スキップ (Stage3 とビット同一)。マット有り経路は
+        // インデックス整合のため 1:1 構築し、スキップ判定は composite() 内部に委ねる。
+        if (!hasMatte && (L.isNullObject || L.rgb.isNull() || L.opacity <= 0.001))
+            continue;  // CPU 経路と同じスキップ条件
+        const clipgeom::ClipTransform t = effectiveTransforms.isEmpty()
+            ? transformForLayer(L)
+            : effectiveTransforms.value(layerIdx, transformForLayer(L));
+        GpuLayerInput in;
+        in.image = L.rgb;
+        in.colorMeta = L.colorMeta;
+        in.desc.sourceTrack        = L.sourceTrack;
+        in.desc.srcSize            = L.rgb.size();
+        in.desc.opacity            = L.opacity;
+        in.desc.videoScale         = t.videoScale;
+        in.desc.videoDx            = t.videoDx;
+        in.desc.videoDy            = t.videoDy;
+        in.desc.rotation2DDegrees  = t.rotationDeg;
+        in.desc.visible            = !L.isNullObject;
+        in.desc.matteSourceIndex   = -1;  // 既定 matte-free; マット有り経路で後段解決
+        // TrackMatteType ordinal == gpucomposite::MatteType ordinal
+        // (0=None,1=Alpha,2=AlphaInverted,3=Luma/Luminance,4=LumaInverted)。
+        // マット無し経路では常に None (ビット同一性のため明示固定)。
+        in.desc.matteType = hasMatte
+            ? static_cast<gpucomposite::MatteType>(static_cast<int>(L.matteType))
+            : gpucomposite::MatteType::None;
+        inputs.append(in);
+    }
+    if (inputs.size() < 2)
+        return QImage();  // スキップ後に多トラック条件を満たさない → CPU 経路
+
+    // STAGE4B: マット有り経路のみ、各レイヤーの matteSourceClipId を inputs ベクトル
+    // 内のインデックスへ解決する。マット時は事前スキップ無しで inputs は order と 1:1
+    // (V1 先頭昇順) なので、i 番目の input は layers.at(order.at(i)) に対応する。
+    // clipId は trackMatteClipKey(sourceTrack, sourceClipIndex)。sourceClipIndex は
+    // m_sequence[sequenceIdx] から取得 (範囲ガード)。解決規則は export 経路
+    // (TimelineFrameRenderer) と同一: srcIdx>0 && srcIdx!=i のみ採用。
+    if (hasMatte) {
+        clipstack::resolveLiveMatteSources(
+            inputs.size(),
+            [&](int i) -> QString {  // clipIdOf
+                const DecodedLayer &L = layers.at(order.at(i));
+                const int sq = L.sequenceIdx;
+                if (sq < 0 || sq >= m_sequence.size())
+                    return QString();  // 範囲外 → 解決不能 (map に載らず srcIdx=-1)
+                return trackMatteClipKey(L.sourceTrack, m_sequence.at(sq).sourceClipIndex);
+            },
+            [&](int i) -> QString {  // matteSrcClipIdOf
+                return layers.at(order.at(i)).matteSourceClipId;
+            },
+            [&](int i) -> bool {     // hasMatteOf
+                return layers.at(order.at(i)).matteType != TrackMatteType::None;
+            },
+            [&](int idx, int srcIdx) {  // setMatteSrcIndex
+                inputs[idx].desc.matteSourceIndex = srcIdx;
+            });
+    }
+
+    // GpuLayerCompositor::composite は内部で gpucomposite::paintOrder により
+    // sourceTrack 降順 (V1-wins) に並べ替えるので、CPU 側の stable_sort と
+    // 同じ V1-frontmost スタッキングになる。空 QImage は GL 失敗のシグナル。
+    const bool allRgba64 = std::all_of(
+        inputs.cbegin(), inputs.cend(),
+        [](const GpuLayerInput& in) {
+            return tlrcompose16::isRgba64Format(in.image.format());
+        });
+    if (hdrexport16::preview16Applicable(hdrexport16::enabledFromEnv(),
+                                         hasMatte,
+                                         static_cast<int>(inputs.size()),
+                                         allRgba64)) {
+        const bool odtEnabled = clipodt::enabledFromEnv();
+        const bool idtEnabled = clipidt::enabledFromEnv();
+        aces::ColorSpace v1OutputSpace = aces::ColorSpace::sRGB;
+        if (odtEnabled || idtEnabled) {
+            int v1Index = 0;
+            for (int i = 1; i < inputs.size(); ++i) {
+                if (inputs.at(i).desc.sourceTrack < inputs.at(v1Index).desc.sourceTrack)
+                    v1Index = i;
+            }
+            v1OutputSpace = clipcolor::acesSpaceFor(inputs.at(v1Index).colorMeta);
+        }
+
+        // Story2: IDT-only (ODT OFF) で VEDITOR_HDR_IDT_GPU が ON なら、CPU の
+        // toUnifiedSpace フルフレーム変換を省き、GPU フラグメントシェーダ
+        // (composite16Idt) に per-fragment IDT を行わせる。outSpace は
+        // composite16Idt が内部で V1 (最小 sourceTrack) から導出し v1OutputSpace と
+        // 一致する。GL 失敗時は下の既存 CPU conv 経路へフォールスルー。
+        // ODT ON 時はこの分岐を踏まず従来の toLinearWorking+applyOdt16 を維持。
+        if (idtEnabled && !odtEnabled && idtgpu::enabledFromEnv()) {
+            QImage outIdt = m_gpuCompositor->composite16Idt(inputs, canvas);
+            if (!outIdt.isNull() && outIdt.size() == canvas) {
+                const QImage out8 = hdrcomposite::to8bit(outIdt);
+                if (!out8.isNull() && out8.size() == canvas)
+                    return out8;
+            }
+        }
+
+        const QVector<GpuLayerInput>* composite16Inputs = &inputs;
+        QVector<GpuLayerInput> conv;
+        if (odtEnabled || idtEnabled) {
+            conv = inputs;
+            for (int i = 0; i < conv.size(); ++i) {
+                if (odtEnabled) {
+                    conv[i].image = clipcolor::toLinearWorking(inputs.at(i).image,
+                                                               inputs.at(i).colorMeta);
+                } else {
+                    conv[i].image = clipcolor::toUnifiedSpace(inputs.at(i).image,
+                                                              inputs.at(i).colorMeta,
+                                                              v1OutputSpace);
+                }
+            }
+            composite16Inputs = &conv;
+        }
+
+        QImage out16 = m_gpuCompositor->composite16(*composite16Inputs, canvas);
+        if (!out16.isNull() && out16.size() == canvas) {
+            if (odtEnabled) {
+                out16 = clipodt::applyOdt16(
+                    out16, clipodt::OdtParams{v1OutputSpace, true});
+            }
+            const QImage out8 = hdrcomposite::to8bit(out16);
+            if (!out8.isNull() && out8.size() == canvas) {
+                if (odtEnabled)
+                    m_lastFrameOdtApplied = true;
+                return out8;
+            }
+        }
+    }
+    if (hdrmatte16::matte16Applicable(hdrmatte16::enabledFromEnv(),
+                                      hasMatte,
+                                      static_cast<int>(inputs.size()),
+                                      allRgba64)) {
+        const bool odtEnabled = clipodt::enabledFromEnv();
+        const bool idtEnabled = clipidt::enabledFromEnv();
+        aces::ColorSpace v1OutputSpace = aces::ColorSpace::sRGB;
+        if (odtEnabled || idtEnabled) {
+            int v1Index = 0;
+            for (int i = 1; i < inputs.size(); ++i) {
+                if (inputs.at(i).desc.sourceTrack < inputs.at(v1Index).desc.sourceTrack)
+                    v1Index = i;
+            }
+            v1OutputSpace = clipcolor::acesSpaceFor(inputs.at(v1Index).colorMeta);
+        }
+
+        // Stage9b: IDT-only matte preview can skip CPU toUnifiedSpace by using
+        // per-fragment IDT on both the matte'd source and the matte source before
+        // luma extraction. ODT ON is excluded to avoid double-application.
+        if (idtEnabled && !odtEnabled && idtgpu::enabledFromEnv()) {
+            QImage out = m_gpuCompositor->composite16IdtMatte(inputs, canvas);
+            if (!out.isNull() && out.size() == canvas) {
+                const QImage out8 = hdrcomposite::to8bit(out);
+                if (!out8.isNull() && out8.size() == canvas)
+                    return out8;
+            }
+        }
+
+        QVector<GpuLayerInput> conv = inputs;
+        for (int i = 0; i < conv.size(); ++i) {
+            if (odtEnabled) {
+                conv[i].image = clipcolor::toLinearWorking(inputs.at(i).image,
+                                                           inputs.at(i).colorMeta);
+            } else if (idtEnabled) {
+                conv[i].image = clipcolor::toUnifiedSpace(inputs.at(i).image,
+                                                          inputs.at(i).colorMeta,
+                                                          v1OutputSpace);
+            }
+        }
+
+        if (odtEnabled) {
+            QSet<int> encoded;
+            for (int i = 0; i < conv.size(); ++i) {
+                const gpucomposite::MatteType mt = conv.at(i).desc.matteType;
+                const bool usesLuma =
+                    mt == gpucomposite::MatteType::Luminance ||
+                    mt == gpucomposite::MatteType::LuminanceInverted;
+                const int k = conv.at(i).desc.matteSourceIndex;
+                if (usesLuma && k >= 0 && k < conv.size() && !encoded.contains(k)) {
+                    conv[k].image = clipodt::applyOdt16(
+                        conv.at(k).image,
+                        clipodt::OdtParams{v1OutputSpace, false});
+                    encoded.insert(k);
+                }
+            }
+        }
+
+        QImage out16 = m_gpuCompositor->composite16Matte(conv, canvas);
+        if (!out16.isNull() && out16.size() == canvas) {
+            if (odtEnabled) {
+                out16 = clipodt::applyOdt16(
+                    out16, clipodt::OdtParams{v1OutputSpace, true});
+            }
+            const QImage out8 = hdrcomposite::to8bit(out16);
+            if (!out8.isNull() && out8.size() == canvas) {
+                if (odtEnabled)
+                    m_lastFrameOdtApplied = true;
+                return out8;
+            }
+        }
+    }
+    QImage out = m_gpuCompositor->composite(inputs, canvas);
+    if (out.isNull() || out.size() != canvas)
+        return QImage();  // 合成失敗 → CPU フォールバック
+    return out;
 }
 
 // decodePoolFrame is decodeNextFrame's V2+ twin: same FFmpeg loop logic but
@@ -4694,29 +6662,37 @@ bool VideoPlayer::decodePoolFrame(TrackDecoder *d, bool ensureRgb)
         if (!displayable || displayable->width <= 0 || displayable->height <= 0)
             return false;
 
-        // sws_scale into a QImage. Pool stays SDR for the MVP — HDR overlay
-        // mixing isn't supported yet (V1 still drives the HDR transfer
-        // metadata). RGB24 is fine for SourceOver compositing because we
-        // promote to ARGB32_Premultiplied in composeMultiTrackFrame anyway.
+        // HDR Stage4: RGBA64 container only — transfer curve is NOT tone-mapped here (F1).
+        const bool wantHdr = d->wantRgba64Overlay;
+        const AVPixelFormat dstPixFmt = wantHdr ? AV_PIX_FMT_RGBA64LE : AV_PIX_FMT_RGB24;
+        const QImage::Format qFmt = wantHdr ? QImage::Format_RGBA64 : QImage::Format_RGB888;
+
         const int proxy = playbackProxyDivisor();
         const int dstW = qMax(2, displayable->width  / proxy);
         const int dstH = qMax(2, displayable->height / proxy);
+
         d->swsCtx = sws_getCachedContext(
             d->swsCtx,
-            displayable->width, displayable->height,
+            displayable->width,
+            displayable->height,
             static_cast<AVPixelFormat>(displayable->format),
-            dstW, dstH,
-            AV_PIX_FMT_RGB24,
-            SWS_BILINEAR, nullptr, nullptr, nullptr);
+            dstW,
+            dstH,
+            dstPixFmt,
+            SWS_BILINEAR,
+            nullptr,
+            nullptr,
+            nullptr);
+
         if (!d->swsCtx)
             return false;
-        QImage image(dstW, dstH, QImage::Format_RGB888);
+
+        QImage image(dstW, dstH, qFmt);
         if (image.isNull())
             return false;
-        uint8_t *dest[4]      = { image.bits(), nullptr, nullptr, nullptr };
-        int      destLines[4] = { static_cast<int>(image.bytesPerLine()), 0, 0, 0 };
-        sws_scale(d->swsCtx, displayable->data, displayable->linesize, 0,
-                  displayable->height, dest, destLines);
+
+        if (!scaleFrameToQImagePadded(d->swsCtx, displayable, dstPixFmt, image))
+            return false;
 
         // Commit position + frame only after the full pipeline succeeded.
         d->currentPositionUs = positionUs;
@@ -4816,9 +6792,12 @@ bool VideoPlayer::finalizeOverlayFromDecoder(const PlaybackEntry &e, int seqIdx,
     if (!out || !d)
         return false;
 
+    QSize sourceSize;
     if (!d->lastFrameRgb.isNull()) {
         out->rgb     = d->lastFrameRgb;
         out->isFresh = decodedOk;
+        if (d->codecCtx && d->codecCtx->width > 0 && d->codecCtx->height > 0)
+            sourceSize = QSize(d->codecCtx->width, d->codecCtx->height);
     } else {
         // Fresh decoder with no successful decode yet — try the eviction
         // grace pool for the same identity. Match the TrackKey contract
@@ -4836,6 +6815,8 @@ bool VideoPlayer::finalizeOverlayFromDecoder(const PlaybackEntry &e, int seqIdx,
                 && !g->lastFrameRgb.isNull()) {
                 out->rgb     = g->lastFrameRgb;
                 out->isFresh = false;
+                if (g->codecCtx && g->codecCtx->width > 0 && g->codecCtx->height > 0)
+                    sourceSize = QSize(g->codecCtx->width, g->codecCtx->height);
                 break;
             }
         }
@@ -4843,12 +6824,20 @@ bool VideoPlayer::finalizeOverlayFromDecoder(const PlaybackEntry &e, int seqIdx,
             return false;
     }
 
-    out->opacity     = e.opacity;
-    out->videoScale  = e.videoScale;
-    out->videoDx     = e.videoDx;
-    out->videoDy     = e.videoDy;
-    out->sourceTrack = e.sourceTrack;
-    out->sequenceIdx = seqIdx;
+    if (sourceSize.width() <= 0 || sourceSize.height() <= 0)
+        sourceSize = out->rgb.size();
+    const Timeline *previewTimeline = m_glPreview ? m_glPreview->timeline() : nullptr;
+    if (seqIdx >= 0 && seqIdx < m_sequence.size()) {
+        const double sourceSec =
+            static_cast<double>(entryLocalPositionUs(seqIdx, m_timelinePositionUs))
+            / AV_TIME_BASE;
+        out->rgb = applyPreviewClipMask(
+            out->rgb, previewTimeline, e, sourceSec, sourceSize);
+    }
+
+    out->colorMeta          = e.colorMeta;
+    applyLayerMotionOpacity(previewTimeline, e, m_timelinePositionUs, e.opacity, out);
+    populateLayerMetadata(previewTimeline, e, seqIdx, out);
     return true;
 }
 
@@ -4878,7 +6867,10 @@ bool VideoPlayer::harvestOverlayLayer(const PlaybackEntry &e, int seqIdx, Decode
         const int64_t clipOutUs = static_cast<int64_t>(e.clipOut * AV_TIME_BASE);
         ok = runOverlayDecodeForDecoder(d, expectedFileLocalUs, clipInUs, clipOutUs);
     }
-    return finalizeOverlayFromDecoder(e, seqIdx, d, ok, out);
+    const bool finalized = finalizeOverlayFromDecoder(e, seqIdx, d, ok, out);
+    if (finalized)
+        out->colorMeta = e.colorMeta;
+    return finalized;
 }
 
 bool VideoPlayer::hasOverlayActive(const QVector<int> &activeIdxs) const

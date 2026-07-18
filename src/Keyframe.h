@@ -3,15 +3,32 @@
 #include <QVariant>
 #include <QString>
 #include <QVector>
+#include <QHash>
 #include <QJsonObject>
 #include <QJsonArray>
+
+enum class LoopMode {
+    None = 0,
+    Cycle,
+    PingPong,
+    Continue
+};
 
 struct KeyframePoint {
     double time = 0.0;   // seconds
     double value = 0.0;
 
-    enum Interpolation { Linear, EaseIn, EaseOut, EaseInOut, Hold };
+    enum Interpolation { Linear, EaseIn, EaseOut, EaseInOut, Hold, Bezier, ElasticOut, BounceOut, BackOut };
     Interpolation interpolation = Linear;
+    double bezX1 = 0.0;
+    double bezY1 = 0.0;
+    double bezX2 = 1.0;
+    double bezY2 = 1.0;
+    bool hasSpatialTangent = false;
+    double spatialOutX = 0.0;
+    double spatialOutY = 0.0;
+    double spatialInX = 0.0;
+    double spatialInY = 0.0;
 };
 
 struct StringKeyframePoint {
@@ -27,12 +44,23 @@ public:
 
     const QString &propertyName() const { return m_property; }
     double defaultValue() const { return m_defaultValue; }
+    void setPropertyName(const QString &propertyName);
 
     void addKeyframe(double time, double value,
-                     KeyframePoint::Interpolation interp = KeyframePoint::Linear);
+                     KeyframePoint::Interpolation interp = KeyframePoint::Linear,
+                     double bezX1 = 0.0,
+                     double bezY1 = 0.0,
+                     double bezX2 = 1.0,
+                     double bezY2 = 1.0,
+                     bool hasSpatialTangent = false,
+                     double spatialOutX = 0.0,
+                     double spatialOutY = 0.0,
+                     double spatialInX = 0.0,
+                     double spatialInY = 0.0);
     void removeKeyframe(int index);
     void setKeyframeValue(int index, double value);
     void setKeyframeTime(int index, double time);
+    void setKeyframePoint(int index, const KeyframePoint &keyframe);
 
     double valueAt(double time) const;
     bool hasKeyframes() const { return !m_keyframes.isEmpty(); }
@@ -47,7 +75,11 @@ public:
 
 private:
     static double interpolate(double from, double to, double t,
-                              KeyframePoint::Interpolation interp);
+                              KeyframePoint::Interpolation interp,
+                              double bezX1 = 0.0,
+                              double bezY1 = 0.0,
+                              double bezX2 = 1.0,
+                              double bezY2 = 1.0);
     static double easeIn(double t);
     static double easeOut(double t);
     static double easeInOut(double t);
@@ -57,6 +89,9 @@ private:
     QVector<KeyframePoint> m_keyframes; // sorted by time
     QVector<KeyframePoint> m_variantKeyframes; // sorted by time, uses interpolation=Hold for discrete
 };
+
+QJsonObject keyframePointToJson(const KeyframePoint &kf);
+KeyframePoint keyframePointFromJson(const QJsonObject &obj);
 
 // US-AETEXT-4: String keyframe track for Source Text animation
 class StringKeyframeTrack
@@ -91,6 +126,7 @@ class KeyframeManager
 public:
     void addTrack(const KeyframeTrack &track);
     void removeTrack(const QString &propertyName);
+    bool renameTrack(const QString &oldPropertyName, const QString &newPropertyName);
     KeyframeTrack *track(const QString &propertyName);
     const KeyframeTrack *track(const QString &propertyName) const;
     bool hasTrack(const QString &propertyName) const;
@@ -98,6 +134,11 @@ public:
 
     QVector<KeyframeTrack> &tracks() { return m_tracks; }
     const QVector<KeyframeTrack> &tracks() const { return m_tracks; }
+
+    // AE-ANIM-3: engine/JSON support only. The editor combo box is deferred
+    // so the default None path remains byte-identical for existing projects.
+    void setLoopOutMode(const QString &propertyName, LoopMode mode);
+    LoopMode loopOutMode(const QString &propertyName) const;
 
     // US-AETEXT-4: String track management (routes source-text keyframes through StringKeyframeTrack)
     void addStringTrack(const StringKeyframeTrack &track);
@@ -111,6 +152,7 @@ public:
 
     // Convenience: get value at time for a named property, returns defaultVal if no track
     double valueAt(const QString &propertyName, double time, double defaultVal = 0.0) const;
+    double loopedTimeForTrack(const QString &propertyName, double time) const;
 
     // US-AETEXT-4: get string value at time for a named property (uses StringKeyframeTrack)
     QString stringValueAt(const QString &propertyName, double time, const QString &defaultVal = QString()) const;
@@ -122,6 +164,7 @@ public:
 private:
     QVector<KeyframeTrack> m_tracks;
     QVector<StringKeyframeTrack> m_stringTracks; // US-AETEXT-4: dedicated string-typed tracks
+    QHash<QString, LoopMode> m_loopOutModes;
 };
 
 // US-BRUSH-5: idempotent helper — adds a 'brush_progress' KeyframeTrack

@@ -1,6 +1,10 @@
 #include "AudioRestoration.h"
+#include "SpectralEngine.h"
 
+#include <algorithm>
+#include <complex>
 #include <cmath>
+#include <vector>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -180,11 +184,102 @@ void spectralNoiseGate(QVector<float> &samples, int sampleRate, double threshold
 }
 
 // ---------------------------------------------------------------------------
+// spectralSubtraction — overlap-add STFT spectral subtraction
+// ---------------------------------------------------------------------------
+void spectralSubtraction(QVector<float> &samples, int sampleRate, double strength)
+{
+    const int n = samples.size();
+    const int kFftSize = 1024;
+    const int kHopSize = 256;
+    if (n < kFftSize || sampleRate <= 0 || strength <= 0.0)
+        return;
+
+    const double amount = std::max(0.0, std::min(2.0, strength));
+    if (amount <= 0.0)
+        return;
+
+    std::vector<double> input;
+    input.reserve(static_cast<size_t>(n));
+    for (float s : samples)
+        input.push_back(std::isfinite(s) ? static_cast<double>(s) : 0.0);
+
+    spectral::Stft spectrum = spectral::stft(input, sampleRate, kFftSize, kHopSize);
+    if (spectrum.fftSize != kFftSize || spectrum.hopSize <= 0 || spectrum.frames.empty())
+        return;
+
+    const int positiveBins = (kFftSize / 2) + 1;
+    std::vector<double> noiseMag(static_cast<size_t>(positiveBins), 0.0);
+    std::vector<double> mags;
+    mags.reserve(spectrum.frames.size());
+
+    for (int k = 0; k < positiveBins; ++k) {
+        mags.clear();
+        for (const auto &frame : spectrum.frames) {
+            if (static_cast<int>(frame.size()) == kFftSize)
+                mags.push_back(std::abs(frame[static_cast<size_t>(k)]));
+        }
+        if (mags.empty())
+            continue;
+
+        std::sort(mags.begin(), mags.end());
+        const size_t idx = std::min(mags.size() - 1,
+                                    static_cast<size_t>(mags.size() * 0.20));
+        noiseMag[static_cast<size_t>(k)] = mags[idx];
+    }
+
+    const double spectralFloor = 0.08;
+    for (auto &frame : spectrum.frames) {
+        if (static_cast<int>(frame.size()) != kFftSize)
+            continue;
+
+        for (int k = 0; k < positiveBins; ++k) {
+            const size_t bin = static_cast<size_t>(k);
+            const double mag = std::abs(frame[bin]);
+            if (mag <= 1e-20) {
+                frame[bin] = std::complex<double>(0.0, 0.0);
+                if (k > 0 && k < kFftSize / 2)
+                    frame[static_cast<size_t>(kFftSize - k)] = std::complex<double>(0.0, 0.0);
+                continue;
+            }
+
+            const double reduced = std::max(mag - amount * noiseMag[bin],
+                                            spectralFloor * mag);
+            const double gain = reduced / mag;
+            frame[bin] *= gain;
+
+            if (k > 0 && k < kFftSize / 2) {
+                const size_t mirror = static_cast<size_t>(kFftSize - k);
+                frame[mirror] *= gain;
+            }
+        }
+    }
+
+    const std::vector<double> restored = spectral::istft(spectrum, n);
+    if (static_cast<int>(restored.size()) != n)
+        return;
+
+    for (int i = 0; i < n; ++i) {
+        double v = restored[static_cast<size_t>(i)];
+        if (!std::isfinite(v))
+            v = 0.0;
+        v = std::max(-1.0, std::min(1.0, v));
+        samples[i] = static_cast<float>(v);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // processAll — conditional 3-stage pipeline
 // ---------------------------------------------------------------------------
 QVector<float> processAll(const QVector<float> &in, int sampleRate, const RestoreConfig &cfg)
 {
     QVector<float> out = in; // copy; never mutate caller's buffer
+
+    // Sanitize non-finite input: a single NaN/Inf would otherwise propagate
+    // through the deHum biquad feedback and corrupt every subsequent sample.
+    for (float &s : out) {
+        if (!std::isfinite(s))
+            s = 0.0f;
+    }
 
     if (cfg.doDeclick)
         deClick(out, sampleRate, cfg.declickThreshold);
@@ -193,7 +288,7 @@ QVector<float> processAll(const QVector<float> &in, int sampleRate, const Restor
         deHum(out, sampleRate, cfg.dehumFreq, cfg.dehumHarmonics);
 
     if (cfg.doNoiseGate)
-        spectralNoiseGate(out, sampleRate, cfg.noiseGateDb);
+        spectralSubtraction(out, sampleRate, cfg.noiseReductionStrength);
 
     return out;
 }

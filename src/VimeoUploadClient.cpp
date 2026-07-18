@@ -16,8 +16,14 @@ namespace vimeo {
 namespace upload {
 
 namespace {
+QString g_apiBaseUrl;
 
-constexpr const char* kCreateVideoUrl = "https://api.vimeo.com/me/videos";
+QString createVideoUrl() {
+    const QString base = g_apiBaseUrl.isEmpty()
+        ? QStringLiteral("https://api.vimeo.com")
+        : g_apiBaseUrl;
+    return base + QStringLiteral("/me/videos");
+}
 
 QString replyMessage(QNetworkReply* reply, const QByteArray& body) {
     QString detail;
@@ -72,6 +78,14 @@ UploadClient::UploadClient(const vimeo::oauth::VimeoOAuthConfig& config, QObject
     , m_accessToken(config.accessToken.trimmed()) {}
 
 UploadClient::~UploadClient() = default;
+
+void UploadClient::setApiBaseUrl(const QString& url) {
+    g_apiBaseUrl = url;
+}
+
+QString UploadClient::apiBaseUrl() {
+    return g_apiBaseUrl;
+}
 
 void UploadClient::setAccessToken(const QString& accessToken) {
     m_accessToken = accessToken.trimmed();
@@ -326,7 +340,7 @@ void UploadClient::createUpload() {
         root.insert(QStringLiteral("description"), m_job.description);
     }
 
-    QNetworkRequest request{QUrl(QString::fromLatin1(kCreateVideoUrl))};
+    QNetworkRequest request{QUrl(createVideoUrl())};
     request.setHeader(QNetworkRequest::ContentTypeHeader,
                       QStringLiteral("application/json; charset=UTF-8"));
     request.setRawHeader("Accept", "application/vnd.vimeo.*+json;version=3.4");
