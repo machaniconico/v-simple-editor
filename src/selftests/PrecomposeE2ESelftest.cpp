@@ -1,10 +1,16 @@
 #include "../MainWindow.h"
+#include "../AudioMixer.h"
+#include "../AudioBusPanel.h"
+#include "../MediaPoolDock.h"
 #include "../Timeline.h"
 #include "../UndoManager.h"
+#include "../VideoPlayer.h"
 
 #include <QApplication>
 #include <QDebug>
+#include <QPointer>
 #include <QString>
+#include <QThread>
 #include <QVector>
 
 #include <cmath>
@@ -515,6 +521,88 @@ int runPrecomposeE2ESelftest()
           detail);
 
     qInfo().noquote() << QStringLiteral("[precompose-e2e] summary: %1 PASS, %2 FAIL")
+        .arg(passed)
+        .arg(failed);
+    return failed == 0 ? 0 : failed;
+}
+
+namespace {
+
+struct MainWindowLifecycleResult {
+    bool mainWindowDestroyed = false;
+    bool dependentDocksFound = false;
+    bool mediaPoolDockDestroyed = false;
+    bool audioBusPanelDestroyed = false;
+};
+
+MainWindowLifecycleResult constructAndDestroyMainWindow()
+{
+    MainWindowLifecycleResult result;
+    MainWindow *window = new MainWindow;
+    QPointer<MainWindow> windowGuard(window);
+    QPointer<MediaPoolDock> mediaPoolDock =
+        window->findChild<MediaPoolDock *>();
+    QPointer<AudioBusPanel> audioBusPanel =
+        window->findChild<AudioBusPanel *>();
+    result.dependentDocksFound = !mediaPoolDock.isNull()
+        && !audioBusPanel.isNull();
+
+    delete window;
+
+    result.mainWindowDestroyed = windowGuard.isNull();
+    result.mediaPoolDockDestroyed = mediaPoolDock.isNull();
+    result.audioBusPanelDestroyed = audioBusPanel.isNull();
+    return result;
+}
+
+} // namespace
+
+int runMainWindowLifecycleSelftest()
+{
+    int passed = 0;
+    int failed = 0;
+    auto check = [&](int gate, const char *name, bool ok,
+                     const QString &detail = QString()) {
+        if (ok) {
+            ++passed;
+            qInfo().noquote() << QStringLiteral("[mainwindow-lifecycle] PASS G%1 %2")
+                .arg(gate)
+                .arg(QString::fromLatin1(name));
+        } else {
+            ++failed;
+            qCritical().noquote() << QStringLiteral("[mainwindow-lifecycle] FAIL G%1 %2%3")
+                .arg(gate)
+                .arg(QString::fromLatin1(name))
+                .arg(detail.isEmpty() ? QString() : QStringLiteral(": ") + detail);
+        }
+    };
+
+    const MainWindowLifecycleResult first = constructAndDestroyMainWindow();
+    check(1, "one MainWindow construct/destroy completes",
+          first.mainWindowDestroyed && first.dependentDocksFound,
+          first.dependentDocksFound
+              ? QString()
+              : QStringLiteral("MediaPoolDock or AudioBusPanel was not created"));
+
+    bool repeated = true;
+    for (int i = 0; i < 3; ++i) {
+        const MainWindowLifecycleResult cycle = constructAndDestroyMainWindow();
+        if (!cycle.mainWindowDestroyed || !cycle.dependentDocksFound) {
+            repeated = false;
+            break;
+        }
+    }
+    check(2, "three repeated MainWindow construct/destroy cycles complete", repeated);
+
+    check(3, "dependent docks are destroyed after MainWindow teardown",
+          first.mediaPoolDockDestroyed && first.audioBusPanelDestroyed,
+          QStringLiteral("MediaPoolDock destroyed=%1, AudioBusPanel destroyed=%2")
+              .arg(first.mediaPoolDockDestroyed ? QStringLiteral("true")
+                                                 : QStringLiteral("false"))
+              .arg(first.audioBusPanelDestroyed ? QStringLiteral("true")
+                                                 : QStringLiteral("false")));
+
+    qInfo().noquote() << QStringLiteral("[mainwindow-lifecycle] summary: %1 PASS, %2 FAIL")
         .arg(passed)
         .arg(failed);
     return failed == 0 ? 0 : failed;

@@ -11,6 +11,7 @@
 #include "ClipGeometry.h"      // clipgeom::renderLayer (shared clip-placement SSOT)
 #include "clipanim/ClipAnim.h" // S1 — motion/opacity keyframe evaluation
 #include "TrackMatteKey.h"     // STAGE4B: trackMatteClipKey (canonical matte clip key)
+#include "VfxFootageLibrary.h" // VFX-C source-side black level + intensity
 #include "playback/LiveMatteResolve.h" // STAGE4B: clipstack::resolveLiveMatteSources
 #include "playback/clipidt_flag.h"
 #include "playback/hdrexport16_flag.h"
@@ -152,6 +153,12 @@ bool scaleFrameToQImagePadded(SwsContext *ctx,
     }
     av_freep(&tmpData[0]);
     return true;
+}
+
+bool pixelFormatHasAlpha(AVPixelFormat pixelFormat)
+{
+    const AVPixFmtDescriptor *descriptor = av_pix_fmt_desc_get(pixelFormat);
+    return descriptor && (descriptor->flags & AV_PIX_FMT_FLAG_ALPHA) != 0;
 }
 
 const ClipInfo *clipForPlaybackEntry(const Timeline *timeline, const PlaybackEntry &entry)
@@ -334,6 +341,17 @@ QImage applyPreviewClipMask(const QImage &frame,
     return clipmask::applyRasterAlphaMask(frame, masks);
 }
 
+QImage applyVfxFootageControls(const QImage &frame,
+                               const PlaybackEntry &entry)
+{
+    if (!entry.isVfxFootage || frame.isNull())
+        return frame;
+    const QImage tightened = vfxfootage::VfxFootageLibrary::applyBlackLevel(
+        frame, entry.vfxBlackLevel);
+    return vfxfootage::VfxFootageLibrary::applyIntensity(
+        tightened, entry.vfxIntensity);
+}
+
 struct ActivePreviewAdjustmentClip {
     int trackIndex = 0;
     const ClipInfo *clip = nullptr;
@@ -423,6 +441,15 @@ bool hasDecodedTrackMatte(const QVector<VideoPlayer::DecodedLayer> &layers)
         });
 }
 
+bool hasDecodedSpecialBlend(const QVector<VideoPlayer::DecodedLayer> &layers)
+{
+    return std::any_of(
+        layers.cbegin(), layers.cend(),
+        [](const VideoPlayer::DecodedLayer &layer) {
+            return layer.blendMode != BlendMode::Normal;
+        });
+}
+
 clipgeom::ClipTransform transformForLayer(const VideoPlayer::DecodedLayer &layer);
 QVector<clipgeom::ClipTransform> effectiveLayerTransforms(
     const QVector<VideoPlayer::DecodedLayer> &layers,
@@ -449,9 +476,7 @@ void composePreviewFrameWithAdjustmentClips(
             ? effectiveLayerTransforms(layers, cs)
             : QVector<clipgeom::ClipTransform>{};
 
-    auto paintTrack = [&](int trackIndex) {
-        QPainter p(&canvas);
-        p.setCompositionMode(QPainter::CompositionMode_SourceOver);
+    auto paintTrack = [&](int trackIndex, bool specialBlendPass) {
         const bool kSmooth = false;
         for (int i = 0; i < layers.size(); ++i) {
             const VideoPlayer::DecodedLayer &L = layers.at(i);
@@ -459,14 +484,25 @@ void composePreviewFrameWithAdjustmentClips(
                 continue;
             if (L.isNullObject || L.rgb.isNull() || L.opacity <= 0.001)
                 continue;
+            if ((L.blendMode != BlendMode::Normal) != specialBlendPass)
+                continue;
             const clipgeom::ClipTransform t = effectiveTransforms.isEmpty()
                 ? transformForLayer(L)
                 : effectiveTransforms.value(i, transformForLayer(L));
             QImage placed = clipgeom::renderLayer(L.rgb, t, cs, kSmooth);
             if (!L.layerStyle.isIdentity())
                 placed = layerstyle::apply(placed, L.layerStyle);
-            p.setOpacity(qBound(0.0, L.opacity, 1.0));
-            p.drawImage(0, 0, placed);
+            if (specialBlendPass) {
+                canvas = LayerCompositor::blendImages(
+                    canvas, placed, L.blendMode,
+                    qBound(0.0, L.opacity, 1.0))
+                    .convertToFormat(QImage::Format_ARGB32_Premultiplied);
+            } else {
+                QPainter p(&canvas);
+                p.setCompositionMode(QPainter::CompositionMode_SourceOver);
+                p.setOpacity(qBound(0.0, L.opacity, 1.0));
+                p.drawImage(0, 0, placed);
+            }
         }
     };
 
@@ -487,14 +523,20 @@ void composePreviewFrameWithAdjustmentClips(
         maxTrack = qMax(maxTrack, adjustment.trackIndex);
 
     for (int track = maxTrack; track >= 1; --track) {
-        paintTrack(track);
+        paintTrack(track, false);
         applyAdjustmentTrack(track);
     }
 
     if (hasPreviewAdjustmentAtTrack(adjustments, 0))
         applyAdjustmentTrack(0);
     else
-        paintTrack(0);
+        paintTrack(0, false);
+
+    // Screen/Add footage must be evaluated after the V1 base, otherwise an
+    // opaque V1 layer would hide the light-producing overlay. Keep this pass
+    // in the same order as TimelineFrameRenderer's adjustment path.
+    for (int track = 1; track <= maxTrack; ++track)
+        paintTrack(track, true);
 }
 
 QImage applyPreviewAdjustmentClipsAfterMatte(
@@ -769,6 +811,10 @@ void applyLayerMotionOpacity(const Timeline *timeline,
     layer->videoDx = entry.videoDx;
     layer->videoDy = entry.videoDy;
     layer->rotation2DDegrees = entry.rotation2DDegrees;
+    layer->isVfxFootage = entry.isVfxFootage;
+    layer->blendMode = entry.blendMode;
+    layer->vfxIntensity = entry.vfxIntensity;
+    layer->vfxBlackLevel = entry.vfxBlackLevel;
 
     const ClipInfo *clip = clipForPlaybackEntry(timeline, entry);
     if (!clip || !clip->keyframes.hasAnyKeyframes())
@@ -1092,6 +1138,16 @@ VideoPlayer::~VideoPlayer()
         m_wbEyedropperOverlay->deleteLater();
         m_wbEyedropperOverlay = nullptr;
     }
+    // resetDecoder() はクリップ切り替え用の関数で、末尾で UI (シークバー/再生ボタン/
+    // 位置表示) を更新し positionChanged 系のシグナルも走る。破棄中にそれを行うと、
+    // 既に畳まれ始めた子ウィジェットやシグナル接続先を触って 0xC0000005 になる
+    // (mainwindow-lifecycle / precompose-e2e / light3d が全て破棄時に落ちていた原因)。
+    // 破棄中は UI 更新を抑止し、リソース解放だけを行わせる。
+    m_suppressUiUpdates = true;
+    // NOTE: ここで m_mixer->shutdown() を先行呼び出しする案を試したが、実測で
+    // 明確に退行した (light3d が 15/15 失敗 = 100%、mainwindow-lifecycle も
+    // 30回中22回失敗へ悪化)。AudioMixer の停止は ~AudioMixer 側の teardown に
+    // 任せる。破棄時の残存クラッシュは別経路にあるため、ここでの先行停止では直らない。
     resetDecoder();
     // Tear down V2+ decoder pool after the legacy V1 decoder is gone, then
     // release the shared HW device context. The pool decoders only hold
@@ -1111,6 +1167,7 @@ VideoPlayer::~VideoPlayer()
     // touches it so it survives clip switches; release at process exit).
     if (m_hwDeviceCtx)
         av_buffer_unref(&m_hwDeviceCtx);
+
 }
 
 void VideoPlayer::setupUI()
@@ -4129,8 +4186,9 @@ bool VideoPlayer::seekInternal(int64_t positionUs, bool displayFrame, bool preci
             && m_activeEntry >= 0
             && m_activeEntry < m_sequence.size()) {
             const auto &entry = m_sequence[m_activeEntry];
+            displayImage = applyVfxFootageControls(displayImage, entry);
             displayImage = applyPreviewClipMask(
-                image,
+                displayImage,
                 m_glPreview ? m_glPreview->timeline() : nullptr,
                 entry,
                 static_cast<double>(targetUs) / AV_TIME_BASE,
@@ -4243,12 +4301,13 @@ bool VideoPlayer::presentDecodedFrame(AVFrame *frame, bool displayFrameRequested
                 && m_activeEntry >= 0
                 && m_activeEntry < m_sequence.size()) {
                 const auto &entry = m_sequence[m_activeEntry];
+                displayImage = applyVfxFootageControls(displayImage, entry);
                 const double sourceSec =
                     static_cast<double>(
                         entryLocalPositionUs(m_activeEntry, m_timelinePositionUs))
                     / AV_TIME_BASE;
                 displayImage = applyPreviewClipMask(
-                    image,
+                    displayImage,
                     m_glPreview ? m_glPreview->timeline() : nullptr,
                     entry,
                     sourceSec,
@@ -4304,8 +4363,12 @@ QImage VideoPlayer::frameToImage(const AVFrame *frame)
     }
 
     const bool hdr = m_hdrInfo.isHdr;
-    const AVPixelFormat dstPixFmt = hdr ? AV_PIX_FMT_RGBA64LE : AV_PIX_FMT_RGB24;
-    const QImage::Format qFmt = hdr ? QImage::Format_RGBA64 : QImage::Format_RGB888;
+    const bool hasAlpha = pixelFormatHasAlpha(
+        static_cast<AVPixelFormat>(frame->format));
+    const AVPixelFormat dstPixFmt = hdr ? AV_PIX_FMT_RGBA64LE
+        : hasAlpha ? AV_PIX_FMT_RGBA : AV_PIX_FMT_RGB24;
+    const QImage::Format qFmt = hdr ? QImage::Format_RGBA64
+        : hasAlpha ? QImage::Format_RGBA8888 : QImage::Format_RGB888;
 
     // Phase 1e proxy: optionally downscale during sws_scale so the
     // destination QImage is 1/N each axis. Compose draws this small
@@ -4474,7 +4537,8 @@ void VideoPlayer::refreshDisplayedFrame()
                         entryLocalPositionUs(m_activeEntry, m_timelinePositionUs))
                     / AV_TIME_BASE;
                 layer.rgb = applyPreviewClipMask(
-                    m_lastV1RawFrame, previewTimeline, e, sourceSec, sourceSize);
+                    applyVfxFootageControls(m_lastV1RawFrame, e),
+                    previewTimeline, e, sourceSec, sourceSize);
                 layer.isFresh = true;
                 layer.colorMeta = e.colorMeta;
                 applyLayerMotionOpacity(previewTimeline,
@@ -5130,7 +5194,8 @@ void VideoPlayer::handlePlaybackTick()
                             entryLocalPositionUs(idx, m_timelinePositionUs))
                         / AV_TIME_BASE;
                     layer.rgb = applyPreviewClipMask(
-                        m_lastV1RawFrame, previewTimeline, e, sourceSec, sourceSize);
+                        applyVfxFootageControls(m_lastV1RawFrame, e),
+                        previewTimeline, e, sourceSec, sourceSize);
                     layer.isFresh = true;
                     layer.colorMeta = e.colorMeta;
                     applyLayerMotionOpacity(previewTimeline,
@@ -5222,7 +5287,8 @@ void VideoPlayer::handlePlaybackTick()
                             entryLocalPositionUs(idx, m_timelinePositionUs))
                         / AV_TIME_BASE;
                     layer.rgb = applyPreviewClipMask(
-                        m_lastV1RawFrame, previewTimeline, e, sourceSec, sourceSize);
+                        applyVfxFootageControls(m_lastV1RawFrame, e),
+                        previewTimeline, e, sourceSec, sourceSize);
                     layer.isFresh = true;
                 } else {
                     if (!harvestOverlayLayer(e, idx, &layer))
@@ -5335,7 +5401,8 @@ void VideoPlayer::handlePlaybackTick()
                             entryLocalPositionUs(m_activeEntry, m_timelinePositionUs))
                         / AV_TIME_BASE;
                     fallbackFrame = applyPreviewClipMask(
-                        m_lastV1RawFrame, previewTimeline, entry, sourceSec, sourceSize);
+                        applyVfxFootageControls(m_lastV1RawFrame, entry),
+                        previewTimeline, entry, sourceSec, sourceSize);
                 }
                 displayFrame(fallbackFrame);
             } else {
@@ -5354,7 +5421,8 @@ void VideoPlayer::handlePlaybackTick()
                 const bool adjustmentClipPresent = !activeAdjustments.isEmpty();
                 const bool trackMattePresent = hasDecodedTrackMatte(layers);
                 const bool canTryGpuComposite =
-                    !adjustmentClipPresent || trackMattePresent;
+                    (!adjustmentClipPresent || trackMattePresent)
+                    && !hasDecodedSpecialBlend(layers);
                 const QImage gpuComposed = canTryGpuComposite
                     ? tryGpuComposeLayers(layers, m_canvasBase.size())
                     : QImage();
@@ -5464,7 +5532,8 @@ void VideoPlayer::handlePlaybackTick()
                         entryLocalPositionUs(m_activeEntry, m_timelinePositionUs))
                     / AV_TIME_BASE;
                 fallbackFrame = applyPreviewClipMask(
-                    m_lastV1RawFrame, previewTimeline, entry, sourceSec, sourceSize);
+                    applyVfxFootageControls(m_lastV1RawFrame, entry),
+                    previewTimeline, entry, sourceSec, sourceSize);
             }
             displayFrame(fallbackFrame);
         }
@@ -6184,19 +6253,34 @@ QImage VideoPlayer::composeMultiTrackFrame(const QImage &v1Frame,
         veditor::parentingEnabledFromEnv()
             ? effectiveLayerTransforms(overlayLayers, canvas)
             : QVector<clipgeom::ClipTransform>{};
-    for (int i = 0; i < overlayLayers.size(); ++i) {
-        const DecodedLayer &L = overlayLayers[i];
-        if (L.isNullObject || L.rgb.isNull() || L.opacity <= 0.001)
-            continue;
-        const clipgeom::ClipTransform t = effectiveTransforms.isEmpty()
-            ? transformForLayer(L)
-            : effectiveTransforms.value(i, transformForLayer(L));
-        QImage placed = clipgeom::renderLayer(
-            L.rgb, t, canvas, kSmooth);
-        if (!L.layerStyle.isIdentity())
-            placed = layerstyle::apply(placed, L.layerStyle);
-        p.setOpacity(qBound(0.0, L.opacity, 1.0));
-        p.drawImage(0, 0, placed);
+    for (int pass = 0; pass < 2; ++pass) {
+        const bool specialBlendPass = pass == 1;
+        for (int i = 0; i < overlayLayers.size(); ++i) {
+            const DecodedLayer &L = overlayLayers[i];
+            if (L.isNullObject || L.rgb.isNull() || L.opacity <= 0.001)
+                continue;
+            if ((L.blendMode != BlendMode::Normal) != specialBlendPass)
+                continue;
+            const clipgeom::ClipTransform t = effectiveTransforms.isEmpty()
+                ? transformForLayer(L)
+                : effectiveTransforms.value(i, transformForLayer(L));
+            QImage placed = clipgeom::renderLayer(
+                L.rgb, t, canvas, kSmooth);
+            if (!L.layerStyle.isIdentity())
+                placed = layerstyle::apply(placed, L.layerStyle);
+            if (specialBlendPass) {
+                p.end();
+                composed = LayerCompositor::blendImages(
+                    composed, placed, L.blendMode,
+                    qBound(0.0, L.opacity, 1.0))
+                    .convertToFormat(QImage::Format_ARGB32_Premultiplied);
+                p.begin(&composed);
+                p.setCompositionMode(QPainter::CompositionMode_SourceOver);
+            } else {
+                p.setOpacity(qBound(0.0, L.opacity, 1.0));
+                p.drawImage(0, 0, placed);
+            }
+        }
     }
     p.end();
     return composed;
@@ -6265,19 +6349,34 @@ void VideoPlayer::composeMultiTrackFrameInto(QImage &canvas,
         veditor::parentingEnabledFromEnv()
             ? effectiveLayerTransforms(overlayLayers, cs)
             : QVector<clipgeom::ClipTransform>{};
-    for (int i = 0; i < overlayLayers.size(); ++i) {
-        const DecodedLayer &L = overlayLayers[i];
-        if (L.isNullObject || L.rgb.isNull() || L.opacity <= 0.001)
-            continue;
-        const clipgeom::ClipTransform t = effectiveTransforms.isEmpty()
-            ? transformForLayer(L)
-            : effectiveTransforms.value(i, transformForLayer(L));
-        QImage placed = clipgeom::renderLayer(
-            L.rgb, t, cs, kSmooth);
-        if (!L.layerStyle.isIdentity())
-            placed = layerstyle::apply(placed, L.layerStyle);
-        p.setOpacity(qBound(0.0, L.opacity, 1.0));
-        p.drawImage(0, 0, placed);
+    for (int pass = 0; pass < 2; ++pass) {
+        const bool specialBlendPass = pass == 1;
+        for (int i = 0; i < overlayLayers.size(); ++i) {
+            const DecodedLayer &L = overlayLayers[i];
+            if (L.isNullObject || L.rgb.isNull() || L.opacity <= 0.001)
+                continue;
+            if ((L.blendMode != BlendMode::Normal) != specialBlendPass)
+                continue;
+            const clipgeom::ClipTransform t = effectiveTransforms.isEmpty()
+                ? transformForLayer(L)
+                : effectiveTransforms.value(i, transformForLayer(L));
+            QImage placed = clipgeom::renderLayer(
+                L.rgb, t, cs, kSmooth);
+            if (!L.layerStyle.isIdentity())
+                placed = layerstyle::apply(placed, L.layerStyle);
+            if (specialBlendPass) {
+                p.end();
+                canvas = LayerCompositor::blendImages(
+                    canvas, placed, L.blendMode,
+                    qBound(0.0, L.opacity, 1.0))
+                    .convertToFormat(QImage::Format_ARGB32_Premultiplied);
+                p.begin(&canvas);
+                p.setCompositionMode(QPainter::CompositionMode_SourceOver);
+            } else {
+                p.setOpacity(qBound(0.0, L.opacity, 1.0));
+                p.drawImage(0, 0, placed);
+            }
+        }
     }
     p.end();
 }
@@ -6664,8 +6763,12 @@ bool VideoPlayer::decodePoolFrame(TrackDecoder *d, bool ensureRgb)
 
         // HDR Stage4: RGBA64 container only — transfer curve is NOT tone-mapped here (F1).
         const bool wantHdr = d->wantRgba64Overlay;
-        const AVPixelFormat dstPixFmt = wantHdr ? AV_PIX_FMT_RGBA64LE : AV_PIX_FMT_RGB24;
-        const QImage::Format qFmt = wantHdr ? QImage::Format_RGBA64 : QImage::Format_RGB888;
+        const bool hasAlpha = pixelFormatHasAlpha(
+            static_cast<AVPixelFormat>(displayable->format));
+        const AVPixelFormat dstPixFmt = wantHdr ? AV_PIX_FMT_RGBA64LE
+            : hasAlpha ? AV_PIX_FMT_RGBA : AV_PIX_FMT_RGB24;
+        const QImage::Format qFmt = wantHdr ? QImage::Format_RGBA64
+            : hasAlpha ? QImage::Format_RGBA8888 : QImage::Format_RGB888;
 
         const int proxy = playbackProxyDivisor();
         const int dstW = qMax(2, displayable->width  / proxy);
@@ -6832,7 +6935,8 @@ bool VideoPlayer::finalizeOverlayFromDecoder(const PlaybackEntry &e, int seqIdx,
             static_cast<double>(entryLocalPositionUs(seqIdx, m_timelinePositionUs))
             / AV_TIME_BASE;
         out->rgb = applyPreviewClipMask(
-            out->rgb, previewTimeline, e, sourceSec, sourceSize);
+            applyVfxFootageControls(out->rgb, e),
+            previewTimeline, e, sourceSec, sourceSize);
     }
 
     out->colorMeta          = e.colorMeta;

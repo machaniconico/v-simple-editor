@@ -2,6 +2,8 @@
 
 **目的**: Sprint 17-22 で追加されたモジュールについて、コアロジックが実装済みか、スタブにとどまるかを正直に評価する。  
 **生成日**: 2026-05-16  
+**更新日**: 2026-08-02
+
 **調査方法**: 各 `.cpp` を `qWarning / stub / dummy / fallback / no-op / TODO` でgrepし、コアロジック（avformat呼び出し、数学、XMLシリアライズ等）の実在を目視確認。
 
 ---
@@ -36,7 +38,7 @@
 | FcpxmlExporter | REAL | `FcpxmlExporter.cpp:55-97` — FCPXML 形式でイベント/シーケンス/クリップを文字列ストリームで生成 | 完全スタンドアローン動作 |
 | ProjectTemplate | REAL | `ProjectTemplate.cpp:75-141` — QJsonDocument でテンプレートのシリアライズ・保存・読み込みを実装。ユーザー定義テンプレートのファイル永続化も実装 | 完全スタンドアローン動作 |
 | TwitchStreamConfig | REAL | `TwitchStreamConfig.cpp:25-45` — `buildFfmpegCommand()` が RTMP URL とエンコードパラメータ (bitrate/framerate/audioBitrate) から ffmpeg 引数リストを生成。stream key は `config.streamKey` から取得 | コマンド生成のみ。実際のストリーミング開始は呼び出し側が `ffmpeg` プロセスを起動する必要がある。stream key なしでは RTMP が失敗する |
-| BatchExportQueue | STUB | `BatchExportQueue.cpp:14-28` — 進捗は `QTimer` が 20% ずつインクリメントするだけで、実際のエクスポート処理は一切行われない。外部エクスポーターへの呼び出しはなし | キューのUIとステート管理はあるが、実エクスポートはno-op |
+| BatchExportQueue | REAL | `BatchExportQueue.cpp:108-146,218` — 各タスクを実 `RenderQueue` の `RenderJob` へ委譲し、live `Timeline`、fps、解像度、codec、bitrate、音声設定を `exportConfig` へ伝播。`BatchExportDialog.cpp` の現在プロジェクト経路と `MainWindow.cpp:14436-14464` の設定注入を `batchexport-e2e` が検証 | 実エンコードは RenderQueue/FFmpeg の実行環境に依存するが、進捗だけの擬似実装ではない |
 
 ---
 
@@ -88,7 +90,7 @@
 
 ### 要注意モジュール
 
-- **BatchExportQueue**: STUB。QTimer で進捗をインクリメントするだけで実エクスポートは一切行われない。唯一の真のスタブ評価。
+- **BatchExportQueue**: REAL。RenderQueue への実委譲済み。今回、実 UI の live Timeline 経路、Source 表示、fps 未指定時のフォールバック、codec/bitrate 設定伝播を修復した。
 - **AnimatedExport (WebP)**: QtのimageformatsプラグインがアニメーションWebPをサポートしない場合、1フレームのみ書き出す。GIFは常に動作する。
 - **LoudnessMaster**: MP4/WAV等のファイルへの呼び出しは -23.0 LUFS を返すため、実測と誤解させるリスクがある。
 
@@ -98,8 +100,8 @@
 
 | 区分 | 数 | モジュール |
 |---|---|---|
-| **REAL** | 10 | DavinciResolveXmlExporter, FcpxmlExporter, ChromaKeyRefine, HdrGrading, LowerThirdTemplates, WatermarkOverlay, ProjectTemplate, TwitchStreamConfig, ColorMatchAnalyzer, ColorMatchLutGenerator |
-| **PARTIAL** | 14 | YoutubeOAuth, YoutubeUploadClient, YoutubeUploadManager, VimeoOAuth, VimeoUploadClient, VimeoUploadManager, XVideoUpload, InstagramPublish, CloudRenderClient, FrameIoImporter, SubtitleTranslator, AudioRestoration, AnimatedExport, MultiCamSync, LoudnessMaster, SmartEditAssistant |
-| **STUB** | 1 | BatchExportQueue |
+| **REAL** | 12 | SmartEditAssistant, ColorMatchAnalyzer, ColorMatchLutGenerator, ChromaKeyRefine, HdrGrading, LowerThirdTemplates, WatermarkOverlay, DavinciResolveXmlExporter, FcpxmlExporter, ProjectTemplate, TwitchStreamConfig, BatchExportQueue |
+| **PARTIAL** | 15 | YoutubeOAuth, YoutubeUploadClient, YoutubeUploadManager, VimeoOAuth, VimeoUploadClient, VimeoUploadManager, XVideoUpload, InstagramPublish, CloudRenderClient, FrameIoImporter, SubtitleTranslator, AudioRestoration, AnimatedExport, MultiCamSync, LoudnessMaster |
+| **STUB** | 0 | — |
 
-*(PARTIAL のカウントが14、合計25 モジュール)*
+*(REAL 12 / PARTIAL 15 / STUB 0、合計27モジュール。生成日 2026-05-16 の評価を 2026-08-02 に更新)*

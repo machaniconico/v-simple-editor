@@ -1,7 +1,7 @@
 // src/selftests/SelftestRegistry.h
 // PRD-SPLIT-MAIN-1: Centralized selftest dispatch — table + 3 helper functions.
-// The run<Foo>Selftest() implementations remain in src/main.cpp; only the
-// routing logic (struct, table, loops) lives here.
+// The run<Foo>Selftest() implementations remain in their owning translation
+// units; only the routing logic (struct, table, loops) lives here.
 #pragma once
 
 #include <cstddef>
@@ -14,6 +14,11 @@ int runLayerStyleSelftest();
 int runRgbParadeSelftest();
 int runText3dPreviewSelftest();
 int runWbEyedropperSelftest();
+int runDeflickerSelftest();
+int runObjectRemovalSelftest();
+int runLight3DSelftest();
+int runVoiceIsolationSelftest();
+int runBatchExportE2ESelftest();
 
 namespace selftests {
 

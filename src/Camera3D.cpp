@@ -1,4 +1,5 @@
 #include "Camera3D.h"
+#include "LayerCompositor.h"
 
 #include <QPainter>
 #include <QTransform>
@@ -368,7 +369,8 @@ QImage Camera3D::applyPerspective(const QImage &image,
 
 QImage Camera3D::renderScene(const QVector<CompositeLayer> &layers,
                              const QVector<QImage> &layerImages,
-                             const QSize &canvasSize, double time)
+                             const QSize &canvasSize, double time,
+                             const QVector<Light3DState> &lights)
 {
     // Update camera state from keyframes if animated
     if (hasAnimation())
@@ -413,8 +415,16 @@ QImage Camera3D::renderScene(const QVector<CompositeLayer> &layers,
                                   ? m_layerTransforms[i]
                                   : Layer3DTransform{};
 
+        QImage lit = layerImages[i];
+        if (light3d::hasActiveLights(lights)) {
+            lit = light3d::applyLighting(
+                lit, lights, lt,
+                light3d::layerCenterWorld(QSizeF(canvasSize)),
+                QSizeF(canvasSize), m_state.position, layers[i].material);
+        }
+
         // Apply perspective transform
-        QImage transformed = applyPerspective(layerImages[i], lt, m_state, canvasSize);
+        QImage transformed = applyPerspective(lit, lt, m_state, canvasSize);
 
         // Draw with layer opacity and blend
         painter.setOpacity(std::clamp(layers[i].opacity, 0.0, 1.0));

@@ -86,6 +86,9 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/MotionBlurP2Selftest.cpp
     src/selftests/effect_keyframe_parity_selftest.cpp
     src/selftests/EffectPresetSelftest.cpp
+    src/selftests/EffectLibrarySelftest.cpp
+    src/selftests/VfxFootageSelftest.cpp
+    src/selftests/VfxGeneratorsSelftest.cpp
     src/selftests/effect_timing_selftest.cpp
     src/selftests/bezier_easing_selftest.cpp
     src/selftests/EasingPresetsSelftest.cpp
@@ -95,8 +98,13 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/FrameExportSelftest.cpp
     src/selftests/NestSequenceSelftest.cpp
     src/selftests/PrecomposeE2ESelftest.cpp
+    src/selftests/BatchExportE2ESelftest.cpp
     src/selftests/AdjustmentLayerSelftest.cpp
     src/selftests/ClipMaskSelftest.cpp
+    src/selftests/DeflickerSelftest.cpp
+    src/selftests/ObjectRemovalSelftest.cpp
+    src/selftests/Light3DSelftest.cpp
+    src/selftests/VoiceIsolationSelftest.cpp
     src/selftests/GradeLggSerializationSelftest.cpp
     src/selftests/GradeKeyframeSelftest.cpp
     src/selftests/GradeWheelWiringSelftest.cpp
@@ -248,6 +256,10 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     # SP (スペクトル編集): iZotope RX 風 STFT/iSTFT 純粋エンジン + スペクトログラム UI。
     src/SpectralEngine.h
     src/SpectralEngine.cpp
+    src/VoiceIsolation.h
+    src/VoiceIsolation.cpp
+    src/VoiceIsolationDialog.h
+    src/VoiceIsolationDialog.cpp
     src/SpectrogramWidget.cpp
     src/SpectralEditDialog.cpp
     src/selftests/spectral_edit_selftest.cpp
@@ -274,6 +286,16 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/AutoMatte.cpp
     src/AutoMatteDialog.cpp
     src/selftests/auto_matte_selftest.cpp
+    # DF (Deflicker): deterministic temporal luminance/RGB/band correction + dialog.
+    src/Deflicker.h
+    src/Deflicker.cpp
+    src/DeflickerDialog.h
+    src/DeflickerDialog.cpp
+    # OR (ObjectRemoval): temporal median + deterministic spatial inpaint.
+    src/ObjectRemoval.h
+    src/ObjectRemoval.cpp
+    src/ObjectRemovalDialog.h
+    src/ObjectRemovalDialog.cpp
     # ED (EDL エクスポート): CMX3600 EDL の純粋書き出しエンジン (放送/Avid/DaVinci 互換)。
     src/EdlExport.h
     src/EdlExport.cpp
@@ -444,6 +466,12 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/TextInteractive.cpp
     src/GradientStopBar.cpp
     src/EffectPreset.cpp
+    src/EffectLibraryModel.h
+    src/EffectLibraryModel.cpp
+    src/EffectLibraryPanel.h
+    src/EffectLibraryPanel.cpp
+    src/VfxFootageLibrary.h
+    src/VfxFootageLibrary.cpp
     src/SubtitleGenerator.cpp
     src/SubtitleKaraoke.h
     src/SubtitleKaraoke.cpp
@@ -551,11 +579,17 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/AIMaskDialog.cpp
     src/SceneDetector.cpp
     src/LayerCompositor.cpp
+    src/Light3D.h
+    src/Light3D.cpp
     src/TransformAnimator.cpp
     src/MaskSystem.cpp
     src/ParticleSystem.cpp
     src/ParticleEffectDialog.h
     src/ParticleEffectDialog.cpp
+    src/VfxGenerators.h
+    src/VfxGenerators.cpp
+    src/VfxGeneratorDialog.h
+    src/VfxGeneratorDialog.cpp
     src/TextAnimator.cpp
     src/VfxControlsPanel.h
     src/VfxControlsPanel.cpp
@@ -585,6 +619,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/ExpressionBindingDialog.cpp
     src/CameraMotionDialog.h
     src/CameraMotionDialog.cpp
+    src/Light3DDialog.h
+    src/Light3DDialog.cpp
     src/TextPathWarp.h
     src/TextPathWarp.cpp
     src/BrushAnimation.h

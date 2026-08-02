@@ -107,3 +107,8 @@ build_*.log
 
 # Test fixtures (kept local, not versioned)
 test_assets/
+
+# 検証用動画と VFX 素材の本体はローカル保持 (README のみ版管理)
+# AI生成物で再生成可能。リポジトリに 50MB 超を永続させないため。
+検証動画/*.mp4
+vfx素材/*.mp4

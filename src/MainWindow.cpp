@@ -196,10 +196,13 @@ double exporter_loudnessGainDb();
   #include "AutoMatteDialog.h"
   #define HAVE_AUTO_MATTE_DIALOG 1
 #endif
+#include "DeflickerDialog.h"
+#include "ObjectRemovalDialog.h"
 #if __has_include("AudioRestorationDialog.h")
   #include "AudioRestorationDialog.h"
   #define HAVE_AUDIO_RESTORATION_DIALOG 1
 #endif
+#include "VoiceIsolationDialog.h"
 #if __has_include("AnimatedExportDialog.h")
   #include "AnimatedExportDialog.h"
   #define HAVE_ANIMATED_EXPORT_DIALOG 1
@@ -243,6 +246,7 @@ double exporter_loudnessGainDb();
 #include <QPointer>
 #include <QUrl>
 #include <QDebug>
+#include <QSizeF>
 #include <QActionGroup>
 #include "ExposureAids.h"  // EXP-AID: 露出/フォーカス確認エイド (プレビュー表示専用)
 #include "SafeZone.h"      // SAFE-ZONE: SNS セーフゾーンオーバーレイ (プレビュー表示専用)
@@ -286,6 +290,8 @@ double exporter_loudnessGainDb();
 #include "SubtitleTrackRenderer.h"
 #include "LoudnessPanel.h"
 #include "ParticleEffectDialog.h"
+#include "VfxGenerators.h"
+#include "VfxGeneratorDialog.h"
 #include "VfxControlsPanel.h"
 #include <QPushButton>
 #include <QDialog>
@@ -322,6 +328,7 @@ double exporter_loudnessGainDb();
 #include "Text3DExtrusionDialog.h"
 #include "ExpressionBindingDialog.h"
 #include "CameraMotionDialog.h"
+#include "Light3DDialog.h"
 #include "ExtrudedMesh.h"
 #include "SoftRaster3D.h"
 #include <QPainter>
@@ -2819,6 +2826,46 @@ MainWindow::MainWindow(QWidget *parent)
     qInfo() << "MainWindow::ctor end";
 }
 
+MainWindow::~MainWindow()
+{
+    // MainWindow's value members are destroyed before QMainWindow deletes its
+    // QObject children. Detach every child that stores a non-owning pointer
+    // to one of those values while the values are still alive.
+    const auto detachFromMainWindow = [this](QObject *child) {
+        if (!child)
+            return;
+        QObject::disconnect(child, nullptr, this, nullptr);
+        QObject::disconnect(this, nullptr, child, nullptr);
+        child->blockSignals(true);
+    };
+
+    if (m_timeline) {
+        detachFromMainWindow(m_timeline);
+        m_timeline->setMarkerManager(nullptr);
+    }
+    if (m_exporter) {
+        detachFromMainWindow(m_exporter);
+        m_exporter->setSmartReframe(nullptr);
+    }
+
+    // These two docks directly dereference MainWindow-owned models from their
+    // refresh/child-widget teardown paths, so destroy them before member
+    // destruction and clear the owning pointer after delete.
+    if (m_audioBusPanel) {
+        detachFromMainWindow(m_audioBusPanel);
+        m_audioBusPanel->setRouting(nullptr);
+        delete m_audioBusPanel;
+        m_audioBusPanel = nullptr;
+    }
+    if (m_mediaPoolDock) {
+        detachFromMainWindow(m_mediaPoolDock);
+        m_mediaPoolDock->setPool(nullptr);
+        delete m_mediaPoolDock;
+        m_mediaPoolDock = nullptr;
+    }
+
+}
+
 void MainWindow::registerCoreShortcuts()
 {
     if (!m_shortcutManager)
@@ -2863,6 +2910,216 @@ void MainWindow::registerCoreShortcuts()
 double MainWindow::currentPlayheadSeconds() const
 {
     return m_timeline ? m_timeline->playheadPosition() : 0.0;
+}
+
+void MainWindow::refreshEffectLibraryPreview()
+{
+    if (!m_effectLibraryPanel || !m_player || !m_player->glPreview()
+        || !m_effectLibraryPanel->previewEnabled()) {
+        return;
+    }
+    const QString entryId = m_effectLibraryPanel->selectedEntryId();
+    if (entryId.isEmpty() || m_lastCompositedFrame.isNull())
+        return;
+
+    QImage preview;
+    if (m_effectLibraryPanel->model().applyToImage(
+            entryId, m_lastCompositedFrame, &preview) && !preview.isNull()) {
+        m_player->glPreview()->displayFrame(preview);
+    }
+}
+
+void MainWindow::applyEffectLibraryEntry(const QString &entryId,
+                                         int trackIdx, int clipIdx)
+{
+    if (!m_timeline || !m_effectLibraryPanel)
+        return;
+
+    efxlib::LibraryEntry entry;
+    if (!m_effectLibraryPanel->model().entryById(entryId, &entry)) {
+        statusBar()->showMessage(QStringLiteral("エフェクトエントリが見つかりません"), 3000);
+        return;
+    }
+    if (entry.kind == efxlib::SourceKind::VfxGenerator) {
+        int typeIndex = -1;
+        for (const QString &tag : entry.tags) {
+            if (!tag.startsWith(QStringLiteral("VfxGeneratorType:")))
+                continue;
+            bool ok = false;
+            const int parsed = tag.section(QLatin1Char(':'), 1, 1).toInt(&ok);
+            if (ok)
+                typeIndex = parsed;
+            break;
+        }
+        addVfxGeneratorForType(typeIndex);
+        return;
+    }
+
+    if (entry.kind == efxlib::SourceKind::Footage) {
+        // Footage entries are source clips, not effects to append to the
+        // currently selected clip. Build the fully configured ClipInfo from
+        // the library model, then place it at the current playhead on V2+.
+        ClipInfo footageClip;
+        footageClip.duration = 0.0;
+        footageClip.opacity = 1.0;
+        if (!m_effectLibraryPanel->model().applyToClip(entryId, footageClip)
+            || footageClip.duration <= 0.0) {
+            statusBar()->showMessage(
+                QStringLiteral("VFX素材の動画を読み込めませんでした"), 3500);
+            return;
+        }
+        int placedTrack = -1;
+        int placedClip = -1;
+        if (!m_timeline->insertVfxFootageAtPlayhead(
+                footageClip, &placedTrack, &placedClip)) {
+            statusBar()->showMessage(
+                QStringLiteral("VFX素材をプレイヘッドへ配置できませんでした"), 3500);
+            return;
+        }
+        const auto &videoTracks = m_timeline->videoTracks();
+        if (placedTrack >= 0 && placedTrack < videoTracks.size()
+            && videoTracks.at(placedTrack)) {
+            videoTracks.at(placedTrack)->setSelectedClip(placedClip);
+        }
+        statusBar()->showMessage(
+            QStringLiteral("VFX素材をV%1へ配置しました（%2）")
+                .arg(placedTrack + 1)
+                .arg(CompositeLayer::blendModeName(footageClip.blendMode)),
+            3000);
+        return;
+    }
+
+    if (trackIdx < 0 || clipIdx < 0) {
+        if (!selectedVideoClipRef(trackIdx, clipIdx)) {
+            statusBar()->showMessage(QStringLiteral("先に動画クリップを選択してください"), 3000);
+            return;
+        }
+    }
+
+    const auto &tracks = m_timeline->videoTracks();
+    if (trackIdx < 0 || trackIdx >= static_cast<int>(tracks.size())
+        || !tracks[trackIdx]
+        || clipIdx < 0
+        || clipIdx >= static_cast<int>(tracks[trackIdx]->clips().size())) {
+        statusBar()->showMessage(QStringLiteral("適用先のクリップが見つかりません"), 3000);
+        return;
+    }
+
+    ClipInfo updated = tracks[trackIdx]->clips().at(clipIdx);
+    if (!m_effectLibraryPanel->model().applyToClip(entryId, updated)) {
+        statusBar()->showMessage(QStringLiteral("このエントリはクリップへ適用できません"), 3000);
+        return;
+    }
+
+    const bool isPreset = entry.kind == efxlib::SourceKind::Preset;
+    if (isPreset)
+        m_timeline->setClipColorCorrection(trackIdx, clipIdx,
+                                           updated.colorCorrection);
+    m_timeline->setClipEffectsAndKeyframes(trackIdx, clipIdx,
+                                           updated.effects, updated.keyframes);
+    statusBar()->showMessage(QStringLiteral("エフェクトを適用しました"), 2500);
+    if (m_effectLibraryPanel->previewEnabled())
+        refreshEffectLibraryPreview();
+}
+
+void MainWindow::addEffectLibraryKeyframe(const QString &entryId,
+                                          const QString &paramName)
+{
+    if (!m_timeline || !m_effectLibraryPanel)
+        return;
+
+    int trackIdx = -1;
+    int clipIdx = -1;
+    ClipInfo clip;
+    if (!selectedVideoClipRef(trackIdx, clipIdx, &clip)) {
+        statusBar()->showMessage(QStringLiteral("先に動画クリップを選択してください"), 3000);
+        return;
+    }
+    const double localTime = qMax(0.0,
+        currentPlayheadSeconds() - clipTimelineStartSeconds(trackIdx, clipIdx));
+    if (!m_effectLibraryPanel->model().addKeyframeToClip(
+            entryId, paramName, localTime, clip)) {
+        statusBar()->showMessage(QStringLiteral("このパラメータはキーフレーム化できません"), 3000);
+        return;
+    }
+    m_timeline->setClipEffectsAndKeyframes(trackIdx, clipIdx,
+                                           clip.effects, clip.keyframes);
+    statusBar()->showMessage(QStringLiteral("キーフレームを追加しました"), 2500);
+}
+
+void MainWindow::saveEffectLibraryPreset()
+{
+    if (!m_timeline || !m_effectLibraryPanel)
+        return;
+    int trackIdx = -1;
+    int clipIdx = -1;
+    ClipInfo clip;
+    if (!selectedVideoClipRef(trackIdx, clipIdx, &clip)) {
+        statusBar()->showMessage(QStringLiteral("先に動画クリップを選択してください"), 3000);
+        return;
+    }
+
+    bool accepted = false;
+    const QString name = QInputDialog::getText(
+        this, QStringLiteral("プリセット保存"), QStringLiteral("プリセット名"),
+        QLineEdit::Normal, QStringLiteral("新しいエフェクトセット"), &accepted).trimmed();
+    if (!accepted || name.isEmpty())
+        return;
+
+    QString path;
+    if (!m_effectLibraryPanel->model().saveUserPreset(name, clip, true, &path)) {
+        QMessageBox::warning(this, QStringLiteral("プリセット保存"),
+                             QStringLiteral("プリセットを保存できませんでした"));
+        return;
+    }
+    m_effectLibraryPanel->refreshCatalog();
+    statusBar()->showMessage(QStringLiteral("プリセットを保存しました: %1").arg(name), 3000);
+}
+
+void MainWindow::renameEffectLibraryPreset(const QString &entryId)
+{
+    if (!m_effectLibraryPanel)
+        return;
+    efxlib::LibraryEntry entry;
+    if (!m_effectLibraryPanel->model().entryById(entryId, &entry)
+        || !entry.isUserPreset) {
+        return;
+    }
+    bool accepted = false;
+    const QString name = QInputDialog::getText(
+        this, QStringLiteral("プリセット名を変更"), QStringLiteral("新しい名前"),
+        QLineEdit::Normal, entry.displayName, &accepted).trimmed();
+    if (!accepted || name.isEmpty() || name == entry.displayName)
+        return;
+    if (!m_effectLibraryPanel->model().renameUserPreset(entryId, name)) {
+        QMessageBox::warning(this, QStringLiteral("プリセット名を変更"),
+                             QStringLiteral("名前を変更できませんでした"));
+        return;
+    }
+    m_effectLibraryPanel->refreshCatalog();
+}
+
+void MainWindow::deleteEffectLibraryPreset(const QString &entryId)
+{
+    if (!m_effectLibraryPanel)
+        return;
+    efxlib::LibraryEntry entry;
+    if (!m_effectLibraryPanel->model().entryById(entryId, &entry)
+        || !entry.isUserPreset) {
+        return;
+    }
+    if (QMessageBox::question(this, QStringLiteral("プリセット削除"),
+                             QStringLiteral("%1 を削除しますか？").arg(entry.displayName),
+                             QMessageBox::Yes | QMessageBox::No,
+                             QMessageBox::No) != QMessageBox::Yes) {
+        return;
+    }
+    if (!m_effectLibraryPanel->model().removeUserPreset(entryId)) {
+        QMessageBox::warning(this, QStringLiteral("プリセット削除"),
+                             QStringLiteral("プリセットを削除できませんでした"));
+        return;
+    }
+    m_effectLibraryPanel->refreshCatalog();
 }
 
 QString MainWindow::brushClipId(int trackIdx, int clipIdx)
@@ -3112,6 +3369,7 @@ void MainWindow::setupUI()
         menu.exec(gp);
     });
     m_timeline = new Timeline(this);
+    syncProjectLightingToTimeline();
     // US-INT-1: hand the Timeline to GLPreview so paintGL can compose any
     // adjustment layers covering the current timeline position.
     if (m_player->glPreview())
@@ -3406,6 +3664,8 @@ void MainWindow::setupUI()
     });
     connect(m_player, &VideoPlayer::frameComposited, this, [this](const QImage &image) {
         m_lastCompositedFrame = image;
+        if (m_effectLibraryPanel)
+            m_effectLibraryPanel->setThumbnailSource(image);
         if (!m_player || m_player->isPlaying() || !m_timeline || !m_player->glPreview())
             return;
 
@@ -3417,6 +3677,8 @@ void MainWindow::setupUI()
         const QImage composed = buildSpecialClipComposite(m_timeline->playheadPosition());
         if (!composed.isNull())
             m_player->glPreview()->displayFrame(composed);
+        if (m_effectLibraryPanel && m_effectLibraryPanel->previewEnabled())
+            refreshEffectLibraryPreview();
     });
 
     // Restore master loudness normalizer settings on startup.
@@ -4106,6 +4368,11 @@ void MainWindow::setupMenuBar()
     m_menuHelpEntries.append({addBrushAnimAction,
         QStringLiteral("手書き風に文字や線が少しずつ描かれていくアニメーションを追加します。")});
 
+    auto *addVfxGeneratorAction = insertMenu->addAction(QStringLiteral("VFX ジェネレータ…"));
+    connect(addVfxGeneratorAction, &QAction::triggered, this, &MainWindow::addVfxGenerator);
+    m_menuHelpEntries.append({addVfxGeneratorAction,
+        QStringLiteral("炎・稲妻・衝撃波などを素材なしで生成し、RGBA クリップとして重ねます。")});
+
     insertMenu->addSeparator();
 
     auto *addTransAction = insertMenu->addAction("トランジションを追加...");
@@ -4749,6 +5016,13 @@ void MainWindow::setupMenuBar()
     m_menuHelpEntries.append({stabilizeAction,
         QStringLiteral("カメラのブレでガタガタ揺れる映像を、なめらかに見えるよう自動で補正します。")});
 
+    auto *deflickerAction = toolsMenu->addAction(QStringLiteral("フリッカー除去..."));
+    deflickerAction->setObjectName(QStringLiteral("action_deflicker"));
+    connect(deflickerAction, &QAction::triggered,
+            this, &MainWindow::openDeflicker);
+    m_menuHelpEntries.append({deflickerAction,
+        QStringLiteral("フレーム間の明滅を解析し、全体輝度・RGB・ローリングバンド単位で補正します。")});
+
     auto *speedRampAction = toolsMenu->addAction("スピードランプ (可変速)...");
     connect(speedRampAction, &QAction::triggered, this, &MainWindow::setSpeedRamp);
     m_menuHelpEntries.append({speedRampAction,
@@ -5135,6 +5409,14 @@ void MainWindow::setupMenuBar()
     m_menuHelpEntries.append({autoMatteAction,
         QStringLiteral("グリーンバック無しでも被写体を自動で抜き、透過 PNG や別背景との合成として書き出します。")});
 
+    auto *objectRemovalAction = toolsMenu->addAction(
+        QStringLiteral("オブジェクト除去（コンテンツに応じた塗りつぶし）…"));
+    objectRemovalAction->setObjectName("action_object_removal");
+    connect(objectRemovalAction, &QAction::triggered,
+            this, &MainWindow::openObjectRemoval);
+    m_menuHelpEntries.append({objectRemovalAction,
+        QStringLiteral("クリップマスクまたはロトブラシで指定した対象を、前後フレームの背景と空間補完で除去し、新しい連番クリップとして取り込みます。")});
+
     auto *audioRestoreAction = toolsMenu->addAction(
         QStringLiteral("音声リストア(&R)…"));
     audioRestoreAction->setObjectName("action_audio_restoration");
@@ -5142,6 +5424,14 @@ void MainWindow::setupMenuBar()
             this, &MainWindow::openAudioRestoreDialog);
     m_menuHelpEntries.append({audioRestoreAction,
         QStringLiteral("ノイズ・クリック・ハムなどの劣化を取り除き、収録音声を復元します。")});
+
+    auto *voiceIsolationAction = toolsMenu->addAction(
+        QStringLiteral("音声分離（スピーチ強調）…"));
+    voiceIsolationAction->setObjectName(QStringLiteral("action_voice_isolation"));
+    connect(voiceIsolationAction, &QAction::triggered,
+            this, &MainWindow::openVoiceIsolationDialog);
+    m_menuHelpEntries.append({voiceIsolationAction,
+        QStringLiteral("周波数領域で会話と背景を分離し、音声のみ・背景のみ・ミックスを作成します。")});
 
     // SP-4: iZotope RX 風スペクトル音声修復 (時間×周波数の矩形領域を減衰)。
     auto *spectralRepairAction = toolsMenu->addAction(
@@ -5360,6 +5650,13 @@ void MainWindow::setupMenuBar()
     connect(cameraMotionAction, &QAction::triggered, this, &MainWindow::openCameraMotionDialog);
     m_menuHelpEntries.append({cameraMotionAction,
         QStringLiteral("仮想 3D カメラの動き（ドリー・パン・周回・手ぶれ）をプロジェクト全体に設定します。")});
+
+    auto *light3DAction = compMenu->addAction(QStringLiteral("3D ライト…"));
+    light3DAction->setObjectName(QStringLiteral("action_light3d"));
+    connect(light3DAction, &QAction::triggered,
+            this, &MainWindow::openLight3DDialog);
+    m_menuHelpEntries.append({light3DAction,
+        QStringLiteral("Ambient / Parallel / Point / Spot の3Dライトと、選択クリップの受光マテリアルを設定します。")});
 
     // --- カラーグレーディングパネル ---
     m_colorGradingPanel = new ColorGradingPanel(this);
@@ -5674,8 +5971,35 @@ void MainWindow::setupMenuBar()
     connect(m_timeline, &Timeline::clipSelectedOnTrack,
             m_effectControlsPanel, &effectctrl::EffectControlsPanel::refreshFromCurrentClip);
     connect(m_effectControlsPanel, &effectctrl::EffectControlsPanel::effectsChanged,
-            this, [this](const QVector<VideoEffect> &effects) {
+        this, [this](const QVector<VideoEffect> &effects) {
         m_timeline->setClipEffects(effects);
+    });
+
+    m_effectLibraryPanel = new EffectLibraryPanel(this);
+    m_effectLibraryPanel->setVisible(false);
+    addDockWidget(Qt::RightDockWidgetArea, m_effectLibraryPanel);
+    connect(m_effectLibraryPanel, &EffectLibraryPanel::applyRequested,
+            this, [this](const QString &entryId) {
+        applyEffectLibraryEntry(entryId);
+    });
+    connect(m_effectLibraryPanel, &EffectLibraryPanel::previewRequested,
+            this, [this](const QString &, bool enabled) {
+        if (enabled)
+            refreshEffectLibraryPreview();
+        else if (m_player && m_player->glPreview() && !m_lastCompositedFrame.isNull())
+            m_player->glPreview()->displayFrame(m_lastCompositedFrame);
+    });
+    connect(m_effectLibraryPanel, &EffectLibraryPanel::keyframeRequested,
+            this, &MainWindow::addEffectLibraryKeyframe);
+    connect(m_effectLibraryPanel, &EffectLibraryPanel::savePresetRequested,
+            this, &MainWindow::saveEffectLibraryPreset);
+    connect(m_effectLibraryPanel, &EffectLibraryPanel::renamePresetRequested,
+            this, &MainWindow::renameEffectLibraryPreset);
+    connect(m_effectLibraryPanel, &EffectLibraryPanel::deletePresetRequested,
+            this, &MainWindow::deleteEffectLibraryPreset);
+    connect(m_timeline, &Timeline::effectDropped, this,
+            [this](int trackIdx, int clipIdx, const QString &entryId) {
+        applyEffectLibraryEntry(entryId, trackIdx, clipIdx);
     });
 
     auto *graphEditorPanel = new GraphEditorPanel(this);
@@ -5775,6 +6099,15 @@ void MainWindow::setupMenuBar()
     connect(m_effectControlsPanel, &QDockWidget::visibilityChanged, effectControlsAction, &QAction::setChecked);
     m_menuHelpEntries.append({effectControlsAction,
         QStringLiteral("選んだクリップに付いているエフェクトの設定値を編集するパネルを出し入れします。")});
+
+    auto *effectLibraryAction = viewMenu->addAction(QStringLiteral("エフェクトライブラリ"));
+    effectLibraryAction->setCheckable(true);
+    connect(effectLibraryAction, &QAction::toggled,
+            m_effectLibraryPanel, &QDockWidget::setVisible);
+    connect(m_effectLibraryPanel, &QDockWidget::visibilityChanged,
+            effectLibraryAction, &QAction::setChecked);
+    m_menuHelpEntries.append({effectLibraryAction,
+        QStringLiteral("既存のシェーダー、パーティクル、プラグイン、AE系エフェクト、プリセットを検索して適用します。")});
 
     auto *graphEditorAction = viewMenu->addAction(QStringLiteral("Graph Editor"));
     graphEditorAction->setCheckable(true);
@@ -6662,6 +6995,14 @@ void MainWindow::applyProjectConfig(const ProjectConfig &config)
         .arg(config.name).arg(config.resolutionLabel()).arg(config.fps));
 }
 
+void MainWindow::syncProjectLightingToTimeline()
+{
+    if (!m_timeline)
+        return;
+    m_timeline->setProjectLights(m_projectLights);
+    m_timeline->setProjectLightViewPosition(m_projectCamera.camera().position);
+}
+
 QString MainWindow::particleClipKey(const ClipInfo &clip)
 {
     return clip.filePath;
@@ -6777,6 +7118,10 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
         .value(QStringLiteral("preview/text3dProxyThreshold"), 1280)
         .toInt();
 
+    const QVector<Light3DState> projectLights = light3d::statesAt(
+        m_projectLights, timelineSeconds);
+    const bool lightingEnabled = light3d::hasActiveLights(projectLights);
+
     struct ActiveLayer {
         CompositeLayer layer;
         QString clipId;
@@ -6812,7 +7157,8 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
                 || m_trackMatteClipEntries.contains(clipId)
                 || m_text3DClipConfigs.contains(clipId)
                 || m_clipExpressionBindings.contains(clipId)
-                || (m_clipWiggleParams.contains(clipId) && m_clipWiggleParams.value(clipId).enabled);
+                || (m_clipWiggleParams.contains(clipId) && m_clipWiggleParams.value(clipId).enabled)
+                || (lightingEnabled && clip.material.acceptsLights);
             const VideoSourceInfo info = probeVideoSourceInfo(
                 ProxyManager::instance().getProxyPath(clip.filePath),
                 m_projectConfig.fps > 0 ? m_projectConfig.fps : 30.0);
@@ -6924,6 +7270,8 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
             active.layer.rotation = layerRotation;
             active.layer.anchorPoint = QPointF(0.0, 0.0);
             active.layer.zOrder = trackIdx;
+            active.layer.layer3D = clip.layer3D;
+            active.layer.material = clip.material;
             active.layer.inPoint = clipStart;
             active.layer.outPoint = clipEnd;
             if (auto matteIt = m_trackMatteClipEntries.constFind(clipId);
@@ -6978,8 +7326,10 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
 
     QVector<CompositeLayer> layers;
     QVector<QImage> layerImages;
+    QVector<QPointF> lightingOffsets;
     layers.reserve(order.size());
     layerImages.reserve(order.size());
+    lightingOffsets.reserve(order.size());
     for (int sortedIdx : order) {
         const ActiveLayer &active = activeLayers[sortedIdx];
         CompositeLayer layer = active.layer;
@@ -6992,7 +7342,15 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
         }
         layers.append(layer);
         layerImages.append(renderCompositeImage(active.image, layer, canvasSize));
+        lightingOffsets.append(QPointF(
+            layer.position.x() * canvasSize.width(),
+            layer.position.y() * canvasSize.height()));
     }
+
+    if (lightingEnabled)
+        layerImages = tlrender::detail::applyLightingToLayerImages(
+            layers, layerImages, canvasSize, lightingOffsets, projectLights,
+            m_projectCamera.camera().position);
 
     return trackmatte::composite(layers, layerImages, canvasSize);
 }
@@ -7011,10 +7369,14 @@ void MainWindow::refreshSpecialClipPreview()
     for (auto it = m_clipWiggleParams.cbegin(); it != m_clipWiggleParams.cend(); ++it) {
         if (it.value().enabled) { anyWiggleEnabled = true; break; }
     }
+    const double playheadSeconds = m_timeline->playheadPosition();
+    const bool anyLightingEnabled = light3d::hasActiveLights(
+        light3d::statesAt(m_projectLights, playheadSeconds));
     if (m_rotoClipEntries.isEmpty() && m_timeRemapClipEntries.isEmpty()
         && !timelineHasClipTimeRemap(m_timeline)
         && m_trackMatteClipEntries.isEmpty() && m_text3DClipConfigs.isEmpty()
-        && m_clipExpressionBindings.isEmpty() && !anyWiggleEnabled) {
+        && m_clipExpressionBindings.isEmpty() && !anyWiggleEnabled
+        && !anyLightingEnabled) {
         if (!m_player->isPlaying()) {
             s_refreshingPreview = true;
             m_player->previewSeek(timelineMs);
@@ -7023,7 +7385,7 @@ void MainWindow::refreshSpecialClipPreview()
         return;
     }
 
-    const QImage composed = buildSpecialClipComposite(m_timeline->playheadPosition());
+    const QImage composed = buildSpecialClipComposite(playheadSeconds);
     if (!composed.isNull()) {
         s_refreshingPreview = true;
         m_player->glPreview()->displayFrame(composed);
@@ -7037,6 +7399,7 @@ void MainWindow::refreshSpecialClipPreview()
 
 void MainWindow::populateProjectData(ProjectData &data)
 {
+    syncProjectLightingToTimeline();
     data.config = m_projectConfig;
     data.videoTracks = m_timeline->allVideoTracks();
     data.audioTracks = m_timeline->allAudioTracks();
@@ -7125,6 +7488,9 @@ void MainWindow::populateProjectData(ProjectData &data)
     std::sort(data.wiggleClipEntries.begin(), data.wiggleClipEntries.end(),
               [](const WiggleClipEntry &a, const WiggleClipEntry &b) { return a.clipId < b.clipId; });
     data.projectCamera = m_projectCamera.toJson();
+    data.projectLights = QJsonArray{};
+    for (const Light3D &light : m_projectLights)
+        data.projectLights.append(light.toJson());
 
     // US-HW-10: persist project-level sidechain ducking parameters.
     data.duckingParams  = m_duckingParams;
@@ -7248,6 +7614,8 @@ void MainWindow::applyVfxProjectState(const ProjectVfxState &state)
 
 void MainWindow::applyLoadedProjectData(const ProjectData &data, const QString &filePath)
 {
+    if (m_light3DDialog)
+        m_light3DDialog->close();
     m_projectFilePath = filePath;
     if (m_recentFilesManager && !filePath.isEmpty())
         m_recentFilesManager->addFile(filePath);
@@ -7300,6 +7668,10 @@ void MainWindow::applyLoadedProjectData(const ProjectData &data, const QString &
     m_projectCamera = Camera3D{};
     if (!data.projectCamera.isEmpty())
         m_projectCamera.fromJson(data.projectCamera);
+    m_projectLights.clear();
+    for (const QJsonValue &value : data.projectLights)
+        m_projectLights.append(Light3D::fromJson(value.toObject()));
+    syncProjectLightingToTimeline();
     // US-HW-10: restore project-level sidechain ducking parameters.
     m_duckingParams  = data.duckingParams;
     m_duckingEnabled = data.duckingEnabled;
@@ -7535,6 +7907,11 @@ void MainWindow::newProject()
 {
     ProjectSettingsDialog dialog(this);
     if (dialog.exec() == QDialog::Accepted) {
+        if (m_light3DDialog)
+            m_light3DDialog->close();
+        m_projectCamera = Camera3D{};
+        m_projectLights.clear();
+        syncProjectLightingToTimeline();
         applyProjectConfig(dialog.config());
         // Undo ベースラインを実プロジェクトサイズで張り直す。Timeline 構築時の
         // "Initial state" は projectWidth=-1 で積まれており、これを唯一のベースラインの
@@ -8136,6 +8513,7 @@ void MainWindow::exportVideo()
     // here or the export silently drops every track matte. Re-sync the
     // GUI map onto m_timeline immediately before submission so an edit
     // made after the last configure-matte/load is reflected.
+    syncProjectLightingToTimeline();
     syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
     // AC: production export 経路に ACES SSOT を push (start() 前)。プレビュー /
     // legacy Exporter には openColorManagement / load で既に push 済み。
@@ -10096,6 +10474,158 @@ void MainWindow::stabilizeVideo()
     statusBar()->showMessage("Stabilizing video (2-pass)...");
 }
 
+void MainWindow::openDeflicker()
+{
+    if (!m_timeline) {
+        QMessageBox::information(this, QStringLiteral("フリッカー除去"),
+                                 QStringLiteral("タイムラインの初期化が完了していません。"));
+        return;
+    }
+
+    int trackIdx = -1;
+    int clipIdx = -1;
+    ClipInfo clip;
+    if (!selectedVideoClipRef(trackIdx, clipIdx, &clip)
+        || clip.filePath.isEmpty() || !clip.sequenceRefId.isEmpty()) {
+        QMessageBox::information(this, QStringLiteral("フリッカー除去"),
+                                 QStringLiteral("先に通常のビデオクリップを選択してください。"));
+        return;
+    }
+
+    const double fallbackFps = m_projectConfig.fps > 0.0
+        ? m_projectConfig.fps : 30.0;
+    // Deflicker metadata and export must be based on the original source.
+    // Preview may still use a proxy, but a proxy's dimensions/duration must
+    // never become the contract for generated frames.
+    const VideoSourceInfo sourceInfo = probeVideoSourceInfo(
+        clip.filePath, fallbackFps);
+    const double fps = clipEffectiveSourceFps(sourceInfo, fallbackFps);
+    const double sourceOut = clipSourceOutPoint(clip);
+    const int sourceFrameBase = qMax(
+        0, static_cast<int>(std::llround(clip.inPoint * fps)));
+    int frameCount = qMax(1, static_cast<int>(std::ceil(
+        qMax(0.0, sourceOut - clip.inPoint) * fps - 1.0e-9)));
+    if (sourceInfo.frameCount > sourceFrameBase)
+        frameCount = qMin(frameCount, sourceInfo.frameCount - sourceFrameBase);
+    frameCount = qMax(1, frameCount);
+
+    const double currentSource = clipSourceTimeAtPlayheadSeconds(
+        trackIdx, clipIdx, clip);
+    const int defaultFrame = qBound(0, static_cast<int>(std::llround(
+        qMax(0.0, currentSource - clip.inPoint) * fps)), frameCount - 1);
+
+    QRect maskRegion;
+    for (const Mask &mask : clip.maskSystem.masks()) {
+        QRectF bounds;
+        bool hasBounds = false;
+        if (mask.rect.isValid() && !mask.rect.isEmpty()) {
+            bounds = mask.rect;
+            hasBounds = true;
+        }
+        for (const QPointF &point : mask.points) {
+            const QRectF pointRect(point, QSizeF(0.0, 0.0));
+            bounds = hasBounds ? bounds.united(pointRect) : pointRect;
+            hasBounds = true;
+        }
+        if (hasBounds)
+            maskRegion = maskRegion.united(bounds.toAlignedRect());
+    }
+
+    const ClipInfo clipSnapshot = clip;
+    deflicker::DeflickerDialogContext context;
+    context.clipLabel = clip.displayName.isEmpty()
+        ? QFileInfo(clip.filePath).fileName() : clip.displayName;
+    context.sourcePath = clip.filePath;
+    context.frameCount = frameCount;
+    context.defaultFrame = defaultFrame;
+    context.fps = fps;
+    context.maskRegion = maskRegion;
+    context.maskCanvasSize = QSize(m_projectConfig.width, m_projectConfig.height);
+    context.frameFetcher = [this, clipSnapshot, fps](int localFrame) {
+        return decodeClipFrameByIndex(clipSnapshot, localFrame, fps);
+    };
+    context.sourceFrameFetcher = [clipSnapshot, fps, sourceOut](int localFrame) {
+        const double seconds = clipSnapshot.inPoint
+            + qMax(0, localFrame) / qMax(1.0, fps);
+        return decodeFrameAtSecondsFromFile(
+            clipSnapshot.filePath,
+            qBound(clipSnapshot.inPoint, seconds, sourceOut));
+    };
+    context.sequenceImporter = [this, trackIdx, clipSnapshot](
+        const QStringList &paths, double sequenceFps, QString *error) {
+        if (!m_timeline || paths.isEmpty()) {
+            if (error)
+                *error = QStringLiteral("取り込み対象のフレームがありません。");
+            return false;
+        }
+
+        QSet<QString> usedIds;
+        for (const TimelineSequence &existing : m_timeline->sequences())
+            usedIds.insert(existing.id);
+        const QString baseId = QStringLiteral("deflicker-%1")
+            .arg(QFileInfo(clipSnapshot.filePath).completeBaseName().left(32));
+        QString sequenceId = baseId;
+        for (int suffix = 2; usedIds.contains(sequenceId); ++suffix)
+            sequenceId = baseId + QStringLiteral("-%1").arg(suffix);
+
+        const double frameDuration = 1.0 / qMax(1.0, sequenceFps);
+        TimelineSequence sequence;
+        sequence.id = sequenceId;
+        sequence.name = QStringLiteral("%1（フリッカー除去）")
+            .arg(clipSnapshot.displayName.isEmpty()
+                     ? QFileInfo(clipSnapshot.filePath).completeBaseName()
+                     : clipSnapshot.displayName);
+        sequence.videoTracks.resize(1);
+        sequence.audioTracks.resize(1);
+        sequence.videoTracks[0].reserve(paths.size());
+        for (const QString &path : paths) {
+            ClipInfo frameClip;
+            frameClip.filePath = path;
+            frameClip.displayName = QFileInfo(path).fileName();
+            frameClip.duration = frameDuration;
+            frameClip.inPoint = 0.0;
+            frameClip.outPoint = frameDuration;
+            frameClip.speed = 1.0;
+            frameClip.volume = 0.0;
+            sequence.videoTracks[0].append(frameClip);
+        }
+        if (!m_timeline->addSequence(sequence)) {
+            if (error)
+                *error = QStringLiteral("タイムラインシーケンスを作成できません。");
+            return false;
+        }
+        if (!m_timeline->addSequenceClip(sequenceId, qMax(0, trackIdx))) {
+            if (error)
+                *error = QStringLiteral("生成したシーケンスをタイムラインへ追加できません。");
+            return false;
+        }
+
+        TimelineTrack *track = m_timeline->videoTracks().value(qMax(0, trackIdx), nullptr);
+        if (track) {
+            const QVector<ClipInfo> &clips = track->clips();
+            for (int i = clips.size() - 1; i >= 0; --i) {
+                if (clips[i].sequenceRefId == sequenceId) {
+                    track->setSelectedClip(i);
+                    break;
+                }
+            }
+        }
+        m_timeline->refreshPlaybackSequence();
+        setWindowModified(true);
+        statusBar()->showMessage(QStringLiteral(
+            "フリッカー除去シーケンスを V%1 に追加しました（%2 フレーム）")
+                                     .arg(qMax(0, trackIdx) + 1)
+                                     .arg(paths.size()), 5000);
+        return true;
+    };
+
+    DeflickerDialog dialog(this);
+    dialog.setWindowTitle(QStringLiteral("フリッカー除去 - %1")
+                              .arg(context.clipLabel));
+    dialog.setContext(context);
+    dialog.exec();
+}
+
 void MainWindow::applyLut()
 {
     if (!m_timeline->hasSelection()) {
@@ -11191,6 +11721,107 @@ void MainWindow::addParticleEffect()
     statusBar()->showMessage(QStringLiteral("Added particle effect clip"), 3000);
 }
 
+void MainWindow::addVfxGenerator()
+{
+    addVfxGeneratorForType(-1);
+}
+
+void MainWindow::addVfxGeneratorForType(int typeIndex)
+{
+    if (!m_timeline) {
+        QMessageBox::warning(this, QStringLiteral("VFX ジェネレータ"),
+                             QStringLiteral("タイムラインが初期化されていません。"));
+        return;
+    }
+
+    VfxGeneratorDialog dialog(this);
+    if (typeIndex >= 0
+        && typeIndex < static_cast<int>(VfxGeneratorType::Count)) {
+        dialog.setGeneratorType(static_cast<VfxGeneratorType>(typeIndex));
+    }
+    if (dialog.exec() != QDialog::Accepted)
+        return;
+
+    const VfxGeneratorType type = dialog.generatorType();
+    const VfxGeneratorParameters parameters = dialog.parameters();
+    const QSize canvasSize(qMax(1, m_projectConfig.width),
+                           qMax(1, m_projectConfig.height));
+    const double fps = m_projectConfig.fps > 0.0 ? m_projectConfig.fps : 30.0;
+    const double duration = VfxGenerators::durationSeconds(type, parameters);
+    if (!std::isfinite(duration) || duration <= 0.0) {
+        QMessageBox::warning(this, QStringLiteral("VFX ジェネレータ"),
+                             QStringLiteral("VFX の継続時間が不正です。"));
+        return;
+    }
+
+    const QString ffmpegBin = findFfmpegBinary();
+    if (ffmpegBin.isEmpty()) {
+        QMessageBox::warning(this, QStringLiteral("VFX ジェネレータ"),
+                             QStringLiteral("ffmpeg が見つからないため VFX クリップを作成できません。"));
+        return;
+    }
+
+    const int frameCount = qMax(1, static_cast<int>(std::ceil(duration * fps)));
+
+    QTemporaryDir tempDir;
+    if (!tempDir.isValid()) {
+        QMessageBox::warning(this, QStringLiteral("VFX ジェネレータ"),
+                             QStringLiteral("一時ディレクトリを作成できませんでした。"));
+        return;
+    }
+    tempDir.setAutoRemove(false);
+
+    for (int i = 0; i < frameCount; ++i) {
+        const QString framePath = tempDir.path()
+            + QStringLiteral("/frame_%1.png").arg(i, 6, 10, QChar('0'));
+        const double timeSeconds = static_cast<double>(i) / fps;
+        const QImage frame = VfxGenerators::render(type, canvasSize, parameters,
+                                                    timeSeconds);
+        if (frame.isNull() || !frame.save(framePath)) {
+            QMessageBox::warning(this, QStringLiteral("VFX ジェネレータ"),
+                                 QStringLiteral("VFX フレームを書き出せませんでした。"));
+            return;
+        }
+    }
+
+    const QString outputPath = tempDir.path() + QStringLiteral("/vfx_generator.mov");
+    const QString framePattern = tempDir.path() + QStringLiteral("/frame_%06d.png");
+    auto encode = [&](const QString &codec, const QString &pixelFormat) {
+        QStringList args;
+        args << QStringLiteral("-y")
+             << QStringLiteral("-framerate") << QString::number(fps, 'f', 6)
+             << QStringLiteral("-i") << framePattern
+             << QStringLiteral("-c:v") << codec
+             << QStringLiteral("-pix_fmt") << pixelFormat
+             << QStringLiteral("-an")
+             << outputPath;
+
+        QProcess ffmpeg;
+        ffmpeg.start(ffmpegBin, args);
+        if (!ffmpeg.waitForStarted(5000))
+            return qMakePair(false, QStringLiteral("ffmpeg を起動できませんでした。"));
+        ffmpeg.waitForFinished(-1);
+        const bool ok = ffmpeg.exitStatus() == QProcess::NormalExit
+            && ffmpeg.exitCode() == 0 && QFileInfo::exists(outputPath);
+        return qMakePair(ok, QString::fromUtf8(ffmpeg.readAllStandardError()));
+    };
+
+    // qtrle keeps the transparent ARGB channel in a MOV. A PNG-in-MOV fallback
+    // retains RGBA when a particular ffmpeg build omits the qtrle encoder.
+    auto encoded = encode(QStringLiteral("qtrle"), QStringLiteral("argb"));
+    if (!encoded.first)
+        encoded = encode(QStringLiteral("png"), QStringLiteral("rgba"));
+    if (!encoded.first) {
+        QMessageBox::warning(this, QStringLiteral("VFX ジェネレータ"),
+                             QStringLiteral("VFX クリップの RGBA エンコードに失敗しました。\n%1")
+                                 .arg(encoded.second));
+        return;
+    }
+
+    loadMediaFile(outputPath, true, QStringLiteral("Added VFX generator"));
+    statusBar()->showMessage(QStringLiteral("Added VFX generator clip"), 3000);
+}
+
 void MainWindow::addTextAnimation()
 {
     bool ok;
@@ -11859,7 +12490,77 @@ void MainWindow::openCameraMotionDialog()
     if (dialog.exec() != QDialog::Accepted)
         return;
     m_projectCamera = dialog.camera();
+    syncProjectLightingToTimeline();
     statusBar()->showMessage(QStringLiteral("カメラモーションを更新しました"), 4000);
+}
+
+void MainWindow::openLight3DDialog()
+{
+    if (m_light3DDialog) {
+        m_light3DDialog->raise();
+        m_light3DDialog->activateWindow();
+        return;
+    }
+
+    int trackIdx = -1;
+    int clipIdx = -1;
+    ClipInfo selectedClip;
+    const bool hasMaterialTarget = selectedVideoClipRef(
+        trackIdx, clipIdx, &selectedClip);
+
+    auto *dialog = new Light3DDialog(this);
+    dialog->setAttribute(Qt::WA_DeleteOnClose, true);
+    dialog->setLights(m_projectLights);
+    dialog->setMaterial(hasMaterialTarget ? selectedClip.material : LayerMaterial{});
+    dialog->setMaterialTargetAvailable(hasMaterialTarget);
+    m_light3DDialog = dialog;
+
+    const QPointer<Light3DDialog> dialogGuard(dialog);
+    const auto syncMaterialTarget = [this, dialogGuard]() {
+        if (!dialogGuard)
+            return;
+        int currentTrackIdx = -1;
+        int currentClipIdx = -1;
+        ClipInfo currentClip;
+        const bool available = selectedVideoClipRef(
+            currentTrackIdx, currentClipIdx, &currentClip);
+        dialogGuard->setMaterialTargetAvailable(available);
+        dialogGuard->setMaterial(available ? currentClip.material
+                                           : LayerMaterial{});
+    };
+    syncMaterialTarget();
+
+    connect(dialog, &Light3DDialog::settingsChanged, this,
+            [this, dialogGuard]() {
+        if (!dialogGuard)
+            return;
+        m_projectLights = dialogGuard->lights();
+        syncProjectLightingToTimeline();
+        int currentTrackIdx = -1;
+        int currentClipIdx = -1;
+        if (m_timeline && selectedVideoClipRef(currentTrackIdx, currentClipIdx)) {
+            m_timeline->setClipLayerMaterial(currentTrackIdx, currentClipIdx,
+                                             dialogGuard->material(), false);
+        }
+        setWindowModified(true);
+        refreshSpecialClipPreview();
+    });
+    if (m_timeline) {
+        connect(m_timeline, &Timeline::clipSelectedOnTrack, dialog,
+                [syncMaterialTarget](int, int) { syncMaterialTarget(); });
+        connect(m_timeline, &Timeline::sequenceChanged, dialog,
+                [syncMaterialTarget](const QVector<PlaybackEntry> &) {
+                    syncMaterialTarget();
+                });
+    }
+    connect(dialog, &QDialog::finished, this, [this, dialog](int) {
+        if (m_light3DDialog == dialog)
+            m_light3DDialog = nullptr;
+    });
+
+    dialog->show();
+    dialog->raise();
+    dialog->activateWindow();
 }
 
 // US-HW-10: Sprint 9 — scene-cut detection menu entry.
@@ -13459,6 +14160,7 @@ void MainWindow::onMobileExport()
                             m_renderQueue, &RenderQueue::stop);
                     // RM-1.3: job.timeline != nullptr path — same carrier
                     // re-sync requirement as File→Export above.
+                    syncProjectLightingToTimeline();
                     syncTrackMatteEntriesToTimeline(
                         m_timeline, m_trackMatteClipEntries);
                     // AC: production export 経路に ACES SSOT を push (start()
@@ -14179,6 +14881,19 @@ void MainWindow::openBatchExportDialog()
         m_batchExportDialog = new BatchExportDialog(this);
         m_batchExportDialog->setObjectName(QStringLiteral("batchExportDialog"));
     }
+    BatchExportDialog::CurrentProjectContext context;
+    context.projectPath = m_projectFilePath;
+    context.timeline = m_timeline;
+    context.width = m_projectConfig.width;
+    context.height = m_projectConfig.height;
+    context.fps = m_projectConfig.fps;
+    if (m_timeline && m_timeline->hasMarkedRange()) {
+        context.startUs = static_cast<qint64>(
+            m_timeline->markedIn() * 1'000'000.0 + 0.5);
+        context.endUs = static_cast<qint64>(
+            m_timeline->markedOut() * 1'000'000.0 + 0.5);
+    }
+    m_batchExportDialog->setCurrentProjectContext(context);
     m_batchExportDialog->show();
     m_batchExportDialog->raise();
     m_batchExportDialog->activateWindow();
@@ -14306,6 +15021,235 @@ void MainWindow::openAutoMatte()
     QMessageBox::information(this, QStringLiteral("自動背景除去 / マッティング"),
         QStringLiteral("AutoMatteDialog がビルドに含まれていません。"));
 #endif
+}
+
+void MainWindow::openObjectRemoval()
+{
+    if (!m_timeline) {
+        QMessageBox::information(this, QStringLiteral("オブジェクト除去"),
+                                 QStringLiteral("タイムラインの初期化が完了していません。"));
+        return;
+    }
+
+    int trackIdx = -1;
+    int clipIdx = -1;
+    ClipInfo clip;
+    if (!selectedVideoClipRef(trackIdx, clipIdx, &clip)
+        || clip.filePath.isEmpty() || !clip.sequenceRefId.isEmpty()) {
+        QMessageBox::information(this, QStringLiteral("オブジェクト除去"),
+                                 QStringLiteral("先に通常のビデオクリップを選択してください。"));
+        return;
+    }
+
+    const double fallbackFps = m_projectConfig.fps > 0.0
+        ? m_projectConfig.fps : 30.0;
+    const VideoSourceInfo sourceInfo = probeVideoSourceInfo(
+        ProxyManager::instance().getProxyPath(clip.filePath), fallbackFps);
+    const double fps = clipEffectiveSourceFps(sourceInfo, fallbackFps);
+    const double sourceOut = clipSourceOutPoint(clip);
+    const int sourceFrameBase = qMax(0, static_cast<int>(std::llround(clip.inPoint * fps)));
+    int frameCount = qMax(1, static_cast<int>(std::ceil(
+        qMax(0.0, sourceOut - clip.inPoint) * fps - 1.0e-9)));
+    if (sourceInfo.frameCount > sourceFrameBase)
+        frameCount = qMin(frameCount, sourceInfo.frameCount - sourceFrameBase);
+    frameCount = qMax(1, frameCount);
+
+    const double currentSource = clipSourceTimeAtPlayheadSeconds(
+        trackIdx, clipIdx, clip);
+    const int defaultFrame = qBound(0, static_cast<int>(std::llround(
+        qMax(0.0, currentSource - clip.inPoint) * fps)), frameCount - 1);
+    const QString clipId = brushClipId(trackIdx, clipIdx);
+    const auto rotoIt = m_rotoClipEntries.constFind(clipId);
+    const bool hasRotoMask = rotoIt != m_rotoClipEntries.cend()
+        && (!rotoIt.value().path.points.isEmpty()
+            || !rotoIt.value().keyframes.isEmpty()
+            || !rotoIt.value().brushMask.isNull());
+    if (!clip.hasMask() && !hasRotoMask) {
+        QMessageBox::information(this, QStringLiteral("オブジェクト除去"),
+                                 QStringLiteral("選択クリップにクリップマスクまたはロトブラシマスクがありません。"));
+        return;
+    }
+
+    const ClipInfo clipSnapshot = clip;
+    // This is the object/mask displacement. ObjectRemovalDialog uses it only
+    // when constructing the animated mask, never as a background sample offset.
+    const auto trackingDeltaAt = [clipSnapshot, fps](int localFrame) {
+        const TrackingResult &tracking = clipSnapshot.maskTrackingData;
+        if (tracking.isEmpty())
+            return QPointF();
+        const double sourceSeconds = clipSnapshot.inPoint
+            + qMax(0, localFrame) / qMax(1.0, fps);
+        const QRect current = tracking.positionAtTime(sourceSeconds);
+        const QRect base = tracking.regions.first().rect;
+        if (current.isNull() || base.isNull())
+            return QPointF();
+        const QPointF currentCenter(
+            current.x() + current.width() / 2.0,
+            current.y() + current.height() / 2.0);
+        const QPointF baseCenter(
+            base.x() + base.width() / 2.0,
+            base.y() + base.height() / 2.0);
+        return currentCenter - baseCenter;
+    };
+
+    const QSize maskSourceSize = sourceInfo.frameSize;
+    const auto clipMaskFetcher = [clipSnapshot, trackingDeltaAt, maskSourceSize](
+        int localFrame, const QSize &size) {
+        QVector<Mask> masks = clipSnapshot.maskSystem.masks();
+        if (masks.isEmpty() || size.isEmpty())
+            return QImage();
+        const QPointF delta = trackingDeltaAt(localFrame);
+        for (Mask &mask : masks) {
+            if (!delta.isNull()) {
+                mask.rect.translate(delta);
+                for (QPointF &point : mask.points)
+                    point += delta;
+            }
+            if (maskSourceSize.width() > 0 && maskSourceSize.height() > 0
+                && maskSourceSize != size) {
+                const double sx = static_cast<double>(size.width())
+                    / maskSourceSize.width();
+                const double sy = static_cast<double>(size.height())
+                    / maskSourceSize.height();
+                mask.rect = QRectF(mask.rect.x() * sx, mask.rect.y() * sy,
+                                   mask.rect.width() * sx,
+                                   mask.rect.height() * sy);
+                for (QPointF &point : mask.points)
+                    point = QPointF(point.x() * sx, point.y() * sy);
+            }
+        }
+        return MaskSystem::generateMaskImage(masks, size);
+    };
+
+    const RotoClipEntry rotoSnapshot = hasRotoMask
+        ? rotoIt.value() : RotoClipEntry();
+    const auto rotoMaskFetcher = [rotoSnapshot, sourceFrameBase](
+        int localFrame, const QSize &size) {
+        if (size.isEmpty())
+            return QImage();
+        const int sourceFrame = sourceFrameBase + qMax(0, localFrame);
+        QImage mask;
+        if (!rotoSnapshot.keyframes.isEmpty()) {
+            Rotoscope roto;
+            for (const RotoKeyframe &keyframe : rotoSnapshot.keyframes)
+                roto.addKeyframe(keyframe.frameNumber, keyframe.path);
+            mask = roto.renderMask(sourceFrame, size);
+        } else if (!rotoSnapshot.path.points.isEmpty()) {
+            Rotoscope roto;
+            roto.addKeyframe(sourceFrame, rotoSnapshot.path);
+            mask = roto.renderMask(sourceFrame, size);
+        }
+        if (!rotoSnapshot.brushMask.isNull()) {
+            QImage brush = rotoSnapshot.brushMask.convertToFormat(
+                QImage::Format_Grayscale8);
+            if (brush.size() != size)
+                brush = brush.scaled(size, Qt::IgnoreAspectRatio,
+                                     Qt::FastTransformation);
+            if (mask.isNull()) {
+                mask = brush;
+            } else {
+                for (int y = 0; y < size.height(); ++y) {
+                    uchar *maskRow = mask.scanLine(y);
+                    const uchar *brushRow = brush.constScanLine(y);
+                    for (int x = 0; x < size.width(); ++x)
+                        maskRow[x] = qMax(maskRow[x], brushRow[x]);
+                }
+            }
+        }
+        return mask;
+    };
+
+    objremoval::ObjectRemovalDialogContext context;
+    context.clipLabel = clip.displayName.isEmpty()
+        ? QFileInfo(clip.filePath).fileName() : clip.displayName;
+    context.sourcePath = clip.filePath;
+    context.frameCount = frameCount;
+    context.defaultFrame = defaultFrame;
+    context.fps = fps;
+    context.clipMaskAvailable = clip.hasMask();
+    context.rotoMaskAvailable = hasRotoMask;
+    context.maskTrackingAvailable = !clip.maskTrackingData.isEmpty();
+    context.frameFetcher = [this, clipSnapshot, fps](int localFrame) {
+        return decodeClipFrameByIndex(clipSnapshot, localFrame, fps);
+    };
+    context.clipMaskFetcher = clipMaskFetcher;
+    context.rotoMaskFetcher = rotoMaskFetcher;
+    // This tracker follows the removal mask shape. It is intentionally not
+    // supplied as a background-alignment source for temporal sampling.
+    context.maskTrackingOffsetFetcher = trackingDeltaAt;
+    context.sequenceImporter = [this, trackIdx, clipSnapshot](
+        const QStringList &paths, double sequenceFps, QString *error) {
+        if (!m_timeline || paths.isEmpty()) {
+            if (error)
+                *error = QStringLiteral("取り込み対象のフレームがありません。");
+            return false;
+        }
+
+        QSet<QString> usedIds;
+        for (const TimelineSequence &existing : m_timeline->sequences())
+            usedIds.insert(existing.id);
+        const QString baseId = QStringLiteral("object-removal-%1")
+            .arg(QFileInfo(clipSnapshot.filePath).completeBaseName().left(32));
+        QString sequenceId = baseId;
+        for (int suffix = 2; usedIds.contains(sequenceId); ++suffix)
+            sequenceId = baseId + QStringLiteral("-%1").arg(suffix);
+
+        const double frameDuration = 1.0 / qMax(1.0, sequenceFps);
+        TimelineSequence sequence;
+        sequence.id = sequenceId;
+        sequence.name = QStringLiteral("%1（オブジェクト除去）")
+            .arg(clipSnapshot.displayName.isEmpty()
+                     ? QFileInfo(clipSnapshot.filePath).completeBaseName()
+                     : clipSnapshot.displayName);
+        sequence.videoTracks.resize(1);
+        sequence.audioTracks.resize(1);
+        sequence.videoTracks[0].reserve(paths.size());
+        for (const QString &path : paths) {
+            ClipInfo frameClip;
+            frameClip.filePath = path;
+            frameClip.displayName = QFileInfo(path).fileName();
+            frameClip.duration = frameDuration;
+            frameClip.inPoint = 0.0;
+            frameClip.outPoint = frameDuration;
+            frameClip.speed = 1.0;
+            frameClip.volume = 0.0;
+            sequence.videoTracks[0].append(frameClip);
+        }
+        if (!m_timeline->addSequence(sequence)) {
+            if (error)
+                *error = QStringLiteral("タイムラインシーケンスを作成できません。");
+            return false;
+        }
+        if (!m_timeline->addSequenceClip(sequenceId, qMax(0, trackIdx))) {
+            if (error)
+                *error = QStringLiteral("生成したシーケンスをタイムラインへ追加できません。");
+            return false;
+        }
+
+        TimelineTrack *track = m_timeline->videoTracks().value(qMax(0, trackIdx), nullptr);
+        if (track) {
+            const QVector<ClipInfo> &clips = track->clips();
+            for (int i = clips.size() - 1; i >= 0; --i) {
+                if (clips[i].sequenceRefId == sequenceId) {
+                    track->setSelectedClip(i);
+                    break;
+                }
+            }
+        }
+        m_timeline->refreshPlaybackSequence();
+        setWindowModified(true);
+        statusBar()->showMessage(QStringLiteral(
+            "オブジェクト除去シーケンスを V%1 に追加しました（%2 フレーム）")
+                                     .arg(qMax(0, trackIdx) + 1)
+                                     .arg(paths.size()), 5000);
+        return true;
+    };
+
+    ObjectRemovalDialog dialog(this);
+    dialog.setWindowTitle(QStringLiteral("オブジェクト除去 - %1")
+                              .arg(context.clipLabel));
+    dialog.setContext(context);
+    dialog.exec();
 }
 
 void MainWindow::openAudioRestoreDialog()
@@ -14486,6 +15430,235 @@ bool readPcm16WavToMono(const QString &wavPath,
 
 } // namespace
 #endif // HAVE_SPECTRAL_EDIT_DIALOG
+
+void MainWindow::openVoiceIsolationDialog()
+{
+#ifdef HAVE_SPECTRAL_EDIT_DIALOG
+    if (!m_timeline) {
+        QMessageBox::information(this, QStringLiteral("音声分離"),
+                                 QStringLiteral("タイムラインの初期化が完了していません。"));
+        return;
+    }
+
+    QString sourcePath;
+    QString sourceLabel;
+    ClipInfo selectedClip;
+    int replaceAudioTrack = -1;
+    int replaceAudioClip = -1;
+    bool selectedVideo = false;
+
+    // Prefer an explicitly selected audio clip. This keeps the operation
+    // local to the audio row when a project has independent BGM/dialogue.
+    for (int trackIndex = 0;
+         trackIndex < m_timeline->audioTracks().size() && sourcePath.isEmpty();
+         ++trackIndex) {
+        const TimelineTrack *track = m_timeline->audioTracks().value(trackIndex, nullptr);
+        if (!track || track->selectedClips().isEmpty())
+            continue;
+        const int clipIndex = track->selectedClips().last();
+        if (clipIndex < 0 || clipIndex >= track->clips().size())
+            continue;
+        selectedClip = track->clips().at(clipIndex);
+        if (selectedClip.filePath.isEmpty() || !selectedClip.sequenceRefId.isEmpty())
+            continue;
+        sourcePath = selectedClip.filePath;
+        sourceLabel = selectedClip.displayName;
+        replaceAudioTrack = trackIndex;
+        replaceAudioClip = clipIndex;
+    }
+
+    if (sourcePath.isEmpty()) {
+        int videoTrack = -1;
+        int videoClip = -1;
+        if (selectedVideoClipRef(videoTrack, videoClip, &selectedClip)
+            && !selectedClip.filePath.isEmpty()
+            && selectedClip.sequenceRefId.isEmpty()) {
+            sourcePath = selectedClip.filePath;
+            sourceLabel = selectedClip.displayName;
+            selectedVideo = true;
+        }
+    }
+
+    if (sourcePath.isEmpty()) {
+        sourcePath = QFileDialog::getOpenFileName(
+            this, QStringLiteral("音声分離: 対象メディアを選択"), QString(),
+            QStringLiteral("メディアファイル (*.mp4 *.mov *.mkv *.wav *.mp3 *.aac *.m4a *.flac);;"
+                           "すべてのファイル (*)"));
+        if (!sourcePath.isEmpty())
+            sourceLabel = QFileInfo(sourcePath).fileName();
+    }
+    if (sourcePath.isEmpty()) {
+        statusBar()->showMessage(QStringLiteral("音声分離: 対象が選択されていません。"), 3000);
+        return;
+    }
+    if (!QFileInfo::exists(sourcePath)) {
+        QMessageBox::warning(this, QStringLiteral("音声分離"),
+                             QStringLiteral("ファイルが存在しません:\n%1").arg(sourcePath));
+        return;
+    }
+
+    // A selected video clip may have a linked audio row using the same source.
+    // Replacing that audio row keeps the video source intact.
+    if (selectedVideo) {
+        for (int trackIndex = 0;
+             trackIndex < m_timeline->audioTracks().size() && replaceAudioTrack < 0;
+             ++trackIndex) {
+            const TimelineTrack *track = m_timeline->audioTracks().value(trackIndex, nullptr);
+            if (!track)
+                continue;
+            for (int clipIndex = 0; clipIndex < track->clips().size(); ++clipIndex) {
+                const ClipInfo &candidate = track->clips().at(clipIndex);
+                const bool linked = selectedClip.linkGroup > 0
+                    && candidate.linkGroup == selectedClip.linkGroup;
+                if (linked || candidate.filePath == sourcePath) {
+                    replaceAudioTrack = trackIndex;
+                    replaceAudioClip = clipIndex;
+                    break;
+                }
+            }
+        }
+    }
+
+    constexpr int kSampleRate = 48000;
+    QTemporaryDir tempDir;
+    if (!tempDir.isValid()) {
+        QMessageBox::warning(this, QStringLiteral("音声分離"),
+                             QStringLiteral("音声抽出用の一時ディレクトリを作成できません。"));
+        return;
+    }
+    const QString sourceWav = tempDir.filePath(QStringLiteral("voice-isolation-source.wav"));
+    QString extractError;
+    statusBar()->showMessage(QStringLiteral("音声を抽出しています..."));
+    if (!libavcore::extractAudioToWav(sourcePath, sourceWav, kSampleRate,
+                                      &extractError)) {
+        QMessageBox::warning(this, QStringLiteral("音声分離"),
+                             QStringLiteral("音声の抽出に失敗しました:\n%1")
+                                 .arg(extractError.isEmpty() ? sourcePath : extractError));
+        statusBar()->showMessage(QStringLiteral("音声分離: 抽出失敗。"), 3000);
+        return;
+    }
+
+    std::vector<double> decoded;
+    int sampleRate = kSampleRate;
+    QString readError;
+    if (!readPcm16WavToMono(sourceWav, decoded, sampleRate, &readError)
+        || decoded.empty()) {
+        QMessageBox::warning(this, QStringLiteral("音声分離"),
+                             QStringLiteral("抽出した音声を読み込めませんでした:\n%1")
+                                 .arg(readError.isEmpty()
+                                          ? QStringLiteral("サンプルがありません") : readError));
+        statusBar()->showMessage(QStringLiteral("音声分離: 読み込み失敗。"), 3000);
+        return;
+    }
+
+    const double duration = decoded.size() / static_cast<double>(sampleRate);
+    constexpr double kMaxDurationSeconds = 10.0 * 60.0;
+    if (duration > kMaxDurationSeconds) {
+        const auto choice = QMessageBox::question(
+            this, QStringLiteral("音声分離"),
+            QStringLiteral("音声が長すぎます（%1 秒）。先頭 10 分だけ処理しますか?")
+                .arg(duration, 0, 'f', 1),
+            QMessageBox::Ok | QMessageBox::Cancel, QMessageBox::Ok);
+        if (choice != QMessageBox::Ok) {
+            statusBar()->showMessage(QStringLiteral("音声分離: キャンセルしました。"), 3000);
+            return;
+        }
+        decoded.resize(static_cast<size_t>(kMaxDurationSeconds * sampleRate));
+    }
+
+    QVector<float> samples;
+    samples.reserve(static_cast<qsizetype>(decoded.size()));
+    for (double sample : decoded)
+        samples.append(static_cast<float>(std::isfinite(sample) ? sample : 0.0));
+
+    const QString displayLabel = sourceLabel.isEmpty()
+        ? QFileInfo(sourcePath).fileName() : sourceLabel;
+    VoiceIsolationDialog dialog(this);
+    dialog.setObjectName(QStringLiteral("voiceIsolationDialog"));
+    dialog.setAudioSource(QStringLiteral("%1\n%2").arg(displayLabel, sourcePath),
+                          samples, sampleRate);
+    if (selectedClip.outPoint > selectedClip.inPoint) {
+        dialog.setInitialRange(selectedClip.inPoint, selectedClip.outPoint);
+    }
+    statusBar()->showMessage(QStringLiteral("音声分離ダイアログを開いています..."), 2000);
+    if (dialog.exec() != QDialog::Accepted) {
+        statusBar()->showMessage(QStringLiteral("音声分離: 適用されませんでした。"), 3000);
+        return;
+    }
+
+    const QVector<float> processed = dialog.processedSamples();
+    if (processed.isEmpty()) {
+        statusBar()->showMessage(QStringLiteral("音声分離: 処理結果が空です。"), 3000);
+        return;
+    }
+
+    const QFileInfo sourceInfo(sourcePath);
+    const QString defaultOutput = sourceInfo.absolutePath() + QLatin1Char('/')
+        + sourceInfo.completeBaseName() + QStringLiteral("_voiceisolated.wav");
+    const QString outputPath = QFileDialog::getSaveFileName(
+        this, QStringLiteral("分離済み音声を保存"), defaultOutput,
+        QStringLiteral("WAV ファイル (*.wav);;すべてのファイル (*)"));
+    if (outputPath.isEmpty()) {
+        statusBar()->showMessage(QStringLiteral("音声分離: 保存をキャンセルしました。"), 3000);
+        return;
+    }
+    if (QFileInfo(outputPath).exists()
+        && QFileInfo(outputPath).canonicalFilePath() == sourceInfo.canonicalFilePath()) {
+        const auto choice = QMessageBox::warning(
+            this, QStringLiteral("音声分離"),
+            QStringLiteral("元のファイルを上書きします。続行しますか?"),
+            QMessageBox::Save | QMessageBox::Cancel, QMessageBox::Cancel);
+        if (choice != QMessageBox::Save)
+            return;
+    }
+
+    QByteArray pcm;
+    if (processed.size() > std::numeric_limits<int>::max() / 2) {
+        QMessageBox::warning(this, QStringLiteral("音声分離"),
+                             QStringLiteral("処理結果が大きすぎます。"));
+        return;
+    }
+    pcm.resize(processed.size() * 2);
+    for (int i = 0; i < processed.size(); ++i) {
+        double value = std::isfinite(processed[i])
+            ? static_cast<double>(processed[i]) : 0.0;
+        value = std::clamp(value, -1.0, 1.0);
+        const qint16 sample = static_cast<qint16>(qRound(value * 32767.0));
+        pcm[i * 2] = static_cast<char>(sample & 0xff);
+        pcm[i * 2 + 1] = static_cast<char>((sample >> 8) & 0xff);
+    }
+
+    QString writeError;
+    if (!libavcore::writePcm16AsWav(outputPath, pcm, dialog.sampleRate(), 1,
+                                    &writeError)) {
+        QMessageBox::warning(this, QStringLiteral("音声分離"),
+                             QStringLiteral("分離済み音声の書き出しに失敗しました:\n%1")
+                                 .arg(writeError.isEmpty() ? outputPath : writeError));
+        return;
+    }
+
+    bool replaced = false;
+    if (replaceAudioTrack >= 0 && replaceAudioClip >= 0) {
+        replaced = m_timeline->replaceAudioClipMedia(
+            replaceAudioTrack, replaceAudioClip, outputPath);
+    }
+    if (!replaced)
+        m_timeline->insertAudioClipAtPlayhead(outputPath, 2);
+
+    setWindowModified(true);
+    statusBar()->showMessage(
+        replaced ? QStringLiteral("音声分離をクリップへ適用しました: %1").arg(outputPath)
+                 : QStringLiteral("分離済み音声をタイムラインへ追加しました: %1").arg(outputPath),
+        6000);
+    QMessageBox::information(
+        this, QStringLiteral("音声分離"),
+        replaced ? QStringLiteral("分離済み音声を選択クリップへ適用しました:\n%1").arg(outputPath)
+                 : QStringLiteral("分離済み音声をタイムラインへ追加しました:\n%1").arg(outputPath));
+#else
+    QMessageBox::information(this, QStringLiteral("音声分離"),
+                             QStringLiteral("音声抽出機能がビルドに含まれていません。"));
+#endif
+}
 
 void MainWindow::openSpectralRepair()
 {
@@ -16186,6 +17359,7 @@ void MainWindow::openRenderQueueDialog()
     // RM-1.4/RM-1.3: keep the live Timeline's matte carrier current so a
     // "current project" queue job exports the same track matte the GUI
     // preview shows (the dialog has no save step before submitting).
+    syncProjectLightingToTimeline();
     syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
     m_renderQueueDialog->show();
     m_renderQueueDialog->raise();

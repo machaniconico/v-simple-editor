@@ -1,7 +1,7 @@
 // src/selftests/SelftestRegistry.cpp
 // PRD-SPLIT-MAIN-1: selftest dispatch table + 3 helper functions.
-// The run<Foo>Selftest() bodies remain in src/main.cpp; this file only
-// owns the routing (struct table + dispatchPre/Post/validateUnknown).
+// The run<Foo>Selftest() bodies remain in their owning selftest translation
+// units; this file only owns the routing (struct table + dispatch helpers).
 
 #include "SelftestRegistry.h"
 
@@ -47,7 +47,12 @@ int runAutoColorSelftest();
 int runAutoColorPreserveGradeSelftest();
 int runAutoDuckingSelftest();
 int runAutoMatteSelftest();
+int runDeflickerSelftest();
+int runObjectRemovalSelftest();
+int runLight3DSelftest();
+int runVoiceIsolationSelftest();
 int runBatchExportSelftest();
+int runBatchExportE2ESelftest();
 int runBezierEasingSelftest();
 int runBlenderSelftest();
 int runBroadcastCaptionSelftest();
@@ -77,6 +82,8 @@ int runE2eSelftest();
 int runEasingSelftest();
 int runEasingPresetsSelftest();
 int runEffectKeyframeParitySelftest();
+int runEffectLibrarySelftest();
+int runVfxFootageSelftest();
 int runEffectPresetSelftest();
 int runEffectTimingSelftest();
 int runExposureAidsSelftest();
@@ -128,6 +135,7 @@ int runPlanarPresetSelftest();
 int runPlatformMockE2eSelftest();
 int runPptxExportSelftest();
 int runPrecomposeE2ESelftest();
+int runMainWindowLifecycleSelftest();
 int runProExtSelftest();
 int runProSelftest();
 int runProjTmplSelftest();
@@ -170,6 +178,7 @@ int runTrackerPresetSelftest();
 int runTrimOpsSelftest();
 int runTwitchSelftest();
 int runVfxSelftest();
+int runVfxGeneratorsSelftest();
 int runVersionedSaveSelftest();
 int runVideostabDeshakeSelftest();
 int runVimeoSelftest();
@@ -511,6 +520,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "AE-ANIM-2 spatial Bezier position path: no-handle invariance, curve, endpoints, JSON, degenerate guards (5 gates)" },
     { "spectral-edit",     "VEDITOR_SPECTRAL_EDIT_SELFTEST",      runSpectralEditSelftest,       false,
       "SpectralEngine: FFT/STFT/iSTFT round-trip + region attenuation" },
+    { "voice-isolation",   "VEDITOR_VOICE_ISOLATION_SELFTEST",    runVoiceIsolationSelftest,     true,
+      "Voice isolation: streaming STFT, complementary outputs, adaptive floor, smoothing, dialog responsiveness and harmonic guards (16 gates)" },
     { "sws-color",         "VEDITOR_SWS_COLOR_SELFTEST",          runSwsColorSelftest,           false,
       "swscale color matrix helper: colorspace/range/tag resolution + coefficient proof (8 gates)" },
     { "rgb-parade",        "VEDITOR_RGB_PARADE_SELFTEST",         runRgbParadeSelftest,          false,
@@ -533,6 +544,10 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "AE-FX-2 Stylize Family: glow, edges, emboss, posterize, threshold, solarize gates (G1-G7)" },
     { "effect-preset", "VEDITOR_EFFECT_PRESET_SELFTEST", runEffectPresetSelftest, false,
       "FXP-1 effect preset stack JSON save/load/apply with optional effect keyframes (5 gates)" },
+    { "effect-library", "VEDITOR_EFFECT_LIBRARY_SELFTEST", runEffectLibrarySelftest, false,
+      "Effect Library: dynamic registry catalog, search/category indexes, favorites, preset round-trip, apply/preview parity, safe thumbnails, shader/plugin parameter routing, VFX registration and image application (13 gates)" },
+    { "vfx-footage", "VEDITOR_VFX_FOOTAGE_SELFTEST", runVfxFootageSelftest, true,
+      "VFX footage: missing-directory safety, extension/category scan, EffectLibrary integration, black-level, Screen, intensity, determinism, ClipInfo/upper-track placement, non-black representative thumbnail (11 gates; valid-media decode explicitly SKIP when absent)" },
     { "dolby-vision",      "VEDITOR_DOLBY_VISION_SELFTEST",       runDolbyVisionSelftest,        false,
       "DolbyVision: PQ ST.2084 math + metadata + DV XML generation" },
     { "dv-timeline",       "VEDITOR_DV_TIMELINE_SELFTEST",         runDvTimelineSelftest,         false,
@@ -541,6 +556,10 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "BroadcastCaption: CEA-608 byte-pair/parity + SCC export + CEA-708 packet" },
     { "auto-matte",        "VEDITOR_AUTO_MATTE_SELFTEST",         runAutoMatteSelftest,          false,
       "AutoMatte: difference matte, morphology, feather, composite" },
+    { "object-removal",    "VEDITOR_OBJECT_REMOVAL_SELFTEST",     runObjectRemovalSelftest,      false,
+      "ObjectRemoval: temporal trust, background alignment, bounds, dilation, cache, composite (14 gates)" },
+    { "light3d",            "VEDITOR_LIGHT3D_SELFTEST",            runLight3DSelftest,            true,
+      "3D lights: compositor/export parity, keyframe edits, dialog guards, JSON, determinism (16 gates)" },
     { "edl-export",        "VEDITOR_EDL_EXPORT_SELFTEST",         runEdlExportSelftest,          false,
       "EdlExport: CMX3600 timecode + event lines + drop-frame" },
     { "workspace",         "VEDITOR_WORKSPACE_SELFTEST",          runWorkspaceSelftest,          false,
@@ -622,6 +641,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "smart-render",       "VEDITOR_SMART_RENDER_SELFTEST",       runSmartRenderSelftest,        false,
       "Smart Render T4: conservative stream-copy eligibility predicate + env gate" },
     // QApplication-required (needsQApplication=true) ----------------------
+    { "deflicker",         "VEDITOR_DEFLICKER_SELFTEST",          runDeflickerSelftest,         true,
+      "Deflicker: global luma/RGB, streaming apply, cancellation, source resolution, and mask bounds (14 gates)" },
     { "adjustment-layer", "VEDITOR_ADJUSTMENT_LAYER_SELFTEST", runAdjustmentLayerSelftest, true,
       "Adjustment clip model: V1-wins z-order, behind-only effect stack, byte-identical off path, JSON true-only persistence" },
     { "frame-export",      "VEDITOR_FRAME_EXPORT_SELFTEST",        runFrameExportSelftest,        true,
@@ -661,7 +682,9 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "nest-sequence", "VEDITOR_NEST_SEQUENCE_SELFTEST", runNestSequenceSelftest, true,
       "Nested sequences: recursive render, cycle/depth guards, audio flatten, store roundtrip, no-nest byte identity" },
     { "precompose-e2e", "VEDITOR_PRECOMPOSE_E2E_SELFTEST", runPrecomposeE2ESelftest, true,
-      "MainWindow precompose UI-flow backend: sequence ref replacement plus single/double undo store cleanup" },
+      "MainWindow precompose UI-flow backend: sequence ref replacement plus single/double undo store cleanup (4 gates)" },
+    { "mainwindow-lifecycle", "VEDITOR_MAINWINDOW_LIFECYCLE_SELFTEST", runMainWindowLifecycleSelftest, true,
+      "MainWindow lifecycle: construct/destroy once, repeat three times, and clear dependent dock objects (3 gates)" },
     { "ripple-delete", "VEDITOR_RIPPLE_DELETE_SELFTEST", runRippleDeleteSelftest, true,
       "Ripple delete and gap close: all-track time-range ripple, one-step undo, and no-selection no-op" },
     { "e2e",               "VEDITOR_E2E_SELFTEST",                runE2eSelftest,                true,
@@ -682,6 +705,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "16-bit RGBA64 track-matte (trackmatte16::composeExport) vs 8-bit trackmatte:: SSOT parity, all 4 matte types + 16-bit precision + ODT luma-space proof (8 gates)" },
     { "vfx",               "VEDITOR_VFX_SELFTEST",                runVfxSelftest,                true,
       "VFX module smoke: Sprint-6 effect graph + GLSL primitive pipeline" },
+    { "vfx-generators",    "VEDITOR_VFX_GENERATORS_SELFTEST",     runVfxGeneratorsSelftest,     true,
+      "VFX generators: seven deterministic procedural generators, RGBA compositor output, keyframes, dynamic-library registration, and ShockWave UV displacement (18 gates)" },
     { "pro",               "VEDITOR_PRO_SELFTEST",                runProSelftest,                true,
       "Pro/advanced toolset smoke (color scopes, envelope, multicam prep)" },
     { "mograph",           "VEDITOR_MOGRAPH_SELFTEST",            runMographSelftest,            true,
@@ -752,6 +777,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Multicam edit module smoke (angle sync, cut-away, monitor layout)" },
     { "batchexport",       "VEDITOR_BATCHEXPORT_SELFTEST",        runBatchExportSelftest,        true,
       "Batch export pipeline smoke (queue manager + per-item preset binding)" },
+    { "batchexport-e2e",   "VEDITOR_BATCHEXPORT_E2E_SELFTEST",    runBatchExportE2ESelftest,    true,
+      "Batch export dialog task bridge: live Timeline/source tagging, fps/config precedence, and pause signal contract (6 gates)" },
     { "chroma",            "VEDITOR_CHROMA_SELFTEST",             runChromaSelftest,             true,
       "Chroma key (greenscreen) module smoke (spill-suppress + matte refine)" },
     { "audiorestore",      "VEDITOR_AUDIORESTORE_SELFTEST",       runAudioRestoreSelftest,       true,

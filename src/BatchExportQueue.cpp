@@ -5,25 +5,43 @@
 namespace batchexport {
 
 namespace {
-// Map the dialog's preset string (1080p / 720p / 4K) onto render geometry +
-// bitrate. Unknown strings fall back to 1080p — the same forgiving behaviour
-// the dialog's fixed preset list implies.
-struct PresetGeom {
-    int width;
-    int height;
-    int bitrateKbps;
-};
-PresetGeom geomForPreset(const QString &preset)
+void fillPresetDefaults(ExportTask &task)
 {
-    const QString p = preset.trimmed().toLower();
-    if (p == QStringLiteral("4k") || p == QStringLiteral("2160p"))
-        return { 3840, 2160, 80000 };
-    if (p == QStringLiteral("720p"))
-        return { 1280, 720, 8000 };
-    // "1080p" and anything unrecognised.
-    return { 1920, 1080, 20000 };
+    if (task.preset.trimmed().isEmpty())
+        task.preset = QStringLiteral("1080p");
+
+    const ExportPresetDefaults defaults = presetDefaults(task.preset);
+    if (task.codec.isEmpty())
+        task.codec = defaults.codec;
+    if (task.videoCodec.isEmpty())
+        task.videoCodec = defaults.videoCodec;
+    if (task.videoBitrateKbps <= 0)
+        task.videoBitrateKbps = defaults.videoBitrateKbps;
+    if (task.audioCodec.isEmpty())
+        task.audioCodec = defaults.audioCodec;
+    if (task.audioBitrateKbps <= 0)
+        task.audioBitrateKbps = defaults.audioBitrateKbps;
 }
 } // namespace
+
+ExportPresetDefaults presetDefaults(const QString &preset)
+{
+    const QString p = preset.trimmed().toLower();
+    if (p == QStringLiteral("4k") || p == QStringLiteral("2160p")) {
+        return { 3840, 2160, QStringLiteral("h264"),
+                 QStringLiteral("libx264"), 80000,
+                 QStringLiteral("aac"), 192 };
+    }
+    if (p == QStringLiteral("720p")) {
+        return { 1280, 720, QStringLiteral("h264"),
+                 QStringLiteral("libx264"), 8000,
+                 QStringLiteral("aac"), 192 };
+    }
+    // "1080p" and anything unrecognised.
+    return { 1920, 1080, QStringLiteral("h264"),
+             QStringLiteral("libx264"), 20000,
+             QStringLiteral("aac"), 192 };
+}
 
 Queue::Queue(QObject *parent)
     : QObject(parent)
@@ -46,7 +64,7 @@ QString Queue::addTask(const QString &projectPath,
                        const QString &preset)
 {
     return addTask(projectPath, outputPath, preset,
-                   nullptr, 0, 0, 0, 0);
+                   nullptr, 0, 0, 0, 0, 0.0);
 }
 
 QString Queue::addTask(const QString &projectPath,
@@ -56,22 +74,72 @@ QString Queue::addTask(const QString &projectPath,
                        int width,
                        int height,
                        qint64 startUs,
-                       qint64 endUs)
+                       qint64 endUs,
+                       double fps)
 {
     ExportTask t;
-    t.id          = QUuid::createUuid().toString(QUuid::WithoutBraces);
     t.projectPath = projectPath;
     t.outputPath  = outputPath;
     t.preset      = preset;
-    t.state       = TaskState::Queued;
-    t.progress    = 0;
+    t.source      = timeline ? TaskSource::CurrentProject : TaskSource::File;
     t.timeline    = timeline;
     t.width       = width;
     t.height      = height;
     t.startUs     = startUs;
     t.endUs       = endUs;
+    t.fps         = fps;
+    return addTask(t);
+}
+
+QString Queue::addTask(const ExportTask &input)
+{
+    ExportTask t = input;
+    t.id       = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    t.state    = TaskState::Queued;
+    t.progress = 0;
+    t.message.clear();
+    t.renderUuid.clear();
+    t.exportConfig = QJsonObject();
+    fillPresetDefaults(t);
     m_tasks.append(t);
     return t.id;
+}
+
+RenderJob Queue::buildRenderJob(const ExportTask &input)
+{
+    ExportTask task = input;
+    fillPresetDefaults(task);
+    const ExportPresetDefaults defaults = presetDefaults(task.preset);
+    const int outW = task.width > 0 ? task.width : defaults.width;
+    const int outH = task.height > 0 ? task.height : defaults.height;
+
+    RenderJob job;
+    job.uuid            = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    job.name            = task.outputPath;
+    job.projectFilePath = task.projectPath;
+    job.outputPath      = task.outputPath;
+    job.preset          = task.preset;
+    job.width           = outW;
+    job.height          = outH;
+    job.codec           = task.codec;
+    job.bitrateBps      = static_cast<qint64>(task.videoBitrateKbps) * 1000;
+    job.startUs         = task.startUs;
+    job.endUs           = task.endUs;
+    // The additive in-memory edit-graph seam (LUT / mask / tracking are not
+    // serialized to .veditor) is handed straight to RenderQueue.
+    job.timeline        = task.timeline;
+
+    QJsonObject cfg;
+    cfg["width"]        = outW;
+    cfg["height"]       = outH;
+    if (task.fps > 0.0)
+        cfg["fps"]       = task.fps;
+    cfg["videoCodec"]   = task.videoCodec;
+    cfg["videoBitrate"] = task.videoBitrateKbps;
+    cfg["audioCodec"]   = task.audioCodec;
+    cfg["audioBitrate"] = task.audioBitrateKbps;
+    job.exportConfig     = cfg;
+    return job;
 }
 
 void Queue::removeTask(const QString &id)
@@ -147,37 +215,8 @@ void Queue::processNext()
             task.state    = TaskState::Running;
             task.progress = 0;
 
-            const PresetGeom g = geomForPreset(task.preset);
-            const int outW = task.width  > 0 ? task.width  : g.width;
-            const int outH = task.height > 0 ? task.height : g.height;
-
-            RenderJob job;
-            job.uuid            = QUuid::createUuid()
-                                      .toString(QUuid::WithoutBraces);
-            job.name            = task.outputPath;
-            job.projectFilePath = task.projectPath;
-            job.outputPath      = task.outputPath;
-            job.preset          = task.preset;
-            job.width           = outW;
-            job.height          = outH;
-            job.codec           = QStringLiteral("h264");
-            job.bitrateBps      = g.bitrateKbps * 1000;
-            job.startUs         = task.startUs;
-            job.endUs           = task.endUs;
-            // The additive in-memory edit-graph seam (LUT / mask / tracking
-            // are NOT serialized to .veditor) — handed straight to the real
-            // RenderQueue exactly as PARITY S8 does (main.cpp:4526).
-            job.timeline        = task.timeline;
-
-            QJsonObject cfg;
-            cfg["width"]        = outW;
-            cfg["height"]       = outH;
-            cfg["fps"]          = 30.0;
-            cfg["videoCodec"]   = QStringLiteral("libx264");
-            cfg["videoBitrate"] = g.bitrateKbps;     // kbps
-            cfg["audioCodec"]   = QStringLiteral("aac");
-            cfg["audioBitrate"] = 192;
-            job.exportConfig    = cfg;
+            RenderJob job = buildRenderJob(task);
+            task.exportConfig = job.exportConfig;
 
             task.renderUuid = job.uuid;
 

@@ -755,6 +755,8 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
     }
     if (!data.projectCamera.isEmpty())
         root["projectCamera"] = data.projectCamera;
+    if (!data.projectLights.isEmpty())
+        root["projectLights"] = data.projectLights;
 
     // US-HW-10: audio ducking (Sprint 9) — always written so a saved project
     // round-trips even when the user has never opened the ducking dialog.
@@ -1035,6 +1037,7 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
     data.projectCamera = root.contains("projectCamera")
         ? root["projectCamera"].toObject()
         : QJsonObject{};
+    data.projectLights = root.value("projectLights").toArray();
 
     // US-HW-10: audio ducking (Sprint 9) — backward compat: missing key keeps
     // the DuckingParams{} defaults and duckingEnabled=false.
@@ -1332,6 +1335,8 @@ QString ProjectFile::toJsonString(const ProjectData &data)
     }
     if (!data.projectCamera.isEmpty())
         root["projectCamera"] = data.projectCamera;
+    if (!data.projectLights.isEmpty())
+        root["projectLights"] = data.projectLights;
 
     // US-HW-10: audio ducking (Sprint 9) — always written so a saved project
     // round-trips even when the user has never opened the ducking dialog.
@@ -1596,6 +1601,7 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
     data.projectCamera = root.contains("projectCamera")
         ? root["projectCamera"].toObject()
         : QJsonObject{};
+    data.projectLights = root.value("projectLights").toArray();
 
     // US-HW-10: audio ducking (Sprint 9) — backward compat: missing key keeps
     // the DuckingParams{} defaults and duckingEnabled=false.
@@ -1755,8 +1761,16 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
     obj["opacity"] = clip.opacity;
     if (clip.isAdjustment)
         obj["isAdjustment"] = true;
+    if (clip.isVfxFootage) {
+        obj["isVfxFootage"] = true;
+        obj["blendMode"] = CompositeLayer::blendModeName(clip.blendMode);
+        obj["vfxIntensity"] = clip.vfxIntensity;
+        obj["vfxBlackLevel"] = clip.vfxBlackLevel;
+    }
     obj["is3DLayer"] = clip.is3DLayer;
     obj["layer3D"] = clip.layer3D.toJson();
+    if (!clip.material.isDefault())
+        obj["layerMaterial"] = clip.material.toJson();
     if (clip.motionBlurEnabled)
         obj["motionBlurEnabled"] = true;
     if (clip.fitContain)
@@ -1846,10 +1860,17 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
     clip.rotation2DDegrees = obj["rotation2DDegrees"].toDouble(0.0);
     clip.opacity = obj["opacity"].toDouble(1.0);
     clip.isAdjustment = obj["isAdjustment"].toBool(false);
+    clip.isVfxFootage = obj["isVfxFootage"].toBool(false);
+    clip.blendMode = CompositeLayer::blendModeFromName(
+        obj["blendMode"].toString("Normal"));
+    clip.vfxIntensity = qMax(0.0, obj["vfxIntensity"].toDouble(1.0));
+    clip.vfxBlackLevel = qBound(0, obj["vfxBlackLevel"].toInt(16), 64);
     clip.is3DLayer = obj["is3DLayer"].toBool(false);
     clip.layer3D = obj.contains("layer3D")
         ? Layer3DTransform::fromJson(obj["layer3D"].toObject())
         : Layer3DTransform{};
+    if (obj.contains("layerMaterial"))
+        clip.material = LayerMaterial::fromJson(obj["layerMaterial"].toObject());
     clip.motionBlurEnabled = obj["motionBlurEnabled"].toBool(false);
     clip.fitContain = obj["fitContain"].toBool(false);
     clip.fitCover = obj["fitCover"].toBool(false);
