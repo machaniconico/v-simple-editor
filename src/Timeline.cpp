@@ -632,6 +632,7 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavcodec/packet.h>
 #include <libavformat/avformat.h>
+#include <libavutil/pixdesc.h>
 }
 
 // RAII helper for one-shot FFmpeg audio decoding used by per-clip PCM peak
@@ -2688,7 +2689,8 @@ static int parseDropPayload(const QByteArray &payload, int &grabOffsetPx)
 
 void TimelineTrack::dragEnterEvent(QDragEnterEvent *event)
 {
-    if (event->mimeData()->hasFormat("application/x-vse-clip"))
+    if (event->mimeData()->hasFormat("application/x-vse-clip")
+        || event->mimeData()->hasFormat("application/x-vse-effect-library"))
         event->acceptProposedAction();
     else
         event->ignore();
@@ -2696,6 +2698,14 @@ void TimelineTrack::dragEnterEvent(QDragEnterEvent *event)
 
 void TimelineTrack::dragMoveEvent(QDragMoveEvent *event)
 {
+    if (event->mimeData()->hasFormat("application/x-vse-effect-library")) {
+        if (m_locked) {
+            event->ignore();
+            return;
+        }
+        event->acceptProposedAction();
+        return;
+    }
     if (!event->mimeData()->hasFormat("application/x-vse-clip")) {
         event->ignore();
         return;
@@ -2743,6 +2753,19 @@ void TimelineTrack::dropEvent(QDropEvent *event)
     m_dropIndicatorX = -1;
     m_dropIndicatorValid = false;
     if (oldIndicator >= 0) update();
+
+    if (event->mimeData()->hasFormat("application/x-vse-effect-library")) {
+        const int clipIndex = clipAtX(event->position().toPoint().x());
+        const QString entryId = QString::fromUtf8(
+            event->mimeData()->data("application/x-vse-effect-library"));
+        if (entryId.isEmpty()) {
+            event->ignore();
+            return;
+        }
+        emit effectDropped(entryId, clipIndex);
+        event->acceptProposedAction();
+        return;
+    }
 
     if (!event->mimeData()->hasFormat("application/x-vse-clip")) {
         event->ignore();
@@ -3336,6 +3359,64 @@ void Timeline::addVideoTrack()
     updateInfoLabel();
 }
 
+bool Timeline::insertVfxFootageAtPlayhead(const ClipInfo &clip,
+                                          int *trackIndex,
+                                          int *clipIndex)
+{
+    if (trackIndex)
+        *trackIndex = -1;
+    if (clipIndex)
+        *clipIndex = -1;
+    if (clip.filePath.isEmpty() || clip.effectiveDuration() <= 0.0)
+        return false;
+
+    // A footage overlay belongs above the base V1. If the project has no
+    // tracks yet, create V1 as the eventual base row and V2 as the target.
+    if (m_videoTracks.isEmpty())
+        addVideoTrack();
+
+    const double dropTime = qMax(0.0, m_playheadPos);
+    int targetTrack = -1;
+    TimelineTrack::DropPlan targetPlan;
+    for (int t = 1; t < m_videoTracks.size(); ++t) {
+        TimelineTrack *candidate = m_videoTracks.at(t);
+        if (!candidate || candidate->isLocked())
+            continue;
+        const TimelineTrack::DropPlan plan = candidate->planDrop(
+            dropTime, clip.effectiveDuration());
+        if (plan.valid) {
+            targetTrack = t;
+            targetPlan = plan;
+            break;
+        }
+    }
+
+    if (targetTrack < 0) {
+        addVideoTrack();
+        targetTrack = static_cast<int>(m_videoTracks.size()) - 1;
+        TimelineTrack *candidate = m_videoTracks.value(targetTrack, nullptr);
+        if (!candidate)
+            return false;
+        targetPlan = candidate->planDrop(dropTime, clip.effectiveDuration());
+        if (!targetPlan.valid)
+            return false;
+    }
+
+    TimelineTrack *target = m_videoTracks.value(targetTrack, nullptr);
+    if (!target)
+        return false;
+    target->insertClipPreservingDownstream(targetPlan.insertIdx, clip,
+                                           targetPlan.newLeadIn);
+    if (trackIndex)
+        *trackIndex = targetTrack;
+    if (clipIndex)
+        *clipIndex = targetPlan.insertIdx;
+    saveUndoState(QStringLiteral("Add VFX footage"));
+    updateInfoLabel();
+    scheduleEmitSequenceChanged();
+    return true;
+}
+
 void Timeline::addAudioTrack()
 {
     int num = m_audioTracks.size() + 1;
@@ -3545,6 +3626,7 @@ void Timeline::addClip(const QString &filePath)
     int capturedTrc = 0;
     int capturedBitDepth = 8;
     bool capturedHasHdrMeta = false;
+    bool capturedHasAlpha = false;
     // ソース映像の素のピクセル寸法 (アスペクト既定フィット判定用)。probe ループで
     // 最初の映像ストリームから捕捉する。0 = 未取得 (probe 失敗/静止画非対応など)。
     int srcVideoW = 0;
@@ -3568,6 +3650,13 @@ void Timeline::addClip(const QString &filePath)
             capturedTrc = colorInputs.trc;
             capturedBitDepth = colorInputs.bitDepth;
             capturedHasHdrMeta = colorInputs.hasHdrMeta;
+            const AVPixFmtDescriptor *pixelDescriptor = av_pix_fmt_desc_get(
+                static_cast<AVPixelFormat>(st->codecpar->format));
+            const bool alphaByPixelFormat = pixelDescriptor
+                && (pixelDescriptor->flags & AV_PIX_FMT_FLAG_ALPHA) != 0;
+            const bool alphaByCodec = st->codecpar->codec_id == AV_CODEC_ID_QTRLE
+                || st->codecpar->codec_id == AV_CODEC_ID_PNG;
+            capturedHasAlpha = alphaByPixelFormat || alphaByCodec;
             const bool isAv1  = st->codecpar->codec_id == AV_CODEC_ID_AV1;
             const bool isQhdPlus = (w >= 2560) || (h >= 1440);
             // h.264 1080p+ も対象 (cinemascope や ultra-wide 含めるため OR)。
@@ -3666,7 +3755,7 @@ void Timeline::addClip(const QString &filePath)
     // Auto-proxy dispatch — runs after the track index is settled so that
     // MultiTrackOnly mode can gate on V2-or-later. wantsAutoProxy was
     // probed up at the top of this function (AV1 OR ≥2560×1440).
-    if (wantsAutoProxy) {
+    if (wantsAutoProxy && !capturedHasAlpha) {
         static const bool autoProxyDisabled =
             qEnvironmentVariableIntValue("VEDITOR_AUTO_PROXY_DISABLE") != 0;
         if (!autoProxyDisabled) {
@@ -5421,6 +5510,24 @@ void Timeline::setClipColorCorrection(const ColorCorrection &cc)
     saveUndoState("Color correction");
 }
 
+void Timeline::setClipColorCorrection(int trackIdx, int clipIdx,
+                                      const ColorCorrection &cc)
+{
+    if (trackIdx < 0 || trackIdx >= m_videoTracks.size())
+        return;
+    auto *track = m_videoTracks[trackIdx];
+    if (!track)
+        return;
+
+    auto clips = track->clips();
+    if (clipIdx < 0 || clipIdx >= clips.size())
+        return;
+    clips[clipIdx].colorCorrection = cc;
+    track->setClips(clips);
+    saveUndoState("Color correction");
+    scheduleEmitSequenceChanged();
+}
+
 void Timeline::setClipLayerStyle(const LayerStyle &style)
 {
     int sel = m_videoTrack->selectedClip();
@@ -5442,6 +5549,33 @@ void Timeline::setClipLayerStyle(int trackIdx, int clipIdx, const LayerStyle &st
     clips[clipIdx].layerStyle = style;
     track->setClips(clips);
     saveUndoState("Layer style");
+    scheduleEmitSequenceChanged();
+}
+
+void Timeline::setClipLayerMaterial(const LayerMaterial &material)
+{
+    const int selected = m_videoTrack ? m_videoTrack->selectedClip() : -1;
+    setClipLayerMaterial(0, selected, material, true);
+}
+
+void Timeline::setClipLayerMaterial(int trackIdx, int clipIdx,
+                                    const LayerMaterial &material,
+                                    bool recordUndo)
+{
+    if (trackIdx < 0 || trackIdx >= m_videoTracks.size())
+        return;
+    auto *track = m_videoTracks[trackIdx];
+    if (!track)
+        return;
+
+    auto clips = track->clips();
+    if (clipIdx < 0 || clipIdx >= clips.size())
+        return;
+
+    clips[clipIdx].material = material;
+    track->setClips(clips);
+    if (recordUndo)
+        saveUndoState("Layer material");
     scheduleEmitSequenceChanged();
 }
 
@@ -5689,6 +5823,25 @@ LayerStyle Timeline::clipLayerStyle(int trackIdx, int clipIdx) const
     return clips[clipIdx].layerStyle;
 }
 
+LayerMaterial Timeline::clipLayerMaterial() const
+{
+    const int selected = m_videoTrack ? m_videoTrack->selectedClip() : -1;
+    return clipLayerMaterial(0, selected);
+}
+
+LayerMaterial Timeline::clipLayerMaterial(int trackIdx, int clipIdx) const
+{
+    if (trackIdx < 0 || trackIdx >= m_videoTracks.size())
+        return {};
+    const auto *track = m_videoTracks[trackIdx];
+    if (!track)
+        return {};
+    const auto &clips = track->clips();
+    if (clipIdx < 0 || clipIdx >= clips.size())
+        return {};
+    return clips[clipIdx].material;
+}
+
 QVector<VideoEffect> Timeline::clipEffects() const
 {
     int sel = m_videoTrack->selectedClip();
@@ -5912,6 +6065,28 @@ void Timeline::insertAudioClipAtPlayhead(const QString &wavPath, int trackIdx)
     saveUndoState("Insert voice-over");
     updateInfoLabel();
     scheduleEmitSequenceChanged();
+}
+
+bool Timeline::replaceAudioClipMedia(int trackIdx, int clipIdx,
+                                     const QString &wavPath)
+{
+    if (wavPath.isEmpty() || trackIdx < 0 || trackIdx >= m_audioTracks.size())
+        return false;
+    TimelineTrack *track = m_audioTracks[trackIdx];
+    if (!track || clipIdx < 0 || clipIdx >= track->clips().size())
+        return false;
+
+    QVector<ClipInfo> updated = track->clips();
+    if (updated[clipIdx].filePath == wavPath)
+        return true;
+    updated[clipIdx].filePath = wavPath;
+    updated[clipIdx].displayName = QFileInfo(wavPath).fileName();
+    updated[clipIdx].waveform = WaveformData{};
+    track->setClips(updated);
+    saveUndoState(QStringLiteral("音声分離を適用"));
+    scheduleEmitSequenceChanged();
+    updateInfoLabel();
+    return true;
 }
 
 void Timeline::toggleMuteTrack(int audioTrackIndex)
@@ -6377,6 +6552,12 @@ void Timeline::wireTrackSelection(TimelineTrack *track)
         [this, track](int /*insertIdx*/, int linkGroup, double dropTime) {
             handleCrossTrackLinkedDrop(track, linkGroup, dropTime);
         });
+    connect(track, &TimelineTrack::effectDropped, this,
+        [this, track](const QString &entryId, int clipIndex) {
+            const int trackIdx = m_videoTracks.indexOf(track);
+            if (trackIdx >= 0)
+                emit effectDropped(trackIdx, clipIndex, entryId);
+        });
     // RM-5: remap Timeline's carrier when clips are reordered within a track.
     // clipMoved supplies (fromIndex, toIndex) after the mutation. Because
     // moveClip is a pure permutation we can derive the exact old→new index map
@@ -6691,6 +6872,10 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         double videoDy = 0.0;
         double rotation2DDegrees = 0.0;
         double opacity = 1.0;
+        bool isVfxFootage = false;
+        BlendMode blendMode = BlendMode::Normal;
+        double vfxIntensity = 1.0;
+        int vfxBlackLevel = 16;
         bool fitContain = false;
         bool fitCover = false;
         clipcolor::ColorMeta colorMeta;
@@ -6811,6 +6996,10 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
                 iv.videoDy = child.videoDy;
                 iv.rotation2DDegrees = child.rotation2DDegrees;
                 iv.opacity = child.opacity * parentClip.opacity;
+                iv.isVfxFootage = child.isVfxFootage;
+                iv.blendMode = child.blendMode;
+                iv.vfxIntensity = child.vfxIntensity;
+                iv.vfxBlackLevel = child.vfxBlackLevel;
                 iv.fitContain = child.fitContain;
                 iv.fitCover = child.fitCover;
                 iv.colorMeta = child.colorMeta;
@@ -6882,6 +7071,10 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
                 iv.videoDy = c.videoDy;
                 iv.rotation2DDegrees = c.rotation2DDegrees;
                 iv.opacity = c.opacity;
+                iv.isVfxFootage = c.isVfxFootage;
+                iv.blendMode = c.blendMode;
+                iv.vfxIntensity = c.vfxIntensity;
+                iv.vfxBlackLevel = c.vfxBlackLevel;
                 iv.fitContain = c.fitContain;
                 iv.fitCover = c.fitCover;
                 iv.colorMeta = c.colorMeta;
@@ -7019,6 +7212,10 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         e.videoDy = iv.videoDy;
         e.rotation2DDegrees = iv.rotation2DDegrees;
         e.opacity = iv.opacity;
+        e.isVfxFootage = iv.isVfxFootage;
+        e.blendMode = iv.blendMode;
+        e.vfxIntensity = iv.vfxIntensity;
+        e.vfxBlackLevel = iv.vfxBlackLevel;
         e.fitContain = iv.fitContain;
         e.fitCover = iv.fitCover;
         e.colorMeta = iv.colorMeta;

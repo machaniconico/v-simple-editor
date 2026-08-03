@@ -26,6 +26,7 @@
 #include "MarkerData.h"
 #include "SpeedRampData.h"
 #include "LayerStyle.h"
+#include "LayerCompositor.h"
 #include "color/ClipColor.h"
 #include "AdjustmentLayer.h"
 #include "MotionStabilizer.h"
@@ -144,6 +145,7 @@ struct ClipInfo {
     double rotation2DDegrees = 0.0;
     bool is3DLayer = false;
     Layer3DTransform layer3D;
+    LayerMaterial material;
     bool motionBlurEnabled = false;
 
     // Future multi-track compositing groundwork. 1.0 = opaque (current
@@ -152,6 +154,15 @@ struct ClipInfo {
     double opacity = 1.0;
     bool visible = true;
     bool isAdjustment = false; // effect-only clip; applies its stack to lower composited layers
+
+    // VFX-C: a footage-library clip is a real video clip with two small
+    // source-side controls. The existing LayerCompositor blend modes remain
+    // the single compositing implementation; defaults keep normal clips
+    // byte-identical to their previous path.
+    bool isVfxFootage = false;
+    BlendMode blendMode = BlendMode::Normal;
+    double vfxIntensity = 1.0;
+    int vfxBlackLevel = 16;
 
     // SNS vertical fit: when true and the project output aspect differs from
     // this clip's native frame, export/previews may pre-contain the frame into
@@ -436,6 +447,7 @@ signals:
     void linkedDragDelta(int clipIndex, double deltaSec);
     void linkedDragCancelled();
     void crossTrackDropped(int clipIndex, int linkGroup, double dropTime);
+    void effectDropped(const QString &entryId, int clipIndex);
 
 protected:
     void paintEvent(QPaintEvent *event) override;
@@ -622,6 +634,12 @@ public:
 
     // Multi-track
     void addVideoTrack();
+    // Insert a VFX footage clip at the current playhead on an upper video
+    // track. Empty upper tracks are preferred; a new upper track is created
+    // when the playhead is occupied everywhere.
+    bool insertVfxFootageAtPlayhead(const ClipInfo &clip,
+                                    int *trackIndex = nullptr,
+                                    int *clipIndex = nullptr);
     void addAudioTrack();
     // Force every audio row to repaint. Used after global UI state changes
     // (e.g. the volume-envelope edit-mode toggle) so the overlay flips
@@ -661,8 +679,14 @@ public:
 
     // Phase 3: Color correction, effects, keyframes
     void setClipColorCorrection(const ColorCorrection &cc);
+    void setClipColorCorrection(int trackIdx, int clipIdx,
+                                const ColorCorrection &cc);
     void setClipLayerStyle(const LayerStyle &style);
     void setClipLayerStyle(int trackIdx, int clipIdx, const LayerStyle &style);
+    void setClipLayerMaterial(const LayerMaterial &material);
+    void setClipLayerMaterial(int trackIdx, int clipIdx,
+                              const LayerMaterial &material,
+                              bool recordUndo = false);
     // Attach a transition to the currently selected clip. FadeIn writes to
     // the clip's leadIn slot (start-of-clip); every other type writes to
     // trailOut (end-of-clip / boundary to next clip).
@@ -677,6 +701,8 @@ public:
     ColorCorrection clipColorCorrection() const;
     LayerStyle clipLayerStyle() const;
     LayerStyle clipLayerStyle(int trackIdx, int clipIdx) const;
+    LayerMaterial clipLayerMaterial() const;
+    LayerMaterial clipLayerMaterial(int trackIdx, int clipIdx) const;
     QVector<VideoEffect> clipEffects() const;
     KeyframeManager clipKeyframes() const;
     double selectedClipDuration() const;
@@ -706,6 +732,8 @@ public:
     // Audio
     void addAudioFile(const QString &filePath);
     void insertAudioClipAtPlayhead(const QString &wavPath, int trackIdx = 2);
+    bool replaceAudioClipMedia(int trackIdx, int clipIdx,
+                               const QString &wavPath);
     void toggleMuteTrack(int audioTrackIndex);
     void toggleSoloTrack(int audioTrackIndex);
     void normalizeAudioClipPeak(int trackIdx, int clipIdx);
@@ -767,6 +795,16 @@ public:
     // (applyProjectConfig / プロジェクト読込)に呼ぶ。
     void setProjectOutputConfig(int width, int height, bool explicitOutput);
 
+    // Project-level Light3D state is carried by Timeline so every
+    // renderFrameAt consumer (preview/export/smart-render fallback/nested
+    // sequence) evaluates the same immutable-at-render snapshot.
+    void setProjectLights(const QVector<Light3D> &lights) { m_projectLights = lights; }
+    QVector<Light3D> projectLights() const { return m_projectLights; }
+    void setProjectLightViewPosition(const QVector3D &position) {
+        m_projectLightViewPosition = position;
+    }
+    QVector3D projectLightViewPosition() const { return m_projectLightViewPosition; }
+
     void setClipParentEntries(const QHash<QString, QString> &entries);
     void setClipParent(const QString& childKey, const QString& parentKey);
     void clearClipParent(const QString& childKey);
@@ -815,6 +853,7 @@ signals:
     // signal so MainWindow can drop its playhead heuristic and resolve
     // the (sourceTrack, sourceClipIndex) directly.
     void clipSelectedOnTrack(int trackIdx, int clipIdx);
+    void effectDropped(int trackIdx, int clipIdx, const QString &entryId);
     void scrubPositionChanged(double seconds);
     void positionChanged(double seconds);
     void sequenceChanged(const QVector<PlaybackEntry> &entries);
@@ -948,6 +987,11 @@ private:
     int m_projectWidth = 1920;
     int m_projectHeight = 1080;
     bool m_projectExplicitOutput = false;
+    // Project-level 3D lighting snapshot consumed by the render SSOT. The
+    // MainWindow owns the editing UI; RenderQueue receives these plain values
+    // through Timeline so worker renders never dereference MainWindow.
+    QVector<Light3D> m_projectLights;
+    QVector3D m_projectLightViewPosition = QVector3D();
     double m_markIn = -1.0;
     double m_markOut = -1.0;
     double m_zoomLevel = 10.0; // pixels per second (double so we can go sub-1 for long clips)

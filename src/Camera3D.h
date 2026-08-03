@@ -34,25 +34,6 @@ struct Camera3DState {
     static Camera3DState fromJson(const QJsonObject &obj);
 };
 
-// --- Per-layer 3D transform extension ---
-
-struct Layer3DTransform {
-    double positionZ = 0.0;     // depth in 3D space
-    double rotationX = 0.0;     // degrees
-    double rotationY = 0.0;     // degrees
-    double rotationZ = 0.0;     // degrees
-
-    bool isDefault() const {
-        return positionZ == 0.0 && rotationX == 0.0
-            && rotationY == 0.0 && rotationZ == 0.0;
-    }
-
-    void reset() { *this = Layer3DTransform{}; }
-
-    QJsonObject toJson() const;
-    static Layer3DTransform fromJson(const QJsonObject &obj);
-};
-
 // --- Camera shake — procedural jitter layered on top of keyframed base ---
 
 struct CameraShake {
@@ -106,7 +87,8 @@ public:
 
     QImage renderScene(const QVector<CompositeLayer> &layers,
                        const QVector<QImage> &layerImages,
-                       const QSize &canvasSize, double time);
+                       const QSize &canvasSize, double time,
+                       const QVector<Light3DState> &lights = {});
 
     // --- Perspective transform (static utility) ---
 

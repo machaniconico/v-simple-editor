@@ -6,6 +6,7 @@
 #include "Overlay.h"
 #include "MotionStabilizer.h"
 #include "LayerStyle.h"
+#include "LayerCompositor.h"
 #include "color/ClipColor.h"
 
 // Volume automation point.
@@ -46,6 +47,10 @@ struct PlaybackEntry {
                                     // clipgeom SSOT (rotate step) identically
                                     // to the export path.
     double opacity = 1.0;        // PiP alpha, propagated from ClipInfo::opacity
+    bool isVfxFootage = false;
+    BlendMode blendMode = BlendMode::Normal;
+    double vfxIntensity = 1.0;
+    int vfxBlackLevel = 16;
     bool fitContain = false;     // SNS vertical fit, propagated from ClipInfo::fitContain
     bool fitCover = false;       // SNS cover fit, propagated from ClipInfo::fitCover
     clipcolor::ColorMeta colorMeta; // Per-clip input color metadata (Stage1 storage only)

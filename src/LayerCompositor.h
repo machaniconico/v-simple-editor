@@ -11,6 +11,7 @@
 #include <QJsonArray>
 
 #include "MaskSystem.h"
+#include "Light3D.h"
 
 // --- Blend Modes ---
 
@@ -68,6 +69,10 @@ struct CompositeLayer {
     TrackMatteType matteType            = TrackMatteType::None;
     int            matteSourceLayerIndex = -1;  // index into layers vector that provides the matte
 
+    // 3D light receiver data. Defaults keep existing 2D compositing inert.
+    Layer3DTransform layer3D;
+    LayerMaterial material;
+
     QJsonObject toJson() const;
     static CompositeLayer fromJson(const QJsonObject &obj);
 
@@ -100,6 +105,10 @@ public:
     // Compositing
     static QImage compositeFrame(const QVector<CompositeLayer> &layers,
                                  const QSize &canvasSize, double time);
+    static QImage compositeFrame(const QVector<CompositeLayer> &layers,
+                                 const QSize &canvasSize, double time,
+                                 const QVector<Light3DState> &lights,
+                                 const QVector3D &viewPos);
 
     // Pixel-level blending (ARGB)
     static QRgb blendPixel(QRgb base, QRgb top, BlendMode mode, double opacity);

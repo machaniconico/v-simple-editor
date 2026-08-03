@@ -88,6 +88,19 @@ bool timelineHasSequenceRenderModel(const Timeline *timeline)
                                           timeline->allAudioTracks());
 }
 
+bool timelineHasProjectLighting(const Timeline *timeline)
+{
+    if (!timeline)
+        return false;
+    const QVector<Light3D> lights = timeline->projectLights();
+    for (const Light3D &light : lights) {
+        const Light3DState state = light.state();
+        if (state.enabled && (state.intensity > 0.0 || light.hasAnimation()))
+            return true;
+    }
+    return false;
+}
+
 struct FpsRational {
     int num = 30;
     int den = 1;
@@ -1112,9 +1125,11 @@ void RenderQueue::startRenderPipe(int jobIndex)
 
     const bool blockSmartRenderForSequences =
         timelineHasSequenceRenderModel(tl);
+    const bool blockSmartRenderForLighting = timelineHasProjectLighting(tl);
     if (smartrender::enabledFromEnv()
         && !applyLoudnessFilter
-        && !blockSmartRenderForSequences) {
+        && !blockSmartRenderForSequences
+        && !blockSmartRenderForLighting) {
         if (m_cancelRequested) {
             delete owned;
             finishCurrentJob(false, QStringLiteral("cancelled"));
@@ -1173,10 +1188,14 @@ void RenderQueue::startRenderPipe(int jobIndex)
         }
     } else if (smartrender::enabledFromEnv()
                && !applyLoudnessFilter
-               && blockSmartRenderForSequences) {
+               && (blockSmartRenderForSequences || blockSmartRenderForLighting)) {
         qInfo().noquote()
             << "[smart-render] whole timeline not stream-copy eligible:"
-            << "timeline contains nested sequence state";
+            << (blockSmartRenderForSequences
+                    ? (blockSmartRenderForLighting
+                           ? "timeline contains nested sequence state and project lighting"
+                           : "timeline contains nested sequence state")
+                    : "timeline contains project lighting");
     }
 
     request.videoBitrateBits = jobCopy.bitrateBps;
@@ -1927,6 +1946,15 @@ Timeline *RenderQueue::resolveTimeline(const RenderJob &job,
     tl->restoreFromProject(data.videoTracks, data.audioTracks,
                            data.playheadPos, data.markIn, data.markOut,
                            data.zoomLevel);
+    QVector<Light3D> projectLights;
+    projectLights.reserve(data.projectLights.size());
+    for (const QJsonValue &value : data.projectLights)
+        projectLights.append(Light3D::fromJson(value.toObject()));
+    Camera3D projectCamera;
+    if (!data.projectCamera.isEmpty())
+        projectCamera.fromJson(data.projectCamera);
+    tl->setProjectLights(projectLights);
+    tl->setProjectLightViewPosition(projectCamera.camera().position);
 
     // RM-1.5: this branch is reached ONLY for a parentless project-FILE
     // load (job.timeline == nullptr). The job.timeline != nullptr paths

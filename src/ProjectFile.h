@@ -273,6 +273,7 @@ struct ProjectData {
     QVector<ExpressionBindingsClipEntry> expressionBindingsEntries;
     QVector<WiggleClipEntry> wiggleClipEntries;
     QJsonObject projectCamera;   // Camera3D::toJson() — single per-project camera
+    QJsonArray projectLights;     // Light3D::toJson() entries — project-level lights
 
     // US-HW-10: audio ducking project state (Sprint 9)
     DuckingParams duckingParams;

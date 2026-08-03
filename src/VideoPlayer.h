@@ -452,6 +452,10 @@ public:
     struct DecodedLayer {
         QImage rgb;
         double opacity = 1.0;
+        bool isVfxFootage = false;
+        BlendMode blendMode = BlendMode::Normal;
+        double vfxIntensity = 1.0;
+        int vfxBlackLevel = 16;
         clipcolor::ColorMeta colorMeta;
         double videoScale = 1.0;
         double videoDx = 0.0;

@@ -32,6 +32,7 @@
 #include "NoiseReduction.h"
 #include "SubtitleGenerator.h"
 #include "EffectPreset.h"
+#include "EffectLibraryPanel.h"
 #include "ResourceGuide.h"
 #include "AutoSave.h"
 #include "LutImporter.h"
@@ -51,6 +52,7 @@
 #include "MaskSystem.h"
 #include "ParticleSystem.h"
 #include "Camera3D.h"
+#include "Light3D.h"
 #include "Expression.h"
 #include "ClipExpressionBindings.h"
 #include "WiggleTransform.h"
@@ -104,6 +106,7 @@ class FavoritesEditDialog;
 class Text3DExtrusionDialog;
 class ExpressionBindingDialog;
 class CameraMotionDialog;
+class Light3DDialog;
 class SceneCutDialog;
 class AudioDuckingDialog;
 class ColorManagementDialog;   // AC-4: ACES カラーマネジメント ダイアログ
@@ -125,6 +128,8 @@ class TextBasedEditDialog;
 class PptxExportDialog;   // PPTX (PowerPoint 資料書き出し) ダイアログ
 class AscCdlExportDialog; // ASC CDL (.cc/.ccc/.cdl カラー書き出し) ダイアログ
 class AutoClipDialog;
+class DeflickerDialog;
+class ObjectRemovalDialog;
 class CommandPaletteDialog;
 class MobileExportDialog;
 class ImportHubDialog;
@@ -211,6 +216,7 @@ class MainWindow : public QMainWindow
 
 public:
     explicit MainWindow(QWidget *parent = nullptr);
+    ~MainWindow() override;
 
     struct PrecomposeResult {
         bool success = false;
@@ -317,6 +323,8 @@ private slots:
     void manageEffectPresets();
     void addShapeLayer();
     void addParticleEffect();
+    void addVfxGenerator();
+    void addVfxGeneratorForType(int typeIndex);
     void addTextAnimation();
     void addBrushAnimation();
     void editTransformKeyframes();
@@ -326,6 +334,7 @@ private slots:
     void precomposeSelected();
     void showResourceGuide();
     void stabilizeVideo();
+    void openDeflicker();
     void applyLut();
     void loadLutCubeFile();
     void clearLutIntensity();
@@ -450,6 +459,7 @@ private slots:
     void editClipExpressionBindings();
     void editClipWiggle();
     void openCameraMotionDialog();
+    void openLight3DDialog();
 
     // US-HW-10: Sprint 9 hardware/perf — 3 new menu actions
     void onSceneCutDetect();
@@ -555,6 +565,7 @@ private slots:
     // subtitle translation / lower-third / watermark.
     void openChromaKeyDialog();
     void openAudioRestoreDialog();
+    void openVoiceIsolationDialog();
     void openAnimExportDialog();
     void openEasingEditorDialog();
     void openSubtitleTranslatorDialog();
@@ -585,6 +596,9 @@ private slots:
     // ファイルへ書き出してステータスバーへ通知する。
     // TODO: クリップエフェクトとしての毎フレーム適用は次段スコープ。
     void openAutoMatte();
+    // OR-4: 選択中クリップのマスクを使った決定論的なオブジェクト除去。
+    // 連番 PNG を TimelineSequence として取り込み、新規クリップにする。
+    void openObjectRemoval();
 
     // User-customizable "お気に入り" menu — opens FavoritesEditDialog, then
     // persists the chosen action ids to QSettings and rebuilds the menu.
@@ -629,6 +643,7 @@ private:
     void updateAcesUiState();
     void updateEditActions();
     void applyProjectConfig(const ProjectConfig &config);
+    void syncProjectLightingToTimeline();
     void updateTitle();
     void populateProjectData(ProjectData &data);
     void applyLoadedProjectData(const ProjectData &data, const QString &filePath);
@@ -642,6 +657,14 @@ private:
     QImage decodeClipFrameAtSourceTime(const ClipInfo &clip, double sourceTimeSeconds) const;
     QImage decodeClipFrameByIndex(const ClipInfo &clip, int sourceFrameIndex, double sourceFps) const;
     void refreshSpecialClipPreview();
+    void refreshEffectLibraryPreview();
+    void applyEffectLibraryEntry(const QString &entryId,
+                                 int trackIdx = -1, int clipIdx = -1);
+    void addEffectLibraryKeyframe(const QString &entryId,
+                                  const QString &paramName);
+    void saveEffectLibraryPreset();
+    void renameEffectLibraryPreset(const QString &entryId);
+    void deleteEffectLibraryPreset(const QString &entryId);
 
     // プレビュー用 sequence のプロキシ解決を 1 箇所に集約する (プレビュー専用)。
     // 手動 isProxyMode と マルチトラック自動プロキシ (多トラック かつ
@@ -693,6 +716,7 @@ private:
     class ProxyProgressDialog *m_proxyDialog = nullptr;
     class ColorGradingPanel *m_colorGradingPanel = nullptr;
     effectctrl::EffectControlsPanel *m_effectControlsPanel = nullptr;
+    EffectLibraryPanel *m_effectLibraryPanel = nullptr;
     VfxControlsPanel *m_vfxControlsPanel = nullptr;
     QImage m_lastCompositedFrame;
     QStringList m_supportedFormats;
@@ -708,6 +732,8 @@ private:
     QHash<QString, exprbind::ClipExpressionBindings> m_clipExpressionBindings;
     QHash<QString, wiggle::WiggleParams> m_clipWiggleParams;
     Camera3D m_projectCamera;                                 // single per-project camera
+    QVector<Light3D> m_projectLights;                         // project-level 3D lights
+    QPointer<Light3DDialog> m_light3DDialog;
     int m_selectedVideoTrackIndex = -1;
     int m_selectedVideoClipIndexTracked = -1;
 

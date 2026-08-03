@@ -1,5 +1,6 @@
 #include "TimelineFrameRenderer.h"
 #include "Timeline.h"
+#include "Light3D.h"
 #include "VideoEffect.h"        // VideoEffectProcessor::applyColorCorrection (CPU SSOT)
 #include "LutImporter.h"        // LutImporter::loadCubeFile / applyLutWithIntensity
 #include "AdjustmentLayer.h"    // composeAdjustmentLayersAt (S6 — genuine composite)
@@ -13,6 +14,7 @@
 #include "LayerStyle.h"         // Per-clip layer style at the rendered-layer seam
 #include "clipanim/ClipAnim.h"  // S1 — motion/opacity keyframe evaluation
 #include "TrackMatteKey.h"      // RM-1.1 — single shared clip-key formula
+#include "VfxFootageLibrary.h"  // VFX-C source-side black level + intensity
 #include <cstring>              // std::memcpy (decode row copy)
 #include "playback/TrackMatteCompose16.h"
 #include "playback/TlrCompose16.h"
@@ -38,6 +40,8 @@
 #include <QPainter>
 #include <QRectF>
 #include <QVector>
+#include <algorithm>
+#include <atomic>
 #include <functional>
 
 extern "C" {
@@ -61,6 +65,63 @@ QImage applyRasterAlphaMask(const QImage &sourceImage, const QVector<Mask> &mask
 }
 
 namespace tlrender {
+
+namespace detail {
+
+namespace {
+
+std::atomic_bool g_lightingSelftestSeamCalled{false};
+
+bool lightingSelftestObservationEnabled()
+{
+    static const bool enabled =
+        qEnvironmentVariableIntValue("VEDITOR_LIGHT3D_SELFTEST") != 0;
+    return enabled;
+}
+
+} // namespace
+
+QVector<QImage> applyLightingToLayerImages(
+    const QVector<CompositeLayer> &layers,
+    const QVector<QImage> &layerImages,
+    const QSize &canvasSize,
+    const QVector<QPointF> &positionOffsets,
+    const QVector<Light3DState> &lights,
+    const QVector3D &viewPos)
+{
+    if (lightingSelftestObservationEnabled())
+        g_lightingSelftestSeamCalled.store(true, std::memory_order_release);
+    QVector<QImage> result = layerImages;
+    if (canvasSize.isEmpty() || !light3d::hasActiveLights(lights))
+        return result;
+
+    const int count = qMin(static_cast<int>(layers.size()),
+                           static_cast<int>(result.size()));
+    for (int i = 0; i < count; ++i) {
+        if (result[i].isNull() || !layers[i].material.acceptsLights)
+            continue;
+        const QPointF offset = i < positionOffsets.size()
+            ? positionOffsets.at(i) : QPointF();
+        result[i] = light3d::applyLighting(
+            result[i], lights, layers[i].layer3D,
+            light3d::layerCenterWorld(QSizeF(canvasSize), offset),
+            QSizeF(canvasSize), viewPos, layers[i].material);
+    }
+    return result;
+}
+
+void resetLightingSelftestObservation()
+{
+    g_lightingSelftestSeamCalled.store(false, std::memory_order_release);
+}
+
+bool lightingSelftestSeamWasCalled()
+{
+    return g_lightingSelftestSeamCalled.load(std::memory_order_acquire);
+}
+
+} // namespace detail
+
 namespace {
 
 // Mirror of Exporter::openInputFile (src/Exporter.cpp:74). Kept self-contained
@@ -835,7 +896,10 @@ QImage renderFrameFromTracks(const Timeline *timeline,
                              int sequenceDepth,
                              const QVector<TimelineSequence> &sequenceSnapshot,
                              QVector<QString> &sequenceStack,
-                             bool applyTimelineGlobals);
+                             const QVector<Light3DState> &projectLights,
+                             const QVector3D &projectLightViewPosition,
+                             bool applyTimelineGlobals,
+                             bool applyProjectLighting);
 
 QString resolveSequenceRefIdForRender(const ClipInfo &clip)
 {
@@ -850,7 +914,9 @@ QImage renderSequenceReferenceFrame(const Timeline *timeline,
                                     QSize outSize,
                                     int sequenceDepth,
                                     const QVector<TimelineSequence> &sequenceSnapshot,
-                                    QVector<QString> &sequenceStack)
+                                    QVector<QString> &sequenceStack,
+                                    const QVector<Light3DState> &projectLights,
+                                    const QVector3D &projectLightViewPosition)
 {
     if (!timeline || outSize.isEmpty())
         return QImage();
@@ -879,7 +945,12 @@ QImage renderSequenceReferenceFrame(const Timeline *timeline,
         sequenceDepth + 1,
         sequenceSnapshot,
         sequenceStack,
-        /*applyTimelineGlobals=*/false);
+        projectLights,
+        projectLightViewPosition,
+        /*applyTimelineGlobals=*/false,
+        // The nested result is lit once as the sequence-reference layer in
+        // the parent stack. Applying it in both stacks would double-light it.
+        /*applyProjectLighting=*/false);
     sequenceStack.removeLast();
 
     return rendered.isNull() ? transparentFrame(outSize) : rendered;
@@ -891,13 +962,25 @@ QImage renderClipSourceFrame(const Timeline *timeline,
                              QSize outSize,
                              int sequenceDepth,
                              const QVector<TimelineSequence> &sequenceSnapshot,
-                             QVector<QString> &sequenceStack)
+                             QVector<QString> &sequenceStack,
+                             const QVector<Light3DState> &projectLights,
+                             const QVector3D &projectLightViewPosition)
 {
     if (clip.isSequenceReference())
         return renderSequenceReferenceFrame(
             timeline, clip, sourceSec, outSize, sequenceDepth, sequenceSnapshot,
-            sequenceStack);
+            sequenceStack, projectLights, projectLightViewPosition);
     return decodeClipFrameNative(clip.filePath, sourceSec);
+}
+
+QImage applyVfxFootageControls(const QImage &native, const ClipInfo &clip)
+{
+    if (!clip.isVfxFootage || native.isNull())
+        return native;
+    const QImage tightened = vfxfootage::VfxFootageLibrary::applyBlackLevel(
+        native, clip.vfxBlackLevel);
+    return vfxfootage::VfxFootageLibrary::applyIntensity(
+        tightened, clip.vfxIntensity);
 }
 
 QImage renderFrameFromTracks(const Timeline *timeline,
@@ -907,7 +990,10 @@ QImage renderFrameFromTracks(const Timeline *timeline,
                              int sequenceDepth,
                              const QVector<TimelineSequence> &sequenceSnapshot,
                              QVector<QString> &sequenceStack,
-                             bool applyTimelineGlobals)
+                             const QVector<Light3DState> &projectLights,
+                             const QVector3D &projectLightViewPosition,
+                             bool applyTimelineGlobals,
+                             bool applyProjectLighting)
 {
     if (outSize.isEmpty())
         return QImage();
@@ -987,9 +1073,12 @@ QImage renderFrameFromTracks(const Timeline *timeline,
 
         const QImage v1NativeRaw = renderClipSourceFrame(
             timeline, v1Clip, v1SourceSec, outSize, sequenceDepth,
-            sequenceSnapshot, sequenceStack);
+            sequenceSnapshot, sequenceStack, projectLights,
+            projectLightViewPosition);
         if (v1NativeRaw.isNull())
             return QImage();
+
+        const QImage v1Vfx = applyVfxFootageControls(v1NativeRaw, v1Clip);
 
         // S4: grade the V1 clip in NATIVE resolution before it is scaled onto the
         // canvas — the preview shader colour-corrects/LUTs the sampled texel, i.e.
@@ -997,7 +1086,7 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         // clip with default colour and no LUT this is a strict no-op so a lone V1
         // clip stays byte-identical to S2.
         const QImage v1Graded =
-            gradeClipNativeFrame(v1NativeRaw, v1Clip, v1LocalSec);
+            gradeClipNativeFrame(v1Vfx, v1Clip, v1LocalSec);
 
         // S5: apply the V1 clip's FX pack on the GRADED native frame — the preview
         // shader runs the FX uniforms AFTER the CC+LUT block closes
@@ -1067,13 +1156,17 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         QString clipId;
         int trackIndex = 0;
         QImage rgb;        // already scaled to outSize (the shared canvas grid)
+        QImage image;      // placed canvas image, after parenting/light setup
         double opacity = 1.0;
         double videoScale = 1.0;
         double videoDx = 0.0;
         double videoDy = 0.0;
         double rotationDeg = 0.0;   // G3: == ClipInfo::rotation2DDegrees
+        BlendMode blendMode = BlendMode::Normal;
         LayerStyle layerStyle;
         clipcolor::ColorMeta colorMeta;
+        Layer3DTransform layer3D;
+        LayerMaterial material;
     };
     QVector<RenderLayer> renderLayers;
     QVector<OverlayLayer> overlays;
@@ -1088,6 +1181,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         baseLayer.layerStyle = v1Clip.layerStyle;
         baseLayer.nullObject = v1NullObject;
         baseLayer.colorMeta = v1Clip.colorMeta;
+        baseLayer.layer.layer3D = v1Clip.layer3D;
+        baseLayer.layer.material = v1Clip.material;
         baseLayer.layer.name = v1Clip.displayName;
         baseLayer.layer.visible = !v1NullObject && v1EffectiveOpacity > 0.001;
         baseLayer.layer.opacity = qBound(0.0, v1EffectiveOpacity, 1.0);
@@ -1135,6 +1230,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
             renderLayer.colorMeta = c.colorMeta;
             renderLayer.transform = cTransform;
             renderLayer.layerStyle = c.layerStyle;
+            renderLayer.layer.layer3D = c.layer3D;
+            renderLayer.layer.material = c.material;
             renderLayer.nullObject = true;
             renderLayer.layer.name = c.displayName;
             renderLayer.layer.visible = false;
@@ -1150,7 +1247,7 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         }
         const QImage nativeRaw = renderClipSourceFrame(
             timeline, c, srcSec, outSize, sequenceDepth, sequenceSnapshot,
-            sequenceStack);
+            sequenceStack, projectLights, projectLightViewPosition);
         if (nativeRaw.isNull())
             continue;
         // S4: grade each overlay clip in native resolution too (same per-clip
@@ -1166,7 +1263,9 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         // through (same CC -> LUT -> FX -> MASK per-clip order as V1). No-op
         // for un-masked overlays, so S3's multi-track MSE stays ~0.
         QImage nativeForMask =
-            applyClipFxPack(gradeClipNativeFrame(nativeRaw, c, localSec),
+            applyClipFxPack(gradeClipNativeFrame(
+                                applyVfxFootageControls(nativeRaw, c),
+                                c, localSec),
                             c, localSec);
         if (c.hasMask()
             && (hdrexport16::enabledFromEnv() || hdrmatte16::enabledFromEnv())) {
@@ -1181,6 +1280,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         renderLayer.colorMeta = c.colorMeta;
         renderLayer.transform = cTransform;
         renderLayer.layerStyle = c.layerStyle;
+        renderLayer.layer.layer3D = c.layer3D;
+        renderLayer.layer.material = c.material;
         // Scale the overlay source to the shared canvas grid first; the
         // compositor's videoScale then sizes the dst rect relative to the
         // canvas exactly as composeMultiTrackFrame does for L.rgb.
@@ -1190,7 +1291,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         renderLayer.layer.name = c.displayName;
         renderLayer.layer.visible = cOpacity > 0.001;
         renderLayer.layer.opacity = qBound(0.0, cOpacity, 1.0);
-        renderLayer.layer.blendMode = BlendMode::Normal;
+        renderLayer.layer.blendMode = c.isVfxFootage
+            ? c.blendMode : BlendMode::Normal;
         renderLayer.layer.zOrder = t;
         renderLayer.layer.inPoint = start;
         renderLayer.layer.outPoint = start + c.effectiveDuration();
@@ -1210,13 +1312,17 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         overlay.clipId = renderLayer.clipId;
         overlay.trackIndex = t;
         overlay.rgb = rgb;
+        overlay.image = renderLayer.image;
         overlay.opacity = cOpacity;
+        overlay.blendMode = renderLayer.layer.blendMode;
         overlay.videoScale = cTransform.videoScale;
         overlay.videoDx = cTransform.videoDx;
         overlay.videoDy = cTransform.videoDy;
         overlay.rotationDeg = cTransform.rotationDeg;   // G3: carry clip rotation
         overlay.layerStyle = c.layerStyle;
         overlay.colorMeta = c.colorMeta;
+        overlay.layer3D = c.layer3D;
+        overlay.material = c.material;
         overlays.append(overlay);
 
         renderLayers.append(renderLayer);
@@ -1297,6 +1403,11 @@ QImage renderFrameFromTracks(const Timeline *timeline,
                 QImage placed = clipgeom::renderLayer(
                     renderLayers[i].sourceRgb, effective, outSize, /*smooth=*/true);
                 renderLayers[i].image = placed;
+                if (const int overlayIdx = overlayIndexByClipId.value(
+                        renderLayers[i].clipId, -1);
+                    overlayIdx >= 0) {
+                    overlays[overlayIdx].image = placed;
+                }
                 if (i == 0)
                     base = renderLayers[i].image;
             }
@@ -1329,6 +1440,42 @@ QImage renderFrameFromTracks(const Timeline *timeline,
                     continue;
                 renderLayers[i].layer.matteType = it.value().matteType;
                 renderLayers[i].layer.matteSourceLayerIndex = srcIdx;
+            }
+        }
+    }
+
+    // Project lighting is deliberately applied after canonical clip placement
+    // and before either matte or ordinary SourceOver composition. This is the
+    // same seam used by LayerCompositor: every layer receives the same
+    // canvas-centre-plus-pixel-offset world anchor, and nested sequence output
+    // is lit once as its parent reference layer.
+    if (applyProjectLighting) {
+        QVector<CompositeLayer> lightingLayers;
+        QVector<QImage> lightingImages;
+        QVector<QPointF> lightingOffsets;
+        lightingLayers.reserve(renderLayers.size());
+        lightingImages.reserve(renderLayers.size());
+        lightingOffsets.reserve(renderLayers.size());
+        for (const RenderLayer &renderLayer : renderLayers) {
+            lightingLayers.append(renderLayer.layer);
+            lightingImages.append(renderLayer.image);
+            lightingOffsets.append(QPointF(
+                renderLayer.transform.videoDx * outSize.width(),
+                renderLayer.transform.videoDy * outSize.height()));
+        }
+        const QVector<QImage> litImages = detail::applyLightingToLayerImages(
+            lightingLayers, lightingImages, outSize, lightingOffsets,
+            projectLights, projectLightViewPosition);
+        for (int i = 0; i < renderLayers.size(); ++i)
+            renderLayers[i].image = litImages.at(i);
+        if (!renderLayers.isEmpty())
+            base = renderLayers.first().image;
+        for (OverlayLayer &overlay : overlays) {
+            for (const RenderLayer &renderLayer : renderLayers) {
+                if (renderLayer.clipId == overlay.clipId) {
+                    overlay.image = renderLayer.image;
+                    break;
+                }
             }
         }
     }
@@ -1403,9 +1550,17 @@ QImage renderFrameFromTracks(const Timeline *timeline,
             composed.fill(Qt::transparent);
             const QSize canvas(composed.width(), composed.height());
 
-            auto paintPlacedLayer = [&](const QImage &placed, double opacity) {
+            auto paintPlacedLayer = [&](const QImage &placed, double opacity,
+                                        BlendMode blendMode) {
                 if (placed.isNull() || opacity <= 0.001)
                     return;
+                if (blendMode != BlendMode::Normal) {
+                    composed = LayerCompositor::blendImages(
+                        composed, placed, blendMode,
+                        qBound(0.0, opacity, 1.0))
+                        .convertToFormat(QImage::Format_ARGB32_Premultiplied);
+                    return;
+                }
                 QPainter p(&composed);
                 p.setRenderHint(QPainter::SmoothPixmapTransform, false);
                 p.setCompositionMode(QPainter::CompositionMode_SourceOver);
@@ -1413,17 +1568,16 @@ QImage renderFrameFromTracks(const Timeline *timeline,
                 p.drawImage(0, 0, placed);
             };
 
-            auto paintOverlayTrack = [&](int trackIndex) {
+            auto paintOverlayTrack = [&](int trackIndex, bool specialBlend) {
                 for (const OverlayLayer &L : overlays) {
                     if (L.trackIndex != trackIndex)
                         continue;
-                    const clipgeom::ClipTransform tr{L.videoScale, L.videoDx,
-                                                     L.videoDy, L.rotationDeg};
-                    QImage placed =
-                        clipgeom::renderLayer(L.rgb, tr, canvas, /*smooth=*/true);
+                    if ((L.blendMode != BlendMode::Normal) != specialBlend)
+                        continue;
+                    QImage placed = L.image;
                     if (!L.layerStyle.isIdentity())
                         placed = layerstyle::apply(placed, L.layerStyle);
-                    paintPlacedLayer(placed, L.opacity);
+                    paintPlacedLayer(placed, L.opacity, L.blendMode);
                 }
             };
 
@@ -1448,7 +1602,7 @@ QImage renderFrameFromTracks(const Timeline *timeline,
             // partial composite already painted behind it; lower-index/front
             // tracks are painted afterwards and are therefore unaffected.
             for (int t = tracks.size() - 1; t >= 1; --t) {
-                paintOverlayTrack(t);
+                paintOverlayTrack(t, false);
                 applyAdjustmentTrack(t);
             }
 
@@ -1460,9 +1614,16 @@ QImage renderFrameFromTracks(const Timeline *timeline,
                     QImage v1Base = base;
                     if (!v1Clip.layerStyle.isIdentity())
                         v1Base = layerstyle::apply(v1Base, v1Clip.layerStyle);
-                    paintPlacedLayer(v1Base, v1Opacity);
+                    paintPlacedLayer(v1Base, v1Opacity, BlendMode::Normal);
                 }
             }
+
+            // Light-producing VFX footage is intentionally evaluated after
+            // the V1 base. This keeps an upper-track black background from
+            // covering the edit underneath while retaining the same blend
+            // math as LayerCompositor's 13-mode implementation.
+            for (int t = 1; t < tracks.size(); ++t)
+                paintOverlayTrack(t, true);
 
             stacked = composed.convertToFormat(QImage::Format_RGBA8888);
         } else {
@@ -1473,7 +1634,12 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         // and then paint the V1 base last (frontmost). This matches the
         // preview compositor's descending clipstack::layerPaintOrderLess sort,
         // so an opaque V1 occludes V2 in export exactly as in preview.
-        const bool use16 = hdrexport16::enabledFromEnv();
+        const bool hasSpecialBlend = std::any_of(
+            overlays.cbegin(), overlays.cend(),
+            [](const OverlayLayer &layer) {
+                return layer.blendMode != BlendMode::Normal;
+            });
+        const bool use16 = hdrexport16::enabledFromEnv() && !hasSpecialBlend;
         if (use16) {
             const QSize canvas(base.width(), base.height());
             QVector<QImage> placedBackToFront;
@@ -1489,12 +1655,9 @@ QImage renderFrameFromTracks(const Timeline *timeline,
 
             for (int i = overlays.size() - 1; i >= 0; --i) {
                 const OverlayLayer &L = overlays[i];
-                if (L.rgb.isNull() || L.opacity <= 0.001)
+                if (L.image.isNull() || L.opacity <= 0.001)
                     continue;
-                const clipgeom::ClipTransform t{L.videoScale, L.videoDx,
-                                                L.videoDy, L.rotationDeg};
-                QImage placed =
-                    clipgeom::renderLayer(L.rgb, t, canvas, /*smooth=*/true);
+                QImage placed = L.image;
                 if (!L.layerStyle.isIdentity())
                     placed = layerstyle::apply(placed, L.layerStyle);
                 if (odtEnabled)
@@ -1545,12 +1708,11 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         const QSize canvas(composed.width(), composed.height());
         for (int i = overlays.size() - 1; i >= 0; --i) {
             const OverlayLayer &L = overlays[i];
-            if (L.rgb.isNull() || L.opacity <= 0.001)
+            if (L.blendMode != BlendMode::Normal)
                 continue;
-            const clipgeom::ClipTransform t{L.videoScale, L.videoDx,
-                                            L.videoDy, L.rotationDeg};
-            QImage placed =
-                clipgeom::renderLayer(L.rgb, t, canvas, /*smooth=*/true);
+            if (L.image.isNull() || L.opacity <= 0.001)
+                continue;
+            QImage placed = L.image;
             if (!L.layerStyle.isIdentity())
                 placed = layerstyle::apply(placed, L.layerStyle);
             p.setOpacity(qBound(0.0, L.opacity, 1.0));
@@ -1567,6 +1729,23 @@ QImage renderFrameFromTracks(const Timeline *timeline,
             p.drawImage(0, 0, v1Base);
         }
         p.end();
+
+        // Screen/Add (and the other supported modes) are overlaid after V1.
+        // The CPU reference is the existing LayerCompositor, so preview and
+        // export share the exact same blend equation.
+        for (int i = 0; i < overlays.size(); ++i) {
+            const OverlayLayer &L = overlays[i];
+            if (L.blendMode == BlendMode::Normal
+                || L.image.isNull() || L.opacity <= 0.001) {
+                continue;
+            }
+            QImage placed = L.image;
+            if (!L.layerStyle.isIdentity())
+                placed = layerstyle::apply(placed, L.layerStyle);
+            composed = LayerCompositor::blendImages(
+                composed, placed, L.blendMode,
+                qBound(0.0, L.opacity, 1.0));
+        }
 
         stacked = composed.convertToFormat(QImage::Format_RGBA8888);
         }
@@ -1689,6 +1868,9 @@ QImage renderFrameAtSingleWithSequenceSnapshot(
     const QString activeId = timeline->activeSequenceId();
     if (!activeId.isEmpty())
         sequenceStack.append(activeId);
+    const QVector<Light3D> lightSnapshot = timeline->projectLights();
+    const QVector<Light3DState> projectLights = light3d::statesAt(
+        lightSnapshot, static_cast<double>(usec) / 1'000'000.0);
     return renderFrameFromTracks(timeline,
                                  snapshotsFromTimeline(timeline),
                                  usec,
@@ -1696,7 +1878,10 @@ QImage renderFrameAtSingleWithSequenceSnapshot(
                                  /*sequenceDepth=*/0,
                                  sequenceSnapshot,
                                  sequenceStack,
-                                 /*applyTimelineGlobals=*/true);
+                                 projectLights,
+                                 timeline->projectLightViewPosition(),
+                                 /*applyTimelineGlobals=*/true,
+                                 /*applyProjectLighting=*/true);
 }
 
 } // namespace

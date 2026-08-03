@@ -1,8 +1,14 @@
 #pragma once
 
+#include "LayerCompositor.h"
+#include "Light3D.h"
+
 #include <QImage>
+#include <QPointF>
 #include <QSize>
 #include <QString>
+#include <QVector>
+#include <QVector3D>
 #include <QtGlobal>
 
 class Timeline;
@@ -58,6 +64,25 @@ namespace detail {
 // Internal single-sample renderer. Public renderFrameAt overloads must route
 // through this directly when motion blur is disabled.
 QImage renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize outSize);
+
+// Apply project lighting to already-placed layer images. `positionOffsets`
+// are pixel offsets from the canvas centre and are intentionally separate
+// from CompositeLayer::position, whose normalised form is used by clipgeom.
+// The helper is shared by the export renderer and the preview parity seam.
+QVector<QImage> applyLightingToLayerImages(
+    const QVector<CompositeLayer> &layers,
+    const QVector<QImage> &layerImages,
+    const QSize &canvasSize,
+    const QVector<QPointF> &positionOffsets,
+    const QVector<Light3DState> &lights,
+    const QVector3D &viewPos);
+
+// Selftest-only seam proof. The renderer calls the lighting seam even when
+// the evaluated light list is empty/disabled; the helper remains a strict
+// no-op in that case. This proves the no-light byte-identity gate exercises
+// the wired export path rather than only a detached helper call.
+void resetLightingSelftestObservation();
+bool lightingSelftestSeamWasCalled();
 
 // Test-only seam (used by main.cpp's S3 parity stage). Decodes a single
 // clip's frame at the given SOURCE-second position and returns it as a

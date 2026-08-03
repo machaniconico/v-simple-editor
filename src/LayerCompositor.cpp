@@ -103,6 +103,10 @@ QJsonObject CompositeLayer::toJson() const
     obj["outPoint"] = outPoint;
     obj["matteType"]             = static_cast<int>(matteType);
     obj["matteSourceLayerIndex"] = matteSourceLayerIndex;
+    if (!layer3D.isDefault())
+        obj["layer3D"] = layer3D.toJson();
+    if (!material.isDefault())
+        obj["layerMaterial"] = material.toJson();
 
     return obj;
 }
@@ -135,6 +139,10 @@ CompositeLayer CompositeLayer::fromJson(const QJsonObject &obj)
     l.matteType = static_cast<TrackMatteType>(
         obj["matteType"].toInt(static_cast<int>(TrackMatteType::None)));
     l.matteSourceLayerIndex = obj["matteSourceLayerIndex"].toInt(-1);
+    if (obj.contains("layer3D"))
+        l.layer3D = Layer3DTransform::fromJson(obj["layer3D"].toObject());
+    if (obj.contains("layerMaterial"))
+        l.material = LayerMaterial::fromJson(obj["layerMaterial"].toObject());
 
     return l;
 }
@@ -354,6 +362,14 @@ QImage LayerCompositor::transformLayer(const QImage &source, const CompositeLaye
 QImage LayerCompositor::compositeFrame(const QVector<CompositeLayer> &layers,
                                        const QSize &canvasSize, double time)
 {
+    return compositeFrame(layers, canvasSize, time, {}, QVector3D());
+}
+
+QImage LayerCompositor::compositeFrame(const QVector<CompositeLayer> &layers,
+                                       const QSize &canvasSize, double time,
+                                       const QVector<Light3DState> &lights,
+                                       const QVector3D &viewPos)
+{
     // Routes ALL layers through the shared trackmatte::composite SSOT, whose
     // isValidMatteSource hard-reserves index 0 as the base. Kept ASCENDING by
     // zOrder to preserve the matte ADJACENCY contract (matching renderFrameAt's
@@ -392,7 +408,15 @@ QImage LayerCompositor::compositeFrame(const QVector<CompositeLayer> &layers,
             layerImages.append(QImage());
             continue;
         }
-        layerImages.append(renderLayerImage(layer));
+        QImage layerImage = renderLayerImage(layer);
+        if (light3d::hasActiveLights(lights) && !layerImage.isNull()) {
+            const QVector3D center = light3d::layerCenterWorld(
+                QSizeF(canvasSize), layer.position);
+            layerImage = light3d::applyLighting(
+                layerImage, lights, layer.layer3D, center,
+                QSizeF(canvasSize), viewPos, layer.material);
+        }
+        layerImages.append(layerImage);
     }
 
     return trackmatte::composite(sorted, layerImages, canvasSize);
