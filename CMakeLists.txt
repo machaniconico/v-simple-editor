@@ -860,6 +860,20 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${FFMPEG_INCLUDE_DIR}
 )
 
+if(MSVC)
+    target_compile_options(${PROJECT_NAME} PRIVATE
+        # MainWindow.cpp already sits near the COFF section limit; /Zi pushes it
+        # over (error C1128), so /bigobj is required for every configuration.
+        /bigobj
+        $<$<CONFIG:Release>:/Zi>
+    )
+    target_link_options(${PROJECT_NAME} PRIVATE
+        $<$<CONFIG:Release>:/DEBUG>
+        $<$<CONFIG:Release>:/OPT:REF>
+        $<$<CONFIG:Release>:/OPT:ICF>
+    )
+endif()
+
 target_link_libraries(${PROJECT_NAME} PRIVATE
     Qt6::Widgets
     Qt6::Gui
@@ -895,7 +909,7 @@ endif()
 if(WIN32)
     # opengl32 — needed for wglGetCurrentDC and the WGL_NV_DX_interop2 entry
     # points (Phase 1e). Qt6::OpenGL is the Qt wrapper, not the system GL.
-    target_link_libraries(${PROJECT_NAME} PRIVATE dbghelp opengl32 advapi32)
+    target_link_libraries(${PROJECT_NAME} PRIVATE dbghelp psapi opengl32 advapi32)
 endif()
 
 target_compile_definitions(${PROJECT_NAME} PRIVATE

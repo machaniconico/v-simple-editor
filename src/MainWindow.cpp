@@ -1899,7 +1899,13 @@ private:
         refresh();
     }
 
-    GLPreview *m_preview = nullptr;
+    // QPointer, not a raw pointer: this overlay is parented to VideoPlayer while
+    // it watches GLPreview, which is a *sibling* created earlier. QWidget teardown
+    // deletes children in insertion order, so GLPreview dies first and the
+    // destructor below then called removeEventFilter() on freed memory — the
+    // long-standing non-deterministic 0xC0000005 on exit. QPointer nulls itself
+    // when the target dies, so the existing null guards actually hold.
+    QPointer<GLPreview> m_preview;
     StateProvider m_stateProvider;
     IndexGetter m_indexGetter;
     CommitCallback m_commitCallback;

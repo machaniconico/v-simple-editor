@@ -3,7 +3,8 @@
 # access violation remains distinguishable from a WSL-shell status truncation.
 [CmdletBinding()]
 param(
-    [ValidateSet('mainwindow-lifecycle', 'light3d')]
+    # precompose-e2e also builds a MainWindow, so it hits the same teardown path.
+    [ValidateSet('mainwindow-lifecycle', 'light3d', 'precompose-e2e')]
     [string]$TestName = 'mainwindow-lifecycle',
 
     [ValidateRange(1, 1000)]
@@ -34,8 +35,12 @@ for ($run = 1; $run -le $Runs; $run++) {
         Write-Host ("[{0}] PASS {1}/{2} EXIT=0" -f $TestName, $run, $Runs)
     } else {
         $failed++
+        # A crash exit code such as 0xC0000005 arrives as a negative Int32.
+        # Casting it straight to UInt32 throws, which used to abort the whole
+        # loop on the first crash; mask through Int64 instead.
+        $unsigned = [uint32]([int64]$exitCode -band 0xFFFFFFFF)
         Write-Host ("[{0}] FAIL {1}/{2} EXIT={3} (0x{4:X8})" -f `
-            $TestName, $run, $Runs, $exitCode, ([uint32]$exitCode))
+            $TestName, $run, $Runs, $exitCode, $unsigned)
     }
 }
 
