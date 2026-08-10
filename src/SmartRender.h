@@ -29,6 +29,7 @@ struct PassThroughTimelineRequest {
     QHash<QString, TimelineTrackMatteEntry> trackMatteEntries;
     QHash<QString, QString> clipParentEntries;
     bool hasAdjustmentLayers = false;
+    bool hasTimelineTextOverlays = false;
     bool hasMarkedRange = false;
     double markedIn = 0.0;
     double markedOut = 0.0;

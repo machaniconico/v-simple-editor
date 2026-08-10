@@ -1943,6 +1943,7 @@ Timeline *RenderQueue::resolveTimeline(const RenderJob &job,
         return nullptr;
 
     auto *tl = new Timeline();
+    tl->restoreGeneratedCaptionOverlays(data.generatedCaptionOverlays);
     tl->restoreFromProject(data.videoTracks, data.audioTracks,
                            data.playheadPos, data.markIn, data.markOut,
                            data.zoomLevel);

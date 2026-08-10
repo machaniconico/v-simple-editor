@@ -356,7 +356,10 @@ private:
     int sliderPositionForUs(int64_t positionUs) const;
     void handlePlaybackTick();
     void updatePlayButton();
-    void displayFrame(const QImage &image);
+    // `overlaysAlreadyBaked` is used only by the nested-sequence SSOT path:
+    // tlrender::renderFrameAt has already applied the parent timeline's text,
+    // so composing m_textOverlays again would darken/double every caption.
+    void displayFrame(const QImage &image, bool overlaysAlreadyBaked = false);
     void displaySeekFrameConformed(const QImage &v1Image);
 
     // Sequence helpers (Phase A/B). When m_sequence is empty, the player runs
@@ -663,6 +666,11 @@ private:
     // setHiddenTextOverlayIndex can re-compose while paused (the cached
     // m_currentFrameImage is already composited and can't be re-filtered).
     QImage m_lastSourceFrame;
+    // True only when m_lastSourceFrame came from tlrender::renderFrameAt's
+    // nested-sequence SSOT path and therefore already contains top-level
+    // text. A paused overlay edit must re-render that timeline frame instead
+    // of treating this cache as a raw image.
+    bool m_lastSourceFrameHasBakedText = false;
     // Phase 1d compositor base: a never-composed copy of the latest V1
     // frame. m_lastSourceFrame may end up holding the post-composite image
     // through displayFrame's caching path; the compositor reads this
@@ -795,7 +803,8 @@ private:
     // Active = startTime <= now < (endTime > 0 ? endTime : infinity),
     // using the current timeline seconds. Returns the source image
     // unmodified when the overlay list is empty.
-    QImage composeFrameWithOverlays(const QImage &source) const;
+    QImage composeFrameWithOverlays(const QImage &source,
+                                    bool textAlreadyBaked = false) const;
 
     // VEDITOR_TICK_TRACE accumulators (Phase 1e Sprint US-1). Populated only
     // when tickTraceEnabled() is true; flushed and reset every 30 ticks.

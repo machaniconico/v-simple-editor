@@ -559,6 +559,8 @@ PassThroughEligibility timelinePassThrough(
 
     if (motionblur::enabledFromEnv())
         return passReject(QStringLiteral("timeline motion blur is enabled"));
+    if (request.hasTimelineTextOverlays)
+        return passReject(QStringLiteral("timeline has generated caption overlays"));
 
     int videoClipCount = 0;
     int onlyTrack = -1;
@@ -733,6 +735,8 @@ PassThroughEligibility timelinePassThrough(const Timeline* timeline,
     request.trackMatteEntries = timeline->trackMatteEntries();
     request.clipParentEntries = timeline->clipParentEntries();
     request.hasAdjustmentLayers = !timeline->adjustmentLayers().isEmpty();
+    request.hasTimelineTextOverlays =
+        !timeline->generatedCaptionOverlays().isEmpty();
     request.hasMarkedRange = timeline->hasMarkedRange();
     request.markedIn = timeline->markedIn();
     request.markedOut = timeline->markedOut();

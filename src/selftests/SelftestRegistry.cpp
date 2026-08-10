@@ -89,6 +89,7 @@ int runEffectTimingSelftest();
 int runExposureAidsSelftest();
 int runExportAuditSelftest();
 int runExportRangeSelftest();
+int runFrameClipboardSelftest();
 int runFrameExportSelftest();
 int runFcpxmlSelftest();
 int runFreezeFrameSelftest();
@@ -186,6 +187,7 @@ int runWatermarkSelftest();
 int runWbEyedropperSelftest();
 int runWhisperTranscribeSelftest();
 int runWhisperWordTimingSelftest();
+int runCaptionOverlayBuilderSelftest();
 int runWorkflowSelftest();
 int runWorkspaceSelftest();
 int runXUploadSelftest();
@@ -647,6 +649,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Adjustment clip model: V1-wins z-order, behind-only effect stack, byte-identical off path, JSON true-only persistence" },
     { "frame-export",      "VEDITOR_FRAME_EXPORT_SELFTEST",        runFrameExportSelftest,        true,
       "Still-frame export: renderFrameAt SSOT -> PNG/JPEG save engine + PNG pixel-identical reread" },
+    { "frame-clipboard",   "VEDITOR_FRAME_CLIPBOARD_SELFTEST",     runFrameClipboardSelftest,     true,
+      "Current-frame clipboard MIME + live Edit action/renderFrameAt integration (17 gates)" },
     { "freeze-frame",      "VEDITOR_FREEZE_FRAME_SELFTEST",        runFreezeFrameSelftest,        true,
       "Freeze Frame: split at playhead, one-key hold curve, renderFrameAt export hold, save/load sync, one-step undo" },
     { "clip-curves",       "VEDITOR_CLIP_CURVES_SELFTEST",         runClipCurvesSelftest,         true,
@@ -678,7 +682,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "grade-keyframe", "VEDITOR_GRADE_KEYFRAME_SELFTEST", runGradeKeyframeSelftest, true,
       "ColorCorrection grade.* keyframes: render evaluation, byte identity, undo, and roundtrip" },
     { "graph-editor", "VEDITOR_GRAPH_EDITOR_SELFTEST", runGraphEditorSelftest, true,
-      "GraphEditor model roundtrip, panel-edit undo restore, and ClipAnim evaluation parity" },
+      "GraphEditor edit/undo, per-track Loop Out UI, ProjectFile persistence, and ClipAnim evaluation parity" },
     { "nest-sequence", "VEDITOR_NEST_SEQUENCE_SELFTEST", runNestSequenceSelftest, true,
       "Nested sequences: recursive render, cycle/depth guards, audio flatten, store roundtrip, no-nest byte identity" },
     { "precompose-e2e", "VEDITOR_PRECOMPOSE_E2E_SELFTEST", runPrecomposeE2ESelftest, true,
@@ -723,8 +727,10 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Caption/subtitle module smoke (SRT/VTT parse, burn-in, track model)" },
     { "whisper-transcribe", "VEDITOR_WHISPER_TRANSCRIBE_SELFTEST", runWhisperTranscribeSelftest,  true,
       "Whisper transcription service scaffold smoke" },
-    { "whisper-word-timing", "VEDITOR_WHISPER_WORD_TIMING_SELFTEST", runWhisperWordTimingSelftest, false,
+    { "whisper-word-timing", "VEDITOR_WHISPER_WORD_TIMING_SELFTEST", runWhisperWordTimingSelftest, true,
       "Whisper word-level timestamps: JSON full parse -> speech::Word -> SubtitleWord monotonic/boundary gates" },
+    { "caption-overlay-builder", "VEDITOR_CAPTION_OVERLAY_BUILDER_SELFTEST", runCaptionOverlayBuilderSelftest, true,
+      "Single-word caption builder, V1 bulk apply/undo, persistence, and renderer boundary gates" },
     { "transcript-highlighter", "VEDITOR_TRANSCRIPT_HIGHLIGHTER_SELFTEST", runTranscriptHighlighterSelftest, true,
       "Transcript highlighter scaffold smoke" },
     { "auto-clip-gen",     "VEDITOR_AUTO_CLIP_GEN_SELFTEST",      runAutoClipGenSelftest,        true,

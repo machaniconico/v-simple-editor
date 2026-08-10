@@ -4,6 +4,7 @@
 
 #include "../SubtitleGenerator.h"
 #include "../WhisperTranscriber.h"
+#include "../CaptionEditorDialog.h"
 
 namespace {
 
@@ -134,6 +135,23 @@ int runWhisperWordTimingSelftest()
               && qAbs(subtitleSegments.at(0).words.at(1).endTime - 3.2) < 0.0001,
           QStringLiteral("subtitleSegments=%1").arg(subtitleSegments.size()));
 
+    const caption::Track timedCaptionTrack =
+        whisper::WhisperTranscriber::toCaptionTrack(segments);
+    check("G5 CaptionTrack conversion preserves word timings",
+          timedCaptionTrack.clipCount() == 3
+              && timedCaptionTrack.clipAt(0).words.size() == 2
+              && timedCaptionTrack.clipAt(0).words.at(0).text == QStringLiteral("karaoke")
+              && timedCaptionTrack.clipAt(0).words.at(0).startMs == 1000
+              && timedCaptionTrack.clipAt(0).words.at(0).endMs == 1900
+              && timedCaptionTrack.clipAt(0).words.at(1).text == QStringLiteral("words")
+              && timedCaptionTrack.clipAt(0).words.at(1).startMs == 1900
+              && timedCaptionTrack.clipAt(0).words.at(1).endMs == 3200,
+          QStringLiteral("caption clips=%1 first words=%2")
+              .arg(timedCaptionTrack.clipCount())
+              .arg(timedCaptionTrack.clipCount() > 0
+                       ? timedCaptionTrack.clipAt(0).words.size()
+                       : -1));
+
     const QByteArray noWordFixture = R"json({
         "language": "en",
         "segments": [
@@ -145,7 +163,7 @@ int runWhisperWordTimingSelftest()
     const caption::Track track = whisper::WhisperTranscriber::toCaptionTrack(noWordSegments);
     const QVector<SubtitleSegment> noWordSubtitleSegments =
         whisper::WhisperTranscriber::toSubtitleSegments(noWordSegments, QStringLiteral("en"));
-    check("G5 no-word path stays segment-level compatible",
+    check("G6 no-word path stays segment-level compatible",
           error.isEmpty()
               && noWordSegments.size() == 1
               && noWordSegments.at(0).words.isEmpty()
@@ -159,6 +177,113 @@ int runWhisperWordTimingSelftest()
               .arg(error)
               .arg(noWordSegments.size())
               .arg(track.clipCount()));
+
+    const QByteArray zeroOriginLegacyFixture = R"json({
+        "language": "en",
+        "transcription": [
+            {
+                "t0": 0,
+                "t1": 100,
+                "text": " zero origin",
+                "words": [
+                    { "word": "zero", "t0": 0, "t1": 50 },
+                    { "word": "origin", "t0": 50, "t1": 100 }
+                ]
+            }
+        ]
+    })json";
+    const QList<speech::Segment> zeroOriginSegments =
+        whisper::WhisperTranscriber::parseWhisperJsonSegments(
+            zeroOriginLegacyFixture, nullptr, &error);
+    check("G7 legacy t0/t1 use 10 ms ticks at zero origin",
+          error.isEmpty()
+              && zeroOriginSegments.size() == 1
+              && zeroOriginSegments.at(0).startMs == 0
+              && zeroOriginSegments.at(0).endMs == 1000
+              && zeroOriginSegments.at(0).words.size() == 2
+              && zeroOriginSegments.at(0).words.at(0).startMs == 0
+              && zeroOriginSegments.at(0).words.at(0).endMs == 500
+              && zeroOriginSegments.at(0).words.at(1).startMs == 500
+              && zeroOriginSegments.at(0).words.at(1).endMs == 1000,
+          QStringLiteral("error='%1' segments=%2")
+              .arg(error)
+              .arg(zeroOriginSegments.size()));
+
+    const speech::RecognizeResult cliParsed =
+        speech::WhisperCliRecognizer::parseJsonOutput(fixture, QStringLiteral("auto"));
+    CaptionEditorDialog captionEditor;
+    captionEditor.setRecognizedSegments(cliParsed.segments);
+    const caption::Track editorTrack = captionEditor.track();
+    check("G8 Caption Editor CLI path retains full-JSON word timings",
+          cliParsed.success
+              && cliParsed.detectedLanguage == QStringLiteral("en")
+              && editorTrack.clipCount() == 3
+              && editorTrack.clipAt(0).words.size() == 2
+              && editorTrack.clipAt(0).words.at(0).startMs == 1000
+              && editorTrack.clipAt(0).words.at(1).endMs == 3200,
+          QStringLiteral("success=%1 error='%2' clips=%3 firstWords=%4")
+              .arg(cliParsed.success)
+              .arg(cliParsed.error)
+              .arg(editorTrack.clipCount())
+              .arg(editorTrack.clipCount() > 0
+                       ? editorTrack.clipAt(0).words.size()
+                       : -1));
+
+    const QByteArray multilingualTokenFixture = R"json({
+        "language": "multi",
+        "segments": [
+            {
+                "start": 0.0,
+                "end": 1.0,
+                "text": " café",
+                "tokens": [
+                    { "text": " caf", "start": 0.0, "end": 0.6 },
+                    { "text": "é",    "start": 0.6, "end": 1.0 }
+                ]
+            },
+            {
+                "start": 1.0,
+                "end": 2.0,
+                "text": " Привет",
+                "tokens": [
+                    { "text": " При", "start": 1.0, "end": 1.5 },
+                    { "text": "вет",  "start": 1.5, "end": 2.0 }
+                ]
+            },
+            {
+                "start": 2.0,
+                "end": 3.0,
+                "text": "日本語",
+                "tokens": [
+                    { "text": "日", "start": 2.0, "end": 2.3 },
+                    { "text": "本", "start": 2.3, "end": 2.6 },
+                    { "text": "語", "start": 2.6, "end": 3.0 }
+                ]
+            }
+        ]
+    })json";
+    const QList<speech::Segment> multilingualSegments =
+        whisper::WhisperTranscriber::parseWhisperJsonSegments(
+            multilingualTokenFixture, nullptr, &error);
+    check("G9 token pieces merge across accented, Cyrillic, and CJK scripts",
+          error.isEmpty()
+              && multilingualSegments.size() == 3
+              && multilingualSegments.at(0).words.size() == 1
+              && multilingualSegments.at(0).words.first().text == QString::fromUtf8("café")
+              && multilingualSegments.at(0).words.first().startMs == 0
+              && multilingualSegments.at(0).words.first().endMs == 1000
+              && multilingualSegments.at(1).words.size() == 1
+              && multilingualSegments.at(1).words.first().text == QString::fromUtf8("Привет")
+              && multilingualSegments.at(2).words.size() == 1
+              && multilingualSegments.at(2).words.first().text == QString::fromUtf8("日本語")
+              && multilingualSegments.at(2).words.first().startMs == 2000
+              && multilingualSegments.at(2).words.first().endMs == 3000,
+          QStringLiteral("error='%1' segments=%2 words=%3/%4/%5")
+              .arg(error)
+              .arg(multilingualSegments.size())
+              .arg(multilingualSegments.size() > 0 ? multilingualSegments.at(0).words.size() : -1)
+              .arg(multilingualSegments.size() > 1 ? multilingualSegments.at(1).words.size() : -1)
+              .arg(multilingualSegments.size() > 2 ? multilingualSegments.at(2).words.size() : -1));
 
     qInfo().noquote() << "[whisper-word-timing] selftest done: passed=" << passed
                       << "failed=" << failed;

@@ -11,6 +11,18 @@
 
 namespace subxlat {
 
+namespace {
+
+void replaceTranslatedText(caption::Clip *clip, const QString &translatedText)
+{
+    if (!clip || clip->text == translatedText)
+        return;
+    clip->text = translatedText;
+    clip->words.clear();
+}
+
+} // namespace
+
 // ---------------------------------------------------------------------------
 // TranslateConfig
 // ---------------------------------------------------------------------------
@@ -70,7 +82,8 @@ void TranslatorClient::translateStub(const caption::Track &track,
     const int total = track.clipCount();
     for (int i = 0; i < total; ++i) {
         caption::Clip c = track.clipAt(i);
-        c.text = QStringLiteral("[") + cfg.targetLang + QStringLiteral("] ") + c.text;
+        replaceTranslatedText(
+            &c, QStringLiteral("[") + cfg.targetLang + QStringLiteral("] ") + c.text);
         result.addClip(c);
         if (total > 0)
             emit translateProgress((i + 1) * 100 / total);
@@ -135,9 +148,11 @@ void TranslatorClient::translateGoogleV2(const caption::Track &track,
         for (int i = 0; i < total; ++i) {
             caption::Clip c = clips.at(i);
             if (i < translations.size()) {
-                c.text = translations.at(i)
-                             .toObject()[QStringLiteral("translatedText")]
-                             .toString();
+                replaceTranslatedText(
+                    &c,
+                    translations.at(i)
+                        .toObject()[QStringLiteral("translatedText")]
+                        .toString());
             }
             result.addClip(c);
             emit translateProgress((i + 1) * 100 / total);
@@ -199,9 +214,11 @@ void TranslatorClient::translateDeepL(const caption::Track &track,
         for (int i = 0; i < total; ++i) {
             caption::Clip c = clips.at(i);
             if (i < translations.size()) {
-                c.text = translations.at(i)
-                             .toObject()[QStringLiteral("text")]
-                             .toString();
+                replaceTranslatedText(
+                    &c,
+                    translations.at(i)
+                        .toObject()[QStringLiteral("text")]
+                        .toString());
             }
             result.addClip(c);
             emit translateProgress((i + 1) * 100 / total);

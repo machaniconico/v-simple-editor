@@ -248,12 +248,12 @@ bool spatialLoopApplies(const ClipInfo& clip, const QString& trackName)
         && track->count() >= 2;
 }
 
-double spatialPathLocalSeconds(const ClipInfo& clip, double clipLocalSeconds)
+double spatialPathLocalSecondsForTrack(const ClipInfo& clip,
+                                       const QString& trackName,
+                                       double clipLocalSeconds)
 {
-    if (spatialLoopApplies(clip, kPosXTrack))
-        return clip.keyframes.loopedTimeForTrack(kPosXTrack, clipLocalSeconds);
-    if (spatialLoopApplies(clip, kPosYTrack))
-        return clip.keyframes.loopedTimeForTrack(kPosYTrack, clipLocalSeconds);
+    if (spatialLoopApplies(clip, trackName))
+        return clip.keyframes.loopedTimeForTrack(trackName, clipLocalSeconds);
     return clipLocalSeconds;
 }
 
@@ -359,61 +359,91 @@ bool spatialPositionAt(const ClipInfo& clip,
     if (times.size() < 2)
         return false;
 
-    const double pathSeconds = spatialPathLocalSeconds(clip, clipLocalSeconds);
-    int segment = -1;
-    for (int i = 0; i < times.size() - 1; ++i) {
-        if (pathSeconds + kKeyTimeEpsilon >= times[i]
-            && pathSeconds - kKeyTimeEpsilon <= times[i + 1]) {
-            segment = i;
-            break;
+    const auto evaluateSpatialPointAt = [&](double pathSeconds,
+                                             QPointF *result) {
+        int segment = -1;
+        for (int i = 0; i < times.size() - 1; ++i) {
+            if (pathSeconds + kKeyTimeEpsilon >= times[i]
+                && pathSeconds - kKeyTimeEpsilon <= times[i + 1]) {
+                segment = i;
+                break;
+            }
         }
-    }
-    if (segment < 0)
-        return false;
+        if (segment < 0)
+            return false;
 
-    const double startTime = times[segment];
-    const double endTime = times[segment + 1];
-    if (!(endTime > startTime))
-        return false;
+        const double startTime = times[segment];
+        const double endTime = times[segment + 1];
+        if (!(endTime > startTime))
+            return false;
 
-    const KeyframePoint *xStart = keyframeAtTime(xTrack, startTime);
-    const KeyframePoint *yStart = keyframeAtTime(yTrack, startTime);
-    const KeyframePoint *xEnd = keyframeAtTime(xTrack, endTime);
-    const KeyframePoint *yEnd = keyframeAtTime(yTrack, endTime);
+        const KeyframePoint *xStart = keyframeAtTime(xTrack, startTime);
+        const KeyframePoint *yStart = keyframeAtTime(yTrack, startTime);
+        const KeyframePoint *xEnd = keyframeAtTime(xTrack, endTime);
+        const KeyframePoint *yEnd = keyframeAtTime(yTrack, endTime);
 
-    if (!hasUsableSpatialTangent(xStart)
-        && !hasUsableSpatialTangent(yStart)
-        && !hasUsableSpatialTangent(xEnd)
-        && !hasUsableSpatialTangent(yEnd)) {
-        return false;
-    }
+        if (!hasUsableSpatialTangent(xStart)
+            && !hasUsableSpatialTangent(yStart)
+            && !hasUsableSpatialTangent(xEnd)
+            && !hasUsableSpatialTangent(yEnd)) {
+            return false;
+        }
 
-    QPointF p0(trackValueAt(xTrack, startTime, clip.videoDx),
-               trackValueAt(yTrack, startTime, clip.videoDy));
-    QPointF p1(trackValueAt(xTrack, endTime, clip.videoDx),
-               trackValueAt(yTrack, endTime, clip.videoDy));
-    if (!finitePoint(p0) || !finitePoint(p1))
-        return false;
+        const QPointF p0(trackValueAt(xTrack, startTime, clip.videoDx),
+                         trackValueAt(yTrack, startTime, clip.videoDy));
+        const QPointF p1(trackValueAt(xTrack, endTime, clip.videoDx),
+                         trackValueAt(yTrack, endTime, clip.videoDy));
+        if (!finitePoint(p0) || !finitePoint(p1))
+            return false;
 
-    const QPointF out = outgoingSpatialTangent(xStart, yStart);
-    const QPointF in = incomingSpatialTangent(xEnd, yEnd);
-    const QPointF c1(p0.x() + out.x(), p0.y() + out.y());
-    const QPointF c2(p1.x() + in.x(), p1.y() + in.y());
-    if (!finitePoint(c1) || !finitePoint(c2))
-        return false;
+        const QPointF out = outgoingSpatialTangent(xStart, yStart);
+        const QPointF in = incomingSpatialTangent(xEnd, yEnd);
+        const QPointF c1(p0.x() + out.x(), p0.y() + out.y());
+        const QPointF c2(p1.x() + in.x(), p1.y() + in.y());
+        if (!finitePoint(c1) || !finitePoint(c2))
+            return false;
 
-    double u = (pathSeconds - startTime) / (endTime - startTime);
-    u = std::max(0.0, std::min(1.0, u));
-    const KeyframePoint *easeKeyframe = xStart ? xStart : yStart;
-    u = easedProgress(u, easeKeyframe);
+        double u = (pathSeconds - startTime) / (endTime - startTime);
+        u = std::max(0.0, std::min(1.0, u));
+        const KeyframePoint *easeKeyframe = xStart ? xStart : yStart;
+        u = easedProgress(u, easeKeyframe);
 
-    const QPointF result = cubicPoint(p0, c1, c2, p1, u);
-    if (!finitePoint(result))
-        return false;
+        const QPointF evaluated = cubicPoint(p0, c1, c2, p1, u);
+        if (!finitePoint(evaluated))
+            return false;
+        if (result)
+            *result = evaluated;
+        return true;
+    };
+
+    // Position X and Y are independently selectable graph tracks.  Their
+    // Loop Out modes therefore need independent time mappings even when the
+    // pair uses one spatial Bezier path.  The previous shared mapping picked
+    // X first and made Y visibly loop despite a UI value of None/PingPong.
+    QPointF result(
+        trackHasKeyframes(clip.keyframes, kPosXTrack)
+            ? clip.keyframes.valueAt(kPosXTrack, clipLocalSeconds, clip.videoDx)
+            : clip.videoDx,
+        trackHasKeyframes(clip.keyframes, kPosYTrack)
+            ? clip.keyframes.valueAt(kPosYTrack, clipLocalSeconds, clip.videoDy)
+            : clip.videoDy);
+
+    QPointF xPoint;
+    QPointF yPoint;
+    const bool xSpatial = evaluateSpatialPointAt(
+        spatialPathLocalSecondsForTrack(clip, kPosXTrack, clipLocalSeconds),
+        &xPoint);
+    const bool ySpatial = evaluateSpatialPointAt(
+        spatialPathLocalSecondsForTrack(clip, kPosYTrack, clipLocalSeconds),
+        &yPoint);
+    if (xSpatial)
+        result.setX(xPoint.x());
+    if (ySpatial)
+        result.setY(yPoint.y());
 
     if (position)
         *position = result;
-    return true;
+    return xSpatial || ySpatial;
 }
 
 } // namespace

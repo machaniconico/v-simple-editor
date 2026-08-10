@@ -13,6 +13,7 @@ double exporter_loudnessGainDb();
 #include "TrimOps.h"
 #include "ExportDialog.h"
 #include "FrameExport.h"
+#include "FrameClipboard.h"
 #include "UndoManager.h"
 #include "OverlayDialogs.h"
 #include "VideoEffectDialogs.h"
@@ -64,6 +65,7 @@ double exporter_loudnessGainDb();
 #include "SocialExportDialog.h"
 #include "YtdlpDownloadDialog.h"
 #include "CaptionEditorDialog.h"
+#include "CaptionOverlayBuilder.h"
 #include "WhisperTranscribeDialog.h"
 #include "TranscriptHighlightDialog.h"
 #include "TextBasedEditDialog.h"
@@ -2889,6 +2891,8 @@ void MainWindow::registerCoreShortcuts()
         QStringLiteral("やり直し"),            QStringLiteral("編集"));
     reg(m_copyAction,            "edit.copy",
         QStringLiteral("クリップをコピー"),    QStringLiteral("編集"));
+    reg(m_copyCurrentFrameAction, "edit.copy_current_frame",
+        QStringLiteral("現在フレームをコピー"), QStringLiteral("編集"));
     reg(m_pasteAction,           "edit.paste",
         QStringLiteral("クリップを貼り付け"),  QStringLiteral("編集"));
     reg(m_splitAction,           "edit.split",
@@ -3433,14 +3437,8 @@ void MainWindow::setupUI()
                         normalizedRect.x(), normalizedRect.y(),
                         normalizedRect.width(), normalizedRect.height()))
                     return;
-                const auto &clips = m_timeline->videoClips();
-                if (!clips.isEmpty() && m_player) {
-                    QVector<EnhancedTextOverlay> overlays;
-                    const auto &mgr = clips[0].textManager;
-                    for (int i = 0; i < mgr.count(); ++i)
-                        overlays.append(mgr.overlay(i));
-                    m_player->setTextOverlays(overlays);
-                }
+                if (m_player)
+                    m_player->setTextOverlays(m_timeline->timelineTextOverlays());
             });
     // US-T35 Video source transform drag/resize → persist to owning clip.
     connect(m_player, &VideoPlayer::videoSourceTransformChanged, this,
@@ -3461,14 +3459,8 @@ void MainWindow::setupUI()
                 }
                 // Re-push the overlay list so the preview re-renders with
                 // the updated time range.
-                const auto &clips = m_timeline->videoClips();
-                if (!clips.isEmpty() && m_player) {
-                    QVector<EnhancedTextOverlay> overlays;
-                    const auto &mgr = clips[0].textManager;
-                    for (int i = 0; i < mgr.count(); ++i)
-                        overlays.append(mgr.overlay(i));
-                    m_player->setTextOverlays(overlays);
-                }
+                if (m_player)
+                    m_player->setTextOverlays(m_timeline->timelineTextOverlays());
                 statusBar()->showMessage(QString("テキスト時間: %1 s → %2 s (%3 s)")
                     .arg(startTime, 0, 'f', 2)
                     .arg(endTime, 0, 'f', 2)
@@ -3561,6 +3553,11 @@ void MainWindow::setupUI()
             videoRamps.append(speedramp::SpeedRamp::identity());
         }
         m_player->setSpeedRamps(videoRamps);
+
+        // Generated captions are timeline-level canonical data; ordinary
+        // authored titles retain their legacy clip owner. Refresh the merged
+        // preview list after every apply and undo/redo.
+        m_player->setTextOverlays(m_timeline->timelineTextOverlays());
     });
     // Audio-side schedule — feeds AudioMixer so every active entry across
     // A1..A16 is sum-mixed into a single output. Unlinked A clips and
@@ -3935,6 +3932,43 @@ void MainWindow::setupMenuBar()
 
     // 編集 メニュー
     auto *editMenu = menuBar()->addMenu("編集(&E)");
+
+    m_copyCurrentFrameAction =
+        editMenu->addAction(QStringLiteral("現在のフレームをクリップボードへコピー"));
+    m_copyCurrentFrameAction->setObjectName(
+        QStringLiteral("action_copy_current_frame_to_clipboard"));
+    m_copyCurrentFrameAction->setProperty(
+        "accessibleName", QStringLiteral("現在のフレームをクリップボードへコピー"));
+    m_copyCurrentFrameAction->setToolTip(
+        QStringLiteral("再生ヘッド位置の合成済みフレームをクリップボードへコピーします"));
+    m_copyCurrentFrameAction->setShortcut(
+        QKeySequence(Qt::CTRL | Qt::ALT | Qt::Key_C));
+    connect(m_copyCurrentFrameAction, &QAction::triggered, this, [this]() {
+        if (!m_timeline)
+            return;
+
+        const qint64 usec = qMax<qint64>(
+            0, qRound64(currentPlayheadSeconds() * 1000000.0));
+        const int width = qMax(1, m_projectConfig.width);
+        const int height = qMax(1, m_projectConfig.height);
+        const QImage renderedFrame =
+            tlrender::renderFrameAt(m_timeline, usec, QSize(width, height));
+
+        QString error;
+        if (!FrameClipboard::copyImage(
+                renderedFrame, QApplication::clipboard(), &error)) {
+            statusBar()->showMessage(
+                QStringLiteral("現在のフレームをコピーできませんでした: %1").arg(error),
+                5000);
+        } else {
+            statusBar()->showMessage(
+                QStringLiteral("現在のフレームをクリップボードへコピーしました。"), 3000);
+        }
+    });
+    m_menuHelpEntries.append({m_copyCurrentFrameAction,
+        QStringLiteral("再生ヘッド位置の合成済みフレームを画像としてクリップボードへコピーします。")});
+
+    editMenu->addSeparator();
 
     m_undoAction = editMenu->addAction("元に戻す(&U)");
     m_undoAction->setShortcut(QKeySequence::Undo);
@@ -6120,7 +6154,7 @@ void MainWindow::setupMenuBar()
     connect(graphEditorAction, &QAction::toggled, graphEditorPanel, &QDockWidget::setVisible);
     connect(graphEditorPanel, &QDockWidget::visibilityChanged, graphEditorAction, &QAction::setChecked);
     m_menuHelpEntries.append({graphEditorAction,
-        QStringLiteral("選択中クリップのキーフレームトラックと値カーブを読み取り専用で表示します。")});
+        QStringLiteral("選択中クリップのキーフレームトラックと値カーブを表示し、選択トラックのループ出力を編集します。")});
 
     m_vfxControlsAction = viewMenu->addAction(QStringLiteral("VFX コントロール"));
     m_vfxControlsAction->setCheckable(true);
@@ -7409,6 +7443,7 @@ void MainWindow::populateProjectData(ProjectData &data)
     data.config = m_projectConfig;
     data.videoTracks = m_timeline->allVideoTracks();
     data.audioTracks = m_timeline->allAudioTracks();
+    data.generatedCaptionOverlays = m_timeline->generatedCaptionOverlays();
     data.playheadPos = m_timeline->playheadPosition();
     data.markIn = m_timeline->markedIn();
     data.markOut = m_timeline->markedOut();
@@ -7699,6 +7734,7 @@ void MainWindow::applyLoadedProjectData(const ProjectData &data, const QString &
             : QSize());
     }
     if (m_timeline) {
+        m_timeline->restoreGeneratedCaptionOverlays(data.generatedCaptionOverlays);
         m_timeline->restoreFromProject(data.videoTracks, data.audioTracks,
                                        data.playheadPos, data.markIn, data.markOut, data.zoomLevel);
         syncTimeRemapEntriesToTimeline(m_timeline, m_timeRemapClipEntries);
@@ -9249,14 +9285,8 @@ void MainWindow::onTextOverlayEditCommitted(int overlayIndex, const QString &new
         statusBar()->showMessage("テキスト更新失敗");
         return;
     }
-    const auto &clips = m_timeline->videoClips();
-    if (!clips.isEmpty() && m_player) {
-        QVector<EnhancedTextOverlay> overlays;
-        const auto &mgr = clips[0].textManager;
-        for (int i = 0; i < mgr.count(); ++i)
-            overlays.append(mgr.overlay(i));
-        m_player->setTextOverlays(overlays);
-    }
+    if (m_player)
+        m_player->setTextOverlays(m_timeline->timelineTextOverlays());
     if (m_player)
         m_player->clearTextToolRect();
     statusBar()->showMessage(QString("テキスト更新: 「%1」").arg(newText));
@@ -9350,15 +9380,8 @@ void MainWindow::applyTextToolOverlay()
     // Push the updated overlay list to the preview so the new text is
     // visible immediately. MainWindow is the single source of truth that
     // owns the timeline → player forwarding.
-    const auto &clips = m_timeline->videoClips();
-    if (!clips.isEmpty()) {
-        QVector<EnhancedTextOverlay> overlays;
-        const auto &mgr = clips[0].textManager;
-        for (int i = 0; i < mgr.count(); ++i)
-            overlays.append(mgr.overlay(i));
-        if (m_player)
-            m_player->setTextOverlays(overlays);
-    }
+    if (m_player)
+        m_player->setTextOverlays(m_timeline->timelineTextOverlays());
     statusBar()->showMessage(QString("テキストを追加しました: 「%1」").arg(overlay.text));
 
     m_textToolLineEdit->clear();
@@ -9384,8 +9407,8 @@ void MainWindow::exportTextOverlays()
                                  "クリップにテキストオーバーレイがありません。");
         return;
     }
-    const auto &clip = m_timeline->videoClips().first();
-    if (clip.textManager.count() == 0) {
+    const QVector<EnhancedTextOverlay> overlays = m_timeline->timelineTextOverlays();
+    if (overlays.isEmpty()) {
         QMessageBox::information(this, "テキスト書き出し",
                                  "V1 の先頭クリップにテキストがありません。");
         return;
@@ -9396,10 +9419,6 @@ void MainWindow::exportTextOverlays()
         "SubRip (*.srt);;CSV (*.csv);;All Files (*)", &selectedFilter);
     if (path.isEmpty())
         return;
-
-    QVector<EnhancedTextOverlay> overlays;
-    for (int i = 0; i < clip.textManager.count(); ++i)
-        overlays.append(clip.textManager.overlay(i));
 
     const bool wantCsv = selectedFilter.contains("CSV")
                       || path.endsWith(".csv", Qt::CaseInsensitive);
@@ -9424,12 +9443,11 @@ void MainWindow::manageTextOverlays()
     int sel = m_timeline->videoClips().size() > 0 ? 0 : -1;
     if (sel < 0) return;
 
-    auto clips = m_timeline->videoClips();
-    auto &textMgr = clips[sel].textManager;
+    const QVector<EnhancedTextOverlay> overlays = m_timeline->timelineTextOverlays();
 
-    QString info = QString("Current clip has %1 text overlay(s).\n\n").arg(textMgr.count());
-    for (int i = 0; i < textMgr.count(); ++i) {
-        const auto &o = textMgr.overlay(i);
+    QString info = QString("Timeline has %1 text overlay(s).\n\n").arg(overlays.count());
+    for (int i = 0; i < overlays.count(); ++i) {
+        const auto &o = overlays.at(i);
         info += QString("%1. \"%2\" (%3s - %4s)\n")
             .arg(i + 1)
             .arg(o.text.left(30))
@@ -10046,10 +10064,9 @@ void MainWindow::trackMotion()
                     return;
                 }
 
-                const auto &vClips = m_timeline->videoClips();
-                if (vClips.isEmpty()) return;
-                const auto &mgr = vClips[0].textManager;
-                const int overlayCount = mgr.count();
+                const QVector<EnhancedTextOverlay> overlays =
+                    m_timeline->timelineTextOverlays();
+                const int overlayCount = overlays.count();
 
                 if (overlayCount == 0) {
                     QMessageBox::information(this,
@@ -10071,7 +10088,7 @@ void MainWindow::trackMotion()
 
                 auto *combo = new QComboBox(&dlg);
                 for (int i = 0; i < overlayCount; ++i) {
-                    const auto &ov = mgr.overlay(i);
+                    const auto &ov = overlays.at(i);
                     combo->addItem(
                         QString("%1: \"%2\"")
                             .arg(i + 1)
@@ -10090,7 +10107,6 @@ void MainWindow::trackMotion()
                     return;
 
                 const int selIdx = combo->currentData().toInt();
-                const auto &overlays = mgr.overlays();
                 if (selIdx < 0 || selIdx >= overlays.size())
                     return;
 
@@ -10109,13 +10125,7 @@ void MainWindow::trackMotion()
                     result, m_projectConfig.fps);
                 m_timeline->applyTrackingToOverlay(selIdx, selOverlay);
 
-                {
-                    const auto &updatedMgr = m_timeline->videoClips()[0].textManager;
-                    QVector<EnhancedTextOverlay> ovList;
-                    for (int i = 0; i < updatedMgr.count(); ++i)
-                        ovList.append(updatedMgr.overlay(i));
-                    m_player->setTextOverlays(ovList);
-                }
+                m_player->setTextOverlays(m_timeline->timelineTextOverlays());
 
                 statusBar()->showMessage(
                     QString::fromUtf8("\xe3\x83\x88\xe3\x83\xa9\xe3\x83\x83\xe3\x82\xad\xe3\x83\xb3\xe3\x82\xb0\xe3\x82\x92\xe9\x81\xa9\xe7\x94\xa8\xe3\x81\x97\xe3\x81\xbe\xe3\x81\x97\xe3\x81\x9f: %1\xe3\x83\x95\xe3\x83\xac\xe3\x83\xbc\xe3\x83\xa0\xe2\x86\x92\"%2\"")
@@ -13652,6 +13662,50 @@ void MainWindow::openCaptionEditorDialog()
     if (!m_captionEditorDialog) {
         m_captionEditorDialog = new CaptionEditorDialog(this);
         m_captionEditorDialog->setObjectName(QStringLiteral("captionEditorDialog"));
+        connect(m_captionEditorDialog,
+                &CaptionEditorDialog::applyToTimelineRequested,
+                this,
+                [this]() {
+            if (!m_captionEditorDialog)
+                return;
+
+            QString error;
+            caption::Track timelineTrack = m_captionEditorDialog->track();
+            const QString recognizedSourcePath =
+                m_captionEditorDialog->recognizedSourcePath();
+            if (!recognizedSourcePath.isEmpty()) {
+                caption::Track mappedTrack;
+                if (!m_timeline
+                    || !m_timeline->mapSourceCaptionTrackToTimeline(
+                        timelineTrack, recognizedSourcePath, &mappedTrack, &error)) {
+                    if (error.isEmpty())
+                        error = QStringLiteral("認識元の動画を V1 上で特定できません。");
+                    m_captionEditorDialog->setApplyError(error);
+                    statusBar()->showMessage(error, 5000);
+                    return;
+                }
+                timelineTrack = mappedTrack;
+            }
+
+            const QVector<EnhancedTextOverlay> overlays =
+                CaptionOverlayBuilder::build(timelineTrack,
+                                             m_captionEditorDialog->style());
+            if (!m_timeline
+                || !m_timeline->applySingleWordCaptionOverlays(overlays, &error)) {
+                if (error.isEmpty())
+                    error = QStringLiteral("字幕を適用するタイムラインがありません。");
+                m_captionEditorDialog->setApplyError(error);
+                statusBar()->showMessage(error, 5000);
+                return;
+            }
+
+            m_captionEditorDialog->setApplyError(QString());
+            setWindowModified(true);
+            statusBar()->showMessage(
+                QStringLiteral("%1 件の1語字幕をタイムラインに適用しました。")
+                    .arg(overlays.size()),
+                4000);
+        });
     }
     m_captionEditorDialog->show();
     m_captionEditorDialog->raise();
@@ -13688,15 +13742,30 @@ void MainWindow::openWhisperTranscribeDialog()
         return;
     }
 
-    const int segmentCount = outcome.track.clipCount();
+    caption::Track editorTrack = outcome.track;
+    QString timelineMappingMessage;
+    if (m_timeline) {
+        caption::Track mappedTrack;
+        QString mappingError;
+        if (m_timeline->mapSourceCaptionTrackToTimeline(
+                outcome.track, req.mediaPath, &mappedTrack, &mappingError)) {
+            editorTrack = mappedTrack;
+            timelineMappingMessage = QStringLiteral(" V1上のトリム・速度・タイムリマップへ時刻を変換しました。");
+        } else if (!mappingError.isEmpty()) {
+            timelineMappingMessage = QStringLiteral(" 元動画時刻のまま読み込みました（%1）").arg(mappingError);
+        }
+    }
+    const int segmentCount = editorTrack.clipCount();
 
     // 生成した caption::Track を既存の字幕エディタ経路へ渡す (破棄しない)。
     openCaptionEditorDialog();
     if (m_captionEditorDialog)
-        m_captionEditorDialog->setTrack(outcome.track);
+        m_captionEditorDialog->setTrack(editorTrack);
 
     const QString summary =
-        QStringLiteral("%1 件のセグメントを生成し、字幕エディタに読み込みました。").arg(segmentCount);
+        QStringLiteral("%1 件のセグメントを生成し、字幕エディタに読み込みました。%2")
+            .arg(segmentCount)
+            .arg(timelineMappingMessage);
     statusBar()->showMessage(summary);
     QMessageBox::information(this, QStringLiteral("動画を文字起こし"), summary);
 }

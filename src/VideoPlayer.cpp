@@ -1686,6 +1686,7 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
         // 黒フレームで上書きして stale 表示を断つ。可視トラックを全 OFF にした
         // ケースでも「非表示 = 黒」で正しく、m_timelinePositionUs は不変。
         m_lastSourceFrame = QImage();
+        m_lastSourceFrameHasBakedText = false;
         if (m_glPreview) {
             const QSize blankSize = m_projectOutputSize.isValid()
                 ? m_projectOutputSize
@@ -3044,11 +3045,12 @@ bool VideoPlayer::pushActiveClipColorCorrectionToGlPreviewForTest(qint64 timelin
     return pushed;
 }
 
-void VideoPlayer::displayFrame(const QImage &image)
+void VideoPlayer::displayFrame(const QImage &image, bool overlaysAlreadyBaked)
 {
     undotrace::log("displayFrame:enter");
     m_lastSourceFrame = image;
-    QImage composed = composeFrameWithOverlays(image);
+    m_lastSourceFrameHasBakedText = overlaysAlreadyBaked;
+    QImage composed = composeFrameWithOverlays(image, overlaysAlreadyBaked);
 
     // Edge-attached transitions: FadeIn / FadeOut alpha-ramp against black.
     // CrossDissolve uses the timeline-overlap path — Timeline overlaps the
@@ -3288,7 +3290,8 @@ void VideoPlayer::refreshTextOverlayHits()
     m_glPreview->setTextOverlayHitList(hits);
 }
 
-QImage VideoPlayer::composeFrameWithOverlays(const QImage &source) const
+QImage VideoPlayer::composeFrameWithOverlays(const QImage &source,
+                                             bool textAlreadyBaked) const
 {
     if (source.isNull())
         return source;
@@ -3318,7 +3321,7 @@ QImage VideoPlayer::composeFrameWithOverlays(const QImage &source) const
                                 Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
     };
 
-    if (m_textOverlays.isEmpty()) {
+    if (textAlreadyBaked || m_textOverlays.isEmpty()) {
         if (!applyPreviewFx) return source;
         return runProxy(source);
     }
@@ -4295,6 +4298,7 @@ bool VideoPlayer::presentDecodedFrame(AVFrame *frame, bool displayFrameRequested
         // into m_lastSourceFrame later in the pipeline.
         m_lastV1RawFrame = image;
         m_lastSourceFrame = image;
+        m_lastSourceFrameHasBakedText = false;
         if (!m_deferDisplayThisTick) {
             QImage displayImage = image;
             if (sequenceActive()
@@ -4513,6 +4517,31 @@ void VideoPlayer::refreshDisplayedFrame()
     // an existing overlay is selected and setTextOverlays re-pushes).
     if (m_lastSourceFrame.isNull())
         return;
+
+    if (m_lastSourceFrameHasBakedText) {
+        const Timeline *previewTimeline =
+            m_glPreview ? m_glPreview->timeline() : nullptr;
+        QSize renderSize = m_projectOutputSize.isValid()
+            ? m_projectOutputSize
+            : QSize(m_canvasWidth, m_canvasHeight);
+        if (renderSize.isEmpty())
+            renderSize = m_lastSourceFrame.size();
+        if (previewTimeline && !renderSize.isEmpty()) {
+            const QImage refreshed = tlrender::renderFrameAt(
+                previewTimeline, m_timelinePositionUs, renderSize);
+            if (!refreshed.isNull()) {
+                m_lastFrameOdtApplied = false;
+                displayFrame(refreshed, true);
+                return;
+            }
+        }
+        // If the authoritative timeline cannot be rendered, preserve the
+        // last valid nested frame without burning the new overlay list into
+        // it a second time.
+        m_lastFrameOdtApplied = false;
+        displayFrame(m_lastSourceFrame, true);
+        return;
+    }
     undotrace::log("refresh:conform");
     if (m_projectOutputSize.isValid()
         && sequenceActive()
@@ -5004,7 +5033,7 @@ void VideoPlayer::handlePlaybackTick()
                 if (m_glPreview)
                     m_glPreview->setCompositeBakedMode(true);
                 cachePreviewComposite(ssotFrame);
-                displayFrame(ssotFrame);
+                displayFrame(ssotFrame, true);
                 servedByNestedSequenceSsot = true;
             }
         }

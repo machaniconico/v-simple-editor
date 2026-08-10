@@ -227,6 +227,7 @@ struct ProjectData {
     ProjectConfig config;
     QVector<QVector<ClipInfo>> videoTracks;
     QVector<QVector<ClipInfo>> audioTracks;
+    QVector<EnhancedTextOverlay> generatedCaptionOverlays;
     double playheadPos = 0.0;
     double markIn = -1.0;
     double markOut = -1.0;

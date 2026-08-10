@@ -16,6 +16,7 @@
 #include <QPainterPath>
 #include <QPushButton>
 #include <QScrollArea>
+#include <QSignalBlocker>
 #include <QSplitter>
 #include <QVBoxLayout>
 #include <algorithm>
@@ -1088,18 +1089,42 @@ GraphEditorPanel::GraphEditorPanel(QWidget *parent)
 
     auto *applyPresetButton = new QPushButton(QStringLiteral("Apply"), root);
 
+    auto *loopOutLabel = new QLabel(QStringLiteral("Loop Out"), root);
+    m_loopOutCombo = new QComboBox(root);
+    m_loopOutCombo->setObjectName(QStringLiteral("GraphEditorLoopOutCombo"));
+    m_loopOutCombo->setAccessibleName(
+        QStringLiteral("Loop Out mode for selected keyframe track"));
+    m_loopOutCombo->addItem(QStringLiteral("None"), static_cast<int>(LoopMode::None));
+    m_loopOutCombo->addItem(QStringLiteral("Cycle"), static_cast<int>(LoopMode::Cycle));
+    m_loopOutCombo->addItem(QStringLiteral("PingPong"), static_cast<int>(LoopMode::PingPong));
+    m_loopOutCombo->addItem(QStringLiteral("Continue"), static_cast<int>(LoopMode::Continue));
+    m_loopOutCombo->setEnabled(false);
+    m_loopOutCombo->setAccessibleName(QStringLiteral("Loop Out"));
+    m_loopOutCombo->setAccessibleDescription(
+        QStringLiteral("Continue uses linear continuation after the last keyframe."));
+    m_loopOutCombo->setItemData(
+        m_loopOutCombo->findData(static_cast<int>(LoopMode::Continue)),
+        QStringLiteral("Linear continuation after the last keyframe."),
+        Qt::ToolTipRole);
+    loopOutLabel->setBuddy(m_loopOutCombo);
+
     controlsLayout->addWidget(graphModeLabel);
     controlsLayout->addWidget(graphModeCombo);
     controlsLayout->addSpacing(8);
     controlsLayout->addWidget(presetLabel);
     controlsLayout->addWidget(presetCombo);
     controlsLayout->addWidget(applyPresetButton);
+    controlsLayout->addSpacing(8);
+    controlsLayout->addWidget(loopOutLabel);
+    controlsLayout->addWidget(m_loopOutCombo);
     controlsLayout->addStretch(1);
     layout->addLayout(controlsLayout);
 
     auto *splitter = new QSplitter(Qt::Horizontal, root);
     m_trackList = new QListWidget(splitter);
-    m_trackList->setSelectionMode(QAbstractItemView::NoSelection);
+    m_trackList->setObjectName(QStringLiteral("GraphEditorTrackList"));
+    m_trackList->setAccessibleName(QStringLiteral("Keyframe tracks"));
+    m_trackList->setSelectionMode(QAbstractItemView::SingleSelection);
     m_trackList->setMinimumWidth(190);
 
     auto *scrollArea = new QScrollArea(splitter);
@@ -1156,6 +1181,42 @@ GraphEditorPanel::GraphEditorPanel(QWidget *parent)
         m_statusLabel->setText(QStringLiteral("Applied %1 to the selected keyframe.")
                                    .arg(presetCombo->currentText()));
     });
+    connect(m_trackList, &QListWidget::currentRowChanged,
+            this, [this](int row) {
+                if (row >= 0 && row < m_tracks.size())
+                    m_selectedProperty = m_tracks[row].propertyName;
+                syncLoopOutControl();
+            });
+    connect(m_loopOutCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, [this](int) {
+                if (!m_timeline || !m_trackList || !m_loopOutCombo)
+                    return;
+
+                const int row = m_trackList->currentRow();
+                if (row < 0 || row >= m_tracks.size())
+                    return;
+                if (m_trackIdx < 0 || m_trackIdx >= m_timeline->videoTracks().size())
+                    return;
+
+                auto *timelineTrack = m_timeline->videoTracks().value(m_trackIdx, nullptr);
+                if (!timelineTrack)
+                    return;
+                const auto clips = timelineTrack->clips();
+                if (m_clipIdx < 0 || m_clipIdx >= clips.size())
+                    return;
+
+                const QString propertyName = m_tracks[row].propertyName;
+                KeyframeManager keyframes = clips[m_clipIdx].keyframes;
+                const auto mode = static_cast<LoopMode>(m_loopOutCombo->currentData().toInt());
+                if (keyframes.loopOutMode(propertyName) == mode)
+                    return;
+
+                keyframes.setLoopOutMode(propertyName, mode);
+                m_timeline->setClipEffectsAndKeyframes(m_trackIdx, m_clipIdx,
+                                                       clips[m_clipIdx].effects,
+                                                       keyframes);
+                rebuildForSelection();
+            });
     scrollArea->setWidget(m_curveView);
 
     splitter->addWidget(m_trackList);
@@ -1199,6 +1260,14 @@ void GraphEditorPanel::refreshFromTimeline()
 
 void GraphEditorPanel::rebuildForSelection()
 {
+    if (m_trackList && m_trackList->currentItem()) {
+        const QString currentProperty =
+            m_trackList->currentItem()->data(Qt::UserRole).toString();
+        if (!currentProperty.isEmpty())
+            m_selectedProperty = currentProperty;
+    }
+    const QString selectedProperty = m_selectedProperty;
+
     if (!m_timeline) {
         showEmptyState(QStringLiteral("No timeline"));
         return;
@@ -1243,25 +1312,40 @@ void GraphEditorPanel::rebuildForSelection()
         m_tracks.append(curve);
     }
 
-    m_trackList->clear();
-    for (const auto &curve : m_tracks) {
-        auto *item = new QListWidgetItem(
-            QStringLiteral("%1\n%2 keyframes")
-                .arg(curve.displayName)
-                .arg(curve.track.count()),
-            m_trackList);
-        item->setForeground(QBrush(curve.color));
-        item->setToolTip(QStringLiteral("%1\n%2")
-                             .arg(curve.propertyName)
-                             .arg(curve.track.keyframes().isEmpty()
-                                  ? QStringLiteral("No keyframes")
-                                  : interpolationLabel(curve.track.keyframes().first().interpolation)));
+    int selectedRow = -1;
+    {
+        const QSignalBlocker blocker(m_trackList);
+        m_trackList->clear();
+        for (int row = 0; row < m_tracks.size(); ++row) {
+            const auto &curve = m_tracks[row];
+            auto *item = new QListWidgetItem(
+                QStringLiteral("%1\n%2 keyframes")
+                    .arg(curve.displayName)
+                    .arg(curve.track.count()),
+                m_trackList);
+        item->setData(Qt::UserRole, curve.propertyName);
+            item->setForeground(QBrush(curve.color));
+            item->setToolTip(QStringLiteral("%1\n%2")
+                                 .arg(curve.propertyName)
+                                 .arg(curve.track.keyframes().isEmpty()
+                                      ? QStringLiteral("No keyframes")
+                                      : interpolationLabel(curve.track.keyframes().first().interpolation)));
+            if (curve.propertyName == selectedProperty)
+                selectedRow = row;
+        }
+        if (!m_tracks.isEmpty()) {
+            const int restoredRow = selectedRow >= 0 ? selectedRow : 0;
+            m_trackList->setCurrentRow(restoredRow);
+            m_selectedProperty = m_tracks[restoredRow].propertyName;
+        }
     }
 
     if (m_tracks.isEmpty()) {
         showEmptyState(QStringLiteral("Selected clip has no keyframe tracks"));
         return;
     }
+
+    syncLoopOutControl();
 
     m_statusLabel->setText(QStringLiteral("V%1 Clip %2  |  %3 tracks  |  %4s")
                                .arg(m_trackIdx + 1)
@@ -1282,4 +1366,34 @@ void GraphEditorPanel::showEmptyState(const QString &message)
         m_trackList->clear();
     if (m_curveView)
         m_curveView->setCurves({}, 1.0, 0.0);
+    syncLoopOutControl();
+}
+
+void GraphEditorPanel::syncLoopOutControl()
+{
+    if (!m_loopOutCombo)
+        return;
+
+    bool hasSelectedTrack = false;
+    LoopMode mode = LoopMode::None;
+    const int row = m_trackList ? m_trackList->currentRow() : -1;
+    if (m_timeline
+        && row >= 0
+        && row < m_tracks.size()
+        && m_trackIdx >= 0
+        && m_trackIdx < m_timeline->videoTracks().size()) {
+        const auto *timelineTrack = m_timeline->videoTracks().value(m_trackIdx, nullptr);
+        if (timelineTrack) {
+            const auto &clips = timelineTrack->clips();
+            if (m_clipIdx >= 0 && m_clipIdx < clips.size()) {
+                hasSelectedTrack = true;
+                mode = clips[m_clipIdx].keyframes.loopOutMode(m_tracks[row].propertyName);
+            }
+        }
+    }
+
+    const QSignalBlocker blocker(m_loopOutCombo);
+    const int index = m_loopOutCombo->findData(static_cast<int>(mode));
+    m_loopOutCombo->setCurrentIndex(index >= 0 ? index : 0);
+    m_loopOutCombo->setEnabled(hasSelectedTrack);
 }
