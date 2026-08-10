@@ -1099,7 +1099,6 @@ GraphEditorPanel::GraphEditorPanel(QWidget *parent)
     m_loopOutCombo->addItem(QStringLiteral("PingPong"), static_cast<int>(LoopMode::PingPong));
     m_loopOutCombo->addItem(QStringLiteral("Continue"), static_cast<int>(LoopMode::Continue));
     m_loopOutCombo->setEnabled(false);
-    m_loopOutCombo->setAccessibleName(QStringLiteral("Loop Out"));
     m_loopOutCombo->setAccessibleDescription(
         QStringLiteral("Continue uses linear continuation after the last keyframe."));
     m_loopOutCombo->setItemData(
