@@ -626,6 +626,7 @@ public:
     void zoomIn();
     void zoomOut();
     void setZoomLevel(double pixelsPerSecond);
+    double zoomLevel() const { return m_zoomLevel; }
 
     // I/O markers
     void markIn();

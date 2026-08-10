@@ -638,7 +638,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "exposure-aids",      "VEDITOR_EXPOSURE_AIDS_SELFTEST",      runExposureAidsSelftest,        false,
       "ExposureAids: luma709 oracle + False Color zones + Zebra stripe period + Focus Peaking edge/threshold + dimension/OOB safety (11 gates)" },
     { "import-ingest",      "VEDITOR_IMPORT_INGEST_SELFTEST",      runImportIngestSelftest,        false,
-      "ImportHub ingest previews: mesh wireframe determinism + empty placeholder (QApplication-free)" },
+      "ImportHub ingest previews: mesh wireframe determinism + empty-state rendering (QApplication-free)" },
     { "layer-style",        "VEDITOR_LAYER_STYLE_SELFTEST",        runLayerStyleSelftest,          false,
       "LayerStyle: identity fast path, drop shadow, stroke, and project JSON omission/round-trip" },
     { "layer-style-ui",     "VEDITOR_LAYER_STYLE_UI_SELFTEST",     runLayerStyleUiSelftest,       true,
