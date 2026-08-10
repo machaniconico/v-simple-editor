@@ -8454,6 +8454,7 @@ void MainWindow::exportVideo()
         job.height = m_projectConfig.height;
     }
     job.bitrateBps = static_cast<qint64>(exportCfg.videoBitrate) * 1000;
+    job.codec = exportCfg.videoCodec;
     job.startUs = 0;
     job.endUs   = 0;   // 0 = whole timeline
     // The additive in-memory edit-graph seam — the SAME pattern PARITY S8
@@ -8469,6 +8470,8 @@ void MainWindow::exportVideo()
     cfg["height"]       = job.height;
     cfg["fps"]          = exportCfg.fps > 0 ? exportCfg.fps : 30;
     cfg["videoCodec"]   = exportCfg.videoCodec;     // already ffmpeg-named
+    cfg["hwEncoder"]    = exportCfg.hwEncoder;
+    cfg["useHardwareAccel"] = exportCfg.useHardwareAccel;
     cfg["videoBitrate"] = exportCfg.videoBitrate;   // kbps
     cfg["audioCodec"]   = exportCfg.audioCodec;
     cfg["audioBitrate"] = exportCfg.audioBitrate;
@@ -14182,6 +14185,7 @@ void MainWindow::onMobileExport()
                     job.height  = cfg.height > 0 ? cfg.height : 1080;
                     job.bitrateBps =
                         static_cast<qint64>(cfg.videoBitrate) * 1000;
+                    job.codec = cfg.videoCodec;
                     job.startUs = 0;
                     job.endUs   = 0;
                     job.timeline = m_timeline;
@@ -14190,6 +14194,8 @@ void MainWindow::onMobileExport()
                     jcfg["height"]       = job.height;
                     jcfg["fps"]          = cfg.fps > 0 ? cfg.fps : 30;
                     jcfg["videoCodec"]   = cfg.videoCodec;
+                    jcfg["hwEncoder"]    = cfg.hwEncoder;
+                    jcfg["useHardwareAccel"] = cfg.useHardwareAccel;
                     jcfg["videoBitrate"] = cfg.videoBitrate;
                     jcfg["audioCodec"]   = cfg.audioCodec;
                     jcfg["audioBitrate"] = cfg.audioBitrate;

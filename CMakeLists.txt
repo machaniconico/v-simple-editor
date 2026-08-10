@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 project(v-simple-editor VERSION 0.14.0 LANGUAGES CXX)
 
-set(VEDITOR_EDITION "classic" CACHE STRING "Build edition: classic (H.264/HEVC) | modern (+ AV1)")
+set(VEDITOR_EDITION "classic" CACHE STRING "Build edition: classic (H.264/HEVC software baseline; hardware AV1 when available) | modern (+ bundled AOM AV1 fallback)")
 set_property(CACHE VEDITOR_EDITION PROPERTY STRINGS classic modern)
 message(STATUS "VEDITOR_EDITION = ${VEDITOR_EDITION}")
 option(VEDITOR_PLANAR_TRACKER_SELFTEST "Enable the planar tracker synthetic self-test helper" OFF)
@@ -359,6 +359,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/exposure_aids_selftests.cpp
     # GPU compositor math (Stage 1 dormant pure engine + headless selftest)。
     src/selftests/gpu_composite_flag_selftest.cpp
+    src/selftests/radeon_amf_selftest.cpp
     src/playback/GpuCompositeMath.h
     src/playback/GpuCompositeMath.cpp
     src/selftests/gpu_composite_math_selftests.cpp
@@ -895,6 +896,15 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     ${SWSCALE_LIBRARY}
     ${SWRESAMPLE_LIBRARY}
     ${AVFILTER_LIBRARY}
+)
+
+# Keep dependency notices beside every executable configuration so copying a
+# Release/Debug output directory cannot silently omit the AMF/AOM obligations.
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/docs/THIRD_PARTY_NOTICES.md"
+            "$<TARGET_FILE_DIR:${PROJECT_NAME}>/THIRD_PARTY_NOTICES.md"
+    COMMENT "Copying third-party dependency notices"
 )
 
 # Sprint 16 / US-AFF-1 / US-BLE-1: optional Qt6::Svg / Qt6::Pdf / assimp links.

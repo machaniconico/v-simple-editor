@@ -14,6 +14,37 @@ struct InputCtxGuard {
     }
 };
 
+bool supportsTenBitHevcInput(const AVCodec* codec)
+{
+#if LIBAVCODEC_VERSION_MAJOR >= 61
+    const void* cfgList = nullptr;
+    int count = 0;
+    const int ret = avcodec_get_supported_config(
+        nullptr, codec, AV_CODEC_CONFIG_PIX_FORMAT, 0, &cfgList, &count);
+    if (ret < 0 || cfgList == nullptr || count <= 0)
+        return false;
+
+    const auto* formats = static_cast<const AVPixelFormat*>(cfgList);
+    for (int i = 0; i < count; ++i) {
+        if (formats[i] == AV_PIX_FMT_YUV420P10LE
+            || formats[i] == AV_PIX_FMT_P010LE) {
+            return true;
+        }
+    }
+#else
+    if (!codec || !codec->pix_fmts)
+        return false;
+    for (const AVPixelFormat* format = codec->pix_fmts;
+         *format != AV_PIX_FMT_NONE; ++format) {
+        if (*format == AV_PIX_FMT_YUV420P10LE
+            || *format == AV_PIX_FMT_P010LE) {
+            return true;
+        }
+    }
+#endif
+    return false;
+}
+
 } // namespace
 
 bool encoderAvailable(const std::string& codecName)
@@ -69,7 +100,8 @@ std::optional<std::string> probeVideoCodecName(const std::string& filePath)
     return std::nullopt;
 }
 
-std::optional<std::string> firstTenBitHevcEncoder()
+std::optional<std::string> firstTenBitHevcEncoder(
+    const std::function<bool(const std::string&)>& runtimeAvailable)
 {
     static const char* const kCandidates[] = {
         "libx265", "hevc_nvenc", "hevc_qsv", "hevc_amf"
@@ -79,32 +111,18 @@ std::optional<std::string> firstTenBitHevcEncoder()
         const AVCodec* codec = avcodec_find_encoder_by_name(name);
         if (!codec) continue;
 
-        // Query supported pixel formats via FFmpeg 8 API.
-        // avcodec_get_supported_config replaces the deprecated AVCodec::pix_fmts.
-        const void* cfgList = nullptr;
-        int count = 0;
-        int ret = avcodec_get_supported_config(
-            nullptr, codec,
-            AV_CODEC_CONFIG_PIX_FORMAT,
-            /*flags=*/0,
-            &cfgList,
-            &count);
-
-        // Treat query failure, NULL list, or empty list as "not 10-bit capable".
-        if (ret < 0 || cfgList == nullptr || count <= 0) continue;
-
-        const AVPixelFormat* fmts = static_cast<const AVPixelFormat*>(cfgList);
-        bool tenBit = false;
-        for (int i = 0; i < count; ++i) {
-            if (fmts[i] == AV_PIX_FMT_YUV420P10LE ||
-                fmts[i] == AV_PIX_FMT_P010LE) {
-                tenBit = true;
-                break;
-            }
+        if (supportsTenBitHevcInput(codec)) {
+            const std::string candidate(name);
+            if (!runtimeAvailable || runtimeAvailable(candidate))
+                return candidate;
         }
-        if (tenBit) return std::string(name);
     }
     return std::nullopt;
+}
+
+std::optional<std::string> firstTenBitHevcEncoder()
+{
+    return firstTenBitHevcEncoder({});
 }
 
 bool tenBitHevcEncoderAvailable()

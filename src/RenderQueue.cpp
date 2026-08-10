@@ -380,6 +380,37 @@ RenderQueue::RenderQueue(QObject *parent)
 {
 }
 
+void RenderQueue::applyHardwareEncodingConfig(
+    const QJsonObject &config,
+    libavcore::EncodeRequest &request)
+{
+    QString vendor = config.value(QStringLiteral("hwEncoder"))
+                         .toString()
+                         .trimmed()
+                         .toLower();
+    bool enabled = config.contains(QStringLiteral("useHardwareAccel"))
+        ? config.value(QStringLiteral("useHardwareAccel")).toBool()
+        : (!vendor.isEmpty() && vendor != QLatin1String("none"));
+
+    if (!enabled || vendor == QLatin1String("none")) {
+        request.useHardwareAccel = false;
+        request.hwVendorHint = "none";
+        return;
+    }
+
+    if (vendor.isEmpty())
+        vendor = QStringLiteral("auto");
+    if (vendor != QLatin1String("auto")
+        && vendor != QLatin1String("nvenc")
+        && vendor != QLatin1String("qsv")
+        && vendor != QLatin1String("amf")) {
+        vendor = QStringLiteral("auto");
+    }
+
+    request.useHardwareAccel = true;
+    request.hwVendorHint = vendor.toStdString();
+}
+
 RenderQueue::~RenderQueue()
 {
     m_cancelRequested = true;
@@ -488,7 +519,15 @@ void RenderQueue::addJob(const RenderJob &job)
             : m_loudnessGainDb);
     cfg["width"] = copy.width;
     cfg["height"] = copy.height;
-    cfg["videoCodec"] = mapCodecToEncoderName(copy.codec);
+    const QString explicitCodec =
+        cfg.value(QStringLiteral("videoCodec")).toString().trimmed();
+    if (explicitCodec.isEmpty()) {
+        cfg["videoCodec"] = mapCodecToEncoderName(copy.codec);
+    } else {
+        // RenderJob::codec defaults to "h264". Do not let that legacy flat
+        // default overwrite the concrete codec selected by ExportDialog.
+        copy.codec = explicitCodec;
+    }
     cfg["videoBitrate"] = copy.bitrateBps / 1000;  // legacy config stores kbps
     if (!copy.preset.isEmpty())
         cfg["preset"] = copy.preset;
@@ -900,10 +939,11 @@ void RenderQueue::startNextJob()
 // Frames always come from tlrender::renderFrameAt (the SSOT edit graph). The
 // SINK depends on the job:
 //   • 10-bit HDR (HDR10 / HLG) AND the loaded avcodec DLL exposes a 10-bit
-//     HEVC encoder (libx265 / hevc_nvenc / hevc_qsv / hevc_amf — probed at
-//     runtime via libavcore::tenBitHevcEncoderAvailable) → in-process
+//     HEVC encoder (libx265 / hevc_nvenc / hevc_qsv / hevc_amf — filtered by
+//     both static capability and a real runtime open) → in-process
 //     libavcore::FrameEncoder path, with request.videoCodecName overridden to
-//     libavcore::firstTenBitHevcEncoder() and isHdr10/isHlg + hdrMaster*
+//     libavcore::firstTenBitHevcEncoder(runtimePredicate) and
+//     isHdr10/isHlg + hdrMaster*
 //     populated. The encoder writes a genuine 10-bit HEVC yuv420p10le stream
 //     with the BT.2020/PQ|HLG colour signalling FrameEncoder already wires up
 //     (the same code path that handles main10 / HDR10 side-data was always
@@ -917,7 +957,7 @@ void RenderQueue::startNextJob()
 //     libavcore::FrameEncoder path below, unchanged from US-MF-5.
 //
 // The 8-bit routing is unchanged: only HDR jobs consult
-// tenBitHevcEncoderAvailable; an 8-bit job never visits the subprocess
+// the runtime-aware 10-bit probe; an 8-bit job never visits the subprocess
 // fallback. Drop-in replacing the bundled DLL with a libx265-enabled build
 // flips HDR jobs to the in-process path automatically — no recompile needed.
 void RenderQueue::startRenderPipe(int jobIndex)
@@ -953,7 +993,13 @@ void RenderQueue::startRenderPipe(int jobIndex)
             // 10-bit HEVC encoder is present, fall through to the in-process
             // FrameEncoder path (videoCodecName + isHdr10/isHlg are set
             // below) which can emit a genuine 10-bit HDR stream directly.
-            if (!libavcore::tenBitHevcEncoderAvailable()) {
+            const auto usableTenBitEncoder =
+                libavcore::firstTenBitHevcEncoder(
+                    [](const std::string &name) {
+                        return CodecDetector::isTenBitEncoderAvailable(
+                            QString::fromStdString(name));
+                    });
+            if (!usableTenBitEncoder.has_value()) {
                 startRenderPipeSubprocess(jobIndex);
                 return;
             }
@@ -1116,7 +1162,11 @@ void RenderQueue::startRenderPipe(int jobIndex)
         && videoCodec != QLatin1String("hevc_nvenc")
         && videoCodec != QLatin1String("hevc_qsv")
         && videoCodec != QLatin1String("hevc_amf")) {
-        const auto probed = libavcore::firstTenBitHevcEncoder();
+        const auto probed = libavcore::firstTenBitHevcEncoder(
+            [](const std::string &name) {
+                return CodecDetector::isTenBitEncoderAvailable(
+                    QString::fromStdString(name));
+            });
         if (probed.has_value() && !probed->empty())
             videoCodec = QString::fromStdString(*probed);
         else
@@ -1207,6 +1257,7 @@ void RenderQueue::startRenderPipe(int jobIndex)
             static_cast<int64_t>(videoBitrateKbps) * 1000;
     }
     request.videoCodecName = videoCodec.toUtf8().toStdString();
+    applyHardwareEncodingConfig(cfg, request);
     request.isHdr10 = isHdr10;
     request.isHlg = isHlg;
     request.proresProfile = proresProfile;
@@ -1250,6 +1301,10 @@ void RenderQueue::startRenderPipe(int jobIndex)
                     + QString::fromStdString(*err);
                 return false;
             }
+            qInfo().noquote()
+                << QStringLiteral("[render-queue] encoder=%1 requested-hw=%2")
+                       .arg(QString::fromStdString(encoder.activeEncoderName()),
+                            QString::fromStdString(request.hwVendorHint));
 
             const QSize outSize(outW, outH);
             const int rgbRowBytes = outW * 3;
@@ -1382,7 +1437,7 @@ void RenderQueue::startRenderPipe(int jobIndex)
 
 // US-MF-6 / US-B3-7: 10-bit HDR (HDR10 / HLG) subprocess fallback branch.
 // Reached only when startRenderPipe() determined the loaded avcodec DLL has
-// no 10-bit HEVC encoder (libavcore::tenBitHevcEncoderAvailable() == false).
+// no runtime-usable 10-bit HEVC encoder.
 // When the bundled avcodec DLL is in use this is the active HDR path: it
 // ships neither libx264/libx265 nor a 10-bit MediaFoundation encoder
 // (h264_mf/hevc_mf are 8-bit only), so the in-process libavcore::FrameEncoder
@@ -1442,8 +1497,8 @@ void RenderQueue::startRenderPipeSubprocess(int jobIndex)
             // US-B3-7: surface the genuine requirement so users can fix
             // their environment instead of seeing a silent failure. The
             // subprocess path is only reached when the loaded avcodec DLL
-            // has no 10-bit HEVC encoder (libavcore::tenBitHevcEncoderAvailable
-            // returned false), and libx265-enabled ffmpeg.exe is what
+            // has no runtime-usable 10-bit HEVC encoder, and a libx265-enabled
+            // ffmpeg.exe is what
             // produces the genuine HDR10/HLG stream the in-process path
             // cannot.
             finishCurrentJob(false, QStringLiteral(
@@ -2034,7 +2089,7 @@ QString RenderQueue::mapCodecToEncoderName(const QString &codec)
     // libavcore encoder name the render-pipe expects.
     if (codec == "h264") return "libx264";
     if (codec == "hevc" || codec == "h265") return "libx265";
-    if (codec == "av1") return "libsvtav1";
+    if (codec == "av1") return "libaom-av1";
     if (codec == "prores") return "prores_ks";
     return codec;  // already-prefixed names pass through (libx264, libvpx-vp9...)
 }

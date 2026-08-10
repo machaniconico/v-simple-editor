@@ -19,6 +19,7 @@
 //   automatically — no recompile needed.
 // ===========================================================================
 
+#include <functional>
 #include <optional>
 #include <string>
 
@@ -49,12 +50,19 @@ std::optional<std::string> probeVideoCodecName(const std::string& filePath);
 // avcodec DLL, probing in priority order: libx265, hevc_nvenc, hevc_qsv,
 // hevc_amf.  An encoder qualifies only if avcodec_find_encoder_by_name()
 // finds it AND it reports support for AV_PIX_FMT_YUV420P10LE or
-// AV_PIX_FMT_P010LE via avcodec_get_supported_config() (FFmpeg 8 API).
+// AV_PIX_FMT_P010LE via avcodec_get_supported_config() (libavcodec 61+) or
+// the legacy AVCodec::pix_fmts list (libavcodec 60).
 // An empty or NULL pixel-format list is treated as "not 10-bit capable"
 // (no optimistic fallback).  hevc_mf is intentionally excluded because
 // MediaFoundation silently downgrades 10-bit input to 8-bit NV12.
 // Returns std::nullopt when no qualifying encoder is found.
 std::optional<std::string> firstTenBitHevcEncoder();
+
+// Same ordered capability probe, additionally filtering each qualifying name
+// through a caller-supplied runtime predicate. This lets Qt-side callers
+// reject a compiled hardware wrapper whose vendor runtime cannot open.
+std::optional<std::string> firstTenBitHevcEncoder(
+    const std::function<bool(const std::string&)>& runtimeAvailable);
 
 // Convenience wrapper: returns true iff firstTenBitHevcEncoder() has a value.
 bool tenBitHevcEncoderAvailable();

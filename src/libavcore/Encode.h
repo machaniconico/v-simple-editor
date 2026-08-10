@@ -17,6 +17,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <vector>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -62,9 +63,9 @@ struct EncodeRequest {
     int audioChannels = 2;
     int64_t audioBitrateBits = 192000;
 
-    // Preferred video encoder name. If an H.264/H.265 encoder is unavailable
-    // or fails to open, FrameEncoder walks its ordered fallback chain.
-    std::string videoCodecName;         // "libx264", "h264_nvenc", "libx265", "libsvtav1", "libvpx-vp9", "prores_ks", ...
+    // Preferred video encoder name. If an H.264/H.265/AV1 encoder is
+    // unavailable or fails to open, FrameEncoder walks the same-family chain.
+    std::string videoCodecName;         // "libx264", "libx265", "libaom-av1", "libsvtav1", "librav1e", ...
 
     // HW selection hint mirroring ExportConfig::hwEncoder ("", "auto", "nvenc",
     // "qsv", "amf", "none"). Empty string means software-only.
@@ -84,17 +85,22 @@ struct EncodeRequest {
     int hdrMaxCll = 1000;
     int hdrMaxFall = 400;
 
-    // [P1-M1] Optional runtime probe for encoder availability. When set,
-    // openEncoderWithFallback() consults this hook for each SW/MF/HW/fallback
-    // candidate name BEFORE avcodec_find_encoder_by_name(); a hook returning
-    // false skips the candidate. Default (nullptr) treats every candidate as
-    // available (legacy behavior of pure avcodec_find_encoder_by_name probe).
-    // Used by Exporter to restore CodecDetector::isEncoderAvailable()
-    // functional-probe semantics that were dropped during the libavcore
-    // refactor. Kept as std::function (not Qt callable) so the header stays
-    // Qt-free.
+    // Optional availability hook. CodecDetector runtime-opens AMF/NVENC/QSV
+    // once per process and uses registration checks for other encoders. A
+    // false result skips the candidate before FrameEncoder performs its real
+    // open with the requested dimensions/options. Default (nullptr) keeps the
+    // legacy avcodec_find_encoder_by_name-only behavior. std::function keeps
+    // this header Qt-free.
     std::function<bool(const std::string&)> encoderAvailableHook;
 };
+
+// Ordered encoder policy used by FrameEncoder::open(). Exposed so callers and
+// headless selftests can report/verify the exact hardware-to-software fallback
+// contract without opening a GPU session.
+std::vector<std::string> videoEncoderCandidateNames(const EncodeRequest& request);
+
+// True for the concrete FFmpeg hardware encoders supported by the policy.
+bool isHardwareVideoEncoderName(const std::string& name);
 
 // RAII encoder session. Construct, then call open(), then pushFrameRgb24()
 // repeatedly with monotonically-increasing pts, then finalize() once.

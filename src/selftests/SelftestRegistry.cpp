@@ -210,6 +210,7 @@ int runGpuIdtParitySelftest();
 int runGpuIdtMatteParitySelftest();
 int runHdrCompositeParitySelftest();
 int runPreview16PolicySelftest();
+int runRadeonAmfSelftest();
 
 namespace {
 
@@ -618,6 +619,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "GPU合成フラグ解決(env OR settings)の純粋リゾルバ検証" },
     { "gpu-composite-math", "VEDITOR_GPU_COMPOSITE_MATH_SELFTEST", runGpuCompositeMathSelftest, false,
       "GpuCompositeMath: paint order, layer transform matrix, premul source-over, matte validity (15 gates)" },
+    { "radeon-amf", "VEDITOR_RADEON_AMF_SELFTEST", runRadeonAmfSelftest, false,
+      "Radeon AMF encoder policy: H.264/HEVC/AV1 priority, software fallback, hardware classification" },
     { "hdr-composite-math", "VEDITOR_HDR_COMPOSITE_MATH_SELFTEST", runHdrCompositeMathSelftest, false,
       "HdrCompositeMath: 16-bit premul source-over + 8-bit SSOT parity + extra-precision proof + paint order (6 gates)" },
     { "hdr-export16",     "VEDITOR_HDR_EXPORT16_SELFTEST",       runHdrExport16Selftest,       false,

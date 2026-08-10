@@ -1178,12 +1178,9 @@ int runProxySelftestV2()
 //
 // Validates three invariants without spawning any subprocess or QProcess:
 //
-//   (1) DLL-ready contract: the bundled avcodec-62.dll ships without
-//       libx265/nvenc/qsv/amf, so firstTenBitHevcEncoder() must return
-//       std::nullopt and tenBitHevcEncoderAvailable() must return false.
-//       When a full-featured DLL (libx265 or HW encoder enabled) is
-//       dropped in, these will return true and the routing logic below
-//       will automatically select the in-process path — no recompile needed.
+//   (1) DLL-ready contract: detection is internally consistent, returns only
+//       a supported HEVC candidate, and honors a runtime predicate that rejects
+//       registered wrappers whose vendor runtime cannot open.
 //
 //   (2) HDR routing predicate: exercises all three branches of the US-B3-7
 //       routing rule via truth-value combinations, not by instantiating a
@@ -1204,38 +1201,38 @@ int runHdrRoutingSelftest()
     // -----------------------------------------------------------------------
     // (1) DLL-ready contract
     // -----------------------------------------------------------------------
-    // The bundled avcodec-62.dll is built without libx265/nvenc/qsv/amf.
-    // Expect std::nullopt / false on the stock build.  A drop-in DLL that
-    // enables any of those encoders will make these assertions fail, which is
-    // the desired signal that the in-process routing path is now reachable.
     auto firstEnc = libavcore::firstTenBitHevcEncoder();
     bool tenBitOk = libavcore::tenBitHevcEncoderAvailable();
 
     if (firstEnc.has_value()) {
         qInfo() << "[INFO] HDR-ROUTING selftest: firstTenBitHevcEncoder ="
                 << QString::fromStdString(*firstEnc)
-                << "(non-null: DLL now carries a 10-bit HEVC encoder;"
-                << "in-process HDR routing is active)";
+                << "(linked FFmpeg advertises a 10-bit HEVC encoder)";
     } else {
         qInfo() << "[INFO] HDR-ROUTING selftest: firstTenBitHevcEncoder = nullopt"
-                << "(stock DLL: libx265/nvenc/qsv/amf absent — expected)";
+                << "(no qualifying encoder is linked)";
     }
     qInfo() << "[INFO] HDR-ROUTING selftest: tenBitHevcEncoderAvailable =" << tenBitOk;
 
-    // Assert stock-DLL contract: no 10-bit HEVC encoder present.
-    // If this assertion ever fails it means the DLL was upgraded and the
-    // in-process HDR path is now live — update this selftest to expect true.
-    if (firstEnc.has_value()) {
-        qCritical() << "HDR-ROUTING selftest FAILED (1): firstTenBitHevcEncoder"
-                    << "returned" << QString::fromStdString(*firstEnc)
-                    << "but stock avcodec-62.dll should have no 10-bit HEVC encoder."
-                    << "If the DLL was intentionally upgraded, update this check.";
+    if (tenBitOk != firstEnc.has_value()) {
+        qCritical() << "HDR-ROUTING selftest FAILED (1): convenience result"
+                    << "does not match firstTenBitHevcEncoder().";
         passed = false;
     }
-    if (tenBitOk) {
-        qCritical() << "HDR-ROUTING selftest FAILED (1): tenBitHevcEncoderAvailable"
-                    << "returned true but stock avcodec-62.dll should return false."
-                    << "If the DLL was intentionally upgraded, update this check.";
+    if (firstEnc.has_value()
+        && *firstEnc != "libx265"
+        && *firstEnc != "hevc_nvenc"
+        && *firstEnc != "hevc_qsv"
+        && *firstEnc != "hevc_amf") {
+        qCritical() << "HDR-ROUTING selftest FAILED (1): unsupported candidate"
+                    << QString::fromStdString(*firstEnc);
+        passed = false;
+    }
+    const auto runtimeRejected = libavcore::firstTenBitHevcEncoder(
+        [](const std::string &) { return false; });
+    if (runtimeRejected.has_value()) {
+        qCritical() << "HDR-ROUTING selftest FAILED (1): runtime predicate"
+                    << "did not reject every registered candidate.";
         passed = false;
     }
 
