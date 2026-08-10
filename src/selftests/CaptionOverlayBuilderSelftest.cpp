@@ -1144,6 +1144,22 @@ int runCaptionOverlayBuilderSelftest()
     }};
     EnhancedTextOverlay remotionCaption = makeNamedOverlay(
         QStringLiteral("CENTRAL_CAPTION_CROSSES_CLIP_BOUNDARY"), reserved, 0.75, 1.25);
+    remotionCaption.font = QFont(QStringLiteral("Noto Sans"), 37, QFont::DemiBold, true);
+    remotionCaption.color = QColor(12, 34, 56, 200);
+    remotionCaption.backgroundColor = QColor(3, 4, 5, 96);
+    remotionCaption.outlineColor = QColor(9, 8, 7, 255);
+    remotionCaption.outlineWidth = 3;
+    remotionCaption.shadow.enabled = true;
+    remotionCaption.shadow.offsetX = 2.5;
+    remotionCaption.shadow.offsetY = 3.5;
+    remotionCaption.shadow.blur = 4.5;
+    remotionCaption.shadow.color = QColor(1, 2, 3, 128);
+    remotionCaption.shadow.opacity = 0.5;
+    remotionCaption.width = 0.42;
+    remotionCaption.alignment = Qt::AlignRight;
+    remotionCaption.wordWrap = false;
+    remotionCaption.letterSpacing = 1.25;
+    remotionCaption.lineSpacing = 3.5;
     remotionData.generatedCaptionOverlays = {remotionCaption};
 
     RemotionExportConfig remotionConfig;
@@ -1175,6 +1191,8 @@ int runCaptionOverlayBuilderSelftest()
     const QString videoTsx = readGeneratedSource(remotionBase + QStringLiteral("/Video.tsx"));
     const QString timelineTs = readGeneratedSource(
         remotionBase + QStringLiteral("/lib/timeline.ts"));
+    const QString textOverlayTsx = readGeneratedSource(
+        remotionBase + QStringLiteral("/components/TextOverlay.tsx"));
     const QString captionSentinel = remotionCaption.text;
     const QString expectedRootVideoBlock = QStringLiteral(
         "      <Sequence from={23} durationInFrames={15}>\n"
@@ -1182,18 +1200,79 @@ int runCaptionOverlayBuilderSelftest()
         "          text={\"CENTRAL_CAPTION_CROSSES_CLIP_BOUNDARY\"}");
     const QString expectedRootTimelineBlock = QStringLiteral(
         "  textOverlays: [\n"
-        "    { text: \"CENTRAL_CAPTION_CROSSES_CLIP_BOUNDARY\", "
-        "startFrame: 23, durationInFrames: 15,");
+        "    {\n"
+        "      text: \"CENTRAL_CAPTION_CROSSES_CLIP_BOUNDARY\",\n"
+        "      startFrame: 23,\n"
+        "      durationInFrames: 15,");
+    const QStringList expectedRootStyle = {
+        QStringLiteral("          fontFamily={\"Noto Sans\"}"),
+        QStringLiteral("          fontSize={\"37pt\"}"),
+        QStringLiteral("          fontWeight={600}"),
+        QStringLiteral("          fontStyle={\"italic\"}"),
+        QStringLiteral("          color={\"rgba(12, 34, 56, 0.784)\"}"),
+        QStringLiteral("          backgroundColor={\"rgba(3, 4, 5, 0.376)\"}"),
+        QStringLiteral("          outlineColor={\"rgba(9, 8, 7, 1.000)\"}"),
+        QStringLiteral("          outlineWidth={3}"),
+        QStringLiteral("          textShadow={\"2.5px 3.5px 4.5px rgba(1, 2, 3, 0.251)\"}"),
+        QStringLiteral("          boxWidth={0.42}"),
+        QStringLiteral("          textAlign={\"right\"}"),
+        QStringLiteral("          wordWrap={false}"),
+        QStringLiteral("          letterSpacing={1.25}"),
+        QStringLiteral("          lineSpacing={3.5}"),
+    };
+    const QStringList expectedTimelineStyle = {
+        QStringLiteral("      fontFamily: \"Noto Sans\","),
+        QStringLiteral("      fontSize: \"37pt\","),
+        QStringLiteral("      fontWeight: 600,"),
+        QStringLiteral("      fontStyle: \"italic\","),
+        QStringLiteral("      color: \"rgba(12, 34, 56, 0.784)\","),
+        QStringLiteral("      backgroundColor: \"rgba(3, 4, 5, 0.376)\","),
+        QStringLiteral("      outlineColor: \"rgba(9, 8, 7, 1.000)\","),
+        QStringLiteral("      outlineWidth: 3,"),
+        QStringLiteral("      textShadow: \"2.5px 3.5px 4.5px rgba(1, 2, 3, 0.251)\","),
+        QStringLiteral("      boxWidth: 0.42,"),
+        QStringLiteral("      textAlign: \"right\","),
+        QStringLiteral("      wordWrap: false,"),
+        QStringLiteral("      letterSpacing: 1.25,"),
+        QStringLiteral("      lineSpacing: 3.5,"),
+    };
+    const QStringList expectedComponentStyleContract = {
+        QStringLiteral("  fontFamily?: string;"),
+        QStringLiteral("  fontSize?: string;"),
+        QStringLiteral("  textShadow?: string;"),
+        QStringLiteral("  boxWidth?: number;"),
+        QStringLiteral("        fontFamily,"),
+        QStringLiteral("        fontSize,"),
+        QStringLiteral("        backgroundColor,"),
+        QStringLiteral("        WebkitTextStroke: outlineWidth > 0"),
+        QStringLiteral("        width: boxWidth > 0"),
+        QStringLiteral("        textAlign,"),
+        QStringLiteral("        whiteSpace: wordWrap ? 'pre-wrap' : 'nowrap',"),
+        QStringLiteral("        letterSpacing,"),
+        QStringLiteral("        lineHeight: lineSpacing !== 0"),
+        QStringLiteral("        textShadow,"),
+    };
+    auto containsEvery = [](const QString &source, const QStringList &needles) {
+        for (const QString &needle : needles) {
+            if (!source.contains(needle))
+                return false;
+        }
+        return true;
+    };
     const bool remotionCaptionIsCentralAndUnique = remotionExported
         && !videoTsx.isEmpty()
         && !timelineTs.isEmpty()
+        && !textOverlayTsx.isEmpty()
         && videoTsx.count(captionSentinel) == 1
         && timelineTs.count(captionSentinel) == 1
         && videoTsx.count(QStringLiteral("Video Track 0 Clip ")) == 2
         && timelineTs.count(QStringLiteral("textOverlays: [")) == 1
         && videoTsx.contains(expectedRootVideoBlock)
-        && timelineTs.contains(expectedRootTimelineBlock);
-    check(17, "Remotion exports one central caption across multiple clips without duplication",
+        && timelineTs.contains(expectedRootTimelineBlock)
+        && containsEvery(videoTsx, expectedRootStyle)
+        && containsEvery(timelineTs, expectedTimelineStyle)
+        && containsEvery(textOverlayTsx, expectedComponentStyleContract);
+    check(17, "Remotion exports one styled central caption across clips without duplication",
           remotionCaptionIsCentralAndUnique, remotionError);
 
     qInfo().noquote() << QStringLiteral("[caption-overlay-builder] summary: %1 PASS, %2 FAIL")
