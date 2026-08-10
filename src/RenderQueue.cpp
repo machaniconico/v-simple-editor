@@ -411,6 +411,25 @@ void RenderQueue::applyHardwareEncodingConfig(
     request.hwVendorHint = vendor.toStdString();
 }
 
+namespace {
+
+std::optional<std::string> configuredTenBitHevcEncoder(
+    const QJsonObject &config)
+{
+    libavcore::EncodeRequest policy;
+    RenderQueue::applyHardwareEncodingConfig(config, policy);
+    const auto candidates = libavcore::tenBitHevcEncoderCandidateNames(
+        policy.useHardwareAccel, policy.hwVendorHint);
+    return libavcore::firstTenBitHevcEncoder(
+        candidates,
+        [](const std::string &name) {
+            return CodecDetector::isTenBitEncoderAvailable(
+                QString::fromStdString(name));
+        });
+}
+
+} // namespace
+
 RenderQueue::~RenderQueue()
 {
     m_cancelRequested = true;
@@ -994,11 +1013,7 @@ void RenderQueue::startRenderPipe(int jobIndex)
             // FrameEncoder path (videoCodecName + isHdr10/isHlg are set
             // below) which can emit a genuine 10-bit HDR stream directly.
             const auto usableTenBitEncoder =
-                libavcore::firstTenBitHevcEncoder(
-                    [](const std::string &name) {
-                        return CodecDetector::isTenBitEncoderAvailable(
-                            QString::fromStdString(name));
-                    });
+                configuredTenBitHevcEncoder(cfg);
             if (!usableTenBitEncoder.has_value()) {
                 startRenderPipeSubprocess(jobIndex);
                 return;
@@ -1162,11 +1177,7 @@ void RenderQueue::startRenderPipe(int jobIndex)
         && videoCodec != QLatin1String("hevc_nvenc")
         && videoCodec != QLatin1String("hevc_qsv")
         && videoCodec != QLatin1String("hevc_amf")) {
-        const auto probed = libavcore::firstTenBitHevcEncoder(
-            [](const std::string &name) {
-                return CodecDetector::isTenBitEncoderAvailable(
-                    QString::fromStdString(name));
-            });
+        const auto probed = configuredTenBitHevcEncoder(cfg);
         if (probed.has_value() && !probed->empty())
             videoCodec = QString::fromStdString(*probed);
         else

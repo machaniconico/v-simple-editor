@@ -1,4 +1,10 @@
-# Third-party notices
+# Radeon/AV1 dependency notices
+
+This additive notice covers AMD AMF and libaom, the dependencies introduced
+for the Radeon/AV1 export path. It is not a complete inventory for every build
+variant or transitive dependency; the exact release artifact still requires a
+resolved SBOM, its corresponding license set, and the obligations recorded in
+`DEPENDENCY_COMPLIANCE.md`.
 
 ## AMD Advanced Media Framework (vcpkg-resolved version)
 

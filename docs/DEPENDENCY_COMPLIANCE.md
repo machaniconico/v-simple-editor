@@ -38,7 +38,8 @@ application keeps a software fallback for unsupported or unavailable sessions.
 
 ## FFmpeg build variants
 
-The repository does not currently produce a single FFmpeg license profile:
+The additive notice file covers the new AMF/AOM dependencies only. The
+repository does not currently produce a single FFmpeg license profile:
 
 - `setup.bat` and the Windows CI workflow request the core codec/filter features
   plus `aom` and `amf`, without x264 or x265.

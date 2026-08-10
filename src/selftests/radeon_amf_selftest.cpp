@@ -330,6 +330,25 @@ int runRadeonAmfSelftest()
     }
 #endif
 
+    const auto explicitAmfHdr =
+        libavcore::tenBitHevcEncoderCandidateNames(true, "amf");
+    check(34, "explicit AMD HDR policy does not spill into another vendor",
+          startsWith(explicitAmfHdr, "hevc_amf")
+          && std::find(explicitAmfHdr.begin(), explicitAmfHdr.end(),
+                       "hevc_nvenc") == explicitAmfHdr.end()
+          && std::find(explicitAmfHdr.begin(), explicitAmfHdr.end(),
+                       "hevc_qsv") == explicitAmfHdr.end()
+          && containsBefore(explicitAmfHdr, "hevc_amf", "libx265"));
+    const auto softwareHdr =
+        libavcore::tenBitHevcEncoderCandidateNames(false, "none");
+    check(35, "software-only HDR policy never selects a hardware encoder",
+          softwareHdr.size() == 1 && softwareHdr.front() == "libx265");
+    const auto automaticHdr =
+        libavcore::tenBitHevcEncoderCandidateNames(true, "auto");
+    check(36, "automatic HDR policy prefers GPU candidates before software",
+          startsWith(automaticHdr, "hevc_nvenc")
+          && containsBefore(automaticHdr, "hevc_amf", "libx265"));
+
     std::printf("[radeon-amf] host runtime: h264_amf=%s hevc_amf=%s "
                 "hevc_amf10=%s av1_amf=%s\n",
                 CodecDetector::isEncoderAvailable(QStringLiteral("h264_amf"))

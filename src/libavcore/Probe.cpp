@@ -101,23 +101,50 @@ std::optional<std::string> probeVideoCodecName(const std::string& filePath)
 }
 
 std::optional<std::string> firstTenBitHevcEncoder(
+    const std::vector<std::string>& candidates,
     const std::function<bool(const std::string&)>& runtimeAvailable)
 {
-    static const char* const kCandidates[] = {
-        "libx265", "hevc_nvenc", "hevc_qsv", "hevc_amf"
-    };
-
-    for (const char* name : kCandidates) {
-        const AVCodec* codec = avcodec_find_encoder_by_name(name);
+    for (const std::string& name : candidates) {
+        const AVCodec* codec = avcodec_find_encoder_by_name(name.c_str());
         if (!codec) continue;
 
         if (supportsTenBitHevcInput(codec)) {
-            const std::string candidate(name);
-            if (!runtimeAvailable || runtimeAvailable(candidate))
-                return candidate;
+            if (!runtimeAvailable || runtimeAvailable(name))
+                return name;
         }
     }
     return std::nullopt;
+}
+
+std::vector<std::string> tenBitHevcEncoderCandidateNames(
+    bool useHardwareAccel,
+    const std::string& hwVendorHint)
+{
+    std::vector<std::string> candidates;
+    if (useHardwareAccel && hwVendorHint != "none") {
+        if (hwVendorHint == "nvenc") {
+            candidates.emplace_back("hevc_nvenc");
+        } else if (hwVendorHint == "qsv") {
+            candidates.emplace_back("hevc_qsv");
+        } else if (hwVendorHint == "amf") {
+            candidates.emplace_back("hevc_amf");
+        } else {
+            candidates.emplace_back("hevc_nvenc");
+            candidates.emplace_back("hevc_qsv");
+            candidates.emplace_back("hevc_amf");
+        }
+    }
+    candidates.emplace_back("libx265");
+    return candidates;
+}
+
+std::optional<std::string> firstTenBitHevcEncoder(
+    const std::function<bool(const std::string&)>& runtimeAvailable)
+{
+    static const std::vector<std::string> kCandidates = {
+        "libx265", "hevc_nvenc", "hevc_qsv", "hevc_amf"
+    };
+    return firstTenBitHevcEncoder(kCandidates, runtimeAvailable);
 }
 
 std::optional<std::string> firstTenBitHevcEncoder()

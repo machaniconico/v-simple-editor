@@ -22,6 +22,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <vector>
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -62,6 +63,19 @@ std::optional<std::string> firstTenBitHevcEncoder();
 // through a caller-supplied runtime predicate. This lets Qt-side callers
 // reject a compiled hardware wrapper whose vendor runtime cannot open.
 std::optional<std::string> firstTenBitHevcEncoder(
+    const std::function<bool(const std::string&)>& runtimeAvailable);
+
+// Build the policy-compatible HDR encoder order. Explicit vendors are not
+// allowed to spill into another vendor, "auto" prefers hardware, and a
+// software-only request contains only libx265.
+std::vector<std::string> tenBitHevcEncoderCandidateNames(
+    bool useHardwareAccel,
+    const std::string& hwVendorHint);
+
+// Probe a caller-provided policy order, retaining the same static 10-bit
+// capability and optional runtime checks as the default overload.
+std::optional<std::string> firstTenBitHevcEncoder(
+    const std::vector<std::string>& candidates,
     const std::function<bool(const std::string&)>& runtimeAvailable);
 
 // Convenience wrapper: returns true iff firstTenBitHevcEncoder() has a value.
