@@ -761,6 +761,7 @@ private:
     QAction *m_deleteAction;
     QAction *m_rippleDeleteAction;
     QAction *m_copyAction;
+    QAction *m_copyCurrentFrameAction = nullptr;
     QAction *m_pasteAction;
     QAction *m_copyEffectsAction = nullptr;
     QAction *m_pasteEffectsAction = nullptr;

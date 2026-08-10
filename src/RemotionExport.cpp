@@ -392,6 +392,31 @@ QString RemotionExporter::generateVideoCompositionBody(const RemotionExportConfi
         ++videoTrackIdx;
     }
 
+    // Timeline-level generated captions are absolute-time overlays and must
+    // not be duplicated inside every clip Sequence.
+    for (const EnhancedTextOverlay &ov : data.generatedCaptionOverlays) {
+        if (!ov.visible)
+            continue;
+        const int ovStart = static_cast<int>(std::round(ov.startTime * fps));
+        const int ovEnd = static_cast<int>(std::round(ov.endTime * fps));
+        if (ovEnd <= ovStart)
+            continue;
+        s << "      <Sequence from={" << ovStart
+          << "} durationInFrames={" << (ovEnd - ovStart) << "}>\n";
+        s << "        <TextOverlay\n";
+        s << "          text={\"" << tsStringLiteralContent(ov.text) << "\"}\n";
+        s << "          x={" << ov.x << "}\n";
+        s << "          y={" << ov.y << "}\n";
+        s << "          opacity={" << ov.opacity << "}\n";
+        s << "          rotation={" << ov.rotation << "}\n";
+        s << "          scale={" << ov.scale << "}\n";
+        s << "          animIn={\"" << TextAnimation::typeName(ov.animIn.type) << "\"}\n";
+        s << "          animOut={\"" << TextAnimation::typeName(ov.animOut.type) << "\"}\n";
+        s << "          animDuration={" << ov.animIn.duration << "}\n";
+        s << "        />\n";
+        s << "      </Sequence>\n";
+    }
+
     // Audio tracks
     int audioTrackIdx = 0;
     for (const auto &track : data.audioTracks) {
@@ -692,6 +717,25 @@ QString RemotionExporter::generateTimelineData(const RemotionExportConfig &confi
         s << "    ],\n";
     }
 
+    s << "  ],\n";
+    s << "  textOverlays: [\n";
+    for (const EnhancedTextOverlay &ov : data.generatedCaptionOverlays) {
+        if (!ov.visible || ov.endTime <= ov.startTime)
+            continue;
+        const int ovStart = static_cast<int>(std::round(ov.startTime * fps));
+        const int ovEnd = static_cast<int>(std::round(ov.endTime * fps));
+        s << "    { text: \"" << tsStringLiteralContent(ov.text)
+          << "\", startFrame: " << ovStart
+          << ", durationInFrames: " << (ovEnd - ovStart)
+          << ", x: " << ov.x
+          << ", y: " << ov.y
+          << ", opacity: " << ov.opacity
+          << ", rotation: " << ov.rotation
+          << ", scale: " << ov.scale
+          << ", animIn: \"" << TextAnimation::typeName(ov.animIn.type)
+          << "\", animOut: \"" << TextAnimation::typeName(ov.animOut.type)
+          << "\", animDuration: " << ov.animIn.duration << " },\n";
+    }
     s << "  ],\n";
     s << "  audioTracks: [\n";
 

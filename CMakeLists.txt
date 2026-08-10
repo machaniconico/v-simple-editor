@@ -96,6 +96,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/SmartRenderSelftest.cpp
     src/selftests/LoudnessExportWireSelftest.cpp
     src/selftests/FrameExportSelftest.cpp
+    src/selftests/FrameClipboardSelftest.cpp
     src/selftests/NestSequenceSelftest.cpp
     src/selftests/PrecomposeE2ESelftest.cpp
     src/selftests/BatchExportE2ESelftest.cpp
@@ -150,6 +151,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/FrameDiff.cpp
     src/FrameExport.h
     src/FrameExport.cpp
+    src/FrameClipboard.h
+    src/FrameClipboard.cpp
     src/TimelineFrameRenderer.cpp
     src/SmartRender.h
     src/SmartRender.cpp
@@ -484,6 +487,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/CaptionCps.h
     src/CaptionStyle.h
     src/CaptionStyle.cpp
+    src/CaptionOverlayBuilder.h
+    src/CaptionOverlayBuilder.cpp
     src/SubtitleIO.h
     src/SubtitleIO.cpp
     src/CaptionEditorDialog.h
@@ -497,6 +502,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/WhisperTranscriber.h
     src/WhisperTranscriber.cpp
     src/selftests/WhisperWordTimingSelftest.cpp
+    src/selftests/CaptionOverlayBuilderSelftest.cpp
     src/WhisperTranscribeDialog.h
     src/WhisperTranscribeDialog.cpp
     src/selftests/whisper_transcribe_selftest.cpp

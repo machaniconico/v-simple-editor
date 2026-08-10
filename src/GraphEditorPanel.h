@@ -3,10 +3,12 @@
 #include <QColor>
 #include <QDockWidget>
 #include <QPointer>
+#include <QString>
 #include <QVector>
 #include "Keyframe.h"
 
 class GraphEditorCurveView;
+class QComboBox;
 class QLabel;
 class QListWidget;
 class Timeline;
@@ -35,6 +37,7 @@ public slots:
 private:
     void rebuildForSelection();
     void showEmptyState(const QString &message);
+    void syncLoopOutControl();
 
     QPointer<Timeline> m_timeline;
     int m_trackIdx = -1;
@@ -42,9 +45,13 @@ private:
     double m_clipStartSeconds = 0.0;
     double m_clipDurationSeconds = 0.0;
     double m_playheadSeconds = 0.0;
+    // Preserve the user's property choice across the transient (-1, -1)
+    // selection emitted while Timeline restores an undo/redo snapshot.
+    QString m_selectedProperty;
 
     QLabel *m_statusLabel = nullptr;
     QListWidget *m_trackList = nullptr;
+    QComboBox *m_loopOutCombo = nullptr;
     GraphEditorCurveView *m_curveView = nullptr;
     QVector<GraphEditorCurveTrack> m_tracks;
 };

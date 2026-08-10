@@ -73,6 +73,7 @@ class QTimer;
 // なる。enum class は前方宣言できないため namespace + enum 種別だけを
 // 前方宣言し、シグネチャに使う (Timeline.cpp 側で TrimOps.h を実 include)。
 namespace trimops { enum class TrimType; }
+namespace caption { class Track; }
 
 namespace timeline_nesting {
 QString sequenceClipFilePath(const QString &sequenceId);
@@ -279,6 +280,7 @@ struct TimelineSequence {
     QString name;
     QVector<QVector<ClipInfo>> videoTracks;
     QVector<QVector<ClipInfo>> audioTracks;
+    QVector<EnhancedTextOverlay> generatedCaptionOverlays;
 
     double duration() const {
         auto tracksDuration = [](const QVector<QVector<ClipInfo>> &tracks) {
@@ -767,6 +769,30 @@ public:
     // the mutation actually persists. Used by MainWindow's Adobe-style text
     // tool. Returns true if an overlay was added.
     bool addTextOverlayToFirstVideoClip(const EnhancedTextOverlay &overlay);
+    // Atomically replace only generated single-word captions on every V1
+    // clip. Incoming times remain absolute timeline seconds so the active
+    // clip renderer sees the same caption set across clip boundaries.
+    bool applySingleWordCaptionOverlays(
+        const QVector<EnhancedTextOverlay> &overlays,
+        QString *errorMessage = nullptr);
+    const QVector<EnhancedTextOverlay> &generatedCaptionOverlays() const {
+        return m_generatedCaptionOverlays;
+    }
+    void restoreGeneratedCaptionOverlays(
+        const QVector<EnhancedTextOverlay> &overlays) {
+        m_generatedCaptionOverlays = overlays;
+    }
+    // Ordinary authored overlays (legacy V1 clip-0 owner) followed by the
+    // project-level generated-caption set. Indices match the text-strip and
+    // preview editing APIs below.
+    QVector<EnhancedTextOverlay> timelineTextOverlays() const;
+    // Convert source-media ASR timestamps into absolute V1 timeline time,
+    // honoring trim in-points, clip speed, gaps and invertible time remaps.
+    bool mapSourceCaptionTrackToTimeline(
+        const caption::Track &sourceTrack,
+        const QString &sourcePath,
+        caption::Track *mappedTrack,
+        QString *errorMessage = nullptr) const;
     // Update the text of an existing overlay on V1's first clip. Used by
     // click-to-edit when the user edits an existing overlay in place.
     bool updateTextOverlayText(int overlayIndex, const QString &newText);
@@ -786,7 +812,8 @@ public:
                        const effectctrl::MotionState &motion);
     // Update an existing overlay's start/end time. Called from the timeline
     // text strip when the user drags an overlay's edge handle.
-    bool updateTextOverlayTime(int overlayIndex, double startTime, double endTime);
+    bool updateTextOverlayTime(int overlayIndex, double startTime, double endTime,
+                               bool createUndo = true);
 
     UndoManager *undoManager() const { return m_undoManager; }
 
@@ -949,6 +976,7 @@ private:
 
     QVector<TimelineTrack*> m_videoTracks;
     QVector<TimelineTrack*> m_audioTracks;
+    QVector<EnhancedTextOverlay> m_generatedCaptionOverlays;
     TimelineTrack *m_videoTrack = nullptr; // alias for m_videoTracks[0]
     TimelineTrack *m_audioTrack = nullptr; // alias for m_audioTracks[0]
     int m_activeVideoTrackIndex = -1; // last video row that originated selection
@@ -974,6 +1002,10 @@ private:
     QWidget *m_vaSeparatorHeader = nullptr;
     int m_textStripCustomHeight = 0;  // 0 = follows m_trackHeight
     void refreshTextStrip();
+    void beginTextOverlayTimeEdit();
+    void finishTextOverlayTimeEdit();
+    bool m_textOverlayTimeEditActive = false;
+    bool m_textOverlayTimeEditChanged = false;
     QLabel *m_infoLabel;
     double m_playheadPos = 0.0;
     // プロジェクト出力ジオメトリの複製 (SSOT は MainWindow::m_projectConfig)。

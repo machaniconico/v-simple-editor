@@ -679,21 +679,11 @@ QImage applyAdjustmentLayers(const QImage &composited, const Timeline *timeline,
 //
 // GATING: no V1 clip / empty TextManager -> nothing to bake -> return the
 // input UNTOUCHED so a clip with no text stays byte-identical to S2..S5.
-QImage applyTextOverlays(const QImage &composited, const Timeline *timeline,
-                         qint64 usec, const ClipInfo *v1Clip)
+QImage applyTextOverlays(const QImage &composited,
+                         qint64 usec,
+                         const ClipInfo *activeTextOwner,
+                         const QVector<EnhancedTextOverlay> &generatedCaptions)
 {
-    Q_UNUSED(timeline);
-    if (!v1Clip)
-        return composited;
-    const TextManager &mgr = v1Clip->textManager;
-    if (mgr.count() <= 0)
-        return composited;                    // strict no-op == S2..S5 byte path
-
-    QVector<EnhancedTextOverlay> overlays;
-    overlays.reserve(mgr.count());
-    for (int i = 0; i < mgr.count(); ++i)
-        overlays.append(mgr.overlay(i));
-
     // The genuine text baker drives off a timeline-second playhead; pass it
     // the SAME timeline seconds renderFrameAt resolved the frame at.
     const double nowSec = static_cast<double>(usec) / 1'000'000.0;
@@ -702,8 +692,18 @@ QImage applyTextOverlays(const QImage &composited, const Timeline *timeline,
     // VideoPlayer::composeFrameWithOverlays now delegates to. NO VideoPlayer,
     // NO QWidget: safe on the RenderQueue worker thread. fontScale = 1.0 /
     // hiddenIdx = -1 == exactly what the prior headless seam produced.
-    return textbake::bakeOverlays(composited, overlays, nowSec,
-                                  /*hiddenIdx=*/-1, /*fontScale=*/1.0);
+    QImage result = composited;
+    if (activeTextOwner && activeTextOwner->textManager.count() > 0) {
+        result = textbake::bakeOverlays(
+            result, activeTextOwner->textManager.overlays(), nowSec,
+            /*hiddenIdx=*/-1, /*fontScale=*/1.0);
+    }
+    if (!generatedCaptions.isEmpty()) {
+        result = textbake::bakeOverlays(
+            result, generatedCaptions, nowSec,
+            /*hiddenIdx=*/-1, /*fontScale=*/1.0);
+    }
+    return result;
 }
 
 // Locate the clip on a single track active at `targetSec`. Returns the clip
@@ -891,6 +891,7 @@ QVector<RenderTrackSnapshot> snapshotsFromSequence(const TimelineSequence &seque
 
 QImage renderFrameFromTracks(const Timeline *timeline,
                              const QVector<RenderTrackSnapshot> &tracks,
+                             const QVector<EnhancedTextOverlay> &generatedCaptions,
                              qint64 usec,
                              QSize outSize,
                              int sequenceDepth,
@@ -940,6 +941,7 @@ QImage renderSequenceReferenceFrame(const Timeline *timeline,
     const QImage rendered = renderFrameFromTracks(
         timeline,
         snapshotsFromSequence(*sequence),
+        sequence->generatedCaptionOverlays,
         childUsec,
         outSize,
         sequenceDepth + 1,
@@ -985,6 +987,7 @@ QImage applyVfxFootageControls(const QImage &native, const ClipInfo &clip)
 
 QImage renderFrameFromTracks(const Timeline *timeline,
                              const QVector<RenderTrackSnapshot> &tracks,
+                             const QVector<EnhancedTextOverlay> &generatedCaptions,
                              qint64 usec,
                              QSize outSize,
                              int sequenceDepth,
@@ -1520,7 +1523,7 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         const QImage adj = applyTimelineGlobals
             ? applyAdjustmentLayers(styledBase, timeline, usec)
             : styledBase;
-        return applyTextOverlays(adj, timeline, usec, &v1Clip);
+        return applyTextOverlays(adj, usec, &v1Clip, generatedCaptions);
     }
 
     // ── Composite ──────────────────────────────────────────────────────────
@@ -1853,7 +1856,7 @@ QImage renderFrameFromTracks(const Timeline *timeline,
     const QImage adj = applyTimelineGlobals
         ? applyAdjustmentLayers(stacked, timeline, usec)
         : stacked;
-    return applyTextOverlays(adj, timeline, usec, &v1Clip);
+    return applyTextOverlays(adj, usec, &v1Clip, generatedCaptions);
 }
 
 QImage renderFrameAtSingleWithSequenceSnapshot(
@@ -1871,8 +1874,11 @@ QImage renderFrameAtSingleWithSequenceSnapshot(
     const QVector<Light3D> lightSnapshot = timeline->projectLights();
     const QVector<Light3DState> projectLights = light3d::statesAt(
         lightSnapshot, static_cast<double>(usec) / 1'000'000.0);
+    const QVector<EnhancedTextOverlay> generatedCaptionSnapshot =
+        timeline->generatedCaptionOverlays();
     return renderFrameFromTracks(timeline,
                                  snapshotsFromTimeline(timeline),
+                                 generatedCaptionSnapshot,
                                  usec,
                                  outSize,
                                  /*sequenceDepth=*/0,

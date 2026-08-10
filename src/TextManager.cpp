@@ -409,6 +409,7 @@ QJsonArray TextManager::toJson(const QVector<EnhancedTextOverlay> &overlays) {
         obj["fontFamily"] = o.font.family();
         obj["fontSize"] = o.font.pointSize();
         obj["fontBold"] = o.font.bold();
+        obj["fontItalic"] = o.font.italic();
         obj["color"] = o.color.name(QColor::HexArgb);
         obj["bgColor"] = o.backgroundColor.name(QColor::HexArgb);
         if (o.letterSpacing != 0.0)
@@ -498,6 +499,7 @@ QVector<EnhancedTextOverlay> TextManager::fromJson(const QJsonArray &arr) {
         o.text = obj["text"].toString();
         o.font = QFont(obj["fontFamily"].toString("Arial"), obj["fontSize"].toInt(32),
                         obj["fontBold"].toBool(true) ? QFont::Bold : QFont::Normal);
+        o.font.setItalic(obj["fontItalic"].toBool(false));
         o.color = QColor(obj["color"].toString("#ffffffff"));
         o.backgroundColor = QColor(obj["bgColor"].toString("#a0000000"));
         o.letterSpacing = obj["letterSpacing"].toDouble(0.0);

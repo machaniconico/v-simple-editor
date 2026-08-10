@@ -1,9 +1,7 @@
 #include "SpeechRecognizer.h"
+#include "WhisperTranscriber.h"
 
 #include <QProcess>
-#include <QJsonDocument>
-#include <QJsonObject>
-#include <QJsonArray>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -24,39 +22,6 @@ bool looksLikeModelPath(const QString& modelId)
            || modelId.contains(QLatin1Char('/'))
            || modelId.contains(QLatin1Char('\\'))
            || modelId.endsWith(QStringLiteral(".bin"), Qt::CaseInsensitive);
-}
-
-void appendOpenAiSegments(const QJsonArray& segs, RecognizeResult& res)
-{
-    for (const QJsonValue& val : segs) {
-        if (!val.isObject())
-            continue;
-        const QJsonObject obj = val.toObject();
-        Segment seg;
-        seg.startMs    = static_cast<qint64>(obj.value(QStringLiteral("start")).toDouble() * 1000.0);
-        seg.endMs      = static_cast<qint64>(obj.value(QStringLiteral("end")).toDouble()   * 1000.0);
-        seg.text       = obj.value(QStringLiteral("text")).toString().trimmed();
-        seg.confidence = 0.95;
-        if (!seg.text.isEmpty())
-            res.segments << seg;
-    }
-}
-
-void appendWhisperCppSegments(const QJsonArray& transcription, RecognizeResult& res)
-{
-    for (const QJsonValue& val : transcription) {
-        if (!val.isObject())
-            continue;
-        const QJsonObject obj = val.toObject();
-        const QJsonObject offsets = obj.value(QStringLiteral("offsets")).toObject();
-        Segment seg;
-        seg.startMs = static_cast<qint64>(offsets.value(QStringLiteral("from")).toDouble());
-        seg.endMs   = static_cast<qint64>(offsets.value(QStringLiteral("to")).toDouble());
-        seg.text    = obj.value(QStringLiteral("text")).toString().trimmed();
-        seg.confidence = 0.95;
-        if (!seg.text.isEmpty())
-            res.segments << seg;
-    }
 }
 
 } // namespace
@@ -151,6 +116,26 @@ QStringList WhisperCliRecognizer::supportedLanguages() const
     };
 }
 
+RecognizeResult WhisperCliRecognizer::parseJsonOutput(const QByteArray& json,
+                                                       const QString& requestedLanguage)
+{
+    RecognizeResult result;
+    QString detectedLanguage;
+    QString parseError;
+    result.segments = whisper::WhisperTranscriber::parseWhisperJsonSegments(
+        json, &detectedLanguage, &parseError);
+    if (!parseError.isEmpty()) {
+        result.error = parseError;
+        return result;
+    }
+
+    result.detectedLanguage = detectedLanguage.isEmpty()
+        ? requestedLanguage
+        : detectedLanguage;
+    result.success = true;
+    return result;
+}
+
 RecognizeResult WhisperCliRecognizer::recognize(const RecognizeParams& params)
 {
     RecognizeResult res;
@@ -169,7 +154,8 @@ RecognizeResult WhisperCliRecognizer::recognize(const RecognizeParams& params)
 
     QStringList args;
     args << QStringLiteral("-f") << params.audioPath
-         << QStringLiteral("-oj")
+         << QStringLiteral("--output-json")
+         << QStringLiteral("--output-json-full")
          << QStringLiteral("-of") << outBase;
     if (lang != QStringLiteral("auto"))
         args << QStringLiteral("-l") << lang;
@@ -217,22 +203,9 @@ RecognizeResult WhisperCliRecognizer::recognize(const RecognizeParams& params)
     jsonFile.close();
     QFile::remove(outJson);
 
-    QJsonParseError parseErr;
-    const QJsonDocument doc = QJsonDocument::fromJson(raw, &parseErr);
-    if (doc.isNull() || !doc.isObject()) {
-        res.success = false;
-        res.error = QStringLiteral("failed to parse JSON output");
-        return res;
-    }
-
-    const QJsonObject root = doc.object();
-    appendOpenAiSegments(root.value(QStringLiteral("segments")).toArray(), res);
-    if (res.segments.isEmpty())
-        appendWhisperCppSegments(root.value(QStringLiteral("transcription")).toArray(), res);
-
-    res.success = true;
-    res.detectedLanguage = params.language;
-    return res;
+    RecognizeResult parsed = parseJsonOutput(raw, params.language);
+    parsed.processingTimeMs = res.processingTimeMs;
+    return parsed;
 }
 
 // ─────────────────────────────────────────────────────────────

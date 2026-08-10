@@ -129,49 +129,13 @@ TimeRange rangeFromTimestampObject(const QJsonObject& obj)
     return { fromMs, toMs, ok && toMs > fromMs };
 }
 
-TimeRange inferLegacyTokenRange(double rawStart, double rawEnd, qint64 segmentStartMs, qint64 segmentEndMs)
-{
-    struct Candidate {
-        qint64 startMs;
-        qint64 endMs;
-        int score;
-    };
-
-    const Candidate candidates[] = {
-        { roundedMs(rawStart * 1000.0), roundedMs(rawEnd * 1000.0), 0 },
-        { roundedMs(rawStart),          roundedMs(rawEnd),          0 },
-        { roundedMs(rawStart * 10.0),   roundedMs(rawEnd * 10.0),   0 },
-    };
-
-    Candidate best = candidates[0];
-    best.score = -1000000;
-    for (Candidate candidate : candidates) {
-        int score = 0;
-        if (candidate.endMs > candidate.startMs)
-            score += 100;
-        if (candidate.startMs >= segmentStartMs)
-            score += 20;
-        else
-            score -= 20;
-        if (candidate.endMs <= segmentEndMs)
-            score += 20;
-        else
-            score -= 20;
-        if (candidate.startMs <= segmentEndMs && candidate.endMs >= segmentStartMs)
-            score += 10;
-        candidate.score = score;
-        if (candidate.score > best.score)
-            best = candidate;
-    }
-
-    return { best.startMs, best.endMs, best.endMs > best.startMs };
-}
-
 TimeRange rangeFromObject(const QJsonObject& obj,
                           qint64 segmentStartMs,
                           qint64 segmentEndMs,
                           bool segmentRange)
 {
+    Q_UNUSED(segmentStartMs);
+    Q_UNUSED(segmentEndMs);
     TimeRange range = rangeFromOffsetObject(obj);
     if (range.valid)
         return range;
@@ -201,12 +165,13 @@ TimeRange rangeFromObject(const QJsonObject& obj,
         double end = 0.0;
         if (numberValue(obj.value(QStringLiteral("t0")), &start)
             && numberValue(obj.value(QStringLiteral("t1")), &end)) {
-            if (segmentRange && segmentEndMs == std::numeric_limits<qint64>::max()) {
-                const qint64 startMs = roundedMs(start * 10.0);
-                const qint64 endMs = roundedMs(end * 10.0);
-                return { startMs, endMs, endMs > startMs };
-            }
-            return inferLegacyTokenRange(start, end, segmentStartMs, segmentEndMs);
+            // whisper.cpp's legacy t0/t1 schema is unambiguously expressed
+            // in 10 ms ticks for both segments and tokens.  Inferring among
+            // seconds/ms/10-ms from the containing segment produced ties at
+            // zero and silently shrank 0..100 ticks to 0..100 ms.
+            const qint64 startMs = roundedMs(start * 10.0);
+            const qint64 endMs = roundedMs(end * 10.0);
+            return { startMs, endMs, endMs > startMs };
         }
     }
 
@@ -308,38 +273,6 @@ bool hasExplicitWordBoundary(const QString& rawText)
         || rawText.startsWith(QString::fromUtf8("\xC4\xA0"));
 }
 
-bool isAsciiWordPiece(const QString& text)
-{
-    if (text.isEmpty())
-        return false;
-    for (const QChar ch : text) {
-        if (ch.unicode() >= 128)
-            return false;
-        if (!ch.isLetterOrNumber() && ch != QLatin1Char('\'') && ch != QLatin1Char('-'))
-            return false;
-    }
-    return true;
-}
-
-bool isAsciiPunctuationOnly(const QString& text)
-{
-    if (text.isEmpty())
-        return false;
-    for (const QChar ch : text) {
-        if (ch.unicode() >= 128)
-            return false;
-        if (ch.isLetterOrNumber() || ch.isSpace())
-            return false;
-    }
-    return true;
-}
-
-bool shouldMergeTokenPiece(const QString& pendingText, const QString& text)
-{
-    return (isAsciiWordPiece(pendingText) && isAsciiWordPiece(text))
-        || isAsciiPunctuationOnly(text);
-}
-
 QList<speech::Word> wordsFromTokenArray(const QJsonArray& tokenArray,
                                         qint64 segmentStartMs,
                                         qint64 segmentEndMs)
@@ -385,8 +318,13 @@ QList<speech::Word> wordsFromTokenArray(const QJsonArray& tokenArray,
         if (!range.valid)
             continue;
 
-        if (hasPending
-            && (hasExplicitWordBoundary(rawText) || !shouldMergeTokenPiece(pendingText, text))) {
+        // `tokens` are tokenizer pieces, not guaranteed words.  A new word
+        // starts only when the tokenizer supplies an explicit boundary
+        // (space, newline, SentencePiece ▁, or GPT-style Ġ).  Every other
+        // piece is joined to the pending word regardless of script.  This
+        // preserves accented/Cyrillic continuations and prevents unsegmented
+        // CJK from turning into character-by-character captions.
+        if (hasPending && hasExplicitWordBoundary(rawText)) {
             flushPending();
         }
 
@@ -659,6 +597,15 @@ caption::Track WhisperTranscriber::toCaptionTrack(const QList<speech::Segment>& 
         clip.endMs = seg.endMs;
         clip.text = seg.text;
         clip.actor = QString();
+        clip.words.reserve(seg.words.size());
+        for (const speech::Word& sourceWord : seg.words) {
+            caption::Word word;
+            word.startMs = sourceWord.startMs;
+            word.endMs = sourceWord.endMs;
+            word.text = sourceWord.text;
+            word.confidence = sourceWord.confidence;
+            clip.words.append(word);
+        }
         track.addClip(clip);
     }
     track.sortByStart();

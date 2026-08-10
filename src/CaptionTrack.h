@@ -4,11 +4,19 @@
 
 namespace caption {
 
+struct Word {
+    qint64  startMs = 0;
+    qint64  endMs   = 0;
+    QString text;
+    double  confidence = 1.0;
+};
+
 struct Clip {
     qint64  startMs = 0;
     qint64  endMs   = 0;
     QString text;
     QString actor;  // 話者識別 (optional, 空文字 OK)
+    QList<Word> words; // optional absolute per-word timing
 
     qint64 durationMs() const { return endMs - startMs; }
     bool   isValid()    const { return endMs > startMs && !text.isEmpty(); }

@@ -1,4 +1,5 @@
 #include "TextOverlayBake.h"
+#include "CaptionOverlayBuilder.h"
 #include "TextManager.h"   // EnhancedTextOverlay / GradientStop / PositionKeyframe
 
 #include <QPainter>
@@ -62,28 +63,30 @@ QVector<BakeTextLine> layoutBakeTextLines(const QString &text, const QFont &font
     return lines;
 }
 
-QSize spacedBakeTextSize(const QString &text, const QFont &font, double lineSpacing)
+QSize spacedBakeTextSize(const QString &text, const QFont &font, double lineSpacing,
+                         qreal maxWidth = 1'000'000.0, bool wordWrap = false)
 {
     const QVector<BakeTextLine> lines =
-        layoutBakeTextLines(text, font, 1'000'000.0, false);
+        layoutBakeTextLines(text, font, maxWidth, wordWrap);
     const QFontMetrics fm(font);
-    qreal maxWidth = 0.0;
+    qreal maxLineWidth = 0.0;
     for (const BakeTextLine &line : lines)
-        maxWidth = qMax(maxWidth, line.width);
+        maxLineWidth = qMax(maxLineWidth, line.width);
     const int lineCount = qMax(1, lines.size());
     const double lineAdvance = qMax(1.0, static_cast<double>(fm.height()) + lineSpacing);
     const double totalHeight =
         fm.height() + qMax(0, lineCount - 1) * lineAdvance;
-    return QSize(static_cast<int>(std::ceil(maxWidth)),
+    return QSize(static_cast<int>(std::ceil(maxLineWidth)),
                  static_cast<int>(std::ceil(qMax(1.0, totalHeight))));
 }
 
 QPainterPath spacedBakeTextPath(const QString &text, const QRect &box,
-                                const QFont &font, double lineSpacing)
+                                const QFont &font, double lineSpacing,
+                                int alignment, bool wordWrap)
 {
     QPainterPath path;
     const QVector<BakeTextLine> lines =
-        layoutBakeTextLines(text, font, box.width(), true);
+        layoutBakeTextLines(text, font, box.width(), wordWrap);
     if (lines.isEmpty())
         return path;
 
@@ -95,7 +98,11 @@ QPainterPath spacedBakeTextPath(const QString &text, const QRect &box,
     double baselineY = box.top() + (box.height() - totalHeight) * 0.5 + fm.ascent();
     for (const BakeTextLine &line : lines) {
         if (!line.text.isEmpty()) {
-            const double x = box.left() + (box.width() - line.width) * 0.5;
+            double x = box.left();
+            if (alignment & Qt::AlignRight)
+                x = box.right() + 1.0 - line.width;
+            else if (alignment & Qt::AlignHCenter)
+                x = box.left() + (box.width() - line.width) * 0.5;
             path.addText(x, baselineY, font, line.text);
         }
         baselineY += lineAdvance;
@@ -103,18 +110,122 @@ QPainterPath spacedBakeTextPath(const QString &text, const QRect &box,
     return path;
 }
 
+struct BakePopState {
+    double opacity = 1.0;
+    double scale = 1.0;
+};
+
+BakePopState popStateAt(const EnhancedTextOverlay &overlay, double nowSec)
+{
+    BakePopState state;
+    if (overlay.animIn.type != TextAnimationType::Pop
+        || overlay.animIn.duration <= 0.0) {
+        return state;
+    }
+
+    const double elapsed = nowSec - overlay.startTime;
+    if (elapsed >= overlay.animIn.duration)
+        return state;
+
+    // Match EnhancedTextRenderer::applyAnimation's Pop curve.  Caption
+    // overlays begin at opacity/scale zero, overshoot, then settle at 1.0.
+    const double progress = qBound(0.0, elapsed / overlay.animIn.duration, 1.0);
+    const double ease = progress * progress * (3.0 - 2.0 * progress);
+    const double overshoot = 1.0 + 0.3 * std::sin(progress * M_PI);
+    state.scale = (progress < 1.0) ? overshoot * ease : 1.0;
+    state.opacity = qMin(1.0, progress * 2.0);
+    return state;
+}
+
+void boxBlurAlphaInPlace(QImage &image, int radius)
+{
+    if (radius <= 0 || image.isNull())
+        return;
+    const int r = qMin(radius, 32);
+    const int width = image.width();
+    const int height = image.height();
+    if (width <= 0 || height <= 0)
+        return;
+    if (image.format() != QImage::Format_ARGB32_Premultiplied)
+        image = image.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+
+    QVector<int> horizontal(width * height);
+    auto index = [width](int x, int y) { return y * width + x; };
+    const int span = 2 * r + 1;
+    for (int y = 0; y < height; ++y) {
+        const QRgb *row = reinterpret_cast<const QRgb *>(image.constScanLine(y));
+        int sum = 0;
+        for (int x = -r; x <= r; ++x)
+            sum += qAlpha(row[qBound(0, x, width - 1)]);
+        for (int x = 0; x < width; ++x) {
+            horizontal[index(x, y)] = sum / span;
+            const int outgoing = qBound(0, x - r, width - 1);
+            const int incoming = qBound(0, x + r + 1, width - 1);
+            sum += qAlpha(row[incoming]) - qAlpha(row[outgoing]);
+        }
+    }
+
+    for (int x = 0; x < width; ++x) {
+        int sum = 0;
+        for (int y = -r; y <= r; ++y)
+            sum += horizontal[index(x, qBound(0, y, height - 1))];
+        for (int y = 0; y < height; ++y) {
+            const int alpha = sum / span;
+            QRgb *row = reinterpret_cast<QRgb *>(image.scanLine(y));
+            row[x] = qRgba(0, 0, 0, alpha);
+            const int outgoing = qBound(0, y - r, height - 1);
+            const int incoming = qBound(0, y + r + 1, height - 1);
+            sum += horizontal[index(x, incoming)] - horizontal[index(x, outgoing)];
+        }
+    }
+}
+
+void drawBakeShadow(QPainter &painter, const QPainterPath &path,
+                    const TextShadow &shadow)
+{
+    if (!shadow.enabled || path.isEmpty())
+        return;
+
+    const double blur = qMax(0.0, shadow.blur);
+    const int pad = qMax(8, static_cast<int>(blur * 2.0) + 4);
+    const QRect maskRect = path.boundingRect().toAlignedRect().adjusted(
+        -pad, -pad, pad, pad);
+    if (maskRect.isEmpty())
+        return;
+
+    QImage mask(maskRect.size(), QImage::Format_ARGB32_Premultiplied);
+    mask.fill(Qt::transparent);
+    {
+        QPainter maskPainter(&mask);
+        maskPainter.setRenderHint(QPainter::Antialiasing, true);
+        maskPainter.setRenderHint(QPainter::TextAntialiasing, true);
+        maskPainter.translate(-maskRect.topLeft());
+        maskPainter.fillPath(path, Qt::black);
+    }
+    boxBlurAlphaInPlace(mask, static_cast<int>(blur));
+    {
+        QPainter tintPainter(&mask);
+        tintPainter.setCompositionMode(QPainter::CompositionMode_SourceIn);
+        tintPainter.fillRect(mask.rect(), shadow.color);
+    }
+
+    const double previousOpacity = painter.opacity();
+    painter.setOpacity(previousOpacity * qBound(0.0, shadow.opacity, 1.0));
+    painter.drawImage(maskRect.topLeft()
+                          + QPoint(static_cast<int>(shadow.offsetX),
+                                   static_cast<int>(shadow.offsetY)),
+                      mask);
+    painter.setOpacity(previousOpacity);
+}
+
 } // namespace
 
-// The body below is the EXACT text-baking code that used to live inline in
-// VideoPlayer::composeFrameWithOverlays (the authoritative preview baker).
-// It was hoisted verbatim so the same code serves both the preview (which
-// delegates here after computing fontScale from its widget) and the SSOT
-// renderer's worker-thread export path (which calls here directly with
-// fontScale = 1.0 — the value the headless path already produced because
-// m_glPreview was null). NOTHING about the glyph/keyframe/outline/gradient
-// math changed: fonts, keyframed position, outline stroke, linear/radial
-// multi-stop gradient and the QFontMetrics layout-rect placement are
-// identical, so S6 export-vs-preview text parity holds by construction.
+// This is the shared text-baking implementation used by both
+// VideoPlayer::composeFrameWithOverlays and the worker-thread export path.
+// It originated in the preview baker and remains the single source of truth;
+// caption layout, shadow, and Pop animation support therefore reaches preview
+// and export together.  The preview supplies its widget-derived fontScale,
+// while headless/export rendering passes 1.0.
 namespace textbake {
 
 // Test-only observability (see header). std::atomic so the worker-thread
@@ -145,6 +256,13 @@ QImage bakeOverlays(const QImage &source,
     if (overlays.isEmpty())
         return source;
 
+    const int generatedBegin = CaptionOverlayBuilder::generatedSuffixBegin(overlays);
+    const int activeGenerated = CaptionOverlayBuilder::activeGeneratedOverlayIndex(
+        overlays, nowSec);
+    const int renderCount = generatedBegin + (activeGenerated >= 0 ? 1 : 0);
+    if (renderCount == 0)
+        return source;
+
     // Record the thread we actually baked text on (test-only). Runtime
     // env check so the argv-switch dispatch path (which qputenvs the var
     // after program startup) is honored. This is GENUINE evidence:
@@ -164,7 +282,8 @@ QImage bakeOverlays(const QImage &source,
     const int H = composed.height();
     if (!(fontScale > 0.0))
         fontScale = 1.0;
-    for (int i = 0; i < overlays.size(); ++i) {
+    for (int renderSlot = 0; renderSlot < renderCount; ++renderSlot) {
+        const int i = renderSlot < generatedBegin ? renderSlot : activeGenerated;
         if (i == hiddenIdx) continue;
         const auto &ov = overlays[i];
         if (!ov.visible || ov.text.isEmpty()) continue;
@@ -172,18 +291,55 @@ QImage bakeOverlays(const QImage &source,
         const double end   = (ov.endTime > 0.0) ? ov.endTime : 1e18;
         if (nowSec < start || nowSec >= end) continue;
 
-        QFont font = bakeFontForOverlay(ov, fontScale);
+        const BakePopState pop = popStateAt(ov, nowSec);
+        const double effectiveOpacity =
+            qBound(0.0, ov.opacity * pop.opacity, 1.0);
+        if (effectiveOpacity <= 0.0)
+            continue;
+
+        QFont font = bakeFontForOverlay(ov, fontScale * pop.scale);
         p.setFont(font);
+        p.save();
+        p.setOpacity(effectiveOpacity);
 
         const QFontMetrics fm(font);
-        int boxW = qMax(1, static_cast<int>(ov.width  * W));
-        int boxH = qMax(1, static_cast<int>(ov.height * H));
-        if (ov.width <= 0.0 || ov.height <= 0.0) {
-            const QSize textSize = (ov.lineSpacing == 0.0)
+        const bool autoWidth = ov.width <= 0.0;
+        const bool autoHeight = ov.height <= 0.0;
+        QSize naturalTextSize;
+        if (autoWidth) {
+            naturalTextSize = (ov.lineSpacing == 0.0)
                 ? fm.boundingRect(ov.text).size()
                 : spacedBakeTextSize(ov.text, font, ov.lineSpacing * fontScale);
-            boxW = textSize.width() + 16;
-            boxH = textSize.height() + 8;
+        }
+        int boxW = autoWidth
+            ? naturalTextSize.width() + 16
+            : qMax(1, static_cast<int>(ov.width * W));
+        int boxH = qMax(1, static_cast<int>(ov.height * H));
+        if (autoHeight) {
+            if (autoWidth) {
+                boxH = naturalTextSize.height() + 8;
+            } else if (ov.lineSpacing == 0.0) {
+                const int flags = ov.alignment
+                    | (ov.wordWrap ? Qt::TextWordWrap : 0);
+                boxH = fm.boundingRect(QRect(0, 0, boxW, qMax(1, H)),
+                                       flags, ov.text).height() + 8;
+            } else {
+                boxH = spacedBakeTextSize(
+                    ov.text, font, ov.lineSpacing * fontScale,
+                    boxW, ov.wordWrap).height() + 8;
+            }
+        }
+        const bool constrainGeneratedCaption =
+            ov.templateName == CaptionOverlayBuilder::generatedTemplateName();
+        // Generated caption anchors are intended to remain on screen.  Keep
+        // this behavior scoped to the reserved caption tag: ordinary titles
+        // and tracked text must still be able to animate partially/off canvas.
+        if (constrainGeneratedCaption) {
+            boxW = qBound(1, boxW, qMax(1, W));
+            boxH = qBound(1, boxH, qMax(1, H));
+        } else {
+            boxW = qMax(1, boxW);
+            boxH = qMax(1, boxH);
         }
         double ovX = ov.x;
         double ovY = ov.y;
@@ -209,7 +365,13 @@ QImage bakeOverlays(const QImage &source,
         }
         const int cx = static_cast<int>(ovX * W);
         const int cy = static_cast<int>(ovY * H);
-        QRect box(cx - boxW / 2, cy - boxH / 2, boxW, boxH);
+        const int boxLeft = constrainGeneratedCaption
+            ? qBound(0, cx - boxW / 2, qMax(0, W - boxW))
+            : cx - boxW / 2;
+        const int boxTop = constrainGeneratedCaption
+            ? qBound(0, cy - boxH / 2, qMax(0, H - boxH))
+            : cy - boxH / 2;
+        QRect box(boxLeft, boxTop, boxW, boxH);
 
         if (ov.backgroundColor.alpha() > 0)
             p.fillRect(box, ov.backgroundColor);
@@ -221,16 +383,21 @@ QImage bakeOverlays(const QImage &source,
         // certain glyph runs because horizontalAdvance includes right-side
         // bearing while the visual glyph rect doesn't).
         QPainterPath path;
+        const int textFlags = ov.alignment
+            | (ov.wordWrap ? Qt::TextWordWrap : 0);
         if (ov.lineSpacing == 0.0) {
             const QRect textRect = fm.boundingRect(
-                box, Qt::AlignCenter | Qt::TextWordWrap, ov.text);
+                box, textFlags, ov.text);
             const int baselineX = textRect.left();
             const int baselineY = textRect.top() + fm.ascent();
             path.addText(baselineX, baselineY, font, ov.text);
         } else {
             path = spacedBakeTextPath(ov.text, box, font,
-                                      ov.lineSpacing * fontScale);
+                                      ov.lineSpacing * fontScale,
+                                      ov.alignment, ov.wordWrap);
         }
+
+        drawBakeShadow(p, path, ov.shadow);
 
         if (ov.outlineWidth > 0 && ov.outlineColor.alpha() > 0) {
             QPen outline(ov.outlineColor);
@@ -300,6 +467,7 @@ QImage bakeOverlays(const QImage &source,
         } else {
             p.fillPath(path, ov.color);
         }
+        p.restore();
     }
     p.end();
     return composed;
