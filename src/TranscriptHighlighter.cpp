@@ -11,6 +11,7 @@
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QStringList>
+#include <QTimer>
 #include <QUrl>
 
 #include <algorithm>
@@ -97,10 +98,79 @@ QString anthropicResponseText(const QByteArray& payload)
     return QString::fromUtf8(payload);
 }
 
+QString openAiResponseText(const QByteArray& payload)
+{
+    QJsonParseError parseError;
+    const QJsonDocument doc = QJsonDocument::fromJson(payload, &parseError);
+    if (parseError.error != QJsonParseError::NoError || !doc.isObject())
+        return QString::fromUtf8(payload);
+
+    const QJsonArray choices = doc.object().value(QStringLiteral("choices")).toArray();
+    if (choices.isEmpty())
+        return QString::fromUtf8(payload);
+
+    const QJsonValue content = choices.at(0).toObject()
+        .value(QStringLiteral("message")).toObject()
+        .value(QStringLiteral("content"));
+    if (content.isString())
+        return content.toString();
+
+    if (content.isArray()) {
+        QStringList parts;
+        for (const QJsonValue& itemValue : content.toArray()) {
+            const QString text = itemValue.toObject().value(QStringLiteral("text")).toString();
+            if (!text.isEmpty())
+                parts.append(text);
+        }
+        if (!parts.isEmpty())
+            return parts.join(QLatin1Char('\n'));
+    }
+
+    return QString::fromUtf8(payload);
+}
+
+QString geminiResponseText(const QByteArray& payload)
+{
+    QJsonParseError parseError;
+    const QJsonDocument doc = QJsonDocument::fromJson(payload, &parseError);
+    if (parseError.error != QJsonParseError::NoError || !doc.isObject())
+        return QString::fromUtf8(payload);
+
+    const QJsonArray candidates = doc.object().value(QStringLiteral("candidates")).toArray();
+    if (candidates.isEmpty())
+        return QString::fromUtf8(payload);
+
+    const QJsonArray parts = candidates.at(0).toObject()
+        .value(QStringLiteral("content")).toObject()
+        .value(QStringLiteral("parts")).toArray();
+    QStringList textParts;
+    for (const QJsonValue& itemValue : parts) {
+        const QString text = itemValue.toObject().value(QStringLiteral("text")).toString();
+        if (!text.isEmpty())
+            textParts.append(text);
+    }
+    if (!textParts.isEmpty())
+        return textParts.join(QLatin1Char('\n'));
+
+    return QString::fromUtf8(payload);
+}
+
 QString anthropicApiKey()
 {
     return creds::CredentialStore::get(
         "ANTHROPIC_API_KEY", QStringLiteral("apiKeys/anthropic"));
+}
+
+QString openaiApiKey()
+{
+    return creds::CredentialStore::get(
+        "OPENAI_API_KEY", QStringLiteral("apiKeys/openai"));
+}
+
+QString geminiApiKey()
+{
+    return creds::CredentialStore::get(
+        "GEMINI_API_KEY", QStringLiteral("apiKeys/gemini"));
 }
 
 bool transcriptRange(const QList<caption::Clip>& transcript, qint64* minStartMs, qint64* maxEndMs)
@@ -215,7 +285,101 @@ int emphasisCount(const QString& text)
     return count;
 }
 
-QString sendAnthropicPrompt(const HighlightRequest& req, const QString& prompt, const QString& apiKey, QString* err)
+// 戻り値: レスポンス本文。失敗時は空 + *err 設定。
+QByteArray postJsonWithTimeout(QNetworkAccessManager& network,
+                               const QNetworkRequest& request,
+                               const QByteArray& payload,
+                               int timeoutMs,
+                               const CancelFn& canceled,
+                               QString* err)
+{
+    if (err)
+        err->clear();
+
+    if (canceled && canceled()) {
+        if (err)
+            *err = QStringLiteral("canceled");
+        return QByteArray();
+    }
+
+    // setTransferTimeout は QNetworkReply ではなく QNetworkRequest の API なので、
+    // POST 前にリクエスト側へ載せる。QTimer は転送タイムアウトが効かない
+    // ケース (接続確立後に無応答が続く等) の保険。
+    QNetworkRequest timedRequest(request);
+    if (timeoutMs > 0)
+        timedRequest.setTransferTimeout(timeoutMs);
+
+    QEventLoop loop;
+    QNetworkReply* reply = network.post(timedRequest, payload);
+    bool timedOut = false;
+    bool wasCanceled = false;
+    QTimer timeoutTimer;
+    QTimer cancelTimer;
+
+    QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
+
+    if (timeoutMs > 0) {
+        timeoutTimer.setSingleShot(true);
+        QObject::connect(&timeoutTimer, &QTimer::timeout, [&timedOut, reply]() {
+            if (!reply->isFinished()) {
+                timedOut = true;
+                reply->abort();
+            }
+        });
+        timeoutTimer.start(timeoutMs);
+    }
+
+    if (canceled) {
+        QObject::connect(&cancelTimer, &QTimer::timeout,
+                         [&wasCanceled, canceled, reply]() {
+            if (canceled()) {
+                wasCanceled = true;
+                if (reply && !reply->isFinished())
+                    reply->abort();
+            }
+        });
+        cancelTimer.start(200);
+    }
+
+    loop.exec();
+
+    timeoutTimer.stop();
+    cancelTimer.stop();
+
+    const QByteArray response = reply->readAll();
+    const QNetworkReply::NetworkError networkError = reply->error();
+    const QString errorString = reply->errorString();
+    const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+    reply->deleteLater();
+
+    if (wasCanceled) {
+        if (err)
+            *err = QStringLiteral("canceled");
+        return QByteArray();
+    }
+
+    const bool requestTimedOut = timedOut
+        || (timeoutMs > 0 && networkError == QNetworkReply::OperationCanceledError);
+    if (requestTimedOut) {
+        if (err)
+            *err = QStringLiteral("timeout after %1 ms").arg(timeoutMs);
+        return QByteArray();
+    }
+
+    if (networkError != QNetworkReply::NoError || status >= 400) {
+        if (err) {
+            *err = status > 0
+                ? QStringLiteral("network error %1: %2").arg(status).arg(errorString)
+                : QStringLiteral("network error: %1").arg(errorString);
+        }
+        return QByteArray();
+    }
+
+    return response;
+}
+
+QString sendAnthropicPrompt(const HighlightRequest& req, const QString& prompt,
+                            const QString& apiKey, const CancelFn& canceled, QString* err)
 {
     if (apiKey.trimmed().isEmpty()) {
         if (err)
@@ -244,27 +408,99 @@ QString sendAnthropicPrompt(const HighlightRequest& req, const QString& prompt, 
     messages.append(message);
     body.insert(QStringLiteral("messages"), messages);
 
-    QEventLoop loop;
-    QNetworkReply* reply = network.post(request, QJsonDocument(body).toJson(QJsonDocument::Compact));
-    QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
-    loop.exec();
+    const QByteArray response = postJsonWithTimeout(
+        network, request, QJsonDocument(body).toJson(QJsonDocument::Compact),
+        req.timeoutMs, canceled, err);
+    if (err && !err->isEmpty())
+        return QString();
 
-    const QByteArray response = reply->readAll();
-    const QNetworkReply::NetworkError networkError = reply->error();
-    const QString errorString = reply->errorString();
-    const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
-    reply->deleteLater();
+    return anthropicResponseText(response);
+}
 
-    if (networkError != QNetworkReply::NoError || status >= 400) {
-        if (err) {
-            *err = status > 0
-                ? QStringLiteral("network error %1: %2").arg(status).arg(errorString)
-                : QStringLiteral("network error: %1").arg(errorString);
-        }
+QString sendOpenAiPrompt(const HighlightRequest& req, const QString& prompt,
+                         const QString& apiKey, const CancelFn& canceled, QString* err)
+{
+    if (apiKey.trimmed().isEmpty()) {
+        if (err)
+            *err = QStringLiteral("no api key");
         return QString();
     }
 
-    return anthropicResponseText(response);
+    QNetworkAccessManager network;
+    QNetworkRequest request(QUrl(QStringLiteral("https://api.openai.com/v1/chat/completions")));
+    request.setRawHeader("Authorization", QByteArray("Bearer ") + apiKey.trimmed().toUtf8());
+    request.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
+
+    const QString model = req.model.trimmed().isEmpty()
+        ? QStringLiteral("gpt-4o-mini")
+        : req.model.trimmed();
+
+    QJsonObject body;
+    body.insert(QStringLiteral("model"), model);
+    body.insert(QStringLiteral("max_tokens"), 1000);
+
+    QJsonArray messages;
+    QJsonObject message;
+    message.insert(QStringLiteral("role"), QStringLiteral("user"));
+    message.insert(QStringLiteral("content"), prompt);
+    messages.append(message);
+    body.insert(QStringLiteral("messages"), messages);
+
+    const QByteArray response = postJsonWithTimeout(
+        network, request, QJsonDocument(body).toJson(QJsonDocument::Compact),
+        req.timeoutMs, canceled, err);
+    if (err && !err->isEmpty())
+        return QString();
+
+    return openAiResponseText(response);
+}
+
+QString sendGeminiPrompt(const HighlightRequest& req, const QString& prompt,
+                         const QString& apiKey, const CancelFn& canceled, QString* err)
+{
+    if (apiKey.trimmed().isEmpty()) {
+        if (err)
+            *err = QStringLiteral("no api key");
+        return QString();
+    }
+
+    const QString model = req.model.trimmed().isEmpty()
+        ? QStringLiteral("gemini-2.0-flash")
+        : req.model.trimmed();
+    const QString encodedModel = QString::fromLatin1(QUrl::toPercentEncoding(model));
+
+    QNetworkAccessManager network;
+    QNetworkRequest request(QUrl(QStringLiteral(
+        "https://generativelanguage.googleapis.com/v1beta/models/%1:generateContent")
+        .arg(encodedModel)));
+    request.setRawHeader("x-goog-api-key", apiKey.trimmed().toUtf8());
+    request.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
+
+    QJsonObject part;
+    part.insert(QStringLiteral("text"), prompt);
+    QJsonArray parts;
+    parts.append(part);
+
+    QJsonObject content;
+    content.insert(QStringLiteral("role"), QStringLiteral("user"));
+    content.insert(QStringLiteral("parts"), parts);
+    QJsonArray contents;
+    contents.append(content);
+
+    QJsonObject generationConfig;
+    generationConfig.insert(QStringLiteral("maxOutputTokens"), 1000);
+
+    QJsonObject body;
+    body.insert(QStringLiteral("contents"), contents);
+    body.insert(QStringLiteral("generationConfig"), generationConfig);
+
+    const QByteArray response = postJsonWithTimeout(
+        network, request, QJsonDocument(body).toJson(QJsonDocument::Compact),
+        req.timeoutMs, canceled, err);
+    if (err && !err->isEmpty())
+        return QString();
+
+    return geminiResponseText(response);
 }
 
 } // namespace
@@ -432,7 +668,8 @@ QVector<Highlight> TranscriptHighlighter::detectOffline(const QList<caption::Cli
     return highlights;
 }
 
-QVector<Highlight> TranscriptHighlighter::detect(const HighlightRequest& req, SendFn sender, QString* err)
+QVector<Highlight> TranscriptHighlighter::detect(const HighlightRequest& req, SendFn sender,
+                                                 QString* err, CancelFn canceled)
 {
     if (err)
         err->clear();
@@ -450,18 +687,34 @@ QVector<Highlight> TranscriptHighlighter::detect(const HighlightRequest& req, Se
         if (sender) {
             raw = sender(prompt, &sendError);
         } else {
-            const QString apiKey = anthropicApiKey();
             const bool offlineProvider = provider.isEmpty()
                 || provider.compare(QStringLiteral("offline"), Qt::CaseInsensitive) == 0;
-            if (offlineProvider || apiKey.trimmed().isEmpty())
+            if (offlineProvider)
                 return detectOffline(req.transcript, targetCount);
 
-            if (provider.compare(QStringLiteral("anthropic"), Qt::CaseInsensitive) != 0) {
+            QString apiKey;
+            if (provider.compare(QStringLiteral("anthropic"), Qt::CaseInsensitive) == 0) {
+                apiKey = anthropicApiKey();
+            } else if (provider.compare(QStringLiteral("openai"), Qt::CaseInsensitive) == 0) {
+                apiKey = openaiApiKey();
+            } else if (provider.compare(QStringLiteral("gemini"), Qt::CaseInsensitive) == 0) {
+                apiKey = geminiApiKey();
+            } else {
                 if (err)
                     *err = QStringLiteral("unsupported provider");
                 return QVector<Highlight>();
             }
-            raw = sendAnthropicPrompt(req, prompt, apiKey, &sendError);
+
+            if (apiKey.trimmed().isEmpty())
+                return detectOffline(req.transcript, targetCount);
+
+            if (provider.compare(QStringLiteral("anthropic"), Qt::CaseInsensitive) == 0) {
+                raw = sendAnthropicPrompt(req, prompt, apiKey, canceled, &sendError);
+            } else if (provider.compare(QStringLiteral("openai"), Qt::CaseInsensitive) == 0) {
+                raw = sendOpenAiPrompt(req, prompt, apiKey, canceled, &sendError);
+            } else {
+                raw = sendGeminiPrompt(req, prompt, apiKey, canceled, &sendError);
+            }
         }
     } catch (const std::exception& ex) {
         if (err)

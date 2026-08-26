@@ -13788,10 +13788,27 @@ void MainWindow::openTranscriptHighlightDialog()
     const transcripthl::HighlightRequest req = dialog.request();
     QString err;
     transcripthl::TranscriptHighlighter highlighter;
-    const QVector<Highlight> highlights = highlighter.detect(req, nullptr, &err);
+    QProgressDialog progress(QStringLiteral("ハイライトを検出中..."),
+                             QStringLiteral("キャンセル"), 0, 0, this);
+    progress.setWindowTitle(QStringLiteral("文字起こしからハイライト検出"));
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setMinimumDuration(0);
+    progress.setAutoClose(false);
+    progress.setAutoReset(false);
+    progress.show();
+    QApplication::processEvents();
+
+    const QVector<Highlight> highlights = highlighter.detect(
+        req, nullptr, &err, [&progress]() { return progress.wasCanceled(); });
+    progress.close();
 
     // dialog.exec() は既に閉じているため、結果は QMessageBox で可視化する
     // (6B-4 whisper と同じパターン)。
+    if (err == QStringLiteral("canceled")) {
+        statusBar()->showMessage(QStringLiteral("ハイライト検出をキャンセルしました。"));
+        return;
+    }
+
     if (highlights.isEmpty()) {
         const QString message = err.isEmpty()
             ? QStringLiteral("ハイライトを検出できませんでした。")
