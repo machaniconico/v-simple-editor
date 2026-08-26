@@ -203,6 +203,7 @@ struct ClipMotion;
 class PasteAttributesDialog;
 class LoudnessPanel;
 class QDockWidget;
+class AiChatDock;
 class NodeCanvasWidget;
 class NodePropertiesPanel;
 class NodeGraph;
@@ -210,9 +211,20 @@ class NodeEvaluator;
 class ParticleEffectDialog;
 class VfxControlsPanel;
 
+namespace mcp {
+class McpToolRegistry;
+class McpHttpServer;
+class McpEditorTools;
+}
+
 class MainWindow : public QMainWindow
 {
     Q_OBJECT
+
+    // MCP サーバのツール実装。MainWindow の内部状態 (メニューアクション表と
+    // Timeline) を読み書きするため friend にしている。GUI スレッド上でしか
+    // 呼ばれない (McpHttpServer が GUI スレッドのイベントループで動く)。
+    friend class mcp::McpEditorTools;
 
 public:
     explicit MainWindow(QWidget *parent = nullptr);
@@ -250,10 +262,14 @@ public slots:
     // US-SNS-7: Loudness normalization slot
     void applyLoudnessNormalize(double targetLUFS, double gainDb);
 
+    // AI チャット Dock から MCP サーバを確実に起動するための公開スロット。
+    void toggleMcpServer(bool enabled);
+
 public:
     // Current playhead position in seconds. Used by EffectControlsPanel
     // for keyframe insertion at the current timeline position.
     double currentPlayheadSeconds() const;
+    QString projectDirectory() const;
 
 signals:
     void playheadSecondsChanged(double seconds);
@@ -603,6 +619,7 @@ private slots:
     // User-customizable "お気に入り" menu — opens FavoritesEditDialog, then
     // persists the chosen action ids to QSettings and rebuilds the menu.
     void editFavorites();
+    void showMcpConnectionInfo();
 
 protected:
     void dragEnterEvent(QDragEnterEvent *event) override;
@@ -761,6 +778,7 @@ private:
     QAction *m_deleteAction;
     QAction *m_rippleDeleteAction;
     QAction *m_copyAction;
+    QAction *m_copyCurrentFrameAction = nullptr;
     QAction *m_pasteAction;
     QAction *m_copyEffectsAction = nullptr;
     QAction *m_pasteEffectsAction = nullptr;
@@ -1044,6 +1062,20 @@ private:
     QString m_nodeModeClipId;
 
     QAction *m_nodeModeAction = nullptr;
+
+    // PRD-MCP: HTTP サーバとツール実装は遅延生成する。MainWindow.h では
+    // 前方宣言だけにして、MCP ヘッダの変更による再コンパイルを広げない。
+    mcp::McpToolRegistry *m_mcpRegistry = nullptr;
+    mcp::McpHttpServer *m_mcpServer = nullptr;
+    mcp::McpEditorTools *m_mcpTools = nullptr;
+    QAction *m_mcpToggleAction = nullptr;
+    QAction *m_mcpConnectionInfoAction = nullptr;
+    // --mcp-serve でのその場限りの起動中だけ true。QSettings の
+    // mcpAutoStart を書き換えないためのガード。
+    bool m_mcpSuppressAutoStartPersist = false;
+    AiChatDock *m_aiChatDock = nullptr;
+
+    void ensureMcpServerComponents();
 
     void setupNodeCompositingDocks();
     void toggleNodeCompositingMode(bool on);

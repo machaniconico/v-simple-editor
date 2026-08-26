@@ -133,6 +133,16 @@ echo ============================================================
 echo.
 
 if not exist "%SCRIPT_DIR%%BUILD_DIR%\Release\v-simple-editor.exe" goto done
+
+REM ------- 7. デスクトップショートカット更新 (setup.bat と同じ方式) -------
+set "EXE_PATH=%SCRIPT_DIR%%BUILD_DIR%\Release\v-simple-editor.exe"
+powershell -NoProfile -Command "$ws = New-Object -ComObject WScript.Shell; $lnk = $ws.CreateShortcut((Join-Path ([Environment]::GetFolderPath('Desktop')) 'V Simple Editor.lnk')); $lnk.TargetPath = '!EXE_PATH!'; $lnk.WorkingDirectory = (Split-Path '!EXE_PATH!' -Parent); $lnk.IconLocation = '!EXE_PATH!,0'; $lnk.Description = 'V Simple Editor'; $lnk.Save()" >nul 2>&1
+if errorlevel 1 (
+    echo [WARN] デスクトップショートカットの更新に失敗しました
+) else (
+    echo [OK] デスクトップの V Simple Editor.lnk をこのビルドに向けました
+)
+
 explorer "%SCRIPT_DIR%%BUILD_DIR%\Release"
 goto done
 

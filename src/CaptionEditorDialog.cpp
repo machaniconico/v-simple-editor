@@ -2,6 +2,7 @@
 #include "CaptionCps.h"
 #include "SubtitleIO.h"
 #include "SpeechRecognizer.h"
+#include "WhisperTranscriber.h"
 
 #include <QApplication>
 #include <QBrush>
@@ -96,6 +97,7 @@ CaptionEditorDialog::CaptionEditorDialog(QWidget* parent)
         {tr("開始(ms)"), tr("終了(ms)"), tr("テキスト"), tr("CPS"), tr("話者")});
     m_clipTable->setSelectionBehavior(QAbstractItemView::SelectRows);
     m_clipTable->setSelectionMode(QAbstractItemView::SingleSelection);
+    m_clipTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
     m_clipTable->setAlternatingRowColors(true);
     m_clipTable->horizontalHeader()->setStretchLastSection(true);
     m_clipTable->verticalHeader()->setVisible(false);
@@ -141,13 +143,16 @@ CaptionEditorDialog::CaptionEditorDialog(QWidget* parent)
     // ===================== 右パネル =====================
     // テキスト GroupBox
     m_textEdit = new QTextEdit(this);
+    m_textEdit->setObjectName(QStringLiteral("captionClipTextEdit"));
     m_textEdit->setFixedHeight(100);
 
     m_startMsSpin = new QSpinBox(this);
+    m_startMsSpin->setObjectName(QStringLiteral("captionClipStartMsSpinBox"));
     m_startMsSpin->setRange(0, 3600000);
     m_startMsSpin->setSuffix(QStringLiteral(" ms"));
 
     m_endMsSpin = new QSpinBox(this);
+    m_endMsSpin->setObjectName(QStringLiteral("captionClipEndMsSpinBox"));
     m_endMsSpin->setRange(0, 3600000);
     m_endMsSpin->setSuffix(QStringLiteral(" ms"));
 
@@ -215,6 +220,13 @@ CaptionEditorDialog::CaptionEditorDialog(QWidget* parent)
     karaokeRow->addWidget(m_karaokeCheck);
     karaokeRow->addWidget(m_karaokeColorButton, 1);
 
+    m_singleWordCheck = new QCheckBox(tr("1語ずつ表示"), this);
+    m_singleWordCheck->setObjectName(QStringLiteral("captionSingleWordModeCheckBox"));
+    m_singleWordCheck->setAccessibleName(tr("1語表示モード"));
+    m_singleWordCheck->setAccessibleDescription(
+        tr("字幕を単語ごとの表示区間に分けてタイムラインへ適用します。"));
+    m_singleWordCheck->setChecked(true);
+
     m_anchorCombo = new QComboBox(this);
     const QStringList anchorLabels = caption::anchorNames();
     m_anchorCombo->addItem(anchorLabels.value(0), caption::anchorToString(caption::Anchor::TopLeft));
@@ -236,6 +248,7 @@ CaptionEditorDialog::CaptionEditorDialog(QWidget* parent)
     styleForm->addRow(tr("縁取り色/太さ:"), outlineRow);
     styleForm->addRow(tr("背景:"),          bgRow);
     styleForm->addRow(tr("カラオケ:"),      karaokeRow);
+    styleForm->addRow(tr("表示:"),          m_singleWordCheck);
     styleForm->addRow(tr("位置:"),          m_anchorCombo);
 
     auto* styleGroup = new QGroupBox(tr("スタイル"), this);
@@ -246,6 +259,19 @@ CaptionEditorDialog::CaptionEditorDialog(QWidget* parent)
     m_previewLabel->setFixedSize(320, 80);
     m_previewLabel->setAlignment(Qt::AlignCenter);
 
+    m_applyToTimelineButton = new QPushButton(tr("1語字幕をタイムラインに適用"), this);
+    m_applyToTimelineButton->setObjectName(QStringLiteral("captionApplyToTimelineButton"));
+    m_applyToTimelineButton->setAccessibleName(tr("字幕をタイムラインに適用"));
+    m_applyToTimelineButton->setAccessibleDescription(
+        tr("現在の字幕とスタイルから1語字幕を作成し、V1に適用します。"));
+
+    m_applyErrorLabel = new QLabel(this);
+    m_applyErrorLabel->setObjectName(QStringLiteral("captionApplyErrorLabel"));
+    m_applyErrorLabel->setAccessibleName(tr("タイムライン適用エラー"));
+    m_applyErrorLabel->setWordWrap(true);
+    m_applyErrorLabel->setStyleSheet(QStringLiteral("color: #e35d6a;"));
+    m_applyErrorLabel->hide();
+
     // ダイアログボタン
     m_buttonBox = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
 
@@ -254,6 +280,8 @@ CaptionEditorDialog::CaptionEditorDialog(QWidget* parent)
     rightLayout->addWidget(styleGroup);
     rightLayout->addWidget(m_previewLabel, 0, Qt::AlignHCenter);
     rightLayout->addStretch();
+    rightLayout->addWidget(m_applyErrorLabel);
+    rightLayout->addWidget(m_applyToTimelineButton);
     rightLayout->addWidget(m_buttonBox);
 
     // ===================== メインレイアウト =====================
@@ -277,6 +305,12 @@ CaptionEditorDialog::CaptionEditorDialog(QWidget* parent)
     connect(m_exportButton,     &QPushButton::clicked, this, &CaptionEditorDialog::onExportClicked);
     connect(m_recognizeButton,  &QPushButton::clicked, this, &CaptionEditorDialog::onRecognizeClicked);
     connect(m_applyPresetButton, &QPushButton::clicked, this, &CaptionEditorDialog::onApplyPresetClicked);
+    connect(m_applyToTimelineButton, &QPushButton::clicked,
+            this, &CaptionEditorDialog::onApplyToTimelineClicked);
+    connect(m_singleWordCheck, &QCheckBox::toggled, this, [this](bool enabled) {
+        m_applyToTimelineButton->setEnabled(enabled);
+        setApplyError(QString());
+    });
 
     // スタイルコントロール → onStyleChanged
     connect(m_fontCombo,    &QFontComboBox::currentFontChanged, this, [this](const QFont&) { onStyleChanged(); });
@@ -348,6 +382,8 @@ CaptionEditorDialog::CaptionEditorDialog(QWidget* parent)
 void CaptionEditorDialog::setTrack(const caption::Track& track)
 {
     m_track = track;
+    m_recognizedSourcePath.clear();
+    setApplyError(QString());
     rebuildClipTable();
     updatePreview();
     emit trackChanged(m_track);
@@ -403,14 +439,55 @@ SubtitleStyle CaptionEditorDialog::subtitleStyle() const
     return m_subtitleStyle;
 }
 
+bool CaptionEditorDialog::singleWordModeEnabled() const
+{
+    return m_singleWordCheck && m_singleWordCheck->isChecked();
+}
+
+void CaptionEditorDialog::setSingleWordModeEnabled(bool enabled)
+{
+    if (m_singleWordCheck)
+        m_singleWordCheck->setChecked(enabled);
+}
+
+QString CaptionEditorDialog::applyError() const
+{
+    return m_applyErrorLabel ? m_applyErrorLabel->text() : QString();
+}
+
+void CaptionEditorDialog::setApplyError(const QString& message)
+{
+    if (!m_applyErrorLabel)
+        return;
+    m_applyErrorLabel->setText(message);
+    m_applyErrorLabel->setVisible(!message.isEmpty());
+}
+
 // ---------------------------------------------------------------------------
 // onClipRowChanged
 // ---------------------------------------------------------------------------
 void CaptionEditorDialog::onClipRowChanged(int row)
 {
     m_currentRow = row;
-    if (row < 0 || row >= m_track.clipCount())
+    if (row < 0 || row >= m_track.clipCount()) {
+        QSignalBlocker b1(m_textEdit);
+        QSignalBlocker b2(m_startMsSpin);
+        QSignalBlocker b3(m_endMsSpin);
+        m_textEdit->clear();
+        m_startMsSpin->setValue(0);
+        m_endMsSpin->setValue(0);
+        m_textEdit->setEnabled(false);
+        m_startMsSpin->setEnabled(false);
+        m_endMsSpin->setEnabled(false);
+        m_removeClipButton->setEnabled(false);
+        updatePreview();
         return;
+    }
+
+    m_textEdit->setEnabled(true);
+    m_startMsSpin->setEnabled(true);
+    m_endMsSpin->setEnabled(true);
+    m_removeClipButton->setEnabled(true);
 
     const caption::Clip clip = m_track.clipAt(row);
 
@@ -434,7 +511,12 @@ void CaptionEditorDialog::onClipTextEdited()
         return;
 
     caption::Clip clip = m_track.clipAt(m_currentRow);
-    clip.text = m_textEdit->toPlainText();
+    const QString editedText = m_textEdit->toPlainText();
+    if (clip.text == editedText)
+        return;
+    clip.text = editedText;
+    clip.words.clear();
+    setApplyError(QString());
     m_track.updateClip(m_currentRow, clip);
     refreshClipRow(m_currentRow);
     emit trackChanged(m_track);
@@ -450,8 +532,14 @@ void CaptionEditorDialog::onClipTimeEdited()
         return;
 
     caption::Clip clip = m_track.clipAt(m_currentRow);
-    clip.startMs = m_startMsSpin->value();
-    clip.endMs   = m_endMsSpin->value();
+    const qint64 editedStartMs = m_startMsSpin->value();
+    const qint64 editedEndMs = m_endMsSpin->value();
+    if (clip.startMs == editedStartMs && clip.endMs == editedEndMs)
+        return;
+    clip.startMs = editedStartMs;
+    clip.endMs = editedEndMs;
+    clip.words.clear();
+    setApplyError(QString());
     m_track.updateClip(m_currentRow, clip);
     refreshClipRow(m_currentRow);
     emit trackChanged(m_track);
@@ -462,6 +550,7 @@ void CaptionEditorDialog::onClipTimeEdited()
 // ---------------------------------------------------------------------------
 void CaptionEditorDialog::onAddClipClicked()
 {
+    setApplyError(QString());
     caption::Clip c;
     c.startMs = 0;
     c.endMs   = 2000;
@@ -486,6 +575,7 @@ void CaptionEditorDialog::onRemoveClipClicked()
     if (m_currentRow < 0 || m_currentRow >= m_track.clipCount())
         return;
 
+    setApplyError(QString());
     m_track.removeClipAt(m_currentRow);
     rebuildClipTable();
     emit trackChanged(m_track);
@@ -517,9 +607,12 @@ void CaptionEditorDialog::onImportClicked()
     }
 
     m_track.clear();
+    m_recognizedSourcePath.clear();
     for (const auto& clip : result.clips)
         m_track.addClip(clip);
     m_track.sortByStart();
+
+    setApplyError(QString());
 
     rebuildClipTable();
     emit trackChanged(m_track);
@@ -563,42 +656,54 @@ void CaptionEditorDialog::onRecognizeClicked()
     if (audioPath.isEmpty())
         return;
 
-    auto recognizer = speech::recognizerByName(m_recognizerCombo->currentText());
-    if (!recognizer) {
-        QMessageBox::warning(this, tr("認識エラー"), tr("認識エンジンが見つかりません。"));
-        return;
-    }
-
-    speech::RecognizeParams params;
-    params.audioPath = audioPath;
-    params.language  = m_languageCombo->currentText();
-    params.modelId   = QStringLiteral("base");
+    whisper::TranscribeRequest request;
+    request.mediaPath = audioPath;
+    request.language = m_languageCombo->currentText();
+    request.recognizerName = m_recognizerCombo->currentText();
 
     QApplication::setOverrideCursor(Qt::WaitCursor);
-    const speech::RecognizeResult res = recognizer->recognize(params);
+    whisper::WhisperTranscriber transcriber;
+    const whisper::TranscribeOutcome outcome = transcriber.transcribe(request);
     QApplication::restoreOverrideCursor();
 
-    if (!res.success) {
-        QMessageBox::warning(this, tr("認識失敗"), res.error);
+    if (!outcome.success) {
+        QMessageBox::warning(this, tr("認識失敗"), outcome.error);
         return;
     }
 
-    m_track.clear();
-    for (const auto& seg : res.segments) {
-        caption::Clip clip;
-        clip.startMs = seg.startMs;
-        clip.endMs   = seg.endMs;
-        clip.text    = seg.text;
-        m_track.addClip(clip);
-    }
-    m_track.sortByStart();
-    rebuildClipTable();
-    emit trackChanged(m_track);
+    setRecognizedSegments(outcome.raw.segments, audioPath);
 
     QMessageBox::information(
         this,
         tr("認識完了"),
-        tr("%1 個のセグメントを取り込みました。").arg(res.segments.size()));
+        tr("%1 個のセグメントを取り込みました。").arg(outcome.raw.segments.size()));
+}
+
+void CaptionEditorDialog::setRecognizedSegments(
+    const QList<speech::Segment>& segments, const QString& sourcePath)
+{
+    m_track.clear();
+    m_recognizedSourcePath = sourcePath;
+    for (const speech::Segment& seg : segments) {
+        caption::Clip clip;
+        clip.startMs = seg.startMs;
+        clip.endMs   = seg.endMs;
+        clip.text    = seg.text;
+        clip.words.reserve(seg.words.size());
+        for (const speech::Word& sourceWord : seg.words) {
+            caption::Word word;
+            word.startMs = sourceWord.startMs;
+            word.endMs = sourceWord.endMs;
+            word.text = sourceWord.text;
+            word.confidence = sourceWord.confidence;
+            clip.words.append(word);
+        }
+        m_track.addClip(clip);
+    }
+    m_track.sortByStart();
+    setApplyError(QString());
+    rebuildClipTable();
+    emit trackChanged(m_track);
 }
 
 // ---------------------------------------------------------------------------
@@ -638,6 +743,34 @@ void CaptionEditorDialog::onApplyPresetClicked()
     syncSubtitleStyleFromCaptionStyle();
     updateStyleControls();
     onStyleChanged();
+}
+
+void CaptionEditorDialog::onApplyToTimelineClicked()
+{
+    setApplyError(QString());
+    if (!singleWordModeEnabled()) {
+        setApplyError(tr("1語表示を有効にしてから適用してください。"));
+        return;
+    }
+    if (m_track.clipCount() <= 0) {
+        setApplyError(tr("適用できる字幕がありません。"));
+        return;
+    }
+
+    for (int i = 0; i < m_track.clipCount(); ++i) {
+        const caption::Clip clip = m_track.clipAt(i);
+        if (clip.text.trimmed().isEmpty()) {
+            setApplyError(tr("空の字幕はタイムラインへ適用できません。"));
+            return;
+        }
+        if (clip.endMs <= clip.startMs) {
+            setApplyError(tr("字幕の終了時刻は開始時刻より後にしてください。"));
+            return;
+        }
+    }
+
+    onStyleChanged();
+    emit applyToTimelineRequested();
 }
 
 // ---------------------------------------------------------------------------

@@ -20,6 +20,10 @@ struct TimelineState {
     // restores the whole timeline state.
     QVector<QVector<ClipInfo>> videoTracks;
     QVector<QVector<ClipInfo>> audioTracks;
+    // Project/timeline-level generated captions.  Keeping these outside
+    // ClipInfo prevents split/copy/delete/reorder from multiplying or losing
+    // the canonical word-caption set.
+    QVector<EnhancedTextOverlay> generatedCaptionOverlays;
     // Legacy V1-relative selection (kept for source compatibility).
     int selectedClip = -1;
     // V2+ track-aware selection: (track index, clip index) — -1 means

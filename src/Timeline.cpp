@@ -1,4 +1,6 @@
 #include "Timeline.h"
+#include "CaptionOverlayBuilder.h"
+#include "CaptionTrack.h"
 #include "AudioClipEditor.h"
 #include "VideoPlayer.h"
 #include "SilenceCut.h"
@@ -22,7 +24,10 @@
 
 #include <algorithm>
 #include <functional>
+#include <limits>
+#include <utility>
 #include <QFileInfo>
+#include <QDir>
 #include <QFont>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -339,6 +344,7 @@ QJsonObject sequenceToStoreJson(const TimelineSequence &sequence)
     ProjectData data;
     data.videoTracks = sequence.videoTracks;
     data.audioTracks = sequence.audioTracks;
+    data.generatedCaptionOverlays = sequence.generatedCaptionOverlays;
 
     QJsonObject project =
         QJsonDocument::fromJson(ProjectFile::toJsonString(data).toUtf8()).object();
@@ -348,6 +354,8 @@ QJsonObject sequenceToStoreJson(const TimelineSequence &sequence)
     obj[QStringLiteral("name")] = sequence.name;
     obj[QStringLiteral("videoTracks")] = project.value(QStringLiteral("videoTracks")).toArray();
     obj[QStringLiteral("audioTracks")] = project.value(QStringLiteral("audioTracks")).toArray();
+    obj[QStringLiteral("generatedCaptionOverlays")] =
+        project.value(QStringLiteral("generatedCaptionOverlays")).toArray();
     return obj;
 }
 
@@ -362,6 +370,8 @@ TimelineSequence sequenceFromStoreJson(const QJsonObject &obj)
     project[QStringLiteral("config")] = QJsonObject{};
     project[QStringLiteral("videoTracks")] = obj.value(QStringLiteral("videoTracks")).toArray();
     project[QStringLiteral("audioTracks")] = obj.value(QStringLiteral("audioTracks")).toArray();
+    project[QStringLiteral("generatedCaptionOverlays")] =
+        obj.value(QStringLiteral("generatedCaptionOverlays")).toArray();
     project[QStringLiteral("playheadPos")] = 0.0;
     project[QStringLiteral("markIn")] = -1.0;
     project[QStringLiteral("markOut")] = -1.0;
@@ -372,6 +382,7 @@ TimelineSequence sequenceFromStoreJson(const QJsonObject &obj)
             QJsonDocument(project).toJson(QJsonDocument::Compact)), data)) {
         sequence.videoTracks = data.videoTracks;
         sequence.audioTracks = data.audioTracks;
+        sequence.generatedCaptionOverlays = data.generatedCaptionOverlays;
     }
     return sequence;
 }
@@ -692,13 +703,16 @@ bool TimelineTrack::envelopeEditMode() { return g_envelopeEditMode; }
 // updateTextOverlayTime.
 class TextStripWidget : public QWidget {
 public:
-    using TimeChangeCallback = std::function<void(int, double, double)>;
+    using TimeChangeCallback = std::function<bool(int, double, double)>;
+    using TimeEditCallback = std::function<void()>;
     using RowHeightChangeCallback = std::function<void(int)>;
     explicit TextStripWidget(QWidget *parent = nullptr) : QWidget(parent) {
         // Caller sets the height via setFixedHeight to match Timeline's
         // m_trackHeight so the text row looks like any V/A row.
         setStyleSheet("background-color: #2b2b2b;");
         setMouseTracking(true);
+        setObjectName(QStringLiteral("TimelineTextStrip"));
+        setAccessibleName(QStringLiteral("Timeline text overlays"));
     }
     void setOverlays(const QVector<EnhancedTextOverlay> &overlays, double clipDurationSec) {
         m_overlays = overlays;
@@ -718,6 +732,12 @@ public:
     // user drags one of an overlay bar's edge handles. A function
     // callback avoids Q_OBJECT + MOC plumbing for this inline widget.
     void setTimeChangeCallback(TimeChangeCallback cb) { m_timeChangeCb = std::move(cb); }
+    void setTimeEditStartedCallback(TimeEditCallback cb) {
+        m_timeEditStartedCb = std::move(cb);
+    }
+    void setTimeEditFinishedCallback(TimeEditCallback cb) {
+        m_timeEditFinishedCb = std::move(cb);
+    }
     // Called with the new row height (pixels) while the user drags the
     // row's bottom edge. Timeline resizes the strip AND its paired header.
     void setRowHeightChangeCallback(RowHeightChangeCallback cb) { m_rowHeightCb = std::move(cb); }
@@ -783,6 +803,7 @@ protected:
         }
         if (m_dragIdx >= 0 && m_dragIdx < m_overlays.size()) {
             const double tSec = qMax(0.0, event->pos().x() / m_pps);
+            const EnhancedTextOverlay previous = m_overlays.at(m_dragIdx);
             auto &ov = m_overlays[m_dragIdx];
             if (m_dragEdge == -1) {
                 ov.startTime = qMin(tSec, ov.endTime - 0.1);
@@ -800,8 +821,17 @@ protected:
             }
             // Re-bin-pack so overlays that now overlap move to a new row.
             rebuildRowLayout();
-            if (m_timeChangeCb)
-                m_timeChangeCb(m_dragIdx, ov.startTime, ov.endTime);
+            const double requestedStart = ov.startTime;
+            const double requestedEnd = ov.endTime;
+            if (m_timeChangeCb
+                && !m_timeChangeCb(m_dragIdx, requestedStart, requestedEnd)) {
+                // Timeline rejected the candidate (for example because it
+                // would cross a neighbouring generated caption).  Restore
+                // the widget model immediately so paint/hit-testing cannot
+                // drift away from the canonical timeline state.
+                m_overlays[m_dragIdx] = previous;
+                rebuildRowLayout();
+            }
             update();
             return;
         }
@@ -858,15 +888,21 @@ protected:
             const QRect r = rectForOverlay(i);
             if (!r.contains(event->pos())) continue;
             if (qAbs(event->pos().x() - r.left()) <= 7) {
+                if (m_timeEditStartedCb)
+                    m_timeEditStartedCb();
                 m_dragIdx = i; m_dragEdge = -1;
                 return;
             }
             if (qAbs(event->pos().x() - r.right()) <= 7) {
+                if (m_timeEditStartedCb)
+                    m_timeEditStartedCb();
                 m_dragIdx = i; m_dragEdge = 1;
                 return;
             }
             // Body drag — capture anchor so the bar slides with the cursor
             // without snapping its leading edge to the click point.
+            if (m_timeEditStartedCb)
+                m_timeEditStartedCb();
             m_dragIdx = i;
             m_dragEdge = 0;
             m_dragOriginalStart = m_overlays[i].startTime;
@@ -878,9 +914,12 @@ protected:
         }
     }
     void mouseReleaseEvent(QMouseEvent *) override {
+        const bool finishedTimingDrag = m_dragIdx >= 0;
         m_dragIdx = -1;
         m_dragEdge = 0;
         m_rowHeightDragging = false;
+        if (finishedTimingDrag && m_timeEditFinishedCb)
+            m_timeEditFinishedCb();
         update();
     }
 private:
@@ -901,18 +940,57 @@ private:
         const int y = 2 + row * slotH;
         return QRect(x, y, w, slotH - 1);
     }
-    // Each overlay gets its own row in insertion order (T1, T2, T3, ...)
-    // so every new text input visibly adds a fresh row below the previous
-    // ones — matches the user's mental model of "T1, T2, T3 grows on each
-    // input" instead of bin-packing multiple non-overlapping overlays
-    // into the same row. The widget height grows to fit all rows so the
-    // user can see every overlay at a reasonable minimum per-row height.
     void rebuildRowLayout() {
         m_overlayRowIdx.clear();
         m_overlayRowIdx.resize(m_overlays.size());
-        for (int i = 0; i < m_overlays.size(); ++i)
-            m_overlayRowIdx[i] = i;
-        m_rowCount = qMax(1, m_overlays.size());
+
+        const QString generatedTag = CaptionOverlayBuilder::generatedTemplateName();
+        int ordinaryRowCount = 0;
+        QVector<int> generatedIndices;
+        generatedIndices.reserve(m_overlays.size());
+        for (int i = 0; i < m_overlays.size(); ++i) {
+            if (m_overlays[i].templateName == generatedTag) {
+                generatedIndices.append(i);
+            } else {
+                // Preserve the existing one-row-per-title behavior for
+                // ordinary authored overlays.
+                m_overlayRowIdx[i] = ordinaryRowCount++;
+            }
+        }
+
+        // Single-word captions are normally sequential.  Interval-color only
+        // the reserved generated set so hundreds of words share one row,
+        // while genuinely overlapping captions receive additional rows.
+        std::sort(generatedIndices.begin(), generatedIndices.end(),
+                  [this](int lhs, int rhs) {
+                      if (m_overlays[lhs].startTime != m_overlays[rhs].startTime)
+                          return m_overlays[lhs].startTime < m_overlays[rhs].startTime;
+                      return m_overlays[lhs].endTime < m_overlays[rhs].endTime;
+                  });
+        QVector<double> generatedRowEnds;
+        for (int index : std::as_const(generatedIndices)) {
+            const auto &overlay = m_overlays[index];
+            const double start = qMax(0.0, overlay.startTime);
+            const double end = overlay.endTime > start
+                ? overlay.endTime
+                : qMax(start + 0.1, m_clipDuration);
+            int generatedRow = -1;
+            for (int row = 0; row < generatedRowEnds.size(); ++row) {
+                if (generatedRowEnds[row] <= start) {
+                    generatedRow = row;
+                    break;
+                }
+            }
+            if (generatedRow < 0) {
+                generatedRow = generatedRowEnds.size();
+                generatedRowEnds.append(end);
+            } else {
+                generatedRowEnds[generatedRow] = end;
+            }
+            m_overlayRowIdx[index] = ordinaryRowCount + generatedRow;
+        }
+
+        m_rowCount = qMax(1, ordinaryRowCount + generatedRowEnds.size());
         const int target = qMax(m_singleRowHeight, m_rowCount * kRowSlotHeight + 4);
         if (target != height() && m_rowHeightCb)
             m_rowHeightCb(target);
@@ -932,6 +1010,8 @@ private:
     int m_hoverIdx = -1;
     int m_hoverEdge = 0;
     TimeChangeCallback m_timeChangeCb;
+    TimeEditCallback m_timeEditStartedCb;
+    TimeEditCallback m_timeEditFinishedCb;
     RowHeightChangeCallback m_rowHeightCb;
     bool m_rowHeightDragging = false;
     int m_rowHeightDragStartY = 0;
@@ -3082,9 +3162,22 @@ void Timeline::setupUI()
     m_textStrip->setFixedHeight(m_trackHeight);
     m_textStrip->setSingleRowHeight(m_trackHeight);
     m_textStrip->setPixelsPerSecond(m_zoomLevel);
+    m_textStrip->setTimeEditStartedCallback([this]() {
+        beginTextOverlayTimeEdit();
+    });
     m_textStrip->setTimeChangeCallback([this](int idx, double start, double end) {
-        if (updateTextOverlayTime(idx, start, end))
-            emit textOverlayTimeChanged(idx, start, end);
+        const bool changed = updateTextOverlayTime(idx, start, end, false);
+        if (changed) {
+            const QVector<EnhancedTextOverlay> applied = timelineTextOverlays();
+            if (idx >= 0 && idx < applied.size()) {
+                emit textOverlayTimeChanged(
+                    idx, applied.at(idx).startTime, applied.at(idx).endTime);
+            }
+        }
+        return changed;
+    });
+    m_textStrip->setTimeEditFinishedCallback([this]() {
+        finishTextOverlayTimeEdit();
     });
     // Row-resize drag: resize ONLY the text row (m_textStrip + paired
     // header), independent of V/A track height, so the user can make the
@@ -4035,6 +4128,391 @@ bool trackRangeOverlapsClip(const TimelineTrack *track, double startSec, double 
 
 } // namespace
 
+namespace {
+
+bool setTimelineEditError(QString *err, const QString &message)
+{
+    if (err)
+        *err = message;
+    return false;
+}
+
+struct IndexEditTarget {
+    TimelineTrack *track = nullptr;
+    int clipIndex = -1;
+    double startSec = 0.0;
+    double endSec = 0.0;
+    double localSplitSec = 0.0;
+};
+
+QVector<TimelineTrack *> timelineTracks(const Timeline *timeline)
+{
+    QVector<TimelineTrack *> tracks;
+    if (!timeline)
+        return tracks;
+    tracks.reserve(timeline->videoTracks().size() + timeline->audioTracks().size());
+    for (TimelineTrack *track : timeline->videoTracks())
+        tracks.append(track);
+    for (TimelineTrack *track : timeline->audioTracks())
+        tracks.append(track);
+    return tracks;
+}
+
+} // namespace
+
+bool Timeline::splitClipByIndex(bool audio, int trackIndex, int clipIndex,
+                                double timelineSeconds, QString *err)
+{
+    if (!std::isfinite(timelineSeconds) || timelineSeconds < 0.0)
+        return setTimelineEditError(err, QStringLiteral("timelineSeconds must be non-negative"));
+
+    TimelineTrack *selectedTrack = trackAt(audio, trackIndex);
+    if (!selectedTrack)
+        return setTimelineEditError(err, QStringLiteral("track index is out of range"));
+    if (clipIndex < 0 || clipIndex >= selectedTrack->clipCount())
+        return setTimelineEditError(err, QStringLiteral("clip index is out of range"));
+    if (selectedTrack->isLocked())
+        return setTimelineEditError(err, QStringLiteral("track is locked"));
+
+    double selectedStart = 0.0;
+    double selectedEnd = 0.0;
+    if (!trackClipTimeRangeAt(selectedTrack, clipIndex, &selectedStart, &selectedEnd)
+        || !std::isfinite(selectedStart) || !std::isfinite(selectedEnd)) {
+        return setTimelineEditError(err, QStringLiteral("clip has no valid duration"));
+    }
+    // Keep the same safety margin as splitAtPlayhead().
+    if (timelineSeconds <= selectedStart + 0.05
+        || timelineSeconds >= selectedEnd - 0.05) {
+        return setTimelineEditError(err, QStringLiteral("split point is outside the clip"));
+    }
+
+    const int oldGroup = selectedTrack->clips().at(clipIndex).linkGroup;
+    const QVector<TimelineTrack *> tracks = timelineTracks(this);
+    QVector<IndexEditTarget> targets;
+    if (oldGroup <= 0) {
+        targets.append(IndexEditTarget{selectedTrack, clipIndex, selectedStart,
+                                       selectedEnd, timelineSeconds - selectedStart});
+    } else {
+        for (TimelineTrack *track : tracks) {
+            if (!track)
+                continue;
+            for (int i = 0; i < track->clipCount(); ++i) {
+                if (track->clips().at(i).linkGroup != oldGroup)
+                    continue;
+                double start = 0.0;
+                double end = 0.0;
+                if (!trackClipTimeRangeAt(track, i, &start, &end)
+                    || !std::isfinite(start) || !std::isfinite(end)
+                    || timelineSeconds <= start + 0.05
+                    || timelineSeconds >= end - 0.05) {
+                    return setTimelineEditError(
+                        err, QStringLiteral("split point is outside the clip"));
+                }
+                if (track->isLocked())
+                    return setTimelineEditError(err, QStringLiteral("track is locked"));
+                targets.append(IndexEditTarget{track, i, start, end,
+                                               timelineSeconds - start});
+            }
+        }
+    }
+
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    const int newGroup = oldGroup > 0 ? allocateLinkGroup() : 0;
+    for (TimelineTrack *track : tracks) {
+        if (!track)
+            continue;
+        QVector<IndexEditTarget> trackTargets;
+        for (const IndexEditTarget &target : targets) {
+            if (target.track == track)
+                trackTargets.append(target);
+        }
+        std::sort(trackTargets.begin(), trackTargets.end(),
+                  [](const IndexEditTarget &a, const IndexEditTarget &b) {
+                      return a.clipIndex > b.clipIndex;
+                  });
+        for (const IndexEditTarget &target : trackTargets) {
+            track->splitClipAt(target.clipIndex, target.localSplitSec, false);
+            if (newGroup > 0) {
+                QVector<ClipInfo> clips = track->clips();
+                clips[target.clipIndex + 1].linkGroup = newGroup;
+                track->setClips(clips);
+            }
+        }
+        if (!trackTargets.isEmpty())
+            track->setClips(track->clips());
+    }
+
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+    saveUndoState(QStringLiteral("Split clip (MCP)"));
+    updateInfoLabel();
+    scheduleEmitSequenceChanged();
+    return true;
+}
+
+bool Timeline::deleteClipByIndex(bool audio, int trackIndex, int clipIndex,
+                                 bool ripple, QString *err)
+{
+    TimelineTrack *selectedTrack = trackAt(audio, trackIndex);
+    if (!selectedTrack)
+        return setTimelineEditError(err, QStringLiteral("track index is out of range"));
+    if (clipIndex < 0 || clipIndex >= selectedTrack->clipCount())
+        return setTimelineEditError(err, QStringLiteral("clip index is out of range"));
+    if (selectedTrack->isLocked())
+        return setTimelineEditError(err, QStringLiteral("track is locked"));
+
+    const int linkGroup = selectedTrack->clips().at(clipIndex).linkGroup;
+    const QVector<TimelineTrack *> tracks = timelineTracks(this);
+    QVector<IndexEditTarget> targets;
+    for (TimelineTrack *track : tracks) {
+        if (!track)
+            continue;
+        for (int i = 0; i < track->clipCount(); ++i) {
+            if ((linkGroup > 0 && track->clips().at(i).linkGroup != linkGroup)
+                || (linkGroup <= 0 && (track != selectedTrack || i != clipIndex))) {
+                continue;
+            }
+            double start = 0.0;
+            double end = 0.0;
+            if (!trackClipTimeRangeAt(track, i, &start, &end))
+                return setTimelineEditError(err, QStringLiteral("clip has no valid duration"));
+            if (track->isLocked())
+                return setTimelineEditError(err, QStringLiteral("track is locked"));
+            targets.append(IndexEditTarget{track, i, start, end, 0.0});
+        }
+    }
+
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    bool changed = false;
+    for (TimelineTrack *track : tracks) {
+        if (!track)
+            continue;
+        QVector<IndexEditTarget> trackTargets;
+        for (const IndexEditTarget &target : targets) {
+            if (target.track == track)
+                trackTargets.append(target);
+        }
+        std::sort(trackTargets.begin(), trackTargets.end(),
+                  [](const IndexEditTarget &a, const IndexEditTarget &b) {
+                      return a.clipIndex > b.clipIndex;
+                  });
+        for (const IndexEditTarget &target : trackTargets) {
+            if (ripple)
+                changed = track->rippleDeleteTimeRange(target.startSec,
+                                                       target.endSec, false)
+                    || changed;
+            else {
+                track->removeClipPreservingDownstream(target.clipIndex, false);
+                changed = true;
+            }
+        }
+        if (!trackTargets.isEmpty())
+            track->setClips(track->clips());
+    }
+
+    if (!changed)
+        return setTimelineEditError(err, QStringLiteral("clip could not be deleted"));
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+    saveUndoState(QStringLiteral("Delete clip (MCP)"));
+    updateInfoLabel();
+    scheduleEmitSequenceChanged();
+    return true;
+}
+
+bool Timeline::moveClipByIndex(bool audio, int trackIndex, int clipIndex,
+                               double newStartSec, double *settledStartSec,
+                               QString *err)
+{
+    if (!std::isfinite(newStartSec) || newStartSec < 0.0)
+        return setTimelineEditError(err, QStringLiteral("newStartSec must be non-negative"));
+
+    TimelineTrack *selectedTrack = trackAt(audio, trackIndex);
+    if (!selectedTrack)
+        return setTimelineEditError(err, QStringLiteral("track index is out of range"));
+    if (clipIndex < 0 || clipIndex >= selectedTrack->clipCount())
+        return setTimelineEditError(err, QStringLiteral("clip index is out of range"));
+    if (selectedTrack->isLocked())
+        return setTimelineEditError(err, QStringLiteral("track is locked"));
+
+    const int linkGroup = selectedTrack->clips().at(clipIndex).linkGroup;
+    const QVector<TimelineTrack *> tracks = timelineTracks(this);
+    QVector<IndexEditTarget> targets;
+    for (TimelineTrack *track : tracks) {
+        if (!track)
+            continue;
+        for (int i = 0; i < track->clipCount(); ++i) {
+            if ((linkGroup > 0 && track->clips().at(i).linkGroup != linkGroup)
+                || (linkGroup <= 0 && (track != selectedTrack || i != clipIndex))) {
+                continue;
+            }
+            double start = 0.0;
+            double end = 0.0;
+            if (!trackClipTimeRangeAt(track, i, &start, &end)
+                || !std::isfinite(start) || !std::isfinite(end)) {
+                return setTimelineEditError(err, QStringLiteral("clip has no valid duration"));
+            }
+            if (track->isLocked())
+                return setTimelineEditError(err, QStringLiteral("track is locked"));
+            targets.append(IndexEditTarget{track, i, start, end, 0.0});
+        }
+    }
+
+    double minimumDelta = -std::numeric_limits<double>::infinity();
+    double maximumDelta = std::numeric_limits<double>::infinity();
+    for (IndexEditTarget &target : targets) {
+        const QVector<ClipInfo> &clips = target.track->clips();
+        double cursor = 0.0;
+        double previousEnd = 0.0;
+        double nextStart = std::numeric_limits<double>::infinity();
+        for (int i = 0; i < clips.size(); ++i) {
+            const double start = cursor + clips.at(i).leadInSec;
+            const double end = start + clips.at(i).effectiveDuration();
+            if (i == target.clipIndex) {
+                previousEnd = cursor;
+                if (i + 1 < clips.size())
+                    nextStart = end + clips.at(i + 1).leadInSec;
+                break;
+            }
+            cursor = end;
+        }
+        minimumDelta = qMax(minimumDelta, previousEnd - target.startSec);
+        if (std::isfinite(nextStart))
+            maximumDelta = qMin(maximumDelta, nextStart - target.endSec);
+    }
+    if (minimumDelta > maximumDelta)
+        return setTimelineEditError(err, QStringLiteral("linked clips cannot move together"));
+
+    const IndexEditTarget &selectedTarget = *std::find_if(
+        targets.cbegin(), targets.cend(), [selectedTrack, clipIndex](const IndexEditTarget &target) {
+            return target.track == selectedTrack && target.clipIndex == clipIndex;
+        });
+    const double requestedDelta = newStartSec - selectedTarget.startSec;
+    const double delta = qBound(minimumDelta, requestedDelta, maximumDelta);
+    if (settledStartSec)
+        *settledStartSec = selectedTarget.startSec + delta;
+
+    struct PendingTrack {
+        TimelineTrack *track = nullptr;
+        QVector<ClipInfo> clips;
+        bool changed = false;
+    };
+    QVector<PendingTrack> pending;
+    for (TimelineTrack *track : tracks) {
+        QVector<int> affected;
+        for (const IndexEditTarget &target : targets) {
+            if (target.track == track)
+                affected.append(target.clipIndex);
+        }
+        if (affected.isEmpty())
+            continue;
+
+        const QVector<ClipInfo> oldClips = track->clips();
+        QVector<double> starts(oldClips.size());
+        QVector<double> durations(oldClips.size());
+        double cursor = 0.0;
+        for (int i = 0; i < oldClips.size(); ++i) {
+            starts[i] = cursor + oldClips.at(i).leadInSec;
+            durations[i] = oldClips.at(i).effectiveDuration();
+            cursor = starts[i] + durations[i];
+        }
+
+        QVector<double> desiredStarts = starts;
+        for (int index : affected)
+            desiredStarts[index] += delta;
+        PendingTrack result{track, oldClips, false};
+        for (int i = 0; i < result.clips.size(); ++i) {
+            const double previousEnd = i == 0
+                ? 0.0 : desiredStarts[i - 1] + durations[i - 1];
+            const double leadIn = desiredStarts[i] - previousEnd;
+            if (!std::isfinite(leadIn) || leadIn < -1e-6)
+                return setTimelineEditError(err, QStringLiteral("linked clips cannot move together"));
+            result.clips[i].leadInSec = qMax(0.0, leadIn);
+            result.changed = result.changed
+                || qAbs(result.clips[i].leadInSec - oldClips.at(i).leadInSec) > 1e-6;
+        }
+        pending.append(std::move(result));
+    }
+
+    if (qAbs(delta) <= 1e-6) {
+        // A clamped no-op is still a valid request, but it must not create a
+        // meaningless undo entry.
+        return true;
+    }
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    for (const PendingTrack &result : pending)
+        result.track->setClips(result.clips);
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+    saveUndoState(QStringLiteral("Move clip (MCP)"));
+    updateInfoLabel();
+    scheduleEmitSequenceChanged();
+    return true;
+}
+
+bool Timeline::setClipPropertyByIndex(bool audio, int trackIndex, int clipIndex,
+                                      const QString &property, double value,
+                                      QString *err)
+{
+    if (!std::isfinite(value))
+        return setTimelineEditError(err, QStringLiteral("value must be a finite number"));
+
+    double lower = 0.0;
+    double upper = 0.0;
+    if (property == QStringLiteral("volume")) {
+        upper = 2.0;
+    } else if (property == QStringLiteral("opacity")) {
+        upper = 1.0;
+    } else if (property == QStringLiteral("speed")) {
+        lower = 0.25;
+        upper = 4.0;
+    } else if (property == QStringLiteral("pan")) {
+        lower = -1.0;
+        upper = 1.0;
+    } else if (property == QStringLiteral("videoScale")) {
+        lower = 0.1;
+        upper = 10.0;
+    } else {
+        return setTimelineEditError(err,
+                                    QStringLiteral("unsupported property: %1").arg(property));
+    }
+    if (value < lower || value > upper)
+        return setTimelineEditError(err, QStringLiteral("%1 out of range [%2, %3]")
+                                         .arg(property).arg(lower).arg(upper));
+
+    TimelineTrack *track = trackAt(audio, trackIndex);
+    if (!track)
+        return setTimelineEditError(err, QStringLiteral("track index is out of range"));
+    if (clipIndex < 0 || clipIndex >= track->clipCount())
+        return setTimelineEditError(err, QStringLiteral("clip index is out of range"));
+    if (track->isLocked())
+        return setTimelineEditError(err, QStringLiteral("track is locked"));
+
+    // Property edits intentionally ignore linkGroup: changing one side's
+    // volume (or another whitelisted property) is a normal MCP use case.
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    QVector<ClipInfo> clips = track->clips();
+    ClipInfo &clip = clips[clipIndex];
+    if (property == QStringLiteral("volume"))
+        clip.volume = value;
+    else if (property == QStringLiteral("opacity"))
+        clip.opacity = value;
+    else if (property == QStringLiteral("speed"))
+        clip.speed = value;
+    else if (property == QStringLiteral("pan"))
+        clip.pan = value;
+    else
+        clip.videoScale = value;
+    track->setClips(clips);
+
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+    saveUndoState(QStringLiteral("Set clip property (MCP)"));
+    updateInfoLabel();
+    scheduleEmitSequenceChanged();
+    return true;
+}
+
 QVector<Timeline::TimeRangeSec> Timeline::selectedClipTimeRanges() const
 {
     QVector<TimeRangeSec> ranges;
@@ -4233,6 +4711,324 @@ bool Timeline::addTextOverlayToFirstVideoClip(const EnhancedTextOverlay &overlay
     return true;
 }
 
+QVector<EnhancedTextOverlay> Timeline::timelineTextOverlays() const
+{
+    QVector<EnhancedTextOverlay> result;
+    if (!m_videoTracks.isEmpty() && m_videoTracks.first()) {
+        const QVector<ClipInfo> &clips = m_videoTracks.first()->clips();
+        if (!clips.isEmpty())
+            result = clips.first().textManager.overlays();
+    }
+    result.reserve(result.size() + m_generatedCaptionOverlays.size());
+    result += m_generatedCaptionOverlays;
+    return result;
+}
+
+namespace {
+
+QString comparableMediaPath(const QString &path)
+{
+    QFileInfo info(path);
+    QString resolved = info.canonicalFilePath();
+    if (resolved.isEmpty())
+        resolved = info.absoluteFilePath();
+    resolved = QDir::cleanPath(resolved);
+#ifdef Q_OS_WIN
+    resolved = resolved.toCaseFolded();
+#endif
+    return resolved;
+}
+
+bool sourceSecondToClipLocal(const ClipInfo &clip,
+                             double sourceSecond,
+                             double *localSecond)
+{
+    if (!localSecond || !std::isfinite(sourceSecond)
+        || clip.speed <= 0.0 || clip.effectiveDuration() <= 0.0) {
+        return false;
+    }
+
+    const double sourceOffset = sourceSecond - clip.inPoint;
+    const double duration = clip.effectiveDuration();
+    constexpr double eps = 1e-7;
+    if (!clip.hasTimeRemap()) {
+        const double local = sourceOffset / clip.speed;
+        if (local < -eps || local > duration + eps)
+            return false;
+        *localSecond = qBound(0.0, local, duration);
+        return true;
+    }
+
+    const QVector<timeremap::TimeRemapKey> &keys = clip.timeRemapCurve.keys;
+    if (keys.size() < 2)
+        return false; // a freeze/constant map has no unique inverse interval
+
+    bool found = false;
+    double resolved = 0.0;
+    for (int i = 1; i < keys.size(); ++i) {
+        const timeremap::TimeRemapKey &a = keys.at(i - 1);
+        const timeremap::TimeRemapKey &b = keys.at(i);
+        const double deltaSource = b.srcTime - a.srcTime;
+        if (qAbs(deltaSource) <= eps)
+            continue;
+        const double low = qMin(a.srcTime, b.srcTime) - eps;
+        const double high = qMax(a.srcTime, b.srcTime) + eps;
+        if (sourceOffset < low || sourceOffset > high)
+            continue;
+        const double u = (sourceOffset - a.srcTime) / deltaSource;
+        const double candidate = a.outTime + u * (b.outTime - a.outTime);
+        if (candidate < -eps || candidate > duration + eps)
+            continue;
+        if (found && qAbs(candidate - resolved) > eps)
+            return false; // non-monotonic curve: source time has two answers
+        found = true;
+        resolved = candidate;
+    }
+    if (!found)
+        return false;
+    *localSecond = qBound(0.0, resolved, duration);
+    return true;
+}
+
+bool clipSourceCoverage(const ClipInfo &clip,
+                        double *sourceStart,
+                        double *sourceEnd)
+{
+    if (!sourceStart || !sourceEnd || clip.speed <= 0.0
+        || clip.effectiveDuration() <= 0.0) {
+        return false;
+    }
+
+    const double duration = clip.effectiveDuration();
+    double minimumOffset = 0.0;
+    double maximumOffset = 0.0;
+    if (!clip.hasTimeRemap()) {
+        maximumOffset = duration * clip.speed;
+    } else {
+        const QVector<timeremap::TimeRemapKey> &keys = clip.timeRemapCurve.keys;
+        if (keys.size() < 2)
+            return false;
+        minimumOffset = clip.timeRemapCurve.srcTimeAt(0.0);
+        maximumOffset = minimumOffset;
+        const auto includeOffset = [&](double value) {
+            minimumOffset = qMin(minimumOffset, value);
+            maximumOffset = qMax(maximumOffset, value);
+        };
+        includeOffset(clip.timeRemapCurve.srcTimeAt(duration));
+        for (const timeremap::TimeRemapKey &key : keys) {
+            if (key.outTime >= 0.0 && key.outTime <= duration)
+                includeOffset(key.srcTime);
+        }
+    }
+
+    *sourceStart = clip.inPoint + minimumOffset;
+    *sourceEnd = clip.inPoint + maximumOffset;
+    if (*sourceEnd < *sourceStart)
+        std::swap(*sourceStart, *sourceEnd);
+    return *sourceEnd > *sourceStart;
+}
+
+} // namespace
+
+bool Timeline::mapSourceCaptionTrackToTimeline(
+    const caption::Track &sourceTrack,
+    const QString &sourcePath,
+    caption::Track *mappedTrack,
+    QString *errorMessage) const
+{
+    if (errorMessage)
+        errorMessage->clear();
+    if (!mappedTrack) {
+        if (errorMessage)
+            *errorMessage = tr("字幕の変換先がありません。");
+        return false;
+    }
+    mappedTrack->clear();
+    if (sourceTrack.clipCount() <= 0 || sourcePath.isEmpty()
+        || m_videoTracks.isEmpty() || !m_videoTracks.first()) {
+        if (errorMessage)
+            *errorMessage = tr("字幕または V1 の元動画がありません。");
+        return false;
+    }
+
+    const QString wantedPath = comparableMediaPath(sourcePath);
+    const QVector<ClipInfo> &clips = m_videoTracks.first()->clips();
+    double cursor = 0.0;
+    bool matchedMedia = false;
+    for (const ClipInfo &mediaClip : clips) {
+        const double clipStart = cursor + qMax(0.0, mediaClip.leadInSec);
+        cursor = clipStart + qMax(0.0, mediaClip.effectiveDuration());
+        if (comparableMediaPath(mediaClip.filePath) != wantedPath)
+            continue;
+        matchedMedia = true;
+
+        for (const caption::Clip &sourceCaption : sourceTrack.clips()) {
+            double coverageStart = 0.0;
+            double coverageEnd = 0.0;
+            if (!clipSourceCoverage(mediaClip, &coverageStart, &coverageEnd))
+                continue;
+            const double clippedSourceStart = qMax(
+                sourceCaption.startMs / 1000.0, coverageStart);
+            const double clippedSourceEnd = qMin(
+                sourceCaption.endMs / 1000.0, coverageEnd);
+            if (clippedSourceEnd <= clippedSourceStart)
+                continue;
+
+            double localA = 0.0;
+            double localB = 0.0;
+            if (!sourceSecondToClipLocal(
+                    mediaClip, clippedSourceStart, &localA)
+                || !sourceSecondToClipLocal(
+                    mediaClip, clippedSourceEnd, &localB)) {
+                continue;
+            }
+
+            caption::Clip mapped = sourceCaption;
+            const double mappedStart = clipStart + qMin(localA, localB);
+            const double mappedEnd = clipStart + qMax(localA, localB);
+            mapped.startMs = qRound64(mappedStart * 1000.0);
+            mapped.endMs = qRound64(mappedEnd * 1000.0);
+            if (mapped.endMs <= mapped.startMs)
+                continue;
+
+            QList<caption::Word> mappedWords;
+            bool wordMappingFailed = false;
+            if (localA <= localB) {
+                mappedWords.reserve(sourceCaption.words.size());
+                for (const caption::Word &sourceWord : sourceCaption.words) {
+                    const double clippedWordStart = qMax(
+                        sourceWord.startMs / 1000.0, clippedSourceStart);
+                    const double clippedWordEnd = qMin(
+                        sourceWord.endMs / 1000.0, clippedSourceEnd);
+                    if (clippedWordEnd <= clippedWordStart)
+                        continue;
+                    double wordA = 0.0;
+                    double wordB = 0.0;
+                    if (!sourceSecondToClipLocal(
+                            mediaClip, clippedWordStart, &wordA)
+                        || !sourceSecondToClipLocal(
+                            mediaClip, clippedWordEnd, &wordB)
+                        || wordB <= wordA) {
+                        mappedWords.clear();
+                        wordMappingFailed = true;
+                        break;
+                    }
+                    caption::Word word = sourceWord;
+                    word.startMs = qRound64((clipStart + wordA) * 1000.0);
+                    word.endMs = qRound64((clipStart + wordB) * 1000.0);
+                    mappedWords.append(word);
+                }
+                // A segment carrying real word timings must never fall back
+                // to its untrimmed full text when every timed word was cut
+                // away or could not be mapped.  Dropping that fragment is
+                // safer than regenerating words that lie outside the clip.
+                if (!sourceCaption.words.isEmpty()
+                    && (wordMappingFailed || mappedWords.isEmpty())) {
+                    continue;
+                }
+                if (!mappedWords.isEmpty()
+                    && mappedWords.size() != sourceCaption.words.size()) {
+                    QStringList retainedText;
+                    retainedText.reserve(mappedWords.size());
+                    for (const caption::Word &word : std::as_const(mappedWords))
+                        retainedText.append(word.text.trimmed());
+                    mapped.text = retainedText.join(QLatin1Char(' '));
+                }
+            }
+            // Reverse/non-invertible word order deliberately falls back to
+            // segment-level captions instead of publishing stale word timing.
+            mapped.words = mappedWords;
+            mappedTrack->addClip(mapped);
+        }
+    }
+
+    mappedTrack->sortByStart();
+    if (!matchedMedia) {
+        if (errorMessage)
+            *errorMessage = tr("選択した元動画は V1 に見つかりません。");
+        return false;
+    }
+    if (mappedTrack->clipCount() <= 0) {
+        if (errorMessage)
+            *errorMessage = tr("トリムまたはタイムリマップ範囲内に字幕がありません。");
+        return false;
+    }
+    return true;
+}
+
+bool Timeline::applySingleWordCaptionOverlays(
+    const QVector<EnhancedTextOverlay> &overlays, QString *errorMessage)
+{
+    if (errorMessage)
+        errorMessage->clear();
+
+    if (overlays.isEmpty()) {
+        if (errorMessage)
+            *errorMessage = tr("適用できる字幕がありません。");
+        return false;
+    }
+    if (m_videoTracks.isEmpty() || !m_videoTracks.first()) {
+        if (errorMessage)
+            *errorMessage = tr("字幕を適用する V1 トラックがありません。");
+        return false;
+    }
+
+    TimelineTrack *track = m_videoTracks.first();
+    QVector<ClipInfo> clips = track->clips();
+    if (clips.isEmpty()) {
+        if (errorMessage)
+            *errorMessage = tr("字幕を適用する動画クリップがありません。");
+        return false;
+    }
+
+    QVector<EnhancedTextOverlay> generated;
+    generated.reserve(overlays.size());
+    for (EnhancedTextOverlay overlay : overlays) {
+        if (overlay.text.trimmed().isEmpty()
+            || !std::isfinite(overlay.startTime)
+            || !std::isfinite(overlay.endTime)
+            || overlay.startTime < 0.0
+            || overlay.endTime <= overlay.startTime) {
+            if (errorMessage)
+                *errorMessage = tr("字幕の本文または表示時刻が不正です。");
+            return false;
+        }
+        overlay.templateName = CaptionOverlayBuilder::generatedTemplateName();
+        generated.append(overlay);
+    }
+    std::stable_sort(generated.begin(), generated.end(),
+                     [](const EnhancedTextOverlay &a, const EnhancedTextOverlay &b) {
+                         return a.startTime < b.startTime;
+                     });
+
+    for (int i = 1; i < generated.size(); ++i) {
+        if (generated.at(i).startTime < generated.at(i - 1).endTime) {
+            if (errorMessage)
+                *errorMessage = tr("1語字幕の表示時刻が重複しています。");
+            return false;
+        }
+    }
+
+    const QString generatedTag = CaptionOverlayBuilder::generatedTemplateName();
+    for (ClipInfo &clip : clips) {
+        QVector<EnhancedTextOverlay> replacement;
+        const QVector<EnhancedTextOverlay> &existing = clip.textManager.overlays();
+        replacement.reserve(existing.size());
+        for (const EnhancedTextOverlay &overlay : existing) {
+            if (overlay.templateName != generatedTag)
+                replacement.append(overlay);
+        }
+        clip.textManager.setOverlays(replacement);
+    }
+
+    m_generatedCaptionOverlays = generated;
+    track->setClips(clips);
+    saveUndoState(tr("1語字幕をタイムラインに適用"));
+    refreshTextStrip();
+    scheduleEmitSequenceChanged();
+    return true;
+}
+
 bool Timeline::updateTextOverlayText(int overlayIndex, const QString &newText)
 {
     if (m_videoTracks.isEmpty() || !m_videoTracks.first())
@@ -4241,11 +5037,24 @@ bool Timeline::updateTextOverlayText(int overlayIndex, const QString &newText)
     QVector<ClipInfo> clips = track->clips();
     if (clips.isEmpty())
         return false;
-    auto &mgr = clips[0].textManager;
-    if (overlayIndex < 0 || overlayIndex >= mgr.count())
+    const int ordinaryCount = clips[0].textManager.count();
+    if (overlayIndex < 0
+        || overlayIndex >= ordinaryCount + m_generatedCaptionOverlays.size()) {
         return false;
-    mgr.overlay(overlayIndex).text = newText;
-    track->setClips(clips);
+    }
+    if (overlayIndex < ordinaryCount) {
+        if (clips[0].textManager.overlay(overlayIndex).text == newText)
+            return false;
+        clips[0].textManager.overlay(overlayIndex).text = newText;
+        track->setClips(clips);
+    } else {
+        const int generatedIndex = overlayIndex - ordinaryCount;
+        if (newText.trimmed().isEmpty()
+            || m_generatedCaptionOverlays.at(generatedIndex).text == newText) {
+            return false;
+        }
+        m_generatedCaptionOverlays[generatedIndex].text = newText;
+    }
     saveUndoState("Edit text overlay");
     refreshTextStrip();
     return true;
@@ -4259,15 +5068,35 @@ bool Timeline::updateTextOverlayRect(int overlayIndex, double x, double y, doubl
     QVector<ClipInfo> clips = track->clips();
     if (clips.isEmpty())
         return false;
-    auto &mgr = clips[0].textManager;
-    if (overlayIndex < 0 || overlayIndex >= mgr.count())
+    const int ordinaryCount = clips[0].textManager.count();
+    if (overlayIndex < 0
+        || overlayIndex >= ordinaryCount + m_generatedCaptionOverlays.size())
         return false;
-    auto &ov = mgr.overlay(overlayIndex);
-    ov.x = x;
-    ov.y = y;
-    ov.width = qMax(0.0, width);
-    ov.height = qMax(0.0, height);
-    track->setClips(clips);
+    const double boundedWidth = qMax(0.0, width);
+    const double boundedHeight = qMax(0.0, height);
+    const EnhancedTextOverlay &current = overlayIndex < ordinaryCount
+        ? clips[0].textManager.overlay(overlayIndex)
+        : m_generatedCaptionOverlays.at(overlayIndex - ordinaryCount);
+    if (current.x == x && current.y == y
+        && current.width == boundedWidth
+        && current.height == boundedHeight) {
+        return false;
+    }
+    if (overlayIndex < ordinaryCount) {
+        EnhancedTextOverlay &overlay = clips[0].textManager.overlay(overlayIndex);
+        overlay.x = x;
+        overlay.y = y;
+        overlay.width = boundedWidth;
+        overlay.height = boundedHeight;
+        track->setClips(clips);
+    } else {
+        EnhancedTextOverlay &overlay =
+            m_generatedCaptionOverlays[overlayIndex - ordinaryCount];
+        overlay.x = x;
+        overlay.y = y;
+        overlay.width = boundedWidth;
+        overlay.height = boundedHeight;
+    }
     saveUndoState("Resize text overlay");
     refreshTextStrip();
     return true;
@@ -4281,11 +5110,24 @@ bool Timeline::applyTrackingToOverlay(int overlayIndex, const EnhancedTextOverla
     QVector<ClipInfo> clips = track->clips();
     if (clips.isEmpty())
         return false;
-    auto &mgr = clips[0].textManager;
-    if (overlayIndex < 0 || overlayIndex >= mgr.count())
+    const int ordinaryCount = clips[0].textManager.count();
+    if (overlayIndex < 0
+        || overlayIndex >= ordinaryCount + m_generatedCaptionOverlays.size())
         return false;
-    mgr.updateOverlay(overlayIndex, updated);
-    track->setClips(clips);
+    EnhancedTextOverlay replacement = updated;
+    if (overlayIndex >= ordinaryCount) {
+        const EnhancedTextOverlay &current =
+            m_generatedCaptionOverlays.at(overlayIndex - ordinaryCount);
+        replacement.templateName = CaptionOverlayBuilder::generatedTemplateName();
+        replacement.startTime = current.startTime;
+        replacement.endTime = current.endTime;
+    }
+    if (overlayIndex < ordinaryCount) {
+        clips[0].textManager.overlay(overlayIndex) = replacement;
+        track->setClips(clips);
+    } else {
+        m_generatedCaptionOverlays[overlayIndex - ordinaryCount] = replacement;
+    }
     saveUndoState("Apply tracking to overlay");
     refreshTextStrip();
     return true;
@@ -4346,7 +5188,8 @@ void Timeline::setClipMotion(int trackIdx, int clipIdx,
     emit positionChanged(m_playheadPos);
 }
 
-bool Timeline::updateTextOverlayTime(int overlayIndex, double startTime, double endTime)
+bool Timeline::updateTextOverlayTime(int overlayIndex, double startTime,
+                                     double endTime, bool createUndo)
 {
     if (m_videoTracks.isEmpty() || !m_videoTracks.first())
         return false;
@@ -4354,34 +5197,71 @@ bool Timeline::updateTextOverlayTime(int overlayIndex, double startTime, double 
     QVector<ClipInfo> clips = track->clips();
     if (clips.isEmpty())
         return false;
-    auto &mgr = clips[0].textManager;
-    if (overlayIndex < 0 || overlayIndex >= mgr.count())
+    const int ordinaryCount = clips[0].textManager.count();
+    if (overlayIndex < 0
+        || overlayIndex >= ordinaryCount + m_generatedCaptionOverlays.size())
         return false;
-    mgr.overlay(overlayIndex).startTime = qMax(0.0, startTime);
-    mgr.overlay(overlayIndex).endTime = qMax(startTime + 0.1, endTime);
-    track->setClips(clips);
-    // No undo snapshot during a live drag — otherwise every pixel of drag
-    // pollutes the undo stack. Caller can add a snapshot on mouseRelease
-    // if needed. For now, skip to keep the UX snappy.
+
+    double boundedStart = qMax(0.0, startTime);
+    double boundedEnd = qMax(boundedStart + 0.01, endTime);
+    const bool generated = overlayIndex >= ordinaryCount;
+    const int generatedIndex = overlayIndex - ordinaryCount;
+    const EnhancedTextOverlay &current = generated
+        ? m_generatedCaptionOverlays.at(generatedIndex)
+        : clips[0].textManager.overlay(overlayIndex);
+    if (generated) {
+        // Preserve the sorted, non-overlapping generated-caption suffix used
+        // by the O(log words) preview/export lookup. A word can be resized up
+        // to its neighbours but cannot cross them.
+        if (generatedIndex > 0)
+            boundedStart = qMax(
+                boundedStart, m_generatedCaptionOverlays.at(generatedIndex - 1).endTime);
+        if (generatedIndex + 1 < m_generatedCaptionOverlays.size())
+            boundedEnd = qMin(
+                boundedEnd, m_generatedCaptionOverlays.at(generatedIndex + 1).startTime);
+        if (boundedEnd <= boundedStart)
+            return false;
+    }
+    if (current.startTime == boundedStart && current.endTime == boundedEnd)
+        return false;
+    if (generated) {
+        m_generatedCaptionOverlays[generatedIndex].startTime = boundedStart;
+        m_generatedCaptionOverlays[generatedIndex].endTime = boundedEnd;
+    } else {
+        clips[0].textManager.overlay(overlayIndex).startTime = boundedStart;
+        clips[0].textManager.overlay(overlayIndex).endTime = boundedEnd;
+        track->setClips(clips);
+    }
+    if (createUndo || !m_textOverlayTimeEditActive) {
+        saveUndoState(tr("字幕の表示時間を変更"));
+    } else {
+        m_textOverlayTimeEditChanged = true;
+    }
     refreshTextStrip();
+    scheduleEmitSequenceChanged();
     return true;
+}
+
+void Timeline::beginTextOverlayTimeEdit()
+{
+    m_textOverlayTimeEditActive = true;
+    m_textOverlayTimeEditChanged = false;
+}
+
+void Timeline::finishTextOverlayTimeEdit()
+{
+    if (m_textOverlayTimeEditActive && m_textOverlayTimeEditChanged)
+        saveUndoState(tr("字幕の表示時間を変更"));
+    m_textOverlayTimeEditActive = false;
+    m_textOverlayTimeEditChanged = false;
 }
 
 void Timeline::refreshTextStrip()
 {
     if (!m_textStrip)
         return;
-    QVector<EnhancedTextOverlay> overlays;
-    double clipDur = 0.0;
-    if (!m_videoTracks.isEmpty() && m_videoTracks.first()) {
-        const auto &clips = m_videoTracks.first()->clips();
-        if (!clips.isEmpty()) {
-            const auto &mgr = clips[0].textManager;
-            for (int i = 0; i < mgr.count(); ++i)
-                overlays.append(mgr.overlay(i));
-            clipDur = clips[0].effectiveDuration();
-        }
-    }
+    const QVector<EnhancedTextOverlay> overlays = timelineTextOverlays();
+    const double clipDur = totalDuration();
     m_textStrip->setOverlays(overlays, clipDur);
     m_textStrip->setPixelsPerSecond(m_zoomLevel);
 }
@@ -7463,7 +8343,6 @@ void Timeline::refreshPlaybackSequence()
     // MainWindow's getProxyPath translation in the sequenceChanged handler
     // pick up the now-Ready proxies.
     scheduleEmitSequenceChanged();
-    scheduleEmitSequenceChanged();
 }
 
 void Timeline::saveUndoState(const QString &description)
@@ -7490,6 +8369,7 @@ TimelineSequence Timeline::currentSequenceSnapshot(const QString &id,
     sequence.audioTracks.reserve(m_audioTracks.size());
     for (const TimelineTrack *track : m_audioTracks)
         sequence.audioTracks.append(track ? track->clips() : QVector<ClipInfo>{});
+    sequence.generatedCaptionOverlays = m_generatedCaptionOverlays;
     return sequence;
 }
 
@@ -7564,6 +8444,7 @@ void Timeline::setSequences(const QVector<TimelineSequence> &sequences,
     if (!sequence)
         return;
 
+    m_generatedCaptionOverlays = sequence->generatedCaptionOverlays;
     restoreFromProject(sequence->videoTracks, sequence->audioTracks,
                        m_playheadPos, m_markIn, m_markOut, int(m_zoomLevel));
     m_activeSequenceId = sequence->id;
@@ -7629,14 +8510,15 @@ bool Timeline::setActiveSequence(const QString &sequenceId)
             : QVector<ClipInfo>{};
         m_audioTracks[i]->setClips(clips);
     }
+    m_generatedCaptionOverlays = targetCopy.generatedCaptionOverlays;
 
     m_activeSequenceId = sequenceId;
     m_sequenceModelEnabled = true;
     clearAllSelections();
     syncActiveSequenceFromCurrentTracks();
     updateInfoLabel();
+    refreshTextStrip();
     ensureSequenceFitsViewport();
-    scheduleEmitSequenceChanged();
     scheduleEmitSequenceChanged();
     rebuildTimelineBreadcrumbBar(this);
     return true;
@@ -7771,6 +8653,7 @@ TimelineState Timeline::currentState() const
     state.audioTracks.reserve(m_audioTracks.size());
     for (const auto *t : m_audioTracks)
         state.audioTracks.append(t ? t->clips() : QVector<ClipInfo>{});
+    state.generatedCaptionOverlays = m_generatedCaptionOverlays;
     state.selectedClip = m_videoTrack->selectedClip();
 
     for (int i = 0; i < m_videoTracks.size(); ++i) {
@@ -7835,6 +8718,7 @@ void Timeline::restoreState(const TimelineState &state)
         m_audioTracks[i]->setClips(clips);
         m_audioTracks[i]->update();
     }
+    m_generatedCaptionOverlays = state.generatedCaptionOverlays;
     setClipParentEntries(state.clipParentEntries);
     rebuildTimelineBreadcrumbBar(this);
 
@@ -7919,7 +8803,7 @@ void Timeline::restoreState(const TimelineState &state)
 
     // setClips bypasses the modified() signal path; trigger explicitly so the
     // VideoPlayer rebuilds its sequence after undo/redo.
-    scheduleEmitSequenceChanged();
+    refreshTextStrip();
     scheduleEmitSequenceChanged();
     undotrace::log("restoreState:exit");
 }
@@ -7967,7 +8851,6 @@ void Timeline::restoreFromProject(const QVector<QVector<ClipInfo>> &videoTracks,
                             : QVector<ClipInfo>{};
         m_audioTracks[i]->setClips(clips);
     }
-
     if (m_sequenceModelEnabled)
         syncActiveSequenceFromCurrentTracks();
 
@@ -7978,8 +8861,8 @@ void Timeline::restoreFromProject(const QVector<QVector<ClipInfo>> &videoTracks,
     syncPlayheadOverlay();
     saveUndoState("Load project");
     updateInfoLabel();
+    refreshTextStrip();
     // setClips bypasses modified(); trigger sequence rebuild explicitly.
-    scheduleEmitSequenceChanged();
     scheduleEmitSequenceChanged();
 }
 

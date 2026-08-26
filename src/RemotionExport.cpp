@@ -29,6 +29,93 @@ QString tsStringLiteralContent(QString value)
     return value;
 }
 
+QString compactNumber(double value)
+{
+    QString result = QString::number(value, 'f', 3);
+    while (result.contains('.') && result.endsWith('0'))
+        result.chop(1);
+    if (result.endsWith('.'))
+        result.chop(1);
+    return result;
+}
+
+QString cssColor(const QColor &color, double opacityMultiplier = 1.0)
+{
+    const double alpha = std::clamp(color.alphaF() * opacityMultiplier, 0.0, 1.0);
+    return QStringLiteral("rgba(%1, %2, %3, %4)")
+        .arg(color.red())
+        .arg(color.green())
+        .arg(color.blue())
+        .arg(QString::number(alpha, 'f', 3));
+}
+
+QString cssFontSize(const QFont &font)
+{
+    if (font.pointSizeF() > 0.0)
+        return compactNumber(font.pointSizeF()) + QStringLiteral("pt");
+    if (font.pixelSize() > 0)
+        return QString::number(font.pixelSize()) + QStringLiteral("px");
+    return QStringLiteral("32pt");
+}
+
+QString cssTextAlign(int alignment)
+{
+    if ((alignment & Qt::AlignLeft) != 0)
+        return QStringLiteral("left");
+    if ((alignment & Qt::AlignRight) != 0)
+        return QStringLiteral("right");
+    return QStringLiteral("center");
+}
+
+QString cssTextShadow(const EnhancedTextOverlay &overlay)
+{
+    if (!overlay.shadow.enabled)
+        return QStringLiteral("none");
+    return QStringLiteral("%1px %2px %3px %4")
+        .arg(compactNumber(overlay.shadow.offsetX))
+        .arg(compactNumber(overlay.shadow.offsetY))
+        .arg(compactNumber(overlay.shadow.blur))
+        .arg(cssColor(overlay.shadow.color, overlay.shadow.opacity));
+}
+
+void writeTextOverlayStyleProps(QTextStream &stream, const EnhancedTextOverlay &overlay,
+                                const QString &indent)
+{
+    stream << indent << "fontFamily={\"" << tsStringLiteralContent(overlay.font.family()) << "\"}\n";
+    stream << indent << "fontSize={\"" << cssFontSize(overlay.font) << "\"}\n";
+    stream << indent << "fontWeight={" << static_cast<int>(overlay.font.weight()) << "}\n";
+    stream << indent << "fontStyle={\"" << (overlay.font.italic() ? "italic" : "normal") << "\"}\n";
+    stream << indent << "color={\"" << cssColor(overlay.color) << "\"}\n";
+    stream << indent << "backgroundColor={\"" << cssColor(overlay.backgroundColor) << "\"}\n";
+    stream << indent << "outlineColor={\"" << cssColor(overlay.outlineColor) << "\"}\n";
+    stream << indent << "outlineWidth={" << overlay.outlineWidth << "}\n";
+    stream << indent << "textShadow={\"" << cssTextShadow(overlay) << "\"}\n";
+    stream << indent << "boxWidth={" << overlay.width << "}\n";
+    stream << indent << "textAlign={\"" << cssTextAlign(overlay.alignment) << "\"}\n";
+    stream << indent << "wordWrap={" << (overlay.wordWrap ? "true" : "false") << "}\n";
+    stream << indent << "letterSpacing={" << overlay.letterSpacing << "}\n";
+    stream << indent << "lineSpacing={" << overlay.lineSpacing << "}\n";
+}
+
+void writeTimelineTextStyle(QTextStream &stream, const EnhancedTextOverlay &overlay,
+                            const QString &indent)
+{
+    stream << indent << "fontFamily: \"" << tsStringLiteralContent(overlay.font.family()) << "\",\n";
+    stream << indent << "fontSize: \"" << cssFontSize(overlay.font) << "\",\n";
+    stream << indent << "fontWeight: " << static_cast<int>(overlay.font.weight()) << ",\n";
+    stream << indent << "fontStyle: \"" << (overlay.font.italic() ? "italic" : "normal") << "\",\n";
+    stream << indent << "color: \"" << cssColor(overlay.color) << "\",\n";
+    stream << indent << "backgroundColor: \"" << cssColor(overlay.backgroundColor) << "\",\n";
+    stream << indent << "outlineColor: \"" << cssColor(overlay.outlineColor) << "\",\n";
+    stream << indent << "outlineWidth: " << overlay.outlineWidth << ",\n";
+    stream << indent << "textShadow: \"" << cssTextShadow(overlay) << "\",\n";
+    stream << indent << "boxWidth: " << overlay.width << ",\n";
+    stream << indent << "textAlign: \"" << cssTextAlign(overlay.alignment) << "\",\n";
+    stream << indent << "wordWrap: " << (overlay.wordWrap ? "true" : "false") << ",\n";
+    stream << indent << "letterSpacing: " << overlay.letterSpacing << ",\n";
+    stream << indent << "lineSpacing: " << overlay.lineSpacing << ",\n";
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -376,6 +463,7 @@ QString RemotionExporter::generateVideoCompositionBody(const RemotionExportConfi
                 s << "              opacity={" << ov.opacity << "}\n";
                 s << "              rotation={" << ov.rotation << "}\n";
                 s << "              scale={" << ov.scale << "}\n";
+                writeTextOverlayStyleProps(s, ov, QStringLiteral("              "));
                 s << "              animIn={\"" << TextAnimation::typeName(ov.animIn.type) << "\"}\n";
                 s << "              animOut={\"" << TextAnimation::typeName(ov.animOut.type) << "\"}\n";
                 s << "              animDuration={" << ov.animIn.duration << "}\n";
@@ -390,6 +478,32 @@ QString RemotionExporter::generateVideoCompositionBody(const RemotionExportConfi
             ++clipIdx;
         }
         ++videoTrackIdx;
+    }
+
+    // Timeline-level generated captions are absolute-time overlays and must
+    // not be duplicated inside every clip Sequence.
+    for (const EnhancedTextOverlay &ov : data.generatedCaptionOverlays) {
+        if (!ov.visible)
+            continue;
+        const int ovStart = static_cast<int>(std::round(ov.startTime * fps));
+        const int ovEnd = static_cast<int>(std::round(ov.endTime * fps));
+        if (ovEnd <= ovStart)
+            continue;
+        s << "      <Sequence from={" << ovStart
+          << "} durationInFrames={" << (ovEnd - ovStart) << "}>\n";
+        s << "        <TextOverlay\n";
+        s << "          text={\"" << tsStringLiteralContent(ov.text) << "\"}\n";
+        s << "          x={" << ov.x << "}\n";
+        s << "          y={" << ov.y << "}\n";
+        s << "          opacity={" << ov.opacity << "}\n";
+        s << "          rotation={" << ov.rotation << "}\n";
+        s << "          scale={" << ov.scale << "}\n";
+        writeTextOverlayStyleProps(s, ov, QStringLiteral("          "));
+        s << "          animIn={\"" << TextAnimation::typeName(ov.animIn.type) << "\"}\n";
+        s << "          animOut={\"" << TextAnimation::typeName(ov.animOut.type) << "\"}\n";
+        s << "          animDuration={" << ov.animIn.duration << "}\n";
+        s << "        />\n";
+        s << "      </Sequence>\n";
     }
 
     // Audio tracks
@@ -598,6 +712,20 @@ QString RemotionExporter::generateTimelineData(const RemotionExportConfig &confi
     s << "  animIn: string;\n";
     s << "  animOut: string;\n";
     s << "  animDuration: number;\n";
+    s << "  fontFamily: string;\n";
+    s << "  fontSize: string;\n";
+    s << "  fontWeight: number;\n";
+    s << "  fontStyle: string;\n";
+    s << "  color: string;\n";
+    s << "  backgroundColor: string;\n";
+    s << "  outlineColor: string;\n";
+    s << "  outlineWidth: number;\n";
+    s << "  textShadow: string;\n";
+    s << "  boxWidth: number;\n";
+    s << "  textAlign: string;\n";
+    s << "  wordWrap: boolean;\n";
+    s << "  letterSpacing: number;\n";
+    s << "  lineSpacing: number;\n";
     s << "}\n\n";
 
     // Video track data
@@ -677,6 +805,7 @@ QString RemotionExporter::generateTimelineData(const RemotionExportConfig &confi
                     s << "            opacity: " << ov.opacity << ",\n";
                     s << "            rotation: " << ov.rotation << ",\n";
                     s << "            scale: " << ov.scale << ",\n";
+                    writeTimelineTextStyle(s, ov, QStringLiteral("            "));
                     s << "            animIn: \"" << TextAnimation::typeName(ov.animIn.type) << "\",\n";
                     s << "            animOut: \"" << TextAnimation::typeName(ov.animOut.type) << "\",\n";
                     s << "            animDuration: " << ov.animIn.duration << ",\n";
@@ -692,6 +821,28 @@ QString RemotionExporter::generateTimelineData(const RemotionExportConfig &confi
         s << "    ],\n";
     }
 
+    s << "  ],\n";
+    s << "  textOverlays: [\n";
+    for (const EnhancedTextOverlay &ov : data.generatedCaptionOverlays) {
+        if (!ov.visible || ov.endTime <= ov.startTime)
+            continue;
+        const int ovStart = static_cast<int>(std::round(ov.startTime * fps));
+        const int ovEnd = static_cast<int>(std::round(ov.endTime * fps));
+        s << "    {\n";
+        s << "      text: \"" << tsStringLiteralContent(ov.text) << "\",\n";
+        s << "      startFrame: " << ovStart << ",\n";
+        s << "      durationInFrames: " << (ovEnd - ovStart) << ",\n";
+        s << "      x: " << ov.x << ",\n";
+        s << "      y: " << ov.y << ",\n";
+        s << "      opacity: " << ov.opacity << ",\n";
+        s << "      rotation: " << ov.rotation << ",\n";
+        s << "      scale: " << ov.scale << ",\n";
+        writeTimelineTextStyle(s, ov, QStringLiteral("      "));
+        s << "      animIn: \"" << TextAnimation::typeName(ov.animIn.type) << "\",\n";
+        s << "      animOut: \"" << TextAnimation::typeName(ov.animOut.type) << "\",\n";
+        s << "      animDuration: " << ov.animIn.duration << ",\n";
+        s << "    },\n";
+    }
     s << "  ],\n";
     s << "  audioTracks: [\n";
 
@@ -831,8 +982,20 @@ bool RemotionExporter::writeTextOverlayTsx(const QString &compDir)
         "  animIn?: string;      // 'FadeIn' | 'SlideLeft' | 'SlideRight' | 'SlideUp' | 'SlideDown' | 'ScaleIn' | 'Pop'\n"
         "  animOut?: string;\n"
         "  animDuration?: number; // seconds\n"
-        "  fontSize?: number;\n"
+        "  fontFamily?: string;\n"
+        "  fontSize?: string;\n"
+        "  fontWeight?: number;\n"
+        "  fontStyle?: 'normal' | 'italic';\n"
         "  color?: string;\n"
+        "  backgroundColor?: string;\n"
+        "  outlineColor?: string;\n"
+        "  outlineWidth?: number;\n"
+        "  textShadow?: string;\n"
+        "  boxWidth?: number;  // 0-1 normalized; 0 = auto\n"
+        "  textAlign?: 'left' | 'center' | 'right';\n"
+        "  wordWrap?: boolean;\n"
+        "  letterSpacing?: number;\n"
+        "  lineSpacing?: number;\n"
         "}\n"
         "\n"
         "export const TextOverlay: React.FC<TextOverlayProps> = ({\n"
@@ -845,8 +1008,20 @@ bool RemotionExporter::writeTextOverlayTsx(const QString &compDir)
         "  animIn = 'FadeIn',\n"
         "  animOut = 'None',\n"
         "  animDuration = 0.5,\n"
-        "  fontSize = 48,\n"
+        "  fontFamily = 'Arial',\n"
+        "  fontSize = '48px',\n"
+        "  fontWeight = 700,\n"
+        "  fontStyle = 'normal',\n"
         "  color = '#ffffff',\n"
+        "  backgroundColor = 'transparent',\n"
+        "  outlineColor = 'transparent',\n"
+        "  outlineWidth = 0,\n"
+        "  textShadow = '2px 2px 4px rgba(0,0,0,0.8)',\n"
+        "  boxWidth = 0,\n"
+        "  textAlign = 'center',\n"
+        "  wordWrap = false,\n"
+        "  letterSpacing = 0,\n"
+        "  lineSpacing = 0,\n"
         "}) => {\n"
         "  const frame = useCurrentFrame();\n"
         "  const { fps, durationInFrames, width, height } = useVideoConfig();\n"
@@ -900,12 +1075,21 @@ bool RemotionExporter::writeTextOverlayTsx(const QString &compDir)
         "        top: `${y * 100}%`,\n"
         "        transform: `translate(-50%, -50%) rotate(${rotation}deg) scale(${scale}) ${combinedTransform}`,\n"
         "        opacity: finalOpacity,\n"
+        "        fontFamily,\n"
         "        fontSize,\n"
         "        color,\n"
-        "        fontWeight: 'bold',\n"
-        "        textAlign: 'center',\n"
-        "        whiteSpace: 'nowrap',\n"
-        "        textShadow: '2px 2px 4px rgba(0,0,0,0.8)',\n"
+        "        backgroundColor,\n"
+        "        fontWeight,\n"
+        "        fontStyle,\n"
+        "        WebkitTextStroke: outlineWidth > 0 ? `${outlineWidth}px ${outlineColor}` : undefined,\n"
+        "        paintOrder: 'stroke fill',\n"
+        "        width: boxWidth > 0 ? `${boxWidth * 100}%` : undefined,\n"
+        "        textAlign,\n"
+        "        whiteSpace: wordWrap ? 'pre-wrap' : 'nowrap',\n"
+        "        overflowWrap: wordWrap ? 'break-word' : 'normal',\n"
+        "        letterSpacing,\n"
+        "        lineHeight: lineSpacing !== 0 ? `calc(1em + ${lineSpacing}px)` : undefined,\n"
+        "        textShadow,\n"
         "        pointerEvents: 'none',\n"
         "        userSelect: 'none',\n"
         "      }}\n"

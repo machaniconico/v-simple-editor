@@ -767,6 +767,12 @@ int runSmartRenderSelftest()
               result.eligible);
     }
     {
+        auto request = passThroughRequest();
+        request.hasTimelineTextOverlays = true;
+        checkPassThroughRejected(
+            100, "timelinePassThrough rejects project-level captions", request);
+    }
+    {
         QString error;
         const bool ok = realRemuxGate(&error);
         if (!ok)

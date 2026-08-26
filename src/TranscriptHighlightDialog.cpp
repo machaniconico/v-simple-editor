@@ -95,11 +95,30 @@ transcripthl::HighlightRequest TranscriptHighlightDialog::request() const
 
 void TranscriptHighlightDialog::updateDetectState()
 {
-    const bool isAnthropic =
-        m_providerCombo->currentData().toString() == QStringLiteral("anthropic");
-    const QString apiKey = creds::CredentialStore::get(
-        "ANTHROPIC_API_KEY", QStringLiteral("apiKeys/anthropic"));
-    m_apiKeyWarningLabel->setVisible(isAnthropic && apiKey.trimmed().isEmpty());
+    const QString provider = m_providerCombo->currentData().toString();
+    const char* envName = nullptr;
+    QString settingsKey;
+    if (provider.compare(QStringLiteral("anthropic"), Qt::CaseInsensitive) == 0) {
+        envName = "ANTHROPIC_API_KEY";
+        settingsKey = QStringLiteral("apiKeys/anthropic");
+    } else if (provider.compare(QStringLiteral("openai"), Qt::CaseInsensitive) == 0) {
+        envName = "OPENAI_API_KEY";
+        settingsKey = QStringLiteral("apiKeys/openai");
+    } else if (provider.compare(QStringLiteral("gemini"), Qt::CaseInsensitive) == 0) {
+        envName = "GEMINI_API_KEY";
+        settingsKey = QStringLiteral("apiKeys/gemini");
+    }
+
+    const bool needsApiKey = envName != nullptr;
+    if (needsApiKey) {
+        const QString apiKey = creds::CredentialStore::get(envName, settingsKey);
+        m_apiKeyWarningLabel->setText(
+            tr("%1 が未設定です。オフライン検出(ヒューリスティック)にフォールバックします。")
+                .arg(QString::fromLatin1(envName)));
+        m_apiKeyWarningLabel->setVisible(apiKey.trimmed().isEmpty());
+    } else {
+        m_apiKeyWarningLabel->setVisible(false);
+    }
 
     // transcript が空のときは検出ボタンを disable
     const bool hasTranscript = !m_transcript.isEmpty();

@@ -73,6 +73,7 @@ class QTimer;
 // なる。enum class は前方宣言できないため namespace + enum 種別だけを
 // 前方宣言し、シグネチャに使う (Timeline.cpp 側で TrimOps.h を実 include)。
 namespace trimops { enum class TrimType; }
+namespace caption { class Track; }
 
 namespace timeline_nesting {
 QString sequenceClipFilePath(const QString &sequenceId);
@@ -279,6 +280,7 @@ struct TimelineSequence {
     QString name;
     QVector<QVector<ClipInfo>> videoTracks;
     QVector<QVector<ClipInfo>> audioTracks;
+    QVector<EnhancedTextOverlay> generatedCaptionOverlays;
 
     double duration() const {
         auto tracksDuration = [](const QVector<QVector<ClipInfo>> &tracks) {
@@ -519,6 +521,19 @@ public:
 
     void addClip(const QString &filePath);
     void splitAtPlayhead();
+    // ---- index 指定の編集 (MCP / スクリプト経路) ----
+    // GUI 経路と同じ「snapshot -> 変更 -> remap -> saveUndoState」の順序を
+    // 内部で守る。選択状態には依存しない。失敗時は *err を埋めて false を返し、
+    // タイムラインを一切変更しない (undo エントリも積まない)。
+    // audio=false なら video トラック、true なら audio トラックの trackIndex。
+    bool splitClipByIndex(bool audio, int trackIndex, int clipIndex,
+                          double timelineSeconds, QString *err);
+    bool deleteClipByIndex(bool audio, int trackIndex, int clipIndex,
+                           bool ripple, QString *err);
+    bool moveClipByIndex(bool audio, int trackIndex, int clipIndex,
+                         double newStartSec, double *settledStartSec, QString *err);
+    bool setClipPropertyByIndex(bool audio, int trackIndex, int clipIndex,
+                                const QString &property, double value, QString *err);
     bool freezeFrameAtPlayhead(TimelineTrack *track = nullptr, int clipIndex = -1);
     void deleteSelectedClip();
     void rippleDeleteSelectedClip();
@@ -536,6 +551,8 @@ public:
     void redo();
     bool canUndo() const;
     bool canRedo() const;
+    // MCP の各変更ツールが、検証済みの 1 操作を正確な説明で記録するための入口。
+    void saveUndoState(const QString &description);
 
     // Snap
     void setSnapEnabled(bool enabled);
@@ -657,6 +674,11 @@ public:
                                double releaseSec = 0.40);
     int videoTrackCount() const { return m_videoTracks.size(); }
     int audioTrackCount() const { return m_audioTracks.size(); }
+    // MCP ツールが index 指定で操作するために追加。該当しない index は nullptr。
+    TimelineTrack *trackAt(bool audio, int index) const {
+        const auto &tracks = audio ? m_audioTracks : m_videoTracks;
+        return index >= 0 && index < tracks.size() ? tracks.at(index) : nullptr;
+    }
 
     // Track row height (applied to all tracks AND their header widgets)
     void setTrackHeight(int h);
@@ -767,6 +789,30 @@ public:
     // the mutation actually persists. Used by MainWindow's Adobe-style text
     // tool. Returns true if an overlay was added.
     bool addTextOverlayToFirstVideoClip(const EnhancedTextOverlay &overlay);
+    // Atomically replace only generated single-word captions on every V1
+    // clip. Incoming times remain absolute timeline seconds so the active
+    // clip renderer sees the same caption set across clip boundaries.
+    bool applySingleWordCaptionOverlays(
+        const QVector<EnhancedTextOverlay> &overlays,
+        QString *errorMessage = nullptr);
+    const QVector<EnhancedTextOverlay> &generatedCaptionOverlays() const {
+        return m_generatedCaptionOverlays;
+    }
+    void restoreGeneratedCaptionOverlays(
+        const QVector<EnhancedTextOverlay> &overlays) {
+        m_generatedCaptionOverlays = overlays;
+    }
+    // Ordinary authored overlays (legacy V1 clip-0 owner) followed by the
+    // project-level generated-caption set. Indices match the text-strip and
+    // preview editing APIs below.
+    QVector<EnhancedTextOverlay> timelineTextOverlays() const;
+    // Convert source-media ASR timestamps into absolute V1 timeline time,
+    // honoring trim in-points, clip speed, gaps and invertible time remaps.
+    bool mapSourceCaptionTrackToTimeline(
+        const caption::Track &sourceTrack,
+        const QString &sourcePath,
+        caption::Track *mappedTrack,
+        QString *errorMessage = nullptr) const;
     // Update the text of an existing overlay on V1's first clip. Used by
     // click-to-edit when the user edits an existing overlay in place.
     bool updateTextOverlayText(int overlayIndex, const QString &newText);
@@ -786,7 +832,8 @@ public:
                        const effectctrl::MotionState &motion);
     // Update an existing overlay's start/end time. Called from the timeline
     // text strip when the user drags an overlay's edge handle.
-    bool updateTextOverlayTime(int overlayIndex, double startTime, double endTime);
+    bool updateTextOverlayTime(int overlayIndex, double startTime, double endTime,
+                               bool createUndo = true);
 
     UndoManager *undoManager() const { return m_undoManager; }
 
@@ -912,7 +959,6 @@ private:
     };
 
     void setupUI();
-    void saveUndoState(const QString &description);
 public:
     void restoreState(const TimelineState &state);
     TimelineState currentState() const;
@@ -949,6 +995,7 @@ private:
 
     QVector<TimelineTrack*> m_videoTracks;
     QVector<TimelineTrack*> m_audioTracks;
+    QVector<EnhancedTextOverlay> m_generatedCaptionOverlays;
     TimelineTrack *m_videoTrack = nullptr; // alias for m_videoTracks[0]
     TimelineTrack *m_audioTrack = nullptr; // alias for m_audioTracks[0]
     int m_activeVideoTrackIndex = -1; // last video row that originated selection
@@ -974,6 +1021,10 @@ private:
     QWidget *m_vaSeparatorHeader = nullptr;
     int m_textStripCustomHeight = 0;  // 0 = follows m_trackHeight
     void refreshTextStrip();
+    void beginTextOverlayTimeEdit();
+    void finishTextOverlayTimeEdit();
+    bool m_textOverlayTimeEditActive = false;
+    bool m_textOverlayTimeEditChanged = false;
     QLabel *m_infoLabel;
     double m_playheadPos = 0.0;
     // プロジェクト出力ジオメトリの複製 (SSOT は MainWindow::m_projectConfig)。

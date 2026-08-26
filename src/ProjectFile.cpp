@@ -4,6 +4,7 @@
 #include "AdjustmentLayer.h"
 #include "color/ClipColor.h"
 #include "mask/ClipMask.h"
+#include "CaptionOverlayBuilder.h"
 #include <QBuffer>
 #include <QFile>
 #include <QJsonDocument>
@@ -279,6 +280,37 @@ QImage imageFromPngBase64(const QString &encoded)
 }
 
 static const int PROJECT_FORMAT_VERSION = 2;
+
+void migrateGeneratedCaptionsToProjectLevel(ProjectData &data)
+{
+    const QString tag = CaptionOverlayBuilder::generatedTemplateName();
+    bool captured = !data.generatedCaptionOverlays.isEmpty();
+    for (QVector<ClipInfo> &track : data.videoTracks) {
+        for (ClipInfo &clip : track) {
+            QVector<EnhancedTextOverlay> ordinary;
+            QVector<EnhancedTextOverlay> legacyGenerated;
+            const QVector<EnhancedTextOverlay> &stored = clip.textManager.overlays();
+            ordinary.reserve(stored.size());
+            for (const EnhancedTextOverlay &overlay : stored) {
+                if (overlay.templateName == tag)
+                    legacyGenerated.append(overlay);
+                else
+                    ordinary.append(overlay);
+            }
+            if (!captured && !legacyGenerated.isEmpty()) {
+                data.generatedCaptionOverlays = legacyGenerated;
+                captured = true;
+            }
+            if (!legacyGenerated.isEmpty())
+                clip.textManager.setOverlays(ordinary);
+        }
+    }
+    std::stable_sort(
+        data.generatedCaptionOverlays.begin(), data.generatedCaptionOverlays.end(),
+        [](const EnhancedTextOverlay &a, const EnhancedTextOverlay &b) {
+            return a.startTime < b.startTime;
+        });
+}
 
 // --- v1 -> v2 migration: clip pan offsets unit convention ---
 //
@@ -565,6 +597,7 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
     root["config"] = configToJson(data.config);
     root["videoTracks"] = tracksToJson(data.videoTracks);
     root["audioTracks"] = tracksToJson(data.audioTracks);
+    root["generatedCaptionOverlays"] = TextManager::toJson(data.generatedCaptionOverlays);
     root["playheadPos"] = data.playheadPos;
     root["markIn"] = data.markIn;
     root["markOut"] = data.markOut;
@@ -873,6 +906,9 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
     data.config = configFromJson(root["config"].toObject());
     data.videoTracks = tracksFromJson(root["videoTracks"].toArray());
     data.audioTracks = tracksFromJson(root["audioTracks"].toArray());
+    data.generatedCaptionOverlays = TextManager::fromJson(
+        root.value("generatedCaptionOverlays").toArray());
+    migrateGeneratedCaptionsToProjectLevel(data);
 
     // v1 -> v2: convert stale pixel-convention clip pan offsets. Runs after
     // config (canvas resolution) and tracks are loaded; no-op for version>=2.
@@ -1154,6 +1190,7 @@ QString ProjectFile::toJsonString(const ProjectData &data)
     root["config"] = configToJson(data.config);
     root["videoTracks"] = tracksToJson(data.videoTracks);
     root["audioTracks"] = tracksToJson(data.audioTracks);
+    root["generatedCaptionOverlays"] = TextManager::toJson(data.generatedCaptionOverlays);
     root["playheadPos"] = data.playheadPos;
     root["markIn"] = data.markIn;
     root["markOut"] = data.markOut;
@@ -1437,6 +1474,9 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
     data.config = configFromJson(root["config"].toObject());
     data.videoTracks = tracksFromJson(root["videoTracks"].toArray());
     data.audioTracks = tracksFromJson(root["audioTracks"].toArray());
+    data.generatedCaptionOverlays = TextManager::fromJson(
+        root.value("generatedCaptionOverlays").toArray());
+    migrateGeneratedCaptionsToProjectLevel(data);
 
     // v1 -> v2: convert stale pixel-convention clip pan offsets. Runs after
     // config (canvas resolution) and tracks are loaded; no-op for version>=2.
@@ -1813,8 +1853,9 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
         obj["effects"] = fxArr;
     }
 
-    if (clip.keyframes.hasAnyKeyframes())
-        obj["keyframes"] = keyframeManagerToJson(clip.keyframes);
+    const QJsonObject keyframeJson = keyframeManagerToJson(clip.keyframes);
+    if (!keyframeJson.value(QStringLiteral("tracks")).toArray().isEmpty())
+        obj["keyframes"] = keyframeJson;
 
     if (clip.textManager.count() > 0)
         obj["textManager"] = TextManager::toJson(clip.textManager.overlays());
@@ -2054,19 +2095,17 @@ KeyframeTrack ProjectFile::keyframeTrackFromJson(const QJsonObject &obj)
 
 QJsonObject ProjectFile::keyframeManagerToJson(const KeyframeManager &km)
 {
-    QJsonObject obj;
-    QJsonArray tracksArr;
-    for (const auto &t : km.tracks())
-        tracksArr.append(keyframeTrackToJson(t));
-    obj["tracks"] = tracksArr;
-    return obj;
+    // Keep project persistence on the KeyframeManager's canonical schema.
+    // The former duplicate serializer omitted Loop Out modes (and string
+    // tracks), so a graph that evaluated correctly in-memory silently lost
+    // its loop behavior after saving and reopening a project.
+    return km.toJson();
 }
 
 KeyframeManager ProjectFile::keyframeManagerFromJson(const QJsonObject &obj)
 {
     KeyframeManager km;
-    for (const auto &v : obj["tracks"].toArray())
-        km.addTrack(keyframeTrackFromJson(v.toObject()));
+    km.fromJson(obj);
     return km;
 }
 

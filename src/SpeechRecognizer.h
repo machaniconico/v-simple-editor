@@ -3,6 +3,7 @@
 #include <QList>
 #include <QSharedPointer>
 #include <QStringList>
+#include <QByteArray>
 
 namespace speech {
 
@@ -68,6 +69,12 @@ public:
     bool supportsLanguage(const QString&) const override { return true; }
     QStringList supportedLanguages() const override;
     RecognizeResult recognize(const RecognizeParams& params) override;
+
+    // Parse the full whisper.cpp JSON schema used by the CLI path.  Kept as
+    // a public, side-effect-free seam so the Caption Editor path can be
+    // verified without launching an external process.
+    static RecognizeResult parseJsonOutput(const QByteArray& json,
+                                           const QString& requestedLanguage = QString());
 
     // CLI バイナリパス上書き (テスト用)
     void setCliPath(const QString& path) { m_cliPath = path; }

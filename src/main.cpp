@@ -185,6 +185,9 @@
 #include "AIHighlight.h"
 #include "color/ClipColor.h"
 #include "playback/HdrIngestProbe.h"
+#include "mcp/McpStdioBridge.h"
+
+std::optional<int> dispatchMcpStdioPreQApplication(int argc, char* argv[]);
 
 extern "C" {
 #include <libavcodec/codec_par.h>
@@ -1481,6 +1484,10 @@ int main(int argc, char *argv[])
         return *rc;
     }
 
+    if (auto rc = dispatchMcpStdioPreQApplication(argc, argv)) {
+        return *rc;
+    }
+
     // PRD-SPLIT-MAIN-1: dispatch moved to src/selftests/SelftestRegistry.{h,cpp}.
     if (auto rc = selftests::dispatchPreQApplication(argc, argv)) {
         return *rc;
@@ -1578,7 +1585,9 @@ int main(int argc, char *argv[])
 
     // Auto-load a file passed on the command line for reproducible testing.
     // Uses the public testLoadFile() slot on MainWindow.
-    if (argc >= 2) {
+    // `--mcp-serve` のようなオプションを渡したときに、それをファイルパスとして
+    // 読み込みにいかないよう "--" 始まりは除外する。
+    if (argc >= 2 && !QString::fromLocal8Bit(argv[1]).startsWith(QStringLiteral("--"))) {
         const QString filePath = QString::fromLocal8Bit(argv[1]);
         writeLogLine("INFO", QString("argv[1] file load requested: %1").arg(filePath));
         QTimer::singleShot(500, &window, [&window, filePath]() {

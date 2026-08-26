@@ -1,29 +1,29 @@
 # NLE Feature Audit — v-simple-editor
 
-_Audit date: 2026-06-02 · 108 features classified · status independently spot-verified against source._
+_Audit date: 2026-06-02 · 110 features classified · status independently spot-verified against source._
 
-> **Scope & denominator caveat (revision note).** The first pass anchored on the **90 selftest-registered engines** plus their flags, which silently SKIPPED older, pre-"selftest-split-campaign" core subsystems that never got a selftest (transitions, undo/redo, color grading, scopes, markers, etc.). Those are added in **§3.1b**. This is a **feature-level** catalog (108 entries); MainWindow.cpp actually has **~251 `addAction` calls**, so many sub-actions of these features are not separately counted. Treat the percentages as a feature-level estimate, not an action-level census — and read them as a **lower bound on "usable"**, since the items most likely to be missing are WIRED core features.
+> **Scope & denominator caveat (revision note).** The first pass anchored on the **90 selftest-registered engines** plus their flags, which silently SKIPPED older, pre-"selftest-split-campaign" core subsystems that never got a selftest (transitions, undo/redo, color grading, scopes, markers, etc.). Those are added in **§3.1b**. This is a **feature-level** catalog (110 entries); MainWindow.cpp actually has **~251 `addAction` calls**, so many sub-actions of these features are not separately counted. Treat the percentages as a feature-level estimate, not an action-level census — and read them as a **lower bound on "usable"**, since the items most likely to be missing are WIRED core features.
 
 ## 1. TL;DR
 
-Of the **108 catalogued features**, **70 (~65%) are genuinely WIRED and usable today** — reachable from a real menu/dock with a real engine behind them and default-on behaviour. That core covers the meat of an NLE: timeline trim/3-point/ripple editing, media pool, source monitor, proxies, in-process libavcore encode/decode, the live audio mixer + bus routing, track mattes (CPU SSOT), HDR export plumbing, ASC-CDL/EDL/FCPXML/DaVinci/Premiere/PPTX export, motion/planar tracking, mograph/lower-thirds/watermark, exposure aids, command palette, and local social/mobile export — **plus the pre-selftest core (§3.1b): transitions, undo/redo + history dock, the color-grading panel (wheels/curves/LUT), scopes/waveform monitors, markers, title presets, the keyframe animation core, autosave/recovery, and in-process AI upscale/frame-interp/mask/smart-reframe (classical engines, not ML models).** The honest weak spots are three "C-like" buckets — **built but not really usable as shipped**: (1) the **entire GPU/HDR compositing path is DORMANT or GATED** — `gpu-composite-math/parity`, `hdr-composite-math/parity` are selftest-only oracles, `live-matte-resolve` only fires behind the default-OFF `VEDITOR_GPU_COMPOSITE` flag, and the HDR16 path (`hdr-composite-parity`/`composite16`) can **never** run live because the overlay decode pool is hard-coded to RGB888 SDR ("Pool stays SDR for the MVP"); (2) **all cloud/social upload integrations are BLOCKED on external credentials** (YouTube, Vimeo, Instagram, X, Frame.io, cloud-render) plus the LLM `transcript-highlighter`; (3) a tail of **MVP-depth features** that are reachable but shallow (Dolby Vision XML-sidecar-only, subtitle-translator stub passthrough, Twitch clipboard-only, whisper stub without external binary, audio loudness/restore simplifications). The remaining DORMANT entries are mostly **selftest harnesses / parity oracles**, not user features — they prove engines work but were never meant to be reachable.
+Of the **110 catalogued features**, **72 (~65%) are genuinely WIRED and usable today** — reachable from a real menu/dock with a real engine behind them and default-on behaviour. That core covers the meat of an NLE: timeline trim/3-point/ripple editing, media pool, source monitor, proxies, in-process libavcore encode/decode, the live audio mixer + bus routing, track mattes (CPU SSOT), HDR export plumbing, ASC-CDL/EDL/FCPXML/DaVinci/Premiere/PPTX export, motion/planar tracking, mograph/lower-thirds/watermark, exposure aids, command palette, local social/mobile export, a localhost MCP server with 13 tools, and the AI chat dock — **plus the pre-selftest core (§3.1b): transitions, undo/redo + history dock, the color-grading panel (wheels/curves/LUT), scopes/waveform monitors, markers, title presets, the keyframe animation core, autosave/recovery, and in-process AI upscale/frame-interp/mask/smart-reframe (classical engines, not ML models).** The honest weak spots are three "C-like" buckets — **built but not really usable as shipped**: (1) the **entire GPU/HDR compositing path is DORMANT or GATED** — `gpu-composite-math/parity`, `hdr-composite-math/parity` are selftest-only oracles, `live-matte-resolve` only fires behind the default-OFF `VEDITOR_GPU_COMPOSITE` flag, and the HDR16 path (`hdr-composite-parity`/`composite16`) can **never** run live because the overlay decode pool is hard-coded to RGB888 SDR ("Pool stays SDR for the MVP"); (2) **all cloud/social upload integrations are BLOCKED on external credentials** (YouTube, Vimeo, Instagram, X, Frame.io, cloud-render), while provider-backed LLM detection in `transcript-highlighter` needs a configured provider credential and otherwise uses its offline heuristic; (3) a tail of **MVP-depth features** that are reachable but shallow (Dolby Vision XML-sidecar-only, subtitle-translator stub passthrough, Twitch clipboard-only, whisper stub without external binary, audio loudness/restore simplifications). The remaining DORMANT entries are mostly **selftest harnesses / parity oracles**, not user features — they prove engines work but were never meant to be reachable.
 
 ## 2. Tally
 
 | Status | Count | % | Meaning |
 |---|---:|---:|---|
-| **WIRED** | 70 | 64.8% | Reachable + real engine + default-on/usable |
+| **WIRED** | 72 | 65.5% | Reachable + real engine + default-on/usable |
 | **MVP** | 12 | 11.1% | Reachable but shallow / partial / sidecar-only |
 | **BLOCKED** | 7 | 6.5% | Wired but needs external creds/dep to function |
 | **GATED** | 3 | 2.8% | Real, but hidden behind a default-OFF flag |
 | **DORMANT** | 16 | 14.8% | Selftest/oracle only — no UI entry point |
-| **TOTAL** | 108 | 100% | |
+| **TOTAL** | 110 | 100% | |
 
-_(WIRED = 59 selftest-registered + 11 pre-selftest core subsystems from §3.1b. The DORMANT 16 are almost entirely test scaffolding, not user features — excluding them, **70 of 92 real features (76%) are usable**.)_
+_(WIRED = 59 selftest-registered + 11 pre-selftest core subsystems from §3.1b + 2 newly documented MCP/AI integrations. The DORMANT 16 are almost entirely test scaffolding, not user features — excluding them, **72 of 94 real features (77%) are usable**.)_
 
 ## 3. By Status
 
-### 3.1 WIRED (59) — usable today
+### 3.1 WIRED (61) — usable today
 
 | Feature | Cluster | UI entry (file:line) | Flag / default | Note |
 |---|---|---|---|---|
@@ -77,6 +77,8 @@ _(WIRED = 59 selftest-registered + 11 pre-selftest core subsystems from §3.1b. 
 | broadcast-cc | import-export | MainWindow.cpp:2728 (Tools, action_broadcast_caption) | none / on | CEA-608/708 .scc export. |
 | aihighlight | ai-ml | MainWindow.cpp:2430 (Tools>AI自動ハイライト) | none / on | 3-pass FFmpeg DSP heuristic on worker thread. |
 | auto-clip-gen | ai-ml | MainWindow.cpp:2354 (Tools>ハイライトから自動カット) | none / on | Deterministic clip-range planner, offline. |
+| mcp-server | ai-ml | MainWindow.cpp (ツール>MCP サーバ) | none | Localhost MCP server. 13 tools. Connects from Claude Code / Codex CLI. WIRED |
+| ai-chat-dock | ai-ml | MainWindow.cpp (表示>AI チャット) | claude CLI | Headless `claude` CLI launch. Works with subscription plan. WIRED |
 | social | streaming-social | MainWindow.cpp:1433 (File>SNS向けエクスポート) | none / on | Local platform-preset export. |
 | snspack | streaming-social | MainWindow.cpp:1433 (= social) | none / on | SNS preset pack driving SocialExportDialog. |
 | obs | streaming-social | MainWindow.cpp:1452 (File>取り込みハブ) OBS tab | HAVE_IMPORT_HUB / present | OBS folder scan import. |
@@ -153,7 +155,7 @@ These predate the selftest-split campaign, so they have no `--selftest=` entry a
 
 | Feature | Cluster | UI entry (file:line) | Blocker | Note |
 |---|---|---|---|---|
-| transcript-highlighter | ai-ml | MainWindow.cpp:2346 (Tools>文字起こしからハイライト検出) | ANTHROPIC_API_KEY | LLM detection; no offline fallback, returns empty without key. |
+| transcript-highlighter | ai-ml | MainWindow.cpp:2346 (Tools>文字起こしからハイライト検出) | provider API key for provider-backed detection (optional) | Supports `anthropic` / `openai` / `gemini` / `offline`. Without an API key, `detectOffline()` falls back to keyword/exclamation-based heuristics. |
 | youtube | streaming-social | MainWindow.cpp:2547 (Tools>YouTube アップロード) | Google OAuth creds | Real resumable QNAM upload, needs CLIENT_ID/SECRET. |
 | vimeo | streaming-social | MainWindow.cpp:2586 (Tools>Vimeo 直送) | Vimeo creds + in-app auth stub | tus upload real; Authenticate button not wired. |
 | instagram | streaming-social | MainWindow.cpp:2677 (Tools>Instagram Reels) | Meta IG token + user id | Real 2-step Graph API publish. |
@@ -171,7 +173,6 @@ These are the features most analogous to the HDR-3 case: the code exists and may
 | **gpu-composite-math / -parity, hdr-composite-math** | Pure parity oracles/selftests. They prove the GPU/HDR blend math is correct but are never invoked at runtime — not features. | N/A (intentional test scaffolding). |
 | **live-matte-resolve** | Only runs inside `tryGpuComposeLayers`, which early-returns unless `m_gpuCompositeEnabled` (`VEDITOR_GPU_COMPOSITE`, default **false**) AND GL is present AND a matte exists. Default users get the CPU matte-free fallback. | No — flip-a-flag away, but GPU compositing parity must be trusted first. |
 | **aces-color** | Fully wired into preview + export, but `AcesPipeline.enabled` defaults **false**, so output is bit-identical until the user opts in via the dialog. | No — a real, working feature merely hidden by a default. |
-| **transcript-highlighter** | Core LLM detection depends on a paid Anthropic API key with **no offline/heuristic fallback** — returns empty out-of-box. | Yes — external paid dep. |
 | **youtube / vimeo / instagram / xupload / frameio / cloudrender** | All real network clients, all blocked on user-supplied OAuth/API creds (vimeo additionally has an unwired in-app Authenticate button). | Yes — external accounts/creds. |
 | **dolby-vision** | Authors a sidecar DV XML only; no RPU mux / pixel grading (requires Dolby license). | Yes — license/tooling dep (dovi_tool external). |
 | **subxlat / whisper-transcribe** | Default to offline stubs (passthrough `[lang]` prefix / canned transcript). Real behaviour needs an API key (translate) or external `whisper-cli` binary (ASR). | Partial — degrade gracefully but useless until external dep present. |
@@ -192,8 +193,7 @@ These are the features most analogous to the HDR-3 case: the code exists and may
 
 ### (c) UNBLOCK — needs external dep (defer / document)
 9. **youtube / vimeo / instagram / xupload / frameio / cloudrender** — leave BLOCKED; add a one-line "set VEDITOR_*_* / sign in" hint in each dialog. Finish vimeo's unwired Authenticate button (small) so it matches the others. *(Defer; these are correct-by-design pending user creds.)*
-10. **transcript-highlighter** — add a **deterministic offline fallback** (keyword/energy heuristic) so it isn't dead without an Anthropic key. *(Medium ROI — turns BLOCKED into MVP.)*
-11. **dolby-vision** — keep as XML-sidecar MVP; document the dovi_tool external step. Full RPU is license-gated, do not invest. *(Defer.)*
+10. **dolby-vision** — keep as XML-sidecar MVP; document the dovi_tool external step. Full RPU is license-gated, do not invest. *(Defer.)*
 
 ### (d) CUT / keep-as-engine (don't ship as features)
 12. **hdr-composite-parity / composite16 + gpu/hdr-composite-math/parity** — these are **correct as test oracles**. Either (i) build the RGBA64 overlay pool so `composite16` can actually run, or (ii) explicitly label the whole HDR-GPU compositing path as "reference/selftest only" and stop tracking it as a user feature. Do **not** advertise HDR GPU compositing until the SDR overlay-pool ceiling is lifted. *(Decisive: it cannot work today.)*
@@ -201,4 +201,4 @@ These are the features most analogous to the HDR-3 case: the code exists and may
 
 ---
 
-_Bottom line: of the **real** (non-test) features, **~76% (70/92) are genuinely usable today**, and the WIRED core — timeline edit/trim/transitions, undo/redo, mixer + bus, color grading (wheels/curves/LUT), scopes, markers, keyframe animation, autosave, tracking, proxies, in-process codec, and the full export-format set — is real, not faked. The NLE is **NOT broadly "C-like."** The honest gaps are concentrated and explainable in three buckets: (1) the not-yet-live GPU/HDR compositing path (blocked by the SDR overlay-pool ceiling), (2) credential-blocked cloud uploads, and (3) a short tail of stub-defaulting external-dep features (whisper, subtitle-translate, transcript-highlighter, Dolby Vision sidecar). Caveat: this is a feature-level estimate over 108 catalogued features; the action-level surface (~251 menu actions) is larger, and the uncounted remainder skews WIRED — so 76% is a floor, not a ceiling._
+_Bottom line: of the **real** (non-test) features, **~77% (72/94) are genuinely usable today**, and the WIRED core — timeline edit/trim/transitions, undo/redo, mixer + bus, color grading (wheels/curves/LUT), scopes, markers, keyframe animation, autosave, tracking, proxies, in-process codec, the MCP server, the AI chat dock, and the full export-format set — is real, not faked. The NLE is **NOT broadly "C-like."** The honest gaps are concentrated and explainable in three buckets: (1) the not-yet-live GPU/HDR compositing path (blocked by the SDR overlay-pool ceiling), (2) credential-blocked cloud uploads and provider-backed AI modes, and (3) a short tail of stub-defaulting external-dep features (whisper, subtitle-translate, Dolby Vision sidecar). Caveat: this is a feature-level estimate over 110 catalogued features; the action-level surface (~251 menu actions) is larger, and the uncounted remainder skews WIRED — so 77% is a floor, not a ceiling._
