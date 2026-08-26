@@ -64,6 +64,23 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/libavcore/AudioExtract.h
     src/libavcore/AudioExtract.cpp
 
+    # PRD-MCP: MCP (Model Context Protocol) サーバのプロトコル層。
+    # トランスポート非依存 / GUI 非依存 — HTTP と stdio ブリッジの両方が使う。
+    src/mcp/McpProtocol.h
+    src/mcp/McpProtocol.cpp
+    src/mcp/McpToolRegistry.h
+    src/mcp/McpToolRegistry.cpp
+    src/mcp/McpHttpServer.h
+    src/mcp/McpHttpServer.cpp
+    src/mcp/McpEditorTools.h
+    src/mcp/McpEditorTools.cpp
+    src/mcp/McpStdioBridge.h
+    src/mcp/McpStdioBridge.cpp
+    src/mcp/McpConnectionInfoDialog.h
+    src/mcp/McpConnectionInfoDialog.cpp
+    src/AiChatDock.h
+    src/AiChatDock.cpp
+
     # PRD-SPLIT-MAIN-1: selftest registry (table + dispatch helpers).
     src/selftests/SelftestRegistry.h
     src/selftests/SelftestRegistry.cpp
@@ -508,6 +525,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/whisper_transcribe_selftest.cpp
     src/selftests/transcript_highlighter_selftest.cpp
     src/selftests/transcript_highlighter_offline_selftest.cpp
+    src/selftests/mcp_selftest.cpp
     src/MotionTracker.cpp
     src/MotionTrackerDialog.h
     src/MotionTrackerDialog.cpp

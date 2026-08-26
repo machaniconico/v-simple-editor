@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <functional>
+#include <limits>
 #include <utility>
 #include <QFileInfo>
 #include <QDir>
@@ -4126,6 +4127,391 @@ bool trackRangeOverlapsClip(const TimelineTrack *track, double startSec, double 
 }
 
 } // namespace
+
+namespace {
+
+bool setTimelineEditError(QString *err, const QString &message)
+{
+    if (err)
+        *err = message;
+    return false;
+}
+
+struct IndexEditTarget {
+    TimelineTrack *track = nullptr;
+    int clipIndex = -1;
+    double startSec = 0.0;
+    double endSec = 0.0;
+    double localSplitSec = 0.0;
+};
+
+QVector<TimelineTrack *> timelineTracks(const Timeline *timeline)
+{
+    QVector<TimelineTrack *> tracks;
+    if (!timeline)
+        return tracks;
+    tracks.reserve(timeline->videoTracks().size() + timeline->audioTracks().size());
+    for (TimelineTrack *track : timeline->videoTracks())
+        tracks.append(track);
+    for (TimelineTrack *track : timeline->audioTracks())
+        tracks.append(track);
+    return tracks;
+}
+
+} // namespace
+
+bool Timeline::splitClipByIndex(bool audio, int trackIndex, int clipIndex,
+                                double timelineSeconds, QString *err)
+{
+    if (!std::isfinite(timelineSeconds) || timelineSeconds < 0.0)
+        return setTimelineEditError(err, QStringLiteral("timelineSeconds must be non-negative"));
+
+    TimelineTrack *selectedTrack = trackAt(audio, trackIndex);
+    if (!selectedTrack)
+        return setTimelineEditError(err, QStringLiteral("track index is out of range"));
+    if (clipIndex < 0 || clipIndex >= selectedTrack->clipCount())
+        return setTimelineEditError(err, QStringLiteral("clip index is out of range"));
+    if (selectedTrack->isLocked())
+        return setTimelineEditError(err, QStringLiteral("track is locked"));
+
+    double selectedStart = 0.0;
+    double selectedEnd = 0.0;
+    if (!trackClipTimeRangeAt(selectedTrack, clipIndex, &selectedStart, &selectedEnd)
+        || !std::isfinite(selectedStart) || !std::isfinite(selectedEnd)) {
+        return setTimelineEditError(err, QStringLiteral("clip has no valid duration"));
+    }
+    // Keep the same safety margin as splitAtPlayhead().
+    if (timelineSeconds <= selectedStart + 0.05
+        || timelineSeconds >= selectedEnd - 0.05) {
+        return setTimelineEditError(err, QStringLiteral("split point is outside the clip"));
+    }
+
+    const int oldGroup = selectedTrack->clips().at(clipIndex).linkGroup;
+    const QVector<TimelineTrack *> tracks = timelineTracks(this);
+    QVector<IndexEditTarget> targets;
+    if (oldGroup <= 0) {
+        targets.append(IndexEditTarget{selectedTrack, clipIndex, selectedStart,
+                                       selectedEnd, timelineSeconds - selectedStart});
+    } else {
+        for (TimelineTrack *track : tracks) {
+            if (!track)
+                continue;
+            for (int i = 0; i < track->clipCount(); ++i) {
+                if (track->clips().at(i).linkGroup != oldGroup)
+                    continue;
+                double start = 0.0;
+                double end = 0.0;
+                if (!trackClipTimeRangeAt(track, i, &start, &end)
+                    || !std::isfinite(start) || !std::isfinite(end)
+                    || timelineSeconds <= start + 0.05
+                    || timelineSeconds >= end - 0.05) {
+                    return setTimelineEditError(
+                        err, QStringLiteral("split point is outside the clip"));
+                }
+                if (track->isLocked())
+                    return setTimelineEditError(err, QStringLiteral("track is locked"));
+                targets.append(IndexEditTarget{track, i, start, end,
+                                               timelineSeconds - start});
+            }
+        }
+    }
+
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    const int newGroup = oldGroup > 0 ? allocateLinkGroup() : 0;
+    for (TimelineTrack *track : tracks) {
+        if (!track)
+            continue;
+        QVector<IndexEditTarget> trackTargets;
+        for (const IndexEditTarget &target : targets) {
+            if (target.track == track)
+                trackTargets.append(target);
+        }
+        std::sort(trackTargets.begin(), trackTargets.end(),
+                  [](const IndexEditTarget &a, const IndexEditTarget &b) {
+                      return a.clipIndex > b.clipIndex;
+                  });
+        for (const IndexEditTarget &target : trackTargets) {
+            track->splitClipAt(target.clipIndex, target.localSplitSec, false);
+            if (newGroup > 0) {
+                QVector<ClipInfo> clips = track->clips();
+                clips[target.clipIndex + 1].linkGroup = newGroup;
+                track->setClips(clips);
+            }
+        }
+        if (!trackTargets.isEmpty())
+            track->setClips(track->clips());
+    }
+
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+    saveUndoState(QStringLiteral("Split clip (MCP)"));
+    updateInfoLabel();
+    scheduleEmitSequenceChanged();
+    return true;
+}
+
+bool Timeline::deleteClipByIndex(bool audio, int trackIndex, int clipIndex,
+                                 bool ripple, QString *err)
+{
+    TimelineTrack *selectedTrack = trackAt(audio, trackIndex);
+    if (!selectedTrack)
+        return setTimelineEditError(err, QStringLiteral("track index is out of range"));
+    if (clipIndex < 0 || clipIndex >= selectedTrack->clipCount())
+        return setTimelineEditError(err, QStringLiteral("clip index is out of range"));
+    if (selectedTrack->isLocked())
+        return setTimelineEditError(err, QStringLiteral("track is locked"));
+
+    const int linkGroup = selectedTrack->clips().at(clipIndex).linkGroup;
+    const QVector<TimelineTrack *> tracks = timelineTracks(this);
+    QVector<IndexEditTarget> targets;
+    for (TimelineTrack *track : tracks) {
+        if (!track)
+            continue;
+        for (int i = 0; i < track->clipCount(); ++i) {
+            if ((linkGroup > 0 && track->clips().at(i).linkGroup != linkGroup)
+                || (linkGroup <= 0 && (track != selectedTrack || i != clipIndex))) {
+                continue;
+            }
+            double start = 0.0;
+            double end = 0.0;
+            if (!trackClipTimeRangeAt(track, i, &start, &end))
+                return setTimelineEditError(err, QStringLiteral("clip has no valid duration"));
+            if (track->isLocked())
+                return setTimelineEditError(err, QStringLiteral("track is locked"));
+            targets.append(IndexEditTarget{track, i, start, end, 0.0});
+        }
+    }
+
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    bool changed = false;
+    for (TimelineTrack *track : tracks) {
+        if (!track)
+            continue;
+        QVector<IndexEditTarget> trackTargets;
+        for (const IndexEditTarget &target : targets) {
+            if (target.track == track)
+                trackTargets.append(target);
+        }
+        std::sort(trackTargets.begin(), trackTargets.end(),
+                  [](const IndexEditTarget &a, const IndexEditTarget &b) {
+                      return a.clipIndex > b.clipIndex;
+                  });
+        for (const IndexEditTarget &target : trackTargets) {
+            if (ripple)
+                changed = track->rippleDeleteTimeRange(target.startSec,
+                                                       target.endSec, false)
+                    || changed;
+            else {
+                track->removeClipPreservingDownstream(target.clipIndex, false);
+                changed = true;
+            }
+        }
+        if (!trackTargets.isEmpty())
+            track->setClips(track->clips());
+    }
+
+    if (!changed)
+        return setTimelineEditError(err, QStringLiteral("clip could not be deleted"));
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+    saveUndoState(QStringLiteral("Delete clip (MCP)"));
+    updateInfoLabel();
+    scheduleEmitSequenceChanged();
+    return true;
+}
+
+bool Timeline::moveClipByIndex(bool audio, int trackIndex, int clipIndex,
+                               double newStartSec, double *settledStartSec,
+                               QString *err)
+{
+    if (!std::isfinite(newStartSec) || newStartSec < 0.0)
+        return setTimelineEditError(err, QStringLiteral("newStartSec must be non-negative"));
+
+    TimelineTrack *selectedTrack = trackAt(audio, trackIndex);
+    if (!selectedTrack)
+        return setTimelineEditError(err, QStringLiteral("track index is out of range"));
+    if (clipIndex < 0 || clipIndex >= selectedTrack->clipCount())
+        return setTimelineEditError(err, QStringLiteral("clip index is out of range"));
+    if (selectedTrack->isLocked())
+        return setTimelineEditError(err, QStringLiteral("track is locked"));
+
+    const int linkGroup = selectedTrack->clips().at(clipIndex).linkGroup;
+    const QVector<TimelineTrack *> tracks = timelineTracks(this);
+    QVector<IndexEditTarget> targets;
+    for (TimelineTrack *track : tracks) {
+        if (!track)
+            continue;
+        for (int i = 0; i < track->clipCount(); ++i) {
+            if ((linkGroup > 0 && track->clips().at(i).linkGroup != linkGroup)
+                || (linkGroup <= 0 && (track != selectedTrack || i != clipIndex))) {
+                continue;
+            }
+            double start = 0.0;
+            double end = 0.0;
+            if (!trackClipTimeRangeAt(track, i, &start, &end)
+                || !std::isfinite(start) || !std::isfinite(end)) {
+                return setTimelineEditError(err, QStringLiteral("clip has no valid duration"));
+            }
+            if (track->isLocked())
+                return setTimelineEditError(err, QStringLiteral("track is locked"));
+            targets.append(IndexEditTarget{track, i, start, end, 0.0});
+        }
+    }
+
+    double minimumDelta = -std::numeric_limits<double>::infinity();
+    double maximumDelta = std::numeric_limits<double>::infinity();
+    for (IndexEditTarget &target : targets) {
+        const QVector<ClipInfo> &clips = target.track->clips();
+        double cursor = 0.0;
+        double previousEnd = 0.0;
+        double nextStart = std::numeric_limits<double>::infinity();
+        for (int i = 0; i < clips.size(); ++i) {
+            const double start = cursor + clips.at(i).leadInSec;
+            const double end = start + clips.at(i).effectiveDuration();
+            if (i == target.clipIndex) {
+                previousEnd = cursor;
+                if (i + 1 < clips.size())
+                    nextStart = end + clips.at(i + 1).leadInSec;
+                break;
+            }
+            cursor = end;
+        }
+        minimumDelta = qMax(minimumDelta, previousEnd - target.startSec);
+        if (std::isfinite(nextStart))
+            maximumDelta = qMin(maximumDelta, nextStart - target.endSec);
+    }
+    if (minimumDelta > maximumDelta)
+        return setTimelineEditError(err, QStringLiteral("linked clips cannot move together"));
+
+    const IndexEditTarget &selectedTarget = *std::find_if(
+        targets.cbegin(), targets.cend(), [selectedTrack, clipIndex](const IndexEditTarget &target) {
+            return target.track == selectedTrack && target.clipIndex == clipIndex;
+        });
+    const double requestedDelta = newStartSec - selectedTarget.startSec;
+    const double delta = qBound(minimumDelta, requestedDelta, maximumDelta);
+    if (settledStartSec)
+        *settledStartSec = selectedTarget.startSec + delta;
+
+    struct PendingTrack {
+        TimelineTrack *track = nullptr;
+        QVector<ClipInfo> clips;
+        bool changed = false;
+    };
+    QVector<PendingTrack> pending;
+    for (TimelineTrack *track : tracks) {
+        QVector<int> affected;
+        for (const IndexEditTarget &target : targets) {
+            if (target.track == track)
+                affected.append(target.clipIndex);
+        }
+        if (affected.isEmpty())
+            continue;
+
+        const QVector<ClipInfo> oldClips = track->clips();
+        QVector<double> starts(oldClips.size());
+        QVector<double> durations(oldClips.size());
+        double cursor = 0.0;
+        for (int i = 0; i < oldClips.size(); ++i) {
+            starts[i] = cursor + oldClips.at(i).leadInSec;
+            durations[i] = oldClips.at(i).effectiveDuration();
+            cursor = starts[i] + durations[i];
+        }
+
+        QVector<double> desiredStarts = starts;
+        for (int index : affected)
+            desiredStarts[index] += delta;
+        PendingTrack result{track, oldClips, false};
+        for (int i = 0; i < result.clips.size(); ++i) {
+            const double previousEnd = i == 0
+                ? 0.0 : desiredStarts[i - 1] + durations[i - 1];
+            const double leadIn = desiredStarts[i] - previousEnd;
+            if (!std::isfinite(leadIn) || leadIn < -1e-6)
+                return setTimelineEditError(err, QStringLiteral("linked clips cannot move together"));
+            result.clips[i].leadInSec = qMax(0.0, leadIn);
+            result.changed = result.changed
+                || qAbs(result.clips[i].leadInSec - oldClips.at(i).leadInSec) > 1e-6;
+        }
+        pending.append(std::move(result));
+    }
+
+    if (qAbs(delta) <= 1e-6) {
+        // A clamped no-op is still a valid request, but it must not create a
+        // meaningless undo entry.
+        return true;
+    }
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    for (const PendingTrack &result : pending)
+        result.track->setClips(result.clips);
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+    saveUndoState(QStringLiteral("Move clip (MCP)"));
+    updateInfoLabel();
+    scheduleEmitSequenceChanged();
+    return true;
+}
+
+bool Timeline::setClipPropertyByIndex(bool audio, int trackIndex, int clipIndex,
+                                      const QString &property, double value,
+                                      QString *err)
+{
+    if (!std::isfinite(value))
+        return setTimelineEditError(err, QStringLiteral("value must be a finite number"));
+
+    double lower = 0.0;
+    double upper = 0.0;
+    if (property == QStringLiteral("volume")) {
+        upper = 2.0;
+    } else if (property == QStringLiteral("opacity")) {
+        upper = 1.0;
+    } else if (property == QStringLiteral("speed")) {
+        lower = 0.25;
+        upper = 4.0;
+    } else if (property == QStringLiteral("pan")) {
+        lower = -1.0;
+        upper = 1.0;
+    } else if (property == QStringLiteral("videoScale")) {
+        lower = 0.1;
+        upper = 10.0;
+    } else {
+        return setTimelineEditError(err,
+                                    QStringLiteral("unsupported property: %1").arg(property));
+    }
+    if (value < lower || value > upper)
+        return setTimelineEditError(err, QStringLiteral("%1 out of range [%2, %3]")
+                                         .arg(property).arg(lower).arg(upper));
+
+    TimelineTrack *track = trackAt(audio, trackIndex);
+    if (!track)
+        return setTimelineEditError(err, QStringLiteral("track index is out of range"));
+    if (clipIndex < 0 || clipIndex >= track->clipCount())
+        return setTimelineEditError(err, QStringLiteral("clip index is out of range"));
+    if (track->isLocked())
+        return setTimelineEditError(err, QStringLiteral("track is locked"));
+
+    // Property edits intentionally ignore linkGroup: changing one side's
+    // volume (or another whitelisted property) is a normal MCP use case.
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    QVector<ClipInfo> clips = track->clips();
+    ClipInfo &clip = clips[clipIndex];
+    if (property == QStringLiteral("volume"))
+        clip.volume = value;
+    else if (property == QStringLiteral("opacity"))
+        clip.opacity = value;
+    else if (property == QStringLiteral("speed"))
+        clip.speed = value;
+    else if (property == QStringLiteral("pan"))
+        clip.pan = value;
+    else
+        clip.videoScale = value;
+    track->setClips(clips);
+
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+    saveUndoState(QStringLiteral("Set clip property (MCP)"));
+    updateInfoLabel();
+    scheduleEmitSequenceChanged();
+    return true;
+}
 
 QVector<Timeline::TimeRangeSec> Timeline::selectedClipTimeRanges() const
 {

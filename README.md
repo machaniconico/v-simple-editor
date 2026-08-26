@@ -97,6 +97,85 @@ A professional video editing application built from scratch with C++17, Qt6, and
 
 ---
 
+## MCP 連携 (LLM からタイムラインを操作する)
+
+V Simple Editor には、LLM からローカルのエディタを操作するための MCP サーバが内蔵されています。会話で「このクリップを分割して、不要な方を削除して」のように指示すると、Claude Code や Codex CLI が MCP ツールを呼び出し、エディタのタイムラインが編集されます。
+
+### なぜサブスク枠で動くのか
+
+API キー方式でモデルを呼び出すと、通常は API の従量課金になります。一方、Claude Code などの CLI はログイン済みのサブスクリプション枠で利用できます。そこで、エディタ自身が localhost の MCP サーバになり、考えて指示を出す側をログイン済みの Claude Code / Codex CLI が担う構造にしています。エディタが API キーを使ってモデルを直接呼び出す構成ではありません。
+
+### MCP サーバの起動
+
+1. エディタで **ツール > MCP サーバ > MCP サーバを有効にする** を選びます。
+2. サーバは `127.0.0.1` のみにバインドし、既定ポート `8765`（使用中なら `+1` し、最大 20 回試行）で起動します。
+3. 認証は Bearer トークンです。`Authorization: Bearer <token>` ヘッダー、または URL の `?token=<token>` を使います。
+4. MCP は protocolVersion `2025-06-18` の Streamable HTTP で、POST 1 回に対して JSON レスポンスを返します。
+
+トークンは QSettings の `VSimpleEditor/Preferences/mcpToken` に保存され、次回起動後も同じ値が使われます。`VEDITOR_MCP_TOKEN` と `VEDITOR_MCP_PORT` を設定すると、それぞれトークンとポートを上書きできます。起動オプション `--mcp-serve` を使うと、その起動中だけサーバを有効にでき、保存設定は変更しません。
+
+### Claude Code から使う
+
+1. 上記のメニューでサーバを起動し、**接続情報...** から mcp.json の内容をコピーします。
+2. それを `veditor-mcp.json` として保存します（`<token>` は実際のトークンに置き換えます）。
+3. 次のように起動します。
+
+   ```sh
+   claude --mcp-config veditor-mcp.json --strict-mcp-config
+   ```
+
+実際に動作する設定例:
+
+```json
+{"mcpServers":{"veditor":{"type":"http","url":"http://127.0.0.1:8765/mcp","headers":{"Authorization":"Bearer <token>"}}}}
+```
+
+### Codex CLI から使う
+
+エディタを起動した状態で、Codex CLI の `config.toml`（通常は `~/.codex/config.toml`）に stdio ブリッジを登録します。`<token>` と必要なら実行ファイルのパスを置き換えてください。
+
+```toml
+[mcp_servers.veditor]
+command = "v-simple-editor.exe"
+args = ["--mcp-stdio", "--port", "8765", "--token", "<token>"]
+```
+
+このブリッジは stdin/stdout の「1 行 1 JSON-RPC」を localhost の HTTP MCP サーバへ中継します。エディタが起動していない場合はプロセスを落とさず、`-32603` と `editor not running` を返します。ポートを変更した場合は `--port` も合わせて変更してください。
+
+### エディタ内 AI チャット
+
+**表示 > AI チャット** で AI チャット Dock を開きます。Dock は `claude` CLI を headless で `-p <prompt> --output-format stream-json --verbose --mcp-config <一時json> --strict-mcp-config --allowedTools mcp__veditor` のオプション付きで起動し、MCP 設定を一時ファイルで渡して `veditor` のツールだけを許可します。子プロセスの環境から `ANTHROPIC_API_KEY` と `ANTHROPIC_AUTH_TOKEN` を除去するため、ログイン済みの Claude Pro / Max のサブスク枠で動作します。使用する CLI 名は QSettings の `aiChatCommand` で変更できます。
+
+`claude` が PATH に無い場合は、先に次を実行してください。
+
+```sh
+npm i -g @anthropic-ai/claude-code
+```
+
+### 安全性
+
+MCP の変更系ツールは確認ダイアログを出さず、常に自動承認されます。編集前に Undo 状態を 1 回だけ保存するため、通常は LLM の 1 操作を **Ctrl+Z 1 回**で戻せます。`run_command` は各メニューアクションが自分で Undo を積むため、MCP 側では二重に積みません。`add_caption` は字幕エディタ側の状態を変更するため Ctrl+Z の対象外です。トークンは他人に渡さないでください。サーバは `127.0.0.1` にのみバインドされるため、LAN 上の別の端末からは接続できません。
+
+### MCP ツール
+
+| 名前 | 何をするか | Undo |
+|---|---|---|
+| `get_project_info` | プロジェクト情報を読み取る | なし |
+| `get_timeline` | タイムラインを読み取る | なし |
+| `get_captions` | 字幕を読み取る | なし |
+| `list_commands` | メニューの全アクション（実測 231 件）を安定 ID（例: `file.11`, `tools.41`）付きで一覧する | なし |
+| `run_command` | `list_commands` のアクションを実行する | アクション依存（MCP 側では追加しない） |
+| `split_clip` | クリップを分割する | あり |
+| `delete_clip` | クリップを削除する | あり |
+| `move_clip` | クリップを移動する | あり |
+| `set_clip_property` | クリップのプロパティを変更する | あり |
+| `add_caption` | 字幕を追加する | なし（Ctrl+Z 対象外） |
+| `set_playhead` | 再生ヘッドを移動する | なし |
+| `undo` | 直前の編集を元に戻す | なし |
+| `redo` | 元に戻した編集をやり直す | なし |
+
+---
+
 ## Supported Formats
 
 | Codec | Decode | Encode |

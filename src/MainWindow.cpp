@@ -25,6 +25,11 @@ double exporter_loudnessGainDb();
 #include "EffectClipboard.h"
 #include "PasteAttributesDialog.h"
 #include <QDockWidget>
+#include "AiChatDock.h"
+#include "mcp/McpConnectionInfoDialog.h"
+#include "mcp/McpEditorTools.h"
+#include "mcp/McpHttpServer.h"
+#include "mcp/McpToolRegistry.h"
 #include "GLPreview.h"
 #include "EqualizerPanel.h"
 #include "CompressorPanel.h"
@@ -2831,6 +2836,28 @@ MainWindow::MainWindow(QWidget *parent)
     registerCoreShortcuts();
     m_shortcutManager->loadFromSettings();
 
+    // MCP の自動起動は UI 構築完了後に行い、接続情報ダイアログや Dock の
+    // QAction が確実に存在する状態で開始する。
+    // `--mcp-serve` は設定に関係なくこの起動でだけサーバを有効にする起動オプション
+    // (常に MCP サーバ付きで開くショートカットを作りたいとき、および自動検証用)。
+    const bool mcpServeRequested =
+        QCoreApplication::arguments().contains(QStringLiteral("--mcp-serve"));
+    if (mcpServeRequested
+        || QSettings(QStringLiteral("VSimpleEditor"), QStringLiteral("Preferences"))
+               .value(QStringLiteral("mcpAutoStart"), false).toBool()) {
+        // --mcp-serve は「この起動でだけ有効」。保存設定は書き換えない
+        // (次回以降も勝手にサーバが上がるのは驚きになる)。
+        m_mcpSuppressAutoStartPersist = mcpServeRequested;
+        if (m_mcpToggleAction) {
+            // toggled シグナル経由で toggleMcpServer() を 1 回だけ通す
+            // (直接呼ぶとメニューのチェック状態がずれる)。
+            m_mcpToggleAction->setChecked(true);
+        } else {
+            toggleMcpServer(true);
+        }
+        m_mcpSuppressAutoStartPersist = false;
+    }
+
     qInfo() << "MainWindow::ctor end";
 }
 
@@ -2872,6 +2899,100 @@ MainWindow::~MainWindow()
         m_mediaPoolDock = nullptr;
     }
 
+    if (m_aiChatDock) {
+        detachFromMainWindow(m_aiChatDock);
+        delete m_aiChatDock;
+        m_aiChatDock = nullptr;
+    }
+    delete m_mcpTools;
+    m_mcpTools = nullptr;
+    if (m_mcpServer) {
+        detachFromMainWindow(m_mcpServer);
+        delete m_mcpServer;
+        m_mcpServer = nullptr;
+    }
+    delete m_mcpRegistry;
+    m_mcpRegistry = nullptr;
+
+}
+
+void MainWindow::ensureMcpServerComponents()
+{
+    if (!m_mcpRegistry)
+        m_mcpRegistry = new mcp::McpToolRegistry;
+    if (!m_mcpTools) {
+        m_mcpTools = new mcp::McpEditorTools(this, m_mcpRegistry);
+        m_mcpTools->registerReadTools();
+        m_mcpTools->registerWriteTools();
+    }
+    if (!m_mcpServer) {
+        m_mcpServer = new mcp::McpHttpServer(m_mcpRegistry, this);
+        connect(m_mcpServer, &mcp::McpHttpServer::stopped, this, [this]() {
+            if (m_mcpToggleAction) {
+                const QSignalBlocker blocker(m_mcpToggleAction);
+                m_mcpToggleAction->setChecked(false);
+            }
+            if (m_mcpConnectionInfoAction)
+                m_mcpConnectionInfoAction->setEnabled(false);
+        });
+    }
+}
+
+void MainWindow::toggleMcpServer(bool enabled)
+{
+    QSettings settings(QStringLiteral("VSimpleEditor"),
+                       QStringLiteral("Preferences"));
+    // --mcp-serve 起動のときだけ、保存設定を書き換えずにサーバを立てる。
+    const bool persist = !m_mcpSuppressAutoStartPersist;
+    if (persist)
+        settings.setValue(QStringLiteral("mcpAutoStart"), enabled);
+
+    if (!enabled) {
+        if (m_mcpServer)
+            m_mcpServer->stop();
+        if (m_mcpConnectionInfoAction)
+            m_mcpConnectionInfoAction->setEnabled(false);
+        statusBar()->showMessage(QStringLiteral("MCP サーバを停止しました"));
+        return;
+    }
+
+    ensureMcpServerComponents();
+    if (!m_mcpServer->start(8765)) {
+        QMessageBox::warning(this, QStringLiteral("MCP サーバ"),
+                             QStringLiteral("MCP サーバを起動できませんでした。"));
+        if (persist)
+            settings.setValue(QStringLiteral("mcpAutoStart"), false);
+        if (m_mcpToggleAction) {
+            const QSignalBlocker blocker(m_mcpToggleAction);
+            m_mcpToggleAction->setChecked(false);
+        }
+        if (m_mcpConnectionInfoAction)
+            m_mcpConnectionInfoAction->setEnabled(false);
+        return;
+    }
+
+    if (m_mcpToggleAction && !m_mcpToggleAction->isChecked()) {
+        const QSignalBlocker blocker(m_mcpToggleAction);
+        m_mcpToggleAction->setChecked(true);
+    }
+    if (m_mcpConnectionInfoAction)
+        m_mcpConnectionInfoAction->setEnabled(true);
+    statusBar()->showMessage(
+        QStringLiteral("MCP サーバを起動しました (ポート %1)")
+            .arg(m_mcpServer->port()));
+}
+
+void MainWindow::showMcpConnectionInfo()
+{
+    if (!m_mcpServer || !m_mcpServer->isRunning()) {
+        QMessageBox::information(this, QStringLiteral("MCP サーバ"),
+                                 QStringLiteral("サーバが停止しています"));
+        return;
+    }
+
+    McpConnectionInfoDialog dialog(m_mcpServer->endpointUrl(),
+                                   m_mcpServer->token(), this);
+    dialog.exec();
 }
 
 void MainWindow::registerCoreShortcuts()
@@ -2920,6 +3041,14 @@ void MainWindow::registerCoreShortcuts()
 double MainWindow::currentPlayheadSeconds() const
 {
     return m_timeline ? m_timeline->playheadPosition() : 0.0;
+}
+
+QString MainWindow::projectDirectory() const
+{
+    if (m_projectFilePath.isEmpty())
+        return QDir::homePath();
+    const QString directory = QFileInfo(m_projectFilePath).absolutePath();
+    return QDir(directory).exists() ? directory : QDir::homePath();
 }
 
 void MainWindow::refreshEffectLibraryPreview()
@@ -5522,6 +5651,32 @@ void MainWindow::setupMenuBar()
     m_menuHelpEntries.append({watermarkAction,
         QStringLiteral("ロゴ画像やテキストの透かしを映像へ重ねて、位置・不透明度を調整します。")});
 
+    // PRD-MCP: ツールメニューの末尾に追加し、保存済みお気に入りの id をずらさない。
+    auto *mcpMenu = toolsMenu->addMenu(QStringLiteral("MCP サーバ"));
+    m_menuHelpEntries.append({mcpMenu->menuAction(),
+        QStringLiteral("Claude Code / Codex CLI から、このエディタのタイムラインを操作する MCP サーバを設定します。")});
+
+    m_mcpToggleAction = mcpMenu->addAction(
+        QStringLiteral("MCP サーバを有効にする"));
+    m_mcpToggleAction->setCheckable(true);
+    // ここでは保存値でチェックを入れない。入れてしまうと、コンストラクタ末尾の
+    // 自動起動が setChecked(true) を no-op にしてしまい toggled が飛ばず、
+    // 「チェックは入っているのにサーバは動いていない」状態になる。
+    // チェック状態 == サーバ稼働状態 を保つため、実際の起動は自動起動ブロックに任せる。
+    m_mcpToggleAction->setChecked(false);
+    connect(m_mcpToggleAction, &QAction::toggled,
+            this, &MainWindow::toggleMcpServer);
+    m_menuHelpEntries.append({m_mcpToggleAction,
+        QStringLiteral("localhost の MCP HTTP サーバを起動し、外部 LLM からタイムライン操作を受け付けます。")});
+
+    m_mcpConnectionInfoAction = mcpMenu->addAction(
+        QStringLiteral("接続情報..."));
+    m_mcpConnectionInfoAction->setEnabled(false);
+    connect(m_mcpConnectionInfoAction, &QAction::triggered,
+            this, &MainWindow::showMcpConnectionInfo);
+    m_menuHelpEntries.append({m_mcpConnectionInfoAction,
+        QStringLiteral("エンドポイント、トークン、Claude Code / Codex CLI 用の設定例を表示します。")});
+
     // US-SNS-7: LoudnessPanel dock (created here so menu action can reference it)
     m_loudnessDock = new QDockWidget("ラウドネスパネル", this);
     m_loudnessDock->setObjectName("LoudnessPanelDock");
@@ -6538,6 +6693,24 @@ void MainWindow::setupMenuBar()
     });
     m_menuHelpEntries.append({toolbarStyleAction,
         QStringLiteral("上のボタン列を、アイコンだけの小さい表示にするか、文字付きの表示にするかを切り替えます。")});
+
+    // US-007: 初回表示時だけ Dock を生成する。表示メニューの末尾へ追加し、
+    // 既存の favoritable QAction の id を変更しない。
+    auto *aiChatAction = viewMenu->addAction(QStringLiteral("AI チャット"));
+    aiChatAction->setCheckable(true);
+    connect(aiChatAction, &QAction::toggled, this, [this, aiChatAction](bool visible) {
+        if (visible && !m_aiChatDock) {
+            ensureMcpServerComponents();
+            m_aiChatDock = new AiChatDock(this, m_mcpServer, this);
+            addDockWidget(Qt::RightDockWidgetArea, m_aiChatDock);
+            connect(m_aiChatDock, &QDockWidget::visibilityChanged,
+                    aiChatAction, &QAction::setChecked);
+        }
+        if (m_aiChatDock)
+            m_aiChatDock->setVisible(visible);
+    });
+    m_menuHelpEntries.append({aiChatAction,
+        QStringLiteral("ログイン済みの Claude Code CLI と MCP で、会話しながらタイムラインを編集します。")});
 
     // 取り込み配置ポリシー: 並列トラック (V2/A2...) か 現在トラック追加 (V1/A1 連結)
     auto *importPlacementGroup = new QActionGroup(this);

@@ -521,6 +521,19 @@ public:
 
     void addClip(const QString &filePath);
     void splitAtPlayhead();
+    // ---- index 指定の編集 (MCP / スクリプト経路) ----
+    // GUI 経路と同じ「snapshot -> 変更 -> remap -> saveUndoState」の順序を
+    // 内部で守る。選択状態には依存しない。失敗時は *err を埋めて false を返し、
+    // タイムラインを一切変更しない (undo エントリも積まない)。
+    // audio=false なら video トラック、true なら audio トラックの trackIndex。
+    bool splitClipByIndex(bool audio, int trackIndex, int clipIndex,
+                          double timelineSeconds, QString *err);
+    bool deleteClipByIndex(bool audio, int trackIndex, int clipIndex,
+                           bool ripple, QString *err);
+    bool moveClipByIndex(bool audio, int trackIndex, int clipIndex,
+                         double newStartSec, double *settledStartSec, QString *err);
+    bool setClipPropertyByIndex(bool audio, int trackIndex, int clipIndex,
+                                const QString &property, double value, QString *err);
     bool freezeFrameAtPlayhead(TimelineTrack *track = nullptr, int clipIndex = -1);
     void deleteSelectedClip();
     void rippleDeleteSelectedClip();
@@ -538,6 +551,8 @@ public:
     void redo();
     bool canUndo() const;
     bool canRedo() const;
+    // MCP の各変更ツールが、検証済みの 1 操作を正確な説明で記録するための入口。
+    void saveUndoState(const QString &description);
 
     // Snap
     void setSnapEnabled(bool enabled);
@@ -659,6 +674,11 @@ public:
                                double releaseSec = 0.40);
     int videoTrackCount() const { return m_videoTracks.size(); }
     int audioTrackCount() const { return m_audioTracks.size(); }
+    // MCP ツールが index 指定で操作するために追加。該当しない index は nullptr。
+    TimelineTrack *trackAt(bool audio, int index) const {
+        const auto &tracks = audio ? m_audioTracks : m_videoTracks;
+        return index >= 0 && index < tracks.size() ? tracks.at(index) : nullptr;
+    }
 
     // Track row height (applied to all tracks AND their header widgets)
     void setTrackHeight(int h);
@@ -939,7 +959,6 @@ private:
     };
 
     void setupUI();
-    void saveUndoState(const QString &description);
 public:
     void restoreState(const TimelineState &state);
     TimelineState currentState() const;
