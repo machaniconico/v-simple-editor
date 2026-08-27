@@ -1,13 +1,14 @@
 #include "McpStdioBridge.h"
 
 #include <QCoreApplication>
-#include <QEventLoop>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonParseError>
+#include <QMetaObject>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QObject>
 #include <QTimer>
 #include <QUrl>
 #include <QtGlobal>
@@ -16,6 +17,7 @@
 #include <iostream>
 #include <optional>
 #include <string>
+#include <thread>
 
 #ifdef Q_OS_WIN
 #include <fcntl.h>
@@ -26,53 +28,9 @@ namespace {
 
 constexpr int kDefaultRequestTimeoutMs = 120000;
 
-struct HttpResult {
-    int status = 0;
-    QByteArray body;
-    bool timedOut = false;
-    bool connectionRefused = false;
-};
-
 QJsonValue nullJsonValue()
 {
     return QJsonValue(QJsonValue::Null);
-}
-
-HttpResult post(QNetworkAccessManager* manager, const QUrl& url,
-                const QByteArray& body, const QByteArray& token,
-                int timeoutMs)
-{
-    QNetworkRequest request(url);
-    request.setHeader(QNetworkRequest::ContentTypeHeader,
-                      QStringLiteral("application/json"));
-    request.setRawHeader("Authorization", "Bearer " + token);
-
-    QNetworkReply* reply = manager->post(request, body);
-    QEventLoop loop;
-    QTimer timeout;
-    timeout.setSingleShot(true);
-
-    QObject::connect(reply, &QNetworkReply::finished,
-                     &loop, &QEventLoop::quit);
-    bool timedOut = false;
-    QObject::connect(&timeout, &QTimer::timeout, &loop,
-                     [&loop, reply, &timedOut]() {
-        timedOut = true;
-        if (reply->isRunning())
-            reply->abort();
-        loop.quit();
-    });
-
-    timeout.start(timeoutMs);
-    loop.exec();
-
-    HttpResult result;
-    result.status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
-    result.body = reply->readAll();
-    result.timedOut = timedOut;
-    result.connectionRefused = reply->error() == QNetworkReply::ConnectionRefusedError;
-    reply->deleteLater();
-    return result;
 }
 
 void setBinaryMode()
@@ -89,6 +47,113 @@ void writeStdoutLine(const QByteArray& line)
     std::cout.put('\n');
     std::cout.flush();
 }
+
+class BridgeSession : public QObject
+{
+public:
+    BridgeSession(const QUrl& endpoint, const QByteArray& token, int timeoutMs)
+        : m_endpoint(endpoint)
+        , m_token(token)
+        , m_timeoutMs(timeoutMs)
+    {
+    }
+
+    void handleLine(QByteArray line)
+    {
+        if (line.endsWith('\r'))
+            line.chop(1);
+        if (line.trimmed().isEmpty())
+            return;
+
+        bool hadRequestId = false;
+        const QJsonValue requestId = McpStdioBridge::extractRequestId(
+            line, &hadRequestId);
+
+        QNetworkRequest request(m_endpoint);
+        request.setHeader(QNetworkRequest::ContentTypeHeader,
+                          QStringLiteral("application/json"));
+        request.setRawHeader("Authorization", "Bearer " + m_token);
+        QNetworkReply* reply = m_manager.post(request, line);
+        ++m_inFlight;
+
+        QTimer* timeout = new QTimer(reply);
+        timeout->setSingleShot(true);
+        QObject::connect(timeout, &QTimer::timeout, reply, [reply]() {
+            reply->setProperty("timedOut", true);
+            if (reply->isRunning())
+                reply->abort();
+        });
+        QObject::connect(reply, &QNetworkReply::finished, this,
+                         [this, reply, requestId, hadRequestId]() {
+            const int status = reply->attribute(
+                QNetworkRequest::HttpStatusCodeAttribute).toInt();
+            const QByteArray body = reply->readAll();
+            bool handled = false;
+
+            if (hadRequestId) {
+                if (status == 202) {
+                    handled = true;
+                } else if (status == 200) {
+                    const QByteArray compactResponse =
+                        McpStdioBridge::compactJson(body);
+                    if (!compactResponse.isEmpty()) {
+                        writeStdoutLine(compactResponse);
+                        handled = true;
+                    }
+                }
+
+                if (!handled) {
+                    if (status == 401) {
+                        writeStdoutLine(McpStdioBridge::makeTransportError(
+                            requestId, QStringLiteral("invalid token")));
+                    } else if (reply->property("timedOut").toBool()) {
+                        // abort() changes QNetworkReply::error(), so the
+                        // explicit timeout marker must be checked first.
+                        writeStdoutLine(McpStdioBridge::makeTransportError(
+                            requestId,
+                            QStringLiteral("editor did not respond in time")));
+                    } else if (reply->error()
+                               == QNetworkReply::ConnectionRefusedError) {
+                        writeStdoutLine(McpStdioBridge::makeTransportError(
+                            requestId, QStringLiteral("editor not running")));
+                    } else {
+                        // Unexpected HTTP/network errors are reported without
+                        // terminating the bridge, but are kept distinct from
+                        // connection refusal.
+                        writeStdoutLine(McpStdioBridge::makeTransportError(
+                            requestId,
+                            QStringLiteral("unexpected editor response")));
+                    }
+                }
+            }
+
+            --m_inFlight;
+            reply->deleteLater();
+            maybeQuit();
+        });
+        timeout->start(m_timeoutMs);
+    }
+
+    void stdinClosed()
+    {
+        m_stdinClosed = true;
+        maybeQuit();
+    }
+
+private:
+    void maybeQuit()
+    {
+        if (m_stdinClosed && m_inFlight == 0)
+            QCoreApplication::quit();
+    }
+
+    QNetworkAccessManager m_manager;
+    QUrl m_endpoint;
+    QByteArray m_token;
+    int m_timeoutMs = 0;
+    int m_inFlight = 0;
+    bool m_stdinClosed = false;
+};
 
 } // namespace
 
@@ -149,56 +214,29 @@ int McpStdioBridge::run(quint16 port, const QString& token)
 
     setBinaryMode();
 
-    QNetworkAccessManager manager;
     const QUrl endpoint(QStringLiteral("http://127.0.0.1:%1/mcp").arg(port));
     const QString environmentToken = qEnvironmentVariable("VEDITOR_MCP_TOKEN");
     const QByteArray tokenBytes = (environmentToken.isEmpty()
                                    ? token : environmentToken).toUtf8();
     const int timeoutMs = requestTimeoutMs();
 
-    std::string inputLine;
-    while (std::getline(std::cin, inputLine)) {
-        QByteArray line = QByteArray::fromStdString(inputLine);
-        if (line.endsWith('\r'))
-            line.chop(1);
-        if (line.trimmed().isEmpty())
-            continue;
-
-        bool hadRequestId = false;
-        const QJsonValue requestId = extractRequestId(line, &hadRequestId);
-        const HttpResult result = post(&manager, endpoint, line, tokenBytes,
-                                       timeoutMs);
-
-        if (!hadRequestId)
-            continue;
-
-        if (result.status == 202)
-            continue;
-
-        if (result.status == 200) {
-            const QByteArray compactResponse = compactJson(result.body);
-            if (!compactResponse.isEmpty()) {
-                writeStdoutLine(compactResponse);
-                continue;
-            }
+    BridgeSession session(endpoint, tokenBytes, timeoutMs);
+    std::thread reader([&session]() {
+        std::string inputLine;
+        while (std::getline(std::cin, inputLine)) {
+            const QByteArray line = QByteArray::fromStdString(inputLine);
+            QMetaObject::invokeMethod(
+                &session,
+                [&session, line]() { session.handleLine(line); },
+                Qt::QueuedConnection);
         }
+        QMetaObject::invokeMethod(
+            &session, [&session]() { session.stdinClosed(); },
+            Qt::QueuedConnection);
+    });
 
-        if (result.status == 401) {
-            writeStdoutLine(makeTransportError(requestId,
-                                                QStringLiteral("invalid token")));
-        } else if (result.timedOut) {
-            writeStdoutLine(makeTransportError(
-                requestId, QStringLiteral("editor did not respond in time")));
-        } else if (result.connectionRefused) {
-            writeStdoutLine(makeTransportError(
-                requestId, QStringLiteral("editor not running")));
-        } else {
-            // Unexpected HTTP/network errors are reported without terminating
-            // the bridge, but are kept distinct from connection refusal.
-            writeStdoutLine(makeTransportError(requestId,
-                                                QStringLiteral("unexpected editor response")));
-        }
-    }
+    application.exec();
+    reader.join();
 
     return 0;
 }

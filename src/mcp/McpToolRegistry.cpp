@@ -48,6 +48,8 @@ QJsonArray McpToolRegistry::listToolsJson() const
         descriptor.insert(QStringLiteral("name"), tool.name);
         descriptor.insert(QStringLiteral("description"), tool.description);
         descriptor.insert(QStringLiteral("inputSchema"), tool.inputSchema);
+        if (!tool.outputSchema.isEmpty())
+            descriptor.insert(QStringLiteral("outputSchema"), tool.outputSchema);
         tools.append(descriptor);
     }
 

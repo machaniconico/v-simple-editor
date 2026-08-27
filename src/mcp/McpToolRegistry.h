@@ -26,6 +26,7 @@ struct ToolDescriptor {
     QJsonObject inputSchema;   // JSON Schema (type:"object", properties, required)
     ToolHandler handler;
     ToolContentHandler contentHandler;
+    QJsonObject outputSchema;
 };
 
 class McpToolRegistry {
@@ -36,7 +37,8 @@ public:
     bool contains(const QString& name) const;
     QVector<QString> toolNames() const;
 
-    // tools/list の "tools" 配列 (name/description/inputSchema のみ、handler は出さない)。
+    // tools/list の "tools" 配列 (name/description/inputSchema/outputSchema、
+    // handler は出さない)。
     QJsonArray listToolsJson() const;
 
     // ツールを実行する。name が未登録なら *found=false。

@@ -59,6 +59,103 @@ QJsonObject schemaWithRequired(const QJsonObject& properties,
     return schema;
 }
 
+// additionalProperties は付けない (応答キーが条件で増減するツールがある)。
+QJsonObject outputSchemaOf(const QJsonObject& properties,
+                           const QStringList& required)
+{
+    QJsonObject schema{
+        {QStringLiteral("type"), QStringLiteral("object")},
+        {QStringLiteral("properties"), properties}
+    };
+    QJsonArray requiredArray;
+    for (const QString& name : required)
+        requiredArray.append(name);
+    if (!requiredArray.isEmpty())
+        schema.insert(QStringLiteral("required"), requiredArray);
+    return schema;
+}
+
+ToolDescriptor withOutputSchema(ToolDescriptor tool,
+                                const QJsonObject& outputSchema)
+{
+    tool.outputSchema = outputSchema;
+    return tool;
+}
+
+QJsonObject clipOutputItemSchema()
+{
+    const QJsonObject properties{
+        {QStringLiteral("index"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+        {QStringLiteral("displayName"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
+        {QStringLiteral("filePath"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
+        {QStringLiteral("startSec"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
+        {QStringLiteral("durationSec"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
+        {QStringLiteral("inPointSec"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
+        {QStringLiteral("outPointSec"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
+        {QStringLiteral("speed"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
+        {QStringLiteral("volume"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
+        {QStringLiteral("opacity"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
+        {QStringLiteral("linkGroup"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+        {QStringLiteral("selected"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}}
+    };
+    return outputSchemaOf(properties, {
+        QStringLiteral("index"), QStringLiteral("displayName"),
+        QStringLiteral("filePath"), QStringLiteral("startSec"),
+        QStringLiteral("durationSec"), QStringLiteral("inPointSec"),
+        QStringLiteral("outPointSec"), QStringLiteral("speed"),
+        QStringLiteral("volume"), QStringLiteral("opacity"),
+        QStringLiteral("linkGroup"), QStringLiteral("selected")
+    });
+}
+
+QJsonObject trackOutputItemSchema()
+{
+    return outputSchemaOf(QJsonObject{
+        {QStringLiteral("index"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+        {QStringLiteral("clips"), QJsonObject{
+            {QStringLiteral("type"), QStringLiteral("array")},
+            {QStringLiteral("items"), clipOutputItemSchema()}
+        }}
+    }, {QStringLiteral("index"), QStringLiteral("clips")});
+}
+
+QJsonObject captionOutputItemSchema()
+{
+    return outputSchemaOf(QJsonObject{
+        {QStringLiteral("index"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+        {QStringLiteral("startSec"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
+        {QStringLiteral("endSec"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
+        {QStringLiteral("text"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}}
+    }, {QStringLiteral("index"), QStringLiteral("startSec"),
+        QStringLiteral("endSec"), QStringLiteral("text")});
+}
+
+QJsonObject commandOutputItemSchema()
+{
+    return outputSchemaOf(QJsonObject{
+        {QStringLiteral("id"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
+        {QStringLiteral("label"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
+        {QStringLiteral("menuPath"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
+        {QStringLiteral("risk"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
+        {QStringLiteral("enabled"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}}
+    }, {QStringLiteral("id"), QStringLiteral("label"),
+        QStringLiteral("menuPath"), QStringLiteral("risk"),
+        QStringLiteral("enabled")});
+}
+
+QJsonObject importedClipOutputItemSchema()
+{
+    return outputSchemaOf(QJsonObject{
+        {QStringLiteral("kind"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
+        {QStringLiteral("trackIndex"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+        {QStringLiteral("clipIndex"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+        {QStringLiteral("startSec"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
+        {QStringLiteral("durationSec"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}}
+    }, {QStringLiteral("kind"), QStringLiteral("trackIndex"),
+        QStringLiteral("clipIndex"), QStringLiteral("startSec"),
+        QStringLiteral("durationSec")});
+}
+
 QJsonObject clipSelectorProperties()
 {
     return QJsonObject{
@@ -607,7 +704,7 @@ void McpEditorTools::registerReadTools()
     if (!m_registry)
         return;
 
-    m_registry->registerTool({
+    m_registry->registerTool(withOutputSchema({
         QStringLiteral("get_project_info"),
         QStringLiteral("プロジェクトの設定、尺、再生ヘッド位置、トラック数を秒単位で返す。編集前の現状確認に使う。"),
         objectSchema(),
@@ -645,9 +742,21 @@ void McpEditorTools::registerReadTools()
                 {QStringLiteral("audioTrackCount"), audioTracks.size()}
             };
         }
-    });
+    }, outputSchemaOf(QJsonObject{
+        {QStringLiteral("projectName"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
+        {QStringLiteral("width"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+        {QStringLiteral("height"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+        {QStringLiteral("fps"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
+        {QStringLiteral("durationSec"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
+        {QStringLiteral("playheadSec"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
+        {QStringLiteral("videoTrackCount"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+        {QStringLiteral("audioTrackCount"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}}
+    }, {QStringLiteral("projectName"), QStringLiteral("width"),
+        QStringLiteral("height"), QStringLiteral("fps"),
+        QStringLiteral("durationSec"), QStringLiteral("playheadSec"),
+        QStringLiteral("videoTrackCount"), QStringLiteral("audioTrackCount")}));
 
-    m_registry->registerTool({
+    m_registry->registerTool(withOutputSchema({
         QStringLiteral("get_frame"),
         QStringLiteral("指定したタイムライン時刻の合成フレームを PNG 画像として返す。maxWidth 省略時は 640px 以下に縮小し、LLM のコンテキストを圧迫しないよう応答を 1MB 以内に抑える。"),
         schemaWithRequired(QJsonObject{
@@ -769,14 +878,23 @@ void McpEditorTools::registerReadTools()
                 {QStringLiteral("base64Bytes"), static_cast<qint64>(base64.size())}
             };
         }
-    });
+    }, outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("timeSec"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
+        {QStringLiteral("width"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+        {QStringLiteral("height"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+        {QStringLiteral("byteSize"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+        {QStringLiteral("base64Bytes"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}}
+    }, {QStringLiteral("ok"), QStringLiteral("timeSec"),
+        QStringLiteral("width"), QStringLiteral("height"),
+        QStringLiteral("byteSize"), QStringLiteral("base64Bytes")}));
 
     const QJsonObject exportStatusProperties{
         {QStringLiteral("jobId"), QJsonObject{
             {QStringLiteral("type"), QStringLiteral("string")}
         }}
     };
-    m_registry->registerTool({
+    m_registry->registerTool(withOutputSchema({
         QStringLiteral("get_export_status"),
         QStringLiteral("非同期 export_video ジョブの状態と進捗を返す。status は queued / running / done / failed。失敗時は error を含める。"),
         schemaWithRequired(exportStatusProperties, {QStringLiteral("jobId")}),
@@ -793,7 +911,15 @@ void McpEditorTools::registerReadTools()
                 return setError(err, QStringLiteral("jobId は必須です")), QJsonObject();
             return exportStatus(jobId, err);
         }
-    });
+    }, outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("jobId"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
+        {QStringLiteral("status"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
+        {QStringLiteral("progress"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+        {QStringLiteral("outputPath"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
+        {QStringLiteral("error"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}}
+    }, {QStringLiteral("ok"), QStringLiteral("jobId"),
+        QStringLiteral("status"), QStringLiteral("progress")}));
 
     const QJsonObject timelineProperties{
         {QStringLiteral("kind"), QJsonObject{
@@ -803,7 +929,7 @@ void McpEditorTools::registerReadTools()
             }}
         }}
     };
-    m_registry->registerTool({
+    m_registry->registerTool(withOutputSchema({
         QStringLiteral("get_timeline"),
         QStringLiteral("タイムライン上の全クリップをトラック別に秒単位で返す。編集前の現状確認に使う。"),
         objectSchema(timelineProperties),
@@ -835,9 +961,18 @@ void McpEditorTools::registerReadTools()
                               tracksToJson(currentTimeline->audioTracks()));
             return result;
         }
-    });
+    }, outputSchemaOf(QJsonObject{
+        {QStringLiteral("video"), QJsonObject{
+            {QStringLiteral("type"), QStringLiteral("array")},
+            {QStringLiteral("items"), trackOutputItemSchema()}
+        }},
+        {QStringLiteral("audio"), QJsonObject{
+            {QStringLiteral("type"), QStringLiteral("array")},
+            {QStringLiteral("items"), trackOutputItemSchema()}
+        }}
+    }, {}));
 
-    m_registry->registerTool({
+    m_registry->registerTool(withOutputSchema({
         QStringLiteral("get_captions"),
         QStringLiteral("captions は字幕エディタの内容、timelineCaptions はタイムラインに適用済みの1語字幕 (undo で戻るのは後者だけ) を秒単位で返す。"),
         objectSchema(),
@@ -888,14 +1023,19 @@ void McpEditorTools::registerReadTools()
                 {QStringLiteral("timelineCaptionCount"), timelineCaptions.size()}
             };
         }
-    });
+    }, outputSchemaOf(QJsonObject{
+        {QStringLiteral("captions"), QJsonObject{
+            {QStringLiteral("type"), QStringLiteral("array")},
+            {QStringLiteral("items"), captionOutputItemSchema()}
+        }}
+    }, {QStringLiteral("captions")}));
 
     const QJsonObject commandProperties{
         {QStringLiteral("query"), QJsonObject{
             {QStringLiteral("type"), QStringLiteral("string")}
         }}
     };
-    m_registry->registerTool({
+    m_registry->registerTool(withOutputSchema({
         QStringLiteral("list_commands"),
         QStringLiteral("エディタで利用できるお気に入り登録可能なコマンドを列挙する。id、表示名、メニュー階層、危険度 (safe / blocking / quit)、有効状態を返す。blocking のコマンドは run_command で既定では実行を拒否される。"),
         objectSchema(commandProperties),
@@ -931,7 +1071,13 @@ void McpEditorTools::registerReadTools()
                 {QStringLiteral("total"), m_window->m_favoritableActions.size()}
             };
         }
-    });
+    }, outputSchemaOf(QJsonObject{
+        {QStringLiteral("commands"), QJsonObject{
+            {QStringLiteral("type"), QStringLiteral("array")},
+            {QStringLiteral("items"), commandOutputItemSchema()}
+        }},
+        {QStringLiteral("total"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}}
+    }, {QStringLiteral("commands"), QStringLiteral("total")}));
 }
 
 void McpEditorTools::registerWriteTools()
@@ -941,7 +1087,127 @@ void McpEditorTools::registerWriteTools()
 
     const QJsonObject clipProperties = clipSelectorProperties();
 
-    m_registry->registerTool({
+    const QJsonObject exportVideoOutputSchema = outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("jobId"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
+        {QStringLiteral("status"), QJsonObject{
+            {QStringLiteral("type"), QStringLiteral("string")},
+            {QStringLiteral("enum"), QJsonArray{QStringLiteral("queued")}}
+        }},
+        {QStringLiteral("progress"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+        {QStringLiteral("outputPath"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
+        {QStringLiteral("width"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+        {QStringLiteral("height"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+        {QStringLiteral("fps"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
+        {QStringLiteral("videoCodec"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
+        {QStringLiteral("videoBitrate"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}}
+    }, {QStringLiteral("ok"), QStringLiteral("jobId"),
+        QStringLiteral("status"), QStringLiteral("progress"),
+        QStringLiteral("outputPath"), QStringLiteral("width"),
+        QStringLiteral("height"), QStringLiteral("fps"),
+        QStringLiteral("videoCodec"), QStringLiteral("videoBitrate")});
+
+    const QJsonObject importMediaOutputSchema = outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("clips"), QJsonObject{
+            {QStringLiteral("type"), QStringLiteral("array")},
+            {QStringLiteral("items"), importedClipOutputItemSchema()}
+        }},
+        {QStringLiteral("kind"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
+        {QStringLiteral("trackIndex"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+        {QStringLiteral("clipIndex"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+        {QStringLiteral("startSec"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
+        {QStringLiteral("durationSec"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}}
+    }, {QStringLiteral("ok"), QStringLiteral("clips")});
+
+    const QJsonObject saveProjectOutputSchema = outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("path"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}}
+    }, {QStringLiteral("ok"), QStringLiteral("path")});
+
+    const QJsonObject openProjectOutputSchema = outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("path"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}}
+    }, {QStringLiteral("ok"), QStringLiteral("path")});
+
+    const QJsonObject selectClipOutputSchema = outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("kind"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
+        {QStringLiteral("trackIndex"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+        {QStringLiteral("clipIndex"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}}
+    }, {QStringLiteral("ok"), QStringLiteral("kind"),
+        QStringLiteral("trackIndex"), QStringLiteral("clipIndex")});
+
+    const QJsonObject clearSelectionOutputSchema = outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}}
+    }, {QStringLiteral("ok")});
+
+    const QJsonObject runCommandOutputSchema = outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("id"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
+        {QStringLiteral("label"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
+        {QStringLiteral("risk"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}}
+    }, {QStringLiteral("ok"), QStringLiteral("id"),
+        QStringLiteral("label"), QStringLiteral("risk")});
+
+    const QJsonObject splitClipOutputSchema = outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("newClipCount"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}}
+    }, {QStringLiteral("ok"), QStringLiteral("newClipCount")});
+
+    const QJsonObject deleteClipOutputSchema = outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("remainingClipCount"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}}
+    }, {QStringLiteral("ok"), QStringLiteral("remainingClipCount")});
+
+    const QJsonObject moveClipOutputSchema = outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("startSec"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
+        {QStringLiteral("actualStartSec"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
+        {QStringLiteral("trackIndex"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+        {QStringLiteral("reason"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
+        {QStringLiteral("clipIndex"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}}
+    }, {QStringLiteral("ok"), QStringLiteral("startSec"),
+        QStringLiteral("actualStartSec"), QStringLiteral("trackIndex")});
+
+    const QJsonObject setClipPropertyOutputSchema = outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("property"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
+        {QStringLiteral("value"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}}
+    }, {QStringLiteral("ok"), QStringLiteral("property"),
+        QStringLiteral("value")});
+
+    const QJsonObject addCaptionOutputSchema = outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("index"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+        {QStringLiteral("captionCount"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}}
+    }, {QStringLiteral("ok"), QStringLiteral("index"),
+        QStringLiteral("captionCount")});
+
+    const QJsonObject applyCaptionsOutputSchema = outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("appliedCount"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+        {QStringLiteral("captionCount"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+        {QStringLiteral("timelineCaptionCount"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}}
+    }, {QStringLiteral("ok"), QStringLiteral("appliedCount"),
+        QStringLiteral("captionCount"), QStringLiteral("timelineCaptionCount")});
+
+    const QJsonObject setPlayheadOutputSchema = outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("playheadSec"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}}
+    }, {QStringLiteral("ok"), QStringLiteral("playheadSec")});
+
+    const QJsonObject undoOutputSchema = outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("reason"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}}
+    }, {QStringLiteral("ok")});
+
+    const QJsonObject redoOutputSchema = outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("reason"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}}
+    }, {QStringLiteral("ok")});
+
+    m_registry->registerTool(withOutputSchema({
         QStringLiteral("export_video"),
         QStringLiteral("現在のタイムラインを動画ファイルへ非同期で書き出す。tools/call はジョブ投入後すぐに jobId を返し、完了は get_export_status で確認する。width / height / fps の省略時は現在のプロジェクト設定を使い、videoBitrate は kbps。"),
         schemaWithRequired(QJsonObject{
@@ -1107,9 +1373,9 @@ void McpEditorTools::registerWriteTools()
                 {QStringLiteral("videoBitrate"), videoBitrate}
             };
         })
-    });
+    }, exportVideoOutputSchema));
 
-    m_registry->registerTool({
+    m_registry->registerTool(withOutputSchema({
         QStringLiteral("import_media"),
         QStringLiteral("ダイアログを開かずに素材を指定トラックへ取り込む。映像と音声の組は既存のGUI経路と同じlinkGroupでリンクし、Undo 1 回で取り消せる。"),
         schemaWithRequired(QJsonObject{
@@ -1204,9 +1470,9 @@ void McpEditorTools::registerWriteTools()
             }
             return response;
         })
-    });
+    }, importMediaOutputSchema));
 
-    m_registry->registerTool({
+    m_registry->registerTool(withOutputSchema({
         QStringLiteral("save_project"),
         QStringLiteral("プロジェクトを指定パスへ保存する。path 省略時は既存の保存先へ上書きし、未保存プロジェクトではエラーを返す。ダイアログは開かない。"),
         objectSchema(QJsonObject{
@@ -1237,9 +1503,9 @@ void McpEditorTools::registerWriteTools()
                 {QStringLiteral("path"), m_window->m_projectFilePath}
             };
         })
-    });
+    }, saveProjectOutputSchema));
 
-    m_registry->registerTool({
+    m_registry->registerTool(withOutputSchema({
         QStringLiteral("open_project"),
         QStringLiteral("指定パスのプロジェクトを読み込む。ダイアログや未保存変更の確認は行わない。"),
         schemaWithRequired(QJsonObject{
@@ -1265,9 +1531,9 @@ void McpEditorTools::registerWriteTools()
                 {QStringLiteral("path"), m_window->m_projectFilePath}
             };
         })
-    });
+    }, openProjectOutputSchema));
 
-    m_registry->registerTool({
+    m_registry->registerTool(withOutputSchema({
         QStringLiteral("select_clip"),
         QStringLiteral("指定クリップを選択する。Timeline と MainWindow の両方の選択状態をGUIクリックと同じ規則で更新する。"),
         schemaWithRequired(clipProperties,
@@ -1317,9 +1583,9 @@ void McpEditorTools::registerWriteTools()
                 {QStringLiteral("clipIndex"), clipIndex}
             };
         })
-    });
+    }, selectClipOutputSchema));
 
-    m_registry->registerTool({
+    m_registry->registerTool(withOutputSchema({
         QStringLiteral("clear_selection"),
         QStringLiteral("タイムライン上の選択をすべて解除する。"),
         objectSchema(),
@@ -1335,9 +1601,9 @@ void McpEditorTools::registerWriteTools()
             m_window->updateEditActions();
             return QJsonObject{{QStringLiteral("ok"), true}};
         })
-    });
+    }, clearSelectionOutputSchema));
 
-    m_registry->registerTool({
+    m_registry->registerTool(withOutputSchema({
         QStringLiteral("run_command"),
         QStringLiteral("お気に入り登録可能なコマンドを id で実行する。危険度を返し、blocking のコマンドは allowBlocking:true のときだけ実行する。quit のコマンドは MCP から常に実行できない。タイムラインを変更する操作は、コマンド自身が undo を記録する場合だけ Ctrl+Z / undo ツールで戻せる。応答の undoRecorded で判定すること (ダイアログを開くコマンドは応答時点では false になり得る)。"),
         schemaWithRequired(QJsonObject{
@@ -1418,9 +1684,9 @@ void McpEditorTools::registerWriteTools()
             setError(err, QStringLiteral("command not found: %1").arg(id));
             return {};
         })
-    });
+    }, runCommandOutputSchema));
 
-    m_registry->registerTool({
+    m_registry->registerTool(withOutputSchema({
         QStringLiteral("split_clip"),
         QStringLiteral("指定クリップを指定時刻で 2 つに分割する。タイムラインを変更する破壊的操作で、Ctrl+Z / undo ツールで戻せる。"),
         schemaWithRequired(mergedProperties(clipProperties, QJsonObject{
@@ -1458,9 +1724,9 @@ void McpEditorTools::registerWriteTools()
                 {QStringLiteral("newClipCount"), target.track->clipCount()}
             };
         })
-    });
+    }, splitClipOutputSchema));
 
-    m_registry->registerTool({
+    m_registry->registerTool(withOutputSchema({
         QStringLiteral("delete_clip"),
         QStringLiteral("指定クリップを削除し、必要なら後続クリップを詰める。タイムラインを変更する破壊的操作で、Ctrl+Z / undo ツールで戻せる。"),
         schemaWithRequired(mergedProperties(clipProperties, QJsonObject{
@@ -1497,9 +1763,9 @@ void McpEditorTools::registerWriteTools()
                 {QStringLiteral("remainingClipCount"), target.track->clipCount()}
             };
         })
-    });
+    }, deleteClipOutputSchema));
 
-    m_registry->registerTool({
+    m_registry->registerTool(withOutputSchema({
         QStringLiteral("move_clip"),
         QStringLiteral("指定クリップを指定開始時刻へ移動する。必要なら別トラックへ移し、連続配置でも並べ替える。置けない要求はok:falseで理由と実際に置ける時刻を返す。タイムラインを変更する破壊的操作で、Ctrl+Z / undo ツールで戻せる。"),
         schemaWithRequired(mergedProperties(clipProperties, QJsonObject{
@@ -1563,9 +1829,9 @@ void McpEditorTools::registerWriteTools()
                 {QStringLiteral("clipIndex"), moveResult.clipIndex}
             };
         })
-    });
+    }, moveClipOutputSchema));
 
-    m_registry->registerTool({
+    m_registry->registerTool(withOutputSchema({
         QStringLiteral("set_clip_property"),
         QStringLiteral("指定クリップの音量、不透明度、速度、パン、映像スケールを設定する。タイムラインを変更する破壊的操作で、Ctrl+Z / undo ツールで戻せる。"),
         schemaWithRequired(mergedProperties(clipProperties, QJsonObject{
@@ -1612,9 +1878,9 @@ void McpEditorTools::registerWriteTools()
                 {QStringLiteral("value"), value}
             };
         })
-    });
+    }, setClipPropertyOutputSchema));
 
-    m_registry->registerTool({
+    m_registry->registerTool(withOutputSchema({
         QStringLiteral("add_caption"),
         QStringLiteral("字幕エディタが未オープンなら内部で生成する (画面には出さない)。字幕エディタの字幕一覧に 1 件追加し、"
                        "タイムラインへの反映は apply_captions を呼ぶ。この操作自体は undo 対象外。"),
@@ -1690,9 +1956,9 @@ void McpEditorTools::registerWriteTools()
                 {QStringLiteral("captionCount"), track.clipCount()}
             };
         })
-    });
+    }, addCaptionOutputSchema));
 
-    m_registry->registerTool({
+    m_registry->registerTool(withOutputSchema({
         QStringLiteral("apply_captions"),
         QStringLiteral("字幕エディタに保持されている字幕を V1 の1語字幕オーバーレイとしてタイムラインへ適用する (字幕エディタの「1語字幕をタイムラインに適用」と同じ経路)。既存の生成済み1語字幕は置き換える。Ctrl+Z / undo ツールで戻せる (戻るのはタイムライン側だけで、字幕エディタの一覧は戻らない)。"),
         objectSchema(),
@@ -1740,9 +2006,9 @@ void McpEditorTools::registerWriteTools()
                     ? currentTimeline->generatedCaptionOverlays().size() : 0}
             };
         })
-    });
+    }, applyCaptionsOutputSchema));
 
-    m_registry->registerTool({
+    m_registry->registerTool(withOutputSchema({
         QStringLiteral("set_playhead"),
         QStringLiteral("再生ヘッドを指定時刻へ移動する。VideoPlayer もシークし、停止中はプレビューが指定時刻のフレームに更新される (描画はイベントループ後)。編集状態を変える操作ではなく、タイムライン編集の Undo / redo には影響しない。"),
         schemaWithRequired(QJsonObject{
@@ -1775,9 +2041,9 @@ void McpEditorTools::registerWriteTools()
                 {QStringLiteral("previewSeekRequested"), player != nullptr}
             };
         })
-    });
+    }, setPlayheadOutputSchema));
 
-    m_registry->registerTool({
+    m_registry->registerTool(withOutputSchema({
         QStringLiteral("undo"),
         QStringLiteral("直前のタイムライン変更を取り消す破壊的操作。Ctrl+Z / undo ツールで記録済みの変更を戻せる。"),
         objectSchema(),
@@ -1794,9 +2060,9 @@ void McpEditorTools::registerWriteTools()
             syncSelectionAfterEdit();
             return QJsonObject{{QStringLiteral("ok"), true}};
         })
-    });
+    }, undoOutputSchema));
 
-    m_registry->registerTool({
+    m_registry->registerTool(withOutputSchema({
         QStringLiteral("redo"),
         QStringLiteral("直前に取り消したタイムライン変更を再適用する破壊的操作。Ctrl+Y / redo ツールで変更を戻し直せる。"),
         objectSchema(),
@@ -1813,7 +2079,7 @@ void McpEditorTools::registerWriteTools()
             syncSelectionAfterEdit();
             return QJsonObject{{QStringLiteral("ok"), true}};
         })
-    });
+    }, redoOutputSchema));
 }
 
 } // namespace mcp
