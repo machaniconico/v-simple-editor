@@ -36,6 +36,7 @@ public:
     bool isRunning() const;
     quint16 port() const { return m_port; }
     QString token() const { return m_token; }
+    static int maxConnections();
     // http://127.0.0.1:<port>/mcp
     QString endpointUrl() const;
 

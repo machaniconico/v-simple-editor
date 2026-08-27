@@ -4,6 +4,7 @@
 #include <QJsonObject>
 #include <QJsonValue>
 #include <QString>
+#include <QStringList>
 
 namespace mcp {
 
@@ -31,9 +32,11 @@ public:
     static QByteArray makeErrorResponse(const QJsonValue& id, int code, const QString& message);
     static QByteArray makeResultResponse(const QJsonValue& id, const QJsonObject& result);
 
-    // MCP の protocolVersion。クライアントが別バージョンを送ってきても
-    // こちらの値を返す (仕様上サーバは自分がサポートする版を返してよい)。
+    // MCP の最新 protocolVersion。initialize で対応版を要求された場合は
+    // その版を返し、欠落または非対応の場合はこの最新値を返す。
     static const char* protocolVersion();
+    static QStringList supportedProtocolVersions();
+    static bool isSupportedProtocolVersion(const QString& version);
 
 private:
     McpToolRegistry* m_registry = nullptr;

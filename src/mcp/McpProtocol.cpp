@@ -81,8 +81,12 @@ QByteArray McpProtocol::handleMessage(const QByteArray& body) const
         serverInfo.insert(QStringLiteral("version"), m_info.version);
 
         QJsonObject result;
+        const QJsonObject params = request.value(QStringLiteral("params")).toObject();
+        const QString requested = params.value(QStringLiteral("protocolVersion")).toString();
+        const QString negotiated = isSupportedProtocolVersion(requested)
+            ? requested : QString::fromLatin1(protocolVersion());
         result.insert(QStringLiteral("protocolVersion"),
-                      QString::fromLatin1(protocolVersion()));
+                      negotiated);
         result.insert(QStringLiteral("capabilities"), capabilities);
         result.insert(QStringLiteral("serverInfo"), serverInfo);
         return responseForRequest(notification, makeResultResponse(id, result));
@@ -191,6 +195,20 @@ const char* McpProtocol::protocolVersion()
     // それが仕様に入った 2025-03-26 以降の版を名乗る。2024-11-05 を名乗ると
     // HTTP+SSE の旧トランスポートを期待するクライアントと噛み合わない。
     return "2025-06-18";
+}
+
+QStringList McpProtocol::supportedProtocolVersions()
+{
+    return {
+        QStringLiteral("2024-11-05"),
+        QStringLiteral("2025-03-26"),
+        QStringLiteral("2025-06-18")
+    };
+}
+
+bool McpProtocol::isSupportedProtocolVersion(const QString& version)
+{
+    return supportedProtocolVersions().contains(version);
 }
 
 } // namespace mcp

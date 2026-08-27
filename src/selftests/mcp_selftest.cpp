@@ -1,5 +1,7 @@
 #include <QEventLoop>
 #include <QElapsedTimer>
+#include <QCoreApplication>
+#include <QHash>
 #include <QHostAddress>
 #include <QImage>
 #include <QJsonArray>
@@ -7,15 +9,20 @@
 #include <QJsonObject>
 #include <QDir>
 #include <QFileInfo>
+#include <QList>
 #include <QTemporaryFile>
 #include <QTemporaryDir>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
+#include <QProcess>
+#include <QProcessEnvironment>
+#include <QPointer>
 #include <QTcpSocket>
 #include <QTimer>
 #include <QUrl>
 #include <QUrlQuery>
+#include <QVector>
 #include <QStringList>
 #include <QSet>
 #include <QDebug>
@@ -62,6 +69,7 @@ QByteArray compact(const QJsonObject& object)
 struct HttpResult {
     int status = 0;
     QByteArray body;
+    QByteArray allowOrigin;
 };
 
 HttpResult get(QNetworkAccessManager* manager, const QUrl& url)
@@ -84,13 +92,16 @@ HttpResult get(QNetworkAccessManager* manager, const QUrl& url)
 }
 
 HttpResult post(QNetworkAccessManager* manager, const QUrl& url,
-                const QByteArray& body, const QByteArray& token = {})
+                const QByteArray& body, const QByteArray& token = {},
+                const QHash<QByteArray, QByteArray>& extraHeaders = {},
+                const QByteArray& contentType = "application/json")
 {
     QNetworkRequest request(url);
-    request.setHeader(QNetworkRequest::ContentTypeHeader,
-                      QStringLiteral("application/json"));
+    request.setRawHeader("Content-Type", contentType);
     if (!token.isEmpty())
         request.setRawHeader("Authorization", "Bearer " + token);
+    for (auto it = extraHeaders.constBegin(); it != extraHeaders.constEnd(); ++it)
+        request.setRawHeader(it.key(), it.value());
 
     QNetworkReply* reply = manager->post(request, body);
     QEventLoop loop;
@@ -105,6 +116,7 @@ HttpResult post(QNetworkAccessManager* manager, const QUrl& url,
     HttpResult result;
     result.status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
     result.body = reply->readAll();
+    result.allowOrigin = reply->rawHeader("Access-Control-Allow-Origin");
     reply->deleteLater();
     return result;
 }
@@ -217,6 +229,17 @@ int runMcpSelftest()
             return QJsonObject{{QStringLiteral("ok"), true}};
         }
     });
+    registry.registerTool({
+        QStringLiteral("slow-tool"),
+        QStringLiteral("Delays before returning"),
+        schema,
+        [](const QJsonObject&, QString*) {
+            QEventLoop loop;
+            QTimer::singleShot(1500, &loop, &QEventLoop::quit);
+            loop.exec();
+            return QJsonObject{{QStringLiteral("ok"), true}};
+        }
+    });
 
     mcp::McpProtocol protocol(&registry, mcp::ServerInfo{});
 
@@ -231,6 +254,26 @@ int runMcpSelftest()
             .value(QStringLiteral("name")).toString() == QStringLiteral("v-simple-editor");
     g1 ? pass("G1 initialize contract")
        : fail("G1 initialize contract", QStringLiteral("unexpected initialize response"));
+
+    const QJsonObject supportedInitialize = parseObject(
+        protocol.handleMessage(compact(rpcRequest(
+            71, QStringLiteral("initialize"), QJsonObject{
+                {QStringLiteral("protocolVersion"), QStringLiteral("2025-03-26")}
+            }))));
+    const QJsonObject unsupportedInitialize = parseObject(
+        protocol.handleMessage(compact(rpcRequest(
+            72, QStringLiteral("initialize"), QJsonObject{
+                {QStringLiteral("protocolVersion"), QStringLiteral("1999-01-01")}
+            }))));
+    const bool g63 = supportedInitialize.value(QStringLiteral("result")).toObject()
+                         .value(QStringLiteral("protocolVersion")).toString()
+                         == QStringLiteral("2025-03-26")
+        && unsupportedInitialize.value(QStringLiteral("result")).toObject()
+               .value(QStringLiteral("protocolVersion")).toString()
+               == QStringLiteral("2025-06-18");
+    g63 ? pass("G63 initialize version negotiation")
+        : fail("G63 initialize version negotiation",
+               QStringLiteral("requested protocol versions were not negotiated correctly"));
 
     const QJsonObject parseError = parseObject(protocol.handleMessage(QByteArray("{")));
     const bool g2 = parseError.value(QStringLiteral("error")).toObject()
@@ -353,6 +396,13 @@ int runMcpSelftest()
         fail("G32 oversized HTTP header", QStringLiteral("server failed to start"));
         fail("G33 chunked transfer rejected", QStringLiteral("server failed to start"));
         fail("G34 duplicate content-length rejected", QStringLiteral("server failed to start"));
+        fail("G59 HTTP Origin rejected", QStringLiteral("server failed to start"));
+        fail("G60 HTTP localhost Origin allowed", QStringLiteral("server failed to start"));
+        fail("G61 HTTP content-type rejected", QStringLiteral("server failed to start"));
+        fail("G62 HTTP protocol header", QStringLiteral("server failed to start"));
+        fail("G66 connection limit 503", QStringLiteral("server failed to start"));
+        fail("G67 stdio bridge no head-of-line blocking / timeout",
+             QStringLiteral("server failed to start"));
     } else {
         QNetworkAccessManager manager;
         const QUrl endpoint(server.endpointUrl());
@@ -423,6 +473,169 @@ int runMcpSelftest()
             ? pass("G34 duplicate content-length rejected")
             : fail("G34 duplicate content-length rejected",
                    QStringLiteral("status=%1").arg(duplicateLengthStatus));
+
+        const HttpResult evilOrigin = post(
+            &manager, endpoint, ping, server.token().toUtf8(),
+            QHash<QByteArray, QByteArray>{{"Origin", "http://evil.example"}});
+        const HttpResult nullOrigin = post(
+            &manager, endpoint, ping, server.token().toUtf8(),
+            QHash<QByteArray, QByteArray>{{"Origin", "null"}});
+        const bool g59 = evilOrigin.status == 403 && nullOrigin.status == 403;
+        g59 ? pass("G59 HTTP Origin rejected")
+            : fail("G59 HTTP Origin rejected",
+                   QStringLiteral("evil=%1 null=%2")
+                       .arg(evilOrigin.status).arg(nullOrigin.status));
+
+        const HttpResult localhostOrigin = post(
+            &manager, endpoint, ping, server.token().toUtf8(),
+            QHash<QByteArray, QByteArray>{{"Origin", "http://localhost:3000"}});
+        const bool g60 = localhostOrigin.status == 200
+            && localhostOrigin.allowOrigin == "http://localhost:3000";
+        g60 ? pass("G60 HTTP localhost Origin allowed")
+            : fail("G60 HTTP localhost Origin allowed",
+                   QStringLiteral("status=%1 allowOrigin=%2")
+                       .arg(localhostOrigin.status)
+                       .arg(QString::fromLatin1(localhostOrigin.allowOrigin)));
+
+        const HttpResult badContentType = post(
+            &manager, endpoint, ping, server.token().toUtf8(),
+            {}, QByteArray("text/plain"));
+        badContentType.status == 415
+            ? pass("G61 HTTP content-type rejected")
+            : fail("G61 HTTP content-type rejected",
+                   QStringLiteral("status=%1").arg(badContentType.status));
+
+        const HttpResult unsupportedVersion = post(
+            &manager, endpoint, ping, server.token().toUtf8(),
+            QHash<QByteArray, QByteArray>{{"MCP-Protocol-Version", "1999-01-01"}});
+        const HttpResult supportedVersion = post(
+            &manager, endpoint, ping, server.token().toUtf8(),
+            QHash<QByteArray, QByteArray>{{"MCP-Protocol-Version", "2025-03-26"}});
+        const bool g62 = unsupportedVersion.status == 400
+            && supportedVersion.status == 200;
+        g62 ? pass("G62 HTTP protocol header")
+            : fail("G62 HTTP protocol header",
+                   QStringLiteral("unsupported=%1 supported=%2")
+                       .arg(unsupportedVersion.status)
+                       .arg(supportedVersion.status));
+
+        QList<QPointer<QTcpSocket>> idle;
+        idle.reserve(mcp::McpHttpServer::maxConnections());
+        for (int index = 0; index < mcp::McpHttpServer::maxConnections(); ++index) {
+            QTcpSocket* socket = new QTcpSocket;
+            idle.append(QPointer<QTcpSocket>(socket));
+            socket->connectToHost(QHostAddress::LocalHost, server.port());
+        }
+        {
+            QEventLoop loop;
+            QTimer::singleShot(300, &loop, &QEventLoop::quit);
+            loop.exec();
+        }
+        const QByteArray connectionLimitRequest(
+            "POST /mcp HTTP/1.1\r\n"
+            "Host: localhost\r\n"
+            "Content-Length: 0\r\n\r\n");
+        const int connectionLimitStatus = rawHttpStatus(
+            server.port(), connectionLimitRequest);
+        connectionLimitStatus == 503
+            ? pass("G66 connection limit 503")
+            : fail("G66 connection limit 503",
+                   QStringLiteral("status=%1").arg(connectionLimitStatus));
+        for (const QPointer<QTcpSocket>& socket : idle) {
+            if (!socket)
+                continue;
+            socket->close();
+            socket->deleteLater();
+        }
+        {
+            QEventLoop loop;
+            QTimer::singleShot(300, &loop, &QEventLoop::quit);
+            loop.exec();
+        }
+
+        QProcess bridge;
+        QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
+        environment.insert(QStringLiteral("VEDITOR_MCP_TOKEN"), server.token());
+        environment.insert(QStringLiteral("VEDITOR_MCP_TIMEOUT_MS"),
+                            QStringLiteral("1000"));
+        environment.remove(QStringLiteral("VEDITOR_MCP_SELFTEST"));
+        environment.remove(QStringLiteral("VEDITOR_ALL_SELFTEST"));
+        bridge.setProcessEnvironment(environment);
+
+        const QByteArray bridgeInput = compact(rpcRequest(
+            101, QStringLiteral("tools/call"), QJsonObject{
+                {QStringLiteral("name"), QStringLiteral("slow-tool")},
+                {QStringLiteral("arguments"), QJsonObject{}}
+            })) + '\n'
+            + compact(rpcRequest(102, QStringLiteral("ping"))) + '\n'
+            + compact(rpcRequest(103, QStringLiteral("ping"))) + '\n';
+        QByteArray bridgeOutput;
+        QVector<QJsonObject> bridgeResponses;
+        QEventLoop bridgeLoop;
+        auto consumeBridgeOutput = [&]() {
+            bridgeOutput += bridge.readAllStandardOutput();
+            int newline = -1;
+            while ((newline = bridgeOutput.indexOf('\n')) >= 0) {
+                QByteArray line = bridgeOutput.left(newline);
+                bridgeOutput.remove(0, newline + 1);
+                if (line.endsWith('\r'))
+                    line.chop(1);
+                const QJsonObject response = parseObject(line);
+                if (!response.isEmpty())
+                    bridgeResponses.append(response);
+            }
+            if (bridgeResponses.size() >= 3)
+                bridgeLoop.quit();
+        };
+        QObject::connect(&bridge, &QProcess::started, &bridge,
+                         [&bridge, bridgeInput]() { bridge.write(bridgeInput); });
+        QObject::connect(&bridge, &QProcess::readyReadStandardOutput, &bridge,
+                         consumeBridgeOutput);
+        QObject::connect(&bridge, &QProcess::errorOccurred, &bridge,
+                         [&bridgeLoop](QProcess::ProcessError) {
+                             bridgeLoop.quit();
+                         });
+        QTimer::singleShot(10000, &bridgeLoop, &QEventLoop::quit);
+        bridge.start(QCoreApplication::applicationFilePath(), QStringList{
+            QStringLiteral("--mcp-stdio"),
+            QStringLiteral("--port"),
+            QString::number(server.port())
+        });
+        bridgeLoop.exec();
+        consumeBridgeOutput();
+        bridge.closeWriteChannel();
+        const bool bridgeFinished = bridge.waitForFinished(5000);
+        if (!bridgeFinished && bridge.state() != QProcess::NotRunning) {
+            bridge.kill();
+            bridge.waitForFinished(1000);
+        }
+
+        bool firstResponseIsPing = false;
+        bool slowRequestTimedOut = false;
+        bool finalPingSucceeded = false;
+        if (!bridgeResponses.isEmpty()) {
+            firstResponseIsPing = bridgeResponses.first()
+                .value(QStringLiteral("id")).toInt(-1) == 102;
+        }
+        for (const QJsonObject& response : bridgeResponses) {
+            const int id = response.value(QStringLiteral("id")).toInt(-1);
+            if (id == 101) {
+                slowRequestTimedOut = response.value(QStringLiteral("error"))
+                    .toObject().value(QStringLiteral("message")).toString()
+                    == QStringLiteral("editor did not respond in time");
+            } else if (id == 103) {
+                finalPingSucceeded = response.value(QStringLiteral("result")).isObject();
+            }
+        }
+        const bool g67 = firstResponseIsPing && slowRequestTimedOut
+            && finalPingSucceeded && bridgeResponses.size() == 3;
+        g67 ? pass("G67 stdio bridge no head-of-line blocking / timeout")
+            : fail("G67 stdio bridge no head-of-line blocking / timeout",
+                   QStringLiteral("responses=%1 firstIsPing=%2 timeout=%3 finalPing=%4")
+                       .arg(bridgeResponses.size())
+                       .arg(firstResponseIsPing)
+                       .arg(slowRequestTimedOut)
+                       .arg(finalPingSucceeded));
     }
 
     mcp::McpEditorTools nullWindowTools(nullptr, &registry);
@@ -737,6 +950,55 @@ int runMcpSelftest()
                 {QStringLiteral("arguments"), arguments}
             }))));
     };
+    const QJsonArray projectInfoToolDescriptors = parseObject(
+        projectInfoProtocol.handleMessage(compact(
+            rpcRequest(73, QStringLiteral("tools/list")))))
+        .value(QStringLiteral("result")).toObject()
+        .value(QStringLiteral("tools")).toArray();
+    bool outputSchemasDeclared = projectInfoToolDescriptors.size() == 21;
+    for (const QJsonValue& value : projectInfoToolDescriptors) {
+        outputSchemasDeclared = outputSchemasDeclared
+            && value.toObject().value(QStringLiteral("outputSchema"))
+                   .toObject().value(QStringLiteral("type")).toString()
+                   == QStringLiteral("object");
+    }
+    const bool g64 = outputSchemasDeclared;
+    g64 ? pass("G64 outputSchema declared")
+        : fail("G64 outputSchema declared",
+               QStringLiteral("expected 21 object output schemas, got %1")
+                   .arg(projectInfoToolDescriptors.size()));
+
+    auto requiredOutputFieldsPresent = [&projectInfoToolDescriptors](
+        const QString& toolName, const QJsonObject& payload) {
+        QJsonObject outputSchema;
+        for (const QJsonValue& value : projectInfoToolDescriptors) {
+            const QJsonObject descriptor = value.toObject();
+            if (descriptor.value(QStringLiteral("name")).toString() == toolName) {
+                outputSchema = descriptor.value(QStringLiteral("outputSchema"))
+                    .toObject();
+                break;
+            }
+        }
+        if (outputSchema.isEmpty())
+            return false;
+        for (const QJsonValue& value : outputSchema.value(QStringLiteral("required"))
+                 .toArray()) {
+            if (!payload.contains(value.toString()))
+                return false;
+        }
+        return true;
+    };
+    const QJsonObject listCommandsResponse = callProjectInfoTool(
+        74, QStringLiteral("list_commands"), QJsonObject{});
+    const bool projectInfoFieldsPresent =
+        !toolResult(projectInfoResponse).value(QStringLiteral("isError")).toBool(false)
+        && requiredOutputFieldsPresent(QStringLiteral("get_project_info"),
+                                       toolPayload(projectInfoResponse));
+    const bool listCommandsFieldsPresent =
+        !toolResult(listCommandsResponse).value(QStringLiteral("isError")).toBool(false)
+        && requiredOutputFieldsPresent(QStringLiteral("list_commands"),
+                                       toolPayload(listCommandsResponse));
+    QJsonObject successfulSelectResponse;
     auto toolErrorText = [&toolResult](const QJsonObject& response) {
         const QJsonArray content = toolResult(response)
             .value(QStringLiteral("content")).toArray();
@@ -880,6 +1142,7 @@ int runMcpSelftest()
                 {QStringLiteral("trackIndex"), 0},
                 {QStringLiteral("clipIndex"), 0}
             });
+        successfulSelectResponse = selectResponse;
         const QJsonObject selectResult = toolPayload(selectResponse);
         const QJsonObject selectionTimelineResponse = callProjectInfoTool(
             48, QStringLiteral("get_timeline"), QJsonObject{
@@ -1058,6 +1321,16 @@ int runMcpSelftest()
     if (!timelineReady) {
         fail("G45-G52 editor timeline MCP behavior", QStringLiteral("Timeline was not available"));
     }
+
+    const bool selectClipFieldsPresent =
+        !toolResult(successfulSelectResponse).value(QStringLiteral("isError")).toBool(false)
+        && requiredOutputFieldsPresent(QStringLiteral("select_clip"),
+                                       toolPayload(successfulSelectResponse));
+    const bool g65 = projectInfoFieldsPresent && listCommandsFieldsPresent
+        && selectClipFieldsPresent;
+    g65 ? pass("G65 structuredContent matches outputSchema")
+        : fail("G65 structuredContent matches outputSchema",
+               QStringLiteral("a successful tool response omitted an outputSchema required key"));
 
     // get_frame は実際に libav の動画デコーダを通るため、リポジトリの
     // 実在する動画を import_media で V1/A1 に配置してから検証する。
