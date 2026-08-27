@@ -1,10 +1,12 @@
 #include <QEventLoop>
 #include <QElapsedTimer>
+#include <QAction>
 #include <QHostAddress>
 #include <QImage>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QMetaObject>
 #include <QDir>
 #include <QFileInfo>
 #include <QTemporaryFile>
@@ -31,6 +33,8 @@
 #include "../mcp/McpStdioBridge.h"
 #include "../mcp/McpToolRegistry.h"
 #include "../AiChatDock.h"
+#include "../CaptionEditorDialog.h"
+#include "../CaptionTrack.h"
 #include "../MainWindow.h"
 #include "../Timeline.h"
 #include "../UndoManager.h"
@@ -491,6 +495,7 @@ int runMcpSelftest()
         QStringLiteral("move_clip"),
         QStringLiteral("set_clip_property"),
         QStringLiteral("add_caption"),
+        QStringLiteral("apply_captions"),
         QStringLiteral("set_playhead"),
         QStringLiteral("undo"),
         QStringLiteral("redo")
@@ -1243,6 +1248,263 @@ int runMcpSelftest()
     g58 ? pass("G58 unknown export job is rejected")
         : fail("G58 unknown export job is rejected",
                QStringLiteral("an unknown jobId did not return isError"));
+
+    TimelineTrack *captionVideo0 = (projectTimeline
+        && !projectTimeline->videoTracks().isEmpty())
+        ? projectTimeline->videoTracks().first() : nullptr;
+    if (!captionVideo0) {
+        fail("G59 add_caption without open editor",
+             QStringLiteral("V1 track was not available"));
+        fail("G60 apply_captions writes timeline overlays",
+             QStringLiteral("V1 track was not available"));
+        fail("G61 apply_captions rejects empty editor",
+             QStringLiteral("V1 track was not available"));
+        fail("G62 exclusive write guard rejects nested write",
+             QStringLiteral("V1 track was not available"));
+        fail("G63 run_command nests through the guard",
+             QStringLiteral("V1 track was not available"));
+        fail("G64 delete_clip resynchronizes selection",
+             QStringLiteral("V1 track was not available"));
+        fail("G65 set_playhead seeks the player",
+             QStringLiteral("V1 track was not available"));
+    } else {
+        const bool noCaptionEditorBefore =
+            projectInfoWindow.findChild<CaptionEditorDialog*>() == nullptr;
+        const QJsonObject addCaptionResponse = callProjectInfoTool(
+            63, QStringLiteral("add_caption"), QJsonObject{
+                {QStringLiteral("text"), QStringLiteral("hello world")},
+                {QStringLiteral("startSec"), 0.5},
+                {QStringLiteral("endSec"), 1.5}
+            });
+        const QJsonObject addCaptionPayload = toolPayload(addCaptionResponse);
+        CaptionEditorDialog *captionDialog =
+            projectInfoWindow.findChild<CaptionEditorDialog*>();
+        const bool g59 = noCaptionEditorBefore
+            && !toolResult(addCaptionResponse).value(QStringLiteral("isError"))
+                   .toBool(false)
+            && addCaptionPayload.value(QStringLiteral("ok")).toBool(false)
+            && addCaptionPayload.value(QStringLiteral("captionCount")).toInt(-1) == 1
+            && captionDialog != nullptr && !captionDialog->isVisible();
+        g59 ? pass("G59 add_caption without open editor")
+            : fail("G59 add_caption without open editor",
+                   QStringLiteral("add_caption did not create a hidden caption editor"));
+
+        ClipInfo captionHost;
+        captionHost.filePath = QStringLiteral("caption-host");
+        captionHost.displayName = QStringLiteral("caption-host");
+        captionHost.duration = 5.0;
+        captionHost.outPoint = 5.0;
+        captionVideo0->setClips(QVector<ClipInfo>{captionHost});
+        projectTimeline->undoManager()->clear();
+        projectTimeline->undoManager()->saveState(
+            projectTimeline->currentState(), QStringLiteral("baseline"));
+
+        const QJsonObject applyCaptionResponse = callProjectInfoTool(
+            64, QStringLiteral("apply_captions"), QJsonObject{});
+        const QJsonObject applyCaptionPayload = toolPayload(applyCaptionResponse);
+        const QJsonObject captionsAfterApply = callProjectInfoTool(
+            66, QStringLiteral("get_captions"), QJsonObject{});
+        const QJsonObject captionsAfterApplyPayload = toolPayload(captionsAfterApply);
+        const QJsonArray timelineCaptions = captionsAfterApplyPayload
+            .value(QStringLiteral("timelineCaptions")).toArray();
+        const bool timelineCaptionContents = timelineCaptions.size() == 2
+            && timelineCaptions.at(0).toObject().value(QStringLiteral("text"))
+                   .toString() == QStringLiteral("hello");
+        const QJsonObject captionUndoResponse = callProjectInfoTool(
+            67, QStringLiteral("undo"), QJsonObject{});
+        const bool captionUndoRestored = toolPayload(captionUndoResponse)
+            .value(QStringLiteral("ok")).toBool(false)
+            && projectTimeline->generatedCaptionOverlays().isEmpty();
+        const QJsonObject captionRedoResponse = callProjectInfoTool(
+            68, QStringLiteral("redo"), QJsonObject{});
+        const bool captionRedoRestored = toolPayload(captionRedoResponse)
+            .value(QStringLiteral("ok")).toBool(false)
+            && projectTimeline->generatedCaptionOverlays().size() == 2;
+        const bool g60 = !toolResult(applyCaptionResponse)
+                              .value(QStringLiteral("isError")).toBool(true)
+            && applyCaptionPayload.value(QStringLiteral("ok")).toBool(false)
+            && applyCaptionPayload.value(QStringLiteral("appliedCount")).toInt(-1) == 2
+            && projectTimeline->generatedCaptionOverlays().size() == 2
+            && captionsAfterApplyPayload.value(QStringLiteral("timelineCaptionCount"))
+                   .toInt(-1) == 2
+            && timelineCaptionContents
+            && captionUndoRestored && captionRedoRestored;
+        g60 ? pass("G60 apply_captions writes timeline overlays")
+            : fail("G60 apply_captions writes timeline overlays",
+                   QStringLiteral("caption overlays, get_captions, or undo/redo did not match"));
+
+        if (captionDialog)
+            captionDialog->setTrack(caption::Track{});
+        const QJsonObject emptyApplyResponse = callProjectInfoTool(
+            69, QStringLiteral("apply_captions"), QJsonObject{});
+        const QJsonObject refillCaptionResponse = callProjectInfoTool(
+            70, QStringLiteral("add_caption"), QJsonObject{
+                {QStringLiteral("text"), QStringLiteral("hello world")},
+                {QStringLiteral("startSec"), 0.5},
+                {QStringLiteral("endSec"), 1.5}
+            });
+        const bool refillCaptionSucceeded = toolPayload(refillCaptionResponse)
+            .value(QStringLiteral("ok")).toBool(false)
+            && toolPayload(refillCaptionResponse)
+                   .value(QStringLiteral("captionCount")).toInt(-1) == 1;
+        const bool g61 = captionDialog != nullptr
+            && toolResult(emptyApplyResponse).value(QStringLiteral("isError"))
+                   .toBool(false)
+            && toolErrorText(emptyApplyResponse).contains(QStringLiteral("add_caption"))
+            && refillCaptionSucceeded;
+        g61 ? pass("G61 apply_captions rejects empty editor")
+            : fail("G61 apply_captions rejects empty editor",
+                   QStringLiteral("empty caption editor was not rejected or restored"));
+
+        QString exclusiveError;
+        const bool exclusiveStarted = projectInfoTools.beginExclusiveWrite(
+            QStringLiteral("selftest-outer"), &exclusiveError);
+        const QJsonObject nestedWriteResponse = callProjectInfoTool(
+            71, QStringLiteral("set_playhead"), QJsonObject{
+                {QStringLiteral("timeSec"), 0.0}
+            });
+        const QJsonObject readDuringWriteResponse = callProjectInfoTool(
+            72, QStringLiteral("get_project_info"), QJsonObject{});
+        projectInfoTools.endExclusiveWrite();
+        const QJsonObject writeAfterReleaseResponse = callProjectInfoTool(
+            73, QStringLiteral("set_playhead"), QJsonObject{
+                {QStringLiteral("timeSec"), 0.0}
+            });
+        const bool g62 = exclusiveStarted
+            && toolResult(nestedWriteResponse).value(QStringLiteral("isError"))
+                   .toBool(false)
+            && toolErrorText(nestedWriteResponse)
+                   .contains(QStringLiteral("別の操作を実行中"))
+            && !toolResult(readDuringWriteResponse).value(QStringLiteral("isError"))
+                   .toBool(true)
+            && toolPayload(writeAfterReleaseResponse)
+                   .value(QStringLiteral("ok")).toBool(false);
+        g62 ? pass("G62 exclusive write guard rejects nested write")
+            : fail("G62 exclusive write guard rejects nested write",
+                   QStringLiteral("nested write was not rejected while a write was active"));
+
+        const QJsonObject undoCommandListResponse = callProjectInfoTool(
+            74, QStringLiteral("list_commands"), QJsonObject{});
+        const QJsonArray undoCommands = toolPayload(undoCommandListResponse)
+            .value(QStringLiteral("commands")).toArray();
+        QAction *undoAction = nullptr;
+        for (QAction *action : projectInfoWindow.findChildren<QAction*>()) {
+            if (action && action->text() == QStringLiteral("元に戻す(&U)")) {
+                undoAction = action;
+                break;
+            }
+        }
+        QString undoCommandId;
+        for (const QJsonValue &value : undoCommands) {
+            const QJsonObject command = value.toObject();
+            if (command.value(QStringLiteral("label")).toString()
+                    == QStringLiteral("元に戻す(&U)")) {
+                undoCommandId = command.value(QStringLiteral("id")).toString();
+                break;
+            }
+        }
+        const bool canUndoBeforeRun = projectTimeline->canUndo();
+        QJsonObject nestedRunCommandResponse;
+        QJsonObject runCommandResponse;
+        bool nestedRunCommandCalled = false;
+        if (undoAction && !undoCommandId.isEmpty() && canUndoBeforeRun) {
+            const QMetaObject::Connection connection = QObject::connect(
+                undoAction, &QAction::triggered, &projectInfoWindow,
+                [&]() {
+                    nestedRunCommandCalled = true;
+                    nestedRunCommandResponse = callProjectInfoTool(
+                        65, QStringLiteral("set_playhead"), QJsonObject{
+                            {QStringLiteral("timeSec"), 0.0}
+                        });
+                });
+            runCommandResponse = callProjectInfoTool(
+                75, QStringLiteral("run_command"), QJsonObject{
+                    {QStringLiteral("id"), undoCommandId}
+                });
+            QObject::disconnect(connection);
+        }
+        const QJsonObject runCommandPayload = toolPayload(runCommandResponse);
+        const bool g63 = canUndoBeforeRun && undoAction != nullptr
+            && !undoCommandId.isEmpty() && nestedRunCommandCalled
+            && !toolResult(runCommandResponse).value(QStringLiteral("isError"))
+                   .toBool(true)
+            && runCommandPayload.value(QStringLiteral("undoRecorded")).isBool()
+            && toolResult(nestedRunCommandResponse)
+                   .value(QStringLiteral("isError")).toBool(false)
+            && toolErrorText(nestedRunCommandResponse)
+                   .contains(QStringLiteral("別の操作を実行中"));
+        g63 ? pass("G63 run_command nests through the guard")
+            : fail("G63 run_command nests through the guard",
+                   QStringLiteral("run_command did not reject a nested write through the guard"));
+
+        const ClipInfo clipA = makeTestClip(QStringLiteral("A"), 0);
+        const ClipInfo clipB = makeTestClip(QStringLiteral("B"), 0);
+        const ClipInfo clipC = makeTestClip(QStringLiteral("C"), 0);
+        captionVideo0->setClips(QVector<ClipInfo>{clipA, clipB, clipC});
+        projectTimeline->clearSelection();
+        const QJsonObject selectLastResponse = callProjectInfoTool(
+            76, QStringLiteral("select_clip"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 2}
+            });
+        const QJsonObject deleteLastResponse = callProjectInfoTool(
+            77, QStringLiteral("delete_clip"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 2}
+            });
+        const bool deleteSelectionSynchronized =
+            toolPayload(deleteLastResponse).value(QStringLiteral("ok")).toBool(false)
+            && projectInfoWindow.selectedVideoClipIndexTracked() == -1
+            && projectInfoWindow.selectedVideoTrackIndex() == -1
+            && captionVideo0->selectedClip() < 0;
+        const QJsonObject selectFirstResponse = callProjectInfoTool(
+            78, QStringLiteral("select_clip"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 0}
+            });
+        const QJsonObject splitSelectedResponse = callProjectInfoTool(
+            79, QStringLiteral("split_clip"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 0},
+                {QStringLiteral("timeSec"), 2.5}
+            });
+        const bool splitSelectionSynchronized =
+            toolPayload(splitSelectedResponse).value(QStringLiteral("ok")).toBool(false)
+            && projectInfoWindow.selectedVideoTrackIndex() == 0
+            && projectInfoWindow.selectedVideoClipIndexTracked() == 0
+            && captionVideo0->isClipSelected(0);
+        const bool g64 = toolPayload(selectLastResponse)
+                             .value(QStringLiteral("ok")).toBool(false)
+            && deleteSelectionSynchronized
+            && toolPayload(selectFirstResponse).value(QStringLiteral("ok"))
+                   .toBool(false)
+            && splitSelectionSynchronized;
+        g64 ? pass("G64 delete_clip resynchronizes selection")
+            : fail("G64 delete_clip resynchronizes selection",
+                   QStringLiteral("MainWindow, Timeline, or split selection state diverged"));
+
+        const QJsonObject playheadResponse = callProjectInfoTool(
+            80, QStringLiteral("set_playhead"), QJsonObject{
+                {QStringLiteral("timeSec"), 1.25}
+            });
+        const QJsonObject playheadPayload = toolPayload(playheadResponse);
+        const bool g65 = !toolResult(playheadResponse).value(QStringLiteral("isError"))
+                              .toBool(true)
+            && playheadPayload.value(QStringLiteral("ok")).toBool(false)
+            && playheadPayload.value(QStringLiteral("playheadSec")).toDouble(-1.0)
+                   == 1.25
+            && playheadPayload.value(QStringLiteral("playing")).isBool()
+            && !playheadPayload.value(QStringLiteral("playing")).toBool()
+            && playheadPayload.value(QStringLiteral("previewSeekRequested"))
+                   .toBool(false)
+            && projectTimeline->playheadPosition() == 1.25;
+        g65 ? pass("G65 set_playhead seeks the player")
+            : fail("G65 set_playhead seeks the player",
+                   QStringLiteral("set_playhead did not synchronize the timeline and preview"));
 
     const QJsonObject commandListResponse = callProjectInfoTool(
         37, QStringLiteral("list_commands"), QJsonObject{});

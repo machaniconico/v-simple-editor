@@ -673,6 +673,11 @@ private:
     void updateStatusInfo();
     void updateAcesUiState();
     void updateEditActions();
+    // 字幕エディタを生成のみ (表示しない)。MCP の add_caption / apply_captions 用。
+    CaptionEditorDialog *ensureCaptionEditorDialog();
+    // 字幕エディタが保持する caption::Track を V1 の1語字幕 overlay として適用する。
+    // 成功で true、*appliedCount に overlay 数。失敗時は *err に日本語メッセージ。
+    bool applyCaptionEditorTrackToTimeline(QString *err, int *appliedCount);
     void applyProjectConfig(const ProjectConfig &config);
     void syncProjectLightingToTimeline();
     void updateTitle();

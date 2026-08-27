@@ -6,6 +6,8 @@
 #include "../RenderQueue.h"
 #include "../TimelineFrameRenderer.h"
 #include "../Timeline.h"
+#include "../UndoManager.h"
+#include "../VideoPlayer.h"
 
 #include <QAction>
 #include <QBuffer>
@@ -368,6 +370,99 @@ McpEditorTools::~McpEditorTools()
 Timeline* McpEditorTools::timeline() const
 {
     return m_window ? m_window->m_timeline : nullptr;
+}
+
+bool McpEditorTools::beginExclusiveWrite(const QString& toolName, QString* err)
+{
+    if (!m_activeWriteTool.isEmpty()) {
+        return setError(err,
+                        QStringLiteral("別の操作を実行中です (%1)。完了を待ってから再試行してください。")
+                            .arg(m_activeWriteTool));
+    }
+    m_activeWriteTool = toolName;
+    return true;
+}
+
+void McpEditorTools::endExclusiveWrite()
+{
+    m_activeWriteTool.clear();
+}
+
+ToolHandler McpEditorTools::guardedWrite(const QString& toolName, ToolHandler inner)
+{
+    return [this, toolName, inner](const QJsonObject& args, QString* err) -> QJsonObject {
+        if (!beginExclusiveWrite(toolName, err))
+            return {};
+        struct Reset {
+            McpEditorTools* tools;
+            ~Reset() { tools->endExclusiveWrite(); }
+        } reset{this};
+        return inner(args, err);
+    };
+}
+
+void McpEditorTools::syncSelectionAfterEdit()
+{
+    Timeline* currentTimeline = timeline();
+    if (!m_window || !currentTimeline)
+        return;
+
+    bool audioSelection = false;
+    int selectedTrack = -1;
+    int selectedClip = -1;
+    bool invalidSelection = false;
+
+    for (int trackIndex = 0;
+         trackIndex < currentTimeline->videoTracks().size(); ++trackIndex) {
+        TimelineTrack* track = currentTimeline->videoTracks().at(trackIndex);
+        if (!track)
+            continue;
+        const int clipIndex = track->selectedClip();
+        if (clipIndex < 0)
+            continue;
+        if (clipIndex >= track->clipCount()) {
+            invalidSelection = true;
+        } else if (selectedTrack < 0) {
+            selectedTrack = trackIndex;
+            selectedClip = clipIndex;
+        }
+    }
+
+    for (int trackIndex = 0;
+         trackIndex < currentTimeline->audioTracks().size(); ++trackIndex) {
+        TimelineTrack* track = currentTimeline->audioTracks().at(trackIndex);
+        if (!track)
+            continue;
+        const int clipIndex = track->selectedClip();
+        if (clipIndex < 0)
+            continue;
+        if (clipIndex >= track->clipCount()) {
+            invalidSelection = true;
+        } else if (selectedTrack < 0) {
+            audioSelection = true;
+            selectedTrack = trackIndex;
+            selectedClip = clipIndex;
+        }
+    }
+
+    if (invalidSelection || selectedTrack < 0) {
+        currentTimeline->clearSelection();
+        m_window->m_selectedVideoTrackIndex = -1;
+        m_window->m_selectedVideoClipIndexTracked = -1;
+        if (m_window->m_player)
+            m_window->m_player->setEditTargetByClip(-1, -1);
+    } else {
+        QString ignored;
+        currentTimeline->selectClipByIndex(audioSelection, selectedTrack,
+                                           selectedClip, &ignored);
+        // select_clip と同じく、同値選択でシグナルが省略されても追跡値を揃える。
+        m_window->m_selectedVideoTrackIndex = audioSelection ? -1 : selectedTrack;
+        m_window->m_selectedVideoClipIndexTracked = selectedClip;
+        if (m_window->m_player)
+            m_window->m_player->setEditTargetByClip(
+                audioSelection ? -1 : selectedTrack, selectedClip);
+    }
+    m_window->updateEditActions();
 }
 
 RenderQueue* McpEditorTools::ensureRenderQueue(QString* err)
@@ -744,7 +839,7 @@ void McpEditorTools::registerReadTools()
 
     m_registry->registerTool({
         QStringLiteral("get_captions"),
-        QStringLiteral("字幕エディタに保持されている字幕クリップを秒単位で返す。字幕内容と現在の編集状態の確認に使う。"),
+        QStringLiteral("captions は字幕エディタの内容、timelineCaptions はタイムラインに適用済みの1語字幕 (undo で戻るのは後者だけ) を秒単位で返す。"),
         objectSchema(),
         [this](const QJsonObject& args, QString* err) -> QJsonObject {
             if (!rejectUnknownArguments(args, {}, err))
@@ -771,7 +866,27 @@ void McpEditorTools::registerReadTools()
                     });
                 }
             }
-            return QJsonObject{{QStringLiteral("captions"), captions}};
+
+            QJsonArray timelineCaptions;
+            const Timeline* currentTimeline = timeline();
+            if (currentTimeline) {
+                const QVector<EnhancedTextOverlay>& overlays =
+                    currentTimeline->generatedCaptionOverlays();
+                for (int index = 0; index < overlays.size(); ++index) {
+                    const EnhancedTextOverlay& overlay = overlays.at(index);
+                    timelineCaptions.append(QJsonObject{
+                        {QStringLiteral("index"), index},
+                        {QStringLiteral("startSec"), overlay.startTime},
+                        {QStringLiteral("endSec"), overlay.endTime},
+                        {QStringLiteral("text"), overlay.text}
+                    });
+                }
+            }
+            return QJsonObject{
+                {QStringLiteral("captions"), captions},
+                {QStringLiteral("timelineCaptions"), timelineCaptions},
+                {QStringLiteral("timelineCaptionCount"), timelineCaptions.size()}
+            };
         }
     });
 
@@ -854,7 +969,8 @@ void McpEditorTools::registerWriteTools()
                 {QStringLiteral("description"), QStringLiteral("kbps")}
             }}
         }, {QStringLiteral("outputPath")}),
-        [this](const QJsonObject& args, QString* err) -> QJsonObject {
+        guardedWrite(QStringLiteral("export_video"),
+                     [this](const QJsonObject& args, QString* err) -> QJsonObject {
             if (!rejectUnknownArguments(args,
                                         {QStringLiteral("outputPath"),
                                          QStringLiteral("width"),
@@ -990,7 +1106,7 @@ void McpEditorTools::registerWriteTools()
                 {QStringLiteral("videoCodec"), videoCodec},
                 {QStringLiteral("videoBitrate"), videoBitrate}
             };
-        }
+        })
     });
 
     m_registry->registerTool({
@@ -1009,7 +1125,8 @@ void McpEditorTools::registerWriteTools()
                 {QStringLiteral("type"), QStringLiteral("number")}
             }}
         }, {QStringLiteral("filePath")}),
-        [this](const QJsonObject& args, QString* err) -> QJsonObject {
+        guardedWrite(QStringLiteral("import_media"),
+                     [this](const QJsonObject& args, QString* err) -> QJsonObject {
             if (!rejectUnknownArguments(args,
                                         {QStringLiteral("filePath"),
                                          QStringLiteral("trackIndex"),
@@ -1086,7 +1203,7 @@ void McpEditorTools::registerWriteTools()
                                 first.value(QStringLiteral("durationSec")));
             }
             return response;
-        }
+        })
     });
 
     m_registry->registerTool({
@@ -1097,7 +1214,8 @@ void McpEditorTools::registerWriteTools()
                 {QStringLiteral("type"), QStringLiteral("string")}
             }}
         }),
-        [this](const QJsonObject& args, QString* err) -> QJsonObject {
+        guardedWrite(QStringLiteral("save_project"),
+                     [this](const QJsonObject& args, QString* err) -> QJsonObject {
             if (!rejectUnknownArguments(args, {QStringLiteral("path")}, err))
                 return {};
             if (!m_window)
@@ -1118,7 +1236,7 @@ void McpEditorTools::registerWriteTools()
                 {QStringLiteral("ok"), true},
                 {QStringLiteral("path"), m_window->m_projectFilePath}
             };
-        }
+        })
     });
 
     m_registry->registerTool({
@@ -1129,7 +1247,8 @@ void McpEditorTools::registerWriteTools()
                 {QStringLiteral("type"), QStringLiteral("string")}
             }}
         }, {QStringLiteral("path")}),
-        [this](const QJsonObject& args, QString* err) -> QJsonObject {
+        guardedWrite(QStringLiteral("open_project"),
+                     [this](const QJsonObject& args, QString* err) -> QJsonObject {
             if (!rejectUnknownArguments(args, {QStringLiteral("path")}, err))
                 return {};
             QString path;
@@ -1145,7 +1264,7 @@ void McpEditorTools::registerWriteTools()
                 {QStringLiteral("ok"), true},
                 {QStringLiteral("path"), m_window->m_projectFilePath}
             };
-        }
+        })
     });
 
     m_registry->registerTool({
@@ -1154,7 +1273,8 @@ void McpEditorTools::registerWriteTools()
         schemaWithRequired(clipProperties,
                            {QStringLiteral("kind"), QStringLiteral("trackIndex"),
                             QStringLiteral("clipIndex")}),
-        [this](const QJsonObject& args, QString* err) -> QJsonObject {
+        guardedWrite(QStringLiteral("select_clip"),
+                     [this](const QJsonObject& args, QString* err) -> QJsonObject {
             if (!rejectUnknownArguments(args,
                                         {QStringLiteral("kind"),
                                          QStringLiteral("trackIndex"),
@@ -1196,14 +1316,15 @@ void McpEditorTools::registerWriteTools()
                 {QStringLiteral("trackIndex"), trackIndex},
                 {QStringLiteral("clipIndex"), clipIndex}
             };
-        }
+        })
     });
 
     m_registry->registerTool({
         QStringLiteral("clear_selection"),
         QStringLiteral("タイムライン上の選択をすべて解除する。"),
         objectSchema(),
-        [this](const QJsonObject& args, QString* err) -> QJsonObject {
+        guardedWrite(QStringLiteral("clear_selection"),
+                     [this](const QJsonObject& args, QString* err) -> QJsonObject {
             if (!rejectUnknownArguments(args, {}, err))
                 return {};
             if (!m_window || !timeline())
@@ -1213,12 +1334,12 @@ void McpEditorTools::registerWriteTools()
             m_window->m_selectedVideoClipIndexTracked = -1;
             m_window->updateEditActions();
             return QJsonObject{{QStringLiteral("ok"), true}};
-        }
+        })
     });
 
     m_registry->registerTool({
         QStringLiteral("run_command"),
-        QStringLiteral("お気に入り登録可能なコマンドを id で実行する。危険度を返し、blocking のコマンドは allowBlocking:true のときだけ実行する。quit のコマンドは MCP から常に実行できない。タイムラインを変更する操作は Ctrl+Z / undo ツールで戻せる。"),
+        QStringLiteral("お気に入り登録可能なコマンドを id で実行する。危険度を返し、blocking のコマンドは allowBlocking:true のときだけ実行する。quit のコマンドは MCP から常に実行できない。タイムラインを変更する操作は、コマンド自身が undo を記録する場合だけ Ctrl+Z / undo ツールで戻せる。応答の undoRecorded で判定すること (ダイアログを開くコマンドは応答時点では false になり得る)。"),
         schemaWithRequired(QJsonObject{
             {QStringLiteral("id"), QJsonObject{
                 {QStringLiteral("type"), QStringLiteral("string")}
@@ -1228,7 +1349,8 @@ void McpEditorTools::registerWriteTools()
                 {QStringLiteral("default"), false}
             }}
         }, {QStringLiteral("id")}),
-        [this](const QJsonObject& args, QString* err) -> QJsonObject {
+        guardedWrite(QStringLiteral("run_command"),
+                     [this](const QJsonObject& args, QString* err) -> QJsonObject {
             if (!rejectUnknownArguments(args,
                                         {QStringLiteral("id"),
                                          QStringLiteral("allowBlocking")}, err))
@@ -1269,19 +1391,33 @@ void McpEditorTools::registerWriteTools()
                         *err = QStringLiteral("command is disabled: %1").arg(id);
                     return {};
                 }
+                UndoManager* undoManager = timeline()
+                    ? timeline()->undoManager() : nullptr;
+                const int undoIndexBefore = undoManager
+                    ? undoManager->currentIndex() : -1;
                 // The QAction owns its own undo policy. Saving here would
                 // double-stack actions that already save an undo state.
                 command.action->trigger();
-                return QJsonObject{
+                const int undoIndexAfter = undoManager
+                    ? undoManager->currentIndex() : -1;
+                syncSelectionAfterEdit();
+                QJsonObject response{
                     {QStringLiteral("ok"), true},
                     {QStringLiteral("id"), id},
                     {QStringLiteral("label"), command.label},
                     {QStringLiteral("risk"), risk}
                 };
+                const bool undoRecorded = undoManager
+                    && undoIndexAfter > undoIndexBefore;
+                response.insert(QStringLiteral("undoRecorded"), undoRecorded);
+                if (undoRecorded)
+                    response.insert(QStringLiteral("undoDescription"),
+                                    undoManager->undoDescription());
+                return response;
             }
             setError(err, QStringLiteral("command not found: %1").arg(id));
             return {};
-        }
+        })
     });
 
     m_registry->registerTool({
@@ -1292,7 +1428,8 @@ void McpEditorTools::registerWriteTools()
                 {QStringLiteral("type"), QStringLiteral("number")}
             }}
         }), {QStringLiteral("clipIndex"), QStringLiteral("timeSec")}),
-        [this](const QJsonObject& args, QString* err) -> QJsonObject {
+        guardedWrite(QStringLiteral("split_clip"),
+                     [this](const QJsonObject& args, QString* err) -> QJsonObject {
             if (!rejectUnknownArguments(args,
                                         {QStringLiteral("kind"), QStringLiteral("trackIndex"),
                                          QStringLiteral("clipIndex"), QStringLiteral("timeSec")},
@@ -1315,11 +1452,12 @@ void McpEditorTools::registerWriteTools()
             if (!currentTimeline->splitClipByIndex(
                     target.audio, target.trackIndex, target.clipIndex, timeSec, err))
                 return {};
+            syncSelectionAfterEdit();
             return QJsonObject{
                 {QStringLiteral("ok"), true},
                 {QStringLiteral("newClipCount"), target.track->clipCount()}
             };
-        }
+        })
     });
 
     m_registry->registerTool({
@@ -1330,7 +1468,8 @@ void McpEditorTools::registerWriteTools()
                 {QStringLiteral("type"), QStringLiteral("boolean")}
             }}
         }), {QStringLiteral("clipIndex")}),
-        [this](const QJsonObject& args, QString* err) -> QJsonObject {
+        guardedWrite(QStringLiteral("delete_clip"),
+                     [this](const QJsonObject& args, QString* err) -> QJsonObject {
             if (!rejectUnknownArguments(args,
                                         {QStringLiteral("kind"), QStringLiteral("trackIndex"),
                                          QStringLiteral("clipIndex"), QStringLiteral("ripple")},
@@ -1352,11 +1491,12 @@ void McpEditorTools::registerWriteTools()
             if (!currentTimeline->deleteClipByIndex(
                     target.audio, target.trackIndex, target.clipIndex, ripple, err))
                 return {};
+            syncSelectionAfterEdit();
             return QJsonObject{
                 {QStringLiteral("ok"), true},
                 {QStringLiteral("remainingClipCount"), target.track->clipCount()}
             };
-        }
+        })
     });
 
     m_registry->registerTool({
@@ -1371,7 +1511,8 @@ void McpEditorTools::registerWriteTools()
                 {QStringLiteral("minimum"), 0}
             }}
         }), {QStringLiteral("clipIndex"), QStringLiteral("newStartSec")}),
-        [this](const QJsonObject& args, QString* err) -> QJsonObject {
+        guardedWrite(QStringLiteral("move_clip"),
+                     [this](const QJsonObject& args, QString* err) -> QJsonObject {
             if (!rejectUnknownArguments(args,
                                         {QStringLiteral("kind"), QStringLiteral("trackIndex"),
                                          QStringLiteral("clipIndex"), QStringLiteral("newStartSec"),
@@ -1412,6 +1553,7 @@ void McpEditorTools::registerWriteTools()
             }
             if (moveResult.moved)
                 m_window->setWindowModified(true);
+            syncSelectionAfterEdit();
             return QJsonObject{
                 {QStringLiteral("ok"), true},
                 // startSec は既存ツールの応答キーとして維持する。
@@ -1420,7 +1562,7 @@ void McpEditorTools::registerWriteTools()
                 {QStringLiteral("trackIndex"), moveResult.trackIndex},
                 {QStringLiteral("clipIndex"), moveResult.clipIndex}
             };
-        }
+        })
     });
 
     m_registry->registerTool({
@@ -1440,7 +1582,8 @@ void McpEditorTools::registerWriteTools()
                 {QStringLiteral("type"), QStringLiteral("number")}
             }}
         }), {QStringLiteral("clipIndex"), QStringLiteral("property"), QStringLiteral("value")}),
-        [this](const QJsonObject& args, QString* err) -> QJsonObject {
+        guardedWrite(QStringLiteral("set_clip_property"),
+                     [this](const QJsonObject& args, QString* err) -> QJsonObject {
             if (!rejectUnknownArguments(args,
                                         {QStringLiteral("kind"), QStringLiteral("trackIndex"),
                                          QStringLiteral("clipIndex"), QStringLiteral("property"),
@@ -1462,18 +1605,19 @@ void McpEditorTools::registerWriteTools()
             if (!currentTimeline->setClipPropertyByIndex(
                     target.audio, target.trackIndex, target.clipIndex, property, value, err))
                 return {};
+            syncSelectionAfterEdit();
             return QJsonObject{
                 {QStringLiteral("ok"), true},
                 {QStringLiteral("property"), property},
                 {QStringLiteral("value"), value}
             };
-        }
+        })
     });
 
     m_registry->registerTool({
         QStringLiteral("add_caption"),
-        QStringLiteral("字幕エディタの字幕一覧に 1 件追加する。タイムラインへの反映は字幕エディタの「適用」が必要で、"
-                       "この操作は Ctrl+Z / undo ツールの対象外 (取り消しは字幕エディタ側で行う)。"),
+        QStringLiteral("字幕エディタが未オープンなら内部で生成する (画面には出さない)。字幕エディタの字幕一覧に 1 件追加し、"
+                       "タイムラインへの反映は apply_captions を呼ぶ。この操作自体は undo 対象外。"),
         schemaWithRequired(QJsonObject{
             {QStringLiteral("text"), QJsonObject{
                 {QStringLiteral("type"), QStringLiteral("string")}
@@ -1485,7 +1629,8 @@ void McpEditorTools::registerWriteTools()
                 {QStringLiteral("type"), QStringLiteral("number")}
             }}
         }, {QStringLiteral("text"), QStringLiteral("startSec"), QStringLiteral("endSec")}),
-        [this](const QJsonObject& args, QString* err) -> QJsonObject {
+        guardedWrite(QStringLiteral("add_caption"),
+                     [this](const QJsonObject& args, QString* err) -> QJsonObject {
             if (!rejectUnknownArguments(args,
                                         {QStringLiteral("text"), QStringLiteral("startSec"),
                                          QStringLiteral("endSec")}, err))
@@ -1509,10 +1654,12 @@ void McpEditorTools::registerWriteTools()
                 static_cast<double>(std::numeric_limits<qint64>::max()) / 1000.0;
             if (startSec > kMaxCaptionSec || endSec > kMaxCaptionSec)
                 return setError(err, QStringLiteral("caption time is too large")), QJsonObject();
-            if (!m_window || !m_window->m_captionEditorDialog)
-                return setError(err, QStringLiteral("caption editor is not open")), QJsonObject();
+            CaptionEditorDialog* dialog = m_window
+                ? m_window->ensureCaptionEditorDialog() : nullptr;
+            if (!dialog)
+                return setError(err, QStringLiteral("editor not available")), QJsonObject();
 
-            caption::Track track = m_window->m_captionEditorDialog->track();
+            caption::Track track = dialog->track();
             const QList<caption::Clip> oldClips = track.clips();
             const qint64 startMs = qRound64(startSec * 1000.0);
             const qint64 endMs = qRound64(endSec * 1000.0);
@@ -1536,24 +1683,75 @@ void McpEditorTools::registerWriteTools()
             captionClip.text = text;
             track.addClip(captionClip);
             track.sortByStart();
-            m_window->m_captionEditorDialog->setTrack(track);
+            dialog->setTrack(track);
             return QJsonObject{
                 {QStringLiteral("ok"), true},
                 {QStringLiteral("index"), insertIndex},
                 {QStringLiteral("captionCount"), track.clipCount()}
             };
-        }
+        })
+    });
+
+    m_registry->registerTool({
+        QStringLiteral("apply_captions"),
+        QStringLiteral("字幕エディタに保持されている字幕を V1 の1語字幕オーバーレイとしてタイムラインへ適用する (字幕エディタの「1語字幕をタイムラインに適用」と同じ経路)。既存の生成済み1語字幕は置き換える。Ctrl+Z / undo ツールで戻せる (戻るのはタイムライン側だけで、字幕エディタの一覧は戻らない)。"),
+        objectSchema(),
+        guardedWrite(QStringLiteral("apply_captions"),
+                     [this](const QJsonObject& args, QString* err) -> QJsonObject {
+            if (!rejectUnknownArguments(args, {}, err))
+                return {};
+            if (!m_window || !timeline())
+                return setError(err, QStringLiteral("エディタまたはタイムラインを利用できません")),
+                       QJsonObject();
+
+            CaptionEditorDialog* dialog = m_window->ensureCaptionEditorDialog();
+            if (!dialog)
+                return setError(err, QStringLiteral("エディタまたはタイムラインを利用できません")),
+                       QJsonObject();
+            const caption::Track track = dialog->track();
+            if (track.clipCount() <= 0)
+                return setError(err,
+                                QStringLiteral("適用できる字幕がありません。add_caption で追加してください。")),
+                       QJsonObject();
+
+            for (const caption::Clip& clip : track.clips()) {
+                if (clip.text.trimmed().isEmpty())
+                    return setError(err,
+                                    QStringLiteral("空の字幕はタイムラインへ適用できません。")),
+                           QJsonObject();
+                if (clip.endMs <= clip.startMs)
+                    return setError(err,
+                                    QStringLiteral("字幕の終了時刻は開始時刻より後にしてください。")),
+                           QJsonObject();
+            }
+
+            QString error;
+            int appliedCount = 0;
+            if (!m_window->applyCaptionEditorTrackToTimeline(&error, &appliedCount))
+                return setError(err, error), QJsonObject();
+
+            m_window->updateEditActions();
+            Timeline* currentTimeline = timeline();
+            return QJsonObject{
+                {QStringLiteral("ok"), true},
+                {QStringLiteral("appliedCount"), appliedCount},
+                {QStringLiteral("captionCount"), dialog->track().clipCount()},
+                {QStringLiteral("timelineCaptionCount"), currentTimeline
+                    ? currentTimeline->generatedCaptionOverlays().size() : 0}
+            };
+        })
     });
 
     m_registry->registerTool({
         QStringLiteral("set_playhead"),
-        QStringLiteral("再生ヘッドを指定時刻へ移動する。編集状態を変える操作ではなく、タイムライン編集の Undo / redo には影響しない。"),
+        QStringLiteral("再生ヘッドを指定時刻へ移動する。VideoPlayer もシークし、停止中はプレビューが指定時刻のフレームに更新される (描画はイベントループ後)。編集状態を変える操作ではなく、タイムライン編集の Undo / redo には影響しない。"),
         schemaWithRequired(QJsonObject{
             {QStringLiteral("timeSec"), QJsonObject{
                 {QStringLiteral("type"), QStringLiteral("number")}
             }}
         }, {QStringLiteral("timeSec")}),
-        [this](const QJsonObject& args, QString* err) -> QJsonObject {
+        guardedWrite(QStringLiteral("set_playhead"),
+                     [this](const QJsonObject& args, QString* err) -> QJsonObject {
             if (!rejectUnknownArguments(args, {QStringLiteral("timeSec")}, err))
                 return {};
             double timeSec = 0.0;
@@ -1566,18 +1764,25 @@ void McpEditorTools::registerWriteTools()
             const double duration = qMax(0.0, timeline()->totalDuration());
             timeSec = qMin(timeSec, duration);
             timeline()->setPlayheadPosition(timeSec);
+            VideoPlayer* player = m_window->m_player;
+            const bool playing = player && player->isPlaying();
+            if (player)
+                player->seek(qRound(timeSec * 1000.0));
             return QJsonObject{
                 {QStringLiteral("ok"), true},
-                {QStringLiteral("playheadSec"), timeSec}
+                {QStringLiteral("playheadSec"), timeSec},
+                {QStringLiteral("playing"), playing},
+                {QStringLiteral("previewSeekRequested"), player != nullptr}
             };
-        }
+        })
     });
 
     m_registry->registerTool({
         QStringLiteral("undo"),
         QStringLiteral("直前のタイムライン変更を取り消す破壊的操作。Ctrl+Z / undo ツールで記録済みの変更を戻せる。"),
         objectSchema(),
-        [this](const QJsonObject& args, QString* err) -> QJsonObject {
+        guardedWrite(QStringLiteral("undo"),
+                     [this](const QJsonObject& args, QString* err) -> QJsonObject {
             if (!rejectUnknownArguments(args, {}, err))
                 return {};
             if (!m_window || !timeline())
@@ -1586,15 +1791,17 @@ void McpEditorTools::registerWriteTools()
                 return QJsonObject{{QStringLiteral("ok"), false},
                                    {QStringLiteral("reason"), QStringLiteral("nothing to undo")}};
             timeline()->undo();
+            syncSelectionAfterEdit();
             return QJsonObject{{QStringLiteral("ok"), true}};
-        }
+        })
     });
 
     m_registry->registerTool({
         QStringLiteral("redo"),
         QStringLiteral("直前に取り消したタイムライン変更を再適用する破壊的操作。Ctrl+Y / redo ツールで変更を戻し直せる。"),
         objectSchema(),
-        [this](const QJsonObject& args, QString* err) -> QJsonObject {
+        guardedWrite(QStringLiteral("redo"),
+                     [this](const QJsonObject& args, QString* err) -> QJsonObject {
             if (!rejectUnknownArguments(args, {}, err))
                 return {};
             if (!m_window || !timeline())
@@ -1603,8 +1810,9 @@ void McpEditorTools::registerWriteTools()
                 return QJsonObject{{QStringLiteral("ok"), false},
                                    {QStringLiteral("reason"), QStringLiteral("nothing to redo")}};
             timeline()->redo();
+            syncSelectionAfterEdit();
             return QJsonObject{{QStringLiteral("ok"), true}};
-        }
+        })
     });
 }
 

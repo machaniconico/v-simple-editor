@@ -13935,7 +13935,7 @@ void MainWindow::openSocialExportDialog()
 
 // US-CAP-B: Sprint 14 — 字幕エディタダイアログ
 // (modeless; 字幕クリップ追加・編集・SRT/VTT 取込/書出し・ASR 自動生成)
-void MainWindow::openCaptionEditorDialog()
+CaptionEditorDialog *MainWindow::ensureCaptionEditorDialog()
 {
     if (!m_captionEditorDialog) {
         m_captionEditorDialog = new CaptionEditorDialog(this);
@@ -13948,46 +13948,79 @@ void MainWindow::openCaptionEditorDialog()
                 return;
 
             QString error;
-            caption::Track timelineTrack = m_captionEditorDialog->track();
-            const QString recognizedSourcePath =
-                m_captionEditorDialog->recognizedSourcePath();
-            if (!recognizedSourcePath.isEmpty()) {
-                caption::Track mappedTrack;
-                if (!m_timeline
-                    || !m_timeline->mapSourceCaptionTrackToTimeline(
-                        timelineTrack, recognizedSourcePath, &mappedTrack, &error)) {
-                    if (error.isEmpty())
-                        error = QStringLiteral("認識元の動画を V1 上で特定できません。");
-                    m_captionEditorDialog->setApplyError(error);
-                    statusBar()->showMessage(error, 5000);
-                    return;
-                }
-                timelineTrack = mappedTrack;
-            }
-
-            const QVector<EnhancedTextOverlay> overlays =
-                CaptionOverlayBuilder::build(timelineTrack,
-                                             m_captionEditorDialog->style());
-            if (!m_timeline
-                || !m_timeline->applySingleWordCaptionOverlays(overlays, &error)) {
-                if (error.isEmpty())
-                    error = QStringLiteral("字幕を適用するタイムラインがありません。");
+            int appliedCount = 0;
+            if (!applyCaptionEditorTrackToTimeline(&error, &appliedCount)) {
                 m_captionEditorDialog->setApplyError(error);
                 statusBar()->showMessage(error, 5000);
                 return;
             }
 
             m_captionEditorDialog->setApplyError(QString());
-            setWindowModified(true);
             statusBar()->showMessage(
                 QStringLiteral("%1 件の1語字幕をタイムラインに適用しました。")
-                    .arg(overlays.size()),
+                    .arg(appliedCount),
                 4000);
         });
     }
-    m_captionEditorDialog->show();
-    m_captionEditorDialog->raise();
-    m_captionEditorDialog->activateWindow();
+    return m_captionEditorDialog;
+}
+
+bool MainWindow::applyCaptionEditorTrackToTimeline(QString *err, int *appliedCount)
+{
+    if (err)
+        err->clear();
+    if (appliedCount)
+        *appliedCount = 0;
+    if (!m_captionEditorDialog)
+        ensureCaptionEditorDialog();
+    if (!m_captionEditorDialog) {
+        if (err)
+            *err = QStringLiteral("字幕エディタを利用できません。");
+        return false;
+    }
+
+    QString error;
+    caption::Track timelineTrack = m_captionEditorDialog->track();
+    const QString recognizedSourcePath = m_captionEditorDialog->recognizedSourcePath();
+    if (!recognizedSourcePath.isEmpty()) {
+        caption::Track mappedTrack;
+        if (!m_timeline
+            || !m_timeline->mapSourceCaptionTrackToTimeline(
+                timelineTrack, recognizedSourcePath, &mappedTrack, &error)) {
+            if (error.isEmpty())
+                error = QStringLiteral("認識元の動画を V1 上で特定できません。");
+            if (err)
+                *err = error;
+            return false;
+        }
+        timelineTrack = mappedTrack;
+    }
+
+    const QVector<EnhancedTextOverlay> overlays =
+        CaptionOverlayBuilder::build(timelineTrack, m_captionEditorDialog->style());
+    if (!m_timeline
+        || !m_timeline->applySingleWordCaptionOverlays(overlays, &error)) {
+        if (error.isEmpty())
+            error = QStringLiteral("字幕を適用するタイムラインがありません。");
+        if (err)
+            *err = error;
+        return false;
+    }
+
+    setWindowModified(true);
+    if (appliedCount)
+        *appliedCount = overlays.size();
+    return true;
+}
+
+void MainWindow::openCaptionEditorDialog()
+{
+    CaptionEditorDialog *dialog = ensureCaptionEditorDialog();
+    if (!dialog)
+        return;
+    dialog->show();
+    dialog->raise();
+    dialog->activateWindow();
 }
 
 // Phase 6 Wave 2 (US-6B-4): 動画→Whisper 文字起こし配線。
