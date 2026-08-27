@@ -10,6 +10,7 @@
 #include <QJsonObject>
 #include <QMetaObject>
 #include <QDir>
+#include <QFile>
 #include <QFileInfo>
 #include <QList>
 #include <QTemporaryFile>
@@ -269,14 +270,14 @@ int runMcpSelftest()
             72, QStringLiteral("initialize"), QJsonObject{
                 {QStringLiteral("protocolVersion"), QStringLiteral("1999-01-01")}
             }))));
-    const bool g63 = supportedInitialize.value(QStringLiteral("result")).toObject()
+    const bool g70 = supportedInitialize.value(QStringLiteral("result")).toObject()
                          .value(QStringLiteral("protocolVersion")).toString()
                          == QStringLiteral("2025-03-26")
         && unsupportedInitialize.value(QStringLiteral("result")).toObject()
                .value(QStringLiteral("protocolVersion")).toString()
                == QStringLiteral("2025-06-18");
-    g63 ? pass("G63 initialize version negotiation")
-        : fail("G63 initialize version negotiation",
+    g70 ? pass("G70 initialize version negotiation")
+        : fail("G70 initialize version negotiation",
                QStringLiteral("requested protocol versions were not negotiated correctly"));
 
     const QJsonObject parseError = parseObject(protocol.handleMessage(QByteArray("{")));
@@ -400,12 +401,12 @@ int runMcpSelftest()
         fail("G32 oversized HTTP header", QStringLiteral("server failed to start"));
         fail("G33 chunked transfer rejected", QStringLiteral("server failed to start"));
         fail("G34 duplicate content-length rejected", QStringLiteral("server failed to start"));
-        fail("G59 HTTP Origin rejected", QStringLiteral("server failed to start"));
-        fail("G60 HTTP localhost Origin allowed", QStringLiteral("server failed to start"));
-        fail("G61 HTTP content-type rejected", QStringLiteral("server failed to start"));
-        fail("G62 HTTP protocol header", QStringLiteral("server failed to start"));
-        fail("G66 connection limit 503", QStringLiteral("server failed to start"));
-        fail("G67 stdio bridge no head-of-line blocking / timeout",
+        fail("G66 HTTP Origin rejected", QStringLiteral("server failed to start"));
+        fail("G67 HTTP localhost Origin allowed", QStringLiteral("server failed to start"));
+        fail("G68 HTTP content-type rejected", QStringLiteral("server failed to start"));
+        fail("G69 HTTP protocol header", QStringLiteral("server failed to start"));
+        fail("G73 connection limit 503", QStringLiteral("server failed to start"));
+        fail("G74 stdio bridge no head-of-line blocking / timeout",
              QStringLiteral("server failed to start"));
     } else {
         QNetworkAccessManager manager;
@@ -484,19 +485,19 @@ int runMcpSelftest()
         const HttpResult nullOrigin = post(
             &manager, endpoint, ping, server.token().toUtf8(),
             QHash<QByteArray, QByteArray>{{"Origin", "null"}});
-        const bool g59 = evilOrigin.status == 403 && nullOrigin.status == 403;
-        g59 ? pass("G59 HTTP Origin rejected")
-            : fail("G59 HTTP Origin rejected",
+        const bool g66 = evilOrigin.status == 403 && nullOrigin.status == 403;
+        g66 ? pass("G66 HTTP Origin rejected")
+            : fail("G66 HTTP Origin rejected",
                    QStringLiteral("evil=%1 null=%2")
                        .arg(evilOrigin.status).arg(nullOrigin.status));
 
         const HttpResult localhostOrigin = post(
             &manager, endpoint, ping, server.token().toUtf8(),
             QHash<QByteArray, QByteArray>{{"Origin", "http://localhost:3000"}});
-        const bool g60 = localhostOrigin.status == 200
+        const bool g67 = localhostOrigin.status == 200
             && localhostOrigin.allowOrigin == "http://localhost:3000";
-        g60 ? pass("G60 HTTP localhost Origin allowed")
-            : fail("G60 HTTP localhost Origin allowed",
+        g67 ? pass("G67 HTTP localhost Origin allowed")
+            : fail("G67 HTTP localhost Origin allowed",
                    QStringLiteral("status=%1 allowOrigin=%2")
                        .arg(localhostOrigin.status)
                        .arg(QString::fromLatin1(localhostOrigin.allowOrigin)));
@@ -505,8 +506,8 @@ int runMcpSelftest()
             &manager, endpoint, ping, server.token().toUtf8(),
             {}, QByteArray("text/plain"));
         badContentType.status == 415
-            ? pass("G61 HTTP content-type rejected")
-            : fail("G61 HTTP content-type rejected",
+            ? pass("G68 HTTP content-type rejected")
+            : fail("G68 HTTP content-type rejected",
                    QStringLiteral("status=%1").arg(badContentType.status));
 
         const HttpResult unsupportedVersion = post(
@@ -515,10 +516,10 @@ int runMcpSelftest()
         const HttpResult supportedVersion = post(
             &manager, endpoint, ping, server.token().toUtf8(),
             QHash<QByteArray, QByteArray>{{"MCP-Protocol-Version", "2025-03-26"}});
-        const bool g62 = unsupportedVersion.status == 400
+        const bool g69 = unsupportedVersion.status == 400
             && supportedVersion.status == 200;
-        g62 ? pass("G62 HTTP protocol header")
-            : fail("G62 HTTP protocol header",
+        g69 ? pass("G69 HTTP protocol header")
+            : fail("G69 HTTP protocol header",
                    QStringLiteral("unsupported=%1 supported=%2")
                        .arg(unsupportedVersion.status)
                        .arg(supportedVersion.status));
@@ -542,8 +543,8 @@ int runMcpSelftest()
         const int connectionLimitStatus = rawHttpStatus(
             server.port(), connectionLimitRequest);
         connectionLimitStatus == 503
-            ? pass("G66 connection limit 503")
-            : fail("G66 connection limit 503",
+            ? pass("G73 connection limit 503")
+            : fail("G73 connection limit 503",
                    QStringLiteral("status=%1").arg(connectionLimitStatus));
         for (const QPointer<QTcpSocket>& socket : idle) {
             if (!socket)
@@ -631,10 +632,10 @@ int runMcpSelftest()
                 finalPingSucceeded = response.value(QStringLiteral("result")).isObject();
             }
         }
-        const bool g67 = firstResponseIsPing && slowRequestTimedOut
+        const bool g74 = firstResponseIsPing && slowRequestTimedOut
             && finalPingSucceeded && bridgeResponses.size() == 3;
-        g67 ? pass("G67 stdio bridge no head-of-line blocking / timeout")
-            : fail("G67 stdio bridge no head-of-line blocking / timeout",
+        g74 ? pass("G74 stdio bridge no head-of-line blocking / timeout")
+            : fail("G74 stdio bridge no head-of-line blocking / timeout",
                    QStringLiteral("responses=%1 firstIsPing=%2 timeout=%3 finalPing=%4")
                        .arg(bridgeResponses.size())
                        .arg(firstResponseIsPing)
@@ -857,22 +858,18 @@ int runMcpSelftest()
                QStringLiteral("credential removal or PATH preservation failed"));
 
     const QStringList arguments = AiChatDock::buildArguments(
-        QStringLiteral("/tmp/veditor-mcp.json"), QStringLiteral("edit this"));
-    // プロンプトは -p の直後。可変長の --allowedTools より後ろに置くと
-    // claude 側がプロンプトを許可ツール名として飲み込む (実測)。
-    const int allowedToolsIndex = arguments.indexOf(QStringLiteral("--allowedTools"));
-    const int promptIndex = arguments.indexOf(QStringLiteral("edit this"));
+        QStringLiteral("/tmp/veditor-mcp.json"), QString());
+    // プロンプトは argv に置かず stdin へ渡し、可変長の --allowedTools は最後に置く。
     const bool g27 = arguments.contains(QStringLiteral("--strict-mcp-config"))
         && arguments.indexOf(QStringLiteral("--output-format")) >= 0
         && arguments.value(arguments.indexOf(QStringLiteral("--output-format")) + 1)
                == QStringLiteral("stream-json")
         && arguments.value(0) == QStringLiteral("-p")
-        && promptIndex == 1
-        && allowedToolsIndex > promptIndex
+        && !arguments.contains(QStringLiteral("edit this"))
         && arguments.constLast() == QStringLiteral("mcp__veditor");
     g27 ? pass("G27 AI chat CLI arguments")
         : fail("G27 AI chat CLI arguments",
-               QStringLiteral("required stream-json arguments or prompt order is wrong"));
+               QStringLiteral("required stream-json arguments or stdin prompt handling is wrong"));
 
     const QByteArray mcpConfig = AiChatDock::buildMcpConfig(
         9876, QStringLiteral("test-token"));
@@ -887,6 +884,116 @@ int runMcpSelftest()
     g28 ? pass("G28 AI chat MCP config JSON")
         : fail("G28 AI chat MCP config JSON",
                QStringLiteral("port or bearer token was not encoded correctly"));
+
+    QTemporaryDir cliCommandDir;
+    const QString fakeCmdPath = cliCommandDir.isValid()
+        ? QDir(cliCommandDir.path()).filePath(QStringLiteral("claude.cmd"))
+        : QString();
+    bool fakeCmdReady = false;
+    if (!fakeCmdPath.isEmpty()) {
+        QFile fakeCmd(fakeCmdPath);
+        fakeCmdReady = fakeCmd.open(QIODevice::WriteOnly);
+        if (fakeCmdReady) {
+            fakeCmd.write("@echo off\r\n");
+            fakeCmd.close();
+            fakeCmdReady = QFile::setPermissions(
+                fakeCmdPath, QFileDevice::ReadOwner | QFileDevice::WriteOwner
+                    | QFileDevice::ExeOwner);
+        }
+    }
+    const AiChatDock::CliCommand resolvedCmd = AiChatDock::resolveCliCommand(
+        QStringLiteral("claude"), {cliCommandDir.path()});
+    const bool g75 = fakeCmdReady
+        && QFileInfo(resolvedCmd.program).absoluteFilePath()
+               == QFileInfo(fakeCmdPath).absoluteFilePath()
+        && resolvedCmd.needsShell;
+    g75 ? pass("G75 CLI resolver finds cmd shell script")
+        : fail("G75 CLI resolver finds cmd shell script",
+               QStringLiteral(".cmd was not resolved or was not marked for the shell"));
+
+    QTemporaryDir cliExeDir;
+    const QString fakeExePath = cliExeDir.isValid()
+        ? QDir(cliExeDir.path()).filePath(QStringLiteral("claude.exe"))
+        : QString();
+    bool fakeExeReady = false;
+    if (!fakeExePath.isEmpty()) {
+        QFile fakeExe(fakeExePath);
+        fakeExeReady = fakeExe.open(QIODevice::WriteOnly);
+        if (fakeExeReady) {
+            fakeExe.write("not a real executable\n");
+            fakeExe.close();
+            fakeExeReady = QFile::setPermissions(
+                fakeExePath, QFileDevice::ReadOwner | QFileDevice::WriteOwner
+                    | QFileDevice::ExeOwner);
+        }
+    }
+    const AiChatDock::CliCommand resolvedExe = AiChatDock::resolveCliCommand(
+        QStringLiteral("claude.exe"), {cliExeDir.path()});
+    const bool g76 = fakeExeReady && !resolvedExe.program.isEmpty()
+        && !resolvedExe.needsShell;
+    g76 ? pass("G76 CLI resolver finds executable without shell")
+        : fail("G76 CLI resolver finds executable without shell",
+               QStringLiteral(".exe was not resolved as a direct executable"));
+
+    QTemporaryDir missingCliDir;
+    const AiChatDock::CliCommand missingCli = AiChatDock::resolveCliCommand(
+        QStringLiteral("definitely-missing-cli-xyz"), {missingCliDir.path()});
+    const bool g77 = missingCliDir.isValid() && missingCli.program.isEmpty()
+        && missingCli.searched.join(QStringLiteral("\n"))
+               .contains(missingCliDir.path());
+    g77 ? pass("G77 CLI resolver reports searched paths")
+        : fail("G77 CLI resolver reports searched paths",
+               QStringLiteral("a missing CLI did not report its search directory"));
+
+    const QString shellLine = AiChatDock::buildShellCommandLine(
+        QStringLiteral("C:\\p q\\claude.cmd"),
+        {QStringLiteral("-p"), QStringLiteral("--mcp-config"),
+         QStringLiteral("C:\\a&b|c^d.json")});
+    const QString expectedShellLine = QStringLiteral(
+        "\"C:\\p q\\claude.cmd\" \"-p\" \"--mcp-config\" \"C:\\a&b|c^d.json\"");
+    bool metacharactersAreQuoted = true;
+    int quoteDepth = 0;
+    for (const QChar character : shellLine) {
+        if (character == QLatin1Char('"'))
+            quoteDepth = quoteDepth == 0 ? 1 : 0;
+        else if (QStringLiteral("&|^").contains(character) && quoteDepth == 0)
+            metacharactersAreQuoted = false;
+    }
+    QString shellError;
+    const bool percentRejected = AiChatDock::buildShellCommandLine(
+        QStringLiteral("claude.cmd"), {QStringLiteral("x%y")}, &shellError)
+            .isEmpty() && !shellError.isEmpty();
+    const bool quoteRejected = AiChatDock::buildShellCommandLine(
+        QStringLiteral("claude.cmd"), {QStringLiteral("x\"y")}, &shellError)
+            .isEmpty() && !shellError.isEmpty();
+    const bool bangRejected = AiChatDock::buildShellCommandLine(
+        QStringLiteral("claude.cmd"), {QStringLiteral("x!y")}, &shellError)
+            .isEmpty() && !shellError.isEmpty();
+    const bool g78 = shellLine == expectedShellLine
+        && shellLine.startsWith(QLatin1Char('"'))
+        && shellLine.endsWith(QLatin1Char('"'))
+        && metacharactersAreQuoted
+        && percentRejected && quoteRejected && bangRejected;
+    g78 ? pass("G78 shell command quoting and rejection")
+        : fail("G78 shell command quoting and rejection",
+               QStringLiteral("cmd.exe command-line quoting or rejection is wrong"));
+
+    const QStringList argumentsWithoutResume = AiChatDock::buildArguments(
+        QStringLiteral("/tmp/c.json"), QString());
+    const QStringList argumentsWithResume = AiChatDock::buildArguments(
+        QStringLiteral("/tmp/c.json"), QStringLiteral("sess-1"));
+    const int resumeIndex = argumentsWithResume.indexOf(QStringLiteral("--resume"));
+    const int sessionIndex = argumentsWithResume.indexOf(QStringLiteral("sess-1"));
+    const int allowedToolsIndex = argumentsWithResume.indexOf(
+        QStringLiteral("--allowedTools"));
+    const bool g79 = argumentsWithoutResume.value(0) == QStringLiteral("-p")
+        && !argumentsWithoutResume.contains(QStringLiteral("--resume"))
+        && argumentsWithoutResume.constLast() == QStringLiteral("mcp__veditor")
+        && resumeIndex >= 0 && sessionIndex == resumeIndex + 1
+        && resumeIndex < allowedToolsIndex;
+    g79 ? pass("G79 resume arguments precede allowed tools")
+        : fail("G79 resume arguments precede allowed tools",
+               QStringLiteral("--resume or stdin argument ordering is wrong"));
 
     const QStringList changedToolNames{
         QStringLiteral("split_clip"), QStringLiteral("delete_clip"),
@@ -960,16 +1067,16 @@ int runMcpSelftest()
             rpcRequest(73, QStringLiteral("tools/list")))))
         .value(QStringLiteral("result")).toObject()
         .value(QStringLiteral("tools")).toArray();
-    bool outputSchemasDeclared = projectInfoToolDescriptors.size() == 21;
+    bool outputSchemasDeclared = projectInfoToolDescriptors.size() == 22;
     for (const QJsonValue& value : projectInfoToolDescriptors) {
         outputSchemasDeclared = outputSchemasDeclared
             && value.toObject().value(QStringLiteral("outputSchema"))
                    .toObject().value(QStringLiteral("type")).toString()
                    == QStringLiteral("object");
     }
-    const bool g64 = outputSchemasDeclared;
-    g64 ? pass("G64 outputSchema declared")
-        : fail("G64 outputSchema declared",
+    const bool g71 = outputSchemasDeclared;
+    g71 ? pass("G71 outputSchema declared")
+        : fail("G71 outputSchema declared",
                QStringLiteral("expected 21 object output schemas, got %1")
                    .arg(projectInfoToolDescriptors.size()));
 
@@ -1331,10 +1438,10 @@ int runMcpSelftest()
         !toolResult(successfulSelectResponse).value(QStringLiteral("isError")).toBool(false)
         && requiredOutputFieldsPresent(QStringLiteral("select_clip"),
                                        toolPayload(successfulSelectResponse));
-    const bool g65 = projectInfoFieldsPresent && listCommandsFieldsPresent
+    const bool g72 = projectInfoFieldsPresent && listCommandsFieldsPresent
         && selectClipFieldsPresent;
-    g65 ? pass("G65 structuredContent matches outputSchema")
-        : fail("G65 structuredContent matches outputSchema",
+    g72 ? pass("G72 structuredContent matches outputSchema")
+        : fail("G72 structuredContent matches outputSchema",
                QStringLiteral("a successful tool response omitted an outputSchema required key"));
 
     // get_frame は実際に libav の動画デコーダを通るため、リポジトリの
