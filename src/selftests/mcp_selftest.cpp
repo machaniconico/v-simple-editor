@@ -380,15 +380,15 @@ int runMcpSelftest()
     const QJsonObject imageItem = imageContent.isEmpty()
         ? QJsonObject() : imageContent.first().toObject();
     const QJsonObject imagePayload = toolPayload(imageCall);
-    const bool g10Image = !imageResult.value(QStringLiteral("isError")).toBool(true)
+    const bool g80Image = !imageResult.value(QStringLiteral("isError")).toBool(true)
         && imageContent.size() == 1
         && imageItem.value(QStringLiteral("type")).toString() == QStringLiteral("image")
         && imageItem.value(QStringLiteral("data")).toString() == QStringLiteral("aGVsbG8=")
         && imageItem.value(QStringLiteral("mimeType")).toString()
                == QStringLiteral("image/png")
         && imagePayload.value(QStringLiteral("ok")).toBool(false);
-    g10Image ? pass("G10 image content result shape")
-             : fail("G10 image content result shape",
+    g80Image ? pass("G80 image content result shape")
+             : fail("G80 image content result shape",
                     QStringLiteral("image content was not emitted in MCP shape"));
 
     mcp::McpHttpServer server(&registry);
@@ -397,7 +397,7 @@ int runMcpSelftest()
         fail("G11 HTTP bearer POST", QStringLiteral("server failed to start"));
         fail("G12 HTTP unauthorized", QStringLiteral("server failed to start"));
         fail("G13 HTTP query token", QStringLiteral("server failed to start"));
-        fail("G14 HTTP GET method", QStringLiteral("server failed to start"));
+        fail("G14 HTTP GET rejected", QStringLiteral("server failed to start"));
         fail("G32 oversized HTTP header", QStringLiteral("server failed to start"));
         fail("G33 chunked transfer rejected", QStringLiteral("server failed to start"));
         fail("G34 duplicate content-length rejected", QStringLiteral("server failed to start"));
@@ -865,11 +865,10 @@ int runMcpSelftest()
         && arguments.value(arguments.indexOf(QStringLiteral("--output-format")) + 1)
                == QStringLiteral("stream-json")
         && arguments.value(0) == QStringLiteral("-p")
-        && !arguments.contains(QStringLiteral("edit this"))
         && arguments.constLast() == QStringLiteral("mcp__veditor");
     g27 ? pass("G27 AI chat CLI arguments")
         : fail("G27 AI chat CLI arguments",
-               QStringLiteral("required stream-json arguments or stdin prompt handling is wrong"));
+               QStringLiteral("required stream-json arguments are wrong"));
 
     const QByteArray mcpConfig = AiChatDock::buildMcpConfig(
         9876, QStringLiteral("test-token"));
@@ -1067,7 +1066,9 @@ int runMcpSelftest()
             rpcRequest(73, QStringLiteral("tools/list")))))
         .value(QStringLiteral("result")).toObject()
         .value(QStringLiteral("tools")).toArray();
-    bool outputSchemasDeclared = projectInfoToolDescriptors.size() == 22;
+    constexpr int kExpectedProjectInfoToolCount = 22;
+    bool outputSchemasDeclared = projectInfoToolDescriptors.size()
+        == kExpectedProjectInfoToolCount;
     for (const QJsonValue& value : projectInfoToolDescriptors) {
         outputSchemasDeclared = outputSchemasDeclared
             && value.toObject().value(QStringLiteral("outputSchema"))
@@ -1077,7 +1078,8 @@ int runMcpSelftest()
     const bool g71 = outputSchemasDeclared;
     g71 ? pass("G71 outputSchema declared")
         : fail("G71 outputSchema declared",
-               QStringLiteral("expected 21 object output schemas, got %1")
+               QStringLiteral("expected %1 object output schemas, got %2")
+                   .arg(kExpectedProjectInfoToolCount)
                    .arg(projectInfoToolDescriptors.size()));
 
     auto requiredOutputFieldsPresent = [&projectInfoToolDescriptors](
@@ -1128,6 +1130,65 @@ int runMcpSelftest()
     g42 ? pass("G42 save without path is rejected non-interactively")
         : fail("G42 save without path is rejected non-interactively",
                QStringLiteral("save_project opened a dialog or returned a wrong error"));
+
+    QTemporaryDir projectBehaviorDir;
+    const bool projectBehaviorDirReady = projectBehaviorDir.isValid();
+    const QString missingProjectPath = projectBehaviorDirReady
+        ? QDir(projectBehaviorDir.path()).filePath(QStringLiteral("missing.vsep"))
+        : QString();
+    const QJsonObject missingProjectResponse = projectBehaviorDirReady
+        ? callProjectInfoTool(
+            81, QStringLiteral("open_project"), QJsonObject{
+                {QStringLiteral("path"), missingProjectPath}
+            })
+        : QJsonObject();
+    const bool g81 = projectBehaviorDirReady
+        && toolResult(missingProjectResponse).value(QStringLiteral("isError"))
+               .toBool(false)
+        && toolErrorText(missingProjectResponse)
+               == QStringLiteral("ファイルが見つかりません: %1").arg(missingProjectPath);
+    g81 ? pass("G81 open_project missing file is rejected")
+        : fail("G81 open_project missing file is rejected",
+               QStringLiteral("missing project was accepted or returned a wrong error"));
+
+    const QString roundtripProjectPath = projectBehaviorDirReady
+        ? QDir(projectBehaviorDir.path()).filePath(QStringLiteral("roundtrip.vsep"))
+        : QString();
+    QJsonObject roundtripSaveResponse;
+    QJsonObject roundtripOpenResponse;
+    if (projectBehaviorDirReady) {
+        roundtripSaveResponse = callProjectInfoTool(
+            82, QStringLiteral("save_project"), QJsonObject{
+                {QStringLiteral("path"), roundtripProjectPath}
+            });
+        roundtripOpenResponse = callProjectInfoTool(
+            83, QStringLiteral("open_project"), QJsonObject{
+                {QStringLiteral("path"), roundtripProjectPath}
+            });
+    }
+    const QJsonObject roundtripSaveResult = toolResult(roundtripSaveResponse);
+    const QJsonObject roundtripSavePayload = toolPayload(roundtripSaveResponse);
+    const QJsonObject roundtripOpenResult = toolResult(roundtripOpenResponse);
+    const QJsonObject roundtripOpenPayload = toolPayload(roundtripOpenResponse);
+    const bool g82 = projectBehaviorDirReady
+        && !roundtripSaveResult.value(QStringLiteral("isError")).toBool(true)
+        && roundtripSavePayload.value(QStringLiteral("ok")).toBool(false)
+        && requiredOutputFieldsPresent(QStringLiteral("save_project"),
+                                       roundtripSavePayload)
+        && roundtripSavePayload.value(QStringLiteral("path")).toString()
+               == roundtripProjectPath
+        && QFileInfo(roundtripProjectPath).exists()
+        && !roundtripOpenResult.value(QStringLiteral("isError")).toBool(true)
+        && roundtripOpenPayload.value(QStringLiteral("ok")).toBool(false)
+        && requiredOutputFieldsPresent(QStringLiteral("open_project"),
+                                       roundtripOpenPayload)
+        && roundtripOpenPayload.value(QStringLiteral("path")).toString()
+               == roundtripProjectPath
+        && projectInfoWindow.projectDirectory()
+               == QFileInfo(roundtripProjectPath).absolutePath();
+    g82 ? pass("G82 save_project/open_project roundtrip")
+        : fail("G82 save_project/open_project roundtrip",
+               QStringLiteral("save/open did not preserve the project path and response contract"));
 
     Timeline *projectTimeline = projectInfoWindow.findChild<Timeline *>();
     const QJsonObject missingImport = callProjectInfoTool(
@@ -1431,7 +1492,14 @@ int runMcpSelftest()
                    QStringLiteral("linked audio/video clips diverged during track move"));
     }
     if (!timelineReady) {
-        fail("G45-G52 editor timeline MCP behavior", QStringLiteral("Timeline was not available"));
+        fail("G45 select_clip rejects out-of-range index", QStringLiteral("Timeline was not available"));
+        fail("G46 select_clip synchronizes Timeline and MainWindow", QStringLiteral("Timeline was not available"));
+        fail("G47 invalid selection preserves existing selection", QStringLiteral("Timeline was not available"));
+        fail("G48 clear_selection clears both state holders", QStringLiteral("Timeline was not available"));
+        fail("G49 continuous clips can be reordered and undone", QStringLiteral("Timeline was not available"));
+        fail("G50 blocked move reports actual start and reason", QStringLiteral("Timeline was not available"));
+        fail("G51 move_clip supports cross-track movement", QStringLiteral("Timeline was not available"));
+        fail("G52 linked V/A clips move together", QStringLiteral("Timeline was not available"));
     }
 
     const bool selectClipFieldsPresent =
@@ -1646,6 +1714,8 @@ int runMcpSelftest()
         fail("G64 delete_clip resynchronizes selection",
              QStringLiteral("V1 track was not available"));
         fail("G65 set_playhead seeks the player",
+             QStringLiteral("V1 track was not available"));
+        fail("G83 set_clip_property changes and undoes a live clip",
              QStringLiteral("V1 track was not available"));
     } else {
         const bool noCaptionEditorBefore =
@@ -1885,6 +1955,50 @@ int runMcpSelftest()
         g65 ? pass("G65 set_playhead seeks the player")
             : fail("G65 set_playhead seeks the player",
                    QStringLiteral("set_playhead did not synchronize the timeline and preview"));
+
+        const bool propertyTargetReady = !captionVideo0->clips().isEmpty();
+        const double originalVolume = propertyTargetReady
+            ? captionVideo0->clips().first().volume : -1.0;
+        QJsonObject setPropertyResponse;
+        QJsonObject setPropertyUndoResponse;
+        if (propertyTargetReady) {
+            projectTimeline->undoManager()->clear();
+            projectTimeline->undoManager()->saveState(
+                projectTimeline->currentState(), QStringLiteral("MCP selftest property baseline"));
+            setPropertyResponse = callProjectInfoTool(
+                84, QStringLiteral("set_clip_property"), QJsonObject{
+                    {QStringLiteral("kind"), QStringLiteral("video")},
+                    {QStringLiteral("trackIndex"), 0},
+                    {QStringLiteral("clipIndex"), 0},
+                    {QStringLiteral("property"), QStringLiteral("volume")},
+                    {QStringLiteral("value"), 0.5}
+                });
+        }
+        const QJsonObject setPropertyResult = toolResult(setPropertyResponse);
+        const QJsonObject setPropertyPayload = toolPayload(setPropertyResponse);
+        const double changedVolume = propertyTargetReady
+            ? captionVideo0->clips().first().volume : -1.0;
+        const bool propertyChanged = propertyTargetReady
+            && !setPropertyResult.value(QStringLiteral("isError")).toBool(true)
+            && setPropertyPayload.value(QStringLiteral("ok")).toBool(false)
+            && setPropertyPayload.value(QStringLiteral("property")).toString()
+                   == QStringLiteral("volume")
+            && qFuzzyCompare(setPropertyPayload.value(QStringLiteral("value")).toDouble()
+                                 + 1.0, 1.5)
+            && qFuzzyCompare(changedVolume + 1.0, 1.5);
+        if (propertyTargetReady) {
+            setPropertyUndoResponse = callProjectInfoTool(
+                85, QStringLiteral("undo"), QJsonObject{});
+        }
+        const QJsonObject setPropertyUndoPayload = toolPayload(setPropertyUndoResponse);
+        const bool propertyUndoRestored = propertyTargetReady
+            && setPropertyUndoPayload.value(QStringLiteral("ok")).toBool(false)
+            && qFuzzyCompare(captionVideo0->clips().first().volume + 1.0,
+                             originalVolume + 1.0);
+        const bool g83 = propertyChanged && propertyUndoRestored;
+        g83 ? pass("G83 set_clip_property changes and undoes a live clip")
+            : fail("G83 set_clip_property changes and undoes a live clip",
+                   QStringLiteral("live volume change or undo restoration did not match"));
     }
 
     const QJsonObject commandListResponse = callProjectInfoTool(

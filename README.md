@@ -137,14 +137,17 @@ API キー方式でモデルを呼び出すと、通常は API の従量課金�
 ```toml
 [mcp_servers.veditor]
 command = "v-simple-editor.exe"
-args = ["--mcp-stdio", "--port", "8765", "--token", "<token>"]
+args = ["--mcp-stdio", "--port", "8765"]
+env = { VEDITOR_MCP_TOKEN = "<token>" }
 ```
 
-このブリッジは stdin/stdout の「1 行 1 JSON-RPC」を localhost の HTTP MCP サーバへ中継します。エディタが起動していない場合はプロセスを落とさず、`-32603` と `editor not running` を返します。ポートを変更した場合は `--port` も合わせて変更してください。
+このブリッジは stdin/stdout の「1 行 1 JSON-RPC」を localhost の HTTP MCP サーバへ中継します。HTTP/ネットワークのエラーはプロセスを落とさず、`-32603` と次のメッセージを返します: `invalid token`（HTTP 401、トークン不一致）、`editor did not respond in time`（リクエストタイムアウト）、`editor not running`（接続拒否）、`unexpected editor response`（その他の HTTP/ネットワークエラー）。ポートを変更した場合は `--port` も合わせて変更してください。
+
+`--token <token>` を args に渡す形も受け付けますが、プロセス一覧からトークンが見えるためブリッジは stderr に警告を出します。`VEDITOR_MCP_TOKEN` が設定されている場合はそちらが優先されます。ブリッジの HTTP リクエストのタイムアウトは `VEDITOR_MCP_TIMEOUT_MS`（1000 以上のミリ秒）で変更できます。
 
 ### エディタ内 AI チャット
 
-**表示 > AI チャット** で AI チャット Dock を開きます。Dock は `claude` CLI を headless で `-p <prompt> --output-format stream-json --verbose --mcp-config <一時json> --strict-mcp-config --allowedTools mcp__veditor` のオプション付きで起動し、MCP 設定を一時ファイルで渡して `veditor` のツールだけを許可します。子プロセスの環境から `ANTHROPIC_API_KEY` と `ANTHROPIC_AUTH_TOKEN` を除去するため、ログイン済みの Claude Pro / Max のサブスク枠で動作します。使用する CLI 名は QSettings の `aiChatCommand` で変更できます。
+**表示 > AI チャット** で AI チャット Dock を開きます。Dock は `claude` CLI を headless で `-p --output-format stream-json --verbose --mcp-config <一時json> --strict-mcp-config [--resume <sessionId>] --allowedTools mcp__veditor` のオプション付きで起動し、MCP 設定を一時ファイルで渡して `veditor` のツールだけを許可します。プロンプトは argv ではなく stdin で渡します。会話継続時は前回の `session_id` を `--resume <sessionId>` で指定します（`--allowedTools` の直前）。子プロセスの環境から `ANTHROPIC_API_KEY` と `ANTHROPIC_AUTH_TOKEN` を除去するため、ログイン済みの Claude Pro / Max のサブスク枠で動作します。使用する CLI 名は QSettings の `aiChatCommand` で変更できます。
 
 `claude` が PATH に無い場合は、先に次を実行してください。
 
@@ -154,7 +157,7 @@ npm i -g @anthropic-ai/claude-code
 
 ### 安全性
 
-MCP の変更系ツールは確認ダイアログを出さず、常に自動承認されます。編集前に Undo 状態を 1 回だけ保存するため、通常は LLM の 1 操作を **Ctrl+Z 1 回**で戻せます。`run_command` は各メニューアクションが自分で Undo を積むため、MCP 側では二重に積みません。`add_caption` は字幕エディタ側の状態を変更するため Ctrl+Z の対象外です。トークンは他人に渡さないでください。サーバは `127.0.0.1` にのみバインドされるため、LAN 上の別の端末からは接続できません。
+MCP の変更系ツールは確認ダイアログを出さず、原則として自動承認されます。ただし `run_command` は `list_commands` が返す危険度（safe / blocking / quit）で分類され、blocking（モーダルダイアログ）のコマンドは `allowBlocking:true` を渡さない限り拒否され、quit のコマンドは MCP から常に実行できません。編集前に Undo 状態を 1 回だけ保存するため、通常は LLM の 1 操作を **Ctrl+Z 1 回**で戻せます。`run_command` は各メニューアクションが自分で Undo を積むため、MCP 側では二重に積みません。`add_caption` は字幕エディタ側の状態を変更するため Ctrl+Z の対象外です。タイムラインへ反映するには `apply_captions` を呼びます（こちらは Ctrl+Z で戻せますが、戻るのはタイムライン側だけです）。トークンは他人に渡さないでください。サーバは `127.0.0.1` にのみバインドされるため、LAN 上の別の端末からは接続できません。
 
 ### MCP ツール
 
@@ -162,17 +165,28 @@ MCP の変更系ツールは確認ダイアログを出さず、常に自動承�
 |---|---|---|
 | `get_project_info` | プロジェクト情報を読み取る | なし |
 | `get_timeline` | タイムラインを読み取る | なし |
+| `get_frame` | 指定時刻の合成フレームを PNG で返す（既定 640px 以下・1MB 以内） | なし |
 | `get_captions` | 字幕を読み取る | なし |
-| `list_commands` | メニューの全アクション（実測 231 件）を安定 ID（例: `file.11`, `tools.41`）付きで一覧する | なし |
-| `run_command` | `list_commands` のアクションを実行する | アクション依存（MCP 側では追加しない） |
+| `get_export_status` | `export_video` ジョブの状態・進捗を返す | なし |
+| `list_commands` | メニュー直下のお気に入り登録可能なアクションを安定 ID（例: `file.11`, `tools.41`）付きで一覧する（サブメニュー内の項目は含まない）。省略可能な `query` で id / 表示名 / メニュー名を部分一致フィルタでき、各項目に `risk`（safe / blocking / quit）と `enabled` を返す | なし |
+| `run_command` | `list_commands` のアクションを ID で実行する（`allowBlocking` は既定 false。応答の `undoRecorded` で Ctrl+Z / `undo` の対象になったか確認できる） | アクション依存（MCP 側では追加しない） |
+| `export_video` | タイムラインを動画へ非同期で書き出し、`jobId` を返す | なし |
+| `import_media` | ダイアログなしで素材を指定トラックへ取り込む | あり |
+| `save_project` | プロジェクトを指定パスへ保存する（ダイアログなし） | なし |
+| `open_project` | 指定パスのプロジェクトを読み込む（未保存確認なし） | なし |
+| `select_clip` | 指定クリップを選択する | なし |
+| `clear_selection` | 選択をすべて解除する | なし |
 | `split_clip` | クリップを分割する | あり |
 | `delete_clip` | クリップを削除する | あり |
 | `move_clip` | クリップを移動する | あり |
 | `set_clip_property` | クリップのプロパティを変更する | あり |
-| `add_caption` | 字幕を追加する | なし（Ctrl+Z 対象外） |
+| `add_caption` | 字幕エディタの一覧に 1 件追加する（タイムラインへは `apply_captions` で反映） | なし（Ctrl+Z 対象外） |
+| `apply_captions` | 字幕エディタの字幕を V1 の 1 語字幕オーバーレイとしてタイムラインへ適用する（既存の生成済み 1 語字幕は置き換え） | あり（タイムライン側のみ。字幕エディタの一覧は戻らない） |
 | `set_playhead` | 再生ヘッドを移動する | なし |
 | `undo` | 直前の編集を元に戻す | なし |
 | `redo` | 元に戻した編集をやり直す | なし |
+
+MCP サーバの自己テストは `--selftest=mcp` または `VEDITOR_MCP_SELFTEST=1` で実行できます（実装: `src/selftests/mcp_selftest.cpp`、ゲート G1..G80）。
 
 ---
 
@@ -306,7 +320,7 @@ All shortcuts are customizable via Edit > Keyboard Shortcuts.
 ## Testing
 
 Selftests are wired into the executable itself, dispatched via a single
-`kArgvSelftests[]` table in `src/main.cpp` (SSOT, 54 entries). Four entry
+`kArgvSelftests[]` table in `src/selftests/SelftestRegistry.cpp` (SSOT, 182 entries). Four entry
 points cover the routing matrix:
 
 ```bash
@@ -386,7 +400,7 @@ byte-equivalent and the selftest dispatch coherent:
 | `trackmatte::composite` | `src/trackmatte/` | Track matte (4 types) compositing, premul ARGB32 + QPainter SourceOver, byte-equivalent to matte-free path |
 | `clipgeom` | `src/clipgeom.h/cpp` | Clip geometry (scale/translate/rotation) anchored at layer center |
 | `libavcore` | `src/libavcore/` | In-process FFmpeg integration (Decode / Encode / Probe / VideoFilterGraph / Concat) replacing per-call ffmpeg.exe subprocess |
-| `kArgvSelftests` | `src/main.cpp` (anonymous ns) | Selftest dispatch table (54 entries × 5 fields: name / envVar / fn / needsQApp / description) |
+| `kArgvSelftests` | `src/selftests/SelftestRegistry.cpp` | Selftest dispatch table (182 entries × 5 fields: name / envVar / fn / needsQApp / description) |
 
 Architecture rationale: preview ≠ export was historically the #1 NLE
 parity bug source. The three rendering SSOTs (`tlrender` / `trackmatte` /
@@ -409,7 +423,8 @@ v-simple-editor/
 ├── scripts/
 │   └── realfootage_parity.sh    # Real-footage selftest harness
 └── src/
-    ├── main.cpp                 # Entry point + kArgvSelftests[] table + 54 selftest functions
+    ├── main.cpp                 # Entry point
+    ├── selftests/               # SelftestRegistry.{h,cpp} dispatcher + per-feature *Selftest.cpp files
     ├── libavcore/               # In-process FFmpeg (Decode/Encode/Probe/VideoFilterGraph/Concat)
     ├── MainWindow.h/cpp         # Main application window
     ├── VideoPlayer.h/cpp        # Video decode & preview
@@ -495,10 +510,10 @@ v-simple-editor/
 - [x] NLE Parity SSOT: `tlrender::renderFrameAt` (every export path) + `trackmatte::composite` (4 matte types) + `clipgeom` (transform parity)
 - [x] PRD-B series: `libavcore` in-process FFmpeg migration (h264_mf 8-bit / HDR10 subprocess fallback)
 - [x] Tracker Preset system: Motion / Planar with Registry + Dialog UX + ProjectFile persistence
-- [x] Selftest argv-switch SSOT: `kArgvSelftests[]` 54-entry table, `--selftest=<name>` + `VEDITOR_*_SELFTEST` + `--selftest={list,help,all}` + unknown-name guard
+- [x] Selftest argv-switch SSOT: `kArgvSelftests[]` 182-entry table in `src/selftests/SelftestRegistry.cpp`, `--selftest=<name>` + `VEDITOR_*_SELFTEST` + `--selftest={list,help,all}` + unknown-name guard
 - [x] CI workflow draft (`.github/workflows/selftest.yml`, `workflow_dispatch` only)
 - [ ] CI green run + auto trigger on push / PR
-- [ ] `src/main.cpp` split refactor (selftest functions → `src/selftests/`, dispatcher → SelftestRegistry module)
+- [x] `src/main.cpp` split refactor (selftest functions → `src/selftests/`, dispatcher → SelftestRegistry module)
 - [ ] CRLF → LF wholesale normalization (per repo-root `.gitattributes`)
 - [ ] Streaming pipeline real-authentication harness (YouTube / Vimeo / Twitch / X / Instagram currently no-op stub for CI)
 
