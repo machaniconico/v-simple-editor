@@ -754,7 +754,7 @@ void McpEditorTools::registerReadTools()
     }, {QStringLiteral("projectName"), QStringLiteral("width"),
         QStringLiteral("height"), QStringLiteral("fps"),
         QStringLiteral("durationSec"), QStringLiteral("playheadSec"),
-        QStringLiteral("videoTrackCount"), QStringLiteral("audioTrackCount")}));
+        QStringLiteral("videoTrackCount"), QStringLiteral("audioTrackCount")})));
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("get_frame"),
@@ -887,7 +887,7 @@ void McpEditorTools::registerReadTools()
         {QStringLiteral("base64Bytes"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}}
     }, {QStringLiteral("ok"), QStringLiteral("timeSec"),
         QStringLiteral("width"), QStringLiteral("height"),
-        QStringLiteral("byteSize"), QStringLiteral("base64Bytes")}));
+        QStringLiteral("byteSize"), QStringLiteral("base64Bytes")})));
 
     const QJsonObject exportStatusProperties{
         {QStringLiteral("jobId"), QJsonObject{
@@ -919,7 +919,7 @@ void McpEditorTools::registerReadTools()
         {QStringLiteral("outputPath"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
         {QStringLiteral("error"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}}
     }, {QStringLiteral("ok"), QStringLiteral("jobId"),
-        QStringLiteral("status"), QStringLiteral("progress")}));
+        QStringLiteral("status"), QStringLiteral("progress")})));
 
     const QJsonObject timelineProperties{
         {QStringLiteral("kind"), QJsonObject{
@@ -970,7 +970,7 @@ void McpEditorTools::registerReadTools()
             {QStringLiteral("type"), QStringLiteral("array")},
             {QStringLiteral("items"), trackOutputItemSchema()}
         }}
-    }, {}));
+    }, {})));
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("get_captions"),
@@ -1028,7 +1028,7 @@ void McpEditorTools::registerReadTools()
             {QStringLiteral("type"), QStringLiteral("array")},
             {QStringLiteral("items"), captionOutputItemSchema()}
         }}
-    }, {QStringLiteral("captions")}));
+    }, {QStringLiteral("captions")})));
 
     const QJsonObject commandProperties{
         {QStringLiteral("query"), QJsonObject{
@@ -1077,7 +1077,7 @@ void McpEditorTools::registerReadTools()
             {QStringLiteral("items"), commandOutputItemSchema()}
         }},
         {QStringLiteral("total"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}}
-    }, {QStringLiteral("commands"), QStringLiteral("total")}));
+    }, {QStringLiteral("commands"), QStringLiteral("total")})));
 }
 
 void McpEditorTools::registerWriteTools()

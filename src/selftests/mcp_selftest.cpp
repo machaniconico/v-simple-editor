@@ -1885,6 +1885,7 @@ int runMcpSelftest()
         g65 ? pass("G65 set_playhead seeks the player")
             : fail("G65 set_playhead seeks the player",
                    QStringLiteral("set_playhead did not synchronize the timeline and preview"));
+    }
 
     const QJsonObject commandListResponse = callProjectInfoTool(
         37, QStringLiteral("list_commands"), QJsonObject{});
