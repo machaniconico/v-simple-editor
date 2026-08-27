@@ -23,6 +23,7 @@
 #include "util/RcPause.h"
 
 #include <algorithm>
+#include <cmath>
 #include <functional>
 #include <limits>
 #include <utility>
@@ -3693,8 +3694,29 @@ void Timeline::applyDuckingFromTrack(int voiceTrackIdx,
     }
 }
 
-void Timeline::addClip(const QString &filePath)
+bool Timeline::importMedia(const QString &filePath,
+                           int requestedTrackIndex,
+                           double requestedStartSec,
+                           MediaImportResult *result,
+                           QString *err)
 {
+    if (result)
+        *result = MediaImportResult{};
+
+    const auto fail = [err](const QString &message) {
+        if (err)
+            *err = message;
+        return false;
+    };
+    const QFileInfo fileInfo(filePath);
+    if (!fileInfo.exists() || !fileInfo.isFile())
+        return fail(QStringLiteral("ファイルが見つかりません: %1").arg(filePath));
+    if (requestedTrackIndex < -1)
+        return fail(QStringLiteral("trackIndex must be non-negative"));
+    if (!std::isfinite(requestedStartSec) || requestedStartSec < -1.0) {
+        return fail(QStringLiteral("startSec must be non-negative"));
+    }
+
     AVFormatContext *fmt = nullptr;
     double duration = 0.0;
     // Phase 1e Win #11 — auto-proxy for heavy video sources. AV1 SW/HW
@@ -3805,7 +3827,16 @@ void Timeline::addClip(const QString &filePath)
 
     int videoTrackIdx = -1;
     int audioTrackIdx = -1;
-    if (placement == ImportPlacement::AppendToFirstTrack) {
+    if (requestedTrackIndex >= 0) {
+        // MCP は指定されたトラック番号をそのまま V/A のペアに使う。
+        // 片方だけ増やすとリンク済み素材が孤立するため、必要なら両方を同時に作る。
+        while (m_videoTracks.size() <= requestedTrackIndex)
+            addVideoTrack();
+        while (m_audioTracks.size() <= requestedTrackIndex)
+            addAudioTrack();
+        videoTrackIdx = requestedTrackIndex;
+        audioTrackIdx = requestedTrackIndex;
+    } else if (placement == ImportPlacement::AppendToFirstTrack) {
         // Extend the existing sequence: always V1/A1, appending after
         // whatever clips already live there. Create V1/A1 if the project
         // starts with zero tracks.
@@ -3844,6 +3875,37 @@ void Timeline::addClip(const QString &filePath)
     qInfo() << "Timeline::addClip routing video→V" << (videoTrackIdx + 1)
             << "audio→A" << (audioTrackIdx + 1)
             << "file=" << filePath;
+
+    auto trackEnd = [](const TimelineTrack *track) {
+        double end = 0.0;
+        if (!track)
+            return end;
+        for (const ClipInfo &existing : track->clips())
+            end += qMax(0.0, existing.leadInSec) + existing.effectiveDuration();
+        return end;
+    };
+    TimelineTrack *videoTrack = m_videoTracks.value(videoTrackIdx, nullptr);
+    TimelineTrack *audioTrack = m_audioTracks.value(audioTrackIdx, nullptr);
+    if (!videoTrack || !audioTrack)
+        return fail(QStringLiteral("取り込み先のトラックを準備できません"));
+
+    // 指定位置は空きへ正確に入れ、既存クリップと重なる要求は MCP から
+    // 黙って丸めない。startSec 省略時だけ対象トラック末尾へ追記する。
+    const double videoDropTime = requestedStartSec >= 0.0
+        ? requestedStartSec : trackEnd(videoTrack);
+    // MCP の指定トラックでは V/A を同じ linkGroup の一組として扱うため、
+    // startSec 省略時も音声だけ別の末尾へ置かず video の開始時刻を共有する。
+    // GUI の従来の自動トラック選択では、元の V/A 各トラック末尾規則を維持する。
+    const double audioDropTime = requestedTrackIndex >= 0
+        ? videoDropTime
+        : (requestedStartSec >= 0.0 ? requestedStartSec : trackEnd(audioTrack));
+    const double importDuration = qMax(0.0, clip.effectiveDuration());
+    const TimelineTrack::DropPlan videoPlan =
+        videoTrack->planDrop(videoDropTime, importDuration);
+    const TimelineTrack::DropPlan audioPlan =
+        audioTrack->planDrop(audioDropTime, importDuration);
+    if (!videoPlan.valid || !audioPlan.valid)
+        return fail(QStringLiteral("指定位置にクリップを配置できません"));
 
     // Auto-proxy dispatch — runs after the track index is settled so that
     // MultiTrackOnly mode can gate on V2-or-later. wantsAutoProxy was
@@ -3923,12 +3985,34 @@ void Timeline::addClip(const QString &filePath)
             clip.fitContain = true;
     }
 
-    if (videoTrackIdx >= 0 && videoTrackIdx < m_videoTracks.size())
-        m_videoTracks[videoTrackIdx]->addClip(clip);
-    if (audioTrackIdx >= 0 && audioTrackIdx < m_audioTracks.size())
-        m_audioTracks[audioTrackIdx]->addClip(clip);
+    // 取り込みも他の MCP 編集と同じく、snapshot を変更の直前に作る。
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    videoTrack->insertClipPreservingDownstream(videoPlan.insertIdx, clip,
+                                               videoPlan.newLeadIn);
+    audioTrack->insertClipPreservingDownstream(audioPlan.insertIdx, clip,
+                                               audioPlan.newLeadIn);
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
     saveUndoState("Add clip");
+    if (result) {
+        result->videoTrackIndex = videoTrackIdx;
+        result->videoClipIndex = videoPlan.insertIdx;
+        result->audioTrackIndex = audioTrackIdx;
+        result->audioClipIndex = audioPlan.insertIdx;
+        result->videoStartSec = videoDropTime;
+        result->audioStartSec = audioDropTime;
+        result->durationSec = importDuration;
+    }
     updateInfoLabel();
+    scheduleEmitSequenceChanged();
+    return true;
+}
+
+void Timeline::addClip(const QString &filePath)
+{
+    // GUI の従来経路も MCP と同じ取り込み実装を使い、配置・リンク・Undo が
+    // 別々に進化しないようにする。GUI 側は失敗理由を表示する契約を持たない。
+    importMedia(filePath);
 }
 
 void Timeline::splitAtPlayhead()
@@ -4324,127 +4408,393 @@ bool Timeline::moveClipByIndex(bool audio, int trackIndex, int clipIndex,
                                double newStartSec, double *settledStartSec,
                                QString *err)
 {
+    MoveClipResult result;
+    const bool valid = moveClipByIndex(audio, trackIndex, clipIndex, newStartSec,
+                                       trackIndex, &result, err);
+    if (settledStartSec)
+        *settledStartSec = result.actualStartSec;
+    return valid;
+}
+
+bool Timeline::moveClipByIndex(bool audio, int trackIndex, int clipIndex,
+                               double newStartSec, int newTrackIndex,
+                               MoveClipResult *result, QString *err)
+{
+    MoveClipResult localResult;
+    MoveClipResult &moveResult = result ? *result : localResult;
+    moveResult = MoveClipResult{};
+
     if (!std::isfinite(newStartSec) || newStartSec < 0.0)
         return setTimelineEditError(err, QStringLiteral("newStartSec must be non-negative"));
 
-    TimelineTrack *selectedTrack = trackAt(audio, trackIndex);
-    if (!selectedTrack)
+    TimelineTrack *sourceTrack = trackAt(audio, trackIndex);
+    if (!sourceTrack)
         return setTimelineEditError(err, QStringLiteral("track index is out of range"));
-    if (clipIndex < 0 || clipIndex >= selectedTrack->clipCount())
+    if (clipIndex < 0 || clipIndex >= sourceTrack->clipCount())
         return setTimelineEditError(err, QStringLiteral("clip index is out of range"));
-    if (selectedTrack->isLocked())
+    TimelineTrack *destinationTrack = trackAt(audio, newTrackIndex);
+    if (!destinationTrack)
+        return setTimelineEditError(err, QStringLiteral("newTrackIndex is out of range"));
+    if (sourceTrack->isLocked() || destinationTrack->isLocked())
         return setTimelineEditError(err, QStringLiteral("track is locked"));
+    struct MovingMember {
+        TimelineTrack *sourceTrack = nullptr;
+        TimelineTrack *destinationTrack = nullptr;
+        int sourceIndex = -1;
+        int insertedIndex = -1;
+        ClipInfo clip;
+        double originalStartSec = 0.0;
+        double desiredStartSec = 0.0;
+        double actualStartSec = 0.0;
+    };
 
-    const int linkGroup = selectedTrack->clips().at(clipIndex).linkGroup;
     const QVector<TimelineTrack *> tracks = timelineTracks(this);
-    QVector<IndexEditTarget> targets;
+    const auto sameClipIdentity = [](const ClipInfo &left, const ClipInfo &right) {
+        return left.filePath == right.filePath
+            && left.linkGroup == right.linkGroup
+            && qFuzzyCompare(left.inPoint + 1.0, right.inPoint + 1.0);
+    };
+
+    struct SelectionReference {
+        TimelineTrack *track = nullptr;
+        int clipIndex = -1;
+        ClipInfo clip;
+        int occurrence = 0;
+    };
+    SelectionReference selection;
+    // 並べ替えで index が変わっても、移動対象でない選択を同じクリップへ
+    // 戻せるように、GUI が保持する主選択を移動前に記録する。
     for (TimelineTrack *track : tracks) {
         if (!track)
             continue;
-        for (int i = 0; i < track->clipCount(); ++i) {
-            if ((linkGroup > 0 && track->clips().at(i).linkGroup != linkGroup)
-                || (linkGroup <= 0 && (track != selectedTrack || i != clipIndex))) {
+        const int selectedIndex = track->selectedClip();
+        if (selectedIndex < 0 || selectedIndex >= track->clipCount())
+            continue;
+        selection.track = track;
+        selection.clipIndex = selectedIndex;
+        selection.clip = track->clips().at(selectedIndex);
+        for (int i = 0; i < selectedIndex; ++i) {
+            if (sameClipIdentity(track->clips().at(i), selection.clip))
+                ++selection.occurrence;
+        }
+        break;
+    }
+
+    const int linkGroup = sourceTrack->clips().at(clipIndex).linkGroup;
+    QVector<MovingMember> members;
+    for (TimelineTrack *track : tracks) {
+        if (!track)
+            continue;
+        for (int index = 0; index < track->clipCount(); ++index) {
+            const bool isSelectedClip = track == sourceTrack && index == clipIndex;
+            const bool isLinkedClip = linkGroup > 0
+                && track->clips().at(index).linkGroup == linkGroup;
+            if (!isSelectedClip && !isLinkedClip)
                 continue;
-            }
-            double start = 0.0;
-            double end = 0.0;
-            if (!trackClipTimeRangeAt(track, i, &start, &end)
-                || !std::isfinite(start) || !std::isfinite(end)) {
+
+            double startSec = 0.0;
+            double endSec = 0.0;
+            if (!trackClipTimeRangeAt(track, index, &startSec, &endSec)
+                || !std::isfinite(startSec) || !std::isfinite(endSec)) {
                 return setTimelineEditError(err, QStringLiteral("clip has no valid duration"));
             }
             if (track->isLocked())
                 return setTimelineEditError(err, QStringLiteral("track is locked"));
-            targets.append(IndexEditTarget{track, i, start, end, 0.0});
+            members.append(MovingMember{
+                track, nullptr, index, -1, track->clips().at(index),
+                startSec, newStartSec + (startSec - 0.0), 0.0
+            });
         }
     }
+    if (members.isEmpty())
+        return setTimelineEditError(err, QStringLiteral("clip could not be found"));
 
-    double minimumDelta = -std::numeric_limits<double>::infinity();
-    double maximumDelta = std::numeric_limits<double>::infinity();
-    for (IndexEditTarget &target : targets) {
-        const QVector<ClipInfo> &clips = target.track->clips();
-        double cursor = 0.0;
-        double previousEnd = 0.0;
-        double nextStart = std::numeric_limits<double>::infinity();
-        for (int i = 0; i < clips.size(); ++i) {
-            const double start = cursor + clips.at(i).leadInSec;
-            const double end = start + clips.at(i).effectiveDuration();
-            if (i == target.clipIndex) {
-                previousEnd = cursor;
-                if (i + 1 < clips.size())
-                    nextStart = end + clips.at(i + 1).leadInSec;
-                break;
-            }
-            cursor = end;
-        }
-        minimumDelta = qMax(minimumDelta, previousEnd - target.startSec);
-        if (std::isfinite(nextStart))
-            maximumDelta = qMin(maximumDelta, nextStart - target.endSec);
+    // リンク済み V/A は同じトラック番号へ移す。片方のトラックがまだ無い
+    // 場合は GUI のクロストラック移動と同じく空の相方トラックを作る。
+    bool needsOppositeTrack = false;
+    for (const MovingMember &member : members) {
+        const bool sameKind = member.sourceTrack->isAudioTrack() == audio;
+        needsOppositeTrack = needsOppositeTrack || !sameKind;
     }
-    if (minimumDelta > maximumDelta)
-        return setTimelineEditError(err, QStringLiteral("linked clips cannot move together"));
+    TimelineTrack *oppositeDestination = nullptr;
+    bool createOppositeTrack = false;
+    if (needsOppositeTrack) {
+        oppositeDestination = trackAt(!audio, newTrackIndex);
+        createOppositeTrack = !oppositeDestination;
+        if (oppositeDestination && oppositeDestination->isLocked())
+            return setTimelineEditError(err, QStringLiteral("track is locked"));
+    }
 
-    const IndexEditTarget &selectedTarget = *std::find_if(
-        targets.cbegin(), targets.cend(), [selectedTrack, clipIndex](const IndexEditTarget &target) {
-            return target.track == selectedTrack && target.clipIndex == clipIndex;
-        });
-    const double requestedDelta = newStartSec - selectedTarget.startSec;
-    const double delta = qBound(minimumDelta, requestedDelta, maximumDelta);
-    if (settledStartSec)
-        *settledStartSec = selectedTarget.startSec + delta;
+    int selectedMemberIndex = -1;
+    for (int i = 0; i < members.size(); ++i) {
+        MovingMember &member = members[i];
+        member.destinationTrack = member.sourceTrack->isAudioTrack() == audio
+            ? destinationTrack : oppositeDestination;
+        if (member.sourceTrack == sourceTrack && member.sourceIndex == clipIndex)
+            selectedMemberIndex = i;
+    }
+    if (selectedMemberIndex < 0)
+        return setTimelineEditError(err, QStringLiteral("clip could not be found"));
+    // members[0] is normally the selected clip, but do not rely on track order
+    // when calculating the linked V/A offset.
+    const double selectedOriginalStart = members[selectedMemberIndex].originalStartSec;
+    for (MovingMember &member : members)
+        member.desiredStartSec = newStartSec
+            + (member.originalStartSec - selectedOriginalStart);
+
+    // 対象トラックも開始時刻も変わらない要求は、後続クリップを一旦外した
+    // シミュレーションで誤って「重なり」と判定しない。特に先頭クリップに
+    // leadInSec がある場合、対象を除くと次のクリップが左へ詰まるためである。
+    bool staysOnOriginalTracks = true;
+    for (const MovingMember &member : members) {
+        if (member.sourceTrack != member.destinationTrack
+            || qAbs(member.desiredStartSec - member.originalStartSec) > 1e-6) {
+            staysOnOriginalTracks = false;
+            break;
+        }
+    }
+    if (staysOnOriginalTracks) {
+        moveResult.actualStartSec = selectedOriginalStart;
+        moveResult.trackIndex = newTrackIndex;
+        moveResult.clipIndex = clipIndex;
+        return true;
+    }
 
     struct PendingTrack {
         TimelineTrack *track = nullptr;
         QVector<ClipInfo> clips;
-        bool changed = false;
+        QVector<int> memberIndices;
     };
     QVector<PendingTrack> pending;
-    for (TimelineTrack *track : tracks) {
-        QVector<int> affected;
-        for (const IndexEditTarget &target : targets) {
-            if (target.track == track)
-                affected.append(target.clipIndex);
+    auto ensurePending = [&pending](TimelineTrack *track) -> int {
+        for (int i = 0; i < pending.size(); ++i) {
+            if (pending[i].track == track)
+                return i;
         }
-        if (affected.isEmpty())
-            continue;
+        pending.append(PendingTrack{track, track ? track->clips() : QVector<ClipInfo>{},
+                                    QVector<int>{}});
+        return static_cast<int>(pending.size() - 1);
+    };
+    for (int i = 0; i < members.size(); ++i) {
+        const int sourcePlan = ensurePending(members[i].sourceTrack);
+        const int destinationPlan = ensurePending(members[i].destinationTrack);
+        pending[sourcePlan].memberIndices.append(i);
+        if (destinationPlan != sourcePlan)
+            pending[destinationPlan].memberIndices.append(i);
+    }
 
-        const QVector<ClipInfo> oldClips = track->clips();
-        QVector<double> starts(oldClips.size());
-        QVector<double> durations(oldClips.size());
+    // まず対象を外して残りを詰め、その配列へ要求時刻順に再挿入する。
+    // ここではまだ実トラックを書き換えないので、途中で重なりを検出しても
+    // タイムラインを変更せずに actualStartSec を計算できる。
+    for (PendingTrack &plan : pending) {
+        QVector<char> removed(plan.clips.size(), 0);
+        for (int memberIndex : plan.memberIndices) {
+            const MovingMember &member = members[memberIndex];
+            if (member.sourceTrack == plan.track
+                && member.sourceIndex >= 0 && member.sourceIndex < removed.size()) {
+                removed[member.sourceIndex] = 1;
+            }
+        }
+        QVector<ClipInfo> remaining;
+        remaining.reserve(plan.clips.size());
+        for (int i = 0; i < plan.clips.size(); ++i) {
+            if (!removed[i])
+                remaining.append(plan.clips.at(i));
+        }
+        plan.clips = remaining;
+        std::sort(plan.memberIndices.begin(), plan.memberIndices.end(),
+                  [&members](int left, int right) {
+                      return members[left].desiredStartSec
+                          < members[right].desiredStartSec;
+                  });
+    }
+
+    auto nearestAvailableStart = [](const QVector<ClipInfo> &clips,
+                                    double duration, double desired) {
+        constexpr double kEps = 1e-6;
         double cursor = 0.0;
-        for (int i = 0; i < oldClips.size(); ++i) {
-            starts[i] = cursor + oldClips.at(i).leadInSec;
-            durations[i] = oldClips.at(i).effectiveDuration();
-            cursor = starts[i] + durations[i];
+        double best = qMax(0.0, desired);
+        double bestDistance = std::numeric_limits<double>::infinity();
+        auto consider = [&](double lower, double upper) {
+            if (upper < lower - kEps)
+                return;
+            const double candidate = qBound(lower, desired, upper);
+            const double distance = qAbs(candidate - desired);
+            if (distance < bestDistance) {
+                best = candidate;
+                bestDistance = distance;
+            }
+        };
+        for (const ClipInfo &clip : clips) {
+            const double clipStart = cursor + qMax(0.0, clip.leadInSec);
+            const double clipDuration = qMax(0.0, clip.effectiveDuration());
+            // 境界への挿入は後続を右へ押し出す並べ替えとして許可する。
+            consider(clipStart, clipStart);
+            consider(cursor, clipStart - duration);
+            cursor = clipStart + clipDuration;
+        }
+        const double tailCandidate = qMax(cursor, desired);
+        if (qAbs(tailCandidate - desired) < bestDistance)
+            best = tailCandidate;
+        return best;
+    };
+
+    auto insertAtRequestedTime = [](PendingTrack &plan, MovingMember &member) {
+        constexpr double kEps = 1e-6;
+        const double duration = member.clip.effectiveDuration();
+        double cursor = 0.0;
+        for (int i = 0; i < plan.clips.size(); ++i) {
+            const double clipStart = cursor + qMax(0.0, plan.clips[i].leadInSec);
+            const double clipEnd = clipStart + qMax(0.0, plan.clips[i].effectiveDuration());
+            // 連続配置の境界は空き時間が無くても挿入位置として有効にする。
+            // 現在のクリップを一つ右へ押し出すことで、A/B/C の A を時刻 5
+            // に置くような並べ替えを可能にする。
+            if (qAbs(member.desiredStartSec - clipStart) <= kEps) {
+                ClipInfo inserted = member.clip;
+                inserted.leadInSec = qMax(0.0, member.desiredStartSec - cursor);
+                plan.clips.insert(i, inserted);
+                member.insertedIndex = i;
+                member.actualStartSec = cursor + inserted.leadInSec;
+                return true;
+            }
+            if (member.desiredStartSec + duration <= clipStart + kEps) {
+                ClipInfo inserted = member.clip;
+                inserted.leadInSec = qMax(0.0, member.desiredStartSec - cursor);
+                const double consumed = inserted.leadInSec + duration;
+                plan.clips.insert(i, inserted);
+                if (i + 1 < plan.clips.size())
+                    plan.clips[i + 1].leadInSec = qMax(
+                        0.0, plan.clips[i + 1].leadInSec - consumed);
+                member.insertedIndex = i;
+                member.actualStartSec = cursor + inserted.leadInSec;
+                return true;
+            }
+            if (member.desiredStartSec < clipEnd - kEps)
+                return false;
+            cursor = clipEnd;
         }
 
-        QVector<double> desiredStarts = starts;
-        for (int index : affected)
-            desiredStarts[index] += delta;
-        PendingTrack result{track, oldClips, false};
-        for (int i = 0; i < result.clips.size(); ++i) {
-            const double previousEnd = i == 0
-                ? 0.0 : desiredStarts[i - 1] + durations[i - 1];
-            const double leadIn = desiredStarts[i] - previousEnd;
-            if (!std::isfinite(leadIn) || leadIn < -1e-6)
-                return setTimelineEditError(err, QStringLiteral("linked clips cannot move together"));
-            result.clips[i].leadInSec = qMax(0.0, leadIn);
-            result.changed = result.changed
-                || qAbs(result.clips[i].leadInSec - oldClips.at(i).leadInSec) > 1e-6;
-        }
-        pending.append(std::move(result));
-    }
-
-    if (qAbs(delta) <= 1e-6) {
-        // A clamped no-op is still a valid request, but it must not create a
-        // meaningless undo entry.
+        ClipInfo inserted = member.clip;
+        inserted.leadInSec = qMax(0.0, member.desiredStartSec - cursor);
+        member.insertedIndex = plan.clips.size();
+        member.actualStartSec = cursor + inserted.leadInSec;
+        plan.clips.append(inserted);
         return true;
+    };
+
+    for (PendingTrack &plan : pending) {
+        const QVector<int> planMembers = plan.memberIndices;
+        for (int memberIndex : planMembers) {
+            MovingMember &member = members[memberIndex];
+            if (member.destinationTrack != plan.track)
+                continue;
+            if (!insertAtRequestedTime(plan, member)) {
+                const double nearest = nearestAvailableStart(
+                    plan.clips, qMax(0.0, member.clip.effectiveDuration()),
+                    member.desiredStartSec);
+                const double correction = nearest - member.desiredStartSec;
+                moveResult.actualStartSec = qMax(0.0, newStartSec + correction);
+                moveResult.trackIndex = newTrackIndex;
+                moveResult.clipIndex = -1;
+                moveResult.reason = QStringLiteral("指定位置は他のクリップと重なっています");
+                return true;
+            }
+        }
     }
+
+    MovingMember &selectedMember = members[selectedMemberIndex];
+    moveResult.actualStartSec = selectedMember.actualStartSec;
+    moveResult.trackIndex = newTrackIndex;
+    moveResult.clipIndex = selectedMember.insertedIndex;
+
+    bool changed = false;
+    for (const MovingMember &member : members) {
+        changed = changed || member.sourceTrack != member.destinationTrack
+            || member.insertedIndex != member.sourceIndex
+            || qAbs(member.actualStartSec - member.originalStartSec) > 1e-6;
+    }
+    if (!changed)
+        return true;
+
+    // 既存規約のスナップショットは、相方トラックを新設する場合も含めて
+    // 実トラックを変更する直前に取得する。
     const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
-    for (const PendingTrack &result : pending)
-        result.track->setClips(result.clips);
+    if (createOppositeTrack) {
+        // 相方トラックは要求位置のシミュレーションが成功した後で作る。
+        // 先に作ると、隣接クリップとの重なりで ok:false を返す場合にも
+        // 空トラックだけが残ってしまう。
+        if (audio) {
+            while (m_videoTracks.size() <= newTrackIndex)
+                addVideoTrack();
+            oppositeDestination = trackAt(false, newTrackIndex);
+        } else {
+            while (m_audioTracks.size() <= newTrackIndex)
+                addAudioTrack();
+            oppositeDestination = trackAt(true, newTrackIndex);
+        }
+        if (!oppositeDestination)
+            return setTimelineEditError(err, QStringLiteral("リンク先のトラックを準備できません"));
+        for (MovingMember &member : members) {
+            if (!member.destinationTrack)
+                member.destinationTrack = oppositeDestination;
+        }
+        for (PendingTrack &plan : pending) {
+            if (!plan.track)
+                plan.track = oppositeDestination;
+        }
+    }
+
+    TimelineTrack *selectionTrack = nullptr;
+    int selectionIndex = -1;
+    if (selection.track) {
+        for (const MovingMember &member : members) {
+            if (member.sourceTrack == selection.track
+                && member.sourceIndex == selection.clipIndex) {
+                selectionTrack = member.destinationTrack;
+                selectionIndex = member.insertedIndex;
+                break;
+            }
+        }
+        if (!selectionTrack) {
+            for (const PendingTrack &plan : pending) {
+                if (plan.track != selection.track)
+                    continue;
+                int occurrence = 0;
+                for (int i = 0; i < plan.clips.size(); ++i) {
+                    if (!sameClipIdentity(plan.clips.at(i), selection.clip))
+                        continue;
+                    if (occurrence == selection.occurrence) {
+                        selectionTrack = plan.track;
+                        selectionIndex = i;
+                        break;
+                    }
+                    ++occurrence;
+                }
+                break;
+            }
+        }
+        if (!selectionTrack && selection.clipIndex < selection.track->clipCount()) {
+            // このトラックが pending に含まれない場合は内容を変更していない。
+            selectionTrack = selection.track;
+            selectionIndex = selection.clipIndex;
+        }
+    }
+
+    // 既存規約: snapshotTrackClips -> 変更 -> remap*AfterMutation -> saveUndoState。
+    for (const PendingTrack &plan : pending)
+        plan.track->setClips(plan.clips);
     remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
     remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+    if (selectionTrack && selectionIndex >= 0
+        && selectionIndex < selectionTrack->clipCount()) {
+        // 選択中のクリップを動かした場合も、並べ替えで index だけ変わった
+        // クリップの場合も、GUI と同じく対象を選択し直す。リンク済み V/A
+        // は setSelectedClip の伝播に任せる。
+        clearAllSelections();
+        selectionTrack->setSelectedClip(selectionIndex);
+    }
     saveUndoState(QStringLiteral("Move clip (MCP)"));
+    moveResult.moved = true;
     updateInfoLabel();
     scheduleEmitSequenceChanged();
     return true;
@@ -7644,6 +7994,27 @@ void Timeline::clearAllSelections()
         // V3 sprint — track-aware overload, deselect path.
         emit clipSelectedOnTrack(-1, -1);
     }
+}
+
+bool Timeline::selectClipByIndex(bool audio, int trackIndex, int clipIndex, QString *err)
+{
+    if (trackIndex < 0 || !trackAt(audio, trackIndex))
+        return setTimelineEditError(err, QStringLiteral("track index is out of range"));
+    TimelineTrack *track = trackAt(audio, trackIndex);
+    if (clipIndex < 0 || clipIndex >= track->clipCount())
+        return setTimelineEditError(err, QStringLiteral("clip index is out of range"));
+
+    // GUI のクリックと同じく、先に全トラックを解除してから setSelectedClip
+    // を通す。これで linked V/A の選択伝播と clipSelectedOnTrack の通知も共通化できる。
+    clearAllSelections();
+    track->setSelectedClip(clipIndex);
+    return true;
+}
+
+void Timeline::clearSelection()
+{
+    clearAllSelections();
+    m_activeVideoTrackIndex = -1;
 }
 
 void Timeline::onTrackModified()

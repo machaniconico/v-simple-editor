@@ -6951,15 +6951,17 @@ void MainWindow::setupMenuBar()
         applyMenuHelpTooltips(prefSettings.value("showMenuHints", true).toBool());
     }
 
-    // --- お気に入り: build the registry of favoritable actions ---
-    // Walk every top-level menu (the お気に入り menu itself excluded) and
-    // register each direct, named, non-submenu action. The stable id is
-    // "<menuKey>.<index>" where menuKey comes from a fixed title→key map and
-    // index is the action's position among the favoritable actions in that
-    // menu. This sprint model only ever appends actions to a menu, so existing
-    // ids stay stable; the id is NEVER derived from the (translatable) text so
-    // the persisted favorites list survives UI-text changes. label / menuPath
-    // are display strings used only by FavoritesEditDialog for grouping.
+    // --- お気に入り: favoritable action のレジストリを構築 ---
+    // お気に入りメニューを除くトップレベルメニューを走査し、名前付きの
+    // 直接アクションだけを登録する。id は「<menuKey>.<index>」で、index は
+    // 各メニュー内の登録対象アクションの順番に依存する。そのためメニューの
+    // 途中にアクションを挿入すると、挿入位置以降の ID はずれる。既存ユーザー
+    // のお気に入り設定を壊さないため、ID の生成方式自体は変更しない。
+    // menuKey は固定のタイトル対応表から取り、表示文字列からは生成しない。
+    // これにより UI 文言の変更には耐えるが、メニュー構成の途中挿入には耐えない。
+    // 全トップレベルメニュー（お気に入りを除く）を対応表に登録して、異なる
+    // メニューが既定値 "menu" を共有しないようにし、生成 ID の一意性を保つ。
+    // label / menuPath は FavoritesEditDialog の表示・グルーピング専用である。
     {
         static const QHash<QString, QString> menuKeyByTitle = {
             {QStringLiteral("ファイル"),       QStringLiteral("file")},
@@ -6969,13 +6971,60 @@ void MainWindow::setupMenuBar()
             {QStringLiteral("挿入"),           QStringLiteral("insert")},
             {QStringLiteral("オーディオ"),     QStringLiteral("audio")},
             {QStringLiteral("マーカー"),       QStringLiteral("marker")},
+            {QStringLiteral("トリム"),         QStringLiteral("trim")},
             {QStringLiteral("エフェクト"),     QStringLiteral("effect")},
             {QStringLiteral("再生"),           QStringLiteral("playback")},
+            {QStringLiteral("検索"),           QStringLiteral("search")},
             {QStringLiteral("ツール"),         QStringLiteral("tools")},
             {QStringLiteral("配信向け"),       QStringLiteral("stream")},
             {QStringLiteral("コンポジション"), QStringLiteral("comp")},
             {QStringLiteral("ヘルプ"),         QStringLiteral("help")},
         };
+
+        // 省略記号だけでは判定できない既知のアクションを明示する。
+        // 例えばショートカット表記やファイル形式が末尾に続くダイアログ、
+        // 条件次第で QFileDialog を開く保存処理、終了処理はここで分類する。
+        // テーブルにないアクションは、末尾が "..." / "…" なら Blocking、
+        // それ以外は Safe と推定する。省略記号の慣習だけに依存しないための
+        // 明示テーブル + 既定推定の二段構えである。
+        static const QHash<QString, FavoritableActionRisk> explicitActionRisks = {
+            {QStringLiteral("終了(&Q)"), FavoritableActionRisk::Quit},
+            {QStringLiteral("プロジェクトを保存(&S)"), FavoritableActionRisk::Blocking},
+            {QStringLiteral("action_versioned_save"), FavoritableActionRisk::Blocking},
+            {QStringLiteral("スリップ..."), FavoritableActionRisk::Blocking},
+            {QStringLiteral("スライド..."), FavoritableActionRisk::Blocking},
+            {QStringLiteral("action_feature_search"), FavoritableActionRisk::Blocking},
+            {QStringLiteral("action_command_palette"), FavoritableActionRisk::Blocking},
+            {QStringLiteral("action_pptx_export"), FavoritableActionRisk::Blocking},
+            {QStringLiteral("action_asc_cdl_export"), FavoritableActionRisk::Blocking},
+            {QStringLiteral("調整レイヤー"), FavoritableActionRisk::Blocking},
+            {QStringLiteral("ソーステキスト keyframe"), FavoritableActionRisk::Blocking},
+            {QStringLiteral("自動カラー"), FavoritableActionRisk::Blocking},
+            {QStringLiteral("タイムラインギャップを詰める (Demo)"), FavoritableActionRisk::Blocking},
+            {QStringLiteral("再生ヘッドにマーカー追加"), FavoritableActionRisk::Blocking},
+            {QStringLiteral("画面録画を停止"), FavoritableActionRisk::Blocking},
+            {QStringLiteral("字幕トラックを生成・表示"), FavoritableActionRisk::Blocking},
+        };
+
+        const auto riskForAction = [](QAction *action) {
+            if (!action)
+                return FavoritableActionRisk::Safe;
+
+            auto objectRisk = explicitActionRisks.constFind(action->objectName());
+            if (objectRisk != explicitActionRisks.constEnd())
+                return objectRisk.value();
+
+            auto labelRisk = explicitActionRisks.constFind(action->text());
+            if (labelRisk != explicitActionRisks.constEnd())
+                return labelRisk.value();
+
+            const QString label = action->text().trimmed();
+            return label.endsWith(QStringLiteral("..."))
+                || label.endsWith(QStringLiteral("…"))
+                ? FavoritableActionRisk::Blocking
+                : FavoritableActionRisk::Safe;
+        };
+
         m_favoritableActions.clear();
         const QList<QAction *> topActions = menuBar()->actions();
         for (QAction *menuAct : topActions) {
@@ -7007,7 +7056,7 @@ void MainWindow::setupMenuBar()
                     continue; // widget actions (e.g. the LUT slider) etc.
                 const QString id = QStringLiteral("%1.%2").arg(menuKey).arg(index);
                 ++index;
-                m_favoritableActions.append({id, label, title, act});
+                m_favoritableActions.append({id, label, title, act, riskForAction(act)});
             }
         }
     }
@@ -8206,15 +8255,12 @@ void MainWindow::saveProject()
         return;
     }
 
-    ProjectData data;
-    populateProjectData(data);
-
-    if (ProjectFile::save(m_projectFilePath, data)) {
+    QString errorMessage;
+    if (saveProjectToPath(m_projectFilePath, &errorMessage))
         statusBar()->showMessage("Saved: " + m_projectFilePath);
-        updateTitle();
-    } else {
-        QMessageBox::critical(this, "Save Failed", "Could not save project file.");
-    }
+    else
+        QMessageBox::critical(this, "Save Failed", errorMessage.isEmpty()
+                              ? "Could not save project file." : errorMessage);
 }
 
 void MainWindow::saveProjectAs()
@@ -8222,8 +8268,12 @@ void MainWindow::saveProjectAs()
     QString filePath = QFileDialog::getSaveFileName(this, "Save Project As",
         m_projectConfig.name + ".veditor", ProjectFile::fileFilter());
     if (filePath.isEmpty()) return;
-    m_projectFilePath = filePath;
-    saveProject();
+    QString errorMessage;
+    if (saveProjectToPath(filePath, &errorMessage))
+        statusBar()->showMessage("Saved: " + m_projectFilePath);
+    else
+        QMessageBox::critical(this, "Save Failed", errorMessage.isEmpty()
+                              ? "Could not save project file." : errorMessage);
 }
 
 void MainWindow::openProject()
@@ -8232,14 +8282,69 @@ void MainWindow::openProject()
         QString(), ProjectFile::fileFilter());
     if (filePath.isEmpty()) return;
 
-    ProjectData data;
-    if (!ProjectFile::load(filePath, data)) {
-        QMessageBox::critical(this, "Open Failed", "Could not load project file.");
-        return;
+    QString errorMessage;
+    if (openProjectFromPath(filePath, &errorMessage))
+        statusBar()->showMessage("Opened: " + filePath);
+    else
+        QMessageBox::critical(this, "Open Failed", errorMessage.isEmpty()
+                              ? "Could not load project file." : errorMessage);
+}
+
+bool MainWindow::saveProjectToPath(const QString &filePath, QString *errorMessage)
+{
+    const QString path = filePath.trimmed();
+    if (path.isEmpty()) {
+        if (errorMessage)
+            *errorMessage = QStringLiteral("保存先のパスを指定してください");
+        return false;
+    }
+    if (!m_timeline) {
+        if (errorMessage)
+            *errorMessage = QStringLiteral("エディタを利用できません");
+        return false;
     }
 
-    applyLoadedProjectData(data, filePath);
-    statusBar()->showMessage("Opened: " + filePath);
+    ProjectData data;
+    populateProjectData(data);
+    if (!ProjectFile::save(path, data)) {
+        if (errorMessage)
+            *errorMessage = QStringLiteral("プロジェクトを保存できませんでした: %1").arg(path);
+        return false;
+    }
+
+    m_projectFilePath = path;
+    setWindowModified(false);
+    updateTitle();
+    return true;
+}
+
+bool MainWindow::openProjectFromPath(const QString &filePath, QString *errorMessage)
+{
+    const QString path = filePath.trimmed();
+    if (path.isEmpty()) {
+        if (errorMessage)
+            *errorMessage = QStringLiteral("プロジェクトのパスを指定してください");
+        return false;
+    }
+    const QFileInfo info(path);
+    if (!info.exists() || !info.isFile()) {
+        if (errorMessage)
+            *errorMessage = QStringLiteral("ファイルが見つかりません: %1").arg(path);
+        return false;
+    }
+
+    ProjectData data;
+    if (!ProjectFile::load(path, data)) {
+        if (errorMessage)
+            *errorMessage = QStringLiteral("プロジェクトを読み込めませんでした: %1").arg(path);
+        return false;
+    }
+
+    // MCP 経路では未保存変更を確認ダイアログなしで破棄し、指定されたプロジェクトを
+    // 開く。確認モーダルを出すと MCP 呼び出しが応答待ちのまま詰まるためである。
+    applyLoadedProjectData(data, path);
+    setWindowModified(false);
+    return true;
 }
 
 void MainWindow::openFile()

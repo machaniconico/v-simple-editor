@@ -17,6 +17,14 @@ QByteArray responseForRequest(bool notification, const QByteArray& response)
     return notification ? QByteArray() : response;
 }
 
+QJsonObject toolCallResult(const QJsonArray& content, bool isError)
+{
+    QJsonObject result;
+    result.insert(QStringLiteral("content"), content);
+    result.insert(QStringLiteral("isError"), isError);
+    return result;
+}
+
 QJsonObject toolCallResult(const QString& text, bool isError)
 {
     QJsonObject contentItem;
@@ -25,11 +33,7 @@ QJsonObject toolCallResult(const QString& text, bool isError)
 
     QJsonArray content;
     content.append(contentItem);
-
-    QJsonObject result;
-    result.insert(QStringLiteral("content"), content);
-    result.insert(QStringLiteral("isError"), isError);
-    return result;
+    return toolCallResult(content, isError);
 }
 
 } // namespace
@@ -128,8 +132,9 @@ QByteArray McpProtocol::handleMessage(const QByteArray& body) const
 
         bool found = false;
         QString error;
+        QJsonArray content;
         const QJsonObject toolResult = m_registry->callTool(
-            nameValue.toString(), arguments, &found, &error);
+            nameValue.toString(), arguments, &found, &error, &content);
         if (!found) {
             return responseForRequest(
                 notification,
@@ -144,7 +149,9 @@ QByteArray McpProtocol::handleMessage(const QByteArray& body) const
 
         const QString serializedResult = QString::fromUtf8(
             QJsonDocument(toolResult).toJson(QJsonDocument::Compact));
-        QJsonObject result = toolCallResult(serializedResult, false);
+        QJsonObject result = content.isEmpty()
+            ? toolCallResult(serializedResult, false)
+            : toolCallResult(content, false);
         result.insert(QStringLiteral("structuredContent"), toolResult);
         return responseForRequest(notification, makeResultResponse(id, result));
     }

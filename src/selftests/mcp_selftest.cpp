@@ -1,8 +1,14 @@
 #include <QEventLoop>
+#include <QElapsedTimer>
 #include <QHostAddress>
+#include <QImage>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QDir>
+#include <QFileInfo>
+#include <QTemporaryFile>
+#include <QTemporaryDir>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
 #include <QNetworkRequest>
@@ -11,8 +17,11 @@
 #include <QUrl>
 #include <QUrlQuery>
 #include <QStringList>
+#include <QSet>
 #include <QDebug>
+#include <QtGlobal>
 
+#include <cmath>
 #include <limits>
 #include <stdexcept>
 
@@ -23,6 +32,8 @@
 #include "../mcp/McpToolRegistry.h"
 #include "../AiChatDock.h"
 #include "../MainWindow.h"
+#include "../Timeline.h"
+#include "../UndoManager.h"
 
 namespace {
 
@@ -150,6 +161,12 @@ int runMcpSelftest()
         ++failed;
         qWarning().noquote() << "[mcp] FAIL" << name << ":" << message;
     };
+    auto toolResult = [](const QJsonObject& response) {
+        return response.value(QStringLiteral("result")).toObject();
+    };
+    auto toolPayload = [&toolResult](const QJsonObject& response) {
+        return toolResult(response).value(QStringLiteral("structuredContent")).toObject();
+    };
 
     mcp::McpToolRegistry registry;
     QJsonObject schema;
@@ -182,6 +199,22 @@ int runMcpSelftest()
         schema,
         [](const QJsonObject&, QString*) -> QJsonObject {
             throw std::runtime_error("expected exception");
+        }
+    });
+    registry.registerTool({
+        QStringLiteral("image-tool"),
+        QStringLiteral("Returns image content"),
+        schema,
+        {},
+        [](const QJsonObject&, QString*, QJsonArray* content) {
+            if (content) {
+                content->append(QJsonObject{
+                    {QStringLiteral("type"), QStringLiteral("image")},
+                    {QStringLiteral("data"), QStringLiteral("aGVsbG8=")},
+                    {QStringLiteral("mimeType"), QStringLiteral("image/png")}
+                });
+            }
+            return QJsonObject{{QStringLiteral("ok"), true}};
         }
     });
 
@@ -254,7 +287,7 @@ int runMcpSelftest()
         rpcRequest(4, QStringLiteral("tools/call"), callParams))));
     const QJsonObject successResult = successCall.value(QStringLiteral("result")).toObject();
     const bool g7 = !successResult.value(QStringLiteral("isError")).toBool(true)
-        && successResult.value(QStringLiteral("structuredContent")).toObject()
+        && toolPayload(successCall)
             .value(QStringLiteral("value")).toInt() == 42;
     g7 ? pass("G7 successful tool call")
        : fail("G7 successful tool call", QStringLiteral("structured result was not preserved"));
@@ -287,6 +320,28 @@ int runMcpSelftest()
         .value(QStringLiteral("isError")).toBool(false);
     g10 ? pass("G10 throwing handler is contained")
         : fail("G10 throwing handler is contained", QStringLiteral("exception escaped"));
+
+    const QJsonObject imageCall = parseObject(protocol.handleMessage(compact(
+        rpcRequest(70, QStringLiteral("tools/call"), QJsonObject{
+            {QStringLiteral("name"), QStringLiteral("image-tool")},
+            {QStringLiteral("arguments"), QJsonObject{}}
+        }))));
+    const QJsonObject imageResult = toolResult(imageCall);
+    const QJsonArray imageContent = imageResult.value(QStringLiteral("content"))
+        .toArray();
+    const QJsonObject imageItem = imageContent.isEmpty()
+        ? QJsonObject() : imageContent.first().toObject();
+    const QJsonObject imagePayload = toolPayload(imageCall);
+    const bool g10Image = !imageResult.value(QStringLiteral("isError")).toBool(true)
+        && imageContent.size() == 1
+        && imageItem.value(QStringLiteral("type")).toString() == QStringLiteral("image")
+        && imageItem.value(QStringLiteral("data")).toString() == QStringLiteral("aGVsbG8=")
+        && imageItem.value(QStringLiteral("mimeType")).toString()
+               == QStringLiteral("image/png")
+        && imagePayload.value(QStringLiteral("ok")).toBool(false);
+    g10Image ? pass("G10 image content result shape")
+             : fail("G10 image content result shape",
+                    QStringLiteral("image content was not emitted in MCP shape"));
 
     mcp::McpHttpServer server(&registry);
     const bool serverStarted = server.start();
@@ -379,6 +434,8 @@ int runMcpSelftest()
         .toObject().value(QStringLiteral("tools")).toArray();
     const QStringList expectedReadToolNames{
         QStringLiteral("get_project_info"),
+        QStringLiteral("get_frame"),
+        QStringLiteral("get_export_status"),
         QStringLiteral("get_timeline"),
         QStringLiteral("get_captions"),
         QStringLiteral("list_commands")
@@ -422,6 +479,12 @@ int runMcpSelftest()
     const QJsonArray writeTools = writeToolsList.value(QStringLiteral("result"))
         .toObject().value(QStringLiteral("tools")).toArray();
     const QStringList expectedWriteToolNames{
+        QStringLiteral("export_video"),
+        QStringLiteral("import_media"),
+        QStringLiteral("save_project"),
+        QStringLiteral("open_project"),
+        QStringLiteral("select_clip"),
+        QStringLiteral("clear_selection"),
         QStringLiteral("run_command"),
         QStringLiteral("split_clip"),
         QStringLiteral("delete_clip"),
@@ -656,9 +719,7 @@ int runMcpSelftest()
                 {QStringLiteral("name"), QStringLiteral("get_project_info")},
                 {QStringLiteral("arguments"), QJsonObject{}}
             }))));
-    const QJsonObject projectInfoResult = projectInfoResponse
-        .value(QStringLiteral("result")).toObject()
-        .value(QStringLiteral("structuredContent")).toObject();
+    const QJsonObject projectInfoResult = toolPayload(projectInfoResponse);
     const bool g30 = !projectInfoResult.contains(QStringLiteral("hasUnsavedChanges"))
         || (projectInfoResult.value(QStringLiteral("hasUnsavedChanges")).isBool()
             && projectInfoResult.value(QStringLiteral("hasUnsavedChanges")).toBool()
@@ -666,6 +727,614 @@ int runMcpSelftest()
     g30 ? pass("G30 project unsaved state is truthful")
         : fail("G30 project unsaved state is truthful",
                QStringLiteral("hasUnsavedChanges was missing a boolean/state contract"));
+
+    projectInfoTools.registerWriteTools();
+    auto callProjectInfoTool = [&](int id, const QString& name,
+                                   const QJsonObject& arguments) {
+        return parseObject(projectInfoProtocol.handleMessage(compact(rpcRequest(
+            id, QStringLiteral("tools/call"), QJsonObject{
+                {QStringLiteral("name"), name},
+                {QStringLiteral("arguments"), arguments}
+            }))));
+    };
+    auto toolErrorText = [&toolResult](const QJsonObject& response) {
+        const QJsonArray content = toolResult(response)
+            .value(QStringLiteral("content")).toArray();
+        return content.isEmpty()
+            ? QString()
+            : content.first().toObject().value(QStringLiteral("text")).toString();
+    };
+
+    const QJsonObject saveWithoutPath = callProjectInfoTool(
+        42, QStringLiteral("save_project"), QJsonObject{});
+    const QJsonObject saveWithoutPathResult = toolResult(saveWithoutPath);
+    const bool g42 = saveWithoutPathResult.value(QStringLiteral("isError")).toBool(false)
+        && toolErrorText(saveWithoutPath)
+               == QStringLiteral("保存先のパスを指定してください");
+    g42 ? pass("G42 save without path is rejected non-interactively")
+        : fail("G42 save without path is rejected non-interactively",
+               QStringLiteral("save_project opened a dialog or returned a wrong error"));
+
+    Timeline *projectTimeline = projectInfoWindow.findChild<Timeline *>();
+    const QJsonObject missingImport = callProjectInfoTool(
+        43, QStringLiteral("import_media"), QJsonObject{
+            {QStringLiteral("filePath"),
+             QStringLiteral("/definitely/missing/mcp-selftest-media.mp4")}
+        });
+    const bool g43 = toolResult(missingImport).value(QStringLiteral("isError")).toBool(false)
+        && toolErrorText(missingImport)
+               == QStringLiteral("ファイルが見つかりません: /definitely/missing/mcp-selftest-media.mp4");
+    g43 ? pass("G43 missing media import is rejected")
+        : fail("G43 missing media import is rejected",
+               QStringLiteral("missing media was accepted or changed the error text"));
+
+    QTemporaryFile importSource;
+    const bool importSourceReady = importSource.open();
+    const int importVideoCountBefore = projectTimeline
+        && !projectTimeline->videoTracks().isEmpty()
+        && projectTimeline->videoTracks().first()
+        ? projectTimeline->videoTracks().first()->clipCount() : -1;
+    const int importAudioCountBefore = projectTimeline
+        && !projectTimeline->audioTracks().isEmpty()
+        && projectTimeline->audioTracks().first()
+        ? projectTimeline->audioTracks().first()->clipCount() : -1;
+    QJsonObject successfulImport;
+    if (importSourceReady) {
+        successfulImport = callProjectInfoTool(
+            44, QStringLiteral("import_media"), QJsonObject{
+                {QStringLiteral("filePath"), importSource.fileName()},
+                {QStringLiteral("trackIndex"), 0}
+            });
+    }
+    const QJsonObject successfulImportResult = toolPayload(successfulImport);
+    const int importVideoCountAfter = projectTimeline
+        && !projectTimeline->videoTracks().isEmpty()
+        && projectTimeline->videoTracks().first()
+        ? projectTimeline->videoTracks().first()->clipCount() : -1;
+    const int importAudioCountAfter = projectTimeline
+        && !projectTimeline->audioTracks().isEmpty()
+        && projectTimeline->audioTracks().first()
+        ? projectTimeline->audioTracks().first()->clipCount() : -1;
+    const QJsonArray importedClips = successfulImportResult
+        .value(QStringLiteral("clips")).toArray();
+    bool importResponseFields = !importedClips.isEmpty();
+    for (const QJsonValue &value : importedClips) {
+        const QJsonObject clip = value.toObject();
+        importResponseFields = importResponseFields
+            && clip.value(QStringLiteral("kind")).isString()
+            && clip.value(QStringLiteral("trackIndex")).isDouble()
+            && clip.value(QStringLiteral("clipIndex")).isDouble()
+            && clip.value(QStringLiteral("startSec")).isDouble()
+            && clip.value(QStringLiteral("durationSec")).isDouble();
+    }
+    bool importUndoRestored = false;
+    if (successfulImportResult.value(QStringLiteral("ok")).toBool(false)) {
+        const QJsonObject importUndo = callProjectInfoTool(
+            45, QStringLiteral("undo"), QJsonObject{});
+        const QJsonObject importUndoResult = toolPayload(importUndo);
+        const int importVideoCountUndo = projectTimeline
+            && !projectTimeline->videoTracks().isEmpty()
+            && projectTimeline->videoTracks().first()
+            ? projectTimeline->videoTracks().first()->clipCount() : -1;
+        const int importAudioCountUndo = projectTimeline
+            && !projectTimeline->audioTracks().isEmpty()
+            && projectTimeline->audioTracks().first()
+            ? projectTimeline->audioTracks().first()->clipCount() : -1;
+        importUndoRestored = importUndoResult.value(QStringLiteral("ok")).toBool(false)
+            && importVideoCountUndo == importVideoCountBefore
+            && importAudioCountUndo == importAudioCountBefore;
+    }
+    const bool g44 = importSourceReady
+        && successfulImportResult.value(QStringLiteral("ok")).toBool(false)
+        && importResponseFields
+        && importVideoCountAfter == importVideoCountBefore + 1
+        && importAudioCountAfter == importAudioCountBefore + 1
+        && importUndoRestored;
+    g44 ? pass("G44 media import and one-step undo")
+        : fail("G44 media import and one-step undo",
+               QStringLiteral("import count, response fields, or undo restoration is wrong"));
+
+    auto makeTestClip = [](const QString &name, int linkGroup) {
+        ClipInfo clip;
+        clip.filePath = name;
+        clip.displayName = name;
+        clip.duration = 5.0;
+        clip.outPoint = 5.0;
+        clip.linkGroup = linkGroup;
+        return clip;
+    };
+    const bool timelineReady = projectTimeline
+        && !projectTimeline->videoTracks().isEmpty()
+        && !projectTimeline->audioTracks().isEmpty()
+        && projectTimeline->videoTracks().first()
+        && projectTimeline->audioTracks().first();
+    if (timelineReady) {
+        TimelineTrack *video0 = projectTimeline->videoTracks().first();
+        TimelineTrack *audio0 = projectTimeline->audioTracks().first();
+        const ClipInfo selectedVideo = makeTestClip(QStringLiteral("selected-video"), 777);
+        ClipInfo selectedAudio = selectedVideo;
+        selectedAudio.filePath = QStringLiteral("selected-audio");
+        selectedAudio.displayName = QStringLiteral("selected-audio");
+        video0->setClips(QVector<ClipInfo>{selectedVideo});
+        audio0->setClips(QVector<ClipInfo>{selectedAudio});
+        projectTimeline->clearSelection();
+
+        const QJsonObject invalidSelect = callProjectInfoTool(
+            46, QStringLiteral("select_clip"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 99}
+            });
+        const bool invalidSelectRejected = toolResult(invalidSelect)
+            .value(QStringLiteral("isError")).toBool(false)
+            && video0->selectedClip() < 0
+            && audio0->selectedClip() < 0;
+        invalidSelectRejected
+            ? pass("G45 select_clip rejects out-of-range index")
+            : fail("G45 select_clip rejects out-of-range index",
+                   QStringLiteral("invalid selection changed state or was accepted"));
+
+        const QJsonObject selectResponse = callProjectInfoTool(
+            47, QStringLiteral("select_clip"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 0}
+            });
+        const QJsonObject selectResult = toolPayload(selectResponse);
+        const QJsonObject selectionTimelineResponse = callProjectInfoTool(
+            48, QStringLiteral("get_timeline"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("all")}
+            });
+        const QJsonObject selectionTimeline = toolPayload(selectionTimelineResponse);
+        auto hasSelectedClip = [](const QJsonArray &tracks) {
+            for (const QJsonValue &trackValue : tracks) {
+                for (const QJsonValue &clipValue : trackValue.toObject()
+                         .value(QStringLiteral("clips")).toArray()) {
+                    if (clipValue.toObject().value(QStringLiteral("selected")).toBool(false))
+                        return true;
+                }
+            }
+            return false;
+        };
+        const bool videoSelectedInJson = hasSelectedClip(
+            selectionTimeline.value(QStringLiteral("video")).toArray());
+        const bool audioSelectedInJson = hasSelectedClip(
+            selectionTimeline.value(QStringLiteral("audio")).toArray());
+        const bool selectStateSynchronized = video0->isClipSelected(0)
+            && audio0->isClipSelected(0)
+            && projectInfoWindow.selectedVideoTrackIndex() == 0
+            && projectInfoWindow.selectedVideoClipIndexTracked() == 0
+            && videoSelectedInJson && audioSelectedInJson;
+        const bool g46 = selectResult.value(QStringLiteral("ok")).toBool(false)
+            && selectStateSynchronized;
+        g46 ? pass("G46 select_clip synchronizes Timeline and MainWindow")
+            : fail("G46 select_clip synchronizes Timeline and MainWindow",
+                   QStringLiteral("selection was not synchronized across all state holders"));
+
+        const QJsonObject invalidAfterSelect = callProjectInfoTool(
+            49, QStringLiteral("select_clip"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 5}
+            });
+        const bool g47 = toolResult(invalidAfterSelect)
+            .value(QStringLiteral("isError")).toBool(false)
+            && video0->isClipSelected(0) && audio0->isClipSelected(0)
+            && projectInfoWindow.selectedVideoTrackIndex() == 0
+            && projectInfoWindow.selectedVideoClipIndexTracked() == 0;
+        g47 ? pass("G47 invalid selection preserves existing selection")
+            : fail("G47 invalid selection preserves existing selection",
+                   QStringLiteral("existing selection was changed by invalid input"));
+
+        const QJsonObject clearResponse = callProjectInfoTool(
+            50, QStringLiteral("clear_selection"), QJsonObject{});
+        const bool g48 = toolPayload(clearResponse).value(QStringLiteral("ok")).toBool(false)
+            && video0->selectedClip() < 0 && audio0->selectedClip() < 0
+            && projectInfoWindow.selectedVideoTrackIndex() == -1
+            && projectInfoWindow.selectedVideoClipIndexTracked() == -1;
+        g48 ? pass("G48 clear_selection clears both state holders")
+            : fail("G48 clear_selection clears both state holders",
+                   QStringLiteral("selection remained in Timeline or MainWindow"));
+        while (projectTimeline->videoTrackCount() < 2)
+            projectTimeline->addVideoTrack();
+        while (projectTimeline->audioTrackCount() < 2)
+            projectTimeline->addAudioTrack();
+        TimelineTrack *video1 = projectTimeline->videoTracks().at(1);
+        TimelineTrack *audio1 = projectTimeline->audioTracks().at(1);
+        auto saveTestUndoBaseline = [&]() {
+            projectTimeline->undoManager()->clear();
+            projectTimeline->undoManager()->saveState(
+                projectTimeline->currentState(), QStringLiteral("MCP selftest baseline"));
+        };
+
+        video0->setClips(QVector<ClipInfo>{
+            makeTestClip(QStringLiteral("A"), 0),
+            makeTestClip(QStringLiteral("B"), 0),
+            makeTestClip(QStringLiteral("C"), 0)
+        });
+        video1->setClips(QVector<ClipInfo>{});
+        audio0->setClips(QVector<ClipInfo>{});
+        audio1->setClips(QVector<ClipInfo>{});
+        projectTimeline->clearSelection();
+        saveTestUndoBaseline();
+        const QJsonObject reorderResponse = callProjectInfoTool(
+            51, QStringLiteral("move_clip"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 0},
+                {QStringLiteral("newStartSec"), 5.0}
+            });
+        const QJsonObject reorderResult = toolPayload(reorderResponse);
+        const bool reorderSucceeded = reorderResult.value(QStringLiteral("ok")).toBool(false)
+            && reorderResult.value(QStringLiteral("actualStartSec")).toDouble(-1.0) == 5.0
+            && video0->clipCount() == 3
+            && video0->clips().at(0).displayName == QStringLiteral("B")
+            && video0->clips().at(1).displayName == QStringLiteral("A")
+            && video0->clips().at(2).displayName == QStringLiteral("C");
+        const QJsonObject reorderUndo = callProjectInfoTool(
+            52, QStringLiteral("undo"), QJsonObject{});
+        const bool reorderUndoSucceeded = toolPayload(reorderUndo)
+            .value(QStringLiteral("ok")).toBool(false)
+            && video0->clips().at(0).displayName == QStringLiteral("A")
+            && video0->clips().at(1).displayName == QStringLiteral("B")
+            && video0->clips().at(2).displayName == QStringLiteral("C");
+        const bool g49 = reorderSucceeded && reorderUndoSucceeded;
+        g49 ? pass("G49 continuous clips can be reordered and undone")
+            : fail("G49 continuous clips can be reordered and undone",
+                   QStringLiteral("move_clip did not reorder or undo in one step"));
+
+        video0->setClips(QVector<ClipInfo>{
+            makeTestClip(QStringLiteral("blocked-A"), 0),
+            makeTestClip(QStringLiteral("blocked-B"), 0)
+        });
+        saveTestUndoBaseline();
+        const QJsonObject blockedResponse = callProjectInfoTool(
+            53, QStringLiteral("move_clip"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 0},
+                {QStringLiteral("newStartSec"), 2.0}
+            });
+        const QJsonObject blockedResult = toolPayload(blockedResponse);
+        const double actualBlockedStart = blockedResult
+            .value(QStringLiteral("actualStartSec")).toDouble(-1.0);
+        const bool g50 = !toolResult(blockedResponse).value(QStringLiteral("isError")).toBool(false)
+            && !blockedResult.value(QStringLiteral("ok")).toBool(true)
+            && std::isfinite(actualBlockedStart) && actualBlockedStart >= 0.0
+            && !blockedResult.value(QStringLiteral("reason")).toString().isEmpty()
+            && video0->clips().at(0).displayName == QStringLiteral("blocked-A")
+            && video0->clips().at(1).displayName == QStringLiteral("blocked-B");
+        g50 ? pass("G50 blocked move reports actual start and reason")
+            : fail("G50 blocked move reports actual start and reason",
+                   QStringLiteral("overlapping move was clamped, errored, or mutated clips"));
+
+        video0->setClips(QVector<ClipInfo>{makeTestClip(QStringLiteral("cross-track"), 0)});
+        video1->setClips(QVector<ClipInfo>{});
+        saveTestUndoBaseline();
+        const QJsonObject crossTrackResponse = callProjectInfoTool(
+            54, QStringLiteral("move_clip"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 0},
+                {QStringLiteral("newStartSec"), 0.0},
+                {QStringLiteral("newTrackIndex"), 1}
+            });
+        const QJsonObject crossTrackResult = toolPayload(crossTrackResponse);
+        const bool g51 = crossTrackResult.value(QStringLiteral("ok")).toBool(false)
+            && crossTrackResult.value(QStringLiteral("trackIndex")).toInt(-1) == 1
+            && video0->clipCount() == 0 && video1->clipCount() == 1
+            && video1->clips().first().displayName == QStringLiteral("cross-track");
+        g51 ? pass("G51 move_clip supports cross-track movement")
+            : fail("G51 move_clip supports cross-track movement",
+                   QStringLiteral("clip was not moved to the requested track"));
+
+        const ClipInfo linkedVideo = makeTestClip(QStringLiteral("linked-video"), 778);
+        ClipInfo linkedAudio = linkedVideo;
+        linkedAudio.filePath = QStringLiteral("linked-audio");
+        linkedAudio.displayName = QStringLiteral("linked-audio");
+        video0->setClips(QVector<ClipInfo>{linkedVideo});
+        video1->setClips(QVector<ClipInfo>{});
+        audio0->setClips(QVector<ClipInfo>{linkedAudio});
+        audio1->setClips(QVector<ClipInfo>{});
+        saveTestUndoBaseline();
+        const QJsonObject linkedMoveResponse = callProjectInfoTool(
+            55, QStringLiteral("move_clip"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 0},
+                {QStringLiteral("newStartSec"), 0.0},
+                {QStringLiteral("newTrackIndex"), 1}
+            });
+        const QJsonObject linkedMoveResult = toolPayload(linkedMoveResponse);
+        const bool g52 = linkedMoveResult.value(QStringLiteral("ok")).toBool(false)
+            && video0->clipCount() == 0 && video1->clipCount() == 1
+            && audio0->clipCount() == 0 && audio1->clipCount() == 1
+            && video1->clips().first().linkGroup == 778
+            && audio1->clips().first().linkGroup == 778;
+        g52 ? pass("G52 linked V/A clips move together")
+            : fail("G52 linked V/A clips move together",
+                   QStringLiteral("linked audio/video clips diverged during track move"));
+    }
+    if (!timelineReady) {
+        fail("G45-G52 editor timeline MCP behavior", QStringLiteral("Timeline was not available"));
+    }
+
+    // get_frame は実際に libav の動画デコーダを通るため、リポジトリの
+    // 実在する動画を import_media で V1/A1 に配置してから検証する。
+    const QString frameAssetPath = QDir::current().absoluteFilePath(
+        QStringLiteral("test_assets/e2e_clip.mp4"));
+    const QFileInfo frameAssetInfo(frameAssetPath);
+    const bool frameAssetReady = frameAssetInfo.exists()
+        && frameAssetInfo.isFile();
+    QJsonObject frameImportResponse;
+    if (frameAssetReady && timelineReady) {
+        frameImportResponse = callProjectInfoTool(
+            56, QStringLiteral("import_media"), QJsonObject{
+                {QStringLiteral("filePath"), frameAssetPath},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("startSec"), 0.0}
+            });
+    }
+    const QJsonObject frameImportEnvelope = toolResult(frameImportResponse);
+    const QJsonObject frameImportPayload = toolPayload(frameImportResponse);
+    const int frameVideoClipCount = timelineReady
+        ? projectTimeline->videoTracks().first()->clipCount() : -1;
+    const int frameAudioClipCount = timelineReady
+        ? projectTimeline->audioTracks().first()->clipCount() : -1;
+    const bool frameFixtureReady = frameAssetReady && timelineReady
+        && !frameImportEnvelope.value(QStringLiteral("isError")).toBool(true)
+        && frameImportPayload.value(QStringLiteral("ok")).toBool(false)
+        && frameImportPayload.value(QStringLiteral("clips")).toArray().size() == 2
+        && frameVideoClipCount == 1 && frameAudioClipCount == 1
+        && projectTimeline->videoTracks().first()->clips().first().filePath
+               == frameAssetPath
+        && projectTimeline->totalDuration() > 0.0;
+
+    const QJsonObject frameResponse = callProjectInfoTool(
+        57, QStringLiteral("get_frame"), QJsonObject{
+            {QStringLiteral("timeSec"), 0.0}
+        });
+    const QJsonObject frameEnvelope = toolResult(frameResponse);
+    const QJsonArray frameContent = frameEnvelope.value(QStringLiteral("content"))
+        .toArray();
+    const QJsonObject frameItem = frameContent.isEmpty()
+        ? QJsonObject() : frameContent.first().toObject();
+    const QJsonObject framePayload = toolPayload(frameResponse);
+    const QByteArray framePng = QByteArray::fromBase64(
+        frameItem.value(QStringLiteral("data")).toString().toLatin1());
+    QImage decodedFrame;
+    const bool frameDecoded = decodedFrame.loadFromData(framePng, "PNG");
+    const bool g53 = frameFixtureReady
+        && !frameEnvelope.value(QStringLiteral("isError")).toBool(true)
+        && frameContent.size() == 1
+        && frameItem.value(QStringLiteral("type")).toString() == QStringLiteral("image")
+        && frameItem.value(QStringLiteral("mimeType")).toString()
+               == QStringLiteral("image/png")
+        && frameDecoded && decodedFrame.width() > 0 && decodedFrame.height() > 0
+        && framePayload.value(QStringLiteral("ok")).toBool(false)
+        && framePayload.value(QStringLiteral("width")).toInt(-1) == decodedFrame.width()
+        && framePayload.value(QStringLiteral("height")).toInt(-1) == decodedFrame.height()
+        && framePayload.value(QStringLiteral("byteSize")).toInt(-1)
+               == framePng.size()
+        && QJsonDocument(frameResponse).toJson(QJsonDocument::Compact).size()
+               <= 1024 * 1024;
+    g53 ? pass("G53 get_frame returns decodable PNG image")
+        : fail("G53 get_frame returns decodable PNG image",
+               QStringLiteral("get_frame did not return a valid non-empty PNG"));
+
+    const QJsonObject narrowFrameResponse = callProjectInfoTool(
+        58, QStringLiteral("get_frame"), QJsonObject{
+            {QStringLiteral("timeSec"), 0.0},
+            {QStringLiteral("maxWidth"), 32}
+        });
+    const QJsonObject narrowFrameEnvelope = toolResult(narrowFrameResponse);
+    const QJsonArray narrowFrameContent = narrowFrameEnvelope
+        .value(QStringLiteral("content")).toArray();
+    const QJsonObject narrowFrameItem = narrowFrameContent.isEmpty()
+        ? QJsonObject() : narrowFrameContent.first().toObject();
+    const QJsonObject narrowFramePayload = toolPayload(narrowFrameResponse);
+    const QByteArray narrowFramePng = QByteArray::fromBase64(
+        narrowFrameItem.value(QStringLiteral("data")).toString().toLatin1());
+    QImage decodedNarrowFrame;
+    const bool narrowFrameDecoded = decodedNarrowFrame.loadFromData(
+        narrowFramePng, "PNG");
+    const bool g54 = g53
+        && !narrowFrameEnvelope.value(QStringLiteral("isError")).toBool(true)
+        && narrowFrameContent.size() == 1
+        && narrowFrameDecoded && decodedNarrowFrame.width() > 0
+        && decodedNarrowFrame.height() > 0
+        && decodedNarrowFrame.width() <= 32
+        && decodedNarrowFrame.width() < decodedFrame.width()
+        && narrowFramePayload.value(QStringLiteral("ok")).toBool(false)
+        && narrowFramePayload.value(QStringLiteral("width")).toInt(-1)
+               == decodedNarrowFrame.width()
+        && narrowFramePayload.value(QStringLiteral("height")).toInt(-1)
+               == decodedNarrowFrame.height();
+    g54 ? pass("G54 get_frame maxWidth shrinks image")
+        : fail("G54 get_frame maxWidth shrinks image",
+               QStringLiteral("maxWidth did not reduce the decoded frame width"));
+
+    QTemporaryDir exportRoot;
+    const bool exportRootReady = exportRoot.isValid();
+    QJsonObject missingParentResponse;
+    if (exportRootReady) {
+        missingParentResponse = callProjectInfoTool(
+            59, QStringLiteral("export_video"), QJsonObject{
+                {QStringLiteral("outputPath"),
+                 QDir(exportRoot.path()).filePath(
+                     QStringLiteral("missing-parent/output.mp4"))}
+            });
+    }
+    const QJsonObject missingParentEnvelope = toolResult(missingParentResponse);
+    const QJsonObject missingParentPayload = toolPayload(missingParentResponse);
+    const bool g55 = exportRootReady
+        && missingParentEnvelope.value(QStringLiteral("isError")).toBool(false)
+        && missingParentPayload.isEmpty();
+    g55 ? pass("G55 export_video rejects missing parent directory")
+        : fail("G55 export_video rejects missing parent directory",
+               QStringLiteral("an output path below a missing directory was accepted"));
+
+    const QString exportOutputPath = exportRootReady
+        ? QDir(exportRoot.path()).filePath(QStringLiteral("output.mp4"))
+        : QString();
+    QElapsedTimer exportTimer;
+    exportTimer.start();
+    QJsonObject exportResponse;
+    if (exportRootReady && timelineReady) {
+        exportResponse = callProjectInfoTool(
+            60, QStringLiteral("export_video"), QJsonObject{
+                {QStringLiteral("outputPath"), exportOutputPath}
+            });
+    }
+    const qint64 exportElapsedMs = exportTimer.elapsed();
+    const QJsonObject exportEnvelope = toolResult(exportResponse);
+    const QJsonObject exportPayload = toolPayload(exportResponse);
+    const QString exportJobId = exportPayload.value(QStringLiteral("jobId")).toString();
+    const bool g56 = exportRootReady && timelineReady
+        && !exportEnvelope.value(QStringLiteral("isError")).toBool(true)
+        && exportPayload.value(QStringLiteral("ok")).toBool(false)
+        && !exportJobId.isEmpty()
+        && exportPayload.value(QStringLiteral("status")).toString()
+               == QStringLiteral("queued")
+        && exportPayload.value(QStringLiteral("width")).toInt(-1)
+               == projectInfoResult.value(QStringLiteral("width")).toInt(-2)
+        && exportPayload.value(QStringLiteral("height")).toInt(-1)
+               == projectInfoResult.value(QStringLiteral("height")).toInt(-2)
+        && qFuzzyCompare(exportPayload.value(QStringLiteral("fps")).toDouble(-1.0),
+                         projectInfoResult.value(QStringLiteral("fps")).toDouble(-2.0))
+        && exportElapsedMs < 3000;
+    g56 ? pass("G56 export_video returns jobId without waiting")
+        : fail("G56 export_video returns jobId without waiting",
+               QStringLiteral("export_video did not return a queued job promptly"));
+
+    QJsonObject knownStatusResponse;
+    if (!exportJobId.isEmpty()) {
+        knownStatusResponse = callProjectInfoTool(
+            61, QStringLiteral("get_export_status"), QJsonObject{
+                {QStringLiteral("jobId"), exportJobId}
+            });
+    }
+    const QJsonObject knownStatusEnvelope = toolResult(knownStatusResponse);
+    const QJsonObject knownStatusPayload = toolPayload(knownStatusResponse);
+    const QSet<QString> validExportStatuses{
+        QStringLiteral("queued"), QStringLiteral("running"),
+        QStringLiteral("done"), QStringLiteral("failed")
+    };
+    const int knownProgress = knownStatusPayload.value(QStringLiteral("progress"))
+        .toInt(-1);
+    const bool g57 = g56
+        && !knownStatusEnvelope.value(QStringLiteral("isError")).toBool(true)
+        && knownStatusPayload.value(QStringLiteral("ok")).toBool(false)
+        && validExportStatuses.contains(
+               knownStatusPayload.value(QStringLiteral("status")).toString())
+        && knownProgress >= 0 && knownProgress <= 100;
+    g57 ? pass("G57 get_export_status returns job state")
+        : fail("G57 get_export_status returns job state",
+               QStringLiteral("the queued export status was not readable"));
+
+    const QJsonObject unknownStatusResponse = callProjectInfoTool(
+        62, QStringLiteral("get_export_status"), QJsonObject{
+            {QStringLiteral("jobId"), QStringLiteral("unknown-mcp-job")}
+        });
+    const QJsonObject unknownStatusEnvelope = toolResult(unknownStatusResponse);
+    const QJsonObject unknownStatusPayload = toolPayload(unknownStatusResponse);
+    const bool g58 = unknownStatusEnvelope.value(QStringLiteral("isError")).toBool(false)
+        && unknownStatusPayload.isEmpty();
+    g58 ? pass("G58 unknown export job is rejected")
+        : fail("G58 unknown export job is rejected",
+               QStringLiteral("an unknown jobId did not return isError"));
+
+    const QJsonObject commandListResponse = callProjectInfoTool(
+        37, QStringLiteral("list_commands"), QJsonObject{});
+    const QJsonObject commandListResult = toolPayload(commandListResponse);
+    const QJsonArray commands = commandListResult.value(QStringLiteral("commands")).toArray();
+    QSet<QString> commandIds;
+    const QSet<QString> validRisks{
+        QStringLiteral("safe"), QStringLiteral("blocking"), QStringLiteral("quit")
+    };
+    bool commandIdsUnique = true;
+    bool allRisksAssigned = true;
+    bool exitIsQuit = false;
+    bool searchMenuCommandFound = false;
+    QString blockingId;
+    QString quitId;
+    for (const QJsonValue& value : commands) {
+        const QJsonObject command = value.toObject();
+        const QString id = command.value(QStringLiteral("id")).toString();
+        const QString label = command.value(QStringLiteral("label")).toString();
+        const QString risk = command.value(QStringLiteral("risk")).toString();
+        commandIdsUnique = commandIdsUnique && !id.isEmpty() && !commandIds.contains(id);
+        commandIds.insert(id);
+        allRisksAssigned = allRisksAssigned && validRisks.contains(risk);
+        if (risk == QStringLiteral("blocking") && blockingId.isEmpty())
+            blockingId = id;
+        if (risk == QStringLiteral("quit"))
+            quitId = id;
+        if (label.startsWith(QStringLiteral("終了")))
+            exitIsQuit = risk == QStringLiteral("quit");
+        if (command.value(QStringLiteral("menuPath")).toString()
+                == QStringLiteral("検索")
+            && id.startsWith(QStringLiteral("search."))) {
+            searchMenuCommandFound = true;
+        }
+    }
+    const bool g37 = commandIdsUnique
+        && commandListResult.value(QStringLiteral("total")).toInt() == commands.size();
+    g37 ? pass("G37 list_commands IDs are unique")
+        : fail("G37 list_commands IDs are unique",
+               QStringLiteral("duplicate, empty, or missing command IDs were returned"));
+
+    const bool g38 = allRisksAssigned && !quitId.isEmpty() && exitIsQuit;
+    g38 ? pass("G38 command risks are assigned")
+        : fail("G38 command risks are assigned",
+               QStringLiteral("risk is missing/invalid or the exit action is not quit"));
+
+    QJsonObject blockingResponse;
+    if (!blockingId.isEmpty()) {
+        blockingResponse = callProjectInfoTool(
+            39, QStringLiteral("run_command"), QJsonObject{
+                {QStringLiteral("id"), blockingId}
+            });
+    }
+    const QJsonObject blockingResult = blockingResponse
+        .value(QStringLiteral("result")).toObject();
+    const QJsonArray blockingContent = blockingResult.value(QStringLiteral("content"))
+        .toArray();
+    const QString blockingErrorText = blockingContent.isEmpty()
+        ? QString()
+        : blockingContent.first().toObject().value(QStringLiteral("text")).toString();
+    const bool g39 = !blockingId.isEmpty()
+        && blockingResult.value(QStringLiteral("isError")).toBool(false)
+        && blockingErrorText.contains(QStringLiteral("allowBlocking:true"));
+    g39 ? pass("G39 blocking command is rejected by default")
+        : fail("G39 blocking command is rejected by default",
+               QStringLiteral("a blocking command was not rejected without allowBlocking"));
+
+    QJsonObject quitResponse;
+    if (!quitId.isEmpty()) {
+        quitResponse = callProjectInfoTool(
+            40, QStringLiteral("run_command"), QJsonObject{
+                {QStringLiteral("id"), quitId},
+                {QStringLiteral("allowBlocking"), true}
+            });
+    }
+    const QJsonObject quitResult = quitResponse.value(QStringLiteral("result")).toObject();
+    const QJsonArray quitContent = quitResult.value(QStringLiteral("content")).toArray();
+    const QString quitErrorText = quitContent.isEmpty()
+        ? QString()
+        : quitContent.first().toObject().value(QStringLiteral("text")).toString();
+    const bool g40 = !quitId.isEmpty()
+        && quitResult.value(QStringLiteral("isError")).toBool(false)
+        && quitErrorText
+               == QStringLiteral("このコマンドはエディタを終了させるため MCP からは実行できません。");
+    g40 ? pass("G40 quit command is always rejected")
+        : fail("G40 quit command is always rejected",
+               QStringLiteral("quit was accepted with allowBlocking"));
+
+    const bool g41 = searchMenuCommandFound;
+    g41 ? pass("G41 search menu command is listed")
+        : fail("G41 search menu command is listed",
+               QStringLiteral("the 検索 menu command was not returned by list_commands"));
 
     const QHash<QString, QJsonObject> nullWindowWriteArguments{
         {QStringLiteral("split_clip"), QJsonObject{

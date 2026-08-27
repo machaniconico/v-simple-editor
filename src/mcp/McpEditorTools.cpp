@@ -3,10 +3,18 @@
 #include "McpToolRegistry.h"
 #include "../CaptionEditorDialog.h"
 #include "../MainWindow.h"
+#include "../RenderQueue.h"
+#include "../TimelineFrameRenderer.h"
 #include "../Timeline.h"
 
 #include <QAction>
+#include <QBuffer>
+#include <QFileInfo>
+#include <QImage>
 #include <QJsonArray>
+#include <QPointer>
+#include <QTimer>
+#include <QUuid>
 #include <QStringList>
 #include <QtGlobal>
 
@@ -100,6 +108,17 @@ bool requiredFiniteNumber(const QJsonObject& args, const QString& name,
     return true;
 }
 
+bool finiteNumberForMcp(const QJsonObject& args, const QString& name,
+                        double* out, QString* err)
+{
+    const QJsonValue value = args.value(name);
+    if (!value.isDouble() || !std::isfinite(value.toDouble()))
+        return setError(err, QStringLiteral("%1 は有限な数で指定してください").arg(name));
+    if (out)
+        *out = value.toDouble();
+    return true;
+}
+
 bool nonNegativeInteger(const QJsonObject& args, const QString& name,
                         int defaultValue, int* out, QString* err)
 {
@@ -122,6 +141,63 @@ bool nonNegativeInteger(const QJsonObject& args, const QString& name,
         *out = static_cast<int>(number);
     return true;
 }
+
+bool positiveInteger(const QJsonObject& args, const QString& name,
+                     int defaultValue, int* out, QString* err)
+{
+    if (!args.contains(name)) {
+        if (out)
+            *out = defaultValue;
+        return true;
+    }
+
+    const QJsonValue value = args.value(name);
+    if (!value.isDouble())
+        return setError(err, QStringLiteral("%1 は正の整数で指定してください").arg(name));
+    const double number = value.toDouble();
+    if (!std::isfinite(number) || number <= 0.0
+        || std::floor(number) != number
+        || number > static_cast<double>(std::numeric_limits<int>::max())) {
+        return setError(err, QStringLiteral("%1 は正の整数で指定してください").arg(name));
+    }
+    if (out)
+        *out = static_cast<int>(number);
+    return true;
+}
+
+bool positiveFiniteNumber(const QJsonObject& args, const QString& name,
+                          double defaultValue, double* out, QString* err)
+{
+    if (!args.contains(name)) {
+        if (out)
+            *out = defaultValue;
+        return true;
+    }
+    double number = 0.0;
+    if (!finiteNumberForMcp(args, name, &number, err))
+        return false;
+    if (number <= 0.0)
+        return setError(err, QStringLiteral("%1 は 0 より大きい数で指定してください").arg(name));
+    if (out)
+        *out = number;
+    return true;
+}
+
+bool encodePng(const QImage& image, QByteArray* encoded)
+{
+    if (!encoded || image.isNull())
+        return false;
+    encoded->clear();
+    QBuffer buffer(encoded);
+    if (!buffer.open(QIODevice::WriteOnly))
+        return false;
+    return image.save(&buffer, "PNG");
+}
+
+constexpr int kDefaultFrameMaxWidth = 640;
+constexpr qsizetype kMaxFrameResponseBytes = 1024 * 1024;
+// JSON のキー・MCP envelope 分を予約し、base64 本体をこの上限内に収める。
+constexpr qsizetype kFrameResponseOverhead = 4096;
 
 struct ClipTarget {
     TimelineTrack* track = nullptr;
@@ -211,7 +287,21 @@ bool requiredString(const QJsonObject& args, const QString& name,
     return true;
 }
 
-QJsonObject clipToJson(const ClipInfo& clip, int clipIndex, double startSec)
+QString actionRiskToString(FavoritableActionRisk risk)
+{
+    switch (risk) {
+    case FavoritableActionRisk::Safe:
+        return QStringLiteral("safe");
+    case FavoritableActionRisk::Blocking:
+        return QStringLiteral("blocking");
+    case FavoritableActionRisk::Quit:
+        return QStringLiteral("quit");
+    }
+    return QStringLiteral("safe");
+}
+
+QJsonObject clipToJson(const ClipInfo& clip, int clipIndex, double startSec,
+                       bool selected)
 {
     const double outPoint = clip.outPoint > 0.0 ? clip.outPoint : clip.duration;
     const double durationSec = clip.speed > 0.0 ? clip.effectiveDuration() : 0.0;
@@ -226,24 +316,28 @@ QJsonObject clipToJson(const ClipInfo& clip, int clipIndex, double startSec)
         {QStringLiteral("speed"), clip.speed},
         {QStringLiteral("volume"), clip.volume},
         {QStringLiteral("opacity"), clip.opacity},
-        {QStringLiteral("linkGroup"), clip.linkGroup}
+        {QStringLiteral("linkGroup"), clip.linkGroup},
+        {QStringLiteral("selected"), selected}
     };
 }
 
-QJsonArray tracksToJson(const QVector<QVector<ClipInfo>>& tracks)
+QJsonArray tracksToJson(const QVector<TimelineTrack*>& tracks)
 {
     QJsonArray result;
     for (int trackIndex = 0; trackIndex < tracks.size(); ++trackIndex) {
         QJsonArray clips;
         double cursorSec = 0.0;
-        const QVector<ClipInfo>& track = tracks.at(trackIndex);
+        const TimelineTrack *trackObject = tracks.at(trackIndex);
+        const QVector<ClipInfo> emptyTrack;
+        const QVector<ClipInfo>& track = trackObject ? trackObject->clips() : emptyTrack;
         for (int clipIndex = 0; clipIndex < track.size(); ++clipIndex) {
             const ClipInfo& clip = track.at(clipIndex);
             // TimelineSequence::duration() and Timeline's placement logic both
             // treat leadInSec as a gap before the clip, then add effectiveDuration().
             // Therefore cursor + leadInSec is the absolute timeline start.
             cursorSec += clip.leadInSec;
-            clips.append(clipToJson(clip, clipIndex, cursorSec));
+            clips.append(clipToJson(clip, clipIndex, cursorSec,
+                                    trackObject && trackObject->isClipSelected(clipIndex)));
             cursorSec += clip.speed > 0.0 ? clip.effectiveDuration() : 0.0;
         }
         result.append(QJsonObject{
@@ -262,9 +356,155 @@ McpEditorTools::McpEditorTools(MainWindow* window, McpToolRegistry* registry)
 {
 }
 
+McpEditorTools::~McpEditorTools()
+{
+    // ハンドラのラムダは this を捕捉しているため、MainWindow が子の
+    // RenderQueue を破棄する前に接続を外してダングリング参照を残さない。
+    QObject::disconnect(m_exportProgressConnection);
+    QObject::disconnect(m_exportCompletedConnection);
+    m_observedRenderQueue = nullptr;
+}
+
 Timeline* McpEditorTools::timeline() const
 {
     return m_window ? m_window->m_timeline : nullptr;
+}
+
+RenderQueue* McpEditorTools::ensureRenderQueue(QString* err)
+{
+    if (!m_window)
+        return setError(err, QStringLiteral("editor not available")), nullptr;
+
+    if (!m_window->m_renderQueue)
+        m_window->m_renderQueue = new RenderQueue(m_window);
+    observeRenderQueue(m_window->m_renderQueue);
+    return m_window->m_renderQueue;
+}
+
+void McpEditorTools::observeRenderQueue(RenderQueue* queue)
+{
+    if (!queue || !m_window || m_observedRenderQueue == queue)
+        return;
+
+    QObject::disconnect(m_exportProgressConnection);
+    QObject::disconnect(m_exportCompletedConnection);
+    m_observedRenderQueue = queue;
+
+    // RenderQueue の進捗シグナルはワーカースレッドから届くことがあるため、
+    // MainWindow を context にして GUI スレッドで MCP 用スナップショットを更新する。
+    m_exportProgressConnection = QObject::connect(
+        queue, &RenderQueue::jobProgressUuid, m_window,
+        [this](const QString& jobId, int percent) {
+            ExportJobObservation& observation = m_exportJobObservations[jobId];
+            // 完了通知より遅れて届く進捗通知で、最終スナップショットを
+            // 99% などへ巻き戻さない。
+            if (observation.status == QStringLiteral("done")
+                || observation.status == QStringLiteral("failed"))
+                return;
+            observation.status = QStringLiteral("running");
+            observation.progress = qBound(0, percent, 100);
+        });
+    m_exportCompletedConnection = QObject::connect(
+        queue, &RenderQueue::jobCompletedUuid, m_window,
+        [this](const QString& jobId, bool success, const QString& error) {
+            ExportJobObservation& observation = m_exportJobObservations[jobId];
+            observation.status = success ? QStringLiteral("done")
+                                         : QStringLiteral("failed");
+            observation.progress = success ? 100 : qBound(0, observation.progress, 100);
+            observation.error = error;
+        });
+}
+
+QJsonObject McpEditorTools::exportStatus(const QString& jobId, QString* err)
+{
+    if (!m_window)
+        return setError(err, QStringLiteral("editor not available")), QJsonObject();
+
+    RenderQueue* queue = m_window->m_renderQueue;
+    if (queue) {
+        // status の照会でもシグナル監視を有効にする。MCP 以外から投入された
+        // RenderQueue ジョブも、照会開始後は同じ進捗スナップショットで返す。
+        observeRenderQueue(queue);
+
+        for (const RenderJob& job : queue->jobs()) {
+            if (job.uuid != jobId)
+                continue;
+
+            QString status;
+            switch (job.status) {
+            case RenderJobStatus::Pending:
+                status = QStringLiteral("queued");
+                break;
+            case RenderJobStatus::Rendering:
+                status = QStringLiteral("running");
+                break;
+            case RenderJobStatus::Completed:
+                status = QStringLiteral("done");
+                break;
+            case RenderJobStatus::Failed:
+            case RenderJobStatus::Cancelled:
+                status = QStringLiteral("failed");
+                break;
+            }
+
+            int progress = job.status == RenderJobStatus::Completed
+                ? 100 : qBound(0, job.progressPercent, 100);
+            const auto observation = m_exportJobObservations.constFind(jobId);
+            if (observation != m_exportJobObservations.constEnd()) {
+                if (status == QStringLiteral("running")
+                    || status == QStringLiteral("queued")) {
+                    progress = observation->progress;
+                } else if (status == QStringLiteral("done")) {
+                    progress = 100;
+                }
+            }
+
+            QJsonObject result{
+                {QStringLiteral("ok"), true},
+                {QStringLiteral("jobId"), jobId},
+                {QStringLiteral("status"), status},
+                {QStringLiteral("progress"), progress}
+            };
+            if (!job.outputPath.isEmpty())
+                result.insert(QStringLiteral("outputPath"), job.outputPath);
+            if (status == QStringLiteral("failed")) {
+                const QString jobError = !job.error.isEmpty()
+                    ? job.error : job.errorMessage;
+                if (!jobError.isEmpty())
+                    result.insert(QStringLiteral("error"), jobError);
+                else if (observation != m_exportJobObservations.constEnd()
+                         && !observation->error.isEmpty())
+                    result.insert(QStringLiteral("error"), observation->error);
+                else
+                    result.insert(QStringLiteral("error"),
+                                  QStringLiteral("書き出しに失敗しました"));
+            }
+            return result;
+        }
+    }
+
+    // RenderQueue の clearCompleted() などで完了ジョブ本体が片付けられても、
+    // MCP が観測した最終スナップショットは McpEditorTools の存続中保持する。
+    // したがって jobId の寿命は通常 MainWindow / プロセス終了までである。
+    const auto observation = m_exportJobObservations.constFind(jobId);
+    if (observation != m_exportJobObservations.constEnd()) {
+        QJsonObject result{
+            {QStringLiteral("ok"), true},
+            {QStringLiteral("jobId"), jobId},
+            {QStringLiteral("status"), observation->status},
+            {QStringLiteral("progress"), qBound(0, observation->progress, 100)}
+        };
+        if (observation->status == QStringLiteral("failed")
+            && !observation->error.isEmpty()) {
+            result.insert(QStringLiteral("error"), observation->error);
+        } else if (observation->status == QStringLiteral("failed")) {
+            result.insert(QStringLiteral("error"),
+                          QStringLiteral("書き出しに失敗しました"));
+        }
+        return result;
+    }
+
+    return setError(err, QStringLiteral("不明な jobId: %1").arg(jobId)), QJsonObject();
 }
 
 void McpEditorTools::registerReadTools()
@@ -312,6 +552,154 @@ void McpEditorTools::registerReadTools()
         }
     });
 
+    m_registry->registerTool({
+        QStringLiteral("get_frame"),
+        QStringLiteral("指定したタイムライン時刻の合成フレームを PNG 画像として返す。maxWidth 省略時は 640px 以下に縮小し、LLM のコンテキストを圧迫しないよう応答を 1MB 以内に抑える。"),
+        schemaWithRequired(QJsonObject{
+            {QStringLiteral("timeSec"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("number")}
+            }},
+            {QStringLiteral("maxWidth"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("integer")},
+                {QStringLiteral("minimum"), 1}
+            }}
+        }, {QStringLiteral("timeSec")}),
+        {},
+        [this](const QJsonObject& args, QString* err,
+               QJsonArray* content) -> QJsonObject {
+            if (!rejectUnknownArguments(args,
+                                        {QStringLiteral("timeSec"),
+                                         QStringLiteral("maxWidth")}, err))
+                return {};
+            if (!m_window || !timeline())
+                return setError(err, QStringLiteral("エディタまたはタイムラインを利用できません")),
+                       QJsonObject();
+            if (!content)
+                return setError(err, QStringLiteral("画像コンテンツの出力先を利用できません")),
+                       QJsonObject();
+
+            double timeSec = 0.0;
+            if (!args.contains(QStringLiteral("timeSec"))) {
+                if (err)
+                    *err = QStringLiteral("timeSec は必須です");
+                return {};
+            }
+            if (!finiteNumberForMcp(args, QStringLiteral("timeSec"),
+                                    &timeSec, err))
+                return {};
+
+            const double durationSec = qMax(0.0, timeline()->totalDuration());
+            // Timeline の終端は次のフレームが存在しない半開区間なので、
+            // 有効範囲を [0, duration) として終端も明示的に拒否する。
+            if (durationSec <= 0.0 || timeSec < 0.0 || timeSec >= durationSec) {
+                return setError(err,
+                                QStringLiteral("timeSec がタイムライン範囲外です: %1 (範囲 0-%2 未満)")
+                                    .arg(timeSec, 0, 'f', 6)
+                                    .arg(durationSec, 0, 'f', 6)),
+                       QJsonObject();
+            }
+
+            int maxWidth = kDefaultFrameMaxWidth;
+            if (!positiveInteger(args, QStringLiteral("maxWidth"),
+                                 kDefaultFrameMaxWidth, &maxWidth, err))
+                return {};
+
+            const int canvasWidth = qMax(1, m_window->m_projectConfig.width);
+            const int canvasHeight = qMax(1, m_window->m_projectConfig.height);
+            const int renderWidth = qMax(1, qMin(canvasWidth, maxWidth));
+            const int renderHeight = qMax(1, qRound(
+                static_cast<double>(canvasHeight) * renderWidth
+                / static_cast<double>(canvasWidth)));
+            const qint64 usec = qRound64(timeSec * 1'000'000.0);
+            QImage image = tlrender::renderFrameAt(
+                timeline(), usec, QSize(renderWidth, renderHeight));
+            if (image.isNull())
+                return setError(err, QStringLiteral("指定時刻のフレームをレンダリングできませんでした")),
+                       QJsonObject();
+            if (image.format() != QImage::Format_RGBA8888)
+                image = image.convertToFormat(QImage::Format_RGBA8888);
+
+            // 指定幅が大きくても、base64 と JSON envelope を含む応答全体が
+            // 1MB を超えないよう PNG の再圧縮ではなく画像自体を段階的に縮小する。
+            QByteArray png;
+            QByteArray base64;
+            bool fitsResponseLimit = false;
+            for (int attempt = 0; attempt < 16; ++attempt) {
+                if (!encodePng(image, &png))
+                    return setError(err, QStringLiteral("フレームを PNG にエンコードできませんでした")),
+                           QJsonObject();
+                base64 = png.toBase64();
+                if (base64.size() + kFrameResponseOverhead
+                        <= kMaxFrameResponseBytes
+                    || image.width() <= 1) {
+                    fitsResponseLimit = base64.size() + kFrameResponseOverhead
+                        <= kMaxFrameResponseBytes;
+                    break;
+                }
+
+                const int nextWidth = qMax(1, qMin(image.width() - 1,
+                                                   qRound(image.width() * 0.8)));
+                const int nextHeight = qMax(1, qRound(
+                    static_cast<double>(image.height()) * nextWidth
+                    / static_cast<double>(image.width())));
+                image = image.scaled(QSize(nextWidth, nextHeight),
+                                     Qt::KeepAspectRatio,
+                                     Qt::SmoothTransformation);
+            }
+            // ループ上限で縮小した場合にも、content と payload が同じ PNG を
+            // 参照するよう最後の画像を必ず再エンコードして判定する。
+            if (!fitsResponseLimit) {
+                if (!encodePng(image, &png))
+                    return setError(err, QStringLiteral("フレームを PNG にエンコードできませんでした")),
+                           QJsonObject();
+                base64 = png.toBase64();
+                fitsResponseLimit = base64.size() + kFrameResponseOverhead
+                    <= kMaxFrameResponseBytes;
+            }
+            if (!fitsResponseLimit)
+                return setError(err, QStringLiteral("PNG 応答を 1MB 以内に縮小できませんでした")),
+                       QJsonObject();
+
+            content->append(QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("image")},
+                {QStringLiteral("data"), QString::fromLatin1(base64)},
+                {QStringLiteral("mimeType"), QStringLiteral("image/png")}
+            });
+            return QJsonObject{
+                {QStringLiteral("ok"), true},
+                {QStringLiteral("timeSec"), timeSec},
+                {QStringLiteral("width"), image.width()},
+                {QStringLiteral("height"), image.height()},
+                {QStringLiteral("byteSize"), static_cast<qint64>(png.size())},
+                {QStringLiteral("base64Bytes"), static_cast<qint64>(base64.size())}
+            };
+        }
+    });
+
+    const QJsonObject exportStatusProperties{
+        {QStringLiteral("jobId"), QJsonObject{
+            {QStringLiteral("type"), QStringLiteral("string")}
+        }}
+    };
+    m_registry->registerTool({
+        QStringLiteral("get_export_status"),
+        QStringLiteral("非同期 export_video ジョブの状態と進捗を返す。status は queued / running / done / failed。失敗時は error を含める。"),
+        schemaWithRequired(exportStatusProperties, {QStringLiteral("jobId")}),
+        [this](const QJsonObject& args, QString* err) -> QJsonObject {
+            if (!rejectUnknownArguments(args, {QStringLiteral("jobId")}, err))
+                return {};
+            QString jobId;
+            if (!requiredString(args, QStringLiteral("jobId"), &jobId, err)) {
+                if (err)
+                    *err = QStringLiteral("jobId は必須です");
+                return {};
+            }
+            if (jobId.trimmed().isEmpty())
+                return setError(err, QStringLiteral("jobId は必須です")), QJsonObject();
+            return exportStatus(jobId, err);
+        }
+    });
+
     const QJsonObject timelineProperties{
         {QStringLiteral("kind"), QJsonObject{
             {QStringLiteral("type"), QStringLiteral("string")},
@@ -346,10 +734,10 @@ void McpEditorTools::registerReadTools()
 
             if (result.contains(QStringLiteral("video")))
                 result.insert(QStringLiteral("video"),
-                              tracksToJson(currentTimeline->allVideoTracks()));
+                              tracksToJson(currentTimeline->videoTracks()));
             if (result.contains(QStringLiteral("audio")))
                 result.insert(QStringLiteral("audio"),
-                              tracksToJson(currentTimeline->allAudioTracks()));
+                              tracksToJson(currentTimeline->audioTracks()));
             return result;
         }
     });
@@ -394,7 +782,7 @@ void McpEditorTools::registerReadTools()
     };
     m_registry->registerTool({
         QStringLiteral("list_commands"),
-        QStringLiteral("エディタで利用できるお気に入り登録可能なコマンドを列挙する。id、表示名、メニュー階層、実行可否の確認に使う。"),
+        QStringLiteral("エディタで利用できるお気に入り登録可能なコマンドを列挙する。id、表示名、メニュー階層、危険度 (safe / blocking / quit)、有効状態を返す。blocking のコマンドは run_command で既定では実行を拒否される。"),
         objectSchema(commandProperties),
         [this](const QJsonObject& args, QString* err) -> QJsonObject {
             if (!rejectUnknownArguments(args, {QStringLiteral("query")}, err))
@@ -418,6 +806,7 @@ void McpEditorTools::registerReadTools()
                     {QStringLiteral("id"), command.id},
                     {QStringLiteral("label"), command.label},
                     {QStringLiteral("menuPath"), command.menuPath},
+                    {QStringLiteral("risk"), actionRiskToString(command.risk)},
                     {QStringLiteral("enabled"),
                      command.action ? command.action->isEnabled() : false}
                 });
@@ -438,25 +827,443 @@ void McpEditorTools::registerWriteTools()
     const QJsonObject clipProperties = clipSelectorProperties();
 
     m_registry->registerTool({
+        QStringLiteral("export_video"),
+        QStringLiteral("現在のタイムラインを動画ファイルへ非同期で書き出す。tools/call はジョブ投入後すぐに jobId を返し、完了は get_export_status で確認する。width / height / fps の省略時は現在のプロジェクト設定を使い、videoBitrate は kbps。"),
+        schemaWithRequired(QJsonObject{
+            {QStringLiteral("outputPath"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("string")}
+            }},
+            {QStringLiteral("width"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("integer")},
+                {QStringLiteral("minimum"), 2}
+            }},
+            {QStringLiteral("height"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("integer")},
+                {QStringLiteral("minimum"), 2}
+            }},
+            {QStringLiteral("fps"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("number")},
+                {QStringLiteral("exclusiveMinimum"), 0}
+            }},
+            {QStringLiteral("videoCodec"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("string")}
+            }},
+            {QStringLiteral("videoBitrate"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("integer")},
+                {QStringLiteral("minimum"), 1},
+                {QStringLiteral("description"), QStringLiteral("kbps")}
+            }}
+        }, {QStringLiteral("outputPath")}),
+        [this](const QJsonObject& args, QString* err) -> QJsonObject {
+            if (!rejectUnknownArguments(args,
+                                        {QStringLiteral("outputPath"),
+                                         QStringLiteral("width"),
+                                         QStringLiteral("height"),
+                                         QStringLiteral("fps"),
+                                         QStringLiteral("videoCodec"),
+                                         QStringLiteral("videoBitrate")}, err))
+                return {};
+
+            QString outputPath;
+            if (!requiredString(args, QStringLiteral("outputPath"),
+                                &outputPath, err)) {
+                if (err)
+                    *err = QStringLiteral("outputPath は必須です");
+                return {};
+            }
+            outputPath = outputPath.trimmed();
+            if (outputPath.isEmpty())
+                return setError(err, QStringLiteral("outputPath は必須です")),
+                       QJsonObject();
+
+            const QFileInfo outputInfo(outputPath);
+            if (!outputInfo.absoluteDir().exists()) {
+                return setError(err,
+                                QStringLiteral("出力先の親ディレクトリが存在しません: %1")
+                                    .arg(outputInfo.absoluteDir().absolutePath())),
+                       QJsonObject();
+            }
+            if (!m_window || !timeline())
+                return setError(err, QStringLiteral("エディタまたはタイムラインを利用できません")),
+                       QJsonObject();
+
+            const int defaultWidth = qMax(2, m_window->m_projectConfig.width);
+            const int defaultHeight = qMax(2, m_window->m_projectConfig.height);
+            const double defaultFps = qMax(1, m_window->m_projectConfig.fps);
+            int width = defaultWidth;
+            int height = defaultHeight;
+            if (!positiveInteger(args, QStringLiteral("width"), defaultWidth,
+                                 &width, err)
+                || !positiveInteger(args, QStringLiteral("height"), defaultHeight,
+                                    &height, err))
+                return {};
+            if (width < 2 || height < 2)
+                return setError(err, QStringLiteral("width と height は 2 以上で指定してください")),
+                       QJsonObject();
+
+            double fps = defaultFps;
+            if (!positiveFiniteNumber(args, QStringLiteral("fps"), defaultFps,
+                                      &fps, err))
+                return {};
+
+            // ProjectConfig が保持する書き出し設定は現状サイズと fps までなので、
+            // codec / bitrate は ExportConfig と同じ既定値を使う。
+            QString videoCodec = QStringLiteral("libx264");
+            if (args.contains(QStringLiteral("videoCodec"))) {
+                const QJsonValue value = args.value(QStringLiteral("videoCodec"));
+                if (!value.isString() || value.toString().trimmed().isEmpty())
+                    return setError(err, QStringLiteral("videoCodec は空でない文字列で指定してください")),
+                           QJsonObject();
+                videoCodec = value.toString().trimmed();
+            }
+
+            int videoBitrate = 10000; // kbps。ExportConfig の既定値と合わせる。
+            if (!positiveInteger(args, QStringLiteral("videoBitrate"),
+                                 videoBitrate, &videoBitrate, err))
+                return {};
+
+            RenderQueue* queue = ensureRenderQueue(err);
+            if (!queue)
+                return {};
+
+            RenderJob job;
+            job.uuid = QUuid::createUuid().toString(QUuid::WithoutBraces);
+            job.name = QFileInfo(outputPath).fileName();
+            if (job.name.isEmpty())
+                job.name = outputPath;
+            job.projectFilePath = m_window->m_projectFilePath;
+            job.outputPath = outputPath;
+            job.width = width;
+            job.height = height;
+            job.codec = videoCodec;
+            job.bitrateBps = static_cast<qint64>(videoBitrate) * 1000;
+            job.startUs = 0;
+            job.endUs = 0;
+            job.timeline = timeline();
+            job.exportConfig = QJsonObject{
+                {QStringLiteral("width"), width},
+                {QStringLiteral("height"), height},
+                {QStringLiteral("fps"), fps},
+                {QStringLiteral("videoCodec"), videoCodec},
+                {QStringLiteral("videoBitrate"), videoBitrate},
+                {QStringLiteral("audioCodec"), QStringLiteral("aac")},
+                {QStringLiteral("audioBitrate"), 192}
+            };
+
+            // ライブ Timeline を渡す経路は GUI の表示内容をそのまま使うため、
+            // RenderQueue のワーカー開始前に MainWindow 側の補助データを同期する。
+            m_window->syncProjectLightingToTimeline();
+            QHash<QString, TimelineTrackMatteEntry> matteEntries;
+            matteEntries.reserve(m_window->m_trackMatteClipEntries.size());
+            for (auto it = m_window->m_trackMatteClipEntries.cbegin();
+                 it != m_window->m_trackMatteClipEntries.cend(); ++it) {
+                TimelineTrackMatteEntry entry;
+                entry.matteType = it.value().matteType;
+                entry.matteSourceClipId = it.value().matteSourceClipId;
+                matteEntries.insert(it.key(), entry);
+            }
+            timeline()->setTrackMatteEntries(matteEntries);
+            queue->setAcesPipeline(m_window->m_acesPipeline);
+            queue->addJob(job);
+            m_exportJobObservations.insert(job.uuid,
+                                           ExportJobObservation{
+                                               QStringLiteral("queued"), 0, QString()});
+
+            // start() は Timeline の解決やレンダースレッドの準備を行うため、
+            // tools/call の中では待たない。GUI イベントループへ移して jobId を
+            // 先に返し、実処理の状態は get_export_status で確認できるようにする。
+            const QPointer<RenderQueue> queueGuard(queue);
+            QTimer::singleShot(0, m_window, [queueGuard]() {
+                if (queueGuard)
+                    queueGuard->start();
+            });
+
+            return QJsonObject{
+                {QStringLiteral("ok"), true},
+                {QStringLiteral("jobId"), job.uuid},
+                {QStringLiteral("status"), QStringLiteral("queued")},
+                {QStringLiteral("progress"), 0},
+                {QStringLiteral("outputPath"), outputPath},
+                {QStringLiteral("width"), width},
+                {QStringLiteral("height"), height},
+                {QStringLiteral("fps"), fps},
+                {QStringLiteral("videoCodec"), videoCodec},
+                {QStringLiteral("videoBitrate"), videoBitrate}
+            };
+        }
+    });
+
+    m_registry->registerTool({
+        QStringLiteral("import_media"),
+        QStringLiteral("ダイアログを開かずに素材を指定トラックへ取り込む。映像と音声の組は既存のGUI経路と同じlinkGroupでリンクし、Undo 1 回で取り消せる。"),
+        schemaWithRequired(QJsonObject{
+            {QStringLiteral("filePath"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("string")}
+            }},
+            {QStringLiteral("trackIndex"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("integer")},
+                {QStringLiteral("minimum"), 0},
+                {QStringLiteral("default"), 0}
+            }},
+            {QStringLiteral("startSec"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("number")}
+            }}
+        }, {QStringLiteral("filePath")}),
+        [this](const QJsonObject& args, QString* err) -> QJsonObject {
+            if (!rejectUnknownArguments(args,
+                                        {QStringLiteral("filePath"),
+                                         QStringLiteral("trackIndex"),
+                                         QStringLiteral("startSec")}, err))
+                return {};
+            QString filePath;
+            if (!requiredString(args, QStringLiteral("filePath"), &filePath, err))
+                return {};
+            if (filePath.isEmpty())
+                return setError(err, QStringLiteral("ファイルが見つかりません: %1").arg(filePath)),
+                       QJsonObject();
+            int trackIndex = 0;
+            if (!nonNegativeInteger(args, QStringLiteral("trackIndex"), 0,
+                                    &trackIndex, err))
+                return {};
+            double startSec = -1.0;
+            if (args.contains(QStringLiteral("startSec"))) {
+                if (!requiredFiniteNumber(args, QStringLiteral("startSec"),
+                                          &startSec, err))
+                    return {};
+                if (startSec < 0.0)
+                    return setError(err, QStringLiteral("startSec must be non-negative")),
+                           QJsonObject();
+            }
+            if (!m_window || !timeline())
+                return setError(err, QStringLiteral("editor not available")), QJsonObject();
+
+            Timeline::MediaImportResult importResult;
+            if (!timeline()->importMedia(filePath, trackIndex, startSec,
+                                         &importResult, err))
+                return {};
+
+            QJsonArray addedClips;
+            const auto appendClip = [&addedClips](const QString &kind,
+                                                   int track,
+                                                   int index,
+                                                   double start,
+                                                   double duration) {
+                if (track < 0 || index < 0)
+                    return;
+                addedClips.append(QJsonObject{
+                    {QStringLiteral("kind"), kind},
+                    {QStringLiteral("trackIndex"), track},
+                    {QStringLiteral("clipIndex"), index},
+                    {QStringLiteral("startSec"), start},
+                    {QStringLiteral("durationSec"), duration}
+                });
+            };
+            appendClip(QStringLiteral("video"), importResult.videoTrackIndex,
+                       importResult.videoClipIndex, importResult.videoStartSec,
+                       importResult.durationSec);
+            appendClip(QStringLiteral("audio"), importResult.audioTrackIndex,
+                       importResult.audioClipIndex, importResult.audioStartSec,
+                       importResult.durationSec);
+
+            m_window->hideWelcomeScreen();
+            m_window->setWindowModified(true);
+            m_window->updateStatusInfo();
+            m_window->updateEditActions();
+            QJsonObject response{
+                {QStringLiteral("ok"), true},
+                {QStringLiteral("clips"), addedClips}
+            };
+            if (!addedClips.isEmpty()) {
+                const QJsonObject first = addedClips.first().toObject();
+                response.insert(QStringLiteral("kind"), first.value(QStringLiteral("kind")));
+                response.insert(QStringLiteral("trackIndex"),
+                                first.value(QStringLiteral("trackIndex")));
+                response.insert(QStringLiteral("clipIndex"),
+                                first.value(QStringLiteral("clipIndex")));
+                response.insert(QStringLiteral("startSec"),
+                                first.value(QStringLiteral("startSec")));
+                response.insert(QStringLiteral("durationSec"),
+                                first.value(QStringLiteral("durationSec")));
+            }
+            return response;
+        }
+    });
+
+    m_registry->registerTool({
+        QStringLiteral("save_project"),
+        QStringLiteral("プロジェクトを指定パスへ保存する。path 省略時は既存の保存先へ上書きし、未保存プロジェクトではエラーを返す。ダイアログは開かない。"),
+        objectSchema(QJsonObject{
+            {QStringLiteral("path"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("string")}
+            }}
+        }),
+        [this](const QJsonObject& args, QString* err) -> QJsonObject {
+            if (!rejectUnknownArguments(args, {QStringLiteral("path")}, err))
+                return {};
+            if (!m_window)
+                return setError(err, QStringLiteral("editor not available")), QJsonObject();
+            QString path = m_window->m_projectFilePath;
+            if (args.contains(QStringLiteral("path"))) {
+                if (!requiredString(args, QStringLiteral("path"), &path, err))
+                    return {};
+            }
+            if (path.trimmed().isEmpty())
+                return setError(err, QStringLiteral("保存先のパスを指定してください")),
+                       QJsonObject();
+
+            QString saveError;
+            if (!m_window->saveProjectToPath(path, &saveError))
+                return setError(err, saveError), QJsonObject();
+            return QJsonObject{
+                {QStringLiteral("ok"), true},
+                {QStringLiteral("path"), m_window->m_projectFilePath}
+            };
+        }
+    });
+
+    m_registry->registerTool({
+        QStringLiteral("open_project"),
+        QStringLiteral("指定パスのプロジェクトを読み込む。ダイアログや未保存変更の確認は行わない。"),
+        schemaWithRequired(QJsonObject{
+            {QStringLiteral("path"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("string")}
+            }}
+        }, {QStringLiteral("path")}),
+        [this](const QJsonObject& args, QString* err) -> QJsonObject {
+            if (!rejectUnknownArguments(args, {QStringLiteral("path")}, err))
+                return {};
+            QString path;
+            if (!requiredString(args, QStringLiteral("path"), &path, err))
+                return {};
+            if (!m_window)
+                return setError(err, QStringLiteral("editor not available")), QJsonObject();
+
+            QString openError;
+            if (!m_window->openProjectFromPath(path, &openError))
+                return setError(err, openError), QJsonObject();
+            return QJsonObject{
+                {QStringLiteral("ok"), true},
+                {QStringLiteral("path"), m_window->m_projectFilePath}
+            };
+        }
+    });
+
+    m_registry->registerTool({
+        QStringLiteral("select_clip"),
+        QStringLiteral("指定クリップを選択する。Timeline と MainWindow の両方の選択状態をGUIクリックと同じ規則で更新する。"),
+        schemaWithRequired(clipProperties,
+                           {QStringLiteral("kind"), QStringLiteral("trackIndex"),
+                            QStringLiteral("clipIndex")}),
+        [this](const QJsonObject& args, QString* err) -> QJsonObject {
+            if (!rejectUnknownArguments(args,
+                                        {QStringLiteral("kind"),
+                                         QStringLiteral("trackIndex"),
+                                         QStringLiteral("clipIndex")}, err))
+                return {};
+            if (!args.contains(QStringLiteral("kind"))
+                || !args.value(QStringLiteral("kind")).isString())
+                return setError(err, QStringLiteral("kind must be video or audio")),
+                       QJsonObject();
+            const QString kind = args.value(QStringLiteral("kind")).toString();
+            if (kind != QStringLiteral("video") && kind != QStringLiteral("audio"))
+                return setError(err, QStringLiteral("kind must be video or audio")),
+                       QJsonObject();
+            if (!args.contains(QStringLiteral("trackIndex"))
+                || !args.contains(QStringLiteral("clipIndex")))
+                return setError(err, QStringLiteral("trackIndex and clipIndex are required")),
+                       QJsonObject();
+            int trackIndex = 0;
+            int clipIndex = 0;
+            if (!nonNegativeInteger(args, QStringLiteral("trackIndex"), 0,
+                                    &trackIndex, err)
+                || !nonNegativeInteger(args, QStringLiteral("clipIndex"), 0,
+                                       &clipIndex, err))
+                return {};
+            if (!m_window || !timeline())
+                return setError(err, QStringLiteral("editor not available")), QJsonObject();
+            const bool audio = kind == QStringLiteral("audio");
+            if (!timeline()->selectClipByIndex(audio, trackIndex, clipIndex, err))
+                return {};
+
+            // Timeline の通知が同値選択で省略されても MainWindow の追跡値を
+            // 必ず同期させ、selectedVideoClipRef() が同じ対象を返すようにする。
+            m_window->m_selectedVideoTrackIndex = audio ? -1 : trackIndex;
+            m_window->m_selectedVideoClipIndexTracked = clipIndex;
+            m_window->updateEditActions();
+            return QJsonObject{
+                {QStringLiteral("ok"), true},
+                {QStringLiteral("kind"), kind},
+                {QStringLiteral("trackIndex"), trackIndex},
+                {QStringLiteral("clipIndex"), clipIndex}
+            };
+        }
+    });
+
+    m_registry->registerTool({
+        QStringLiteral("clear_selection"),
+        QStringLiteral("タイムライン上の選択をすべて解除する。"),
+        objectSchema(),
+        [this](const QJsonObject& args, QString* err) -> QJsonObject {
+            if (!rejectUnknownArguments(args, {}, err))
+                return {};
+            if (!m_window || !timeline())
+                return setError(err, QStringLiteral("editor not available")), QJsonObject();
+            timeline()->clearSelection();
+            m_window->m_selectedVideoTrackIndex = -1;
+            m_window->m_selectedVideoClipIndexTracked = -1;
+            m_window->updateEditActions();
+            return QJsonObject{{QStringLiteral("ok"), true}};
+        }
+    });
+
+    m_registry->registerTool({
         QStringLiteral("run_command"),
-        QStringLiteral("お気に入りコマンドを実行する。内容によってはタイムラインを変更する破壊的操作で、変更は Ctrl+Z / undo ツールで戻せる。"),
+        QStringLiteral("お気に入り登録可能なコマンドを id で実行する。危険度を返し、blocking のコマンドは allowBlocking:true のときだけ実行する。quit のコマンドは MCP から常に実行できない。タイムラインを変更する操作は Ctrl+Z / undo ツールで戻せる。"),
         schemaWithRequired(QJsonObject{
             {QStringLiteral("id"), QJsonObject{
                 {QStringLiteral("type"), QStringLiteral("string")}
+            }},
+            {QStringLiteral("allowBlocking"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("boolean")},
+                {QStringLiteral("default"), false}
             }}
         }, {QStringLiteral("id")}),
         [this](const QJsonObject& args, QString* err) -> QJsonObject {
-            if (!rejectUnknownArguments(args, {QStringLiteral("id")}, err))
+            if (!rejectUnknownArguments(args,
+                                        {QStringLiteral("id"),
+                                         QStringLiteral("allowBlocking")}, err))
                 return {};
             QString id;
             if (!requiredString(args, QStringLiteral("id"), &id, err))
                 return {};
+            bool allowBlocking = false;
+            if (args.contains(QStringLiteral("allowBlocking"))) {
+                const QJsonValue allowBlockingValue =
+                    args.value(QStringLiteral("allowBlocking"));
+                if (!allowBlockingValue.isBool()) {
+                    setError(err, QStringLiteral("allowBlocking は boolean で指定してください"));
+                    return {};
+                }
+                allowBlocking = allowBlockingValue.toBool();
+            }
             if (!m_window)
                 return setError(err, QStringLiteral("editor not available")), QJsonObject();
 
             for (const auto& command : m_window->m_favoritableActions) {
                 if (command.id != id)
                     continue;
+
+                const QString risk = actionRiskToString(command.risk);
+                // 危険度の拒否は enabled 判定より先に行う。終了は常に拒否し、
+                // Blocking はユーザーが明示的に許可した場合だけ QAction を trigger する。
+                if (command.risk == FavoritableActionRisk::Quit) {
+                    setError(err, QStringLiteral("このコマンドはエディタを終了させるため MCP からは実行できません。"));
+                    return {};
+                }
+                if (command.risk == FavoritableActionRisk::Blocking && !allowBlocking) {
+                    setError(err, QStringLiteral("このコマンドはモーダルダイアログを開くため既定では実行しません。ユーザが画面で操作する必要があります。どうしても実行する場合は allowBlocking:true を指定してください。"));
+                    return {};
+                }
                 if (!command.action || !command.action->isEnabled()) {
                     if (err)
                         *err = QStringLiteral("command is disabled: %1").arg(id);
@@ -468,7 +1275,8 @@ void McpEditorTools::registerWriteTools()
                 return QJsonObject{
                     {QStringLiteral("ok"), true},
                     {QStringLiteral("id"), id},
-                    {QStringLiteral("label"), command.label}
+                    {QStringLiteral("label"), command.label},
+                    {QStringLiteral("risk"), risk}
                 };
             }
             setError(err, QStringLiteral("command not found: %1").arg(id));
@@ -553,16 +1361,21 @@ void McpEditorTools::registerWriteTools()
 
     m_registry->registerTool({
         QStringLiteral("move_clip"),
-        QStringLiteral("指定クリップを同一トラック内の指定開始時刻へ移動する。タイムラインを変更する破壊的操作で、Ctrl+Z / undo ツールで戻せる。"),
+        QStringLiteral("指定クリップを指定開始時刻へ移動する。必要なら別トラックへ移し、連続配置でも並べ替える。置けない要求はok:falseで理由と実際に置ける時刻を返す。タイムラインを変更する破壊的操作で、Ctrl+Z / undo ツールで戻せる。"),
         schemaWithRequired(mergedProperties(clipProperties, QJsonObject{
             {QStringLiteral("newStartSec"), QJsonObject{
                 {QStringLiteral("type"), QStringLiteral("number")}
+            }},
+            {QStringLiteral("newTrackIndex"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("integer")},
+                {QStringLiteral("minimum"), 0}
             }}
         }), {QStringLiteral("clipIndex"), QStringLiteral("newStartSec")}),
         [this](const QJsonObject& args, QString* err) -> QJsonObject {
             if (!rejectUnknownArguments(args,
                                         {QStringLiteral("kind"), QStringLiteral("trackIndex"),
-                                         QStringLiteral("clipIndex"), QStringLiteral("newStartSec")},
+                                         QStringLiteral("clipIndex"), QStringLiteral("newStartSec"),
+                                         QStringLiteral("newTrackIndex")},
                                         err))
                 return {};
             double newStartSec = 0.0;
@@ -576,14 +1389,36 @@ void McpEditorTools::registerWriteTools()
             ClipTarget target;
             if (!readClipTarget(args, m_window, timeline(), &target, err))
                 return {};
-            Timeline* currentTimeline = timeline();
-            double settledStart = 0.0;
-            if (!currentTimeline->moveClipByIndex(
-                    target.audio, target.trackIndex, target.clipIndex, newStartSec, &settledStart, err))
+            int newTrackIndex = target.trackIndex;
+            if (!nonNegativeInteger(args, QStringLiteral("newTrackIndex"),
+                                    target.trackIndex, &newTrackIndex, err))
                 return {};
+            Timeline* currentTimeline = timeline();
+            Timeline::MoveClipResult moveResult;
+            if (!currentTimeline->moveClipByIndex(
+                    target.audio, target.trackIndex, target.clipIndex, newStartSec,
+                    newTrackIndex, &moveResult, err))
+                return {};
+            if (!moveResult.reason.isEmpty()) {
+                return QJsonObject{
+                    {QStringLiteral("ok"), false},
+                    // 既存の move_clip 応答キーを失わないよう、失敗時も
+                    // startSec は actualStartSec と同じ値で返す。
+                    {QStringLiteral("startSec"), moveResult.actualStartSec},
+                    {QStringLiteral("actualStartSec"), moveResult.actualStartSec},
+                    {QStringLiteral("reason"), moveResult.reason},
+                    {QStringLiteral("trackIndex"), newTrackIndex}
+                };
+            }
+            if (moveResult.moved)
+                m_window->setWindowModified(true);
             return QJsonObject{
                 {QStringLiteral("ok"), true},
-                {QStringLiteral("startSec"), settledStart}
+                // startSec は既存ツールの応答キーとして維持する。
+                {QStringLiteral("startSec"), moveResult.actualStartSec},
+                {QStringLiteral("actualStartSec"), moveResult.actualStartSec},
+                {QStringLiteral("trackIndex"), moveResult.trackIndex},
+                {QStringLiteral("clipIndex"), moveResult.clipIndex}
             };
         }
     });

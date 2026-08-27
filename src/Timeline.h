@@ -519,6 +519,31 @@ class Timeline : public QWidget
 public:
     explicit Timeline(QWidget *parent = nullptr);
 
+    struct MediaImportResult {
+        int videoTrackIndex = -1;
+        int videoClipIndex = -1;
+        int audioTrackIndex = -1;
+        int audioClipIndex = -1;
+        double videoStartSec = 0.0;
+        double audioStartSec = 0.0;
+        double durationSec = 0.0;
+    };
+
+    struct MoveClipResult {
+        bool moved = false;
+        int trackIndex = -1;
+        int clipIndex = -1;
+        double actualStartSec = 0.0;
+        QString reason;
+    };
+
+    // GUI のファイル追加と MCP の非対話取り込みが共有する入口。
+    // requestedTrackIndex / requestedStartSec が -1 のときは既存の GUI 配置規則を使う。
+    bool importMedia(const QString &filePath,
+                     int requestedTrackIndex = -1,
+                     double requestedStartSec = -1.0,
+                     MediaImportResult *result = nullptr,
+                     QString *err = nullptr);
     void addClip(const QString &filePath);
     void splitAtPlayhead();
     // ---- index 指定の編集 (MCP / スクリプト経路) ----
@@ -532,8 +557,13 @@ public:
                            bool ripple, QString *err);
     bool moveClipByIndex(bool audio, int trackIndex, int clipIndex,
                          double newStartSec, double *settledStartSec, QString *err);
+    bool moveClipByIndex(bool audio, int trackIndex, int clipIndex,
+                         double newStartSec, int newTrackIndex,
+                         MoveClipResult *result, QString *err);
     bool setClipPropertyByIndex(bool audio, int trackIndex, int clipIndex,
                                 const QString &property, double value, QString *err);
+    bool selectClipByIndex(bool audio, int trackIndex, int clipIndex, QString *err);
+    void clearSelection();
     bool freezeFrameAtPlayhead(TimelineTrack *track = nullptr, int clipIndex = -1);
     void deleteSelectedClip();
     void rippleDeleteSelectedClip();

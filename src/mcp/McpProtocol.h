@@ -22,6 +22,8 @@ public:
     // JSON-RPC メッセージ 1 件分のボディを処理し、返すべきレスポンスボディを返す。
     // 通知 (id を持たないメッセージ) の場合は空 QByteArray を返す
     // = トランスポート側は 202 Accepted / 何も書かない、で応じる。
+    // tools/call の content は従来の text に加えて MCP の image なども保持する。
+    // ツールの payload は従来どおり structuredContent に格納する。
     QByteArray handleMessage(const QByteArray& body) const;
 
     bool initialized() const { return m_initialized; }

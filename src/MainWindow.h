@@ -217,6 +217,15 @@ class McpHttpServer;
 class McpEditorTools;
 }
 
+// MCP からメニューアクションを実行するときの危険度。
+// Safe は即時完了、Blocking はユーザー操作を待つ可能性があり、Quit は
+// アプリケーションを終了させるアクションを表す。
+enum class FavoritableActionRisk {
+    Safe,
+    Blocking,
+    Quit
+};
+
 class MainWindow : public QMainWindow
 {
     Q_OBJECT
@@ -270,6 +279,9 @@ public:
     // for keyframe insertion at the current timeline position.
     double currentPlayheadSeconds() const;
     QString projectDirectory() const;
+    // MCP の選択確認とセルフテストが、Timeline 側と同じ追跡値を確認できるようにする。
+    int selectedVideoTrackIndex() const { return m_selectedVideoTrackIndex; }
+    int selectedVideoClipIndexTracked() const { return m_selectedVideoClipIndexTracked; }
 
 signals:
     void playheadSecondsChanged(double seconds);
@@ -656,6 +668,8 @@ private:
     void showWelcomeScreen();
     void hideWelcomeScreen();
     void loadMediaFile(const QString &filePath, bool addToTimeline, const QString &statusPrefix);
+    bool saveProjectToPath(const QString &filePath, QString *errorMessage = nullptr);
+    bool openProjectFromPath(const QString &filePath, QString *errorMessage = nullptr);
     void updateStatusInfo();
     void updateAcesUiState();
     void updateEditActions();
@@ -948,18 +962,19 @@ private:
     QHash<QString, QAction *> m_commandActions;
 
     // User-customizable "お気に入り" menu support.
-    // FavoritableAction::id is a STABLE string (e.g. "file.new", "edit.split")
-    // — never the translated text — so the persisted favorites list survives
-    // UI-text changes. label = current display text (shown in the editor
-    // dialog), menuPath = parent menu title used for grouping in the dialog,
-    // action = the real menu QAction (the proxy added to the お気に入り menu
-    // forwards trigger() to it). Populated in setupMenuBar() alongside
-    // m_menuHelpEntries.
+    // FavoritableAction::id は menuKey とメニュー内 index の文字列
+    // (例: "file.0", "edit.1") で、翻訳後の表示文字列からは生成しない。
+    // そのため UI 文言の変更ではお気に入り設定を維持できるが、メニュー途中への
+    // アクション挿入では後続 ID がずれる。label = エディタに表示する現在の文言、
+    // menuPath = ダイアログでグループ化する親メニュー名、action = 実体の QAction
+    // (お気に入りメニューに追加する proxy はこれへ trigger() を転送) である。
+    // setupMenuBar() で m_menuHelpEntries と同時に構築する。
     struct FavoritableAction {
         QString id;
         QString label;
         QString menuPath;
         QAction *action = nullptr;
+        FavoritableActionRisk risk = FavoritableActionRisk::Safe;
     };
     QVector<FavoritableAction> m_favoritableActions;
     QMenu *m_favoritesMenu = nullptr;
