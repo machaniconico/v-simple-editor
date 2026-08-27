@@ -6,6 +6,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QDir>
+#include <QFile>
 #include <QFileInfo>
 #include <QTemporaryFile>
 #include <QTemporaryDir>
@@ -639,22 +640,18 @@ int runMcpSelftest()
                QStringLiteral("credential removal or PATH preservation failed"));
 
     const QStringList arguments = AiChatDock::buildArguments(
-        QStringLiteral("/tmp/veditor-mcp.json"), QStringLiteral("edit this"));
-    // プロンプトは -p の直後。可変長の --allowedTools より後ろに置くと
-    // claude 側がプロンプトを許可ツール名として飲み込む (実測)。
-    const int allowedToolsIndex = arguments.indexOf(QStringLiteral("--allowedTools"));
-    const int promptIndex = arguments.indexOf(QStringLiteral("edit this"));
+        QStringLiteral("/tmp/veditor-mcp.json"), QString());
+    // プロンプトは argv に置かず stdin へ渡し、可変長の --allowedTools は最後に置く。
     const bool g27 = arguments.contains(QStringLiteral("--strict-mcp-config"))
         && arguments.indexOf(QStringLiteral("--output-format")) >= 0
         && arguments.value(arguments.indexOf(QStringLiteral("--output-format")) + 1)
                == QStringLiteral("stream-json")
         && arguments.value(0) == QStringLiteral("-p")
-        && promptIndex == 1
-        && allowedToolsIndex > promptIndex
+        && !arguments.contains(QStringLiteral("edit this"))
         && arguments.constLast() == QStringLiteral("mcp__veditor");
     g27 ? pass("G27 AI chat CLI arguments")
         : fail("G27 AI chat CLI arguments",
-               QStringLiteral("required stream-json arguments or prompt order is wrong"));
+               QStringLiteral("required stream-json arguments or stdin prompt handling is wrong"));
 
     const QByteArray mcpConfig = AiChatDock::buildMcpConfig(
         9876, QStringLiteral("test-token"));
@@ -669,6 +666,116 @@ int runMcpSelftest()
     g28 ? pass("G28 AI chat MCP config JSON")
         : fail("G28 AI chat MCP config JSON",
                QStringLiteral("port or bearer token was not encoded correctly"));
+
+    QTemporaryDir cliCommandDir;
+    const QString fakeCmdPath = cliCommandDir.isValid()
+        ? QDir(cliCommandDir.path()).filePath(QStringLiteral("claude.cmd"))
+        : QString();
+    bool fakeCmdReady = false;
+    if (!fakeCmdPath.isEmpty()) {
+        QFile fakeCmd(fakeCmdPath);
+        fakeCmdReady = fakeCmd.open(QIODevice::WriteOnly);
+        if (fakeCmdReady) {
+            fakeCmd.write("@echo off\r\n");
+            fakeCmd.close();
+            fakeCmdReady = QFile::setPermissions(
+                fakeCmdPath, QFileDevice::ReadOwner | QFileDevice::WriteOwner
+                    | QFileDevice::ExeOwner);
+        }
+    }
+    const AiChatDock::CliCommand resolvedCmd = AiChatDock::resolveCliCommand(
+        QStringLiteral("claude"), {cliCommandDir.path()});
+    const bool g59 = fakeCmdReady
+        && QFileInfo(resolvedCmd.program).absoluteFilePath()
+               == QFileInfo(fakeCmdPath).absoluteFilePath()
+        && resolvedCmd.needsShell;
+    g59 ? pass("G59 CLI resolver finds cmd shell script")
+        : fail("G59 CLI resolver finds cmd shell script",
+               QStringLiteral(".cmd was not resolved or was not marked for the shell"));
+
+    QTemporaryDir cliExeDir;
+    const QString fakeExePath = cliExeDir.isValid()
+        ? QDir(cliExeDir.path()).filePath(QStringLiteral("claude.exe"))
+        : QString();
+    bool fakeExeReady = false;
+    if (!fakeExePath.isEmpty()) {
+        QFile fakeExe(fakeExePath);
+        fakeExeReady = fakeExe.open(QIODevice::WriteOnly);
+        if (fakeExeReady) {
+            fakeExe.write("not a real executable\n");
+            fakeExe.close();
+            fakeExeReady = QFile::setPermissions(
+                fakeExePath, QFileDevice::ReadOwner | QFileDevice::WriteOwner
+                    | QFileDevice::ExeOwner);
+        }
+    }
+    const AiChatDock::CliCommand resolvedExe = AiChatDock::resolveCliCommand(
+        QStringLiteral("claude.exe"), {cliExeDir.path()});
+    const bool g60 = fakeExeReady && !resolvedExe.program.isEmpty()
+        && !resolvedExe.needsShell;
+    g60 ? pass("G60 CLI resolver finds executable without shell")
+        : fail("G60 CLI resolver finds executable without shell",
+               QStringLiteral(".exe was not resolved as a direct executable"));
+
+    QTemporaryDir missingCliDir;
+    const AiChatDock::CliCommand missingCli = AiChatDock::resolveCliCommand(
+        QStringLiteral("definitely-missing-cli-xyz"), {missingCliDir.path()});
+    const bool g61 = missingCliDir.isValid() && missingCli.program.isEmpty()
+        && missingCli.searched.join(QStringLiteral("\n"))
+               .contains(missingCliDir.path());
+    g61 ? pass("G61 CLI resolver reports searched paths")
+        : fail("G61 CLI resolver reports searched paths",
+               QStringLiteral("a missing CLI did not report its search directory"));
+
+    const QString shellLine = AiChatDock::buildShellCommandLine(
+        QStringLiteral("C:\\p q\\claude.cmd"),
+        {QStringLiteral("-p"), QStringLiteral("--mcp-config"),
+         QStringLiteral("C:\\a&b|c^d.json")});
+    const QString expectedShellLine = QStringLiteral(
+        "\"C:\\p q\\claude.cmd\" \"-p\" \"--mcp-config\" \"C:\\a&b|c^d.json\"");
+    bool metacharactersAreQuoted = true;
+    int quoteDepth = 0;
+    for (const QChar character : shellLine) {
+        if (character == QLatin1Char('"'))
+            quoteDepth = quoteDepth == 0 ? 1 : 0;
+        else if (QStringLiteral("&|^").contains(character) && quoteDepth == 0)
+            metacharactersAreQuoted = false;
+    }
+    QString shellError;
+    const bool percentRejected = AiChatDock::buildShellCommandLine(
+        QStringLiteral("claude.cmd"), {QStringLiteral("x%y")}, &shellError)
+            .isEmpty() && !shellError.isEmpty();
+    const bool quoteRejected = AiChatDock::buildShellCommandLine(
+        QStringLiteral("claude.cmd"), {QStringLiteral("x\"y")}, &shellError)
+            .isEmpty() && !shellError.isEmpty();
+    const bool bangRejected = AiChatDock::buildShellCommandLine(
+        QStringLiteral("claude.cmd"), {QStringLiteral("x!y")}, &shellError)
+            .isEmpty() && !shellError.isEmpty();
+    const bool g62 = shellLine == expectedShellLine
+        && shellLine.startsWith(QLatin1Char('"'))
+        && shellLine.endsWith(QLatin1Char('"'))
+        && metacharactersAreQuoted
+        && percentRejected && quoteRejected && bangRejected;
+    g62 ? pass("G62 shell command quoting and rejection")
+        : fail("G62 shell command quoting and rejection",
+               QStringLiteral("cmd.exe command-line quoting or rejection is wrong"));
+
+    const QStringList argumentsWithoutResume = AiChatDock::buildArguments(
+        QStringLiteral("/tmp/c.json"), QString());
+    const QStringList argumentsWithResume = AiChatDock::buildArguments(
+        QStringLiteral("/tmp/c.json"), QStringLiteral("sess-1"));
+    const int resumeIndex = argumentsWithResume.indexOf(QStringLiteral("--resume"));
+    const int sessionIndex = argumentsWithResume.indexOf(QStringLiteral("sess-1"));
+    const int allowedToolsIndex = argumentsWithResume.indexOf(
+        QStringLiteral("--allowedTools"));
+    const bool g63 = argumentsWithoutResume.value(0) == QStringLiteral("-p")
+        && !argumentsWithoutResume.contains(QStringLiteral("--resume"))
+        && argumentsWithoutResume.constLast() == QStringLiteral("mcp__veditor")
+        && resumeIndex >= 0 && sessionIndex == resumeIndex + 1
+        && resumeIndex < allowedToolsIndex;
+    g63 ? pass("G63 resume arguments precede allowed tools")
+        : fail("G63 resume arguments precede allowed tools",
+               QStringLiteral("--resume or stdin argument ordering is wrong"));
 
     const QStringList changedToolNames{
         QStringLiteral("split_clip"), QStringLiteral("delete_clip"),
