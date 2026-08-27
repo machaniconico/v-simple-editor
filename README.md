@@ -180,13 +180,16 @@ MCP の変更系ツールは確認ダイアログを出さず、原則として�
 | `delete_clip` | クリップを削除する | あり |
 | `move_clip` | クリップを移動する | あり |
 | `set_clip_property` | クリップのプロパティを変更する | あり |
+| `trim_clip` | edge=in は開始位置を保ったまま timeSec 時点の内容を新しい先頭にし、以降が (timeSec−開始) だけ左へ詰まる（RippleIn）。edge=out は末尾を timeSec にし後続が詰まる（RippleOut）。video のみ、リンクした音声は追従しない（ripple 既定 true） | あり |
+| `set_transition` | V1 のクリップにトランジションを設定する（FadeIn は先頭、その他は末尾、None で解除） | あり |
+| `add_text_overlay` | V1 の先頭クリップにテキスト／テロップを追加する（時刻は秒、位置は 0..1） | あり |
 | `add_caption` | 字幕エディタの一覧に 1 件追加する（タイムラインへは `apply_captions` で反映） | なし（Ctrl+Z 対象外） |
 | `apply_captions` | 字幕エディタの字幕を V1 の 1 語字幕オーバーレイとしてタイムラインへ適用する（既存の生成済み 1 語字幕は置き換え） | あり（タイムライン側のみ。字幕エディタの一覧は戻らない） |
 | `set_playhead` | 再生ヘッドを移動する | なし |
 | `undo` | 直前の編集を元に戻す | なし |
 | `redo` | 元に戻した編集をやり直す | なし |
 
-MCP サーバの自己テストは `--selftest=mcp` または `VEDITOR_MCP_SELFTEST=1` で実行できます（実装: `src/selftests/mcp_selftest.cpp`、ゲート G1..G80）。
+MCP サーバの自己テストは `--selftest=mcp` または `VEDITOR_MCP_SELFTEST=1` で実行できます（実装: `src/selftests/mcp_selftest.cpp`、ゲート G1..G93）。
 
 ---
 

@@ -1,6 +1,7 @@
 #include <QEventLoop>
 #include <QElapsedTimer>
 #include <QAction>
+#include <QColor>
 #include <QCoreApplication>
 #include <QHash>
 #include <QHostAddress>
@@ -708,6 +709,9 @@ int runMcpSelftest()
         QStringLiteral("delete_clip"),
         QStringLiteral("move_clip"),
         QStringLiteral("set_clip_property"),
+        QStringLiteral("trim_clip"),
+        QStringLiteral("set_transition"),
+        QStringLiteral("add_text_overlay"),
         QStringLiteral("add_caption"),
         QStringLiteral("apply_captions"),
         QStringLiteral("set_playhead"),
@@ -996,7 +1000,9 @@ int runMcpSelftest()
 
     const QStringList changedToolNames{
         QStringLiteral("split_clip"), QStringLiteral("delete_clip"),
-        QStringLiteral("move_clip"), QStringLiteral("set_clip_property")
+        QStringLiteral("move_clip"), QStringLiteral("set_clip_property"),
+        QStringLiteral("trim_clip"), QStringLiteral("set_transition"),
+        QStringLiteral("add_text_overlay")
     };
     const QHash<QString, QJsonObject> unknownArgumentCases{
         {QStringLiteral("split_clip"), QJsonObject{
@@ -1014,6 +1020,19 @@ int runMcpSelftest()
         {QStringLiteral("set_clip_property"), QJsonObject{
             {QStringLiteral("clipIndex"), 0}, {QStringLiteral("property"), QStringLiteral("volume")},
             {QStringLiteral("value"), 1.0}, {QStringLiteral("track"), QStringLiteral("video")}
+        }},
+        {QStringLiteral("trim_clip"), QJsonObject{
+            {QStringLiteral("clipIndex"), 0}, {QStringLiteral("edge"), QStringLiteral("in")},
+            {QStringLiteral("timeSec"), 1.0}, {QStringLiteral("track"), QStringLiteral("video")}
+        }},
+        {QStringLiteral("set_transition"), QJsonObject{
+            {QStringLiteral("clipIndex"), 0}, {QStringLiteral("type"), QStringLiteral("FadeOut")},
+            {QStringLiteral("track"), QStringLiteral("video")}
+        }},
+        {QStringLiteral("add_text_overlay"), QJsonObject{
+            {QStringLiteral("text"), QStringLiteral("text")},
+            {QStringLiteral("startSec"), 0.0}, {QStringLiteral("endSec"), 1.0},
+            {QStringLiteral("track"), QStringLiteral("video")}
         }}
     };
     bool unknownArgumentsRejected = true;
@@ -1044,10 +1063,9 @@ int runMcpSelftest()
                 {QStringLiteral("arguments"), QJsonObject{}}
             }))));
     const QJsonObject projectInfoResult = toolPayload(projectInfoResponse);
-    const bool g30 = !projectInfoResult.contains(QStringLiteral("hasUnsavedChanges"))
-        || (projectInfoResult.value(QStringLiteral("hasUnsavedChanges")).isBool()
-            && projectInfoResult.value(QStringLiteral("hasUnsavedChanges")).toBool()
-                == projectInfoWindow.isWindowModified());
+    const bool g30 = projectInfoResult.value(QStringLiteral("hasUnsavedChanges")).isBool()
+        && projectInfoResult.value(QStringLiteral("hasUnsavedChanges")).toBool()
+            == projectInfoWindow.isWindowModified();
     g30 ? pass("G30 project unsaved state is truthful")
         : fail("G30 project unsaved state is truthful",
                QStringLiteral("hasUnsavedChanges was missing a boolean/state contract"));
@@ -1066,7 +1084,7 @@ int runMcpSelftest()
             rpcRequest(73, QStringLiteral("tools/list")))))
         .value(QStringLiteral("result")).toObject()
         .value(QStringLiteral("tools")).toArray();
-    constexpr int kExpectedProjectInfoToolCount = 22;
+    constexpr int kExpectedProjectInfoToolCount = 25;
     bool outputSchemasDeclared = projectInfoToolDescriptors.size()
         == kExpectedProjectInfoToolCount;
     for (const QJsonValue& value : projectInfoToolDescriptors) {
@@ -2001,6 +2019,268 @@ int runMcpSelftest()
                    QStringLiteral("live volume change or undo restoration did not match"));
     }
 
+    if (!projectTimeline || !captionVideo0) {
+        fail("G84 trim_clip changes and undoes a live clip",
+             QStringLiteral("V1 track was not available"));
+        fail("G85 trim_clip rejects an invalid edge",
+             QStringLiteral("V1 track was not available"));
+        fail("G86 set_transition changes and undoes a live clip",
+             QStringLiteral("V1 track was not available"));
+        fail("G87 set_transition rejects an invalid type",
+             QStringLiteral("V1 track was not available"));
+        fail("G88 add_text_overlay changes and undoes a live clip",
+             QStringLiteral("V1 track was not available"));
+        fail("G89 add_text_overlay rejects an invalid interval",
+             QStringLiteral("V1 track was not available"));
+        fail("G90 set_transition rejects clearing an absent transition",
+             QStringLiteral("V1 track was not available"));
+        fail("G91 trim_clip rejects in trim at clip end",
+             QStringLiteral("V1 track was not available"));
+        fail("G92 trim_clip rejects out trim beyond source end",
+             QStringLiteral("V1 track was not available"));
+        fail("G93 trim_clip rejects ripple:false",
+             QStringLiteral("V1 track was not available"));
+    } else {
+        auto saveMcpLiveBaseline = [&]() {
+            projectTimeline->clearSelection();
+            projectTimeline->undoManager()->clear();
+            projectTimeline->undoManager()->saveState(
+                projectTimeline->currentState(), QStringLiteral("MCP selftest new tools baseline"));
+        };
+
+        captionVideo0->setClips(QVector<ClipInfo>{
+            makeTestClip(QStringLiteral("trim-A"), 0),
+            makeTestClip(QStringLiteral("trim-B"), 0)
+        });
+        saveMcpLiveBaseline();
+        const QJsonObject trimResponse = callProjectInfoTool(
+            86, QStringLiteral("trim_clip"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 0},
+                {QStringLiteral("edge"), QStringLiteral("in")},
+                {QStringLiteral("timeSec"), 1.0}
+            });
+        const QJsonObject trimPayload = toolPayload(trimResponse);
+        const bool trimChanged = !toolResult(trimResponse)
+                                      .value(QStringLiteral("isError")).toBool(true)
+            && trimPayload.value(QStringLiteral("ok")).toBool(false)
+            && requiredOutputFieldsPresent(QStringLiteral("trim_clip"), trimPayload)
+            && qAbs(trimPayload.value(QStringLiteral("startSec")).toDouble(-1.0) - 0.0) < 1e-9
+            && qAbs(trimPayload.value(QStringLiteral("endSec")).toDouble(-1.0) - 4.0) < 1e-9
+            && qAbs(captionVideo0->clips().first().inPoint - 1.0) < 1e-9;
+        const QJsonObject trimUndoResponse = trimChanged
+            ? callProjectInfoTool(87, QStringLiteral("undo"), QJsonObject{}) : QJsonObject();
+        const bool trimUndoRestored = trimChanged
+            && toolPayload(trimUndoResponse).value(QStringLiteral("ok")).toBool(false)
+            && !captionVideo0->clips().isEmpty()
+            && qAbs(captionVideo0->clips().first().inPoint) < 1e-9
+            && qAbs(captionVideo0->clips().first().effectiveDuration() - 5.0) < 1e-9;
+        const bool g84 = trimChanged && trimUndoRestored;
+        g84 ? pass("G84 trim_clip changes and undoes a live clip")
+            : fail("G84 trim_clip changes and undoes a live clip",
+                   QStringLiteral("trim output, live clip state, or undo restoration did not match"));
+
+        const QJsonObject invalidTrimResponse = callProjectInfoTool(
+            88, QStringLiteral("trim_clip"), QJsonObject{
+                {QStringLiteral("clipIndex"), 0},
+                {QStringLiteral("edge"), QStringLiteral("middle")},
+                {QStringLiteral("timeSec"), 1.0}
+            });
+        const bool g85 = toolResult(invalidTrimResponse)
+                             .value(QStringLiteral("isError")).toBool(false)
+            && toolPayload(invalidTrimResponse).isEmpty();
+        g85 ? pass("G85 trim_clip rejects an invalid edge")
+            : fail("G85 trim_clip rejects an invalid edge",
+                   QStringLiteral("an invalid edge was accepted"));
+
+        captionVideo0->setClips(QVector<ClipInfo>{
+            makeTestClip(QStringLiteral("transition-A"), 0),
+            makeTestClip(QStringLiteral("transition-B"), 0)
+        });
+        saveMcpLiveBaseline();
+        const QJsonObject transitionResponse = callProjectInfoTool(
+            89, QStringLiteral("set_transition"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 0},
+                {QStringLiteral("type"), QStringLiteral("FadeOut")},
+                {QStringLiteral("durationSec"), 0.75}
+            });
+        const QJsonObject transitionPayload = toolPayload(transitionResponse);
+        const bool transitionChanged = !toolResult(transitionResponse)
+                                            .value(QStringLiteral("isError")).toBool(true)
+            && transitionPayload.value(QStringLiteral("ok")).toBool(false)
+            && requiredOutputFieldsPresent(QStringLiteral("set_transition"),
+                                           transitionPayload)
+            && transitionPayload.value(QStringLiteral("type")).toString()
+                   == QStringLiteral("FadeOut")
+            && qAbs(transitionPayload.value(QStringLiteral("durationSec"))
+                        .toDouble(-1.0) - 0.75) < 1e-9
+            && captionVideo0->clips().first().trailOut.type == TransitionType::FadeOut
+            && qAbs(captionVideo0->clips().first().trailOut.duration - 0.75) < 1e-9
+            && captionVideo0->clips().at(1).leadIn.type == TransitionType::FadeIn
+            && captionVideo0->selectedClip() < 0
+            && !projectTimeline->hasAnySelection();
+        const QJsonObject transitionUndoResponse = transitionChanged
+            ? callProjectInfoTool(90, QStringLiteral("undo"), QJsonObject{}) : QJsonObject();
+        const bool transitionUndoRestored = transitionChanged
+            && toolPayload(transitionUndoResponse).value(QStringLiteral("ok")).toBool(false)
+            && captionVideo0->clips().first().trailOut.type == TransitionType::None
+            && captionVideo0->clips().at(1).leadIn.type == TransitionType::None;
+        const bool g86 = transitionChanged && transitionUndoRestored;
+        g86 ? pass("G86 set_transition changes and undoes a live clip")
+            : fail("G86 set_transition changes and undoes a live clip",
+                   QStringLiteral("transition output, pairing, selection, or undo restoration did not match"));
+
+        const QJsonObject invalidTransitionResponse = callProjectInfoTool(
+            91, QStringLiteral("set_transition"), QJsonObject{
+                {QStringLiteral("clipIndex"), 0},
+                {QStringLiteral("type"), QStringLiteral("NotATransition")}
+            });
+        const bool g87 = toolResult(invalidTransitionResponse)
+                               .value(QStringLiteral("isError")).toBool(false)
+            && toolPayload(invalidTransitionResponse).isEmpty();
+        g87 ? pass("G87 set_transition rejects an invalid type")
+            : fail("G87 set_transition rejects an invalid type",
+                   QStringLiteral("an invalid TransitionType identifier was accepted"));
+
+        captionVideo0->setClips(QVector<ClipInfo>{makeTestClip(QStringLiteral("text-A"), 0)});
+        saveMcpLiveBaseline();
+        const QJsonObject textResponse = callProjectInfoTool(
+            92, QStringLiteral("add_text_overlay"), QJsonObject{
+                {QStringLiteral("text"), QStringLiteral("MCP title")},
+                {QStringLiteral("startSec"), 1.0},
+                {QStringLiteral("endSec"), 3.0},
+                {QStringLiteral("x"), 0.25},
+                {QStringLiteral("y"), 0.75},
+                {QStringLiteral("fontSize"), 24},
+                {QStringLiteral("color"), QStringLiteral("#ff0000")}
+            });
+        const QJsonObject textPayload = toolPayload(textResponse);
+        const bool textChanged = !toolResult(textResponse)
+                                      .value(QStringLiteral("isError")).toBool(true)
+            && textPayload.value(QStringLiteral("ok")).toBool(false)
+            && requiredOutputFieldsPresent(QStringLiteral("add_text_overlay"), textPayload)
+            && textPayload.value(QStringLiteral("index")).toInt(-1) == 0
+            && captionVideo0->clips().first().textManager.count() == 1
+            && captionVideo0->clips().first().textManager.overlays().first().text
+                   == QStringLiteral("MCP title")
+            && qAbs(captionVideo0->clips().first().textManager.overlays().first().startTime - 1.0)
+                   < 1e-9
+            && qAbs(captionVideo0->clips().first().textManager.overlays().first().endTime - 3.0)
+                   < 1e-9
+            && qAbs(captionVideo0->clips().first().textManager.overlays().first().x - 0.25)
+                   < 1e-9
+            && qAbs(captionVideo0->clips().first().textManager.overlays().first().y - 0.75)
+                   < 1e-9
+            && captionVideo0->clips().first().textManager.overlays().first().font.pointSize() == 24
+            && captionVideo0->clips().first().textManager.overlays().first().color
+                   == QColor(QStringLiteral("#ff0000"));
+        const QJsonObject textUndoResponse = textChanged
+            ? callProjectInfoTool(93, QStringLiteral("undo"), QJsonObject{}) : QJsonObject();
+        const bool textUndoRestored = textChanged
+            && toolPayload(textUndoResponse).value(QStringLiteral("ok")).toBool(false)
+            && !captionVideo0->clips().isEmpty()
+            && captionVideo0->clips().first().textManager.count() == 0;
+        const bool g88 = textChanged && textUndoRestored;
+        g88 ? pass("G88 add_text_overlay changes and undoes a live clip")
+            : fail("G88 add_text_overlay changes and undoes a live clip",
+                   QStringLiteral("text output, persisted overlay, preview data, or undo restoration did not match"));
+
+        const QJsonObject invalidTextResponse = callProjectInfoTool(
+            94, QStringLiteral("add_text_overlay"), QJsonObject{
+                {QStringLiteral("text"), QStringLiteral("invalid")},
+                {QStringLiteral("startSec"), 2.0},
+                {QStringLiteral("endSec"), 2.0}
+            });
+        const bool g89 = toolResult(invalidTextResponse)
+                            .value(QStringLiteral("isError")).toBool(false)
+            && toolPayload(invalidTextResponse).isEmpty();
+        g89 ? pass("G89 add_text_overlay rejects an invalid interval")
+            : fail("G89 add_text_overlay rejects an invalid interval",
+                   QStringLiteral("an interval with no positive duration was accepted"));
+
+        captionVideo0->setClips(QVector<ClipInfo>{
+            makeTestClip(QStringLiteral("transition-none"), 0)
+        });
+        saveMcpLiveBaseline();
+        const QJsonObject noTransitionResponse = callProjectInfoTool(
+            95, QStringLiteral("set_transition"), QJsonObject{
+                {QStringLiteral("clipIndex"), 0},
+                {QStringLiteral("type"), QStringLiteral("None")}
+            });
+        const bool g90 = toolResult(noTransitionResponse)
+                             .value(QStringLiteral("isError")).toBool(false)
+            && toolPayload(noTransitionResponse).isEmpty()
+            && !projectTimeline->canUndo()
+            && captionVideo0->clips().first().leadIn.type == TransitionType::None
+            && captionVideo0->clips().first().trailOut.type == TransitionType::None;
+        g90 ? pass("G90 set_transition rejects clearing an absent transition")
+            : fail("G90 set_transition rejects clearing an absent transition",
+                   QStringLiteral("clearing an absent transition was accepted or added undo state"));
+
+        captionVideo0->setClips(QVector<ClipInfo>{
+            makeTestClip(QStringLiteral("trim-in-boundary"), 0)
+        });
+        saveMcpLiveBaseline();
+        const QJsonObject trimInBoundaryResponse = callProjectInfoTool(
+            96, QStringLiteral("trim_clip"), QJsonObject{
+                {QStringLiteral("clipIndex"), 0},
+                {QStringLiteral("edge"), QStringLiteral("in")},
+                {QStringLiteral("timeSec"), 5.0}
+            });
+        const bool g91 = toolResult(trimInBoundaryResponse)
+                             .value(QStringLiteral("isError")).toBool(false)
+            && toolPayload(trimInBoundaryResponse).isEmpty()
+            && !projectTimeline->canUndo()
+            && qAbs(captionVideo0->clips().first().inPoint) < 1e-9
+            && qAbs(captionVideo0->clips().first().outPoint - 5.0) < 1e-9;
+        g91 ? pass("G91 trim_clip rejects in trim at clip end")
+            : fail("G91 trim_clip rejects in trim at clip end",
+                   QStringLiteral("edge=in accepted timeSec at or beyond the clip end"));
+
+        captionVideo0->setClips(QVector<ClipInfo>{
+            makeTestClip(QStringLiteral("trim-out-boundary"), 0)
+        });
+        saveMcpLiveBaseline();
+        const QJsonObject trimOutBoundaryResponse = callProjectInfoTool(
+            97, QStringLiteral("trim_clip"), QJsonObject{
+                {QStringLiteral("clipIndex"), 0},
+                {QStringLiteral("edge"), QStringLiteral("out")},
+                {QStringLiteral("timeSec"), 6.0}
+            });
+        const bool g92 = toolResult(trimOutBoundaryResponse)
+                             .value(QStringLiteral("isError")).toBool(false)
+            && toolPayload(trimOutBoundaryResponse).isEmpty()
+            && !projectTimeline->canUndo()
+            && qAbs(captionVideo0->clips().first().outPoint - 5.0) < 1e-9;
+        g92 ? pass("G92 trim_clip rejects out trim beyond source end")
+            : fail("G92 trim_clip rejects out trim beyond source end",
+                   QStringLiteral("edge=out accepted a timeSec beyond the source end"));
+
+        captionVideo0->setClips(QVector<ClipInfo>{
+            makeTestClip(QStringLiteral("trim-no-ripple"), 0)
+        });
+        saveMcpLiveBaseline();
+        const QJsonObject noRippleResponse = callProjectInfoTool(
+            98, QStringLiteral("trim_clip"), QJsonObject{
+                {QStringLiteral("clipIndex"), 0},
+                {QStringLiteral("edge"), QStringLiteral("in")},
+                {QStringLiteral("timeSec"), 1.0},
+                {QStringLiteral("ripple"), false}
+            });
+        const bool g93 = toolResult(noRippleResponse)
+                             .value(QStringLiteral("isError")).toBool(false)
+            && toolPayload(noRippleResponse).isEmpty()
+            && !projectTimeline->canUndo()
+            && qAbs(captionVideo0->clips().first().inPoint) < 1e-9
+            && qAbs(captionVideo0->clips().first().outPoint - 5.0) < 1e-9;
+        g93 ? pass("G93 trim_clip rejects ripple:false")
+            : fail("G93 trim_clip rejects ripple:false",
+                   QStringLiteral("ripple:false was accepted by trim_clip"));
+    }
+
     const QJsonObject commandListResponse = callProjectInfoTool(
         37, QStringLiteral("list_commands"), QJsonObject{});
     const QJsonObject commandListResult = toolPayload(commandListResponse);
@@ -2104,6 +2384,17 @@ int runMcpSelftest()
         {QStringLiteral("set_clip_property"), QJsonObject{
             {QStringLiteral("clipIndex"), 0}, {QStringLiteral("property"), QStringLiteral("volume")},
             {QStringLiteral("value"), 1.0}
+        }},
+        {QStringLiteral("trim_clip"), QJsonObject{
+            {QStringLiteral("clipIndex"), 0}, {QStringLiteral("edge"), QStringLiteral("in")},
+            {QStringLiteral("timeSec"), 1.0}
+        }},
+        {QStringLiteral("set_transition"), QJsonObject{
+            {QStringLiteral("clipIndex"), 0}, {QStringLiteral("type"), QStringLiteral("FadeOut")}
+        }},
+        {QStringLiteral("add_text_overlay"), QJsonObject{
+            {QStringLiteral("text"), QStringLiteral("text")},
+            {QStringLiteral("startSec"), 0.0}, {QStringLiteral("endSec"), 1.0}
         }}
     };
     bool nullWindowWriteToolsSafe = true;
