@@ -1125,6 +1125,14 @@ void GLPreview::setBrushAnimationProgress(double progress)
 
 GLPreview::~GLPreview()
 {
+    // ~QOpenGLWidget (which runs AFTER this body and after our members are gone)
+    // destroys the context and emits aboutToBeDestroyed. The QObject base that
+    // would auto-disconnect us is destroyed even later, so without this explicit
+    // disconnect the signal re-enters cleanupGL() on a half-destroyed object
+    // (QOpenGLBuffer::isCreated on freed m_vbo). Seen as a crash in the combined
+    // --selftest=all run (GradeKeyframeSelftest glPreviewInitializes teardown).
+    if (QOpenGLContext *ctx = context())
+        QObject::disconnect(ctx, &QOpenGLContext::aboutToBeDestroyed, this, nullptr);
     // Primary cleanup path is cleanupGL() via QOpenGLContext::aboutToBeDestroyed.
     // Fallback: only touch GL state here if a current context is available — calling
     // makeCurrent() on a destroyed context segfaults some drivers on shutdown.
