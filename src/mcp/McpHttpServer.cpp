@@ -137,6 +137,24 @@ QString toolCallName(const QByteArray& body)
         .value(QStringLiteral("name")).toString();
 }
 
+// initialize リクエストなら params.clientInfo の name / version を取り出す。
+bool initializeClientInfo(const QByteArray& body, QString* name, QString* version)
+{
+    const QJsonDocument document = QJsonDocument::fromJson(body);
+    if (!document.isObject())
+        return false;
+    const QJsonObject request = document.object();
+    if (request.value(QStringLiteral("method")).toString() != QStringLiteral("initialize"))
+        return false;
+    const QJsonObject clientInfo = request.value(QStringLiteral("params")).toObject()
+        .value(QStringLiteral("clientInfo")).toObject();
+    if (name)
+        *name = clientInfo.value(QStringLiteral("name")).toString();
+    if (version)
+        *version = clientInfo.value(QStringLiteral("version")).toString();
+    return true;
+}
+
 bool successfulToolCall(const QByteArray& response)
 {
     if (response.isEmpty())
@@ -595,6 +613,14 @@ void McpHttpServer::handleRequest(QTcpSocket* socket, const Request& request)
     }
     if (!calledTool.isEmpty())
         emit toolCalled(calledTool, successfulToolCall(response));
+    QString clientName;
+    QString clientVersion;
+    if (initializeClientInfo(request.body, &clientName, &clientVersion)
+        && QJsonDocument::fromJson(response).object().contains(QStringLiteral("result"))) {
+        m_lastClientName = clientName.isEmpty() ? QStringLiteral("(名前なし)") : clientName;
+        m_lastClientVersion = clientVersion;
+        emit clientInitialized(m_lastClientName, m_lastClientVersion);
+    }
 
     if (response.isEmpty()) {
         QHash<QByteArray, QByteArray> headers = corsHeaders(origin);

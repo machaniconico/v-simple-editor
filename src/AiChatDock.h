@@ -12,6 +12,7 @@ class MainWindow;
 class QEvent;
 class QLabel;
 class QPlainTextEdit;
+class QComboBox;
 class QPushButton;
 class QTimer;
 
@@ -45,6 +46,18 @@ public:
     // 入力欄にキーボードフォーカスを移す (「LLM に指示を出す」ボタンから呼ばれる)。
     void focusPrompt();
 
+    // Dock が起動する CLI。Claude Code は HTTP の MCP 設定ファイル、Codex CLI は
+    // `codex exec --json` に stdio ブリッジ (このエディタ自身 --mcp-stdio) を -c で渡す。
+    enum class Provider { Claude, Codex };
+    Provider provider() const { return m_provider; }
+    // codex exec の引数。TOML の値はシングルクォート文字列にして、cmd.exe 経由の
+    // クォート規則 (" % ! を拒否) を通す。threadId があれば `exec resume <id>`。
+    static QStringList buildCodexArguments(quint16 port, const QString& token,
+                                           const QString& editorPath,
+                                           const QString& threadId);
+    // ~/.codex/config.toml (CODEX_HOME) の model = "..."。無ければ空。
+    static QString codexConfiguredModel();
+
 protected:
     bool eventFilter(QObject *watched, QEvent *event) override;
 
@@ -63,6 +76,12 @@ private:
     bool writeMcpConfig();
     void updateRunningStatus();
     void armWatchdog();
+    // Dock 下部の接続状態行: MCP サーバの待受 (ポート)、接続元クライアント、CLI 検出、モデル。
+    void refreshConnectionStatus();
+    // 「接続 / 切断」ボタン: MCP サーバを起動 / 停止する。
+    void toggleConnection();
+    // codex exec --json の 1 イベント (thread.started / item.* / turn.* / error)。
+    void processCodexOutputLine(const QJsonObject& object);
 
     MainWindow *m_mainWindow = nullptr;
     mcp::McpHttpServer *m_server = nullptr;
@@ -71,6 +90,13 @@ private:
     QPushButton *m_sendButton = nullptr;
     QPushButton *m_stopButton = nullptr;
     QLabel *m_statusLabel = nullptr;
+    QLabel *m_connectionLabel = nullptr;
+    QPushButton *m_connectButton = nullptr;
+    QComboBox *m_providerCombo = nullptr;
+    Provider m_provider = Provider::Claude;
+    QString m_model;              // 起動した CLI が報告したモデル (Claude の init イベント)
+    QString m_lastClientName;     // MCP サーバに initialize した最後のクライアント
+    QString m_lastClientVersion;
     QProcess *m_process = nullptr;
     QTimer *m_watchdog = nullptr;
     QTimer *m_statusTimer = nullptr;

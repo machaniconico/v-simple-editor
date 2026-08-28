@@ -139,6 +139,8 @@ API キー方式でモデルを呼び出すと、通常は API の従量課金�
 command = "v-simple-editor.exe"
 args = ["--mcp-stdio", "--port", "8765"]
 env = { VEDITOR_MCP_TOKEN = "<token>" }
+# 非対話 (codex exec) でツール呼び出しが自動拒否されないようにする
+default_tools_approval_mode = "approve"
 ```
 
 このブリッジは stdin/stdout の「1 行 1 JSON-RPC」を localhost の HTTP MCP サーバへ中継します。HTTP/ネットワークのエラーはプロセスを落とさず、`-32603` と次のメッセージを返します: `invalid token`（HTTP 401、トークン不一致）、`editor did not respond in time`（リクエストタイムアウト）、`editor not running`（接続拒否）、`unexpected editor response`（その他の HTTP/ネットワークエラー）。ポートを変更した場合は `--port` も合わせて変更してください。
@@ -147,7 +149,7 @@ env = { VEDITOR_MCP_TOKEN = "<token>" }
 
 ### エディタ内 AI チャット
 
-一番簡単な入口は画面右下（ステータスバー右端）の **「LLM に指示を出す」** ボタンです。押すと MCP サーバの起動と AI チャット Dock の表示をまとめて行い、入力欄にフォーカスが移ります（不要なら **表示 > 「LLM に指示を出す」ボタンを表示** のチェックを外すと隠せます。設定は保存されます）。**表示 > AI チャット** で AI チャット Dock を直接開くこともできます。Dock は `claude` CLI を headless で `-p --output-format stream-json --verbose --mcp-config <一時json> --strict-mcp-config [--resume <sessionId>] --allowedTools mcp__veditor` のオプション付きで起動し、MCP 設定を一時ファイルで渡して `veditor` のツールだけを許可します。プロンプトは argv ではなく stdin で渡します。会話継続時は前回の `session_id` を `--resume <sessionId>` で指定します（`--allowedTools` の直前）。子プロセスの環境から `ANTHROPIC_API_KEY` と `ANTHROPIC_AUTH_TOKEN` を除去するため、ログイン済みの Claude Pro / Max のサブスク枠で動作します。使用する CLI 名は QSettings の `aiChatCommand` で変更できます。
+一番簡単な入口は画面右下（ステータスバー右端）の **「LLM に指示を出す」** ボタンです。押すと MCP サーバの起動と AI チャット Dock の表示をまとめて行い、入力欄にフォーカスが移ります（不要なら **表示 > 「LLM に指示を出す」ボタンを表示** のチェックを外すと隠せます。設定は保存されます）。**表示 > AI チャット** で AI チャット Dock を直接開くこともできます。Dock の下部 (送信ボタンの下) には MCP サーバの状態（待受ポート）、最後に接続してきたクライアント（`initialize` の clientInfo: Claude Code / Codex など）、選択中の CLI の検出状況とモデル名が常に表示され、隣の **「接続 / 切断」** ボタンでサーバを起動・停止できます。CLI の選択で **Claude Code** と **Codex CLI** を切り替えられます。Codex は `codex exec --json` を stdio ブリッジ（このエディタ自身の `--mcp-stdio`）付きで起動し、会話継続は `codex exec resume <thread_id>`、モデル名は `~/.codex/config.toml` の `model` を表示します（コマンド名は QSettings の `aiChatCodexCommand`、既定 `codex`）。Codex は MCP ツール呼び出しごとに承認を求め、非対話実行では自動拒否（`user cancelled MCP tool call`）されるため、このサーバに限り `-c mcp_servers.veditor.default_tools_approval_mode='approve'` を渡して自動承認にしています（シェルコマンドの sandbox は `read-only` のまま）。`~/.codex/config.toml` に手で登録する場合も同じキーを付けてください。Dock は `claude` CLI を headless で `-p --output-format stream-json --verbose --mcp-config <一時json> --strict-mcp-config [--resume <sessionId>] --allowedTools mcp__veditor` のオプション付きで起動し、MCP 設定を一時ファイルで渡して `veditor` のツールだけを許可します。プロンプトは argv ではなく stdin で渡します。会話継続時は前回の `session_id` を `--resume <sessionId>` で指定します（`--allowedTools` の直前）。子プロセスの環境から `ANTHROPIC_API_KEY` と `ANTHROPIC_AUTH_TOKEN` を除去するため、ログイン済みの Claude Pro / Max のサブスク枠で動作します。使用する CLI 名は QSettings の `aiChatCommand` で変更できます。
 
 `claude` が PATH に無い場合は、先に次を実行してください。
 
@@ -191,7 +193,7 @@ MCP の変更系ツールは確認ダイアログを出さず、原則として�
 | `undo` | 直前の編集を元に戻す | なし |
 | `redo` | 元に戻した編集をやり直す | なし |
 
-MCP サーバの自己テストは `--selftest=mcp` または `VEDITOR_MCP_SELFTEST=1` で実行できます（実装: `src/selftests/mcp_selftest.cpp`、ゲート G1..G110）。
+MCP サーバの自己テストは `--selftest=mcp` または `VEDITOR_MCP_SELFTEST=1` で実行できます（実装: `src/selftests/mcp_selftest.cpp`、ゲート G1..G113）。
 
 ---
 
