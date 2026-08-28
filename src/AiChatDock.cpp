@@ -108,6 +108,12 @@ AiChatDock::AiChatDock(MainWindow *mainWindow, mcp::McpHttpServer *server,
     // Console の従量課金に落ちるため、起動時に childEnvironment() を適用する。
 }
 
+void AiChatDock::focusPrompt()
+{
+    if (m_input)
+        m_input->setFocus(Qt::OtherFocusReason);
+}
+
 AiChatDock::~AiChatDock()
 {
     if (m_watchdog)

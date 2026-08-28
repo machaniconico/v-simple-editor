@@ -310,6 +310,7 @@ double exporter_loudnessGainDb();
 #include <QColorDialog>
 #include <QFormLayout>
 #include <QLabel>
+#include <QToolButton>
 #include <QListWidget>
 #include <QMouseEvent>
 #include <QKeyEvent>
@@ -6726,6 +6727,7 @@ void MainWindow::setupMenuBar()
     // 既存の favoritable QAction の id を変更しない。
     auto *aiChatAction = viewMenu->addAction(QStringLiteral("AI チャット"));
     aiChatAction->setCheckable(true);
+    m_aiChatAction = aiChatAction;
     connect(aiChatAction, &QAction::toggled, this, [this, aiChatAction](bool visible) {
         if (visible && !m_aiChatDock) {
             ensureMcpServerComponents();
@@ -6739,6 +6741,28 @@ void MainWindow::setupMenuBar()
     });
     m_menuHelpEntries.append({aiChatAction,
         QStringLiteral("ログイン済みの Claude Code CLI と MCP で、会話しながらタイムラインを編集します。")});
+
+    // ステータスバー右端の「LLM に指示を出す」ボタンの表示切替 (設定に保存)。
+    // 表示メニューの末尾に追加し、既存の favoritable QAction の id を変更しない。
+    m_llmAssistantToggleAction = viewMenu->addAction(
+        QStringLiteral("「LLM に指示を出す」ボタンを表示"));
+    m_llmAssistantToggleAction->setCheckable(true);
+    {
+        QSettings prefSettings("VSimpleEditor", "Preferences");
+        m_llmAssistantToggleAction->setChecked(
+            prefSettings.value(QStringLiteral("llmAssistantButtonVisible"), true).toBool());
+    }
+    connect(m_llmAssistantToggleAction, &QAction::toggled, this, [this](bool visible) {
+        QSettings prefSettings("VSimpleEditor", "Preferences");
+        prefSettings.setValue(QStringLiteral("llmAssistantButtonVisible"), visible);
+        if (m_llmAssistantButton)
+            m_llmAssistantButton->setVisible(visible);
+        statusBar()->showMessage(visible
+            ? QStringLiteral("「LLM に指示を出す」ボタンを表示しました")
+            : QStringLiteral("「LLM に指示を出す」ボタンを隠しました (表示メニューから戻せます)"));
+    });
+    m_menuHelpEntries.append({m_llmAssistantToggleAction,
+        QStringLiteral("画面右下の「LLM に指示を出す」ボタンを表示するかどうかを切り替えます。")});
 
     // 取り込み配置ポリシー: 並列トラック (V2/A2...) か 現在トラック追加 (V1/A1 連結)
     auto *importPlacementGroup = new QActionGroup(this);
@@ -16600,6 +16624,48 @@ void MainWindow::setupStatusBarWidgets()
     m_statusDuration = makeLabel("00:00:00");
     m_statusAces = makeLabel(QStringLiteral("ACES: 無効"));
     m_statusTheme = makeLabel("Dark");
+
+    // 画面右下の常設入口。「表示 > 『LLM に指示を出す』ボタンを表示」で隠せる。
+    m_llmAssistantButton = new QToolButton(this);
+    m_llmAssistantButton->setObjectName(QStringLiteral("LlmAssistantButton"));
+    m_llmAssistantButton->setText(QStringLiteral("LLM に指示を出す"));
+    m_llmAssistantButton->setToolTip(QStringLiteral(
+        "AI チャットを開き、Claude Code に日本語で編集を依頼します (MCP サーバも自動で起動)。\n"
+        "例: 「この動画を取り込んで 2.5 秒で分割し、字幕を付けて mp4 に書き出して」"));
+    m_llmAssistantButton->setCursor(Qt::PointingHandCursor);
+    m_llmAssistantButton->setStyleSheet(
+        "QToolButton { background: #2f6feb; color: white; border: none; border-radius: 4px;"
+        " padding: 2px 10px; margin: 0 6px; font-size: 11px; font-weight: bold; }"
+        "QToolButton:hover { background: #3b7ff5; }"
+        "QToolButton:pressed { background: #245ac4; }");
+    connect(m_llmAssistantButton, &QToolButton::clicked,
+            this, &MainWindow::openLlmAssistant);
+    statusBar()->addPermanentWidget(m_llmAssistantButton);
+    {
+        QSettings settings(QStringLiteral("VSimpleEditor"), QStringLiteral("Preferences"));
+        m_llmAssistantButton->setVisible(
+            settings.value(QStringLiteral("llmAssistantButtonVisible"), true).toBool());
+    }
+}
+
+void MainWindow::openLlmAssistant()
+{
+    // 1. MCP サーバ (チェック状態 == 稼働状態)。失敗時は toggleMcpServer が警告を出す。
+    if (m_mcpToggleAction && !m_mcpToggleAction->isChecked())
+        m_mcpToggleAction->setChecked(true);
+    if (!m_mcpServer || !m_mcpServer->isRunning())
+        return;
+    // 2. AI チャット Dock (初回はここで生成される)。
+    if (m_aiChatAction)
+        m_aiChatAction->setChecked(true);
+    if (m_aiChatDock) {
+        m_aiChatDock->show();
+        m_aiChatDock->raise();
+        m_aiChatDock->focusPrompt();
+    }
+    statusBar()->showMessage(
+        QStringLiteral("AI チャットに日本語で依頼してください (例: この動画を取り込んで 2.5 秒で分割して)"),
+        8000);
 }
 
 void MainWindow::updateStatusInfo()

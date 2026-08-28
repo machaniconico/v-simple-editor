@@ -42,6 +42,8 @@ public:
                                          const QStringList& args,
                                          QString* error = nullptr);
     static QByteArray buildMcpConfig(quint16 port, const QString& token);
+    // 入力欄にキーボードフォーカスを移す (「LLM に指示を出す」ボタンから呼ばれる)。
+    void focusPrompt();
 
 protected:
     bool eventFilter(QObject *watched, QEvent *event) override;
