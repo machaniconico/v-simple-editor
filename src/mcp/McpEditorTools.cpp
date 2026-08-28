@@ -20,11 +20,15 @@
 #include <QPointer>
 #include <QTimer>
 #include <QUuid>
+#include <QSet>
 #include <QStringList>
 #include <QtGlobal>
 
 #include <cmath>
 #include <limits>
+
+// Exporter.cpp: GUI の exportVideo と同じラウドネス正規化ゲインを export_video にも適用する。
+double exporter_loudnessGainDb();
 
 namespace mcp {
 
@@ -451,10 +455,18 @@ bool readClipTarget(const QJsonObject& args, MainWindow* window,
 
     TimelineTrack* track = currentTimeline->trackAt(
         kind == QStringLiteral("audio"), trackIndex);
-    if (!track)
-        return setError(err, QStringLiteral("track index is out of range"));
-    if (clipIndex >= track->clipCount())
-        return setError(err, QStringLiteral("clip index is out of range"));
+    if (!track) {
+        const int trackCount = kind == QStringLiteral("audio")
+            ? currentTimeline->audioTracks().size()
+            : currentTimeline->videoTracks().size();
+        return setError(err, QStringLiteral("track index is out of range (%1 トラックは %2 本: 0..%3)")
+                                 .arg(kind).arg(trackCount).arg(trackCount - 1));
+    }
+    if (clipIndex >= track->clipCount()) {
+        return setError(err, QStringLiteral("clip index is out of range (%1 トラック %2 のクリップは %3 個: 0..%4)")
+                                 .arg(kind).arg(trackIndex).arg(track->clipCount())
+                                 .arg(track->clipCount() - 1));
+    }
 
     double cursor = 0.0;
     const QVector<ClipInfo>& clips = track->clips();
@@ -594,6 +606,24 @@ void McpEditorTools::endExclusiveWrite()
     m_activeWriteTool.clear();
 }
 
+namespace {
+
+// export_video はライブの Timeline をレンダースレッドへ渡すので、レンダリング中に
+// クリップ構成を変える変更系ツールは拒否する。選択・再生ヘッド・保存・字幕エディタ
+// 側の一覧編集はタイムラインのクリップ配列を触らないので通す。
+bool toolMutatesTimeline(const QString& toolName)
+{
+    static const QSet<QString> kNonMutating{
+        QStringLiteral("export_video"), QStringLiteral("select_clip"),
+        QStringLiteral("clear_selection"), QStringLiteral("set_playhead"),
+        QStringLiteral("save_project"), QStringLiteral("add_caption"),
+        QStringLiteral("remove_caption"), QStringLiteral("clear_captions")
+    };
+    return !kNonMutating.contains(toolName);
+}
+
+} // namespace
+
 ToolHandler McpEditorTools::guardedWrite(const QString& toolName, ToolHandler inner)
 {
     return [this, toolName, inner](const QJsonObject& args, QString* err) -> QJsonObject {
@@ -603,6 +633,17 @@ ToolHandler McpEditorTools::guardedWrite(const QString& toolName, ToolHandler in
             McpEditorTools* tools;
             ~Reset() { tools->endExclusiveWrite(); }
         } reset{this};
+        RenderQueue* queue = m_window ? m_window->m_renderQueue : nullptr;
+        if (queue && toolMutatesTimeline(toolName)) {
+            for (const RenderJob& job : queue->jobs()) {
+                if (job.status != RenderJobStatus::Rendering)
+                    continue;
+                return setError(err,
+                                QStringLiteral("書き出し中 (jobId %1) はタイムラインを変更できません。get_export_status で done / failed になるのを待ってから再試行してください。")
+                                    .arg(job.uuid)),
+                       QJsonObject();
+            }
+        }
         return inner(args, err);
     };
 }
@@ -1172,7 +1213,7 @@ void McpEditorTools::registerReadTools()
     };
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("list_commands"),
-        QStringLiteral("エディタで利用できるお気に入り登録可能なコマンドを列挙する。query を指定すると id / 表示名 / メニュー階層を大文字小文字を区別せず部分一致で絞り込む。id、表示名、メニュー階層、危険度 (safe / blocking / quit)、有効状態を返す。blocking のコマンドは run_command で既定では実行を拒否される。"),
+        QStringLiteral("エディタで利用できるお気に入り登録可能なコマンドを列挙する。query を指定すると id / 表示名 / メニュー階層を大文字小文字を区別せず部分一致で絞り込む。query 省略時は全件 (約 230 件、JSON で約 60KB) を返すので、通常は query で絞り込むこと。id、表示名、メニュー階層、危険度 (safe / blocking / quit)、有効状態を返す。blocking のコマンドは run_command で既定では実行を拒否される。"),
         objectSchema(commandProperties),
         [this](const QJsonObject& args, QString* err) -> QJsonObject {
             if (!rejectUnknownArguments(args, {QStringLiteral("query")}, err))
@@ -1239,7 +1280,9 @@ void McpEditorTools::registerWriteTools()
         {QStringLiteral("height"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
         {QStringLiteral("fps"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
         {QStringLiteral("videoCodec"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
-        {QStringLiteral("videoBitrate"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}}
+        {QStringLiteral("videoBitrate"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+        {QStringLiteral("audioCodec"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
+        {QStringLiteral("audioBitrate"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}}
     }, {QStringLiteral("ok"), QStringLiteral("jobId"),
         QStringLiteral("status"), QStringLiteral("progress"),
         QStringLiteral("outputPath"), QStringLiteral("width"),
@@ -1318,7 +1361,8 @@ void McpEditorTools::registerWriteTools()
     const QJsonObject setClipPropertyOutputSchema = outputSchemaOf(QJsonObject{
         {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
         {QStringLiteral("property"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
-        {QStringLiteral("value"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}}
+        {QStringLiteral("value"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
+        {QStringLiteral("linkedApplied"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}}
     }, {QStringLiteral("ok"), QStringLiteral("property"),
         QStringLiteral("value")});
 
@@ -1359,7 +1403,11 @@ void McpEditorTools::registerWriteTools()
         {QStringLiteral("x"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
         {QStringLiteral("y"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
         {QStringLiteral("fontSize"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
-        {QStringLiteral("color"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}}
+        {QStringLiteral("color"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
+        {QStringLiteral("clipIndices"), QJsonObject{
+            {QStringLiteral("type"), QStringLiteral("array")},
+            {QStringLiteral("items"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}}
+        }}
     }, {QStringLiteral("ok"), QStringLiteral("index"),
         QStringLiteral("text"), QStringLiteral("startSec"),
         QStringLiteral("endSec"), QStringLiteral("x"),
@@ -1401,7 +1449,7 @@ void McpEditorTools::registerWriteTools()
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("export_video"),
-        QStringLiteral("現在のタイムラインを動画ファイルへ非同期で書き出す。tools/call はジョブ投入後すぐに jobId を返し、完了は get_export_status で確認する。width / height / fps の省略時は現在のプロジェクト設定を使い、videoBitrate は kbps。"),
+        QStringLiteral("現在のタイムラインを動画ファイルへ非同期で書き出す。tools/call はジョブ投入後すぐに jobId を返し、完了は get_export_status で確認する。width / height / fps の省略時は現在のプロジェクト設定を使い、videoBitrate / audioBitrate は kbps (既定 10000 / 192)、videoCodec / audioCodec は ffmpeg のエンコーダ名 (既定 libx264 / aac)。音声はトリム・分割・並べ替え・音量・ミュートを反映したタイムラインのミックスを ffmpeg で作ってから多重化する (ffmpeg が PATH に無いと単純な 1 クリップ構成以外は failed になる)。"),
         schemaWithRequired(QJsonObject{
             {QStringLiteral("outputPath"), QJsonObject{
                 {QStringLiteral("type"), QStringLiteral("string")}
@@ -1425,6 +1473,15 @@ void McpEditorTools::registerWriteTools()
                 {QStringLiteral("type"), QStringLiteral("integer")},
                 {QStringLiteral("minimum"), 1},
                 {QStringLiteral("description"), QStringLiteral("kbps")}
+            }},
+            {QStringLiteral("audioCodec"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("string")},
+                {QStringLiteral("description"), QStringLiteral("ffmpeg の音声エンコーダ名。既定 aac")}
+            }},
+            {QStringLiteral("audioBitrate"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("integer")},
+                {QStringLiteral("minimum"), 1},
+                {QStringLiteral("description"), QStringLiteral("kbps。既定 192")}
             }}
         }, {QStringLiteral("outputPath")}),
         guardedWrite(QStringLiteral("export_video"),
@@ -1435,7 +1492,9 @@ void McpEditorTools::registerWriteTools()
                                          QStringLiteral("height"),
                                          QStringLiteral("fps"),
                                          QStringLiteral("videoCodec"),
-                                         QStringLiteral("videoBitrate")}, err))
+                                         QStringLiteral("videoBitrate"),
+                                         QStringLiteral("audioCodec"),
+                                         QStringLiteral("audioBitrate")}, err))
                 return {};
 
             QString outputPath;
@@ -1459,6 +1518,9 @@ void McpEditorTools::registerWriteTools()
             }
             if (!m_window || !timeline())
                 return setError(err, QStringLiteral("エディタまたはタイムラインを利用できません")),
+                       QJsonObject();
+            if (timeline()->totalDuration() <= 0.0)
+                return setError(err, QStringLiteral("タイムラインが空です。import_media で素材を追加してください")),
                        QJsonObject();
 
             const int defaultWidth = qMax(2, m_window->m_projectConfig.width);
@@ -1496,6 +1558,19 @@ void McpEditorTools::registerWriteTools()
                                  videoBitrate, &videoBitrate, err))
                 return {};
 
+            QString audioCodec = QStringLiteral("aac");
+            if (args.contains(QStringLiteral("audioCodec"))) {
+                const QJsonValue value = args.value(QStringLiteral("audioCodec"));
+                if (!value.isString() || value.toString().trimmed().isEmpty())
+                    return setError(err, QStringLiteral("audioCodec は空でない文字列で指定してください")),
+                           QJsonObject();
+                audioCodec = value.toString().trimmed();
+            }
+            int audioBitrate = 192; // kbps。ExportConfig の既定値と合わせる。
+            if (!positiveInteger(args, QStringLiteral("audioBitrate"),
+                                 audioBitrate, &audioBitrate, err))
+                return {};
+
             RenderQueue* queue = ensureRenderQueue(err);
             if (!queue)
                 return {};
@@ -1505,7 +1580,11 @@ void McpEditorTools::registerWriteTools()
             job.name = QFileInfo(outputPath).fileName();
             if (job.name.isEmpty())
                 job.name = outputPath;
-            job.projectFilePath = m_window->m_projectFilePath;
+            // projectFilePath は RenderQueue の音声 mux 元を兼ねる。MCP のプロジェクト
+            // パスは常にプロジェクト JSON で音声ソースにならないので渡さない (空なら
+            // RenderQueue は V1 先頭クリップの元音声へフォールバックする)。タイムラインの
+            // 音声ミックスが必要なら、下の遅延ステップでそのパスを入れる。
+            job.projectFilePath.clear();
             job.outputPath = outputPath;
             job.width = width;
             job.height = height;
@@ -1514,14 +1593,17 @@ void McpEditorTools::registerWriteTools()
             job.startUs = 0;
             job.endUs = 0;
             job.timeline = timeline();
+            const double loudnessGainDb = exporter_loudnessGainDb();
+            job.loudnessGainDb = loudnessGainDb;
             job.exportConfig = QJsonObject{
                 {QStringLiteral("width"), width},
                 {QStringLiteral("height"), height},
                 {QStringLiteral("fps"), fps},
                 {QStringLiteral("videoCodec"), videoCodec},
                 {QStringLiteral("videoBitrate"), videoBitrate},
-                {QStringLiteral("audioCodec"), QStringLiteral("aac")},
-                {QStringLiteral("audioBitrate"), 192}
+                {QStringLiteral("audioCodec"), audioCodec},
+                {QStringLiteral("audioBitrate"), audioBitrate},
+                {QStringLiteral("loudnessGainDb"), loudnessGainDb}
             };
 
             // ライブ Timeline を渡す経路は GUI の表示内容をそのまま使うため、
@@ -1538,18 +1620,32 @@ void McpEditorTools::registerWriteTools()
             }
             timeline()->setTrackMatteEntries(matteEntries);
             queue->setAcesPipeline(m_window->m_acesPipeline);
-            queue->addJob(job);
+            queue->setLoudnessGainDb(loudnessGainDb);
             m_exportJobObservations.insert(job.uuid,
                                            ExportJobObservation{
                                                QStringLiteral("queued"), 0, QString()});
 
-            // start() は Timeline の解決やレンダースレッドの準備を行うため、
-            // tools/call の中では待たない。GUI イベントループへ移して jobId を
-            // 先に返し、実処理の状態は get_export_status で確認できるようにする。
+            // 音声ミックス (ffmpeg 同期実行) と start() は tools/call の中では走らせない。
+            // jobId を先に返し、GUI イベントループでミックスを作ってからジョブを投入する。
+            // それまで get_export_status は観測テーブルの queued を返す。
             const QPointer<RenderQueue> queueGuard(queue);
-            QTimer::singleShot(0, m_window, [queueGuard]() {
-                if (queueGuard)
-                    queueGuard->start();
+            const QPointer<MainWindow> windowGuard(m_window);
+            const QString jobId = job.uuid;
+            QTimer::singleShot(0, m_window, [this, queueGuard, windowGuard, job, jobId]() mutable {
+                if (!queueGuard || !windowGuard || windowGuard->m_mcpTools != this)
+                    return;
+                QString audioMixError;
+                const QString audioMixPath = windowGuard->prepareExportAudioMix(&audioMixError);
+                if (!audioMixError.isEmpty()) {
+                    ExportJobObservation& observation = m_exportJobObservations[jobId];
+                    observation.status = QStringLiteral("failed");
+                    observation.error = audioMixError;
+                    return;
+                }
+                if (!audioMixPath.isEmpty())
+                    job.projectFilePath = audioMixPath;
+                queueGuard->addJob(job);
+                queueGuard->start();
             });
 
             return QJsonObject{
@@ -1562,17 +1658,28 @@ void McpEditorTools::registerWriteTools()
                 {QStringLiteral("height"), height},
                 {QStringLiteral("fps"), fps},
                 {QStringLiteral("videoCodec"), videoCodec},
-                {QStringLiteral("videoBitrate"), videoBitrate}
+                {QStringLiteral("videoBitrate"), videoBitrate},
+                {QStringLiteral("audioCodec"), audioCodec},
+                {QStringLiteral("audioBitrate"), audioBitrate}
             };
         })
     }, exportVideoOutputSchema));
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("import_media"),
-        QStringLiteral("ダイアログを開かずに素材を指定トラックへ取り込む。trackIndex は映像・音声で同じ番号のトラックペアを指し、存在しなければ両方を作成する (0-based、既定 0)。startSec 省略時は指定した映像トラックの末尾に追記し、音声も同じ開始時刻に置く。startSec 指定時は既存クリップと重なる位置には配置せずエラーで拒否する (丸めない)。映像と音声の組は既存のGUI経路と同じlinkGroupでリンクし、Undo 1 回で取り消せる。"),
+        QStringLiteral("ダイアログを開かずに素材を指定トラックへ取り込む。trackIndex は映像・音声で同じ番号のトラックペアを指し、存在しなければ両方を作成する (0-based、既定 0)。startSec 省略時は指定した映像トラックの末尾に追記し、音声も同じ開始時刻に置く。startSec 指定時は既存クリップと重なる位置には配置せずエラーで拒否する (丸めない)。kind 既定 auto はファイルのストリーム構成で決め、映像の無いファイル (BGM / ナレーション) は音声トラックだけへ置く。video / audio で片側だけ取り込める。映像と音声の組は既存のGUI経路と同じlinkGroupでリンクし、Undo 1 回で取り消せる。動画/音声として開けないファイルはエラー。"),
         schemaWithRequired(QJsonObject{
             {QStringLiteral("filePath"), QJsonObject{
                 {QStringLiteral("type"), QStringLiteral("string")}
+            }},
+            {QStringLiteral("kind"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("string")},
+                {QStringLiteral("enum"), QJsonArray{
+                    QStringLiteral("auto"), QStringLiteral("video"), QStringLiteral("audio")
+                }},
+                {QStringLiteral("default"), QStringLiteral("auto")},
+                {QStringLiteral("description"),
+                 QStringLiteral("auto: 映像があれば V/A の組、無ければ音声だけ。video: 映像だけ。audio: 音声だけ (BGM やナレーションの追加)。省略時は auto")}
             }},
             {QStringLiteral("trackIndex"), QJsonObject{
                 {QStringLiteral("type"), QStringLiteral("integer")},
@@ -1592,7 +1699,8 @@ void McpEditorTools::registerWriteTools()
             if (!rejectUnknownArguments(args,
                                         {QStringLiteral("filePath"),
                                          QStringLiteral("trackIndex"),
-                                         QStringLiteral("startSec")}, err))
+                                         QStringLiteral("startSec"),
+                                         QStringLiteral("kind")}, err))
                 return {};
             QString filePath;
             if (!requiredString(args, QStringLiteral("filePath"), &filePath, err))
@@ -1600,6 +1708,20 @@ void McpEditorTools::registerWriteTools()
             if (filePath.isEmpty())
                 return setError(err, QStringLiteral("ファイルが見つかりません: %1").arg(filePath)),
                        QJsonObject();
+            Timeline::ImportMediaKind importKind = Timeline::ImportMediaKind::Auto;
+            if (args.contains(QStringLiteral("kind"))) {
+                const QJsonValue kindValue = args.value(QStringLiteral("kind"));
+                const QString kind = kindValue.isString() ? kindValue.toString() : QString();
+                if (kind == QStringLiteral("auto"))
+                    importKind = Timeline::ImportMediaKind::Auto;
+                else if (kind == QStringLiteral("video"))
+                    importKind = Timeline::ImportMediaKind::VideoOnly;
+                else if (kind == QStringLiteral("audio"))
+                    importKind = Timeline::ImportMediaKind::AudioOnly;
+                else
+                    return setError(err, QStringLiteral("kind must be auto, video or audio")),
+                           QJsonObject();
+            }
             int trackIndex = 0;
             if (!nonNegativeInteger(args, QStringLiteral("trackIndex"), 0,
                                     &trackIndex, err))
@@ -1618,7 +1740,7 @@ void McpEditorTools::registerWriteTools()
 
             Timeline::MediaImportResult importResult;
             if (!timeline()->importMedia(filePath, trackIndex, startSec,
-                                         &importResult, err))
+                                         &importResult, err, importKind))
                 return {};
 
             QJsonArray addedClips;
@@ -1731,10 +1853,8 @@ void McpEditorTools::registerWriteTools()
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("select_clip"),
-        QStringLiteral("指定クリップを選択する。kind、trackIndex、clipIndex はすべて指定する。Timeline と MainWindow の両方の選択状態をGUIクリックと同じ規則で更新する。"),
-        schemaWithRequired(clipProperties,
-                           {QStringLiteral("kind"), QStringLiteral("trackIndex"),
-                            QStringLiteral("clipIndex")}),
+        QStringLiteral("指定クリップを選択する。kind / trackIndex 省略時は video トラック 0 (他のクリップ系ツールと同じ既定)。clipIndex は get_timeline の index。Timeline と MainWindow の両方の選択状態を GUI クリックと同じ規則で更新する。"),
+        schemaWithRequired(clipProperties, {QStringLiteral("clipIndex")}),
         guardedWrite(QStringLiteral("select_clip"),
                      [this](const QJsonObject& args, QString* err) -> QJsonObject {
             if (!rejectUnknownArguments(args,
@@ -1742,17 +1862,18 @@ void McpEditorTools::registerWriteTools()
                                          QStringLiteral("trackIndex"),
                                          QStringLiteral("clipIndex")}, err))
                 return {};
-            if (!args.contains(QStringLiteral("kind"))
-                || !args.value(QStringLiteral("kind")).isString())
-                return setError(err, QStringLiteral("kind must be video or audio")),
-                       QJsonObject();
-            const QString kind = args.value(QStringLiteral("kind")).toString();
+            QString kind = QStringLiteral("video");
+            if (args.contains(QStringLiteral("kind"))) {
+                if (!args.value(QStringLiteral("kind")).isString())
+                    return setError(err, QStringLiteral("kind must be video or audio")),
+                           QJsonObject();
+                kind = args.value(QStringLiteral("kind")).toString();
+            }
             if (kind != QStringLiteral("video") && kind != QStringLiteral("audio"))
                 return setError(err, QStringLiteral("kind must be video or audio")),
                        QJsonObject();
-            if (!args.contains(QStringLiteral("trackIndex"))
-                || !args.contains(QStringLiteral("clipIndex")))
-                return setError(err, QStringLiteral("trackIndex and clipIndex are required")),
+            if (!args.contains(QStringLiteral("clipIndex")))
+                return setError(err, QStringLiteral("clipIndex is required")),
                        QJsonObject();
             int trackIndex = 0;
             int clipIndex = 0;
@@ -1855,13 +1976,15 @@ void McpEditorTools::registerWriteTools()
                 }
                 UndoManager* undoManager = timeline()
                     ? timeline()->undoManager() : nullptr;
-                const int undoIndexBefore = undoManager
-                    ? undoManager->currentIndex() : -1;
+                // saveSerial は MAX_UNDO で先頭が落ちても増えるので、長い編集
+                // セッションでも「この操作で undo が積まれたか」を正しく判定できる。
+                const quint64 undoSerialBefore = undoManager
+                    ? undoManager->saveSerial() : 0;
                 // The QAction owns its own undo policy. Saving here would
                 // double-stack actions that already save an undo state.
                 command.action->trigger();
-                const int undoIndexAfter = undoManager
-                    ? undoManager->currentIndex() : -1;
+                const quint64 undoSerialAfter = undoManager
+                    ? undoManager->saveSerial() : 0;
                 syncSelectionAfterEdit();
                 QJsonObject response{
                     {QStringLiteral("ok"), true},
@@ -1870,7 +1993,7 @@ void McpEditorTools::registerWriteTools()
                     {QStringLiteral("risk"), risk}
                 };
                 const bool undoRecorded = undoManager
-                    && undoIndexAfter > undoIndexBefore;
+                    && undoSerialAfter > undoSerialBefore;
                 response.insert(QStringLiteral("undoRecorded"), undoRecorded);
                 if (undoRecorded)
                     response.insert(QStringLiteral("undoDescription"),
@@ -1928,7 +2051,7 @@ void McpEditorTools::registerWriteTools()
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("delete_clip"),
-        QStringLiteral("指定クリップを削除し、必要なら後続クリップを詰める。linkGroup が同じクリップ (例: 対になる音声) も同時に削除される。削除後は後続クリップの index が 1 ずれる。ripple:true で後続クリップを前に詰める (既定 false)。kind/trackIndex 省略時は video トラック 0。clipIndex は get_timeline の index。タイムラインを変更する破壊的操作で、Ctrl+Z / undo ツールで戻せる。"),
+        QStringLiteral("指定クリップを削除し、必要なら後続クリップを詰める。linkGroup が同じクリップ (例: 対になる音声) も同時に削除される。削除後は後続クリップの index が 1 ずれる。ripple:true で後続クリップを前に詰める (既定 false)。詰まるのは削除したクリップと同じ linkGroup を持つトラックだけで、他のトラック (V2 の B ロールや A2 の BGM) はずれない。kind/trackIndex 省略時は video トラック 0。clipIndex は get_timeline の index。タイムラインを変更する破壊的操作で、Ctrl+Z / undo ツールで戻せる。"),
         schemaWithRequired(mergedProperties(clipProperties, QJsonObject{
             {QStringLiteral("ripple"), QJsonObject{
                 {QStringLiteral("type"), QStringLiteral("boolean")},
@@ -2011,8 +2134,23 @@ void McpEditorTools::registerWriteTools()
             Timeline::MoveClipResult moveResult;
             if (!currentTimeline->moveClipByIndex(
                     target.audio, target.trackIndex, target.clipIndex, newStartSec,
-                    newTrackIndex, &moveResult, err))
+                    newTrackIndex, &moveResult, err)) {
+                // 既定プロジェクトは V1/A1 の 1 段しかない。LLM がトラックを増やす
+                // 手段 (run_command のトラック追加コマンド) をエラー文で案内する。
+                if (err && err->contains(QStringLiteral("newTrackIndex"))) {
+                    const QString needle = target.audio
+                        ? QStringLiteral("オーディオトラックを追加")
+                        : QStringLiteral("ビデオトラックを追加");
+                    for (const auto& command : m_window->m_favoritableActions) {
+                        if (!command.label.contains(needle))
+                            continue;
+                        *err += QStringLiteral("。トラックを追加するには run_command で id \"%1\" (%2) を実行してください")
+                                    .arg(command.id, command.label);
+                        break;
+                    }
+                }
                 return {};
+            }
             if (!moveResult.reason.isEmpty()) {
                 return QJsonObject{
                     {QStringLiteral("ok"), false},
@@ -2040,7 +2178,7 @@ void McpEditorTools::registerWriteTools()
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("set_clip_property"),
-        QStringLiteral("指定クリップのプロパティを設定する。property と有効範囲: volume 0..2 (1.0=原音の音量、0=無音)、opacity 0..1 (1.0=不透明)、speed 0.25..4 (1.0=等速)、pan -1..1 (0=中央)、videoScale 0.1..10 (1.0=等倍)。範囲外は out of range エラーで拒否される。現在の volume/opacity/speed は get_timeline のクリップ情報で確認できる。kind/trackIndex 省略時は video トラック 0。clipIndex は get_timeline の index。タイムラインを変更する破壊的操作で、Ctrl+Z / undo ツールで戻せる。"),
+        QStringLiteral("指定クリップのプロパティを設定する。property と有効範囲: volume 0..2 (1.0=原音の音量、0=無音)、opacity 0..1 (1.0=不透明)、speed 0.25..4 (1.0=等速)、pan -1..1 (0=中央)、videoScale 0.1..10 (1.0=等倍)。範囲外は out of range エラーで拒否される。speed は実尺が変わるため同じ linkGroup の音声クリップにも同時に適用する (応答の linkedApplied)。他のプロパティは指定クリップだけ。現在の volume/opacity/speed は get_timeline のクリップ情報で確認できる。kind/trackIndex 省略時は video トラック 0。clipIndex は get_timeline の index。タイムラインを変更する破壊的操作で、Ctrl+Z / undo ツールで戻せる。"),
         schemaWithRequired(mergedProperties(clipProperties, QJsonObject{
             {QStringLiteral("property"), QJsonObject{
                 {QStringLiteral("type"), QStringLiteral("string")},
@@ -2079,21 +2217,26 @@ void McpEditorTools::registerWriteTools()
                 return {};
 
             Timeline* currentTimeline = timeline();
+            // speed は実尺を変えるので、リンクした音声も同時に変えないと V/A の
+            // 長さが食い違う。他のプロパティは指定クリップだけに適用する。
+            const bool applyToLinked = property == QStringLiteral("speed");
             if (!currentTimeline->setClipPropertyByIndex(
-                    target.audio, target.trackIndex, target.clipIndex, property, value, err))
+                    target.audio, target.trackIndex, target.clipIndex, property, value, err,
+                    applyToLinked))
                 return {};
             syncSelectionAfterEdit();
             return QJsonObject{
                 {QStringLiteral("ok"), true},
                 {QStringLiteral("property"), property},
-                {QStringLiteral("value"), value}
+                {QStringLiteral("value"), value},
+                {QStringLiteral("linkedApplied"), applyToLinked}
             };
         })
     }, setClipPropertyOutputSchema));
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("trim_clip"),
-        QStringLiteral("指定した映像クリップを、タイムライン絶対時刻 (秒) の timeSec でトリムする。edge=in はクリップの開始位置を保ったまま timeSec 時点の内容を新しい先頭にし、以降が (timeSec−開始) だけ左へ詰まる (RippleIn)。edge=out は末尾を timeSec にし後続が詰まる (RippleOut)。video のみ対応し、リンクした音声クリップは追従しない。ripple は既定 true。現在のトリムエンジンに非リップル種別がないため ripple:false は拒否する。タイムラインを変更する破壊的操作で、Ctrl+Z / undo ツールで戻せる。"),
+        QStringLiteral("指定した映像クリップを、タイムライン絶対時刻 (秒) の timeSec でトリムする。edge=in はクリップの開始位置を保ったまま timeSec 時点の内容を新しい先頭にし、以降が (timeSec−開始) だけ左へ詰まる (RippleIn)。edge=out は末尾を timeSec にし後続が詰まる (RippleOut)。kind は video のみ対応し、同じ linkGroup の音声クリップ (A1 など) も同じ量だけトリムして映像と同期を保つ。ripple は既定 true。現在のトリムエンジンに非リップル種別がないため ripple:false は拒否する。タイムラインを変更する破壊的操作で、Ctrl+Z / undo ツールで戻せる。"),
         schemaWithRequired(mergedProperties(clipProperties, QJsonObject{
             {QStringLiteral("edge"), QJsonObject{
                 {QStringLiteral("type"), QStringLiteral("string")},
@@ -2160,10 +2303,12 @@ void McpEditorTools::registerWriteTools()
             const double deltaSec = timeSec
                 - (edge == QStringLiteral("in") ? target.startSec : target.endSec);
             Timeline* currentTimeline = timeline();
-            if (!target.track->applyTrim(target.clipIndex, trimType, deltaSec, err))
+            if (!currentTimeline->applyTrimLinked(target.track, target.clipIndex,
+                                                  trimType, deltaSec, err))
                 return {};
-            // TimelineTrack::applyTrim emits modified() but deliberately does not
-            // push an undo state; keep this MCP operation as one undo step.
+            // Timeline::applyTrimLinked (TimelineTrack::applyTrim) emits modified()
+            // but deliberately does not push an undo state; keep this MCP
+            // operation (video + linked audio) as one undo step.
             currentTimeline->saveUndoState(QStringLiteral("トリム"));
             syncSelectionAfterEdit();
 
@@ -2309,7 +2454,7 @@ void McpEditorTools::registerWriteTools()
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("add_text_overlay"),
-        QStringLiteral("V1 の先頭クリップに通常のテキスト／テロップを追加する。startSec と endSec はタイムライン絶対時刻 (秒) で、endSec は startSec より後にする。x / y は正規化座標 0..1、fontSize はポイント単位で 6..256 (既定 32)、color は QColor/CSS 形式 (既定 #ffffff)。この操作は Ctrl+Z / undo ツールで戻せる。"),
+        QStringLiteral("V1 に通常のテキスト／テロップを追加する。startSec と endSec はタイムライン絶対時刻 (秒) で、endSec は startSec より後にする。区間と重なる V1 の全クリップに付くので、クリップ境界をまたいでも表示される (重なるクリップが無ければエラー。応答の clipIndices が付いたクリップ)。x / y は正規化座標 0..1、fontSize はポイント単位で 6..256 (既定 32)、color は QColor/CSS 形式 (既定 #ffffff)。この操作は Ctrl+Z / undo ツールで戻せる。"),
         schemaWithRequired(QJsonObject{
             {QStringLiteral("text"), QJsonObject{
                 {QStringLiteral("type"), QStringLiteral("string")},
@@ -2427,20 +2572,28 @@ void McpEditorTools::registerWriteTools()
             overlay.y = y;
             overlay.startTime = startSec;
             overlay.endTime = endSec;
-            if (!currentTimeline->addTextOverlayToFirstVideoClip(overlay))
-                return setError(err, QStringLiteral("V1 に追加できるクリップがありません")),
+            // レンダラはその時刻にアクティブな V1 クリップのオーバーレイだけを焼き込む
+            // ので、区間と重なる全クリップへ付ける (clip 0 固定だと 2 個目以降の
+            // クリップの時間帯に出したテキストが表示されない)。
+            const QVector<int> touchedClips =
+                currentTimeline->addTextOverlayToVideoClipsInRange(overlay, startSec, endSec);
+            if (touchedClips.isEmpty()) {
+                return setError(err, QStringLiteral("V1 に startSec..endSec (%1..%2 秒) と重なるクリップがありません。get_timeline でクリップの時間帯を確認してください")
+                                         .arg(startSec).arg(endSec)),
                        QJsonObject();
+            }
             if (m_window->m_player)
                 m_window->m_player->setTextOverlays(currentTimeline->timelineTextOverlays());
 
-            const int index = currentTimeline->videoTracks().isEmpty()
-                || !currentTimeline->videoTracks().first()
-                || currentTimeline->videoTracks().first()->clips().isEmpty()
-                ? -1 : currentTimeline->videoTracks().first()->clips().first()
-                          .textManager.count() - 1;
+            QJsonArray clipIndices;
+            for (int clipIndex : touchedClips)
+                clipIndices.append(clipIndex);
+            const int index = currentTimeline->videoTracks().first()->clips()
+                                  .at(touchedClips.first()).textManager.count() - 1;
             return QJsonObject{
                 {QStringLiteral("ok"), true},
                 {QStringLiteral("index"), index},
+                {QStringLiteral("clipIndices"), clipIndices},
                 {QStringLiteral("text"), overlay.text},
                 {QStringLiteral("startSec"), overlay.startTime},
                 {QStringLiteral("endSec"), overlay.endTime},
@@ -2579,6 +2732,70 @@ void McpEditorTools::registerWriteTools()
             };
         })
     }, applyCaptionsOutputSchema));
+
+    const QJsonObject captionListOutputSchema = outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("captionCount"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}}
+    }, {QStringLiteral("ok"), QStringLiteral("captionCount")});
+
+    m_registry->registerTool(withOutputSchema({
+        QStringLiteral("remove_caption"),
+        QStringLiteral("字幕エディタの一覧から index (get_captions の captions[].index) の字幕を 1 件削除する。タイムラインへ反映するには apply_captions を呼ぶ。この操作自体は undo 対象外。"),
+        schemaWithRequired(QJsonObject{
+            {QStringLiteral("index"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("integer")},
+                {QStringLiteral("minimum"), 0}
+            }}
+        }, {QStringLiteral("index")}),
+        guardedWrite(QStringLiteral("remove_caption"),
+                     [this](const QJsonObject& args, QString* err) -> QJsonObject {
+            if (!rejectUnknownArguments(args, {QStringLiteral("index")}, err))
+                return {};
+            if (!args.contains(QStringLiteral("index")))
+                return setError(err, QStringLiteral("index is required")), QJsonObject();
+            int index = -1;
+            if (!nonNegativeInteger(args, QStringLiteral("index"), -1, &index, err))
+                return {};
+            CaptionEditorDialog* dialog = m_window
+                ? m_window->ensureCaptionEditorDialog() : nullptr;
+            if (!dialog)
+                return setError(err, QStringLiteral("editor not available")), QJsonObject();
+            caption::Track track = dialog->track();
+            if (index < 0 || index >= track.clipCount()) {
+                return setError(err, QStringLiteral("index is out of range (字幕は %1 件: 0..%2)")
+                                         .arg(track.clipCount()).arg(track.clipCount() - 1)),
+                       QJsonObject();
+            }
+            track.removeClipAt(index);
+            dialog->setTrack(track);
+            return QJsonObject{
+                {QStringLiteral("ok"), true},
+                {QStringLiteral("captionCount"), track.clipCount()}
+            };
+        })
+    }, captionListOutputSchema));
+
+    m_registry->registerTool(withOutputSchema({
+        QStringLiteral("clear_captions"),
+        QStringLiteral("字幕エディタの一覧を空にする。タイムライン上の生成済み字幕はそのままなので、消したい場合は続けて apply_captions を呼べないことに注意 (空の一覧は適用できない)。undo ツールでタイムライン側を戻す。この操作自体は undo 対象外。"),
+        objectSchema(),
+        guardedWrite(QStringLiteral("clear_captions"),
+                     [this](const QJsonObject& args, QString* err) -> QJsonObject {
+            if (!rejectUnknownArguments(args, {}, err))
+                return {};
+            CaptionEditorDialog* dialog = m_window
+                ? m_window->ensureCaptionEditorDialog() : nullptr;
+            if (!dialog)
+                return setError(err, QStringLiteral("editor not available")), QJsonObject();
+            caption::Track track = dialog->track();
+            track.clear();
+            dialog->setTrack(track);
+            return QJsonObject{
+                {QStringLiteral("ok"), true},
+                {QStringLiteral("captionCount"), track.clipCount()}
+            };
+        })
+    }, captionListOutputSchema));
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("set_playhead"),

@@ -1027,6 +1027,7 @@ private:
 #include <QWheelEvent>
 #include <QDebug>
 #include <QCoreApplication>
+#include <QPair>
 #include <QTimer>
 #include <QDrag>
 #include <QMimeData>
@@ -3698,7 +3699,8 @@ bool Timeline::importMedia(const QString &filePath,
                            int requestedTrackIndex,
                            double requestedStartSec,
                            MediaImportResult *result,
-                           QString *err)
+                           QString *err,
+                           ImportMediaKind kind)
 {
     if (result)
         *result = MediaImportResult{};
@@ -3737,6 +3739,8 @@ bool Timeline::importMedia(const QString &filePath,
     // generating proxies for clips that already play smoothly.
     bool wantsAutoProxy = false;
     bool videoStreamFound = false;
+    bool audioStreamFound = false;
+    bool openedOk = false;
     int capturedPrimaries = 0;
     int capturedTrc = 0;
     int capturedBitDepth = 8;
@@ -3747,12 +3751,18 @@ bool Timeline::importMedia(const QString &filePath,
     int srcVideoW = 0;
     int srcVideoH = 0;
     if (avformat_open_input(&fmt, filePath.toUtf8().constData(), nullptr, nullptr) == 0) {
+        openedOk = true;
         if (avformat_find_stream_info(fmt, nullptr) >= 0 && fmt->duration > 0)
             duration = static_cast<double>(fmt->duration) / AV_TIME_BASE;
         for (unsigned i = 0; i < fmt->nb_streams; ++i) {
             const AVStream *st = fmt->streams[i];
-            if (!st || !st->codecpar
-                || st->codecpar->codec_type != AVMEDIA_TYPE_VIDEO)
+            if (!st || !st->codecpar)
+                continue;
+            if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+                audioStreamFound = true;
+                continue;
+            }
+            if (st->codecpar->codec_type != AVMEDIA_TYPE_VIDEO || videoStreamFound)
                 continue;
             const int w = st->codecpar->width;
             const int h = st->codecpar->height;
@@ -3785,10 +3795,27 @@ bool Timeline::importMedia(const QString &filePath,
             const bool isHdPlus = (w >= 1920) || (h >= 1080);
             if (isAv1 || isQhdPlus || isHdPlus)
                 wantsAutoProxy = true;
-            break;
         }
         avformat_close_input(&fmt);
     }
+    // MCP (Auto / VideoOnly / AudioOnly) は開けないファイルを拒否して 0 秒クリップを
+    // 作らない。GUI の LinkedPair は従来どおり (既存のセルフテストが仮ファイルを
+    // addClip で置く前提を保つ)。
+    if (kind != ImportMediaKind::LinkedPair
+        && (!openedOk || (!videoStreamFound && !audioStreamFound))) {
+        return fail(QStringLiteral("メディアとして開けません (動画/音声ストリームがありません): %1")
+                        .arg(filePath));
+    }
+    if (kind == ImportMediaKind::VideoOnly && !videoStreamFound)
+        return fail(QStringLiteral("映像ストリームがありません: %1").arg(filePath));
+    if (kind == ImportMediaKind::AudioOnly && !audioStreamFound)
+        return fail(QStringLiteral("音声ストリームがありません: %1").arg(filePath));
+    const bool placeVideo = kind == ImportMediaKind::LinkedPair
+        || kind == ImportMediaKind::VideoOnly
+        || (kind == ImportMediaKind::Auto && videoStreamFound);
+    const bool placeAudio = kind == ImportMediaKind::LinkedPair
+        || kind == ImportMediaKind::AudioOnly
+        || (kind == ImportMediaKind::Auto && audioStreamFound);
     // NOTE: auto-proxy trigger moved past the track-index decision below
     // (search for "autoProxyMode" in this function). wantsAutoProxy is
     // the probe verdict consumed there.
@@ -3829,10 +3856,11 @@ bool Timeline::importMedia(const QString &filePath,
     int audioTrackIdx = -1;
     if (requestedTrackIndex >= 0) {
         // MCP は指定されたトラック番号をそのまま V/A のペアに使う。
-        // 片方だけ増やすとリンク済み素材が孤立するため、必要なら両方を同時に作る。
-        while (m_videoTracks.size() <= requestedTrackIndex)
+        // 片方だけ増やすとリンク済み素材が孤立するため、必要なら両方を同時に作る
+        // (片側だけ置く kind ではその側だけ)。
+        while (placeVideo && m_videoTracks.size() <= requestedTrackIndex)
             addVideoTrack();
-        while (m_audioTracks.size() <= requestedTrackIndex)
+        while (placeAudio && m_audioTracks.size() <= requestedTrackIndex)
             addAudioTrack();
         videoTrackIdx = requestedTrackIndex;
         audioTrackIdx = requestedTrackIndex;
@@ -3840,9 +3868,9 @@ bool Timeline::importMedia(const QString &filePath,
         // Extend the existing sequence: always V1/A1, appending after
         // whatever clips already live there. Create V1/A1 if the project
         // starts with zero tracks.
-        if (m_videoTracks.isEmpty())
+        if (placeVideo && m_videoTracks.isEmpty())
             addVideoTrack();
-        if (m_audioTracks.isEmpty())
+        if (placeAudio && m_audioTracks.isEmpty())
             addAudioTrack();
         videoTrackIdx = 0;
         audioTrackIdx = 0;
@@ -3850,25 +3878,29 @@ bool Timeline::importMedia(const QString &filePath,
         // Premiere-style stacking: each drop lands on the first EMPTY video
         // track (creating V<n>/A<n> as needed). First drop fills V1/A1,
         // second fills V2/A2, and so on.
-        for (int t = 0; t < m_videoTracks.size(); ++t) {
-            if (m_videoTracks[t] && m_videoTracks[t]->clipCount() == 0) {
-                videoTrackIdx = t;
-                break;
+        if (placeVideo) {
+            for (int t = 0; t < m_videoTracks.size(); ++t) {
+                if (m_videoTracks[t] && m_videoTracks[t]->clipCount() == 0) {
+                    videoTrackIdx = t;
+                    break;
+                }
+            }
+            if (videoTrackIdx < 0) {
+                addVideoTrack();
+                videoTrackIdx = m_videoTracks.size() - 1;
             }
         }
-        if (videoTrackIdx < 0) {
-            addVideoTrack();
-            videoTrackIdx = m_videoTracks.size() - 1;
-        }
-        for (int t = 0; t < m_audioTracks.size(); ++t) {
-            if (m_audioTracks[t] && m_audioTracks[t]->clipCount() == 0) {
-                audioTrackIdx = t;
-                break;
+        if (placeAudio) {
+            for (int t = 0; t < m_audioTracks.size(); ++t) {
+                if (m_audioTracks[t] && m_audioTracks[t]->clipCount() == 0) {
+                    audioTrackIdx = t;
+                    break;
+                }
             }
-        }
-        if (audioTrackIdx < 0) {
-            addAudioTrack();
-            audioTrackIdx = m_audioTracks.size() - 1;
+            if (audioTrackIdx < 0) {
+                addAudioTrack();
+                audioTrackIdx = m_audioTracks.size() - 1;
+            }
         }
     }
 
@@ -3884,9 +3916,9 @@ bool Timeline::importMedia(const QString &filePath,
             end += qMax(0.0, existing.leadInSec) + existing.effectiveDuration();
         return end;
     };
-    TimelineTrack *videoTrack = m_videoTracks.value(videoTrackIdx, nullptr);
-    TimelineTrack *audioTrack = m_audioTracks.value(audioTrackIdx, nullptr);
-    if (!videoTrack || !audioTrack)
+    TimelineTrack *videoTrack = placeVideo ? m_videoTracks.value(videoTrackIdx, nullptr) : nullptr;
+    TimelineTrack *audioTrack = placeAudio ? m_audioTracks.value(audioTrackIdx, nullptr) : nullptr;
+    if ((placeVideo && !videoTrack) || (placeAudio && !audioTrack))
         return fail(QStringLiteral("取り込み先のトラックを準備できません"));
 
     // 指定位置は空きへ正確に入れ、既存クリップと重なる要求は MCP から
@@ -3896,16 +3928,22 @@ bool Timeline::importMedia(const QString &filePath,
     // MCP の指定トラックでは V/A を同じ linkGroup の一組として扱うため、
     // startSec 省略時も音声だけ別の末尾へ置かず video の開始時刻を共有する。
     // GUI の従来の自動トラック選択では、元の V/A 各トラック末尾規則を維持する。
-    const double audioDropTime = requestedTrackIndex >= 0
+    const double audioDropTime = (requestedTrackIndex >= 0 && placeVideo)
         ? videoDropTime
         : (requestedStartSec >= 0.0 ? requestedStartSec : trackEnd(audioTrack));
     const double importDuration = qMax(0.0, clip.effectiveDuration());
-    const TimelineTrack::DropPlan videoPlan =
-        videoTrack->planDrop(videoDropTime, importDuration);
-    const TimelineTrack::DropPlan audioPlan =
-        audioTrack->planDrop(audioDropTime, importDuration);
-    if (!videoPlan.valid || !audioPlan.valid)
-        return fail(QStringLiteral("指定位置にクリップを配置できません"));
+    TimelineTrack::DropPlan videoPlan;
+    TimelineTrack::DropPlan audioPlan;
+    if (placeVideo) {
+        videoPlan = videoTrack->planDrop(videoDropTime, importDuration);
+        if (!videoPlan.valid)
+            return fail(QStringLiteral("指定位置にクリップを配置できません"));
+    }
+    if (placeAudio) {
+        audioPlan = audioTrack->planDrop(audioDropTime, importDuration);
+        if (!audioPlan.valid)
+            return fail(QStringLiteral("指定位置にクリップを配置できません"));
+    }
 
     // Auto-proxy dispatch — runs after the track index is settled so that
     // MultiTrackOnly mode can gate on V2-or-later. wantsAutoProxy was
@@ -3987,18 +4025,22 @@ bool Timeline::importMedia(const QString &filePath,
 
     // 取り込みも他の MCP 編集と同じく、snapshot を変更の直前に作る。
     const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
-    videoTrack->insertClipPreservingDownstream(videoPlan.insertIdx, clip,
-                                               videoPlan.newLeadIn);
-    audioTrack->insertClipPreservingDownstream(audioPlan.insertIdx, clip,
-                                               audioPlan.newLeadIn);
+    if (placeVideo) {
+        videoTrack->insertClipPreservingDownstream(videoPlan.insertIdx, clip,
+                                                   videoPlan.newLeadIn);
+    }
+    if (placeAudio) {
+        audioTrack->insertClipPreservingDownstream(audioPlan.insertIdx, clip,
+                                                   audioPlan.newLeadIn);
+    }
     remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
     remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
     saveUndoState("Add clip");
     if (result) {
-        result->videoTrackIndex = videoTrackIdx;
-        result->videoClipIndex = videoPlan.insertIdx;
-        result->audioTrackIndex = audioTrackIdx;
-        result->audioClipIndex = audioPlan.insertIdx;
+        result->videoTrackIndex = placeVideo ? videoTrackIdx : -1;
+        result->videoClipIndex = placeVideo ? videoPlan.insertIdx : -1;
+        result->audioTrackIndex = placeAudio ? audioTrackIdx : -1;
+        result->audioClipIndex = placeAudio ? audioPlan.insertIdx : -1;
         result->videoStartSec = videoDropTime;
         result->audioStartSec = audioDropTime;
         result->durationSec = importDuration;
@@ -4802,7 +4844,7 @@ bool Timeline::moveClipByIndex(bool audio, int trackIndex, int clipIndex,
 
 bool Timeline::setClipPropertyByIndex(bool audio, int trackIndex, int clipIndex,
                                       const QString &property, double value,
-                                      QString *err)
+                                      QString *err, bool applyToLinked)
 {
     if (!std::isfinite(value))
         return setTimelineEditError(err, QStringLiteral("value must be a finite number"));
@@ -4838,22 +4880,44 @@ bool Timeline::setClipPropertyByIndex(bool audio, int trackIndex, int clipIndex,
     if (track->isLocked())
         return setTimelineEditError(err, QStringLiteral("track is locked"));
 
-    // Property edits intentionally ignore linkGroup: changing one side's
-    // volume (or another whitelisted property) is a normal MCP use case.
+    // Property edits ignore linkGroup by default: changing one side's volume
+    // (or another whitelisted property) is a normal MCP use case. Callers opt
+    // in with applyToLinked for properties that change the effective duration
+    // (speed) so the linked V/A pair keeps the same length.
     const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    const auto assignProperty = [&property, value](ClipInfo &target) {
+        if (property == QStringLiteral("volume"))
+            target.volume = value;
+        else if (property == QStringLiteral("opacity"))
+            target.opacity = value;
+        else if (property == QStringLiteral("speed"))
+            target.speed = value;
+        else if (property == QStringLiteral("pan"))
+            target.pan = value;
+        else
+            target.videoScale = value;
+    };
     QVector<ClipInfo> clips = track->clips();
-    ClipInfo &clip = clips[clipIndex];
-    if (property == QStringLiteral("volume"))
-        clip.volume = value;
-    else if (property == QStringLiteral("opacity"))
-        clip.opacity = value;
-    else if (property == QStringLiteral("speed"))
-        clip.speed = value;
-    else if (property == QStringLiteral("pan"))
-        clip.pan = value;
-    else
-        clip.videoScale = value;
+    const int linkGroup = clips[clipIndex].linkGroup;
+    assignProperty(clips[clipIndex]);
     track->setClips(clips);
+    if (applyToLinked && linkGroup > 0) {
+        const QVector<TimelineTrack *> partnerTracks = m_videoTracks + m_audioTracks;
+        for (TimelineTrack *partner : partnerTracks) {
+            if (!partner || partner == track || partner->isLocked())
+                continue;
+            QVector<ClipInfo> partnerClips = partner->clips();
+            bool changed = false;
+            for (ClipInfo &candidate : partnerClips) {
+                if (candidate.linkGroup != linkGroup)
+                    continue;
+                assignProperty(candidate);
+                changed = true;
+            }
+            if (changed)
+                partner->setClips(partnerClips);
+        }
+    }
 
     remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
     remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
@@ -5059,6 +5123,32 @@ bool Timeline::addTextOverlayToFirstVideoClip(const EnhancedTextOverlay &overlay
     saveUndoState("Add text overlay");
     refreshTextStrip();
     return true;
+}
+
+QVector<int> Timeline::addTextOverlayToVideoClipsInRange(const EnhancedTextOverlay &overlay,
+                                                         double startSec, double endSec)
+{
+    QVector<int> touched;
+    if (m_videoTracks.isEmpty() || !m_videoTracks.first())
+        return touched;
+    auto *track = m_videoTracks.first();
+    QVector<ClipInfo> clips = track->clips();
+    double cursor = 0.0;
+    for (int i = 0; i < clips.size(); ++i) {
+        const double start = cursor + clips[i].leadInSec;
+        const double end = start + clips[i].effectiveDuration();
+        cursor = end;
+        if (end <= startSec || start >= endSec)
+            continue;
+        clips[i].textManager.addOverlay(overlay);
+        touched.append(i);
+    }
+    if (touched.isEmpty())
+        return touched;
+    track->setClips(clips);
+    saveUndoState("Add text overlay");
+    refreshTextStrip();
+    return touched;
 }
 
 QVector<EnhancedTextOverlay> Timeline::timelineTextOverlays() const
@@ -7177,9 +7267,54 @@ bool Timeline::applyTrimActive(trimops::TrimType type, double deltaSec,
         if (errorOut) *errorOut = QObject::tr("トリム対象のクリップが選択されていません");
         return false;
     }
-    if (!track->applyTrim(sel, type, deltaSec, errorOut))
+    if (!applyTrimLinked(track, sel, type, deltaSec, errorOut))
         return false;
     saveUndoState("トリム");
+    return true;
+}
+
+bool Timeline::applyTrimLinked(TimelineTrack *track, int clipIndex,
+                               trimops::TrimType type, double deltaSec,
+                               QString *errorOut)
+{
+    if (!track || clipIndex < 0 || clipIndex >= track->clipCount()) {
+        if (errorOut) *errorOut = QObject::tr("トリム対象のクリップがありません");
+        return false;
+    }
+    const int linkGroup = track->clips().at(clipIndex).linkGroup;
+    const QVector<ClipInfo> sourceBefore = track->clips();
+    if (!track->applyTrim(clipIndex, type, deltaSec, errorOut))
+        return false;
+    if (linkGroup <= 0)
+        return true;
+
+    // Linked partners live on other tracks (V1 clip <-> A1 clip). Apply the
+    // identical trim so audio stays in sync with the picture; if the partner
+    // cannot take the trim (shorter source, boundary), restore the source track.
+    QVector<QPair<TimelineTrack *, QVector<ClipInfo>>> touched;
+    const QVector<TimelineTrack *> partnerTracks = m_videoTracks + m_audioTracks;
+    for (TimelineTrack *partner : partnerTracks) {
+        if (!partner || partner == track)
+            continue;
+        for (int i = 0; i < partner->clipCount(); ++i) {
+            if (partner->clips().at(i).linkGroup != linkGroup)
+                continue;
+            const QVector<ClipInfo> partnerBefore = partner->clips();
+            QString partnerError;
+            if (!partner->applyTrim(i, type, deltaSec, &partnerError)) {
+                for (auto &entry : touched)
+                    entry.first->setClips(entry.second);
+                track->setClips(sourceBefore);
+                if (errorOut) {
+                    *errorOut = QObject::tr("リンクしたクリップをトリムできません: %1")
+                                    .arg(partnerError);
+                }
+                return false;
+            }
+            touched.append(qMakePair(partner, partnerBefore));
+            break;
+        }
+    }
     return true;
 }
 

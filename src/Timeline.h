@@ -539,11 +539,17 @@ public:
 
     // GUI のファイル追加と MCP の非対話取り込みが共有する入口。
     // requestedTrackIndex / requestedStartSec が -1 のときは既存の GUI 配置規則を使う。
+    // kind: LinkedPair は従来どおり V/A の対で置く (GUI 既定)。Auto はファイルの
+    // ストリーム構成で決め、映像の無いファイル (BGM / ナレーション) は音声トラック
+    // だけへ置く。VideoOnly / AudioOnly は片側だけ置く。
+    // 開けないファイル (動画/音声ストリームが無い) は false + err。
+    enum class ImportMediaKind { LinkedPair, Auto, VideoOnly, AudioOnly };
     bool importMedia(const QString &filePath,
                      int requestedTrackIndex = -1,
                      double requestedStartSec = -1.0,
                      MediaImportResult *result = nullptr,
-                     QString *err = nullptr);
+                     QString *err = nullptr,
+                     ImportMediaKind kind = ImportMediaKind::LinkedPair);
     void addClip(const QString &filePath);
     void splitAtPlayhead();
     // ---- index 指定の編集 (MCP / スクリプト経路) ----
@@ -560,8 +566,11 @@ public:
     bool moveClipByIndex(bool audio, int trackIndex, int clipIndex,
                          double newStartSec, int newTrackIndex,
                          MoveClipResult *result, QString *err);
+    // applyToLinked=true のとき、同じ linkGroup のクリップ (対になる V/A) にも同じ
+    // 値を設定する (speed のように実尺が変わるプロパティの同期用)。1 操作 = 1 Undo。
     bool setClipPropertyByIndex(bool audio, int trackIndex, int clipIndex,
-                                const QString &property, double value, QString *err);
+                                const QString &property, double value, QString *err,
+                                bool applyToLinked = false);
     bool selectClipByIndex(bool audio, int trackIndex, int clipIndex, QString *err);
     void clearSelection();
     bool freezeFrameAtPlayhead(TimelineTrack *track = nullptr, int clipIndex = -1);
@@ -781,6 +790,13 @@ public:
     bool applyTrimActive(trimops::TrimType type, double deltaSec,
                          QString *errorOut = nullptr);
 
+    // track の clip[clipIndex] へトリムを適用し、同じ linkGroup を持つ他トラックの
+    // クリップ (V/A リンク) にも同じ種別・同じ delta を適用する。片方が境界違反なら
+    // 両方とも変更前に戻して false + errorOut。undo は積まない (呼び出し側の責務)。
+    bool applyTrimLinked(TimelineTrack *track, int clipIndex,
+                         trimops::TrimType type, double deltaSec,
+                         QString *errorOut = nullptr);
+
     // Audio
     void addAudioFile(const QString &filePath);
     void insertAudioClipAtPlayhead(const QString &wavPath, int trackIdx = 2);
@@ -819,6 +835,12 @@ public:
     // the mutation actually persists. Used by MainWindow's Adobe-style text
     // tool. Returns true if an overlay was added.
     bool addTextOverlayToFirstVideoClip(const EnhancedTextOverlay &overlay);
+    // [startSec, endSec) と重なる V1 の全クリップへ同じオーバーレイを追加する。
+    // レンダラはその時刻にアクティブなクリップのオーバーレイだけを焼き込むため、
+    // 区間をまたぐテキストは各クリップに持たせる。追加したクリップ index を返す
+    // (重なるクリップが無ければ空で、何も変更しない)。1 操作 = 1 Undo。
+    QVector<int> addTextOverlayToVideoClipsInRange(const EnhancedTextOverlay &overlay,
+                                                   double startSec, double endSec);
     // Atomically replace only generated single-word captions on every V1
     // clip. Incoming times remain absolute timeline seconds so the active
     // clip renderer sees the same caption set across clip boundaries.

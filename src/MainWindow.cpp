@@ -739,21 +739,49 @@ bool applyDuckingToTimeline(Timeline *timeline,
     return true;
 }
 
+// RenderQueue の音声パススルーは「V1 先頭クリップの元ファイルの音声を 0 秒から
+// そのまま mux」する。音声タイムラインが厳密にそれと一致するときだけ省略できる。
+// トリム・分割・並べ替え・複数クリップ・音量/パン/エンベロープ/トランジション・
+// ミュートのどれか一つでもあれば、ffmpeg の amix でタイムライン通りの音声を作る。
+bool timelineAudioMatchesPassthrough(Timeline *timeline)
+{
+    const QVector<ClipInfo> &v1 = timeline->videoClips();
+    if (v1.isEmpty())
+        return true; // 映像が無ければ書き出し自体が成立しない
+    const ClipInfo *only = nullptr;
+    for (TimelineTrack *track : timeline->audioTracks()) {
+        if (!track || track->isMuted())
+            continue;
+        for (const ClipInfo &clip : track->clips()) {
+            if (only)
+                return false; // 2 つ以上の音声クリップ
+            only = &clip;
+        }
+    }
+    if (!only)
+        return false; // 音声クリップ無し → 無音トラックを作る (元音声を復活させない)
+    const ClipInfo &a = *only;
+    if (a.isSequenceReference())
+        return false;
+    const double sourceEnd = a.outPoint > 0.0 ? a.outPoint : a.duration;
+    return a.filePath == v1.first().filePath
+        && qAbs(a.leadInSec) < 1e-6
+        && qAbs(a.inPoint) < 1e-6
+        && sourceEnd + 1e-6 >= a.duration
+        && qAbs(a.speed - 1.0) < 1e-6
+        && qAbs(a.volume - 1.0) < 1e-6
+        && qAbs(a.pan) < 1e-6
+        && a.volumeEnvelope.isEmpty()
+        && a.audioChannelMode == AudioChannelMode::Stereo
+        && a.leadIn.type == TransitionType::None
+        && a.trailOut.type == TransitionType::None;
+}
+
 bool timelineNeedsAudioMixForExport(Timeline *timeline)
 {
     if (!timeline)
         return false;
-    for (TimelineTrack *track : timeline->audioTracks()) {
-        if (!track)
-            continue;
-        for (const ClipInfo &clip : track->clips()) {
-            if (!clip.volumeEnvelope.isEmpty())
-                return true;
-            if (clip.audioChannelMode != AudioChannelMode::Stereo)
-                return true;
-        }
-    }
-    return false;
+    return !timelineAudioMatchesPassthrough(timeline);
 }
 
 QString volumeExpressionForEntry(const PlaybackEntry &entry)
@@ -6989,6 +7017,8 @@ void MainWindow::setupMenuBar()
         // 明示テーブル + 既定推定の二段構えである。
         static const QHash<QString, FavoritableActionRisk> explicitActionRisks = {
             {QStringLiteral("終了(&Q)"), FavoritableActionRisk::Quit},
+            // QMessageBox::about はモーダルだが末尾に省略記号が無い。
+            {QStringLiteral("バージョン情報(&A)"), FavoritableActionRisk::Blocking},
             {QStringLiteral("プロジェクトを保存(&S)"), FavoritableActionRisk::Blocking},
             {QStringLiteral("action_versioned_save"), FavoritableActionRisk::Blocking},
             {QStringLiteral("スリップ..."), FavoritableActionRisk::Blocking},
@@ -8678,6 +8708,16 @@ void MainWindow::slideSelectedClip()
     }
 }
 
+bool MainWindow::timelineRequiresExportAudioMix(Timeline *timeline)
+{
+    return timelineNeedsAudioMixForExport(timeline);
+}
+
+QString MainWindow::prepareExportAudioMix(QString *error)
+{
+    return prepareTimelineAudioMixForExport(m_timeline, error);
+}
+
 void MainWindow::exportVideo()
 {
     ExportDialog dialog(m_projectConfig, this);
@@ -8709,8 +8749,7 @@ void MainWindow::exportVideo()
     RenderJob job;
     job.name = QFileInfo(exportCfg.outputPath).fileName();
     QString audioMixError;
-    const QString preparedAudioMixPath =
-        prepareTimelineAudioMixForExport(m_timeline, &audioMixError);
+    const QString preparedAudioMixPath = prepareExportAudioMix(&audioMixError);
     if (!audioMixError.isEmpty()) {
         QMessageBox::warning(this, QStringLiteral("Export"),
                              audioMixError);

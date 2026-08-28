@@ -45,6 +45,7 @@
 #include "../CaptionEditorDialog.h"
 #include "../CaptionTrack.h"
 #include "../MainWindow.h"
+#include "../RenderQueue.h"
 #include "../Timeline.h"
 #include "../UndoManager.h"
 
@@ -491,6 +492,24 @@ int runMcpSelftest()
             : fail("G66 HTTP Origin rejected",
                    QStringLiteral("evil=%1 null=%2")
                        .arg(evilOrigin.status).arg(nullOrigin.status));
+
+        // G101: Host ヘッダが loopback 以外 (DNS リバインディング経由) なら 403。
+        // loopback (ポート付き / IPv6 括弧付き) はそのまま通る。
+        const HttpResult evilHost = post(
+            &manager, endpoint, ping, server.token().toUtf8(),
+            QHash<QByteArray, QByteArray>{{"Host", "evil.example:8765"}});
+        const HttpResult portHost = post(
+            &manager, endpoint, ping, server.token().toUtf8(),
+            QHash<QByteArray, QByteArray>{{"Host", "localhost:8765"}});
+        const HttpResult ipv6Host = post(
+            &manager, endpoint, ping, server.token().toUtf8(),
+            QHash<QByteArray, QByteArray>{{"Host", "[::1]:8765"}});
+        const bool g101 = evilHost.status == 403 && portHost.status == 200
+            && ipv6Host.status == 200;
+        g101 ? pass("G101 HTTP non-loopback Host rejected")
+             : fail("G101 HTTP non-loopback Host rejected",
+                    QStringLiteral("evil=%1 localhost:port=%2 [::1]:port=%3")
+                        .arg(evilHost.status).arg(portHost.status).arg(ipv6Host.status));
 
         const HttpResult localhostOrigin = post(
             &manager, endpoint, ping, server.token().toUtf8(),
@@ -1084,7 +1103,7 @@ int runMcpSelftest()
             rpcRequest(73, QStringLiteral("tools/list")))))
         .value(QStringLiteral("result")).toObject()
         .value(QStringLiteral("tools")).toArray();
-    constexpr int kExpectedProjectInfoToolCount = 25;
+    constexpr int kExpectedProjectInfoToolCount = 27;
     bool outputSchemasDeclared = projectInfoToolDescriptors.size()
         == kExpectedProjectInfoToolCount;
     for (const QJsonValue& value : projectInfoToolDescriptors) {
@@ -1221,8 +1240,11 @@ int runMcpSelftest()
         : fail("G43 missing media import is rejected",
                QStringLiteral("missing media was accepted or changed the error text"));
 
-    QTemporaryFile importSource;
-    const bool importSourceReady = importSource.open();
+    // import_media は動画/音声として開けないファイルを拒否する (G104) ので、
+    // 取り込み + undo の検証にはリポジトリの実在する動画を使う。
+    const QString importSourcePath = QDir::current().absoluteFilePath(
+        QStringLiteral("test_assets/e2e_clip.mp4"));
+    const bool importSourceReady = QFileInfo::exists(importSourcePath);
     const int importVideoCountBefore = projectTimeline
         && !projectTimeline->videoTracks().isEmpty()
         && projectTimeline->videoTracks().first()
@@ -1235,7 +1257,7 @@ int runMcpSelftest()
     if (importSourceReady) {
         successfulImport = callProjectInfoTool(
             44, QStringLiteral("import_media"), QJsonObject{
-                {QStringLiteral("filePath"), importSource.fileName()},
+                {QStringLiteral("filePath"), importSourcePath},
                 {QStringLiteral("trackIndex"), 0}
             });
     }
@@ -2279,6 +2301,405 @@ int runMcpSelftest()
         g93 ? pass("G93 trim_clip rejects ripple:false")
             : fail("G93 trim_clip rejects ripple:false",
                    QStringLiteral("ripple:false was accepted by trim_clip"));
+
+        // G94-G95: trim_clip は同じ linkGroup の音声クリップも同量トリムし、
+        // 片方が境界違反なら両方とも変更前へ戻す (映像と音声の同期を壊さない)。
+        TimelineTrack *linkedAudio0 = projectTimeline->audioTracks().isEmpty()
+            ? nullptr : projectTimeline->audioTracks().first();
+        if (!linkedAudio0) {
+            fail("G94 trim_clip trims the linked audio clip and undo restores both",
+                 QStringLiteral("A1 track was not available"));
+            fail("G95 trim_clip rolls back when the linked audio cannot take the trim",
+                 QStringLiteral("A1 track was not available"));
+        } else {
+            captionVideo0->setClips(QVector<ClipInfo>{
+                makeTestClip(QStringLiteral("trim-linked-video"), 903)
+            });
+            linkedAudio0->setClips(QVector<ClipInfo>{
+                makeTestClip(QStringLiteral("trim-linked-audio"), 903)
+            });
+            saveMcpLiveBaseline();
+            const QJsonObject linkedTrimResponse = callProjectInfoTool(
+                99, QStringLiteral("trim_clip"), QJsonObject{
+                    {QStringLiteral("clipIndex"), 0},
+                    {QStringLiteral("edge"), QStringLiteral("in")},
+                    {QStringLiteral("timeSec"), 1.0}
+                });
+            const bool linkedTrimmed = !toolResult(linkedTrimResponse)
+                                            .value(QStringLiteral("isError")).toBool(true)
+                && toolPayload(linkedTrimResponse).value(QStringLiteral("ok")).toBool(false)
+                && qAbs(captionVideo0->clips().first().inPoint - 1.0) < 1e-9
+                && qAbs(linkedAudio0->clips().first().inPoint - 1.0) < 1e-9
+                && qAbs(linkedAudio0->clips().first().effectiveDuration() - 4.0) < 1e-9;
+            const QJsonObject linkedUndoResponse = linkedTrimmed
+                ? callProjectInfoTool(100, QStringLiteral("undo"), QJsonObject{}) : QJsonObject();
+            const bool linkedRestored = linkedTrimmed
+                && toolPayload(linkedUndoResponse).value(QStringLiteral("ok")).toBool(false)
+                && qAbs(captionVideo0->clips().first().inPoint) < 1e-9
+                && !linkedAudio0->clips().isEmpty()
+                && qAbs(linkedAudio0->clips().first().inPoint) < 1e-9
+                && qAbs(linkedAudio0->clips().first().effectiveDuration() - 5.0) < 1e-9;
+            const bool g94 = linkedTrimmed && linkedRestored;
+            g94 ? pass("G94 trim_clip trims the linked audio clip and undo restores both")
+                : fail("G94 trim_clip trims the linked audio clip and undo restores both",
+                       QStringLiteral("linked audio did not follow the trim or undo did not restore both clips"));
+
+            ClipInfo shortAudio = makeTestClip(QStringLiteral("trim-linked-short-audio"), 904);
+            shortAudio.duration = 0.5;
+            shortAudio.outPoint = 0.5;
+            captionVideo0->setClips(QVector<ClipInfo>{
+                makeTestClip(QStringLiteral("trim-linked-video-2"), 904)
+            });
+            linkedAudio0->setClips(QVector<ClipInfo>{shortAudio});
+            saveMcpLiveBaseline();
+            const QJsonObject rollbackResponse = callProjectInfoTool(
+                101, QStringLiteral("trim_clip"), QJsonObject{
+                    {QStringLiteral("clipIndex"), 0},
+                    {QStringLiteral("edge"), QStringLiteral("in")},
+                    {QStringLiteral("timeSec"), 1.0}
+                });
+            const bool g95 = toolResult(rollbackResponse)
+                                 .value(QStringLiteral("isError")).toBool(false)
+                && toolPayload(rollbackResponse).isEmpty()
+                && !projectTimeline->canUndo()
+                && qAbs(captionVideo0->clips().first().inPoint) < 1e-9
+                && qAbs(captionVideo0->clips().first().outPoint - 5.0) < 1e-9
+                && qAbs(linkedAudio0->clips().first().inPoint) < 1e-9;
+            g95 ? pass("G95 trim_clip rolls back when the linked audio cannot take the trim")
+                : fail("G95 trim_clip rolls back when the linked audio cannot take the trim",
+                       QStringLiteral("a partially applied trim survived a linked-audio boundary failure"));
+            linkedAudio0->setClips(QVector<ClipInfo>{});
+        }
+
+        // G96: 書き出し音声のパススルー (V1 先頭クリップの元音声を 0 秒から mux) が
+        // 正しいのは「音声クリップが 1 つ・同じファイル・未トリム・等倍・音量 1」の
+        // ときだけ。それ以外は ffmpeg でタイムライン通りのミックスを作る必要がある。
+        if (!linkedAudio0) {
+            fail("G96 export audio mix is required whenever passthrough would be wrong",
+                 QStringLiteral("A1 track was not available"));
+        } else {
+            auto requiresMix = [&]() {
+                return MainWindow::timelineRequiresExportAudioMix(projectTimeline);
+            };
+            // 先行ゲート (G51/G52) が A2 に残したクリップも正しく「ミックス要」と
+            // 判定されるので、パススルー判定の前に A1 以外を空にして後で戻す。
+            QVector<QPair<TimelineTrack *, QVector<ClipInfo>>> otherAudioClips;
+            for (TimelineTrack *otherTrack : projectTimeline->audioTracks()) {
+                if (!otherTrack || otherTrack == linkedAudio0)
+                    continue;
+                otherAudioClips.append(qMakePair(otherTrack, otherTrack->clips()));
+                otherTrack->setClips(QVector<ClipInfo>{});
+            }
+            const ClipInfo sourceVideo = makeTestClip(QStringLiteral("mix-source"), 905);
+            captionVideo0->setClips(QVector<ClipInfo>{sourceVideo});
+            linkedAudio0->setClips(QVector<ClipInfo>{
+                makeTestClip(QStringLiteral("mix-source"), 905)
+            });
+            const bool passthroughOk = !requiresMix();
+
+            ClipInfo trimmedAudio = makeTestClip(QStringLiteral("mix-source"), 905);
+            trimmedAudio.inPoint = 1.0;
+            linkedAudio0->setClips(QVector<ClipInfo>{trimmedAudio});
+            const bool trimmedNeedsMix = requiresMix();
+
+            ClipInfo quietAudio = makeTestClip(QStringLiteral("mix-source"), 905);
+            quietAudio.volume = 0.5;
+            linkedAudio0->setClips(QVector<ClipInfo>{quietAudio});
+            const bool volumeNeedsMix = requiresMix();
+
+            linkedAudio0->setClips(QVector<ClipInfo>{
+                makeTestClip(QStringLiteral("mix-source"), 905),
+                makeTestClip(QStringLiteral("mix-source"), 906)
+            });
+            const bool twoClipsNeedMix = requiresMix();
+
+            linkedAudio0->setClips(QVector<ClipInfo>{});
+            const bool noAudioNeedsMix = requiresMix();
+
+            linkedAudio0->setClips(QVector<ClipInfo>{
+                makeTestClip(QStringLiteral("mix-source"), 905)
+            });
+            const bool wasMuted = linkedAudio0->isMuted();
+            linkedAudio0->setMuted(true);
+            const bool mutedNeedsMix = requiresMix();
+            linkedAudio0->setMuted(wasMuted);
+            linkedAudio0->setClips(QVector<ClipInfo>{});
+            for (auto &entry : otherAudioClips)
+                entry.first->setClips(entry.second);
+
+            const bool g96 = passthroughOk && trimmedNeedsMix && volumeNeedsMix
+                && twoClipsNeedMix && noAudioNeedsMix && mutedNeedsMix;
+            g96 ? pass("G96 export audio mix is required whenever passthrough would be wrong")
+                : fail("G96 export audio mix is required whenever passthrough would be wrong",
+                       QStringLiteral("passthrough=%1 trimmed=%2 volume=%3 twoClips=%4 noAudio=%5 muted=%6")
+                           .arg(passthroughOk).arg(trimmedNeedsMix).arg(volumeNeedsMix)
+                           .arg(twoClipsNeedMix).arg(noAudioNeedsMix).arg(mutedNeedsMix));
+        }
+
+        // G97: RenderQueue はプロジェクト JSON (.veditor / .vsep / .json) を音声ソース
+        // として開かず、V1 クリップへフォールバックする。
+        const bool g97 = RenderQueue::isProjectFilePath(QStringLiteral("D:/x/project.veditor"))
+            && RenderQueue::isProjectFilePath(QStringLiteral("D:/x/project.vsep"))
+            && RenderQueue::isProjectFilePath(QStringLiteral("D:/x/PROJECT.JSON"))
+            && !RenderQueue::isProjectFilePath(QStringLiteral("D:/x/clip.mp4"))
+            && !RenderQueue::isProjectFilePath(QStringLiteral("D:/x/mix.m4a"))
+            && !RenderQueue::isProjectFilePath(QStringLiteral("D:/x/audio.wav"))
+            && !RenderQueue::isProjectFilePath(QString());
+        g97 ? pass("G97 project files are never used as the export audio source")
+            : fail("G97 project files are never used as the export audio source",
+                   QStringLiteral("RenderQueue::isProjectFilePath misclassified a path"));
+
+        // G98: export_video の音声引数はキュー投入前に検証される。
+        const QString exportArgsPath = QDir::tempPath()
+            + QStringLiteral("/mcp-selftest-export-args.mp4");
+        const QJsonObject emptyAudioCodecResponse = callProjectInfoTool(
+            102, QStringLiteral("export_video"), QJsonObject{
+                {QStringLiteral("outputPath"), exportArgsPath},
+                {QStringLiteral("audioCodec"), QStringLiteral("  ")}
+            });
+        const QJsonObject zeroAudioBitrateResponse = callProjectInfoTool(
+            103, QStringLiteral("export_video"), QJsonObject{
+                {QStringLiteral("outputPath"), exportArgsPath},
+                {QStringLiteral("audioBitrate"), 0}
+            });
+        const bool g98 = toolResult(emptyAudioCodecResponse)
+                             .value(QStringLiteral("isError")).toBool(false)
+            && toolPayload(emptyAudioCodecResponse).isEmpty()
+            && toolResult(zeroAudioBitrateResponse)
+                   .value(QStringLiteral("isError")).toBool(false)
+            && toolPayload(zeroAudioBitrateResponse).isEmpty()
+            && !QFileInfo::exists(exportArgsPath);
+        g98 ? pass("G98 export_video validates audioCodec and audioBitrate before queuing")
+            : fail("G98 export_video validates audioCodec and audioBitrate before queuing",
+                   QStringLiteral("an invalid audio argument was accepted by export_video"));
+
+        // G99-G100: 字幕エディタの一覧は remove_caption / clear_captions で直せる。
+        {
+            const QJsonObject clearedFirst = callProjectInfoTool(
+                104, QStringLiteral("clear_captions"), QJsonObject{});
+            callProjectInfoTool(105, QStringLiteral("add_caption"), QJsonObject{
+                {QStringLiteral("text"), QStringLiteral("first")},
+                {QStringLiteral("startSec"), 0.0}, {QStringLiteral("endSec"), 1.0}});
+            callProjectInfoTool(106, QStringLiteral("add_caption"), QJsonObject{
+                {QStringLiteral("text"), QStringLiteral("second")},
+                {QStringLiteral("startSec"), 2.0}, {QStringLiteral("endSec"), 3.0}});
+            const QJsonObject removed = callProjectInfoTool(
+                107, QStringLiteral("remove_caption"), QJsonObject{{QStringLiteral("index"), 0}});
+            const QJsonObject afterRemove = toolPayload(callProjectInfoTool(
+                108, QStringLiteral("get_captions"), QJsonObject{}));
+            const QJsonArray remaining = afterRemove.value(QStringLiteral("captions")).toArray();
+            const QJsonObject removeOutOfRange = callProjectInfoTool(
+                109, QStringLiteral("remove_caption"), QJsonObject{{QStringLiteral("index"), 5}});
+            const bool g99 = toolPayload(clearedFirst).value(QStringLiteral("captionCount")).toInt(-1) == 0
+                && toolPayload(removed).value(QStringLiteral("ok")).toBool(false)
+                && toolPayload(removed).value(QStringLiteral("captionCount")).toInt(-1) == 1
+                && remaining.size() == 1
+                && remaining.first().toObject().value(QStringLiteral("text")).toString()
+                       == QStringLiteral("second")
+                && toolResult(removeOutOfRange).value(QStringLiteral("isError")).toBool(false)
+                && toolResult(removeOutOfRange).value(QStringLiteral("content")).toArray()
+                       .first().toObject().value(QStringLiteral("text")).toString()
+                       .contains(QStringLiteral("0..0"));
+            g99 ? pass("G99 remove_caption removes one caption and reports the valid range")
+                : fail("G99 remove_caption removes one caption and reports the valid range",
+                       QStringLiteral("caption list after remove_caption did not match"));
+
+            const QJsonObject cleared = callProjectInfoTool(
+                110, QStringLiteral("clear_captions"), QJsonObject{});
+            const QJsonObject afterClear = toolPayload(callProjectInfoTool(
+                111, QStringLiteral("get_captions"), QJsonObject{}));
+            const QJsonObject applyEmpty = callProjectInfoTool(
+                112, QStringLiteral("apply_captions"), QJsonObject{});
+            const bool g100 = toolPayload(cleared).value(QStringLiteral("captionCount")).toInt(-1) == 0
+                && afterClear.value(QStringLiteral("captions")).toArray().isEmpty()
+                && toolResult(applyEmpty).value(QStringLiteral("isError")).toBool(false);
+            g100 ? pass("G100 clear_captions empties the editor list")
+                 : fail("G100 clear_captions empties the editor list",
+                        QStringLiteral("caption list was not empty after clear_captions"));
+        }
+
+        // G102: モーダルを開くが省略記号の無い「バージョン情報」は blocking。
+        {
+            const QJsonObject aboutList = toolPayload(callProjectInfoTool(
+                113, QStringLiteral("list_commands"),
+                QJsonObject{{QStringLiteral("query"), QStringLiteral("バージョン情報")}}));
+            const QJsonArray aboutCommands = aboutList.value(QStringLiteral("commands")).toArray();
+            bool aboutBlocking = !aboutCommands.isEmpty();
+            for (const QJsonValue& value : aboutCommands) {
+                if (value.toObject().value(QStringLiteral("risk")).toString()
+                    != QStringLiteral("blocking"))
+                    aboutBlocking = false;
+            }
+            aboutBlocking ? pass("G102 about dialog command is classified blocking")
+                          : fail("G102 about dialog command is classified blocking",
+                                 QStringLiteral("commands=%1").arg(
+                                     QString::fromUtf8(QJsonDocument(aboutCommands).toJson(
+                                         QJsonDocument::Compact))));
+        }
+
+        // G103: UndoManager::saveSerial は MAX_UNDO 到達後も増える (undoRecorded の根拠)。
+        {
+            UndoManager* undoManager = projectTimeline->undoManager();
+            const quint64 serialBefore = undoManager->saveSerial();
+            for (int i = 0; i < UndoManager::MAX_UNDO + 5; ++i)
+                projectTimeline->saveUndoState(QStringLiteral("serial probe"));
+            const bool g103 = undoManager->saveSerial()
+                    == serialBefore + static_cast<quint64>(UndoManager::MAX_UNDO + 5)
+                && undoManager->currentIndex() == UndoManager::MAX_UNDO - 1;
+            g103 ? pass("G103 undo save serial keeps counting past MAX_UNDO")
+                 : fail("G103 undo save serial keeps counting past MAX_UNDO",
+                        QStringLiteral("serial=%1 index=%2")
+                            .arg(undoManager->saveSerial()).arg(undoManager->currentIndex()));
+            saveMcpLiveBaseline();
+        }
+
+        // G104: 動画/音声として開けないファイルは取り込まない (0 秒クリップを作らない)。
+        {
+            QTemporaryFile notMedia(QDir::tempPath() + QStringLiteral("/mcp-selftest-XXXXXX.txt"));
+            bool importRejected = false;
+            if (notMedia.open()) {
+                notMedia.write("this is not a media file\n");
+                notMedia.flush();
+                const int videoBefore = captionVideo0->clipCount();
+                const QJsonObject rejected = callProjectInfoTool(
+                    114, QStringLiteral("import_media"),
+                    QJsonObject{{QStringLiteral("filePath"), notMedia.fileName()}});
+                importRejected = toolResult(rejected).value(QStringLiteral("isError")).toBool(false)
+                    && toolResult(rejected).value(QStringLiteral("content")).toArray()
+                           .first().toObject().value(QStringLiteral("text")).toString()
+                           .contains(QStringLiteral("開けません"))
+                    && captionVideo0->clipCount() == videoBefore
+                    && !projectTimeline->canUndo();
+            }
+            importRejected ? pass("G104 import_media rejects a file that is not media")
+                           : fail("G104 import_media rejects a file that is not media",
+                                  QStringLiteral("a non-media file was imported or the error text was unclear"));
+        }
+
+        // G105: 空のタイムラインは export_video で即エラー (1 フレームの無意味な出力を作らない)。
+        // 先行ゲートが V2/A2 に残したクリップも尺に数えるので、全トラックを空にして後で戻す。
+        {
+            QVector<QPair<TimelineTrack *, QVector<ClipInfo>>> everyTrackClips;
+            const QVector<TimelineTrack *> everyTrack =
+                projectTimeline->videoTracks() + projectTimeline->audioTracks();
+            for (TimelineTrack *anyTrack : everyTrack) {
+                if (!anyTrack)
+                    continue;
+                everyTrackClips.append(qMakePair(anyTrack, anyTrack->clips()));
+                anyTrack->setClips(QVector<ClipInfo>{});
+            }
+            saveMcpLiveBaseline();
+            const QJsonObject emptyExport = callProjectInfoTool(
+                115, QStringLiteral("export_video"),
+                QJsonObject{{QStringLiteral("outputPath"), exportArgsPath}});
+            const bool g105 = toolResult(emptyExport).value(QStringLiteral("isError")).toBool(false)
+                && toolResult(emptyExport).value(QStringLiteral("content")).toArray()
+                       .first().toObject().value(QStringLiteral("text")).toString()
+                       .contains(QStringLiteral("空"))
+                && !QFileInfo::exists(exportArgsPath);
+            g105 ? pass("G105 export_video rejects an empty timeline")
+                 : fail("G105 export_video rejects an empty timeline",
+                        QStringLiteral("an empty timeline was accepted for export (totalDuration=%1)")
+                            .arg(projectTimeline->totalDuration()));
+            for (auto &entry : everyTrackClips)
+                entry.first->setClips(entry.second);
+        }
+
+        // G106: speed はリンクした音声にも適用され、1 回の undo で両方戻る。volume は片側だけ。
+        if (!linkedAudio0) {
+            fail("G106 set_clip_property speed follows the linked audio clip",
+                 QStringLiteral("A1 track was not available"));
+        } else {
+            captionVideo0->setClips(QVector<ClipInfo>{
+                makeTestClip(QStringLiteral("speed-video"), 907)});
+            linkedAudio0->setClips(QVector<ClipInfo>{
+                makeTestClip(QStringLiteral("speed-audio"), 907)});
+            saveMcpLiveBaseline();
+            const QJsonObject speedResponse = callProjectInfoTool(
+                116, QStringLiteral("set_clip_property"), QJsonObject{
+                    {QStringLiteral("clipIndex"), 0},
+                    {QStringLiteral("property"), QStringLiteral("speed")},
+                    {QStringLiteral("value"), 2.0}});
+            const bool speedLinked = toolPayload(speedResponse).value(QStringLiteral("linkedApplied")).toBool(false)
+                && qAbs(captionVideo0->clips().first().speed - 2.0) < 1e-9
+                && qAbs(linkedAudio0->clips().first().speed - 2.0) < 1e-9;
+            const QJsonObject speedUndo = speedLinked
+                ? callProjectInfoTool(117, QStringLiteral("undo"), QJsonObject{}) : QJsonObject();
+            const bool speedRestored = speedLinked
+                && toolPayload(speedUndo).value(QStringLiteral("ok")).toBool(false)
+                && qAbs(captionVideo0->clips().first().speed - 1.0) < 1e-9
+                && qAbs(linkedAudio0->clips().first().speed - 1.0) < 1e-9;
+            const QJsonObject volumeResponse = callProjectInfoTool(
+                118, QStringLiteral("set_clip_property"), QJsonObject{
+                    {QStringLiteral("clipIndex"), 0},
+                    {QStringLiteral("property"), QStringLiteral("volume")},
+                    {QStringLiteral("value"), 0.5}});
+            const bool volumeOnlyVideo = !toolPayload(volumeResponse).value(QStringLiteral("linkedApplied")).toBool(true)
+                && qAbs(captionVideo0->clips().first().volume - 0.5) < 1e-9
+                && qAbs(linkedAudio0->clips().first().volume - 1.0) < 1e-9;
+            const bool g106 = speedLinked && speedRestored && volumeOnlyVideo;
+            g106 ? pass("G106 set_clip_property speed follows the linked audio clip")
+                 : fail("G106 set_clip_property speed follows the linked audio clip",
+                        QStringLiteral("speedLinked=%1 restored=%2 volumeOnlyVideo=%3")
+                            .arg(speedLinked).arg(speedRestored).arg(volumeOnlyVideo));
+            linkedAudio0->setClips(QVector<ClipInfo>{});
+        }
+
+        // G107: select_clip は kind / trackIndex を省略でき、他ツールと同じ既定 (video / 0)。
+        {
+            captionVideo0->setClips(QVector<ClipInfo>{
+                makeTestClip(QStringLiteral("select-default"), 0)});
+            saveMcpLiveBaseline();
+            const QJsonObject selectDefault = callProjectInfoTool(
+                119, QStringLiteral("select_clip"), QJsonObject{{QStringLiteral("clipIndex"), 0}});
+            const QJsonObject selectPayload = toolPayload(selectDefault);
+            const bool g107 = selectPayload.value(QStringLiteral("ok")).toBool(false)
+                && selectPayload.value(QStringLiteral("kind")).toString() == QStringLiteral("video")
+                && selectPayload.value(QStringLiteral("trackIndex")).toInt(-1) == 0
+                && captionVideo0->selectedClip() == 0;
+            g107 ? pass("G107 select_clip defaults kind and trackIndex like the other clip tools")
+                 : fail("G107 select_clip defaults kind and trackIndex like the other clip tools",
+                        QStringLiteral("select_clip without kind/trackIndex did not select V1 clip 0"));
+            projectTimeline->clearSelection();
+        }
+
+        // G108: add_text_overlay は区間と重なる V1 の全クリップに付く (clip 0 固定ではない)。
+        {
+            captionVideo0->setClips(QVector<ClipInfo>{
+                makeTestClip(QStringLiteral("text-A"), 0),
+                makeTestClip(QStringLiteral("text-B"), 0)});
+            saveMcpLiveBaseline();
+            const QJsonObject secondClipText = callProjectInfoTool(
+                120, QStringLiteral("add_text_overlay"), QJsonObject{
+                    {QStringLiteral("text"), QStringLiteral("late")},
+                    {QStringLiteral("startSec"), 6.0}, {QStringLiteral("endSec"), 7.0}});
+            const QJsonArray lateIndices = toolPayload(secondClipText)
+                                               .value(QStringLiteral("clipIndices")).toArray();
+            const bool lateOnSecond = lateIndices.size() == 1 && lateIndices.first().toInt(-1) == 1
+                && captionVideo0->clips().at(0).textManager.count() == 0
+                && captionVideo0->clips().at(1).textManager.count() == 1;
+            const QJsonObject spanningText = callProjectInfoTool(
+                121, QStringLiteral("add_text_overlay"), QJsonObject{
+                    {QStringLiteral("text"), QStringLiteral("span")},
+                    {QStringLiteral("startSec"), 4.0}, {QStringLiteral("endSec"), 6.0}});
+            const QJsonArray spanIndices = toolPayload(spanningText)
+                                               .value(QStringLiteral("clipIndices")).toArray();
+            const bool spanOnBoth = spanIndices.size() == 2
+                && captionVideo0->clips().at(0).textManager.count() == 1
+                && captionVideo0->clips().at(1).textManager.count() == 2;
+            const QJsonObject outsideText = callProjectInfoTool(
+                122, QStringLiteral("add_text_overlay"), QJsonObject{
+                    {QStringLiteral("text"), QStringLiteral("nowhere")},
+                    {QStringLiteral("startSec"), 20.0}, {QStringLiteral("endSec"), 21.0}});
+            const bool outsideRejected = toolResult(outsideText)
+                                             .value(QStringLiteral("isError")).toBool(false)
+                && captionVideo0->clips().at(1).textManager.count() == 2;
+            const bool g108 = lateOnSecond && spanOnBoth && outsideRejected;
+            g108 ? pass("G108 add_text_overlay attaches to every V1 clip overlapping the interval")
+                 : fail("G108 add_text_overlay attaches to every V1 clip overlapping the interval",
+                        QStringLiteral("lateOnSecond=%1 spanOnBoth=%2 outsideRejected=%3")
+                            .arg(lateOnSecond).arg(spanOnBoth).arg(outsideRejected));
+        }
     }
 
     const QJsonObject commandListResponse = callProjectInfoTool(

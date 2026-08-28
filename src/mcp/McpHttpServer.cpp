@@ -54,6 +54,26 @@ int originVerdict(const QByteArray& origin)
     return url.isValid() && allowedScheme && allowedHost ? 1 : -1;
 }
 
+// Host ヘッダが loopback 以外 (DNS リバインディングで到達したページや誤設定の
+// クライアント) を指すリクエストを拒否する。ヘッダ無しは HTTP/1.0 として許可。
+bool isLoopbackHostHeader(const QByteArray& host)
+{
+    if (host.isEmpty())
+        return true;
+    QString value = QString::fromLatin1(host).trimmed().toLower();
+    if (value.startsWith(QLatin1Char('['))) {
+        const int close = value.indexOf(QLatin1Char(']'));
+        if (close < 0)
+            return false;
+        value = value.mid(1, close - 1);
+    } else if (value.count(QLatin1Char(':')) == 1) {
+        value = value.left(value.indexOf(QLatin1Char(':')));
+    }
+    return value == QStringLiteral("localhost")
+        || value == QStringLiteral("127.0.0.1")
+        || value == QStringLiteral("::1");
+}
+
 QHash<QByteArray, QByteArray> corsHeaders(const QByteArray& origin)
 {
     QHash<QByteArray, QByteArray> headers;
@@ -492,6 +512,12 @@ void McpHttpServer::handleRequest(QTcpSocket* socket, const Request& request)
     const QByteArray origin = headerValue(request.headers, "origin");
     if (originVerdict(origin) < 0) {
         writeResponse(socket, 403, QByteArray("{\"error\":\"forbidden origin\"}"),
+                      {{"Content-Type", "application/json; charset=utf-8"}},
+                      closeConnection);
+        return;
+    }
+    if (!isLoopbackHostHeader(headerValue(request.headers, "host"))) {
+        writeResponse(socket, 403, QByteArray("{\"error\":\"forbidden host\"}"),
                       {{"Content-Type", "application/json; charset=utf-8"}},
                       closeConnection);
         return;

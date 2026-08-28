@@ -251,6 +251,11 @@ public:
     // instead of showing dialogs.
     PrecomposeResult precomposeSelectionWithName(const QString &name);
 
+    // RenderQueue の音声パススルー (V1 先頭クリップの元ファイル音声を 0 秒から
+    // そのまま mux) では正しくならないタイムラインかどうか。true なら書き出し前に
+    // ffmpeg で音声ミックス (prepareExportAudioMix) を作る必要がある。
+    static bool timelineRequiresExportAudioMix(Timeline *timeline);
+
 public slots:
     // Used by main.cpp when the app is launched with a file argument.
     // Loads the given file as a media clip (same code path as File > Open).
@@ -680,6 +685,10 @@ private:
     bool applyCaptionEditorTrackToTimeline(QString *err, int *appliedCount);
     void applyProjectConfig(const ProjectConfig &config);
     void syncProjectLightingToTimeline();
+    // 書き出し用の音声ミックス (.m4a) を temp に作り、そのパスを返す。ミックスが
+    // 不要 (パススルーで正しい) なら空文字列。失敗時は *error に日本語メッセージ。
+    // GUI の exportVideo と MCP の export_video が同じ経路で使う。
+    QString prepareExportAudioMix(QString *error);
     void updateTitle();
     void populateProjectData(ProjectData &data);
     void applyLoadedProjectData(const ProjectData &data, const QString &filePath);

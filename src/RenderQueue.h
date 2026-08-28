@@ -119,6 +119,10 @@ public:
 
     static QStringList buildLoudnessAudioFilterArgs(double gainDb);
 
+    // RenderJob::projectFilePath は音声 mux 元 (メディア or 事前ミックス) を兼ねる。
+    // プロジェクト JSON (.veditor / .vsep / .json) を音声ソースとして開かないための判定。
+    static bool isProjectFilePath(const QString &path);
+
     static QVector<RenderPreset> availablePresets();
     static RenderJob jobFromPreset(const RenderPreset &preset,
                                    const QString &outputPath,

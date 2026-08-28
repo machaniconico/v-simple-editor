@@ -168,28 +168,30 @@ MCP の変更系ツールは確認ダイアログを出さず、原則として�
 | `get_frame` | 指定時刻の合成フレームを PNG で返す（既定 640px 以下・1MB 以内） | なし |
 | `get_captions` | 字幕を読み取る | なし |
 | `get_export_status` | `export_video` ジョブの状態・進捗を返す | なし |
-| `list_commands` | メニュー直下のお気に入り登録可能なアクションを安定 ID（例: `file.11`, `tools.41`）付きで一覧する（サブメニュー内の項目は含まない）。省略可能な `query` で id / 表示名 / メニュー名を部分一致フィルタでき、各項目に `risk`（safe / blocking / quit）と `enabled` を返す | なし |
+| `list_commands` | メニュー直下のお気に入り登録可能なアクションを一覧する（サブメニュー内の項目は含まない）。ID は `<メニューキー>.<メニュー内の通し番号>`（例: `file.11`, `tools.41`）で、表示文言の変更では変わらないが、メニューの途中にアクションが追加されると後続の番号がずれる（位置依存）ため、実行前に `list_commands` で id を確認する。`query` 省略時は全件（約 230 件・JSON で約 60KB）を返すので通常は `query` で id / 表示名 / メニュー名を部分一致フィルタする。各項目に `risk`（safe / blocking / quit）と `enabled` を返す | なし |
 | `run_command` | `list_commands` のアクションを ID で実行する（`allowBlocking` は既定 false。応答の `undoRecorded` で Ctrl+Z / `undo` の対象になったか確認できる） | アクション依存（MCP 側では追加しない） |
-| `export_video` | タイムラインを動画へ非同期で書き出し、`jobId` を返す | なし |
-| `import_media` | ダイアログなしで素材を指定トラックへ取り込む | あり |
-| `save_project` | プロジェクトを指定パスへ保存する（ダイアログなし） | なし |
+| `export_video` | タイムラインを動画へ非同期で書き出し、`jobId` を返す。音声はトリム・分割・並べ替え・音量・ミュートを反映したタイムラインのミックスを ffmpeg で作ってから多重化する（`audioCodec` / `audioBitrate` 省略時は aac / 192 kbps） | なし |
+| `import_media` | ダイアログなしで素材を指定トラックへ取り込む（`kind` 既定 `auto`: 映像があれば V/A の組、無いファイル（BGM・ナレーション）は音声トラックだけ。`video` / `audio` で片側だけ。開けないファイルはエラー） | あり |
+| `save_project` | プロジェクトを指定パスへ保存する（ダイアログなし。拡張子は GUI と同じ `.veditor` を推奨） | なし |
 | `open_project` | 指定パスのプロジェクトを読み込む（未保存確認なし） | なし |
-| `select_clip` | 指定クリップを選択する | なし |
+| `select_clip` | 指定クリップを選択する（`kind` / `trackIndex` 省略時は video / 0） | なし |
 | `clear_selection` | 選択をすべて解除する | なし |
 | `split_clip` | クリップを分割する | あり |
 | `delete_clip` | クリップを削除する | あり |
-| `move_clip` | クリップを移動する | あり |
-| `set_clip_property` | クリップのプロパティを変更する | あり |
-| `trim_clip` | edge=in は開始位置を保ったまま timeSec 時点の内容を新しい先頭にし、以降が (timeSec−開始) だけ左へ詰まる（RippleIn）。edge=out は末尾を timeSec にし後続が詰まる（RippleOut）。video のみ、リンクした音声は追従しない（ripple 既定 true） | あり |
+| `move_clip` | クリップを移動する（`newTrackIndex` で別トラックへ。既定プロジェクトは V1/A1 の 1 段なので、先に `run_command` の「ビデオトラックを追加」を実行する。存在しないトラックを指定するとエラー文でそのコマンド id を案内する） | あり |
+| `set_clip_property` | クリップのプロパティ（volume / opacity / speed / pan / videoScale）を変更する。`speed` はリンクした音声クリップにも同時に適用される | あり |
+| `trim_clip` | edge=in は開始位置を保ったまま timeSec 時点の内容を新しい先頭にし、以降が (timeSec−開始) だけ左へ詰まる（RippleIn）。edge=out は末尾を timeSec にし後続が詰まる（RippleOut）。kind は video のみだが、同じ linkGroup の音声クリップも同じ量だけトリムされる（ripple 既定 true） | あり |
 | `set_transition` | V1 のクリップにトランジションを設定する（FadeIn は先頭、その他は末尾、None で解除） | あり |
-| `add_text_overlay` | V1 の先頭クリップにテキスト／テロップを追加する（時刻は秒、位置は 0..1） | あり |
+| `add_text_overlay` | V1 にテキスト／テロップを追加する（時刻は秒、位置は 0..1。区間と重なる全クリップに付くのでクリップ境界をまたいでも表示される） | あり |
 | `add_caption` | 字幕エディタの一覧に 1 件追加する（タイムラインへは `apply_captions` で反映） | なし（Ctrl+Z 対象外） |
 | `apply_captions` | 字幕エディタの字幕を V1 の 1 語字幕オーバーレイとしてタイムラインへ適用する（既存の生成済み 1 語字幕は置き換え） | あり（タイムライン側のみ。字幕エディタの一覧は戻らない） |
+| `remove_caption` | 字幕エディタの一覧から `index`（`get_captions` の `captions[].index`）の字幕を 1 件削除する | なし（Ctrl+Z 対象外） |
+| `clear_captions` | 字幕エディタの一覧を空にする | なし（Ctrl+Z 対象外） |
 | `set_playhead` | 再生ヘッドを移動する | なし |
 | `undo` | 直前の編集を元に戻す | なし |
 | `redo` | 元に戻した編集をやり直す | なし |
 
-MCP サーバの自己テストは `--selftest=mcp` または `VEDITOR_MCP_SELFTEST=1` で実行できます（実装: `src/selftests/mcp_selftest.cpp`、ゲート G1..G93）。
+MCP サーバの自己テストは `--selftest=mcp` または `VEDITOR_MCP_SELFTEST=1` で実行できます（実装: `src/selftests/mcp_selftest.cpp`、ゲート G1..G108）。
 
 ---
 

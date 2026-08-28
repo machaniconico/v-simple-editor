@@ -421,6 +421,14 @@ void RenderQueue::setLoudnessGainDb(double gainDb)
     m_loudnessGainDb = sanitizeLoudnessGainDb(gainDb);
 }
 
+bool RenderQueue::isProjectFilePath(const QString &path)
+{
+    const QString suffix = QFileInfo(path).suffix().toLower();
+    return suffix == QLatin1String("veditor")
+        || suffix == QLatin1String("vsep")
+        || suffix == QLatin1String("json");
+}
+
 QStringList RenderQueue::buildLoudnessAudioFilterArgs(double gainDb)
 {
     if (!hasLoudnessGain(gainDb))
@@ -1047,8 +1055,7 @@ void RenderQueue::startRenderPipe(int jobIndex)
     {
         const bool projIsMedia = !audioInputPath.isEmpty()
             && QFile::exists(audioInputPath)
-            && !audioInputPath.endsWith(QStringLiteral(".veditor"),
-                                        Qt::CaseInsensitive);
+            && !RenderQueue::isProjectFilePath(audioInputPath);
         if (!projIsMedia) {
             const QVector<ClipInfo> &v1 = tl->videoClips();
             if (!v1.isEmpty() && QFile::exists(v1.first().filePath))
@@ -1522,8 +1529,7 @@ void RenderQueue::startRenderPipeSubprocess(int jobIndex)
     {
         const bool projIsMedia = !audioInputPath.isEmpty()
             && QFile::exists(audioInputPath)
-            && !audioInputPath.endsWith(QStringLiteral(".veditor"),
-                                        Qt::CaseInsensitive);
+            && !RenderQueue::isProjectFilePath(audioInputPath);
         if (!projIsMedia) {
             const QVector<ClipInfo> &v1 = tl->videoClips();
             if (!v1.isEmpty() && QFile::exists(v1.first().filePath))

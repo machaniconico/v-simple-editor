@@ -11,6 +11,7 @@ void UndoManager::saveState(const TimelineState &state, const QString &descripti
     m_undoStack.push({state, description});
     if (m_undoStack.size() > MAX_UNDO)
         m_undoStack.removeFirst();
+    ++m_saveSerial;
     emit stateChanged();
     emit historyChanged();
 }
