@@ -17,6 +17,14 @@ QByteArray responseForRequest(bool notification, const QByteArray& response)
     return notification ? QByteArray() : response;
 }
 
+QJsonObject toolCallResult(const QJsonArray& content, bool isError)
+{
+    QJsonObject result;
+    result.insert(QStringLiteral("content"), content);
+    result.insert(QStringLiteral("isError"), isError);
+    return result;
+}
+
 QJsonObject toolCallResult(const QString& text, bool isError)
 {
     QJsonObject contentItem;
@@ -25,11 +33,7 @@ QJsonObject toolCallResult(const QString& text, bool isError)
 
     QJsonArray content;
     content.append(contentItem);
-
-    QJsonObject result;
-    result.insert(QStringLiteral("content"), content);
-    result.insert(QStringLiteral("isError"), isError);
-    return result;
+    return toolCallResult(content, isError);
 }
 
 } // namespace
@@ -77,8 +81,12 @@ QByteArray McpProtocol::handleMessage(const QByteArray& body) const
         serverInfo.insert(QStringLiteral("version"), m_info.version);
 
         QJsonObject result;
+        const QJsonObject params = request.value(QStringLiteral("params")).toObject();
+        const QString requested = params.value(QStringLiteral("protocolVersion")).toString();
+        const QString negotiated = isSupportedProtocolVersion(requested)
+            ? requested : QString::fromLatin1(protocolVersion());
         result.insert(QStringLiteral("protocolVersion"),
-                      QString::fromLatin1(protocolVersion()));
+                      negotiated);
         result.insert(QStringLiteral("capabilities"), capabilities);
         result.insert(QStringLiteral("serverInfo"), serverInfo);
         return responseForRequest(notification, makeResultResponse(id, result));
@@ -128,8 +136,9 @@ QByteArray McpProtocol::handleMessage(const QByteArray& body) const
 
         bool found = false;
         QString error;
+        QJsonArray content;
         const QJsonObject toolResult = m_registry->callTool(
-            nameValue.toString(), arguments, &found, &error);
+            nameValue.toString(), arguments, &found, &error, &content);
         if (!found) {
             return responseForRequest(
                 notification,
@@ -144,7 +153,9 @@ QByteArray McpProtocol::handleMessage(const QByteArray& body) const
 
         const QString serializedResult = QString::fromUtf8(
             QJsonDocument(toolResult).toJson(QJsonDocument::Compact));
-        QJsonObject result = toolCallResult(serializedResult, false);
+        QJsonObject result = content.isEmpty()
+            ? toolCallResult(serializedResult, false)
+            : toolCallResult(content, false);
         result.insert(QStringLiteral("structuredContent"), toolResult);
         return responseForRequest(notification, makeResultResponse(id, result));
     }
@@ -184,6 +195,20 @@ const char* McpProtocol::protocolVersion()
     // それが仕様に入った 2025-03-26 以降の版を名乗る。2024-11-05 を名乗ると
     // HTTP+SSE の旧トランスポートを期待するクライアントと噛み合わない。
     return "2025-06-18";
+}
+
+QStringList McpProtocol::supportedProtocolVersions()
+{
+    return {
+        QStringLiteral("2024-11-05"),
+        QStringLiteral("2025-03-26"),
+        QStringLiteral("2025-06-18")
+    };
+}
+
+bool McpProtocol::isSupportedProtocolVersion(const QString& version)
+{
+    return supportedProtocolVersions().contains(version);
 }
 
 } // namespace mcp

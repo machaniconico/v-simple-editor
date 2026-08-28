@@ -65,6 +65,12 @@ public:
 
     int currentIndex() const { return m_undoStack.size() - 1; }
 
+    // saveState の累積回数。MAX_UNDO で先頭が落ちて size が変わらなくても増えるので、
+    // 「この操作で undo が積まれたか」は currentIndex の差分ではなくこの値で判定する。
+    quint64 saveSerial() const { return m_saveSerial; }
+
+    static constexpr int MAX_UNDO = 100;
+
     QStringList historyDescriptions() const;
 
     bool jumpTo(int index);
@@ -84,5 +90,5 @@ private:
 
     QStack<Entry> m_undoStack;
     QStack<Entry> m_redoStack;
-    static constexpr int MAX_UNDO = 100;
+    quint64 m_saveSerial = 0;
 };

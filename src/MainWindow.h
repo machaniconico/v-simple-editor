@@ -217,6 +217,15 @@ class McpHttpServer;
 class McpEditorTools;
 }
 
+// MCP からメニューアクションを実行するときの危険度。
+// Safe は即時完了、Blocking はユーザー操作を待つ可能性があり、Quit は
+// アプリケーションを終了させるアクションを表す。
+enum class FavoritableActionRisk {
+    Safe,
+    Blocking,
+    Quit
+};
+
 class MainWindow : public QMainWindow
 {
     Q_OBJECT
@@ -241,6 +250,11 @@ public:
     // programmatic callers. Returns success=false with failureReason populated
     // instead of showing dialogs.
     PrecomposeResult precomposeSelectionWithName(const QString &name);
+
+    // RenderQueue の音声パススルー (V1 先頭クリップの元ファイル音声を 0 秒から
+    // そのまま mux) では正しくならないタイムラインかどうか。true なら書き出し前に
+    // ffmpeg で音声ミックス (prepareExportAudioMix) を作る必要がある。
+    static bool timelineRequiresExportAudioMix(Timeline *timeline);
 
 public slots:
     // Used by main.cpp when the app is launched with a file argument.
@@ -270,6 +284,9 @@ public:
     // for keyframe insertion at the current timeline position.
     double currentPlayheadSeconds() const;
     QString projectDirectory() const;
+    // MCP の選択確認とセルフテストが、Timeline 側と同じ追跡値を確認できるようにする。
+    int selectedVideoTrackIndex() const { return m_selectedVideoTrackIndex; }
+    int selectedVideoClipIndexTracked() const { return m_selectedVideoClipIndexTracked; }
 
 signals:
     void playheadSecondsChanged(double seconds);
@@ -656,11 +673,22 @@ private:
     void showWelcomeScreen();
     void hideWelcomeScreen();
     void loadMediaFile(const QString &filePath, bool addToTimeline, const QString &statusPrefix);
+    bool saveProjectToPath(const QString &filePath, QString *errorMessage = nullptr);
+    bool openProjectFromPath(const QString &filePath, QString *errorMessage = nullptr);
     void updateStatusInfo();
     void updateAcesUiState();
     void updateEditActions();
+    // 字幕エディタを生成のみ (表示しない)。MCP の add_caption / apply_captions 用。
+    CaptionEditorDialog *ensureCaptionEditorDialog();
+    // 字幕エディタが保持する caption::Track を V1 の1語字幕 overlay として適用する。
+    // 成功で true、*appliedCount に overlay 数。失敗時は *err に日本語メッセージ。
+    bool applyCaptionEditorTrackToTimeline(QString *err, int *appliedCount);
     void applyProjectConfig(const ProjectConfig &config);
     void syncProjectLightingToTimeline();
+    // 書き出し用の音声ミックス (.m4a) を temp に作り、そのパスを返す。ミックスが
+    // 不要 (パススルーで正しい) なら空文字列。失敗時は *error に日本語メッセージ。
+    // GUI の exportVideo と MCP の export_video が同じ経路で使う。
+    QString prepareExportAudioMix(QString *error);
     void updateTitle();
     void populateProjectData(ProjectData &data);
     void applyLoadedProjectData(const ProjectData &data, const QString &filePath);
@@ -948,18 +976,19 @@ private:
     QHash<QString, QAction *> m_commandActions;
 
     // User-customizable "お気に入り" menu support.
-    // FavoritableAction::id is a STABLE string (e.g. "file.new", "edit.split")
-    // — never the translated text — so the persisted favorites list survives
-    // UI-text changes. label = current display text (shown in the editor
-    // dialog), menuPath = parent menu title used for grouping in the dialog,
-    // action = the real menu QAction (the proxy added to the お気に入り menu
-    // forwards trigger() to it). Populated in setupMenuBar() alongside
-    // m_menuHelpEntries.
+    // FavoritableAction::id は menuKey とメニュー内 index の文字列
+    // (例: "file.0", "edit.1") で、翻訳後の表示文字列からは生成しない。
+    // そのため UI 文言の変更ではお気に入り設定を維持できるが、メニュー途中への
+    // アクション挿入では後続 ID がずれる。label = エディタに表示する現在の文言、
+    // menuPath = ダイアログでグループ化する親メニュー名、action = 実体の QAction
+    // (お気に入りメニューに追加する proxy はこれへ trigger() を転送) である。
+    // setupMenuBar() で m_menuHelpEntries と同時に構築する。
     struct FavoritableAction {
         QString id;
         QString label;
         QString menuPath;
         QAction *action = nullptr;
+        FavoritableActionRisk risk = FavoritableActionRisk::Safe;
     };
     QVector<FavoritableAction> m_favoritableActions;
     QMenu *m_favoritesMenu = nullptr;

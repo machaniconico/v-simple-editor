@@ -37,6 +37,61 @@ QByteArray headerValue(const QHash<QByteArray, QByteArray>& headers,
     return headers.value(name.toLower());
 }
 
+// 0 = Origin ヘッダ無し (許可), 1 = 許可 Origin, -1 = 拒否
+int originVerdict(const QByteArray& origin)
+{
+    if (origin.isEmpty())
+        return 0;
+
+    const QUrl url = QUrl::fromEncoded(origin);
+    const QString scheme = url.scheme().toLower();
+    const QString host = url.host().toLower();
+    const bool allowedScheme = scheme == QStringLiteral("http")
+        || scheme == QStringLiteral("https");
+    const bool allowedHost = host == QStringLiteral("localhost")
+        || host == QStringLiteral("127.0.0.1")
+        || host == QStringLiteral("::1");
+    return url.isValid() && allowedScheme && allowedHost ? 1 : -1;
+}
+
+// Host ヘッダが loopback 以外 (DNS リバインディングで到達したページや誤設定の
+// クライアント) を指すリクエストを拒否する。ヘッダ無しは HTTP/1.0 として許可。
+bool isLoopbackHostHeader(const QByteArray& host)
+{
+    if (host.isEmpty())
+        return true;
+    QString value = QString::fromLatin1(host).trimmed().toLower();
+    if (value.startsWith(QLatin1Char('['))) {
+        const int close = value.indexOf(QLatin1Char(']'));
+        if (close < 0)
+            return false;
+        value = value.mid(1, close - 1);
+    } else if (value.count(QLatin1Char(':')) == 1) {
+        value = value.left(value.indexOf(QLatin1Char(':')));
+    }
+    return value == QStringLiteral("localhost")
+        || value == QStringLiteral("127.0.0.1")
+        || value == QStringLiteral("::1");
+}
+
+QHash<QByteArray, QByteArray> corsHeaders(const QByteArray& origin)
+{
+    QHash<QByteArray, QByteArray> headers;
+    if (originVerdict(origin) == 1) {
+        headers.insert("Access-Control-Allow-Origin", origin);
+        headers.insert("Vary", "Origin");
+    }
+    return headers;
+}
+
+bool isJsonContentType(const QByteArray& value)
+{
+    const int semicolon = value.indexOf(';');
+    const QByteArray mediaType = (semicolon >= 0 ? value.left(semicolon) : value)
+        .trimmed().toLower();
+    return mediaType == "application/json";
+}
+
 const char* reasonPhrase(int status)
 {
     switch (status) {
@@ -45,11 +100,14 @@ const char* reasonPhrase(int status)
     case 204: return "No Content";
     case 400: return "Bad Request";
     case 401: return "Unauthorized";
+    case 403: return "Forbidden";
     case 404: return "Not Found";
     case 405: return "Method Not Allowed";
+    case 415: return "Unsupported Media Type";
     case 413: return "Payload Too Large";
     case 431: return "Request Header Fields Too Large";
     case 501: return "Not Implemented";
+    case 503: return "Service Unavailable";
     default: return "Internal Server Error";
     }
 }
@@ -214,6 +272,11 @@ QString McpHttpServer::endpointUrl() const
     return QStringLiteral("http://127.0.0.1:%1/mcp").arg(m_port);
 }
 
+int McpHttpServer::maxConnections()
+{
+    return kMaxConnections;
+}
+
 void McpHttpServer::onNewConnection()
 {
     while (m_server && m_server->hasPendingConnections()) {
@@ -222,8 +285,14 @@ void McpHttpServer::onNewConnection()
             continue;
 
         if (m_pending.size() >= kMaxConnections) {
-            socket->disconnectFromHost();
-            socket->deleteLater();
+            connect(socket, &QTcpSocket::disconnected,
+                    socket, &QObject::deleteLater);
+            writeResponse(socket, 503,
+                          QByteArray("{\"error\":\"too many connections\"}"),
+                          {{"Content-Type", "application/json; charset=utf-8"},
+                           {"Retry-After", "1"}},
+                          true);
+            QTimer::singleShot(5000, socket, &QObject::deleteLater);
             continue;
         }
 
@@ -440,6 +509,20 @@ void McpHttpServer::handleRequest(QTcpSocket* socket, const Request& request)
         return;
     }
 
+    const QByteArray origin = headerValue(request.headers, "origin");
+    if (originVerdict(origin) < 0) {
+        writeResponse(socket, 403, QByteArray("{\"error\":\"forbidden origin\"}"),
+                      {{"Content-Type", "application/json; charset=utf-8"}},
+                      closeConnection);
+        return;
+    }
+    if (!isLoopbackHostHeader(headerValue(request.headers, "host"))) {
+        writeResponse(socket, 403, QByteArray("{\"error\":\"forbidden host\"}"),
+                      {{"Content-Type", "application/json; charset=utf-8"}},
+                      closeConnection);
+        return;
+    }
+
     if (request.method == "GET") {
         writeResponse(socket, 405, QByteArray(),
                       {{"Allow", "POST, OPTIONS"}}, closeConnection);
@@ -447,10 +530,12 @@ void McpHttpServer::handleRequest(QTcpSocket* socket, const Request& request)
     }
 
     if (request.method == "OPTIONS") {
+        QHash<QByteArray, QByteArray> headers = corsHeaders(origin);
+        headers.insert("Access-Control-Allow-Headers",
+                       "content-type, authorization, mcp-protocol-version");
+        headers.insert("Access-Control-Allow-Methods", "POST, OPTIONS");
         writeResponse(socket, 204, QByteArray(),
-                      {{"Access-Control-Allow-Origin", "*"},
-                       {"Access-Control-Allow-Headers", "content-type, authorization"},
-                       {"Access-Control-Allow-Methods", "POST, OPTIONS"}},
+                      headers,
                       closeConnection);
         return;
     }
@@ -461,8 +546,39 @@ void McpHttpServer::handleRequest(QTcpSocket* socket, const Request& request)
     }
 
     if (!authorized(request)) {
+        QHash<QByteArray, QByteArray> headers = corsHeaders(origin);
+        headers.insert("Content-Type", "application/json; charset=utf-8");
         writeResponse(socket, 401, QByteArray("{\"error\":\"unauthorized\"}"),
-                      {{"Content-Type", "application/json; charset=utf-8"}},
+                      headers,
+                      closeConnection);
+        return;
+    }
+
+    const QByteArray contentType = headerValue(request.headers, "content-type");
+    if (!isJsonContentType(contentType)) {
+        QHash<QByteArray, QByteArray> headers = corsHeaders(origin);
+        headers.insert("Content-Type", "application/json; charset=utf-8");
+        writeResponse(socket, 415,
+                      QByteArray("{\"error\":\"content-type must be application/json\"}"),
+                      headers,
+                      closeConnection);
+        return;
+    }
+
+    const QByteArray mcpVersion = headerValue(request.headers,
+                                              "mcp-protocol-version");
+    if (!mcpVersion.isEmpty()
+        && !McpProtocol::isSupportedProtocolVersion(
+            QString::fromLatin1(mcpVersion))) {
+        QJsonObject errorBody;
+        errorBody.insert(QStringLiteral("error"),
+                         QStringLiteral("unsupported MCP-Protocol-Version: %1")
+                             .arg(QString::fromLatin1(mcpVersion)));
+        QHash<QByteArray, QByteArray> headers = corsHeaders(origin);
+        headers.insert("Content-Type", "application/json; charset=utf-8");
+        writeResponse(socket, 400,
+                      QJsonDocument(errorBody).toJson(QJsonDocument::Compact),
+                      headers,
                       closeConnection);
         return;
     }
@@ -481,12 +597,15 @@ void McpHttpServer::handleRequest(QTcpSocket* socket, const Request& request)
         emit toolCalled(calledTool, successfulToolCall(response));
 
     if (response.isEmpty()) {
-        writeResponse(socket, 202, QByteArray(), {}, closeConnection);
+        QHash<QByteArray, QByteArray> headers = corsHeaders(origin);
+        writeResponse(socket, 202, QByteArray(), headers, closeConnection);
         return;
     }
 
+    QHash<QByteArray, QByteArray> headers = corsHeaders(origin);
+    headers.insert("Content-Type", "application/json; charset=utf-8");
     writeResponse(socket, 200, response,
-                  {{"Content-Type", "application/json; charset=utf-8"}},
+                  headers,
                   closeConnection);
 }
 
