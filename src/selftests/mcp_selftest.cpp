@@ -1,6 +1,8 @@
 #include <QEventLoop>
 #include <QElapsedTimer>
 #include <QAction>
+#include <QSettings>
+#include <QToolButton>
 #include <QColor>
 #include <QCoreApplication>
 #include <QHash>
@@ -2699,6 +2701,76 @@ int runMcpSelftest()
                  : fail("G108 add_text_overlay attaches to every V1 clip overlapping the interval",
                         QStringLiteral("lateOnSecond=%1 spanOnBoth=%2 outsideRejected=%3")
                             .arg(lateOnSecond).arg(spanOnBoth).arg(outsideRejected));
+        }
+
+        // G109-G110: ステータスバー右端の「LLM に指示を出す」ボタンは MCP サーバ起動 +
+        // AI チャット表示までを 1 クリックで行い、表示メニューで隠せる (設定に保存)。
+        {
+            QSettings prefSettings(QStringLiteral("VSimpleEditor"), QStringLiteral("Preferences"));
+            const QVariant autoStartBefore = prefSettings.value(QStringLiteral("mcpAutoStart"));
+            const QVariant buttonVisibleBefore =
+                prefSettings.value(QStringLiteral("llmAssistantButtonVisible"));
+
+            // MainWindow の内部メンバは private なので、メニューの QAction / 子 QObject を
+            // 実際の UI ツリーから引く (ユーザーが見るものと同じ経路)。
+            auto actionByText = [&projectInfoWindow](const QString &text) -> QAction * {
+                const QList<QAction *> actions = projectInfoWindow.findChildren<QAction *>();
+                for (QAction *action : actions) {
+                    if (action && action->text() == text)
+                        return action;
+                }
+                return nullptr;
+            };
+            QAction *mcpToggle = actionByText(QStringLiteral("MCP サーバを有効にする"));
+            QAction *aiChatAction = actionByText(QStringLiteral("AI チャット"));
+            auto *assistantButton = projectInfoWindow.findChild<QToolButton *>(
+                QStringLiteral("LlmAssistantButton"));
+            const bool buttonPresent = assistantButton
+                && assistantButton->text() == QStringLiteral("LLM に指示を出す")
+                && assistantButton->parentWidget() == projectInfoWindow.statusBar()
+                && !assistantButton->isHidden();
+            bool assistantOpened = false;
+            if (buttonPresent) {
+                assistantButton->click();
+                auto *server = projectInfoWindow.findChild<mcp::McpHttpServer *>();
+                auto *dock = projectInfoWindow.findChild<AiChatDock *>();
+                assistantOpened = mcpToggle && mcpToggle->isChecked()
+                    && server && server->isRunning()
+                    && aiChatAction && aiChatAction->isChecked()
+                    && dock && !dock->isHidden();
+            }
+            if (aiChatAction)
+                aiChatAction->setChecked(false);
+            if (mcpToggle && mcpToggle->isChecked())
+                mcpToggle->setChecked(false);
+            const bool g109 = buttonPresent && assistantOpened;
+            g109 ? pass("G109 status bar LLM button starts the MCP server and opens the AI chat")
+                 : fail("G109 status bar LLM button starts the MCP server and opens the AI chat",
+                        QStringLiteral("present=%1 opened=%2").arg(buttonPresent).arg(assistantOpened));
+
+            QAction *toggle = actionByText(QStringLiteral("「LLM に指示を出す」ボタンを表示"));
+            bool toggleWorks = toggle && toggle->isCheckable() && toggle->isChecked()
+                && assistantButton && !assistantButton->isHidden();
+            if (toggleWorks) {
+                toggle->setChecked(false);
+                toggleWorks = assistantButton->isHidden()
+                    && !prefSettings.value(QStringLiteral("llmAssistantButtonVisible"), true).toBool();
+                toggle->setChecked(true);
+                toggleWorks = toggleWorks && !assistantButton->isHidden()
+                    && prefSettings.value(QStringLiteral("llmAssistantButtonVisible"), false).toBool();
+            }
+            toggleWorks ? pass("G110 View menu toggles the LLM button and persists the choice")
+                        : fail("G110 View menu toggles the LLM button and persists the choice",
+                               QStringLiteral("the View menu toggle did not hide/show the button or persist it"));
+
+            if (autoStartBefore.isValid())
+                prefSettings.setValue(QStringLiteral("mcpAutoStart"), autoStartBefore);
+            else
+                prefSettings.remove(QStringLiteral("mcpAutoStart"));
+            if (buttonVisibleBefore.isValid())
+                prefSettings.setValue(QStringLiteral("llmAssistantButtonVisible"), buttonVisibleBefore);
+            else
+                prefSettings.remove(QStringLiteral("llmAssistantButtonVisible"));
         }
     }
 

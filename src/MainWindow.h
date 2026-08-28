@@ -203,6 +203,7 @@ struct ClipMotion;
 class PasteAttributesDialog;
 class LoudnessPanel;
 class QDockWidget;
+class QToolButton;
 class AiChatDock;
 class NodeCanvasWidget;
 class NodePropertiesPanel;
@@ -278,6 +279,9 @@ public slots:
 
     // AI チャット Dock から MCP サーバを確実に起動するための公開スロット。
     void toggleMcpServer(bool enabled);
+    // ステータスバー右端の「LLM に指示を出す」ボタン: MCP サーバを起動し、
+    // AI チャット Dock を表示して入力欄にフォーカスを移す (初めての人向けの入口)。
+    void openLlmAssistant();
 
 public:
     // Current playhead position in seconds. Used by EffectControlsPanel
@@ -1103,6 +1107,9 @@ private:
     // mcpAutoStart を書き換えないためのガード。
     bool m_mcpSuppressAutoStartPersist = false;
     AiChatDock *m_aiChatDock = nullptr;
+    QAction *m_aiChatAction = nullptr;              // 表示 > AI チャット
+    QAction *m_llmAssistantToggleAction = nullptr;  // 表示 > 「LLM に指示を出す」ボタンを表示
+    QToolButton *m_llmAssistantButton = nullptr;    // ステータスバー右端の入口
 
     void ensureMcpServerComponents();
 

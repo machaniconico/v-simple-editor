@@ -147,7 +147,7 @@ env = { VEDITOR_MCP_TOKEN = "<token>" }
 
 ### エディタ内 AI チャット
 
-**表示 > AI チャット** で AI チャット Dock を開きます。Dock は `claude` CLI を headless で `-p --output-format stream-json --verbose --mcp-config <一時json> --strict-mcp-config [--resume <sessionId>] --allowedTools mcp__veditor` のオプション付きで起動し、MCP 設定を一時ファイルで渡して `veditor` のツールだけを許可します。プロンプトは argv ではなく stdin で渡します。会話継続時は前回の `session_id` を `--resume <sessionId>` で指定します（`--allowedTools` の直前）。子プロセスの環境から `ANTHROPIC_API_KEY` と `ANTHROPIC_AUTH_TOKEN` を除去するため、ログイン済みの Claude Pro / Max のサブスク枠で動作します。使用する CLI 名は QSettings の `aiChatCommand` で変更できます。
+一番簡単な入口は画面右下（ステータスバー右端）の **「LLM に指示を出す」** ボタンです。押すと MCP サーバの起動と AI チャット Dock の表示をまとめて行い、入力欄にフォーカスが移ります（不要なら **表示 > 「LLM に指示を出す」ボタンを表示** のチェックを外すと隠せます。設定は保存されます）。**表示 > AI チャット** で AI チャット Dock を直接開くこともできます。Dock は `claude` CLI を headless で `-p --output-format stream-json --verbose --mcp-config <一時json> --strict-mcp-config [--resume <sessionId>] --allowedTools mcp__veditor` のオプション付きで起動し、MCP 設定を一時ファイルで渡して `veditor` のツールだけを許可します。プロンプトは argv ではなく stdin で渡します。会話継続時は前回の `session_id` を `--resume <sessionId>` で指定します（`--allowedTools` の直前）。子プロセスの環境から `ANTHROPIC_API_KEY` と `ANTHROPIC_AUTH_TOKEN` を除去するため、ログイン済みの Claude Pro / Max のサブスク枠で動作します。使用する CLI 名は QSettings の `aiChatCommand` で変更できます。
 
 `claude` が PATH に無い場合は、先に次を実行してください。
 
@@ -191,7 +191,7 @@ MCP の変更系ツールは確認ダイアログを出さず、原則として�
 | `undo` | 直前の編集を元に戻す | なし |
 | `redo` | 元に戻した編集をやり直す | なし |
 
-MCP サーバの自己テストは `--selftest=mcp` または `VEDITOR_MCP_SELFTEST=1` で実行できます（実装: `src/selftests/mcp_selftest.cpp`、ゲート G1..G108）。
+MCP サーバの自己テストは `--selftest=mcp` または `VEDITOR_MCP_SELFTEST=1` で実行できます（実装: `src/selftests/mcp_selftest.cpp`、ゲート G1..G110）。
 
 ---
 
