@@ -3,7 +3,9 @@
 #include "MainWindow.h"
 #include "mcp/McpHttpServer.h"
 
+#include <QComboBox>
 #include <QCoreApplication>
+#include <QRegularExpression>
 #include <QDateTime>
 #include <QDir>
 #include <QEvent>
@@ -82,6 +84,66 @@ AiChatDock::AiChatDock(MainWindow *mainWindow, mcp::McpHttpServer *server,
     buttons->addWidget(m_stopButton);
     layout->addLayout(buttons);
 
+    // 接続状態と接続ボタン (送信ボタンの行の直下)。MCP サーバの待受と claude CLI の
+    // 検出状況を常時表示し、サーバが止まっていればここから起動 (稼働中は停止) できる。
+    auto *connection = new QHBoxLayout();
+    m_connectionLabel = new QLabel(content);
+    m_connectionLabel->setObjectName(QStringLiteral("AiChatConnectionStatus"));
+    m_connectionLabel->setTextFormat(Qt::PlainText);
+    m_providerCombo = new QComboBox(content);
+    m_providerCombo->setObjectName(QStringLiteral("AiChatProviderCombo"));
+    m_providerCombo->addItem(QStringLiteral("Claude Code"), QStringLiteral("claude"));
+    m_providerCombo->addItem(QStringLiteral("Codex CLI"), QStringLiteral("codex"));
+    m_providerCombo->setToolTip(QStringLiteral(
+        "この Dock が起動する CLI。どちらもログイン済みのサブスク枠で動き、MCP でこのエディタを操作します。"));
+    {
+        QSettings settings(QStringLiteral("VSimpleEditor"), QStringLiteral("Preferences"));
+        const QString saved = settings.value(QStringLiteral("aiChatProvider"),
+                                             QStringLiteral("claude")).toString();
+        m_provider = saved == QStringLiteral("codex") ? Provider::Codex : Provider::Claude;
+        m_providerCombo->setCurrentIndex(m_provider == Provider::Codex ? 1 : 0);
+    }
+    connect(m_providerCombo, qOverload<int>(&QComboBox::currentIndexChanged), this,
+            [this](int index) {
+        const Provider next = m_providerCombo->itemData(index).toString()
+                == QStringLiteral("codex") ? Provider::Codex : Provider::Claude;
+        if (next != m_provider) {
+            // セッション id とモデルは CLI ごとの値なので切替時に捨てる。
+            m_provider = next;
+            m_sessionId.clear();
+            m_model.clear();
+        }
+        QSettings settings(QStringLiteral("VSimpleEditor"), QStringLiteral("Preferences"));
+        settings.setValue(QStringLiteral("aiChatProvider"),
+                          m_provider == Provider::Codex ? QStringLiteral("codex")
+                                                        : QStringLiteral("claude"));
+        refreshConnectionStatus();
+    });
+    m_connectButton = new QPushButton(QStringLiteral("接続"), content);
+    m_connectButton->setObjectName(QStringLiteral("AiChatConnectButton"));
+    connect(m_connectButton, &QPushButton::clicked, this, &AiChatDock::toggleConnection);
+    connection->addWidget(m_connectionLabel, 1);
+    connection->addWidget(m_providerCombo);
+    connection->addWidget(m_connectButton);
+    layout->addLayout(connection);
+    if (m_server) {
+        connect(m_server, &mcp::McpHttpServer::started, this,
+                [this](quint16) { refreshConnectionStatus(); });
+        connect(m_server, &mcp::McpHttpServer::stopped, this,
+                &AiChatDock::refreshConnectionStatus);
+        connect(m_server, &mcp::McpHttpServer::clientInitialized, this,
+                [this](const QString& name, const QString& version) {
+            m_lastClientName = name;
+            m_lastClientVersion = version;
+            refreshConnectionStatus();
+            appendLog(QStringLiteral("MCP クライアント接続: %1 %2").arg(name, version).trimmed(),
+                      QColor(Qt::gray));
+        });
+        m_lastClientName = m_server->lastClientName();
+        m_lastClientVersion = m_server->lastClientVersion();
+    }
+    refreshConnectionStatus();
+
     setWidget(content);
     setMinimumWidth(360);
 
@@ -112,6 +174,176 @@ void AiChatDock::focusPrompt()
 {
     if (m_input)
         m_input->setFocus(Qt::OtherFocusReason);
+}
+
+void AiChatDock::refreshConnectionStatus()
+{
+    if (!m_connectionLabel || !m_connectButton)
+        return;
+    const bool running = m_server && m_server->isRunning();
+    const bool codex = m_provider == Provider::Codex;
+    const QSettings settings(QStringLiteral("VSimpleEditor"),
+                             QStringLiteral("Preferences"));
+    const QString command = codex
+        ? settings.value(QStringLiteral("aiChatCodexCommand"), QStringLiteral("codex")).toString()
+        : settings.value(QStringLiteral("aiChatCommand"), QStringLiteral("claude")).toString();
+    const CliCommand cli = resolveCliCommand(command);
+    const QString serverText = running
+        ? QStringLiteral("● MCP サーバ: 待受中 (ポート %1)").arg(m_server->port())
+        : QStringLiteral("○ MCP サーバ: 停止中");
+    const QString clientText = m_lastClientName.isEmpty()
+        ? QStringLiteral("接続元: まだ接続なし")
+        : QStringLiteral("接続元: %1 %2").arg(m_lastClientName, m_lastClientVersion).trimmed();
+    QString model = m_model;
+    if (model.isEmpty() && codex)
+        model = codexConfiguredModel();
+    const QString modelText = model.isEmpty()
+        ? (codex ? QStringLiteral("モデル: Codex 既定") : QStringLiteral("モデル: 送信後に表示"))
+        : QStringLiteral("モデル: %1").arg(model);
+    const QString cliText = QStringLiteral("CLI: %1 %2")
+        .arg(command, cli.program.isEmpty() ? QStringLiteral("未検出") : QStringLiteral("検出済み"));
+    m_connectionLabel->setText(serverText + QStringLiteral(" / ") + clientText
+                               + QLatin1Char('\n') + cliText + QStringLiteral(" / ") + modelText);
+    m_connectionLabel->setStyleSheet(running
+        ? QStringLiteral("QLabel { color: #3fb950; }")
+        : QStringLiteral("QLabel { color: #8b949e; }"));
+    const QString installHint = codex
+        ? QStringLiteral("npm i -g @openai/codex")
+        : QStringLiteral("npm i -g @anthropic-ai/claude-code");
+    m_connectionLabel->setToolTip(cli.program.isEmpty()
+        ? QStringLiteral("%1 が見つかりません。%2 を実行してください。\n探索:\n%3")
+              .arg(command, installHint, cli.searched.join(QLatin1Char('\n')))
+        : cli.program);
+    m_connectButton->setText(running ? QStringLiteral("切断") : QStringLiteral("接続"));
+    m_connectButton->setToolTip(running
+        ? QStringLiteral("MCP サーバを停止します (Claude Code / Codex CLI からの接続も切れます)")
+        : QStringLiteral("MCP サーバを起動して、Claude Code から接続できるようにします"));
+}
+
+void AiChatDock::processCodexOutputLine(const QJsonObject& object)
+{
+    const QString type = object.value(QStringLiteral("type")).toString();
+    if (type == QStringLiteral("thread.started")) {
+        const QString threadId = object.value(QStringLiteral("thread_id")).toString();
+        if (!threadId.isEmpty())
+            m_sessionId = threadId;
+        return;
+    }
+    if (type == QStringLiteral("item.started") || type == QStringLiteral("item.completed")) {
+        const QJsonObject item = object.value(QStringLiteral("item")).toObject();
+        const QString itemType = item.value(QStringLiteral("type")).toString();
+        const bool completed = type == QStringLiteral("item.completed");
+        if (itemType == QStringLiteral("agent_message")) {
+            if (completed)
+                appendLog(item.value(QStringLiteral("text")).toString());
+        } else if (itemType == QStringLiteral("mcp_tool_call")) {
+            const QString tool = item.value(QStringLiteral("server")).toString()
+                + QLatin1Char('/') + item.value(QStringLiteral("tool")).toString();
+            if (!completed)
+                appendLog(QStringLiteral("ツール実行: ") + tool, QColor(Qt::gray));
+            else if (item.value(QStringLiteral("status")).toString() == QStringLiteral("failed"))
+                appendLog(QStringLiteral("ツール失敗: ") + tool, QColor(Qt::red));
+        } else if (itemType == QStringLiteral("command_execution")) {
+            if (!completed) {
+                appendLog(QStringLiteral("コマンド実行: ")
+                              + item.value(QStringLiteral("command")).toString(),
+                          QColor(Qt::gray));
+            }
+        } else if (itemType == QStringLiteral("error")) {
+            appendLog(QStringLiteral("codex エラー: ")
+                          + item.value(QStringLiteral("message")).toString(),
+                      QColor(Qt::red));
+            m_gotError = true;
+        }
+        return;
+    }
+    if (type == QStringLiteral("turn.completed")) {
+        m_gotResult = true;
+        return;
+    }
+    if (type == QStringLiteral("turn.failed") || type == QStringLiteral("error")) {
+        QString message = object.value(QStringLiteral("message")).toString();
+        if (message.isEmpty()) {
+            message = object.value(QStringLiteral("error")).toObject()
+                .value(QStringLiteral("message")).toString();
+        }
+        appendLog(QStringLiteral("codex エラー: ")
+                      + (message.isEmpty() ? QStringLiteral("(詳細なし)") : message),
+                  QColor(Qt::red));
+        m_gotError = true;
+        m_gotResult = true;
+    }
+}
+
+QStringList AiChatDock::buildCodexArguments(quint16 port, const QString& token,
+                                            const QString& editorPath,
+                                            const QString& threadId)
+{
+    // 値は TOML のシングルクォート文字列にする (" を含むと cmd.exe 経由で拒否される)。
+    // -s はトップレベルの exec だけが受けるので resume では付けない。
+    QStringList arguments{QStringLiteral("exec")};
+    if (!threadId.isEmpty())
+        arguments << QStringLiteral("resume");
+    arguments << QStringLiteral("--json") << QStringLiteral("--skip-git-repo-check");
+    if (threadId.isEmpty())
+        arguments << QStringLiteral("-s") << QStringLiteral("read-only");
+    arguments << QStringLiteral("-c")
+              << QStringLiteral("mcp_servers.veditor.command='%1'")
+                     .arg(QDir::fromNativeSeparators(editorPath))
+              << QStringLiteral("-c")
+              << QStringLiteral("mcp_servers.veditor.args=['--mcp-stdio','--port','%1']")
+                     .arg(port)
+              << QStringLiteral("-c")
+              << QStringLiteral("mcp_servers.veditor.env={VEDITOR_MCP_TOKEN='%1'}")
+                     .arg(token)
+              // Codex は MCP ツール呼び出しごとに承認を求め、非対話の exec では
+              // 「user cancelled MCP tool call」で自動拒否される。このエディタのツールは
+              // モーダルを開かず Ctrl+Z で戻せるので、このサーバだけ自動承認にする。
+              << QStringLiteral("-c")
+              << QStringLiteral("mcp_servers.veditor.default_tools_approval_mode='approve'");
+    if (!threadId.isEmpty())
+        arguments << threadId;
+    arguments << QStringLiteral("-"); // プロンプトは stdin
+    return arguments;
+}
+
+QString AiChatDock::codexConfiguredModel()
+{
+    QString home = qEnvironmentVariable("CODEX_HOME");
+    if (home.isEmpty())
+        home = QDir::homePath() + QStringLiteral("/.codex");
+    QFile file(QDir(home).filePath(QStringLiteral("config.toml")));
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text))
+        return {};
+    static const QRegularExpression pattern(
+        QStringLiteral("^\\s*model\\s*=\\s*[\"']([^\"']+)[\"']"));
+    while (!file.atEnd()) {
+        const QString line = QString::fromUtf8(file.readLine());
+        if (line.trimmed().startsWith(QLatin1Char('[')))
+            break; // トップレベルの model だけ見る (profiles の中は無視)
+        const QRegularExpressionMatch match = pattern.match(line);
+        if (match.hasMatch())
+            return match.captured(1);
+    }
+    return {};
+}
+
+void AiChatDock::toggleConnection()
+{
+    if (!m_mainWindow)
+        return;
+    const bool wasRunning = m_server && m_server->isRunning();
+    m_mainWindow->toggleMcpServer(!wasRunning);
+    refreshConnectionStatus();
+    const bool running = m_server && m_server->isRunning();
+    if (!wasRunning && running) {
+        appendLog(QStringLiteral("MCP サーバを起動しました (ポート %1)。")
+                      .arg(m_server->port()), QColor(Qt::gray));
+    } else if (!wasRunning) {
+        appendLog(QStringLiteral("MCP サーバを起動できませんでした。"), QColor(Qt::red));
+    } else if (!running) {
+        appendLog(QStringLiteral("MCP サーバを停止しました。"), QColor(Qt::gray));
+    }
 }
 
 AiChatDock::~AiChatDock()
@@ -389,17 +621,21 @@ void AiChatDock::sendPrompt()
 
     const QSettings settings(QStringLiteral("VSimpleEditor"),
                              QStringLiteral("Preferences"));
-    const QString command = settings.value(QStringLiteral("aiChatCommand"),
-                                            QStringLiteral("claude"))
-        .toString();
+    const bool codex = m_provider == Provider::Codex;
+    const QString command = codex
+        ? settings.value(QStringLiteral("aiChatCodexCommand"), QStringLiteral("codex")).toString()
+        : settings.value(QStringLiteral("aiChatCommand"), QStringLiteral("claude")).toString();
     const CliCommand cli = resolveCliCommand(command);
     if (cli.program.isEmpty()) {
         const QString searched = cli.searched.isEmpty()
             ? QStringLiteral("(なし)")
             : cli.searched.join(QLatin1Char('\n'));
         appendLog(QStringLiteral(
-                       "claude が見つかりません: %1\n探索:\n%2\nnpm i -g @anthropic-ai/claude-code を実行してください。")
-                      .arg(command, searched), QColor(Qt::red));
+                       "%1 が見つかりません\n探索:\n%2\n%3 を実行してください。")
+                      .arg(command, searched,
+                           codex ? QStringLiteral("npm i -g @openai/codex")
+                                 : QStringLiteral("npm i -g @anthropic-ai/claude-code")),
+                  QColor(Qt::red));
         if (m_statusLabel)
             m_statusLabel->setText(QStringLiteral("エラー"));
         return;
@@ -442,7 +678,12 @@ void AiChatDock::sendPrompt()
     m_watchdogTimeoutMs = timeoutOk && configuredTimeout > 0
         ? configuredTimeout : kDefaultAiChatTimeoutMs;
 
-    const QStringList arguments = buildArguments(m_configPath, m_sessionId);
+    // Codex は MCP 設定ファイルではなく -c 上書きで stdio ブリッジ (このエディタ自身) を渡す。
+    const QStringList arguments = codex
+        ? buildCodexArguments(m_server->port(), m_server->token(),
+                              QDir::fromNativeSeparators(QCoreApplication::applicationFilePath()),
+                              m_sessionId)
+        : buildArguments(m_configPath, m_sessionId);
 #ifdef Q_OS_WIN
     QString shellLine;
     if (cli.needsShell) {
@@ -595,17 +836,33 @@ void AiChatDock::processOutputLine(const QByteArray& line)
     const QJsonDocument document = QJsonDocument::fromJson(line);
     if (!document.isObject()) {
         const QString text = QString::fromUtf8(line).trimmed();
-        if (!text.isEmpty())
-            appendLog(QStringLiteral("claude: ") + text, QColor(Qt::gray));
+        if (!text.isEmpty()) {
+            appendLog((m_provider == Provider::Codex ? QStringLiteral("codex: ")
+                                                     : QStringLiteral("claude: ")) + text,
+                      QColor(Qt::gray));
+        }
         return;
     }
     const QJsonObject object = document.object();
+    if (m_provider == Provider::Codex) {
+        processCodexOutputLine(object);
+        return;
+    }
     const QString sessionId = object.value(QStringLiteral("session_id"))
         .toString();
     if (!sessionId.isEmpty())
         m_sessionId = sessionId;
 
     const QString type = object.value(QStringLiteral("type")).toString();
+    if (type == QStringLiteral("system")
+        && object.value(QStringLiteral("subtype")).toString() == QStringLiteral("init")) {
+        // 起動時イベントにモデル名が入る。接続状態行の「モデル」に反映する。
+        const QString model = object.value(QStringLiteral("model")).toString();
+        if (!model.isEmpty() && model != m_model) {
+            m_model = model;
+            refreshConnectionStatus();
+        }
+    }
     if (type == QStringLiteral("assistant")) {
         const QJsonArray content = object.value(QStringLiteral("message"))
             .toObject().value(QStringLiteral("content")).toArray();
@@ -698,7 +955,9 @@ void AiChatDock::processFinished(int exitCode, QProcess::ExitStatus exitStatus)
 
     const bool abnormalExit = exitStatus == QProcess::CrashExit || exitCode != 0;
     if (abnormalExit) {
-        QString message = QStringLiteral("claude が終了コード %1 で終了しました")
+        QString message = QStringLiteral("%1 が終了コード %2 で終了しました")
+            .arg(m_provider == Provider::Codex ? QStringLiteral("codex")
+                                               : QStringLiteral("claude"))
             .arg(exitCode);
         if (!m_stderrText.isEmpty()) {
             message += QLatin1Char('\n');

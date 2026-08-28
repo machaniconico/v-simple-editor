@@ -1,6 +1,8 @@
 #include <QEventLoop>
 #include <QElapsedTimer>
 #include <QAction>
+#include <QLabel>
+#include <QPushButton>
 #include <QSettings>
 #include <QToolButton>
 #include <QColor>
@@ -512,6 +514,43 @@ int runMcpSelftest()
              : fail("G101 HTTP non-loopback Host rejected",
                     QStringLiteral("evil=%1 localhost:port=%2 [::1]:port=%3")
                         .arg(evilHost.status).arg(portHost.status).arg(ipv6Host.status));
+
+        // G113: initialize の clientInfo を記録して通知する (どのクライアントが接続したか)。
+        {
+            const QByteArray initBody = QJsonDocument(QJsonObject{
+                {QStringLiteral("jsonrpc"), QStringLiteral("2.0")},
+                {QStringLiteral("id"), 77},
+                {QStringLiteral("method"), QStringLiteral("initialize")},
+                {QStringLiteral("params"), QJsonObject{
+                    {QStringLiteral("protocolVersion"), QStringLiteral("2025-06-18")},
+                    {QStringLiteral("capabilities"), QJsonObject{}},
+                    {QStringLiteral("clientInfo"), QJsonObject{
+                        {QStringLiteral("name"), QStringLiteral("codex-selftest")},
+                        {QStringLiteral("version"), QStringLiteral("9.9")}}}}}
+            }).toJson(QJsonDocument::Compact);
+            QString seenName;
+            QString seenVersion;
+            const QMetaObject::Connection clientConnection = QObject::connect(
+                &server, &mcp::McpHttpServer::clientInitialized,
+                [&seenName, &seenVersion](const QString& name, const QString& version) {
+                    seenName = name;
+                    seenVersion = version;
+                });
+            const HttpResult initResult = post(
+                &manager, endpoint, initBody, server.token().toUtf8(),
+                QHash<QByteArray, QByteArray>{});
+            QObject::disconnect(clientConnection);
+            const bool g113 = initResult.status == 200
+                && server.lastClientName() == QStringLiteral("codex-selftest")
+                && server.lastClientVersion() == QStringLiteral("9.9")
+                && seenName == QStringLiteral("codex-selftest")
+                && seenVersion == QStringLiteral("9.9");
+            g113 ? pass("G113 initialize clientInfo is recorded and announced")
+                 : fail("G113 initialize clientInfo is recorded and announced",
+                        QStringLiteral("status=%1 name=%2 version=%3 seen=%4")
+                            .arg(initResult.status).arg(server.lastClientName(),
+                                                        server.lastClientVersion(), seenName));
+        }
 
         const HttpResult localhostOrigin = post(
             &manager, endpoint, ping, server.token().toUtf8(),
@@ -2762,6 +2801,79 @@ int runMcpSelftest()
             toggleWorks ? pass("G110 View menu toggles the LLM button and persists the choice")
                         : fail("G110 View menu toggles the LLM button and persists the choice",
                                QStringLiteral("the View menu toggle did not hide/show the button or persist it"));
+
+            // G111: AI チャット Dock 下部の接続状態行と「接続 / 切断」ボタン。
+            {
+                if (aiChatAction)
+                    aiChatAction->setChecked(true);
+                auto *dock = projectInfoWindow.findChild<AiChatDock *>();
+                auto *connectionLabel = dock
+                    ? dock->findChild<QLabel *>(QStringLiteral("AiChatConnectionStatus")) : nullptr;
+                auto *connectButton = dock
+                    ? dock->findChild<QPushButton *>(QStringLiteral("AiChatConnectButton")) : nullptr;
+                auto *server = projectInfoWindow.findChild<mcp::McpHttpServer *>();
+                const bool stoppedShown = connectionLabel && connectButton
+                    && !(server && server->isRunning())
+                    && connectionLabel->text().contains(QStringLiteral("停止中"))
+                    && connectionLabel->text().contains(QStringLiteral("CLI"))
+                    && connectButton->text() == QStringLiteral("接続");
+                bool connected = false;
+                bool disconnected = false;
+                if (stoppedShown) {
+                    connectButton->click();
+                    server = projectInfoWindow.findChild<mcp::McpHttpServer *>();
+                    connected = server && server->isRunning()
+                        && connectionLabel->text().contains(QString::number(server->port()))
+                        && connectButton->text() == QStringLiteral("切断")
+                        && mcpToggle && mcpToggle->isChecked();
+                    connectButton->click();
+                    disconnected = !(server && server->isRunning())
+                        && connectionLabel->text().contains(QStringLiteral("停止中"))
+                        && connectButton->text() == QStringLiteral("接続")
+                        && mcpToggle && !mcpToggle->isChecked();
+                }
+                if (aiChatAction)
+                    aiChatAction->setChecked(false);
+                const bool g111 = stoppedShown && connected && disconnected;
+                g111 ? pass("G111 AI chat dock shows the connection state and its button starts/stops the server")
+                     : fail("G111 AI chat dock shows the connection state and its button starts/stops the server",
+                            QStringLiteral("stoppedShown=%1 connected=%2 disconnected=%3")
+                                .arg(stoppedShown).arg(connected).arg(disconnected));
+            }
+
+            // G112: codex exec の引数は stdio ブリッジを -c で渡し、cmd.exe 経由でも安全 (" を含まない)。
+            {
+                const QString editorPath = QStringLiteral("D:/x y/v-simple-editor.exe");
+                const QStringList codexArgs = AiChatDock::buildCodexArguments(
+                    8765, QStringLiteral("tok123"), editorPath, QString());
+                const QStringList codexResume = AiChatDock::buildCodexArguments(
+                    8765, QStringLiteral("tok123"), editorPath, QStringLiteral("thread-1"));
+                bool noDoubleQuote = true;
+                for (const QString& argument : codexArgs + codexResume) {
+                    if (argument.contains(QLatin1Char('"')))
+                        noDoubleQuote = false;
+                }
+                QString shellError;
+                const QString shellLine = AiChatDock::buildShellCommandLine(
+                    QStringLiteral("C:/npm/codex.cmd"), codexArgs, &shellError);
+                const QString joined = codexArgs.join(QLatin1Char(' '));
+                const bool g112 = codexArgs.first() == QStringLiteral("exec")
+                    && codexArgs.contains(QStringLiteral("--json"))
+                    && codexArgs.contains(QStringLiteral("--skip-git-repo-check"))
+                    && joined.contains(QStringLiteral("mcp_servers.veditor.command='D:/x y/v-simple-editor.exe'"))
+                    && joined.contains(QStringLiteral("mcp_servers.veditor.args=['--mcp-stdio','--port','8765']"))
+                    && joined.contains(QStringLiteral("mcp_servers.veditor.env={VEDITOR_MCP_TOKEN='tok123'}"))
+                    && joined.contains(QStringLiteral("mcp_servers.veditor.default_tools_approval_mode='approve'"))
+                    && codexArgs.last() == QStringLiteral("-")
+                    && codexResume.at(1) == QStringLiteral("resume")
+                    && codexResume.contains(QStringLiteral("thread-1"))
+                    && !codexResume.contains(QStringLiteral("-s"))
+                    && noDoubleQuote && !shellLine.isEmpty() && shellError.isEmpty();
+                g112 ? pass("G112 codex exec arguments carry the stdio bridge and pass the shell quoting rules")
+                     : fail("G112 codex exec arguments carry the stdio bridge and pass the shell quoting rules",
+                            QStringLiteral("args=%1 resume=%2 shellError=%3")
+                                .arg(joined, codexResume.join(QLatin1Char(' ')), shellError));
+            }
 
             if (autoStartBefore.isValid())
                 prefSettings.setValue(QStringLiteral("mcpAutoStart"), autoStartBefore);

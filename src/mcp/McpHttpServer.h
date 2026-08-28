@@ -40,9 +40,16 @@ public:
     // http://127.0.0.1:<port>/mcp
     QString endpointUrl() const;
 
+    // 最後に initialize を送ってきたクライアント (clientInfo)。Claude Code / Codex など
+    // どのクライアントが接続しているかを UI に出すために保持する。未接続なら空。
+    QString lastClientName() const { return m_lastClientName; }
+    QString lastClientVersion() const { return m_lastClientVersion; }
+
 signals:
     void started(quint16 port);
     void stopped();
+    // initialize が成功したときの clientInfo。AI チャット Dock の接続状態表示用。
+    void clientInitialized(const QString& name, const QString& version);
     // ログ用。tools/call の name と成否。UI のステータス表示に使う。
     void toolCalled(const QString& toolName, bool ok);
 
@@ -80,6 +87,8 @@ private:
     McpProtocol m_protocol;
     quint16 m_port = 0;
     QString m_token;
+    QString m_lastClientName;
+    QString m_lastClientVersion;
     QHash<QTcpSocket*, Request> m_pending;
     QSet<QTcpSocket*> m_processingSockets;
 };
