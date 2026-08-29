@@ -12,6 +12,7 @@
 #include <QHash>
 #include <QMenu>
 #include <QElapsedTimer>
+#include <QColor>
 #include <QString>
 #include <QJsonObject>
 #include <cstdint>
@@ -61,6 +62,23 @@ enum class TrackKind {
     Video,
     Audio
 };
+
+enum class ClipLabel {
+    None,
+    Red,
+    Orange,
+    Yellow,
+    Green,
+    Cyan,
+    Blue,
+    Purple,
+    Pink
+};
+
+QColor clipLabelColor(ClipLabel label);
+QString clipLabelName(ClipLabel label);
+ClipLabel clipLabelFromString(const QString &value);
+QString clipLabelToString(ClipLabel label);
 
 class AudioMixer;
 class UndoManager;
@@ -144,6 +162,10 @@ struct ClipInfo {
     // linkGroup. Linked clips are selected together, dragged together, and
     // deleted together so V/A stays in AV sync. 0 = unlinked / standalone.
     int linkGroup = 0;
+
+    // Editing-only clip colour. None is the legacy/default appearance and has
+    // no effect on preview or export rendering.
+    ClipLabel label = ClipLabel::None;
 
     // US-T35 per-clip OBS-style video source transform. scale=1.0, dx=dy=0
     // is identity (no transform). dx/dy are offsets in fractions of the
@@ -611,6 +633,7 @@ public:
     bool setClipPropertyByIndex(bool audio, int trackIndex, int clipIndex,
                                 const QString &property, double value, QString *err,
                                 bool applyToLinked = false);
+    bool setClipLabel(TrackKind kind, int trackIndex, int clipIndex, ClipLabel label);
     bool selectClipByIndex(bool audio, int trackIndex, int clipIndex, QString *err);
     void clearSelection();
     bool freezeFrameAtPlayhead(TimelineTrack *track = nullptr, int clipIndex = -1);

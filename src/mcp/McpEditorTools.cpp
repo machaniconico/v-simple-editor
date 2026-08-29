@@ -152,6 +152,35 @@ bool transitionTypeFromName(const QString& name, TransitionType* out)
     return true;
 }
 
+const QStringList& clipLabelIds()
+{
+    static const QStringList ids{
+        QStringLiteral("none"), QStringLiteral("red"),
+        QStringLiteral("orange"), QStringLiteral("yellow"),
+        QStringLiteral("green"), QStringLiteral("cyan"),
+        QStringLiteral("blue"), QStringLiteral("purple"),
+        QStringLiteral("pink")
+    };
+    return ids;
+}
+
+QJsonArray clipLabelEnum()
+{
+    QJsonArray result;
+    for (const QString& id : clipLabelIds())
+        result.append(id);
+    return result;
+}
+
+bool parseClipLabel(const QString& id, ClipLabel* out)
+{
+    if (!clipLabelIds().contains(id))
+        return false;
+    if (out)
+        *out = clipLabelFromString(id);
+    return true;
+}
+
 QJsonObject transitionToJson(const Transition& transition)
 {
     return QJsonObject{
@@ -189,6 +218,10 @@ QJsonObject clipOutputItemSchema()
         {QStringLiteral("speed"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
         {QStringLiteral("volume"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
         {QStringLiteral("opacity"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
+        {QStringLiteral("label"), QJsonObject{
+            {QStringLiteral("type"), QStringLiteral("string")},
+            {QStringLiteral("enum"), clipLabelEnum()}
+        }},
         {QStringLiteral("linkGroup"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
         {QStringLiteral("selected"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
         {QStringLiteral("leadIn"), transitionOutputItemSchema()},
@@ -203,7 +236,7 @@ QJsonObject clipOutputItemSchema()
         QStringLiteral("filePath"), QStringLiteral("startSec"),
         QStringLiteral("durationSec"), QStringLiteral("inPointSec"),
         QStringLiteral("outPointSec"), QStringLiteral("speed"),
-        QStringLiteral("volume"), QStringLiteral("opacity"),
+        QStringLiteral("volume"), QStringLiteral("opacity"), QStringLiteral("label"),
         QStringLiteral("linkGroup"), QStringLiteral("selected"),
         QStringLiteral("leadIn"), QStringLiteral("trailOut"),
         QStringLiteral("textOverlayCount")
@@ -599,6 +632,7 @@ QJsonObject clipToJson(const ClipInfo& clip, int clipIndex, double startSec,
         {QStringLiteral("speed"), clip.speed},
         {QStringLiteral("volume"), clip.volume},
         {QStringLiteral("opacity"), clip.opacity},
+        {QStringLiteral("label"), clipLabelToString(clip.label)},
         {QStringLiteral("linkGroup"), clip.linkGroup},
         {QStringLiteral("selected"), selected},
         {QStringLiteral("leadIn"), transitionToJson(clip.leadIn)},
@@ -1443,6 +1477,19 @@ void McpEditorTools::registerWriteTools()
         {QStringLiteral("linkedApplied"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}}
     }, {QStringLiteral("ok"), QStringLiteral("property"),
         QStringLiteral("value")});
+
+    const QJsonObject setClipLabelOutputSchema = outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("kind"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
+        {QStringLiteral("trackIndex"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+        {QStringLiteral("clipIndex"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+        {QStringLiteral("label"), QJsonObject{
+            {QStringLiteral("type"), QStringLiteral("string")},
+            {QStringLiteral("enum"), clipLabelEnum()}
+        }}
+    }, {QStringLiteral("ok"), QStringLiteral("kind"),
+        QStringLiteral("trackIndex"), QStringLiteral("clipIndex"),
+        QStringLiteral("label")});
 
     const QJsonObject trimClipOutputSchema = outputSchemaOf(QJsonObject{
         {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
@@ -2358,6 +2405,61 @@ void McpEditorTools::registerWriteTools()
             };
         })
     }, setClipPropertyOutputSchema));
+
+    m_registry->registerTool(withOutputSchema({
+        QStringLiteral("set_clip_label"),
+        QStringLiteral("指定クリップのラベルカラーを設定する。label は none / red / orange / yellow / green / cyan / blue / purple / pink。kind/trackIndex 省略時は video トラック 0。clipIndex は get_timeline の index。変更後の値は get_timeline の label で確認でき、Ctrl+Z / undo ツールで戻せる。"),
+        schemaWithRequired(mergedProperties(clipProperties, QJsonObject{
+            {QStringLiteral("label"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("string")},
+                {QStringLiteral("enum"), clipLabelEnum()},
+                {QStringLiteral("description"),
+                 QStringLiteral("ラベルカラー。none で解除")}
+            }}
+        }), {QStringLiteral("clipIndex"), QStringLiteral("label")}),
+        guardedWrite(QStringLiteral("set_clip_label"),
+                     [this](const QJsonObject& args, QString* err) -> QJsonObject {
+            if (!rejectUnknownArguments(args,
+                                        {QStringLiteral("kind"), QStringLiteral("trackIndex"),
+                                         QStringLiteral("clipIndex"), QStringLiteral("label")},
+                                        err)) {
+                return {};
+            }
+            QString labelId;
+            if (!requiredString(args, QStringLiteral("label"), &labelId, err))
+                return {};
+            ClipLabel label = ClipLabel::None;
+            if (!parseClipLabel(labelId, &label)) {
+                return setError(err,
+                                QStringLiteral("label must be one of: %1")
+                                    .arg(clipLabelIds().join(QStringLiteral(", ")))),
+                       QJsonObject();
+            }
+
+            ClipTarget target;
+            Timeline* currentTimeline = timeline();
+            if (!readClipTarget(args, m_window, currentTimeline, &target, err))
+                return {};
+            if (target.track->isLocked())
+                return setError(err, QStringLiteral("track is locked")), QJsonObject();
+
+            const TrackKind kind = target.audio ? TrackKind::Audio : TrackKind::Video;
+            if (!currentTimeline->setClipLabel(kind, target.trackIndex,
+                                               target.clipIndex, label)) {
+                return setError(err, QStringLiteral("clip label could not be set")),
+                       QJsonObject();
+            }
+            syncSelectionAfterEdit();
+            return QJsonObject{
+                {QStringLiteral("ok"), true},
+                {QStringLiteral("kind"), target.audio
+                    ? QStringLiteral("audio") : QStringLiteral("video")},
+                {QStringLiteral("trackIndex"), target.trackIndex},
+                {QStringLiteral("clipIndex"), target.clipIndex},
+                {QStringLiteral("label"), clipLabelToString(label)}
+            };
+        })
+    }, setClipLabelOutputSchema));
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("trim_clip"),

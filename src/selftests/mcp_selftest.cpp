@@ -770,6 +770,7 @@ int runMcpSelftest()
         QStringLiteral("move_clip"),
         QStringLiteral("set_track_locked"),
         QStringLiteral("set_clip_property"),
+        QStringLiteral("set_clip_label"),
         QStringLiteral("trim_clip"),
         QStringLiteral("set_transition"),
         QStringLiteral("add_text_overlay"),
@@ -1062,7 +1063,7 @@ int runMcpSelftest()
     const QStringList changedToolNames{
         QStringLiteral("split_clip"), QStringLiteral("delete_clip"),
         QStringLiteral("move_clip"), QStringLiteral("set_track_locked"),
-        QStringLiteral("set_clip_property"),
+        QStringLiteral("set_clip_property"), QStringLiteral("set_clip_label"),
         QStringLiteral("trim_clip"), QStringLiteral("set_transition"),
         QStringLiteral("add_text_overlay")
     };
@@ -1087,6 +1088,10 @@ int runMcpSelftest()
         {QStringLiteral("set_clip_property"), QJsonObject{
             {QStringLiteral("clipIndex"), 0}, {QStringLiteral("property"), QStringLiteral("volume")},
             {QStringLiteral("value"), 1.0}, {QStringLiteral("track"), QStringLiteral("video")}
+        }},
+        {QStringLiteral("set_clip_label"), QJsonObject{
+            {QStringLiteral("clipIndex"), 0}, {QStringLiteral("label"), QStringLiteral("red")},
+            {QStringLiteral("track"), QStringLiteral("video")}
         }},
         {QStringLiteral("trim_clip"), QJsonObject{
             {QStringLiteral("clipIndex"), 0}, {QStringLiteral("edge"), QStringLiteral("in")},
@@ -1151,7 +1156,7 @@ int runMcpSelftest()
             rpcRequest(73, QStringLiteral("tools/list")))))
         .value(QStringLiteral("result")).toObject()
         .value(QStringLiteral("tools")).toArray();
-    constexpr int kExpectedProjectInfoToolCount = 28;
+    constexpr int kExpectedProjectInfoToolCount = 29;
     bool outputSchemasDeclared = projectInfoToolDescriptors.size()
         == kExpectedProjectInfoToolCount;
     for (const QJsonValue& value : projectInfoToolDescriptors) {
@@ -1841,6 +1846,145 @@ int runMcpSelftest()
              : fail("G118 track flags survive save/open and legacy defaults are false",
                     QStringLiteral("flags, header state, array lengths, or legacy defaults diverged"));
 
+        video0->setClips(QVector<ClipInfo>{
+            makeTestClip(QStringLiteral("label-target"), 0),
+            makeTestClip(QStringLiteral("label-default"), 0)
+        });
+        video1->setClips(QVector<ClipInfo>{});
+        audio0->setClips(QVector<ClipInfo>{});
+        audio1->setClips(QVector<ClipInfo>{});
+        projectTimeline->applyTrackFlagsFromJson(QJsonObject{});
+        projectTimeline->clearSelection();
+        saveTestUndoBaseline();
+
+        const QJsonObject setLabelResponse = callProjectInfoTool(
+            215, QStringLiteral("set_clip_label"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 0},
+                {QStringLiteral("label"), QStringLiteral("red")}
+            });
+        const QJsonObject labelledTimelineResponse = callProjectInfoTool(
+            216, QStringLiteral("get_timeline"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")}
+            });
+        const QJsonArray labelledTimelineClips = timelineTrackObject(
+            toolPayload(labelledTimelineResponse), QStringLiteral("video"), 0)
+                .value(QStringLiteral("clips")).toArray();
+        const QJsonObject setLabelPayload = toolPayload(setLabelResponse);
+        const bool g119 = !toolResult(setLabelResponse)
+                                .value(QStringLiteral("isError")).toBool(true)
+            && setLabelPayload.value(QStringLiteral("ok")).toBool(false)
+            && setLabelPayload.value(QStringLiteral("label")).toString()
+                   == QStringLiteral("red")
+            && requiredOutputFieldsPresent(QStringLiteral("set_clip_label"),
+                                           setLabelPayload)
+            && video0->clips().at(0).label == ClipLabel::Red
+            && labelledTimelineClips.size() == 2
+            && labelledTimelineClips.at(0).toObject()
+                   .value(QStringLiteral("label")).toString() == QStringLiteral("red")
+            && labelledTimelineClips.at(1).toObject()
+                   .value(QStringLiteral("label")).toString() == QStringLiteral("none");
+        g119 ? pass("G119 set_clip_label is reflected by get_timeline")
+             : fail("G119 set_clip_label is reflected by get_timeline",
+                    QStringLiteral("label mutation, response schema, or get_timeline.label diverged"));
+
+        const QJsonObject invalidLabelResponse = callProjectInfoTool(
+            217, QStringLiteral("set_clip_label"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 0},
+                {QStringLiteral("label"), QStringLiteral("ultraviolet")}
+            });
+        const bool g120 = toolResult(invalidLabelResponse)
+                                .value(QStringLiteral("isError")).toBool(false)
+            && toolErrorText(invalidLabelResponse).contains(
+                   QStringLiteral("label must be one of"))
+            && video0->clips().at(0).label == ClipLabel::Red;
+        g120 ? pass("G120 set_clip_label rejects an invalid label")
+             : fail("G120 set_clip_label rejects an invalid label",
+                    QStringLiteral("invalid label was accepted or changed the clip"));
+
+        const QJsonObject labelUndoResponse = callProjectInfoTool(
+            218, QStringLiteral("undo"), QJsonObject{});
+        const bool g121 = toolPayload(labelUndoResponse)
+                                .value(QStringLiteral("ok")).toBool(false)
+            && video0->clips().at(0).label == ClipLabel::None
+            && !projectTimeline->undoManager()->canUndo();
+        g121 ? pass("G121 set_clip_label is reverted by one undo")
+             : fail("G121 set_clip_label is reverted by one undo",
+                    QStringLiteral("one undo did not restore the default label"));
+
+        saveTestUndoBaseline();
+        const QJsonObject roundtripLabelResponse = callProjectInfoTool(
+            219, QStringLiteral("set_clip_label"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 0},
+                {QStringLiteral("label"), QStringLiteral("green")}
+            });
+        const QString labelProjectPath = projectBehaviorDirReady
+            ? QDir(projectBehaviorDir.path()).filePath(
+                  QStringLiteral("clip-label-roundtrip.vsep"))
+            : QString();
+        QJsonObject labelSaveResponse;
+        QJsonObject labelOpenResponse;
+        QJsonDocument savedLabelDocument;
+        bool savedLabelFileRead = false;
+        if (projectBehaviorDirReady) {
+            labelSaveResponse = callProjectInfoTool(
+                220, QStringLiteral("save_project"), QJsonObject{
+                    {QStringLiteral("path"), labelProjectPath}
+                });
+            QFile labelFile(labelProjectPath);
+            savedLabelFileRead = labelFile.open(QIODevice::ReadOnly);
+            if (savedLabelFileRead)
+                savedLabelDocument = QJsonDocument::fromJson(labelFile.readAll());
+
+            QVector<ClipInfo> clearedLabels = video0->clips();
+            for (ClipInfo &clip : clearedLabels)
+                clip.label = ClipLabel::None;
+            video0->setClips(clearedLabels);
+            labelOpenResponse = callProjectInfoTool(
+                221, QStringLiteral("open_project"), QJsonObject{
+                    {QStringLiteral("path"), labelProjectPath}
+                });
+        }
+        TimelineTrack *reopenedLabelTrack = projectTimeline->trackAt(false, 0);
+        const QJsonArray savedLabelTracks = savedLabelDocument.object()
+            .value(QStringLiteral("videoTracks")).toArray();
+        const QJsonArray savedLabelClips = savedLabelTracks.isEmpty()
+            ? QJsonArray{} : savedLabelTracks.first().toArray();
+        const QJsonObject reopenedLabelTimeline = callProjectInfoTool(
+            222, QStringLiteral("get_timeline"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")}
+            });
+        const QJsonArray reopenedLabelClips = timelineTrackObject(
+            toolPayload(reopenedLabelTimeline), QStringLiteral("video"), 0)
+                .value(QStringLiteral("clips")).toArray();
+        const bool g122 = projectBehaviorDirReady && savedLabelFileRead
+            && !toolResult(roundtripLabelResponse)
+                    .value(QStringLiteral("isError")).toBool(true)
+            && !toolResult(labelSaveResponse)
+                    .value(QStringLiteral("isError")).toBool(true)
+            && !toolResult(labelOpenResponse)
+                    .value(QStringLiteral("isError")).toBool(true)
+            && savedLabelClips.size() == 2
+            && savedLabelClips.at(0).toObject()
+                   .value(QStringLiteral("label")).toString() == QStringLiteral("green")
+            && !savedLabelClips.at(1).toObject().contains(QStringLiteral("label"))
+            && reopenedLabelTrack && reopenedLabelTrack->clipCount() == 2
+            && reopenedLabelTrack->clips().at(0).label == ClipLabel::Green
+            && reopenedLabelTrack->clips().at(1).label == ClipLabel::None
+            && reopenedLabelClips.size() == 2
+            && reopenedLabelClips.at(0).toObject()
+                   .value(QStringLiteral("label")).toString() == QStringLiteral("green")
+            && reopenedLabelClips.at(1).toObject()
+                   .value(QStringLiteral("label")).toString() == QStringLiteral("none");
+        g122 ? pass("G122 clip labels survive save/open and None is omitted")
+             : fail("G122 clip labels survive save/open and None is omitted",
+                    QStringLiteral("project JSON or reopened timeline lost clip labels"));
+
         // 後続の get_frame fixture は空の V1/A1 へ media を 1 件ずつ取り込む。
         // roundtrip で再読込したクリップと undo 履歴をここで隔離する。
         const QVector<TimelineTrack *> tracks =
@@ -1867,6 +2011,10 @@ int runMcpSelftest()
         fail("G116 set_track_locked rejects a missing track", QStringLiteral("Timeline was not available"));
         fail("G117 locked tracks reject split/delete/move", QStringLiteral("Timeline was not available"));
         fail("G118 track flags survive save/open and legacy defaults are false", QStringLiteral("Timeline was not available"));
+        fail("G119 set_clip_label is reflected by get_timeline", QStringLiteral("Timeline was not available"));
+        fail("G120 set_clip_label rejects an invalid label", QStringLiteral("Timeline was not available"));
+        fail("G121 set_clip_label is reverted by one undo", QStringLiteral("Timeline was not available"));
+        fail("G122 clip labels survive save/open and None is omitted", QStringLiteral("Timeline was not available"));
     }
 
     const bool selectClipFieldsPresent =

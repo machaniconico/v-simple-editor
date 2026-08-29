@@ -213,7 +213,85 @@ QAction *addAudioChannelModeAction(QMenu *menu,
     act->setChecked(current == mode);
     return act;
 }
+
+QAction *addClipLabelAction(QMenu *menu, ClipLabel current, ClipLabel label)
+{
+    QAction *act = menu->addAction(clipLabelName(label));
+    act->setCheckable(true);
+    act->setChecked(current == label);
+    return act;
+}
 } // namespace
+
+QColor clipLabelColor(ClipLabel label)
+{
+    switch (label) {
+    case ClipLabel::Red:    return QColor(0xD9, 0x4B, 0x4B);
+    case ClipLabel::Orange: return QColor(0xE5, 0x8A, 0x3A);
+    case ClipLabel::Yellow: return QColor(0xD7, 0xB8, 0x4A);
+    case ClipLabel::Green:  return QColor(0x53, 0xA8, 0x5B);
+    case ClipLabel::Cyan:   return QColor(0x36, 0xA9, 0xB7);
+    case ClipLabel::Blue:   return QColor(0x4B, 0x78, 0xD1);
+    case ClipLabel::Purple: return QColor(0x8A, 0x5A, 0xBD);
+    case ClipLabel::Pink:   return QColor(0xD6, 0x5B, 0x9E);
+    case ClipLabel::None:   return QColor();
+    }
+    return QColor();
+}
+
+QString clipLabelName(ClipLabel label)
+{
+    switch (label) {
+    case ClipLabel::None:   return QStringLiteral("なし");
+    case ClipLabel::Red:    return QStringLiteral("赤");
+    case ClipLabel::Orange: return QStringLiteral("オレンジ");
+    case ClipLabel::Yellow: return QStringLiteral("黄");
+    case ClipLabel::Green:  return QStringLiteral("緑");
+    case ClipLabel::Cyan:   return QStringLiteral("シアン");
+    case ClipLabel::Blue:   return QStringLiteral("青");
+    case ClipLabel::Purple: return QStringLiteral("紫");
+    case ClipLabel::Pink:   return QStringLiteral("ピンク");
+    }
+    return QStringLiteral("なし");
+}
+
+ClipLabel clipLabelFromString(const QString &value)
+{
+    const QString normalized = value.trimmed().toLower();
+    if (normalized == QStringLiteral("red"))
+        return ClipLabel::Red;
+    if (normalized == QStringLiteral("orange"))
+        return ClipLabel::Orange;
+    if (normalized == QStringLiteral("yellow"))
+        return ClipLabel::Yellow;
+    if (normalized == QStringLiteral("green"))
+        return ClipLabel::Green;
+    if (normalized == QStringLiteral("cyan"))
+        return ClipLabel::Cyan;
+    if (normalized == QStringLiteral("blue"))
+        return ClipLabel::Blue;
+    if (normalized == QStringLiteral("purple"))
+        return ClipLabel::Purple;
+    if (normalized == QStringLiteral("pink"))
+        return ClipLabel::Pink;
+    return ClipLabel::None;
+}
+
+QString clipLabelToString(ClipLabel label)
+{
+    switch (label) {
+    case ClipLabel::None:   return QStringLiteral("none");
+    case ClipLabel::Red:    return QStringLiteral("red");
+    case ClipLabel::Orange: return QStringLiteral("orange");
+    case ClipLabel::Yellow: return QStringLiteral("yellow");
+    case ClipLabel::Green:  return QStringLiteral("green");
+    case ClipLabel::Cyan:   return QStringLiteral("cyan");
+    case ClipLabel::Blue:   return QStringLiteral("blue");
+    case ClipLabel::Purple: return QStringLiteral("purple");
+    case ClipLabel::Pink:   return QStringLiteral("pink");
+    }
+    return QStringLiteral("none");
+}
 
 namespace timeline_nesting {
 namespace {
@@ -1861,6 +1939,7 @@ void TimelineTrack::paintEvent(QPaintEvent *event)
     QPainter painter(this);
     painter.setRenderHint(QPainter::Antialiasing);
     const QRect visibleRect = event ? event->rect() : QRect(0, 0, width(), height());
+    QVector<QPair<QRect, QColor>> labelBars;
     int x = 0;
     for (int i = 0; i < m_clips.size(); ++i) {
         // Leading gap (leadInSec) before this clip, created by left-trim so the
@@ -1885,6 +1964,8 @@ void TimelineTrack::paintEvent(QPaintEvent *event)
                              || !m_clips[i].effects.isEmpty();
         QColor color = hasEffects ? QColor(0x44, 0xAA, 0x88)
                                   : QColor(0x44, 0x88, 0xCC);
+        if (m_clips[i].label != ClipLabel::None)
+            color = clipLabelColor(m_clips[i].label);
         const bool isSelected = m_selectedClips.contains(i);
         if (isSelected) color = color.lighter(140);
         if (m_dragMode == DragMode::MoveClip && i == m_dropTargetIndex) {
@@ -1892,6 +1973,11 @@ void TimelineTrack::paintEvent(QPaintEvent *event)
             painter.drawLine(x, 0, x, m_rowHeight);
         }
         painter.fillRect(clipRect, color);
+        if (m_clips[i].label != ClipLabel::None) {
+            labelBars.append(qMakePair(
+                QRect(x, clipRect.bottom() - 2, clipWidth, 3),
+                clipLabelColor(m_clips[i].label)));
+        }
         // Premiere-style effect indicator: a 3 px purple bar along the top
         // edge of any clip with a non-default color correction OR any video
         // effect applied. The bar spans the full clip width so the user can
@@ -2154,6 +2240,12 @@ void TimelineTrack::paintEvent(QPaintEvent *event)
     // Resize handle hint at the bottom edge of the track. A faint horizontal
     // bar tells the user the row height can be dragged here.
     painter.fillRect(0, height() - 2, width(), 2, QColor(70, 70, 70));
+
+    // Labelled clips reclaim their own bottom 3 px after the shared resize
+    // affordance is painted. With no labels this loop is empty, preserving the
+    // exact legacy paint sequence and pixels.
+    for (const auto &labelBar : std::as_const(labelBars))
+        painter.fillRect(labelBar.first, labelBar.second);
 
     // Snap line visual feedback — yellow vertical line fading over 200 ms.
     if (m_timeline) {
@@ -4990,6 +5082,45 @@ bool Timeline::setClipPropertyByIndex(bool audio, int trackIndex, int clipIndex,
     return true;
 }
 
+bool Timeline::setClipLabel(TrackKind kind, int trackIndex, int clipIndex,
+                            ClipLabel label)
+{
+    switch (label) {
+    case ClipLabel::None:
+    case ClipLabel::Red:
+    case ClipLabel::Orange:
+    case ClipLabel::Yellow:
+    case ClipLabel::Green:
+    case ClipLabel::Cyan:
+    case ClipLabel::Blue:
+    case ClipLabel::Purple:
+    case ClipLabel::Pink:
+        break;
+    default:
+        return false;
+    }
+
+    TimelineTrack *track = trackAt(kind == TrackKind::Audio, trackIndex);
+    if (!track || track->isLocked()
+        || clipIndex < 0 || clipIndex >= track->clipCount()) {
+        return false;
+    }
+
+    QVector<ClipInfo> clips = track->clips();
+    if (clips[clipIndex].label == label)
+        return true;
+
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    clips[clipIndex].label = label;
+    track->setClips(clips);
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+    saveUndoState(QStringLiteral("Clip label"));
+    updateInfoLabel();
+    scheduleEmitSequenceChanged();
+    return true;
+}
+
 QVector<Timeline::TimeRangeSec> Timeline::selectedClipTimeRanges() const
 {
     QVector<TimeRangeSec> ranges;
@@ -6127,6 +6258,37 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     if (!track->isClipSelected(clipIndex))
         track->setSelectedClip(clipIndex);
 
+    auto applyLabelToSelection = [&](ClipLabel label) {
+        const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+        bool changed = false;
+        const QVector<TimelineTrack *> tracks = m_videoTracks + m_audioTracks;
+        for (TimelineTrack *selectedTrack : tracks) {
+            if (!selectedTrack || selectedTrack->isLocked())
+                continue;
+            QVector<ClipInfo> clips = selectedTrack->clips();
+            bool trackChanged = false;
+            for (int selectedIndex : selectedTrack->selectedClips()) {
+                if (selectedIndex < 0 || selectedIndex >= clips.size()
+                    || clips[selectedIndex].label == label) {
+                    continue;
+                }
+                clips[selectedIndex].label = label;
+                trackChanged = true;
+            }
+            if (trackChanged) {
+                selectedTrack->setClips(clips);
+                changed = true;
+            }
+        }
+        if (!changed)
+            return;
+        remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+        remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+        saveUndoState(QStringLiteral("Clip label"));
+        updateInfoLabel();
+        scheduleEmitSequenceChanged();
+    };
+
     if (QSettings("VSimpleEditor", "Preferences")
             .value(rcpause::pauseOnRightClickKey(),
                    rcpause::kDefaultPauseOnRightClick).toBool()) {
@@ -6169,6 +6331,19 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
                                                       AudioChannelMode::Swap);
         QAction *aMonoAct = addAudioChannelModeAction(aChannelMenu, aClip.audioChannelMode,
                                                       AudioChannelMode::Mono);
+        aMenu.addSeparator();
+        QMenu *aLabelMenu = aMenu.addMenu(QStringLiteral("ラベルカラー"));
+        const QList<QPair<QAction *, ClipLabel>> aLabelActions{
+            {addClipLabelAction(aLabelMenu, aClip.label, ClipLabel::None), ClipLabel::None},
+            {addClipLabelAction(aLabelMenu, aClip.label, ClipLabel::Red), ClipLabel::Red},
+            {addClipLabelAction(aLabelMenu, aClip.label, ClipLabel::Orange), ClipLabel::Orange},
+            {addClipLabelAction(aLabelMenu, aClip.label, ClipLabel::Yellow), ClipLabel::Yellow},
+            {addClipLabelAction(aLabelMenu, aClip.label, ClipLabel::Green), ClipLabel::Green},
+            {addClipLabelAction(aLabelMenu, aClip.label, ClipLabel::Cyan), ClipLabel::Cyan},
+            {addClipLabelAction(aLabelMenu, aClip.label, ClipLabel::Blue), ClipLabel::Blue},
+            {addClipLabelAction(aLabelMenu, aClip.label, ClipLabel::Purple), ClipLabel::Purple},
+            {addClipLabelAction(aLabelMenu, aClip.label, ClipLabel::Pink), ClipLabel::Pink}
+        };
         aMenu.addSeparator();
         QMenu *atMenu = aMenu.addMenu(QStringLiteral("音声トランジション"));
         QAction *aXdAct = atMenu->addAction(QStringLiteral("クロスフェード (1.0s)"));
@@ -6224,6 +6399,12 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
             saveUndoState(QStringLiteral("Set audio channel mapping"));
             scheduleEmitSequenceChanged();
         };
+        for (const auto &labelAction : aLabelActions) {
+            if (aChosen == labelAction.first) {
+                applyLabelToSelection(labelAction.second);
+                return;
+            }
+        }
         if (aChosen == aCut) cutSelectedClip();
         else if (aChosen == aCopy) copySelectedClip();
         else if (aChosen == aDel) deleteSelectedClip();
@@ -6320,6 +6501,19 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
                                                  AudioChannelMode::Swap);
     QAction *monoAct = addAudioChannelModeAction(channelMenu, currentChannelMode,
                                                  AudioChannelMode::Mono);
+    menu.addSeparator();
+    QMenu *labelMenu = menu.addMenu(QStringLiteral("ラベルカラー"));
+    const QList<QPair<QAction *, ClipLabel>> labelActions{
+        {addClipLabelAction(labelMenu, clipInfo.label, ClipLabel::None), ClipLabel::None},
+        {addClipLabelAction(labelMenu, clipInfo.label, ClipLabel::Red), ClipLabel::Red},
+        {addClipLabelAction(labelMenu, clipInfo.label, ClipLabel::Orange), ClipLabel::Orange},
+        {addClipLabelAction(labelMenu, clipInfo.label, ClipLabel::Yellow), ClipLabel::Yellow},
+        {addClipLabelAction(labelMenu, clipInfo.label, ClipLabel::Green), ClipLabel::Green},
+        {addClipLabelAction(labelMenu, clipInfo.label, ClipLabel::Cyan), ClipLabel::Cyan},
+        {addClipLabelAction(labelMenu, clipInfo.label, ClipLabel::Blue), ClipLabel::Blue},
+        {addClipLabelAction(labelMenu, clipInfo.label, ClipLabel::Purple), ClipLabel::Purple},
+        {addClipLabelAction(labelMenu, clipInfo.label, ClipLabel::Pink), ClipLabel::Pink}
+    };
     menu.addSeparator();
     QMenu *transitionMenu = menu.addMenu(QStringLiteral("トランジション"));
     QAction *xdAct = transitionMenu->addAction(QStringLiteral("クロスディゾルブ (1.0s)"));
@@ -6451,6 +6645,12 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
 
     QAction *chosen = menu.exec(globalPos);
     if (!chosen) return;
+    for (const auto &labelAction : labelActions) {
+        if (chosen == labelAction.first) {
+            applyLabelToSelection(labelAction.second);
+            return;
+        }
+    }
     if (chosen == cutAct) cutSelectedClip();
     else if (chosen == copyAct) copySelectedClip();
     else if (chosen == deleteAct) deleteSelectedClip();

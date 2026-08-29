@@ -1792,6 +1792,8 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
         obj["leadInSec"] = clip.leadInSec;
     if (clip.linkGroup != 0)
         obj["linkGroup"] = clip.linkGroup;
+    if (clip.label != ClipLabel::None)
+        obj["label"] = clipLabelToString(clip.label);
     obj["speed"] = clip.speed;
     obj["volume"] = clip.volume;
     if (clip.pan != 0.0)
@@ -1893,6 +1895,7 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
     clip.outPoint = obj["outPoint"].toDouble();
     clip.leadInSec = obj["leadInSec"].toDouble(0.0);
     clip.linkGroup = obj["linkGroup"].toInt(0);
+    clip.label = clipLabelFromString(obj["label"].toString());
     clip.speed = obj["speed"].toDouble(1.0);
     clip.volume = obj["volume"].toDouble(1.0);
     clip.pan = obj["pan"].toDouble(0.0);
