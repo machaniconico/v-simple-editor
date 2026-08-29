@@ -56,6 +56,12 @@ class Timeline;
 // rather than failing the whole frame.
 namespace tlrender {
 
+// Pure temporal-composite helper. `echoes[0]` is the frame at t-delay,
+// `echoes[1]` at t-2*delay, and so on; each receives decay^(index+1).
+// blend: 0=Add, 1=Screen, 2=Lighten, 3=Normal alpha composite.
+QImage composeEcho(const QImage &base, const QVector<QImage> &echoes,
+                   double decay, int blend);
+
 QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize);
 QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize,
                      double frameDurationUs);

@@ -132,7 +132,9 @@ enum class VideoEffectType {
     Mirror,
     PolarCoordinates,
     MotionTile,
-    CornerPinSimple
+    CornerPinSimple,
+    FilmGrain,
+    Echo
 };
 
 struct VideoEffect {
@@ -184,6 +186,10 @@ struct VideoEffect {
     //   PolarCoordinates: p1=type(0=rect->polar,1=polar->rect), p2=amount(0..1)
     //   MotionTile: p1=tilesX(1..10), p2=tilesY(1..10), p3=mirrorEdges(0/1). 1x1 is no-op.
     //   CornerPinSimple: p1=horizontalTilt(-100..100), p2=verticalTilt(-100..100)
+    //   FilmGrain: p1=amount(0..1), p2=size(1..4), p3=colorAmount(0..1), keyColor.red=seedPerFrame(0/1)
+    //   Echo: p1=delaySec(0.02..2), p2=count(1..8), p3=decay(0..1), keyColor.red=blend(0=Add,1=Screen,2=Lighten,3=Normal)
+    // keyColor is otherwise unused by these two effects; its serialized red
+    // channel carries their fourth scalar without changing the project format.
     double param1 = 0.0;
     double param2 = 0.0;
     double param3 = 0.0;
@@ -241,6 +247,11 @@ struct VideoEffect {
     static VideoEffect createPolarCoordinates(int type = 0, double amount = 0.0);
     static VideoEffect createMotionTile(int tilesX = 1, int tilesY = 1, bool mirrorEdges = false);
     static VideoEffect createCornerPinSimple(double horizontalTilt = 0.0, double verticalTilt = 0.0);
+    static VideoEffect createFilmGrain(double amount = 0.3, int size = 1,
+                                       double colorAmount = 0.0,
+                                       bool seedPerFrame = true);
+    static VideoEffect createEcho(double delaySec = 0.1, int count = 3,
+                                  double decay = 0.5, int blend = 2);
 };
 
 // --- Processor ---
@@ -312,4 +323,6 @@ private:
     static QImage applyPolarCoordinates(const QImage &img, int type, double amount);
     static QImage applyMotionTile(const QImage &img, int tilesX, int tilesY, bool mirrorEdges);
     static QImage applyCornerPinSimple(const QImage &img, double horizontalTilt, double verticalTilt);
+    static QImage applyFilmGrain(const QImage &img, double amount, int size,
+                                 double colorAmount, bool seedPerFrame);
 };

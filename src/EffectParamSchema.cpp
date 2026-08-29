@@ -245,6 +245,23 @@ QVector<ParamDef> paramSchemaFor(VideoEffectType type)
             { "verticalTilt", "垂直チルト", ParamType::Float, -100.0, 100.0, 0.0 }
         };
 
+    case VideoEffectType::FilmGrain:
+        return {
+            { "amount", "量", ParamType::Float, 0.0, 1.0, 0.3 },
+            { "size", "サイズ", ParamType::Int, 1.0, 4.0, 1.0 },
+            { "colorAmount", "カラー量", ParamType::Float, 0.0, 1.0, 0.0 },
+            { "seedPerFrame", "フレーム毎にシード", ParamType::Bool, 0.0, 1.0, 1.0 }
+        };
+
+    case VideoEffectType::Echo:
+        return {
+            { "delaySec", "遅延 (秒)", ParamType::Float, 0.02, 2.0, 0.1 },
+            { "count", "残像数", ParamType::Int, 1.0, 8.0, 3.0 },
+            { "decay", "減衰", ParamType::Float, 0.0, 1.0, 0.5 },
+            { "blend", "合成", ParamType::Choice, 0.0, 3.0, 2.0,
+              { "加算", "スクリーン", "比較 (明)", "通常" } }
+        };
+
     case VideoEffectType::None:
     default:
         return {};

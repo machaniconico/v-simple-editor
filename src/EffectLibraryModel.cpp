@@ -129,6 +129,8 @@ QString videoCategory(VideoEffectType type)
     case VideoEffectType::Scanlines:
     case VideoEffectType::Halftone:
     case VideoEffectType::Sharpen:
+    case VideoEffectType::FilmGrain:
+    case VideoEffectType::Echo:
         return QStringLiteral("スタイライズ");
     case VideoEffectType::None:
         return QStringLiteral("その他");
@@ -176,7 +178,7 @@ VideoEffectType shaderVideoType(const QString &name)
     if (name == QStringLiteral("Glitch"))
         return VideoEffectType::GlitchVHS;
     if (name == QStringLiteral("Film Grain"))
-        return VideoEffectType::Noise;
+        return VideoEffectType::FilmGrain;
     if (name == QStringLiteral("Vignette"))
         return VideoEffectType::Vignette;
     if (name.contains(QStringLiteral("CRT"), Qt::CaseInsensitive))

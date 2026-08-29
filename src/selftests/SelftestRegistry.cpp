@@ -94,6 +94,7 @@ int runFrameExportSelftest();
 int runFcpxmlSelftest();
 int runFreezeFrameSelftest();
 int runFrameIoSelftest();
+int runFxGrainEchoSelftest();
 int runGradeKeyframeSelftest();
 int runGradeWheelWiringSelftest();
 int runGraphEditorSelftest();
@@ -545,6 +546,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "AE-FX-5 Generate Family: gradient ramp, fill, bloom, scanlines, halftone gates (G1-G6)" },
     { "ae-fx-stylize",     "VEDITOR_AE_FX_STYLIZE_SELFTEST",      runAeFxStylizeSelftest,        false,
       "AE-FX-2 Stylize Family: glow, edges, emboss, posterize, threshold, solarize gates (G1-G7)" },
+    { "fxgrain-echo",      "VEDITOR_FXGRAIN_ECHO_SELFTEST",       runFxGrainEchoSelftest,         false,
+      "FilmGrain deterministic CPU effect + Echo temporal compositor gates (G1-G8)" },
     { "effect-preset", "VEDITOR_EFFECT_PRESET_SELFTEST", runEffectPresetSelftest, false,
       "FXP-1 effect preset stack JSON save/load/apply with optional effect keyframes (5 gates)" },
     { "effect-library", "VEDITOR_EFFECT_LIBRARY_SELFTEST", runEffectLibrarySelftest, false,

@@ -42,6 +42,7 @@
 #include <QVector>
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <functional>
 
 extern "C" {
@@ -121,6 +122,91 @@ bool lightingSelftestSeamWasCalled()
 }
 
 } // namespace detail
+
+QImage composeEcho(const QImage &base, const QVector<QImage> &echoes,
+                   double decay, int blend)
+{
+    const double boundedDecay = qBound(0.0, decay, 1.0);
+    if (base.isNull() || echoes.isEmpty() || boundedDecay <= 0.0)
+        return base;
+
+    const int mode = qBound(0, blend, 3);
+    QImage result = base.convertToFormat(QImage::Format_ARGB32);
+    bool composed = false;
+
+    for (int echoIndex = 0; echoIndex < echoes.size(); ++echoIndex) {
+        if (echoes[echoIndex].isNull())
+            continue;
+        const double weight = std::pow(boundedDecay,
+                                       static_cast<double>(echoIndex + 1));
+        if (weight <= 0.0)
+            continue;
+
+        QImage echo = echoes[echoIndex];
+        if (echo.size() != result.size()) {
+            echo = echo.scaled(result.size(), Qt::IgnoreAspectRatio,
+                               Qt::SmoothTransformation);
+        }
+        echo = echo.convertToFormat(QImage::Format_ARGB32);
+        composed = true;
+
+        for (int y = 0; y < result.height(); ++y) {
+            QRgb *dstLine = reinterpret_cast<QRgb *>(result.scanLine(y));
+            const QRgb *srcLine = reinterpret_cast<const QRgb *>(echo.constScanLine(y));
+            for (int x = 0; x < result.width(); ++x) {
+                const QRgb dst = dstLine[x];
+                const QRgb src = srcLine[x];
+                const double opacity = qBound(
+                    0.0, weight * (static_cast<double>(qAlpha(src)) / 255.0), 1.0);
+                const double destinationAlpha =
+                    static_cast<double>(qAlpha(dst)) / 255.0;
+                const double normalOutputAlpha =
+                    opacity + destinationAlpha * (1.0 - opacity);
+
+                auto compositeChannel = [mode, opacity, destinationAlpha,
+                                         normalOutputAlpha](int d, int s) -> int {
+                    double value = d;
+                    switch (mode) {
+                    case 0: // Add
+                        value = d + s * opacity;
+                        break;
+                    case 1: { // Screen
+                        const double screened = 255.0
+                            - ((255.0 - d) * (255.0 - s) / 255.0);
+                        value = d + (screened - d) * opacity;
+                        break;
+                    }
+                    case 2: { // Lighten
+                        const double lightened = qMax(d, s);
+                        value = d + (lightened - d) * opacity;
+                        break;
+                    }
+                    case 3: // Normal alpha composite (straight-alpha SourceOver)
+                        value = normalOutputAlpha > 0.0
+                            ? (s * opacity
+                               + d * destinationAlpha * (1.0 - opacity))
+                                / normalOutputAlpha
+                            : 0.0;
+                        break;
+                    }
+                    return qBound(0, qRound(value), 255);
+                };
+
+                const int outAlpha = mode == 3
+                    ? qBound(0, qRound(255.0 * normalOutputAlpha), 255)
+                    : qMax(qAlpha(dst), qBound(0, qRound(qAlpha(src) * weight), 255));
+                dstLine[x] = qRgba(compositeChannel(qRed(dst), qRed(src)),
+                                   compositeChannel(qGreen(dst), qGreen(src)),
+                                   compositeChannel(qBlue(dst), qBlue(src)),
+                                   outAlpha);
+            }
+        }
+    }
+
+    if (!composed)
+        return base;
+    return result.convertToFormat(base.format());
+}
 
 namespace {
 
@@ -450,6 +536,86 @@ QImage applyClipFxPack(const QImage &graded, const ClipInfo &clip,
     // downstream scale/composite is unchanged (same contract gradeClipNativeFrame
     // preserves for S2/S3/S4).
     return out.convertToFormat(QImage::Format_RGBA8888);
+}
+
+using EchoFrameProvider =
+    std::function<QImage(double sourceSeconds, double clipLocalSeconds)>;
+
+bool hasActiveEcho(const ClipInfo &clip, double clipLocalSeconds)
+{
+    bool containsEnabledEcho = false;
+    for (const VideoEffect &effect : clip.effects) {
+        if (effect.enabled && effect.type == VideoEffectType::Echo) {
+            containsEnabledEcho = true;
+            break;
+        }
+    }
+    if (!containsEnabledEcho)
+        return false;
+
+    const QVector<VideoEffect> effects =
+        clipanim::effectiveEffectsAt(clip, clipLocalSeconds);
+    for (const VideoEffect &effect : effects) {
+        if (effect.enabled && effect.type == VideoEffectType::Echo)
+            return true;
+    }
+    return false;
+}
+
+QImage applyClipFxPackWithEcho(const QImage &graded, const ClipInfo &clip,
+                               double clipLocalSeconds, double sourceSeconds,
+                               const EchoFrameProvider &frameProvider)
+{
+    const QVector<VideoEffect> effects =
+        clipanim::effectiveEffectsAt(clip, clipLocalSeconds);
+    QImage result = graded;
+
+    for (int effectIndex = 0; effectIndex < effects.size(); ++effectIndex) {
+        const VideoEffect &effect = effects[effectIndex];
+        if (!effect.enabled || effect.type != VideoEffectType::Echo) {
+            result = VideoEffectProcessor::applyEffect(result, effect);
+            continue;
+        }
+
+        const double delaySec = std::isfinite(effect.param1)
+            ? qBound(0.02, effect.param1, 2.0) : 0.1;
+        const int count = qBound(1, static_cast<int>(std::round(effect.param2)), 8);
+        const double decay = std::isfinite(effect.param3)
+            ? qBound(0.0, effect.param3, 1.0) : 0.5;
+        const int blend = qBound(0, effect.keyColor.red(), 3);
+        QVector<QImage> echoes;
+        echoes.reserve(count);
+
+        for (int i = 1; i <= count; ++i) {
+            const double sampleSourceSec = sourceSeconds - i * delaySec;
+            if (sampleSourceSec < clip.inPoint)
+                break;
+            const double sampleLocalSec =
+                clip.timeRemapCurve.keys.isEmpty() && std::abs(clip.speed) > 1e-9
+                ? qMax(0.0, (sampleSourceSec - clip.inPoint) / clip.speed)
+                : qMax(0.0, clipLocalSeconds - i * delaySec);
+
+            QImage echoFrame = frameProvider
+                ? frameProvider(sampleSourceSec, sampleLocalSec) : QImage();
+            if (!echoFrame.isNull()) {
+                // Preserve stack order: every effect before Echo is applied to
+                // each re-fetched source frame; later effects run after blend.
+                for (int prefixIndex = 0; prefixIndex < effectIndex; ++prefixIndex) {
+                    if (effects[prefixIndex].type != VideoEffectType::Echo) {
+                        echoFrame = VideoEffectProcessor::applyEffect(
+                            echoFrame, effects[prefixIndex]);
+                    }
+                }
+            }
+            // Keep null entries so composeEcho retains the decay^i exponent
+            // when one individual decode fails.
+            echoes.append(echoFrame);
+        }
+
+        result = composeEcho(result, echoes, decay, blend);
+    }
+
+    return result.convertToFormat(QImage::Format_RGBA8888);
 }
 
 struct ActiveAdjustmentClip {
@@ -1097,7 +1263,25 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         // GLPreview.cpp:910-916), so FX comes strictly after CC -> LUT. No-op when
         // the clip carries no effects, so a lone V1 clip stays byte-identical to
         // S2/S3/S4.
-        const QImage v1Fx = applyClipFxPack(v1Graded, v1Clip, v1LocalSec);
+        QImage v1Fx;
+        if (hasActiveEcho(v1Clip, v1LocalSec)) {
+            const EchoFrameProvider echoFrameProvider =
+                [&](double sampleSourceSec, double sampleLocalSec) -> QImage {
+                    const QImage sampleRaw = renderClipSourceFrame(
+                        timeline, v1Clip, sampleSourceSec, outSize, sequenceDepth,
+                        sequenceSnapshot, sequenceStack, projectLights,
+                        projectLightViewPosition);
+                    if (sampleRaw.isNull())
+                        return QImage();
+                    return gradeClipNativeFrame(
+                        applyVfxFootageControls(sampleRaw, v1Clip),
+                        v1Clip, sampleLocalSec);
+                };
+            v1Fx = applyClipFxPackWithEcho(
+                v1Graded, v1Clip, v1LocalSec, v1SourceSec, echoFrameProvider);
+        } else {
+            v1Fx = applyClipFxPack(v1Graded, v1Clip, v1LocalSec);
+        }
 
         // S7: apply the V1 clip's per-clip compositing mask (motion-tracker
         // animated) on the GRADED+FX'd native frame, BEFORE it is scaled onto
@@ -1265,11 +1449,27 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         // overlay is SourceOver-composited and the layers beneath show
         // through (same CC -> LUT -> FX -> MASK per-clip order as V1). No-op
         // for un-masked overlays, so S3's multi-track MSE stays ~0.
-        QImage nativeForMask =
-            applyClipFxPack(gradeClipNativeFrame(
-                                applyVfxFootageControls(nativeRaw, c),
-                                c, localSec),
-                            c, localSec);
+        const QImage gradedNative = gradeClipNativeFrame(
+            applyVfxFootageControls(nativeRaw, c), c, localSec);
+        QImage nativeForMask;
+        if (hasActiveEcho(c, localSec)) {
+            const EchoFrameProvider echoFrameProvider =
+                [&](double sampleSourceSec, double sampleLocalSec) -> QImage {
+                    const QImage sampleRaw = renderClipSourceFrame(
+                        timeline, c, sampleSourceSec, outSize, sequenceDepth,
+                        sequenceSnapshot, sequenceStack, projectLights,
+                        projectLightViewPosition);
+                    if (sampleRaw.isNull())
+                        return QImage();
+                    return gradeClipNativeFrame(
+                        applyVfxFootageControls(sampleRaw, c),
+                        c, sampleLocalSec);
+                };
+            nativeForMask = applyClipFxPackWithEcho(
+                gradedNative, c, localSec, srcSec, echoFrameProvider);
+        } else {
+            nativeForMask = applyClipFxPack(gradedNative, c, localSec);
+        }
         if (c.hasMask()
             && (hdrexport16::enabledFromEnv() || hdrmatte16::enabledFromEnv())) {
             nativeForMask = nativeForMask.convertToFormat(QImage::Format_RGBA64);
