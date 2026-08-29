@@ -85,6 +85,7 @@ inline uint qHash(const ReversePlaybackKey &k, uint seed = 0) noexcept
          ^ qHash(k.timelineStartUs, seed + 0x27d4eb2du);
 }
 
+class Timeline;
 class GLPreview;
 class QResizeEvent;
 
