@@ -354,6 +354,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/HslSecondarySelftest.cpp
     src/selftests/ClipLutSelftest.cpp
     src/selftests/ColorMatchApplySelftest.cpp
+    src/selftests/reverse_clip_selftest.cpp
     src/selftests/clip_idt_selftest.cpp
     src/selftests/clip_odt_selftest.cpp
     src/selftests/sws_color_selftest.cpp

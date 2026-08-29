@@ -770,6 +770,7 @@ bool timelineAudioMatchesPassthrough(Timeline *timeline)
         && qAbs(a.inPoint) < 1e-6
         && sourceEnd + 1e-6 >= a.duration
         && qAbs(a.speed - 1.0) < 1e-6
+        && !a.reversed
         && qAbs(a.volume - 1.0) < 1e-6
         && qAbs(a.pan) < 1e-6
         && a.volumeEnvelope.isEmpty()
@@ -830,7 +831,8 @@ QString nextExportAudioMixPath()
 
 QString exportAudioFilterChainForEntry(int inputIndex,
                                        const PlaybackEntry &entry,
-                                       AudioChannelMode channelMode)
+                                       AudioChannelMode channelMode,
+                                       bool reversed)
 {
     const int delayMs = qMax(0, qRound(entry.timelineStart * 1000.0));
     return buildExportAudioMixEntryFilterChain(
@@ -839,7 +841,8 @@ QString exportAudioFilterChainForEntry(int inputIndex,
         ffmpegNumber(entry.clipOut),
         delayMs,
         volumeExpressionForEntry(entry),
-        channelMode);
+        channelMode,
+        reversed);
 }
 
 bool runFfmpegForAudioMix(const QStringList &args, QString *error)
@@ -882,8 +885,13 @@ QString prepareTimelineAudioMixForExport(Timeline *timeline, QString *error)
     args << QStringLiteral("-y");
 
     QVector<PlaybackEntry> validEntries;
+    QVector<bool> validReversedFlags;
+    const QVector<bool> reversedFlags =
+        audioReversedFlagsForPlaybackEntries(entries);
     validEntries.reserve(entries.size());
-    for (const PlaybackEntry &entry : entries) {
+    validReversedFlags.reserve(entries.size());
+    for (int entryIndex = 0; entryIndex < entries.size(); ++entryIndex) {
+        const PlaybackEntry &entry = entries[entryIndex];
         if (entry.audioMuted)
             continue;
         if (entry.timelineEnd <= entry.timelineStart)
@@ -892,7 +900,15 @@ QString prepareTimelineAudioMixForExport(Timeline *timeline, QString *error)
             continue;
         if (!QFileInfo::exists(entry.filePath))
             continue;
+        const bool reversed = reversedFlags.value(entryIndex, false);
+        if (reversed && entry.clipOut - entry.clipIn > 10.0 * 60.0) {
+            qWarning().noquote()
+                << QStringLiteral("音声の逆再生クリップが10分の上限を超えたため、書き出しでは無音にします: %1")
+                       .arg(entry.filePath);
+            continue;
+        }
         validEntries.append(entry);
+        validReversedFlags.append(reversed);
         args << QStringLiteral("-i") << entry.filePath;
     }
 
@@ -916,7 +932,8 @@ QString prepareTimelineAudioMixForExport(Timeline *timeline, QString *error)
         chains << exportAudioFilterChainForEntry(
             i,
             entry,
-            audioChannelModeForPlaybackEntry(entry));
+            audioChannelModeForPlaybackEntry(entry),
+            validReversedFlags.value(i, false));
         mixInputs << QStringLiteral("[a%1]").arg(i);
     }
 
@@ -3684,12 +3701,16 @@ void MainWindow::setupUI()
     connect(m_timeline, &Timeline::sequenceChanged, this, [this](const QVector<PlaybackEntry> &entries) {
         if (!m_player) return;
         QVector<PlaybackEntry> resolved = entries;
+        QVector<bool> videoReversedFlags;
+        videoReversedFlags.reserve(entries.size());
+        for (const PlaybackEntry &entry : entries)
+            videoReversedFlags.append(videoReversedForPlaybackEntry(entry));
         // プロキシ解決 (プレビュー専用)。手動 isProxyMode と マルチトラック自動
         // プロキシの両方をこの 1 箇所で適用する。書き出し経路はここを通らない。
         resolvePreviewProxies(resolved, true);
         qInfo() << "MainWindow: forwarding sequenceChanged entries=" << resolved.size();
         undotrace::log("mw:beforeSetSequence");
-        m_player->setSequence(resolved);
+        m_player->setSequence(resolved, videoReversedFlags);
         // US-INT-2 Phase A: gather per-entry speed ramps in lockstep with
         // setSequence. Key by (sourceTrack, sourceClipIndex) — positional
         // alignment between resolved[] and any single track's clips() is
@@ -3723,31 +3744,40 @@ void MainWindow::setupUI()
     connect(m_timeline, &Timeline::audioSequenceChanged, this, [this](const QVector<PlaybackEntry> &entries) {
         if (!m_player) return;
         QVector<PlaybackEntry> resolved = entries;
+        const QVector<bool> sourceReversedFlags =
+            audioReversedFlagsForPlaybackEntries(entries);
         // プロキシ解決 (プレビュー専用)。映像側と同じ単一経路。書き出しは非経由。
         resolvePreviewProxies(resolved, false);
         qInfo() << "MainWindow: forwarding audioSequenceChanged entries=" << resolved.size();
-        m_player->setAudioSequence(resolved);
         // US-INT-2 Phase A: forward audio-side speed ramps (stored only for
         // now; AudioMixer Phase B will read them under m_controlMutex when
         // per-fragment atempo lands).
         QVector<speedramp::SpeedRamp> audioRamps;
         QVector<bool> audioAtempoFlags;
+        QVector<bool> audioReversedFlags;
         audioRamps.reserve(resolved.size());
         audioAtempoFlags.reserve(resolved.size());
+        audioReversedFlags.reserve(resolved.size());
         const auto &aTracks = m_timeline->audioTracks();
-        for (const auto &e : resolved) {
+        for (int entryIndex = 0; entryIndex < resolved.size(); ++entryIndex) {
+            const auto &e = resolved[entryIndex];
             if (e.sourceTrack >= 0 && e.sourceTrack < aTracks.size()) {
                 const auto &clips = aTracks[e.sourceTrack]->clips();
                 if (e.sourceClipIndex >= 0
                     && e.sourceClipIndex < clips.size()) {
                     audioRamps.append(clips[e.sourceClipIndex].speedRamp);
                     audioAtempoFlags.append(clips[e.sourceClipIndex].atempoEnabled);
+                    audioReversedFlags.append(
+                        sourceReversedFlags.value(entryIndex, false));
                     continue;
                 }
             }
             audioRamps.append(speedramp::SpeedRamp::identity());
             audioAtempoFlags.append(false);
+            audioReversedFlags.append(
+                sourceReversedFlags.value(entryIndex, false));
         }
+        m_player->setAudioSequence(resolved, audioReversedFlags);
         if (auto *mix = m_player->audioMixer()) {
             mix->setSpeedRamps(audioRamps);
             mix->setAtempoFlags(audioAtempoFlags);
@@ -4240,6 +4270,14 @@ void MainWindow::setupMenuBar()
     auto *speedRampDialogAction = editMenu->addAction("速度 / 持続時間...");
     speedRampDialogAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_R));
     connect(speedRampDialogAction, &QAction::triggered, this, &MainWindow::openSpeedRampDialog);
+
+    m_reverseClipAction = editMenu->addAction(QStringLiteral("逆再生"));
+    m_reverseClipAction->setObjectName(QStringLiteral("action_reverse_clip"));
+    m_reverseClipAction->setCheckable(true);
+    connect(m_reverseClipAction, &QAction::triggered,
+            this, &MainWindow::toggleClipReversed);
+    m_menuHelpEntries.append({m_reverseClipAction,
+        QStringLiteral("選んだクリップを後ろから再生します。リンクした映像と音声にも同時に適用します。")});
 
     editMenu->addSeparator();
 
@@ -7280,6 +7318,17 @@ void MainWindow::updateEditActions()
     m_pasteAction->setEnabled(m_timeline->hasClipboard());
     m_undoAction->setEnabled(m_timeline->canUndo());
     m_redoAction->setEnabled(m_timeline->canRedo());
+    if (m_reverseClipAction) {
+        TrackKind kind = TrackKind::Video;
+        int trackIndex = -1;
+        int clipIndex = -1;
+        ClipInfo selectedClip;
+        const bool canReverse = selectedClipRef(
+            kind, trackIndex, clipIndex, &selectedClip);
+        const QSignalBlocker blocker(m_reverseClipAction);
+        m_reverseClipAction->setEnabled(canReverse);
+        m_reverseClipAction->setChecked(canReverse && selectedClip.reversed);
+    }
 }
 
 void MainWindow::updateTitle()
@@ -7490,17 +7539,68 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
                     : clip.timeRemapCurve;
                 if (curve.sourceFps <= 0.0)
                     curve.sourceFps = fps;
-                sourceFrameIndex = qMax(0, static_cast<int>(std::llround(
-                    (clip.inPoint + curve.srcTimeAt(localSeconds)) * curve.sourceFps)));
-                frame = timeremap::resolveFrame(curve, localSeconds, [this, clip, curve](int srcFrameIndex) {
-                    return decodeClipFrameByIndex(clip, srcFrameIndex, curve.sourceFps);
-                });
+                if (clip.reversed) {
+                    ClipInfo mappedClip = clip;
+                    mappedClip.timeRemapCurve = curve;
+                    double sourceTime =
+                        mappedClip.sourceSecondAtLocalTime(localSeconds);
+                    if (mappedClip.sourceTimeRunsBackwardAtLocalTime(
+                            localSeconds)) {
+                        sourceTime = qMax(mappedClip.inPoint,
+                                          sourceTime - 1.0 / curve.sourceFps);
+                    }
+                    sourceFrameIndex = qMax(
+                        0, static_cast<int>(std::llround(
+                               sourceTime * curve.sourceFps)));
+
+                    // resolveFrame consumes clip-relative source seconds. Pin
+                    // a one-key sampling curve to the already-composed source
+                    // time so its blend/optical-flow mode is retained.
+                    timeremap::TimeRemapCurve samplingCurve = curve;
+                    samplingCurve.keys.clear();
+                    samplingCurve.addKey(
+                        0.0, qMax(0.0, sourceTime - mappedClip.inPoint));
+                    frame = timeremap::resolveFrame(
+                        samplingCurve, 0.0,
+                        [this, clip, curve](int srcFrameIndex) {
+                            return decodeClipFrameByIndex(
+                                clip, srcFrameIndex, curve.sourceFps);
+                        });
+                } else {
+                    // Keep the pre-US-004 path byte-identical while reverse
+                    // is OFF, including its existing time-remap sampling.
+                    sourceFrameIndex = qMax(
+                        0, static_cast<int>(std::llround(
+                               (clip.inPoint
+                                + curve.srcTimeAt(localSeconds))
+                               * curve.sourceFps)));
+                    frame = timeremap::resolveFrame(
+                        curve, localSeconds,
+                        [this, clip, curve](int srcFrameIndex) {
+                            return decodeClipFrameByIndex(
+                                clip, srcFrameIndex, curve.sourceFps);
+                        });
+                }
+            } else if (clip.reversed) {
+                double sourceTime = clip.sourceSecondAtLocalTime(localSeconds);
+                if (clip.sourceTimeRunsBackwardAtLocalTime(localSeconds)) {
+                    sourceTime = qMax(clip.inPoint,
+                                      sourceTime - 1.0 / fps);
+                }
+                sourceFrameIndex = qMax(
+                    0, static_cast<int>(std::llround(sourceTime * fps)));
+                frame = decodeClipFrameAtSourceTime(clip, sourceTime);
             } else {
+                // Preserve the legacy special-compositor mapping exactly for
+                // every existing project where reverse remains OFF.
                 const double clipOut = clipSourceOutPoint(clip);
-                const double sourceTime = qBound(clip.inPoint,
-                                                 clip.inPoint + localSeconds * qMax(clip.speed, 0.0001),
-                                                 clipOut);
-                sourceFrameIndex = qMax(0, static_cast<int>(std::llround(sourceTime * fps)));
+                const double sourceTime = qBound(
+                    clip.inPoint,
+                    clip.inPoint
+                        + localSeconds * qMax(clip.speed, 0.0001),
+                    clipOut);
+                sourceFrameIndex = qMax(
+                    0, static_cast<int>(std::llround(sourceTime * fps)));
                 frame = decodeClipFrameAtSourceTime(clip, sourceTime);
             }
 
@@ -8372,6 +8472,35 @@ bool MainWindow::saveProjectToPath(const QString &filePath, QString *errorMessag
     return true;
 }
 
+bool MainWindow::selectedClipRef(TrackKind &kind, int &trackIdx, int &clipIdx,
+                                 ClipInfo *clip) const
+{
+    if (!m_timeline)
+        return false;
+
+    const auto findSelected = [&](const QVector<TimelineTrack *> &tracks,
+                                  TrackKind candidateKind) {
+        for (int i = 0; i < tracks.size(); ++i) {
+            const TimelineTrack *track = tracks.at(i);
+            const int selected = track ? track->selectedClip() : -1;
+            if (!track || selected < 0 || selected >= track->clipCount())
+                continue;
+            kind = candidateKind;
+            trackIdx = i;
+            clipIdx = selected;
+            if (clip)
+                *clip = track->clips().at(selected);
+            return true;
+        }
+        return false;
+    };
+    if (findSelected(m_timeline->videoTracks(), TrackKind::Video))
+        return true;
+    if (findSelected(m_timeline->audioTracks(), TrackKind::Audio))
+        return true;
+    return false;
+}
+
 bool MainWindow::openProjectFromPath(const QString &filePath, QString *errorMessage)
 {
     const QString path = filePath.trimmed();
@@ -9157,6 +9286,28 @@ void MainWindow::setClipSpeed()
         m_timeline->setClipSpeed(speed);
         statusBar()->showMessage(QString("Clip speed: %1x").arg(speed));
     }
+}
+
+void MainWindow::toggleClipReversed(bool reversed)
+{
+    TrackKind kind = TrackKind::Video;
+    int trackIndex = -1;
+    int clipIndex = -1;
+    ClipInfo clip;
+    if (!m_timeline
+        || !selectedClipRef(kind, trackIndex, clipIndex, &clip)
+        || !m_timeline->setClipReversed(kind, trackIndex,
+                                        clipIndex, reversed, true)) {
+        updateEditActions();
+        statusBar()->showMessage(QStringLiteral("逆再生を変更できるクリップを選択してください"),
+                                 3000);
+        return;
+    }
+    statusBar()->showMessage(
+        reversed ? QStringLiteral("逆再生を有効にしました")
+                 : QStringLiteral("逆再生を解除しました"),
+        3000);
+    updateEditActions();
 }
 
 void MainWindow::setClipVolume()

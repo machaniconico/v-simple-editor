@@ -324,6 +324,7 @@ private slots:
     void markIn();
     void markOut();
     void setClipSpeed();
+    void toggleClipReversed(bool reversed);
     void addTextOverlay();
     void manageTextOverlays();
     void exportTextOverlays();
@@ -701,6 +702,8 @@ private:
     static QString brushClipId(int trackIdx, int clipIdx);
     static QString particleClipKey(const ClipInfo &clip);
     bool selectedVideoClipRef(int &trackIdx, int &clipIdx, ClipInfo *clip = nullptr) const;
+    bool selectedClipRef(TrackKind &kind, int &trackIdx, int &clipIdx,
+                         ClipInfo *clip = nullptr) const;
     double clipTimelineStartSeconds(int trackIdx, int clipIdx) const;
     double clipSourceTimeAtPlayheadSeconds(int trackIdx, int clipIdx, const ClipInfo &clip) const;
     QImage decodeClipFrameAtSourceTime(const ClipInfo &clip, double sourceTimeSeconds) const;
@@ -818,6 +821,7 @@ private:
     QAction *m_undoAction;
     QAction *m_redoAction;
     QAction *m_snapAction;
+    QAction *m_reverseClipAction = nullptr;
     QAction *m_colorManagementAction = nullptr;
     Exporter *m_exporter;
     QString m_projectFilePath; // current .veditor file

@@ -175,6 +175,80 @@ const ClipInfo *clipForPlaybackEntry(const Timeline *timeline, const PlaybackEnt
     return &clips[entry.sourceClipIndex];
 }
 
+ReversePlaybackKey playbackEntryKey(const PlaybackEntry &entry)
+{
+    return {
+        TrackKey{
+            entry.filePath,
+            qRound64(entry.clipIn * 1000.0),
+            entry.sourceTrack,
+            entry.sourceClipIndex
+        },
+        qRound64(entry.timelineStart * AV_TIME_BASE)
+    };
+}
+
+bool playbackEntryIsReversed(const Timeline *timeline,
+                             const PlaybackEntry &entry,
+                             const QHash<ReversePlaybackKey, bool> *states = nullptr)
+{
+    if (states) {
+        const auto state = states->constFind(playbackEntryKey(entry));
+        if (state != states->constEnd())
+            return state.value();
+    }
+    const ClipInfo *clip = clipForPlaybackEntry(timeline, entry);
+    return clip && clip->reversed;
+}
+
+bool playbackEntrySourceRunsBackwardAt(
+    const Timeline *timeline,
+    const PlaybackEntry &entry,
+    int64_t timelineUs,
+    const QHash<ReversePlaybackKey, bool> *states = nullptr)
+{
+    if (!playbackEntryIsReversed(timeline, entry, states))
+        return false;
+    const ClipInfo *clip = clipForPlaybackEntry(timeline, entry);
+    if (!clip || clip->isSequenceReference())
+        return true;
+    const double timelineSec = static_cast<double>(timelineUs) / AV_TIME_BASE;
+    return clip->sourceTimeRunsBackwardAtLocalTime(
+        qMax(0.0, timelineSec - entry.timelineStart));
+}
+
+int64_t decodableSourcePositionUs(const Timeline *timeline,
+                                  const PlaybackEntry &entry,
+                                  int64_t timelineUs,
+                                  int64_t mappedSourceUs,
+                                  int64_t frameDurationUs,
+                                  const QHash<ReversePlaybackKey, bool> *states = nullptr)
+{
+    if (!playbackEntrySourceRunsBackwardAt(
+            timeline, entry, timelineUs, states)) {
+        return mappedSourceUs;
+    }
+    double sourceIn = entry.clipIn;
+    double sourceOut = entry.clipOut;
+    if (const ClipInfo *clip = clipForPlaybackEntry(timeline, entry);
+        clip && !clip->isSequenceReference()) {
+        sourceIn = clip->inPoint;
+        sourceOut = clip->outPoint > 0.0
+            ? clip->outPoint : clip->duration;
+    }
+    const int64_t inUs = qRound64(sourceIn * AV_TIME_BASE);
+    const int64_t outUs = qRound64(sourceOut * AV_TIME_BASE);
+    // sourceSecondAtLocalTime() intentionally maps timeline boundaries to
+    // source boundaries (t=start -> outPoint). A video frame occupies the
+    // interval ending at that boundary, so reverse decoding must request the
+    // immediately preceding source frame. Without this one-frame conversion,
+    // the last frame is displayed twice and the first frame is omitted.
+    const int64_t sourceFrameUs = qMax<int64_t>(1, frameDurationUs);
+    const int64_t lastFrameUs = qMax(
+        inUs, outUs - sourceFrameUs);
+    return qBound(inUs, mappedSourceUs - sourceFrameUs, lastFrameUs);
+}
+
 bool isNullObjectPath(const QString &path)
 {
     return clipgeom::isNullObjectFilePath(path);
@@ -191,20 +265,28 @@ bool isAdjustmentEntry(const Timeline *timeline, const PlaybackEntry &entry)
     return clip && clip->isAdjustment;
 }
 
-bool trackHasActiveSequenceReference(const QVector<ClipInfo> &clips, double targetSec)
+const ClipInfo *activeClipOnTrack(const QVector<ClipInfo> &clips,
+                                  double targetSec)
 {
     if (clips.isEmpty())
-        return false;
+        return nullptr;
 
     double cursor = 0.0;
     for (const ClipInfo &clip : clips) {
         const double clipStart = cursor + qMax(0.0, clip.leadInSec);
         const double clipEnd = clipStart + clip.effectiveDuration();
         if (targetSec >= clipStart && targetSec < clipEnd)
-            return clip.isSequenceReference();
+            return &clip;
         cursor = clipEnd;
     }
-    return targetSec <= 0.0 && clips.first().isSequenceReference();
+    return targetSec <= 0.0 ? &clips.first() : nullptr;
+}
+
+bool trackHasActiveSequenceReference(const QVector<ClipInfo> &clips,
+                                     double targetSec)
+{
+    const ClipInfo *clip = activeClipOnTrack(clips, targetSec);
+    return clip && clip->isSequenceReference();
 }
 
 bool timelineHasActiveSequenceReference(const Timeline *timeline, qint64 timelineUsec)
@@ -217,6 +299,75 @@ bool timelineHasActiveSequenceReference(const Timeline *timeline, qint64 timelin
             continue;
         if (trackHasActiveSequenceReference(track->clips(), targetSec))
             return true;
+    }
+    return false;
+}
+
+bool sequenceTreeHasReversedVideoClip(
+    const QVector<TimelineSequence> &sequences,
+    const QString &sequenceId,
+    QSet<QString> &visited,
+    int depth = 0)
+{
+    if (sequenceId.isEmpty() || depth > 8 || visited.contains(sequenceId))
+        return false;
+    visited.insert(sequenceId);
+
+    const TimelineSequence *sequence = nullptr;
+    for (const TimelineSequence &candidate : sequences) {
+        if (candidate.id == sequenceId) {
+            sequence = &candidate;
+            break;
+        }
+    }
+    if (!sequence)
+        return false;
+
+    for (const QVector<ClipInfo> &track : sequence->videoTracks) {
+        for (const ClipInfo &clip : track) {
+            if (clip.reversed)
+                return true;
+            if (!clip.isSequenceReference())
+                continue;
+            QString childId = clip.sequenceRefId;
+            if (childId.isEmpty()) {
+                childId = timeline_nesting::sequenceIdFromClipFilePath(
+                    clip.filePath);
+            }
+            if (sequenceTreeHasReversedVideoClip(
+                    sequences, childId, visited, depth + 1)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool timelineHasActiveReversedSequenceReference(
+    const Timeline *timeline, qint64 timelineUsec)
+{
+    if (!timeline)
+        return false;
+    const double targetSec = static_cast<double>(timelineUsec) / AV_TIME_BASE;
+    const QVector<TimelineSequence> sequences = timeline->sequences();
+    for (const TimelineTrack *track : timeline->videoTracks()) {
+        if (!track || track->isHidden())
+            continue;
+        const ClipInfo *clip = activeClipOnTrack(track->clips(), targetSec);
+        if (!clip || !clip->isSequenceReference())
+            continue;
+        if (clip->reversed)
+            return true;
+        QString sequenceId = clip->sequenceRefId;
+        if (sequenceId.isEmpty()) {
+            sequenceId = timeline_nesting::sequenceIdFromClipFilePath(
+                clip->filePath);
+        }
+        QSet<QString> visited;
+        if (sequenceTreeHasReversedVideoClip(
+                sequences, sequenceId, visited)) {
+            return true;
+        }
     }
     return false;
 }
@@ -1553,7 +1704,8 @@ void VideoPlayer::loadFile(const QString &filePath)
     undotrace::log("loadFile:exit");
 }
 
-void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
+void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries,
+                              const QVector<bool> &reversedFlags)
 {
     undotrace::log("setSeq:enter");
     qInfo() << "VideoPlayer::setSequence count=" << entries.size();
@@ -1574,6 +1726,13 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
     // Subsequent re-emits (proxy promote, edit, scrub) already carry the
     // user's prior playing/paused state via Iteration 10 boundary auto-resume.
     const bool seqWasEmpty = m_sequence.isEmpty();
+    const QHash<ReversePlaybackKey, bool> previousReverseStates = m_reverseStates;
+    PlaybackEntry previousActiveEntry;
+    const bool hadPreviousActiveEntry = m_activeEntry >= 0
+        && m_activeEntry < m_sequence.size();
+    const int previousActiveIndex = m_activeEntry;
+    if (hadPreviousActiveEntry)
+        previousActiveEntry = m_sequence[m_activeEntry];
 
     // V3 sprint — preserve drag-edit target across sequenceChanged round-trips.
     // Timeline::setClipVideoTransform fires sequenceChanged on every drag event,
@@ -1604,12 +1763,28 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
 
     m_sequence = entries;
     const Timeline *timeline = m_glPreview ? m_glPreview->timeline() : nullptr;
+    m_reverseStates.clear();
+    m_reverseStates.reserve(m_sequence.size());
     if (timeline) {
-        for (PlaybackEntry &entry : m_sequence) {
+        for (int entryIndex = 0; entryIndex < m_sequence.size(); ++entryIndex) {
+            PlaybackEntry &entry = m_sequence[entryIndex];
+            const ReversePlaybackKey key = playbackEntryKey(entry);
+            const bool reversed = entryIndex < reversedFlags.size()
+                ? reversedFlags[entryIndex]
+                : playbackEntryIsReversed(timeline, entry);
+            m_reverseStates.insert(key, reversed);
             if (!entry.layerStyle.isIdentity())
                 continue;
             if (const ClipInfo *clip = clipForPlaybackEntry(timeline, entry))
                 entry.layerStyle = clip->layerStyle;
+        }
+    } else {
+        for (int entryIndex = 0; entryIndex < m_sequence.size(); ++entryIndex) {
+            const PlaybackEntry &entry = m_sequence[entryIndex];
+            const ReversePlaybackKey key = playbackEntryKey(entry);
+            m_reverseStates.insert(
+                key, entryIndex < reversedFlags.size()
+                    ? reversedFlags[entryIndex] : false);
         }
     }
     m_sequenceDurationUs = totalUs;
@@ -1751,12 +1926,36 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
 
     const auto &target = m_sequence[desiredIdx];
     const bool needFileSwitch = (target.filePath != m_loadedFilePath) || !m_formatCtx;
+    const ReversePlaybackKey targetKey = playbackEntryKey(target);
+    const bool reverseStateChanged = previousReverseStates.contains(targetKey)
+        && previousReverseStates.value(targetKey)
+            != m_reverseStates.value(targetKey, false);
+    const auto changedDouble = [](double before, double after) {
+        return !qFuzzyCompare(before + 1.0, after + 1.0);
+    };
+    const bool reverseMappingFeatureActive =
+        m_reverseStates.value(targetKey, false)
+        || previousReverseStates.value(targetKey, false)
+        || timelineHasActiveReversedSequenceReference(timeline, clamped);
+    const bool sourceMappingChanged =
+        reverseMappingFeatureActive
+        && hadPreviousActiveEntry
+        && previousActiveIndex == desiredIdx
+        && (changedDouble(previousActiveEntry.clipIn, target.clipIn)
+            || changedDouble(previousActiveEntry.clipOut, target.clipOut)
+            || changedDouble(previousActiveEntry.timelineStart,
+                             target.timelineStart)
+            || changedDouble(previousActiveEntry.timelineEnd,
+                             target.timelineEnd)
+            || changedDouble(previousActiveEntry.speed, target.speed));
     // Idempotency: if the structurally identical entry is already active and
     // the file is already loaded, skip the seek entirely so back-to-back
     // sequenceChanged emissions (e.g. video track + audio track both
     // emitting modified() during a single addClip) don't repeatedly disturb
     // the mixer and cause audible artifacts.
-    const bool entryStructurallyChanged = needFileSwitch || (m_activeEntry != desiredIdx);
+    const bool entryStructurallyChanged = needFileSwitch
+        || (m_activeEntry != desiredIdx) || reverseStateChanged
+        || sourceMappingChanged;
 
     // Snapshot playback state BEFORE loadFile+resetDecoder tear down the
     // playback timer, so we can resurrect it after the file swap completes.
@@ -1783,9 +1982,20 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
     m_timelinePositionUs = clamped;
 
     if (entryStructurallyChanged) {
-        const int64_t localUs = entryLocalPositionUs(desiredIdx, clamped);
+        const bool nestedSequencePreview =
+            timelineHasActiveReversedSequenceReference(timeline, clamped);
+        const int64_t localUs = decodableSourcePositionUs(
+            timeline, target, clamped,
+            entryLocalPositionUs(desiredIdx, clamped),
+            m_frameDurationUs, &m_reverseStates);
         undotrace::log("setSeq:beforeSeek");
-        seekInternal(localUs, true, true);
+        seekInternal(localUs, !nestedSequencePreview, true);
+        if (nestedSequencePreview
+            && !displayNestedSequenceFrameAt(timeline, clamped)) {
+            // Offline/missing nested media keeps the historic flattened
+            // decoder fallback instead of leaving the prior frame visible.
+            seekInternal(localUs, true, true);
+        }
         undotrace::log("setSeq:afterSeek");
     }
 
@@ -1845,13 +2055,14 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries)
     undotrace::log("setSeq:exit");
 }
 
-void VideoPlayer::setAudioSequence(const QVector<PlaybackEntry> &entries)
+void VideoPlayer::setAudioSequence(const QVector<PlaybackEntry> &entries,
+                                   const QVector<bool> &reversedFlags)
 {
     qInfo() << "VideoPlayer::setAudioSequence count=" << entries.size();
     const bool hadEntries = m_audioSequenceHadEntries;
     m_audioSequenceHadEntries = !entries.isEmpty();
     if (!m_mixer) return;
-    m_mixer->setSequence(entries);
+    m_mixer->setSequence(entries, reversedFlags);
     if (entries.isEmpty()) {
         m_mixer->stop();
         return;
@@ -1893,11 +2104,27 @@ void VideoPlayer::setSpeedRamps(const QVector<speedramp::SpeedRamp> &ramps)
 {
     qInfo() << "VideoPlayer::setSpeedRamps count=" << ramps.size()
             << "(sequence size=" << m_sequence.size() << ")";
+    const bool activeRampChanged = m_activeEntry >= 0
+        && m_activeEntry < m_speedRamps.size()
+        && m_activeEntry < ramps.size()
+        && !(m_speedRamps[m_activeEntry] == ramps[m_activeEntry]);
     m_speedRamps = ramps;
     if (m_speedRamps.size() != m_sequence.size()) {
         qWarning()
             << "VideoPlayer::setSpeedRamps SIZE MISMATCH — entries past"
             << m_speedRamps.size() << "fall back to identity ramp";
+    }
+    const Timeline *timeline = m_glPreview ? m_glPreview->timeline() : nullptr;
+    const bool activeReversed = m_activeEntry >= 0
+        && m_activeEntry < m_sequence.size()
+        && playbackEntryIsReversed(
+            timeline, m_sequence[m_activeEntry], &m_reverseStates);
+    const bool reverseMappingFeatureActive = activeReversed
+        || timelineHasActiveReversedSequenceReference(
+            timeline, m_timelinePositionUs);
+    if (activeRampChanged && reverseMappingFeatureActive
+        && !m_playing && sequenceActive()) {
+        seekToTimelineUs(m_timelinePositionUs, /*precise=*/true);
     }
 }
 
@@ -1952,6 +2179,22 @@ int64_t VideoPlayer::entryLocalPositionUs(int entryIdx, int64_t timelineUs) cons
     const double tSec = static_cast<double>(timelineUs) / AV_TIME_BASE;
     const double offsetIntoEntry = qMax(0.0, tSec - e.timelineStart);
     const double speed = (e.speed > 0.0) ? e.speed : 1.0;
+    const Timeline *timeline = m_glPreview ? m_glPreview->timeline() : nullptr;
+    const ClipInfo *clip = clipForPlaybackEntry(timeline, e);
+    if (playbackEntryIsReversed(timeline, e, &m_reverseStates)) {
+        ClipInfo mappedClip{};
+        if (clip && !clip->isSequenceReference()) {
+            mappedClip = *clip;
+        } else {
+            mappedClip.inPoint = e.clipIn;
+            mappedClip.outPoint = e.clipOut;
+            mappedClip.duration = e.clipOut;
+            mappedClip.speed = speed;
+        }
+        mappedClip.reversed = true;
+        return qRound64(mappedClip.sourceSecondAtLocalTime(offsetIntoEntry)
+                        * AV_TIME_BASE);
+    }
     // US-INT-2 Phase A: ramp-aware reprojection. The legacy uniform
     // `clip.speed` (carried on PlaybackEntry as `e.speed`) and the
     // per-clip SpeedRamp curve compose multiplicatively — first scale
@@ -1981,6 +2224,23 @@ int64_t VideoPlayer::fileLocalToTimelineUs(int entryIdx, int64_t fileLocalUs) co
     const auto &e = m_sequence[entryIdx];
     const double fileLocalSec = static_cast<double>(fileLocalUs) / AV_TIME_BASE;
     const double speed = (e.speed > 0.0) ? e.speed : 1.0;
+    const Timeline *timeline = m_glPreview ? m_glPreview->timeline() : nullptr;
+    const ClipInfo *clip = clipForPlaybackEntry(timeline, e);
+    if (playbackEntryIsReversed(timeline, e, &m_reverseStates)) {
+        ClipInfo mappedClip{};
+        if (clip && !clip->isSequenceReference()) {
+            mappedClip = *clip;
+        } else {
+            mappedClip.inPoint = e.clipIn;
+            mappedClip.outPoint = e.clipOut;
+            mappedClip.duration = e.clipOut;
+            mappedClip.speed = speed;
+        }
+        mappedClip.reversed = true;
+        const double timelineSec = e.timelineStart
+            + mappedClip.localSecondAtSourceTime(fileLocalSec);
+        return qRound64(timelineSec * AV_TIME_BASE);
+    }
     // US-INT-2 Phase B: ramp-aware inverse. Mirror the entryLocalPositionUs
     // forward path (offsetIntoEntry * speed → timelineToSourceUs → +clipIn).
     // Mathematical inverse modulo ~1 us integer truncation; stepForward's
@@ -2002,6 +2262,32 @@ int64_t VideoPlayer::fileLocalToTimelineUs(int entryIdx, int64_t fileLocalUs) co
         qMax(0.0, static_cast<double>(scaledTlUs) / speed / AV_TIME_BASE);
     const double timelineSec = e.timelineStart + offsetIntoEntry;
     return static_cast<int64_t>(timelineSec * AV_TIME_BASE);
+}
+
+bool VideoPlayer::displayNestedSequenceFrameAt(const Timeline *timeline,
+                                               int64_t timelineUs)
+{
+    if (!timelineHasActiveReversedSequenceReference(timeline, timelineUs))
+        return false;
+    QSize renderSize = m_projectOutputSize.isValid()
+        ? m_projectOutputSize
+        : QSize(m_canvasWidth, m_canvasHeight);
+    if (renderSize.isEmpty() && m_codecCtx
+        && m_codecCtx->width > 0 && m_codecCtx->height > 0) {
+        renderSize = QSize(m_codecCtx->width, m_codecCtx->height);
+    }
+    if (renderSize.isEmpty())
+        return false;
+
+    const QImage ssotFrame = tlrender::renderFrameAt(
+        timeline, timelineUs, renderSize);
+    if (ssotFrame.isNull())
+        return false;
+    if (m_glPreview)
+        m_glPreview->setCompositeBakedMode(true);
+    cachePreviewComposite(ssotFrame);
+    displayFrame(ssotFrame, true);
+    return true;
 }
 
 void VideoPlayer::applySequenceSliderRange()
@@ -2059,8 +2345,25 @@ bool VideoPlayer::seekToTimelineUs(int64_t timelineUs, bool precise)
 
     m_activeEntry = idx;
     m_timelinePositionUs = timelineUs;
-    const int64_t localUs = entryLocalPositionUs(idx, timelineUs);
-    const bool ok = seekInternal(localUs, true, precise);
+    const Timeline *previewTimeline = m_glPreview
+        ? m_glPreview->timeline() : nullptr;
+    const bool nestedSequencePreview =
+        timelineHasActiveReversedSequenceReference(
+            previewTimeline, timelineUs);
+    const int64_t localUs = decodableSourcePositionUs(
+        previewTimeline, e, timelineUs,
+        entryLocalPositionUs(idx, timelineUs),
+        m_frameDurationUs, &m_reverseStates);
+    bool ok = seekInternal(localUs, !nestedSequencePreview, precise);
+    const bool nestedSequenceRendered = nestedSequencePreview
+        && displayNestedSequenceFrameAt(previewTimeline, timelineUs);
+    if (nestedSequencePreview) {
+        if (!nestedSequenceRendered) {
+            // Keep the historic flattened-frame fallback when the nested
+            // renderer cannot produce an image (missing/offline media).
+            ok = seekInternal(localUs, true, precise);
+        }
+    }
     // Push the seeked-to clip's own transform so cross-clip seeks don't
     // inherit the previously-active clip's OBS-style scale/offset.
     // V3 sprint fix (architect NIT) — prefer edit-target transform on seek so
@@ -2078,7 +2381,7 @@ bool VideoPlayer::seekToTimelineUs(int64_t timelineUs, bool precise)
         // though it now needs the entry's scale applied. The next
         // playback tick re-sets the flag based on willComposite, so this
         // is always safe.
-        m_glPreview->setCompositeBakedMode(false);
+        m_glPreview->setCompositeBakedMode(nestedSequenceRendered);
     }
     m_suppressUiUpdates = prevSuppress;
 
@@ -2159,8 +2462,25 @@ bool VideoPlayer::advanceToEntry(int newEntryIdx)
         m_glPreview->setCompositeBakedMode(false);
     }
     m_timelinePositionUs = static_cast<int64_t>(next.timelineStart * AV_TIME_BASE);
-    const int64_t startLocalUs = static_cast<int64_t>(next.clipIn * AV_TIME_BASE);
-    if (!seekInternal(startLocalUs, true, true)) {
+    const Timeline *previewTimeline = m_glPreview
+        ? m_glPreview->timeline() : nullptr;
+    const int64_t startLocalUs = decodableSourcePositionUs(
+        previewTimeline, next, m_timelinePositionUs,
+        entryLocalPositionUs(newEntryIdx, m_timelinePositionUs),
+        m_frameDurationUs, &m_reverseStates);
+    const bool nestedSequencePreview =
+        timelineHasActiveReversedSequenceReference(
+            previewTimeline, m_timelinePositionUs);
+    bool seekOk = seekInternal(
+        startLocalUs, !nestedSequencePreview, true);
+    const bool nestedSequenceRendered = nestedSequencePreview
+        && displayNestedSequenceFrameAt(
+            previewTimeline, m_timelinePositionUs);
+    if (nestedSequencePreview && !nestedSequenceRendered)
+        seekOk = seekInternal(startLocalUs, true, true);
+    if (m_glPreview && nestedSequenceRendered)
+        m_glPreview->setCompositeBakedMode(true);
+    if (!seekOk) {
         m_suppressUiUpdates = prevSuppress;
         return false;
     }
@@ -2622,9 +2942,18 @@ void VideoPlayer::stepForward()
     // boundary", gap-cross behaviour) stay bit-exact.
     int64_t newPos;
     {
+        const Timeline *timeline = m_glPreview ? m_glPreview->timeline() : nullptr;
+        const bool activeReversed = m_activeEntry >= 0
+            && m_activeEntry < m_sequence.size()
+            && playbackEntryIsReversed(
+                timeline, m_sequence[m_activeEntry], &m_reverseStates);
+        const bool reverseTimelineDriven = activeReversed
+            || timelineHasActiveReversedSequenceReference(
+                timeline, m_timelinePositionUs);
         const bool haveRampHere = (m_activeEntry >= 0
                 && m_activeEntry < static_cast<int>(m_speedRamps.size()))
-            && !m_speedRamps[m_activeEntry].isIdentity();
+            && !m_speedRamps[m_activeEntry].isIdentity()
+            && !reverseTimelineDriven;
         if (haveRampHere) {
             const int64_t curSrc =
                 entryLocalPositionUs(m_activeEntry, m_timelinePositionUs);
@@ -2668,6 +2997,20 @@ void VideoPlayer::stepForward()
     // axis tracks frame-rate accurately (avoids ~1-frame skew compounding
     // on VFR or 23.976 sources). Force-forward to newPos ONLY when the
     // reprojection went backward (reproject regression scenario).
+    const Timeline *timeline = m_glPreview ? m_glPreview->timeline() : nullptr;
+    const bool activeReversed = m_activeEntry >= 0
+        && m_activeEntry < m_sequence.size()
+        && playbackEntryIsReversed(
+            timeline, m_sequence[m_activeEntry], &m_reverseStates);
+    const bool reverseTimelineDriven = activeReversed
+        || timelineHasActiveReversedSequenceReference(
+            timeline, m_timelinePositionUs);
+    if (reverseTimelineDriven) {
+        seekToTimelineUs(newPos, /*precise=*/true);
+        m_timelinePositionUs = newPos;
+        forceTimelineUiToCurrent();
+        return;
+    }
     if (decodeNextFrame(true)) {
         const int64_t projected = (m_activeEntry >= 0
                 && m_activeEntry < static_cast<int>(m_sequence.size()))
@@ -2705,9 +3048,18 @@ void VideoPlayer::stepBackward()
         // legacy timeline arithmetic for bit-exact compatibility.
         int64_t target;
         {
+            const Timeline *timeline = m_glPreview ? m_glPreview->timeline() : nullptr;
+            const bool activeReversed = m_activeEntry >= 0
+                && m_activeEntry < m_sequence.size()
+                && playbackEntryIsReversed(
+                    timeline, m_sequence[m_activeEntry], &m_reverseStates);
+            const bool reverseTimelineDriven = activeReversed
+                || timelineHasActiveReversedSequenceReference(
+                    timeline, m_timelinePositionUs);
             const bool haveRampHere = (m_activeEntry >= 0
                     && m_activeEntry < static_cast<int>(m_speedRamps.size()))
-                && !m_speedRamps[m_activeEntry].isIdentity();
+                && !m_speedRamps[m_activeEntry].isIdentity()
+                && !reverseTimelineDriven;
             if (haveRampHere) {
                 const int64_t curSrc =
                     entryLocalPositionUs(m_activeEntry, m_timelinePositionUs);
@@ -3245,7 +3597,13 @@ void VideoPlayer::displayFrame(const QImage &image, bool overlaysAlreadyBaked)
                 m_glPreview->setStabilizerKeyframes(ae.stabilizerKeyframes);
                 const double T = static_cast<double>(m_timelinePositionUs)
                                / static_cast<double>(AV_TIME_BASE);
-                const double srcSec = ae.clipIn + (T - ae.timelineStart) * ae.speed;
+                const Timeline *timeline = m_glPreview
+                    ? m_glPreview->timeline() : nullptr;
+                const double srcSec = playbackEntryIsReversed(
+                                          timeline, ae, &m_reverseStates)
+                    ? static_cast<double>(entryLocalPositionUs(
+                          m_activeEntry, m_timelinePositionUs)) / AV_TIME_BASE
+                    : ae.clipIn + (T - ae.timelineStart) * ae.speed;
                 m_glPreview->setStabilizerSourceTimeUs(
                     static_cast<qint64>(srcSec * 1.0e6));
             } else {
@@ -4196,7 +4554,18 @@ void VideoPlayer::updatePositionUi()
         // produced the bogus 10628s seekTo leak into AudioMixer (see
         // .omc/state/v2ff_rca.md). The 2-frame acceptance window admits
         // decoder-driven progression; explicit seeks bypass via the seek flags.
-        if (m_activeEntry >= 0 && m_activeEntry < m_sequence.size()) {
+        const Timeline *previewTimeline = m_glPreview
+            ? m_glPreview->timeline() : nullptr;
+        const bool activeReversed = m_activeEntry >= 0
+            && m_activeEntry < m_sequence.size()
+            && playbackEntryIsReversed(previewTimeline,
+                                       m_sequence[m_activeEntry],
+                                       &m_reverseStates);
+        const bool reverseTimelineDriven = activeReversed
+            || timelineHasActiveReversedSequenceReference(
+                previewTimeline, m_timelinePositionUs);
+        if (!reverseTimelineDriven
+            && m_activeEntry >= 0 && m_activeEntry < m_sequence.size()) {
             const int64_t projected =
                 fileLocalToTimelineUs(m_activeEntry, m_currentPositionUs);
             const int64_t baseFrameUs = (m_frameDurationUs > 0)
@@ -4272,6 +4641,24 @@ bool VideoPlayer::seekInternal(int64_t positionUs, bool displayFrame, bool preci
         const QImage image = frameToImage(displayable);
         if (image.isNull())
             return false;
+        const Timeline *previewTimeline = m_glPreview
+            ? m_glPreview->timeline() : nullptr;
+        const bool activeReversed = sequenceActive()
+            && m_activeEntry >= 0 && m_activeEntry < m_sequence.size()
+            && playbackEntryIsReversed(previewTimeline,
+                                       m_sequence[m_activeEntry],
+                                       &m_reverseStates);
+        const bool reverseTimelineDriven = activeReversed
+            || timelineHasActiveReversedSequenceReference(
+                previewTimeline, m_timelinePositionUs);
+        if (reverseTimelineDriven) {
+            // The normal streaming path fills these caches in
+            // presentDecodedFrame(). Reverse playback seeks instead, so keep
+            // the compositor's V1 source current here as well.
+            m_lastV1RawFrame = image;
+            m_lastSourceFrame = image;
+            m_lastSourceFrameHasBakedText = false;
+        }
         // This path displays a non-baked frame.
         QImage displayImage = image;
         if (sequenceActive()
@@ -4281,13 +4668,14 @@ bool VideoPlayer::seekInternal(int64_t positionUs, bool displayFrame, bool preci
             displayImage = applyVfxFootageControls(displayImage, entry);
             displayImage = applyPreviewClipMask(
                 displayImage,
-                m_glPreview ? m_glPreview->timeline() : nullptr,
+                previewTimeline,
                 entry,
                 static_cast<double>(targetUs) / AV_TIME_BASE,
                 QSize(displayable->width, displayable->height));
         }
         m_lastFrameOdtApplied = false;
-        this->displaySeekFrameConformed(displayImage);
+        if (!reverseTimelineDriven || !m_deferDisplayThisTick)
+            this->displaySeekFrameConformed(displayImage);
         m_currentPositionUs = targetUs;
         updatePositionUi();
         return true;
@@ -4990,6 +5378,7 @@ void VideoPlayer::handlePlaybackTick()
         qint64 expectedFileLocalUs = 0;
         qint64 clipInUs = 0;
         qint64 clipOutUs = 0;
+        bool reversed = false;
     };
     QVector<V2PrefetchJob> v2PrefetchJobs;
     QFuture<void> v2PrefetchFuture;
@@ -5011,9 +5400,14 @@ void VideoPlayer::handlePlaybackTick()
                 continue;
             V2PrefetchJob job;
             job.d = d;
-            job.expectedFileLocalUs = entryLocalPositionUs(idx, m_timelinePositionUs);
+            job.expectedFileLocalUs = decodableSourcePositionUs(
+                previewTimeline, e, m_timelinePositionUs,
+                entryLocalPositionUs(idx, m_timelinePositionUs),
+                d->frameDurationUs, &m_reverseStates);
             job.clipInUs  = static_cast<int64_t>(e.clipIn  * AV_TIME_BASE);
             job.clipOutUs = static_cast<int64_t>(e.clipOut * AV_TIME_BASE);
+            job.reversed = playbackEntryIsReversed(
+                previewTimeline, e, &m_reverseStates);
             v2PrefetchJobs.append(job);
         }
         // MAJOR-1: when 2+ V2 overlays are active AND threadedPool gate is on
@@ -5032,7 +5426,8 @@ void VideoPlayer::handlePlaybackTick()
             v2PrefetchFuture = QtConcurrent::run([this, jobs = v2PrefetchJobs]() mutable {
                 for (V2PrefetchJob &j : jobs) {
                     runOverlayDecodeForDecoder(j.d, j.expectedFileLocalUs,
-                                               j.clipInUs, j.clipOutUs);
+                                               j.clipInUs, j.clipOutUs,
+                                               j.reversed);
                 }
             });
         }
@@ -5059,32 +5454,70 @@ void VideoPlayer::handlePlaybackTick()
 
     bool advanced = false;
     if (m_playbackSpeed >= 0.0) {
-        // Drift correction runs BEFORE the display decode so the frame the
-        // user sees this tick is always the freshest one, not the tail of a
-        // skip-decode batch. Helper short-circuits on J-cut/L-cut.
-        if (traceTick)
-            sectionMark = tickTimer.nsecsElapsed();
-        const int driftSkipped = correctVideoDriftAgainstAudioClock();
-        if (traceTick) {
-            m_tickTraceDriftNs += tickTimer.nsecsElapsed() - sectionMark;
-            m_tickTraceSkipped += driftSkipped;
-            sectionMark = tickTimer.nsecsElapsed();
-        }
-        QElapsedTimer decodeTimer;
-        if (traceStall)
-            decodeTimer.start();
-        advanced = decodeNextFrame(true);
-        if (traceTick)
-            m_tickTraceDecodeNs += tickTimer.nsecsElapsed() - sectionMark;
-        if (traceStall && decodeTimer.isValid()) {
-            const qint64 elapsedMs = decodeTimer.elapsed();
-            if (elapsedMs >= kStallThresholdWaitMs) {
-                qWarning().noquote()
-                    << QStringLiteral("[stall>=%1ms] decodeNextFrame(V1) %2ms tlUs=%3 entry=%4")
-                           .arg(kStallThresholdWaitMs)
-                           .arg(elapsedMs)
-                           .arg(m_timelinePositionUs)
-                           .arg(m_activeEntry);
+        const bool activeReversed = sequenceActive()
+            && m_activeEntry >= 0 && m_activeEntry < m_sequence.size()
+            && playbackEntryIsReversed(previewTimeline,
+                                       m_sequence[m_activeEntry],
+                                       &m_reverseStates);
+        const bool reverseTimelineDriven = activeReversed
+            || timelineHasActiveReversedSequenceReference(
+                previewTimeline, m_timelinePositionUs);
+        if (reverseTimelineDriven) {
+            // FFmpeg's normal decoder loop streams forward. A reversed clip
+            // instead advances only the timeline clock and precisely seeks to
+            // the shared decreasing source-time mapping for each display tick.
+            // This keeps preview semantics identical to renderFrameAt.
+            if (traceTick)
+                sectionMark = tickTimer.nsecsElapsed();
+            const int64_t frameStep = m_frameDurationUs > 0
+                ? m_frameDurationUs : (AV_TIME_BASE / 30);
+            const int64_t deltaUs = qMax<int64_t>(
+                1, qRound64(static_cast<double>(frameStep)
+                            * qMax(0.01, m_playbackSpeed)));
+            const int64_t entryEndUs = qRound64(
+                m_sequence[m_activeEntry].timelineEnd * AV_TIME_BASE);
+            const int64_t targetTimelineUs = qMin(
+                entryEndUs, m_timelinePositionUs + deltaUs);
+            const int64_t targetSourceUs = decodableSourcePositionUs(
+                previewTimeline, m_sequence[m_activeEntry], targetTimelineUs,
+                entryLocalPositionUs(m_activeEntry, targetTimelineUs),
+                m_frameDurationUs, &m_reverseStates);
+            // seekInternal publishes positionChanged before returning. Move
+            // the canonical timeline cursor first so reverse playback never
+            // emits the previous tick position immediately before the new one.
+            m_timelinePositionUs = targetTimelineUs;
+            advanced = seekInternal(targetSourceUs, true, true);
+            forceTimelineUiToCurrent();
+            if (traceTick)
+                m_tickTraceDecodeNs += tickTimer.nsecsElapsed() - sectionMark;
+        } else {
+            // Drift correction runs BEFORE the display decode so the frame the
+            // user sees this tick is always the freshest one, not the tail of a
+            // skip-decode batch. Helper short-circuits on J-cut/L-cut.
+            if (traceTick)
+                sectionMark = tickTimer.nsecsElapsed();
+            const int driftSkipped = correctVideoDriftAgainstAudioClock();
+            if (traceTick) {
+                m_tickTraceDriftNs += tickTimer.nsecsElapsed() - sectionMark;
+                m_tickTraceSkipped += driftSkipped;
+                sectionMark = tickTimer.nsecsElapsed();
+            }
+            QElapsedTimer decodeTimer;
+            if (traceStall)
+                decodeTimer.start();
+            advanced = decodeNextFrame(true);
+            if (traceTick)
+                m_tickTraceDecodeNs += tickTimer.nsecsElapsed() - sectionMark;
+            if (traceStall && decodeTimer.isValid()) {
+                const qint64 elapsedMs = decodeTimer.elapsed();
+                if (elapsedMs >= kStallThresholdWaitMs) {
+                    qWarning().noquote()
+                        << QStringLiteral("[stall>=%1ms] decodeNextFrame(V1) %2ms tlUs=%3 entry=%4")
+                               .arg(kStallThresholdWaitMs)
+                               .arg(elapsedMs)
+                               .arg(m_timelinePositionUs)
+                               .arg(m_activeEntry);
+                }
             }
         }
     } else {
@@ -5255,6 +5688,7 @@ void VideoPlayer::handlePlaybackTick()
                 qint64 expectedFileLocalUs = 0;
                 qint64 clipInUs = 0;
                 qint64 clipOutUs = 0;
+                bool reversed = false;
                 bool decodedOk = false;
             };
             QVector<OverlayJob> overlayJobs;
@@ -5334,9 +5768,14 @@ void VideoPlayer::handlePlaybackTick()
                 OverlayJob job;
                 job.d = d;
                 job.seqIdx = idx;
-                job.expectedFileLocalUs = entryLocalPositionUs(idx, m_timelinePositionUs);
+                job.expectedFileLocalUs = decodableSourcePositionUs(
+                    previewTimeline, e, m_timelinePositionUs,
+                    entryLocalPositionUs(idx, m_timelinePositionUs),
+                    d->frameDurationUs, &m_reverseStates);
                 job.clipInUs = static_cast<int64_t>(e.clipIn * AV_TIME_BASE);
                 job.clipOutUs = static_cast<int64_t>(e.clipOut * AV_TIME_BASE);
+                job.reversed = playbackEntryIsReversed(
+                    previewTimeline, e, &m_reverseStates);
                 overlayJobs.append(job);
             }
             // Pass 2 (workers): parallel decode. Each job touches only its
@@ -5349,7 +5788,7 @@ void VideoPlayer::handlePlaybackTick()
                 QtConcurrent::blockingMap(overlayJobs, [this](OverlayJob &job) {
                     job.decodedOk = runOverlayDecodeForDecoder(
                         job.d, job.expectedFileLocalUs,
-                        job.clipInUs, job.clipOutUs);
+                        job.clipInUs, job.clipOutUs, job.reversed);
                 });
                 if (stallTraceEnabled() && mapTimer.isValid()) {
                     const qint64 elapsedMs = mapTimer.elapsed();
@@ -5670,7 +6109,16 @@ void VideoPlayer::handlePlaybackTick()
         && m_playbackSpeed >= 0.0) {
         const auto &active = m_sequence[m_activeEntry];
         const int64_t entryEndLocalUs = static_cast<int64_t>(active.clipOut * AV_TIME_BASE);
-        const bool reachedEntryEnd = (m_currentPositionUs >= entryEndLocalUs);
+        const bool activeReversed = playbackEntryIsReversed(
+            previewTimeline, active, &m_reverseStates);
+        const bool reverseTimelineDriven = activeReversed
+            || timelineHasActiveReversedSequenceReference(
+                previewTimeline, m_timelinePositionUs);
+        const int64_t entryEndTimelineUs = qRound64(
+            active.timelineEnd * AV_TIME_BASE);
+        const bool reachedEntryEnd = reverseTimelineDriven
+            ? (m_timelinePositionUs >= entryEndTimelineUs)
+            : (m_currentPositionUs >= entryEndLocalUs);
         // NB: previously also triggered on `decodeStopped = !advanced`, but
         // that fires for any transient decode stall (cold open of the new
         // primary after overlay rotation, V2 prefetch worker starving the
@@ -6962,7 +7410,8 @@ bool VideoPlayer::decodePoolFrame(TrackDecoder *d, bool ensureRgb)
 bool VideoPlayer::runOverlayDecodeForDecoder(TrackDecoder *d,
                                               qint64 expectedFileLocalUs,
                                               qint64 clipInUs,
-                                              qint64 clipOutUs)
+                                              qint64 clipOutUs,
+                                              bool reverseSourceOrder)
 {
     if (!d)
         return false;
@@ -6971,8 +7420,10 @@ bool VideoPlayer::runOverlayDecodeForDecoder(TrackDecoder *d,
     const int64_t drift = expectedFileLocalUs - d->currentPositionUs;
 
     // Case B: large drift (rewind / non-1x speed mismatch / post-seek). Re-seek.
-    if (d->firstFrameDecoded
-        && (drift < -halfFrame * 2 || drift > d->frameDurationUs * 4)) {
+    if (reverseSourceOrder
+        || (d->firstFrameDecoded
+            && (drift < -halfFrame * 2
+                || drift > d->frameDurationUs * 4))) {
         const int64_t targetUs = qBound<int64_t>(clipInUs, expectedFileLocalUs, clipOutUs);
         av_seek_frame(d->formatCtx, -1, targetUs, AVSEEK_FLAG_BACKWARD);
         avcodec_flush_buffers(d->codecCtx);
@@ -7072,22 +7523,30 @@ bool VideoPlayer::harvestOverlayLayer(const PlaybackEntry &e, int seqIdx, Decode
     if (!d)
         return false;
 
-    const int64_t expectedFileLocalUs = entryLocalPositionUs(seqIdx, m_timelinePositionUs);
+    const Timeline *previewTimeline = m_glPreview
+        ? m_glPreview->timeline() : nullptr;
+    const int64_t expectedFileLocalUs = decodableSourcePositionUs(
+        previewTimeline, e, m_timelinePositionUs,
+        entryLocalPositionUs(seqIdx, m_timelinePositionUs),
+        d->frameDurationUs, &m_reverseStates);
     const int64_t halfFrame = qMax<int64_t>(d->frameDurationUs / 2, 1);
+    const bool reversed = playbackEntryIsReversed(
+        previewTimeline, e, &m_reverseStates);
     bool ok = true;
     // Phase 1e Win #6: skip catch-up entirely when a worker prefetch already
     // brought the decoder current. Without this, the parallel-path optimization
     // would still re-enter the decode loop on the main thread and decode an
     // extra frame past the playhead. firstFrameDecoded gates against fresh
     // decoders that have no usable lastFrameRgb yet.
-    if (d->firstFrameDecoded
+    if (!reversed && d->firstFrameDecoded
         && !d->lastFrameRgb.isNull()
         && d->currentPositionUs + halfFrame >= expectedFileLocalUs) {
         // Already current — no decode needed; just finalize.
     } else {
         const int64_t clipInUs  = static_cast<int64_t>(e.clipIn  * AV_TIME_BASE);
         const int64_t clipOutUs = static_cast<int64_t>(e.clipOut * AV_TIME_BASE);
-        ok = runOverlayDecodeForDecoder(d, expectedFileLocalUs, clipInUs, clipOutUs);
+        ok = runOverlayDecodeForDecoder(
+            d, expectedFileLocalUs, clipInUs, clipOutUs, reversed);
     }
     const bool finalized = finalizeOverlayFromDecoder(e, seqIdx, d, ok, out);
     if (finalized)

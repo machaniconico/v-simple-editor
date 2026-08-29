@@ -146,6 +146,7 @@ int runProxySelftestV2();
 int runRenderQueueAcesDecisionSelftest();
 int runRenderQueueFpsRationalSelftest();
 int runRightclickPausePrefSelftest();
+int runReverseClipSelftest();
 int runRippleDeleteSelftest();
 int runRgbParadeSelftest();
 int runShortcutSelftest();
@@ -657,6 +658,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Current-frame clipboard MIME + live Edit action/renderFrameAt integration (17 gates)" },
     { "freeze-frame",      "VEDITOR_FREEZE_FRAME_SELFTEST",        runFreezeFrameSelftest,        true,
       "Freeze Frame: split at playhead, one-key hold curve, renderFrameAt export hold, save/load sync, one-step undo" },
+    { "reverse-clip",      "VEDITOR_REVERSE_CLIP_SELFTEST",        runReverseClipSelftest,        true,
+      "Reverse clip: source-time fold, speed composition, default-omit persistence, reversed PCM, renderer end-frame parity" },
     { "clip-curves",       "VEDITOR_CLIP_CURVES_SELFTEST",         runClipCurvesSelftest,         true,
       "Clip RGB/Luma curves: unset/identity byte identity, renderFrameAt reflection, ProjectFile round-trip" },
     { "hsl-secondary",     "VEDITOR_HSL_SECONDARY_SELFTEST",       runHslSecondarySelftest,       true,
@@ -738,7 +741,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "transcript-highlighter", "VEDITOR_TRANSCRIPT_HIGHLIGHTER_SELFTEST", runTranscriptHighlighterSelftest, true,
       "Transcript highlighter scaffold smoke" },
     { "mcp",              "VEDITOR_MCP_SELFTEST",                runMcpSelftest,                true,
-      "MCP server: JSON-RPC framing + tool registry dispatch + HTTP transport auth + write-tool validation + AI chat helpers (113 gates)" },
+      "MCP server: JSON-RPC framing + tool registry dispatch + HTTP transport auth + write-tool validation + AI chat helpers (124 gates)" },
     { "auto-clip-gen",     "VEDITOR_AUTO_CLIP_GEN_SELFTEST",      runAutoClipGenSelftest,        true,
       "Auto clip generator scaffold smoke" },
     { "planar",            "VEDITOR_PLANAR_SELFTEST",             runPlanarSelftest,             true,

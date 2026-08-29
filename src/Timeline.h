@@ -125,8 +125,22 @@ struct AudioChannelModePlaybackBinding {
     AudioChannelMode mode = AudioChannelMode::Stereo;
 };
 
+struct AudioReversedPlaybackBinding {
+    PlaybackEntry entry;
+    bool reversed = false;
+};
+
+using VideoReversedPlaybackBinding = AudioReversedPlaybackBinding;
+
 void setAudioChannelModePlaybackBindings(const QVector<AudioChannelModePlaybackBinding> &bindings);
 AudioChannelMode audioChannelModeForPlaybackEntry(const PlaybackEntry &entry);
+void setAudioReversedPlaybackBindings(
+    const QVector<AudioReversedPlaybackBinding> &bindings);
+QVector<bool> audioReversedFlagsForPlaybackEntries(
+    const QVector<PlaybackEntry> &entries);
+void setVideoReversedPlaybackBindings(
+    const QVector<VideoReversedPlaybackBinding> &bindings);
+bool videoReversedForPlaybackEntry(const PlaybackEntry &entry);
 void applyAudioChannelModeToInterleavedStereoS16(int16_t *samples,
                                                 int frameCount,
                                                 AudioChannelMode mode);
@@ -136,7 +150,8 @@ QString buildExportAudioMixEntryFilterChain(int inputIndex,
                                             const QString &clipOut,
                                             int delayMs,
                                             const QString &volumeExpression,
-                                            AudioChannelMode mode);
+                                            AudioChannelMode mode,
+                                            bool reversed = false);
 
 struct ClipInfo {
     QString filePath;
@@ -151,6 +166,7 @@ struct ClipInfo {
     double outPoint = 0.0;
     double leadInSec = 0.0; // leading gap before the clip on the timeline, grows on left-trim to keep the right edge fixed
     double speed = 1.0;   // 0.25x - 4.0x
+    bool reversed = false; // OFF by default; fold the resolved source time around inPoint + outPoint
     double volume = 1.0;  // 0.0 - 2.0 (0=mute, 1=normal, 2=boost)
     double pan = 0.0;     // -1.0..+1.0 balance pan (-1=L, 0=center, +1=R)
     AudioChannelMode audioChannelMode = AudioChannelMode::Stereo;
@@ -298,6 +314,13 @@ struct ClipInfo {
         double out = (outPoint > 0.0) ? outPoint : duration;
         return (out - inPoint) / speed;
     }
+
+    // Shared preview/export source-time mapping. Existing speed, speed-ramp,
+    // or time-remap mapping is resolved first; reverse playback then folds
+    // that source position around the clip's trimmed in/out interval.
+    double sourceSecondAtLocalTime(double localSec) const;
+    double localSecondAtSourceTime(double sourceSec) const;
+    bool sourceTimeRunsBackwardAtLocalTime(double localSec) const;
 
     bool isSequenceReference() const {
         return !sequenceRefId.isEmpty()
@@ -633,6 +656,8 @@ public:
     bool setClipPropertyByIndex(bool audio, int trackIndex, int clipIndex,
                                 const QString &property, double value, QString *err,
                                 bool applyToLinked = false);
+    bool setClipReversed(TrackKind kind, int trackIndex, int clipIndex,
+                         bool reversed, bool applyToLinked = true);
     bool setClipLabel(TrackKind kind, int trackIndex, int clipIndex, ClipLabel label);
     bool selectClipByIndex(bool audio, int trackIndex, int clipIndex, QString *err);
     void clearSelection();

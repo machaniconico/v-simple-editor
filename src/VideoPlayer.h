@@ -69,6 +69,22 @@ inline uint qHash(const TrackKey &k, uint seed = 0) noexcept
          ^ qHash(k.sourceClipIndex, seed + 0x85ebca6bu);
 }
 
+struct ReversePlaybackKey {
+    TrackKey trackKey;
+    qint64 timelineStartUs = 0;
+    bool operator==(const ReversePlaybackKey &other) const noexcept
+    {
+        return trackKey == other.trackKey
+            && timelineStartUs == other.timelineStartUs;
+    }
+};
+
+inline uint qHash(const ReversePlaybackKey &k, uint seed = 0) noexcept
+{
+    return qHash(k.trackKey, seed)
+         ^ qHash(k.timelineStartUs, seed + 0x27d4eb2du);
+}
+
 class GLPreview;
 class QResizeEvent;
 
@@ -100,7 +116,8 @@ public:
     // non-empty, seek/playback are interpreted in timeline-space and files are
     // switched automatically at clip boundaries. Empty argument falls back to
     // single-file mode (current loaded file is left intact).
-    void setSequence(const QVector<PlaybackEntry> &entries);
+    void setSequence(const QVector<PlaybackEntry> &entries,
+                     const QVector<bool> &reversedFlags = {});
     // Parallel speed-ramp array for the video sequence. Must be called
     // after setSequence with the same index alignment. Identity ramps are
     // the default so callers may omit this call for non-ramped sequences.
@@ -109,7 +126,8 @@ public:
     // FFmpeg decoder pool + ring buffers and mixes every active entry into
     // a single QAudioSink output, so unlinked J-cut/L-cut clips and stacked
     // A2/A3/... tracks all sound simultaneously.
-    void setAudioSequence(const QVector<PlaybackEntry> &entries);
+    void setAudioSequence(const QVector<PlaybackEntry> &entries,
+                          const QVector<bool> &reversedFlags = {});
     AudioMixer *audioMixer() { return m_mixer; }
     void setMuted(bool muted);
     bool isMuted() const { return m_muted; }
@@ -375,6 +393,8 @@ private:
     QVector<int> findActiveEntriesAt(int64_t timelineUs) const;
     int64_t entryLocalPositionUs(int entryIdx, int64_t timelineUs) const;
     int64_t fileLocalToTimelineUs(int entryIdx, int64_t fileLocalUs) const;
+    bool displayNestedSequenceFrameAt(const Timeline *timeline,
+                                      int64_t timelineUs);
     bool seekToTimelineUs(int64_t timelineUs, bool precise);
     bool advanceToEntry(int newEntryIdx);
     // Phase 1e Win #16 (Iteration 9) — Premiere Pro-style decoder hot-swap.
@@ -506,7 +526,8 @@ private:
     // the per-decoder TrackDecoder state — no pool / sequence / Qt object
     // access — so it is safe to invoke from a QtConcurrent worker thread.
     bool runOverlayDecodeForDecoder(TrackDecoder *d, qint64 expectedFileLocalUs,
-                                    qint64 clipInUs, qint64 clipOutUs);
+                                    qint64 clipInUs, qint64 clipOutUs,
+                                    bool reverseSourceOrder);
     // Main-thread post-processing: builds DecodedLayer fields from the
     // decoder's lastFrameRgb, falling back to the eviction grace pool when
     // the decoder produced nothing.
@@ -635,6 +656,11 @@ private:
     // the existing decoder loop is untouched); m_timelinePositionUs tracks the
     // resolved timeline position when sequence mode is active.
     QVector<PlaybackEntry> m_sequence;
+    // Last reverse state per resolved playback entry. PlaybackEntry itself
+    // intentionally stays unchanged, so this side table lets setSequence()
+    // detect a reverse toggle and refresh a paused preview at the same
+    // playhead instead of treating the update as structurally identical.
+    QHash<ReversePlaybackKey, bool> m_reverseStates;
     int m_activeEntry = -1;
     // Phase 1e Win #16 (Iteration 9) — boundary preroll de-dup. Set to the
     // sequence index of the entry we last asked acquireDecoderForClip to

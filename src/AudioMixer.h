@@ -43,11 +43,16 @@ class AudioDecodeRunner;
 struct AudioTrackKey {
     QString filePath;
     qint64 clipInMs = 0;
+    // Zero preserves the exact pre-US-004 key/hash. Reversed entries start at
+    // timelineStartUs+1 and increment on collision so repeated nested leaves
+    // can each own a distinct whole-clip PCM buffer.
+    qint64 reverseInstanceUs = 0;
     int sourceTrack = 0;
     int sourceClipIndex = -1;
     bool operator==(const AudioTrackKey &o) const noexcept {
         return filePath == o.filePath
             && clipInMs == o.clipInMs
+            && reverseInstanceUs == o.reverseInstanceUs
             && sourceTrack == o.sourceTrack
             && sourceClipIndex == o.sourceClipIndex;
     }
@@ -58,6 +63,10 @@ inline uint qHash(const AudioTrackKey &k, uint seed = 0) noexcept {
     // with hash_combine the bits diffuse properly.
     uint h = qHash(k.filePath, seed);
     h ^= qHash(k.clipInMs, seed) + 0x9e3779b9u + (h << 6) + (h >> 2);
+    if (k.reverseInstanceUs != 0) {
+        h ^= qHash(k.reverseInstanceUs, seed)
+            + 0x9e3779b9u + (h << 6) + (h >> 2);
+    }
     h ^= qHash(k.sourceTrack, seed) + 0x9e3779b9u + (h << 6) + (h >> 2);
     h ^= qHash(k.sourceClipIndex, seed) + 0x9e3779b9u + (h << 6) + (h >> 2);
     return h;
@@ -68,6 +77,11 @@ inline constexpr bool resolveAudioAtempoEnabled(bool envForce,
 {
     return envForce || perClipFlag;
 }
+
+// Reverse whole interleaved PCM frames while preserving channel order.
+// channelCount=1 is also the scalar helper exercised by reverse-clip G4.
+QVector<float> reversedPcmFrames(const QVector<float> &samples,
+                                 int channelCount = 1);
 
 class AudioMixer : public QObject {
     Q_OBJECT
@@ -96,7 +110,8 @@ public:
     // Replace the active timeline schedule. Opens decoders for new entries
     // and releases decoders for entries no longer present. Safe from GUI
     // thread; locks m_controlMutex briefly.
-    void setSequence(const QVector<PlaybackEntry> &entries);
+    void setSequence(const QVector<PlaybackEntry> &entries,
+                     const QVector<bool> &reversedFlags = {});
     // Parallel speed-ramp array aligned to setSequence entries.
     void setSpeedRamps(const QVector<speedramp::SpeedRamp> &ramps);
     // Parallel per-entry atempo opt-in flags aligned to setSequence entries.
@@ -343,6 +358,7 @@ private:
     void seekEntryToTimeline(AudioDecoderEntry *e, int64_t timelineUs);
     void refillRingForEntry(AudioDecoderEntry *e, int targetBytes);
     void resampleAndAppend(AudioDecoderEntry *e);
+    bool prepareReversedPcm(AudioDecoderEntry *e);
     bool refillRings();                   // called by AudioDecodeRunner; returns whether work was done
 
     QAudioFormat m_format;

@@ -265,7 +265,9 @@ bool openVideoInput(const QString &path, AVFormatContext **fmtCtx,
 // video track reuses identical seek/decode/sws semantics. Returns a null
 // QImage on any failure (open / decode / sws) so the caller can skip the
 // layer gracefully — mirrors S2's "any failure -> null" contract.
-QImage decodeClipFrameNative(const QString &filePath, double sourceSec)
+QImage decodeClipFrameNative(const QString &filePath, double sourceSec,
+                             bool usePreviousSourceFrame = false,
+                             double sourceInSec = 0.0)
 {
     AVFormatContext *fmtCtx = nullptr;
     AVCodecContext *decCtx = nullptr;
@@ -276,7 +278,10 @@ QImage decodeClipFrameNative(const QString &filePath, double sourceSec)
     // Seek a hair before the wanted source pts using the same BACKWARD seek
     // Exporter uses for the clip in-point, then decode forward until a frame
     // at-or-after sourceSec arrives.
-    const int64_t seekTarget = static_cast<int64_t>(sourceSec * AV_TIME_BASE);
+    const double seekSourceSec = usePreviousSourceFrame
+        ? qMax(0.0, sourceSec - 0.000001)
+        : sourceSec;
+    const int64_t seekTarget = static_cast<int64_t>(seekSourceSec * AV_TIME_BASE);
     if (seekTarget > 0) {
         av_seek_frame(fmtCtx, -1, seekTarget, AVSEEK_FLAG_BACKWARD);
         avcodec_flush_buffers(decCtx);
@@ -285,6 +290,7 @@ QImage decodeClipFrameNative(const QString &filePath, double sourceSec)
     AVStream *vStream = fmtCtx->streams[videoIdx];
     AVPacket *packet = av_packet_alloc();
     AVFrame *frame = av_frame_alloc();
+    AVFrame *previousFrame = usePreviousSourceFrame ? av_frame_alloc() : nullptr;
     SwsContext *swsCtx = nullptr;
     QImage result;
 
@@ -362,6 +368,27 @@ QImage decodeClipFrameNative(const QString &filePath, double sourceSec)
         while (avcodec_receive_frame(decCtx, frame) == 0) {
             const double framePts =
                 static_cast<double>(frame->pts) * av_q2d(vStream->time_base);
+            if (previousFrame) {
+                // Reverse source positions denote the right-hand boundary of
+                // the wanted frame. Keep the last frame strictly before that
+                // boundary; at the trim in-point, use the first frame at-or-
+                // after it. This yields N-1..0 without duplicating N-1.
+                if (framePts + 1e-9 < sourceSec) {
+                    if (framePts + 1e-9 >= sourceInSec) {
+                        av_frame_unref(previousFrame);
+                        av_frame_ref(previousFrame, frame);
+                    }
+                    av_frame_unref(frame);
+                    continue;
+                }
+                if (previousFrame->data[0])
+                    buildResult(previousFrame);
+                else
+                    buildResult(frame);
+                av_frame_unref(frame);
+                decoded = !result.isNull();
+                break;
+            }
             // Same gate Exporter applies: skip frames before the wanted
             // source position; take the first frame at-or-after it.
             if (framePts + 1e-6 < sourceSec) {
@@ -380,6 +407,26 @@ QImage decodeClipFrameNative(const QString &filePath, double sourceSec)
     if (!decoded) {
         avcodec_send_packet(decCtx, nullptr);
         while (avcodec_receive_frame(decCtx, frame) == 0) {
+            if (previousFrame) {
+                const double framePts =
+                    static_cast<double>(frame->pts)
+                    * av_q2d(vStream->time_base);
+                if (framePts + 1e-9 < sourceSec) {
+                    if (framePts + 1e-9 >= sourceInSec) {
+                        av_frame_unref(previousFrame);
+                        av_frame_ref(previousFrame, frame);
+                    }
+                    av_frame_unref(frame);
+                    continue;
+                }
+                if (previousFrame->data[0])
+                    buildResult(previousFrame);
+                else
+                    buildResult(frame);
+                av_frame_unref(frame);
+                decoded = !result.isNull();
+                break;
+            }
             buildResult(frame);
             av_frame_unref(frame);
             decoded = true;
@@ -387,8 +434,18 @@ QImage decodeClipFrameNative(const QString &filePath, double sourceSec)
         }
     }
 
+    // A reversed source position is a frame's right-hand boundary. At EOF no
+    // following frame exists to close the search, so present the retained
+    // predecessor. The opt-in keeps non-reversed rendering byte-identical.
+    if (!decoded && previousFrame && previousFrame->data[0]) {
+        buildResult(previousFrame);
+        decoded = !result.isNull();
+    }
+
     if (swsCtx)
         sws_freeContext(swsCtx);
+    if (previousFrame)
+        av_frame_free(&previousFrame);
     av_frame_free(&frame);
     av_packet_free(&packet);
     avcodec_free_context(&decCtx);
@@ -901,12 +958,18 @@ int activeClipOnTrack(const QVector<ClipInfo> &clips, double targetSec,
     return -1;
 }
 
-double sourceSecondForClipAtLocalTime(const ClipInfo &clip, double localSec)
+double sourceSecondForClipAtLocalTime(const ClipInfo &clip, double localSec,
+                                      bool reverseCompositionActive)
 {
+    if (reverseCompositionActive)
+        return clip.sourceSecondAtLocalTime(localSec);
+
+    // Preserve the legacy export path byte-for-byte while reverse playback
+    // is OFF. The shared ClipInfo mapper is entered only when this clip or an
+    // ancestor/descendant sequence participates in reverse composition.
     const double sourceOut = (clip.outPoint > 0.0) ? clip.outPoint : clip.duration;
     if (clip.timeRemapCurve.keys.isEmpty())
         return clip.inPoint + localSec * clip.speed;
-
     const double remappedLocal =
         qMax(0.0, clip.timeRemapCurve.srcTimeAt(qMax(0.0, localSec)));
     if (sourceOut <= clip.inPoint)
@@ -1067,13 +1130,62 @@ QImage renderFrameFromTracks(const Timeline *timeline,
                              const QVector<Light3DState> &projectLights,
                              const QVector3D &projectLightViewPosition,
                              bool applyTimelineGlobals,
-                             bool applyProjectLighting);
+                             bool applyProjectLighting,
+                             bool sampleFromLeftBoundary);
 
 QString resolveSequenceRefIdForRender(const ClipInfo &clip)
 {
     if (!clip.sequenceRefId.isEmpty())
         return clip.sequenceRefId;
     return timeline_nesting::sequenceIdFromClipFilePath(clip.filePath);
+}
+
+bool sequenceContainsReversedVideoClip(
+    const QVector<TimelineSequence> &sequences,
+    const QString &sequenceId,
+    QVector<QString> &visited,
+    int depth = 0)
+{
+    if (sequenceId.isEmpty() || depth > kMaxNestedSequenceDepth
+        || visited.contains(sequenceId)) {
+        return false;
+    }
+    const TimelineSequence *sequence = findSequenceById(sequences, sequenceId);
+    if (!sequence)
+        return false;
+
+    visited.append(sequenceId);
+    for (const QVector<ClipInfo> &track : sequence->videoTracks) {
+        for (const ClipInfo &child : track) {
+            if (child.reversed) {
+                visited.removeLast();
+                return true;
+            }
+            if (!child.isSequenceReference())
+                continue;
+            if (sequenceContainsReversedVideoClip(
+                    sequences, resolveSequenceRefIdForRender(child),
+                    visited, depth + 1)) {
+                visited.removeLast();
+                return true;
+            }
+        }
+    }
+    visited.removeLast();
+    return false;
+}
+
+bool clipParticipatesInReverseComposition(
+    const ClipInfo &clip,
+    const QVector<TimelineSequence> &sequences)
+{
+    if (clip.reversed)
+        return true;
+    if (!clip.isSequenceReference())
+        return false;
+    QVector<QString> visited;
+    return sequenceContainsReversedVideoClip(
+        sequences, resolveSequenceRefIdForRender(clip), visited);
 }
 
 QImage renderSequenceReferenceFrame(const Timeline *timeline,
@@ -1084,7 +1196,8 @@ QImage renderSequenceReferenceFrame(const Timeline *timeline,
                                     const QVector<TimelineSequence> &sequenceSnapshot,
                                     QVector<QString> &sequenceStack,
                                     const QVector<Light3DState> &projectLights,
-                                    const QVector3D &projectLightViewPosition)
+                                    const QVector3D &projectLightViewPosition,
+                                    bool sampleFromLeftBoundary)
 {
     if (!timeline || outSize.isEmpty())
         return QImage();
@@ -1119,7 +1232,8 @@ QImage renderSequenceReferenceFrame(const Timeline *timeline,
         /*applyTimelineGlobals=*/false,
         // The nested result is lit once as the sequence-reference layer in
         // the parent stack. Applying it in both stacks would double-light it.
-        /*applyProjectLighting=*/false);
+        /*applyProjectLighting=*/false,
+        sampleFromLeftBoundary);
     sequenceStack.removeLast();
 
     return rendered.isNull() ? transparentFrame(outSize) : rendered;
@@ -1128,18 +1242,35 @@ QImage renderSequenceReferenceFrame(const Timeline *timeline,
 QImage renderClipSourceFrame(const Timeline *timeline,
                              const ClipInfo &clip,
                              double sourceSec,
+                             double clipLocalSec,
                              QSize outSize,
                              int sequenceDepth,
                              const QVector<TimelineSequence> &sequenceSnapshot,
                              QVector<QString> &sequenceStack,
                              const QVector<Light3DState> &projectLights,
-                             const QVector3D &projectLightViewPosition)
+                             const QVector3D &projectLightViewPosition,
+                             bool sampleFromLeftBoundary)
 {
-    if (clip.isSequenceReference())
+    // `sampleFromLeftBoundary` carries an ancestor sequence's source-time
+    // direction. Compose it with this clip's resolved local direction. The
+    // special gate preserves the historic renderer exactly when no reverse
+    // operation participates, including legacy descending time-remap curves.
+    const bool reverseCompositionActive = sampleFromLeftBoundary
+        || clipParticipatesInReverseComposition(clip, sequenceSnapshot);
+    bool resolvedSampleFromLeft = false;
+    if (reverseCompositionActive) {
+        resolvedSampleFromLeft = sampleFromLeftBoundary
+            != clip.sourceTimeRunsBackwardAtLocalTime(clipLocalSec);
+    }
+    if (clip.isSequenceReference()) {
         return renderSequenceReferenceFrame(
             timeline, clip, sourceSec, outSize, sequenceDepth, sequenceSnapshot,
-            sequenceStack, projectLights, projectLightViewPosition);
-    return decodeClipFrameNative(clip.filePath, sourceSec);
+            sequenceStack, projectLights, projectLightViewPosition,
+            resolvedSampleFromLeft);
+    }
+    return decodeClipFrameNative(
+        clip.filePath, sourceSec,
+        resolvedSampleFromLeft, clip.inPoint);
 }
 
 QImage applyVfxFootageControls(const QImage &native, const ClipInfo &clip)
@@ -1163,7 +1294,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
                              const QVector<Light3DState> &projectLights,
                              const QVector3D &projectLightViewPosition,
                              bool applyTimelineGlobals,
-                             bool applyProjectLighting)
+                             bool applyProjectLighting,
+                             bool sampleFromLeftBoundary)
 {
     if (outSize.isEmpty())
         return QImage();
@@ -1180,7 +1312,10 @@ QImage renderFrameFromTracks(const Timeline *timeline,
     if (tracks.isEmpty())
         return QImage();
 
-    const double targetSec = static_cast<double>(usec) / 1'000'000.0;
+    const qint64 sampledUsec = sampleFromLeftBoundary
+        ? qMax<qint64>(0, usec - 1)
+        : usec;
+    const double targetSec = static_cast<double>(sampledUsec) / 1'000'000.0;
     QVector<ActiveAdjustmentClip> activeAdjustments;
 
     // ── Resolve + decode the V1 base layer ──────────────────────────────────
@@ -1219,7 +1354,11 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         // the legacy inPoint + local*speed path; one-key curves resolve to the
         // constant held source time used by computePlaybackSequence.
         const double v1LocalSec = targetSec - v1Start;            // >= 0
-        const double v1SourceSec = sourceSecondForClipAtLocalTime(v1Clip, v1LocalSec);
+        const bool v1ReverseComposition = sampleFromLeftBoundary
+            || clipParticipatesInReverseComposition(
+                v1Clip, sequenceSnapshot);
+        const double v1SourceSec = sourceSecondForClipAtLocalTime(
+            v1Clip, v1LocalSec, v1ReverseComposition);
         const bool v1HasKeyframes = v1Clip.keyframes.hasAnyKeyframes();
         v1Transform = v1HasKeyframes
             ? clipanim::effectiveTransformAt(v1Clip, v1LocalSec)
@@ -1242,9 +1381,9 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         } else {
 
         const QImage v1NativeRaw = renderClipSourceFrame(
-            timeline, v1Clip, v1SourceSec, outSize, sequenceDepth,
+            timeline, v1Clip, v1SourceSec, v1LocalSec, outSize, sequenceDepth,
             sequenceSnapshot, sequenceStack, projectLights,
-            projectLightViewPosition);
+            projectLightViewPosition, sampleFromLeftBoundary);
         if (v1NativeRaw.isNull())
             return QImage();
 
@@ -1269,9 +1408,10 @@ QImage renderFrameFromTracks(const Timeline *timeline,
             const EchoFrameProvider echoFrameProvider =
                 [&](double sampleSourceSec, double sampleLocalSec) -> QImage {
                     const QImage sampleRaw = renderClipSourceFrame(
-                        timeline, v1Clip, sampleSourceSec, outSize, sequenceDepth,
+                        timeline, v1Clip, sampleSourceSec, sampleLocalSec,
+                        outSize, sequenceDepth,
                         sequenceSnapshot, sequenceStack, projectLights,
-                        projectLightViewPosition);
+                        projectLightViewPosition, sampleFromLeftBoundary);
                     if (sampleRaw.isNull())
                         return QImage();
                     return gradeClipNativeFrame(
@@ -1396,7 +1536,10 @@ QImage renderFrameFromTracks(const Timeline *timeline,
             continue;
         const ClipInfo &c = clips[idx];
         const double localSec = targetSec - start;            // >= 0
-        const double srcSec = sourceSecondForClipAtLocalTime(c, localSec);
+        const bool reverseComposition = sampleFromLeftBoundary
+            || clipParticipatesInReverseComposition(c, sequenceSnapshot);
+        const double srcSec = sourceSecondForClipAtLocalTime(
+            c, localSec, reverseComposition);
         const bool cHasKeyframes = c.keyframes.hasAnyKeyframes();
         const clipgeom::ClipTransform cTransform = cHasKeyframes
             ? clipanim::effectiveTransformAt(c, localSec)
@@ -1434,8 +1577,10 @@ QImage renderFrameFromTracks(const Timeline *timeline,
             continue;
         }
         const QImage nativeRaw = renderClipSourceFrame(
-            timeline, c, srcSec, outSize, sequenceDepth, sequenceSnapshot,
-            sequenceStack, projectLights, projectLightViewPosition);
+            timeline, c, srcSec, localSec, outSize, sequenceDepth,
+            sequenceSnapshot,
+            sequenceStack, projectLights, projectLightViewPosition,
+            sampleFromLeftBoundary);
         if (nativeRaw.isNull())
             continue;
         // S4: grade each overlay clip in native resolution too (same per-clip
@@ -1457,9 +1602,10 @@ QImage renderFrameFromTracks(const Timeline *timeline,
             const EchoFrameProvider echoFrameProvider =
                 [&](double sampleSourceSec, double sampleLocalSec) -> QImage {
                     const QImage sampleRaw = renderClipSourceFrame(
-                        timeline, c, sampleSourceSec, outSize, sequenceDepth,
+                        timeline, c, sampleSourceSec, sampleLocalSec,
+                        outSize, sequenceDepth,
                         sequenceSnapshot, sequenceStack, projectLights,
-                        projectLightViewPosition);
+                        projectLightViewPosition, sampleFromLeftBoundary);
                     if (sampleRaw.isNull())
                         return QImage();
                     return gradeClipNativeFrame(
@@ -1722,9 +1868,10 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         if (!v1Clip.layerStyle.isIdentity())
             styledBase = layerstyle::apply(styledBase, v1Clip.layerStyle);
         const QImage adj = applyTimelineGlobals
-            ? applyAdjustmentLayers(styledBase, timeline, usec)
+            ? applyAdjustmentLayers(styledBase, timeline, sampledUsec)
             : styledBase;
-        return applyTextOverlays(adj, usec, &v1Clip, generatedCaptions);
+        return applyTextOverlays(
+            adj, sampledUsec, &v1Clip, generatedCaptions);
     }
 
     // ── Composite ──────────────────────────────────────────────────────────
@@ -2055,9 +2202,10 @@ QImage renderFrameFromTracks(const Timeline *timeline,
     // adjustment layer / the V1 clip has no text, preserving S3 multi-track
     // parity exactly.
     const QImage adj = applyTimelineGlobals
-        ? applyAdjustmentLayers(stacked, timeline, usec)
+        ? applyAdjustmentLayers(stacked, timeline, sampledUsec)
         : stacked;
-    return applyTextOverlays(adj, usec, &v1Clip, generatedCaptions);
+    return applyTextOverlays(
+        adj, sampledUsec, &v1Clip, generatedCaptions);
 }
 
 QImage renderFrameAtSingleWithSequenceSnapshot(
@@ -2088,7 +2236,8 @@ QImage renderFrameAtSingleWithSequenceSnapshot(
                                  projectLights,
                                  timeline->projectLightViewPosition(),
                                  /*applyTimelineGlobals=*/true,
-                                 /*applyProjectLighting=*/true);
+                                 /*applyProjectLighting=*/true,
+                                 /*sampleFromLeftBoundary=*/false);
 }
 
 } // namespace
@@ -2113,9 +2262,11 @@ QImage renderClipSourceFrameForEcho(const Timeline *timeline,
         static_cast<double>(timelineUsec) / 1'000'000.0);
 
     const QImage source = renderClipSourceFrame(
-        timeline, clip, sourceSeconds, outSize, /*sequenceDepth=*/0,
+        timeline, clip, sourceSeconds, clipLocalSeconds,
+        outSize, /*sequenceDepth=*/0,
         sequenceSnapshot, sequenceStack, projectLights,
-        timeline->projectLightViewPosition());
+        timeline->projectLightViewPosition(),
+        /*sampleFromLeftBoundary=*/false);
     if (source.isNull())
         return QImage();
     return gradeClipNativeFrame(

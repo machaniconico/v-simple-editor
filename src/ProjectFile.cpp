@@ -1795,6 +1795,8 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
     if (clip.label != ClipLabel::None)
         obj["label"] = clipLabelToString(clip.label);
     obj["speed"] = clip.speed;
+    if (clip.reversed)
+        obj["reversed"] = true;
     obj["volume"] = clip.volume;
     if (clip.pan != 0.0)
         obj["pan"] = clip.pan;
@@ -1897,6 +1899,7 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
     clip.linkGroup = obj["linkGroup"].toInt(0);
     clip.label = clipLabelFromString(obj["label"].toString());
     clip.speed = obj["speed"].toDouble(1.0);
+    clip.reversed = obj["reversed"].toBool(false);
     clip.volume = obj["volume"].toDouble(1.0);
     clip.pan = obj["pan"].toDouble(0.0);
     clip.audioChannelMode = obj.contains("audioChannelMode")

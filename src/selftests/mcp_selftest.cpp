@@ -1985,6 +1985,89 @@ int runMcpSelftest()
              : fail("G122 clip labels survive save/open and None is omitted",
                     QStringLiteral("project JSON or reopened timeline lost clip labels"));
 
+        TimelineTrack *reverseVideoTrack = projectTimeline->trackAt(false, 0);
+        TimelineTrack *reverseAudioTrack = projectTimeline->trackAt(true, 0);
+        ClipInfo reverseVideoClip = makeTestClip(
+            QStringLiteral("reverse-video"), 0);
+        ClipInfo reverseAudioClip = makeTestClip(
+            QStringLiteral("reverse-audio"), 0);
+        reverseVideoClip.linkGroup = 12304;
+        reverseAudioClip.linkGroup = 12304;
+        if (reverseVideoTrack)
+            reverseVideoTrack->setClips({reverseVideoClip});
+        if (reverseAudioTrack)
+            reverseAudioTrack->setClips({reverseAudioClip});
+        saveTestUndoBaseline();
+
+        const QJsonObject setReversedResponse = callProjectInfoTool(
+            223, QStringLiteral("set_clip_property"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 0},
+                {QStringLiteral("property"), QStringLiteral("reversed")},
+                {QStringLiteral("value"), true}
+            });
+        const QJsonObject reversedTimelineResponse = callProjectInfoTool(
+            224, QStringLiteral("get_timeline"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("all")}
+            });
+        const QJsonObject reversedPayload = toolPayload(setReversedResponse);
+        const QJsonArray reversedVideoClips = timelineTrackObject(
+            toolPayload(reversedTimelineResponse), QStringLiteral("video"), 0)
+                .value(QStringLiteral("clips")).toArray();
+        const QJsonArray reversedAudioClips = timelineTrackObject(
+            toolPayload(reversedTimelineResponse), QStringLiteral("audio"), 0)
+                .value(QStringLiteral("clips")).toArray();
+        const bool g123 = reverseVideoTrack && reverseAudioTrack
+            && !toolResult(setReversedResponse)
+                    .value(QStringLiteral("isError")).toBool(true)
+            && reversedPayload.value(QStringLiteral("ok")).toBool(false)
+            && reversedPayload.value(QStringLiteral("property")).toString()
+                   == QStringLiteral("reversed")
+            && reversedPayload.value(QStringLiteral("value")).isBool()
+            && reversedPayload.value(QStringLiteral("value")).toBool(false)
+            && reversedPayload.value(QStringLiteral("linkedApplied")).toBool(false)
+            && requiredOutputFieldsPresent(QStringLiteral("set_clip_property"),
+                                           reversedPayload)
+            && reverseVideoTrack->clips().first().reversed
+            && reverseAudioTrack->clips().first().reversed
+            && reversedVideoClips.size() == 1
+            && reversedAudioClips.size() == 1
+            && reversedVideoClips.first().toObject()
+                   .value(QStringLiteral("reversed")).toBool(false)
+            && reversedAudioClips.first().toObject()
+                   .value(QStringLiteral("reversed")).toBool(false);
+        g123 ? pass("G123 reversed set is reflected by get_timeline")
+             : fail("G123 reversed set is reflected by get_timeline",
+                    QStringLiteral("boolean mutation, linked clip, schema, or timeline output diverged"));
+
+        const QJsonObject reverseUndoResponse = callProjectInfoTool(
+            225, QStringLiteral("undo"), QJsonObject{});
+        const QJsonObject undoTimelineResponse = callProjectInfoTool(
+            226, QStringLiteral("get_timeline"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("all")}
+            });
+        const QJsonArray undoVideoClips = timelineTrackObject(
+            toolPayload(undoTimelineResponse), QStringLiteral("video"), 0)
+                .value(QStringLiteral("clips")).toArray();
+        const QJsonArray undoAudioClips = timelineTrackObject(
+            toolPayload(undoTimelineResponse), QStringLiteral("audio"), 0)
+                .value(QStringLiteral("clips")).toArray();
+        const bool g124 = toolPayload(reverseUndoResponse)
+                                .value(QStringLiteral("ok")).toBool(false)
+            && reverseVideoTrack && reverseAudioTrack
+            && !reverseVideoTrack->clips().first().reversed
+            && !reverseAudioTrack->clips().first().reversed
+            && undoVideoClips.size() == 1 && undoAudioClips.size() == 1
+            && !undoVideoClips.first().toObject()
+                    .value(QStringLiteral("reversed")).toBool(true)
+            && !undoAudioClips.first().toObject()
+                    .value(QStringLiteral("reversed")).toBool(true)
+            && !projectTimeline->undoManager()->canUndo();
+        g124 ? pass("G124 reversed is reverted by one undo")
+             : fail("G124 reversed is reverted by one undo",
+                    QStringLiteral("one undo did not restore linked reverse flags"));
+
         // 後続の get_frame fixture は空の V1/A1 へ media を 1 件ずつ取り込む。
         // roundtrip で再読込したクリップと undo 履歴をここで隔離する。
         const QVector<TimelineTrack *> tracks =
@@ -2015,6 +2098,8 @@ int runMcpSelftest()
         fail("G120 set_clip_label rejects an invalid label", QStringLiteral("Timeline was not available"));
         fail("G121 set_clip_label is reverted by one undo", QStringLiteral("Timeline was not available"));
         fail("G122 clip labels survive save/open and None is omitted", QStringLiteral("Timeline was not available"));
+        fail("G123 reversed set is reflected by get_timeline", QStringLiteral("Timeline was not available"));
+        fail("G124 reversed is reverted by one undo", QStringLiteral("Timeline was not available"));
     }
 
     const bool selectClipFieldsPresent =

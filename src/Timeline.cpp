@@ -55,6 +55,103 @@ static_assert(static_cast<int>(TrackMatteType::LumaMatte) == 3,
 static_assert(static_cast<int>(TrackMatteType::LumaInvertedMatte) == 4,
               "PlaybackEntry::matteTypeOrdinal 4 must mean TrackMatteType::LumaInvertedMatte");
 
+double ClipInfo::sourceSecondAtLocalTime(double localSec) const
+{
+    const double sourceOut = (outPoint > 0.0) ? outPoint : duration;
+    if (sourceOut <= inPoint)
+        return inPoint;
+
+    const double boundedLocal = qMax(0.0, localSec);
+    double sourceSecond = inPoint;
+    if (!timeRemapCurve.keys.isEmpty()) {
+        sourceSecond += qMax(0.0, timeRemapCurve.srcTimeAt(boundedLocal));
+    } else {
+        const double uniformSpeed = (speed > 0.0) ? speed : 1.0;
+        if (speedRamp.isIdentity()) {
+            sourceSecond += boundedLocal * uniformSpeed;
+        } else {
+            const qint64 scaledTimelineUs = qRound64(
+                boundedLocal * uniformSpeed * 1'000'000.0);
+            sourceSecond += static_cast<double>(
+                speedRamp.timelineToSourceUs(scaledTimelineUs)) / 1'000'000.0;
+        }
+    }
+
+    sourceSecond = qBound(inPoint, sourceSecond, sourceOut);
+    if (reversed)
+        sourceSecond = inPoint + sourceOut - sourceSecond;
+    return qBound(inPoint, sourceSecond, sourceOut);
+}
+
+double ClipInfo::localSecondAtSourceTime(double sourceSec) const
+{
+    const double sourceOut = (outPoint > 0.0) ? outPoint : duration;
+    if (sourceOut <= inPoint)
+        return 0.0;
+
+    double foldedSource = qBound(inPoint, sourceSec, sourceOut);
+    if (reversed)
+        foldedSource = inPoint + sourceOut - foldedSource;
+    const double targetOffset = qBound(0.0, foldedSource - inPoint,
+                                       sourceOut - inPoint);
+
+    if (!timeRemapCurve.keys.isEmpty()) {
+        const auto &keys = timeRemapCurve.keys;
+        if (keys.size() == 1)
+            return qMax(0.0, keys.first().outTime);
+        for (int i = 1; i < keys.size(); ++i) {
+            const auto &left = keys[i - 1];
+            const auto &right = keys[i];
+            const double lo = qMin(left.srcTime, right.srcTime);
+            const double hi = qMax(left.srcTime, right.srcTime);
+            if (targetOffset < lo || targetOffset > hi)
+                continue;
+            const double span = right.srcTime - left.srcTime;
+            if (qFuzzyIsNull(span))
+                return qMax(0.0, left.outTime);
+            const double fraction = (targetOffset - left.srcTime) / span;
+            return qMax(0.0, left.outTime
+                                 + fraction * (right.outTime - left.outTime));
+        }
+        const auto nearest = std::min_element(
+            keys.cbegin(), keys.cend(), [targetOffset](const auto &a, const auto &b) {
+                return qAbs(a.srcTime - targetOffset) < qAbs(b.srcTime - targetOffset);
+            });
+        return nearest == keys.cend() ? 0.0 : qMax(0.0, nearest->outTime);
+    }
+
+    const double uniformSpeed = (speed > 0.0) ? speed : 1.0;
+    if (speedRamp.isIdentity())
+        return targetOffset / uniformSpeed;
+    const qint64 sourceOffsetUs = qRound64(targetOffset * 1'000'000.0);
+    return qMax(0.0, static_cast<double>(
+        speedRamp.sourceToTimelineUs(sourceOffsetUs))
+        / uniformSpeed / 1'000'000.0);
+}
+
+bool ClipInfo::sourceTimeRunsBackwardAtLocalTime(double localSec) const
+{
+    const double localDuration = qMax(0.0, effectiveDuration());
+    const double boundedLocal = qBound(0.0, localSec, localDuration);
+    const double currentSource = sourceSecondAtLocalTime(boundedLocal);
+    constexpr double probeSec = 0.000001;
+    constexpr double sourceEpsilon = 1e-12;
+
+    if (boundedLocal < localDuration) {
+        const double nextLocal = qMin(localDuration, boundedLocal + probeSec);
+        const double delta = sourceSecondAtLocalTime(nextLocal) - currentSource;
+        if (qAbs(delta) > sourceEpsilon)
+            return delta < 0.0;
+    }
+    if (boundedLocal > 0.0) {
+        const double previousLocal = qMax(0.0, boundedLocal - probeSec);
+        const double delta = currentSource - sourceSecondAtLocalTime(previousLocal);
+        if (qAbs(delta) > sourceEpsilon)
+            return delta < 0.0;
+    }
+    return false;
+}
+
 namespace {
 // Transition badge geometry. The badge width grows with duration so the
 // user gets live visual feedback while dragging the resize handle (a 6 px
@@ -378,6 +475,91 @@ QString resolveSequenceRefId(const ClipInfo &clip)
     return timeline_nesting::sequenceIdFromClipFilePath(clip.filePath);
 }
 
+struct NestedSequenceIntervalMapping {
+    double timelineStart = 0.0;
+    double timelineEnd = 0.0;
+    bool runsBackward = false;
+};
+
+NestedSequenceIntervalMapping mapNestedSequenceInterval(
+    const ClipInfo &parentClip,
+    double parentTimelineStart,
+    double sourceIn,
+    double overlapStart,
+    double overlapEnd,
+    double parentSpeed,
+    bool reverseCompositionActive)
+{
+    // Preserve the legacy flattening arithmetic exactly while reverse is OFF.
+    // Once either side participates in reverse, resolve the parent's authored
+    // time-remap as well: a descending non-reversed parent composed with a
+    // reversed child runs forward and must keep video/audio on the same nested
+    // interval. The renderer enters the same shared mapper only when this
+    // reverse-composition flag is active, keeping reverse-OFF projects on the
+    // exact legacy path.
+    if (!reverseCompositionActive) {
+        return {
+            parentTimelineStart + (overlapStart - sourceIn) / parentSpeed,
+            parentTimelineStart + (overlapEnd - sourceIn) / parentSpeed,
+            false
+        };
+    }
+
+    const double localAtSourceStart =
+        parentClip.localSecondAtSourceTime(overlapStart);
+    const double localAtSourceEnd =
+        parentClip.localSecondAtSourceTime(overlapEnd);
+    return {
+        parentTimelineStart + qMin(localAtSourceStart, localAtSourceEnd),
+        parentTimelineStart + qMax(localAtSourceStart, localAtSourceEnd),
+        localAtSourceEnd + 1e-9 < localAtSourceStart
+    };
+}
+
+bool sequenceContainsReversedClip(
+    const QVector<TimelineSequence> &sequences,
+    const QString &sequenceId,
+    bool audio,
+    QVector<QString> &visited,
+    int depth = 0)
+{
+    if (sequenceId.isEmpty() || depth > 8
+        || visited.contains(sequenceId)) {
+        return false;
+    }
+    const TimelineSequence *sequence = nullptr;
+    for (const TimelineSequence &candidate : sequences) {
+        if (candidate.id == sequenceId) {
+            sequence = &candidate;
+            break;
+        }
+    }
+    if (!sequence)
+        return false;
+
+    visited.append(sequenceId);
+    const QVector<QVector<ClipInfo>> &tracks = audio
+        ? sequence->audioTracks : sequence->videoTracks;
+    for (const QVector<ClipInfo> &track : tracks) {
+        for (const ClipInfo &child : track) {
+            if (child.reversed) {
+                visited.removeLast();
+                return true;
+            }
+            if (!child.isSequenceReference())
+                continue;
+            if (sequenceContainsReversedClip(
+                    sequences, resolveSequenceRefId(child), audio,
+                    visited, depth + 1)) {
+                visited.removeLast();
+                return true;
+            }
+        }
+    }
+    visited.removeLast();
+    return false;
+}
+
 void upsertSequence(QVector<TimelineSequence> &sequences,
                     const TimelineSequence &sequence)
 {
@@ -695,12 +877,15 @@ QString buildExportAudioMixEntryFilterChain(int inputIndex,
                                             const QString &clipOut,
                                             int delayMs,
                                             const QString &volumeExpression,
-                                            AudioChannelMode mode)
+                                            AudioChannelMode mode,
+                                            bool reversed)
 {
     QStringList filters;
     filters << QStringLiteral("atrim=start=%1:end=%2")
-                   .arg(clipIn, clipOut)
-            << QStringLiteral("asetpts=PTS-STARTPTS")
+                   .arg(clipIn, clipOut);
+    if (reversed)
+        filters << QStringLiteral("areverse");
+    filters << QStringLiteral("asetpts=PTS-STARTPTS")
             << QStringLiteral("aresample=48000")
             << QStringLiteral("aformat=sample_fmts=fltp:channel_layouts=stereo");
 
@@ -2030,7 +2215,9 @@ void TimelineTrack::paintEvent(QPaintEvent *event)
         double dur = m_clips[i].effectiveDuration();
         int mins = static_cast<int>(dur) / 60;
         int secs = static_cast<int>(dur) % 60;
-        QString label = m_clips[i].displayName;
+        QString label = m_clips[i].reversed
+            ? QStringLiteral("◀ ") + m_clips[i].displayName
+            : m_clips[i].displayName;
         if (m_clips[i].speed != 1.0)
             label += QString(" [%1x]").arg(m_clips[i].speed, 0, 'f', 1);
         label += QString(" %1:%2").arg(mins, 2, 10, QChar('0')).arg(secs, 2, 10, QChar('0'));
@@ -5077,6 +5264,75 @@ bool Timeline::setClipPropertyByIndex(bool audio, int trackIndex, int clipIndex,
     remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
     remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
     saveUndoState(QStringLiteral("Set clip property (MCP)"));
+    updateInfoLabel();
+    scheduleEmitSequenceChanged();
+    return true;
+}
+
+bool Timeline::setClipReversed(TrackKind kind, int trackIndex, int clipIndex,
+                               bool reversed, bool applyToLinked)
+{
+    TimelineTrack *track = trackAt(kind == TrackKind::Audio, trackIndex);
+    if (!track || track->isLocked()
+        || clipIndex < 0 || clipIndex >= track->clipCount()) {
+        return false;
+    }
+
+    const QVector<ClipInfo> targetClips = track->clips();
+    const int linkGroup = targetClips[clipIndex].linkGroup;
+    QVector<TimelineTrack *> affectedTracks{track};
+    if (applyToLinked && linkGroup > 0) {
+        const QVector<TimelineTrack *> allTracks = m_videoTracks + m_audioTracks;
+        for (TimelineTrack *candidateTrack : allTracks) {
+            if (!candidateTrack || candidateTrack == track)
+                continue;
+            const auto &clips = candidateTrack->clips();
+            const bool hasLinkedClip = std::any_of(
+                clips.cbegin(), clips.cend(), [linkGroup](const ClipInfo &clip) {
+                    return clip.linkGroup == linkGroup;
+                });
+            if (!hasLinkedClip)
+                continue;
+            if (candidateTrack->isLocked())
+                return false;
+            affectedTracks.append(candidateTrack);
+        }
+    }
+
+    bool needsChange = false;
+    for (TimelineTrack *affected : affectedTracks) {
+        const auto &clips = affected->clips();
+        for (int i = 0; i < clips.size(); ++i) {
+            const bool isTarget = affected == track && i == clipIndex;
+            const bool isLinked = applyToLinked && linkGroup > 0
+                && clips[i].linkGroup == linkGroup;
+            if ((isTarget || isLinked) && clips[i].reversed != reversed) {
+                needsChange = true;
+                break;
+            }
+        }
+        if (needsChange)
+            break;
+    }
+    if (!needsChange)
+        return true;
+
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    for (TimelineTrack *affected : affectedTracks) {
+        QVector<ClipInfo> clips = affected->clips();
+        for (int i = 0; i < clips.size(); ++i) {
+            const bool isTarget = affected == track && i == clipIndex;
+            const bool isLinked = applyToLinked && linkGroup > 0
+                && clips[i].linkGroup == linkGroup;
+            if (isTarget || isLinked)
+                clips[i].reversed = reversed;
+        }
+        affected->setClips(clips);
+    }
+
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+    saveUndoState(QStringLiteral("逆再生"));
     updateInfoLabel();
     scheduleEmitSequenceChanged();
     return true;
@@ -8499,8 +8755,11 @@ void Timeline::ensureSequenceFitsViewport()
 QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
 {
     QVector<PlaybackEntry> result;
-    if (m_videoTracks.isEmpty())
+    QVector<VideoReversedPlaybackBinding> reversedBindings;
+    if (m_videoTracks.isEmpty()) {
+        setVideoReversedPlaybackBindings(reversedBindings);
         return result;
+    }
 
     // PiP overlay resolution: every visible track contributes its full clip
     // intervals without mutual subtraction. The compositor stacks layers using
@@ -8514,6 +8773,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         double clipIn;
         double clipOut;
         double speed;
+        bool reversed = false;
         QString filePath;
         int trackIdx;
         // US-T35 per-clip video source transform + owning clip index for
@@ -8602,14 +8862,51 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
                 const double childSpeed = (child.speed > 0.0) ? child.speed : 1.0;
                 const double localIn = overlapStart - childAccum;
                 const double localOut = overlapEnd - childAccum;
-                const double childTimelineStart =
-                    parentTimelineStart + (overlapStart - sourceIn) / parentSpeed;
+                bool childReverseComposition = child.reversed;
+                if (!childReverseComposition
+                    && child.isSequenceReference()) {
+                    QVector<QString> reverseScanStack = sequenceStack;
+                    childReverseComposition = sequenceContainsReversedClip(
+                        sequenceSnapshot, resolveSequenceRefId(child),
+                        /*audio=*/false, reverseScanStack);
+                }
+                const bool reverseCompositionActive = parentClip.reversed
+                    || childReverseComposition;
+                const NestedSequenceIntervalMapping parentInterval =
+                    mapNestedSequenceInterval(
+                        parentClip, parentTimelineStart, sourceIn,
+                        overlapStart, overlapEnd, parentSpeed,
+                        reverseCompositionActive);
+                const double childTimelineStart = parentInterval.timelineStart;
+                const double childTimelineEnd = parentInterval.timelineEnd;
+                double childSourceIn = child.inPoint + localIn * childSpeed;
+                double childSourceOut = child.inPoint + localOut * childSpeed;
+                double combinedSpeed = childSpeed * parentSpeed;
+                bool effectiveReversed = false;
+                if (reverseCompositionActive) {
+                    const double mappedAtLocalIn =
+                        child.sourceSecondAtLocalTime(localIn);
+                    const double mappedAtLocalOut =
+                        child.sourceSecondAtLocalTime(localOut);
+                    childSourceIn = qMin(mappedAtLocalIn, mappedAtLocalOut);
+                    childSourceOut = qMax(mappedAtLocalIn, mappedAtLocalOut);
+                    const bool childDescending =
+                        mappedAtLocalOut + 1e-9 < mappedAtLocalIn;
+                    effectiveReversed = parentInterval.runsBackward
+                        != childDescending;
+                    const double timelineSpan = qMax(
+                        1e-9, childTimelineEnd - childTimelineStart);
+                    combinedSpeed = qMax(
+                        1e-9,
+                        (childSourceOut - childSourceIn) / timelineSpan);
+                }
 
                 if (child.isSequenceReference()) {
                     ClipInfo nested = child;
-                    nested.inPoint = child.inPoint + localIn * childSpeed;
-                    nested.outPoint = child.inPoint + localOut * childSpeed;
-                    nested.speed = childSpeed * parentSpeed;
+                    nested.inPoint = childSourceIn;
+                    nested.outPoint = childSourceOut;
+                    nested.speed = combinedSpeed;
+                    nested.reversed = effectiveReversed;
                     nested.opacity = child.opacity * parentClip.opacity;
                     nested.volume = child.volume * parentClip.volume;
                     nested.pan = qBound(-1.0, child.pan + parentClip.pan, 1.0);
@@ -8622,10 +8919,11 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
 
                 Interval iv;
                 iv.timelineStart = childTimelineStart;
-                iv.timelineEnd = parentTimelineStart + (overlapEnd - sourceIn) / parentSpeed;
-                iv.clipIn = child.inPoint + localIn * childSpeed;
-                iv.clipOut = child.inPoint + localOut * childSpeed;
-                iv.speed = childSpeed * parentSpeed;
+                iv.timelineEnd = childTimelineEnd;
+                iv.clipIn = childSourceIn;
+                iv.clipOut = childSourceOut;
+                iv.speed = combinedSpeed;
+                iv.reversed = effectiveReversed;
                 if (child.timeRemapCurve.keys.size() == 1) {
                     const double childSourceOut = (child.outPoint > 0.0) ? child.outPoint : child.duration;
                     const double holdSource =
@@ -8706,6 +9004,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
                 iv.clipIn = c.inPoint;
                 iv.clipOut = (c.outPoint > 0.0) ? c.outPoint : c.duration;
                 iv.speed = (c.speed > 0.0) ? c.speed : 1.0;
+                iv.reversed = c.reversed;
                 if (c.timeRemapCurve.keys.size() == 1) {
                     const double sourceOut = (c.outPoint > 0.0) ? c.outPoint : c.duration;
                     const double holdSource =
@@ -8882,6 +9181,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         e.trailOutDuration = iv.trailOutDuration;
         e.trailOutEasing = iv.trailOutEasing;
         e.stabilizerKeyframes = iv.stabilizerKeyframes;
+        reversedBindings.append({e, iv.reversed});
         // STAGE4B: carry this entry's track-matte assignment (if any) so the
         // live GPU compositor can apply it identically to the export path
         // (TimelineFrameRenderer.cpp:792-814). This is pure data plumbing —
@@ -8914,6 +9214,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         }
         result.append(e);
     }
+    setVideoReversedPlaybackBindings(reversedBindings);
     return result;
 }
 
@@ -8928,10 +9229,17 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
     // to reuse open file contexts across re-emits.
     QVector<PlaybackEntry> result;
     QVector<AudioChannelModePlaybackBinding> channelModeBindings;
+    QVector<AudioReversedPlaybackBinding> reversedBindings;
     if (m_audioTracks.isEmpty()) {
         setAudioChannelModePlaybackBindings(channelModeBindings);
+        setAudioReversedPlaybackBindings(reversedBindings);
         return result;
     }
+
+    const auto appendReversedBinding = [&reversedBindings](
+        const PlaybackEntry &entry, bool reversed) {
+        reversedBindings.append({entry, reversed});
+    };
 
     const QVector<TimelineSequence> sequenceSnapshot = sequences();
     auto findSequence = [&sequenceSnapshot](const QString &id) -> const TimelineSequence * {
@@ -8988,14 +9296,54 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
                 const double childSpeed = (child.speed > 0.0) ? child.speed : 1.0;
                 const double localIn = overlapStart - childAccum;
                 const double localOut = overlapEnd - childAccum;
-                const double childTimelineStart =
-                    parentTimelineStart + (overlapStart - sourceIn) / parentSpeed;
+                bool childReverseComposition = child.reversed;
+                if (!childReverseComposition
+                    && child.isSequenceReference()) {
+                    QVector<QString> reverseScanStack = sequenceStack;
+                    childReverseComposition = sequenceContainsReversedClip(
+                        sequenceSnapshot, resolveSequenceRefId(child),
+                        /*audio=*/true, reverseScanStack);
+                }
+                const bool reverseCompositionActive = parentClip.reversed
+                    || childReverseComposition;
+                const NestedSequenceIntervalMapping parentInterval =
+                    mapNestedSequenceInterval(
+                        parentClip, parentTimelineStart, sourceIn,
+                        overlapStart, overlapEnd, parentSpeed,
+                        reverseCompositionActive);
+                const double childTimelineStart = parentInterval.timelineStart;
+                const double childTimelineEnd = parentInterval.timelineEnd;
+                double childSourceIn = child.inPoint + localIn * childSpeed;
+                double childSourceOut = child.inPoint + localOut * childSpeed;
+                double combinedSpeed = childSpeed * parentSpeed;
+                bool effectiveReversed = false;
+                // Preserve the legacy nested-audio flattening exactly while
+                // reverse is OFF. Only reverse-enabled branches need the
+                // shared source mapper and direction composition.
+                if (reverseCompositionActive) {
+                    const double mappedAtLocalIn =
+                        child.sourceSecondAtLocalTime(localIn);
+                    const double mappedAtLocalOut =
+                        child.sourceSecondAtLocalTime(localOut);
+                    childSourceIn = qMin(mappedAtLocalIn, mappedAtLocalOut);
+                    childSourceOut = qMax(mappedAtLocalIn, mappedAtLocalOut);
+                    const bool childDescending =
+                        mappedAtLocalOut + 1e-9 < mappedAtLocalIn;
+                    effectiveReversed = parentInterval.runsBackward
+                        != childDescending;
+                    const double timelineSpan = qMax(
+                        1e-9, childTimelineEnd - childTimelineStart);
+                    combinedSpeed = qMax(
+                        1e-9,
+                        (childSourceOut - childSourceIn) / timelineSpan);
+                }
 
                 if (child.isSequenceReference()) {
                     ClipInfo nested = child;
-                    nested.inPoint = child.inPoint + localIn * childSpeed;
-                    nested.outPoint = child.inPoint + localOut * childSpeed;
-                    nested.speed = childSpeed * parentSpeed;
+                    nested.inPoint = childSourceIn;
+                    nested.outPoint = childSourceOut;
+                    nested.speed = combinedSpeed;
+                    nested.reversed = effectiveReversed;
                     nested.volume = child.volume * parentClip.volume;
                     nested.pan = qBound(-1.0, child.pan + parentClip.pan, 1.0);
                     appendSequenceAudioEntries(nested, childTimelineStart,
@@ -9008,11 +9356,11 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
 
                 PlaybackEntry e;
                 e.filePath = child.filePath;
-                e.clipIn = child.inPoint + localIn * childSpeed;
-                e.clipOut = child.inPoint + localOut * childSpeed;
+                e.clipIn = childSourceIn;
+                e.clipOut = childSourceOut;
                 e.timelineStart = childTimelineStart;
-                e.timelineEnd = parentTimelineStart + (overlapEnd - sourceIn) / parentSpeed;
-                e.speed = childSpeed * parentSpeed;
+                e.timelineEnd = childTimelineEnd;
+                e.speed = combinedSpeed;
                 // Audio flattening also keeps parent identity so sequence
                 // clips added as linked V/A references route as one parent
                 // timeline item while recursively exposing the leaf media.
@@ -9022,13 +9370,22 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
                 e.pan = qBound(-1.0, child.pan + parentClip.pan, 1.0);
                 e.volumeEnvelope = child.volumeEnvelope;
                 e.sourceClipIndex = parentClipIdx;
-                e.leadInType = child.leadIn.type;
-                e.leadInDuration = child.leadIn.duration;
-                e.leadInEasing = child.leadIn.easing;
-                e.trailOutType = child.trailOut.type;
-                e.trailOutDuration = child.trailOut.duration;
-                e.trailOutEasing = child.trailOut.easing;
+                // Transitions are attached to timeline edges, not source
+                // direction. Reverse the edges only when the parent sequence
+                // itself runs backward; a child-only reverse keeps its
+                // authored fade-in/fade-out positions.
+                const Transition &timelineLead = parentInterval.runsBackward
+                    ? child.trailOut : child.leadIn;
+                const Transition &timelineTrail = parentInterval.runsBackward
+                    ? child.leadIn : child.trailOut;
+                e.leadInType = timelineLead.type;
+                e.leadInDuration = timelineLead.duration;
+                e.leadInEasing = timelineLead.easing;
+                e.trailOutType = timelineTrail.type;
+                e.trailOutDuration = timelineTrail.duration;
+                e.trailOutEasing = timelineTrail.easing;
                 result.append(e);
+                appendReversedBinding(e, effectiveReversed);
                 channelModeBindings.append({
                     qRound64(e.clipIn * 1000.0),
                     e.sourceTrack,
@@ -9083,6 +9440,7 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
             e.trailOutDuration = c.trailOut.duration;
             e.trailOutEasing = c.trailOut.easing;
             result.append(e);
+            appendReversedBinding(e, c.reversed);
             channelModeBindings.append({
                 qRound64(e.clipIn * 1000.0),
                 e.sourceTrack,
@@ -9103,6 +9461,7 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
                   return a.sourceTrack < b.sourceTrack;
               });
     setAudioChannelModePlaybackBindings(channelModeBindings);
+    setAudioReversedPlaybackBindings(reversedBindings);
     return result;
 }
 

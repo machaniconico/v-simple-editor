@@ -216,6 +216,7 @@ QJsonObject clipOutputItemSchema()
         {QStringLiteral("inPointSec"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
         {QStringLiteral("outPointSec"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
         {QStringLiteral("speed"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
+        {QStringLiteral("reversed"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
         {QStringLiteral("volume"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
         {QStringLiteral("opacity"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
         {QStringLiteral("label"), QJsonObject{
@@ -236,7 +237,8 @@ QJsonObject clipOutputItemSchema()
         QStringLiteral("filePath"), QStringLiteral("startSec"),
         QStringLiteral("durationSec"), QStringLiteral("inPointSec"),
         QStringLiteral("outPointSec"), QStringLiteral("speed"),
-        QStringLiteral("volume"), QStringLiteral("opacity"), QStringLiteral("label"),
+        QStringLiteral("reversed"), QStringLiteral("volume"),
+        QStringLiteral("opacity"), QStringLiteral("label"),
         QStringLiteral("linkGroup"), QStringLiteral("selected"),
         QStringLiteral("leadIn"), QStringLiteral("trailOut"),
         QStringLiteral("textOverlayCount")
@@ -630,6 +632,7 @@ QJsonObject clipToJson(const ClipInfo& clip, int clipIndex, double startSec,
         {QStringLiteral("inPointSec"), clip.inPoint},
         {QStringLiteral("outPointSec"), outPoint},
         {QStringLiteral("speed"), clip.speed},
+        {QStringLiteral("reversed"), clip.reversed},
         {QStringLiteral("volume"), clip.volume},
         {QStringLiteral("opacity"), clip.opacity},
         {QStringLiteral("label"), clipLabelToString(clip.label)},
@@ -1473,7 +1476,10 @@ void McpEditorTools::registerWriteTools()
     const QJsonObject setClipPropertyOutputSchema = outputSchemaOf(QJsonObject{
         {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
         {QStringLiteral("property"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
-        {QStringLiteral("value"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
+        {QStringLiteral("value"), QJsonObject{{QStringLiteral("oneOf"), QJsonArray{
+            QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}},
+            QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}
+        }}}},
         {QStringLiteral("linkedApplied"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}}
     }, {QStringLiteral("ok"), QStringLiteral("property"),
         QStringLiteral("value")});
@@ -2350,7 +2356,7 @@ void McpEditorTools::registerWriteTools()
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("set_clip_property"),
-        QStringLiteral("指定クリップのプロパティを設定する。property と有効範囲: volume 0..2 (1.0=原音の音量、0=無音)、opacity 0..1 (1.0=不透明)、speed 0.25..4 (1.0=等速)、pan -1..1 (0=中央)、videoScale 0.1..10 (1.0=等倍)。範囲外は out of range エラーで拒否される。speed は実尺が変わるため同じ linkGroup の音声クリップにも同時に適用する (応答の linkedApplied)。他のプロパティは指定クリップだけ。現在の volume/opacity/speed は get_timeline のクリップ情報で確認できる。kind/trackIndex 省略時は video トラック 0。clipIndex は get_timeline の index。タイムラインを変更する破壊的操作で、Ctrl+Z / undo ツールで戻せる。"),
+        QStringLiteral("指定クリップのプロパティを設定する。property と有効範囲: volume 0..2、opacity 0..1、speed 0.25..4、pan -1..1、videoScale 0.1..10、reversed true/false。speed と reversed は同じ linkGroup の映像・音声にも同時に適用する (応答の linkedApplied)。現在値は get_timeline で確認でき、Ctrl+Z / undo ツールで戻せる。"),
         schemaWithRequired(mergedProperties(clipProperties, QJsonObject{
             {QStringLiteral("property"), QJsonObject{
                 {QStringLiteral("type"), QStringLiteral("string")},
@@ -2358,15 +2364,18 @@ void McpEditorTools::registerWriteTools()
                 {QStringLiteral("enum"), QJsonArray{
                     QStringLiteral("volume"), QStringLiteral("opacity"),
                     QStringLiteral("speed"), QStringLiteral("pan"),
-                    QStringLiteral("videoScale")
+                    QStringLiteral("videoScale"), QStringLiteral("reversed")
                 }},
                 {QStringLiteral("description"),
-                 QStringLiteral("設定対象。volume / opacity / speed / pan / videoScale")}
+                 QStringLiteral("設定対象。volume / opacity / speed / pan / videoScale / reversed")}
             }},
             {QStringLiteral("value"), QJsonObject{
-                {QStringLiteral("type"), QStringLiteral("number")},
+                {QStringLiteral("oneOf"), QJsonArray{
+                    QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}},
+                    QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}
+                }},
                 {QStringLiteral("description"),
-                 QStringLiteral("property に応じた値。volume: 0..2 (1.0=原音、0=無音)、opacity: 0..1 (1.0=不透明)、speed: 0.25..4 (1.0=等速)、pan: -1..1 (0=中央)、videoScale: 0.1..10 (1.0=等倍)。範囲外は拒否される。")}
+                 QStringLiteral("property に応じた値。reversed は boolean、それ以外は number。")}
             }}
         }), {QStringLiteral("clipIndex"), QStringLiteral("property"), QStringLiteral("value")}),
         guardedWrite(QStringLiteral("set_clip_property"),
@@ -2380,27 +2389,48 @@ void McpEditorTools::registerWriteTools()
             QString property;
             if (!requiredString(args, QStringLiteral("property"), &property, err))
                 return {};
+            const bool isReversedProperty = property == QStringLiteral("reversed");
             double value = 0.0;
-            if (!requiredFiniteNumber(args, QStringLiteral("value"), &value, err))
+            bool reversedValue = false;
+            if (isReversedProperty) {
+                const QJsonValue rawValue = args.value(QStringLiteral("value"));
+                if (!rawValue.isBool()) {
+                    return setError(err, QStringLiteral("value must be a boolean for reversed")),
+                           QJsonObject();
+                }
+                reversedValue = rawValue.toBool();
+            } else if (!requiredFiniteNumber(args, QStringLiteral("value"), &value, err)) {
                 return {};
+            }
 
             ClipTarget target;
             if (!readClipTarget(args, m_window, timeline(), &target, err))
                 return {};
 
             Timeline* currentTimeline = timeline();
-            // speed は実尺を変えるので、リンクした音声も同時に変えないと V/A の
-            // 長さが食い違う。他のプロパティは指定クリップだけに適用する。
-            const bool applyToLinked = property == QStringLiteral("speed");
-            if (!currentTimeline->setClipPropertyByIndex(
-                    target.audio, target.trackIndex, target.clipIndex, property, value, err,
-                    applyToLinked))
+            // speed と reversed はリンクした映像・音声を同じ再生方向/尺に
+            // 保つ。他のプロパティは指定クリップだけに適用する。
+            const bool applyToLinked = property == QStringLiteral("speed")
+                || isReversedProperty;
+            if (isReversedProperty) {
+                if (!currentTimeline->setClipReversed(
+                        target.audio ? TrackKind::Audio : TrackKind::Video,
+                        target.trackIndex, target.clipIndex,
+                        reversedValue, /*applyToLinked=*/true)) {
+                    return setError(err, QStringLiteral("clip reverse update failed")),
+                           QJsonObject();
+                }
+            } else if (!currentTimeline->setClipPropertyByIndex(
+                           target.audio, target.trackIndex, target.clipIndex,
+                           property, value, err, applyToLinked)) {
                 return {};
+            }
             syncSelectionAfterEdit();
             return QJsonObject{
                 {QStringLiteral("ok"), true},
                 {QStringLiteral("property"), property},
-                {QStringLiteral("value"), value},
+                {QStringLiteral("value"), isReversedProperty
+                    ? QJsonValue(reversedValue) : QJsonValue(value)},
                 {QStringLiteral("linkedApplied"), applyToLinked}
             };
         })

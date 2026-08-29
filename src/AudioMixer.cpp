@@ -33,6 +33,7 @@ extern "C" {
 // stereo, ready for direct memcpy / accumulate from MixerIODevice::readData.
 struct AudioDecoderEntry {
     PlaybackEntry entry;
+    AudioTrackKey trackKey;
     AudioChannelMode channelMode = AudioChannelMode::Stereo;
     AVFormatContext *fmtCtx = nullptr;
     AVCodecContext *codecCtx = nullptr;
@@ -44,6 +45,9 @@ struct AudioDecoderEntry {
     // the kRingCompactThreshold below, amortising compaction cost.
     QByteArray ring;
     int ringHead = 0;
+    bool reversed = false;
+    bool reversedPcmPrepared = false;
+    bool reversedTooLong = false;
     // Timeline microseconds of the FIRST live sample (ring[ringHead]).
     // Used by readData to skip past samples behind the master clock when a
     // ring underrun + decoder catch-up has produced samples that should
@@ -173,6 +177,22 @@ struct AudioChannelModeKey {
     }
 };
 
+struct AudioReversedKey {
+    QString filePath;
+    qint64 clipInUs = 0;
+    qint64 timelineStartUs = 0;
+    int sourceTrack = 0;
+    int sourceClipIndex = -1;
+
+    bool operator==(const AudioReversedKey &other) const noexcept {
+        return filePath == other.filePath
+            && clipInUs == other.clipInUs
+            && timelineStartUs == other.timelineStartUs
+            && sourceTrack == other.sourceTrack
+            && sourceClipIndex == other.sourceClipIndex;
+    }
+};
+
 uint qHash(const AudioChannelModeKey &key, uint seed = 0) noexcept
 {
     uint h = ::qHash(key.clipInMs, seed);
@@ -181,8 +201,20 @@ uint qHash(const AudioChannelModeKey &key, uint seed = 0) noexcept
     return h;
 }
 
+uint qHash(const AudioReversedKey &key, uint seed = 0) noexcept
+{
+    uint h = ::qHash(key.filePath, seed);
+    h ^= ::qHash(key.clipInUs, seed) + 0x9e3779b9u + (h << 6) + (h >> 2);
+    h ^= ::qHash(key.timelineStartUs, seed) + 0x9e3779b9u + (h << 6) + (h >> 2);
+    h ^= ::qHash(key.sourceTrack, seed) + 0x9e3779b9u + (h << 6) + (h >> 2);
+    h ^= ::qHash(key.sourceClipIndex, seed) + 0x9e3779b9u + (h << 6) + (h >> 2);
+    return h;
+}
+
 QMutex g_audioChannelModeMutex;
 QHash<AudioChannelModeKey, AudioChannelMode> g_audioChannelModes;
+QHash<AudioReversedKey, bool> g_videoReversedEntries;
+QVector<AudioReversedPlaybackBinding> g_audioReversedBindingOrder;
 
 inline AudioChannelMode sanitizeAudioChannelMode(AudioChannelMode mode)
 {
@@ -204,6 +236,25 @@ inline AudioChannelModeKey audioChannelModeKeyForEntry(const PlaybackEntry &entr
         entry.sourceTrack,
         entry.sourceClipIndex
     };
+}
+
+inline AudioReversedKey audioReversedKeyForEntry(const PlaybackEntry &entry)
+{
+    return {
+        entry.filePath,
+        qRound64(entry.clipIn * 1'000'000.0),
+        qRound64(entry.timelineStart * 1'000'000.0),
+        entry.sourceTrack,
+        entry.sourceClipIndex
+    };
+}
+
+inline qint64 reverseInstanceForEntry(const PlaybackEntry &entry,
+                                      bool reversed)
+{
+    return reversed
+        ? qRound64(entry.timelineStart * 1'000'000.0) + 1
+        : 0;
 }
 
 // Linear-interpolate the per-clip volume envelope at a given clip-local
@@ -228,7 +279,45 @@ inline double evaluateVolumeEnvelope(const QVector<AudioGainPoint> &env,
     }
     return fallbackGain;
 }
+
+constexpr double kMaxReversedClipSeconds = 10.0 * 60.0;
+
+template<typename Sample>
+void reverseInterleavedFrames(Sample *samples, int sampleCount,
+                              int channelCount)
+{
+    if (!samples || channelCount <= 0 || sampleCount <= 0
+        || sampleCount % channelCount != 0) {
+        return;
+    }
+    const int frameCount = sampleCount / channelCount;
+    for (int left = 0, right = frameCount - 1; left < right; ++left, --right) {
+        for (int channel = 0; channel < channelCount; ++channel) {
+            std::swap(samples[left * channelCount + channel],
+                      samples[right * channelCount + channel]);
+        }
+    }
+}
+
+void reverseInterleavedStereoS16(QByteArray &pcm)
+{
+    auto *samples = reinterpret_cast<int16_t *>(pcm.data());
+    reverseInterleavedFrames(
+        samples, pcm.size() / static_cast<int>(sizeof(int16_t)),
+        AudioMixer::kChannels);
+}
 } // namespace
+
+QVector<float> reversedPcmFrames(const QVector<float> &samples, int channelCount)
+{
+    QVector<float> result = samples;
+    if (channelCount <= 0 || result.isEmpty()
+        || result.size() % channelCount != 0) {
+        return result;
+    }
+    reverseInterleavedFrames(result.data(), result.size(), channelCount);
+    return result;
+}
 
 void setAudioChannelModePlaybackBindings(const QVector<AudioChannelModePlaybackBinding> &bindings)
 {
@@ -252,6 +341,102 @@ AudioChannelMode audioChannelModeForPlaybackEntry(const PlaybackEntry &entry)
     QMutexLocker lock(&g_audioChannelModeMutex);
     return g_audioChannelModes.value(audioChannelModeKeyForEntry(entry),
                                      AudioChannelMode::Stereo);
+}
+
+void setAudioReversedPlaybackBindings(
+    const QVector<AudioReversedPlaybackBinding> &bindings)
+{
+    QMutexLocker lock(&g_audioChannelModeMutex);
+    g_audioReversedBindingOrder = bindings;
+}
+
+QVector<bool> audioReversedFlagsForPlaybackEntries(
+    const QVector<PlaybackEntry> &entries)
+{
+    QVector<AudioReversedPlaybackBinding> bindings;
+    {
+        QMutexLocker lock(&g_audioChannelModeMutex);
+        bindings = g_audioReversedBindingOrder;
+    }
+
+    const auto sameEnvelope = [](const QVector<AudioGainPoint> &left,
+                                 const QVector<AudioGainPoint> &right) {
+        if (left.size() != right.size())
+            return false;
+        for (int i = 0; i < left.size(); ++i) {
+            if (!qFuzzyCompare(left[i].time + 1.0, right[i].time + 1.0)
+                || !qFuzzyCompare(left[i].gain + 1.0,
+                                  right[i].gain + 1.0)) {
+                return false;
+            }
+        }
+        return true;
+    };
+    const auto sameAudioEntry = [&sameEnvelope](const PlaybackEntry &left,
+                                                const PlaybackEntry &right) {
+        return left.filePath == right.filePath
+            && qRound64(left.clipIn * 1'000'000.0)
+                == qRound64(right.clipIn * 1'000'000.0)
+            && qRound64(left.clipOut * 1'000'000.0)
+                == qRound64(right.clipOut * 1'000'000.0)
+            && qRound64(left.timelineStart * 1'000'000.0)
+                == qRound64(right.timelineStart * 1'000'000.0)
+            && qRound64(left.timelineEnd * 1'000'000.0)
+                == qRound64(right.timelineEnd * 1'000'000.0)
+            && qFuzzyCompare(left.speed + 1.0, right.speed + 1.0)
+            && left.sourceTrack == right.sourceTrack
+            && left.sourceClipIndex == right.sourceClipIndex
+            && left.audioMuted == right.audioMuted
+            && qFuzzyCompare(left.volume + 1.0, right.volume + 1.0)
+            && qFuzzyCompare(left.pan + 2.0, right.pan + 2.0)
+            && left.leadInType == right.leadInType
+            && qFuzzyCompare(left.leadInDuration + 1.0,
+                             right.leadInDuration + 1.0)
+            && left.leadInEasing == right.leadInEasing
+            && left.trailOutType == right.trailOutType
+            && qFuzzyCompare(left.trailOutDuration + 1.0,
+                             right.trailOutDuration + 1.0)
+            && left.trailOutEasing == right.trailOutEasing
+            && sameEnvelope(left.volumeEnvelope, right.volumeEnvelope);
+    };
+
+    QVector<bool> flags(entries.size(), false);
+    QVector<bool> consumed(bindings.size(), false);
+    for (int entryIndex = 0; entryIndex < entries.size(); ++entryIndex) {
+        for (int bindingIndex = 0; bindingIndex < bindings.size();
+             ++bindingIndex) {
+            if (consumed[bindingIndex]
+                || !sameAudioEntry(entries[entryIndex],
+                                   bindings[bindingIndex].entry)) {
+                continue;
+            }
+            flags[entryIndex] = bindings[bindingIndex].reversed;
+            consumed[bindingIndex] = true;
+            break;
+        }
+    }
+    return flags;
+}
+
+void setVideoReversedPlaybackBindings(
+    const QVector<VideoReversedPlaybackBinding> &bindings)
+{
+    QHash<AudioReversedKey, bool> next;
+    next.reserve(bindings.size());
+    for (const auto &binding : bindings) {
+        next.insert(audioReversedKeyForEntry(binding.entry),
+                    binding.reversed);
+    }
+
+    QMutexLocker lock(&g_audioChannelModeMutex);
+    g_videoReversedEntries = std::move(next);
+}
+
+bool videoReversedForPlaybackEntry(const PlaybackEntry &entry)
+{
+    QMutexLocker lock(&g_audioChannelModeMutex);
+    return g_videoReversedEntries.value(
+        audioReversedKeyForEntry(entry), false);
 }
 
 void applyAudioChannelModeToInterleavedStereoS16(int16_t *samples,
@@ -520,6 +705,17 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
         const int64_t endUs = static_cast<int64_t>(e->entry.timelineEnd * 1e6);
         if (cursorUs < startUs || cursorUs >= endUs) continue;
         if (liveBytes(*e) <= 0) {
+            // A prepared reverse buffer is finite by design. Exhaustion (or
+            // the explicit >10 minute silent fallback) is intentional
+            // silence, not a decoder warm-up that should stall the clock.
+            if (e->reversed && e->reversedPcmPrepared) {
+                // seekTo parks ringHead at EOF until the decode worker
+                // repositions the cached buffer. Hold the master clock during
+                // that short hand-off so a seek cannot skip reversed samples.
+                if (e->seekPending)
+                    entryActiveButStalled = true;
+                continue;
+            }
             entryActiveButStalled = true;
             continue;
         }
@@ -779,12 +975,7 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
             // builds detect the regression at the first stale-snapshot path.
             const uint64_t genAtEntry =
                 m_mixer->m_speedRampGeneration.load(std::memory_order_relaxed);
-            const AudioTrackKey atempoKey{
-                e->entry.filePath,
-                qRound64(e->entry.clipIn * 1000.0),
-                e->entry.sourceTrack,
-                e->entry.sourceClipIndex
-            };
+            const AudioTrackKey &atempoKey = e->trackKey;
             if (resolveAudioAtempoEnabled(audioAtempoEnvForceCached(),
                                           m_mixer->m_atempoByKey.contains(atempoKey))) {
                 const auto rampIt = m_mixer->m_speedRampByKey.constFind(atempoKey);
@@ -1453,7 +1644,7 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
     for (auto it = m_mixer->m_entries.begin(); it != m_mixer->m_entries.end(); ++it) {
         AudioDecoderEntry *e = it.value();
         if (!e) continue;
-        if (e->ringHead >= kRingCompactThreshold) {
+        if (!e->reversed && e->ringHead >= kRingCompactThreshold) {
             e->ring.remove(0, e->ringHead);
             e->ringHead = 0;
         }
@@ -1739,7 +1930,8 @@ AudioMixer::~AudioMixer() {
     }
 }
 
-void AudioMixer::setSequence(const QVector<PlaybackEntry> &entries) {
+void AudioMixer::setSequence(const QVector<PlaybackEntry> &entries,
+                             const QVector<bool> &reversedFlags) {
     qInfo() << "AudioMixer::setSequence in=" << entries.size()
             << "existing=" << m_entries.size();
     QStringList pendingErrors;
@@ -1758,7 +1950,9 @@ void AudioMixer::setSequence(const QVector<PlaybackEntry> &entries) {
         m_speedRampKeyOrder.reserve(entries.size());
         m_atempoByKey.clear();
 
-        for (const auto &e : entries) {
+        for (int entryIndex = 0; entryIndex < entries.size(); ++entryIndex) {
+            const PlaybackEntry &e = entries[entryIndex];
+            const bool reversed = reversedFlags.value(entryIndex, false);
             // Cap on UNIQUE source tracks, not total entry count, so a
             // single track with many clips doesn't get its trailing entries
             // silently dropped. Check membership BEFORE inserting: the old
@@ -1776,9 +1970,17 @@ void AudioMixer::setSequence(const QVector<PlaybackEntry> &entries) {
             AudioTrackKey key{
                 e.filePath,
                 qRound64(e.clipIn * 1000.0),
+                reverseInstanceForEntry(e, reversed),
                 e.sourceTrack,
                 e.sourceClipIndex
             };
+            if (reversed) {
+                // Multiple nested child tracks can resolve to the same parent
+                // identity and timeline position. Preserve every reversed
+                // occurrence instead of dropping later decoders as duplicate.
+                while (retained.contains(key))
+                    ++key.reverseInstanceUs;
+            }
             const AudioChannelMode channelMode = audioChannelModeForPlaybackEntry(e);
             if (e.sourceTrack > maxTrack) maxTrack = e.sourceTrack;
 
@@ -1803,12 +2005,25 @@ void AudioMixer::setSequence(const QVector<PlaybackEntry> &entries) {
                 // Same key reappears — update mutable timeline metadata only.
                 const auto oldStart = de->entry.timelineStart;
                 const auto oldEnd = de->entry.timelineEnd;
+                const auto oldClipIn = de->entry.clipIn;
+                const auto oldClipOut = de->entry.clipOut;
+                const auto oldSpeed = de->entry.speed;
+                const bool oldReversed = de->reversed;
                 const bool channelModeChanged = de->channelMode != channelMode;
+                const bool reverseStateChanged = oldReversed != reversed;
+                const bool reverseSourceWindowChanged =
+                    (oldReversed || reversed)
+                    && (!qFuzzyCompare(oldClipIn, e.clipIn)
+                        || !qFuzzyCompare(oldClipOut, e.clipOut)
+                        || !qFuzzyCompare(oldSpeed, e.speed));
                 de->entry = e;
+                de->trackKey = key;
                 de->channelMode = channelMode;
+                de->reversed = reversed;
                 if (!qFuzzyCompare(oldStart, e.timelineStart)
                     || !qFuzzyCompare(oldEnd, e.timelineEnd)
-                    || channelModeChanged) {
+                    || channelModeChanged || reverseStateChanged
+                    || reverseSourceWindowChanged) {
                     // [P2-M3] Use the shared resetAtempoState helper for the
                     // pre-seek atempo field invalidation (atempoSrcFrameCarry,
                     // seekPending) so this site and R10-a's removed-key loop
@@ -1818,14 +2033,24 @@ void AudioMixer::setSequence(const QVector<PlaybackEntry> &entries) {
                     // timeline window); seekEntryToTimeline would reset them on
                     // the next refill regardless.
                     resetAtempoState(de);
-                    de->ring.clear();
+                    if (!de->reversed || channelModeChanged
+                        || reverseStateChanged
+                        || reverseSourceWindowChanged) {
+                        de->ring.clear();
+                        de->reversedPcmPrepared = false;
+                        de->reversedTooLong = false;
+                    }
                     de->ringHead = 0;
+                    if (reverseStateChanged)
+                        de->eof = false;
                 }
                 retained.insert(key, de);
             } else {
                 de = new AudioDecoderEntry;
                 de->entry = e;
+                de->trackKey = key;
                 de->channelMode = channelMode;
+                de->reversed = reversed;
                 if (!openEntry(de)) {
                     pendingErrors << QStringLiteral("AudioMixer: failed to open audio: %1").arg(e.filePath);
                     closeEntry(de);
@@ -2234,11 +2459,13 @@ void AudioMixer::seekTo(int64_t timelineUs) {
             for (auto *e : qAsConst(m_entries)) {
                 if (!e) continue;
                 e->seekPending = true;
-                e->ring.clear();
-                e->ringHead = 0;
+                if (!e->reversed || !e->reversedPcmPrepared)
+                    e->ring.clear();
+                e->ringHead = (e->reversed && e->reversedPcmPrepared)
+                    ? e->ring.size() : 0;
                 e->atempoSrcFrameCarry = 0.0;
                 e->ringStartTlUs = timelineUs;
-                e->eof = false;
+                e->eof = e->reversed && e->reversedPcmPrepared;
                 // US-FIX-7 (R3): Fix-K sets ringStartTlUs = timelineUs (true
                 // cursor on an active sink). Clear both US-FIX-7 flags so a
                 // prior paused-seek's anchor/fast-drain state does not corrupt
@@ -2275,11 +2502,13 @@ void AudioMixer::seekTo(int64_t timelineUs) {
         for (auto *e : qAsConst(m_entries)) {
             if (!e) continue;
             e->seekPending = true;
-            e->ring.clear();
-            e->ringHead = 0;
+            if (!e->reversed || !e->reversedPcmPrepared)
+                e->ring.clear();
+            e->ringHead = (e->reversed && e->reversedPcmPrepared)
+                ? e->ring.size() : 0;
             e->atempoSrcFrameCarry = 0.0;
             e->ringStartTlUs = timelineUs;
-            e->eof = false;
+            e->eof = e->reversed && e->reversedPcmPrepared;
             // US-FIX-7 (R3): clear both flags. seekEntryToTimeline (called
             // from refillRings once the decode worker wakes) will re-set both
             // to true. Clearing here prevents stale state from a prior seek
@@ -2890,9 +3119,182 @@ void AudioMixer::closeEntry(AudioDecoderEntry *e) {
     delete e;
 }
 
+bool AudioMixer::prepareReversedPcm(AudioDecoderEntry *e)
+{
+    if (!e || !e->reversed || !e->fmtCtx || !e->codecCtx
+        || !e->swrCtx || e->audioStreamIdx < 0) {
+        return false;
+    }
+    if (e->reversedPcmPrepared)
+        return !e->reversedTooLong;
+
+    e->ring.clear();
+    e->ringHead = 0;
+    const double sourceDuration = qMax(0.0, e->entry.clipOut - e->entry.clipIn);
+    if (sourceDuration > kMaxReversedClipSeconds) {
+        e->reversedPcmPrepared = true;
+        e->reversedTooLong = true;
+        e->eof = true;
+        qWarning().noquote()
+            << QStringLiteral("AudioMixer: 逆再生クリップが10分の上限を超えたため無音にします: %1 (%2 秒)")
+                   .arg(e->entry.filePath)
+                   .arg(sourceDuration, 0, 'f', 3);
+        return false;
+    }
+
+    AVStream *stream = e->fmtCtx->streams[e->audioStreamIdx];
+    const double timeBase = av_q2d(stream->time_base);
+    const int64_t seekTs = static_cast<int64_t>(e->entry.clipIn / timeBase);
+    if (av_seek_frame(e->fmtCtx, e->audioStreamIdx, seekTs,
+                      AVSEEK_FLAG_BACKWARD) < 0) {
+        qWarning() << "AudioMixer: reverse PCM seek failed" << e->entry.filePath;
+    }
+    avcodec_flush_buffers(e->codecCtx);
+    swr_init(e->swrCtx);
+
+    const qint64 maxFrames = qCeil(sourceDuration * kSampleRateHz);
+    const qint64 maxBytes = maxFrames * kBytesPerFrame;
+    double fallbackPtsSec = e->entry.clipIn;
+    bool reachedClipOut = false;
+
+    const auto appendDecodedFrame = [&]() -> bool {
+        const int64_t rawPts = e->frame->best_effort_timestamp != AV_NOPTS_VALUE
+            ? e->frame->best_effort_timestamp
+            : e->frame->pts;
+        const double frameStartSec = rawPts == AV_NOPTS_VALUE
+            ? fallbackPtsSec
+            : static_cast<double>(rawPts) * timeBase;
+        const int sourceRate = e->frame->sample_rate > 0
+            ? e->frame->sample_rate
+            : qMax(1, e->codecCtx->sample_rate);
+        const double frameDurationSec = static_cast<double>(e->frame->nb_samples)
+            / static_cast<double>(sourceRate);
+        fallbackPtsSec = frameStartSec + frameDurationSec;
+        if (frameStartSec >= e->entry.clipOut)
+            return false;
+        if (frameStartSec + frameDurationSec <= e->entry.clipIn)
+            return true;
+
+        const int outSamples = swr_get_out_samples(e->swrCtx,
+                                                   e->frame->nb_samples);
+        if (outSamples <= 0)
+            return true;
+        QByteArray converted;
+        converted.resize(outSamples * kBytesPerFrame);
+        uint8_t *out[1] = {
+            reinterpret_cast<uint8_t *>(converted.data())
+        };
+        const int got = swr_convert(
+            e->swrCtx, out, outSamples,
+            const_cast<const uint8_t **>(e->frame->data),
+            e->frame->nb_samples);
+        if (got <= 0)
+            return true;
+        converted.resize(got * kBytesPerFrame);
+        applyAudioChannelModeToInterleavedStereoS16(
+            reinterpret_cast<int16_t *>(converted.data()), got,
+            e->channelMode);
+
+        const int firstFrame = qBound(
+            0,
+            qCeil((e->entry.clipIn - frameStartSec) * kSampleRateHz),
+            got);
+        const int pastLastFrame = qBound(
+            firstFrame,
+            qCeil((e->entry.clipOut - frameStartSec) * kSampleRateHz),
+            got);
+        const int keepFrames = pastLastFrame - firstFrame;
+        if (keepFrames > 0) {
+            const qint64 roomBytes = qMax<qint64>(0, maxBytes - e->ring.size());
+            const qint64 appendBytes = qMin<qint64>(
+                static_cast<qint64>(keepFrames) * kBytesPerFrame,
+                roomBytes);
+            e->ring.append(converted.constData()
+                               + firstFrame * kBytesPerFrame,
+                           static_cast<qsizetype>(appendBytes));
+        }
+        return e->ring.size() < maxBytes;
+    };
+
+    while (!reachedClipOut && e->ring.size() < maxBytes) {
+        const int readResult = av_read_frame(e->fmtCtx, e->pkt);
+        if (readResult < 0) {
+            avcodec_send_packet(e->codecCtx, nullptr);
+            while (avcodec_receive_frame(e->codecCtx, e->frame) >= 0) {
+                if (!appendDecodedFrame()) {
+                    reachedClipOut = true;
+                    break;
+                }
+            }
+            break;
+        }
+        if (e->pkt->stream_index != e->audioStreamIdx) {
+            av_packet_unref(e->pkt);
+            continue;
+        }
+        const int sendResult = avcodec_send_packet(e->codecCtx, e->pkt);
+        av_packet_unref(e->pkt);
+        if (sendResult < 0)
+            continue;
+        while (true) {
+            const int receiveResult = avcodec_receive_frame(e->codecCtx, e->frame);
+            if (receiveResult == AVERROR(EAGAIN)
+                || receiveResult == AVERROR_EOF) {
+                break;
+            }
+            if (receiveResult < 0)
+                break;
+            if (!appendDecodedFrame()) {
+                reachedClipOut = true;
+                break;
+            }
+        }
+    }
+
+    const int alignedBytes = (e->ring.size() / kBytesPerFrame) * kBytesPerFrame;
+    e->ring.resize(alignedBytes);
+    reverseInterleavedStereoS16(e->ring);
+    e->ringHead = 0;
+    e->reversedPcmPrepared = true;
+    e->reversedTooLong = false;
+    e->eof = true;
+    qInfo() << "AudioMixer: prepared reversed PCM bytes=" << e->ring.size()
+            << "file=" << e->entry.filePath;
+    return true;
+}
+
 void AudioMixer::seekEntryToTimeline(AudioDecoderEntry *e, int64_t timelineUs) {
     if (!e || !e->fmtCtx || !e->codecCtx || e->audioStreamIdx < 0) return;
     const double tlSec = static_cast<double>(timelineUs) / 1e6;
+    if (e->reversed) {
+        prepareReversedPcm(e);
+        const double localSec = qMax(0.0, tlSec - e->entry.timelineStart);
+        const double uniformSpeed = e->entry.speed > 0.0
+            ? e->entry.speed : 1.0;
+        const AudioTrackKey &key = e->trackKey;
+        double sourceOffsetSec = localSec * uniformSpeed;
+        const auto rampIt = m_speedRampByKey.constFind(key);
+        if (rampIt != m_speedRampByKey.constEnd()) {
+            sourceOffsetSec = static_cast<double>(
+                rampIt.value().timelineToSourceUs(
+                    qRound64(localSec * uniformSpeed * 1'000'000.0)))
+                / 1'000'000.0;
+        }
+        const double sourceDuration = qMax(
+            0.0, e->entry.clipOut - e->entry.clipIn);
+        sourceOffsetSec = qBound(0.0, sourceOffsetSec, sourceDuration);
+        const qint64 requestedFrame = qRound64(
+            sourceOffsetSec * kSampleRateHz);
+        const qint64 requestedByte = requestedFrame * kBytesPerFrame;
+        e->ringHead = static_cast<int>(qBound<qint64>(
+            0, requestedByte, e->ring.size()));
+        e->ringStartTlUs = timelineUs;
+        e->atempoSrcFrameCarry = 0.0;
+        e->needsPtsAnchor = false;
+        e->postSeekFullDrop = false;
+        e->eof = true;
+        return;
+    }
     double fileLocalSec = e->entry.clipIn + (tlSec - e->entry.timelineStart);
     fileLocalSec = qBound(e->entry.clipIn, fileLocalSec, e->entry.clipOut);
     AVRational tb = e->fmtCtx->streams[e->audioStreamIdx]->time_base;
@@ -2970,12 +3372,7 @@ void AudioMixer::seekEntryToTimeline(AudioDecoderEntry *e, int64_t timelineUs) {
         // first stale-snapshot path.
         const uint64_t genAtEntry =
             m_speedRampGeneration.load(std::memory_order_relaxed);
-        const AudioTrackKey r8Key{
-            e->entry.filePath,
-            qRound64(e->entry.clipIn * 1000.0),
-            e->entry.sourceTrack,
-            e->entry.sourceClipIndex
-        };
+        const AudioTrackKey &r8Key = e->trackKey;
         const bool present = resolveAudioAtempoEnabled(
                 audioAtempoEnvForceCached(),
                 m_atempoByKey.contains(r8Key))
@@ -3165,7 +3562,7 @@ bool AudioMixer::refillRings() {
             e->seekPending = false;
             didWork = true;
         }
-        if (liveBytes(*e) < kRingTargetBytes) {
+        if (!e->reversed && liveBytes(*e) < kRingTargetBytes) {
             const int chunkTarget = qMin<int>(liveBytes(*e) + kPerCallChunkBytes,
                                               kRingTargetBytes);
             refillRingForEntry(e, chunkTarget);
