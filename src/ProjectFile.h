@@ -225,8 +225,9 @@ struct PlanarTrackerProjectState {
 // Full project state for serialization
 struct ProjectData {
     ProjectConfig config;
-    QVector<QVector<ClipInfo>> videoTracks;
-    QVector<QVector<ClipInfo>> audioTracks;
+    ProjectTrackClips videoTracks;
+    ProjectTrackClips audioTracks;
+    QJsonObject trackFlags;
     QVector<EnhancedTextOverlay> generatedCaptionOverlays;
     double playheadPos = 0.0;
     double markIn = -1.0;
@@ -368,6 +369,8 @@ private:
 
     static QJsonArray tracksToJson(const QVector<QVector<ClipInfo>> &tracks);
     static QVector<QVector<ClipInfo>> tracksFromJson(const QJsonArray &arr);
+    static QJsonObject trackFlagsToJson(const ProjectData &data);
+    static void trackFlagsFromJson(const QJsonObject &obj, ProjectData &data);
 
     // Audio mixer serialization
     static QJsonObject trackEqToJson(const TrackEqState &s);

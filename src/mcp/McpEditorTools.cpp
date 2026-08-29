@@ -214,11 +214,12 @@ QJsonObject trackOutputItemSchema()
 {
     return outputSchemaOf(QJsonObject{
         {QStringLiteral("index"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+        {QStringLiteral("locked"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
         {QStringLiteral("clips"), QJsonObject{
             {QStringLiteral("type"), QStringLiteral("array")},
             {QStringLiteral("items"), clipOutputItemSchema()}
         }}
-    }, {QStringLiteral("index"), QStringLiteral("clips")});
+    }, {QStringLiteral("index"), QStringLiteral("locked"), QStringLiteral("clips")});
 }
 
 QJsonObject captionOutputItemSchema()
@@ -282,6 +283,26 @@ QJsonObject clipSelectorProperties()
             {QStringLiteral("minimum"), 0},
             {QStringLiteral("description"),
              QStringLiteral("トラック内の 0-based のクリップ番号。get_timeline の index に対応する。必須")}
+        }}
+    };
+}
+
+QJsonObject trackSelectorProperties()
+{
+    return QJsonObject{
+        {QStringLiteral("kind"), QJsonObject{
+            {QStringLiteral("type"), QStringLiteral("string")},
+            {QStringLiteral("enum"), QJsonArray{
+                QStringLiteral("video"), QStringLiteral("audio")
+            }},
+            {QStringLiteral("description"),
+             QStringLiteral("video または audio")}
+        }},
+        {QStringLiteral("trackIndex"), QJsonObject{
+            {QStringLiteral("type"), QStringLiteral("integer")},
+            {QStringLiteral("minimum"), 0},
+            {QStringLiteral("description"),
+             QStringLiteral("0-based のトラック番号")}
         }}
     };
 }
@@ -504,6 +525,51 @@ bool requiredString(const QJsonObject& args, const QString& name,
     return true;
 }
 
+struct TrackTarget {
+    TimelineTrack* track = nullptr;
+    TrackKind kind = TrackKind::Video;
+    QString kindName;
+    int trackIndex = -1;
+};
+
+bool readTrackTarget(const QJsonObject& args, MainWindow* window,
+                     Timeline* currentTimeline, TrackTarget* out, QString* err)
+{
+    QString kind;
+    if (!requiredString(args, QStringLiteral("kind"), &kind, err))
+        return false;
+    if (kind != QStringLiteral("video") && kind != QStringLiteral("audio"))
+        return setError(err, QStringLiteral("kind must be video or audio"));
+    if (!args.contains(QStringLiteral("trackIndex")))
+        return setError(err, QStringLiteral("trackIndex is required"));
+    int trackIndex = -1;
+    if (!nonNegativeInteger(args, QStringLiteral("trackIndex"), -1,
+                            &trackIndex, err)) {
+        return false;
+    }
+    if (!window || !currentTimeline)
+        return setError(err, QStringLiteral("editor not available"));
+
+    const TrackKind trackKind = kind == QStringLiteral("audio")
+        ? TrackKind::Audio : TrackKind::Video;
+    TimelineTrack* track = currentTimeline->trackAt(trackKind == TrackKind::Audio,
+                                                    trackIndex);
+    if (!track) {
+        const int trackCount = trackKind == TrackKind::Audio
+            ? currentTimeline->audioTrackCount()
+            : currentTimeline->videoTrackCount();
+        return setError(err, QStringLiteral("track index is out of range (%1 トラックは %2 本: 0..%3)")
+                                 .arg(kind).arg(trackCount).arg(trackCount - 1));
+    }
+    if (out) {
+        out->track = track;
+        out->kind = trackKind;
+        out->kindName = kind;
+        out->trackIndex = trackIndex;
+    }
+    return true;
+}
+
 QString actionRiskToString(FavoritableActionRisk risk)
 {
     switch (risk) {
@@ -562,6 +628,7 @@ QJsonArray tracksToJson(const QVector<TimelineTrack*>& tracks)
         }
         result.append(QJsonObject{
             {QStringLiteral("index"), trackIndex},
+            {QStringLiteral("locked"), trackObject && trackObject->isLocked()},
             {QStringLiteral("clips"), clips}
         });
     }
@@ -616,7 +683,8 @@ bool toolMutatesTimeline(const QString& toolName)
     static const QSet<QString> kNonMutating{
         QStringLiteral("export_video"), QStringLiteral("select_clip"),
         QStringLiteral("clear_selection"), QStringLiteral("set_playhead"),
-        QStringLiteral("save_project"), QStringLiteral("add_caption"),
+        QStringLiteral("save_project"), QStringLiteral("set_track_locked"),
+        QStringLiteral("add_caption"),
         QStringLiteral("remove_caption"), QStringLiteral("clear_captions")
     };
     return !kNonMutating.contains(toolName);
@@ -869,9 +937,11 @@ void McpEditorTools::registerReadTools()
 
             const Timeline* currentTimeline = timeline();
             const QVector<QVector<ClipInfo>> videoTracks = currentTimeline
-                ? currentTimeline->allVideoTracks() : QVector<QVector<ClipInfo>>();
+                ? QVector<QVector<ClipInfo>>(currentTimeline->allVideoTracks())
+                : QVector<QVector<ClipInfo>>();
             const QVector<QVector<ClipInfo>> audioTracks = currentTimeline
-                ? currentTimeline->allAudioTracks() : QVector<QVector<ClipInfo>>();
+                ? QVector<QVector<ClipInfo>>(currentTimeline->allAudioTracks())
+                : QVector<QVector<ClipInfo>>();
             // MainWindow owns the project configuration; when its Timeline is
             // absent there is no loaded editor project, so expose empty/zero values.
             const bool projectAvailable = currentTimeline != nullptr;
@@ -1311,6 +1381,14 @@ void McpEditorTools::registerWriteTools()
         {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
         {QStringLiteral("path"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}}
     }, {QStringLiteral("ok"), QStringLiteral("path")});
+
+    const QJsonObject setTrackLockedOutputSchema = outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("kind"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
+        {QStringLiteral("trackIndex"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+        {QStringLiteral("locked"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}}
+    }, {QStringLiteral("ok"), QStringLiteral("kind"),
+        QStringLiteral("trackIndex"), QStringLiteral("locked")});
 
     const QJsonObject selectClipOutputSchema = outputSchemaOf(QJsonObject{
         {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
@@ -1850,6 +1928,53 @@ void McpEditorTools::registerWriteTools()
             };
         })
     }, openProjectOutputSchema));
+
+    m_registry->registerTool(withOutputSchema({
+        QStringLiteral("set_track_locked"),
+        QStringLiteral("指定トラックの編集ロックを設定する。ロック中は split_clip / delete_clip / move_clip などのクリップ編集を拒否する。ロック変更は Undo 対象外。"),
+        schemaWithRequired(mergedProperties(trackSelectorProperties(), QJsonObject{
+            {QStringLiteral("locked"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("boolean")},
+                {QStringLiteral("description"),
+                 QStringLiteral("true でロック、false で解除")}
+            }}
+        }), {QStringLiteral("kind"), QStringLiteral("trackIndex"),
+             QStringLiteral("locked")}),
+        guardedWrite(QStringLiteral("set_track_locked"),
+                     [this](const QJsonObject& args, QString* err) -> QJsonObject {
+            if (!rejectUnknownArguments(args,
+                                        {QStringLiteral("kind"),
+                                         QStringLiteral("trackIndex"),
+                                         QStringLiteral("locked")}, err)) {
+                return {};
+            }
+            const QJsonValue lockedValue = args.value(QStringLiteral("locked"));
+            if (!lockedValue.isBool())
+                return setError(err, QStringLiteral("locked must be a boolean")),
+                       QJsonObject();
+
+            TrackTarget target;
+            Timeline* currentTimeline = timeline();
+            if (!readTrackTarget(args, m_window, currentTimeline, &target, err))
+                return {};
+            const bool locked = lockedValue.toBool();
+            const bool changed = target.track->isLocked() != locked;
+            if (!currentTimeline->setTrackLocked(target.kind, target.trackIndex,
+                                                 locked)) {
+                return setError(err, QStringLiteral("track index is out of range")),
+                       QJsonObject();
+            }
+            if (changed)
+                m_window->setWindowModified(true);
+            syncSelectionAfterEdit();
+            return QJsonObject{
+                {QStringLiteral("ok"), true},
+                {QStringLiteral("kind"), target.kindName},
+                {QStringLiteral("trackIndex"), target.trackIndex},
+                {QStringLiteral("locked"), locked}
+            };
+        })
+    }, setTrackLockedOutputSchema));
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("select_clip"),

@@ -597,6 +597,7 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
     root["config"] = configToJson(data.config);
     root["videoTracks"] = tracksToJson(data.videoTracks);
     root["audioTracks"] = tracksToJson(data.audioTracks);
+    root["trackFlags"] = trackFlagsToJson(data);
     root["generatedCaptionOverlays"] = TextManager::toJson(data.generatedCaptionOverlays);
     root["playheadPos"] = data.playheadPos;
     root["markIn"] = data.markIn;
@@ -906,6 +907,7 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
     data.config = configFromJson(root["config"].toObject());
     data.videoTracks = tracksFromJson(root["videoTracks"].toArray());
     data.audioTracks = tracksFromJson(root["audioTracks"].toArray());
+    trackFlagsFromJson(root.value("trackFlags").toObject(), data);
     data.generatedCaptionOverlays = TextManager::fromJson(
         root.value("generatedCaptionOverlays").toArray());
     migrateGeneratedCaptionsToProjectLevel(data);
@@ -1190,6 +1192,7 @@ QString ProjectFile::toJsonString(const ProjectData &data)
     root["config"] = configToJson(data.config);
     root["videoTracks"] = tracksToJson(data.videoTracks);
     root["audioTracks"] = tracksToJson(data.audioTracks);
+    root["trackFlags"] = trackFlagsToJson(data);
     root["generatedCaptionOverlays"] = TextManager::toJson(data.generatedCaptionOverlays);
     root["playheadPos"] = data.playheadPos;
     root["markIn"] = data.markIn;
@@ -1474,6 +1477,7 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
     data.config = configFromJson(root["config"].toObject());
     data.videoTracks = tracksFromJson(root["videoTracks"].toArray());
     data.audioTracks = tracksFromJson(root["audioTracks"].toArray());
+    trackFlagsFromJson(root.value("trackFlags").toObject(), data);
     data.generatedCaptionOverlays = TextManager::fromJson(
         root.value("generatedCaptionOverlays").toArray());
     migrateGeneratedCaptionsToProjectLevel(data);
@@ -2163,6 +2167,57 @@ QVector<QVector<ClipInfo>> ProjectFile::tracksFromJson(const QJsonArray &arr)
         tracks.append(clips);
     }
     return tracks;
+}
+
+QJsonObject ProjectFile::trackFlagsToJson(const ProjectData &data)
+{
+    QJsonObject source = data.trackFlags;
+    if (source.isEmpty())
+        source = data.videoTracks.trackFlagsSnapshot;
+    if (source.isEmpty())
+        source = data.audioTracks.trackFlagsSnapshot;
+
+    auto normalizedArray = [](const QJsonArray &flags, int trackCount) {
+        QJsonArray result;
+        for (int index = 0; index < trackCount; ++index) {
+            const QJsonObject candidate = index < flags.size()
+                ? flags.at(index).toObject() : QJsonObject{};
+            QJsonObject item;
+            const bool locked = candidate.value(QStringLiteral("locked")).toBool(false);
+            const bool muted = candidate.value(QStringLiteral("muted")).toBool(false);
+            const bool solo = candidate.value(QStringLiteral("solo")).toBool(false);
+            const bool hidden = candidate.value(QStringLiteral("hidden")).toBool(false);
+            if (locked || muted || solo || hidden) {
+                item.insert(QStringLiteral("locked"), locked);
+                item.insert(QStringLiteral("muted"), muted);
+                item.insert(QStringLiteral("solo"), solo);
+                item.insert(QStringLiteral("hidden"), hidden);
+            }
+            // Keep one array entry per track even when every flag is false.
+            result.append(item);
+        }
+        return result;
+    };
+
+    return QJsonObject{
+        {QStringLiteral("video"),
+         normalizedArray(source.value(QStringLiteral("video")).toArray(),
+                         data.videoTracks.size())},
+        {QStringLiteral("audio"),
+         normalizedArray(source.value(QStringLiteral("audio")).toArray(),
+                         data.audioTracks.size())}
+    };
+}
+
+void ProjectFile::trackFlagsFromJson(const QJsonObject &obj, ProjectData &data)
+{
+    ProjectData normalizedSource;
+    normalizedSource.videoTracks.resize(data.videoTracks.size());
+    normalizedSource.audioTracks.resize(data.audioTracks.size());
+    normalizedSource.trackFlags = obj;
+    data.trackFlags = trackFlagsToJson(normalizedSource);
+    data.videoTracks.trackFlagsSnapshot = data.trackFlags;
+    data.audioTracks.trackFlagsSnapshot = data.trackFlags;
 }
 
 // --- Audio Mixer: Track EQ ---

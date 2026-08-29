@@ -768,6 +768,7 @@ int runMcpSelftest()
         QStringLiteral("split_clip"),
         QStringLiteral("delete_clip"),
         QStringLiteral("move_clip"),
+        QStringLiteral("set_track_locked"),
         QStringLiteral("set_clip_property"),
         QStringLiteral("trim_clip"),
         QStringLiteral("set_transition"),
@@ -1060,7 +1061,8 @@ int runMcpSelftest()
 
     const QStringList changedToolNames{
         QStringLiteral("split_clip"), QStringLiteral("delete_clip"),
-        QStringLiteral("move_clip"), QStringLiteral("set_clip_property"),
+        QStringLiteral("move_clip"), QStringLiteral("set_track_locked"),
+        QStringLiteral("set_clip_property"),
         QStringLiteral("trim_clip"), QStringLiteral("set_transition"),
         QStringLiteral("add_text_overlay")
     };
@@ -1075,6 +1077,11 @@ int runMcpSelftest()
         }},
         {QStringLiteral("move_clip"), QJsonObject{
             {QStringLiteral("clipIndex"), 0}, {QStringLiteral("newStartSec"), 0.0},
+            {QStringLiteral("track"), QStringLiteral("video")}
+        }},
+        {QStringLiteral("set_track_locked"), QJsonObject{
+            {QStringLiteral("kind"), QStringLiteral("video")},
+            {QStringLiteral("trackIndex"), 0}, {QStringLiteral("locked"), true},
             {QStringLiteral("track"), QStringLiteral("video")}
         }},
         {QStringLiteral("set_clip_property"), QJsonObject{
@@ -1144,7 +1151,7 @@ int runMcpSelftest()
             rpcRequest(73, QStringLiteral("tools/list")))))
         .value(QStringLiteral("result")).toObject()
         .value(QStringLiteral("tools")).toArray();
-    constexpr int kExpectedProjectInfoToolCount = 27;
+    constexpr int kExpectedProjectInfoToolCount = 28;
     bool outputSchemasDeclared = projectInfoToolDescriptors.size()
         == kExpectedProjectInfoToolCount;
     for (const QJsonValue& value : projectInfoToolDescriptors) {
@@ -1571,6 +1578,280 @@ int runMcpSelftest()
         g52 ? pass("G52 linked V/A clips move together")
             : fail("G52 linked V/A clips move together",
                    QStringLiteral("linked audio/video clips diverged during track move"));
+
+        auto timelineTrackObject = [](const QJsonObject &payload,
+                                      const QString &kind, int trackIndex) {
+            const QJsonArray tracks = payload.value(kind).toArray();
+            return trackIndex >= 0 && trackIndex < tracks.size()
+                ? tracks.at(trackIndex).toObject() : QJsonObject{};
+        };
+
+        const QJsonObject lockResponse = callProjectInfoTool(
+            201, QStringLiteral("set_track_locked"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("locked"), true}
+            });
+        const QJsonObject lockedTimelineResponse = callProjectInfoTool(
+            202, QStringLiteral("get_timeline"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")}
+            });
+        const QJsonObject lockPayload = toolPayload(lockResponse);
+        const QJsonObject lockedTimelinePayload = toolPayload(lockedTimelineResponse);
+        const bool g114 = !toolResult(lockResponse)
+                                .value(QStringLiteral("isError")).toBool(true)
+            && lockPayload.value(QStringLiteral("ok")).toBool(false)
+            && lockPayload.value(QStringLiteral("locked")).toBool(false)
+            && requiredOutputFieldsPresent(QStringLiteral("set_track_locked"),
+                                           lockPayload)
+            && video0->isLocked()
+            && timelineTrackObject(lockedTimelinePayload,
+                                   QStringLiteral("video"), 0)
+                   .value(QStringLiteral("locked")).toBool(false);
+        g114 ? pass("G114 set_track_locked is reflected by get_timeline")
+             : fail("G114 set_track_locked is reflected by get_timeline",
+                    QStringLiteral("V1 was not locked or get_timeline omitted locked=true"));
+
+        const QJsonObject unlockResponse = callProjectInfoTool(
+            203, QStringLiteral("set_track_locked"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("locked"), false}
+            });
+        const QJsonObject unlockedTimelineResponse = callProjectInfoTool(
+            204, QStringLiteral("get_timeline"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")}
+            });
+        const bool g115 = toolPayload(unlockResponse)
+                                .value(QStringLiteral("ok")).toBool(false)
+            && !video0->isLocked()
+            && !timelineTrackObject(toolPayload(unlockedTimelineResponse),
+                                    QStringLiteral("video"), 0)
+                    .value(QStringLiteral("locked")).toBool(true);
+        g115 ? pass("G115 set_track_locked unlocks the track")
+             : fail("G115 set_track_locked unlocks the track",
+                    QStringLiteral("V1 remained locked after locked=false"));
+
+        const QJsonObject missingTrackLockResponse = callProjectInfoTool(
+            205, QStringLiteral("set_track_locked"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")},
+                {QStringLiteral("trackIndex"), projectTimeline->videoTrackCount() + 10},
+                {QStringLiteral("locked"), true}
+            });
+        const bool g116 = toolResult(missingTrackLockResponse)
+                                .value(QStringLiteral("isError")).toBool(false)
+            && toolErrorText(missingTrackLockResponse)
+                   .contains(QStringLiteral("track index is out of range"));
+        g116 ? pass("G116 set_track_locked rejects a missing track")
+             : fail("G116 set_track_locked rejects a missing track",
+                    QStringLiteral("an out-of-range track was accepted"));
+
+        video0->setClips(QVector<ClipInfo>{
+            makeTestClip(QStringLiteral("locked-guard"), 0)
+        });
+        video1->setClips(QVector<ClipInfo>{});
+        audio0->setClips(QVector<ClipInfo>{});
+        audio1->setClips(QVector<ClipInfo>{});
+        projectTimeline->clearSelection();
+        saveTestUndoBaseline();
+        callProjectInfoTool(206, QStringLiteral("set_track_locked"), QJsonObject{
+            {QStringLiteral("kind"), QStringLiteral("video")},
+            {QStringLiteral("trackIndex"), 0},
+            {QStringLiteral("locked"), true}
+        });
+        const QJsonObject lockedSplitResponse = callProjectInfoTool(
+            207, QStringLiteral("split_clip"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 0},
+                {QStringLiteral("timeSec"), 1.0}
+            });
+        const QJsonObject lockedDeleteResponse = callProjectInfoTool(
+            208, QStringLiteral("delete_clip"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 0}
+            });
+        const QJsonObject lockedMoveResponse = callProjectInfoTool(
+            209, QStringLiteral("move_clip"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 0},
+                {QStringLiteral("newStartSec"), 1.0}
+            });
+        const auto lockedEditRejected = [&](const QJsonObject &response) {
+            return toolResult(response).value(QStringLiteral("isError")).toBool(false)
+                && toolErrorText(response) == QStringLiteral("track is locked");
+        };
+        const bool g117 = lockedEditRejected(lockedSplitResponse)
+            && lockedEditRejected(lockedDeleteResponse)
+            && lockedEditRejected(lockedMoveResponse)
+            && video0->clipCount() == 1
+            && video0->clips().first().displayName == QStringLiteral("locked-guard")
+            && !projectTimeline->undoManager()->canUndo();
+        g117 ? pass("G117 locked tracks reject split/delete/move")
+             : fail("G117 locked tracks reject split/delete/move",
+                    QStringLiteral("a locked edit mutated V1 or added undo state"));
+        callProjectInfoTool(210, QStringLiteral("set_track_locked"), QJsonObject{
+            {QStringLiteral("kind"), QStringLiteral("video")},
+            {QStringLiteral("trackIndex"), 0},
+            {QStringLiteral("locked"), false}
+        });
+
+        QJsonArray videoFlags;
+        QJsonArray audioFlags;
+        for (int index = 0; index < projectTimeline->videoTrackCount(); ++index) {
+            videoFlags.append(index == 0
+                ? QJsonObject{{QStringLiteral("locked"), true},
+                              {QStringLiteral("hidden"), true}}
+                : QJsonObject{});
+        }
+        for (int index = 0; index < projectTimeline->audioTrackCount(); ++index) {
+            audioFlags.append(index == 0
+                ? QJsonObject{{QStringLiteral("muted"), true},
+                              {QStringLiteral("solo"), true}}
+                : QJsonObject{});
+        }
+        projectTimeline->applyTrackFlagsFromJson(QJsonObject{
+            {QStringLiteral("video"), videoFlags},
+            {QStringLiteral("audio"), audioFlags}
+        });
+
+        const QString trackFlagsProjectPath = projectBehaviorDirReady
+            ? QDir(projectBehaviorDir.path()).filePath(
+                  QStringLiteral("track-flags-roundtrip.vsep"))
+            : QString();
+        const QString legacyTrackFlagsProjectPath = projectBehaviorDirReady
+            ? QDir(projectBehaviorDir.path()).filePath(
+                  QStringLiteral("track-flags-legacy.vsep"))
+            : QString();
+        QJsonObject trackFlagsSaveResponse;
+        QJsonObject trackFlagsOpenResponse;
+        QJsonDocument savedTrackFlagsDocument;
+        bool savedFileRead = false;
+        if (projectBehaviorDirReady) {
+            trackFlagsSaveResponse = callProjectInfoTool(
+                211, QStringLiteral("save_project"), QJsonObject{
+                    {QStringLiteral("path"), trackFlagsProjectPath}
+                });
+            QFile savedFile(trackFlagsProjectPath);
+            savedFileRead = savedFile.open(QIODevice::ReadOnly);
+            if (savedFileRead)
+                savedTrackFlagsDocument = QJsonDocument::fromJson(savedFile.readAll());
+            projectTimeline->applyTrackFlagsFromJson(QJsonObject{});
+            trackFlagsOpenResponse = callProjectInfoTool(
+                212, QStringLiteral("open_project"), QJsonObject{
+                    {QStringLiteral("path"), trackFlagsProjectPath}
+                });
+        }
+        const QJsonObject reopenedTimelineResponse = callProjectInfoTool(
+            213, QStringLiteral("get_timeline"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("all")}
+            });
+        const QJsonObject reopenedTimelinePayload = toolPayload(reopenedTimelineResponse);
+        const QJsonObject restoredFlags = projectTimeline->trackFlagsToJson();
+        const QJsonArray restoredVideoFlags = restoredFlags
+            .value(QStringLiteral("video")).toArray();
+        const QJsonArray restoredAudioFlags = restoredFlags
+            .value(QStringLiteral("audio")).toArray();
+        const QJsonObject restoredVideo0 = restoredVideoFlags.isEmpty()
+            ? QJsonObject{} : restoredVideoFlags.first().toObject();
+        const QJsonObject restoredAudio0 = restoredAudioFlags.isEmpty()
+            ? QJsonObject{} : restoredAudioFlags.first().toObject();
+        const QJsonObject savedRoot = savedTrackFlagsDocument.object();
+        const QJsonObject savedFlags = savedRoot
+            .value(QStringLiteral("trackFlags")).toObject();
+        const bool flagsRoundtripped = projectBehaviorDirReady && savedFileRead
+            && !toolResult(trackFlagsSaveResponse)
+                    .value(QStringLiteral("isError")).toBool(true)
+            && !toolResult(trackFlagsOpenResponse)
+                    .value(QStringLiteral("isError")).toBool(true)
+            && timelineTrackObject(reopenedTimelinePayload,
+                                   QStringLiteral("video"), 0)
+                   .value(QStringLiteral("locked")).toBool(false)
+            && restoredVideoFlags.size() == projectTimeline->videoTrackCount()
+            && restoredAudioFlags.size() == projectTimeline->audioTrackCount()
+            && restoredVideo0.value(QStringLiteral("locked")).toBool(false)
+            && restoredVideo0.value(QStringLiteral("hidden")).toBool(false)
+            && restoredAudio0.value(QStringLiteral("muted")).toBool(false)
+            && restoredAudio0.value(QStringLiteral("solo")).toBool(false)
+            && savedFlags.value(QStringLiteral("video")).toArray().size()
+                   == projectTimeline->videoTrackCount()
+            && savedFlags.value(QStringLiteral("audio")).toArray().size()
+                   == projectTimeline->audioTrackCount();
+
+        const auto anyCheckedButton = [&projectInfoWindow](const QString &objectName,
+                                                           const QString &text) {
+            const QList<QPushButton *> buttons =
+                projectInfoWindow.findChildren<QPushButton *>(objectName);
+            for (const QPushButton *button : buttons) {
+                if (button && button->isChecked() && button->text() == text)
+                    return true;
+            }
+            return false;
+        };
+        const bool headersSynchronized =
+            anyCheckedButton(QStringLiteral("timelineTrackLockButton"),
+                             QString::fromUtf8("\xF0\x9F\x94\x92"))
+            && anyCheckedButton(QStringLiteral("timelineTrackMuteButton"),
+                                QString::fromUtf8("\xF0\x9F\x94\x87"))
+            && anyCheckedButton(QStringLiteral("timelineTrackSoloButton"),
+                                QStringLiteral("S"))
+            && anyCheckedButton(QStringLiteral("timelineTrackHideButton"),
+                                QString::fromUtf8("\xE2\x8A\x98"));
+
+        bool legacyFileWritten = false;
+        if (savedFileRead && !savedTrackFlagsDocument.isNull()) {
+            QJsonObject legacyRoot = savedTrackFlagsDocument.object();
+            legacyRoot.remove(QStringLiteral("trackFlags"));
+            QFile legacyFile(legacyTrackFlagsProjectPath);
+            if (legacyFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+                const QByteArray legacyJson = QJsonDocument(legacyRoot).toJson(
+                    QJsonDocument::Indented);
+                legacyFileWritten = legacyFile.write(legacyJson) == legacyJson.size();
+            }
+        }
+        QJsonObject legacyOpenResponse;
+        if (legacyFileWritten) {
+            legacyOpenResponse = callProjectInfoTool(
+                214, QStringLiteral("open_project"), QJsonObject{
+                    {QStringLiteral("path"), legacyTrackFlagsProjectPath}
+                });
+        }
+        const QJsonObject legacyFlags = projectTimeline->trackFlagsToJson();
+        auto allFlagsFalse = [](const QJsonArray &tracks) {
+            for (const QJsonValue &value : tracks) {
+                const QJsonObject flags = value.toObject();
+                if (flags.value(QStringLiteral("locked")).toBool(false)
+                    || flags.value(QStringLiteral("muted")).toBool(false)
+                    || flags.value(QStringLiteral("solo")).toBool(false)
+                    || flags.value(QStringLiteral("hidden")).toBool(false)) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        const bool legacyDefaults = legacyFileWritten
+            && !toolResult(legacyOpenResponse)
+                    .value(QStringLiteral("isError")).toBool(true)
+            && allFlagsFalse(legacyFlags.value(QStringLiteral("video")).toArray())
+            && allFlagsFalse(legacyFlags.value(QStringLiteral("audio")).toArray());
+        const bool g118 = flagsRoundtripped && headersSynchronized && legacyDefaults;
+        g118 ? pass("G118 track flags survive save/open and legacy defaults are false")
+             : fail("G118 track flags survive save/open and legacy defaults are false",
+                    QStringLiteral("flags, header state, array lengths, or legacy defaults diverged"));
+
+        // 後続の get_frame fixture は空の V1/A1 へ media を 1 件ずつ取り込む。
+        // roundtrip で再読込したクリップと undo 履歴をここで隔離する。
+        const QVector<TimelineTrack *> tracks =
+            projectTimeline->videoTracks() + projectTimeline->audioTracks();
+        for (TimelineTrack *track : tracks) {
+            if (track)
+                track->setClips(QVector<ClipInfo>{});
+        }
+        projectTimeline->applyTrackFlagsFromJson(QJsonObject{});
+        projectTimeline->clearSelection();
+        saveTestUndoBaseline();
     }
     if (!timelineReady) {
         fail("G45 select_clip rejects out-of-range index", QStringLiteral("Timeline was not available"));
@@ -1581,6 +1862,11 @@ int runMcpSelftest()
         fail("G50 blocked move reports actual start and reason", QStringLiteral("Timeline was not available"));
         fail("G51 move_clip supports cross-track movement", QStringLiteral("Timeline was not available"));
         fail("G52 linked V/A clips move together", QStringLiteral("Timeline was not available"));
+        fail("G114 set_track_locked is reflected by get_timeline", QStringLiteral("Timeline was not available"));
+        fail("G115 set_track_locked unlocks the track", QStringLiteral("Timeline was not available"));
+        fail("G116 set_track_locked rejects a missing track", QStringLiteral("Timeline was not available"));
+        fail("G117 locked tracks reject split/delete/move", QStringLiteral("Timeline was not available"));
+        fail("G118 track flags survive save/open and legacy defaults are false", QStringLiteral("Timeline was not available"));
     }
 
     const bool selectClipFieldsPresent =
@@ -2986,6 +3272,10 @@ int runMcpSelftest()
         {QStringLiteral("move_clip"), QJsonObject{
             {QStringLiteral("clipIndex"), 0}, {QStringLiteral("newStartSec"), 0.0}
         }},
+        {QStringLiteral("set_track_locked"), QJsonObject{
+            {QStringLiteral("kind"), QStringLiteral("video")},
+            {QStringLiteral("trackIndex"), 0}, {QStringLiteral("locked"), true}
+        }},
         {QStringLiteral("set_clip_property"), QJsonObject{
             {QStringLiteral("clipIndex"), 0}, {QStringLiteral("property"), QStringLiteral("volume")},
             {QStringLiteral("value"), 1.0}
@@ -3049,5 +3339,7 @@ int runMcpSelftest()
     server.stop();
     qInfo().noquote().nospace() << "[mcp] selftest end, passed=" << passed
                                 << " failed=" << failed;
-    return failed == 0 ? 0 : 1;
+    qInfo().noquote().nospace() << "summary: " << passed << " PASS, "
+                                << failed << " FAIL";
+    return failed;
 }

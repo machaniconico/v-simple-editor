@@ -15,6 +15,9 @@
 #include <QString>
 #include <QJsonObject>
 #include <cstdint>
+#include <initializer_list>
+#include <optional>
+#include <utility>
 #include "VideoEffect.h"
 #include "Keyframe.h"
 #include "WaveformGenerator.h"
@@ -52,6 +55,11 @@ enum class AutoProxyMode {
     Disabled = 0,         // Never auto-generate; user runs ツール → プロキシ管理 manually
     MultiTrackOnly = 1,   // Default: only when the clip lands on V2 or later
     Always = 2            // Generate on every heavy import regardless of track
+};
+
+enum class TrackKind {
+    Video,
+    Audio
 };
 
 class AudioMixer;
@@ -295,6 +303,38 @@ struct TimelineSequence {
         };
         return qMax(tracksDuration(videoTracks), tracksDuration(audioTracks));
     }
+};
+
+// ProjectData normally receives its clip matrices through allVideoTracks() /
+// allAudioTracks().  Keep the matching track-flag snapshot attached to those
+// values so the existing MainWindow save/load call sites do not need a second,
+// separately ordered transfer step.  It is metadata for ProjectFile only and
+// remains implicitly usable anywhere a QVector<QVector<ClipInfo>> is expected.
+struct ProjectTrackClips : public QVector<QVector<ClipInfo>> {
+    using Base = QVector<QVector<ClipInfo>>;
+    using Base::Base;
+
+    ProjectTrackClips() = default;
+    ProjectTrackClips(const Base &clips) : Base(clips) {}
+    ProjectTrackClips(Base &&clips) : Base(std::move(clips)) {}
+
+    ProjectTrackClips &operator=(const Base &clips) {
+        Base::operator=(clips);
+        trackFlagsSnapshot = QJsonObject{};
+        return *this;
+    }
+    ProjectTrackClips &operator=(Base &&clips) {
+        Base::operator=(std::move(clips));
+        trackFlagsSnapshot = QJsonObject{};
+        return *this;
+    }
+    ProjectTrackClips &operator=(std::initializer_list<QVector<ClipInfo>> clips) {
+        Base::operator=(clips);
+        trackFlagsSnapshot = QJsonObject{};
+        return *this;
+    }
+
+    QJsonObject trackFlagsSnapshot;
 };
 
 enum class DragMode {
@@ -718,6 +758,9 @@ public:
         const auto &tracks = audio ? m_audioTracks : m_videoTracks;
         return index >= 0 && index < tracks.size() ? tracks.at(index) : nullptr;
     }
+    bool setTrackLocked(TrackKind kind, int trackIndex, bool locked);
+    QJsonObject trackFlagsToJson() const;
+    void applyTrackFlagsFromJson(const QJsonObject &flags);
 
     // Track row height (applied to all tracks AND their header widgets)
     void setTrackHeight(int h);
@@ -922,10 +965,13 @@ public:
     void refreshPlaybackSequence();
 
     // Project save/load support
-    QVector<QVector<ClipInfo>> allVideoTracks() const;
-    QVector<QVector<ClipInfo>> allAudioTracks() const;
+    ProjectTrackClips allVideoTracks() const;
+    ProjectTrackClips allAudioTracks() const;
     void restoreFromProject(const QVector<QVector<ClipInfo>> &videoTracks,
                             const QVector<QVector<ClipInfo>> &audioTracks,
+                            double playhead, double markIn, double markOut, int zoom);
+    void restoreFromProject(const ProjectTrackClips &videoTracks,
+                            const ProjectTrackClips &audioTracks,
                             double playhead, double markIn, double markOut, int zoom);
 
     // TM-8: track-matte wiring SSOT. Producers (MainWindow on every
@@ -1019,6 +1065,7 @@ private:
     void updateInfoLabel();
     void ensureSequenceFitsViewport();
     QWidget *createTrackHeader(TimelineTrack *track, const QString &name, bool isAudioRow);
+    void syncTrackHeaderFlags(TimelineTrack *track);
     void notifyMutationsChanged();
     void wireTrackSelection(TimelineTrack *track);
     void clearAllSelections();
@@ -1063,6 +1110,7 @@ private:
     QVBoxLayout *m_tracksLayout;
     QWidget *m_headerColumn = nullptr;
     QVBoxLayout *m_headerLayout = nullptr;
+    QHash<TimelineTrack *, QWidget *> m_trackHeaders;
     static constexpr int kHeaderColumnWidth = 130;
     PlayheadOverlay *m_playheadOverlay = nullptr;
     class TimeRuler *m_timeRuler = nullptr;

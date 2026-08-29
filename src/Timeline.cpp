@@ -3329,6 +3329,7 @@ QWidget *Timeline::createTrackHeader(TimelineTrack *track, const QString &name, 
     // When locked, mousePressEvent/dropEvent on the track early-return so
     // drag/trim/split/drop edits are blocked — playback is unaffected.
     auto *lockBtn = new QPushButton(QString::fromUtf8("\xF0\x9F\x94\x93"), w); // 🔓
+    lockBtn->setObjectName(QStringLiteral("timelineTrackLockButton"));
     lockBtn->setFixedSize(28, 28);
     lockBtn->setCheckable(true);
     lockBtn->setToolTip(QStringLiteral("編集ロック"));
@@ -3338,13 +3339,13 @@ QWidget *Timeline::createTrackHeader(TimelineTrack *track, const QString &name, 
         "QPushButton:hover { background-color: #555; }"
         "QPushButton:checked { background-color: #cc8; color: #222; border: 1px solid #ffd; }");
 
-    // Audio rows get a mute toggle; video rows get a hide toggle. Previously
-    // both rows carried both icons which had no semantic fit on the wrong
-    // track type.
+    // Audio rows get mute/solo toggles; video rows get a hide toggle.
     QPushButton *muteBtn = nullptr;
+    QPushButton *soloBtn = nullptr;
     QPushButton *hideBtn = nullptr;
     if (isAudioRow) {
         muteBtn = new QPushButton(QString::fromUtf8("\xF0\x9F\x94\x8A"), w); // 🔊
+        muteBtn->setObjectName(QStringLiteral("timelineTrackMuteButton"));
         muteBtn->setFixedSize(28, 28);
         muteBtn->setCheckable(true);
         muteBtn->setToolTip(QStringLiteral("ミュート (audio)"));
@@ -3353,8 +3354,20 @@ QWidget *Timeline::createTrackHeader(TimelineTrack *track, const QString &name, 
             "  border-radius: 3px; font-size: 14px; padding: 0; }"
             "QPushButton:hover { background-color: #555; }"
             "QPushButton:checked { background-color: #c44; color: white; border: 1px solid #f88; }");
+
+        soloBtn = new QPushButton(QStringLiteral("S"), w);
+        soloBtn->setObjectName(QStringLiteral("timelineTrackSoloButton"));
+        soloBtn->setFixedSize(28, 28);
+        soloBtn->setCheckable(true);
+        soloBtn->setToolTip(QStringLiteral("ソロ（音声）"));
+        soloBtn->setStyleSheet(
+            "QPushButton { background-color: #444; color: #ddd; border: 1px solid #666;"
+            "  border-radius: 3px; font-size: 13px; font-weight: bold; padding: 0; }"
+            "QPushButton:hover { background-color: #555; }"
+            "QPushButton:checked { background-color: #ca3; color: #222; border: 1px solid #fd6; }");
     } else {
         hideBtn = new QPushButton(QString::fromUtf8("\xE2\x97\x89"), w); // ◉
+        hideBtn->setObjectName(QStringLiteral("timelineTrackHideButton"));
         hideBtn->setFixedSize(28, 28);
         hideBtn->setCheckable(true);
         hideBtn->setToolTip(QStringLiteral("非表示 (hide video)"));
@@ -3372,12 +3385,14 @@ QWidget *Timeline::createTrackHeader(TimelineTrack *track, const QString &name, 
 
     hbox->addWidget(lockBtn);
     if (muteBtn) hbox->addWidget(muteBtn);
+    if (soloBtn) hbox->addWidget(soloBtn);
     if (hideBtn) hbox->addWidget(hideBtn);
     hbox->addWidget(label, 1);
 
     QPointer<TimelineTrack> trackPtr(track);
     QPointer<QPushButton> lockBtnPtr(lockBtn);
     QPointer<QPushButton> muteBtnPtr(muteBtn);
+    QPointer<QPushButton> soloBtnPtr(soloBtn);
     QPointer<QPushButton> hideBtnPtr(hideBtn);
     QPointer<QWidget> headerPtr(w);
 
@@ -3413,6 +3428,20 @@ QWidget *Timeline::createTrackHeader(TimelineTrack *track, const QString &name, 
             scheduleEmitSequenceChanged();
         });
     }
+    if (soloBtn) {
+        connect(soloBtn, &QPushButton::toggled, this,
+                [this, trackPtr, soloBtnPtr](bool checked) {
+            if (!trackPtr)
+                return;
+            qInfo() << "Timeline: solo toggled =" << checked
+                    << "track=" << trackPtr.data();
+            const int trackIndex = m_audioTracks.indexOf(trackPtr.data());
+            if (trackIndex >= 0)
+                toggleSoloTrack(trackIndex);
+            if (soloBtnPtr)
+                soloBtnPtr->setChecked(trackPtr->isSolo());
+        });
+    }
     if (hideBtn) {
         connect(hideBtn, &QPushButton::toggled, this, [this, trackPtr, hideBtnPtr](bool checked) {
             if (!trackPtr) return;
@@ -3428,7 +3457,41 @@ QWidget *Timeline::createTrackHeader(TimelineTrack *track, const QString &name, 
         });
     }
 
+    m_trackHeaders.insert(track, w);
+    syncTrackHeaderFlags(track);
+
     return w;
+}
+
+void Timeline::syncTrackHeaderFlags(TimelineTrack *track)
+{
+    QWidget *header = m_trackHeaders.value(track, nullptr);
+    if (!track || !header)
+        return;
+
+    auto syncButton = [header](const QString &objectName, bool checked,
+                               const QString &onText, const QString &offText) {
+        auto *button = header->findChild<QPushButton *>(objectName,
+                                                        Qt::FindDirectChildrenOnly);
+        if (!button)
+            return;
+        const bool wasBlocked = button->blockSignals(true);
+        button->setChecked(checked);
+        button->setText(checked ? onText : offText);
+        button->blockSignals(wasBlocked);
+    };
+
+    syncButton(QStringLiteral("timelineTrackLockButton"), track->isLocked(),
+               QString::fromUtf8("\xF0\x9F\x94\x92"), // 🔒
+               QString::fromUtf8("\xF0\x9F\x94\x93")); // 🔓
+    syncButton(QStringLiteral("timelineTrackMuteButton"), track->isMuted(),
+               QString::fromUtf8("\xF0\x9F\x94\x87"), // 🔇
+               QString::fromUtf8("\xF0\x9F\x94\x8A")); // 🔊
+    syncButton(QStringLiteral("timelineTrackSoloButton"), track->isSolo(),
+               QStringLiteral("S"), QStringLiteral("S"));
+    syncButton(QStringLiteral("timelineTrackHideButton"), track->isHidden(),
+               QString::fromUtf8("\xE2\x8A\x98"), // ⊘
+               QString::fromUtf8("\xE2\x97\x89")); // ◉
 }
 
 void Timeline::addVideoTrack()
@@ -7459,6 +7522,7 @@ void Timeline::toggleMuteTrack(int audioTrackIndex)
     if (audioTrackIndex < 0 || audioTrackIndex >= m_audioTracks.size()) return;
     auto *track = m_audioTracks[audioTrackIndex];
     track->setMuted(!track->isMuted());
+    syncTrackHeaderFlags(track);
     // Re-emit so AudioMixer picks up the new audioMuted flag for every
     // entry on this track. Without this the mute toggle stayed silent
     // until the next clip edit triggered a sequence rebuild.
@@ -7476,6 +7540,7 @@ void Timeline::toggleSoloTrack(int audioTrackIndex)
         const bool nowSolo = (i == audioTrackIndex && newSolo);
         if (wasSolo != nowSolo) {
             m_audioTracks[i]->setSolo(nowSolo);
+            syncTrackHeaderFlags(m_audioTracks[i]);
             emit trackSoloChanged(i, nowSolo);
         }
     }
@@ -9316,19 +9381,98 @@ void Timeline::restoreState(const TimelineState &state)
 
 // --- Project save/load ---
 
-QVector<QVector<ClipInfo>> Timeline::allVideoTracks() const
+bool Timeline::setTrackLocked(TrackKind kind, int trackIndex, bool locked)
 {
-    QVector<QVector<ClipInfo>> result;
+    TimelineTrack *track = trackAt(kind == TrackKind::Audio, trackIndex);
+    if (!track)
+        return false;
+    track->setLocked(locked);
+    syncTrackHeaderFlags(track);
+    return true;
+}
+
+QJsonObject Timeline::trackFlagsToJson() const
+{
+    auto flagsForTracks = [](const QVector<TimelineTrack *> &tracks) {
+        QJsonArray result;
+        for (const TimelineTrack *track : tracks) {
+            QJsonObject flags;
+            if (track) {
+                const bool locked = track->isLocked();
+                const bool muted = track->isMuted();
+                const bool solo = track->isSolo();
+                const bool hidden = track->isHidden();
+                if (locked || muted || solo || hidden) {
+                    flags.insert(QStringLiteral("locked"), locked);
+                    flags.insert(QStringLiteral("muted"), muted);
+                    flags.insert(QStringLiteral("solo"), solo);
+                    flags.insert(QStringLiteral("hidden"), hidden);
+                }
+            }
+            result.append(flags);
+        }
+        return result;
+    };
+
+    return QJsonObject{
+        {QStringLiteral("video"), flagsForTracks(m_videoTracks)},
+        {QStringLiteral("audio"), flagsForTracks(m_audioTracks)}
+    };
+}
+
+void Timeline::applyTrackFlagsFromJson(const QJsonObject &flags)
+{
+    bool playbackFlagsChanged = false;
+    auto applyFlags = [this, &playbackFlagsChanged](
+                          const QVector<TimelineTrack *> &tracks,
+                          const QJsonArray &items, bool audio) {
+        for (int index = 0; index < tracks.size(); ++index) {
+            TimelineTrack *track = tracks.at(index);
+            if (!track)
+                continue;
+            const QJsonObject item = index < items.size()
+                ? items.at(index).toObject() : QJsonObject{};
+            const bool locked = item.value(QStringLiteral("locked")).toBool(false);
+            const bool muted = item.value(QStringLiteral("muted")).toBool(false);
+            const bool solo = item.value(QStringLiteral("solo")).toBool(false);
+            const bool hidden = item.value(QStringLiteral("hidden")).toBool(false);
+            const bool soloChanged = track->isSolo() != solo;
+            playbackFlagsChanged = playbackFlagsChanged
+                || track->isMuted() != muted || track->isHidden() != hidden;
+            track->setLocked(locked);
+            track->setMuted(muted);
+            track->setSolo(solo);
+            track->setHidden(hidden);
+            syncTrackHeaderFlags(track);
+            if (audio && soloChanged)
+                emit trackSoloChanged(index, solo);
+        }
+    };
+
+    applyFlags(m_videoTracks,
+               flags.value(QStringLiteral("video")).toArray(), false);
+    applyFlags(m_audioTracks,
+               flags.value(QStringLiteral("audio")).toArray(), true);
+    if (playbackFlagsChanged)
+        scheduleEmitSequenceChanged();
+    updateInfoLabel();
+}
+
+ProjectTrackClips Timeline::allVideoTracks() const
+{
+    ProjectTrackClips result;
     for (const auto *t : m_videoTracks)
         result.append(t->clips());
+    result.trackFlagsSnapshot = trackFlagsToJson();
     return result;
 }
 
-QVector<QVector<ClipInfo>> Timeline::allAudioTracks() const
+ProjectTrackClips Timeline::allAudioTracks() const
 {
-    QVector<QVector<ClipInfo>> result;
+    ProjectTrackClips result;
     for (const auto *t : m_audioTracks)
         result.append(t->clips());
+    result.trackFlagsSnapshot = trackFlagsToJson();
     return result;
 }
 
@@ -9370,6 +9514,20 @@ void Timeline::restoreFromProject(const QVector<QVector<ClipInfo>> &videoTracks,
     refreshTextStrip();
     // setClips bypasses modified(); trigger sequence rebuild explicitly.
     scheduleEmitSequenceChanged();
+}
+
+void Timeline::restoreFromProject(const ProjectTrackClips &videoTracks,
+                                  const ProjectTrackClips &audioTracks,
+                                  double playhead, double markInVal,
+                                  double markOutVal, int zoom)
+{
+    QJsonObject flags = videoTracks.trackFlagsSnapshot;
+    if (flags.isEmpty())
+        flags = audioTracks.trackFlagsSnapshot;
+    restoreFromProject(static_cast<const QVector<QVector<ClipInfo>> &>(videoTracks),
+                       static_cast<const QVector<QVector<ClipInfo>> &>(audioTracks),
+                       playhead, markInVal, markOutVal, zoom);
+    applyTrackFlagsFromJson(flags);
 }
 
 // --- Timeline markers (Premiere Pro / DaVinci Resolve parity) ---
