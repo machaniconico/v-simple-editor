@@ -2102,6 +2102,8 @@ int runMcpSelftest()
         fail("G124 reversed is reverted by one undo", QStringLiteral("Timeline was not available"));
     }
 
+    const QJsonObject originalTimecodeBurnIn =
+        projectInfoResult.value(QStringLiteral("timecodeBurnIn")).toObject();
     const QJsonObject requestedTimecodeBurnIn{
         {QStringLiteral("enabled"), true},
         {QStringLiteral("position"), QStringLiteral("topRight")},
@@ -2158,13 +2160,25 @@ int runMcpSelftest()
         });
     const QJsonObject projectInfoAfterUnknownOption = callProjectInfoTool(
         230, QStringLiteral("get_project_info"), QJsonObject{});
+    const QJsonObject restoreProjectOptionResponse = callProjectInfoTool(
+        231, QStringLiteral("set_project_option"), QJsonObject{
+            {QStringLiteral("option"), QStringLiteral("timecodeBurnIn")},
+            {QStringLiteral("value"), originalTimecodeBurnIn}
+        });
+    const QJsonObject projectInfoAfterRestore = callProjectInfoTool(
+        232, QStringLiteral("get_project_info"), QJsonObject{});
     const bool g126 = toolResult(unknownProjectOptionResponse)
                             .value(QStringLiteral("isError")).toBool(false)
         && toolErrorText(unknownProjectOptionResponse).contains(
                QStringLiteral("unknown project option"))
         && toolPayload(projectInfoAfterUnknownOption)
                .value(QStringLiteral("timecodeBurnIn")).toObject()
-               == reflectedTimecodeBurnIn;
+               == reflectedTimecodeBurnIn
+        && !toolResult(restoreProjectOptionResponse)
+                .value(QStringLiteral("isError")).toBool(true)
+        && toolPayload(projectInfoAfterRestore)
+               .value(QStringLiteral("timecodeBurnIn")).toObject()
+               == originalTimecodeBurnIn;
     g126 ? pass("G126 unknown project option is rejected")
          : fail("G126 unknown project option is rejected",
                 QStringLiteral("unknown option was accepted or changed settings"));
