@@ -5,6 +5,7 @@
 #include "color/ClipColor.h"
 #include "mask/ClipMask.h"
 #include "CaptionOverlayBuilder.h"
+#include "TimecodeBurnIn.h"
 #include <QBuffer>
 #include <QFile>
 #include <QJsonDocument>
@@ -723,7 +724,19 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
         root["subtitleSegments"] = subArr;
     }
     root["subtitleStyle"] = data.subtitleStyle;
-    root["loudnessSettings"] = data.loudnessSettings;
+    {
+        // ProjectData has no dedicated extension slot in the locked header.
+        // MainWindow carries this setting in loudnessSettings only while the
+        // value is in memory; strip that private carrier so the on-disk schema
+        // has the requested top-level timecodeBurnIn object and no pollution
+        // under loudnessSettings.
+        QJsonObject loudness = data.loudnessSettings;
+        const QJsonObject timecode = loudness.take(
+            QStringLiteral("_timecodeBurnIn")).toObject();
+        root["loudnessSettings"] = loudness;
+        root["timecodeBurnIn"] =
+            TimecodeBurnInSettings::fromJson(timecode).toJson();
+    }
     {
         QJsonArray particleArr;
         for (const auto &entry : data.particleClipEntries)
@@ -1020,6 +1033,10 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
     data.loudnessSettings = QJsonObject{};
     if (root.contains("loudnessSettings"))
         data.loudnessSettings = root["loudnessSettings"].toObject();
+    data.loudnessSettings.insert(
+        QStringLiteral("_timecodeBurnIn"),
+        TimecodeBurnInSettings::fromJson(
+            root.value(QStringLiteral("timecodeBurnIn")).toObject()).toJson());
     data.particleClipEntries.clear();
     if (root.contains("particleClipEntries")) {
         for (const auto &v : root["particleClipEntries"].toArray())
@@ -1309,7 +1326,14 @@ QString ProjectFile::toJsonString(const ProjectData &data)
         root["subtitleSegments"] = subArr;
     }
     root["subtitleStyle"] = data.subtitleStyle;
-    root["loudnessSettings"] = data.loudnessSettings;
+    {
+        QJsonObject loudness = data.loudnessSettings;
+        const QJsonObject timecode = loudness.take(
+            QStringLiteral("_timecodeBurnIn")).toObject();
+        root["loudnessSettings"] = loudness;
+        root["timecodeBurnIn"] =
+            TimecodeBurnInSettings::fromJson(timecode).toJson();
+    }
     {
         QJsonArray particleArr;
         for (const auto &entry : data.particleClipEntries)
@@ -1590,6 +1614,10 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
     data.loudnessSettings = QJsonObject{};
     if (root.contains("loudnessSettings"))
         data.loudnessSettings = root["loudnessSettings"].toObject();
+    data.loudnessSettings.insert(
+        QStringLiteral("_timecodeBurnIn"),
+        TimecodeBurnInSettings::fromJson(
+            root.value(QStringLiteral("timecodeBurnIn")).toObject()).toJson());
     data.particleClipEntries.clear();
     if (root.contains("particleClipEntries")) {
         for (const auto &v : root["particleClipEntries"].toArray())

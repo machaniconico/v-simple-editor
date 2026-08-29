@@ -1156,7 +1156,7 @@ int runMcpSelftest()
             rpcRequest(73, QStringLiteral("tools/list")))))
         .value(QStringLiteral("result")).toObject()
         .value(QStringLiteral("tools")).toArray();
-    constexpr int kExpectedProjectInfoToolCount = 29;
+    constexpr int kExpectedProjectInfoToolCount = 30;
     bool outputSchemasDeclared = projectInfoToolDescriptors.size()
         == kExpectedProjectInfoToolCount;
     for (const QJsonValue& value : projectInfoToolDescriptors) {
@@ -2101,6 +2101,73 @@ int runMcpSelftest()
         fail("G123 reversed set is reflected by get_timeline", QStringLiteral("Timeline was not available"));
         fail("G124 reversed is reverted by one undo", QStringLiteral("Timeline was not available"));
     }
+
+    const QJsonObject requestedTimecodeBurnIn{
+        {QStringLiteral("enabled"), true},
+        {QStringLiteral("position"), QStringLiteral("topRight")},
+        {QStringLiteral("fontSizePct"), 6},
+        {QStringLiteral("showFrames"), false},
+        {QStringLiteral("dropFrame"), true},
+        {QStringLiteral("prefix"), QStringLiteral("MCP")},
+        {QStringLiteral("showClipName"), true},
+        {QStringLiteral("opacity"), 0.65}
+    };
+    const QJsonObject setProjectOptionResponse = callProjectInfoTool(
+        227, QStringLiteral("set_project_option"), QJsonObject{
+            {QStringLiteral("option"), QStringLiteral("timecodeBurnIn")},
+            {QStringLiteral("value"), requestedTimecodeBurnIn}
+        });
+    const QJsonObject projectInfoAfterOption = callProjectInfoTool(
+        228, QStringLiteral("get_project_info"), QJsonObject{});
+    const QJsonObject setProjectOptionPayload = toolPayload(
+        setProjectOptionResponse);
+    const QJsonObject reflectedTimecodeBurnIn = toolPayload(
+        projectInfoAfterOption).value(QStringLiteral("timecodeBurnIn"))
+            .toObject();
+    const bool g125 = !toolResult(setProjectOptionResponse)
+                            .value(QStringLiteral("isError")).toBool(true)
+        && setProjectOptionPayload.value(QStringLiteral("ok")).toBool(false)
+        && setProjectOptionPayload.value(QStringLiteral("option")).toString()
+               == QStringLiteral("timecodeBurnIn")
+        && requiredOutputFieldsPresent(QStringLiteral("set_project_option"),
+                                       setProjectOptionPayload)
+        && requiredOutputFieldsPresent(QStringLiteral("get_project_info"),
+                                       toolPayload(projectInfoAfterOption))
+        && reflectedTimecodeBurnIn.value(QStringLiteral("enabled")).toBool(false)
+        && reflectedTimecodeBurnIn.value(QStringLiteral("position")).toString()
+               == QStringLiteral("topRight")
+        && reflectedTimecodeBurnIn.value(QStringLiteral("fontSizePct")).toInt()
+               == 6
+        && !reflectedTimecodeBurnIn.value(QStringLiteral("showFrames"))
+                .toBool(true)
+        && reflectedTimecodeBurnIn.value(QStringLiteral("dropFrame")).toBool(false)
+        && reflectedTimecodeBurnIn.value(QStringLiteral("prefix")).toString()
+               == QStringLiteral("MCP")
+        && reflectedTimecodeBurnIn.value(QStringLiteral("showClipName"))
+               .toBool(false)
+        && std::fabs(reflectedTimecodeBurnIn.value(QStringLiteral("opacity"))
+                         .toDouble() - 0.65) < 1e-9;
+    g125 ? pass("G125 set_project_option is reflected by get_project_info")
+         : fail("G125 set_project_option is reflected by get_project_info",
+                QStringLiteral("timecodeBurnIn mutation or output schema diverged"));
+
+    const QJsonObject unknownProjectOptionResponse = callProjectInfoTool(
+        229, QStringLiteral("set_project_option"), QJsonObject{
+            {QStringLiteral("option"), QStringLiteral("unknownOption")},
+            {QStringLiteral("value"), QJsonObject{}}
+        });
+    const QJsonObject projectInfoAfterUnknownOption = callProjectInfoTool(
+        230, QStringLiteral("get_project_info"), QJsonObject{});
+    const bool g126 = toolResult(unknownProjectOptionResponse)
+                            .value(QStringLiteral("isError")).toBool(false)
+        && toolErrorText(unknownProjectOptionResponse).contains(
+               QStringLiteral("unknown project option"))
+        && toolPayload(projectInfoAfterUnknownOption)
+               .value(QStringLiteral("timecodeBurnIn")).toObject()
+               == reflectedTimecodeBurnIn;
+    g126 ? pass("G126 unknown project option is rejected")
+         : fail("G126 unknown project option is rejected",
+                QStringLiteral("unknown option was accepted or changed settings"));
 
     const bool selectClipFieldsPresent =
         !toolResult(successfulSelectResponse).value(QStringLiteral("isError")).toBool(false)

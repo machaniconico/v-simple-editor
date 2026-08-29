@@ -169,6 +169,7 @@ int runTextBasedEditSelftest();
 int runTextSpacingSelftest();
 int runText3dPreviewSelftest();
 int runTextExportSelftest();
+int runTcburnSelftest();
 int runThreePointEditSelftest();
 int runTrackMatteExportIntegrationSelftest();
 int runTrackMatteParitySelftest();
@@ -569,6 +570,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "3D lights: compositor/export parity, keyframe edits, dialog guards, JSON, determinism (16 gates)" },
     { "edl-export",        "VEDITOR_EDL_EXPORT_SELFTEST",         runEdlExportSelftest,          false,
       "EdlExport: CMX3600 timecode + event lines + drop-frame" },
+    { "tcburn",            "VEDITOR_TCBURN_SELFTEST",             runTcburnSelftest,             true,
+      "Timecode burn-in: disabled no-op, six positions, drop-frame, JSON and HH:MM:SS (5 gates)" },
     { "workspace",         "VEDITOR_WORKSPACE_SELFTEST",          runWorkspaceSelftest,          false,
       "WorkspaceManager: named layout CRUD + base64 blob JSON round-trip" },
     { "text-based-edit",   "VEDITOR_TEXT_BASED_EDIT_SELFTEST",    runTextBasedEditSelftest,      false,

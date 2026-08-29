@@ -10,6 +10,7 @@
 #include <QVector>
 #include <QPoint>
 #include <QRectF>
+#include "TimecodeBurnIn.h"
 #include <QString>
 #include <QTimer>
 #include <QFont>
@@ -172,6 +173,11 @@ public:
     void setTimeline(Timeline *t) { m_timeline = t; }
     const Timeline *timeline() const { return m_timeline; }
 
+    // Project-level data burn-in. The renderer is shared with both export
+    // paths; disabled settings retain the pre-feature paint path.
+    void setTimecodeBurnIn(const TimecodeBurnInSettings &settings,
+                           double frameRate);
+
     // Phase 1e — true only when VEDITOR_GL_INTEROP=1 AND WGL_NV_DX_interop2
     // is supported AND all 6 wglDX*NV procs resolved during initializeGL().
     bool isInteropAvailable() const noexcept { return m_interopAvailable; }
@@ -307,6 +313,7 @@ private:
     bool ensureInteropDeviceForPaint();
     void releaseRegisteredTexturesLocked();
     void renderPendingD3D11Frame();
+    void paintTimecodeBurnInOverlay();
     // letterboxRect() moved to public section (US-T32).
 
     QOpenGLShaderProgram *m_program = nullptr;
@@ -608,6 +615,9 @@ private:
 
     // US-INT-1: non-owning Timeline pointer for adjustment-layer composition.
     Timeline *m_timeline = nullptr;
+
+    TimecodeBurnInRenderer m_timecodeBurnInRenderer;
+    double m_timecodeBurnInFrameRate = 30.0;
 
     // Phase 1e — m_interopDevice holds the wglDXOpenDeviceNV HANDLE once
     // Section B opens it lazily in paintGL; void* avoids leaking windows.h.

@@ -117,6 +117,14 @@ void Exporter::setSubtitleRenderer(SubtitleTrackRenderer *renderer)
     m_subtitleRenderer = renderer;
 }
 
+void Exporter::setTimecodeBurnIn(const TimecodeBurnInSettings &settings)
+{
+    if (settings.enabled)
+        m_timecodeBurnIn = settings;
+    else
+        m_timecodeBurnIn.reset();
+}
+
 void Exporter::setLoudnessGainDb(double gainDb)
 {
     m_loudnessGainDb = std::isfinite(gainDb) ? gainDb : 0.0;
@@ -133,13 +141,15 @@ void Exporter::startExport(const ExportConfig &config, const QVector<ClipInfo> &
 {
     m_cancelled = false;
     const double loudnessGainDb = m_loudnessGainDb;
+    const std::optional<TimecodeBurnInSettings> timecodeBurnIn =
+        m_timecodeBurnIn;
     {
         QMutexLocker locker(&g_exporterLoudnessMutex);
         g_exporterLoudnessGainDb = std::isfinite(loudnessGainDb)
             ? loudnessGainDb : 0.0;
     }
-    m_thread = QThread::create([this, config, clips]() {
-        doExport(config, clips);
+    m_thread = QThread::create([this, config, clips, timecodeBurnIn]() {
+        doExport(config, clips, timecodeBurnIn);
     });
     connect(m_thread, &QThread::finished, m_thread, &QThread::deleteLater);
     m_thread->start();
@@ -194,7 +204,10 @@ bool Exporter::openInputFile(const QString &path, AVFormatContext **fmtCtx, AVCo
 // CPU-only transcode applies a hard-coded effect subset and skips the graph
 // for 10-bit/HDR/ProRes. No UI action reaches this as of S12 (File->Export
 // and Mobile Export now route through RenderQueue). See progress.txt S12.
-void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &clips)
+void Exporter::doExport(
+    const ExportConfig &config,
+    const QVector<ClipInfo> &clips,
+    const std::optional<TimecodeBurnInSettings> &timecodeBurnIn)
 {
     const aces::AcesPipeline exporterAcesPipeline = exporterAcesPipelineSnapshot();
     const double loudnessGainDb = exporterLoudnessGainSnapshot();
@@ -292,6 +305,10 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
                 << "MaxCLL=" << config.hdrSettings.maxCll
                 << "MaxFALL=" << config.hdrSettings.maxFall;
     }
+
+    std::optional<TimecodeBurnInRenderer> timecodeRenderer;
+    if (timecodeBurnIn.has_value() && timecodeBurnIn->enabled)
+        timecodeRenderer.emplace(*timecodeBurnIn);
 
     // Process each clip
     SwsContext *swsCtx = nullptr;
@@ -410,7 +427,8 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
             bool needsRgbPass = hasEffects
                                 || acesActive
                                 || (m_smartReframe != nullptr)
-                                || (m_subtitleRenderer != nullptr);
+                                || (m_subtitleRenderer != nullptr)
+                                || timecodeRenderer.has_value();
             if (needsRgbPass) {
                 QImage workingImage;
                 if (hasEffects) {
@@ -530,6 +548,24 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
                         painter,
                         QRectF(0, 0, workingImage.width(), workingImage.height()),
                         framePts - clip.inPoint);
+                }
+
+                // Timecode burn-in follows subtitles and uses the shared
+                // renderer used by GLPreview and RenderQueue. The optional is
+                // absent for enabled=false, so the legacy byte path above is
+                // untouched and no RGB pass is introduced.
+                if (timecodeRenderer.has_value()) {
+                    const double speed = clip.speed > 0.0 ? clip.speed : 1.0;
+                    const double timelineSec = processedDuration
+                        + qMax(0.0, framePts - clip.inPoint) / speed;
+                    const QString clipName = !clip.displayName.isEmpty()
+                        ? clip.displayName
+                        : QFileInfo(clip.filePath).completeBaseName();
+                    QPainter painter(&workingImage);
+                    timecodeRenderer->paintOnto(
+                        painter,
+                        QRectF(0, 0, workingImage.width(), workingImage.height()),
+                        timelineSec, config.fps, clipName);
                 }
 
                 // AR-2: ACES シーンリファード色管理を最終 RGB フレームへ適用する。

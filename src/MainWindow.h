@@ -93,6 +93,7 @@
 #include "AcesColor.h"             // AC-4: ACES カラーマネジメント パイプライン SSOT
 #include "DolbyVisionMetadata.h"   // DV-4: Dolby Vision メタデータ SSOT
 #include "BroadcastCaption.h"      // CC-4: 放送CC (CEA-608/708) メタデータ SSOT
+#include "TimecodeBurnIn.h"
 
 class VideoPlayer;
 class Timeline;
@@ -114,6 +115,7 @@ class DolbyVisionDialog;       // DV-4: Dolby Vision メタデータ ダイア�
 class BroadcastCaptionDialog;  // CC-4: 放送CC (CEA-608/708) ダイアログ
 class ProjectCollectorDialog;
 class HDRSettingsDialog;
+class TimecodeBurnInDialog;
 class AIProcessingDialog;
 class PluginBrowserDialog;
 class AIMaskDialog;
@@ -506,6 +508,7 @@ private slots:
 
     // US-EXT-10: Sprint 10 pro extensions — 3 new menu actions
     void onHDRSettings();
+    void onTimecodeBurnInSettings();
     void onAIProcessing();
     void onPluginBrowser();
 
@@ -689,6 +692,8 @@ private:
     // 成功で true、*appliedCount に overlay 数。失敗時は *err に日本語メッセージ。
     bool applyCaptionEditorTrackToTimeline(QString *err, int *appliedCount);
     void applyProjectConfig(const ProjectConfig &config);
+    void applyTimecodeBurnInSettings(
+        const TimecodeBurnInSettings &settings);
     void syncProjectLightingToTimeline();
     // 書き出し用の音声ミックス (.m4a) を temp に作り、そのパスを返す。ミックスが
     // 不要 (パススルーで正しい) なら空文字列。失敗時は *error に日本語メッセージ。
@@ -798,6 +803,7 @@ private:
     // is defined in AIProcessingDialog.h.
     HDRSettings           m_hdrSettings;
     AIProcessingSettings  m_aiSettings;
+    TimecodeBurnInSettings m_tcBurnIn;
 
     // US-AETEXT-12: AE text feature objects
     QVector<PathText *> m_pathTexts;

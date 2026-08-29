@@ -1858,6 +1858,8 @@ void GLPreview::paintGL()
 
     if (m_pendingD3D11Texture && m_interopAvailable) {
         renderPendingD3D11Frame();
+        if (m_timecodeBurnInRenderer.settings().enabled)
+            paintTimecodeBurnInOverlay();
         undotrace::log("gl:paintGL:exit");
         return;
     }
@@ -2425,6 +2427,9 @@ void GLPreview::paintGL()
     m_program->release();
     glViewport(0, 0, physW, physH);
 
+    if (m_timecodeBurnInRenderer.settings().enabled)
+        paintTimecodeBurnInOverlay();
+
     // Adobe-style text tool overlay: draw the dashed marquee plus 8 resize
     // handles while the tool is active and a rect is present (either being
     // created/moved/resized this frame, or persisted from a previous drag).
@@ -2555,6 +2560,32 @@ void GLPreview::paintGL()
         m_surfaceTool->paintOverlay(spainter, letterboxRect());
     }
     undotrace::log("gl:paintGL:exit");
+}
+
+void GLPreview::setTimecodeBurnIn(
+    const TimecodeBurnInSettings &settings,
+    double frameRate)
+{
+    m_timecodeBurnInRenderer.setSettings(settings);
+    m_timecodeBurnInFrameRate = std::isfinite(frameRate) && frameRate > 0.0
+        ? frameRate : 30.0;
+    update();
+}
+
+void GLPreview::paintTimecodeBurnInOverlay()
+{
+    if (!m_timecodeBurnInRenderer.settings().enabled)
+        return;
+
+    double timelineSec = m_timeline ? m_timeline->playheadPosition() : 0.0;
+    if (auto *player = qobject_cast<VideoPlayer *>(parentWidget()))
+        timelineSec = static_cast<double>(player->timelinePositionUs())
+            / AV_TIME_BASE;
+
+    QPainter painter(this);
+    m_timecodeBurnInRenderer.paintOnto(
+        painter, letterboxRect(), timelineSec, m_timecodeBurnInFrameRate,
+        timecodeBurnInClipNameAt(m_timeline, timelineSec));
 }
 
 QRectF GLPreview::letterboxRect() const

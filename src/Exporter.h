@@ -3,8 +3,10 @@
 #include <QObject>
 #include <QThread>
 #include <atomic>
+#include <optional>
 #include "ExportDialog.h"
 #include "PremiereXmlExporter.h"
+#include "TimecodeBurnIn.h"
 #include "Timeline.h"
 
 class SmartReframe;
@@ -47,6 +49,7 @@ public:
 
     void setSmartReframe(SmartReframe *reframe);
     void setSubtitleRenderer(SubtitleTrackRenderer *renderer);
+    void setTimecodeBurnIn(const TimecodeBurnInSettings &settings);
     void setLoudnessGainDb(double gainDb);
 
     // Premiere Pro XML (FCP7) export dispatcher.
@@ -62,7 +65,8 @@ signals:
     void exportFinished(bool success, const QString &message);
 
 private:
-    void doExport(const ExportConfig &config, const QVector<ClipInfo> &clips);
+    void doExport(const ExportConfig &config, const QVector<ClipInfo> &clips,
+                  const std::optional<TimecodeBurnInSettings> &timecodeBurnIn);
     bool openInputFile(const QString &path, AVFormatContext **fmtCtx, AVCodecContext **decCtx, int *streamIndex);
     bool transcodeClip(const ClipInfo &clip, AVFormatContext *outFmt, AVCodecContext *encCtx,
                        AVStream *outStream, SwsContext *swsCtx, int64_t &pts);
@@ -72,5 +76,6 @@ private:
 
     SmartReframe *m_smartReframe = nullptr;
     SubtitleTrackRenderer *m_subtitleRenderer = nullptr;
+    std::optional<TimecodeBurnInSettings> m_timecodeBurnIn;
     double m_loudnessGainDb = 0.0;
 };

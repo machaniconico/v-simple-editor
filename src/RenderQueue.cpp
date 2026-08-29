@@ -7,6 +7,7 @@
 #include "CodecDetector.h"
 #include "SmartRender.h"
 #include "AcesColor.h"  // AC: production export 経路への ACES 適用 (8bit のみ)
+#include "TimecodeBurnIn.h"
 #include "color/ClipOdt.h"
 #include "playback/hdrexport16_flag.h"
 #include "playback/hdrmatte16_flag.h"
@@ -24,6 +25,7 @@
 #include <QThread>
 #include <QImage>
 #include <QPainter>
+#include <QVariant>
 #include <QtGlobal>
 // US-MF-6 / US-B3-7: the 10-bit HDR (HDR10/HLG) branch falls back to ffmpeg.exe
 // whenever the loaded avcodec DLL ships no 10-bit HEVC encoder. These restore
@@ -38,6 +40,7 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <string>
 
 namespace {
@@ -59,6 +62,24 @@ bool shouldApplyExportAces(bool acesEnabled,
                            bool odtOwnsTonemap)
 {
     return acesEnabled && !isHdr10 && !isHlg && !isProRes && !odtOwnsTonemap;
+}
+
+std::optional<TimecodeBurnInRenderer> timecodeBurnInForRender(
+    const QJsonObject &exportConfig,
+    const Timeline *timeline)
+{
+    QJsonObject object;
+    if (exportConfig.value(QStringLiteral("timecodeBurnIn")).isObject()) {
+        object = exportConfig.value(QStringLiteral("timecodeBurnIn")).toObject();
+    } else if (timeline) {
+        object = timeline->property("timecodeBurnIn").value<QJsonObject>();
+    }
+
+    const TimecodeBurnInSettings settings =
+        TimecodeBurnInSettings::fromJson(object);
+    if (!settings.enabled)
+        return std::nullopt;
+    return TimecodeBurnInRenderer(settings);
 }
 
 bool tracksContainSequenceReference(const QVector<QVector<ClipInfo>> &tracks)
@@ -998,6 +1019,8 @@ void RenderQueue::startRenderPipe(int jobIndex)
     }
 
     const QJsonObject &cfg = jobCopy.exportConfig;
+    const std::optional<TimecodeBurnInRenderer> timecodeRenderer =
+        timecodeBurnInForRender(cfg, tl);
     const double loudnessGainDb = configuredLoudnessGainDb(
         cfg, jobCopy.loudnessGainDb);
     const bool applyLoudnessFilter = hasLoudnessGain(loudnessGainDb);
@@ -1135,6 +1158,7 @@ void RenderQueue::startRenderPipe(int jobIndex)
     const bool blockSmartRenderForLighting = timelineHasProjectLighting(tl);
     if (smartrender::enabledFromEnv()
         && !applyLoudnessFilter
+        && !timecodeRenderer.has_value()
         && !blockSmartRenderForSequences
         && !blockSmartRenderForLighting) {
         if (m_cancelRequested) {
@@ -1242,7 +1266,7 @@ void RenderQueue::startRenderPipe(int jobIndex)
         [this, jobCopy, tl, owned, request, outW, outH,
          totalFrames, startUsec, usecPerFrame, applyAces, acesPipe,
          haveAudio, loudnessGainDb, loudnessAudioCodec,
-         loudnessAudioBitrateKbps]() {
+         loudnessAudioBitrateKbps, timecodeRenderer, fps]() {
         QString failMsg;
         // Delete the heap Timeline (only set when loaded from a project
         // file). It is a QWidget created on the GUI thread; QObject deletion
@@ -1318,6 +1342,13 @@ void RenderQueue::startRenderPipe(int jobIndex)
                     QPainter pp(&rgb);
                     pp.setCompositionMode(QPainter::CompositionMode_SourceOver);
                     pp.drawImage(0, 0, frame);
+                    if (timecodeRenderer.has_value()) {
+                        const double timelineSec =
+                            static_cast<double>(usec) / 1'000'000.0;
+                        timecodeRenderer->paintOnto(
+                            pp, QRectF(0, 0, outW, outH), timelineSec, fps,
+                            timecodeBurnInClipNameAt(tl, timelineSec));
+                    }
                 }
 
                 // FrameEncoder receives packed RGB24. Qt pads Format_RGB888
@@ -1474,6 +1505,8 @@ void RenderQueue::startRenderPipeSubprocess(int jobIndex)
     }
 
     const QJsonObject &cfg = jobCopy.exportConfig;
+    const std::optional<TimecodeBurnInRenderer> timecodeRenderer =
+        timecodeBurnInForRender(cfg, tl);
     const double loudnessGainDb = configuredLoudnessGainDb(
         cfg, jobCopy.loudnessGainDb);
     const QStringList loudnessAudioFilterArgs =
@@ -1671,7 +1704,7 @@ void RenderQueue::startRenderPipeSubprocess(int jobIndex)
 
     m_renderThread = QThread::create(
         [this, jobCopy, tl, owned, ffmpegBin, args, outW, outH,
-         totalFrames, startUsec, usecPerFrame]() {
+         totalFrames, startUsec, usecPerFrame, timecodeRenderer, fps]() {
         QString failMsg;
         const bool ok = [&]() -> bool {
             QProcess *proc = new QProcess();
@@ -1736,6 +1769,13 @@ void RenderQueue::startRenderPipeSubprocess(int jobIndex)
                     QPainter pp(&rgb);
                     pp.setCompositionMode(QPainter::CompositionMode_SourceOver);
                     pp.drawImage(0, 0, frame);
+                    if (timecodeRenderer.has_value()) {
+                        const double timelineSec =
+                            static_cast<double>(usec) / 1'000'000.0;
+                        timecodeRenderer->paintOnto(
+                            pp, QRectF(0, 0, outW, outH), timelineSec, fps,
+                            timecodeBurnInClipNameAt(tl, timelineSec));
+                    }
                 }
 
                 // ffmpeg -s WxH -pix_fmt rgb24 expects exactly W*H*3 bytes
@@ -1953,6 +1993,10 @@ Timeline *RenderQueue::resolveTimeline(const RenderJob &job,
     tl->restoreFromProject(data.videoTracks, data.audioTracks,
                            data.playheadPos, data.markIn, data.markOut,
                            data.zoomLevel);
+    tl->setProperty(
+        "timecodeBurnIn",
+        QVariant::fromValue(data.loudnessSettings.value(
+            QStringLiteral("_timecodeBurnIn")).toObject()));
     QVector<Light3D> projectLights;
     projectLights.reserve(data.projectLights.size());
     for (const QJsonValue &value : data.projectLights)

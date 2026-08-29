@@ -9,6 +9,7 @@
 #include "../TrimOps.h"
 #include "../UndoManager.h"
 #include "../VideoPlayer.h"
+#include "../TimecodeBurnIn.h"
 
 #include <QAction>
 #include <QBuffer>
@@ -80,6 +81,55 @@ QJsonObject outputSchemaOf(const QJsonObject& properties,
     if (!requiredArray.isEmpty())
         schema.insert(QStringLiteral("required"), requiredArray);
     return schema;
+}
+
+QJsonObject timecodeBurnInSchema()
+{
+    return outputSchemaOf(QJsonObject{
+        {QStringLiteral("enabled"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("position"), QJsonObject{
+            {QStringLiteral("type"), QStringLiteral("string")},
+            {QStringLiteral("enum"), QJsonArray{
+                QStringLiteral("topLeft"), QStringLiteral("topCenter"),
+                QStringLiteral("topRight"), QStringLiteral("bottomLeft"),
+                QStringLiteral("bottomCenter"), QStringLiteral("bottomRight")
+            }}
+        }},
+        {QStringLiteral("fontSizePct"), QJsonObject{
+            {QStringLiteral("type"), QStringLiteral("integer")},
+            {QStringLiteral("minimum"), 1},
+            {QStringLiteral("maximum"), 20}
+        }},
+        {QStringLiteral("showFrames"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("dropFrame"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("prefix"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
+        {QStringLiteral("showClipName"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("opacity"), QJsonObject{
+            {QStringLiteral("type"), QStringLiteral("number")},
+            {QStringLiteral("minimum"), 0.0},
+            {QStringLiteral("maximum"), 1.0}
+        }}
+    }, {QStringLiteral("enabled"), QStringLiteral("position"),
+        QStringLiteral("fontSizePct"), QStringLiteral("showFrames"),
+        QStringLiteral("dropFrame"), QStringLiteral("prefix"),
+        QStringLiteral("showClipName"), QStringLiteral("opacity")});
+}
+
+QJsonObject timecodeBurnInInputSchema()
+{
+    QJsonObject schema = timecodeBurnInSchema();
+    schema.remove(QStringLiteral("required"));
+    schema.insert(QStringLiteral("additionalProperties"), false);
+    return schema;
+}
+
+QJsonObject timecodeBurnInForMcp(const TimecodeBurnInSettings &settings)
+{
+    QJsonObject object = settings.toJson();
+    // The MCP contract intentionally exposes the eight fields declared by
+    // set_project_option; showDate remains available in project/UI JSON.
+    object.remove(QStringLiteral("showDate"));
+    return object;
 }
 
 const QStringList& transitionTypeNames()
@@ -721,6 +771,7 @@ bool toolMutatesTimeline(const QString& toolName)
         QStringLiteral("export_video"), QStringLiteral("select_clip"),
         QStringLiteral("clear_selection"), QStringLiteral("set_playhead"),
         QStringLiteral("save_project"), QStringLiteral("set_track_locked"),
+        QStringLiteral("set_project_option"),
         QStringLiteral("add_caption"),
         QStringLiteral("remove_caption"), QStringLiteral("clear_captions")
     };
@@ -997,7 +1048,9 @@ void McpEditorTools::registerReadTools()
                     ? currentTimeline->playheadPosition() : 0.0},
                 {QStringLiteral("videoTrackCount"), videoTracks.size()},
                 {QStringLiteral("audioTrackCount"), audioTracks.size()},
-                {QStringLiteral("hasUnsavedChanges"), m_window->isWindowModified()}
+                {QStringLiteral("hasUnsavedChanges"), m_window->isWindowModified()},
+                {QStringLiteral("timecodeBurnIn"),
+                 timecodeBurnInForMcp(m_window->m_tcBurnIn)}
             };
         }
     }, outputSchemaOf(QJsonObject{
@@ -1009,12 +1062,14 @@ void McpEditorTools::registerReadTools()
         {QStringLiteral("playheadSec"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
         {QStringLiteral("videoTrackCount"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
         {QStringLiteral("audioTrackCount"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
-        {QStringLiteral("hasUnsavedChanges"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}}
+        {QStringLiteral("hasUnsavedChanges"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("timecodeBurnIn"), timecodeBurnInSchema()}
     }, {QStringLiteral("projectName"), QStringLiteral("width"),
         QStringLiteral("height"), QStringLiteral("fps"),
         QStringLiteral("durationSec"), QStringLiteral("playheadSec"),
         QStringLiteral("videoTrackCount"), QStringLiteral("audioTrackCount"),
-        QStringLiteral("hasUnsavedChanges")})));
+        QStringLiteral("hasUnsavedChanges"),
+        QStringLiteral("timecodeBurnIn")})));
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("get_frame"),
@@ -1578,6 +1633,132 @@ void McpEditorTools::registerWriteTools()
         {QStringLiteral("reason"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}}
     }, {QStringLiteral("ok")});
 
+    const QJsonObject setProjectOptionOutputSchema = outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("option"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
+        {QStringLiteral("value"), timecodeBurnInSchema()}
+    }, {QStringLiteral("ok"), QStringLiteral("option"),
+        QStringLiteral("value")});
+
+    m_registry->registerTool(withOutputSchema({
+        QStringLiteral("set_project_option"),
+        QStringLiteral("プロジェクト全体の設定を変更する。現在は option=timecodeBurnIn を受け付け、プレビューと以後の書き出しへ即時反映する。undo 対象外。"),
+        schemaWithRequired(QJsonObject{
+            {QStringLiteral("option"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("string")},
+                {QStringLiteral("enum"), QJsonArray{
+                    QStringLiteral("timecodeBurnIn")
+                }}
+            }},
+            {QStringLiteral("value"), timecodeBurnInInputSchema()}
+        }, {QStringLiteral("option"), QStringLiteral("value")}),
+        guardedWrite(QStringLiteral("set_project_option"),
+                     [this](const QJsonObject& args, QString* err) -> QJsonObject {
+            if (!rejectUnknownArguments(
+                    args,
+                    {QStringLiteral("option"), QStringLiteral("value")},
+                    err)) {
+                return {};
+            }
+
+            QString option;
+            if (!requiredString(args, QStringLiteral("option"), &option, err))
+                return {};
+            if (option != QStringLiteral("timecodeBurnIn")) {
+                return setError(err,
+                                QStringLiteral("unknown project option: %1")
+                                    .arg(option)),
+                       QJsonObject();
+            }
+            if (!m_window)
+                return setError(err, QStringLiteral("editor not available")),
+                       QJsonObject();
+
+            const QJsonValue rawValue = args.value(QStringLiteral("value"));
+            if (!rawValue.isObject()) {
+                return setError(err,
+                                QStringLiteral("value must be an object for timecodeBurnIn")),
+                       QJsonObject();
+            }
+            const QJsonObject value = rawValue.toObject();
+            const QStringList allowedFields{
+                QStringLiteral("enabled"), QStringLiteral("position"),
+                QStringLiteral("fontSizePct"), QStringLiteral("showFrames"),
+                QStringLiteral("dropFrame"), QStringLiteral("prefix"),
+                QStringLiteral("showClipName"), QStringLiteral("opacity")
+            };
+            if (!rejectUnknownArguments(value, allowedFields, err))
+                return {};
+
+            const QStringList booleanFields{
+                QStringLiteral("enabled"), QStringLiteral("showFrames"),
+                QStringLiteral("dropFrame"), QStringLiteral("showClipName")
+            };
+            for (const QString &name : booleanFields) {
+                if (value.contains(name) && !value.value(name).isBool()) {
+                    return setError(
+                               err,
+                               QStringLiteral("%1 must be a boolean").arg(name)),
+                           QJsonObject();
+                }
+            }
+            if (value.contains(QStringLiteral("prefix"))
+                && !value.value(QStringLiteral("prefix")).isString()) {
+                return setError(err, QStringLiteral("prefix must be a string")),
+                       QJsonObject();
+            }
+            if (value.contains(QStringLiteral("position"))) {
+                const QJsonValue rawPosition = value.value(
+                    QStringLiteral("position"));
+                TimecodeBurnInSettings::Position parsedPosition;
+                if (!rawPosition.isString()
+                    || !TimecodeBurnInSettings::positionFromName(
+                        rawPosition.toString(), &parsedPosition)) {
+                    return setError(err,
+                                    QStringLiteral("position is invalid")),
+                           QJsonObject();
+                }
+            }
+            if (value.contains(QStringLiteral("fontSizePct"))) {
+                const QJsonValue rawFontSize = value.value(
+                    QStringLiteral("fontSizePct"));
+                const double fontSize = rawFontSize.toDouble(-1.0);
+                if (!rawFontSize.isDouble() || !std::isfinite(fontSize)
+                    || std::floor(fontSize) != fontSize
+                    || fontSize < 1.0 || fontSize > 20.0) {
+                    return setError(
+                               err,
+                               QStringLiteral("fontSizePct must be an integer from 1 to 20")),
+                           QJsonObject();
+                }
+            }
+            if (value.contains(QStringLiteral("opacity"))) {
+                const QJsonValue rawOpacity = value.value(
+                    QStringLiteral("opacity"));
+                const double opacity = rawOpacity.toDouble(-1.0);
+                if (!rawOpacity.isDouble() || !std::isfinite(opacity)
+                    || opacity < 0.0 || opacity > 1.0) {
+                    return setError(err,
+                                    QStringLiteral("opacity must be from 0 to 1")),
+                           QJsonObject();
+                }
+            }
+
+            QJsonObject merged = m_window->m_tcBurnIn.toJson();
+            for (auto it = value.constBegin(); it != value.constEnd(); ++it)
+                merged.insert(it.key(), it.value());
+            const TimecodeBurnInSettings updated =
+                TimecodeBurnInSettings::fromJson(merged);
+            m_window->applyTimecodeBurnInSettings(updated);
+            m_window->setWindowModified(true);
+            return QJsonObject{
+                {QStringLiteral("ok"), true},
+                {QStringLiteral("option"), option},
+                {QStringLiteral("value"), timecodeBurnInForMcp(updated)}
+            };
+        })
+    }, setProjectOptionOutputSchema));
+
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("export_video"),
         QStringLiteral("現在のタイムラインを動画ファイルへ非同期で書き出す。tools/call はジョブ投入後すぐに jobId を返し、完了は get_export_status で確認する。width / height / fps の省略時は現在のプロジェクト設定を使い、videoBitrate / audioBitrate は kbps (既定 10000 / 192)、videoCodec / audioCodec は ffmpeg のエンコーダ名 (既定 libx264 / aac)。音声はトリム・分割・並べ替え・音量・ミュートを反映したタイムラインのミックスを ffmpeg で作ってから多重化する (ffmpeg が PATH に無いと単純な 1 クリップ構成以外は failed になる)。"),
@@ -1736,6 +1917,9 @@ void McpEditorTools::registerWriteTools()
                 {QStringLiteral("audioBitrate"), audioBitrate},
                 {QStringLiteral("loudnessGainDb"), loudnessGainDb}
             };
+            job.exportConfig.insert(
+                QStringLiteral("timecodeBurnIn"),
+                m_window->m_tcBurnIn.toJson());
 
             // ライブ Timeline を渡す経路は GUI の表示内容をそのまま使うため、
             // RenderQueue のワーカー開始前に MainWindow 側の補助データを同期する。

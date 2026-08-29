@@ -25,6 +25,7 @@ double exporter_loudnessGainDb();
 #include "EffectClipboard.h"
 #include "PasteAttributesDialog.h"
 #include <QDockWidget>
+#include <QVariant>
 #include "AiChatDock.h"
 #include "mcp/McpConnectionInfoDialog.h"
 #include "mcp/McpEditorTools.h"
@@ -59,6 +60,7 @@ double exporter_loudnessGainDb();
 #include "TimelineFrameRenderer.h"
 #include "SequenceSettingsDialog.h"
 #include "HDRSettingsDialog.h"
+#include "TimecodeBurnInDialog.h"
 #include "AIProcessingDialog.h"
 #include "PluginBrowserDialog.h"
 #include "AIMaskDialog.h"
@@ -4095,6 +4097,15 @@ void MainWindow::setupMenuBar()
     m_menuHelpEntries.append({hdrSettingsAction,
         QStringLiteral("HDR (HDR10 / HLG) 書き出しのメタデータと表示プレビュー設定を編集する。")});
 
+    auto *timecodeBurnInAction = fileMenu->addAction(
+        QStringLiteral("タイムコード焼き込み設定…"));
+    timecodeBurnInAction->setObjectName(
+        QStringLiteral("action_timecode_burn_in_settings"));
+    connect(timecodeBurnInAction, &QAction::triggered,
+            this, &MainWindow::onTimecodeBurnInSettings);
+    m_menuHelpEntries.append({timecodeBurnInAction,
+        QStringLiteral("プレビューと動画書き出しに表示するタイムコードの位置と書式を設定します。")});
+
     // US-HW-10: collect project + referenced media into a single folder.
     auto *collectAction = fileMenu->addAction("プロジェクトを収集 (Collect Files)...");
     collectAction->setObjectName("action_collect_project");
@@ -7355,6 +7366,7 @@ void MainWindow::applyProjectConfig(const ProjectConfig &config)
     if (m_timeline)
         m_timeline->setProjectOutputConfig(config.width, config.height,
                                            config.explicitOutputResolution);
+    applyTimecodeBurnInSettings(m_tcBurnIn);
     updateTitle();
     statusBar()->showMessage(QString("Project: %1 — %2 %3fps")
         .arg(config.name).arg(config.resolutionLabel()).arg(config.fps));
@@ -7960,6 +7972,7 @@ void MainWindow::populateProjectData(ProjectData &data)
     QJsonObject loudnessJson;
     loudnessJson["normalizerAmount"] = 0.0;
     loudnessJson["loudnessGainDb"] = 0.0;
+    loudnessJson[QStringLiteral("_timecodeBurnIn")] = m_tcBurnIn.toJson();
     data.loudnessSettings = loudnessJson;
 
     data.particleClipEntries.clear();
@@ -8095,6 +8108,9 @@ void MainWindow::applyLoadedProjectData(const ProjectData &data, const QString &
     // US-EXT-10: restore project-level HDR + AI processing settings.
     m_hdrSettings = data.hdrSettings;
     m_aiSettings  = data.aiSettings;
+    applyTimecodeBurnInSettings(TimecodeBurnInSettings::fromJson(
+        data.loudnessSettings.value(
+            QStringLiteral("_timecodeBurnIn")).toObject()));
 
     // PRD-PROJECT-PRESET US-PP-4: restore tracker dialog states.
     m_motionTrackerState = data.motionTrackerState;
@@ -8330,6 +8346,7 @@ void MainWindow::newProject()
         m_projectCamera = Camera3D{};
         m_projectLights.clear();
         syncProjectLightingToTimeline();
+        m_tcBurnIn = TimecodeBurnInSettings{};
         applyProjectConfig(dialog.config());
         // Undo ベースラインを実プロジェクトサイズで張り直す。Timeline 構築時の
         // "Initial state" は projectWidth=-1 で積まれており、これを唯一のベースラインの
@@ -8943,6 +8960,7 @@ void MainWindow::exportVideo()
     cfg["audioCodec"]   = exportCfg.audioCodec;
     cfg["audioBitrate"] = exportCfg.audioBitrate;
     cfg["exportMarkedRangeOnly"] = exportCfg.exportMarkedRangeOnly;
+    cfg["timecodeBurnIn"] = m_tcBurnIn.toJson();
     const double loudnessGainDb = exporter_loudnessGainDb();
     job.loudnessGainDb = loudnessGainDb;
     cfg["loudnessGainDb"] = loudnessGainDb;
@@ -13322,6 +13340,40 @@ void MainWindow::onHDRSettings()
         4000);
 }
 
+void MainWindow::onTimecodeBurnInSettings()
+{
+    TimecodeBurnInDialog dlg(m_tcBurnIn, this);
+    if (dlg.exec() != QDialog::Accepted)
+        return;
+
+    applyTimecodeBurnInSettings(dlg.settings());
+    setWindowModified(true);
+    statusBar()->showMessage(
+        m_tcBurnIn.enabled
+            ? QStringLiteral("タイムコード焼き込みを有効にしました。")
+            : QStringLiteral("タイムコード焼き込みを無効にしました。"),
+        4000);
+}
+
+void MainWindow::applyTimecodeBurnInSettings(
+    const TimecodeBurnInSettings &settings)
+{
+    // Normalize every entry point through one parser so project load, UI,
+    // MCP, preview, and export share bounds and defaults.
+    m_tcBurnIn = TimecodeBurnInSettings::fromJson(settings.toJson());
+    if (m_exporter)
+        m_exporter->setTimecodeBurnIn(m_tcBurnIn);
+    if (m_timeline) {
+        m_timeline->setProperty(
+            "timecodeBurnIn", QVariant::fromValue(m_tcBurnIn.toJson()));
+    }
+    if (m_player && m_player->glPreview()) {
+        m_player->glPreview()->setTimecodeBurnIn(
+            m_tcBurnIn,
+            m_projectConfig.fps > 0 ? m_projectConfig.fps : 30.0);
+    }
+}
+
 void MainWindow::onAIProcessing()
 {
     AIProcessingDialog dlg(m_aiSettings, this);
@@ -14735,6 +14787,7 @@ void MainWindow::onMobileExport()
                     jcfg["videoBitrate"] = cfg.videoBitrate;
                     jcfg["audioCodec"]   = cfg.audioCodec;
                     jcfg["audioBitrate"] = cfg.audioBitrate;
+                    jcfg["timecodeBurnIn"] = m_tcBurnIn.toJson();
                     const double loudnessGainDb = exporter_loudnessGainDb();
                     job.loudnessGainDb = loudnessGainDb;
                     jcfg["loudnessGainDb"] = loudnessGainDb;

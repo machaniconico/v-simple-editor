@@ -129,6 +129,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/MediaPoolDragSelftest.cpp
     src/selftests/TextSpacingSelftest.cpp
     src/selftests/VersionedSaveSelftest.cpp
+    src/selftests/tcburn_selftest.cpp
 
     # PRD-SPLIT-MAIN-3 Phase 3-A: libavcore-backed selftests (moved from src/main.cpp).
     src/selftests/libavcore_selftests.cpp
@@ -166,6 +167,10 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/ExportRange.h
     src/ExportRange.cpp
     src/Exporter.cpp
+    src/TimecodeBurnIn.h
+    src/TimecodeBurnIn.cpp
+    src/TimecodeBurnInDialog.h
+    src/TimecodeBurnInDialog.cpp
     src/FrameDiff.cpp
     src/FrameExport.h
     src/FrameExport.cpp
