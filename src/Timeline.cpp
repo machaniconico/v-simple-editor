@@ -8841,6 +8841,11 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         if (sourceOut <= sourceIn)
             return true;
 
+        QVector<QString> reverseScanStack = sequenceStack;
+        const bool reverseCompositionActive = parentClip.reversed
+            || sequenceContainsReversedClip(
+                sequenceSnapshot, refId, /*audio=*/false,
+                reverseScanStack);
         sequenceStack.append(refId);
         for (const QVector<ClipInfo> &track : sequence->videoTracks) {
             double childAccum = 0.0;
@@ -8862,16 +8867,6 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
                 const double childSpeed = (child.speed > 0.0) ? child.speed : 1.0;
                 const double localIn = overlapStart - childAccum;
                 const double localOut = overlapEnd - childAccum;
-                bool childReverseComposition = child.reversed;
-                if (!childReverseComposition
-                    && child.isSequenceReference()) {
-                    QVector<QString> reverseScanStack = sequenceStack;
-                    childReverseComposition = sequenceContainsReversedClip(
-                        sequenceSnapshot, resolveSequenceRefId(child),
-                        /*audio=*/false, reverseScanStack);
-                }
-                const bool reverseCompositionActive = parentClip.reversed
-                    || childReverseComposition;
                 const NestedSequenceIntervalMapping parentInterval =
                     mapNestedSequenceInterval(
                         parentClip, parentTimelineStart, sourceIn,
@@ -9276,6 +9271,11 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
         if (sourceOut <= sourceIn)
             return true;
 
+        QVector<QString> reverseScanStack = sequenceStack;
+        const bool reverseCompositionActive = parentClip.reversed
+            || sequenceContainsReversedClip(
+                sequenceSnapshot, refId, /*audio=*/true,
+                reverseScanStack);
         sequenceStack.append(refId);
         for (const QVector<ClipInfo> &track : sequence->audioTracks) {
             double childAccum = 0.0;
@@ -9296,16 +9296,6 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
                 const double childSpeed = (child.speed > 0.0) ? child.speed : 1.0;
                 const double localIn = overlapStart - childAccum;
                 const double localOut = overlapEnd - childAccum;
-                bool childReverseComposition = child.reversed;
-                if (!childReverseComposition
-                    && child.isSequenceReference()) {
-                    QVector<QString> reverseScanStack = sequenceStack;
-                    childReverseComposition = sequenceContainsReversedClip(
-                        sequenceSnapshot, resolveSequenceRefId(child),
-                        /*audio=*/true, reverseScanStack);
-                }
-                const bool reverseCompositionActive = parentClip.reversed
-                    || childReverseComposition;
                 const NestedSequenceIntervalMapping parentInterval =
                     mapNestedSequenceInterval(
                         parentClip, parentTimelineStart, sourceIn,
