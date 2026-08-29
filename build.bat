@@ -4,8 +4,8 @@ REM v-simple-editor: ワンクリックビルドスクリプト
 REM
 REM 使い方:
 REM   build.bat                   GPU 自動判定 + 5 秒の選択タイマー
-REM   build.bat --modern          AV1 対応で強制ビルド
-REM   build.bat --classic         H.264/HEVC のみで強制ビルド
+REM   build.bat --modern          AOM AV1 fallback 同梱で強制ビルド
+REM   build.bat --classic         H.264/HEVC software 基盤で強制ビルド
 REM   build.bat --modern --yes    確認プロンプトをスキップ
 REM
 REM 必要なもの (見つからなければ案内):
@@ -65,8 +65,8 @@ echo ============================================================
 echo  Edition 選択 ^(現在: !EDITION!^)
 echo ============================================================
 echo    Enter   このまま !EDITION! でビルド
-echo    M       Modern   AV1 対応 / 推奨 GPU: RTX30+, Arc, RX6000+, M3+
-echo    C       Classic  H.264/HEVC のみ / 旧 GPU 互換
+echo    M       Modern   AOM AV1 fallback 同梱 / 推奨 GPU: RTX30+, Arc, RX6000+, M3+
+echo    C       Classic  H.264/HEVC software 基盤 / HW AV1 は実行時検出
 echo ------------------------------------------------------------
 echo    5 秒で自動的に !EDITION! で続行します
 choice /T 5 /D Y /N /C YMC >nul
@@ -101,10 +101,10 @@ echo.
 REM ------- 4. FFmpeg + 依存パッケージ -------
 echo [STEP 3/5] FFmpeg 等の依存ライブラリを準備しています ^(初回のみ時間がかかります^)...
 if /I "!EDITION!"=="modern" goto ffmpeg_modern
-set FFMPEG_PKG=ffmpeg[avcodec,avformat,avfilter,swscale,swresample,x264,x265,opus,mp3lame]:x64-windows
+set FFMPEG_PKG=ffmpeg[avcodec,avformat,avfilter,swscale,swresample,x264,x265,opus,mp3lame,amf]:x64-windows
 goto ffmpeg_install
 :ffmpeg_modern
-set FFMPEG_PKG=ffmpeg[avcodec,avformat,avfilter,swscale,swresample,x264,x265,opus,mp3lame,svt-av1,dav1d]:x64-windows
+set FFMPEG_PKG=ffmpeg[avcodec,avformat,avfilter,swscale,swresample,x264,x265,opus,mp3lame,aom,dav1d,amf]:x64-windows
 :ffmpeg_install
 "%VCPKG_ROOT%\vcpkg.exe" install !FFMPEG_PKG! --recurse
 if errorlevel 1 goto err_vcpkg_install

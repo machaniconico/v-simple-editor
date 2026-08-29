@@ -19,7 +19,7 @@ enum class ExportType {
 
 struct ExportPreset {
     QString name;
-    QString videoCodec;  // libx264, libx265, libsvtav1, libvpx-vp9
+    QString videoCodec;  // libx264, libx265, libaom-av1, libsvtav1, librav1e, ...
     QString audioCodec;  // aac, libopus, libmp3lame
     QString container;   // mp4, mkv, webm
     int videoBitrate;    // kbps

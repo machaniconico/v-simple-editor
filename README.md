@@ -76,7 +76,7 @@ A professional video editing application built from scratch with C++17, Qt6, and
 
 ### Export & Workflow
 - 13 export presets (YouTube, Twitter, Instagram, TikTok, 4K, ProRes, etc.)
-- Hardware encoding (NVENC / QSV / AMF auto-detect)
+- Hardware encoding (NVENC / QSV / AMD AMF with available software fallbacks)
 - Codec auto-detection
 - Project save/load (.veditor JSON format)
 - Auto-save & crash recovery
@@ -180,9 +180,9 @@ MCP の変更系ツールは確認ダイアログを出さず、常に自動承�
 
 | Codec | Decode | Encode |
 |-------|--------|--------|
-| H.264 (x264) | Yes | Yes |
-| H.265 (HEVC) | Yes | Yes |
-| AV1 | Yes | Yes (SVT-AV1) |
+| H.264 | Yes | Yes (x264 / NVENC / QSV / AMF) |
+| H.265 (HEVC) | Yes | Yes (x265 / NVENC / QSV / AMF) |
+| AV1 | Yes | Yes (AOM / SVT-AV1 / NVENC / QSV / AMF) |
 | ProRes | Yes | Yes |
 | VP9 | Yes | Yes |
 
@@ -206,6 +206,18 @@ MCP の変更系ツールは確認ダイアログを出さず、常に自動承�
 
 ---
 
+### AMD Radeon support
+
+On Windows, decoding uses vendor-neutral D3D11VA and preview/effects use
+OpenGL. Supported Radeon GPUs can encode H.264, HEVC, and AV1 through AMD AMF
+when the installed AMD driver exposes the requested encoder. If AMF cannot be
+opened, export tries the matching software candidates in the active FFmpeg
+build; it reports an error if none is installed instead of silently changing
+to a different codec family. AV1 hardware support depends on the Radeon GPU
+generation and driver.
+
+---
+
 ## Build
 
 ### Prerequisites
@@ -220,6 +232,11 @@ MCP の変更系ツールは確認ダイアログを出さず、常に自動承�
 ### Windows (One-Click Setup)
 
 `setup.bat` が必要なツールを **すべて自動でインストール** します。手動での事前準備は不要です。
+
+`setup.bat` と Windows CI は Modern edition を構成し、AOM の AV1
+software fallback を同梱します。`build.bat --classic` は H.264/HEVC の
+software 基盤を維持しますが、対応する FFmpeg と GPU driver がある場合は
+hardware AV1 も実行時検出されます。`build.bat --modern` は AOM を追加します。
 
 ```bash
 # GitHub から取得（git clone または ZIP ダウンロード）
@@ -363,10 +380,10 @@ Steps (build + light smoke, ~15-30 min on a fresh runner):
 
 1. checkout
 2. MSVC x64 dev env
-3. vcpkg install ffmpeg:x64-windows
+3. vcpkg install ffmpeg with the `amf` and `aom` features
 4. Qt 6.7.0 install (qtmultimedia / qtsvg / qtimageformats)
 5. cmake configure + Release build
-6. smoke: `--selftest=list` / `--selftest=tracker-preset` / `--selftest=hdr-routing`
+6. smoke: `--selftest=list` / `--selftest=tracker-preset` / `--selftest=hdr-routing` / `--selftest=radeon-amf`
 7. guard: `--selftest=unknown-foo` exits 2
 
 Heavy entries (`--selftest=all` sweep with parity / e2e / libavcore-encode)

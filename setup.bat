@@ -220,7 +220,7 @@ echo   [OK] Qt6 ready
 
 :: FFmpeg
 echo   [Installing] FFmpeg...
-"%VCPKG%" install ffmpeg[core,avformat,avcodec,swscale,swresample,avfilter]:x64-windows
+"%VCPKG%" install ffmpeg[core,avformat,avcodec,swscale,swresample,avfilter,aom,amf]:x64-windows
 if !errorlevel! neq 0 (
     echo   [ERROR] Failed to install FFmpeg
     pause
@@ -258,7 +258,7 @@ if !errorlevel! equ 0 (
 
 echo   Using generator: !CMAKE_GEN!
 
-cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE="%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=x64-windows -G "!CMAKE_GEN!" -A x64
+cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE="%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=x64-windows -DVEDITOR_EDITION=modern -G "!CMAKE_GEN!" -A x64
 
 if !errorlevel! neq 0 (
     echo.

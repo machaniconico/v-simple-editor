@@ -211,6 +211,7 @@ int runGpuIdtParitySelftest();
 int runGpuIdtMatteParitySelftest();
 int runHdrCompositeParitySelftest();
 int runPreview16PolicySelftest();
+int runRadeonAmfSelftest();
 
 namespace {
 
@@ -619,6 +620,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "GPU合成フラグ解決(env OR settings)の純粋リゾルバ検証" },
     { "gpu-composite-math", "VEDITOR_GPU_COMPOSITE_MATH_SELFTEST", runGpuCompositeMathSelftest, false,
       "GpuCompositeMath: paint order, layer transform matrix, premul source-over, matte validity (15 gates)" },
+    { "radeon-amf", "VEDITOR_RADEON_AMF_SELFTEST", runRadeonAmfSelftest, false,
+      "Radeon AMF encoder policy: H.264/HEVC/AV1 priority, software fallback, hardware classification" },
     { "hdr-composite-math", "VEDITOR_HDR_COMPOSITE_MATH_SELFTEST", runHdrCompositeMathSelftest, false,
       "HdrCompositeMath: 16-bit premul source-over + 8-bit SSOT parity + extra-precision proof + paint order (6 gates)" },
     { "hdr-export16",     "VEDITOR_HDR_EXPORT16_SELFTEST",       runHdrExport16Selftest,       false,
@@ -636,7 +639,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "exposure-aids",      "VEDITOR_EXPOSURE_AIDS_SELFTEST",      runExposureAidsSelftest,        false,
       "ExposureAids: luma709 oracle + False Color zones + Zebra stripe period + Focus Peaking edge/threshold + dimension/OOB safety (11 gates)" },
     { "import-ingest",      "VEDITOR_IMPORT_INGEST_SELFTEST",      runImportIngestSelftest,        false,
-      "ImportHub ingest previews: mesh wireframe determinism + empty placeholder (QApplication-free)" },
+      "ImportHub ingest previews: mesh wireframe determinism + empty-state rendering (QApplication-free)" },
     { "layer-style",        "VEDITOR_LAYER_STYLE_SELFTEST",        runLayerStyleSelftest,          false,
       "LayerStyle: identity fast path, drop shadow, stroke, and project JSON omission/round-trip" },
     { "layer-style-ui",     "VEDITOR_LAYER_STYLE_UI_SELFTEST",     runLayerStyleUiSelftest,       true,

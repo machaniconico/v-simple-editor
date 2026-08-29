@@ -7021,7 +7021,7 @@ void MainWindow::rebuildFavoritesMenu()
     if (!m_favoritesMenu)
         return;
 
-    // Clear everything we own (the proxy actions, any placeholder, and the
+    // Clear everything we own (proxy actions, the empty-state action, and the
     // bottom separator + edit action) and rebuild from scratch. The
     // m_editFavoritesAction QAction object is reused — only re-added.
     m_favoritesMenu->clear();
@@ -7062,9 +7062,9 @@ void MainWindow::rebuildFavoritesMenu()
     }
 
     if (added == 0) {
-        auto *placeholder = m_favoritesMenu->addAction(
+        auto *emptyStateAction = m_favoritesMenu->addAction(
             QStringLiteral("（「お気に入りを編集...」から機能を追加してください）"));
-        placeholder->setEnabled(false);
+        emptyStateAction->setEnabled(false);
     }
 
     m_favoritesMenu->addSeparator();
@@ -7620,7 +7620,7 @@ void MainWindow::populateProjectData(ProjectData &data)
     data.playheadPos = m_timeline->playheadPosition();
     data.markIn = m_timeline->markedIn();
     data.markOut = m_timeline->markedOut();
-    data.zoomLevel = 10; // TODO: expose zoom level getter
+    data.zoomLevel = qRound(m_timeline->zoomLevel());
     data.brushAnimations = m_brushAnimationEntries;
     data.rotoClipEntries.clear();
     for (auto it = m_rotoClipEntries.cbegin(); it != m_rotoClipEntries.cend(); ++it)
@@ -8627,6 +8627,7 @@ void MainWindow::exportVideo()
         job.height = m_projectConfig.height;
     }
     job.bitrateBps = static_cast<qint64>(exportCfg.videoBitrate) * 1000;
+    job.codec = exportCfg.videoCodec;
     job.startUs = 0;
     job.endUs   = 0;   // 0 = whole timeline
     // The additive in-memory edit-graph seam — the SAME pattern PARITY S8
@@ -8642,6 +8643,8 @@ void MainWindow::exportVideo()
     cfg["height"]       = job.height;
     cfg["fps"]          = exportCfg.fps > 0 ? exportCfg.fps : 30;
     cfg["videoCodec"]   = exportCfg.videoCodec;     // already ffmpeg-named
+    cfg["hwEncoder"]    = exportCfg.hwEncoder;
+    cfg["useHardwareAccel"] = exportCfg.useHardwareAccel;
     cfg["videoBitrate"] = exportCfg.videoBitrate;   // kbps
     cfg["audioCodec"]   = exportCfg.audioCodec;
     cfg["audioBitrate"] = exportCfg.audioBitrate;
@@ -9047,7 +9050,7 @@ void MainWindow::setupToolPropertyPanel()
     m_toolPropertyStack->setMinimumWidth(260);
     m_toolPropertyStack->setMaximumWidth(360);
 
-    // Page 0: empty placeholder shown when no tool is active.
+    // Page 0: empty state shown when no tool is active.
     auto *emptyPage = new QWidget(m_toolPropertyStack);
     auto *emptyLayout = new QVBoxLayout(emptyPage);
     emptyLayout->addStretch();
@@ -9568,7 +9571,9 @@ void MainWindow::addTextOverlay()
     TextOverlayDialog dialog(this);
     if (dialog.exec() == QDialog::Accepted) {
         auto overlay = dialog.result();
-        // TODO: Store overlay in project and render on preview
+        // Known limitation: this legacy dialog only reports its result;
+        // project-backed creation and preview rendering use the text-tool
+        // path in applyTextToolOverlay().
         statusBar()->showMessage(QString("Added text: \"%1\"").arg(overlay.text));
     }
 }
@@ -13034,8 +13039,8 @@ void MainWindow::openAIMaskDialog()
     if (!m_aiMaskDialog) {
         m_aiMaskDialog = new AIMaskDialog(this);
     }
-    // TODO: pass the currently-selected clip's preview frame as the source
-    // image once a frame-grab path from VideoPlayer/GLPreview is available.
+    // Known limitation: this dialog opens without the selected clip's source
+    // frame because VideoPlayer/GLPreview does not expose a frame-grab path.
     m_aiMaskDialog->show();
     m_aiMaskDialog->raise();
     m_aiMaskDialog->activateWindow();
@@ -14372,6 +14377,7 @@ void MainWindow::onMobileExport()
                     job.height  = cfg.height > 0 ? cfg.height : 1080;
                     job.bitrateBps =
                         static_cast<qint64>(cfg.videoBitrate) * 1000;
+                    job.codec = cfg.videoCodec;
                     job.startUs = 0;
                     job.endUs   = 0;
                     job.timeline = m_timeline;
@@ -14380,6 +14386,8 @@ void MainWindow::onMobileExport()
                     jcfg["height"]       = job.height;
                     jcfg["fps"]          = cfg.fps > 0 ? cfg.fps : 30;
                     jcfg["videoCodec"]   = cfg.videoCodec;
+                    jcfg["hwEncoder"]    = cfg.hwEncoder;
+                    jcfg["useHardwareAccel"] = cfg.useHardwareAccel;
                     jcfg["videoBitrate"] = cfg.videoBitrate;
                     jcfg["audioCodec"]   = cfg.audioCodec;
                     jcfg["audioBitrate"] = cfg.audioBitrate;
@@ -15190,7 +15198,8 @@ void MainWindow::openChromaKeyDialog()
 // AM-4: 自動背景除去 / マッティング。選択クリップの現在フレームを 1 枚取得し
 // (取れなければ QFileDialog で画像を開く)、AutoMatteDialog でマット生成 →
 // 「適用」されたら透過 PNG (マット) / 合成結果をファイルへ書き出す。
-// TODO: クリップエフェクトとして毎フレーム適用する完全統合は次段スコープ。
+// 現在は静止画マット/合成結果の書き出しまでを提供し、クリップへ毎フレーム
+// 適用するライブエフェクト統合は提供していない。
 void MainWindow::openAutoMatte()
 {
 #ifdef HAVE_AUTO_MATTE_DIALOG

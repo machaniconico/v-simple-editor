@@ -68,7 +68,11 @@ QString normalizedCodecFamily(QString codec)
         return QStringLiteral("hevc");
 
     if (codec == QLatin1String("libsvtav1")
-        || codec == QLatin1String("libaom-av1"))
+        || codec == QLatin1String("libaom-av1")
+        || codec == QLatin1String("librav1e")
+        || codec == QLatin1String("av1_nvenc")
+        || codec == QLatin1String("av1_qsv")
+        || codec == QLatin1String("av1_amf"))
         return QStringLiteral("av1");
 
     if (codec == QLatin1String("libvpx-vp9"))

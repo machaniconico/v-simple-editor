@@ -18,7 +18,8 @@ QString ExportConfig::codecDisplayName() const
 {
     if (videoCodec == "libx264") return "H.264";
     if (videoCodec == "libx265") return "H.265 (HEVC)";
-    if (videoCodec == "libsvtav1") return "AV1";
+    if (videoCodec == "libaom-av1" || videoCodec == "libsvtav1"
+        || videoCodec == "librav1e") return "AV1";
     if (videoCodec == "libvpx-vp9") return "VP9";
     return videoCodec;
 }
@@ -35,7 +36,7 @@ QVector<ExportPreset> ExportDialog::presets()
         {"ProRes 422",                  "prores_ks",  "pcm_s16le","mov", 147000, 1536, 0, false, 2},
         {"ProRes 422 HQ",               "prores_ks",  "pcm_s16le","mov", 220000, 1536, 0, false, 3},
         {"ProRes 4444",                 "prores_ks",  "pcm_s16le","mov", 330000, 1536, 0, false, 4},
-        {"YouTube (AV1 高圧縮)",        "libsvtav1",  "aac",      "mp4",   8000, 192, 0},
+        {"YouTube (AV1 高圧縮)",        "libaom-av1", "aac",      "mp4",   8000, 192, 0},
         {"YouTube Shorts",              "libx264",    "aac",      "mp4",   8000, 192, 0},
         {"TikTok / Reels",              "libx264",    "aac",      "mp4",   8000, 192, 0},
         {"X / Twitter",                 "libx264",    "aac",      "mp4",  10000, 192, 512},
@@ -319,7 +320,15 @@ void ExportDialog::onPresetChanged(int index)
 
     if (!isCustom && index < presetList.size()) {
         const auto &p = presetList[index];
-        int vcIdx = m_videoCodecCombo->findData(p.videoCodec);
+        QString presetCodec = p.videoCodec;
+        if (presetCodec == QLatin1String("libaom-av1")
+            || presetCodec == QLatin1String("libsvtav1")
+            || presetCodec == QLatin1String("librav1e")) {
+            presetCodec = CodecDetector::bestSoftwareAv1Encoder();
+        }
+        int vcIdx = m_videoCodecCombo->findData(presetCodec);
+        if (vcIdx < 0)
+            vcIdx = m_videoCodecCombo->findData(p.videoCodec);
         if (vcIdx >= 0) m_videoCodecCombo->setCurrentIndex(vcIdx);
         int acIdx = m_audioCodecCombo->findData(p.audioCodec);
         if (acIdx >= 0) m_audioCodecCombo->setCurrentIndex(acIdx);
@@ -519,7 +528,8 @@ void ExportDialog::updateSummary()
     QString codecName;
     if (vc == "libx264") codecName = "H.264";
     else if (vc == "libx265") codecName = "H.265";
-    else if (vc == "libsvtav1") codecName = "AV1";
+    else if (vc == "libaom-av1" || vc == "libsvtav1"
+             || vc == "librav1e") codecName = "AV1";
     else if (vc == "libvpx-vp9") codecName = "VP9";
 
     QString hwInfo = QString("HW encode: %1 (%2)")

@@ -11,7 +11,8 @@ name: selftest
 #   1. --selftest=list           : verify kArgvSelftests table populates
 #   2. --selftest=tracker-preset : QApplication-free entry
 #   3. --selftest=hdr-routing    : QApplication-free entry
-#   4. --selftest=unknown-foo    : guard returns exit 2
+#   4. --selftest=radeon-amf     : deterministic AMF routing/fallback entry
+#   5. --selftest=unknown-foo    : guard returns exit 2
 #
 # Heavy entries (--selftest=all sweep with parity / e2e / libavcore-encode)
 # are out of scope here — they need real footage assets and stronger DLL
@@ -44,12 +45,17 @@ jobs:
       - name: Set up vcpkg
         uses: lukka/run-vcpkg@v11
         with:
-          vcpkgGitCommitId: "2024.07.12"
+          vcpkgGitCommitId: "afeb285c9e2e015292985856b9382ea1d82a4492"
 
       - name: Install FFmpeg (vcpkg)
         shell: cmd
         run: |
-          %VCPKG_ROOT%\vcpkg install ffmpeg:x64-windows
+          %VCPKG_ROOT%\vcpkg install ffmpeg[core,avformat,avcodec,swscale,swresample,avfilter,aom,amf]:x64-windows --recurse
+
+      - name: Verify Radeon build declarations
+        shell: powershell
+        run: |
+          .\scripts\verify_radeon_build_support.ps1
 
       - name: Install Qt 6
         uses: jurplel/install-qt-action@v4
@@ -65,7 +71,8 @@ jobs:
         shell: cmd
         run: |
           cmake -S . -B build_win -G "Visual Studio 17 2022" -A x64 ^
-            -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake
+            -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake ^
+            -DVEDITOR_EDITION=modern
 
       - name: Build Release
         shell: cmd
@@ -86,6 +93,11 @@ jobs:
         shell: cmd
         run: |
           build_win\Release\v-simple-editor.exe --selftest=hdr-routing
+
+      - name: Smoke — --selftest=radeon-amf (QApp-free)
+        shell: cmd
+        run: |
+          build_win\Release\v-simple-editor.exe --selftest=radeon-amf
 
       - name: Guard — --selftest=<unknown> exits 2
         shell: cmd

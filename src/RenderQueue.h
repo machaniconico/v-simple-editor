@@ -13,6 +13,7 @@
 class QThread;
 class QProcess;
 class Timeline;
+namespace libavcore { struct EncodeRequest; }
 
 enum class RenderJobStatus {
     Pending,
@@ -100,6 +101,13 @@ class RenderQueue : public QObject
 public:
     explicit RenderQueue(QObject *parent = nullptr);
     ~RenderQueue();
+
+    // Convert the persisted export selection into FrameEncoder's Qt-free
+    // request fields. Public so headless tests and alternate queue producers
+    // share the exact same normalization contract.
+    static void applyHardwareEncodingConfig(
+        const QJsonObject &config,
+        libavcore::EncodeRequest &request);
 
     // Spec API — preferred for new code (uuid-keyed).
     void addJob(const RenderJob &job);
