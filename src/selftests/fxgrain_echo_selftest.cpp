@@ -1,13 +1,17 @@
+#include "../ClipGeometry.h"
 #include "../EffectParamSchema.h"
 #include "../EffectPreset.h"
+#include "../MaskSystem.h"
 #include "../Timeline.h"
 #include "../TimelineFrameRenderer.h"
 #include "../VideoEffect.h"
+#include "../VideoPlayer.h"
 
 #include <QColor>
 #include <QImage>
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QPainter>
 #include <QStringList>
 #include <QVector>
 
@@ -15,6 +19,7 @@
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <limits>
 
 namespace {
 
@@ -64,6 +69,34 @@ double redVariance(const QImage &image)
     }
     const double mean = sum / sampleCount;
     return sumSquares / sampleCount - mean * mean;
+}
+
+double meanAbsoluteError(const QImage &a, const QImage &b)
+{
+    if (a.isNull() || b.isNull() || a.size() != b.size())
+        return std::numeric_limits<double>::infinity();
+
+    const QImage lhs = a.convertToFormat(QImage::Format_RGBA8888);
+    const QImage rhs = b.convertToFormat(QImage::Format_RGBA8888);
+    quint64 totalError = 0;
+    for (int y = 0; y < lhs.height(); ++y) {
+        const uchar *left = lhs.constScanLine(y);
+        const uchar *right = rhs.constScanLine(y);
+        for (int x = 0; x < lhs.width() * 4; ++x)
+            totalError += static_cast<quint64>(std::abs(int(left[x]) - int(right[x])));
+    }
+    return static_cast<double>(totalError)
+        / static_cast<double>(lhs.width() * lhs.height() * 4);
+}
+
+QImage sourceOver(const QImage &lower, const QImage &upper)
+{
+    QImage out = lower.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+    QPainter painter(&out);
+    painter.setCompositionMode(QPainter::CompositionMode_SourceOver);
+    painter.drawImage(0, 0, upper);
+    painter.end();
+    return out;
 }
 
 bool schemaNamesEqual(VideoEffectType type, const QStringList &expected)
@@ -226,6 +259,8 @@ int runFxGrainEchoSelftest()
         effectctrl::setParamValue(blendEffect, QStringLiteral("blend"), blend);
         ClipInfo blendClip;
         blendClip.inPoint = 0.0;
+        blendClip.outPoint = 2.0;
+        blendClip.duration = 2.0;
         blendClip.effects = { blendEffect };
         const tlrender::EchoFrameProvider provider =
             [&blendEcho](double, double) { return blendEcho; };
@@ -237,6 +272,143 @@ int runFxGrainEchoSelftest()
     }
     reportGate("G10", "Echo blend values 0..3 match schema and composition",
                blendModesValid, passed, failed);
+
+    const auto delayDef = std::find_if(
+        echoSchema.cbegin(), echoSchema.cend(),
+        [](const effectctrl::ParamDef &def) { return def.name == "delaySec"; });
+    ClipInfo adjustmentClip;
+    adjustmentClip.isAdjustment = true;
+    adjustmentClip.inPoint = 0.0;
+    adjustmentClip.outPoint = 2.0;
+    adjustmentClip.duration = 2.0;
+    adjustmentClip.effects = { VideoEffect::createEcho(0.1, 1, 1.0, 2) };
+    const tlrender::EchoFrameProvider brightProvider =
+        [&brighter](double, double) { return brighter; };
+    const QImage adjustmentResult = tlrender::applyClipFxPackWithEcho(
+        pattern, adjustmentClip, 1.0, 1.0, brightProvider);
+    const bool adjustmentEchoNoOp = imagesByteIdentical(pattern, adjustmentResult)
+        && delayDef != echoSchema.cend()
+        && delayDef->displayLabel.contains(
+            QStringLiteral("調整レイヤーでは無効"));
+    reportGate("G11", "adjustment-layer Echo is documented and remains a no-op",
+               adjustmentEchoNoOp, passed, failed);
+
+    // G12 uses the same clip-local Echo helper called by export and VideoPlayer,
+    // then follows their real mask/transform/composite primitives. The upper
+    // track has all three operations so a canvas-final Echo regression cannot
+    // hide behind a single-layer identity case.
+    const QSize paritySize(64, 48);
+    QImage lowerTrack(paritySize, QImage::Format_RGBA8888);
+    lowerTrack.fill(QColor(12, 40, 96, 255));
+    QImage upperTrack(paritySize, QImage::Format_RGBA8888);
+    upperTrack.fill(QColor(92, 24, 18, 255));
+    QImage priorUpper(paritySize, QImage::Format_RGBA8888);
+    priorUpper.fill(QColor(28, 184, 64, 255));
+
+    ClipInfo upperClip;
+    upperClip.inPoint = 0.0;
+    upperClip.outPoint = 2.0;
+    upperClip.duration = 2.0;
+    upperClip.colorCorrection.brightness = 18.0;
+    upperClip.colorCorrection.contrast = 12.0;
+    upperClip.effects = { VideoEffect::createEcho(0.1, 1, 0.65, 2) };
+    upperClip.videoScale = 1.0;
+    upperClip.videoDx = 0.125;
+    upperClip.videoDy = -0.125;
+    Mask upperMask;
+    upperMask.shape = MaskShape::Rectangle;
+    upperMask.rect = QRectF(8.0, 6.0, 40.0, 30.0);
+    upperClip.maskSystem.addMask(upperMask);
+
+    int exportProviderCalls = 0;
+    int previewProviderCalls = 0;
+    const QImage exportFx = tlrender::applyClipFxStackWithEchoFromSource(
+        upperTrack, upperClip, 1.0, 1.0,
+        [&priorUpper, &upperClip, &exportProviderCalls](double,
+                                                        double sampleLocalSec) {
+            ++exportProviderCalls;
+            return tlrender::prepareClipSourceForEcho(
+                priorUpper, upperClip, sampleLocalSec);
+        });
+    const QVector<Mask> masks = upperClip.maskSystem.masks();
+    const QImage previewMasked = videopreview::prepareEchoClipForComposite(
+        upperTrack, upperClip, 1.0, 1.0,
+        [&priorUpper, &upperClip, &previewProviderCalls](double,
+                                                         double sampleLocalSec) {
+            ++previewProviderCalls;
+            return tlrender::prepareClipSourceForEcho(
+                priorUpper, upperClip, sampleLocalSec);
+        },
+        masks);
+
+    const QImage exportMasked = MaskSystem::applyMask(
+        exportFx, MaskSystem::generateMaskImage(masks, exportFx.size()));
+    const clipgeom::ClipTransform upperTransform{
+        upperClip.videoScale, upperClip.videoDx, upperClip.videoDy,
+        upperClip.rotation2DDegrees};
+    const QImage exportPlaced = clipgeom::renderLayer(
+        exportMasked, upperTransform, paritySize, /*smooth=*/true);
+    const QImage previewPlaced = clipgeom::renderLayer(
+        previewMasked, upperTransform, paritySize, /*smooth=*/false);
+    const QImage exportComposite = sourceOver(lowerTrack, exportPlaced);
+    const QImage previewComposite = sourceOver(lowerTrack, previewPlaced);
+    const double parityMae = meanAbsoluteError(exportComposite, previewComposite);
+    const bool gradeWasApplied = !imagesByteIdentical(
+        upperTrack,
+        tlrender::prepareClipSourceForEcho(upperTrack, upperClip, 1.0));
+
+    ClipInfo reverseClip;
+    reverseClip.inPoint = 2.0;
+    reverseClip.outPoint = 6.0;
+    reverseClip.duration = 6.0;
+    reverseClip.reversed = true;
+    reverseClip.effects = { VideoEffect::createEcho(0.5, 1, 1.0, 3) };
+    double reverseSampleSource = -1.0;
+    double reverseSampleLocal = -1.0;
+    (void)tlrender::applyClipFxStackWithEchoFromSource(
+        upperTrack, reverseClip, 1.0,
+        reverseClip.sourceSecondAtLocalTime(1.0),
+        [&priorUpper, &reverseSampleSource, &reverseSampleLocal](
+            double sourceSec, double localSec) {
+            reverseSampleSource = sourceSec;
+            reverseSampleLocal = localSec;
+            return priorUpper;
+        });
+    const bool reverseMappedToEarlierTimelineFrame =
+        std::abs(reverseSampleLocal - 0.5) < 1e-9
+        && std::abs(reverseSampleSource - 5.5) < 1e-9;
+
+    ClipInfo animatedPrefixClip;
+    animatedPrefixClip.inPoint = 0.0;
+    animatedPrefixClip.outPoint = 2.0;
+    animatedPrefixClip.duration = 2.0;
+    animatedPrefixClip.effects = {
+        VideoEffect::createBrightnessContrast(0.0, 0.0),
+        VideoEffect::createEcho(0.5, 1, 1.0, 3)
+    };
+    KeyframeTrack brightnessTrack(
+        QStringLiteral("effect.0.brightness"), 0.0);
+    brightnessTrack.addKeyframe(0.0, 0.0);
+    brightnessTrack.addKeyframe(1.0, 100.0);
+    animatedPrefixClip.keyframes.addTrack(brightnessTrack);
+    const QImage animatedPrefixResult =
+        tlrender::applyClipFxStackWithEchoFromSource(
+            upperTrack, animatedPrefixClip, 1.0, 1.0,
+            [&priorUpper](double, double) { return priorUpper; });
+    const QImage expectedAnimatedPrefix =
+        VideoEffectProcessor::applyEffect(
+            priorUpper,
+            VideoEffect::createBrightnessContrast(50.0, 0.0))
+            .convertToFormat(QImage::Format_RGBA8888);
+    const bool prefixKeyframeUsesHistoryTime = imagesByteIdentical(
+        animatedPrefixResult, expectedAnimatedPrefix);
+
+    reportGate("G12", "two-track mask+transform+Echo preview/export MAE < 1.0",
+               exportProviderCalls == 1 && previewProviderCalls == 1
+                   && gradeWasApplied && parityMae < 1.0
+                   && reverseMappedToEarlierTimelineFrame
+                   && prefixKeyframeUsesHistoryTime,
+               passed, failed);
 
     std::cerr << "summary: " << passed << " PASS, " << failed << " FAIL\n";
     return failed;

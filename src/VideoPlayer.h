@@ -88,6 +88,18 @@ inline uint qHash(const ReversePlaybackKey &k, uint seed = 0) noexcept
 class Timeline;
 class GLPreview;
 class QResizeEvent;
+struct ClipInfo;
+
+namespace videopreview {
+// Pure clip-local preview seam used before layer transform/composition. It is
+// public so headless parity tests can exercise the production VideoPlayer
+// ordering without constructing QWidget/QApplication state.
+QImage prepareEchoClipForComposite(
+    const QImage &source, const ClipInfo &clip, double clipLocalSeconds,
+    double sourceSeconds,
+    const std::function<QImage(double, double)> &frameProvider,
+    const QVector<Mask> &masks);
+}
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -345,6 +357,7 @@ private:
     double effectiveDisplayAspectRatio() const;
     double streamDisplayAspectRatio() const;
     void refreshDisplayedFrame();
+    bool refreshPreviewEchoComposite();
     void setupUI();
     void resetDecoder();
     void scheduleNextFrame();
@@ -717,8 +730,14 @@ private:
     // on top of every composed frame while the dialog is open; empty in the
     // default/committed state.
     QVector<VideoEffect> m_previewEffects;
+    // Original ordered stack before GPU/CPU partitioning. If a committed
+    // Echo forces the whole canvas through CPU preview, this stack preserves
+    // GPU-capable effects and their order instead of silently dropping them.
+    QVector<VideoEffect> m_fullPreviewEffects;
+    QVector<VideoEffect> m_gpuPreviewEffects;
     bool m_previewEffectsLive = false;
     bool m_gpuEffectsEnabled = true;
+    bool m_echoDisabledGlGrade = false;
     // Preview proxy divisor (1=Full, 2=1/2, 4=1/4, 8=1/8). Applied only when
     // CPU-path effects are active during playback, so heavy Sharpen/Mosaic/
     // ChromaKey stay smooth. Persisted via QSettings "proxyDivisor".
@@ -832,10 +851,19 @@ private:
     // unmodified when the overlay list is empty.
     QImage composeFrameWithOverlays(const QImage &source,
                                     bool textAlreadyBaked = false) const;
-    QImage applyPreviewEffectStackWithEcho(
-        const QImage &source,
-        const QVector<VideoEffect> &effects,
-        qint64 timelineUsec) const;
+    int previewEffectTargetEntryIndex(const Timeline *timeline) const;
+    bool activePreviewEchoStack(qint64 timelineUsec,
+                                int *targetEntryIndex = nullptr) const;
+    bool hasCpuBakedEchoAt(qint64 timelineUsec) const;
+    // Echo clips take the CPU SSOT before their compositing mask and layer
+    // transform. Effect-free clips keep the historical VFX -> mask path.
+    QImage preparePreviewClipFrame(const QImage &source,
+                                   const PlaybackEntry &entry,
+                                   int entryIndex,
+                                   double sourceSeconds,
+                                   QSize sourceSize,
+                                   qint64 timelineUsec,
+                                   bool *echoApplied = nullptr) const;
 
     // VEDITOR_TICK_TRACE accumulators (Phase 1e Sprint US-1). Populated only
     // when tickTraceEnabled() is true; flushed and reset every 30 ticks.

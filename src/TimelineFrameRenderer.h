@@ -68,9 +68,22 @@ using EchoFrameProvider =
     std::function<QImage(double sourceSeconds, double clipLocalSeconds)>;
 
 bool hasActiveEcho(const ClipInfo &clip, double clipLocalSeconds);
+// Shared clip-local pre-Echo stage used by export and VideoPlayer. The source
+// frame is processed as VFX footage (when enabled) and then receives the
+// clip's effective HSL/grade/curves/LUT at `clipLocalSeconds`.
+QImage prepareClipSourceForEcho(const QImage &source, const ClipInfo &clip,
+                                double clipLocalSeconds);
+QImage applyClipFxStackFromSource(const QImage &source, const ClipInfo &clip,
+                                  double clipLocalSeconds);
 QImage applyClipFxPackWithEcho(const QImage &graded, const ClipInfo &clip,
                                double clipLocalSeconds, double sourceSeconds,
                                const EchoFrameProvider &frameProvider);
+// Full native clip stage for an Echo-bearing stack: VFX footage controls ->
+// grade/LUT -> ordered FX/Echo. Both export and preview call this function
+// before mask, fit, transform, and canvas composition.
+QImage applyClipFxStackWithEchoFromSource(
+    const QImage &source, const ClipInfo &clip, double clipLocalSeconds,
+    double sourceSeconds, const EchoFrameProvider &frameProvider);
 
 // Random-access source-frame path shared with preview Echo. It mirrors the
 // export provider's source decode/nested render -> VFX controls -> grade order.

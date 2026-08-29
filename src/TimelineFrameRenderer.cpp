@@ -43,6 +43,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <map>
+#include <tuple>
 #include <functional>
 
 extern "C" {
@@ -622,56 +624,123 @@ QImage applyClipFxPackWithEcho(const QImage &graded, const ClipInfo &clip,
                                double clipLocalSeconds, double sourceSeconds,
                                const EchoFrameProvider &frameProvider)
 {
-    const QVector<VideoEffect> effects =
-        clipanim::effectiveEffectsAt(clip, clipLocalSeconds);
-    QImage result = graded;
+    // Adjustment layers have no clip-local source frame to re-fetch. Keep
+    // Echo a no-op there while preserving every other effect's stack order.
+    if (clip.isAdjustment)
+        return applyClipFxPack(graded, clip, clipLocalSeconds);
 
-    for (int effectIndex = 0; effectIndex < effects.size(); ++effectIndex) {
-        const VideoEffect &effect = effects[effectIndex];
-        if (!effect.enabled || effect.type != VideoEffectType::Echo) {
-            result = VideoEffectProcessor::applyEffect(result, effect);
-            continue;
+    auto stableEffectsAt = [&clip](double localSeconds) {
+        // effectiveEffectsAt removes time-inactive effects, which destroys
+        // their stack indices. Echo recursion needs stable indices so an
+        // animated prefix is evaluated at each historical sample while later
+        // effects remain after the blend.
+        ClipInfo evaluationClip;
+        evaluationClip.effects = clip.effects;
+        evaluationClip.keyframes = clip.keyframes;
+        for (VideoEffect &effect : evaluationClip.effects) {
+            effect.startSec = -1.0;
+            effect.endSec = -1.0;
         }
+        return clipanim::effectiveEffectsAt(evaluationClip, localSeconds);
+    };
+    auto effectActiveAt = [](const VideoEffect &effect, double localSeconds) {
+        return !(effect.startSec >= 0.0 && localSeconds < effect.startSec)
+            && !(effect.endSec >= 0.0 && localSeconds > effect.endSec);
+    };
 
-        const double delaySec = std::isfinite(effect.param1)
-            ? qBound(0.02, effect.param1, 2.0) : 0.1;
-        const int count = qBound(1, static_cast<int>(std::round(effect.param2)), 8);
-        const double decay = std::isfinite(effect.param3)
-            ? qBound(0.0, effect.param3, 1.0) : 0.5;
-        const int blend = qBound(0, effect.keyColor.red(), 3);
-        QVector<QImage> echoes;
-        echoes.reserve(count);
-
-        for (int i = 1; i <= count; ++i) {
-            const double sampleSourceSec = sourceSeconds - i * delaySec;
-            if (sampleSourceSec < clip.inPoint)
-                break;
-            const double sampleLocalSec =
-                clip.timeRemapCurve.keys.isEmpty() && std::abs(clip.speed) > 1e-9
-                ? qMax(0.0, (sampleSourceSec - clip.inPoint) / clip.speed)
-                : qMax(0.0, clipLocalSeconds - i * delaySec);
-
-            QImage echoFrame = frameProvider
-                ? frameProvider(sampleSourceSec, sampleLocalSec) : QImage();
-            if (!echoFrame.isNull()) {
-                // Preserve stack order: every effect before Echo is applied to
-                // each re-fetched source frame; later effects run after blend.
-                for (int prefixIndex = 0; prefixIndex < effectIndex; ++prefixIndex) {
-                    if (effects[prefixIndex].type != VideoEffectType::Echo) {
-                        echoFrame = VideoEffectProcessor::applyEffect(
-                            echoFrame, effects[prefixIndex]);
-                    }
-                }
+    // Apply a prefix recursively so a second Echo sees the complete output of
+    // every preceding effect, including an earlier Echo. The recursion always
+    // decreases its effect limit, so it is finite and keeps no frame history.
+    // Memoization lives only for this output frame: it removes exponential
+    // duplicate decodes from stacked Echo effects without becoming a seek-
+    // sensitive history/ring buffer.
+    using PrefixCacheKey = std::tuple<int, quint64, quint64>;
+    std::map<PrefixCacheKey, QImage> prefixCache;
+    auto doubleBits = [](double value) {
+        quint64 bits = 0;
+        static_assert(sizeof(bits) == sizeof(value),
+                      "double and quint64 must have equal width");
+        std::memcpy(&bits, &value, sizeof(bits));
+        return bits;
+    };
+    std::function<QImage(const QImage &, int, double, double)> applyPrefix;
+    applyPrefix = [&](const QImage &input, int effectLimit,
+                      double localSeconds, double currentSourceSeconds) {
+        QImage result = input;
+        const QVector<VideoEffect> effects = stableEffectsAt(localSeconds);
+        const int boundedLimit = qMin(
+            effectLimit, static_cast<int>(effects.size()));
+        for (int effectIndex = 0; effectIndex < boundedLimit; ++effectIndex) {
+            const VideoEffect &effect = effects[effectIndex];
+            if (!effectActiveAt(clip.effects[effectIndex], localSeconds))
+                continue;
+            if (!effect.enabled || effect.type != VideoEffectType::Echo) {
+                result = VideoEffectProcessor::applyEffect(result, effect);
+                continue;
             }
-            // Keep null entries so composeEcho retains the decay^i exponent
-            // when one individual decode fails.
-            echoes.append(echoFrame);
+
+            const double delaySec = std::isfinite(effect.param1)
+                ? qBound(0.02, effect.param1, 2.0) : 0.1;
+            const int count = qBound(
+                1, static_cast<int>(std::round(effect.param2)), 8);
+            const double decay = std::isfinite(effect.param3)
+                ? qBound(0.0, effect.param3, 1.0) : 0.5;
+            const int blend = qBound(0, effect.keyColor.red(), 3);
+            QVector<QImage> echoes;
+            echoes.reserve(count);
+
+            for (int i = 1; i <= count; ++i) {
+                // Echo delay is clip-local time. Mapping t-i*delay through the
+                // clip handles reverse playback, speed ramps, and time remap;
+                // a reversed clip naturally resolves to a larger source PTS.
+                const double sampleLocalSec = localSeconds - i * delaySec;
+                if (sampleLocalSec < 0.0)
+                    break;
+                const double sourceOut =
+                    clip.outPoint > 0.0 ? clip.outPoint : clip.duration;
+                const bool hasSourceBounds = sourceOut > clip.inPoint;
+                const double sampleSourceSec = hasSourceBounds
+                    ? clip.sourceSecondAtLocalTime(sampleLocalSec)
+                    : currentSourceSeconds
+                        + (clip.reversed ? 1.0 : -1.0) * i * delaySec;
+                if (hasSourceBounds
+                    && (sampleSourceSec < clip.inPoint
+                        || sampleSourceSec > sourceOut)) {
+                    continue;
+                }
+
+                const PrefixCacheKey cacheKey{
+                    effectIndex, doubleBits(sampleLocalSec),
+                    doubleBits(sampleSourceSec)};
+                const auto cached = prefixCache.find(cacheKey);
+                QImage echoFrame;
+                if (cached != prefixCache.end()) {
+                    echoFrame = cached->second;
+                } else {
+                    echoFrame = frameProvider
+                        ? frameProvider(sampleSourceSec, sampleLocalSec)
+                        : QImage();
+                    if (!echoFrame.isNull()) {
+                        echoFrame = applyPrefix(
+                            echoFrame, effectIndex,
+                            sampleLocalSec, sampleSourceSec);
+                    }
+                    prefixCache.emplace(cacheKey, echoFrame);
+                }
+                // Keep null entries so composeEcho retains the decay^i
+                // exponent when one individual decode fails.
+                echoes.append(echoFrame);
+            }
+
+            result = composeEcho(result, echoes, decay, blend);
         }
+        return result;
+    };
 
-        result = composeEcho(result, echoes, decay, blend);
-    }
-
-    return result.convertToFormat(QImage::Format_RGBA8888);
+    return applyPrefix(
+        graded, static_cast<int>(clip.effects.size()),
+        clipLocalSeconds, sourceSeconds)
+        .convertToFormat(QImage::Format_RGBA8888);
 }
 
 namespace {
@@ -1414,12 +1483,12 @@ QImage renderFrameFromTracks(const Timeline *timeline,
                         projectLightViewPosition, sampleFromLeftBoundary);
                     if (sampleRaw.isNull())
                         return QImage();
-                    return gradeClipNativeFrame(
-                        applyVfxFootageControls(sampleRaw, v1Clip),
-                        v1Clip, sampleLocalSec);
+                    return prepareClipSourceForEcho(
+                        sampleRaw, v1Clip, sampleLocalSec);
                 };
-            v1Fx = applyClipFxPackWithEcho(
-                v1Graded, v1Clip, v1LocalSec, v1SourceSec, echoFrameProvider);
+            v1Fx = applyClipFxStackWithEchoFromSource(
+                v1NativeRaw, v1Clip, v1LocalSec, v1SourceSec,
+                echoFrameProvider);
         } else {
             v1Fx = applyClipFxPack(v1Graded, v1Clip, v1LocalSec);
         }
@@ -1608,12 +1677,11 @@ QImage renderFrameFromTracks(const Timeline *timeline,
                         projectLightViewPosition, sampleFromLeftBoundary);
                     if (sampleRaw.isNull())
                         return QImage();
-                    return gradeClipNativeFrame(
-                        applyVfxFootageControls(sampleRaw, c),
-                        c, sampleLocalSec);
+                    return prepareClipSourceForEcho(
+                        sampleRaw, c, sampleLocalSec);
                 };
-            nativeForMask = applyClipFxPackWithEcho(
-                gradedNative, c, localSec, srcSec, echoFrameProvider);
+            nativeForMask = applyClipFxStackWithEchoFromSource(
+                nativeRaw, c, localSec, srcSec, echoFrameProvider);
         } else {
             nativeForMask = applyClipFxPack(gradedNative, c, localSec);
         }
@@ -2269,8 +2337,33 @@ QImage renderClipSourceFrameForEcho(const Timeline *timeline,
         /*sampleFromLeftBoundary=*/false);
     if (source.isNull())
         return QImage();
+    return prepareClipSourceForEcho(source, clip, clipLocalSeconds);
+}
+
+QImage prepareClipSourceForEcho(const QImage &source, const ClipInfo &clip,
+                                double clipLocalSeconds)
+{
+    if (source.isNull())
+        return source;
     return gradeClipNativeFrame(
         applyVfxFootageControls(source, clip), clip, clipLocalSeconds);
+}
+
+QImage applyClipFxStackFromSource(const QImage &source, const ClipInfo &clip,
+                                  double clipLocalSeconds)
+{
+    return applyClipFxPack(
+        prepareClipSourceForEcho(source, clip, clipLocalSeconds),
+        clip, clipLocalSeconds);
+}
+
+QImage applyClipFxStackWithEchoFromSource(
+    const QImage &source, const ClipInfo &clip, double clipLocalSeconds,
+    double sourceSeconds, const EchoFrameProvider &frameProvider)
+{
+    return applyClipFxPackWithEcho(
+        prepareClipSourceForEcho(source, clip, clipLocalSeconds),
+        clip, clipLocalSeconds, sourceSeconds, frameProvider);
 }
 
 QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize outSize)

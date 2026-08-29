@@ -4,7 +4,6 @@
 #include "TimelineFrameRenderer.h"
 #include "Timeline.h"
 #include "LayerStyle.h"
-#include "EffectParamSchema.h"
 #include "UndoTrace.h"
 #include "ProxyManager.h"
 #include "TextOverlayBake.h"   // textbake::bakeOverlays (shared text baker SSOT)
@@ -85,6 +84,21 @@ bool parentingEnabledFromEnv();
 namespace clipmask {
 QImage applyRasterAlphaMask(const QImage &sourceImage, const QVector<Mask> &masks);
 }
+
+namespace videopreview {
+QImage prepareEchoClipForComposite(
+    const QImage &source, const ClipInfo &clip, double clipLocalSeconds,
+    double sourceSeconds,
+    const std::function<QImage(double, double)> &frameProvider,
+    const QVector<Mask> &masks)
+{
+    const QImage effected = tlrender::applyClipFxStackWithEchoFromSource(
+        source, clip, clipLocalSeconds, sourceSeconds, frameProvider);
+    if (effected.isNull() || masks.isEmpty())
+        return effected;
+    return clipmask::applyRasterAlphaMask(effected, masks);
+}
+} // namespace videopreview
 
 namespace {
 
@@ -538,17 +552,11 @@ QImage applyPreviewAdjustmentClipStack(
     if (effects.isEmpty())
         return lowerComposite;
 
-    QImage adjusted;
-    if (tlrender::hasActiveEcho(*adjustment.clip, adjustment.localSec)) {
-        const double sourceSec = adjustment.clip->inPoint
-            + adjustment.localSec * adjustment.clip->speed;
-        adjusted = tlrender::applyClipFxPackWithEcho(
-            lowerComposite, *adjustment.clip, adjustment.localSec, sourceSec,
-            tlrender::EchoFrameProvider());
-    } else {
-        adjusted = VideoEffectProcessor::applyEffectStack(
-            lowerComposite, ColorCorrection(), effects);
-    }
+    // Adjustment layers have no clip-local source frame. Echo's single-frame
+    // implementation is intentionally a no-op; the remaining effects retain
+    // their original order on the already-composited lower tracks.
+    const QImage adjusted = VideoEffectProcessor::applyEffectStack(
+        lowerComposite, ColorCorrection(), effects);
     if (adjusted.isNull() || adjusted.size() != lowerComposite.size())
         return adjusted;
 
@@ -834,19 +842,19 @@ QVector<int> resolvePreviewEffectSourceIndices(const QVector<VideoEffect> &sourc
 {
     QVector<int> indices;
     indices.reserve(preview.size());
+    QVector<bool> used(source.size(), false);
 
-    int searchFrom = 0;
     for (const VideoEffect &effect : preview) {
         int found = -1;
-        for (int i = searchFrom; i < source.size(); ++i) {
-            if (sameEffectValue(source[i], effect)) {
+        for (int i = 0; i < source.size(); ++i) {
+            if (!used[i] && sameEffectValue(source[i], effect)) {
                 found = i;
                 break;
             }
         }
         if (found < 0) {
-            for (int i = searchFrom; i < source.size(); ++i) {
-                if (source[i].type == effect.type) {
+            for (int i = 0; i < source.size(); ++i) {
+                if (!used[i] && source[i].type == effect.type) {
                     found = i;
                     break;
                 }
@@ -854,7 +862,7 @@ QVector<int> resolvePreviewEffectSourceIndices(const QVector<VideoEffect> &sourc
         }
         indices.append(found);
         if (found >= 0)
-            searchFrom = found + 1;
+            used[found] = true;
     }
 
     return indices;
@@ -863,43 +871,118 @@ QVector<int> resolvePreviewEffectSourceIndices(const QVector<VideoEffect> &sourc
 KeyframeTrack remapKeyframeTrack(const KeyframeTrack &sourceTrack,
                                  const QString &propertyName)
 {
-    KeyframeTrack remapped(propertyName, sourceTrack.defaultValue());
-    for (const KeyframePoint &kf : sourceTrack.keyframes()) {
-        remapped.addKeyframe(kf.time,
-                             kf.value,
-                             kf.interpolation,
-                             kf.bezX1,
-                             kf.bezY1,
-                             kf.bezX2,
-                             kf.bezY2,
-                             kf.hasSpatialTangent,
-                             kf.spatialOutX,
-                             kf.spatialOutY,
-                             kf.spatialInX,
-                             kf.spatialInY);
-    }
+    KeyframeTrack remapped = sourceTrack;
+    remapped.setPropertyName(propertyName);
     return remapped;
+}
+
+StringKeyframeTrack remapStringKeyframeTrack(
+    const StringKeyframeTrack &sourceTrack,
+    const QString &propertyName)
+{
+    StringKeyframeTrack remapped(propertyName, sourceTrack.defaultValue());
+    for (const StringKeyframePoint &kf : sourceTrack.keyframes())
+        remapped.addKeyframe(kf.time, kf.value);
+    return remapped;
+}
+
+ClipInfo remappedPreviewClip(const ClipInfo &sourceClip,
+                             const QVector<VideoEffect> &previewEffects)
+{
+    ClipInfo previewClip = sourceClip;
+    previewClip.effects.clear();
+
+    // Preserve grade/motion/etc. tracks, but remove effect-indexed tracks;
+    // those must follow the dialog stack after add/remove/reorder operations.
+    QVector<QString> numericEffectTracks;
+    for (const KeyframeTrack &track : previewClip.keyframes.tracks()) {
+        if (track.propertyName().startsWith(QStringLiteral("effect.")))
+            numericEffectTracks.append(track.propertyName());
+    }
+    for (const QString &trackName : numericEffectTracks)
+        previewClip.keyframes.removeTrack(trackName);
+
+    QVector<QString> stringEffectTracks;
+    for (const StringKeyframeTrack &track : previewClip.keyframes.stringTracks()) {
+        if (track.propertyName().startsWith(QStringLiteral("effect.")))
+            stringEffectTracks.append(track.propertyName());
+    }
+    for (const QString &trackName : stringEffectTracks)
+        previewClip.keyframes.removeStringTrack(trackName);
+
+    const QVector<int> sourceIndices = resolvePreviewEffectSourceIndices(
+        sourceClip.effects, previewEffects);
+    for (int previewIndex = 0;
+         previewIndex < previewEffects.size()
+         && previewIndex < sourceIndices.size();
+         ++previewIndex) {
+        const int sourceIndex = sourceIndices[previewIndex];
+        VideoEffect effect = previewEffects[previewIndex];
+        if (sourceIndex < 0 || sourceIndex >= sourceClip.effects.size()) {
+            effect.startSec = -1.0;
+            effect.endSec = -1.0;
+            previewClip.effects.append(effect);
+            continue;
+        }
+
+        effect.startSec = sourceClip.effects[sourceIndex].startSec;
+        effect.endSec = sourceClip.effects[sourceIndex].endSec;
+        previewClip.effects.append(effect);
+
+        const QString sourcePrefix =
+            QStringLiteral("effect.%1.").arg(sourceIndex);
+        const QString previewPrefix =
+            QStringLiteral("effect.%1.").arg(previewIndex);
+        for (const KeyframeTrack &sourceTrack : sourceClip.keyframes.tracks()) {
+            if (!sourceTrack.propertyName().startsWith(sourcePrefix))
+                continue;
+            const QString targetName = previewPrefix
+                + sourceTrack.propertyName().mid(sourcePrefix.size());
+            previewClip.keyframes.addTrack(
+                remapKeyframeTrack(sourceTrack, targetName));
+            const LoopMode loopMode = sourceClip.keyframes.loopOutMode(
+                sourceTrack.propertyName());
+            if (loopMode != LoopMode::None)
+                previewClip.keyframes.setLoopOutMode(targetName, loopMode);
+        }
+        for (const StringKeyframeTrack &sourceTrack
+             : sourceClip.keyframes.stringTracks()) {
+            if (!sourceTrack.propertyName().startsWith(sourcePrefix))
+                continue;
+            const QString targetName = previewPrefix
+                + sourceTrack.propertyName().mid(sourcePrefix.size());
+            previewClip.keyframes.addStringTrack(
+                remapStringKeyframeTrack(sourceTrack, targetName));
+        }
+    }
+
+    return previewClip;
 }
 
 QVector<VideoEffect> effectivePreviewEffectsAt(
     const QVector<VideoEffect> &staticEffects,
     const Timeline *timeline,
     const QVector<PlaybackEntry> &sequence,
-    qint64 timelineUsec)
+    qint64 timelineUsec,
+    int preferredEntryIndex = -1)
 {
     if (staticEffects.isEmpty() || !timeline)
         return staticEffects;
 
-    const int selectedClip = timeline->selectedVideoClipIndex();
-    if (selectedClip < 0)
-        return staticEffects;
+    const PlaybackEntry *entry =
+        preferredEntryIndex >= 0 && preferredEntryIndex < sequence.size()
+        ? &sequence.at(preferredEntryIndex) : nullptr;
+    if (!entry) {
+        const int selectedClip = timeline->selectedVideoClipIndex();
+        if (selectedClip < 0)
+            return staticEffects;
 
-    const PlaybackEntry *entry = nullptr;
-    for (const PlaybackEntry &candidate : sequence) {
-        if (candidate.sourceTrack == 0
-            && candidate.sourceClipIndex == selectedClip) {
-            entry = &candidate;
-            break;
+        for (const PlaybackEntry &candidate : sequence) {
+            if (candidate.sourceTrack == 0
+                && candidate.sourceClipIndex == selectedClip) {
+                entry = &candidate;
+                break;
+            }
         }
     }
     if (!entry)
@@ -909,51 +992,10 @@ QVector<VideoEffect> effectivePreviewEffectsAt(
     if (!clip)
         return staticEffects;
 
-    const QVector<int> sourceIndices =
-        resolvePreviewEffectSourceIndices(clip->effects, staticEffects);
     const double clipLocalSec =
         (static_cast<double>(timelineUsec) - entry->timelineStart * 1'000'000.0)
         / 1'000'000.0;
-
-    ClipInfo previewClip = *clip;
-    previewClip.effects.clear();
-    previewClip.keyframes = KeyframeManager();
-
-    for (int i = 0; i < staticEffects.size() && i < sourceIndices.size(); ++i) {
-        const int sourceIndex = sourceIndices[i];
-        if (sourceIndex < 0 || sourceIndex >= clip->effects.size()) {
-            VideoEffect unmapped = staticEffects[i];
-            unmapped.startSec = -1.0;
-            unmapped.endSec = -1.0;
-            previewClip.effects.append(unmapped);
-            continue;
-        }
-
-        VideoEffect effect = staticEffects[i];
-        effect.startSec = clip->effects[sourceIndex].startSec;
-        effect.endSec = clip->effects[sourceIndex].endSec;
-
-        const int previewIndex = previewClip.effects.size();
-        previewClip.effects.append(effect);
-        const auto schema = effectctrl::paramSchemaFor(effect.type);
-        for (const auto &def : schema) {
-            const QString sourceTrackName =
-                QStringLiteral("effect.%1.%2").arg(sourceIndex).arg(def.name);
-            const KeyframeTrack *sourceTrack = clip->keyframes.track(sourceTrackName);
-            if (!sourceTrack || sourceTrack->count() <= 0)
-                continue;
-
-            const QString previewTrackName =
-                QStringLiteral("effect.%1.%2").arg(previewIndex).arg(def.name);
-            previewClip.keyframes.addTrack(
-                remapKeyframeTrack(*sourceTrack, previewTrackName));
-
-            const LoopMode loopMode = clip->keyframes.loopOutMode(sourceTrackName);
-            if (loopMode != LoopMode::None)
-                previewClip.keyframes.setLoopOutMode(previewTrackName, loopMode);
-        }
-    }
-
+    const ClipInfo previewClip = remappedPreviewClip(*clip, staticEffects);
     return clipanim::effectiveEffectsAt(previewClip, clipLocalSec);
 }
 
@@ -3612,7 +3654,24 @@ void VideoPlayer::displayFrame(const QImage &image, bool overlaysAlreadyBaked)
         } else {
             m_glPreview->setStabilizerKeyframes({});
         }
-        pushActiveClipColorCorrectionToGlPreview();
+        // Echo is fully baked on CPU after the clip's grade/LUT. Running the
+        // GL grade branch on that result would grade the temporal composite a
+        // second time and no longer match export. Restore the branch as soon
+        // as no active non-adjustment Echo is present.
+        const qint64 previewUsec =
+            sequenceActive() ? m_timelinePositionUs : m_currentPositionUs;
+        const bool cpuBakedEcho = hasCpuBakedEchoAt(previewUsec);
+        if (cpuBakedEcho && !m_echoDisabledGlGrade) {
+            m_glPreview->setEffectsEnabled(false);
+            m_glPreview->setVideoEffects({});
+            m_echoDisabledGlGrade = true;
+        } else if (!cpuBakedEcho && m_echoDisabledGlGrade) {
+            m_glPreview->setEffectsEnabled(true);
+            m_glPreview->setVideoEffects(m_gpuPreviewEffects);
+            m_echoDisabledGlGrade = false;
+        }
+        if (!cpuBakedEcho)
+            pushActiveClipColorCorrectionToGlPreview();
         undotrace::log("displayFrame:beforeGL");
         m_glPreview->displayFrame(display);
         undotrace::log("displayFrame:afterGL");
@@ -3657,20 +3716,12 @@ void VideoPlayer::refreshTextOverlayHits()
     m_glPreview->setTextOverlayHitList(hits);
 }
 
-QImage VideoPlayer::applyPreviewEffectStackWithEcho(
-    const QImage &source,
-    const QVector<VideoEffect> &effects,
-    qint64 timelineUsec) const
+int VideoPlayer::previewEffectTargetEntryIndex(const Timeline *timeline) const
 {
-    const Timeline *timeline = m_glPreview ? m_glPreview->timeline() : nullptr;
-    if (!timeline || !sequenceActive())
-        return VideoEffectProcessor::applyEffectStack(
-            source, ColorCorrection(), effects);
-
     int targetEntryIndex =
         m_editTargetEntry >= 0 && m_editTargetEntry < m_sequence.size()
         ? m_editTargetEntry : -1;
-    if (targetEntryIndex < 0) {
+    if (targetEntryIndex < 0 && timeline) {
         const int selectedClip = timeline->selectedVideoClipIndex();
         for (int i = 0; i < m_sequence.size(); ++i) {
             const PlaybackEntry &candidate = m_sequence.at(i);
@@ -3685,42 +3736,164 @@ QImage VideoPlayer::applyPreviewEffectStackWithEcho(
         && m_activeEntry >= 0 && m_activeEntry < m_sequence.size()) {
         targetEntryIndex = m_activeEntry;
     }
-    if (targetEntryIndex < 0)
-        return VideoEffectProcessor::applyEffectStack(
-            source, ColorCorrection(), effects);
+    return targetEntryIndex;
+}
 
-    const PlaybackEntry &entry = m_sequence.at(targetEntryIndex);
-    const ClipInfo *sourceClip = clipForPlaybackEntry(timeline, entry);
-    if (!sourceClip)
-        return VideoEffectProcessor::applyEffectStack(
-            source, ColorCorrection(), effects);
+bool VideoPlayer::activePreviewEchoStack(qint64 timelineUsec,
+                                         int *targetEntryIndex) const
+{
+    if (targetEntryIndex)
+        *targetEntryIndex = -1;
 
-    const double clipLocalSec = entryClipLocalSeconds(entry, timelineUsec);
-    ClipInfo previewClip = *sourceClip;
-    previewClip.effects = effects;
-    previewClip.keyframes = KeyframeManager();
-    for (VideoEffect &effect : previewClip.effects) {
-        // `effects` was already evaluated by effectivePreviewEffectsAt().
-        effect.startSec = -1.0;
-        effect.endSec = -1.0;
+    const bool wantsPreviewFx = !m_fullPreviewEffects.isEmpty()
+                                && (m_previewEffectsLive || !m_playing);
+    const Timeline *timeline = m_glPreview ? m_glPreview->timeline() : nullptr;
+    if (!wantsPreviewFx || !timeline || !sequenceActive())
+        return false;
+
+    const int target = previewEffectTargetEntryIndex(timeline);
+    if (target < 0 || target >= m_sequence.size())
+        return false;
+    const double timelineSec =
+        static_cast<double>(timelineUsec) / AV_TIME_BASE;
+    const PlaybackEntry &targetEntry = m_sequence.at(target);
+    if (timelineSec < targetEntry.timelineStart
+        || timelineSec >= targetEntry.timelineEnd) {
+        return false;
     }
-    if (!tlrender::hasActiveEcho(previewClip, clipLocalSec))
-        return VideoEffectProcessor::applyEffectStack(
-            source, ColorCorrection(), effects);
+    const ClipInfo *targetClip = clipForPlaybackEntry(timeline, targetEntry);
+    if (!targetClip || targetClip->isAdjustment
+        || isNullObjectEntry(targetEntry))
+        return false;
 
-    const double sourceSec = static_cast<double>(
-        entryLocalPositionUs(targetEntryIndex, timelineUsec)) / AV_TIME_BASE;
-    const QSize echoRenderSize = source.size();
-    const ClipInfo sourceClipSnapshot = *sourceClip;
-    const tlrender::EchoFrameProvider echoFrameProvider =
-        [timeline, sourceClipSnapshot, echoRenderSize, timelineUsec](
-            double sampleSourceSec, double sampleLocalSec) -> QImage {
-            return tlrender::renderClipSourceFrameForEcho(
-                timeline, sourceClipSnapshot, sampleSourceSec, sampleLocalSec,
-                echoRenderSize, timelineUsec);
-        };
-    return tlrender::applyClipFxPackWithEcho(
-        source, previewClip, clipLocalSec, sourceSec, echoFrameProvider);
+    const QVector<VideoEffect> evaluated = effectivePreviewEffectsAt(
+        m_fullPreviewEffects, timeline, m_sequence, timelineUsec, target);
+    const bool hasEcho = std::any_of(
+        evaluated.cbegin(), evaluated.cend(),
+        [](const VideoEffect &effect) {
+            return effect.enabled && effect.type == VideoEffectType::Echo;
+        });
+    if (!hasEcho)
+        return false;
+
+    if (targetEntryIndex)
+        *targetEntryIndex = target;
+    return true;
+}
+
+bool VideoPlayer::hasCpuBakedEchoAt(qint64 timelineUsec) const
+{
+    const Timeline *timeline = m_glPreview ? m_glPreview->timeline() : nullptr;
+    if (!timeline || !sequenceActive())
+        return false;
+
+    int previewTarget = -1;
+    const bool previewOverride = !m_fullPreviewEffects.isEmpty()
+        && (m_previewEffectsLive || !m_playing);
+    if (previewOverride) {
+        previewTarget = previewEffectTargetEntryIndex(timeline);
+        if (previewTarget >= 0 && previewTarget < m_sequence.size()) {
+            const PlaybackEntry &entry = m_sequence.at(previewTarget);
+            const double timelineSec =
+                static_cast<double>(timelineUsec) / AV_TIME_BASE;
+            const ClipInfo *clip = clipForPlaybackEntry(timeline, entry);
+            if (timelineSec >= entry.timelineStart
+                && timelineSec < entry.timelineEnd
+                && clip && !clip->isAdjustment
+                && !isNullObjectEntry(entry)) {
+                const QVector<VideoEffect> evaluated =
+                    effectivePreviewEffectsAt(
+                        m_fullPreviewEffects, timeline, m_sequence,
+                        timelineUsec, previewTarget);
+                if (std::any_of(
+                        evaluated.cbegin(), evaluated.cend(),
+                        [](const VideoEffect &effect) {
+                            return effect.enabled
+                                && effect.type == VideoEffectType::Echo;
+                        })) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    const QVector<int> activeEntries = findActiveEntriesAt(timelineUsec);
+    for (int entryIndex : activeEntries) {
+        if (previewOverride && entryIndex == previewTarget)
+            continue;
+        const PlaybackEntry &entry = m_sequence.at(entryIndex);
+        const ClipInfo *clip = clipForPlaybackEntry(timeline, entry);
+        if (clip && !clip->isAdjustment && !isNullObjectEntry(entry)
+            && tlrender::hasActiveEcho(
+                *clip, entryClipLocalSeconds(entry, timelineUsec))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+QImage VideoPlayer::preparePreviewClipFrame(
+    const QImage &source,
+    const PlaybackEntry &entry,
+    int entryIndex,
+    double sourceSeconds,
+    QSize sourceSize,
+    qint64 timelineUsec,
+    bool *echoApplied) const
+{
+    if (echoApplied)
+        *echoApplied = false;
+
+    QImage prepared = applyVfxFootageControls(source, entry);
+    const Timeline *timeline = m_glPreview ? m_glPreview->timeline() : nullptr;
+    const ClipInfo *sourceClip = clipForPlaybackEntry(timeline, entry);
+    if (sourceClip && !sourceClip->isAdjustment) {
+        const double clipLocalSec = entryClipLocalSeconds(entry, timelineUsec);
+        const bool frameHasEcho = hasCpuBakedEchoAt(timelineUsec);
+        const bool previewOverride = !m_fullPreviewEffects.isEmpty()
+            && (m_previewEffectsLive || !m_playing)
+            && previewEffectTargetEntryIndex(timeline) == entryIndex;
+        const ClipInfo previewClip = previewOverride
+            ? remappedPreviewClip(*sourceClip, m_fullPreviewEffects)
+            : *sourceClip;
+        const bool hasEcho =
+            tlrender::hasActiveEcho(previewClip, clipLocalSec);
+
+        if (hasEcho) {
+            // Export and preview share the complete native clip stage. This
+            // grades both the current source and every history sample before
+            // Echo; moving a non-linear grade/LUT after Echo changes pixels.
+            const QSize echoRenderSize = source.size();
+            const ClipInfo sourceClipSnapshot = *sourceClip;
+            const tlrender::EchoFrameProvider echoFrameProvider =
+                [timeline, sourceClipSnapshot, echoRenderSize, timelineUsec](
+                    double sampleSourceSec, double sampleLocalSec) -> QImage {
+                    return tlrender::renderClipSourceFrameForEcho(
+                        timeline, sourceClipSnapshot, sampleSourceSec,
+                        sampleLocalSec, echoRenderSize, timelineUsec);
+                };
+            const QVector<Mask> masks = previewMasksForFrame(
+                *sourceClip, sourceSeconds, sourceSize, source.size());
+            prepared = videopreview::prepareEchoClipForComposite(
+                source, previewClip, clipLocalSec, sourceSeconds,
+                echoFrameProvider, masks);
+            if (echoApplied)
+                *echoApplied = true;
+            return prepared;
+        }
+        if (frameHasEcho) {
+            // GL grading is disabled for a CPU-baked Echo canvas. Bake every
+            // sibling clip's grade and ordered FX too, so multi-track frames
+            // do not lose the non-Echo layers' per-clip processing.
+            prepared = tlrender::applyClipFxStackFromSource(
+                source, *sourceClip, clipLocalSec);
+        }
+    }
+
+    // Echo is deliberately complete before this call: the mask cuts the
+    // clip-local result, then the caller performs fit/transform/composition.
+    return applyPreviewClipMask(
+        prepared, timeline, entry, sourceSeconds, sourceSize);
 }
 
 QImage VideoPlayer::composeFrameWithOverlays(const QImage &source,
@@ -3729,41 +3902,37 @@ QImage VideoPlayer::composeFrameWithOverlays(const QImage &source,
     if (source.isNull())
         return source;
 
-    const bool wantsPreviewFx = !m_previewEffects.isEmpty()
-                                && (m_previewEffectsLive || !m_playing);
     const qint64 previewTimelineUsec =
         sequenceActive() ? m_timelinePositionUs : m_currentPositionUs;
-    const QVector<VideoEffect> previewEffects = wantsPreviewFx
-        ? effectivePreviewEffectsAt(m_previewEffects,
+    // A committed Echo disables the GL effect stage for the whole canvas.
+    // In that state use the original unsplit preview stack on CPU so a
+    // GPU-capable preview effect on another track does not disappear.
+    const bool cpuBakedEcho = hasCpuBakedEchoAt(previewTimelineUsec);
+    const QVector<VideoEffect> &cpuPreviewStack = cpuBakedEcho
+        ? m_fullPreviewEffects : m_previewEffects;
+    const bool wantsPreviewFx = !cpuPreviewStack.isEmpty()
+                                && (m_previewEffectsLive || !m_playing);
+    // An Echo stack is consumed on its target DecodedLayer before mask and
+    // transform. Never apply that stack again to the composited canvas.
+    const bool echoHandledPerClip = activePreviewEchoStack(previewTimelineUsec);
+    const QVector<VideoEffect> previewEffects = wantsPreviewFx && !echoHandledPerClip
+        ? effectivePreviewEffectsAt(cpuPreviewStack,
                                     m_glPreview ? m_glPreview->timeline() : nullptr,
                                     m_sequence,
                                     previewTimelineUsec)
         : QVector<VideoEffect>();
     const bool applyPreviewFx = !previewEffects.isEmpty();
-    const bool hasPreviewEcho = std::any_of(
-        previewEffects.cbegin(), previewEffects.cend(),
-        [](const VideoEffect &effect) {
-            return effect.enabled && effect.type == VideoEffectType::Echo;
-        });
 
     // Preview proxy: only shrink during playback, keep paused frames full-res.
     const int proxy = (applyPreviewFx && m_playing) ? qMax(1, m_proxyDivisor) : 1;
-    auto runProxy = [this, proxy, &previewEffects, hasPreviewEcho,
-                     previewTimelineUsec](const QImage &img) {
-        if (proxy <= 1) {
-            if (!hasPreviewEcho)
-                return VideoEffectProcessor::applyEffectStack(
-                    img, ColorCorrection(), previewEffects);
-            return applyPreviewEffectStackWithEcho(
-                img, previewEffects, previewTimelineUsec);
-        }
+    auto runProxy = [proxy, &previewEffects](const QImage &img) {
+        if (proxy <= 1)
+            return VideoEffectProcessor::applyEffectStack(
+                img, ColorCorrection(), previewEffects);
         const QImage small = img.scaled(img.width() / proxy, img.height() / proxy,
                                         Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
-        const QImage processed = hasPreviewEcho
-            ? applyPreviewEffectStackWithEcho(
-                small, previewEffects, previewTimelineUsec)
-            : VideoEffectProcessor::applyEffectStack(
-                small, ColorCorrection(), previewEffects);
+        const QImage processed = VideoEffectProcessor::applyEffectStack(
+            small, ColorCorrection(), previewEffects);
         return processed.scaled(img.width(), img.height(),
                                 Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
     };
@@ -4054,6 +4223,16 @@ void VideoPlayer::setPreviewEffects(const QVector<VideoEffect> &effects, bool li
     m_previewEffectsLive = live;
 
     const bool gpuEnabled = m_gpuEffectsEnabled && m_useGL && m_glPreview;
+    const bool containsEcho = std::any_of(
+        effects.cbegin(), effects.cend(),
+        [](const VideoEffect &effect) {
+            return effect.type == VideoEffectType::Echo;
+        });
+    const bool previouslyContainedEcho = std::any_of(
+        m_fullPreviewEffects.cbegin(), m_fullPreviewEffects.cend(),
+        [](const VideoEffect &effect) {
+            return effect.type == VideoEffectType::Echo;
+        });
 
     QVector<VideoEffect> gpu;
     QVector<VideoEffect> cpu;
@@ -4066,13 +4245,24 @@ void VideoPlayer::setPreviewEffects(const QVector<VideoEffect> &effects, bool li
             e.type == VideoEffectType::Invert    ||
             e.type == VideoEffectType::Vignette;
         const bool hasTiming = e.startSec >= 0.0 || e.endSec >= 0.0;
-        if (gpuEnabled && gpuCapable && !hasTiming) gpu.append(e);
-        else                                        cpu.append(e);
+        // Echo needs random-access source frames at its exact stack position.
+        // Keep the complete stack on CPU so [Invert, Echo] cannot become
+        // [Echo on CPU, Invert on the final GPU canvas].
+        if (!containsEcho && gpuEnabled && gpuCapable && !hasTiming) gpu.append(e);
+        else                                                         cpu.append(e);
     }
 
+    m_fullPreviewEffects = effects;
     m_previewEffects = cpu;
+    m_gpuPreviewEffects = gpu;
     if (m_glPreview)
-        m_glPreview->setVideoEffects(gpu);
+        m_glPreview->setVideoEffects(
+            m_echoDisabledGlGrade ? QVector<VideoEffect>() : gpu);
+
+    if (containsEcho || previouslyContainedEcho) {
+        ++m_timelineRevision;
+        m_frameCache.invalidateRevision(m_timelineRevision);
+    }
 
     refreshDisplayedFrame();
 }
@@ -4665,13 +4855,11 @@ bool VideoPlayer::seekInternal(int64_t positionUs, bool displayFrame, bool preci
             && m_activeEntry >= 0
             && m_activeEntry < m_sequence.size()) {
             const auto &entry = m_sequence[m_activeEntry];
-            displayImage = applyVfxFootageControls(displayImage, entry);
-            displayImage = applyPreviewClipMask(
-                displayImage,
-                previewTimeline,
-                entry,
+            displayImage = preparePreviewClipFrame(
+                displayImage, entry, m_activeEntry,
                 static_cast<double>(targetUs) / AV_TIME_BASE,
-                QSize(displayable->width, displayable->height));
+                QSize(displayable->width, displayable->height),
+                m_timelinePositionUs);
         }
         m_lastFrameOdtApplied = false;
         if (!reverseTimelineDriven || !m_deferDisplayThisTick)
@@ -4782,17 +4970,14 @@ bool VideoPlayer::presentDecodedFrame(AVFrame *frame, bool displayFrameRequested
                 && m_activeEntry >= 0
                 && m_activeEntry < m_sequence.size()) {
                 const auto &entry = m_sequence[m_activeEntry];
-                displayImage = applyVfxFootageControls(displayImage, entry);
                 const double sourceSec =
                     static_cast<double>(
                         entryLocalPositionUs(m_activeEntry, m_timelinePositionUs))
                     / AV_TIME_BASE;
-                displayImage = applyPreviewClipMask(
-                    displayImage,
-                    m_glPreview ? m_glPreview->timeline() : nullptr,
-                    entry,
-                    sourceSec,
-                    QSize(displayable->width, displayable->height));
+                displayImage = preparePreviewClipFrame(
+                    displayImage, entry, m_activeEntry, sourceSec,
+                    QSize(displayable->width, displayable->height),
+                    m_timelinePositionUs);
             }
             // This path displays a non-baked frame.
             m_lastFrameOdtApplied = false;
@@ -4985,6 +5170,101 @@ QSize VideoPlayer::fittedDisplaySize(const QSize &bounds) const
     return QSize(qMax(1, targetWidth), qMax(1, targetHeight));
 }
 
+bool VideoPlayer::refreshPreviewEchoComposite()
+{
+    int echoTarget = -1;
+    if (!activePreviewEchoStack(m_timelinePositionUs, &echoTarget)
+        || m_lastV1RawFrame.isNull()) {
+        return false;
+    }
+
+    const Timeline *timeline = m_glPreview ? m_glPreview->timeline() : nullptr;
+    if (!timeline)
+        return false;
+
+    const QVector<int> activeEntries = findActiveEntriesAt(m_timelinePositionUs);
+    QVector<DecodedLayer> layers;
+    layers.reserve(activeEntries.size());
+    QVector<ActivePreviewAdjustmentClip> adjustments;
+    adjustments.reserve(activeEntries.size());
+    bool targetPrepared = false;
+
+    for (int entryIndex : activeEntries) {
+        if (entryIndex < 0 || entryIndex >= m_sequence.size())
+            continue;
+        const PlaybackEntry &entry = m_sequence.at(entryIndex);
+        if (appendPreviewAdjustmentClip(
+                timeline, entry, m_timelinePositionUs, &adjustments)) {
+            continue;
+        }
+
+        DecodedLayer layer;
+        if (isNullObjectEntry(entry)) {
+            layer.isFresh = true;
+        } else if (entryIndex == m_activeEntry) {
+            const QSize sourceSize =
+                (m_codecCtx && m_codecCtx->width > 0 && m_codecCtx->height > 0)
+                ? QSize(m_codecCtx->width, m_codecCtx->height)
+                : m_lastV1RawFrame.size();
+            const double sourceSeconds = static_cast<double>(
+                entryLocalPositionUs(entryIndex, m_timelinePositionUs))
+                / AV_TIME_BASE;
+            bool echoApplied = false;
+            layer.rgb = preparePreviewClipFrame(
+                m_lastV1RawFrame, entry, entryIndex, sourceSeconds,
+                sourceSize, m_timelinePositionUs, &echoApplied);
+            layer.isFresh = true;
+            targetPrepared = entryIndex == echoTarget && echoApplied;
+        } else {
+            if (!harvestOverlayLayer(entry, entryIndex, &layer))
+                continue;
+            if (entryIndex == echoTarget && !layer.rgb.isNull())
+                targetPrepared = true;
+        }
+
+        layer.colorMeta = entry.colorMeta;
+        applyLayerMotionOpacity(
+            timeline, entry, m_timelinePositionUs, entry.opacity, &layer);
+        populateLayerMetadata(timeline, entry, entryIndex, &layer);
+        layers.append(layer);
+    }
+
+    if (!targetPrepared || layers.isEmpty())
+        return false;
+
+    std::stable_sort(
+        layers.begin(), layers.end(), clipstack::layerPaintOrderLess);
+    if (veditor::parentingEnabledFromEnv())
+        resolveDecodedLayerParentSources(layers);
+
+    QSize canvasSize = m_projectOutputSize.isValid()
+        ? m_projectOutputSize : QSize(m_canvasWidth, m_canvasHeight);
+    if (canvasSize.isEmpty())
+        canvasSize = m_lastSourceFrame.size();
+    if (canvasSize.isEmpty())
+        return false;
+
+    for (DecodedLayer &layer : layers) {
+        layer.rgb = snsfit::maybeFit(
+            layer.rgb, layer.fitContain, layer.fitCover, canvasSize);
+    }
+
+    QImage canvas(canvasSize, QImage::Format_ARGB32_Premultiplied);
+    if (canvas.isNull())
+        return false;
+    canvas.fill(Qt::black);
+    if (adjustments.isEmpty())
+        composeMultiTrackFrameInto(canvas, layers);
+    else
+        composePreviewFrameWithAdjustmentClips(canvas, layers, adjustments);
+
+    if (m_glPreview)
+        m_glPreview->setCompositeBakedMode(true);
+    m_lastFrameOdtApplied = false;
+    displayFrame(canvas);
+    return true;
+}
+
 void VideoPlayer::refreshDisplayedFrame()
 {
     undotrace::log("refresh:enter");
@@ -4993,6 +5273,12 @@ void VideoPlayer::refreshDisplayedFrame()
     // would burn the overlays in twice (visible as duplicated text when
     // an existing overlay is selected and setTextOverlays re-pushes).
     if (m_lastSourceFrame.isNull())
+        return;
+
+    // A paused effect-dialog preview has no playback tick to rebuild V2+
+    // layers. Recompose from the current decoded layer frames before any
+    // baked-text/nested early return so the transient Echo is never omitted.
+    if (refreshPreviewEchoComposite())
         return;
 
     if (m_lastSourceFrameHasBakedText) {
@@ -5020,52 +5306,72 @@ void VideoPlayer::refreshDisplayedFrame()
         return;
     }
     undotrace::log("refresh:conform");
-    if (m_projectOutputSize.isValid()
-        && sequenceActive()
+    if (sequenceActive()
         && !m_lastV1RawFrame.isNull()
         && m_activeEntry >= 0
         && m_activeEntry < m_sequence.size()) {
         const QVector<int> activeIdxs = findActiveEntriesAt(m_timelinePositionUs);
         const auto &e = m_sequence[m_activeEntry];
         if (!hasOverlayActive(activeIdxs) && e.sourceTrack == 0) {
-            QImage canvas(m_projectOutputSize, QImage::Format_ARGB32_Premultiplied);
-            if (!canvas.isNull()) {
-                canvas.fill(Qt::black);
-                DecodedLayer layer;
-                const Timeline *previewTimeline =
-                    m_glPreview ? m_glPreview->timeline() : nullptr;
-                const QSize sourceSize =
-                    (m_codecCtx && m_codecCtx->width > 0 && m_codecCtx->height > 0)
-                        ? QSize(m_codecCtx->width, m_codecCtx->height)
-                        : m_lastV1RawFrame.size();
-                const double sourceSec =
-                    static_cast<double>(
-                        entryLocalPositionUs(m_activeEntry, m_timelinePositionUs))
-                    / AV_TIME_BASE;
-                layer.rgb = applyPreviewClipMask(
-                    applyVfxFootageControls(m_lastV1RawFrame, e),
-                    previewTimeline, e, sourceSec, sourceSize);
-                layer.isFresh = true;
-                layer.colorMeta = e.colorMeta;
-                applyLayerMotionOpacity(previewTimeline,
-                                        e, m_timelinePositionUs, e.opacity, &layer);
-                populateLayerMetadata(previewTimeline, e, m_activeEntry, &layer);
-                {
-                    double insetFw = 1.0, insetFh = 1.0;
-                    if (layer.fitContain && !layer.fitCover) {
-                        snsfit::containContentInset(layer.rgb.size(), m_projectOutputSize, insetFw, insetFh);
+            const Timeline *previewTimeline =
+                m_glPreview ? m_glPreview->timeline() : nullptr;
+            const QSize sourceSize =
+                (m_codecCtx && m_codecCtx->width > 0 && m_codecCtx->height > 0)
+                    ? QSize(m_codecCtx->width, m_codecCtx->height)
+                    : m_lastV1RawFrame.size();
+            const double sourceSec =
+                static_cast<double>(
+                    entryLocalPositionUs(m_activeEntry, m_timelinePositionUs))
+                / AV_TIME_BASE;
+            bool echoApplied = false;
+            const QImage prepared = preparePreviewClipFrame(
+                m_lastV1RawFrame, e, m_activeEntry, sourceSec, sourceSize,
+                m_timelinePositionUs, &echoApplied);
+
+            if (m_projectOutputSize.isValid()) {
+                QImage canvas(m_projectOutputSize,
+                              QImage::Format_ARGB32_Premultiplied);
+                if (!canvas.isNull()) {
+                    canvas.fill(Qt::black);
+                    DecodedLayer layer;
+                    layer.rgb = prepared;
+                    layer.isFresh = true;
+                    layer.colorMeta = e.colorMeta;
+                    applyLayerMotionOpacity(
+                        previewTimeline, e, m_timelinePositionUs, e.opacity,
+                        &layer);
+                    populateLayerMetadata(
+                        previewTimeline, e, m_activeEntry, &layer);
+                    {
+                        double insetFw = 1.0, insetFh = 1.0;
+                        if (layer.fitContain && !layer.fitCover) {
+                            snsfit::containContentInset(
+                                layer.rgb.size(), m_projectOutputSize,
+                                insetFw, insetFh);
+                        }
+                        if (m_glPreview)
+                            m_glPreview->setVideoContentInset(insetFw, insetFh);
                     }
+                    layer.rgb = snsfit::maybeFit(
+                        layer.rgb, layer.fitContain, layer.fitCover,
+                        m_projectOutputSize);
+                    QVector<DecodedLayer> singleLayer;
+                    singleLayer.append(layer);
+                    composeMultiTrackFrameInto(canvas, singleLayer);
                     if (m_glPreview)
-                        m_glPreview->setVideoContentInset(insetFw, insetFh);
+                        m_glPreview->setCompositeBakedMode(true);
+                    m_lastFrameOdtApplied = false;
+                    displayFrame(canvas);
+                    return;
                 }
-                layer.rgb = snsfit::maybeFit(layer.rgb, layer.fitContain, layer.fitCover, m_projectOutputSize);
-                QVector<DecodedLayer> singleLayer;
-                singleLayer.append(layer);
-                composeMultiTrackFrameInto(canvas, singleLayer);
-                if (m_glPreview)
-                    m_glPreview->setCompositeBakedMode(true);
+            }
+
+            // Without a project canvas the normal raw-frame path is retained.
+            // Echo is the sole exception because its stack has already been
+            // consumed here and composeFrameWithOverlays intentionally skips it.
+            if (echoApplied) {
                 m_lastFrameOdtApplied = false;
-                displayFrame(canvas);
+                displayFrame(prepared);
                 return;
             }
         }
@@ -5745,9 +6051,9 @@ void VideoPlayer::handlePlaybackTick()
                         static_cast<double>(
                             entryLocalPositionUs(idx, m_timelinePositionUs))
                         / AV_TIME_BASE;
-                    layer.rgb = applyPreviewClipMask(
-                        applyVfxFootageControls(m_lastV1RawFrame, e),
-                        previewTimeline, e, sourceSec, sourceSize);
+                    layer.rgb = preparePreviewClipFrame(
+                        m_lastV1RawFrame, e, idx, sourceSec, sourceSize,
+                        m_timelinePositionUs);
                     layer.isFresh = true;
                     layer.colorMeta = e.colorMeta;
                     applyLayerMotionOpacity(previewTimeline,
@@ -5843,9 +6149,9 @@ void VideoPlayer::handlePlaybackTick()
                         static_cast<double>(
                             entryLocalPositionUs(idx, m_timelinePositionUs))
                         / AV_TIME_BASE;
-                    layer.rgb = applyPreviewClipMask(
-                        applyVfxFootageControls(m_lastV1RawFrame, e),
-                        previewTimeline, e, sourceSec, sourceSize);
+                    layer.rgb = preparePreviewClipFrame(
+                        m_lastV1RawFrame, e, idx, sourceSec, sourceSize,
+                        m_timelinePositionUs);
                     layer.isFresh = true;
                 } else {
                     if (!harvestOverlayLayer(e, idx, &layer))
@@ -5957,9 +6263,9 @@ void VideoPlayer::handlePlaybackTick()
                         static_cast<double>(
                             entryLocalPositionUs(m_activeEntry, m_timelinePositionUs))
                         / AV_TIME_BASE;
-                    fallbackFrame = applyPreviewClipMask(
-                        applyVfxFootageControls(m_lastV1RawFrame, entry),
-                        previewTimeline, entry, sourceSec, sourceSize);
+                    fallbackFrame = preparePreviewClipFrame(
+                        m_lastV1RawFrame, entry, m_activeEntry, sourceSec,
+                        sourceSize, m_timelinePositionUs);
                 }
                 displayFrame(fallbackFrame);
             } else {
@@ -6088,9 +6394,9 @@ void VideoPlayer::handlePlaybackTick()
                     static_cast<double>(
                         entryLocalPositionUs(m_activeEntry, m_timelinePositionUs))
                     / AV_TIME_BASE;
-                fallbackFrame = applyPreviewClipMask(
-                    applyVfxFootageControls(m_lastV1RawFrame, entry),
-                    previewTimeline, entry, sourceSec, sourceSize);
+                fallbackFrame = preparePreviewClipFrame(
+                    m_lastV1RawFrame, entry, m_activeEntry, sourceSec,
+                    sourceSize, m_timelinePositionUs);
             }
             displayFrame(fallbackFrame);
         }
@@ -7503,9 +7809,9 @@ bool VideoPlayer::finalizeOverlayFromDecoder(const PlaybackEntry &e, int seqIdx,
         const double sourceSec =
             static_cast<double>(entryLocalPositionUs(seqIdx, m_timelinePositionUs))
             / AV_TIME_BASE;
-        out->rgb = applyPreviewClipMask(
-            applyVfxFootageControls(out->rgb, e),
-            previewTimeline, e, sourceSec, sourceSize);
+        out->rgb = preparePreviewClipFrame(
+            out->rgb, e, seqIdx, sourceSec, sourceSize,
+            m_timelinePositionUs);
     }
 
     out->colorMeta          = e.colorMeta;
