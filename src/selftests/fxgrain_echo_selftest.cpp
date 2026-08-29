@@ -410,6 +410,128 @@ int runFxGrainEchoSelftest()
                    && prefixKeyframeUsesHistoryTime,
                passed, failed);
 
+    // G13 exercises VideoPlayer's production CPU-routing seam, not the Echo
+    // helper alone. V1 has only FilmGrain while the sibling V2 has Echo: the
+    // complete V1 stack must be baked on V1 exactly once and must not be
+    // reapplied to the final two-track canvas.
+    QImage grainTrack = makePattern(paritySize.width(), paritySize.height());
+    QImage echoTrack(paritySize, QImage::Format_RGBA8888);
+    QImage echoHistory(paritySize, QImage::Format_RGBA8888);
+    for (int y = 0; y < paritySize.height(); ++y) {
+        for (int x = 0; x < paritySize.width(); ++x) {
+            echoTrack.setPixelColor(
+                x, y, QColor(18 + (x * 2) % 90, 24 + (y * 3) % 110,
+                             42 + (x + y) % 100, 255));
+            echoHistory.setPixelColor(
+                x, y, QColor(110 + (x * 3) % 120, 80 + (y * 5) % 150,
+                             70 + (x + y * 2) % 150, 255));
+        }
+    }
+
+    ClipInfo grainClip;
+    grainClip.inPoint = 0.0;
+    grainClip.outPoint = 2.0;
+    grainClip.duration = 2.0;
+    grainClip.opacity = 0.58;
+    grainClip.effects = {
+        VideoEffect::createFilmGrain(0.55, 1, 0.25, true)
+    };
+    ClipInfo echoClip;
+    echoClip.inPoint = 0.0;
+    echoClip.outPoint = 2.0;
+    echoClip.duration = 2.0;
+    echoClip.effects = {
+        VideoEffect::createEcho(0.1, 2, 0.65, 2)
+    };
+
+    const auto grainProvider = [](double, double) { return QImage(); };
+    const auto echoProvider =
+        [&echoHistory, &echoClip](double, double sampleLocalSec) {
+            return tlrender::prepareClipSourceForEcho(
+                echoHistory, echoClip, sampleLocalSec);
+        };
+    const QImage playerCpuPreview = VideoPlayer::composeCpuPreviewForTest(
+        grainTrack, grainClip, grainProvider,
+        echoTrack, echoClip, echoProvider,
+        1.0, 1.0, paritySize);
+
+    const QImage rendererV1 = tlrender::applyClipFxStackFromSource(
+        grainTrack, grainClip, 1.0);
+    const QImage rendererV2 = tlrender::applyClipFxStackWithEchoFromSource(
+        echoTrack, echoClip, 1.0, 1.0, echoProvider);
+    QImage rendererOutput(
+        paritySize, QImage::Format_ARGB32_Premultiplied);
+    rendererOutput.fill(Qt::black);
+    {
+        QPainter painter(&rendererOutput);
+        painter.setRenderHint(QPainter::SmoothPixmapTransform, false);
+        painter.setCompositionMode(QPainter::CompositionMode_SourceOver);
+        painter.setOpacity(1.0);
+        painter.drawImage(0, 0, rendererV2);
+        painter.setOpacity(grainClip.opacity);
+        painter.drawImage(0, 0, rendererV1);
+    }
+    rendererOutput = rendererOutput.convertToFormat(QImage::Format_RGBA8888);
+
+    const QImage canvasLeak = VideoEffectProcessor::applyEffect(
+        rendererOutput, grainClip.effects.constFirst());
+    const double playerRendererMae =
+        meanAbsoluteError(playerCpuPreview, rendererOutput);
+    const double leakedCanvasMae =
+        meanAbsoluteError(canvasLeak, rendererOutput);
+    const bool cpuRoutingRecognized =
+        videopreview::stackRequiresClipLocalCpu(grainClip.effects)
+        && videopreview::stackRequiresClipLocalCpu(echoClip.effects)
+        && !videopreview::stackRequiresClipLocalCpu(
+            QVector<VideoEffect>{VideoEffect::createInvert()});
+    reportGate(
+        "G13",
+        "V1 FilmGrain + V2 Echo VideoPlayer CPU preview/renderer MAE < 1.0",
+        cpuRoutingRecognized && playerRendererMae < 1.0
+            && leakedCanvasMae >= 1.0,
+        passed, failed);
+
+    // G14 checks the stored premultiplied contribution. With equal alpha=128
+    // on base/history and decay=0.5, Lighten keeps alpha=128 and the history
+    // RGB contribution is multiplied by 0.5 exactly once.
+    QImage translucentBase(1, 1, QImage::Format_RGBA8888);
+    translucentBase.fill(QColor(40, 50, 60, 128));
+    QImage translucentEcho(1, 1, QImage::Format_RGBA8888);
+    translucentEcho.fill(QColor(200, 150, 100, 128));
+    const QImage translucentLighten = tlrender::composeEcho(
+        translucentBase, QVector<QImage>{translucentEcho}, 0.5, 2);
+    const QImage basePremultiplied = translucentBase.convertToFormat(
+        QImage::Format_ARGB32_Premultiplied);
+    const QImage echoPremultiplied = translucentEcho.convertToFormat(
+        QImage::Format_ARGB32_Premultiplied);
+    const QImage outputPremultiplied = translucentLighten.convertToFormat(
+        QImage::Format_ARGB32_Premultiplied);
+    const QRgb basePixel =
+        reinterpret_cast<const QRgb *>(basePremultiplied.constScanLine(0))[0];
+    const QRgb echoPixel =
+        reinterpret_cast<const QRgb *>(echoPremultiplied.constScanLine(0))[0];
+    const QRgb outputPixel =
+        reinterpret_cast<const QRgb *>(outputPremultiplied.constScanLine(0))[0];
+    const auto expectedLightenChannel = [](int baseChannel, int echoChannel) {
+        return qMax(baseChannel, qRound(echoChannel * 0.5));
+    };
+    const int oldDoubleDecayedRed = qRound(
+        (40.0 + (200.0 - 40.0) * (128.0 / 255.0) * 0.5)
+        * (128.0 / 255.0));
+    const bool translucentLightenValid =
+        qAlpha(outputPixel) == qAlpha(basePixel)
+        && std::abs(qRed(outputPixel)
+                    - expectedLightenChannel(qRed(basePixel), qRed(echoPixel))) <= 1
+        && std::abs(qGreen(outputPixel)
+                    - expectedLightenChannel(qGreen(basePixel), qGreen(echoPixel))) <= 1
+        && std::abs(qBlue(outputPixel)
+                    - expectedLightenChannel(qBlue(basePixel), qBlue(echoPixel))) <= 1
+        && qRed(outputPixel) > oldDoubleDecayedRed;
+    reportGate(
+        "G14",
+        "translucent Lighten preserves alpha and applies decay once",
+        translucentLightenValid, passed, failed);
+
     std::cerr << "summary: " << passed << " PASS, " << failed << " FAIL\n";
     return failed;
 }

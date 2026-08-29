@@ -86,19 +86,113 @@ QImage applyRasterAlphaMask(const QImage &sourceImage, const QVector<Mask> &mask
 }
 
 namespace videopreview {
+namespace {
+
+bool gpuPreviewSupportsEffect(VideoEffectType type)
+{
+    return type == VideoEffectType::Blur
+        || type == VideoEffectType::Noise
+        || type == VideoEffectType::Sepia
+        || type == VideoEffectType::Grayscale
+        || type == VideoEffectType::Invert
+        || type == VideoEffectType::Vignette;
+}
+
+QImage prepareClipForCpuComposite(
+    const QImage &source, const ClipInfo &clip, double clipLocalSeconds,
+    double sourceSeconds,
+    const std::function<QImage(double, double)> &frameProvider,
+    const QVector<Mask> &masks)
+{
+    const QImage effected = tlrender::hasActiveEcho(clip, clipLocalSeconds)
+        ? tlrender::applyClipFxStackWithEchoFromSource(
+              source, clip, clipLocalSeconds, sourceSeconds, frameProvider)
+        : tlrender::applyClipFxStackFromSource(
+              source, clip, clipLocalSeconds);
+    if (effected.isNull() || masks.isEmpty())
+        return effected;
+    return clipmask::applyRasterAlphaMask(effected, masks);
+}
+
+} // namespace
+
+bool stackRequiresClipLocalCpu(const QVector<VideoEffect> &effects,
+                               bool gpuAvailable)
+{
+    return std::any_of(
+        effects.cbegin(), effects.cend(),
+        [gpuAvailable](const VideoEffect &effect) {
+            if (!effect.enabled)
+                return false;
+            const bool hasTiming = effect.startSec >= 0.0
+                || effect.endSec >= 0.0;
+            return !gpuAvailable || hasTiming
+                || !gpuPreviewSupportsEffect(effect.type);
+        });
+}
+
 QImage prepareEchoClipForComposite(
     const QImage &source, const ClipInfo &clip, double clipLocalSeconds,
     double sourceSeconds,
     const std::function<QImage(double, double)> &frameProvider,
     const QVector<Mask> &masks)
 {
-    const QImage effected = tlrender::applyClipFxStackWithEchoFromSource(
-        source, clip, clipLocalSeconds, sourceSeconds, frameProvider);
-    if (effected.isNull() || masks.isEmpty())
-        return effected;
-    return clipmask::applyRasterAlphaMask(effected, masks);
+    return prepareClipForCpuComposite(
+        source, clip, clipLocalSeconds, sourceSeconds, frameProvider, masks);
 }
 } // namespace videopreview
+
+QImage VideoPlayer::composeCpuPreviewForTest(
+    const QImage &v1Source, const ClipInfo &v1Clip,
+    const std::function<QImage(double, double)> &v1FrameProvider,
+    const QImage &v2Source, const ClipInfo &v2Clip,
+    const std::function<QImage(double, double)> &v2FrameProvider,
+    double clipLocalSeconds, double sourceSeconds, QSize canvasSize)
+{
+    if (v1Source.isNull() || v2Source.isNull() || canvasSize.isEmpty())
+        return QImage();
+
+    const QVector<VideoEffect> v1Effects =
+        clipanim::effectiveEffectsAt(v1Clip, clipLocalSeconds);
+    const QVector<VideoEffect> v2Effects =
+        clipanim::effectiveEffectsAt(v2Clip, clipLocalSeconds);
+    if (!videopreview::stackRequiresClipLocalCpu(v1Effects)
+        && !videopreview::stackRequiresClipLocalCpu(v2Effects)) {
+        return QImage();
+    }
+
+    const QImage v1Prepared = videopreview::prepareClipForCpuComposite(
+        v1Source, v1Clip, clipLocalSeconds, sourceSeconds,
+        v1FrameProvider, v1Clip.maskSystem.masks());
+    const QImage v2Prepared = videopreview::prepareClipForCpuComposite(
+        v2Source, v2Clip, clipLocalSeconds, sourceSeconds,
+        v2FrameProvider, v2Clip.maskSystem.masks());
+    if (v1Prepared.isNull() || v2Prepared.isNull())
+        return QImage();
+
+    QImage composed(canvasSize, QImage::Format_ARGB32_Premultiplied);
+    composed.fill(Qt::black);
+    QPainter painter(&composed);
+    painter.setRenderHint(QPainter::SmoothPixmapTransform, false);
+    painter.setCompositionMode(QPainter::CompositionMode_SourceOver);
+
+    auto paintClip = [&](const QImage &prepared, const ClipInfo &clip) {
+        const clipgeom::ClipTransform transform{
+            clip.videoScale, clip.videoDx, clip.videoDy,
+            clip.rotation2DDegrees};
+        const QImage placed = clipgeom::renderLayer(
+            prepared, transform, canvasSize, /*smooth=*/false);
+        painter.setOpacity(qBound(0.0, clip.opacity, 1.0));
+        painter.drawImage(0, 0, placed);
+    };
+
+    // V1-wins ordering is the production VideoPlayer ordering: V2 is the
+    // back layer and V1 is painted last/frontmost.
+    paintClip(v2Prepared, v2Clip);
+    paintClip(v1Prepared, v1Clip);
+    painter.end();
+    return composed.convertToFormat(QImage::Format_RGBA8888);
+}
 
 namespace {
 
@@ -3654,23 +3748,22 @@ void VideoPlayer::displayFrame(const QImage &image, bool overlaysAlreadyBaked)
         } else {
             m_glPreview->setStabilizerKeyframes({});
         }
-        // Echo is fully baked on CPU after the clip's grade/LUT. Running the
-        // GL grade branch on that result would grade the temporal composite a
-        // second time and no longer match export. Restore the branch as soon
-        // as no active non-adjustment Echo is present.
+        // A clip-local CPU stack already includes each clip's grade/LUT and
+        // ordered FX. Running the GL branch on that frame would reorder or
+        // duplicate the stack and no longer match export.
         const qint64 previewUsec =
             sequenceActive() ? m_timelinePositionUs : m_currentPositionUs;
-        const bool cpuBakedEcho = hasCpuBakedEchoAt(previewUsec);
-        if (cpuBakedEcho && !m_echoDisabledGlGrade) {
+        const bool clipCpuFxBaked = hasClipLocalCpuFxAt(previewUsec);
+        if (clipCpuFxBaked && !m_clipCpuDisabledGlGrade) {
             m_glPreview->setEffectsEnabled(false);
             m_glPreview->setVideoEffects({});
-            m_echoDisabledGlGrade = true;
-        } else if (!cpuBakedEcho && m_echoDisabledGlGrade) {
+            m_clipCpuDisabledGlGrade = true;
+        } else if (!clipCpuFxBaked && m_clipCpuDisabledGlGrade) {
             m_glPreview->setEffectsEnabled(true);
             m_glPreview->setVideoEffects(m_gpuPreviewEffects);
-            m_echoDisabledGlGrade = false;
+            m_clipCpuDisabledGlGrade = false;
         }
-        if (!cpuBakedEcho)
+        if (!clipCpuFxBaked)
             pushActiveClipColorCorrectionToGlPreview();
         undotrace::log("displayFrame:beforeGL");
         m_glPreview->displayFrame(display);
@@ -3739,8 +3832,8 @@ int VideoPlayer::previewEffectTargetEntryIndex(const Timeline *timeline) const
     return targetEntryIndex;
 }
 
-bool VideoPlayer::activePreviewEchoStack(qint64 timelineUsec,
-                                         int *targetEntryIndex) const
+bool VideoPlayer::activePreviewClipCpuStack(qint64 timelineUsec,
+                                            int *targetEntryIndex) const
 {
     if (targetEntryIndex)
         *targetEntryIndex = -1;
@@ -3766,14 +3859,10 @@ bool VideoPlayer::activePreviewEchoStack(qint64 timelineUsec,
         || isNullObjectEntry(targetEntry))
         return false;
 
-    const QVector<VideoEffect> evaluated = effectivePreviewEffectsAt(
-        m_fullPreviewEffects, timeline, m_sequence, timelineUsec, target);
-    const bool hasEcho = std::any_of(
-        evaluated.cbegin(), evaluated.cend(),
-        [](const VideoEffect &effect) {
-            return effect.enabled && effect.type == VideoEffectType::Echo;
-        });
-    if (!hasEcho)
+    // A selected GPU-capable stack also belongs here when a sibling clip has
+    // forced the complete frame onto CPU. The selected stack then has to be
+    // rebuilt on its own clip instead of leaking through canvas-final FX.
+    if (!hasClipLocalCpuFxAt(timelineUsec))
         return false;
 
     if (targetEntryIndex)
@@ -3781,12 +3870,13 @@ bool VideoPlayer::activePreviewEchoStack(qint64 timelineUsec,
     return true;
 }
 
-bool VideoPlayer::hasCpuBakedEchoAt(qint64 timelineUsec) const
+bool VideoPlayer::hasClipLocalCpuFxAt(qint64 timelineUsec) const
 {
     const Timeline *timeline = m_glPreview ? m_glPreview->timeline() : nullptr;
     if (!timeline || !sequenceActive())
         return false;
 
+    const bool gpuAvailable = m_gpuEffectsEnabled && m_useGL && m_glPreview;
     int previewTarget = -1;
     const bool previewOverride = !m_fullPreviewEffects.isEmpty()
         && (m_previewEffectsLive || !m_playing);
@@ -3805,12 +3895,8 @@ bool VideoPlayer::hasCpuBakedEchoAt(qint64 timelineUsec) const
                     effectivePreviewEffectsAt(
                         m_fullPreviewEffects, timeline, m_sequence,
                         timelineUsec, previewTarget);
-                if (std::any_of(
-                        evaluated.cbegin(), evaluated.cend(),
-                        [](const VideoEffect &effect) {
-                            return effect.enabled
-                                && effect.type == VideoEffectType::Echo;
-                        })) {
+                if (videopreview::stackRequiresClipLocalCpu(
+                        evaluated, gpuAvailable)) {
                     return true;
                 }
             }
@@ -3823,9 +3909,12 @@ bool VideoPlayer::hasCpuBakedEchoAt(qint64 timelineUsec) const
             continue;
         const PlaybackEntry &entry = m_sequence.at(entryIndex);
         const ClipInfo *clip = clipForPlaybackEntry(timeline, entry);
-        if (clip && !clip->isAdjustment && !isNullObjectEntry(entry)
-            && tlrender::hasActiveEcho(
-                *clip, entryClipLocalSeconds(entry, timelineUsec))) {
+        if (!clip || clip->isAdjustment || isNullObjectEntry(entry))
+            continue;
+        const QVector<VideoEffect> evaluated = clipanim::effectiveEffectsAt(
+            *clip, entryClipLocalSeconds(entry, timelineUsec));
+        if (videopreview::stackRequiresClipLocalCpu(
+                evaluated, gpuAvailable)) {
             return true;
         }
     }
@@ -3839,17 +3928,17 @@ QImage VideoPlayer::preparePreviewClipFrame(
     double sourceSeconds,
     QSize sourceSize,
     qint64 timelineUsec,
-    bool *echoApplied) const
+    bool *clipFxApplied) const
 {
-    if (echoApplied)
-        *echoApplied = false;
+    if (clipFxApplied)
+        *clipFxApplied = false;
 
     QImage prepared = applyVfxFootageControls(source, entry);
     const Timeline *timeline = m_glPreview ? m_glPreview->timeline() : nullptr;
     const ClipInfo *sourceClip = clipForPlaybackEntry(timeline, entry);
     if (sourceClip && !sourceClip->isAdjustment) {
         const double clipLocalSec = entryClipLocalSeconds(entry, timelineUsec);
-        const bool frameHasEcho = hasCpuBakedEchoAt(timelineUsec);
+        const bool frameNeedsClipCpu = hasClipLocalCpuFxAt(timelineUsec);
         const bool previewOverride = !m_fullPreviewEffects.isEmpty()
             && (m_previewEffectsLive || !m_playing)
             && previewEffectTargetEntryIndex(timeline) == entryIndex;
@@ -3859,39 +3948,35 @@ QImage VideoPlayer::preparePreviewClipFrame(
         const bool hasEcho =
             tlrender::hasActiveEcho(previewClip, clipLocalSec);
 
-        if (hasEcho) {
-            // Export and preview share the complete native clip stage. This
-            // grades both the current source and every history sample before
-            // Echo; moving a non-linear grade/LUT after Echo changes pixels.
+        if (frameNeedsClipCpu) {
+            // Once one active stack needs CPU, GL grading/effects are disabled
+            // for the composited frame. Bake every active clip independently
+            // so [GPU FX, CPU FX] order, masks, and track isolation are kept.
             const QSize echoRenderSize = source.size();
-            const ClipInfo sourceClipSnapshot = *sourceClip;
-            const tlrender::EchoFrameProvider echoFrameProvider =
-                [timeline, sourceClipSnapshot, echoRenderSize, timelineUsec](
-                    double sampleSourceSec, double sampleLocalSec) -> QImage {
-                    return tlrender::renderClipSourceFrameForEcho(
-                        timeline, sourceClipSnapshot, sampleSourceSec,
-                        sampleLocalSec, echoRenderSize, timelineUsec);
-                };
+            tlrender::EchoFrameProvider echoFrameProvider;
+            if (hasEcho) {
+                const ClipInfo sourceClipSnapshot = *sourceClip;
+                echoFrameProvider =
+                    [timeline, sourceClipSnapshot, echoRenderSize, timelineUsec](
+                        double sampleSourceSec, double sampleLocalSec) -> QImage {
+                        return tlrender::renderClipSourceFrameForEcho(
+                            timeline, sourceClipSnapshot, sampleSourceSec,
+                            sampleLocalSec, echoRenderSize, timelineUsec);
+                    };
+            }
             const QVector<Mask> masks = previewMasksForFrame(
                 *sourceClip, sourceSeconds, sourceSize, source.size());
-            prepared = videopreview::prepareEchoClipForComposite(
+            prepared = videopreview::prepareClipForCpuComposite(
                 source, previewClip, clipLocalSec, sourceSeconds,
                 echoFrameProvider, masks);
-            if (echoApplied)
-                *echoApplied = true;
+            if (clipFxApplied)
+                *clipFxApplied = true;
             return prepared;
-        }
-        if (frameHasEcho) {
-            // GL grading is disabled for a CPU-baked Echo canvas. Bake every
-            // sibling clip's grade and ordered FX too, so multi-track frames
-            // do not lose the non-Echo layers' per-clip processing.
-            prepared = tlrender::applyClipFxStackFromSource(
-                source, *sourceClip, clipLocalSec);
         }
     }
 
-    // Echo is deliberately complete before this call: the mask cuts the
-    // clip-local result, then the caller performs fit/transform/composition.
+    // The legacy frame path remains untouched unless an enabled active effect
+    // explicitly required clip-local CPU processing above.
     return applyPreviewClipMask(
         prepared, timeline, entry, sourceSeconds, sourceSize);
 }
@@ -3904,18 +3989,16 @@ QImage VideoPlayer::composeFrameWithOverlays(const QImage &source,
 
     const qint64 previewTimelineUsec =
         sequenceActive() ? m_timelinePositionUs : m_currentPositionUs;
-    // A committed Echo disables the GL effect stage for the whole canvas.
-    // In that state use the original unsplit preview stack on CPU so a
-    // GPU-capable preview effect on another track does not disappear.
-    const bool cpuBakedEcho = hasCpuBakedEchoAt(previewTimelineUsec);
-    const QVector<VideoEffect> &cpuPreviewStack = cpuBakedEcho
-        ? m_fullPreviewEffects : m_previewEffects;
+    const bool clipFxHandledPerClip =
+        hasClipLocalCpuFxAt(previewTimelineUsec);
+    const QVector<VideoEffect> &cpuPreviewStack = m_previewEffects;
     const bool wantsPreviewFx = !cpuPreviewStack.isEmpty()
                                 && (m_previewEffectsLive || !m_playing);
-    // An Echo stack is consumed on its target DecodedLayer before mask and
-    // transform. Never apply that stack again to the composited canvas.
-    const bool echoHandledPerClip = activePreviewEchoStack(previewTimelineUsec);
-    const QVector<VideoEffect> previewEffects = wantsPreviewFx && !echoHandledPerClip
+    // Every active layer was already graded and FX-processed when the frame
+    // took the clip-local CPU path. Reapplying the selected stack here would
+    // duplicate it and leak it into sibling tracks.
+    const QVector<VideoEffect> previewEffects =
+        wantsPreviewFx && !clipFxHandledPerClip
         ? effectivePreviewEffectsAt(cpuPreviewStack,
                                     m_glPreview ? m_glPreview->timeline() : nullptr,
                                     m_sequence,
@@ -4223,33 +4306,28 @@ void VideoPlayer::setPreviewEffects(const QVector<VideoEffect> &effects, bool li
     m_previewEffectsLive = live;
 
     const bool gpuEnabled = m_gpuEffectsEnabled && m_useGL && m_glPreview;
-    const bool containsEcho = std::any_of(
-        effects.cbegin(), effects.cend(),
-        [](const VideoEffect &effect) {
-            return effect.type == VideoEffectType::Echo;
-        });
-    const bool previouslyContainedEcho = std::any_of(
-        m_fullPreviewEffects.cbegin(), m_fullPreviewEffects.cend(),
-        [](const VideoEffect &effect) {
-            return effect.type == VideoEffectType::Echo;
-        });
+    const bool requiresClipCpu =
+        videopreview::stackRequiresClipLocalCpu(effects, gpuEnabled);
+    const bool previouslyRequiredClipCpu =
+        videopreview::stackRequiresClipLocalCpu(
+            m_fullPreviewEffects, gpuEnabled);
 
     QVector<VideoEffect> gpu;
     QVector<VideoEffect> cpu;
-    for (const VideoEffect &e : effects) {
-        const bool gpuCapable =
-            e.type == VideoEffectType::Blur      ||
-            e.type == VideoEffectType::Noise     ||
-            e.type == VideoEffectType::Sepia     ||
-            e.type == VideoEffectType::Grayscale ||
-            e.type == VideoEffectType::Invert    ||
-            e.type == VideoEffectType::Vignette;
-        const bool hasTiming = e.startSec >= 0.0 || e.endSec >= 0.0;
-        // Echo needs random-access source frames at its exact stack position.
-        // Keep the complete stack on CPU so [Invert, Echo] cannot become
-        // [Echo on CPU, Invert on the final GPU canvas].
-        if (!containsEcho && gpuEnabled && gpuCapable && !hasTiming) gpu.append(e);
-        else                                                         cpu.append(e);
+    if (requiresClipCpu) {
+        // Preserve the entire ordered stack on one backend. This covers Echo,
+        // FilmGrain, and future effects outside GLPreview's supported subset.
+        cpu = effects;
+    } else {
+        for (const VideoEffect &effect : effects) {
+            const QVector<VideoEffect> singleEffect{effect};
+            if (!videopreview::stackRequiresClipLocalCpu(
+                    singleEffect, gpuEnabled)) {
+                gpu.append(effect);
+            } else {
+                cpu.append(effect);
+            }
+        }
     }
 
     m_fullPreviewEffects = effects;
@@ -4257,9 +4335,9 @@ void VideoPlayer::setPreviewEffects(const QVector<VideoEffect> &effects, bool li
     m_gpuPreviewEffects = gpu;
     if (m_glPreview)
         m_glPreview->setVideoEffects(
-            m_echoDisabledGlGrade ? QVector<VideoEffect>() : gpu);
+            m_clipCpuDisabledGlGrade ? QVector<VideoEffect>() : gpu);
 
-    if (containsEcho || previouslyContainedEcho) {
+    if (requiresClipCpu || previouslyRequiredClipCpu) {
         ++m_timelineRevision;
         m_frameCache.invalidateRevision(m_timelineRevision);
     }
@@ -5170,10 +5248,10 @@ QSize VideoPlayer::fittedDisplaySize(const QSize &bounds) const
     return QSize(qMax(1, targetWidth), qMax(1, targetHeight));
 }
 
-bool VideoPlayer::refreshPreviewEchoComposite()
+bool VideoPlayer::refreshPreviewClipCpuComposite()
 {
-    int echoTarget = -1;
-    if (!activePreviewEchoStack(m_timelinePositionUs, &echoTarget)
+    int cpuTarget = -1;
+    if (!activePreviewClipCpuStack(m_timelinePositionUs, &cpuTarget)
         || m_lastV1RawFrame.isNull()) {
         return false;
     }
@@ -5209,16 +5287,16 @@ bool VideoPlayer::refreshPreviewEchoComposite()
             const double sourceSeconds = static_cast<double>(
                 entryLocalPositionUs(entryIndex, m_timelinePositionUs))
                 / AV_TIME_BASE;
-            bool echoApplied = false;
+            bool clipFxApplied = false;
             layer.rgb = preparePreviewClipFrame(
                 m_lastV1RawFrame, entry, entryIndex, sourceSeconds,
-                sourceSize, m_timelinePositionUs, &echoApplied);
+                sourceSize, m_timelinePositionUs, &clipFxApplied);
             layer.isFresh = true;
-            targetPrepared = entryIndex == echoTarget && echoApplied;
+            targetPrepared = entryIndex == cpuTarget && clipFxApplied;
         } else {
             if (!harvestOverlayLayer(entry, entryIndex, &layer))
                 continue;
-            if (entryIndex == echoTarget && !layer.rgb.isNull())
+            if (entryIndex == cpuTarget && !layer.rgb.isNull())
                 targetPrepared = true;
         }
 
@@ -5276,9 +5354,9 @@ void VideoPlayer::refreshDisplayedFrame()
         return;
 
     // A paused effect-dialog preview has no playback tick to rebuild V2+
-    // layers. Recompose from the current decoded layer frames before any
-    // baked-text/nested early return so the transient Echo is never omitted.
-    if (refreshPreviewEchoComposite())
+    // layers. Recompose before any early return whenever an active stack has
+    // forced clip-local CPU FX, including FilmGrain and sibling-Echo frames.
+    if (refreshPreviewClipCpuComposite())
         return;
 
     if (m_lastSourceFrameHasBakedText) {
@@ -5323,10 +5401,10 @@ void VideoPlayer::refreshDisplayedFrame()
                 static_cast<double>(
                     entryLocalPositionUs(m_activeEntry, m_timelinePositionUs))
                 / AV_TIME_BASE;
-            bool echoApplied = false;
+            bool clipFxApplied = false;
             const QImage prepared = preparePreviewClipFrame(
                 m_lastV1RawFrame, e, m_activeEntry, sourceSec, sourceSize,
-                m_timelinePositionUs, &echoApplied);
+                m_timelinePositionUs, &clipFxApplied);
 
             if (m_projectOutputSize.isValid()) {
                 QImage canvas(m_projectOutputSize,
@@ -5367,9 +5445,9 @@ void VideoPlayer::refreshDisplayedFrame()
             }
 
             // Without a project canvas the normal raw-frame path is retained.
-            // Echo is the sole exception because its stack has already been
-            // consumed here and composeFrameWithOverlays intentionally skips it.
-            if (echoApplied) {
+            // A clip-local CPU stack is already complete and
+            // composeFrameWithOverlays intentionally skips it.
+            if (clipFxApplied) {
                 m_lastFrameOdtApplied = false;
                 displayFrame(prepared);
                 return;
