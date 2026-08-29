@@ -1,9 +1,13 @@
 #include "../EffectParamSchema.h"
+#include "../EffectPreset.h"
+#include "../Timeline.h"
 #include "../TimelineFrameRenderer.h"
 #include "../VideoEffect.h"
 
 #include <QColor>
 #include <QImage>
+#include <QJsonArray>
+#include <QJsonObject>
 #include <QStringList>
 #include <QVector>
 
@@ -167,6 +171,72 @@ int runFxGrainEchoSelftest()
     }
     reportGate("G8", "Lighten output channels are not below base",
                lightenNeverDarkens, passed, failed);
+
+    EffectPreset preset;
+    preset.name = QStringLiteral("fxgrain-echo-roundtrip");
+    preset.effects = {
+        VideoEffect::createFilmGrain(),
+        VideoEffect::createEcho()
+    };
+    QJsonObject presetJson = preset.toJson();
+    QJsonArray serializedEffects = presetJson.value("effects").toArray();
+    const bool serializedTypeNames = serializedEffects.size() == 2
+        && serializedEffects.at(0).toObject().value("type").toString()
+            == QStringLiteral("FilmGrain")
+        && serializedEffects.at(1).toObject().value("type").toString()
+            == QStringLiteral("Echo");
+    for (int i = 0; i < serializedEffects.size(); ++i) {
+        QJsonObject effectJson = serializedEffects.at(i).toObject();
+        effectJson.remove("typeId");
+        effectJson.remove("typeName");
+        serializedEffects[i] = effectJson;
+    }
+    presetJson["effects"] = serializedEffects;
+    const EffectPreset restoredPreset = EffectPreset::fromJson(presetJson);
+    const bool presetStringRoundTrip = serializedTypeNames
+        && restoredPreset.effects.size() == 2
+        && restoredPreset.effects.at(0).type == VideoEffectType::FilmGrain
+        && restoredPreset.effects.at(1).type == VideoEffectType::Echo;
+    reportGate("G9", "EffectPreset string round-trip preserves FilmGrain and Echo",
+               presetStringRoundTrip, passed, failed);
+
+    const QVector<effectctrl::ParamDef> echoSchema =
+        effectctrl::paramSchemaFor(VideoEffectType::Echo);
+    const auto blendDef = std::find_if(
+        echoSchema.cbegin(), echoSchema.cend(),
+        [](const effectctrl::ParamDef &def) { return def.name == "blend"; });
+    bool blendModesValid = blendDef != echoSchema.cend()
+        && blendDef->type == effectctrl::ParamType::Int
+        && blendDef->minVal == 0.0
+        && blendDef->maxVal == 3.0
+        && blendDef->defaultVal == 2.0;
+
+    QImage blendBase(1, 1, QImage::Format_RGBA8888);
+    blendBase.fill(QColor(40, 80, 120, 255));
+    QImage blendEcho(1, 1, QImage::Format_RGBA8888);
+    blendEcho.fill(QColor(200, 100, 60, 255));
+    const QVector<QColor> expectedBlendPixels = {
+        QColor(240, 180, 180, 255),
+        QColor(209, 149, 152, 255),
+        QColor(200, 100, 120, 255),
+        QColor(200, 100, 60, 255)
+    };
+    for (int blend = 0; blend <= 3 && blendModesValid; ++blend) {
+        VideoEffect blendEffect = VideoEffect::createEcho(0.1, 1, 1.0, blend);
+        effectctrl::setParamValue(blendEffect, QStringLiteral("blend"), blend);
+        ClipInfo blendClip;
+        blendClip.inPoint = 0.0;
+        blendClip.effects = { blendEffect };
+        const tlrender::EchoFrameProvider provider =
+            [&blendEcho](double, double) { return blendEcho; };
+        const QImage composed = tlrender::applyClipFxPackWithEcho(
+            blendBase, blendClip, 1.0, 1.0, provider);
+        blendModesValid = effectctrl::paramValue(
+            blendEffect, QStringLiteral("blend")) == blend
+            && composed.pixelColor(0, 0) == expectedBlendPixels.at(blend);
+    }
+    reportGate("G10", "Echo blend values 0..3 match schema and composition",
+               blendModesValid, passed, failed);
 
     std::cerr << "summary: " << passed << " PASS, " << failed << " FAIL\n";
     return failed;

@@ -258,8 +258,8 @@ QVector<ParamDef> paramSchemaFor(VideoEffectType type)
             { "delaySec", "遅延 (秒)", ParamType::Float, 0.02, 2.0, 0.1 },
             { "count", "残像数", ParamType::Int, 1.0, 8.0, 3.0 },
             { "decay", "減衰", ParamType::Float, 0.0, 1.0, 0.5 },
-            { "blend", "合成", ParamType::Choice, 0.0, 3.0, 2.0,
-              { "加算", "スクリーン", "比較 (明)", "通常" } }
+            { "blend", "合成 (0=加算 / 1=スクリーン / 2=比較 (明) / 3=通常)",
+              ParamType::Int, 0.0, 3.0, 2.0 }
         };
 
     case VideoEffectType::None:

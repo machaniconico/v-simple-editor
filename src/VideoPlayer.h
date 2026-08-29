@@ -805,6 +805,10 @@ private:
     // unmodified when the overlay list is empty.
     QImage composeFrameWithOverlays(const QImage &source,
                                     bool textAlreadyBaked = false) const;
+    QImage applyPreviewEffectStackWithEcho(
+        const QImage &source,
+        const QVector<VideoEffect> &effects,
+        qint64 timelineUsec) const;
 
     // VEDITOR_TICK_TRACE accumulators (Phase 1e Sprint US-1). Populated only
     // when tickTraceEnabled() is true; flushed and reset every 30 ticks.

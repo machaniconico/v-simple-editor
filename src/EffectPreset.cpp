@@ -85,6 +85,8 @@ QString effectTypeKey(VideoEffectType type)
     case VideoEffectType::PolarCoordinates: return QStringLiteral("PolarCoordinates");
     case VideoEffectType::MotionTile: return QStringLiteral("MotionTile");
     case VideoEffectType::CornerPinSimple: return QStringLiteral("CornerPinSimple");
+    case VideoEffectType::FilmGrain: return QStringLiteral("FilmGrain");
+    case VideoEffectType::Echo: return QStringLiteral("Echo");
     }
     return QStringLiteral("None");
 }

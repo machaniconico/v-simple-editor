@@ -10,8 +10,10 @@
 #include <QVector>
 #include <QVector3D>
 #include <QtGlobal>
+#include <functional>
 
 class Timeline;
+struct ClipInfo;
 
 // Single Source Of Truth (SSOT) Timeline -> QImage renderer.
 //
@@ -61,6 +63,23 @@ namespace tlrender {
 // blend: 0=Add, 1=Screen, 2=Lighten, 3=Normal alpha composite.
 QImage composeEcho(const QImage &base, const QVector<QImage> &echoes,
                    double decay, int blend);
+
+using EchoFrameProvider =
+    std::function<QImage(double sourceSeconds, double clipLocalSeconds)>;
+
+bool hasActiveEcho(const ClipInfo &clip, double clipLocalSeconds);
+QImage applyClipFxPackWithEcho(const QImage &graded, const ClipInfo &clip,
+                               double clipLocalSeconds, double sourceSeconds,
+                               const EchoFrameProvider &frameProvider);
+
+// Random-access source-frame path shared with preview Echo. It mirrors the
+// export provider's source decode/nested render -> VFX controls -> grade order.
+QImage renderClipSourceFrameForEcho(const Timeline *timeline,
+                                    const ClipInfo &clip,
+                                    double sourceSeconds,
+                                    double clipLocalSeconds,
+                                    QSize outSize,
+                                    qint64 timelineUsec);
 
 QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize);
 QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize,

@@ -538,8 +538,7 @@ QImage applyClipFxPack(const QImage &graded, const ClipInfo &clip,
     return out.convertToFormat(QImage::Format_RGBA8888);
 }
 
-using EchoFrameProvider =
-    std::function<QImage(double sourceSeconds, double clipLocalSeconds)>;
+} // namespace
 
 bool hasActiveEcho(const ClipInfo &clip, double clipLocalSeconds)
 {
@@ -617,6 +616,8 @@ QImage applyClipFxPackWithEcho(const QImage &graded, const ClipInfo &clip,
 
     return result.convertToFormat(QImage::Format_RGBA8888);
 }
+
+namespace {
 
 struct ActiveAdjustmentClip {
     int trackIndex = 0;
@@ -2091,6 +2092,35 @@ QImage renderFrameAtSingleWithSequenceSnapshot(
 }
 
 } // namespace
+
+QImage renderClipSourceFrameForEcho(const Timeline *timeline,
+                                    const ClipInfo &clip,
+                                    double sourceSeconds,
+                                    double clipLocalSeconds,
+                                    QSize outSize,
+                                    qint64 timelineUsec)
+{
+    if (!timeline || outSize.isEmpty())
+        return QImage();
+
+    const QVector<TimelineSequence> sequenceSnapshot = timeline->sequences();
+    QVector<QString> sequenceStack;
+    const QString activeId = timeline->activeSequenceId();
+    if (!activeId.isEmpty())
+        sequenceStack.append(activeId);
+    const QVector<Light3DState> projectLights = light3d::statesAt(
+        timeline->projectLights(),
+        static_cast<double>(timelineUsec) / 1'000'000.0);
+
+    const QImage source = renderClipSourceFrame(
+        timeline, clip, sourceSeconds, outSize, /*sequenceDepth=*/0,
+        sequenceSnapshot, sequenceStack, projectLights,
+        timeline->projectLightViewPosition());
+    if (source.isNull())
+        return QImage();
+    return gradeClipNativeFrame(
+        applyVfxFootageControls(source, clip), clip, clipLocalSeconds);
+}
 
 QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize outSize)
 {
