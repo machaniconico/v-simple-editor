@@ -623,6 +623,13 @@ public:
         QString reason;
     };
 
+    struct MatchFrameResult {
+        QString filePath;
+        double sourceSec = 0.0;
+        int trackIndex = -1;
+        int clipIndex = -1;
+    };
+
     // GUI のファイル追加と MCP の非対話取り込みが共有する入口。
     // requestedTrackIndex / requestedStartSec が -1 のときは既存の GUI 配置規則を使う。
     // kind: LinkedPair は従来どおり V/A の対で置く (GUI 既定)。Auto はファイルの
@@ -659,6 +666,17 @@ public:
                                 bool applyToLinked = false);
     bool setClipReversed(TrackKind kind, int trackIndex, int clipIndex,
                          bool reversed, bool applyToLinked = true);
+    // タイムライン時刻からソース時刻を引く。選択中の動画トラックを優先し、
+    // 該当しなければ V1 を検索する。ClipInfo の共通 speed/reverse/remap 写像を使う。
+    bool matchFrame(double timelineSec, MatchFrameResult *result,
+                    QString *errorOut = nullptr) const;
+    // 素材だけを差し替え、トリム・配置・エフェクト等は維持する。新素材が短い場合は
+    // 収まる長さまで短縮し、messageOut に警告を返す。成功時は Undo 1 回。
+    bool replaceClipMedia(TrackKind kind, int trackIndex, int clipIndex,
+                          const QString &newPath,
+                          const QString &newDisplayName,
+                          double newSourceDurationSec,
+                          QString *messageOut = nullptr);
     bool setClipLabel(TrackKind kind, int trackIndex, int clipIndex, ClipLabel label);
     bool selectClipByIndex(bool audio, int trackIndex, int clipIndex, QString *err);
     void clearSelection();
@@ -1076,6 +1094,7 @@ signals:
     void transitionDialogRequested();
     void videoEffectsDialogRequested();
     void colorCorrectionRequested();
+    void replaceClipRequested(TrackKind kind, int trackIndex, int clipIndex);
     void clipParentDialogRequested();
     void nullObjectRequested();
     // Emitted from applyTransitionToSelected when the requested duration

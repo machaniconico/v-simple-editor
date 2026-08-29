@@ -865,6 +865,7 @@ bool toolMutatesTimeline(const QString& toolName)
     static const QSet<QString> kNonMutating{
         QStringLiteral("export_video"), QStringLiteral("select_clip"),
         QStringLiteral("clear_selection"), QStringLiteral("set_playhead"),
+        QStringLiteral("match_frame"),
         QStringLiteral("save_project"), QStringLiteral("set_track_locked"),
         QStringLiteral("set_project_option"),
         QStringLiteral("add_caption"),
@@ -1622,6 +1623,18 @@ void McpEditorTools::registerWriteTools()
         {QStringLiteral("clipIndex"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}}
     }, {QStringLiteral("ok"), QStringLiteral("startSec"),
         QStringLiteral("actualStartSec"), QStringLiteral("trackIndex")});
+
+    const QJsonObject matchFrameOutputSchema = outputSchemaOf(QJsonObject{
+        {QStringLiteral("filePath"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
+        {QStringLiteral("sourceSec"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
+        {QStringLiteral("clipIndex"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}}
+    }, {QStringLiteral("filePath"), QStringLiteral("sourceSec"),
+        QStringLiteral("clipIndex")});
+
+    const QJsonObject replaceClipOutputSchema = outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("warning"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}}
+    }, {QStringLiteral("ok")});
 
     const QJsonObject setClipPropertyOutputSchema = outputSchemaOf(QJsonObject{
         {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
@@ -2652,6 +2665,102 @@ void McpEditorTools::registerWriteTools()
             };
         })
     }, moveClipOutputSchema));
+
+    m_registry->registerTool(withOutputSchema({
+        QStringLiteral("match_frame"),
+        QStringLiteral("再生ヘッド位置 (または timeSec) の動画クリップを、speed・逆再生・リマップを反映したソース時刻でソースモニターに開く。選択中の動画トラックを優先し、該当しなければ V1 を使う。"),
+        objectSchema(QJsonObject{
+            {QStringLiteral("timeSec"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("number")},
+                {QStringLiteral("minimum"), 0},
+                {QStringLiteral("description"),
+                 QStringLiteral("タイムライン絶対時刻 (秒)。省略時は現在の再生ヘッド位置")}
+            }}
+        }),
+        guardedWrite(QStringLiteral("match_frame"),
+                     [this](const QJsonObject& args, QString* err) -> QJsonObject {
+            if (!rejectUnknownArguments(args, {QStringLiteral("timeSec")}, err))
+                return {};
+            if (!m_window || !timeline())
+                return setError(err, QStringLiteral("editor not available")), QJsonObject();
+
+            double timeSec = timeline()->playheadPosition();
+            if (args.contains(QStringLiteral("timeSec"))) {
+                if (!requiredFiniteNumber(args, QStringLiteral("timeSec"),
+                                          &timeSec, err)) {
+                    return {};
+                }
+                if (timeSec < 0.0) {
+                    return setError(err, QStringLiteral("timeSec must be non-negative")),
+                           QJsonObject();
+                }
+            }
+
+            Timeline::MatchFrameResult match;
+            if (!timeline()->matchFrame(timeSec, &match, err))
+                return {};
+
+            m_window->openInSourceMonitor(match.filePath, match.sourceSec);
+            return QJsonObject{
+                {QStringLiteral("filePath"), match.filePath},
+                {QStringLiteral("sourceSec"), match.sourceSec},
+                {QStringLiteral("clipIndex"), match.clipIndex}
+            };
+        })
+    }, matchFrameOutputSchema));
+
+    m_registry->registerTool(withOutputSchema({
+        QStringLiteral("replace_clip"),
+        QStringLiteral("指定クリップの素材を filePath のメディアへ置き換える。位置・inPoint・長さを可能な限り維持し、同じ linkGroup の音声も新素材に音声があれば置き換える。新素材が短い場合は warning を返す。変更は Ctrl+Z / undo 1 回で戻せる。"),
+        schemaWithRequired(mergedProperties(clipProperties, QJsonObject{
+            {QStringLiteral("filePath"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("string")},
+                {QStringLiteral("description"), QStringLiteral("置き換え先のメディアファイル")}
+            }}
+        }), {QStringLiteral("clipIndex"), QStringLiteral("filePath")}),
+        guardedWrite(QStringLiteral("replace_clip"),
+                     [this](const QJsonObject& args, QString* err) -> QJsonObject {
+            if (!rejectUnknownArguments(
+                    args,
+                    {QStringLiteral("kind"), QStringLiteral("trackIndex"),
+                     QStringLiteral("clipIndex"), QStringLiteral("filePath")},
+                    err)) {
+                return {};
+            }
+
+            QString filePath;
+            if (!requiredString(args, QStringLiteral("filePath"), &filePath, err))
+                return {};
+            if (filePath.isEmpty()) {
+                return setError(err, QStringLiteral("ファイルが見つかりません: %1")
+                                         .arg(filePath)),
+                       QJsonObject();
+            }
+
+            ClipTarget target;
+            Timeline *currentTimeline = timeline();
+            if (!readClipTarget(args, m_window, currentTimeline, &target, err))
+                return {};
+
+            QString message;
+            if (!currentTimeline->replaceClipMedia(
+                    target.audio ? TrackKind::Audio : TrackKind::Video,
+                    target.trackIndex, target.clipIndex, filePath,
+                    QFileInfo(filePath).fileName(), 0.0, &message)) {
+                return setError(err, message.isEmpty()
+                                         ? QStringLiteral("クリップを置き換えられません")
+                                         : message),
+                       QJsonObject();
+            }
+
+            m_window->setWindowModified(true);
+            syncSelectionAfterEdit();
+            QJsonObject response{{QStringLiteral("ok"), true}};
+            if (!message.isEmpty())
+                response.insert(QStringLiteral("warning"), message);
+            return response;
+        })
+    }, replaceClipOutputSchema));
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("set_clip_property"),

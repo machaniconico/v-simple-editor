@@ -28,9 +28,11 @@ public:
 
     // 素材をロードする。durationSec<=0 のときは VideoPlayer の durationChanged
     // シグナル経由で実尺が判明した時点でスライダー範囲を補正する。
-    void loadSource(const threepoint::SourceSelection &sel);
+    void loadSource(const threepoint::SourceSelection &sel,
+                    double initialPositionSec = 0.0);
     void loadSource(const QString &filePath, double durationSec,
-                    const QString &displayName);
+                    const QString &displayName,
+                    double initialPositionSec = 0.0);
 
     // 現在マークしている選択範囲。filePath/displayName/durationSec/
     // sourceInSec/sourceOutSec を詰めて返す。未ロード時は空の filePath。

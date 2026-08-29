@@ -558,7 +558,12 @@ private slots:
     // SM-5: ソースモニター + 3点編集。メディアプールのダブルクリックは
     // 直接タイムラインへ取り込まず、いったんソースモニターへロードして
     // マークイン/アウト → 挿入/上書きの 3 点編集ワークフローに乗せる。
-    void openInSourceMonitor(const QString &filePath);
+    void openInSourceMonitor(const QString &filePath,
+                             double positionSec = 0.0);
+    // 再生ヘッド直下の素材をソースモニターで同じフレーム位置に開く。
+    void matchFrame();
+    // 選択クリップを、メディアプールで選択中の素材へ置き換える。
+    void replaceSelectedClipFromMediaPool();
     // ソースモニターの「挿入 (Insert)」押下。選択範囲を検証して
     // insertClip3PointActive で再生ヘッド位置へリップル挿入する。
     void onSourceInsertRequested(const threepoint::SourceSelection &sel);
@@ -710,6 +715,7 @@ private:
     bool selectedVideoClipRef(int &trackIdx, int &clipIdx, ClipInfo *clip = nullptr) const;
     bool selectedClipRef(TrackKind &kind, int &trackIdx, int &clipIdx,
                          ClipInfo *clip = nullptr) const;
+    void replaceClipFromMediaPool(TrackKind kind, int trackIdx, int clipIdx);
     double clipTimelineStartSeconds(int trackIdx, int clipIdx) const;
     double clipSourceTimeAtPlayheadSeconds(int trackIdx, int clipIdx, const ClipInfo &clip) const;
     QImage decodeClipFrameAtSourceTime(const ClipInfo &clip, double sourceTimeSeconds) const;

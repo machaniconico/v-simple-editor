@@ -2810,6 +2810,10 @@ MainWindow::MainWindow(QWidget *parent)
     connect(m_timeline, &Timeline::clipSelected, this, [this](int /*index*/) {
         updateEditActions();
     });
+    connect(m_timeline, &Timeline::replaceClipRequested, this,
+            [this](TrackKind kind, int trackIndex, int clipIndex) {
+                replaceClipFromMediaPool(kind, trackIndex, clipIndex);
+            });
     // V3 sprint — preview drag handle の edit target を選択 clip に同期。
     // Timeline 側で (sourceTrack, sourceClipIndex) を直接運んでくれる
     // track-aware overload にスイッチ。playhead heuristic は
@@ -4215,6 +4219,22 @@ void MainWindow::setupMenuBar()
     connect(m_rippleDeleteAction, &QAction::triggered, this, &MainWindow::rippleDelete);
     m_menuHelpEntries.append({m_rippleDeleteAction,
         QStringLiteral("クリップを消して、空いた隙間を後ろのクリップが詰めて埋めます。間を空けたくないときに。")});
+
+    auto *matchFrameAction = editMenu->addAction(QStringLiteral("マッチフレーム"));
+    matchFrameAction->setObjectName(QStringLiteral("action_match_frame"));
+    matchFrameAction->setShortcut(QKeySequence(Qt::Key_F));
+    connect(matchFrameAction, &QAction::triggered,
+            this, &MainWindow::matchFrame);
+    m_menuHelpEntries.append({matchFrameAction,
+        QStringLiteral("再生ヘッド位置のクリップを、対応するソース時刻でソースモニターに開きます。")});
+
+    auto *replaceClipAction = editMenu->addAction(
+        QStringLiteral("クリップをメディアプールの素材で置き換え"));
+    replaceClipAction->setObjectName(QStringLiteral("action_replace_clip_media"));
+    connect(replaceClipAction, &QAction::triggered,
+            this, &MainWindow::replaceSelectedClipFromMediaPool);
+    m_menuHelpEntries.append({replaceClipAction,
+        QStringLiteral("選んだクリップの位置とトリムを保ったまま、メディアプールで選択中の素材へ差し替えます。")});
 
     // US-WF-D: Sprint 11 workflow — magnetic timeline closeGaps demo.
     auto *magTlDemoAction = editMenu->addAction("タイムラインギャップを詰める (Demo)");
@@ -8647,7 +8667,8 @@ void MainWindow::onMediaPoolAssetActivated(const QString &filePath)
 // SM-5: 素材をソースモニターへロードする。長さ/表示名はメディアプールに
 // 登録済みなら MediaAsset から取得し、無ければファイル名 + 長さ 0 で渡す
 // (SourceMonitorDock 側で VideoPlayer の durationChanged から実尺を補正する)。
-void MainWindow::openInSourceMonitor(const QString &filePath)
+void MainWindow::openInSourceMonitor(const QString &filePath,
+                                     double positionSec)
 {
     if (filePath.isEmpty() || !m_sourceMonitorDock)
         return;
@@ -8665,11 +8686,93 @@ void MainWindow::openInSourceMonitor(const QString &filePath)
     if (displayName.isEmpty())
         displayName = QFileInfo(filePath).fileName();
 
-    m_sourceMonitorDock->loadSource(filePath, durationSec, displayName);
+    m_sourceMonitorDock->loadSource(filePath, durationSec, displayName,
+                                    positionSec);
     m_sourceMonitorDock->show();
     m_sourceMonitorDock->raise();
     statusBar()->showMessage(
         QStringLiteral("ソースモニターに読み込みました: %1").arg(displayName));
+}
+
+void MainWindow::matchFrame()
+{
+    if (!m_timeline) {
+        statusBar()->showMessage(QStringLiteral("タイムラインがありません"));
+        return;
+    }
+
+    Timeline::MatchFrameResult match;
+    QString error;
+    if (!m_timeline->matchFrame(currentPlayheadSeconds(), &match, &error)) {
+        statusBar()->showMessage(
+            QStringLiteral("マッチフレームできません: %1").arg(error), 5000);
+        return;
+    }
+
+    openInSourceMonitor(match.filePath, match.sourceSec);
+    statusBar()->showMessage(
+        QStringLiteral("マッチフレーム: %1 (%2 秒)")
+            .arg(QFileInfo(match.filePath).fileName())
+            .arg(match.sourceSec, 0, 'f', 3),
+        5000);
+}
+
+void MainWindow::replaceSelectedClipFromMediaPool()
+{
+    TrackKind kind = TrackKind::Video;
+    int trackIndex = -1;
+    int clipIndex = -1;
+    if (!selectedClipRef(kind, trackIndex, clipIndex)) {
+        statusBar()->showMessage(
+            QStringLiteral("置き換えるクリップを選択してください"), 5000);
+        return;
+    }
+    replaceClipFromMediaPool(kind, trackIndex, clipIndex);
+}
+
+void MainWindow::replaceClipFromMediaPool(TrackKind kind, int trackIndex,
+                                          int clipIndex)
+{
+    if (!m_timeline || !m_mediaPoolDock)
+        return;
+
+    const QString filePath = m_mediaPoolDock->selectedAssetPath();
+    if (filePath.isEmpty()) {
+        statusBar()->showMessage(
+            QStringLiteral("メディアプールで置き換え素材を選択してください"), 5000);
+        return;
+    }
+
+    QString displayName = QFileInfo(filePath).fileName();
+    double durationSec = 0.0;
+    for (const mediapool::MediaAsset &asset : m_mediaPool.assets()) {
+        if (asset.filePath != filePath)
+            continue;
+        if (!asset.displayName.isEmpty())
+            displayName = asset.displayName;
+        if (asset.durationMs > 0)
+            durationSec = static_cast<double>(asset.durationMs) / 1000.0;
+        break;
+    }
+
+    QString message;
+    if (!m_timeline->replaceClipMedia(kind, trackIndex, clipIndex,
+                                      filePath, displayName, durationSec,
+                                      &message)) {
+        statusBar()->showMessage(
+            QStringLiteral("クリップを置き換えられません: %1").arg(message),
+            6000);
+        return;
+    }
+
+    setWindowModified(true);
+    updateStatusInfo();
+    updateEditActions();
+    statusBar()->showMessage(
+        message.isEmpty()
+            ? QStringLiteral("クリップを置き換えました: %1").arg(displayName)
+            : message,
+        6000);
 }
 
 // SM-5: ソースモニターの「挿入 (Insert)」押下。選択範囲を検証してから

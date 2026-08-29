@@ -4038,6 +4038,94 @@ void Timeline::applyDuckingFromTrack(int voiceTrackIdx,
     }
 }
 
+namespace {
+
+struct TimelineMediaProbe {
+    bool openedOk = false;
+    bool videoStreamFound = false;
+    bool audioStreamFound = false;
+    bool wantsAutoProxy = false;
+    double durationSec = 0.0;
+    int videoWidth = 0;
+    int videoHeight = 0;
+    int primaries = 0;
+    int transferCharacteristic = 0;
+    int bitDepth = 8;
+    bool hasHdrMetadata = false;
+    bool hasAlpha = false;
+};
+
+// import_media とクリップ置き換えで共有する同期 probe。ストリーム有無・尺・
+// 映像メタデータを 1 回の avformat open から取得し、呼び出し側が同じ判定を使う。
+TimelineMediaProbe probeTimelineMedia(const QString &filePath)
+{
+    TimelineMediaProbe result;
+    AVFormatContext *formatContext = nullptr;
+    if (avformat_open_input(&formatContext, filePath.toUtf8().constData(),
+                            nullptr, nullptr) != 0) {
+        return result;
+    }
+
+    result.openedOk = true;
+    const bool streamInfoAvailable =
+        avformat_find_stream_info(formatContext, nullptr) >= 0;
+    if (streamInfoAvailable && formatContext->duration > 0) {
+        result.durationSec = static_cast<double>(formatContext->duration)
+            / AV_TIME_BASE;
+    }
+
+    for (unsigned i = 0; i < formatContext->nb_streams; ++i) {
+        const AVStream *stream = formatContext->streams[i];
+        if (!stream || !stream->codecpar)
+            continue;
+        if (streamInfoAvailable && formatContext->duration <= 0
+            && stream->duration > 0) {
+            const double streamDurationSec =
+                stream->duration * av_q2d(stream->time_base);
+            if (std::isfinite(streamDurationSec) && streamDurationSec > 0.0)
+                result.durationSec = qMax(result.durationSec, streamDurationSec);
+        }
+        if (stream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+            result.audioStreamFound = true;
+            continue;
+        }
+        if (stream->codecpar->codec_type != AVMEDIA_TYPE_VIDEO
+            || result.videoStreamFound) {
+            continue;
+        }
+
+        result.videoStreamFound = true;
+        result.videoWidth = stream->codecpar->width;
+        result.videoHeight = stream->codecpar->height;
+        const hdringest::ColorInputs colorInputs =
+            hdringest::captureColorInputs(stream->codecpar);
+        result.primaries = colorInputs.primaries;
+        result.transferCharacteristic = colorInputs.trc;
+        result.bitDepth = colorInputs.bitDepth;
+        result.hasHdrMetadata = colorInputs.hasHdrMeta;
+
+        const AVPixFmtDescriptor *pixelDescriptor = av_pix_fmt_desc_get(
+            static_cast<AVPixelFormat>(stream->codecpar->format));
+        const bool alphaByPixelFormat = pixelDescriptor
+            && (pixelDescriptor->flags & AV_PIX_FMT_FLAG_ALPHA) != 0;
+        const bool alphaByCodec = stream->codecpar->codec_id == AV_CODEC_ID_QTRLE
+            || stream->codecpar->codec_id == AV_CODEC_ID_PNG;
+        result.hasAlpha = alphaByPixelFormat || alphaByCodec;
+
+        const bool isAv1 = stream->codecpar->codec_id == AV_CODEC_ID_AV1;
+        const bool isQhdPlus = result.videoWidth >= 2560
+            || result.videoHeight >= 1440;
+        const bool isHdPlus = result.videoWidth >= 1920
+            || result.videoHeight >= 1080;
+        result.wantsAutoProxy = isAv1 || isQhdPlus || isHdPlus;
+    }
+
+    avformat_close_input(&formatContext);
+    return result;
+}
+
+} // namespace
+
 bool Timeline::importMedia(const QString &filePath,
                            int requestedTrackIndex,
                            double requestedStartSec,
@@ -4062,8 +4150,6 @@ bool Timeline::importMedia(const QString &filePath,
         return fail(QStringLiteral("startSec must be non-negative"));
     }
 
-    AVFormatContext *fmt = nullptr;
-    double duration = 0.0;
     // Phase 1e Win #11 — auto-proxy for heavy video sources. AV1 SW/HW
     // decode runs 4–10x heavier than H.264 (no SIMD-friendly inverse
     // transforms in libdav1d; the D3D11VA path still pays full-res
@@ -4080,67 +4166,20 @@ bool Timeline::importMedia(const QString &filePath,
     // VEDITOR_AUTO_PROXY_DISABLE=1 in case a user wants to skip the
     // first-import encode wait, and gated on resolution/codec to avoid
     // generating proxies for clips that already play smoothly.
-    bool wantsAutoProxy = false;
-    bool videoStreamFound = false;
-    bool audioStreamFound = false;
-    bool openedOk = false;
-    int capturedPrimaries = 0;
-    int capturedTrc = 0;
-    int capturedBitDepth = 8;
-    bool capturedHasHdrMeta = false;
-    bool capturedHasAlpha = false;
-    // ソース映像の素のピクセル寸法 (アスペクト既定フィット判定用)。probe ループで
-    // 最初の映像ストリームから捕捉する。0 = 未取得 (probe 失敗/静止画非対応など)。
-    int srcVideoW = 0;
-    int srcVideoH = 0;
-    if (avformat_open_input(&fmt, filePath.toUtf8().constData(), nullptr, nullptr) == 0) {
-        openedOk = true;
-        if (avformat_find_stream_info(fmt, nullptr) >= 0 && fmt->duration > 0)
-            duration = static_cast<double>(fmt->duration) / AV_TIME_BASE;
-        for (unsigned i = 0; i < fmt->nb_streams; ++i) {
-            const AVStream *st = fmt->streams[i];
-            if (!st || !st->codecpar)
-                continue;
-            if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
-                audioStreamFound = true;
-                continue;
-            }
-            if (st->codecpar->codec_type != AVMEDIA_TYPE_VIDEO || videoStreamFound)
-                continue;
-            const int w = st->codecpar->width;
-            const int h = st->codecpar->height;
-            videoStreamFound = true;
-            srcVideoW = w;
-            srcVideoH = h;
-            const hdringest::ColorInputs colorInputs =
-                hdringest::captureColorInputs(st->codecpar);
-            capturedPrimaries = colorInputs.primaries;
-            capturedTrc = colorInputs.trc;
-            capturedBitDepth = colorInputs.bitDepth;
-            capturedHasHdrMeta = colorInputs.hasHdrMeta;
-            const AVPixFmtDescriptor *pixelDescriptor = av_pix_fmt_desc_get(
-                static_cast<AVPixelFormat>(st->codecpar->format));
-            const bool alphaByPixelFormat = pixelDescriptor
-                && (pixelDescriptor->flags & AV_PIX_FMT_FLAG_ALPHA) != 0;
-            const bool alphaByCodec = st->codecpar->codec_id == AV_CODEC_ID_QTRLE
-                || st->codecpar->codec_id == AV_CODEC_ID_PNG;
-            capturedHasAlpha = alphaByPixelFormat || alphaByCodec;
-            const bool isAv1  = st->codecpar->codec_id == AV_CODEC_ID_AV1;
-            const bool isQhdPlus = (w >= 2560) || (h >= 1440);
-            // h.264 1080p+ も対象 (cinemascope や ultra-wide 含めるため OR)。
-            // 1920×800 シネスコや 3840×800 ultra-wide も raw decode 負荷は
-            // 1080p に匹敵するので bandwidth 観点で OR の方が semantic に近い。
-            // single-track 編集なら直接 decode で問題ないが、PiP 4 並列の中に
-            // 1080p raw が混ざると compose に追いつかなくなり smooth な PiP
-            // source (proxy 360p) と並べたとき差が出る。MultiTrackOnly mode の
-            // videoTrackIdx >= 1 gate (下記 switch) が V1 単体編集を保護する
-            // ので過剰 encode は起きない。
-            const bool isHdPlus = (w >= 1920) || (h >= 1080);
-            if (isAv1 || isQhdPlus || isHdPlus)
-                wantsAutoProxy = true;
-        }
-        avformat_close_input(&fmt);
-    }
+    const TimelineMediaProbe mediaProbe = probeTimelineMedia(filePath);
+    const double duration = mediaProbe.durationSec;
+    const bool wantsAutoProxy = mediaProbe.wantsAutoProxy;
+    const bool videoStreamFound = mediaProbe.videoStreamFound;
+    const bool audioStreamFound = mediaProbe.audioStreamFound;
+    const bool openedOk = mediaProbe.openedOk;
+    const int capturedPrimaries = mediaProbe.primaries;
+    const int capturedTrc = mediaProbe.transferCharacteristic;
+    const int capturedBitDepth = mediaProbe.bitDepth;
+    const bool capturedHasHdrMeta = mediaProbe.hasHdrMetadata;
+    const bool capturedHasAlpha = mediaProbe.hasAlpha;
+    // ソース映像の素のピクセル寸法 (アスペクト既定フィット判定用)。0 = 未取得。
+    const int srcVideoW = mediaProbe.videoWidth;
+    const int srcVideoH = mediaProbe.videoHeight;
     // MCP (Auto / VideoOnly / AudioOnly) は開けないファイルを拒否して 0 秒クリップを
     // 作らない。GUI の LinkedPair は従来どおり (既存のセルフテストが仮ファイルを
     // addClip で置く前提を保つ)。
@@ -5336,6 +5375,268 @@ bool Timeline::setClipReversed(TrackKind kind, int trackIndex, int clipIndex,
     saveUndoState(QStringLiteral("逆再生"));
     updateInfoLabel();
     scheduleEmitSequenceChanged();
+    return true;
+}
+
+bool Timeline::matchFrame(double timelineSec, MatchFrameResult *result,
+                          QString *errorOut) const
+{
+    if (result)
+        *result = MatchFrameResult{};
+    if (errorOut)
+        errorOut->clear();
+    const auto fail = [errorOut](const QString &message) {
+        if (errorOut)
+            *errorOut = message;
+        return false;
+    };
+    if (!std::isfinite(timelineSec) || timelineSec < 0.0)
+        return fail(QStringLiteral("タイムライン時刻が不正です"));
+
+    QVector<int> trackOrder;
+    const auto appendTrack = [&trackOrder, this](int index) {
+        if (index >= 0 && index < m_videoTracks.size()
+            && m_videoTracks.at(index) && !trackOrder.contains(index)) {
+            trackOrder.append(index);
+        }
+    };
+
+    // 最後にユーザーが選択した動画トラックを最優先にし、選択情報が復元された
+    // 直後など active index が無い場合も selectedClip() から拾う。
+    if (m_activeVideoTrackIndex >= 0
+        && m_activeVideoTrackIndex < m_videoTracks.size()
+        && m_videoTracks.at(m_activeVideoTrackIndex)
+        && m_videoTracks.at(m_activeVideoTrackIndex)->selectedClip() >= 0) {
+        appendTrack(m_activeVideoTrackIndex);
+    }
+    for (int i = 0; i < m_videoTracks.size(); ++i) {
+        if (m_videoTracks.at(i) && m_videoTracks.at(i)->selectedClip() >= 0)
+            appendTrack(i);
+    }
+    appendTrack(0); // 選択トラックで見つからなければ V1。
+
+    constexpr double kEpsilon = 1e-9;
+    for (int trackIndex : std::as_const(trackOrder)) {
+        const TimelineTrack *track = m_videoTracks.at(trackIndex);
+        const QVector<ClipInfo> &clips = track->clips();
+        double cursor = 0.0;
+        for (int clipIndex = 0; clipIndex < clips.size(); ++clipIndex) {
+            const ClipInfo &clip = clips.at(clipIndex);
+            const double clipStart = cursor + qMax(0.0, clip.leadInSec);
+            const double clipDuration = qMax(0.0, clip.effectiveDuration());
+            const double clipEnd = clipStart + clipDuration;
+            if (timelineSec + kEpsilon >= clipStart
+                && timelineSec < clipEnd - kEpsilon) {
+                if (clip.filePath.isEmpty())
+                    return fail(QStringLiteral("クリップにソースファイルがありません"));
+                if (clip.isSequenceReference()) {
+                    return fail(QStringLiteral(
+                        "シーケンス参照はソースモニターで開けません"));
+                }
+                if (result) {
+                    result->filePath = clip.filePath;
+                    result->sourceSec = clip.sourceSecondAtLocalTime(
+                        qBound(0.0, timelineSec - clipStart, clipDuration));
+                    result->trackIndex = trackIndex;
+                    result->clipIndex = clipIndex;
+                }
+                return true;
+            }
+            cursor = clipEnd;
+        }
+    }
+
+    return fail(QStringLiteral("再生ヘッド位置に動画クリップがありません"));
+}
+
+bool Timeline::replaceClipMedia(TrackKind kind, int trackIndex, int clipIndex,
+                                const QString &newPath,
+                                const QString &newDisplayName,
+                                double newSourceDurationSec,
+                                QString *messageOut)
+{
+    if (messageOut)
+        messageOut->clear();
+    const auto fail = [messageOut](const QString &message) {
+        if (messageOut)
+            *messageOut = message;
+        return false;
+    };
+
+    const QFileInfo fileInfo(newPath);
+    if (newPath.isEmpty() || !fileInfo.exists() || !fileInfo.isFile())
+        return fail(QStringLiteral("ファイルが見つかりません: %1").arg(newPath));
+
+    TimelineTrack *targetTrack = trackAt(kind == TrackKind::Audio, trackIndex);
+    if (!targetTrack)
+        return fail(QStringLiteral("トラック番号が範囲外です"));
+    if (clipIndex < 0 || clipIndex >= targetTrack->clipCount())
+        return fail(QStringLiteral("クリップ番号が範囲外です"));
+    if (targetTrack->isLocked())
+        return fail(QStringLiteral("トラックがロックされています"));
+
+    const TimelineMediaProbe mediaProbe = probeTimelineMedia(newPath);
+    if (!mediaProbe.openedOk
+        || (!mediaProbe.videoStreamFound && !mediaProbe.audioStreamFound)) {
+        return fail(QStringLiteral("メディアとして開けません: %1").arg(newPath));
+    }
+    if (kind == TrackKind::Video && !mediaProbe.videoStreamFound)
+        return fail(QStringLiteral("映像ストリームがありません: %1").arg(newPath));
+    if (kind == TrackKind::Audio && !mediaProbe.audioStreamFound)
+        return fail(QStringLiteral("音声ストリームがありません: %1").arg(newPath));
+
+    const double sourceDuration = mediaProbe.durationSec > 0.0
+        ? mediaProbe.durationSec : newSourceDurationSec;
+    if (!std::isfinite(sourceDuration) || sourceDuration <= 0.0)
+        return fail(QStringLiteral("新しい素材の長さを取得できません"));
+
+    const QVector<ClipInfo> targetClips = targetTrack->clips();
+    const int linkGroup = targetClips.at(clipIndex).linkGroup;
+    const QString displayName = newDisplayName.isEmpty()
+        ? fileInfo.fileName() : newDisplayName;
+
+    const auto shouldReplace = [&](TimelineTrack *track, int index,
+                                   bool audioTrack) {
+        if (!track || index < 0 || index >= track->clipCount())
+            return false;
+        const bool isTarget = track == targetTrack && index == clipIndex;
+        const bool isLinked = linkGroup > 0
+            && track->clips().at(index).linkGroup == linkGroup;
+        if (!isTarget && !isLinked)
+            return false;
+        return audioTrack ? mediaProbe.audioStreamFound
+                          : mediaProbe.videoStreamFound;
+    };
+
+    bool linkedAudioLeftUnchanged = false;
+    if (linkGroup > 0 && !mediaProbe.audioStreamFound) {
+        for (TimelineTrack *audioTrack : std::as_const(m_audioTracks)) {
+            if (!audioTrack)
+                continue;
+            const auto &clips = audioTrack->clips();
+            linkedAudioLeftUnchanged = std::any_of(
+                clips.cbegin(), clips.cend(), [linkGroup](const ClipInfo &clip) {
+                    return clip.linkGroup == linkGroup;
+                });
+            if (linkedAudioLeftUnchanged)
+                break;
+        }
+    }
+
+    // 全対象を先に検証し、リンク相方がロック中・新素材が現在の inPoint より
+    // 短い場合は 1 つも変更しない。
+    const auto validateTracks = [&](const QVector<TimelineTrack *> &tracks,
+                                    bool audioTrack) {
+        for (TimelineTrack *track : tracks) {
+            if (!track)
+                continue;
+            const auto &clips = track->clips();
+            for (int i = 0; i < clips.size(); ++i) {
+                if (!shouldReplace(track, i, audioTrack))
+                    continue;
+                if (track->isLocked())
+                    return fail(QStringLiteral("リンクしたトラックがロックされています"));
+                if (sourceDuration <= clips.at(i).inPoint + 1e-9) {
+                    return fail(QStringLiteral(
+                        "新しい素材が現在のイン点 (%1 秒) より短いため置き換えできません")
+                                    .arg(clips.at(i).inPoint, 0, 'f', 3));
+                }
+            }
+        }
+        return true;
+    };
+    if (!validateTracks(m_videoTracks, false)
+        || !validateTracks(m_audioTracks, true)) {
+        return false;
+    }
+
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    TrackClipSnapshot remapSnapshot = snapBefore;
+    bool changed = false;
+    bool shortened = false;
+    double shortestTimelineDuration = std::numeric_limits<double>::infinity();
+    const auto replaceOnTracks = [&](const QVector<TimelineTrack *> &tracks,
+                                     bool audioTrack) {
+        for (TimelineTrack *track : tracks) {
+            if (!track)
+                continue;
+            QVector<ClipInfo> clips = track->clips();
+            bool trackChanged = false;
+            for (int i = 0; i < clips.size(); ++i) {
+                if (!shouldReplace(track, i, audioTrack))
+                    continue;
+
+                ClipInfo &clip = clips[i];
+                const double oldTimelineDuration = qMax(0.0, clip.effectiveDuration());
+                const double oldSourceOut = clip.outPoint > 0.0
+                    ? clip.outPoint : clip.duration;
+                const double oldSourceSpan = qMax(0.0, oldSourceOut - clip.inPoint);
+                const double requestedOut = clip.inPoint + oldSourceSpan;
+                const double replacementOut = qMin(requestedOut, sourceDuration);
+
+                clip.filePath = newPath;
+                clip.displayName = displayName;
+                clip.duration = sourceDuration;
+                clip.outPoint = replacementOut;
+                clip.sequenceRefId.clear();
+                clip.waveform = WaveformData{};
+
+                // ClipKeyId のfilePath も置き換わるため、古い識別子の
+                // まま remap すると位置が変わっていないマット/親子参照が
+                // 削除扱いになる。対象のみ新識別子に置き換えて、
+                // 従来の snapshot -> mutation -> remap 手順で同一 index へ写す。
+                if (!audioTrack) {
+                    const int videoTrackIndex = m_videoTracks.indexOf(track);
+                    if (videoTrackIndex >= 0
+                        && videoTrackIndex < remapSnapshot.size()
+                        && i < remapSnapshot[videoTrackIndex].size()) {
+                        remapSnapshot[videoTrackIndex][i].filePath = newPath;
+                    }
+                }
+
+                const double replacementTimelineDuration =
+                    qMax(0.0, clip.effectiveDuration());
+                const double lostDuration = qMax(
+                    0.0, oldTimelineDuration - replacementTimelineDuration);
+                if (lostDuration > 1e-9 && i + 1 < clips.size())
+                    clips[i + 1].leadInSec += lostDuration;
+                if (replacementOut + 1e-9 < requestedOut) {
+                    shortened = true;
+                    shortestTimelineDuration = qMin(
+                        shortestTimelineDuration, replacementTimelineDuration);
+                }
+                trackChanged = true;
+            }
+            if (trackChanged) {
+                track->setClips(clips);
+                changed = true;
+            }
+        }
+    };
+    replaceOnTracks(m_videoTracks, false);
+    replaceOnTracks(m_audioTracks, true);
+
+    if (!changed)
+        return fail(QStringLiteral("置き換え対象のクリップがありません"));
+
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, remapSnapshot);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, remapSnapshot);
+    saveUndoState(QStringLiteral("Replace clip media"));
+    updateInfoLabel();
+    scheduleEmitSequenceChanged();
+
+    QStringList warnings;
+    if (shortened) {
+        warnings.append(QStringLiteral(
+            "新しい素材が短いため、クリップを %1 秒に短縮しました。")
+                            .arg(shortestTimelineDuration, 0, 'f', 3));
+    }
+    if (linkedAudioLeftUnchanged) {
+        warnings.append(QStringLiteral(
+            "新しい素材に音声がないため、リンクした音声クリップは変更していません。"));
+    }
+    if (messageOut)
+        *messageOut = warnings.join(QLatin1Char(' '));
     return true;
 }
 
@@ -6571,6 +6872,7 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
         QAction *aCut = aMenu.addAction(QStringLiteral("カット"));
         QAction *aCopy = aMenu.addAction(QStringLiteral("コピー"));
         QAction *aDel = aMenu.addAction(QStringLiteral("削除"));
+        QAction *aReplace = aMenu.addAction(QStringLiteral("置き換え"));
         aMenu.addSeparator();
         QAction *aUnlink = aMenu.addAction(QStringLiteral("同期を切る"));
         aUnlink->setEnabled(aLinkGroup > 0);
@@ -6665,6 +6967,10 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
         if (aChosen == aCut) cutSelectedClip();
         else if (aChosen == aCopy) copySelectedClip();
         else if (aChosen == aDel) deleteSelectedClip();
+        else if (aChosen == aReplace) {
+            emit replaceClipRequested(TrackKind::Audio,
+                                      m_audioTracks.indexOf(track), clipIndex);
+        }
         else if (aChosen == aUnlink) unlinkClipGroup(aLinkGroup);
         else if (aChosen == aNormalize) {
             const int trackIdx = m_audioTracks.indexOf(track);
@@ -6723,6 +7029,7 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     QAction *cutAct = menu.addAction(QStringLiteral("カット"));
     QAction *copyAct = menu.addAction(QStringLiteral("コピー"));
     QAction *deleteAct = menu.addAction(QStringLiteral("削除"));
+    QAction *replaceAct = menu.addAction(QStringLiteral("置き換え"));
     QAction *freezeFrameAct = menu.addAction(QStringLiteral("フリーズフレームを追加"));
     auto playheadInsideClickedClip = [&]() {
         const auto &clips = track->clips();
@@ -6911,6 +7218,10 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     if (chosen == cutAct) cutSelectedClip();
     else if (chosen == copyAct) copySelectedClip();
     else if (chosen == deleteAct) deleteSelectedClip();
+    else if (chosen == replaceAct) {
+        emit replaceClipRequested(TrackKind::Video,
+                                  m_videoTracks.indexOf(track), clipIndex);
+    }
     else if (chosen == freezeFrameAct) freezeFrameAtPlayhead(track, clipIndex);
     else if (chosen == silenceCutAct) applySilenceCutToClip(track, clipIndex);
     else if (chosen == beatMarkerAct) applyBeatMarkersToClip(track, clipIndex);
