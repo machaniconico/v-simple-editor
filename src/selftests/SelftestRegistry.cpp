@@ -77,6 +77,7 @@ int runCredentialVaultSelftest();
 int runDavinciSelftest();
 int runDolbyVisionSelftest();
 int runDvTimelineSelftest();
+int runDynzoomSelftest();
 int runEdlExportSelftest();
 int runE2eSelftest();
 int runEasingSelftest();
@@ -644,6 +645,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "ExposureAids: luma709 oracle + False Color zones + Zebra stripe period + Focus Peaking edge/threshold + dimension/OOB safety (11 gates)" },
     { "import-ingest",      "VEDITOR_IMPORT_INGEST_SELFTEST",      runImportIngestSelftest,        false,
       "ImportHub ingest previews: mesh wireframe determinism + empty placeholder (QApplication-free)" },
+    { "dynzoom",           "VEDITOR_DYNZOOM_SELFTEST",           runDynzoomSelftest,             false,
+      "Dynamic Zoom pure builder: identity, zoom/pan direction, clamping, and clip-time endpoints (5 gates)" },
     { "layer-style",        "VEDITOR_LAYER_STYLE_SELFTEST",        runLayerStyleSelftest,          false,
       "LayerStyle: identity fast path, drop shadow, stroke, and project JSON omission/round-trip" },
     { "layer-style-ui",     "VEDITOR_LAYER_STYLE_UI_SELFTEST",     runLayerStyleUiSelftest,       true,
@@ -744,7 +747,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "transcript-highlighter", "VEDITOR_TRANSCRIPT_HIGHLIGHTER_SELFTEST", runTranscriptHighlighterSelftest, true,
       "Transcript highlighter scaffold smoke" },
     { "mcp",              "VEDITOR_MCP_SELFTEST",                runMcpSelftest,                true,
-      "MCP server: JSON-RPC framing + tool registry dispatch + HTTP transport auth + write-tool validation + AI chat helpers (124 gates)" },
+      "MCP server: JSON-RPC framing + tool registry dispatch + HTTP transport auth + write-tool validation + AI chat helpers (127 gates)" },
     { "auto-clip-gen",     "VEDITOR_AUTO_CLIP_GEN_SELFTEST",      runAutoClipGenSelftest,        true,
       "Auto clip generator scaffold smoke" },
     { "planar",            "VEDITOR_PLANAR_SELFTEST",             runPlanarSelftest,             true,

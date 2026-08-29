@@ -2,6 +2,7 @@
 
 #include "McpToolRegistry.h"
 #include "../CaptionEditorDialog.h"
+#include "../DynamicZoom.h"
 #include "../MainWindow.h"
 #include "../RenderQueue.h"
 #include "../TimelineFrameRenderer.h"
@@ -597,6 +598,100 @@ bool readClipTarget(const QJsonObject& args, MainWindow* window,
     }
 
     return setError(err, QStringLiteral("clip index is out of range"));
+}
+
+QJsonObject dynamicZoomRectSchema()
+{
+    return schemaWithRequired(QJsonObject{
+        {QStringLiteral("cx"), QJsonObject{
+            {QStringLiteral("type"), QStringLiteral("number")},
+            {QStringLiteral("minimum"), 0.0},
+            {QStringLiteral("maximum"), 1.0}
+        }},
+        {QStringLiteral("cy"), QJsonObject{
+            {QStringLiteral("type"), QStringLiteral("number")},
+            {QStringLiteral("minimum"), 0.0},
+            {QStringLiteral("maximum"), 1.0}
+        }},
+        {QStringLiteral("w"), QJsonObject{
+            {QStringLiteral("type"), QStringLiteral("number")},
+            {QStringLiteral("exclusiveMinimum"), 0.0},
+            {QStringLiteral("maximum"), 1.0}
+        }},
+        {QStringLiteral("h"), QJsonObject{
+            {QStringLiteral("type"), QStringLiteral("number")},
+            {QStringLiteral("exclusiveMinimum"), 0.0},
+            {QStringLiteral("maximum"), 1.0}
+        }}
+    }, {QStringLiteral("cx"), QStringLiteral("cy"),
+        QStringLiteral("w"), QStringLiteral("h")});
+}
+
+bool readDynamicZoomRect(const QJsonObject& args, const QString& name,
+                         dynzoom::Rect *out, QString* err)
+{
+    const QJsonValue value = args.value(name);
+    if (!value.isObject())
+        return setError(err, QStringLiteral("%1 must be an object").arg(name));
+    const QJsonObject object = value.toObject();
+    if (!rejectUnknownArguments(
+            object,
+            {QStringLiteral("cx"), QStringLiteral("cy"),
+             QStringLiteral("w"), QStringLiteral("h")}, err)) {
+        return false;
+    }
+
+    dynzoom::Rect rect;
+    if (!requiredFiniteNumber(object, QStringLiteral("cx"), &rect.cx, err)
+        || !requiredFiniteNumber(object, QStringLiteral("cy"), &rect.cy, err)
+        || !requiredFiniteNumber(object, QStringLiteral("w"), &rect.w, err)
+        || !requiredFiniteNumber(object, QStringLiteral("h"), &rect.h, err)) {
+        return false;
+    }
+    if (rect.cx < 0.0 || rect.cx > 1.0
+        || rect.cy < 0.0 || rect.cy > 1.0) {
+        return setError(err, QStringLiteral("%1 cx/cy must be in range [0, 1]")
+                                 .arg(name));
+    }
+    if (rect.w <= 0.0 || rect.h <= 0.0
+        || rect.w > 1.0 || rect.h > 1.0) {
+        return setError(err, QStringLiteral("%1 w/h must be in range (0, 1]")
+                                 .arg(name));
+    }
+    if (out)
+        *out = rect;
+    return true;
+}
+
+bool dynamicZoomPresetFrames(const QString& preset, dynzoom::Rect *start,
+                             dynzoom::Rect *end)
+{
+    dynzoom::Rect first = dynzoom::presetRect(dynzoom::Preset::Full);
+    dynzoom::Rect last = first;
+    if (preset == QStringLiteral("zoomIn")) {
+        last = dynzoom::presetRect(dynzoom::Preset::ZoomIn);
+    } else if (preset == QStringLiteral("zoomOut")) {
+        first = dynzoom::presetRect(dynzoom::Preset::ZoomOut);
+    } else if (preset == QStringLiteral("panLeft")) {
+        first = dynzoom::presetRect(dynzoom::Preset::PanRight);
+        last = dynzoom::presetRect(dynzoom::Preset::PanLeft);
+    } else if (preset == QStringLiteral("panRight")) {
+        first = dynzoom::presetRect(dynzoom::Preset::PanLeft);
+        last = dynzoom::presetRect(dynzoom::Preset::PanRight);
+    } else if (preset == QStringLiteral("panUp")) {
+        first = dynzoom::presetRect(dynzoom::Preset::PanDown);
+        last = dynzoom::presetRect(dynzoom::Preset::PanUp);
+    } else if (preset == QStringLiteral("panDown")) {
+        first = dynzoom::presetRect(dynzoom::Preset::PanUp);
+        last = dynzoom::presetRect(dynzoom::Preset::PanDown);
+    } else {
+        return false;
+    }
+    if (start)
+        *start = first;
+    if (end)
+        *end = last;
+    return true;
 }
 
 bool requiredString(const QJsonObject& args, const QString& name,
@@ -1538,6 +1633,26 @@ void McpEditorTools::registerWriteTools()
         {QStringLiteral("linkedApplied"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}}
     }, {QStringLiteral("ok"), QStringLiteral("property"),
         QStringLiteral("value")});
+
+    const QJsonObject dynamicZoomOutputSchema = outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("kind"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
+        {QStringLiteral("trackIndex"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+        {QStringLiteral("clipIndex"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+        {QStringLiteral("keyframeCount"), QJsonObject{
+            {QStringLiteral("type"), QStringLiteral("integer")},
+            {QStringLiteral("minimum"), 0}
+        }},
+        {QStringLiteral("keyframeCounts"), outputSchemaOf(QJsonObject{
+            {QStringLiteral("positionX"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+            {QStringLiteral("positionY"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+            {QStringLiteral("scaleX"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+            {QStringLiteral("scaleY"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}}
+        }, {QStringLiteral("positionX"), QStringLiteral("positionY"),
+            QStringLiteral("scaleX"), QStringLiteral("scaleY")})}
+    }, {QStringLiteral("ok"), QStringLiteral("kind"),
+        QStringLiteral("trackIndex"), QStringLiteral("clipIndex"),
+        QStringLiteral("keyframeCount"), QStringLiteral("keyframeCounts")});
 
     const QJsonObject setClipLabelOutputSchema = outputSchemaOf(QJsonObject{
         {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
@@ -2619,6 +2734,137 @@ void McpEditorTools::registerWriteTools()
             };
         })
     }, setClipPropertyOutputSchema));
+
+    QJsonObject dynamicZoomInputSchema = schemaWithRequired(
+        mergedProperties(clipProperties, QJsonObject{
+            {QStringLiteral("preset"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("string")},
+                {QStringLiteral("enum"), QJsonArray{
+                    QStringLiteral("zoomIn"), QStringLiteral("zoomOut"),
+                    QStringLiteral("panLeft"), QStringLiteral("panRight"),
+                    QStringLiteral("panUp"), QStringLiteral("panDown")
+                }},
+                {QStringLiteral("description"),
+                 QStringLiteral("プリセット。start/end と同時には指定できない")}
+            }},
+            {QStringLiteral("start"), dynamicZoomRectSchema()},
+            {QStringLiteral("end"), dynamicZoomRectSchema()},
+            {QStringLiteral("easing"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("string")},
+                {QStringLiteral("enum"), QJsonArray{
+                    QStringLiteral("linear"), QStringLiteral("easeInOut")
+                }},
+                {QStringLiteral("default"), QStringLiteral("easeInOut")}
+            }}
+        }), {QStringLiteral("clipIndex")});
+    dynamicZoomInputSchema.insert(QStringLiteral("oneOf"), QJsonArray{
+        QJsonObject{{QStringLiteral("required"),
+                     QJsonArray{QStringLiteral("preset")}}},
+        QJsonObject{{QStringLiteral("required"),
+                     QJsonArray{QStringLiteral("start"), QStringLiteral("end")}}}
+    });
+    m_registry->registerTool(withOutputSchema({
+        QStringLiteral("dynamic_zoom"),
+        QStringLiteral("指定動画クリップへダイナミックズームを適用し、位置とスケールに開始・終了キーフレームを生成する。preset または start/end のどちらかを指定する。1 回の undo で元に戻せる。"),
+        dynamicZoomInputSchema,
+        guardedWrite(QStringLiteral("dynamic_zoom"),
+                     [this](const QJsonObject& args, QString* err) -> QJsonObject {
+            if (!rejectUnknownArguments(
+                    args,
+                    {QStringLiteral("kind"), QStringLiteral("trackIndex"),
+                     QStringLiteral("clipIndex"), QStringLiteral("preset"),
+                     QStringLiteral("start"), QStringLiteral("end"),
+                     QStringLiteral("easing")}, err)) {
+                return {};
+            }
+
+            const bool hasPreset = args.contains(QStringLiteral("preset"));
+            const bool hasStart = args.contains(QStringLiteral("start"));
+            const bool hasEnd = args.contains(QStringLiteral("end"));
+            if (hasPreset && (hasStart || hasEnd)) {
+                return setError(err, QStringLiteral("preset and start/end cannot be combined")),
+                       QJsonObject();
+            }
+            if (!hasPreset && !(hasStart && hasEnd)) {
+                return setError(err, QStringLiteral("preset or both start and end are required")),
+                       QJsonObject();
+            }
+            if (!hasPreset && hasStart != hasEnd) {
+                return setError(err, QStringLiteral("start and end must be specified together")),
+                       QJsonObject();
+            }
+
+            dynzoom::Rect start;
+            dynzoom::Rect end;
+            if (hasPreset) {
+                QString preset;
+                if (!requiredString(args, QStringLiteral("preset"), &preset, err))
+                    return {};
+                if (!dynamicZoomPresetFrames(preset, &start, &end)) {
+                    return setError(err, QStringLiteral("preset is not a valid dynamic zoom preset")),
+                           QJsonObject();
+                }
+            } else if (!readDynamicZoomRect(args, QStringLiteral("start"), &start, err)
+                       || !readDynamicZoomRect(args, QStringLiteral("end"), &end, err)) {
+                return {};
+            }
+
+            dynzoom::Easing easing = dynzoom::Easing::EaseInOut;
+            if (args.contains(QStringLiteral("easing"))) {
+                QString easingName;
+                if (!requiredString(args, QStringLiteral("easing"), &easingName, err))
+                    return {};
+                if (easingName == QStringLiteral("linear"))
+                    easing = dynzoom::Easing::Linear;
+                else if (easingName != QStringLiteral("easeInOut"))
+                    return setError(err, QStringLiteral("easing must be linear or easeInOut")),
+                           QJsonObject();
+            }
+
+            ClipTarget target;
+            Timeline *currentTimeline = timeline();
+            if (!readClipTarget(args, m_window, currentTimeline, &target, err))
+                return {};
+            if (target.audio)
+                return setError(err, QStringLiteral("dynamic_zoom supports video clips only")),
+                       QJsonObject();
+            if (target.track->isLocked())
+                return setError(err, QStringLiteral("track is locked")), QJsonObject();
+            if (!currentTimeline->applyDynamicZoom(
+                    TrackKind::Video, target.trackIndex, target.clipIndex,
+                    start, end, easing)) {
+                return setError(err, QStringLiteral("dynamic zoom update failed")),
+                       QJsonObject();
+            }
+
+            m_window->setWindowModified(true);
+            syncSelectionAfterEdit();
+            const KeyframeManager& keyframes =
+                target.track->clips().at(target.clipIndex).keyframes;
+            const auto trackCount = [&keyframes](const QString& property) {
+                const KeyframeTrack *track = keyframes.track(property);
+                return track ? track->count() : 0;
+            };
+            const QJsonObject counts{
+                {QStringLiteral("positionX"), trackCount(QStringLiteral("positionX"))},
+                {QStringLiteral("positionY"), trackCount(QStringLiteral("positionY"))},
+                {QStringLiteral("scaleX"), trackCount(QStringLiteral("scaleX"))},
+                {QStringLiteral("scaleY"), trackCount(QStringLiteral("scaleY"))}
+            };
+            return QJsonObject{
+                {QStringLiteral("ok"), true},
+                {QStringLiteral("kind"), QStringLiteral("video")},
+                {QStringLiteral("trackIndex"), target.trackIndex},
+                {QStringLiteral("clipIndex"), target.clipIndex},
+                {QStringLiteral("keyframeCount"),
+                 counts.value(QStringLiteral("positionX")).toInt()
+                     + counts.value(QStringLiteral("positionY")).toInt()
+                     + counts.value(QStringLiteral("scaleX")).toInt()
+                     + counts.value(QStringLiteral("scaleY")).toInt()},
+                {QStringLiteral("keyframeCounts"), counts}
+            };
+        })
+    }, dynamicZoomOutputSchema));
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("set_clip_label"),

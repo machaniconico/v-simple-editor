@@ -4,6 +4,7 @@
 #include "UndoTrace.h"
 #include "AutoColor.h"
 #include "VersionedSave.h"
+#include "DynamicZoomDialog.h"
 
 // AR-2: レガシー Exporter 経路へ ACES 色管理パイプラインを渡すフリー関数。実体は
 // Exporter.cpp に TU ローカル状態とともに定義 (Exporter.h は touchedFiles 外のため
@@ -5862,6 +5863,12 @@ void MainWindow::setupMenuBar()
     connect(transformKfAction, &QAction::triggered, this, &MainWindow::editTransformKeyframes);
     m_menuHelpEntries.append({transformKfAction,
         QStringLiteral("位置・大きさ・回転を時間に沿って変化させ、動くアニメーションを作ります。")});
+
+    auto *dynamicZoomAction = compMenu->addAction(QStringLiteral("ダイナミックズーム…"));
+    connect(dynamicZoomAction, &QAction::triggered,
+            this, &MainWindow::openDynamicZoom);
+    m_menuHelpEntries.append({dynamicZoomAction,
+        QStringLiteral("開始枠と終了枠を指定し、パンやズームのキーフレームを一度に作成します。")});
 
     auto *maskAction = compMenu->addAction("マスク追加...");
     connect(maskAction, &QAction::triggered, this, &MainWindow::addMask);
@@ -13561,6 +13568,33 @@ void MainWindow::editTransformKeyframes()
 
     statusBar()->showMessage(QString("Set keyframe: %1 = %2 at %3s")
         .arg(prop).arg(value).arg(time, 0, 'f', 1));
+}
+
+void MainWindow::openDynamicZoom()
+{
+    int trackIndex = -1;
+    int clipIndex = -1;
+    if (!selectedVideoClipRef(trackIndex, clipIndex)) {
+        QMessageBox::information(this, QStringLiteral("ダイナミックズーム"),
+                                 QStringLiteral("動画クリップを選択してください。"));
+        return;
+    }
+
+    DynamicZoomDialog dialog(this);
+    if (dialog.exec() != QDialog::Accepted)
+        return;
+    if (!m_timeline->applyDynamicZoom(
+            TrackKind::Video, trackIndex, clipIndex,
+            dialog.startRect(), dialog.endRect(), dialog.easing())) {
+        QMessageBox::warning(this, QStringLiteral("ダイナミックズーム"),
+                             QStringLiteral("ダイナミックズームを適用できませんでした。クリップまたはトラックの状態を確認してください。"));
+        return;
+    }
+
+    setWindowModified(true);
+    statusBar()->showMessage(
+        QStringLiteral("ダイナミックズームを適用しました（8 キーフレーム）"),
+        3000);
 }
 
 void MainWindow::addMask()

@@ -21,6 +21,7 @@
 #include <utility>
 #include "VideoEffect.h"
 #include "Keyframe.h"
+#include "DynamicZoom.h"
 #include "WaveformGenerator.h"
 #include "TextManager.h"
 #include "PlaybackTypes.h"
@@ -850,6 +851,11 @@ public:
                                     const QVector<VideoEffect> &effects,
                                     const KeyframeManager &km);
     void setClipKeyframes(const KeyframeManager &km);
+    bool setClipKeyframes(TrackKind kind, int trackIndex, int clipIndex,
+                          const KeyframeManager &km);
+    bool applyDynamicZoom(TrackKind kind, int trackIndex, int clipIndex,
+                          const dynzoom::Rect& start, const dynzoom::Rect& end,
+                          dynzoom::Easing easing);
     ColorCorrection clipColorCorrection() const;
     LayerStyle clipLayerStyle() const;
     LayerStyle clipLayerStyle(int trackIdx, int clipIdx) const;

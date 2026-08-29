@@ -12,6 +12,7 @@
 #include "UndoTrace.h"
 #include "UndoManager.h"
 #include "AudioMixer.h"
+#include "DynamicZoom.h"
 #include "OverlayDialogs.h"
 #include "ProjectFile.h"
 #include "WaveformGenerator.h"
@@ -7628,12 +7629,90 @@ void Timeline::setClipEffectsAndKeyframes(int trackIdx, int clipIdx,
 
 void Timeline::setClipKeyframes(const KeyframeManager &km)
 {
+    if (!m_videoTrack)
+        return;
     int sel = m_videoTrack->selectedClip();
-    if (sel < 0) return;
-    auto clips = m_videoTrack->clips();
-    clips[sel].keyframes = km;
-    m_videoTrack->setClips(clips);
-    saveUndoState("Keyframes");
+    if (sel < 0)
+        return;
+    setClipKeyframes(TrackKind::Video, 0, sel, km);
+}
+
+bool Timeline::setClipKeyframes(TrackKind kind, int trackIndex, int clipIndex,
+                                const KeyframeManager &km)
+{
+    if (kind != TrackKind::Video)
+        return false;
+    TimelineTrack *track = trackAt(false, trackIndex);
+    if (!track)
+        return false;
+    QVector<ClipInfo> clips = track->clips();
+    if (clipIndex < 0 || clipIndex >= clips.size())
+        return false;
+    clips[clipIndex].keyframes = km;
+    track->setClips(clips);
+    saveUndoState(QStringLiteral("Keyframes"));
+    scheduleEmitSequenceChanged();
+    return true;
+}
+
+bool Timeline::applyDynamicZoom(TrackKind kind, int trackIndex, int clipIndex,
+                                const dynzoom::Rect& start,
+                                const dynzoom::Rect& end,
+                                dynzoom::Easing easing)
+{
+    if (kind != TrackKind::Video)
+        return false;
+    TimelineTrack *track = trackAt(false, trackIndex);
+    if (!track || track->isLocked())
+        return false;
+
+    QVector<ClipInfo> clips = track->clips();
+    if (clipIndex < 0 || clipIndex >= clips.size())
+        return false;
+    const double duration = clips.at(clipIndex).effectiveDuration();
+    if (!std::isfinite(duration) || duration <= 0.0)
+        return false;
+    const auto validRect = [](const dynzoom::Rect& rect) {
+        return std::isfinite(rect.cx) && std::isfinite(rect.cy)
+            && std::isfinite(rect.w) && std::isfinite(rect.h)
+            && rect.w > 0.0 && rect.h > 0.0;
+    };
+    if (!validRect(start) || !validRect(end))
+        return false;
+
+    const dynzoom::Result generated = dynzoom::build(
+        start, end, 0.0, duration, easing);
+    KeyframeManager keyframes = clips.at(clipIndex).keyframes;
+    keyframes.addTrack(generated.positionX);
+    keyframes.addTrack(generated.positionY);
+    keyframes.addTrack(generated.scaleX);
+    keyframes.addTrack(generated.scaleY);
+
+    // The current preview/export evaluator consumes the motion.* names while
+    // Dynamic Zoom's public tracks use TransformAnimator property names.
+    // Mirrored tracks keep the authored API stable and make the animation play
+    // through the existing ClipGeometry pipeline.
+    const auto mirroredTrack = [](const KeyframeTrack& source,
+                                  const QString& propertyName) {
+        KeyframeTrack mirror(propertyName, source.defaultValue());
+        for (const KeyframePoint& point : source.keyframes()) {
+            mirror.addKeyframe(point.time, point.value, point.interpolation,
+                               point.bezX1, point.bezY1,
+                               point.bezX2, point.bezY2,
+                               point.hasSpatialTangent,
+                               point.spatialOutX, point.spatialOutY,
+                               point.spatialInX, point.spatialInY);
+        }
+        return mirror;
+    };
+    keyframes.addTrack(mirroredTrack(
+        generated.positionX, QStringLiteral("motion.position.x")));
+    keyframes.addTrack(mirroredTrack(
+        generated.positionY, QStringLiteral("motion.position.y")));
+    keyframes.addTrack(mirroredTrack(
+        generated.scaleX, QStringLiteral("motion.scale")));
+
+    return setClipKeyframes(kind, trackIndex, clipIndex, keyframes);
 }
 
 ColorCorrection Timeline::clipColorCorrection() const

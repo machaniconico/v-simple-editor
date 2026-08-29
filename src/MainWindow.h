@@ -368,6 +368,7 @@ private slots:
     void addTextAnimation();
     void addBrushAnimation();
     void editTransformKeyframes();
+    void openDynamicZoom();
     void addMask();
     void applyWarpEffect();
     void editExpressions();

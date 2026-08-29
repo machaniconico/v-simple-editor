@@ -130,6 +130,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/TextSpacingSelftest.cpp
     src/selftests/VersionedSaveSelftest.cpp
     src/selftests/tcburn_selftest.cpp
+    src/selftests/dynzoom_selftest.cpp
 
     # PRD-SPLIT-MAIN-3 Phase 3-A: libavcore-backed selftests (moved from src/main.cpp).
     src/selftests/libavcore_selftests.cpp
@@ -156,6 +157,10 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/util/CrashHandler.cpp
     src/util/Logger.cpp
     src/util/RcPause.h
+    src/DynamicZoom.h
+    src/DynamicZoom.cpp
+    src/DynamicZoomDialog.h
+    src/DynamicZoomDialog.cpp
     src/MainWindow.cpp
     src/VideoPlayer.cpp
     src/Timeline.cpp
