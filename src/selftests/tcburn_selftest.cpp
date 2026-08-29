@@ -1,4 +1,6 @@
 #include "../TimecodeBurnIn.h"
+#include "../Exporter.h"
+#include "../Timeline.h"
 
 #include <QImage>
 #include <QIODevice>
@@ -181,6 +183,93 @@ int runTcburnSelftest()
                    QStringLiteral("showFrames=false emits HH:MM:SS only"))
             : fail(QStringLiteral("G5"),
                    QStringLiteral("frame field remained in the display text"));
+    }
+
+    {
+        Timeline timeline;
+        while (timeline.videoTracks().size() < 2)
+            timeline.addVideoTrack();
+
+        ClipInfo v1Clip;
+        v1Clip.displayName = QStringLiteral("V1 front");
+        v1Clip.duration = 1.25;
+        v1Clip.outPoint = 1.25;
+        v1Clip.speed = 1.0;
+
+        ClipInfo v2Clip = v1Clip;
+        v2Clip.displayName = QStringLiteral("V2 back");
+        v2Clip.duration = 2.0;
+        v2Clip.outPoint = 2.0;
+        timeline.videoTracks().at(0)->setClips(QVector<ClipInfo>{v1Clip});
+        timeline.videoTracks().at(1)->setClips(QVector<ClipInfo>{v2Clip});
+
+        TimecodeBurnInSettings settings;
+        settings.enabled = true;
+        settings.showClipName = true;
+        TimecodeBurnInRenderer renderer(settings);
+        const QString clipName = timecodeBurnInClipNameAt(&timeline, 1.0);
+        const QString text = renderer.displayText(1.0, 30.0, clipName);
+        const QString v2OnlyName = timecodeBurnInClipNameAt(&timeline, 1.5);
+        const bool v1Selected = clipName == QStringLiteral("V1 front")
+            && text.endsWith(QStringLiteral("V1 front"))
+            && !text.contains(QStringLiteral("V2 back"))
+            && v2OnlyName == QStringLiteral("V2 back");
+        v1Selected
+            ? pass(QStringLiteral("G6"),
+                   QStringLiteral("showClipName selects overlapping frontmost V1"))
+            : fail(QStringLiteral("G6"),
+                   QStringLiteral("overlapping V2 was selected ahead of V1"));
+    }
+
+    {
+        constexpr int frameWidth = 160;
+        constexpr int frameHeight = 90;
+        QImage rgb(frameWidth, frameHeight, QImage::Format_RGB888);
+        rgb.fill(qRgb(40, 80, 120));
+        const QImage beforeBurnIn = rgb.copy();
+
+        TimecodeBurnInSettings settings;
+        settings.enabled = true;
+        settings.fontSizePct = 8;
+        settings.opacity = 1.0;
+        TimecodeBurnInRenderer renderer(settings);
+        {
+            QPainter painter(&rgb);
+            renderer.paintOnto(painter, QRectF(rgb.rect()), 1.0, 30.0);
+        }
+
+        AVFrame *outputFrame = av_frame_alloc();
+        bool bufferAllocated = false;
+        if (outputFrame) {
+            outputFrame->format = AV_PIX_FMT_YUV420P10LE;
+            outputFrame->width = frameWidth;
+            outputFrame->height = frameHeight;
+            outputFrame->colorspace = AVCOL_SPC_BT709;
+            outputFrame->color_range = AVCOL_RANGE_MPEG;
+            bufferAllocated = av_frame_get_buffer(outputFrame, 32) >= 0;
+        }
+
+        const int originalFormat = outputFrame
+            ? outputFrame->format : AV_PIX_FMT_NONE;
+        const int originalWidth = outputFrame ? outputFrame->width : 0;
+        const int originalHeight = outputFrame ? outputFrame->height : 0;
+        const bool converted = bufferAllocated
+            && exporterframe::convertRgbImageToFrame(
+                rgb, outputFrame, /*configureColorMatrix=*/true);
+        const bool framePreserved = converted
+            && outputFrame->format == originalFormat
+            && outputFrame->width == originalWidth
+            && outputFrame->height == originalHeight
+            && outputFrame->data[0] && outputFrame->data[1]
+            && outputFrame->data[2]
+            && !imagesEqual(beforeBurnIn, rgb);
+        av_frame_free(&outputFrame);
+
+        framePreserved
+            ? pass(QStringLiteral("G7"),
+                   QStringLiteral("YUV420P10 burn-in preserves frame format and size"))
+            : fail(QStringLiteral("G7"),
+                   QStringLiteral("YUV420P10 RGB round-trip failed or changed metadata"));
     }
 
     err << "summary: " << passed << " PASS, " << failed << " FAIL\n";

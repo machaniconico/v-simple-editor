@@ -11,6 +11,7 @@
 
 class SmartReframe;
 class SubtitleTrackRenderer;
+class QImage;
 
 // ===========================================================================
 // LEGACY — bypasses the SSOT edit graph; do not use for new code.
@@ -36,6 +37,16 @@ extern "C" {
 #include <libswscale/swscale.h>
 #include <libswresample/swresample.h>
 }
+
+namespace exporterframe {
+
+// Stateless RGB24 -> encoder-frame conversion shared by every legacy RGB
+// overlay/effect path. The caller owns an allocated outputFrame; its format,
+// dimensions, and colour metadata are preserved and define the swscale target.
+bool convertRgbImageToFrame(const QImage &image, AVFrame *outputFrame,
+                            bool configureColorMatrix);
+
+} // namespace exporterframe
 
 class Exporter : public QObject
 {

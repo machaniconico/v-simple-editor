@@ -9,6 +9,7 @@
 #include "color/SwsColorParams.h"
 #include "playback/swsmatrix_flag.h"
 #include <QFileInfo>
+#include <QImage>
 #include <QMutex>
 #include <QMutexLocker>
 #include <QPainter>
@@ -88,6 +89,83 @@ bool scaleFrameToQImagePadded(SwsContext *ctx,
     av_freep(&tmpData[0]);
     return true;
 }
+}
+
+bool exporterframe::convertRgbImageToFrame(const QImage &image,
+                                           AVFrame *outputFrame,
+                                           bool configureColorMatrix)
+{
+    if (image.isNull() || !outputFrame || outputFrame->width <= 0
+        || outputFrame->height <= 0 || !outputFrame->data[0]) {
+        return false;
+    }
+
+    const AVPixelFormat outputFormat =
+        static_cast<AVPixelFormat>(outputFrame->format);
+    if (outputFormat == AV_PIX_FMT_NONE)
+        return false;
+
+    const QImage rgbImage = image.format() == QImage::Format_RGB888
+        ? image
+        : image.convertToFormat(QImage::Format_RGB888);
+    if (rgbImage.isNull())
+        return false;
+
+    SwsContext *toOutputCtx = sws_getContext(
+        rgbImage.width(), rgbImage.height(), AV_PIX_FMT_RGB24,
+        outputFrame->width, outputFrame->height, outputFormat,
+        SWS_BILINEAR, nullptr, nullptr, nullptr);
+    if (!toOutputCtx)
+        return false;
+
+    if (configureColorMatrix) {
+        const AVColorSpace dstCs = swscolor::resolveColorspace(
+            outputFrame->colorspace, outputFrame->width, outputFrame->height);
+        const AVColorRange dstRange =
+            swscolor::resolveRange(outputFrame->color_range);
+        int *currentInvTable = nullptr;
+        int *currentTable = nullptr;
+        int currentSrcRange = 0;
+        int currentDstRange = 0;
+        int brightness = 0;
+        int contrast = 0;
+        int saturation = 0;
+        if (sws_getColorspaceDetails(toOutputCtx, &currentInvTable,
+                                     &currentSrcRange, &currentTable,
+                                     &currentDstRange, &brightness,
+                                     &contrast, &saturation) >= 0) {
+            const int *srcCoeffs = sws_getCoefficients(SWS_CS_DEFAULT);
+            const int *dstCoeffs =
+                sws_getCoefficients(swscolor::swsCoeffsId(dstCs));
+            if (srcCoeffs && dstCoeffs) {
+                (void)sws_setColorspaceDetails(
+                    toOutputCtx, srcCoeffs, 1, dstCoeffs,
+                    dstRange == AVCOL_RANGE_JPEG ? 1 : 0,
+                    brightness, contrast, saturation);
+            }
+        }
+    }
+
+    if (av_frame_make_writable(outputFrame) < 0) {
+        sws_freeContext(toOutputCtx);
+        return false;
+    }
+
+    const uint8_t *rgbData[4] = {
+        rgbImage.constBits(), nullptr, nullptr, nullptr
+    };
+    const int rgbLinesize[4] = {
+        static_cast<int>(rgbImage.bytesPerLine()), 0, 0, 0
+    };
+    const int scaledHeight = sws_scale(
+        toOutputCtx, rgbData, rgbLinesize, 0, rgbImage.height(),
+        outputFrame->data, outputFrame->linesize);
+    sws_freeContext(toOutputCtx);
+    if (scaledHeight != outputFrame->height)
+        return false;
+
+    fillOpaqueAlphaPlane(outputFrame);
+    return true;
 }
 
 // MainWindow.cpp から extern 宣言で参照される。
@@ -417,7 +495,10 @@ void Exporter::doExport(
 
             av_frame_make_writable(outFrame);
 
-            // 10-bit outputs (HDR10 / HLG / ProRes) bypass the 8-bit RGB24 effect round-trip.
+            // Traditional effects and ACES stay off on the 10-bit path. RGB
+            // overlays may still run there, and the shared conversion below
+            // restores the encoder's actual pixel format rather than assuming
+            // an 8-bit planar layout.
             const bool tenBitPath = isHdr10Mode || isHlgMode || config.proresProfile >= 0;
             bool hasEffects = !tenBitPath
                               && (!clip.colorCorrection.isDefault() || !clip.effects.isEmpty());
@@ -571,7 +652,7 @@ void Exporter::doExport(
                 // AR-2: ACES シーンリファード色管理を最終 RGB フレームへ適用する。
                 // enabled=false (既定) のときは一切呼ばず、従来出力とビット同一を維持
                 // (回帰ゼロ)。applyPipelineToImage は RGBA8888 を返すため、後段の
-                // RGB24->YUV420P 変換に合わせて RGB888 へ戻す。プレビューは
+                // RGB24->encoder pixel format 変換に合わせて RGB888 へ戻す。プレビューは
                 // VideoPlayer::displayFrame でのみ適用するので二重適用しない。
                 if (acesActive && !workingImage.isNull()) {
                     QImage acesOut = aces::applyPipelineToImage(
@@ -579,51 +660,12 @@ void Exporter::doExport(
                     workingImage = acesOut.convertToFormat(QImage::Format_RGB888);
                 }
 
-                // Convert processed RGB back to YUV420P
-                SwsContext *toYuvCtx = sws_getContext(
-                    workingImage.width(), workingImage.height(), AV_PIX_FMT_RGB24,
-                    config.width, config.height, AV_PIX_FMT_YUV420P,
-                    SWS_BILINEAR, nullptr, nullptr, nullptr);
-                if (swscolor::matrixEnabledFromEnv() && toYuvCtx) {
-                    AVColorSpace dstCs = AVCOL_SPC_UNSPECIFIED;
-                    AVColorRange dstRange = AVCOL_RANGE_UNSPECIFIED;
-                    if (isHdr10Mode || isHlgMode) {
-                        dstCs = swscolor::resolveColorspace(
-                            outFrame->colorspace, config.width, config.height);
-                        dstRange = swscolor::resolveRange(outFrame->color_range);
-                    } else {
-                        const swscolor::SdrTags t =
-                            swscolor::sdrTagsFor(config.width, config.height);
-                        dstCs = t.spc;
-                        dstRange = t.range;
-                    }
-                    int *currentInvTable = nullptr;
-                    int *currentTable = nullptr;
-                    int currentSrcRange = 0;
-                    int currentDstRange = 0;
-                    int brightness = 0;
-                    int contrast = 0;
-                    int saturation = 0;
-                    if (sws_getColorspaceDetails(toYuvCtx, &currentInvTable,
-                                                  &currentSrcRange, &currentTable,
-                                                  &currentDstRange, &brightness,
-                                                  &contrast, &saturation) >= 0) {
-                        const int *srcCoeffs = sws_getCoefficients(SWS_CS_DEFAULT);
-                        const int *dstCoeffs =
-                            sws_getCoefficients(swscolor::swsCoeffsId(dstCs));
-                        if (srcCoeffs && dstCoeffs) {
-                            (void)sws_setColorspaceDetails(
-                                toYuvCtx, srcCoeffs, 1, dstCoeffs,
-                                dstRange == AVCOL_RANGE_JPEG ? 1 : 0,
-                                brightness, contrast, saturation);
-                        }
-                    }
+                if (!exporterframe::convertRgbImageToFrame(
+                        workingImage, outFrame,
+                        swscolor::matrixEnabledFromEnv())) {
+                    m_cancelled = true;
+                    return;
                 }
-                const uint8_t *rgbSrc[1] = { workingImage.constBits() };
-                int rgbSrcLinesize[1] = { static_cast<int>(workingImage.bytesPerLine()) };
-                sws_scale(toYuvCtx, rgbSrc, rgbSrcLinesize, 0, workingImage.height(),
-                          outFrame->data, outFrame->linesize);
-                sws_freeContext(toYuvCtx);
             } else {
                 sws_scale(swsCtx, frame->data, frame->linesize, 0, frame->height,
                           outFrame->data, outFrame->linesize);

@@ -245,7 +245,9 @@ QString timecodeBurnInClipNameAt(const Timeline *timeline, double timelineSec)
         return {};
 
     const auto &tracks = timeline->videoTracks();
-    for (int trackIndex = tracks.size() - 1; trackIndex >= 0; --trackIndex) {
+    // The compositor paints higher-numbered tracks first and V1/index 0 last,
+    // so the first visible hit in ascending index order is the frontmost clip.
+    for (int trackIndex = 0; trackIndex < tracks.size(); ++trackIndex) {
         const TimelineTrack *track = tracks.at(trackIndex);
         if (!track || track->isHidden())
             continue;
