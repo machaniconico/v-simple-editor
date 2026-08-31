@@ -140,6 +140,18 @@ QImage prepareEchoClipForComposite(
     return prepareClipForCpuComposite(
         source, clip, clipLocalSeconds, sourceSeconds, frameProvider, masks);
 }
+
+bool shouldApplyCanvasPreviewStack(const QVector<VideoEffect> &evaluated,
+                                   bool gpuAvailable,
+                                   bool clipFxHandledPerClip,
+                                   bool sequencePlayback)
+{
+    if (evaluated.isEmpty() || clipFxHandledPerClip)
+        return false;
+    if (!sequencePlayback)
+        return true;
+    return !stackRequiresClipLocalCpu(evaluated, gpuAvailable);
+}
 } // namespace videopreview
 
 QImage VideoPlayer::composeCpuPreviewForTest(
@@ -3997,13 +4009,24 @@ QImage VideoPlayer::composeFrameWithOverlays(const QImage &source,
     // Every active layer was already graded and FX-processed when the frame
     // took the clip-local CPU path. Reapplying the selected stack here would
     // duplicate it and leak it into sibling tracks.
-    const QVector<VideoEffect> previewEffects =
+    QVector<VideoEffect> previewEffects =
         wantsPreviewFx && !clipFxHandledPerClip
         ? effectivePreviewEffectsAt(cpuPreviewStack,
                                     m_glPreview ? m_glPreview->timeline() : nullptr,
                                     m_sequence,
                                     previewTimelineUsec)
         : QVector<VideoEffect>();
+    // A clip-local stack whose target entry is inactive at this time must not
+    // fall back to the canvas either: FilmGrain would cover sibling tracks and
+    // Echo would silently no-op. shouldApplyCanvasPreviewStack keeps the
+    // single-file legacy path unchanged.
+    const bool canvasGpuAvailable =
+        m_gpuEffectsEnabled && m_useGL && m_glPreview;
+    if (!videopreview::shouldApplyCanvasPreviewStack(
+            previewEffects, canvasGpuAvailable, clipFxHandledPerClip,
+            sequenceActive())) {
+        previewEffects.clear();
+    }
     const bool applyPreviewFx = !previewEffects.isEmpty();
 
     // Preview proxy: only shrink during playback, keep paused frames full-res.

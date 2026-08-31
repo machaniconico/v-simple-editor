@@ -96,6 +96,16 @@ namespace videopreview {
 // ordered stack must run on the clip before mask/transform/composition.
 bool stackRequiresClipLocalCpu(const QVector<VideoEffect> &effects,
                                bool gpuAvailable = true);
+// Canvas-level transient preview may only apply stacks that are NOT defined to
+// run clip-locally. During sequence playback a clip-local stack is either
+// already baked per clip (clipFxHandledPerClip) or belongs to a clip that is
+// not visible at the current time, so applying it to the composited canvas
+// would leak FX onto sibling tracks. Single-file playback keeps the legacy
+// canvas semantics.
+bool shouldApplyCanvasPreviewStack(const QVector<VideoEffect> &evaluated,
+                                   bool gpuAvailable,
+                                   bool clipFxHandledPerClip,
+                                   bool sequencePlayback);
 // Pure clip-local preview seam used before layer transform/composition. It is
 // public so headless parity tests can exercise the production VideoPlayer
 // ordering without constructing QWidget/QApplication state.

@@ -532,6 +532,37 @@ int runFxGrainEchoSelftest()
         "translucent Lighten preserves alpha and applies decay once",
         translucentLightenValid, passed, failed);
 
+    // G15: the canvas-level transient preview must refuse clip-local stacks
+    // during sequence playback (inactive target would leak FilmGrain onto the
+    // composited canvas and silently no-op Echo), while the single-file legacy
+    // path and canvas-safe stacks stay applied.
+    const QVector<VideoEffect> grainStack{
+        VideoEffect::createFilmGrain(0.45, 2, 0.3, true)};
+    const QVector<VideoEffect> echoStack{
+        VideoEffect::createEcho(0.1, 3, 0.5, 2)};
+    const QVector<VideoEffect> gpuSafeStack{VideoEffect::createBlur(4)};
+    const bool canvasRoutingValid =
+        !videopreview::shouldApplyCanvasPreviewStack(
+            grainStack, /*gpuAvailable=*/true,
+            /*clipFxHandledPerClip=*/false, /*sequencePlayback=*/true)
+        && !videopreview::shouldApplyCanvasPreviewStack(
+               echoStack, true, false, true)
+        && !videopreview::shouldApplyCanvasPreviewStack(
+               gpuSafeStack, true, /*clipFxHandledPerClip=*/true, true)
+        && !videopreview::shouldApplyCanvasPreviewStack(
+               gpuSafeStack, /*gpuAvailable=*/false, false,
+               /*sequencePlayback=*/true)
+        && videopreview::shouldApplyCanvasPreviewStack(
+               grainStack, true, false, /*sequencePlayback=*/false)
+        && videopreview::shouldApplyCanvasPreviewStack(
+               gpuSafeStack, true, false, true)
+        && !videopreview::shouldApplyCanvasPreviewStack(
+               QVector<VideoEffect>(), true, false, false);
+    reportGate(
+        "G15",
+        "clip-local preview stacks never fall back to the canvas in sequences",
+        canvasRoutingValid, passed, failed);
+
     std::cerr << "summary: " << passed << " PASS, " << failed << " FAIL\n";
     return failed;
 }
