@@ -688,7 +688,9 @@ private:
     void hideWelcomeScreen();
     void loadMediaFile(const QString &filePath, bool addToTimeline, const QString &statusPrefix);
     bool saveProjectToPath(const QString &filePath, QString *errorMessage = nullptr);
-    bool openProjectFromPath(const QString &filePath, QString *errorMessage = nullptr);
+    bool openProjectFromPath(const QString &filePath,
+                             QString *errorMessage = nullptr,
+                             bool promptForMissingMedia = true);
     void updateStatusInfo();
     void updateAcesUiState();
     void updateEditActions();
@@ -710,6 +712,7 @@ private:
     void applyLoadedProjectData(const ProjectData &data, const QString &filePath);
     void collectAudioState(ProjectData &data);
     void applyAudioState(const ProjectData &data);
+    bool m_promptForMissingMedia = true;
     static QString brushClipId(int trackIdx, int clipIdx);
     static QString particleClipKey(const ClipInfo &clip);
     bool selectedVideoClipRef(int &trackIdx, int &clipIdx, ClipInfo *clip = nullptr) const;

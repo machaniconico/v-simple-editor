@@ -5,6 +5,8 @@
 #include "AutoColor.h"
 #include "VersionedSave.h"
 #include "DynamicZoomDialog.h"
+#include "MediaPaths.h"
+#include "MediaRelinkDialog.h"
 
 // AR-2: レガシー Exporter 経路へ ACES 色管理パイプラインを渡すフリー関数。実体は
 // Exporter.cpp に TU ローカル状態とともに定義 (Exporter.h は touchedFiles 外のため
@@ -26,6 +28,7 @@ double exporter_loudnessGainDb();
 #include "EffectClipboard.h"
 #include "PasteAttributesDialog.h"
 #include <QDockWidget>
+#include <QScopedValueRollback>
 #include <QVariant>
 #include "AiChatDock.h"
 #include "mcp/McpConnectionInfoDialog.h"
@@ -8070,8 +8073,26 @@ void MainWindow::applyVfxProjectState(const ProjectVfxState &state)
     preview->setLightWrap(state.lightWrap.enabled, state.lightWrap.amount, state.lightWrap.radius);
 }
 
-void MainWindow::applyLoadedProjectData(const ProjectData &data, const QString &filePath)
+void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
+                                        const QString &filePath)
 {
+    ProjectData data = loadedData;
+    const ProjectTrackClips originalVideoTracks = loadedData.videoTracks;
+    const ProjectTrackClips originalAudioTracks = loadedData.audioTracks;
+    const QVector<ClipParentEntry> originalClipParentEntries =
+        loadedData.clipParentEntries;
+    QHash<QString, QString> relinkMapping;
+    if (m_promptForMissingMedia) {
+        const QStringList missing = mediapaths::missingFiles(data);
+        if (!missing.isEmpty()) {
+            MediaRelinkDialog dialog(missing, this);
+            if (dialog.exec() == QDialog::Accepted) {
+                relinkMapping = dialog.mapping();
+                mediapaths::replacePaths(data, relinkMapping);
+            }
+        }
+    }
+
     if (m_light3DDialog)
         m_light3DDialog->close();
     m_projectFilePath = filePath;
@@ -8099,7 +8120,9 @@ void MainWindow::applyLoadedProjectData(const ProjectData &data, const QString &
     // SSOT renderer (preview AND export) sources it from the Timeline.
     syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
     QHash<QString, QString> parentEntries;
-    for (const auto &entry : data.clipParentEntries) {
+    const QVector<ClipParentEntry> &timelineParentEntries = relinkMapping.isEmpty()
+        ? data.clipParentEntries : originalClipParentEntries;
+    for (const auto &entry : timelineParentEntries) {
         if (!entry.clipId.isEmpty() && !entry.parentClipId.isEmpty()
             && entry.clipId != entry.parentClipId) {
             parentEntries.insert(entry.clipId, entry.parentClipId);
@@ -8155,7 +8178,9 @@ void MainWindow::applyLoadedProjectData(const ProjectData &data, const QString &
     }
     if (m_timeline) {
         m_timeline->restoreGeneratedCaptionOverlays(data.generatedCaptionOverlays);
-        m_timeline->restoreFromProject(data.videoTracks, data.audioTracks,
+        m_timeline->restoreFromProject(
+            relinkMapping.isEmpty() ? data.videoTracks : originalVideoTracks,
+            relinkMapping.isEmpty() ? data.audioTracks : originalAudioTracks,
                                        data.playheadPos, data.markIn, data.markOut, data.zoomLevel);
         syncTimeRemapEntriesToTimeline(m_timeline, m_timeRemapClipEntries);
     }
@@ -8276,6 +8301,10 @@ void MainWindow::applyLoadedProjectData(const ProjectData &data, const QString &
         m_timeline->undoManager()->clear();
         m_timeline->undoManager()->saveState(m_timeline->currentState(),
                                              QStringLiteral("Project loaded"));
+    }
+    if (m_timeline && !relinkMapping.isEmpty()) {
+        QString relinkError;
+        m_timeline->relinkMediaPaths(relinkMapping, &relinkError);
     }
 
     updateTitle();
@@ -8546,7 +8575,9 @@ bool MainWindow::selectedClipRef(TrackKind &kind, int &trackIdx, int &clipIdx,
     return false;
 }
 
-bool MainWindow::openProjectFromPath(const QString &filePath, QString *errorMessage)
+bool MainWindow::openProjectFromPath(const QString &filePath,
+                                     QString *errorMessage,
+                                     bool promptForMissingMedia)
 {
     const QString path = filePath.trimmed();
     if (path.isEmpty()) {
@@ -8570,6 +8601,8 @@ bool MainWindow::openProjectFromPath(const QString &filePath, QString *errorMess
 
     // MCP 経路では未保存変更を確認ダイアログなしで破棄し、指定されたプロジェクトを
     // 開く。確認モーダルを出すと MCP 呼び出しが応答待ちのまま詰まるためである。
+    const QScopedValueRollback<bool> promptGuard(
+        m_promptForMissingMedia, promptForMissingMedia);
     applyLoadedProjectData(data, path);
     setWindowModified(false);
     return true;

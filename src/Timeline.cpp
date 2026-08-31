@@ -5,6 +5,7 @@
 #include "VideoPlayer.h"
 #include "SilenceCut.h"
 #include "BeatDetect.h"
+#include "ClipGeometry.h"
 #include "ThreePointEdit.h"
 #include "TrimOps.h"
 #include "TrackMatteKey.h"
@@ -5672,6 +5673,116 @@ bool Timeline::replaceClipMedia(TrackKind kind, int trackIndex, int clipIndex,
     }
     if (messageOut)
         *messageOut = warnings.join(QLatin1Char(' '));
+    return true;
+}
+
+bool Timeline::relinkMediaPaths(const QHash<QString, QString> &oldToNew,
+                                QString *errorOut)
+{
+    if (errorOut)
+        errorOut->clear();
+    const auto fail = [errorOut](const QString &message) {
+        if (errorOut)
+            *errorOut = message;
+        return false;
+    };
+    if (oldToNew.isEmpty())
+        return fail(QStringLiteral("mapping が空です"));
+
+    for (auto it = oldToNew.cbegin(); it != oldToNew.cend(); ++it) {
+        if (timeline_nesting::isSequenceClipFilePath(it.key())
+            || clipgeom::isNullObjectFilePath(it.key())) {
+            return fail(QStringLiteral("内部メディア参照は再リンクできません: %1")
+                            .arg(it.key()));
+        }
+        const QFileInfo destination(it.value());
+        if (it.key().isEmpty() || it.value().isEmpty()
+            || !destination.exists() || !destination.isFile()) {
+            return fail(QStringLiteral("ファイルが見つかりません: %1")
+                            .arg(it.value()));
+        }
+    }
+
+    syncActiveSequenceFromCurrentTracks();
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    TrackClipSnapshot remapSnapshot = snapBefore;
+    bool changed = false;
+
+    const auto relinkClip = [&oldToNew, &changed](ClipInfo &clip) {
+        const auto media = oldToNew.constFind(clip.filePath);
+        if (media != oldToNew.cend() && media.value() != clip.filePath) {
+            clip.filePath = media.value();
+            changed = true;
+        }
+        const auto lut = oldToNew.constFind(clip.lutFilePath);
+        if (lut != oldToNew.cend() && lut.value() != clip.lutFilePath) {
+            clip.lutFilePath = lut.value();
+            changed = true;
+        }
+    };
+
+    for (int trackIndex = 0; trackIndex < m_videoTracks.size(); ++trackIndex) {
+        TimelineTrack *track = m_videoTracks.at(trackIndex);
+        if (!track)
+            continue;
+        QVector<ClipInfo> clips = track->clips();
+        bool trackChanged = false;
+        for (int clipIndex = 0; clipIndex < clips.size(); ++clipIndex) {
+            const QString oldFilePath = clips.at(clipIndex).filePath;
+            const QString oldLutPath = clips.at(clipIndex).lutFilePath;
+            relinkClip(clips[clipIndex]);
+            if (clips.at(clipIndex).filePath != oldFilePath
+                || clips.at(clipIndex).lutFilePath != oldLutPath) {
+                trackChanged = true;
+            }
+            if (clips.at(clipIndex).filePath != oldFilePath
+                && trackIndex < remapSnapshot.size()
+                && clipIndex < remapSnapshot[trackIndex].size()) {
+                remapSnapshot[trackIndex][clipIndex].filePath =
+                    clips.at(clipIndex).filePath;
+            }
+        }
+        if (trackChanged)
+            track->setClips(clips);
+    }
+
+    for (TimelineTrack *track : std::as_const(m_audioTracks)) {
+        if (!track)
+            continue;
+        QVector<ClipInfo> clips = track->clips();
+        bool trackChanged = false;
+        for (ClipInfo &clip : clips) {
+            const QString oldFilePath = clip.filePath;
+            const QString oldLutPath = clip.lutFilePath;
+            relinkClip(clip);
+            trackChanged = trackChanged || clip.filePath != oldFilePath
+                || clip.lutFilePath != oldLutPath;
+        }
+        if (trackChanged)
+            track->setClips(clips);
+    }
+
+    if (m_sequenceModelEnabled) {
+        for (TimelineSequence &sequence : m_sequences) {
+            for (auto &track : sequence.videoTracks) {
+                for (ClipInfo &clip : track)
+                    relinkClip(clip);
+            }
+            for (auto &track : sequence.audioTracks) {
+                for (ClipInfo &clip : track)
+                    relinkClip(clip);
+            }
+        }
+    }
+
+    if (!changed)
+        return fail(QStringLiteral("置換対象のメディア参照がありません"));
+
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, remapSnapshot);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, remapSnapshot);
+    saveUndoState(QStringLiteral("メディアを再リンク"));
+    updateInfoLabel();
+    scheduleEmitSequenceChanged();
     return true;
 }
 

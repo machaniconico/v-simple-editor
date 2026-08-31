@@ -772,6 +772,7 @@ int runMcpSelftest()
         QStringLiteral("set_track_locked"),
         QStringLiteral("match_frame"),
         QStringLiteral("replace_clip"),
+        QStringLiteral("relink_media"),
         QStringLiteral("set_clip_property"),
         QStringLiteral("dynamic_zoom"),
         QStringLiteral("set_clip_label"),
@@ -1068,6 +1069,7 @@ int runMcpSelftest()
         QStringLiteral("split_clip"), QStringLiteral("delete_clip"),
         QStringLiteral("move_clip"), QStringLiteral("set_track_locked"),
         QStringLiteral("match_frame"), QStringLiteral("replace_clip"),
+        QStringLiteral("relink_media"),
         QStringLiteral("set_clip_property"), QStringLiteral("dynamic_zoom"),
         QStringLiteral("set_clip_label"),
         QStringLiteral("trim_clip"), QStringLiteral("set_transition"),
@@ -1098,6 +1100,13 @@ int runMcpSelftest()
         {QStringLiteral("replace_clip"), QJsonObject{
             {QStringLiteral("clipIndex"), 0},
             {QStringLiteral("filePath"), QStringLiteral("missing.mp4")},
+            {QStringLiteral("track"), QStringLiteral("video")}
+        }},
+        {QStringLiteral("relink_media"), QJsonObject{
+            {QStringLiteral("mapping"), QJsonArray{
+                QJsonObject{{QStringLiteral("from"), QStringLiteral("old.mp4")},
+                            {QStringLiteral("to"), QStringLiteral("new.mp4")}}
+            }},
             {QStringLiteral("track"), QStringLiteral("video")}
         }},
         {QStringLiteral("set_clip_property"), QJsonObject{
@@ -1176,7 +1185,7 @@ int runMcpSelftest()
             rpcRequest(73, QStringLiteral("tools/list")))))
         .value(QStringLiteral("result")).toObject()
         .value(QStringLiteral("tools")).toArray();
-    constexpr int kExpectedProjectInfoToolCount = 33;
+    constexpr int kExpectedProjectInfoToolCount = 34;
     bool outputSchemasDeclared = projectInfoToolDescriptors.size()
         == kExpectedProjectInfoToolCount;
     for (const QJsonValue& value : projectInfoToolDescriptors) {
@@ -2387,6 +2396,91 @@ int runMcpSelftest()
              QStringLiteral("Timeline was not available"));
         fail("G134 dynamic_zoom rejects preset with start/end",
              QStringLiteral("Timeline was not available"));
+    }
+
+    QTemporaryDir relinkMediaDir;
+    const QString relinkOldPath = relinkMediaDir.isValid()
+        ? QDir(relinkMediaDir.path()).filePath(QStringLiteral("offline.mp4"))
+        : QString();
+    const QString relinkNewPath = relinkMediaDir.isValid()
+        ? QDir(relinkMediaDir.path()).filePath(QStringLiteral("online.mp4"))
+        : QString();
+    TimelineTrack *relinkVideoTrack = timelineReady
+        ? projectTimeline->trackAt(false, 0) : nullptr;
+    TimelineTrack *relinkAudioTrack = timelineReady
+        ? projectTimeline->trackAt(true, 0) : nullptr;
+    const bool relinkFixtureReady = relinkVideoTrack && relinkAudioTrack
+        && importSourceReady && relinkMediaDir.isValid()
+        && QFile::copy(importSourcePath, relinkNewPath);
+    if (relinkFixtureReady) {
+        ClipInfo relinkVideoClip = makeTestClip(relinkOldPath, 935);
+        relinkVideoClip.linkGroup = 935;
+        ClipInfo relinkAudioClip = relinkVideoClip;
+        relinkVideoTrack->setClips({relinkVideoClip});
+        relinkAudioTrack->setClips({relinkAudioClip});
+        projectTimeline->clearSelection();
+        projectTimeline->undoManager()->clear();
+        projectTimeline->undoManager()->saveState(
+            projectTimeline->currentState(),
+            QStringLiteral("MCP relink media baseline"));
+
+        const QJsonArray mapping{
+            QJsonObject{
+                {QStringLiteral("from"), relinkOldPath},
+                {QStringLiteral("to"), relinkNewPath}
+            }
+        };
+        const QJsonObject relinkResponse = callProjectInfoTool(
+            244, QStringLiteral("relink_media"), QJsonObject{
+                {QStringLiteral("mapping"), mapping}
+            });
+        const bool g135 = !toolResult(relinkResponse)
+                                .value(QStringLiteral("isError")).toBool(true)
+            && toolPayload(relinkResponse).value(QStringLiteral("ok")).toBool(false)
+            && toolPayload(relinkResponse).value(QStringLiteral("relinked")).toInt() == 1
+            && relinkVideoTrack->clips().size() == 1
+            && relinkAudioTrack->clips().size() == 1
+            && relinkVideoTrack->clips().first().filePath == relinkNewPath
+            && relinkAudioTrack->clips().first().filePath == relinkNewPath
+            && relinkVideoTrack->clips().first().linkGroup == 935
+            && relinkAudioTrack->clips().first().linkGroup == 935;
+        g135 ? pass("G135 relink_media applies a valid mapping")
+             : fail("G135 relink_media applies a valid mapping",
+                    QStringLiteral("valid mapping did not update the linked clips"));
+
+        const QString invalidDestination = QDir(relinkMediaDir.path())
+            .filePath(QStringLiteral("missing.mp4"));
+        const QJsonObject invalidRelinkResponse = callProjectInfoTool(
+            245, QStringLiteral("relink_media"), QJsonObject{
+                {QStringLiteral("mapping"), QJsonArray{
+                    QJsonObject{
+                        {QStringLiteral("from"), relinkNewPath},
+                        {QStringLiteral("to"), invalidDestination}
+                    }
+                }}
+            });
+        const bool g136 = toolResult(invalidRelinkResponse)
+                                .value(QStringLiteral("isError")).toBool(false)
+            && toolErrorText(invalidRelinkResponse).contains(
+                   QStringLiteral("ファイルが見つかりません"))
+            && relinkVideoTrack->clips().first().filePath == relinkNewPath
+            && relinkAudioTrack->clips().first().filePath == relinkNewPath;
+        g136 ? pass("G136 relink_media rejects a missing destination")
+             : fail("G136 relink_media rejects a missing destination",
+                    QStringLiteral("missing destination was accepted or mutated clips"));
+
+        relinkVideoTrack->setClips({});
+        relinkAudioTrack->setClips({});
+        projectTimeline->clearSelection();
+        projectTimeline->undoManager()->clear();
+        projectTimeline->undoManager()->saveState(
+            projectTimeline->currentState(),
+            QStringLiteral("MCP selftest baseline"));
+    } else {
+        const QString reason = QStringLiteral(
+            "Timeline or relink media fixture was not available");
+        fail("G135 relink_media applies a valid mapping", reason);
+        fail("G136 relink_media rejects a missing destination", reason);
     }
 
     TimelineTrack *replaceVideoTrack = timelineReady
@@ -3935,6 +4029,12 @@ int runMcpSelftest()
         {QStringLiteral("replace_clip"), QJsonObject{
             {QStringLiteral("clipIndex"), 0},
             {QStringLiteral("filePath"), QStringLiteral("missing.mp4")}
+        }},
+        {QStringLiteral("relink_media"), QJsonObject{
+            {QStringLiteral("mapping"), QJsonArray{
+                QJsonObject{{QStringLiteral("from"), QStringLiteral("old.mp4")},
+                            {QStringLiteral("to"), QStringLiteral("new.mp4")}}
+            }}
         }},
         {QStringLiteral("set_clip_property"), QJsonObject{
             {QStringLiteral("clipIndex"), 0}, {QStringLiteral("property"), QStringLiteral("volume")},

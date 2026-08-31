@@ -1638,6 +1638,11 @@ void McpEditorTools::registerWriteTools()
         {QStringLiteral("warning"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}}
     }, {QStringLiteral("ok")});
 
+    const QJsonObject relinkMediaOutputSchema = outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("relinked"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}}
+    }, {QStringLiteral("ok"), QStringLiteral("relinked")});
+
     const QJsonObject setClipPropertyOutputSchema = outputSchemaOf(QJsonObject{
         {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
         {QStringLiteral("property"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
@@ -2288,7 +2293,8 @@ void McpEditorTools::registerWriteTools()
                 return setError(err, QStringLiteral("editor not available")), QJsonObject();
 
             QString openError;
-            if (!m_window->openProjectFromPath(path, &openError))
+            if (!m_window->openProjectFromPath(
+                    path, &openError, /*promptForMissingMedia=*/false))
                 return setError(err, openError), QJsonObject();
             return QJsonObject{
                 {QStringLiteral("ok"), true},
@@ -2764,6 +2770,76 @@ void McpEditorTools::registerWriteTools()
             return response;
         })
     }, replaceClipOutputSchema));
+
+    m_registry->registerTool(withOutputSchema({
+        QStringLiteral("relink_media"),
+        QStringLiteral("見つからないメディアまたは LUT のパスを一括で再リンクする。mapping の全 to が実在するファイルの場合だけ変更し、active / nested sequence を 1 回の undo で更新する。"),
+        schemaWithRequired(QJsonObject{
+            {QStringLiteral("mapping"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("array")},
+                {QStringLiteral("minItems"), 1},
+                {QStringLiteral("items"), schemaWithRequired(QJsonObject{
+                    {QStringLiteral("from"), QJsonObject{
+                        {QStringLiteral("type"), QStringLiteral("string")}
+                    }},
+                    {QStringLiteral("to"), QJsonObject{
+                        {QStringLiteral("type"), QStringLiteral("string")}
+                    }}
+                }, {QStringLiteral("from"), QStringLiteral("to")})}
+            }}
+        }, {QStringLiteral("mapping")}),
+        guardedWrite(QStringLiteral("relink_media"),
+                     [this](const QJsonObject& args, QString* err) -> QJsonObject {
+            if (!rejectUnknownArguments(args, {QStringLiteral("mapping")}, err))
+                return {};
+            const QJsonValue mappingValue = args.value(QStringLiteral("mapping"));
+            if (!mappingValue.isArray() || mappingValue.toArray().isEmpty()) {
+                return setError(err, QStringLiteral("mapping must be a non-empty array")),
+                       QJsonObject();
+            }
+
+            QHash<QString, QString> mapping;
+            const QJsonArray entries = mappingValue.toArray();
+            for (int index = 0; index < entries.size(); ++index) {
+                if (!entries.at(index).isObject()) {
+                    return setError(err, QStringLiteral("mapping[%1] must be an object")
+                                             .arg(index)),
+                           QJsonObject();
+                }
+                const QJsonObject entry = entries.at(index).toObject();
+                if (!rejectUnknownArguments(
+                        entry, {QStringLiteral("from"), QStringLiteral("to")}, err)) {
+                    return {};
+                }
+                QString from;
+                QString to;
+                if (!requiredString(entry, QStringLiteral("from"), &from, err)
+                    || !requiredString(entry, QStringLiteral("to"), &to, err)) {
+                    return {};
+                }
+                if (from.isEmpty() || to.isEmpty()) {
+                    return setError(err, QStringLiteral("mapping[%1] from/to must not be empty")
+                                             .arg(index)),
+                           QJsonObject();
+                }
+                mapping.insert(from, to);
+            }
+
+            Timeline *currentTimeline = timeline();
+            if (!m_window || !currentTimeline)
+                return setError(err, QStringLiteral("editor not available")), QJsonObject();
+            QString relinkError;
+            if (!currentTimeline->relinkMediaPaths(mapping, &relinkError))
+                return setError(err, relinkError), QJsonObject();
+
+            m_window->setWindowModified(true);
+            syncSelectionAfterEdit();
+            return QJsonObject{
+                {QStringLiteral("ok"), true},
+                {QStringLiteral("relinked"), mapping.size()}
+            };
+        })
+    }, relinkMediaOutputSchema));
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("set_clip_property"),

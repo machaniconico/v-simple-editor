@@ -678,6 +678,10 @@ public:
                           const QString &newDisplayName,
                           double newSourceDurationSec,
                           QString *messageOut = nullptr);
+    // 参照切れメディアの一括再リンク。filePath と lutFilePath を active / nested
+    // sequence 全体で置換し、マット・親子 carrier を維持したまま 1 Undo にまとめる。
+    bool relinkMediaPaths(const QHash<QString, QString> &oldToNew,
+                          QString *errorOut = nullptr);
     bool setClipLabel(TrackKind kind, int trackIndex, int clipIndex, ClipLabel label);
     bool selectClipByIndex(bool audio, int trackIndex, int clipIndex, QString *err);
     void clearSelection();

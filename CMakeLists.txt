@@ -470,6 +470,10 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/AIUpscale.cpp
     src/FrameInterpolator.cpp
     src/ProjectFile.cpp
+    src/MediaPaths.h
+    src/MediaPaths.cpp
+    src/MediaRelinkDialog.h
+    src/MediaRelinkDialog.cpp
     src/ProjectCollector.cpp
     src/ProjectCollector.h
     src/ProjectCollectorDialog.h
@@ -537,6 +541,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/whisper_transcribe_selftest.cpp
     src/selftests/transcript_highlighter_selftest.cpp
     src/selftests/transcript_highlighter_offline_selftest.cpp
+    src/selftests/media_relink_selftest.cpp
     src/selftests/mcp_selftest.cpp
     src/MotionTracker.cpp
     src/MotionTrackerDialog.h

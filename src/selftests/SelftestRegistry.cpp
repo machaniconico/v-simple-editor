@@ -120,6 +120,7 @@ int runLowerThirdSelftest();
 int runMatte16ParitySelftest();
 int runMediaPoolDragSelftest();
 int runMediaPoolSelftest();
+int runMediaRelinkSelftest();
 int runMobileSelftest();
 int runMographSelftest();
 int runMotionBlurP2Selftest();
@@ -746,8 +747,10 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Single-word caption builder, V1 bulk apply/undo, persistence, and renderer boundary gates" },
     { "transcript-highlighter", "VEDITOR_TRANSCRIPT_HIGHLIGHTER_SELFTEST", runTranscriptHighlighterSelftest, true,
       "Transcript highlighter scaffold smoke" },
+    { "media-relink",     "VEDITOR_MEDIA_RELINK_SELFTEST",       runMediaRelinkSelftest,         true,
+      "Offline media path enumeration, nested sequences, undo-safe relink, and persistence (5 gates)" },
     { "mcp",              "VEDITOR_MCP_SELFTEST",                runMcpSelftest,                true,
-      "MCP server: JSON-RPC framing + tool registry dispatch + HTTP transport auth + write-tool validation + AI chat helpers (134 gates)" },
+      "MCP server: JSON-RPC framing + tool registry dispatch + HTTP transport auth + write-tool validation + AI chat helpers (136 gates)" },
     { "auto-clip-gen",     "VEDITOR_AUTO_CLIP_GEN_SELFTEST",      runAutoClipGenSelftest,        true,
       "Auto clip generator scaffold smoke" },
     { "planar",            "VEDITOR_PLANAR_SELFTEST",             runPlanarSelftest,             true,
