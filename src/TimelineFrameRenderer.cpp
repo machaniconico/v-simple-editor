@@ -738,23 +738,35 @@ QImage applyClipFxPackWithEcho(const QImage &graded, const ClipInfo &clip,
             QVector<QImage> echoes;
             echoes.reserve(count);
 
+            // Tolerate the floating-point noise of localSeconds - i*delaySec
+            // (e.g. 0.3 - 3*0.1 == -5.6e-17): a sample landing exactly on the
+            // clip head or the source bounds is still valid.
+            constexpr double kEchoBoundaryEps = 1e-9;
             for (int i = 1; i <= count; ++i) {
                 // Echo delay is clip-local time. Mapping t-i*delay through the
                 // clip handles reverse playback, speed ramps, and time remap;
                 // a reversed clip naturally resolves to a larger source PTS.
-                const double sampleLocalSec = localSeconds - i * delaySec;
-                if (sampleLocalSec < 0.0)
+                // The caller's currentSourceSeconds anchors the samples: when
+                // its mapping differs from the shared ClipInfo mapper (the
+                // ramp-less legacy export mapping), the echoes shift with the
+                // base frame instead of drifting onto a different time axis.
+                // With matching mappings the delta is exactly zero.
+                double sampleLocalSec = localSeconds - i * delaySec;
+                if (sampleLocalSec < -kEchoBoundaryEps)
                     break;
+                sampleLocalSec = qMax(0.0, sampleLocalSec);
                 const double sourceOut =
                     clip.outPoint > 0.0 ? clip.outPoint : clip.duration;
                 const bool hasSourceBounds = sourceOut > clip.inPoint;
                 const double sampleSourceSec = hasSourceBounds
-                    ? clip.sourceSecondAtLocalTime(sampleLocalSec)
+                    ? currentSourceSeconds
+                        + (clip.sourceSecondAtLocalTime(sampleLocalSec)
+                           - clip.sourceSecondAtLocalTime(localSeconds))
                     : currentSourceSeconds
                         + (clip.reversed ? 1.0 : -1.0) * i * delaySec;
                 if (hasSourceBounds
-                    && (sampleSourceSec < clip.inPoint
-                        || sampleSourceSec > sourceOut)) {
+                    && (sampleSourceSec < clip.inPoint - kEchoBoundaryEps
+                        || sampleSourceSec > sourceOut + kEchoBoundaryEps)) {
                     continue;
                 }
 
