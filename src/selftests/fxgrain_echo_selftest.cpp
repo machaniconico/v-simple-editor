@@ -491,9 +491,12 @@ int runFxGrainEchoSelftest()
             && leakedCanvasMae >= 1.0,
         passed, failed);
 
-    // G14 checks the stored premultiplied contribution. With equal alpha=128
-    // on base/history and decay=0.5, Lighten keeps alpha=128 and the history
-    // RGB contribution is multiplied by 0.5 exactly once.
+    // G14 checks the stored premultiplied contribution against the W3C
+    // separable blend-composite hand-derived by hand: base RGBA(40,50,60,128),
+    // echo RGBA(200,150,100,128), decay=0.5 -> as=64/255, ab=128/255,
+    // ao=0.62696 -> alpha 160, premultiplied RGB (65,56,47). Decay scales the
+    // echo coverage exactly once (the old double-decay regression stayed at
+    // red=40).
     QImage translucentBase(1, 1, QImage::Format_RGBA8888);
     translucentBase.fill(QColor(40, 50, 60, 128));
     QImage translucentEcho(1, 1, QImage::Format_RGBA8888);
@@ -512,25 +515,61 @@ int runFxGrainEchoSelftest()
         reinterpret_cast<const QRgb *>(echoPremultiplied.constScanLine(0))[0];
     const QRgb outputPixel =
         reinterpret_cast<const QRgb *>(outputPremultiplied.constScanLine(0))[0];
-    const auto expectedLightenChannel = [](int baseChannel, int echoChannel) {
-        return qMax(baseChannel, qRound(echoChannel * 0.5));
-    };
+    Q_UNUSED(echoPixel);
     const int oldDoubleDecayedRed = qRound(
         (40.0 + (200.0 - 40.0) * (128.0 / 255.0) * 0.5)
         * (128.0 / 255.0));
     const bool translucentLightenValid =
-        qAlpha(outputPixel) == qAlpha(basePixel)
-        && std::abs(qRed(outputPixel)
-                    - expectedLightenChannel(qRed(basePixel), qRed(echoPixel))) <= 1
-        && std::abs(qGreen(outputPixel)
-                    - expectedLightenChannel(qGreen(basePixel), qGreen(echoPixel))) <= 1
-        && std::abs(qBlue(outputPixel)
-                    - expectedLightenChannel(qBlue(basePixel), qBlue(echoPixel))) <= 1
+        qAlpha(outputPixel) == 160
+        && std::abs(qRed(outputPixel) - 65) <= 1
+        && std::abs(qGreen(outputPixel) - 56) <= 1
+        && std::abs(qBlue(outputPixel) - 47) <= 1
+        && qAlpha(basePixel) == 128
         && qRed(outputPixel) > oldDoubleDecayedRed;
     reportGate(
         "G14",
-        "translucent Lighten preserves alpha and applies decay once",
+        "translucent Lighten composites coverage and applies decay once",
         translucentLightenValid, passed, failed);
+
+    // G16: hand-derived counterexamples for Lighten's coverage handling.
+    // (a) Semi-transparent base RGBA(200,200,200,64) under an opaque black
+    //     echo at decay=1: the echo alone covers 75% of the pixel, so the
+    //     standard composite yields premultiplied (50,50,50,255) — the base
+    //     colour survives only inside its own 25% coverage.
+    // (b) Opaque base RGBA(128,128,128,255) under a half-transparent white
+    //     echo: standard Lighten gives premultiplied (192,192,192,255) and an
+    //     opaque base can never darken (>= its own premultiplied value).
+    QImage counterBase(1, 1, QImage::Format_RGBA8888);
+    counterBase.fill(QColor(200, 200, 200, 64));
+    QImage counterEcho(1, 1, QImage::Format_RGBA8888);
+    counterEcho.fill(QColor(0, 0, 0, 255));
+    const QImage counterOut = tlrender::composeEcho(
+        counterBase, QVector<QImage>{counterEcho}, 1.0, 2)
+        .convertToFormat(QImage::Format_ARGB32_Premultiplied);
+    const QRgb counterPixel =
+        reinterpret_cast<const QRgb *>(counterOut.constScanLine(0))[0];
+    QImage opaqueBase(1, 1, QImage::Format_RGBA8888);
+    opaqueBase.fill(QColor(128, 128, 128, 255));
+    QImage whiteEcho(1, 1, QImage::Format_RGBA8888);
+    whiteEcho.fill(QColor(255, 255, 255, 128));
+    const QImage opaqueOut = tlrender::composeEcho(
+        opaqueBase, QVector<QImage>{whiteEcho}, 1.0, 2)
+        .convertToFormat(QImage::Format_ARGB32_Premultiplied);
+    const QRgb opaquePixel =
+        reinterpret_cast<const QRgb *>(opaqueOut.constScanLine(0))[0];
+    const bool lightenCoverageValid =
+        qAlpha(counterPixel) == 255
+        && std::abs(qRed(counterPixel) - 50) <= 1
+        && std::abs(qGreen(counterPixel) - 50) <= 1
+        && std::abs(qBlue(counterPixel) - 50) <= 1
+        && qAlpha(opaquePixel) == 255
+        && std::abs(qRed(opaquePixel) - 192) <= 1
+        && qRed(opaquePixel) >= 128 && qGreen(opaquePixel) >= 128
+        && qBlue(opaquePixel) >= 128;
+    reportGate(
+        "G16",
+        "Lighten follows the standard blend-composite for translucent layers",
+        lightenCoverageValid, passed, failed);
 
     // G15: the canvas-level transient preview must refuse clip-local stacks
     // during sequence playback (inactive target would leak FilmGrain onto the

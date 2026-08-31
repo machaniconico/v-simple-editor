@@ -170,68 +170,85 @@ QImage composeEcho(const QImage &base, const QVector<QImage> &echoes,
                 if (weightedSrcAlpha <= 0)
                     continue;
 
-                auto weightedPremultiplied = [weight](int channel) {
-                    return qBound(
-                        0, qRound(static_cast<double>(channel) * weight), 255);
-                };
-                const int srcRed = weightedPremultiplied(qRed(src));
-                const int srcGreen = weightedPremultiplied(qGreen(src));
-                const int srcBlue = weightedPremultiplied(qBlue(src));
-
-                int outAlpha = 0;
-                auto compositeChannel = [&](int dstChannel,
-                                            int srcChannel) -> int {
-                    if (mode == 3) {
-                        const double sourceCoverage =
-                            static_cast<double>(weightedSrcAlpha) / 255.0;
+                if (mode == 3) {
+                    // Normal: plain premultiplied source-over with the echo's
+                    // coverage scaled once by decay^i.
+                    auto weightedPremultiplied = [weight](int channel) {
+                        return qBound(
+                            0, qRound(static_cast<double>(channel) * weight),
+                            255);
+                    };
+                    const double sourceCoverage =
+                        static_cast<double>(weightedSrcAlpha) / 255.0;
+                    const int outAlpha = qBound(
+                        0,
+                        weightedSrcAlpha
+                            + qRound(dstAlpha * (1.0 - sourceCoverage)),
+                        255);
+                    auto sourceOver = [&](int dstChannel, int srcChannel) {
                         return qBound(
                             0,
                             srcChannel + qRound(
                                 dstChannel * (1.0 - sourceCoverage)),
                             outAlpha);
-                    }
+                    };
+                    dstLine[x] = qRgba(
+                        sourceOver(qRed(dst),
+                                   weightedPremultiplied(qRed(src))),
+                        sourceOver(qGreen(dst),
+                                   weightedPremultiplied(qGreen(src))),
+                        sourceOver(qBlue(dst),
+                                   weightedPremultiplied(qBlue(src))),
+                        outAlpha);
+                    continue;
+                }
 
-                    if (outAlpha <= 0)
-                        return 0;
-                    const double destination =
-                        static_cast<double>(dstChannel) / outAlpha;
-                    const double source =
-                        static_cast<double>(srcChannel) / outAlpha;
-                    double blended = destination;
+                // Add/Screen/Lighten: the W3C compositing-1 separable
+                // blend-composite. decay^i scales the echo's coverage (as),
+                // never its straight colour. Co = as*ab*B(Cb,Cs)
+                // + as*(1-ab)*Cs + ab*(1-as)*Cb over straight colours,
+                // premultiplied onto ao = as + ab*(1-as). A region covered by
+                // only one layer shows that layer's own colour, and an opaque
+                // base can never darken under Lighten — unlike the previous
+                // premultiplied max that renormalised to the larger alpha and
+                // darkened semi-transparent bases under an opaque echo.
+                const int srcAlphaRaw = qAlpha(src);
+                const double as =
+                    static_cast<double>(weightedSrcAlpha) / 255.0;
+                const double ab = static_cast<double>(dstAlpha) / 255.0;
+                const double ao = as + ab * (1.0 - as);
+                const int outAlpha = qBound(0, qRound(ao * 255.0), 255);
+                auto blendComposite = [&](int dstChannel,
+                                          int srcChannelRaw) -> int {
+                    const double baseColour = dstAlpha > 0
+                        ? static_cast<double>(dstChannel) / dstAlpha : 0.0;
+                    const double echoColour = srcAlphaRaw > 0
+                        ? static_cast<double>(srcChannelRaw) / srcAlphaRaw
+                        : 0.0;
+                    double blended = baseColour;
                     switch (mode) {
                     case 0: // Add
-                        blended = qMin(1.0, destination + source);
+                        blended = qMin(1.0, baseColour + echoColour);
                         break;
                     case 1: // Screen
                         blended = 1.0
-                            - (1.0 - destination) * (1.0 - source);
+                            - (1.0 - baseColour) * (1.0 - echoColour);
                         break;
                     case 2: // Lighten
-                        blended = qMax(destination, source);
+                        blended = qMax(baseColour, echoColour);
                         break;
                     default:
                         break;
                     }
-                    return qBound(0, qRound(blended * outAlpha), outAlpha);
+                    const double premultiplied = as * ab * blended
+                        + as * (1.0 - ab) * echoColour
+                        + ab * (1.0 - as) * baseColour;
+                    return qBound(0, qRound(premultiplied * 255.0), outAlpha);
                 };
-
-                if (mode == 3) {
-                    const double sourceCoverage =
-                        static_cast<double>(weightedSrcAlpha) / 255.0;
-                    outAlpha = qBound(
-                        0,
-                        weightedSrcAlpha
-                            + qRound(dstAlpha * (1.0 - sourceCoverage)),
-                        255);
-                } else {
-                    // Artistic blend modes retain the larger layer coverage;
-                    // decay affects the premultiplied echo color and alpha once.
-                    outAlpha = qMax(dstAlpha, weightedSrcAlpha);
-                }
                 dstLine[x] = qRgba(
-                    compositeChannel(qRed(dst), srcRed),
-                    compositeChannel(qGreen(dst), srcGreen),
-                    compositeChannel(qBlue(dst), srcBlue),
+                    blendComposite(qRed(dst), qRed(src)),
+                    blendComposite(qGreen(dst), qGreen(src)),
+                    blendComposite(qBlue(dst), qBlue(src)),
                     outAlpha);
             }
         }
