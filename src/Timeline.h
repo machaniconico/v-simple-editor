@@ -152,7 +152,8 @@ QString buildExportAudioMixEntryFilterChain(int inputIndex,
                                             int delayMs,
                                             const QString &volumeExpression,
                                             AudioChannelMode mode,
-                                            bool reversed = false);
+                                            bool reversed = false,
+                                            double speed = 1.0);
 
 struct ClipInfo {
     QString filePath;

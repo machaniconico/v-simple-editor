@@ -17,6 +17,7 @@
 
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 
@@ -188,6 +189,48 @@ int runReverseClipSelftest()
     const QString reversedAudioFilter = buildExportAudioMixEntryFilterChain(
         0, QStringLiteral("0"), QStringLiteral("4"), 0,
         QStringLiteral("1"), AudioChannelMode::Stereo, true);
+    const QString reversedSpeed2AudioFilter =
+        buildExportAudioMixEntryFilterChain(
+            0, QStringLiteral("0"), QStringLiteral("4"), 0,
+            QStringLiteral("1"), AudioChannelMode::Stereo, true, 2.0);
+    const QString forwardSpeed2AudioFilter =
+        buildExportAudioMixEntryFilterChain(
+            0, QStringLiteral("0"), QStringLiteral("4"), 0,
+            QStringLiteral("1"), AudioChannelMode::Stereo, false, 2.0);
+    const QString reversedBelowHalfAudioFilter =
+        buildExportAudioMixEntryFilterChain(
+            0, QStringLiteral("0"), QStringLiteral("4"), 0,
+            QStringLiteral("1"), AudioChannelMode::Stereo, true,
+            0.4999999995);
+
+    // This is the same staging primitive MixerIODevice uses to consume the
+    // whole-clip reversed PCM buffer. Verify both identity-speed consumption
+    // and the speed=2 path that previously advanced ringHead at only 1x.
+    const std::int16_t reversedStereoInput[] = {
+        4, 40, 3, 30, 2, 20, 1, 10
+    };
+    std::int16_t stagedSpeed1[8] = {};
+    int consumedSpeed1 = 0;
+    double phaseSpeed1 = -1.0;
+    const int framesSpeed1 = stageInterleavedPcmFramesAtSpeed(
+        reversedStereoInput, 4, 2, 1.0, 0.0,
+        stagedSpeed1, 4, &consumedSpeed1, &phaseSpeed1);
+    std::int16_t stagedSpeed2[8] = {};
+    int consumedSpeed2 = 0;
+    double phaseSpeed2 = -1.0;
+    const int framesSpeed2 = stageInterleavedPcmFramesAtSpeed(
+        reversedStereoInput, 4, 2, 2.0, 0.0,
+        stagedSpeed2, 4, &consumedSpeed2, &phaseSpeed2);
+    const bool previewSpeed1Ok = framesSpeed1 == 4
+        && consumedSpeed1 == 4 && near(phaseSpeed1, 0.0)
+        && stagedSpeed1[0] == 4 && stagedSpeed1[1] == 40
+        && stagedSpeed1[2] == 3 && stagedSpeed1[3] == 30
+        && stagedSpeed1[4] == 2 && stagedSpeed1[5] == 20
+        && stagedSpeed1[6] == 1 && stagedSpeed1[7] == 10;
+    const bool previewSpeed2Ok = framesSpeed2 == 2
+        && consumedSpeed2 == 4 && near(phaseSpeed2, 0.0)
+        && stagedSpeed2[0] == 4 && stagedSpeed2[1] == 40
+        && stagedSpeed2[2] == 2 && stagedSpeed2[3] == 20;
 
     ClipInfo nestedAudioA;
     nestedAudioA.filePath = QStringLiteral("nested-a.wav");
@@ -346,13 +389,20 @@ int runReverseClipSelftest()
             parallelReverse.volume + 1.0);
         parallelReverseOk = parallelFlags[i] == expected;
     }
-    check(4, "PCM バッファをフレーム順に反転する",
+    check(4, "AudioMixer の逆順 PCM を speed=1/2 で正しく消費する",
           reversedPcm == QVector<float>{4.0f, 3.0f, 2.0f, 1.0f}
               && reversedStereoPcm
                      == QVector<float>{3.0f, 4.0f, 1.0f, 2.0f}
+              && previewSpeed1Ok && previewSpeed2Ok
               && !forwardAudioFilter.contains(QStringLiteral("areverse"))
+              && !forwardSpeed2AudioFilter.contains(QStringLiteral("atempo"))
               && reversedAudioFilter.contains(
                      QStringLiteral("atrim=start=0:end=4,areverse,asetpts"))
+              && reversedSpeed2AudioFilter.contains(
+                     QStringLiteral(
+                         "atrim=start=0:end=4,areverse,atempo=2,asetpts"))
+              && reversedBelowHalfAudioFilter.contains(
+                     QStringLiteral("areverse,atempo=0.5,atempo=0.999999999"))
               && childReverseOk && parentReverseOk
               && foldedParentAudioOk && remappedForwardParentOk
               && rampedForwardParentOk && parallelReverseOk);
@@ -383,8 +433,11 @@ int runReverseClipSelftest()
         reverseTimeline.videoTracks().first()->setClips({renderClip});
         reverseTimeline.refreshPlaybackSequence();
 
+        // The clip end is exclusive. Sample one microsecond before the final
+        // frame's nominal PTS boundary so the forward decoder's at-or-after
+        // policy selects that frame without seeking exactly to encoded EOF.
         const qint64 finalFrameTimelineUs = qRound64(
-            (renderClip.duration - 1.0 / kFps) * 1'000'000.0);
+            (renderClip.duration - 1.0 / kFps) * 1'000'000.0) - 1;
         const QImage forwardEnd = tlrender::renderFrameAt(
             &forwardTimeline, finalFrameTimelineUs, QSize(kWidth, kHeight));
         const QImage reverseStart = tlrender::renderFrameAt(
@@ -540,6 +593,49 @@ int runReverseClipSelftest()
     }
     check(5, "TimelineFrameRenderer の逆再生始端が通常再生の終端フレームと一致する",
           rendererOk, rendererDetail);
+
+    ClipInfo heldLeaf;
+    heldLeaf.filePath = QStringLiteral("nested-hold-leaf.mp4");
+    heldLeaf.displayName = QStringLiteral("nested hold leaf");
+    heldLeaf.duration = 2.0;
+    heldLeaf.outPoint = 2.0;
+    heldLeaf.reversed = true;
+    TimelineSequence heldLeafSequence;
+    heldLeafSequence.id = QStringLiteral("nested-one-key-leaf");
+    heldLeafSequence.name = heldLeafSequence.id;
+    heldLeafSequence.videoTracks = {{heldLeaf}};
+    heldLeafSequence.audioTracks = {{heldLeaf}};
+
+    ClipInfo heldSequenceRef;
+    heldSequenceRef.sequenceRefId = heldLeafSequence.id;
+    heldSequenceRef.filePath = timeline_nesting::sequenceClipFilePath(
+        heldLeafSequence.id);
+    heldSequenceRef.displayName = QStringLiteral("nested one-key hold");
+    heldSequenceRef.duration = 2.0;
+    heldSequenceRef.outPoint = 2.0;
+    heldSequenceRef.timeRemapCurve.addKey(0.0, 0.75);
+    TimelineSequence heldMainSequence;
+    heldMainSequence.id = QStringLiteral("nested-one-key-main");
+    heldMainSequence.name = heldMainSequence.id;
+    heldMainSequence.videoTracks = {{heldSequenceRef}};
+    heldMainSequence.audioTracks = {{heldSequenceRef}};
+
+    Timeline heldTimeline;
+    heldTimeline.setSequences(
+        QVector<TimelineSequence>{heldMainSequence, heldLeafSequence},
+        heldMainSequence.id);
+    const QVector<PlaybackEntry> heldVideoEntries =
+        heldTimeline.computePlaybackSequence();
+    const QVector<PlaybackEntry> heldAudioEntries =
+        heldTimeline.computeAudioPlaybackSequence();
+    const bool heldVideoIntervalOk = heldVideoEntries.size() == 1
+        && heldVideoEntries.first().timelineEnd
+               > heldVideoEntries.first().timelineStart;
+    const bool heldAudioIntervalOk = heldAudioEntries.size() == 1
+        && heldAudioEntries.first().timelineEnd
+               > heldAudioEntries.first().timelineStart;
+    check(6, "ネストした1キー time-remap の preview 区間を保持する",
+          heldVideoIntervalOk && heldAudioIntervalOk);
 
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
     return failed;

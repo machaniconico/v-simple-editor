@@ -319,6 +319,58 @@ QVector<float> reversedPcmFrames(const QVector<float> &samples, int channelCount
     return result;
 }
 
+int stageInterleavedPcmFramesAtSpeed(const std::int16_t *input,
+                                    int inputFrames,
+                                    int channelCount,
+                                    double speed,
+                                    double phase,
+                                    std::int16_t *output,
+                                    int outputCapacityFrames,
+                                    int *sourceFramesConsumed,
+                                    double *nextPhase)
+{
+    if (sourceFramesConsumed)
+        *sourceFramesConsumed = 0;
+    if (nextPhase)
+        *nextPhase = 0.0;
+    if (!input || !output || inputFrames <= 0 || channelCount <= 0
+        || outputCapacityFrames <= 0) {
+        return 0;
+    }
+
+    const double boundedSpeed = std::isfinite(speed) && speed > 0.0
+        ? speed : 1.0;
+    const double boundedPhase = std::isfinite(phase) && phase >= 0.0
+        ? phase : 0.0;
+    const int maxOutputByInput = static_cast<int>(
+        static_cast<double>(inputFrames) / boundedSpeed);
+    const int outputFrames = qMin(outputCapacityFrames,
+                                  qMax(0, maxOutputByInput));
+    if (outputFrames <= 0)
+        return 0;
+
+    for (int frame = 0; frame < outputFrames; ++frame) {
+        int sourceFrame = static_cast<int>(
+            boundedPhase + static_cast<double>(frame) * boundedSpeed);
+        sourceFrame = qBound(0, sourceFrame, inputFrames - 1);
+        for (int channel = 0; channel < channelCount; ++channel) {
+            output[frame * channelCount + channel] =
+                input[sourceFrame * channelCount + channel];
+        }
+    }
+
+    const double wantedSourceFrames =
+        boundedPhase + static_cast<double>(outputFrames) * boundedSpeed;
+    const int wantedWholeFrames = static_cast<int>(
+        qMax(0.0, wantedSourceFrames));
+    const int consumed = qMin(inputFrames, wantedWholeFrames);
+    if (sourceFramesConsumed)
+        *sourceFramesConsumed = consumed;
+    if (nextPhase && consumed == wantedWholeFrames)
+        *nextPhase = wantedSourceFrames - wantedWholeFrames;
+    return outputFrames;
+}
+
 void setAudioChannelModePlaybackBindings(const QVector<AudioChannelModePlaybackBinding> &bindings)
 {
     QHash<AudioChannelModeKey, AudioChannelMode> next;
@@ -944,23 +996,19 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
         }
 
         // US-INT-2 Phase B: per-fragment ramp-aware atempo (envvar-gated).
-        // Default path (no atempo / identity ramp): copyBytes is bounded by
-        // ring availability and maxlen; src points at the ring directly;
-        // sourceBytesConsumed == copyBytes. Atempo path: speed-multiplier
-        // is sampled from the ramp at fragment start, output samples are
-        // staged via nearest-neighbor pick from the ring (no pitch
-        // correction — sprint description explicitly permits resample-only
-        // for v1), and ringHead advances by speedMul * copyBytes while
-        // ringStartTlUs still advances by bytesToUs(copyBytes) so the entry
-        // stays in time with the master cursor. Identity-only sequences
-        // never populate m_speedRampByKey so this branch is unreachable
-        // unless the user has authored a ramp.
+        // Reversed PCM is also staged here unconditionally: unlike a forward
+        // decoder, its whole-clip buffer cannot obtain uniform speed from
+        // decoder seeks/refills. This opt-in branch consumes `entry.speed`
+        // source frames per timeline frame, while reverse-OFF behavior keeps
+        // the previous atempo gate and direct-ring path byte-for-byte.
         QVarLengthArray<int16_t, 16384> stagedSamples;
         int copyBytes = static_cast<int>(qMin<qint64>(maxlen, liveBytes(*e)));
         int sourceBytesConsumed = copyBytes;
         const int16_t *src = reinterpret_cast<const int16_t *>(liveData(*e));
         const speedramp::SpeedRamp *atempoRamp = nullptr;
-        if ((audioAtempoEnvForceCached()
+        const bool reversedSpeedPath = e->reversed;
+        if ((reversedSpeedPath
+             || audioAtempoEnvForceCached()
              || !m_mixer->m_atempoByKey.isEmpty())
             && !m_mixer->m_speedRampByKey.isEmpty()) {
             // [P2-M1] R10-b: locking-regression tripwire (Q_ASSERT under
@@ -976,8 +1024,10 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
             const uint64_t genAtEntry =
                 m_mixer->m_speedRampGeneration.load(std::memory_order_relaxed);
             const AudioTrackKey &atempoKey = e->trackKey;
-            if (resolveAudioAtempoEnabled(audioAtempoEnvForceCached(),
-                                          m_mixer->m_atempoByKey.contains(atempoKey))) {
+            if (reversedSpeedPath
+                || resolveAudioAtempoEnabled(
+                    audioAtempoEnvForceCached(),
+                    m_mixer->m_atempoByKey.contains(atempoKey))) {
                 const auto rampIt = m_mixer->m_speedRampByKey.constFind(atempoKey);
                 if (rampIt != m_mixer->m_speedRampByKey.constEnd()) {
                     Q_ASSERT(genAtEntry == m_mixer->m_speedRampGeneration.load(
@@ -988,7 +1038,7 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
                 }
             }
         }
-        if (atempoRamp) {
+        if (reversedSpeedPath || atempoRamp) {
             // Sample instantaneous d(src)/d(timeline) at the fragment start
             // by finite difference of timelineToSourceUs over a 1 ms tick.
             // Compose with the legacy uniform e.entry.speed (mirrors the
@@ -997,26 +1047,42 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
             const int64_t localTlUs = cursorUs
                 - static_cast<int64_t>(e->entry.timelineStart * 1e6);
             const double uniSpeed = (e->entry.speed > 0.0) ? e->entry.speed : 1.0;
-            const qint64 scaledLocalTlUs = static_cast<qint64>(
-                qMax<int64_t>(0, localTlUs) * uniSpeed);
-            // 1ms tick — short enough to read per-keyframe slope, long
-            // enough to dodge integer-us truncation noise.
-            constexpr qint64 kSlopeTickUs = 1000;
-            const qint64 srcA = atempoRamp->timelineToSourceUs(scaledLocalTlUs);
-            const qint64 srcB =
-                atempoRamp->timelineToSourceUs(scaledLocalTlUs + kSlopeTickUs);
-            const double instSrcPerTl =
-                static_cast<double>(srcB - srcA) / kSlopeTickUs;
-            const double speedMul = qBound(speedramp::SpeedRamp::kMinSpeed,
-                instSrcPerTl * uniSpeed,
-                speedramp::SpeedRamp::kMaxSpeed);
+            double speedMul = uniSpeed;
+            if (atempoRamp) {
+                const qint64 scaledLocalTlUs = static_cast<qint64>(
+                    qMax<int64_t>(0, localTlUs) * uniSpeed);
+                // 1ms tick — short enough to read per-keyframe slope, long
+                // enough to dodge integer-us truncation noise.
+                constexpr qint64 kSlopeTickUs = 1000;
+                const qint64 srcA =
+                    atempoRamp->timelineToSourceUs(scaledLocalTlUs);
+                const qint64 srcB = atempoRamp->timelineToSourceUs(
+                    scaledLocalTlUs + kSlopeTickUs);
+                const double instSrcPerTl =
+                    static_cast<double>(srcB - srcA) / kSlopeTickUs;
+                speedMul = instSrcPerTl * uniSpeed;
+            }
+            speedMul = qBound(speedramp::SpeedRamp::kMinSpeed,
+                              speedMul,
+                              speedramp::SpeedRamp::kMaxSpeed);
             const int liveB = liveBytes(*e);
-            // Cap output by what the ring can supply at speedMul.
-            const int maxOutputByRing = static_cast<int>(
-                static_cast<double>(liveB) / speedMul);
-            const int outputBound = qMin<int>(static_cast<int>(maxlen),
-                qMax<int>(0, maxOutputByRing));
-            const int outputFrames = outputBound / AudioMixer::kBytesPerFrame;
+            const int liveFrames = liveB / AudioMixer::kBytesPerFrame;
+            const int outputCapacityFrames = static_cast<int>(maxlen)
+                / AudioMixer::kBytesPerFrame;
+            stagedSamples.resize(
+                outputCapacityFrames * AudioMixer::kChannels);
+            int consumedFrames = 0;
+            double nextPhase = 0.0;
+            const int outputFrames = stageInterleavedPcmFramesAtSpeed(
+                reinterpret_cast<const int16_t *>(liveData(*e)),
+                liveFrames,
+                AudioMixer::kChannels,
+                speedMul,
+                e->atempoSrcFrameCarry,
+                stagedSamples.data(),
+                outputCapacityFrames,
+                &consumedFrames,
+                &nextPhase);
             if (outputFrames <= 0) {
                 // Atempo wants more source than the ring holds — flag stalled
                 // so the cursor freezes for a few callbacks while the decoder
@@ -1025,51 +1091,8 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
                 continue;
             }
             copyBytes = outputFrames * AudioMixer::kBytesPerFrame;
-            // M2 fix: phase-coherent fractional source-frame accounting.
-            // Without this, int(outputFrames*speedMul) truncates per
-            // fragment (e.g. 1.5 × 999 = 1498.5 → 1498), so ringHead lags
-            // ringStartTlUs and the loop's first srcFrameIdx in fragment
-            // N+1 misaligns with fragment N's last read by the truncated
-            // fraction. Tracking the residual phase fixes both:
-            //   • wantSrcFrames adds last fragment's leftover phase, so
-            //     ringHead advances by floor(phase_in + outFrames*speed)
-            //     and (over time) averages exactly outFrames*speed.
-            //   • The inner loop offsets srcFrameIdx by phase_in so the
-            //     fragment-local walk continues the global continuous
-            //     walk without a sample-boundary skip.
-            const double phaseIn = e->atempoSrcFrameCarry;
-            const double wantSrcFrames =
-                static_cast<double>(outputFrames) * speedMul + phaseIn;
-            const int takeSrcFrames =
-                static_cast<int>(qMax<double>(0.0, wantSrcFrames));
-            const int unclampedSrcBytes =
-                takeSrcFrames * AudioMixer::kBytesPerFrame;
-            sourceBytesConsumed = qMin<int>(liveB,
-                qMax<int>(0, unclampedSrcBytes));
-            if (sourceBytesConsumed == unclampedSrcBytes) {
-                e->atempoSrcFrameCarry = wantSrcFrames
-                    - static_cast<double>(takeSrcFrames);
-            } else {
-                // Ring-underflow clamp tripped — drop carry so the
-                // late-drop / re-sync path (cursorUs vs ringStartTlUs)
-                // does not see an amplified deficit on the next fragment.
-                e->atempoSrcFrameCarry = 0.0;
-            }
-            const int outputSamples = copyBytes
-                / static_cast<int>(sizeof(int16_t));
-            stagedSamples.resize(outputSamples);
-            const int16_t *ringSrc = reinterpret_cast<const int16_t *>(liveData(*e));
-            const int liveFrames = liveB / AudioMixer::kBytesPerFrame;
-            for (int frame = 0; frame < outputFrames; ++frame) {
-                int srcFrameIdx = static_cast<int>(
-                    phaseIn + static_cast<double>(frame) * speedMul);
-                if (srcFrameIdx >= liveFrames) srcFrameIdx = liveFrames - 1;
-                if (srcFrameIdx < 0) srcFrameIdx = 0;
-                for (int ch = 0; ch < AudioMixer::kChannels; ++ch) {
-                    stagedSamples[frame * AudioMixer::kChannels + ch] =
-                        ringSrc[srcFrameIdx * AudioMixer::kChannels + ch];
-                }
-            }
+            sourceBytesConsumed = consumedFrames * AudioMixer::kBytesPerFrame;
+            e->atempoSrcFrameCarry = nextPhase;
             src = stagedSamples.data();
         }
         const int copySamples = copyBytes / static_cast<int>(sizeof(int16_t));

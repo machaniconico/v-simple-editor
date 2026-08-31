@@ -506,6 +506,21 @@ NestedSequenceIntervalMapping mapNestedSequenceInterval(
         };
     }
 
+    // A one-key time-remap is a hold. Its inverse is not a point-to-point
+    // function: every output time maps to the same source time. Inverting both
+    // source boundaries therefore returns the same key time and collapses the
+    // flattened preview entry to zero length, while the recursive renderer
+    // correctly keeps drawing the hold. Preserve the authored half-open
+    // timeline interval for this degenerate inverse so preview and export both
+    // retain a live [start, end) entry.
+    if (parentClip.timeRemapCurve.keys.size() == 1) {
+        return {
+            parentTimelineStart + (overlapStart - sourceIn) / parentSpeed,
+            parentTimelineStart + (overlapEnd - sourceIn) / parentSpeed,
+            false
+        };
+    }
+
     const double localAtSourceStart =
         parentClip.localSecondAtSourceTime(overlapStart);
     const double localAtSourceEnd =
@@ -879,13 +894,33 @@ QString buildExportAudioMixEntryFilterChain(int inputIndex,
                                             int delayMs,
                                             const QString &volumeExpression,
                                             AudioChannelMode mode,
-                                            bool reversed)
+                                            bool reversed,
+                                            double speed)
 {
     QStringList filters;
     filters << QStringLiteral("atrim=start=%1:end=%2")
                    .arg(clipIn, clipOut);
-    if (reversed)
+    if (reversed) {
         filters << QStringLiteral("areverse");
+        // Reversed preview consumes its buffered PCM at the clip's uniform
+        // speed. Mirror that order for export: reverse first, then change
+        // duration. Split factors to remain compatible with FFmpeg versions
+        // whose atempo range is 0.5..2.0.
+        double remainingSpeed = std::isfinite(speed) && speed > 0.0
+            ? speed : 1.0;
+        while (remainingSpeed < 0.5) {
+            filters << QStringLiteral("atempo=0.5");
+            remainingSpeed /= 0.5;
+        }
+        while (remainingSpeed > 2.0) {
+            filters << QStringLiteral("atempo=2");
+            remainingSpeed /= 2.0;
+        }
+        if (remainingSpeed != 1.0) {
+            filters << QStringLiteral("atempo=%1").arg(
+                QString::number(remainingSpeed, 'g', 15));
+        }
+    }
     filters << QStringLiteral("asetpts=PTS-STARTPTS")
             << QStringLiteral("aresample=48000")
             << QStringLiteral("aformat=sample_fmts=fltp:channel_layouts=stereo");

@@ -665,7 +665,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "freeze-frame",      "VEDITOR_FREEZE_FRAME_SELFTEST",        runFreezeFrameSelftest,        true,
       "Freeze Frame: split at playhead, one-key hold curve, renderFrameAt export hold, save/load sync, one-step undo" },
     { "reverse-clip",      "VEDITOR_REVERSE_CLIP_SELFTEST",        runReverseClipSelftest,        true,
-      "Reverse clip: source-time fold, speed composition, default-omit persistence, reversed PCM, renderer end-frame parity" },
+      "Reverse clip: source-time fold, speed composition, default-omit persistence, speed-aware reversed PCM, renderer parity, nested hold interval" },
     { "clip-curves",       "VEDITOR_CLIP_CURVES_SELFTEST",         runClipCurvesSelftest,         true,
       "Clip RGB/Luma curves: unset/identity byte identity, renderFrameAt reflection, ProjectFile round-trip" },
     { "hsl-secondary",     "VEDITOR_HSL_SECONDARY_SELFTEST",       runHslSecondarySelftest,       true,

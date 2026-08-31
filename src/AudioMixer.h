@@ -12,6 +12,7 @@
 #include "SpeedRampData.h"
 #include <array>
 #include <atomic>
+#include <cstdint>
 
 #include "PlaybackTypes.h"
 #include "AudioEQ.h"
@@ -82,6 +83,21 @@ inline constexpr bool resolveAudioAtempoEnabled(bool envForce,
 // channelCount=1 is also the scalar helper exercised by reverse-clip G4.
 QVector<float> reversedPcmFrames(const QVector<float> &samples,
                                  int channelCount = 1);
+
+// Production PCM consumption primitive used by reversed preview playback.
+// It walks complete interleaved frames at `speed`, writes at most
+// outputCapacityFrames, and reports how many source frames the caller must
+// advance. Keeping this outside MixerIODevice makes the exact reverse-buffer
+// path deterministic and directly self-testable without an audio device.
+int stageInterleavedPcmFramesAtSpeed(const std::int16_t *input,
+                                    int inputFrames,
+                                    int channelCount,
+                                    double speed,
+                                    double phase,
+                                    std::int16_t *output,
+                                    int outputCapacityFrames,
+                                    int *sourceFramesConsumed,
+                                    double *nextPhase);
 
 class AudioMixer : public QObject {
     Q_OBJECT

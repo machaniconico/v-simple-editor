@@ -845,7 +845,8 @@ QString exportAudioFilterChainForEntry(int inputIndex,
         delayMs,
         volumeExpressionForEntry(entry),
         channelMode,
-        reversed);
+        reversed,
+        entry.speed);
 }
 
 bool runFfmpegForAudioMix(const QStringList &args, QString *error)
