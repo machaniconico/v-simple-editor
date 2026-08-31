@@ -272,6 +272,35 @@ int runTcburnSelftest()
                    QStringLiteral("YUV420P10 RGB round-trip failed or changed metadata"));
     }
 
+    {
+        const bool legacyWhenDisabled =
+            exporterframe::selectRgbConversionPath(false)
+                == exporterframe::RgbConversionPath::LegacyFixedYuv420P;
+        const bool encoderFormatWhenEnabled =
+            exporterframe::selectRgbConversionPath(true)
+                == exporterframe::RgbConversionPath::EncoderPixelFormat;
+        legacyWhenDisabled && encoderFormatWhenEnabled
+            ? pass(QStringLiteral("G8"),
+                   QStringLiteral("disabled TC selects fixed YUV420P legacy conversion"))
+            : fail(QStringLiteral("G8"),
+                   QStringLiteral("RGB conversion path selection diverged"));
+    }
+
+    {
+        TimecodeBurnInSettings settings;
+        settings.enabled = true;
+        TimecodeBurnInRenderer renderer(settings);
+        const double timelineSec = exportertimecode::timelineSeconds(
+            /*processedDuration=*/3.0, /*leadInSec=*/2.0,
+            /*sourceOffsetSec=*/0.0, /*speed=*/1.0);
+        const QString text = renderer.displayText(timelineSec, 30.0);
+        text == QStringLiteral("00:00:05:00")
+            ? pass(QStringLiteral("G9"),
+                   QStringLiteral("lead-in contributes to absolute timeline TC"))
+            : fail(QStringLiteral("G9"),
+                   QStringLiteral("2 s lead-in plus 3 s processed did not display 00:00:05:00"));
+    }
+
     err << "summary: " << passed << " PASS, " << failed << " FAIL\n";
     err.flush();
     return failed;

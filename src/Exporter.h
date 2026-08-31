@@ -40,13 +40,30 @@ extern "C" {
 
 namespace exporterframe {
 
-// Stateless RGB24 -> encoder-frame conversion shared by every legacy RGB
-// overlay/effect path. The caller owns an allocated outputFrame; its format,
-// dimensions, and colour metadata are preserved and define the swscale target.
+enum class RgbConversionPath {
+    LegacyFixedYuv420P,
+    EncoderPixelFormat
+};
+
+// TC disabled must retain the pre-burn-in fixed-YUV420P conversion byte path.
+// Keeping this decision pure makes the no-op compatibility rule testable.
+RgbConversionPath selectRgbConversionPath(bool timecodeBurnInEnabled) noexcept;
+
+// TC-enabled RGB24 -> encoder-frame conversion. The caller owns an allocated
+// outputFrame; its format, dimensions, and colour metadata are preserved and
+// define the swscale target.
 bool convertRgbImageToFrame(const QImage &image, AVFrame *outputFrame,
                             bool configureColorMatrix);
 
 } // namespace exporterframe
+
+namespace exportertimecode {
+
+// Absolute timeline time for a frame in the legacy sequential exporter.
+double timelineSeconds(double processedDuration, double leadInSec,
+                       double sourceOffsetSec, double speed) noexcept;
+
+} // namespace exportertimecode
 
 class Exporter : public QObject
 {
