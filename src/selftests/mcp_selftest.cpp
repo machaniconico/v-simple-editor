@@ -40,6 +40,7 @@
 #include <limits>
 #include <stdexcept>
 
+#include "../clipanim/ClipAnim.h"
 #include "../mcp/McpEditorTools.h"
 #include "../mcp/McpHttpServer.h"
 #include "../mcp/McpProtocol.h"
@@ -2225,18 +2226,48 @@ int runMcpSelftest()
         const QJsonObject zoomPayload = toolPayload(zoomResponse);
         const QJsonObject zoomCounts =
             zoomPayload.value(QStringLiteral("keyframeCounts")).toObject();
-        const KeyframeTrack *scaleX = dynamicZoomTrack->clips().first()
-                                          .keyframes.track(QStringLiteral("scaleX"));
-        const KeyframeTrack *runtimeScale = dynamicZoomTrack->clips().first()
-                                                .keyframes.track(
-                                                    QStringLiteral("motion.scale"));
+        QVector<ClipInfo> editedZoomClips = dynamicZoomTrack->clips();
+        KeyframeTrack *editableScaleX = editedZoomClips.isEmpty()
+            ? nullptr
+            : editedZoomClips.first().keyframes.track(QStringLiteral("scaleX"));
+        const double editedScale = 2.75;
+        if (editableScaleX && editableScaleX->count() == 2) {
+            const KeyframePoint last = editableScaleX->keyframes().last();
+            editableScaleX->addKeyframe(
+                last.time, editedScale, last.interpolation,
+                last.bezX1, last.bezY1, last.bezX2, last.bezY2,
+                last.hasSpatialTangent,
+                last.spatialOutX, last.spatialOutY,
+                last.spatialInX, last.spatialInY);
+            dynamicZoomTrack->setClips(editedZoomClips);
+        }
+        const KeyframeManager& zoomKeyframes =
+            dynamicZoomTrack->clips().first().keyframes;
+        const KeyframeTrack *scaleX =
+            zoomKeyframes.track(QStringLiteral("scaleX"));
+        int storedZoomKeyframeCount = 0;
+        for (const KeyframeTrack& track : zoomKeyframes.tracks())
+            storedZoomKeyframeCount += track.count();
+        // clipanim resolves the runtime motion.* names from the stored public
+        // tracks at read time, so the playback value must follow the edited
+        // public keyframe without any motion.* track existing.
+        const double zoomEndTime = scaleX && scaleX->count() == 2
+            ? scaleX->keyframes().last().time : 0.0;
+        const double derivedEndScale = clipanim::effectiveTransformAt(
+            dynamicZoomTrack->clips().first(), zoomEndTime).videoScale;
         const bool g127 = !toolResult(zoomResponse)
                                .value(QStringLiteral("isError")).toBool(true)
             && zoomPayload.value(QStringLiteral("ok")).toBool(false)
             && zoomPayload.value(QStringLiteral("keyframeCount")).toInt(-1) == 8
             && zoomCounts.value(QStringLiteral("scaleX")).toInt(-1) == 2
             && scaleX && scaleX->count() == 2
-            && runtimeScale && runtimeScale->count() == 2
+            && zoomKeyframes.tracks().size() == 4
+            && storedZoomKeyframeCount == 8
+            && !zoomKeyframes.hasTrack(QStringLiteral("motion.position.x"))
+            && !zoomKeyframes.hasTrack(QStringLiteral("motion.position.y"))
+            && !zoomKeyframes.hasTrack(QStringLiteral("motion.scale"))
+            && qAbs(derivedEndScale - scaleX->keyframes().last().value) < 1e-9
+            && qAbs(derivedEndScale - editedScale) < 1e-9
             && scaleX->keyframes().last().value
                    > scaleX->keyframes().first().value;
         g127 ? pass("G127 dynamic_zoom zoomIn generates two scaleX keyframes")
@@ -2253,6 +2284,8 @@ int runMcpSelftest()
             && !afterUndo.hasTrack(QStringLiteral("positionY"))
             && !afterUndo.hasTrack(QStringLiteral("scaleX"))
             && !afterUndo.hasTrack(QStringLiteral("scaleY"))
+            && !afterUndo.hasTrack(QStringLiteral("motion.position.x"))
+            && !afterUndo.hasTrack(QStringLiteral("motion.position.y"))
             && !afterUndo.hasTrack(QStringLiteral("motion.scale"))
             && !projectTimeline->undoManager()->canUndo();
         g128 ? pass("G128 undo removes dynamic_zoom keyframes in one step")
@@ -2261,11 +2294,11 @@ int runMcpSelftest()
 
         const QJsonObject customRect{
             {QStringLiteral("cx"), 0.5}, {QStringLiteral("cy"), 0.5},
-            {QStringLiteral("w"), 1.0}, {QStringLiteral("h"), 1.0}
+            {QStringLiteral("w"), 1.0}
         };
         const QJsonObject customEnd{
             {QStringLiteral("cx"), 0.6}, {QStringLiteral("cy"), 0.4},
-            {QStringLiteral("w"), 0.5}, {QStringLiteral("h"), 0.5}
+            {QStringLiteral("w"), 0.5}, {QStringLiteral("h"), 0.25}
         };
         const QJsonObject customResponse = callProjectInfoTool(
             235, QStringLiteral("dynamic_zoom"), QJsonObject{
@@ -2274,11 +2307,19 @@ int runMcpSelftest()
                 {QStringLiteral("end"), customEnd},
                 {QStringLiteral("easing"), QStringLiteral("linear")}
             });
+        const KeyframeTrack *customScaleX =
+            dynamicZoomTrack->clips().first().keyframes.track(
+                QStringLiteral("scaleX"));
         const bool validCustomApplied = !toolResult(customResponse)
                                              .value(QStringLiteral("isError"))
                                              .toBool(true)
             && toolPayload(customResponse)
-                   .value(QStringLiteral("keyframeCount")).toInt(-1) == 8;
+                   .value(QStringLiteral("keyframeCount")).toInt(-1) == 8
+            && toolPayload(customResponse).value(QStringLiteral("warning"))
+                   .toString().contains(
+                       QStringLiteral("h はキャンバス比に固定"))
+            && customScaleX && customScaleX->count() == 2
+            && qAbs(customScaleX->keyframes().last().value - 2.0) < 1e-9;
         if (validCustomApplied)
             callProjectInfoTool(236, QStringLiteral("undo"), QJsonObject{});
 
@@ -2293,13 +2334,43 @@ int runMcpSelftest()
         const bool g129 = validCustomApplied
             && toolResult(invalidRectResponse)
                    .value(QStringLiteral("isError")).toBool(false)
-            && toolErrorText(invalidRectResponse).contains(QStringLiteral("w/h"))
+            && toolErrorText(invalidRectResponse).contains(QStringLiteral("w"))
             && !dynamicZoomTrack->clips().first().keyframes
                     .hasTrack(QStringLiteral("scaleX"))
             && !projectTimeline->undoManager()->canUndo();
         g129 ? pass("G129 dynamic_zoom accepts custom frames and rejects w<=0")
              : fail("G129 dynamic_zoom accepts custom frames and rejects w<=0",
                     QStringLiteral("custom rect handling or invalid-rect guard diverged"));
+
+        const QJsonObject ambiguousResponse = callProjectInfoTool(
+            243, QStringLiteral("dynamic_zoom"), QJsonObject{
+                {QStringLiteral("clipIndex"), 0},
+                {QStringLiteral("preset"), QStringLiteral("zoomIn")},
+                {QStringLiteral("start"), customRect}
+            });
+        QJsonObject dynamicZoomInputSchema;
+        for (const QJsonValue& value : projectInfoToolDescriptors) {
+            const QJsonObject descriptor = value.toObject();
+            if (descriptor.value(QStringLiteral("name")).toString()
+                == QStringLiteral("dynamic_zoom")) {
+                dynamicZoomInputSchema =
+                    descriptor.value(QStringLiteral("inputSchema")).toObject();
+                break;
+            }
+        }
+        const bool g134 = toolResult(ambiguousResponse)
+                                .value(QStringLiteral("isError")).toBool(false)
+            && toolErrorText(ambiguousResponse).contains(
+                   QStringLiteral("cannot be combined"))
+            && !dynamicZoomInputSchema.contains(QStringLiteral("oneOf"))
+            && dynamicZoomInputSchema.value(QStringLiteral("description"))
+                   .toString().contains(QStringLiteral("どちらか一方"))
+            && !dynamicZoomTrack->clips().first().keyframes
+                    .hasTrack(QStringLiteral("scaleX"))
+            && !projectTimeline->undoManager()->canUndo();
+        g134 ? pass("G134 dynamic_zoom rejects preset with start/end")
+             : fail("G134 dynamic_zoom rejects preset with start/end",
+                    QStringLiteral("ambiguous input or schema contract diverged"));
 
         dynamicZoomTrack->setClips(QVector<ClipInfo>{});
         projectTimeline->clearSelection();
@@ -2313,6 +2384,8 @@ int runMcpSelftest()
         fail("G128 undo removes dynamic_zoom keyframes in one step",
              QStringLiteral("Timeline was not available"));
         fail("G129 dynamic_zoom accepts custom frames and rejects w<=0",
+             QStringLiteral("Timeline was not available"));
+        fail("G134 dynamic_zoom rejects preset with start/end",
              QStringLiteral("Timeline was not available"));
     }
 

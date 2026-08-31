@@ -4,13 +4,22 @@
 
 namespace dynzoom {
 
-// Normalized crop frame. cx/cy are canvas-relative center coordinates and
-// w/h are fractions of the canvas dimensions.
+// Normalized crop frame. cx/cy are canvas-relative center coordinates and w
+// is the visible width as a fraction of the canvas. The visible height always
+// follows the canvas aspect ratio (the normalized height is therefore w).
 struct Rect {
     double cx = 0.5;
     double cy = 0.5;
     double w = 1.0;
-    double h = 1.0;
+
+    constexpr Rect() = default;
+    constexpr Rect(double centerX, double centerY, double width)
+        : cx(centerX), cy(centerY), w(width) {}
+    // Compatibility input for callers that still provide h. Height is not
+    // stored: Dynamic Zoom is always a uniform-scale, canvas-aspect crop.
+    constexpr Rect(double centerX, double centerY, double width,
+                   double /*ignoredHeight*/)
+        : cx(centerX), cy(centerY), w(width) {}
 };
 
 enum class Easing {

@@ -16,6 +16,13 @@ namespace {
 const QString kScaleTrack = QStringLiteral("motion.scale");
 const QString kPosXTrack = QStringLiteral("motion.position.x");
 const QString kPosYTrack = QStringLiteral("motion.position.y");
+// Dynamic Zoom stores only the public TransformAnimator track names; the
+// runtime motion.* names are resolved from them at read time so no mirrored
+// tracks are ever persisted. motion.* stays authoritative when present.
+const QString kPublicPosXTrack = QStringLiteral("positionX");
+const QString kPublicPosYTrack = QStringLiteral("positionY");
+const QString kPublicScaleXTrack = QStringLiteral("scaleX");
+const QString kPublicScaleYTrack = QStringLiteral("scaleY");
 const QString kRotationTrack = QStringLiteral("motion.rotation");
 const QString kOpacityTrack = QStringLiteral("motion.opacity");
 const QString kGradeBrightnessTrack = QStringLiteral("grade.brightness");
@@ -45,13 +52,44 @@ bool trackHasKeyframes(const KeyframeManager& keyframes, const QString& trackNam
     return track && track->count() > 0;
 }
 
+// Runtime-name resolution: prefer the motion.* track, otherwise fall back to
+// the public TransformAnimator name Dynamic Zoom stores. Returning the runtime
+// name when neither has keyframes keeps every "no keyframes" branch untouched.
+const QString& resolvedMotionTrack(const KeyframeManager& keyframes,
+                                   const QString& runtimeName,
+                                   const QString& publicName)
+{
+    if (trackHasKeyframes(keyframes, runtimeName))
+        return runtimeName;
+    if (trackHasKeyframes(keyframes, publicName))
+        return publicName;
+    return runtimeName;
+}
+
+// motion.scale is a uniform scale; Dynamic Zoom writes identical scaleX and
+// scaleY tracks, so either public track can stand in for it.
+const QString& resolvedScaleTrack(const KeyframeManager& keyframes)
+{
+    if (trackHasKeyframes(keyframes, kScaleTrack))
+        return kScaleTrack;
+    if (trackHasKeyframes(keyframes, kPublicScaleXTrack))
+        return kPublicScaleXTrack;
+    if (trackHasKeyframes(keyframes, kPublicScaleYTrack))
+        return kPublicScaleYTrack;
+    return kScaleTrack;
+}
+
 bool hasAnyMotionKeyframes(const ClipInfo& clip)
 {
     return trackHasKeyframes(clip.keyframes, kScaleTrack)
         || trackHasKeyframes(clip.keyframes, kPosXTrack)
         || trackHasKeyframes(clip.keyframes, kPosYTrack)
         || trackHasKeyframes(clip.keyframes, kRotationTrack)
-        || trackHasKeyframes(clip.keyframes, kOpacityTrack);
+        || trackHasKeyframes(clip.keyframes, kOpacityTrack)
+        || trackHasKeyframes(clip.keyframes, kPublicScaleXTrack)
+        || trackHasKeyframes(clip.keyframes, kPublicScaleYTrack)
+        || trackHasKeyframes(clip.keyframes, kPublicPosXTrack)
+        || trackHasKeyframes(clip.keyframes, kPublicPosYTrack);
 }
 
 bool hasAnyEffectKeyframes(const ClipInfo& clip)
@@ -353,8 +391,12 @@ bool spatialPositionAt(const ClipInfo& clip,
                        double clipLocalSeconds,
                        QPointF *position)
 {
-    const KeyframeTrack *xTrack = clip.keyframes.track(kPosXTrack);
-    const KeyframeTrack *yTrack = clip.keyframes.track(kPosYTrack);
+    const QString& posXName =
+        resolvedMotionTrack(clip.keyframes, kPosXTrack, kPublicPosXTrack);
+    const QString& posYName =
+        resolvedMotionTrack(clip.keyframes, kPosYTrack, kPublicPosYTrack);
+    const KeyframeTrack *xTrack = clip.keyframes.track(posXName);
+    const KeyframeTrack *yTrack = clip.keyframes.track(posYName);
     const QVector<double> times = positionKeyframeTimes(xTrack, yTrack);
     if (times.size() < 2)
         return false;
@@ -421,20 +463,20 @@ bool spatialPositionAt(const ClipInfo& clip,
     // pair uses one spatial Bezier path.  The previous shared mapping picked
     // X first and made Y visibly loop despite a UI value of None/PingPong.
     QPointF result(
-        trackHasKeyframes(clip.keyframes, kPosXTrack)
-            ? clip.keyframes.valueAt(kPosXTrack, clipLocalSeconds, clip.videoDx)
+        trackHasKeyframes(clip.keyframes, posXName)
+            ? clip.keyframes.valueAt(posXName, clipLocalSeconds, clip.videoDx)
             : clip.videoDx,
-        trackHasKeyframes(clip.keyframes, kPosYTrack)
-            ? clip.keyframes.valueAt(kPosYTrack, clipLocalSeconds, clip.videoDy)
+        trackHasKeyframes(clip.keyframes, posYName)
+            ? clip.keyframes.valueAt(posYName, clipLocalSeconds, clip.videoDy)
             : clip.videoDy);
 
     QPointF xPoint;
     QPointF yPoint;
     const bool xSpatial = evaluateSpatialPointAt(
-        spatialPathLocalSecondsForTrack(clip, kPosXTrack, clipLocalSeconds),
+        spatialPathLocalSecondsForTrack(clip, posXName, clipLocalSeconds),
         &xPoint);
     const bool ySpatial = evaluateSpatialPointAt(
-        spatialPathLocalSecondsForTrack(clip, kPosYTrack, clipLocalSeconds),
+        spatialPathLocalSecondsForTrack(clip, posYName, clipLocalSeconds),
         &yPoint);
     if (xSpatial)
         result.setX(xPoint.x());
@@ -456,13 +498,17 @@ QPointF effectivePositionAt(const ClipInfo& clip,
         return spatialPosition;
 
     QPointF position(clip.videoDx, clip.videoDy);
-    if (trackHasKeyframes(clip.keyframes, kPosXTrack)) {
+    const QString& posXName =
+        resolvedMotionTrack(clip.keyframes, kPosXTrack, kPublicPosXTrack);
+    const QString& posYName =
+        resolvedMotionTrack(clip.keyframes, kPosYTrack, kPublicPosYTrack);
+    if (trackHasKeyframes(clip.keyframes, posXName)) {
         position.setX(
-            clip.keyframes.valueAt(kPosXTrack, clipLocalSeconds, position.x()));
+            clip.keyframes.valueAt(posXName, clipLocalSeconds, position.x()));
     }
-    if (trackHasKeyframes(clip.keyframes, kPosYTrack)) {
+    if (trackHasKeyframes(clip.keyframes, posYName)) {
         position.setY(
-            clip.keyframes.valueAt(kPosYTrack, clipLocalSeconds, position.y()));
+            clip.keyframes.valueAt(posYName, clipLocalSeconds, position.y()));
     }
     return position;
 }
@@ -479,22 +525,27 @@ clipgeom::ClipTransform effectiveTransformAt(const ClipInfo& clip,
 
     clipgeom::ClipTransform transform{clip.videoScale, clip.videoDx,
                                       clip.videoDy, clip.rotation2DDegrees};
-    if (trackHasKeyframes(clip.keyframes, kScaleTrack)) {
+    const QString& scaleName = resolvedScaleTrack(clip.keyframes);
+    if (trackHasKeyframes(clip.keyframes, scaleName)) {
         transform.videoScale =
-            clip.keyframes.valueAt(kScaleTrack, clipLocalSeconds, transform.videoScale);
+            clip.keyframes.valueAt(scaleName, clipLocalSeconds, transform.videoScale);
     }
     QPointF spatialPosition;
     if (spatialPositionAt(clip, clipLocalSeconds, &spatialPosition)) {
         transform.videoDx = spatialPosition.x();
         transform.videoDy = spatialPosition.y();
     } else {
-        if (trackHasKeyframes(clip.keyframes, kPosXTrack)) {
+        const QString& posXName =
+            resolvedMotionTrack(clip.keyframes, kPosXTrack, kPublicPosXTrack);
+        const QString& posYName =
+            resolvedMotionTrack(clip.keyframes, kPosYTrack, kPublicPosYTrack);
+        if (trackHasKeyframes(clip.keyframes, posXName)) {
             transform.videoDx =
-                clip.keyframes.valueAt(kPosXTrack, clipLocalSeconds, transform.videoDx);
+                clip.keyframes.valueAt(posXName, clipLocalSeconds, transform.videoDx);
         }
-        if (trackHasKeyframes(clip.keyframes, kPosYTrack)) {
+        if (trackHasKeyframes(clip.keyframes, posYName)) {
             transform.videoDy =
-                clip.keyframes.valueAt(kPosYTrack, clipLocalSeconds, transform.videoDy);
+                clip.keyframes.valueAt(posYName, clipLocalSeconds, transform.videoDy);
         }
     }
     if (trackHasKeyframes(clip.keyframes, kRotationTrack)) {

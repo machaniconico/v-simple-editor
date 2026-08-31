@@ -7985,8 +7985,7 @@ bool Timeline::applyDynamicZoom(TrackKind kind, int trackIndex, int clipIndex,
         return false;
     const auto validRect = [](const dynzoom::Rect& rect) {
         return std::isfinite(rect.cx) && std::isfinite(rect.cy)
-            && std::isfinite(rect.w) && std::isfinite(rect.h)
-            && rect.w > 0.0 && rect.h > 0.0;
+            && std::isfinite(rect.w) && rect.w > 0.0;
     };
     if (!validRect(start) || !validRect(end))
         return false;
@@ -7999,29 +7998,13 @@ bool Timeline::applyDynamicZoom(TrackKind kind, int trackIndex, int clipIndex,
     keyframes.addTrack(generated.scaleX);
     keyframes.addTrack(generated.scaleY);
 
-    // The current preview/export evaluator consumes the motion.* names while
-    // Dynamic Zoom's public tracks use TransformAnimator property names.
-    // Mirrored tracks keep the authored API stable and make the animation play
-    // through the existing ClipGeometry pipeline.
-    const auto mirroredTrack = [](const KeyframeTrack& source,
-                                  const QString& propertyName) {
-        KeyframeTrack mirror(propertyName, source.defaultValue());
-        for (const KeyframePoint& point : source.keyframes()) {
-            mirror.addKeyframe(point.time, point.value, point.interpolation,
-                               point.bezX1, point.bezY1,
-                               point.bezX2, point.bezY2,
-                               point.hasSpatialTangent,
-                               point.spatialOutX, point.spatialOutY,
-                               point.spatialInX, point.spatialInY);
-        }
-        return mirror;
-    };
-    keyframes.addTrack(mirroredTrack(
-        generated.positionX, QStringLiteral("motion.position.x")));
-    keyframes.addTrack(mirroredTrack(
-        generated.positionY, QStringLiteral("motion.position.y")));
-    keyframes.addTrack(mirroredTrack(
-        generated.scaleX, QStringLiteral("motion.scale")));
+    // Keep the four TransformAnimator tracks as the sole stored source.
+    // clipanim resolves the runtime motion.* names from these public tracks
+    // at read time, so no mirrored tracks are persisted. Removing stale
+    // mirrors also migrates projects saved by the older dual-write scheme.
+    keyframes.removeTrack(QStringLiteral("motion.position.x"));
+    keyframes.removeTrack(QStringLiteral("motion.position.y"));
+    keyframes.removeTrack(QStringLiteral("motion.scale"));
 
     return setClipKeyframes(kind, trackIndex, clipIndex, keyframes);
 }

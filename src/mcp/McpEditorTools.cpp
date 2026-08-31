@@ -602,7 +602,7 @@ bool readClipTarget(const QJsonObject& args, MainWindow* window,
 
 QJsonObject dynamicZoomRectSchema()
 {
-    return schemaWithRequired(QJsonObject{
+    QJsonObject schema = schemaWithRequired(QJsonObject{
         {QStringLiteral("cx"), QJsonObject{
             {QStringLiteral("type"), QStringLiteral("number")},
             {QStringLiteral("minimum"), 0.0},
@@ -620,11 +620,15 @@ QJsonObject dynamicZoomRectSchema()
         }},
         {QStringLiteral("h"), QJsonObject{
             {QStringLiteral("type"), QStringLiteral("number")},
-            {QStringLiteral("exclusiveMinimum"), 0.0},
-            {QStringLiteral("maximum"), 1.0}
+            {QStringLiteral("description"),
+             QStringLiteral("互換入力。値は無視され、可視領域はキャンバスのアスペクト比に固定される")}
         }}
     }, {QStringLiteral("cx"), QStringLiteral("cy"),
-        QStringLiteral("w"), QStringLiteral("h")});
+        QStringLiteral("w")});
+    schema.insert(
+        QStringLiteral("description"),
+        QStringLiteral("正規化された枠。h は省略可能で、指定しても無視されキャンバス比に固定される"));
+    return schema;
 }
 
 bool readDynamicZoomRect(const QJsonObject& args, const QString& name,
@@ -644,8 +648,7 @@ bool readDynamicZoomRect(const QJsonObject& args, const QString& name,
     dynzoom::Rect rect;
     if (!requiredFiniteNumber(object, QStringLiteral("cx"), &rect.cx, err)
         || !requiredFiniteNumber(object, QStringLiteral("cy"), &rect.cy, err)
-        || !requiredFiniteNumber(object, QStringLiteral("w"), &rect.w, err)
-        || !requiredFiniteNumber(object, QStringLiteral("h"), &rect.h, err)) {
+        || !requiredFiniteNumber(object, QStringLiteral("w"), &rect.w, err)) {
         return false;
     }
     if (rect.cx < 0.0 || rect.cx > 1.0
@@ -653,9 +656,8 @@ bool readDynamicZoomRect(const QJsonObject& args, const QString& name,
         return setError(err, QStringLiteral("%1 cx/cy must be in range [0, 1]")
                                  .arg(name));
     }
-    if (rect.w <= 0.0 || rect.h <= 0.0
-        || rect.w > 1.0 || rect.h > 1.0) {
-        return setError(err, QStringLiteral("%1 w/h must be in range (0, 1]")
+    if (rect.w <= 0.0 || rect.w > 1.0) {
+        return setError(err, QStringLiteral("%1 w must be in range (0, 1]")
                                  .arg(name));
     }
     if (out)
@@ -1652,6 +1654,7 @@ void McpEditorTools::registerWriteTools()
         {QStringLiteral("kind"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
         {QStringLiteral("trackIndex"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
         {QStringLiteral("clipIndex"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+        {QStringLiteral("warning"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
         {QStringLiteral("keyframeCount"), QJsonObject{
             {QStringLiteral("type"), QStringLiteral("integer")},
             {QStringLiteral("minimum"), 0}
@@ -2866,15 +2869,12 @@ void McpEditorTools::registerWriteTools()
                 {QStringLiteral("default"), QStringLiteral("easeInOut")}
             }}
         }), {QStringLiteral("clipIndex")});
-    dynamicZoomInputSchema.insert(QStringLiteral("oneOf"), QJsonArray{
-        QJsonObject{{QStringLiteral("required"),
-                     QJsonArray{QStringLiteral("preset")}}},
-        QJsonObject{{QStringLiteral("required"),
-                     QJsonArray{QStringLiteral("start"), QStringLiteral("end")}}}
-    });
+    dynamicZoomInputSchema.insert(
+        QStringLiteral("description"),
+        QStringLiteral("preset か start/end のどちらか一方を指定する。両方の指定はエラー。start/end の h は省略可能で、指定しても無視されキャンバス比に固定される"));
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("dynamic_zoom"),
-        QStringLiteral("指定動画クリップへダイナミックズームを適用し、位置とスケールに開始・終了キーフレームを生成する。preset または start/end のどちらかを指定する。1 回の undo で元に戻せる。"),
+        QStringLiteral("指定動画クリップへダイナミックズームを適用し、位置とスケールに開始・終了キーフレームを生成する。preset か start/end のどちらか一方を指定し、両方の指定はエラー。start/end の h は省略可能で、指定しても無視されキャンバス比に固定される。1 回の undo で元に戻せる。"),
         dynamicZoomInputSchema,
         guardedWrite(QStringLiteral("dynamic_zoom"),
                      [this](const QJsonObject& args, QString* err) -> QJsonObject {
@@ -2902,6 +2902,11 @@ void McpEditorTools::registerWriteTools()
                 return setError(err, QStringLiteral("start and end must be specified together")),
                        QJsonObject();
             }
+            const bool ignoredHeight = !hasPreset
+                && (args.value(QStringLiteral("start")).toObject().contains(
+                        QStringLiteral("h"))
+                    || args.value(QStringLiteral("end")).toObject().contains(
+                        QStringLiteral("h")));
 
             dynzoom::Rect start;
             dynzoom::Rect end;
@@ -2960,7 +2965,7 @@ void McpEditorTools::registerWriteTools()
                 {QStringLiteral("scaleX"), trackCount(QStringLiteral("scaleX"))},
                 {QStringLiteral("scaleY"), trackCount(QStringLiteral("scaleY"))}
             };
-            return QJsonObject{
+            QJsonObject response{
                 {QStringLiteral("ok"), true},
                 {QStringLiteral("kind"), QStringLiteral("video")},
                 {QStringLiteral("trackIndex"), target.trackIndex},
@@ -2972,6 +2977,12 @@ void McpEditorTools::registerWriteTools()
                      + counts.value(QStringLiteral("scaleY")).toInt()},
                 {QStringLiteral("keyframeCounts"), counts}
             };
+            if (ignoredHeight) {
+                response.insert(
+                    QStringLiteral("warning"),
+                    QStringLiteral("h はキャンバス比に固定されるため指定値を無視しました"));
+            }
+            return response;
         })
     }, dynamicZoomOutputSchema));
 

@@ -78,9 +78,9 @@ int runDynzoomSelftest()
     gate(3, QStringLiteral("左パンは positionX が単調"), positionXMonotonic);
 
     const dynzoom::Result clamped = dynzoom::build(
-        dynzoom::Rect{0.5, 0.5, 2.0, 2.0}, full,
+        dynzoom::Rect{0.5, 0.5, 2.0}, full,
         0.0, 1.0, dynzoom::Easing::Linear);
-    gate(4, QStringLiteral("w/h > 1 は 1 にクランプ"),
+    gate(4, QStringLiteral("w > 1 は 1 にクランプ"),
          clamped.scaleX.count() == 2
              && near(clamped.scaleX.keyframes().first().value, 1.0)
              && near(clamped.scaleY.keyframes().first().value, 1.0));
@@ -102,6 +102,30 @@ int runDynzoomSelftest()
     }
     gate(5, QStringLiteral("KF 時刻は clipStart と clipStart+duration"),
          timesMatch);
+
+    const dynzoom::Result ignoredLegacyHeight = dynzoom::build(
+        dynzoom::Rect{0.5, 0.5, 1.0, 0.5}, full,
+        0.0, 1.0, dynzoom::Easing::Linear);
+    gate(6, QStringLiteral("h 入力は無視されキャンバス比に固定"),
+         twoValues(ignoredLegacyHeight.positionX, 0.0, 0.0)
+             && twoValues(ignoredLegacyHeight.positionY, 0.0, 0.0)
+             && twoValues(ignoredLegacyHeight.scaleX, 1.0, 1.0)
+             && twoValues(ignoredLegacyHeight.scaleY, 1.0, 1.0));
+
+    KeyframeManager publicTracks;
+    publicTracks.addTrack(zoomIn.positionX);
+    publicTracks.addTrack(zoomIn.positionY);
+    publicTracks.addTrack(zoomIn.scaleX);
+    publicTracks.addTrack(zoomIn.scaleY);
+    int publicKeyframeCount = 0;
+    for (const KeyframeTrack& track : publicTracks.tracks())
+        publicKeyframeCount += track.count();
+    gate(7, QStringLiteral("公開 4 トラックだけが 8 KF の単一ソース"),
+         publicTracks.tracks().size() == 4
+             && publicKeyframeCount == 8
+             && !publicTracks.hasTrack(QStringLiteral("motion.position.x"))
+             && !publicTracks.hasTrack(QStringLiteral("motion.position.y"))
+             && !publicTracks.hasTrack(QStringLiteral("motion.scale")));
 
     err << "summary: " << passed << " PASS, " << failed << " FAIL\n";
     err.flush();

@@ -35,12 +35,10 @@ TransformValues transformForRect(const Rect& rect)
     const double cx = normalizedCoordinate(rect.cx);
     const double cy = normalizedCoordinate(rect.cy);
     const double width = normalizedSize(rect.w);
-    const double height = normalizedSize(rect.h);
 
-    // ClipGeometry uses one uniform videoScale. Use the larger axis ratio so
-    // the requested frame fills the canvas, then translate its center back to
-    // the canvas center in normalized ClipTransform coordinates.
-    const double scale = std::max(1.0 / width, 1.0 / height);
+    // ClipGeometry has one uniform videoScale, so width defines both visible
+    // axes and keeps the crop locked to the canvas aspect ratio.
+    const double scale = 1.0 / width;
     return TransformValues{
         (0.5 - cx) * scale,
         (0.5 - cy) * scale,
@@ -90,15 +88,15 @@ Rect presetRect(Preset preset)
     switch (preset) {
     case Preset::ZoomIn:
     case Preset::ZoomOut:
-        return Rect{0.5, 0.5, 0.65, 0.65};
+        return Rect{0.5, 0.5, 0.65};
     case Preset::PanLeft:
-        return Rect{0.35, 0.5, 0.70, 0.70};
+        return Rect{0.35, 0.5, 0.70};
     case Preset::PanRight:
-        return Rect{0.65, 0.5, 0.70, 0.70};
+        return Rect{0.65, 0.5, 0.70};
     case Preset::PanUp:
-        return Rect{0.5, 0.35, 0.70, 0.70};
+        return Rect{0.5, 0.35, 0.70};
     case Preset::PanDown:
-        return Rect{0.5, 0.65, 0.70, 0.70};
+        return Rect{0.5, 0.65, 0.70};
     case Preset::Full:
         return Rect{};
     }

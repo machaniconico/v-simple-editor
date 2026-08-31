@@ -77,10 +77,13 @@ DynamicZoomDialog::DynamicZoomDialog(QWidget *parent)
         editors->cy = makeRectSpinBox(group, 0.0);
         editors->w = makeRectSpinBox(group, 0.01);
         editors->h = makeRectSpinBox(group, 0.01);
+        editors->h->setEnabled(false);
+        editors->h->setToolTip(
+            QStringLiteral("キャンバスのアスペクト比に合わせて自動設定されます"));
         form->addRow(QStringLiteral("中心 X (cx)"), editors->cx);
         form->addRow(QStringLiteral("中心 Y (cy)"), editors->cy);
         form->addRow(QStringLiteral("幅 (w)"), editors->w);
-        form->addRow(QStringLiteral("高さ (h)"), editors->h);
+        form->addRow(QStringLiteral("高さ (h、自動)"), editors->h);
         return group;
     };
     auto *frames = new QHBoxLayout();
@@ -105,10 +108,16 @@ DynamicZoomDialog::DynamicZoomDialog(QWidget *parent)
             this, &DynamicZoomDialog::applyPreset);
     const RectEditors editorSets[] = {m_startEditors, m_endEditors};
     for (const RectEditors& editors : editorSets) {
-        for (QDoubleSpinBox *spin : {editors.cx, editors.cy, editors.w, editors.h}) {
+        for (QDoubleSpinBox *spin : {editors.cx, editors.cy}) {
             connect(spin, qOverload<double>(&QDoubleSpinBox::valueChanged),
                     this, [this](double) { markCustom(); });
         }
+        connect(editors.w, qOverload<double>(&QDoubleSpinBox::valueChanged),
+                this, [this, height = editors.h](double width) {
+            const QSignalBlocker blocker(height);
+            height->setValue(width);
+            markCustom();
+        });
     }
     connect(swapButton, &QPushButton::clicked, this, [this]() {
         const dynzoom::Rect oldStart = startRect();
@@ -129,7 +138,7 @@ dynzoom::Rect DynamicZoomDialog::readRect(const RectEditors& editors)
 {
     return dynzoom::Rect{
         editors.cx->value(), editors.cy->value(),
-        editors.w->value(), editors.h->value()
+        editors.w->value()
     };
 }
 
@@ -143,7 +152,7 @@ void DynamicZoomDialog::writeRect(const RectEditors& editors,
     editors.cx->setValue(rect.cx);
     editors.cy->setValue(rect.cy);
     editors.w->setValue(rect.w);
-    editors.h->setValue(rect.h);
+    editors.h->setValue(rect.w);
 }
 
 dynzoom::Rect DynamicZoomDialog::startRect() const
