@@ -1,0 +1,292 @@
+================================================================================
+ V Simple Editor — 機能一覧と LLM(MCP) 検証ガイド
+ 作成日: 2026-08-29   対象ブランチ: feat/ai-chat-connection
+================================================================================
+
+このファイルは 3 部構成です。
+  第1部  今ある機能の一覧 (Premiere / After Effects / DaVinci Resolve との対応つき)
+  第2部  今後実装していく機能の一覧 (Wave 1 = 今回実装済み / Wave 2 / Wave 3)
+  第3部  LLM と MCP 連携しながら検証する手順 (準備 → 共通手順 → 機能別チェックリスト)
+
+凡例:  ○=同等機能あり  △=部分的  ×=無い  ★=今回 (Wave 1) 追加
+       [P]=Premiere Pro  [AE]=After Effects  [R]=DaVinci Resolve
+
+--------------------------------------------------------------------------------
+ 第1部  今ある機能の一覧
+--------------------------------------------------------------------------------
+
+■ 1. 編集 (タイムライン)
+  ○ リップル / ロール / スリップ / スライド トリム        [P][R]  トリムメニュー Q/W/R
+  ○ 3点編集 (ソースモニターから挿入/上書き)               [P][R]  表示>ソースモニター
+  ○ 再生ヘッドで分割 / 削除 / リップル削除 / ギャップを詰める
+  ○ スナップ / J-K-L 再生 / イン点・アウト点
+  ○ ネスト (プリコンポーズ) / パンくずナビ                   [P][AE][R] コンポジション>選択をプリコンポーズ
+  ○ 調整レイヤー                                            [P][AE][R] 挿入>調整レイヤー
+  ○ トラックマット / ブレンドモード                         [P][AE][R] コンポジション>トラックマット
+  ○ フリーズフレーム / 速度・持続時間 / スピードランプ / タイムリマップ
+  ○ トラックのミュート / ソロ / 非表示 / ロック (🔒ボタン)   ★保存対応は Wave 1
+  ○ リンクした映像/音声の同期移動・分割
+  ○ クリップのコピー&貼り付け / エフェクトのコピー&貼り付け / 属性の貼り付け
+  ○ マルチカメラ (△ 同期は基本。専用同期で音声相関あり)     [P][R]
+  ○ テキストベース編集 / 無音検出 / 自動ジャンプカット / シーン検出  [P][R]
+  ○ メディアプール (ビン / スマートビン / ドラッグ&ドロップ配置)     [P][R]
+  ○ マーカー (色付き / 一覧パネル / YouTube チャプター出力)
+  ○ Undo / Redo + ヒストリーパネル
+  ○ 自動保存 / 復旧 / インクリメンタル保存 / プロジェクト収集
+  ○ ワークスペース保存 / ショートカット設定 (Premiere/FCP/DaVinci プリセット)
+  ○ コマンドパレット (Ctrl+Shift+P)
+
+■ 2. モーション / アニメーション
+  ○ キーフレーム (位置/スケール/回転/不透明度/アンカー/スキュー)
+  ○ グラフエディタ / イージングプリセット / ベジェ / モーションパス / ループ
+  ○ ペアレント (ヌルオブジェクト) / エクスプレッション      [AE]
+  ○ モーションブラー                                        [AE][P]
+  ○ ウィグル / 手持ちカメラ風 / カメラモーション
+  ○ 3D カメラ / 3D ライト / 3D テキスト押し出し             [AE]
+
+■ 3. VFX / 合成
+  ○ ベジェマスク + プラナートラッカー連携 / ロト / 自動マット / AI マスク  [AE][R]
+  ○ モーショントラッカー / プラナートラッカー (Mocha 風)      [AE]
+  ○ クロマキー (精緻化ダイアログ)
+  ○ パペット / ワープ / 歪み / ディストーション系
+  ○ パーティクル / フラクタルノイズ / シェイプレイヤー / レイヤースタイル
+  ○ コンテンツに応じた塗りつぶし (オブジェクト除去)          [AE][R]
+  ○ 手ブレ補正 / フリッカー除去 / ノイズ除去
+  ○ ノードコンポジットモード (Fusion 風、線形チェーン)      [R]
+  ○ ビデオエフェクト 46 種 (Blur/Glow/Glitch/Halftone/Curves/... ) ★Wave 1 で 48 種
+  ○ トランジション 43 種 (Dissolve/Wipe/Push/Iris/LightLeak/...)
+  ○ GPU シェーダーエフェクト / プラグインエフェクト / エフェクトプリセット / エフェクトライブラリ
+  ○ VFX ジェネレータ / VFX 素材合成 / ブラシ書き起こしアニメ / Mograph テンプレート / ローワーサード / ウォーターマーク
+
+■ 4. カラー
+  ○ カラーホイール (Lift/Gamma/Gain) / RGB・Luma カーブ / HSL セカンダリ  [P][R]
+  ○ LUT 適用・管理 / ASC CDL 書き出し / カラーマッチ / 自動カラー
+  ○ ACES カラーマネジメント / HDR (HDR10/HLG) 出力 / Dolby Vision メタデータ (サイドカー)
+  ○ Lumetri 風スコープ (波形/ベクトル) / 露出補助 (フォルスカラー/ゼブラ/ピーキング)
+  ○ カラーパラメータのキーフレーム
+
+■ 5. オーディオ
+  ○ ミキサー / バス・サブミックス / トラック EQ / コンプレッサー / リミッター / リバーブ
+  ○ 自動ダッキング (BGM) / ボリュームエンベロープ / ステレオパン / チャンネルマッピング
+  ○ ラウドネス (BS.1770) 計測・正規化 / 音声リストア / スペクトル修復 / 音声分離 (スピーチ強調)
+  ○ ボイスオーバー録音 / VST・AU プラグイン / ビート検出
+  △ 音声トランジション (重なり時の自動クロスフェードのみ)
+
+■ 6. テキスト / 字幕
+  ○ テキスト/テロップ / タイトルプリセット / テキストアニメーション / パステキスト / 可変フォント
+  ○ 字幕エディタ / SRT・VTT 取込 / SRT・CSV 出力 / 放送字幕 (CEA-608/708 .scc)
+  ○ Whisper 自動字幕 (外部 whisper-cli が必要) / カラオケ 1 語字幕 / CPS チェック
+  ○ 字幕翻訳 (API キーが必要、既定はスタブ)
+
+■ 7. 書き出し / 連携
+  ○ レンダーキュー / バッチ書き出し / SNS 向け / モバイル向け / GIF・WebP / 現在フレーム
+  ○ Premiere XML / FCPXML / DaVinci XML / EDL / PPTX / Remotion 形式
+  ○ 取り込みハブ (Affinity PSD/SVG, Blender, OBS, Frame.io, URL(yt-dlp))
+  △ YouTube / Vimeo / Instagram / X 直送 (認証情報が必要)
+  ○ スマートリフレーム (縦/正方形) / SNS セーフゾーン / SNS プリセット
+  ○ プロキシ (自動マルチトラックプロキシ) / GPU 合成プレビュー (実験的)
+
+■ 8. AI / 自動化
+  ○ AI アップスケール / フレーム補間 / AI ハイライト / 自動カット / スマートエディット
+  ○ 文字起こしからハイライト検出 (Anthropic/OpenAI/Gemini/オフライン)
+  ○ MCP サーバ内蔵 (27 ツール ★Wave 1 で 33 ツール、selftest --selftest=mcp は
+    ★Wave 1 で G1..G134 の 134 ゲート) + AI チャット Dock (Claude Code / Codex CLI)
+     → 競合 3 製品には無い、本アプリ独自の機能
+
+--------------------------------------------------------------------------------
+ 第2部  今後実装していく機能
+--------------------------------------------------------------------------------
+
+■ Wave 1 (今回実装)  — 詳細な検証手順は第3部
+  ★ フィルムグレイン エフェクト                          [R] Film Grain / [P] ノイズ
+  ★ Echo (残像) エフェクト                                [AE] Echo
+  ★ トラックフラグ (ロック/ミュート/ソロ/非表示) の保存    [P][AE][R]
+  ★ クリップのラベルカラー (8 色)                         [P] ラベル / [R] クリップカラー
+  ★ クリップの逆再生 (映像 + 音声)                        [P][AE][R]
+  ★ タイムコード焼き込み (Data Burn-In)                   [P] タイムコード / [R] Data Burn-In
+  ★ ダイナミックズーム (Ken Burns 一発設定。枠は常にキャンバスのアスペクト比に
+    固定され、h を指定しても無視して warning を返す)        [R] Dynamic Zoom
+  ★ マッチフレーム                                        [P][R]
+  ★ クリップの置き換え (Replace with clip)                [P][R]
+  ★ MCP 新ツール: set_track_locked / set_clip_label / set_project_option /
+                   dynamic_zoom / match_frame / replace_clip / set_clip_property(reversed)
+
+■ Wave 2 (次回)
+  × オフラインメディアの再リンク                           [P][R]
+  × Log ホイール (Shadow/Mid/Highlight の Log レンジ)       [R]
+  × スチル保存 + ワイプ比較 (ギャラリー / 分割画面)          [R]
+  × ミュージックリミックス (BGM の尺合わせ、ビート検出を利用) [P] Remix / [R] Music Remixer
+  × ダイアログレベラー                                     [R]
+  × 音声トランジション (コンスタントパワー) の明示化        [P][R]
+  × パスに沿った自動回転 (Auto-Orient)                     [AE]
+  × シェイプモディファイア (Repeater / Trim Paths)          [AE]
+  △ マルチカム完全版 (音声相関同期を基本ダイアログへ)      [P][R]
+  △ Whisper / 字幕翻訳の外部エンジン検出と案内強化
+
+■ Wave 3 (大型・要検討)
+  × 3D カメラトラッカー                                    [AE]
+  × Morph Cut                                              [P]
+  × Color Warper                                           [R]
+  × Generative Extend / Depth Map / Relight (ML モデル前提のため対象外)
+
+--------------------------------------------------------------------------------
+ 第3部  LLM と MCP 連携しながら検証する手順
+--------------------------------------------------------------------------------
+
+■ 3.0 準備 (1 回だけ)
+  1. ビルド:  build.bat  (または  cmake --build build --config Release)
+     実行ファイル: build\Release\v-simple-editor.exe
+  2. 自動テスト (GUI 不要。exit code 0 = 全ゲート PASS):
+       build\Release\v-simple-editor.exe --selftest=mcp
+       build\Release\v-simple-editor.exe --selftest=fxgrain-echo
+       build\Release\v-simple-editor.exe --selftest=reverse-clip
+       build\Release\v-simple-editor.exe --selftest=tcburn
+       build\Release\v-simple-editor.exe --selftest=dynzoom
+     標準エラー出力に PASS G1 ... / summary: N PASS, 0 FAIL が出ます。
+  3. エディタを起動し、検証動画/ の素材を 2〜3 本タイムラインへ置く
+     (ファイル > ファイルを開く、または後述の import_media を LLM に頼む)。
+  4. 画面右下の「LLM に指示を出す」ボタンを押す
+     → MCP サーバが起動し AI チャット Dock が開きます。
+     Dock 下部に「MCP: 待受 127.0.0.1:8765」「CLI: Claude Code (検出済み) / モデル名」が出れば OK。
+     CLI が未検出なら:  npm i -g @anthropic-ai/claude-code   (Codex なら npm i -g @openai/codex)
+  5. 外部ターミナルから使う場合:
+       ツール > MCP サーバ > 接続情報...  で mcp.json をコピー → veditor-mcp.json に保存
+       claude --mcp-config veditor-mcp.json --strict-mcp-config
+
+■ 3.1 共通の検証ルール
+  ・LLM への指示は「〜して」と自然文で OK。LLM が MCP ツールを選んで実行します。
+  ・各操作後に次の 3 点を確認:
+      (a) タイムライン/プレビューが指示どおり変わった
+      (b) Ctrl+Z 1 回で元に戻る (Undo あり のツール)
+      (c) get_timeline / get_project_info の応答に新しい値が反映されている
+  ・まず「今のタイムラインを教えて」と聞いて get_timeline の出力を見るのが確実です。
+  ・ツール ID (list_commands の file.11 等) は位置依存なので、run_command を使う指示は
+    「先に list_commands で確認してから」と付けると安全です。
+  ・危険なコマンド: 終了系は MCP から実行不可。モーダルダイアログ系は allowBlocking が必要。
+
+■ 3.2 既存機能のスモークテスト (MCP 27 ツール)
+  □ 「プロジェクト情報を教えて」                      → get_project_info
+  □ 「検証動画フォルダの xxx.mp4 を V1 に取り込んで」  → import_media (V/A ペアで入る)
+  □ 「2 番目のクリップを 3 秒の位置で分割して」        → split_clip、Ctrl+Z で戻る
+  □ 「最初のクリップを削除してリップルで詰めて」        → delete_clip(ripple)
+  □ 「クリップ 1 を V2 に移動して」(V2 が無い場合は LLM が run_command でトラック追加)
+  □ 「クリップ 1 の音量を 50%、速度を 2 倍に」          → set_clip_property (音声も同期)
+  □ 「クリップ 1 の先頭を 1 秒詰めて」                   → trim_clip(edge=in)
+  □ 「クリップ 1 と 2 の間にクロスディゾルブ」          → set_transition
+  □ 「0〜3 秒に『テスト』というテロップを中央に」        → add_text_overlay
+  □ 「字幕を 2 件追加してタイムラインに適用」            → add_caption ×2 → apply_captions
+  □ 「5 秒時点のフレームを見せて」                        → get_frame (PNG が返る)
+  □ 「再生ヘッドを 10 秒へ」                              → set_playhead
+  □ 「デスクトップに test.veditor で保存」 → 「それを開き直して」 → save_project / open_project
+  □ 「mp4 に書き出して進捗を教えて」                      → export_video → get_export_status
+  □ 「元に戻す」「やり直す」                                → undo / redo
+
+■ 3.3 Wave 1 新機能の検証チェックリスト
+
+  ▼ (1) フィルムグレイン  (エフェクト > ビデオエフェクト / エフェクトライブラリ「スタイライズ」)
+     手動:  クリップを選択 → エフェクトライブラリで「フィルムグレイン」を追加 → amount を 0 → 0.6 に
+            期待: 0 のとき変化なし。上げるほど粒状ノイズ。再生を止めて同じフレームを 2 回見ても同じ模様 (決定論)。
+     LLM:   エフェクトの追加自体を行う専用 MCP ツールは無いため、手動でエフェクトを
+            追加した後に LLM へフレーム確認だけ依頼する。
+            呼び出し例:      get_frame {"timeSec": 5}
+            期待レスポンス:  {"ok": true, "timeSec": 5, "width": …, "height": …} と
+                            image content (PNG) にフィルムグレインのノイズが写っている
+     Undo:  Ctrl+Z 1 回で消える
+
+  ▼ (2) Echo (残像)  (エフェクトライブラリ「スタイライズ」)
+     手動:  動きのあるクリップに Echo (delaySec 0.1, count 3, decay 0.5, blend Lighten)
+            期待: 動く被写体の後ろに減衰する残像。再生ヘッドを前後にジャンプしても同じ時刻なら同じ絵 (seek に強い)。
+            書き出した動画でも同じ残像が出る (preview = export)。
+     LLM:   Echo も add_effect 相当の MCP ツールは無いため (1) と同様に手動追加 →
+            get_frame で確認する。
+            呼び出し例:      get_frame {"timeSec": 3}
+            期待レスポンス:  image content に減衰する残像が写っている
+
+  ▼ (3) トラックフラグの保存
+     手動:  トラックヘッダの 🔒 でロック → 保存 → 再起動して開く → 🔒 が復元されている
+            ロック中はクリップの移動/分割/削除ができない
+     LLM:   「V1 をロックして」→ set_track_locked → 「今のタイムライン」で locked:true
+            「V1 のクリップを分割して」→ ロック中なのでエラーが返る
+            「ロックを外して」→ 分割できる
+     呼び出し例:      set_track_locked {"kind":"video","trackIndex":0,"locked":true}
+     期待レスポンス:  {"ok":true,"kind":"video","trackIndex":0,"locked":true}
+                     (この後 split_clip を同じトラックに投げると "track is locked" 相当のエラー)
+     旧プロジェクト: trackFlags の無い .veditor を開いても全て未ロックで開ける
+
+  ▼ (4) クリップのラベルカラー
+     手動:  クリップ右クリック > ラベルカラー > 赤   → クリップ本体が赤系 + 下端バー
+            複数選択して一括で色付け → Ctrl+Z 1 回で全部戻る → 保存/再読込で保持
+     LLM:   「クリップ 1 を赤、クリップ 2 を青にラベル付けして」→ set_clip_label
+            「今のタイムライン」で label:"red" / "blue"
+     呼び出し例:      set_clip_label {"kind":"video","trackIndex":0,"clipIndex":0,"label":"red"}
+     期待レスポンス:  {"ok":true,"kind":"video","trackIndex":0,"clipIndex":0,"label":"red"}
+
+  ▼ (5) 逆再生
+     手動:  クリップ選択 → 編集 > 逆再生 (チェック) → クリップ名の前に ◀
+            再生: 映像が逆順、音声も逆順 (リンクした音声クリップにも適用)
+            書き出し: 出力動画も逆順。Ctrl+Z 1 回で戻る。保存/再読込で保持
+            速度 2 倍と併用しても逆順のまま
+     LLM:   「クリップ 2 を逆再生にして」→ set_clip_property(reversed=true)
+            「クリップ 2 の先頭と末尾のフレームを見せて」→ get_frame で反転を確認
+     呼び出し例:      set_clip_property {"kind":"video","trackIndex":0,"clipIndex":1,
+                                        "property":"reversed","value":true}
+     期待レスポンス:  {"ok":true,"property":"reversed","value":true,"linkedApplied":true}
+                     (linkedApplied:true ならリンクした音声クリップにも反転が適用済み)
+
+  ▼ (6) タイムコード焼き込み
+     手動:  ファイル > タイムコード焼き込み設定... → 有効、位置=下中央、フレーム表示 ON
+            プレビュー右下/下中央に「00:00:05:12」のような TC。29.97fps + ドロップフレームで「;」区切り
+            書き出した動画にも同じ位置に焼き込まれる。無効に戻すと消える。
+     LLM:   「タイムコード焼き込みを有効にして左上に出して」→ set_project_option
+            「プロジェクト情報」で timecodeBurnIn.enabled:true
+            「5 秒のフレームを見せて」→ get_frame に TC が写っている
+     呼び出し例:      set_project_option {"option":"timecodeBurnIn",
+                                         "value":{"enabled":true,"position":"topLeft"}}
+     期待レスポンス:  {"ok":true,"option":"timecodeBurnIn","value":{"enabled":true,
+                     "position":"topLeft","fontSizePct":…,"showFrames":…,"dropFrame":…,
+                     "prefix":…,"showClipName":…,"opacity":…}}
+                     (value に無い項目は既存設定のまま部分マージされる)
+
+  ▼ (7) ダイナミックズーム
+     手動:  クリップ選択 → コンポジション > ダイナミックズーム... → プリセット「ズームイン」→ OK
+            再生でゆっくり寄っていく。グラフエディタに scaleX/scaleY/positionX/positionY の KF が 2 つずつ。
+            Ctrl+Z 1 回で全 KF が消える。
+            枠は常にキャンバスのアスペクト比に固定されるため、高さ (h) の指定欄は無い。
+     LLM:   「クリップ 1 にズームアウトのダイナミックズームをかけて」→ dynamic_zoom(preset=zoomOut)
+            「左上 1/4 から全体へパンして」→ dynamic_zoom(start={cx:0.25,cy:0.25,w:0.5}, end=Full)
+     呼び出し例:      dynamic_zoom {"kind":"video","trackIndex":0,"clipIndex":0,"preset":"zoomOut"}
+     期待レスポンス:  {"ok":true,"kind":"video","trackIndex":0,"clipIndex":0,
+                     "keyframeCount":8,"keyframeCounts":{"positionX":2,"positionY":2,
+                     "scaleX":2,"scaleY":2}}
+     h を指定した場合: dynamic_zoom {..., "start":{"cx":0.25,"cy":0.25,"w":0.5,"h":0.3}, "end":{...}}
+                     → 期待レスポンス: 上記に加えて
+                     "warning":"h はキャンバス比に固定されるため指定値を無視しました"
+
+  ▼ (8) マッチフレーム
+     手動:  再生ヘッドをクリップ中央に置き F (割当キーはメニューで確認) → ソースモニターが同じ素材の同じ時刻で開く
+            速度 2 倍 / 逆再生のクリップでも正しいソース時刻
+     LLM:   「今の再生ヘッドのマッチフレームを出して」→ match_frame → 応答の sourceSec を確認
+     呼び出し例:      match_frame {}                     (省略時は現在の再生ヘッド位置)
+                     match_frame {"timeSec": 6.5}         (時刻を明示する場合)
+     期待レスポンス:  {"filePath":"C:/.../xxx.mp4","sourceSec":3.25,"clipIndex":0}
+
+  ▼ (9) クリップの置き換え
+     手動:  メディアプールで別素材を選択 → タイムラインのクリップ右クリック > 置き換え
+            位置・長さ・inPoint は保持され、素材だけ差し替わる。新素材が短ければ短縮 + 警告。Ctrl+Z 1 回で戻る
+     LLM:   「クリップ 1 を 検証動画\yyy.mp4 に置き換えて」→ replace_clip
+            「今のタイムライン」で filePath が変わり start/duration が同じ
+     呼び出し例:      replace_clip {"kind":"video","trackIndex":0,"clipIndex":0,
+                                   "filePath":"検証動画\\yyy.mp4"}
+     期待レスポンス:  {"ok":true}  (新素材が短い場合のみ {"ok":true,"warning":"…"})
+
+■ 3.4 回帰確認 (Wave 1 後に必ず)
+  □ 新機能を一切使わないプロジェクトの書き出しが以前と同一 (byte-identical)
+     → 旧 exe と新 exe で同じプロジェクトを書き出し、fc /b で比較
+  □ --selftest=mcp / trackmatte-parity / gpu-composite-parity / effect-preset / effect-library が全 PASS
+  □ 旧 .veditor プロジェクトが警告なく開ける
+
+■ 3.5 不具合を見つけたとき
+  ・AI チャット Dock のログ (ツール名・引数・応答) をそのまま貼る
+  ・再現に使った指示文、期待した結果、実際の結果、Ctrl+Z で戻ったか を添える
+  ・selftest が FAIL なら stderr の FAIL Gn 行を添える
+================================================================================

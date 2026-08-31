@@ -181,7 +181,7 @@ MCP の変更系ツールは確認ダイアログを出さず、原則として�
 | `split_clip` | クリップを分割する | あり |
 | `delete_clip` | クリップを削除する | あり |
 | `move_clip` | クリップを移動する（`newTrackIndex` で別トラックへ。既定プロジェクトは V1/A1 の 1 段なので、先に `run_command` の「ビデオトラックを追加」を実行する。存在しないトラックを指定するとエラー文でそのコマンド id を案内する） | あり |
-| `set_clip_property` | クリップのプロパティ（volume / opacity / speed / pan / videoScale）を変更する。`speed` はリンクした音声クリップにも同時に適用される | あり |
+| `set_clip_property` | クリップのプロパティ（volume / opacity / speed / pan / videoScale / reversed）を変更する。`speed` と `reversed` はリンクした音声クリップにも同時に適用される | あり |
 | `trim_clip` | edge=in は開始位置を保ったまま timeSec 時点の内容を新しい先頭にし、以降が (timeSec−開始) だけ左へ詰まる（RippleIn）。edge=out は末尾を timeSec にし後続が詰まる（RippleOut）。kind は video のみだが、同じ linkGroup の音声クリップも同じ量だけトリムされる（ripple 既定 true） | あり |
 | `set_transition` | V1 のクリップにトランジションを設定する（FadeIn は先頭、その他は末尾、None で解除） | あり |
 | `add_text_overlay` | V1 にテキスト／テロップを追加する（時刻は秒、位置は 0..1。区間と重なる全クリップに付くのでクリップ境界をまたいでも表示される） | あり |
@@ -192,8 +192,14 @@ MCP の変更系ツールは確認ダイアログを出さず、原則として�
 | `set_playhead` | 再生ヘッドを移動する | なし |
 | `undo` | 直前の編集を元に戻す | なし |
 | `redo` | 元に戻した編集をやり直す | なし |
+| `set_track_locked` | 指定トラックの編集ロックを設定する。ロック中は `split_clip` / `delete_clip` / `move_clip` などのクリップ編集を拒否する | なし（ロック変更自体は Ctrl+Z 対象外） |
+| `set_clip_label` | クリップのラベルカラーを設定する（`none` / `red` / `orange` / `yellow` / `green` / `cyan` / `blue` / `purple` / `pink`）。`kind` / `trackIndex` 省略時は video / 0 | あり |
+| `set_project_option` | プロジェクト全体の設定を変更する。現在は `option=timecodeBurnIn` のみ受け付け、プレビューと以後の書き出しへ即時反映する | なし（Ctrl+Z 対象外） |
+| `dynamic_zoom` | 指定動画クリップへダイナミックズームを適用し、位置とスケールに開始・終了キーフレームを生成する。`preset`（zoomIn / zoomOut / panLeft / panRight / panUp / panDown）か `start` / `end`（cx / cy / w の正規化座標）のどちらか一方を指定する（両方指定はエラー）。枠は常にキャンバスのアスペクト比に固定され、`h` を指定しても無視して warning を返す | あり |
+| `match_frame` | 再生ヘッド位置（または `timeSec`）の動画クリップを、speed・逆再生・リマップを反映したソース時刻でソースモニターに開く | なし |
+| `replace_clip` | 指定クリップの素材を `filePath` のメディアへ置き換える。位置・inPoint・長さを可能な限り維持し、同じ linkGroup の音声も新素材に音声があれば置き換える。新素材が短い場合は warning を返す | あり |
 
-MCP サーバの自己テストは `--selftest=mcp` または `VEDITOR_MCP_SELFTEST=1` で実行できます（実装: `src/selftests/mcp_selftest.cpp`、ゲート G1..G113）。
+MCP サーバの自己テストは `--selftest=mcp` または `VEDITOR_MCP_SELFTEST=1` で実行できます（実装: `src/selftests/mcp_selftest.cpp`、ゲート G1..G134）。
 
 ---
 
