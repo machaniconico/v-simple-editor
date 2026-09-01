@@ -282,6 +282,7 @@ double exporter_loudnessGainDb();
 #include <QDir>
 #include <QThread>
 #include <algorithm>
+#include <utility>
 #include <cmath>
 #include <array>
 #include <limits>
@@ -2834,6 +2835,11 @@ MainWindow::MainWindow(QWidget *parent)
     connect(m_timeline->undoManager(), &UndoManager::stateChanged, this, [this]() {
         updateEditActions();
     });
+    m_mediaRelinkObservedSaveSerial = m_timeline->undoManager()->saveSerial();
+    m_mediaRelinkObservedUndoIndex = m_timeline->undoManager()->currentIndex();
+    captureMediaRelinkSidecarsAtCurrentUndoIndex();
+    connect(m_timeline->undoManager(), &UndoManager::historyChanged,
+            this, &MainWindow::handleMediaRelinkHistoryChanged);
     connect(m_timeline->undoManager(), &UndoManager::stateJumpRequested,
             m_timeline, &Timeline::restoreState);
     // undo/redo/履歴ジャンプでプロジェクト出力ジオメトリが復元されたら、canvas +
@@ -7863,6 +7869,7 @@ void MainWindow::populateProjectData(ProjectData &data)
     data.videoTracks = m_timeline->allVideoTracks();
     data.audioTracks = m_timeline->allAudioTracks();
     data.generatedCaptionOverlays = m_timeline->generatedCaptionOverlays();
+    data.overlays = m_projectOverlays;
     data.playheadPos = m_timeline->playheadPosition();
     data.markIn = m_timeline->markedIn();
     data.markOut = m_timeline->markedOut();
@@ -8077,19 +8084,13 @@ void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
                                         const QString &filePath)
 {
     ProjectData data = loadedData;
-    const ProjectTrackClips originalVideoTracks = loadedData.videoTracks;
-    const ProjectTrackClips originalAudioTracks = loadedData.audioTracks;
-    const QVector<ClipParentEntry> originalClipParentEntries =
-        loadedData.clipParentEntries;
     QHash<QString, QString> relinkMapping;
     if (m_promptForMissingMedia) {
         const QStringList missing = mediapaths::missingFiles(data);
         if (!missing.isEmpty()) {
             MediaRelinkDialog dialog(missing, this);
-            if (dialog.exec() == QDialog::Accepted) {
+            if (dialog.exec() == QDialog::Accepted)
                 relinkMapping = dialog.mapping();
-                mediapaths::replacePaths(data, relinkMapping);
-            }
         }
     }
 
@@ -8120,9 +8121,7 @@ void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
     // SSOT renderer (preview AND export) sources it from the Timeline.
     syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
     QHash<QString, QString> parentEntries;
-    const QVector<ClipParentEntry> &timelineParentEntries = relinkMapping.isEmpty()
-        ? data.clipParentEntries : originalClipParentEntries;
-    for (const auto &entry : timelineParentEntries) {
+    for (const auto &entry : data.clipParentEntries) {
         if (!entry.clipId.isEmpty() && !entry.parentClipId.isEmpty()
             && entry.clipId != entry.parentClipId) {
             parentEntries.insert(entry.clipId, entry.parentClipId);
@@ -8178,16 +8177,16 @@ void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
     }
     if (m_timeline) {
         m_timeline->restoreGeneratedCaptionOverlays(data.generatedCaptionOverlays);
-        m_timeline->restoreFromProject(
-            relinkMapping.isEmpty() ? data.videoTracks : originalVideoTracks,
-            relinkMapping.isEmpty() ? data.audioTracks : originalAudioTracks,
-                                       data.playheadPos, data.markIn, data.markOut, data.zoomLevel);
+        m_timeline->restoreFromProject(data.videoTracks, data.audioTracks,
+                                       data.playheadPos, data.markIn,
+                                       data.markOut, data.zoomLevel);
         syncTimeRemapEntriesToTimeline(m_timeline, m_timeRemapClipEntries);
     }
 
     rebuildAudioMeters();
     applyAudioState(data);
 
+    m_projectOverlays = data.overlays;
     m_particleClipConfigs.clear();
     for (const auto &entry : data.particleClipEntries) {
         QString key = entry.clipFilePath;
@@ -8304,7 +8303,12 @@ void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
     }
     if (m_timeline && !relinkMapping.isEmpty()) {
         QString relinkError;
-        m_timeline->relinkMediaPaths(relinkMapping, &relinkError);
+        if (!relinkMediaPaths(relinkMapping, &relinkError)) {
+            statusBar()->showMessage(
+                QStringLiteral("メディアの再リンクに失敗しました: %1")
+                    .arg(relinkError),
+                5000);
+        }
     }
 
     updateTitle();
@@ -8313,6 +8317,103 @@ void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
     updateEditActions();
     syncBrushAnimationPreviewForClip(0, m_timeline ? m_timeline->selectedVideoClipIndex() : -1);
     refreshSpecialClipPreview();
+}
+
+bool MainWindow::relinkMediaPaths(
+    const QHash<QString, QString> &oldToNew, QString *errorOut)
+{
+    if (!m_timeline) {
+        if (errorOut)
+            *errorOut = QStringLiteral("タイムラインを利用できません");
+        return false;
+    }
+
+    // Preserve the exact pre-operation sidecars for the current undo entry.
+    // This also covers programmatic callers that populated sidecars after the
+    // baseline TimelineState was created.
+    captureMediaRelinkSidecarsAtCurrentUndoIndex();
+    return m_timeline->relinkMediaPaths(
+        oldToNew, errorOut,
+        [this](const QHash<QString, QString> &mapping) {
+            return relinkMediaSidecars(mapping);
+        });
+}
+
+bool MainWindow::relinkMediaSidecars(
+    const QHash<QString, QString> &oldToNew)
+{
+    bool changed = false;
+    for (OverlayItem &overlay : m_projectOverlays) {
+        if (overlay.type != QLatin1String("image"))
+            continue;
+        const auto replacement = oldToNew.constFind(overlay.text);
+        if (replacement == oldToNew.cend() || replacement.value() == overlay.text)
+            continue;
+        overlay.text = replacement.value();
+        changed = true;
+    }
+
+    QHash<QString, ParticleEmitterConfig> remappedParticleConfigs;
+    remappedParticleConfigs.reserve(m_particleClipConfigs.size());
+    for (auto it = m_particleClipConfigs.cbegin();
+         it != m_particleClipConfigs.cend(); ++it) {
+        const QString replacement = oldToNew.value(it.key(), it.key());
+        remappedParticleConfigs.insert(replacement, it.value());
+        changed = changed || replacement != it.key();
+    }
+    if (changed)
+        m_particleClipConfigs = std::move(remappedParticleConfigs);
+    return changed;
+}
+
+void MainWindow::captureMediaRelinkSidecarsAtCurrentUndoIndex()
+{
+    if (!m_timeline || !m_timeline->undoManager())
+        return;
+    const int index = m_timeline->undoManager()->currentIndex();
+    if (index < 0)
+        return;
+    if (m_mediaRelinkSidecarHistory.size() <= index)
+        m_mediaRelinkSidecarHistory.resize(index + 1);
+    m_mediaRelinkSidecarHistory[index] = {
+        m_projectOverlays, m_particleClipConfigs
+    };
+}
+
+void MainWindow::handleMediaRelinkHistoryChanged()
+{
+    if (!m_timeline || !m_timeline->undoManager())
+        return;
+    UndoManager *undo = m_timeline->undoManager();
+    const quint64 saveSerial = undo->saveSerial();
+    const int index = undo->currentIndex();
+
+    if (index < 0) {
+        m_mediaRelinkSidecarHistory.clear();
+    } else if (saveSerial != m_mediaRelinkObservedSaveSerial) {
+        // A new edit invalidates redo snapshots. At MAX_UNDO the index stays
+        // fixed while the oldest TimelineState is removed, so mirror that
+        // left shift before appending the current sidecars.
+        if (index == m_mediaRelinkObservedUndoIndex
+            && index == UndoManager::MAX_UNDO - 1
+            && m_mediaRelinkSidecarHistory.size() == UndoManager::MAX_UNDO) {
+            m_mediaRelinkSidecarHistory.removeFirst();
+        } else if (m_mediaRelinkSidecarHistory.size() > index) {
+            m_mediaRelinkSidecarHistory.resize(index);
+        }
+        m_mediaRelinkSidecarHistory.resize(index + 1);
+        m_mediaRelinkSidecarHistory[index] = {
+            m_projectOverlays, m_particleClipConfigs
+        };
+    } else if (index < m_mediaRelinkSidecarHistory.size()) {
+        const MediaRelinkSidecarState &state =
+            m_mediaRelinkSidecarHistory.at(index);
+        m_projectOverlays = state.overlays;
+        m_particleClipConfigs = state.particleClipConfigs;
+    }
+
+    m_mediaRelinkObservedSaveSerial = saveSerial;
+    m_mediaRelinkObservedUndoIndex = index;
 }
 
 void MainWindow::collectAudioState(ProjectData &data)
@@ -8402,6 +8503,8 @@ void MainWindow::newProject()
             m_light3DDialog->close();
         m_projectCamera = Camera3D{};
         m_projectLights.clear();
+        m_projectOverlays.clear();
+        m_particleClipConfigs.clear();
         syncProjectLightingToTimeline();
         m_tcBurnIn = TimecodeBurnInSettings{};
         applyProjectConfig(dialog.config());

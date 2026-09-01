@@ -5677,7 +5677,9 @@ bool Timeline::replaceClipMedia(TrackKind kind, int trackIndex, int clipIndex,
 }
 
 bool Timeline::relinkMediaPaths(const QHash<QString, QString> &oldToNew,
-                                QString *errorOut)
+                                QString *errorOut,
+                                const std::function<bool(
+                                    const QHash<QString, QString> &)> &relinkSidecars)
 {
     if (errorOut)
         errorOut->clear();
@@ -5774,6 +5776,13 @@ bool Timeline::relinkMediaPaths(const QHash<QString, QString> &oldToNew,
             }
         }
     }
+
+    // MainWindow owns project-level image overlays and particle emitter
+    // configs. Let their owner join this already-validated mutation before
+    // the single undo snapshot is saved. A sidecar-only mapping is still a
+    // real relink even when no active/nested ClipInfo uses it.
+    if (relinkSidecars)
+        changed = relinkSidecars(oldToNew) || changed;
 
     if (!changed)
         return fail(QStringLiteral("置換対象のメディア参照がありません"));

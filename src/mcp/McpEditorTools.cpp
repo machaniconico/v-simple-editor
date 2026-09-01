@@ -2829,7 +2829,7 @@ void McpEditorTools::registerWriteTools()
             if (!m_window || !currentTimeline)
                 return setError(err, QStringLiteral("editor not available")), QJsonObject();
             QString relinkError;
-            if (!currentTimeline->relinkMediaPaths(mapping, &relinkError))
+            if (!m_window->relinkMediaPaths(mapping, &relinkError))
                 return setError(err, relinkError), QJsonObject();
 
             m_window->setWindowModified(true);

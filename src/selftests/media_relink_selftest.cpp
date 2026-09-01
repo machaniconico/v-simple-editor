@@ -64,11 +64,15 @@ int runMediaRelinkSelftest()
     ClipInfo activeClip;
     activeClip.filePath = oldPath;
     activeClip.lutFilePath = oldLutPath;
+    activeClip.duration = 1.0;
+    activeClip.outPoint = 1.0;
     activeData.videoTracks = ProjectTrackClips{
         QVector<ClipInfo>{activeClip}
     };
     ClipInfo audioClip;
     audioClip.filePath = oldPath;
+    audioClip.duration = 1.0;
+    audioClip.outPoint = 1.0;
     activeData.audioTracks = ProjectTrackClips{
         QVector<ClipInfo>{audioClip}
     };
@@ -97,6 +101,8 @@ int runMediaRelinkSelftest()
     ClipInfo nestedClip;
     nestedClip.filePath = oldPath;
     nestedClip.lutFilePath = oldLutPath;
+    nestedClip.duration = 1.0;
+    nestedClip.outPoint = 1.0;
     nestedSequence.videoTracks = {
         QVector<ClipInfo>{nestedClip}
     };
@@ -231,23 +237,28 @@ int runMediaRelinkSelftest()
          relinkError.isEmpty() ? QStringLiteral("relink or one-step undo lost references")
                                : relinkError);
 
-    ProjectData saveData;
-    ClipInfo savedClip;
-    savedClip.filePath = newPath;
-    savedClip.lutFilePath = newLutPath;
-    saveData.videoTracks = ProjectTrackClips{
-        QVector<ClipInfo>{savedClip}
-    };
+    ProjectData saveData = activeData;
+    saveData.clipParentEntries = nestedData.clipParentEntries;
+    const int persistedReplacementCount = mediapaths::replacePaths(
+        saveData, {{oldPath, newPath}, {oldLutPath, newLutPath}});
     const QString projectPath = QDir(fixtureDir.path()).filePath(
         QStringLiteral("media-relink-roundtrip.veditor"));
     ProjectData loadedData;
-    const bool roundTrip = fixturesReady
+    QVector<mediapaths::PathSlot> loadedSlots;
+    const bool savedAndLoaded = fixturesReady
+        && persistedReplacementCount >= 7
         && ProjectFile::save(projectPath, saveData)
-        && ProjectFile::load(projectPath, loadedData)
-        && !loadedData.videoTracks.isEmpty()
-        && !loadedData.videoTracks.first().isEmpty()
-        && loadedData.videoTracks.first().first().filePath == newPath
-        && loadedData.videoTracks.first().first().lutFilePath == newLutPath;
+        && ProjectFile::load(projectPath, loadedData);
+    if (savedAndLoaded)
+        loadedSlots = mediapaths::enumeratePathSlots(loadedData);
+    const bool roundTrip = savedAndLoaded
+        && hasSlot(loadedSlots, newPath, QStringLiteral("video.filePath"))
+        && hasSlot(loadedSlots, newLutPath, QStringLiteral("video.lutFilePath"))
+        && hasSlot(loadedSlots, newPath, QStringLiteral("particle.clipFilePath"))
+        && hasSlot(loadedSlots, newPath, QStringLiteral("overlay.image"))
+        && hasSlot(loadedSlots, newPath, QStringLiteral("nested.video.filePath"))
+        && hasSlot(loadedSlots, newLutPath,
+                   QStringLiteral("nested.video.lutFilePath"));
     gate(roundTrip, "G5", QStringLiteral("relinked paths did not survive save/load"));
 
     std::cerr << "[media-relink] summary: " << passed << " PASS, "

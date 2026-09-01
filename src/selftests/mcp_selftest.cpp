@@ -2418,6 +2418,13 @@ int runMcpSelftest()
         ClipInfo relinkAudioClip = relinkVideoClip;
         relinkVideoTrack->setClips({relinkVideoClip});
         relinkAudioTrack->setClips({relinkAudioClip});
+        projectInfoWindow.m_particleClipConfigs.clear();
+        projectInfoWindow.m_particleClipConfigs.insert(
+            relinkOldPath, ParticleEmitterConfig{});
+        OverlayItem relinkOverlay;
+        relinkOverlay.type = QStringLiteral("image");
+        relinkOverlay.text = relinkOldPath;
+        projectInfoWindow.m_projectOverlays = {relinkOverlay};
         projectTimeline->clearSelection();
         projectTimeline->undoManager()->clear();
         projectTimeline->undoManager()->saveState(
@@ -2434,6 +2441,24 @@ int runMcpSelftest()
             244, QStringLiteral("relink_media"), QJsonObject{
                 {QStringLiteral("mapping"), mapping}
             });
+        const bool sidecarsRelinked =
+            projectInfoWindow.m_particleClipConfigs.contains(relinkNewPath)
+            && !projectInfoWindow.m_particleClipConfigs.contains(relinkOldPath)
+            && projectInfoWindow.m_projectOverlays.size() == 1
+            && projectInfoWindow.m_projectOverlays.first().text == relinkNewPath;
+        projectTimeline->undo();
+        const bool sidecarsUndoRestored =
+            !projectTimeline->canUndo()
+            && projectInfoWindow.m_particleClipConfigs.contains(relinkOldPath)
+            && !projectInfoWindow.m_particleClipConfigs.contains(relinkNewPath)
+            && projectInfoWindow.m_projectOverlays.size() == 1
+            && projectInfoWindow.m_projectOverlays.first().text == relinkOldPath;
+        projectTimeline->redo();
+        const bool sidecarsRedoRestored =
+            projectInfoWindow.m_particleClipConfigs.contains(relinkNewPath)
+            && !projectInfoWindow.m_particleClipConfigs.contains(relinkOldPath)
+            && projectInfoWindow.m_projectOverlays.size() == 1
+            && projectInfoWindow.m_projectOverlays.first().text == relinkNewPath;
         const bool g135 = !toolResult(relinkResponse)
                                 .value(QStringLiteral("isError")).toBool(true)
             && toolPayload(relinkResponse).value(QStringLiteral("ok")).toBool(false)
@@ -2443,7 +2468,8 @@ int runMcpSelftest()
             && relinkVideoTrack->clips().first().filePath == relinkNewPath
             && relinkAudioTrack->clips().first().filePath == relinkNewPath
             && relinkVideoTrack->clips().first().linkGroup == 935
-            && relinkAudioTrack->clips().first().linkGroup == 935;
+            && relinkAudioTrack->clips().first().linkGroup == 935
+            && sidecarsRelinked && sidecarsUndoRestored && sidecarsRedoRestored;
         g135 ? pass("G135 relink_media applies a valid mapping")
              : fail("G135 relink_media applies a valid mapping",
                     QStringLiteral("valid mapping did not update the linked clips"));
@@ -2471,6 +2497,8 @@ int runMcpSelftest()
 
         relinkVideoTrack->setClips({});
         relinkAudioTrack->setClips({});
+        projectInfoWindow.m_particleClipConfigs.clear();
+        projectInfoWindow.m_projectOverlays.clear();
         projectTimeline->clearSelection();
         projectTimeline->undoManager()->clear();
         projectTimeline->undoManager()->saveState(

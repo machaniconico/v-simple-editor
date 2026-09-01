@@ -237,6 +237,7 @@ class MainWindow : public QMainWindow
     // Timeline) を読み書きするため friend にしている。GUI スレッド上でしか
     // 呼ばれない (McpHttpServer が GUI スレッドのイベントループで動く)。
     friend class mcp::McpEditorTools;
+    friend int runMcpSelftest();
 
 public:
     explicit MainWindow(QWidget *parent = nullptr);
@@ -710,6 +711,11 @@ private:
     void updateTitle();
     void populateProjectData(ProjectData &data);
     void applyLoadedProjectData(const ProjectData &data, const QString &filePath);
+    bool relinkMediaPaths(const QHash<QString, QString> &oldToNew,
+                          QString *errorOut = nullptr);
+    bool relinkMediaSidecars(const QHash<QString, QString> &oldToNew);
+    void captureMediaRelinkSidecarsAtCurrentUndoIndex();
+    void handleMediaRelinkHistoryChanged();
     void collectAudioState(ProjectData &data);
     void applyAudioState(const ProjectData &data);
     bool m_promptForMissingMedia = true;
@@ -789,7 +795,15 @@ private:
     QStringList m_supportedFormats;
     ProjectConfig m_projectConfig;
     QVector<BrushAnimationEntry> m_brushAnimationEntries;
+    QVector<OverlayItem> m_projectOverlays;
     QHash<QString, ParticleEmitterConfig> m_particleClipConfigs;
+    struct MediaRelinkSidecarState {
+        QVector<OverlayItem> overlays;
+        QHash<QString, ParticleEmitterConfig> particleClipConfigs;
+    };
+    QVector<MediaRelinkSidecarState> m_mediaRelinkSidecarHistory;
+    quint64 m_mediaRelinkObservedSaveSerial = 0;
+    int m_mediaRelinkObservedUndoIndex = -1;
     QHash<QString, BrushAnimation *> m_liveBrushAnimations;
     QHash<QString, RotoClipEntry> m_rotoClipEntries;
     QHash<QString, TimeRemapClipEntry> m_timeRemapClipEntries;

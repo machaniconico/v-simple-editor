@@ -16,6 +16,7 @@
 #include <QString>
 #include <QJsonObject>
 #include <cstdint>
+#include <functional>
 #include <initializer_list>
 #include <optional>
 #include <utility>
@@ -681,7 +682,9 @@ public:
     // 参照切れメディアの一括再リンク。filePath と lutFilePath を active / nested
     // sequence 全体で置換し、マット・親子 carrier を維持したまま 1 Undo にまとめる。
     bool relinkMediaPaths(const QHash<QString, QString> &oldToNew,
-                          QString *errorOut = nullptr);
+                          QString *errorOut = nullptr,
+                          const std::function<bool(
+                              const QHash<QString, QString> &)> &relinkSidecars = {});
     bool setClipLabel(TrackKind kind, int trackIndex, int clipIndex, ClipLabel label);
     bool selectClipByIndex(bool audio, int trackIndex, int clipIndex, QString *err);
     void clearSelection();
