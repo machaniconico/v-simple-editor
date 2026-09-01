@@ -1,5 +1,8 @@
 #include "ProjectCollector.h"
+#include "ClipGeometry.h"
+#include "MediaPaths.h"
 #include "ProjectFile.h"
+#include "Timeline.h"
 
 #include <QDir>
 #include <QFile>
@@ -43,54 +46,6 @@ static QString resolveDestBasename(const QString& srcPath,
     seenSrcToBasename.insert(srcPath, candidate);
     seenBasenameToSrc.insert(candidate, srcPath);
     return candidate;
-}
-
-// ---------------------------------------------------------------------------
-// PathSlot — file-scope struct, safe for QVector + range-for under MSVC
-// ---------------------------------------------------------------------------
-
-struct PathSlot {
-    QString* field;    // pointer into a mutable ProjectData field
-    QString  srcPath;  // the absolute source path at collection time
-};
-
-// Collect all media path pathSlots from a ProjectData copy.
-static QVector<PathSlot> collectSlots(ProjectData& data)
-{
-    QVector<PathSlot> pathSlots;
-
-    for (int ti = 0; ti < data.videoTracks.size(); ++ti) {
-        QVector<ClipInfo>& track = data.videoTracks[ti];
-        for (int ci = 0; ci < track.size(); ++ci) {
-            ClipInfo& clip = track[ci];
-            if (!clip.filePath.isEmpty())
-                pathSlots.append({&clip.filePath, clip.filePath});
-        }
-    }
-
-    for (int ti = 0; ti < data.audioTracks.size(); ++ti) {
-        QVector<ClipInfo>& track = data.audioTracks[ti];
-        for (int ci = 0; ci < track.size(); ++ci) {
-            ClipInfo& clip = track[ci];
-            if (!clip.filePath.isEmpty())
-                pathSlots.append({&clip.filePath, clip.filePath});
-        }
-    }
-
-    for (int i = 0; i < data.particleClipEntries.size(); ++i) {
-        ParticleClipEntry& pce = data.particleClipEntries[i];
-        if (!pce.clipFilePath.isEmpty())
-            pathSlots.append({&pce.clipFilePath, pce.clipFilePath});
-    }
-
-    // OverlayItem with type == "image": path stored in `text` field.
-    for (int i = 0; i < data.overlays.size(); ++i) {
-        OverlayItem& overlay = data.overlays[i];
-        if (overlay.type == QLatin1String("image") && !overlay.text.isEmpty())
-            pathSlots.append({&overlay.text, overlay.text});
-    }
-
-    return pathSlots;
 }
 
 // ---------------------------------------------------------------------------
@@ -194,13 +149,24 @@ void ProjectCollector::doCollect(ProjectData dataCopy,
     QHash<QString, QString> srcToBasename;
     QHash<QString, QString> basenameToSrc;
 
-    // 2. Collect all path pathSlots from the data copy.
-    QVector<PathSlot> pathSlots = collectSlots(dataCopy);
+    // 2. Collect all path slots from the data copy and snapshot their sources
+    // before any slot writer mutates the project data.
+    QVector<mediapaths::PathSlot> pathSlots =
+        mediapaths::enumeratePathSlots(dataCopy);
+    QVector<QString> sourcePaths;
+    sourcePaths.reserve(pathSlots.size());
+    for (const mediapaths::PathSlot& slot : pathSlots)
+        sourcePaths.append(slot.value());
 
     // 3. Compute total bytes for progress reporting (best-effort).
     qint64 totalBytes = 0;
     for (int i = 0; i < pathSlots.size(); ++i) {
-        QFileInfo fi(pathSlots[i].srcPath);
+        const QString& src = sourcePaths.at(i);
+        if (clipgeom::isNullObjectFilePath(src)
+            || timeline_nesting::isSequenceClipFilePath(src)) {
+            continue;
+        }
+        QFileInfo fi(src);
         if (fi.exists())
             totalBytes += fi.size();
     }
@@ -215,8 +181,12 @@ void ProjectCollector::doCollect(ProjectData dataCopy,
             return;
         }
 
-        PathSlot& ps = pathSlots[i];
-        const QString& src = ps.srcPath;
+        mediapaths::PathSlot& ps = pathSlots[i];
+        const QString& src = sourcePaths.at(i);
+        if (clipgeom::isNullObjectFilePath(src)
+            || timeline_nesting::isSequenceClipFilePath(src)) {
+            continue;
+        }
         QFileInfo srcInfo(src);
 
         if (src.isEmpty() || !srcInfo.exists()) {
@@ -283,7 +253,7 @@ void ProjectCollector::doCollect(ProjectData dataCopy,
         }
 
         // The loader opens filePath as-is, so avoid CWD-dependent collected projects.
-        *ps.field = QDir::cleanPath(destPath);
+        ps.setValue(QDir::cleanPath(destPath));
     }
 
     if (m_cancelled) {
