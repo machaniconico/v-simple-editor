@@ -8308,6 +8308,10 @@ void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
                 QStringLiteral("メディアの再リンクに失敗しました: %1")
                     .arg(relinkError),
                 5000);
+        } else {
+            // The loaded file still contains the old paths. Keep the project
+            // dirty until the successful relink is explicitly saved.
+            setWindowModified(true);
         }
     }
 
@@ -8706,8 +8710,8 @@ bool MainWindow::openProjectFromPath(const QString &filePath,
     // 開く。確認モーダルを出すと MCP 呼び出しが応答待ちのまま詰まるためである。
     const QScopedValueRollback<bool> promptGuard(
         m_promptForMissingMedia, promptForMissingMedia);
-    applyLoadedProjectData(data, path);
     setWindowModified(false);
+    applyLoadedProjectData(data, path);
     return true;
 }
 
@@ -17015,6 +17019,7 @@ void MainWindow::openRecentFile(const QString &filePath)
     if (filePath.endsWith(".veditor", Qt::CaseInsensitive)) {
         ProjectData data;
         if (ProjectFile::load(filePath, data)) {
+            setWindowModified(false);
             applyLoadedProjectData(data, filePath);
             statusBar()->showMessage("Opened project: " + fi.fileName());
         }
@@ -17466,6 +17471,7 @@ void MainWindow::dropEvent(QDropEvent *event)
             // Open as project
             ProjectData data;
             if (ProjectFile::load(filePath, data)) {
+                setWindowModified(false);
                 applyLoadedProjectData(data, filePath);
                 statusBar()->showMessage("Opened project: " + QFileInfo(filePath).fileName());
             }

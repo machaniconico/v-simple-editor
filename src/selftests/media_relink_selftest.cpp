@@ -71,6 +71,7 @@ int runMediaRelinkSelftest()
     };
     ClipInfo audioClip;
     audioClip.filePath = oldPath;
+    audioClip.lutFilePath = oldLutPath;
     audioClip.duration = 1.0;
     audioClip.outPoint = 1.0;
     activeData.audioTracks = ProjectTrackClips{
@@ -89,6 +90,7 @@ int runMediaRelinkSelftest()
     const bool g1 = hasSlot(activeSlots, oldPath, QStringLiteral("video.filePath"))
         && hasSlot(activeSlots, oldLutPath, QStringLiteral("video.lutFilePath"))
         && hasSlot(activeSlots, oldPath, QStringLiteral("audio.filePath"))
+        && hasSlot(activeSlots, oldLutPath, QStringLiteral("audio.lutFilePath"))
         && hasSlot(activeSlots, oldPath, QStringLiteral("particle.clipFilePath"))
         && hasSlot(activeSlots, oldPath, QStringLiteral("overlay.image"));
     gate(g1, "G1", QStringLiteral("active timeline path slots were incomplete"));
@@ -237,16 +239,73 @@ int runMediaRelinkSelftest()
          relinkError.isEmpty() ? QStringLiteral("relink or one-step undo lost references")
                                : relinkError);
 
-    ProjectData saveData = activeData;
-    saveData.clipParentEntries = nestedData.clipParentEntries;
-    const int persistedReplacementCount = mediapaths::replacePaths(
-        saveData, {{oldPath, newPath}, {oldLutPath, newLutPath}});
+    Timeline persistenceTimeline;
+    TimelineSequence activeSequence;
+    activeSequence.id = QStringLiteral("active");
+    activeSequence.name = QStringLiteral("Active");
+    activeSequence.videoTracks = activeData.videoTracks;
+    activeSequence.audioTracks = activeData.audioTracks;
+    persistenceTimeline.setSequences(
+        {activeSequence, nestedSequence}, activeSequence.id);
+    persistenceTimeline.undoManager()->clear();
+    persistenceTimeline.undoManager()->saveState(
+        persistenceTimeline.currentState(),
+        QStringLiteral("persistence baseline"));
+
+    QVector<ParticleClipEntry> persistedParticles = activeData.particleClipEntries;
+    QVector<OverlayItem> persistedOverlays = activeData.overlays;
+    const auto relinkSidecars = [&persistedParticles, &persistedOverlays](
+                                    const QHash<QString, QString> &mapping) {
+        bool changed = false;
+        for (ParticleClipEntry &entry : persistedParticles) {
+            const auto replacement = mapping.constFind(entry.clipFilePath);
+            if (replacement == mapping.cend()
+                || replacement.value() == entry.clipFilePath) {
+                continue;
+            }
+            entry.clipFilePath = replacement.value();
+            changed = true;
+        }
+        for (OverlayItem &overlay : persistedOverlays) {
+            if (overlay.type != QLatin1String("image"))
+                continue;
+            const auto replacement = mapping.constFind(overlay.text);
+            if (replacement == mapping.cend()
+                || replacement.value() == overlay.text) {
+                continue;
+            }
+            overlay.text = replacement.value();
+            changed = true;
+        }
+        return changed;
+    };
+
+    QString persistenceError;
+    const bool persistenceRelinked = fixturesReady
+        && persistenceTimeline.relinkMediaPaths(
+            {{oldPath, newPath}, {oldLutPath, newLutPath}},
+            &persistenceError, relinkSidecars);
+
+    ProjectData saveData;
+    if (persistenceRelinked) {
+        saveData.videoTracks = persistenceTimeline.allVideoTracks();
+        saveData.audioTracks = persistenceTimeline.allAudioTracks();
+        saveData.particleClipEntries = persistedParticles;
+        saveData.overlays = persistedOverlays;
+        const QHash<QString, QString> parentEntries =
+            persistenceTimeline.clipParentEntries();
+        for (auto it = parentEntries.cbegin(); it != parentEntries.cend(); ++it) {
+            ClipParentEntry entry;
+            entry.clipId = it.key();
+            entry.parentClipId = it.value();
+            saveData.clipParentEntries.append(entry);
+        }
+    }
     const QString projectPath = QDir(fixtureDir.path()).filePath(
         QStringLiteral("media-relink-roundtrip.veditor"));
     ProjectData loadedData;
     QVector<mediapaths::PathSlot> loadedSlots;
-    const bool savedAndLoaded = fixturesReady
-        && persistedReplacementCount >= 7
+    const bool savedAndLoaded = persistenceRelinked
         && ProjectFile::save(projectPath, saveData)
         && ProjectFile::load(projectPath, loadedData);
     if (savedAndLoaded)
@@ -254,12 +313,17 @@ int runMediaRelinkSelftest()
     const bool roundTrip = savedAndLoaded
         && hasSlot(loadedSlots, newPath, QStringLiteral("video.filePath"))
         && hasSlot(loadedSlots, newLutPath, QStringLiteral("video.lutFilePath"))
+        && hasSlot(loadedSlots, newPath, QStringLiteral("audio.filePath"))
+        && hasSlot(loadedSlots, newLutPath, QStringLiteral("audio.lutFilePath"))
         && hasSlot(loadedSlots, newPath, QStringLiteral("particle.clipFilePath"))
         && hasSlot(loadedSlots, newPath, QStringLiteral("overlay.image"))
         && hasSlot(loadedSlots, newPath, QStringLiteral("nested.video.filePath"))
         && hasSlot(loadedSlots, newLutPath,
                    QStringLiteral("nested.video.lutFilePath"));
-    gate(roundTrip, "G5", QStringLiteral("relinked paths did not survive save/load"));
+    gate(roundTrip, "G5",
+         persistenceError.isEmpty()
+             ? QStringLiteral("relinked paths did not survive save/load")
+             : persistenceError);
 
     std::cerr << "[media-relink] summary: " << passed << " PASS, "
               << failed << " FAIL\n";
