@@ -282,6 +282,11 @@ uniform vec4 uLift;      // additive offset
 uniform vec4 uLggGamma;  // power-curve exponent denominator (renamed from uGamma to avoid collision with scalar uGamma at line ~117)
 uniform vec4 uGain;      // multiplicative scaling
 
+// Log range wheels. Identity is three zero vectors.
+uniform vec3 uLogShadow;
+uniform vec3 uLogMid;
+uniform vec3 uLogHigh;
+
 // 3D LUT uniforms
 uniform sampler3D uLut3D;
 uniform float uLutIntensity;  // 0.0 to 1.0
@@ -292,7 +297,7 @@ uniform sampler2D uCurveLut;
 uniform bool uCurvesEnabled;
 
 // US-CG-2: White-balance gain triple, applied at the very top of the grade
-// chain (BEFORE LGG, curves, and the .cube LUT). Identity = vec3(1.0).
+// chain (BEFORE LGG, Log wheels, curves, and the .cube LUT). Identity = vec3(1.0).
 uniform vec3 uWb;
 
 // US-CG-3: Radial vignette / Power Window. Applied AFTER curves and BEFORE
@@ -303,7 +308,7 @@ uniform float uVigRound;      // -1..+1 (0=circular, ±1=squareness)
 uniform float uVigFeather;    //  0..1  (edge softness, 0.3 default)
 
 // US-EF-1: Chroma Key (Premiere Ultra Key / Resolve 3D Keyer simplified).
-// Applied at the VERY TOP of the compose path — BEFORE WB/LGG/curves/
+// Applied at the VERY TOP of the compose path — BEFORE WB/LGG/Log/curves/
 // vignette/LUT — so HSL gating + spill suppression operate on raw frame
 // colour. uChromaEnabled=false is a free no-op.
 uniform bool  uChromaEnabled;
@@ -570,6 +575,18 @@ vec3 applyLiftGammaGain(vec3 color) {
     return c3;
 }
 
+// Log range wheels — must match VideoEffectProcessor::applyColorCorrection().
+// Order: after Lift/Gamma/Gain, before saturation and temperature/tint.
+vec3 applyLogWheels(vec3 color) {
+    vec3 normalized = clamp(color, 0.0, 1.0);
+    float Y = dot(normalized, vec3(0.2126, 0.7152, 0.0722));
+    float wS = 1.0 - smoothstep(0.15, 0.45, Y);
+    float wH = smoothstep(0.55, 0.85, Y);
+    float wM = clamp(1.0 - wS - wH, 0.0, 1.0);
+    return clamp(normalized + 0.5 * (wS * uLogShadow + wM * uLogMid + wH * uLogHigh),
+                 0.0, 1.0);
+}
+
 float luminance(vec3 color) {
     return dot(color, vec3(0.2126, 0.7152, 0.0722));
 }
@@ -824,7 +841,7 @@ void main() {
         }
 
         // US-CG-2: White-balance multiply at the VERY TOP of the grade chain
-        // (BEFORE LGG, curves, .cube LUT, and the legacy CPU-style stages).
+        // (BEFORE LGG, Log wheels, curves, .cube LUT, and the legacy CPU-style stages).
         // Identity uWb=vec3(1.0) is a free no-op.
         if (uWb != vec3(1.0))
             color *= uWb;
@@ -837,11 +854,14 @@ R"(
             color = adjustBrightnessContrast(color, uBrightness, uContrast);
         if (uHighlights != 0.0 || uShadows != 0.0)
             color = adjustHighlightsShadows(color, uHighlights, uShadows);
-        if (uSaturation != 0.0)
+        bool logEnabled = uLogShadow != vec3(0.0)
+                       || uLogMid != vec3(0.0)
+                       || uLogHigh != vec3(0.0);
+        if (!logEnabled && uSaturation != 0.0)
             color = adjustSaturation(color, uSaturation);
         if (uHue != 0.0)
             color = adjustHue(color, uHue);
-        if (uTemperature != 0.0 || uTint != 0.0)
+        if (!logEnabled && (uTemperature != 0.0 || uTint != 0.0))
             color = adjustTemperatureTint(color, uTemperature, uTint);
         if (uGamma != 1.0)
             color = adjustGamma(color, uGamma);
@@ -850,6 +870,14 @@ R"(
         // Identity: vec4(0,0,0,0) / vec4(1,1,1,1) / vec4(1,1,1,1) = no-op
         if (uLift != vec4(0.0) || uLggGamma != vec4(1.0, 1.0, 1.0, 1.0) || uGain != vec4(1.0, 1.0, 1.0, 1.0))
             color = applyLiftGammaGain(color);
+
+        if (logEnabled) {
+            color = applyLogWheels(color);
+            if (uSaturation != 0.0)
+                color = adjustSaturation(color, uSaturation);
+            if (uTemperature != 0.0 || uTint != 0.0)
+                color = adjustTemperatureTint(color, uTemperature, uTint);
+        }
 
         // US-CG-1: RGB Curves stage. The 256x4 LUT has rows
         //   0=R, 1=G, 2=B, 3=Luma (sample at v = 0.125, 0.375, 0.625, 0.875).
@@ -1487,6 +1515,9 @@ void GLPreview::createShaderProgram()
     m_locLift     = m_program->uniformLocation("uLift");
     m_locLggGamma = m_program->uniformLocation("uLggGamma");
     m_locGain     = m_program->uniformLocation("uGain");
+    m_locLogShadow = m_program->uniformLocation("uLogShadow");
+    m_locLogMid    = m_program->uniformLocation("uLogMid");
+    m_locLogHigh   = m_program->uniformLocation("uLogHigh");
 
     // LUT
     m_locLut3D         = m_program->uniformLocation("uLut3D");
@@ -1663,6 +1694,11 @@ void GLPreview::setDisplayAspectRatio(double aspectRatio)
 void GLPreview::setColorCorrection(const ColorCorrection &cc)
 {
     m_cc = cc;
+    m_logWheels = {{
+        {cc.logShadowR, cc.logShadowG, cc.logShadowB},
+        {cc.logMidR, cc.logMidG, cc.logMidB},
+        {cc.logHighR, cc.logHighG, cc.logHighB}
+    }};
     ++m_colorCorrectionSetCountForTest;
     update();
 }
@@ -2322,6 +2358,18 @@ void GLPreview::paintGL()
                   static_cast<float>(effLgg[2][1]),
                   static_cast<float>(effLgg[2][2]),
                   static_cast<float>(effLgg[2][3])));
+    m_program->setUniformValue(m_locLogShadow,
+        QVector3D(static_cast<float>(m_logWheels[0][0]),
+                  static_cast<float>(m_logWheels[0][1]),
+                  static_cast<float>(m_logWheels[0][2])));
+    m_program->setUniformValue(m_locLogMid,
+        QVector3D(static_cast<float>(m_logWheels[1][0]),
+                  static_cast<float>(m_logWheels[1][1]),
+                  static_cast<float>(m_logWheels[1][2])));
+    m_program->setUniformValue(m_locLogHigh,
+        QVector3D(static_cast<float>(m_logWheels[2][0]),
+                  static_cast<float>(m_logWheels[2][1]),
+                  static_cast<float>(m_logWheels[2][2])));
 
     // LUT
     m_program->setUniformValue(m_locLutEnabled, m_lutEnabled);
@@ -3800,6 +3848,12 @@ void GLPreview::setLiftGammaGain(const std::array<std::array<double,4>,3> &value
         m_liftGammaGain[1][ch] = values[1][ch];
         m_liftGammaGain[2][ch] = std::pow(2.0, values[2][ch] * 2.0);
     }
+    update();
+}
+
+void GLPreview::setLogWheels(const std::array<std::array<double,3>,3> &values)
+{
+    m_logWheels = values;
     update();
 }
 

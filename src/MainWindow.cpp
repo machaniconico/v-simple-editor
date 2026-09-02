@@ -5995,7 +5995,16 @@ void MainWindow::setupMenuBar()
             && near(a.gammaB, b.gammaB)
             && near(a.gainR, b.gainR)
             && near(a.gainG, b.gainG)
-            && near(a.gainB, b.gainB);
+            && near(a.gainB, b.gainB)
+            && near(a.logShadowR, b.logShadowR)
+            && near(a.logShadowG, b.logShadowG)
+            && near(a.logShadowB, b.logShadowB)
+            && near(a.logMidR, b.logMidR)
+            && near(a.logMidG, b.logMidG)
+            && near(a.logMidB, b.logMidB)
+            && near(a.logHighR, b.logHighR)
+            && near(a.logHighG, b.logHighG)
+            && near(a.logHighB, b.logHighB);
     };
     auto writeSelectedClipColorCorrection = [this, sameColorCorrection](const ColorCorrection &cc) {
         if (!m_timeline || !m_timeline->hasSelection())
@@ -6022,6 +6031,18 @@ void MainWindow::setupMenuBar()
                      static_cast<double>(cw.gain.z()),
                      cw.gainLuma};
         m_player->glPreview()->setLiftGammaGain(values);
+        const std::array<std::array<double,3>,3> logValues = {{
+            {static_cast<double>(cw.logShadow.x()),
+             static_cast<double>(cw.logShadow.y()),
+             static_cast<double>(cw.logShadow.z())},
+            {static_cast<double>(cw.logMid.x()),
+             static_cast<double>(cw.logMid.y()),
+             static_cast<double>(cw.logMid.z())},
+            {static_cast<double>(cw.logHigh.x()),
+             static_cast<double>(cw.logHigh.y()),
+             static_cast<double>(cw.logHigh.z())}
+        }};
+        m_player->glPreview()->setLogWheels(logValues);
     };
     auto applyWhiteBalanceToPreview = [this](const ColorCorrection &cc) {
         if (!m_player || !m_player->glPreview())
@@ -6126,7 +6147,8 @@ void MainWindow::setupMenuBar()
         }
     });
     connect(m_timeline, &Timeline::clipSelectedOnTrack,
-            this, [this, applyColorWheelsToPreview, applyWhiteBalanceToPreview](int /*trackIdx*/, int /*clipIdx*/) {
+            this, [this, applyColorWheelsToPreview,
+                   applyWhiteBalanceToPreview](int /*trackIdx*/, int /*clipIdx*/) {
         if (!m_colorGradingPanel || !m_timeline || !m_timeline->hasSelection())
             return;
         const ColorCorrection cc = m_timeline->clipColorCorrection();

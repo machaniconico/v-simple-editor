@@ -124,6 +124,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/Light3DSelftest.cpp
     src/selftests/VoiceIsolationSelftest.cpp
     src/selftests/GradeLggSerializationSelftest.cpp
+    src/selftests/GradeLogWheelSelftest.cpp
     src/selftests/GradeKeyframeSelftest.cpp
     src/selftests/GradeWheelWiringSelftest.cpp
     src/selftests/MediaPoolDragSelftest.cpp

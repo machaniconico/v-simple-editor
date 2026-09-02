@@ -20,17 +20,21 @@ class QGroupBox;
 class QLayout;
 class QJsonObject;
 
-// US-FEAT-C: Lift/Gamma/Gain wheels
+// Primary Lift/Gamma/Gain wheels plus Log Shadow/Midtone/Highlight wheels.
 struct ColorWheels {
     QVector3D lift   = QVector3D(0.0f, 0.0f, 0.0f);
     QVector3D gamma  = QVector3D(1.0f, 1.0f, 1.0f);
     QVector3D gain   = QVector3D(0.0f, 0.0f, 0.0f);
+    QVector3D logShadow = QVector3D(0.0f, 0.0f, 0.0f);
+    QVector3D logMid    = QVector3D(0.0f, 0.0f, 0.0f);
+    QVector3D logHigh   = QVector3D(0.0f, 0.0f, 0.0f);
     double liftLuma  = 0.0;
     double gammaLuma = 1.0;
     double gainLuma  = 0.0;
 
     bool operator==(const ColorWheels &o) const {
         return lift == o.lift && gamma == o.gamma && gain == o.gain
+            && logShadow == o.logShadow && logMid == o.logMid && logHigh == o.logHigh
             && liftLuma == o.liftLuma && gammaLuma == o.gammaLuma && gainLuma == o.gainLuma;
     }
     bool operator!=(const ColorWheels &o) const { return !(*this == o); }
@@ -159,6 +163,9 @@ private slots:
     void onLiftChanged(double r, double g, double b);
     void onGammaWheelChanged(double r, double g, double b);
     void onGainChanged(double r, double g, double b);
+    void onLogShadowChanged(double r, double g, double b);
+    void onLogMidChanged(double r, double g, double b);
+    void onLogHighChanged(double r, double g, double b);
     void onSliderChanged();
     void onWheelSliderChanged();
     void emitWheelsDebounced();
@@ -217,7 +224,10 @@ private:
 
     SliderRow addSlider(QLayout *layout, const QString &label,
                         int min, int max, int initial, int scale = 1);
-    enum WheelType { LiftWheel, GammaWheel, GainWheel };
+    enum WheelType {
+        LiftWheel, GammaWheel, GainWheel,
+        LogShadowWheel, LogMidWheel, LogHighWheel
+    };
     WheelSliderGroup addWheelSliders(QGroupBox *group, WheelType type);
     void updateSlidersFromCC();
     void blockSliderSignals(bool block);
@@ -240,6 +250,9 @@ private:
     ColorWheelWidget *m_liftWheel;
     ColorWheelWidget *m_gammaWheel;
     ColorWheelWidget *m_gainWheel;
+    ColorWheelWidget *m_logShadowWheel;
+    ColorWheelWidget *m_logMidWheel;
+    ColorWheelWidget *m_logHighWheel;
 
     // Lift/Gamma/Gain slider groups
     WheelSliderGroup m_liftSliders;

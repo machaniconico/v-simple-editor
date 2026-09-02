@@ -25,6 +25,11 @@ struct ColorCorrection {
     double gammaR = 0.0, gammaG = 0.0, gammaB = 0.0;     // -1.0 to 1.0
     double gainR = 0.0, gainG = 0.0, gainB = 0.0;        // -1.0 to 1.0
 
+    // Log range color wheels (DaVinci Resolve style)
+    double logShadowR = 0.0, logShadowG = 0.0, logShadowB = 0.0; // -1.0 to 1.0
+    double logMidR = 0.0, logMidG = 0.0, logMidB = 0.0;          // -1.0 to 1.0
+    double logHighR = 0.0, logHighG = 0.0, logHighB = 0.0;       // -1.0 to 1.0
+
     bool isDefault() const {
         return brightness == 0.0 && contrast == 0.0 && saturation == 0.0
             && hue == 0.0 && temperature == 0.0 && tint == 0.0
@@ -32,7 +37,10 @@ struct ColorCorrection {
             && exposure == 0.0
             && liftR == 0.0 && liftG == 0.0 && liftB == 0.0
             && gammaR == 0.0 && gammaG == 0.0 && gammaB == 0.0
-            && gainR == 0.0 && gainG == 0.0 && gainB == 0.0;
+            && gainR == 0.0 && gainG == 0.0 && gainB == 0.0
+            && logShadowR == 0.0 && logShadowG == 0.0 && logShadowB == 0.0
+            && logMidR == 0.0 && logMidG == 0.0 && logMidB == 0.0
+            && logHighR == 0.0 && logHighG == 0.0 && logHighB == 0.0;
     }
 
     void reset() { *this = ColorCorrection{}; }

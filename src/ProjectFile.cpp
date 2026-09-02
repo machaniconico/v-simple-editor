@@ -2040,6 +2040,15 @@ QJsonObject ProjectFile::colorCorrectionToJson(const ColorCorrection &cc)
     addIfNonZero(QStringLiteral("gainR"), cc.gainR);
     addIfNonZero(QStringLiteral("gainG"), cc.gainG);
     addIfNonZero(QStringLiteral("gainB"), cc.gainB);
+    addIfNonZero(QStringLiteral("logShadowR"), cc.logShadowR);
+    addIfNonZero(QStringLiteral("logShadowG"), cc.logShadowG);
+    addIfNonZero(QStringLiteral("logShadowB"), cc.logShadowB);
+    addIfNonZero(QStringLiteral("logMidR"), cc.logMidR);
+    addIfNonZero(QStringLiteral("logMidG"), cc.logMidG);
+    addIfNonZero(QStringLiteral("logMidB"), cc.logMidB);
+    addIfNonZero(QStringLiteral("logHighR"), cc.logHighR);
+    addIfNonZero(QStringLiteral("logHighG"), cc.logHighG);
+    addIfNonZero(QStringLiteral("logHighB"), cc.logHighB);
     return obj;
 }
 
@@ -2065,6 +2074,15 @@ ColorCorrection ProjectFile::colorCorrectionFromJson(const QJsonObject &obj)
     cc.gainR = obj["gainR"].toDouble(0.0);
     cc.gainG = obj["gainG"].toDouble(0.0);
     cc.gainB = obj["gainB"].toDouble(0.0);
+    cc.logShadowR = obj["logShadowR"].toDouble(0.0);
+    cc.logShadowG = obj["logShadowG"].toDouble(0.0);
+    cc.logShadowB = obj["logShadowB"].toDouble(0.0);
+    cc.logMidR = obj["logMidR"].toDouble(0.0);
+    cc.logMidG = obj["logMidG"].toDouble(0.0);
+    cc.logMidB = obj["logMidB"].toDouble(0.0);
+    cc.logHighR = obj["logHighR"].toDouble(0.0);
+    cc.logHighG = obj["logHighG"].toDouble(0.0);
+    cc.logHighB = obj["logHighB"].toDouble(0.0);
     return cc;
 }
 

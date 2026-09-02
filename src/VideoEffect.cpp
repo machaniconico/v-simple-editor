@@ -1143,26 +1143,35 @@ QImage VideoEffectProcessor::applyColorCorrection(const QImage &input, const Col
     if (cc.isDefault()) return input;
     QImage img = input.convertToFormat(QImage::Format_RGB888);
 
+    const bool hasLog = cc.logShadowR != 0.0 || cc.logShadowG != 0.0 || cc.logShadowB != 0.0
+                     || cc.logMidR != 0.0 || cc.logMidG != 0.0 || cc.logMidB != 0.0
+                     || cc.logHighR != 0.0 || cc.logHighG != 0.0 || cc.logHighB != 0.0;
+
     if (cc.exposure != 0.0)
         adjustExposure(img, cc.exposure);
     if (cc.brightness != 0.0 || cc.contrast != 0.0)
         adjustBrightnessContrast(img, cc.brightness, cc.contrast);
     if (cc.highlights != 0.0 || cc.shadows != 0.0)
         adjustHighlightsShadows(img, cc.highlights, cc.shadows);
-    if (cc.saturation != 0.0)
+    if (!hasLog && cc.saturation != 0.0)
         adjustSaturation(img, cc.saturation);
     if (cc.hue != 0.0)
         adjustHue(img, cc.hue);
-    if (cc.temperature != 0.0 || cc.tint != 0.0)
+    if (!hasLog && (cc.temperature != 0.0 || cc.tint != 0.0))
         adjustTemperatureTint(img, cc.temperature, cc.tint);
     if (cc.gamma != 1.0)
         adjustGamma(img, cc.gamma);
 
-    // Lift/Gamma/Gain (DaVinci Resolve style) — must match GLSL applyLiftGammaGain()
-    bool hasLGG = cc.liftR != 0.0 || cc.liftG != 0.0 || cc.liftB != 0.0
-               || cc.gammaR != 0.0 || cc.gammaG != 0.0 || cc.gammaB != 0.0
-               || cc.gainR != 0.0 || cc.gainG != 0.0 || cc.gainB != 0.0;
-    if (hasLGG) {
+    // Lift/Gamma/Gain followed by Log range wheels — must match GLSL
+    // applyLiftGammaGain() and applyLogWheels().
+    const bool hasLGG = cc.liftR != 0.0 || cc.liftG != 0.0 || cc.liftB != 0.0
+                     || cc.gammaR != 0.0 || cc.gammaG != 0.0 || cc.gammaB != 0.0
+                     || cc.gainR != 0.0 || cc.gainG != 0.0 || cc.gainB != 0.0;
+    if (hasLGG || hasLog) {
+        auto smoothstep = [](double edge0, double edge1, double value) {
+            const double t = qBound(0.0, (value - edge0) / (edge1 - edge0), 1.0);
+            return t * t * (3.0 - 2.0 * t);
+        };
         const int w = img.width(), h = img.height();
         for (int y = 0; y < h; ++y) {
             uint8_t *line = img.scanLine(y);
@@ -1171,25 +1180,40 @@ QImage VideoEffectProcessor::applyColorCorrection(const QImage &input, const Col
                 double g = line[x * 3 + 1] / 255.0;
                 double b = line[x * 3 + 2] / 255.0;
 
-                // Stage 1 — Lift: additive offset (matches GLSL: color + uLift where uLift = liftR*0.5)
-                r += cc.liftR * 0.5;
-                g += cc.liftG * 0.5;
-                b += cc.liftB * 0.5;
+                if (hasLGG) {
+                    // Stage 1 — Lift: additive offset (matches GLSL: color + uLift where uLift = liftR*0.5)
+                    r += cc.liftR * 0.5;
+                    g += cc.liftG * 0.5;
+                    b += cc.liftB * 0.5;
 
-                // Stage 2 — Gamma: power curve; internalGamma = pow(2, gammaR) — matches GPU contract
-                // cc.gammaR in [-1,1], neutral=0 → internalGamma=1 → identity pow(in,1)
-                double igR = std::max(std::pow(2.0, cc.gammaR), 1e-3);
-                double igG = std::max(std::pow(2.0, cc.gammaG), 1e-3);
-                double igB = std::max(std::pow(2.0, cc.gammaB), 1e-3);
-                r = std::pow(std::max(r, 0.0), 1.0 / igR);
-                g = std::pow(std::max(g, 0.0), 1.0 / igG);
-                b = std::pow(std::max(b, 0.0), 1.0 / igB);
+                    // Stage 2 — Gamma: power curve; internalGamma = pow(2, gammaR) — matches GPU contract
+                    // cc.gammaR in [-1,1], neutral=0 → internalGamma=1 → identity pow(in,1)
+                    double igR = std::max(std::pow(2.0, cc.gammaR), 1e-3);
+                    double igG = std::max(std::pow(2.0, cc.gammaG), 1e-3);
+                    double igB = std::max(std::pow(2.0, cc.gammaB), 1e-3);
+                    r = std::pow(std::max(r, 0.0), 1.0 / igR);
+                    g = std::pow(std::max(g, 0.0), 1.0 / igG);
+                    b = std::pow(std::max(b, 0.0), 1.0 / igB);
 
-                // Stage 3 — Gain: multiplicative scaling; matches GPU pow(2, gainR*2)
-                // cc.gainR in [-1,1], neutral=0 → factor=1 → identity
-                r *= std::pow(2.0, cc.gainR * 2.0);
-                g *= std::pow(2.0, cc.gainG * 2.0);
-                b *= std::pow(2.0, cc.gainB * 2.0);
+                    // Stage 3 — Gain: multiplicative scaling; matches GPU pow(2, gainR*2)
+                    // cc.gainR in [-1,1], neutral=0 → factor=1 → identity
+                    r *= std::pow(2.0, cc.gainR * 2.0);
+                    g *= std::pow(2.0, cc.gainG * 2.0);
+                    b *= std::pow(2.0, cc.gainB * 2.0);
+                }
+
+                if (hasLog) {
+                    r = qBound(0.0, r, 1.0);
+                    g = qBound(0.0, g, 1.0);
+                    b = qBound(0.0, b, 1.0);
+                    const double luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                    const double wS = 1.0 - smoothstep(0.15, 0.45, luminance);
+                    const double wH = smoothstep(0.55, 0.85, luminance);
+                    const double wM = qBound(0.0, 1.0 - wS - wH, 1.0);
+                    r += 0.5 * (wS * cc.logShadowR + wM * cc.logMidR + wH * cc.logHighR);
+                    g += 0.5 * (wS * cc.logShadowG + wM * cc.logMidG + wH * cc.logHighG);
+                    b += 0.5 * (wS * cc.logShadowB + wM * cc.logMidB + wH * cc.logHighB);
+                }
 
                 line[x * 3 + 0] = static_cast<uint8_t>(qBound(0.0, r, 1.0) * 255.0);
                 line[x * 3 + 1] = static_cast<uint8_t>(qBound(0.0, g, 1.0) * 255.0);
@@ -1197,6 +1221,11 @@ QImage VideoEffectProcessor::applyColorCorrection(const QImage &input, const Col
             }
         }
     }
+
+    if (hasLog && cc.saturation != 0.0)
+        adjustSaturation(img, cc.saturation);
+    if (hasLog && (cc.temperature != 0.0 || cc.tint != 0.0))
+        adjustTemperatureTint(img, cc.temperature, cc.tint);
 
     return img;
 }

@@ -55,12 +55,14 @@ public:
     void clearLut();
     // US-WIRE-2: Lift/Gamma/Gain color wheels from ColorGradingPanel
     void setLiftGammaGain(const std::array<std::array<double,4>,3> &values);
+    // Log range wheels: Shadow / Midtone / Highlight RGB adjustments.
+    void setLogWheels(const std::array<std::array<double,3>,3> &values);
     // US-CG-1: RGB curves editor — 4 channels (R, G, B, Luma) of 256 ints
     // each in [0,255]. Uploaded as a 256x4 GL_RGBA8 texture and applied
-    // in the fragment shader after Lift/Gamma/Gain and before the .cube LUT.
+    // in the fragment shader after Lift/Gamma/Gain and Log wheels, before the .cube LUT.
     void setRgbCurves(const QVector<QVector<int>> &curves);
     // US-CG-2: White-balance gain triple. Multiplied into c.rgb at the very
-    // top of the grade chain — BEFORE LGG, RGB curves, and the .cube LUT.
+    // top of the grade chain — BEFORE LGG, Log wheels, RGB curves, and the .cube LUT.
     // Identity = (1, 1, 1) → no-op.
     void setWhiteBalance(float r, float g, float b);
     // US-CG-3: Radial vignette / Power Window. Applied AFTER RGB curves and
@@ -85,7 +87,7 @@ public:
                       float hueTol, float satTol, float lumTol,
                       float spill, float softness);
     // US-EF-2: Mask Animation (DaVinci Power Window simplified). Wraps the
-    // entire grade chain (chroma key → WB → LGG → curves → vignette → LUT)
+    // entire grade chain (chroma key → WB → LGG → Log → curves → vignette → LUT)
     // so the colour grade applies INSIDE the mask region; outside stays raw
     // (or vice versa when invert=true). enabled=false is a free no-op (the
     // shader test branches around the mix() so the previous output is
@@ -442,6 +444,12 @@ private:
         {0.0, 0.0, 0.0, 0.0},
         {1.0, 1.0, 1.0, 1.0},
         {1.0, 1.0, 1.0, 1.0}
+    }};
+    int m_locLogShadow = -1, m_locLogMid = -1, m_locLogHigh = -1;
+    std::array<std::array<double,3>,3> m_logWheels = {{
+        {0.0, 0.0, 0.0},
+        {0.0, 0.0, 0.0},
+        {0.0, 0.0, 0.0}
     }};
 
     // LUT uniform locations and texture
