@@ -34,18 +34,9 @@ bool hasSlot(const QVector<mediapaths::PathSlot> &pathSlots,
     return false;
 }
 
-bool hasCollectedSlot(const QVector<mediapaths::PathSlot> &pathSlots,
-                      const QString &category, const QString &mediaDir)
+QString pathSlotKey(const QString &sourcePath, const QString &category)
 {
-    const QString expectedDir = QDir(mediaDir).absolutePath();
-    for (const mediapaths::PathSlot &slot : pathSlots) {
-        const QString value = slot.value();
-        if (slot.category == category && QFileInfo(value).absolutePath() == expectedDir
-            && QFileInfo::exists(value)) {
-            return true;
-        }
-    }
-    return false;
+    return category + QLatin1Char('\x1f') + QDir::cleanPath(sourcePath);
 }
 
 } // namespace
@@ -430,6 +421,17 @@ int runMediaRelinkSelftest()
         collectData.clipParentEntries.append(entry);
     }
 
+    QVector<QString> collectOriginalSources;
+    QVector<QString> collectOriginalCategories;
+    const QVector<mediapaths::PathSlot> collectOriginalSlots =
+        mediapaths::enumeratePathSlots(collectData);
+    collectOriginalSources.reserve(collectOriginalSlots.size());
+    collectOriginalCategories.reserve(collectOriginalSlots.size());
+    for (const mediapaths::PathSlot &slot : collectOriginalSlots) {
+        collectOriginalSources.append(slot.value());
+        collectOriginalCategories.append(slot.category);
+    }
+
     const QString collectDestDir = QDir(fixtureDir.path()).filePath(
         QStringLiteral("collected-project"));
     const QString collectedProjectName = QStringLiteral("collected.veditor");
@@ -467,34 +469,104 @@ int runMediaRelinkSelftest()
         collectedSlots = mediapaths::enumeratePathSlots(collectedData);
     const QString collectedMediaDir = QDir(collectDestDir).filePath(
         QStringLiteral("media"));
-    const bool allCategoriesCollected = collectedProjectLoaded
-        && hasCollectedSlot(collectedSlots, QStringLiteral("video.filePath"),
-                            collectedMediaDir)
-        && hasCollectedSlot(collectedSlots, QStringLiteral("video.lutFilePath"),
-                            collectedMediaDir)
-        && hasCollectedSlot(collectedSlots, QStringLiteral("audio.filePath"),
-                            collectedMediaDir)
-        && hasCollectedSlot(collectedSlots, QStringLiteral("particle.clipFilePath"),
-                            collectedMediaDir)
-        && hasCollectedSlot(collectedSlots, QStringLiteral("overlay.image"),
-                            collectedMediaDir)
-        && hasCollectedSlot(collectedSlots, QStringLiteral("nested.video.filePath"),
-                            collectedMediaDir)
-        && hasCollectedSlot(collectedSlots, QStringLiteral("nested.video.lutFilePath"),
-                            collectedMediaDir);
-    const bool internalReferencesSkipped = collectedProjectLoaded
-        && hasSlot(collectedSlots, collectNullObject.filePath,
-                   QStringLiteral("audio.filePath"))
-        && hasSlot(collectedSlots, collectSequenceReference.filePath,
-                   QStringLiteral("audio.filePath"))
+    const QString expectedVideoPath = QDir(collectedMediaDir).absoluteFilePath(
+        QStringLiteral("shared.mov"));
+    const QString expectedAudioPath = QDir(collectedMediaDir).absoluteFilePath(
+        QStringLiteral("shared_2.mov"));
+    QHash<QString, QString> expectedCollectedPaths;
+    expectedCollectedPaths.insert(
+        pathSlotKey(collectVideoPath, QStringLiteral("video.filePath")),
+        expectedVideoPath);
+    expectedCollectedPaths.insert(
+        pathSlotKey(collectLutPath, QStringLiteral("video.lutFilePath")),
+        QDir(collectedMediaDir).absoluteFilePath(QStringLiteral("top.cube")));
+    expectedCollectedPaths.insert(
+        pathSlotKey(collectAudioPath, QStringLiteral("audio.filePath")),
+        expectedAudioPath);
+    expectedCollectedPaths.insert(
+        pathSlotKey(collectParticlePath, QStringLiteral("particle.clipFilePath")),
+        QDir(collectedMediaDir).absoluteFilePath(QStringLiteral("particle.bin")));
+    expectedCollectedPaths.insert(
+        pathSlotKey(collectOverlayPath, QStringLiteral("overlay.image")),
+        QDir(collectedMediaDir).absoluteFilePath(QStringLiteral("overlay.png")));
+    expectedCollectedPaths.insert(
+        pathSlotKey(collectNestedVideoPath,
+                    QStringLiteral("nested.video.filePath")),
+        QDir(collectedMediaDir).absoluteFilePath(QStringLiteral("nested.mov")));
+    expectedCollectedPaths.insert(
+        pathSlotKey(collectNestedLutPath,
+                    QStringLiteral("nested.video.lutFilePath")),
+        QDir(collectedMediaDir).absoluteFilePath(QStringLiteral("nested.cube")));
+
+    bool everySlotMatchesExpected = collectedProjectLoaded
+        && collectedSlots.size() == collectOriginalSources.size();
+    bool internalReferencesSkipped = everySlotMatchesExpected;
+    bool duplicateSourcesShareDestination = everySlotMatchesExpected;
+    QHash<QString, QString> actualPathByOriginalSlot;
+    QHash<QString, QString> destinationBySource;
+    if (everySlotMatchesExpected) {
+        const QString expectedMediaDir = QDir(collectedMediaDir).absolutePath();
+        for (int i = 0; i < collectedSlots.size(); ++i) {
+            const QString &source = collectOriginalSources.at(i);
+            const QString &category = collectOriginalCategories.at(i);
+            const mediapaths::PathSlot &collectedSlot = collectedSlots.at(i);
+            const QString actualPath = QDir::cleanPath(collectedSlot.value());
+            if (collectedSlot.category != category) {
+                everySlotMatchesExpected = false;
+                internalReferencesSkipped = false;
+                continue;
+            }
+
+            if (clipgeom::isNullObjectFilePath(source)
+                || timeline_nesting::isSequenceClipFilePath(source)) {
+                internalReferencesSkipped = internalReferencesSkipped
+                    && actualPath == QDir::cleanPath(source);
+                continue;
+            }
+
+            const QString key = pathSlotKey(source, category);
+            const auto expected = expectedCollectedPaths.constFind(key);
+            const bool slotMatches = expected != expectedCollectedPaths.cend()
+                && actualPath == QDir::cleanPath(expected.value())
+                && QFileInfo(actualPath).absolutePath() == expectedMediaDir
+                && QFileInfo::exists(actualPath);
+            everySlotMatchesExpected = everySlotMatchesExpected && slotMatches;
+            actualPathByOriginalSlot.insert(key, actualPath);
+
+            const QString normalizedSource = QDir::cleanPath(source);
+            const auto previousDestination =
+                destinationBySource.constFind(normalizedSource);
+            if (previousDestination != destinationBySource.cend()) {
+                duplicateSourcesShareDestination =
+                    duplicateSourcesShareDestination
+                    && previousDestination.value() == actualPath;
+            } else {
+                destinationBySource.insert(normalizedSource, actualPath);
+            }
+        }
+    }
+    internalReferencesSkipped = internalReferencesSkipped
         && collector.warnings().isEmpty();
-    const bool deduplicatedAndRenamed = collectedProjectLoaded
+
+    const QString videoSlotKey = pathSlotKey(
+        collectVideoPath, QStringLiteral("video.filePath"));
+    const QString audioSlotKey = pathSlotKey(
+        collectAudioPath, QStringLiteral("audio.filePath"));
+    const bool collisionTargetsCorrect = collectedProjectLoaded
+        && actualPathByOriginalSlot.value(videoSlotKey) == expectedVideoPath
+        && actualPathByOriginalSlot.value(audioSlotKey) == expectedAudioPath
+        && expectedVideoPath != expectedAudioPath
+        && QFileInfo::exists(expectedVideoPath)
+        && QFileInfo::exists(expectedAudioPath);
+    const bool copiedOnceAndProgressed = collectedProjectLoaded
+        && duplicateSourcesShareDestination
         && collector.bytesCopied() == collectorSources.size() * 5
-        && QFile::exists(QDir(collectedMediaDir).filePath(QStringLiteral("shared.mov")))
-        && QFile::exists(QDir(collectedMediaDir).filePath(QStringLiteral("shared_2.mov")))
+        && QDir(collectedMediaDir).entryList(QDir::Files | QDir::NoDotAndDotDot).size()
+               == collectorSources.size()
         && collectorProgress.contains(100);
-    gate(collectorFilesReady && allCategoriesCollected
-             && internalReferencesSkipped && deduplicatedAndRenamed,
+    gate(collectorFilesReady && everySlotMatchesExpected
+             && internalReferencesSkipped && collisionTargetsCorrect
+             && copiedOnceAndProgressed,
          "G6",
          !collectorFinished
              ? QStringLiteral("ProjectCollector did not finish")
