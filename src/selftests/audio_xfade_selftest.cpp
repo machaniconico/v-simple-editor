@@ -1,5 +1,7 @@
 #include "../Timeline.h"
 
+#include <QApplication>
+
 #include <cmath>
 #include <cstdio>
 
@@ -38,6 +40,30 @@ bool sameClipIdentity(const QVector<ClipInfo> &left,
     return true;
 }
 
+bool transitionsAreNone(const QVector<ClipInfo> &clips)
+{
+    for (const ClipInfo &clip : clips) {
+        if (clip.leadIn.type != TransitionType::None
+            || clip.trailOut.type != TransitionType::None) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool saveAudioBaseline(Timeline &timeline,
+                       const QVector<ClipInfo> &clips)
+{
+    TimelineTrack *track = timeline.trackAt(true, 0);
+    if (!track || !timeline.undoManager())
+        return false;
+    track->setClips(clips);
+    timeline.undoManager()->clear();
+    timeline.undoManager()->saveState(
+        timeline.currentState(), QStringLiteral("audio-xfade selftest baseline"));
+    return true;
+}
+
 void gate(int number, const char *description, bool ok, int &passed, int &failed)
 {
     std::fprintf(stderr, "%s G%d %s\n", ok ? "PASS" : "FAIL", number,
@@ -52,27 +78,36 @@ int runAudioXfadeSelftest()
     int passed = 0;
     int failed = 0;
 
-    QVector<ClipInfo> clips{testClip(QStringLiteral("A")),
-                            testClip(QStringLiteral("B"))};
-    const QVector<ClipInfo> before = clips;
-    QString error;
-    const bool crossfadeApplied = audioxfade::applyCrossfade(
-        clips, 0, 1.25, &error);
+    Timeline timeline;
+    TimelineTrack *audioTrack = timeline.trackAt(true, 0);
+    const QVector<ClipInfo> before{testClip(QStringLiteral("A")),
+                                   testClip(QStringLiteral("B"))};
     const Transition expectedCrossfade{
         TransitionType::CrossDissolve, 1.25,
         TransitionAlignment::Center, TransitionEasing::Linear};
-    const bool g1Mutation = crossfadeApplied
-        && sameTransition(clips[0].trailOut, expectedCrossfade)
-        && sameTransition(clips[1].leadIn, expectedCrossfade)
-        && clips[0].leadIn.type == TransitionType::None
-        && clips[1].trailOut.type == TransitionType::None;
-    // The public Timeline API stores the post-mutation state as one undo
-    // entry. This pure gate mirrors that contract without constructing a
-    // QWidget, as this selftest is intentionally needsQApplication=false.
-    QVector<ClipInfo> undoState = clips;
-    undoState = before;
+    QString error;
+    const bool baselineReady = saveAudioBaseline(timeline, before);
+    const bool crossfadeApplied = baselineReady
+        && timeline.applyAudioCrossfade(0, 0, 1.25, &error);
+    const QVector<ClipInfo> crossfadeState = audioTrack
+        ? audioTrack->clips() : QVector<ClipInfo>{};
+    const bool crossfadeMutation = crossfadeApplied
+        && crossfadeState.size() == 2
+        && sameTransition(crossfadeState[0].trailOut, expectedCrossfade)
+        && sameTransition(crossfadeState[1].leadIn, expectedCrossfade)
+        && crossfadeState[0].leadIn.type == TransitionType::None
+        && crossfadeState[1].trailOut.type == TransitionType::None
+        && timeline.canUndo();
+    if (crossfadeApplied)
+        timeline.undo();
+    const QVector<ClipInfo> crossfadeRestored = audioTrack
+        ? audioTrack->clips() : QVector<ClipInfo>{};
+    const bool crossfadeUndo = crossfadeApplied
+        && sameClipIdentity(crossfadeRestored, before)
+        && transitionsAreNone(crossfadeRestored)
+        && !timeline.canUndo();
     gate(1, "applyAudioCrossfade pairs A.trailOut/B.leadIn and one undo restores it",
-         g1Mutation && sameClipIdentity(undoState, before), passed, failed);
+         crossfadeMutation && crossfadeUndo, passed, failed);
 
     const QString legacy = buildExportAudioMixEntryFilterChain(
         0, QStringLiteral("1"), QStringLiteral("4"), 0,
@@ -100,17 +135,48 @@ int runAudioXfadeSelftest()
     gate(2, "export keeps the no-fade chain byte-identical and emits qsin afade",
          g2, passed, failed);
 
-    QVector<ClipInfo> fadeClips{testClip(QStringLiteral("fade"))};
-    const bool fadeIn = audioxfade::applyFade(
-        fadeClips, 0, AudioFadeEdge::In, 0.4, &error);
-    const bool fadeOut = audioxfade::applyFade(
-        fadeClips, 0, AudioFadeEdge::Out, 0.6, &error);
-    gate(3, "applyAudioFade sets both clip edges independently",
-         fadeIn && fadeOut
-             && fadeClips[0].leadIn.type == TransitionType::FadeIn
-             && fadeClips[0].trailOut.type == TransitionType::FadeOut
-             && std::abs(fadeClips[0].leadIn.duration - 0.4) < 1e-9
-             && std::abs(fadeClips[0].trailOut.duration - 0.6) < 1e-9,
+    const QVector<ClipInfo> fadeBefore{testClip(QStringLiteral("fade"))};
+    const bool fadeInBaseline = saveAudioBaseline(timeline, fadeBefore);
+    const bool fadeIn = fadeInBaseline
+        && timeline.applyAudioFade(0, 0, AudioFadeEdge::In, 0.4, &error);
+    const QVector<ClipInfo> fadeInState = audioTrack
+        ? audioTrack->clips() : QVector<ClipInfo>{};
+    const bool fadeInMutation = fadeIn
+        && fadeInState.size() == 1
+        && fadeInState[0].leadIn.type == TransitionType::FadeIn
+        && std::abs(fadeInState[0].leadIn.duration - 0.4) < 1e-9
+        && fadeInState[0].trailOut.type == TransitionType::None
+        && timeline.canUndo();
+    if (fadeIn)
+        timeline.undo();
+    const QVector<ClipInfo> fadeInRestored = audioTrack
+        ? audioTrack->clips() : QVector<ClipInfo>{};
+    const bool fadeInUndo = fadeIn
+        && sameClipIdentity(fadeInRestored, fadeBefore)
+        && transitionsAreNone(fadeInRestored)
+        && !timeline.canUndo();
+
+    const bool fadeOutBaseline = saveAudioBaseline(timeline, fadeBefore);
+    const bool fadeOut = fadeOutBaseline
+        && timeline.applyAudioFade(0, 0, AudioFadeEdge::Out, 0.6, &error);
+    const QVector<ClipInfo> fadeOutState = audioTrack
+        ? audioTrack->clips() : QVector<ClipInfo>{};
+    const bool fadeOutMutation = fadeOut
+        && fadeOutState.size() == 1
+        && fadeOutState[0].trailOut.type == TransitionType::FadeOut
+        && std::abs(fadeOutState[0].trailOut.duration - 0.6) < 1e-9
+        && fadeOutState[0].leadIn.type == TransitionType::None
+        && timeline.canUndo();
+    if (fadeOut)
+        timeline.undo();
+    const QVector<ClipInfo> fadeOutRestored = audioTrack
+        ? audioTrack->clips() : QVector<ClipInfo>{};
+    const bool fadeOutUndo = fadeOut
+        && sameClipIdentity(fadeOutRestored, fadeBefore)
+        && transitionsAreNone(fadeOutRestored)
+        && !timeline.canUndo();
+    gate(3, "applyAudioFade sets each requested edge and one undo restores it",
+         fadeInMutation && fadeInUndo && fadeOutMutation && fadeOutUndo,
          passed, failed);
 
     QVector<ClipInfo> nonAdjacent{testClip(QStringLiteral("A")),
@@ -124,15 +190,32 @@ int runAudioXfadeSelftest()
              && nonAdjacent[1].leadIn.type == TransitionType::None,
          passed, failed);
 
-    QVector<ClipInfo> video{testClip(QStringLiteral("video"))};
-    const QVector<ClipInfo> videoBefore = video;
-    QVector<ClipInfo> audio{testClip(QStringLiteral("audio-a")),
-                            testClip(QStringLiteral("audio-b"))};
-    const bool audioOnly = audioxfade::applyCrossfade(audio, 0, 1.0, &error);
-    gate(5, "audio transition mutation leaves video-side mirror behavior untouched",
-         audioOnly && sameClipIdentity(video, videoBefore)
-             && audio[0].trailOut.type == TransitionType::CrossDissolve
-             && audio[1].leadIn.type == TransitionType::CrossDissolve,
+    Timeline mirrorTimeline;
+    TimelineTrack *videoTrack = mirrorTimeline.trackAt(false, 0);
+    TimelineTrack *mirrorAudioTrack = mirrorTimeline.trackAt(true, 0);
+    const QVector<ClipInfo> videoBefore{testClip(QStringLiteral("video-a")),
+                                        testClip(QStringLiteral("video-b"))};
+    const QVector<ClipInfo> audioBefore{testClip(QStringLiteral("audio-a")),
+                                        testClip(QStringLiteral("audio-b"))};
+    if (videoTrack)
+        videoTrack->setClips(videoBefore);
+    if (mirrorAudioTrack)
+        mirrorAudioTrack->setClips(audioBefore);
+    if (videoTrack)
+        videoTrack->setSelectedClip(0);
+    const Transition mirrorTransition{
+        TransitionType::CrossDissolve, 1.0,
+        TransitionAlignment::Center, TransitionEasing::Linear};
+    if (videoTrack && mirrorAudioTrack)
+        mirrorTimeline.applyTransitionToSelected(mirrorTransition);
+    const QVector<ClipInfo> mirroredAudio = mirrorAudioTrack
+        ? mirrorAudioTrack->clips() : QVector<ClipInfo>{};
+    gate(5, "applyTransitionToSelected mirrors CrossDissolve to the A1 cut",
+         mirroredAudio.size() == 2
+             && sameTransition(mirroredAudio[0].trailOut, mirrorTransition)
+             && sameTransition(mirroredAudio[1].leadIn, mirrorTransition)
+             && mirroredAudio[0].leadIn.type == TransitionType::None
+             && mirroredAudio[1].trailOut.type == TransitionType::None,
          passed, failed);
 
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
