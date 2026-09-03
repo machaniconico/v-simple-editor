@@ -2,6 +2,7 @@
 
 #include "McpToolRegistry.h"
 #include "../CaptionEditorDialog.h"
+#include "../BeatDetect.h"
 #include "../DynamicZoom.h"
 #include "../MainWindow.h"
 #include "../RenderQueue.h"
@@ -10,6 +11,7 @@
 #include "../TrimOps.h"
 #include "../UndoManager.h"
 #include "../VideoPlayer.h"
+#include "../WaveformGenerator.h"
 #include "../TimecodeBurnIn.h"
 
 #include <QAction>
@@ -598,6 +600,60 @@ bool readClipTarget(const QJsonObject& args, MainWindow* window,
     }
 
     return setError(err, QStringLiteral("clip index is out of range"));
+}
+
+bool detectMusicRemixBeats(const ClipInfo &clip, QVector<double> *beatTimes,
+                           double *bpm, QString *err)
+{
+    if (beatTimes)
+        beatTimes->clear();
+    if (bpm)
+        *bpm = 0.0;
+
+    QVector<float> samples;
+    int sampleRate = 0;
+    if (!WaveformGenerator::decodeAudio(clip.filePath, samples, sampleRate)
+        || samples.isEmpty() || sampleRate <= 0) {
+        return setError(err, QStringLiteral("音声のデコードに失敗しました。"));
+    }
+    const double sourceOut = clip.outPoint > 0.0 ? clip.outPoint : clip.duration;
+    const double totalSourceSec = static_cast<double>(samples.size()) / sampleRate;
+    const double activeStart = qMax(0.0, clip.inPoint);
+    const double activeEnd = qMin(sourceOut, totalSourceSec);
+    if (activeEnd <= activeStart)
+        return setError(err, QStringLiteral("クリップの有効な音声範囲がありません。"));
+
+    const int sampleCount = static_cast<int>(samples.size());
+    const int startSample = qBound(
+        0, static_cast<int>(std::floor(activeStart * sampleRate)), sampleCount);
+    const int endSample = qBound(
+        startSample, static_cast<int>(std::ceil(activeEnd * sampleRate)), sampleCount);
+    const beatdetect::Result detected = beatdetect::detectBeats(
+        samples.mid(startSample, endSample - startSample),
+        sampleRate, beatdetect::Config{});
+    if (detected.beatTimesSec.size() < 2)
+        return setError(err, QStringLiteral("ビートが 2 個未満のため適用できません。"));
+
+    const double speed = clip.speed > 0.0 ? clip.speed : 1.0;
+    const double clipDuration = clip.effectiveDuration();
+    if (!std::isfinite(clipDuration) || clipDuration <= 0.0)
+        return setError(err, QStringLiteral("対象クリップの尺が不正です"));
+    QVector<double> localBeats;
+    localBeats.reserve(detected.beatTimesSec.size());
+    for (double beat : detected.beatTimesSec) {
+        const double sourceLocal = activeStart + beat - clip.inPoint;
+        if (sourceLocal >= -1.0e-6
+            && sourceLocal <= clipDuration * speed + 1.0e-6) {
+            localBeats.append(qBound(0.0, sourceLocal / speed, clipDuration));
+        }
+    }
+    if (localBeats.size() < 2)
+        return setError(err, QStringLiteral("ビート境界を作成できませんでした。"));
+    if (beatTimes)
+        *beatTimes = localBeats;
+    if (bpm)
+        *bpm = detected.bpm;
+    return true;
 }
 
 QJsonObject dynamicZoomRectSchema()
@@ -1653,6 +1709,19 @@ void McpEditorTools::registerWriteTools()
         {QStringLiteral("linkedApplied"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}}
     }, {QStringLiteral("ok"), QStringLiteral("property"),
         QStringLiteral("value")});
+
+    const QJsonObject musicRemixOutputSchema = outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("kind"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
+        {QStringLiteral("trackIndex"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+        {QStringLiteral("clipIndex"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+        {QStringLiteral("targetSec"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
+        {QStringLiteral("resultDuration"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
+        {QStringLiteral("segmentCount"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}}
+    }, {QStringLiteral("ok"), QStringLiteral("kind"),
+        QStringLiteral("trackIndex"), QStringLiteral("clipIndex"),
+        QStringLiteral("targetSec"), QStringLiteral("resultDuration"),
+        QStringLiteral("segmentCount")});
 
     const QJsonObject dynamicZoomOutputSchema = outputSchemaOf(QJsonObject{
         {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
@@ -2922,6 +2991,86 @@ void McpEditorTools::registerWriteTools()
             };
         })
     }, setClipPropertyOutputSchema));
+
+    m_registry->registerTool(withOutputSchema({
+        QStringLiteral("music_remix"),
+        QStringLiteral("音声クリップをビート境界のセグメントで再構成し、目標尺へ自動調整する。kind は audio のみ。beatTimes が 2 個未満の素材は変更せずエラーにする。変更は Ctrl+Z / undo ツールで戻せる。"),
+        schemaWithRequired(QJsonObject{
+            {QStringLiteral("kind"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("string")},
+                {QStringLiteral("enum"), QJsonArray{QStringLiteral("audio")}}
+            }},
+            {QStringLiteral("trackIndex"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("integer")},
+                {QStringLiteral("minimum"), 0}
+            }},
+            {QStringLiteral("clipIndex"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("integer")},
+                {QStringLiteral("minimum"), 0}
+            }},
+            {QStringLiteral("targetSec"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("number")},
+                {QStringLiteral("exclusiveMinimum"), 0.0}
+            }}
+        }, {QStringLiteral("kind"), QStringLiteral("trackIndex"),
+            QStringLiteral("clipIndex"), QStringLiteral("targetSec")}),
+        guardedWrite(QStringLiteral("music_remix"),
+                     [this](const QJsonObject &args, QString *err) -> QJsonObject {
+            if (!rejectUnknownArguments(args,
+                                        {QStringLiteral("kind"), QStringLiteral("trackIndex"),
+                                         QStringLiteral("clipIndex"), QStringLiteral("targetSec")},
+                                        err)) {
+                return {};
+            }
+            if (args.value(QStringLiteral("kind")).toString()
+                    != QStringLiteral("audio")) {
+                return setError(err, QStringLiteral("music_remix は audio のみ対応しています")),
+                       QJsonObject();
+            }
+            double targetSec = 0.0;
+            if (!requiredFiniteNumber(args, QStringLiteral("targetSec"),
+                                      &targetSec, err)) {
+                return {};
+            }
+            if (targetSec <= 0.0)
+                return setError(err, QStringLiteral("targetSec は 0 より大きい有限値で指定してください")),
+                       QJsonObject();
+
+            ClipTarget target;
+            if (!readClipTarget(args, m_window, timeline(), &target, err))
+                return {};
+            if (!target.audio)
+                return setError(err, QStringLiteral("music_remix は audio のみ対応しています")),
+                       QJsonObject();
+
+            QVector<double> beatTimes;
+            QString detectionError;
+            if (!detectMusicRemixBeats(target.track->clips().at(target.clipIndex),
+                                       &beatTimes, nullptr, &detectionError)) {
+                return setError(err, detectionError), QJsonObject();
+            }
+            const ClipInfo &clip = target.track->clips().at(target.clipIndex);
+            const remix::Plan plan = remix::planRemix(
+                beatTimes, clip.effectiveDuration(), targetSec, remix::Config{});
+            if (!plan.valid)
+                return setError(err, plan.error), QJsonObject();
+            QString applyError;
+            if (!timeline()->applyMusicRemix(target.trackIndex, target.clipIndex,
+                                             plan, false, &applyError)) {
+                return setError(err, applyError), QJsonObject();
+            }
+            syncSelectionAfterEdit();
+            return QJsonObject{
+                {QStringLiteral("ok"), true},
+                {QStringLiteral("kind"), QStringLiteral("audio")},
+                {QStringLiteral("trackIndex"), target.trackIndex},
+                {QStringLiteral("clipIndex"), target.clipIndex},
+                {QStringLiteral("targetSec"), targetSec},
+                {QStringLiteral("resultDuration"), plan.resultDuration},
+                {QStringLiteral("segmentCount"), plan.segments.size()}
+            };
+        })
+    }, musicRemixOutputSchema));
 
     QJsonObject dynamicZoomInputSchema = schemaWithRequired(
         mergedProperties(clipProperties, QJsonObject{

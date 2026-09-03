@@ -1,6 +1,7 @@
 #include <QEventLoop>
 #include <QElapsedTimer>
 #include <QAction>
+#include <QByteArray>
 #include <QLabel>
 #include <QPushButton>
 #include <QSettings>
@@ -783,7 +784,8 @@ int runMcpSelftest()
         QStringLiteral("apply_captions"),
         QStringLiteral("set_playhead"),
         QStringLiteral("undo"),
-        QStringLiteral("redo")
+        QStringLiteral("redo"),
+        QStringLiteral("music_remix")
     };
     bool allWriteToolsListed = true;
     for (const QString& expectedName : expectedWriteToolNames) {
@@ -1185,7 +1187,7 @@ int runMcpSelftest()
             rpcRequest(73, QStringLiteral("tools/list")))))
         .value(QStringLiteral("result")).toObject()
         .value(QStringLiteral("tools")).toArray();
-    constexpr int kExpectedProjectInfoToolCount = 34;
+    constexpr int kExpectedProjectInfoToolCount = 35;
     bool outputSchemasDeclared = projectInfoToolDescriptors.size()
         == kExpectedProjectInfoToolCount;
     for (const QJsonValue& value : projectInfoToolDescriptors) {
@@ -2509,6 +2511,148 @@ int runMcpSelftest()
             "Timeline or relink media fixture was not available");
         fail("G135 relink_media applies a valid mapping", reason);
         fail("G136 relink_media rejects a missing destination", reason);
+    }
+
+    // US-105: use a small in-memory-generated PCM WAV so the normal MCP path
+    // exercises decodeAudio -> beatdetect -> Timeline mutation without
+    // depending on the contents of a repository media fixture.
+    QTemporaryFile musicRemixWav;
+    musicRemixWav.setFileTemplate(
+        QDir::tempPath() + QStringLiteral("/veditor-remix-XXXXXX.wav"));
+    bool musicRemixWavReady = musicRemixWav.open();
+    if (musicRemixWavReady) {
+        const auto appendLe16 = [](QByteArray &bytes, quint16 value) {
+            bytes.append(static_cast<char>(value & 0xff));
+            bytes.append(static_cast<char>((value >> 8) & 0xff));
+        };
+        const auto appendLe32 = [](QByteArray &bytes, quint32 value) {
+            bytes.append(static_cast<char>(value & 0xff));
+            bytes.append(static_cast<char>((value >> 8) & 0xff));
+            bytes.append(static_cast<char>((value >> 16) & 0xff));
+            bytes.append(static_cast<char>((value >> 24) & 0xff));
+        };
+        constexpr int sampleRate = 16000;
+        constexpr int sampleCount = sampleRate * 8;
+        QByteArray pcm;
+        pcm.reserve(sampleCount * 2);
+        for (int i = 0; i < sampleCount; ++i) {
+            const double t = static_cast<double>(i) / sampleRate;
+            const int beatIndex = qRound((t - 0.2) / 0.5);
+            const double beatTime = 0.2 + beatIndex * 0.5;
+            const bool click = beatIndex >= 0 && beatIndex < 15
+                && qAbs(t - beatTime) < 0.0125;
+            const qint16 value = click && ((i % 2) == 0) ? 28000 : 0;
+            appendLe16(pcm, static_cast<quint16>(value));
+        }
+        QByteArray wav;
+        wav.append("RIFF", 4);
+        appendLe32(wav, static_cast<quint32>(36 + pcm.size()));
+        wav.append("WAVEfmt ", 8);
+        appendLe32(wav, 16);
+        appendLe16(wav, 1);
+        appendLe16(wav, 1);
+        appendLe32(wav, sampleRate);
+        appendLe32(wav, sampleRate * 2);
+        appendLe16(wav, 2);
+        appendLe16(wav, 16);
+        wav.append("data", 4);
+        appendLe32(wav, static_cast<quint32>(pcm.size()));
+        wav.append(pcm);
+        musicRemixWavReady = musicRemixWav.write(wav) == wav.size();
+        musicRemixWav.flush();
+        musicRemixWav.close();
+    }
+
+    TimelineTrack *musicRemixTrack = timelineReady
+        ? projectTimeline->trackAt(true, 0) : nullptr;
+    const bool musicRemixFixtureReady = musicRemixWavReady && musicRemixTrack;
+    if (musicRemixFixtureReady) {
+        ClipInfo remixClip;
+        remixClip.filePath = musicRemixWav.fileName();
+        remixClip.displayName = QStringLiteral("remix-test.wav");
+        remixClip.duration = 8.0;
+        remixClip.outPoint = 8.0;
+        musicRemixTrack->setClips(QVector<ClipInfo>{remixClip});
+        projectTimeline->clearSelection();
+        projectTimeline->undoManager()->clear();
+        projectTimeline->undoManager()->saveState(
+            projectTimeline->currentState(), QStringLiteral("MCP music remix baseline"));
+
+        const QJsonObject musicRemixResponse = callProjectInfoTool(
+            260, QStringLiteral("music_remix"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("audio")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 0},
+                {QStringLiteral("targetSec"), 6.0}
+            });
+        const QJsonObject musicRemixPayload = toolPayload(musicRemixResponse);
+        const bool g137 = !toolResult(musicRemixResponse)
+                                .value(QStringLiteral("isError")).toBool(true)
+            && musicRemixPayload.value(QStringLiteral("ok")).toBool(false)
+            && musicRemixPayload.value(QStringLiteral("resultDuration")).toDouble() > 0.0
+            && musicRemixPayload.value(QStringLiteral("segmentCount")).toInt() >= 2
+            && musicRemixTrack->clipCount() >= 2;
+        g137 ? pass("G137 music_remix normal case")
+             : fail("G137 music_remix normal case",
+                    QStringLiteral("decode, beat detection, or response failed: %1")
+                        .arg(toolErrorText(musicRemixResponse)));
+
+        const int remixCountAfter = musicRemixTrack->clipCount();
+        const QJsonObject invalidMusicRemixResponse = callProjectInfoTool(
+            261, QStringLiteral("music_remix"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("audio")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 0},
+                {QStringLiteral("targetSec"), 0.0}
+            });
+        const bool g138 = toolResult(invalidMusicRemixResponse)
+                                .value(QStringLiteral("isError")).toBool(false)
+            && toolErrorText(invalidMusicRemixResponse).contains(
+                   QStringLiteral("targetSec"))
+            && musicRemixTrack->clipCount() == remixCountAfter;
+        g138 ? pass("G138 music_remix rejects invalid target")
+             : fail("G138 music_remix rejects invalid target",
+                    QStringLiteral("invalid target was accepted or mutated the timeline"));
+
+        QJsonObject musicRemixDescriptor;
+        for (const QJsonValue &value : projectInfoToolDescriptors) {
+            if (value.toObject().value(QStringLiteral("name")).toString()
+                    == QStringLiteral("music_remix")) {
+                musicRemixDescriptor = value.toObject();
+                break;
+            }
+        }
+        const QJsonObject musicInputSchema = musicRemixDescriptor
+            .value(QStringLiteral("inputSchema")).toObject();
+        const QJsonObject musicOutputSchema = musicRemixDescriptor
+            .value(QStringLiteral("outputSchema")).toObject();
+        const auto requiredHas = [](const QJsonObject &schema, const QString &key) {
+            for (const QJsonValue &required : schema.value(QStringLiteral("required"))
+                     .toArray()) {
+                if (required.toString() == key)
+                    return true;
+            }
+            return false;
+        };
+        const bool g139 = !musicRemixDescriptor.isEmpty()
+            && musicInputSchema.value(QStringLiteral("type")).toString()
+                   == QStringLiteral("object")
+            && requiredHas(musicInputSchema, QStringLiteral("kind"))
+            && requiredHas(musicInputSchema, QStringLiteral("targetSec"))
+            && musicOutputSchema.value(QStringLiteral("type")).toString()
+                   == QStringLiteral("object")
+            && requiredHas(musicOutputSchema, QStringLiteral("resultDuration"))
+            && requiredHas(musicOutputSchema, QStringLiteral("segmentCount"));
+        g139 ? pass("G139 music_remix schema")
+             : fail("G139 music_remix schema",
+                    QStringLiteral("input or output schema is incomplete"));
+        projectTimeline->undo();
+    } else {
+        const QString reason = QStringLiteral(
+            "Timeline or generated WAV fixture was not available");
+        fail("G137 music_remix normal case", reason);
+        fail("G138 music_remix rejects invalid target", reason);
+        fail("G139 music_remix schema", reason);
     }
 
     TimelineTrack *replaceVideoTrack = timelineReady

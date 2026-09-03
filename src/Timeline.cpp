@@ -17,6 +17,8 @@
 #include "OverlayDialogs.h"
 #include "ProjectFile.h"
 #include "WaveformGenerator.h"
+#include "MusicRemixDialog.h"
+#include "MusicRemix.h"
 #include "color/ClipColor.h"
 #include "playback/HdrIngestProbe.h"
 #include "playback/hdringest_flag.h"
@@ -28,6 +30,7 @@
 #include <cmath>
 #include <functional>
 #include <limits>
+#include <numeric>
 #include <utility>
 #include <QFileInfo>
 #include <QDir>
@@ -7025,6 +7028,122 @@ void Timeline::applyBeatMarkersToClip(TimelineTrack *track, int clipIndex)
         emit positionChanged(m_playheadPos);
 }
 
+bool Timeline::applyMusicRemix(int trackIndex, int clipIndex,
+                               const remix::Plan &plan, bool ripple,
+                               QString *errorOut)
+{
+    if (errorOut)
+        errorOut->clear();
+    const auto fail = [errorOut](const QString &message) {
+        if (errorOut)
+            *errorOut = message;
+        return false;
+    };
+    if (!plan.error.isEmpty() || plan.segments.isEmpty())
+        return fail(plan.error.isEmpty()
+                        ? QStringLiteral("リミックス計画が空です") : plan.error);
+    if (!std::isfinite(plan.resultDuration) || plan.resultDuration <= 0.0)
+        return fail(QStringLiteral("リミックス後の尺が不正です"));
+    if (!std::isfinite(plan.crossfadeSec) || plan.crossfadeSec < 0.0)
+        return fail(QStringLiteral("クロスフェード時間が不正です"));
+
+    TimelineTrack *track = trackAt(true, trackIndex);
+    if (!track)
+        return fail(QStringLiteral("音声トラックの index が範囲外です"));
+    if (clipIndex < 0 || clipIndex >= track->clipCount())
+        return fail(QStringLiteral("音声クリップの index が範囲外です"));
+    if (track->isLocked())
+        return fail(QStringLiteral("音声トラックがロックされています"));
+
+    const ClipInfo original = track->clips().at(clipIndex);
+    const double sourceOut = original.outPoint > 0.0
+        ? original.outPoint : original.duration;
+    const double sourceSpan = sourceOut - original.inPoint;
+    const double speed = original.speed > 0.0 ? original.speed : 1.0;
+    const double clipDuration = sourceSpan / speed;
+    if (!std::isfinite(clipDuration) || clipDuration <= 0.0)
+        return fail(QStringLiteral("対象クリップの尺が不正です"));
+
+    QVector<ClipInfo> replacement;
+    replacement.reserve(plan.segments.size());
+    for (const remix::Segment &segment : plan.segments) {
+        if (!std::isfinite(segment.srcStart) || !std::isfinite(segment.srcEnd)
+            || segment.srcStart < -1.0e-6
+            || segment.srcEnd > clipDuration + 1.0e-6
+            || segment.srcEnd <= segment.srcStart + 1.0e-9) {
+            return fail(QStringLiteral("リミックス区間が対象クリップ外です"));
+        }
+        ClipInfo part = original;
+        const double localStart = qBound(0.0, segment.srcStart, clipDuration);
+        const double localEnd = qBound(0.0, segment.srcEnd, clipDuration);
+        part.inPoint = original.inPoint + localStart * speed;
+        part.outPoint = original.inPoint + localEnd * speed;
+        part.leadInSec = replacement.isEmpty() ? original.leadInSec : 0.0;
+        part.leadIn = Transition{};
+        part.trailOut = Transition{};
+        replacement.append(part);
+    }
+    if (replacement.isEmpty())
+        return fail(QStringLiteral("リミックス区間がありません"));
+
+    const double actualDuration = std::accumulate(
+        replacement.cbegin(), replacement.cend(), 0.0,
+        [](double sum, const ClipInfo &clip) {
+            return sum + qMax(0.0, clip.effectiveDuration());
+        });
+    if (!std::isfinite(actualDuration) || actualDuration <= 0.0)
+        return fail(QStringLiteral("リミックス後の尺が不正です"));
+
+    const QVector<ClipInfo> before = track->clips();
+    const int nextIndexBefore = clipIndex + 1;
+    const bool hasNext = nextIndexBefore < before.size();
+    const double nextLeadIn = hasNext ? before[nextIndexBefore].leadInSec : 0.0;
+    const double downstreamLeadIn = nextLeadIn + original.effectiveDuration()
+                                  - actualDuration;
+    if (!ripple && hasNext && downstreamLeadIn < -1.0e-6)
+        return fail(QStringLiteral(
+            "後続クリップの空きが足りません。「後続をリップル」を有効にしてください"));
+
+    const Transition originalLeadIn = original.leadIn;
+    const Transition originalTrailOut = original.trailOut;
+    for (int i = 0; i + 1 < replacement.size(); ++i) {
+        double duration = qMin(plan.crossfadeSec,
+                               replacement[i].effectiveDuration());
+        duration = qMin(duration, replacement[i + 1].effectiveDuration());
+        if (duration <= 0.0)
+            continue;
+        Transition crossfade;
+        crossfade.type = TransitionType::CrossDissolve;
+        crossfade.duration = duration;
+        replacement[i].trailOut = crossfade;
+        replacement[i + 1].leadIn = crossfade;
+    }
+    replacement.first().leadIn = originalLeadIn;
+    replacement.last().trailOut = originalTrailOut;
+
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    // Keep the public TimelineTrack primitives as the only clip-array edit
+    // operations. The final setClips below only settles the downstream gap
+    // after the primitive replacement has completed.
+    track->removeClip(clipIndex);
+    for (int i = 0; i < replacement.size(); ++i)
+        track->insertClip(clipIndex + i, replacement.at(i));
+
+    QVector<ClipInfo> after = track->clips();
+    const int nextIndexAfter = clipIndex + replacement.size();
+    if (hasNext && nextIndexAfter < after.size() && !ripple)
+        after[nextIndexAfter].leadInSec = qMax(0.0, downstreamLeadIn);
+    track->setClips(after);
+    track->setSelectedClip(clipIndex);
+
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+    saveUndoState(QStringLiteral("ミュージックリミックス"));
+    updateInfoLabel();
+    scheduleEmitSequenceChanged();
+    return true;
+}
+
 // 再生ヘッド直下の V1(最初の動画トラック)クリップを解決。見つかれば true。
 bool Timeline::clipUnderPlayhead(TimelineTrack *&outTrack, int &outClipIndex) const
 {
@@ -7122,6 +7241,7 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
         aUnlink->setEnabled(aLinkGroup > 0);
         aMenu.addSeparator();
         QAction *aNormalize = aMenu.addAction(QStringLiteral("ノーマライズ"));
+        QAction *aRemix = aMenu.addAction(QStringLiteral("ミュージックリミックス…"));
         aMenu.addSeparator();
         QMenu *aChannelMenu = aMenu.addMenu(QStringLiteral("チャンネルマッピング"));
         QAction *aStereoAct = addAudioChannelModeAction(aChannelMenu, aClip.audioChannelMode,
@@ -7207,6 +7327,83 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
         else if (aChosen == aNormalize) {
             const int trackIdx = m_audioTracks.indexOf(track);
             normalizeAudioClipPeak(trackIdx, clipIndex);
+        }
+        else if (aChosen == aRemix) {
+            QVector<float> samples;
+            int sampleRate = 0;
+            if (!WaveformGenerator::decodeAudio(aClip.filePath, samples, sampleRate)
+                || samples.isEmpty() || sampleRate <= 0) {
+                QMessageBox::warning(this, QStringLiteral("ミュージックリミックス"),
+                                     QStringLiteral("音声のデコードに失敗しました。"));
+                return;
+            }
+
+            const double sourceOut = aClip.outPoint > 0.0
+                ? aClip.outPoint : aClip.duration;
+            const double totalSourceSec =
+                static_cast<double>(samples.size()) / sampleRate;
+            const double activeStart = qMax(0.0, aClip.inPoint);
+            const double activeEnd = qMin(sourceOut, totalSourceSec);
+            if (activeEnd <= activeStart) {
+                QMessageBox::information(
+                    this, QStringLiteral("ミュージックリミックス"),
+                    QStringLiteral("クリップの有効な音声範囲がありません。"));
+                return;
+            }
+            const int startSample = qBound(
+                0, static_cast<int>(std::floor(activeStart * sampleRate)),
+                static_cast<int>(samples.size()));
+            const int endSample = qBound(
+                startSample, static_cast<int>(std::ceil(activeEnd * sampleRate)),
+                static_cast<int>(samples.size()));
+            const QVector<float> activeSamples =
+                samples.mid(startSample, endSample - startSample);
+            const beatdetect::Result beats = beatdetect::detectBeats(
+                activeSamples, sampleRate, beatdetect::Config{});
+            if (beats.beatTimesSec.size() < 2) {
+                QMessageBox::information(
+                    this, QStringLiteral("ミュージックリミックス"),
+                    QStringLiteral("ビートが 2 個未満のため適用できません。"));
+                return;
+            }
+
+            const double speed = aClip.speed > 0.0 ? aClip.speed : 1.0;
+            const double clipDuration = aClip.effectiveDuration();
+            QVector<double> localBeatTimes;
+            localBeatTimes.reserve(beats.beatTimesSec.size());
+            for (double beat : beats.beatTimesSec) {
+                const double sourceLocal = activeStart + beat - aClip.inPoint;
+                if (sourceLocal >= -1.0e-6
+                    && sourceLocal <= clipDuration * speed + 1.0e-6) {
+                    localBeatTimes.append(qBound(0.0, sourceLocal / speed,
+                                                 clipDuration));
+                }
+            }
+            if (localBeatTimes.size() < 2) {
+                QMessageBox::information(
+                    this, QStringLiteral("ミュージックリミックス"),
+                    QStringLiteral("ビート境界を作成できませんでした。"));
+                return;
+            }
+
+            MusicRemixDialog dialog(this);
+            dialog.setDetectedBpm(beats.bpm);
+            dialog.setTargetDuration(clipDuration);
+            if (dialog.exec() != QDialog::Accepted)
+                return;
+            const remix::Plan plan = remix::planRemix(
+                localBeatTimes, clipDuration, dialog.targetDuration(), remix::Config{});
+            if (!plan.valid) {
+                QMessageBox::warning(this, QStringLiteral("ミュージックリミックス"),
+                                     plan.error);
+                return;
+            }
+            QString error;
+            if (!applyMusicRemix(m_audioTracks.indexOf(track), clipIndex, plan,
+                                 dialog.rippleFollowingClips(), &error)) {
+                QMessageBox::warning(this, QStringLiteral("ミュージックリミックス"),
+                                     error);
+            }
         }
         else if (aChosen == aStereoAct) applyAudioChannelMode(AudioChannelMode::Stereo);
         else if (aChosen == aFillLeftAct) applyAudioChannelMode(AudioChannelMode::FillLeft);

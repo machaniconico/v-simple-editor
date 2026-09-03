@@ -128,6 +128,7 @@ int runMographSelftest();
 int runMotionBlurP2Selftest();
 int runMotionBlurParitySelftest();
 int runMotionPresetSelftest();
+int runMusicRemixSelftest();
 int runMultiCamSelftest();
 int runNestSequenceSelftest();
 int runObsSelftest();
@@ -758,6 +759,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Offline media path enumeration, nested sequences, undo-safe relink, and persistence (6 gates)" },
     { "mcp",              "VEDITOR_MCP_SELFTEST",                runMcpSelftest,                true,
       "MCP server: JSON-RPC framing + tool registry dispatch + HTTP transport auth + write-tool validation + AI chat helpers (143 gates)" },
+    { "music-remix",      nullptr,                                  runMusicRemixSelftest,        true,
+      "Music Remix: beat-boundary shortening/extension, intro/outro retention, crossfade, and one-step undo" },
     { "auto-clip-gen",     "VEDITOR_AUTO_CLIP_GEN_SELFTEST",      runAutoClipGenSelftest,        true,
       "Auto clip generator scaffold smoke" },
     { "planar",            "VEDITOR_PLANAR_SELFTEST",             runPlanarSelftest,             true,

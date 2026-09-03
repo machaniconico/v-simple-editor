@@ -24,6 +24,7 @@
 #include "Keyframe.h"
 #include "DynamicZoom.h"
 #include "WaveformGenerator.h"
+#include "MusicRemix.h"
 #include "TextManager.h"
 #include "PlaybackTypes.h"
 #include "Overlay.h"
@@ -775,6 +776,12 @@ public:
                            bool contain, bool cover, const QString &undoLabel);
     void applySilenceCutToClip(TimelineTrack *track, int clipIndex);
     void applyBeatMarkersToClip(TimelineTrack *track, int clipIndex);
+    // Beat-boundary music remix. Plan times are local timeline seconds in the
+    // selected audio clip. The optional ripple flag keeps the existing
+    // downstream clips fixed when false (the default).
+    bool applyMusicRemix(int trackIndex, int clipIndex,
+                         const remix::Plan &plan, bool ripple = false,
+                         QString *errorOut = nullptr);
     // 再生ヘッド直下の V1 クリップを解決(見つかれば true)。
     bool clipUnderPlayhead(TimelineTrack *&outTrack, int &outClipIndex) const;
     bool removeMarker(int id);

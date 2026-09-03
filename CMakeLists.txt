@@ -261,6 +261,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/playback/smartrender_flag.h
     src/SilenceCut.cpp
     src/BeatDetect.cpp
+    src/MusicRemix.cpp
+    src/MusicRemixDialog.cpp
     src/AudioBusPanel.cpp
     src/selftests/audio_bus_selftest.cpp
     src/selftests/audio_xfade_selftest.cpp
@@ -279,6 +281,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/atempo_resolve_selftest.cpp
     src/selftests/silence_cut_selftest.cpp
     src/selftests/beat_detect_selftest.cpp
+    src/selftests/music_remix_selftest.cpp
     src/selftests/safe_zone_selftest.cpp
     src/selftests/StillCompareSelftest.cpp
     src/selftests/onion_skin_selftests.cpp
