@@ -4349,11 +4349,11 @@ QImage VideoPlayer::stillCompareDisplaySource(const QImage &fallback) const
     // Match MainWindow's frame-export/still-capture SSOT arguments: the
     // current timeline head in microseconds and the configured canvas size.
     // During playback displayFrame runs just before positionChanged updates
-    // Timeline, so m_timelinePositionUs is the non-lagging head value.
+    // Timeline, so the player's sequence/non-sequence clocks are the
+    // non-lagging head values.
     const qint64 usec = sequenceActive()
         ? qMax<qint64>(0, m_timelinePositionUs)
-        : qMax<qint64>(
-              0, qRound64(timeline->playheadPosition() * 1000000.0));
+        : qMax<qint64>(0, m_currentPositionUs);
     QSize renderSize(qMax(1, m_canvasWidth), qMax(1, m_canvasHeight));
     if ((m_canvasWidth <= 0 || m_canvasHeight <= 0) && fallback.size().isValid())
         renderSize = fallback.size();
