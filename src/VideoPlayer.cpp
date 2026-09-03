@@ -4358,7 +4358,7 @@ QImage VideoPlayer::applyStillCompareForDisplay(const QImage &image,
     QImage display = externalPreview
         ? image
         : stillCompareDisplaySource(image, timelineUsec);
-    if (externalPreview)
+    if (externalPreview && stillCompareActive())
         setCompositeBakedModeForDisplay(true);
     if (stillCompareActive())
         applyStillCompareGlBypass();
