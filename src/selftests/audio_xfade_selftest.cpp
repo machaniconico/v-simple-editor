@@ -1,4 +1,5 @@
 #include "../Timeline.h"
+#include "../UndoManager.h"
 
 #include <QApplication>
 
