@@ -2009,25 +2009,16 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries,
         // the stale picture (paired with resetDecoder's clear).
         m_lastV1RawFrame = QImage();
         // Defect-2 fix: 空タイムラインは黒プレビューでなければならない。
-        // 以前は m_lastSourceFrame が残り、GL プレビューも最後にアップロードした
-        // テクスチャを保持したままだった。直前の resetVideoSourceTransform() が
-        // アスペクト/コンテンツインセット補正を外すため、その stale テクスチャが
-        // アスペクト無視で引き伸ばし描画され、「undo で全クリップが消えたのに縦伸び
-        // 映像が再生され続ける」残像になっていた。source キャッシュをクリアし
-        // (refreshDisplayedFrame の null ガードで再描画を抑止)、GL プレビューを
-        // 黒フレームで上書きして stale 表示を断つ。可視トラックを全 OFF にした
-        // ケースでも「非表示 = 黒」で正しく、m_timelinePositionUs は不変。
-        m_lastSourceFrame = QImage();
-        m_lastSourceFrameHasBakedText = false;
-        if (m_glPreview) {
-            const QSize blankSize = m_projectOutputSize.isValid()
-                ? m_projectOutputSize
-                : QSize(m_canvasWidth  > 0 ? m_canvasWidth  : 16,
-                        m_canvasHeight > 0 ? m_canvasHeight : 16);
-            QImage blank(blankSize, QImage::Format_ARGB32_Premultiplied);
-            blank.fill(Qt::black);
-            m_glPreview->displayFrame(applyStillCompareForDisplay(blank));
-        }
+        // 黒フレームも通常の表示経路へ通し、比較前の source として保持する。
+        // これにより GL / QPixmap の両経路で stale 表示を消し、比較 OFF や対象削除時も
+        // setStillCompare() -> refreshDisplayedFrame() で通常の黒へ再描画できる。
+        const QSize blankSize = m_projectOutputSize.isValid()
+            ? m_projectOutputSize
+            : QSize(m_canvasWidth  > 0 ? m_canvasWidth  : 16,
+                    m_canvasHeight > 0 ? m_canvasHeight : 16);
+        QImage blank(blankSize, QImage::Format_ARGB32_Premultiplied);
+        blank.fill(Qt::black);
+        displayFrame(blank);
         undotrace::log("setSeq:exit");
         return;
     }

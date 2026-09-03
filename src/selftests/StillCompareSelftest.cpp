@@ -2,8 +2,10 @@
 #include "../StillStore.h"
 
 #include <QColor>
+#include <QDir>
 #include <QFile>
 #include <QImage>
+#include <QStringList>
 #include <QTemporaryDir>
 
 #include <cstdio>
@@ -118,7 +120,8 @@ int runStillCompareSelftest()
                      && isColor(result, 7, 5, QColor(Qt::black)));
     }
 
-    // G5: StillStore persists metadata and PNG, then removes both cleanly.
+    // G5: StillStore persists metadata and PNG, removes both cleanly, and does
+    // not drop the index entry when deleting the PNG fails.
     {
         QTemporaryDir temporary;
         stillstore::StillStore store;
@@ -141,7 +144,43 @@ int runStillCompareSelftest()
         const bool removedOk = listedOk && store.remove(saved.id, &error)
             && error.isEmpty() && store.list(&error).isEmpty()
             && !QFile::exists(saved.filePath);
-        check(5, savedOk && listedOk && removedOk);
+
+        stillstore::Still blocked;
+        const bool blockedSaved = removedOk
+            && store.save(image, QStringLiteral("削除失敗テスト"),
+                          QString(), &blocked, &error)
+            && QFile::remove(blocked.filePath)
+            && QDir().mkpath(blocked.filePath);
+        QString removeError;
+        const bool removeRejected = blockedSaved
+            && !store.remove(blocked.id, &removeError)
+            && !removeError.isEmpty();
+        QString relistError;
+        const QVector<stillstore::Still> afterRejectedRemove =
+            store.list(&relistError);
+        const bool indexPreserved = removeRejected && relistError.isEmpty()
+            && afterRejectedRemove.size() == 1
+            && afterRejectedRemove.front().id == blocked.id;
+        const bool cleanedUp = !blockedSaved
+            || (QDir(blocked.filePath).removeRecursively()
+                && store.remove(blocked.id, &error));
+
+        QFile invalidIndex(temporary.filePath(QStringLiteral("index.json")));
+        const bool invalidIndexReady = cleanedUp
+            && invalidIndex.open(QIODevice::WriteOnly | QIODevice::Truncate)
+            && invalidIndex.write("{") == 1;
+        invalidIndex.close();
+        stillstore::Still rejected;
+        QString saveError;
+        const bool saveRejected = invalidIndexReady
+            && !store.save(image, QStringLiteral("一覧失敗テスト"),
+                           QString(), &rejected, &saveError)
+            && !saveError.isEmpty();
+        const QStringList orphanPngs = QDir(temporary.path()).entryList(
+            QStringList{QStringLiteral("still-*.png")}, QDir::Files);
+        check(5, savedOk && listedOk && removedOk && blockedSaved
+                     && removeRejected && indexPreserved && cleanedUp
+                     && saveRejected && orphanPngs.isEmpty());
     }
 
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);

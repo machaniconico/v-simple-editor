@@ -209,13 +209,13 @@ bool StillStore::remove(const QString &id, QString *error)
     }
 
     const QString imagePath = it->filePath;
-    stills.erase(it);
-    if (!writeIndex(stills, error))
-        return false;
     if (QFile::exists(imagePath) && !QFile::remove(imagePath)) {
         setError(error, QStringLiteral("スチル画像を削除できません: %1").arg(imagePath));
         return false;
     }
+    stills.erase(it);
+    if (!writeIndex(stills, error))
+        return false;
     return true;
 }
 

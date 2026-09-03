@@ -6513,9 +6513,11 @@ void MainWindow::setupMenuBar()
         }
         frame = frame.convertToFormat(QImage::Format_RGBA8888);
 
-        const QString projectName = m_projectFilePath.isEmpty()
-            ? QStringLiteral("無題")
-            : QFileInfo(m_projectFilePath).completeBaseName();
+        QString projectName = m_projectConfig.name;
+        if (projectName.isEmpty() && !m_projectFilePath.isEmpty())
+            projectName = QFileInfo(m_projectFilePath).completeBaseName();
+        if (projectName.isEmpty())
+            projectName = QStringLiteral("無題");
         stillstore::Still saved;
         QString error;
         if (!m_stillStore.save(frame, projectName, QString(), &saved, &error)) {
