@@ -183,7 +183,8 @@ public:
     void setOnionSkinConfig(const onionskin::Config &cfg);
     void setStillCompare(const stillcompare::Config &cfg);
     QImage applyStillCompareForDisplay(const QImage &image,
-                                       qint64 displayTimelineUsec);
+                                       qint64 displayTimelineUsec,
+                                       bool externalPreview = false);
     void setPreviewEffectsPack(float sharpen, float blur, float lens);
     void setPreviewGlow(bool enabled, float threshold, float radius, float intensity);
     void setPreviewBloom(bool enabled, float threshold, float intensity, float spread);
@@ -800,7 +801,9 @@ private:
     stillcompare::Config m_stillCompare;  // STILLS-WIPE: display-only、既定 OFF。
     const Timeline *m_stillCompareGlTimeline = nullptr;
     bool m_stillCompareGlBypassActive = false;
-    bool m_stillCompareSavedCompositeBakedMode = false;
+    // Keep the mode required by the normal preview path while comparison
+    // forces GL into baked mode for the display-only composite.
+    bool m_stillCompareNormalCompositeBakedMode = false;
     float m_previewSharpen = 0.0f;
     float m_previewBlur = 0.0f;
     float m_previewLens = 0.0f;
@@ -919,6 +922,7 @@ private:
     QImage stillCompareDisplaySource(const QImage &fallback,
                                      qint64 displayTimelineUsec) const;
     QImage compositeStillCompare(const QImage &display) const;
+    void setCompositeBakedModeForDisplay(bool baked);
     void beginStillCompareGlBypass();
     void applyStillCompareGlBypass();
     void restoreStillCompareGlState();

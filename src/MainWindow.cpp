@@ -3139,7 +3139,7 @@ void MainWindow::applyStillCompareConfig()
     if (!special.isNull()) {
         m_player->glPreview()->displayFrame(
             m_player->applyStillCompareForDisplay(
-                special, m_player->timelinePositionUs()));
+                special, m_player->timelinePositionUs(), true));
     }
 }
 
@@ -3166,7 +3166,7 @@ void MainWindow::refreshEffectLibraryPreview()
             entryId, m_lastCompositedFrame, &preview) && !preview.isNull()) {
         m_player->glPreview()->displayFrame(
             m_player->applyStillCompareForDisplay(
-                preview, m_player->timelinePositionUs()));
+                preview, m_player->timelinePositionUs(), true));
     }
 }
 
@@ -3925,7 +3925,7 @@ void MainWindow::setupUI()
         if (!composed.isNull())
             m_player->glPreview()->displayFrame(
                 m_player->applyStillCompareForDisplay(
-                    composed, m_player->timelinePositionUs()));
+                    composed, m_player->timelinePositionUs(), true));
         if (m_effectLibraryPanel && m_effectLibraryPanel->previewEnabled())
             refreshEffectLibraryPreview();
     });
@@ -6396,7 +6396,7 @@ void MainWindow::setupMenuBar()
         else if (m_player && m_player->glPreview() && !m_lastCompositedFrame.isNull())
             m_player->glPreview()->displayFrame(
                 m_player->applyStillCompareForDisplay(
-                    m_lastCompositedFrame, m_player->timelinePositionUs()));
+                    m_lastCompositedFrame, m_player->timelinePositionUs(), true));
     });
     connect(m_effectLibraryPanel, &EffectLibraryPanel::keyframeRequested,
             this, &MainWindow::addEffectLibraryKeyframe);
@@ -8032,7 +8032,7 @@ void MainWindow::refreshSpecialClipPreview()
         s_refreshingPreview = true;
         m_player->glPreview()->displayFrame(
             m_player->applyStillCompareForDisplay(
-                composed, m_player->timelinePositionUs()));
+                composed, m_player->timelinePositionUs(), true));
         s_refreshingPreview = false;
     } else if (!m_player->isPlaying()) {
         s_refreshingPreview = true;
@@ -19533,7 +19533,7 @@ void MainWindow::onNodeGraphChanged()
     if (!result.isNull() && m_player->glPreview()) {
         m_player->glPreview()->displayFrame(
             m_player->applyStillCompareForDisplay(
-                result, m_player->timelinePositionUs()));
+                result, m_player->timelinePositionUs(), true));
         m_player->glPreview()->update();
     }
 }

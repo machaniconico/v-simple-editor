@@ -2423,7 +2423,7 @@ bool VideoPlayer::displayNestedSequenceFrameAt(const Timeline *timeline,
     if (ssotFrame.isNull())
         return false;
     if (m_glPreview)
-        m_glPreview->setCompositeBakedMode(true);
+        setCompositeBakedModeForDisplay(true);
     cachePreviewComposite(ssotFrame);
     displayFrame(ssotFrame, true, timelineUs);
     return true;
@@ -2519,7 +2519,7 @@ bool VideoPlayer::seekToTimelineUs(int64_t timelineUs, bool precise)
         // though it now needs the entry's scale applied. The next
         // playback tick re-sets the flag based on willComposite, so this
         // is always safe.
-        m_glPreview->setCompositeBakedMode(nestedSequenceRendered);
+        setCompositeBakedModeForDisplay(nestedSequenceRendered);
     }
     m_suppressUiUpdates = prevSuppress;
 
@@ -2597,7 +2597,7 @@ bool VideoPlayer::advanceToEntry(int newEntryIdx)
         // Match the seek path's defensive un-bake — a paused boundary
         // crossing followed by a single-clip displayFrame would otherwise
         // render at viewport identity if the prior tick was composite.
-        m_glPreview->setCompositeBakedMode(false);
+        setCompositeBakedModeForDisplay(false);
     }
     m_timelinePositionUs = static_cast<int64_t>(next.timelineStart * AV_TIME_BASE);
     const Timeline *previewTimeline = this->previewTimeline();
@@ -2616,7 +2616,7 @@ bool VideoPlayer::advanceToEntry(int newEntryIdx)
     if (nestedSequencePreview && !nestedSequenceRendered)
         seekOk = seekInternal(startLocalUs, true, true);
     if (m_glPreview && nestedSequenceRendered)
-        m_glPreview->setCompositeBakedMode(true);
+        setCompositeBakedModeForDisplay(true);
     if (!seekOk) {
         m_suppressUiUpdates = prevSuppress;
         return false;
@@ -3501,7 +3501,7 @@ void VideoPlayer::displaySeekFrameConformed(const QImage &v1Image,
     singleLayer.append(layer);
     composeMultiTrackFrameInto(canvas, singleLayer);
     if (m_glPreview)
-        m_glPreview->setCompositeBakedMode(true);
+        setCompositeBakedModeForDisplay(true);
     m_lastFrameOdtApplied = false;
     displayFrame(canvas, false, timelineUsec);
 }
@@ -4347,11 +4347,19 @@ void VideoPlayer::setStillCompare(const stillcompare::Config &cfg)
 }
 
 QImage VideoPlayer::applyStillCompareForDisplay(const QImage &image,
-                                                qint64 displayTimelineUsec)
+                                                qint64 displayTimelineUsec,
+                                                bool externalPreview)
 {
     const qint64 timelineUsec =
         resolvedDisplayTimelineUsec(displayTimelineUsec);
-    QImage display = stillCompareDisplaySource(image, timelineUsec);
+    // MainWindow's special/effect/node previews are already rendered by
+    // their own pipeline. They are not timeline frames and must remain the
+    // live side of the comparison instead of being replaced by renderFrameAt.
+    QImage display = externalPreview
+        ? image
+        : stillCompareDisplaySource(image, timelineUsec);
+    if (externalPreview)
+        setCompositeBakedModeForDisplay(true);
     if (stillCompareActive())
         applyStillCompareGlBypass();
     return compositeStillCompare(display);
@@ -4374,6 +4382,20 @@ qint64 VideoPlayer::resolvedDisplayTimelineUsec(qint64 requestedUsec) const
 bool VideoPlayer::stillCompareActive() const
 {
     return m_stillCompare.enabled && !m_stillCompare.still.isNull();
+}
+
+void VideoPlayer::setCompositeBakedModeForDisplay(bool baked)
+{
+    m_stillCompareNormalCompositeBakedMode = baked;
+    if (!m_glPreview)
+        return;
+    if (m_stillCompareGlBypassActive) {
+        // The comparison image is itself a display-local composite. Keep GL
+        // bypassed while retaining the normal path's latest intended mode.
+        m_glPreview->setCompositeBakedMode(true);
+        return;
+    }
+    m_glPreview->setCompositeBakedMode(baked);
 }
 
 QImage VideoPlayer::stillCompareDisplaySource(const QImage &fallback,
@@ -4412,7 +4434,7 @@ void VideoPlayer::beginStillCompareGlBypass()
     if (!m_glPreview || m_stillCompareGlBypassActive)
         return;
     m_stillCompareGlTimeline = m_glPreview->timeline();
-    m_stillCompareSavedCompositeBakedMode =
+    m_stillCompareNormalCompositeBakedMode =
         m_glPreview->compositeBakedMode();
     m_stillCompareGlBypassActive = true;
     // GLPreview derives single-clip motion and opacity directly from Timeline
@@ -4474,8 +4496,10 @@ void VideoPlayer::restoreStillCompareGlState()
     } else {
         m_glPreview->setStabilizerKeyframes({});
     }
+    // Restore the mode required by the latest normal preview path, not the
+    // value that happened to be present when comparison was enabled.
     m_glPreview->setCompositeBakedMode(
-        m_stillCompareSavedCompositeBakedMode);
+        m_stillCompareNormalCompositeBakedMode);
     m_stillCompareGlTimeline = nullptr;
     m_stillCompareGlBypassActive = false;
 }
@@ -5619,7 +5643,7 @@ bool VideoPlayer::refreshPreviewClipCpuComposite()
         composePreviewFrameWithAdjustmentClips(canvas, layers, adjustments);
 
     if (m_glPreview)
-        m_glPreview->setCompositeBakedMode(true);
+        setCompositeBakedModeForDisplay(true);
     m_lastFrameOdtApplied = false;
     displayFrame(canvas, false, m_timelinePositionUs);
     return true;
@@ -5717,7 +5741,7 @@ void VideoPlayer::refreshDisplayedFrame()
                     singleLayer.append(layer);
                     composeMultiTrackFrameInto(canvas, singleLayer);
                     if (m_glPreview)
-                        m_glPreview->setCompositeBakedMode(true);
+                        setCompositeBakedModeForDisplay(true);
                     m_lastFrameOdtApplied = false;
                     displayFrame(canvas, false, m_timelinePositionUs);
                     return;
@@ -6011,7 +6035,7 @@ void VideoPlayer::handlePlaybackTick()
                                : m_activeEntry;
         const auto &targetE = m_sequence[displayIdx];
         m_glPreview->setVideoSourceTransform(targetE.videoScale, targetE.videoDx, targetE.videoDy);
-        m_glPreview->setCompositeBakedMode(false);
+        setCompositeBakedModeForDisplay(false);
         (void)v1e; // retained for adjacent compose path; intentionally unused here
     }
     m_lastTickWasComposite = willComposite;
@@ -6218,7 +6242,7 @@ void VideoPlayer::handlePlaybackTick()
                                         renderSize);
             if (!ssotFrame.isNull()) {
                 if (m_glPreview)
-                    m_glPreview->setCompositeBakedMode(true);
+                    setCompositeBakedModeForDisplay(true);
                 cachePreviewComposite(ssotFrame);
                 displayFrame(ssotFrame, true, m_timelinePositionUs);
                 servedByNestedSequenceSsot = true;
@@ -6257,7 +6281,7 @@ void VideoPlayer::handlePlaybackTick()
                 && !cached.isNull()
                 && cached.size() == QSize(hitKey.width, hitKey.height)) {
                 if (m_glPreview)
-                    m_glPreview->setCompositeBakedMode(true);
+                    setCompositeBakedModeForDisplay(true);
                 // Cache hits can re-serve ODT-baked frames; without a cached baked flag, paused same-playhead hits can double-apply ACES.
                 displayFrame(cached, false, m_timelinePositionUs);
                 servedFromCache = true;
@@ -6606,7 +6630,7 @@ void VideoPlayer::handlePlaybackTick()
                     const auto &targetE = m_sequence[displayIdx];
                     m_glPreview->setVideoSourceTransform(
                         targetE.videoScale, targetE.videoDx, targetE.videoDy);
-                    m_glPreview->setCompositeBakedMode(false);
+                    setCompositeBakedModeForDisplay(false);
                     (void)v1e;
                 }
                 if (traceTick)
@@ -6659,7 +6683,7 @@ void VideoPlayer::handlePlaybackTick()
                     // CPU 経路と同じ baked-mode: paintGL が m_videoSourceScale を
                     // 二重適用しないよう viewport を identity 扱いにする。
                     if (m_glPreview)
-                        m_glPreview->setCompositeBakedMode(true);
+                        setCompositeBakedModeForDisplay(true);
                     cachePreviewComposite(displayedComposite);  // CPU 経路と同じキーで put
                     displayFrame(displayedComposite, false,
                                  m_timelinePositionUs);          // 1 tick = 最大 1 displayFrame
@@ -6678,7 +6702,7 @@ void VideoPlayer::handlePlaybackTick()
                     if (traceTick)
                         m_tickTraceComposeNs += tickTimer.nsecsElapsed() - sectionMark;
                     if (m_glPreview)
-                        m_glPreview->setCompositeBakedMode(true);
+                        setCompositeBakedModeForDisplay(true);
                     cachePreviewComposite(m_canvasBase);
                     displayFrame(m_canvasBase, false, m_timelinePositionUs);
                 } else if (inplaceComposeEnabled) {
@@ -6694,7 +6718,7 @@ void VideoPlayer::handlePlaybackTick()
                     // (the prior behavior) made resize/move drags impossible
                     // during multi-track playback.
                     if (m_glPreview)
-                        m_glPreview->setCompositeBakedMode(true);
+                        setCompositeBakedModeForDisplay(true);
                     // ADAPTIVE-1: 合成結果を (timelineRevision, playhead, size, tier)
                     // でキャッシュ。再生は毎 tick playhead が進むのでキーは毎回変わり、
                     // ライブ再生で hit することはない (= decode をスキップしないので
@@ -6714,7 +6738,7 @@ void VideoPlayer::handlePlaybackTick()
                     if (traceTick)
                         m_tickTraceComposeNs += tickTimer.nsecsElapsed() - sectionMark;
                     if (m_glPreview)
-                        m_glPreview->setCompositeBakedMode(true);
+                        setCompositeBakedModeForDisplay(true);
                     cachePreviewComposite(composed); // ADAPTIVE-1: 上の in-place 分岐と同旨
                     displayFrame(composed, false, m_timelinePositionUs);
                 }
@@ -6738,7 +6762,7 @@ void VideoPlayer::handlePlaybackTick()
                                        : m_activeEntry;
                 const auto &targetE = m_sequence[displayIdx];
                 m_glPreview->setVideoSourceTransform(targetE.videoScale, targetE.videoDx, targetE.videoDy);
-                m_glPreview->setCompositeBakedMode(false);
+                setCompositeBakedModeForDisplay(false);
                 (void)v1e;
             }
             if (traceTick)
