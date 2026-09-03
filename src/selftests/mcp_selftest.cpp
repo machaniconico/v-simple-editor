@@ -2706,6 +2706,12 @@ int runMcpSelftest()
             g143 ? pass("G143 audio set_transition rejects non-audio transition types")
                  : fail("G143 audio set_transition rejects non-audio transition types",
                         QStringLiteral("an invalid audio transition type was accepted"));
+
+            audioXfadeTrack->setClips(QVector<ClipInfo>{});
+            projectTimeline->clearSelection();
+            projectTimeline->undoManager()->clear();
+            projectTimeline->undoManager()->saveState(
+                projectTimeline->currentState(), QStringLiteral("MCP selftest baseline"));
         } else {
             fail("G142 audio set_transition applies CrossDissolve and one undo",
                  QStringLiteral("audio track was not available"));
