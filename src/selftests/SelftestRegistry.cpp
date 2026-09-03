@@ -40,6 +40,7 @@ int runAudioChannelMapSelftest();
 int runAnimExportSelftest();
 int runAudioBusSelftest();
 int runAudioClipDragUndoSelftest();
+int runAudioXfadeSelftest();
 int runAudioMixerSelftest();
 int runAudioRestoreSelftest();
 int runAutoClipGenSelftest();
@@ -756,7 +757,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "media-relink",     "VEDITOR_MEDIA_RELINK_SELFTEST",       runMediaRelinkSelftest,         true,
       "Offline media path enumeration, nested sequences, undo-safe relink, and persistence (6 gates)" },
     { "mcp",              "VEDITOR_MCP_SELFTEST",                runMcpSelftest,                true,
-      "MCP server: JSON-RPC framing + tool registry dispatch + HTTP transport auth + write-tool validation + AI chat helpers (136 gates)" },
+      "MCP server: JSON-RPC framing + tool registry dispatch + HTTP transport auth + write-tool validation + AI chat helpers (143 gates)" },
     { "auto-clip-gen",     "VEDITOR_AUTO_CLIP_GEN_SELFTEST",      runAutoClipGenSelftest,        true,
       "Auto clip generator scaffold smoke" },
     { "planar",            "VEDITOR_PLANAR_SELFTEST",             runPlanarSelftest,             true,
@@ -837,6 +838,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "AudioClipEditor drag ticks live-update without filling undo; release/default calls record once" },
     { "audiomixer",        "VEDITOR_AUDIOMIXER_SELFTEST",         runAudioMixerSelftest,         true,
       "Audio mixer module smoke (Sprint-23 bus routing + send/return stubs)" },
+    { "audio-xfade",       "VEDITOR_AUDIO_XFADE_SELFTEST",         runAudioXfadeSelftest,       false,
+      "Audio constant-power crossfade/fade API and export afade=qsin contract (5 gates)" },
     { "oauth-mock-e2e",   "VEDITOR_OAUTH_MOCK_SELFTEST",        runOAuthMockE2eSelftest,       true,
       "OAuth + Upload pipeline を localhost mock HTTP server で exercise する 10 gate e2e selftest" },
     { "oauth-refresh-e2e", "VEDITOR_OAUTH_REFRESH_E2E_SELFTEST", runOAuthRefreshE2eSelftest,    true,

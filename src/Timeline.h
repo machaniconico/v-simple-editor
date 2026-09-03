@@ -154,7 +154,11 @@ QString buildExportAudioMixEntryFilterChain(int inputIndex,
                                             const QString &volumeExpression,
                                             AudioChannelMode mode,
                                             bool reversed = false,
-                                            double speed = 1.0);
+                                            double speed = 1.0,
+                                            TransitionType leadInType = TransitionType::None,
+                                            double leadInDuration = 0.0,
+                                            TransitionType trailOutType = TransitionType::None,
+                                            double trailOutDuration = 0.0);
 
 struct ClipInfo {
     QString filePath;
@@ -330,6 +334,23 @@ struct ClipInfo {
             || timeline_nesting::isSequenceClipFilePath(filePath);
     }
 };
+
+enum class AudioFadeEdge {
+    In,
+    Out
+};
+
+namespace audioxfade {
+
+// Pure clip-vector mutation helpers shared by Timeline's undo-aware API and
+// the QApplication-free audio-xfade selftest.
+bool applyCrossfade(QVector<ClipInfo> &clips, int clipIndexA,
+                    double durationSec, QString *errorOut = nullptr);
+bool applyFade(QVector<ClipInfo> &clips, int clipIndex,
+               AudioFadeEdge edge, double durationSec,
+               QString *errorOut = nullptr);
+
+} // namespace audioxfade
 
 struct TimelineSequence {
     QString id;
@@ -928,6 +949,16 @@ public:
     void toggleMuteTrack(int audioTrackIndex);
     void toggleSoloTrack(int audioTrackIndex);
     void normalizeAudioClipPeak(int trackIdx, int clipIdx);
+    // Audio-only transition APIs. Crossfade requires adjacent clips A/B and
+    // writes the same CrossDissolve duration to A.trailOut and B.leadIn.
+    // Fade changes only the requested edge of the requested clip. Each
+    // successful call records exactly one undo state.
+    bool applyAudioCrossfade(int trackIndex, int clipIndexA,
+                             double durationSec,
+                             QString *errorOut = nullptr);
+    bool applyAudioFade(int trackIndex, int clipIndex,
+                        AudioFadeEdge edge, double durationSec,
+                        QString *errorOut = nullptr);
 
     void setPlayheadPosition(double seconds);
     // Chase mode — re-centres the viewport on the playhead when it leaves

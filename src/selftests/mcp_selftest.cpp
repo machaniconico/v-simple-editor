@@ -2646,6 +2646,79 @@ int runMcpSelftest()
         fail("G133 match_frame maps timeline offset to sourceSec", reason);
     }
 
+    // G142-G143: AUDIO-XFADE adds an audio-only set_transition kind. Keep
+    // these gates in the reserved range for US-107; video set_transition
+    // coverage above remains unchanged.
+    if (projectTimeline) {
+        TimelineTrack *audioXfadeTrack = projectTimeline->trackAt(true, 0);
+        if (audioXfadeTrack) {
+            audioXfadeTrack->setClips(QVector<ClipInfo>{
+                makeTestClip(QStringLiteral("audio-xfade-A"), 0),
+                makeTestClip(QStringLiteral("audio-xfade-B"), 0)
+            });
+            projectTimeline->clearSelection();
+            projectTimeline->undoManager()->clear();
+            projectTimeline->undoManager()->saveState(
+                projectTimeline->currentState(),
+                QStringLiteral("MCP audio-xfade baseline"));
+
+            const QJsonObject audioCrossfade = callProjectInfoTool(
+                246, QStringLiteral("set_transition"), QJsonObject{
+                    {QStringLiteral("kind"), QStringLiteral("audio")},
+                    {QStringLiteral("trackIndex"), 0},
+                    {QStringLiteral("clipIndex"), 0},
+                    {QStringLiteral("type"), QStringLiteral("CrossDissolve")},
+                    {QStringLiteral("durationSec"), 1.25}
+                });
+            const QJsonObject audioCrossfadePayload = toolPayload(audioCrossfade);
+            const bool audioCrossfadeApplied =
+                !toolResult(audioCrossfade).value(QStringLiteral("isError")).toBool(true)
+                && audioCrossfadePayload.value(QStringLiteral("ok")).toBool(false)
+                && audioCrossfadePayload.value(QStringLiteral("kind")).toString()
+                       == QStringLiteral("audio")
+                && audioXfadeTrack->clips().at(0).trailOut.type
+                       == TransitionType::CrossDissolve
+                && audioXfadeTrack->clips().at(1).leadIn.type
+                       == TransitionType::CrossDissolve
+                && std::abs(audioXfadeTrack->clips().at(0).trailOut.duration - 1.25) < 1e-9;
+            projectTimeline->undo();
+            const bool audioCrossfadeUndo =
+                !projectTimeline->canUndo()
+                && audioXfadeTrack->clips().at(0).trailOut.type == TransitionType::None
+                && audioXfadeTrack->clips().at(1).leadIn.type == TransitionType::None;
+            const bool g142 = audioCrossfadeApplied && audioCrossfadeUndo;
+            g142 ? pass("G142 audio set_transition applies CrossDissolve and one undo")
+                 : fail("G142 audio set_transition applies CrossDissolve and one undo",
+                        QStringLiteral("audio transition or undo did not match"));
+
+            const QJsonObject invalidAudioType = callProjectInfoTool(
+                247, QStringLiteral("set_transition"), QJsonObject{
+                    {QStringLiteral("kind"), QStringLiteral("audio")},
+                    {QStringLiteral("trackIndex"), 0},
+                    {QStringLiteral("clipIndex"), 0},
+                    {QStringLiteral("type"), QStringLiteral("WipeLeft")},
+                    {QStringLiteral("durationSec"), 1.0}
+                });
+            const bool g143 = toolResult(invalidAudioType)
+                                  .value(QStringLiteral("isError")).toBool(false)
+                && audioXfadeTrack->clips().at(0).trailOut.type == TransitionType::None
+                && audioXfadeTrack->clips().at(1).leadIn.type == TransitionType::None;
+            g143 ? pass("G143 audio set_transition rejects non-audio transition types")
+                 : fail("G143 audio set_transition rejects non-audio transition types",
+                        QStringLiteral("an invalid audio transition type was accepted"));
+        } else {
+            fail("G142 audio set_transition applies CrossDissolve and one undo",
+                 QStringLiteral("audio track was not available"));
+            fail("G143 audio set_transition rejects non-audio transition types",
+                 QStringLiteral("audio track was not available"));
+        }
+    } else {
+        fail("G142 audio set_transition applies CrossDissolve and one undo",
+             QStringLiteral("Timeline was not available"));
+        fail("G143 audio set_transition rejects non-audio transition types",
+             QStringLiteral("Timeline was not available"));
+    }
+
     const bool selectClipFieldsPresent =
         !toolResult(successfulSelectResponse).value(QStringLiteral("isError")).toBool(false)
         && requiredOutputFieldsPresent(QStringLiteral("select_clip"),

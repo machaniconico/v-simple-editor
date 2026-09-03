@@ -263,6 +263,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/BeatDetect.cpp
     src/AudioBusPanel.cpp
     src/selftests/audio_bus_selftest.cpp
+    src/selftests/audio_xfade_selftest.cpp
     src/selftests/AutoDuckingSelftest.cpp
     src/selftests/AudioChannelMapSelftest.cpp
     src/selftests/StereoPanSelftest.cpp

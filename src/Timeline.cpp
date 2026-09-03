@@ -36,6 +36,7 @@
 #include <QJsonDocument>
 #include <QJsonValue>
 #include <QMessageBox>
+#include <QInputDialog>
 #include <QPushButton>
 #include <QSizePolicy>
 #include <QSpacerItem>
@@ -153,6 +154,65 @@ bool ClipInfo::sourceTimeRunsBackwardAtLocalTime(double localSec) const
     }
     return false;
 }
+
+namespace audioxfade {
+
+namespace {
+
+bool validAudioFadeDuration(double durationSec, QString *errorOut)
+{
+    if (!std::isfinite(durationSec) || durationSec <= 0.0) {
+        if (errorOut)
+            *errorOut = QStringLiteral("フェード時間は 0 より大きい有限値で指定してください");
+        return false;
+    }
+    return true;
+}
+
+} // namespace
+
+bool applyCrossfade(QVector<ClipInfo> &clips, int clipIndexA,
+                    double durationSec, QString *errorOut)
+{
+    if (!validAudioFadeDuration(durationSec, errorOut))
+        return false;
+    if (clipIndexA < 0 || clipIndexA + 1 >= clips.size()) {
+        if (errorOut)
+            *errorOut = QStringLiteral("クロスフェードには隣接する A/B クリップが必要です");
+        return false;
+    }
+
+    Transition transition;
+    transition.type = TransitionType::CrossDissolve;
+    transition.duration = durationSec;
+    clips[clipIndexA].trailOut = transition;
+    clips[clipIndexA + 1].leadIn = transition;
+    return true;
+}
+
+bool applyFade(QVector<ClipInfo> &clips, int clipIndex,
+               AudioFadeEdge edge, double durationSec, QString *errorOut)
+{
+    if (!validAudioFadeDuration(durationSec, errorOut))
+        return false;
+    if (clipIndex < 0 || clipIndex >= clips.size()) {
+        if (errorOut)
+            *errorOut = QStringLiteral("音声クリップの index が範囲外です");
+        return false;
+    }
+
+    Transition transition;
+    transition.type = edge == AudioFadeEdge::In
+        ? TransitionType::FadeIn : TransitionType::FadeOut;
+    transition.duration = durationSec;
+    if (edge == AudioFadeEdge::In)
+        clips[clipIndex].leadIn = transition;
+    else
+        clips[clipIndex].trailOut = transition;
+    return true;
+}
+
+} // namespace audioxfade
 
 namespace {
 // Transition badge geometry. The badge width grows with duration so the
@@ -896,7 +956,11 @@ QString buildExportAudioMixEntryFilterChain(int inputIndex,
                                             const QString &volumeExpression,
                                             AudioChannelMode mode,
                                             bool reversed,
-                                            double speed)
+                                            double speed,
+                                            TransitionType leadInType,
+                                            double leadInDuration,
+                                            TransitionType trailOutType,
+                                            double trailOutDuration)
 {
     QStringList filters;
     filters << QStringLiteral("atrim=start=%1:end=%2")
@@ -931,6 +995,31 @@ QString buildExportAudioMixEntryFilterChain(int inputIndex,
         filters << panFilter;
 
     filters << QStringLiteral("volume='%1':eval=frame").arg(volumeExpression);
+
+    // Audio-only fades use the same equal-power characteristic as
+    // AudioMixer's sqrt gain. FFmpeg's qsin curve is the matching export
+    // implementation. Keep these filters after areverse/atempo so their
+    // durations are expressed in timeline-time. Defaults add nothing, which
+    // preserves the legacy chain byte-for-byte for clips without fades.
+    const bool leadFade = (leadInType == TransitionType::FadeIn
+                           || leadInType == TransitionType::CrossDissolve)
+        && std::isfinite(leadInDuration) && leadInDuration > 0.0;
+    const bool trailFade = (trailOutType == TransitionType::FadeOut
+                            || trailOutType == TransitionType::CrossDissolve)
+        && std::isfinite(trailOutDuration) && trailOutDuration > 0.0;
+    if (leadFade) {
+        filters << QStringLiteral("afade=t=in:curve=qsin:d=%1")
+                       .arg(QString::number(leadInDuration, 'g', 15));
+    }
+    if (trailFade) {
+        const double clipDuration = std::isfinite(speed) && speed > 0.0
+            ? qMax(0.0, (clipOut.toDouble() - clipIn.toDouble()) / speed)
+            : qMax(0.0, clipOut.toDouble() - clipIn.toDouble());
+        const double start = qMax(0.0, clipDuration - trailOutDuration);
+        filters << QStringLiteral("afade=t=out:curve=qsin:st=%1:d=%2")
+                       .arg(QString::number(start, 'g', 15),
+                            QString::number(trailOutDuration, 'g', 15));
+    }
 
     if (delayMs > 0)
         filters << QStringLiteral("adelay=%1:all=1").arg(delayMs);
@@ -7060,9 +7149,10 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
         };
         aMenu.addSeparator();
         QMenu *atMenu = aMenu.addMenu(QStringLiteral("音声トランジション"));
-        QAction *aXdAct = atMenu->addAction(QStringLiteral("クロスフェード (1.0s)"));
-        QAction *aFiAct = atMenu->addAction(QStringLiteral("フェードイン (0.5s)"));
-        QAction *aFoAct = atMenu->addAction(QStringLiteral("フェードアウト (0.5s)"));
+        QAction *aXdAct = atMenu->addAction(QStringLiteral("クロスフェード (コンスタントパワー)…"));
+        aXdAct->setEnabled(clipIndex + 1 < track->clips().size());
+        QAction *aFiAct = atMenu->addAction(QStringLiteral("フェードイン…"));
+        QAction *aFoAct = atMenu->addAction(QStringLiteral("フェードアウト…"));
         QAction *aClearAct = nullptr;
         if (aHasTrans) {
             atMenu->addSeparator();
@@ -7070,39 +7160,26 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
         }
         QAction *aChosen = aMenu.exec(globalPos);
         if (!aChosen) return;
-        // Helper: mutate this audio track only (no video mirror) so the
-        // audio fade can outlive or precede the video cut for J/L-cuts.
-        auto applyAudioOnly = [&](TransitionType type, double duration) {
-            auto clips = track->clips();
-            if (clipIndex >= clips.size()) return;
-            Transition t;
-            t.type = type;
-            t.duration = duration;
-            if (type == TransitionType::FadeIn) {
-                clips[clipIndex].leadIn = t;
-                if (clipIndex > 0) {
-                    Transition mirror;
-                    mirror.type = TransitionType::FadeOut;
-                    mirror.duration = duration;
-                    clips[clipIndex - 1].trailOut = mirror;
-                }
-            } else if (type == TransitionType::FadeOut) {
-                clips[clipIndex].trailOut = t;
-                if (clipIndex + 1 < clips.size()) {
-                    Transition mirror;
-                    mirror.type = TransitionType::FadeIn;
-                    mirror.duration = duration;
-                    clips[clipIndex + 1].leadIn = mirror;
-                }
-            } else { // CrossDissolve (audio-only equal-power crossfade)
-                clips[clipIndex].trailOut = t;
-                if (clipIndex + 1 < clips.size())
-                    clips[clipIndex + 1].leadIn = t;
-            }
-            track->setClips(clips);
-            saveUndoState(QString("Audio-only transition: %1")
-                .arg(Transition::typeName(type)));
-            scheduleEmitSequenceChanged();
+        auto applyAudioAction = [&](AudioFadeEdge edge, bool crossfade) {
+            bool accepted = false;
+            const double defaultDuration = crossfade ? 1.0 : 0.5;
+            const QString title = crossfade
+                ? QStringLiteral("コンスタントパワー・クロスフェード")
+                : (edge == AudioFadeEdge::In
+                    ? QStringLiteral("音声フェードイン")
+                    : QStringLiteral("音声フェードアウト"));
+            const double duration = QInputDialog::getDouble(
+                this, title, QStringLiteral("時間 (秒):"), defaultDuration,
+                0.01, 60.0, 2, &accepted);
+            if (!accepted)
+                return;
+            QString error;
+            const int audioTrackIndex = m_audioTracks.indexOf(track);
+            const bool applied = crossfade
+                ? applyAudioCrossfade(audioTrackIndex, clipIndex, duration, &error)
+                : applyAudioFade(audioTrackIndex, clipIndex, edge, duration, &error);
+            if (!applied && !error.isEmpty())
+                QMessageBox::warning(this, QStringLiteral("音声トランジション"), error);
         };
         auto applyAudioChannelMode = [&](AudioChannelMode mode) {
             auto clips = track->clips();
@@ -7136,9 +7213,9 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
         else if (aChosen == aFillRightAct) applyAudioChannelMode(AudioChannelMode::FillRight);
         else if (aChosen == aSwapAct) applyAudioChannelMode(AudioChannelMode::Swap);
         else if (aChosen == aMonoAct) applyAudioChannelMode(AudioChannelMode::Mono);
-        else if (aChosen == aXdAct) applyAudioOnly(TransitionType::CrossDissolve, 1.0);
-        else if (aChosen == aFiAct) applyAudioOnly(TransitionType::FadeIn, 0.5);
-        else if (aChosen == aFoAct) applyAudioOnly(TransitionType::FadeOut, 0.5);
+        else if (aChosen == aXdAct) applyAudioAction(AudioFadeEdge::Out, true);
+        else if (aChosen == aFiAct) applyAudioAction(AudioFadeEdge::In, false);
+        else if (aChosen == aFoAct) applyAudioAction(AudioFadeEdge::Out, false);
         else if (aClearAct && aChosen == aClearAct) {
             auto clips = track->clips();
             if (clipIndex < clips.size()) {
@@ -7883,6 +7960,65 @@ void Timeline::setClipLayerMaterial(int trackIdx, int clipIdx,
     if (recordUndo)
         saveUndoState("Layer material");
     scheduleEmitSequenceChanged();
+}
+
+bool Timeline::applyAudioCrossfade(int trackIndex, int clipIndexA,
+                                   double durationSec, QString *errorOut)
+{
+    if (trackIndex < 0 || trackIndex >= m_audioTracks.size()
+        || !m_audioTracks[trackIndex]) {
+        if (errorOut)
+            *errorOut = QStringLiteral("音声トラックの index が範囲外です");
+        return false;
+    }
+    TimelineTrack *track = m_audioTracks[trackIndex];
+    if (track->isLocked()) {
+        if (errorOut)
+            *errorOut = QStringLiteral("音声トラックがロックされています");
+        return false;
+    }
+
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    QVector<ClipInfo> clips = track->clips();
+    if (!audioxfade::applyCrossfade(clips, clipIndexA, durationSec, errorOut))
+        return false;
+    track->setClips(clips);
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+    saveUndoState(QStringLiteral("音声クロスフェード"));
+    scheduleEmitSequenceChanged();
+    return true;
+}
+
+bool Timeline::applyAudioFade(int trackIndex, int clipIndex,
+                              AudioFadeEdge edge, double durationSec,
+                              QString *errorOut)
+{
+    if (trackIndex < 0 || trackIndex >= m_audioTracks.size()
+        || !m_audioTracks[trackIndex]) {
+        if (errorOut)
+            *errorOut = QStringLiteral("音声トラックの index が範囲外です");
+        return false;
+    }
+    TimelineTrack *track = m_audioTracks[trackIndex];
+    if (track->isLocked()) {
+        if (errorOut)
+            *errorOut = QStringLiteral("音声トラックがロックされています");
+        return false;
+    }
+
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    QVector<ClipInfo> clips = track->clips();
+    if (!audioxfade::applyFade(clips, clipIndex, edge, durationSec, errorOut))
+        return false;
+    track->setClips(clips);
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+    saveUndoState(edge == AudioFadeEdge::In
+                      ? QStringLiteral("音声フェードイン")
+                      : QStringLiteral("音声フェードアウト"));
+    scheduleEmitSequenceChanged();
+    return true;
 }
 
 void Timeline::applyTransitionToSelected(const Transition &t)

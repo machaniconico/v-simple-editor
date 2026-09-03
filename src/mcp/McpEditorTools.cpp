@@ -3213,13 +3213,13 @@ void McpEditorTools::registerWriteTools()
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("set_transition"),
-        QStringLiteral("V1 (video トラック 0) の指定クリップにトランジションを設定する。type は TransitionType の識別子で None は leadIn / trailOut のトランジションを解除する。FadeIn はクリップ先頭の leadIn、それ以外はクリップ末尾の trailOut に適用する。FadeOut は次クリップの leadIn=FadeIn、FadeIn は前クリップの trailOut=FadeOut、その他は次クリップの leadIn に同型を同時に設定し、A1 の同 index にもミラーする。None は隣接側も解除する。durationSec は秒、既定 0.5、範囲 0.1..5.0。タイムラインを変更する破壊的操作で、Ctrl+Z / undo ツールで戻せる。"),
+        QStringLiteral("video は V1、audio は指定音声トラックのクリップにトランジションを設定する。video の type は TransitionType の識別子で None は解除する。audio では CrossDissolve (コンスタントパワーの隣接クロスフェード)、FadeIn、FadeOut のみ許可し、None を含む他の type はエラー。audio の変更は映像側へミラーしない。durationSec は秒、既定 0.5、範囲 0.1..5.0。タイムラインを変更する破壊的操作で、Ctrl+Z / undo ツールで戻せる。"),
         schemaWithRequired(mergedProperties(clipProperties, QJsonObject{
             {QStringLiteral("type"), QJsonObject{
                 {QStringLiteral("type"), QStringLiteral("string")},
                 {QStringLiteral("enum"), transitionTypeEnum()},
                 {QStringLiteral("description"),
-                 QStringLiteral("TransitionType の識別子。None で解除")}
+                 QStringLiteral("TransitionType の識別子。video は None で解除。kind=audio では CrossDissolve / FadeIn / FadeOut のみ許可")}
             }},
             {QStringLiteral("durationSec"), QJsonObject{
                 {QStringLiteral("type"), QStringLiteral("number")},
@@ -3257,7 +3257,44 @@ void McpEditorTools::registerWriteTools()
             ClipTarget target;
             if (!readClipTarget(args, m_window, timeline(), &target, err))
                 return {};
-            if (target.audio || target.trackIndex != 0)
+
+            if (target.audio) {
+                if (target.track->isLocked())
+                    return setError(err, QStringLiteral("track is locked")), QJsonObject();
+                if (type != TransitionType::CrossDissolve
+                    && type != TransitionType::FadeIn
+                    && type != TransitionType::FadeOut) {
+                    return setError(err, QStringLiteral(
+                        "audio set_transition supports CrossDissolve, FadeIn, or FadeOut only")),
+                           QJsonObject();
+                }
+                Timeline* currentTimeline = timeline();
+                QString audioError;
+                const bool applied = type == TransitionType::CrossDissolve
+                    ? currentTimeline->applyAudioCrossfade(
+                        target.trackIndex, target.clipIndex, durationSec, &audioError)
+                    : currentTimeline->applyAudioFade(
+                        target.trackIndex, target.clipIndex,
+                        type == TransitionType::FadeIn
+                            ? AudioFadeEdge::In : AudioFadeEdge::Out,
+                        durationSec, &audioError);
+                if (!applied)
+                    return setError(err, audioError), QJsonObject();
+
+                const ClipInfo& updated = target.track->clips().at(target.clipIndex);
+                return QJsonObject{
+                    {QStringLiteral("ok"), true},
+                    {QStringLiteral("kind"), QStringLiteral("audio")},
+                    {QStringLiteral("trackIndex"), target.trackIndex},
+                    {QStringLiteral("clipIndex"), target.clipIndex},
+                    {QStringLiteral("type"), typeName},
+                    {QStringLiteral("durationSec"), durationSec},
+                    {QStringLiteral("leadIn"), transitionToJson(updated.leadIn)},
+                    {QStringLiteral("trailOut"), transitionToJson(updated.trailOut)}
+                };
+            }
+
+            if (target.trackIndex != 0)
                 return setError(err, QStringLiteral("set_transition supports video track 0 only")),
                        QJsonObject();
             if (type == TransitionType::None) {
