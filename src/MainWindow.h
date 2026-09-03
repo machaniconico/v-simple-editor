@@ -94,10 +94,13 @@
 #include "DolbyVisionMetadata.h"   // DV-4: Dolby Vision メタデータ SSOT
 #include "BroadcastCaption.h"      // CC-4: 放送CC (CEA-608/708) メタデータ SSOT
 #include "TimecodeBurnIn.h"
+#include "StillStore.h"
+#include "StillCompare.h"
 
 class VideoPlayer;
 class Timeline;
 class SourceMonitorDock;
+class StillGalleryDock;
 class AudioBusPanel;
 class ExportDialog;
 class BrushAnimation;
@@ -731,6 +734,7 @@ private:
     QImage decodeClipFrameByIndex(const ClipInfo &clip, int sourceFrameIndex, double sourceFps) const;
     void refreshSpecialClipPreview();
     void refreshEffectLibraryPreview();
+    void applyStillCompareConfig();
     void applyEffectLibraryEntry(const QString &entryId,
                                  int trackIdx = -1, int clipIdx = -1);
     void addEffectLibraryKeyframe(const QString &entryId,
@@ -899,6 +903,13 @@ private:
     // SM-5: ソースモニター ドック (右側)。素材を VideoPlayer でプレビューし、
     // マークイン/アウト後に insertRequested/overwriteRequested で 3 点編集する。
     SourceMonitorDock *m_sourceMonitorDock = nullptr;
+
+    // STILLS-WIPE: AppData のスチル一覧と、その表示専用比較状態。
+    stillstore::StillStore m_stillStore;
+    StillGalleryDock *m_stillGalleryDock = nullptr;
+    stillcompare::Config m_stillCompare;
+    QString m_activeStillId;
+    QAction *m_stillCompareAction = nullptr;
 
     // AB-5: オーディオ バス パネル ドック (右側)。m_audioBusRouting が SSOT で、
     // パネルはそれをポインタで指すビュー。routingChanged を受けて AudioMixer へ

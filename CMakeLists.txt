@@ -279,9 +279,16 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/silence_cut_selftest.cpp
     src/selftests/beat_detect_selftest.cpp
     src/selftests/safe_zone_selftest.cpp
+    src/selftests/StillCompareSelftest.cpp
     src/selftests/onion_skin_selftests.cpp
     src/SafeZone.h
     src/SafeZone.cpp
+    src/StillCompare.h
+    src/StillCompare.cpp
+    src/StillStore.h
+    src/StillStore.cpp
+    src/StillGalleryDock.h
+    src/StillGalleryDock.cpp
     src/OnionSkin.h
     src/OnionSkin.cpp
     src/selftests/subtitle_karaoke_selftest.cpp

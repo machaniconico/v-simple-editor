@@ -156,6 +156,7 @@ int runShortcutSelftest();
 int runSilenceCutSelftest();
 int runBeatDetectSelftest();
 int runSafeZoneSelftest();
+int runStillCompareSelftest();
 int runSmartEditSelftest();
 int runSmartRenderSelftest();
 int runSnsCoverSelftest();
@@ -605,6 +606,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "BeatDetect energy-flux onset detection + median-interval BPM estimate (7 gates)" },
     { "safe-zone",        "VEDITOR_SAFE_ZONE_SELFTEST",           runSafeZoneSelftest,           false,
       "SafeZone: SNS platform UI guide rects + apply display-local overlay (9 gates)" },
+    { "still-compare",    "VEDITOR_STILL_COMPARE_SELFTEST",       runStillCompareSelftest,       false,
+      "StillCompare: horizontal/vertical wipe + split compositing + StillStore round-trip (5 gates)" },
     { "onion-skin",       "VEDITOR_ONION_SKIN_SELFTEST",          runOnionSkinSelftest,          false,
       "OnionSkin: disabled/empty/opacity-zero no-op + display blend invariant (4 gates)" },
     { "capcut-caption",   "VEDITOR_CAPCUT_CAPTION_SELFTEST",      runCapcutCaptionSelftest,      false,

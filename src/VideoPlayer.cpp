@@ -2026,7 +2026,7 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries,
                         m_canvasHeight > 0 ? m_canvasHeight : 16);
             QImage blank(blankSize, QImage::Format_ARGB32_Premultiplied);
             blank.fill(Qt::black);
-            m_glPreview->displayFrame(blank);
+            m_glPreview->displayFrame(applyStillCompareForDisplay(blank));
         }
         undotrace::log("setSeq:exit");
         return;
@@ -3727,6 +3727,11 @@ void VideoPlayer::displayFrame(const QImage &image, bool overlaysAlreadyBaked)
         }
     }
 
+    // STILLS-WIPE: 保存スチルとの比較は display 専用コピーに 1 回だけ適用する。
+    // m_currentFrameImage / frameComposited / 合成キャッシュは上で確定済みであり、
+    // renderFrameAt / Exporter もこの経路を通らないため書き出しには影響しない。
+    display = applyStillCompareForDisplay(display);
+
     if (m_useGL && m_glPreview) {
         m_glPreview->setDisplayAspectRatio(effectiveDisplayAspectRatio());
         int hdrTransfer = 0;
@@ -4314,6 +4319,35 @@ void VideoPlayer::setOnionSkinConfig(const onionskin::Config &cfg)
         return;
     m_onionSkin = cfg;
     refreshDisplayedFrame();
+}
+
+void VideoPlayer::setStillCompare(const stillcompare::Config &cfg)
+{
+    const stillcompare::Config next{
+        cfg.enabled,
+        cfg.mode,
+        qBound(0.0, cfg.position, 1.0),
+        cfg.still
+    };
+    if (m_stillCompare.enabled == next.enabled
+        && m_stillCompare.mode == next.mode
+        && qFuzzyCompare(m_stillCompare.position + 1.0, next.position + 1.0)
+        && m_stillCompare.still == next.still) {
+        return;
+    }
+    m_stillCompare = next;
+    refreshDisplayedFrame();
+}
+
+QImage VideoPlayer::applyStillCompareForDisplay(const QImage &image) const
+{
+    if (!m_stillCompare.enabled || m_stillCompare.still.isNull()
+        || image.isNull()) {
+        return image;
+    }
+    return stillcompare::apply(image, m_stillCompare.still,
+                               m_stillCompare.mode,
+                               m_stillCompare.position);
 }
 
 void VideoPlayer::setExposureAidConfig(const exposureaid::AidConfig &cfg)
@@ -5034,7 +5068,9 @@ bool VideoPlayer::presentDecodedFrame(AVFrame *frame, bool displayFrameRequested
         // is intentionally NOT updated here; pause/resize during fast path
         // shows whatever was last cached by the legacy path. Acceptable for
         // V1-only narrow conditions; revisit if user reports staleness.
-        if (canUseInteropFastPath(frame) && !m_projectOutputSize.isValid()) {
+        if (!m_stillCompare.enabled
+            && canUseInteropFastPath(frame)
+            && !m_projectOutputSize.isValid()) {
             D3D11FrameRef ref;
             if (extractD3D11FrameRef(frame, &ref)) {
                 static bool loggedFastPathEngage = false;

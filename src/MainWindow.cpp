@@ -92,6 +92,7 @@ double exporter_loudnessGainDb();
 #include "AspectReframer.h"
 #include "ClipGeometry.h"
 #include "SourceMonitorDock.h"
+#include "StillGalleryDock.h"
 #include "AudioBusPanel.h"   // AB-5: オーディオ バス パネル ドック
 #include "util/RcPause.h"
 
@@ -2946,7 +2947,7 @@ MainWindow::~MainWindow()
         m_exporter->setSmartReframe(nullptr);
     }
 
-    // These two docks directly dereference MainWindow-owned models from their
+    // These docks directly dereference MainWindow-owned models from their
     // refresh/child-widget teardown paths, so destroy them before member
     // destruction and clear the owning pointer after delete.
     if (m_audioBusPanel) {
@@ -2960,6 +2961,12 @@ MainWindow::~MainWindow()
         m_mediaPoolDock->setPool(nullptr);
         delete m_mediaPoolDock;
         m_mediaPoolDock = nullptr;
+    }
+    if (m_stillGalleryDock) {
+        detachFromMainWindow(m_stillGalleryDock);
+        m_stillGalleryDock->setStore(nullptr);
+        delete m_stillGalleryDock;
+        m_stillGalleryDock = nullptr;
     }
 
     if (m_aiChatDock) {
@@ -3106,6 +3113,35 @@ double MainWindow::currentPlayheadSeconds() const
     return m_timeline ? m_timeline->playheadPosition() : 0.0;
 }
 
+void MainWindow::applyStillCompareConfig()
+{
+    if (!m_player)
+        return;
+
+    m_player->setStillCompare(m_stillCompare);
+    if (m_player->isPlaying() || !m_player->glPreview())
+        return;
+
+    // setStillCompare() refreshes the normal frame. Reassert any paused
+    // preview that intentionally bypasses VideoPlayer::displayFrame so the
+    // compared image remains the last upload to GLPreview.
+    if (m_nodeModeActive) {
+        onNodeGraphChanged();
+        return;
+    }
+    if (m_effectLibraryPanel && m_effectLibraryPanel->previewEnabled()) {
+        refreshEffectLibraryPreview();
+        return;
+    }
+    if (!m_timeline)
+        return;
+    const QImage special = buildSpecialClipComposite(m_timeline->playheadPosition());
+    if (!special.isNull()) {
+        m_player->glPreview()->displayFrame(
+            m_player->applyStillCompareForDisplay(special));
+    }
+}
+
 QString MainWindow::projectDirectory() const
 {
     if (m_projectFilePath.isEmpty())
@@ -3127,7 +3163,8 @@ void MainWindow::refreshEffectLibraryPreview()
     QImage preview;
     if (m_effectLibraryPanel->model().applyToImage(
             entryId, m_lastCompositedFrame, &preview) && !preview.isNull()) {
-        m_player->glPreview()->displayFrame(preview);
+        m_player->glPreview()->displayFrame(
+            m_player->applyStillCompareForDisplay(preview));
     }
 }
 
@@ -3884,7 +3921,8 @@ void MainWindow::setupUI()
         // stopped and creating a self-sustaining repaint loop.
         const QImage composed = buildSpecialClipComposite(m_timeline->playheadPosition());
         if (!composed.isNull())
-            m_player->glPreview()->displayFrame(composed);
+            m_player->glPreview()->displayFrame(
+                m_player->applyStillCompareForDisplay(composed));
         if (m_effectLibraryPanel && m_effectLibraryPanel->previewEnabled())
             refreshEffectLibraryPreview();
     });
@@ -5835,6 +5873,42 @@ void MainWindow::setupMenuBar()
     connect(m_sourceMonitorDock, &SourceMonitorDock::overwriteRequested,
             this, &MainWindow::onSourceOverwriteRequested);
 
+    // STILLS-WIPE: 保存済みフレームのギャラリー。比較合成は VideoPlayer の
+    // display-local 経路だけで行い、Timeline / renderFrameAt は変更しない。
+    m_stillGalleryDock = new StillGalleryDock(this);
+    m_stillGalleryDock->setStore(&m_stillStore);
+    addDockWidget(Qt::RightDockWidgetArea, m_stillGalleryDock);
+    m_stillGalleryDock->setVisible(false);
+    connect(m_stillGalleryDock, &StillGalleryDock::stillSelected,
+            this, [this](const QString &id, const QImage &image) {
+        m_activeStillId = id;
+        m_stillCompare.still = image;
+        applyStillCompareConfig();
+        statusBar()->showMessage(QStringLiteral("比較対象のスチルを設定しました。"), 3000);
+    });
+    connect(m_stillGalleryDock, &StillGalleryDock::stillRemoved,
+            this, [this](const QString &id) {
+        if (id != m_activeStillId)
+            return;
+        m_activeStillId.clear();
+        m_stillCompare.still = QImage();
+        m_stillCompare.enabled = false;
+        if (m_stillCompareAction)
+            m_stillCompareAction->setChecked(false);
+        applyStillCompareConfig();
+    });
+    connect(m_stillGalleryDock, &StillGalleryDock::comparisonModeChanged,
+            this, [this](int modeIndex) {
+        m_stillCompare.mode = static_cast<stillcompare::Mode>(
+            qBound(0, modeIndex, 2));
+        applyStillCompareConfig();
+    });
+    connect(m_stillGalleryDock, &StillGalleryDock::comparisonPositionChanged,
+            this, [this](double position) {
+        m_stillCompare.position = qBound(0.0, position, 1.0);
+        applyStillCompareConfig();
+    });
+
     // AB-5: オーディオ バス パネル ドック (右側)。m_audioBusRouting が SSOT で、
     // パネルはそのポインタを指すビュー。ユーザ操作 → routingChanged →
     // onAudioBusRoutingChanged で AudioMixer へ反映する。既定では非表示にして
@@ -6319,7 +6393,8 @@ void MainWindow::setupMenuBar()
         if (enabled)
             refreshEffectLibraryPreview();
         else if (m_player && m_player->glPreview() && !m_lastCompositedFrame.isNull())
-            m_player->glPreview()->displayFrame(m_lastCompositedFrame);
+            m_player->glPreview()->displayFrame(
+                m_player->applyStillCompareForDisplay(m_lastCompositedFrame));
     });
     connect(m_effectLibraryPanel, &EffectLibraryPanel::keyframeRequested,
             this, &MainWindow::addEffectLibraryKeyframe);
@@ -6415,6 +6490,82 @@ void MainWindow::setupMenuBar()
             panel->setMaskRect(normalizedRect);
         });
     });
+
+    viewMenu->addSeparator();
+    auto *saveStillAction = viewMenu->addAction(QStringLiteral("スチルを保存"));
+    connect(saveStillAction, &QAction::triggered, this, [this]() {
+        if (!m_timeline) {
+            QMessageBox::warning(this, QStringLiteral("スチルを保存"),
+                                 QStringLiteral("タイムラインがありません。"));
+            return;
+        }
+
+        const qint64 usec = qMax<qint64>(
+            0, qRound64(currentPlayheadSeconds() * 1000000.0));
+        const QSize canvasSize(qMax(1, m_projectConfig.width),
+                               qMax(1, m_projectConfig.height));
+        QImage frame = tlrender::renderFrameAt(m_timeline, usec, canvasSize);
+        if (frame.isNull()) {
+            QMessageBox::warning(
+                this, QStringLiteral("スチルを保存"),
+                QStringLiteral("現在位置の合成フレームをレンダリングできませんでした。"));
+            return;
+        }
+        frame = frame.convertToFormat(QImage::Format_RGBA8888);
+
+        const QString projectName = m_projectFilePath.isEmpty()
+            ? QStringLiteral("無題")
+            : QFileInfo(m_projectFilePath).completeBaseName();
+        stillstore::Still saved;
+        QString error;
+        if (!m_stillStore.save(frame, projectName, QString(), &saved, &error)) {
+            QMessageBox::warning(this, QStringLiteral("スチルを保存"), error);
+            return;
+        }
+
+        m_activeStillId = saved.id;
+        m_stillCompare.still = frame;
+        applyStillCompareConfig();
+        if (m_stillGalleryDock) {
+            m_stillGalleryDock->refresh();
+            m_stillGalleryDock->selectStill(saved.id);
+            m_stillGalleryDock->show();
+            m_stillGalleryDock->raise();
+        }
+        statusBar()->showMessage(QStringLiteral("スチルを保存しました。"), 3000);
+    });
+    m_menuHelpEntries.append({saveStillAction,
+        QStringLiteral("現在のタイムラインフレームをスチルギャラリーへ PNG で保存します。")});
+
+    m_stillCompareAction = viewMenu->addAction(QStringLiteral("ワイプ比較 (オン/オフ)"));
+    m_stillCompareAction->setCheckable(true);
+    m_stillCompareAction->setChecked(false);
+    connect(m_stillCompareAction, &QAction::toggled, this, [this](bool enabled) {
+        if (enabled && m_stillCompare.still.isNull()) {
+            QMessageBox::information(
+                this, QStringLiteral("ワイプ比較"),
+                QStringLiteral("スチルギャラリーで比較するスチルをダブルクリックしてください。"));
+            const QSignalBlocker blocker(m_stillCompareAction);
+            m_stillCompareAction->setChecked(false);
+            return;
+        }
+        m_stillCompare.enabled = enabled;
+        applyStillCompareConfig();
+    });
+    m_menuHelpEntries.append({m_stillCompareAction,
+        QStringLiteral("保存したスチルと現在のプレビューを比較します。書き出しには影響しません。")});
+
+    if (m_stillGalleryDock) {
+        auto *stillGalleryAction = viewMenu->addAction(QStringLiteral("スチルギャラリー"));
+        stillGalleryAction->setCheckable(true);
+        stillGalleryAction->setChecked(m_stillGalleryDock->isVisible());
+        connect(stillGalleryAction, &QAction::toggled,
+                m_stillGalleryDock, &QDockWidget::setVisible);
+        connect(m_stillGalleryDock, &QDockWidget::visibilityChanged,
+                stillGalleryAction, &QAction::setChecked);
+        m_menuHelpEntries.append({stillGalleryAction,
+            QStringLiteral("保存したスチルの一覧とワイプ位置を表示します。")});
+    }
 
     viewMenu->addSeparator();
     auto *colorPanelAction = viewMenu->addAction("カラーグレーディングパネル(&G)");
@@ -7875,7 +8026,8 @@ void MainWindow::refreshSpecialClipPreview()
     const QImage composed = buildSpecialClipComposite(playheadSeconds);
     if (!composed.isNull()) {
         s_refreshingPreview = true;
-        m_player->glPreview()->displayFrame(composed);
+        m_player->glPreview()->displayFrame(
+            m_player->applyStillCompareForDisplay(composed));
         s_refreshingPreview = false;
     } else if (!m_player->isPlaying()) {
         s_refreshingPreview = true;
@@ -19370,7 +19522,8 @@ void MainWindow::onNodeGraphChanged()
     // Quick evaluation at time=0 to push a result to GLPreview
     QImage result = m_nodeEvaluator->render(0.0);
     if (!result.isNull() && m_player->glPreview()) {
-        m_player->glPreview()->displayFrame(result);
+        m_player->glPreview()->displayFrame(
+            m_player->applyStillCompareForDisplay(result));
         m_player->glPreview()->update();
     }
 }
