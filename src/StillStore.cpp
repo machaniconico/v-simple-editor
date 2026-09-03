@@ -75,14 +75,18 @@ QVector<Still> StillStore::list(QString *error) const
         return {};
     }
 
+    const QByteArray payload = file.readAll();
+    file.close();
+
     QJsonParseError parseError;
-    const QJsonDocument document = QJsonDocument::fromJson(file.readAll(), &parseError);
+    const QJsonDocument document = QJsonDocument::fromJson(payload, &parseError);
     if (parseError.error != QJsonParseError::NoError || !document.isObject()) {
         setError(error, QStringLiteral("スチル一覧が壊れています: %1").arg(parseError.errorString()));
         return {};
     }
 
     QVector<Still> result;
+    bool indexNeedsRepair = false;
     const QJsonArray entries = document.object().value(QStringLiteral("stills")).toArray();
     result.reserve(entries.size());
     for (const QJsonValue &value : entries) {
@@ -90,6 +94,7 @@ QVector<Still> StillStore::list(QString *error) const
         const QString fileName = object.value(QStringLiteral("fileName")).toString();
         if (fileName.isEmpty() || QFileInfo(fileName).fileName() != fileName
             || !fileName.endsWith(QStringLiteral(".png"), Qt::CaseInsensitive)) {
+            indexNeedsRepair = true;
             continue;
         }
 
@@ -100,13 +105,18 @@ QVector<Still> StillStore::list(QString *error) const
             object.value(QStringLiteral("timestamp")).toString(), Qt::ISODateWithMs);
         still.projectName = object.value(QStringLiteral("projectName")).toString();
         still.label = object.value(QStringLiteral("label")).toString();
-        if (!still.id.isEmpty())
-            result.append(still);
+        if (still.id.isEmpty() || !QFileInfo::exists(still.filePath)) {
+            indexNeedsRepair = true;
+            continue;
+        }
+        result.append(still);
     }
 
     std::sort(result.begin(), result.end(), [](const Still &a, const Still &b) {
         return a.timestamp > b.timestamp;
     });
+    if (indexNeedsRepair && !writeIndex(result, error))
+        return {};
     return result;
 }
 

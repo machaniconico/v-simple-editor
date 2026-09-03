@@ -3651,7 +3651,13 @@ void VideoPlayer::displayFrame(const QImage &image, bool overlaysAlreadyBaked)
     // 加工が 1 つ増えるだけで、displayFrame の発火回数は不変 (1 tick = 最大 1 frame)。
     // 精度が必要なエッジ/輝度判定のためエイドは PV-C 縮小前の full res に適用し、
     // aid=None + cap=0 の既定パスは従来どおり composed をそのまま表示へ渡す。
-    QImage display = composed;
+    // STILLS-WIPE: the live side must be the same fully processed timeline
+    // frame used by "現在フレームを書き出し" and still capture.  The decoded
+    // preview image can still be raw and would otherwise receive the active
+    // clip grade later in GLPreview.  Resolve only the display-local copy from
+    // renderFrameAt; m_currentFrameImage, frameComposited, and preview caches
+    // remain on the normal path, so comparison cannot affect export/cache.
+    QImage display = stillCompareDisplaySource(composed);
     if (m_exposureAidMode != exposureaid::AidMode::None && !display.isNull()) {
         display = exposureaid::apply(display, m_exposureAidMode, m_exposureAidConfig);
     }
@@ -3721,7 +3727,7 @@ void VideoPlayer::displayFrame(const QImage &image, bool overlaysAlreadyBaked)
     // STILLS-WIPE: 保存スチルとの比較は display 専用コピーに 1 回だけ適用する。
     // m_currentFrameImage / frameComposited / 合成キャッシュは上で確定済みであり、
     // renderFrameAt / Exporter もこの経路を通らないため書き出しには影響しない。
-    display = applyStillCompareForDisplay(display);
+    display = compositeStillCompare(display);
 
     if (m_useGL && m_glPreview) {
         m_glPreview->setDisplayAspectRatio(effectiveDisplayAspectRatio());
@@ -3761,17 +3767,9 @@ void VideoPlayer::displayFrame(const QImage &image, bool overlaysAlreadyBaked)
         // duplicate the stack and no longer match export.
         const qint64 previewUsec =
             sequenceActive() ? m_timelinePositionUs : m_currentPositionUs;
-        const bool clipCpuFxBaked = hasClipLocalCpuFxAt(previewUsec);
-        if (clipCpuFxBaked && !m_clipCpuDisabledGlGrade) {
-            m_glPreview->setEffectsEnabled(false);
-            m_glPreview->setVideoEffects({});
-            m_clipCpuDisabledGlGrade = true;
-        } else if (!clipCpuFxBaked && m_clipCpuDisabledGlGrade) {
-            m_glPreview->setEffectsEnabled(true);
-            m_glPreview->setVideoEffects(m_gpuPreviewEffects);
-            m_clipCpuDisabledGlGrade = false;
-        }
-        if (!clipCpuFxBaked)
+        const bool glEffectsAlreadyBaked =
+            updateGlEffectsForBakedDisplay(previewUsec);
+        if (!glEffectsAlreadyBaked)
             pushActiveClipColorCorrectionToGlPreview();
         undotrace::log("displayFrame:beforeGL");
         m_glPreview->displayFrame(display);
@@ -4327,18 +4325,74 @@ void VideoPlayer::setStillCompare(const stillcompare::Config &cfg)
         return;
     }
     m_stillCompare = next;
+    const qint64 previewUsec =
+        sequenceActive() ? m_timelinePositionUs : m_currentPositionUs;
+    // Update the GL bypass immediately. Some paused preview modes upload
+    // through MainWindow after this setter and do not call displayFrame.
+    updateGlEffectsForBakedDisplay(previewUsec);
     refreshDisplayedFrame();
 }
 
 QImage VideoPlayer::applyStillCompareForDisplay(const QImage &image) const
 {
+    return compositeStillCompare(stillCompareDisplaySource(image));
+}
+
+QImage VideoPlayer::stillCompareDisplaySource(const QImage &fallback) const
+{
     if (!m_stillCompare.enabled || m_stillCompare.still.isNull()
-        || image.isNull()) {
-        return image;
+        || !m_glPreview || !m_glPreview->timeline()) {
+        return fallback;
     }
-    return stillcompare::apply(image, m_stillCompare.still,
+
+    const Timeline *timeline = m_glPreview->timeline();
+    // Match MainWindow's frame-export/still-capture SSOT arguments: the
+    // current timeline head in microseconds and the configured canvas size.
+    // During playback displayFrame runs just before positionChanged updates
+    // Timeline, so m_timelinePositionUs is the non-lagging head value.
+    const qint64 usec = sequenceActive()
+        ? qMax<qint64>(0, m_timelinePositionUs)
+        : qMax<qint64>(
+              0, qRound64(timeline->playheadPosition() * 1000000.0));
+    QSize renderSize(qMax(1, m_canvasWidth), qMax(1, m_canvasHeight));
+    if ((m_canvasWidth <= 0 || m_canvasHeight <= 0) && fallback.size().isValid())
+        renderSize = fallback.size();
+    const QImage rendered = tlrender::renderFrameAt(timeline, usec, renderSize);
+    return rendered.isNull() ? fallback : rendered;
+}
+
+QImage VideoPlayer::compositeStillCompare(const QImage &display) const
+{
+    if (!m_stillCompare.enabled || m_stillCompare.still.isNull()
+        || display.isNull()) {
+        return display;
+    }
+    return stillcompare::apply(display, m_stillCompare.still,
                                m_stillCompare.mode,
                                m_stillCompare.position);
+}
+
+bool VideoPlayer::updateGlEffectsForBakedDisplay(qint64 timelineUsec)
+{
+    const bool clipCpuFxBaked = hasClipLocalCpuFxAt(timelineUsec);
+    // renderFrameAt has already applied every clip grade/LUT. The comparison
+    // composite therefore has the same invariant as the clip-local CPU path:
+    // GLPreview must not apply the current clip's grade/effects to the whole
+    // image (especially the saved-still side). The shared latch also restores
+    // the prior GPU preview stack as soon as neither baked condition remains.
+    const bool glEffectsAlreadyBaked = clipCpuFxBaked || m_stillCompare.enabled;
+    if (!m_glPreview)
+        return glEffectsAlreadyBaked;
+    if (glEffectsAlreadyBaked && !m_clipCpuDisabledGlGrade) {
+        m_glPreview->setEffectsEnabled(false);
+        m_glPreview->setVideoEffects({});
+        m_clipCpuDisabledGlGrade = true;
+    } else if (!glEffectsAlreadyBaked && m_clipCpuDisabledGlGrade) {
+        m_glPreview->setEffectsEnabled(true);
+        m_glPreview->setVideoEffects(m_gpuPreviewEffects);
+        m_clipCpuDisabledGlGrade = false;
+    }
+    return glEffectsAlreadyBaked;
 }
 
 void VideoPlayer::setExposureAidConfig(const exposureaid::AidConfig &cfg)

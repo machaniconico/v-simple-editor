@@ -879,6 +879,9 @@ private:
     // unmodified when the overlay list is empty.
     QImage composeFrameWithOverlays(const QImage &source,
                                     bool textAlreadyBaked = false) const;
+    QImage stillCompareDisplaySource(const QImage &fallback) const;
+    QImage compositeStillCompare(const QImage &display) const;
+    bool updateGlEffectsForBakedDisplay(qint64 timelineUsec);
     int previewEffectTargetEntryIndex(const Timeline *timeline) const;
     bool activePreviewClipCpuStack(qint64 timelineUsec,
                                    int *targetEntryIndex = nullptr) const;

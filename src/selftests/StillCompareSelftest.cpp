@@ -5,6 +5,9 @@
 #include <QDir>
 #include <QFile>
 #include <QImage>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QStringList>
 #include <QTemporaryDir>
 
@@ -120,8 +123,8 @@ int runStillCompareSelftest()
                      && isColor(result, 7, 5, QColor(Qt::black)));
     }
 
-    // G5: StillStore persists metadata and PNG, removes both cleanly, and does
-    // not drop the index entry when deleting the PNG fails.
+    // G5: StillStore persists metadata and PNG, removes both cleanly, repairs
+    // missing-PNG entries, and does not drop a still before deletion succeeds.
     {
         QTemporaryDir temporary;
         stillstore::StillStore store;
@@ -145,8 +148,26 @@ int runStillCompareSelftest()
             && error.isEmpty() && store.list(&error).isEmpty()
             && !QFile::exists(saved.filePath);
 
+        stillstore::Still missing;
+        const bool missingSaved = removedOk
+            && store.save(image, QStringLiteral("自己修復テスト"),
+                          QString(), &missing, &error)
+            && QFile::remove(missing.filePath);
+        QString repairError;
+        const QVector<stillstore::Still> afterRepair = store.list(&repairError);
+        QFile repairedIndex(temporary.filePath(QStringLiteral("index.json")));
+        const bool repairedIndexReadable = repairedIndex.open(QIODevice::ReadOnly);
+        const QJsonDocument repairedDocument = repairedIndexReadable
+            ? QJsonDocument::fromJson(repairedIndex.readAll())
+            : QJsonDocument();
+        repairedIndex.close();
+        const bool missingEntryRepaired = missingSaved && repairError.isEmpty()
+            && afterRepair.isEmpty() && repairedDocument.isObject()
+            && repairedDocument.object().value(QStringLiteral("stills"))
+                   .toArray().isEmpty();
+
         stillstore::Still blocked;
-        const bool blockedSaved = removedOk
+        const bool blockedSaved = missingEntryRepaired
             && store.save(image, QStringLiteral("削除失敗テスト"),
                           QString(), &blocked, &error)
             && QFile::remove(blocked.filePath)
@@ -163,7 +184,7 @@ int runStillCompareSelftest()
             && afterRejectedRemove.front().id == blocked.id;
         const bool cleanedUp = !blockedSaved
             || (QDir(blocked.filePath).removeRecursively()
-                && store.remove(blocked.id, &error));
+                && store.list(&error).isEmpty() && error.isEmpty());
 
         QFile invalidIndex(temporary.filePath(QStringLiteral("index.json")));
         const bool invalidIndexReady = cleanedUp
@@ -178,7 +199,8 @@ int runStillCompareSelftest()
             && !saveError.isEmpty();
         const QStringList orphanPngs = QDir(temporary.path()).entryList(
             QStringList{QStringLiteral("still-*.png")}, QDir::Files);
-        check(5, savedOk && listedOk && removedOk && blockedSaved
+        check(5, savedOk && listedOk && removedOk && missingEntryRepaired
+                     && blockedSaved
                      && removeRejected && indexPreserved && cleanedUp
                      && saveRejected && orphanPngs.isEmpty());
     }
