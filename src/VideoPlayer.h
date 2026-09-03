@@ -182,7 +182,15 @@ public:
     void setSafeZonePlatform(safezone::Platform p);  // SAFE-ZONE
     void setOnionSkinConfig(const onionskin::Config &cfg);
     void setStillCompare(const stillcompare::Config &cfg);
-    QImage applyStillCompareForDisplay(const QImage &image) const;
+    QImage applyStillCompareForDisplay(const QImage &image,
+                                       qint64 displayTimelineUsec);
+    void setPreviewEffectsPack(float sharpen, float blur, float lens);
+    void setPreviewGlow(bool enabled, float threshold, float radius, float intensity);
+    void setPreviewBloom(bool enabled, float threshold, float intensity, float spread);
+    void setPreviewChromaticAberration(bool enabled, float amount, float radialFalloff);
+    void setPreviewLightWrap(bool enabled, float amount, float radius);
+    void setPreviewRotation3D(float xDeg, float yDeg, float zDeg,
+                              float perspectiveDist);
     onionskin::Config onionSkinConfig() const { return m_onionSkin; }
     // PV-C: プレビュー表示の長辺上限(px)。0=無制限。display専用(書き出し非変更)。
     void setPreviewMaxLongSide(int px);
@@ -418,8 +426,10 @@ private:
     // `overlaysAlreadyBaked` is used only by the nested-sequence SSOT path:
     // tlrender::renderFrameAt has already applied the parent timeline's text,
     // so composing m_textOverlays again would darken/double every caption.
-    void displayFrame(const QImage &image, bool overlaysAlreadyBaked = false);
-    void displaySeekFrameConformed(const QImage &v1Image);
+    void displayFrame(const QImage &image, bool overlaysAlreadyBaked,
+                      qint64 displayTimelineUsec);
+    void displaySeekFrameConformed(const QImage &v1Image,
+                                   qint64 displayTimelineUsec);
 
     // Sequence helpers (Phase A/B). When m_sequence is empty, the player runs
     // in single-file legacy mode and these are unused.
@@ -788,6 +798,30 @@ private:
     safezone::Platform m_safeZonePlatform = safezone::Platform::None;  // SAFE-ZONE
     onionskin::Config m_onionSkin;  // ONION-SKIN: display-only、既定 OFF。
     stillcompare::Config m_stillCompare;  // STILLS-WIPE: display-only、既定 OFF。
+    const Timeline *m_stillCompareGlTimeline = nullptr;
+    bool m_stillCompareGlBypassActive = false;
+    bool m_stillCompareSavedCompositeBakedMode = false;
+    float m_previewSharpen = 0.0f;
+    float m_previewBlur = 0.0f;
+    float m_previewLens = 0.0f;
+    bool m_previewGlowEnabled = false;
+    float m_previewGlowThreshold = 0.8f;
+    float m_previewGlowRadius = 0.0f;
+    float m_previewGlowIntensity = 0.0f;
+    bool m_previewBloomEnabled = false;
+    float m_previewBloomThreshold = 0.8f;
+    float m_previewBloomIntensity = 0.0f;
+    float m_previewBloomSpread = 0.0f;
+    bool m_previewChromAbEnabled = false;
+    float m_previewChromAbAmount = 0.0f;
+    float m_previewChromAbFalloff = 2.0f;
+    bool m_previewLightWrapEnabled = false;
+    float m_previewLightWrapAmount = 0.0f;
+    float m_previewLightWrapRadius = 0.0f;
+    float m_previewRot3DX = 0.0f;
+    float m_previewRot3DY = 0.0f;
+    float m_previewRot3DZ = 0.0f;
+    float m_previewPerspectiveDist = 2.0f;
     int m_previewMaxLongSide = 0;  // PV-C: 0=無制限。display専用の長辺上限。
     exposureaid::AidConfig m_exposureAidConfig;
 
@@ -879,8 +913,16 @@ private:
     // unmodified when the overlay list is empty.
     QImage composeFrameWithOverlays(const QImage &source,
                                     bool textAlreadyBaked = false) const;
-    QImage stillCompareDisplaySource(const QImage &fallback) const;
+    const Timeline *previewTimeline() const;
+    qint64 resolvedDisplayTimelineUsec(qint64 requestedUsec) const;
+    bool stillCompareActive() const;
+    QImage stillCompareDisplaySource(const QImage &fallback,
+                                     qint64 displayTimelineUsec) const;
     QImage compositeStillCompare(const QImage &display) const;
+    void beginStillCompareGlBypass();
+    void applyStillCompareGlBypass();
+    void restoreStillCompareGlState();
+    void restorePreviewPostEffects();
     bool updateGlEffectsForBakedDisplay(qint64 timelineUsec);
     int previewEffectTargetEntryIndex(const Timeline *timeline) const;
     bool activePreviewClipCpuStack(qint64 timelineUsec,

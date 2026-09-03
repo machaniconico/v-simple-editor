@@ -3138,7 +3138,8 @@ void MainWindow::applyStillCompareConfig()
     const QImage special = buildSpecialClipComposite(m_timeline->playheadPosition());
     if (!special.isNull()) {
         m_player->glPreview()->displayFrame(
-            m_player->applyStillCompareForDisplay(special));
+            m_player->applyStillCompareForDisplay(
+                special, m_player->timelinePositionUs()));
     }
 }
 
@@ -3164,7 +3165,8 @@ void MainWindow::refreshEffectLibraryPreview()
     if (m_effectLibraryPanel->model().applyToImage(
             entryId, m_lastCompositedFrame, &preview) && !preview.isNull()) {
         m_player->glPreview()->displayFrame(
-            m_player->applyStillCompareForDisplay(preview));
+            m_player->applyStillCompareForDisplay(
+                preview, m_player->timelinePositionUs()));
     }
 }
 
@@ -3922,7 +3924,8 @@ void MainWindow::setupUI()
         const QImage composed = buildSpecialClipComposite(m_timeline->playheadPosition());
         if (!composed.isNull())
             m_player->glPreview()->displayFrame(
-                m_player->applyStillCompareForDisplay(composed));
+                m_player->applyStillCompareForDisplay(
+                    composed, m_player->timelinePositionUs()));
         if (m_effectLibraryPanel && m_effectLibraryPanel->previewEnabled())
             refreshEffectLibraryPreview();
     });
@@ -6359,11 +6362,9 @@ void MainWindow::setupMenuBar()
     // |amount|>eps tests skip each kernel/transform entirely).
     connect(m_colorGradingPanel, &ColorGradingPanel::effectsPackChanged,
             this, [this](float sharpen, float blur, float lens) {
-        if (!m_player || !m_player->glPreview())
+        if (!m_player)
             return;
-        m_player->glPreview()->setSharpen(sharpen);
-        m_player->glPreview()->setBlur(blur);
-        m_player->glPreview()->setLensDistortion(lens);
+        m_player->setPreviewEffectsPack(sharpen, blur, lens);
     });
 
     // US-EFC-1: Effect Controls panel — per-clip effect parameter panel.
@@ -6394,7 +6395,8 @@ void MainWindow::setupMenuBar()
             refreshEffectLibraryPreview();
         else if (m_player && m_player->glPreview() && !m_lastCompositedFrame.isNull())
             m_player->glPreview()->displayFrame(
-                m_player->applyStillCompareForDisplay(m_lastCompositedFrame));
+                m_player->applyStillCompareForDisplay(
+                    m_lastCompositedFrame, m_player->timelinePositionUs()));
     });
     connect(m_effectLibraryPanel, &EffectLibraryPanel::keyframeRequested,
             this, &MainWindow::addEffectLibraryKeyframe);
@@ -6435,27 +6437,27 @@ void MainWindow::setupMenuBar()
 
     connect(m_vfxControlsPanel, &VfxControlsPanel::glowChanged,
             this, [this](bool enabled, float threshold, float radius, float intensity) {
-        if (!m_player || !m_player->glPreview())
+        if (!m_player)
             return;
-        m_player->glPreview()->setGlow(enabled, threshold, radius, intensity);
+        m_player->setPreviewGlow(enabled, threshold, radius, intensity);
     });
     connect(m_vfxControlsPanel, &VfxControlsPanel::bloomChanged,
             this, [this](bool enabled, float threshold, float intensity, float spread) {
-        if (!m_player || !m_player->glPreview())
+        if (!m_player)
             return;
-        m_player->glPreview()->setBloom(enabled, threshold, intensity, spread);
+        m_player->setPreviewBloom(enabled, threshold, intensity, spread);
     });
     connect(m_vfxControlsPanel, &VfxControlsPanel::chromaticAberrationChanged,
             this, [this](bool enabled, float amount, float radialFalloff) {
-        if (!m_player || !m_player->glPreview())
+        if (!m_player)
             return;
-        m_player->glPreview()->setChromaticAberration(enabled, amount, radialFalloff);
+        m_player->setPreviewChromaticAberration(enabled, amount, radialFalloff);
     });
     connect(m_vfxControlsPanel, &VfxControlsPanel::lightWrapChanged,
             this, [this](bool enabled, float amount, float radius) {
-        if (!m_player || !m_player->glPreview())
+        if (!m_player)
             return;
-        m_player->glPreview()->setLightWrap(enabled, amount, radius);
+        m_player->setPreviewLightWrap(enabled, amount, radius);
     });
 
     // US-3D: 3-axis rotation + perspective foreshortening (Premiere "Basic
@@ -6466,9 +6468,9 @@ void MainWindow::setupMenuBar()
     // and skips the warp entirely.
     connect(m_colorGradingPanel, &ColorGradingPanel::rotation3DChanged,
             this, [this](float xDeg, float yDeg, float zDeg, float persDist) {
-        if (!m_player || !m_player->glPreview())
+        if (!m_player)
             return;
-        m_player->glPreview()->setRotation3D(xDeg, yDeg, zDeg, persDist);
+        m_player->setPreviewRotation3D(xDeg, yDeg, zDeg, persDist);
     });
 
     // US-EF-2: "マスクを描画" → enter the mask drawing overlay on the
@@ -8029,7 +8031,8 @@ void MainWindow::refreshSpecialClipPreview()
     if (!composed.isNull()) {
         s_refreshingPreview = true;
         m_player->glPreview()->displayFrame(
-            m_player->applyStillCompareForDisplay(composed));
+            m_player->applyStillCompareForDisplay(
+                composed, m_player->timelinePositionUs()));
         s_refreshingPreview = false;
     } else if (!m_player->isPlaying()) {
         s_refreshingPreview = true;
@@ -8244,16 +8247,20 @@ void MainWindow::applyVfxProjectState(const ProjectVfxState &state)
 {
     setVfxPanelState(m_vfxControlsPanel, state);
 
-    if (!m_player || !m_player->glPreview())
+    if (!m_player)
         return;
 
-    auto *preview = m_player->glPreview();
-    preview->setGlow(state.glow.enabled, state.glow.threshold, state.glow.radius, state.glow.intensity);
-    preview->setBloom(state.bloom.enabled, state.bloom.threshold, state.bloom.intensity, state.bloom.spread);
-    preview->setChromaticAberration(state.chromaticAberration.enabled,
-                                    state.chromaticAberration.amount,
-                                    state.chromaticAberration.radialFalloff);
-    preview->setLightWrap(state.lightWrap.enabled, state.lightWrap.amount, state.lightWrap.radius);
+    m_player->setPreviewGlow(state.glow.enabled, state.glow.threshold,
+                             state.glow.radius, state.glow.intensity);
+    m_player->setPreviewBloom(state.bloom.enabled, state.bloom.threshold,
+                              state.bloom.intensity, state.bloom.spread);
+    m_player->setPreviewChromaticAberration(
+        state.chromaticAberration.enabled,
+        state.chromaticAberration.amount,
+        state.chromaticAberration.radialFalloff);
+    m_player->setPreviewLightWrap(state.lightWrap.enabled,
+                                  state.lightWrap.amount,
+                                  state.lightWrap.radius);
 }
 
 void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
@@ -19525,7 +19532,8 @@ void MainWindow::onNodeGraphChanged()
     QImage result = m_nodeEvaluator->render(0.0);
     if (!result.isNull() && m_player->glPreview()) {
         m_player->glPreview()->displayFrame(
-            m_player->applyStillCompareForDisplay(result));
+            m_player->applyStillCompareForDisplay(
+                result, m_player->timelinePositionUs()));
         m_player->glPreview()->update();
     }
 }

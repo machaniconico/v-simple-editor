@@ -1910,7 +1910,7 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries,
     }
 
     m_sequence = entries;
-    const Timeline *timeline = m_glPreview ? m_glPreview->timeline() : nullptr;
+    const Timeline *timeline = previewTimeline();
     m_reverseStates.clear();
     m_reverseStates.reserve(m_sequence.size());
     if (timeline) {
@@ -2018,7 +2018,7 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries,
                     m_canvasHeight > 0 ? m_canvasHeight : 16);
         QImage blank(blankSize, QImage::Format_ARGB32_Premultiplied);
         blank.fill(Qt::black);
-        displayFrame(blank);
+        displayFrame(blank, false, m_timelinePositionUs);
         undotrace::log("setSeq:exit");
         return;
     }
@@ -2253,7 +2253,7 @@ void VideoPlayer::setSpeedRamps(const QVector<speedramp::SpeedRamp> &ramps)
             << "VideoPlayer::setSpeedRamps SIZE MISMATCH — entries past"
             << m_speedRamps.size() << "fall back to identity ramp";
     }
-    const Timeline *timeline = m_glPreview ? m_glPreview->timeline() : nullptr;
+    const Timeline *timeline = previewTimeline();
     const bool activeReversed = m_activeEntry >= 0
         && m_activeEntry < m_sequence.size()
         && playbackEntryIsReversed(
@@ -2318,7 +2318,7 @@ int64_t VideoPlayer::entryLocalPositionUs(int entryIdx, int64_t timelineUs) cons
     const double tSec = static_cast<double>(timelineUs) / AV_TIME_BASE;
     const double offsetIntoEntry = qMax(0.0, tSec - e.timelineStart);
     const double speed = (e.speed > 0.0) ? e.speed : 1.0;
-    const Timeline *timeline = m_glPreview ? m_glPreview->timeline() : nullptr;
+    const Timeline *timeline = previewTimeline();
     const ClipInfo *clip = clipForPlaybackEntry(timeline, e);
     if (playbackEntryIsReversed(timeline, e, &m_reverseStates)) {
         ClipInfo mappedClip{};
@@ -2363,7 +2363,7 @@ int64_t VideoPlayer::fileLocalToTimelineUs(int entryIdx, int64_t fileLocalUs) co
     const auto &e = m_sequence[entryIdx];
     const double fileLocalSec = static_cast<double>(fileLocalUs) / AV_TIME_BASE;
     const double speed = (e.speed > 0.0) ? e.speed : 1.0;
-    const Timeline *timeline = m_glPreview ? m_glPreview->timeline() : nullptr;
+    const Timeline *timeline = previewTimeline();
     const ClipInfo *clip = clipForPlaybackEntry(timeline, e);
     if (playbackEntryIsReversed(timeline, e, &m_reverseStates)) {
         ClipInfo mappedClip{};
@@ -2425,7 +2425,7 @@ bool VideoPlayer::displayNestedSequenceFrameAt(const Timeline *timeline,
     if (m_glPreview)
         m_glPreview->setCompositeBakedMode(true);
     cachePreviewComposite(ssotFrame);
-    displayFrame(ssotFrame, true);
+    displayFrame(ssotFrame, true, timelineUs);
     return true;
 }
 
@@ -2450,7 +2450,7 @@ bool VideoPlayer::seekToTimelineUs(int64_t timelineUs, bool precise)
     if (idx < 0) idx = 0;
     if (idx >= m_sequence.size()) return false;
     idx = previewPrimaryEntryIndexAt(
-        m_glPreview ? m_glPreview->timeline() : nullptr,
+        previewTimeline(),
         m_sequence,
         idx,
         timelineUs);
@@ -2484,8 +2484,7 @@ bool VideoPlayer::seekToTimelineUs(int64_t timelineUs, bool precise)
 
     m_activeEntry = idx;
     m_timelinePositionUs = timelineUs;
-    const Timeline *previewTimeline = m_glPreview
-        ? m_glPreview->timeline() : nullptr;
+    const Timeline *previewTimeline = this->previewTimeline();
     const bool nestedSequencePreview =
         timelineHasActiveReversedSequenceReference(
             previewTimeline, timelineUs);
@@ -2545,7 +2544,7 @@ bool VideoPlayer::advanceToEntry(int newEntryIdx)
     const qint64 nextTimelineUs =
         static_cast<qint64>(m_sequence.at(newEntryIdx).timelineStart * AV_TIME_BASE);
     newEntryIdx = previewPrimaryEntryIndexAt(
-        m_glPreview ? m_glPreview->timeline() : nullptr,
+        previewTimeline(),
         m_sequence,
         newEntryIdx,
         nextTimelineUs);
@@ -2601,8 +2600,7 @@ bool VideoPlayer::advanceToEntry(int newEntryIdx)
         m_glPreview->setCompositeBakedMode(false);
     }
     m_timelinePositionUs = static_cast<int64_t>(next.timelineStart * AV_TIME_BASE);
-    const Timeline *previewTimeline = m_glPreview
-        ? m_glPreview->timeline() : nullptr;
+    const Timeline *previewTimeline = this->previewTimeline();
     const int64_t startLocalUs = decodableSourcePositionUs(
         previewTimeline, next, m_timelinePositionUs,
         entryLocalPositionUs(newEntryIdx, m_timelinePositionUs),
@@ -3081,7 +3079,7 @@ void VideoPlayer::stepForward()
     // boundary", gap-cross behaviour) stay bit-exact.
     int64_t newPos;
     {
-        const Timeline *timeline = m_glPreview ? m_glPreview->timeline() : nullptr;
+        const Timeline *timeline = previewTimeline();
         const bool activeReversed = m_activeEntry >= 0
             && m_activeEntry < m_sequence.size()
             && playbackEntryIsReversed(
@@ -3136,7 +3134,7 @@ void VideoPlayer::stepForward()
     // axis tracks frame-rate accurately (avoids ~1-frame skew compounding
     // on VFR or 23.976 sources). Force-forward to newPos ONLY when the
     // reprojection went backward (reproject regression scenario).
-    const Timeline *timeline = m_glPreview ? m_glPreview->timeline() : nullptr;
+    const Timeline *timeline = previewTimeline();
     const bool activeReversed = m_activeEntry >= 0
         && m_activeEntry < m_sequence.size()
         && playbackEntryIsReversed(
@@ -3187,7 +3185,7 @@ void VideoPlayer::stepBackward()
         // legacy timeline arithmetic for bit-exact compatibility.
         int64_t target;
         {
-            const Timeline *timeline = m_glPreview ? m_glPreview->timeline() : nullptr;
+            const Timeline *timeline = previewTimeline();
             const bool activeReversed = m_activeEntry >= 0
                 && m_activeEntry < m_sequence.size()
                 && playbackEntryIsReversed(
@@ -3453,10 +3451,13 @@ bool VideoPlayer::canUseInteropFastPath(const AVFrame *frame) const
     return false;
 }
 
-void VideoPlayer::displaySeekFrameConformed(const QImage &v1Image)
+void VideoPlayer::displaySeekFrameConformed(const QImage &v1Image,
+                                            qint64 displayTimelineUsec)
 {
+    const qint64 timelineUsec =
+        resolvedDisplayTimelineUsec(displayTimelineUsec);
     if (!m_projectOutputSize.isValid()) {
-        displayFrame(v1Image);
+        displayFrame(v1Image, false, timelineUsec);
         return;
     }
 
@@ -3487,9 +3488,9 @@ void VideoPlayer::displaySeekFrameConformed(const QImage &v1Image)
     layer.opacity = 1.0;
     if (entry) {
         layer.colorMeta = entry->colorMeta;
-        applyLayerMotionOpacity(m_glPreview ? m_glPreview->timeline() : nullptr,
-                                *entry, m_timelinePositionUs, layer.opacity, &layer);
-        populateLayerMetadata(m_glPreview ? m_glPreview->timeline() : nullptr,
+        applyLayerMotionOpacity(previewTimeline(),
+                                *entry, timelineUsec, layer.opacity, &layer);
+        populateLayerMetadata(previewTimeline(),
                               *entry, m_activeEntry, &layer);
     }
     layer.fitContain = fitContain;
@@ -3502,7 +3503,7 @@ void VideoPlayer::displaySeekFrameConformed(const QImage &v1Image)
     if (m_glPreview)
         m_glPreview->setCompositeBakedMode(true);
     m_lastFrameOdtApplied = false;
-    displayFrame(canvas);
+    displayFrame(canvas, false, timelineUsec);
 }
 
 bool VideoPlayer::pushActiveClipColorCorrectionToGlPreview()
@@ -3523,7 +3524,7 @@ bool VideoPlayer::pushActiveClipColorCorrectionToGlPreview()
         return false;
     }
 
-    const Timeline *timeline = m_glPreview->timeline();
+    const Timeline *timeline = previewTimeline();
     const PlaybackEntry &entry = m_sequence[m_activeEntry];
     const ClipInfo *clip = clipForPlaybackEntry(timeline, entry);
     if (!clip)
@@ -3545,9 +3546,12 @@ bool VideoPlayer::pushActiveClipColorCorrectionToGlPreviewForTest(qint64 timelin
     return pushed;
 }
 
-void VideoPlayer::displayFrame(const QImage &image, bool overlaysAlreadyBaked)
+void VideoPlayer::displayFrame(const QImage &image, bool overlaysAlreadyBaked,
+                               qint64 displayTimelineUsec)
 {
     undotrace::log("displayFrame:enter");
+    const qint64 timelineUsec =
+        resolvedDisplayTimelineUsec(displayTimelineUsec);
     m_lastSourceFrame = image;
     m_lastSourceFrameHasBakedText = overlaysAlreadyBaked;
     QImage composed = composeFrameWithOverlays(image, overlaysAlreadyBaked);
@@ -3657,7 +3661,7 @@ void VideoPlayer::displayFrame(const QImage &image, bool overlaysAlreadyBaked)
     // clip grade later in GLPreview.  Resolve only the display-local copy from
     // renderFrameAt; m_currentFrameImage, frameComposited, and preview caches
     // remain on the normal path, so comparison cannot affect export/cache.
-    QImage display = stillCompareDisplaySource(composed);
+    QImage display = stillCompareDisplaySource(composed, timelineUsec);
     if (m_exposureAidMode != exposureaid::AidMode::None && !display.isNull()) {
         display = exposureaid::apply(display, m_exposureAidMode, m_exposureAidConfig);
     }
@@ -3682,7 +3686,7 @@ void VideoPlayer::displayFrame(const QImage &image, bool overlaysAlreadyBaked)
         if (!m_playing) {
             QVector<QImage> before;
             QVector<QImage> after;
-            const Timeline *tl = m_glPreview ? m_glPreview->timeline() : nullptr;
+            const Timeline *tl = previewTimeline();
             const qint64 durationUs = (m_sequenceDurationUs > 0)
                 ? m_sequenceDurationUs
                 : (tl ? static_cast<qint64>(tl->totalDuration() * AV_TIME_BASE) : 0);
@@ -3748,7 +3752,7 @@ void VideoPlayer::displayFrame(const QImage &image, bool overlaysAlreadyBaked)
                 const double T = static_cast<double>(m_timelinePositionUs)
                                / static_cast<double>(AV_TIME_BASE);
                 const Timeline *timeline = m_glPreview
-                    ? m_glPreview->timeline() : nullptr;
+                    ? previewTimeline() : nullptr;
                 const double srcSec = playbackEntryIsReversed(
                                           timeline, ae, &m_reverseStates)
                     ? static_cast<double>(entryLocalPositionUs(
@@ -3765,12 +3769,12 @@ void VideoPlayer::displayFrame(const QImage &image, bool overlaysAlreadyBaked)
         // A clip-local CPU stack already includes each clip's grade/LUT and
         // ordered FX. Running the GL branch on that frame would reorder or
         // duplicate the stack and no longer match export.
-        const qint64 previewUsec =
-            sequenceActive() ? m_timelinePositionUs : m_currentPositionUs;
         const bool glEffectsAlreadyBaked =
-            updateGlEffectsForBakedDisplay(previewUsec);
+            updateGlEffectsForBakedDisplay(timelineUsec);
         if (!glEffectsAlreadyBaked)
             pushActiveClipColorCorrectionToGlPreview();
+        if (stillCompareActive())
+            applyStillCompareGlBypass();
         undotrace::log("displayFrame:beforeGL");
         m_glPreview->displayFrame(display);
         undotrace::log("displayFrame:afterGL");
@@ -3846,7 +3850,7 @@ bool VideoPlayer::activePreviewClipCpuStack(qint64 timelineUsec,
 
     const bool wantsPreviewFx = !m_fullPreviewEffects.isEmpty()
                                 && (m_previewEffectsLive || !m_playing);
-    const Timeline *timeline = m_glPreview ? m_glPreview->timeline() : nullptr;
+    const Timeline *timeline = previewTimeline();
     if (!wantsPreviewFx || !timeline || !sequenceActive())
         return false;
 
@@ -3878,7 +3882,7 @@ bool VideoPlayer::activePreviewClipCpuStack(qint64 timelineUsec,
 
 bool VideoPlayer::hasClipLocalCpuFxAt(qint64 timelineUsec) const
 {
-    const Timeline *timeline = m_glPreview ? m_glPreview->timeline() : nullptr;
+    const Timeline *timeline = previewTimeline();
     if (!timeline || !sequenceActive())
         return false;
 
@@ -3940,7 +3944,7 @@ QImage VideoPlayer::preparePreviewClipFrame(
         *clipFxApplied = false;
 
     QImage prepared = applyVfxFootageControls(source, entry);
-    const Timeline *timeline = m_glPreview ? m_glPreview->timeline() : nullptr;
+    const Timeline *timeline = previewTimeline();
     const ClipInfo *sourceClip = clipForPlaybackEntry(timeline, entry);
     if (sourceClip && !sourceClip->isAdjustment) {
         const double clipLocalSec = entryClipLocalSeconds(entry, timelineUsec);
@@ -4006,7 +4010,7 @@ QImage VideoPlayer::composeFrameWithOverlays(const QImage &source,
     QVector<VideoEffect> previewEffects =
         wantsPreviewFx && !clipFxHandledPerClip
         ? effectivePreviewEffectsAt(cpuPreviewStack,
-                                    m_glPreview ? m_glPreview->timeline() : nullptr,
+                                    previewTimeline(),
                                     m_sequence,
                                     previewTimelineUsec)
         : QVector<VideoEffect>();
@@ -4318,42 +4322,73 @@ void VideoPlayer::setStillCompare(const stillcompare::Config &cfg)
         qBound(0.0, cfg.position, 1.0),
         cfg.still
     };
+    const bool wasActive = stillCompareActive();
+    const bool nextActive = next.enabled && !next.still.isNull();
     if (m_stillCompare.enabled == next.enabled
         && m_stillCompare.mode == next.mode
         && qFuzzyCompare(m_stillCompare.position + 1.0, next.position + 1.0)
         && m_stillCompare.still == next.still) {
         return;
     }
+    if (!wasActive && nextActive)
+        beginStillCompareGlBypass();
     m_stillCompare = next;
     const qint64 previewUsec =
         sequenceActive() ? m_timelinePositionUs : m_currentPositionUs;
-    // Update the GL bypass immediately. Some paused preview modes upload
-    // through MainWindow after this setter and do not call displayFrame.
+    if (nextActive)
+        applyStillCompareGlBypass();
+    else if (wasActive)
+        restoreStillCompareGlState();
+    // Update the grade/effect-stack bypass immediately. Some paused preview
+    // modes upload through MainWindow after this setter and do not call
+    // displayFrame.
     updateGlEffectsForBakedDisplay(previewUsec);
     refreshDisplayedFrame();
 }
 
-QImage VideoPlayer::applyStillCompareForDisplay(const QImage &image) const
+QImage VideoPlayer::applyStillCompareForDisplay(const QImage &image,
+                                                qint64 displayTimelineUsec)
 {
-    return compositeStillCompare(stillCompareDisplaySource(image));
+    const qint64 timelineUsec =
+        resolvedDisplayTimelineUsec(displayTimelineUsec);
+    QImage display = stillCompareDisplaySource(image, timelineUsec);
+    if (stillCompareActive())
+        applyStillCompareGlBypass();
+    return compositeStillCompare(display);
 }
 
-QImage VideoPlayer::stillCompareDisplaySource(const QImage &fallback) const
+const Timeline *VideoPlayer::previewTimeline() const
 {
-    if (!m_stillCompare.enabled || m_stillCompare.still.isNull()
-        || !m_glPreview || !m_glPreview->timeline()) {
+    if (m_stillCompareGlBypassActive && m_stillCompareGlTimeline)
+        return m_stillCompareGlTimeline;
+    return m_glPreview ? m_glPreview->timeline() : nullptr;
+}
+
+qint64 VideoPlayer::resolvedDisplayTimelineUsec(qint64 requestedUsec) const
+{
+    if (requestedUsec >= 0)
+        return requestedUsec;
+    return sequenceActive() ? m_timelinePositionUs : m_currentPositionUs;
+}
+
+bool VideoPlayer::stillCompareActive() const
+{
+    return m_stillCompare.enabled && !m_stillCompare.still.isNull();
+}
+
+QImage VideoPlayer::stillCompareDisplaySource(const QImage &fallback,
+                                              qint64 displayTimelineUsec) const
+{
+    const Timeline *timeline = previewTimeline();
+    if (!stillCompareActive() || !timeline) {
         return fallback;
     }
 
-    const Timeline *timeline = m_glPreview->timeline();
     // Match MainWindow's frame-export/still-capture SSOT arguments: the
-    // current timeline head in microseconds and the configured canvas size.
-    // During playback displayFrame runs just before positionChanged updates
-    // Timeline, so the player's sequence/non-sequence clocks are the
-    // non-lagging head values.
-    const qint64 usec = sequenceActive()
-        ? qMax<qint64>(0, m_timelinePositionUs)
-        : qMax<qint64>(0, m_currentPositionUs);
+    // exact timeline timestamp belonging to the frame being presented and the
+    // configured canvas size. The timestamp is passed down by the decode path
+    // before updatePositionUi() mutates the public playhead clock.
+    const qint64 usec = qMax<qint64>(0, displayTimelineUsec);
     QSize renderSize(qMax(1, m_canvasWidth), qMax(1, m_canvasHeight));
     if ((m_canvasWidth <= 0 || m_canvasHeight <= 0) && fallback.size().isValid())
         renderSize = fallback.size();
@@ -4372,6 +4407,143 @@ QImage VideoPlayer::compositeStillCompare(const QImage &display) const
                                m_stillCompare.position);
 }
 
+void VideoPlayer::beginStillCompareGlBypass()
+{
+    if (!m_glPreview || m_stillCompareGlBypassActive)
+        return;
+    m_stillCompareGlTimeline = m_glPreview->timeline();
+    m_stillCompareSavedCompositeBakedMode =
+        m_glPreview->compositeBakedMode();
+    m_stillCompareGlBypassActive = true;
+    // GLPreview derives single-clip motion and opacity directly from Timeline
+    // even in composite-baked mode. Detach only its paint-time lookup while
+    // comparison is active; VideoPlayer keeps using the saved non-owning
+    // pointer through previewTimeline().
+    m_glPreview->setTimeline(nullptr);
+}
+
+void VideoPlayer::applyStillCompareGlBypass()
+{
+    if (!m_glPreview || !m_stillCompareGlBypassActive)
+        return;
+    m_glPreview->setCompositeBakedMode(true);
+    m_glPreview->setSharpen(0.0f);
+    m_glPreview->setBlur(0.0f);
+    m_glPreview->setLensDistortion(0.0f);
+    m_glPreview->setGlow(false, 0.8f, 0.0f, 0.0f);
+    m_glPreview->setBloom(false, 0.8f, 0.0f, 0.0f);
+    m_glPreview->setChromaticAberration(false, 0.0f, 2.0f);
+    m_glPreview->setLightWrap(false, 0.0f, 0.0f);
+    m_glPreview->setRotation3D(0.0f, 0.0f, 0.0f, 2.0f);
+    m_glPreview->setStabilizerKeyframes({});
+}
+
+void VideoPlayer::restorePreviewPostEffects()
+{
+    if (!m_glPreview)
+        return;
+    m_glPreview->setSharpen(m_previewSharpen);
+    m_glPreview->setBlur(m_previewBlur);
+    m_glPreview->setLensDistortion(m_previewLens);
+    m_glPreview->setGlow(m_previewGlowEnabled, m_previewGlowThreshold,
+                         m_previewGlowRadius, m_previewGlowIntensity);
+    m_glPreview->setBloom(m_previewBloomEnabled, m_previewBloomThreshold,
+                          m_previewBloomIntensity, m_previewBloomSpread);
+    m_glPreview->setChromaticAberration(
+        m_previewChromAbEnabled, m_previewChromAbAmount,
+        m_previewChromAbFalloff);
+    m_glPreview->setLightWrap(m_previewLightWrapEnabled,
+                              m_previewLightWrapAmount,
+                              m_previewLightWrapRadius);
+    m_glPreview->setRotation3D(m_previewRot3DX, m_previewRot3DY,
+                               m_previewRot3DZ,
+                               m_previewPerspectiveDist);
+}
+
+void VideoPlayer::restoreStillCompareGlState()
+{
+    if (!m_glPreview || !m_stillCompareGlBypassActive)
+        return;
+    m_glPreview->setTimeline(const_cast<Timeline *>(m_stillCompareGlTimeline));
+    restorePreviewPostEffects();
+    if (sequenceActive() && m_activeEntry >= 0
+        && m_activeEntry < m_sequence.size()
+        && m_sequence[m_activeEntry].sourceTrack == 0) {
+        m_glPreview->setStabilizerKeyframes(
+            m_sequence[m_activeEntry].stabilizerKeyframes);
+    } else {
+        m_glPreview->setStabilizerKeyframes({});
+    }
+    m_glPreview->setCompositeBakedMode(
+        m_stillCompareSavedCompositeBakedMode);
+    m_stillCompareGlTimeline = nullptr;
+    m_stillCompareGlBypassActive = false;
+}
+
+void VideoPlayer::setPreviewEffectsPack(float sharpen, float blur, float lens)
+{
+    m_previewSharpen = sharpen;
+    m_previewBlur = blur;
+    m_previewLens = lens;
+    if (!m_glPreview || stillCompareActive())
+        return;
+    m_glPreview->setSharpen(sharpen);
+    m_glPreview->setBlur(blur);
+    m_glPreview->setLensDistortion(lens);
+}
+
+void VideoPlayer::setPreviewGlow(bool enabled, float threshold, float radius,
+                                 float intensity)
+{
+    m_previewGlowEnabled = enabled;
+    m_previewGlowThreshold = threshold;
+    m_previewGlowRadius = radius;
+    m_previewGlowIntensity = intensity;
+    if (m_glPreview && !stillCompareActive())
+        m_glPreview->setGlow(enabled, threshold, radius, intensity);
+}
+
+void VideoPlayer::setPreviewBloom(bool enabled, float threshold,
+                                  float intensity, float spread)
+{
+    m_previewBloomEnabled = enabled;
+    m_previewBloomThreshold = threshold;
+    m_previewBloomIntensity = intensity;
+    m_previewBloomSpread = spread;
+    if (m_glPreview && !stillCompareActive())
+        m_glPreview->setBloom(enabled, threshold, intensity, spread);
+}
+
+void VideoPlayer::setPreviewChromaticAberration(bool enabled, float amount,
+                                                float radialFalloff)
+{
+    m_previewChromAbEnabled = enabled;
+    m_previewChromAbAmount = amount;
+    m_previewChromAbFalloff = radialFalloff;
+    if (m_glPreview && !stillCompareActive())
+        m_glPreview->setChromaticAberration(enabled, amount, radialFalloff);
+}
+
+void VideoPlayer::setPreviewLightWrap(bool enabled, float amount, float radius)
+{
+    m_previewLightWrapEnabled = enabled;
+    m_previewLightWrapAmount = amount;
+    m_previewLightWrapRadius = radius;
+    if (m_glPreview && !stillCompareActive())
+        m_glPreview->setLightWrap(enabled, amount, radius);
+}
+
+void VideoPlayer::setPreviewRotation3D(float xDeg, float yDeg, float zDeg,
+                                       float perspectiveDist)
+{
+    m_previewRot3DX = xDeg;
+    m_previewRot3DY = yDeg;
+    m_previewRot3DZ = zDeg;
+    m_previewPerspectiveDist = perspectiveDist;
+    if (m_glPreview && !stillCompareActive())
+        m_glPreview->setRotation3D(xDeg, yDeg, zDeg, perspectiveDist);
+}
+
 bool VideoPlayer::updateGlEffectsForBakedDisplay(qint64 timelineUsec)
 {
     const bool clipCpuFxBaked = hasClipLocalCpuFxAt(timelineUsec);
@@ -4380,7 +4552,7 @@ bool VideoPlayer::updateGlEffectsForBakedDisplay(qint64 timelineUsec)
     // GLPreview must not apply the current clip's grade/effects to the whole
     // image (especially the saved-still side). The shared latch also restores
     // the prior GPU preview stack as soon as neither baked condition remains.
-    const bool glEffectsAlreadyBaked = clipCpuFxBaked || m_stillCompare.enabled;
+    const bool glEffectsAlreadyBaked = clipCpuFxBaked || stillCompareActive();
     if (!m_glPreview)
         return glEffectsAlreadyBaked;
     if (glEffectsAlreadyBaked && !m_clipCpuDisabledGlGrade) {
@@ -4924,8 +5096,7 @@ void VideoPlayer::updatePositionUi()
         // produced the bogus 10628s seekTo leak into AudioMixer (see
         // .omc/state/v2ff_rca.md). The 2-frame acceptance window admits
         // decoder-driven progression; explicit seeks bypass via the seek flags.
-        const Timeline *previewTimeline = m_glPreview
-            ? m_glPreview->timeline() : nullptr;
+        const Timeline *previewTimeline = this->previewTimeline();
         const bool activeReversed = m_activeEntry >= 0
             && m_activeEntry < m_sequence.size()
             && playbackEntryIsReversed(previewTimeline,
@@ -5011,8 +5182,7 @@ bool VideoPlayer::seekInternal(int64_t positionUs, bool displayFrame, bool preci
         const QImage image = frameToImage(displayable);
         if (image.isNull())
             return false;
-        const Timeline *previewTimeline = m_glPreview
-            ? m_glPreview->timeline() : nullptr;
+        const Timeline *previewTimeline = this->previewTimeline();
         const bool activeReversed = sequenceActive()
             && m_activeEntry >= 0 && m_activeEntry < m_sequence.size()
             && playbackEntryIsReversed(previewTimeline,
@@ -5043,7 +5213,9 @@ bool VideoPlayer::seekInternal(int64_t positionUs, bool displayFrame, bool preci
         }
         m_lastFrameOdtApplied = false;
         if (!reverseTimelineDriven || !m_deferDisplayThisTick)
-            this->displaySeekFrameConformed(displayImage);
+            this->displaySeekFrameConformed(
+                displayImage,
+                sequenceActive() ? m_timelinePositionUs : targetUs);
         m_currentPositionUs = targetUs;
         updatePositionUi();
         return true;
@@ -5147,6 +5319,12 @@ bool VideoPlayer::presentDecodedFrame(AVFrame *frame, bool displayFrameRequested
         m_lastSourceFrame = image;
         m_lastSourceFrameHasBakedText = false;
         if (!m_deferDisplayThisTick) {
+            const qint64 displayTimelineUs =
+                sequenceActive()
+                && m_activeEntry >= 0
+                && m_activeEntry < m_sequence.size()
+                    ? fileLocalToTimelineUs(m_activeEntry, m_currentPositionUs)
+                    : m_currentPositionUs;
             QImage displayImage = image;
             if (sequenceActive()
                 && m_activeEntry >= 0
@@ -5154,16 +5332,16 @@ bool VideoPlayer::presentDecodedFrame(AVFrame *frame, bool displayFrameRequested
                 const auto &entry = m_sequence[m_activeEntry];
                 const double sourceSec =
                     static_cast<double>(
-                        entryLocalPositionUs(m_activeEntry, m_timelinePositionUs))
+                        entryLocalPositionUs(m_activeEntry, displayTimelineUs))
                     / AV_TIME_BASE;
                 displayImage = preparePreviewClipFrame(
                     displayImage, entry, m_activeEntry, sourceSec,
                     QSize(displayable->width, displayable->height),
-                    m_timelinePositionUs);
+                    displayTimelineUs);
             }
             // This path displays a non-baked frame.
             m_lastFrameOdtApplied = false;
-            displaySeekFrameConformed(displayImage);
+            displaySeekFrameConformed(displayImage, displayTimelineUs);
         }
         updatePositionUi();
     }
@@ -5360,7 +5538,7 @@ bool VideoPlayer::refreshPreviewClipCpuComposite()
         return false;
     }
 
-    const Timeline *timeline = m_glPreview ? m_glPreview->timeline() : nullptr;
+    const Timeline *timeline = previewTimeline();
     if (!timeline)
         return false;
 
@@ -5443,7 +5621,7 @@ bool VideoPlayer::refreshPreviewClipCpuComposite()
     if (m_glPreview)
         m_glPreview->setCompositeBakedMode(true);
     m_lastFrameOdtApplied = false;
-    displayFrame(canvas);
+    displayFrame(canvas, false, m_timelinePositionUs);
     return true;
 }
 
@@ -5464,8 +5642,7 @@ void VideoPlayer::refreshDisplayedFrame()
         return;
 
     if (m_lastSourceFrameHasBakedText) {
-        const Timeline *previewTimeline =
-            m_glPreview ? m_glPreview->timeline() : nullptr;
+        const Timeline *previewTimeline = this->previewTimeline();
         QSize renderSize = m_projectOutputSize.isValid()
             ? m_projectOutputSize
             : QSize(m_canvasWidth, m_canvasHeight);
@@ -5476,7 +5653,7 @@ void VideoPlayer::refreshDisplayedFrame()
                 previewTimeline, m_timelinePositionUs, renderSize);
             if (!refreshed.isNull()) {
                 m_lastFrameOdtApplied = false;
-                displayFrame(refreshed, true);
+                displayFrame(refreshed, true, m_timelinePositionUs);
                 return;
             }
         }
@@ -5484,7 +5661,7 @@ void VideoPlayer::refreshDisplayedFrame()
         // last valid nested frame without burning the new overlay list into
         // it a second time.
         m_lastFrameOdtApplied = false;
-        displayFrame(m_lastSourceFrame, true);
+        displayFrame(m_lastSourceFrame, true, m_timelinePositionUs);
         return;
     }
     undotrace::log("refresh:conform");
@@ -5495,8 +5672,7 @@ void VideoPlayer::refreshDisplayedFrame()
         const QVector<int> activeIdxs = findActiveEntriesAt(m_timelinePositionUs);
         const auto &e = m_sequence[m_activeEntry];
         if (!hasOverlayActive(activeIdxs) && e.sourceTrack == 0) {
-            const Timeline *previewTimeline =
-                m_glPreview ? m_glPreview->timeline() : nullptr;
+            const Timeline *previewTimeline = this->previewTimeline();
             const QSize sourceSize =
                 (m_codecCtx && m_codecCtx->width > 0 && m_codecCtx->height > 0)
                     ? QSize(m_codecCtx->width, m_codecCtx->height)
@@ -5543,7 +5719,7 @@ void VideoPlayer::refreshDisplayedFrame()
                     if (m_glPreview)
                         m_glPreview->setCompositeBakedMode(true);
                     m_lastFrameOdtApplied = false;
-                    displayFrame(canvas);
+                    displayFrame(canvas, false, m_timelinePositionUs);
                     return;
                 }
             }
@@ -5553,7 +5729,7 @@ void VideoPlayer::refreshDisplayedFrame()
             // composeFrameWithOverlays intentionally skips it.
             if (clipFxApplied) {
                 m_lastFrameOdtApplied = false;
-                displayFrame(prepared);
+                displayFrame(prepared, false, m_timelinePositionUs);
                 return;
             }
         }
@@ -5583,7 +5759,8 @@ void VideoPlayer::refreshDisplayedFrame()
     // This path displays a non-baked frame.
     m_lastFrameOdtApplied = false;
     undotrace::log("refresh:fallthrough");
-    displayFrame(m_lastSourceFrame);
+    displayFrame(m_lastSourceFrame, false,
+                 resolvedDisplayTimelineUsec(-1));
 }
 
 void VideoPlayer::resizeEvent(QResizeEvent *event)
@@ -5799,7 +5976,7 @@ void VideoPlayer::handlePlaybackTick()
     // with V2+ overlays. When yes, presentDecodedFrame caches the V1 frame
     // into m_lastSourceFrame but skips displayFrame so the compositor step
     // below can blend the overlays before pushing the final image.
-    const Timeline *previewTimeline = m_glPreview ? m_glPreview->timeline() : nullptr;
+    const Timeline *previewTimeline = this->previewTimeline();
     const QVector<int> activeForComposite = findActiveEntriesAt(m_timelinePositionUs);
     const bool nestedSequenceActive =
         m_playbackSpeed >= 0.0
@@ -6043,7 +6220,7 @@ void VideoPlayer::handlePlaybackTick()
                 if (m_glPreview)
                     m_glPreview->setCompositeBakedMode(true);
                 cachePreviewComposite(ssotFrame);
-                displayFrame(ssotFrame, true);
+                displayFrame(ssotFrame, true, m_timelinePositionUs);
                 servedByNestedSequenceSsot = true;
             }
         }
@@ -6082,7 +6259,7 @@ void VideoPlayer::handlePlaybackTick()
                 if (m_glPreview)
                     m_glPreview->setCompositeBakedMode(true);
                 // Cache hits can re-serve ODT-baked frames; without a cached baked flag, paused same-playhead hits can double-apply ACES.
-                displayFrame(cached);
+                displayFrame(cached, false, m_timelinePositionUs);
                 servedFromCache = true;
             }
         }
@@ -6449,7 +6626,7 @@ void VideoPlayer::handlePlaybackTick()
                         m_lastV1RawFrame, entry, m_activeEntry, sourceSec,
                         sourceSize, m_timelinePositionUs);
                 }
-                displayFrame(fallbackFrame);
+                displayFrame(fallbackFrame, false, m_timelinePositionUs);
             } else {
                 if (traceTick) {
                     m_tickTraceDecodeNs += tickTimer.nsecsElapsed() - sectionMark;
@@ -6484,7 +6661,8 @@ void VideoPlayer::handlePlaybackTick()
                     if (m_glPreview)
                         m_glPreview->setCompositeBakedMode(true);
                     cachePreviewComposite(displayedComposite);  // CPU 経路と同じキーで put
-                    displayFrame(displayedComposite);           // 1 tick = 最大 1 displayFrame
+                    displayFrame(displayedComposite, false,
+                                 m_timelinePositionUs);          // 1 tick = 最大 1 displayFrame
                 } else {
                 // Phase 1e Win #7 — in-place compose. Default ON; opt out
                 // via VEDITOR_INPLACE_COMPOSE_DISABLE=1 to fall back to the
@@ -6502,7 +6680,7 @@ void VideoPlayer::handlePlaybackTick()
                     if (m_glPreview)
                         m_glPreview->setCompositeBakedMode(true);
                     cachePreviewComposite(m_canvasBase);
-                    displayFrame(m_canvasBase);
+                    displayFrame(m_canvasBase, false, m_timelinePositionUs);
                 } else if (inplaceComposeEnabled) {
                     composeMultiTrackFrameInto(m_canvasBase, layers);
                     if (traceTick)
@@ -6524,7 +6702,7 @@ void VideoPlayer::handlePlaybackTick()
                     // scrub 戻り) でのみ将来 hit する純キャッシュ。displayFrame の
                     // 発火回数は不変 (1 tick = 最大 1 frame)。
                     cachePreviewComposite(m_canvasBase);
-                    displayFrame(m_canvasBase);
+                    displayFrame(m_canvasBase, false, m_timelinePositionUs);
                 } else {
                     // Legacy path (VEDITOR_INPLACE_COMPOSE_DISABLE=1): allocates
                     // a separate `composed` via composeMultiTrackFrame's
@@ -6538,7 +6716,7 @@ void VideoPlayer::handlePlaybackTick()
                     if (m_glPreview)
                         m_glPreview->setCompositeBakedMode(true);
                     cachePreviewComposite(composed); // ADAPTIVE-1: 上の in-place 分岐と同旨
-                    displayFrame(composed);
+                    displayFrame(composed, false, m_timelinePositionUs);
                 }
                 } // STAGE3-GPU: close `else` (CPU フォールバック経路)
             }
@@ -6580,7 +6758,7 @@ void VideoPlayer::handlePlaybackTick()
                     m_lastV1RawFrame, entry, m_activeEntry, sourceSec,
                     sourceSize, m_timelinePositionUs);
             }
-            displayFrame(fallbackFrame);
+            displayFrame(fallbackFrame, false, m_timelinePositionUs);
         }
       } // ADAPTIVE-1: close `if (!servedFromCache)`
     }
@@ -7986,7 +8164,7 @@ bool VideoPlayer::finalizeOverlayFromDecoder(const PlaybackEntry &e, int seqIdx,
 
     if (sourceSize.width() <= 0 || sourceSize.height() <= 0)
         sourceSize = out->rgb.size();
-    const Timeline *previewTimeline = m_glPreview ? m_glPreview->timeline() : nullptr;
+    const Timeline *previewTimeline = this->previewTimeline();
     if (seqIdx >= 0 && seqIdx < m_sequence.size()) {
         const double sourceSec =
             static_cast<double>(entryLocalPositionUs(seqIdx, m_timelinePositionUs))
@@ -8011,8 +8189,7 @@ bool VideoPlayer::harvestOverlayLayer(const PlaybackEntry &e, int seqIdx, Decode
     if (!d)
         return false;
 
-    const Timeline *previewTimeline = m_glPreview
-        ? m_glPreview->timeline() : nullptr;
+    const Timeline *previewTimeline = this->previewTimeline();
     const int64_t expectedFileLocalUs = decodableSourcePositionUs(
         previewTimeline, e, m_timelinePositionUs,
         entryLocalPositionUs(seqIdx, m_timelinePositionUs),

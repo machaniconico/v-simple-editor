@@ -4,6 +4,7 @@
 
 #include <QComboBox>
 #include <QDateTime>
+#include <QFileInfo>
 #include <QHBoxLayout>
 #include <QInputDialog>
 #include <QLabel>
@@ -208,10 +209,18 @@ void StillGalleryDock::showItemMenu(const QPoint &position)
                               QMessageBox::No) != QMessageBox::Yes) {
         return;
     }
-    if (!m_store->remove(id, &error)) {
+    const QString imagePath = item->data(kStillPathRole).toString();
+    const bool removed = m_store->remove(id, &error);
+    // remove() can delete the PNG and then fail to persist index.json. Always
+    // reload so StillStore::list() can repair that partial state. If the PNG
+    // is already gone, notify the owner even though remove() returned false;
+    // otherwise MainWindow would keep comparing against an orphaned QImage.
+    refresh();
+    if (!removed) {
+        if (!QFileInfo::exists(imagePath))
+            emit stillRemoved(id);
         QMessageBox::warning(this, tr("スチルを削除"), error);
         return;
     }
-    refresh();
     emit stillRemoved(id);
 }
