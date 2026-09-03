@@ -5,6 +5,7 @@
 
 #include "../MusicRemix.h"
 #include "../Timeline.h"
+#include "../UndoManager.h"
 
 int runMusicRemixSelftest()
 {
