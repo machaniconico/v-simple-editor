@@ -5921,11 +5921,6 @@ void VideoPlayer::cachePreviewComposite(const QImage &composed)
     m_frameCache.put(key, composed);
 }
 
-void VideoPlayer::handlePlaybackTickForTest()
-{
-    handlePlaybackTick();
-}
-
 void VideoPlayer::handlePlaybackTick()
 {
     if (!m_playing)

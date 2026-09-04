@@ -6,6 +6,9 @@
 #include "../GLPreview.h"
 
 #include <QColor>
+#include <QCoreApplication>
+#include <QElapsedTimer>
+#include <QEventLoop>
 #include <QFile>
 #include <QJsonDocument>
 #include <QRect>
@@ -234,8 +237,11 @@ int runShapeClipSelftest()
     });
     const qint64 beforePlayback = player.timelinePositionUs();
     player.play();
-    player.handlePlaybackTickForTest();
-    player.handlePlaybackTickForTest();
+    // Let the production playback timer deliver ticks, with a bounded wait.
+    QElapsedTimer guard;
+    guard.start();
+    while (guard.elapsed() < 2000 && tickFrames < 2)
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
     player.pause();
     const QColor playbackCenter = lastTickFrame.isNull()
         ? QColor() : lastTickFrame.pixelColor(30, 20);
