@@ -786,7 +786,8 @@ int runMcpSelftest()
         QStringLiteral("set_playhead"),
         QStringLiteral("undo"),
         QStringLiteral("redo"),
-        QStringLiteral("music_remix")
+        QStringLiteral("music_remix"),
+        QStringLiteral("dialogue_level")
     };
     bool allWriteToolsListed = true;
     for (const QString& expectedName : expectedWriteToolNames) {
@@ -2802,6 +2803,82 @@ int runMcpSelftest()
         fail("G131 replace_clip rejects a missing file", reason);
         fail("G132 undo restores replace_clip in one step", reason);
         fail("G133 match_frame maps timeline offset to sourceSec", reason);
+    }
+
+    // G140-G141: dialogue_level generates an audio volume envelope and
+    // rejects non-audio targets.
+    if (projectTimeline && musicRemixWavReady) {
+        TimelineTrack *dialogueTrack = projectTimeline->trackAt(true, 0);
+        if (dialogueTrack) {
+            ClipInfo dialogueClip;
+            dialogueClip.filePath = musicRemixWav.fileName();
+            dialogueClip.displayName = QStringLiteral("dialogue-level-test.wav");
+            dialogueClip.duration = 8.0;
+            dialogueClip.outPoint = 8.0;
+            dialogueTrack->setClips(QVector<ClipInfo>{dialogueClip});
+            projectTimeline->clearSelection();
+            projectTimeline->undoManager()->clear();
+            projectTimeline->undoManager()->saveState(
+                projectTimeline->currentState(),
+                QStringLiteral("MCP dialogue level baseline"));
+
+            const QJsonObject dialogueResponse = callProjectInfoTool(
+                263, QStringLiteral("dialogue_level"), QJsonObject{
+                    {QStringLiteral("kind"), QStringLiteral("audio")},
+                    {QStringLiteral("trackIndex"), 0},
+                    {QStringLiteral("clipIndex"), 0},
+                    {QStringLiteral("targetLufs"), -18.0}
+                });
+            const QJsonObject dialoguePayload = toolPayload(dialogueResponse);
+            const int pointCount = dialoguePayload
+                .value(QStringLiteral("pointCount")).toInt();
+            const bool applied = !toolResult(dialogueResponse)
+                                      .value(QStringLiteral("isError")).toBool(true)
+                && dialoguePayload.value(QStringLiteral("ok")).toBool(false)
+                && pointCount > 1
+                && dialogueTrack->clips().first().volumeEnvelope.size()
+                       == pointCount
+                && dialoguePayload.value(QStringLiteral("measuredLufsMin")).toDouble()
+                       <= dialoguePayload.value(QStringLiteral("measuredLufsMax")).toDouble();
+            projectTimeline->undo();
+            const bool oneUndo = !projectTimeline->canUndo()
+                && dialogueTrack->clips().first().volumeEnvelope.isEmpty();
+            const bool g140 = applied && oneUndo;
+            g140 ? pass("G140 dialogue_level normal case")
+                 : fail("G140 dialogue_level normal case",
+                        QStringLiteral("envelope generation, response, or undo failed: %1")
+                            .arg(toolErrorText(dialogueResponse)));
+
+            const QJsonObject nonAudioResponse = callProjectInfoTool(
+                264, QStringLiteral("dialogue_level"), QJsonObject{
+                    {QStringLiteral("kind"), QStringLiteral("video")},
+                    {QStringLiteral("trackIndex"), 0},
+                    {QStringLiteral("clipIndex"), 0}
+                });
+            const bool g141 = toolResult(nonAudioResponse)
+                                  .value(QStringLiteral("isError")).toBool(false)
+                && dialogueTrack->clips().first().volumeEnvelope.isEmpty();
+            g141 ? pass("G141 dialogue_level rejects non-audio target")
+                 : fail("G141 dialogue_level rejects non-audio target",
+                        QStringLiteral("video target was accepted or mutated audio"));
+
+            dialogueTrack->setClips(QVector<ClipInfo>{});
+            projectTimeline->clearSelection();
+            projectTimeline->undoManager()->clear();
+            projectTimeline->undoManager()->saveState(
+                projectTimeline->currentState(),
+                QStringLiteral("MCP selftest baseline"));
+        } else {
+            fail("G140 dialogue_level normal case",
+                 QStringLiteral("audio track was not available"));
+            fail("G141 dialogue_level rejects non-audio target",
+                 QStringLiteral("audio track was not available"));
+        }
+    } else {
+        const QString reason = QStringLiteral(
+            "Timeline or generated WAV fixture was not available");
+        fail("G140 dialogue_level normal case", reason);
+        fail("G141 dialogue_level rejects non-audio target", reason);
     }
 
     // G142-G143: AUDIO-XFADE adds an audio-only set_transition kind. Keep

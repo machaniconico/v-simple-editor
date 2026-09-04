@@ -19,6 +19,8 @@
 #include "WaveformGenerator.h"
 #include "MusicRemixDialog.h"
 #include "MusicRemix.h"
+#include "DialogueLevelerDialog.h"
+#include "DialogueLeveler.h"
 #include "color/ClipColor.h"
 #include "playback/HdrIngestProbe.h"
 #include "playback/hdringest_flag.h"
@@ -7147,6 +7149,54 @@ bool Timeline::applyMusicRemix(int trackIndex, int clipIndex,
     return true;
 }
 
+bool Timeline::applyDialogueLevel(
+    int trackIndex, int clipIndex,
+    const QVector<AudioGainPoint> &envelope, QString *errorOut)
+{
+    if (errorOut)
+        errorOut->clear();
+    const auto fail = [errorOut](const QString &message) {
+        if (errorOut)
+            *errorOut = message;
+        return false;
+    };
+
+    TimelineTrack *track = trackAt(true, trackIndex);
+    if (!track)
+        return fail(QStringLiteral("音声トラックの index が範囲外です"));
+    if (clipIndex < 0 || clipIndex >= track->clipCount())
+        return fail(QStringLiteral("音声クリップの index が範囲外です"));
+    if (track->isLocked())
+        return fail(QStringLiteral("音声トラックがロックされています"));
+    if (envelope.isEmpty())
+        return fail(QStringLiteral("音量エンベロープが空です"));
+
+    const double duration = track->clips().at(clipIndex).effectiveDuration();
+    if (!std::isfinite(duration) || duration <= 0.0)
+        return fail(QStringLiteral("対象クリップの尺が不正です"));
+    double previousTime = -1.0;
+    for (const AudioGainPoint &point : envelope) {
+        if (!std::isfinite(point.time) || !std::isfinite(point.gain)
+            || point.time < 0.0 || point.time > duration + 1.0e-6
+            || point.time + 1.0e-12 < previousTime || point.gain < 0.0) {
+            return fail(QStringLiteral("音量エンベロープが不正です"));
+        }
+        previousTime = point.time;
+    }
+
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    QVector<ClipInfo> clips = track->clips();
+    clips[clipIndex].volumeEnvelope = envelope;
+    track->setClips(clips);
+    track->setSelectedClip(clipIndex);
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+    saveUndoState(QStringLiteral("ダイアログレベラー"));
+    updateInfoLabel();
+    scheduleEmitSequenceChanged();
+    return true;
+}
+
 // 再生ヘッド直下の V1(最初の動画トラック)クリップを解決。見つかれば true。
 bool Timeline::clipUnderPlayhead(TimelineTrack *&outTrack, int &outClipIndex) const
 {
@@ -7244,6 +7294,8 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
         aUnlink->setEnabled(aLinkGroup > 0);
         aMenu.addSeparator();
         QAction *aNormalize = aMenu.addAction(QStringLiteral("ノーマライズ"));
+        QAction *aDialogueLevel = aMenu.addAction(
+            QStringLiteral("ダイアログレベラー…"));
         QAction *aRemix = aMenu.addAction(QStringLiteral("ミュージックリミックス…"));
         aMenu.addSeparator();
         QMenu *aChannelMenu = aMenu.addMenu(QStringLiteral("チャンネルマッピング"));
@@ -7330,6 +7382,69 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
         else if (aChosen == aNormalize) {
             const int trackIdx = m_audioTracks.indexOf(track);
             normalizeAudioClipPeak(trackIdx, clipIndex);
+        }
+        else if (aChosen == aDialogueLevel) {
+            if (!aClip.volumeEnvelope.isEmpty()
+                && QMessageBox::question(
+                       this, QStringLiteral("ダイアログレベラー"),
+                       QStringLiteral("既存の音量エンベロープを上書きしますか？"),
+                       QMessageBox::Yes | QMessageBox::No,
+                       QMessageBox::No) != QMessageBox::Yes) {
+                return;
+            }
+
+            DialogueLevelerDialog dialog(this);
+            if (dialog.exec() != QDialog::Accepted)
+                return;
+
+            QVector<float> samples;
+            int sampleRate = 0;
+            if (!WaveformGenerator::decodeAudio(aClip.filePath, samples, sampleRate)
+                || samples.isEmpty() || sampleRate <= 0) {
+                QMessageBox::warning(this, QStringLiteral("ダイアログレベラー"),
+                                     QStringLiteral("音声のデコードに失敗しました。"));
+                return;
+            }
+
+            const double sourceOut = aClip.outPoint > 0.0
+                ? aClip.outPoint : aClip.duration;
+            const double sourceDuration =
+                static_cast<double>(samples.size()) / sampleRate;
+            const double activeStart = qBound(0.0, aClip.inPoint, sourceDuration);
+            const double activeEnd = qBound(activeStart, sourceOut, sourceDuration);
+            const int firstSample = qBound(
+                0, static_cast<int>(std::floor(activeStart * sampleRate)),
+                static_cast<int>(samples.size()));
+            const int lastSample = qBound(
+                firstSample, static_cast<int>(std::ceil(activeEnd * sampleRate)),
+                static_cast<int>(samples.size()));
+            if (lastSample <= firstSample) {
+                QMessageBox::information(
+                    this, QStringLiteral("ダイアログレベラー"),
+                    QStringLiteral("クリップの有効な音声範囲がありません。"));
+                return;
+            }
+
+            leveler::Config config;
+            config.targetShortTermLufs = dialog.targetLufs();
+            config.smoothingSec = dialog.smoothingSec();
+            QVector<float> activeSamples =
+                samples.mid(firstSample, lastSample - firstSample);
+            if (aClip.reversed)
+                std::reverse(activeSamples.begin(), activeSamples.end());
+            QVector<AudioGainPoint> envelope = leveler::computeEnvelope(
+                activeSamples, sampleRate, config);
+            const double speed = aClip.speed > 0.0 ? aClip.speed : 1.0;
+            const double clipDuration = aClip.effectiveDuration();
+            for (AudioGainPoint &point : envelope)
+                point.time = qBound(0.0, point.time / speed, clipDuration);
+
+            QString error;
+            if (!applyDialogueLevel(m_audioTracks.indexOf(track), clipIndex,
+                                    envelope, &error)) {
+                QMessageBox::warning(this, QStringLiteral("ダイアログレベラー"),
+                                     error);
+            }
         }
         else if (aChosen == aRemix) {
             QVector<float> samples;

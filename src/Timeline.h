@@ -782,6 +782,11 @@ public:
     bool applyMusicRemix(int trackIndex, int clipIndex,
                          const remix::Plan &plan, bool ripple = false,
                          QString *errorOut = nullptr);
+    // Replace one audio clip's gain automation with a dialogue-leveler
+    // envelope. Times are clip-local timeline seconds; one call is one undo.
+    bool applyDialogueLevel(int trackIndex, int clipIndex,
+                            const QVector<AudioGainPoint> &envelope,
+                            QString *errorOut = nullptr);
     // 再生ヘッド直下の V1 クリップを解決(見つかれば true)。
     bool clipUnderPlayhead(TimelineTrack *&outTrack, int &outClipIndex) const;
     bool removeMarker(int id);

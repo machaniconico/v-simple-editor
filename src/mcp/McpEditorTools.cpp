@@ -4,6 +4,7 @@
 #include "../CaptionEditorDialog.h"
 #include "../BeatDetect.h"
 #include "../DynamicZoom.h"
+#include "../DialogueLeveler.h"
 #include "../MainWindow.h"
 #include "../MusicRemix.h"
 #include "../RenderQueue.h"
@@ -29,6 +30,7 @@
 #include <QStringList>
 #include <QtGlobal>
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 
@@ -654,6 +656,49 @@ bool detectMusicRemixBeats(const ClipInfo &clip, QVector<double> *beatTimes,
         *beatTimes = localBeats;
     if (bpm)
         *bpm = detected.bpm;
+    return true;
+}
+
+bool analyzeDialogueClip(const ClipInfo &clip, const leveler::Config &config,
+                         leveler::Analysis *analysis, QString *err)
+{
+    if (analysis)
+        *analysis = {};
+    QVector<float> samples;
+    int sampleRate = 0;
+    if (!WaveformGenerator::decodeAudio(clip.filePath, samples, sampleRate)
+        || samples.isEmpty() || sampleRate <= 0) {
+        return setError(err, QStringLiteral("音声のデコードに失敗しました。"));
+    }
+
+    const double sourceOut = clip.outPoint > 0.0 ? clip.outPoint : clip.duration;
+    const double sourceDuration = static_cast<double>(samples.size()) / sampleRate;
+    const double activeStart = qBound(0.0, clip.inPoint, sourceDuration);
+    const double activeEnd = qBound(activeStart, sourceOut, sourceDuration);
+    const int sampleCount = static_cast<int>(samples.size());
+    const int firstSample = qBound(
+        0, static_cast<int>(std::floor(activeStart * sampleRate)), sampleCount);
+    const int lastSample = qBound(
+        firstSample, static_cast<int>(std::ceil(activeEnd * sampleRate)),
+        sampleCount);
+    if (lastSample <= firstSample)
+        return setError(err, QStringLiteral("クリップの有効な音声範囲がありません。"));
+
+    QVector<float> activeSamples =
+        samples.mid(firstSample, lastSample - firstSample);
+    if (clip.reversed)
+        std::reverse(activeSamples.begin(), activeSamples.end());
+    leveler::Analysis computed = leveler::analyze(
+        activeSamples, sampleRate, config);
+    if (computed.envelope.isEmpty())
+        return setError(err, QStringLiteral("音量エンベロープを生成できませんでした。"));
+
+    const double speed = clip.speed > 0.0 ? clip.speed : 1.0;
+    const double clipDuration = clip.effectiveDuration();
+    for (AudioGainPoint &point : computed.envelope)
+        point.time = qBound(0.0, point.time / speed, clipDuration);
+    if (analysis)
+        *analysis = computed;
     return true;
 }
 
@@ -1723,6 +1768,20 @@ void McpEditorTools::registerWriteTools()
         QStringLiteral("trackIndex"), QStringLiteral("clipIndex"),
         QStringLiteral("targetSec"), QStringLiteral("resultDuration"),
         QStringLiteral("segmentCount")});
+
+    const QJsonObject dialogueLevelOutputSchema = outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("kind"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
+        {QStringLiteral("trackIndex"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+        {QStringLiteral("clipIndex"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+        {QStringLiteral("targetLufs"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
+        {QStringLiteral("pointCount"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+        {QStringLiteral("measuredLufsMin"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
+        {QStringLiteral("measuredLufsMax"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}}
+    }, {QStringLiteral("ok"), QStringLiteral("kind"),
+        QStringLiteral("trackIndex"), QStringLiteral("clipIndex"),
+        QStringLiteral("targetLufs"), QStringLiteral("pointCount"),
+        QStringLiteral("measuredLufsMin"), QStringLiteral("measuredLufsMax")});
 
     const QJsonObject dynamicZoomOutputSchema = outputSchemaOf(QJsonObject{
         {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
@@ -3076,6 +3135,89 @@ void McpEditorTools::registerWriteTools()
             };
         })
     }, musicRemixOutputSchema));
+
+    m_registry->registerTool(withOutputSchema({
+        QStringLiteral("dialogue_level"),
+        QStringLiteral("音声クリップの短時間ラウドネスを解析し、会話音量を平準化する音量エンベロープを生成する。kind は audio のみ。変更は Ctrl+Z / undo ツールで戻せる。"),
+        schemaWithRequired(QJsonObject{
+            {QStringLiteral("kind"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("string")},
+                {QStringLiteral("enum"), QJsonArray{QStringLiteral("audio")}}
+            }},
+            {QStringLiteral("trackIndex"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("integer")},
+                {QStringLiteral("minimum"), 0}
+            }},
+            {QStringLiteral("clipIndex"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("integer")},
+                {QStringLiteral("minimum"), 0}
+            }},
+            {QStringLiteral("targetLufs"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("number")},
+                {QStringLiteral("default"), -18.0}
+            }}
+        }, {QStringLiteral("kind"), QStringLiteral("trackIndex"),
+            QStringLiteral("clipIndex")}),
+        guardedWrite(QStringLiteral("dialogue_level"),
+                     [this](const QJsonObject &args, QString *err) -> QJsonObject {
+            if (!rejectUnknownArguments(
+                    args, {QStringLiteral("kind"), QStringLiteral("trackIndex"),
+                           QStringLiteral("clipIndex"), QStringLiteral("targetLufs")},
+                    err)) {
+                return {};
+            }
+            if (args.value(QStringLiteral("kind")).toString()
+                    != QStringLiteral("audio")) {
+                return setError(
+                           err, QStringLiteral("dialogue_level は audio のみ対応しています")),
+                       QJsonObject();
+            }
+
+            leveler::Config config;
+            if (args.contains(QStringLiteral("targetLufs"))) {
+                if (!requiredFiniteNumber(args, QStringLiteral("targetLufs"),
+                                          &config.targetShortTermLufs, err)) {
+                    return {};
+                }
+            }
+
+            ClipTarget target;
+            if (!readClipTarget(args, m_window, timeline(), &target, err))
+                return {};
+            if (!target.audio) {
+                return setError(
+                           err, QStringLiteral("dialogue_level は audio のみ対応しています")),
+                       QJsonObject();
+            }
+
+            leveler::Analysis analysis;
+            if (!analyzeDialogueClip(target.track->clips().at(target.clipIndex),
+                                     config, &analysis, err)) {
+                return {};
+            }
+            QString applyError;
+            if (!timeline()->applyDialogueLevel(
+                    target.trackIndex, target.clipIndex,
+                    analysis.envelope, &applyError)) {
+                return setError(err, applyError), QJsonObject();
+            }
+            syncSelectionAfterEdit();
+            const double measuredMin = analysis.hasMeasuredLufs
+                ? analysis.minMeasuredLufs : -70.0;
+            const double measuredMax = analysis.hasMeasuredLufs
+                ? analysis.maxMeasuredLufs : -70.0;
+            return QJsonObject{
+                {QStringLiteral("ok"), true},
+                {QStringLiteral("kind"), QStringLiteral("audio")},
+                {QStringLiteral("trackIndex"), target.trackIndex},
+                {QStringLiteral("clipIndex"), target.clipIndex},
+                {QStringLiteral("targetLufs"), config.targetShortTermLufs},
+                {QStringLiteral("pointCount"), analysis.envelope.size()},
+                {QStringLiteral("measuredLufsMin"), measuredMin},
+                {QStringLiteral("measuredLufsMax"), measuredMax}
+            };
+        })
+    }, dialogueLevelOutputSchema));
 
     QJsonObject dynamicZoomInputSchema = schemaWithRequired(
         mergedProperties(clipProperties, QJsonObject{
