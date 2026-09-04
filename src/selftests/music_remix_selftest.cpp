@@ -144,11 +144,17 @@ int runMusicRemixSelftest()
     const bool oversizedTargetRejected = !oversizedTarget.valid
         && oversizedTarget.segments.isEmpty()
         && !oversizedTarget.error.isEmpty();
+    const remix::Plan excessiveSegmentPlan = remix::planRemix(
+        {0.3, 0.6, 0.9, 1.2, 1.5, 1.8}, 2.0, 30000.0);
+    const bool excessiveSegmentPlanRejected = !excessiveSegmentPlan.valid
+        && excessiveSegmentPlan.segments.isEmpty()
+        && !excessiveSegmentPlan.error.isEmpty();
     const bool g6 = shortRejected && longRejected
-        && artificialBoundaryAverageRejected && oversizedTargetRejected;
+        && artificialBoundaryAverageRejected && oversizedTargetRejected
+        && excessiveSegmentPlanRejected;
     g6 ? pass("G6")
        : fail("G6", QStringLiteral(
-                          "unreachable target accepted: short=%1 long=%2 artificial=%3 oversized=%4")
+                          "unreachable target accepted: short=%1 long=%2 artificial=%3 oversized=%4 segments=%5")
                           .arg(shortRejected ? QStringLiteral("rejected")
                                              : QStringLiteral("accepted"))
                           .arg(longRejected ? QStringLiteral("rejected")
@@ -158,7 +164,37 @@ int runMusicRemixSelftest()
                                    : QStringLiteral("accepted"))
                           .arg(oversizedTargetRejected
                                    ? QStringLiteral("rejected")
+                                   : QStringLiteral("accepted"))
+                          .arg(excessiveSegmentPlanRejected
+                                   ? QStringLiteral("rejected")
                                    : QStringLiteral("accepted")));
+
+    if (audioTrack) {
+        remix::Plan excessiveExternalPlan;
+        excessiveExternalPlan.segments.reserve(remix::kMaxSegments + 1);
+        for (int i = 0; i <= remix::kMaxSegments; ++i)
+            excessiveExternalPlan.segments.append({0.0, 1.0});
+        excessiveExternalPlan.resultDuration = remix::kMaxSegments + 1.0;
+        QString error;
+        const bool applied = timeline.applyMusicRemix(
+            0, 0, excessiveExternalPlan, true, &error);
+        const QVector<ClipInfo> &unchanged = audioTrack->clips();
+        const bool g7 = !applied
+            && error.contains(QStringLiteral("上限"))
+            && unchanged.size() == 2
+            && unchanged[0].filePath == original.filePath
+            && qAbs(unchanged[0].inPoint - original.inPoint) <= 1.0e-9
+            && qAbs(unchanged[0].outPoint - original.outPoint) <= 1.0e-9
+            && unchanged[1].filePath == following.filePath
+            && qAbs(unchanged[1].leadInSec - following.leadInSec) <= 1.0e-9
+            && !timeline.canUndo();
+        g7 ? pass("G7")
+           : fail("G7", error.isEmpty()
+                              ? QStringLiteral("oversized external plan changed the track")
+                              : error);
+    } else {
+        fail("G7", QStringLiteral("A1 track was not available"));
+    }
 
     std::cerr << "summary: " << passed << " PASS, " << failed << " FAIL\n";
     return failed;

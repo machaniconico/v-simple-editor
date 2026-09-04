@@ -9,7 +9,6 @@ namespace remix {
 namespace {
 
 constexpr double kEpsilon = 1.0e-9;
-constexpr int kMaxRepeatedSegments = 100000;
 
 struct Interval {
     double start = 0.0;
@@ -146,8 +145,10 @@ Plan planRemix(const QVector<double> &beatTimes,
         // Repeating one interior beat interval at a time makes the result
         // deterministic and keeps every inserted boundary musical.
         while (remainingToAdd > kEpsilon) {
-            if (repeatedIntervals.size() >= kMaxRepeatedSegments) {
-                plan.error = QStringLiteral("リミックス区間数が上限を超えます");
+            if (intervals.size() + repeatedIntervals.size()
+                >= kMaxSegments) {
+                plan.error = QStringLiteral("リミックス区間数が上限 (%1) を超えます")
+                                 .arg(kMaxSegments);
                 return plan;
             }
             int bestIndex = -1;
@@ -177,6 +178,12 @@ Plan planRemix(const QVector<double> &beatTimes,
         }
         selectedIntervals += repeatedIntervals;
         selectedIntervals.append(intervals.last());
+    }
+
+    if (selectedIntervals.size() > kMaxSegments) {
+        plan.error = QStringLiteral("リミックス区間数が上限 (%1) を超えます")
+                         .arg(kMaxSegments);
+        return plan;
     }
 
     for (const Interval &interval : selectedIntervals)

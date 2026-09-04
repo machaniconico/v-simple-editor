@@ -7042,6 +7042,9 @@ bool Timeline::applyMusicRemix(int trackIndex, int clipIndex,
     if (!plan.error.isEmpty() || plan.segments.isEmpty())
         return fail(plan.error.isEmpty()
                         ? QStringLiteral("リミックス計画が空です") : plan.error);
+    if (plan.segments.size() > remix::kMaxSegments)
+        return fail(QStringLiteral("リミックス区間数が上限 (%1) を超えています")
+                        .arg(remix::kMaxSegments));
     if (!std::isfinite(plan.resultDuration) || plan.resultDuration <= 0.0)
         return fail(QStringLiteral("リミックス後の尺が不正です"));
     if (!std::isfinite(plan.crossfadeSec) || plan.crossfadeSec < 0.0)
@@ -7122,14 +7125,13 @@ bool Timeline::applyMusicRemix(int trackIndex, int clipIndex,
     replacement.last().trailOut = originalTrailOut;
 
     const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
-    // Keep the public TimelineTrack primitives as the only clip-array edit
-    // operations. The final setClips below only settles the downstream gap
-    // after the primitive replacement has completed.
-    track->removeClip(clipIndex);
-    for (int i = 0; i < replacement.size(); ++i)
-        track->insertClip(clipIndex + i, replacement.at(i));
-
-    QVector<ClipInfo> after = track->clips();
+    QVector<ClipInfo> after;
+    after.reserve(before.size() - 1 + replacement.size());
+    for (int i = 0; i < clipIndex; ++i)
+        after.append(before.at(i));
+    after += replacement;
+    for (int i = clipIndex + 1; i < before.size(); ++i)
+        after.append(before.at(i));
     const int nextIndexAfter = clipIndex + replacement.size();
     if (hasNext && nextIndexAfter < after.size() && !ripple)
         after[nextIndexAfter].leadInSec = qMax(0.0, downstreamLeadIn);
@@ -7140,6 +7142,7 @@ bool Timeline::applyMusicRemix(int trackIndex, int clipIndex,
     remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
     saveUndoState(QStringLiteral("ミュージックリミックス"));
     updateInfoLabel();
+    ensureSequenceFitsViewport();
     scheduleEmitSequenceChanged();
     return true;
 }
