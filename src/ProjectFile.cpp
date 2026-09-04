@@ -6,6 +6,7 @@
 #include "mask/ClipMask.h"
 #include "CaptionOverlayBuilder.h"
 #include "TimecodeBurnIn.h"
+#include "ShapeLayer.h"
 #include <QBuffer>
 #include <QFile>
 #include <QJsonDocument>
@@ -1811,6 +1812,12 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
     QJsonObject obj;
     obj["filePath"] = clip.filePath;
     obj["displayName"] = clip.displayName;
+    if (!clip.shapes.isEmpty()) {
+        QJsonArray shapes;
+        for (const Shape &shape : clip.shapes)
+            shapes.append(shape.toJson());
+        obj["shapes"] = shapes;
+    }
     if (!clip.sequenceRefId.isEmpty())
         obj["sequenceRefId"] = clip.sequenceRefId;
     obj["duration"] = clip.duration;
@@ -1919,6 +1926,10 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
     ClipInfo clip;
     clip.filePath = obj["filePath"].toString();
     clip.displayName = obj["displayName"].toString();
+    if (obj.contains("shapes")) {
+        for (const QJsonValue &value : obj["shapes"].toArray())
+            clip.shapes.append(Shape::fromJson(value.toObject()));
+    }
     clip.sequenceRefId = obj["sequenceRefId"].toString();
     if (clip.sequenceRefId.isEmpty())
         clip.sequenceRefId = timeline_nesting::sequenceIdFromClipFilePath(clip.filePath);

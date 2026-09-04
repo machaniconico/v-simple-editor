@@ -15,6 +15,7 @@
 #include "clipanim/ClipAnim.h"  // S1 — motion/opacity keyframe evaluation
 #include "TrackMatteKey.h"      // RM-1.1 — single shared clip-key formula
 #include "VfxFootageLibrary.h"  // VFX-C source-side black level + intensity
+#include "ShapeLayer.h"         // SHAPE-CLIP generated source-frame SSOT
 #include <cstring>              // std::memcpy (decode row copy)
 #include "playback/TrackMatteCompose16.h"
 #include "playback/TlrCompose16.h"
@@ -1381,6 +1382,9 @@ QImage renderClipSourceFrame(const Timeline *timeline,
                              const QVector3D &projectLightViewPosition,
                              bool sampleFromLeftBoundary)
 {
+    if (!clip.shapes.isEmpty())
+        return ShapeLayer::renderShapesToImage(clip.shapes, outSize);
+
     // `sampleFromLeftBoundary` carries an ancestor sequence's source-time
     // direction. Compose it with this clip's resolved local direction. The
     // special gate preserves the historic renderer exactly when no reverse
@@ -1470,16 +1474,32 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         base.fill(Qt::transparent);
     } else {
         const QVector<ClipInfo> &v1Clips = v1.clips;
-        if (v1Clips.isEmpty())
-            return QImage();
+        if (v1Clips.isEmpty()) {
+            // A shape clip may legitimately live on a selected upper track
+            // while V1 is empty. Keep the legacy no-V1 result for ordinary
+            // projects, but provide a transparent base for this opt-in case.
+            bool activeUpperShape = false;
+            for (int t = 1; t < tracks.size() && !activeUpperShape; ++t) {
+                double ignoredStart = 0.0;
+                const int idx = activeClipOnTrack(
+                    tracks[t].clips, targetSec, /*clampToFirst=*/false,
+                    &ignoredStart);
+                activeUpperShape = idx >= 0
+                    && !tracks[t].clips[idx].shapes.isEmpty();
+            }
+            if (!activeUpperShape)
+                return QImage();
+            v1NullObject = true;
+            base = QImage(outSize, QImage::Format_RGBA8888);
+            base.fill(Qt::transparent);
+        } else {
+            v1Idx = activeClipOnTrack(v1Clips, targetSec,
+                                      /*clampToFirst=*/true, &v1Start);
+            if (v1Idx < 0)
+                return QImage();
 
-        v1Idx = activeClipOnTrack(v1Clips, targetSec,
-                                  /*clampToFirst=*/true, &v1Start);
-        if (v1Idx < 0)
-            return QImage();
-
-        const ClipInfo &v1Clip = v1Clips[v1Idx];
-        v1ClipPtr = &v1Clip;
+            const ClipInfo &v1Clip = v1Clips[v1Idx];
+            v1ClipPtr = &v1Clip;
         // Timeline-second -> source-second mapping. Empty time-remap curves keep
         // the legacy inPoint + local*speed path; one-key curves resolve to the
         // constant held source time used by computePlaybackSequence.
@@ -1498,7 +1518,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
             ? clipanim::effectiveOpacityAt(v1Clip, v1LocalSec, v1Clip.opacity)
             : v1Clip.opacity;
         v1NullObject = v1Clip.isAdjustment
-            || clipgeom::isNullObjectFilePath(v1Clip.filePath);
+            || (v1Clip.shapes.isEmpty()
+                && clipgeom::isNullObjectFilePath(v1Clip.filePath));
         if (v1Clip.isAdjustment) {
             activeAdjustments.append(ActiveAdjustmentClip{0, &v1Clip, v1LocalSec});
             v1EffectiveOpacity = 0.0;
@@ -1595,6 +1616,7 @@ QImage renderFrameFromTracks(const Timeline *timeline,
                   v1Transform,
                   outSize, /*smooth=*/true);
         }
+        }
     }
     const ClipInfo &v1Clip = *v1ClipPtr;
 
@@ -1682,7 +1704,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
             activeAdjustments.append(ActiveAdjustmentClip{t, &c, localSec});
             continue;
         }
-        const bool cNullObject = clipgeom::isNullObjectFilePath(c.filePath);
+        const bool cNullObject = c.shapes.isEmpty()
+            && clipgeom::isNullObjectFilePath(c.filePath);
         if (cNullObject) {
             RenderLayer renderLayer;
             renderLayer.clipId =

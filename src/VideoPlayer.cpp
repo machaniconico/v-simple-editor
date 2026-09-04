@@ -385,6 +385,12 @@ bool isAdjustmentEntry(const Timeline *timeline, const PlaybackEntry &entry)
     return clip && clip->isAdjustment;
 }
 
+bool isShapeClipEntry(const Timeline *timeline, const PlaybackEntry &entry)
+{
+    const ClipInfo *clip = clipForPlaybackEntry(timeline, entry);
+    return clip && !clip->shapes.isEmpty();
+}
+
 const ClipInfo *activeClipOnTrack(const QVector<ClipInfo> &clips,
                                   double targetSec)
 {
@@ -418,6 +424,21 @@ bool timelineHasActiveSequenceReference(const Timeline *timeline, qint64 timelin
         if (!track || track->isHidden())
             continue;
         if (trackHasActiveSequenceReference(track->clips(), targetSec))
+            return true;
+    }
+    return false;
+}
+
+bool timelineHasActiveShapeClip(const Timeline *timeline, qint64 timelineUsec)
+{
+    if (!timeline)
+        return false;
+    const double targetSec = static_cast<double>(timelineUsec) / AV_TIME_BASE;
+    for (const TimelineTrack *track : timeline->videoTracks()) {
+        if (!track || track->isHidden())
+            continue;
+        const ClipInfo *clip = activeClipOnTrack(track->clips(), targetSec);
+        if (clip && !clip->shapes.isEmpty())
             return true;
     }
     return false;
@@ -500,7 +521,8 @@ int previewPrimaryEntryIndexAt(const Timeline *timeline,
     auto usableMediaEntry = [&](int idx) {
         return idx >= 0 && idx < sequence.size()
             && !isAdjustmentEntry(timeline, sequence.at(idx))
-            && !isNullObjectEntry(sequence.at(idx));
+            && (!isNullObjectEntry(sequence.at(idx))
+                || isShapeClipEntry(timeline, sequence.at(idx)));
     };
     if (usableMediaEntry(preferredIdx))
         return preferredIdx;
@@ -2064,7 +2086,10 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries,
     desiredIdx = previewPrimaryEntryIndexAt(timeline, m_sequence, desiredIdx, clamped);
 
     const auto &target = m_sequence[desiredIdx];
-    const bool needFileSwitch = (target.filePath != m_loadedFilePath) || !m_formatCtx;
+    const bool shapePreviewActive = timelineHasActiveShapeClip(timeline, clamped);
+    const bool targetIsShapeClip = isShapeClipEntry(timeline, target);
+    const bool needFileSwitch = !targetIsShapeClip
+        && ((target.filePath != m_loadedFilePath) || !m_formatCtx);
     const ReversePlaybackKey targetKey = playbackEntryKey(target);
     const bool reverseStateChanged = previousReverseStates.contains(targetKey)
         && previousReverseStates.value(targetKey)
@@ -2094,7 +2119,7 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries,
     // the mixer and cause audible artifacts.
     const bool entryStructurallyChanged = needFileSwitch
         || (m_activeEntry != desiredIdx) || reverseStateChanged
-        || sourceMappingChanged;
+        || sourceMappingChanged || shapePreviewActive;
 
     // Snapshot playback state BEFORE loadFile+resetDecoder tear down the
     // playback timer, so we can resurrect it after the file swap completes.
@@ -2122,7 +2147,8 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries,
 
     if (entryStructurallyChanged) {
         const bool nestedSequencePreview =
-            timelineHasActiveReversedSequenceReference(timeline, clamped);
+            timelineHasActiveReversedSequenceReference(timeline, clamped)
+            || shapePreviewActive;
         const int64_t localUs = decodableSourcePositionUs(
             timeline, target, clamped,
             entryLocalPositionUs(desiredIdx, clamped),
@@ -2406,7 +2432,8 @@ int64_t VideoPlayer::fileLocalToTimelineUs(int entryIdx, int64_t fileLocalUs) co
 bool VideoPlayer::displayNestedSequenceFrameAt(const Timeline *timeline,
                                                int64_t timelineUs)
 {
-    if (!timelineHasActiveReversedSequenceReference(timeline, timelineUs))
+    if (!timelineHasActiveReversedSequenceReference(timeline, timelineUs)
+        && !timelineHasActiveShapeClip(timeline, timelineUs))
         return false;
     QSize renderSize = m_projectOutputSize.isValid()
         ? m_projectOutputSize
@@ -2457,7 +2484,9 @@ bool VideoPlayer::seekToTimelineUs(int64_t timelineUs, bool precise)
     if (idx < 0 || idx >= m_sequence.size()) return false;
 
     const auto &e = m_sequence[idx];
-    const bool needSwitch = (e.filePath != m_loadedFilePath) || !m_formatCtx;
+    const bool targetIsShapeClip = isShapeClipEntry(previewTimeline(), e);
+    const bool needSwitch = !targetIsShapeClip
+        && ((e.filePath != m_loadedFilePath) || !m_formatCtx);
     // Freeze UI updates across the loadFile → seek chain so the slider
     // doesn't flash back to 0 while the intermediate seekInternal(0) runs
     // inside loadFile. We explicitly call updatePositionUi at the end.
@@ -2487,7 +2516,8 @@ bool VideoPlayer::seekToTimelineUs(int64_t timelineUs, bool precise)
     const Timeline *previewTimeline = this->previewTimeline();
     const bool nestedSequencePreview =
         timelineHasActiveReversedSequenceReference(
-            previewTimeline, timelineUs);
+            previewTimeline, timelineUs)
+        || timelineHasActiveShapeClip(previewTimeline, timelineUs);
     const int64_t localUs = decodableSourcePositionUs(
         previewTimeline, e, timelineUs,
         entryLocalPositionUs(idx, timelineUs),
@@ -2495,6 +2525,8 @@ bool VideoPlayer::seekToTimelineUs(int64_t timelineUs, bool precise)
     bool ok = seekInternal(localUs, !nestedSequencePreview, precise);
     const bool nestedSequenceRendered = nestedSequencePreview
         && displayNestedSequenceFrameAt(previewTimeline, timelineUs);
+    if (nestedSequenceRendered)
+        ok = true;
     if (nestedSequencePreview) {
         if (!nestedSequenceRendered) {
             // Keep the historic flattened-frame fallback when the nested
@@ -2558,7 +2590,9 @@ bool VideoPlayer::advanceToEntry(int newEntryIdx)
             << "clipIn=" << next.clipIn;
 
     const bool wasPlaying = m_playing;
-    const bool needSwitch = (next.filePath != m_loadedFilePath);
+    const bool targetIsShapeClip = isShapeClipEntry(previewTimeline(), next);
+    const bool needSwitch = !targetIsShapeClip
+        && (next.filePath != m_loadedFilePath);
     // Suppress intermediate UI updates across the loadFile → seek chain so the
     // slider doesn't flash back to 0 while resetDecoder/seekInternal(0) inside
     // loadFile temporarily clear the slider range.
@@ -2607,12 +2641,15 @@ bool VideoPlayer::advanceToEntry(int newEntryIdx)
         m_frameDurationUs, &m_reverseStates);
     const bool nestedSequencePreview =
         timelineHasActiveReversedSequenceReference(
-            previewTimeline, m_timelinePositionUs);
+            previewTimeline, m_timelinePositionUs)
+        || timelineHasActiveShapeClip(previewTimeline, m_timelinePositionUs);
     bool seekOk = seekInternal(
         startLocalUs, !nestedSequencePreview, true);
     const bool nestedSequenceRendered = nestedSequencePreview
         && displayNestedSequenceFrameAt(
             previewTimeline, m_timelinePositionUs);
+    if (nestedSequenceRendered)
+        seekOk = true;
     if (nestedSequencePreview && !nestedSequenceRendered)
         seekOk = seekInternal(startLocalUs, true, true);
     if (m_glPreview && nestedSequenceRendered)
@@ -2900,7 +2937,9 @@ void VideoPlayer::play()
             << "speed=" << m_playbackSpeed
             << "tlPos=" << m_timelinePositionUs
             << "activeEntry=" << m_activeEntry;
-    if (!m_formatCtx || !m_codecCtx) {
+    const bool shapeTimelinePreview = sequenceActive()
+        && timelineHasActiveShapeClip(previewTimeline(), m_timelinePositionUs);
+    if ((!m_formatCtx || !m_codecCtx) && !shapeTimelinePreview) {
         qWarning() << "VideoPlayer::play() no decoder, abort";
         return;
     }
@@ -5215,7 +5254,9 @@ bool VideoPlayer::seekInternal(int64_t positionUs, bool displayFrame, bool preci
         const bool reverseTimelineDriven = activeReversed
             || timelineHasActiveReversedSequenceReference(
                 previewTimeline, m_timelinePositionUs);
-        if (reverseTimelineDriven) {
+        const bool shapeTimelineDriven = timelineHasActiveShapeClip(
+            previewTimeline, m_timelinePositionUs);
+        if (reverseTimelineDriven || shapeTimelineDriven) {
             // The normal streaming path fills these caches in
             // presentDecodedFrame(). Reverse playback seeks instead, so keep
             // the compositor's V1 source current here as well.
@@ -6005,7 +6046,8 @@ void VideoPlayer::handlePlaybackTick()
     const bool nestedSequenceActive =
         m_playbackSpeed >= 0.0
         && sequenceActive()
-        && timelineHasActiveSequenceReference(previewTimeline, m_timelinePositionUs);
+        && (timelineHasActiveSequenceReference(previewTimeline, m_timelinePositionUs)
+            || timelineHasActiveShapeClip(previewTimeline, m_timelinePositionUs));
     const bool forceProjectOutputComposite =
         m_projectOutputSize.isValid() && !activeForComposite.isEmpty();
     const bool willComposite = m_playbackSpeed >= 0.0
@@ -6167,15 +6209,20 @@ void VideoPlayer::handlePlaybackTick()
                 m_sequence[m_activeEntry].timelineEnd * AV_TIME_BASE);
             const int64_t targetTimelineUs = qMin(
                 entryEndUs, m_timelinePositionUs + deltaUs);
-            const int64_t targetSourceUs = decodableSourcePositionUs(
-                previewTimeline, m_sequence[m_activeEntry], targetTimelineUs,
-                entryLocalPositionUs(m_activeEntry, targetTimelineUs),
-                m_frameDurationUs, &m_reverseStates);
-            // seekInternal publishes positionChanged before returning. Move
-            // the canonical timeline cursor first so reverse playback never
-            // emits the previous tick position immediately before the new one.
+            const int64_t previousTimelineUs = m_timelinePositionUs;
             m_timelinePositionUs = targetTimelineUs;
-            advanced = seekInternal(targetSourceUs, true, true);
+            if (reverseTimelineDriven) {
+                const int64_t targetSourceUs = decodableSourcePositionUs(
+                    previewTimeline, m_sequence[m_activeEntry], targetTimelineUs,
+                    entryLocalPositionUs(m_activeEntry, targetTimelineUs),
+                    m_frameDurationUs, &m_reverseStates);
+                // seekInternal publishes positionChanged before returning.
+                advanced = seekInternal(targetSourceUs, true, true);
+            } else {
+                // Shape clips have no decoder. Advance the timeline clock and
+                // let the compositor below obtain the frame from renderFrameAt.
+                advanced = targetTimelineUs > previousTimelineUs;
+            }
             forceTimelineUiToCurrent();
             if (traceTick)
                 m_tickTraceDecodeNs += tickTimer.nsecsElapsed() - sectionMark;

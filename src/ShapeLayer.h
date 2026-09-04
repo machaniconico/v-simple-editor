@@ -135,6 +135,11 @@ public:
     // Render all shapes onto a transparent QImage
     QImage renderShapes(const QSize &canvasSize) const;
 
+    // Shape-clip preview/export SSOT. Renders the supplied shapes onto a
+    // transparent canvas without requiring a mutable ShapeLayer instance.
+    static QImage renderShapesToImage(const QVector<Shape> &shapes,
+                                      const QSize &canvasSize);
+
     // Render a single shape using the given painter
     static void renderShape(const Shape &shape, QPainter &painter);
 

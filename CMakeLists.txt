@@ -287,6 +287,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/whisper_guide_selftest.cpp
     src/selftests/dialogue_leveler_selftest.cpp
     src/selftests/safe_zone_selftest.cpp
+    src/selftests/shape_clip_selftest.cpp
     src/selftests/StillCompareSelftest.cpp
     src/selftests/onion_skin_selftests.cpp
     src/SafeZone.h

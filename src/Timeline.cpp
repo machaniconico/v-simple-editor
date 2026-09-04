@@ -8738,6 +8738,31 @@ void Timeline::overwriteClip3PointActive(double timelineStartSec, const ClipInfo
     saveUndoState("3点編集: 上書き");
 }
 
+bool Timeline::insertShapeClipAtPlayhead(const ClipInfo &clip)
+{
+    if (clip.shapes.isEmpty() || m_videoTracks.isEmpty())
+        return false;
+
+    TimelineTrack *track = nullptr;
+    if (m_activeVideoTrackIndex >= 0
+        && m_activeVideoTrackIndex < m_videoTracks.size()) {
+        track = m_videoTracks[m_activeVideoTrackIndex];
+    }
+    if (!track)
+        track = m_videoTracks.first();
+    if (!track || track->isLocked())
+        return false;
+
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    track->insertClip3Point(qMax(0.0, m_playheadPos), clip);
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+    saveUndoState(QStringLiteral("シェイプクリップを挿入"));
+    updateInfoLabel();
+    scheduleEmitSequenceChanged();
+    return true;
+}
+
 void Timeline::rippleDeleteTimeRangeActive(double startSec, double endSec)
 {
     if (m_videoTracks.isEmpty())

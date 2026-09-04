@@ -42,6 +42,7 @@
 #include "MaskSystem.h"      // S7: per-clip mask container (additive seam)
 #include "MotionTracker.h"   // S7: per-clip tracker data animating the mask
 #include "TimeRemap.h"
+#include "ShapeLayer.h"
 
 // Where Timeline::addClip drops a freshly-imported clip. Persisted via
 // QSettings('VSimpleEditor','Preferences')/importPlacement; the MainWindow
@@ -164,6 +165,9 @@ QString buildExportAudioMixEntryFilterChain(int inputIndex,
 struct ClipInfo {
     QString filePath;
     QString displayName;
+    // SHAPE-CLIP: non-empty means this is a generated, media-less shape clip.
+    // Empty is the legacy/default state and is omitted from project JSON.
+    QVector<Shape> shapes;
     // EPIC-7/NEST-1: empty for normal media clips. When populated, this clip
     // is a timeline reference to a named sequence stored in Timeline's
     // sequence model; filePath uses a veditor://sequence/<id> URI only as a
@@ -934,6 +938,11 @@ public:
     // 配置し、saveUndoState で 1 操作 = 1 Undo にまとめる。
     void insertClip3PointActive(double timelineStartSec, const ClipInfo &clip);
     void overwriteClip3PointActive(double timelineStartSec, const ClipInfo &clip);
+
+    // Insert a five-second media-less shape clip on the selected video track
+    // at the current playhead. Returns false when no usable track/shape exists.
+    // The complete mutation is recorded as exactly one undo operation.
+    bool insertShapeClipAtPlayhead(const ClipInfo &clip);
 
     // TB-3: アクティブ動画トラック (m_activeVideoTrackIndex、無ければ先頭 V1) の
     // タイムライン時間範囲 [startSec, endSec) をリップル削除する薄いラッパー。

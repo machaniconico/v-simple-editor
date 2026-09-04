@@ -4725,6 +4725,12 @@ void MainWindow::setupMenuBar()
     m_menuHelpEntries.append({addAdjustmentAction,
         QStringLiteral("その下にある全部の映像にまとめて色補正やエフェクトをかけられる特別なレイヤーを追加します。")});
 
+    auto *addShapeClipAction = insertMenu->addAction(QStringLiteral("シェイプクリップ"));
+    connect(addShapeClipAction, &QAction::triggered,
+            this, &MainWindow::addShapeLayer);
+    m_menuHelpEntries.append({addShapeClipAction,
+        QStringLiteral("選択中の動画トラックへ、図形を描画する5秒のクリップを挿入します。")});
+
     // US-AETEXT-12: AE Text Parity — 11 new menu actions
     insertMenu->addSeparator();
 
@@ -12560,13 +12566,22 @@ void MainWindow::analyzeHighlights()
 
 void MainWindow::addShapeLayer()
 {
-    QStringList shapes = {"Rectangle", "Rounded Rectangle", "Ellipse", "Polygon", "Star", "Line", "Arrow"};
+    const QStringList shapes = {
+        QStringLiteral("長方形"),
+        QStringLiteral("角丸長方形"),
+        QStringLiteral("楕円"),
+        QStringLiteral("多角形"),
+        QStringLiteral("星形"),
+        QStringLiteral("線"),
+        QStringLiteral("矢印")
+    };
     bool ok;
-    QString selected = QInputDialog::getItem(this, "Add Shape Layer",
-        "Shape type:", shapes, 0, false, &ok);
-    if (!ok) return;
+    const QString selected = QInputDialog::getItem(
+        this, QStringLiteral("シェイプクリップを追加"),
+        QStringLiteral("シェイプの種類:"), shapes, 0, false, &ok);
+    if (!ok)
+        return;
 
-    ShapeLayer shapeLayer;
     ShapeFill fill;
     fill.color = QColor(65, 105, 225); // Royal blue
     fill.enabled = true;
@@ -12575,15 +12590,57 @@ void MainWindow::addShapeLayer()
     stroke.width = 2.0;
     stroke.enabled = true;
 
-    if (selected == "Star") {
-        shapeLayer.addShape(ShapeLayer::createStar(5, 80, 40, fill, stroke));
-    } else if (selected == "Ellipse") {
-        shapeLayer.addShape(ShapeLayer::createCircle(60, fill, stroke));
+    Shape shape;
+    if (selected == QStringLiteral("星形")) {
+        shape = ShapeLayer::createStar(5, 80, 40, fill, stroke);
+    } else if (selected == QStringLiteral("楕円")) {
+        shape = ShapeLayer::createCircle(60, fill, stroke);
+    } else if (selected == QStringLiteral("角丸長方形")) {
+        shape = ShapeLayer::createRectangle(QSizeF(200, 120), fill, stroke);
+        shape.type = ShapeType::RoundedRect;
+        shape.properties.cornerRadius = 24.0;
+        shape.name = QStringLiteral("角丸長方形");
+    } else if (selected == QStringLiteral("多角形")) {
+        shape.type = ShapeType::Polygon;
+        shape.properties.radius = 80.0;
+        shape.properties.sides = 6;
+        shape.fill = fill;
+        shape.stroke = stroke;
+        shape.name = QStringLiteral("多角形");
+    } else if (selected == QStringLiteral("線")) {
+        shape.type = ShapeType::Line;
+        shape.properties.startPoint = QPointF(-100.0, 0.0);
+        shape.properties.endPoint = QPointF(100.0, 0.0);
+        shape.fill.enabled = false;
+        shape.stroke = stroke;
+        shape.name = QStringLiteral("線");
+    } else if (selected == QStringLiteral("矢印")) {
+        shape = ShapeLayer::createArrow(
+            QPointF(-100.0, 0.0), QPointF(100.0, 0.0), 20.0, stroke);
+        shape.name = QStringLiteral("矢印");
     } else {
-        shapeLayer.addShape(ShapeLayer::createRectangle(QSizeF(200, 120), fill, stroke));
+        shape = ShapeLayer::createRectangle(QSizeF(200, 120), fill, stroke);
     }
 
-    statusBar()->showMessage(QString("Added shape layer: %1").arg(selected));
+    shape.position = QPointF(m_projectConfig.width * 0.5,
+                             m_projectConfig.height * 0.5);
+
+    ClipInfo clip;
+    clip.displayName = QStringLiteral("シェイプ: %1").arg(selected);
+    clip.duration = 5.0;
+    clip.inPoint = 0.0;
+    clip.outPoint = 5.0;
+    clip.shapes.append(shape);
+
+    if (!m_timeline || !m_timeline->insertShapeClipAtPlayhead(clip)) {
+        QMessageBox::warning(this, QStringLiteral("シェイプクリップ"),
+                             QStringLiteral("シェイプクリップを挿入できる動画トラックがありません。"));
+        return;
+    }
+
+    statusBar()->showMessage(
+        QStringLiteral("シェイプクリップを追加しました: %1").arg(selected),
+        4000);
 }
 
 void MainWindow::addParticleEffect()

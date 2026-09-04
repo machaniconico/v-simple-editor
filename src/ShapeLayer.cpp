@@ -486,6 +486,15 @@ void ShapeLayer::renderShape(const Shape &shape, QPainter &painter)
 
 QImage ShapeLayer::renderShapes(const QSize &canvasSize) const
 {
+    return renderShapesToImage(m_shapes, canvasSize);
+}
+
+QImage ShapeLayer::renderShapesToImage(const QVector<Shape> &shapes,
+                                       const QSize &canvasSize)
+{
+    if (canvasSize.isEmpty())
+        return QImage();
+
     QImage image(canvasSize, QImage::Format_ARGB32_Premultiplied);
     image.fill(Qt::transparent);
 
@@ -493,7 +502,7 @@ QImage ShapeLayer::renderShapes(const QSize &canvasSize) const
     painter.setRenderHint(QPainter::Antialiasing, true);
     painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
 
-    for (const Shape &shape : m_shapes)
+    for (const Shape &shape : shapes)
         renderShape(shape, painter);
 
     painter.end();
