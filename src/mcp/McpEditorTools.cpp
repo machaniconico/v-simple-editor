@@ -273,6 +273,7 @@ QJsonObject clipOutputItemSchema()
         {QStringLiteral("outPointSec"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
         {QStringLiteral("speed"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
         {QStringLiteral("reversed"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("autoOrient"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
         {QStringLiteral("volume"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
         {QStringLiteral("opacity"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
         {QStringLiteral("label"), QJsonObject{
@@ -293,7 +294,8 @@ QJsonObject clipOutputItemSchema()
         QStringLiteral("filePath"), QStringLiteral("startSec"),
         QStringLiteral("durationSec"), QStringLiteral("inPointSec"),
         QStringLiteral("outPointSec"), QStringLiteral("speed"),
-        QStringLiteral("reversed"), QStringLiteral("volume"),
+        QStringLiteral("reversed"), QStringLiteral("autoOrient"),
+        QStringLiteral("volume"),
         QStringLiteral("opacity"), QStringLiteral("label"),
         QStringLiteral("linkGroup"), QStringLiteral("selected"),
         QStringLiteral("leadIn"), QStringLiteral("trailOut"),
@@ -882,6 +884,7 @@ QJsonObject clipToJson(const ClipInfo& clip, int clipIndex, double startSec,
         {QStringLiteral("outPointSec"), outPoint},
         {QStringLiteral("speed"), clip.speed},
         {QStringLiteral("reversed"), clip.reversed},
+        {QStringLiteral("autoOrient"), clip.autoOrientEnabled},
         {QStringLiteral("volume"), clip.volume},
         {QStringLiteral("opacity"), clip.opacity},
         {QStringLiteral("label"), clipLabelToString(clip.label)},
@@ -2972,7 +2975,7 @@ void McpEditorTools::registerWriteTools()
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("set_clip_property"),
-        QStringLiteral("指定クリップのプロパティを設定する。property と有効範囲: volume 0..2、opacity 0..1、speed 0.25..4、pan -1..1、videoScale 0.1..10、reversed true/false。speed と reversed は同じ linkGroup の映像・音声にも同時に適用する (応答の linkedApplied)。現在値は get_timeline で確認でき、Ctrl+Z / undo ツールで戻せる。"),
+        QStringLiteral("指定クリップのプロパティを設定する。property と有効範囲: volume 0..2、opacity 0..1、speed 0.25..4、pan -1..1、videoScale 0.1..10、reversed true/false、autoOrient true/false。speed と reversed は同じ linkGroup の映像・音声にも同時に適用する (応答の linkedApplied)。現在値は get_timeline で確認でき、Ctrl+Z / undo ツールで戻せる。"),
         schemaWithRequired(mergedProperties(clipProperties, QJsonObject{
             {QStringLiteral("property"), QJsonObject{
                 {QStringLiteral("type"), QStringLiteral("string")},
@@ -2980,10 +2983,11 @@ void McpEditorTools::registerWriteTools()
                 {QStringLiteral("enum"), QJsonArray{
                     QStringLiteral("volume"), QStringLiteral("opacity"),
                     QStringLiteral("speed"), QStringLiteral("pan"),
-                    QStringLiteral("videoScale"), QStringLiteral("reversed")
+                    QStringLiteral("videoScale"), QStringLiteral("reversed"),
+                    QStringLiteral("autoOrient")
                 }},
                 {QStringLiteral("description"),
-                 QStringLiteral("設定対象。volume / opacity / speed / pan / videoScale / reversed")}
+                 QStringLiteral("設定対象。volume / opacity / speed / pan / videoScale / reversed / autoOrient")}
             }},
             {QStringLiteral("value"), QJsonObject{
                 {QStringLiteral("oneOf"), QJsonArray{
@@ -2991,7 +2995,7 @@ void McpEditorTools::registerWriteTools()
                     QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}
                 }},
                 {QStringLiteral("description"),
-                 QStringLiteral("property に応じた値。reversed は boolean、それ以外は number。")}
+                 QStringLiteral("property に応じた値。reversed / autoOrient は boolean、それ以外は number。")}
             }}
         }), {QStringLiteral("clipIndex"), QStringLiteral("property"), QStringLiteral("value")}),
         guardedWrite(QStringLiteral("set_clip_property"),
@@ -3006,15 +3010,19 @@ void McpEditorTools::registerWriteTools()
             if (!requiredString(args, QStringLiteral("property"), &property, err))
                 return {};
             const bool isReversedProperty = property == QStringLiteral("reversed");
+            const bool isAutoOrientProperty = property == QStringLiteral("autoOrient");
+            const bool isBooleanProperty = isReversedProperty || isAutoOrientProperty;
             double value = 0.0;
-            bool reversedValue = false;
-            if (isReversedProperty) {
+            bool booleanValue = false;
+            if (isBooleanProperty) {
                 const QJsonValue rawValue = args.value(QStringLiteral("value"));
                 if (!rawValue.isBool()) {
-                    return setError(err, QStringLiteral("value must be a boolean for reversed")),
+                    return setError(
+                               err,
+                               QStringLiteral("value must be a boolean for %1").arg(property)),
                            QJsonObject();
                 }
-                reversedValue = rawValue.toBool();
+                booleanValue = rawValue.toBool();
             } else if (!requiredFiniteNumber(args, QStringLiteral("value"), &value, err)) {
                 return {};
             }
@@ -3032,8 +3040,15 @@ void McpEditorTools::registerWriteTools()
                 if (!currentTimeline->setClipReversed(
                         target.audio ? TrackKind::Audio : TrackKind::Video,
                         target.trackIndex, target.clipIndex,
-                        reversedValue, /*applyToLinked=*/true)) {
+                        booleanValue, /*applyToLinked=*/true)) {
                     return setError(err, QStringLiteral("clip reverse update failed")),
+                           QJsonObject();
+                }
+            } else if (isAutoOrientProperty) {
+                if (!currentTimeline->setClipAutoOrientEnabled(
+                        target.audio ? TrackKind::Audio : TrackKind::Video,
+                        target.trackIndex, target.clipIndex, booleanValue)) {
+                    return setError(err, QStringLiteral("clip auto-orient update failed")),
                            QJsonObject();
                 }
             } else if (!currentTimeline->setClipPropertyByIndex(
@@ -3045,8 +3060,8 @@ void McpEditorTools::registerWriteTools()
             return QJsonObject{
                 {QStringLiteral("ok"), true},
                 {QStringLiteral("property"), property},
-                {QStringLiteral("value"), isReversedProperty
-                    ? QJsonValue(reversedValue) : QJsonValue(value)},
+                {QStringLiteral("value"), isBooleanProperty
+                    ? QJsonValue(booleanValue) : QJsonValue(value)},
                 {QStringLiteral("linkedApplied"), applyToLinked}
             };
         })

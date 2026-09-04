@@ -202,6 +202,7 @@ struct ClipInfo {
     Layer3DTransform layer3D;
     LayerMaterial material;
     bool motionBlurEnabled = false;
+    bool autoOrientEnabled = false;
 
     // Future multi-track compositing groundwork. 1.0 = opaque (current
     // V1-wins behaviour). <1.0 values are placeholders until the layered
@@ -690,6 +691,8 @@ public:
                                 bool applyToLinked = false);
     bool setClipReversed(TrackKind kind, int trackIndex, int clipIndex,
                          bool reversed, bool applyToLinked = true);
+    bool setClipAutoOrientEnabled(TrackKind kind, int trackIndex, int clipIndex,
+                                  bool enabled);
     // タイムライン時刻からソース時刻を引く。選択中の動画トラックを優先し、
     // 該当しなければ V1 を検索する。ClipInfo の共通 speed/reverse/remap 写像を使う。
     bool matchFrame(double timelineSec, MatchFrameResult *result,

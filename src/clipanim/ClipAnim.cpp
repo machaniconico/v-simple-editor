@@ -277,6 +277,86 @@ QPointF cubicPoint(const QPointF& p0,
                    a * p0.y() + b * c1.y() + c * c2.y() + d * p1.y());
 }
 
+QPointF cubicTangent(const QPointF& p0,
+                     const QPointF& c1,
+                     const QPointF& c2,
+                     const QPointF& p1,
+                     double u)
+{
+    const double omt = 1.0 - u;
+    return 3.0 * omt * omt * (c1 - p0)
+        + 6.0 * omt * u * (c2 - c1)
+        + 3.0 * u * u * (p1 - c2);
+}
+
+struct SpatialSegmentEvaluation {
+    QPointF p0;
+    QPointF c1;
+    QPointF c2;
+    QPointF p1;
+    double u = 0.0;
+    bool hasSpatialTangents = false;
+};
+
+bool evaluateSpatialSegment(const ClipInfo& clip,
+                            const KeyframeTrack *xTrack,
+                            const KeyframeTrack *yTrack,
+                            const QVector<double>& times,
+                            double pathSeconds,
+                            SpatialSegmentEvaluation *evaluation)
+{
+    int segment = -1;
+    for (int i = 0; i < times.size() - 1; ++i) {
+        if (pathSeconds + kKeyTimeEpsilon >= times[i]
+            && pathSeconds - kKeyTimeEpsilon <= times[i + 1]) {
+            segment = i;
+            break;
+        }
+    }
+    if (segment < 0)
+        return false;
+
+    const double startTime = times[segment];
+    const double endTime = times[segment + 1];
+    if (!(endTime > startTime))
+        return false;
+
+    const KeyframePoint *xStart = keyframeAtTime(xTrack, startTime);
+    const KeyframePoint *yStart = keyframeAtTime(yTrack, startTime);
+    const KeyframePoint *xEnd = keyframeAtTime(xTrack, endTime);
+    const KeyframePoint *yEnd = keyframeAtTime(yTrack, endTime);
+
+    SpatialSegmentEvaluation result;
+    result.hasSpatialTangents = hasUsableSpatialTangent(xStart)
+        || hasUsableSpatialTangent(yStart)
+        || hasUsableSpatialTangent(xEnd)
+        || hasUsableSpatialTangent(yEnd);
+    result.p0 = QPointF(trackValueAt(xTrack, startTime, clip.videoDx),
+                        trackValueAt(yTrack, startTime, clip.videoDy));
+    result.p1 = QPointF(trackValueAt(xTrack, endTime, clip.videoDx),
+                        trackValueAt(yTrack, endTime, clip.videoDy));
+    if (!finitePoint(result.p0) || !finitePoint(result.p1))
+        return false;
+
+    const QPointF out = outgoingSpatialTangent(xStart, yStart);
+    const QPointF in = incomingSpatialTangent(xEnd, yEnd);
+    result.c1 = result.p0 + out;
+    result.c2 = result.p1 + in;
+    if (!finitePoint(result.c1) || !finitePoint(result.c2))
+        return false;
+
+    result.u = (pathSeconds - startTime) / (endTime - startTime);
+    result.u = std::max(0.0, std::min(1.0, result.u));
+    const KeyframePoint *easeKeyframe = xStart ? xStart : yStart;
+    result.u = easedProgress(result.u, easeKeyframe);
+    if (!std::isfinite(result.u))
+        return false;
+
+    if (evaluation)
+        *evaluation = result;
+    return true;
+}
+
 bool spatialLoopApplies(const ClipInfo& clip, const QString& trackName)
 {
     const LoopMode mode = clip.keyframes.loopOutMode(trackName);
@@ -293,6 +373,27 @@ double spatialPathLocalSecondsForTrack(const ClipInfo& clip,
     if (spatialLoopApplies(clip, trackName))
         return clip.keyframes.loopedTimeForTrack(trackName, clipLocalSeconds);
     return clipLocalSeconds;
+}
+
+double spatialPathDirectionForTrack(const ClipInfo& clip,
+                                    const QString& trackName,
+                                    double clipLocalSeconds)
+{
+    if (clip.keyframes.loopOutMode(trackName) != LoopMode::PingPong)
+        return 1.0;
+    const KeyframeTrack *track = clip.keyframes.track(trackName);
+    if (!track || track->count() < 2)
+        return 1.0;
+    const QVector<KeyframePoint>& keyframes = track->keyframes();
+    const double firstTime = keyframes.first().time;
+    const double lastTime = keyframes.last().time;
+    const double range = lastTime - firstTime;
+    if (clipLocalSeconds <= lastTime || !std::isfinite(range) || range <= 0.0)
+        return 1.0;
+    double phase = std::fmod(clipLocalSeconds - firstTime, 2.0 * range);
+    if (phase < 0.0)
+        phase += 2.0 * range;
+    return phase > range ? -1.0 : 1.0;
 }
 
 double clampedAnimatedParamValue(const effectctrl::ParamDef& def, double value)
@@ -403,54 +504,15 @@ bool spatialPositionAt(const ClipInfo& clip,
 
     const auto evaluateSpatialPointAt = [&](double pathSeconds,
                                              QPointF *result) {
-        int segment = -1;
-        for (int i = 0; i < times.size() - 1; ++i) {
-            if (pathSeconds + kKeyTimeEpsilon >= times[i]
-                && pathSeconds - kKeyTimeEpsilon <= times[i + 1]) {
-                segment = i;
-                break;
-            }
-        }
-        if (segment < 0)
-            return false;
-
-        const double startTime = times[segment];
-        const double endTime = times[segment + 1];
-        if (!(endTime > startTime))
-            return false;
-
-        const KeyframePoint *xStart = keyframeAtTime(xTrack, startTime);
-        const KeyframePoint *yStart = keyframeAtTime(yTrack, startTime);
-        const KeyframePoint *xEnd = keyframeAtTime(xTrack, endTime);
-        const KeyframePoint *yEnd = keyframeAtTime(yTrack, endTime);
-
-        if (!hasUsableSpatialTangent(xStart)
-            && !hasUsableSpatialTangent(yStart)
-            && !hasUsableSpatialTangent(xEnd)
-            && !hasUsableSpatialTangent(yEnd)) {
+        SpatialSegmentEvaluation evaluation;
+        if (!evaluateSpatialSegment(clip, xTrack, yTrack, times,
+                                    pathSeconds, &evaluation)
+            || !evaluation.hasSpatialTangents) {
             return false;
         }
-
-        const QPointF p0(trackValueAt(xTrack, startTime, clip.videoDx),
-                         trackValueAt(yTrack, startTime, clip.videoDy));
-        const QPointF p1(trackValueAt(xTrack, endTime, clip.videoDx),
-                         trackValueAt(yTrack, endTime, clip.videoDy));
-        if (!finitePoint(p0) || !finitePoint(p1))
-            return false;
-
-        const QPointF out = outgoingSpatialTangent(xStart, yStart);
-        const QPointF in = incomingSpatialTangent(xEnd, yEnd);
-        const QPointF c1(p0.x() + out.x(), p0.y() + out.y());
-        const QPointF c2(p1.x() + in.x(), p1.y() + in.y());
-        if (!finitePoint(c1) || !finitePoint(c2))
-            return false;
-
-        double u = (pathSeconds - startTime) / (endTime - startTime);
-        u = std::max(0.0, std::min(1.0, u));
-        const KeyframePoint *easeKeyframe = xStart ? xStart : yStart;
-        u = easedProgress(u, easeKeyframe);
-
-        const QPointF evaluated = cubicPoint(p0, c1, c2, p1, u);
+        const QPointF evaluated = cubicPoint(
+            evaluation.p0, evaluation.c1, evaluation.c2, evaluation.p1,
+            evaluation.u);
         if (!finitePoint(evaluated))
             return false;
         if (result)
@@ -513,6 +575,68 @@ QPointF effectivePositionAt(const ClipInfo& clip,
     return position;
 }
 
+bool spatialTangentAt(const ClipInfo& clip,
+                      double clipLocalSeconds,
+                      QPointF *tangent)
+{
+    const QString& posXName =
+        resolvedMotionTrack(clip.keyframes, kPosXTrack, kPublicPosXTrack);
+    const QString& posYName =
+        resolvedMotionTrack(clip.keyframes, kPosYTrack, kPublicPosYTrack);
+    const KeyframeTrack *xTrack = clip.keyframes.track(posXName);
+    const KeyframeTrack *yTrack = clip.keyframes.track(posYName);
+    const QVector<double> times = positionKeyframeTimes(xTrack, yTrack);
+    if (times.size() < 2)
+        return false;
+
+    const auto tangentPathSeconds = [&](const QString& trackName) {
+        return std::max(times.first(), std::min(
+            times.last(), spatialPathLocalSecondsForTrack(
+                clip, trackName, clipLocalSeconds)));
+    };
+
+    SpatialSegmentEvaluation xEvaluation;
+    SpatialSegmentEvaluation yEvaluation;
+    const bool hasXEvaluation = evaluateSpatialSegment(
+        clip, xTrack, yTrack, times,
+        tangentPathSeconds(posXName),
+        &xEvaluation);
+    const bool hasYEvaluation = evaluateSpatialSegment(
+        clip, xTrack, yTrack, times,
+        tangentPathSeconds(posYName),
+        &yEvaluation);
+    if (!hasXEvaluation && !hasYEvaluation)
+        return false;
+
+    const auto segmentTangent = [](const SpatialSegmentEvaluation& evaluation) {
+        if (evaluation.hasSpatialTangents) {
+            const QPointF derivative = cubicTangent(
+                evaluation.p0, evaluation.c1, evaluation.c2, evaluation.p1,
+                evaluation.u);
+            if (finitePoint(derivative)
+                && (derivative.x() != 0.0 || derivative.y() != 0.0)) {
+                return derivative;
+            }
+        }
+        return evaluation.p1 - evaluation.p0;
+    };
+
+    const QPointF xDirection = hasXEvaluation
+        ? segmentTangent(xEvaluation) : QPointF();
+    const QPointF yDirection = hasYEvaluation
+        ? segmentTangent(yEvaluation) : QPointF();
+    const QPointF result(
+        xDirection.x() * spatialPathDirectionForTrack(
+            clip, posXName, clipLocalSeconds),
+        yDirection.y() * spatialPathDirectionForTrack(
+            clip, posYName, clipLocalSeconds));
+    if (!finitePoint(result) || (result.x() == 0.0 && result.y() == 0.0))
+        return false;
+    if (tangent)
+        *tangent = result;
+    return true;
+}
+
 clipgeom::ClipTransform effectiveTransformAt(const ClipInfo& clip,
                                              double clipLocalSeconds)
 {
@@ -551,6 +675,15 @@ clipgeom::ClipTransform effectiveTransformAt(const ClipInfo& clip,
     if (trackHasKeyframes(clip.keyframes, kRotationTrack)) {
         transform.rotationDeg =
             clip.keyframes.valueAt(kRotationTrack, clipLocalSeconds, transform.rotationDeg);
+    }
+    if (clip.autoOrientEnabled) {
+        QPointF tangent;
+        if (spatialTangentAt(clip, clipLocalSeconds, &tangent)) {
+            constexpr double kRadiansToDegrees =
+                180.0 / 3.14159265358979323846264338327950288;
+            transform.rotationDeg += std::atan2(tangent.y(), tangent.x())
+                * kRadiansToDegrees;
+        }
     }
     return transform;
 }

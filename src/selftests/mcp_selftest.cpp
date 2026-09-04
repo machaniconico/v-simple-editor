@@ -2101,6 +2101,71 @@ int runMcpSelftest()
              : fail("G124 reversed is reverted by one undo",
                     QStringLiteral("one undo did not restore linked reverse flags"));
 
+        // G144-G145: AUTO-ORIENT boolean property is visible and one-step undoable.
+        ClipInfo autoOrientClip = makeTestClip(
+            QStringLiteral("auto-orient-video"), 0);
+        if (reverseVideoTrack)
+            reverseVideoTrack->setClips({autoOrientClip});
+        if (reverseAudioTrack)
+            reverseAudioTrack->setClips(QVector<ClipInfo>{});
+        saveTestUndoBaseline();
+
+        const QJsonObject setAutoOrientResponse = callProjectInfoTool(
+            301, QStringLiteral("set_clip_property"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 0},
+                {QStringLiteral("property"), QStringLiteral("autoOrient")},
+                {QStringLiteral("value"), true}
+            });
+        const QJsonObject autoOrientTimelineResponse = callProjectInfoTool(
+            302, QStringLiteral("get_timeline"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")}
+            });
+        const QJsonObject autoOrientPayload = toolPayload(setAutoOrientResponse);
+        const QJsonArray autoOrientClips = timelineTrackObject(
+            toolPayload(autoOrientTimelineResponse), QStringLiteral("video"), 0)
+                .value(QStringLiteral("clips")).toArray();
+        const bool g144 = reverseVideoTrack
+            && !toolResult(setAutoOrientResponse)
+                    .value(QStringLiteral("isError")).toBool(true)
+            && autoOrientPayload.value(QStringLiteral("ok")).toBool(false)
+            && autoOrientPayload.value(QStringLiteral("property")).toString()
+                   == QStringLiteral("autoOrient")
+            && autoOrientPayload.value(QStringLiteral("value")).isBool()
+            && autoOrientPayload.value(QStringLiteral("value")).toBool(false)
+            && !autoOrientPayload.value(QStringLiteral("linkedApplied")).toBool(true)
+            && requiredOutputFieldsPresent(QStringLiteral("set_clip_property"),
+                                           autoOrientPayload)
+            && reverseVideoTrack->clips().first().autoOrientEnabled
+            && autoOrientClips.size() == 1
+            && autoOrientClips.first().toObject()
+                   .value(QStringLiteral("autoOrient")).toBool(false);
+        g144 ? pass("G144 set_clip_property autoOrient is reflected by get_timeline")
+             : fail("G144 set_clip_property autoOrient is reflected by get_timeline",
+                    QStringLiteral("boolean mutation, schema, or timeline output diverged"));
+
+        const QJsonObject autoOrientUndoResponse = callProjectInfoTool(
+            303, QStringLiteral("undo"), QJsonObject{});
+        const QJsonObject autoOrientUndoTimelineResponse = callProjectInfoTool(
+            304, QStringLiteral("get_timeline"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")}
+            });
+        const QJsonArray autoOrientUndoClips = timelineTrackObject(
+            toolPayload(autoOrientUndoTimelineResponse),
+            QStringLiteral("video"), 0).value(QStringLiteral("clips")).toArray();
+        const bool g145 = toolPayload(autoOrientUndoResponse)
+                                .value(QStringLiteral("ok")).toBool(false)
+            && reverseVideoTrack
+            && !reverseVideoTrack->clips().first().autoOrientEnabled
+            && autoOrientUndoClips.size() == 1
+            && !autoOrientUndoClips.first().toObject()
+                    .value(QStringLiteral("autoOrient")).toBool(true)
+            && !projectTimeline->undoManager()->canUndo();
+        g145 ? pass("G145 autoOrient is reverted by one undo")
+             : fail("G145 autoOrient is reverted by one undo",
+                    QStringLiteral("one undo did not restore the auto-orient flag"));
+
         // 後続の get_frame fixture は空の V1/A1 へ media を 1 件ずつ取り込む。
         // roundtrip で再読込したクリップと undo 履歴をここで隔離する。
         const QVector<TimelineTrack *> tracks =
@@ -2133,6 +2198,8 @@ int runMcpSelftest()
         fail("G122 clip labels survive save/open and None is omitted", QStringLiteral("Timeline was not available"));
         fail("G123 reversed set is reflected by get_timeline", QStringLiteral("Timeline was not available"));
         fail("G124 reversed is reverted by one undo", QStringLiteral("Timeline was not available"));
+        fail("G144 set_clip_property autoOrient is reflected by get_timeline", QStringLiteral("Timeline was not available"));
+        fail("G145 autoOrient is reverted by one undo", QStringLiteral("Timeline was not available"));
     }
 
     const QJsonObject originalTimecodeBurnIn =

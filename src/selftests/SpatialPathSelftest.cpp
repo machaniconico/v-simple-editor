@@ -11,6 +11,7 @@
 #include <QString>
 
 #include <cmath>
+#include <cstring>
 #include <cstdio>
 #include <limits>
 
@@ -27,6 +28,11 @@ bool exactly(double a, double b)
 bool near(double a, double b, double eps = 1e-9)
 {
     return std::abs(a - b) <= eps;
+}
+
+bool sameBits(double a, double b)
+{
+    return std::memcmp(&a, &b, sizeof(double)) == 0;
 }
 
 bool isFiniteValue(double value)
@@ -351,6 +357,94 @@ int runSpatialPathSelftest()
                   .arg(pingPong.y(), 0, 'g', 12)
                   .arg(pingPongTransform.videoDx, 0, 'g', 12)
                   .arg(pingPongTransform.videoDy, 0, 'g', 12));
+    }
+
+    // G8: auto-orient follows the path and preserves static rotation as offset.
+    {
+        auto makeDirectionalClip = [](const QPointF& end, double rotation) {
+            ClipInfo clip = makeClip();
+            clip.autoOrientEnabled = true;
+            clip.rotation2DDegrees = rotation;
+            KeyframeTrack x(kPosXTrack, 0.0);
+            x.addKeyframe(0.0, 0.0, KeyframePoint::Linear,
+                          0.0, 0.0, 1.0, 1.0,
+                          true, end.x() * 0.25, end.y() * 0.25, 0.0, 0.0);
+            x.addKeyframe(1.0, end.x(), KeyframePoint::Linear,
+                          0.0, 0.0, 1.0, 1.0,
+                          true, 0.0, 0.0, -end.x() * 0.25, -end.y() * 0.25);
+            KeyframeTrack y(kPosYTrack, 0.0);
+            y.addKeyframe(0.0, 0.0);
+            y.addKeyframe(1.0, end.y());
+            clip.keyframes.addTrack(x);
+            clip.keyframes.addTrack(y);
+            return clip;
+        };
+
+        const ClipInfo right = makeDirectionalClip(QPointF(1.0, 0.0), 0.0);
+        const ClipInfo down = makeDirectionalClip(QPointF(0.0, 1.0), 0.0);
+        const ClipInfo downWithOffset =
+            makeDirectionalClip(QPointF(0.0, 1.0), 17.0);
+        ClipInfo downWithMotionRotation =
+            makeDirectionalClip(QPointF(0.0, 1.0), 0.0);
+        KeyframeTrack rotation(QStringLiteral("motion.rotation"), 0.0);
+        rotation.addKeyframe(0.0, 11.0);
+        rotation.addKeyframe(1.0, 11.0);
+        downWithMotionRotation.keyframes.addTrack(rotation);
+        const double rightAngle =
+            clipanim::effectiveTransformAt(right, 0.5).rotationDeg;
+        const double downAngle =
+            clipanim::effectiveTransformAt(down, 0.5).rotationDeg;
+        const double offsetAngle =
+            clipanim::effectiveTransformAt(downWithOffset, 0.5).rotationDeg;
+        const double motionOffsetAngle = clipanim::effectiveTransformAt(
+            downWithMotionRotation, 0.5).rotationDeg;
+        check(8, "auto-orient follows right/down paths and adds rotation offset",
+              near(rightAngle, 0.0, 0.5)
+                  && near(downAngle, 90.0, 0.5)
+                  && near(offsetAngle, 107.0, 0.5)
+                  && near(motionOffsetAngle, 101.0, 0.5),
+              QStringLiteral("right=%1 down=%2 staticOffset=%3 motionOffset=%4")
+                  .arg(rightAngle, 0, 'g', 12)
+                  .arg(downAngle, 0, 'g', 12)
+                  .arg(offsetAngle, 0, 'g', 12)
+                  .arg(motionOffsetAngle, 0, 'g', 12));
+    }
+
+    // G9: disabling auto-orient restores every transform component bit-for-bit.
+    {
+        ClipInfo clip = makeClip();
+        clip.videoScale = 1.25;
+        clip.videoDx = -0.125;
+        clip.videoDy = 0.375;
+        clip.rotation2DDegrees = -23.5;
+        KeyframeTrack x(kPosXTrack, clip.videoDx);
+        x.addKeyframe(0.0, -0.125);
+        x.addKeyframe(1.0, 0.875);
+        KeyframeTrack y(kPosYTrack, clip.videoDy);
+        y.addKeyframe(0.0, 0.375);
+        y.addKeyframe(1.0, 0.875);
+        clip.keyframes.addTrack(x);
+        clip.keyframes.addTrack(y);
+
+        clip.autoOrientEnabled = false;
+        const clipgeom::ClipTransform before =
+            clipanim::effectiveTransformAt(clip, 0.375);
+        clip.autoOrientEnabled = true;
+        const clipgeom::ClipTransform oriented =
+            clipanim::effectiveTransformAt(clip, 0.375);
+        clip.autoOrientEnabled = false;
+        const clipgeom::ClipTransform after =
+            clipanim::effectiveTransformAt(clip, 0.375);
+        const bool bitIdentical = sameBits(before.videoScale, after.videoScale)
+            && sameBits(before.videoDx, after.videoDx)
+            && sameBits(before.videoDy, after.videoDy)
+            && sameBits(before.rotationDeg, after.rotationDeg);
+        check(9, "auto-orient OFF leaves effective transform bit-identical",
+              bitIdentical && !sameBits(before.rotationDeg, oriented.rotationDeg),
+              QStringLiteral("before=%1 oriented=%2 after=%3")
+                  .arg(before.rotationDeg, 0, 'g', 17)
+                  .arg(oriented.rotationDeg, 0, 'g', 17)
+                  .arg(after.rotationDeg, 0, 'g', 17));
     }
 
     std::printf("[spatial-path] summary: %d PASS, %d FAIL\n", passed, failed);

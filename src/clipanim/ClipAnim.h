@@ -15,6 +15,13 @@ namespace clipanim {
 QPointF effectivePositionAt(const ClipInfo& clip,
                             double clipLocalSeconds);
 
+// Returns the direction of travel along the position path. Cubic spatial
+// handles use the Bezier derivative; ordinary position keyframes use the
+// adjacent-keyframe direction. Returns false when no direction is available.
+bool spatialTangentAt(const ClipInfo& clip,
+                      double clipLocalSeconds,
+                      QPointF *tangent);
+
 // Returns effective transform at clip-local time.
 // If no keyframe track exists for a property, uses the static ClipInfo value.
 // If all motion tracks are absent/empty, returns the static values unchanged.

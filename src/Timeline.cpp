@@ -5508,6 +5508,32 @@ bool Timeline::setClipReversed(TrackKind kind, int trackIndex, int clipIndex,
     return true;
 }
 
+bool Timeline::setClipAutoOrientEnabled(TrackKind kind, int trackIndex,
+                                        int clipIndex, bool enabled)
+{
+    TimelineTrack *track = trackAt(kind == TrackKind::Audio, trackIndex);
+    if (!track || track->isLocked()
+        || clipIndex < 0 || clipIndex >= track->clipCount()) {
+        return false;
+    }
+
+    const QVector<ClipInfo> currentClips = track->clips();
+    if (currentClips[clipIndex].autoOrientEnabled == enabled)
+        return true;
+
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    QVector<ClipInfo> clips = currentClips;
+    clips[clipIndex].autoOrientEnabled = enabled;
+    track->setClips(clips);
+
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+    saveUndoState(QStringLiteral("パスに沿って自動回転"));
+    updateInfoLabel();
+    scheduleEmitSequenceChanged();
+    return true;
+}
+
 bool Timeline::matchFrame(double timelineSec, MatchFrameResult *result,
                           QString *errorOut) const
 {
@@ -7712,6 +7738,9 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     QAction *adjustmentAct = menu.addAction(QStringLiteral("調整レイヤーを作成"));
     QAction *parentAct = menu.addAction(QStringLiteral("ペアレント..."));
     QAction *nullAct = menu.addAction(QStringLiteral("ヌルオブジェクトを作成"));
+    QAction *autoOrientAct = menu.addAction(QStringLiteral("パスに沿って自動回転"));
+    autoOrientAct->setCheckable(true);
+    autoOrientAct->setChecked(clipInfo.autoOrientEnabled);
     menu.addSeparator();
     // SNS 縦動画フィット (相互排他の3択): 幅フィット=レターボックスで全表示 /
     // 幅埋め=中央クロップで枠を歪みなく充填 / 解除=既定 (IgnoreAspectRatio で
@@ -7779,6 +7808,10 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     else if (chosen == fillRightAct) applyLinkedAudioChannelMode(AudioChannelMode::FillRight);
     else if (chosen == swapAct) applyLinkedAudioChannelMode(AudioChannelMode::Swap);
     else if (chosen == monoAct) applyLinkedAudioChannelMode(AudioChannelMode::Mono);
+    else if (chosen == autoOrientAct) {
+        setClipAutoOrientEnabled(TrackKind::Video, m_videoTracks.indexOf(track),
+                                 clipIndex, autoOrientAct->isChecked());
+    }
     else if (chosen == snsFitAct) applySnsFitToClip(track, clipIndex, true, false, QStringLiteral("SNS width fit center"));
     else if (chosen == snsCoverAct) applySnsFitToClip(track, clipIndex, false, true, QStringLiteral("SNS width fill crop"));
     else if (chosen == snsFillAct) applySnsFitToClip(track, clipIndex, false, false, QStringLiteral("SNS restore fullscreen"));

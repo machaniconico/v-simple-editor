@@ -533,7 +533,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "motion-preset",     "VEDITOR_MOTION_PRESET_SELFTEST",       runMotionPresetSelftest,       false,
       "Motion preset library: built-in ids, generated motion keyframes, deterministic replacement (6 gates)" },
     { "spatial-path",      "VEDITOR_SPATIAL_PATH_SELFTEST",        runSpatialPathSelftest,        false,
-      "AE-ANIM-2 spatial Bezier position path: no-handle invariance, curve, endpoints, JSON, degenerate guards (5 gates)" },
+      "AE-ANIM-2 spatial Bezier position path and auto-orient (9 gates)" },
     { "spectral-edit",     "VEDITOR_SPECTRAL_EDIT_SELFTEST",      runSpectralEditSelftest,       false,
       "SpectralEngine: FFT/STFT/iSTFT round-trip + region attenuation" },
     { "voice-isolation",   "VEDITOR_VOICE_ISOLATION_SELFTEST",    runVoiceIsolationSelftest,     true,

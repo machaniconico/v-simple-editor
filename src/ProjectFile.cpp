@@ -1849,6 +1849,8 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
         obj["layerMaterial"] = clip.material.toJson();
     if (clip.motionBlurEnabled)
         obj["motionBlurEnabled"] = true;
+    if (clip.autoOrientEnabled)
+        obj["autoOrientEnabled"] = true;
     if (clip.fitContain)
         obj["fitContain"] = true;
     if (clip.fitCover)
@@ -1951,6 +1953,7 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
     if (obj.contains("layerMaterial"))
         clip.material = LayerMaterial::fromJson(obj["layerMaterial"].toObject());
     clip.motionBlurEnabled = obj["motionBlurEnabled"].toBool(false);
+    clip.autoOrientEnabled = obj["autoOrientEnabled"].toBool(false);
     clip.fitContain = obj["fitContain"].toBool(false);
     clip.fitCover = obj["fitCover"].toBool(false);
     clip.lutFilePath = obj["lutFilePath"].toString();
