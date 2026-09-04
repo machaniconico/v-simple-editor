@@ -2,6 +2,7 @@
 #include "MultiCamSync.h"
 
 #include <QDialogButtonBox>
+#include <QDoubleSpinBox>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QGridLayout>
@@ -141,7 +142,8 @@ void MultiCamDialog::buildUi()
     auto *btnCol = new QVBoxLayout();
     m_addBtn = new QPushButton(tr("Add Angle..."), this);
     m_removeBtn = new QPushButton(tr("Remove"), this);
-    m_syncBtn = new QPushButton(tr("Sync (start time)"), this);
+    m_syncBtn = new QPushButton(tr("音声で同期"), this);
+    m_syncBtn->setObjectName(QStringLiteral("multiCamAudioSyncButton"));
     btnCol->addWidget(m_addBtn);
     btnCol->addWidget(m_removeBtn);
     btnCol->addWidget(m_syncBtn);
@@ -190,6 +192,7 @@ void MultiCamDialog::buildUi()
     m_applyBtn = bb->addButton(QDialogButtonBox::Apply);
     m_cancelBtn = bb->addButton(QDialogButtonBox::Cancel);
     m_applyBtn->setText(tr("タイムラインに適用"));
+    m_applyBtn->setObjectName(QStringLiteral("multiCamApplyButton"));
     connect(m_applyBtn, &QPushButton::clicked, this, [this]() {
         emit applyToTimeline(m_project);
         accept();
@@ -291,6 +294,7 @@ void MultiCamDialog::onSync()
     if (angleCount < 2) {
         for (MultiCamAngle &a : m_project.angles)
             a.syncOffsetUs = 0;
+        rebuildAngleList();
         QMessageBox::information(
             this, tr("Multi-camera"),
             tr("Audio waveform sync needs at least two angles; offsets remain 0."));
@@ -345,6 +349,8 @@ void MultiCamDialog::onSync()
                  0, 'f', 1);
     }
 
+    rebuildAngleList();
+
     QMessageBox::information(
         this, tr("Multi-camera"),
         hasUsableComparison
@@ -392,19 +398,65 @@ void MultiCamDialog::onAngleListSelected()
     refreshAngleButtons();
 }
 
+void MultiCamDialog::onAngleOffsetChanged(int angleId, double offsetMs)
+{
+    for (MultiCamAngle &angle : m_project.angles) {
+        if (angle.id != angleId)
+            continue;
+        angle.syncOffsetUs = qRound64(offsetMs * 1000.0);
+        break;
+    }
+}
+
 // ----------------------------- helpers -----------------------------
 
 void MultiCamDialog::rebuildAngleList()
 {
     if (!m_angleList) return;
+
+    int selectedId = 0;
+    if (QListWidgetItem *selected = m_angleList->currentItem())
+        selectedId = selected->data(Qt::UserRole).toInt();
+
     m_angleList->clear();
     for (int i = 0; i < m_project.angles.size(); ++i) {
         const MultiCamAngle &a = m_project.angles[i];
         const QString fileName = QFileInfo(a.sourcePath).fileName();
-        m_angleList->addItem(
+
+        auto *item = new QListWidgetItem(m_angleList);
+        item->setData(Qt::UserRole, a.id);
+
+        auto *rowWidget = new QWidget(m_angleList);
+        auto *rowLayout = new QHBoxLayout(rowWidget);
+        rowLayout->setContentsMargins(4, 1, 4, 1);
+        rowLayout->addWidget(new QLabel(
             QStringLiteral("[%1] %2  —  %3")
-                .arg(i + 1).arg(a.label, fileName));
+                .arg(i + 1).arg(a.label, fileName), rowWidget), 1);
+        rowLayout->addWidget(new QLabel(tr("同期オフセット:"), rowWidget));
+
+        auto *offsetSpin = new QDoubleSpinBox(rowWidget);
+        offsetSpin->setObjectName(
+            QStringLiteral("multiCamSyncOffsetMs_%1").arg(a.id));
+        offsetSpin->setRange(-86400000.0, 86400000.0);
+        offsetSpin->setDecimals(1);
+        offsetSpin->setSingleStep(10.0);
+        offsetSpin->setSuffix(tr(" ms"));
+        offsetSpin->setValue(static_cast<double>(a.syncOffsetUs) / 1000.0);
+        offsetSpin->setToolTip(tr("自動同期結果をミリ秒単位で微調整します"));
+        connect(offsetSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+                this, [this, angleId = a.id](double value) {
+                    onAngleOffsetChanged(angleId, value);
+                });
+        rowLayout->addWidget(offsetSpin);
+
+        item->setSizeHint(rowWidget->sizeHint());
+        m_angleList->setItemWidget(item, rowWidget);
+        if (a.id == selectedId)
+            m_angleList->setCurrentItem(item);
     }
+
+    if (m_angleList->currentRow() < 0 && m_angleList->count() > 0)
+        m_angleList->setCurrentRow(0);
 }
 
 void MultiCamDialog::rebuildThumbnailGrid()

@@ -46,6 +46,7 @@
 #include "LoudnessMaster.h"
 #include "HdrGrading.h"
 #include "MultiCamSync.h"
+#include "MultiCamDialog.h"
 #include "BatchExportQueue.h"
 #include "SelftestRegistry.h"
 #include "Timeline.h"
@@ -76,7 +77,9 @@
 #include <QHash>
 #include <QTimer>
 #include <QEventLoop>
+#include <QDoubleSpinBox>
 #include <QProcess>
+#include <QPushButton>
 #include <QVector3D>
 #include <cmath>
 #include <algorithm>
@@ -1635,6 +1638,78 @@ int runMultiCamSelftest()
         if (!requireSelftest(qAbs(offsetsUs[2] + 20000LL) <= 10000LL,
                              QStringLiteral("MULTICAM: early angle offset should be ~-20000us"),
                              &error))
+            return 1;
+
+        // G7: a 250 ms delayed copy must be recovered within one envelope hop.
+        constexpr double hopMs = 10.0;
+        constexpr int delayedSamples = 25;
+        QVector<float> base(100, 0.0f);
+        const QVector<float> signature{
+            0.15f, 0.82f, 0.31f, 0.94f, 0.47f, 0.21f, 0.73f, 0.38f,
+            0.88f, 0.12f, 0.55f, 0.97f, 0.26f, 0.64f, 0.43f, 0.79f};
+        for (int i = 0; i < signature.size(); ++i)
+            base[20 + i] = signature[i];
+        QVector<float> delayed(base.size(), 0.0f);
+        for (int i = 0; i + delayedSamples < base.size(); ++i)
+            delayed[i + delayedSamples] = base[i];
+
+        const double delayedMs =
+            multicam::MultiCamSync::estimateOffsetMs(base, delayed, hopMs);
+        if (!requireSelftest(qAbs(delayedMs - 250.0) <= hopMs,
+                             QStringLiteral("MULTICAM G7: 250ms synthetic offset should be estimated within one hop"),
+                             &error))
+            return 1;
+
+        // G8: all angles are estimated in one call against angle 0.
+        QVector<float> early(base.size(), 0.0f);
+        constexpr int earlySamples = 12;
+        for (int i = earlySamples; i < base.size(); ++i)
+            early[i - earlySamples] = base[i];
+        const QVector<qint64> batchOffsets =
+            multicam::MultiCamSync::computeAngleOffsetsUs(
+                QVector<QVector<float>>{base, delayed, early}, hopMs);
+        if (!requireSelftest(
+                batchOffsets.size() == 3
+                    && batchOffsets[0] == 0
+                    && qAbs(batchOffsets[1] - 250000LL) <= 10000LL
+                    && qAbs(batchOffsets[2] + 120000LL) <= 10000LL,
+                QStringLiteral("MULTICAM G8: batch angle offsets should use the first angle as reference"),
+                &error))
+            return 1;
+
+        // G9: editing milliseconds in the unified dialog immediately updates
+        // the MultiCamProject EDL emitted by the Apply button.
+        MultiCamProject project;
+        project.angles = {
+            MultiCamAngle{1, QStringLiteral("angle-a.mp4"), 0, QStringLiteral("A")},
+            MultiCamAngle{2, QStringLiteral("angle-b.mp4"), 250000, QStringLiteral("B")}};
+        project.defaultAngleId = 1;
+
+        MultiCamDialog dialog;
+        dialog.setProject(project);
+        QDoubleSpinBox *offsetEditor = dialog.findChild<QDoubleSpinBox *>(
+            QStringLiteral("multiCamSyncOffsetMs_2"));
+        QPushButton *applyButton = dialog.findChild<QPushButton *>(
+            QStringLiteral("multiCamApplyButton"));
+        const bool estimatedOffsetDisplayed =
+            offsetEditor && qAbs(offsetEditor->value() - 250.0) < 0.05;
+        MultiCamProject appliedProject;
+        bool applied = false;
+        QObject::connect(&dialog, &MultiCamDialog::applyToTimeline,
+                         [&appliedProject, &applied](const MultiCamProject &value) {
+                             appliedProject = value;
+                             applied = true;
+                         });
+        if (offsetEditor)
+            offsetEditor->setValue(275.5);
+        if (applyButton)
+            applyButton->click();
+        if (!requireSelftest(
+                estimatedOffsetDisplayed && applyButton && applied
+                    && dialog.result().angles[1].syncOffsetUs == 275500LL
+                    && appliedProject.angles[1].syncOffsetUs == 275500LL,
+                QStringLiteral("MULTICAM G9: dialog offset edit should be reflected in the applied EDL"),
+                &error))
             return 1;
     }
 #endif

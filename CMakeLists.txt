@@ -871,8 +871,6 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/HdrGradingDialog.cpp
     src/MultiCamSync.h
     src/MultiCamSync.cpp
-    src/MultiCamSyncDialog.h
-    src/MultiCamSyncDialog.cpp
     src/BatchExportQueue.h
     src/BatchExportQueue.cpp
     src/BatchExportDialog.h

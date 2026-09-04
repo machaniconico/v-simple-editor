@@ -154,7 +154,6 @@ class InstagramPublishDialog;
 class ProjectTemplateDialog;
 class LoudnessMasterDialog;
 class HdrGradingDialog;
-class MultiCamSyncDialog;
 class BatchExportDialog;
 
 // US-INT-2: Sprint 22 — keying / restoration / animated export / easing /
@@ -609,7 +608,6 @@ private slots:
     void openProjectTemplateDialog();
     void openLoudnessDialog();
     void openHdrDialog();
-    void openMultiCamSyncDialog();
     void openBatchExportDialog();
 
     // US-INT-2: Sprint 22 — keying / restoration / animated export / easing /
@@ -1113,7 +1111,6 @@ private:
     ProjectTemplateDialog              *m_projectTemplateDialog;
     LoudnessMasterDialog               *m_loudnessDialog;
     HdrGradingDialog                   *m_hdrDialog;
-    MultiCamSyncDialog                 *m_multiCamSyncDialog;
     BatchExportDialog                  *m_batchExportDialog;
 
     // US-INT-2: Sprint 22 — keying / restoration / animated export / easing /

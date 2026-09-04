@@ -191,10 +191,6 @@ double exporter_loudnessGainDb();
   #include "HdrGradingDialog.h"
   #define HAVE_HDR_GRADING 1
 #endif
-#if __has_include("MultiCamSyncDialog.h")
-  #include "MultiCamSyncDialog.h"
-  #define HAVE_MULTICAM_SYNC 1
-#endif
 #if __has_include("BatchExportDialog.h")
   #include "BatchExportDialog.h"
   #define HAVE_BATCH_EXPORT 1
@@ -2700,7 +2696,6 @@ MainWindow::MainWindow(QWidget *parent)
     , m_projectTemplateDialog(nullptr)
     , m_loudnessDialog(nullptr)
     , m_hdrDialog(nullptr)
-    , m_multiCamSyncDialog(nullptr)
     , m_batchExportDialog(nullptr)
     , m_chromaKeyDialog(nullptr)
     , m_audioRestoreDialog(nullptr)
@@ -4040,7 +4035,7 @@ void MainWindow::setupMenuBar()
     auto *multiCamDialogAction = fileMenu->addAction("マルチカメラ...");
     connect(multiCamDialogAction, &QAction::triggered, this, &MainWindow::openMultiCamDialog);
     m_menuHelpEntries.append({multiCamDialogAction,
-        QStringLiteral("複数カメラで撮った同じ場面の映像を切り替えながら 1 本にまとめます。")});
+        QStringLiteral("複数カメラの映像を音声で同期し、切り替えながら 1 本にまとめます。")});
 
     // Premiere Media Encoder / Resolve Deliver page parity — modeless
     // dialog that lists pending / running / completed export jobs.
@@ -5696,14 +5691,6 @@ void MainWindow::setupMenuBar()
             this, &MainWindow::openBroadcastCaption);
     m_menuHelpEntries.append({broadcastCaptionAction,
         QStringLiteral("放送納品向けの CEA-608/708 クローズドキャプションを設定し、SCC サイドカーを書き出します。")});
-
-    auto *multiCamSyncAction = toolsMenu->addAction(
-        QStringLiteral("マルチカム同期(&M)…"));
-    multiCamSyncAction->setObjectName("action_multicam_sync");
-    connect(multiCamSyncAction, &QAction::triggered,
-            this, &MainWindow::openMultiCamSyncDialog);
-    m_menuHelpEntries.append({multiCamSyncAction,
-        QStringLiteral("複数カメラのクリップを音声波形で自動同期し、マルチカムシーケンスを作成します。")});
 
     auto *batchExportAction = toolsMenu->addAction(
         QStringLiteral("バッチエクスポート(&B)…"));
@@ -15990,22 +15977,6 @@ void MainWindow::openHdrDialog()
 #else
     QMessageBox::information(this, QStringLiteral("HDR カラーグレーディング"),
         QStringLiteral("HdrGradingDialog がビルドに含まれていません。"));
-#endif
-}
-
-void MainWindow::openMultiCamSyncDialog()
-{
-#ifdef HAVE_MULTICAM_SYNC
-    if (!m_multiCamSyncDialog) {
-        m_multiCamSyncDialog = new MultiCamSyncDialog(this);
-        m_multiCamSyncDialog->setObjectName(QStringLiteral("multiCamSyncDialog"));
-    }
-    m_multiCamSyncDialog->show();
-    m_multiCamSyncDialog->raise();
-    m_multiCamSyncDialog->activateWindow();
-#else
-    QMessageBox::information(this, QStringLiteral("マルチカム同期"),
-        QStringLiteral("MultiCamSyncDialog がビルドに含まれていません。"));
 #endif
 }
 

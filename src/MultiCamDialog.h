@@ -68,6 +68,7 @@ private slots:
     void onPlayheadChanged(int valueMs);
     void onCutToAngle(int slotIndex);     // 0..3 — which UI slot
     void onAngleListSelected();
+    void onAngleOffsetChanged(int angleId, double offsetMs);
 
 private:
     void buildUi();
