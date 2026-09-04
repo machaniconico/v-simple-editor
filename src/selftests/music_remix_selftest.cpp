@@ -133,13 +133,32 @@ int runMusicRemixSelftest()
     const bool longRejected = !unreachableLong.valid
         && unreachableLong.segments.isEmpty()
         && !unreachableLong.error.isEmpty();
-    const bool g6 = shortRejected && longRejected;
+    const remix::Plan artificialBoundaryAverage =
+        remix::planRemix({5.0, 6.0}, 10.0, 7.0);
+    const bool artificialBoundaryAverageRejected =
+        !artificialBoundaryAverage.valid
+        && artificialBoundaryAverage.segments.isEmpty()
+        && !artificialBoundaryAverage.error.isEmpty();
+    const remix::Plan oversizedTarget = remix::planRemix(
+        interiorBeats, 60.0, remix::kMaxTargetSec + 1.0);
+    const bool oversizedTargetRejected = !oversizedTarget.valid
+        && oversizedTarget.segments.isEmpty()
+        && !oversizedTarget.error.isEmpty();
+    const bool g6 = shortRejected && longRejected
+        && artificialBoundaryAverageRejected && oversizedTargetRejected;
     g6 ? pass("G6")
-       : fail("G6", QStringLiteral("unreachable target accepted: short=%1 long=%2")
+       : fail("G6", QStringLiteral(
+                          "unreachable target accepted: short=%1 long=%2 artificial=%3 oversized=%4")
                           .arg(shortRejected ? QStringLiteral("rejected")
                                              : QStringLiteral("accepted"))
                           .arg(longRejected ? QStringLiteral("rejected")
-                                            : QStringLiteral("accepted")));
+                                            : QStringLiteral("accepted"))
+                          .arg(artificialBoundaryAverageRejected
+                                   ? QStringLiteral("rejected")
+                                   : QStringLiteral("accepted"))
+                          .arg(oversizedTargetRejected
+                                   ? QStringLiteral("rejected")
+                                   : QStringLiteral("accepted")));
 
     std::cerr << "summary: " << passed << " PASS, " << failed << " FAIL\n";
     return failed;

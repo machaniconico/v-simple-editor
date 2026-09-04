@@ -9,6 +9,7 @@ namespace remix {
 namespace {
 
 constexpr double kEpsilon = 1.0e-9;
+constexpr int kMaxRepeatedSegments = 100000;
 
 struct Interval {
     double start = 0.0;
@@ -17,8 +18,8 @@ struct Interval {
     double duration() const { return end - start; }
 };
 
-QVector<double> normalizedBoundaries(const QVector<double> &beatTimes,
-                                     double clipDuration)
+QVector<double> normalizedBeatTimes(const QVector<double> &beatTimes,
+                                    double clipDuration)
 {
     QVector<double> beats;
     beats.reserve(beatTimes.size());
@@ -31,6 +32,18 @@ QVector<double> normalizedBoundaries(const QVector<double> &beatTimes,
     }
     std::sort(beats.begin(), beats.end());
 
+    QVector<double> normalized;
+    normalized.reserve(beats.size());
+    for (double beat : beats) {
+        if (normalized.isEmpty() || qAbs(beat - normalized.last()) > kEpsilon)
+            normalized.append(beat);
+    }
+    return normalized;
+}
+
+QVector<double> boundariesFromBeats(const QVector<double> &beats,
+                                    double clipDuration)
+{
     QVector<double> boundaries;
     boundaries.reserve(beats.size() + 2);
     boundaries.append(0.0);
@@ -78,12 +91,23 @@ Plan planRemix(const QVector<double> &beatTimes,
         plan.error = QStringLiteral("目標尺は 0 より大きい有限値で指定してください");
         return plan;
     }
+    if (targetDuration > kMaxTargetSec) {
+        plan.error = QStringLiteral("目標尺が上限を超えています");
+        return plan;
+    }
     if (!std::isfinite(plan.crossfadeSec) || plan.crossfadeSec < 0.0) {
         plan.error = QStringLiteral("クロスフェード時間が不正です");
         return plan;
     }
 
-    const QVector<double> boundaries = normalizedBoundaries(beatTimes, clipDuration);
+    const QVector<double> normalizedBeats =
+        normalizedBeatTimes(beatTimes, clipDuration);
+    if (normalizedBeats.size() < 2) {
+        plan.error = QStringLiteral("有効なビート境界が 2 個未満です");
+        return plan;
+    }
+    const QVector<double> boundaries =
+        boundariesFromBeats(normalizedBeats, clipDuration);
     const QVector<Interval> intervals = makeIntervals(boundaries);
     if (intervals.isEmpty()) {
         plan.error = QStringLiteral("クリップのビート区間を作成できません");
@@ -122,6 +146,10 @@ Plan planRemix(const QVector<double> &beatTimes,
         // Repeating one interior beat interval at a time makes the result
         // deterministic and keeps every inserted boundary musical.
         while (remainingToAdd > kEpsilon) {
+            if (repeatedIntervals.size() >= kMaxRepeatedSegments) {
+                plan.error = QStringLiteral("リミックス区間数が上限を超えます");
+                return plan;
+            }
             int bestIndex = -1;
             double bestError = remainingToAdd;
             for (int i = 1; i + 1 < intervals.size(); ++i) {
@@ -163,13 +191,11 @@ Plan planRemix(const QVector<double> &beatTimes,
         return plan;
     }
 
-    double totalIntervalDuration = 0.0;
-    for (const Interval &interval : intervals)
-        totalIntervalDuration += interval.duration();
-    const double averageIntervalDuration =
-        totalIntervalDuration / intervals.size();
+    const double averageBeatInterval =
+        (normalizedBeats.last() - normalizedBeats.first())
+        / static_cast<double>(normalizedBeats.size() - 1);
     if (qAbs(plan.resultDuration - targetDuration)
-        > averageIntervalDuration + kEpsilon) {
+        > averageBeatInterval + kEpsilon) {
         const double reachableDuration = plan.resultDuration;
         plan.segments.clear();
         plan.resultDuration = 0.0;

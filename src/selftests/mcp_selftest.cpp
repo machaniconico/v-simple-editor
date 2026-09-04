@@ -51,6 +51,7 @@
 #include "../CaptionEditorDialog.h"
 #include "../CaptionTrack.h"
 #include "../MainWindow.h"
+#include "../MusicRemix.h"
 #include "../RenderQueue.h"
 #include "../Timeline.h"
 #include "../UndoManager.h"
@@ -2605,10 +2606,19 @@ int runMcpSelftest()
                 {QStringLiteral("clipIndex"), 0},
                 {QStringLiteral("targetSec"), 0.0}
             });
+        const QJsonObject oversizedMusicRemixResponse = callProjectInfoTool(
+            262, QStringLiteral("music_remix"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("audio")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 0},
+                {QStringLiteral("targetSec"), remix::kMaxTargetSec + 1.0}
+            });
         const bool g138 = toolResult(invalidMusicRemixResponse)
                                 .value(QStringLiteral("isError")).toBool(false)
             && toolErrorText(invalidMusicRemixResponse).contains(
                    QStringLiteral("targetSec"))
+            && toolResult(oversizedMusicRemixResponse)
+                   .value(QStringLiteral("isError")).toBool(false)
             && musicRemixTrack->clipCount() == remixCountAfter;
         g138 ? pass("G138 music_remix rejects invalid target")
              : fail("G138 music_remix rejects invalid target",
@@ -2639,6 +2649,10 @@ int runMcpSelftest()
                    == QStringLiteral("object")
             && requiredHas(musicInputSchema, QStringLiteral("kind"))
             && requiredHas(musicInputSchema, QStringLiteral("targetSec"))
+            && musicInputSchema.value(QStringLiteral("properties")).toObject()
+                   .value(QStringLiteral("targetSec")).toObject()
+                   .value(QStringLiteral("maximum")).toDouble()
+                   == remix::kMaxTargetSec
             && musicOutputSchema.value(QStringLiteral("type")).toString()
                    == QStringLiteral("object")
             && requiredHas(musicOutputSchema, QStringLiteral("resultDuration"))

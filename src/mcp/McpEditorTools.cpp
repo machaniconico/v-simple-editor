@@ -5,6 +5,7 @@
 #include "../BeatDetect.h"
 #include "../DynamicZoom.h"
 #include "../MainWindow.h"
+#include "../MusicRemix.h"
 #include "../RenderQueue.h"
 #include "../TimelineFrameRenderer.h"
 #include "../Timeline.h"
@@ -3010,7 +3011,8 @@ void McpEditorTools::registerWriteTools()
             }},
             {QStringLiteral("targetSec"), QJsonObject{
                 {QStringLiteral("type"), QStringLiteral("number")},
-                {QStringLiteral("exclusiveMinimum"), 0.0}
+                {QStringLiteral("exclusiveMinimum"), 0.0},
+                {QStringLiteral("maximum"), remix::kMaxTargetSec}
             }}
         }, {QStringLiteral("kind"), QStringLiteral("trackIndex"),
             QStringLiteral("clipIndex"), QStringLiteral("targetSec")}),
@@ -3034,6 +3036,9 @@ void McpEditorTools::registerWriteTools()
             }
             if (targetSec <= 0.0)
                 return setError(err, QStringLiteral("targetSec は 0 より大きい有限値で指定してください")),
+                       QJsonObject();
+            if (targetSec > remix::kMaxTargetSec)
+                return setError(err, QStringLiteral("targetSec は 86400 秒以下で指定してください")),
                        QJsonObject();
 
             ClipTarget target;

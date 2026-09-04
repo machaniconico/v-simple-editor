@@ -1,4 +1,5 @@
 #include "MusicRemixDialog.h"
+#include "MusicRemix.h"
 
 #include <QCheckBox>
 #include <QDialogButtonBox>
@@ -35,7 +36,7 @@ MusicRemixDialog::MusicRemixDialog(QWidget *parent)
     m_durationLabel = new QLabel(QStringLiteral("目標尺 (mm:ss): 00:00"), this);
 
     m_targetSpin = new QDoubleSpinBox(this);
-    m_targetSpin->setRange(0.05, 24.0 * 60.0 * 60.0);
+    m_targetSpin->setRange(0.05, remix::kMaxTargetSec);
     m_targetSpin->setDecimals(2);
     m_targetSpin->setSingleStep(1.0);
     m_targetSpin->setSuffix(QStringLiteral(" 秒"));

@@ -5,6 +5,8 @@
 
 namespace remix {
 
+inline constexpr double kMaxTargetSec = 24.0 * 60.0 * 60.0;
+
 struct Config {
     double crossfadeSec = 0.05;
 };
