@@ -162,6 +162,23 @@ Plan planRemix(const QVector<double> &beatTimes,
         plan.error = QStringLiteral("リミックス区間を作成できません");
         return plan;
     }
+
+    double totalIntervalDuration = 0.0;
+    for (const Interval &interval : intervals)
+        totalIntervalDuration += interval.duration();
+    const double averageIntervalDuration =
+        totalIntervalDuration / intervals.size();
+    if (qAbs(plan.resultDuration - targetDuration)
+        > averageIntervalDuration + kEpsilon) {
+        const double reachableDuration = plan.resultDuration;
+        plan.segments.clear();
+        plan.resultDuration = 0.0;
+        plan.error = QStringLiteral(
+                         "目標尺 %1 秒はビート境界で実現できません (到達可能: %2 秒)")
+                         .arg(targetDuration, 0, 'f', 3)
+                         .arg(reachableDuration, 0, 'f', 3);
+        return plan;
+    }
     plan.valid = true;
     return plan;
 }

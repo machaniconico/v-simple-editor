@@ -119,6 +119,28 @@ int runMusicRemixSelftest()
         fail("G5", QStringLiteral("A1 track was not available"));
     }
 
+    QVector<double> interiorBeats;
+    for (int i = 1; i < 60; ++i)
+        interiorBeats.append(static_cast<double>(i));
+    const remix::Plan unreachableShort =
+        remix::planRemix(interiorBeats, 60.0, 0.05);
+    const bool shortRejected = !unreachableShort.valid
+        && unreachableShort.segments.isEmpty()
+        && !unreachableShort.error.isEmpty();
+
+    const remix::Plan unreachableLong =
+        remix::planRemix({0.0, 30.0}, 60.0, 120.0);
+    const bool longRejected = !unreachableLong.valid
+        && unreachableLong.segments.isEmpty()
+        && !unreachableLong.error.isEmpty();
+    const bool g6 = shortRejected && longRejected;
+    g6 ? pass("G6")
+       : fail("G6", QStringLiteral("unreachable target accepted: short=%1 long=%2")
+                          .arg(shortRejected ? QStringLiteral("rejected")
+                                             : QStringLiteral("accepted"))
+                          .arg(longRejected ? QStringLiteral("rejected")
+                                            : QStringLiteral("accepted")));
+
     std::cerr << "summary: " << passed << " PASS, " << failed << " FAIL\n";
     return failed;
 }
