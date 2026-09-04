@@ -323,6 +323,9 @@ public:
         double clipLocalSeconds, double sourceSeconds, QSize canvasSize);
     // Test-only seam for grade-keyframe GPU-preview wiring.
     bool pushActiveClipColorCorrectionToGlPreviewForTest(qint64 timelineUsec);
+    // Test-only seam for deterministic playback-tick coverage.  Callers must
+    // start playback first; this forwards to the production tick unchanged.
+    void handlePlaybackTickForTest();
 
     // NOTE: the genuine text baker is now the free function
     // textbake::bakeOverlays (src/TextOverlayBake.h), extracted verbatim from

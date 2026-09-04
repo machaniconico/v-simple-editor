@@ -2,6 +2,8 @@
 #include "../ShapeLayer.h"
 #include "../Timeline.h"
 #include "../TimelineFrameRenderer.h"
+#include "../VideoPlayer.h"
+#include "../GLPreview.h"
 
 #include <QColor>
 #include <QFile>
@@ -211,6 +213,41 @@ int runShapeClipSelftest()
         && frame.pixelColor(0, 0).alpha() == 0;
     reportGate(5, rendered,
                "renderFrameAt did not composite the media-less shape clip",
+               passed, failed);
+
+    Timeline playbackTimeline;
+    playbackTimeline.videoTracks().first()->setClips(
+        QVector<ClipInfo>{makeShapeClip(renderedRectangle)});
+    playbackTimeline.refreshPlaybackSequence();
+    int tickFrames = 0;
+    QImage lastTickFrame;
+    VideoPlayer player;
+    player.setCanvasSize(60, 40);
+    player.setProjectOutputSize(QSize(60, 40));
+    player.glPreview()->setTimeline(&playbackTimeline);
+    player.setSequence(playbackTimeline.computePlaybackSequence());
+
+    QObject::connect(&player, &VideoPlayer::frameComposited,
+                     [&tickFrames, &lastTickFrame](const QImage &image) {
+        ++tickFrames;
+        lastTickFrame = image;
+    });
+    const qint64 beforePlayback = player.timelinePositionUs();
+    player.play();
+    player.handlePlaybackTickForTest();
+    player.handlePlaybackTickForTest();
+    player.pause();
+    const QColor playbackCenter = lastTickFrame.isNull()
+        ? QColor() : lastTickFrame.pixelColor(30, 20);
+    const bool playbackRendered = player.timelinePositionUs() > beforePlayback
+        && tickFrames >= 1
+        && !lastTickFrame.isNull()
+        && lastTickFrame.size() == QSize(60, 40)
+        && playbackCenter.red() >= 220
+        && playbackCenter.green() <= 45
+        && playbackCenter.blue() >= 70;
+    reportGate(6, playbackRendered,
+               "VideoPlayer shape tick did not advance/render via SSOT",
                passed, failed);
 
     std::fprintf(stderr, "[shape-clip] summary: %d PASS, %d FAIL\n",

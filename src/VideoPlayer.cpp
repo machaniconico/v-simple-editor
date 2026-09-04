@@ -5921,6 +5921,11 @@ void VideoPlayer::cachePreviewComposite(const QImage &composed)
     m_frameCache.put(key, composed);
 }
 
+void VideoPlayer::handlePlaybackTickForTest()
+{
+    handlePlaybackTick();
+}
+
 void VideoPlayer::handlePlaybackTick()
 {
     if (!m_playing)
@@ -6193,7 +6198,10 @@ void VideoPlayer::handlePlaybackTick()
         const bool reverseTimelineDriven = activeReversed
             || timelineHasActiveReversedSequenceReference(
                 previewTimeline, m_timelinePositionUs);
-        if (reverseTimelineDriven) {
+        const bool shapeTimelineDriven = sequenceActive()
+            && m_activeEntry >= 0 && m_activeEntry < m_sequence.size()
+            && isShapeClipEntry(previewTimeline, m_sequence[m_activeEntry]);
+        if (reverseTimelineDriven || shapeTimelineDriven) {
             // FFmpeg's normal decoder loop streams forward. A reversed clip
             // instead advances only the timeline clock and precisely seeks to
             // the shared decreasing source-time mapping for each display tick.
@@ -6851,9 +6859,12 @@ void VideoPlayer::handlePlaybackTick()
         const bool reverseTimelineDriven = activeReversed
             || timelineHasActiveReversedSequenceReference(
                 previewTimeline, m_timelinePositionUs);
+        const bool shapeTimelineDriven =
+            isShapeClipEntry(previewTimeline, active);
         const int64_t entryEndTimelineUs = qRound64(
             active.timelineEnd * AV_TIME_BASE);
-        const bool reachedEntryEnd = reverseTimelineDriven
+        const bool reachedEntryEnd =
+            (reverseTimelineDriven || shapeTimelineDriven)
             ? (m_timelinePositionUs >= entryEndTimelineUs)
             : (m_currentPositionUs >= entryEndLocalUs);
         // NB: previously also triggered on `decodeStopped = !advanced`, but
