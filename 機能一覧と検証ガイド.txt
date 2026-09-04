@@ -1,14 +1,14 @@
 ================================================================================
  V Simple Editor — 機能一覧と LLM(MCP) 検証ガイド
- 作成日: 2026-08-29   対象ブランチ: feat/ai-chat-connection
+ 作成日: 2026-08-29   更新日: 2026-09-05 (Wave 2 実装済み)   対象ブランチ: feat/ai-chat-connection
 ================================================================================
 
 このファイルは 3 部構成です。
   第1部  今ある機能の一覧 (Premiere / After Effects / DaVinci Resolve との対応つき)
-  第2部  今後実装していく機能の一覧 (Wave 1 = 今回実装済み / Wave 2 / Wave 3)
+  第2部  今後実装していく機能の一覧 (Wave 1 / Wave 2 = 実装済み / Wave 3)
   第3部  LLM と MCP 連携しながら検証する手順 (準備 → 共通手順 → 機能別チェックリスト)
 
-凡例:  ○=同等機能あり  △=部分的  ×=無い  ★=今回 (Wave 1) 追加
+凡例:  ○=同等機能あり  △=部分的  ×=無い  ★=Wave 1 追加  ☆=Wave 2 追加 (今回)
        [P]=Premiere Pro  [AE]=After Effects  [R]=DaVinci Resolve
 
 --------------------------------------------------------------------------------
@@ -27,18 +27,20 @@
   ○ トラックのミュート / ソロ / 非表示 / ロック (🔒ボタン)   ★保存対応は Wave 1
   ○ リンクした映像/音声の同期移動・分割
   ○ クリップのコピー&貼り付け / エフェクトのコピー&貼り付け / 属性の貼り付け
-  ○ マルチカメラ (△ 同期は基本。専用同期で音声相関あり)     [P][R]
+  ○ マルチカメラ (☆ 音声相関同期を基本ダイアログへ統合、角度ごとの ms 微調整)  [P][R]
   ○ テキストベース編集 / 無音検出 / 自動ジャンプカット / シーン検出  [P][R]
   ○ メディアプール (ビン / スマートビン / ドラッグ&ドロップ配置)     [P][R]
   ○ マーカー (色付き / 一覧パネル / YouTube チャプター出力)
   ○ Undo / Redo + ヒストリーパネル
-  ○ 自動保存 / 復旧 / インクリメンタル保存 / プロジェクト収集
+  ○ 自動保存 / 復旧 / インクリメンタル保存 / プロジェクト収集 (☆ 収集漏れ修正)
+  ☆ オフラインメディアの検出と再リンク (プロジェクトを開いたとき自動検出 / MCP relink_media)  [P][R]
   ○ ワークスペース保存 / ショートカット設定 (Premiere/FCP/DaVinci プリセット)
   ○ コマンドパレット (Ctrl+Shift+P)
 
 ■ 2. モーション / アニメーション
   ○ キーフレーム (位置/スケール/回転/不透明度/アンカー/スキュー)
   ○ グラフエディタ / イージングプリセット / ベジェ / モーションパス / ループ
+  ☆ パスに沿った自動回転 (Auto-Orient)                      [AE]
   ○ ペアレント (ヌルオブジェクト) / エクスプレッション      [AE]
   ○ モーションブラー                                        [AE][P]
   ○ ウィグル / 手持ちカメラ風 / カメラモーション
@@ -50,6 +52,8 @@
   ○ クロマキー (精緻化ダイアログ)
   ○ パペット / ワープ / 歪み / ディストーション系
   ○ パーティクル / フラクタルノイズ / シェイプレイヤー / レイヤースタイル
+  ☆ シェイプクリップ (シェイプレイヤーをタイムラインのクリップとして永続化・描画)  [AE]
+  ☆ シェイプモディファイア (Repeater / Trim Paths)          [AE]
   ○ コンテンツに応じた塗りつぶし (オブジェクト除去)          [AE][R]
   ○ 手ブレ補正 / フリッカー除去 / ノイズ除去
   ○ ノードコンポジットモード (Fusion 風、線形チェーン)      [R]
@@ -60,6 +64,8 @@
 
 ■ 4. カラー
   ○ カラーホイール (Lift/Gamma/Gain) / RGB・Luma カーブ / HSL セカンダリ  [P][R]
+  ☆ Log ホイール (Shadow / Midtone / Highlight の Log レンジ)   [R]
+  ☆ スチル保存 + ワイプ比較 (スチルギャラリー / 分割画面)       [R]
   ○ LUT 適用・管理 / ASC CDL 書き出し / カラーマッチ / 自動カラー
   ○ ACES カラーマネジメント / HDR (HDR10/HLG) 出力 / Dolby Vision メタデータ (サイドカー)
   ○ Lumetri 風スコープ (波形/ベクトル) / 露出補助 (フォルスカラー/ゼブラ/ピーキング)
@@ -70,13 +76,15 @@
   ○ 自動ダッキング (BGM) / ボリュームエンベロープ / ステレオパン / チャンネルマッピング
   ○ ラウドネス (BS.1770) 計測・正規化 / 音声リストア / スペクトル修復 / 音声分離 (スピーチ強調)
   ○ ボイスオーバー録音 / VST・AU プラグイン / ビート検出
-  △ 音声トランジション (重なり時の自動クロスフェードのみ)
+  ○ 音声トランジション (☆ コンスタントパワーのクロスフェード / フェードイン / フェードアウトを明示指定)  [P][R]
+  ☆ ダイアログレベラー (会話音量の自動平準化)                [R]
+  ☆ ミュージックリミックス (BGM の尺合わせ、ビート検出を利用)  [P] Remix / [R] Music Remixer
 
 ■ 6. テキスト / 字幕
   ○ テキスト/テロップ / タイトルプリセット / テキストアニメーション / パステキスト / 可変フォント
   ○ 字幕エディタ / SRT・VTT 取込 / SRT・CSV 出力 / 放送字幕 (CEA-608/708 .scc)
-  ○ Whisper 自動字幕 (外部 whisper-cli が必要) / カラオケ 1 語字幕 / CPS チェック
-  ○ 字幕翻訳 (API キーが必要、既定はスタブ)
+  ○ Whisper 自動字幕 (外部 whisper-cli が必要。☆ 設定→環境変数→PATH→既知パスの順に自動検出し、無ければ入手案内と実行ファイル指定) / カラオケ 1 語字幕 / CPS チェック
+  ○ 字幕翻訳 (API キーが必要、既定はスタブ。☆ プロバイダと API キーの保存/非保存を選択)
 
 ■ 7. 書き出し / 連携
   ○ レンダーキュー / バッチ書き出し / SNS 向け / モバイル向け / GIF・WebP / 現在フレーム
@@ -89,15 +97,15 @@
 ■ 8. AI / 自動化
   ○ AI アップスケール / フレーム補間 / AI ハイライト / 自動カット / スマートエディット
   ○ 文字起こしからハイライト検出 (Anthropic/OpenAI/Gemini/オフライン)
-  ○ MCP サーバ内蔵 (27 ツール ★Wave 1 で 33 ツール、selftest --selftest=mcp は
-    ★Wave 1 で G1..G134 の 134 ゲート) + AI チャット Dock (Claude Code / Codex CLI)
+  ○ MCP サーバ内蔵 (27 ツール ★Wave 1 で 33 ツール ☆Wave 2 で 36 ツール、selftest --selftest=mcp は
+    ★Wave 1 で G1..G134 ☆Wave 2 で G1..G145 の 145 ゲート) + AI チャット Dock (Claude Code / Codex CLI)
      → 競合 3 製品には無い、本アプリ独自の機能
 
 --------------------------------------------------------------------------------
  第2部  今後実装していく機能
 --------------------------------------------------------------------------------
 
-■ Wave 1 (今回実装)  — 詳細な検証手順は第3部
+■ Wave 1 (実装済み)  — 詳細な検証手順は第3部 3.3
   ★ フィルムグレイン エフェクト                          [R] Film Grain / [P] ノイズ
   ★ Echo (残像) エフェクト                                [AE] Echo
   ★ トラックフラグ (ロック/ミュート/ソロ/非表示) の保存    [P][AE][R]
@@ -111,19 +119,26 @@
   ★ MCP 新ツール: set_track_locked / set_clip_label / set_project_option /
                    dynamic_zoom / match_frame / replace_clip / set_clip_property(reversed)
 
-■ Wave 2 (次回)
-  × オフラインメディアの再リンク                           [P][R]
-  × Log ホイール (Shadow/Mid/Highlight の Log レンジ)       [R]
-  × スチル保存 + ワイプ比較 (ギャラリー / 分割画面)          [R]
-  × ミュージックリミックス (BGM の尺合わせ、ビート検出を利用) [P] Remix / [R] Music Remixer
-  × ダイアログレベラー                                     [R]
-  × 音声トランジション (コンスタントパワー) の明示化        [P][R]
-  × パスに沿った自動回転 (Auto-Orient)                     [AE]
-  × シェイプモディファイア (Repeater / Trim Paths)          [AE]
-  △ マルチカム完全版 (音声相関同期を基本ダイアログへ)      [P][R]
-  △ Whisper / 字幕翻訳の外部エンジン検出と案内強化
+■ Wave 2 (今回実装)  — 詳細な検証手順は第3部 3.4
+  ☆ オフラインメディアの再リンク (開いたとき自動検出 + 一括再リンク)  [P][R]
+  ☆ プロジェクト収集のパス列挙を再リンクと同じ経路 (mediapaths) へ統一 (収集漏れ修正)
+  ☆ Log ホイール (Shadow/Mid/Highlight の Log レンジ)       [R]
+  ☆ スチル保存 + ワイプ比較 (ギャラリー / 分割画面)          [R]
+  ☆ ミュージックリミックス (BGM の尺合わせ、ビート検出を利用) [P] Remix / [R] Music Remixer
+  ☆ ダイアログレベラー                                     [R]
+  ☆ 音声トランジション (コンスタントパワー) の明示化        [P][R]
+  ☆ パスに沿った自動回転 (Auto-Orient)                     [AE]
+  ☆ シェイプクリップ (シェイプレイヤーのタイムライン統合)   [AE]
+  ☆ シェイプモディファイア (Repeater / Trim Paths)          [AE]
+  ☆ マルチカム完全版 (音声相関同期を基本ダイアログへ)      [P][R]
+  ☆ Whisper / 字幕翻訳の外部エンジン検出と案内強化
+  ☆ MCP 新ツール: relink_media / music_remix / dialogue_level /
+                   set_transition(kind:audio) / set_clip_property(autoOrient)
+  ※ 新機能はすべて既定 OFF。新機能を使わないプロジェクトの書き出しは Wave 1 と byte-identical。
 
 ■ Wave 3 (大型・要検討)
+  × 音声クリップの実オーバーラップ (Premiere 型の重なりクロスフェード。現状の CrossDissolve は
+    継ぎ目の等パワーディップ。音声スケジューラ + AudioMixer + export の設計変更が必要)  [P][R]
   × 3D カメラトラッカー                                    [AE]
   × Morph Cut                                              [P]
   × Color Warper                                           [R]
@@ -279,13 +294,145 @@
                                    "filePath":"検証動画\\yyy.mp4"}
      期待レスポンス:  {"ok":true}  (新素材が短い場合のみ {"ok":true,"warning":"…"})
 
-■ 3.4 回帰確認 (Wave 1 後に必ず)
+■ 3.4 Wave 2 新機能の検証チェックリスト
+
+  ※ MCP ツールがある機能は「呼び出し例 / 期待レスポンス」を載せています。MCP ツールが無い
+     機能 (UI のみ) は、手動操作のあとに LLM へ get_frame / get_timeline での確認だけ依頼します。
+  ※ 引数の kind / trackIndex / clipIndex は get_timeline の出力 (tracks[].clips[]) で確認してから指定。
+
+  ▼ (1) オフラインメディアの再リンク  (プロジェクトを開いたとき自動 / MCP relink_media)
+     手動:  素材ファイルを別フォルダへ移動してからプロジェクトを開く
+            期待: 「メディアの再リンク」ダイアログが出て、見つからないファイルが一覧される。
+                  フォルダを指定すると同名ファイルが一括で再リンクされ、リンクした音声・ネストした
+                  シーケンス・パーティクル設定の参照もまとめて更新。全ファイルがある場合は何も出ない。
+     LLM:   「C:\old\a.mp4 を D:\new\a.mp4 に再リンクして」→ relink_media
+     呼び出し例:      relink_media {"mapping":[{"from":"C:/old/a.mp4","to":"D:/new/a.mp4"}]}
+     期待レスポンス:  {"ok":true,"relinked":1}
+                     to が存在しないファイルなら isError で「ファイルが見つかりません」を含み、何も変わらない
+     Undo:  Ctrl+Z 1 回で全ファイルの再リンクが戻る
+     selftest: --selftest=media-relink (6 ゲート)
+
+  ▼ (2) プロジェクト収集の収集漏れ修正  (ファイル > プロジェクトを収集 (Collect Files)...)
+     手動:  LUT / 画像オーバーレイ / パーティクル / ネストしたシーケンスを含むプロジェクトを収集
+            期待: 再リンクが検出するのと同じ一覧 (mediapaths) が収集対象になり、上記の素材が漏れない。
+                  収集後のプロジェクトを開いて再リンクダイアログが出ない。
+     LLM:   専用 MCP ツールは無い。収集後のプロジェクトを open_project で開き、get_project_info /
+            get_timeline の filePath が収集先を指していることを確認。
+
+  ▼ (3) Log ホイール  (カラーグレーディング パネル > 「Log ホイール (Shadow / Midtone / Highlight)」)
+     手動:  シャドウ / ミッドトーン / ハイライトの各ホイールを動かす (各 -1.0..1.0、既定 0)
+            期待: 暗部 / 中間 / 明部だけが色づく。全ホイール 0 なら Lift/Gamma/Gain と同じ絵 (無変化)。
+     LLM:   MCP ツール無し。手動で設定後に get_frame {"timeSec": 5} で確認。
+     期待レスポンス:  {"ok":true,"timeSec":5,...} + PNG (対象レンジだけ色が変わる)
+     Undo:  Ctrl+Z 1 回で戻る
+     selftest: --selftest=grade-log-wheel (5 ゲート)
+
+  ▼ (4) スチル保存 + ワイプ比較  (表示 > スチルを保存 / ワイプ比較 (オン/オフ) / スチルギャラリー)
+     手動:  グレーディング済みフレームで「スチルを保存」→ 別カットへ移動 → 「スチルギャラリー」で
+            スチルをダブルクリック → 「ワイプ比較 (オン/オフ)」を ON
+            期待: プレビューが分割され、左右 (または上下) に保存スチルと現在フレームが並ぶ。
+                  ギャラリーの比較位置スライダーで境界が動く。OFF に戻すと元の表示に戻り、
+                  書き出しにはスチルが写らない (プレビュー専用)。
+     LLM:   MCP ツール無し。ON のときに get_frame を取ると分割合成後の絵が返る。
+     selftest: --selftest=still-compare (5 ゲート)
+
+  ▼ (5) ミュージックリミックス  (音声クリップ右クリック > ミュージックリミックス…)
+     手動:  60 秒の BGM を選び、目標尺 40 秒 (または 80 秒) を入力
+            期待: ビート境界でセグメントを組み替えて目標尺 ±1 ビート間隔に収まる。先頭と末尾は
+                  元のまま、継ぎ目にはコンスタントパワーのクロスフェード。ビートが 2 個未満の素材は
+                  「適用できません」で変更なし。
+     LLM:   「A1 の 1 番目の BGM を 6 秒に尺合わせして」→ music_remix
+     呼び出し例:      music_remix {"kind":"audio","trackIndex":0,"clipIndex":0,"targetSec":6.0}
+     期待レスポンス:  {"ok":true,"kind":"audio","trackIndex":0,"clipIndex":0,"targetSec":6.0,
+                      "resultDuration":5.9…,"segmentCount":2 以上}
+                     targetSec が 0 以下 / 86400 超 / kind が video は isError で何も変わらない
+     Undo:  Ctrl+Z 1 回で元の 1 クリップに戻る (get_timeline のクリップ数で確認)
+     selftest: --selftest=music-remix (7 ゲート) / --selftest=beat-detect
+
+  ▼ (6) ダイアログレベラー  (音声クリップ右クリック > ダイアログレベラー…)
+     手動:  声量差の大きい会話クリップに適用 (目標 -18 LUFS、既定)
+            期待: 音量エンベロープが生成され、小さい区間が持ち上がり大きい区間が抑えられる
+                  (区間 RMS 差が 3 dB 以内)。無音区間は持ち上がらない。既にエンベロープがあると
+                  上書き確認が出る。
+     LLM:   「A1 の 1 番目のクリップの会話音量を揃えて」→ dialogue_level
+     呼び出し例:      dialogue_level {"kind":"audio","trackIndex":0,"clipIndex":0,"targetLufs":-18}
+     期待レスポンス:  {"ok":true,"kind":"audio","trackIndex":0,"clipIndex":0,"targetLufs":-18,
+                      "pointCount":2 以上,"measuredLufsMin":…,"measuredLufsMax":…}
+                     kind が video なら isError でエンベロープは作られない
+     Undo:  Ctrl+Z 1 回でエンベロープが消える
+     selftest: --selftest=dialogue-leveler (5 ゲート) / --selftest=loudness
+
+  ▼ (7) 音声トランジション (コンスタントパワー)  (音声クリップ右クリック > 音声トランジション >
+         クロスフェード (コンスタントパワー)… / フェードイン… / フェードアウト…)
+     手動:  隣接する 2 つの音声クリップの前側で「クロスフェード…」→ 0.5 秒
+            期待: 継ぎ目で音量が等パワーで滑らかにつながる (プレビュー・書き出しとも)。
+                  隣接クリップが無いとクロスフェードは選べない。設定していないクリップの書き出しは
+                  従来と byte-identical。
+     LLM:   「A1 の 1 番目と 2 番目の間に 1.25 秒のクロスフェード」→ set_transition (kind:audio)
+     呼び出し例:      set_transition {"kind":"audio","trackIndex":0,"clipIndex":0,
+                                     "type":"CrossDissolve","durationSec":1.25}
+     期待レスポンス:  {"ok":true,"kind":"audio","trackIndex":0,"clipIndex":0,"type":"CrossDissolve",
+                      "durationSec":1.25,"leadIn":{…},"trailOut":{…}}
+                     type が WipeLeft や None など (CrossDissolve/FadeIn/FadeOut 以外) は isError
+                     映像側 (V1) のトランジションは変わらない
+     Undo:  Ctrl+Z 1 回で両クリップのトランジションが戻る
+     selftest: --selftest=audio-xfade (5 ゲート)
+
+  ▼ (8) パスに沿った自動回転 (Auto-Orient)  (映像クリップ右クリック > パスに沿って自動回転)
+     手動:  位置キーフレームで曲線のモーションパスを作り、チェックを ON
+            期待: クリップがパスの進行方向を向いて回転する (右向き 0°、下向き 90°)。元の回転値や
+                  回転キーフレームはオフセットとして加算される。OFF に戻すと元の絵と一致。
+     LLM:   「クリップ 1 をパスに沿って自動回転して」→ set_clip_property (autoOrient)
+     呼び出し例:      set_clip_property {"kind":"video","trackIndex":0,"clipIndex":0,
+                                        "property":"autoOrient","value":true}
+     期待レスポンス:  {"ok":true,"property":"autoOrient","value":true,"linkedApplied":false}
+                     get_timeline の該当クリップに "autoOrient":true が出る。value が数値なら isError
+     Undo:  Ctrl+Z 1 回で false に戻る
+     selftest: --selftest=spatial-path (9 ゲート、G8/G9 が自動回転)
+
+  ▼ (9) シェイプクリップ  (挿入 > シェイプクリップ)
+     手動:  再生ヘッドを置き「シェイプクリップ」→ 名前を入力
+            期待: ビデオトラックにシェイプクリップが入り、プレビューと書き出しで同じ図形が描かれる。
+                  保存 → 開き直しで図形が復元。シェイプの無い既存プロジェクトの JSON は変わらない。
+     LLM:   MCP ツール無し。get_timeline に新クリップが増えていること、get_frame で図形が写ることを確認。
+     Undo:  Ctrl+Z 1 回でクリップが消える
+     selftest: --selftest=shape-clip (10 ゲート、G1..G6 がクリップ統合)
+
+  ▼ (10) シェイプモディファイア (Repeater / Trim Paths)  (シェイプクリップ右クリック > シェイプモディファイア…)
+     手動:  「リピーター」有効 → コピー数 5、移動 X 40 px、回転 10°
+            「パスのトリミング」有効 → 開始 0% / 終了 50%
+            期待: 図形が 5 個並んで回転し、パスが半分だけ描かれる。両方無効に戻すと元の絵と画素一致。
+                  プレビューと書き出しの絵が一致。
+     LLM:   MCP ツール無し。get_frame で確認。
+     Undo:  ダイアログ OK 1 回 = Ctrl+Z 1 回
+     selftest: --selftest=shape-clip (G7..G10 がモディファイア)
+
+  ▼ (11) マルチカム 音声同期  (ファイル > マルチカメラ... > 「音声で同期」)
+     手動:  同じ音声を録った 2〜3 本のアングルを追加 → 「音声で同期」
+            期待: 各アングル行のオフセット欄 (ms) に推定値が入る (基準は最初のアングル)。欄を手で
+                  直すと即座に反映され、適用後のマルチカム EDL に反映される。
+                  ツール > マルチカメラセットアップ / 切替 は従来どおり (別系統)。
+     LLM:   MCP ツール無し。
+     selftest: --selftest=multicam (既存ゲート + G7..G9 が同期)
+
+  ▼ (12) Whisper / 字幕翻訳の外部エンジン案内  (ツール > 字幕自動生成 (Whisper) / 字幕翻訳)
+     手動:  whisper-cli が無い環境で Whisper ダイアログを開く
+            期待: 「外部エンジン whisper-cli が見つかりません」と入手案内が出て、「実行ファイルを指定…」
+                  で選んだパスが次回も使われる。見つかる環境では「whisper-cli を検出しました: <パス>」。
+                  字幕翻訳ダイアログでは「このキーを保存」を外すと API キーが保存されない。
+     LLM:   MCP ツール無し。
+     selftest: --selftest=whisper-guide (5 ゲート) / --selftest=whisper-transcribe / --selftest=subxlat
+
+■ 3.5 回帰確認 (Wave 1 / Wave 2 後に必ず)
   □ 新機能を一切使わないプロジェクトの書き出しが以前と同一 (byte-identical)
      → 旧 exe と新 exe で同じプロジェクトを書き出し、fc /b で比較
   □ --selftest=mcp / trackmatte-parity / gpu-composite-parity / effect-preset / effect-library が全 PASS
+  □ Wave 2 分: --selftest=media-relink / grade-log-wheel / still-compare / music-remix /
+     dialogue-leveler / audio-xfade / spatial-path / shape-clip / multicam / whisper-guide が全 PASS
+     (mcp は G1..G145 の 145 PASS、shape-clip は G1..G10 の 10 PASS)
   □ 旧 .veditor プロジェクトが警告なく開ける
 
-■ 3.5 不具合を見つけたとき
+■ 3.6 不具合を見つけたとき
   ・AI チャット Dock のログ (ツール名・引数・応答) をそのまま貼る
   ・再現に使った指示文、期待した結果、実際の結果、Ctrl+Z で戻ったか を添える
   ・selftest が FAIL なら stderr の FAIL Gn 行を添える
