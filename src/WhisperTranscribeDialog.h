@@ -28,6 +28,7 @@ public:
 
 private slots:
     void onBrowseClicked();
+    void onCliBrowseClicked();
     void updateAcceptState();
     void updateRecognizerWarning();
 
@@ -37,6 +38,8 @@ private:
     QComboBox*        m_modelCombo     = nullptr;
     QComboBox*        m_languageCombo  = nullptr;
     QLabel*           m_engineWarningLabel = nullptr;
+    QLabel*           m_engineInstallLabel = nullptr;
+    QPushButton*      m_cliBrowseButton = nullptr;
     QLabel*           m_resultLabel    = nullptr;
     QDialogButtonBox* m_buttonBox      = nullptr;
 };

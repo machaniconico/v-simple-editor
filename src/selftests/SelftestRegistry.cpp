@@ -196,6 +196,7 @@ int runVideostabDeshakeSelftest();
 int runVimeoSelftest();
 int runWatermarkSelftest();
 int runWbEyedropperSelftest();
+int runWhisperGuideSelftest();
 int runWhisperTranscribeSelftest();
 int runWhisperWordTimingSelftest();
 int runCaptionOverlayBuilderSelftest();
@@ -663,6 +664,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Layer Style UI: default identity, JSON round-trip, enabled-flag identity, and Timeline setter/getter gates (V1 legacy + track-aware)" },
     { "smart-render",       "VEDITOR_SMART_RENDER_SELFTEST",       runSmartRenderSelftest,        false,
       "Smart Render T4: conservative stream-copy eligibility predicate + env gate" },
+    { "whisper-guide",      nullptr,                                runWhisperGuideSelftest,       false,
+      "Whisper CLI resolution and subtitle translation preference persistence (5 gates)" },
     // QApplication-required (needsQApplication=true) ----------------------
     { "deflicker",         "VEDITOR_DEFLICKER_SELFTEST",          runDeflickerSelftest,         true,
       "Deflicker: global luma/RGB, streaming apply, cancellation, source resolution, and mask bounds (14 gates)" },

@@ -60,8 +60,9 @@ public:
 };
 
 // 組み込み実装 2: Whisper.cpp CLI ラッパー。
-// PATH 上の `whisper-cli` (Whisper.cpp 公式 binary) を QProcess で呼び出し JSON parse。
-// バイナリが存在しなければ isAvailable=false / recognize success=false。
+// 設定 / 環境変数 / PATH / 既知の場所から解決した `whisper-cli`
+// (Whisper.cpp 公式 binary) を QProcess で呼び出し JSON parse。
+// バイナリが利用できなければ isAvailable=false / recognize success=false。
 class WhisperCliRecognizer : public Recognizer {
 public:
     QString name() const override { return QStringLiteral("Whisper.cpp CLI"); }

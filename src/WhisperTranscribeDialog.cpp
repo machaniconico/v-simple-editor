@@ -10,6 +10,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QPushButton>
+#include <QSettings>
 #include <QVBoxLayout>
 
 WhisperTranscribeDialog::WhisperTranscribeDialog(QWidget* parent)
@@ -31,6 +32,8 @@ WhisperTranscribeDialog::WhisperTranscribeDialog(QWidget* parent)
 
     // --- モデル (recognizer) ---
     m_modelCombo = new QComboBox(this);
+    m_cliBrowseButton = new QPushButton(tr("実行ファイルを指定…"), this);
+
     const auto recognizers = speech::availableRecognizers();
     for (const auto& r : recognizers) {
         if (r) {
@@ -39,10 +42,15 @@ WhisperTranscribeDialog::WhisperTranscribeDialog(QWidget* parent)
     }
 
     m_engineWarningLabel = new QLabel(
-        QStringLiteral("外部エンジン(whisper-cli)が見つかりません。サンプル文字起こしになります。PATH に whisper-cli を配置してください。"),
+        tr("外部エンジン whisper-cli が見つかりません。サンプル文字起こしになります。"),
         this);
     m_engineWarningLabel->setWordWrap(true);
     m_engineWarningLabel->setStyleSheet(QStringLiteral("color: #b00020; font-weight: 600;"));
+
+    m_engineInstallLabel = new QLabel(
+        tr("whisper.cpp の GitHub リリースから whisper-cli を取得し、PATH へ追加してください。"),
+        this);
+    m_engineInstallLabel->setWordWrap(true);
 
     // --- 言語 ---
     m_languageCombo = new QComboBox(this);
@@ -70,11 +78,15 @@ WhisperTranscribeDialog::WhisperTranscribeDialog(QWidget* parent)
     auto* mainLayout = new QVBoxLayout(this);
     mainLayout->addLayout(formLayout);
     mainLayout->addWidget(m_engineWarningLabel);
+    mainLayout->addWidget(m_cliBrowseButton);
+    mainLayout->addWidget(m_engineInstallLabel);
     mainLayout->addWidget(m_resultLabel);
     mainLayout->addWidget(m_buttonBox);
 
     // --- 接続 ---
     connect(m_browseButton, &QPushButton::clicked, this, &WhisperTranscribeDialog::onBrowseClicked);
+    connect(m_cliBrowseButton, &QPushButton::clicked,
+            this, &WhisperTranscribeDialog::onCliBrowseClicked);
     connect(m_pathEdit, &QLineEdit::textChanged, this, &WhisperTranscribeDialog::updateAcceptState);
     connect(m_modelCombo, &QComboBox::currentTextChanged, this, [this](const QString&) {
         updateRecognizerWarning();
@@ -118,6 +130,37 @@ void WhisperTranscribeDialog::onBrowseClicked()
     }
 }
 
+void WhisperTranscribeDialog::onCliBrowseClicked()
+{
+    const QString path = QFileDialog::getOpenFileName(
+        this,
+        tr("whisper-cli 実行ファイルを選択"),
+        QString(),
+#ifdef Q_OS_WIN
+        tr("実行ファイル (*.exe);;すべてのファイル (*.*)"));
+#else
+        tr("すべてのファイル (*)"));
+#endif
+    if (path.isEmpty())
+        return;
+
+    QSettings settings;
+    settings.setValue(QStringLiteral("whisper/cli_path"), path);
+    settings.sync();
+
+    const QString previousSelection = m_modelCombo->currentText();
+    m_modelCombo->clear();
+    const auto recognizers = speech::availableRecognizers();
+    for (const auto& recognizer : recognizers) {
+        if (recognizer)
+            m_modelCombo->addItem(recognizer->name());
+    }
+    const int previousIndex = m_modelCombo->findText(previousSelection);
+    if (previousIndex >= 0)
+        m_modelCombo->setCurrentIndex(previousIndex);
+    updateRecognizerWarning();
+}
+
 void WhisperTranscribeDialog::updateAcceptState()
 {
     const bool hasPath = !m_pathEdit->text().trimmed().isEmpty();
@@ -132,17 +175,19 @@ void WhisperTranscribeDialog::updateAcceptState()
 
 void WhisperTranscribeDialog::updateRecognizerWarning()
 {
-    const QList<QSharedPointer<speech::Recognizer>> recognizers = speech::availableRecognizers();
-    bool hasExternalRecognizer = false;
-    for (const QSharedPointer<speech::Recognizer>& recognizer : recognizers) {
-        if (recognizer
-            && recognizer->isAvailable()
-            && recognizer->name() != QStringLiteral("Stub")) {
-            hasExternalRecognizer = true;
-            break;
-        }
+    const whisperpath::Resolution resolution = whisperpath::resolveWhisperCli();
+    const bool found = !resolution.executablePath.isEmpty();
+    if (found) {
+        m_engineWarningLabel->setText(
+            tr("whisper-cli を検出しました: %1").arg(resolution.executablePath));
+        m_engineWarningLabel->setStyleSheet(
+            QStringLiteral("color: #17823b; font-weight: 600;"));
+    } else {
+        m_engineWarningLabel->setText(
+            tr("外部エンジン whisper-cli が見つかりません。サンプル文字起こしになります。"));
+        m_engineWarningLabel->setStyleSheet(
+            QStringLiteral("color: #b00020; font-weight: 600;"));
     }
-
-    const bool selectedStub = m_modelCombo->currentText() == QStringLiteral("Stub");
-    m_engineWarningLabel->setVisible(selectedStub && !hasExternalRecognizer);
+    m_cliBrowseButton->setVisible(!found);
+    m_engineInstallLabel->setVisible(!found);
 }

@@ -284,6 +284,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/silence_cut_selftest.cpp
     src/selftests/beat_detect_selftest.cpp
     src/selftests/music_remix_selftest.cpp
+    src/selftests/whisper_guide_selftest.cpp
     src/selftests/dialogue_leveler_selftest.cpp
     src/selftests/safe_zone_selftest.cpp
     src/selftests/StillCompareSelftest.cpp

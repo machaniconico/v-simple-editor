@@ -29,20 +29,54 @@ void replaceTranslatedText(caption::Clip *clip, const QString &translatedText)
 
 TranslateConfig TranslateConfig::defaultConfig()
 {
-    TranslateConfig cfg;
-    // env var takes priority
+    QSettings settings;
     const QString envKey = QProcessEnvironment::systemEnvironment()
                                .value(QStringLiteral("VEDITOR_TRANSLATE_KEY"));
-    if (!envKey.isEmpty()) {
-        cfg.apiKey = envKey;
-        return cfg;
-    }
-    // fall back to QSettings
-    QSettings settings;
-    settings.beginGroup(QStringLiteral("translate"));
-    cfg.apiKey = settings.value(QStringLiteral("api_key")).toString();
-    settings.endGroup();
+    return defaultConfig(settings, envKey);
+}
+
+TranslateConfig TranslateConfig::defaultConfig(QSettings &settings,
+                                                const QString &environmentKey)
+{
+    TranslateConfig cfg;
+    // The environment variable intentionally remains higher priority than the
+    // persisted dialog value.
+    cfg.apiKey = environmentKey.isEmpty()
+        ? settings.value(QStringLiteral("translate/api_key")).toString()
+        : environmentKey;
     return cfg;
+}
+
+Provider providerFromSettings(QSettings &settings, Provider fallback)
+{
+    const QString value = settings.value(QStringLiteral("translate/provider"))
+                              .toString()
+                              .trimmed()
+                              .toLower();
+    if (value == QStringLiteral("stub"))
+        return Provider::Stub;
+    if (value == QStringLiteral("google-v2"))
+        return Provider::GoogleV2;
+    if (value == QStringLiteral("deepl"))
+        return Provider::DeepL;
+    return fallback;
+}
+
+void saveDialogSettings(QSettings &settings,
+                        Provider provider,
+                        const QString &apiKey,
+                        bool saveApiKey)
+{
+    QString providerValue = QStringLiteral("stub");
+    if (provider == Provider::GoogleV2)
+        providerValue = QStringLiteral("google-v2");
+    else if (provider == Provider::DeepL)
+        providerValue = QStringLiteral("deepl");
+
+    settings.setValue(QStringLiteral("translate/provider"), providerValue);
+    if (saveApiKey)
+        settings.setValue(QStringLiteral("translate/api_key"), apiKey);
+    settings.sync();
 }
 
 // ---------------------------------------------------------------------------
