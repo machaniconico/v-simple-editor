@@ -690,6 +690,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/SmartReframeDialog.h
     src/SmartReframeDialog.cpp
     src/ShapeLayer.cpp
+    src/ShapeModifierDialog.h
+    src/ShapeModifierDialog.cpp
     src/Camera3D.cpp
     src/Expression.cpp
     src/Precompose.cpp

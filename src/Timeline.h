@@ -906,6 +906,9 @@ public:
     void setClipLayerMaterial(int trackIdx, int clipIdx,
                               const LayerMaterial &material,
                               bool recordUndo = false);
+    // Shape-clip UI edits shapes[0]. Live changes do not create undo entries.
+    void setClipShapeModifiers(int trackIdx, int clipIdx,
+                               const ShapeModifiers &modifiers, bool recordUndo);
     // Attach a transition to the currently selected clip. FadeIn writes to
     // the clip's leadIn slot (start-of-clip); every other type writes to
     // trailOut (end-of-clip / boundary to next clip).

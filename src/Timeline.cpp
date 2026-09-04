@@ -18,6 +18,7 @@
 #include "ProjectFile.h"
 #include "WaveformGenerator.h"
 #include "MusicRemixDialog.h"
+#include "ShapeModifierDialog.h"
 #include "MusicRemix.h"
 #include "DialogueLevelerDialog.h"
 #include "DialogueLeveler.h"
@@ -7733,6 +7734,10 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
         transClearAct = transitionMenu->addAction(QStringLiteral("トランジションを削除"));
     }
 
+    QAction *shapeModifiersAct = nullptr;
+    if (!clipInfo.shapes.isEmpty())
+        shapeModifiersAct = menu.addAction(QStringLiteral("シェイプモディファイア…"));
+
     QAction *fxAct = menu.addAction(QStringLiteral("ビデオエフェクト..."));
     QAction *ccAct = menu.addAction(QStringLiteral("色補正 / グレーディング..."));
     QAction *adjustmentAct = menu.addAction(QStringLiteral("調整レイヤーを作成"));
@@ -7931,6 +7936,24 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     }
     else if (chosen == transDialogAct) emit transitionDialogRequested();
     else if (transClearAct && chosen == transClearAct) clearTransitionsOnSelected();
+    else if (shapeModifiersAct && chosen == shapeModifiersAct) {
+        const int trackIdx = m_videoTracks.indexOf(track);
+        if (trackIdx < 0 || track->isLocked()) return;
+        // Copy before entering the nested event loop; preview replaces the clips vector.
+        const ShapeModifiers original = track->clips()[clipIndex].shapes.first().modifiers;
+        ShapeModifierDialog dialog(original, this);
+        bool changed = false;
+        connect(&dialog, &ShapeModifierDialog::modifiersChanged, this, [&]() {
+            changed = true;
+            setClipShapeModifiers(trackIdx, clipIndex, dialog.modifiers(), false);
+        });
+        const bool accepted = dialog.exec() == QDialog::Accepted;
+        const ShapeModifiers finalValue = dialog.modifiers();
+        // Restore the original before committing so one user operation is one undo.
+        if (changed) setClipShapeModifiers(trackIdx, clipIndex, original, false);
+        if (accepted && changed && finalValue.toJson() != original.toJson())
+            setClipShapeModifiers(trackIdx, clipIndex, finalValue, true);
+    }
     else if (chosen == fxAct) emit videoEffectsDialogRequested();
     else if (chosen == ccAct) emit colorCorrectionRequested();
     else if (chosen == adjustmentAct) {
@@ -8307,6 +8330,23 @@ void Timeline::setClipLayerMaterial(int trackIdx, int clipIdx,
     track->setClips(clips);
     if (recordUndo)
         saveUndoState("Layer material");
+    scheduleEmitSequenceChanged();
+}
+
+void Timeline::setClipShapeModifiers(int trackIdx, int clipIdx,
+                                     const ShapeModifiers &modifiers, bool recordUndo)
+{
+    if (trackIdx < 0 || trackIdx >= m_videoTracks.size()) return;
+    auto *track = m_videoTracks[trackIdx];
+    if (!track || track->isLocked()) return;
+    auto clips = track->clips();
+    if (clipIdx < 0 || clipIdx >= clips.size() || clips[clipIdx].shapes.isEmpty()) return;
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    clips[clipIdx].shapes[0].modifiers = modifiers;
+    track->setClips(clips);
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+    if (recordUndo) saveUndoState(QStringLiteral("シェイプモディファイア"));
     scheduleEmitSequenceChanged();
 }
 
