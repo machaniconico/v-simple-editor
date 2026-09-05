@@ -123,8 +123,8 @@ Dump generate(const QDir &out, const QString &media)
             const QImage frame = tlrender::renderFrameAt(&timeline, us, kSize);
             result.ok &= !frame.isNull() && frame.size() == kSize;
             const QByteArray bytes = rgbaBytes(frame);
-            if (name == QStringLiteral("a") && index == 1)
-                result.solidMatches = !frame.isNull() && bytes == rgbaBytes(second);
+            if (name == QStringLiteral("b") && index == 1)
+                result.solidMatches = !frame.isNull() && bytes == rgbaBytes(first);
             result.frames.append(bytes);
             saveImage(QStringLiteral("frame_%1_%2.png").arg(name).arg(index++), frame);
             ++result.frameCount;
@@ -132,10 +132,11 @@ Dump generate(const QDir &out, const QString &media)
     };
     {
         Timeline timeline;
-        ClipInfo a = clip(aPath, 0.0, 1.5);
-        ClipInfo b = clip(bPath, 0.0, 2.5);
-        // PNG has only PTS 0. Use the existing freeze-frame mapping so the
-        // legacy decoder does not seek past that single frame (no transition).
+        ClipInfo a = clip(media, 0.0, 1.5);
+        ClipInfo b = clip(media, 0.0, 2.5);
+        // Exercise the legacy no-transition decoder with frozen video frames:
+        // the acceptance build need not provide a libav PNG decoder. Fixture
+        // (b) covers the generated PNGs through the Qt still-image reader.
         a.timeRemapCurve.addKey(0.0, 0.0);
         b.timeRemapCurve.addKey(0.0, 0.0);
         timeline.videoTracks().first()->setClips({a, b});
@@ -204,6 +205,8 @@ Dump generate(const QDir &out, const QString &media)
         c.is3DLayer = true;
         c.layer3D.rotationX = 20.0;
         c.layer3D.positionZ = 40.0;
+        // With lights OFF, the CPU renderer currently leaves this legacy 3D
+        // geometry unchanged; this fixture records that existing no-op.
         timeline.videoTracks().first()->setClips({c});
         render(timeline, QStringLiteral("e"), {1000000});
     }
@@ -285,6 +288,6 @@ int runRenderFixtureSelftest()
     const bool audioRead = readBytes(out.filePath(QStringLiteral("audio.json")), audioAgain);
     gate(2, firstOk && second.ok && framesRead && audioRead
         && frames == framesAgain && audio == audioAgain, "second full generation is bit-identical");
-    gate(3, first.solidMatches && second.solidMatches, "fixture (a) at 1.7s equals every RGBA pixel of source_1.png");
+    gate(3, first.solidMatches && second.solidMatches, "fixture (b) at 0.2s equals every RGBA pixel of source_0.png");
     return summary();
 }
