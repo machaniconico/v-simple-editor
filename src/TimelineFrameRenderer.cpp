@@ -1639,6 +1639,11 @@ QImage renderFrameFromTracks(const Timeline *timeline,
                 && targetSec >= b.timelineStart && targetSec < a.timelineEnd
                 && a.clipIdx >= 0 && a.clipIdx < tracks[t].clips.size()
                 && b.clipIdx >= 0 && b.clipIdx < tracks[t].clips.size()) {
+                // Child overlaps are rendered recursively in sequence time.
+                // Do not remap the parent source through flattened child intervals.
+                if (a.clipIdx == b.clipIdx
+                    && tracks[t].clips[a.clipIdx].isSequenceReference())
+                    continue;
                 overlapA[t] = j - 1;
                 overlapB[t] = j;
                 break;
@@ -1683,8 +1688,13 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         }
         if (primaryTrack < 0) return composed;
         const auto &a = intervals[primaryTrack][primaryIndex];
-        if (a.leadInType == TransitionType::FadeIn
-            || a.trailOutType == TransitionType::FadeOut)
+        // A nested layer already contains its child edge fades. Transitions
+        // between distinct parent clips still belong to this composition.
+        const bool nestedInterval = a.clipIdx >= 0
+            && a.clipIdx < tracks[primaryTrack].clips.size()
+            && tracks[primaryTrack].clips[a.clipIdx].isSequenceReference();
+        if (!nestedInterval && (a.leadInType == TransitionType::FadeIn
+            || a.trailOutType == TransitionType::FadeOut))
             composed = applyEdgeFadeStep(composed, a, targetSec);
         if (overlapA[primaryTrack] != primaryIndex) return composed;
         const auto &b = intervals[primaryTrack][overlapB[primaryTrack]];

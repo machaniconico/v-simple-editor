@@ -320,6 +320,57 @@ int runTransitionExportSelftest()
         }
     }
     gate(8, reverseParity);
+
+    // Regression expectation: G9 FAIL on pre-fix HEAD e3b411e (nested
+    // transitions applied again by the parent), PASS with this fix.
+    // Both builds must be run by the acceptance lane; not claimed here.
+    bool nestedOnce = layersValid;
+    child.videoTracks = {{fade}};
+    nested.duration = nested.outPoint = fade.effectiveDuration();
+    main.videoTracks = {{nested, fast, childVideo}};
+    timeline.setSequences({main, child}, main.id);
+    tlrender::setTransitionStepsEnabledForTest(true);
+    const QImage nestedFadeOnly = render(0.25);
+    nestedOnce &= tlrender::transitionStepCallCountForTest() == 1;
+    OverlapInterval childFade;
+    childFade.timelineStart = 0.0;
+    childFade.timelineEnd = fade.effectiveDuration();
+    childFade.leadInType = TransitionType::FadeIn;
+    childFade.leadInDuration = 0.5;
+    const QImage expectedFade = tlrender::applyEdgeFadeStep(layerA, childFade, 0.25);
+    main.videoTracks = {{nested, fastTransition, nextTransition}};
+    timeline.setSequences({main, child}, main.id);
+    tlrender::setTransitionStepsEnabledForTest(true);
+    const QImage nestedFadeWithParent = render(0.25);
+    const QColor fadeMean = meanColor(nestedFadeWithParent, 0, size.width());
+    nestedOnce &= tlrender::transitionStepCallCountForTest() == 1
+        && pixelsEqual(nestedFadeOnly, nestedFadeWithParent)
+        && mse(nestedFadeOnly, expectedFade) < 1.0
+        && fadeMean.red() >= 126 && fadeMean.red() <= 129
+        && fadeMean.green() == 0 && fadeMean.blue() == 0;
+
+    // Child overlap must also stay in child time, even when parent transition
+    // discovery is enabled by an unrelated pair later on the same track.
+    ClipInfo childA = a, childB = b;
+    childA.trailOut.type = childB.leadIn.type = TransitionType::CrossDissolve;
+    childA.trailOut.duration = childB.leadIn.duration = 1.0;
+    childA.trailOut.alignment = childB.leadIn.alignment = TransitionAlignment::Center;
+    child.videoTracks = {{childA, childB}};
+    nested.duration = nested.outPoint = childA.effectiveDuration() + childB.effectiveDuration();
+    main.videoTracks = {{nested, fast, childVideo}};
+    timeline.setSequences({main, child}, main.id);
+    tlrender::setTransitionStepsEnabledForTest(true);
+    const QImage nestedOverlapOnly = render(1.75);
+    nestedOnce &= tlrender::transitionStepCallCountForTest() == 1;
+    main.videoTracks = {{nested, fastTransition, nextTransition}};
+    timeline.setSequences({main, child}, main.id);
+    tlrender::setTransitionStepsEnabledForTest(true);
+    const QImage nestedOverlapWithParent = render(1.75);
+    nestedOnce &= tlrender::transitionStepCallCountForTest() == 1
+        && pixelsEqual(nestedOverlapOnly, nestedOverlapWithParent)
+        && mse(nestedOverlapOnly, OverlayRenderer::applyTransition(
+            layerA, layerB, TransitionType::CrossDissolve, 0.25)) < 1.0;
+    gate(9, nestedOnce);
     tlrender::setTransitionStepsEnabledForTest(true);
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
     return failed;
