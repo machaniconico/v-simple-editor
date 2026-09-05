@@ -34,7 +34,8 @@ public:
     ~GLPreview();
 
     void displayFrame(const QImage &frame);
-    void setProjectCamera(const Camera3DState &camera);
+    void setProjectCamera(const Camera3D &camera);
+    void setProjectCamera(const Camera3DState &camera) { setProjectCamera(Camera3D{camera}); }
     void setBrushAnimation(BrushAnimation *animation);
     void clearBrushAnimation();
     void setBrushAnimationProgress(double progress);
@@ -325,7 +326,7 @@ private:
     QOpenGLBuffer m_vbo;
     QOpenGLVertexArrayObject m_vao;
 
-    Camera3DState m_projectCamera;
+    Camera3D m_projectCamera;
     QImage m_projectCameraFrame;
     qint64 m_projectCameraFrameTimeUs = -1;
     QImage m_currentFrame;

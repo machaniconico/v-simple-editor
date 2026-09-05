@@ -195,6 +195,11 @@ Camera3D::Camera3D()
     ensureTracks();
 }
 
+Camera3D::Camera3D(const Camera3DState &state) : Camera3D()
+{
+    setCamera(state);
+}
+
 void Camera3D::ensureTracks()
 {
     const int count = static_cast<int>(Camera3DProperty::Count);
@@ -568,7 +573,11 @@ Camera3DState Camera3D::getCameraAt(double time) const
         static_cast<float>(m_tracks[trackIndex(Camera3DProperty::TargetX)].valueAt(time)),
         static_cast<float>(m_tracks[trackIndex(Camera3DProperty::TargetY)].valueAt(time)),
         static_cast<float>(m_tracks[trackIndex(Camera3DProperty::TargetZ)].valueAt(time)));
-    state.fov  = m_tracks[trackIndex(Camera3DProperty::Fov)].valueAt(time);
+    const auto &fovTrack = m_tracks[trackIndex(Camera3DProperty::Fov)];
+    // Solves keyframe pose only: retain the focal length used by the solver.
+    // Keep legacy (projection OFF) evaluation unchanged.
+    state.fov = m_state.trueProjection && !fovTrack.hasKeyframes()
+        ? m_state.fov : fovTrack.valueAt(time);
     state.roll = m_tracks[trackIndex(Camera3DProperty::Roll)].valueAt(time);
 
     // Preserve near/far from current state (not typically animated)

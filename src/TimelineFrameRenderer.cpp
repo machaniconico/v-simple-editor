@@ -1579,6 +1579,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         ? qMax<qint64>(0, usec - 1)
         : usec;
     const double targetSec = static_cast<double>(sampledUsec) / 1'000'000.0;
+    const Camera3DState projectCamera = applyTimelineGlobals && timeline
+        ? timeline->projectCameraAt(targetSec) : Camera3DState{};
     QVector<ActiveAdjustmentClip> activeAdjustments;
 
     // Preserve the ClipInfo path exactly unless this sample is inside a real
@@ -1719,9 +1721,9 @@ QImage renderFrameFromTracks(const Timeline *timeline,
             : applyClipFxStackFromSource(raw, c, local);
         neighbour = applyClipMask(neighbour, c, source);
         neighbour = snsfit::maybeFit(neighbour, c.fitContain, c.fitCover, outSize);
-        if (applyTimelineGlobals && timeline && timeline->projectCamera().trueProjection)
+        if (applyTimelineGlobals && timeline && projectCamera.trueProjection)
             neighbour = applyProjectCameraProjection(
-                neighbour, c.layer3D, c.is3DLayer, timeline->projectCamera(), outSize);
+                neighbour, c.layer3D, c.is3DLayer, projectCamera, outSize);
         neighbour = prepareTransitionLayer(neighbour,
             clipanim::effectiveTransformAt(c, local), outSize);
         return applyOverlapTransitionStep(composed, neighbour, a, targetSec);
@@ -1866,10 +1868,10 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         QImage v1Contained =
             snsfit::maybeFit(v1Native, v1Clip.fitContain, v1Clip.fitCover, outSize);
         // Nested sequence contents are projected once, as the parent reference layer.
-        if (applyTimelineGlobals && timeline && timeline->projectCamera().trueProjection)
+        if (applyTimelineGlobals && timeline && projectCamera.trueProjection)
             v1Contained = applyProjectCameraProjection(
                 v1Contained, v1Clip.layer3D, v1Clip.is3DLayer,
-                timeline->projectCamera(), outSize);
+                projectCamera, outSize);
         v1LayerSource = v1Contained;
 
         // Base canvas placement — V1 clip transform applied via clipgeom SSOT.
@@ -2066,9 +2068,9 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         QImage rgb = native.scaled(outSize, Qt::IgnoreAspectRatio,
                                    Qt::SmoothTransformation);
         // Nested sequence contents are projected once, as the parent reference layer.
-        if (applyTimelineGlobals && timeline && timeline->projectCamera().trueProjection)
+        if (applyTimelineGlobals && timeline && projectCamera.trueProjection)
             rgb = applyProjectCameraProjection(
-                rgb, c.layer3D, c.is3DLayer, timeline->projectCamera(), outSize);
+                rgb, c.layer3D, c.is3DLayer, projectCamera, outSize);
         renderLayer.sourceRgb = rgb;
         renderLayer.layer.name = c.displayName;
         renderLayer.layer.visible = cOpacity > 0.001;

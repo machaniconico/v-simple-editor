@@ -14,6 +14,8 @@ namespace camsolve {
 // Pinhole intrinsics in pixels; independent of Camera3D's legacy fov semantics.
 struct Intrinsics { double f; double cx, cy; };
 Intrinsics makeIntrinsics(double fovDeg, QSize canvas);
+// Camera3DState::fov is already a focal length in pixels.
+Intrinsics makeIntrinsicsFromFocalPx(double fPx, QSize canvas);
 
 struct Pose {
     double R[9] = {1,0,0, 0,1,0, 0,0,1}; // row-major, world to camera

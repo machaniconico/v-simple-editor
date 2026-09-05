@@ -302,6 +302,45 @@ int runCamera3DSelftest()
             && Camera3D::trueProjectionCallCountForTest() == 0;
     }
     gate(8, overlapOk);
+
+    // A static source spanning both sample times isolates camera animation.
+    Timeline animatedTimeline;
+    ClipInfo animatedClip = fixtureClip(QColor(220, 80, 40), canvas);
+    animatedClip.duration = animatedClip.outPoint = 3.0;
+    animatedClip.is3DLayer = true;
+    animatedTimeline.videoTracks()[0]->setClips({animatedClip});
+    Camera3DState animatedState;
+    animatedState.trueProjection = true;
+    Camera3D animatedCamera{animatedState};
+    animatedCamera.track(Camera3DProperty::PositionX)->addKeyframe(0.0, 0.0);
+    animatedCamera.track(Camera3DProperty::PositionX)->addKeyframe(2.0, 200.0);
+    animatedTimeline.setProjectCamera(animatedCamera);
+    Camera3D::setTrueProjectionEnabledForTest(true);
+    const QImage atZero = tlrender::renderFrameAt(&animatedTimeline, 0, canvas);
+    const QImage atTwo = tlrender::renderFrameAt(&animatedTimeline, 2000000, canvas);
+    const QImage animatedSource = ShapeLayer::renderShapesToImage(animatedClip.shapes, canvas);
+    const QImage atTwoReference = Camera3D::applyTrueProjection(
+        animatedSource, animatedClip.layer3D, animatedCamera.getCameraAt(2.0), canvas);
+    bool animationOk = !sameBytes(atZero, atTwo) && mse(atTwo, atTwoReference) < 1.0;
+    animatedTimeline.setProjectCamera(Camera3D{animatedState});
+    animationOk = animationOk && sameBytes(
+        tlrender::renderFrameAt(&animatedTimeline, 0, canvas),
+        tlrender::renderFrameAt(&animatedTimeline, 2000000, canvas));
+
+    // OFF must bypass projection even when keyframe tracks are present.
+    animatedState.trueProjection = false;
+    animatedCamera.setCamera(animatedState);
+    animatedTimeline.setProjectCamera(animatedCamera);
+    Camera3D::setTrueProjectionEnabledForTest(false);
+    const QImage animatedBypass = tlrender::renderFrameAt(&animatedTimeline, 2000000, canvas);
+    Camera3D::setTrueProjectionEnabledForTest(true);
+    const QImage animatedOff = tlrender::renderFrameAt(&animatedTimeline, 2000000, canvas);
+    animationOk = animationOk && sameBytes(animatedOff, animatedBypass)
+        && Camera3D::trueProjectionCallCountForTest() == 0;
+    animatedTimeline.setProjectCamera(animatedState);
+    animationOk = animationOk && sameBytes(animatedOff,
+        tlrender::renderFrameAt(&animatedTimeline, 2000000, canvas));
+    gate(9, animationOk);
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
     return failed;
 }

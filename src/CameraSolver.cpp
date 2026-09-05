@@ -111,6 +111,12 @@ Intrinsics makeIntrinsics(double fovDeg, QSize canvas)
     return {f, canvas.width()/2.0, canvas.height()/2.0};
 }
 
+Intrinsics makeIntrinsicsFromFocalPx(double fPx, QSize canvas)
+{
+    return {std::isfinite(fPx) && fPx > 0 ? fPx : 60.0,
+            canvas.width()/2.0, canvas.height()/2.0};
+}
+
 Pose decomposeHomography(const double H[9], const Intrinsics& k, const Pose* previous)
 {
     if (!H || !std::isfinite(k.f) || k.f <= 0 || !std::isfinite(k.cx) || !std::isfinite(k.cy)) return {};

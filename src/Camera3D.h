@@ -68,6 +68,7 @@ class Camera3D
 {
 public:
     Camera3D();
+    explicit Camera3D(const Camera3DState &state);
 
     // --- Camera state ---
 

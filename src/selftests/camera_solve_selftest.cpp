@@ -28,11 +28,11 @@ Mat rotation(double yaw, double pitch)
     const Mat x = {1,0,0, 0,std::cos(pitch),-std::sin(pitch), 0,std::sin(pitch),std::cos(pitch)};
     return multiply(y, x);
 }
-Mat homography(Mat r, const QVector3D& t = {})
+Mat homography(Mat r, const QVector3D& t = {},
+               const camsolve::Intrinsics& k = intrinsics)
 {
     // Synthetic plane: n=(0,0,-1), d=1. This is fixture generation, not a solver.
     for (int i = 0; i < 3; ++i) r[3*i+2] -= t[i];
-    const auto& k = intrinsics;
     return multiply(multiply(Mat{k.f,0,k.cx, 0,k.f,k.cy, 0,0,1}, r),
                     Mat{1/k.f,0,-k.cx/k.f, 0,1/k.f,-k.cy/k.f, 0,0,1});
 }
@@ -154,8 +154,21 @@ int runCameraSolveSelftest()
     Camera3D applied;
     const double fps = 24.0;
     const double startSec = 2.5;
-    camsolve::applyPosesToCamera(applied, filtered, fps, startSec);
-    bool keyframesOk = applied.camera().trueProjection;
+    const auto focal = camsolve::makeIntrinsicsFromFocalPx(applied.camera().fov, QSize(1920,1080));
+    QVector<QPolygonF> focalFrames;
+    for (int i = 0; i < 30; ++i)
+        focalFrames.append(project(homography(rotation(2.0*i/29, 0), {}, focal)));
+    const auto focalPoses = camsolve::solveSequence(focalFrames, confidence, 0, focal);
+    camsolve::applyPosesToCamera(applied, focalPoses, fps, startSec);
+    bool keyframesOk = applied.camera().trueProjection
+        && focal.f == 60.0 && focal.f == applied.camera().fov
+        && focal.cx == 960 && focal.cy == 540;
+    for (double invalidF : {0.0, -1.0, std::numeric_limits<double>::infinity(),
+                            std::numeric_limits<double>::quiet_NaN()})
+        keyframesOk = keyframesOk
+            && camsolve::makeIntrinsicsFromFocalPx(invalidF, QSize(1920,1080)).f == 60.0;
+    keyframesOk = keyframesOk
+        && camsolve::makeIntrinsicsFromFocalPx(123.0, QSize(1920,1080)).f == 123.0;
     for (auto property : {Camera3DProperty::PositionX, Camera3DProperty::PositionY,
                           Camera3DProperty::PositionZ, Camera3DProperty::TargetX,
                           Camera3DProperty::TargetY, Camera3DProperty::TargetZ,
@@ -169,7 +182,9 @@ int runCameraSolveSelftest()
                 [time](const KeyframePoint& key) { return std::abs(key.time-time) < 1e-10; });
             keyframesOk = keyframesOk && found == filtered[i].valid;
             if (filtered[i].valid) {
-                const auto expected = camsolve::poseToCameraState(filtered[i], applied.camera());
+                const auto expected = camsolve::poseToCameraState(focalPoses[i], applied.camera());
+                keyframesOk = keyframesOk && focalPoses[i].valid
+                    && error(focalPoses[i], rotation(2.0*i/29, 0)) < 0.5;
                 const auto actual = applied.getCameraAt(time);
                 keyframesOk = keyframesOk && (actual.position-expected.position).length() < 1e-6
                     && (actual.target-expected.target).length() < 1e-6
@@ -178,6 +193,12 @@ int runCameraSolveSelftest()
         }
     }
     keyframesOk = keyframesOk && applied.track(Camera3DProperty::Fov)->count() == 0;
+    Camera3DState customFocalState;
+    customFocalState.fov = 123.0;
+    Camera3D customFocalCamera{customFocalState};
+    camsolve::applyPosesToCamera(customFocalCamera, focalPoses, fps, startSec);
+    keyframesOk = keyframesOk && customFocalCamera.getCameraAt(startSec).fov == 123.0
+        && applied.getCameraAt(startSec).fov == focal.f;
     gate(7, keyframesOk);
 
     // Exercise a populated undo slot, including animation and non-default state.

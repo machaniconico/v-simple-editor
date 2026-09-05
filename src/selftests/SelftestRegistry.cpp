@@ -588,7 +588,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "camera-solve",      "VEDITOR_CAMERA_SOLVE_SELFTEST",       runCameraSolveSelftest,        true,
       "Planar camera solver: SVD, continuity, confidence, camera keyframes and single-slot undo (8 gates)" },
     { "camera3d",           "VEDITOR_CAMERA3D_SELFTEST",           runCamera3DSelftest,           true,
-      "Project camera: opt-in projection, view/roll, JSON and export parity (7 gates)" },
+      "Project camera: opt-in projection, view/roll, JSON, overlap and animated export parity (G1-G9)" },
     { "light3d",            "VEDITOR_LIGHT3D_SELFTEST",            runLight3DSelftest,            true,
       "3D lights: compositor/export parity, keyframe edits, dialog guards, JSON, determinism (16 gates)" },
     { "edl-export",        "VEDITOR_EDL_EXPORT_SELFTEST",         runEdlExportSelftest,          false,

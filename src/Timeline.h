@@ -1091,8 +1091,13 @@ public:
     // Project-level Light3D state is carried by Timeline so every
     // renderFrameAt consumer (preview/export/smart-render fallback/nested
     // sequence) evaluates the same immutable-at-render snapshot.
-    void setProjectCamera(const Camera3DState &camera) { m_projectCamera = camera; }
-    Camera3DState projectCamera() const { return m_projectCamera; }
+    void setProjectCamera(const Camera3D &camera) { m_projectCamera = camera; }
+    void setProjectCamera(const Camera3DState &camera) { setProjectCamera(Camera3D{camera}); }
+    Camera3DState projectCamera() const { return m_projectCamera.camera(); }
+    Camera3DState projectCameraAt(double sec) const {
+        return m_projectCamera.hasAnimation() ? m_projectCamera.getCameraAt(sec)
+                                              : m_projectCamera.camera();
+    }
 
     void setProjectLights(const QVector<Light3D> &lights) { m_projectLights = lights; }
     QVector<Light3D> projectLights() const { return m_projectLights; }
@@ -1305,7 +1310,7 @@ private:
     // Project-level 3D lighting snapshot consumed by the render SSOT. The
     // MainWindow owns the editing UI; RenderQueue receives these plain values
     // through Timeline so worker renders never dereference MainWindow.
-    Camera3DState m_projectCamera;
+    Camera3D m_projectCamera;
     QVector<Light3D> m_projectLights;
     QVector3D m_projectLightViewPosition = QVector3D();
     double m_markIn = -1.0;

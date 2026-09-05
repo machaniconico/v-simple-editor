@@ -819,6 +819,7 @@ private:
     Camera3D m_projectCamera;                                 // single per-project camera
     QJsonObject m_projectCameraUndoSlot;
     int m_projectCameraUndoTimelineDepth = -1;
+    quint64 m_projectCameraUndoSaveSerial = 0;
     QVector<Light3D> m_projectLights;                         // project-level 3D lights
     QPointer<Light3DDialog> m_light3DDialog;
     int m_selectedVideoTrackIndex = -1;

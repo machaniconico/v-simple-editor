@@ -7568,7 +7568,8 @@ void MainWindow::updateEditActions()
     m_pasteAction->setEnabled(m_timeline->hasClipboard());
     m_undoAction->setEnabled(m_timeline->canUndo()
         || (!m_projectCameraUndoSlot.isEmpty()
-            && m_timeline->undoManager()->currentIndex() == m_projectCameraUndoTimelineDepth));
+            && m_timeline->undoManager()->currentIndex() == m_projectCameraUndoTimelineDepth
+            && m_timeline->undoManager()->saveSerial() == m_projectCameraUndoSaveSerial));
     m_redoAction->setEnabled(m_timeline->canRedo());
     if (m_reverseClipAction) {
         TrackKind kind = TrackKind::Video;
@@ -7619,9 +7620,9 @@ void MainWindow::syncProjectLightingToTimeline()
         return;
     m_timeline->setProjectLights(m_projectLights);
     m_timeline->setProjectLightViewPosition(m_projectCamera.camera().position);
-    m_timeline->setProjectCamera(m_projectCamera.camera());
+    m_timeline->setProjectCamera(m_projectCamera);
     if (m_player && m_player->glPreview())
-        m_player->glPreview()->setProjectCamera(m_projectCamera.camera());
+        m_player->glPreview()->setProjectCamera(m_projectCamera);
 }
 
 QString MainWindow::particleClipKey(const ClipInfo &clip)
@@ -8361,6 +8362,7 @@ void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
     m_projectCamera = Camera3D{};
     m_projectCameraUndoSlot = QJsonObject{};
     m_projectCameraUndoTimelineDepth = -1;
+    m_projectCameraUndoSaveSerial = 0;
     if (!data.projectCamera.isEmpty())
         m_projectCamera.fromJson(data.projectCamera);
     m_projectLights.clear();
@@ -8723,6 +8725,7 @@ void MainWindow::newProject()
         m_projectCamera = Camera3D{};
         m_projectCameraUndoSlot = QJsonObject{};
         m_projectCameraUndoTimelineDepth = -1;
+        m_projectCameraUndoSaveSerial = 0;
         m_projectLights.clear();
         m_projectOverlays.clear();
         m_particleClipConfigs.clear();
@@ -9706,13 +9709,15 @@ void MainWindow::pasteAttributes()
 void MainWindow::undoAction()
 {
     if (!m_projectCameraUndoSlot.isEmpty()
-        && m_timeline->undoManager()->currentIndex() == m_projectCameraUndoTimelineDepth) {
+        && m_timeline->undoManager()->currentIndex() == m_projectCameraUndoTimelineDepth
+        && m_timeline->undoManager()->saveSerial() == m_projectCameraUndoSaveSerial) {
         // fromJson only replaces tracks present in JSON; clear newly added tracks
         // before restoring a slot whose camera originally had no animation.
         m_projectCamera = Camera3D{};
         m_projectCamera.fromJson(m_projectCameraUndoSlot);
         m_projectCameraUndoSlot = QJsonObject{};
         m_projectCameraUndoTimelineDepth = -1;
+        m_projectCameraUndoSaveSerial = 0;
         syncProjectLightingToTimeline();
         refreshSpecialClipPreview();
         statusBar()->showMessage(QStringLiteral("カメラ解析の適用を元に戻しました"));
@@ -13552,6 +13557,7 @@ void MainWindow::openCameraMotionDialog()
     m_projectCamera = dialog.camera();
     m_projectCameraUndoSlot = QJsonObject{};
     m_projectCameraUndoTimelineDepth = -1;
+    m_projectCameraUndoSaveSerial = 0;
     updateEditActions();
     syncProjectLightingToTimeline();
     refreshSpecialClipPreview();
@@ -14024,6 +14030,7 @@ void MainWindow::applyCameraSolve(const QVector<camsolve::Pose>& poses,
         return;
     m_projectCameraUndoSlot = m_projectCamera.toJson();
     m_projectCameraUndoTimelineDepth = m_timeline->undoManager()->currentIndex();
+    m_projectCameraUndoSaveSerial = m_timeline->undoManager()->saveSerial();
     camsolve::applyPosesToCamera(m_projectCamera, poses, fps, startSec);
     syncProjectLightingToTimeline();
     refreshSpecialClipPreview();

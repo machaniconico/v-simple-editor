@@ -844,7 +844,7 @@ void PlanarTrackerDialog::onCameraSolveClicked()
         confidence.append(frame.confidence);
     }
     const auto poses = camsolve::solveSequence(corners, confidence, 0,
-        camsolve::makeIntrinsics(m_cameraFov, m_cameraCanvas));
+        camsolve::makeIntrinsicsFromFocalPx(m_cameraFov, m_cameraCanvas));
     int valid = 0;
     double residual = 0;
     for (const auto& pose : poses) {

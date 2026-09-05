@@ -1676,13 +1676,13 @@ void GLPreview::setTimeline(Timeline *timeline)
         return;
     m_timeline = timeline;
     m_projectCameraFrame = QImage();
-    if (m_projectCamera.trueProjection) {
+    if (m_projectCamera.camera().trueProjection) {
         m_needsUpload = true;
         update();
     }
 }
 
-void GLPreview::setProjectCamera(const Camera3DState &camera)
+void GLPreview::setProjectCamera(const Camera3D &camera)
 {
     m_projectCamera = camera;
     m_projectCameraFrame = QImage();
@@ -1957,6 +1957,12 @@ void GLPreview::paintGL()
                 << "upload=" << m_needsUpload;
     }
 
+    const auto *cameraPlayer = qobject_cast<VideoPlayer *>(parentWidget());
+    const double cameraSec = cameraPlayer ? cameraPlayer->timelinePositionUs() / 1000000.0 : 0.0;
+    const Camera3DState projectCamera = m_timeline ? m_timeline->projectCameraAt(cameraSec)
+        : (m_projectCamera.hasAnimation() ? m_projectCamera.getCameraAt(cameraSec)
+                                         : m_projectCamera.camera());
+
     glClear(GL_COLOR_BUFFER_BIT);
 
 #if defined(Q_OS_WIN)
@@ -1966,7 +1972,7 @@ void GLPreview::paintGL()
         ensureInteropDeviceForPaint();
 
     if (m_pendingD3D11Texture && m_interopAvailable
-        && !m_projectCamera.trueProjection) {
+        && !projectCamera.trueProjection) {
         renderPendingD3D11Frame();
         if (m_timecodeBurnInRenderer.settings().enabled)
             paintTimecodeBurnInOverlay();
@@ -1979,7 +1985,7 @@ void GLPreview::paintGL()
     // frames. This also avoids projecting a flattened composite or applying
     // shader grade/geometry twice. A seek or output-size change can repaint
     // before another decoded frame arrives, so both belong to the cache key.
-    if (m_projectCamera.trueProjection && m_timeline) {
+    if (projectCamera.trueProjection && m_timeline) {
         if (auto *player = qobject_cast<VideoPlayer *>(parentWidget())) {
             QSize canvas = player->projectOutputSize();
             if (canvas.isEmpty())
@@ -1993,7 +1999,7 @@ void GLPreview::paintGL()
             }
         }
     }
-    const bool cameraBaked = m_projectCamera.trueProjection && m_timeline
+    const bool cameraBaked = projectCamera.trueProjection && m_timeline
         && !m_projectCameraFrame.isNull();
     const bool compositeBaked = m_compositeBakedMode || cameraBaked;
 
@@ -2069,11 +2075,11 @@ void GLPreview::paintGL()
         }
         if (!compositeBaked
             && (std::abs(previewMotion.rotation2D) > 1e-4 || previewMotion.is3DLayer
-                || (m_projectCamera.trueProjection && !previewMotion.layer3D.isDefault()))) {
-            if (m_projectCamera.trueProjection) {
+                || (projectCamera.trueProjection && !previewMotion.layer3D.isDefault()))) {
+            if (projectCamera.trueProjection) {
                 uploadFrame = applyProjectCameraProjection(
                     uploadFrame, previewMotion.layer3D, previewMotion.is3DLayer,
-                    m_projectCamera, uploadFrame.size());
+                    projectCamera, uploadFrame.size());
                 uploadFrame = applyPlanarRotation(uploadFrame, previewMotion.rotation2D);
             } else {
                 uploadFrame = applyPlanarRotation(uploadFrame, previewMotion.rotation2D);
