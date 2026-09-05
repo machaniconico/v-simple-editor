@@ -1115,6 +1115,8 @@ public:
         const std::function<double(const OverlapInterval &)> &trailAvailable,
         const std::function<double(const OverlapInterval &)> &leadAvailable);
     QVector<PlaybackEntry> computeAudioPlaybackSequence() const;
+    static void setAudioOverlapEnabledForTest(bool enabled);
+    static int audioOverlapCallCountForTest();
 
     // Re-emit sequenceChanged / audioSequenceChanged with the current clip
     // graph. Called when an external source (proxy generation, proxy mode

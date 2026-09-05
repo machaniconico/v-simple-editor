@@ -866,7 +866,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "transition-export", "VEDITOR_TRANSITION_EXPORT_SELFTEST", runTransitionExportSelftest, true,
       "Video transition export/preview shared steps and no-transition identity (9 gates)" },
     { "audio-xfade",       "VEDITOR_AUDIO_XFADE_SELFTEST",         runAudioXfadeSelftest,       true,
-      "Audio constant-power crossfade/fade API and export afade=qsin contract (5 gates); QApplication required for Timeline undo/mirror checks" },
+      "Audio constant-power crossfade/fade API and export afade=qsin contract (11 gates); QApplication required for Timeline undo/mirror checks" },
     { "oauth-mock-e2e",   "VEDITOR_OAUTH_MOCK_SELFTEST",        runOAuthMockE2eSelftest,       true,
       "OAuth + Upload pipeline を localhost mock HTTP server で exercise する 10 gate e2e selftest" },
     { "oauth-refresh-e2e", "VEDITOR_OAUTH_REFRESH_E2E_SELFTEST", runOAuthRefreshE2eSelftest,    true,

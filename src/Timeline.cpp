@@ -10305,6 +10305,23 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequenceImpl(
     return result;
 }
 
+namespace {
+// GUI-thread test controls; resetting the switch also resets instrumentation.
+bool audioOverlapEnabled = true;
+int audioOverlapCalls = 0;
+}
+
+void Timeline::setAudioOverlapEnabledForTest(bool enabled)
+{
+    audioOverlapEnabled = enabled;
+    audioOverlapCalls = 0;
+}
+
+int Timeline::audioOverlapCallCountForTest()
+{
+    return audioOverlapCalls;
+}
+
 QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
 {
     // Sum-mix every visible audio track. AudioMixer in VideoPlayer combines
@@ -10335,6 +10352,76 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
                 return &sequence;
         }
         return nullptr;
+    };
+
+    // First pass: project each audio track into the SAME overlap solver as
+    // video. Reverse sources use reflected coordinates so the solver's
+    // clipOut always represents the timeline's trailing source edge.
+    const auto audioIntervals = [](const QVector<ClipInfo> &clips) {
+        QVector<OverlapInterval> intervals;
+        double accum = 0.0;
+        bool hasPair = false;
+        for (int i = 0; i < clips.size(); ++i) {
+            const ClipInfo &c = clips[i];
+            accum += qMax(0.0, c.leadInSec); // including zero-length clips
+            const double duration = c.effectiveDuration();
+            if (duration <= 0.0)
+                continue;
+            OverlapInterval iv;
+            iv.clipIdx = i;
+            iv.timelineStart = accum;
+            iv.timelineEnd = accum + duration;
+            iv.speed = c.speed > 0.0 ? c.speed : 1.0;
+            const double out = c.outPoint > 0.0 ? c.outPoint : c.duration;
+            iv.clipIn = c.reversed ? c.duration - out : c.inPoint;
+            iv.clipOut = c.reversed ? c.duration - c.inPoint : out;
+            // US-206's compatibility exception is specifically CrossDissolve.
+            // Other authored audio transitions retain their legacy positions;
+            // only this solver projection masks them, never the emitted entry.
+            iv.leadInType = c.leadIn.type == TransitionType::CrossDissolve
+                ? c.leadIn.type : TransitionType::None;
+            iv.leadInDuration = c.leadIn.duration;
+            iv.leadInEasing = c.leadIn.easing;
+            iv.trailOutType = c.trailOut.type == TransitionType::CrossDissolve
+                ? c.trailOut.type : TransitionType::None;
+            iv.trailOutDuration = c.trailOut.duration;
+            iv.trailOutAlignment = c.trailOut.alignment;
+            iv.trailOutEasing = c.trailOut.easing;
+            if (!intervals.isEmpty()) {
+                const auto &a = intervals.last();
+                hasPair |= isOverlapTransition(a.trailOutType)
+                    && a.trailOutType == iv.leadInType
+                    && qAbs(a.timelineEnd - iv.timelineStart) <= 1e-3
+                    && qMin(a.trailOutDuration, iv.leadInDuration) > 0.0;
+            }
+            intervals.append(iv);
+            accum += duration;
+        }
+        if (audioOverlapEnabled && hasPair) {
+            ++audioOverlapCalls;
+            Timeline::applyOverlapTransitionsToIntervals(intervals,
+                [&clips](const OverlapInterval &a) {
+                    return qMax(0.0, (clips[a.clipIdx].duration - a.clipOut) / a.speed);
+                }, [](const OverlapInterval &b) {
+                    return qMax(0.0, b.clipIn / b.speed);
+                });
+        }
+        return intervals;
+    };
+    const auto intervalClip = [](const ClipInfo &original, const OverlapInterval &iv) {
+        ClipInfo c = original;
+        // Apply deltas, avoiding roundoff and outPoint normalization on the
+        // disabled/default path (including reversed clips).
+        const double out = c.outPoint > 0.0 ? c.outPoint : c.duration;
+        const double oldIn = c.reversed ? c.duration - out : c.inPoint;
+        const double oldOut = c.reversed ? c.duration - c.inPoint : out;
+        if (iv.clipIn != oldIn || iv.clipOut != oldOut) {
+            c.inPoint = c.reversed ? c.inPoint - (iv.clipOut - oldOut) : iv.clipIn;
+            c.outPoint = c.reversed ? out - (iv.clipIn - oldIn) : iv.clipOut;
+        }
+        c.leadIn.duration = iv.leadInDuration;
+        c.trailOut.duration = iv.trailOutDuration;
+        return c;
     };
 
     std::function<bool(const ClipInfo &, double, int, int, bool, int,
@@ -10370,18 +10457,21 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
                 reverseScanStack);
         sequenceStack.append(refId);
         for (const QVector<ClipInfo> &track : sequence->audioTracks) {
-            double childAccum = 0.0;
-            for (int childIdx = 0; childIdx < track.size(); ++childIdx) {
-                const ClipInfo &child = track[childIdx];
-                childAccum += qMax(0.0, child.leadInSec);
-                const double childDur = child.effectiveDuration();
-                if (childDur <= 0.0)
-                    continue;
+            const auto intervals = audioIntervals(track);
+            const bool expanded = std::any_of(intervals.cbegin(), intervals.cend(),
+                [&track](const OverlapInterval &iv) {
+                    const auto &c = track[iv.clipIdx];
+                    const double out = c.outPoint > 0.0 ? c.outPoint : c.duration;
+                    return iv.clipIn != (c.reversed ? c.duration - out : c.inPoint)
+                        || iv.clipOut != (c.reversed ? c.duration - c.inPoint : out);
+                });
+            for (const OverlapInterval &iv : intervals) {
+                const ClipInfo child = intervalClip(track[iv.clipIdx], iv);
+                const double childAccum = iv.timelineStart;
 
                 const double overlapStart = qMax(sourceIn, childAccum);
-                const double overlapEnd = qMin(sourceOut, childAccum + childDur);
+                const double overlapEnd = qMin(sourceOut, iv.timelineEnd);
                 if (overlapEnd <= overlapStart) {
-                    childAccum += childDur;
                     continue;
                 }
 
@@ -10432,7 +10522,6 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
                                                parentTrackIdx, parentClipIdx,
                                                trackMuted, depth + 1,
                                                sequenceStack);
-                    childAccum += childDur;
                     continue;
                 }
 
@@ -10466,6 +10555,18 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
                 e.trailOutType = timelineTrail.type;
                 e.trailOutDuration = timelineTrail.duration;
                 e.trailOutEasing = timelineTrail.easing;
+                // Newly expanded edges live in child-sequence seconds. Map
+                // their fade windows along with their intervals, including
+                // a sped-up or backward-running parent. Leave legacy fades
+                // byte-identical when this track has not been expanded.
+                if (expanded) {
+                    const double timeScale = (childTimelineEnd - childTimelineStart)
+                        / (overlapEnd - overlapStart);
+                    if (e.leadInType == TransitionType::CrossDissolve)
+                        e.leadInDuration *= timeScale;
+                    if (e.trailOutType == TransitionType::CrossDissolve)
+                        e.trailOutDuration *= timeScale;
+                }
                 result.append(e);
                 appendReversedBinding(e, effectiveReversed);
                 channelModeBindings.append({
@@ -10474,8 +10575,6 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
                     e.sourceClipIndex,
                     child.audioChannelMode
                 });
-
-                childAccum += childDur;
             }
         }
         sequenceStack.removeLast();
@@ -10487,19 +10586,17 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
         if (!track || track->isHidden()) continue;
         const auto &clips = track->clips();
         const bool trackMuted = track->isMuted();
-        double accum = 0.0;
-        for (int ci = 0; ci < clips.size(); ++ci) {
-            const auto &c = clips[ci];
-            accum += qMax(0.0, c.leadInSec);
-            const double clipDur = c.effectiveDuration();
-            if (clipDur <= 0.0) continue;
+        const auto intervals = audioIntervals(clips);
+        for (const OverlapInterval &iv : intervals) {
+            const int ci = iv.clipIdx;
+            const ClipInfo c = intervalClip(clips[ci], iv);
+            const double accum = iv.timelineStart;
             QVector<QString> sequenceStack;
             if (!m_activeSequenceId.isEmpty())
                 sequenceStack.append(m_activeSequenceId);
             if (c.isSequenceReference()
                 && appendSequenceAudioEntries(c, accum, t, ci, trackMuted,
                                               /*depth=*/0, sequenceStack)) {
-                accum += clipDur;
                 continue;
             }
             PlaybackEntry e;
@@ -10507,7 +10604,7 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
             e.clipIn = c.inPoint;
             e.clipOut = (c.outPoint > 0.0) ? c.outPoint : c.duration;
             e.timelineStart = accum;
-            e.timelineEnd = accum + clipDur;
+            e.timelineEnd = iv.timelineEnd;
             e.speed = (c.speed > 0.0) ? c.speed : 1.0;
             e.sourceTrack = t;
             e.audioMuted = trackMuted;
@@ -10529,7 +10626,6 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
                 e.sourceClipIndex,
                 c.audioChannelMode
             });
-            accum += clipDur;
         }
     }
 
