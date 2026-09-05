@@ -54,6 +54,7 @@ int runDeflickerSelftest();
 int runObjectRemovalSelftest();
 int runLight3DSelftest();
 int runCamera3DSelftest();
+int runCameraSolveSelftest();
 int runVoiceIsolationSelftest();
 int runBatchExportSelftest();
 int runBatchExportE2ESelftest();
@@ -584,6 +585,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "AutoMatte: difference matte, morphology, feather, composite" },
     { "object-removal",    "VEDITOR_OBJECT_REMOVAL_SELFTEST",     runObjectRemovalSelftest,      false,
       "ObjectRemoval: temporal trust, background alignment, bounds, dilation, cache, composite (14 gates)" },
+    { "camera-solve",      "VEDITOR_CAMERA_SOLVE_SELFTEST",       runCameraSolveSelftest,        false,
+      "Planar camera solver: Jacobi SVD, decomposition, continuity and confidence (6 gates)" },
     { "camera3d",           "VEDITOR_CAMERA3D_SELFTEST",           runCamera3DSelftest,           true,
       "Project camera: opt-in projection, view/roll, JSON and export parity (7 gates)" },
     { "light3d",            "VEDITOR_LIGHT3D_SELFTEST",            runLight3DSelftest,            true,

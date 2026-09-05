@@ -124,6 +124,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/ObjectRemovalSelftest.cpp
     src/selftests/Light3DSelftest.cpp
     src/selftests/camera3d_selftest.cpp
+    src/selftests/camera_solve_selftest.cpp
     src/selftests/VoiceIsolationSelftest.cpp
     src/selftests/GradeLggSerializationSelftest.cpp
     src/selftests/color_warper_selftest.cpp
@@ -700,6 +701,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/ShapeModifierDialog.h
     src/ShapeModifierDialog.cpp
     src/Camera3D.cpp
+    src/CameraSolver.h
+    src/CameraSolver.cpp
     src/Expression.cpp
     src/Precompose.cpp
     src/Rotoscope.cpp
