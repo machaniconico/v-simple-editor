@@ -31,12 +31,13 @@ A professional video editing application built from scratch with C++17, Qt6, and
 - AI-powered subtitle generation (Whisper)
 
 ### Transitions & Effects
-- 9 transition types (crossfade, wipe, slide, zoom, etc.)
+- 45 transition types (crossfade, wipe, slide, zoom, light leak, morph cut, etc.), rendered identically in preview and export
 - Image overlay & Picture-in-Picture
 - 9 video effects (blur, sharpen, sepia, negative, etc.)
 - Color correction (10 parameters: brightness, contrast, saturation, hue, temperature, tint, gamma, highlights, shadows, exposure)
 - LUT import (.cube format + 4 built-in LUTs)
 - Log-range color wheels (Shadow / Midtone / Highlight) and still store with wipe compare
+- Color warper (12 x 3 hue / saturation mesh, CPU and GPU parity)
 - Effect stacking with keyframe animation (5 interpolation modes)
 - Plugin system (5 built-in: Glow, Emboss, Posterize, Edge Detect, Color Shift)
 - Effect preset library (8 built-in + custom save)
@@ -51,7 +52,7 @@ A professional video editing application built from scratch with C++17, Qt6, and
 - 7 audio effects
 - Audio noise reduction (afftdn)
 - VST3 / AudioUnit plugin support
-- Explicit audio transitions (constant-power crossfade / fade in / fade out)
+- Explicit audio transitions (constant-power crossfade / fade in / fade out) with true clip overlap (Center / Start / End at cut)
 - Dialogue leveler (automatic speech loudness leveling to a target LUFS)
 - Music remix (beat-aware BGM re-timing to a target duration)
 
@@ -69,7 +70,8 @@ A professional video editing application built from scratch with C++17, Qt6, and
 - Transform animations (7 presets)
 - Mask & track mattes
 - Particle system (7 presets)
-- 3D camera (dolly, pan, orbit, zoom)
+- 3D camera (dolly, pan, orbit, zoom) with optional true perspective projection (look-at, roll, layer rotation)
+- 3D camera solve from planar tracks (homography decomposition, no external solver)
 - Expression engine (wiggle, noise, ease)
 - Shape layers (8 primitives) as timeline clips, with Repeater / Trim Paths modifiers
 - Auto-orient along motion path
@@ -189,7 +191,7 @@ MCP の変更系ツールは確認ダイアログを出さず、原則として�
 | `move_clip` | クリップを移動する（`newTrackIndex` で別トラックへ。既定プロジェクトは V1/A1 の 1 段なので、先に `run_command` の「ビデオトラックを追加」を実行する。存在しないトラックを指定するとエラー文でそのコマンド id を案内する） | あり |
 | `set_clip_property` | クリップのプロパティ（volume / opacity / speed / pan / videoScale / reversed / autoOrient）を変更する。`speed` と `reversed` はリンクした音声クリップにも同時に適用される。`autoOrient`（boolean）はモーションパスの進行方向へクリップを自動回転させる（`get_timeline` の各クリップに `autoOrient` が返る） | あり |
 | `trim_clip` | edge=in は開始位置を保ったまま timeSec 時点の内容を新しい先頭にし、以降が (timeSec−開始) だけ左へ詰まる（RippleIn）。edge=out は末尾を timeSec にし後続が詰まる（RippleOut）。kind は video のみだが、同じ linkGroup の音声クリップも同じ量だけトリムされる（ripple 既定 true） | あり |
-| `set_transition` | `kind` 既定 `video`: V1 のクリップにトランジションを設定する（FadeIn は先頭、その他は末尾、None で解除）。`kind:"audio"` では指定音声トラック（`trackIndex`）のクリップにコンスタントパワーの音声トランジションを設定する。音声で使える `type` は `CrossDissolve`（隣接クリップとのクロスフェード）/ `FadeIn` / `FadeOut` のみで、None を含む他の type はエラー。`durationSec` は 0.1..5.0（既定 0.5）。音声側の変更は映像へミラーしない | あり |
+| `set_transition` | `kind` 既定 `video`: V1 のクリップにトランジションを設定する（FadeIn は先頭、その他は末尾、None で解除）。`type` には `MorphCut`（オプティカルフローで A/B を変形しながらつなぐモーフカット）も指定できる。ビデオトランジションはプレビューだけでなく書き出しにも反映される。`kind:"audio"` では指定音声トラック（`trackIndex`）のクリップにコンスタントパワーの音声トランジションを設定する。音声で使える `type` は `CrossDissolve`（隣接クリップとのクロスフェード）/ `FadeIn` / `FadeOut` のみで、None を含む他の type はエラー。`durationSec` は 0.1..5.0（既定 0.5）。音声側の変更は映像へミラーしない | あり |
 | `add_text_overlay` | V1 にテキスト／テロップを追加する（時刻は秒、位置は 0..1。区間と重なる全クリップに付くのでクリップ境界をまたいでも表示される） | あり |
 | `add_caption` | 字幕エディタの一覧に 1 件追加する（タイムラインへは `apply_captions` で反映） | なし（Ctrl+Z 対象外） |
 | `apply_captions` | 字幕エディタの字幕を V1 の 1 語字幕オーバーレイとしてタイムラインへ適用する（既存の生成済み 1 語字幕は置き換え） | あり（タイムライン側のみ。字幕エディタの一覧は戻らない） |
@@ -208,7 +210,7 @@ MCP の変更系ツールは確認ダイアログを出さず、原則として�
 | `music_remix` | 音声クリップ（`kind` は `audio` のみ）をビート境界のセグメントで再構成し、`targetSec`（0 より大きく 86400 以下）の尺へ自動調整する。継ぎ目にはコンスタントパワーのクロスフェードが付く。ビートが 2 個未満の素材は変更せずエラー。応答に `resultDuration` と `segmentCount` を返す | あり |
 | `dialogue_level` | 音声クリップ（`kind` は `audio` のみ）の短時間ラウドネスを解析し、会話音量を `targetLufs`（既定 -18）へ平準化する音量エンベロープを生成する。応答に `pointCount` / `measuredLufsMin` / `measuredLufsMax` を返す | あり |
 
-MCP サーバの自己テストは `--selftest=mcp` または `VEDITOR_MCP_SELFTEST=1` で実行できます（実装: `src/selftests/mcp_selftest.cpp`、ゲート G1..G145。ツール数は 36）。
+MCP サーバの自己テストは `--selftest=mcp` または `VEDITOR_MCP_SELFTEST=1` で実行できます（実装: `src/selftests/mcp_selftest.cpp`、ゲート G1..G147。ツール数は 36）。
 
 ---
 
