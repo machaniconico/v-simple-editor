@@ -209,6 +209,26 @@ int runTransitionExportSelftest()
             && tlrender::transitionStepCallCountForTest() == 1;
     }
     gate(6, previewParity);
+
+    // SSOT preview frames already contain transitions. Display must preserve
+    // their pixels without calling either transition step a second time.
+    auto ssotDisplayMatches = [&](double t) {
+        const QVector<PlaybackEntry> ssotSequence = timeline.computePlaybackSequence();
+        if (ssotSequence.isEmpty()) return false;
+        tlrender::setTransitionStepsEnabledForTest(true);
+        const QImage ssotFrame = render(t);
+        const int renderCalls = tlrender::transitionStepCallCountForTest();
+        const QImage displayed = VideoPlayer::displayFrameForTest(
+            ssotFrame, layerB, ssotSequence, 0, qRound64(t * 1000000.0),
+            /*transitionsAlreadyApplied=*/true);
+        return renderCalls == 1
+            && tlrender::transitionStepCallCountForTest() == renderCalls
+            && pixelsEqual(displayed, ssotFrame);
+    };
+    bool ssotPreviewParity = layersValid && ssotDisplayMatches(1.75);
+    timeline.trackAt(false, 0)->setClips({fade});
+    ssotPreviewParity &= ssotDisplayMatches(0.25);
+    gate(7, ssotPreviewParity);
     tlrender::setTransitionStepsEnabledForTest(true);
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
     return failed;

@@ -323,7 +323,7 @@ public:
         double clipLocalSeconds, double sourceSeconds, QSize canvasSize);
     static QImage displayFrameForTest(const QImage &composed,
         const QImage &neighbourLayer, const QVector<PlaybackEntry> &sequence,
-        int activeEntry, qint64 timelineUsec);
+        int activeEntry, qint64 timelineUsec, bool transitionsAlreadyApplied = false);
     // Test-only seam for grade-keyframe GPU-preview wiring.
     bool pushActiveClipColorCorrectionToGlPreviewForTest(qint64 timelineUsec);
 
@@ -794,6 +794,8 @@ private:
     // 既存のプレビュー出力とビット同一 (回帰ゼロ)。
     aces::AcesPipeline m_acesPipeline;
     bool m_lastFrameOdtApplied{false};
+    // Consumed by displayFrame: renderFrameAt already applied transitions.
+    bool m_lastFrameTransitionsApplied{false};
 
     // EXP-AID: 露出/フォーカス確認エイド。既定 None なので displayFrame は apply を
     // 一切呼ばず従来出力とビット同一 (性能無影響・回帰ゼロ)。None 以外のときだけ

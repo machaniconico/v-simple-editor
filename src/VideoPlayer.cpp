@@ -2452,6 +2452,7 @@ bool VideoPlayer::displayNestedSequenceFrameAt(const Timeline *timeline,
     if (m_glPreview)
         setCompositeBakedModeForDisplay(true);
     cachePreviewComposite(ssotFrame);
+    m_lastFrameTransitionsApplied = true;
     displayFrame(ssotFrame, true, timelineUs);
     return true;
 }
@@ -3587,13 +3588,15 @@ bool VideoPlayer::pushActiveClipColorCorrectionToGlPreviewForTest(qint64 timelin
 
 QImage VideoPlayer::displayFrameForTest(
     const QImage &composed, const QImage &neighbourLayer,
-    const QVector<PlaybackEntry> &sequence, int activeEntry, qint64 timelineUsec)
+    const QVector<PlaybackEntry> &sequence, int activeEntry, qint64 timelineUsec,
+    bool transitionsAlreadyApplied)
 {
     VideoPlayer player;
     player.m_sequence = sequence;
     player.m_activeEntry = activeEntry;
     player.m_timelinePositionUs = timelineUsec;
     player.m_transitionNeighbourForTest = neighbourLayer;
+    player.m_lastFrameTransitionsApplied = transitionsAlreadyApplied;
     player.displayFrame(composed, /*overlaysAlreadyBaked=*/true, timelineUsec);
     return player.m_currentFrameImage;
 }
@@ -3601,6 +3604,8 @@ QImage VideoPlayer::displayFrameForTest(
 void VideoPlayer::displayFrame(const QImage &image, bool overlaysAlreadyBaked,
                                qint64 displayTimelineUsec)
 {
+    const bool transitionsAlreadyApplied = m_lastFrameTransitionsApplied;
+    m_lastFrameTransitionsApplied = false;
     undotrace::log("displayFrame:enter");
     const qint64 timelineUsec =
         resolvedDisplayTimelineUsec(displayTimelineUsec);
@@ -3612,7 +3617,7 @@ void VideoPlayer::displayFrame(const QImage &image, bool overlaysAlreadyBaked,
     // CrossDissolve uses the timeline-overlap path — Timeline overlaps the
     // CrossDissolve pair so B is in m_sequence with timelineStart pulled
     // back by D, and the blend happens via harvestOverlayLayer below.
-    if (!composed.isNull() && sequenceActive()
+    if (!transitionsAlreadyApplied && !composed.isNull() && sequenceActive()
         && m_activeEntry >= 0 && m_activeEntry < m_sequence.size()) {
         const auto &e = m_sequence[m_activeEntry];
         const double T = static_cast<double>(m_timelinePositionUs)
@@ -5712,6 +5717,7 @@ void VideoPlayer::refreshDisplayedFrame()
                 previewTimeline, m_timelinePositionUs, renderSize);
             if (!refreshed.isNull()) {
                 m_lastFrameOdtApplied = false;
+                m_lastFrameTransitionsApplied = true;
                 displayFrame(refreshed, true, m_timelinePositionUs);
                 return;
             }
@@ -5720,6 +5726,7 @@ void VideoPlayer::refreshDisplayedFrame()
         // last valid nested frame without burning the new overlay list into
         // it a second time.
         m_lastFrameOdtApplied = false;
+        m_lastFrameTransitionsApplied = true;
         displayFrame(m_lastSourceFrame, true, m_timelinePositionUs);
         return;
     }
@@ -6288,6 +6295,7 @@ void VideoPlayer::handlePlaybackTick()
                 if (m_glPreview)
                     setCompositeBakedModeForDisplay(true);
                 cachePreviewComposite(ssotFrame);
+                m_lastFrameTransitionsApplied = true;
                 displayFrame(ssotFrame, true, m_timelinePositionUs);
                 servedByNestedSequenceSsot = true;
             }
