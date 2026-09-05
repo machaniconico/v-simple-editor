@@ -151,6 +151,7 @@ int runProSelftest();
 int runProjTmplSelftest();
 int runProjectPresetSelftest();
 int runProxySelftestV2();
+int runRenderFixtureSelftest();
 int runRenderQueueAcesDecisionSelftest();
 int runRenderQueueFpsRationalSelftest();
 int runRightclickPausePrefSelftest();
@@ -694,6 +695,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Shape clip G1-G10: JSON, raster SSOT, preview/export, trim/repeater, modifier dialog + undo, legacy brush byte identity" },
     { "colormatch-apply",  "VEDITOR_COLORMATCH_APPLY_SELFTEST",    runColorMatchApplySelftest,    true,
       "ColorMatch apply: generated .cube -> selected clip LUT fields + undo + renderFrameAt reflection" },
+    { "render-fixture", "VEDITOR_RENDER_FIXTURE_SELFTEST", runRenderFixtureSelftest, true,
+      "Deterministic acceptance-lane render/audio dump (G1-G3; VEDITOR_RENDER_FIXTURE_OUT required)" },
     { "parity",            "VEDITOR_PARITY_SELFTEST",             runParitySelftest,             true,
       "Preview vs export pixel-parity (S1-S11, framediff::mse, 10-bit HDR10)" },
     { "keyframe-anim-parity", "VEDITOR_KEYFRAME_ANIM_PARITY_SELFTEST", runKeyframeAnimParitySelftest, true,

@@ -84,6 +84,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     # PRD-SPLIT-MAIN-1: selftest registry (table + dispatch helpers).
     src/selftests/SelftestRegistry.h
     src/selftests/SelftestRegistry.cpp
+    src/selftests/render_fixture_selftest.cpp
 
     # PRD-PHASE5B-OAUTH-MOCK-HARNESS: localhost OAuth/upload mock server for e2e selftests.
     src/selftests/oauth_mock_server.h
