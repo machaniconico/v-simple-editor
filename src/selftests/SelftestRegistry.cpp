@@ -52,6 +52,7 @@ int runAutoMatteSelftest();
 int runDeflickerSelftest();
 int runObjectRemovalSelftest();
 int runLight3DSelftest();
+int runCamera3DSelftest();
 int runVoiceIsolationSelftest();
 int runBatchExportSelftest();
 int runBatchExportE2ESelftest();
@@ -582,6 +583,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "AutoMatte: difference matte, morphology, feather, composite" },
     { "object-removal",    "VEDITOR_OBJECT_REMOVAL_SELFTEST",     runObjectRemovalSelftest,      false,
       "ObjectRemoval: temporal trust, background alignment, bounds, dilation, cache, composite (14 gates)" },
+    { "camera3d",           "VEDITOR_CAMERA3D_SELFTEST",           runCamera3DSelftest,           true,
+      "Project camera: opt-in projection, view/roll, JSON and export parity (7 gates)" },
     { "light3d",            "VEDITOR_LIGHT3D_SELFTEST",            runLight3DSelftest,            true,
       "3D lights: compositor/export parity, keyframe edits, dialog guards, JSON, determinism (16 gates)" },
     { "edl-export",        "VEDITOR_EDL_EXPORT_SELFTEST",         runEdlExportSelftest,          false,

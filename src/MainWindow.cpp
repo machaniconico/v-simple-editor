@@ -7617,6 +7617,9 @@ void MainWindow::syncProjectLightingToTimeline()
         return;
     m_timeline->setProjectLights(m_projectLights);
     m_timeline->setProjectLightViewPosition(m_projectCamera.camera().position);
+    m_timeline->setProjectCamera(m_projectCamera.camera());
+    if (m_player && m_player->glPreview())
+        m_player->glPreview()->setProjectCamera(m_projectCamera.camera());
 }
 
 QString MainWindow::particleClipKey(const ClipInfo &clip)
@@ -13527,6 +13530,7 @@ void MainWindow::openCameraMotionDialog()
         return;
     m_projectCamera = dialog.camera();
     syncProjectLightingToTimeline();
+    refreshSpecialClipPreview();
     statusBar()->showMessage(QStringLiteral("カメラモーションを更新しました"), 4000);
 }
 

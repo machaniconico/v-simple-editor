@@ -1,6 +1,7 @@
 #include "TimelineFrameRenderer.h"
 #include "Timeline.h"
 #include "Light3D.h"
+#include "Camera3D.h"
 #include "VideoEffect.h"        // VideoEffectProcessor::applyColorCorrection (CPU SSOT)
 #include "LutImporter.h"        // LutImporter::loadCubeFile / applyLutWithIntensity
 #include "AdjustmentLayer.h"    // composeAdjustmentLayersAt (S6 — genuine composite)
@@ -1849,8 +1850,13 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         const QImage v1Native = applyClipMask(v1MaskInput, v1Clip, v1SourceSec);
         const bool contained =
             snsfit::shouldFit(v1Clip.fitContain, v1Clip.fitCover, outSize, v1Native.size());
-        const QImage v1Contained =
+        QImage v1Contained =
             snsfit::maybeFit(v1Native, v1Clip.fitContain, v1Clip.fitCover, outSize);
+        // Nested sequence contents are projected once, as the parent reference layer.
+        if (applyTimelineGlobals && timeline && timeline->projectCamera().trueProjection)
+            v1Contained = applyProjectCameraProjection(
+                v1Contained, v1Clip.layer3D, v1Clip.is3DLayer,
+                timeline->projectCamera(), outSize);
         v1LayerSource = v1Contained;
 
         // Base canvas placement — V1 clip transform applied via clipgeom SSOT.
@@ -2044,8 +2050,12 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         // Scale the overlay source to the shared canvas grid first; the
         // compositor's videoScale then sizes the dst rect relative to the
         // canvas exactly as composeMultiTrackFrame does for L.rgb.
-        const QImage rgb = native.scaled(outSize, Qt::IgnoreAspectRatio,
-                                         Qt::SmoothTransformation);
+        QImage rgb = native.scaled(outSize, Qt::IgnoreAspectRatio,
+                                   Qt::SmoothTransformation);
+        // Nested sequence contents are projected once, as the parent reference layer.
+        if (applyTimelineGlobals && timeline && timeline->projectCamera().trueProjection)
+            rgb = applyProjectCameraProjection(
+                rgb, c.layer3D, c.is3DLayer, timeline->projectCamera(), outSize);
         renderLayer.sourceRgb = rgb;
         renderLayer.layer.name = c.displayName;
         renderLayer.layer.visible = cOpacity > 0.001;

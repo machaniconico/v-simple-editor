@@ -19,6 +19,7 @@
 #include "VideoEffect.h"
 #include "LutImporter.h"
 #include "MotionStabilizer.h"
+#include "Camera3D.h"
 
 class Timeline;
 class SurfaceTool;
@@ -33,6 +34,7 @@ public:
     ~GLPreview();
 
     void displayFrame(const QImage &frame);
+    void setProjectCamera(const Camera3DState &camera);
     void setBrushAnimation(BrushAnimation *animation);
     void clearBrushAnimation();
     void setBrushAnimationProgress(double progress);
@@ -323,6 +325,8 @@ private:
     QOpenGLBuffer m_vbo;
     QOpenGLVertexArrayObject m_vao;
 
+    Camera3DState m_projectCamera;
+    QImage m_projectCameraFrame;
     QImage m_currentFrame;
     BrushAnimation *m_brushAnimation = nullptr;
     double m_brushAnimationProgress = 0.0;

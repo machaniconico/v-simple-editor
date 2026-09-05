@@ -5,6 +5,7 @@
 #include "UndoTrace.h"
 #include "AdjustmentLayer.h"
 #include "Camera3D.h"
+#include "TimelineFrameRenderer.h"
 #include "clipanim/ClipAnim.h"
 #include "SurfaceTool.h"
 #include <algorithm>
@@ -147,7 +148,7 @@ PreviewClipMotion makePreviewMotion(const ClipInfo &clip, int trackIdx, int clip
     motion.rotation2D = clip.rotation2DDegrees;
     motion.opacity = clip.opacity;
     motion.is3DLayer = clip.is3DLayer;
-    motion.layer3D = clip.is3DLayer ? clip.layer3D : Layer3DTransform{};
+    motion.layer3D = clip.layer3D;
     if (clip.keyframes.hasAnyKeyframes()) {
         const clipgeom::ClipTransform transform =
             clipanim::effectiveTransformAt(clip, clipLocalSeconds);
@@ -262,6 +263,7 @@ out vec4 FragColor;
 
 uniform sampler2D uTexture;
 uniform bool uEffectsEnabled;
+uniform bool uProjectCameraBaked;
 uniform float uClipOpacity;
 
 // Color correction uniforms
@@ -768,6 +770,11 @@ vec3 blurBright9(vec2 uv, float radiusPx, float threshold) {
 }
 
 void main() {
+    // Project-camera CPU composite already contains all clip processing.
+    if (uProjectCameraBaked) {
+        FragColor = texture(uTexture, vTexCoord);
+        return;
+    }
     // US-EF-4: Lens Distortion — applied at the very TOP of main() as a
     // texture-coordinate transform BEFORE the texture sample. amount<0 →
     // barrel (frame edges bow outward), amount>0 → pincushion. Identity at
@@ -1429,6 +1436,7 @@ void GLPreview::displayD3D11Frame(void *d3d11Texture, int subresource, int width
 #if defined(Q_OS_WIN)
     if (!m_interopAvailable || !d3d11Texture || width <= 0 || height <= 0)
         return;
+    m_projectCameraFrame = QImage();
     m_pendingD3D11Texture = d3d11Texture;
     m_pendingD3D11Subresource = subresource;
     m_pendingD3D11Width = width;
@@ -1662,6 +1670,14 @@ void GLPreview::resizeGL(int w, int h)
     glViewport(0, 0, w, h);
 }
 
+void GLPreview::setProjectCamera(const Camera3DState &camera)
+{
+    m_projectCamera = camera;
+    m_projectCameraFrame = QImage();
+    m_needsUpload = true;
+    update();
+}
+
 void GLPreview::displayFrame(const QImage &frame)
 {
     undotrace::log("gl:displayFrame:enter");
@@ -1674,6 +1690,7 @@ void GLPreview::displayFrame(const QImage &frame)
     // builder can convert SOURCE-pixel offsets to UV-fraction. Identity
     // path (m_stabKeyframes empty) leaves the matrix at identity so this
     // is a free no-op when stabilization is not in use.
+    m_projectCameraFrame = QImage();
     m_stabFrameW = frame.width();
     m_stabFrameH = frame.height();
     const QImage::Format inFmt = frame.format();
@@ -1936,7 +1953,8 @@ void GLPreview::paintGL()
     if (m_interopAvailable && m_pendingD3D11Device && !m_interopDevice)
         ensureInteropDeviceForPaint();
 
-    if (m_pendingD3D11Texture && m_interopAvailable) {
+    if (m_pendingD3D11Texture && m_interopAvailable
+        && !m_projectCamera.trueProjection) {
         renderPendingD3D11Frame();
         if (m_timecodeBurnInRenderer.settings().enabled)
             paintTimecodeBurnInOverlay();
@@ -1945,7 +1963,24 @@ void GLPreview::paintGL()
     }
 #endif
 
-    if (m_currentFrame.isNull()) {
+    // Opt-in preview uses the export layer stack, including multi-track/baked
+    // frames. This also avoids projecting a flattened composite or applying
+    // shader grade/geometry twice. Cache until the next frame/camera update.
+    if (m_projectCamera.trueProjection && m_timeline && m_projectCameraFrame.isNull()) {
+        if (auto *player = qobject_cast<VideoPlayer *>(parentWidget())) {
+            QSize canvas = player->projectOutputSize();
+            if (canvas.isEmpty())
+                canvas = m_currentFrame.size();
+            m_projectCameraFrame = tlrender::renderFrameAt(
+                m_timeline, player->timelinePositionUs(), canvas);
+            if (!m_projectCameraFrame.isNull())
+                m_needsUpload = true;
+        }
+    }
+    const bool cameraBaked = m_projectCamera.trueProjection && !m_projectCameraFrame.isNull();
+    const bool compositeBaked = m_compositeBakedMode || cameraBaked;
+
+    if (m_currentFrame.isNull() && !cameraBaked) {
         undotrace::log("gl:paintGL:exit");
         return;
     }
@@ -1958,11 +1993,12 @@ void GLPreview::paintGL()
     const int physW = qMax(1, qRound(width() * dpr));
     const int physH = qMax(1, qRound(height() * dpr));
 
+    const QImage &aspectFrame = cameraBaked ? m_projectCameraFrame : m_currentFrame;
     const double frameAspect =
         (m_displayAspectRatio > 0.0 && std::isfinite(m_displayAspectRatio))
             ? m_displayAspectRatio
-            : ((m_currentFrame.height() > 0)
-                   ? static_cast<double>(m_currentFrame.width()) / m_currentFrame.height()
+            : ((aspectFrame.height() > 0)
+                   ? static_cast<double>(aspectFrame.width()) / aspectFrame.height()
                    : 1.0);
     const double widgetAspect =
         (physH > 0) ? static_cast<double>(physW) / physH : frameAspect;
@@ -1988,7 +2024,7 @@ void GLPreview::paintGL()
         if (auto *player = qobject_cast<VideoPlayer *>(parentWidget()))
             timelineSec = static_cast<double>(player->timelinePositionUs()) / AV_TIME_BASE;
         previewMotion = resolvePreviewClipMotion(m_timeline, timelineSec,
-                                                 m_compositeBakedMode,
+                                                 compositeBaked,
                                                  m_videoSourceScale,
                                                  m_videoSourceDx,
                                                  m_videoSourceDy);
@@ -1998,13 +2034,13 @@ void GLPreview::paintGL()
     double renderDx = m_videoSourceDx;
     double renderDy = m_videoSourceDy;
     double clipOpacity = 1.0;
-    QImage uploadFrame = m_currentFrame;
-    if (m_brushAnimation) {
+    QImage uploadFrame = cameraBaked ? m_projectCameraFrame : m_currentFrame;
+    if (m_brushAnimation && !cameraBaked) {
         OverlayRenderer::renderBrushOverlay(uploadFrame,
                                             m_brushAnimation,
                                             m_brushAnimationProgress);
     }
-    if (previewMotion.valid) {
+    if (previewMotion.valid && !cameraBaked) {
         renderScale = previewMotion.scale;
         renderDx = previewMotion.dx;
         renderDy = previewMotion.dy;
@@ -2014,15 +2050,23 @@ void GLPreview::paintGL()
             m_videoSourceDx = renderDx;
             m_videoSourceDy = renderDy;
         }
-        if (!m_compositeBakedMode
-            && (std::abs(previewMotion.rotation2D) > 1e-4 || previewMotion.is3DLayer)) {
-            uploadFrame = applyPlanarRotation(uploadFrame, previewMotion.rotation2D);
-            if (previewMotion.is3DLayer) {
-                Camera3DState cameraState;
-                uploadFrame = Camera3D::applyPerspective(uploadFrame,
-                                                         previewMotion.layer3D,
-                                                         cameraState,
-                                                         uploadFrame.size());
+        if (!compositeBaked
+            && (std::abs(previewMotion.rotation2D) > 1e-4 || previewMotion.is3DLayer
+                || (m_projectCamera.trueProjection && !previewMotion.layer3D.isDefault()))) {
+            if (m_projectCamera.trueProjection) {
+                uploadFrame = applyProjectCameraProjection(
+                    uploadFrame, previewMotion.layer3D, previewMotion.is3DLayer,
+                    m_projectCamera, uploadFrame.size());
+                uploadFrame = applyPlanarRotation(uploadFrame, previewMotion.rotation2D);
+            } else {
+                uploadFrame = applyPlanarRotation(uploadFrame, previewMotion.rotation2D);
+                if (previewMotion.is3DLayer) {
+                    Camera3DState cameraState;
+                    uploadFrame = Camera3D::applyPerspective(uploadFrame,
+                                                             previewMotion.layer3D,
+                                                             cameraState,
+                                                             uploadFrame.size());
+                }
             }
         }
     }
@@ -2035,7 +2079,7 @@ void GLPreview::paintGL()
     // this guard, the per-tick composite pass would either clobber the
     // user's drag state (if it called setVideoSourceTransform(1, 0, 0))
     // or apply the transform twice on top of the baked canvas.
-    if (!m_compositeBakedMode
+    if (!compositeBaked
         && (renderScale != 1.0 || renderDx != 0.0 || renderDy != 0.0)) {
         const int baseW = viewportW;
         const int baseH = viewportH;
@@ -2147,6 +2191,7 @@ void GLPreview::paintGL()
 
     // Set uniforms
     m_program->setUniformValue(m_locTexture, 0);
+    m_program->setUniformValue("uProjectCameraBaked", cameraBaked);
     m_program->setUniformValue(m_locEffectsEnabled, m_effectsEnabled);
     if (m_locClipOpacity != -1)
         m_program->setUniformValue(m_locClipOpacity, static_cast<float>(clipOpacity));

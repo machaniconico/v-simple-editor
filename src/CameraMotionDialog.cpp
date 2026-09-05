@@ -220,6 +220,9 @@ void CameraMotionDialog::buildUi()
         fl->addRow(QStringLiteral("ターゲット Z"), m_tgtZ);
         fl->addRow(QStringLiteral("FOV (度)"), m_fov);
         fl->addRow(QStringLiteral("ロール (度)"), m_roll);
+        m_trueProjection = new QCheckBox(
+            QStringLiteral("真の透視投影 (回転・注視点・ロールを反映)"), m_baseCameraGroup);
+        fl->addRow(m_trueProjection);
     }
     mainLayout->addWidget(m_baseCameraGroup);
 
@@ -325,6 +328,8 @@ void CameraMotionDialog::buildUi()
     connectDSB(m_posX); connectDSB(m_posY); connectDSB(m_posZ);
     connectDSB(m_tgtX); connectDSB(m_tgtY); connectDSB(m_tgtZ);
     connectDSB(m_fov);  connectDSB(m_roll);
+    connect(m_trueProjection, &QCheckBox::toggled,
+            this, &CameraMotionDialog::onBaseCameraEdited);
 
     // Shake widgets
     connect(m_shakeEnabled, &QCheckBox::toggled,
@@ -424,6 +429,7 @@ void CameraMotionDialog::applyStateToWidgets(const Camera3DState &state)
     m_tgtZ->setValue(static_cast<double>(state.target.z()));
     m_fov->setValue(state.fov);
     m_roll->setValue(state.roll);
+    m_trueProjection->setChecked(state.trueProjection);
 }
 
 void CameraMotionDialog::applyShakeToWidgets(const CameraShake &shake)
@@ -451,6 +457,7 @@ Camera3DState CameraMotionDialog::baseStateFromWidgets() const
         static_cast<float>(m_tgtZ->value()));
     s.fov  = m_fov->value();
     s.roll = m_roll->value();
+    s.trueProjection = m_trueProjection->isChecked();
     return s;
 }
 
@@ -727,6 +734,7 @@ void CameraMotionDialog::blockAllSignals(bool block)
     m_tgtZ->blockSignals(block);
     m_fov->blockSignals(block);
     m_roll->blockSignals(block);
+    m_trueProjection->blockSignals(block);
 
     m_shakeEnabled->blockSignals(block);
     m_shakeFreq->blockSignals(block);

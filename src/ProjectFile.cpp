@@ -17,6 +17,18 @@
 
 namespace {
 
+// Keep legacy camera JSON unchanged; the opt-in flag is written only as true.
+QJsonObject projectCameraJsonForSave(QJsonObject camera)
+{
+    QJsonObject state = camera.value(QStringLiteral("cameraState")).toObject();
+    const QString key = QStringLiteral("trueProjection");
+    if (state.contains(key) && !state.value(key).toBool(false)) {
+        state.remove(key);
+        camera[QStringLiteral("cameraState")] = state;
+    }
+    return camera;
+}
+
 void appendPngU32(QByteArray &bytes, quint32 value)
 {
     bytes.append(static_cast<char>((value >> 24) & 0xff));
@@ -802,7 +814,7 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
         root["wiggleClipEntries"] = wigArr;
     }
     if (!data.projectCamera.isEmpty())
-        root["projectCamera"] = data.projectCamera;
+        root["projectCamera"] = projectCameraJsonForSave(data.projectCamera);
     if (!data.projectLights.isEmpty())
         root["projectLights"] = data.projectLights;
 
@@ -1399,7 +1411,7 @@ QString ProjectFile::toJsonString(const ProjectData &data)
         root["wiggleClipEntries"] = wigArr;
     }
     if (!data.projectCamera.isEmpty())
-        root["projectCamera"] = data.projectCamera;
+        root["projectCamera"] = projectCameraJsonForSave(data.projectCamera);
     if (!data.projectLights.isEmpty())
         root["projectLights"] = data.projectLights;
 
