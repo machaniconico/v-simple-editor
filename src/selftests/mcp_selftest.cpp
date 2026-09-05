@@ -3645,6 +3645,13 @@ int runMcpSelftest()
                    QStringLiteral("transition output, pairing, selection, or undo restoration did not match"));
 
         // US-202 reserves G146-G147; use the same live pair and undo protocol.
+        auto timelineTrackObject = [](const QJsonObject &payload,
+                                      const QString &kind, int trackIndex) {
+            const QJsonArray tracks = payload.value(kind).toArray();
+            return trackIndex >= 0 && trackIndex < tracks.size()
+                ? tracks.at(trackIndex).toObject() : QJsonObject{};
+        };
+
         saveMcpLiveBaseline();
         const auto morphBefore = captionVideo0->clips();
         const QJsonObject morphResponse = callProjectInfoTool(
