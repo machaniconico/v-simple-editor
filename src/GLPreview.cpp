@@ -1670,6 +1670,18 @@ void GLPreview::resizeGL(int w, int h)
     glViewport(0, 0, w, h);
 }
 
+void GLPreview::setTimeline(Timeline *timeline)
+{
+    if (m_timeline == timeline)
+        return;
+    m_timeline = timeline;
+    m_projectCameraFrame = QImage();
+    if (m_projectCamera.trueProjection) {
+        m_needsUpload = true;
+        update();
+    }
+}
+
 void GLPreview::setProjectCamera(const Camera3DState &camera)
 {
     m_projectCamera = camera;
@@ -1965,19 +1977,24 @@ void GLPreview::paintGL()
 
     // Opt-in preview uses the export layer stack, including multi-track/baked
     // frames. This also avoids projecting a flattened composite or applying
-    // shader grade/geometry twice. Cache until the next frame/camera update.
-    if (m_projectCamera.trueProjection && m_timeline && m_projectCameraFrame.isNull()) {
+    // shader grade/geometry twice. A seek or output-size change can repaint
+    // before another decoded frame arrives, so both belong to the cache key.
+    if (m_projectCamera.trueProjection && m_timeline) {
         if (auto *player = qobject_cast<VideoPlayer *>(parentWidget())) {
             QSize canvas = player->projectOutputSize();
             if (canvas.isEmpty())
                 canvas = m_currentFrame.size();
-            m_projectCameraFrame = tlrender::renderFrameAt(
-                m_timeline, player->timelinePositionUs(), canvas);
-            if (!m_projectCameraFrame.isNull())
+            const qint64 timeUs = player->timelinePositionUs();
+            if (m_projectCameraFrame.isNull() || m_projectCameraFrameTimeUs != timeUs
+                || m_projectCameraFrame.size() != canvas) {
+                m_projectCameraFrame = tlrender::renderFrameAt(m_timeline, timeUs, canvas);
+                m_projectCameraFrameTimeUs = timeUs;
                 m_needsUpload = true;
+            }
         }
     }
-    const bool cameraBaked = m_projectCamera.trueProjection && !m_projectCameraFrame.isNull();
+    const bool cameraBaked = m_projectCamera.trueProjection && m_timeline
+        && !m_projectCameraFrame.isNull();
     const bool compositeBaked = m_compositeBakedMode || cameraBaked;
 
     if (m_currentFrame.isNull() && !cameraBaked) {

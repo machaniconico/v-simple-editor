@@ -218,7 +218,7 @@ void CameraMotionDialog::buildUi()
         fl->addRow(QStringLiteral("ターゲット X"), m_tgtX);
         fl->addRow(QStringLiteral("ターゲット Y"), m_tgtY);
         fl->addRow(QStringLiteral("ターゲット Z"), m_tgtZ);
-        fl->addRow(QStringLiteral("FOV (度)"), m_fov);
+        fl->addRow(QStringLiteral("焦点距離 (px)"), m_fov);
         fl->addRow(QStringLiteral("ロール (度)"), m_roll);
         m_trueProjection = new QCheckBox(
             QStringLiteral("真の透視投影 (回転・注視点・ロールを反映)"), m_baseCameraGroup);

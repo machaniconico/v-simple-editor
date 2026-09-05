@@ -174,7 +174,7 @@ public:
     // US-INT-1: non-owning Timeline pointer used to query
     // composeAdjustmentLayersAt(timelineUs) in paintGL. nullptr → no-op
     // (preview is bit-identical to pre-INT-1 baseline).
-    void setTimeline(Timeline *t) { m_timeline = t; }
+    void setTimeline(Timeline *t);
     const Timeline *timeline() const { return m_timeline; }
 
     // Project-level data burn-in. The renderer is shared with both export
@@ -327,6 +327,7 @@ private:
 
     Camera3DState m_projectCamera;
     QImage m_projectCameraFrame;
+    qint64 m_projectCameraFrameTimeUs = -1;
     QImage m_currentFrame;
     BrushAnimation *m_brushAnimation = nullptr;
     double m_brushAnimationProgress = 0.0;

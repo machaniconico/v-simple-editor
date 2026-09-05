@@ -198,6 +198,7 @@ int runCamera3DSelftest()
 
     front.layer3D.rotationY = 25;
     front.layer3D.positionZ = 12;
+    front.rotation2DDegrees = 17;
     back.is3DLayer = true; // Default transform still receives camera pan and roll.
     camera.target.setX(0.1f);
     camera.roll = 12;
@@ -222,9 +223,29 @@ int runCamera3DSelftest()
     }
     Camera3D::setTrueProjectionEnabledForTest(false);
     const QImage enabledButBypassed = tlrender::renderFrameAt(&timeline, 0, canvas);
-    gate(7, exportCalls == 2 && mse(exported, reference) < 1.0
+    bool exportOk = exportCalls == 2 && mse(exported, reference) < 1.0
             && mse(exported, enabledButBypassed) > 1.0
-            && Camera3D::trueProjectionCallCountForTest() == 0);
+            && Camera3D::trueProjectionCallCountForTest() == 0;
+    // A non-default transform opts a layer in even without the explicit flag.
+    // Conversely, an ordinary 2D layer must remain untouched with the camera ON.
+    front.is3DLayer = false;
+    setFixture(front, back);
+    Camera3D::setTrueProjectionEnabledForTest(true);
+    const QImage implicit3D = tlrender::renderFrameAt(&timeline, 0, canvas);
+    exportOk = exportOk && sameBytes(exported, implicit3D)
+        && Camera3D::trueProjectionCallCountForTest() == 2;
+    plain = front;
+    plain.layer3D.reset();
+    back.is3DLayer = false;
+    setFixture(plain, back);
+    Camera3D::setTrueProjectionEnabledForTest(true);
+    const QImage ordinary2D = tlrender::renderFrameAt(&timeline, 0, canvas);
+    exportOk = exportOk && Camera3D::trueProjectionCallCountForTest() == 0;
+    camera.trueProjection = false;
+    timeline.setProjectCamera(camera);
+    exportOk = exportOk && sameBytes(ordinary2D,
+        tlrender::renderFrameAt(&timeline, 0, canvas));
+    gate(7, exportOk);
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
     return failed;
 }
