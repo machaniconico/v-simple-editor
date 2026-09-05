@@ -2,6 +2,7 @@
 #include "../TimelineFrameRenderer.h"
 #include "../VideoPlayer.h"
 #include "../Overlay.h"
+#include "../libavcore/Encode.h"
 
 #include <QFileInfo>
 #include <QTemporaryDir>
@@ -11,6 +12,39 @@
 #include <limits>
 
 namespace {
+bool writeChangingClip(const QString &path, QSize size, bool blueChannel)
+{
+    libavcore::EncodeRequest req;
+    req.width = size.width();
+    req.height = size.height();
+    req.fps = req.fpsNum = 24;
+    req.fpsDen = 1;
+    req.videoBitrateBits = 600000;
+    req.outputPath = path.toStdString();
+    req.videoCodecName = "mpeg4";
+    req.hwVendorHint = "none";
+    req.useHardwareAccel = false;
+    libavcore::FrameEncoder encoder;
+    if (auto error = encoder.open(req)) {
+        std::fprintf(stderr, "G8 fixture open: %s\n", error->c_str());
+        return false;
+    }
+    for (int i = 0; i < 48; ++i) {
+        QImage frame(size, QImage::Format_RGB888);
+        const int value = 16 + i * 4;
+        frame.fill(blueChannel ? QColor(16, 16, value) : QColor(value, 16, 16));
+        if (!encoder.pushFrame(frame, i)) {
+            std::fprintf(stderr, "G8 fixture frame %d failed\n", i);
+            return false;
+        }
+    }
+    if (auto error = encoder.finalize()) {
+        std::fprintf(stderr, "G8 fixture finalize: %s\n", error->c_str());
+        return false;
+    }
+    return true;
+}
+
 bool bitsEqual(const QImage &a, const QImage &b)
 {
     if (a.isNull() || b.isNull() || a.size() != b.size() || a.format() != b.format())
@@ -229,6 +263,63 @@ int runTransitionExportSelftest()
     timeline.trackAt(false, 0)->setClips({fade});
     ssotPreviewParity &= ssotDisplayMatches(0.25);
     gate(7, ssotPreviewParity);
+
+    // Regression expectation: G8 FAIL on pre-fix HEAD 3dcab5c (forward source
+    // mapping inside overlaps), PASS with the reverse-overlap fix. Execution
+    // of both builds is left to the acceptance lane, not claimed here.
+    const QString changingAPath = temp.filePath(QStringLiteral("changing-a.mp4"));
+    const QString changingBPath = temp.filePath(QStringLiteral("changing-b.mp4"));
+    bool reverseParity = temp.isValid()
+        && writeChangingClip(changingAPath, size, false)
+        && writeChangingClip(changingBPath, size, true);
+    if (reverseParity) {
+        // Distinct changing channels prevent A/B timing errors cancelling.
+        // Check A only, B only, then both reversed, away from the midpoint.
+        for (int reverseMask : {1, 2, 3}) {
+            ClipInfo changingA = clip(changingAPath), changingB = clip(changingBPath);
+            changingA.duration = changingB.duration = 2.0;
+            changingA.inPoint = changingB.inPoint = 0.5;
+            changingA.outPoint = changingB.outPoint = 1.5;
+            changingA.reversed = (reverseMask & 1) != 0;
+            changingB.reversed = (reverseMask & 2) != 0;
+            transitionPair(timeline, changingA, changingB, TransitionType::CrossDissolve);
+            const auto reverseIntervals = timeline.videoOverlapIntervals();
+            const auto reverseSequence = timeline.computePlaybackSequence();
+            if (reverseIntervals.isEmpty() || reverseIntervals[0].size() != 2
+                || reverseSequence.size() != 2) {
+                reverseParity = false;
+                continue;
+            }
+            const double t = 0.75;
+            // Oracle follows entryLocalPositionUs using the actual playback
+            // entries and the production ClipInfo mapper, not export's helper.
+            auto previewSource = [&](const ClipInfo &c, const PlaybackEntry &entry) {
+                const double local = qMax(0.0, t - entry.timelineStart);
+                const double source = c.reversed ? c.sourceSecondAtLocalTime(local)
+                    : entry.clipIn + local * entry.speed;
+                return static_cast<double>(qRound64(source * 1000000.0)) / 1000000.0;
+            };
+            // Preserve the decoder's existing reverse boundary convention:
+            // a reversed source samples the frame immediately before its PTS.
+            const QImage decodedA = tlrender::detail::decodeClipFrameNativeForTest(
+                changingAPath, previewSource(changingA, reverseSequence[0]),
+                changingA.reversed, changingA.inPoint);
+            const QImage decodedB = tlrender::detail::decodeClipFrameNativeForTest(
+                changingBPath, previewSource(changingB, reverseSequence[1]),
+                changingB.reversed, changingB.inPoint);
+            const QImage expected = tlrender::applyOverlapTransitionStep(
+                decodedA, decodedB, reverseIntervals[0][0], t);
+            const QImage actual = render(t);
+            const double error = mse(actual, expected);
+            const bool ok = !decodedA.isNull() && !decodedB.isNull()
+                && t > reverseIntervals[0][1].timelineStart
+                && t < reverseIntervals[0][0].timelineEnd && error < 1.0;
+            if (!ok)
+                std::fprintf(stderr, "G8 reverse mask %d: MSE %.6f\n", reverseMask, error);
+            reverseParity &= ok;
+        }
+    }
+    gate(8, reverseParity);
     tlrender::setTransitionStepsEnabledForTest(true);
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
     return failed;

@@ -1206,6 +1206,27 @@ double sourceSecondForClipAtLocalTime(const ClipInfo &clip, double localSec,
     return qBound(clip.inPoint, clip.inPoint + remappedLocal, sourceOut);
 }
 
+// Match VideoPlayer::entryLocalPositionUs within the borrowed interval.
+// Direct reverse clips keep their original trim; flattened sequence entries
+// instead map through the expanded interval's source range.
+double overlapSourceSecond(const OverlapInterval &iv, const ClipInfo &clip,
+                           double localSec, bool reverseCompositionActive)
+{
+    if (reverseCompositionActive && (clip.reversed || clip.isSequenceReference())) {
+        ClipInfo mapped{};
+        if (!clip.isSequenceReference()) {
+            mapped = clip;
+        } else {
+            mapped.inPoint = iv.clipIn;
+            mapped.outPoint = mapped.duration = iv.clipOut;
+            mapped.speed = iv.speed;
+        }
+        mapped.reversed = true;
+        return mapped.sourceSecondAtLocalTime(localSec);
+    }
+    return qBound(iv.clipIn, iv.clipIn + localSec * iv.speed, iv.clipOut);
+}
+
 QString renderClipId(int trackIdx, int clipIdx)
 {
     // RM-1.1: same shared formula as MainWindow::brushClipId and
@@ -1634,7 +1655,7 @@ QImage renderFrameFromTracks(const Timeline *timeline,
     auto sourceAt = [&](int t, const ClipInfo &c, double local, bool reverse) {
         if (overlapA[t] >= 0) {
             const auto &a = intervals[t][overlapA[t]];
-            return qBound(a.clipIn, a.clipIn + local * a.speed, a.clipOut);
+            return overlapSourceSecond(a, c, local, reverse);
         }
         return sourceSecondForClipAtLocalTime(c, local, reverse);
     };
@@ -1668,7 +1689,9 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         const auto &b = intervals[primaryTrack][overlapB[primaryTrack]];
         const ClipInfo &c = tracks[primaryTrack].clips[b.clipIdx];
         const double local = targetSec - b.timelineStart;
-        const double source = qBound(b.clipIn, b.clipIn + local * b.speed, b.clipOut);
+        const bool reverse = sampleFromLeftBoundary
+            || clipParticipatesInReverseComposition(c, sequenceSnapshot);
+        const double source = overlapSourceSecond(b, c, local, reverse);
         const QImage raw = renderClipSourceFrame(
             timeline, c, source, local, outSize, sequenceDepth,
             sequenceSnapshot, sequenceStack, projectLights,
@@ -2736,12 +2759,13 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize,
 
 namespace detail {
 
-QImage decodeClipFrameNativeForTest(const QString &filePath, double sourceSec)
+QImage decodeClipFrameNativeForTest(const QString &filePath, double sourceSec,
+                                   bool usePreviousSourceFrame, double sourceInSec)
 {
     // Thin pass-through to the production decode helper so the parity
     // selftest's reference path uses the byte-identical libav+sws decode
     // renderFrameAt applies per layer. No logic is duplicated.
-    return decodeClipFrameNative(filePath, sourceSec);
+    return decodeClipFrameNative(filePath, sourceSec, usePreviousSourceFrame, sourceInSec);
 }
 
 

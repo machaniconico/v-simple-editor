@@ -147,7 +147,9 @@ bool lightingSelftestSeamWasCalled();
 // authoritative comparator) byte-identical decoded frames so the measured
 // MSE reflects compositing fidelity, not decode-path drift. NOT part of the
 // production render API; do not call from the export/preview pipelines.
-QImage decodeClipFrameNativeForTest(const QString &filePath, double sourceSec);
+QImage decodeClipFrameNativeForTest(const QString &filePath, double sourceSec,
+                                   bool usePreviousSourceFrame = false,
+                                   double sourceInSec = 0.0);
 } // namespace detail
 
 } // namespace tlrender
