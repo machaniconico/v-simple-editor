@@ -14,6 +14,9 @@
 
 class Timeline;
 struct ClipInfo;
+struct OverlapInterval;
+struct PlaybackEntry;
+namespace clipgeom { struct ClipTransform; }
 
 // Single Source Of Truth (SSOT) Timeline -> QImage renderer.
 //
@@ -51,12 +54,26 @@ struct ClipInfo;
 //     has no adjustment layer / the V1 clip has no text, so S2/S3/S4/S5 stay
 //     byte-identical (MSE 0).
 //
-// Transitions and 2D rotation are still out of scope (the authoritative
-// multi-track compositor itself applies no rotation). Any failure (no
+// Transitions share the preview post-overlay seam. Any failure (no
 // timeline, no V1 clip, decode error) yields a null QImage so callers can
 // fall back gracefully; an upper track that fails to decode is skipped
 // rather than failing the whole frame.
 namespace tlrender {
+
+// Timeless source for transition-bearing stills; null for video/animation.
+QImage readTransitionStillFrame(const QString &filePath);
+// Place the neighbouring clip alone, without canvas overlays or adjustments.
+QImage prepareTransitionLayer(QImage source, const clipgeom::ClipTransform &transform,
+                              QSize canvasSize);
+// Test switch also resets the calling thread's observation count.
+void setTransitionStepsEnabledForTest(bool enabled);
+int transitionStepCallCountForTest();
+QImage applyEdgeFadeStep(QImage composed, const OverlapInterval &entry, double T);
+QImage applyEdgeFadeStep(QImage composed, const PlaybackEntry &entry, double T);
+QImage applyOverlapTransitionStep(QImage composed, const QImage &neighbourLayer,
+                                 const OverlapInterval &entry, double T);
+QImage applyOverlapTransitionStep(QImage composed, const QImage &neighbourLayer,
+                                 const PlaybackEntry &entry, double T);
 
 // Pure temporal-composite helper. `echoes[0]` is the frame at t-delay,
 // `echoes[1]` at t-2*delay, and so on; each receives decay^(index+1).

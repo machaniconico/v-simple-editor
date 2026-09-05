@@ -44,6 +44,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <limits>
+#include <QImageReader>
 #include <map>
 #include <tuple>
 #include <functional>
@@ -69,6 +71,102 @@ QImage applyRasterAlphaMask(const QImage &sourceImage, const QVector<Mask> &mask
 }
 
 namespace tlrender {
+namespace {
+thread_local bool transitionStepsEnabled = true;
+thread_local int transitionStepCalls = 0;
+OverlapInterval transitionInterval(const PlaybackEntry &e)
+{
+    OverlapInterval iv;
+    iv.timelineStart = e.timelineStart;
+    iv.timelineEnd = e.timelineEnd;
+    iv.leadInType = e.leadInType;
+    iv.trailOutType = e.trailOutType;
+    iv.leadInDuration = e.leadInDuration;
+    iv.trailOutDuration = e.trailOutDuration;
+    iv.leadInEasing = e.leadInEasing;
+    iv.trailOutEasing = e.trailOutEasing;
+    return iv;
+}
+}
+QImage readTransitionStillFrame(const QString &filePath)
+{
+    QImageReader reader(filePath);
+    if (!reader.canRead() || reader.supportsAnimation()) return QImage();
+    return reader.read().convertToFormat(QImage::Format_RGBA8888);
+}
+QImage prepareTransitionLayer(QImage source, const clipgeom::ClipTransform &transform,
+                              QSize canvasSize)
+{
+    if (source.isNull()) return source;
+    if (source.size() != canvasSize)
+        source = source.scaled(canvasSize, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+    if (transform.videoScale == 1.0 && transform.videoDx == 0.0
+        && transform.videoDy == 0.0 && transform.rotationDeg == 0.0)
+        return source;
+    return clipgeom::renderLayer(source, transform, canvasSize, /*smooth=*/true);
+}
+void setTransitionStepsEnabledForTest(bool enabled)
+{
+    transitionStepsEnabled = enabled;
+    transitionStepCalls = 0;
+}
+int transitionStepCallCountForTest() { return transitionStepCalls; }
+
+QImage applyEdgeFadeStep(QImage composed, const OverlapInterval &e, double T)
+{
+    ++transitionStepCalls;
+    if (!transitionStepsEnabled || composed.isNull()) return composed;
+    const double elapsed = T - e.timelineStart;
+    const double remaining = e.timelineEnd - T;
+    double alpha = 1.0;
+    if (e.leadInType == TransitionType::FadeIn
+        && e.leadInDuration > 0.0
+        && elapsed >= 0.0 && elapsed < e.leadInDuration) {
+        const double raw = qBound(0.0, elapsed / e.leadInDuration, 1.0);
+        alpha = applyEasing(raw, e.leadInEasing);
+    } else if (e.trailOutType == TransitionType::FadeOut
+        && e.trailOutDuration > 0.0
+        && remaining >= 0.0 && remaining < e.trailOutDuration) {
+        const double raw = qBound(0.0, remaining / e.trailOutDuration, 1.0);
+        alpha = applyEasing(raw, e.trailOutEasing);
+    }
+    if (alpha < 0.999) {
+        QImage faded(composed.size(), QImage::Format_ARGB32_Premultiplied);
+        faded.fill(Qt::black);
+        QPainter pp(&faded);
+        pp.setOpacity(alpha);
+        pp.drawImage(0, 0, composed);
+        pp.end();
+        composed = faded;
+    }
+
+    return composed;
+}
+QImage applyEdgeFadeStep(QImage composed, const PlaybackEntry &e, double T)
+{
+    return applyEdgeFadeStep(composed, transitionInterval(e), T);
+}
+QImage applyOverlapTransitionStep(QImage composed, const QImage &neighbourLayer,
+                                 const OverlapInterval &e, double T)
+{
+    ++transitionStepCalls;
+    const double remaining = e.timelineEnd - T;
+    if (!transitionStepsEnabled || composed.isNull() || neighbourLayer.isNull()
+        || !isOverlapTransition(e.trailOutType) || e.trailOutDuration <= 0.0
+        || remaining < 0.0 || remaining >= e.trailOutDuration)
+        return composed;
+    const double rawProgress = qBound(0.0,
+        1.0 - remaining / e.trailOutDuration, 1.0);
+    const double progress = applyEasing(rawProgress, e.trailOutEasing);
+    return OverlayRenderer::applyTransition(
+        composed, neighbourLayer, e.trailOutType, progress);
+}
+QImage applyOverlapTransitionStep(QImage composed, const QImage &neighbourLayer,
+                                 const PlaybackEntry &e, double T)
+{
+    return applyOverlapTransitionStep(composed, neighbourLayer, transitionInterval(e), T);
+}
+
 
 namespace detail {
 
@@ -1402,6 +1500,15 @@ QImage renderClipSourceFrame(const Timeline *timeline,
             sequenceStack, projectLights, projectLightViewPosition,
             resolvedSampleFromLeft);
     }
+    // A still has one decoded frame, not footage handles with later PTS.
+    // Transition-bearing stills must hold that frame throughout the borrowed
+    // interval. Gate this on transitions to preserve every legacy no-
+    // transition decode path (including its failure behaviour) byte-for-byte.
+    if (clip.leadIn.type != TransitionType::None
+        || clip.trailOut.type != TransitionType::None) {
+        const QImage still = readTransitionStillFrame(clip.filePath);
+        if (!still.isNull()) return still;
+    }
     return decodeClipFrameNative(
         clip.filePath, sourceSec,
         resolvedSampleFromLeft, clip.inPoint);
@@ -1452,6 +1559,137 @@ QImage renderFrameFromTracks(const Timeline *timeline,
     const double targetSec = static_cast<double>(sampledUsec) / 1'000'000.0;
     QVector<ActiveAdjustmentClip> activeAdjustments;
 
+    // Preserve the ClipInfo path exactly unless this sample is inside a real
+    // borrowed overlap. In particular, nested/source-speed mapping outside
+    // that window must not inherit playback's flattened interval mapping.
+    bool hasTransitions = false;
+    for (const auto &track : tracks)
+        for (const auto &clip : track.clips)
+            hasTransitions |= clip.leadIn.type != TransitionType::None
+                           || clip.trailOut.type != TransitionType::None;
+    QVector<QVector<OverlapInterval>> intervals;
+    if (hasTransitions && applyTimelineGlobals)
+        intervals = timeline->videoOverlapIntervals();
+    else if (hasTransitions) {
+        for (const auto &track : tracks) {
+            QVector<OverlapInterval> ivs;
+            double start = 0.0;
+            for (int i = 0; i < track.clips.size(); ++i) {
+                const ClipInfo &c = track.clips[i];
+                start += qMax(0.0, c.leadInSec);
+                OverlapInterval iv;
+                iv.timelineStart = start;
+                iv.timelineEnd = start + c.effectiveDuration();
+                iv.clipIn = c.inPoint;
+                iv.clipOut = c.outPoint > 0.0 ? c.outPoint : c.duration;
+                iv.speed = c.speed > 0.0 ? c.speed : 1.0;
+                iv.clipIdx = i;
+                iv.leadInType = c.leadIn.type;
+                iv.trailOutType = c.trailOut.type;
+                iv.leadInDuration = c.leadIn.duration;
+                iv.trailOutDuration = c.trailOut.duration;
+                iv.trailOutAlignment = c.trailOut.alignment;
+                iv.leadInEasing = c.leadIn.easing;
+                iv.trailOutEasing = c.trailOut.easing;
+                if (c.effectiveDuration() > 0.0) ivs.append(iv);
+                start = iv.timelineEnd;
+            }
+            Timeline::applyOverlapTransitionsToIntervals(ivs,
+                [&](const OverlapInterval &a) {
+                    return qMax(0.0, (track.clips[a.clipIdx].duration - a.clipOut) / a.speed);
+                }, [](const OverlapInterval &b) {
+                    return qMax(0.0, b.clipIn / b.speed);
+                });
+            intervals.append(ivs);
+        }
+    }
+    QVector<int> overlapA(tracks.size(), -1);
+    QVector<int> overlapB(tracks.size(), -1);
+    for (int t = 0; t < intervals.size() && t < tracks.size(); ++t) {
+        if (tracks[t].hidden) continue;
+        const auto &ivs = intervals[t];
+        for (int j = 1; j < ivs.size(); ++j) {
+            const auto &a = ivs[j - 1];
+            const auto &b = ivs[j];
+            if (isOverlapTransition(a.trailOutType)
+                && a.trailOutType == b.leadInType
+                && b.timelineStart < a.timelineEnd
+                && targetSec >= b.timelineStart && targetSec < a.timelineEnd
+                && a.clipIdx >= 0 && a.clipIdx < tracks[t].clips.size()
+                && b.clipIdx >= 0 && b.clipIdx < tracks[t].clips.size()) {
+                overlapA[t] = j - 1;
+                overlapB[t] = j;
+                break;
+            }
+        }
+    }
+    auto selectClip = [&](int t, bool clamp, double *start) {
+        if (overlapA[t] >= 0) {
+            const auto &a = intervals[t][overlapA[t]];
+            *start = a.timelineStart;
+            return a.clipIdx;
+        }
+        return activeClipOnTrack(tracks[t].clips, targetSec, clamp, start);
+    };
+    auto sourceAt = [&](int t, const ClipInfo &c, double local, bool reverse) {
+        if (overlapA[t] >= 0) {
+            const auto &a = intervals[t][overlapA[t]];
+            return qBound(a.clipIn, a.clipIn + local * a.speed, a.clipOut);
+        }
+        return sourceSecondForClipAtLocalTime(c, local, reverse);
+    };
+
+    // The preview applies transitions to its primary playback entry only,
+    // selected by (timelineStart, sourceTrack). Other tracks have already
+    // contributed to the completed canvas at this seam.
+    auto finishTransitions = [&](QImage composed) {
+        if (!hasTransitions || composed.isNull()) return composed;
+        int primaryTrack = -1;
+        int primaryIndex = -1;
+        double earliest = (std::numeric_limits<double>::max)();
+        for (int t = 0; t < intervals.size() && t < tracks.size(); ++t) {
+            if (tracks[t].hidden) continue;
+            for (int j = 0; j < intervals[t].size(); ++j) {
+                const auto &iv = intervals[t][j];
+                if (targetSec >= iv.timelineStart && targetSec < iv.timelineEnd
+                    && iv.timelineStart < earliest) {
+                    earliest = iv.timelineStart;
+                    primaryTrack = t;
+                    primaryIndex = j;
+                }
+            }
+        }
+        if (primaryTrack < 0) return composed;
+        const auto &a = intervals[primaryTrack][primaryIndex];
+        if (a.leadInType == TransitionType::FadeIn
+            || a.trailOutType == TransitionType::FadeOut)
+            composed = applyEdgeFadeStep(composed, a, targetSec);
+        if (overlapA[primaryTrack] != primaryIndex) return composed;
+        const auto &b = intervals[primaryTrack][overlapB[primaryTrack]];
+        const ClipInfo &c = tracks[primaryTrack].clips[b.clipIdx];
+        const double local = targetSec - b.timelineStart;
+        const double source = qBound(b.clipIn, b.clipIn + local * b.speed, b.clipOut);
+        const QImage raw = renderClipSourceFrame(
+            timeline, c, source, local, outSize, sequenceDepth,
+            sequenceSnapshot, sequenceStack, projectLights,
+            projectLightViewPosition, sampleFromLeftBoundary);
+        if (raw.isNull()) return composed;
+        const EchoFrameProvider provider = [&](double src, double loc) {
+            return prepareClipSourceForEcho(renderClipSourceFrame(
+                timeline, c, src, loc, outSize, sequenceDepth,
+                sequenceSnapshot, sequenceStack, projectLights,
+                projectLightViewPosition, sampleFromLeftBoundary), c, loc);
+        };
+        QImage neighbour = hasActiveEcho(c, local)
+            ? applyClipFxStackWithEchoFromSource(raw, c, local, source, provider)
+            : applyClipFxStackFromSource(raw, c, local);
+        neighbour = applyClipMask(neighbour, c, source);
+        neighbour = snsfit::maybeFit(neighbour, c.fitContain, c.fitCover, outSize);
+        neighbour = prepareTransitionLayer(neighbour,
+            clipanim::effectiveTransformAt(c, local), outSize);
+        return applyOverlapTransitionStep(composed, neighbour, a, targetSec);
+    };
+
     // ── Resolve + decode the V1 base layer ──────────────────────────────────
     // Single-track byte-identity with S2: V1 alone with a default transform
     // must produce the SAME pixels S2 returned (decode native -> scale to
@@ -1493,8 +1731,7 @@ QImage renderFrameFromTracks(const Timeline *timeline,
             base = QImage(outSize, QImage::Format_RGBA8888);
             base.fill(Qt::transparent);
         } else {
-            v1Idx = activeClipOnTrack(v1Clips, targetSec,
-                                      /*clampToFirst=*/true, &v1Start);
+            v1Idx = selectClip(0, /*clampToFirst=*/true, &v1Start);
             if (v1Idx < 0)
                 return QImage();
 
@@ -1507,8 +1744,7 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         const bool v1ReverseComposition = sampleFromLeftBoundary
             || clipParticipatesInReverseComposition(
                 v1Clip, sequenceSnapshot);
-        const double v1SourceSec = sourceSecondForClipAtLocalTime(
-            v1Clip, v1LocalSec, v1ReverseComposition);
+        const double v1SourceSec = sourceAt(0, v1Clip, v1LocalSec, v1ReverseComposition);
         const bool v1HasKeyframes = v1Clip.keyframes.hasAnyKeyframes();
         v1Transform = v1HasKeyframes
             ? clipanim::effectiveTransformAt(v1Clip, v1LocalSec)
@@ -1682,16 +1918,14 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         // Overlay tracks do NOT clamp-to-first: an upper track only
         // contributes where it genuinely has a clip under the playhead
         // (matches computePlaybackSequence's interval-only stacking).
-        const int idx = activeClipOnTrack(clips, targetSec,
-                                          /*clampToFirst=*/false, &start);
+        const int idx = selectClip(t, /*clampToFirst=*/false, &start);
         if (idx < 0)
             continue;
         const ClipInfo &c = clips[idx];
         const double localSec = targetSec - start;            // >= 0
         const bool reverseComposition = sampleFromLeftBoundary
             || clipParticipatesInReverseComposition(c, sequenceSnapshot);
-        const double srcSec = sourceSecondForClipAtLocalTime(
-            c, localSec, reverseComposition);
+        const double srcSec = sourceAt(t, c, localSec, reverseComposition);
         const bool cHasKeyframes = c.keyframes.hasAnyKeyframes();
         const clipgeom::ClipTransform cTransform = cHasKeyframes
             ? clipanim::effectiveTransformAt(c, localSec)
@@ -2022,8 +2256,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         const QImage adj = applyTimelineGlobals
             ? applyAdjustmentLayers(styledBase, timeline, sampledUsec)
             : styledBase;
-        return applyTextOverlays(
-            adj, sampledUsec, &v1Clip, generatedCaptions);
+        return finishTransitions(applyTextOverlays(
+            adj, sampledUsec, &v1Clip, generatedCaptions));
     }
 
     // ── Composite ──────────────────────────────────────────────────────────
@@ -2356,8 +2590,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
     const QImage adj = applyTimelineGlobals
         ? applyAdjustmentLayers(stacked, timeline, sampledUsec)
         : stacked;
-    return applyTextOverlays(
-        adj, sampledUsec, &v1Clip, generatedCaptions);
+    return finishTransitions(applyTextOverlays(
+        adj, sampledUsec, &v1Clip, generatedCaptions));
 }
 
 QImage renderFrameAtSingleWithSequenceSnapshot(

@@ -3585,6 +3585,19 @@ bool VideoPlayer::pushActiveClipColorCorrectionToGlPreviewForTest(qint64 timelin
     return pushed;
 }
 
+QImage VideoPlayer::displayFrameForTest(
+    const QImage &composed, const QImage &neighbourLayer,
+    const QVector<PlaybackEntry> &sequence, int activeEntry, qint64 timelineUsec)
+{
+    VideoPlayer player;
+    player.m_sequence = sequence;
+    player.m_activeEntry = activeEntry;
+    player.m_timelinePositionUs = timelineUsec;
+    player.m_transitionNeighbourForTest = neighbourLayer;
+    player.displayFrame(composed, /*overlaysAlreadyBaked=*/true, timelineUsec);
+    return player.m_currentFrameImage;
+}
+
 void VideoPlayer::displayFrame(const QImage &image, bool overlaysAlreadyBaked,
                                qint64 displayTimelineUsec)
 {
@@ -3599,35 +3612,15 @@ void VideoPlayer::displayFrame(const QImage &image, bool overlaysAlreadyBaked,
     // CrossDissolve uses the timeline-overlap path — Timeline overlaps the
     // CrossDissolve pair so B is in m_sequence with timelineStart pulled
     // back by D, and the blend happens via harvestOverlayLayer below.
-    // Wipes / slides need path geometry not yet wired through displayFrame.
     if (!composed.isNull() && sequenceActive()
         && m_activeEntry >= 0 && m_activeEntry < m_sequence.size()) {
         const auto &e = m_sequence[m_activeEntry];
         const double T = static_cast<double>(m_timelinePositionUs)
                        / static_cast<double>(AV_TIME_BASE);
-        const double elapsed = T - e.timelineStart;
         const double remaining = e.timelineEnd - T;
-        double alpha = 1.0;
         if (e.leadInType == TransitionType::FadeIn
-            && e.leadInDuration > 0.0
-            && elapsed >= 0.0 && elapsed < e.leadInDuration) {
-            const double raw = qBound(0.0, elapsed / e.leadInDuration, 1.0);
-            alpha = applyEasing(raw, e.leadInEasing);
-        } else if (e.trailOutType == TransitionType::FadeOut
-            && e.trailOutDuration > 0.0
-            && remaining >= 0.0 && remaining < e.trailOutDuration) {
-            const double raw = qBound(0.0, remaining / e.trailOutDuration, 1.0);
-            alpha = applyEasing(raw, e.trailOutEasing);
-        }
-        if (alpha < 0.999) {
-            QImage faded(composed.size(), QImage::Format_ARGB32_Premultiplied);
-            faded.fill(Qt::black);
-            QPainter pp(&faded);
-            pp.setOpacity(alpha);
-            pp.drawImage(0, 0, composed);
-            pp.end();
-            composed = faded;
-        }
+            || e.trailOutType == TransitionType::FadeOut)
+            composed = tlrender::applyEdgeFadeStep(composed, e, T);
 
         // Overlap blend for boundary transitions (CrossDissolve / Wipe /
         // Slide). Timeline pulled the next clip's timelineStart back by D
@@ -3659,13 +3652,14 @@ void VideoPlayer::displayFrame(const QImage &image, bool overlaysAlreadyBaked,
                 DecodedLayer layer;
                 if (harvestOverlayLayer(m_sequence[nextIdx], nextIdx, &layer)
                     && !layer.rgb.isNull()) {
-                    const double rawProgress = qBound(0.0,
-                                                   1.0 - remaining / e.trailOutDuration,
-                                                   1.0);
-                    const double progress = applyEasing(rawProgress, e.trailOutEasing);
-                    composed = OverlayRenderer::applyTransition(
-                        composed, layer.rgb,
-                        e.trailOutType, progress);
+                    const QImage neighbour = tlrender::prepareTransitionLayer(
+                        snsfit::maybeFit(layer.rgb, layer.fitContain,
+                                         layer.fitCover, composed.size()),
+                        clipgeom::ClipTransform{layer.videoScale, layer.videoDx,
+                                                layer.videoDy, layer.rotation2DDegrees},
+                        composed.size());
+                    composed = tlrender::applyOverlapTransitionStep(
+                        composed, neighbour, e, T);
                 }
             }
         }
@@ -8261,6 +8255,26 @@ bool VideoPlayer::harvestOverlayLayer(const PlaybackEntry &e, int seqIdx, Decode
 {
     if (!out)
         return false;
+
+    if (!m_transitionNeighbourForTest.isNull()) {
+        out->rgb = m_transitionNeighbourForTest;
+        return true;
+    }
+
+    if (e.leadInType != TransitionType::None || e.trailOutType != TransitionType::None) {
+        const QImage still = tlrender::readTransitionStillFrame(e.filePath);
+        if (!still.isNull()) {
+            const double sourceSec =
+                static_cast<double>(entryLocalPositionUs(seqIdx, m_timelinePositionUs))
+                / AV_TIME_BASE;
+            out->rgb = preparePreviewClipFrame(
+                still, e, seqIdx, sourceSec, still.size(), m_timelinePositionUs);
+            out->colorMeta = e.colorMeta;
+            applyLayerMotionOpacity(previewTimeline(), e, m_timelinePositionUs, e.opacity, out);
+            populateLayerMetadata(previewTimeline(), e, seqIdx, out);
+            return true;
+        }
+    }
 
     TrackDecoder *d = acquireDecoderForClip(e);
     if (!d)

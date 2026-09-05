@@ -321,6 +321,9 @@ public:
         const QImage &v2Source, const ClipInfo &v2Clip,
         const std::function<QImage(double, double)> &v2FrameProvider,
         double clipLocalSeconds, double sourceSeconds, QSize canvasSize);
+    static QImage displayFrameForTest(const QImage &composed,
+        const QImage &neighbourLayer, const QVector<PlaybackEntry> &sequence,
+        int activeEntry, qint64 timelineUsec);
     // Test-only seam for grade-keyframe GPU-preview wiring.
     bool pushActiveClipColorCorrectionToGlPreviewForTest(qint64 timelineUsec);
 
@@ -708,6 +711,7 @@ private:
     // the existing decoder loop is untouched); m_timelinePositionUs tracks the
     // resolved timeline position when sequence mode is active.
     QVector<PlaybackEntry> m_sequence;
+    QImage m_transitionNeighbourForTest;
     // Last reverse state per resolved playback entry. PlaybackEntry itself
     // intentionally stays unchanged, so this side table lets setSequence()
     // detect a reverse toggle and refresh a paused preview at the same

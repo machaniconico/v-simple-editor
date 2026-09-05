@@ -41,6 +41,7 @@ int runAnimExportSelftest();
 int runAudioBusSelftest();
 int runAudioClipDragUndoSelftest();
 int runAudioXfadeSelftest();
+int runTransitionExportSelftest();
 int runAudioMixerSelftest();
 int runAudioRestoreSelftest();
 int runAutoClipGenSelftest();
@@ -850,6 +851,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "AudioClipEditor drag ticks live-update without filling undo; release/default calls record once" },
     { "audiomixer",        "VEDITOR_AUDIOMIXER_SELFTEST",         runAudioMixerSelftest,         true,
       "Audio mixer module smoke (Sprint-23 bus routing + send/return stubs)" },
+    { "transition-export", "VEDITOR_TRANSITION_EXPORT_SELFTEST", runTransitionExportSelftest, true,
+      "Video transition export/preview shared steps and no-transition identity (6 gates)" },
     { "audio-xfade",       "VEDITOR_AUDIO_XFADE_SELFTEST",         runAudioXfadeSelftest,       true,
       "Audio constant-power crossfade/fade API and export afade=qsin contract (5 gates); QApplication required for Timeline undo/mirror checks" },
     { "oauth-mock-e2e",   "VEDITOR_OAUTH_MOCK_SELFTEST",        runOAuthMockE2eSelftest,       true,

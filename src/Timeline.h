@@ -44,6 +44,19 @@
 #include "TimeRemap.h"
 #include "ShapeLayer.h"
 
+// Shared timeline/source bounds after borrowing transition handles.
+struct OverlapInterval {
+    double timelineStart = 0.0, timelineEnd = 0.0;
+    double clipIn = 0.0, clipOut = 0.0, speed = 1.0;
+    TransitionType leadInType = TransitionType::None;
+    TransitionType trailOutType = TransitionType::None;
+    double leadInDuration = 0.0, trailOutDuration = 0.0;
+    TransitionAlignment trailOutAlignment = TransitionAlignment::Center;
+    TransitionEasing leadInEasing = TransitionEasing::Linear;
+    TransitionEasing trailOutEasing = TransitionEasing::Linear;
+    int clipIdx = -1;
+};
+
 // Where Timeline::addClip drops a freshly-imported clip. Persisted via
 // QSettings('VSimpleEditor','Preferences')/importPlacement; the MainWindow
 // preference menu toggles between the two values.
@@ -1093,6 +1106,11 @@ public:
     // Multi-clip playback: flatten all video tracks into a sorted, gap-aware
     // schedule with topmost-track-wins resolution (Premiere V1/V2 semantics).
     QVector<PlaybackEntry> computePlaybackSequence() const;
+    QVector<QVector<OverlapInterval>> videoOverlapIntervals() const;
+    static void applyOverlapTransitionsToIntervals(
+        QVector<OverlapInterval> &intervals,
+        const std::function<double(const OverlapInterval &)> &trailAvailable,
+        const std::function<double(const OverlapInterval &)> &leadAvailable);
     QVector<PlaybackEntry> computeAudioPlaybackSequence() const;
 
     // Re-emit sequenceChanged / audioSequenceChanged with the current clip
@@ -1190,6 +1208,8 @@ private slots:
     void onPlayheadAutoScrollTick();
 
 private:
+    QVector<PlaybackEntry> computePlaybackSequenceImpl(
+        QVector<QVector<OverlapInterval>> *overlapIntervals) const;
     struct TimeRangeSec {
         double startSec = 0.0;
         double endSec = 0.0;

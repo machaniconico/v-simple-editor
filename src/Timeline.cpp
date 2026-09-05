@@ -9829,12 +9829,91 @@ void Timeline::ensureSequenceFitsViewport()
     }
 }
 
+void Timeline::applyOverlapTransitionsToIntervals(
+    QVector<OverlapInterval> &trackIvs,
+    const std::function<double(const OverlapInterval &)> &trailAvailable,
+    const std::function<double(const OverlapInterval &)> &leadAvailable)
+{
+    for (int j = 1; j < trackIvs.size(); ++j) {
+        OverlapInterval &a = trackIvs[j - 1];
+        OverlapInterval &b = trackIvs[j];
+        if (!isOverlapTransition(a.trailOutType)) continue;
+        if (a.trailOutType != b.leadInType) continue;
+        if (qAbs(a.timelineEnd - b.timelineStart) > 1e-3) continue;
+        const double askedD = qMin(a.trailOutDuration, b.leadInDuration);
+        if (askedD <= 0.0) continue;
+        const double aSpeed = (a.speed > 0.0) ? a.speed : 1.0;
+        const double bSpeed = (b.speed > 0.0) ? b.speed : 1.0;
+        // A's trail handle = source frames past clipOut, divided by speed.
+        // We grab the source duration from the owning ClipInfo since the
+        // Interval struct does not carry it.
+        const double aTrailAvailable = trailAvailable(a);
+        const double bLeadAvailable = leadAvailable(b);
+
+        double aExtend = 0.0, bRetract = 0.0;
+        switch (a.trailOutAlignment) {
+            case TransitionAlignment::Start:
+                // Premiere "Start at Cut": entire transition AFTER cut.
+                // Consumes A's trail handle only; B stays put.
+                aExtend = qMin(askedD, aTrailAvailable);
+                break;
+            case TransitionAlignment::End:
+                // Premiere "End at Cut": entire transition BEFORE cut.
+                // Consumes B's lead handle only; A stays put.
+                bRetract = qMin(askedD, bLeadAvailable);
+                break;
+            case TransitionAlignment::Center:
+                // Premiere default: D/2 each side, with borrowing when
+                // one side runs short so the user gets the requested
+                // duration whenever physics allow.
+                aExtend  = qMin(askedD * 0.5, aTrailAvailable);
+                bRetract = qMin(askedD * 0.5, bLeadAvailable);
+                if (aExtend + bRetract < askedD) {
+                    if (bRetract < askedD * 0.5) {
+                        const double slack = qMin(askedD - aExtend - bRetract,
+                                                  aTrailAvailable - aExtend);
+                        if (slack > 0.0) aExtend += slack;
+                    }
+                    if (aExtend + bRetract < askedD && aExtend < askedD * 0.5) {
+                        const double slack = qMin(askedD - aExtend - bRetract,
+                                                  bLeadAvailable - bRetract);
+                        if (slack > 0.0) bRetract += slack;
+                    }
+                }
+                break;
+        }
+        const double effectiveD = aExtend + bRetract;
+        if (effectiveD < 0.01) continue;
+
+        a.clipOut       += aExtend * aSpeed;
+        a.timelineEnd   += aExtend;
+        b.timelineStart -= bRetract;
+        b.clipIn        -= bRetract * bSpeed;
+        a.trailOutDuration = effectiveD;
+        b.leadInDuration   = effectiveD;
+    }
+}
+
+QVector<QVector<OverlapInterval>> Timeline::videoOverlapIntervals() const
+{
+    QVector<QVector<OverlapInterval>> intervals;
+    computePlaybackSequenceImpl(&intervals);
+    return intervals;
+}
+
 QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
+{
+    return computePlaybackSequenceImpl(nullptr);
+}
+
+QVector<PlaybackEntry> Timeline::computePlaybackSequenceImpl(
+    QVector<QVector<OverlapInterval>> *overlapIntervals) const
 {
     QVector<PlaybackEntry> result;
     QVector<VideoReversedPlaybackBinding> reversedBindings;
     if (m_videoTracks.isEmpty()) {
-        setVideoReversedPlaybackBindings(reversedBindings);
+        if (!overlapIntervals)
+            setVideoReversedPlaybackBindings(reversedBindings);
         return result;
     }
 
@@ -9844,12 +9923,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
     // walks the sorted sequence in order, so the (timelineStart, sourceTrack
     // asc) sort below keeps V1 as the "primary" entry when multiple overlap.
 
-    struct Interval {
-        double timelineStart;
-        double timelineEnd;
-        double clipIn;
-        double clipOut;
-        double speed;
+    struct Interval : OverlapInterval {
         bool reversed = false;
         QString filePath;
         int trackIdx;
@@ -9871,15 +9945,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         double volume = 1.0;
         double pan = 0.0;
         QVector<AudioGainPoint> volumeEnvelope;
-        int clipIdx = -1;
-        TransitionType leadInType = TransitionType::None;
-        double leadInDuration = 0.0;
         TransitionAlignment leadInAlignment = TransitionAlignment::Center;
-        TransitionEasing leadInEasing = TransitionEasing::Linear;
-        TransitionType trailOutType = TransitionType::None;
-        double trailOutDuration = 0.0;
-        TransitionAlignment trailOutAlignment = TransitionAlignment::Center;
-        TransitionEasing trailOutEasing = TransitionEasing::Linear;
         QVector<StabilizerKeyframe> stabilizerKeyframes;
     };
 
@@ -10121,86 +10187,32 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         trackIntervals.append(ivs);
     }
 
-    // Premiere-style overlap for boundary transitions. Center-at-Cut
-    // alignment (Premiere default): the transition is split so half lives
-    // in A's trail handle and half in B's lead handle. Each side may
-    // borrow from the other when its own handle runs short, gracefully
-    // degrading toward End-at-Cut (A no trail) or Start-at-Cut (B no lead)
-    // before giving up. We only kick in when the two intervals are
-    // adjacent on the timeline (no leadIn gap on B), since a deliberate
-    // gap means the user wants a hard cut, not a transition.
     for (auto &trackIvs : trackIntervals) {
-        for (int j = 1; j < trackIvs.size(); ++j) {
-            Interval &a = trackIvs[j - 1];
-            Interval &b = trackIvs[j];
-            if (!isOverlapTransition(a.trailOutType)) continue;
-            if (a.trailOutType != b.leadInType) continue;
-            if (qAbs(a.timelineEnd - b.timelineStart) > 1e-3) continue;
-            const double askedD = qMin(a.trailOutDuration, b.leadInDuration);
-            if (askedD <= 0.0) continue;
-            const double aSpeed = (a.speed > 0.0) ? a.speed : 1.0;
-            const double bSpeed = (b.speed > 0.0) ? b.speed : 1.0;
-            // A's trail handle = source frames past clipOut, divided by speed.
-            // We grab the source duration from the owning ClipInfo since the
-            // Interval struct does not carry it.
-            double aTrailAvailable = 0.0;
-            auto *aTrack = m_videoTracks.value(a.trackIdx, nullptr);
-            if (aTrack && a.clipIdx >= 0 && a.clipIdx < aTrack->clips().size()) {
-                const auto &ac = aTrack->clips()[a.clipIdx];
-                aTrailAvailable = qMax(0.0, (ac.duration - a.clipOut) / aSpeed);
-            }
-            const double bLeadAvailable = qMax(0.0, b.clipIn / bSpeed);
-
-            double aExtend = 0.0, bRetract = 0.0;
-            switch (a.trailOutAlignment) {
-                case TransitionAlignment::Start:
-                    // Premiere "Start at Cut": entire transition AFTER cut.
-                    // Consumes A's trail handle only; B stays put.
-                    aExtend = qMin(askedD, aTrailAvailable);
-                    break;
-                case TransitionAlignment::End:
-                    // Premiere "End at Cut": entire transition BEFORE cut.
-                    // Consumes B's lead handle only; A stays put.
-                    bRetract = qMin(askedD, bLeadAvailable);
-                    break;
-                case TransitionAlignment::Center:
-                    // Premiere default: D/2 each side, with borrowing when
-                    // one side runs short so the user gets the requested
-                    // duration whenever physics allow.
-                    aExtend  = qMin(askedD * 0.5, aTrailAvailable);
-                    bRetract = qMin(askedD * 0.5, bLeadAvailable);
-                    if (aExtend + bRetract < askedD) {
-                        if (bRetract < askedD * 0.5) {
-                            const double slack = qMin(askedD - aExtend - bRetract,
-                                                      aTrailAvailable - aExtend);
-                            if (slack > 0.0) aExtend += slack;
-                        }
-                        if (aExtend + bRetract < askedD && aExtend < askedD * 0.5) {
-                            const double slack = qMin(askedD - aExtend - bRetract,
-                                                      bLeadAvailable - bRetract);
-                            if (slack > 0.0) bRetract += slack;
-                        }
-                    }
-                    break;
-            }
-            const double effectiveD = aExtend + bRetract;
-            if (effectiveD < 0.01) continue;
-
-            a.clipOut       += aExtend * aSpeed;
-            a.timelineEnd   += aExtend;
-            b.timelineStart -= bRetract;
-            b.clipIn        -= bRetract * bSpeed;
-            a.trailOutDuration = effectiveD;
-            b.leadInDuration   = effectiveD;
-            qInfo() << "[SEQ] overlap pair:"
-                    << Transition::typeName(a.trailOutType)
-                    << "track=" << a.trackIdx
-                    << "askedD=" << askedD
-                    << "aTrail=" << aTrailAvailable << "bLead=" << bLeadAvailable
-                    << "aExtend=" << aExtend << "bRetract=" << bRetract
-                    << "effectiveD=" << effectiveD;
-        }
+        QVector<OverlapInterval> shared;
+        for (const auto &iv : trackIvs)
+            shared.append(static_cast<const OverlapInterval &>(iv));
+        applyOverlapTransitionsToIntervals(shared,
+            [&](const OverlapInterval &a) {
+                const int index = int(&a - shared.constData());
+                auto *track = m_videoTracks.value(trackIvs[index].trackIdx, nullptr);
+                if (!track || a.clipIdx < 0 || a.clipIdx >= track->clips().size())
+                    return 0.0;
+                return qMax(0.0, (track->clips()[a.clipIdx].duration - a.clipOut)
+                                      / (a.speed > 0.0 ? a.speed : 1.0));
+            },
+            [](const OverlapInterval &b) {
+                return qMax(0.0, b.clipIn / (b.speed > 0.0 ? b.speed : 1.0));
+            });
+        for (int i = 0; i < trackIvs.size(); ++i)
+            static_cast<OverlapInterval &>(trackIvs[i]) = shared[i];
+        if (overlapIntervals)
+            overlapIntervals->append(shared);
     }
+
+    // The export accessor needs only bounds, not playback bindings or the
+    // flattened public entries. Keep its read path free of binding writes.
+    if (overlapIntervals)
+        return result;
 
     QVector<Interval> visible;
     for (const auto &trackClips : trackIntervals) {
