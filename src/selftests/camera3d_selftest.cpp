@@ -246,6 +246,62 @@ int runCamera3DSelftest()
     exportOk = exportOk && sameBytes(ordinary2D,
         tlrender::renderFrameAt(&timeline, 0, canvas));
     gate(7, exportOk);
+
+    // Both sides of a real borrowed overlap must pass through projection.
+    // Keep the outgoing layer unrotated so the image difference specifically
+    // exercises the incoming layer's projection before transition placement.
+    Timeline overlapTimeline;
+    ClipInfo outgoing = fixtureClip(QColor(220, 80, 40), canvas);
+    ClipInfo incoming = fixtureClip(QColor(40, 100, 210), canvas);
+    outgoing.duration = incoming.duration = 4.0;
+    outgoing.inPoint = incoming.inPoint = 1.0;
+    outgoing.outPoint = incoming.outPoint = 3.0;
+    outgoing.is3DLayer = incoming.is3DLayer = true;
+    incoming.layer3D.rotationY = 60.0;
+    outgoing.trailOut.type = incoming.leadIn.type = TransitionType::CrossDissolve;
+    outgoing.trailOut.duration = incoming.leadIn.duration = 1.0;
+    outgoing.trailOut.alignment = incoming.leadIn.alignment = TransitionAlignment::Center;
+    overlapTimeline.videoTracks()[0]->setClips({outgoing, incoming});
+    const auto overlapIntervals = overlapTimeline.videoOverlapIntervals();
+    bool overlapOk = !overlapIntervals.isEmpty() && overlapIntervals[0].size() == 2;
+    if (overlapOk) {
+        const auto &a = overlapIntervals[0][0];
+        const auto &b = overlapIntervals[0][1];
+        overlapOk = b.timelineStart < a.timelineEnd
+            && std::abs((a.timelineEnd - b.timelineStart) - 1.0) < 1e-9;
+        const qint64 midpointUsec = qRound64(
+            (b.timelineStart + a.timelineEnd) * 0.5 * 1000000.0);
+        Camera3DState overlapCamera;
+        overlapCamera.trueProjection = true;
+        overlapTimeline.setProjectCamera(overlapCamera);
+        Camera3D::setTrueProjectionEnabledForTest(true);
+        const QImage projectedOverlap = tlrender::renderFrameAt(
+            &overlapTimeline, midpointUsec, canvas);
+        const int overlapCalls = Camera3D::trueProjectionCallCountForTest();
+        Camera3D::setTrueProjectionEnabledForTest(false);
+        const QImage bypassedOverlap = tlrender::renderFrameAt(
+            &overlapTimeline, midpointUsec, canvas);
+        overlapOk = overlapOk && !projectedOverlap.isNull() && !bypassedOverlap.isNull()
+            && overlapCalls == 2 && mse(projectedOverlap, bypassedOverlap) > 1.0
+            && Camera3D::trueProjectionCallCountForTest() == 0;
+
+        overlapCamera.trueProjection = false;
+        overlapTimeline.setProjectCamera(overlapCamera);
+        Camera3D::setTrueProjectionEnabledForTest(true);
+        const QImage offOverlap = tlrender::renderFrameAt(
+            &overlapTimeline, midpointUsec, canvas);
+        overlapOk = overlapOk && Camera3D::trueProjectionCallCountForTest() == 0
+            && sameBytes(offOverlap, bypassedOverlap);
+        outgoing.is3DLayer = incoming.is3DLayer = false;
+        outgoing.layer3D.reset();
+        incoming.layer3D.reset();
+        overlapTimeline.videoTracks()[0]->setClips({outgoing, incoming});
+        const QImage plainOverlap = tlrender::renderFrameAt(
+            &overlapTimeline, midpointUsec, canvas);
+        overlapOk = overlapOk && sameBytes(offOverlap, plainOverlap)
+            && Camera3D::trueProjectionCallCountForTest() == 0;
+    }
+    gate(8, overlapOk);
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
     return failed;
 }

@@ -1719,6 +1719,9 @@ QImage renderFrameFromTracks(const Timeline *timeline,
             : applyClipFxStackFromSource(raw, c, local);
         neighbour = applyClipMask(neighbour, c, source);
         neighbour = snsfit::maybeFit(neighbour, c.fitContain, c.fitCover, outSize);
+        if (applyTimelineGlobals && timeline && timeline->projectCamera().trueProjection)
+            neighbour = applyProjectCameraProjection(
+                neighbour, c.layer3D, c.is3DLayer, timeline->projectCamera(), outSize);
         neighbour = prepareTransitionLayer(neighbour,
             clipanim::effectiveTransformAt(c, local), outSize);
         return applyOverlapTransitionStep(composed, neighbour, a, targetSec);
