@@ -185,7 +185,8 @@ const QStringList& transitionTypeNames()
         QStringLiteral("Pixelate"),
         QStringLiteral("BlurDissolve"),
         QStringLiteral("CameraShake"),
-        QStringLiteral("ColorChannelShift")
+        QStringLiteral("ColorChannelShift"),
+        QStringLiteral("MorphCut")
     };
     return names;
 }

@@ -2400,6 +2400,7 @@ void TimelineTrack::paintEvent(QPaintEvent *event)
                 case TransitionType::WhipPanLeft:        return "<<";
                 case TransitionType::WhipPanRight:       return ">>";
                 case TransitionType::Glitch:             return "G!";
+                case TransitionType::MorphCut:           return "MC";
                 case TransitionType::LightLeak:          return "LL";
                 case TransitionType::FlipHorizontal:     return "FH";
                 case TransitionType::FlipVertical:       return "FV";
@@ -7698,6 +7699,7 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     QAction *wplAct = whipMenu->addAction(QStringLiteral("左へ"));
     QAction *wprAct = whipMenu->addAction(QStringLiteral("右へ"));
     QAction *glAct  = transitionMenu->addAction(QStringLiteral("グリッチ (0.5s)"));
+    QAction *mcAct  = transitionMenu->addAction(QStringLiteral("モーフカット (1.0s)"));
     QAction *llAct  = transitionMenu->addAction(QStringLiteral("ライトリーク (1.0s)"));
     QAction *lfAct  = transitionMenu->addAction(QStringLiteral("レンズフレア (1.0s)"));
     QAction *fbAct  = transitionMenu->addAction(QStringLiteral("フィルムバーン (1.0s)"));
@@ -7884,7 +7886,7 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
              || chosen == puAct || chosen == pdAct
              || chosen == czAct || chosen == scwAct || chosen == sccwAct
              || chosen == wplAct || chosen == wprAct || chosen == glAct
-             || chosen == llAct || chosen == fhAct || chosen == fvAct
+             || chosen == mcAct || chosen == llAct || chosen == fhAct || chosen == fvAct
              || chosen == lfAct || chosen == fbAct
              || chosen == skAct || chosen == chAct
              || chosen == irAct || chosen == ircAct
@@ -7921,6 +7923,7 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
         else if (chosen == wplAct)  t.type = TransitionType::WhipPanLeft;
         else if (chosen == wprAct)  t.type = TransitionType::WhipPanRight;
         else if (chosen == glAct)   t.type = TransitionType::Glitch;
+        else if (chosen == mcAct)   t.type = TransitionType::MorphCut;
         else if (chosen == llAct)   t.type = TransitionType::LightLeak;
         else if (chosen == lfAct)   t.type = TransitionType::LensFlare;
         else if (chosen == fbAct)   t.type = TransitionType::FilmBurn;

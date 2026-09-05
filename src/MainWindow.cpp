@@ -10568,6 +10568,7 @@ void MainWindow::editDefaultTransition()
         TransitionType::WhipPanRight,
         TransitionType::Glitch,
         TransitionType::LightLeak,
+        TransitionType::MorphCut,
         TransitionType::LensFlare,
         TransitionType::FilmBurn,
         TransitionType::CameraShake,
@@ -10584,7 +10585,7 @@ void MainWindow::editDefaultTransition()
     };
     int curIdx = 0;
     for (size_t i = 0; i < sizeof(options) / sizeof(options[0]); ++i) {
-        typeCombo->addItem(Transition::typeName(options[i]), static_cast<int>(options[i]));
+        typeCombo->addItem(options[i] == TransitionType::MorphCut ? QStringLiteral("モーフカット") : Transition::typeName(options[i]), static_cast<int>(options[i]));
         if (static_cast<int>(options[i]) == curType) curIdx = static_cast<int>(i);
     }
     typeCombo->setCurrentIndex(curIdx);

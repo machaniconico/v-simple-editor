@@ -89,7 +89,8 @@ enum class TransitionType {
     Pixelate,
     BlurDissolve,
     CameraShake,
-    ColorChannelShift
+    ColorChannelShift,
+    MorphCut
 };
 
 // True when the type renders as a "boundary" blend between two clips:
@@ -131,6 +132,7 @@ inline bool isOverlapTransition(TransitionType t) {
         case TransitionType::WhipPanLeft:
         case TransitionType::WhipPanRight:
         case TransitionType::Glitch:
+        case TransitionType::MorphCut:
         case TransitionType::LightLeak:
         case TransitionType::FlipHorizontal:
         case TransitionType::FlipVertical:
@@ -231,6 +233,7 @@ struct Transition {
             case TransitionType::WhipPanLeft:        return "Whip Pan Left";
             case TransitionType::WhipPanRight:       return "Whip Pan Right";
             case TransitionType::Glitch:             return "Glitch";
+            case TransitionType::MorphCut:           return "Morph Cut";
             case TransitionType::LightLeak:          return "Light Leak";
             case TransitionType::FlipHorizontal:     return "Flip Horizontal";
             case TransitionType::FlipVertical:       return "Flip Vertical";
@@ -330,5 +333,6 @@ public:
     static void renderBrushOverlay(QImage &frame, const BrushOverlay &overlay, double currentTime);
     static void renderBrushOverlay(QImage &frame, BrushAnimation *brushAnimation, double progress);
     static void renderPip(QImage &frame, const QImage &pipSource, const PipConfig &config);
+    static void clearMorphCutCacheForTest();
     static QImage applyTransition(const QImage &from, const QImage &to, TransitionType type, double progress);
 };

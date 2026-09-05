@@ -325,14 +325,14 @@ void TransitionDialog::setupUI()
         TransitionType::BarnDoorHClose, TransitionType::BarnDoorVClose,
         TransitionType::ClockWipeCCW,
         TransitionType::WhipPanLeft, TransitionType::WhipPanRight,
-        TransitionType::Glitch, TransitionType::LightLeak,
+        TransitionType::Glitch, TransitionType::LightLeak, TransitionType::MorphCut,
         TransitionType::FlipHorizontal, TransitionType::FlipVertical,
         TransitionType::LensFlare, TransitionType::FilmBurn,
         TransitionType::Pixelate, TransitionType::BlurDissolve,
         TransitionType::CameraShake, TransitionType::ColorChannelShift,
     };
     for (const TransitionType t : kDialogTypeOrder)
-        m_typeCombo->addItem(Transition::typeName(t), static_cast<int>(t));
+        m_typeCombo->addItem(t == TransitionType::MorphCut ? QStringLiteral("モーフカット") : Transition::typeName(t), static_cast<int>(t));
     form->addRow("Type:", m_typeCombo);
 
     m_durationSpin = new QDoubleSpinBox(this);

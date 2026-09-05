@@ -3533,6 +3533,10 @@ int runMcpSelftest()
              QStringLiteral("V1 track was not available"));
         fail("G86 set_transition changes and undoes a live clip",
              QStringLiteral("V1 track was not available"));
+        fail("G146 MorphCut is applied and reflected by get_timeline",
+             QStringLiteral("V1 track was not available"));
+        fail("G147 MorphCut is reverted by one undo",
+             QStringLiteral("V1 track was not available"));
         fail("G87 set_transition rejects an invalid type",
              QStringLiteral("V1 track was not available"));
         fail("G88 add_text_overlay changes and undoes a live clip",
@@ -3639,6 +3643,60 @@ int runMcpSelftest()
         g86 ? pass("G86 set_transition changes and undoes a live clip")
             : fail("G86 set_transition changes and undoes a live clip",
                    QStringLiteral("transition output, pairing, selection, or undo restoration did not match"));
+
+        // US-202 reserves G146-G147; use the same live pair and undo protocol.
+        saveMcpLiveBaseline();
+        const auto morphBefore = captionVideo0->clips();
+        const QJsonObject morphResponse = callProjectInfoTool(
+            305, QStringLiteral("set_transition"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 0},
+                {QStringLiteral("type"), QStringLiteral("MorphCut")},
+                {QStringLiteral("durationSec"), 0.75}
+            });
+        const auto morphTimeline = callProjectInfoTool(
+            306, QStringLiteral("get_timeline"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")}
+            });
+        const QJsonArray morphClips = timelineTrackObject(
+            toolPayload(morphTimeline), QStringLiteral("video"), 0)
+                .value(QStringLiteral("clips")).toArray();
+        const bool g146 = !toolResult(morphResponse).value(QStringLiteral("isError")).toBool(true)
+            && toolPayload(morphResponse).value(QStringLiteral("ok")).toBool(false)
+            && requiredOutputFieldsPresent(QStringLiteral("set_transition"), toolPayload(morphResponse))
+            && captionVideo0->clips().size() == 2
+            && captionVideo0->clips().first().trailOut.type == TransitionType::MorphCut
+            && captionVideo0->clips().at(1).leadIn.type == TransitionType::MorphCut
+            && morphClips.size() == 2
+            && morphClips.first().toObject().value(QStringLiteral("trailOut")).toObject()
+                   .value(QStringLiteral("type")).toString() == QStringLiteral("MorphCut")
+            && morphClips.at(1).toObject().value(QStringLiteral("leadIn")).toObject()
+                   .value(QStringLiteral("type")).toString() == QStringLiteral("MorphCut");
+        g146 ? pass("G146 MorphCut is applied and reflected by get_timeline")
+             : fail("G146 MorphCut is applied and reflected by get_timeline",
+                    QStringLiteral("MCP mutation, mirrored transition or timeline output diverged"));
+        const auto morphUndo = callProjectInfoTool(307, QStringLiteral("undo"), QJsonObject{});
+        const auto morphUndoTimeline = callProjectInfoTool(
+            308, QStringLiteral("get_timeline"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")}
+            });
+        const QJsonArray morphUndoClips = timelineTrackObject(
+            toolPayload(morphUndoTimeline), QStringLiteral("video"), 0)
+                .value(QStringLiteral("clips")).toArray();
+        const bool g147 = g146 && toolPayload(morphUndo).value(QStringLiteral("ok")).toBool(false)
+            && captionVideo0->clips().size() == morphBefore.size()
+            && captionVideo0->clips().first().trailOut.type == morphBefore.first().trailOut.type
+            && captionVideo0->clips().at(1).leadIn.type == morphBefore.at(1).leadIn.type
+            && morphUndoClips.size() == 2
+            && morphUndoClips.first().toObject().value(QStringLiteral("trailOut")).toObject()
+                   .value(QStringLiteral("type")).toString() == QStringLiteral("None")
+            && morphUndoClips.at(1).toObject().value(QStringLiteral("leadIn")).toObject()
+                   .value(QStringLiteral("type")).toString() == QStringLiteral("None")
+            && !projectTimeline->undoManager()->canUndo();
+        g147 ? pass("G147 MorphCut is reverted by one undo")
+             : fail("G147 MorphCut is reverted by one undo",
+                    QStringLiteral("one undo did not restore both clips and history"));
 
         const QJsonObject invalidTransitionResponse = callProjectInfoTool(
             91, QStringLiteral("set_transition"), QJsonObject{

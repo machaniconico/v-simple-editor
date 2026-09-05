@@ -1,5 +1,14 @@
 #include "Overlay.h"
 #include "BrushAnimation.h"
+#include "OpticalFlow.h"
+#include <QByteArray>
+#include <QByteArrayView>
+#include <QMutex>
+#include <QMutexLocker>
+#include <list>
+#include <tuple>
+#include <cmath>
+#include <cstring>
 #include <QPainter>
 #include <QPainterPath>
 #include <QFontMetrics>
@@ -7,6 +16,116 @@
 #include <QVector>
 
 namespace {
+
+// Content keys survive QImage detach. Keep the source images too: qChecksum is
+// only 16 bits, so a checksum collision must be verified before reusing flow.
+using MorphImageKey = std::tuple<int, int, QImage::Format, quint16>;
+MorphImageKey morphKey(const QImage &image)
+{
+    return {image.width(), image.height(), image.format(),
+            qChecksum(QByteArrayView(reinterpret_cast<const char *>(image.constBits()),
+                                     image.sizeInBytes()))};
+}
+bool morphBytesEqual(const QImage &a, const QImage &b)
+{
+    return a.bytesPerLine() == b.bytesPerLine() && a.sizeInBytes() == b.sizeInBytes()
+        && std::memcmp(a.constBits(), b.constBits(), size_t(a.sizeInBytes())) == 0;
+}
+struct MorphCacheEntry {
+    MorphImageKey aKey, bKey;
+    QImage a, b;
+    opticalflow::FlowField flow;
+};
+QMutex morphCacheMutex;
+std::list<MorphCacheEntry> morphCache; // MRU first, at most four pairs.
+
+opticalflow::FlowField morphFlow(const QImage &a, const QImage &b, const QSize &size)
+{
+    const auto aKey = morphKey(a), bKey = morphKey(b);
+    QMutexLocker lock(&morphCacheMutex);
+    for (auto it = morphCache.begin(); it != morphCache.end(); ++it) {
+        if (it->aKey == aKey && it->bKey == bKey
+            && morphBytesEqual(it->a, a) && morphBytesEqual(it->b, b)) {
+            morphCache.splice(morphCache.begin(), morphCache, it);
+            return morphCache.front().flow;
+        }
+    }
+    QSize smallSize = size;
+    if (qMax(size.width(), size.height()) > 480)
+        smallSize.scale(480, 480, Qt::KeepAspectRatio);
+    smallSize.setWidth(qMax(1, smallSize.width()));
+    smallSize.setHeight(qMax(1, smallSize.height()));
+    const QImage smallA = a.scaled(smallSize, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+    const QImage smallB = b.scaled(smallSize, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+    opticalflow::FlowParams params;
+    params.levels = 3;
+    params.blockSize = 16;
+    params.searchRange = 16;
+    params.smooth = true;
+    const auto small = opticalflow::estimateFlow(smallA, smallB, params);
+    opticalflow::FlowField flow;
+    flow.width = size.width();
+    flow.height = size.height();
+    flow.v.resize(flow.width * flow.height);
+    const double scaleX = double(flow.width) / small.width;
+    const double scaleY = double(flow.height) / small.height;
+    for (int y = 0; y < flow.height; ++y) {
+        const double sy = qBound(0.0, (y + 0.5) / scaleY - 0.5, double(small.height - 1));
+        const int y0 = int(std::floor(sy));
+        const double fy = sy - y0;
+        for (int x = 0; x < flow.width; ++x) {
+            const double sx = qBound(0.0, (x + 0.5) / scaleX - 0.5, double(small.width - 1));
+            const int x0 = int(std::floor(sx));
+            const double fx = sx - x0;
+            const QPointF v = (small.at(x0, y0) * (1.0 - fx) + small.at(x0 + 1, y0) * fx) * (1.0 - fy)
+                            + (small.at(x0, y0 + 1) * (1.0 - fx) + small.at(x0 + 1, y0 + 1) * fx) * fy;
+            // estimateFlow returns source-to-destination displacement; warpImage
+            // pulls from x + flow, so convert to sampling displacement here.
+            flow.v[y * flow.width + x] = QPointF(-v.x() * scaleX, -v.y() * scaleY);
+        }
+    }
+    morphCache.push_front({aKey, bKey, a.copy(), b.copy(), flow});
+    if (morphCache.size() > 4) morphCache.pop_back();
+    return flow;
+}
+
+QImage renderMorphCut(const QImage &a, const QImage &b, double t)
+{
+    // Unconditional endpoints preserve format, padding and every input bit.
+    if (t <= 0.0) return a;
+    if (t >= 1.0) return b;
+    if (a.isNull() || b.isNull()) return t < 0.5 ? a : b;
+    const QSize size(qMax(a.width(), b.width()), qMax(a.height(), b.height()));
+    const auto flow = morphFlow(a, b, size);
+    opticalflow::FlowField negFlow;
+    negFlow.width = flow.width;
+    negFlow.height = flow.height;
+    negFlow.v.resize(flow.v.size());
+    for (qsizetype i = 0; i < flow.v.size(); ++i)
+        negFlow.v[i] = QPointF(-flow.v[i].x(), -flow.v[i].y());
+    // Negating forward flow is an approximation: warpImage samples on the
+    // output grid, rather than transporting/inverting the field geometrically.
+    const QImage fwd = opticalflow::warpImage(
+        a.scaled(size, Qt::IgnoreAspectRatio, Qt::SmoothTransformation), flow, t)
+        .convertToFormat(QImage::Format_ARGB32_Premultiplied);
+    const QImage bwd = opticalflow::warpImage(
+        b.scaled(size, Qt::IgnoreAspectRatio, Qt::SmoothTransformation), negFlow, 1.0 - t)
+        .convertToFormat(QImage::Format_ARGB32_Premultiplied);
+    QImage result(size, QImage::Format_ARGB32_Premultiplied);
+    for (int y = 0; y < size.height(); ++y) {
+        const auto *f = reinterpret_cast<const QRgb *>(fwd.constScanLine(y));
+        const auto *bRow = reinterpret_cast<const QRgb *>(bwd.constScanLine(y));
+        auto *out = reinterpret_cast<QRgb *>(result.scanLine(y));
+        for (int x = 0; x < size.width(); ++x) {
+            const auto blend = [t](int u, int v) { return qRound((1.0 - t) * u + t * v); };
+            out[x] = qRgba(blend(qRed(f[x]), qRed(bRow[x])),
+                           blend(qGreen(f[x]), qGreen(bRow[x])),
+                           blend(qBlue(f[x]), qBlue(bRow[x])),
+                           blend(qAlpha(f[x]), qAlpha(bRow[x])));
+        }
+    }
+    return result;
+}
 
 // Separable box blur on the alpha channel. Mirrors the helper used in
 // TextManager.cpp's enhanced path; kept local here so Overlay.cpp does
@@ -284,9 +403,19 @@ void OverlayRenderer::renderPip(QImage &frame, const QImage &pipSource, const Pi
     painter.drawImage(x, y, scaled);
 }
 
+void OverlayRenderer::clearMorphCutCacheForTest()
+{
+    QMutexLocker lock(&morphCacheMutex);
+    morphCache.clear();
+}
+
 QImage OverlayRenderer::applyTransition(const QImage &from, const QImage &to,
     TransitionType type, double progress)
 {
+    switch (type) {
+    case TransitionType::MorphCut: return renderMorphCut(from, to, progress);
+    default: break;
+    }
     if (type == TransitionType::None) return (progress < 0.5) ? from : to;
 
     // NOTE: easing must be applied by the caller (compose path) so the
