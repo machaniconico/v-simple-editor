@@ -8,6 +8,31 @@
 
 // --- Color Correction / Grading ---
 
+struct HueSatWarp {
+    static constexpr int kHueNodes = 12;
+    static constexpr int kSatRings = 3;
+    float hueShiftDeg[kSatRings][kHueNodes] = {};
+    float satScale[kSatRings][kHueNodes];
+    HueSatWarp() {
+        for (auto &ring : satScale)
+            for (float &value : ring) value = 1.0f;
+    }
+    bool isDefault() const {
+        for (int r = 0; r < kSatRings; ++r)
+            for (int h = 0; h < kHueNodes; ++h)
+                if (hueShiftDeg[r][h] != 0.0f || satScale[r][h] != 1.0f) return false;
+        return true;
+    }
+};
+
+// Test bypass exercises the same production pipeline, without reimplementing it.
+namespace colorwarper {
+void setDisabledForTest(bool disabled);
+void resetCallCountForTest();
+int callCountForTest();
+void apply(float &r, float &g, float &b, const HueSatWarp &warp);
+}
+
 struct ColorCorrection {
     double brightness = 0.0;    // -100 to 100
     double contrast = 0.0;      // -100 to 100
@@ -30,6 +55,8 @@ struct ColorCorrection {
     double logMidR = 0.0, logMidG = 0.0, logMidB = 0.0;          // -1.0 to 1.0
     double logHighR = 0.0, logHighG = 0.0, logHighB = 0.0;       // -1.0 to 1.0
 
+    HueSatWarp hueSatWarp;
+
     bool isDefault() const {
         return brightness == 0.0 && contrast == 0.0 && saturation == 0.0
             && hue == 0.0 && temperature == 0.0 && tint == 0.0
@@ -40,7 +67,8 @@ struct ColorCorrection {
             && gainR == 0.0 && gainG == 0.0 && gainB == 0.0
             && logShadowR == 0.0 && logShadowG == 0.0 && logShadowB == 0.0
             && logMidR == 0.0 && logMidG == 0.0 && logMidB == 0.0
-            && logHighR == 0.0 && logHighG == 0.0 && logHighB == 0.0;
+            && logHighR == 0.0 && logHighG == 0.0 && logHighB == 0.0
+            && hueSatWarp.isDefault();
     }
 
     void reset() { *this = ColorCorrection{}; }

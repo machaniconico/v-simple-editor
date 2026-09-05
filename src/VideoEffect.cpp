@@ -1136,6 +1136,59 @@ void setColorParam(VideoEffect &effect, const QString &paramName, QColor color)
 
 } // namespace effectctrl
 
+namespace colorwarper {
+namespace {
+thread_local bool disabledForTest = false;
+thread_local int callsForTest = 0;
+}
+void setDisabledForTest(bool disabled) { disabledForTest = disabled; }
+void resetCallCountForTest() { callsForTest = 0; }
+int callCountForTest() { return callsForTest; }
+void apply(float &r, float &g, float &b, const HueSatWarp &warp)
+{
+    const float mx = std::max(r, std::max(g, b));
+    const float mn = std::min(r, std::min(g, b));
+    const float dl = mx - mn;
+    const float v = mx;
+    const float s = mx > 0.0f ? dl / mx : 0.0f;
+    float h = dl <= 1e-6f ? 0.0f : (mx == r ? 60.0f * ((g-b)/dl)
+        : mx == g ? 60.0f * ((b-r)/dl) + 120.0f : 60.0f * ((r-g)/dl) + 240.0f);
+    if (h < 0.0f) h += 360.0f;
+    // Achromatic pixels have undefined hue, but s'=0: leave them unchanged.
+    if (s == 0.0f) return;
+    const float hi = h / 30.0f;
+    const int h0 = static_cast<int>(std::floor(hi)) % 12;
+    const int h1 = (h0 + 1) % 12;
+    const float fh = hi - std::floor(hi);
+    const float ri = std::clamp(s, 0.0f, 1.0f) * 2.0f;
+    const int r0 = std::clamp(static_cast<int>(std::floor(ri)), 0, 1);
+    const int r1 = r0 + 1;
+    const float fr = ri - static_cast<float>(r0);
+    auto interpolate = [&](const float (&nodes)[3][12]) {
+        const float a = nodes[r0][h0] * (1.0f-fh) + nodes[r0][h1] * fh;
+        const float b = nodes[r1][h0] * (1.0f-fh) + nodes[r1][h1] * fh;
+        return a * (1.0f-fr) + b * fr;
+    };
+    const float shift = interpolate(warp.hueShiftDeg);
+    const float scale = interpolate(warp.satScale);
+    if (shift == 0.0f && scale == 1.0f) return;
+    h = std::fmod(h + shift + 360.0f, 360.0f);
+    const float sat = std::clamp(s * scale, 0.0f, 1.0f);
+    const float c = v * sat;
+    const float x = c * (1.0f - std::abs(std::fmod(h / 60.0f, 2.0f) - 1.0f));
+    const float m = v - c;
+    switch (static_cast<int>(std::floor(h / 60.0f))) {
+    case 0: r=c; g=x; b=0; break;
+    case 1: r=x; g=c; b=0; break;
+    case 2: r=0; g=c; b=x; break;
+    case 3: r=0; g=x; b=c; break;
+    case 4: r=x; g=0; b=c; break;
+    default: r=c; g=0; b=x; break;
+    }
+    r += m; g += m; b += m;
+}
+} // namespace colorwarper
+
 // ===== Color Correction Processing =====
 
 QImage VideoEffectProcessor::applyColorCorrection(const QImage &input, const ColorCorrection &cc)
@@ -1143,6 +1196,7 @@ QImage VideoEffectProcessor::applyColorCorrection(const QImage &input, const Col
     if (cc.isDefault()) return input;
     QImage img = input.convertToFormat(QImage::Format_RGB888);
 
+    const bool hasWarp = !colorwarper::disabledForTest && !cc.hueSatWarp.isDefault();
     const bool hasLog = cc.logShadowR != 0.0 || cc.logShadowG != 0.0 || cc.logShadowB != 0.0
                      || cc.logMidR != 0.0 || cc.logMidG != 0.0 || cc.logMidB != 0.0
                      || cc.logHighR != 0.0 || cc.logHighG != 0.0 || cc.logHighB != 0.0;
@@ -1153,11 +1207,11 @@ QImage VideoEffectProcessor::applyColorCorrection(const QImage &input, const Col
         adjustBrightnessContrast(img, cc.brightness, cc.contrast);
     if (cc.highlights != 0.0 || cc.shadows != 0.0)
         adjustHighlightsShadows(img, cc.highlights, cc.shadows);
-    if (!hasLog && cc.saturation != 0.0)
+    if (!hasLog && !hasWarp && cc.saturation != 0.0)
         adjustSaturation(img, cc.saturation);
     if (cc.hue != 0.0)
         adjustHue(img, cc.hue);
-    if (!hasLog && (cc.temperature != 0.0 || cc.tint != 0.0))
+    if (!hasLog && !hasWarp && (cc.temperature != 0.0 || cc.tint != 0.0))
         adjustTemperatureTint(img, cc.temperature, cc.tint);
     if (cc.gamma != 1.0)
         adjustGamma(img, cc.gamma);
@@ -1222,9 +1276,26 @@ QImage VideoEffectProcessor::applyColorCorrection(const QImage &input, const Col
         }
     }
 
-    if (hasLog && cc.saturation != 0.0)
+    if (hasWarp) {
+        // Count branch entries, not pixels, to keep instrumentation inexpensive.
+        if (colorwarper::callsForTest < 2147483647) ++colorwarper::callsForTest;
+        for (int y = 0; y < img.height(); ++y) {
+            uchar *line = img.scanLine(y);
+            for (int x = 0; x < img.width(); ++x) {
+                float r = line[3*x] / 255.0f;
+                float g = line[3*x+1] / 255.0f;
+                float b = line[3*x+2] / 255.0f;
+                colorwarper::apply(r, g, b, cc.hueSatWarp);
+                line[3*x] = static_cast<uchar>(std::clamp(r, 0.0f, 1.0f) * 255.0f + 0.5f);
+                line[3*x+1] = static_cast<uchar>(std::clamp(g, 0.0f, 1.0f) * 255.0f + 0.5f);
+                line[3*x+2] = static_cast<uchar>(std::clamp(b, 0.0f, 1.0f) * 255.0f + 0.5f);
+            }
+        }
+    }
+
+    if ((hasLog || hasWarp) && cc.saturation != 0.0)
         adjustSaturation(img, cc.saturation);
-    if (hasLog && (cc.temperature != 0.0 || cc.tint != 0.0))
+    if ((hasLog || hasWarp) && (cc.temperature != 0.0 || cc.tint != 0.0))
         adjustTemperatureTint(img, cc.temperature, cc.tint);
 
     return img;

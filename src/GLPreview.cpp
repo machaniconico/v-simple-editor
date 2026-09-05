@@ -286,6 +286,8 @@ uniform vec4 uGain;      // multiplicative scaling
 uniform vec3 uLogShadow;
 uniform vec3 uLogMid;
 uniform vec3 uLogHigh;
+uniform vec2 uHueSatWarp[36];
+uniform bool uHueSatWarpEnabled;
 
 // 3D LUT uniforms
 uniform sampler3D uLut3D;
@@ -587,6 +589,45 @@ vec3 applyLogWheels(vec3 color) {
                  0.0, 1.0);
 }
 
+
+)"
+R"(
+// Float HSV and bilinear interpolation match colorwarper::apply in VideoEffect.cpp.
+vec3 applyHueSatWarp(vec3 color) {
+    float r=color.r, g=color.g, b=color.b;
+    float mx=max(r,max(g,b)), mn=min(r,min(g,b)), dl=mx-mn;
+    float v=mx, s=mx>0.0 ? dl/mx : 0.0;
+    float h=dl<=1e-6 ? 0.0 : (mx==r ? 60.0*((g-b)/dl)
+        : mx==g ? 60.0*((b-r)/dl)+120.0 : 60.0*((r-g)/dl)+240.0);
+    if (h<0.0) h+=360.0;
+    // Achromatic pixels have undefined hue, but s'=0: leave them unchanged.
+    if (s==0.0) return color;
+    float hi=h/30.0;
+    int h0=int(floor(hi))%12, h1=(h0+1)%12;
+    float fh=hi-floor(hi);
+    float ri=clamp(s,0.0,1.0)*2.0;
+    int r0=clamp(int(floor(ri)),0,1), r1=r0+1;
+    float fr=ri-float(r0);
+    vec2 a=uHueSatWarp[r0*12+h0]*(1.0-fh)+uHueSatWarp[r0*12+h1]*fh;
+    vec2 bnodes=uHueSatWarp[r1*12+h0]*(1.0-fh)+uHueSatWarp[r1*12+h1]*fh;
+    vec2 warp=a*(1.0-fr)+bnodes*fr;
+    if (warp.x==0.0 && warp.y==1.0) return color;
+    h=mod(h+warp.x+360.0,360.0);
+    float sat=clamp(s*warp.y,0.0,1.0);
+    float c=v*sat;
+    float x=c*(1.0-abs(mod(h/60.0,2.0)-1.0));
+    float m=v-c;
+    int sector=int(floor(h/60.0));
+    vec3 result;
+    if (sector==0) result=vec3(c,x,0.0);
+    else if (sector==1) result=vec3(x,c,0.0);
+    else if (sector==2) result=vec3(0.0,c,x);
+    else if (sector==3) result=vec3(0.0,x,c);
+    else if (sector==4) result=vec3(x,0.0,c);
+    else result=vec3(c,0.0,x);
+    return result+vec3(m);
+}
+
 float luminance(vec3 color) {
     return dot(color, vec3(0.2126, 0.7152, 0.0722));
 }
@@ -857,11 +898,11 @@ R"(
         bool logEnabled = uLogShadow != vec3(0.0)
                        || uLogMid != vec3(0.0)
                        || uLogHigh != vec3(0.0);
-        if (!logEnabled && uSaturation != 0.0)
+        if (!logEnabled && !uHueSatWarpEnabled && uSaturation != 0.0)
             color = adjustSaturation(color, uSaturation);
         if (uHue != 0.0)
             color = adjustHue(color, uHue);
-        if (!logEnabled && (uTemperature != 0.0 || uTint != 0.0))
+        if (!logEnabled && !uHueSatWarpEnabled && (uTemperature != 0.0 || uTint != 0.0))
             color = adjustTemperatureTint(color, uTemperature, uTint);
         if (uGamma != 1.0)
             color = adjustGamma(color, uGamma);
@@ -871,8 +912,11 @@ R"(
         if (uLift != vec4(0.0) || uLggGamma != vec4(1.0, 1.0, 1.0, 1.0) || uGain != vec4(1.0, 1.0, 1.0, 1.0))
             color = applyLiftGammaGain(color);
 
-        if (logEnabled) {
+        if (logEnabled)
             color = applyLogWheels(color);
+        if (uHueSatWarpEnabled)
+            color = applyHueSatWarp(color);
+        if (logEnabled || uHueSatWarpEnabled) {
             if (uSaturation != 0.0)
                 color = adjustSaturation(color, uSaturation);
             if (uTemperature != 0.0 || uTint != 0.0)
@@ -2358,6 +2402,15 @@ void GLPreview::paintGL()
                   static_cast<float>(effLgg[2][1]),
                   static_cast<float>(effLgg[2][2]),
                   static_cast<float>(effLgg[2][3])));
+    m_program->setUniformValue("uHueSatWarpEnabled", !m_cc.hueSatWarp.isDefault());
+    if (!m_cc.hueSatWarp.isDefault()) {
+        QVector2D nodes[36];
+        for (int r = 0; r < 3; ++r)
+            for (int h = 0; h < 12; ++h)
+                nodes[r*12+h] = QVector2D(m_cc.hueSatWarp.hueShiftDeg[r][h],
+                                           m_cc.hueSatWarp.satScale[r][h]);
+        m_program->setUniformValueArray("uHueSatWarp", nodes, 36);
+    }
     m_program->setUniformValue(m_locLogShadow,
         QVector3D(static_cast<float>(m_logWheels[0][0]),
                   static_cast<float>(m_logWheels[0][1]),

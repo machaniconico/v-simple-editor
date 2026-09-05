@@ -1,3 +1,4 @@
+#include "HueSatWarpWidget.h"
 #include "ColorGradingPanel.h"
 #include "ColorWheelWidget.h"
 #include "CurveEditor.h"
@@ -888,6 +889,21 @@ ColorGradingPanel::ColorGradingPanel(QWidget *parent)
     connect(m_logHighWheel, &ColorWheelWidget::colorChanged,
             this, &ColorGradingPanel::onLogHighChanged);
 
+    auto *warpGroup = new QGroupBox(tr("カラーワーパー (色相 × 彩度)"));
+    auto *warpLayout = new QVBoxLayout(warpGroup);
+    m_hueSatWarp = new HueSatWarpWidget(warpGroup);
+    m_hueSatWarp->setObjectName(QStringLiteral("hueSatWarpWidget"));
+    warpLayout->addWidget(m_hueSatWarp);
+    mainLayout->addWidget(warpGroup);
+    connect(m_hueSatWarp, &HueSatWarpWidget::valueChanged, this, [this]() {
+        if (m_updating) return;
+        m_cc.hueSatWarp = m_hueSatWarp->value();
+        emit hueSatWarpChanged(m_cc, false);
+    });
+    connect(m_hueSatWarp, &HueSatWarpWidget::editingFinished, this, [this]() {
+        if (!m_updating) emit hueSatWarpChanged(m_cc, true);
+    });
+
     // --- Basic Corrections Section ---
     auto *basicGroup = new QGroupBox(tr("基本補正"));
     auto *basicLayout = new QVBoxLayout(basicGroup);
@@ -1278,6 +1294,7 @@ void ColorGradingPanel::updateWhiteBalanceControlsFromCC()
 
 void ColorGradingPanel::updateGraphicalWheelsFromCC()
 {
+    if (m_hueSatWarp) m_hueSatWarp->setValue(m_cc.hueSatWarp);
     if (m_liftWheel)
         m_liftWheel->setColor(m_cc.liftR, m_cc.liftG, m_cc.liftB);
     if (m_gammaWheel)
@@ -1640,6 +1657,7 @@ void ColorGradingPanel::onResetClicked()
     m_liftWheel->setColor(0, 0, 0);
     m_gammaWheel->setColor(0, 0, 0);
     m_gainWheel->setColor(0, 0, 0);
+    m_hueSatWarp->setValue(m_cc.hueSatWarp);
     m_logShadowWheel->setColor(0, 0, 0);
     m_logMidWheel->setColor(0, 0, 0);
     m_logHighWheel->setColor(0, 0, 0);

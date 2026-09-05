@@ -100,6 +100,7 @@ int runFreezeFrameSelftest();
 int runFrameIoSelftest();
 int runFxGrainEchoSelftest();
 int runGradeKeyframeSelftest();
+int runColorWarperSelftest();
 int runGradeLogWheelSelftest();
 int runGradeWheelWiringSelftest();
 int runGraphEditorSelftest();
@@ -492,6 +493,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Tracker preset state persistence in ProjectFile save/load cycle (10 gates)" },
     { "grade-lgg-serialization", "VEDITOR_GRADE_LGG_SERIALIZATION_SELFTEST", runGradeLggSerializationSelftest, false,
       "ColorCorrection LGG 9-field project serialization round-trip/default-omit/backward-compat gates" },
+    { "color-warper", "VEDITOR_COLOR_WARPER_SELFTEST", runColorWarperSelftest, false,
+      "Hue/saturation mesh CPU math and persistence (6 gates)" },
     { "grade-log-wheel", "VEDITOR_GRADE_LOG_WHEEL_SELFTEST", runGradeLogWheelSelftest, false,
       "ColorCorrection Log Shadow/Midtone/Highlight CPU math and project serialization (5 gates)" },
     { "aihighlight",       "VEDITOR_AIHIGHLIGHT_SELFTEST",        runAIHighlightSelftest,        false,

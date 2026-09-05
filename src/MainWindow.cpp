@@ -6050,6 +6050,10 @@ void MainWindow::setupMenuBar()
     m_colorGradingPanel->close(); // 初期非表示を確実にする
 
     auto sameColorCorrection = [](const ColorCorrection &a, const ColorCorrection &b) {
+        for (int r = 0; r < 3; ++r)
+            for (int h = 0; h < 12; ++h)
+                if (a.hueSatWarp.hueShiftDeg[r][h] != b.hueSatWarp.hueShiftDeg[r][h]
+                    || a.hueSatWarp.satScale[r][h] != b.hueSatWarp.satScale[r][h]) return false;
         auto near = [](double x, double y) { return std::abs(x - y) <= 1e-9; };
         return near(a.brightness, b.brightness)
             && near(a.contrast, b.contrast)
@@ -6130,6 +6134,30 @@ void MainWindow::setupMenuBar()
                                                static_cast<float>(bGain));
     };
 
+    connect(m_colorGradingPanel, &ColorGradingPanel::hueSatWarpChanged,
+            this, [this, sameColorCorrection, dirty = false](const ColorCorrection &cc, bool finished) mutable {
+        if (finished) {
+            if (dirty) m_timeline->saveUndoState(QStringLiteral("カラーワーパー"));
+            dirty = false;
+            return;
+        }
+        int trackIdx = -1, clipIdx = -1;
+        ClipInfo selected;
+        if (!selectedVideoClipRef(trackIdx, clipIdx, &selected)) return;
+        if (sameColorCorrection(selected.colorCorrection, cc)) return;
+        auto *track = m_timeline->videoTracks().value(trackIdx, nullptr);
+        if (!track) return;
+        auto clips = track->clips();
+        if (clipIdx < 0 || clipIdx >= clips.size()) return;
+        const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
+        clips[clipIdx].colorCorrection = cc;
+        track->setClips(clips);
+        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
+        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+        dirty = true;
+        m_timeline->refreshPlaybackSequence();
+        m_player->setColorCorrection(cc);
+    });
     connect(m_colorGradingPanel, &ColorGradingPanel::colorCorrectionChanged,
             this, [this, writeSelectedClipColorCorrection](const ColorCorrection &cc) {
         if (m_timeline->hasSelection()) {

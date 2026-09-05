@@ -2063,6 +2063,15 @@ QJsonObject ProjectFile::colorCorrectionToJson(const ColorCorrection &cc)
     addIfNonZero(QStringLiteral("logHighR"), cc.logHighR);
     addIfNonZero(QStringLiteral("logHighG"), cc.logHighG);
     addIfNonZero(QStringLiteral("logHighB"), cc.logHighB);
+    if (!cc.hueSatWarp.isDefault()) {
+        QJsonArray shifts, scales;
+        for (int r = 0; r < HueSatWarp::kSatRings; ++r)
+            for (int h = 0; h < HueSatWarp::kHueNodes; ++h) {
+                shifts.append(cc.hueSatWarp.hueShiftDeg[r][h]);
+                scales.append(cc.hueSatWarp.satScale[r][h]);
+            }
+        obj["hueSatWarp"] = QJsonObject{{"hueShift", shifts}, {"satScale", scales}};
+    }
     return obj;
 }
 
@@ -2097,6 +2106,17 @@ ColorCorrection ProjectFile::colorCorrectionFromJson(const QJsonObject &obj)
     cc.logHighR = obj["logHighR"].toDouble(0.0);
     cc.logHighG = obj["logHighG"].toDouble(0.0);
     cc.logHighB = obj["logHighB"].toDouble(0.0);
+    const QJsonObject warp = obj["hueSatWarp"].toObject();
+    const QJsonArray shifts = warp["hueShift"].toArray();
+    const QJsonArray scales = warp["satScale"].toArray();
+    for (int r = 0; r < HueSatWarp::kSatRings; ++r)
+        for (int h = 0; h < HueSatWarp::kHueNodes; ++h) {
+            const int i = r * HueSatWarp::kHueNodes + h;
+            if (i < shifts.size())
+                cc.hueSatWarp.hueShiftDeg[r][h] = static_cast<float>(qBound(-60.0, shifts[i].toDouble(0.0), 60.0));
+            if (i < scales.size())
+                cc.hueSatWarp.satScale[r][h] = static_cast<float>(qBound(0.0, scales[i].toDouble(1.0), 2.0));
+        }
     return cc;
 }
 

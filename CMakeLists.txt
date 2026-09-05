@@ -124,6 +124,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/Light3DSelftest.cpp
     src/selftests/VoiceIsolationSelftest.cpp
     src/selftests/GradeLggSerializationSelftest.cpp
+    src/selftests/color_warper_selftest.cpp
     src/selftests/GradeLogWheelSelftest.cpp
     src/selftests/GradeKeyframeSelftest.cpp
     src/selftests/GradeWheelWiringSelftest.cpp
@@ -218,6 +219,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/EffectParamSchema.cpp
     src/VideoEffectDialogs.cpp
     src/ColorGradingPanel.cpp
+    src/HueSatWarpWidget.h
+    src/HueSatWarpWidget.cpp
     src/ColorWheelWidget.cpp
     src/CredentialDialog.cpp
     src/CredentialVault.h

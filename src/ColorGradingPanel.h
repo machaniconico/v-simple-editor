@@ -14,6 +14,7 @@
 #include "LutImporter.h"
 
 class ColorWheelWidget;
+class HueSatWarpWidget;
 class CurveEditor;
 class HueVsSatEditor;
 class QGroupBox;
@@ -65,6 +66,7 @@ public:
     void curvesFromJson(const QJsonObject &obj, int curWidth, int curHeight);
 
 signals:
+    void hueSatWarpChanged(const ColorCorrection &cc, bool finished);
     void colorCorrectionChanged(const ColorCorrection &cc);
     void colorWheelsChanged(const ColorWheels &cw);
     void lutSelected(const QString &name);
@@ -250,6 +252,7 @@ private:
     ColorWheelWidget *m_liftWheel;
     ColorWheelWidget *m_gammaWheel;
     ColorWheelWidget *m_gainWheel;
+    HueSatWarpWidget *m_hueSatWarp = nullptr;
     ColorWheelWidget *m_logShadowWheel;
     ColorWheelWidget *m_logMidWheel;
     ColorWheelWidget *m_logHighWheel;
