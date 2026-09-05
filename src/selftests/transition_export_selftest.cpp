@@ -21,6 +21,13 @@ bool bitsEqual(const QImage &a, const QImage &b)
             return false;
     return true;
 }
+// Preview/export may store identical pixels in different QImage formats.
+// Keep bitsEqual strict for G1's same-path byte identity check.
+bool pixelsEqual(const QImage &a, const QImage &b)
+{
+    return bitsEqual(a.convertToFormat(QImage::Format_RGBA8888),
+                     b.convertToFormat(QImage::Format_RGBA8888));
+}
 double mse(const QImage &left, const QImage &right)
 {
     if (left.isNull() || right.isNull() || left.size() != right.size())
@@ -117,9 +124,11 @@ int runTransitionExportSelftest()
     gate(1, identity);
 
     timeline.trackAt(false, 0)->setClips({a, b});
-    const QImage layerA = tlrender::detail::decodeClipFrameNativeForTest(redPath, 0.0);
-    const QImage layerB = tlrender::detail::decodeClipFrameNativeForTest(bluePath, 0.0);
-    bool dissolve = fixtures && !layerA.isNull() && !layerB.isNull();
+    // Use the same still-image reader as export and preview harvesting.
+    const QImage layerA = tlrender::readTransitionStillFrame(redPath);
+    const QImage layerB = tlrender::readTransitionStillFrame(bluePath);
+    const bool layersValid = fixtures && pixelsEqual(layerA, red) && pixelsEqual(layerB, blue);
+    bool dissolve = layersValid;
     // All alignments use the same handle-borrowing helper; the cut is T=2.
     for (TransitionAlignment alignment : {TransitionAlignment::Center,
              TransitionAlignment::Start, TransitionAlignment::End}) {
@@ -129,7 +138,8 @@ int runTransitionExportSelftest()
         const double expectedStart = alignment == TransitionAlignment::Start ? 2.0
             : alignment == TransitionAlignment::End ? 1.0 : 1.5;
         dissolve &= std::abs(ivs[0][1].timelineStart - expectedStart) < 1e-9;
-        const double mid = (ivs[0][1].timelineStart + ivs[0][0].timelineEnd) * 0.5;
+        dissolve &= std::abs(ivs[0][0].timelineEnd - (expectedStart + 1.0)) < 1e-9;
+        const double mid = expectedStart + 0.5;
         dissolve &= mse(render(mid), OverlayRenderer::applyTransition(
             layerA, layerB, TransitionType::CrossDissolve, 0.5)) < 1.0;
     }
@@ -159,7 +169,10 @@ int runTransitionExportSelftest()
     transitionPair(timeline, a, b, TransitionType::CrossDissolve,
         TransitionAlignment::Center, TransitionEasing::EaseIn);
     const QImage eased = render(1.75);
-    gate(4, mse(eased, linear) > 1.0 && mse(eased, OverlayRenderer::applyTransition(
+    gate(4, layersValid && !linear.isNull() && !eased.isNull()
+        && mse(linear, OverlayRenderer::applyTransition(
+            layerA, layerB, TransitionType::CrossDissolve, 0.25)) < 1.0
+        && mse(eased, linear) > 1.0 && mse(eased, OverlayRenderer::applyTransition(
         layerA, layerB, TransitionType::CrossDissolve,
         applyEasing(0.25, TransitionEasing::EaseIn))) < 1.0);
 
@@ -169,15 +182,17 @@ int runTransitionExportSelftest()
     timeline.trackAt(false, 0)->setClips({fade});
     const QImage first = render(1.0 / 30.0);
     const QColor mean = meanColor(first, 0, size.width());
-    gate(5, !first.isNull() && (mean.red() + mean.green() + mean.blue()) / 3.0 < 8.0
-        && bitsEqual(render(0.6), layerA));
+    gate(5, layersValid && !first.isNull() && mean.red() > 8
+        && mean.green() == 0 && mean.blue() == 0
+        && (mean.red() + mean.green() + mean.blue()) / 3.0 < 8.0
+        && pixelsEqual(render(0.6), layerA));
 
     // Inject only decoded pixels: sequence lookup, neighbour selection,
     // displayFrame, and m_currentFrameImage are the real preview path.
     transitionPair(timeline, a, b, TransitionType::CrossDissolve,
         TransitionAlignment::Center, TransitionEasing::EaseIn);
     const QVector<PlaybackEntry> sequence = timeline.computePlaybackSequence();
-    bool previewParity = sequence.size() == 2;
+    bool previewParity = layersValid && sequence.size() == 2;
     if (previewParity) {
         tlrender::setTransitionStepsEnabledForTest(true);
         const QImage preview = VideoPlayer::displayFrameForTest(
@@ -185,12 +200,12 @@ int runTransitionExportSelftest()
         previewParity &= tlrender::transitionStepCallCountForTest() == 1;
         const QImage shared = tlrender::applyOverlapTransitionStep(
             layerA, layerB, timeline.videoOverlapIntervals()[0][0], 1.75);
-        previewParity &= bitsEqual(preview, shared) && bitsEqual(render(1.75), shared);
+        previewParity &= pixelsEqual(preview, shared) && pixelsEqual(render(1.75), shared);
         // Also traverse the real still-image harvest without pixel injection.
         tlrender::setTransitionStepsEnabledForTest(true);
         const QImage harvested = VideoPlayer::displayFrameForTest(
             layerA, QImage(), sequence, 0, 1750000);
-        previewParity &= bitsEqual(harvested, shared)
+        previewParity &= pixelsEqual(harvested, shared)
             && tlrender::transitionStepCallCountForTest() == 1;
     }
     gate(6, previewParity);
