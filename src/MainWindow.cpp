@@ -7566,7 +7566,9 @@ void MainWindow::updateEditActions()
     m_rippleDeleteAction->setEnabled(hasAnySel);
     m_copyAction->setEnabled(hasSel);
     m_pasteAction->setEnabled(m_timeline->hasClipboard());
-    m_undoAction->setEnabled(m_timeline->canUndo());
+    m_undoAction->setEnabled(m_timeline->canUndo()
+        || (!m_projectCameraUndoSlot.isEmpty()
+            && m_timeline->undoManager()->currentIndex() == m_projectCameraUndoTimelineDepth));
     m_redoAction->setEnabled(m_timeline->canRedo());
     if (m_reverseClipAction) {
         TrackKind kind = TrackKind::Video;
@@ -8357,6 +8359,8 @@ void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
             m_clipWiggleParams.insert(entry.clipId, entry.params);
     }
     m_projectCamera = Camera3D{};
+    m_projectCameraUndoSlot = QJsonObject{};
+    m_projectCameraUndoTimelineDepth = -1;
     if (!data.projectCamera.isEmpty())
         m_projectCamera.fromJson(data.projectCamera);
     m_projectLights.clear();
@@ -8717,6 +8721,8 @@ void MainWindow::newProject()
         if (m_light3DDialog)
             m_light3DDialog->close();
         m_projectCamera = Camera3D{};
+        m_projectCameraUndoSlot = QJsonObject{};
+        m_projectCameraUndoTimelineDepth = -1;
         m_projectLights.clear();
         m_projectOverlays.clear();
         m_particleClipConfigs.clear();
@@ -9699,6 +9705,20 @@ void MainWindow::pasteAttributes()
 
 void MainWindow::undoAction()
 {
+    if (!m_projectCameraUndoSlot.isEmpty()
+        && m_timeline->undoManager()->currentIndex() == m_projectCameraUndoTimelineDepth) {
+        // fromJson only replaces tracks present in JSON; clear newly added tracks
+        // before restoring a slot whose camera originally had no animation.
+        m_projectCamera = Camera3D{};
+        m_projectCamera.fromJson(m_projectCameraUndoSlot);
+        m_projectCameraUndoSlot = QJsonObject{};
+        m_projectCameraUndoTimelineDepth = -1;
+        syncProjectLightingToTimeline();
+        refreshSpecialClipPreview();
+        statusBar()->showMessage(QStringLiteral("カメラ解析の適用を元に戻しました"));
+        updateEditActions();
+        return;
+    }
     m_timeline->undo();
     statusBar()->showMessage("Undo");
     updateEditActions();
@@ -13530,6 +13550,9 @@ void MainWindow::openCameraMotionDialog()
     if (dialog.exec() != QDialog::Accepted)
         return;
     m_projectCamera = dialog.camera();
+    m_projectCameraUndoSlot = QJsonObject{};
+    m_projectCameraUndoTimelineDepth = -1;
+    updateEditActions();
     syncProjectLightingToTimeline();
     refreshSpecialClipPreview();
     statusBar()->showMessage(QStringLiteral("カメラモーションを更新しました"), 4000);
@@ -13929,9 +13952,46 @@ void MainWindow::openAIMaskDialog()
 
 void MainWindow::openPlanarTrackerDialog()
 {
+    int trackIndex = -1;
+    int clipIndex = -1;
+    ClipInfo clip;
+    if (!selectedVideoClipRef(trackIndex, clipIndex, &clip)) {
+        QMessageBox::information(this, QStringLiteral("プラナートラッカー"),
+                                 QStringLiteral("解析する動画クリップを選択してください。"));
+        return;
+    }
+    const double fps = m_projectConfig.fps;
+    const double startSec = clipTimelineStartSeconds(trackIndex, clipIndex);
+    const QSize canvas(m_projectConfig.width, m_projectConfig.height);
+    const double frameCount = std::ceil(clip.effectiveDuration() * fps);
+    if (!std::isfinite(fps) || fps <= 0 || !std::isfinite(frameCount)
+        || frameCount < 1 || frameCount > std::numeric_limits<int>::max())
+        return;
+    QList<QImage> frames;
+    QProgressDialog progress(QStringLiteral("解析用フレームを読み込み中…"),
+                             QStringLiteral("キャンセル"), 0, int(frameCount), this);
+    progress.setWindowModality(Qt::ApplicationModal);
+    for (int i = 0; i < int(frameCount); ++i) {
+        progress.setValue(i);
+        if (progress.wasCanceled())
+            return;
+        // Canvas-space input keeps corner coordinates consistent with intrinsics,
+        // including clip speed, reverse, transforms and the project output size.
+        QImage frame = tlrender::renderFrameAt(m_timeline,
+            qRound64((startSec + double(i) / fps) * 1000000.0), canvas);
+        if (frame.isNull()) {
+            QMessageBox::warning(this, QStringLiteral("プラナートラッカー"),
+                                 QStringLiteral("解析用フレームを読み込めませんでした。"));
+            return;
+        }
+        frames.append(frame);
+    }
+    progress.setValue(int(frameCount));
     if (!m_planarTrackerDialog) {
         m_planarTrackerDialog = new PlanarTrackerDialog(this);
         m_planarTrackerDialog->setObjectName(QStringLiteral("planarTrackerDialog"));
+        connect(m_planarTrackerDialog, &PlanarTrackerDialog::cameraSolveApplied,
+                this, &MainWindow::applyCameraSolve);
 
         // PRD-PROJECT-PRESET US-PP-4: write back state when dialog is closed.
         connect(m_planarTrackerDialog, &QDialog::finished, this,
@@ -13944,10 +14004,31 @@ void MainWindow::openPlanarTrackerDialog()
 
     // PRD-PROJECT-PRESET US-PP-4: restore state before showing.
     m_planarTrackerDialog->setInitialState(m_planarTrackerState);
+    m_planarTrackerDialog->setCameraSolveContext(
+        canvas, m_projectCamera.camera().fov, fps, startSec);
+    m_planarTrackerDialog->setReferenceFrame(frames.first());
+    m_planarTrackerDialog->setFrames(frames);
+    m_planarTrackerDialog->setWindowModality(Qt::ApplicationModal);
 
     m_planarTrackerDialog->show();
     m_planarTrackerDialog->raise();
     m_planarTrackerDialog->activateWindow();
+}
+
+void MainWindow::applyCameraSolve(const QVector<camsolve::Pose>& poses,
+                                 double fps, double startSec)
+{
+    if (!m_timeline || !std::isfinite(fps) || fps <= 0 || !std::isfinite(startSec)
+        || !std::any_of(poses.cbegin(), poses.cend(),
+                        [](const camsolve::Pose& p) { return p.valid; }))
+        return;
+    m_projectCameraUndoSlot = m_projectCamera.toJson();
+    m_projectCameraUndoTimelineDepth = m_timeline->undoManager()->currentIndex();
+    camsolve::applyPosesToCamera(m_projectCamera, poses, fps, startSec);
+    syncProjectLightingToTimeline();
+    refreshSpecialClipPreview();
+    updateEditActions();
+    statusBar()->showMessage(QStringLiteral("3D カメラ解析を適用しました"), 4000);
 }
 
 // US-TP-6: PRD-TP — open the motion-tracker preset dialog modally and, on

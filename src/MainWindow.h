@@ -24,6 +24,7 @@
 #include "ProjectSettings.h"
 #include "Exporter.h"
 #include "ProjectFile.h"
+#include "CameraSolver.h"
 #include "AutoEdit.h"
 #include "ThemeManager.h"
 #include "MultiCam.h"
@@ -523,6 +524,7 @@ private slots:
 
     // US-PT-B: Sprint 15 — Planar (4-corner) tracker dialog
     void openPlanarTrackerDialog();
+    void applyCameraSolve(const QVector<camsolve::Pose>& poses, double fps, double startSec);
 
     // US-TP-6: PRD-TP — モーショントラッカー preset 適用ダイアログ
     void showMotionTrackerDialog();
@@ -815,6 +817,8 @@ private:
     QHash<QString, exprbind::ClipExpressionBindings> m_clipExpressionBindings;
     QHash<QString, wiggle::WiggleParams> m_clipWiggleParams;
     Camera3D m_projectCamera;                                 // single per-project camera
+    QJsonObject m_projectCameraUndoSlot;
+    int m_projectCameraUndoTimelineDepth = -1;
     QVector<Light3D> m_projectLights;                         // project-level 3D lights
     QPointer<Light3DDialog> m_light3DDialog;
     int m_selectedVideoTrackIndex = -1;

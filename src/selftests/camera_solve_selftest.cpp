@@ -151,6 +151,62 @@ int runCameraSolveSelftest()
         if (filtered[i].valid) exact = exact && error(filtered[i], rotation(15.0*i/29,0)) < 0.5;
     }
     gate(6, exact && valid == 27);
+    Camera3D applied;
+    const double fps = 24.0;
+    const double startSec = 2.5;
+    camsolve::applyPosesToCamera(applied, filtered, fps, startSec);
+    bool keyframesOk = applied.camera().trueProjection;
+    for (auto property : {Camera3DProperty::PositionX, Camera3DProperty::PositionY,
+                          Camera3DProperty::PositionZ, Camera3DProperty::TargetX,
+                          Camera3DProperty::TargetY, Camera3DProperty::TargetZ,
+                          Camera3DProperty::Roll}) {
+        const auto* track = applied.track(property);
+        keyframesOk = keyframesOk && track->count() == 27;
+        for (int i = 0; i < 30; ++i) {
+            const double time = startSec + double(i) / fps;
+            const auto& keys = track->keyframes();
+            const bool found = std::any_of(keys.cbegin(), keys.cend(),
+                [time](const KeyframePoint& key) { return std::abs(key.time-time) < 1e-10; });
+            keyframesOk = keyframesOk && found == filtered[i].valid;
+            if (filtered[i].valid) {
+                const auto expected = camsolve::poseToCameraState(filtered[i], applied.camera());
+                const auto actual = applied.getCameraAt(time);
+                keyframesOk = keyframesOk && (actual.position-expected.position).length() < 1e-6
+                    && (actual.target-expected.target).length() < 1e-6
+                    && std::abs(actual.roll-expected.roll) < 1e-6 && actual.trueProjection;
+            }
+        }
+    }
+    keyframesOk = keyframesOk && applied.track(Camera3DProperty::Fov)->count() == 0;
+    gate(7, keyframesOk);
+
+    // Exercise a populated undo slot, including animation and non-default state.
+    Camera3D restored;
+    auto beforeState = restored.camera();
+    beforeState.position = QVector3D(3, 4, 5);
+    beforeState.fov = 75;
+    beforeState.nearPlane = 0.3;
+    restored.setCamera(beforeState);
+    restored.setCameraKeyframe(0.25, beforeState, KeyframePoint::EaseInOut);
+    restored.setLayerDepth(1, 12);
+    const QJsonObject before = restored.toJson();
+    camsolve::applyPosesToCamera(restored, filtered, fps, startSec);
+    const bool changed = restored.toJson() != before
+        && restored.track(Camera3DProperty::Fov)->count() == 1
+        && restored.track(Camera3DProperty::Fov)->keyframes().first().time == 0.25;
+    restored = Camera3D{};
+    restored.fromJson(before);
+    bool undoOk = changed && restored.toJson() == before;
+    camsolve::applyPosesToCamera(restored, filtered, 0, startSec);
+    undoOk = undoOk && restored.toJson() == before;
+    camsolve::applyPosesToCamera(restored, QVector<camsolve::Pose>(3), fps, startSec);
+    undoOk = undoOk && restored.toJson() == before;
+    Camera3D initiallyEmpty;
+    const QJsonObject emptyBefore = initiallyEmpty.toJson();
+    camsolve::applyPosesToCamera(initiallyEmpty, filtered, fps, startSec);
+    initiallyEmpty = Camera3D{};
+    initiallyEmpty.fromJson(emptyBefore);
+    gate(8, undoOk && initiallyEmpty.toJson() == emptyBefore);
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
     return failed;
 }

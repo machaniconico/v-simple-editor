@@ -10,6 +10,7 @@
 #include "PlanarTracker.h"
 #include "PlanarTrackerPreset.h"
 #include "ProjectFile.h"
+#include "CameraSolver.h"
 
 class QComboBox;
 class QDialogButtonBox;
@@ -73,6 +74,7 @@ public:
 
     // Result after tracking
     QList<planar::Frame> trackResult() const;
+    void setCameraSolveContext(QSize canvas, double fov, double fps, double startSec);
 
     // PRD-PROJECT-PRESET US-PP-4: project-state persistence hooks
     void setInitialState(const PlanarTrackerProjectState& s);
@@ -83,6 +85,7 @@ public slots:
 
 signals:
     void trackComputed(const QList<planar::Frame>& frames);
+    void cameraSolveApplied(const QVector<camsolve::Pose>& poses, double fps, double startSec);
     void presetApplied(planar_tracker_preset::PlanarTrackerPreset);
 
 private slots:
@@ -94,6 +97,7 @@ private slots:
     void onImportPreset();
     void onResetCorners();
     void onTrackClicked();
+    void onCameraSolveClicked();
     void onPatchSizeChanged(int value);
     void onSearchRadiusChanged(int value);
     void onDampingChanged(int value);
@@ -112,6 +116,11 @@ private:
     planar::CornerSet    m_corners;
     QList<planar::Frame> m_result;
     planar::TrackParams  m_params;
+    QSize               m_cameraCanvas{1920, 1080};
+    double              m_cameraFov = 60.0;
+    double              m_cameraFps = 30.0;
+    double              m_cameraStartSec = 0.0;
+    QPushButton*        m_cameraSolveButton = nullptr;
 
     QLabel*             m_descriptionLabel       = nullptr;
     QComboBox*          m_presetCombo            = nullptr;

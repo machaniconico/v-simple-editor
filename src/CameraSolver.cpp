@@ -224,4 +224,22 @@ Camera3DState poseToCameraState(const Pose& p, const Camera3DState& base)
                             QVector3D::dotProduct(poseRight, right))*180/pi;
     return state;
 }
+void applyPosesToCamera(Camera3D& camera, const QVector<Pose>& poses,
+                        double fps, double startSec)
+{
+    if (!std::isfinite(fps) || fps <= 0 || !std::isfinite(startSec)
+        || !std::any_of(poses.cbegin(), poses.cend(), [](const Pose& p) { return p.valid; }))
+        return;
+    auto base = camera.camera();
+    base.trueProjection = true;
+    camera.setCamera(base);
+    // setCameraKeyframe also writes Fov; preserve that unrelated track verbatim.
+    const KeyframeTrack fov = *camera.track(Camera3DProperty::Fov);
+    for (qsizetype i = 0; i < poses.size(); ++i) {
+        if (poses[i].valid)
+            camera.setCameraKeyframe(startSec + double(i) / fps,
+                                      poseToCameraState(poses[i], base));
+    }
+    *camera.track(Camera3DProperty::Fov) = fov;
+}
 } // namespace camsolve

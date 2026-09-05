@@ -7,6 +7,7 @@
 #include <limits>
 
 struct Camera3DState;
+class Camera3D;
 
 namespace camsolve {
 
@@ -29,5 +30,7 @@ QVector<Pose> solveSequence(const QVector<QPolygonF>& cornersPerFrame,
                             int refFrame, const Intrinsics& intrinsics,
                             double confidenceThreshold = 0.5);
 Camera3DState poseToCameraState(const Pose& pose, const Camera3DState& base);
+void applyPosesToCamera(Camera3D& camera, const QVector<Pose>& poses,
+                        double fps, double startSec);
 
 } // namespace camsolve
