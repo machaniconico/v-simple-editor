@@ -11,6 +11,7 @@
 #include "../TimelineFrameRenderer.h"
 #include "../Timeline.h"
 #include "../TrimOps.h"
+#include "../TrackMatteKey.h"
 #include "../UndoManager.h"
 #include "../VideoPlayer.h"
 #include "../WaveformGenerator.h"
@@ -24,6 +25,7 @@
 #include <QImage>
 #include <QJsonArray>
 #include <QPointer>
+#include <QPair>
 #include <QTimer>
 #include <QUuid>
 #include <QSet>
@@ -243,7 +245,17 @@ QJsonObject transitionToJson(const Transition& transition)
     return QJsonObject{
         {QStringLiteral("type"), transitionTypeNames().at(static_cast<int>(transition.type))},
         {QStringLiteral("durationSec"),
-         transition.type == TransitionType::None ? 0.0 : transition.duration}
+         transition.type == TransitionType::None ? 0.0 : transition.duration},
+        {QStringLiteral("alignment"), transitionAlignmentNames().at(static_cast<int>(transition.alignment))},
+        {QStringLiteral("easing"), transitionEasingNames().at(static_cast<int>(transition.easing))}
+    };
+}
+
+QJsonObject transitionIdentifierSchema(const QStringList& names)
+{
+    return QJsonObject{
+        {QStringLiteral("type"), QStringLiteral("string")},
+        {QStringLiteral("enum"), QJsonArray::fromStringList(names)}
     };
 }
 
@@ -251,7 +263,9 @@ QJsonObject transitionOutputItemSchema()
 {
     return outputSchemaOf(QJsonObject{
         {QStringLiteral("type"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
-        {QStringLiteral("durationSec"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}}
+        {QStringLiteral("durationSec"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
+        {QStringLiteral("alignment"), transitionIdentifierSchema(transitionAlignmentNames())},
+        {QStringLiteral("easing"), transitionIdentifierSchema(transitionEasingNames())}
     }, {QStringLiteral("type"), QStringLiteral("durationSec")});
 }
 
@@ -285,6 +299,10 @@ QJsonObject clipOutputItemSchema()
         {QStringLiteral("selected"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
         {QStringLiteral("leadIn"), transitionOutputItemSchema()},
         {QStringLiteral("trailOut"), transitionOutputItemSchema()},
+        {QStringLiteral("overlap"), objectSchema(QJsonObject{
+            {QStringLiteral("leadInSec"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
+            {QStringLiteral("trailOutSec"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}}
+        })},
         {QStringLiteral("textOverlayCount"), QJsonObject{
             {QStringLiteral("type"), QStringLiteral("integer")},
             {QStringLiteral("minimum"), 0}
@@ -870,8 +888,13 @@ QString actionRiskToString(FavoritableActionRisk risk)
     return QStringLiteral("safe");
 }
 
+struct ClipOverlap {
+    double leadInSec = 0.0;
+    double trailOutSec = 0.0;
+};
+
 QJsonObject clipToJson(const ClipInfo& clip, int clipIndex, double startSec,
-                       bool selected)
+                       bool selected, const ClipOverlap& overlap)
 {
     const double outPoint = clip.outPoint > 0.0 ? clip.outPoint : clip.duration;
     const double durationSec = clip.speed > 0.0 ? clip.effectiveDuration() : 0.0;
@@ -893,12 +916,35 @@ QJsonObject clipToJson(const ClipInfo& clip, int clipIndex, double startSec,
         {QStringLiteral("selected"), selected},
         {QStringLiteral("leadIn"), transitionToJson(clip.leadIn)},
         {QStringLiteral("trailOut"), transitionToJson(clip.trailOut)},
+        {QStringLiteral("overlap"), QJsonObject{
+            {QStringLiteral("leadInSec"), overlap.leadInSec},
+            {QStringLiteral("trailOutSec"), overlap.trailOutSec}
+        }},
         {QStringLiteral("textOverlayCount"), clip.textManager.count()}
     };
 }
 
-QJsonArray tracksToJson(const QVector<TimelineTrack*>& tracks)
+QJsonArray tracksToJson(const Timeline* timeline, TrackKind kind)
 {
+    const auto& tracks = kind == TrackKind::Video
+        ? timeline->videoTracks() : timeline->audioTracks();
+    // Use resolved playback bounds, including handle shortages and alignment.
+    // Audio can emit several entries per clip (time remapping / sequences).
+    QVector<QVector<OverlapInterval>> intervals;
+    if (kind == TrackKind::Video) {
+        intervals = timeline->videoOverlapIntervals();
+    } else {
+        intervals.resize(tracks.size());
+        for (const PlaybackEntry& entry : timeline->computeAudioPlaybackSequence()) {
+            if (entry.sourceTrack < 0 || entry.sourceTrack >= intervals.size())
+                continue;
+            OverlapInterval interval;
+            interval.clipIdx = entry.sourceClipIndex;
+            interval.timelineStart = entry.timelineStart;
+            interval.timelineEnd = entry.timelineEnd;
+            intervals[entry.sourceTrack].append(interval);
+        }
+    }
     QJsonArray result;
     for (int trackIndex = 0; trackIndex < tracks.size(); ++trackIndex) {
         QJsonArray clips;
@@ -906,6 +952,33 @@ QJsonArray tracksToJson(const QVector<TimelineTrack*>& tracks)
         const TimelineTrack *trackObject = tracks.at(trackIndex);
         const QVector<ClipInfo> emptyTrack;
         const QVector<ClipInfo>& track = trackObject ? trackObject->clips() : emptyTrack;
+        QVector<ClipOverlap> overlaps(track.size());
+        if (trackIndex < intervals.size()) {
+            QVector<QVector<OverlapInterval>> clipBounds(track.size());
+            for (const auto& interval : intervals.at(trackIndex)) {
+                if (interval.clipIdx >= 0 && interval.clipIdx < clipBounds.size())
+                    clipBounds[interval.clipIdx].append(interval);
+            }
+            for (int clipIndex = 0; clipIndex + 1 < track.size(); ++clipIndex) {
+                QVector<QPair<double, double>> intersections;
+                for (const auto& a : clipBounds.at(clipIndex)) {
+                    for (const auto& b : clipBounds.at(clipIndex + 1)) {
+                        const double start = qMax(a.timelineStart, b.timelineStart);
+                        const double end = qMin(a.timelineEnd, b.timelineEnd);
+                        if (end > start) intersections.append(qMakePair(start, end));
+                    }
+                }
+                std::sort(intersections.begin(), intersections.end());
+                double duration = 0.0;
+                double coveredEnd = -std::numeric_limits<double>::infinity();
+                for (const auto& span : intersections) {
+                    duration += qMax(0.0, span.second - qMax(span.first, coveredEnd));
+                    coveredEnd = qMax(coveredEnd, span.second);
+                }
+                overlaps[clipIndex].trailOutSec = duration;
+                overlaps[clipIndex + 1].leadInSec = duration;
+            }
+        }
         for (int clipIndex = 0; clipIndex < track.size(); ++clipIndex) {
             const ClipInfo& clip = track.at(clipIndex);
             // TimelineSequence::duration() and Timeline's placement logic both
@@ -913,7 +986,8 @@ QJsonArray tracksToJson(const QVector<TimelineTrack*>& tracks)
             // Therefore cursor + leadInSec is the absolute timeline start.
             cursorSec += clip.leadInSec;
             clips.append(clipToJson(clip, clipIndex, cursorSec,
-                                    trackObject && trackObject->isClipSelected(clipIndex)));
+                                    trackObject && trackObject->isClipSelected(clipIndex),
+                                    overlaps.at(clipIndex)));
             cursorSec += clip.speed > 0.0 ? clip.effectiveDuration() : 0.0;
         }
         result.append(QJsonObject{
@@ -1487,10 +1561,10 @@ void McpEditorTools::registerReadTools()
 
             if (result.contains(QStringLiteral("video")))
                 result.insert(QStringLiteral("video"),
-                              tracksToJson(currentTimeline->videoTracks()));
+                              tracksToJson(currentTimeline, TrackKind::Video));
             if (result.contains(QStringLiteral("audio")))
                 result.insert(QStringLiteral("audio"),
-                              tracksToJson(currentTimeline->audioTracks()));
+                              tracksToJson(currentTimeline, TrackKind::Audio));
             return result;
         }
     }, outputSchemaOf(QJsonObject{
@@ -3525,7 +3599,7 @@ void McpEditorTools::registerWriteTools()
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("set_transition"),
-        QStringLiteral("video は V1、audio は指定音声トラックのクリップにトランジションを設定する。video の type は TransitionType の識別子で None は解除する。audio では CrossDissolve (コンスタントパワーの隣接クロスフェード)、FadeIn、FadeOut のみ許可し、None を含む他の type はエラー。audio の変更は映像側へミラーしない。durationSec は秒、既定 0.5、範囲 0.1..5.0。タイムラインを変更する破壊的操作で、Ctrl+Z / undo ツールで戻せる。"),
+        QStringLiteral("video は V1、audio は指定音声トラックのクリップにトランジションを設定する。video の type は TransitionType の識別子で None は解除する。audio では CrossDissolve (コンスタントパワーの隣接クロスフェード)、FadeIn、FadeOut のみ許可し、None を含む他の type はエラー。audio の変更は映像側へミラーしない。durationSec は秒、既定 0.5、範囲 0.1..5.0。alignment は Center / Start / End (既定 Center)、easing は Linear / EaseIn / EaseOut / EaseInOut (既定 Linear)。タイムラインを変更する破壊的操作で、Ctrl+Z / undo ツールで戻せる。"),
         schemaWithRequired(mergedProperties(clipProperties, QJsonObject{
             {QStringLiteral("type"), QJsonObject{
                 {QStringLiteral("type"), QStringLiteral("string")},
@@ -3533,6 +3607,8 @@ void McpEditorTools::registerWriteTools()
                 {QStringLiteral("description"),
                  QStringLiteral("TransitionType の識別子。video は None で解除。kind=audio では CrossDissolve / FadeIn / FadeOut のみ許可")}
             }},
+            {QStringLiteral("alignment"), transitionIdentifierSchema(transitionAlignmentNames())},
+            {QStringLiteral("easing"), transitionIdentifierSchema(transitionEasingNames())},
             {QStringLiteral("durationSec"), QJsonObject{
                 {QStringLiteral("type"), QStringLiteral("number")},
                 {QStringLiteral("minimum"), 0.1},
@@ -3547,7 +3623,8 @@ void McpEditorTools::registerWriteTools()
             if (!rejectUnknownArguments(args,
                                         {QStringLiteral("kind"), QStringLiteral("trackIndex"),
                                          QStringLiteral("clipIndex"), QStringLiteral("type"),
-                                         QStringLiteral("durationSec")},
+                                         QStringLiteral("durationSec"), QStringLiteral("alignment"),
+                                         QStringLiteral("easing")},
                                         err))
                 return {};
             QString typeName;
@@ -3557,6 +3634,22 @@ void McpEditorTools::registerWriteTools()
             if (!transitionTypeFromName(typeName, &type))
                 return setError(err, QStringLiteral("type is not a valid TransitionType identifier")),
                        QJsonObject();
+
+            int alignmentIndex = 0;
+            int easingIndex = 0;
+            const auto parseIdentifier = [&](const QString& key, const QStringList& names,
+                                              int* index) {
+                if (!args.contains(key)) return true;
+                QString name;
+                if (!requiredString(args, key, &name, err)) return false;
+                *index = names.indexOf(name);
+                return *index >= 0 || setError(err, key + QStringLiteral(" の識別子が不正です"));
+            };
+            if (!parseIdentifier(QStringLiteral("alignment"), transitionAlignmentNames(), &alignmentIndex)
+                || !parseIdentifier(QStringLiteral("easing"), transitionEasingNames(), &easingIndex))
+                return {};
+            const auto alignment = static_cast<TransitionAlignment>(alignmentIndex);
+            const auto easing = static_cast<TransitionEasing>(easingIndex);
 
             double durationSec = 0.5;
             if (!positiveFiniteNumber(args, QStringLiteral("durationSec"), 0.5,
@@ -3582,16 +3675,39 @@ void McpEditorTools::registerWriteTools()
                 }
                 Timeline* currentTimeline = timeline();
                 QString audioError;
+                const auto before = snapshotTrackClips(currentTimeline);
+                auto clips = target.track->clips();
                 const bool applied = type == TransitionType::CrossDissolve
-                    ? currentTimeline->applyAudioCrossfade(
-                        target.trackIndex, target.clipIndex, durationSec, &audioError)
-                    : currentTimeline->applyAudioFade(
-                        target.trackIndex, target.clipIndex,
+                    ? audioxfade::applyCrossfade(clips, target.clipIndex, durationSec, &audioError)
+                    : audioxfade::applyFade(clips, target.clipIndex,
                         type == TransitionType::FadeIn
                             ? AudioFadeEdge::In : AudioFadeEdge::Out,
                         durationSec, &audioError);
                 if (!applied)
                     return setError(err, audioError), QJsonObject();
+
+                auto setShape = [&](Transition& transition) {
+                    transition.alignment = alignment;
+                    transition.easing = easing;
+                };
+                if (type == TransitionType::FadeIn)
+                    setShape(clips[target.clipIndex].leadIn);
+                else
+                    setShape(clips[target.clipIndex].trailOut);
+                if (type == TransitionType::CrossDissolve)
+                    setShape(clips[target.clipIndex + 1].leadIn);
+                target.track->setClips(clips);
+                auto mattes = currentTimeline->trackMatteEntries();
+                auto parents = currentTimeline->clipParentEntries();
+                remapTimelineCarrierAfterMutation(currentTimeline, mattes, before);
+                remapClipParentEntriesAfterMutation(currentTimeline, parents, before);
+                currentTimeline->setTrackMatteEntries(mattes);
+                currentTimeline->setClipParentEntries(parents);
+                currentTimeline->saveUndoState(type == TransitionType::CrossDissolve
+                    ? QStringLiteral("音声クロスフェード")
+                    : type == TransitionType::FadeIn ? QStringLiteral("音声フェードイン")
+                                                     : QStringLiteral("音声フェードアウト"));
+                emit target.track->modified();
 
                 const ClipInfo& updated = target.track->clips().at(target.clipIndex);
                 return QJsonObject{
@@ -3663,6 +3779,8 @@ void McpEditorTools::registerWriteTools()
             Transition transition;
             transition.type = type;
             transition.duration = durationSec;
+            transition.alignment = alignment;
+            transition.easing = easing;
             if (type == TransitionType::None)
                 currentTimeline->clearTransitionsOnSelected();
             else

@@ -3027,6 +3027,137 @@ int runMcpSelftest()
              QStringLiteral("Timeline was not available"));
     }
 
+    // US-300 reserves G148-G149: identifiers and actual playback overlap.
+    if (timelineReady) {
+        auto* videoTrack = projectTimeline->trackAt(false, 0);
+        auto* audioTrack = projectTimeline->trackAt(true, 0);
+        const auto savedVideo = videoTrack->clips();
+        const auto savedAudio = audioTrack->clips();
+        ClipInfo first = makeTestClip(QStringLiteral("overlap-A"), 0);
+        ClipInfo second = makeTestClip(QStringLiteral("overlap-B"), 0);
+        first.duration = second.duration = 10.0;
+        first.inPoint = second.inPoint = 2.0;
+        first.outPoint = second.outPoint = 7.0; // Handles for all alignments.
+        const auto resetOverlapFixture = [&]() {
+            videoTrack->setClips({first, second});
+            audioTrack->setClips({first, second});
+            projectTimeline->clearSelection();
+            projectTimeline->undoManager()->clear();
+            projectTimeline->undoManager()->saveState(
+                projectTimeline->currentState(), QStringLiteral("MCP overlap baseline"));
+        };
+        const auto exportedClips = [&](const QString& kind) {
+            const auto response = callProjectInfoTool(
+                310, QStringLiteral("get_timeline"), QJsonObject{});
+            const auto tracks = toolPayload(response).value(kind).toArray();
+            return tracks.isEmpty() ? QJsonArray{} : tracks.at(0).toObject()
+                .value(QStringLiteral("clips")).toArray();
+        };
+        const auto clipObject = [](const QJsonArray& clips, int index) {
+            return index < clips.size() ? clips.at(index).toObject() : QJsonObject{};
+        };
+        const auto overlapSeconds = [](const QJsonArray& clips, int index,
+                                       const QString& edge) {
+            return index < clips.size() ? clips.at(index).toObject()
+                .value(QStringLiteral("overlap")).toObject().value(edge).toDouble(-1.0)
+                : -1.0;
+        };
+        QJsonObject arguments{
+            {QStringLiteral("kind"), QStringLiteral("video")},
+            {QStringLiteral("trackIndex"), 0}, {QStringLiteral("clipIndex"), 0},
+            {QStringLiteral("type"), QStringLiteral("CrossDissolve")},
+            {QStringLiteral("durationSec"), 1.0},
+            {QStringLiteral("alignment"), QStringLiteral("Start")},
+            {QStringLiteral("easing"), QStringLiteral("EaseIn")}
+        };
+        resetOverlapFixture();
+        const auto videoResponse = callProjectInfoTool(
+            311, QStringLiteral("set_transition"), arguments);
+        const auto videoClips = exportedClips(QStringLiteral("video"));
+        const auto trail = clipObject(videoClips, 0)
+            .value(QStringLiteral("trailOut")).toObject();
+        const auto lead = clipObject(videoClips, 1)
+            .value(QStringLiteral("leadIn")).toObject();
+        bool g148 = !toolResult(videoResponse).value(QStringLiteral("isError")).toBool(true)
+            && trail.value(QStringLiteral("alignment")).toString() == QStringLiteral("Start")
+            && trail.value(QStringLiteral("easing")).toString() == QStringLiteral("EaseIn")
+            && lead.value(QStringLiteral("alignment")).toString() == QStringLiteral("Start")
+            && lead.value(QStringLiteral("easing")).toString() == QStringLiteral("EaseIn")
+            && qAbs(overlapSeconds(videoClips, 0, QStringLiteral("trailOutSec")) - 1.0) < 0.001
+            && qAbs(overlapSeconds(videoClips, 1, QStringLiteral("leadInSec")) - 1.0) < 0.001
+            && overlapSeconds(videoClips, 0, QStringLiteral("leadInSec")) == 0.0
+            && overlapSeconds(videoClips, 1, QStringLiteral("trailOutSec")) == 0.0
+            && clipObject(videoClips, 1).value(QStringLiteral("startSec")).toDouble() == 5.0;
+        const auto serial = projectTimeline->undoManager()->saveSerial();
+        for (const QString& key : {QStringLiteral("alignment"), QStringLiteral("easing")}) {
+            auto invalid = arguments;
+            invalid.insert(key, QStringLiteral("invalid"));
+            const auto rejected = callProjectInfoTool(312, QStringLiteral("set_transition"), invalid);
+            g148 = g148 && toolResult(rejected).value(QStringLiteral("isError")).toBool(false)
+                && projectTimeline->undoManager()->saveSerial() == serial;
+        }
+        projectTimeline->undo();
+        g148 = g148 && !projectTimeline->canUndo()
+            && videoTrack->clips().first().trailOut.type == TransitionType::None;
+        g148 ? pass("G148 transition alignment/easing and video overlap")
+             : fail("G148 transition alignment/easing and video overlap",
+                    QStringLiteral("identifiers, overlap, invalid input, or undo did not match"));
+
+        resetOverlapFixture();
+        arguments.insert(QStringLiteral("kind"), QStringLiteral("audio"));
+        const auto audioResponse = callProjectInfoTool(
+            313, QStringLiteral("set_transition"), arguments);
+        const auto audioClips = exportedClips(QStringLiteral("audio"));
+        bool g149 = !toolResult(audioResponse).value(QStringLiteral("isError")).toBool(true)
+            && qAbs(overlapSeconds(audioClips, 0, QStringLiteral("trailOutSec")) - 1.0) < 0.001
+            && qAbs(overlapSeconds(audioClips, 1, QStringLiteral("leadInSec")) - 1.0) < 0.001
+            && overlapSeconds(audioClips, 0, QStringLiteral("leadInSec")) == 0.0
+            && overlapSeconds(audioClips, 1, QStringLiteral("trailOutSec")) == 0.0
+            && clipObject(audioClips, 0).value(QStringLiteral("trailOut")).toObject()
+                   .value(QStringLiteral("alignment")).toString() == QStringLiteral("Start")
+            && clipObject(audioClips, 1).value(QStringLiteral("leadIn")).toObject()
+                   .value(QStringLiteral("easing")).toString() == QStringLiteral("EaseIn")
+            && videoTrack->clips().first().trailOut.type == TransitionType::None;
+        projectTimeline->undo();
+        g149 = g149 && !projectTimeline->canUndo()
+            && audioTrack->clips().first().trailOut.type == TransitionType::None
+            && audioTrack->clips().at(1).leadIn.type == TransitionType::None;
+        const auto noOverlap = exportedClips(QStringLiteral("audio"));
+        g149 = g149 && overlapSeconds(noOverlap, 0, QStringLiteral("trailOutSec")) == 0.0
+            && overlapSeconds(noOverlap, 1, QStringLiteral("leadInSec")) == 0.0;
+        // Omitting both optional arguments retains Center / Linear.
+        arguments.remove(QStringLiteral("alignment"));
+        arguments.remove(QStringLiteral("easing"));
+        const auto defaultAudioResponse = callProjectInfoTool(
+            314, QStringLiteral("set_transition"), arguments);
+        const auto defaultAudioClips = exportedClips(QStringLiteral("audio"));
+        const auto defaultTrail = clipObject(defaultAudioClips, 0)
+            .value(QStringLiteral("trailOut")).toObject();
+        g149 = g149
+            && !toolResult(defaultAudioResponse).value(QStringLiteral("isError")).toBool(true)
+            && defaultTrail.value(QStringLiteral("alignment")).toString() == QStringLiteral("Center")
+            && defaultTrail.value(QStringLiteral("easing")).toString() == QStringLiteral("Linear")
+            && qAbs(overlapSeconds(defaultAudioClips, 0, QStringLiteral("trailOutSec")) - 1.0) < 0.001
+            && qAbs(overlapSeconds(defaultAudioClips, 1, QStringLiteral("leadInSec")) - 1.0) < 0.001;
+        projectTimeline->undo();
+        g149 = g149 && !projectTimeline->canUndo()
+            && audioTrack->clips().first().trailOut.type == TransitionType::None;
+        g149 ? pass("G149 audio overlap and one undo")
+             : fail("G149 audio overlap and one undo",
+                    QStringLiteral("audio overlap, identifiers, isolation, or undo did not match"));
+        videoTrack->setClips(savedVideo);
+        audioTrack->setClips(savedAudio);
+        projectTimeline->clearSelection();
+        projectTimeline->undoManager()->clear();
+        projectTimeline->undoManager()->saveState(
+            projectTimeline->currentState(), QStringLiteral("MCP selftest baseline"));
+    } else {
+        fail("G148 transition alignment/easing and video overlap",
+             QStringLiteral("Timeline tracks were not available"));
+        fail("G149 audio overlap and one undo",
+             QStringLiteral("Timeline tracks were not available"));
+    }
+
     const bool selectClipFieldsPresent =
         !toolResult(successfulSelectResponse).value(QStringLiteral("isError")).toBool(false)
         && requiredOutputFieldsPresent(QStringLiteral("select_clip"),

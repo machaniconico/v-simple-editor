@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QString>
+#include <QStringList>
 #include <QColor>
 #include <QFont>
 #include <QRectF>
@@ -188,6 +189,24 @@ enum class TransitionAlignment {
     Start,  // entire transition AFTER the cut, consumes A.trailHandle
     End,    // entire transition BEFORE the cut, consumes B.leadHandle
 };
+
+// Stable enum identifiers for scripting; index equals the persisted ordinal.
+inline const QStringList& transitionAlignmentNames()
+{
+    static const QStringList names{
+        QStringLiteral("Center"), QStringLiteral("Start"), QStringLiteral("End")
+    };
+    return names;
+}
+
+inline const QStringList& transitionEasingNames()
+{
+    static const QStringList names{
+        QStringLiteral("Linear"), QStringLiteral("EaseIn"),
+        QStringLiteral("EaseOut"), QStringLiteral("EaseInOut")
+    };
+    return names;
+}
 
 struct Transition {
     TransitionType type = TransitionType::None;
