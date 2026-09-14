@@ -868,7 +868,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "morph-cut", "VEDITOR_MORPH_CUT_SELFTEST", runMorphCutSelftest, false,
       "Morph Cut motion, endpoints, determinism, ordinals, flow timing and cache isolation (6 gates)" },
     { "transition-params", "VEDITOR_TRANSITION_PARAMS_SELFTEST", runTransitionParamsSelftest, true,
-      "Wipe and barn-door softness, border, persistence and shared render step (7 gates)" },
+      "Wipe, barn-door, iris and clock softness, border, persistence and shared render step (10 gates)" },
     { "transition-export", "VEDITOR_TRANSITION_EXPORT_SELFTEST", runTransitionExportSelftest, true,
       "Video transition export/preview shared steps and no-transition identity (9 gates)" },
     { "audio-xfade",       "VEDITOR_AUDIO_XFADE_SELFTEST",         runAudioXfadeSelftest,       true,

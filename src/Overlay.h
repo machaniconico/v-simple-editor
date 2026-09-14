@@ -214,6 +214,9 @@ inline bool supportsEdgeParams(TransitionType type) {
     case TransitionType::WipeUp: case TransitionType::WipeDown:
     case TransitionType::BarnDoorHorizontal: case TransitionType::BarnDoorVertical:
     case TransitionType::BarnDoorHClose: case TransitionType::BarnDoorVClose:
+    case TransitionType::IrisRound: case TransitionType::IrisBox:
+    case TransitionType::IrisRoundClose: case TransitionType::IrisBoxClose:
+    case TransitionType::ClockWipe: case TransitionType::ClockWipeCCW:
         return true;
     default: return false;
     }

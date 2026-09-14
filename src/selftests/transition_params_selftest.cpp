@@ -3,6 +3,7 @@
 #include "../TimelineFrameRenderer.h"
 #include "../ProjectFile.h"
 #include <QJsonDocument>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 
@@ -118,7 +119,10 @@ int runTransitionParamsSelftest()
     for (const auto type : {TransitionType::WipeLeft, TransitionType::WipeRight,
                            TransitionType::WipeUp, TransitionType::WipeDown,
                            TransitionType::BarnDoorHorizontal, TransitionType::BarnDoorVertical,
-                           TransitionType::BarnDoorHClose, TransitionType::BarnDoorVClose}) {
+                           TransitionType::BarnDoorHClose, TransitionType::BarnDoorVClose,
+                           TransitionType::IrisRound, TransitionType::IrisRoundClose,
+                           TransitionType::IrisBox, TransitionType::IrisBoxClose,
+                           TransitionType::ClockWipe, TransitionType::ClockWipeCCW}) {
         t.type = type;
         t.duration = 1.0;
         t.softness = 0.5;
@@ -168,7 +172,92 @@ int runTransitionParamsSelftest()
                 && OverlayRenderer::edgeParamsCallCountForTest() == 3;
         }
     }
-    gate(7, shared && tlrender::transitionStepCallCountForTest() == 32);
+    gate(7, shared && tlrender::transitionStepCallCountForTest() == 56);
+
+    bool irisDefaults = true;
+    for (const auto type : {TransitionType::IrisRound, TransitionType::IrisRoundClose,
+                           TransitionType::IrisBox, TransitionType::IrisBoxClose,
+                           TransitionType::ClockWipe, TransitionType::ClockWipeCCW}) {
+        Transition edge;
+        edge.type = type;
+        for (double progress : {0.0, 0.25, 0.5, 0.75, 1.0}) {
+            OverlayRenderer::setEdgeParamsEnabledForTest(true);
+            const QImage enabled = OverlayRenderer::applyTransition(from, to, edge, progress);
+            irisDefaults &= supportsEdgeParams(type) && edge.hasDefaultEdgeParams()
+                && OverlayRenderer::edgeParamsCallCountForTest() == 0;
+            OverlayRenderer::setEdgeParamsEnabledForTest(false);
+            const QImage bypassed = OverlayRenderer::applyTransition(from, to, edge, progress);
+            irisDefaults &= bitsEqual(enabled, bypassed)
+                && OverlayRenderer::edgeParamsCallCountForTest() == 0;
+        }
+    }
+    gate(8, irisDefaults);
+
+    bool irisEdges = true;
+    for (const auto type : {TransitionType::IrisRound, TransitionType::IrisRoundClose,
+                           TransitionType::IrisBox, TransitionType::IrisBoxClose}) {
+        Transition edge;
+        edge.type = type;
+        edge.softness = 0.5;
+        const bool round = type == TransitionType::IrisRound || type == TransitionType::IrisRoundClose;
+        const bool close = type == TransitionType::IrisRoundClose || type == TransitionType::IrisBoxClose;
+        OverlayRenderer::setEdgeParamsEnabledForTest(true);
+        const QImage frame = OverlayRenderer::applyTransition(from, to, edge, 0.5);
+        // The 200x100 circular iris crosses x=156.9 at the horizontal centre;
+        // the rectangular iris crosses x=150 and y=75.
+        irisEdges &= !edge.hasDefaultEdgeParams() && intermediate(frame, round ? 156 : 150, 50)
+            && intermediate(frame, round ? 43 : 49, 50)
+            && (round || intermediate(frame, 100, 75))
+            && frame.pixelColor(100, 50) == QColor(close ? Qt::black : Qt::white)
+            && frame.pixelColor(190, 50) == QColor(close ? Qt::white : Qt::black)
+            && OverlayRenderer::edgeParamsCallCountForTest() == 1;
+        edge.softness = 0.0;
+        edge.borderWidth = 6.0;
+        edge.borderColor = Qt::red;
+        const QImage outlined = OverlayRenderer::applyTransition(from, to, edge, 0.5);
+        irisEdges &= outlined.pixelColor(round ? 156 : 150, 50) == QColor(Qt::red)
+            && bitsEqual(OverlayRenderer::applyTransition(from, to, edge, 0.0), from)
+            && bitsEqual(OverlayRenderer::applyTransition(from, to, edge, 1.0), to);
+    }
+    gate(9, irisEdges);
+
+    bool clockEdges = true;
+    const double tau = 2.0 * std::acos(-1.0);
+    for (const auto type : {TransitionType::ClockWipe, TransitionType::ClockWipeCCW}) {
+        Transition edge;
+        edge.type = type;
+        edge.borderWidth = 6.0;
+        edge.borderColor = Qt::red;
+        const double direction = type == TransitionType::ClockWipe ? 1.0 : -1.0;
+        for (double progress : {0.125, 0.25, 0.5, 0.75, 0.875}) {
+            OverlayRenderer::setEdgeParamsEnabledForTest(true);
+            const QImage frame = OverlayRenderer::applyTransition(from, to, edge, progress);
+            clockEdges &= OverlayRenderer::edgeParamsCallCountForTest() == 1;
+            // Three angular samples straddle the moving ray at three radii.
+            // Offsets are arc lengths in pixels, so the band stays 6px wide.
+            for (double radius : {16.0, 28.0, 40.0}) {
+                for (int offset : {-6, 0, 6}) {
+                    const double angle = direction * (tau * progress + offset / radius);
+                    const int x = static_cast<int>(std::floor(100.0 + radius * std::sin(angle)));
+                    const int y = static_cast<int>(std::floor(50.0 - radius * std::cos(angle)));
+                    const QColor expected = offset == 0 ? QColor(Qt::red)
+                        : QColor(offset < 0 ? Qt::white : Qt::black);
+                    clockEdges &= frame.pixelColor(x, y) == expected;
+                }
+            }
+        }
+        // The fixed 12 o'clock seam must not reverse the revealed sector.
+        const QImage quarter = OverlayRenderer::applyTransition(from, to, edge, 0.25);
+        clockEdges &= quarter.pixelColor(direction > 0 ? 104 : 95, 10) == QColor(Qt::white)
+            && quarter.pixelColor(direction > 0 ? 95 : 104, 10) == QColor(Qt::black)
+            && bitsEqual(OverlayRenderer::applyTransition(from, to, edge, 0.0), from)
+            && bitsEqual(OverlayRenderer::applyTransition(from, to, edge, 1.0), to);
+        edge.borderWidth = 0.0;
+        edge.softness = 0.5;
+        const QImage feathered = OverlayRenderer::applyTransition(from, to, edge, 0.25);
+        clockEdges &= intermediate(feathered, direction > 0 ? 128 : 71, 50);
+    }
+    gate(10, clockEdges);
     OverlayRenderer::setEdgeParamsEnabledForTest(true);
     tlrender::setTransitionStepsEnabledForTest(true);
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);

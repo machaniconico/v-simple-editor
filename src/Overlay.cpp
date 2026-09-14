@@ -467,6 +467,38 @@ QImage OverlayRenderer::applyTransition(const QImage &from, const QImage &to,
             case TransitionType::BarnDoorVertical: d = h * p * 0.5 - std::abs(py - h * 0.5); break;
             case TransitionType::BarnDoorHClose: d = std::abs(px - w * 0.5) - w * (1.0 - p) * 0.5; break;
             case TransitionType::BarnDoorVClose: d = std::abs(py - h * 0.5) - h * (1.0 - p) * 0.5; break;
+            case TransitionType::IrisRound:
+            case TransitionType::IrisRoundClose: {
+                const bool close = transition.type == TransitionType::IrisRoundClose;
+                const double cx = w / 2, cy = h / 2;
+                const double radius = (std::hypot(cx, cy) + 2.0) * (close ? 1.0 - p : p);
+                d = radius - std::hypot(px - cx, py - cy);
+                if (close) d = -d;
+                break;
+            }
+            case TransitionType::IrisBox:
+            case TransitionType::IrisBoxClose: {
+                const bool close = transition.type == TransitionType::IrisBoxClose;
+                const double extent = close ? 1.0 - p : p;
+                // Rectangular Chebyshev distance, in pixels: independent half
+                // extents preserve the canvas aspect ratio and uniform feather.
+                d = -qMax(std::abs(px - w * 0.5) - w * extent * 0.5,
+                          std::abs(py - h * 0.5) - h * extent * 0.5);
+                if (close) d = -d;
+                break;
+            }
+            case TransitionType::ClockWipe:
+            case TransitionType::ClockWipeCCW: {
+                const double dx = px - w / 2, dy = py - h / 2;
+                const double tau = 2.0 * std::acos(-1.0);
+                // Angle from 12 o'clock in the sweep direction, wrapped into
+                // [0, 2pi). Reverse the angle for CCW before normalizing.
+                double angle = std::atan2(dx, -dy);
+                if (transition.type == TransitionType::ClockWipeCCW) angle = -angle;
+                if (angle < 0.0) angle += tau;
+                d = (tau * p - angle) * std::hypot(dx, dy);
+                break;
+            }
             default: break;
             }
             const double u = feather > 0.0 ? qBound(0.0, (d + feather) / (2.0 * feather), 1.0)
