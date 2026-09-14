@@ -86,6 +86,9 @@ OverlapInterval transitionInterval(const PlaybackEntry &e)
     iv.trailOutDuration = e.trailOutDuration;
     iv.leadInEasing = e.leadInEasing;
     iv.trailOutEasing = e.trailOutEasing;
+    iv.softness = e.softness;
+    iv.borderWidth = e.borderWidth;
+    iv.borderColor = e.borderColor;
     return iv;
 }
 }

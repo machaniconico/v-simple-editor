@@ -10106,6 +10106,9 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequenceImpl(
                 iv.trailOutDuration = child.trailOut.duration;
                 iv.trailOutAlignment = child.trailOut.alignment;
                 iv.trailOutEasing = child.trailOut.easing;
+                iv.softness = child.trailOut.softness;
+                iv.borderWidth = child.trailOut.borderWidth;
+                iv.borderColor = child.trailOut.borderColor;
                 iv.stabilizerKeyframes = child.stabilizerKeyframes;
                 out.append(iv);
 
@@ -10182,6 +10185,9 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequenceImpl(
                 iv.trailOutDuration = c.trailOut.duration;
                 iv.trailOutAlignment = c.trailOut.alignment;
                 iv.trailOutEasing = c.trailOut.easing;
+                iv.softness = c.trailOut.softness;
+                iv.borderWidth = c.trailOut.borderWidth;
+                iv.borderColor = c.trailOut.borderColor;
                 iv.stabilizerKeyframes = c.stabilizerKeyframes;
                 ivs.append(iv);
                 accum += clipDur;
@@ -10267,6 +10273,9 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequenceImpl(
         e.trailOutType = iv.trailOutType;
         e.trailOutDuration = iv.trailOutDuration;
         e.trailOutEasing = iv.trailOutEasing;
+        e.softness = iv.softness;
+        e.borderWidth = iv.borderWidth;
+        e.borderColor = iv.borderColor;
         e.stabilizerKeyframes = iv.stabilizerKeyframes;
         reversedBindings.append({e, iv.reversed});
         // STAGE4B: carry this entry's track-matte assignment (if any) so the

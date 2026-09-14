@@ -82,6 +82,9 @@ struct PlaybackEntry {
     TransitionType trailOutType = TransitionType::None;
     double trailOutDuration = 0.0;
     TransitionEasing trailOutEasing = TransitionEasing::Linear;
+    double softness = 0.0;
+    double borderWidth = 0.0;
+    QColor borderColor = Qt::white;
 
     // Per-clip volume automation (the audio "rubber band" / pen-tool envelope
     // in pro NLEs). Empty = use static `volume` for the whole clip; non-empty

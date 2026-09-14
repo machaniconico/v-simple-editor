@@ -1,4 +1,5 @@
 #include "../Overlay.h"
+#include "../Timeline.h"
 #include "../TimelineFrameRenderer.h"
 #include "../ProjectFile.h"
 #include <QJsonDocument>
@@ -112,28 +113,62 @@ int runTransitionParamsSelftest()
     gate(6, barn);
 
     bool shared = true;
+    Timeline timeline;
     tlrender::setTransitionStepsEnabledForTest(true);
     for (const auto type : {TransitionType::WipeLeft, TransitionType::WipeRight,
                            TransitionType::WipeUp, TransitionType::WipeDown,
                            TransitionType::BarnDoorHorizontal, TransitionType::BarnDoorVertical,
                            TransitionType::BarnDoorHClose, TransitionType::BarnDoorVClose}) {
         t.type = type;
+        t.duration = 1.0;
         t.softness = 0.5;
-        OverlapInterval interval;
-        interval.timelineEnd = 1.0;
-        interval.trailOutDuration = 1.0;
-        interval.trailOutType = type;
-        interval.softness = t.softness;
-        interval.borderWidth = t.borderWidth;
-        interval.borderColor = t.borderColor;
-        // Differing aspect ratios exercise the legacy top-left black canvas.
-        QImage tall(50, 100, QImage::Format_RGB888);
-        tall.fill(Qt::white);
-        shared = shared && bitsEqual(
-            tlrender::applyOverlapTransitionStep(from, tall, interval, 0.5),
-            OverlayRenderer::applyTransition(from, tall, t, 0.5));
+        ClipInfo first, second;
+        first.filePath = QStringLiteral("test_assets/transition-params-from.png");
+        second.filePath = QStringLiteral("test_assets/transition-params-to.png");
+        first.duration = second.duration = 4.0;
+        first.inPoint = second.inPoint = 1.0;
+        first.outPoint = second.outPoint = 3.0;
+        first.trailOut = second.leadIn = t;
+        // Exercise both top-level discovery and nested sequence expansion.
+        for (bool nested : {false, true}) {
+            TimelineSequence main, child;
+            main.id = QStringLiteral("transition-params-main");
+            child.id = QStringLiteral("transition-params-child");
+            child.videoTracks = {{first, second}};
+            ClipInfo parent;
+            parent.sequenceRefId = child.id;
+            parent.filePath = timeline_nesting::sequenceClipFilePath(child.id);
+            parent.duration = parent.outPoint = 4.0;
+            if (nested)
+                main.videoTracks = {{parent}};
+            else
+                main.videoTracks = {{first, second}};
+            timeline.setSequences({main, child}, main.id);
+            const auto intervals = timeline.videoOverlapIntervals();
+            const auto entries = timeline.computePlaybackSequence();
+            if (intervals.isEmpty() || intervals[0].size() != 2 || entries.size() != 2) {
+                shared = false;
+                continue;
+            }
+            const auto &interval = intervals[0][0];
+            const auto &entry = entries[0];
+            shared &= interval.softness == t.softness && entry.softness == t.softness
+                && interval.borderWidth == t.borderWidth && entry.borderWidth == t.borderWidth
+                && interval.borderColor == t.borderColor && entry.borderColor == t.borderColor;
+            // Differing aspect ratios exercise the legacy top-left black canvas.
+            QImage tall(50, 100, QImage::Format_RGB888);
+            tall.fill(Qt::white);
+            OverlayRenderer::setEdgeParamsEnabledForTest(true);
+            const QImage expected = OverlayRenderer::applyTransition(from, tall, t, 0.5);
+            const QImage exported = tlrender::applyOverlapTransitionStep(
+                from, tall, interval, interval.timelineEnd - t.duration * 0.5);
+            const QImage previewed = tlrender::applyOverlapTransitionStep(
+                from, tall, entry, entry.timelineEnd - t.duration * 0.5);
+            shared &= bitsEqual(exported, expected) && bitsEqual(previewed, expected)
+                && OverlayRenderer::edgeParamsCallCountForTest() == 3;
+        }
     }
-    gate(7, shared && tlrender::transitionStepCallCountForTest() == 8);
+    gate(7, shared && tlrender::transitionStepCallCountForTest() == 32);
     OverlayRenderer::setEdgeParamsEnabledForTest(true);
     tlrender::setTransitionStepsEnabledForTest(true);
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
