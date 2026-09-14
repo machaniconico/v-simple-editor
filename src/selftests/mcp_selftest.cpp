@@ -3033,6 +3033,7 @@ int runMcpSelftest()
         auto* audioTrack = projectTimeline->trackAt(true, 0);
         const auto savedVideo = videoTrack->clips();
         const auto savedAudio = audioTrack->clips();
+        const auto savedParents = projectTimeline->clipParentEntries();
         ClipInfo first = makeTestClip(QStringLiteral("overlap-A"), 0);
         ClipInfo second = makeTestClip(QStringLiteral("overlap-B"), 0);
         first.duration = second.duration = 10.0;
@@ -3142,9 +3143,67 @@ int runMcpSelftest()
         projectTimeline->undo();
         g149 = g149 && !projectTimeline->canUndo()
             && audioTrack->clips().first().trailOut.type == TransitionType::None;
+        // Enable the sequence model without replacing the live track objects.
+        // Legacy calls (no alignment/easing) must preserve its special carrier.
+        TimelineSequence inactiveSequence;
+        inactiveSequence.id = QStringLiteral("mcp-overlap-inactive");
+        inactiveSequence.name = QStringLiteral("MCP overlap inactive");
+        inactiveSequence.videoTracks = {{second}};
+        const bool sequenceAdded = projectTimeline->addSequence(inactiveSequence);
+        g149 = g149 && sequenceAdded;
+        const QString sequenceStoreKey = timeline_nesting::sequenceStoreParentKey();
+        for (const QString& typeName : {QStringLiteral("CrossDissolve"),
+                                       QStringLiteral("FadeIn"), QStringLiteral("FadeOut")}) {
+            resetOverlapFixture();
+            const auto parentsBefore = projectTimeline->clipParentEntries();
+            const auto sequencesBefore = projectTimeline->sequences();
+            const auto activeBefore = projectTimeline->activeSequenceId();
+            const auto serialBefore = projectTimeline->undoManager()->saveSerial();
+            arguments.insert(QStringLiteral("type"), typeName);
+            const auto response = callProjectInfoTool(
+                315, QStringLiteral("set_transition"), arguments);
+            const auto parentsAfter = projectTimeline->clipParentEntries();
+            const auto sequencesAfter = projectTimeline->sequences();
+            bool sequencesPreserved = sequencesBefore.size() >= 2
+                && sequencesAfter.size() == sequencesBefore.size();
+            for (int index = 0; sequencesPreserved && index < sequencesBefore.size(); ++index) {
+                sequencesPreserved = sequencesAfter.at(index).id == sequencesBefore.at(index).id
+                    && sequencesAfter.at(index).name == sequencesBefore.at(index).name;
+            }
+            // The active sequence's clips legitimately change. Inactive
+            // sequence payloads must remain identical, including their clips.
+            const auto storeBefore = timeline_nesting::decodeSequenceStoreObject(
+                parentsBefore.value(sequenceStoreKey)).value(QStringLiteral("sequences")).toArray();
+            const auto storeAfter = timeline_nesting::decodeSequenceStoreObject(
+                parentsAfter.value(sequenceStoreKey)).value(QStringLiteral("sequences")).toArray();
+            sequencesPreserved = sequencesPreserved
+                && storeBefore.size() == sequencesBefore.size()
+                && storeAfter.size() == storeBefore.size();
+            for (int index = 0; sequencesPreserved && index < storeBefore.size(); ++index) {
+                if (sequencesBefore.at(index).id != activeBefore)
+                    sequencesPreserved = index < storeAfter.size()
+                        && storeAfter.at(index) == storeBefore.at(index);
+            }
+            g149 = g149 && !toolResult(response).value(QStringLiteral("isError")).toBool(true)
+                && !parentsBefore.value(sequenceStoreKey).isEmpty()
+                && !parentsAfter.value(sequenceStoreKey).isEmpty()
+                && !activeBefore.isEmpty()
+                && projectTimeline->activeSequenceId() == activeBefore
+                && sequencesPreserved
+                && projectTimeline->undoManager()->saveSerial() == serialBefore + 1;
+            projectTimeline->undo();
+            g149 = g149 && !projectTimeline->canUndo()
+                && projectTimeline->clipParentEntries() == parentsBefore
+                && projectTimeline->activeSequenceId() == activeBefore
+                && projectTimeline->sequences().size() == sequencesBefore.size()
+                && audioTrack->clips().first().leadIn.type == TransitionType::None
+                && audioTrack->clips().first().trailOut.type == TransitionType::None
+                && audioTrack->clips().at(1).leadIn.type == TransitionType::None;
+        }
         g149 ? pass("G149 audio overlap and one undo")
              : fail("G149 audio overlap and one undo",
-                    QStringLiteral("audio overlap, identifiers, isolation, or undo did not match"));
+                    QStringLiteral("audio overlap, identifiers, isolation, sequence store, or undo did not match"));
+        projectTimeline->setClipParentEntries(savedParents);
         videoTrack->setClips(savedVideo);
         audioTrack->setClips(savedAudio);
         projectTimeline->clearSelection();

@@ -3699,8 +3699,14 @@ void McpEditorTools::registerWriteTools()
                 target.track->setClips(clips);
                 auto mattes = currentTimeline->trackMatteEntries();
                 auto parents = currentTimeline->clipParentEntries();
+                // The public parent carrier also contains the sequence store,
+                // which is not a clip key and must survive the clip-only remap.
+                const QString sequenceStoreKey = timeline_nesting::sequenceStoreParentKey();
+                const QString sequenceStore = parents.take(sequenceStoreKey);
                 remapTimelineCarrierAfterMutation(currentTimeline, mattes, before);
                 remapClipParentEntriesAfterMutation(currentTimeline, parents, before);
+                if (!sequenceStore.isEmpty())
+                    parents.insert(sequenceStoreKey, sequenceStore);
                 currentTimeline->setTrackMatteEntries(mattes);
                 currentTimeline->setClipParentEntries(parents);
                 currentTimeline->saveUndoState(type == TransitionType::CrossDissolve
