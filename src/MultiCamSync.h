@@ -3,11 +3,24 @@
 #include <QObject>
 #include <QVector>
 #include <QString>
+#include <QStringList>
 #include <cmath>
 
 #include "WaveformGenerator.h"
 
 namespace multicam {
+
+struct AudioSyncReport {
+    int total = 0;
+    int synced = 0;
+    int silent = 0;
+    QVector<qint64> offsetsUs;
+    QString message;
+};
+
+// The first file is the reference. Unusable/silent audio gets offset zero;
+// synced includes the reference only when a usable comparison exists.
+AudioSyncReport estimateOffsetsForFiles(const QStringList &paths);
 
 struct CamSource {
     QString filePath;

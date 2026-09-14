@@ -301,37 +301,13 @@ void MultiCamDialog::onSync()
         return;
     }
 
-    const int peaksPerSecond = 50;
-    const double envHopMs = 1000.0 / static_cast<double>(peaksPerSecond);
-
-    QVector<QVector<float>> envelopes;
-    envelopes.reserve(angleCount);
-    for (const MultiCamAngle &a : m_project.angles) {
-        const QString path = a.sourcePath.trimmed();
-        if (path.isEmpty() || !QFileInfo::exists(path)) {
-            envelopes.append(QVector<float>());
-            continue;
-        }
-
-        const WaveformData wf =
-            WaveformGenerator::generate(path, peaksPerSecond);
-        envelopes.append(wf.peaks);
-    }
-
-    bool hasUsableComparison =
-        !envelopes.isEmpty() && !envelopes.first().isEmpty();
-    if (hasUsableComparison) {
-        hasUsableComparison = false;
-        for (int i = 1; i < envelopes.size(); ++i) {
-            if (!envelopes[i].isEmpty()) {
-                hasUsableComparison = true;
-                break;
-            }
-        }
-    }
-
-    const QVector<qint64> offsetsUs =
-        multicam::MultiCamSync::computeAngleOffsetsUs(envelopes, envHopMs);
+    QStringList paths;
+    paths.reserve(angleCount);
+    for (const MultiCamAngle &a : m_project.angles)
+        paths.append(a.sourcePath);
+    const multicam::AudioSyncReport report = multicam::estimateOffsetsForFiles(paths);
+    const QVector<qint64> &offsetsUs = report.offsetsUs;
+    const bool hasUsableComparison = report.synced >= 2;
 
     QString offsetSummary;
     for (int i = 0; i < angleCount; ++i) {

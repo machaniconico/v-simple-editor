@@ -10972,14 +10972,14 @@ void MainWindow::multiCamSetup()
 
     if (reply == QMessageBox::Yes) {
         statusBar()->showMessage("Syncing cameras by audio...");
-        m_multiCam->autoSyncByAudio();
-        QString info;
+        const auto report = m_multiCam->autoSyncByAudio();
+        QString info = report.message + QLatin1Char('\n');
         for (int i = 0; i < m_multiCam->sourceCount(); ++i) {
             info += QString("%1: offset %2s\n")
                 .arg(m_multiCam->sources()[i].label)
                 .arg(m_multiCam->sources()[i].syncOffset, 0, 'f', 2);
         }
-        statusBar()->showMessage("Sync complete");
+        statusBar()->showMessage(report.message);
         QMessageBox::information(this, "Sync Results", info);
     }
 }

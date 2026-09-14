@@ -45,7 +45,9 @@
 #include "ProjectTemplate.h"
 #include "LoudnessMaster.h"
 #include "HdrGrading.h"
+#include "MultiCam.h"
 #include "MultiCamSync.h"
+#include "libavcore/AudioExtract.h"
 #include "MultiCamDialog.h"
 #include "BatchExportQueue.h"
 #include "SelftestRegistry.h"
@@ -1710,6 +1712,84 @@ int runMultiCamSelftest()
                     && appliedProject.angles[1].syncOffsetUs == 275500LL,
                 QStringLiteral("MULTICAM G9: dialog offset edit should be reflected in the applied EDL"),
                 &error))
+            return 1;
+
+        // G10 (US-301): exercise real WAV decoding through the legacy session.
+        QTemporaryDir audioDir;
+        if (!requireSelftest(audioDir.isValid(),
+                             QStringLiteral("MULTICAM G10: temporary WAV directory"), &error))
+            return 1;
+        constexpr int sampleRate = 48000;
+        constexpr int sampleCount = 3 * sampleRate;
+        constexpr int delaySamples = sampleRate / 4;
+        QByteArray referencePcm(sampleCount * 2, '\0');
+        // Unequal, irregularly spaced pulses avoid periodic correlation ties.
+        const int pulseStarts[] = {404, 464, 564, 704, 784, 964, 1104, 1264};
+        const int pulseAmplitudes[] = {4000, 19000, 8000, 26000, 12000, 6000, 23000, 15000};
+        for (int pulse = 0; pulse < 8; ++pulse) {
+            const int start = pulseStarts[pulse] * sampleRate / 1000;
+            for (int j = 0; j < sampleRate / 500; ++j) {
+                const quint16 value = static_cast<quint16>(
+                    (j % 2 == 0 ? 1 : -1) * pulseAmplitudes[pulse]);
+                referencePcm[2 * (start + j)] = static_cast<char>(value & 0xff);
+                referencePcm[2 * (start + j) + 1] = static_cast<char>(value >> 8);
+            }
+        }
+        QByteArray delayedPcm(sampleCount * 2, '\0');
+        std::copy(referencePcm.cbegin(), referencePcm.cend() - delaySamples * 2,
+                  delayedPcm.begin() + delaySamples * 2);
+        const QByteArray silentPcm(sampleCount * 2, '\0');
+        const QString referencePath = audioDir.filePath(QStringLiteral("reference.wav"));
+        const QString delayedPath = audioDir.filePath(QStringLiteral("delayed.wav"));
+        const QString silentPath = audioDir.filePath(QStringLiteral("silent.wav"));
+        QString wavError;
+        if (!requireSelftest(
+                libavcore::writePcm16AsWav(referencePath, referencePcm, sampleRate, 1, &wavError)
+                    && libavcore::writePcm16AsWav(delayedPath, delayedPcm, sampleRate, 1, &wavError)
+                    && libavcore::writePcm16AsWav(silentPath, silentPcm, sampleRate, 1, &wavError),
+                QStringLiteral("MULTICAM G10: write PCM WAV fixtures: %1").arg(wavError), &error))
+            return 1;
+        MultiCamSession legacy;
+        legacy.addSource(referencePath);
+        legacy.addSource(delayedPath);
+        int completed = 0;
+        QObject::connect(&legacy, &MultiCamSession::syncCompleted,
+                         &legacy, [&completed]() { ++completed; });
+        const auto legacyReport = legacy.autoSyncByAudio();
+        if (!requireSelftest(
+                legacyReport.total == 2 && legacyReport.synced == 2
+                    && legacyReport.silent == 0 && completed == 1
+                    && legacy.sources()[0].syncOffset == 0.0
+                    && qAbs(legacy.sources()[1].syncOffset * 1000.0 - 250.0) <= 10.0,
+                QStringLiteral("MULTICAM G10: legacy autoSync offset ~250ms"), &error))
+            return 1;
+        legacy.addSource(silentPath);
+        legacy.setSyncOffset(2, 1.0);
+        const auto silentReport = legacy.autoSyncByAudio();
+        if (!requireSelftest(
+                silentReport.total == 3 && silentReport.synced == 2
+                    && silentReport.silent == 1 && completed == 2
+                    && silentReport.offsetsUs.size() == 3
+                    && silentReport.offsetsUs[2] == 0
+                    && legacy.sources()[2].syncOffset == 0.0
+                    && qAbs(legacy.sources()[1].syncOffset * 1000.0 - 250.0) <= 10.0
+                    && silentReport.message == QStringLiteral("3 本中 2 本を同期しました (音声なし 1 本)"),
+                QStringLiteral("MULTICAM G10: silent WAV counted with zero offset"), &error))
+            return 1;
+        const auto missingReport = multicam::estimateOffsetsForFiles(
+            QStringList{audioDir.filePath(QStringLiteral("missing.wav")), delayedPath});
+        const auto silentReferenceReport = multicam::estimateOffsetsForFiles(
+            QStringList{silentPath, delayedPath});
+        const auto emptyReport = multicam::estimateOffsetsForFiles(QStringList{});
+        if (!requireSelftest(
+                missingReport.total == 2 && missingReport.silent == 1
+                    && missingReport.synced == 0
+                    && missingReport.offsetsUs == QVector<qint64>({0, 0})
+                    && silentReferenceReport.silent == 1 && silentReferenceReport.synced == 0
+                    && silentReferenceReport.offsetsUs == QVector<qint64>({0, 0})
+                    && emptyReport.total == 0 && emptyReport.synced == 0
+                    && emptyReport.silent == 0 && emptyReport.offsetsUs.isEmpty(),
+                QStringLiteral("MULTICAM G10: unusable reference cannot report successful sync"), &error))
             return 1;
     }
 #endif

@@ -8,8 +8,7 @@
 
 // ===========================================================================
 // MultiCamSession (legacy / advanced — referenced by MainWindow).
-// Minimal correct implementation; auto-sync is a stub. Heavier audio
-// cross-correlation lives in a follow-up story.
+// Audio synchronization shares the dialog's file-based correlation helper.
 // ===========================================================================
 
 MultiCamSession::MultiCamSession(QObject *parent)
@@ -57,15 +56,17 @@ void MultiCamSession::setSyncOffset(int sourceIndex, double offset)
     emit sourcesChanged();
 }
 
-void MultiCamSession::autoSyncByAudio()
+multicam::AudioSyncReport MultiCamSession::autoSyncByAudio()
 {
-    // Stub: deferred to follow-up story. Resets all offsets to 0.0 so
-    // the existing UI message ("auto-sync done") reflects a deterministic
-    // state. Real implementation = audio cross-correlation against the
-    // first source.
-    for (auto &src : m_sources)
-        src.syncOffset = 0.0;
+    QStringList paths;
+    paths.reserve(m_sources.size());
+    for (const CameraSource &src : m_sources)
+        paths.append(src.filePath);
+    const multicam::AudioSyncReport report = multicam::estimateOffsetsForFiles(paths);
+    for (int i = 0; i < m_sources.size(); ++i)
+        m_sources[i].syncOffset = static_cast<double>(report.offsetsUs[i]) / 1000000.0;
     emit syncCompleted();
+    return report;
 }
 
 void MultiCamSession::switchToCamera(int cameraIndex, double time)

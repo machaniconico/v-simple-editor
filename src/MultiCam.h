@@ -25,6 +25,7 @@
 #include <QString>
 #include <QImage>
 #include <QJsonObject>
+#include "MultiCamSync.h"
 
 class QJsonArray;
 
@@ -57,7 +58,7 @@ public:
 
     // Sync
     void setSyncOffset(int sourceIndex, double offset);
-    void autoSyncByAudio(); // cross-correlate audio for auto-sync
+    multicam::AudioSyncReport autoSyncByAudio();
 
     // Cutting
     void switchToCamera(int cameraIndex, double time);
