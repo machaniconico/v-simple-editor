@@ -54,6 +54,9 @@ struct OverlapInterval {
     TransitionAlignment trailOutAlignment = TransitionAlignment::Center;
     TransitionEasing leadInEasing = TransitionEasing::Linear;
     TransitionEasing trailOutEasing = TransitionEasing::Linear;
+    double softness = 0.0;
+    double borderWidth = 0.0;
+    QColor borderColor = Qt::white;
     int clipIdx = -1;
 };
 

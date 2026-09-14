@@ -2220,6 +2220,9 @@ QJsonObject ProjectFile::transitionToJson(const Transition &t)
     obj["duration"] = t.duration;
     obj["alignment"] = static_cast<int>(t.alignment);
     obj["easing"] = static_cast<int>(t.easing);
+    if (t.softness != 0.0) obj["softness"] = t.softness;
+    if (t.borderWidth != 0.0) obj["borderWidth"] = t.borderWidth;
+    if (t.borderColor != QColor(Qt::white)) obj["borderColor"] = t.borderColor.name();
     return obj;
 }
 
@@ -2238,6 +2241,10 @@ Transition ProjectFile::transitionFromJson(const QJsonObject &obj)
     // every transition advanced its progress with no curve applied.
     t.easing = static_cast<TransitionEasing>(
         obj["easing"].toInt(static_cast<int>(TransitionEasing::Linear)));
+    t.softness = qBound(0.0, obj["softness"].toDouble(0.0), 1.0);
+    t.borderWidth = qBound(0.0, obj["borderWidth"].toDouble(0.0), 50.0);
+    const QColor border(obj["borderColor"].toString(QStringLiteral("#ffffff")));
+    if (border.isValid()) t.borderColor = border;
     return t;
 }
 

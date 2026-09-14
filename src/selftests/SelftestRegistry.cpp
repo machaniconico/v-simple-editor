@@ -43,6 +43,7 @@ int runAudioClipDragUndoSelftest();
 int runAudioXfadeSelftest();
 int runMorphCutSelftest();
 int runTransitionExportSelftest();
+int runTransitionParamsSelftest();
 int runAudioMixerSelftest();
 int runAudioRestoreSelftest();
 int runAutoClipGenSelftest();
@@ -866,6 +867,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Audio mixer module smoke (Sprint-23 bus routing + send/return stubs)" },
     { "morph-cut", "VEDITOR_MORPH_CUT_SELFTEST", runMorphCutSelftest, false,
       "Morph Cut motion, endpoints, determinism, ordinals, flow timing and cache isolation (6 gates)" },
+    { "transition-params", "VEDITOR_TRANSITION_PARAMS_SELFTEST", runTransitionParamsSelftest, false,
+      "Wipe and barn-door softness, border, persistence and shared render step (7 gates)" },
     { "transition-export", "VEDITOR_TRANSITION_EXPORT_SELFTEST", runTransitionExportSelftest, true,
       "Video transition export/preview shared steps and no-transition identity (9 gates)" },
     { "audio-xfade",       "VEDITOR_AUDIO_XFADE_SELFTEST",         runAudioXfadeSelftest,       true,

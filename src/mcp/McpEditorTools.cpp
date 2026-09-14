@@ -247,7 +247,10 @@ QJsonObject transitionToJson(const Transition& transition)
         {QStringLiteral("durationSec"),
          transition.type == TransitionType::None ? 0.0 : transition.duration},
         {QStringLiteral("alignment"), transitionAlignmentNames().at(static_cast<int>(transition.alignment))},
-        {QStringLiteral("easing"), transitionEasingNames().at(static_cast<int>(transition.easing))}
+        {QStringLiteral("easing"), transitionEasingNames().at(static_cast<int>(transition.easing))},
+        {QStringLiteral("softness"), transition.softness},
+        {QStringLiteral("borderWidth"), transition.borderWidth},
+        {QStringLiteral("borderColor"), transition.borderColor.name()}
     };
 }
 
@@ -265,7 +268,10 @@ QJsonObject transitionOutputItemSchema()
         {QStringLiteral("type"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
         {QStringLiteral("durationSec"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
         {QStringLiteral("alignment"), transitionIdentifierSchema(transitionAlignmentNames())},
-        {QStringLiteral("easing"), transitionIdentifierSchema(transitionEasingNames())}
+        {QStringLiteral("easing"), transitionIdentifierSchema(transitionEasingNames())},
+        {QStringLiteral("softness"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
+        {QStringLiteral("borderWidth"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
+        {QStringLiteral("borderColor"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}}
     }, {QStringLiteral("type"), QStringLiteral("durationSec")});
 }
 
@@ -1910,6 +1916,7 @@ void McpEditorTools::registerWriteTools()
         QStringLiteral("startSec"), QStringLiteral("endSec")});
 
     const QJsonObject setTransitionOutputSchema = outputSchemaOf(QJsonObject{
+        {QStringLiteral("warning"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
         {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
         {QStringLiteral("kind"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
         {QStringLiteral("trackIndex"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
@@ -3609,6 +3616,15 @@ void McpEditorTools::registerWriteTools()
             }},
             {QStringLiteral("alignment"), transitionIdentifierSchema(transitionAlignmentNames())},
             {QStringLiteral("easing"), transitionIdentifierSchema(transitionEasingNames())},
+            {QStringLiteral("softness"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("number")},
+                {QStringLiteral("minimum"), 0.0}, {QStringLiteral("maximum"), 1.0}}},
+            {QStringLiteral("borderWidth"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("number")},
+                {QStringLiteral("minimum"), 0.0}, {QStringLiteral("maximum"), 50.0}}},
+            {QStringLiteral("borderColor"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("string")},
+                {QStringLiteral("pattern"), QStringLiteral("^#[0-9a-fA-F]{6}$")}}},
             {QStringLiteral("durationSec"), QJsonObject{
                 {QStringLiteral("type"), QStringLiteral("number")},
                 {QStringLiteral("minimum"), 0.1},
@@ -3624,7 +3640,8 @@ void McpEditorTools::registerWriteTools()
                                         {QStringLiteral("kind"), QStringLiteral("trackIndex"),
                                          QStringLiteral("clipIndex"), QStringLiteral("type"),
                                          QStringLiteral("durationSec"), QStringLiteral("alignment"),
-                                         QStringLiteral("easing")},
+                                         QStringLiteral("easing"), QStringLiteral("softness"),
+                                         QStringLiteral("borderWidth"), QStringLiteral("borderColor")},
                                         err))
                 return {};
             QString typeName;
@@ -3650,6 +3667,31 @@ void McpEditorTools::registerWriteTools()
                 return {};
             const auto alignment = static_cast<TransitionAlignment>(alignmentIndex);
             const auto easing = static_cast<TransitionEasing>(easingIndex);
+            double softness = 0.0, borderWidth = 0.0;
+            if (args.contains(QStringLiteral("softness"))
+                && !finiteNumberForMcp(args, QStringLiteral("softness"), &softness, err)) return {};
+            if (args.contains(QStringLiteral("borderWidth"))
+                && !finiteNumberForMcp(args, QStringLiteral("borderWidth"), &borderWidth, err)) return {};
+            if (softness < 0.0 || softness > 1.0 || borderWidth < 0.0 || borderWidth > 50.0)
+                return setError(err, QStringLiteral("ソフトネスは0..1、境界線の幅は0..50で指定してください")), QJsonObject();
+            QColor borderColor = Qt::white;
+            if (args.contains(QStringLiteral("borderColor"))) {
+                QString color;
+                if (!requiredString(args, QStringLiteral("borderColor"), &color, err)) return {};
+                bool valid = color.size() == 7 && color.startsWith(QLatin1Char('#'));
+                for (int i = 1; i < color.size(); ++i) {
+                    const ushort c = color.at(i).unicode();
+                    valid = valid && ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'));
+                }
+                if (!valid) return setError(err, QStringLiteral("境界線の色は #RRGGBB で指定してください")), QJsonObject();
+                borderColor = QColor(color);
+            }
+            const bool ignoredEdges = !supportsEdgeParams(type)
+                && (args.contains(QStringLiteral("softness")) || args.contains(QStringLiteral("borderWidth"))
+                    || args.contains(QStringLiteral("borderColor")));
+            const QString edgeWarning = args.contains(QStringLiteral("softness"))
+                ? QStringLiteral("この type ではソフトネスは無視されます")
+                : QStringLiteral("この type では境界線は無視されます");
 
             double durationSec = 0.5;
             if (!positiveFiniteNumber(args, QStringLiteral("durationSec"), 0.5,
@@ -3716,7 +3758,7 @@ void McpEditorTools::registerWriteTools()
                 emit target.track->modified();
 
                 const ClipInfo& updated = target.track->clips().at(target.clipIndex);
-                return QJsonObject{
+                QJsonObject response{
                     {QStringLiteral("ok"), true},
                     {QStringLiteral("kind"), QStringLiteral("audio")},
                     {QStringLiteral("trackIndex"), target.trackIndex},
@@ -3726,6 +3768,8 @@ void McpEditorTools::registerWriteTools()
                     {QStringLiteral("leadIn"), transitionToJson(updated.leadIn)},
                     {QStringLiteral("trailOut"), transitionToJson(updated.trailOut)}
                 };
+                if (ignoredEdges) response.insert(QStringLiteral("warning"), edgeWarning);
+                return response;
             }
 
             if (target.trackIndex != 0)
@@ -3787,6 +3831,11 @@ void McpEditorTools::registerWriteTools()
             transition.duration = durationSec;
             transition.alignment = alignment;
             transition.easing = easing;
+            if (supportsEdgeParams(type)) {
+                transition.softness = softness;
+                transition.borderWidth = borderWidth;
+                transition.borderColor = borderColor;
+            }
             if (type == TransitionType::None)
                 currentTimeline->clearTransitionsOnSelected();
             else
@@ -3794,7 +3843,7 @@ void McpEditorTools::registerWriteTools()
             restoreSelection();
 
             const ClipInfo& updated = target.track->clips().at(target.clipIndex);
-            return QJsonObject{
+            QJsonObject response{
                 {QStringLiteral("ok"), true},
                 {QStringLiteral("kind"), QStringLiteral("video")},
                 {QStringLiteral("trackIndex"), 0},
@@ -3805,6 +3854,8 @@ void McpEditorTools::registerWriteTools()
                 {QStringLiteral("leadIn"), transitionToJson(updated.leadIn)},
                 {QStringLiteral("trailOut"), transitionToJson(updated.trailOut)}
             };
+            if (ignoredEdges) response.insert(QStringLiteral("warning"), edgeWarning);
+            return response;
         })
     }, setTransitionOutputSchema));
 

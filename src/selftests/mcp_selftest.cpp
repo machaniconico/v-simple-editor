@@ -3027,6 +3027,70 @@ int runMcpSelftest()
              QStringLiteral("Timeline was not available"));
     }
 
+    // US-302 reserves G150-G151: edge parameters and unsupported-type warning.
+    if (timelineReady) {
+        auto *track = projectTimeline->trackAt(false, 0);
+        const auto saved = track->clips();
+        auto *audioTrack = projectTimeline->trackAt(true, 0);
+        const auto savedAudio = audioTrack->clips();
+        const auto savedParents = projectTimeline->clipParentEntries();
+        ClipInfo a = makeTestClip(QStringLiteral("edge-A"), 0);
+        ClipInfo b = makeTestClip(QStringLiteral("edge-B"), 0);
+        a.duration = b.duration = 10.0;
+        a.inPoint = b.inPoint = 2.0;
+        a.outPoint = b.outPoint = 7.0;
+        track->setClips({a, b});
+        projectTimeline->clearSelection();
+        projectTimeline->undoManager()->clear();
+        projectTimeline->undoManager()->saveState(
+            projectTimeline->currentState(), QStringLiteral("MCP edge baseline"));
+        const auto getEdge = [&]() {
+            const auto tracks = toolPayload(callProjectInfoTool(
+                350, QStringLiteral("get_timeline"), QJsonObject{})).value("video").toArray();
+            if (tracks.isEmpty()) return QJsonObject{};
+            const auto clips = tracks.at(0).toObject().value("clips").toArray();
+            return clips.isEmpty() ? QJsonObject{} : clips.at(0).toObject().value("trailOut").toObject();
+        };
+        QJsonObject args{{QStringLiteral("kind"), QStringLiteral("video")},
+                         {QStringLiteral("clipIndex"), 0},
+                         {QStringLiteral("type"), QStringLiteral("WipeLeft")},
+                         {QStringLiteral("softness"), 0.5},
+                         {QStringLiteral("borderWidth"), 4.0},
+                         {QStringLiteral("borderColor"), QStringLiteral("#ff0000")}};
+        const auto serial = projectTimeline->undoManager()->saveSerial();
+        const auto response = toolPayload(callProjectInfoTool(351, QStringLiteral("set_transition"), args));
+        const auto edge = getEdge();
+        bool g150 = response.value("ok").toBool() && edge.value("softness").toDouble() == 0.5
+            && edge.value("borderWidth").toDouble() == 4.0
+            && edge.value("borderColor").toString() == QStringLiteral("#ff0000")
+            && projectTimeline->undoManager()->saveSerial() == serial + 1;
+        projectTimeline->undo();
+        g150 = g150 && track->clips().first().trailOut.type == TransitionType::None;
+        g150 ? pass("G150 transition edge parameters and one undo")
+             : fail("G150 transition edge parameters and one undo", QStringLiteral("edge values or undo did not match"));
+        args["type"] = QStringLiteral("CrossDissolve");
+        const auto ignored = toolPayload(callProjectInfoTool(352, QStringLiteral("set_transition"), args));
+        const auto ignoredEdge = getEdge();
+        const bool g151 = ignored.value("ok").toBool()
+            && ignored.value("warning").toString() == QStringLiteral("この type ではソフトネスは無視されます")
+            && ignoredEdge.value("softness").toDouble(-1.0) == 0.0
+            && ignoredEdge.value("borderWidth").toDouble(-1.0) == 0.0
+            && ignoredEdge.value("borderColor").toString() == QStringLiteral("#ffffff")
+            && track->clips().first().trailOut.hasDefaultEdgeParams();
+        g151 ? pass("G151 unsupported transition ignores edge parameters")
+             : fail("G151 unsupported transition ignores edge parameters", QStringLiteral("warning or stored defaults did not match"));
+        projectTimeline->setClipParentEntries(savedParents);
+        track->setClips(saved);
+        audioTrack->setClips(savedAudio);
+        projectTimeline->clearSelection();
+        projectTimeline->undoManager()->clear();
+        projectTimeline->undoManager()->saveState(
+            projectTimeline->currentState(), QStringLiteral("MCP selftest baseline"));
+    } else {
+        fail("G150 transition edge parameters and one undo", QStringLiteral("Timeline tracks were not available"));
+        fail("G151 unsupported transition ignores edge parameters", QStringLiteral("Timeline tracks were not available"));
+    }
+
     // US-300 reserves G148-G149: identifiers and actual playback overlap.
     if (timelineReady) {
         auto* videoTrack = projectTimeline->trackAt(false, 0);

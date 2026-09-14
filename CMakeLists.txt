@@ -276,6 +276,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/audio_xfade_selftest.cpp
     src/selftests/morph_cut_selftest.cpp
     src/selftests/transition_export_selftest.cpp
+    src/selftests/transition_params_selftest.cpp
     src/selftests/AutoDuckingSelftest.cpp
     src/selftests/AudioChannelMapSelftest.cpp
     src/selftests/StereoPanSelftest.cpp

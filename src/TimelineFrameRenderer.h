@@ -70,6 +70,7 @@ void setTransitionStepsEnabledForTest(bool enabled);
 int transitionStepCallCountForTest();
 QImage applyEdgeFadeStep(QImage composed, const OverlapInterval &entry, double T);
 QImage applyEdgeFadeStep(QImage composed, const PlaybackEntry &entry, double T);
+// Uses the outgoing interval edge parameters in OverlayRenderer::applyTransition.
 QImage applyOverlapTransitionStep(QImage composed, const QImage &neighbourLayer,
                                  const OverlapInterval &entry, double T);
 QImage applyOverlapTransitionStep(QImage composed, const QImage &neighbourLayer,

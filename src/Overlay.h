@@ -208,11 +208,29 @@ inline const QStringList& transitionEasingNames()
     return names;
 }
 
+inline bool supportsEdgeParams(TransitionType type) {
+    switch (type) {
+    case TransitionType::WipeLeft: case TransitionType::WipeRight:
+    case TransitionType::WipeUp: case TransitionType::WipeDown:
+    case TransitionType::BarnDoorHorizontal: case TransitionType::BarnDoorVertical:
+    case TransitionType::BarnDoorHClose: case TransitionType::BarnDoorVClose:
+        return true;
+    default: return false;
+    }
+}
+
 struct Transition {
     TransitionType type = TransitionType::None;
     double duration = 0.5; // seconds
     TransitionAlignment alignment = TransitionAlignment::Center;
     TransitionEasing easing = TransitionEasing::Linear;
+
+    double softness = 0.0;
+    double borderWidth = 0.0;
+    QColor borderColor = Qt::white;
+    bool hasDefaultEdgeParams() const {
+        return softness == 0.0 && borderWidth == 0.0 && borderColor == QColor(Qt::white);
+    }
 
     static QString typeName(TransitionType t) {
         switch (t) {
@@ -354,4 +372,8 @@ public:
     static void renderPip(QImage &frame, const QImage &pipSource, const PipConfig &config);
     static void clearMorphCutCacheForTest();
     static QImage applyTransition(const QImage &from, const QImage &to, TransitionType type, double progress);
+    static QImage applyTransition(const QImage &from, const QImage &to,
+                                  const Transition &transition, double progress);
+    static void setEdgeParamsEnabledForTest(bool enabled);
+    static int edgeParamsCallCountForTest();
 };

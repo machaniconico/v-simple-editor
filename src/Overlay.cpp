@@ -6,6 +6,7 @@
 #include <QMutex>
 #include <QMutexLocker>
 #include <list>
+#include <atomic>
 #include <tuple>
 #include <cmath>
 #include <cstring>
@@ -407,6 +408,80 @@ void OverlayRenderer::clearMorphCutCacheForTest()
 {
     QMutexLocker lock(&morphCacheMutex);
     morphCache.clear();
+}
+
+namespace {
+std::atomic<bool> edgeParamsEnabled{true};
+std::atomic<int> edgeParamsCalls{0};
+}
+
+void OverlayRenderer::setEdgeParamsEnabledForTest(bool enabled)
+{
+    edgeParamsEnabled = enabled;
+    edgeParamsCalls = 0;
+}
+int OverlayRenderer::edgeParamsCallCountForTest() { return edgeParamsCalls.load(); }
+
+QImage OverlayRenderer::applyTransition(const QImage &from, const QImage &to,
+                                       const Transition &transition, double progress)
+{
+    if (!edgeParamsEnabled || transition.hasDefaultEdgeParams()
+        || !supportsEdgeParams(transition.type))
+        return applyTransition(from, to, transition.type, progress);
+    ++edgeParamsCalls;
+    const int w = qMax(from.width(), to.width());
+    const int h = qMax(from.height(), to.height());
+    if (w <= 0 || h <= 0) return QImage();
+    // Preserve the legacy top-left KeepAspectRatio placement and black canvas.
+    const auto canvas = [&](const QImage &source) {
+        QImage image(w, h, QImage::Format_RGB888);
+        image.fill(Qt::black);
+        QPainter painter(&image);
+        painter.drawImage(0, 0, source.scaled(w, h, Qt::KeepAspectRatio,
+                                            Qt::SmoothTransformation));
+        painter.end();
+        return image;
+    };
+    QImage result = canvas(from);
+    const QImage target = canvas(to);
+    const double p = qBound(0.0, progress, 1.0);
+    if (p <= 0.0) return result;
+    if (p >= 1.0) return target;
+    const double feather = qBound(0.0, transition.softness, 1.0) * qMin(w, h) * 0.1;
+    const double halfBorder = qBound(0.0, transition.borderWidth, 50.0) * 0.5;
+    const QColor border = transition.borderColor.isValid() ? transition.borderColor : QColor(Qt::white);
+    for (int y = 0; y < h; ++y) {
+        uchar *dst = result.scanLine(y);
+        const uchar *src = target.constScanLine(y);
+        for (int x = 0; x < w; ++x) {
+            // Positive distance is the revealed (to) side. Pixel centres keep
+            // symmetric feather and border coverage around the moving boundary.
+            const double px = x + 0.5, py = y + 0.5;
+            double d = 0.0;
+            switch (transition.type) {
+            case TransitionType::WipeLeft: d = w * p - px; break;
+            case TransitionType::WipeRight: d = px - w * (1.0 - p); break;
+            case TransitionType::WipeUp: d = h * p - py; break;
+            case TransitionType::WipeDown: d = py - h * (1.0 - p); break;
+            case TransitionType::BarnDoorHorizontal: d = w * p * 0.5 - std::abs(px - w * 0.5); break;
+            case TransitionType::BarnDoorVertical: d = h * p * 0.5 - std::abs(py - h * 0.5); break;
+            case TransitionType::BarnDoorHClose: d = std::abs(px - w * 0.5) - w * (1.0 - p) * 0.5; break;
+            case TransitionType::BarnDoorVClose: d = std::abs(py - h * 0.5) - h * (1.0 - p) * 0.5; break;
+            default: break;
+            }
+            const double u = feather > 0.0 ? qBound(0.0, (d + feather) / (2.0 * feather), 1.0)
+                                            : (d >= 0.0 ? 1.0 : 0.0);
+            const double mask = u * u * (3.0 - 2.0 * u);
+            for (int c = 0; c < 3; ++c)
+                dst[x * 3 + c] = static_cast<uchar>(qRound(dst[x * 3 + c] * (1.0 - mask) + src[x * 3 + c] * mask));
+            if (std::abs(d) < halfBorder) {
+                dst[x * 3] = border.red();
+                dst[x * 3 + 1] = border.green();
+                dst[x * 3 + 2] = border.blue();
+            }
+        }
+    }
+    return result;
 }
 
 QImage OverlayRenderer::applyTransition(const QImage &from, const QImage &to,

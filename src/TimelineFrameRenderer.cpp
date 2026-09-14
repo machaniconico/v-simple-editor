@@ -159,8 +159,13 @@ QImage applyOverlapTransitionStep(QImage composed, const QImage &neighbourLayer,
     const double rawProgress = qBound(0.0,
         1.0 - remaining / e.trailOutDuration, 1.0);
     const double progress = applyEasing(rawProgress, e.trailOutEasing);
+    Transition transition;
+    transition.type = e.trailOutType;
+    transition.softness = e.softness;
+    transition.borderWidth = e.borderWidth;
+    transition.borderColor = e.borderColor;
     return OverlayRenderer::applyTransition(
-        composed, neighbourLayer, e.trailOutType, progress);
+        composed, neighbourLayer, transition, progress);
 }
 QImage applyOverlapTransitionStep(QImage composed, const QImage &neighbourLayer,
                                  const PlaybackEntry &e, double T)
@@ -1615,6 +1620,9 @@ QImage renderFrameFromTracks(const Timeline *timeline,
                 iv.trailOutAlignment = c.trailOut.alignment;
                 iv.leadInEasing = c.leadIn.easing;
                 iv.trailOutEasing = c.trailOut.easing;
+                iv.softness = c.trailOut.softness;
+                iv.borderWidth = c.trailOut.borderWidth;
+                iv.borderColor = c.trailOut.borderColor;
                 if (c.effectiveDuration() > 0.0) ivs.append(iv);
                 start = iv.timelineEnd;
             }
