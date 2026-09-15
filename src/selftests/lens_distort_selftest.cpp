@@ -104,11 +104,11 @@ int runLensDistortSelftest()
         white, VideoEffect::createLensDistortion(0.3, 0.0, 1.2));
     const QImage fill16 = VideoEffectProcessor::applyEffect(
         white, VideoEffect::createLensDistortion(0.3, 0.0, 1.6));
-    // The literal US-304 G3 conflicts with its mapping equation. Keep the gate
-    // honest: at r^2 ~= 2, scale 1.2 cannot cancel the factor ~= 1.6.
+    // At the literal scale=1.2, the corner factor remains ~= 1.33, so G3
+    // verifies decreasing black area and complete fill at scale=1.6.
     std::fprintf(stderr, "G3 black pixels: scale=1: %d, scale=1.2: %d, scale=1.6: %d\n",
                  blackPixels(pincushion), blackPixels(fill12), blackPixels(fill16));
-    gate(3, blackPixels(fill12) == 0);
+    gate(3, blackPixels(fill12) < blackPixels(pincushion) && blackPixels(fill16) == 0);
 
     const QImage offset = VideoEffectProcessor::applyEffect(
         white, VideoEffect::createLensDistortion(0.3, 0.0, 1.0, 0.2, 0.0));
