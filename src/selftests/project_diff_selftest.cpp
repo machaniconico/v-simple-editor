@@ -102,8 +102,15 @@ int runProjectDiffSelftest()
 
     b = a;
     b.videoTracks[0][0].effects.append(effect);
+    KeyframeTrack bezierTrack(QStringLiteral("volume"), 1.0);
+    bezierTrack.addKeyframe(0.0, 1.0, KeyframePoint::Bezier);
+    b.videoTracks[0][0].keyframes.addTrack(bezierTrack);
     c = b;
     auto &small = c.videoTracks[0][0];
+    auto &smallTrack = *small.keyframes.track(QStringLiteral("volume"));
+    auto smallKeyframe = smallTrack.keyframes()[0];
+    smallKeyframe.bezX1 += 0.0001;
+    smallTrack.setKeyframePoint(0, smallKeyframe);
     small.inPoint += 0.0001;
     small.duration += 0.0001;
     small.leadInSec += 0.0001;
@@ -128,10 +135,20 @@ int runProjectDiffSelftest()
         && materialChanges[0].type == Change::PropertyChanged
         && materialChanges[0].path.endsWith(QStringLiteral(".layerMaterial"));
     c = b;
+    auto &keyframeTrack = *c.videoTracks[0][0].keyframes.track(QStringLiteral("volume"));
+    auto keyframe = keyframeTrack.keyframes()[0];
+    keyframe.bezX1 = 0.5;
+    keyframeTrack.setKeyframePoint(0, keyframe);
+    const auto keyframeChanges = diff(b, c);
+    const bool keyframeChanged = keyframeChanges.size() == 1
+        && keyframeChanges[0].type == Change::PropertyChanged
+        && keyframeChanges[0].path.endsWith(QStringLiteral(".keyframes"));
+    c = b;
     c.audioTracks[0][0].volume = 0.5;
     c.trackFlags = {{"audio", QJsonArray{QJsonObject{{"muted", true}}}}};
     const auto properties = diff(b, c);
-    gate(7, epsilonIgnored && epsilonBoundary && materialChanged && properties.size() == 2
+    gate(7, epsilonIgnored && epsilonBoundary && materialChanged && keyframeChanged
+         && properties.size() == 2
          && count(properties, Change::PropertyChanged) == 1
          && count(properties, Change::TrackFlagChanged) == 1
          && properties[0].path == QStringLiteral("audio[0].clips[0].volume"));

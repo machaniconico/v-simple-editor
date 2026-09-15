@@ -63,6 +63,35 @@ QJsonObject projection(const ProjectData &data)
             for (int c = 0; c < tracks[t].size(); ++c) {
                 const auto &clip = tracks[t][c];
                 auto obj = clips.at(c).toObject();
+                // Persistence omits identity Bezier handles and absent spatial
+                // tangents. Complete their keys so numeric differences reach equal().
+                if (obj.contains("keyframes")) {
+                    auto keyframes = obj.value("keyframes").toObject();
+                    auto keyframeTracks = keyframes.value("tracks").toArray();
+                    for (int k = 0; k < keyframeTracks.size(); ++k) {
+                        auto track = keyframeTracks.at(k).toObject();
+                        auto points = track.value("keyframes").toArray();
+                        for (int p = 0; p < points.size(); ++p) {
+                            auto point = points.at(p).toObject();
+                            const bool hasSpatialTangent = point.contains("spatialOutX")
+                                || point.contains("spatialOutY")
+                                || point.contains("spatialInX")
+                                || point.contains("spatialInY");
+                            point.insert("hasSpatialTangent", hasSpatialTangent);
+                            for (const char *field : {"bezX1", "bezY1", "spatialOutX",
+                                                     "spatialOutY", "spatialInX", "spatialInY"})
+                                if (!point.contains(field)) point.insert(field, 0.0);
+                            for (const char *field : {"bezX2", "bezY2"})
+                                if (!point.contains(field)) point.insert(field, 1.0);
+                            point.remove("interp"); // duplicates numeric interpolation
+                            points[p] = point;
+                        }
+                        track.insert("keyframes", points);
+                        keyframeTracks[k] = track;
+                    }
+                    keyframes.insert("tracks", keyframeTracks);
+                    obj.insert("keyframes", keyframes);
+                }
                 const auto &cc = clip.colorCorrection;
                 QJsonObject grade{
                     {"brightness", cc.brightness},
