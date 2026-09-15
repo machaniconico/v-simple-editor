@@ -37,6 +37,8 @@
 #include <numeric>
 #include <utility>
 #include <QFileInfo>
+#include <QSignalBlocker>
+#include <QSet>
 #include <QDir>
 #include <QFont>
 #include <QJsonArray>
@@ -4570,6 +4572,113 @@ void Timeline::addClip(const QString &filePath)
     // GUI の従来経路も MCP と同じ取り込み実装を使い、配置・リンク・Undo が
     // 別々に進化しないようにする。GUI 側は失敗理由を表示する契約を持たない。
     importMedia(filePath);
+}
+
+void Timeline::selectAllClips()
+{
+    selectClipsForErgo(0);
+}
+
+void Timeline::selectClipsFromPlayhead(bool forward)
+{
+    selectClipsForErgo(forward ? 1 : -1);
+}
+
+void Timeline::selectClipsForErgo(int direction)
+{
+    // Block linked-selection propagation: eligibility is per clip and track.
+    int primary = -1;
+    m_activeVideoTrackIndex = -1;
+    auto selectTrack = [&](TimelineTrack *track, int videoIndex) {
+        if (!track) return;
+        const QSignalBlocker blocker(track);
+        track->clearClipSelection();
+        if (track->isLocked() || track->isHidden()) return;
+        double cursor = 0.0;
+        for (int i = 0; i < track->clipCount(); ++i) {
+            const ClipInfo &clip = track->clips()[i];
+            const double start = cursor + clip.leadInSec;
+            const double end = start + clip.effectiveDuration();
+            if (direction == 0 || (direction > 0 && start >= m_playheadPos)
+                || (direction < 0 && end <= m_playheadPos)) {
+                track->toggleClipSelection(i);
+                if (primary < 0 || videoIndex >= 0) {
+                    primary = i;
+                    m_activeVideoTrackIndex = videoIndex;
+                }
+            }
+            cursor = end;
+        }
+    };
+    for (int i = 0; i < m_videoTracks.size(); ++i) selectTrack(m_videoTracks[i], i);
+    for (auto *track : m_audioTracks) selectTrack(track, -1);
+    emit clipSelected(primary);
+    emit clipSelectedOnTrack(m_activeVideoTrackIndex, primary);
+    if (primary < 0)
+        emit statusMessageRequested(QStringLiteral("選択できるクリップがありません。"), 3000);
+}
+
+void Timeline::bladeAllTracksAtPlayhead()
+{
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    QHash<int, int> oldGroupToNewGroup;
+    // Loaded projects may contain groups beyond the allocator's current value.
+    QSet<int> usedGroups;
+    auto collectGroups = [&](TimelineTrack *track) {
+        if (!track) return;
+        for (const auto &clip : track->clips())
+            if (clip.linkGroup > 0) usedGroups.insert(clip.linkGroup);
+    };
+    for (auto *track : m_videoTracks) collectGroups(track);
+    for (auto *track : m_audioTracks) collectGroups(track);
+    bool anySplit = false;
+    auto splitTrack = [&](TimelineTrack *track) {
+        if (!track || track->isLocked()) return;
+        const auto clips = track->clips();
+        double cursor = 0.0;
+        for (int i = 0; i < clips.size(); ++i) {
+            const double start = cursor + clips[i].leadInSec;
+            const double end = start + clips[i].effectiveDuration();
+            if (m_playheadPos > start && m_playheadPos < end) {
+                track->splitClipAt(i, m_playheadPos - start, false);
+                if (track->clipCount() == clips.size()) return;
+                auto updated = track->clips();
+                const int oldGroup = updated[i + 1].linkGroup;
+                if (oldGroup > 0) {
+                    auto it = oldGroupToNewGroup.find(oldGroup);
+                    if (it == oldGroupToNewGroup.end()) {
+                        int newGroup = allocateLinkGroup();
+                        while (usedGroups.contains(newGroup)) newGroup = allocateLinkGroup();
+                        usedGroups.insert(newGroup);
+                        it = oldGroupToNewGroup.insert(oldGroup, newGroup);
+                    }
+                    updated[i + 1].linkGroup = it.value();
+                }
+                track->setClips(updated);
+                // Keep selected downstream clips attached to their new indices.
+                const auto selected = track->selectedClips();
+                const QSignalBlocker blocker(track);
+                track->clearClipSelection();
+                for (int index : selected)
+                    track->toggleClipSelection(index > i ? index + 1 : index);
+                anySplit = true;
+                return;
+            }
+            cursor = end;
+        }
+    };
+    for (auto *track : m_videoTracks) splitTrack(track);
+    for (auto *track : m_audioTracks) splitTrack(track);
+    if (!anySplit) {
+        emit statusMessageRequested(QStringLiteral("再生ヘッド位置に分割できるクリップがありません。"), 3000);
+        return;
+    }
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+    saveUndoState(QStringLiteral("全トラックを再生ヘッドで分割"));
+    onTrackModified();
+    updateInfoLabel();
+    emit positionChanged(m_playheadPos);
 }
 
 void Timeline::splitAtPlayhead()

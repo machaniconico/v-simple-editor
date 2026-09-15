@@ -694,6 +694,9 @@ public:
                      ImportMediaKind kind = ImportMediaKind::LinkedPair);
     void addClip(const QString &filePath);
     void splitAtPlayhead();
+    void selectAllClips();
+    void selectClipsFromPlayhead(bool forward);
+    void bladeAllTracksAtPlayhead();
     // ---- index 指定の編集 (MCP / スクリプト経路) ----
     // GUI 経路と同じ「snapshot -> 変更 -> remap -> saveUndoState」の順序を
     // 内部で守る。選択状態には依存しない。失敗時は *err を埋めて false を返し、
@@ -1231,6 +1234,7 @@ private slots:
     void onPlayheadAutoScrollTick();
 
 private:
+    void selectClipsForErgo(int direction); // 0: all, +1: forward, -1: backward
     QVector<PlaybackEntry> computePlaybackSequenceImpl(
         QVector<QVector<OverlapInterval>> *overlapIntervals) const;
     struct TimeRangeSec {

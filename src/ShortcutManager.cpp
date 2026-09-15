@@ -15,7 +15,7 @@ QList<QPair<QString, QKeySequence>> ShortcutManager::presetBindingTable(Preset p
 
     switch (p) {
     case Preset::VEditor:
-        // VEditor default — returns empty; defaults come from registerAction
+        // VEditor defaults come from registerAction; new operations are below.
         break;
 
     case Preset::Premiere:
@@ -90,6 +90,11 @@ QList<QPair<QString, QKeySequence>> ShortcutManager::presetBindingTable(Preset p
         break;
     }
 
+    // Common timeline operations are available in every preset.
+    table << P{"timeline.select_forward", QKeySequence()}
+          << P{"timeline.select_backward", QKeySequence()}
+          << P{"timeline.blade_all", QKeySequence("Ctrl+Shift+K")}
+          << P{"timeline.lift", QKeySequence()};
     return table;
 }
 

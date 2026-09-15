@@ -3116,6 +3116,16 @@ void MainWindow::registerCoreShortcuts()
         QStringLiteral("クリップを貼り付け"),  QStringLiteral("編集"));
     reg(m_splitAction,           "edit.split",
         QStringLiteral("再生ヘッドで分割"),    QStringLiteral("編集"));
+    reg(m_selectAllClipsAction, "timeline.select_all",
+        QStringLiteral("すべて選択"), QStringLiteral("編集"));
+    reg(m_selectForwardAction, "timeline.select_forward",
+        QStringLiteral("再生ヘッド以降を選択"), QStringLiteral("編集"));
+    reg(m_selectBackwardAction, "timeline.select_backward",
+        QStringLiteral("再生ヘッド以前を選択"), QStringLiteral("編集"));
+    reg(m_bladeAllAction, "timeline.blade_all",
+        QStringLiteral("全トラックを再生ヘッドで分割"), QStringLiteral("編集"));
+    reg(m_liftAction, "timeline.lift",
+        QStringLiteral("リフト (ギャップを残して削除)"), QStringLiteral("編集"));
     reg(m_deleteAction,          "edit.delete",
         QStringLiteral("クリップを削除"),      QStringLiteral("編集"));
     reg(m_rippleDeleteAction,    "timeline.ripple_delete",
@@ -4290,6 +4300,48 @@ void MainWindow::setupMenuBar()
     m_menuHelpEntries.append({m_pasteAction,
         QStringLiteral("コピーしたクリップを再生ヘッドの位置に貼り付けます。")});
 
+    editMenu->addSeparator();
+
+    m_selectAllClipsAction = editMenu->addAction("すべて選択");
+    m_selectForwardAction = editMenu->addAction("再生ヘッド以降を選択");
+    m_selectBackwardAction = editMenu->addAction("再生ヘッド以前を選択");
+    m_bladeAllAction = editMenu->addAction("全トラックを再生ヘッドで分割");
+    m_liftAction = editMenu->addAction("リフト (ギャップを残して削除)");
+    m_selectAllClipsAction->setShortcut(QKeySequence("Ctrl+A"));
+    m_bladeAllAction->setShortcut(QKeySequence("Ctrl+Shift+K"));
+    connect(m_timeline, &Timeline::statusMessageRequested, this,
+            [this](const QString &message, int timeout) { statusBar()->showMessage(message, timeout); });
+    connect(m_selectAllClipsAction, &QAction::triggered, this, [this]() {
+        m_timeline->selectAllClips();
+        updateEditActions();
+    });
+    connect(m_selectForwardAction, &QAction::triggered, this, [this]() {
+        m_timeline->selectClipsFromPlayhead(true);
+        updateEditActions();
+    });
+    connect(m_selectBackwardAction, &QAction::triggered, this, [this]() {
+        m_timeline->selectClipsFromPlayhead(false);
+        updateEditActions();
+    });
+    connect(m_bladeAllAction, &QAction::triggered, this, [this]() {
+        const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
+        m_timeline->bladeAllTracksAtPlayhead();
+        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
+        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+        updateEditActions();
+    });
+    connect(m_liftAction, &QAction::triggered, this, [this]() {
+        if (!m_timeline->hasAnySelection()) {
+            statusBar()->showMessage(QStringLiteral("削除するクリップを選択してください。"), 3000);
+            return;
+        }
+        const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
+        m_timeline->deleteSelectedClip();
+        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
+        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+        statusBar()->showMessage(QStringLiteral("クリップをリフトしました。"), 3000);
+        updateEditActions();
+    });
     editMenu->addSeparator();
 
     m_splitAction = editMenu->addAction("再生ヘッドで分割(&S)");
