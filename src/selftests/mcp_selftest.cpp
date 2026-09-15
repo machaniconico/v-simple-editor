@@ -4923,7 +4923,8 @@ int runMcpSelftest()
         original.inPoint = 1.0;
         original.outPoint = 2.0;
         original.effects.append(VideoEffect::createBrightnessContrast(12.0, 0.0));
-        projectTimeline->restoreFromProject({{original}}, {}, 0, -1, -1, 10);
+        projectTimeline->restoreFromProject(QVector<QVector<ClipInfo>>{{original}},
+            QVector<QVector<ClipInfo>>{}, 0, -1, -1, 10);
         projectTimeline->undoManager()->clear();
         projectTimeline->saveUndoState(QStringLiteral("MCP焼き込み初期状態"));
         const QSize size(640, 360);

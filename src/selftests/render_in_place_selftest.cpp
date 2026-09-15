@@ -479,7 +479,8 @@ int runRenderInPlaceSelftest()
     linkedAudio.pan = -0.2;
     const bool toneReady = writeTone(linkedAudio.filePath, 440.0);
     Timeline linkedTimeline;
-    linkedTimeline.restoreFromProject({{linkedVideo}}, {{linkedAudio}}, 0, -1, -1, 10);
+    linkedTimeline.restoreFromProject(QVector<QVector<ClipInfo>>{{linkedVideo}},
+        QVector<QVector<ClipInfo>>{{linkedAudio}}, 0, -1, -1, 10);
     linkedTimeline.undoManager()->clear();
     linkedTimeline.saveUndoState(QStringLiteral("リンク音声初期状態"));
     const quint64 linkedSerial = linkedTimeline.undoManager()->saveSerial();
