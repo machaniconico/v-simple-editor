@@ -1,4 +1,5 @@
 #include "RenderInPlace.h"
+#include "ClipGeometry.h"
 #include "Timeline.h"
 #include "RenderQueue.h"
 #include "UndoManager.h"
@@ -222,9 +223,24 @@ bool renderClipInPlace(Timeline &timeline, int trackIndex, int clipIndex,
         audio.leadInSec = qMax(0.0, start - audioEnd);
         audioEnd = start + audio.effectiveDuration();
     }
-    isolated.leadInSec = prefix - handles;
+    // Linked audio may extend beyond either video handle. Give every export
+    // frame an active V1 clip: null objects render black in the opaque output.
+    // Keep the isolated clip's local clock unchanged so retained effects,
+    // keyframes and source-time mapping still start at prefix in the media.
+    QVector<ClipInfo> isolatedVideo;
+    const auto appendBlack = [&](double duration) {
+        if (duration <= 0.0) return;
+        ClipInfo black{};
+        black.filePath = clipgeom::nullObjectFilePath();
+        black.duration = duration;
+        black.outPoint = duration;
+        isolatedVideo.append(black);
+    };
+    appendBlack(prefix - handles);
+    isolatedVideo.append(isolated);
+    appendBlack(suffix - handles);
     Timeline temporary;
-    temporary.restoreFromProject(QVector<QVector<ClipInfo>>{{isolated}},
+    temporary.restoreFromProject(QVector<QVector<ClipInfo>>{isolatedVideo},
                                  QVector<QVector<ClipInfo>>{linked}, 0.0, -1.0, -1.0, 10);
     temporary.setProjectOutputConfig(outputSize.width(), outputSize.height(), true);
 

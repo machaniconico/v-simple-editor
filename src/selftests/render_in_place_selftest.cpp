@@ -509,14 +509,26 @@ int runRenderInPlaceSelftest()
                 && clipJson(overlap.videoTracks()[0]->clips()[1]) == clipJson(second);
         }
     }
-    for (const double audioOut : {2.0, 3.0}) {
+    struct LinkedCase {
+        double audioOut;
+        double videoStart;
+        double expectedPrefix;
+        double expectedJobLength;
+    };
+    // Equal lengths, audio extending past the video, and audio starting a
+    // second before the video. The latter two used to leave V1 export gaps.
+    for (const LinkedCase &test : {LinkedCase{2.0, 0.0, 0.25, 1.5},
+                                  LinkedCase{3.0, 0.0, 0.25, 2.25},
+                                  LinkedCase{3.0, 1.0, 1.0, 2.25}}) {
         ClipInfo linkedVideo = original;
         linkedVideo.linkGroup = 312;
+        linkedVideo.leadInSec = test.videoStart;
         ClipInfo linkedAudio = linkedVideo;
+        linkedAudio.leadInSec = 0.0;
         linkedAudio.filePath = output.filePath(QStringLiteral("linked-tone.wav"));
         linkedAudio.effects.clear();
         linkedAudio.duration = 8.0;
-        linkedAudio.outPoint = audioOut;
+        linkedAudio.outPoint = test.audioOut;
         linkedAudio.volume = 0.65;
         linkedAudio.pan = -0.2;
         const bool toneReady = writeTone(linkedAudio.filePath, 440.0);
@@ -538,13 +550,19 @@ int runRenderInPlaceSelftest()
         const double deltaDb = rmsBefore > 0.0 && rmsAfter > 0.0
             ? 20.0 * std::log10(rmsAfter / rmsBefore) : std::numeric_limits<double>::infinity();
         const bool audioLengthOk = linkedBaked
-            && audioCoversJob(linkedPath, audioOut == 2.0 ? 1.5 : 2.25);
+            && audioCoversJob(linkedPath, test.expectedJobLength);
         bool linkedOk = linkedBaked && !videoOnly(linkedPath) && std::abs(deltaDb) <= 1.0
             && audioLengthOk
             && linkedTimeline.undoManager()->saveSerial() == linkedSerial + 1
             && linkedTimeline.audioTracks()[0]->clips()[0].filePath == linkedPath
             && bool(linkedTimeline.audioTracks()[0]->clips()[0].renderInPlaceOriginal);
         if (linkedBaked) {
+            const ClipInfo &bakedVideo = linkedTimeline.videoTracks()[0]->clips()[0];
+            const ClipInfo &bakedAudio = linkedTimeline.audioTracks()[0]->clips()[0];
+            linkedOk = linkedOk && bakedVideo.inPoint == test.expectedPrefix
+                && bakedVideo.outPoint == test.expectedPrefix + linkedVideo.effectiveDuration()
+                && bakedAudio.inPoint == test.expectedPrefix - test.videoStart
+                && bakedAudio.outPoint == bakedAudio.inPoint + linkedAudio.effectiveDuration();
             Timeline unbaked;
             unbaked.restoreFromProject(QVector<QVector<ClipInfo>>{{linkedVideo}},
                 QVector<QVector<ClipInfo>>{{linkedAudio}}, 0, -1, -1, 10);
@@ -556,6 +574,21 @@ int runRenderInPlaceSelftest()
                 std::fprintf(stderr, "G6 window=%.3f before=%.6f after=%.6f delta=%.3f dB\n",
                     center, beforeRms, afterRms, db);
                 linkedOk = linkedOk && std::abs(db) <= 1.0;
+            }
+            int frame = 0;
+            for (qint64 tick : {100000LL, 500000LL, 900000LL}) {
+                const qint64 timelineTick = qRound64(test.videoStart * 1000000.0) + tick;
+                const QImage beforeImage = tlrender::renderFrameAt(&unbaked, timelineTick, options.outputSize);
+                const QImage afterImage = tlrender::renderFrameAt(&linkedTimeline, timelineTick, options.outputSize);
+                const QImage control = tlrender::renderFrameAt(&controlTimeline, tick, options.outputSize);
+                const double actualMse = mse(beforeImage, afterImage);
+                const double controlMse = mse(beforeImage, control);
+                const double residual = mse(control, afterImage);
+                const bool ok = controlRendered && std::isfinite(actualMse) && std::isfinite(controlMse)
+                    && actualMse <= controlMse + margin && residual <= margin;
+                std::fprintf(stderr, "G6 retained frame=%d MSE=%.6f control=%.6f residual=%.6f %s\n",
+                    frame++, actualMse, controlMse, residual, ok ? "OK" : "FAIL");
+                linkedOk = linkedOk && ok;
             }
             linkedTimeline.undo();
             linkedOk = linkedOk
@@ -571,8 +604,8 @@ int runRenderInPlaceSelftest()
             linkedOk = linkedOk && linkedTimeline.videoTracks()[0]->clips()[0].filePath == linkedPath
                 && linkedTimeline.audioTracks()[0]->clips()[0].filePath == linkedPath;
         }
-        std::fprintf(stderr, "G6 linked audio RMS before=%.6f after=%.6f delta=%.3f dB error=%s\n",
-            rmsBefore, rmsAfter, deltaDb, qPrintable(linkedError));
+        std::fprintf(stderr, "G6 audioOut=%.3f videoStart=%.3f linked audio RMS before=%.6f after=%.6f delta=%.3f dB error=%s\n",
+            test.audioOut, test.videoStart, rmsBefore, rmsAfter, deltaDb, qPrintable(linkedError));
         if (!linkedOk) {
             output.setAutoRemove(false);
             std::fprintf(stderr, "G6 retained mp4, linked-tone.wav and linked-audio.m4a under %s\n",
