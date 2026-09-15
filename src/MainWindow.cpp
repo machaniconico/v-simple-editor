@@ -293,6 +293,7 @@ double exporter_loudnessGainDb();
 #include "VariableFontAxis.h"
 #include "MographText.h"
 #include "Keyframe.h"
+#include "clipanim/ClipAnim.h"
 #include "SmartReframe.h"
 #include "SmartReframeDialog.h"
 #include "LoudnessAnalyzer.h"
@@ -3739,16 +3740,22 @@ void MainWindow::setupUI()
         }
     });
 
+    connect(m_player, &VideoPlayer::frameComposited, this, [this](const QImage &) {
+        pushAnimatedHslPreview(static_cast<double>(m_player->timelinePositionUs()) / 1000000.0);
+    });
     connect(m_player, &VideoPlayer::positionChanged, this, [this](double seconds) {
         if (m_timeline) {
             m_timeline->setPlayheadPosition(seconds);
         }
+        pushAnimatedHslPreview(seconds);
         emit playheadSecondsChanged(seconds);
     });
     connect(m_timeline, &Timeline::scrubPositionChanged, this, [this](double seconds) {
+        pushAnimatedHslPreview(seconds);
         m_player->previewSeek(qRound(static_cast<double>(seconds) * 1000.0));
     });
     connect(m_timeline, &Timeline::positionChanged, this, [this](double seconds) {
+        pushAnimatedHslPreview(seconds);
         m_player->seek(qRound(static_cast<double>(seconds) * 1000.0));
     });
     // Multi-clip playback: forward Timeline's resolved schedule to VideoPlayer.
@@ -6133,6 +6140,43 @@ void MainWindow::setupMenuBar()
                                                static_cast<float>(gGain),
                                                static_cast<float>(bGain));
     };
+
+    connect(m_colorGradingPanel, &ColorGradingPanel::gradeKeyframeRequested,
+            this, [this](const QString &section) {
+        int trackIdx = -1, clipIdx = -1;
+        ClipInfo selected;
+        if (!selectedVideoClipRef(trackIdx, clipIdx, &selected)) return;
+        auto *track = m_timeline->videoTracks().value(trackIdx, nullptr);
+        if (!track || track->isLocked()) return;
+        const double localSec = qBound(0.0, m_timeline->playheadPosition()
+            - clipTimelineStartSeconds(trackIdx, clipIdx), selected.effectiveDuration());
+        auto km = selected.keyframes;
+        const auto add = [&](const QString &name, double value) {
+            if (!km.hasTrack(name)) km.addTrack(KeyframeTrack(name, value));
+            km.track(name)->addKeyframe(localSec, value);
+        };
+        const ColorCorrection cc = m_colorGradingPanel->colorCorrection();
+        if (section == QStringLiteral("hsl")) {
+            for (const auto &field : clipanim::hslGradeTracks())
+                add(field.name, selected.hslSecondary.*(field.member));
+        } else if (section == QStringLiteral("warp")) {
+            for (const auto &field : clipanim::warpGradeTracks())
+                add(field.name, field.shift ? cc.hueSatWarp.hueShiftDeg[field.ring][field.hue]
+                                          : cc.hueSatWarp.satScale[field.ring][field.hue]);
+        } else {
+            for (const auto &field : clipanim::sectionGradeTracks(section == QStringLiteral("log")))
+                add(field.name, cc.*(field.member));
+        }
+        const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
+        auto clips = track->clips();
+        clips[clipIdx].keyframes = km;
+        track->setClips(clips);
+        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
+        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+        m_timeline->saveUndoState(QStringLiteral("グレードのキーフレーム追加"));
+        m_timeline->refreshPlaybackSequence();
+        pushAnimatedHslPreview(m_timeline->playheadPosition());
+    });
 
     connect(m_colorGradingPanel, &ColorGradingPanel::hueSatWarpChanged,
             this, [this, sameColorCorrection, dirty = false](const ColorCorrection &cc, bool finished) mutable {
@@ -19696,4 +19740,33 @@ void MainWindow::onNodeSelected(int id)
     if (!m_nodePropsPanel || !m_activeNodeGraph)
         return;
     m_nodePropsPanel->setSelection(m_activeNodeGraph, id);
+}
+
+// The same clip-local evaluator is used by gradeClipNativeFrame for export.
+void MainWindow::pushAnimatedHslPreview(double seconds)
+{
+    if (!m_timeline || !m_player || !m_player->isGLAccelerated()) return;
+    auto *gl = m_player->glPreview();
+    if (!gl || gl->compositeBakedMode() || !gl->effectsEnabled()) return;
+    const auto entries = m_timeline->computePlaybackSequence();
+    const ClipInfo *active = nullptr;
+    double localSec = 0.0;
+    for (const auto &entry : entries) {
+        if (seconds < entry.timelineStart || seconds >= entry.timelineEnd) continue;
+        const auto *track = m_timeline->videoTracks().value(entry.sourceTrack, nullptr);
+        if (!track || entry.sourceClipIndex < 0 || entry.sourceClipIndex >= track->clips().size()) continue;
+        active = &track->clips().at(entry.sourceClipIndex);
+        localSec = qMax(0.0, seconds - entry.timelineStart);
+        break;
+    }
+    const bool animated = active && clipanim::hasHslSecondaryKeyframes(*active);
+    // Restore static uniforms once on leaving an animated clip (including undo).
+    if (!animated && !m_animatedHslPreview) return;
+    const HslSecondaryGrade hsl = active
+        ? clipanim::effectiveHslSecondaryAt(*active, localSec) : HslSecondaryGrade{};
+    gl->setHslQualifier(hsl.enabled, hsl.hueCenter, hsl.hueRange,
+        hsl.satMin, hsl.satMax, hsl.lumaMin, hsl.lumaMax, hsl.softness,
+        hsl.liftR, hsl.liftG, hsl.liftB, hsl.gammaR, hsl.gammaG, hsl.gammaB,
+        hsl.gainR, hsl.gainG, hsl.gainB);
+    m_animatedHslPreview = animated;
 }

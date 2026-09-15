@@ -130,6 +130,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/color_warper_selftest.cpp
     src/selftests/GradeLogWheelSelftest.cpp
     src/selftests/GradeKeyframeSelftest.cpp
+    src/selftests/grade_keyframe_ext_selftest.cpp
     src/selftests/GradeWheelWiringSelftest.cpp
     src/selftests/MediaPoolDragSelftest.cpp
     src/selftests/TextSpacingSelftest.cpp

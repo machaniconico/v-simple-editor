@@ -553,6 +553,12 @@ ColorGradingPanel::ColorGradingPanel(QWidget *parent)
         addHslqRow(tr("G"), -100, 100, 0, QString(), m_hslqGainG, m_hslqGainGLabel);
         addHslqRow(tr("B"), -100, 100, 0, QString(), m_hslqGainB, m_hslqGainBLabel);
 
+        auto *keyframe = new QPushButton(tr("キーフレーム追加"), hslqGroup);
+        keyframe->setObjectName(QStringLiteral("hslGradeAddKeyframe"));
+        hslqLayout->addWidget(keyframe);
+        connect(keyframe, &QPushButton::clicked, this, [this] {
+            emit gradeKeyframeRequested(QStringLiteral("hsl"));
+        });
         mainLayout->addWidget(hslqGroup);
 
         // Wire every control to the single onHslQualifierChanged slot.
@@ -856,6 +862,13 @@ ColorGradingPanel::ColorGradingPanel(QWidget *parent)
     wheelsLayout->addWidget(m_liftWheel);
     wheelsLayout->addWidget(m_gammaWheel);
     wheelsLayout->addWidget(m_gainWheel);
+    auto *lggKeyframe = new QPushButton(tr("キーフレーム追加"), wheelsGroup);
+    lggKeyframe->setObjectName(QStringLiteral("lggGradeAddKeyframe"));
+    wheelsLayout->addWidget(lggKeyframe);
+    connect(lggKeyframe, &QPushButton::clicked, this, [this] {
+        m_wheelDebounce->stop();
+        emit gradeKeyframeRequested(QStringLiteral("lgg"));
+    });
     mainLayout->addWidget(wheelsGroup);
 
     connect(m_liftWheel, &ColorWheelWidget::colorChanged,
@@ -880,6 +893,13 @@ ColorGradingPanel::ColorGradingPanel(QWidget *parent)
     logWheelsLayout->addWidget(m_logShadowWheel);
     logWheelsLayout->addWidget(m_logMidWheel);
     logWheelsLayout->addWidget(m_logHighWheel);
+    auto *logKeyframe = new QPushButton(tr("キーフレーム追加"), logWheelsGroup);
+    logKeyframe->setObjectName(QStringLiteral("logGradeAddKeyframe"));
+    logWheelsLayout->addWidget(logKeyframe);
+    connect(logKeyframe, &QPushButton::clicked, this, [this] {
+        m_wheelDebounce->stop();
+        emit gradeKeyframeRequested(QStringLiteral("log"));
+    });
     mainLayout->addWidget(logWheelsGroup);
 
     connect(m_logShadowWheel, &ColorWheelWidget::colorChanged,
@@ -894,6 +914,13 @@ ColorGradingPanel::ColorGradingPanel(QWidget *parent)
     m_hueSatWarp = new HueSatWarpWidget(warpGroup);
     m_hueSatWarp->setObjectName(QStringLiteral("hueSatWarpWidget"));
     warpLayout->addWidget(m_hueSatWarp);
+    auto *warpKeyframe = new QPushButton(tr("キーフレーム追加"), warpGroup);
+    warpKeyframe->setObjectName(QStringLiteral("warpGradeAddKeyframe"));
+    warpLayout->addWidget(warpKeyframe);
+    connect(warpKeyframe, &QPushButton::clicked, this, [this] {
+        m_wheelDebounce->stop();
+        emit gradeKeyframeRequested(QStringLiteral("warp"));
+    });
     mainLayout->addWidget(warpGroup);
     connect(m_hueSatWarp, &HueSatWarpWidget::valueChanged, this, [this]() {
         if (m_updating) return;

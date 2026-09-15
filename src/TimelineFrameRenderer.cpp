@@ -659,7 +659,9 @@ QImage gradeClipNativeFrame(const QImage &native,
     const ColorCorrection effectiveColor =
         clipanim::effectiveColorCorrectionAt(clip, clipLocalSeconds);
     const bool hasColor = !effectiveColor.isDefault();
-    const bool hasHsl = clip.hslSecondary.isActive();
+    const HslSecondaryGrade effectiveHsl =
+        clipanim::effectiveHslSecondaryAt(clip, clipLocalSeconds);
+    const bool hasHsl = effectiveHsl.isActive();
     const bool hasCurves = clip.colorCurves.hasCurves();
     const bool hasLut   = clip.hasLut();
     if (!hasHsl && !hasColor && !hasCurves && !hasLut)
@@ -669,7 +671,7 @@ QImage gradeClipNativeFrame(const QImage &native,
     // block. Runs before the primary grade, matching the preview order.
     QImage img = native;
     if (hasHsl)
-        img = VideoEffectProcessor::applyHslSecondary(img, clip.hslSecondary);
+        img = VideoEffectProcessor::applyHslSecondary(img, effectiveHsl);
 
     // Stage 2 — colour correction via the genuine CPU SSOT (the very function
     // the task names as the comparator). isDefault() short-circuits inside

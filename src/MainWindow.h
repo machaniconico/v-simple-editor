@@ -663,6 +663,8 @@ protected:
     void showEvent(QShowEvent *event) override;
 
 private:
+    void pushAnimatedHslPreview(double seconds);
+    bool m_animatedHslPreview = false;
     void setupMenuBar();
     // Beginner-friendly Japanese hover help for menu items. Iterates
     // m_menuHelpEntries and either sets each QAction's tooltip to its

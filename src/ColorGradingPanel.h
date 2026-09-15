@@ -66,6 +66,7 @@ public:
     void curvesFromJson(const QJsonObject &obj, int curWidth, int curHeight);
 
 signals:
+    void gradeKeyframeRequested(const QString &section);
     void hueSatWarpChanged(const ColorCorrection &cc, bool finished);
     void colorCorrectionChanged(const ColorCorrection &cc);
     void colorWheelsChanged(const ColorWheels &cw);

@@ -104,6 +104,7 @@ int runFreezeFrameSelftest();
 int runFrameIoSelftest();
 int runFxGrainEchoSelftest();
 int runGradeKeyframeSelftest();
+int runGradeKeyframeExtSelftest();
 int runColorWarperSelftest();
 int runGradeLogWheelSelftest();
 int runGradeWheelWiringSelftest();
@@ -723,6 +724,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Text letter/line spacing: default byte-identical, spacing widens render, toJson/fromJson roundtrip" },
     { "grade-wheel-wiring", "VEDITOR_GRADE_WHEEL_WIRING_SELFTEST", runGradeWheelWiringSelftest, true,
       "LGG wheels + WB -> per-clip ColorCorrection wiring: value mapping, restore, render reflection" },
+    { "grade-keyframe-ext", "VEDITOR_GRADE_KEYFRAME_EXT_SELFTEST", runGradeKeyframeExtSelftest, false,
+      "HSL secondary and color warper keyframes: interpolation, static identity, and project roundtrip" },
     { "grade-keyframe", "VEDITOR_GRADE_KEYFRAME_SELFTEST", runGradeKeyframeSelftest, true,
       "ColorCorrection grade.* keyframes: render evaluation, byte identity, undo, and roundtrip" },
     { "graph-editor", "VEDITOR_GRAPH_EDITOR_SELFTEST", runGraphEditorSelftest, true,

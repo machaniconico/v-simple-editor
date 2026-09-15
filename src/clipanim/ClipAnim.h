@@ -45,4 +45,18 @@ QVector<VideoEffect> effectiveEffectsAt(const ClipInfo& clip,
 ColorCorrection effectiveColorCorrectionAt(const ClipInfo& clip,
                                            double clipLocalSeconds);
 
+// Shared descriptors keep evaluation, section insertion and persistence names aligned.
+struct HslGradeTrack { QString name; double HslSecondaryGrade::*member; };
+struct PrimaryGradeTrack { QString name; double ColorCorrection::*member; };
+struct WarpGradeTrack { QString name; int ring; int hue; bool shift; };
+const QVector<HslGradeTrack>& hslGradeTracks();
+const QVector<PrimaryGradeTrack>& sectionGradeTracks(bool log);
+const QVector<WarpGradeTrack>& warpGradeTracks();
+// Acceptance instrumentation: bypass only the newly added evaluation branches.
+void setExtendedGradeDisabledForTest(bool disabled);
+void resetExtendedGradeCallCountForTest();
+int extendedGradeCallCountForTest();
+bool hasHslSecondaryKeyframes(const ClipInfo& clip);
+HslSecondaryGrade effectiveHslSecondaryAt(const ClipInfo& clip, double localSec);
+
 } // namespace clipanim

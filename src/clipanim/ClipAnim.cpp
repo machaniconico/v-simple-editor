@@ -8,6 +8,7 @@
 #include <QColor>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 
 namespace clipanim {
@@ -39,6 +40,9 @@ const QString kGradeGammaBTrack = QStringLiteral("grade.gammaB");
 const QString kGradeGainRTrack = QStringLiteral("grade.gainR");
 const QString kGradeGainGTrack = QStringLiteral("grade.gainG");
 const QString kGradeGainBTrack = QStringLiteral("grade.gainB");
+
+std::atomic<bool> extendedGradeDisabled{false};
+std::atomic<int> extendedGradeCalls{0};
 
 constexpr double kKeyTimeEpsilon = 1e-6;
 constexpr double kColorChannelMin = 0.0;
@@ -105,20 +109,11 @@ bool hasAnyEffectKeyframes(const ClipInfo& clip)
 
 bool hasAnyGradeKeyframes(const ClipInfo& clip)
 {
-    return trackHasKeyframes(clip.keyframes, kGradeBrightnessTrack)
-        || trackHasKeyframes(clip.keyframes, kGradeContrastTrack)
-        || trackHasKeyframes(clip.keyframes, kGradeSaturationTrack)
-        || trackHasKeyframes(clip.keyframes, kGradeExposureTrack)
-        || trackHasKeyframes(clip.keyframes, kGradeTemperatureTrack)
-        || trackHasKeyframes(clip.keyframes, kGradeLiftRTrack)
-        || trackHasKeyframes(clip.keyframes, kGradeLiftGTrack)
-        || trackHasKeyframes(clip.keyframes, kGradeLiftBTrack)
-        || trackHasKeyframes(clip.keyframes, kGradeGammaRTrack)
-        || trackHasKeyframes(clip.keyframes, kGradeGammaGTrack)
-        || trackHasKeyframes(clip.keyframes, kGradeGammaBTrack)
-        || trackHasKeyframes(clip.keyframes, kGradeGainRTrack)
-        || trackHasKeyframes(clip.keyframes, kGradeGainGTrack)
-        || trackHasKeyframes(clip.keyframes, kGradeGainBTrack);
+    for (const KeyframeTrack &track : clip.keyframes.tracks()) {
+        if (track.propertyName().startsWith(QStringLiteral("grade.")) && track.count() > 0)
+            return true;
+    }
+    return false;
 }
 
 bool hasAnyEffectTiming(const ClipInfo& clip)
@@ -783,7 +778,108 @@ ColorCorrection effectiveColorCorrectionAt(const ClipInfo& clip,
                          clipLocalSeconds, cc.gainG);
     applyGradeTrackValue(clip, kGradeGainBTrack,
                          clipLocalSeconds, cc.gainB);
+    if (extendedGradeDisabled.load(std::memory_order_relaxed)) return cc;
+    for (const auto &track : sectionGradeTracks(true)) {
+        if (!trackHasKeyframes(clip.keyframes, track.name)) continue;
+        ++extendedGradeCalls;
+        applyGradeTrackValue(clip, track.name, clipLocalSeconds, cc.*(track.member));
+    }
+    for (const auto &track : warpGradeTracks()) {
+        if (!trackHasKeyframes(clip.keyframes, track.name)) continue;
+        ++extendedGradeCalls;
+        float &value = track.shift ? cc.hueSatWarp.hueShiftDeg[track.ring][track.hue]
+                                   : cc.hueSatWarp.satScale[track.ring][track.hue];
+        value = static_cast<float>(clip.keyframes.valueAt(track.name, clipLocalSeconds, value));
+    }
     return cc;
 }
+
+const QVector<HslGradeTrack>& hslGradeTracks()
+{
+    static const QVector<HslGradeTrack> tracks = {
+        {QStringLiteral("grade.hsl.hueCenter"), &HslSecondaryGrade::hueCenter},
+        {QStringLiteral("grade.hsl.hueRange"), &HslSecondaryGrade::hueRange},
+        {QStringLiteral("grade.hsl.satMin"), &HslSecondaryGrade::satMin},
+        {QStringLiteral("grade.hsl.satMax"), &HslSecondaryGrade::satMax},
+        {QStringLiteral("grade.hsl.lumaMin"), &HslSecondaryGrade::lumaMin},
+        {QStringLiteral("grade.hsl.lumaMax"), &HslSecondaryGrade::lumaMax},
+        {QStringLiteral("grade.hsl.softness"), &HslSecondaryGrade::softness},
+        {QStringLiteral("grade.hsl.liftR"), &HslSecondaryGrade::liftR},
+        {QStringLiteral("grade.hsl.liftG"), &HslSecondaryGrade::liftG},
+        {QStringLiteral("grade.hsl.liftB"), &HslSecondaryGrade::liftB},
+        {QStringLiteral("grade.hsl.gammaR"), &HslSecondaryGrade::gammaR},
+        {QStringLiteral("grade.hsl.gammaG"), &HslSecondaryGrade::gammaG},
+        {QStringLiteral("grade.hsl.gammaB"), &HslSecondaryGrade::gammaB},
+        {QStringLiteral("grade.hsl.gainR"), &HslSecondaryGrade::gainR},
+        {QStringLiteral("grade.hsl.gainG"), &HslSecondaryGrade::gainG},
+        {QStringLiteral("grade.hsl.gainB"), &HslSecondaryGrade::gainB},
+    };
+    return tracks;
+}
+
+const QVector<PrimaryGradeTrack>& sectionGradeTracks(bool log)
+{
+    static const QVector<PrimaryGradeTrack> lgg = {
+        {QStringLiteral("grade.liftR"), &ColorCorrection::liftR},
+        {QStringLiteral("grade.liftG"), &ColorCorrection::liftG},
+        {QStringLiteral("grade.liftB"), &ColorCorrection::liftB},
+        {QStringLiteral("grade.gammaR"), &ColorCorrection::gammaR},
+        {QStringLiteral("grade.gammaG"), &ColorCorrection::gammaG},
+        {QStringLiteral("grade.gammaB"), &ColorCorrection::gammaB},
+        {QStringLiteral("grade.gainR"), &ColorCorrection::gainR},
+        {QStringLiteral("grade.gainG"), &ColorCorrection::gainG},
+        {QStringLiteral("grade.gainB"), &ColorCorrection::gainB},
+    };
+    static const QVector<PrimaryGradeTrack> logs = {
+        {QStringLiteral("grade.logShadowR"), &ColorCorrection::logShadowR},
+        {QStringLiteral("grade.logShadowG"), &ColorCorrection::logShadowG},
+        {QStringLiteral("grade.logShadowB"), &ColorCorrection::logShadowB},
+        {QStringLiteral("grade.logMidR"), &ColorCorrection::logMidR},
+        {QStringLiteral("grade.logMidG"), &ColorCorrection::logMidG},
+        {QStringLiteral("grade.logMidB"), &ColorCorrection::logMidB},
+        {QStringLiteral("grade.logHighR"), &ColorCorrection::logHighR},
+        {QStringLiteral("grade.logHighG"), &ColorCorrection::logHighG},
+        {QStringLiteral("grade.logHighB"), &ColorCorrection::logHighB},
+    };
+    return log ? logs : lgg;
+}
+
+const QVector<WarpGradeTrack>& warpGradeTracks()
+{
+    static const QVector<WarpGradeTrack> tracks = [] {
+        QVector<WarpGradeTrack> result;
+        for (int ring = 0; ring < HueSatWarp::kSatRings; ++ring)
+            for (int hue = 0; hue < HueSatWarp::kHueNodes; ++hue)
+                for (bool shift : {true, false})
+                    result.append({QStringLiteral("grade.hueSatWarp.%1.%2.%3")
+                        .arg(shift ? QStringLiteral("shift") : QStringLiteral("scale"))
+                        .arg(ring).arg(hue), ring, hue, shift});
+        return result;
+    }();
+    return tracks;
+}
+
+bool hasHslSecondaryKeyframes(const ClipInfo& clip)
+{
+    for (const auto &track : clip.keyframes.tracks())
+        if (track.propertyName().startsWith(QStringLiteral("grade.hsl.")) && track.count() > 0)
+            return true;
+    return false;
+}
+
+HslSecondaryGrade effectiveHslSecondaryAt(const ClipInfo& clip, double localSec)
+{
+    HslSecondaryGrade hsl = clip.hslSecondary;
+    if (extendedGradeDisabled.load(std::memory_order_relaxed)
+        || !hasHslSecondaryKeyframes(clip)) return hsl;
+    ++extendedGradeCalls;
+    for (const auto &track : hslGradeTracks())
+        applyGradeTrackValue(clip, track.name, localSec, hsl.*(track.member));
+    return hsl;
+}
+
+void setExtendedGradeDisabledForTest(bool disabled) { extendedGradeDisabled.store(disabled); }
+void resetExtendedGradeCallCountForTest() { extendedGradeCalls.store(0); }
+int extendedGradeCallCountForTest() { return extendedGradeCalls.load(); }
 
 } // namespace clipanim
