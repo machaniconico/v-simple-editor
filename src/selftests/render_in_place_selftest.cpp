@@ -389,8 +389,10 @@ int runRenderInPlaceSelftest()
             QVector<QVector<ClipInfo>>{}, 0, -1, -1, 10);
         expected.restoreFromProject(QVector<QVector<ClipInfo>>{{expectedUpper}, {lower}},
             QVector<QVector<ClipInfo>>{}, 0, -1, -1, 10);
-        backgroundOnly.restoreFromProject(QVector<QVector<ClipInfo>>{{}, {lower}},
+        backgroundOnly.restoreFromProject(QVector<QVector<ClipInfo>>{{upper}, {lower}},
             QVector<QVector<ClipInfo>>{}, 0, -1, -1, 10);
+        // Preserve the background's V2 placement; hidden V1 supplies a transparent base.
+        backgroundOnly.videoTracks()[0]->setHidden(true);
         const QSize canvas = animated ? QSize(360, 640) : options.outputSize;
         QVector<QImage> beforeComposite;
         for (qint64 tick : {100000LL, 500000LL, 900000LL})
