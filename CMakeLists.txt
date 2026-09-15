@@ -125,6 +125,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/Light3DSelftest.cpp
     src/selftests/camera3d_selftest.cpp
     src/selftests/camera_solve_selftest.cpp
+    src/selftests/feature_tracker_selftest.cpp
     src/selftests/VoiceIsolationSelftest.cpp
     src/selftests/noise_print_selftest.cpp
     src/selftests/GradeLggSerializationSelftest.cpp
@@ -604,6 +605,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/DecoderSlotManager.cpp
     src/AudioMixer.cpp
     src/PlanarTracker.cpp
+    src/FeatureTracker.cpp
+    src/FeatureTracker.h
     src/PlanarTracker.h
     src/PlanarTrackerDialog.cpp
     src/PlanarTrackerDialog.h

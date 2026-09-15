@@ -57,6 +57,7 @@ int runObjectRemovalSelftest();
 int runLight3DSelftest();
 int runCamera3DSelftest();
 int runCameraSolveSelftest();
+int runFeatureTrackerSelftest();
 int runVoiceIsolationSelftest();
 int runNoisePrintSelftest();
 int runBatchExportSelftest();
@@ -600,6 +601,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "AutoMatte: difference matte, morphology, feather, composite" },
     { "object-removal",    "VEDITOR_OBJECT_REMOVAL_SELFTEST",     runObjectRemovalSelftest,      false,
       "ObjectRemoval: temporal trust, background alignment, bounds, dilation, cache, composite (14 gates)" },
+    { "feature-tracker", "VEDITOR_FEATURE_TRACKER_SELFTEST", runFeatureTrackerSelftest, false,
+      "Shi-Tomasi 特徴点検出とピラミッド LK 多点追跡 (G1-G6)" },
     { "camera-solve",      "VEDITOR_CAMERA_SOLVE_SELFTEST",       runCameraSolveSelftest,        true,
       "Planar camera solver: SVD, continuity, confidence, camera keyframes and single-slot undo (8 gates)" },
     { "camera3d",           "VEDITOR_CAMERA3D_SELFTEST",           runCamera3DSelftest,           true,
