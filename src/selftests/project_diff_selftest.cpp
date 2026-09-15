@@ -109,6 +109,7 @@ int runProjectDiffSelftest()
     small.leadInSec += 0.0001;
     small.volume += 0.0001;
     small.pan += 0.0001;
+    small.material.diffuseCoeff += 0.0001;
     small.colorCorrection.brightness += 0.0001;
     small.colorCorrection.liftR += 0.0001;
     small.hslSecondary.hueCenter += 0.0001;
@@ -121,10 +122,16 @@ int runProjectDiffSelftest()
     const bool epsilonBoundary = diff(b, c, 0.125).isEmpty()
         && !diff(b, c, 0.124).isEmpty();
     c = b;
+    c.videoTracks[0][0].material.diffuseCoeff = 0.9;
+    const auto materialChanges = diff(b, c);
+    const bool materialChanged = materialChanges.size() == 1
+        && materialChanges[0].type == Change::PropertyChanged
+        && materialChanges[0].path.endsWith(QStringLiteral(".layerMaterial"));
+    c = b;
     c.audioTracks[0][0].volume = 0.5;
     c.trackFlags = {{"audio", QJsonArray{QJsonObject{{"muted", true}}}}};
     const auto properties = diff(b, c);
-    gate(7, epsilonIgnored && epsilonBoundary && properties.size() == 2
+    gate(7, epsilonIgnored && epsilonBoundary && materialChanged && properties.size() == 2
          && count(properties, Change::PropertyChanged) == 1
          && count(properties, Change::TrackFlagChanged) == 1
          && properties[0].path == QStringLiteral("audio[0].clips[0].volume"));

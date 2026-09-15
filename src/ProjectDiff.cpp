@@ -129,7 +129,14 @@ QJsonObject projection(const ProjectData &data)
                 obj.insert("vfxIntensity", clip.vfxIntensity);
                 obj.insert("vfxBlackLevel", clip.vfxBlackLevel);
                 obj.insert("visible", clip.visible);
-                obj.insert("layerMaterial", clip.material.toJson());
+                const auto &material = clip.material;
+                obj.insert("layerMaterial", QJsonObject{
+                    {"acceptsLights", material.acceptsLights},
+                    {"ambientCoeff", material.ambientCoeff},
+                    {"diffuseCoeff", material.diffuseCoeff},
+                    {"specularCoeff", material.specularCoeff},
+                    {"shininess", material.shininess}
+                });
                 obj.insert("layerStyle", clip.layerStyle.toJson());
                 obj.insert("colorMeta", clipcolor::toJson(clip.colorMeta));
                 obj.insert("speedRamp", clip.speedRamp.toJson());
