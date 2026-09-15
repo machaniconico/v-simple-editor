@@ -61,7 +61,7 @@ int runNoisePrintSelftest() {
     std::vector<double> bypass;
     gate(3, noiseprint::subtract(mixed, bypass, print, 0, -20, rate, &error)
             && maxError(mixed, bypass) <= 1e-4);
-    // L has noise; R carries a clean tone. Deinterleave as the UI does,
+    // L has noise; R carries a clean tone. Deinterleave for independent API calls,
     // and also check digital silence for channel leakage.
     std::vector<double> stereo(mixed.size() * 2), left(mixed.size()), right(mixed.size());
     for (size_t i = 0; i < mixed.size(); ++i) { stereo[2 * i] = mixed[i]; stereo[2 * i + 1] = tone[i]; }

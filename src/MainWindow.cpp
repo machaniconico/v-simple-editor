@@ -16600,7 +16600,6 @@ void MainWindow::openAudioRestoreDialog()
 #endif
 }
 
-#ifdef HAVE_SPECTRAL_EDIT_DIALOG
 namespace {
 
 // 16bit PCM WAV (RIFF/fmt/data) を読み込み mono の double サンプル列へ展開する。
@@ -16761,7 +16760,6 @@ bool readPcm16WavToMono(const QString &wavPath,
 }
 
 } // namespace
-#endif // HAVE_SPECTRAL_EDIT_DIALOG
 
 void MainWindow::openVoiceIsolationDialog()
 {
@@ -19874,72 +19872,53 @@ void MainWindow::processNoisePrint(TimelineTrack *track, int clipIndex, bool cap
     }
     // Decode the entire source, preserving the source-time origin used by
     // trimmed/reversed clips. Never replace it with just the selected range.
-    // Two interleaved channels are retained throughout; there is no mono fold.
-    const QString ffmpeg = findFfmpegBinary();
+    // Use the same in-process mono extraction as voice isolation.
     QTemporaryDir temp;
-    if (ffmpeg.isEmpty() || !temp.isValid()) {
-        report(QStringLiteral("音声の抽出に必要な ffmpeg または一時フォルダーを利用できません。"));
+    if (!temp.isValid()) {
+        report(QStringLiteral("音声抽出用の一時ディレクトリを作成できません。"));
         return;
     }
-    constexpr int sampleRate = 48000;
-    const QString rawPath = temp.filePath(QStringLiteral("noiseprint.pcm"));
-    QProcess decoder;
-    decoder.start(ffmpeg, {QStringLiteral("-v"), QStringLiteral("error"),
-        QStringLiteral("-nostdin"), QStringLiteral("-i"), clip.filePath,
-        QStringLiteral("-map"), QStringLiteral("0:a:0"), QStringLiteral("-vn"),
-        QStringLiteral("-ac"), QStringLiteral("2"), QStringLiteral("-ar"), QString::number(sampleRate),
-        QStringLiteral("-f"), QStringLiteral("s16le"), rawPath});
-    if (!decoder.waitForStarted(5000) || !decoder.waitForFinished(-1)
-        || decoder.exitStatus() != QProcess::NormalExit || decoder.exitCode() != 0) {
-        report(QStringLiteral("音声の抽出に失敗しました:\n%1")
-                   .arg(QString::fromUtf8(decoder.readAllStandardError())));
-        return;
-    }
-    QFile raw(rawPath);
-    if (!raw.open(QIODevice::ReadOnly) || raw.size() <= 0 || raw.size() % 4 != 0
-        || raw.size() > 256 * 1024 * 1024) {
-        report(QStringLiteral("音声を読み込めません。長い音声の場合は短くして再試行してください。"));
-        return;
-    }
-    QByteArray pcm = raw.readAll();
-    if (pcm.size() != raw.size()) { report(QStringLiteral("音声の読み込みが完了しませんでした。")); return; }
-    const size_t count = static_cast<size_t>(pcm.size() / 4);
-    noiseprint::NoisePrint captured;
+    constexpr int kSampleRate = 48000;
+    const QString sourceWav = temp.filePath(QStringLiteral("noiseprint-source.wav"));
     QString error;
-    for (int channel = 0; channel < 2; ++channel) {
-        std::vector<double> input(count), output;
-        for (size_t i = 0; i < count; ++i) {
-            const auto offset = static_cast<qsizetype>(i * 4 + channel * 2);
-            const quint16 bits = static_cast<unsigned char>(pcm[offset])
-                | (static_cast<quint16>(static_cast<unsigned char>(pcm[offset + 1])) << 8);
-            input[i] = static_cast<qint16>(bits) / 32768.0;
-        }
-        if (captureOnly) {
-            auto print = noiseprint::capture(input, sampleRate, start, end);
-            if (!print.isValid()) {
-                report(QStringLiteral("取得範囲には少なくとも 2048 サンプルの音声が必要です。"));
-                return;
-            }
-            if (channel == 0) captured = print;
-            else for (size_t k = 0; k < print.magnitude.size(); ++k)
-                captured.magnitude[k] = std::sqrt((captured.magnitude[k] * captured.magnitude[k]
-                                                   + print.magnitude[k] * print.magnitude[k]) / 2.0);
-        } else {
-            if (!noiseprint::subtract(input, output, m_noisePrint, amount, floor, sampleRate, &error)) {
-                report(error); return;
-            }
-            for (size_t i = 0; i < count; ++i) {
-                const qint16 value = static_cast<qint16>(std::lround(std::clamp(output[i], -1.0, 1.0) * 32767.0));
-                const auto offset = static_cast<qsizetype>(i * 4 + channel * 2);
-                pcm[offset] = static_cast<char>(value & 0xff);
-                pcm[offset + 1] = static_cast<char>((value >> 8) & 0xff);
-            }
-        }
+    if (!libavcore::extractAudioToWav(clip.filePath, sourceWav, kSampleRate, &error)) {
+        report(QStringLiteral("音声の抽出に失敗しました:\n%1")
+                   .arg(error.isEmpty() ? clip.filePath : error));
+        return;
+    }
+    std::vector<double> input;
+    int sampleRate = kSampleRate;
+    if (!readPcm16WavToMono(sourceWav, input, sampleRate, &error) || input.empty()) {
+        report(QStringLiteral("抽出した音声を読み込めませんでした:\n%1")
+                   .arg(error.isEmpty() ? QStringLiteral("サンプルがありません") : error));
+        return;
     }
     if (captureOnly) {
+        auto captured = noiseprint::capture(input, sampleRate, start, end);
+        if (!captured.isValid()) {
+            report(QStringLiteral("取得範囲には少なくとも 2048 サンプルの音声が必要です。"));
+            return;
+        }
         m_noisePrint = std::move(captured);
         statusBar()->showMessage(QStringLiteral("ノイズプリントを取得しました。"), 5000);
         return;
+    }
+    std::vector<double> output;
+    if (!noiseprint::subtract(input, output, m_noisePrint, amount, floor, sampleRate, &error)) {
+        report(error); return;
+    }
+    if (output.size() > static_cast<size_t>(std::numeric_limits<int>::max() / 2)) {
+        report(QStringLiteral("処理結果が大きすぎます。"));
+        return;
+    }
+    QByteArray pcm;
+    pcm.resize(static_cast<int>(output.size()) * 2);
+    for (size_t i = 0; i < output.size(); ++i) {
+        const double sample = std::isfinite(output[i]) ? output[i] : 0.0;
+        const qint16 value = static_cast<qint16>(std::lround(std::clamp(sample, -1.0, 1.0) * 32767.0));
+        const auto offset = static_cast<qsizetype>(i * 2);
+        pcm[offset] = static_cast<char>(value & 0xff);
+        pcm[offset + 1] = static_cast<char>((value >> 8) & 0xff);
     }
     const QFileInfo source(clip.filePath);
     const QString outputPath = QFileDialog::getSaveFileName(this, QStringLiteral("除去済み音声を保存"),
@@ -19960,7 +19939,7 @@ void MainWindow::processNoisePrint(TimelineTrack *track, int clipIndex, bool cap
     if (!targetUnchanged()) {
         report(QStringLiteral("処理中に対象クリップが変更されました。もう一度実行してください。")); return;
     }
-    if (!libavcore::writePcm16AsWav(outputPath, pcm, sampleRate, 2, &error)) { report(error); return; }
+    if (!libavcore::writePcm16AsWav(outputPath, pcm, sampleRate, /*channels=*/1, &error)) { report(error); return; }
     if (!m_timeline->replaceAudioClipMedia(m_timeline->audioTracks().indexOf(track), clipIndex, outputPath)) {
         report(QStringLiteral("クリップの音源を差し替えられませんでした。")); return;
     }
