@@ -7,6 +7,8 @@
 class Timeline;
 class RenderQueue;
 namespace renderinplace {
+// Uses the same audio filter/mix implementation as normal export.
+QString prepareAudioMix(Timeline *timeline, const QString &outputPath, QString *error);
 struct Options {
     QString codec = QStringLiteral("h264");
     double handlesSec = 0.0;

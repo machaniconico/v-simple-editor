@@ -1,4 +1,7 @@
 #include "../RenderInPlace.h"
+#include "../AudioMixer.h"
+#include <QDataStream>
+#include <QtEndian>
 #include "../RenderQueue.h"
 #include "../Timeline.h"
 #include "../TimelineFrameRenderer.h"
@@ -6,6 +9,7 @@
 #include "../UndoManager.h"
 #include "../libavcore/Probe.h"
 #include <QFileInfo>
+#include <QFile>
 #include <QDir>
 #include <QEventLoop>
 #include <QSet>
@@ -17,7 +21,113 @@
 #include <cmath>
 #include <limits>
 
+class MixerIODevice : public QIODevice {
+public:
+    explicit MixerIODevice(AudioMixer *mixer) : m_mixer(mixer) {}
+    ~MixerIODevice() override = default;
+
+    // QAudioSink in Qt 6 pull mode (start(QIODevice*)) checks
+    // bytesAvailable() before calling readData — if it returns 0 the
+    // sink transitions to IdleState and STOPS pulling. Our mixer
+    // generates data on demand from FFmpeg decoders + a silence
+    // fallback, so we always have data to give. Returning a large
+    // value here keeps the sink in ActiveState and the readData
+    // callback firing. Without this override, the sink went Active
+    // for ~8 ms after start() then went Idle and never called
+    // readData again — the actual root cause of "no audio plays" in
+    // Phase 2 sum-mix.
+    bool isSequential() const override { return true; }
+    // Advertise enough on-demand availability to keep Qt's pull-mode
+    // worker from declaring the device starved. Anything >= one sink
+    // period (~10–20 ms typical) keeps it Active; we use 1 s as a safety
+    // margin. Do NOT return INT64_MAX or similar — some Qt backends use
+    // bytesAvailable() to size an internal pre-buffer and a huge value
+    // freezes the audio worker for several seconds.
+    qint64 bytesAvailable() const override {
+        return AudioMixer::kSampleRateHz * AudioMixer::kBytesPerFrame;
+    }
+
+protected:
+    qint64 readData(char *data, qint64 maxlen) override;
+    qint64 writeData(const char *, qint64) override { return -1; }
+private:
+    AudioMixer *m_mixer;
+};
+
 namespace {
+bool writeTone(const QString &path, double hz)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::WriteOnly)) return false;
+    QDataStream out(&file);
+    out.setByteOrder(QDataStream::LittleEndian);
+    constexpr quint32 frames = 8 * 48000;
+    out.writeRawData("RIFF", 4);
+    out << quint32(36 + frames * 2);
+    out.writeRawData("WAVEfmt ", 8);
+    out << quint32(16) << quint16(1) << quint16(1) << quint32(48000)
+        << quint32(96000) << quint16(2) << quint16(16);
+    out.writeRawData("data", 4);
+    out << quint32(frames * 2);
+    for (quint32 i = 0; i < frames; ++i)
+        out << qint16(std::lround(8192.0 * std::sin(6.283185307179586 * hz * i / 48000.0)));
+    return out.status() == QDataStream::Ok && file.flush();
+}
+
+// Explicit-instantiation access is confined to this test: transport is set
+// without starting a hardware sink, and decoder refill uses the production
+// method under its own mutex. No layout casts or alternate mixing code.
+template<class Tag, typename Tag::Type Member>
+struct MixerTestAccess {
+    friend typename Tag::Type mixerMember(Tag) { return Member; }
+};
+struct PlayingMember {
+    using Type = std::atomic<bool> AudioMixer::*;
+    friend Type mixerMember(PlayingMember);
+};
+struct RefillMember {
+    using Type = bool (AudioMixer::*)();
+    friend Type mixerMember(RefillMember);
+};
+template struct MixerTestAccess<PlayingMember, &AudioMixer::m_playing>;
+template struct MixerTestAccess<RefillMember, &AudioMixer::refillRings>;
+
+double mixerWindowRms(const QVector<PlaybackEntry> &entries, double center)
+{
+    AudioMixer mixer;
+    mixer.setSequence(entries);
+    const qint64 startUs = qRound64((center - 0.05) * 1000000.0);
+    mixer.seekTo(startUs);
+    (mixer.*mixerMember(PlayingMember{})).store(true);
+    MixerIODevice io(&mixer);
+    io.open(QIODevice::ReadOnly | QIODevice::Unbuffered);
+    // refillRings budgets one pending seek per call; warm both decoders and
+    // fill their rings before sampling, independent of worker scheduling.
+    for (int pass = 0; pass < 16; ++pass)
+        (mixer.*mixerMember(RefillMember{}))();
+    // Exactly 100 ms, split into 10 ms reads to cross both clip boundaries
+    // with the same refill/accumulate path used by preview's audio sink.
+    double sumSquares = 0.0;
+    int sampleCount = 0;
+    for (int block = 0; block < 10; ++block) {
+        (mixer.*mixerMember(RefillMember{}))();
+        const QByteArray pcm = io.read(480 * AudioMixer::kBytesPerFrame);
+        if (pcm.size() != 480 * AudioMixer::kBytesPerFrame
+            || mixer.masterClockUs() != startUs + (block + 1) * 10000) {
+            mixer.stop();
+            return 0.0;
+        }
+        for (int i = 0; i < pcm.size(); i += 2) {
+            const double value = qFromLittleEndian<qint16>(
+                reinterpret_cast<const uchar *>(pcm.constData() + i)) / 32768.0;
+            sumSquares += value * value;
+            ++sampleCount;
+        }
+    }
+    mixer.stop();
+    return std::sqrt(sumSquares / sampleCount);
+}
+
 QJsonObject clipJson(const ClipInfo &clip)
 {
     ProjectData data;
@@ -359,7 +469,52 @@ int runRenderInPlaceSelftest()
                 && clipJson(overlap.videoTracks()[0]->clips()[1]) == clipJson(second);
         }
     }
-    gate(6, overlapRejected);
+    ClipInfo linkedVideo = original;
+    linkedVideo.linkGroup = 312;
+    ClipInfo linkedAudio = linkedVideo;
+    linkedAudio.filePath = output.filePath(QStringLiteral("linked-tone.wav"));
+    linkedAudio.effects.clear();
+    linkedAudio.duration = 8.0;
+    linkedAudio.volume = 0.65;
+    linkedAudio.pan = -0.2;
+    const bool toneReady = writeTone(linkedAudio.filePath, 440.0);
+    Timeline linkedTimeline;
+    linkedTimeline.restoreFromProject({{linkedVideo}}, {{linkedAudio}}, 0, -1, -1, 10);
+    linkedTimeline.undoManager()->clear();
+    linkedTimeline.saveUndoState(QStringLiteral("リンク音声初期状態"));
+    const quint64 linkedSerial = linkedTimeline.undoManager()->saveSerial();
+    const double rmsBefore = mixerWindowRms(linkedTimeline.computeAudioPlaybackSequence(), 0.5);
+    auto linkedOptions = options;
+    linkedOptions.handlesSec = 0.25;
+    QString linkedPath, linkedError;
+    const bool linkedBaked = toneReady && renderinplace::renderClipInPlace(
+        linkedTimeline, 0, 0, linkedOptions, &linkedPath, &linkedError);
+    const double rmsAfter = linkedBaked
+        ? mixerWindowRms(linkedTimeline.computeAudioPlaybackSequence(), 0.5) : 0.0;
+    const double deltaDb = rmsBefore > 0.0 && rmsAfter > 0.0
+        ? 20.0 * std::log10(rmsAfter / rmsBefore) : std::numeric_limits<double>::infinity();
+    bool linkedOk = linkedBaked && !videoOnly(linkedPath) && std::abs(deltaDb) <= 1.0
+        && linkedTimeline.undoManager()->saveSerial() == linkedSerial + 1
+        && linkedTimeline.audioTracks()[0]->clips()[0].filePath == linkedPath
+        && bool(linkedTimeline.audioTracks()[0]->clips()[0].renderInPlaceOriginal);
+    if (linkedBaked) {
+        linkedTimeline.undo();
+        linkedOk = linkedOk
+            && clipJson(linkedTimeline.videoTracks()[0]->clips()[0]) == clipJson(linkedVideo)
+            && clipJson(linkedTimeline.audioTracks()[0]->clips()[0]) == clipJson(linkedAudio);
+        linkedTimeline.redo();
+        const quint64 decomposeSerial = linkedTimeline.undoManager()->saveSerial();
+        linkedOk = renderinplace::decomposeRenderInPlace(linkedTimeline, 0, 0) && linkedOk;
+        linkedOk = linkedOk && linkedTimeline.undoManager()->saveSerial() == decomposeSerial + 1
+            && clipJson(linkedTimeline.videoTracks()[0]->clips()[0]) == clipJson(linkedVideo)
+            && clipJson(linkedTimeline.audioTracks()[0]->clips()[0]) == clipJson(linkedAudio);
+        linkedTimeline.undo();
+        linkedOk = linkedOk && linkedTimeline.videoTracks()[0]->clips()[0].filePath == linkedPath
+            && linkedTimeline.audioTracks()[0]->clips()[0].filePath == linkedPath;
+    }
+    std::fprintf(stderr, "G6 linked audio RMS before=%.6f after=%.6f delta=%.3f dB error=%s\n",
+        rmsBefore, rmsAfter, deltaDb, qPrintable(linkedError));
+    gate(6, overlapRejected && linkedOk);
 
     // Independent material control from G1, composited over the same untouched
     // lower track. This measures queue loss without encoding the background.

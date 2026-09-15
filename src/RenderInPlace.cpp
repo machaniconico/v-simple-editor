@@ -12,8 +12,10 @@
 #include <QRegularExpression>
 #include <QStandardPaths>
 #include <QTemporaryFile>
+#include <QTemporaryDir>
 #include <QUuid>
 #include <cmath>
+#include <algorithm>
 
 namespace renderinplace {
 namespace {
@@ -175,9 +177,55 @@ bool renderClipInPlace(Timeline &timeline, int trackIndex, int clipIndex,
             }
         }
     }
+    // A1 contains only linked audio, positioned relative to the baked video.
+    // Non-overlapping linked pieces can share the same rendered audio stream.
+    const auto startAt = [](const TimelineTrack *t, int index) {
+        double start = 0.0;
+        for (int i = 0; i <= index; ++i) {
+            start += t->clips()[i].leadInSec;
+            if (i < index) start += t->clips()[i].effectiveDuration();
+        }
+        return start;
+    };
+    const double videoStart = startAt(track, clipIndex);
+    double prefix = handles;
+    double suffix = handles;
+    QVector<ClipInfo> linked;
+    if (original.linkGroup != 0) {
+        for (const auto *audioTrack : timeline.audioTracks()) {
+            for (int i = 0; i < audioTrack->clipCount(); ++i) {
+                ClipInfo audio = audioTrack->clips()[i];
+                if (audio.linkGroup != original.linkGroup) continue;
+                if (audioTrack->isLocked())
+                    return fail(QStringLiteral("リンク音声トラックがロックされています"));
+                const double relative = startAt(audioTrack, i) - videoStart;
+                if (!std::isfinite(audio.effectiveDuration()) || audio.effectiveDuration() <= 0.0
+                    || !std::isfinite(relative))
+                    return fail(QStringLiteral("リンク音声の尺が不正です"));
+                prefix = qMax(prefix, -relative);
+                suffix = qMax(suffix, relative + audio.effectiveDuration() - length);
+                audio.leadInSec = relative;
+                audio.linkGroup = 0;
+                audio.renderInPlaceOriginal.reset();
+                linked.append(audio);
+            }
+        }
+    }
+    std::sort(linked.begin(), linked.end(), [](const ClipInfo &a, const ClipInfo &b) {
+        return a.leadInSec < b.leadInSec;
+    });
+    double audioEnd = 0.0;
+    for (auto &audio : linked) {
+        const double start = audio.leadInSec + prefix;
+        if (start < audioEnd - 1e-6)
+            return fail(QStringLiteral("重なったリンク音声は焼き込めません"));
+        audio.leadInSec = qMax(0.0, start - audioEnd);
+        audioEnd = start + audio.effectiveDuration();
+    }
+    isolated.leadInSec = prefix - handles;
     Timeline temporary;
     temporary.restoreFromProject(QVector<QVector<ClipInfo>>{{isolated}},
-                                 QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 10);
+                                 QVector<QVector<ClipInfo>>{linked}, 0.0, -1.0, -1.0, 10);
     temporary.setProjectOutputConfig(outputSize.width(), outputSize.height(), true);
 
     QString directory = options.outputDir;
@@ -201,7 +249,7 @@ bool renderClipInPlace(Timeline &timeline, int trackIndex, int clipIndex,
     RenderPreset preset{QStringLiteral("クリップ焼き込み"), outputSize.width(),
         outputSize.height(), options.codec, 100000000, extension.mid(1)};
     RenderJob job = RenderQueue::jobFromPreset(preset, path, 0,
-        qRound64((length + 2.0 * handles) * 1000000.0));
+        qRound64((length + prefix + suffix) * 1000000.0));
     job.uuid = QUuid::createUuid().toString(QUuid::WithoutBraces);
     job.timeline = &temporary;
     // RenderQueue falls back to V1 audio when projectFilePath is empty.
@@ -216,6 +264,19 @@ bool renderClipInPlace(Timeline &timeline, int trackIndex, int clipIndex,
     if (!silentFrame.save(silentInput.fileName(), "PNG"))
         return fail(QStringLiteral("音声なしの入力を準備できません"));
     job.projectFilePath = silentInput.fileName();
+    // .veditor is not an audio-mix trigger in RenderQueue: it falls back to
+    // V1 media. Prepare the normal export mix and mux it in this same job.
+    QTemporaryDir mixDirectory;
+    if (!linked.isEmpty()) {
+        if (!mixDirectory.isValid())
+            return fail(QStringLiteral("リンク音声の一時フォルダーを作成できません"));
+        QString mixError;
+        const QString mixPath = prepareAudioMix(&temporary,
+            mixDirectory.filePath(QStringLiteral("linked-audio.m4a")), &mixError);
+        if (mixPath.isEmpty() || !mixError.isEmpty())
+            return fail(mixError.isEmpty() ? QStringLiteral("リンク音声を準備できません") : mixError);
+        job.projectFilePath = mixPath;
+    }
     job.exportConfig["fps"] = options.fps;
     job.exportConfig["proresProfile"] = 3;
     RenderQueue queue;
@@ -265,8 +326,8 @@ bool renderClipInPlace(Timeline &timeline, int trackIndex, int clipIndex,
     replacement.filePath = path;
     replacement.displayName = original.displayName;
     replacement.duration = double(*duration) / 1000000.0;
-    replacement.inPoint = handles;
-    replacement.outPoint = handles + length;
+    replacement.inPoint = prefix;
+    replacement.outPoint = prefix + length;
     replacement.leadInSec = original.leadInSec;
     replacement.linkGroup = original.linkGroup;
     replacement.label = original.label;

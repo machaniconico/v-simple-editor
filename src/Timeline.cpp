@@ -5614,10 +5614,51 @@ bool Timeline::replaceRenderedClip(int trackIndex, int clipIndex,
     TimelineTrack *track = trackAt(false, trackIndex);
     if (!track || track->isLocked() || clipIndex < 0 || clipIndex >= track->clipCount())
         return false;
+    const ClipInfo previous = track->clips()[clipIndex];
+    const bool decomposing = previous.renderInPlaceOriginal
+        && previous.renderInPlaceOriginal.get() == &clip;
+    const auto startAt = [](const TimelineTrack *t, int index) {
+        double start = 0.0;
+        for (int i = 0; i <= index; ++i) {
+            start += t->clips()[i].leadInSec;
+            if (i < index) start += t->clips()[i].effectiveDuration();
+        }
+        return start;
+    };
+    const double videoStart = startAt(track, clipIndex);
+    QVector<QVector<ClipInfo>> audioReplacements;
+    for (const auto *audioTrack : m_audioTracks) {
+        auto audioClips = audioTrack->clips();
+        for (int i = 0; i < audioClips.size(); ++i) {
+            const ClipInfo original = audioClips[i];
+            if (previous.linkGroup == 0 || original.linkGroup != previous.linkGroup) continue;
+            if (audioTrack->isLocked()) return false;
+            if (decomposing) {
+                if (!original.renderInPlaceOriginal || original.filePath != previous.filePath)
+                    return false;
+                audioClips[i] = *original.renderInPlaceOriginal;
+            } else {
+                ClipInfo baked{};
+                baked.filePath = clip.filePath;
+                baked.displayName = original.displayName;
+                baked.duration = clip.duration;
+                baked.inPoint = clip.inPoint + startAt(audioTrack, i) - videoStart;
+                baked.outPoint = baked.inPoint + original.effectiveDuration();
+                baked.leadInSec = original.leadInSec;
+                baked.linkGroup = original.linkGroup;
+                baked.label = original.label;
+                baked.renderInPlaceOriginal = std::make_shared<ClipInfo>(original);
+                audioClips[i] = baked;
+            }
+        }
+        audioReplacements.append(audioClips);
+    }
     TrackClipSnapshot before = snapshotTrackClips(this);
     auto clips = track->clips();
     clips[clipIndex] = clip;
     track->setClips(clips);
+    for (int i = 0; i < m_audioTracks.size(); ++i)
+        m_audioTracks[i]->setClips(audioReplacements[i]);
     // Replacement preserves the position; update its identity before remap
     // (the same convention as replaceClipMedia).
     before[trackIndex][clipIndex] = {clip.filePath, clip.linkGroup, clip.inPoint};

@@ -10,6 +10,7 @@
 #include "../ProjectDiff.h"
 #include "../ProjectFile.h"
 #include "../RenderQueue.h"
+#include "../RenderInPlace.h"
 #include "../TimelineFrameRenderer.h"
 #include "../Timeline.h"
 #include "../TrimOps.h"
@@ -906,7 +907,16 @@ QJsonObject clipToJson(const ClipInfo& clip, int clipIndex, double startSec,
 {
     const double outPoint = clip.outPoint > 0.0 ? clip.outPoint : clip.duration;
     const double durationSec = clip.speed > 0.0 ? clip.effectiveDuration() : 0.0;
+    QJsonArray effects;
+    for (const auto &effect : clip.effects) {
+        effects.append(QJsonObject{{QStringLiteral("type"), static_cast<int>(effect.type)},
+            {QStringLiteral("enabled"), effect.enabled}, {QStringLiteral("param1"), effect.param1},
+            {QStringLiteral("param2"), effect.param2}, {QStringLiteral("param3"), effect.param3},
+            {QStringLiteral("keyColor"), effect.keyColor.name()},
+            {QStringLiteral("startSec"), effect.startSec}, {QStringLiteral("endSec"), effect.endSec}});
+    }
     return QJsonObject{
+        {QStringLiteral("effects"), effects},
         {QStringLiteral("index"), clipIndex},
         {QStringLiteral("displayName"), clip.displayName},
         {QStringLiteral("filePath"), clip.filePath},
@@ -3663,6 +3673,76 @@ void McpEditorTools::registerWriteTools()
             };
         })
     }, trimClipOutputSchema));
+
+    for (bool decompose : {false, true}) {
+        const QString name = decompose ? QStringLiteral("decompose_render_in_place")
+                                       : QStringLiteral("render_in_place");
+        QJsonObject properties = clipProperties;
+        properties.remove(QStringLiteral("kind"));
+        if (!decompose) {
+            properties.insert(QStringLiteral("kind"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("string")},
+                {QStringLiteral("enum"), QJsonArray{QStringLiteral("video")}}});
+            properties.insert(QStringLiteral("codec"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("string")},
+                {QStringLiteral("enum"), QJsonArray{QStringLiteral("h264"), QStringLiteral("prores")}}});
+            properties.insert(QStringLiteral("handlesSec"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("number")},
+                {QStringLiteral("minimum"), 0.0}, {QStringLiteral("maximum"), 5.0}});
+        }
+        QJsonObject outputProperties{
+            {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}}};
+        QStringList requiredOutput{QStringLiteral("ok")};
+        if (!decompose) {
+            outputProperties.insert(QStringLiteral("outputPath"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}});
+            for (const QString &key : {QStringLiteral("replaced"), QStringLiteral("linkedAudioReplaced")})
+                outputProperties.insert(key, QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}});
+            requiredOutput << QStringLiteral("outputPath") << QStringLiteral("replaced") << QStringLiteral("linkedAudioReplaced");
+        }
+        m_registry->registerTool(withOutputSchema({name,
+            decompose ? QStringLiteral("焼き込み前の映像とリンク音声を1回の操作で復元する。取り消し可能。")
+                      : QStringLiteral("映像の効果とリンク音声を焼き込み、差し替える。完了まで待機する。取り消し可能。"),
+            schemaWithRequired(properties, decompose
+                ? QStringList{QStringLiteral("trackIndex"), QStringLiteral("clipIndex")}
+                : QStringList{QStringLiteral("kind"), QStringLiteral("trackIndex"), QStringLiteral("clipIndex")}),
+            guardedWrite(name, [this, decompose](const QJsonObject &args, QString *err) -> QJsonObject {
+                const QStringList allowed = decompose
+                    ? QStringList{QStringLiteral("trackIndex"), QStringLiteral("clipIndex")}
+                    : QStringList{QStringLiteral("kind"), QStringLiteral("trackIndex"), QStringLiteral("clipIndex"),
+                                  QStringLiteral("codec"), QStringLiteral("handlesSec")};
+                if (!rejectUnknownArguments(args, allowed, err)) return {};
+                if (!args.contains(QStringLiteral("trackIndex")))
+                    return setError(err, QStringLiteral("trackIndex が必要です")), QJsonObject();
+                if (!decompose && args.value(QStringLiteral("kind")).toString() != QStringLiteral("video"))
+                    return setError(err, QStringLiteral("kind は video を指定してください")), QJsonObject();
+                ClipTarget target;
+                if (!readClipTarget(args, m_window, timeline(), &target, err)) return {};
+                if (decompose) {
+                    if (!renderinplace::decomposeRenderInPlace(*timeline(), target.trackIndex, target.clipIndex))
+                        return setError(err, QStringLiteral("元のクリップに戻せません")), QJsonObject();
+                    syncSelectionAfterEdit();
+                    return QJsonObject{{QStringLiteral("ok"), true}};
+                }
+                renderinplace::Options options;
+                options.projectFilePath = m_window->m_projectFilePath;
+                options.fps = qMax(1, m_window->m_projectConfig.fps);
+                if (args.contains(QStringLiteral("codec"))
+                    && !requiredString(args, QStringLiteral("codec"), &options.codec, err)) return {};
+                if (args.contains(QStringLiteral("handlesSec"))
+                    && !finiteNumberForMcp(args, QStringLiteral("handlesSec"), &options.handlesSec, err)) return {};
+                QString path;
+                if (!renderinplace::renderClipInPlace(*timeline(), target.trackIndex, target.clipIndex, options, &path, err))
+                    return {};
+                bool linkedAudio = false;
+                for (const auto *track : timeline()->audioTracks())
+                    for (const auto &clip : track->clips())
+                        linkedAudio |= clip.filePath == path && bool(clip.renderInPlaceOriginal);
+                syncSelectionAfterEdit();
+                return QJsonObject{{QStringLiteral("ok"), true}, {QStringLiteral("outputPath"), path},
+                    {QStringLiteral("replaced"), true}, {QStringLiteral("linkedAudioReplaced"), linkedAudio}};
+            })
+        }, outputSchemaOf(outputProperties, requiredOutput)));
+    }
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("set_transition"),

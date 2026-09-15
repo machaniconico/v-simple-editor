@@ -887,14 +887,16 @@ bool runFfmpegForAudioMix(const QStringList &args, QString *error)
     return true;
 }
 
-QString prepareTimelineAudioMixForExport(Timeline *timeline, QString *error)
+QString prepareTimelineAudioMixForExport(Timeline *timeline, QString *error,
+                                         const QString &forcedOutputPath = {})
 {
-    if (!timelineNeedsAudioMixForExport(timeline))
+    if (forcedOutputPath.isEmpty() && !timelineNeedsAudioMixForExport(timeline))
         return {};
 
     const QVector<PlaybackEntry> entries = timeline->computeAudioPlaybackSequence();
     const double durationSeconds = qMax(0.001, timeline->totalDuration());
-    const QString outputPath = nextExportAudioMixPath();
+    const QString outputPath = forcedOutputPath.isEmpty()
+        ? nextExportAudioMixPath() : forcedOutputPath;
 
     QStringList args;
     args << QStringLiteral("-y");
@@ -2679,6 +2681,11 @@ LoudnessMeasureResult measureTimelineLoudness(const QVector<PlaybackEntry> &entr
 }
 
 } // namespace
+
+QString renderinplace::prepareAudioMix(Timeline *timeline, const QString &outputPath, QString *error)
+{
+    return prepareTimelineAudioMixForExport(timeline, error, outputPath);
+}
 
 void syncTimeRemapEntriesToTimeline(
     Timeline *timeline,

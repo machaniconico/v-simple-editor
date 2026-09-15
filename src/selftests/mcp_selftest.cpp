@@ -54,6 +54,8 @@
 #include "../MusicRemix.h"
 #include "../RenderQueue.h"
 #include "../Timeline.h"
+#include "../TimelineFrameRenderer.h"
+#include "../libavcore/Probe.h"
 #include "../UndoManager.h"
 
 namespace {
@@ -1189,7 +1191,7 @@ int runMcpSelftest()
             rpcRequest(73, QStringLiteral("tools/list")))))
         .value(QStringLiteral("result")).toObject()
         .value(QStringLiteral("tools")).toArray();
-    constexpr int kExpectedProjectInfoToolCount = 36 + 1; // US-308: compare_project
+    constexpr int kExpectedProjectInfoToolCount = 36 + 1 + 2; // US-308: compare_project; US-312: render/decompose
     bool outputSchemasDeclared = projectInfoToolDescriptors.size()
         == kExpectedProjectInfoToolCount;
     for (const QJsonValue& value : projectInfoToolDescriptors) {
@@ -4910,6 +4912,88 @@ int runMcpSelftest()
     if (!timelineReady) {
         fail("G154 compare_project detects move and volume", QStringLiteral("Timeline was not available"));
         fail("G155 compare_project unchanged and invalid inputs", QStringLiteral("Timeline was not available"));
+    }
+    // US-312 reserves G152-G153. Exercise the actual MCP handlers and renderer.
+    if (timelineReady) {
+        const auto savedState = projectTimeline->currentState();
+        ClipInfo original{};
+        original.filePath = QFileInfo(QStringLiteral("test_assets/e2e_clip.mp4")).absoluteFilePath();
+        const auto duration = libavcore::probeDurationMicroseconds(original.filePath.toStdString());
+        original.duration = duration ? double(*duration) / 1000000.0 : 0.0;
+        original.inPoint = 1.0;
+        original.outPoint = 2.0;
+        original.effects.append(VideoEffect::createBrightnessContrast(12.0, 0.0));
+        projectTimeline->restoreFromProject({{original}}, {}, 0, -1, -1, 10);
+        projectTimeline->undoManager()->clear();
+        projectTimeline->saveUndoState(QStringLiteral("MCP焼き込み初期状態"));
+        const QSize size(640, 360);
+        const QImage before = tlrender::renderFrameAt(projectTimeline, 500000, size);
+        const QJsonObject target{{QStringLiteral("trackIndex"), 0}, {QStringLiteral("clipIndex"), 0}};
+        QJsonObject renderArgs = target;
+        renderArgs.insert(QStringLiteral("kind"), QStringLiteral("video"));
+        const quint64 serial = projectTimeline->undoManager()->saveSerial();
+        const auto rendered = toolPayload(callProjectInfoTool(452, QStringLiteral("render_in_place"), renderArgs));
+        const QString path = rendered.value(QStringLiteral("outputPath")).toString();
+        const auto timelineClip = [&]() {
+            const auto payload = toolPayload(callProjectInfoTool(453, QStringLiteral("get_timeline"), {}));
+            const auto tracks = payload.value(QStringLiteral("video")).toArray();
+            const auto clips = tracks.isEmpty() ? QJsonArray{} : tracks.first().toObject().value(QStringLiteral("clips")).toArray();
+            return clips.isEmpty() ? QJsonObject{} : clips.first().toObject();
+        };
+        const QJsonObject bakedClip = timelineClip();
+        const QImage after = tlrender::renderFrameAt(projectTimeline, 500000, size);
+        double error = std::numeric_limits<double>::infinity();
+        if (!before.isNull() && !after.isNull() && before.size() == after.size()) {
+            const QImage a = before.convertToFormat(QImage::Format_RGB32);
+            const QImage b = after.convertToFormat(QImage::Format_RGB32);
+            double sum = 0.0;
+            for (int y = 0; y < a.height(); ++y) {
+                const auto *pa = reinterpret_cast<const QRgb *>(a.constScanLine(y));
+                const auto *pb = reinterpret_cast<const QRgb *>(b.constScanLine(y));
+                for (int x = 0; x < a.width(); ++x) {
+                    const double r = qRed(pa[x]) - qRed(pb[x]);
+                    const double g = qGreen(pa[x]) - qGreen(pb[x]);
+                    const double bl = qBlue(pa[x]) - qBlue(pb[x]);
+                    sum += r*r + g*g + bl*bl;
+                }
+            }
+            error = sum / (3.0 * a.width() * a.height());
+        }
+        const bool g152 = duration && *duration >= 2000000
+            && rendered.value(QStringLiteral("ok")).toBool()
+            && rendered.value(QStringLiteral("replaced")).toBool()
+            && rendered.value(QStringLiteral("linkedAudioReplaced")).isBool()
+            && !rendered.value(QStringLiteral("linkedAudioReplaced")).toBool()
+            && QFileInfo::exists(path) && path.endsWith(QStringLiteral(".mp4"))
+            && path != original.filePath && bakedClip.value(QStringLiteral("filePath")).toString() == path
+            && bakedClip.value(QStringLiteral("effects")).isArray()
+            && bakedClip.value(QStringLiteral("effects")).toArray().isEmpty()
+            && projectTimeline->undoManager()->saveSerial() == serial + 1 && error < 2.0;
+        g152 ? pass("G152 render_in_place MCP picture and timeline")
+             : fail("G152 render_in_place MCP picture and timeline",
+                    QStringLiteral("MSE=%1 response=%2").arg(error).arg(QString::fromUtf8(compact(rendered))));
+        const auto decomposed = toolPayload(callProjectInfoTool(454, QStringLiteral("decompose_render_in_place"), target));
+        const QJsonObject restored = timelineClip();
+        bool g153 = decomposed.value(QStringLiteral("ok")).toBool()
+            && restored.value(QStringLiteral("filePath")).toString() == original.filePath
+            && restored.value(QStringLiteral("effects")).toArray().size() == 1
+            && restored.value(QStringLiteral("effects")).toArray().first().toObject().value(QStringLiteral("param1")).toDouble() == 12.0;
+        const auto undoDecompose = toolPayload(callProjectInfoTool(455, QStringLiteral("undo"), {}));
+        g153 = g153 && undoDecompose.value(QStringLiteral("ok")).toBool()
+            && timelineClip().value(QStringLiteral("filePath")).toString() == path;
+        const auto undoRender = toolPayload(callProjectInfoTool(456, QStringLiteral("undo"), {}));
+        const auto undone = timelineClip();
+        g153 = g153 && undoRender.value(QStringLiteral("ok")).toBool()
+            && undone.value(QStringLiteral("filePath")).toString() == original.filePath
+            && undone.value(QStringLiteral("effects")) == restored.value(QStringLiteral("effects"));
+        g153 ? pass("G153 decompose and undo restore media and effects")
+             : fail("G153 decompose and undo restore media and effects", QStringLiteral("復元または取り消しに失敗"));
+        projectTimeline->restoreState(savedState);
+        if (rendered.value(QStringLiteral("ok")).toBool() && path != original.filePath)
+            QFile::remove(path);
+    } else {
+        fail("G152 render_in_place MCP picture and timeline", QStringLiteral("Timeline was not available"));
+        fail("G153 decompose and undo restore media and effects", QStringLiteral("Timeline was not available"));
     }
     server.stop();
     qInfo().noquote().nospace() << "[mcp] selftest end, passed=" << passed
