@@ -87,6 +87,7 @@ QString effectTypeKey(VideoEffectType type)
     case VideoEffectType::CornerPinSimple: return QStringLiteral("CornerPinSimple");
     case VideoEffectType::FilmGrain: return QStringLiteral("FilmGrain");
     case VideoEffectType::Echo: return QStringLiteral("Echo");
+    case VideoEffectType::LensDistortion: return QStringLiteral("LensDistortion");
     }
     return QStringLiteral("None");
 }
@@ -794,6 +795,25 @@ VideoEffect PresetLibrary::videoEffectFromJson(const QJsonObject &obj)
 void PresetLibrary::registerBuiltins()
 {
     QDateTime now = QDateTime::currentDateTime();
+
+    // Approximate starting points, not calibrated camera/lens profiles.
+    const struct LensPreset { const char *name; double k1; double k2; } lenses[] = {
+        { "GoPro 広角", -0.30, 0.08 },
+        { "DJI", -0.18, 0.04 },
+        { "一眼 24mm", -0.08, 0.01 }
+    };
+    for (const auto &lens : lenses) {
+        EffectPreset p;
+        p.name = QString::fromUtf8(lens.name);
+        p.description = QStringLiteral("レンズ歪み補正の概算値です。映像に合わせて調整してください。");
+        p.category = QStringLiteral("ディストーション");
+        p.author = QStringLiteral("v-editor");
+        p.isBuiltIn = true;
+        p.createdAt = now;
+        p.modifiedAt = now;
+        p.effects.append(VideoEffect::createLensDistortion(lens.k1, lens.k2));
+        m_presets.append(p);
+    }
 
     // --- Cinematic Warm ---
     {

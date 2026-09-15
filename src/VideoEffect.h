@@ -170,7 +170,8 @@ enum class VideoEffectType {
     MotionTile,
     CornerPinSimple,
     FilmGrain,
-    Echo
+    Echo,
+    LensDistortion
 };
 
 struct VideoEffect {
@@ -223,6 +224,9 @@ struct VideoEffect {
     //   MotionTile: p1=tilesX(1..10), p2=tilesY(1..10), p3=mirrorEdges(0/1). 1x1 is no-op.
     //   CornerPinSimple: p1=horizontalTilt(-100..100), p2=verticalTilt(-100..100)
     //   FilmGrain: p1=amount(0..1), p2=size(1..4), p3=colorAmount(0..1), keyColor.red=seedPerFrame(0/1)
+    //   LensDistortion: p1=k1, p2=k2, p3=scale (factory default 1).
+    //     keyColor RGB packs two 12-bit centers: round(center*4000)+2000,
+    //     X in high 12 bits, Y in low 12 bits (0.00025 precision, HexRgb-safe).
     //   Echo: p1=delaySec(0.02..2), p2=count(1..8), p3=decay(0..1), keyColor.red=blend(0=Add,1=Screen,2=Lighten,3=Normal)
     // keyColor is otherwise unused by these two effects; its serialized red
     // channel carries their fourth scalar without changing the project format.
@@ -286,6 +290,9 @@ struct VideoEffect {
     static VideoEffect createFilmGrain(double amount = 0.3, int size = 1,
                                        double colorAmount = 0.0,
                                        bool seedPerFrame = true);
+    static VideoEffect createLensDistortion(double k1 = 0.0, double k2 = 0.0,
+                                            double scale = 1.0,
+                                            double centerX = 0.0, double centerY = 0.0);
     static VideoEffect createEcho(double delaySec = 0.1, int count = 3,
                                   double decay = 0.5, int blend = 2);
 };
@@ -299,6 +306,10 @@ public:
     static QImage applyHslSecondary(const QImage &input, const HslSecondaryGrade &hsl);
     static QImage applyRgbLumaCurves(const QImage &input, const ClipCurveData &curves);
     static QImage applyRgbLumaCurves(const QImage &input, const QVector<QVector<int>> &curves);
+    // Thread-local hooks for proving the new branch is inactive by default.
+    static void setLensDistortionEnabledForTesting(bool enabled);
+    static void resetLensDistortionInvocationCount();
+    static int lensDistortionInvocationCount();
     static QImage applyEffect(const QImage &input, const VideoEffect &effect);
     static QImage applyEffectStack(const QImage &input, const ColorCorrection &cc,
                                    const QVector<VideoEffect> &effects);
@@ -359,6 +370,7 @@ private:
     static QImage applyPolarCoordinates(const QImage &img, int type, double amount);
     static QImage applyMotionTile(const QImage &img, int tilesX, int tilesY, bool mirrorEdges);
     static QImage applyCornerPinSimple(const QImage &img, double horizontalTilt, double verticalTilt);
+    static QImage applyLensDistortion(const QImage &img, const VideoEffect &effect);
     static QImage applyFilmGrain(const QImage &img, double amount, int size,
                                  double colorAmount, bool seedPerFrame);
 };

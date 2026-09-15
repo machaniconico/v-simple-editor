@@ -245,6 +245,15 @@ QVector<ParamDef> paramSchemaFor(VideoEffectType type)
             { "verticalTilt", "垂直チルト", ParamType::Float, -100.0, 100.0, 0.0 }
         };
 
+    case VideoEffectType::LensDistortion:
+        return {
+            { "k1", "径方向２次", ParamType::Float, -0.5, 0.5, 0.0 },
+            { "k2", "径方向４次", ParamType::Float, -0.5, 0.5, 0.0 },
+            { "scale", "拡大率", ParamType::Float, 0.5, 2.0, 1.0 },
+            { "centerX", "中心Ｘ", ParamType::Float, -0.5, 0.5, 0.0 },
+            { "centerY", "中心Ｙ", ParamType::Float, -0.5, 0.5, 0.0 }
+        };
+
     case VideoEffectType::FilmGrain:
         return {
             { "amount", "量", ParamType::Float, 0.0, 1.0, 0.3 },

@@ -468,6 +468,7 @@ QString VideoEffect::typeName(VideoEffectType t)
     case VideoEffectType::CornerPinSimple: return "コーナーピン(簡易)";
     case VideoEffectType::FilmGrain: return "フィルムグレイン";
     case VideoEffectType::Echo: return "エコー(残像)";
+    case VideoEffectType::LensDistortion: return "レンズ歪み補正";
     }
     return "Unknown";
 }
@@ -496,7 +497,7 @@ QVector<VideoEffectType> VideoEffect::allTypes()
              VideoEffectType::Twirl, VideoEffectType::Mirror,
              VideoEffectType::PolarCoordinates, VideoEffectType::MotionTile,
              VideoEffectType::CornerPinSimple, VideoEffectType::FilmGrain,
-             VideoEffectType::Echo };
+             VideoEffectType::Echo, VideoEffectType::LensDistortion };
 }
 
 VideoEffect VideoEffect::createBlur(double r)
@@ -593,6 +594,19 @@ VideoEffect VideoEffect::createCornerPinSimple(double h, double v)
     { VideoEffect e; e.type = VideoEffectType::CornerPinSimple; e.param1 = h; e.param2 = v; return e; }
 VideoEffect VideoEffect::createFilmGrain(double a, int s, double c, bool perFrame)
     { VideoEffect e; e.type = VideoEffectType::FilmGrain; e.param1 = a; e.param2 = static_cast<double>(s); e.param3 = c; e.keyColor = QColor(perFrame ? 1 : 0, 0, 0); return e; }
+VideoEffect VideoEffect::createLensDistortion(double k1, double k2, double scale,
+                                               double centerX, double centerY)
+{
+    VideoEffect e;
+    e.type = VideoEffectType::LensDistortion;
+    effectctrl::setParamValue(e, QStringLiteral("k1"), k1);
+    effectctrl::setParamValue(e, QStringLiteral("k2"), k2);
+    effectctrl::setParamValue(e, QStringLiteral("scale"), scale);
+    effectctrl::setParamValue(e, QStringLiteral("centerX"), centerX);
+    effectctrl::setParamValue(e, QStringLiteral("centerY"), centerY);
+    return e;
+}
+
 VideoEffect VideoEffect::createEcho(double delay, int count, double decay, int blend)
     { VideoEffect e; e.type = VideoEffectType::Echo; e.param1 = delay; e.param2 = static_cast<double>(count); e.param3 = decay; e.keyColor = QColor(qBound(0, blend, 3), 0, 0); return e; }
 
@@ -631,6 +645,14 @@ static QColor defaultColorForParam(const VideoEffect &effect, const QString &par
 
 double paramValue(const VideoEffect &effect, const QString &paramName)
 {
+    if (effect.type == VideoEffectType::LensDistortion) {
+        if (paramName == "k1") return effect.param1;
+        if (paramName == "k2") return effect.param2;
+        if (paramName == "scale") return effect.param3;
+        const unsigned packed = effect.keyColor.rgb() & 0xffffffu;
+        if (paramName == "centerX") return (int(packed >> 12) - 2000) / 4000.0;
+        if (paramName == "centerY") return (int(packed & 4095u) - 2000) / 4000.0;
+    }
     auto schema = paramSchemaFor(effect.type);
     for (const auto &def : schema) {
         if (def.name == paramName) {
@@ -819,6 +841,22 @@ double paramValue(const VideoEffect &effect, const QString &paramName)
 
 void setParamValue(VideoEffect &effect, const QString &paramName, double value)
 {
+    if (effect.type == VideoEffectType::LensDistortion) {
+        if (!std::isfinite(value)) value = paramName == "scale" ? 1.0 : 0.0;
+        if (paramName == "k1") { effect.param1 = qBound(-0.5, value, 0.5); return; }
+        if (paramName == "k2") { effect.param2 = qBound(-0.5, value, 0.5); return; }
+        if (paramName == "scale") { effect.param3 = qBound(0.5, value, 2.0); return; }
+        if (paramName == "centerX" || paramName == "centerY") {
+            const unsigned encoded = static_cast<unsigned>(
+                std::lround(qBound(-0.5, value, 0.5) * 4000.0) + 2000);
+            unsigned packed = effect.keyColor.rgb() & 0xffffffu;
+            packed = paramName == "centerX"
+                ? (packed & 4095u) | (encoded << 12)
+                : (packed & 0xfff000u) | encoded;
+            effect.keyColor = QColor::fromRgb(0xff000000u | packed);
+            return;
+        }
+    }
     auto schema = paramSchemaFor(effect.type);
     for (const auto &def : schema) {
         if (def.name == paramName) {
@@ -1607,6 +1645,7 @@ QImage VideoEffectProcessor::applyEffect(const QImage &input, const VideoEffect 
                                                              static_cast<int>(std::round(effect.param2)),
                                                              std::round(effect.param3) != 0.0);
     case VideoEffectType::CornerPinSimple: return applyCornerPinSimple(input, effect.param1, effect.param2);
+    case VideoEffectType::LensDistortion: return applyLensDistortion(input, effect);
     case VideoEffectType::FilmGrain: return applyFilmGrain(
         input, effect.param1, static_cast<int>(std::round(effect.param2)),
         effect.param3, effect.keyColor.red() != 0);
@@ -3416,4 +3455,79 @@ QImage VideoEffectProcessor::applyCornerPinSimple(const QImage &input,
     }
 
     return result;
+}
+
+namespace {
+thread_local bool lensDistortionEnabled = true;
+thread_local int lensDistortionCalls = 0;
+}
+
+void VideoEffectProcessor::setLensDistortionEnabledForTesting(bool enabled)
+{
+    lensDistortionEnabled = enabled;
+}
+
+void VideoEffectProcessor::resetLensDistortionInvocationCount()
+{
+    lensDistortionCalls = 0;
+}
+
+int VideoEffectProcessor::lensDistortionInvocationCount()
+{
+    return lensDistortionCalls;
+}
+
+QImage VideoEffectProcessor::applyLensDistortion(const QImage &input,
+                                                 const VideoEffect &effect)
+{
+    auto parameter = [&](const char *name, double lo, double hi, double fallback) {
+        const double v = effectctrl::paramValue(effect, QString::fromLatin1(name));
+        return std::isfinite(v) ? qBound(lo, v, hi) : fallback;
+    };
+    const double k1 = parameter("k1", -0.5, 0.5, 0.0);
+    const double k2 = parameter("k2", -0.5, 0.5, 0.0);
+    const double scale = parameter("scale", 0.5, 2.0, 1.0);
+    const double centerX = parameter("centerX", -0.5, 0.5, 0.0);
+    const double centerY = parameter("centerY", -0.5, 0.5, 0.0);
+    // Return the original storage, including format, alpha and row padding.
+    if (!lensDistortionEnabled || input.isNull()
+        || (k1 == 0.0 && k2 == 0.0 && scale == 1.0
+            && centerX == 0.0 && centerY == 0.0))
+        return input;
+    ++lensDistortionCalls;
+    const QImage src = input.convertToFormat(QImage::Format_RGB888);
+    QImage out(src.size(), QImage::Format_RGB888);
+    out.fill(Qt::black);
+    const double shortSide = std::min(src.width(), src.height());
+    const double radius = shortSide * 0.5;
+    // Integer coordinates denote pixel centers. GLSL uses uv*size - 0.5.
+    const double cx = (src.width() - 1) * 0.5 + centerX * shortSide;
+    const double cy = (src.height() - 1) * 0.5 + centerY * shortSide;
+    for (int py = 0; py < out.height(); ++py) {
+        uchar *dst = out.scanLine(py);
+        for (int px = 0; px < out.width(); ++px) {
+            const double x = (px - cx) / radius;
+            const double y = (py - cy) / radius;
+            const double r2 = x * x + y * y;
+            const double factor = (1.0 + k1 * r2 + k2 * r2 * r2) / scale;
+            const double sx = cx + radius * x * factor;
+            const double sy = cy + radius * y * factor;
+            if (sx < 0.0 || sy < 0.0 || sx > src.width() - 1.0
+                || sy > src.height() - 1.0)
+                continue; // Opaque black, exactly as kFragLensDistortion.
+            const int x0 = static_cast<int>(std::floor(sx));
+            const int y0 = static_cast<int>(std::floor(sy));
+            const int x1 = std::min(x0 + 1, src.width() - 1);
+            const int y1 = std::min(y0 + 1, src.height() - 1);
+            const double fx = sx - x0, fy = sy - y0;
+            const uchar *a = src.constScanLine(y0);
+            const uchar *b = src.constScanLine(y1);
+            for (int ch = 0; ch < 3; ++ch) {
+                const double top = a[x0 * 3 + ch] * (1.0 - fx) + a[x1 * 3 + ch] * fx;
+                const double bottom = b[x0 * 3 + ch] * (1.0 - fx) + b[x1 * 3 + ch] * fx;
+                dst[px * 3 + ch] = static_cast<uchar>(clamp255d(top * (1.0 - fy) + bottom * fy));
+            }
+        }
+    }
+    return out;
 }
