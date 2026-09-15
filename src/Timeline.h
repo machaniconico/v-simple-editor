@@ -923,6 +923,8 @@ public:
     void setClipColorCorrection(const ColorCorrection &cc);
     void setClipColorCorrection(int trackIdx, int clipIdx,
                                 const ColorCorrection &cc);
+    bool setClipLut(int trackIdx, int clipIdx, const QString &lutFilePath,
+                    double intensity, QString *err = nullptr);
     void setClipLayerStyle(const LayerStyle &style);
     void setClipLayerStyle(int trackIdx, int clipIdx, const LayerStyle &style);
     void setClipLayerMaterial(const LayerMaterial &material);

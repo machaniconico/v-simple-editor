@@ -285,9 +285,90 @@ ToolDescriptor withOutputSchema(ToolDescriptor tool,
     return tool;
 }
 
+// ColorGradingPanel basic sliders (including their scale factors) and
+// ColorWheelWidget RGB controls. hueSatWarp is deliberately not exposed.
+struct McpColorField {
+    const char *name;
+    double ColorCorrection::*member;
+    double minimum;
+    double maximum;
+};
+
+const McpColorField kMcpColorFields[] = {
+    {"brightness", &ColorCorrection::brightness, -100, 100},
+    {"contrast", &ColorCorrection::contrast, -100, 100},
+    {"saturation", &ColorCorrection::saturation, -100, 100},
+    {"hue", &ColorCorrection::hue, -180, 180},
+    {"temperature", &ColorCorrection::temperature, -100, 100},
+    {"tint", &ColorCorrection::tint, -100, 100},
+    {"gamma", &ColorCorrection::gamma, 0.1, 3},
+    {"highlights", &ColorCorrection::highlights, -100, 100},
+    {"shadows", &ColorCorrection::shadows, -100, 100},
+    {"exposure", &ColorCorrection::exposure, -3, 3},
+    {"liftR", &ColorCorrection::liftR, -1, 1},
+    {"liftG", &ColorCorrection::liftG, -1, 1},
+    {"liftB", &ColorCorrection::liftB, -1, 1},
+    {"gammaR", &ColorCorrection::gammaR, -1, 1},
+    {"gammaG", &ColorCorrection::gammaG, -1, 1},
+    {"gammaB", &ColorCorrection::gammaB, -1, 1},
+    {"gainR", &ColorCorrection::gainR, -1, 1},
+    {"gainG", &ColorCorrection::gainG, -1, 1},
+    {"gainB", &ColorCorrection::gainB, -1, 1},
+    {"logShadowR", &ColorCorrection::logShadowR, -1, 1},
+    {"logShadowG", &ColorCorrection::logShadowG, -1, 1},
+    {"logShadowB", &ColorCorrection::logShadowB, -1, 1},
+    {"logMidR", &ColorCorrection::logMidR, -1, 1},
+    {"logMidG", &ColorCorrection::logMidG, -1, 1},
+    {"logMidB", &ColorCorrection::logMidB, -1, 1},
+    {"logHighR", &ColorCorrection::logHighR, -1, 1},
+    {"logHighG", &ColorCorrection::logHighG, -1, 1},
+    {"logHighB", &ColorCorrection::logHighB, -1, 1},
+};
+
+QJsonObject colorCorrectionToJson(const ColorCorrection &cc)
+{
+    QJsonObject result;
+    for (const auto &field : kMcpColorFields)
+        result.insert(QString::fromLatin1(field.name), cc.*(field.member));
+    return result;
+}
+
+QJsonObject colorCorrectionSchema(bool input = false)
+{
+    QJsonObject properties;
+    for (const auto &field : kMcpColorFields) {
+        QJsonObject property{{QStringLiteral("type"), QStringLiteral("number")}};
+        if (input) {
+            property.insert(QStringLiteral("minimum"), field.minimum);
+            property.insert(QStringLiteral("maximum"), field.maximum);
+        }
+        properties.insert(QString::fromLatin1(field.name), property);
+    }
+    if (input)
+        properties.insert(QStringLiteral("hueSatWarp"), QJsonObject{
+            {QStringLiteral("description"), QStringLiteral("対象外。指定された場合は無視し、warning を返します。")}});
+    return objectSchema(properties);
+}
+
+QJsonObject lutOutputSchema()
+{
+    return outputSchemaOf(QJsonObject{
+        {QStringLiteral("filePath"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
+        {QStringLiteral("intensity"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}}
+    }, {QStringLiteral("filePath"), QStringLiteral("intensity")});
+}
+
+QJsonObject lutToJson(const ClipInfo &clip)
+{
+    return QJsonObject{{QStringLiteral("filePath"), clip.lutFilePath},
+                       {QStringLiteral("intensity"), clip.lutIntensity}};
+}
+
 QJsonObject clipOutputItemSchema()
 {
     const QJsonObject properties{
+        {QStringLiteral("colorCorrection"), colorCorrectionSchema()},
+        {QStringLiteral("lut"), lutOutputSchema()},
         {QStringLiteral("index"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
         {QStringLiteral("displayName"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
         {QStringLiteral("filePath"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
@@ -916,6 +997,8 @@ QJsonObject clipToJson(const ClipInfo& clip, int clipIndex, double startSec,
             {QStringLiteral("startSec"), effect.startSec}, {QStringLiteral("endSec"), effect.endSec}});
     }
     return QJsonObject{
+        {QStringLiteral("colorCorrection"), colorCorrectionToJson(clip.colorCorrection)},
+        {QStringLiteral("lut"), lutToJson(clip)},
         {QStringLiteral("effects"), effects},
         {QStringLiteral("index"), clipIndex},
         {QStringLiteral("displayName"), clip.displayName},
@@ -3124,6 +3207,106 @@ void McpEditorTools::registerWriteTools()
             };
         })
     }, relinkMediaOutputSchema));
+
+    m_registry->registerTool(withOutputSchema({
+        QStringLiteral("set_color_correction"),
+        QStringLiteral("映像クリップの色補正を部分更新する。reset=true は既定値へ戻してから values を適用する。hueSatWarp は無視して警告を返す。Ctrl+Z / undo で戻せる。"),
+        schemaWithRequired(mergedProperties(clipProperties, QJsonObject{
+            {QStringLiteral("values"), colorCorrectionSchema(true)},
+            {QStringLiteral("reset"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}}
+        }), {QStringLiteral("clipIndex"), QStringLiteral("values")}),
+        guardedWrite(QStringLiteral("set_color_correction"),
+                     [this](const QJsonObject &args, QString *err) -> QJsonObject {
+            if (!rejectUnknownArguments(args, {QStringLiteral("kind"), QStringLiteral("trackIndex"),
+                    QStringLiteral("clipIndex"), QStringLiteral("values"), QStringLiteral("reset")}, err))
+                return {};
+            if (!args.value(QStringLiteral("values")).isObject())
+                return setError(err, QStringLiteral("values にはオブジェクトを指定してください")), QJsonObject{};
+            if (args.contains(QStringLiteral("reset")) && !args.value(QStringLiteral("reset")).isBool())
+                return setError(err, QStringLiteral("reset には真偽値を指定してください")), QJsonObject{};
+            ClipTarget target;
+            if (!readClipTarget(args, m_window, timeline(), &target, err)) return {};
+            if (target.audio)
+                return setError(err, QStringLiteral("色補正は映像クリップにのみ設定できます")), QJsonObject{};
+            ColorCorrection cc = args.value(QStringLiteral("reset")).toBool(false)
+                ? ColorCorrection{} : target.track->clips().at(target.clipIndex).colorCorrection;
+            const QJsonObject values = args.value(QStringLiteral("values")).toObject();
+            bool warpIgnored = false;
+            for (auto it = values.constBegin(); it != values.constEnd(); ++it) {
+                if (it.key() == QStringLiteral("hueSatWarp")) {
+                    warpIgnored = true;
+                    continue;
+                }
+                const McpColorField *matched = nullptr;
+                for (const auto &field : kMcpColorFields) {
+                    if (it.key() == QString::fromLatin1(field.name)) {
+                        matched = &field;
+                        break;
+                    }
+                }
+                if (!matched)
+                    return setError(err, QStringLiteral("未知の色補正フィールド: %1").arg(it.key())), QJsonObject{};
+                const double value = it.value().toDouble();
+                if (!it.value().isDouble() || !std::isfinite(value)
+                    || value < matched->minimum || value > matched->maximum)
+                    return setError(err, QStringLiteral("%1 は %2 以上 %3 以下の数値で指定してください")
+                        .arg(it.key()).arg(matched->minimum).arg(matched->maximum)), QJsonObject{};
+                cc.*(matched->member) = value;
+            }
+            timeline()->setClipColorCorrection(target.trackIndex, target.clipIndex, cc);
+            syncSelectionAfterEdit();
+            QJsonObject result{{QStringLiteral("ok"), true},
+                               {QStringLiteral("colorCorrection"), colorCorrectionToJson(cc)}};
+            if (warpIgnored)
+                result.insert(QStringLiteral("warning"), QStringLiteral("hueSatWarp は対象外のため無視しました"));
+            return result;
+        })
+    }, outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("colorCorrection"), colorCorrectionSchema()},
+        {QStringLiteral("warning"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}}
+    }, {QStringLiteral("ok"), QStringLiteral("colorCorrection")})));
+
+    m_registry->registerTool(withOutputSchema({
+        QStringLiteral("apply_lut"),
+        QStringLiteral("映像クリップに LUT ファイルを適用する。filePath が空文字なら解除。intensity は 0..1、既定 1。Ctrl+Z / undo で戻せる。"),
+        schemaWithRequired(mergedProperties(clipProperties, QJsonObject{
+            {QStringLiteral("filePath"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
+            {QStringLiteral("intensity"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("number")},
+                {QStringLiteral("minimum"), 0}, {QStringLiteral("maximum"), 1},
+                {QStringLiteral("default"), 1}}}
+        }), {QStringLiteral("clipIndex"), QStringLiteral("filePath")}),
+        guardedWrite(QStringLiteral("apply_lut"),
+                     [this](const QJsonObject &args, QString *err) -> QJsonObject {
+            if (!rejectUnknownArguments(args, {QStringLiteral("kind"), QStringLiteral("trackIndex"),
+                    QStringLiteral("clipIndex"), QStringLiteral("filePath"), QStringLiteral("intensity")}, err))
+                return {};
+            if (!args.value(QStringLiteral("filePath")).isString())
+                return setError(err, QStringLiteral("filePath には文字列を指定してください")), QJsonObject{};
+            const QString path = args.value(QStringLiteral("filePath")).toString();
+            double intensity = 1.0;
+            if (args.contains(QStringLiteral("intensity"))) {
+                const auto raw = args.value(QStringLiteral("intensity"));
+                intensity = raw.toDouble();
+                if (!raw.isDouble() || !std::isfinite(intensity) || intensity < 0.0 || intensity > 1.0)
+                    return setError(err, QStringLiteral("intensity は 0 以上 1 以下の数値で指定してください")), QJsonObject{};
+            }
+            ClipTarget target;
+            if (!readClipTarget(args, m_window, timeline(), &target, err)) return {};
+            if (target.audio)
+                return setError(err, QStringLiteral("LUT は映像クリップにのみ設定できます")), QJsonObject{};
+            if (!path.isEmpty() && !QFileInfo(path).isFile())
+                return setError(err, QStringLiteral("LUT ファイルが見つかりません: %1").arg(path)), QJsonObject{};
+            if (!timeline()->setClipLut(target.trackIndex, target.clipIndex, path, intensity, err)) return {};
+            syncSelectionAfterEdit();
+            return QJsonObject{{QStringLiteral("ok"), true},
+                {QStringLiteral("lut"), lutToJson(target.track->clips().at(target.clipIndex))}};
+        })
+    }, outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("lut"), lutOutputSchema()}
+    }, {QStringLiteral("ok"), QStringLiteral("lut")})));
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("set_clip_property"),

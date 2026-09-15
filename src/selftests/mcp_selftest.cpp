@@ -1193,7 +1193,7 @@ int runMcpSelftest()
             rpcRequest(73, QStringLiteral("tools/list")))))
         .value(QStringLiteral("result")).toObject()
         .value(QStringLiteral("tools")).toArray();
-    constexpr int kExpectedProjectInfoToolCount = 36 + 1 + 2; // US-308: compare_project; US-312: render/decompose
+    constexpr int kExpectedProjectInfoToolCount = 36 + 1 + 2 + 2; // US-308: compare_project; US-312: render/decompose; US-400: color/LUT
     bool outputSchemasDeclared = projectInfoToolDescriptors.size()
         == kExpectedProjectInfoToolCount;
     for (const QJsonValue& value : projectInfoToolDescriptors) {
@@ -1512,6 +1512,152 @@ int runMcpSelftest()
             projectTimeline->undoManager()->saveState(
                 projectTimeline->currentState(), QStringLiteral("MCP selftest baseline"));
         };
+
+        // US-400 reserved G156-G158: actual MCP writes, reads and single-step undo.
+        {
+            video0->setClips({makeTestClip(QStringLiteral("mcp-color.mp4"), 0)});
+            video1->setClips({});
+            audio0->setClips({});
+            audio1->setClips({});
+            projectTimeline->clearSelection();
+            saveTestUndoBaseline();
+            auto isToolErrorResponse = [&toolResult](const QJsonObject &response) {
+                return toolResult(response).value(QStringLiteral("isError")).toBool(false);
+            };
+            int requestId = 15600;
+            auto callColor = [&](const QJsonObject &values, bool reset = false) {
+                return callProjectInfoTool(++requestId, QStringLiteral("set_color_correction"),
+                    QJsonObject{{QStringLiteral("clipIndex"), 0},
+                        {QStringLiteral("values"), values}, {QStringLiteral("reset"), reset}});
+            };
+            auto readClip = [&]() {
+                const auto payload = toolPayload(callProjectInfoTool(++requestId,
+                    QStringLiteral("get_timeline"), QJsonObject{}));
+                const auto tracks = payload.value(QStringLiteral("video")).toArray();
+                if (tracks.isEmpty()) return QJsonObject{};
+                const auto clips = tracks.at(0).toObject().value(QStringLiteral("clips")).toArray();
+                return clips.isEmpty() ? QJsonObject{} : clips.at(0).toObject();
+            };
+            auto undo = [&]() {
+                return toolPayload(callProjectInfoTool(++requestId, QStringLiteral("undo"), QJsonObject{}))
+                    .value(QStringLiteral("ok")).toBool();
+            };
+            const QJsonObject values{{QStringLiteral("liftR"), 0.2},
+                {QStringLiteral("gammaG"), -0.3}, {QStringLiteral("gainB"), 0.4},
+                {QStringLiteral("exposure"), 1.5}};
+            const quint64 serial = projectTimeline->undoManager()->saveSerial();
+            const auto response = toolPayload(callColor(values));
+            const auto readback = readClip();
+            const auto correction = readback.value(QStringLiteral("colorCorrection")).toObject();
+            bool g156 = response.value(QStringLiteral("ok")).toBool()
+                && requiredOutputFieldsPresent(QStringLiteral("set_color_correction"), response)
+                && correction.size() == 28 && !correction.contains(QStringLiteral("hueSatWarp"))
+                && response.value(QStringLiteral("colorCorrection")).toObject() == correction
+                && readback.contains(QStringLiteral("lut"))
+                && projectTimeline->undoManager()->saveSerial() == serial + 1;
+            for (const auto &descriptorValue : projectInfoToolDescriptors) {
+                const auto descriptor = descriptorValue.toObject();
+                if (descriptor.value(QStringLiteral("name")).toString() != QStringLiteral("get_timeline")) continue;
+                const auto clipSchema = descriptor.value(QStringLiteral("outputSchema")).toObject()
+                    .value(QStringLiteral("properties")).toObject().value(QStringLiteral("video")).toObject()
+                    .value(QStringLiteral("items")).toObject().value(QStringLiteral("properties")).toObject()
+                    .value(QStringLiteral("clips")).toObject().value(QStringLiteral("items")).toObject();
+                const auto properties = clipSchema.value(QStringLiteral("properties")).toObject();
+                const auto required = clipSchema.value(QStringLiteral("required")).toArray();
+                g156 = g156 && properties.contains(QStringLiteral("colorCorrection"))
+                    && properties.contains(QStringLiteral("lut"))
+                    && !required.contains(QStringLiteral("colorCorrection"))
+                    && !required.contains(QStringLiteral("lut"));
+            }
+            for (auto it = values.constBegin(); it != values.constEnd(); ++it)
+                g156 = g156 && correction.value(it.key()) == it.value();
+            g156 = undo() && video0->clips().at(0).colorCorrection.isDefault() && g156;
+            // Partial updates retain other fields; reset starts from defaults.
+            callColor(values);
+            callColor(QJsonObject{{QStringLiteral("brightness"), 12.0}});
+            g156 = g156 && video0->clips().at(0).colorCorrection.exposure == 1.5;
+            callColor(QJsonObject{{QStringLiteral("shadows"), 10.0}}, true);
+            g156 = g156 && video0->clips().at(0).colorCorrection.exposure == 0.0
+                && video0->clips().at(0).colorCorrection.brightness == 0.0
+                && video0->clips().at(0).colorCorrection.shadows == 10.0;
+            g156 = undo() && video0->clips().at(0).colorCorrection.brightness == 12.0 && g156;
+            g156 ? pass("G156 color correction readback and single undo")
+                 : fail("G156 color correction readback and single undo", QStringLiteral("color/undo mismatch"));
+
+            const auto beforeInvalid = readClip();
+            const quint64 invalidSerial = projectTimeline->undoManager()->saveSerial();
+            bool g157 = true;
+            const QVector<QJsonObject> invalidValues{
+                {{QStringLiteral("exposure"), 3.01}}, {{QStringLiteral("gamma"), 0.09}},
+                {{QStringLiteral("brightness"), 101}}, {{QStringLiteral("hue"), -181}},
+                {{QStringLiteral("liftR"), 1.01}}, {{QStringLiteral("gammaG"), -1.01}},
+                {{QStringLiteral("logHighB"), 1.01}}, {{QStringLiteral("unknown"), 1}},
+                {{QStringLiteral("contrast"), QStringLiteral("bad")}},
+                {{QStringLiteral("brightness"), 15}, {QStringLiteral("unknown"), 1}}
+            };
+            for (const auto &invalid : invalidValues)
+                g157 = isToolErrorResponse(callColor(invalid)) && g157;
+            g157 = g157 && readClip() == beforeInvalid
+                && projectTimeline->undoManager()->saveSerial() == invalidSerial;
+            const auto warned = toolPayload(callColor(QJsonObject{
+                {QStringLiteral("hueSatWarp"), QJsonObject{{QStringLiteral("enabled"), true}}},
+                {QStringLiteral("tint"), 25.0}}));
+            const auto warnedColor = readClip().value(QStringLiteral("colorCorrection")).toObject();
+            g157 = g157 && warned.value(QStringLiteral("ok")).toBool()
+                && warned.value(QStringLiteral("warning")).toString().contains(QStringLiteral("hueSatWarp"))
+                && warnedColor.value(QStringLiteral("tint")).toDouble() == 25.0
+                && !warnedColor.contains(QStringLiteral("hueSatWarp"))
+                && video0->clips().at(0).colorCorrection.hueSatWarp.isDefault();
+            g157 = undo() && readClip() == beforeInvalid && g157;
+            g157 ? pass("G157 invalid color fields and hueSatWarp warning")
+                 : fail("G157 invalid color fields and hueSatWarp warning", QStringLiteral("validation was not atomic"));
+
+            QTemporaryDir lutDirectory;
+            const QString lutPath = QDir(lutDirectory.path()).filePath(QStringLiteral("identity.cube"));
+            QFile lutFile(lutPath);
+            const QByteArray cube("LUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n");
+            bool g158 = lutDirectory.isValid() && lutFile.open(QIODevice::WriteOnly);
+            if (g158) g158 = lutFile.write(cube) == cube.size();
+            lutFile.close();
+            auto applyLut = [&](const QString &path, double intensity) {
+                return callProjectInfoTool(++requestId, QStringLiteral("apply_lut"), QJsonObject{
+                    {QStringLiteral("clipIndex"), 0}, {QStringLiteral("filePath"), path},
+                    {QStringLiteral("intensity"), intensity}});
+            };
+            saveTestUndoBaseline();
+            const quint64 lutSerial = projectTimeline->undoManager()->saveSerial();
+            const auto applied = toolPayload(applyLut(lutPath, 0.65));
+            const QJsonObject expectedLut{{QStringLiteral("filePath"), lutPath},
+                                         {QStringLiteral("intensity"), 0.65}};
+            g158 = g158 && applied.value(QStringLiteral("ok")).toBool()
+                && requiredOutputFieldsPresent(QStringLiteral("apply_lut"), applied)
+                && applied.value(QStringLiteral("lut")).toObject() == expectedLut
+                && readClip().value(QStringLiteral("lut")).toObject() == expectedLut
+                && projectTimeline->undoManager()->saveSerial() == lutSerial + 1;
+            // Repeated UI writes retain the existing no-change guard.
+            g158 = projectTimeline->setClipLut(0, 0, lutPath, 0.65) && g158;
+            g158 = g158 && projectTimeline->undoManager()->saveSerial() == lutSerial + 1;
+            const auto missingLut = applyLut(lutPath + QStringLiteral(".missing"), 1.0);
+            g158 = isToolErrorResponse(missingLut)
+                && toolErrorText(missingLut).contains(QStringLiteral("LUT ファイルが見つかりません: ")) && g158;
+            g158 = isToolErrorResponse(applyLut(lutPath, 1.01)) && g158;
+            g158 = g158 && projectTimeline->undoManager()->saveSerial() == lutSerial + 1;
+            const auto cleared = toolPayload(applyLut(QString(), 0.25));
+            const auto clearedLut = readClip().value(QStringLiteral("lut")).toObject();
+            g158 = g158 && cleared.value(QStringLiteral("ok")).toBool()
+                && clearedLut.value(QStringLiteral("filePath")).toString().isEmpty()
+                && clearedLut.value(QStringLiteral("intensity")).toDouble() == 1.0
+                && projectTimeline->undoManager()->saveSerial() == lutSerial + 2;
+            g158 = undo() && readClip().value(QStringLiteral("lut")).toObject() == expectedLut && g158;
+            g158 = undo() && video0->clips().at(0).lutFilePath.isEmpty() && g158;
+            const auto defaultLut = toolPayload(callProjectInfoTool(++requestId, QStringLiteral("apply_lut"),
+                QJsonObject{{QStringLiteral("clipIndex"), 0}, {QStringLiteral("filePath"), lutPath}}));
+            g158 = g158 && defaultLut.value(QStringLiteral("ok")).toBool()
+                && defaultLut.value(QStringLiteral("lut")).toObject().value(QStringLiteral("intensity")).toDouble() == 1.0;
+            g158 = undo() && video0->clips().at(0).lutFilePath.isEmpty() && g158;
+            g158 ? pass("G158 LUT apply clear and single-step undo")
+                 : fail("G158 LUT apply clear and single-step undo", QStringLiteral("LUT/undo mismatch"));
+        }
 
         // US-308 reserved G154-G155: compare the same saved/current pair as
         // the UI and prove comparison does not add undo states or dirty it.
@@ -4912,6 +5058,9 @@ int runMcpSelftest()
                QStringLiteral("id presence was not distinguished"));
 
     if (!timelineReady) {
+        fail("G156 color correction readback and single undo", QStringLiteral("Timeline was not available"));
+        fail("G157 invalid color fields and hueSatWarp warning", QStringLiteral("Timeline was not available"));
+        fail("G158 LUT apply clear and single-step undo", QStringLiteral("Timeline was not available"));
         fail("G154 compare_project detects move and volume", QStringLiteral("Timeline was not available"));
         fail("G155 compare_project unchanged and invalid inputs", QStringLiteral("Timeline was not available"));
     }

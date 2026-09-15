@@ -6252,32 +6252,7 @@ void MainWindow::setupMenuBar()
         if (!selectedVideoClipRef(trackIdx, clipIdx, &selected))
             return false;
 
-        TimelineTrack *track = m_timeline->videoTracks().value(trackIdx, nullptr);
-        if (!track)
-            return false;
-
-        QVector<ClipInfo> clips = track->clips();
-        if (clipIdx < 0 || clipIdx >= clips.size())
-            return false;
-
-        const double clampedIntensity = lutPath.isEmpty()
-            ? 1.0
-            : qBound(0.0, intensity, 1.0);
-        ClipInfo &clip = clips[clipIdx];
-        if (clip.lutFilePath == lutPath
-            && std::abs(clip.lutIntensity - clampedIntensity) <= 1e-9) {
-            return true;
-        }
-
-        clip.lutFilePath = lutPath;
-        clip.lutIntensity = clampedIntensity;
-        track->setClips(clips);
-
-        if (m_timeline->undoManager())
-            m_timeline->undoManager()->saveState(
-                m_timeline->currentState(), QStringLiteral("Clip LUT"));
-        m_timeline->refreshPlaybackSequence();
-        return true;
+        return m_timeline->setClipLut(trackIdx, clipIdx, lutPath, intensity);
     };
     connect(m_colorGradingPanel, &ColorGradingPanel::lutSelected,
             this, [this, writeSelectedClipLut](const QString &name) {

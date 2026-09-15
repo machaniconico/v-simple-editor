@@ -8362,6 +8362,33 @@ void Timeline::setClipColorCorrection(int trackIdx, int clipIdx,
     scheduleEmitSequenceChanged();
 }
 
+bool Timeline::setClipLut(int trackIdx, int clipIdx, const QString &lutFilePath,
+                          double intensity, QString *err)
+{
+    auto fail = [err](const QString &message) {
+        if (err) *err = message;
+        return false;
+    };
+    auto *track = m_videoTracks.value(trackIdx, nullptr);
+    if (!track || clipIdx < 0 || clipIdx >= track->clipCount())
+        return fail(QStringLiteral("映像クリップが見つかりません"));
+    if (!std::isfinite(intensity))
+        return fail(QStringLiteral("LUT 強度には有限の数値を指定してください"));
+    const double clampedIntensity = lutFilePath.isEmpty()
+        ? 1.0 : qBound(0.0, intensity, 1.0);
+    auto clips = track->clips();
+    auto &clip = clips[clipIdx];
+    if (clip.lutFilePath == lutFilePath
+        && std::abs(clip.lutIntensity - clampedIntensity) <= 1e-9)
+        return true;
+    clip.lutFilePath = lutFilePath;
+    clip.lutIntensity = clampedIntensity;
+    track->setClips(clips);
+    saveUndoState("Clip LUT");
+    refreshPlaybackSequence();
+    return true;
+}
+
 void Timeline::setClipLayerStyle(const LayerStyle &style)
 {
     int sel = m_videoTrack->selectedClip();
