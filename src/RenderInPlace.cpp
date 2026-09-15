@@ -16,6 +16,56 @@
 #include <cmath>
 
 namespace renderinplace {
+namespace {
+// These properties act on the layer after the material effects. Never flatten
+// them into an opaque codec: the shared renderer must still composite them.
+void copyComposition(const ClipInfo &from, ClipInfo &to)
+{
+    to.videoScale = from.videoScale;
+    to.videoDx = from.videoDx;
+    to.videoDy = from.videoDy;
+    to.rotation2DDegrees = from.rotation2DDegrees;
+    to.is3DLayer = from.is3DLayer;
+    to.layer3D = from.layer3D;
+    to.material = from.material;
+    to.motionBlurEnabled = from.motionBlurEnabled;
+    to.autoOrientEnabled = from.autoOrientEnabled;
+    to.opacity = from.opacity;
+    to.visible = from.visible;
+    to.blendMode = from.blendMode;
+    to.layerStyle = from.layerStyle;
+    to.maskSystem = from.maskSystem;
+    to.maskTrackingData = from.maskTrackingData;
+    to.fitContain = from.fitContain;
+    to.fitCover = from.fitCover;
+}
+
+bool compositionTrack(const QString &name)
+{
+    return name.startsWith(QStringLiteral("motion."))
+        || name == QStringLiteral("positionX") || name == QStringLiteral("positionY")
+        || name == QStringLiteral("scaleX") || name == QStringLiteral("scaleY");
+}
+
+QSize nativeVideoSize(const QString &path)
+{
+    AVFormatContext *context = nullptr;
+    QSize size;
+    if (avformat_open_input(&context, path.toUtf8().constData(), nullptr, nullptr) < 0)
+        return size;
+    if (avformat_find_stream_info(context, nullptr) >= 0) {
+        const int stream = av_find_best_stream(context, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+        if (stream >= 0) {
+            const auto *parameters = context->streams[stream]->codecpar;
+            if (parameters->width > 0 && parameters->height > 0)
+                size = QSize((parameters->width + 1) & ~1, (parameters->height + 1) & ~1);
+        }
+    }
+    avformat_close_input(&context);
+    return size;
+}
+}
+
 bool renderClipInPlace(Timeline &timeline, int trackIndex, int clipIndex,
                        const Options &options, QString *outPath, QString *error)
 {
@@ -45,6 +95,13 @@ bool renderClipInPlace(Timeline &timeline, int trackIndex, int clipIndex,
         return fail(QStringLiteral("このクリップは焼き込みに対応していません"));
 
     const double handles = options.handlesSec;
+    if (isOverlapTransition(original.leadIn.type) || isOverlapTransition(original.trailOut.type))
+        return fail(QStringLiteral("重ね合わせトランジション付きクリップは焼き込めません。先にトランジションを解除してください"));
+    if (!original.maskTrackingData.isEmpty() || !original.stabilizerKeyframes.isEmpty())
+        return fail(QStringLiteral("追跡マスクまたはスタビライズ付きクリップの焼き込みには対応していません"));
+    const QSize outputSize = nativeVideoSize(original.filePath);
+    if (outputSize.isEmpty())
+        return fail(QStringLiteral("素材の映像サイズを取得できません"));
     // Edge transitions are evaluated relative to clip boundaries by the
     // shared renderer. Extending those boundaries would move the transition
     // in the retained region. Do not silently change that picture.
@@ -53,6 +110,11 @@ bool renderClipInPlace(Timeline &timeline, int trackIndex, int clipIndex,
         return fail(QStringLiteral("トランジション付きクリップの焼き込みは、ハンドル秒を0に設定してください"));
     ClipInfo isolated = original;
     isolated.renderInPlaceOriginal.reset();
+    copyComposition(ClipInfo{}, isolated);
+    for (const auto &keys : original.keyframes.tracks()) {
+        if (compositionTrack(keys.propertyName()))
+            isolated.keyframes.removeTrack(keys.propertyName());
+    }
     isolated.leadInSec = 0.0;
     isolated.linkGroup = 0;
     if (handles > 0.0) {
@@ -110,7 +172,7 @@ bool renderClipInPlace(Timeline &timeline, int trackIndex, int clipIndex,
     Timeline temporary;
     temporary.restoreFromProject(QVector<QVector<ClipInfo>>{{isolated}},
                                  QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 10);
-    temporary.setProjectOutputConfig(options.outputSize.width(), options.outputSize.height(), true);
+    temporary.setProjectOutputConfig(outputSize.width(), outputSize.height(), true);
 
     QString directory = options.outputDir;
     if (directory.isEmpty()) {
@@ -130,8 +192,8 @@ bool renderClipInPlace(Timeline &timeline, int trackIndex, int clipIndex,
     QString path = QDir(directory).absoluteFilePath(name + extension);
     for (int suffix = 1; QFileInfo::exists(path); ++suffix)
         path = QDir(directory).absoluteFilePath(name + QStringLiteral("_%1").arg(suffix) + extension);
-    RenderPreset preset{QStringLiteral("クリップ焼き込み"), options.outputSize.width(),
-        options.outputSize.height(), options.codec, 100000000, extension.mid(1)};
+    RenderPreset preset{QStringLiteral("クリップ焼き込み"), outputSize.width(),
+        outputSize.height(), options.codec, 100000000, extension.mid(1)};
     RenderJob job = RenderQueue::jobFromPreset(preset, path, 0,
         qRound64((length + 2.0 * handles) * 1000000.0));
     job.uuid = QUuid::createUuid().toString(QUuid::WithoutBraces);
@@ -183,9 +245,17 @@ bool renderClipInPlace(Timeline &timeline, int trackIndex, int clipIndex,
         return fail(changed ? QStringLiteral("処理中にタイムラインが変更されました")
                             : QStringLiteral("出力メディアを確認できません"));
     }
-    // A fresh ClipInfo resets every baked visual/temporal field, including
-    // new effects added later. Preserve only editing/audio metadata.
+    // Reset baked material/time properties and retain the live composition.
     ClipInfo replacement{};
+    copyComposition(original, replacement);
+    for (const auto &keys : original.keyframes.tracks()) {
+        if (compositionTrack(keys.propertyName()))
+            replacement.keyframes.addTrack(keys);
+    }
+    replacement.isVfxFootage = original.isVfxFootage;
+    replacement.vfxIntensity = 1.0;
+    // VFX black-level zero is identity; ordinary clips retain their default.
+    replacement.vfxBlackLevel = original.isVfxFootage ? 0 : replacement.vfxBlackLevel;
     replacement.filePath = path;
     replacement.displayName = original.displayName;
     replacement.duration = double(*duration) / 1000000.0;

@@ -9,6 +9,7 @@
 #include <QDir>
 #include <QEventLoop>
 #include <QSet>
+#include <QUuid>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QTemporaryDir>
@@ -43,6 +44,7 @@ bool renderControl(Timeline &timeline, const renderinplace::Options &options,
         options.outputSize.height(), options.codec, 100000000, QStringLiteral("mp4")};
     RenderJob job = RenderQueue::jobFromPreset(preset, *path, 0,
         qRound64(timeline.totalDuration() * 1000000.0));
+    job.uuid = QUuid::createUuid().toString(QUuid::WithoutBraces);
     job.timeline = &timeline;
     job.projectFilePath = silentPath;
     job.exportConfig["fps"] = options.fps;
@@ -168,7 +170,7 @@ int runRenderInPlaceSelftest()
             "fixture=%s, exists=%d, duration=%.6f (required >= 3.0 seconds); "
             "run from the repository root\n", int(output.isValid()),
             qPrintable(original.filePath), int(QFileInfo::exists(original.filePath)), original.duration);
-        for (int number = 1; number <= 5; ++number) gate(number, false);
+        for (int number = 1; number <= 7; ++number) gate(number, false);
         std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
         return failed;
     }
@@ -327,6 +329,98 @@ int runRenderInPlaceSelftest()
         std::fprintf(stderr, "G5 roundtrip project retained in %s\n", qPrintable(projectPath));
     }
     gate(5, persistenceMatches);
+    // Reject either side of an overlap before even creating the output directory
+    // or connecting queue progress. Include handles=0 (the reported regression).
+    bool overlapRejected = true;
+    for (int target : {0, 1}) {
+        for (double handles : {0.0, 1.0}) {
+            ClipInfo first = original, second = original;
+            first.trailOut.type = second.leadIn.type = TransitionType::CrossDissolve;
+            first.trailOut.duration = second.leadIn.duration = 0.5;
+            Timeline overlap;
+            overlap.restoreFromProject(QVector<QVector<ClipInfo>>{{first, second}},
+                QVector<QVector<ClipInfo>>{}, 0, -1, -1, 10);
+            overlap.undoManager()->clear();
+            overlap.saveUndoState(QStringLiteral("重ね合わせ初期状態"));
+            const quint64 initialSerial = overlap.undoManager()->saveSerial();
+            auto rejectOptions = options;
+            rejectOptions.handlesSec = handles;
+            rejectOptions.outputDir = output.filePath(QStringLiteral("rejected_%1_%2").arg(target).arg(handles));
+            bool queueStarted = false;
+            rejectOptions.connectProgress = [&](RenderQueue &) { queueStarted = true; };
+            QString rejectedPath, rejectedError;
+            const bool accepted = renderinplace::renderClipInPlace(
+                overlap, 0, target, rejectOptions, &rejectedPath, &rejectedError);
+            overlapRejected = overlapRejected && !accepted && !rejectedError.isEmpty()
+                && rejectedPath.isEmpty() && !queueStarted
+                && !QFileInfo::exists(rejectOptions.outputDir)
+                && overlap.undoManager()->saveSerial() == initialSerial
+                && clipJson(overlap.videoTracks()[0]->clips()[0]) == clipJson(first)
+                && clipJson(overlap.videoTracks()[0]->clips()[1]) == clipJson(second);
+        }
+    }
+    gate(6, overlapRejected);
+
+    // Independent material control from G1, composited over the same untouched
+    // lower track. This measures queue loss without encoding the background.
+    // Also exercise a portrait canvas: a project-sized bake would add black bars.
+    bool compositionMatches = controlRendered;
+    for (bool animated : {false, true}) {
+        ClipInfo lower = original;
+        lower.effects.clear();
+        ClipInfo upper = original;
+        upper.videoScale = 0.5;
+        upper.videoDx = 0.25;
+        upper.opacity = 0.6;
+        if (animated) {
+            KeyframeTrack opacity(QStringLiteral("motion.opacity"));
+            opacity.addKeyframe(0.0, 0.6);
+            opacity.addKeyframe(1.0, 0.8);
+            upper.keyframes.addTrack(opacity);
+        }
+        ClipInfo expectedUpper = controlClip;
+        expectedUpper.videoScale = upper.videoScale;
+        expectedUpper.videoDx = upper.videoDx;
+        expectedUpper.opacity = upper.opacity;
+        expectedUpper.keyframes = upper.keyframes;
+        Timeline layered, expected;
+        layered.restoreFromProject(QVector<QVector<ClipInfo>>{{lower}, {upper}},
+            QVector<QVector<ClipInfo>>{}, 0, -1, -1, 10);
+        expected.restoreFromProject(QVector<QVector<ClipInfo>>{{lower}, {expectedUpper}},
+            QVector<QVector<ClipInfo>>{}, 0, -1, -1, 10);
+        const QSize canvas = animated ? QSize(360, 640) : options.outputSize;
+        QVector<QImage> beforeComposite;
+        for (qint64 tick : {100000LL, 500000LL, 900000LL})
+            beforeComposite.append(tlrender::renderFrameAt(&layered, tick, canvas));
+        auto layerOptions = options;
+        layerOptions.handlesSec = 0.0;
+        layerOptions.outputSize = canvas;
+        QString layerPath, layerError;
+        const bool layerBaked = renderinplace::renderClipInPlace(
+            layered, 1, 0, layerOptions, &layerPath, &layerError);
+        if (!layerBaked) std::fprintf(stderr, "G7 bake failed: %s\n", qPrintable(layerError));
+        const ClipInfo actualUpper = layered.videoTracks()[1]->clips()[0];
+        compositionMatches = compositionMatches && layerBaked
+            && actualUpper.videoScale == upper.videoScale
+            && actualUpper.videoDx == upper.videoDx && actualUpper.opacity == upper.opacity
+            && clipJson(actualUpper).value("keyframes") == clipJson(upper).value("keyframes")
+            && clipJson(layered.videoTracks()[0]->clips()[0]) == clipJson(lower);
+        int frame = 0;
+        for (qint64 tick : {100000LL, 500000LL, 900000LL}) {
+            const QImage after = tlrender::renderFrameAt(&layered, tick, canvas);
+            const QImage control = tlrender::renderFrameAt(&expected, tick, canvas);
+            const double actualMse = mse(beforeComposite[frame], after);
+            const double controlMse = mse(beforeComposite[frame], control);
+            const double residual = mse(control, after);
+            const bool ok = std::isfinite(actualMse) && std::isfinite(controlMse)
+                && actualMse <= controlMse + margin && residual <= margin;
+            std::fprintf(stderr, "G7 animated=%d frame=%d MSE=%.6f control=%.6f residual=%.6f %s\n",
+                int(animated), frame, actualMse, controlMse, residual, ok ? "OK" : "FAIL");
+            compositionMatches = compositionMatches && ok;
+            ++frame;
+        }
+    }
+    gate(7, compositionMatches);
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
     return failed;
 }
