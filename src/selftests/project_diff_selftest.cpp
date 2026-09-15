@@ -105,8 +105,19 @@ int runProjectDiffSelftest()
     KeyframeTrack bezierTrack(QStringLiteral("volume"), 1.0);
     bezierTrack.addKeyframe(0.0, 1.0, KeyframePoint::Bezier);
     b.videoTracks[0][0].keyframes.addTrack(bezierTrack);
+    EnhancedTextOverlay overlay;
+    overlay.letterSpacing = 0.0;
+    overlay.lineSpacing = 0.0;
+    b.videoTracks[0][0].textManager.addOverlay(overlay);
+    b.videoTracks[0][0].shapes.append(Shape{});
+    b.videoTracks[0][0].shapes[0].modifiers.trim.enabled = true;
     c = b;
     auto &small = c.videoTracks[0][0];
+    auto overlays = small.textManager.overlays();
+    overlays[0].letterSpacing += 0.0001;
+    overlays[0].lineSpacing += 0.0001;
+    small.textManager.setOverlays(overlays);
+    small.shapes[0].modifiers.trim.startPct += 0.0001;
     auto &smallTrack = *small.keyframes.track(QStringLiteral("volume"));
     auto smallKeyframe = smallTrack.keyframes()[0];
     smallKeyframe.bezX1 += 0.0001;
@@ -144,10 +155,25 @@ int runProjectDiffSelftest()
         && keyframeChanges[0].type == Change::PropertyChanged
         && keyframeChanges[0].path.endsWith(QStringLiteral(".keyframes"));
     c = b;
+    overlays = c.videoTracks[0][0].textManager.overlays();
+    overlays[0].letterSpacing = 5.0;
+    c.videoTracks[0][0].textManager.setOverlays(overlays);
+    const auto textChanges = diff(b, c);
+    const bool textChanged = textChanges.size() == 1
+        && textChanges[0].type == Change::PropertyChanged
+        && textChanges[0].path.endsWith(QStringLiteral(".textManager"));
+    c = b;
+    c.videoTracks[0][0].shapes[0].modifiers.trim.startPct = 25.0;
+    const auto shapeChanges = diff(b, c);
+    const bool shapeChanged = shapeChanges.size() == 1
+        && shapeChanges[0].type == Change::PropertyChanged
+        && shapeChanges[0].path.endsWith(QStringLiteral(".shapes"));
+    c = b;
     c.audioTracks[0][0].volume = 0.5;
     c.trackFlags = {{"audio", QJsonArray{QJsonObject{{"muted", true}}}}};
     const auto properties = diff(b, c);
     gate(7, epsilonIgnored && epsilonBoundary && materialChanged && keyframeChanged
+         && textChanged && shapeChanged
          && properties.size() == 2
          && count(properties, Change::PropertyChanged) == 1
          && count(properties, Change::TrackFlagChanged) == 1

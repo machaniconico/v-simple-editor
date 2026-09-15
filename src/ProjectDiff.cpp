@@ -63,6 +63,57 @@ QJsonObject projection(const ProjectData &data)
             for (int c = 0; c < tracks[t].size(); ++c) {
                 const auto &clip = tracks[t][c];
                 auto obj = clips.at(c).toObject();
+                // Keep optional collection presence meaningful, but complete
+                // omitted numeric defaults inside each existing collection.
+                if (obj.contains("textManager")) {
+                    auto overlays = obj.value("textManager").toArray();
+                    for (int i = 0; i < overlays.size(); ++i) {
+                        auto overlay = overlays.at(i).toObject();
+                        for (const char *field : {"letterSpacing", "lineSpacing"})
+                            if (!overlay.contains(field)) overlay.insert(field, 0.0);
+                        overlays[i] = overlay;
+                    }
+                    obj.insert("textManager", overlays);
+                }
+                if (obj.contains("shapes")) {
+                    auto shapes = obj.value("shapes").toArray();
+                    for (int i = 0; i < shapes.size(); ++i) {
+                        auto shape = shapes.at(i).toObject();
+                        const auto &modifiers = clip.shapes[i].modifiers;
+                        const auto &repeater = modifiers.repeater;
+                        const auto &trim = modifiers.trim;
+                        shape.insert("modifiers", QJsonObject{
+                            {"repeater", QJsonObject{
+                                {"enabled", repeater.enabled}, {"copies", repeater.copies},
+                                {"offsetX", repeater.offset.x()}, {"offsetY", repeater.offset.y()},
+                                {"rotationDeg", repeater.rotationDeg}, {"scale", repeater.scale},
+                                {"opacityEnd", repeater.opacityEnd}}},
+                            {"trim", QJsonObject{
+                                {"enabled", trim.enabled}, {"startPct", trim.startPct},
+                                {"endPct", trim.endPct}, {"offsetPct", trim.offsetPct}}}
+                        });
+                        shapes[i] = shape;
+                    }
+                    obj.insert("shapes", shapes);
+                }
+                if (obj.contains("clipMasks")) {
+                    auto clipMasks = obj.value("clipMasks").toObject();
+                    auto masks = clipMasks.value("masks").toArray();
+                    for (int i = 0; i < masks.size(); ++i) {
+                        auto mask = masks.at(i).toObject();
+                        auto points = mask.value("points").toArray();
+                        for (int p = 0; p < points.size(); ++p) {
+                            auto point = points.at(p).toObject();
+                            for (const char *field : {"inX", "inY", "outX", "outY"})
+                                if (!point.contains(field)) point.insert(field, 0.0);
+                            points[p] = point;
+                        }
+                        mask.insert("points", points);
+                        masks[i] = mask;
+                    }
+                    clipMasks.insert("masks", masks);
+                    obj.insert("clipMasks", clipMasks);
+                }
                 // Persistence omits identity Bezier handles and absent spatial
                 // tangents. Complete their keys so numeric differences reach equal().
                 if (obj.contains("keyframes")) {
