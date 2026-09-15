@@ -97,7 +97,12 @@ bool renderClipInPlace(Timeline &timeline, int trackIndex, int clipIndex,
         || original.isAdjustment)
         return fail(QStringLiteral("このクリップは焼き込みに対応していません"));
 
-    const double handles = options.handlesSec;
+    // Keep the retained interval on the export frame grid, including when
+    // requested handles contain a fractional frame.
+    const auto snap = [&](double seconds) {
+        return std::ceil(seconds * options.fps - 1e-6) / options.fps;
+    };
+    const double handles = snap(options.handlesSec);
     if (isOverlapTransition(original.leadIn.type) || isOverlapTransition(original.trailOut.type))
         return fail(QStringLiteral("重ね合わせトランジション付きクリップは焼き込めません。先にトランジションを解除してください"));
     // The available codecs flatten alpha to black. Inspect the entire stack,
@@ -212,6 +217,10 @@ bool renderClipInPlace(Timeline &timeline, int trackIndex, int clipIndex,
             }
         }
     }
+    // Audio can extend the job beyond the handles. Snap before positioning
+    // either track so the video source clock and replacement trim agree.
+    prefix = snap(prefix);
+    suffix = snap(suffix);
     std::sort(linked.begin(), linked.end(), [](const ClipInfo &a, const ClipInfo &b) {
         return a.leadInSec < b.leadInSec;
     });

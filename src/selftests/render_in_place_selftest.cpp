@@ -517,9 +517,10 @@ int runRenderInPlaceSelftest()
     };
     // Equal lengths, audio extending past the video, and audio starting a
     // second before the video. The latter two used to leave V1 export gaps.
-    for (const LinkedCase &test : {LinkedCase{2.0, 0.0, 0.25, 1.5},
-                                  LinkedCase{3.0, 0.0, 0.25, 2.25},
-                                  LinkedCase{3.0, 1.0, 1.0, 2.25}}) {
+    // Request 7.5 frames of handles at 30 fps to verify rounding up to 8.
+    for (const LinkedCase &test : {LinkedCase{2.0, 0.0, 8.0 / 30.0, 1.0 + 16.0 / 30.0},
+                                  LinkedCase{3.0, 0.0, 8.0 / 30.0, 2.0 + 8.0 / 30.0},
+                                  LinkedCase{3.0, 1.0, 1.0, 2.0 + 8.0 / 30.0}}) {
         ClipInfo linkedVideo = original;
         linkedVideo.linkGroup = 312;
         linkedVideo.leadInSec = test.videoStart;
@@ -559,10 +560,10 @@ int runRenderInPlaceSelftest()
         if (linkedBaked) {
             const ClipInfo &bakedVideo = linkedTimeline.videoTracks()[0]->clips()[0];
             const ClipInfo &bakedAudio = linkedTimeline.audioTracks()[0]->clips()[0];
-            linkedOk = linkedOk && bakedVideo.inPoint == test.expectedPrefix
-                && bakedVideo.outPoint == test.expectedPrefix + linkedVideo.effectiveDuration()
-                && bakedAudio.inPoint == test.expectedPrefix - test.videoStart
-                && bakedAudio.outPoint == bakedAudio.inPoint + linkedAudio.effectiveDuration();
+            linkedOk = linkedOk && std::abs(bakedVideo.inPoint - test.expectedPrefix) <= 1e-6
+                && std::abs(bakedVideo.outPoint - (test.expectedPrefix + linkedVideo.effectiveDuration())) <= 1e-6
+                && std::abs(bakedAudio.inPoint - (test.expectedPrefix - test.videoStart)) <= 1e-6
+                && std::abs(bakedAudio.outPoint - (bakedAudio.inPoint + linkedAudio.effectiveDuration())) <= 1e-6;
             Timeline unbaked;
             unbaked.restoreFromProject(QVector<QVector<ClipInfo>>{{linkedVideo}},
                 QVector<QVector<ClipInfo>>{{linkedAudio}}, 0, -1, -1, 10);
@@ -580,14 +581,25 @@ int runRenderInPlaceSelftest()
                 const qint64 timelineTick = qRound64(test.videoStart * 1000000.0) + tick;
                 const QImage beforeImage = tlrender::renderFrameAt(&unbaked, timelineTick, options.outputSize);
                 const QImage afterImage = tlrender::renderFrameAt(&linkedTimeline, timelineTick, options.outputSize);
+                const qint64 frameTick = qRound64(1000000.0 / linkedOptions.fps);
+                const QImage previousImage = tlrender::renderFrameAt(
+                    &linkedTimeline, timelineTick - frameTick, options.outputSize);
+                const QImage nextImage = tlrender::renderFrameAt(
+                    &linkedTimeline, timelineTick + frameTick, options.outputSize);
                 const QImage control = tlrender::renderFrameAt(&controlTimeline, tick, options.outputSize);
                 const double actualMse = mse(beforeImage, afterImage);
                 const double controlMse = mse(beforeImage, control);
                 const double residual = mse(control, afterImage);
+                const double residualPrev = mse(control, previousImage);
+                const double residualNext = mse(control, nextImage);
+                // Prefix frames change encoder history. Allow its noise floor,
+                // but require the retained frame to beat both adjacent frames.
                 const bool ok = controlRendered && std::isfinite(actualMse) && std::isfinite(controlMse)
-                    && actualMse <= controlMse + margin && residual <= margin;
-                std::fprintf(stderr, "G6 retained frame=%d MSE=%.6f control=%.6f residual=%.6f %s\n",
-                    frame++, actualMse, controlMse, residual, ok ? "OK" : "FAIL");
+                    && std::isfinite(residualPrev) && std::isfinite(residualNext)
+                    && actualMse <= controlMse + margin && residual <= 3.5
+                    && residual < residualPrev && residual < residualNext;
+                std::fprintf(stderr, "G6 retained frame=%d MSE=%.6f control=%.6f residual=%.6f prev=%.6f next=%.6f %s\n",
+                    frame++, actualMse, controlMse, residual, residualPrev, residualNext, ok ? "OK" : "FAIL");
                 linkedOk = linkedOk && ok;
             }
             linkedTimeline.undo();
