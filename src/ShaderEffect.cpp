@@ -999,6 +999,11 @@ QStringList ShaderEffectLibrary::categories() const
 
 ShaderEffectDef ShaderEffectLibrary::findByName(const QString &name) const
 {
+    // RollingShutterRepair is CPU-only: temporal optical flow is dispatched
+    // through tlrender::applyRollingShutterFromSource, like Echo.
+    if (name == QStringLiteral("RollingShutterRepair")
+        || name == QStringLiteral("ローリングシャッター補正"))
+        return {};
     for (const ShaderEffectDef &d : m_effects) {
         if (d.name == name)
             return d;

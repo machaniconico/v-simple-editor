@@ -104,7 +104,8 @@ QImage prepareClipForCpuComposite(
     const std::function<QImage(double, double)> &frameProvider,
     const QVector<Mask> &masks)
 {
-    const QImage effected = tlrender::hasActiveEcho(clip, clipLocalSeconds)
+    const QImage effected = (tlrender::hasActiveEcho(clip, clipLocalSeconds)
+        || tlrender::hasActiveRollingShutter(clip, clipLocalSeconds))
         ? tlrender::applyClipFxStackWithEchoFromSource(
               source, clip, clipLocalSeconds, sourceSeconds, frameProvider)
         : tlrender::applyClipFxStackFromSource(
@@ -3994,7 +3995,8 @@ QImage VideoPlayer::preparePreviewClipFrame(
             ? remappedPreviewClip(*sourceClip, m_fullPreviewEffects)
             : *sourceClip;
         const bool hasEcho =
-            tlrender::hasActiveEcho(previewClip, clipLocalSec);
+            tlrender::hasActiveEcho(previewClip, clipLocalSec)
+            || tlrender::hasActiveRollingShutter(previewClip, clipLocalSec);
 
         if (frameNeedsClipCpu) {
             // Once one active stack needs CPU, GL grading/effects are disabled

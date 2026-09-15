@@ -171,7 +171,8 @@ enum class VideoEffectType {
     CornerPinSimple,
     FilmGrain,
     Echo,
-    LensDistortion
+    LensDistortion,
+    RollingShutterRepair
 };
 
 struct VideoEffect {
@@ -293,6 +294,10 @@ struct VideoEffect {
     static VideoEffect createLensDistortion(double k1 = 0.0, double k2 = 0.0,
                                             double scale = 1.0,
                                             double centerX = 0.0, double centerY = 0.0);
+    // CPU temporal effect: p1=rate, p2=direction, p3=strength.
+    static VideoEffect createRollingShutterRepair(double rate = 0.5,
+                                                  int direction = 0,
+                                                  double strength = 1.0);
     static VideoEffect createEcho(double delaySec = 0.1, int count = 3,
                                   double decay = 0.5, int blend = 2);
 };

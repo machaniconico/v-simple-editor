@@ -113,6 +113,7 @@ QString videoCategory(VideoEffectType type)
     case VideoEffectType::Mirror:
     case VideoEffectType::PolarCoordinates:
     case VideoEffectType::MotionTile:
+    case VideoEffectType::RollingShutterRepair:
     case VideoEffectType::LensDistortion:
     case VideoEffectType::CornerPinSimple:
         return QStringLiteral("ディストーション");

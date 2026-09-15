@@ -152,6 +152,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/AeFxDistort2Selftest.cpp
     src/selftests/AeFxGenerateSelftest.cpp
     src/selftests/AeFxStylizeSelftest.cpp
+    src/selftests/rolling_shutter_selftest.cpp
     src/selftests/fxgrain_echo_selftest.cpp
 
     # PRD-SPLIT-MAIN-3 Phase 3-C: Sprint 11-22 サービス selftests (moved from src/main.cpp).

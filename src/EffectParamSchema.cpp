@@ -262,6 +262,13 @@ QVector<ParamDef> paramSchemaFor(VideoEffectType type)
             { "seedPerFrame", "フレーム毎にシード", ParamType::Bool, 0.0, 1.0, 1.0 }
         };
 
+    case VideoEffectType::RollingShutterRepair:
+        return {
+            { "rate", "走査時間", ParamType::Float, 0.0, 1.0, 0.5 },
+            { "direction", "走査方向 (0=上→下 / 1=下→上)", ParamType::Int, 0.0, 1.0, 0.0 },
+            { "strength", "強度", ParamType::Float, 0.0, 1.0, 1.0 }
+        };
+
     case VideoEffectType::Echo:
         return {
             { "delaySec", "遅延 (秒・調整レイヤーでは無効)",

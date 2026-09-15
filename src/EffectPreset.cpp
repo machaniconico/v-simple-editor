@@ -86,6 +86,7 @@ QString effectTypeKey(VideoEffectType type)
     case VideoEffectType::MotionTile: return QStringLiteral("MotionTile");
     case VideoEffectType::CornerPinSimple: return QStringLiteral("CornerPinSimple");
     case VideoEffectType::FilmGrain: return QStringLiteral("FilmGrain");
+    case VideoEffectType::RollingShutterRepair: return QStringLiteral("RollingShutterRepair");
     case VideoEffectType::Echo: return QStringLiteral("Echo");
     case VideoEffectType::LensDistortion: return QStringLiteral("LensDistortion");
     }

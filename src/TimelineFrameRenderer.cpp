@@ -1,5 +1,7 @@
 #include "TimelineFrameRenderer.h"
 #include "Timeline.h"
+#include "OpticalFlow.h"
+#include <atomic>
 #include "Light3D.h"
 #include "Camera3D.h"
 #include "VideoEffect.h"        // VideoEffectProcessor::applyColorCorrection (CPU SSOT)
@@ -758,6 +760,129 @@ QImage applyClipFxPack(const QImage &graded, const ClipInfo &clip,
 
 } // namespace
 
+namespace {
+std::atomic<bool> rollingShutterDisabled{false};
+std::atomic<quint64> rollingShutterCalls{0};
+
+bool activeRollingShutterEffect(const VideoEffect &effect)
+{
+    return effect.enabled && effect.type == VideoEffectType::RollingShutterRepair
+        && std::isfinite(effect.param1) && effect.param1 > 0.0
+        && std::isfinite(effect.param3) && effect.param3 > 0.0;
+}
+
+double rollingShutterSourceFps(const ClipInfo &clip)
+{
+    // Same stream-rate priority as VideoPlayer::videoFrameDurationUs.
+    // Generated frames have no stream metadata and use the 30 Hz fallback.
+    double fps = 30.0;
+    if (clip.filePath.isEmpty() || clip.filePath.startsWith(QStringLiteral("veditor://")))
+        return fps;
+    AVFormatContext *format = nullptr;
+    if (avformat_open_input(&format, clip.filePath.toUtf8().constData(), nullptr, nullptr) < 0)
+        return fps;
+    if (avformat_find_stream_info(format, nullptr) >= 0) {
+        for (unsigned i = 0; i < format->nb_streams; ++i) {
+            const AVStream *stream = format->streams[i];
+            if (stream->codecpar->codec_type != AVMEDIA_TYPE_VIDEO)
+                continue;
+            AVRational rate = stream->avg_frame_rate;
+            if (rate.num <= 0 || rate.den <= 0)
+                rate = stream->r_frame_rate;
+            if (rate.num > 0 && rate.den > 0)
+                fps = av_q2d(rate);
+            break;
+        }
+    }
+    avformat_close_input(&format);
+    return fps;
+}
+} // namespace
+
+void setRollingShutterDisabledForTesting(bool disabled)
+{
+    rollingShutterDisabled.store(disabled);
+}
+void resetRollingShutterInvocationCountForTesting() { rollingShutterCalls.store(0); }
+quint64 rollingShutterInvocationCountForTesting() { return rollingShutterCalls.load(); }
+
+bool hasActiveRollingShutter(const ClipInfo &clip, double clipLocalSeconds)
+{
+    if (rollingShutterDisabled.load() || clip.isAdjustment)
+        return false;
+    bool contains = false;
+    for (const VideoEffect &effect : clip.effects)
+        contains |= effect.enabled && effect.type == VideoEffectType::RollingShutterRepair;
+    if (!contains)
+        return false;
+    for (const VideoEffect &effect : clipanim::effectiveEffectsAt(clip, clipLocalSeconds))
+        if (activeRollingShutterEffect(effect))
+            return true;
+    return false;
+}
+
+QImage applyRollingShutterFromSource(
+    const QImage &source, const VideoEffect &effect, const ClipInfo &clip,
+    double localSeconds, double sourceSeconds,
+    const EchoFrameProvider &provider, double sourceFps)
+{
+    if (rollingShutterDisabled.load() || clip.isAdjustment || source.isNull()
+        || !provider || !activeRollingShutterEffect(effect))
+        return source;
+    const double fps = std::isfinite(sourceFps) && sourceFps > 0.0
+        ? sourceFps : rollingShutterSourceFps(clip);
+    const double step = 1.0 / fps;
+    double sign = 1.0;
+    auto sample = [&](double local) {
+        if (local < -1e-9 || local >= clip.effectiveDuration() - 1e-9)
+            return QImage();
+        const double src = sourceSeconds + clip.sourceSecondAtLocalTime(local)
+            - clip.sourceSecondAtLocalTime(localSeconds);
+        const double sourceOut = clip.outPoint > 0.0 ? clip.outPoint : clip.duration;
+        if (src < clip.inPoint - 1e-9 || src >= sourceOut - 1e-9)
+            return QImage();
+        return provider(src, qMax(0.0, local));
+    };
+    QImage neighbour = sample(localSeconds + step);
+    if (neighbour.isNull()) {
+        sign = -1.0;
+        neighbour = sample(localSeconds - step);
+    }
+    if (neighbour.isNull())
+        return source;
+    const QSize estimateSize = source.size().scaled(480, 480, Qt::KeepAspectRatio);
+    const QSize size = qMax(source.width(), source.height()) > 480
+        ? estimateSize : source.size();
+    const QImage currentSmall = source.scaled(size, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+    const QImage nextSmall = neighbour.scaled(size, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+    const auto flow = opticalflow::estimateFlow(currentSmall, nextSmall);
+    if (flow.v.isEmpty())
+        return source;
+    opticalflow::FlowField correction;
+    correction.width = source.width();
+    correction.height = source.height();
+    correction.v.resize(correction.width * correction.height);
+    const double sx = double(source.width()) / size.width();
+    const double sy = double(source.height()) / size.height();
+    const double direction = effect.param2 >= 0.5 ? -1.0 : 1.0;
+    for (int y = 0; y < correction.height; ++y) {
+        const double tau = qBound(0.0, effect.param1, 1.0)
+            * (double(y) / correction.height - 0.5) * direction;
+        for (int x = 0; x < correction.width; ++x) {
+            const double fx = x / sx, fy = y / sy;
+            const int ix = int(fx), iy = int(fy);
+            const double ax = fx - ix, ay = fy - iy;
+            const QPointF v = (flow.at(ix, iy) * (1.0 - ax) + flow.at(ix + 1, iy) * ax) * (1.0 - ay)
+                + (flow.at(ix, iy + 1) * (1.0 - ax) + flow.at(ix + 1, iy + 1) * ax) * ay;
+            correction.v[y * correction.width + x] = QPointF(v.x() * sx, v.y() * sy)
+                * (-tau * qBound(0.0, effect.param3, 1.0) * sign);
+        }
+    }
+    ++rollingShutterCalls;
+    // correction is a forward displacement; warpImage takes pull coordinates.
+    return opticalflow::warpImage(source, correction, -1.0);
+}
+
 bool hasActiveEcho(const ClipInfo &clip, double clipLocalSeconds)
 {
     bool containsEnabledEcho = false;
@@ -833,6 +958,15 @@ QImage applyClipFxPackWithEcho(const QImage &graded, const ClipInfo &clip,
             const VideoEffect &effect = effects[effectIndex];
             if (!effectActiveAt(clip.effects[effectIndex], localSeconds))
                 continue;
+            if (activeRollingShutterEffect(effect)) {
+                const EchoFrameProvider prefixProvider = [&](double src, double loc) {
+                    const QImage frame = frameProvider ? frameProvider(src, loc) : QImage();
+                    return frame.isNull() ? frame : applyPrefix(frame, effectIndex, loc, src);
+                };
+                result = applyRollingShutterFromSource(
+                    result, effect, clip, localSeconds, currentSourceSeconds, prefixProvider);
+                continue;
+            }
             if (!effect.enabled || effect.type != VideoEffectType::Echo) {
                 result = VideoEffectProcessor::applyEffect(result, effect);
                 continue;
@@ -1729,7 +1863,7 @@ QImage renderFrameFromTracks(const Timeline *timeline,
                 sequenceSnapshot, sequenceStack, projectLights,
                 projectLightViewPosition, sampleFromLeftBoundary), c, loc);
         };
-        QImage neighbour = hasActiveEcho(c, local)
+        QImage neighbour = (hasActiveEcho(c, local) || hasActiveRollingShutter(c, local))
             ? applyClipFxStackWithEchoFromSource(raw, c, local, source, provider)
             : applyClipFxStackFromSource(raw, c, local);
         neighbour = applyClipMask(neighbour, c, source);
@@ -1843,7 +1977,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         // the clip carries no effects, so a lone V1 clip stays byte-identical to
         // S2/S3/S4.
         QImage v1Fx;
-        if (hasActiveEcho(v1Clip, v1LocalSec)) {
+        if (hasActiveEcho(v1Clip, v1LocalSec)
+            || hasActiveRollingShutter(v1Clip, v1LocalSec)) {
             const EchoFrameProvider echoFrameProvider =
                 [&](double sampleSourceSec, double sampleLocalSec) -> QImage {
                     const QImage sampleRaw = renderClipSourceFrame(
@@ -2042,7 +2177,7 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         const QImage gradedNative = gradeClipNativeFrame(
             applyVfxFootageControls(nativeRaw, c), c, localSec);
         QImage nativeForMask;
-        if (hasActiveEcho(c, localSec)) {
+        if (hasActiveEcho(c, localSec) || hasActiveRollingShutter(c, localSec)) {
             const EchoFrameProvider echoFrameProvider =
                 [&](double sampleSourceSec, double sampleLocalSec) -> QImage {
                     const QImage sampleRaw = renderClipSourceFrame(

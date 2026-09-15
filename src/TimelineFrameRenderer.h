@@ -14,6 +14,7 @@
 
 class Timeline;
 struct ClipInfo;
+struct VideoEffect;
 struct OverlapInterval;
 struct PlaybackEntry;
 namespace clipgeom { struct ClipTransform; }
@@ -85,6 +86,17 @@ QImage composeEcho(const QImage &base, const QVector<QImage> &echoes,
 using EchoFrameProvider =
     std::function<QImage(double sourceSeconds, double clipLocalSeconds)>;
 
+// CPU-only temporal repair. Source and provider must have the same FX prefix.
+// sourceFps=0 probes the source stream (generated sources fall back to 30 Hz).
+bool hasActiveRollingShutter(const ClipInfo &clip, double clipLocalSeconds);
+void setRollingShutterDisabledForTesting(bool disabled);
+void resetRollingShutterInvocationCountForTesting();
+quint64 rollingShutterInvocationCountForTesting();
+QImage applyRollingShutterFromSource(
+    const QImage &source, const VideoEffect &effect, const ClipInfo &clip,
+    double clipLocalSeconds, double sourceSeconds,
+    const EchoFrameProvider &frameProvider, double sourceFps = 0.0);
+
 bool hasActiveEcho(const ClipInfo &clip, double clipLocalSeconds);
 // Shared clip-local pre-Echo stage used by export and VideoPlayer. The source
 // frame is processed as VFX footage (when enabled) and then receives the
@@ -96,7 +108,7 @@ QImage applyClipFxStackFromSource(const QImage &source, const ClipInfo &clip,
 QImage applyClipFxPackWithEcho(const QImage &graded, const ClipInfo &clip,
                                double clipLocalSeconds, double sourceSeconds,
                                const EchoFrameProvider &frameProvider);
-// Full native clip stage for an Echo-bearing stack: VFX footage controls ->
+// Full native clip stage for Echo/RollingShutterRepair: VFX footage controls ->
 // grade/LUT -> ordered FX/Echo. Both export and preview call this function
 // before mask, fit, transform, and canvas composition.
 QImage applyClipFxStackWithEchoFromSource(

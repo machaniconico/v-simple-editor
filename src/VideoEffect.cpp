@@ -467,6 +467,7 @@ QString VideoEffect::typeName(VideoEffectType t)
     case VideoEffectType::MotionTile: return "モーションタイル";
     case VideoEffectType::CornerPinSimple: return "コーナーピン(簡易)";
     case VideoEffectType::FilmGrain: return "フィルムグレイン";
+    case VideoEffectType::RollingShutterRepair: return "ローリングシャッター補正";
     case VideoEffectType::Echo: return "エコー(残像)";
     case VideoEffectType::LensDistortion: return "レンズ歪み補正";
     }
@@ -497,7 +498,8 @@ QVector<VideoEffectType> VideoEffect::allTypes()
              VideoEffectType::Twirl, VideoEffectType::Mirror,
              VideoEffectType::PolarCoordinates, VideoEffectType::MotionTile,
              VideoEffectType::CornerPinSimple, VideoEffectType::FilmGrain,
-             VideoEffectType::Echo, VideoEffectType::LensDistortion };
+             VideoEffectType::Echo, VideoEffectType::LensDistortion,
+             VideoEffectType::RollingShutterRepair };
 }
 
 VideoEffect VideoEffect::createBlur(double r)
@@ -604,6 +606,16 @@ VideoEffect VideoEffect::createLensDistortion(double k1, double k2, double scale
     effectctrl::setParamValue(e, QStringLiteral("scale"), scale);
     effectctrl::setParamValue(e, QStringLiteral("centerX"), centerX);
     effectctrl::setParamValue(e, QStringLiteral("centerY"), centerY);
+    return e;
+}
+
+VideoEffect VideoEffect::createRollingShutterRepair(double rate, int direction, double strength)
+{
+    VideoEffect e;
+    e.type = VideoEffectType::RollingShutterRepair;
+    e.param1 = qBound(0.0, rate, 1.0);
+    e.param2 = qBound(0, direction, 1);
+    e.param3 = qBound(0.0, strength, 1.0);
     return e;
 }
 
@@ -825,6 +837,12 @@ double paramValue(const VideoEffect &effect, const QString &paramName)
                 return effect.param3;
             if (paramName == "seedPerFrame" && effect.type == VideoEffectType::FilmGrain)
                 return effect.keyColor.red() != 0 ? 1.0 : 0.0;
+            if (paramName == "rate" && effect.type == VideoEffectType::RollingShutterRepair)
+                return effect.param1;
+            if (paramName == "direction" && effect.type == VideoEffectType::RollingShutterRepair)
+                return effect.param2;
+            if (paramName == "strength" && effect.type == VideoEffectType::RollingShutterRepair)
+                return effect.param3;
             if (paramName == "delaySec" && effect.type == VideoEffectType::Echo)
                 return effect.param1;
             if (paramName == "count" && effect.type == VideoEffectType::Echo)
@@ -1118,6 +1136,15 @@ void setParamValue(VideoEffect &effect, const QString &paramName, double value)
                 storage.setRed(value >= 0.5 ? 1 : 0);
                 effect.keyColor = storage;
                 return;
+            }
+            if (paramName == "rate" && effect.type == VideoEffectType::RollingShutterRepair) {
+                effect.param1 = value; return;
+            }
+            if (paramName == "direction" && effect.type == VideoEffectType::RollingShutterRepair) {
+                effect.param2 = value; return;
+            }
+            if (paramName == "strength" && effect.type == VideoEffectType::RollingShutterRepair) {
+                effect.param3 = value; return;
             }
             if (paramName == "delaySec" && effect.type == VideoEffectType::Echo) {
                 effect.param1 = value; return;
@@ -1649,6 +1676,7 @@ QImage VideoEffectProcessor::applyEffect(const QImage &input, const VideoEffect 
     case VideoEffectType::FilmGrain: return applyFilmGrain(
         input, effect.param1, static_cast<int>(std::round(effect.param2)),
         effect.param3, effect.keyColor.red() != 0);
+    case VideoEffectType::RollingShutterRepair: // CPU temporal SSOT in tlrender.
     case VideoEffectType::Echo:
         // Echo needs random-access source frames and is therefore composed by
         // TimelineFrameRenderer. The single-frame CPU effect remains a no-op.

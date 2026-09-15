@@ -103,6 +103,7 @@ int runFrameExportSelftest();
 int runFcpxmlSelftest();
 int runFreezeFrameSelftest();
 int runFrameIoSelftest();
+int runRollingShutterSelftest();
 int runFxGrainEchoSelftest();
 int runGradeKeyframeSelftest();
 int runGradeKeyframeExtSelftest();
@@ -572,6 +573,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "AE-FX-5 Generate Family: gradient ramp, fill, bloom, scanlines, halftone gates (G1-G6)" },
     { "ae-fx-stylize",     "VEDITOR_AE_FX_STYLIZE_SELFTEST",      runAeFxStylizeSelftest,        false,
       "AE-FX-2 Stylize Family: glow, edges, emboss, posterize, threshold, solarize gates (G1-G7)" },
+    { "rolling-shutter", "VEDITOR_ROLLING_SHUTTER_SELFTEST", runRollingShutterSelftest, true,
+      "Rolling shutter: bypass, repair, direction, last frame, determinism, presets (G1-G6)" },
     { "fxgrain-echo",      "VEDITOR_FXGRAIN_ECHO_SELFTEST",       runFxGrainEchoSelftest,         false,
       "FilmGrain deterministic CPU effect + Echo temporal compositor + preview routing gates (G1-G16)" },
     { "effect-preset", "VEDITOR_EFFECT_PRESET_SELFTEST", runEffectPresetSelftest, false,
