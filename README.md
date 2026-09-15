@@ -174,10 +174,11 @@ MCP の変更系ツールは確認ダイアログを出さず、原則として�
 | 名前 | 何をするか | Undo |
 |---|---|---|
 | `get_project_info` | プロジェクト情報を読み取る | なし |
-| `get_timeline` | タイムラインを読み取る | なし |
+| `get_timeline` | タイムラインを読み取る。各クリップの `leadIn` / `trailOut` は `{type, durationSec, alignment, easing, softness, borderWidth, borderColor}`、`overlap` は隣接クリップとのトランジションで実際に重なる秒数 `{leadInSec, trailOutSec}` を返す | なし |
 | `get_frame` | 指定時刻の合成フレームを PNG で返す（既定 640px 以下・1MB 以内） | なし |
 | `get_captions` | 字幕を読み取る | なし |
 | `get_export_status` | `export_video` ジョブの状態・進捗を返す | なし |
+| `compare_project` | `filePath` の保存済み `.veditor` と現在のタイムラインを構造比較し、`{ok, changes:[{type, path, before, after}], summary:{added, removed, moved, trimmed, changed}}` を返す（読み取り専用）。`type` は `Added` / `Removed` / `Moved` / `Trimmed` / `PropertyChanged` / `EffectsChanged` / `TransitionChanged` / `TrackFlagChanged`。数値の微小差（eps 以内）は同一とみなす | なし |
 | `list_commands` | メニュー直下のお気に入り登録可能なアクションを一覧する（サブメニュー内の項目は含まない）。ID は `<メニューキー>.<メニュー内の通し番号>`（例: `file.11`, `tools.41`）で、表示文言の変更では変わらないが、メニューの途中にアクションが追加されると後続の番号がずれる（位置依存）ため、実行前に `list_commands` で id を確認する。`query` 省略時は全件（約 230 件・JSON で約 60KB）を返すので通常は `query` で id / 表示名 / メニュー名を部分一致フィルタする。各項目に `risk`（safe / blocking / quit）と `enabled` を返す | なし |
 | `run_command` | `list_commands` のアクションを ID で実行する（`allowBlocking` は既定 false。応答の `undoRecorded` で Ctrl+Z / `undo` の対象になったか確認できる） | アクション依存（MCP 側では追加しない） |
 | `export_video` | タイムラインを動画へ非同期で書き出し、`jobId` を返す。音声はトリム・分割・並べ替え・音量・ミュートを反映したタイムラインのミックスを ffmpeg で作ってから多重化する（`audioCodec` / `audioBitrate` 省略時は aac / 192 kbps） | なし |
@@ -191,7 +192,7 @@ MCP の変更系ツールは確認ダイアログを出さず、原則として�
 | `move_clip` | クリップを移動する（`newTrackIndex` で別トラックへ。既定プロジェクトは V1/A1 の 1 段なので、先に `run_command` の「ビデオトラックを追加」を実行する。存在しないトラックを指定するとエラー文でそのコマンド id を案内する） | あり |
 | `set_clip_property` | クリップのプロパティ（volume / opacity / speed / pan / videoScale / reversed / autoOrient）を変更する。`speed` と `reversed` はリンクした音声クリップにも同時に適用される。`autoOrient`（boolean）はモーションパスの進行方向へクリップを自動回転させる（`get_timeline` の各クリップに `autoOrient` が返る） | あり |
 | `trim_clip` | edge=in は開始位置を保ったまま timeSec 時点の内容を新しい先頭にし、以降が (timeSec−開始) だけ左へ詰まる（RippleIn）。edge=out は末尾を timeSec にし後続が詰まる（RippleOut）。kind は video のみだが、同じ linkGroup の音声クリップも同じ量だけトリムされる（ripple 既定 true） | あり |
-| `set_transition` | `kind` 既定 `video`: V1 のクリップにトランジションを設定する（FadeIn は先頭、その他は末尾、None で解除）。`type` には `MorphCut`（オプティカルフローで A/B を変形しながらつなぐモーフカット）も指定できる。ビデオトランジションはプレビューだけでなく書き出しにも反映される。`kind:"audio"` では指定音声トラック（`trackIndex`）のクリップにコンスタントパワーの音声トランジションを設定する。音声で使える `type` は `CrossDissolve`（隣接クリップとのクロスフェード）/ `FadeIn` / `FadeOut` のみで、None を含む他の type はエラー。`durationSec` は 0.1..5.0（既定 0.5）。音声側の変更は映像へミラーしない | あり |
+| `set_transition` | `kind` 既定 `video`: V1 のクリップにトランジションを設定する（FadeIn は先頭、その他は末尾、None で解除）。`type` には `MorphCut`（オプティカルフローで A/B を変形しながらつなぐモーフカット）も指定できる。ビデオトランジションはプレビューだけでなく書き出しにも反映される。`kind:"audio"` では指定音声トラック（`trackIndex`）のクリップにコンスタントパワーの音声トランジションを設定する。音声で使える `type` は `CrossDissolve`（隣接クリップとのクロスフェード）/ `FadeIn` / `FadeOut` のみで、None を含む他の type はエラー。`durationSec` は 0.1..5.0（既定 0.5）。音声側の変更は映像へミラーしない。`alignment`（`Center` / `Start` / `End`、既定 Center）と `easing`（`Linear` / `EaseIn` / `EaseOut` / `EaseInOut`、既定 Linear）は映像・音声どちらでも指定できる。`softness`（0..1）/ `borderWidth`（0..50 px）/ `borderColor`（`#RRGGBB`）はワイプ・バーンドア・アイリス・クロックワイプ系だけに効き、他の type では無視して `warning` を返す | あり |
 | `add_text_overlay` | V1 にテキスト／テロップを追加する（時刻は秒、位置は 0..1。区間と重なる全クリップに付くのでクリップ境界をまたいでも表示される） | あり |
 | `add_caption` | 字幕エディタの一覧に 1 件追加する（タイムラインへは `apply_captions` で反映） | なし（Ctrl+Z 対象外） |
 | `apply_captions` | 字幕エディタの字幕を V1 の 1 語字幕オーバーレイとしてタイムラインへ適用する（既存の生成済み 1 語字幕は置き換え） | あり（タイムライン側のみ。字幕エディタの一覧は戻らない） |
@@ -206,11 +207,13 @@ MCP の変更系ツールは確認ダイアログを出さず、原則として�
 | `dynamic_zoom` | 指定動画クリップへダイナミックズームを適用し、位置とスケールに開始・終了キーフレームを生成する。`preset`（zoomIn / zoomOut / panLeft / panRight / panUp / panDown）か `start` / `end`（cx / cy / w の正規化座標）のどちらか一方を指定する（両方指定はエラー）。枠は常にキャンバスのアスペクト比に固定され、`h` を指定しても無視して warning を返す | あり |
 | `match_frame` | 再生ヘッド位置（または `timeSec`）の動画クリップを、speed・逆再生・リマップを反映したソース時刻でソースモニターに開く | なし |
 | `replace_clip` | 指定クリップの素材を `filePath` のメディアへ置き換える。位置・inPoint・長さを可能な限り維持し、同じ linkGroup の音声も新素材に音声があれば置き換える。新素材が短い場合は warning を返す | あり |
+| `render_in_place` | 指定した映像クリップ（`trackIndex` / `clipIndex`、`kind` は `video` のみ）の効果・変形を新規メディアへ焼き込み、そのクリップを差し替える（`codec` は `h264` / `prores`、`handlesSec` 0..5 で前後の余白秒）。同じ linkGroup の音声クリップも同時に焼き込む。応答は `{ok, outputPath, replaced, linkedAudioReplaced}`。重ね合わせトランジション付き・クロマキー付きのクリップは拒否する | あり（映像・音声まとめて 1 回） |
+| `decompose_render_in_place` | `render_in_place` で差し替えたクリップ（`trackIndex` / `clipIndex`）を効果・変形つきの元のクリップに戻す（リンク音声も同時） | あり |
 | `relink_media` | 見つからないメディア / LUT のパスを `mapping`（`[{from, to}]`、1 件以上）で一括再リンクする。`to` が全て実在するファイルのときだけ変更し、リンクした映像・音声、パーティクル設定やオーバーレイの参照、ネストしたシーケンスまで 1 回の Undo で更新する。存在しないファイルを指定すると「ファイルが見つかりません」のエラーで何も変更しない。応答は `{"ok":true,"relinked":N}` | あり |
 | `music_remix` | 音声クリップ（`kind` は `audio` のみ）をビート境界のセグメントで再構成し、`targetSec`（0 より大きく 86400 以下）の尺へ自動調整する。継ぎ目にはコンスタントパワーのクロスフェードが付く。ビートが 2 個未満の素材は変更せずエラー。応答に `resultDuration` と `segmentCount` を返す | あり |
 | `dialogue_level` | 音声クリップ（`kind` は `audio` のみ）の短時間ラウドネスを解析し、会話音量を `targetLufs`（既定 -18）へ平準化する音量エンベロープを生成する。応答に `pointCount` / `measuredLufsMin` / `measuredLufsMax` を返す | あり |
 
-MCP サーバの自己テストは `--selftest=mcp` または `VEDITOR_MCP_SELFTEST=1` で実行できます（実装: `src/selftests/mcp_selftest.cpp`、ゲート G1..G147。ツール数は 36）。
+MCP サーバの自己テストは `--selftest=mcp` または `VEDITOR_MCP_SELFTEST=1` で実行できます（実装: `src/selftests/mcp_selftest.cpp`、ゲート G1..G155。ツール数は 39）。
 
 ---
 

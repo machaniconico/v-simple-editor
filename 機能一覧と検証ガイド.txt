@@ -1,14 +1,14 @@
 ================================================================================
  V Simple Editor — 機能一覧と LLM(MCP) 検証ガイド
- 作成日: 2026-08-29   更新日: 2026-09-05 (Wave 3 実装済み)   対象ブランチ: feat/ai-chat-connection
+ 作成日: 2026-08-29   更新日: 2026-09-16 (Wave 4 実装済み)   対象ブランチ: feat/ai-chat-connection
 ================================================================================
 
 このファイルは 3 部構成です。
   第1部  今ある機能の一覧 (Premiere / After Effects / DaVinci Resolve との対応つき)
-  第2部  今後実装していく機能の一覧 (Wave 1 / Wave 2 / Wave 3 = 実装済み / Wave 4 候補)
+  第2部  今後実装していく機能の一覧 (Wave 1 〜 Wave 4 = 実装済み / Wave 5 候補)
   第3部  LLM と MCP 連携しながら検証する手順 (準備 → 共通手順 → 機能別チェックリスト)
 
-凡例:  ○=同等機能あり  △=部分的  ×=無い  ★=Wave 1 追加  ☆=Wave 2 追加  ◆=Wave 3 追加 (今回)
+凡例:  ○=同等機能あり  △=部分的  ×=無い  ★=Wave 1 追加  ☆=Wave 2 追加  ◆=Wave 3 追加  ◇=Wave 4 追加 (今回)
        [P]=Premiere Pro  [AE]=After Effects  [R]=DaVinci Resolve
 
 --------------------------------------------------------------------------------
@@ -27,12 +27,14 @@
   ○ トラックのミュート / ソロ / 非表示 / ロック (🔒ボタン)   ★保存対応は Wave 1
   ○ リンクした映像/音声の同期移動・分割
   ○ クリップのコピー&貼り付け / エフェクトのコピー&貼り付け / 属性の貼り付け
-  ○ マルチカメラ (☆ 音声相関同期を基本ダイアログへ統合、角度ごとの ms 微調整)  [P][R]
+  ○ マルチカメラ (☆ 音声相関同期を基本ダイアログへ統合、角度ごとの ms 微調整、◇ 旧セットアップも実同期に修正)  [P][R]
+  ◇ 効果を焼き込んで差し替え (Render in Place。リンク音声も同時、「元のクリップに戻す」で復元)  [P] Render and Replace / [R] Render in Place
   ○ テキストベース編集 / 無音検出 / 自動ジャンプカット / シーン検出  [P][R]
   ○ メディアプール (ビン / スマートビン / ドラッグ&ドロップ配置)     [P][R]
   ○ マーカー (色付き / 一覧パネル / YouTube チャプター出力)
   ○ Undo / Redo + ヒストリーパネル
   ○ 自動保存 / 復旧 / インクリメンタル保存 / プロジェクト収集 (☆ 収集漏れ修正)
+  ◇ 保存版と比較 (現在のタイムラインと保存済み .veditor の構造差分 / MCP compare_project)  [P] Compare Project
   ☆ オフラインメディアの検出と再リンク (プロジェクトを開いたとき自動検出 / MCP relink_media)  [P][R]
   ○ ワークスペース保存 / ショートカット設定 (Premiere/FCP/DaVinci プリセット)
   ○ コマンドパレット (Ctrl+Shift+P)
@@ -51,6 +53,7 @@
 ■ 3. VFX / 合成
   ○ ベジェマスク + プラナートラッカー連携 / ロト / 自動マット / AI マスク  [AE][R]
   ○ モーショントラッカー / プラナートラッカー (Mocha 風)      [AE]
+  ◇ 特徴点検出 (Shi-Tomasi) + ピラミッド KLT 多点トラッカー (数値基盤、UI なし。フル 3D カメラトラッカーの土台)
   ○ クロマキー (精緻化ダイアログ)
   ○ パペット / ワープ / 歪み / ディストーション系
   ○ パーティクル / フラクタルノイズ / シェイプレイヤー / レイヤースタイル
@@ -59,8 +62,11 @@
   ○ コンテンツに応じた塗りつぶし (オブジェクト除去)          [AE][R]
   ○ 手ブレ補正 / フリッカー除去 / ノイズ除去
   ○ ノードコンポジットモード (Fusion 風、線形チェーン)      [R]
-  ○ ビデオエフェクト 46 種 (Blur/Glow/Glitch/Halftone/Curves/... ) ★Wave 1 で 48 種
+  ○ ビデオエフェクト 46 種 (Blur/Glow/Glitch/Halftone/Curves/... ) ★Wave 1 で 48 種 ◇Wave 4 で 50 種
+  ◇ レンズ歪み補正 (径方向 k1/k2、拡大率、中心。CPU / GPU 同一式、書き出し対応)  [AE] Optics Compensation / [R] Lens Distortion
+  ◇ ローリングシャッター補正 (オプティカルフロー Warp。走査時間 / 方向 / 強度)  [AE] Rolling Shutter Repair
   ○ トランジション 45 種 (Dissolve/Wipe/Push/Iris/LightLeak/... ◆モーフカット追加)
+  ◇ ワイプ / バーンドア / アイリス / クロックワイプのソフトネスと境界線 (幅・色)  [P] Border / [R] Feather
   ◆ ビデオトランジションの書き出し対応 (従来はプレビューのみ。書き出しにも同じ合成が出る欠陥修正)
   ○ GPU シェーダーエフェクト / プラグインエフェクト / エフェクトプリセット / エフェクトライブラリ
   ○ VFX ジェネレータ / VFX 素材合成 / ブラシ書き起こしアニメ / Mograph テンプレート / ローワーサード / ウォーターマーク
@@ -73,12 +79,13 @@
   ○ LUT 適用・管理 / ASC CDL 書き出し / カラーマッチ / 自動カラー
   ○ ACES カラーマネジメント / HDR (HDR10/HLG) 出力 / Dolby Vision メタデータ (サイドカー)
   ○ Lumetri 風スコープ (波形/ベクトル) / 露出補助 (フォルスカラー/ゼブラ/ピーキング)
-  ○ カラーパラメータのキーフレーム
+  ○ カラーパラメータのキーフレーム (◇ HSL セカンダリ / Log ホイール / カラーワーパーも「キーフレーム追加」で対応)
 
 ■ 5. オーディオ
   ○ ミキサー / バス・サブミックス / トラック EQ / コンプレッサー / リミッター / リバーブ
   ○ 自動ダッキング (BGM) / ボリュームエンベロープ / ステレオパン / チャンネルマッピング
   ○ ラウドネス (BS.1770) 計測・正規化 / 音声リストア / スペクトル修復 / 音声分離 (スピーチ強調)
+  ◇ ノイズプリント (イン点〜アウト点からノイズを採取し、クリップ全体からスペクトル減算)  [P] Adaptive Noise Reduction / [R] Noise Removal / [AE] Audition Noise Print
   ○ ボイスオーバー録音 / VST・AU プラグイン / ビート検出
   ○ 音声トランジション (☆ コンスタントパワーのクロスフェード / フェードイン / フェードアウトを明示指定、◆ クロスフェードは実際にクリップが重なる Premiere 型)  [P][R]
   ☆ ダイアログレベラー (会話音量の自動平準化)                [R]
@@ -101,8 +108,8 @@
 ■ 8. AI / 自動化
   ○ AI アップスケール / フレーム補間 / AI ハイライト / 自動カット / スマートエディット
   ○ 文字起こしからハイライト検出 (Anthropic/OpenAI/Gemini/オフライン)
-  ○ MCP サーバ内蔵 (27 ツール ★Wave 1 で 33 ツール ☆Wave 2 で 36 ツール、selftest --selftest=mcp は
-    ★Wave 1 で G1..G134 ☆Wave 2 で G1..G145 ◆Wave 3 で G1..G147 の 147 ゲート) + AI チャット Dock (Claude Code / Codex CLI)
+  ○ MCP サーバ内蔵 (27 ツール ★Wave 1 で 33 ツール ☆Wave 2 で 36 ツール ◇Wave 4 で 39 ツール、selftest --selftest=mcp は
+    ★Wave 1 で G1..G134 ☆Wave 2 で G1..G145 ◆Wave 3 で G1..G147 ◇Wave 4 で G1..G155 の 155 ゲート) + AI チャット Dock (Claude Code / Codex CLI)
      → 競合 3 製品には無い、本アプリ独自の機能
 
 --------------------------------------------------------------------------------
@@ -140,7 +147,7 @@
                    set_transition(kind:audio) / set_clip_property(autoOrient)
   ※ 新機能はすべて既定 OFF。新機能を使わないプロジェクトの書き出しは Wave 1 と byte-identical。
 
-■ Wave 3 (今回実装)  — 詳細な検証手順は第3部 3.5
+■ Wave 3 (実装済み)  — 詳細な検証手順は第3部 3.5
   ◆ ビデオトランジションの書き出し対応 (欠陥修正。トランジション付きプロジェクトは書き出しが変わる)  [P][AE][R]
   ◆ モーフカット (オプティカルフローで 2 ショットをつなぐ)      [P] Morph Cut
   ◆ 音声クリップの実オーバーラップ (欠陥修正。音声 CrossDissolve 付きプロジェクトは音が変わる)  [P][R]
@@ -150,9 +157,24 @@
   ◆ 受け入れ検証用 --selftest=render-fixture (旧 exe と新 exe の書き出し一致を機械的に比較)
   ※ 上記 2 件の欠陥修正を除き新機能は既定 OFF。該当要素を持たないプロジェクトの書き出しは Wave 2 と byte-identical。
 
-■ Wave 4 候補 (大型・要検討)
-  × フル 3D カメラトラッカー (特徴点検出 + バンドル調整。外部ライブラリ無しでは不可)  [AE]
-  × カラーワーパーのキーフレーム対応 (v1 は静的)
+■ Wave 4 (今回実装)  — 詳細な検証手順は第3部 3.6
+  ◇ get_timeline のトランジション詳細 (alignment / easing / ソフトネス / 境界線) と実オーバーラップ秒 (MCP)
+  ◇ 旧「マルチカメラセットアップ」の音声同期を実同期に (欠陥修正。同ダイアログのオフセットが変わる)  [P][R]
+  ◇ ワイプ / バーンドア / アイリス / クロックワイプのソフトネスと境界線 (幅・色)  [P] Border / [R] Feather
+  ◇ HSL セカンダリ / カラーワーパー / Log ホイールのキーフレーム対応  [R]
+  ◇ レンズ歪み補正 (CPU / GPU 同一式、書き出し対応)  [AE] Optics Compensation / [R] Lens Distortion
+  ◇ ローリングシャッター補正 (オプティカルフロー Warp)  [AE] Rolling Shutter Repair
+  ◇ ノイズプリント (選択範囲から採取してスペクトル減算)  [P][R][AE]
+  ◇ 効果を焼き込んで差し替え (Render in Place。リンク音声も同時、元に戻す付き)  [P] Render and Replace / [R] Render in Place
+  ◇ 保存版と比較 (現在のタイムラインと保存済みプロジェクトの構造差分)  [P] Compare Project
+  ◇ 特徴点検出 (Shi-Tomasi) + ピラミッド KLT 多点トラッカー (数値基盤、UI なし)
+  ◇ MCP 新ツール: compare_project / render_in_place / decompose_render_in_place、
+                   set_transition(alignment / easing / softness / borderWidth / borderColor)
+  ※ 上記 1 件の欠陥修正を除き新機能は既定 OFF。該当要素を持たないプロジェクトの書き出しは Wave 3 と byte-identical
+     (各 story で --selftest=render-fixture を Wave 3 exe と HEAD exe で実行し全ファイル一致を確認済み)。
+
+■ Wave 5 候補 (大型・要検討)
+  × フル 3D カメラトラッカー (特徴点 + KLT は Wave 4 で実装済み。残りはバンドル調整と一般シーンの解法)  [AE]
   × Generative Extend / Depth Map / Relight (ML モデル前提のため対象外)
 
 --------------------------------------------------------------------------------
@@ -190,7 +212,7 @@
     「先に list_commands で確認してから」と付けると安全です。
   ・危険なコマンド: 終了系は MCP から実行不可。モーダルダイアログ系は allowBlocking が必要。
 
-■ 3.2 既存機能のスモークテスト (MCP 27 ツール)
+■ 3.2 既存機能のスモークテスト (MCP 39 ツール)
   □ 「プロジェクト情報を教えて」                      → get_project_info
   □ 「検証動画フォルダの xxx.mp4 を V1 に取り込んで」  → import_media (V/A ペアで入る)
   □ 「2 番目のクリップを 3 秒の位置で分割して」        → split_clip、Ctrl+Z で戻る
@@ -503,7 +525,98 @@
      期待レスポンス:  {"ok":true,"kind":"audio",...,"leadIn":{…},"trailOut":{…}}
      selftest: --selftest=audio-xfade (11 ゲート、G9 が継ぎ目の音量ディップ解消)
 
-■ 3.6 回帰確認 (Wave 1 / 2 / 3 後に必ず)
+■ 3.6 Wave 4 新機能の検証チェックリスト
+
+  ※ Wave 4 で MCP に増えたのは compare_project / render_in_place / decompose_render_in_place の 3 ツール (36 → 39)。
+     set_transition に alignment / easing / softness / borderWidth / borderColor、get_timeline に leadIn・trailOut の
+     詳細と overlap が増えた。mcp selftest は G148..G155 が追加 (G1..G155)。
+  ※ 1 件は既存欠陥の修正で結果が変わる: (2) 旧「マルチカメラセットアップ」の音声同期。これまではオフセットを
+     推定せず 0 を返していたが、音声の相関で実際に同期するようになった。同ダイアログで作ったプロジェクトは
+     オフセットが変わる。基本ダイアログ [ファイル] → [マルチカメラ...] は Wave 2 から実同期なので不変。
+
+  ▼ (1) get_timeline のトランジション詳細と overlap  (MCP のみ)
+     LLM:   「タイムラインを読んで」→ get_timeline
+     呼び出し例:      get_timeline {}
+     期待レスポンス:  clips[].leadIn / trailOut が {"type","durationSec","alignment","easing","softness","borderWidth","borderColor"}、
+                      clips[].overlap が {"leadInSec","trailOutSec"} (トランジション無しは 0)。既存フィールドと required は不変。
+     selftest: --selftest=mcp G148 (alignment / easing と実オーバーラップ) / G149 (音声オーバーラップと 1 undo)
+
+  ▼ (2) 旧マルチカメラセットアップの実同期 (欠陥修正)  (ツール > マルチカメラセットアップ / 切替)
+     手動:  同じ音声を 250ms ずらした 2 素材 + 無音 1 素材を登録して同期
+            期待: 「3 本中 2 本を同期しました (音声なし 1 本)」がステータスバーとダイアログに出て、
+                  ずらした素材のオフセットが ±10ms で推定される。無音素材はオフセット 0。
+     LLM:   MCP ツール無し。
+     selftest: --selftest=multicam (G10 が実 WAV デコードで 250ms ±10ms / 無音 / ファイル不在を検証)
+
+  ▼ (3) トランジションのソフトネスと境界線  (挿入 > トランジションを追加 / クリップ右クリック / MCP set_transition)
+     手動:  ワイプ / バーンドア / アイリス / クロックワイプのダイアログで「ソフトネス」「境界線の幅」「境界線の色」を設定
+            期待: 境界がぼけ、指定色・幅の帯が出る。クロスディゾルブ等では 3 欄がグレーアウト。
+                  既定 (0 / 0 / 白) なら従来と byte-identical。プリセット保存で 3 値も残る。プレビューと書き出しが同じ絵。
+     LLM:   「クリップ 1 と 2 の間に赤い境界線 6px のワイプ、ソフトネス 0.3」→ set_transition
+     呼び出し例:      set_transition {"clipIndex":0,"type":"WipeLeft","durationSec":1.0,"softness":0.3,"borderWidth":6,"borderColor":"#ff0000"}
+     期待レスポンス:  {"ok":true,...}。type "CrossDissolve" に softness を付けると {"ok":true,"warning":"この type ではソフトネスは無視されます"}
+                      範囲外 (softness 2) はエラー「ソフトネスは0..1、境界線の幅は0..50で指定してください」
+     Undo:  Ctrl+Z 1 回で戻る (mcp G150)
+     selftest: --selftest=transition-params (10 ゲート。G8..G10 がアイリス / クロック) / --selftest=mcp G150-G151
+
+  ▼ (4) グレードのキーフレーム (HSL セカンダリ / LGG / Log / カラーワーパー)  (カラーグレーディング パネル各セクションの「キーフレーム追加」)
+     手動:  再生ヘッド 0 秒で HSL の色相中心を 0、2 秒で 120 にして各時刻で「キーフレーム追加」
+            期待: 1 秒で 60 に補間される。プレビュー (GPU uniform) と書き出しが同じ絵。
+                  キーフレームの無いクリップは従来と byte-identical。保存 / 再読込で保持。
+     LLM:   MCP ツール無し。get_frame で中間時刻を確認。
+     Undo:  「キーフレーム追加」1 回 = Ctrl+Z 1 回
+     selftest: --selftest=grade-keyframe-ext (5 ゲート) / --selftest=grade-keyframe (7 ゲート、従来と同数)
+
+  ▼ (5) レンズ歪み補正  (エフェクト > ビデオエフェクト > ディストーション > レンズ歪み補正)
+     手動:  径方向２次 (k1) を +0.3 にする
+            期待: 糸巻き型に歪み、四隅に黒が出る。拡大率 1.6 で黒が消える。中心Ｘ/Ｙで歪みの中心が動く。
+                  既定 (k1=k2=0, 拡大率 1) なら byte-identical。プレビュー (GLSL) と書き出し (CPU) が同じ式。
+     LLM:   MCP ツール無し。get_frame で確認。
+     selftest: --selftest=lens-distort (6 ゲート) / --selftest=effect-preset (型数 51)
+
+  ▼ (6) ローリングシャッター補正  (エフェクト > ビデオエフェクト > ディストーション > ローリングシャッター補正)
+     手動:  横パン中に縦線が斜めに倒れる素材へ適用 (走査時間 0.5、強度 1.0)
+            期待: 縦線が立つ。走査方向を 1 (下→上) にすると逆に倒れる。走査時間 0 / 強度 0 は無変化。
+                  前フレームとのオプティカルフローを使う CPU 処理 (GPU プレビューも CPU 結果を表示)。
+     LLM:   MCP ツール無し。
+     selftest: --selftest=rolling-shutter (6 ゲート)
+
+  ▼ (7) ノイズプリント  (音声クリップ右クリック > ノイズプリントを取得 (イン点〜アウト点) → ノイズプリントで除去…)
+     手動:  会話クリップの無音部 (空調ノイズだけ) にイン点・アウト点を打ち「ノイズプリントを取得」、
+            その後「ノイズプリントで除去…」で除去量 / 下限 (dB) を指定して適用
+            期待: ステータスバーに「ノイズプリントを取得しました。」→ 保存先 (.wav) を聞かれ、
+                  適用後はクリップ全体のノイズが下がり会話の音量は変わらない。イン/アウトが無いと項目がグレー。
+     LLM:   MCP ツール無し。
+     Undo:  Ctrl+Z 1 回で元の音源に戻る
+     selftest: --selftest=noise-print (6 ゲート。SNR +10dB 以上、信号 ±1dB)
+
+  ▼ (8) 効果を焼き込んで差し替え (Render in Place)  (映像クリップ右クリック > 効果を焼き込んで差し替え… / 元のクリップに戻す / MCP render_in_place)
+     手動:  効果付きクリップで「効果を焼き込んで差し替え…」→ コーデック (H.264 / ProRes)、ハンドル秒、出力先を指定
+            期待: 書き出し後にクリップが新メディア (効果なし) に差し替わり絵は同じ。リンク音声も同時に差し替わる。
+                  「元のクリップに戻す」または Ctrl+Z 1 回で効果付きの元クリップに戻る (映像・音声まとめて)。
+                  重ね合わせトランジション付き / クロマキー付きのクリップは拒否メッセージ。
+     LLM:   「V1 の 1 番目のクリップを焼き込んで差し替えて」→ render_in_place
+     呼び出し例:      render_in_place {"kind":"video","trackIndex":0,"clipIndex":0,"codec":"h264","handlesSec":0}
+     期待レスポンス:  {"ok":true,"outputPath":"...","replaced":true,"linkedAudioReplaced":true} → get_timeline で filePath が新規 mp4、effects が空
+                      decompose_render_in_place {"trackIndex":0,"clipIndex":0} → {"ok":true} で元の filePath / effects に戻る
+     Undo:  Ctrl+Z 1 回 (mcp G153)
+     selftest: --selftest=render-in-place (8 ゲート。G6 がリンク音声の同時焼き込みと RMS ±1dB) / --selftest=mcp G152-G153
+
+  ▼ (9) 保存版と比較  (ファイル > 保存版と比較… / MCP compare_project)
+     手動:  プロジェクトを保存 → クリップを移動・音量変更 → 「保存版と比較…」で保存した .veditor を選ぶ
+            期待: 「2 件の変更。…」の一覧 (種別 / 場所 / 変更前 / 変更後) に「移動」「プロパティ変更」が出る。
+                  行をダブルクリックでそのクリップが選択され再生ヘッドが移動 (削除済みは移動不可)。変更が無ければ「変更はありません。」
+     LLM:   「保存したプロジェクトと今の違いを教えて」→ compare_project
+     呼び出し例:      compare_project {"filePath":"D:/work/test.veditor"}
+     期待レスポンス:  {"ok":true,"changes":[{"type":"Moved","path":"video[0].clips[0].start","before":"0","after":"1.5"},...],
+                       "summary":{"added":0,"removed":0,"moved":1,"trimmed":0,"changed":1}}。読み取り専用 (undo 段数・再生ヘッド・変更フラグは不変)
+     selftest: --selftest=project-diff (7 ゲート) / --selftest=mcp G154-G155
+
+  ▼ (10) 特徴点検出 + KLT 多点トラッカー  (UI なし、数値基盤)
+     手動:  操作なし (フル 3D カメラトラッカーの土台。src/FeatureTracker.h の detectShiTomasi / trackPyramidalLK)
+     selftest: --selftest=feature-tracker (6 ゲート。並進 ≥95% が 0.3px 以内、回転+拡大 ≥80% が 1px 以内、遮蔽の棄却)
+
+■ 3.7 回帰確認 (Wave 1 / 2 / 3 / 4 後に必ず)
   □ 新機能を一切使わないプロジェクトの書き出しが以前と同一 (byte-identical)
      → 旧 exe と新 exe で同じプロジェクトを書き出し、fc /b で比較
   □ --selftest=mcp / trackmatte-parity / gpu-composite-parity / effect-preset / effect-library が全 PASS
@@ -511,13 +624,16 @@
      dialogue-leveler / audio-xfade / spatial-path / shape-clip / multicam / whisper-guide が全 PASS
      (shape-clip は G1..G10 の 10 PASS)
   □ Wave 3 分: --selftest=transition-export (9) / morph-cut (6) / audio-xfade (11) / color-warper (6) /
-     camera3d (9) / camera-solve (8) / render-fixture (3) / parity S1..S10 が全 PASS (mcp は G1..G147 の 147 PASS)
+     camera3d (9) / camera-solve (8) / render-fixture (3) / parity S1..S10 が全 PASS
+  □ Wave 4 分: --selftest=transition-params (10) / grade-keyframe-ext (5) / lens-distort (6) / rolling-shutter (6) /
+     noise-print (6) / render-in-place (8) / project-diff (7) / feature-tracker (6) / multicam / effect-preset (5、型数 51)
+     が全 PASS (mcp は G1..G155 の 155 PASS)
   □ 旧 exe と新 exe の書き出し一致は --selftest=render-fixture で機械的に確認できる:
      両方の exe で VEDITOR_RENDER_FIXTURE_OUT=<別フォルダ> を付けて実行し、フォルダ同士を比較 (diff -r / fc)。
      fixture (b) (CrossDissolve 付き) だけは Wave 3 以降の exe で変わるのが正しい。
   □ 旧 .veditor プロジェクトが警告なく開ける
 
-■ 3.7 不具合を見つけたとき
+■ 3.8 不具合を見つけたとき
   ・AI チャット Dock のログ (ツール名・引数・応答) をそのまま貼る
   ・再現に使った指示文、期待した結果、実際の結果、Ctrl+Z で戻ったか を添える
   ・selftest が FAIL なら stderr の FAIL Gn 行を添える
