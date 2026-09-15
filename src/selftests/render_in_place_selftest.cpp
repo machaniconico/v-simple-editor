@@ -577,6 +577,7 @@ int runRenderInPlaceSelftest()
                 linkedOk = linkedOk && std::abs(db) <= 1.0;
             }
             int frame = 0;
+            constexpr double retainedMargin = 1.0; // 前置フレームで GOP 位置が変わる別エンコードのゆらぎ (実測 ±0.9)
             for (qint64 tick : {100000LL, 500000LL, 900000LL}) {
                 const qint64 timelineTick = qRound64(test.videoStart * 1000000.0) + tick;
                 const QImage beforeImage = tlrender::renderFrameAt(&unbaked, timelineTick, options.outputSize);
@@ -596,7 +597,7 @@ int runRenderInPlaceSelftest()
                 // but require the retained frame to beat both adjacent frames.
                 const bool ok = controlRendered && std::isfinite(actualMse) && std::isfinite(controlMse)
                     && std::isfinite(residualPrev) && std::isfinite(residualNext)
-                    && actualMse <= controlMse + margin && residual <= 3.5
+                    && actualMse <= controlMse + retainedMargin && residual <= 3.5
                     && residual < residualPrev && residual < residualNext;
                 std::fprintf(stderr, "G6 retained frame=%d MSE=%.6f control=%.6f residual=%.6f prev=%.6f next=%.6f %s\n",
                     frame++, actualMse, controlMse, residual, residualPrev, residualNext, ok ? "OK" : "FAIL");
