@@ -114,8 +114,12 @@ double mixerWindowRms(const QVector<PlaybackEntry> &entries, double center)
         const QByteArray pcm = io.read(480 * AudioMixer::kBytesPerFrame);
         if (pcm.size() != 480 * AudioMixer::kBytesPerFrame
             || mixer.masterClockUs() != startUs + (block + 1) * 10000) {
+            std::fprintf(stderr, "G6 AudioMixer read failed: block=%d bytes=%lld expected=%d "
+                "clock=%lld expectedClock=%lld\n", block, static_cast<long long>(pcm.size()),
+                480 * AudioMixer::kBytesPerFrame, static_cast<long long>(mixer.masterClockUs()),
+                static_cast<long long>(startUs + (block + 1) * 10000));
             mixer.stop();
-            return 0.0;
+            return std::numeric_limits<double>::quiet_NaN();
         }
         for (int i = 0; i < pcm.size(); i += 2) {
             const double value = qFromLittleEndian<qint16>(
@@ -239,6 +243,42 @@ bool videoOnly(const QString &path)
     }
     avformat_close_input(&context);
     return probed && video && !audio;
+}
+// Check stream duration AND packet coverage, independent of AudioMixer seeks.
+bool audioCoversJob(const QString &path, double expected)
+{
+    AVFormatContext *context = nullptr;
+    if (avformat_open_input(&context, path.toUtf8().constData(), nullptr, nullptr) < 0)
+        return false;
+    const int stream = avformat_find_stream_info(context, nullptr) >= 0
+        ? av_find_best_stream(context, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0) : -1;
+    double duration = -1.0, end = -1.0;
+    bool monotonic = true;
+    if (stream >= 0) {
+        const AVStream *audio = context->streams[stream];
+        const double tb = av_q2d(audio->time_base);
+        if (audio->duration != AV_NOPTS_VALUE) duration = audio->duration * tb;
+        AVPacket *packet = av_packet_alloc();
+        qint64 previous = AV_NOPTS_VALUE;
+        if (packet) {
+            while (av_read_frame(context, packet) >= 0) {
+                if (packet->stream_index == stream && packet->pts != AV_NOPTS_VALUE) {
+                    monotonic = monotonic && (previous == AV_NOPTS_VALUE || packet->pts >= previous);
+                    previous = packet->pts;
+                    end = (packet->pts + packet->duration) * tb;
+                }
+                av_packet_unref(packet);
+            }
+            av_packet_free(&packet);
+        }
+    }
+    avformat_close_input(&context);
+    // One AAC packet covers 1024/48000 seconds, including encoder padding.
+    const bool ok = monotonic && std::abs(duration - expected) <= 1024.0 / 48000.0
+        && std::abs(end - expected) <= 1024.0 / 48000.0;
+    std::fprintf(stderr, "G6 audio duration=%.6f packetEnd=%.6f expected=%.6f monotonic=%d %s\n",
+        duration, end, expected, int(monotonic), qPrintable(path));
+    return ok;
 }
 double mse(const QImage &left, const QImage &right)
 {
@@ -469,53 +509,78 @@ int runRenderInPlaceSelftest()
                 && clipJson(overlap.videoTracks()[0]->clips()[1]) == clipJson(second);
         }
     }
-    ClipInfo linkedVideo = original;
-    linkedVideo.linkGroup = 312;
-    ClipInfo linkedAudio = linkedVideo;
-    linkedAudio.filePath = output.filePath(QStringLiteral("linked-tone.wav"));
-    linkedAudio.effects.clear();
-    linkedAudio.duration = 8.0;
-    linkedAudio.volume = 0.65;
-    linkedAudio.pan = -0.2;
-    const bool toneReady = writeTone(linkedAudio.filePath, 440.0);
-    Timeline linkedTimeline;
-    linkedTimeline.restoreFromProject(QVector<QVector<ClipInfo>>{{linkedVideo}},
-        QVector<QVector<ClipInfo>>{{linkedAudio}}, 0, -1, -1, 10);
-    linkedTimeline.undoManager()->clear();
-    linkedTimeline.saveUndoState(QStringLiteral("リンク音声初期状態"));
-    const quint64 linkedSerial = linkedTimeline.undoManager()->saveSerial();
-    const double rmsBefore = mixerWindowRms(linkedTimeline.computeAudioPlaybackSequence(), 0.5);
-    auto linkedOptions = options;
-    linkedOptions.handlesSec = 0.25;
-    QString linkedPath, linkedError;
-    const bool linkedBaked = toneReady && renderinplace::renderClipInPlace(
-        linkedTimeline, 0, 0, linkedOptions, &linkedPath, &linkedError);
-    const double rmsAfter = linkedBaked
-        ? mixerWindowRms(linkedTimeline.computeAudioPlaybackSequence(), 0.5) : 0.0;
-    const double deltaDb = rmsBefore > 0.0 && rmsAfter > 0.0
-        ? 20.0 * std::log10(rmsAfter / rmsBefore) : std::numeric_limits<double>::infinity();
-    bool linkedOk = linkedBaked && !videoOnly(linkedPath) && std::abs(deltaDb) <= 1.0
-        && linkedTimeline.undoManager()->saveSerial() == linkedSerial + 1
-        && linkedTimeline.audioTracks()[0]->clips()[0].filePath == linkedPath
-        && bool(linkedTimeline.audioTracks()[0]->clips()[0].renderInPlaceOriginal);
-    if (linkedBaked) {
-        linkedTimeline.undo();
-        linkedOk = linkedOk
-            && clipJson(linkedTimeline.videoTracks()[0]->clips()[0]) == clipJson(linkedVideo)
-            && clipJson(linkedTimeline.audioTracks()[0]->clips()[0]) == clipJson(linkedAudio);
-        linkedTimeline.redo();
-        const quint64 decomposeSerial = linkedTimeline.undoManager()->saveSerial();
-        linkedOk = renderinplace::decomposeRenderInPlace(linkedTimeline, 0, 0) && linkedOk;
-        linkedOk = linkedOk && linkedTimeline.undoManager()->saveSerial() == decomposeSerial + 1
-            && clipJson(linkedTimeline.videoTracks()[0]->clips()[0]) == clipJson(linkedVideo)
-            && clipJson(linkedTimeline.audioTracks()[0]->clips()[0]) == clipJson(linkedAudio);
-        linkedTimeline.undo();
-        linkedOk = linkedOk && linkedTimeline.videoTracks()[0]->clips()[0].filePath == linkedPath
-            && linkedTimeline.audioTracks()[0]->clips()[0].filePath == linkedPath;
+    for (const double audioOut : {2.0, 3.0}) {
+        ClipInfo linkedVideo = original;
+        linkedVideo.linkGroup = 312;
+        ClipInfo linkedAudio = linkedVideo;
+        linkedAudio.filePath = output.filePath(QStringLiteral("linked-tone.wav"));
+        linkedAudio.effects.clear();
+        linkedAudio.duration = 8.0;
+        linkedAudio.outPoint = audioOut;
+        linkedAudio.volume = 0.65;
+        linkedAudio.pan = -0.2;
+        const bool toneReady = writeTone(linkedAudio.filePath, 440.0);
+        Timeline linkedTimeline;
+        linkedTimeline.restoreFromProject(QVector<QVector<ClipInfo>>{{linkedVideo}},
+            QVector<QVector<ClipInfo>>{{linkedAudio}}, 0, -1, -1, 10);
+        linkedTimeline.undoManager()->clear();
+        linkedTimeline.saveUndoState(QStringLiteral("リンク音声初期状態"));
+        const quint64 linkedSerial = linkedTimeline.undoManager()->saveSerial();
+        const double rmsBefore = mixerWindowRms(linkedTimeline.computeAudioPlaybackSequence(), 0.5);
+        auto linkedOptions = options;
+        linkedOptions.handlesSec = 0.25;
+        linkedOptions.retainAudioMixForDiagnostics = true;
+        QString linkedPath, linkedError;
+        const bool linkedBaked = toneReady && renderinplace::renderClipInPlace(
+            linkedTimeline, 0, 0, linkedOptions, &linkedPath, &linkedError);
+        const double rmsAfter = linkedBaked
+            ? mixerWindowRms(linkedTimeline.computeAudioPlaybackSequence(), 0.5) : 0.0;
+        const double deltaDb = rmsBefore > 0.0 && rmsAfter > 0.0
+            ? 20.0 * std::log10(rmsAfter / rmsBefore) : std::numeric_limits<double>::infinity();
+        const bool audioLengthOk = linkedBaked
+            && audioCoversJob(linkedPath, audioOut == 2.0 ? 1.5 : 2.25);
+        bool linkedOk = linkedBaked && !videoOnly(linkedPath) && std::abs(deltaDb) <= 1.0
+            && audioLengthOk
+            && linkedTimeline.undoManager()->saveSerial() == linkedSerial + 1
+            && linkedTimeline.audioTracks()[0]->clips()[0].filePath == linkedPath
+            && bool(linkedTimeline.audioTracks()[0]->clips()[0].renderInPlaceOriginal);
+        if (linkedBaked) {
+            Timeline unbaked;
+            unbaked.restoreFromProject(QVector<QVector<ClipInfo>>{{linkedVideo}},
+                QVector<QVector<ClipInfo>>{{linkedAudio}}, 0, -1, -1, 10);
+            for (double center : {0.1, linkedAudio.effectiveDuration() - 0.1}) {
+                const double beforeRms = mixerWindowRms(unbaked.computeAudioPlaybackSequence(), center);
+                const double afterRms = mixerWindowRms(linkedTimeline.computeAudioPlaybackSequence(), center);
+                const double db = beforeRms > 0.0 && afterRms > 0.0
+                    ? 20.0 * std::log10(afterRms / beforeRms) : std::numeric_limits<double>::infinity();
+                std::fprintf(stderr, "G6 window=%.3f before=%.6f after=%.6f delta=%.3f dB\n",
+                    center, beforeRms, afterRms, db);
+                linkedOk = linkedOk && std::abs(db) <= 1.0;
+            }
+            linkedTimeline.undo();
+            linkedOk = linkedOk
+                && clipJson(linkedTimeline.videoTracks()[0]->clips()[0]) == clipJson(linkedVideo)
+                && clipJson(linkedTimeline.audioTracks()[0]->clips()[0]) == clipJson(linkedAudio);
+            linkedTimeline.redo();
+            const quint64 decomposeSerial = linkedTimeline.undoManager()->saveSerial();
+            linkedOk = renderinplace::decomposeRenderInPlace(linkedTimeline, 0, 0) && linkedOk;
+            linkedOk = linkedOk && linkedTimeline.undoManager()->saveSerial() == decomposeSerial + 1
+                && clipJson(linkedTimeline.videoTracks()[0]->clips()[0]) == clipJson(linkedVideo)
+                && clipJson(linkedTimeline.audioTracks()[0]->clips()[0]) == clipJson(linkedAudio);
+            linkedTimeline.undo();
+            linkedOk = linkedOk && linkedTimeline.videoTracks()[0]->clips()[0].filePath == linkedPath
+                && linkedTimeline.audioTracks()[0]->clips()[0].filePath == linkedPath;
+        }
+        std::fprintf(stderr, "G6 linked audio RMS before=%.6f after=%.6f delta=%.3f dB error=%s\n",
+            rmsBefore, rmsAfter, deltaDb, qPrintable(linkedError));
+        if (!linkedOk) {
+            output.setAutoRemove(false);
+            std::fprintf(stderr, "G6 retained mp4, linked-tone.wav and linked-audio.m4a under %s\n",
+                qPrintable(output.path()));
+        }
+        overlapRejected = overlapRejected && linkedOk;
     }
-    std::fprintf(stderr, "G6 linked audio RMS before=%.6f after=%.6f delta=%.3f dB error=%s\n",
-        rmsBefore, rmsAfter, deltaDb, qPrintable(linkedError));
-    gate(6, overlapRejected && linkedOk);
+    gate(6, overlapRejected);
 
     // Independent material control from G1, composited over the same untouched
     // lower track. This measures queue loss without encoding the background.

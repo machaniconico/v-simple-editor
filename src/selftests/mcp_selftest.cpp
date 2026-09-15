@@ -31,6 +31,7 @@
 #include <QTimer>
 #include <QUrl>
 #include <QUrlQuery>
+#include <QUuid>
 #include <QVector>
 #include <QStringList>
 #include <QSet>
@@ -38,6 +39,7 @@
 #include <QtGlobal>
 
 #include <cmath>
+#include <cstdio>
 #include <limits>
 #include <stdexcept>
 
@@ -4929,6 +4931,60 @@ int runMcpSelftest()
         projectTimeline->saveUndoState(QStringLiteral("MCP焼き込み初期状態"));
         const QSize size(640, 360);
         const QImage before = tlrender::renderFrameAt(projectTimeline, 500000, size);
+        // Same independent queue control as render-in-place G1, at the MCP
+        // project's fps and source-native size. Measure the YUV/codec floor
+        // instead of assuming a lossless RGB round trip on every encoder.
+        QTemporaryDir controlOutput;
+        QSize nativeSize;
+        AVFormatContext *source = nullptr;
+        if (avformat_open_input(&source, original.filePath.toUtf8().constData(), nullptr, nullptr) >= 0) {
+            if (avformat_find_stream_info(source, nullptr) >= 0) {
+                const int index = av_find_best_stream(source, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+                if (index >= 0) {
+                    const auto *parameters = source->streams[index]->codecpar;
+                    nativeSize = QSize((parameters->width + 1) & ~1, (parameters->height + 1) & ~1);
+                }
+            }
+            avformat_close_input(&source);
+        }
+        const double controlFps = toolPayload(callProjectInfoTool(451,
+            QStringLiteral("get_project_info"), {})).value(QStringLiteral("fps")).toDouble();
+        const QString controlPath = controlOutput.filePath(QStringLiteral("control.mp4"));
+        const QString silentPath = controlOutput.filePath(QStringLiteral("silent.png"));
+        QImage silent(2, 2, QImage::Format_RGB32);
+        silent.fill(Qt::black);
+        bool controlOk = false;
+        QString controlError;
+        if (controlOutput.isValid() && !nativeSize.isEmpty() && controlFps > 0.0 && silent.save(silentPath)) {
+            RenderPreset preset{QStringLiteral("対照書き出し"), nativeSize.width(), nativeSize.height(),
+                QStringLiteral("h264"), 100000000, QStringLiteral("mp4")};
+            RenderJob job = RenderQueue::jobFromPreset(preset, controlPath, 0, 1000000);
+            job.uuid = QUuid::createUuid().toString(QUuid::WithoutBraces);
+            job.timeline = projectTimeline;
+            job.projectFilePath = silentPath;
+            job.exportConfig["fps"] = controlFps;
+            RenderQueue queue;
+            QEventLoop loop;
+            bool done = false;
+            QObject::connect(&queue, &RenderQueue::jobCompletedUuid, &loop,
+                [&](const QString &uuid, bool ok, const QString &message) {
+                    if (uuid != job.uuid) return;
+                    done = true;
+                    controlOk = ok;
+                    controlError = message;
+                    loop.quit();
+                });
+            queue.addJob(job);
+            queue.start();
+            if (!done) loop.exec();
+        }
+        ClipInfo controlClip{};
+        controlClip.filePath = controlPath;
+        controlClip.duration = 1.0;
+        Timeline controlTimeline;
+        controlTimeline.restoreFromProject(QVector<QVector<ClipInfo>>{{controlClip}},
+            QVector<QVector<ClipInfo>>{}, 0, -1, -1, 10);
+        const QImage control = tlrender::renderFrameAt(&controlTimeline, 500000, size);
         const QJsonObject target{{QStringLiteral("trackIndex"), 0}, {QStringLiteral("clipIndex"), 0}};
         QJsonObject renderArgs = target;
         renderArgs.insert(QStringLiteral("kind"), QStringLiteral("video"));
@@ -4943,23 +4999,32 @@ int runMcpSelftest()
         };
         const QJsonObject bakedClip = timelineClip();
         const QImage after = tlrender::renderFrameAt(projectTimeline, 500000, size);
-        double error = std::numeric_limits<double>::infinity();
-        if (!before.isNull() && !after.isNull() && before.size() == after.size()) {
-            const QImage a = before.convertToFormat(QImage::Format_RGB32);
-            const QImage b = after.convertToFormat(QImage::Format_RGB32);
-            double sum = 0.0;
-            for (int y = 0; y < a.height(); ++y) {
-                const auto *pa = reinterpret_cast<const QRgb *>(a.constScanLine(y));
-                const auto *pb = reinterpret_cast<const QRgb *>(b.constScanLine(y));
-                for (int x = 0; x < a.width(); ++x) {
-                    const double r = qRed(pa[x]) - qRed(pb[x]);
-                    const double g = qGreen(pa[x]) - qGreen(pb[x]);
-                    const double bl = qBlue(pa[x]) - qBlue(pb[x]);
-                    sum += r*r + g*g + bl*bl;
+        const auto imageMse = [](const QImage &before, const QImage &after) {
+            double error = std::numeric_limits<double>::infinity();
+            if (!before.isNull() && !after.isNull() && before.size() == after.size()) {
+                const QImage a = before.convertToFormat(QImage::Format_RGB32);
+                const QImage b = after.convertToFormat(QImage::Format_RGB32);
+                double sum = 0.0;
+                for (int y = 0; y < a.height(); ++y) {
+                    const auto *pa = reinterpret_cast<const QRgb *>(a.constScanLine(y));
+                    const auto *pb = reinterpret_cast<const QRgb *>(b.constScanLine(y));
+                    for (int x = 0; x < a.width(); ++x) {
+                        const double r = qRed(pa[x]) - qRed(pb[x]);
+                        const double g = qGreen(pa[x]) - qGreen(pb[x]);
+                        const double bl = qBlue(pa[x]) - qBlue(pb[x]);
+                        sum += r*r + g*g + bl*bl;
+                    }
                 }
+                error = sum / (3.0 * a.width() * a.height());
             }
-            error = sum / (3.0 * a.width() * a.height());
-        }
+            return error;
+        };
+        const double error = imageMse(before, after);
+        const double floor = imageMse(before, control);
+        const double residual = imageMse(control, after);
+        constexpr double margin = 0.25; // Same measured-floor margin as G1.
+        std::fprintf(stderr, "G152 fps=%.3f MSE=%.6f control=%.6f residual=%.6f margin=%.2f error=%s\n",
+            controlFps, error, floor, residual, margin, qPrintable(controlError));
         const bool g152 = duration && *duration >= 2000000
             && rendered.value(QStringLiteral("ok")).toBool()
             && rendered.value(QStringLiteral("replaced")).toBool()
@@ -4969,10 +5034,19 @@ int runMcpSelftest()
             && path != original.filePath && bakedClip.value(QStringLiteral("filePath")).toString() == path
             && bakedClip.value(QStringLiteral("effects")).isArray()
             && bakedClip.value(QStringLiteral("effects")).toArray().isEmpty()
-            && projectTimeline->undoManager()->saveSerial() == serial + 1 && error < 2.0;
+            && projectTimeline->undoManager()->saveSerial() == serial + 1
+            && controlOk && std::isfinite(error) && std::isfinite(floor)
+            && error <= floor + margin && residual <= margin;
         g152 ? pass("G152 render_in_place MCP picture and timeline")
              : fail("G152 render_in_place MCP picture and timeline",
                     QStringLiteral("MSE=%1 response=%2").arg(error).arg(QString::fromUtf8(compact(rendered))));
+        if (!g152) {
+            controlOutput.setAutoRemove(false);
+            before.save(controlOutput.filePath(QStringLiteral("before.png")));
+            after.save(controlOutput.filePath(QStringLiteral("after.png")));
+            control.save(controlOutput.filePath(QStringLiteral("control.png")));
+            std::fprintf(stderr, "G152 retained control=%s baked=%s\n", qPrintable(controlPath), qPrintable(path));
+        }
         const auto decomposed = toolPayload(callProjectInfoTool(454, QStringLiteral("decompose_render_in_place"), target));
         const QJsonObject restored = timelineClip();
         bool g153 = decomposed.value(QStringLiteral("ok")).toBool()
@@ -4990,7 +5064,7 @@ int runMcpSelftest()
         g153 ? pass("G153 decompose and undo restore media and effects")
              : fail("G153 decompose and undo restore media and effects", QStringLiteral("復元または取り消しに失敗"));
         projectTimeline->restoreState(savedState);
-        if (rendered.value(QStringLiteral("ok")).toBool() && path != original.filePath)
+        if (g152 && rendered.value(QStringLiteral("ok")).toBool() && path != original.filePath)
             QFile::remove(path);
     } else {
         fail("G152 render_in_place MCP picture and timeline", QStringLiteral("Timeline was not available"));

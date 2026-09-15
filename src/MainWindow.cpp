@@ -888,13 +888,16 @@ bool runFfmpegForAudioMix(const QStringList &args, QString *error)
 }
 
 QString prepareTimelineAudioMixForExport(Timeline *timeline, QString *error,
-                                         const QString &forcedOutputPath = {})
+                                         const QString &forcedOutputPath = {},
+                                         double forcedDurationSeconds = 0.0)
 {
     if (forcedOutputPath.isEmpty() && !timelineNeedsAudioMixForExport(timeline))
         return {};
 
     const QVector<PlaybackEntry> entries = timeline->computeAudioPlaybackSequence();
-    const double durationSeconds = qMax(0.001, timeline->totalDuration());
+    const bool renderInPlace = !forcedOutputPath.isEmpty();
+    const double durationSeconds = qMax(0.001, renderInPlace
+        ? forcedDurationSeconds : timeline->totalDuration());
     const QString outputPath = forcedOutputPath.isEmpty()
         ? nextExportAudioMixPath() : forcedOutputPath;
 
@@ -951,14 +954,23 @@ QString prepareTimelineAudioMixForExport(Timeline *timeline, QString *error,
             entry,
             audioChannelModeForPlaybackEntry(entry),
             validReversedFlags.value(i, false));
-        mixInputs << QStringLiteral("[a%1]").arg(i);
+        if (renderInPlace) {
+            // adelay can leave unset timestamps on its generated silence.
+            // amix propagates them; atrim then cuts at the first real PTS.
+            // Count samples after delay so both silence and content are 0-origin.
+            chains << QStringLiteral("[a%1]asetpts=N/SR/TB[rip%1]").arg(i);
+            mixInputs << QStringLiteral("[rip%1]").arg(i);
+        } else {
+            mixInputs << QStringLiteral("[a%1]").arg(i);
+        }
     }
 
     chains << QStringLiteral("%1amix=inputs=%2:normalize=0:duration=longest,"
-                             "atrim=duration=%3,"
+                             "%4atrim=duration=%3,"
                              "asetpts=PTS-STARTPTS[aout]")
         .arg(mixInputs.join(QString()), QString::number(validEntries.size()),
-             ffmpegNumber(durationSeconds));
+             ffmpegNumber(durationSeconds),
+             renderInPlace ? QStringLiteral("asetpts=N/SR/TB,apad,") : QString());
 
     args << QStringLiteral("-filter_complex") << chains.join(QStringLiteral(";"))
          << QStringLiteral("-map") << QStringLiteral("[aout]")
@@ -2682,9 +2694,10 @@ LoudnessMeasureResult measureTimelineLoudness(const QVector<PlaybackEntry> &entr
 
 } // namespace
 
-QString renderinplace::prepareAudioMix(Timeline *timeline, const QString &outputPath, QString *error)
+QString renderinplace::prepareAudioMix(Timeline *timeline, const QString &outputPath,
+                                      double durationSeconds, QString *error)
 {
-    return prepareTimelineAudioMixForExport(timeline, error, outputPath);
+    return prepareTimelineAudioMixForExport(timeline, error, outputPath, durationSeconds);
 }
 
 void syncTimeRemapEntriesToTimeline(

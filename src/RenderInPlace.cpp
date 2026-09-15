@@ -266,13 +266,17 @@ bool renderClipInPlace(Timeline &timeline, int trackIndex, int clipIndex,
     job.projectFilePath = silentInput.fileName();
     // .veditor is not an audio-mix trigger in RenderQueue: it falls back to
     // V1 media. Prepare the normal export mix and mux it in this same job.
-    QTemporaryDir mixDirectory;
+    QTemporaryDir mixDirectory(QDir(directory).filePath(QStringLiteral(".render-in-place-mix-XXXXXX")));
     if (!linked.isEmpty()) {
         if (!mixDirectory.isValid())
             return fail(QStringLiteral("リンク音声の一時フォルダーを作成できません"));
+        // Keep the intermediate beneath outputDir when a selftest needs diagnostics.
+        if (options.retainAudioMixForDiagnostics)
+            mixDirectory.setAutoRemove(false);
         QString mixError;
         const QString mixPath = prepareAudioMix(&temporary,
-            mixDirectory.filePath(QStringLiteral("linked-audio.m4a")), &mixError);
+            mixDirectory.filePath(QStringLiteral("linked-audio.m4a")),
+            length + prefix + suffix, &mixError);
         if (mixPath.isEmpty() || !mixError.isEmpty())
             return fail(mixError.isEmpty() ? QStringLiteral("リンク音声を準備できません") : mixError);
         job.projectFilePath = mixPath;
