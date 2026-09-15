@@ -1542,8 +1542,10 @@ int runMcpSelftest()
                 return toolPayload(callProjectInfoTool(++requestId, QStringLiteral("undo"), QJsonObject{}))
                     .value(QStringLiteral("ok")).toBool();
             };
-            const QJsonObject values{{QStringLiteral("liftR"), 0.2},
-                {QStringLiteral("gammaG"), -0.3}, {QStringLiteral("gainB"), 0.4},
+            // UI wheel values outside +/-1 must survive MCP readback and one undo.
+            const QJsonObject values{{QStringLiteral("liftR"), 1.5},
+                {QStringLiteral("gammaR"), 2.0}, {QStringLiteral("gammaG"), -3.3},
+                {QStringLiteral("gainB"), -1.5},
                 {QStringLiteral("exposure"), 1.5}};
             const quint64 serial = projectTimeline->undoManager()->saveSerial();
             const auto response = toolPayload(callColor(values));
@@ -1590,7 +1592,8 @@ int runMcpSelftest()
             const QVector<QJsonObject> invalidValues{
                 {{QStringLiteral("exposure"), 3.01}}, {{QStringLiteral("gamma"), 0.09}},
                 {{QStringLiteral("brightness"), 101}}, {{QStringLiteral("hue"), -181}},
-                {{QStringLiteral("liftR"), 1.01}}, {{QStringLiteral("gammaG"), -1.01}},
+                {{QStringLiteral("liftR"), 2.01}}, {{QStringLiteral("gammaG"), -6.65}},
+                {{QStringLiteral("gammaR"), 4.01}},
                 {{QStringLiteral("logHighB"), 1.01}}, {{QStringLiteral("unknown"), 1}},
                 {{QStringLiteral("contrast"), QStringLiteral("bad")}},
                 {{QStringLiteral("brightness"), 15}, {QStringLiteral("unknown"), 1}}
