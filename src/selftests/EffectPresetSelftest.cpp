@@ -318,15 +318,15 @@ int runEffectPresetSelftest()
               && includePath == PresetLibrary::presetFilePath(includeName),
           includePath);
 
-    // G2: JSON round-trip preserves all 50 supported enum cases and params.
+    // G2: JSON round-trip preserves all 51 supported enum cases and params.
     EffectPreset includePreset;
     const bool loadedInclude = library.loadClipStackPreset(includeName, &includePreset);
     const KeyframeManager sourceEffectKf = effectKeyframesOnly(source.keyframes);
-    check(2, "load round-trip preserves 50 effect entries and parameters",
+    check(2, "load round-trip preserves 51 effect entries and parameters",
           loadedInclude
               && includePreset.includesKeyframes
               && includePreset.effects.size() == supportedTypes().size()
-              && supportedTypes().size() == 50
+              && supportedTypes().size() == 51
               && sameColorCorrection(includePreset.colorCorrection, source.colorCorrection)
               && sameEffects(includePreset.effects, source.effects)
               && sameKeyframes(includePreset.keyframes, sourceEffectKf),
