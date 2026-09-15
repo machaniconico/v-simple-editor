@@ -148,6 +148,37 @@ int runTimelineErgoSelftest()
             && sameTracks(before.audioTracks, timeline.currentState().audioTracks);
         gate(3, ok);
     }
+    {
+        Timeline timeline;
+        const QVector<ClipInfo> clips{clip(4.0), clip(2.0)};
+        timeline.restoreFromProject(QVector<QVector<ClipInfo>>{clips},
+                                    QVector<QVector<ClipInfo>>{},
+                                    2.0, -1.0, -1.0, 100);
+        timeline.videoTracks()[0]->setSelectedClip(1);
+        baseline(timeline);
+        const TimelineState before = timeline.currentState();
+        const int undoIndex = timeline.undoManager()->currentIndex();
+        int primaryNotifications = 0;
+        int trackNotifications = 0;
+        QObject::connect(&timeline, &Timeline::clipSelected, &timeline,
+                         [&](int primary) { if (primary == 2) ++primaryNotifications; });
+        QObject::connect(&timeline, &Timeline::clipSelectedOnTrack, &timeline,
+                         [&](int trackIndex, int primary) {
+                             if (trackIndex == 0 && primary == 2) ++trackNotifications;
+                         });
+        timeline.bladeAllTracksAtPlayhead();
+        bool ok = primaryNotifications >= 1 && trackNotifications >= 1
+            && timeline.videoTracks()[0]->selectedClips() == QList<int>({2})
+            && timeline.videoTracks()[0]->clipCount() == 3
+            && timeline.undoManager()->currentIndex() == undoIndex + 1;
+        timeline.undo();
+        const TimelineState restored = timeline.currentState();
+        ok = ok && sameTracks(before.videoTracks, restored.videoTracks)
+            && sameTracks(before.audioTracks, restored.audioTracks)
+            && timeline.videoTracks()[0]->selectedClips() == QList<int>({1})
+            && timeline.undoManager()->currentIndex() == undoIndex && !timeline.canUndo();
+        gate(4, ok);
+    }
     std::fprintf(stderr, "[timeline-ergo] summary: %d PASS, %d FAIL\n", passed, failed);
     return failed;
 }

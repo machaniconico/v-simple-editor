@@ -4676,6 +4676,23 @@ void Timeline::bladeAllTracksAtPlayhead()
     remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
     remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
     saveUndoState(QStringLiteral("全トラックを再生ヘッドで分割"));
+    // Refresh edit targets without triggering linked-selection propagation.
+    int primary = -1;
+    int videoTrackIndex = -1;
+    if (m_activeVideoTrackIndex >= 0 && m_activeVideoTrackIndex < m_videoTracks.size()
+        && m_videoTracks[m_activeVideoTrackIndex]) {
+        videoTrackIndex = m_activeVideoTrackIndex;
+        primary = m_videoTracks[videoTrackIndex]->selectedClip();
+    } else {
+        for (auto *track : m_audioTracks) {
+            if (track && track->selectedClip() >= 0) {
+                primary = track->selectedClip();
+                break;
+            }
+        }
+    }
+    emit clipSelected(primary);
+    emit clipSelectedOnTrack(videoTrackIndex, primary);
     onTrackModified();
     updateInfoLabel();
     emit positionChanged(m_playheadPos);
