@@ -1,10 +1,14 @@
 #include "../RenderInPlace.h"
+#include "../RenderQueue.h"
 #include "../Timeline.h"
 #include "../TimelineFrameRenderer.h"
 #include "../ProjectFile.h"
 #include "../UndoManager.h"
 #include "../libavcore/Probe.h"
 #include <QFileInfo>
+#include <QDir>
+#include <QEventLoop>
+#include <QSet>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QTemporaryDir>
@@ -20,6 +24,94 @@ QJsonObject clipJson(const ClipInfo &clip)
     return QJsonDocument::fromJson(ProjectFile::toJsonString(data).toUtf8()).object()
         .value("videoTracks").toArray().at(0).toArray().at(0).toObject();
 }
+// Independent encode/decode control: export the untouched, one-clip timeline
+// directly. This deliberately does not call renderClipInPlace or construct its
+// isolated/replacement clips. It measures the actual queue codec + RGB/YUV
+// round trip, including the encoder fallback available on the acceptance host.
+bool renderControl(Timeline &timeline, const renderinplace::Options &options,
+                   QString *path, QString *error)
+{
+    *path = QDir(options.outputDir).filePath(QStringLiteral("control.mp4"));
+    const QString silentPath = QDir(options.outputDir).filePath(QStringLiteral("silent.png"));
+    QImage silent(2, 2, QImage::Format_RGB32);
+    silent.fill(Qt::black);
+    if (!silent.save(silentPath)) {
+        *error = QStringLiteral("control: cannot save silent input");
+        return false;
+    }
+    RenderPreset preset{QStringLiteral("対照書き出し"), options.outputSize.width(),
+        options.outputSize.height(), options.codec, 100000000, QStringLiteral("mp4")};
+    RenderJob job = RenderQueue::jobFromPreset(preset, *path, 0,
+        qRound64(timeline.totalDuration() * 1000000.0));
+    job.timeline = &timeline;
+    job.projectFilePath = silentPath;
+    job.exportConfig["fps"] = options.fps;
+    RenderQueue queue;
+    QEventLoop loop;
+    bool done = false, success = false;
+    QObject::connect(&queue, &RenderQueue::jobCompletedUuid, &loop,
+        [&](const QString &uuid, bool ok, const QString &message) {
+            if (uuid != job.uuid) return;
+            done = true;
+            success = ok;
+            *error = message;
+            loop.quit();
+        });
+    queue.addJob(job);
+    queue.start();
+    if (!done) loop.exec();
+    return success;
+}
+
+bool jsonEqual(const char *label, const QJsonObject &expected, const QJsonObject &actual)
+{
+    QSet<QString> keys;
+    for (const QString &key : expected.keys()) keys.insert(key);
+    for (const QString &key : actual.keys()) keys.insert(key);
+    for (const QString &key : keys) {
+        if (expected.value(key) == actual.value(key)) continue;
+        const auto describe = [](const QJsonValue &value) {
+            return QJsonDocument(QJsonArray{value}).toJson(QJsonDocument::Compact);
+        };
+        std::fprintf(stderr, "%s diff key=%s expected=%s actual=%s\n", label,
+            qPrintable(key), describe(expected.value(key)).constData(),
+            describe(actual.value(key)).constData());
+    }
+    return expected == actual;
+}
+
+void saveFrameDifference(const QString &directory, int index,
+                         const QImage &before, const QImage &after)
+{
+    const QString prefix = QDir(directory).filePath(QStringLiteral("G1_%1_").arg(index));
+    const bool beforeSaved = before.save(prefix + QStringLiteral("before.png"));
+    const bool afterSaved = after.save(prefix + QStringLiteral("after.png"));
+    if (before.isNull() || after.isNull() || before.size() != after.size()) {
+        std::fprintf(stderr, "G1 frame %d invalid dimensions: %dx%d / %dx%d\n",
+            index, before.width(), before.height(), after.width(), after.height());
+        return;
+    }
+    const QImage a = before.convertToFormat(QImage::Format_RGB32);
+    const QImage b = after.convertToFormat(QImage::Format_RGB32);
+    QImage difference(a.size(), QImage::Format_RGB32);
+    double signedSum[3] = {};
+    for (int y = 0; y < a.height(); ++y) {
+        for (int x = 0; x < a.width(); ++x) {
+            const QRgb left = a.pixel(x, y), right = b.pixel(x, y);
+            const int r = qRed(right) - qRed(left);
+            const int g = qGreen(right) - qGreen(left);
+            const int bl = qBlue(right) - qBlue(left);
+            signedSum[0] += r; signedSum[1] += g; signedSum[2] += bl;
+            difference.setPixel(x, y, qRgb(std::abs(r), std::abs(g), std::abs(bl)));
+        }
+    }
+    const double pixels = double(a.width()) * a.height();
+    const bool diffSaved = difference.save(prefix + QStringLiteral("diff.png"));
+    std::fprintf(stderr, "G1 frame %d mean RGB bias=(%.6f, %.6f, %.6f), PNG saved=%d/%d/%d\n",
+        index, signedSum[0] / pixels, signedSum[1] / pixels, signedSum[2] / pixels,
+        int(beforeSaved), int(afterSaved), int(diffSaved));
+}
+
 bool videoOnly(const QString &path)
 {
     AVFormatContext *context = nullptr;
@@ -70,6 +162,16 @@ int runRenderInPlaceSelftest()
     original.displayName = QStringLiteral("焼き込みテスト");
     const auto sourceDuration = libavcore::probeDurationMicroseconds(original.filePath.toStdString());
     original.duration = sourceDuration ? double(*sourceDuration) / 1000000.0 : 0.0;
+    if (!output.isValid() || !QFileInfo::exists(original.filePath)
+        || !sourceDuration || original.duration < 3.0) {
+        std::fprintf(stderr, "render-in-place prerequisite FAIL: outputValid=%d, "
+            "fixture=%s, exists=%d, duration=%.6f (required >= 3.0 seconds); "
+            "run from the repository root\n", int(output.isValid()),
+            qPrintable(original.filePath), int(QFileInfo::exists(original.filePath)), original.duration);
+        for (int number = 1; number <= 5; ++number) gate(number, false);
+        std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
+        return failed;
+    }
     original.inPoint = 1.0;
     original.outPoint = 2.0;
     original.effects.append(VideoEffect::createBrightnessContrast(12.0, 0.0));
@@ -86,23 +188,67 @@ int runRenderInPlaceSelftest()
     QVector<QImage> frames;
     for (qint64 tick : {100000LL, 500000LL, 900000LL})
         frames.append(tlrender::renderFrameAt(&timeline, tick, options.outputSize));
-    QString path, error;
+    QString path, error, controlPath;
+    const bool controlRendered = renderControl(timeline, options, &controlPath, &error);
+    if (!controlRendered) std::fprintf(stderr, "G1 control export failed: %s\n", qPrintable(error));
+    ClipInfo controlClip{};
+    controlClip.filePath = controlPath;
+    controlClip.duration = original.effectiveDuration();
+    Timeline controlTimeline;
+    controlTimeline.restoreFromProject(QVector<QVector<ClipInfo>>{{controlClip}},
+        QVector<QVector<ClipInfo>>{}, 0, -1, -1, 10);
     const quint64 serial = timeline.undoManager()->saveSerial();
-    const bool baked = output.isValid() && original.duration >= 3.0
-        && renderinplace::renderClipInPlace(timeline, 0, 0, options, &path, &error);
-    if (!baked) std::fprintf(stderr, "%s\n", qPrintable(error));
-    double worst = 0.0;
+    const bool baked = renderinplace::renderClipInPlace(timeline, 0, 0, options, &path, &error);
+    if (!baked) std::fprintf(stderr, "G1 bake failed: %s\n", qPrintable(error));
+    bool pictureMatches = baked && controlRendered;
+    QVector<QImage> afterFrames;
     int index = 0;
-    for (qint64 tick : {100000LL, 500000LL, 900000LL})
-        worst = qMax(worst, mse(frames[index++], tlrender::renderFrameAt(&timeline, tick, options.outputSize)));
-    std::fprintf(stderr, "render-in-place MSE: %.6f\n", worst);
-    gate(1, baked && worst < 2.0);
+    // A YUV-to-YUV transcode does not measure the queue's RGB round trip.
+    // The queue consumes RGB
+    // after effects and resamples chroma with SWS_BILINEAR on both legs.
+    // Use the measured control floor for EACH frame, with a 0.25 MSE margin;
+    // also compare to the decoded control directly to catch time/colour shifts.
+    constexpr double margin = 0.25;
+    for (qint64 tick : {100000LL, 500000LL, 900000LL}) {
+        const QImage after = tlrender::renderFrameAt(&timeline, tick, options.outputSize);
+        const QImage control = tlrender::renderFrameAt(&controlTimeline, tick, options.outputSize);
+        afterFrames.append(after);
+        const double actualMse = mse(frames[index], after);
+        const double controlMse = mse(frames[index], control);
+        const double residual = mse(control, after);
+        const bool ok = std::isfinite(actualMse) && std::isfinite(controlMse)
+            && actualMse <= controlMse + margin && residual <= margin;
+        std::fprintf(stderr, "G1 frame %d tick=%lld MSE=%.6f control=%.6f "
+            "residual=%.6f margin=%.2f %s\n", index, static_cast<long long>(tick),
+            actualMse, controlMse, residual, margin, ok ? "OK" : "FAIL");
+        pictureMatches = pictureMatches && ok;
+        ++index;
+    }
+    if (!pictureMatches) {
+        output.setAutoRemove(false);
+        std::fprintf(stderr, "G1 diagnostics retained in %s\n", qPrintable(output.path()));
+        index = 0;
+        for (qint64 tick : {100000LL, 500000LL, 900000LL}) {
+            saveFrameDifference(output.path(), index, frames[index], afterFrames[index]);
+            const QImage control = tlrender::renderFrameAt(&controlTimeline, tick, options.outputSize);
+            control.save(output.filePath(QStringLiteral("G1_%1_control.png").arg(index)));
+            const double earlier = mse(frames[index], tlrender::renderFrameAt(
+                &timeline, tick - 33333, options.outputSize));
+            const double later = mse(frames[index], tlrender::renderFrameAt(
+                &timeline, tick + 33333, options.outputSize));
+            std::fprintf(stderr, "G1 frame %d adjacent-frame MSE: earlier=%.6f later=%.6f\n",
+                index, earlier, later);
+            ++index;
+        }
+    }
+    gate(1, pictureMatches);
     const bool oneUndo = baked && timeline.undoManager()->saveSerial() == serial + 1;
     if (baked) timeline.undo();
     gate(4, oneUndo && clipJson(timeline.videoTracks()[0]->clips()[0]) == before);
 
     options.handlesSec = 1.0;
     const bool withHandles = baked && renderinplace::renderClipInPlace(timeline, 0, 0, options, &path, &error);
+    if (baked && !withHandles) std::fprintf(stderr, "G2 bake failed: %s\n", qPrintable(error));
     const ClipInfo replaced = timeline.videoTracks()[0]->clips()[0];
     const auto mediaDuration = withHandles ? libavcore::probeDurationMicroseconds(path.toStdString())
                                            : std::optional<int64_t>{};
@@ -121,7 +267,12 @@ int runRenderInPlaceSelftest()
     saved.videoTracks = QVector<QVector<ClipInfo>>{{nested, original}};
     const QString projectPath = output.filePath(QStringLiteral("roundtrip.veditor"));
     const QJsonObject serialized = clipJson(nested);
-    const bool roundTrip = ProjectFile::save(projectPath, saved) && ProjectFile::load(projectPath, loaded);
+    const bool savedOk = ProjectFile::save(projectPath, saved);
+    const bool loadedOk = savedOk && ProjectFile::load(projectPath, loaded);
+    const bool roundTrip = savedOk && loadedOk;
+    std::fprintf(stderr, "G5 file save=%d load=%d tracks=%lld firstTrackClips=%lld\n",
+        int(savedOk), int(loadedOk), static_cast<long long>(loaded.videoTracks.size()),
+        loaded.videoTracks.isEmpty() ? -1LL : static_cast<long long>(loaded.videoTracks[0].size()));
     const bool shape = roundTrip && loaded.videoTracks.size() == 1 && loaded.videoTracks[0].size() == 2;
     // Also exercise the reader against nested input that was not emitted by
     // our writer (which already strips the second level).
@@ -130,19 +281,52 @@ int runRenderInPlaceSelftest()
     child["renderInPlaceOriginal"] = before;
     injected["renderInPlaceOriginal"] = child;
     QJsonObject root = QJsonDocument::fromJson(ProjectFile::toJsonString(saved).toUtf8()).object();
-    root["videoTracks"] = QJsonArray{QJsonArray{injected}};
+    QJsonArray injectedClips;
+    injectedClips.append(injected);
+    QJsonArray injectedTracks;
+    injectedTracks.append(QJsonValue(injectedClips));
+    root["videoTracks"] = injectedTracks;
     ProjectData external;
     const bool readNested = ProjectFile::fromJsonString(
         QString::fromUtf8(QJsonDocument(root).toJson()), external)
         && external.videoTracks.size() == 1 && external.videoTracks[0].size() == 1
         && external.videoTracks[0][0].renderInPlaceOriginal
         && !external.videoTracks[0][0].renderInPlaceOriginal->renderInPlaceOriginal;
-    gate(5, shape && readNested && loaded.videoTracks[0][0].renderInPlaceOriginal
-        && !loaded.videoTracks[0][0].renderInPlaceOriginal->renderInPlaceOriginal
-        && clipJson(*loaded.videoTracks[0][0].renderInPlaceOriginal) == before
-        && !loaded.videoTracks[0][1].renderInPlaceOriginal
-        && !clipJson(original).contains("renderInPlaceOriginal")
+    std::fprintf(stderr, "G5 injected reader tracks=%lld firstTrackClips=%lld\n",
+        static_cast<long long>(external.videoTracks.size()),
+        external.videoTracks.isEmpty() ? -1LL : static_cast<long long>(external.videoTracks[0].size()));
+    bool persistenceMatches = true;
+    const auto condition = [&](const char *name, bool ok) {
+        std::fprintf(stderr, "G5 %s: %s\n", name, ok ? "OK" : "FAIL");
+        persistenceMatches = persistenceMatches && ok;
+    };
+    condition("shape", shape);
+    condition("readNested", readNested);
+    const auto loadedOriginal = shape ? loaded.videoTracks[0][0].renderInPlaceOriginal
+                                      : std::shared_ptr<ClipInfo>{};
+    condition("loaded original non-null", bool(loadedOriginal));
+    condition("second level null", loadedOriginal && !loadedOriginal->renderInPlaceOriginal);
+    condition("clipJson equality", loadedOriginal
+        && jsonEqual("G5 saved original", before, clipJson(*loadedOriginal)));
+    condition("adjacent original null", shape && !loaded.videoTracks[0][1].renderInPlaceOriginal);
+    condition("default-omit ordinary", !clipJson(original).contains("renderInPlaceOriginal")
+        && shape && !clipJson(loaded.videoTracks[0][1]).contains("renderInPlaceOriginal"));
+    condition("default-omit nested", serialized.value("renderInPlaceOriginal").isObject()
         && !serialized.value("renderInPlaceOriginal").toObject().contains("renderInPlaceOriginal"));
+
+    // Independent JSON idempotence, without an UndoManager copy or a baked
+    // clip: clipToJson(clipFromJson(clipToJson(original))) == clipToJson(original).
+    ProjectData plain, plainLoaded;
+    plain.videoTracks = QVector<QVector<ClipInfo>>{{original}};
+    const bool plainRead = ProjectFile::fromJsonString(ProjectFile::toJsonString(plain), plainLoaded)
+        && plainLoaded.videoTracks.size() == 1 && plainLoaded.videoTracks[0].size() == 1;
+    condition("independent JSON idempotence", plainRead
+        && jsonEqual("G5 plain original", before, clipJson(plainLoaded.videoTracks[0][0])));
+    if (!persistenceMatches) {
+        output.setAutoRemove(false);
+        std::fprintf(stderr, "G5 roundtrip project retained in %s\n", qPrintable(projectPath));
+    }
+    gate(5, persistenceMatches);
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
     return failed;
 }
