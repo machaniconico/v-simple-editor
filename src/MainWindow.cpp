@@ -213,6 +213,8 @@ double exporter_loudnessGainDb();
   #define HAVE_AUDIO_RESTORATION_DIALOG 1
 #endif
 #include "VoiceIsolationDialog.h"
+#include "NoisePrintDialog.h"
+#include "libavcore/AudioExtract.h"
 #if __has_include("AnimatedExportDialog.h")
   #include "AnimatedExportDialog.h"
   #define HAVE_ANIMATED_EXPORT_DIALOG 1
@@ -2927,6 +2929,7 @@ MainWindow::MainWindow(QWidget *parent)
 
 MainWindow::~MainWindow()
 {
+    qApp->removeEventFilter(this);
     // MainWindow's value members are destroyed before QMainWindow deletes its
     // QObject children. Detach every child that stores a non-owning pointer
     // to one of those values while the values are still alive.
@@ -3610,6 +3613,7 @@ void MainWindow::setupUI()
         menu.exec(gp);
     });
     m_timeline = new Timeline(this);
+    qApp->installEventFilter(this);
     syncProjectLightingToTimeline();
     // US-INT-1: hand the Timeline to GLPreview so paintGL can compose any
     // adjustment layers covering the current timeline position.
@@ -19769,4 +19773,198 @@ void MainWindow::pushAnimatedHslPreview(double seconds)
         hsl.liftR, hsl.liftG, hsl.liftB, hsl.gammaR, hsl.gammaG, hsl.gammaB,
         hsl.gainR, hsl.gainG, hsl.gainB);
     m_animatedHslPreview = animated;
+}
+
+bool MainWindow::noisePrintRange(TimelineTrack *track, int clipIndex,
+                                 double *start, double *end) const
+{
+    if (!m_timeline || !track || clipIndex < 0 || clipIndex >= track->clips().size()
+        || !m_timeline->hasMarkedRange()) return false;
+    double cursor = 0.0;
+    for (int i = 0; i < clipIndex; ++i)
+        cursor += qMax(0.0, track->clips()[i].leadInSec) + track->clips()[i].effectiveDuration();
+    const auto &clip = track->clips()[clipIndex];
+    cursor += qMax(0.0, clip.leadInSec);
+    if (m_timeline->markedIn() < cursor
+        || m_timeline->markedOut() > cursor + clip.effectiveDuration()) return false;
+    *start = clip.sourceSecondAtLocalTime(m_timeline->markedIn() - cursor);
+    *end = clip.sourceSecondAtLocalTime(m_timeline->markedOut() - cursor);
+    if (*start > *end) std::swap(*start, *end);
+    return std::isfinite(*start) && std::isfinite(*end) && *end > *start;
+}
+
+bool MainWindow::eventFilter(QObject *watched, QEvent *event)
+{
+    // Timeline owns its menu. Observe the initiating right press and extend
+    // only the immediately opened root menu, preserving every existing action.
+    if (event->type() == QEvent::MouseButtonPress && m_timeline) {
+        m_noisePrintMenuTrack.clear();
+        auto *track = qobject_cast<TimelineTrack *>(watched);
+        auto *mouse = static_cast<QMouseEvent *>(event);
+        if (track && m_timeline->audioTracks().contains(track) && !track->isLocked()
+            && mouse->button() == Qt::RightButton) {
+            const int index = track->clipAtX(mouse->pos().x());
+            if (index >= 0) {
+                m_noisePrintMenuTrack = track;
+                m_noisePrintMenuClip = index;
+                QTimer::singleShot(0, this, [this]() { m_noisePrintMenuTrack.clear(); });
+            }
+        }
+    } else if (event->type() == QEvent::Show && m_noisePrintMenuTrack) {
+        if (auto *menu = qobject_cast<QMenu *>(watched)) {
+            const QPointer<TimelineTrack> track = m_noisePrintMenuTrack;
+            const int index = m_noisePrintMenuClip;
+            m_noisePrintMenuTrack.clear();
+            if (index >= track->clips().size()) return false;
+            const auto &clip = track->clips()[index];
+            const bool usable = !clip.filePath.isEmpty() && clip.sequenceRefId.isEmpty();
+            double start = 0, end = 0;
+            const bool range = usable && noisePrintRange(track, index, &start, &end);
+            menu->addSeparator();
+            auto *captureAction = menu->addAction(QStringLiteral("ノイズプリントを取得 (イン点〜アウト点)"));
+            captureAction->setEnabled(range);
+            if (!range) {
+                auto *hint = menu->addAction(QStringLiteral("イン点とアウト点をクリップ内に設定してください"));
+                hint->setEnabled(false);
+            }
+            auto *subtractAction = menu->addAction(QStringLiteral("ノイズプリントで除去…"));
+            subtractAction->setEnabled(usable && m_noisePrint.isValid());
+            auto schedule = [this, track, index](bool captureOnly) {
+                QTimer::singleShot(0, this, [this, track, index, captureOnly]() {
+                    if (track) processNoisePrint(track, index, captureOnly);
+                });
+            };
+            connect(captureAction, &QAction::triggered, this, [schedule]() { schedule(true); });
+            connect(subtractAction, &QAction::triggered, this, [schedule]() { schedule(false); });
+        }
+    }
+    return QMainWindow::eventFilter(watched, event);
+}
+
+void MainWindow::processNoisePrint(TimelineTrack *track, int clipIndex, bool captureOnly)
+{
+    if (!m_timeline || !track || track->isLocked()
+        || !m_timeline->audioTracks().contains(track)
+        || clipIndex < 0 || clipIndex >= track->clips().size()) return;
+    const QPointer<TimelineTrack> target(track);
+    const ClipInfo clip = track->clips()[clipIndex];
+    const auto targetUnchanged = [&]() {
+        if (!target || target->isLocked() || !m_timeline->audioTracks().contains(target.data())
+            || clipIndex >= target->clips().size()) return false;
+        const auto &current = target->clips()[clipIndex];
+        return current.filePath == clip.filePath && current.inPoint == clip.inPoint
+            && current.outPoint == clip.outPoint && current.leadInSec == clip.leadInSec;
+    };
+    if (clip.filePath.isEmpty() || !clip.sequenceRefId.isEmpty()) return;
+    auto report = [this](const QString &message) {
+        QMessageBox::warning(this, QStringLiteral("ノイズプリント"), message);
+    };
+    double start = 0, end = 0;
+    if (captureOnly && !noisePrintRange(track, clipIndex, &start, &end)) {
+        report(QStringLiteral("イン点とアウト点をクリップ内に設定してください"));
+        return;
+    }
+    double amount = 12, floor = -20;
+    if (!captureOnly) {
+        if (!m_noisePrint.isValid()) return;
+        NoisePrintDialog dialog(this);
+        if (dialog.exec() != QDialog::Accepted) return;
+        amount = dialog.amountDb();
+        floor = dialog.floorDb();
+    }
+    // Decode the entire source, preserving the source-time origin used by
+    // trimmed/reversed clips. Never replace it with just the selected range.
+    // Two interleaved channels are retained throughout; there is no mono fold.
+    const QString ffmpeg = findFfmpegBinary();
+    QTemporaryDir temp;
+    if (ffmpeg.isEmpty() || !temp.isValid()) {
+        report(QStringLiteral("音声の抽出に必要な ffmpeg または一時フォルダーを利用できません。"));
+        return;
+    }
+    constexpr int sampleRate = 48000;
+    const QString rawPath = temp.filePath(QStringLiteral("noiseprint.pcm"));
+    QProcess decoder;
+    decoder.start(ffmpeg, {QStringLiteral("-v"), QStringLiteral("error"),
+        QStringLiteral("-nostdin"), QStringLiteral("-i"), clip.filePath,
+        QStringLiteral("-map"), QStringLiteral("0:a:0"), QStringLiteral("-vn"),
+        QStringLiteral("-ac"), QStringLiteral("2"), QStringLiteral("-ar"), QString::number(sampleRate),
+        QStringLiteral("-f"), QStringLiteral("s16le"), rawPath});
+    if (!decoder.waitForStarted(5000) || !decoder.waitForFinished(-1)
+        || decoder.exitStatus() != QProcess::NormalExit || decoder.exitCode() != 0) {
+        report(QStringLiteral("音声の抽出に失敗しました:\n%1")
+                   .arg(QString::fromUtf8(decoder.readAllStandardError())));
+        return;
+    }
+    QFile raw(rawPath);
+    if (!raw.open(QIODevice::ReadOnly) || raw.size() <= 0 || raw.size() % 4 != 0
+        || raw.size() > 256 * 1024 * 1024) {
+        report(QStringLiteral("音声を読み込めません。長い音声の場合は短くして再試行してください。"));
+        return;
+    }
+    QByteArray pcm = raw.readAll();
+    if (pcm.size() != raw.size()) { report(QStringLiteral("音声の読み込みが完了しませんでした。")); return; }
+    const size_t count = static_cast<size_t>(pcm.size() / 4);
+    noiseprint::NoisePrint captured;
+    QString error;
+    for (int channel = 0; channel < 2; ++channel) {
+        std::vector<double> input(count), output;
+        for (size_t i = 0; i < count; ++i) {
+            const auto offset = static_cast<qsizetype>(i * 4 + channel * 2);
+            const quint16 bits = static_cast<unsigned char>(pcm[offset])
+                | (static_cast<quint16>(static_cast<unsigned char>(pcm[offset + 1])) << 8);
+            input[i] = static_cast<qint16>(bits) / 32768.0;
+        }
+        if (captureOnly) {
+            auto print = noiseprint::capture(input, sampleRate, start, end);
+            if (!print.isValid()) {
+                report(QStringLiteral("取得範囲には少なくとも 2048 サンプルの音声が必要です。"));
+                return;
+            }
+            if (channel == 0) captured = print;
+            else for (size_t k = 0; k < print.magnitude.size(); ++k)
+                captured.magnitude[k] = std::sqrt((captured.magnitude[k] * captured.magnitude[k]
+                                                   + print.magnitude[k] * print.magnitude[k]) / 2.0);
+        } else {
+            if (!noiseprint::subtract(input, output, m_noisePrint, amount, floor, sampleRate, &error)) {
+                report(error); return;
+            }
+            for (size_t i = 0; i < count; ++i) {
+                const qint16 value = static_cast<qint16>(std::lround(std::clamp(output[i], -1.0, 1.0) * 32767.0));
+                const auto offset = static_cast<qsizetype>(i * 4 + channel * 2);
+                pcm[offset] = static_cast<char>(value & 0xff);
+                pcm[offset + 1] = static_cast<char>((value >> 8) & 0xff);
+            }
+        }
+    }
+    if (captureOnly) {
+        m_noisePrint = std::move(captured);
+        statusBar()->showMessage(QStringLiteral("ノイズプリントを取得しました。"), 5000);
+        return;
+    }
+    const QFileInfo source(clip.filePath);
+    const QString outputPath = QFileDialog::getSaveFileName(this, QStringLiteral("除去済み音声を保存"),
+        source.absolutePath() + QLatin1Char('/') + source.completeBaseName() + QStringLiteral("_noiseprint.wav"),
+        QStringLiteral("WAV ファイル (*.wav)"));
+    if (outputPath.isEmpty()) return;
+    // Existing media must remain intact for undo, including earlier processed WAVs.
+    const QFileInfo destination(outputPath);
+    for (auto *existingTrack : m_timeline->audioTracks() + m_timeline->videoTracks()) {
+        if (!existingTrack) continue;
+        for (const auto &existingClip : existingTrack->clips()) {
+            if (destination.exists() && destination.canonicalFilePath() == QFileInfo(existingClip.filePath).canonicalFilePath()) {
+                report(QStringLiteral("元に戻せるよう、使用中の音源とは別のファイル名を指定してください。"));
+                return;
+            }
+        }
+    }
+    if (!targetUnchanged()) {
+        report(QStringLiteral("処理中に対象クリップが変更されました。もう一度実行してください。")); return;
+    }
+    if (!libavcore::writePcm16AsWav(outputPath, pcm, sampleRate, 2, &error)) { report(error); return; }
+    if (!m_timeline->replaceAudioClipMedia(m_timeline->audioTracks().indexOf(track), clipIndex, outputPath)) {
+        report(QStringLiteral("クリップの音源を差し替えられませんでした。")); return;
+    }
+    // replaceAudioClipMedia owns the single undo entry.
+    setWindowModified(true);
+    statusBar()->showMessage(QStringLiteral("ノイズプリントで除去した音声を適用しました。"), 5000);
 }

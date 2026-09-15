@@ -126,6 +126,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/camera3d_selftest.cpp
     src/selftests/camera_solve_selftest.cpp
     src/selftests/VoiceIsolationSelftest.cpp
+    src/selftests/noise_print_selftest.cpp
     src/selftests/GradeLggSerializationSelftest.cpp
     src/selftests/color_warper_selftest.cpp
     src/selftests/GradeLogWheelSelftest.cpp
@@ -320,6 +321,10 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/VoiceIsolation.cpp
     src/VoiceIsolationDialog.h
     src/VoiceIsolationDialog.cpp
+    src/NoisePrint.h
+    src/NoisePrint.cpp
+    src/NoisePrintDialog.h
+    src/NoisePrintDialog.cpp
     src/SpectrogramWidget.cpp
     src/SpectralEditDialog.cpp
     src/selftests/spectral_edit_selftest.cpp

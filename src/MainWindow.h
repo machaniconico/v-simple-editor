@@ -31,6 +31,7 @@
 #include "WorkspaceManager.h"  // WS-3: 名前付きワークスペース (ドックレイアウト) モデル SSOT
 #include "MotionTracker.h"
 #include "NoiseReduction.h"
+#include "NoisePrint.h"
 #include "SubtitleGenerator.h"
 #include "EffectPreset.h"
 #include "EffectLibraryPanel.h"
@@ -100,6 +101,7 @@
 
 class VideoPlayer;
 class Timeline;
+class TimelineTrack;
 class SourceMonitorDock;
 class StillGalleryDock;
 class AudioBusPanel;
@@ -657,12 +659,18 @@ private slots:
     void showMcpConnectionInfo();
 
 protected:
+    bool eventFilter(QObject *watched, QEvent *event) override;
     void dragEnterEvent(QDragEnterEvent *event) override;
     void dropEvent(QDropEvent *event) override;
     void closeEvent(QCloseEvent *event) override;
     void showEvent(QShowEvent *event) override;
 
 private:
+    noiseprint::NoisePrint m_noisePrint;
+    QPointer<TimelineTrack> m_noisePrintMenuTrack;
+    int m_noisePrintMenuClip = -1;
+    bool noisePrintRange(TimelineTrack *track, int clipIndex, double *start, double *end) const;
+    void processNoisePrint(TimelineTrack *track, int clipIndex, bool captureOnly);
     void pushAnimatedHslPreview(double seconds);
     bool m_animatedHslPreview = false;
     void setupMenuBar();

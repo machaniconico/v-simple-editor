@@ -58,6 +58,7 @@ int runLight3DSelftest();
 int runCamera3DSelftest();
 int runCameraSolveSelftest();
 int runVoiceIsolationSelftest();
+int runNoisePrintSelftest();
 int runBatchExportSelftest();
 int runBatchExportE2ESelftest();
 int runBezierEasingSelftest();
@@ -549,6 +550,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "AE-ANIM-2 spatial Bezier position path and auto-orient (9 gates)" },
     { "spectral-edit",     "VEDITOR_SPECTRAL_EDIT_SELFTEST",      runSpectralEditSelftest,       false,
       "SpectralEngine: FFT/STFT/iSTFT round-trip + region attenuation" },
+    { "noise-print", "VEDITOR_NOISE_PRINT_SELFTEST", runNoisePrintSelftest, false,
+      "Noise print: SNR, amplitude, bypass, stereo independence, validation and determinism (6 gates)" },
     { "voice-isolation",   "VEDITOR_VOICE_ISOLATION_SELFTEST",    runVoiceIsolationSelftest,     true,
       "Voice isolation: streaming STFT, complementary outputs, adaptive floor, smoothing, dialog responsiveness and harmonic guards (16 gates)" },
     { "sws-color",         "VEDITOR_SWS_COLOR_SELFTEST",          runSwsColorSelftest,           false,
