@@ -19,6 +19,7 @@
 #include <functional>
 #include <initializer_list>
 #include <optional>
+#include <memory>
 #include <utility>
 #include "VideoEffect.h"
 #include "Keyframe.h"
@@ -338,6 +339,9 @@ struct ClipInfo {
     // looks up the active source-time via std::lower_bound and applies the
     // INVERSE 2D affine, composed with the user 3D-rotate matrix.
     QVector<StabilizerKeyframe> stabilizerKeyframes;
+
+    // US-307: absent for ordinary clips; persistence retains one level only.
+    std::shared_ptr<ClipInfo> renderInPlaceOriginal;
 
     double effectiveDuration() const {
         double out = (outPoint > 0.0) ? outPoint : duration;
@@ -717,6 +721,9 @@ public:
     // 該当しなければ V1 を検索する。ClipInfo の共通 speed/reverse/remap 写像を使う。
     bool matchFrame(double timelineSec, MatchFrameResult *result,
                     QString *errorOut = nullptr) const;
+    // US-307: replace one video clip atomically, preserving carrier indices.
+    bool replaceRenderedClip(int trackIndex, int clipIndex, const ClipInfo &clip,
+                             const QString &description);
     // 素材だけを差し替え、トリム・配置・エフェクト等は維持する。新素材が短い場合は
     // 収まる長さまで短縮し、messageOut に警告を返す。成功時は Undo 1 回。
     bool replaceClipMedia(TrackKind kind, int trackIndex, int clipIndex,
@@ -1162,6 +1169,7 @@ public:
         return m_trackMatteEntries;
     }
 signals:
+    void renderInPlaceRequested(int trackIndex, int clipIndex);
     void clipSelected(int index);
     // V3 sprint — track-aware overload. emitted alongside the int-only
     // signal so MainWindow can drop its playhead heuristic and resolve

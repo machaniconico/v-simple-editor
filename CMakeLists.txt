@@ -632,6 +632,9 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/SpeedRamp.cpp
     src/SpeedRampData.cpp
     src/SpeedRampData.h
+    src/RenderInPlace.h
+    src/RenderInPlace.cpp
+    src/selftests/render_in_place_selftest.cpp
     src/RenderQueue.cpp
     src/RenderQueueDialog.cpp
     src/RenderQueueDialog.h

@@ -406,6 +406,7 @@ private slots:
     void addMarker();
     void showMarkers();
     void exportChapters();
+    void renderClipInPlaceDialog(int trackIndex, int clipIndex);
     void openRenderQueue();
     void startScreenRecording();
     void stopScreenRecording();

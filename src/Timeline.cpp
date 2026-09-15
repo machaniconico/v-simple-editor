@@ -1,3 +1,4 @@
+#include "RenderInPlace.h"
 #include "Timeline.h"
 #include "CaptionOverlayBuilder.h"
 #include "CaptionTrack.h"
@@ -5607,6 +5608,27 @@ bool Timeline::matchFrame(double timelineSec, MatchFrameResult *result,
     return fail(QStringLiteral("再生ヘッド位置に動画クリップがありません"));
 }
 
+bool Timeline::replaceRenderedClip(int trackIndex, int clipIndex,
+                                   const ClipInfo &clip, const QString &description)
+{
+    TimelineTrack *track = trackAt(false, trackIndex);
+    if (!track || track->isLocked() || clipIndex < 0 || clipIndex >= track->clipCount())
+        return false;
+    TrackClipSnapshot before = snapshotTrackClips(this);
+    auto clips = track->clips();
+    clips[clipIndex] = clip;
+    track->setClips(clips);
+    // Replacement preserves the position; update its identity before remap
+    // (the same convention as replaceClipMedia).
+    before[trackIndex][clipIndex] = {clip.filePath, clip.linkGroup, clip.inPoint};
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, before);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, before);
+    saveUndoState(description);
+    updateInfoLabel();
+    scheduleEmitSequenceChanged();
+    return true;
+}
+
 bool Timeline::replaceClipMedia(TrackKind kind, int trackIndex, int clipIndex,
                                 const QString &newPath,
                                 const QString &newDisplayName,
@@ -7601,6 +7623,20 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     };
 
     QMenu menu;
+    const int renderTrack = m_videoTracks.indexOf(track);
+    if (renderTrack >= 0) {
+        auto *bake = menu.addAction(QStringLiteral("効果を焼き込んで差し替え…"));
+        bake->setEnabled(!track->isLocked());
+        connect(bake, &QAction::triggered, this, [this, renderTrack, clipIndex]() {
+            emit renderInPlaceRequested(renderTrack, clipIndex);
+        });
+        auto *restore = menu.addAction(QStringLiteral("元のクリップに戻す"));
+        restore->setEnabled(!track->isLocked() && bool(track->clips()[clipIndex].renderInPlaceOriginal));
+        connect(restore, &QAction::triggered, this, [this, renderTrack, clipIndex]() {
+            renderinplace::decomposeRenderInPlace(*this, renderTrack, clipIndex);
+        });
+        menu.addSeparator();
+    }
     QAction *cutAct = menu.addAction(QStringLiteral("カット"));
     QAction *copyAct = menu.addAction(QStringLiteral("コピー"));
     QAction *deleteAct = menu.addAction(QStringLiteral("削除"));

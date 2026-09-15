@@ -160,6 +160,7 @@ int runProjTmplSelftest();
 int runProjectPresetSelftest();
 int runProxySelftestV2();
 int runRenderFixtureSelftest();
+int runRenderInPlaceSelftest();
 int runRenderQueueAcesDecisionSelftest();
 int runRenderQueueFpsRationalSelftest();
 int runRightclickPausePrefSelftest();
@@ -691,6 +692,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "whisper-guide",      nullptr,                                runWhisperGuideSelftest,       false,
       "Whisper CLI resolution and subtitle translation preference persistence (5 gates)" },
     // QApplication-required (needsQApplication=true) ----------------------
+    { "render-in-place", nullptr, runRenderInPlaceSelftest, true,
+      "Render in place: image, handles, decompose, undo, persistence (5 gates)" },
     { "deflicker",         "VEDITOR_DEFLICKER_SELFTEST",          runDeflickerSelftest,         true,
       "Deflicker: global luma/RGB, streaming apply, cancellation, source resolution, and mask bounds (14 gates)" },
     { "adjustment-layer", "VEDITOR_ADJUSTMENT_LAYER_SELFTEST", runAdjustmentLayerSelftest, true,

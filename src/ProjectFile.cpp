@@ -1929,6 +1929,11 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
     if (!clip.speedRamp.isIdentity())
         obj["speedRamp"] = clip.speedRamp.toJson();
     obj["atempoEnabled"] = clip.atempoEnabled;
+    if (clip.renderInPlaceOriginal) {
+        ClipInfo original = *clip.renderInPlaceOriginal;
+        original.renderInPlaceOriginal.reset();
+        obj["renderInPlaceOriginal"] = clipToJson(original);
+    }
 
     return obj;
 }
@@ -2033,6 +2038,11 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
     if (obj.contains("speedRamp"))
         clip.speedRamp = speedramp::SpeedRamp::fromJson(obj["speedRamp"].toObject());
     clip.atempoEnabled = obj["atempoEnabled"].toBool(false);
+    if (obj.value("renderInPlaceOriginal").isObject()) {
+        QJsonObject original = obj.value("renderInPlaceOriginal").toObject();
+        original.remove("renderInPlaceOriginal");
+        clip.renderInPlaceOriginal = std::make_shared<ClipInfo>(clipFromJson(original));
+    }
 
     return clip;
 }

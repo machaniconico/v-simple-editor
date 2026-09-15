@@ -1,3 +1,4 @@
+#include "RenderInPlace.h"
 #include "MainWindow.h"
 #include "VideoPlayer.h"
 #include "Timeline.h"
@@ -2818,6 +2819,8 @@ MainWindow::MainWindow(QWidget *parent)
     connect(m_timeline, &Timeline::clipSelected, this, [this](int /*index*/) {
         updateEditActions();
     });
+    connect(m_timeline, &Timeline::renderInPlaceRequested,
+            this, &MainWindow::renderClipInPlaceDialog);
     connect(m_timeline, &Timeline::replaceClipRequested, this,
             [this](TrackKind kind, int trackIndex, int clipIndex) {
                 replaceClipFromMediaPool(kind, trackIndex, clipIndex);
@@ -9137,6 +9140,69 @@ void MainWindow::replaceSelectedClipFromMediaPool()
         return;
     }
     replaceClipFromMediaPool(kind, trackIndex, clipIndex);
+}
+
+void MainWindow::renderClipInPlaceDialog(int trackIndex, int clipIndex)
+{
+    QDialog dialog(this);
+    dialog.setWindowTitle(QStringLiteral("効果を焼き込んで差し替え"));
+    auto *form = new QFormLayout(&dialog);
+    auto *codec = new QComboBox(&dialog);
+    codec->addItem(QStringLiteral("H.264（MP4）"), QStringLiteral("h264"));
+    codec->addItem(QStringLiteral("ProRes（MOV）"), QStringLiteral("prores"));
+    auto *handles = new QDoubleSpinBox(&dialog);
+    handles->setRange(0.0, 5.0);
+    handles->setDecimals(3);
+    handles->setSuffix(QStringLiteral(" 秒"));
+    const QString base = m_projectFilePath.isEmpty()
+        ? QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)
+        : QFileInfo(m_projectFilePath).absolutePath();
+    auto *directory = new QLineEdit(QDir(base).filePath(QStringLiteral("RenderInPlace")), &dialog);
+    auto *browse = new QPushButton(QStringLiteral("参照…"), &dialog);
+    auto *outputRow = new QHBoxLayout;
+    outputRow->addWidget(directory);
+    outputRow->addWidget(browse);
+    connect(browse, &QPushButton::clicked, &dialog, [&]() {
+        const QString selected = QFileDialog::getExistingDirectory(&dialog,
+            QStringLiteral("出力先を選択"), directory->text());
+        if (!selected.isEmpty()) directory->setText(selected);
+    });
+    form->addRow(QStringLiteral("コーデック"), codec);
+    form->addRow(QStringLiteral("ハンドル秒"), handles);
+    form->addRow(QStringLiteral("出力先"), outputRow);
+    auto *buttons = new QDialogButtonBox(&dialog);
+    buttons->addButton(QStringLiteral("焼き込んで差し替え"), QDialogButtonBox::AcceptRole);
+    buttons->addButton(QStringLiteral("キャンセル"), QDialogButtonBox::RejectRole);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    form->addRow(buttons);
+    if (dialog.exec() != QDialog::Accepted) return;
+
+    renderinplace::Options options;
+    options.codec = codec->currentData().toString();
+    options.handlesSec = handles->value();
+    options.outputDir = directory->text();
+    options.projectFilePath = m_projectFilePath;
+    options.outputSize = QSize(m_projectConfig.width, m_projectConfig.height);
+    options.fps = m_projectConfig.fps;
+    QProgressDialog progress(QStringLiteral("効果を焼き込んでいます…"),
+                             QStringLiteral("キャンセル"), 0, 100, this);
+    progress.setWindowModality(Qt::ApplicationModal);
+    progress.setMinimumDuration(0);
+    progress.setAutoClose(false);
+    progress.setAutoReset(false);
+    options.connectProgress = [&progress](RenderQueue &queue) {
+        QObject::connect(&queue, &RenderQueue::jobProgressUuid, &progress,
+                         [&progress](const QString &, int percent) { progress.setValue(percent); });
+        QObject::connect(&progress, &QProgressDialog::canceled, &queue, &RenderQueue::stop);
+    };
+    progress.show();
+    QString path, error;
+    const bool ok = renderinplace::renderClipInPlace(*m_timeline, trackIndex, clipIndex,
+                                                   options, &path, &error);
+    progress.close();
+    if (!ok) QMessageBox::warning(this, QStringLiteral("焼き込み"), error);
+    else statusBar()->showMessage(QStringLiteral("差し替えました: %1").arg(path), 5000);
 }
 
 void MainWindow::replaceClipFromMediaPool(TrackKind kind, int trackIndex,
