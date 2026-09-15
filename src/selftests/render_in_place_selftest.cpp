@@ -170,7 +170,7 @@ int runRenderInPlaceSelftest()
             "fixture=%s, exists=%d, duration=%.6f (required >= 3.0 seconds); "
             "run from the repository root\n", int(output.isValid()),
             qPrintable(original.filePath), int(QFileInfo::exists(original.filePath)), original.duration);
-        for (int number = 1; number <= 7; ++number) gate(number, false);
+        for (int number = 1; number <= 8; ++number) gate(number, false);
         std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
         return failed;
     }
@@ -383,10 +383,13 @@ int runRenderInPlaceSelftest()
         expectedUpper.videoDx = upper.videoDx;
         expectedUpper.opacity = upper.opacity;
         expectedUpper.keyframes = upper.keyframes;
-        Timeline layered, expected;
-        layered.restoreFromProject(QVector<QVector<ClipInfo>>{{lower}, {upper}},
+        // V1 wins stacking: the target must be in front of the background.
+        Timeline layered, expected, backgroundOnly;
+        layered.restoreFromProject(QVector<QVector<ClipInfo>>{{upper}, {lower}},
             QVector<QVector<ClipInfo>>{}, 0, -1, -1, 10);
-        expected.restoreFromProject(QVector<QVector<ClipInfo>>{{lower}, {expectedUpper}},
+        expected.restoreFromProject(QVector<QVector<ClipInfo>>{{expectedUpper}, {lower}},
+            QVector<QVector<ClipInfo>>{}, 0, -1, -1, 10);
+        backgroundOnly.restoreFromProject(QVector<QVector<ClipInfo>>{{}, {lower}},
             QVector<QVector<ClipInfo>>{}, 0, -1, -1, 10);
         const QSize canvas = animated ? QSize(360, 640) : options.outputSize;
         QVector<QImage> beforeComposite;
@@ -397,30 +400,57 @@ int runRenderInPlaceSelftest()
         layerOptions.outputSize = canvas;
         QString layerPath, layerError;
         const bool layerBaked = renderinplace::renderClipInPlace(
-            layered, 1, 0, layerOptions, &layerPath, &layerError);
+            layered, 0, 0, layerOptions, &layerPath, &layerError);
         if (!layerBaked) std::fprintf(stderr, "G7 bake failed: %s\n", qPrintable(layerError));
-        const ClipInfo actualUpper = layered.videoTracks()[1]->clips()[0];
+        const ClipInfo actualUpper = layered.videoTracks()[0]->clips()[0];
         compositionMatches = compositionMatches && layerBaked
             && actualUpper.videoScale == upper.videoScale
             && actualUpper.videoDx == upper.videoDx && actualUpper.opacity == upper.opacity
             && clipJson(actualUpper).value("keyframes") == clipJson(upper).value("keyframes")
-            && clipJson(layered.videoTracks()[0]->clips()[0]) == clipJson(lower);
+            && clipJson(layered.videoTracks()[1]->clips()[0]) == clipJson(lower);
         int frame = 0;
         for (qint64 tick : {100000LL, 500000LL, 900000LL}) {
             const QImage after = tlrender::renderFrameAt(&layered, tick, canvas);
             const QImage control = tlrender::renderFrameAt(&expected, tick, canvas);
+            const QImage background = tlrender::renderFrameAt(&backgroundOnly, tick, canvas);
+            const double visibilityMse = mse(beforeComposite[frame], background);
             const double actualMse = mse(beforeComposite[frame], after);
             const double controlMse = mse(beforeComposite[frame], control);
             const double residual = mse(control, after);
             const bool ok = std::isfinite(actualMse) && std::isfinite(controlMse)
+                && std::isfinite(visibilityMse) && visibilityMse > 1.0
                 && actualMse <= controlMse + margin && residual <= margin;
-            std::fprintf(stderr, "G7 animated=%d frame=%d MSE=%.6f control=%.6f residual=%.6f %s\n",
-                int(animated), frame, actualMse, controlMse, residual, ok ? "OK" : "FAIL");
+            std::fprintf(stderr, "G7 animated=%d frame=%d MSE=%.6f control=%.6f residual=%.6f visibility=%.6f %s\n",
+                int(animated), frame, actualMse, controlMse, residual, visibilityMse, ok ? "OK" : "FAIL");
             compositionMatches = compositionMatches && ok;
             ++frame;
         }
     }
     gate(7, compositionMatches);
+    // An opaque codec cannot preserve the background through keyed V1 pixels.
+    // Reject before queue setup, filesystem changes, or timeline/undo mutation.
+    ClipInfo keyed = original, background = original;
+    keyed.effects.append(VideoEffect::createChromaKey(QColor(0, 255, 0), 442, 0));
+    background.effects.clear();
+    Timeline chroma;
+    chroma.restoreFromProject(QVector<QVector<ClipInfo>>{{keyed}, {background}},
+        QVector<QVector<ClipInfo>>{}, 0, -1, -1, 10);
+    chroma.undoManager()->clear();
+    chroma.saveUndoState(QStringLiteral("クロマキー初期状態"));
+    const quint64 chromaSerial = chroma.undoManager()->saveSerial();
+    auto chromaOptions = options;
+    chromaOptions.handlesSec = 0.0;
+    chromaOptions.outputDir = output.filePath(QStringLiteral("rejected_chroma"));
+    bool chromaQueueStarted = false;
+    chromaOptions.connectProgress = [&](RenderQueue &) { chromaQueueStarted = true; };
+    QString chromaPath = QStringLiteral("must be cleared"), chromaError;
+    const bool chromaAccepted = renderinplace::renderClipInPlace(
+        chroma, 0, 0, chromaOptions, &chromaPath, &chromaError);
+    gate(8, !chromaAccepted && !chromaError.isEmpty() && chromaPath.isEmpty()
+        && !chromaQueueStarted && !QFileInfo::exists(chromaOptions.outputDir)
+        && chroma.undoManager()->saveSerial() == chromaSerial
+        && clipJson(chroma.videoTracks()[0]->clips()[0]) == clipJson(keyed)
+        && clipJson(chroma.videoTracks()[1]->clips()[0]) == clipJson(background));
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
     return failed;
 }

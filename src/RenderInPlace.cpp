@@ -97,6 +97,12 @@ bool renderClipInPlace(Timeline &timeline, int trackIndex, int clipIndex,
     const double handles = options.handlesSec;
     if (isOverlapTransition(original.leadIn.type) || isOverlapTransition(original.trailOut.type))
         return fail(QStringLiteral("重ね合わせトランジション付きクリップは焼き込めません。先にトランジションを解除してください"));
+    // The available codecs flatten alpha to black. Inspect the entire stack,
+    // including effects whose active interval/keyframes exclude the current frame.
+    for (const auto &effect : original.effects) {
+        if (effect.type == VideoEffectType::ChromaKey && effect.enabled)
+            return fail(QStringLiteral("クロマキー付きクリップは透明部分を保持できないため焼き込めません。先にクロマキーを無効にしてください"));
+    }
     if (!original.maskTrackingData.isEmpty() || !original.stabilizerKeyframes.isEmpty())
         return fail(QStringLiteral("追跡マスクまたはスタビライズ付きクリップの焼き込みには対応していません"));
     const QSize outputSize = nativeVideoSize(original.filePath);
