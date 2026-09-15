@@ -5,6 +5,8 @@
 #include "UndoTrace.h"
 #include "AutoColor.h"
 #include "VersionedSave.h"
+#include "ProjectDiff.h"
+#include "ProjectDiffDialog.h"
 #include "DynamicZoomDialog.h"
 #include "MediaPaths.h"
 #include "MediaRelinkDialog.h"
@@ -4008,6 +4010,10 @@ void MainWindow::setupMenuBar()
     connect(saveAsAction, &QAction::triggered, this, &MainWindow::saveProjectAs);
     m_menuHelpEntries.append({saveAsAction,
         QStringLiteral("別名でプロジェクトを保存します。元のファイルを残したまま別バージョンを作りたいときに使います。")});
+
+    auto *compareProjectAction = fileMenu->addAction(QStringLiteral("保存版と比較…"));
+    compareProjectAction->setObjectName(QStringLiteral("action_compare_project"));
+    connect(compareProjectAction, &QAction::triggered, this, &MainWindow::compareSavedProject);
 
     auto *versionedSaveAction = fileMenu->addAction(QStringLiteral("インクリメンタル保存(&I)"));
     versionedSaveAction->setObjectName(QStringLiteral("action_versioned_save"));
@@ -8852,6 +8858,42 @@ void MainWindow::editProjectSettings()
 
         updateStatusInfo();
     }
+}
+
+void MainWindow::compareSavedProject()
+{
+    const QString path = QFileDialog::getOpenFileName(this, QStringLiteral("保存版と比較"),
+        m_projectFilePath, QStringLiteral("プロジェクト (*.veditor)"));
+    if (path.isEmpty() || !m_timeline) return;
+    ProjectData saved;
+    if (!ProjectFile::load(path, saved)) {
+        QMessageBox::warning(this, QStringLiteral("保存版と比較"),
+                             QStringLiteral("プロジェクトを読み込めませんでした: %1").arg(path));
+        return;
+    }
+    ProjectData current;
+    current.videoTracks = m_timeline->allVideoTracks();
+    current.audioTracks = m_timeline->allAudioTracks();
+    current.trackFlags = m_timeline->trackFlagsToJson();
+    ProjectDiffDialog dialog(projdiff::diff(saved, current), this);
+    connect(&dialog, &ProjectDiffDialog::clipActivated, this,
+            [this](bool audio, int trackIndex, int clipIndex) {
+        const auto &tracks = audio ? m_timeline->audioTracks() : m_timeline->videoTracks();
+        if (trackIndex < 0 || trackIndex >= tracks.size() || !tracks[trackIndex]) return;
+        const auto &clips = tracks[trackIndex]->clips();
+        if (clipIndex < 0 || clipIndex >= clips.size()) return;
+        double start = 0.0;
+        for (int i = 0; i <= clipIndex; ++i) {
+            start += qMax(0.0, clips[i].leadInSec);
+            if (i < clipIndex) start += clips[i].effectiveDuration();
+        }
+        QString error;
+        if (m_timeline->selectClipByIndex(audio, trackIndex, clipIndex, &error)) {
+            m_timeline->setPlayheadPosition(start);
+            if (m_player) m_player->seek(qRound(start * 1000.0));
+        }
+    });
+    dialog.exec();
 }
 
 void MainWindow::saveProject()

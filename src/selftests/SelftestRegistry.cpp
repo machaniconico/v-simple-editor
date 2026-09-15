@@ -205,6 +205,7 @@ int runTwitchSelftest();
 int runVfxSelftest();
 int runVfxGeneratorsSelftest();
 int runVersionedSaveSelftest();
+int runProjectDiffSelftest();
 int runVideostabDeshakeSelftest();
 int runVimeoSelftest();
 int runWatermarkSelftest();
@@ -491,6 +492,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "RenderQueue loudness gain to ffmpeg audio filter argument wiring (4 gates)" },
     { "versioned-save",   "VEDITOR_VERSIONED_SAVE_SELFTEST",    runVersionedSaveSelftest,      false,
       "Increment and Save filename resolver: numbered suffix, unnumbered v002, collision skip, digit width" },
+    { "project-diff", "VEDITOR_PROJECT_DIFF_SELFTEST", runProjectDiffSelftest, false,
+      "Structural project comparison: matching, properties, effects, transitions and epsilon (7 gates)" },
     { "export-range",      "VEDITOR_EXPORT_RANGE_SELFTEST",       runExportRangeSelftest,       false,
       "Marked In/Out export frame-range helper (5 gates)" },
     { "tracker-preset",    "VEDITOR_TRACKER_PRESET_SELFTEST",     runTrackerPresetSelftest,      false,

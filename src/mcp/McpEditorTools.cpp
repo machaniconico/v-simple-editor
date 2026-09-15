@@ -7,6 +7,8 @@
 #include "../DialogueLeveler.h"
 #include "../MainWindow.h"
 #include "../MusicRemix.h"
+#include "../ProjectDiff.h"
+#include "../ProjectFile.h"
 #include "../RenderQueue.h"
 #include "../TimelineFrameRenderer.h"
 #include "../Timeline.h"
@@ -1293,6 +1295,64 @@ void McpEditorTools::registerReadTools()
 {
     if (!m_registry)
         return;
+
+    m_registry->registerTool(withOutputSchema({
+        QStringLiteral("compare_project"),
+        QStringLiteral("保存版と現在のタイムラインの映像・音声クリップとトラック設定を比較する。読み取り専用。変更前は保存版、変更後は現在。Removed の場所は保存版、それ以外は現在のクリップ番号。"),
+        schemaWithRequired(QJsonObject{
+            {QStringLiteral("filePath"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}}
+        }, {QStringLiteral("filePath")}),
+        [this](const QJsonObject &args, QString *err) -> QJsonObject {
+            if (!rejectUnknownArguments(args, {QStringLiteral("filePath")}, err)) return {};
+            QString filePath;
+            if (!requiredString(args, QStringLiteral("filePath"), &filePath, err)) return {};
+            const Timeline *currentTimeline = timeline();
+            if (!currentTimeline)
+                return setError(err, QStringLiteral("エディターを利用できません")), QJsonObject();
+            ProjectData saved;
+            if (!ProjectFile::load(filePath, saved))
+                return setError(err, QStringLiteral("プロジェクトを読み込めませんでした: %1").arg(filePath)), QJsonObject();
+            ProjectData current;
+            current.videoTracks = currentTimeline->allVideoTracks();
+            current.audioTracks = currentTimeline->allAudioTracks();
+            current.trackFlags = currentTimeline->trackFlagsToJson();
+            QJsonArray changes;
+            int added = 0, removed = 0, moved = 0, trimmed = 0, changed = 0;
+            for (const auto &change : projdiff::diff(saved, current)) {
+                changes.append(QJsonObject{{"type", projdiff::typeName(change.type)},
+                    {"path", change.path}, {"before", change.before}, {"after", change.after}});
+                switch (change.type) {
+                case projdiff::Change::Added: ++added; break;
+                case projdiff::Change::Removed: ++removed; break;
+                case projdiff::Change::Moved: ++moved; break;
+                case projdiff::Change::Trimmed: ++trimmed; break;
+                default: ++changed; break;
+                }
+            }
+            return {{"ok", true}, {"changes", changes},
+                    {"summary", QJsonObject{{"added", added}, {"removed", removed},
+                        {"moved", moved}, {"trimmed", trimmed}, {"changed", changed}}}};
+        }
+    }, outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("changes"), QJsonObject{
+            {QStringLiteral("type"), QStringLiteral("array")},
+            {QStringLiteral("items"), outputSchemaOf(QJsonObject{
+                {QStringLiteral("type"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
+                {QStringLiteral("path"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
+                {QStringLiteral("before"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
+                {QStringLiteral("after"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}}
+            }, {QStringLiteral("type"), QStringLiteral("path"), QStringLiteral("before"), QStringLiteral("after")})}
+        }},
+        {QStringLiteral("summary"), outputSchemaOf(QJsonObject{
+            {QStringLiteral("added"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+            {QStringLiteral("removed"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+            {QStringLiteral("moved"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+            {QStringLiteral("trimmed"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+            {QStringLiteral("changed"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}}
+        }, {QStringLiteral("added"), QStringLiteral("removed"), QStringLiteral("moved"),
+            QStringLiteral("trimmed"), QStringLiteral("changed")})}
+    }, {QStringLiteral("ok"), QStringLiteral("changes"), QStringLiteral("summary")})));
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("get_project_info"),

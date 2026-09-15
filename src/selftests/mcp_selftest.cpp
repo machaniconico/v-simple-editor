@@ -1189,7 +1189,7 @@ int runMcpSelftest()
             rpcRequest(73, QStringLiteral("tools/list")))))
         .value(QStringLiteral("result")).toObject()
         .value(QStringLiteral("tools")).toArray();
-    constexpr int kExpectedProjectInfoToolCount = 36;
+    constexpr int kExpectedProjectInfoToolCount = 36 + 1; // US-308: compare_project
     bool outputSchemasDeclared = projectInfoToolDescriptors.size()
         == kExpectedProjectInfoToolCount;
     for (const QJsonValue& value : projectInfoToolDescriptors) {
@@ -1508,6 +1508,85 @@ int runMcpSelftest()
             projectTimeline->undoManager()->saveState(
                 projectTimeline->currentState(), QStringLiteral("MCP selftest baseline"));
         };
+
+        // US-308 reserved G154-G155: compare the same saved/current pair as
+        // the UI and prove comparison does not add undo states or dirty it.
+        {
+            QTemporaryDir diffDirectory;
+            const QString diffPath = QDir(diffDirectory.path()).filePath(QStringLiteral("baseline.veditor"));
+            video0->setClips({makeTestClip(QStringLiteral("project-diff-source.mp4"), 0)});
+            video1->setClips({});
+            audio0->setClips({});
+            audio1->setClips({});
+            projectTimeline->clearSelection();
+            saveTestUndoBaseline();
+            const auto saved = callProjectInfoTool(1540, QStringLiteral("save_project"),
+                QJsonObject{{QStringLiteral("path"), diffPath}});
+            const auto moved = callProjectInfoTool(1541, QStringLiteral("move_clip"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")}, {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 0}, {QStringLiteral("newStartSec"), 2.0}});
+            const auto volume = callProjectInfoTool(1542, QStringLiteral("set_clip_property"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")}, {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 0}, {QStringLiteral("property"), QStringLiteral("volume")},
+                {QStringLiteral("value"), 0.5}});
+            const quint64 serial = projectTimeline->undoManager()->saveSerial();
+            const double playhead = projectTimeline->playheadPosition();
+            const bool dirty = projectInfoWindow.isWindowModified();
+            const auto comparison = callProjectInfoTool(1543, QStringLiteral("compare_project"),
+                QJsonObject{{QStringLiteral("filePath"), diffPath}});
+            const auto payload = toolPayload(comparison);
+            int movedCount = 0, volumeCount = 0;
+            for (const auto &value : payload.value(QStringLiteral("changes")).toArray()) {
+                const auto change = value.toObject();
+                if (change.value(QStringLiteral("type")).toString() == QStringLiteral("Moved")) ++movedCount;
+                if (change.value(QStringLiteral("type")).toString() == QStringLiteral("PropertyChanged")
+                    && change.value(QStringLiteral("path")).toString() == QStringLiteral("video[0].clips[0].volume")
+                    && change.value(QStringLiteral("before")).toString() == QStringLiteral("1")
+                    && change.value(QStringLiteral("after")).toString() == QStringLiteral("0.5")) ++volumeCount;
+            }
+            const auto summary = payload.value(QStringLiteral("summary")).toObject();
+            const bool g154 = diffDirectory.isValid()
+                && toolPayload(saved).value(QStringLiteral("ok")).toBool()
+                && toolPayload(moved).value(QStringLiteral("ok")).toBool()
+                && toolPayload(volume).value(QStringLiteral("ok")).toBool()
+                && payload.value(QStringLiteral("ok")).toBool()
+                && requiredOutputFieldsPresent(QStringLiteral("compare_project"), payload)
+                && payload.value(QStringLiteral("changes")).toArray().size() == 2
+                && movedCount == 1 && volumeCount == 1
+                && summary.value(QStringLiteral("moved")).toInt() == 1
+                && summary.value(QStringLiteral("changed")).toInt() == 1
+                && summary.value(QStringLiteral("added")).toInt() == 0
+                && summary.value(QStringLiteral("removed")).toInt() == 0
+                && summary.value(QStringLiteral("trimmed")).toInt() == 0
+                && projectTimeline->undoManager()->saveSerial() == serial
+                && projectTimeline->playheadPosition() == playhead
+                && projectInfoWindow.isWindowModified() == dirty;
+            g154 ? pass("G154 compare_project detects move and volume")
+                 : fail("G154 compare_project detects move and volume", QStringLiteral("wrong diff, summary, or read-only behavior"));
+
+            const auto savedAgain = callProjectInfoTool(1550, QStringLiteral("save_project"),
+                QJsonObject{{QStringLiteral("path"), diffPath}});
+            const auto identical = toolPayload(callProjectInfoTool(1551, QStringLiteral("compare_project"),
+                QJsonObject{{QStringLiteral("filePath"), diffPath}}));
+            const auto missing = callProjectInfoTool(1552, QStringLiteral("compare_project"),
+                QJsonObject{{QStringLiteral("filePath"), diffPath + QStringLiteral(".missing")}});
+            const auto invalid = callProjectInfoTool(1553, QStringLiteral("compare_project"),
+                QJsonObject{{QStringLiteral("filePath"), 42}});
+            const bool g155 = toolPayload(savedAgain).value(QStringLiteral("ok")).toBool()
+                && identical.value(QStringLiteral("ok")).toBool()
+                && identical.value(QStringLiteral("changes")).isArray()
+                && identical.value(QStringLiteral("changes")).toArray().isEmpty()
+                && identical.value(QStringLiteral("summary")).toObject() == QJsonObject{
+                    {"added", 0}, {"removed", 0}, {"moved", 0}, {"trimmed", 0}, {"changed", 0}}
+                && toolResult(missing).value(QStringLiteral("isError")).toBool()
+                && toolResult(invalid).value(QStringLiteral("isError")).toBool()
+                && projectTimeline->undoManager()->saveSerial() == serial
+                && !projectInfoWindow.isWindowModified();
+            g155 ? pass("G155 compare_project unchanged and invalid inputs")
+                 : fail("G155 compare_project unchanged and invalid inputs", QStringLiteral("nonempty diff or unsafe failure"));
+            // Later save_project tests use this pre-existing temporary path.
+            projectInfoWindow.m_projectFilePath = roundtripProjectPath;
+        }
 
         video0->setClips(QVector<ClipInfo>{
             makeTestClip(QStringLiteral("A"), 0),
@@ -4828,6 +4907,10 @@ int runMcpSelftest()
         : fail("G36 request id absence versus null",
                QStringLiteral("id presence was not distinguished"));
 
+    if (!timelineReady) {
+        fail("G154 compare_project detects move and volume", QStringLiteral("Timeline was not available"));
+        fail("G155 compare_project unchanged and invalid inputs", QStringLiteral("Timeline was not available"));
+    }
     server.stop();
     qInfo().noquote().nospace() << "[mcp] selftest end, passed=" << passed
                                 << " failed=" << failed;

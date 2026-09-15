@@ -310,6 +310,7 @@ private slots:
     void importVideoFromUrl();
     void saveProject();
     void saveProjectAs();
+    void compareSavedProject();
     void openProject();
     void exportVideo();
     void splitClip();

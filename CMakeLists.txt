@@ -136,6 +136,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/MediaPoolDragSelftest.cpp
     src/selftests/TextSpacingSelftest.cpp
     src/selftests/VersionedSaveSelftest.cpp
+    src/selftests/project_diff_selftest.cpp
     src/selftests/tcburn_selftest.cpp
     src/selftests/dynzoom_selftest.cpp
 
@@ -212,6 +213,10 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/UndoTrace.cpp
     src/VersionedSave.h
     src/VersionedSave.cpp
+    src/ProjectDiff.h
+    src/ProjectDiff.cpp
+    src/ProjectDiffDialog.h
+    src/ProjectDiffDialog.cpp
     src/UndoManager.cpp
     src/Overlay.cpp
     src/OverlayDialogs.cpp
