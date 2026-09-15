@@ -9,6 +9,7 @@
 #include "color/SwsColorParams.h"
 #include "playback/swsmatrix_flag.h"
 #include <QFileInfo>
+#include <QImage>
 #include <QMutex>
 #include <QMutexLocker>
 #include <QPainter>
@@ -90,6 +91,102 @@ bool scaleFrameToQImagePadded(SwsContext *ctx,
 }
 }
 
+exporterframe::RgbConversionPath exporterframe::selectRgbConversionPath(
+    bool timecodeBurnInEnabled) noexcept
+{
+    return timecodeBurnInEnabled
+        ? RgbConversionPath::EncoderPixelFormat
+        : RgbConversionPath::LegacyFixedYuv420P;
+}
+
+bool exporterframe::convertRgbImageToFrame(const QImage &image,
+                                           AVFrame *outputFrame,
+                                           bool configureColorMatrix)
+{
+    if (image.isNull() || !outputFrame || outputFrame->width <= 0
+        || outputFrame->height <= 0 || !outputFrame->data[0]) {
+        return false;
+    }
+
+    const AVPixelFormat outputFormat =
+        static_cast<AVPixelFormat>(outputFrame->format);
+    if (outputFormat == AV_PIX_FMT_NONE)
+        return false;
+
+    const QImage rgbImage = image.format() == QImage::Format_RGB888
+        ? image
+        : image.convertToFormat(QImage::Format_RGB888);
+    if (rgbImage.isNull())
+        return false;
+
+    SwsContext *toOutputCtx = sws_getContext(
+        rgbImage.width(), rgbImage.height(), AV_PIX_FMT_RGB24,
+        outputFrame->width, outputFrame->height, outputFormat,
+        SWS_BILINEAR, nullptr, nullptr, nullptr);
+    if (!toOutputCtx)
+        return false;
+
+    if (configureColorMatrix) {
+        const AVColorSpace dstCs = swscolor::resolveColorspace(
+            outputFrame->colorspace, outputFrame->width, outputFrame->height);
+        const AVColorRange dstRange =
+            swscolor::resolveRange(outputFrame->color_range);
+        int *currentInvTable = nullptr;
+        int *currentTable = nullptr;
+        int currentSrcRange = 0;
+        int currentDstRange = 0;
+        int brightness = 0;
+        int contrast = 0;
+        int saturation = 0;
+        if (sws_getColorspaceDetails(toOutputCtx, &currentInvTable,
+                                     &currentSrcRange, &currentTable,
+                                     &currentDstRange, &brightness,
+                                     &contrast, &saturation) >= 0) {
+            const int *srcCoeffs = sws_getCoefficients(SWS_CS_DEFAULT);
+            const int *dstCoeffs =
+                sws_getCoefficients(swscolor::swsCoeffsId(dstCs));
+            if (srcCoeffs && dstCoeffs) {
+                (void)sws_setColorspaceDetails(
+                    toOutputCtx, srcCoeffs, 1, dstCoeffs,
+                    dstRange == AVCOL_RANGE_JPEG ? 1 : 0,
+                    brightness, contrast, saturation);
+            }
+        }
+    }
+
+    if (av_frame_make_writable(outputFrame) < 0) {
+        sws_freeContext(toOutputCtx);
+        return false;
+    }
+
+    const uint8_t *rgbData[4] = {
+        rgbImage.constBits(), nullptr, nullptr, nullptr
+    };
+    const int rgbLinesize[4] = {
+        static_cast<int>(rgbImage.bytesPerLine()), 0, 0, 0
+    };
+    const int scaledHeight = sws_scale(
+        toOutputCtx, rgbData, rgbLinesize, 0, rgbImage.height(),
+        outputFrame->data, outputFrame->linesize);
+    sws_freeContext(toOutputCtx);
+    if (scaledHeight != outputFrame->height)
+        return false;
+
+    fillOpaqueAlphaPlane(outputFrame);
+    return true;
+}
+
+double exportertimecode::timelineSeconds(double processedDuration,
+                                         double leadInSec,
+                                         double sourceOffsetSec,
+                                         double speed) noexcept
+{
+    const double effectiveSpeed = speed > 0.0 ? speed : 1.0;
+    return processedDuration
+        + std::max(0.0, leadInSec)
+        + std::max(0.0, sourceOffsetSec) / effectiveSpeed;
+}
+
 // MainWindow.cpp から extern 宣言で参照される。
 void exporter_setAcesPipeline(const aces::AcesPipeline &pipeline)
 {
@@ -117,6 +214,14 @@ void Exporter::setSubtitleRenderer(SubtitleTrackRenderer *renderer)
     m_subtitleRenderer = renderer;
 }
 
+void Exporter::setTimecodeBurnIn(const TimecodeBurnInSettings &settings)
+{
+    if (settings.enabled)
+        m_timecodeBurnIn = settings;
+    else
+        m_timecodeBurnIn.reset();
+}
+
 void Exporter::setLoudnessGainDb(double gainDb)
 {
     m_loudnessGainDb = std::isfinite(gainDb) ? gainDb : 0.0;
@@ -133,13 +238,15 @@ void Exporter::startExport(const ExportConfig &config, const QVector<ClipInfo> &
 {
     m_cancelled = false;
     const double loudnessGainDb = m_loudnessGainDb;
+    const std::optional<TimecodeBurnInSettings> timecodeBurnIn =
+        m_timecodeBurnIn;
     {
         QMutexLocker locker(&g_exporterLoudnessMutex);
         g_exporterLoudnessGainDb = std::isfinite(loudnessGainDb)
             ? loudnessGainDb : 0.0;
     }
-    m_thread = QThread::create([this, config, clips]() {
-        doExport(config, clips);
+    m_thread = QThread::create([this, config, clips, timecodeBurnIn]() {
+        doExport(config, clips, timecodeBurnIn);
     });
     connect(m_thread, &QThread::finished, m_thread, &QThread::deleteLater);
     m_thread->start();
@@ -194,7 +301,10 @@ bool Exporter::openInputFile(const QString &path, AVFormatContext **fmtCtx, AVCo
 // CPU-only transcode applies a hard-coded effect subset and skips the graph
 // for 10-bit/HDR/ProRes. No UI action reaches this as of S12 (File->Export
 // and Mobile Export now route through RenderQueue). See progress.txt S12.
-void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &clips)
+void Exporter::doExport(
+    const ExportConfig &config,
+    const QVector<ClipInfo> &clips,
+    const std::optional<TimecodeBurnInSettings> &timecodeBurnIn)
 {
     const aces::AcesPipeline exporterAcesPipeline = exporterAcesPipelineSnapshot();
     const double loudnessGainDb = exporterLoudnessGainSnapshot();
@@ -293,10 +403,17 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
                 << "MaxFALL=" << config.hdrSettings.maxFall;
     }
 
+    std::optional<TimecodeBurnInRenderer> timecodeRenderer;
+    if (timecodeBurnIn.has_value() && timecodeBurnIn->enabled)
+        timecodeRenderer.emplace(*timecodeBurnIn);
+    const exporterframe::RgbConversionPath rgbConversionPath =
+        exporterframe::selectRgbConversionPath(timecodeRenderer.has_value());
+
     // Process each clip
     SwsContext *swsCtx = nullptr;
     int64_t globalPts = 0;
     double processedDuration = 0.0;
+    double timecodeTimelineCursorSec = 0.0;
 
     for (int clipIdx = 0; clipIdx < clips.size() && !m_cancelled; ++clipIdx) {
         const auto &clip = clips[clipIdx];
@@ -307,6 +424,10 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
 
         if (!openInputFile(clip.filePath, &inFmt, &decCtx, &videoIdx)) {
             processedDuration += clip.effectiveDuration();
+            if (timecodeRenderer.has_value()) {
+                timecodeTimelineCursorSec +=
+                    std::max(0.0, clip.leadInSec) + clip.effectiveDuration();
+            }
             continue;
         }
 
@@ -400,7 +521,9 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
 
             av_frame_make_writable(outFrame);
 
-            // 10-bit outputs (HDR10 / HLG / ProRes) bypass the 8-bit RGB24 effect round-trip.
+            // Traditional effects and ACES stay off on the 10-bit path. TC
+            // burn-in may still run there; only that enabled path restores the
+            // encoder's actual pixel format after the RGB overlay.
             const bool tenBitPath = isHdr10Mode || isHlgMode || config.proresProfile >= 0;
             bool hasEffects = !tenBitPath
                               && (!clip.colorCorrection.isDefault() || !clip.effects.isEmpty());
@@ -410,7 +533,8 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
             bool needsRgbPass = hasEffects
                                 || acesActive
                                 || (m_smartReframe != nullptr)
-                                || (m_subtitleRenderer != nullptr);
+                                || (m_subtitleRenderer != nullptr)
+                                || timecodeRenderer.has_value();
             if (needsRgbPass) {
                 QImage workingImage;
                 if (hasEffects) {
@@ -532,10 +656,28 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
                         framePts - clip.inPoint);
                 }
 
+                // Timecode burn-in follows subtitles and uses the shared
+                // renderer used by GLPreview and RenderQueue. The optional is
+                // absent for enabled=false, so no TC-only RGB pass is
+                // introduced and the legacy conversion below remains selected.
+                if (timecodeRenderer.has_value()) {
+                    const double timelineSec = exportertimecode::timelineSeconds(
+                        timecodeTimelineCursorSec, clip.leadInSec,
+                        framePts - clip.inPoint, clip.speed);
+                    const QString clipName = !clip.displayName.isEmpty()
+                        ? clip.displayName
+                        : QFileInfo(clip.filePath).completeBaseName();
+                    QPainter painter(&workingImage);
+                    timecodeRenderer->paintOnto(
+                        painter,
+                        QRectF(0, 0, workingImage.width(), workingImage.height()),
+                        timelineSec, config.fps, clipName);
+                }
+
                 // AR-2: ACES シーンリファード色管理を最終 RGB フレームへ適用する。
                 // enabled=false (既定) のときは一切呼ばず、従来出力とビット同一を維持
                 // (回帰ゼロ)。applyPipelineToImage は RGBA8888 を返すため、後段の
-                // RGB24->YUV420P 変換に合わせて RGB888 へ戻す。プレビューは
+                // RGB24 変換に合わせて RGB888 へ戻す。プレビューは
                 // VideoPlayer::displayFrame でのみ適用するので二重適用しない。
                 if (acesActive && !workingImage.isNull()) {
                     QImage acesOut = aces::applyPipelineToImage(
@@ -543,51 +685,62 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
                     workingImage = acesOut.convertToFormat(QImage::Format_RGB888);
                 }
 
-                // Convert processed RGB back to YUV420P
-                SwsContext *toYuvCtx = sws_getContext(
-                    workingImage.width(), workingImage.height(), AV_PIX_FMT_RGB24,
-                    config.width, config.height, AV_PIX_FMT_YUV420P,
-                    SWS_BILINEAR, nullptr, nullptr, nullptr);
-                if (swscolor::matrixEnabledFromEnv() && toYuvCtx) {
-                    AVColorSpace dstCs = AVCOL_SPC_UNSPECIFIED;
-                    AVColorRange dstRange = AVCOL_RANGE_UNSPECIFIED;
-                    if (isHdr10Mode || isHlgMode) {
-                        dstCs = swscolor::resolveColorspace(
-                            outFrame->colorspace, config.width, config.height);
-                        dstRange = swscolor::resolveRange(outFrame->color_range);
-                    } else {
-                        const swscolor::SdrTags t =
-                            swscolor::sdrTagsFor(config.width, config.height);
-                        dstCs = t.spc;
-                        dstRange = t.range;
+                if (rgbConversionPath
+                    == exporterframe::RgbConversionPath::EncoderPixelFormat) {
+                    if (!exporterframe::convertRgbImageToFrame(
+                            workingImage, outFrame,
+                            swscolor::matrixEnabledFromEnv())) {
+                        m_cancelled = true;
+                        return;
                     }
-                    int *currentInvTable = nullptr;
-                    int *currentTable = nullptr;
-                    int currentSrcRange = 0;
-                    int currentDstRange = 0;
-                    int brightness = 0;
-                    int contrast = 0;
-                    int saturation = 0;
-                    if (sws_getColorspaceDetails(toYuvCtx, &currentInvTable,
-                                                  &currentSrcRange, &currentTable,
-                                                  &currentDstRange, &brightness,
-                                                  &contrast, &saturation) >= 0) {
-                        const int *srcCoeffs = sws_getCoefficients(SWS_CS_DEFAULT);
-                        const int *dstCoeffs =
-                            sws_getCoefficients(swscolor::swsCoeffsId(dstCs));
-                        if (srcCoeffs && dstCoeffs) {
-                            (void)sws_setColorspaceDetails(
-                                toYuvCtx, srcCoeffs, 1, dstCoeffs,
-                                dstRange == AVCOL_RANGE_JPEG ? 1 : 0,
-                                brightness, contrast, saturation);
+                } else {
+                    // Preserve the pre-timecode RGB -> fixed YUV420P path
+                    // verbatim whenever TC burn-in is disabled.
+                    SwsContext *toYuvCtx = sws_getContext(
+                        workingImage.width(), workingImage.height(), AV_PIX_FMT_RGB24,
+                        config.width, config.height, AV_PIX_FMT_YUV420P,
+                        SWS_BILINEAR, nullptr, nullptr, nullptr);
+                    if (swscolor::matrixEnabledFromEnv() && toYuvCtx) {
+                        AVColorSpace dstCs = AVCOL_SPC_UNSPECIFIED;
+                        AVColorRange dstRange = AVCOL_RANGE_UNSPECIFIED;
+                        if (isHdr10Mode || isHlgMode) {
+                            dstCs = swscolor::resolveColorspace(
+                                outFrame->colorspace, config.width, config.height);
+                            dstRange = swscolor::resolveRange(outFrame->color_range);
+                        } else {
+                            const swscolor::SdrTags t =
+                                swscolor::sdrTagsFor(config.width, config.height);
+                            dstCs = t.spc;
+                            dstRange = t.range;
+                        }
+                        int *currentInvTable = nullptr;
+                        int *currentTable = nullptr;
+                        int currentSrcRange = 0;
+                        int currentDstRange = 0;
+                        int brightness = 0;
+                        int contrast = 0;
+                        int saturation = 0;
+                        if (sws_getColorspaceDetails(toYuvCtx, &currentInvTable,
+                                                      &currentSrcRange, &currentTable,
+                                                      &currentDstRange, &brightness,
+                                                      &contrast, &saturation) >= 0) {
+                            const int *srcCoeffs = sws_getCoefficients(SWS_CS_DEFAULT);
+                            const int *dstCoeffs =
+                                sws_getCoefficients(swscolor::swsCoeffsId(dstCs));
+                            if (srcCoeffs && dstCoeffs) {
+                                (void)sws_setColorspaceDetails(
+                                    toYuvCtx, srcCoeffs, 1, dstCoeffs,
+                                    dstRange == AVCOL_RANGE_JPEG ? 1 : 0,
+                                    brightness, contrast, saturation);
+                            }
                         }
                     }
+                    const uint8_t *rgbSrc[1] = { workingImage.constBits() };
+                    int rgbSrcLinesize[1] = { static_cast<int>(workingImage.bytesPerLine()) };
+                    sws_scale(toYuvCtx, rgbSrc, rgbSrcLinesize, 0, workingImage.height(),
+                              outFrame->data, outFrame->linesize);
+                    sws_freeContext(toYuvCtx);
                 }
-                const uint8_t *rgbSrc[1] = { workingImage.constBits() };
-                int rgbSrcLinesize[1] = { static_cast<int>(workingImage.bytesPerLine()) };
-                sws_scale(toYuvCtx, rgbSrc, rgbSrcLinesize, 0, workingImage.height(),
-                          outFrame->data, outFrame->linesize);
-                sws_freeContext(toYuvCtx);
             } else {
                 sws_scale(swsCtx, frame->data, frame->linesize, 0, frame->height,
                           outFrame->data, outFrame->linesize);
@@ -640,6 +793,10 @@ void Exporter::doExport(const ExportConfig &config, const QVector<ClipInfo> &cli
 
 clip_done:
         processedDuration += clip.effectiveDuration();
+        if (timecodeRenderer.has_value()) {
+            timecodeTimelineCursorSec +=
+                std::max(0.0, clip.leadInSec) + clip.effectiveDuration();
+        }
         av_frame_free(&frame);
         av_frame_free(&outFrame);
         av_packet_free(&packet);

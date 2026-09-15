@@ -2,6 +2,8 @@
 
 #include <QFont>
 #include <QFontMetricsF>
+#include <QLineF>
+#include <QPolygonF>
 #include <QLinearGradient>
 #include <QPainter>
 #include <QPainterPath>
@@ -232,6 +234,56 @@ ShapeProperties ShapeProperties::fromJson(const QJsonObject &obj)
     return p;
 }
 
+// ===== ShapeModifiers — default-omitting serialisation =====
+
+bool ShapeModifiers::isDefault() const
+{
+    return !repeater.enabled && repeater.copies == 3
+        && repeater.offset == QPointF(40.0, 0.0) && repeater.rotationDeg == 0.0
+        && repeater.scale == 1.0 && repeater.opacityEnd == 1.0
+        && !trim.enabled && trim.startPct == 0.0 && trim.endPct == 100.0
+        && trim.offsetPct == 0.0;
+}
+
+QJsonObject ShapeModifiers::toJson() const
+{
+    QJsonObject r;
+    if (repeater.enabled) r["enabled"] = true;
+    if (repeater.copies != 3) r["copies"] = repeater.copies;
+    if (repeater.offset.x() != 40.0) r["offsetX"] = repeater.offset.x();
+    if (repeater.offset.y() != 0.0) r["offsetY"] = repeater.offset.y();
+    if (repeater.rotationDeg != 0.0) r["rotationDeg"] = repeater.rotationDeg;
+    if (repeater.scale != 1.0) r["scale"] = repeater.scale;
+    if (repeater.opacityEnd != 1.0) r["opacityEnd"] = repeater.opacityEnd;
+    QJsonObject t;
+    if (trim.enabled) t["enabled"] = true;
+    if (trim.startPct != 0.0) t["startPct"] = trim.startPct;
+    if (trim.endPct != 100.0) t["endPct"] = trim.endPct;
+    if (trim.offsetPct != 0.0) t["offsetPct"] = trim.offsetPct;
+    QJsonObject obj;
+    if (!r.isEmpty()) obj["repeater"] = r;
+    if (!t.isEmpty()) obj["trim"] = t;
+    return obj;
+}
+
+ShapeModifiers ShapeModifiers::fromJson(const QJsonObject &obj)
+{
+    ShapeModifiers m;
+    const QJsonObject r = obj["repeater"].toObject();
+    m.repeater.enabled = r["enabled"].toBool(false);
+    m.repeater.copies = qBound(1, r["copies"].toInt(3), 1000);
+    m.repeater.offset = QPointF(r["offsetX"].toDouble(40.0), r["offsetY"].toDouble(0.0));
+    m.repeater.rotationDeg = r["rotationDeg"].toDouble(0.0);
+    m.repeater.scale = qBound(0.0, r["scale"].toDouble(1.0), 100.0);
+    m.repeater.opacityEnd = qBound(0.0, r["opacityEnd"].toDouble(1.0), 1.0);
+    const QJsonObject t = obj["trim"].toObject();
+    m.trim.enabled = t["enabled"].toBool(false);
+    m.trim.startPct = qBound(0.0, t["startPct"].toDouble(0.0), 100.0);
+    m.trim.endPct = qBound(0.0, t["endPct"].toDouble(100.0), 100.0);
+    m.trim.offsetPct = t["offsetPct"].toDouble(0.0);
+    return m;
+}
+
 // ===== Shape — serialisation =====
 
 QJsonObject Shape::toJson() const
@@ -246,6 +298,8 @@ QJsonObject Shape::toJson() const
     obj["rotation"] = rotation;
     obj["scale"] = scale;
     obj["name"] = name;
+    if (!modifiers.isDefault())
+        obj["modifiers"] = modifiers.toJson();
     return obj;
 }
 
@@ -260,6 +314,7 @@ Shape Shape::fromJson(const QJsonObject &obj)
     s.rotation = obj["rotation"].toDouble(0.0);
     s.scale = obj["scale"].toDouble(1.0);
     s.name = obj["name"].toString();
+    s.modifiers = ShapeModifiers::fromJson(obj["modifiers"].toObject());
     return s;
 }
 
@@ -454,6 +509,57 @@ void ShapeLayer::applyStroke(QPainter &painter, const ShapeStroke &stroke)
 
 // ===== ShapeLayer — rendering =====
 
+QPainterPath ShapeLayer::trimPathRange(const QPainterPath &path, double startPct,
+                                        double endPct, double offsetPct)
+{
+    if (!std::isfinite(startPct) || !std::isfinite(endPct) || !std::isfinite(offsetPct))
+        return QPainterPath();
+    const double start = qBound(0.0, startPct, 100.0);
+    const double end = qBound(0.0, endPct, 100.0);
+    // Reversed start/end select the same interval. Only offset wraps.
+    const double span = std::abs(end - start) / 100.0;
+    if (span >= 1.0) return path;
+    if (span <= 0.0 || path.isEmpty()) return QPainterPath();
+
+    // Flatten in a magnified coordinate system for subpixel curve accuracy.
+    // Keep subpaths separate: moveTo gaps must never count towards path length.
+    const auto polygons = path.toSubpathPolygons(QTransform::fromScale(16.0, 16.0));
+    double total = 0.0;
+    for (const auto &polygon : polygons)
+        for (int i = 1; i < polygon.size(); ++i)
+            total += QLineF(polygon[i - 1], polygon[i]).length();
+    if (total <= 0.0 || !std::isfinite(total)) return QPainterPath();
+
+    double from = std::fmod(qMin(start, end) / 100.0
+                            + std::fmod(offsetPct, 100.0) / 100.0, 1.0);
+    if (from < 0.0) from += 1.0;
+    QPainterPath result;
+    result.setFillRule(path.fillRule());
+    auto appendRange = [&](double low, double high) {
+        double cursor = 0.0;
+        for (const auto &polygon : polygons) {
+            bool started = false;
+            for (int i = 1; i < polygon.size(); ++i) {
+                const QPointF a = polygon[i - 1];
+                const QPointF b = polygon[i];
+                const double length = QLineF(a, b).length();
+                const double lo = qMax(low, cursor);
+                const double hi = qMin(high, cursor + length);
+                if (length > 0.0 && hi > lo) {
+                    const QPointF first = (a + (b - a) * ((lo - cursor) / length)) / 16.0;
+                    const QPointF last = (a + (b - a) * ((hi - cursor) / length)) / 16.0;
+                    if (!started) { result.moveTo(first); started = true; }
+                    result.lineTo(last);
+                }
+                cursor += length;
+            }
+        }
+    };
+    appendRange(from * total, qMin(1.0, from + span) * total);
+    if (from + span > 1.0) appendRange(0.0, (from + span - 1.0) * total);
+    return result;
+}
+
 void ShapeLayer::renderShape(const Shape &shape, QPainter &painter)
 {
     painter.save();
@@ -464,6 +570,37 @@ void ShapeLayer::renderShape(const Shape &shape, QPainter &painter)
     painter.scale(shape.scale, shape.scale);
 
     QPainterPath path = buildShapePath(shape);
+    if (shape.modifiers.trim.enabled) {
+        const auto &trim = shape.modifiers.trim;
+        path = trimPathRange(path, trim.startPct, trim.endPct, trim.offsetPct);
+    }
+    if (shape.modifiers.repeater.enabled) {
+        const auto &r = shape.modifiers.repeater;
+        const int copies = qBound(1, r.copies, 1000);
+        const double baseOpacity = painter.opacity();
+        for (int i = 0; i < copies; ++i) {
+            painter.save();
+            const double fraction = copies > 1 ? double(i) / (copies - 1) : 0.0;
+            painter.setOpacity(baseOpacity * (1.0 + (qBound(0.0, r.opacityEnd, 1.0) - 1.0) * fraction));
+            applyFill(painter, shape, path.boundingRect());
+            applyStroke(painter, shape.stroke);
+            if (shape.type == ShapeType::Line || shape.type == ShapeType::Arrow)
+                painter.setBrush(Qt::NoBrush);
+            painter.drawPath(path);
+            painter.restore();
+            // Repeated composition: each copy inherits every preceding step.
+            painter.translate(r.offset);
+            painter.rotate(r.rotationDeg);
+            painter.scale(r.scale, r.scale);
+            const QTransform t = painter.worldTransform();
+            if (!std::isfinite(t.m11()) || !std::isfinite(t.m12())
+                || !std::isfinite(t.m21()) || !std::isfinite(t.m22())
+                || !std::isfinite(t.dx()) || !std::isfinite(t.dy()))
+                break;
+        }
+        painter.restore();
+        return;
+    }
     QRectF bounds = path.boundingRect();
 
     // Fill
@@ -486,6 +623,15 @@ void ShapeLayer::renderShape(const Shape &shape, QPainter &painter)
 
 QImage ShapeLayer::renderShapes(const QSize &canvasSize) const
 {
+    return renderShapesToImage(m_shapes, canvasSize);
+}
+
+QImage ShapeLayer::renderShapesToImage(const QVector<Shape> &shapes,
+                                       const QSize &canvasSize)
+{
+    if (canvasSize.isEmpty())
+        return QImage();
+
     QImage image(canvasSize, QImage::Format_ARGB32_Premultiplied);
     image.fill(Qt::transparent);
 
@@ -493,7 +639,7 @@ QImage ShapeLayer::renderShapes(const QSize &canvasSize) const
     painter.setRenderHint(QPainter::Antialiasing, true);
     painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
 
-    for (const Shape &shape : m_shapes)
+    for (const Shape &shape : shapes)
         renderShape(shape, painter);
 
     painter.end();

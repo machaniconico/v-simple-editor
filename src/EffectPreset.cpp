@@ -85,6 +85,10 @@ QString effectTypeKey(VideoEffectType type)
     case VideoEffectType::PolarCoordinates: return QStringLiteral("PolarCoordinates");
     case VideoEffectType::MotionTile: return QStringLiteral("MotionTile");
     case VideoEffectType::CornerPinSimple: return QStringLiteral("CornerPinSimple");
+    case VideoEffectType::FilmGrain: return QStringLiteral("FilmGrain");
+    case VideoEffectType::RollingShutterRepair: return QStringLiteral("RollingShutterRepair");
+    case VideoEffectType::Echo: return QStringLiteral("Echo");
+    case VideoEffectType::LensDistortion: return QStringLiteral("LensDistortion");
     }
     return QStringLiteral("None");
 }
@@ -677,6 +681,24 @@ QJsonObject PresetLibrary::colorCorrectionToJson(const ColorCorrection &cc)
     addIfNonZero(QStringLiteral("gainR"), cc.gainR);
     addIfNonZero(QStringLiteral("gainG"), cc.gainG);
     addIfNonZero(QStringLiteral("gainB"), cc.gainB);
+    addIfNonZero(QStringLiteral("logShadowR"), cc.logShadowR);
+    addIfNonZero(QStringLiteral("logShadowG"), cc.logShadowG);
+    addIfNonZero(QStringLiteral("logShadowB"), cc.logShadowB);
+    addIfNonZero(QStringLiteral("logMidR"), cc.logMidR);
+    addIfNonZero(QStringLiteral("logMidG"), cc.logMidG);
+    addIfNonZero(QStringLiteral("logMidB"), cc.logMidB);
+    addIfNonZero(QStringLiteral("logHighR"), cc.logHighR);
+    addIfNonZero(QStringLiteral("logHighG"), cc.logHighG);
+    addIfNonZero(QStringLiteral("logHighB"), cc.logHighB);
+    if (!cc.hueSatWarp.isDefault()) {
+        QJsonArray shifts, scales;
+        for (int r = 0; r < HueSatWarp::kSatRings; ++r)
+            for (int h = 0; h < HueSatWarp::kHueNodes; ++h) {
+                shifts.append(cc.hueSatWarp.hueShiftDeg[r][h]);
+                scales.append(cc.hueSatWarp.satScale[r][h]);
+            }
+        obj["hueSatWarp"] = QJsonObject{{"hueShift", shifts}, {"satScale", scales}};
+    }
     return obj;
 }
 
@@ -702,6 +724,26 @@ ColorCorrection PresetLibrary::colorCorrectionFromJson(const QJsonObject &obj)
     cc.gainR       = obj["gainR"].toDouble(0.0);
     cc.gainG       = obj["gainG"].toDouble(0.0);
     cc.gainB       = obj["gainB"].toDouble(0.0);
+    cc.logShadowR  = obj["logShadowR"].toDouble(0.0);
+    cc.logShadowG  = obj["logShadowG"].toDouble(0.0);
+    cc.logShadowB  = obj["logShadowB"].toDouble(0.0);
+    cc.logMidR     = obj["logMidR"].toDouble(0.0);
+    cc.logMidG     = obj["logMidG"].toDouble(0.0);
+    cc.logMidB     = obj["logMidB"].toDouble(0.0);
+    cc.logHighR    = obj["logHighR"].toDouble(0.0);
+    cc.logHighG    = obj["logHighG"].toDouble(0.0);
+    cc.logHighB    = obj["logHighB"].toDouble(0.0);
+    const QJsonObject warp = obj["hueSatWarp"].toObject();
+    const QJsonArray shifts = warp["hueShift"].toArray();
+    const QJsonArray scales = warp["satScale"].toArray();
+    for (int r = 0; r < HueSatWarp::kSatRings; ++r)
+        for (int h = 0; h < HueSatWarp::kHueNodes; ++h) {
+            const int i = r * HueSatWarp::kHueNodes + h;
+            if (i < shifts.size())
+                cc.hueSatWarp.hueShiftDeg[r][h] = static_cast<float>(qBound(-60.0, shifts[i].toDouble(0.0), 60.0));
+            if (i < scales.size())
+                cc.hueSatWarp.satScale[r][h] = static_cast<float>(qBound(0.0, scales[i].toDouble(1.0), 2.0));
+        }
     return cc;
 }
 
@@ -754,6 +796,25 @@ VideoEffect PresetLibrary::videoEffectFromJson(const QJsonObject &obj)
 void PresetLibrary::registerBuiltins()
 {
     QDateTime now = QDateTime::currentDateTime();
+
+    // Approximate starting points, not calibrated camera/lens profiles.
+    const struct LensPreset { const char *name; double k1; double k2; } lenses[] = {
+        { "GoPro 広角", -0.30, 0.08 },
+        { "DJI", -0.18, 0.04 },
+        { "一眼 24mm", -0.08, 0.01 }
+    };
+    for (const auto &lens : lenses) {
+        EffectPreset p;
+        p.name = QString::fromUtf8(lens.name);
+        p.description = QStringLiteral("レンズ歪み補正の概算値です。映像に合わせて調整してください。");
+        p.category = QStringLiteral("ディストーション");
+        p.author = QStringLiteral("v-editor");
+        p.isBuiltIn = true;
+        p.createdAt = now;
+        p.modifiedAt = now;
+        p.effects.append(VideoEffect::createLensDistortion(lens.k1, lens.k2));
+        m_presets.append(p);
+    }
 
     // --- Cinematic Warm ---
     {

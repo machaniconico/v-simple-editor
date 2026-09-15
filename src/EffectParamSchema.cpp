@@ -245,6 +245,40 @@ QVector<ParamDef> paramSchemaFor(VideoEffectType type)
             { "verticalTilt", "垂直チルト", ParamType::Float, -100.0, 100.0, 0.0 }
         };
 
+    case VideoEffectType::LensDistortion:
+        return {
+            { "k1", "径方向２次", ParamType::Float, -0.5, 0.5, 0.0 },
+            { "k2", "径方向４次", ParamType::Float, -0.5, 0.5, 0.0 },
+            { "scale", "拡大率", ParamType::Float, 0.5, 2.0, 1.0 },
+            { "centerX", "中心Ｘ", ParamType::Float, -0.5, 0.5, 0.0 },
+            { "centerY", "中心Ｙ", ParamType::Float, -0.5, 0.5, 0.0 }
+        };
+
+    case VideoEffectType::FilmGrain:
+        return {
+            { "amount", "量", ParamType::Float, 0.0, 1.0, 0.3 },
+            { "size", "サイズ", ParamType::Int, 1.0, 4.0, 1.0 },
+            { "colorAmount", "カラー量", ParamType::Float, 0.0, 1.0, 0.0 },
+            { "seedPerFrame", "フレーム毎にシード", ParamType::Bool, 0.0, 1.0, 1.0 }
+        };
+
+    case VideoEffectType::RollingShutterRepair:
+        return {
+            { "rate", "走査時間", ParamType::Float, 0.0, 1.0, 0.5 },
+            { "direction", "走査方向 (0=上→下 / 1=下→上)", ParamType::Int, 0.0, 1.0, 0.0 },
+            { "strength", "強度", ParamType::Float, 0.0, 1.0, 1.0 }
+        };
+
+    case VideoEffectType::Echo:
+        return {
+            { "delaySec", "遅延 (秒・調整レイヤーでは無効)",
+              ParamType::Float, 0.02, 2.0, 0.1 },
+            { "count", "残像数", ParamType::Int, 1.0, 8.0, 3.0 },
+            { "decay", "減衰", ParamType::Float, 0.0, 1.0, 0.5 },
+            { "blend", "合成 (0=加算 / 1=スクリーン / 2=比較 (明) / 3=通常)",
+              ParamType::Int, 0.0, 3.0, 2.0 }
+        };
+
     case VideoEffectType::None:
     default:
         return {};

@@ -12,12 +12,20 @@
 #include <QHash>
 #include <QMenu>
 #include <QElapsedTimer>
+#include <QColor>
 #include <QString>
 #include <QJsonObject>
 #include <cstdint>
+#include <functional>
+#include <initializer_list>
+#include <optional>
+#include <memory>
+#include <utility>
 #include "VideoEffect.h"
 #include "Keyframe.h"
+#include "DynamicZoom.h"
 #include "WaveformGenerator.h"
+#include "MusicRemix.h"
 #include "TextManager.h"
 #include "PlaybackTypes.h"
 #include "Overlay.h"
@@ -35,6 +43,23 @@
 #include "MaskSystem.h"      // S7: per-clip mask container (additive seam)
 #include "MotionTracker.h"   // S7: per-clip tracker data animating the mask
 #include "TimeRemap.h"
+#include "ShapeLayer.h"
+
+// Shared timeline/source bounds after borrowing transition handles.
+struct OverlapInterval {
+    double timelineStart = 0.0, timelineEnd = 0.0;
+    double clipIn = 0.0, clipOut = 0.0, speed = 1.0;
+    TransitionType leadInType = TransitionType::None;
+    TransitionType trailOutType = TransitionType::None;
+    double leadInDuration = 0.0, trailOutDuration = 0.0;
+    TransitionAlignment trailOutAlignment = TransitionAlignment::Center;
+    TransitionEasing leadInEasing = TransitionEasing::Linear;
+    TransitionEasing trailOutEasing = TransitionEasing::Linear;
+    double softness = 0.0;
+    double borderWidth = 0.0;
+    QColor borderColor = Qt::white;
+    int clipIdx = -1;
+};
 
 // Where Timeline::addClip drops a freshly-imported clip. Persisted via
 // QSettings('VSimpleEditor','Preferences')/importPlacement; the MainWindow
@@ -53,6 +78,28 @@ enum class AutoProxyMode {
     MultiTrackOnly = 1,   // Default: only when the clip lands on V2 or later
     Always = 2            // Generate on every heavy import regardless of track
 };
+
+enum class TrackKind {
+    Video,
+    Audio
+};
+
+enum class ClipLabel {
+    None,
+    Red,
+    Orange,
+    Yellow,
+    Green,
+    Cyan,
+    Blue,
+    Purple,
+    Pink
+};
+
+QColor clipLabelColor(ClipLabel label);
+QString clipLabelName(ClipLabel label);
+ClipLabel clipLabelFromString(const QString &value);
+QString clipLabelToString(ClipLabel label);
 
 class AudioMixer;
 class UndoManager;
@@ -99,8 +146,22 @@ struct AudioChannelModePlaybackBinding {
     AudioChannelMode mode = AudioChannelMode::Stereo;
 };
 
+struct AudioReversedPlaybackBinding {
+    PlaybackEntry entry;
+    bool reversed = false;
+};
+
+using VideoReversedPlaybackBinding = AudioReversedPlaybackBinding;
+
 void setAudioChannelModePlaybackBindings(const QVector<AudioChannelModePlaybackBinding> &bindings);
 AudioChannelMode audioChannelModeForPlaybackEntry(const PlaybackEntry &entry);
+void setAudioReversedPlaybackBindings(
+    const QVector<AudioReversedPlaybackBinding> &bindings);
+QVector<bool> audioReversedFlagsForPlaybackEntries(
+    const QVector<PlaybackEntry> &entries);
+void setVideoReversedPlaybackBindings(
+    const QVector<VideoReversedPlaybackBinding> &bindings);
+bool videoReversedForPlaybackEntry(const PlaybackEntry &entry);
 void applyAudioChannelModeToInterleavedStereoS16(int16_t *samples,
                                                 int frameCount,
                                                 AudioChannelMode mode);
@@ -110,11 +171,20 @@ QString buildExportAudioMixEntryFilterChain(int inputIndex,
                                             const QString &clipOut,
                                             int delayMs,
                                             const QString &volumeExpression,
-                                            AudioChannelMode mode);
+                                            AudioChannelMode mode,
+                                            bool reversed = false,
+                                            double speed = 1.0,
+                                            TransitionType leadInType = TransitionType::None,
+                                            double leadInDuration = 0.0,
+                                            TransitionType trailOutType = TransitionType::None,
+                                            double trailOutDuration = 0.0);
 
 struct ClipInfo {
     QString filePath;
     QString displayName;
+    // SHAPE-CLIP: non-empty means this is a generated, media-less shape clip.
+    // Empty is the legacy/default state and is omitted from project JSON.
+    QVector<Shape> shapes;
     // EPIC-7/NEST-1: empty for normal media clips. When populated, this clip
     // is a timeline reference to a named sequence stored in Timeline's
     // sequence model; filePath uses a veditor://sequence/<id> URI only as a
@@ -125,6 +195,7 @@ struct ClipInfo {
     double outPoint = 0.0;
     double leadInSec = 0.0; // leading gap before the clip on the timeline, grows on left-trim to keep the right edge fixed
     double speed = 1.0;   // 0.25x - 4.0x
+    bool reversed = false; // OFF by default; fold the resolved source time around inPoint + outPoint
     double volume = 1.0;  // 0.0 - 2.0 (0=mute, 1=normal, 2=boost)
     double pan = 0.0;     // -1.0..+1.0 balance pan (-1=L, 0=center, +1=R)
     AudioChannelMode audioChannelMode = AudioChannelMode::Stereo;
@@ -137,6 +208,10 @@ struct ClipInfo {
     // deleted together so V/A stays in AV sync. 0 = unlinked / standalone.
     int linkGroup = 0;
 
+    // Editing-only clip colour. None is the legacy/default appearance and has
+    // no effect on preview or export rendering.
+    ClipLabel label = ClipLabel::None;
+
     // US-T35 per-clip OBS-style video source transform. scale=1.0, dx=dy=0
     // is identity (no transform). dx/dy are offsets in fractions of the
     // letterbox width/height, scale is uniform.
@@ -148,6 +223,7 @@ struct ClipInfo {
     Layer3DTransform layer3D;
     LayerMaterial material;
     bool motionBlurEnabled = false;
+    bool autoOrientEnabled = false;
 
     // Future multi-track compositing groundwork. 1.0 = opaque (current
     // V1-wins behaviour). <1.0 values are placeholders until the layered
@@ -264,16 +340,43 @@ struct ClipInfo {
     // INVERSE 2D affine, composed with the user 3D-rotate matrix.
     QVector<StabilizerKeyframe> stabilizerKeyframes;
 
+    // US-307: absent for ordinary clips; persistence retains one level only.
+    std::shared_ptr<ClipInfo> renderInPlaceOriginal;
+
     double effectiveDuration() const {
         double out = (outPoint > 0.0) ? outPoint : duration;
         return (out - inPoint) / speed;
     }
+
+    // Shared preview/export source-time mapping. Existing speed, speed-ramp,
+    // or time-remap mapping is resolved first; reverse playback then folds
+    // that source position around the clip's trimmed in/out interval.
+    double sourceSecondAtLocalTime(double localSec) const;
+    double localSecondAtSourceTime(double sourceSec) const;
+    bool sourceTimeRunsBackwardAtLocalTime(double localSec) const;
 
     bool isSequenceReference() const {
         return !sequenceRefId.isEmpty()
             || timeline_nesting::isSequenceClipFilePath(filePath);
     }
 };
+
+enum class AudioFadeEdge {
+    In,
+    Out
+};
+
+namespace audioxfade {
+
+// Pure clip-vector mutation helpers shared by Timeline's undo-aware API and
+// the QApplication-free audio-xfade selftest.
+bool applyCrossfade(QVector<ClipInfo> &clips, int clipIndexA,
+                    double durationSec, QString *errorOut = nullptr);
+bool applyFade(QVector<ClipInfo> &clips, int clipIndex,
+               AudioFadeEdge edge, double durationSec,
+               QString *errorOut = nullptr);
+
+} // namespace audioxfade
 
 struct TimelineSequence {
     QString id;
@@ -295,6 +398,38 @@ struct TimelineSequence {
         };
         return qMax(tracksDuration(videoTracks), tracksDuration(audioTracks));
     }
+};
+
+// ProjectData normally receives its clip matrices through allVideoTracks() /
+// allAudioTracks().  Keep the matching track-flag snapshot attached to those
+// values so the existing MainWindow save/load call sites do not need a second,
+// separately ordered transfer step.  It is metadata for ProjectFile only and
+// remains implicitly usable anywhere a QVector<QVector<ClipInfo>> is expected.
+struct ProjectTrackClips : public QVector<QVector<ClipInfo>> {
+    using Base = QVector<QVector<ClipInfo>>;
+    using Base::Base;
+
+    ProjectTrackClips() = default;
+    ProjectTrackClips(const Base &clips) : Base(clips) {}
+    ProjectTrackClips(Base &&clips) : Base(std::move(clips)) {}
+
+    ProjectTrackClips &operator=(const Base &clips) {
+        Base::operator=(clips);
+        trackFlagsSnapshot = QJsonObject{};
+        return *this;
+    }
+    ProjectTrackClips &operator=(Base &&clips) {
+        Base::operator=(std::move(clips));
+        trackFlagsSnapshot = QJsonObject{};
+        return *this;
+    }
+    ProjectTrackClips &operator=(std::initializer_list<QVector<ClipInfo>> clips) {
+        Base::operator=(clips);
+        trackFlagsSnapshot = QJsonObject{};
+        return *this;
+    }
+
+    QJsonObject trackFlagsSnapshot;
 };
 
 enum class DragMode {
@@ -537,6 +672,13 @@ public:
         QString reason;
     };
 
+    struct MatchFrameResult {
+        QString filePath;
+        double sourceSec = 0.0;
+        int trackIndex = -1;
+        int clipIndex = -1;
+    };
+
     // GUI のファイル追加と MCP の非対話取り込みが共有する入口。
     // requestedTrackIndex / requestedStartSec が -1 のときは既存の GUI 配置規則を使う。
     // kind: LinkedPair は従来どおり V/A の対で置く (GUI 既定)。Auto はファイルの
@@ -571,6 +713,31 @@ public:
     bool setClipPropertyByIndex(bool audio, int trackIndex, int clipIndex,
                                 const QString &property, double value, QString *err,
                                 bool applyToLinked = false);
+    bool setClipReversed(TrackKind kind, int trackIndex, int clipIndex,
+                         bool reversed, bool applyToLinked = true);
+    bool setClipAutoOrientEnabled(TrackKind kind, int trackIndex, int clipIndex,
+                                  bool enabled);
+    // タイムライン時刻からソース時刻を引く。選択中の動画トラックを優先し、
+    // 該当しなければ V1 を検索する。ClipInfo の共通 speed/reverse/remap 写像を使う。
+    bool matchFrame(double timelineSec, MatchFrameResult *result,
+                    QString *errorOut = nullptr) const;
+    // US-307: replace one video clip atomically, preserving carrier indices.
+    bool replaceRenderedClip(int trackIndex, int clipIndex, const ClipInfo &clip,
+                             const QString &description);
+    // 素材だけを差し替え、トリム・配置・エフェクト等は維持する。新素材が短い場合は
+    // 収まる長さまで短縮し、messageOut に警告を返す。成功時は Undo 1 回。
+    bool replaceClipMedia(TrackKind kind, int trackIndex, int clipIndex,
+                          const QString &newPath,
+                          const QString &newDisplayName,
+                          double newSourceDurationSec,
+                          QString *messageOut = nullptr);
+    // 参照切れメディアの一括再リンク。filePath と lutFilePath を active / nested
+    // sequence 全体で置換し、マット・親子 carrier を維持したまま 1 Undo にまとめる。
+    bool relinkMediaPaths(const QHash<QString, QString> &oldToNew,
+                          QString *errorOut = nullptr,
+                          const std::function<bool(
+                              const QHash<QString, QString> &)> &relinkSidecars = {});
+    bool setClipLabel(TrackKind kind, int trackIndex, int clipIndex, ClipLabel label);
     bool selectClipByIndex(bool audio, int trackIndex, int clipIndex, QString *err);
     void clearSelection();
     bool freezeFrameAtPlayhead(TimelineTrack *track = nullptr, int clipIndex = -1);
@@ -639,6 +806,17 @@ public:
                            bool contain, bool cover, const QString &undoLabel);
     void applySilenceCutToClip(TimelineTrack *track, int clipIndex);
     void applyBeatMarkersToClip(TimelineTrack *track, int clipIndex);
+    // Beat-boundary music remix. Plan times are local timeline seconds in the
+    // selected audio clip. The optional ripple flag keeps the existing
+    // downstream clips fixed when false (the default).
+    bool applyMusicRemix(int trackIndex, int clipIndex,
+                         const remix::Plan &plan, bool ripple = false,
+                         QString *errorOut = nullptr);
+    // Replace one audio clip's gain automation with a dialogue-leveler
+    // envelope. Times are clip-local timeline seconds; one call is one undo.
+    bool applyDialogueLevel(int trackIndex, int clipIndex,
+                            const QVector<AudioGainPoint> &envelope,
+                            QString *errorOut = nullptr);
     // 再生ヘッド直下の V1 クリップを解決(見つかれば true)。
     bool clipUnderPlayhead(TimelineTrack *&outTrack, int &outClipIndex) const;
     bool removeMarker(int id);
@@ -718,6 +896,9 @@ public:
         const auto &tracks = audio ? m_audioTracks : m_videoTracks;
         return index >= 0 && index < tracks.size() ? tracks.at(index) : nullptr;
     }
+    bool setTrackLocked(TrackKind kind, int trackIndex, bool locked);
+    QJsonObject trackFlagsToJson() const;
+    void applyTrackFlagsFromJson(const QJsonObject &flags);
 
     // Track row height (applied to all tracks AND their header widgets)
     void setTrackHeight(int h);
@@ -748,6 +929,9 @@ public:
     void setClipLayerMaterial(int trackIdx, int clipIdx,
                               const LayerMaterial &material,
                               bool recordUndo = false);
+    // Shape-clip UI edits shapes[0]. Live changes do not create undo entries.
+    void setClipShapeModifiers(int trackIdx, int clipIdx,
+                               const ShapeModifiers &modifiers, bool recordUndo);
     // Attach a transition to the currently selected clip. FadeIn writes to
     // the clip's leadIn slot (start-of-clip); every other type writes to
     // trailOut (end-of-clip / boundary to next clip).
@@ -759,6 +943,11 @@ public:
                                     const QVector<VideoEffect> &effects,
                                     const KeyframeManager &km);
     void setClipKeyframes(const KeyframeManager &km);
+    bool setClipKeyframes(TrackKind kind, int trackIndex, int clipIndex,
+                          const KeyframeManager &km);
+    bool applyDynamicZoom(TrackKind kind, int trackIndex, int clipIndex,
+                          const dynzoom::Rect& start, const dynzoom::Rect& end,
+                          dynzoom::Easing easing);
     ColorCorrection clipColorCorrection() const;
     LayerStyle clipLayerStyle() const;
     LayerStyle clipLayerStyle(int trackIdx, int clipIdx) const;
@@ -775,6 +964,11 @@ public:
     // 配置し、saveUndoState で 1 操作 = 1 Undo にまとめる。
     void insertClip3PointActive(double timelineStartSec, const ClipInfo &clip);
     void overwriteClip3PointActive(double timelineStartSec, const ClipInfo &clip);
+
+    // Insert a five-second media-less shape clip on the selected video track
+    // at the current playhead. Returns false when no usable track/shape exists.
+    // The complete mutation is recorded as exactly one undo operation.
+    bool insertShapeClipAtPlayhead(const ClipInfo &clip);
 
     // TB-3: アクティブ動画トラック (m_activeVideoTrackIndex、無ければ先頭 V1) の
     // タイムライン時間範囲 [startSec, endSec) をリップル削除する薄いラッパー。
@@ -805,6 +999,16 @@ public:
     void toggleMuteTrack(int audioTrackIndex);
     void toggleSoloTrack(int audioTrackIndex);
     void normalizeAudioClipPeak(int trackIdx, int clipIdx);
+    // Audio-only transition APIs. Crossfade requires adjacent clips A/B and
+    // writes the same CrossDissolve duration to A.trailOut and B.leadIn.
+    // Fade changes only the requested edge of the requested clip. Each
+    // successful call records exactly one undo state.
+    bool applyAudioCrossfade(int trackIndex, int clipIndexA,
+                             double durationSec,
+                             QString *errorOut = nullptr);
+    bool applyAudioFade(int trackIndex, int clipIndex,
+                        AudioFadeEdge edge, double durationSec,
+                        QString *errorOut = nullptr);
 
     void setPlayheadPosition(double seconds);
     // Chase mode — re-centres the viewport on the playhead when it leaves
@@ -897,6 +1101,14 @@ public:
     // Project-level Light3D state is carried by Timeline so every
     // renderFrameAt consumer (preview/export/smart-render fallback/nested
     // sequence) evaluates the same immutable-at-render snapshot.
+    void setProjectCamera(const Camera3D &camera) { m_projectCamera = camera; }
+    void setProjectCamera(const Camera3DState &camera) { setProjectCamera(Camera3D{camera}); }
+    Camera3DState projectCamera() const { return m_projectCamera.camera(); }
+    Camera3DState projectCameraAt(double sec) const {
+        return m_projectCamera.hasAnimation() ? m_projectCamera.getCameraAt(sec)
+                                              : m_projectCamera.camera();
+    }
+
     void setProjectLights(const QVector<Light3D> &lights) { m_projectLights = lights; }
     QVector<Light3D> projectLights() const { return m_projectLights; }
     void setProjectLightViewPosition(const QVector3D &position) {
@@ -912,7 +1124,14 @@ public:
     // Multi-clip playback: flatten all video tracks into a sorted, gap-aware
     // schedule with topmost-track-wins resolution (Premiere V1/V2 semantics).
     QVector<PlaybackEntry> computePlaybackSequence() const;
+    QVector<QVector<OverlapInterval>> videoOverlapIntervals() const;
+    static void applyOverlapTransitionsToIntervals(
+        QVector<OverlapInterval> &intervals,
+        const std::function<double(const OverlapInterval &)> &trailAvailable,
+        const std::function<double(const OverlapInterval &)> &leadAvailable);
     QVector<PlaybackEntry> computeAudioPlaybackSequence() const;
+    static void setAudioOverlapEnabledForTest(bool enabled);
+    static int audioOverlapCallCountForTest();
 
     // Re-emit sequenceChanged / audioSequenceChanged with the current clip
     // graph. Called when an external source (proxy generation, proxy mode
@@ -922,10 +1141,13 @@ public:
     void refreshPlaybackSequence();
 
     // Project save/load support
-    QVector<QVector<ClipInfo>> allVideoTracks() const;
-    QVector<QVector<ClipInfo>> allAudioTracks() const;
+    ProjectTrackClips allVideoTracks() const;
+    ProjectTrackClips allAudioTracks() const;
     void restoreFromProject(const QVector<QVector<ClipInfo>> &videoTracks,
                             const QVector<QVector<ClipInfo>> &audioTracks,
+                            double playhead, double markIn, double markOut, int zoom);
+    void restoreFromProject(const ProjectTrackClips &videoTracks,
+                            const ProjectTrackClips &audioTracks,
                             double playhead, double markIn, double markOut, int zoom);
 
     // TM-8: track-matte wiring SSOT. Producers (MainWindow on every
@@ -947,6 +1169,7 @@ public:
         return m_trackMatteEntries;
     }
 signals:
+    void renderInPlaceRequested(int trackIndex, int clipIndex);
     void clipSelected(int index);
     // V3 sprint — track-aware overload. emitted alongside the int-only
     // signal so MainWindow can drop its playhead heuristic and resolve
@@ -976,6 +1199,7 @@ signals:
     void transitionDialogRequested();
     void videoEffectsDialogRequested();
     void colorCorrectionRequested();
+    void replaceClipRequested(TrackKind kind, int trackIndex, int clipIndex);
     void clipParentDialogRequested();
     void nullObjectRequested();
     // Emitted from applyTransitionToSelected when the requested duration
@@ -1005,6 +1229,8 @@ private slots:
     void onPlayheadAutoScrollTick();
 
 private:
+    QVector<PlaybackEntry> computePlaybackSequenceImpl(
+        QVector<QVector<OverlapInterval>> *overlapIntervals) const;
     struct TimeRangeSec {
         double startSec = 0.0;
         double endSec = 0.0;
@@ -1019,6 +1245,7 @@ private:
     void updateInfoLabel();
     void ensureSequenceFitsViewport();
     QWidget *createTrackHeader(TimelineTrack *track, const QString &name, bool isAudioRow);
+    void syncTrackHeaderFlags(TimelineTrack *track);
     void notifyMutationsChanged();
     void wireTrackSelection(TimelineTrack *track);
     void clearAllSelections();
@@ -1063,6 +1290,7 @@ private:
     QVBoxLayout *m_tracksLayout;
     QWidget *m_headerColumn = nullptr;
     QVBoxLayout *m_headerLayout = nullptr;
+    QHash<TimelineTrack *, QWidget *> m_trackHeaders;
     static constexpr int kHeaderColumnWidth = 130;
     PlayheadOverlay *m_playheadOverlay = nullptr;
     class TimeRuler *m_timeRuler = nullptr;
@@ -1093,6 +1321,7 @@ private:
     // Project-level 3D lighting snapshot consumed by the render SSOT. The
     // MainWindow owns the editing UI; RenderQueue receives these plain values
     // through Timeline so worker renders never dereference MainWindow.
+    Camera3D m_projectCamera;
     QVector<Light3D> m_projectLights;
     QVector3D m_projectLightViewPosition = QVector3D();
     double m_markIn = -1.0;

@@ -142,7 +142,7 @@ RecognizeResult WhisperCliRecognizer::recognize(const RecognizeParams& params)
 
     if (!isAvailable()) {
         res.success = false;
-        res.error = QStringLiteral("whisper-cli binary not found in PATH");
+        res.error = QStringLiteral("whisper-cli binary is not available");
         return res;
     }
 
@@ -219,6 +219,9 @@ QList<QSharedPointer<Recognizer>> availableRecognizers()
     list.append(QSharedPointer<Recognizer>(new StubRecognizer()));
 
     auto whisper = QSharedPointer<WhisperCliRecognizer>(new WhisperCliRecognizer());
+    const QString cliPath = whisperpath::resolveWhisperCli().executablePath;
+    if (!cliPath.isEmpty())
+        whisper->setCliPath(cliPath);
     if (whisper->isAvailable()) {
         list.append(whisper);
     }

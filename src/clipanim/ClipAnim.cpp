@@ -8,6 +8,7 @@
 #include <QColor>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 
 namespace clipanim {
@@ -16,6 +17,13 @@ namespace {
 const QString kScaleTrack = QStringLiteral("motion.scale");
 const QString kPosXTrack = QStringLiteral("motion.position.x");
 const QString kPosYTrack = QStringLiteral("motion.position.y");
+// Dynamic Zoom stores only the public TransformAnimator track names; the
+// runtime motion.* names are resolved from them at read time so no mirrored
+// tracks are ever persisted. motion.* stays authoritative when present.
+const QString kPublicPosXTrack = QStringLiteral("positionX");
+const QString kPublicPosYTrack = QStringLiteral("positionY");
+const QString kPublicScaleXTrack = QStringLiteral("scaleX");
+const QString kPublicScaleYTrack = QStringLiteral("scaleY");
 const QString kRotationTrack = QStringLiteral("motion.rotation");
 const QString kOpacityTrack = QStringLiteral("motion.opacity");
 const QString kGradeBrightnessTrack = QStringLiteral("grade.brightness");
@@ -33,6 +41,9 @@ const QString kGradeGainRTrack = QStringLiteral("grade.gainR");
 const QString kGradeGainGTrack = QStringLiteral("grade.gainG");
 const QString kGradeGainBTrack = QStringLiteral("grade.gainB");
 
+std::atomic<bool> extendedGradeDisabled{false};
+std::atomic<int> extendedGradeCalls{0};
+
 constexpr double kKeyTimeEpsilon = 1e-6;
 constexpr double kColorChannelMin = 0.0;
 constexpr double kColorChannelMax = 255.0;
@@ -45,13 +56,44 @@ bool trackHasKeyframes(const KeyframeManager& keyframes, const QString& trackNam
     return track && track->count() > 0;
 }
 
+// Runtime-name resolution: prefer the motion.* track, otherwise fall back to
+// the public TransformAnimator name Dynamic Zoom stores. Returning the runtime
+// name when neither has keyframes keeps every "no keyframes" branch untouched.
+const QString& resolvedMotionTrack(const KeyframeManager& keyframes,
+                                   const QString& runtimeName,
+                                   const QString& publicName)
+{
+    if (trackHasKeyframes(keyframes, runtimeName))
+        return runtimeName;
+    if (trackHasKeyframes(keyframes, publicName))
+        return publicName;
+    return runtimeName;
+}
+
+// motion.scale is a uniform scale; Dynamic Zoom writes identical scaleX and
+// scaleY tracks, so either public track can stand in for it.
+const QString& resolvedScaleTrack(const KeyframeManager& keyframes)
+{
+    if (trackHasKeyframes(keyframes, kScaleTrack))
+        return kScaleTrack;
+    if (trackHasKeyframes(keyframes, kPublicScaleXTrack))
+        return kPublicScaleXTrack;
+    if (trackHasKeyframes(keyframes, kPublicScaleYTrack))
+        return kPublicScaleYTrack;
+    return kScaleTrack;
+}
+
 bool hasAnyMotionKeyframes(const ClipInfo& clip)
 {
     return trackHasKeyframes(clip.keyframes, kScaleTrack)
         || trackHasKeyframes(clip.keyframes, kPosXTrack)
         || trackHasKeyframes(clip.keyframes, kPosYTrack)
         || trackHasKeyframes(clip.keyframes, kRotationTrack)
-        || trackHasKeyframes(clip.keyframes, kOpacityTrack);
+        || trackHasKeyframes(clip.keyframes, kOpacityTrack)
+        || trackHasKeyframes(clip.keyframes, kPublicScaleXTrack)
+        || trackHasKeyframes(clip.keyframes, kPublicScaleYTrack)
+        || trackHasKeyframes(clip.keyframes, kPublicPosXTrack)
+        || trackHasKeyframes(clip.keyframes, kPublicPosYTrack);
 }
 
 bool hasAnyEffectKeyframes(const ClipInfo& clip)
@@ -67,20 +109,11 @@ bool hasAnyEffectKeyframes(const ClipInfo& clip)
 
 bool hasAnyGradeKeyframes(const ClipInfo& clip)
 {
-    return trackHasKeyframes(clip.keyframes, kGradeBrightnessTrack)
-        || trackHasKeyframes(clip.keyframes, kGradeContrastTrack)
-        || trackHasKeyframes(clip.keyframes, kGradeSaturationTrack)
-        || trackHasKeyframes(clip.keyframes, kGradeExposureTrack)
-        || trackHasKeyframes(clip.keyframes, kGradeTemperatureTrack)
-        || trackHasKeyframes(clip.keyframes, kGradeLiftRTrack)
-        || trackHasKeyframes(clip.keyframes, kGradeLiftGTrack)
-        || trackHasKeyframes(clip.keyframes, kGradeLiftBTrack)
-        || trackHasKeyframes(clip.keyframes, kGradeGammaRTrack)
-        || trackHasKeyframes(clip.keyframes, kGradeGammaGTrack)
-        || trackHasKeyframes(clip.keyframes, kGradeGammaBTrack)
-        || trackHasKeyframes(clip.keyframes, kGradeGainRTrack)
-        || trackHasKeyframes(clip.keyframes, kGradeGainGTrack)
-        || trackHasKeyframes(clip.keyframes, kGradeGainBTrack);
+    for (const KeyframeTrack &track : clip.keyframes.tracks()) {
+        if (track.propertyName().startsWith(QStringLiteral("grade.")) && track.count() > 0)
+            return true;
+    }
+    return false;
 }
 
 bool hasAnyEffectTiming(const ClipInfo& clip)
@@ -239,6 +272,86 @@ QPointF cubicPoint(const QPointF& p0,
                    a * p0.y() + b * c1.y() + c * c2.y() + d * p1.y());
 }
 
+QPointF cubicTangent(const QPointF& p0,
+                     const QPointF& c1,
+                     const QPointF& c2,
+                     const QPointF& p1,
+                     double u)
+{
+    const double omt = 1.0 - u;
+    return 3.0 * omt * omt * (c1 - p0)
+        + 6.0 * omt * u * (c2 - c1)
+        + 3.0 * u * u * (p1 - c2);
+}
+
+struct SpatialSegmentEvaluation {
+    QPointF p0;
+    QPointF c1;
+    QPointF c2;
+    QPointF p1;
+    double u = 0.0;
+    bool hasSpatialTangents = false;
+};
+
+bool evaluateSpatialSegment(const ClipInfo& clip,
+                            const KeyframeTrack *xTrack,
+                            const KeyframeTrack *yTrack,
+                            const QVector<double>& times,
+                            double pathSeconds,
+                            SpatialSegmentEvaluation *evaluation)
+{
+    int segment = -1;
+    for (int i = 0; i < times.size() - 1; ++i) {
+        if (pathSeconds + kKeyTimeEpsilon >= times[i]
+            && pathSeconds - kKeyTimeEpsilon <= times[i + 1]) {
+            segment = i;
+            break;
+        }
+    }
+    if (segment < 0)
+        return false;
+
+    const double startTime = times[segment];
+    const double endTime = times[segment + 1];
+    if (!(endTime > startTime))
+        return false;
+
+    const KeyframePoint *xStart = keyframeAtTime(xTrack, startTime);
+    const KeyframePoint *yStart = keyframeAtTime(yTrack, startTime);
+    const KeyframePoint *xEnd = keyframeAtTime(xTrack, endTime);
+    const KeyframePoint *yEnd = keyframeAtTime(yTrack, endTime);
+
+    SpatialSegmentEvaluation result;
+    result.hasSpatialTangents = hasUsableSpatialTangent(xStart)
+        || hasUsableSpatialTangent(yStart)
+        || hasUsableSpatialTangent(xEnd)
+        || hasUsableSpatialTangent(yEnd);
+    result.p0 = QPointF(trackValueAt(xTrack, startTime, clip.videoDx),
+                        trackValueAt(yTrack, startTime, clip.videoDy));
+    result.p1 = QPointF(trackValueAt(xTrack, endTime, clip.videoDx),
+                        trackValueAt(yTrack, endTime, clip.videoDy));
+    if (!finitePoint(result.p0) || !finitePoint(result.p1))
+        return false;
+
+    const QPointF out = outgoingSpatialTangent(xStart, yStart);
+    const QPointF in = incomingSpatialTangent(xEnd, yEnd);
+    result.c1 = result.p0 + out;
+    result.c2 = result.p1 + in;
+    if (!finitePoint(result.c1) || !finitePoint(result.c2))
+        return false;
+
+    result.u = (pathSeconds - startTime) / (endTime - startTime);
+    result.u = std::max(0.0, std::min(1.0, result.u));
+    const KeyframePoint *easeKeyframe = xStart ? xStart : yStart;
+    result.u = easedProgress(result.u, easeKeyframe);
+    if (!std::isfinite(result.u))
+        return false;
+
+    if (evaluation)
+        *evaluation = result;
+    return true;
+}
+
 bool spatialLoopApplies(const ClipInfo& clip, const QString& trackName)
 {
     const LoopMode mode = clip.keyframes.loopOutMode(trackName);
@@ -255,6 +368,27 @@ double spatialPathLocalSecondsForTrack(const ClipInfo& clip,
     if (spatialLoopApplies(clip, trackName))
         return clip.keyframes.loopedTimeForTrack(trackName, clipLocalSeconds);
     return clipLocalSeconds;
+}
+
+double spatialPathDirectionForTrack(const ClipInfo& clip,
+                                    const QString& trackName,
+                                    double clipLocalSeconds)
+{
+    if (clip.keyframes.loopOutMode(trackName) != LoopMode::PingPong)
+        return 1.0;
+    const KeyframeTrack *track = clip.keyframes.track(trackName);
+    if (!track || track->count() < 2)
+        return 1.0;
+    const QVector<KeyframePoint>& keyframes = track->keyframes();
+    const double firstTime = keyframes.first().time;
+    const double lastTime = keyframes.last().time;
+    const double range = lastTime - firstTime;
+    if (clipLocalSeconds <= lastTime || !std::isfinite(range) || range <= 0.0)
+        return 1.0;
+    double phase = std::fmod(clipLocalSeconds - firstTime, 2.0 * range);
+    if (phase < 0.0)
+        phase += 2.0 * range;
+    return phase > range ? -1.0 : 1.0;
 }
 
 double clampedAnimatedParamValue(const effectctrl::ParamDef& def, double value)
@@ -353,62 +487,27 @@ bool spatialPositionAt(const ClipInfo& clip,
                        double clipLocalSeconds,
                        QPointF *position)
 {
-    const KeyframeTrack *xTrack = clip.keyframes.track(kPosXTrack);
-    const KeyframeTrack *yTrack = clip.keyframes.track(kPosYTrack);
+    const QString& posXName =
+        resolvedMotionTrack(clip.keyframes, kPosXTrack, kPublicPosXTrack);
+    const QString& posYName =
+        resolvedMotionTrack(clip.keyframes, kPosYTrack, kPublicPosYTrack);
+    const KeyframeTrack *xTrack = clip.keyframes.track(posXName);
+    const KeyframeTrack *yTrack = clip.keyframes.track(posYName);
     const QVector<double> times = positionKeyframeTimes(xTrack, yTrack);
     if (times.size() < 2)
         return false;
 
     const auto evaluateSpatialPointAt = [&](double pathSeconds,
                                              QPointF *result) {
-        int segment = -1;
-        for (int i = 0; i < times.size() - 1; ++i) {
-            if (pathSeconds + kKeyTimeEpsilon >= times[i]
-                && pathSeconds - kKeyTimeEpsilon <= times[i + 1]) {
-                segment = i;
-                break;
-            }
-        }
-        if (segment < 0)
-            return false;
-
-        const double startTime = times[segment];
-        const double endTime = times[segment + 1];
-        if (!(endTime > startTime))
-            return false;
-
-        const KeyframePoint *xStart = keyframeAtTime(xTrack, startTime);
-        const KeyframePoint *yStart = keyframeAtTime(yTrack, startTime);
-        const KeyframePoint *xEnd = keyframeAtTime(xTrack, endTime);
-        const KeyframePoint *yEnd = keyframeAtTime(yTrack, endTime);
-
-        if (!hasUsableSpatialTangent(xStart)
-            && !hasUsableSpatialTangent(yStart)
-            && !hasUsableSpatialTangent(xEnd)
-            && !hasUsableSpatialTangent(yEnd)) {
+        SpatialSegmentEvaluation evaluation;
+        if (!evaluateSpatialSegment(clip, xTrack, yTrack, times,
+                                    pathSeconds, &evaluation)
+            || !evaluation.hasSpatialTangents) {
             return false;
         }
-
-        const QPointF p0(trackValueAt(xTrack, startTime, clip.videoDx),
-                         trackValueAt(yTrack, startTime, clip.videoDy));
-        const QPointF p1(trackValueAt(xTrack, endTime, clip.videoDx),
-                         trackValueAt(yTrack, endTime, clip.videoDy));
-        if (!finitePoint(p0) || !finitePoint(p1))
-            return false;
-
-        const QPointF out = outgoingSpatialTangent(xStart, yStart);
-        const QPointF in = incomingSpatialTangent(xEnd, yEnd);
-        const QPointF c1(p0.x() + out.x(), p0.y() + out.y());
-        const QPointF c2(p1.x() + in.x(), p1.y() + in.y());
-        if (!finitePoint(c1) || !finitePoint(c2))
-            return false;
-
-        double u = (pathSeconds - startTime) / (endTime - startTime);
-        u = std::max(0.0, std::min(1.0, u));
-        const KeyframePoint *easeKeyframe = xStart ? xStart : yStart;
-        u = easedProgress(u, easeKeyframe);
-
-        const QPointF evaluated = cubicPoint(p0, c1, c2, p1, u);
+        const QPointF evaluated = cubicPoint(
+            evaluation.p0, evaluation.c1, evaluation.c2, evaluation.p1,
+            evaluation.u);
         if (!finitePoint(evaluated))
             return false;
         if (result)
@@ -421,20 +520,20 @@ bool spatialPositionAt(const ClipInfo& clip,
     // pair uses one spatial Bezier path.  The previous shared mapping picked
     // X first and made Y visibly loop despite a UI value of None/PingPong.
     QPointF result(
-        trackHasKeyframes(clip.keyframes, kPosXTrack)
-            ? clip.keyframes.valueAt(kPosXTrack, clipLocalSeconds, clip.videoDx)
+        trackHasKeyframes(clip.keyframes, posXName)
+            ? clip.keyframes.valueAt(posXName, clipLocalSeconds, clip.videoDx)
             : clip.videoDx,
-        trackHasKeyframes(clip.keyframes, kPosYTrack)
-            ? clip.keyframes.valueAt(kPosYTrack, clipLocalSeconds, clip.videoDy)
+        trackHasKeyframes(clip.keyframes, posYName)
+            ? clip.keyframes.valueAt(posYName, clipLocalSeconds, clip.videoDy)
             : clip.videoDy);
 
     QPointF xPoint;
     QPointF yPoint;
     const bool xSpatial = evaluateSpatialPointAt(
-        spatialPathLocalSecondsForTrack(clip, kPosXTrack, clipLocalSeconds),
+        spatialPathLocalSecondsForTrack(clip, posXName, clipLocalSeconds),
         &xPoint);
     const bool ySpatial = evaluateSpatialPointAt(
-        spatialPathLocalSecondsForTrack(clip, kPosYTrack, clipLocalSeconds),
+        spatialPathLocalSecondsForTrack(clip, posYName, clipLocalSeconds),
         &yPoint);
     if (xSpatial)
         result.setX(xPoint.x());
@@ -456,15 +555,81 @@ QPointF effectivePositionAt(const ClipInfo& clip,
         return spatialPosition;
 
     QPointF position(clip.videoDx, clip.videoDy);
-    if (trackHasKeyframes(clip.keyframes, kPosXTrack)) {
+    const QString& posXName =
+        resolvedMotionTrack(clip.keyframes, kPosXTrack, kPublicPosXTrack);
+    const QString& posYName =
+        resolvedMotionTrack(clip.keyframes, kPosYTrack, kPublicPosYTrack);
+    if (trackHasKeyframes(clip.keyframes, posXName)) {
         position.setX(
-            clip.keyframes.valueAt(kPosXTrack, clipLocalSeconds, position.x()));
+            clip.keyframes.valueAt(posXName, clipLocalSeconds, position.x()));
     }
-    if (trackHasKeyframes(clip.keyframes, kPosYTrack)) {
+    if (trackHasKeyframes(clip.keyframes, posYName)) {
         position.setY(
-            clip.keyframes.valueAt(kPosYTrack, clipLocalSeconds, position.y()));
+            clip.keyframes.valueAt(posYName, clipLocalSeconds, position.y()));
     }
     return position;
+}
+
+bool spatialTangentAt(const ClipInfo& clip,
+                      double clipLocalSeconds,
+                      QPointF *tangent)
+{
+    const QString& posXName =
+        resolvedMotionTrack(clip.keyframes, kPosXTrack, kPublicPosXTrack);
+    const QString& posYName =
+        resolvedMotionTrack(clip.keyframes, kPosYTrack, kPublicPosYTrack);
+    const KeyframeTrack *xTrack = clip.keyframes.track(posXName);
+    const KeyframeTrack *yTrack = clip.keyframes.track(posYName);
+    const QVector<double> times = positionKeyframeTimes(xTrack, yTrack);
+    if (times.size() < 2)
+        return false;
+
+    const auto tangentPathSeconds = [&](const QString& trackName) {
+        return std::max(times.first(), std::min(
+            times.last(), spatialPathLocalSecondsForTrack(
+                clip, trackName, clipLocalSeconds)));
+    };
+
+    SpatialSegmentEvaluation xEvaluation;
+    SpatialSegmentEvaluation yEvaluation;
+    const bool hasXEvaluation = evaluateSpatialSegment(
+        clip, xTrack, yTrack, times,
+        tangentPathSeconds(posXName),
+        &xEvaluation);
+    const bool hasYEvaluation = evaluateSpatialSegment(
+        clip, xTrack, yTrack, times,
+        tangentPathSeconds(posYName),
+        &yEvaluation);
+    if (!hasXEvaluation && !hasYEvaluation)
+        return false;
+
+    const auto segmentTangent = [](const SpatialSegmentEvaluation& evaluation) {
+        if (evaluation.hasSpatialTangents) {
+            const QPointF derivative = cubicTangent(
+                evaluation.p0, evaluation.c1, evaluation.c2, evaluation.p1,
+                evaluation.u);
+            if (finitePoint(derivative)
+                && (derivative.x() != 0.0 || derivative.y() != 0.0)) {
+                return derivative;
+            }
+        }
+        return evaluation.p1 - evaluation.p0;
+    };
+
+    const QPointF xDirection = hasXEvaluation
+        ? segmentTangent(xEvaluation) : QPointF();
+    const QPointF yDirection = hasYEvaluation
+        ? segmentTangent(yEvaluation) : QPointF();
+    const QPointF result(
+        xDirection.x() * spatialPathDirectionForTrack(
+            clip, posXName, clipLocalSeconds),
+        yDirection.y() * spatialPathDirectionForTrack(
+            clip, posYName, clipLocalSeconds));
+    if (!finitePoint(result) || (result.x() == 0.0 && result.y() == 0.0))
+        return false;
+    if (tangent)
+        *tangent = result;
+    return true;
 }
 
 clipgeom::ClipTransform effectiveTransformAt(const ClipInfo& clip,
@@ -479,27 +644,41 @@ clipgeom::ClipTransform effectiveTransformAt(const ClipInfo& clip,
 
     clipgeom::ClipTransform transform{clip.videoScale, clip.videoDx,
                                       clip.videoDy, clip.rotation2DDegrees};
-    if (trackHasKeyframes(clip.keyframes, kScaleTrack)) {
+    const QString& scaleName = resolvedScaleTrack(clip.keyframes);
+    if (trackHasKeyframes(clip.keyframes, scaleName)) {
         transform.videoScale =
-            clip.keyframes.valueAt(kScaleTrack, clipLocalSeconds, transform.videoScale);
+            clip.keyframes.valueAt(scaleName, clipLocalSeconds, transform.videoScale);
     }
     QPointF spatialPosition;
     if (spatialPositionAt(clip, clipLocalSeconds, &spatialPosition)) {
         transform.videoDx = spatialPosition.x();
         transform.videoDy = spatialPosition.y();
     } else {
-        if (trackHasKeyframes(clip.keyframes, kPosXTrack)) {
+        const QString& posXName =
+            resolvedMotionTrack(clip.keyframes, kPosXTrack, kPublicPosXTrack);
+        const QString& posYName =
+            resolvedMotionTrack(clip.keyframes, kPosYTrack, kPublicPosYTrack);
+        if (trackHasKeyframes(clip.keyframes, posXName)) {
             transform.videoDx =
-                clip.keyframes.valueAt(kPosXTrack, clipLocalSeconds, transform.videoDx);
+                clip.keyframes.valueAt(posXName, clipLocalSeconds, transform.videoDx);
         }
-        if (trackHasKeyframes(clip.keyframes, kPosYTrack)) {
+        if (trackHasKeyframes(clip.keyframes, posYName)) {
             transform.videoDy =
-                clip.keyframes.valueAt(kPosYTrack, clipLocalSeconds, transform.videoDy);
+                clip.keyframes.valueAt(posYName, clipLocalSeconds, transform.videoDy);
         }
     }
     if (trackHasKeyframes(clip.keyframes, kRotationTrack)) {
         transform.rotationDeg =
             clip.keyframes.valueAt(kRotationTrack, clipLocalSeconds, transform.rotationDeg);
+    }
+    if (clip.autoOrientEnabled) {
+        QPointF tangent;
+        if (spatialTangentAt(clip, clipLocalSeconds, &tangent)) {
+            constexpr double kRadiansToDegrees =
+                180.0 / 3.14159265358979323846264338327950288;
+            transform.rotationDeg += std::atan2(tangent.y(), tangent.x())
+                * kRadiansToDegrees;
+        }
     }
     return transform;
 }
@@ -599,7 +778,108 @@ ColorCorrection effectiveColorCorrectionAt(const ClipInfo& clip,
                          clipLocalSeconds, cc.gainG);
     applyGradeTrackValue(clip, kGradeGainBTrack,
                          clipLocalSeconds, cc.gainB);
+    if (extendedGradeDisabled.load(std::memory_order_relaxed)) return cc;
+    for (const auto &track : sectionGradeTracks(true)) {
+        if (!trackHasKeyframes(clip.keyframes, track.name)) continue;
+        ++extendedGradeCalls;
+        applyGradeTrackValue(clip, track.name, clipLocalSeconds, cc.*(track.member));
+    }
+    for (const auto &track : warpGradeTracks()) {
+        if (!trackHasKeyframes(clip.keyframes, track.name)) continue;
+        ++extendedGradeCalls;
+        float &value = track.shift ? cc.hueSatWarp.hueShiftDeg[track.ring][track.hue]
+                                   : cc.hueSatWarp.satScale[track.ring][track.hue];
+        value = static_cast<float>(clip.keyframes.valueAt(track.name, clipLocalSeconds, value));
+    }
     return cc;
 }
+
+const QVector<HslGradeTrack>& hslGradeTracks()
+{
+    static const QVector<HslGradeTrack> tracks = {
+        {QStringLiteral("grade.hsl.hueCenter"), &HslSecondaryGrade::hueCenter},
+        {QStringLiteral("grade.hsl.hueRange"), &HslSecondaryGrade::hueRange},
+        {QStringLiteral("grade.hsl.satMin"), &HslSecondaryGrade::satMin},
+        {QStringLiteral("grade.hsl.satMax"), &HslSecondaryGrade::satMax},
+        {QStringLiteral("grade.hsl.lumaMin"), &HslSecondaryGrade::lumaMin},
+        {QStringLiteral("grade.hsl.lumaMax"), &HslSecondaryGrade::lumaMax},
+        {QStringLiteral("grade.hsl.softness"), &HslSecondaryGrade::softness},
+        {QStringLiteral("grade.hsl.liftR"), &HslSecondaryGrade::liftR},
+        {QStringLiteral("grade.hsl.liftG"), &HslSecondaryGrade::liftG},
+        {QStringLiteral("grade.hsl.liftB"), &HslSecondaryGrade::liftB},
+        {QStringLiteral("grade.hsl.gammaR"), &HslSecondaryGrade::gammaR},
+        {QStringLiteral("grade.hsl.gammaG"), &HslSecondaryGrade::gammaG},
+        {QStringLiteral("grade.hsl.gammaB"), &HslSecondaryGrade::gammaB},
+        {QStringLiteral("grade.hsl.gainR"), &HslSecondaryGrade::gainR},
+        {QStringLiteral("grade.hsl.gainG"), &HslSecondaryGrade::gainG},
+        {QStringLiteral("grade.hsl.gainB"), &HslSecondaryGrade::gainB},
+    };
+    return tracks;
+}
+
+const QVector<PrimaryGradeTrack>& sectionGradeTracks(bool log)
+{
+    static const QVector<PrimaryGradeTrack> lgg = {
+        {QStringLiteral("grade.liftR"), &ColorCorrection::liftR},
+        {QStringLiteral("grade.liftG"), &ColorCorrection::liftG},
+        {QStringLiteral("grade.liftB"), &ColorCorrection::liftB},
+        {QStringLiteral("grade.gammaR"), &ColorCorrection::gammaR},
+        {QStringLiteral("grade.gammaG"), &ColorCorrection::gammaG},
+        {QStringLiteral("grade.gammaB"), &ColorCorrection::gammaB},
+        {QStringLiteral("grade.gainR"), &ColorCorrection::gainR},
+        {QStringLiteral("grade.gainG"), &ColorCorrection::gainG},
+        {QStringLiteral("grade.gainB"), &ColorCorrection::gainB},
+    };
+    static const QVector<PrimaryGradeTrack> logs = {
+        {QStringLiteral("grade.logShadowR"), &ColorCorrection::logShadowR},
+        {QStringLiteral("grade.logShadowG"), &ColorCorrection::logShadowG},
+        {QStringLiteral("grade.logShadowB"), &ColorCorrection::logShadowB},
+        {QStringLiteral("grade.logMidR"), &ColorCorrection::logMidR},
+        {QStringLiteral("grade.logMidG"), &ColorCorrection::logMidG},
+        {QStringLiteral("grade.logMidB"), &ColorCorrection::logMidB},
+        {QStringLiteral("grade.logHighR"), &ColorCorrection::logHighR},
+        {QStringLiteral("grade.logHighG"), &ColorCorrection::logHighG},
+        {QStringLiteral("grade.logHighB"), &ColorCorrection::logHighB},
+    };
+    return log ? logs : lgg;
+}
+
+const QVector<WarpGradeTrack>& warpGradeTracks()
+{
+    static const QVector<WarpGradeTrack> tracks = [] {
+        QVector<WarpGradeTrack> result;
+        for (int ring = 0; ring < HueSatWarp::kSatRings; ++ring)
+            for (int hue = 0; hue < HueSatWarp::kHueNodes; ++hue)
+                for (bool shift : {true, false})
+                    result.append({QStringLiteral("grade.hueSatWarp.%1.%2.%3")
+                        .arg(shift ? QStringLiteral("shift") : QStringLiteral("scale"))
+                        .arg(ring).arg(hue), ring, hue, shift});
+        return result;
+    }();
+    return tracks;
+}
+
+bool hasHslSecondaryKeyframes(const ClipInfo& clip)
+{
+    for (const auto &track : clip.keyframes.tracks())
+        if (track.propertyName().startsWith(QStringLiteral("grade.hsl.")) && track.count() > 0)
+            return true;
+    return false;
+}
+
+HslSecondaryGrade effectiveHslSecondaryAt(const ClipInfo& clip, double localSec)
+{
+    HslSecondaryGrade hsl = clip.hslSecondary;
+    if (extendedGradeDisabled.load(std::memory_order_relaxed)
+        || !hasHslSecondaryKeyframes(clip)) return hsl;
+    ++extendedGradeCalls;
+    for (const auto &track : hslGradeTracks())
+        applyGradeTrackValue(clip, track.name, localSec, hsl.*(track.member));
+    return hsl;
+}
+
+void setExtendedGradeDisabledForTest(bool disabled) { extendedGradeDisabled.store(disabled); }
+void resetExtendedGradeCallCountForTest() { extendedGradeCalls.store(0); }
+int extendedGradeCallCountForTest() { return extendedGradeCalls.load(); }
 
 } // namespace clipanim

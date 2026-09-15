@@ -1,3 +1,4 @@
+#include "RenderInPlace.h"
 #include "Timeline.h"
 #include "CaptionOverlayBuilder.h"
 #include "CaptionTrack.h"
@@ -5,6 +6,7 @@
 #include "VideoPlayer.h"
 #include "SilenceCut.h"
 #include "BeatDetect.h"
+#include "ClipGeometry.h"
 #include "ThreePointEdit.h"
 #include "TrimOps.h"
 #include "TrackMatteKey.h"
@@ -12,9 +14,15 @@
 #include "UndoTrace.h"
 #include "UndoManager.h"
 #include "AudioMixer.h"
+#include "DynamicZoom.h"
 #include "OverlayDialogs.h"
 #include "ProjectFile.h"
 #include "WaveformGenerator.h"
+#include "MusicRemixDialog.h"
+#include "ShapeModifierDialog.h"
+#include "MusicRemix.h"
+#include "DialogueLevelerDialog.h"
+#include "DialogueLeveler.h"
 #include "color/ClipColor.h"
 #include "playback/HdrIngestProbe.h"
 #include "playback/hdringest_flag.h"
@@ -26,6 +34,7 @@
 #include <cmath>
 #include <functional>
 #include <limits>
+#include <numeric>
 #include <utility>
 #include <QFileInfo>
 #include <QDir>
@@ -34,6 +43,7 @@
 #include <QJsonDocument>
 #include <QJsonValue>
 #include <QMessageBox>
+#include <QInputDialog>
 #include <QPushButton>
 #include <QSizePolicy>
 #include <QSpacerItem>
@@ -54,6 +64,162 @@ static_assert(static_cast<int>(TrackMatteType::LumaMatte) == 3,
               "PlaybackEntry::matteTypeOrdinal 3 must mean TrackMatteType::LumaMatte");
 static_assert(static_cast<int>(TrackMatteType::LumaInvertedMatte) == 4,
               "PlaybackEntry::matteTypeOrdinal 4 must mean TrackMatteType::LumaInvertedMatte");
+
+double ClipInfo::sourceSecondAtLocalTime(double localSec) const
+{
+    const double sourceOut = (outPoint > 0.0) ? outPoint : duration;
+    if (sourceOut <= inPoint)
+        return inPoint;
+
+    const double boundedLocal = qMax(0.0, localSec);
+    double sourceSecond = inPoint;
+    if (!timeRemapCurve.keys.isEmpty()) {
+        sourceSecond += qMax(0.0, timeRemapCurve.srcTimeAt(boundedLocal));
+    } else {
+        const double uniformSpeed = (speed > 0.0) ? speed : 1.0;
+        if (speedRamp.isIdentity()) {
+            sourceSecond += boundedLocal * uniformSpeed;
+        } else {
+            const qint64 scaledTimelineUs = qRound64(
+                boundedLocal * uniformSpeed * 1'000'000.0);
+            sourceSecond += static_cast<double>(
+                speedRamp.timelineToSourceUs(scaledTimelineUs)) / 1'000'000.0;
+        }
+    }
+
+    sourceSecond = qBound(inPoint, sourceSecond, sourceOut);
+    if (reversed)
+        sourceSecond = inPoint + sourceOut - sourceSecond;
+    return qBound(inPoint, sourceSecond, sourceOut);
+}
+
+double ClipInfo::localSecondAtSourceTime(double sourceSec) const
+{
+    const double sourceOut = (outPoint > 0.0) ? outPoint : duration;
+    if (sourceOut <= inPoint)
+        return 0.0;
+
+    double foldedSource = qBound(inPoint, sourceSec, sourceOut);
+    if (reversed)
+        foldedSource = inPoint + sourceOut - foldedSource;
+    const double targetOffset = qBound(0.0, foldedSource - inPoint,
+                                       sourceOut - inPoint);
+
+    if (!timeRemapCurve.keys.isEmpty()) {
+        const auto &keys = timeRemapCurve.keys;
+        if (keys.size() == 1)
+            return qMax(0.0, keys.first().outTime);
+        for (int i = 1; i < keys.size(); ++i) {
+            const auto &left = keys[i - 1];
+            const auto &right = keys[i];
+            const double lo = qMin(left.srcTime, right.srcTime);
+            const double hi = qMax(left.srcTime, right.srcTime);
+            if (targetOffset < lo || targetOffset > hi)
+                continue;
+            const double span = right.srcTime - left.srcTime;
+            if (qFuzzyIsNull(span))
+                return qMax(0.0, left.outTime);
+            const double fraction = (targetOffset - left.srcTime) / span;
+            return qMax(0.0, left.outTime
+                                 + fraction * (right.outTime - left.outTime));
+        }
+        const auto nearest = std::min_element(
+            keys.cbegin(), keys.cend(), [targetOffset](const auto &a, const auto &b) {
+                return qAbs(a.srcTime - targetOffset) < qAbs(b.srcTime - targetOffset);
+            });
+        return nearest == keys.cend() ? 0.0 : qMax(0.0, nearest->outTime);
+    }
+
+    const double uniformSpeed = (speed > 0.0) ? speed : 1.0;
+    if (speedRamp.isIdentity())
+        return targetOffset / uniformSpeed;
+    const qint64 sourceOffsetUs = qRound64(targetOffset * 1'000'000.0);
+    return qMax(0.0, static_cast<double>(
+        speedRamp.sourceToTimelineUs(sourceOffsetUs))
+        / uniformSpeed / 1'000'000.0);
+}
+
+bool ClipInfo::sourceTimeRunsBackwardAtLocalTime(double localSec) const
+{
+    const double localDuration = qMax(0.0, effectiveDuration());
+    const double boundedLocal = qBound(0.0, localSec, localDuration);
+    const double currentSource = sourceSecondAtLocalTime(boundedLocal);
+    constexpr double probeSec = 0.000001;
+    constexpr double sourceEpsilon = 1e-12;
+
+    if (boundedLocal < localDuration) {
+        const double nextLocal = qMin(localDuration, boundedLocal + probeSec);
+        const double delta = sourceSecondAtLocalTime(nextLocal) - currentSource;
+        if (qAbs(delta) > sourceEpsilon)
+            return delta < 0.0;
+    }
+    if (boundedLocal > 0.0) {
+        const double previousLocal = qMax(0.0, boundedLocal - probeSec);
+        const double delta = currentSource - sourceSecondAtLocalTime(previousLocal);
+        if (qAbs(delta) > sourceEpsilon)
+            return delta < 0.0;
+    }
+    return false;
+}
+
+namespace audioxfade {
+
+namespace {
+
+bool validAudioFadeDuration(double durationSec, QString *errorOut)
+{
+    if (!std::isfinite(durationSec) || durationSec <= 0.0) {
+        if (errorOut)
+            *errorOut = QStringLiteral("フェード時間は 0 より大きい有限値で指定してください");
+        return false;
+    }
+    return true;
+}
+
+} // namespace
+
+bool applyCrossfade(QVector<ClipInfo> &clips, int clipIndexA,
+                    double durationSec, QString *errorOut)
+{
+    if (!validAudioFadeDuration(durationSec, errorOut))
+        return false;
+    if (clipIndexA < 0 || clipIndexA + 1 >= clips.size()) {
+        if (errorOut)
+            *errorOut = QStringLiteral("クロスフェードには隣接する A/B クリップが必要です");
+        return false;
+    }
+
+    Transition transition;
+    transition.type = TransitionType::CrossDissolve;
+    transition.duration = durationSec;
+    clips[clipIndexA].trailOut = transition;
+    clips[clipIndexA + 1].leadIn = transition;
+    return true;
+}
+
+bool applyFade(QVector<ClipInfo> &clips, int clipIndex,
+               AudioFadeEdge edge, double durationSec, QString *errorOut)
+{
+    if (!validAudioFadeDuration(durationSec, errorOut))
+        return false;
+    if (clipIndex < 0 || clipIndex >= clips.size()) {
+        if (errorOut)
+            *errorOut = QStringLiteral("音声クリップの index が範囲外です");
+        return false;
+    }
+
+    Transition transition;
+    transition.type = edge == AudioFadeEdge::In
+        ? TransitionType::FadeIn : TransitionType::FadeOut;
+    transition.duration = durationSec;
+    if (edge == AudioFadeEdge::In)
+        clips[clipIndex].leadIn = transition;
+    else
+        clips[clipIndex].trailOut = transition;
+    return true;
+}
+
+} // namespace audioxfade
 
 namespace {
 // Transition badge geometry. The badge width grows with duration so the
@@ -213,7 +379,85 @@ QAction *addAudioChannelModeAction(QMenu *menu,
     act->setChecked(current == mode);
     return act;
 }
+
+QAction *addClipLabelAction(QMenu *menu, ClipLabel current, ClipLabel label)
+{
+    QAction *act = menu->addAction(clipLabelName(label));
+    act->setCheckable(true);
+    act->setChecked(current == label);
+    return act;
+}
 } // namespace
+
+QColor clipLabelColor(ClipLabel label)
+{
+    switch (label) {
+    case ClipLabel::Red:    return QColor(0xD9, 0x4B, 0x4B);
+    case ClipLabel::Orange: return QColor(0xE5, 0x8A, 0x3A);
+    case ClipLabel::Yellow: return QColor(0xD7, 0xB8, 0x4A);
+    case ClipLabel::Green:  return QColor(0x53, 0xA8, 0x5B);
+    case ClipLabel::Cyan:   return QColor(0x36, 0xA9, 0xB7);
+    case ClipLabel::Blue:   return QColor(0x4B, 0x78, 0xD1);
+    case ClipLabel::Purple: return QColor(0x8A, 0x5A, 0xBD);
+    case ClipLabel::Pink:   return QColor(0xD6, 0x5B, 0x9E);
+    case ClipLabel::None:   return QColor();
+    }
+    return QColor();
+}
+
+QString clipLabelName(ClipLabel label)
+{
+    switch (label) {
+    case ClipLabel::None:   return QStringLiteral("なし");
+    case ClipLabel::Red:    return QStringLiteral("赤");
+    case ClipLabel::Orange: return QStringLiteral("オレンジ");
+    case ClipLabel::Yellow: return QStringLiteral("黄");
+    case ClipLabel::Green:  return QStringLiteral("緑");
+    case ClipLabel::Cyan:   return QStringLiteral("シアン");
+    case ClipLabel::Blue:   return QStringLiteral("青");
+    case ClipLabel::Purple: return QStringLiteral("紫");
+    case ClipLabel::Pink:   return QStringLiteral("ピンク");
+    }
+    return QStringLiteral("なし");
+}
+
+ClipLabel clipLabelFromString(const QString &value)
+{
+    const QString normalized = value.trimmed().toLower();
+    if (normalized == QStringLiteral("red"))
+        return ClipLabel::Red;
+    if (normalized == QStringLiteral("orange"))
+        return ClipLabel::Orange;
+    if (normalized == QStringLiteral("yellow"))
+        return ClipLabel::Yellow;
+    if (normalized == QStringLiteral("green"))
+        return ClipLabel::Green;
+    if (normalized == QStringLiteral("cyan"))
+        return ClipLabel::Cyan;
+    if (normalized == QStringLiteral("blue"))
+        return ClipLabel::Blue;
+    if (normalized == QStringLiteral("purple"))
+        return ClipLabel::Purple;
+    if (normalized == QStringLiteral("pink"))
+        return ClipLabel::Pink;
+    return ClipLabel::None;
+}
+
+QString clipLabelToString(ClipLabel label)
+{
+    switch (label) {
+    case ClipLabel::None:   return QStringLiteral("none");
+    case ClipLabel::Red:    return QStringLiteral("red");
+    case ClipLabel::Orange: return QStringLiteral("orange");
+    case ClipLabel::Yellow: return QStringLiteral("yellow");
+    case ClipLabel::Green:  return QStringLiteral("green");
+    case ClipLabel::Cyan:   return QStringLiteral("cyan");
+    case ClipLabel::Blue:   return QStringLiteral("blue");
+    case ClipLabel::Purple: return QStringLiteral("purple");
+    case ClipLabel::Pink:   return QStringLiteral("pink");
+    }
+    return QStringLiteral("none");
+}
 
 namespace timeline_nesting {
 namespace {
@@ -298,6 +542,106 @@ QString resolveSequenceRefId(const ClipInfo &clip)
     if (!clip.sequenceRefId.isEmpty())
         return clip.sequenceRefId;
     return timeline_nesting::sequenceIdFromClipFilePath(clip.filePath);
+}
+
+struct NestedSequenceIntervalMapping {
+    double timelineStart = 0.0;
+    double timelineEnd = 0.0;
+    bool runsBackward = false;
+};
+
+NestedSequenceIntervalMapping mapNestedSequenceInterval(
+    const ClipInfo &parentClip,
+    double parentTimelineStart,
+    double sourceIn,
+    double overlapStart,
+    double overlapEnd,
+    double parentSpeed,
+    bool reverseCompositionActive)
+{
+    // Preserve the legacy flattening arithmetic exactly while reverse is OFF.
+    // Once either side participates in reverse, resolve the parent's authored
+    // time-remap as well: a descending non-reversed parent composed with a
+    // reversed child runs forward and must keep video/audio on the same nested
+    // interval. The renderer enters the same shared mapper only when this
+    // reverse-composition flag is active, keeping reverse-OFF projects on the
+    // exact legacy path.
+    if (!reverseCompositionActive) {
+        return {
+            parentTimelineStart + (overlapStart - sourceIn) / parentSpeed,
+            parentTimelineStart + (overlapEnd - sourceIn) / parentSpeed,
+            false
+        };
+    }
+
+    // A one-key time-remap is a hold. Its inverse is not a point-to-point
+    // function: every output time maps to the same source time. Inverting both
+    // source boundaries therefore returns the same key time and collapses the
+    // flattened preview entry to zero length, while the recursive renderer
+    // correctly keeps drawing the hold. Preserve the authored half-open
+    // timeline interval for this degenerate inverse so preview and export both
+    // retain a live [start, end) entry.
+    if (parentClip.timeRemapCurve.keys.size() == 1) {
+        return {
+            parentTimelineStart + (overlapStart - sourceIn) / parentSpeed,
+            parentTimelineStart + (overlapEnd - sourceIn) / parentSpeed,
+            false
+        };
+    }
+
+    const double localAtSourceStart =
+        parentClip.localSecondAtSourceTime(overlapStart);
+    const double localAtSourceEnd =
+        parentClip.localSecondAtSourceTime(overlapEnd);
+    return {
+        parentTimelineStart + qMin(localAtSourceStart, localAtSourceEnd),
+        parentTimelineStart + qMax(localAtSourceStart, localAtSourceEnd),
+        localAtSourceEnd + 1e-9 < localAtSourceStart
+    };
+}
+
+bool sequenceContainsReversedClip(
+    const QVector<TimelineSequence> &sequences,
+    const QString &sequenceId,
+    bool audio,
+    QVector<QString> &visited,
+    int depth = 0)
+{
+    if (sequenceId.isEmpty() || depth > 8
+        || visited.contains(sequenceId)) {
+        return false;
+    }
+    const TimelineSequence *sequence = nullptr;
+    for (const TimelineSequence &candidate : sequences) {
+        if (candidate.id == sequenceId) {
+            sequence = &candidate;
+            break;
+        }
+    }
+    if (!sequence)
+        return false;
+
+    visited.append(sequenceId);
+    const QVector<QVector<ClipInfo>> &tracks = audio
+        ? sequence->audioTracks : sequence->videoTracks;
+    for (const QVector<ClipInfo> &track : tracks) {
+        for (const ClipInfo &child : track) {
+            if (child.reversed) {
+                visited.removeLast();
+                return true;
+            }
+            if (!child.isSequenceReference())
+                continue;
+            if (sequenceContainsReversedClip(
+                    sequences, resolveSequenceRefId(child), audio,
+                    visited, depth + 1)) {
+                visited.removeLast();
+                return true;
+            }
+        }
+    }
+    visited.removeLast();
+    return false;
 }
 
 void upsertSequence(QVector<TimelineSequence> &sequences,
@@ -617,12 +961,39 @@ QString buildExportAudioMixEntryFilterChain(int inputIndex,
                                             const QString &clipOut,
                                             int delayMs,
                                             const QString &volumeExpression,
-                                            AudioChannelMode mode)
+                                            AudioChannelMode mode,
+                                            bool reversed,
+                                            double speed,
+                                            TransitionType leadInType,
+                                            double leadInDuration,
+                                            TransitionType trailOutType,
+                                            double trailOutDuration)
 {
     QStringList filters;
     filters << QStringLiteral("atrim=start=%1:end=%2")
-                   .arg(clipIn, clipOut)
-            << QStringLiteral("asetpts=PTS-STARTPTS")
+                   .arg(clipIn, clipOut);
+    if (reversed) {
+        filters << QStringLiteral("areverse");
+        // Reversed preview consumes its buffered PCM at the clip's uniform
+        // speed. Mirror that order for export: reverse first, then change
+        // duration. Split factors to remain compatible with FFmpeg versions
+        // whose atempo range is 0.5..2.0.
+        double remainingSpeed = std::isfinite(speed) && speed > 0.0
+            ? speed : 1.0;
+        while (remainingSpeed < 0.5) {
+            filters << QStringLiteral("atempo=0.5");
+            remainingSpeed /= 0.5;
+        }
+        while (remainingSpeed > 2.0) {
+            filters << QStringLiteral("atempo=2");
+            remainingSpeed /= 2.0;
+        }
+        if (remainingSpeed != 1.0) {
+            filters << QStringLiteral("atempo=%1").arg(
+                QString::number(remainingSpeed, 'g', 15));
+        }
+    }
+    filters << QStringLiteral("asetpts=PTS-STARTPTS")
             << QStringLiteral("aresample=48000")
             << QStringLiteral("aformat=sample_fmts=fltp:channel_layouts=stereo");
 
@@ -631,6 +1002,31 @@ QString buildExportAudioMixEntryFilterChain(int inputIndex,
         filters << panFilter;
 
     filters << QStringLiteral("volume='%1':eval=frame").arg(volumeExpression);
+
+    // Audio-only fades use the same equal-power characteristic as
+    // AudioMixer's sqrt gain. FFmpeg's qsin curve is the matching export
+    // implementation. Keep these filters after areverse/atempo so their
+    // durations are expressed in timeline-time. Defaults add nothing, which
+    // preserves the legacy chain byte-for-byte for clips without fades.
+    const bool leadFade = (leadInType == TransitionType::FadeIn
+                           || leadInType == TransitionType::CrossDissolve)
+        && std::isfinite(leadInDuration) && leadInDuration > 0.0;
+    const bool trailFade = (trailOutType == TransitionType::FadeOut
+                            || trailOutType == TransitionType::CrossDissolve)
+        && std::isfinite(trailOutDuration) && trailOutDuration > 0.0;
+    if (leadFade) {
+        filters << QStringLiteral("afade=t=in:curve=qsin:d=%1")
+                       .arg(QString::number(leadInDuration, 'g', 15));
+    }
+    if (trailFade) {
+        const double clipDuration = std::isfinite(speed) && speed > 0.0
+            ? qMax(0.0, (clipOut.toDouble() - clipIn.toDouble()) / speed)
+            : qMax(0.0, clipOut.toDouble() - clipIn.toDouble());
+        const double start = qMax(0.0, clipDuration - trailOutDuration);
+        filters << QStringLiteral("afade=t=out:curve=qsin:st=%1:d=%2")
+                       .arg(QString::number(start, 'g', 15),
+                            QString::number(trailOutDuration, 'g', 15));
+    }
 
     if (delayMs > 0)
         filters << QStringLiteral("adelay=%1:all=1").arg(delayMs);
@@ -1861,6 +2257,7 @@ void TimelineTrack::paintEvent(QPaintEvent *event)
     QPainter painter(this);
     painter.setRenderHint(QPainter::Antialiasing);
     const QRect visibleRect = event ? event->rect() : QRect(0, 0, width(), height());
+    QVector<QPair<QRect, QColor>> labelBars;
     int x = 0;
     for (int i = 0; i < m_clips.size(); ++i) {
         // Leading gap (leadInSec) before this clip, created by left-trim so the
@@ -1885,6 +2282,8 @@ void TimelineTrack::paintEvent(QPaintEvent *event)
                              || !m_clips[i].effects.isEmpty();
         QColor color = hasEffects ? QColor(0x44, 0xAA, 0x88)
                                   : QColor(0x44, 0x88, 0xCC);
+        if (m_clips[i].label != ClipLabel::None)
+            color = clipLabelColor(m_clips[i].label);
         const bool isSelected = m_selectedClips.contains(i);
         if (isSelected) color = color.lighter(140);
         if (m_dragMode == DragMode::MoveClip && i == m_dropTargetIndex) {
@@ -1892,6 +2291,11 @@ void TimelineTrack::paintEvent(QPaintEvent *event)
             painter.drawLine(x, 0, x, m_rowHeight);
         }
         painter.fillRect(clipRect, color);
+        if (m_clips[i].label != ClipLabel::None) {
+            labelBars.append(qMakePair(
+                QRect(x, clipRect.bottom() - 2, clipWidth, 3),
+                clipLabelColor(m_clips[i].label)));
+        }
         // Premiere-style effect indicator: a 3 px purple bar along the top
         // edge of any clip with a non-default color correction OR any video
         // effect applied. The bar spans the full clip width so the user can
@@ -1944,7 +2348,9 @@ void TimelineTrack::paintEvent(QPaintEvent *event)
         double dur = m_clips[i].effectiveDuration();
         int mins = static_cast<int>(dur) / 60;
         int secs = static_cast<int>(dur) % 60;
-        QString label = m_clips[i].displayName;
+        QString label = m_clips[i].reversed
+            ? QStringLiteral("◀ ") + m_clips[i].displayName
+            : m_clips[i].displayName;
         if (m_clips[i].speed != 1.0)
             label += QString(" [%1x]").arg(m_clips[i].speed, 0, 'f', 1);
         label += QString(" %1:%2").arg(mins, 2, 10, QChar('0')).arg(secs, 2, 10, QChar('0'));
@@ -1995,6 +2401,7 @@ void TimelineTrack::paintEvent(QPaintEvent *event)
                 case TransitionType::WhipPanLeft:        return "<<";
                 case TransitionType::WhipPanRight:       return ">>";
                 case TransitionType::Glitch:             return "G!";
+                case TransitionType::MorphCut:           return "MC";
                 case TransitionType::LightLeak:          return "LL";
                 case TransitionType::FlipHorizontal:     return "FH";
                 case TransitionType::FlipVertical:       return "FV";
@@ -2154,6 +2561,12 @@ void TimelineTrack::paintEvent(QPaintEvent *event)
     // Resize handle hint at the bottom edge of the track. A faint horizontal
     // bar tells the user the row height can be dragged here.
     painter.fillRect(0, height() - 2, width(), 2, QColor(70, 70, 70));
+
+    // Labelled clips reclaim their own bottom 3 px after the shared resize
+    // affordance is painted. With no labels this loop is empty, preserving the
+    // exact legacy paint sequence and pixels.
+    for (const auto &labelBar : std::as_const(labelBars))
+        painter.fillRect(labelBar.first, labelBar.second);
 
     // Snap line visual feedback — yellow vertical line fading over 200 ms.
     if (m_timeline) {
@@ -3329,6 +3742,7 @@ QWidget *Timeline::createTrackHeader(TimelineTrack *track, const QString &name, 
     // When locked, mousePressEvent/dropEvent on the track early-return so
     // drag/trim/split/drop edits are blocked — playback is unaffected.
     auto *lockBtn = new QPushButton(QString::fromUtf8("\xF0\x9F\x94\x93"), w); // 🔓
+    lockBtn->setObjectName(QStringLiteral("timelineTrackLockButton"));
     lockBtn->setFixedSize(28, 28);
     lockBtn->setCheckable(true);
     lockBtn->setToolTip(QStringLiteral("編集ロック"));
@@ -3338,13 +3752,13 @@ QWidget *Timeline::createTrackHeader(TimelineTrack *track, const QString &name, 
         "QPushButton:hover { background-color: #555; }"
         "QPushButton:checked { background-color: #cc8; color: #222; border: 1px solid #ffd; }");
 
-    // Audio rows get a mute toggle; video rows get a hide toggle. Previously
-    // both rows carried both icons which had no semantic fit on the wrong
-    // track type.
+    // Audio rows get mute/solo toggles; video rows get a hide toggle.
     QPushButton *muteBtn = nullptr;
+    QPushButton *soloBtn = nullptr;
     QPushButton *hideBtn = nullptr;
     if (isAudioRow) {
         muteBtn = new QPushButton(QString::fromUtf8("\xF0\x9F\x94\x8A"), w); // 🔊
+        muteBtn->setObjectName(QStringLiteral("timelineTrackMuteButton"));
         muteBtn->setFixedSize(28, 28);
         muteBtn->setCheckable(true);
         muteBtn->setToolTip(QStringLiteral("ミュート (audio)"));
@@ -3353,8 +3767,20 @@ QWidget *Timeline::createTrackHeader(TimelineTrack *track, const QString &name, 
             "  border-radius: 3px; font-size: 14px; padding: 0; }"
             "QPushButton:hover { background-color: #555; }"
             "QPushButton:checked { background-color: #c44; color: white; border: 1px solid #f88; }");
+
+        soloBtn = new QPushButton(QStringLiteral("S"), w);
+        soloBtn->setObjectName(QStringLiteral("timelineTrackSoloButton"));
+        soloBtn->setFixedSize(28, 28);
+        soloBtn->setCheckable(true);
+        soloBtn->setToolTip(QStringLiteral("ソロ（音声）"));
+        soloBtn->setStyleSheet(
+            "QPushButton { background-color: #444; color: #ddd; border: 1px solid #666;"
+            "  border-radius: 3px; font-size: 13px; font-weight: bold; padding: 0; }"
+            "QPushButton:hover { background-color: #555; }"
+            "QPushButton:checked { background-color: #ca3; color: #222; border: 1px solid #fd6; }");
     } else {
         hideBtn = new QPushButton(QString::fromUtf8("\xE2\x97\x89"), w); // ◉
+        hideBtn->setObjectName(QStringLiteral("timelineTrackHideButton"));
         hideBtn->setFixedSize(28, 28);
         hideBtn->setCheckable(true);
         hideBtn->setToolTip(QStringLiteral("非表示 (hide video)"));
@@ -3372,12 +3798,14 @@ QWidget *Timeline::createTrackHeader(TimelineTrack *track, const QString &name, 
 
     hbox->addWidget(lockBtn);
     if (muteBtn) hbox->addWidget(muteBtn);
+    if (soloBtn) hbox->addWidget(soloBtn);
     if (hideBtn) hbox->addWidget(hideBtn);
     hbox->addWidget(label, 1);
 
     QPointer<TimelineTrack> trackPtr(track);
     QPointer<QPushButton> lockBtnPtr(lockBtn);
     QPointer<QPushButton> muteBtnPtr(muteBtn);
+    QPointer<QPushButton> soloBtnPtr(soloBtn);
     QPointer<QPushButton> hideBtnPtr(hideBtn);
     QPointer<QWidget> headerPtr(w);
 
@@ -3413,6 +3841,20 @@ QWidget *Timeline::createTrackHeader(TimelineTrack *track, const QString &name, 
             scheduleEmitSequenceChanged();
         });
     }
+    if (soloBtn) {
+        connect(soloBtn, &QPushButton::toggled, this,
+                [this, trackPtr, soloBtnPtr](bool checked) {
+            if (!trackPtr)
+                return;
+            qInfo() << "Timeline: solo toggled =" << checked
+                    << "track=" << trackPtr.data();
+            const int trackIndex = m_audioTracks.indexOf(trackPtr.data());
+            if (trackIndex >= 0)
+                toggleSoloTrack(trackIndex);
+            if (soloBtnPtr)
+                soloBtnPtr->setChecked(trackPtr->isSolo());
+        });
+    }
     if (hideBtn) {
         connect(hideBtn, &QPushButton::toggled, this, [this, trackPtr, hideBtnPtr](bool checked) {
             if (!trackPtr) return;
@@ -3428,7 +3870,41 @@ QWidget *Timeline::createTrackHeader(TimelineTrack *track, const QString &name, 
         });
     }
 
+    m_trackHeaders.insert(track, w);
+    syncTrackHeaderFlags(track);
+
     return w;
+}
+
+void Timeline::syncTrackHeaderFlags(TimelineTrack *track)
+{
+    QWidget *header = m_trackHeaders.value(track, nullptr);
+    if (!track || !header)
+        return;
+
+    auto syncButton = [header](const QString &objectName, bool checked,
+                               const QString &onText, const QString &offText) {
+        auto *button = header->findChild<QPushButton *>(objectName,
+                                                        Qt::FindDirectChildrenOnly);
+        if (!button)
+            return;
+        const bool wasBlocked = button->blockSignals(true);
+        button->setChecked(checked);
+        button->setText(checked ? onText : offText);
+        button->blockSignals(wasBlocked);
+    };
+
+    syncButton(QStringLiteral("timelineTrackLockButton"), track->isLocked(),
+               QString::fromUtf8("\xF0\x9F\x94\x92"), // 🔒
+               QString::fromUtf8("\xF0\x9F\x94\x93")); // 🔓
+    syncButton(QStringLiteral("timelineTrackMuteButton"), track->isMuted(),
+               QString::fromUtf8("\xF0\x9F\x94\x87"), // 🔇
+               QString::fromUtf8("\xF0\x9F\x94\x8A")); // 🔊
+    syncButton(QStringLiteral("timelineTrackSoloButton"), track->isSolo(),
+               QStringLiteral("S"), QStringLiteral("S"));
+    syncButton(QStringLiteral("timelineTrackHideButton"), track->isHidden(),
+               QString::fromUtf8("\xE2\x8A\x98"), // ⊘
+               QString::fromUtf8("\xE2\x97\x89")); // ◉
 }
 
 void Timeline::addVideoTrack()
@@ -3695,6 +4171,94 @@ void Timeline::applyDuckingFromTrack(int voiceTrackIdx,
     }
 }
 
+namespace {
+
+struct TimelineMediaProbe {
+    bool openedOk = false;
+    bool videoStreamFound = false;
+    bool audioStreamFound = false;
+    bool wantsAutoProxy = false;
+    double durationSec = 0.0;
+    int videoWidth = 0;
+    int videoHeight = 0;
+    int primaries = 0;
+    int transferCharacteristic = 0;
+    int bitDepth = 8;
+    bool hasHdrMetadata = false;
+    bool hasAlpha = false;
+};
+
+// import_media とクリップ置き換えで共有する同期 probe。ストリーム有無・尺・
+// 映像メタデータを 1 回の avformat open から取得し、呼び出し側が同じ判定を使う。
+TimelineMediaProbe probeTimelineMedia(const QString &filePath)
+{
+    TimelineMediaProbe result;
+    AVFormatContext *formatContext = nullptr;
+    if (avformat_open_input(&formatContext, filePath.toUtf8().constData(),
+                            nullptr, nullptr) != 0) {
+        return result;
+    }
+
+    result.openedOk = true;
+    const bool streamInfoAvailable =
+        avformat_find_stream_info(formatContext, nullptr) >= 0;
+    if (streamInfoAvailable && formatContext->duration > 0) {
+        result.durationSec = static_cast<double>(formatContext->duration)
+            / AV_TIME_BASE;
+    }
+
+    for (unsigned i = 0; i < formatContext->nb_streams; ++i) {
+        const AVStream *stream = formatContext->streams[i];
+        if (!stream || !stream->codecpar)
+            continue;
+        if (streamInfoAvailable && formatContext->duration <= 0
+            && stream->duration > 0) {
+            const double streamDurationSec =
+                stream->duration * av_q2d(stream->time_base);
+            if (std::isfinite(streamDurationSec) && streamDurationSec > 0.0)
+                result.durationSec = qMax(result.durationSec, streamDurationSec);
+        }
+        if (stream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+            result.audioStreamFound = true;
+            continue;
+        }
+        if (stream->codecpar->codec_type != AVMEDIA_TYPE_VIDEO
+            || result.videoStreamFound) {
+            continue;
+        }
+
+        result.videoStreamFound = true;
+        result.videoWidth = stream->codecpar->width;
+        result.videoHeight = stream->codecpar->height;
+        const hdringest::ColorInputs colorInputs =
+            hdringest::captureColorInputs(stream->codecpar);
+        result.primaries = colorInputs.primaries;
+        result.transferCharacteristic = colorInputs.trc;
+        result.bitDepth = colorInputs.bitDepth;
+        result.hasHdrMetadata = colorInputs.hasHdrMeta;
+
+        const AVPixFmtDescriptor *pixelDescriptor = av_pix_fmt_desc_get(
+            static_cast<AVPixelFormat>(stream->codecpar->format));
+        const bool alphaByPixelFormat = pixelDescriptor
+            && (pixelDescriptor->flags & AV_PIX_FMT_FLAG_ALPHA) != 0;
+        const bool alphaByCodec = stream->codecpar->codec_id == AV_CODEC_ID_QTRLE
+            || stream->codecpar->codec_id == AV_CODEC_ID_PNG;
+        result.hasAlpha = alphaByPixelFormat || alphaByCodec;
+
+        const bool isAv1 = stream->codecpar->codec_id == AV_CODEC_ID_AV1;
+        const bool isQhdPlus = result.videoWidth >= 2560
+            || result.videoHeight >= 1440;
+        const bool isHdPlus = result.videoWidth >= 1920
+            || result.videoHeight >= 1080;
+        result.wantsAutoProxy = isAv1 || isQhdPlus || isHdPlus;
+    }
+
+    avformat_close_input(&formatContext);
+    return result;
+}
+
+} // namespace
+
 bool Timeline::importMedia(const QString &filePath,
                            int requestedTrackIndex,
                            double requestedStartSec,
@@ -3719,8 +4283,6 @@ bool Timeline::importMedia(const QString &filePath,
         return fail(QStringLiteral("startSec must be non-negative"));
     }
 
-    AVFormatContext *fmt = nullptr;
-    double duration = 0.0;
     // Phase 1e Win #11 — auto-proxy for heavy video sources. AV1 SW/HW
     // decode runs 4–10x heavier than H.264 (no SIMD-friendly inverse
     // transforms in libdav1d; the D3D11VA path still pays full-res
@@ -3737,67 +4299,20 @@ bool Timeline::importMedia(const QString &filePath,
     // VEDITOR_AUTO_PROXY_DISABLE=1 in case a user wants to skip the
     // first-import encode wait, and gated on resolution/codec to avoid
     // generating proxies for clips that already play smoothly.
-    bool wantsAutoProxy = false;
-    bool videoStreamFound = false;
-    bool audioStreamFound = false;
-    bool openedOk = false;
-    int capturedPrimaries = 0;
-    int capturedTrc = 0;
-    int capturedBitDepth = 8;
-    bool capturedHasHdrMeta = false;
-    bool capturedHasAlpha = false;
-    // ソース映像の素のピクセル寸法 (アスペクト既定フィット判定用)。probe ループで
-    // 最初の映像ストリームから捕捉する。0 = 未取得 (probe 失敗/静止画非対応など)。
-    int srcVideoW = 0;
-    int srcVideoH = 0;
-    if (avformat_open_input(&fmt, filePath.toUtf8().constData(), nullptr, nullptr) == 0) {
-        openedOk = true;
-        if (avformat_find_stream_info(fmt, nullptr) >= 0 && fmt->duration > 0)
-            duration = static_cast<double>(fmt->duration) / AV_TIME_BASE;
-        for (unsigned i = 0; i < fmt->nb_streams; ++i) {
-            const AVStream *st = fmt->streams[i];
-            if (!st || !st->codecpar)
-                continue;
-            if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
-                audioStreamFound = true;
-                continue;
-            }
-            if (st->codecpar->codec_type != AVMEDIA_TYPE_VIDEO || videoStreamFound)
-                continue;
-            const int w = st->codecpar->width;
-            const int h = st->codecpar->height;
-            videoStreamFound = true;
-            srcVideoW = w;
-            srcVideoH = h;
-            const hdringest::ColorInputs colorInputs =
-                hdringest::captureColorInputs(st->codecpar);
-            capturedPrimaries = colorInputs.primaries;
-            capturedTrc = colorInputs.trc;
-            capturedBitDepth = colorInputs.bitDepth;
-            capturedHasHdrMeta = colorInputs.hasHdrMeta;
-            const AVPixFmtDescriptor *pixelDescriptor = av_pix_fmt_desc_get(
-                static_cast<AVPixelFormat>(st->codecpar->format));
-            const bool alphaByPixelFormat = pixelDescriptor
-                && (pixelDescriptor->flags & AV_PIX_FMT_FLAG_ALPHA) != 0;
-            const bool alphaByCodec = st->codecpar->codec_id == AV_CODEC_ID_QTRLE
-                || st->codecpar->codec_id == AV_CODEC_ID_PNG;
-            capturedHasAlpha = alphaByPixelFormat || alphaByCodec;
-            const bool isAv1  = st->codecpar->codec_id == AV_CODEC_ID_AV1;
-            const bool isQhdPlus = (w >= 2560) || (h >= 1440);
-            // h.264 1080p+ も対象 (cinemascope や ultra-wide 含めるため OR)。
-            // 1920×800 シネスコや 3840×800 ultra-wide も raw decode 負荷は
-            // 1080p に匹敵するので bandwidth 観点で OR の方が semantic に近い。
-            // single-track 編集なら直接 decode で問題ないが、PiP 4 並列の中に
-            // 1080p raw が混ざると compose に追いつかなくなり smooth な PiP
-            // source (proxy 360p) と並べたとき差が出る。MultiTrackOnly mode の
-            // videoTrackIdx >= 1 gate (下記 switch) が V1 単体編集を保護する
-            // ので過剰 encode は起きない。
-            const bool isHdPlus = (w >= 1920) || (h >= 1080);
-            if (isAv1 || isQhdPlus || isHdPlus)
-                wantsAutoProxy = true;
-        }
-        avformat_close_input(&fmt);
-    }
+    const TimelineMediaProbe mediaProbe = probeTimelineMedia(filePath);
+    const double duration = mediaProbe.durationSec;
+    const bool wantsAutoProxy = mediaProbe.wantsAutoProxy;
+    const bool videoStreamFound = mediaProbe.videoStreamFound;
+    const bool audioStreamFound = mediaProbe.audioStreamFound;
+    const bool openedOk = mediaProbe.openedOk;
+    const int capturedPrimaries = mediaProbe.primaries;
+    const int capturedTrc = mediaProbe.transferCharacteristic;
+    const int capturedBitDepth = mediaProbe.bitDepth;
+    const bool capturedHasHdrMeta = mediaProbe.hasHdrMetadata;
+    const bool capturedHasAlpha = mediaProbe.hasAlpha;
+    // ソース映像の素のピクセル寸法 (アスペクト既定フィット判定用)。0 = 未取得。
+    const int srcVideoW = mediaProbe.videoWidth;
+    const int srcVideoH = mediaProbe.videoHeight;
     // MCP (Auto / VideoOnly / AudioOnly) は開けないファイルを拒否して 0 秒クリップを
     // 作らない。GUI の LinkedPair は従来どおり (既存のセルフテストが仮ファイルを
     // addClip で置く前提を保つ)。
@@ -4927,6 +5442,583 @@ bool Timeline::setClipPropertyByIndex(bool audio, int trackIndex, int clipIndex,
     return true;
 }
 
+bool Timeline::setClipReversed(TrackKind kind, int trackIndex, int clipIndex,
+                               bool reversed, bool applyToLinked)
+{
+    TimelineTrack *track = trackAt(kind == TrackKind::Audio, trackIndex);
+    if (!track || track->isLocked()
+        || clipIndex < 0 || clipIndex >= track->clipCount()) {
+        return false;
+    }
+
+    const QVector<ClipInfo> targetClips = track->clips();
+    const int linkGroup = targetClips[clipIndex].linkGroup;
+    QVector<TimelineTrack *> affectedTracks{track};
+    if (applyToLinked && linkGroup > 0) {
+        const QVector<TimelineTrack *> allTracks = m_videoTracks + m_audioTracks;
+        for (TimelineTrack *candidateTrack : allTracks) {
+            if (!candidateTrack || candidateTrack == track)
+                continue;
+            const auto &clips = candidateTrack->clips();
+            const bool hasLinkedClip = std::any_of(
+                clips.cbegin(), clips.cend(), [linkGroup](const ClipInfo &clip) {
+                    return clip.linkGroup == linkGroup;
+                });
+            if (!hasLinkedClip)
+                continue;
+            if (candidateTrack->isLocked())
+                return false;
+            affectedTracks.append(candidateTrack);
+        }
+    }
+
+    bool needsChange = false;
+    for (TimelineTrack *affected : affectedTracks) {
+        const auto &clips = affected->clips();
+        for (int i = 0; i < clips.size(); ++i) {
+            const bool isTarget = affected == track && i == clipIndex;
+            const bool isLinked = applyToLinked && linkGroup > 0
+                && clips[i].linkGroup == linkGroup;
+            if ((isTarget || isLinked) && clips[i].reversed != reversed) {
+                needsChange = true;
+                break;
+            }
+        }
+        if (needsChange)
+            break;
+    }
+    if (!needsChange)
+        return true;
+
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    for (TimelineTrack *affected : affectedTracks) {
+        QVector<ClipInfo> clips = affected->clips();
+        for (int i = 0; i < clips.size(); ++i) {
+            const bool isTarget = affected == track && i == clipIndex;
+            const bool isLinked = applyToLinked && linkGroup > 0
+                && clips[i].linkGroup == linkGroup;
+            if (isTarget || isLinked)
+                clips[i].reversed = reversed;
+        }
+        affected->setClips(clips);
+    }
+
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+    saveUndoState(QStringLiteral("逆再生"));
+    updateInfoLabel();
+    scheduleEmitSequenceChanged();
+    return true;
+}
+
+bool Timeline::setClipAutoOrientEnabled(TrackKind kind, int trackIndex,
+                                        int clipIndex, bool enabled)
+{
+    TimelineTrack *track = trackAt(kind == TrackKind::Audio, trackIndex);
+    if (!track || track->isLocked()
+        || clipIndex < 0 || clipIndex >= track->clipCount()) {
+        return false;
+    }
+
+    const QVector<ClipInfo> currentClips = track->clips();
+    if (currentClips[clipIndex].autoOrientEnabled == enabled)
+        return true;
+
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    QVector<ClipInfo> clips = currentClips;
+    clips[clipIndex].autoOrientEnabled = enabled;
+    track->setClips(clips);
+
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+    saveUndoState(QStringLiteral("パスに沿って自動回転"));
+    updateInfoLabel();
+    scheduleEmitSequenceChanged();
+    return true;
+}
+
+bool Timeline::matchFrame(double timelineSec, MatchFrameResult *result,
+                          QString *errorOut) const
+{
+    if (result)
+        *result = MatchFrameResult{};
+    if (errorOut)
+        errorOut->clear();
+    const auto fail = [errorOut](const QString &message) {
+        if (errorOut)
+            *errorOut = message;
+        return false;
+    };
+    if (!std::isfinite(timelineSec) || timelineSec < 0.0)
+        return fail(QStringLiteral("タイムライン時刻が不正です"));
+
+    QVector<int> trackOrder;
+    const auto appendTrack = [&trackOrder, this](int index) {
+        if (index >= 0 && index < m_videoTracks.size()
+            && m_videoTracks.at(index) && !trackOrder.contains(index)) {
+            trackOrder.append(index);
+        }
+    };
+
+    // 最後にユーザーが選択した動画トラックを最優先にし、選択情報が復元された
+    // 直後など active index が無い場合も selectedClip() から拾う。
+    if (m_activeVideoTrackIndex >= 0
+        && m_activeVideoTrackIndex < m_videoTracks.size()
+        && m_videoTracks.at(m_activeVideoTrackIndex)
+        && m_videoTracks.at(m_activeVideoTrackIndex)->selectedClip() >= 0) {
+        appendTrack(m_activeVideoTrackIndex);
+    }
+    for (int i = 0; i < m_videoTracks.size(); ++i) {
+        if (m_videoTracks.at(i) && m_videoTracks.at(i)->selectedClip() >= 0)
+            appendTrack(i);
+    }
+    appendTrack(0); // 選択トラックで見つからなければ V1。
+
+    constexpr double kEpsilon = 1e-9;
+    for (int trackIndex : std::as_const(trackOrder)) {
+        const TimelineTrack *track = m_videoTracks.at(trackIndex);
+        const QVector<ClipInfo> &clips = track->clips();
+        double cursor = 0.0;
+        for (int clipIndex = 0; clipIndex < clips.size(); ++clipIndex) {
+            const ClipInfo &clip = clips.at(clipIndex);
+            const double clipStart = cursor + qMax(0.0, clip.leadInSec);
+            const double clipDuration = qMax(0.0, clip.effectiveDuration());
+            const double clipEnd = clipStart + clipDuration;
+            if (timelineSec + kEpsilon >= clipStart
+                && timelineSec < clipEnd - kEpsilon) {
+                if (clip.filePath.isEmpty())
+                    return fail(QStringLiteral("クリップにソースファイルがありません"));
+                if (clip.isSequenceReference()) {
+                    return fail(QStringLiteral(
+                        "シーケンス参照はソースモニターで開けません"));
+                }
+                if (result) {
+                    result->filePath = clip.filePath;
+                    result->sourceSec = clip.sourceSecondAtLocalTime(
+                        qBound(0.0, timelineSec - clipStart, clipDuration));
+                    result->trackIndex = trackIndex;
+                    result->clipIndex = clipIndex;
+                }
+                return true;
+            }
+            cursor = clipEnd;
+        }
+    }
+
+    return fail(QStringLiteral("再生ヘッド位置に動画クリップがありません"));
+}
+
+bool Timeline::replaceRenderedClip(int trackIndex, int clipIndex,
+                                   const ClipInfo &clip, const QString &description)
+{
+    TimelineTrack *track = trackAt(false, trackIndex);
+    if (!track || track->isLocked() || clipIndex < 0 || clipIndex >= track->clipCount())
+        return false;
+    const ClipInfo previous = track->clips()[clipIndex];
+    const bool decomposing = previous.renderInPlaceOriginal
+        && previous.renderInPlaceOriginal.get() == &clip;
+    const auto startAt = [](const TimelineTrack *t, int index) {
+        double start = 0.0;
+        for (int i = 0; i <= index; ++i) {
+            start += t->clips()[i].leadInSec;
+            if (i < index) start += t->clips()[i].effectiveDuration();
+        }
+        return start;
+    };
+    const double videoStart = startAt(track, clipIndex);
+    QVector<QVector<ClipInfo>> audioReplacements;
+    for (const auto *audioTrack : m_audioTracks) {
+        auto audioClips = audioTrack->clips();
+        for (int i = 0; i < audioClips.size(); ++i) {
+            const ClipInfo original = audioClips[i];
+            if (previous.linkGroup == 0 || original.linkGroup != previous.linkGroup) continue;
+            if (audioTrack->isLocked()) return false;
+            if (decomposing) {
+                if (!original.renderInPlaceOriginal || original.filePath != previous.filePath)
+                    return false;
+                audioClips[i] = *original.renderInPlaceOriginal;
+            } else {
+                ClipInfo baked{};
+                baked.filePath = clip.filePath;
+                baked.displayName = original.displayName;
+                baked.duration = clip.duration;
+                baked.inPoint = clip.inPoint + startAt(audioTrack, i) - videoStart;
+                baked.outPoint = baked.inPoint + original.effectiveDuration();
+                baked.leadInSec = original.leadInSec;
+                baked.linkGroup = original.linkGroup;
+                baked.label = original.label;
+                baked.renderInPlaceOriginal = std::make_shared<ClipInfo>(original);
+                audioClips[i] = baked;
+            }
+        }
+        audioReplacements.append(audioClips);
+    }
+    TrackClipSnapshot before = snapshotTrackClips(this);
+    auto clips = track->clips();
+    clips[clipIndex] = clip;
+    track->setClips(clips);
+    for (int i = 0; i < m_audioTracks.size(); ++i)
+        m_audioTracks[i]->setClips(audioReplacements[i]);
+    // Replacement preserves the position; update its identity before remap
+    // (the same convention as replaceClipMedia).
+    before[trackIndex][clipIndex] = {clip.filePath, clip.linkGroup, clip.inPoint};
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, before);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, before);
+    saveUndoState(description);
+    updateInfoLabel();
+    scheduleEmitSequenceChanged();
+    return true;
+}
+
+bool Timeline::replaceClipMedia(TrackKind kind, int trackIndex, int clipIndex,
+                                const QString &newPath,
+                                const QString &newDisplayName,
+                                double newSourceDurationSec,
+                                QString *messageOut)
+{
+    if (messageOut)
+        messageOut->clear();
+    const auto fail = [messageOut](const QString &message) {
+        if (messageOut)
+            *messageOut = message;
+        return false;
+    };
+
+    const QFileInfo fileInfo(newPath);
+    if (newPath.isEmpty() || !fileInfo.exists() || !fileInfo.isFile())
+        return fail(QStringLiteral("ファイルが見つかりません: %1").arg(newPath));
+
+    TimelineTrack *targetTrack = trackAt(kind == TrackKind::Audio, trackIndex);
+    if (!targetTrack)
+        return fail(QStringLiteral("トラック番号が範囲外です"));
+    if (clipIndex < 0 || clipIndex >= targetTrack->clipCount())
+        return fail(QStringLiteral("クリップ番号が範囲外です"));
+    if (targetTrack->isLocked())
+        return fail(QStringLiteral("トラックがロックされています"));
+
+    const TimelineMediaProbe mediaProbe = probeTimelineMedia(newPath);
+    if (!mediaProbe.openedOk
+        || (!mediaProbe.videoStreamFound && !mediaProbe.audioStreamFound)) {
+        return fail(QStringLiteral("メディアとして開けません: %1").arg(newPath));
+    }
+    if (kind == TrackKind::Video && !mediaProbe.videoStreamFound)
+        return fail(QStringLiteral("映像ストリームがありません: %1").arg(newPath));
+    if (kind == TrackKind::Audio && !mediaProbe.audioStreamFound)
+        return fail(QStringLiteral("音声ストリームがありません: %1").arg(newPath));
+
+    const double sourceDuration = mediaProbe.durationSec > 0.0
+        ? mediaProbe.durationSec : newSourceDurationSec;
+    if (!std::isfinite(sourceDuration) || sourceDuration <= 0.0)
+        return fail(QStringLiteral("新しい素材の長さを取得できません"));
+
+    const QVector<ClipInfo> targetClips = targetTrack->clips();
+    const int linkGroup = targetClips.at(clipIndex).linkGroup;
+    const QString displayName = newDisplayName.isEmpty()
+        ? fileInfo.fileName() : newDisplayName;
+
+    const auto shouldReplace = [&](TimelineTrack *track, int index,
+                                   bool audioTrack) {
+        if (!track || index < 0 || index >= track->clipCount())
+            return false;
+        const bool isTarget = track == targetTrack && index == clipIndex;
+        const bool isLinked = linkGroup > 0
+            && track->clips().at(index).linkGroup == linkGroup;
+        if (!isTarget && !isLinked)
+            return false;
+        return audioTrack ? mediaProbe.audioStreamFound
+                          : mediaProbe.videoStreamFound;
+    };
+
+    bool linkedAudioLeftUnchanged = false;
+    if (linkGroup > 0 && !mediaProbe.audioStreamFound) {
+        for (TimelineTrack *audioTrack : std::as_const(m_audioTracks)) {
+            if (!audioTrack)
+                continue;
+            const auto &clips = audioTrack->clips();
+            linkedAudioLeftUnchanged = std::any_of(
+                clips.cbegin(), clips.cend(), [linkGroup](const ClipInfo &clip) {
+                    return clip.linkGroup == linkGroup;
+                });
+            if (linkedAudioLeftUnchanged)
+                break;
+        }
+    }
+
+    // 全対象を先に検証し、リンク相方がロック中・新素材が現在の inPoint より
+    // 短い場合は 1 つも変更しない。
+    const auto validateTracks = [&](const QVector<TimelineTrack *> &tracks,
+                                    bool audioTrack) {
+        for (TimelineTrack *track : tracks) {
+            if (!track)
+                continue;
+            const auto &clips = track->clips();
+            for (int i = 0; i < clips.size(); ++i) {
+                if (!shouldReplace(track, i, audioTrack))
+                    continue;
+                if (track->isLocked())
+                    return fail(QStringLiteral("リンクしたトラックがロックされています"));
+                if (sourceDuration <= clips.at(i).inPoint + 1e-9) {
+                    return fail(QStringLiteral(
+                        "新しい素材が現在のイン点 (%1 秒) より短いため置き換えできません")
+                                    .arg(clips.at(i).inPoint, 0, 'f', 3));
+                }
+            }
+        }
+        return true;
+    };
+    if (!validateTracks(m_videoTracks, false)
+        || !validateTracks(m_audioTracks, true)) {
+        return false;
+    }
+
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    TrackClipSnapshot remapSnapshot = snapBefore;
+    bool changed = false;
+    bool shortened = false;
+    double shortestTimelineDuration = std::numeric_limits<double>::infinity();
+    const auto replaceOnTracks = [&](const QVector<TimelineTrack *> &tracks,
+                                     bool audioTrack) {
+        for (TimelineTrack *track : tracks) {
+            if (!track)
+                continue;
+            QVector<ClipInfo> clips = track->clips();
+            bool trackChanged = false;
+            for (int i = 0; i < clips.size(); ++i) {
+                if (!shouldReplace(track, i, audioTrack))
+                    continue;
+
+                ClipInfo &clip = clips[i];
+                const double oldTimelineDuration = qMax(0.0, clip.effectiveDuration());
+                const double oldSourceOut = clip.outPoint > 0.0
+                    ? clip.outPoint : clip.duration;
+                const double oldSourceSpan = qMax(0.0, oldSourceOut - clip.inPoint);
+                const double requestedOut = clip.inPoint + oldSourceSpan;
+                const double replacementOut = qMin(requestedOut, sourceDuration);
+
+                clip.filePath = newPath;
+                clip.displayName = displayName;
+                clip.duration = sourceDuration;
+                clip.outPoint = replacementOut;
+                clip.sequenceRefId.clear();
+                clip.waveform = WaveformData{};
+
+                // ClipKeyId のfilePath も置き換わるため、古い識別子の
+                // まま remap すると位置が変わっていないマット/親子参照が
+                // 削除扱いになる。対象のみ新識別子に置き換えて、
+                // 従来の snapshot -> mutation -> remap 手順で同一 index へ写す。
+                if (!audioTrack) {
+                    const int videoTrackIndex = m_videoTracks.indexOf(track);
+                    if (videoTrackIndex >= 0
+                        && videoTrackIndex < remapSnapshot.size()
+                        && i < remapSnapshot[videoTrackIndex].size()) {
+                        remapSnapshot[videoTrackIndex][i].filePath = newPath;
+                    }
+                }
+
+                const double replacementTimelineDuration =
+                    qMax(0.0, clip.effectiveDuration());
+                const double lostDuration = qMax(
+                    0.0, oldTimelineDuration - replacementTimelineDuration);
+                if (lostDuration > 1e-9 && i + 1 < clips.size())
+                    clips[i + 1].leadInSec += lostDuration;
+                if (replacementOut + 1e-9 < requestedOut) {
+                    shortened = true;
+                    shortestTimelineDuration = qMin(
+                        shortestTimelineDuration, replacementTimelineDuration);
+                }
+                trackChanged = true;
+            }
+            if (trackChanged) {
+                track->setClips(clips);
+                changed = true;
+            }
+        }
+    };
+    replaceOnTracks(m_videoTracks, false);
+    replaceOnTracks(m_audioTracks, true);
+
+    if (!changed)
+        return fail(QStringLiteral("置き換え対象のクリップがありません"));
+
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, remapSnapshot);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, remapSnapshot);
+    saveUndoState(QStringLiteral("Replace clip media"));
+    updateInfoLabel();
+    scheduleEmitSequenceChanged();
+
+    QStringList warnings;
+    if (shortened) {
+        warnings.append(QStringLiteral(
+            "新しい素材が短いため、クリップを %1 秒に短縮しました。")
+                            .arg(shortestTimelineDuration, 0, 'f', 3));
+    }
+    if (linkedAudioLeftUnchanged) {
+        warnings.append(QStringLiteral(
+            "新しい素材に音声がないため、リンクした音声クリップは変更していません。"));
+    }
+    if (messageOut)
+        *messageOut = warnings.join(QLatin1Char(' '));
+    return true;
+}
+
+bool Timeline::relinkMediaPaths(const QHash<QString, QString> &oldToNew,
+                                QString *errorOut,
+                                const std::function<bool(
+                                    const QHash<QString, QString> &)> &relinkSidecars)
+{
+    if (errorOut)
+        errorOut->clear();
+    const auto fail = [errorOut](const QString &message) {
+        if (errorOut)
+            *errorOut = message;
+        return false;
+    };
+    if (oldToNew.isEmpty())
+        return fail(QStringLiteral("mapping が空です"));
+
+    for (auto it = oldToNew.cbegin(); it != oldToNew.cend(); ++it) {
+        if (timeline_nesting::isSequenceClipFilePath(it.key())
+            || clipgeom::isNullObjectFilePath(it.key())) {
+            return fail(QStringLiteral("内部メディア参照は再リンクできません: %1")
+                            .arg(it.key()));
+        }
+        const QFileInfo destination(it.value());
+        if (it.key().isEmpty() || it.value().isEmpty()
+            || !destination.exists() || !destination.isFile()) {
+            return fail(QStringLiteral("ファイルが見つかりません: %1")
+                            .arg(it.value()));
+        }
+    }
+
+    syncActiveSequenceFromCurrentTracks();
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    TrackClipSnapshot remapSnapshot = snapBefore;
+    bool changed = false;
+
+    const auto relinkClip = [&oldToNew, &changed](ClipInfo &clip) {
+        const auto media = oldToNew.constFind(clip.filePath);
+        if (media != oldToNew.cend() && media.value() != clip.filePath) {
+            clip.filePath = media.value();
+            changed = true;
+        }
+        const auto lut = oldToNew.constFind(clip.lutFilePath);
+        if (lut != oldToNew.cend() && lut.value() != clip.lutFilePath) {
+            clip.lutFilePath = lut.value();
+            changed = true;
+        }
+    };
+
+    for (int trackIndex = 0; trackIndex < m_videoTracks.size(); ++trackIndex) {
+        TimelineTrack *track = m_videoTracks.at(trackIndex);
+        if (!track)
+            continue;
+        QVector<ClipInfo> clips = track->clips();
+        bool trackChanged = false;
+        for (int clipIndex = 0; clipIndex < clips.size(); ++clipIndex) {
+            const QString oldFilePath = clips.at(clipIndex).filePath;
+            const QString oldLutPath = clips.at(clipIndex).lutFilePath;
+            relinkClip(clips[clipIndex]);
+            if (clips.at(clipIndex).filePath != oldFilePath
+                || clips.at(clipIndex).lutFilePath != oldLutPath) {
+                trackChanged = true;
+            }
+            if (clips.at(clipIndex).filePath != oldFilePath
+                && trackIndex < remapSnapshot.size()
+                && clipIndex < remapSnapshot[trackIndex].size()) {
+                remapSnapshot[trackIndex][clipIndex].filePath =
+                    clips.at(clipIndex).filePath;
+            }
+        }
+        if (trackChanged)
+            track->setClips(clips);
+    }
+
+    for (TimelineTrack *track : std::as_const(m_audioTracks)) {
+        if (!track)
+            continue;
+        QVector<ClipInfo> clips = track->clips();
+        bool trackChanged = false;
+        for (ClipInfo &clip : clips) {
+            const QString oldFilePath = clip.filePath;
+            const QString oldLutPath = clip.lutFilePath;
+            relinkClip(clip);
+            trackChanged = trackChanged || clip.filePath != oldFilePath
+                || clip.lutFilePath != oldLutPath;
+        }
+        if (trackChanged)
+            track->setClips(clips);
+    }
+
+    if (m_sequenceModelEnabled) {
+        for (TimelineSequence &sequence : m_sequences) {
+            for (auto &track : sequence.videoTracks) {
+                for (ClipInfo &clip : track)
+                    relinkClip(clip);
+            }
+            for (auto &track : sequence.audioTracks) {
+                for (ClipInfo &clip : track)
+                    relinkClip(clip);
+            }
+        }
+    }
+
+    // MainWindow owns project-level image overlays and particle emitter
+    // configs. Let their owner join this already-validated mutation before
+    // the single undo snapshot is saved. A sidecar-only mapping is still a
+    // real relink even when no active/nested ClipInfo uses it.
+    if (relinkSidecars)
+        changed = relinkSidecars(oldToNew) || changed;
+
+    if (!changed)
+        return fail(QStringLiteral("置換対象のメディア参照がありません"));
+
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, remapSnapshot);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, remapSnapshot);
+    saveUndoState(QStringLiteral("メディアを再リンク"));
+    updateInfoLabel();
+    scheduleEmitSequenceChanged();
+    return true;
+}
+
+bool Timeline::setClipLabel(TrackKind kind, int trackIndex, int clipIndex,
+                            ClipLabel label)
+{
+    switch (label) {
+    case ClipLabel::None:
+    case ClipLabel::Red:
+    case ClipLabel::Orange:
+    case ClipLabel::Yellow:
+    case ClipLabel::Green:
+    case ClipLabel::Cyan:
+    case ClipLabel::Blue:
+    case ClipLabel::Purple:
+    case ClipLabel::Pink:
+        break;
+    default:
+        return false;
+    }
+
+    TimelineTrack *track = trackAt(kind == TrackKind::Audio, trackIndex);
+    if (!track || track->isLocked()
+        || clipIndex < 0 || clipIndex >= track->clipCount()) {
+        return false;
+    }
+
+    QVector<ClipInfo> clips = track->clips();
+    if (clips[clipIndex].label == label)
+        return true;
+
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    clips[clipIndex].label = label;
+    track->setClips(clips);
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+    saveUndoState(QStringLiteral("Clip label"));
+    updateInfoLabel();
+    scheduleEmitSequenceChanged();
+    return true;
+}
+
 QVector<Timeline::TimeRangeSec> Timeline::selectedClipTimeRanges() const
 {
     QVector<TimeRangeSec> ranges;
@@ -6029,6 +7121,173 @@ void Timeline::applyBeatMarkersToClip(TimelineTrack *track, int clipIndex)
         emit positionChanged(m_playheadPos);
 }
 
+bool Timeline::applyMusicRemix(int trackIndex, int clipIndex,
+                               const remix::Plan &plan, bool ripple,
+                               QString *errorOut)
+{
+    if (errorOut)
+        errorOut->clear();
+    const auto fail = [errorOut](const QString &message) {
+        if (errorOut)
+            *errorOut = message;
+        return false;
+    };
+    if (!plan.error.isEmpty() || plan.segments.isEmpty())
+        return fail(plan.error.isEmpty()
+                        ? QStringLiteral("リミックス計画が空です") : plan.error);
+    if (plan.segments.size() > remix::kMaxSegments)
+        return fail(QStringLiteral("リミックス区間数が上限 (%1) を超えています")
+                        .arg(remix::kMaxSegments));
+    if (!std::isfinite(plan.resultDuration) || plan.resultDuration <= 0.0)
+        return fail(QStringLiteral("リミックス後の尺が不正です"));
+    if (!std::isfinite(plan.crossfadeSec) || plan.crossfadeSec < 0.0)
+        return fail(QStringLiteral("クロスフェード時間が不正です"));
+
+    TimelineTrack *track = trackAt(true, trackIndex);
+    if (!track)
+        return fail(QStringLiteral("音声トラックの index が範囲外です"));
+    if (clipIndex < 0 || clipIndex >= track->clipCount())
+        return fail(QStringLiteral("音声クリップの index が範囲外です"));
+    if (track->isLocked())
+        return fail(QStringLiteral("音声トラックがロックされています"));
+
+    const ClipInfo original = track->clips().at(clipIndex);
+    const double sourceOut = original.outPoint > 0.0
+        ? original.outPoint : original.duration;
+    const double sourceSpan = sourceOut - original.inPoint;
+    const double speed = original.speed > 0.0 ? original.speed : 1.0;
+    const double clipDuration = sourceSpan / speed;
+    if (!std::isfinite(clipDuration) || clipDuration <= 0.0)
+        return fail(QStringLiteral("対象クリップの尺が不正です"));
+
+    QVector<ClipInfo> replacement;
+    replacement.reserve(plan.segments.size());
+    for (const remix::Segment &segment : plan.segments) {
+        if (!std::isfinite(segment.srcStart) || !std::isfinite(segment.srcEnd)
+            || segment.srcStart < -1.0e-6
+            || segment.srcEnd > clipDuration + 1.0e-6
+            || segment.srcEnd <= segment.srcStart + 1.0e-9) {
+            return fail(QStringLiteral("リミックス区間が対象クリップ外です"));
+        }
+        ClipInfo part = original;
+        const double localStart = qBound(0.0, segment.srcStart, clipDuration);
+        const double localEnd = qBound(0.0, segment.srcEnd, clipDuration);
+        part.inPoint = original.inPoint + localStart * speed;
+        part.outPoint = original.inPoint + localEnd * speed;
+        part.leadInSec = replacement.isEmpty() ? original.leadInSec : 0.0;
+        part.leadIn = Transition{};
+        part.trailOut = Transition{};
+        replacement.append(part);
+    }
+    if (replacement.isEmpty())
+        return fail(QStringLiteral("リミックス区間がありません"));
+
+    const double actualDuration = std::accumulate(
+        replacement.cbegin(), replacement.cend(), 0.0,
+        [](double sum, const ClipInfo &clip) {
+            return sum + qMax(0.0, clip.effectiveDuration());
+        });
+    if (!std::isfinite(actualDuration) || actualDuration <= 0.0)
+        return fail(QStringLiteral("リミックス後の尺が不正です"));
+
+    const QVector<ClipInfo> before = track->clips();
+    const int nextIndexBefore = clipIndex + 1;
+    const bool hasNext = nextIndexBefore < before.size();
+    const double nextLeadIn = hasNext ? before[nextIndexBefore].leadInSec : 0.0;
+    const double downstreamLeadIn = nextLeadIn + original.effectiveDuration()
+                                  - actualDuration;
+    if (!ripple && hasNext && downstreamLeadIn < -1.0e-6)
+        return fail(QStringLiteral(
+            "後続クリップの空きが足りません。「後続をリップル」を有効にしてください"));
+
+    const Transition originalLeadIn = original.leadIn;
+    const Transition originalTrailOut = original.trailOut;
+    for (int i = 0; i + 1 < replacement.size(); ++i) {
+        double duration = qMin(plan.crossfadeSec,
+                               replacement[i].effectiveDuration());
+        duration = qMin(duration, replacement[i + 1].effectiveDuration());
+        if (duration <= 0.0)
+            continue;
+        Transition crossfade;
+        crossfade.type = TransitionType::CrossDissolve;
+        crossfade.duration = duration;
+        replacement[i].trailOut = crossfade;
+        replacement[i + 1].leadIn = crossfade;
+    }
+    replacement.first().leadIn = originalLeadIn;
+    replacement.last().trailOut = originalTrailOut;
+
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    QVector<ClipInfo> after;
+    after.reserve(before.size() - 1 + replacement.size());
+    for (int i = 0; i < clipIndex; ++i)
+        after.append(before.at(i));
+    after += replacement;
+    for (int i = clipIndex + 1; i < before.size(); ++i)
+        after.append(before.at(i));
+    const int nextIndexAfter = clipIndex + replacement.size();
+    if (hasNext && nextIndexAfter < after.size() && !ripple)
+        after[nextIndexAfter].leadInSec = qMax(0.0, downstreamLeadIn);
+    track->setClips(after);
+    track->setSelectedClip(clipIndex);
+
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+    saveUndoState(QStringLiteral("ミュージックリミックス"));
+    updateInfoLabel();
+    ensureSequenceFitsViewport();
+    scheduleEmitSequenceChanged();
+    return true;
+}
+
+bool Timeline::applyDialogueLevel(
+    int trackIndex, int clipIndex,
+    const QVector<AudioGainPoint> &envelope, QString *errorOut)
+{
+    if (errorOut)
+        errorOut->clear();
+    const auto fail = [errorOut](const QString &message) {
+        if (errorOut)
+            *errorOut = message;
+        return false;
+    };
+
+    TimelineTrack *track = trackAt(true, trackIndex);
+    if (!track)
+        return fail(QStringLiteral("音声トラックの index が範囲外です"));
+    if (clipIndex < 0 || clipIndex >= track->clipCount())
+        return fail(QStringLiteral("音声クリップの index が範囲外です"));
+    if (track->isLocked())
+        return fail(QStringLiteral("音声トラックがロックされています"));
+    if (envelope.isEmpty())
+        return fail(QStringLiteral("音量エンベロープが空です"));
+
+    const double duration = track->clips().at(clipIndex).effectiveDuration();
+    if (!std::isfinite(duration) || duration <= 0.0)
+        return fail(QStringLiteral("対象クリップの尺が不正です"));
+    double previousTime = -1.0;
+    for (const AudioGainPoint &point : envelope) {
+        if (!std::isfinite(point.time) || !std::isfinite(point.gain)
+            || point.time < 0.0 || point.time > duration + 1.0e-6
+            || point.time + 1.0e-12 < previousTime || point.gain < 0.0) {
+            return fail(QStringLiteral("音量エンベロープが不正です"));
+        }
+        previousTime = point.time;
+    }
+
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    QVector<ClipInfo> clips = track->clips();
+    clips[clipIndex].volumeEnvelope = envelope;
+    track->setClips(clips);
+    track->setSelectedClip(clipIndex);
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+    saveUndoState(QStringLiteral("ダイアログレベラー"));
+    updateInfoLabel();
+    scheduleEmitSequenceChanged();
+    return true;
+}
+
 // 再生ヘッド直下の V1(最初の動画トラック)クリップを解決。見つかれば true。
 bool Timeline::clipUnderPlayhead(TimelineTrack *&outTrack, int &outClipIndex) const
 {
@@ -6064,6 +7323,37 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     if (!track->isClipSelected(clipIndex))
         track->setSelectedClip(clipIndex);
 
+    auto applyLabelToSelection = [&](ClipLabel label) {
+        const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+        bool changed = false;
+        const QVector<TimelineTrack *> tracks = m_videoTracks + m_audioTracks;
+        for (TimelineTrack *selectedTrack : tracks) {
+            if (!selectedTrack || selectedTrack->isLocked())
+                continue;
+            QVector<ClipInfo> clips = selectedTrack->clips();
+            bool trackChanged = false;
+            for (int selectedIndex : selectedTrack->selectedClips()) {
+                if (selectedIndex < 0 || selectedIndex >= clips.size()
+                    || clips[selectedIndex].label == label) {
+                    continue;
+                }
+                clips[selectedIndex].label = label;
+                trackChanged = true;
+            }
+            if (trackChanged) {
+                selectedTrack->setClips(clips);
+                changed = true;
+            }
+        }
+        if (!changed)
+            return;
+        remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+        remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+        saveUndoState(QStringLiteral("Clip label"));
+        updateInfoLabel();
+        scheduleEmitSequenceChanged();
+    };
+
     if (QSettings("VSimpleEditor", "Preferences")
             .value(rcpause::pauseOnRightClickKey(),
                    rcpause::kDefaultPauseOnRightClick).toBool()) {
@@ -6089,11 +7379,15 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
         QAction *aCut = aMenu.addAction(QStringLiteral("カット"));
         QAction *aCopy = aMenu.addAction(QStringLiteral("コピー"));
         QAction *aDel = aMenu.addAction(QStringLiteral("削除"));
+        QAction *aReplace = aMenu.addAction(QStringLiteral("置き換え"));
         aMenu.addSeparator();
         QAction *aUnlink = aMenu.addAction(QStringLiteral("同期を切る"));
         aUnlink->setEnabled(aLinkGroup > 0);
         aMenu.addSeparator();
         QAction *aNormalize = aMenu.addAction(QStringLiteral("ノーマライズ"));
+        QAction *aDialogueLevel = aMenu.addAction(
+            QStringLiteral("ダイアログレベラー…"));
+        QAction *aRemix = aMenu.addAction(QStringLiteral("ミュージックリミックス…"));
         aMenu.addSeparator();
         QMenu *aChannelMenu = aMenu.addMenu(QStringLiteral("チャンネルマッピング"));
         QAction *aStereoAct = addAudioChannelModeAction(aChannelMenu, aClip.audioChannelMode,
@@ -6107,10 +7401,24 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
         QAction *aMonoAct = addAudioChannelModeAction(aChannelMenu, aClip.audioChannelMode,
                                                       AudioChannelMode::Mono);
         aMenu.addSeparator();
+        QMenu *aLabelMenu = aMenu.addMenu(QStringLiteral("ラベルカラー"));
+        const QList<QPair<QAction *, ClipLabel>> aLabelActions{
+            {addClipLabelAction(aLabelMenu, aClip.label, ClipLabel::None), ClipLabel::None},
+            {addClipLabelAction(aLabelMenu, aClip.label, ClipLabel::Red), ClipLabel::Red},
+            {addClipLabelAction(aLabelMenu, aClip.label, ClipLabel::Orange), ClipLabel::Orange},
+            {addClipLabelAction(aLabelMenu, aClip.label, ClipLabel::Yellow), ClipLabel::Yellow},
+            {addClipLabelAction(aLabelMenu, aClip.label, ClipLabel::Green), ClipLabel::Green},
+            {addClipLabelAction(aLabelMenu, aClip.label, ClipLabel::Cyan), ClipLabel::Cyan},
+            {addClipLabelAction(aLabelMenu, aClip.label, ClipLabel::Blue), ClipLabel::Blue},
+            {addClipLabelAction(aLabelMenu, aClip.label, ClipLabel::Purple), ClipLabel::Purple},
+            {addClipLabelAction(aLabelMenu, aClip.label, ClipLabel::Pink), ClipLabel::Pink}
+        };
+        aMenu.addSeparator();
         QMenu *atMenu = aMenu.addMenu(QStringLiteral("音声トランジション"));
-        QAction *aXdAct = atMenu->addAction(QStringLiteral("クロスフェード (1.0s)"));
-        QAction *aFiAct = atMenu->addAction(QStringLiteral("フェードイン (0.5s)"));
-        QAction *aFoAct = atMenu->addAction(QStringLiteral("フェードアウト (0.5s)"));
+        QAction *aXdAct = atMenu->addAction(QStringLiteral("クロスフェード (コンスタントパワー)…"));
+        aXdAct->setEnabled(clipIndex + 1 < track->clips().size());
+        QAction *aFiAct = atMenu->addAction(QStringLiteral("フェードイン…"));
+        QAction *aFoAct = atMenu->addAction(QStringLiteral("フェードアウト…"));
         QAction *aClearAct = nullptr;
         if (aHasTrans) {
             atMenu->addSeparator();
@@ -6118,39 +7426,26 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
         }
         QAction *aChosen = aMenu.exec(globalPos);
         if (!aChosen) return;
-        // Helper: mutate this audio track only (no video mirror) so the
-        // audio fade can outlive or precede the video cut for J/L-cuts.
-        auto applyAudioOnly = [&](TransitionType type, double duration) {
-            auto clips = track->clips();
-            if (clipIndex >= clips.size()) return;
-            Transition t;
-            t.type = type;
-            t.duration = duration;
-            if (type == TransitionType::FadeIn) {
-                clips[clipIndex].leadIn = t;
-                if (clipIndex > 0) {
-                    Transition mirror;
-                    mirror.type = TransitionType::FadeOut;
-                    mirror.duration = duration;
-                    clips[clipIndex - 1].trailOut = mirror;
-                }
-            } else if (type == TransitionType::FadeOut) {
-                clips[clipIndex].trailOut = t;
-                if (clipIndex + 1 < clips.size()) {
-                    Transition mirror;
-                    mirror.type = TransitionType::FadeIn;
-                    mirror.duration = duration;
-                    clips[clipIndex + 1].leadIn = mirror;
-                }
-            } else { // CrossDissolve (audio-only equal-power crossfade)
-                clips[clipIndex].trailOut = t;
-                if (clipIndex + 1 < clips.size())
-                    clips[clipIndex + 1].leadIn = t;
-            }
-            track->setClips(clips);
-            saveUndoState(QString("Audio-only transition: %1")
-                .arg(Transition::typeName(type)));
-            scheduleEmitSequenceChanged();
+        auto applyAudioAction = [&](AudioFadeEdge edge, bool crossfade) {
+            bool accepted = false;
+            const double defaultDuration = crossfade ? 1.0 : 0.5;
+            const QString title = crossfade
+                ? QStringLiteral("コンスタントパワー・クロスフェード")
+                : (edge == AudioFadeEdge::In
+                    ? QStringLiteral("音声フェードイン")
+                    : QStringLiteral("音声フェードアウト"));
+            const double duration = QInputDialog::getDouble(
+                this, title, QStringLiteral("時間 (秒):"), defaultDuration,
+                0.01, 60.0, 2, &accepted);
+            if (!accepted)
+                return;
+            QString error;
+            const int audioTrackIndex = m_audioTracks.indexOf(track);
+            const bool applied = crossfade
+                ? applyAudioCrossfade(audioTrackIndex, clipIndex, duration, &error)
+                : applyAudioFade(audioTrackIndex, clipIndex, edge, duration, &error);
+            if (!applied && !error.isEmpty())
+                QMessageBox::warning(this, QStringLiteral("音声トランジション"), error);
         };
         auto applyAudioChannelMode = [&](AudioChannelMode mode) {
             auto clips = track->clips();
@@ -6161,22 +7456,172 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
             saveUndoState(QStringLiteral("Set audio channel mapping"));
             scheduleEmitSequenceChanged();
         };
+        for (const auto &labelAction : aLabelActions) {
+            if (aChosen == labelAction.first) {
+                applyLabelToSelection(labelAction.second);
+                return;
+            }
+        }
         if (aChosen == aCut) cutSelectedClip();
         else if (aChosen == aCopy) copySelectedClip();
         else if (aChosen == aDel) deleteSelectedClip();
+        else if (aChosen == aReplace) {
+            emit replaceClipRequested(TrackKind::Audio,
+                                      m_audioTracks.indexOf(track), clipIndex);
+        }
         else if (aChosen == aUnlink) unlinkClipGroup(aLinkGroup);
         else if (aChosen == aNormalize) {
             const int trackIdx = m_audioTracks.indexOf(track);
             normalizeAudioClipPeak(trackIdx, clipIndex);
+        }
+        else if (aChosen == aDialogueLevel) {
+            if (!aClip.volumeEnvelope.isEmpty()
+                && QMessageBox::question(
+                       this, QStringLiteral("ダイアログレベラー"),
+                       QStringLiteral("既存の音量エンベロープを上書きしますか？"),
+                       QMessageBox::Yes | QMessageBox::No,
+                       QMessageBox::No) != QMessageBox::Yes) {
+                return;
+            }
+
+            DialogueLevelerDialog dialog(this);
+            if (dialog.exec() != QDialog::Accepted)
+                return;
+
+            QVector<float> samples;
+            int sampleRate = 0;
+            if (!WaveformGenerator::decodeAudio(aClip.filePath, samples, sampleRate)
+                || samples.isEmpty() || sampleRate <= 0) {
+                QMessageBox::warning(this, QStringLiteral("ダイアログレベラー"),
+                                     QStringLiteral("音声のデコードに失敗しました。"));
+                return;
+            }
+
+            const double sourceOut = aClip.outPoint > 0.0
+                ? aClip.outPoint : aClip.duration;
+            const double sourceDuration =
+                static_cast<double>(samples.size()) / sampleRate;
+            const double activeStart = qBound(0.0, aClip.inPoint, sourceDuration);
+            const double activeEnd = qBound(activeStart, sourceOut, sourceDuration);
+            const int firstSample = qBound(
+                0, static_cast<int>(std::floor(activeStart * sampleRate)),
+                static_cast<int>(samples.size()));
+            const int lastSample = qBound(
+                firstSample, static_cast<int>(std::ceil(activeEnd * sampleRate)),
+                static_cast<int>(samples.size()));
+            if (lastSample <= firstSample) {
+                QMessageBox::information(
+                    this, QStringLiteral("ダイアログレベラー"),
+                    QStringLiteral("クリップの有効な音声範囲がありません。"));
+                return;
+            }
+
+            leveler::Config config;
+            config.targetShortTermLufs = dialog.targetLufs();
+            config.smoothingSec = dialog.smoothingSec();
+            QVector<float> activeSamples =
+                samples.mid(firstSample, lastSample - firstSample);
+            if (aClip.reversed)
+                std::reverse(activeSamples.begin(), activeSamples.end());
+            QVector<AudioGainPoint> envelope = leveler::computeEnvelope(
+                activeSamples, sampleRate, config);
+            const double speed = aClip.speed > 0.0 ? aClip.speed : 1.0;
+            const double clipDuration = aClip.effectiveDuration();
+            for (AudioGainPoint &point : envelope)
+                point.time = qBound(0.0, point.time / speed, clipDuration);
+
+            QString error;
+            if (!applyDialogueLevel(m_audioTracks.indexOf(track), clipIndex,
+                                    envelope, &error)) {
+                QMessageBox::warning(this, QStringLiteral("ダイアログレベラー"),
+                                     error);
+            }
+        }
+        else if (aChosen == aRemix) {
+            QVector<float> samples;
+            int sampleRate = 0;
+            if (!WaveformGenerator::decodeAudio(aClip.filePath, samples, sampleRate)
+                || samples.isEmpty() || sampleRate <= 0) {
+                QMessageBox::warning(this, QStringLiteral("ミュージックリミックス"),
+                                     QStringLiteral("音声のデコードに失敗しました。"));
+                return;
+            }
+
+            const double sourceOut = aClip.outPoint > 0.0
+                ? aClip.outPoint : aClip.duration;
+            const double totalSourceSec =
+                static_cast<double>(samples.size()) / sampleRate;
+            const double activeStart = qMax(0.0, aClip.inPoint);
+            const double activeEnd = qMin(sourceOut, totalSourceSec);
+            if (activeEnd <= activeStart) {
+                QMessageBox::information(
+                    this, QStringLiteral("ミュージックリミックス"),
+                    QStringLiteral("クリップの有効な音声範囲がありません。"));
+                return;
+            }
+            const int startSample = qBound(
+                0, static_cast<int>(std::floor(activeStart * sampleRate)),
+                static_cast<int>(samples.size()));
+            const int endSample = qBound(
+                startSample, static_cast<int>(std::ceil(activeEnd * sampleRate)),
+                static_cast<int>(samples.size()));
+            const QVector<float> activeSamples =
+                samples.mid(startSample, endSample - startSample);
+            const beatdetect::Result beats = beatdetect::detectBeats(
+                activeSamples, sampleRate, beatdetect::Config{});
+            if (beats.beatTimesSec.size() < 2) {
+                QMessageBox::information(
+                    this, QStringLiteral("ミュージックリミックス"),
+                    QStringLiteral("ビートが 2 個未満のため適用できません。"));
+                return;
+            }
+
+            const double speed = aClip.speed > 0.0 ? aClip.speed : 1.0;
+            const double clipDuration = aClip.effectiveDuration();
+            QVector<double> localBeatTimes;
+            localBeatTimes.reserve(beats.beatTimesSec.size());
+            for (double beat : beats.beatTimesSec) {
+                const double sourceLocal = activeStart + beat - aClip.inPoint;
+                if (sourceLocal >= -1.0e-6
+                    && sourceLocal <= clipDuration * speed + 1.0e-6) {
+                    localBeatTimes.append(qBound(0.0, sourceLocal / speed,
+                                                 clipDuration));
+                }
+            }
+            if (localBeatTimes.size() < 2) {
+                QMessageBox::information(
+                    this, QStringLiteral("ミュージックリミックス"),
+                    QStringLiteral("ビート境界を作成できませんでした。"));
+                return;
+            }
+
+            MusicRemixDialog dialog(this);
+            dialog.setDetectedBpm(beats.bpm);
+            dialog.setTargetDuration(clipDuration);
+            if (dialog.exec() != QDialog::Accepted)
+                return;
+            const remix::Plan plan = remix::planRemix(
+                localBeatTimes, clipDuration, dialog.targetDuration(), remix::Config{});
+            if (!plan.valid) {
+                QMessageBox::warning(this, QStringLiteral("ミュージックリミックス"),
+                                     plan.error);
+                return;
+            }
+            QString error;
+            if (!applyMusicRemix(m_audioTracks.indexOf(track), clipIndex, plan,
+                                 dialog.rippleFollowingClips(), &error)) {
+                QMessageBox::warning(this, QStringLiteral("ミュージックリミックス"),
+                                     error);
+            }
         }
         else if (aChosen == aStereoAct) applyAudioChannelMode(AudioChannelMode::Stereo);
         else if (aChosen == aFillLeftAct) applyAudioChannelMode(AudioChannelMode::FillLeft);
         else if (aChosen == aFillRightAct) applyAudioChannelMode(AudioChannelMode::FillRight);
         else if (aChosen == aSwapAct) applyAudioChannelMode(AudioChannelMode::Swap);
         else if (aChosen == aMonoAct) applyAudioChannelMode(AudioChannelMode::Mono);
-        else if (aChosen == aXdAct) applyAudioOnly(TransitionType::CrossDissolve, 1.0);
-        else if (aChosen == aFiAct) applyAudioOnly(TransitionType::FadeIn, 0.5);
-        else if (aChosen == aFoAct) applyAudioOnly(TransitionType::FadeOut, 0.5);
+        else if (aChosen == aXdAct) applyAudioAction(AudioFadeEdge::Out, true);
+        else if (aChosen == aFiAct) applyAudioAction(AudioFadeEdge::In, false);
+        else if (aChosen == aFoAct) applyAudioAction(AudioFadeEdge::Out, false);
         else if (aClearAct && aChosen == aClearAct) {
             auto clips = track->clips();
             if (clipIndex < clips.size()) {
@@ -6219,9 +7664,24 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     };
 
     QMenu menu;
+    const int renderTrack = m_videoTracks.indexOf(track);
+    if (renderTrack >= 0) {
+        auto *bake = menu.addAction(QStringLiteral("効果を焼き込んで差し替え…"));
+        bake->setEnabled(!track->isLocked());
+        connect(bake, &QAction::triggered, this, [this, renderTrack, clipIndex]() {
+            emit renderInPlaceRequested(renderTrack, clipIndex);
+        });
+        auto *restore = menu.addAction(QStringLiteral("元のクリップに戻す"));
+        restore->setEnabled(!track->isLocked() && bool(track->clips()[clipIndex].renderInPlaceOriginal));
+        connect(restore, &QAction::triggered, this, [this, renderTrack, clipIndex]() {
+            renderinplace::decomposeRenderInPlace(*this, renderTrack, clipIndex);
+        });
+        menu.addSeparator();
+    }
     QAction *cutAct = menu.addAction(QStringLiteral("カット"));
     QAction *copyAct = menu.addAction(QStringLiteral("コピー"));
     QAction *deleteAct = menu.addAction(QStringLiteral("削除"));
+    QAction *replaceAct = menu.addAction(QStringLiteral("置き換え"));
     QAction *freezeFrameAct = menu.addAction(QStringLiteral("フリーズフレームを追加"));
     auto playheadInsideClickedClip = [&]() {
         const auto &clips = track->clips();
@@ -6257,6 +7717,19 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
                                                  AudioChannelMode::Swap);
     QAction *monoAct = addAudioChannelModeAction(channelMenu, currentChannelMode,
                                                  AudioChannelMode::Mono);
+    menu.addSeparator();
+    QMenu *labelMenu = menu.addMenu(QStringLiteral("ラベルカラー"));
+    const QList<QPair<QAction *, ClipLabel>> labelActions{
+        {addClipLabelAction(labelMenu, clipInfo.label, ClipLabel::None), ClipLabel::None},
+        {addClipLabelAction(labelMenu, clipInfo.label, ClipLabel::Red), ClipLabel::Red},
+        {addClipLabelAction(labelMenu, clipInfo.label, ClipLabel::Orange), ClipLabel::Orange},
+        {addClipLabelAction(labelMenu, clipInfo.label, ClipLabel::Yellow), ClipLabel::Yellow},
+        {addClipLabelAction(labelMenu, clipInfo.label, ClipLabel::Green), ClipLabel::Green},
+        {addClipLabelAction(labelMenu, clipInfo.label, ClipLabel::Cyan), ClipLabel::Cyan},
+        {addClipLabelAction(labelMenu, clipInfo.label, ClipLabel::Blue), ClipLabel::Blue},
+        {addClipLabelAction(labelMenu, clipInfo.label, ClipLabel::Purple), ClipLabel::Purple},
+        {addClipLabelAction(labelMenu, clipInfo.label, ClipLabel::Pink), ClipLabel::Pink}
+    };
     menu.addSeparator();
     QMenu *transitionMenu = menu.addMenu(QStringLiteral("トランジション"));
     QAction *xdAct = transitionMenu->addAction(QStringLiteral("クロスディゾルブ (1.0s)"));
@@ -6303,6 +7776,7 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     QAction *wplAct = whipMenu->addAction(QStringLiteral("左へ"));
     QAction *wprAct = whipMenu->addAction(QStringLiteral("右へ"));
     QAction *glAct  = transitionMenu->addAction(QStringLiteral("グリッチ (0.5s)"));
+    QAction *mcAct  = transitionMenu->addAction(QStringLiteral("モーフカット (1.0s)"));
     QAction *llAct  = transitionMenu->addAction(QStringLiteral("ライトリーク (1.0s)"));
     QAction *lfAct  = transitionMenu->addAction(QStringLiteral("レンズフレア (1.0s)"));
     QAction *fbAct  = transitionMenu->addAction(QStringLiteral("フィルムバーン (1.0s)"));
@@ -6339,11 +7813,18 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
         transClearAct = transitionMenu->addAction(QStringLiteral("トランジションを削除"));
     }
 
+    QAction *shapeModifiersAct = nullptr;
+    if (!clipInfo.shapes.isEmpty())
+        shapeModifiersAct = menu.addAction(QStringLiteral("シェイプモディファイア…"));
+
     QAction *fxAct = menu.addAction(QStringLiteral("ビデオエフェクト..."));
     QAction *ccAct = menu.addAction(QStringLiteral("色補正 / グレーディング..."));
     QAction *adjustmentAct = menu.addAction(QStringLiteral("調整レイヤーを作成"));
     QAction *parentAct = menu.addAction(QStringLiteral("ペアレント..."));
     QAction *nullAct = menu.addAction(QStringLiteral("ヌルオブジェクトを作成"));
+    QAction *autoOrientAct = menu.addAction(QStringLiteral("パスに沿って自動回転"));
+    autoOrientAct->setCheckable(true);
+    autoOrientAct->setChecked(clipInfo.autoOrientEnabled);
     menu.addSeparator();
     // SNS 縦動画フィット (相互排他の3択): 幅フィット=レターボックスで全表示 /
     // 幅埋め=中央クロップで枠を歪みなく充填 / 解除=既定 (IgnoreAspectRatio で
@@ -6388,9 +7869,19 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
 
     QAction *chosen = menu.exec(globalPos);
     if (!chosen) return;
+    for (const auto &labelAction : labelActions) {
+        if (chosen == labelAction.first) {
+            applyLabelToSelection(labelAction.second);
+            return;
+        }
+    }
     if (chosen == cutAct) cutSelectedClip();
     else if (chosen == copyAct) copySelectedClip();
     else if (chosen == deleteAct) deleteSelectedClip();
+    else if (chosen == replaceAct) {
+        emit replaceClipRequested(TrackKind::Video,
+                                  m_videoTracks.indexOf(track), clipIndex);
+    }
     else if (chosen == freezeFrameAct) freezeFrameAtPlayhead(track, clipIndex);
     else if (chosen == silenceCutAct) applySilenceCutToClip(track, clipIndex);
     else if (chosen == beatMarkerAct) applyBeatMarkersToClip(track, clipIndex);
@@ -6401,6 +7892,10 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     else if (chosen == fillRightAct) applyLinkedAudioChannelMode(AudioChannelMode::FillRight);
     else if (chosen == swapAct) applyLinkedAudioChannelMode(AudioChannelMode::Swap);
     else if (chosen == monoAct) applyLinkedAudioChannelMode(AudioChannelMode::Mono);
+    else if (chosen == autoOrientAct) {
+        setClipAutoOrientEnabled(TrackKind::Video, m_videoTracks.indexOf(track),
+                                 clipIndex, autoOrientAct->isChecked());
+    }
     else if (chosen == snsFitAct) applySnsFitToClip(track, clipIndex, true, false, QStringLiteral("SNS width fit center"));
     else if (chosen == snsCoverAct) applySnsFitToClip(track, clipIndex, false, true, QStringLiteral("SNS width fill crop"));
     else if (chosen == snsFillAct) applySnsFitToClip(track, clipIndex, false, false, QStringLiteral("SNS restore fullscreen"));
@@ -6468,7 +7963,7 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
              || chosen == puAct || chosen == pdAct
              || chosen == czAct || chosen == scwAct || chosen == sccwAct
              || chosen == wplAct || chosen == wprAct || chosen == glAct
-             || chosen == llAct || chosen == fhAct || chosen == fvAct
+             || chosen == mcAct || chosen == llAct || chosen == fhAct || chosen == fvAct
              || chosen == lfAct || chosen == fbAct
              || chosen == skAct || chosen == chAct
              || chosen == irAct || chosen == ircAct
@@ -6505,6 +8000,7 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
         else if (chosen == wplAct)  t.type = TransitionType::WhipPanLeft;
         else if (chosen == wprAct)  t.type = TransitionType::WhipPanRight;
         else if (chosen == glAct)   t.type = TransitionType::Glitch;
+        else if (chosen == mcAct)   t.type = TransitionType::MorphCut;
         else if (chosen == llAct)   t.type = TransitionType::LightLeak;
         else if (chosen == lfAct)   t.type = TransitionType::LensFlare;
         else if (chosen == fbAct)   t.type = TransitionType::FilmBurn;
@@ -6520,6 +8016,24 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     }
     else if (chosen == transDialogAct) emit transitionDialogRequested();
     else if (transClearAct && chosen == transClearAct) clearTransitionsOnSelected();
+    else if (shapeModifiersAct && chosen == shapeModifiersAct) {
+        const int trackIdx = m_videoTracks.indexOf(track);
+        if (trackIdx < 0 || track->isLocked()) return;
+        // Copy before entering the nested event loop; preview replaces the clips vector.
+        const ShapeModifiers original = track->clips()[clipIndex].shapes.first().modifiers;
+        ShapeModifierDialog dialog(original, this);
+        bool changed = false;
+        connect(&dialog, &ShapeModifierDialog::modifiersChanged, this, [&]() {
+            changed = true;
+            setClipShapeModifiers(trackIdx, clipIndex, dialog.modifiers(), false);
+        });
+        const bool accepted = dialog.exec() == QDialog::Accepted;
+        const ShapeModifiers finalValue = dialog.modifiers();
+        // Restore the original before committing so one user operation is one undo.
+        if (changed) setClipShapeModifiers(trackIdx, clipIndex, original, false);
+        if (accepted && changed && finalValue.toJson() != original.toJson())
+            setClipShapeModifiers(trackIdx, clipIndex, finalValue, true);
+    }
     else if (chosen == fxAct) emit videoEffectsDialogRequested();
     else if (chosen == ccAct) emit colorCorrectionRequested();
     else if (chosen == adjustmentAct) {
@@ -6899,6 +8413,82 @@ void Timeline::setClipLayerMaterial(int trackIdx, int clipIdx,
     scheduleEmitSequenceChanged();
 }
 
+void Timeline::setClipShapeModifiers(int trackIdx, int clipIdx,
+                                     const ShapeModifiers &modifiers, bool recordUndo)
+{
+    if (trackIdx < 0 || trackIdx >= m_videoTracks.size()) return;
+    auto *track = m_videoTracks[trackIdx];
+    if (!track || track->isLocked()) return;
+    auto clips = track->clips();
+    if (clipIdx < 0 || clipIdx >= clips.size() || clips[clipIdx].shapes.isEmpty()) return;
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    clips[clipIdx].shapes[0].modifiers = modifiers;
+    track->setClips(clips);
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+    if (recordUndo) saveUndoState(QStringLiteral("シェイプモディファイア"));
+    scheduleEmitSequenceChanged();
+}
+
+bool Timeline::applyAudioCrossfade(int trackIndex, int clipIndexA,
+                                   double durationSec, QString *errorOut)
+{
+    if (trackIndex < 0 || trackIndex >= m_audioTracks.size()
+        || !m_audioTracks[trackIndex]) {
+        if (errorOut)
+            *errorOut = QStringLiteral("音声トラックの index が範囲外です");
+        return false;
+    }
+    TimelineTrack *track = m_audioTracks[trackIndex];
+    if (track->isLocked()) {
+        if (errorOut)
+            *errorOut = QStringLiteral("音声トラックがロックされています");
+        return false;
+    }
+
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    QVector<ClipInfo> clips = track->clips();
+    if (!audioxfade::applyCrossfade(clips, clipIndexA, durationSec, errorOut))
+        return false;
+    track->setClips(clips);
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+    saveUndoState(QStringLiteral("音声クロスフェード"));
+    scheduleEmitSequenceChanged();
+    return true;
+}
+
+bool Timeline::applyAudioFade(int trackIndex, int clipIndex,
+                              AudioFadeEdge edge, double durationSec,
+                              QString *errorOut)
+{
+    if (trackIndex < 0 || trackIndex >= m_audioTracks.size()
+        || !m_audioTracks[trackIndex]) {
+        if (errorOut)
+            *errorOut = QStringLiteral("音声トラックの index が範囲外です");
+        return false;
+    }
+    TimelineTrack *track = m_audioTracks[trackIndex];
+    if (track->isLocked()) {
+        if (errorOut)
+            *errorOut = QStringLiteral("音声トラックがロックされています");
+        return false;
+    }
+
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    QVector<ClipInfo> clips = track->clips();
+    if (!audioxfade::applyFade(clips, clipIndex, edge, durationSec, errorOut))
+        return false;
+    track->setClips(clips);
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+    saveUndoState(edge == AudioFadeEdge::In
+                      ? QStringLiteral("音声フェードイン")
+                      : QStringLiteral("音声フェードアウト"));
+    scheduleEmitSequenceChanged();
+    return true;
+}
+
 void Timeline::applyTransitionToSelected(const Transition &t)
 {
     int sel = m_videoTrack->selectedClip();
@@ -7109,12 +8699,73 @@ void Timeline::setClipEffectsAndKeyframes(int trackIdx, int clipIdx,
 
 void Timeline::setClipKeyframes(const KeyframeManager &km)
 {
+    if (!m_videoTrack)
+        return;
     int sel = m_videoTrack->selectedClip();
-    if (sel < 0) return;
-    auto clips = m_videoTrack->clips();
-    clips[sel].keyframes = km;
-    m_videoTrack->setClips(clips);
-    saveUndoState("Keyframes");
+    if (sel < 0)
+        return;
+    setClipKeyframes(TrackKind::Video, 0, sel, km);
+}
+
+bool Timeline::setClipKeyframes(TrackKind kind, int trackIndex, int clipIndex,
+                                const KeyframeManager &km)
+{
+    if (kind != TrackKind::Video)
+        return false;
+    TimelineTrack *track = trackAt(false, trackIndex);
+    if (!track)
+        return false;
+    QVector<ClipInfo> clips = track->clips();
+    if (clipIndex < 0 || clipIndex >= clips.size())
+        return false;
+    clips[clipIndex].keyframes = km;
+    track->setClips(clips);
+    saveUndoState(QStringLiteral("Keyframes"));
+    scheduleEmitSequenceChanged();
+    return true;
+}
+
+bool Timeline::applyDynamicZoom(TrackKind kind, int trackIndex, int clipIndex,
+                                const dynzoom::Rect& start,
+                                const dynzoom::Rect& end,
+                                dynzoom::Easing easing)
+{
+    if (kind != TrackKind::Video)
+        return false;
+    TimelineTrack *track = trackAt(false, trackIndex);
+    if (!track || track->isLocked())
+        return false;
+
+    QVector<ClipInfo> clips = track->clips();
+    if (clipIndex < 0 || clipIndex >= clips.size())
+        return false;
+    const double duration = clips.at(clipIndex).effectiveDuration();
+    if (!std::isfinite(duration) || duration <= 0.0)
+        return false;
+    const auto validRect = [](const dynzoom::Rect& rect) {
+        return std::isfinite(rect.cx) && std::isfinite(rect.cy)
+            && std::isfinite(rect.w) && rect.w > 0.0;
+    };
+    if (!validRect(start) || !validRect(end))
+        return false;
+
+    const dynzoom::Result generated = dynzoom::build(
+        start, end, 0.0, duration, easing);
+    KeyframeManager keyframes = clips.at(clipIndex).keyframes;
+    keyframes.addTrack(generated.positionX);
+    keyframes.addTrack(generated.positionY);
+    keyframes.addTrack(generated.scaleX);
+    keyframes.addTrack(generated.scaleY);
+
+    // Keep the four TransformAnimator tracks as the sole stored source.
+    // clipanim resolves the runtime motion.* names from these public tracks
+    // at read time, so no mirrored tracks are persisted. Removing stale
+    // mirrors also migrates projects saved by the older dual-write scheme.
+    keyframes.removeTrack(QStringLiteral("motion.position.x"));
+    keyframes.removeTrack(QStringLiteral("motion.position.y"));
+    keyframes.removeTrack(QStringLiteral("motion.scale"));
+
+    return setClipKeyframes(kind, trackIndex, clipIndex, keyframes);
 }
 
 ColorCorrection Timeline::clipColorCorrection() const
@@ -7205,6 +8856,31 @@ void Timeline::overwriteClip3PointActive(double timelineStartSec, const ClipInfo
     auto *track = m_videoTracks.first();
     track->overwriteClip3Point(timelineStartSec, clip);
     saveUndoState("3点編集: 上書き");
+}
+
+bool Timeline::insertShapeClipAtPlayhead(const ClipInfo &clip)
+{
+    if (clip.shapes.isEmpty() || m_videoTracks.isEmpty())
+        return false;
+
+    TimelineTrack *track = nullptr;
+    if (m_activeVideoTrackIndex >= 0
+        && m_activeVideoTrackIndex < m_videoTracks.size()) {
+        track = m_videoTracks[m_activeVideoTrackIndex];
+    }
+    if (!track)
+        track = m_videoTracks.first();
+    if (!track || track->isLocked())
+        return false;
+
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    track->insertClip3Point(qMax(0.0, m_playheadPos), clip);
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+    saveUndoState(QStringLiteral("シェイプクリップを挿入"));
+    updateInfoLabel();
+    scheduleEmitSequenceChanged();
+    return true;
 }
 
 void Timeline::rippleDeleteTimeRangeActive(double startSec, double endSec)
@@ -7459,6 +9135,7 @@ void Timeline::toggleMuteTrack(int audioTrackIndex)
     if (audioTrackIndex < 0 || audioTrackIndex >= m_audioTracks.size()) return;
     auto *track = m_audioTracks[audioTrackIndex];
     track->setMuted(!track->isMuted());
+    syncTrackHeaderFlags(track);
     // Re-emit so AudioMixer picks up the new audioMuted flag for every
     // entry on this track. Without this the mute toggle stayed silent
     // until the next clip edit triggered a sequence rebuild.
@@ -7476,6 +9153,7 @@ void Timeline::toggleSoloTrack(int audioTrackIndex)
         const bool nowSolo = (i == audioTrackIndex && newSolo);
         if (wasSolo != nowSolo) {
             m_audioTracks[i]->setSolo(nowSolo);
+            syncTrackHeaderFlags(m_audioTracks[i]);
             emit trackSoloChanged(i, nowSolo);
         }
     }
@@ -8231,11 +9909,93 @@ void Timeline::ensureSequenceFitsViewport()
     }
 }
 
+void Timeline::applyOverlapTransitionsToIntervals(
+    QVector<OverlapInterval> &trackIvs,
+    const std::function<double(const OverlapInterval &)> &trailAvailable,
+    const std::function<double(const OverlapInterval &)> &leadAvailable)
+{
+    for (int j = 1; j < trackIvs.size(); ++j) {
+        OverlapInterval &a = trackIvs[j - 1];
+        OverlapInterval &b = trackIvs[j];
+        if (!isOverlapTransition(a.trailOutType)) continue;
+        if (a.trailOutType != b.leadInType) continue;
+        if (qAbs(a.timelineEnd - b.timelineStart) > 1e-3) continue;
+        const double askedD = qMin(a.trailOutDuration, b.leadInDuration);
+        if (askedD <= 0.0) continue;
+        const double aSpeed = (a.speed > 0.0) ? a.speed : 1.0;
+        const double bSpeed = (b.speed > 0.0) ? b.speed : 1.0;
+        // A's trail handle = source frames past clipOut, divided by speed.
+        // We grab the source duration from the owning ClipInfo since the
+        // Interval struct does not carry it.
+        const double aTrailAvailable = trailAvailable(a);
+        const double bLeadAvailable = leadAvailable(b);
+
+        double aExtend = 0.0, bRetract = 0.0;
+        switch (a.trailOutAlignment) {
+            case TransitionAlignment::Start:
+                // Premiere "Start at Cut": entire transition AFTER cut.
+                // Consumes A's trail handle only; B stays put.
+                aExtend = qMin(askedD, aTrailAvailable);
+                break;
+            case TransitionAlignment::End:
+                // Premiere "End at Cut": entire transition BEFORE cut.
+                // Consumes B's lead handle only; A stays put.
+                bRetract = qMin(askedD, bLeadAvailable);
+                break;
+            case TransitionAlignment::Center:
+                // Premiere default: D/2 each side, with borrowing when
+                // one side runs short so the user gets the requested
+                // duration whenever physics allow.
+                aExtend  = qMin(askedD * 0.5, aTrailAvailable);
+                bRetract = qMin(askedD * 0.5, bLeadAvailable);
+                if (aExtend + bRetract < askedD) {
+                    if (bRetract < askedD * 0.5) {
+                        const double slack = qMin(askedD - aExtend - bRetract,
+                                                  aTrailAvailable - aExtend);
+                        if (slack > 0.0) aExtend += slack;
+                    }
+                    if (aExtend + bRetract < askedD && aExtend < askedD * 0.5) {
+                        const double slack = qMin(askedD - aExtend - bRetract,
+                                                  bLeadAvailable - bRetract);
+                        if (slack > 0.0) bRetract += slack;
+                    }
+                }
+                break;
+        }
+        const double effectiveD = aExtend + bRetract;
+        if (effectiveD < 0.01) continue;
+
+        a.clipOut       += aExtend * aSpeed;
+        a.timelineEnd   += aExtend;
+        b.timelineStart -= bRetract;
+        b.clipIn        -= bRetract * bSpeed;
+        a.trailOutDuration = effectiveD;
+        b.leadInDuration   = effectiveD;
+    }
+}
+
+QVector<QVector<OverlapInterval>> Timeline::videoOverlapIntervals() const
+{
+    QVector<QVector<OverlapInterval>> intervals;
+    computePlaybackSequenceImpl(&intervals);
+    return intervals;
+}
+
 QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
 {
+    return computePlaybackSequenceImpl(nullptr);
+}
+
+QVector<PlaybackEntry> Timeline::computePlaybackSequenceImpl(
+    QVector<QVector<OverlapInterval>> *overlapIntervals) const
+{
     QVector<PlaybackEntry> result;
-    if (m_videoTracks.isEmpty())
+    QVector<VideoReversedPlaybackBinding> reversedBindings;
+    if (m_videoTracks.isEmpty()) {
+        if (!overlapIntervals)
+            setVideoReversedPlaybackBindings(reversedBindings);
         return result;
+    }
 
     // PiP overlay resolution: every visible track contributes its full clip
     // intervals without mutual subtraction. The compositor stacks layers using
@@ -8243,12 +10003,8 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
     // walks the sorted sequence in order, so the (timelineStart, sourceTrack
     // asc) sort below keeps V1 as the "primary" entry when multiple overlap.
 
-    struct Interval {
-        double timelineStart;
-        double timelineEnd;
-        double clipIn;
-        double clipOut;
-        double speed;
+    struct Interval : OverlapInterval {
+        bool reversed = false;
         QString filePath;
         int trackIdx;
         // US-T35 per-clip video source transform + owning clip index for
@@ -8269,15 +10025,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         double volume = 1.0;
         double pan = 0.0;
         QVector<AudioGainPoint> volumeEnvelope;
-        int clipIdx = -1;
-        TransitionType leadInType = TransitionType::None;
-        double leadInDuration = 0.0;
         TransitionAlignment leadInAlignment = TransitionAlignment::Center;
-        TransitionEasing leadInEasing = TransitionEasing::Linear;
-        TransitionType trailOutType = TransitionType::None;
-        double trailOutDuration = 0.0;
-        TransitionAlignment trailOutAlignment = TransitionAlignment::Center;
-        TransitionEasing trailOutEasing = TransitionEasing::Linear;
         QVector<StabilizerKeyframe> stabilizerKeyframes;
     };
 
@@ -8316,6 +10064,11 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         if (sourceOut <= sourceIn)
             return true;
 
+        QVector<QString> reverseScanStack = sequenceStack;
+        const bool reverseCompositionActive = parentClip.reversed
+            || sequenceContainsReversedClip(
+                sequenceSnapshot, refId, /*audio=*/false,
+                reverseScanStack);
         sequenceStack.append(refId);
         for (const QVector<ClipInfo> &track : sequence->videoTracks) {
             double childAccum = 0.0;
@@ -8337,14 +10090,41 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
                 const double childSpeed = (child.speed > 0.0) ? child.speed : 1.0;
                 const double localIn = overlapStart - childAccum;
                 const double localOut = overlapEnd - childAccum;
-                const double childTimelineStart =
-                    parentTimelineStart + (overlapStart - sourceIn) / parentSpeed;
+                const NestedSequenceIntervalMapping parentInterval =
+                    mapNestedSequenceInterval(
+                        parentClip, parentTimelineStart, sourceIn,
+                        overlapStart, overlapEnd, parentSpeed,
+                        reverseCompositionActive);
+                const double childTimelineStart = parentInterval.timelineStart;
+                const double childTimelineEnd = parentInterval.timelineEnd;
+                double childSourceIn = child.inPoint + localIn * childSpeed;
+                double childSourceOut = child.inPoint + localOut * childSpeed;
+                double combinedSpeed = childSpeed * parentSpeed;
+                bool effectiveReversed = false;
+                if (reverseCompositionActive) {
+                    const double mappedAtLocalIn =
+                        child.sourceSecondAtLocalTime(localIn);
+                    const double mappedAtLocalOut =
+                        child.sourceSecondAtLocalTime(localOut);
+                    childSourceIn = qMin(mappedAtLocalIn, mappedAtLocalOut);
+                    childSourceOut = qMax(mappedAtLocalIn, mappedAtLocalOut);
+                    const bool childDescending =
+                        mappedAtLocalOut + 1e-9 < mappedAtLocalIn;
+                    effectiveReversed = parentInterval.runsBackward
+                        != childDescending;
+                    const double timelineSpan = qMax(
+                        1e-9, childTimelineEnd - childTimelineStart);
+                    combinedSpeed = qMax(
+                        1e-9,
+                        (childSourceOut - childSourceIn) / timelineSpan);
+                }
 
                 if (child.isSequenceReference()) {
                     ClipInfo nested = child;
-                    nested.inPoint = child.inPoint + localIn * childSpeed;
-                    nested.outPoint = child.inPoint + localOut * childSpeed;
-                    nested.speed = childSpeed * parentSpeed;
+                    nested.inPoint = childSourceIn;
+                    nested.outPoint = childSourceOut;
+                    nested.speed = combinedSpeed;
+                    nested.reversed = effectiveReversed;
                     nested.opacity = child.opacity * parentClip.opacity;
                     nested.volume = child.volume * parentClip.volume;
                     nested.pan = qBound(-1.0, child.pan + parentClip.pan, 1.0);
@@ -8357,10 +10137,11 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
 
                 Interval iv;
                 iv.timelineStart = childTimelineStart;
-                iv.timelineEnd = parentTimelineStart + (overlapEnd - sourceIn) / parentSpeed;
-                iv.clipIn = child.inPoint + localIn * childSpeed;
-                iv.clipOut = child.inPoint + localOut * childSpeed;
-                iv.speed = childSpeed * parentSpeed;
+                iv.timelineEnd = childTimelineEnd;
+                iv.clipIn = childSourceIn;
+                iv.clipOut = childSourceOut;
+                iv.speed = combinedSpeed;
+                iv.reversed = effectiveReversed;
                 if (child.timeRemapCurve.keys.size() == 1) {
                     const double childSourceOut = (child.outPoint > 0.0) ? child.outPoint : child.duration;
                     const double holdSource =
@@ -8402,6 +10183,9 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
                 iv.trailOutDuration = child.trailOut.duration;
                 iv.trailOutAlignment = child.trailOut.alignment;
                 iv.trailOutEasing = child.trailOut.easing;
+                iv.softness = child.trailOut.softness;
+                iv.borderWidth = child.trailOut.borderWidth;
+                iv.borderColor = child.trailOut.borderColor;
                 iv.stabilizerKeyframes = child.stabilizerKeyframes;
                 out.append(iv);
 
@@ -8441,6 +10225,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
                 iv.clipIn = c.inPoint;
                 iv.clipOut = (c.outPoint > 0.0) ? c.outPoint : c.duration;
                 iv.speed = (c.speed > 0.0) ? c.speed : 1.0;
+                iv.reversed = c.reversed;
                 if (c.timeRemapCurve.keys.size() == 1) {
                     const double sourceOut = (c.outPoint > 0.0) ? c.outPoint : c.duration;
                     const double holdSource =
@@ -8477,6 +10262,9 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
                 iv.trailOutDuration = c.trailOut.duration;
                 iv.trailOutAlignment = c.trailOut.alignment;
                 iv.trailOutEasing = c.trailOut.easing;
+                iv.softness = c.trailOut.softness;
+                iv.borderWidth = c.trailOut.borderWidth;
+                iv.borderColor = c.trailOut.borderColor;
                 iv.stabilizerKeyframes = c.stabilizerKeyframes;
                 ivs.append(iv);
                 accum += clipDur;
@@ -8485,86 +10273,32 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         trackIntervals.append(ivs);
     }
 
-    // Premiere-style overlap for boundary transitions. Center-at-Cut
-    // alignment (Premiere default): the transition is split so half lives
-    // in A's trail handle and half in B's lead handle. Each side may
-    // borrow from the other when its own handle runs short, gracefully
-    // degrading toward End-at-Cut (A no trail) or Start-at-Cut (B no lead)
-    // before giving up. We only kick in when the two intervals are
-    // adjacent on the timeline (no leadIn gap on B), since a deliberate
-    // gap means the user wants a hard cut, not a transition.
     for (auto &trackIvs : trackIntervals) {
-        for (int j = 1; j < trackIvs.size(); ++j) {
-            Interval &a = trackIvs[j - 1];
-            Interval &b = trackIvs[j];
-            if (!isOverlapTransition(a.trailOutType)) continue;
-            if (a.trailOutType != b.leadInType) continue;
-            if (qAbs(a.timelineEnd - b.timelineStart) > 1e-3) continue;
-            const double askedD = qMin(a.trailOutDuration, b.leadInDuration);
-            if (askedD <= 0.0) continue;
-            const double aSpeed = (a.speed > 0.0) ? a.speed : 1.0;
-            const double bSpeed = (b.speed > 0.0) ? b.speed : 1.0;
-            // A's trail handle = source frames past clipOut, divided by speed.
-            // We grab the source duration from the owning ClipInfo since the
-            // Interval struct does not carry it.
-            double aTrailAvailable = 0.0;
-            auto *aTrack = m_videoTracks.value(a.trackIdx, nullptr);
-            if (aTrack && a.clipIdx >= 0 && a.clipIdx < aTrack->clips().size()) {
-                const auto &ac = aTrack->clips()[a.clipIdx];
-                aTrailAvailable = qMax(0.0, (ac.duration - a.clipOut) / aSpeed);
-            }
-            const double bLeadAvailable = qMax(0.0, b.clipIn / bSpeed);
-
-            double aExtend = 0.0, bRetract = 0.0;
-            switch (a.trailOutAlignment) {
-                case TransitionAlignment::Start:
-                    // Premiere "Start at Cut": entire transition AFTER cut.
-                    // Consumes A's trail handle only; B stays put.
-                    aExtend = qMin(askedD, aTrailAvailable);
-                    break;
-                case TransitionAlignment::End:
-                    // Premiere "End at Cut": entire transition BEFORE cut.
-                    // Consumes B's lead handle only; A stays put.
-                    bRetract = qMin(askedD, bLeadAvailable);
-                    break;
-                case TransitionAlignment::Center:
-                    // Premiere default: D/2 each side, with borrowing when
-                    // one side runs short so the user gets the requested
-                    // duration whenever physics allow.
-                    aExtend  = qMin(askedD * 0.5, aTrailAvailable);
-                    bRetract = qMin(askedD * 0.5, bLeadAvailable);
-                    if (aExtend + bRetract < askedD) {
-                        if (bRetract < askedD * 0.5) {
-                            const double slack = qMin(askedD - aExtend - bRetract,
-                                                      aTrailAvailable - aExtend);
-                            if (slack > 0.0) aExtend += slack;
-                        }
-                        if (aExtend + bRetract < askedD && aExtend < askedD * 0.5) {
-                            const double slack = qMin(askedD - aExtend - bRetract,
-                                                      bLeadAvailable - bRetract);
-                            if (slack > 0.0) bRetract += slack;
-                        }
-                    }
-                    break;
-            }
-            const double effectiveD = aExtend + bRetract;
-            if (effectiveD < 0.01) continue;
-
-            a.clipOut       += aExtend * aSpeed;
-            a.timelineEnd   += aExtend;
-            b.timelineStart -= bRetract;
-            b.clipIn        -= bRetract * bSpeed;
-            a.trailOutDuration = effectiveD;
-            b.leadInDuration   = effectiveD;
-            qInfo() << "[SEQ] overlap pair:"
-                    << Transition::typeName(a.trailOutType)
-                    << "track=" << a.trackIdx
-                    << "askedD=" << askedD
-                    << "aTrail=" << aTrailAvailable << "bLead=" << bLeadAvailable
-                    << "aExtend=" << aExtend << "bRetract=" << bRetract
-                    << "effectiveD=" << effectiveD;
-        }
+        QVector<OverlapInterval> shared;
+        for (const auto &iv : trackIvs)
+            shared.append(static_cast<const OverlapInterval &>(iv));
+        applyOverlapTransitionsToIntervals(shared,
+            [&](const OverlapInterval &a) {
+                const int index = int(&a - shared.constData());
+                auto *track = m_videoTracks.value(trackIvs[index].trackIdx, nullptr);
+                if (!track || a.clipIdx < 0 || a.clipIdx >= track->clips().size())
+                    return 0.0;
+                return qMax(0.0, (track->clips()[a.clipIdx].duration - a.clipOut)
+                                      / (a.speed > 0.0 ? a.speed : 1.0));
+            },
+            [](const OverlapInterval &b) {
+                return qMax(0.0, b.clipIn / (b.speed > 0.0 ? b.speed : 1.0));
+            });
+        for (int i = 0; i < trackIvs.size(); ++i)
+            static_cast<OverlapInterval &>(trackIvs[i]) = shared[i];
+        if (overlapIntervals)
+            overlapIntervals->append(shared);
     }
+
+    // The export accessor needs only bounds, not playback bindings or the
+    // flattened public entries. Keep its read path free of binding writes.
+    if (overlapIntervals)
+        return result;
 
     QVector<Interval> visible;
     for (const auto &trackClips : trackIntervals) {
@@ -8616,7 +10350,11 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         e.trailOutType = iv.trailOutType;
         e.trailOutDuration = iv.trailOutDuration;
         e.trailOutEasing = iv.trailOutEasing;
+        e.softness = iv.softness;
+        e.borderWidth = iv.borderWidth;
+        e.borderColor = iv.borderColor;
         e.stabilizerKeyframes = iv.stabilizerKeyframes;
+        reversedBindings.append({e, iv.reversed});
         // STAGE4B: carry this entry's track-matte assignment (if any) so the
         // live GPU compositor can apply it identically to the export path
         // (TimelineFrameRenderer.cpp:792-814). This is pure data plumbing —
@@ -8649,7 +10387,25 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequence() const
         }
         result.append(e);
     }
+    setVideoReversedPlaybackBindings(reversedBindings);
     return result;
+}
+
+namespace {
+// GUI-thread test controls; resetting the switch also resets instrumentation.
+bool audioOverlapEnabled = true;
+int audioOverlapCalls = 0;
+}
+
+void Timeline::setAudioOverlapEnabledForTest(bool enabled)
+{
+    audioOverlapEnabled = enabled;
+    audioOverlapCalls = 0;
+}
+
+int Timeline::audioOverlapCallCountForTest()
+{
+    return audioOverlapCalls;
 }
 
 QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
@@ -8663,10 +10419,17 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
     // to reuse open file contexts across re-emits.
     QVector<PlaybackEntry> result;
     QVector<AudioChannelModePlaybackBinding> channelModeBindings;
+    QVector<AudioReversedPlaybackBinding> reversedBindings;
     if (m_audioTracks.isEmpty()) {
         setAudioChannelModePlaybackBindings(channelModeBindings);
+        setAudioReversedPlaybackBindings(reversedBindings);
         return result;
     }
+
+    const auto appendReversedBinding = [&reversedBindings](
+        const PlaybackEntry &entry, bool reversed) {
+        reversedBindings.append({entry, reversed});
+    };
 
     const QVector<TimelineSequence> sequenceSnapshot = sequences();
     auto findSequence = [&sequenceSnapshot](const QString &id) -> const TimelineSequence * {
@@ -8675,6 +10438,76 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
                 return &sequence;
         }
         return nullptr;
+    };
+
+    // First pass: project each audio track into the SAME overlap solver as
+    // video. Reverse sources use reflected coordinates so the solver's
+    // clipOut always represents the timeline's trailing source edge.
+    const auto audioIntervals = [](const QVector<ClipInfo> &clips) {
+        QVector<OverlapInterval> intervals;
+        double accum = 0.0;
+        bool hasPair = false;
+        for (int i = 0; i < clips.size(); ++i) {
+            const ClipInfo &c = clips[i];
+            accum += qMax(0.0, c.leadInSec); // including zero-length clips
+            const double duration = c.effectiveDuration();
+            if (duration <= 0.0)
+                continue;
+            OverlapInterval iv;
+            iv.clipIdx = i;
+            iv.timelineStart = accum;
+            iv.timelineEnd = accum + duration;
+            iv.speed = c.speed > 0.0 ? c.speed : 1.0;
+            const double out = c.outPoint > 0.0 ? c.outPoint : c.duration;
+            iv.clipIn = c.reversed ? c.duration - out : c.inPoint;
+            iv.clipOut = c.reversed ? c.duration - c.inPoint : out;
+            // US-206's compatibility exception is specifically CrossDissolve.
+            // Other authored audio transitions retain their legacy positions;
+            // only this solver projection masks them, never the emitted entry.
+            iv.leadInType = c.leadIn.type == TransitionType::CrossDissolve
+                ? c.leadIn.type : TransitionType::None;
+            iv.leadInDuration = c.leadIn.duration;
+            iv.leadInEasing = c.leadIn.easing;
+            iv.trailOutType = c.trailOut.type == TransitionType::CrossDissolve
+                ? c.trailOut.type : TransitionType::None;
+            iv.trailOutDuration = c.trailOut.duration;
+            iv.trailOutAlignment = c.trailOut.alignment;
+            iv.trailOutEasing = c.trailOut.easing;
+            if (!intervals.isEmpty()) {
+                const auto &a = intervals.last();
+                hasPair |= isOverlapTransition(a.trailOutType)
+                    && a.trailOutType == iv.leadInType
+                    && qAbs(a.timelineEnd - iv.timelineStart) <= 1e-3
+                    && qMin(a.trailOutDuration, iv.leadInDuration) > 0.0;
+            }
+            intervals.append(iv);
+            accum += duration;
+        }
+        if (audioOverlapEnabled && hasPair) {
+            ++audioOverlapCalls;
+            Timeline::applyOverlapTransitionsToIntervals(intervals,
+                [&clips](const OverlapInterval &a) {
+                    return qMax(0.0, (clips[a.clipIdx].duration - a.clipOut) / a.speed);
+                }, [](const OverlapInterval &b) {
+                    return qMax(0.0, b.clipIn / b.speed);
+                });
+        }
+        return intervals;
+    };
+    const auto intervalClip = [](const ClipInfo &original, const OverlapInterval &iv) {
+        ClipInfo c = original;
+        // Apply deltas, avoiding roundoff and outPoint normalization on the
+        // disabled/default path (including reversed clips).
+        const double out = c.outPoint > 0.0 ? c.outPoint : c.duration;
+        const double oldIn = c.reversed ? c.duration - out : c.inPoint;
+        const double oldOut = c.reversed ? c.duration - c.inPoint : out;
+        if (iv.clipIn != oldIn || iv.clipOut != oldOut) {
+            c.inPoint = c.reversed ? c.inPoint - (iv.clipOut - oldOut) : iv.clipIn;
+            c.outPoint = c.reversed ? out - (iv.clipIn - oldIn) : iv.clipOut;
+        }
+        c.leadIn.duration = iv.leadInDuration;
+        c.trailOut.duration = iv.trailOutDuration;
+        return c;
     };
 
     std::function<bool(const ClipInfo &, double, int, int, bool, int,
@@ -8703,51 +10536,88 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
         if (sourceOut <= sourceIn)
             return true;
 
+        QVector<QString> reverseScanStack = sequenceStack;
+        const bool reverseCompositionActive = parentClip.reversed
+            || sequenceContainsReversedClip(
+                sequenceSnapshot, refId, /*audio=*/true,
+                reverseScanStack);
         sequenceStack.append(refId);
         for (const QVector<ClipInfo> &track : sequence->audioTracks) {
-            double childAccum = 0.0;
-            for (int childIdx = 0; childIdx < track.size(); ++childIdx) {
-                const ClipInfo &child = track[childIdx];
-                childAccum += qMax(0.0, child.leadInSec);
-                const double childDur = child.effectiveDuration();
-                if (childDur <= 0.0)
-                    continue;
+            const auto intervals = audioIntervals(track);
+            const bool expanded = std::any_of(intervals.cbegin(), intervals.cend(),
+                [&track](const OverlapInterval &iv) {
+                    const auto &c = track[iv.clipIdx];
+                    const double out = c.outPoint > 0.0 ? c.outPoint : c.duration;
+                    return iv.clipIn != (c.reversed ? c.duration - out : c.inPoint)
+                        || iv.clipOut != (c.reversed ? c.duration - c.inPoint : out);
+                });
+            for (const OverlapInterval &iv : intervals) {
+                const ClipInfo child = intervalClip(track[iv.clipIdx], iv);
+                const double childAccum = iv.timelineStart;
 
                 const double overlapStart = qMax(sourceIn, childAccum);
-                const double overlapEnd = qMin(sourceOut, childAccum + childDur);
+                const double overlapEnd = qMin(sourceOut, iv.timelineEnd);
                 if (overlapEnd <= overlapStart) {
-                    childAccum += childDur;
                     continue;
                 }
 
                 const double childSpeed = (child.speed > 0.0) ? child.speed : 1.0;
                 const double localIn = overlapStart - childAccum;
                 const double localOut = overlapEnd - childAccum;
-                const double childTimelineStart =
-                    parentTimelineStart + (overlapStart - sourceIn) / parentSpeed;
+                const NestedSequenceIntervalMapping parentInterval =
+                    mapNestedSequenceInterval(
+                        parentClip, parentTimelineStart, sourceIn,
+                        overlapStart, overlapEnd, parentSpeed,
+                        reverseCompositionActive);
+                const double childTimelineStart = parentInterval.timelineStart;
+                const double childTimelineEnd = parentInterval.timelineEnd;
+                double childSourceIn = child.inPoint + localIn * childSpeed;
+                double childSourceOut = child.inPoint + localOut * childSpeed;
+                double combinedSpeed = childSpeed * parentSpeed;
+                bool effectiveReversed = false;
+                // Preserve the legacy nested-audio flattening exactly while
+                // reverse is OFF. Only reverse-enabled branches need the
+                // shared source mapper and direction composition.
+                if (reverseCompositionActive) {
+                    const double mappedAtLocalIn =
+                        child.sourceSecondAtLocalTime(localIn);
+                    const double mappedAtLocalOut =
+                        child.sourceSecondAtLocalTime(localOut);
+                    childSourceIn = qMin(mappedAtLocalIn, mappedAtLocalOut);
+                    childSourceOut = qMax(mappedAtLocalIn, mappedAtLocalOut);
+                    const bool childDescending =
+                        mappedAtLocalOut + 1e-9 < mappedAtLocalIn;
+                    effectiveReversed = parentInterval.runsBackward
+                        != childDescending;
+                    const double timelineSpan = qMax(
+                        1e-9, childTimelineEnd - childTimelineStart);
+                    combinedSpeed = qMax(
+                        1e-9,
+                        (childSourceOut - childSourceIn) / timelineSpan);
+                }
 
                 if (child.isSequenceReference()) {
                     ClipInfo nested = child;
-                    nested.inPoint = child.inPoint + localIn * childSpeed;
-                    nested.outPoint = child.inPoint + localOut * childSpeed;
-                    nested.speed = childSpeed * parentSpeed;
+                    nested.inPoint = childSourceIn;
+                    nested.outPoint = childSourceOut;
+                    nested.speed = combinedSpeed;
+                    nested.reversed = effectiveReversed;
                     nested.volume = child.volume * parentClip.volume;
                     nested.pan = qBound(-1.0, child.pan + parentClip.pan, 1.0);
                     appendSequenceAudioEntries(nested, childTimelineStart,
                                                parentTrackIdx, parentClipIdx,
                                                trackMuted, depth + 1,
                                                sequenceStack);
-                    childAccum += childDur;
                     continue;
                 }
 
                 PlaybackEntry e;
                 e.filePath = child.filePath;
-                e.clipIn = child.inPoint + localIn * childSpeed;
-                e.clipOut = child.inPoint + localOut * childSpeed;
+                e.clipIn = childSourceIn;
+                e.clipOut = childSourceOut;
                 e.timelineStart = childTimelineStart;
-                e.timelineEnd = parentTimelineStart + (overlapEnd - sourceIn) / parentSpeed;
-                e.speed = childSpeed * parentSpeed;
+                e.timelineEnd = childTimelineEnd;
+                e.speed = combinedSpeed;
                 // Audio flattening also keeps parent identity so sequence
                 // clips added as linked V/A references route as one parent
                 // timeline item while recursively exposing the leaf media.
@@ -8757,21 +10627,40 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
                 e.pan = qBound(-1.0, child.pan + parentClip.pan, 1.0);
                 e.volumeEnvelope = child.volumeEnvelope;
                 e.sourceClipIndex = parentClipIdx;
-                e.leadInType = child.leadIn.type;
-                e.leadInDuration = child.leadIn.duration;
-                e.leadInEasing = child.leadIn.easing;
-                e.trailOutType = child.trailOut.type;
-                e.trailOutDuration = child.trailOut.duration;
-                e.trailOutEasing = child.trailOut.easing;
+                // Transitions are attached to timeline edges, not source
+                // direction. Reverse the edges only when the parent sequence
+                // itself runs backward; a child-only reverse keeps its
+                // authored fade-in/fade-out positions.
+                const Transition &timelineLead = parentInterval.runsBackward
+                    ? child.trailOut : child.leadIn;
+                const Transition &timelineTrail = parentInterval.runsBackward
+                    ? child.leadIn : child.trailOut;
+                e.leadInType = timelineLead.type;
+                e.leadInDuration = timelineLead.duration;
+                e.leadInEasing = timelineLead.easing;
+                e.trailOutType = timelineTrail.type;
+                e.trailOutDuration = timelineTrail.duration;
+                e.trailOutEasing = timelineTrail.easing;
+                // Newly expanded edges live in child-sequence seconds. Map
+                // their fade windows along with their intervals, including
+                // a sped-up or backward-running parent. Leave legacy fades
+                // byte-identical when this track has not been expanded.
+                if (expanded) {
+                    const double timeScale = (childTimelineEnd - childTimelineStart)
+                        / (overlapEnd - overlapStart);
+                    if (e.leadInType == TransitionType::CrossDissolve)
+                        e.leadInDuration *= timeScale;
+                    if (e.trailOutType == TransitionType::CrossDissolve)
+                        e.trailOutDuration *= timeScale;
+                }
                 result.append(e);
+                appendReversedBinding(e, effectiveReversed);
                 channelModeBindings.append({
                     qRound64(e.clipIn * 1000.0),
                     e.sourceTrack,
                     e.sourceClipIndex,
                     child.audioChannelMode
                 });
-
-                childAccum += childDur;
             }
         }
         sequenceStack.removeLast();
@@ -8783,19 +10672,17 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
         if (!track || track->isHidden()) continue;
         const auto &clips = track->clips();
         const bool trackMuted = track->isMuted();
-        double accum = 0.0;
-        for (int ci = 0; ci < clips.size(); ++ci) {
-            const auto &c = clips[ci];
-            accum += qMax(0.0, c.leadInSec);
-            const double clipDur = c.effectiveDuration();
-            if (clipDur <= 0.0) continue;
+        const auto intervals = audioIntervals(clips);
+        for (const OverlapInterval &iv : intervals) {
+            const int ci = iv.clipIdx;
+            const ClipInfo c = intervalClip(clips[ci], iv);
+            const double accum = iv.timelineStart;
             QVector<QString> sequenceStack;
             if (!m_activeSequenceId.isEmpty())
                 sequenceStack.append(m_activeSequenceId);
             if (c.isSequenceReference()
                 && appendSequenceAudioEntries(c, accum, t, ci, trackMuted,
                                               /*depth=*/0, sequenceStack)) {
-                accum += clipDur;
                 continue;
             }
             PlaybackEntry e;
@@ -8803,7 +10690,7 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
             e.clipIn = c.inPoint;
             e.clipOut = (c.outPoint > 0.0) ? c.outPoint : c.duration;
             e.timelineStart = accum;
-            e.timelineEnd = accum + clipDur;
+            e.timelineEnd = iv.timelineEnd;
             e.speed = (c.speed > 0.0) ? c.speed : 1.0;
             e.sourceTrack = t;
             e.audioMuted = trackMuted;
@@ -8818,13 +10705,13 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
             e.trailOutDuration = c.trailOut.duration;
             e.trailOutEasing = c.trailOut.easing;
             result.append(e);
+            appendReversedBinding(e, c.reversed);
             channelModeBindings.append({
                 qRound64(e.clipIn * 1000.0),
                 e.sourceTrack,
                 e.sourceClipIndex,
                 c.audioChannelMode
             });
-            accum += clipDur;
         }
     }
 
@@ -8838,6 +10725,7 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
                   return a.sourceTrack < b.sourceTrack;
               });
     setAudioChannelModePlaybackBindings(channelModeBindings);
+    setAudioReversedPlaybackBindings(reversedBindings);
     return result;
 }
 
@@ -9316,19 +11204,98 @@ void Timeline::restoreState(const TimelineState &state)
 
 // --- Project save/load ---
 
-QVector<QVector<ClipInfo>> Timeline::allVideoTracks() const
+bool Timeline::setTrackLocked(TrackKind kind, int trackIndex, bool locked)
 {
-    QVector<QVector<ClipInfo>> result;
+    TimelineTrack *track = trackAt(kind == TrackKind::Audio, trackIndex);
+    if (!track)
+        return false;
+    track->setLocked(locked);
+    syncTrackHeaderFlags(track);
+    return true;
+}
+
+QJsonObject Timeline::trackFlagsToJson() const
+{
+    auto flagsForTracks = [](const QVector<TimelineTrack *> &tracks) {
+        QJsonArray result;
+        for (const TimelineTrack *track : tracks) {
+            QJsonObject flags;
+            if (track) {
+                const bool locked = track->isLocked();
+                const bool muted = track->isMuted();
+                const bool solo = track->isSolo();
+                const bool hidden = track->isHidden();
+                if (locked || muted || solo || hidden) {
+                    flags.insert(QStringLiteral("locked"), locked);
+                    flags.insert(QStringLiteral("muted"), muted);
+                    flags.insert(QStringLiteral("solo"), solo);
+                    flags.insert(QStringLiteral("hidden"), hidden);
+                }
+            }
+            result.append(flags);
+        }
+        return result;
+    };
+
+    return QJsonObject{
+        {QStringLiteral("video"), flagsForTracks(m_videoTracks)},
+        {QStringLiteral("audio"), flagsForTracks(m_audioTracks)}
+    };
+}
+
+void Timeline::applyTrackFlagsFromJson(const QJsonObject &flags)
+{
+    bool playbackFlagsChanged = false;
+    auto applyFlags = [this, &playbackFlagsChanged](
+                          const QVector<TimelineTrack *> &tracks,
+                          const QJsonArray &items, bool audio) {
+        for (int index = 0; index < tracks.size(); ++index) {
+            TimelineTrack *track = tracks.at(index);
+            if (!track)
+                continue;
+            const QJsonObject item = index < items.size()
+                ? items.at(index).toObject() : QJsonObject{};
+            const bool locked = item.value(QStringLiteral("locked")).toBool(false);
+            const bool muted = item.value(QStringLiteral("muted")).toBool(false);
+            const bool solo = item.value(QStringLiteral("solo")).toBool(false);
+            const bool hidden = item.value(QStringLiteral("hidden")).toBool(false);
+            const bool soloChanged = track->isSolo() != solo;
+            playbackFlagsChanged = playbackFlagsChanged
+                || track->isMuted() != muted || track->isHidden() != hidden;
+            track->setLocked(locked);
+            track->setMuted(muted);
+            track->setSolo(solo);
+            track->setHidden(hidden);
+            syncTrackHeaderFlags(track);
+            if (audio && soloChanged)
+                emit trackSoloChanged(index, solo);
+        }
+    };
+
+    applyFlags(m_videoTracks,
+               flags.value(QStringLiteral("video")).toArray(), false);
+    applyFlags(m_audioTracks,
+               flags.value(QStringLiteral("audio")).toArray(), true);
+    if (playbackFlagsChanged)
+        scheduleEmitSequenceChanged();
+    updateInfoLabel();
+}
+
+ProjectTrackClips Timeline::allVideoTracks() const
+{
+    ProjectTrackClips result;
     for (const auto *t : m_videoTracks)
         result.append(t->clips());
+    result.trackFlagsSnapshot = trackFlagsToJson();
     return result;
 }
 
-QVector<QVector<ClipInfo>> Timeline::allAudioTracks() const
+ProjectTrackClips Timeline::allAudioTracks() const
 {
-    QVector<QVector<ClipInfo>> result;
+    ProjectTrackClips result;
     for (const auto *t : m_audioTracks)
         result.append(t->clips());
+    result.trackFlagsSnapshot = trackFlagsToJson();
     return result;
 }
 
@@ -9370,6 +11337,20 @@ void Timeline::restoreFromProject(const QVector<QVector<ClipInfo>> &videoTracks,
     refreshTextStrip();
     // setClips bypasses modified(); trigger sequence rebuild explicitly.
     scheduleEmitSequenceChanged();
+}
+
+void Timeline::restoreFromProject(const ProjectTrackClips &videoTracks,
+                                  const ProjectTrackClips &audioTracks,
+                                  double playhead, double markInVal,
+                                  double markOutVal, int zoom)
+{
+    QJsonObject flags = videoTracks.trackFlagsSnapshot;
+    if (flags.isEmpty())
+        flags = audioTracks.trackFlagsSnapshot;
+    restoreFromProject(static_cast<const QVector<QVector<ClipInfo>> &>(videoTracks),
+                       static_cast<const QVector<QVector<ClipInfo>> &>(audioTracks),
+                       playhead, markInVal, markOutVal, zoom);
+    applyTrackFlagsFromJson(flags);
 }
 
 // --- Timeline markers (Premiere Pro / DaVinci Resolve parity) ---

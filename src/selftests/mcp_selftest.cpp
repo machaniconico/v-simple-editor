@@ -1,6 +1,7 @@
 #include <QEventLoop>
 #include <QElapsedTimer>
 #include <QAction>
+#include <QByteArray>
 #include <QLabel>
 #include <QPushButton>
 #include <QSettings>
@@ -30,6 +31,7 @@
 #include <QTimer>
 #include <QUrl>
 #include <QUrlQuery>
+#include <QUuid>
 #include <QVector>
 #include <QStringList>
 #include <QSet>
@@ -37,9 +39,11 @@
 #include <QtGlobal>
 
 #include <cmath>
+#include <cstdio>
 #include <limits>
 #include <stdexcept>
 
+#include "../clipanim/ClipAnim.h"
 #include "../mcp/McpEditorTools.h"
 #include "../mcp/McpHttpServer.h"
 #include "../mcp/McpProtocol.h"
@@ -49,8 +53,11 @@
 #include "../CaptionEditorDialog.h"
 #include "../CaptionTrack.h"
 #include "../MainWindow.h"
+#include "../MusicRemix.h"
 #include "../RenderQueue.h"
 #include "../Timeline.h"
+#include "../TimelineFrameRenderer.h"
+#include "../libavcore/Probe.h"
 #include "../UndoManager.h"
 
 namespace {
@@ -768,7 +775,13 @@ int runMcpSelftest()
         QStringLiteral("split_clip"),
         QStringLiteral("delete_clip"),
         QStringLiteral("move_clip"),
+        QStringLiteral("set_track_locked"),
+        QStringLiteral("match_frame"),
+        QStringLiteral("replace_clip"),
+        QStringLiteral("relink_media"),
         QStringLiteral("set_clip_property"),
+        QStringLiteral("dynamic_zoom"),
+        QStringLiteral("set_clip_label"),
         QStringLiteral("trim_clip"),
         QStringLiteral("set_transition"),
         QStringLiteral("add_text_overlay"),
@@ -776,7 +789,9 @@ int runMcpSelftest()
         QStringLiteral("apply_captions"),
         QStringLiteral("set_playhead"),
         QStringLiteral("undo"),
-        QStringLiteral("redo")
+        QStringLiteral("redo"),
+        QStringLiteral("music_remix"),
+        QStringLiteral("dialogue_level")
     };
     bool allWriteToolsListed = true;
     for (const QString& expectedName : expectedWriteToolNames) {
@@ -1060,7 +1075,11 @@ int runMcpSelftest()
 
     const QStringList changedToolNames{
         QStringLiteral("split_clip"), QStringLiteral("delete_clip"),
-        QStringLiteral("move_clip"), QStringLiteral("set_clip_property"),
+        QStringLiteral("move_clip"), QStringLiteral("set_track_locked"),
+        QStringLiteral("match_frame"), QStringLiteral("replace_clip"),
+        QStringLiteral("relink_media"),
+        QStringLiteral("set_clip_property"), QStringLiteral("dynamic_zoom"),
+        QStringLiteral("set_clip_label"),
         QStringLiteral("trim_clip"), QStringLiteral("set_transition"),
         QStringLiteral("add_text_overlay")
     };
@@ -1077,9 +1096,39 @@ int runMcpSelftest()
             {QStringLiteral("clipIndex"), 0}, {QStringLiteral("newStartSec"), 0.0},
             {QStringLiteral("track"), QStringLiteral("video")}
         }},
+        {QStringLiteral("set_track_locked"), QJsonObject{
+            {QStringLiteral("kind"), QStringLiteral("video")},
+            {QStringLiteral("trackIndex"), 0}, {QStringLiteral("locked"), true},
+            {QStringLiteral("track"), QStringLiteral("video")}
+        }},
+        {QStringLiteral("match_frame"), QJsonObject{
+            {QStringLiteral("timeSec"), 0.0},
+            {QStringLiteral("track"), QStringLiteral("video")}
+        }},
+        {QStringLiteral("replace_clip"), QJsonObject{
+            {QStringLiteral("clipIndex"), 0},
+            {QStringLiteral("filePath"), QStringLiteral("missing.mp4")},
+            {QStringLiteral("track"), QStringLiteral("video")}
+        }},
+        {QStringLiteral("relink_media"), QJsonObject{
+            {QStringLiteral("mapping"), QJsonArray{
+                QJsonObject{{QStringLiteral("from"), QStringLiteral("old.mp4")},
+                            {QStringLiteral("to"), QStringLiteral("new.mp4")}}
+            }},
+            {QStringLiteral("track"), QStringLiteral("video")}
+        }},
         {QStringLiteral("set_clip_property"), QJsonObject{
             {QStringLiteral("clipIndex"), 0}, {QStringLiteral("property"), QStringLiteral("volume")},
             {QStringLiteral("value"), 1.0}, {QStringLiteral("track"), QStringLiteral("video")}
+        }},
+        {QStringLiteral("dynamic_zoom"), QJsonObject{
+            {QStringLiteral("clipIndex"), 0},
+            {QStringLiteral("preset"), QStringLiteral("zoomIn")},
+            {QStringLiteral("track"), QStringLiteral("video")}
+        }},
+        {QStringLiteral("set_clip_label"), QJsonObject{
+            {QStringLiteral("clipIndex"), 0}, {QStringLiteral("label"), QStringLiteral("red")},
+            {QStringLiteral("track"), QStringLiteral("video")}
         }},
         {QStringLiteral("trim_clip"), QJsonObject{
             {QStringLiteral("clipIndex"), 0}, {QStringLiteral("edge"), QStringLiteral("in")},
@@ -1144,7 +1193,7 @@ int runMcpSelftest()
             rpcRequest(73, QStringLiteral("tools/list")))))
         .value(QStringLiteral("result")).toObject()
         .value(QStringLiteral("tools")).toArray();
-    constexpr int kExpectedProjectInfoToolCount = 27;
+    constexpr int kExpectedProjectInfoToolCount = 36 + 1 + 2; // US-308: compare_project; US-312: render/decompose
     bool outputSchemasDeclared = projectInfoToolDescriptors.size()
         == kExpectedProjectInfoToolCount;
     for (const QJsonValue& value : projectInfoToolDescriptors) {
@@ -1464,6 +1513,85 @@ int runMcpSelftest()
                 projectTimeline->currentState(), QStringLiteral("MCP selftest baseline"));
         };
 
+        // US-308 reserved G154-G155: compare the same saved/current pair as
+        // the UI and prove comparison does not add undo states or dirty it.
+        {
+            QTemporaryDir diffDirectory;
+            const QString diffPath = QDir(diffDirectory.path()).filePath(QStringLiteral("baseline.veditor"));
+            video0->setClips({makeTestClip(QStringLiteral("project-diff-source.mp4"), 0)});
+            video1->setClips({});
+            audio0->setClips({});
+            audio1->setClips({});
+            projectTimeline->clearSelection();
+            saveTestUndoBaseline();
+            const auto saved = callProjectInfoTool(1540, QStringLiteral("save_project"),
+                QJsonObject{{QStringLiteral("path"), diffPath}});
+            const auto moved = callProjectInfoTool(1541, QStringLiteral("move_clip"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")}, {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 0}, {QStringLiteral("newStartSec"), 2.0}});
+            const auto volume = callProjectInfoTool(1542, QStringLiteral("set_clip_property"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")}, {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 0}, {QStringLiteral("property"), QStringLiteral("volume")},
+                {QStringLiteral("value"), 0.5}});
+            const quint64 serial = projectTimeline->undoManager()->saveSerial();
+            const double playhead = projectTimeline->playheadPosition();
+            const bool dirty = projectInfoWindow.isWindowModified();
+            const auto comparison = callProjectInfoTool(1543, QStringLiteral("compare_project"),
+                QJsonObject{{QStringLiteral("filePath"), diffPath}});
+            const auto payload = toolPayload(comparison);
+            int movedCount = 0, volumeCount = 0;
+            for (const auto &value : payload.value(QStringLiteral("changes")).toArray()) {
+                const auto change = value.toObject();
+                if (change.value(QStringLiteral("type")).toString() == QStringLiteral("Moved")) ++movedCount;
+                if (change.value(QStringLiteral("type")).toString() == QStringLiteral("PropertyChanged")
+                    && change.value(QStringLiteral("path")).toString() == QStringLiteral("video[0].clips[0].volume")
+                    && change.value(QStringLiteral("before")).toString() == QStringLiteral("1")
+                    && change.value(QStringLiteral("after")).toString() == QStringLiteral("0.5")) ++volumeCount;
+            }
+            const auto summary = payload.value(QStringLiteral("summary")).toObject();
+            const bool g154 = diffDirectory.isValid()
+                && toolPayload(saved).value(QStringLiteral("ok")).toBool()
+                && toolPayload(moved).value(QStringLiteral("ok")).toBool()
+                && toolPayload(volume).value(QStringLiteral("ok")).toBool()
+                && payload.value(QStringLiteral("ok")).toBool()
+                && requiredOutputFieldsPresent(QStringLiteral("compare_project"), payload)
+                && payload.value(QStringLiteral("changes")).toArray().size() == 2
+                && movedCount == 1 && volumeCount == 1
+                && summary.value(QStringLiteral("moved")).toInt() == 1
+                && summary.value(QStringLiteral("changed")).toInt() == 1
+                && summary.value(QStringLiteral("added")).toInt() == 0
+                && summary.value(QStringLiteral("removed")).toInt() == 0
+                && summary.value(QStringLiteral("trimmed")).toInt() == 0
+                && projectTimeline->undoManager()->saveSerial() == serial
+                && projectTimeline->playheadPosition() == playhead
+                && projectInfoWindow.isWindowModified() == dirty;
+            g154 ? pass("G154 compare_project detects move and volume")
+                 : fail("G154 compare_project detects move and volume", QStringLiteral("wrong diff, summary, or read-only behavior"));
+
+            const auto savedAgain = callProjectInfoTool(1550, QStringLiteral("save_project"),
+                QJsonObject{{QStringLiteral("path"), diffPath}});
+            const auto identical = toolPayload(callProjectInfoTool(1551, QStringLiteral("compare_project"),
+                QJsonObject{{QStringLiteral("filePath"), diffPath}}));
+            const auto missing = callProjectInfoTool(1552, QStringLiteral("compare_project"),
+                QJsonObject{{QStringLiteral("filePath"), diffPath + QStringLiteral(".missing")}});
+            const auto invalid = callProjectInfoTool(1553, QStringLiteral("compare_project"),
+                QJsonObject{{QStringLiteral("filePath"), 42}});
+            const bool g155 = toolPayload(savedAgain).value(QStringLiteral("ok")).toBool()
+                && identical.value(QStringLiteral("ok")).toBool()
+                && identical.value(QStringLiteral("changes")).isArray()
+                && identical.value(QStringLiteral("changes")).toArray().isEmpty()
+                && identical.value(QStringLiteral("summary")).toObject() == QJsonObject{
+                    {"added", 0}, {"removed", 0}, {"moved", 0}, {"trimmed", 0}, {"changed", 0}}
+                && toolResult(missing).value(QStringLiteral("isError")).toBool()
+                && toolResult(invalid).value(QStringLiteral("isError")).toBool()
+                && projectTimeline->undoManager()->saveSerial() == serial
+                && !projectInfoWindow.isWindowModified();
+            g155 ? pass("G155 compare_project unchanged and invalid inputs")
+                 : fail("G155 compare_project unchanged and invalid inputs", QStringLiteral("nonempty diff or unsafe failure"));
+            // Later save_project tests use this pre-existing temporary path.
+            projectInfoWindow.m_projectFilePath = roundtripProjectPath;
+        }
+
         video0->setClips(QVector<ClipInfo>{
             makeTestClip(QStringLiteral("A"), 0),
             makeTestClip(QStringLiteral("B"), 0),
@@ -1571,6 +1699,567 @@ int runMcpSelftest()
         g52 ? pass("G52 linked V/A clips move together")
             : fail("G52 linked V/A clips move together",
                    QStringLiteral("linked audio/video clips diverged during track move"));
+
+        auto timelineTrackObject = [](const QJsonObject &payload,
+                                      const QString &kind, int trackIndex) {
+            const QJsonArray tracks = payload.value(kind).toArray();
+            return trackIndex >= 0 && trackIndex < tracks.size()
+                ? tracks.at(trackIndex).toObject() : QJsonObject{};
+        };
+
+        const QJsonObject lockResponse = callProjectInfoTool(
+            201, QStringLiteral("set_track_locked"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("locked"), true}
+            });
+        const QJsonObject lockedTimelineResponse = callProjectInfoTool(
+            202, QStringLiteral("get_timeline"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")}
+            });
+        const QJsonObject lockPayload = toolPayload(lockResponse);
+        const QJsonObject lockedTimelinePayload = toolPayload(lockedTimelineResponse);
+        const bool g114 = !toolResult(lockResponse)
+                                .value(QStringLiteral("isError")).toBool(true)
+            && lockPayload.value(QStringLiteral("ok")).toBool(false)
+            && lockPayload.value(QStringLiteral("locked")).toBool(false)
+            && requiredOutputFieldsPresent(QStringLiteral("set_track_locked"),
+                                           lockPayload)
+            && video0->isLocked()
+            && timelineTrackObject(lockedTimelinePayload,
+                                   QStringLiteral("video"), 0)
+                   .value(QStringLiteral("locked")).toBool(false);
+        g114 ? pass("G114 set_track_locked is reflected by get_timeline")
+             : fail("G114 set_track_locked is reflected by get_timeline",
+                    QStringLiteral("V1 was not locked or get_timeline omitted locked=true"));
+
+        const QJsonObject unlockResponse = callProjectInfoTool(
+            203, QStringLiteral("set_track_locked"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("locked"), false}
+            });
+        const QJsonObject unlockedTimelineResponse = callProjectInfoTool(
+            204, QStringLiteral("get_timeline"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")}
+            });
+        const bool g115 = toolPayload(unlockResponse)
+                                .value(QStringLiteral("ok")).toBool(false)
+            && !video0->isLocked()
+            && !timelineTrackObject(toolPayload(unlockedTimelineResponse),
+                                    QStringLiteral("video"), 0)
+                    .value(QStringLiteral("locked")).toBool(true);
+        g115 ? pass("G115 set_track_locked unlocks the track")
+             : fail("G115 set_track_locked unlocks the track",
+                    QStringLiteral("V1 remained locked after locked=false"));
+
+        const QJsonObject missingTrackLockResponse = callProjectInfoTool(
+            205, QStringLiteral("set_track_locked"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")},
+                {QStringLiteral("trackIndex"), projectTimeline->videoTrackCount() + 10},
+                {QStringLiteral("locked"), true}
+            });
+        const bool g116 = toolResult(missingTrackLockResponse)
+                                .value(QStringLiteral("isError")).toBool(false)
+            && toolErrorText(missingTrackLockResponse)
+                   .contains(QStringLiteral("track index is out of range"));
+        g116 ? pass("G116 set_track_locked rejects a missing track")
+             : fail("G116 set_track_locked rejects a missing track",
+                    QStringLiteral("an out-of-range track was accepted"));
+
+        video0->setClips(QVector<ClipInfo>{
+            makeTestClip(QStringLiteral("locked-guard"), 0)
+        });
+        video1->setClips(QVector<ClipInfo>{});
+        audio0->setClips(QVector<ClipInfo>{});
+        audio1->setClips(QVector<ClipInfo>{});
+        projectTimeline->clearSelection();
+        saveTestUndoBaseline();
+        callProjectInfoTool(206, QStringLiteral("set_track_locked"), QJsonObject{
+            {QStringLiteral("kind"), QStringLiteral("video")},
+            {QStringLiteral("trackIndex"), 0},
+            {QStringLiteral("locked"), true}
+        });
+        const QJsonObject lockedSplitResponse = callProjectInfoTool(
+            207, QStringLiteral("split_clip"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 0},
+                {QStringLiteral("timeSec"), 1.0}
+            });
+        const QJsonObject lockedDeleteResponse = callProjectInfoTool(
+            208, QStringLiteral("delete_clip"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 0}
+            });
+        const QJsonObject lockedMoveResponse = callProjectInfoTool(
+            209, QStringLiteral("move_clip"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 0},
+                {QStringLiteral("newStartSec"), 1.0}
+            });
+        const auto lockedEditRejected = [&](const QJsonObject &response) {
+            return toolResult(response).value(QStringLiteral("isError")).toBool(false)
+                && toolErrorText(response) == QStringLiteral("track is locked");
+        };
+        const bool g117 = lockedEditRejected(lockedSplitResponse)
+            && lockedEditRejected(lockedDeleteResponse)
+            && lockedEditRejected(lockedMoveResponse)
+            && video0->clipCount() == 1
+            && video0->clips().first().displayName == QStringLiteral("locked-guard")
+            && !projectTimeline->undoManager()->canUndo();
+        g117 ? pass("G117 locked tracks reject split/delete/move")
+             : fail("G117 locked tracks reject split/delete/move",
+                    QStringLiteral("a locked edit mutated V1 or added undo state"));
+        callProjectInfoTool(210, QStringLiteral("set_track_locked"), QJsonObject{
+            {QStringLiteral("kind"), QStringLiteral("video")},
+            {QStringLiteral("trackIndex"), 0},
+            {QStringLiteral("locked"), false}
+        });
+
+        QJsonArray videoFlags;
+        QJsonArray audioFlags;
+        for (int index = 0; index < projectTimeline->videoTrackCount(); ++index) {
+            videoFlags.append(index == 0
+                ? QJsonObject{{QStringLiteral("locked"), true},
+                              {QStringLiteral("hidden"), true}}
+                : QJsonObject{});
+        }
+        for (int index = 0; index < projectTimeline->audioTrackCount(); ++index) {
+            audioFlags.append(index == 0
+                ? QJsonObject{{QStringLiteral("muted"), true},
+                              {QStringLiteral("solo"), true}}
+                : QJsonObject{});
+        }
+        projectTimeline->applyTrackFlagsFromJson(QJsonObject{
+            {QStringLiteral("video"), videoFlags},
+            {QStringLiteral("audio"), audioFlags}
+        });
+
+        const QString trackFlagsProjectPath = projectBehaviorDirReady
+            ? QDir(projectBehaviorDir.path()).filePath(
+                  QStringLiteral("track-flags-roundtrip.vsep"))
+            : QString();
+        const QString legacyTrackFlagsProjectPath = projectBehaviorDirReady
+            ? QDir(projectBehaviorDir.path()).filePath(
+                  QStringLiteral("track-flags-legacy.vsep"))
+            : QString();
+        QJsonObject trackFlagsSaveResponse;
+        QJsonObject trackFlagsOpenResponse;
+        QJsonDocument savedTrackFlagsDocument;
+        bool savedFileRead = false;
+        if (projectBehaviorDirReady) {
+            trackFlagsSaveResponse = callProjectInfoTool(
+                211, QStringLiteral("save_project"), QJsonObject{
+                    {QStringLiteral("path"), trackFlagsProjectPath}
+                });
+            QFile savedFile(trackFlagsProjectPath);
+            savedFileRead = savedFile.open(QIODevice::ReadOnly);
+            if (savedFileRead)
+                savedTrackFlagsDocument = QJsonDocument::fromJson(savedFile.readAll());
+            projectTimeline->applyTrackFlagsFromJson(QJsonObject{});
+            trackFlagsOpenResponse = callProjectInfoTool(
+                212, QStringLiteral("open_project"), QJsonObject{
+                    {QStringLiteral("path"), trackFlagsProjectPath}
+                });
+        }
+        const QJsonObject reopenedTimelineResponse = callProjectInfoTool(
+            213, QStringLiteral("get_timeline"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("all")}
+            });
+        const QJsonObject reopenedTimelinePayload = toolPayload(reopenedTimelineResponse);
+        const QJsonObject restoredFlags = projectTimeline->trackFlagsToJson();
+        const QJsonArray restoredVideoFlags = restoredFlags
+            .value(QStringLiteral("video")).toArray();
+        const QJsonArray restoredAudioFlags = restoredFlags
+            .value(QStringLiteral("audio")).toArray();
+        const QJsonObject restoredVideo0 = restoredVideoFlags.isEmpty()
+            ? QJsonObject{} : restoredVideoFlags.first().toObject();
+        const QJsonObject restoredAudio0 = restoredAudioFlags.isEmpty()
+            ? QJsonObject{} : restoredAudioFlags.first().toObject();
+        const QJsonObject savedRoot = savedTrackFlagsDocument.object();
+        const QJsonObject savedFlags = savedRoot
+            .value(QStringLiteral("trackFlags")).toObject();
+        const bool flagsRoundtripped = projectBehaviorDirReady && savedFileRead
+            && !toolResult(trackFlagsSaveResponse)
+                    .value(QStringLiteral("isError")).toBool(true)
+            && !toolResult(trackFlagsOpenResponse)
+                    .value(QStringLiteral("isError")).toBool(true)
+            && timelineTrackObject(reopenedTimelinePayload,
+                                   QStringLiteral("video"), 0)
+                   .value(QStringLiteral("locked")).toBool(false)
+            && restoredVideoFlags.size() == projectTimeline->videoTrackCount()
+            && restoredAudioFlags.size() == projectTimeline->audioTrackCount()
+            && restoredVideo0.value(QStringLiteral("locked")).toBool(false)
+            && restoredVideo0.value(QStringLiteral("hidden")).toBool(false)
+            && restoredAudio0.value(QStringLiteral("muted")).toBool(false)
+            && restoredAudio0.value(QStringLiteral("solo")).toBool(false)
+            && savedFlags.value(QStringLiteral("video")).toArray().size()
+                   == projectTimeline->videoTrackCount()
+            && savedFlags.value(QStringLiteral("audio")).toArray().size()
+                   == projectTimeline->audioTrackCount();
+
+        const auto anyCheckedButton = [&projectInfoWindow](const QString &objectName,
+                                                           const QString &text) {
+            const QList<QPushButton *> buttons =
+                projectInfoWindow.findChildren<QPushButton *>(objectName);
+            for (const QPushButton *button : buttons) {
+                if (button && button->isChecked() && button->text() == text)
+                    return true;
+            }
+            return false;
+        };
+        const bool headersSynchronized =
+            anyCheckedButton(QStringLiteral("timelineTrackLockButton"),
+                             QString::fromUtf8("\xF0\x9F\x94\x92"))
+            && anyCheckedButton(QStringLiteral("timelineTrackMuteButton"),
+                                QString::fromUtf8("\xF0\x9F\x94\x87"))
+            && anyCheckedButton(QStringLiteral("timelineTrackSoloButton"),
+                                QStringLiteral("S"))
+            && anyCheckedButton(QStringLiteral("timelineTrackHideButton"),
+                                QString::fromUtf8("\xE2\x8A\x98"));
+
+        bool legacyFileWritten = false;
+        if (savedFileRead && !savedTrackFlagsDocument.isNull()) {
+            QJsonObject legacyRoot = savedTrackFlagsDocument.object();
+            legacyRoot.remove(QStringLiteral("trackFlags"));
+            QFile legacyFile(legacyTrackFlagsProjectPath);
+            if (legacyFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+                const QByteArray legacyJson = QJsonDocument(legacyRoot).toJson(
+                    QJsonDocument::Indented);
+                legacyFileWritten = legacyFile.write(legacyJson) == legacyJson.size();
+            }
+        }
+        QJsonObject legacyOpenResponse;
+        if (legacyFileWritten) {
+            legacyOpenResponse = callProjectInfoTool(
+                214, QStringLiteral("open_project"), QJsonObject{
+                    {QStringLiteral("path"), legacyTrackFlagsProjectPath}
+                });
+        }
+        const QJsonObject legacyFlags = projectTimeline->trackFlagsToJson();
+        auto allFlagsFalse = [](const QJsonArray &tracks) {
+            for (const QJsonValue &value : tracks) {
+                const QJsonObject flags = value.toObject();
+                if (flags.value(QStringLiteral("locked")).toBool(false)
+                    || flags.value(QStringLiteral("muted")).toBool(false)
+                    || flags.value(QStringLiteral("solo")).toBool(false)
+                    || flags.value(QStringLiteral("hidden")).toBool(false)) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        const bool legacyDefaults = legacyFileWritten
+            && !toolResult(legacyOpenResponse)
+                    .value(QStringLiteral("isError")).toBool(true)
+            && allFlagsFalse(legacyFlags.value(QStringLiteral("video")).toArray())
+            && allFlagsFalse(legacyFlags.value(QStringLiteral("audio")).toArray());
+        const bool g118 = flagsRoundtripped && headersSynchronized && legacyDefaults;
+        g118 ? pass("G118 track flags survive save/open and legacy defaults are false")
+             : fail("G118 track flags survive save/open and legacy defaults are false",
+                    QStringLiteral("flags, header state, array lengths, or legacy defaults diverged"));
+
+        video0->setClips(QVector<ClipInfo>{
+            makeTestClip(QStringLiteral("label-target"), 0),
+            makeTestClip(QStringLiteral("label-default"), 0)
+        });
+        video1->setClips(QVector<ClipInfo>{});
+        audio0->setClips(QVector<ClipInfo>{});
+        audio1->setClips(QVector<ClipInfo>{});
+        projectTimeline->applyTrackFlagsFromJson(QJsonObject{});
+        projectTimeline->clearSelection();
+        saveTestUndoBaseline();
+
+        const QJsonObject setLabelResponse = callProjectInfoTool(
+            215, QStringLiteral("set_clip_label"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 0},
+                {QStringLiteral("label"), QStringLiteral("red")}
+            });
+        const QJsonObject labelledTimelineResponse = callProjectInfoTool(
+            216, QStringLiteral("get_timeline"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")}
+            });
+        const QJsonArray labelledTimelineClips = timelineTrackObject(
+            toolPayload(labelledTimelineResponse), QStringLiteral("video"), 0)
+                .value(QStringLiteral("clips")).toArray();
+        const QJsonObject setLabelPayload = toolPayload(setLabelResponse);
+        const bool g119 = !toolResult(setLabelResponse)
+                                .value(QStringLiteral("isError")).toBool(true)
+            && setLabelPayload.value(QStringLiteral("ok")).toBool(false)
+            && setLabelPayload.value(QStringLiteral("label")).toString()
+                   == QStringLiteral("red")
+            && requiredOutputFieldsPresent(QStringLiteral("set_clip_label"),
+                                           setLabelPayload)
+            && video0->clips().at(0).label == ClipLabel::Red
+            && labelledTimelineClips.size() == 2
+            && labelledTimelineClips.at(0).toObject()
+                   .value(QStringLiteral("label")).toString() == QStringLiteral("red")
+            && labelledTimelineClips.at(1).toObject()
+                   .value(QStringLiteral("label")).toString() == QStringLiteral("none");
+        g119 ? pass("G119 set_clip_label is reflected by get_timeline")
+             : fail("G119 set_clip_label is reflected by get_timeline",
+                    QStringLiteral("label mutation, response schema, or get_timeline.label diverged"));
+
+        const QJsonObject invalidLabelResponse = callProjectInfoTool(
+            217, QStringLiteral("set_clip_label"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 0},
+                {QStringLiteral("label"), QStringLiteral("ultraviolet")}
+            });
+        const bool g120 = toolResult(invalidLabelResponse)
+                                .value(QStringLiteral("isError")).toBool(false)
+            && toolErrorText(invalidLabelResponse).contains(
+                   QStringLiteral("label must be one of"))
+            && video0->clips().at(0).label == ClipLabel::Red;
+        g120 ? pass("G120 set_clip_label rejects an invalid label")
+             : fail("G120 set_clip_label rejects an invalid label",
+                    QStringLiteral("invalid label was accepted or changed the clip"));
+
+        const QJsonObject labelUndoResponse = callProjectInfoTool(
+            218, QStringLiteral("undo"), QJsonObject{});
+        const bool g121 = toolPayload(labelUndoResponse)
+                                .value(QStringLiteral("ok")).toBool(false)
+            && video0->clips().at(0).label == ClipLabel::None
+            && !projectTimeline->undoManager()->canUndo();
+        g121 ? pass("G121 set_clip_label is reverted by one undo")
+             : fail("G121 set_clip_label is reverted by one undo",
+                    QStringLiteral("one undo did not restore the default label"));
+
+        saveTestUndoBaseline();
+        const QJsonObject roundtripLabelResponse = callProjectInfoTool(
+            219, QStringLiteral("set_clip_label"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 0},
+                {QStringLiteral("label"), QStringLiteral("green")}
+            });
+        const QString labelProjectPath = projectBehaviorDirReady
+            ? QDir(projectBehaviorDir.path()).filePath(
+                  QStringLiteral("clip-label-roundtrip.vsep"))
+            : QString();
+        QJsonObject labelSaveResponse;
+        QJsonObject labelOpenResponse;
+        QJsonDocument savedLabelDocument;
+        bool savedLabelFileRead = false;
+        if (projectBehaviorDirReady) {
+            labelSaveResponse = callProjectInfoTool(
+                220, QStringLiteral("save_project"), QJsonObject{
+                    {QStringLiteral("path"), labelProjectPath}
+                });
+            QFile labelFile(labelProjectPath);
+            savedLabelFileRead = labelFile.open(QIODevice::ReadOnly);
+            if (savedLabelFileRead)
+                savedLabelDocument = QJsonDocument::fromJson(labelFile.readAll());
+
+            QVector<ClipInfo> clearedLabels = video0->clips();
+            for (ClipInfo &clip : clearedLabels)
+                clip.label = ClipLabel::None;
+            video0->setClips(clearedLabels);
+            labelOpenResponse = callProjectInfoTool(
+                221, QStringLiteral("open_project"), QJsonObject{
+                    {QStringLiteral("path"), labelProjectPath}
+                });
+        }
+        TimelineTrack *reopenedLabelTrack = projectTimeline->trackAt(false, 0);
+        const QJsonArray savedLabelTracks = savedLabelDocument.object()
+            .value(QStringLiteral("videoTracks")).toArray();
+        const QJsonArray savedLabelClips = savedLabelTracks.isEmpty()
+            ? QJsonArray{} : savedLabelTracks.first().toArray();
+        const QJsonObject reopenedLabelTimeline = callProjectInfoTool(
+            222, QStringLiteral("get_timeline"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")}
+            });
+        const QJsonArray reopenedLabelClips = timelineTrackObject(
+            toolPayload(reopenedLabelTimeline), QStringLiteral("video"), 0)
+                .value(QStringLiteral("clips")).toArray();
+        const bool g122 = projectBehaviorDirReady && savedLabelFileRead
+            && !toolResult(roundtripLabelResponse)
+                    .value(QStringLiteral("isError")).toBool(true)
+            && !toolResult(labelSaveResponse)
+                    .value(QStringLiteral("isError")).toBool(true)
+            && !toolResult(labelOpenResponse)
+                    .value(QStringLiteral("isError")).toBool(true)
+            && savedLabelClips.size() == 2
+            && savedLabelClips.at(0).toObject()
+                   .value(QStringLiteral("label")).toString() == QStringLiteral("green")
+            && !savedLabelClips.at(1).toObject().contains(QStringLiteral("label"))
+            && reopenedLabelTrack && reopenedLabelTrack->clipCount() == 2
+            && reopenedLabelTrack->clips().at(0).label == ClipLabel::Green
+            && reopenedLabelTrack->clips().at(1).label == ClipLabel::None
+            && reopenedLabelClips.size() == 2
+            && reopenedLabelClips.at(0).toObject()
+                   .value(QStringLiteral("label")).toString() == QStringLiteral("green")
+            && reopenedLabelClips.at(1).toObject()
+                   .value(QStringLiteral("label")).toString() == QStringLiteral("none");
+        g122 ? pass("G122 clip labels survive save/open and None is omitted")
+             : fail("G122 clip labels survive save/open and None is omitted",
+                    QStringLiteral("project JSON or reopened timeline lost clip labels"));
+
+        TimelineTrack *reverseVideoTrack = projectTimeline->trackAt(false, 0);
+        TimelineTrack *reverseAudioTrack = projectTimeline->trackAt(true, 0);
+        ClipInfo reverseVideoClip = makeTestClip(
+            QStringLiteral("reverse-video"), 0);
+        ClipInfo reverseAudioClip = makeTestClip(
+            QStringLiteral("reverse-audio"), 0);
+        reverseVideoClip.linkGroup = 12304;
+        reverseAudioClip.linkGroup = 12304;
+        if (reverseVideoTrack)
+            reverseVideoTrack->setClips({reverseVideoClip});
+        if (reverseAudioTrack)
+            reverseAudioTrack->setClips({reverseAudioClip});
+        saveTestUndoBaseline();
+
+        const QJsonObject setReversedResponse = callProjectInfoTool(
+            223, QStringLiteral("set_clip_property"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 0},
+                {QStringLiteral("property"), QStringLiteral("reversed")},
+                {QStringLiteral("value"), true}
+            });
+        const QJsonObject reversedTimelineResponse = callProjectInfoTool(
+            224, QStringLiteral("get_timeline"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("all")}
+            });
+        const QJsonObject reversedPayload = toolPayload(setReversedResponse);
+        const QJsonArray reversedVideoClips = timelineTrackObject(
+            toolPayload(reversedTimelineResponse), QStringLiteral("video"), 0)
+                .value(QStringLiteral("clips")).toArray();
+        const QJsonArray reversedAudioClips = timelineTrackObject(
+            toolPayload(reversedTimelineResponse), QStringLiteral("audio"), 0)
+                .value(QStringLiteral("clips")).toArray();
+        const bool g123 = reverseVideoTrack && reverseAudioTrack
+            && !toolResult(setReversedResponse)
+                    .value(QStringLiteral("isError")).toBool(true)
+            && reversedPayload.value(QStringLiteral("ok")).toBool(false)
+            && reversedPayload.value(QStringLiteral("property")).toString()
+                   == QStringLiteral("reversed")
+            && reversedPayload.value(QStringLiteral("value")).isBool()
+            && reversedPayload.value(QStringLiteral("value")).toBool(false)
+            && reversedPayload.value(QStringLiteral("linkedApplied")).toBool(false)
+            && requiredOutputFieldsPresent(QStringLiteral("set_clip_property"),
+                                           reversedPayload)
+            && reverseVideoTrack->clips().first().reversed
+            && reverseAudioTrack->clips().first().reversed
+            && reversedVideoClips.size() == 1
+            && reversedAudioClips.size() == 1
+            && reversedVideoClips.first().toObject()
+                   .value(QStringLiteral("reversed")).toBool(false)
+            && reversedAudioClips.first().toObject()
+                   .value(QStringLiteral("reversed")).toBool(false);
+        g123 ? pass("G123 reversed set is reflected by get_timeline")
+             : fail("G123 reversed set is reflected by get_timeline",
+                    QStringLiteral("boolean mutation, linked clip, schema, or timeline output diverged"));
+
+        const QJsonObject reverseUndoResponse = callProjectInfoTool(
+            225, QStringLiteral("undo"), QJsonObject{});
+        const QJsonObject undoTimelineResponse = callProjectInfoTool(
+            226, QStringLiteral("get_timeline"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("all")}
+            });
+        const QJsonArray undoVideoClips = timelineTrackObject(
+            toolPayload(undoTimelineResponse), QStringLiteral("video"), 0)
+                .value(QStringLiteral("clips")).toArray();
+        const QJsonArray undoAudioClips = timelineTrackObject(
+            toolPayload(undoTimelineResponse), QStringLiteral("audio"), 0)
+                .value(QStringLiteral("clips")).toArray();
+        const bool g124 = toolPayload(reverseUndoResponse)
+                                .value(QStringLiteral("ok")).toBool(false)
+            && reverseVideoTrack && reverseAudioTrack
+            && !reverseVideoTrack->clips().first().reversed
+            && !reverseAudioTrack->clips().first().reversed
+            && undoVideoClips.size() == 1 && undoAudioClips.size() == 1
+            && !undoVideoClips.first().toObject()
+                    .value(QStringLiteral("reversed")).toBool(true)
+            && !undoAudioClips.first().toObject()
+                    .value(QStringLiteral("reversed")).toBool(true)
+            && !projectTimeline->undoManager()->canUndo();
+        g124 ? pass("G124 reversed is reverted by one undo")
+             : fail("G124 reversed is reverted by one undo",
+                    QStringLiteral("one undo did not restore linked reverse flags"));
+
+        // G144-G145: AUTO-ORIENT boolean property is visible and one-step undoable.
+        ClipInfo autoOrientClip = makeTestClip(
+            QStringLiteral("auto-orient-video"), 0);
+        if (reverseVideoTrack)
+            reverseVideoTrack->setClips({autoOrientClip});
+        if (reverseAudioTrack)
+            reverseAudioTrack->setClips(QVector<ClipInfo>{});
+        saveTestUndoBaseline();
+
+        const QJsonObject setAutoOrientResponse = callProjectInfoTool(
+            301, QStringLiteral("set_clip_property"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 0},
+                {QStringLiteral("property"), QStringLiteral("autoOrient")},
+                {QStringLiteral("value"), true}
+            });
+        const QJsonObject autoOrientTimelineResponse = callProjectInfoTool(
+            302, QStringLiteral("get_timeline"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")}
+            });
+        const QJsonObject autoOrientPayload = toolPayload(setAutoOrientResponse);
+        const QJsonArray autoOrientClips = timelineTrackObject(
+            toolPayload(autoOrientTimelineResponse), QStringLiteral("video"), 0)
+                .value(QStringLiteral("clips")).toArray();
+        const bool g144 = reverseVideoTrack
+            && !toolResult(setAutoOrientResponse)
+                    .value(QStringLiteral("isError")).toBool(true)
+            && autoOrientPayload.value(QStringLiteral("ok")).toBool(false)
+            && autoOrientPayload.value(QStringLiteral("property")).toString()
+                   == QStringLiteral("autoOrient")
+            && autoOrientPayload.value(QStringLiteral("value")).isBool()
+            && autoOrientPayload.value(QStringLiteral("value")).toBool(false)
+            && !autoOrientPayload.value(QStringLiteral("linkedApplied")).toBool(true)
+            && requiredOutputFieldsPresent(QStringLiteral("set_clip_property"),
+                                           autoOrientPayload)
+            && reverseVideoTrack->clips().first().autoOrientEnabled
+            && autoOrientClips.size() == 1
+            && autoOrientClips.first().toObject()
+                   .value(QStringLiteral("autoOrient")).toBool(false);
+        g144 ? pass("G144 set_clip_property autoOrient is reflected by get_timeline")
+             : fail("G144 set_clip_property autoOrient is reflected by get_timeline",
+                    QStringLiteral("boolean mutation, schema, or timeline output diverged"));
+
+        const QJsonObject autoOrientUndoResponse = callProjectInfoTool(
+            303, QStringLiteral("undo"), QJsonObject{});
+        const QJsonObject autoOrientUndoTimelineResponse = callProjectInfoTool(
+            304, QStringLiteral("get_timeline"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")}
+            });
+        const QJsonArray autoOrientUndoClips = timelineTrackObject(
+            toolPayload(autoOrientUndoTimelineResponse),
+            QStringLiteral("video"), 0).value(QStringLiteral("clips")).toArray();
+        const bool g145 = toolPayload(autoOrientUndoResponse)
+                                .value(QStringLiteral("ok")).toBool(false)
+            && reverseVideoTrack
+            && !reverseVideoTrack->clips().first().autoOrientEnabled
+            && autoOrientUndoClips.size() == 1
+            && !autoOrientUndoClips.first().toObject()
+                    .value(QStringLiteral("autoOrient")).toBool(true)
+            && !projectTimeline->undoManager()->canUndo();
+        g145 ? pass("G145 autoOrient is reverted by one undo")
+             : fail("G145 autoOrient is reverted by one undo",
+                    QStringLiteral("one undo did not restore the auto-orient flag"));
+
+        // 後続の get_frame fixture は空の V1/A1 へ media を 1 件ずつ取り込む。
+        // roundtrip で再読込したクリップと undo 履歴をここで隔離する。
+        const QVector<TimelineTrack *> tracks =
+            projectTimeline->videoTracks() + projectTimeline->audioTracks();
+        for (TimelineTrack *track : tracks) {
+            if (track)
+                track->setClips(QVector<ClipInfo>{});
+        }
+        projectTimeline->applyTrackFlagsFromJson(QJsonObject{});
+        projectTimeline->clearSelection();
+        saveTestUndoBaseline();
     }
     if (!timelineReady) {
         fail("G45 select_clip rejects out-of-range index", QStringLiteral("Timeline was not available"));
@@ -1581,6 +2270,1098 @@ int runMcpSelftest()
         fail("G50 blocked move reports actual start and reason", QStringLiteral("Timeline was not available"));
         fail("G51 move_clip supports cross-track movement", QStringLiteral("Timeline was not available"));
         fail("G52 linked V/A clips move together", QStringLiteral("Timeline was not available"));
+        fail("G114 set_track_locked is reflected by get_timeline", QStringLiteral("Timeline was not available"));
+        fail("G115 set_track_locked unlocks the track", QStringLiteral("Timeline was not available"));
+        fail("G116 set_track_locked rejects a missing track", QStringLiteral("Timeline was not available"));
+        fail("G117 locked tracks reject split/delete/move", QStringLiteral("Timeline was not available"));
+        fail("G118 track flags survive save/open and legacy defaults are false", QStringLiteral("Timeline was not available"));
+        fail("G119 set_clip_label is reflected by get_timeline", QStringLiteral("Timeline was not available"));
+        fail("G120 set_clip_label rejects an invalid label", QStringLiteral("Timeline was not available"));
+        fail("G121 set_clip_label is reverted by one undo", QStringLiteral("Timeline was not available"));
+        fail("G122 clip labels survive save/open and None is omitted", QStringLiteral("Timeline was not available"));
+        fail("G123 reversed set is reflected by get_timeline", QStringLiteral("Timeline was not available"));
+        fail("G124 reversed is reverted by one undo", QStringLiteral("Timeline was not available"));
+        fail("G144 set_clip_property autoOrient is reflected by get_timeline", QStringLiteral("Timeline was not available"));
+        fail("G145 autoOrient is reverted by one undo", QStringLiteral("Timeline was not available"));
+    }
+
+    const QJsonObject originalTimecodeBurnIn =
+        projectInfoResult.value(QStringLiteral("timecodeBurnIn")).toObject();
+    const QJsonObject requestedTimecodeBurnIn{
+        {QStringLiteral("enabled"), true},
+        {QStringLiteral("position"), QStringLiteral("topRight")},
+        {QStringLiteral("fontSizePct"), 6},
+        {QStringLiteral("showFrames"), false},
+        {QStringLiteral("dropFrame"), true},
+        {QStringLiteral("prefix"), QStringLiteral("MCP")},
+        {QStringLiteral("showClipName"), true},
+        {QStringLiteral("opacity"), 0.65}
+    };
+    const QJsonObject setProjectOptionResponse = callProjectInfoTool(
+        227, QStringLiteral("set_project_option"), QJsonObject{
+            {QStringLiteral("option"), QStringLiteral("timecodeBurnIn")},
+            {QStringLiteral("value"), requestedTimecodeBurnIn}
+        });
+    const QJsonObject projectInfoAfterOption = callProjectInfoTool(
+        228, QStringLiteral("get_project_info"), QJsonObject{});
+    const QJsonObject setProjectOptionPayload = toolPayload(
+        setProjectOptionResponse);
+    const QJsonObject reflectedTimecodeBurnIn = toolPayload(
+        projectInfoAfterOption).value(QStringLiteral("timecodeBurnIn"))
+            .toObject();
+    const bool g125 = !toolResult(setProjectOptionResponse)
+                            .value(QStringLiteral("isError")).toBool(true)
+        && setProjectOptionPayload.value(QStringLiteral("ok")).toBool(false)
+        && setProjectOptionPayload.value(QStringLiteral("option")).toString()
+               == QStringLiteral("timecodeBurnIn")
+        && requiredOutputFieldsPresent(QStringLiteral("set_project_option"),
+                                       setProjectOptionPayload)
+        && requiredOutputFieldsPresent(QStringLiteral("get_project_info"),
+                                       toolPayload(projectInfoAfterOption))
+        && reflectedTimecodeBurnIn.value(QStringLiteral("enabled")).toBool(false)
+        && reflectedTimecodeBurnIn.value(QStringLiteral("position")).toString()
+               == QStringLiteral("topRight")
+        && reflectedTimecodeBurnIn.value(QStringLiteral("fontSizePct")).toInt()
+               == 6
+        && !reflectedTimecodeBurnIn.value(QStringLiteral("showFrames"))
+                .toBool(true)
+        && reflectedTimecodeBurnIn.value(QStringLiteral("dropFrame")).toBool(false)
+        && reflectedTimecodeBurnIn.value(QStringLiteral("prefix")).toString()
+               == QStringLiteral("MCP")
+        && reflectedTimecodeBurnIn.value(QStringLiteral("showClipName"))
+               .toBool(false)
+        && std::fabs(reflectedTimecodeBurnIn.value(QStringLiteral("opacity"))
+                         .toDouble() - 0.65) < 1e-9;
+    g125 ? pass("G125 set_project_option is reflected by get_project_info")
+         : fail("G125 set_project_option is reflected by get_project_info",
+                QStringLiteral("timecodeBurnIn mutation or output schema diverged"));
+
+    const QJsonObject unknownProjectOptionResponse = callProjectInfoTool(
+        229, QStringLiteral("set_project_option"), QJsonObject{
+            {QStringLiteral("option"), QStringLiteral("unknownOption")},
+            {QStringLiteral("value"), QJsonObject{}}
+        });
+    const QJsonObject projectInfoAfterUnknownOption = callProjectInfoTool(
+        230, QStringLiteral("get_project_info"), QJsonObject{});
+    const QJsonObject restoreProjectOptionResponse = callProjectInfoTool(
+        231, QStringLiteral("set_project_option"), QJsonObject{
+            {QStringLiteral("option"), QStringLiteral("timecodeBurnIn")},
+            {QStringLiteral("value"), originalTimecodeBurnIn}
+        });
+    const QJsonObject projectInfoAfterRestore = callProjectInfoTool(
+        232, QStringLiteral("get_project_info"), QJsonObject{});
+    const bool g126 = toolResult(unknownProjectOptionResponse)
+                            .value(QStringLiteral("isError")).toBool(false)
+        && toolErrorText(unknownProjectOptionResponse).contains(
+               QStringLiteral("unknown project option"))
+        && toolPayload(projectInfoAfterUnknownOption)
+               .value(QStringLiteral("timecodeBurnIn")).toObject()
+               == reflectedTimecodeBurnIn
+        && !toolResult(restoreProjectOptionResponse)
+                .value(QStringLiteral("isError")).toBool(true)
+        && toolPayload(projectInfoAfterRestore)
+               .value(QStringLiteral("timecodeBurnIn")).toObject()
+               == originalTimecodeBurnIn;
+    g126 ? pass("G126 unknown project option is rejected")
+         : fail("G126 unknown project option is rejected",
+                QStringLiteral("unknown option was accepted or changed settings"));
+
+    TimelineTrack *dynamicZoomTrack = timelineReady
+        ? projectTimeline->trackAt(false, 0) : nullptr;
+    if (dynamicZoomTrack) {
+        dynamicZoomTrack->setClips(QVector<ClipInfo>{
+            makeTestClip(QStringLiteral("dynamic-zoom"), 0)
+        });
+        projectTimeline->clearSelection();
+        projectTimeline->undoManager()->clear();
+        projectTimeline->undoManager()->saveState(
+            projectTimeline->currentState(),
+            QStringLiteral("MCP dynamic zoom baseline"));
+
+        const QJsonObject zoomResponse = callProjectInfoTool(
+            233, QStringLiteral("dynamic_zoom"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 0},
+                {QStringLiteral("preset"), QStringLiteral("zoomIn")},
+                {QStringLiteral("easing"), QStringLiteral("easeInOut")}
+            });
+        const QJsonObject zoomPayload = toolPayload(zoomResponse);
+        const QJsonObject zoomCounts =
+            zoomPayload.value(QStringLiteral("keyframeCounts")).toObject();
+        QVector<ClipInfo> editedZoomClips = dynamicZoomTrack->clips();
+        KeyframeTrack *editableScaleX = editedZoomClips.isEmpty()
+            ? nullptr
+            : editedZoomClips.first().keyframes.track(QStringLiteral("scaleX"));
+        const double editedScale = 2.75;
+        if (editableScaleX && editableScaleX->count() == 2) {
+            const KeyframePoint last = editableScaleX->keyframes().last();
+            editableScaleX->addKeyframe(
+                last.time, editedScale, last.interpolation,
+                last.bezX1, last.bezY1, last.bezX2, last.bezY2,
+                last.hasSpatialTangent,
+                last.spatialOutX, last.spatialOutY,
+                last.spatialInX, last.spatialInY);
+            dynamicZoomTrack->setClips(editedZoomClips);
+        }
+        const KeyframeManager& zoomKeyframes =
+            dynamicZoomTrack->clips().first().keyframes;
+        const KeyframeTrack *scaleX =
+            zoomKeyframes.track(QStringLiteral("scaleX"));
+        int storedZoomKeyframeCount = 0;
+        for (const KeyframeTrack& track : zoomKeyframes.tracks())
+            storedZoomKeyframeCount += track.count();
+        // clipanim resolves the runtime motion.* names from the stored public
+        // tracks at read time, so the playback value must follow the edited
+        // public keyframe without any motion.* track existing.
+        const double zoomEndTime = scaleX && scaleX->count() == 2
+            ? scaleX->keyframes().last().time : 0.0;
+        const double derivedEndScale = clipanim::effectiveTransformAt(
+            dynamicZoomTrack->clips().first(), zoomEndTime).videoScale;
+        const bool g127 = !toolResult(zoomResponse)
+                               .value(QStringLiteral("isError")).toBool(true)
+            && zoomPayload.value(QStringLiteral("ok")).toBool(false)
+            && zoomPayload.value(QStringLiteral("keyframeCount")).toInt(-1) == 8
+            && zoomCounts.value(QStringLiteral("scaleX")).toInt(-1) == 2
+            && scaleX && scaleX->count() == 2
+            && zoomKeyframes.tracks().size() == 4
+            && storedZoomKeyframeCount == 8
+            && !zoomKeyframes.hasTrack(QStringLiteral("motion.position.x"))
+            && !zoomKeyframes.hasTrack(QStringLiteral("motion.position.y"))
+            && !zoomKeyframes.hasTrack(QStringLiteral("motion.scale"))
+            && qAbs(derivedEndScale - scaleX->keyframes().last().value) < 1e-9
+            && qAbs(derivedEndScale - editedScale) < 1e-9
+            && scaleX->keyframes().last().value
+                   > scaleX->keyframes().first().value;
+        g127 ? pass("G127 dynamic_zoom zoomIn generates two scaleX keyframes")
+             : fail("G127 dynamic_zoom zoomIn generates two scaleX keyframes",
+                    QStringLiteral("preset response or generated scaleX track diverged"));
+
+        const QJsonObject zoomUndo = callProjectInfoTool(
+            234, QStringLiteral("undo"), QJsonObject{});
+        const KeyframeManager& afterUndo =
+            dynamicZoomTrack->clips().first().keyframes;
+        const bool g128 = toolPayload(zoomUndo)
+                                .value(QStringLiteral("ok")).toBool(false)
+            && !afterUndo.hasTrack(QStringLiteral("positionX"))
+            && !afterUndo.hasTrack(QStringLiteral("positionY"))
+            && !afterUndo.hasTrack(QStringLiteral("scaleX"))
+            && !afterUndo.hasTrack(QStringLiteral("scaleY"))
+            && !afterUndo.hasTrack(QStringLiteral("motion.position.x"))
+            && !afterUndo.hasTrack(QStringLiteral("motion.position.y"))
+            && !afterUndo.hasTrack(QStringLiteral("motion.scale"))
+            && !projectTimeline->undoManager()->canUndo();
+        g128 ? pass("G128 undo removes dynamic_zoom keyframes in one step")
+             : fail("G128 undo removes dynamic_zoom keyframes in one step",
+                    QStringLiteral("one undo did not restore the keyframe-free clip"));
+
+        const QJsonObject customRect{
+            {QStringLiteral("cx"), 0.5}, {QStringLiteral("cy"), 0.5},
+            {QStringLiteral("w"), 1.0}
+        };
+        const QJsonObject customEnd{
+            {QStringLiteral("cx"), 0.6}, {QStringLiteral("cy"), 0.4},
+            {QStringLiteral("w"), 0.5}, {QStringLiteral("h"), 0.25}
+        };
+        const QJsonObject customResponse = callProjectInfoTool(
+            235, QStringLiteral("dynamic_zoom"), QJsonObject{
+                {QStringLiteral("clipIndex"), 0},
+                {QStringLiteral("start"), customRect},
+                {QStringLiteral("end"), customEnd},
+                {QStringLiteral("easing"), QStringLiteral("linear")}
+            });
+        const KeyframeTrack *customScaleX =
+            dynamicZoomTrack->clips().first().keyframes.track(
+                QStringLiteral("scaleX"));
+        const bool validCustomApplied = !toolResult(customResponse)
+                                             .value(QStringLiteral("isError"))
+                                             .toBool(true)
+            && toolPayload(customResponse)
+                   .value(QStringLiteral("keyframeCount")).toInt(-1) == 8
+            && toolPayload(customResponse).value(QStringLiteral("warning"))
+                   .toString().contains(
+                       QStringLiteral("h はキャンバス比に固定"))
+            && customScaleX && customScaleX->count() == 2
+            && qAbs(customScaleX->keyframes().last().value - 2.0) < 1e-9;
+        if (validCustomApplied)
+            callProjectInfoTool(236, QStringLiteral("undo"), QJsonObject{});
+
+        QJsonObject invalidStart = customRect;
+        invalidStart.insert(QStringLiteral("w"), 0.0);
+        const QJsonObject invalidRectResponse = callProjectInfoTool(
+            237, QStringLiteral("dynamic_zoom"), QJsonObject{
+                {QStringLiteral("clipIndex"), 0},
+                {QStringLiteral("start"), invalidStart},
+                {QStringLiteral("end"), customEnd}
+            });
+        const bool g129 = validCustomApplied
+            && toolResult(invalidRectResponse)
+                   .value(QStringLiteral("isError")).toBool(false)
+            && toolErrorText(invalidRectResponse).contains(QStringLiteral("w"))
+            && !dynamicZoomTrack->clips().first().keyframes
+                    .hasTrack(QStringLiteral("scaleX"))
+            && !projectTimeline->undoManager()->canUndo();
+        g129 ? pass("G129 dynamic_zoom accepts custom frames and rejects w<=0")
+             : fail("G129 dynamic_zoom accepts custom frames and rejects w<=0",
+                    QStringLiteral("custom rect handling or invalid-rect guard diverged"));
+
+        const QJsonObject ambiguousResponse = callProjectInfoTool(
+            243, QStringLiteral("dynamic_zoom"), QJsonObject{
+                {QStringLiteral("clipIndex"), 0},
+                {QStringLiteral("preset"), QStringLiteral("zoomIn")},
+                {QStringLiteral("start"), customRect}
+            });
+        QJsonObject dynamicZoomInputSchema;
+        for (const QJsonValue& value : projectInfoToolDescriptors) {
+            const QJsonObject descriptor = value.toObject();
+            if (descriptor.value(QStringLiteral("name")).toString()
+                == QStringLiteral("dynamic_zoom")) {
+                dynamicZoomInputSchema =
+                    descriptor.value(QStringLiteral("inputSchema")).toObject();
+                break;
+            }
+        }
+        const bool g134 = toolResult(ambiguousResponse)
+                                .value(QStringLiteral("isError")).toBool(false)
+            && toolErrorText(ambiguousResponse).contains(
+                   QStringLiteral("cannot be combined"))
+            && !dynamicZoomInputSchema.contains(QStringLiteral("oneOf"))
+            && dynamicZoomInputSchema.value(QStringLiteral("description"))
+                   .toString().contains(QStringLiteral("どちらか一方"))
+            && !dynamicZoomTrack->clips().first().keyframes
+                    .hasTrack(QStringLiteral("scaleX"))
+            && !projectTimeline->undoManager()->canUndo();
+        g134 ? pass("G134 dynamic_zoom rejects preset with start/end")
+             : fail("G134 dynamic_zoom rejects preset with start/end",
+                    QStringLiteral("ambiguous input or schema contract diverged"));
+
+        dynamicZoomTrack->setClips(QVector<ClipInfo>{});
+        projectTimeline->clearSelection();
+        projectTimeline->undoManager()->clear();
+        projectTimeline->undoManager()->saveState(
+            projectTimeline->currentState(),
+            QStringLiteral("MCP selftest baseline"));
+    } else {
+        fail("G127 dynamic_zoom zoomIn generates two scaleX keyframes",
+             QStringLiteral("Timeline was not available"));
+        fail("G128 undo removes dynamic_zoom keyframes in one step",
+             QStringLiteral("Timeline was not available"));
+        fail("G129 dynamic_zoom accepts custom frames and rejects w<=0",
+             QStringLiteral("Timeline was not available"));
+        fail("G134 dynamic_zoom rejects preset with start/end",
+             QStringLiteral("Timeline was not available"));
+    }
+
+    QTemporaryDir relinkMediaDir;
+    const QString relinkOldPath = relinkMediaDir.isValid()
+        ? QDir(relinkMediaDir.path()).filePath(QStringLiteral("offline.mp4"))
+        : QString();
+    const QString relinkNewPath = relinkMediaDir.isValid()
+        ? QDir(relinkMediaDir.path()).filePath(QStringLiteral("online.mp4"))
+        : QString();
+    TimelineTrack *relinkVideoTrack = timelineReady
+        ? projectTimeline->trackAt(false, 0) : nullptr;
+    TimelineTrack *relinkAudioTrack = timelineReady
+        ? projectTimeline->trackAt(true, 0) : nullptr;
+    const bool relinkFixtureReady = relinkVideoTrack && relinkAudioTrack
+        && importSourceReady && relinkMediaDir.isValid()
+        && QFile::copy(importSourcePath, relinkNewPath);
+    if (relinkFixtureReady) {
+        ClipInfo relinkVideoClip = makeTestClip(relinkOldPath, 935);
+        relinkVideoClip.linkGroup = 935;
+        ClipInfo relinkAudioClip = relinkVideoClip;
+        relinkVideoTrack->setClips({relinkVideoClip});
+        relinkAudioTrack->setClips({relinkAudioClip});
+        projectInfoWindow.m_particleClipConfigs.clear();
+        projectInfoWindow.m_particleClipConfigs.insert(
+            relinkOldPath, ParticleEmitterConfig{});
+        OverlayItem relinkOverlay;
+        relinkOverlay.type = QStringLiteral("image");
+        relinkOverlay.text = relinkOldPath;
+        projectInfoWindow.m_projectOverlays = {relinkOverlay};
+        projectTimeline->clearSelection();
+        projectTimeline->undoManager()->clear();
+        projectTimeline->undoManager()->saveState(
+            projectTimeline->currentState(),
+            QStringLiteral("MCP relink media baseline"));
+
+        const QJsonArray mapping{
+            QJsonObject{
+                {QStringLiteral("from"), relinkOldPath},
+                {QStringLiteral("to"), relinkNewPath}
+            }
+        };
+        const QJsonObject relinkResponse = callProjectInfoTool(
+            244, QStringLiteral("relink_media"), QJsonObject{
+                {QStringLiteral("mapping"), mapping}
+            });
+        const bool sidecarsRelinked =
+            projectInfoWindow.m_particleClipConfigs.contains(relinkNewPath)
+            && !projectInfoWindow.m_particleClipConfigs.contains(relinkOldPath)
+            && projectInfoWindow.m_projectOverlays.size() == 1
+            && projectInfoWindow.m_projectOverlays.first().text == relinkNewPath;
+        projectTimeline->undo();
+        const bool sidecarsUndoRestored =
+            !projectTimeline->canUndo()
+            && projectInfoWindow.m_particleClipConfigs.contains(relinkOldPath)
+            && !projectInfoWindow.m_particleClipConfigs.contains(relinkNewPath)
+            && projectInfoWindow.m_projectOverlays.size() == 1
+            && projectInfoWindow.m_projectOverlays.first().text == relinkOldPath;
+        projectTimeline->redo();
+        const bool sidecarsRedoRestored =
+            projectInfoWindow.m_particleClipConfigs.contains(relinkNewPath)
+            && !projectInfoWindow.m_particleClipConfigs.contains(relinkOldPath)
+            && projectInfoWindow.m_projectOverlays.size() == 1
+            && projectInfoWindow.m_projectOverlays.first().text == relinkNewPath;
+        const bool g135 = !toolResult(relinkResponse)
+                                .value(QStringLiteral("isError")).toBool(true)
+            && toolPayload(relinkResponse).value(QStringLiteral("ok")).toBool(false)
+            && toolPayload(relinkResponse).value(QStringLiteral("relinked")).toInt() == 1
+            && relinkVideoTrack->clips().size() == 1
+            && relinkAudioTrack->clips().size() == 1
+            && relinkVideoTrack->clips().first().filePath == relinkNewPath
+            && relinkAudioTrack->clips().first().filePath == relinkNewPath
+            && relinkVideoTrack->clips().first().linkGroup == 935
+            && relinkAudioTrack->clips().first().linkGroup == 935
+            && sidecarsRelinked && sidecarsUndoRestored && sidecarsRedoRestored;
+        g135 ? pass("G135 relink_media applies a valid mapping")
+             : fail("G135 relink_media applies a valid mapping",
+                    QStringLiteral("valid mapping did not update the linked clips"));
+
+        const QString invalidDestination = QDir(relinkMediaDir.path())
+            .filePath(QStringLiteral("missing.mp4"));
+        const QJsonObject invalidRelinkResponse = callProjectInfoTool(
+            245, QStringLiteral("relink_media"), QJsonObject{
+                {QStringLiteral("mapping"), QJsonArray{
+                    QJsonObject{
+                        {QStringLiteral("from"), relinkNewPath},
+                        {QStringLiteral("to"), invalidDestination}
+                    }
+                }}
+            });
+        const bool g136 = toolResult(invalidRelinkResponse)
+                                .value(QStringLiteral("isError")).toBool(false)
+            && toolErrorText(invalidRelinkResponse).contains(
+                   QStringLiteral("ファイルが見つかりません"))
+            && relinkVideoTrack->clips().first().filePath == relinkNewPath
+            && relinkAudioTrack->clips().first().filePath == relinkNewPath;
+        g136 ? pass("G136 relink_media rejects a missing destination")
+             : fail("G136 relink_media rejects a missing destination",
+                    QStringLiteral("missing destination was accepted or mutated clips"));
+
+        relinkVideoTrack->setClips({});
+        relinkAudioTrack->setClips({});
+        projectInfoWindow.m_particleClipConfigs.clear();
+        projectInfoWindow.m_projectOverlays.clear();
+        projectTimeline->clearSelection();
+        projectTimeline->undoManager()->clear();
+        projectTimeline->undoManager()->saveState(
+            projectTimeline->currentState(),
+            QStringLiteral("MCP selftest baseline"));
+    } else {
+        const QString reason = QStringLiteral(
+            "Timeline or relink media fixture was not available");
+        fail("G135 relink_media applies a valid mapping", reason);
+        fail("G136 relink_media rejects a missing destination", reason);
+    }
+
+    // US-105: use a small in-memory-generated PCM WAV so the normal MCP path
+    // exercises decodeAudio -> beatdetect -> Timeline mutation without
+    // depending on the contents of a repository media fixture.
+    QTemporaryFile musicRemixWav;
+    musicRemixWav.setFileTemplate(
+        QDir::tempPath() + QStringLiteral("/veditor-remix-XXXXXX.wav"));
+    bool musicRemixWavReady = musicRemixWav.open();
+    if (musicRemixWavReady) {
+        const auto appendLe16 = [](QByteArray &bytes, quint16 value) {
+            bytes.append(static_cast<char>(value & 0xff));
+            bytes.append(static_cast<char>((value >> 8) & 0xff));
+        };
+        const auto appendLe32 = [](QByteArray &bytes, quint32 value) {
+            bytes.append(static_cast<char>(value & 0xff));
+            bytes.append(static_cast<char>((value >> 8) & 0xff));
+            bytes.append(static_cast<char>((value >> 16) & 0xff));
+            bytes.append(static_cast<char>((value >> 24) & 0xff));
+        };
+        constexpr int sampleRate = 16000;
+        constexpr int sampleCount = sampleRate * 8;
+        QByteArray pcm;
+        pcm.reserve(sampleCount * 2);
+        for (int i = 0; i < sampleCount; ++i) {
+            const double t = static_cast<double>(i) / sampleRate;
+            const int beatIndex = qRound((t - 0.2) / 0.5);
+            const double beatTime = 0.2 + beatIndex * 0.5;
+            const bool click = beatIndex >= 0 && beatIndex < 15
+                && qAbs(t - beatTime) < 0.0125;
+            const qint16 value = click && ((i % 2) == 0) ? 28000 : 0;
+            appendLe16(pcm, static_cast<quint16>(value));
+        }
+        QByteArray wav;
+        wav.append("RIFF", 4);
+        appendLe32(wav, static_cast<quint32>(36 + pcm.size()));
+        wav.append("WAVEfmt ", 8);
+        appendLe32(wav, 16);
+        appendLe16(wav, 1);
+        appendLe16(wav, 1);
+        appendLe32(wav, sampleRate);
+        appendLe32(wav, sampleRate * 2);
+        appendLe16(wav, 2);
+        appendLe16(wav, 16);
+        wav.append("data", 4);
+        appendLe32(wav, static_cast<quint32>(pcm.size()));
+        wav.append(pcm);
+        musicRemixWavReady = musicRemixWav.write(wav) == wav.size();
+        musicRemixWav.flush();
+        musicRemixWav.close();
+    }
+
+    TimelineTrack *musicRemixTrack = timelineReady
+        ? projectTimeline->trackAt(true, 0) : nullptr;
+    const bool musicRemixFixtureReady = musicRemixWavReady && musicRemixTrack;
+    if (musicRemixFixtureReady) {
+        ClipInfo remixClip;
+        remixClip.filePath = musicRemixWav.fileName();
+        remixClip.displayName = QStringLiteral("remix-test.wav");
+        remixClip.duration = 8.0;
+        remixClip.outPoint = 8.0;
+        musicRemixTrack->setClips(QVector<ClipInfo>{remixClip});
+        projectTimeline->clearSelection();
+        projectTimeline->undoManager()->clear();
+        projectTimeline->undoManager()->saveState(
+            projectTimeline->currentState(), QStringLiteral("MCP music remix baseline"));
+
+        const QJsonObject musicRemixResponse = callProjectInfoTool(
+            260, QStringLiteral("music_remix"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("audio")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 0},
+                {QStringLiteral("targetSec"), 6.0}
+            });
+        const QJsonObject musicRemixPayload = toolPayload(musicRemixResponse);
+        const bool g137 = !toolResult(musicRemixResponse)
+                                .value(QStringLiteral("isError")).toBool(true)
+            && musicRemixPayload.value(QStringLiteral("ok")).toBool(false)
+            && musicRemixPayload.value(QStringLiteral("resultDuration")).toDouble() > 0.0
+            && musicRemixPayload.value(QStringLiteral("segmentCount")).toInt() >= 2
+            && musicRemixTrack->clipCount() >= 2;
+        g137 ? pass("G137 music_remix normal case")
+             : fail("G137 music_remix normal case",
+                    QStringLiteral("decode, beat detection, or response failed: %1")
+                        .arg(toolErrorText(musicRemixResponse)));
+
+        const int remixCountAfter = musicRemixTrack->clipCount();
+        const QJsonObject invalidMusicRemixResponse = callProjectInfoTool(
+            261, QStringLiteral("music_remix"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("audio")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 0},
+                {QStringLiteral("targetSec"), 0.0}
+            });
+        const QJsonObject oversizedMusicRemixResponse = callProjectInfoTool(
+            262, QStringLiteral("music_remix"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("audio")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 0},
+                {QStringLiteral("targetSec"), remix::kMaxTargetSec + 1.0}
+            });
+        const bool g138 = toolResult(invalidMusicRemixResponse)
+                                .value(QStringLiteral("isError")).toBool(false)
+            && toolErrorText(invalidMusicRemixResponse).contains(
+                   QStringLiteral("targetSec"))
+            && toolResult(oversizedMusicRemixResponse)
+                   .value(QStringLiteral("isError")).toBool(false)
+            && musicRemixTrack->clipCount() == remixCountAfter;
+        g138 ? pass("G138 music_remix rejects invalid target")
+             : fail("G138 music_remix rejects invalid target",
+                    QStringLiteral("invalid target was accepted or mutated the timeline"));
+
+        QJsonObject musicRemixDescriptor;
+        for (const QJsonValue &value : projectInfoToolDescriptors) {
+            if (value.toObject().value(QStringLiteral("name")).toString()
+                    == QStringLiteral("music_remix")) {
+                musicRemixDescriptor = value.toObject();
+                break;
+            }
+        }
+        const QJsonObject musicInputSchema = musicRemixDescriptor
+            .value(QStringLiteral("inputSchema")).toObject();
+        const QJsonObject musicOutputSchema = musicRemixDescriptor
+            .value(QStringLiteral("outputSchema")).toObject();
+        const auto requiredHas = [](const QJsonObject &schema, const QString &key) {
+            for (const QJsonValue &required : schema.value(QStringLiteral("required"))
+                     .toArray()) {
+                if (required.toString() == key)
+                    return true;
+            }
+            return false;
+        };
+        const bool g139 = !musicRemixDescriptor.isEmpty()
+            && musicInputSchema.value(QStringLiteral("type")).toString()
+                   == QStringLiteral("object")
+            && requiredHas(musicInputSchema, QStringLiteral("kind"))
+            && requiredHas(musicInputSchema, QStringLiteral("targetSec"))
+            && musicInputSchema.value(QStringLiteral("properties")).toObject()
+                   .value(QStringLiteral("targetSec")).toObject()
+                   .value(QStringLiteral("maximum")).toDouble()
+                   == remix::kMaxTargetSec
+            && musicOutputSchema.value(QStringLiteral("type")).toString()
+                   == QStringLiteral("object")
+            && requiredHas(musicOutputSchema, QStringLiteral("resultDuration"))
+            && requiredHas(musicOutputSchema, QStringLiteral("segmentCount"));
+        g139 ? pass("G139 music_remix schema")
+             : fail("G139 music_remix schema",
+                    QStringLiteral("input or output schema is incomplete"));
+        projectTimeline->undo();
+    } else {
+        const QString reason = QStringLiteral(
+            "Timeline or generated WAV fixture was not available");
+        fail("G137 music_remix normal case", reason);
+        fail("G138 music_remix rejects invalid target", reason);
+        fail("G139 music_remix schema", reason);
+    }
+
+    TimelineTrack *replaceVideoTrack = timelineReady
+        ? projectTimeline->trackAt(false, 0) : nullptr;
+    TimelineTrack *replaceAudioTrack = timelineReady
+        ? projectTimeline->trackAt(true, 0) : nullptr;
+    QTemporaryDir replacementMediaDir;
+    const QString replacementMediaPath = replacementMediaDir.isValid()
+        ? QDir(replacementMediaDir.path()).filePath(
+              QStringLiteral("replacement.mp4"))
+        : QString();
+    const bool replacementFixtureReady = replaceVideoTrack && replaceAudioTrack
+        && importSourceReady && replacementMediaDir.isValid()
+        && QFile::copy(importSourcePath, replacementMediaPath);
+    if (replacementFixtureReady) {
+        ClipInfo replaceVideoClip = makeTestClip(importSourcePath, 930);
+        replaceVideoClip.displayName = QStringLiteral("original.mp4");
+        replaceVideoClip.inPoint = 1.0;
+        replaceVideoClip.outPoint = 3.0;
+        replaceVideoClip.leadInSec = 2.0;
+        ClipInfo replaceAudioClip = replaceVideoClip;
+        replaceVideoTrack->setClips(QVector<ClipInfo>{replaceVideoClip});
+        replaceAudioTrack->setClips(QVector<ClipInfo>{replaceAudioClip});
+        projectTimeline->clearSelection();
+        projectTimeline->undoManager()->clear();
+        projectTimeline->undoManager()->saveState(
+            projectTimeline->currentState(),
+            QStringLiteral("MCP replace clip baseline"));
+
+        const QJsonObject replaceResponse = callProjectInfoTool(
+            238, QStringLiteral("replace_clip"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 0},
+                {QStringLiteral("filePath"), replacementMediaPath}
+            });
+        const QJsonObject replaceTimelineResponse = callProjectInfoTool(
+            239, QStringLiteral("get_timeline"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("all")}
+            });
+        const QJsonObject replaceTimelinePayload =
+            toolPayload(replaceTimelineResponse);
+        const QJsonArray replacementVideoTracks =
+            replaceTimelinePayload.value(QStringLiteral("video")).toArray();
+        const QJsonArray replacementVideoClips = replacementVideoTracks.isEmpty()
+            ? QJsonArray()
+            : replacementVideoTracks.first().toObject()
+                  .value(QStringLiteral("clips")).toArray();
+        const QJsonObject replacementVideoJson = replacementVideoClips.isEmpty()
+            ? QJsonObject() : replacementVideoClips.first().toObject();
+        const bool g130 = !toolResult(replaceResponse)
+                                .value(QStringLiteral("isError")).toBool(true)
+            && toolPayload(replaceResponse).value(QStringLiteral("ok")).toBool(false)
+            && replacementVideoJson.value(QStringLiteral("filePath")).toString()
+                   == replacementMediaPath
+            && qAbs(replacementVideoJson.value(QStringLiteral("startSec")).toDouble()
+                    - 2.0) < 1e-9
+            && qAbs(replacementVideoJson.value(QStringLiteral("durationSec")).toDouble()
+                    - 2.0) < 1e-9
+            && qAbs(replacementVideoJson.value(QStringLiteral("inPointSec")).toDouble()
+                    - 1.0) < 1e-9
+            && replaceAudioTrack->clips().size() == 1
+            && replaceAudioTrack->clips().first().filePath == replacementMediaPath;
+        g130 ? pass("G130 replace_clip changes filePath and preserves start/duration")
+             : fail("G130 replace_clip changes filePath and preserves start/duration",
+                    QStringLiteral("replacement response or preserved clip geometry diverged"));
+
+        const QString missingReplacementPath = QDir(replacementMediaDir.path())
+            .filePath(QStringLiteral("missing.mp4"));
+        const QJsonObject missingReplaceResponse = callProjectInfoTool(
+            240, QStringLiteral("replace_clip"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 0},
+                {QStringLiteral("filePath"), missingReplacementPath}
+            });
+        const bool g131 = toolResult(missingReplaceResponse)
+                                .value(QStringLiteral("isError")).toBool(false)
+            && toolErrorText(missingReplaceResponse).contains(
+                   QStringLiteral("ファイルが見つかりません"))
+            && replaceVideoTrack->clips().first().filePath
+                   == replacementMediaPath
+            && replaceAudioTrack->clips().first().filePath
+                   == replacementMediaPath;
+        g131 ? pass("G131 replace_clip rejects a missing file")
+             : fail("G131 replace_clip rejects a missing file",
+                    QStringLiteral("missing replacement was accepted or mutated clips"));
+
+        const QJsonObject replaceUndoResponse = callProjectInfoTool(
+            241, QStringLiteral("undo"), QJsonObject{});
+        const bool g132 = toolPayload(replaceUndoResponse)
+                                .value(QStringLiteral("ok")).toBool(false)
+            && replaceVideoTrack->clips().size() == 1
+            && replaceAudioTrack->clips().size() == 1
+            && replaceVideoTrack->clips().first().filePath == importSourcePath
+            && replaceAudioTrack->clips().first().filePath == importSourcePath
+            && qAbs(replaceVideoTrack->clips().first().leadInSec - 2.0) < 1e-9
+            && qAbs(replaceVideoTrack->clips().first().effectiveDuration() - 2.0)
+                   < 1e-9
+            && qAbs(replaceVideoTrack->clips().first().inPoint - 1.0) < 1e-9
+            && !projectTimeline->undoManager()->canUndo();
+        g132 ? pass("G132 undo restores replace_clip in one step")
+             : fail("G132 undo restores replace_clip in one step",
+                    QStringLiteral("one undo did not restore the linked clip pair"));
+
+        const QJsonObject matchFrameResponse = callProjectInfoTool(
+            242, QStringLiteral("match_frame"), QJsonObject{
+                {QStringLiteral("timeSec"), 3.0}
+            });
+        const QJsonObject matchFramePayload = toolPayload(matchFrameResponse);
+        const bool g133 = !toolResult(matchFrameResponse)
+                                .value(QStringLiteral("isError")).toBool(true)
+            && matchFramePayload.value(QStringLiteral("filePath")).toString()
+                   == importSourcePath
+            && qAbs(matchFramePayload.value(QStringLiteral("sourceSec")).toDouble()
+                    - 2.0) < 1e-9
+            && matchFramePayload.value(QStringLiteral("clipIndex")).toInt(-1) == 0;
+        g133 ? pass("G133 match_frame maps timeline offset to sourceSec")
+             : fail("G133 match_frame maps timeline offset to sourceSec",
+                    QStringLiteral("match_frame did not return inPoint + offset"));
+
+        replaceVideoTrack->setClips(QVector<ClipInfo>{});
+        replaceAudioTrack->setClips(QVector<ClipInfo>{});
+        projectTimeline->clearSelection();
+        projectTimeline->undoManager()->clear();
+        projectTimeline->undoManager()->saveState(
+            projectTimeline->currentState(),
+            QStringLiteral("MCP selftest baseline"));
+    } else {
+        const QString reason = QStringLiteral(
+            "Timeline or replacement media fixture was not available");
+        fail("G130 replace_clip changes filePath and preserves start/duration", reason);
+        fail("G131 replace_clip rejects a missing file", reason);
+        fail("G132 undo restores replace_clip in one step", reason);
+        fail("G133 match_frame maps timeline offset to sourceSec", reason);
+    }
+
+    // G140-G141: dialogue_level generates an audio volume envelope and
+    // rejects non-audio targets.
+    if (projectTimeline && musicRemixWavReady) {
+        TimelineTrack *dialogueTrack = projectTimeline->trackAt(true, 0);
+        if (dialogueTrack) {
+            ClipInfo dialogueClip;
+            dialogueClip.filePath = musicRemixWav.fileName();
+            dialogueClip.displayName = QStringLiteral("dialogue-level-test.wav");
+            dialogueClip.duration = 8.0;
+            dialogueClip.outPoint = 8.0;
+            dialogueTrack->setClips(QVector<ClipInfo>{dialogueClip});
+            projectTimeline->clearSelection();
+            projectTimeline->undoManager()->clear();
+            projectTimeline->undoManager()->saveState(
+                projectTimeline->currentState(),
+                QStringLiteral("MCP dialogue level baseline"));
+
+            const QJsonObject dialogueResponse = callProjectInfoTool(
+                263, QStringLiteral("dialogue_level"), QJsonObject{
+                    {QStringLiteral("kind"), QStringLiteral("audio")},
+                    {QStringLiteral("trackIndex"), 0},
+                    {QStringLiteral("clipIndex"), 0},
+                    {QStringLiteral("targetLufs"), -18.0}
+                });
+            const QJsonObject dialoguePayload = toolPayload(dialogueResponse);
+            const int pointCount = dialoguePayload
+                .value(QStringLiteral("pointCount")).toInt();
+            const bool applied = !toolResult(dialogueResponse)
+                                      .value(QStringLiteral("isError")).toBool(true)
+                && dialoguePayload.value(QStringLiteral("ok")).toBool(false)
+                && pointCount > 1
+                && dialogueTrack->clips().first().volumeEnvelope.size()
+                       == pointCount
+                && dialoguePayload.value(QStringLiteral("measuredLufsMin")).toDouble()
+                       <= dialoguePayload.value(QStringLiteral("measuredLufsMax")).toDouble();
+            projectTimeline->undo();
+            const bool oneUndo = !projectTimeline->canUndo()
+                && dialogueTrack->clips().first().volumeEnvelope.isEmpty();
+            const bool g140 = applied && oneUndo;
+            g140 ? pass("G140 dialogue_level normal case")
+                 : fail("G140 dialogue_level normal case",
+                        QStringLiteral("envelope generation, response, or undo failed: %1")
+                            .arg(toolErrorText(dialogueResponse)));
+
+            const QJsonObject nonAudioResponse = callProjectInfoTool(
+                264, QStringLiteral("dialogue_level"), QJsonObject{
+                    {QStringLiteral("kind"), QStringLiteral("video")},
+                    {QStringLiteral("trackIndex"), 0},
+                    {QStringLiteral("clipIndex"), 0}
+                });
+            const bool g141 = toolResult(nonAudioResponse)
+                                  .value(QStringLiteral("isError")).toBool(false)
+                && dialogueTrack->clips().first().volumeEnvelope.isEmpty();
+            g141 ? pass("G141 dialogue_level rejects non-audio target")
+                 : fail("G141 dialogue_level rejects non-audio target",
+                        QStringLiteral("video target was accepted or mutated audio"));
+
+            dialogueTrack->setClips(QVector<ClipInfo>{});
+            projectTimeline->clearSelection();
+            projectTimeline->undoManager()->clear();
+            projectTimeline->undoManager()->saveState(
+                projectTimeline->currentState(),
+                QStringLiteral("MCP selftest baseline"));
+        } else {
+            fail("G140 dialogue_level normal case",
+                 QStringLiteral("audio track was not available"));
+            fail("G141 dialogue_level rejects non-audio target",
+                 QStringLiteral("audio track was not available"));
+        }
+    } else {
+        const QString reason = QStringLiteral(
+            "Timeline or generated WAV fixture was not available");
+        fail("G140 dialogue_level normal case", reason);
+        fail("G141 dialogue_level rejects non-audio target", reason);
+    }
+
+    // G142-G143: AUDIO-XFADE adds an audio-only set_transition kind. Keep
+    // these gates in the reserved range for US-107; video set_transition
+    // coverage above remains unchanged.
+    if (projectTimeline) {
+        TimelineTrack *audioXfadeTrack = projectTimeline->trackAt(true, 0);
+        if (audioXfadeTrack) {
+            audioXfadeTrack->setClips(QVector<ClipInfo>{
+                makeTestClip(QStringLiteral("audio-xfade-A"), 0),
+                makeTestClip(QStringLiteral("audio-xfade-B"), 0)
+            });
+            projectTimeline->clearSelection();
+            projectTimeline->undoManager()->clear();
+            projectTimeline->undoManager()->saveState(
+                projectTimeline->currentState(),
+                QStringLiteral("MCP audio-xfade baseline"));
+
+            const QJsonObject audioCrossfade = callProjectInfoTool(
+                246, QStringLiteral("set_transition"), QJsonObject{
+                    {QStringLiteral("kind"), QStringLiteral("audio")},
+                    {QStringLiteral("trackIndex"), 0},
+                    {QStringLiteral("clipIndex"), 0},
+                    {QStringLiteral("type"), QStringLiteral("CrossDissolve")},
+                    {QStringLiteral("durationSec"), 1.25}
+                });
+            const QJsonObject audioCrossfadePayload = toolPayload(audioCrossfade);
+            const bool audioCrossfadeApplied =
+                !toolResult(audioCrossfade).value(QStringLiteral("isError")).toBool(true)
+                && audioCrossfadePayload.value(QStringLiteral("ok")).toBool(false)
+                && audioCrossfadePayload.value(QStringLiteral("kind")).toString()
+                       == QStringLiteral("audio")
+                && audioXfadeTrack->clips().at(0).trailOut.type
+                       == TransitionType::CrossDissolve
+                && audioXfadeTrack->clips().at(1).leadIn.type
+                       == TransitionType::CrossDissolve
+                && std::abs(audioXfadeTrack->clips().at(0).trailOut.duration - 1.25) < 1e-9;
+            projectTimeline->undo();
+            const bool audioCrossfadeUndo =
+                !projectTimeline->canUndo()
+                && audioXfadeTrack->clips().at(0).trailOut.type == TransitionType::None
+                && audioXfadeTrack->clips().at(1).leadIn.type == TransitionType::None;
+            const bool g142 = audioCrossfadeApplied && audioCrossfadeUndo;
+            g142 ? pass("G142 audio set_transition applies CrossDissolve and one undo")
+                 : fail("G142 audio set_transition applies CrossDissolve and one undo",
+                        QStringLiteral("audio transition or undo did not match"));
+
+            const QJsonObject invalidAudioType = callProjectInfoTool(
+                247, QStringLiteral("set_transition"), QJsonObject{
+                    {QStringLiteral("kind"), QStringLiteral("audio")},
+                    {QStringLiteral("trackIndex"), 0},
+                    {QStringLiteral("clipIndex"), 0},
+                    {QStringLiteral("type"), QStringLiteral("WipeLeft")},
+                    {QStringLiteral("durationSec"), 1.0}
+                });
+            const bool g143 = toolResult(invalidAudioType)
+                                  .value(QStringLiteral("isError")).toBool(false)
+                && audioXfadeTrack->clips().at(0).trailOut.type == TransitionType::None
+                && audioXfadeTrack->clips().at(1).leadIn.type == TransitionType::None;
+            g143 ? pass("G143 audio set_transition rejects non-audio transition types")
+                 : fail("G143 audio set_transition rejects non-audio transition types",
+                        QStringLiteral("an invalid audio transition type was accepted"));
+
+            audioXfadeTrack->setClips(QVector<ClipInfo>{});
+            projectTimeline->clearSelection();
+            projectTimeline->undoManager()->clear();
+            projectTimeline->undoManager()->saveState(
+                projectTimeline->currentState(), QStringLiteral("MCP selftest baseline"));
+        } else {
+            fail("G142 audio set_transition applies CrossDissolve and one undo",
+                 QStringLiteral("audio track was not available"));
+            fail("G143 audio set_transition rejects non-audio transition types",
+                 QStringLiteral("audio track was not available"));
+        }
+    } else {
+        fail("G142 audio set_transition applies CrossDissolve and one undo",
+             QStringLiteral("Timeline was not available"));
+        fail("G143 audio set_transition rejects non-audio transition types",
+             QStringLiteral("Timeline was not available"));
+    }
+
+    // US-302 reserves G150-G151: edge parameters and unsupported-type warning.
+    if (timelineReady) {
+        auto *track = projectTimeline->trackAt(false, 0);
+        const auto saved = track->clips();
+        auto *audioTrack = projectTimeline->trackAt(true, 0);
+        const auto savedAudio = audioTrack->clips();
+        const auto savedParents = projectTimeline->clipParentEntries();
+        ClipInfo a = makeTestClip(QStringLiteral("edge-A"), 0);
+        ClipInfo b = makeTestClip(QStringLiteral("edge-B"), 0);
+        a.duration = b.duration = 10.0;
+        a.inPoint = b.inPoint = 2.0;
+        a.outPoint = b.outPoint = 7.0;
+        track->setClips({a, b});
+        projectTimeline->clearSelection();
+        projectTimeline->undoManager()->clear();
+        projectTimeline->undoManager()->saveState(
+            projectTimeline->currentState(), QStringLiteral("MCP edge baseline"));
+        const auto getEdge = [&]() {
+            const auto tracks = toolPayload(callProjectInfoTool(
+                350, QStringLiteral("get_timeline"), QJsonObject{})).value("video").toArray();
+            if (tracks.isEmpty()) return QJsonObject{};
+            const auto clips = tracks.at(0).toObject().value("clips").toArray();
+            return clips.isEmpty() ? QJsonObject{} : clips.at(0).toObject().value("trailOut").toObject();
+        };
+        QJsonObject args{{QStringLiteral("kind"), QStringLiteral("video")},
+                         {QStringLiteral("clipIndex"), 0},
+                         {QStringLiteral("type"), QStringLiteral("WipeLeft")},
+                         {QStringLiteral("softness"), 0.5},
+                         {QStringLiteral("borderWidth"), 4.0},
+                         {QStringLiteral("borderColor"), QStringLiteral("#ff0000")}};
+        const auto serial = projectTimeline->undoManager()->saveSerial();
+        const auto response = toolPayload(callProjectInfoTool(351, QStringLiteral("set_transition"), args));
+        const auto edge = getEdge();
+        bool g150 = response.value("ok").toBool() && edge.value("softness").toDouble() == 0.5
+            && edge.value("borderWidth").toDouble() == 4.0
+            && edge.value("borderColor").toString() == QStringLiteral("#ff0000")
+            && projectTimeline->undoManager()->saveSerial() == serial + 1;
+        projectTimeline->undo();
+        g150 = g150 && track->clips().first().trailOut.type == TransitionType::None;
+        g150 ? pass("G150 transition edge parameters and one undo")
+             : fail("G150 transition edge parameters and one undo", QStringLiteral("edge values or undo did not match"));
+        args["type"] = QStringLiteral("CrossDissolve");
+        const auto ignored = toolPayload(callProjectInfoTool(352, QStringLiteral("set_transition"), args));
+        const auto ignoredEdge = getEdge();
+        const bool g151 = ignored.value("ok").toBool()
+            && ignored.value("warning").toString() == QStringLiteral("この type ではソフトネスは無視されます")
+            && ignoredEdge.value("softness").toDouble(-1.0) == 0.0
+            && ignoredEdge.value("borderWidth").toDouble(-1.0) == 0.0
+            && ignoredEdge.value("borderColor").toString() == QStringLiteral("#ffffff")
+            && track->clips().first().trailOut.hasDefaultEdgeParams();
+        g151 ? pass("G151 unsupported transition ignores edge parameters")
+             : fail("G151 unsupported transition ignores edge parameters", QStringLiteral("warning or stored defaults did not match"));
+        projectTimeline->setClipParentEntries(savedParents);
+        track->setClips(saved);
+        audioTrack->setClips(savedAudio);
+        projectTimeline->clearSelection();
+        projectTimeline->undoManager()->clear();
+        projectTimeline->undoManager()->saveState(
+            projectTimeline->currentState(), QStringLiteral("MCP selftest baseline"));
+    } else {
+        fail("G150 transition edge parameters and one undo", QStringLiteral("Timeline tracks were not available"));
+        fail("G151 unsupported transition ignores edge parameters", QStringLiteral("Timeline tracks were not available"));
+    }
+
+    // US-300 reserves G148-G149: identifiers and actual playback overlap.
+    if (timelineReady) {
+        auto* videoTrack = projectTimeline->trackAt(false, 0);
+        auto* audioTrack = projectTimeline->trackAt(true, 0);
+        const auto savedVideo = videoTrack->clips();
+        const auto savedAudio = audioTrack->clips();
+        const auto savedParents = projectTimeline->clipParentEntries();
+        ClipInfo first = makeTestClip(QStringLiteral("overlap-A"), 0);
+        ClipInfo second = makeTestClip(QStringLiteral("overlap-B"), 0);
+        first.duration = second.duration = 10.0;
+        first.inPoint = second.inPoint = 2.0;
+        first.outPoint = second.outPoint = 7.0; // Handles for all alignments.
+        const auto resetOverlapFixture = [&]() {
+            videoTrack->setClips({first, second});
+            audioTrack->setClips({first, second});
+            projectTimeline->clearSelection();
+            projectTimeline->undoManager()->clear();
+            projectTimeline->undoManager()->saveState(
+                projectTimeline->currentState(), QStringLiteral("MCP overlap baseline"));
+        };
+        const auto exportedClips = [&](const QString& kind) {
+            const auto response = callProjectInfoTool(
+                310, QStringLiteral("get_timeline"), QJsonObject{});
+            const auto tracks = toolPayload(response).value(kind).toArray();
+            return tracks.isEmpty() ? QJsonArray{} : tracks.at(0).toObject()
+                .value(QStringLiteral("clips")).toArray();
+        };
+        const auto clipObject = [](const QJsonArray& clips, int index) {
+            return index < clips.size() ? clips.at(index).toObject() : QJsonObject{};
+        };
+        const auto overlapSeconds = [](const QJsonArray& clips, int index,
+                                       const QString& edge) {
+            return index < clips.size() ? clips.at(index).toObject()
+                .value(QStringLiteral("overlap")).toObject().value(edge).toDouble(-1.0)
+                : -1.0;
+        };
+        QJsonObject arguments{
+            {QStringLiteral("kind"), QStringLiteral("video")},
+            {QStringLiteral("trackIndex"), 0}, {QStringLiteral("clipIndex"), 0},
+            {QStringLiteral("type"), QStringLiteral("CrossDissolve")},
+            {QStringLiteral("durationSec"), 1.0},
+            {QStringLiteral("alignment"), QStringLiteral("Start")},
+            {QStringLiteral("easing"), QStringLiteral("EaseIn")}
+        };
+        resetOverlapFixture();
+        const auto videoResponse = callProjectInfoTool(
+            311, QStringLiteral("set_transition"), arguments);
+        const auto videoClips = exportedClips(QStringLiteral("video"));
+        const auto trail = clipObject(videoClips, 0)
+            .value(QStringLiteral("trailOut")).toObject();
+        const auto lead = clipObject(videoClips, 1)
+            .value(QStringLiteral("leadIn")).toObject();
+        bool g148 = !toolResult(videoResponse).value(QStringLiteral("isError")).toBool(true)
+            && trail.value(QStringLiteral("alignment")).toString() == QStringLiteral("Start")
+            && trail.value(QStringLiteral("easing")).toString() == QStringLiteral("EaseIn")
+            && lead.value(QStringLiteral("alignment")).toString() == QStringLiteral("Start")
+            && lead.value(QStringLiteral("easing")).toString() == QStringLiteral("EaseIn")
+            && qAbs(overlapSeconds(videoClips, 0, QStringLiteral("trailOutSec")) - 1.0) < 0.001
+            && qAbs(overlapSeconds(videoClips, 1, QStringLiteral("leadInSec")) - 1.0) < 0.001
+            && overlapSeconds(videoClips, 0, QStringLiteral("leadInSec")) == 0.0
+            && overlapSeconds(videoClips, 1, QStringLiteral("trailOutSec")) == 0.0
+            && clipObject(videoClips, 1).value(QStringLiteral("startSec")).toDouble() == 5.0;
+        const auto serial = projectTimeline->undoManager()->saveSerial();
+        for (const QString& key : {QStringLiteral("alignment"), QStringLiteral("easing")}) {
+            auto invalid = arguments;
+            invalid.insert(key, QStringLiteral("invalid"));
+            const auto rejected = callProjectInfoTool(312, QStringLiteral("set_transition"), invalid);
+            g148 = g148 && toolResult(rejected).value(QStringLiteral("isError")).toBool(false)
+                && projectTimeline->undoManager()->saveSerial() == serial;
+        }
+        projectTimeline->undo();
+        g148 = g148 && !projectTimeline->canUndo()
+            && videoTrack->clips().first().trailOut.type == TransitionType::None;
+        g148 ? pass("G148 transition alignment/easing and video overlap")
+             : fail("G148 transition alignment/easing and video overlap",
+                    QStringLiteral("identifiers, overlap, invalid input, or undo did not match"));
+
+        resetOverlapFixture();
+        arguments.insert(QStringLiteral("kind"), QStringLiteral("audio"));
+        const auto audioResponse = callProjectInfoTool(
+            313, QStringLiteral("set_transition"), arguments);
+        const auto audioClips = exportedClips(QStringLiteral("audio"));
+        bool g149 = !toolResult(audioResponse).value(QStringLiteral("isError")).toBool(true)
+            && qAbs(overlapSeconds(audioClips, 0, QStringLiteral("trailOutSec")) - 1.0) < 0.001
+            && qAbs(overlapSeconds(audioClips, 1, QStringLiteral("leadInSec")) - 1.0) < 0.001
+            && overlapSeconds(audioClips, 0, QStringLiteral("leadInSec")) == 0.0
+            && overlapSeconds(audioClips, 1, QStringLiteral("trailOutSec")) == 0.0
+            && clipObject(audioClips, 0).value(QStringLiteral("trailOut")).toObject()
+                   .value(QStringLiteral("alignment")).toString() == QStringLiteral("Start")
+            && clipObject(audioClips, 1).value(QStringLiteral("leadIn")).toObject()
+                   .value(QStringLiteral("easing")).toString() == QStringLiteral("EaseIn")
+            && videoTrack->clips().first().trailOut.type == TransitionType::None;
+        projectTimeline->undo();
+        g149 = g149 && !projectTimeline->canUndo()
+            && audioTrack->clips().first().trailOut.type == TransitionType::None
+            && audioTrack->clips().at(1).leadIn.type == TransitionType::None;
+        const auto noOverlap = exportedClips(QStringLiteral("audio"));
+        g149 = g149 && overlapSeconds(noOverlap, 0, QStringLiteral("trailOutSec")) == 0.0
+            && overlapSeconds(noOverlap, 1, QStringLiteral("leadInSec")) == 0.0;
+        // Omitting both optional arguments retains Center / Linear.
+        arguments.remove(QStringLiteral("alignment"));
+        arguments.remove(QStringLiteral("easing"));
+        const auto defaultAudioResponse = callProjectInfoTool(
+            314, QStringLiteral("set_transition"), arguments);
+        const auto defaultAudioClips = exportedClips(QStringLiteral("audio"));
+        const auto defaultTrail = clipObject(defaultAudioClips, 0)
+            .value(QStringLiteral("trailOut")).toObject();
+        g149 = g149
+            && !toolResult(defaultAudioResponse).value(QStringLiteral("isError")).toBool(true)
+            && defaultTrail.value(QStringLiteral("alignment")).toString() == QStringLiteral("Center")
+            && defaultTrail.value(QStringLiteral("easing")).toString() == QStringLiteral("Linear")
+            && qAbs(overlapSeconds(defaultAudioClips, 0, QStringLiteral("trailOutSec")) - 1.0) < 0.001
+            && qAbs(overlapSeconds(defaultAudioClips, 1, QStringLiteral("leadInSec")) - 1.0) < 0.001;
+        projectTimeline->undo();
+        g149 = g149 && !projectTimeline->canUndo()
+            && audioTrack->clips().first().trailOut.type == TransitionType::None;
+        // Enable the sequence model without replacing the live track objects.
+        // Legacy calls (no alignment/easing) must preserve its special carrier.
+        TimelineSequence inactiveSequence;
+        inactiveSequence.id = QStringLiteral("mcp-overlap-inactive");
+        inactiveSequence.name = QStringLiteral("MCP overlap inactive");
+        inactiveSequence.videoTracks = {{second}};
+        const bool sequenceAdded = projectTimeline->addSequence(inactiveSequence);
+        g149 = g149 && sequenceAdded;
+        const QString sequenceStoreKey = timeline_nesting::sequenceStoreParentKey();
+        for (const QString& typeName : {QStringLiteral("CrossDissolve"),
+                                       QStringLiteral("FadeIn"), QStringLiteral("FadeOut")}) {
+            resetOverlapFixture();
+            const auto parentsBefore = projectTimeline->clipParentEntries();
+            const auto sequencesBefore = projectTimeline->sequences();
+            const auto activeBefore = projectTimeline->activeSequenceId();
+            const auto serialBefore = projectTimeline->undoManager()->saveSerial();
+            arguments.insert(QStringLiteral("type"), typeName);
+            const auto response = callProjectInfoTool(
+                315, QStringLiteral("set_transition"), arguments);
+            const auto parentsAfter = projectTimeline->clipParentEntries();
+            const auto sequencesAfter = projectTimeline->sequences();
+            bool sequencesPreserved = sequencesBefore.size() >= 2
+                && sequencesAfter.size() == sequencesBefore.size();
+            for (int index = 0; sequencesPreserved && index < sequencesBefore.size(); ++index) {
+                sequencesPreserved = sequencesAfter.at(index).id == sequencesBefore.at(index).id
+                    && sequencesAfter.at(index).name == sequencesBefore.at(index).name;
+            }
+            // The active sequence's clips legitimately change. Inactive
+            // sequence payloads must remain identical, including their clips.
+            const auto storeBefore = timeline_nesting::decodeSequenceStoreObject(
+                parentsBefore.value(sequenceStoreKey)).value(QStringLiteral("sequences")).toArray();
+            const auto storeAfter = timeline_nesting::decodeSequenceStoreObject(
+                parentsAfter.value(sequenceStoreKey)).value(QStringLiteral("sequences")).toArray();
+            sequencesPreserved = sequencesPreserved
+                && storeBefore.size() == sequencesBefore.size()
+                && storeAfter.size() == storeBefore.size();
+            for (int index = 0; sequencesPreserved && index < storeBefore.size(); ++index) {
+                if (sequencesBefore.at(index).id != activeBefore)
+                    sequencesPreserved = index < storeAfter.size()
+                        && storeAfter.at(index) == storeBefore.at(index);
+            }
+            g149 = g149 && !toolResult(response).value(QStringLiteral("isError")).toBool(true)
+                && !parentsBefore.value(sequenceStoreKey).isEmpty()
+                && !parentsAfter.value(sequenceStoreKey).isEmpty()
+                && !activeBefore.isEmpty()
+                && projectTimeline->activeSequenceId() == activeBefore
+                && sequencesPreserved
+                && projectTimeline->undoManager()->saveSerial() == serialBefore + 1;
+            projectTimeline->undo();
+            g149 = g149 && !projectTimeline->canUndo()
+                && projectTimeline->clipParentEntries() == parentsBefore
+                && projectTimeline->activeSequenceId() == activeBefore
+                && projectTimeline->sequences().size() == sequencesBefore.size()
+                && audioTrack->clips().first().leadIn.type == TransitionType::None
+                && audioTrack->clips().first().trailOut.type == TransitionType::None
+                && audioTrack->clips().at(1).leadIn.type == TransitionType::None;
+        }
+        g149 ? pass("G149 audio overlap and one undo")
+             : fail("G149 audio overlap and one undo",
+                    QStringLiteral("audio overlap, identifiers, isolation, sequence store, or undo did not match"));
+        projectTimeline->setClipParentEntries(savedParents);
+        videoTrack->setClips(savedVideo);
+        audioTrack->setClips(savedAudio);
+        projectTimeline->clearSelection();
+        projectTimeline->undoManager()->clear();
+        projectTimeline->undoManager()->saveState(
+            projectTimeline->currentState(), QStringLiteral("MCP selftest baseline"));
+    } else {
+        fail("G148 transition alignment/easing and video overlap",
+             QStringLiteral("Timeline tracks were not available"));
+        fail("G149 audio overlap and one undo",
+             QStringLiteral("Timeline tracks were not available"));
     }
 
     const bool selectClipFieldsPresent =
@@ -2089,6 +3870,10 @@ int runMcpSelftest()
              QStringLiteral("V1 track was not available"));
         fail("G86 set_transition changes and undoes a live clip",
              QStringLiteral("V1 track was not available"));
+        fail("G146 MorphCut is applied and reflected by get_timeline",
+             QStringLiteral("V1 track was not available"));
+        fail("G147 MorphCut is reverted by one undo",
+             QStringLiteral("V1 track was not available"));
         fail("G87 set_transition rejects an invalid type",
              QStringLiteral("V1 track was not available"));
         fail("G88 add_text_overlay changes and undoes a live clip",
@@ -2195,6 +3980,67 @@ int runMcpSelftest()
         g86 ? pass("G86 set_transition changes and undoes a live clip")
             : fail("G86 set_transition changes and undoes a live clip",
                    QStringLiteral("transition output, pairing, selection, or undo restoration did not match"));
+
+        // US-202 reserves G146-G147; use the same live pair and undo protocol.
+        auto timelineTrackObject = [](const QJsonObject &payload,
+                                      const QString &kind, int trackIndex) {
+            const QJsonArray tracks = payload.value(kind).toArray();
+            return trackIndex >= 0 && trackIndex < tracks.size()
+                ? tracks.at(trackIndex).toObject() : QJsonObject{};
+        };
+
+        saveMcpLiveBaseline();
+        const auto morphBefore = captionVideo0->clips();
+        const QJsonObject morphResponse = callProjectInfoTool(
+            305, QStringLiteral("set_transition"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")},
+                {QStringLiteral("trackIndex"), 0},
+                {QStringLiteral("clipIndex"), 0},
+                {QStringLiteral("type"), QStringLiteral("MorphCut")},
+                {QStringLiteral("durationSec"), 0.75}
+            });
+        const auto morphTimeline = callProjectInfoTool(
+            306, QStringLiteral("get_timeline"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")}
+            });
+        const QJsonArray morphClips = timelineTrackObject(
+            toolPayload(morphTimeline), QStringLiteral("video"), 0)
+                .value(QStringLiteral("clips")).toArray();
+        const bool g146 = !toolResult(morphResponse).value(QStringLiteral("isError")).toBool(true)
+            && toolPayload(morphResponse).value(QStringLiteral("ok")).toBool(false)
+            && requiredOutputFieldsPresent(QStringLiteral("set_transition"), toolPayload(morphResponse))
+            && captionVideo0->clips().size() == 2
+            && captionVideo0->clips().first().trailOut.type == TransitionType::MorphCut
+            && captionVideo0->clips().at(1).leadIn.type == TransitionType::MorphCut
+            && morphClips.size() == 2
+            && morphClips.first().toObject().value(QStringLiteral("trailOut")).toObject()
+                   .value(QStringLiteral("type")).toString() == QStringLiteral("MorphCut")
+            && morphClips.at(1).toObject().value(QStringLiteral("leadIn")).toObject()
+                   .value(QStringLiteral("type")).toString() == QStringLiteral("MorphCut");
+        g146 ? pass("G146 MorphCut is applied and reflected by get_timeline")
+             : fail("G146 MorphCut is applied and reflected by get_timeline",
+                    QStringLiteral("MCP mutation, mirrored transition or timeline output diverged"));
+        const auto morphUndo = callProjectInfoTool(307, QStringLiteral("undo"), QJsonObject{});
+        const auto morphUndoTimeline = callProjectInfoTool(
+            308, QStringLiteral("get_timeline"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("video")}
+            });
+        const QJsonArray morphUndoClips = timelineTrackObject(
+            toolPayload(morphUndoTimeline), QStringLiteral("video"), 0)
+                .value(QStringLiteral("clips")).toArray();
+        const bool g147 = g146 && toolPayload(morphUndo).value(QStringLiteral("ok")).toBool(false)
+            && captionVideo0->clips().size() == morphBefore.size()
+            && captionVideo0->clips().first().trailOut.type == morphBefore.first().trailOut.type
+            && captionVideo0->clips().at(1).leadIn.type == morphBefore.at(1).leadIn.type
+            && morphUndoClips.size() == 2
+            && morphUndoClips.first().toObject().value(QStringLiteral("trailOut")).toObject()
+                   .value(QStringLiteral("type")).toString() == QStringLiteral("None")
+            && morphUndoClips.at(1).toObject().value(QStringLiteral("leadIn")).toObject()
+                   .value(QStringLiteral("type")).toString() == QStringLiteral("None")
+            && !projectTimeline->undoManager()->canUndo();
+        g147 ? pass("G147 MorphCut is reverted by one undo")
+             : fail("G147 MorphCut is reverted by one undo",
+                    QStringLiteral("one undo did not restore both clips and history"));
 
         const QJsonObject invalidTransitionResponse = callProjectInfoTool(
             91, QStringLiteral("set_transition"), QJsonObject{
@@ -2986,9 +4832,28 @@ int runMcpSelftest()
         {QStringLiteral("move_clip"), QJsonObject{
             {QStringLiteral("clipIndex"), 0}, {QStringLiteral("newStartSec"), 0.0}
         }},
+        {QStringLiteral("set_track_locked"), QJsonObject{
+            {QStringLiteral("kind"), QStringLiteral("video")},
+            {QStringLiteral("trackIndex"), 0}, {QStringLiteral("locked"), true}
+        }},
+        {QStringLiteral("match_frame"), QJsonObject{}},
+        {QStringLiteral("replace_clip"), QJsonObject{
+            {QStringLiteral("clipIndex"), 0},
+            {QStringLiteral("filePath"), QStringLiteral("missing.mp4")}
+        }},
+        {QStringLiteral("relink_media"), QJsonObject{
+            {QStringLiteral("mapping"), QJsonArray{
+                QJsonObject{{QStringLiteral("from"), QStringLiteral("old.mp4")},
+                            {QStringLiteral("to"), QStringLiteral("new.mp4")}}
+            }}
+        }},
         {QStringLiteral("set_clip_property"), QJsonObject{
             {QStringLiteral("clipIndex"), 0}, {QStringLiteral("property"), QStringLiteral("volume")},
             {QStringLiteral("value"), 1.0}
+        }},
+        {QStringLiteral("dynamic_zoom"), QJsonObject{
+            {QStringLiteral("clipIndex"), 0},
+            {QStringLiteral("preset"), QStringLiteral("zoomIn")}
         }},
         {QStringLiteral("trim_clip"), QJsonObject{
             {QStringLiteral("clipIndex"), 0}, {QStringLiteral("edge"), QStringLiteral("in")},
@@ -3046,8 +4911,169 @@ int runMcpSelftest()
         : fail("G36 request id absence versus null",
                QStringLiteral("id presence was not distinguished"));
 
+    if (!timelineReady) {
+        fail("G154 compare_project detects move and volume", QStringLiteral("Timeline was not available"));
+        fail("G155 compare_project unchanged and invalid inputs", QStringLiteral("Timeline was not available"));
+    }
+    // US-312 reserves G152-G153. Exercise the actual MCP handlers and renderer.
+    if (timelineReady) {
+        const auto savedState = projectTimeline->currentState();
+        ClipInfo original{};
+        original.filePath = QFileInfo(QStringLiteral("test_assets/e2e_clip.mp4")).absoluteFilePath();
+        const auto duration = libavcore::probeDurationMicroseconds(original.filePath.toStdString());
+        original.duration = duration ? double(*duration) / 1000000.0 : 0.0;
+        original.inPoint = 1.0;
+        original.outPoint = 2.0;
+        original.effects.append(VideoEffect::createBrightnessContrast(12.0, 0.0));
+        projectTimeline->restoreFromProject(QVector<QVector<ClipInfo>>{{original}},
+            QVector<QVector<ClipInfo>>{}, 0, -1, -1, 10);
+        projectTimeline->undoManager()->clear();
+        projectTimeline->saveUndoState(QStringLiteral("MCP焼き込み初期状態"));
+        const QSize size(640, 360);
+        const QImage before = tlrender::renderFrameAt(projectTimeline, 500000, size);
+        // Same independent queue control as render-in-place G1, at the MCP
+        // project's fps and source-native size. Measure the YUV/codec floor
+        // instead of assuming a lossless RGB round trip on every encoder.
+        QTemporaryDir controlOutput;
+        QSize nativeSize;
+        AVFormatContext *source = nullptr;
+        if (avformat_open_input(&source, original.filePath.toUtf8().constData(), nullptr, nullptr) >= 0) {
+            if (avformat_find_stream_info(source, nullptr) >= 0) {
+                const int index = av_find_best_stream(source, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+                if (index >= 0) {
+                    const auto *parameters = source->streams[index]->codecpar;
+                    nativeSize = QSize((parameters->width + 1) & ~1, (parameters->height + 1) & ~1);
+                }
+            }
+            avformat_close_input(&source);
+        }
+        const double controlFps = toolPayload(callProjectInfoTool(451,
+            QStringLiteral("get_project_info"), {})).value(QStringLiteral("fps")).toDouble();
+        const QString controlPath = controlOutput.filePath(QStringLiteral("control.mp4"));
+        const QString silentPath = controlOutput.filePath(QStringLiteral("silent.png"));
+        QImage silent(2, 2, QImage::Format_RGB32);
+        silent.fill(Qt::black);
+        bool controlOk = false;
+        QString controlError;
+        if (controlOutput.isValid() && !nativeSize.isEmpty() && controlFps > 0.0 && silent.save(silentPath)) {
+            RenderPreset preset{QStringLiteral("対照書き出し"), nativeSize.width(), nativeSize.height(),
+                QStringLiteral("h264"), 100000000, QStringLiteral("mp4")};
+            RenderJob job = RenderQueue::jobFromPreset(preset, controlPath, 0, 1000000);
+            job.uuid = QUuid::createUuid().toString(QUuid::WithoutBraces);
+            job.timeline = projectTimeline;
+            job.projectFilePath = silentPath;
+            job.exportConfig["fps"] = controlFps;
+            RenderQueue queue;
+            QEventLoop loop;
+            bool done = false;
+            QObject::connect(&queue, &RenderQueue::jobCompletedUuid, &loop,
+                [&](const QString &uuid, bool ok, const QString &message) {
+                    if (uuid != job.uuid) return;
+                    done = true;
+                    controlOk = ok;
+                    controlError = message;
+                    loop.quit();
+                });
+            queue.addJob(job);
+            queue.start();
+            if (!done) loop.exec();
+        }
+        ClipInfo controlClip{};
+        controlClip.filePath = controlPath;
+        controlClip.duration = 1.0;
+        Timeline controlTimeline;
+        controlTimeline.restoreFromProject(QVector<QVector<ClipInfo>>{{controlClip}},
+            QVector<QVector<ClipInfo>>{}, 0, -1, -1, 10);
+        const QImage control = tlrender::renderFrameAt(&controlTimeline, 500000, size);
+        const QJsonObject target{{QStringLiteral("trackIndex"), 0}, {QStringLiteral("clipIndex"), 0}};
+        QJsonObject renderArgs = target;
+        renderArgs.insert(QStringLiteral("kind"), QStringLiteral("video"));
+        const quint64 serial = projectTimeline->undoManager()->saveSerial();
+        const auto rendered = toolPayload(callProjectInfoTool(452, QStringLiteral("render_in_place"), renderArgs));
+        const QString path = rendered.value(QStringLiteral("outputPath")).toString();
+        const auto timelineClip = [&]() {
+            const auto payload = toolPayload(callProjectInfoTool(453, QStringLiteral("get_timeline"), {}));
+            const auto tracks = payload.value(QStringLiteral("video")).toArray();
+            const auto clips = tracks.isEmpty() ? QJsonArray{} : tracks.first().toObject().value(QStringLiteral("clips")).toArray();
+            return clips.isEmpty() ? QJsonObject{} : clips.first().toObject();
+        };
+        const QJsonObject bakedClip = timelineClip();
+        const QImage after = tlrender::renderFrameAt(projectTimeline, 500000, size);
+        const auto imageMse = [](const QImage &before, const QImage &after) {
+            double error = std::numeric_limits<double>::infinity();
+            if (!before.isNull() && !after.isNull() && before.size() == after.size()) {
+                const QImage a = before.convertToFormat(QImage::Format_RGB32);
+                const QImage b = after.convertToFormat(QImage::Format_RGB32);
+                double sum = 0.0;
+                for (int y = 0; y < a.height(); ++y) {
+                    const auto *pa = reinterpret_cast<const QRgb *>(a.constScanLine(y));
+                    const auto *pb = reinterpret_cast<const QRgb *>(b.constScanLine(y));
+                    for (int x = 0; x < a.width(); ++x) {
+                        const double r = qRed(pa[x]) - qRed(pb[x]);
+                        const double g = qGreen(pa[x]) - qGreen(pb[x]);
+                        const double bl = qBlue(pa[x]) - qBlue(pb[x]);
+                        sum += r*r + g*g + bl*bl;
+                    }
+                }
+                error = sum / (3.0 * a.width() * a.height());
+            }
+            return error;
+        };
+        const double error = imageMse(before, after);
+        const double floor = imageMse(before, control);
+        const double residual = imageMse(control, after);
+        constexpr double margin = 0.25; // Same measured-floor margin as G1.
+        std::fprintf(stderr, "G152 fps=%.3f MSE=%.6f control=%.6f residual=%.6f margin=%.2f error=%s\n",
+            controlFps, error, floor, residual, margin, qPrintable(controlError));
+        const bool g152 = duration && *duration >= 2000000
+            && rendered.value(QStringLiteral("ok")).toBool()
+            && rendered.value(QStringLiteral("replaced")).toBool()
+            && rendered.value(QStringLiteral("linkedAudioReplaced")).isBool()
+            && !rendered.value(QStringLiteral("linkedAudioReplaced")).toBool()
+            && QFileInfo::exists(path) && path.endsWith(QStringLiteral(".mp4"))
+            && path != original.filePath && bakedClip.value(QStringLiteral("filePath")).toString() == path
+            && bakedClip.value(QStringLiteral("effects")).isArray()
+            && bakedClip.value(QStringLiteral("effects")).toArray().isEmpty()
+            && projectTimeline->undoManager()->saveSerial() == serial + 1
+            && controlOk && std::isfinite(error) && std::isfinite(floor)
+            && error <= floor + margin && residual <= margin;
+        g152 ? pass("G152 render_in_place MCP picture and timeline")
+             : fail("G152 render_in_place MCP picture and timeline",
+                    QStringLiteral("MSE=%1 response=%2").arg(error).arg(QString::fromUtf8(compact(rendered))));
+        if (!g152) {
+            controlOutput.setAutoRemove(false);
+            before.save(controlOutput.filePath(QStringLiteral("before.png")));
+            after.save(controlOutput.filePath(QStringLiteral("after.png")));
+            control.save(controlOutput.filePath(QStringLiteral("control.png")));
+            std::fprintf(stderr, "G152 retained control=%s baked=%s\n", qPrintable(controlPath), qPrintable(path));
+        }
+        const auto decomposed = toolPayload(callProjectInfoTool(454, QStringLiteral("decompose_render_in_place"), target));
+        const QJsonObject restored = timelineClip();
+        bool g153 = decomposed.value(QStringLiteral("ok")).toBool()
+            && restored.value(QStringLiteral("filePath")).toString() == original.filePath
+            && restored.value(QStringLiteral("effects")).toArray().size() == 1
+            && restored.value(QStringLiteral("effects")).toArray().first().toObject().value(QStringLiteral("param1")).toDouble() == 12.0;
+        const auto undoDecompose = toolPayload(callProjectInfoTool(455, QStringLiteral("undo"), {}));
+        g153 = g153 && undoDecompose.value(QStringLiteral("ok")).toBool()
+            && timelineClip().value(QStringLiteral("filePath")).toString() == path;
+        const auto undoRender = toolPayload(callProjectInfoTool(456, QStringLiteral("undo"), {}));
+        const auto undone = timelineClip();
+        g153 = g153 && undoRender.value(QStringLiteral("ok")).toBool()
+            && undone.value(QStringLiteral("filePath")).toString() == original.filePath
+            && undone.value(QStringLiteral("effects")) == restored.value(QStringLiteral("effects"));
+        g153 ? pass("G153 decompose and undo restore media and effects")
+             : fail("G153 decompose and undo restore media and effects", QStringLiteral("復元または取り消しに失敗"));
+        projectTimeline->restoreState(savedState);
+        if (g152 && rendered.value(QStringLiteral("ok")).toBool() && path != original.filePath)
+            QFile::remove(path);
+    } else {
+        fail("G152 render_in_place MCP picture and timeline", QStringLiteral("Timeline was not available"));
+        fail("G153 decompose and undo restore media and effects", QStringLiteral("Timeline was not available"));
+    }
     server.stop();
     qInfo().noquote().nospace() << "[mcp] selftest end, passed=" << passed
                                 << " failed=" << failed;
-    return failed == 0 ? 0 : 1;
+    qInfo().noquote().nospace() << "summary: " << passed << " PASS, "
+                                << failed << " FAIL";
+    return failed;
 }

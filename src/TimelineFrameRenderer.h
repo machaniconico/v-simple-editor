@@ -10,8 +10,14 @@
 #include <QVector>
 #include <QVector3D>
 #include <QtGlobal>
+#include <functional>
 
 class Timeline;
+struct ClipInfo;
+struct VideoEffect;
+struct OverlapInterval;
+struct PlaybackEntry;
+namespace clipgeom { struct ClipTransform; }
 
 // Single Source Of Truth (SSOT) Timeline -> QImage renderer.
 //
@@ -49,12 +55,74 @@ class Timeline;
 //     has no adjustment layer / the V1 clip has no text, so S2/S3/S4/S5 stay
 //     byte-identical (MSE 0).
 //
-// Transitions and 2D rotation are still out of scope (the authoritative
-// multi-track compositor itself applies no rotation). Any failure (no
+// Transitions share the preview post-overlay seam. Any failure (no
 // timeline, no V1 clip, decode error) yields a null QImage so callers can
 // fall back gracefully; an upper track that fails to decode is skipped
 // rather than failing the whole frame.
 namespace tlrender {
+
+// Timeless source for transition-bearing stills; null for video/animation.
+QImage readTransitionStillFrame(const QString &filePath);
+// Place the neighbouring clip alone, without canvas overlays or adjustments.
+QImage prepareTransitionLayer(QImage source, const clipgeom::ClipTransform &transform,
+                              QSize canvasSize);
+// Test switch also resets the calling thread's observation count.
+void setTransitionStepsEnabledForTest(bool enabled);
+int transitionStepCallCountForTest();
+QImage applyEdgeFadeStep(QImage composed, const OverlapInterval &entry, double T);
+QImage applyEdgeFadeStep(QImage composed, const PlaybackEntry &entry, double T);
+// Uses the outgoing interval edge parameters in OverlayRenderer::applyTransition.
+QImage applyOverlapTransitionStep(QImage composed, const QImage &neighbourLayer,
+                                 const OverlapInterval &entry, double T);
+QImage applyOverlapTransitionStep(QImage composed, const QImage &neighbourLayer,
+                                 const PlaybackEntry &entry, double T);
+
+// Pure temporal-composite helper. `echoes[0]` is the frame at t-delay,
+// `echoes[1]` at t-2*delay, and so on; each receives decay^(index+1).
+// blend: 0=Add, 1=Screen, 2=Lighten, 3=Normal alpha composite.
+QImage composeEcho(const QImage &base, const QVector<QImage> &echoes,
+                   double decay, int blend);
+
+using EchoFrameProvider =
+    std::function<QImage(double sourceSeconds, double clipLocalSeconds)>;
+
+// CPU-only temporal repair. Source and provider must have the same FX prefix.
+// sourceFps=0 probes the source stream (generated sources fall back to 30 Hz).
+bool hasActiveRollingShutter(const ClipInfo &clip, double clipLocalSeconds);
+void setRollingShutterDisabledForTesting(bool disabled);
+void resetRollingShutterInvocationCountForTesting();
+quint64 rollingShutterInvocationCountForTesting();
+QImage applyRollingShutterFromSource(
+    const QImage &source, const VideoEffect &effect, const ClipInfo &clip,
+    double clipLocalSeconds, double sourceSeconds,
+    const EchoFrameProvider &frameProvider, double sourceFps = 0.0);
+
+bool hasActiveEcho(const ClipInfo &clip, double clipLocalSeconds);
+// Shared clip-local pre-Echo stage used by export and VideoPlayer. The source
+// frame is processed as VFX footage (when enabled) and then receives the
+// clip's effective HSL/grade/curves/LUT at `clipLocalSeconds`.
+QImage prepareClipSourceForEcho(const QImage &source, const ClipInfo &clip,
+                                double clipLocalSeconds);
+QImage applyClipFxStackFromSource(const QImage &source, const ClipInfo &clip,
+                                  double clipLocalSeconds);
+QImage applyClipFxPackWithEcho(const QImage &graded, const ClipInfo &clip,
+                               double clipLocalSeconds, double sourceSeconds,
+                               const EchoFrameProvider &frameProvider);
+// Full native clip stage for Echo/RollingShutterRepair: VFX footage controls ->
+// grade/LUT -> ordered FX/Echo. Both export and preview call this function
+// before mask, fit, transform, and canvas composition.
+QImage applyClipFxStackWithEchoFromSource(
+    const QImage &source, const ClipInfo &clip, double clipLocalSeconds,
+    double sourceSeconds, const EchoFrameProvider &frameProvider);
+
+// Random-access source-frame path shared with preview Echo. It mirrors the
+// export provider's source decode/nested render -> VFX controls -> grade order.
+QImage renderClipSourceFrameForEcho(const Timeline *timeline,
+                                    const ClipInfo &clip,
+                                    double sourceSeconds,
+                                    double clipLocalSeconds,
+                                    QSize outSize,
+                                    qint64 timelineUsec);
 
 QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize);
 QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize,
@@ -92,7 +160,9 @@ bool lightingSelftestSeamWasCalled();
 // authoritative comparator) byte-identical decoded frames so the measured
 // MSE reflects compositing fidelity, not decode-path drift. NOT part of the
 // production render API; do not call from the export/preview pipelines.
-QImage decodeClipFrameNativeForTest(const QString &filePath, double sourceSec);
+QImage decodeClipFrameNativeForTest(const QString &filePath, double sourceSec,
+                                   bool usePreviousSourceFrame = false,
+                                   double sourceInSec = 0.0);
 } // namespace detail
 
 } // namespace tlrender

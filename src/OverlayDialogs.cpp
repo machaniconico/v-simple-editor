@@ -27,6 +27,10 @@ QList<TransitionPreset> TransitionPresetStore::loadAll()
             prefs.value("alignment", static_cast<int>(TransitionAlignment::Center)).toInt());
         p.transition.easing = static_cast<TransitionEasing>(
             prefs.value("easing", static_cast<int>(TransitionEasing::Linear)).toInt());
+        p.transition.softness = qBound(0.0, prefs.value("softness", 0.0).toDouble(), 1.0);
+        p.transition.borderWidth = qBound(0.0, prefs.value("borderWidth", 0.0).toDouble(), 50.0);
+        const QColor border(prefs.value("borderColor", "#ffffff").toString());
+        if (border.isValid()) p.transition.borderColor = border;
         out.append(p);
     }
     prefs.endArray();
@@ -57,6 +61,13 @@ void TransitionPresetStore::save(const QString &name, const Transition &t)
         prefs.setValue("duration", presets[i].transition.duration);
         prefs.setValue("alignment", static_cast<int>(presets[i].transition.alignment));
         prefs.setValue("easing", static_cast<int>(presets[i].transition.easing));
+        const Transition &edge = presets[i].transition;
+        prefs.remove("softness");
+        prefs.remove("borderWidth");
+        prefs.remove("borderColor");
+        if (edge.softness != 0.0) prefs.setValue("softness", edge.softness);
+        if (edge.borderWidth != 0.0) prefs.setValue("borderWidth", edge.borderWidth);
+        if (edge.borderColor != QColor(Qt::white)) prefs.setValue("borderColor", edge.borderColor.name());
     }
     prefs.endArray();
 }
@@ -81,6 +92,13 @@ void TransitionPresetStore::remove(const QString &name)
         prefs.setValue("duration", kept[i].transition.duration);
         prefs.setValue("alignment", static_cast<int>(kept[i].transition.alignment));
         prefs.setValue("easing", static_cast<int>(kept[i].transition.easing));
+        const Transition &edge = kept[i].transition;
+        prefs.remove("softness");
+        prefs.remove("borderWidth");
+        prefs.remove("borderColor");
+        if (edge.softness != 0.0) prefs.setValue("softness", edge.softness);
+        if (edge.borderWidth != 0.0) prefs.setValue("borderWidth", edge.borderWidth);
+        if (edge.borderColor != QColor(Qt::white)) prefs.setValue("borderColor", edge.borderColor.name());
     }
     prefs.endArray();
 }
@@ -325,14 +343,14 @@ void TransitionDialog::setupUI()
         TransitionType::BarnDoorHClose, TransitionType::BarnDoorVClose,
         TransitionType::ClockWipeCCW,
         TransitionType::WhipPanLeft, TransitionType::WhipPanRight,
-        TransitionType::Glitch, TransitionType::LightLeak,
+        TransitionType::Glitch, TransitionType::LightLeak, TransitionType::MorphCut,
         TransitionType::FlipHorizontal, TransitionType::FlipVertical,
         TransitionType::LensFlare, TransitionType::FilmBurn,
         TransitionType::Pixelate, TransitionType::BlurDissolve,
         TransitionType::CameraShake, TransitionType::ColorChannelShift,
     };
     for (const TransitionType t : kDialogTypeOrder)
-        m_typeCombo->addItem(Transition::typeName(t), static_cast<int>(t));
+        m_typeCombo->addItem(t == TransitionType::MorphCut ? QStringLiteral("モーフカット") : Transition::typeName(t), static_cast<int>(t));
     form->addRow("Type:", m_typeCombo);
 
     m_durationSpin = new QDoubleSpinBox(this);
@@ -358,6 +376,31 @@ void TransitionDialog::setupUI()
     m_easingCombo->addItem("Ease In/Out", static_cast<int>(TransitionEasing::EaseInOut));
     form->addRow("Easing:", m_easingCombo);
 
+    m_softnessSpin = new QDoubleSpinBox(this);
+    m_softnessSpin->setRange(0.0, 100.0);
+    m_softnessSpin->setSuffix("%");
+    form->addRow(QStringLiteral("ソフトネス"), m_softnessSpin);
+    m_borderWidthSpin = new QDoubleSpinBox(this);
+    m_borderWidthSpin->setRange(0.0, 50.0);
+    m_borderWidthSpin->setSuffix(" px");
+    form->addRow(QStringLiteral("境界線の幅"), m_borderWidthSpin);
+    m_borderColorBtn = new QPushButton(m_borderColor.name(), this);
+    form->addRow(QStringLiteral("境界線の色"), m_borderColorBtn);
+    connect(m_borderColorBtn, &QPushButton::clicked, this, [this]() {
+        const QColor color = QColorDialog::getColor(m_borderColor, this, QStringLiteral("境界線の色"));
+        if (!color.isValid()) return;
+        m_borderColor = color;
+        m_borderColorBtn->setText(color.name());
+    });
+    const auto updateEdgeControls = [this]() {
+        const bool enabled = supportsEdgeParams(static_cast<TransitionType>(m_typeCombo->currentData().toInt()));
+        m_softnessSpin->setEnabled(enabled);
+        m_borderWidthSpin->setEnabled(enabled);
+        m_borderColorBtn->setEnabled(enabled);
+    };
+    connect(m_typeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, updateEdgeControls);
+    updateEdgeControls();
+
     // Preset wiring (after the four field combos so we can read/write
     // them when applying or capturing a preset).
     refreshPresetCombo();
@@ -374,6 +417,10 @@ void TransitionDialog::setupUI()
                 if (aIdx >= 0) m_alignmentCombo->setCurrentIndex(aIdx);
                 const int eIdx = m_easingCombo->findData(static_cast<int>(p.transition.easing));
                 if (eIdx >= 0) m_easingCombo->setCurrentIndex(eIdx);
+                m_softnessSpin->setValue(p.transition.softness * 100.0);
+                m_borderWidthSpin->setValue(p.transition.borderWidth);
+                m_borderColor = p.transition.borderColor;
+                m_borderColorBtn->setText(m_borderColor.name());
                 break;
             }
         });
@@ -389,6 +436,11 @@ void TransitionDialog::setupUI()
         t.duration = m_durationSpin->value();
         t.alignment = static_cast<TransitionAlignment>(m_alignmentCombo->currentData().toInt());
         t.easing = static_cast<TransitionEasing>(m_easingCombo->currentData().toInt());
+        if (supportsEdgeParams(t.type)) {
+            t.softness = m_softnessSpin->value() / 100.0;
+            t.borderWidth = m_borderWidthSpin->value();
+            t.borderColor = m_borderColor;
+        }
         TransitionPresetStore::save(name.trimmed(), t);
         refreshPresetCombo();
         const int idx = m_presetCombo->findData(name.trimmed());
@@ -417,6 +469,11 @@ void TransitionDialog::setupUI()
             m_alignmentCombo->currentData().toInt());
         m_result.easing = static_cast<TransitionEasing>(
             m_easingCombo->currentData().toInt());
+        if (supportsEdgeParams(m_result.type)) {
+            m_result.softness = m_softnessSpin->value() / 100.0;
+            m_result.borderWidth = m_borderWidthSpin->value();
+            m_result.borderColor = m_borderColor;
+        }
         accept();
     });
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);

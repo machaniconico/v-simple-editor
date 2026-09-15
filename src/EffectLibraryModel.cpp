@@ -113,6 +113,8 @@ QString videoCategory(VideoEffectType type)
     case VideoEffectType::Mirror:
     case VideoEffectType::PolarCoordinates:
     case VideoEffectType::MotionTile:
+    case VideoEffectType::RollingShutterRepair:
+    case VideoEffectType::LensDistortion:
     case VideoEffectType::CornerPinSimple:
         return QStringLiteral("ディストーション");
     case VideoEffectType::Vignette:
@@ -129,6 +131,8 @@ QString videoCategory(VideoEffectType type)
     case VideoEffectType::Scanlines:
     case VideoEffectType::Halftone:
     case VideoEffectType::Sharpen:
+    case VideoEffectType::FilmGrain:
+    case VideoEffectType::Echo:
         return QStringLiteral("スタイライズ");
     case VideoEffectType::None:
         return QStringLiteral("その他");
@@ -151,6 +155,8 @@ QString localizedVideoName(VideoEffectType type)
 
 VideoEffectType shaderVideoType(const QString &name)
 {
+    if (name == QStringLiteral("レンズ歪み補正"))
+        return VideoEffectType::LensDistortion;
     if (name.contains(QStringLiteral("Chromatic"), Qt::CaseInsensitive))
         return VideoEffectType::RGBSplit;
     if (name.contains(QStringLiteral("Halftone"), Qt::CaseInsensitive))
@@ -176,7 +182,7 @@ VideoEffectType shaderVideoType(const QString &name)
     if (name == QStringLiteral("Glitch"))
         return VideoEffectType::GlitchVHS;
     if (name == QStringLiteral("Film Grain"))
-        return VideoEffectType::Noise;
+        return VideoEffectType::FilmGrain;
     if (name == QStringLiteral("Vignette"))
         return VideoEffectType::Vignette;
     if (name.contains(QStringLiteral("CRT"), Qt::CaseInsensitive))
@@ -200,6 +206,13 @@ VideoEffectType pluginVideoType(const QString &name)
 
 QString shaderNativeParam(const QString &effectName, const QString &shaderParam)
 {
+    if (effectName == QStringLiteral("レンズ歪み補正")) {
+        if (shaderParam == QStringLiteral("uK1")) return QStringLiteral("k1");
+        if (shaderParam == QStringLiteral("uK2")) return QStringLiteral("k2");
+        if (shaderParam == QStringLiteral("uScale")) return QStringLiteral("scale");
+        if (shaderParam == QStringLiteral("uCenterX")) return QStringLiteral("centerX");
+        if (shaderParam == QStringLiteral("uCenterY")) return QStringLiteral("centerY");
+    }
     if (effectName == QStringLiteral("Chromatic Aberration")
         && shaderParam == QStringLiteral("uAmount")) return QStringLiteral("offsetX");
     if (effectName == QStringLiteral("Color Halftone")
@@ -648,6 +661,15 @@ QVector<ParameterSpec> EffectLibraryModel::parametersForData(
             ParameterSpec spec;
             spec.name = param.name;
             spec.displayName = param.name;
+            if (data.sourceName == QStringLiteral("レンズ歪み補正")) {
+                const QString nativeName = shaderNativeParam(data.sourceName, param.name);
+                for (const auto &native : effectctrl::paramSchemaFor(VideoEffectType::LensDistortion)) {
+                    if (native.name == nativeName) {
+                        spec.displayName = native.displayLabel;
+                        break;
+                    }
+                }
+            }
             spec.minValue = param.minVal.isValid() ? param.minVal.toDouble() : 0.0;
             spec.maxValue = param.maxVal.isValid() ? param.maxVal.toDouble() : 1.0;
             spec.defaultValue = param.defaultVal.isValid()

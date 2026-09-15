@@ -81,6 +81,10 @@ private:
     QDoubleSpinBox *m_durationSpin;
     QComboBox *m_alignmentCombo;
     QComboBox *m_easingCombo;
+    QDoubleSpinBox *m_softnessSpin;
+    QDoubleSpinBox *m_borderWidthSpin;
+    QPushButton *m_borderColorBtn;
+    QColor m_borderColor = Qt::white;
     QComboBox *m_presetCombo;
 };
 

@@ -1236,6 +1236,14 @@ bool FrameEncoder::pushFrameNative(AVFrame* frame, int64_t pts)
     int receiveRc = 0;
     while ((receiveRc = avcodec_receive_packet(m_encCtx, encPkt)) == 0) {
         av_packet_rescale_ts(encPkt, m_encCtx->time_base, m_outStream->time_base);
+        // The mov muxer derives the track duration — and writes a matching
+        // edit list — from accumulated packet durations. With duration 0 the
+        // final sample falls outside the edit list, the demuxer flags it
+        // DISCARD, and every mp4 written here loses its last frame on decode.
+        if (encPkt->duration <= 0) {
+            encPkt->duration = av_rescale_q(
+                1, m_encCtx->time_base, m_outStream->time_base);
+        }
         encPkt->stream_index = m_outStream->index;
         const int wr = av_interleaved_write_frame(m_outFmt, encPkt);
         av_packet_unref(encPkt);
@@ -1456,6 +1464,12 @@ std::optional<std::string> FrameEncoder::finalize()
             }
 
             av_packet_rescale_ts(flushPkt, m_encCtx->time_base, m_outStream->time_base);
+            // Same duration backfill as pushFrameNative: without it the last
+            // (flushed) sample sits outside the mov edit list and is dropped.
+            if (flushPkt->duration <= 0) {
+                flushPkt->duration = av_rescale_q(
+                    1, m_encCtx->time_base, m_outStream->time_base);
+            }
             flushPkt->stream_index = m_outStream->index;
             const int writeRc = av_interleaved_write_frame(m_outFmt, flushPkt);
             av_packet_unref(flushPkt);

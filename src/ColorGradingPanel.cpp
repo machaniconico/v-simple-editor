@@ -1,3 +1,4 @@
+#include "HueSatWarpWidget.h"
 #include "ColorGradingPanel.h"
 #include "ColorWheelWidget.h"
 #include "CurveEditor.h"
@@ -552,6 +553,12 @@ ColorGradingPanel::ColorGradingPanel(QWidget *parent)
         addHslqRow(tr("G"), -100, 100, 0, QString(), m_hslqGainG, m_hslqGainGLabel);
         addHslqRow(tr("B"), -100, 100, 0, QString(), m_hslqGainB, m_hslqGainBLabel);
 
+        auto *keyframe = new QPushButton(tr("キーフレーム追加"), hslqGroup);
+        keyframe->setObjectName(QStringLiteral("hslGradeAddKeyframe"));
+        hslqLayout->addWidget(keyframe);
+        connect(keyframe, &QPushButton::clicked, this, [this] {
+            emit gradeKeyframeRequested(QStringLiteral("hsl"));
+        });
         mainLayout->addWidget(hslqGroup);
 
         // Wire every control to the single onHslQualifierChanged slot.
@@ -855,6 +862,13 @@ ColorGradingPanel::ColorGradingPanel(QWidget *parent)
     wheelsLayout->addWidget(m_liftWheel);
     wheelsLayout->addWidget(m_gammaWheel);
     wheelsLayout->addWidget(m_gainWheel);
+    auto *lggKeyframe = new QPushButton(tr("キーフレーム追加"), wheelsGroup);
+    lggKeyframe->setObjectName(QStringLiteral("lggGradeAddKeyframe"));
+    wheelsLayout->addWidget(lggKeyframe);
+    connect(lggKeyframe, &QPushButton::clicked, this, [this] {
+        m_wheelDebounce->stop();
+        emit gradeKeyframeRequested(QStringLiteral("lgg"));
+    });
     mainLayout->addWidget(wheelsGroup);
 
     connect(m_liftWheel, &ColorWheelWidget::colorChanged,
@@ -863,6 +877,59 @@ ColorGradingPanel::ColorGradingPanel(QWidget *parent)
             this, &ColorGradingPanel::onGammaWheelChanged);
     connect(m_gainWheel, &ColorWheelWidget::colorChanged,
             this, &ColorGradingPanel::onGainChanged);
+
+    auto *logWheelsGroup = new QGroupBox(
+        tr("Log ホイール (Shadow / Midtone / Highlight)"));
+    auto *logWheelsLayout = new QHBoxLayout(logWheelsGroup);
+    logWheelsLayout->setSpacing(4);
+
+    m_logShadowWheel = new ColorWheelWidget(tr("シャドウ"));
+    m_logMidWheel = new ColorWheelWidget(tr("ミッドトーン"));
+    m_logHighWheel = new ColorWheelWidget(tr("ハイライト"));
+    m_logShadowWheel->setObjectName(QStringLiteral("logShadowWheel"));
+    m_logMidWheel->setObjectName(QStringLiteral("logMidWheel"));
+    m_logHighWheel->setObjectName(QStringLiteral("logHighWheel"));
+
+    logWheelsLayout->addWidget(m_logShadowWheel);
+    logWheelsLayout->addWidget(m_logMidWheel);
+    logWheelsLayout->addWidget(m_logHighWheel);
+    auto *logKeyframe = new QPushButton(tr("キーフレーム追加"), logWheelsGroup);
+    logKeyframe->setObjectName(QStringLiteral("logGradeAddKeyframe"));
+    logWheelsLayout->addWidget(logKeyframe);
+    connect(logKeyframe, &QPushButton::clicked, this, [this] {
+        m_wheelDebounce->stop();
+        emit gradeKeyframeRequested(QStringLiteral("log"));
+    });
+    mainLayout->addWidget(logWheelsGroup);
+
+    connect(m_logShadowWheel, &ColorWheelWidget::colorChanged,
+            this, &ColorGradingPanel::onLogShadowChanged);
+    connect(m_logMidWheel, &ColorWheelWidget::colorChanged,
+            this, &ColorGradingPanel::onLogMidChanged);
+    connect(m_logHighWheel, &ColorWheelWidget::colorChanged,
+            this, &ColorGradingPanel::onLogHighChanged);
+
+    auto *warpGroup = new QGroupBox(tr("カラーワーパー (色相 × 彩度)"));
+    auto *warpLayout = new QVBoxLayout(warpGroup);
+    m_hueSatWarp = new HueSatWarpWidget(warpGroup);
+    m_hueSatWarp->setObjectName(QStringLiteral("hueSatWarpWidget"));
+    warpLayout->addWidget(m_hueSatWarp);
+    auto *warpKeyframe = new QPushButton(tr("キーフレーム追加"), warpGroup);
+    warpKeyframe->setObjectName(QStringLiteral("warpGradeAddKeyframe"));
+    warpLayout->addWidget(warpKeyframe);
+    connect(warpKeyframe, &QPushButton::clicked, this, [this] {
+        m_wheelDebounce->stop();
+        emit gradeKeyframeRequested(QStringLiteral("warp"));
+    });
+    mainLayout->addWidget(warpGroup);
+    connect(m_hueSatWarp, &HueSatWarpWidget::valueChanged, this, [this]() {
+        if (m_updating) return;
+        m_cc.hueSatWarp = m_hueSatWarp->value();
+        emit hueSatWarpChanged(m_cc, false);
+    });
+    connect(m_hueSatWarp, &HueSatWarpWidget::editingFinished, this, [this]() {
+        if (!m_updating) emit hueSatWarpChanged(m_cc, true);
+    });
 
     // --- Basic Corrections Section ---
     auto *basicGroup = new QGroupBox(tr("基本補正"));
@@ -1182,6 +1249,15 @@ ColorWheels ColorGradingPanel::wheelsFromColorCorrection(const ColorCorrection &
     cw.gain = QVector3D(static_cast<float>(cc.gainR),
                         static_cast<float>(cc.gainG),
                         static_cast<float>(cc.gainB));
+    cw.logShadow = QVector3D(static_cast<float>(cc.logShadowR),
+                             static_cast<float>(cc.logShadowG),
+                             static_cast<float>(cc.logShadowB));
+    cw.logMid = QVector3D(static_cast<float>(cc.logMidR),
+                          static_cast<float>(cc.logMidG),
+                          static_cast<float>(cc.logMidB));
+    cw.logHigh = QVector3D(static_cast<float>(cc.logHighR),
+                           static_cast<float>(cc.logHighG),
+                           static_cast<float>(cc.logHighB));
     cw.liftLuma = 0.0;
     cw.gammaLuma = 1.0;
     cw.gainLuma = 0.0;
@@ -1201,6 +1277,16 @@ void ColorGradingPanel::syncColorCorrectionFromWheels(const ColorWheels &cw)
     m_cc.gainR = static_cast<double>(cw.gain.x()) + cw.gainLuma;
     m_cc.gainG = static_cast<double>(cw.gain.y()) + cw.gainLuma;
     m_cc.gainB = static_cast<double>(cw.gain.z()) + cw.gainLuma;
+
+    m_cc.logShadowR = cw.logShadow.x();
+    m_cc.logShadowG = cw.logShadow.y();
+    m_cc.logShadowB = cw.logShadow.z();
+    m_cc.logMidR = cw.logMid.x();
+    m_cc.logMidG = cw.logMid.y();
+    m_cc.logMidB = cw.logMid.z();
+    m_cc.logHighR = cw.logHigh.x();
+    m_cc.logHighG = cw.logHigh.y();
+    m_cc.logHighB = cw.logHigh.z();
 }
 
 void ColorGradingPanel::updateBasicTemperatureTintFromCC()
@@ -1235,12 +1321,19 @@ void ColorGradingPanel::updateWhiteBalanceControlsFromCC()
 
 void ColorGradingPanel::updateGraphicalWheelsFromCC()
 {
+    if (m_hueSatWarp) m_hueSatWarp->setValue(m_cc.hueSatWarp);
     if (m_liftWheel)
         m_liftWheel->setColor(m_cc.liftR, m_cc.liftG, m_cc.liftB);
     if (m_gammaWheel)
         m_gammaWheel->setColor(m_cc.gammaR, m_cc.gammaG, m_cc.gammaB);
     if (m_gainWheel)
         m_gainWheel->setColor(m_cc.gainR, m_cc.gainG, m_cc.gainB);
+    if (m_logShadowWheel)
+        m_logShadowWheel->setColor(m_cc.logShadowR, m_cc.logShadowG, m_cc.logShadowB);
+    if (m_logMidWheel)
+        m_logMidWheel->setColor(m_cc.logMidR, m_cc.logMidG, m_cc.logMidB);
+    if (m_logHighWheel)
+        m_logHighWheel->setColor(m_cc.logHighR, m_cc.logHighG, m_cc.logHighB);
 }
 
 void ColorGradingPanel::setColorCorrection(const ColorCorrection &cc)
@@ -1345,6 +1438,36 @@ void ColorGradingPanel::onGainChanged(double r, double g, double b)
     m_cc.gainR = r;
     m_cc.gainG = g;
     m_cc.gainB = b;
+    setWheels(wheelsFromColorCorrection(m_cc));
+    m_wheelDebounce->start();
+}
+
+void ColorGradingPanel::onLogShadowChanged(double r, double g, double b)
+{
+    if (m_updating) return;
+    m_cc.logShadowR = r;
+    m_cc.logShadowG = g;
+    m_cc.logShadowB = b;
+    setWheels(wheelsFromColorCorrection(m_cc));
+    m_wheelDebounce->start();
+}
+
+void ColorGradingPanel::onLogMidChanged(double r, double g, double b)
+{
+    if (m_updating) return;
+    m_cc.logMidR = r;
+    m_cc.logMidG = g;
+    m_cc.logMidB = b;
+    setWheels(wheelsFromColorCorrection(m_cc));
+    m_wheelDebounce->start();
+}
+
+void ColorGradingPanel::onLogHighChanged(double r, double g, double b)
+{
+    if (m_updating) return;
+    m_cc.logHighR = r;
+    m_cc.logHighG = g;
+    m_cc.logHighB = b;
     setWheels(wheelsFromColorCorrection(m_cc));
     m_wheelDebounce->start();
 }
@@ -1561,6 +1684,10 @@ void ColorGradingPanel::onResetClicked()
     m_liftWheel->setColor(0, 0, 0);
     m_gammaWheel->setColor(0, 0, 0);
     m_gainWheel->setColor(0, 0, 0);
+    m_hueSatWarp->setValue(m_cc.hueSatWarp);
+    m_logShadowWheel->setColor(0, 0, 0);
+    m_logMidWheel->setColor(0, 0, 0);
+    m_logHighWheel->setColor(0, 0, 0);
     updateSlidersFromCC();
 
     // US-FEAT-C: reset wheel sliders to neutral

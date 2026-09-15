@@ -43,6 +43,9 @@ public:
     // pool の状態からビンツリーと素材一覧を再描画する。
     void refresh();
 
+    // 素材一覧で現在選択されている項目のパス。選択なしは空文字列。
+    QString selectedAssetPath() const;
+
 signals:
     // 素材をダブルクリックしたとき (MainWindow がタイムラインへ取り込む)。
     void assetActivated(const QString &filePath);

@@ -1,10 +1,45 @@
 #include "MultiCamSync.h"
 
+#include <QFileInfo>
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
 
 namespace multicam {
+
+AudioSyncReport estimateOffsetsForFiles(const QStringList &paths)
+{
+    AudioSyncReport report;
+    report.total = static_cast<int>(paths.size());
+    // Preserve the dialog's 20 ms envelope resolution.
+    constexpr int peaksPerSecond = 50;
+    QVector<QVector<float>> envelopes;
+    envelopes.reserve(paths.size());
+    for (const QString &sourcePath : paths) {
+        const QString path = sourcePath.trimmed();
+        QVector<float> peaks;
+        if (!path.isEmpty() && QFileInfo::exists(path))
+            peaks = WaveformGenerator::generate(path, peaksPerSecond).peaks;
+        const bool usable = std::all_of(peaks.cbegin(), peaks.cend(),
+                                       [](float p) { return std::isfinite(p); })
+            && std::any_of(peaks.cbegin(), peaks.cend(),
+                           [](float p) { return p > 0.0f; });
+        if (!usable) {
+            peaks.clear();
+            ++report.silent;
+        }
+        envelopes.append(peaks);
+    }
+    report.offsetsUs = MultiCamSync::computeAngleOffsetsUs(
+        envelopes, 1000.0 / peaksPerSecond);
+    const int usableCount = report.total - report.silent;
+    if (!envelopes.isEmpty() && !envelopes.first().isEmpty() && usableCount >= 2)
+        report.synced = usableCount;
+    report.message = QObject::tr("%1 本中 %2 本を同期しました (音声なし %3 本)")
+                         .arg(report.total).arg(report.synced).arg(report.silent);
+    return report;
+}
 
 MultiCamSync::MultiCamSync(QObject *parent)
     : QObject(parent)

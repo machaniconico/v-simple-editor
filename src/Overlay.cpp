@@ -1,5 +1,15 @@
 #include "Overlay.h"
 #include "BrushAnimation.h"
+#include "OpticalFlow.h"
+#include <QByteArray>
+#include <QByteArrayView>
+#include <QMutex>
+#include <QMutexLocker>
+#include <list>
+#include <atomic>
+#include <tuple>
+#include <cmath>
+#include <cstring>
 #include <QPainter>
 #include <QPainterPath>
 #include <QFontMetrics>
@@ -7,6 +17,116 @@
 #include <QVector>
 
 namespace {
+
+// Content keys survive QImage detach. Keep the source images too: qChecksum is
+// only 16 bits, so a checksum collision must be verified before reusing flow.
+using MorphImageKey = std::tuple<int, int, QImage::Format, quint16>;
+MorphImageKey morphKey(const QImage &image)
+{
+    return {image.width(), image.height(), image.format(),
+            qChecksum(QByteArrayView(reinterpret_cast<const char *>(image.constBits()),
+                                     image.sizeInBytes()))};
+}
+bool morphBytesEqual(const QImage &a, const QImage &b)
+{
+    return a.bytesPerLine() == b.bytesPerLine() && a.sizeInBytes() == b.sizeInBytes()
+        && std::memcmp(a.constBits(), b.constBits(), size_t(a.sizeInBytes())) == 0;
+}
+struct MorphCacheEntry {
+    MorphImageKey aKey, bKey;
+    QImage a, b;
+    opticalflow::FlowField flow;
+};
+QMutex morphCacheMutex;
+std::list<MorphCacheEntry> morphCache; // MRU first, at most four pairs.
+
+opticalflow::FlowField morphFlow(const QImage &a, const QImage &b, const QSize &size)
+{
+    const auto aKey = morphKey(a), bKey = morphKey(b);
+    QMutexLocker lock(&morphCacheMutex);
+    for (auto it = morphCache.begin(); it != morphCache.end(); ++it) {
+        if (it->aKey == aKey && it->bKey == bKey
+            && morphBytesEqual(it->a, a) && morphBytesEqual(it->b, b)) {
+            morphCache.splice(morphCache.begin(), morphCache, it);
+            return morphCache.front().flow;
+        }
+    }
+    QSize smallSize = size;
+    if (qMax(size.width(), size.height()) > 480)
+        smallSize.scale(480, 480, Qt::KeepAspectRatio);
+    smallSize.setWidth(qMax(1, smallSize.width()));
+    smallSize.setHeight(qMax(1, smallSize.height()));
+    const QImage smallA = a.scaled(smallSize, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+    const QImage smallB = b.scaled(smallSize, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+    opticalflow::FlowParams params;
+    params.levels = 3;
+    params.blockSize = 16;
+    params.searchRange = 16;
+    params.smooth = true;
+    const auto small = opticalflow::estimateFlow(smallA, smallB, params);
+    opticalflow::FlowField flow;
+    flow.width = size.width();
+    flow.height = size.height();
+    flow.v.resize(flow.width * flow.height);
+    const double scaleX = double(flow.width) / small.width;
+    const double scaleY = double(flow.height) / small.height;
+    for (int y = 0; y < flow.height; ++y) {
+        const double sy = qBound(0.0, (y + 0.5) / scaleY - 0.5, double(small.height - 1));
+        const int y0 = int(std::floor(sy));
+        const double fy = sy - y0;
+        for (int x = 0; x < flow.width; ++x) {
+            const double sx = qBound(0.0, (x + 0.5) / scaleX - 0.5, double(small.width - 1));
+            const int x0 = int(std::floor(sx));
+            const double fx = sx - x0;
+            const QPointF v = (small.at(x0, y0) * (1.0 - fx) + small.at(x0 + 1, y0) * fx) * (1.0 - fy)
+                            + (small.at(x0, y0 + 1) * (1.0 - fx) + small.at(x0 + 1, y0 + 1) * fx) * fy;
+            // estimateFlow returns source-to-destination displacement; warpImage
+            // pulls from x + flow, so convert to sampling displacement here.
+            flow.v[y * flow.width + x] = QPointF(-v.x() * scaleX, -v.y() * scaleY);
+        }
+    }
+    morphCache.push_front({aKey, bKey, a.copy(), b.copy(), flow});
+    if (morphCache.size() > 4) morphCache.pop_back();
+    return flow;
+}
+
+QImage renderMorphCut(const QImage &a, const QImage &b, double t)
+{
+    // Unconditional endpoints preserve format, padding and every input bit.
+    if (t <= 0.0) return a;
+    if (t >= 1.0) return b;
+    if (a.isNull() || b.isNull()) return t < 0.5 ? a : b;
+    const QSize size(qMax(a.width(), b.width()), qMax(a.height(), b.height()));
+    const auto flow = morphFlow(a, b, size);
+    opticalflow::FlowField negFlow;
+    negFlow.width = flow.width;
+    negFlow.height = flow.height;
+    negFlow.v.resize(flow.v.size());
+    for (qsizetype i = 0; i < flow.v.size(); ++i)
+        negFlow.v[i] = QPointF(-flow.v[i].x(), -flow.v[i].y());
+    // Negating forward flow is an approximation: warpImage samples on the
+    // output grid, rather than transporting/inverting the field geometrically.
+    const QImage fwd = opticalflow::warpImage(
+        a.scaled(size, Qt::IgnoreAspectRatio, Qt::SmoothTransformation), flow, t)
+        .convertToFormat(QImage::Format_ARGB32_Premultiplied);
+    const QImage bwd = opticalflow::warpImage(
+        b.scaled(size, Qt::IgnoreAspectRatio, Qt::SmoothTransformation), negFlow, 1.0 - t)
+        .convertToFormat(QImage::Format_ARGB32_Premultiplied);
+    QImage result(size, QImage::Format_ARGB32_Premultiplied);
+    for (int y = 0; y < size.height(); ++y) {
+        const auto *f = reinterpret_cast<const QRgb *>(fwd.constScanLine(y));
+        const auto *bRow = reinterpret_cast<const QRgb *>(bwd.constScanLine(y));
+        auto *out = reinterpret_cast<QRgb *>(result.scanLine(y));
+        for (int x = 0; x < size.width(); ++x) {
+            const auto blend = [t](int u, int v) { return qRound((1.0 - t) * u + t * v); };
+            out[x] = qRgba(blend(qRed(f[x]), qRed(bRow[x])),
+                           blend(qGreen(f[x]), qGreen(bRow[x])),
+                           blend(qBlue(f[x]), qBlue(bRow[x])),
+                           blend(qAlpha(f[x]), qAlpha(bRow[x])));
+        }
+    }
+    return result;
+}
 
 // Separable box blur on the alpha channel. Mirrors the helper used in
 // TextManager.cpp's enhanced path; kept local here so Overlay.cpp does
@@ -284,9 +404,125 @@ void OverlayRenderer::renderPip(QImage &frame, const QImage &pipSource, const Pi
     painter.drawImage(x, y, scaled);
 }
 
+void OverlayRenderer::clearMorphCutCacheForTest()
+{
+    QMutexLocker lock(&morphCacheMutex);
+    morphCache.clear();
+}
+
+namespace {
+std::atomic<bool> edgeParamsEnabled{true};
+std::atomic<int> edgeParamsCalls{0};
+}
+
+void OverlayRenderer::setEdgeParamsEnabledForTest(bool enabled)
+{
+    edgeParamsEnabled = enabled;
+    edgeParamsCalls = 0;
+}
+int OverlayRenderer::edgeParamsCallCountForTest() { return edgeParamsCalls.load(); }
+
+QImage OverlayRenderer::applyTransition(const QImage &from, const QImage &to,
+                                       const Transition &transition, double progress)
+{
+    if (!edgeParamsEnabled || transition.hasDefaultEdgeParams()
+        || !supportsEdgeParams(transition.type))
+        return applyTransition(from, to, transition.type, progress);
+    ++edgeParamsCalls;
+    const int w = qMax(from.width(), to.width());
+    const int h = qMax(from.height(), to.height());
+    if (w <= 0 || h <= 0) return QImage();
+    // Preserve the legacy top-left KeepAspectRatio placement and black canvas.
+    const auto canvas = [&](const QImage &source) {
+        QImage image(w, h, QImage::Format_RGB888);
+        image.fill(Qt::black);
+        QPainter painter(&image);
+        painter.drawImage(0, 0, source.scaled(w, h, Qt::KeepAspectRatio,
+                                            Qt::SmoothTransformation));
+        painter.end();
+        return image;
+    };
+    QImage result = canvas(from);
+    const QImage target = canvas(to);
+    const double p = qBound(0.0, progress, 1.0);
+    if (p <= 0.0) return result;
+    if (p >= 1.0) return target;
+    const double feather = qBound(0.0, transition.softness, 1.0) * qMin(w, h) * 0.1;
+    const double halfBorder = qBound(0.0, transition.borderWidth, 50.0) * 0.5;
+    const QColor border = transition.borderColor.isValid() ? transition.borderColor : QColor(Qt::white);
+    for (int y = 0; y < h; ++y) {
+        uchar *dst = result.scanLine(y);
+        const uchar *src = target.constScanLine(y);
+        for (int x = 0; x < w; ++x) {
+            // Positive distance is the revealed (to) side. Pixel centres keep
+            // symmetric feather and border coverage around the moving boundary.
+            const double px = x + 0.5, py = y + 0.5;
+            double d = 0.0;
+            switch (transition.type) {
+            case TransitionType::WipeLeft: d = w * p - px; break;
+            case TransitionType::WipeRight: d = px - w * (1.0 - p); break;
+            case TransitionType::WipeUp: d = h * p - py; break;
+            case TransitionType::WipeDown: d = py - h * (1.0 - p); break;
+            case TransitionType::BarnDoorHorizontal: d = w * p * 0.5 - std::abs(px - w * 0.5); break;
+            case TransitionType::BarnDoorVertical: d = h * p * 0.5 - std::abs(py - h * 0.5); break;
+            case TransitionType::BarnDoorHClose: d = std::abs(px - w * 0.5) - w * (1.0 - p) * 0.5; break;
+            case TransitionType::BarnDoorVClose: d = std::abs(py - h * 0.5) - h * (1.0 - p) * 0.5; break;
+            case TransitionType::IrisRound:
+            case TransitionType::IrisRoundClose: {
+                const bool close = transition.type == TransitionType::IrisRoundClose;
+                const double cx = w / 2, cy = h / 2;
+                const double radius = (std::hypot(cx, cy) + 2.0) * (close ? 1.0 - p : p);
+                d = radius - std::hypot(px - cx, py - cy);
+                if (close) d = -d;
+                break;
+            }
+            case TransitionType::IrisBox:
+            case TransitionType::IrisBoxClose: {
+                const bool close = transition.type == TransitionType::IrisBoxClose;
+                const double extent = close ? 1.0 - p : p;
+                // Rectangular Chebyshev distance, in pixels: independent half
+                // extents preserve the canvas aspect ratio and uniform feather.
+                d = -qMax(std::abs(px - w * 0.5) - w * extent * 0.5,
+                          std::abs(py - h * 0.5) - h * extent * 0.5);
+                if (close) d = -d;
+                break;
+            }
+            case TransitionType::ClockWipe:
+            case TransitionType::ClockWipeCCW: {
+                const double dx = px - w / 2, dy = py - h / 2;
+                const double tau = 2.0 * std::acos(-1.0);
+                // Angle from 12 o'clock in the sweep direction, wrapped into
+                // [0, 2pi). Reverse the angle for CCW before normalizing.
+                double angle = std::atan2(dx, -dy);
+                if (transition.type == TransitionType::ClockWipeCCW) angle = -angle;
+                if (angle < 0.0) angle += tau;
+                d = (tau * p - angle) * std::hypot(dx, dy);
+                break;
+            }
+            default: break;
+            }
+            const double u = feather > 0.0 ? qBound(0.0, (d + feather) / (2.0 * feather), 1.0)
+                                            : (d >= 0.0 ? 1.0 : 0.0);
+            const double mask = u * u * (3.0 - 2.0 * u);
+            for (int c = 0; c < 3; ++c)
+                dst[x * 3 + c] = static_cast<uchar>(qRound(dst[x * 3 + c] * (1.0 - mask) + src[x * 3 + c] * mask));
+            if (std::abs(d) < halfBorder) {
+                dst[x * 3] = border.red();
+                dst[x * 3 + 1] = border.green();
+                dst[x * 3 + 2] = border.blue();
+            }
+        }
+    }
+    return result;
+}
+
 QImage OverlayRenderer::applyTransition(const QImage &from, const QImage &to,
     TransitionType type, double progress)
 {
+    switch (type) {
+    case TransitionType::MorphCut: return renderMorphCut(from, to, progress);
+    default: break;
+    }
     if (type == TransitionType::None) return (progress < 0.5) ? from : to;
 
     // NOTE: easing must be applied by the caller (compose path) so the

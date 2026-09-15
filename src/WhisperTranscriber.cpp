@@ -3,11 +3,15 @@
 #include "libavcore/AudioExtract.h"
 
 #include <QFile>
+#include <QFileInfo>
+#include <QDir>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonParseError>
 #include <QProcess>
+#include <QProcessEnvironment>
+#include <QSettings>
 #include <QStandardPaths>
 #include <QElapsedTimer>
 #include <QStringList>
@@ -15,6 +19,120 @@
 #include <QtGlobal>
 #include <cmath>
 #include <limits>
+
+namespace whisperpath {
+
+namespace {
+
+QString usableExecutable(const QString& value)
+{
+    const QString trimmed = value.trimmed();
+    if (trimmed.isEmpty())
+        return QString();
+
+    const QString found = QStandardPaths::findExecutable(trimmed);
+    if (!found.isEmpty())
+        return found;
+
+    const QFileInfo info(trimmed);
+    if (!info.exists() || !info.isFile())
+        return QString();
+#ifdef Q_OS_WIN
+    return info.absoluteFilePath();
+#else
+    return info.isExecutable() ? info.absoluteFilePath() : QString();
+#endif
+}
+
+Resolution resolveWhisperCliValues(const QString& configuredPath,
+                                   const QString& environmentPath,
+                                   const QString& pathExecutable,
+                                   const QStringList& knownLocations,
+                                   const QStringList& existingKnownLocations)
+{
+    Resolution result;
+    result.candidatePaths = knownLocations;
+
+    if (!configuredPath.trimmed().isEmpty()) {
+        result.executablePath = configuredPath.trimmed();
+        return result;
+    }
+    if (!environmentPath.trimmed().isEmpty()) {
+        result.executablePath = environmentPath.trimmed();
+        return result;
+    }
+    if (!pathExecutable.trimmed().isEmpty()) {
+        result.executablePath = pathExecutable.trimmed();
+        return result;
+    }
+
+    for (const QString& candidate : knownLocations) {
+        if (existingKnownLocations.contains(candidate)) {
+            result.executablePath = candidate;
+            break;
+        }
+    }
+    return result;
+}
+
+} // namespace
+
+QStringList whisperCliCandidatePaths()
+{
+    QStringList candidates;
+    const QString localAppData = qEnvironmentVariable("LOCALAPPDATA").trimmed();
+    if (!localAppData.isEmpty()) {
+        candidates.append(QDir(localAppData).filePath(
+            QStringLiteral("whisper-cli/whisper-cli.exe")));
+    }
+
+    candidates.append(QDir(QDir::homePath()).filePath(
+        QStringLiteral(".local/bin/whisper-cli")));
+    candidates.append(QStringLiteral("/opt/homebrew/bin/whisper-cli"));
+    candidates.append(QStringLiteral("/usr/local/bin/whisper-cli"));
+    return candidates;
+}
+
+Resolution resolveWhisperCli(QSettings& settings,
+                             const QString& environmentPath,
+                             const QString& pathExecutable,
+                             const QStringList& knownLocations,
+                             const QStringList& existingKnownLocations)
+{
+    const QString configuredPath =
+        settings.value(QStringLiteral("whisper/cli_path")).toString().trimmed();
+    return resolveWhisperCliValues(configuredPath,
+                                   environmentPath,
+                                   pathExecutable,
+                                   knownLocations,
+                                   existingKnownLocations);
+}
+
+Resolution resolveWhisperCli()
+{
+    QSettings settings;
+    const QString configuredPath = usableExecutable(
+        settings.value(QStringLiteral("whisper/cli_path")).toString());
+    const QString environmentPath = usableExecutable(
+        QProcessEnvironment::systemEnvironment().value(
+            QStringLiteral("VEDITOR_WHISPER_CLI")));
+    const QString pathExecutable =
+        QStandardPaths::findExecutable(QStringLiteral("whisper-cli"));
+    const QStringList candidates = whisperCliCandidatePaths();
+    QStringList existingCandidates;
+    for (const QString& candidate : candidates) {
+        if (!usableExecutable(candidate).isEmpty())
+            existingCandidates.append(candidate);
+    }
+
+    return resolveWhisperCliValues(configuredPath,
+                                   environmentPath,
+                                   pathExecutable,
+                                   candidates,
+                                   existingCandidates);
+}
+
+} // namespace whisperpath
 
 namespace whisper {
 
@@ -424,10 +542,10 @@ bool recognizeWhisperCppFullJson(const QString& audioPath,
                                  speech::RecognizeResult* result,
                                  QString* error)
 {
-    const QString cliPath = QStandardPaths::findExecutable(QStringLiteral("whisper-cli"));
+    const QString cliPath = whisperpath::resolveWhisperCli().executablePath;
     if (cliPath.isEmpty()) {
         if (error)
-            *error = QStringLiteral("whisper-cli binary not found in PATH");
+            *error = QStringLiteral("whisper-cli binary not found");
         return false;
     }
 

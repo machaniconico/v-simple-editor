@@ -5,6 +5,7 @@
 #include "UndoTrace.h"
 #include "AdjustmentLayer.h"
 #include "Camera3D.h"
+#include "TimelineFrameRenderer.h"
 #include "clipanim/ClipAnim.h"
 #include "SurfaceTool.h"
 #include <algorithm>
@@ -147,7 +148,7 @@ PreviewClipMotion makePreviewMotion(const ClipInfo &clip, int trackIdx, int clip
     motion.rotation2D = clip.rotation2DDegrees;
     motion.opacity = clip.opacity;
     motion.is3DLayer = clip.is3DLayer;
-    motion.layer3D = clip.is3DLayer ? clip.layer3D : Layer3DTransform{};
+    motion.layer3D = clip.layer3D;
     if (clip.keyframes.hasAnyKeyframes()) {
         const clipgeom::ClipTransform transform =
             clipanim::effectiveTransformAt(clip, clipLocalSeconds);
@@ -262,6 +263,7 @@ out vec4 FragColor;
 
 uniform sampler2D uTexture;
 uniform bool uEffectsEnabled;
+uniform bool uProjectCameraBaked;
 uniform float uClipOpacity;
 
 // Color correction uniforms
@@ -282,6 +284,13 @@ uniform vec4 uLift;      // additive offset
 uniform vec4 uLggGamma;  // power-curve exponent denominator (renamed from uGamma to avoid collision with scalar uGamma at line ~117)
 uniform vec4 uGain;      // multiplicative scaling
 
+// Log range wheels. Identity is three zero vectors.
+uniform vec3 uLogShadow;
+uniform vec3 uLogMid;
+uniform vec3 uLogHigh;
+uniform vec2 uHueSatWarp[36];
+uniform bool uHueSatWarpEnabled;
+
 // 3D LUT uniforms
 uniform sampler3D uLut3D;
 uniform float uLutIntensity;  // 0.0 to 1.0
@@ -292,7 +301,7 @@ uniform sampler2D uCurveLut;
 uniform bool uCurvesEnabled;
 
 // US-CG-2: White-balance gain triple, applied at the very top of the grade
-// chain (BEFORE LGG, curves, and the .cube LUT). Identity = vec3(1.0).
+// chain (BEFORE LGG, Log wheels, curves, and the .cube LUT). Identity = vec3(1.0).
 uniform vec3 uWb;
 
 // US-CG-3: Radial vignette / Power Window. Applied AFTER curves and BEFORE
@@ -303,7 +312,7 @@ uniform float uVigRound;      // -1..+1 (0=circular, ±1=squareness)
 uniform float uVigFeather;    //  0..1  (edge softness, 0.3 default)
 
 // US-EF-1: Chroma Key (Premiere Ultra Key / Resolve 3D Keyer simplified).
-// Applied at the VERY TOP of the compose path — BEFORE WB/LGG/curves/
+// Applied at the VERY TOP of the compose path — BEFORE WB/LGG/Log/curves/
 // vignette/LUT — so HSL gating + spill suppression operate on raw frame
 // colour. uChromaEnabled=false is a free no-op.
 uniform bool  uChromaEnabled;
@@ -570,6 +579,57 @@ vec3 applyLiftGammaGain(vec3 color) {
     return c3;
 }
 
+// Log range wheels — must match VideoEffectProcessor::applyColorCorrection().
+// Order: after Lift/Gamma/Gain, before saturation and temperature/tint.
+vec3 applyLogWheels(vec3 color) {
+    vec3 normalized = clamp(color, 0.0, 1.0);
+    float Y = dot(normalized, vec3(0.2126, 0.7152, 0.0722));
+    float wS = 1.0 - smoothstep(0.15, 0.45, Y);
+    float wH = smoothstep(0.55, 0.85, Y);
+    float wM = clamp(1.0 - wS - wH, 0.0, 1.0);
+    return clamp(normalized + 0.5 * (wS * uLogShadow + wM * uLogMid + wH * uLogHigh),
+                 0.0, 1.0);
+}
+
+
+)"
+R"(
+// Float HSV and bilinear interpolation match colorwarper::apply in VideoEffect.cpp.
+vec3 applyHueSatWarp(vec3 color) {
+    float r=color.r, g=color.g, b=color.b;
+    float mx=max(r,max(g,b)), mn=min(r,min(g,b)), dl=mx-mn;
+    float v=mx, s=mx>0.0 ? dl/mx : 0.0;
+    float h=dl<=1e-6 ? 0.0 : (mx==r ? 60.0*((g-b)/dl)
+        : mx==g ? 60.0*((b-r)/dl)+120.0 : 60.0*((r-g)/dl)+240.0);
+    if (h<0.0) h+=360.0;
+    // Achromatic pixels have undefined hue, but s'=0: leave them unchanged.
+    if (s==0.0) return color;
+    float hi=h/30.0;
+    int h0=int(floor(hi))%12, h1=(h0+1)%12;
+    float fh=hi-floor(hi);
+    float ri=clamp(s,0.0,1.0)*2.0;
+    int r0=clamp(int(floor(ri)),0,1), r1=r0+1;
+    float fr=ri-float(r0);
+    vec2 a=uHueSatWarp[r0*12+h0]*(1.0-fh)+uHueSatWarp[r0*12+h1]*fh;
+    vec2 bnodes=uHueSatWarp[r1*12+h0]*(1.0-fh)+uHueSatWarp[r1*12+h1]*fh;
+    vec2 warp=a*(1.0-fr)+bnodes*fr;
+    if (warp.x==0.0 && warp.y==1.0) return color;
+    h=mod(h+warp.x+360.0,360.0);
+    float sat=clamp(s*warp.y,0.0,1.0);
+    float c=v*sat;
+    float x=c*(1.0-abs(mod(h/60.0,2.0)-1.0));
+    float m=v-c;
+    int sector=int(floor(h/60.0));
+    vec3 result;
+    if (sector==0) result=vec3(c,x,0.0);
+    else if (sector==1) result=vec3(x,c,0.0);
+    else if (sector==2) result=vec3(0.0,c,x);
+    else if (sector==3) result=vec3(0.0,x,c);
+    else if (sector==4) result=vec3(x,0.0,c);
+    else result=vec3(c,0.0,x);
+    return result+vec3(m);
+}
+
 float luminance(vec3 color) {
     return dot(color, vec3(0.2126, 0.7152, 0.0722));
 }
@@ -710,6 +770,11 @@ vec3 blurBright9(vec2 uv, float radiusPx, float threshold) {
 }
 
 void main() {
+    // Project-camera CPU composite already contains all clip processing.
+    if (uProjectCameraBaked) {
+        FragColor = texture(uTexture, vTexCoord);
+        return;
+    }
     // US-EF-4: Lens Distortion — applied at the very TOP of main() as a
     // texture-coordinate transform BEFORE the texture sample. amount<0 →
     // barrel (frame edges bow outward), amount>0 → pincushion. Identity at
@@ -824,7 +889,7 @@ void main() {
         }
 
         // US-CG-2: White-balance multiply at the VERY TOP of the grade chain
-        // (BEFORE LGG, curves, .cube LUT, and the legacy CPU-style stages).
+        // (BEFORE LGG, Log wheels, curves, .cube LUT, and the legacy CPU-style stages).
         // Identity uWb=vec3(1.0) is a free no-op.
         if (uWb != vec3(1.0))
             color *= uWb;
@@ -837,11 +902,14 @@ R"(
             color = adjustBrightnessContrast(color, uBrightness, uContrast);
         if (uHighlights != 0.0 || uShadows != 0.0)
             color = adjustHighlightsShadows(color, uHighlights, uShadows);
-        if (uSaturation != 0.0)
+        bool logEnabled = uLogShadow != vec3(0.0)
+                       || uLogMid != vec3(0.0)
+                       || uLogHigh != vec3(0.0);
+        if (!logEnabled && !uHueSatWarpEnabled && uSaturation != 0.0)
             color = adjustSaturation(color, uSaturation);
         if (uHue != 0.0)
             color = adjustHue(color, uHue);
-        if (uTemperature != 0.0 || uTint != 0.0)
+        if (!logEnabled && !uHueSatWarpEnabled && (uTemperature != 0.0 || uTint != 0.0))
             color = adjustTemperatureTint(color, uTemperature, uTint);
         if (uGamma != 1.0)
             color = adjustGamma(color, uGamma);
@@ -850,6 +918,17 @@ R"(
         // Identity: vec4(0,0,0,0) / vec4(1,1,1,1) / vec4(1,1,1,1) = no-op
         if (uLift != vec4(0.0) || uLggGamma != vec4(1.0, 1.0, 1.0, 1.0) || uGain != vec4(1.0, 1.0, 1.0, 1.0))
             color = applyLiftGammaGain(color);
+
+        if (logEnabled)
+            color = applyLogWheels(color);
+        if (uHueSatWarpEnabled)
+            color = applyHueSatWarp(color);
+        if (logEnabled || uHueSatWarpEnabled) {
+            if (uSaturation != 0.0)
+                color = adjustSaturation(color, uSaturation);
+            if (uTemperature != 0.0 || uTint != 0.0)
+                color = adjustTemperatureTint(color, uTemperature, uTint);
+        }
 
         // US-CG-1: RGB Curves stage. The 256x4 LUT has rows
         //   0=R, 1=G, 2=B, 3=Luma (sample at v = 0.125, 0.375, 0.625, 0.875).
@@ -1357,6 +1436,7 @@ void GLPreview::displayD3D11Frame(void *d3d11Texture, int subresource, int width
 #if defined(Q_OS_WIN)
     if (!m_interopAvailable || !d3d11Texture || width <= 0 || height <= 0)
         return;
+    m_projectCameraFrame = QImage();
     m_pendingD3D11Texture = d3d11Texture;
     m_pendingD3D11Subresource = subresource;
     m_pendingD3D11Width = width;
@@ -1487,6 +1567,9 @@ void GLPreview::createShaderProgram()
     m_locLift     = m_program->uniformLocation("uLift");
     m_locLggGamma = m_program->uniformLocation("uLggGamma");
     m_locGain     = m_program->uniformLocation("uGain");
+    m_locLogShadow = m_program->uniformLocation("uLogShadow");
+    m_locLogMid    = m_program->uniformLocation("uLogMid");
+    m_locLogHigh   = m_program->uniformLocation("uLogHigh");
 
     // LUT
     m_locLut3D         = m_program->uniformLocation("uLut3D");
@@ -1587,6 +1670,26 @@ void GLPreview::resizeGL(int w, int h)
     glViewport(0, 0, w, h);
 }
 
+void GLPreview::setTimeline(Timeline *timeline)
+{
+    if (m_timeline == timeline)
+        return;
+    m_timeline = timeline;
+    m_projectCameraFrame = QImage();
+    if (m_projectCamera.camera().trueProjection) {
+        m_needsUpload = true;
+        update();
+    }
+}
+
+void GLPreview::setProjectCamera(const Camera3D &camera)
+{
+    m_projectCamera = camera;
+    m_projectCameraFrame = QImage();
+    m_needsUpload = true;
+    update();
+}
+
 void GLPreview::displayFrame(const QImage &frame)
 {
     undotrace::log("gl:displayFrame:enter");
@@ -1599,6 +1702,7 @@ void GLPreview::displayFrame(const QImage &frame)
     // builder can convert SOURCE-pixel offsets to UV-fraction. Identity
     // path (m_stabKeyframes empty) leaves the matrix at identity so this
     // is a free no-op when stabilization is not in use.
+    m_projectCameraFrame = QImage();
     m_stabFrameW = frame.width();
     m_stabFrameH = frame.height();
     const QImage::Format inFmt = frame.format();
@@ -1663,6 +1767,11 @@ void GLPreview::setDisplayAspectRatio(double aspectRatio)
 void GLPreview::setColorCorrection(const ColorCorrection &cc)
 {
     m_cc = cc;
+    m_logWheels = {{
+        {cc.logShadowR, cc.logShadowG, cc.logShadowB},
+        {cc.logMidR, cc.logMidG, cc.logMidB},
+        {cc.logHighR, cc.logHighG, cc.logHighB}
+    }};
     ++m_colorCorrectionSetCountForTest;
     update();
 }
@@ -1848,6 +1957,12 @@ void GLPreview::paintGL()
                 << "upload=" << m_needsUpload;
     }
 
+    const auto *cameraPlayer = qobject_cast<VideoPlayer *>(parentWidget());
+    const double cameraSec = cameraPlayer ? cameraPlayer->timelinePositionUs() / 1000000.0 : 0.0;
+    const Camera3DState projectCamera = m_timeline ? m_timeline->projectCameraAt(cameraSec)
+        : (m_projectCamera.hasAnimation() ? m_projectCamera.getCameraAt(cameraSec)
+                                         : m_projectCamera.camera());
+
     glClear(GL_COLOR_BUFFER_BIT);
 
 #if defined(Q_OS_WIN)
@@ -1856,14 +1971,39 @@ void GLPreview::paintGL()
     if (m_interopAvailable && m_pendingD3D11Device && !m_interopDevice)
         ensureInteropDeviceForPaint();
 
-    if (m_pendingD3D11Texture && m_interopAvailable) {
+    if (m_pendingD3D11Texture && m_interopAvailable
+        && !projectCamera.trueProjection) {
         renderPendingD3D11Frame();
+        if (m_timecodeBurnInRenderer.settings().enabled)
+            paintTimecodeBurnInOverlay();
         undotrace::log("gl:paintGL:exit");
         return;
     }
 #endif
 
-    if (m_currentFrame.isNull()) {
+    // Opt-in preview uses the export layer stack, including multi-track/baked
+    // frames. This also avoids projecting a flattened composite or applying
+    // shader grade/geometry twice. A seek or output-size change can repaint
+    // before another decoded frame arrives, so both belong to the cache key.
+    if (projectCamera.trueProjection && m_timeline) {
+        if (auto *player = qobject_cast<VideoPlayer *>(parentWidget())) {
+            QSize canvas = player->projectOutputSize();
+            if (canvas.isEmpty())
+                canvas = m_currentFrame.size();
+            const qint64 timeUs = player->timelinePositionUs();
+            if (m_projectCameraFrame.isNull() || m_projectCameraFrameTimeUs != timeUs
+                || m_projectCameraFrame.size() != canvas) {
+                m_projectCameraFrame = tlrender::renderFrameAt(m_timeline, timeUs, canvas);
+                m_projectCameraFrameTimeUs = timeUs;
+                m_needsUpload = true;
+            }
+        }
+    }
+    const bool cameraBaked = projectCamera.trueProjection && m_timeline
+        && !m_projectCameraFrame.isNull();
+    const bool compositeBaked = m_compositeBakedMode || cameraBaked;
+
+    if (m_currentFrame.isNull() && !cameraBaked) {
         undotrace::log("gl:paintGL:exit");
         return;
     }
@@ -1876,11 +2016,12 @@ void GLPreview::paintGL()
     const int physW = qMax(1, qRound(width() * dpr));
     const int physH = qMax(1, qRound(height() * dpr));
 
+    const QImage &aspectFrame = cameraBaked ? m_projectCameraFrame : m_currentFrame;
     const double frameAspect =
         (m_displayAspectRatio > 0.0 && std::isfinite(m_displayAspectRatio))
             ? m_displayAspectRatio
-            : ((m_currentFrame.height() > 0)
-                   ? static_cast<double>(m_currentFrame.width()) / m_currentFrame.height()
+            : ((aspectFrame.height() > 0)
+                   ? static_cast<double>(aspectFrame.width()) / aspectFrame.height()
                    : 1.0);
     const double widgetAspect =
         (physH > 0) ? static_cast<double>(physW) / physH : frameAspect;
@@ -1906,7 +2047,7 @@ void GLPreview::paintGL()
         if (auto *player = qobject_cast<VideoPlayer *>(parentWidget()))
             timelineSec = static_cast<double>(player->timelinePositionUs()) / AV_TIME_BASE;
         previewMotion = resolvePreviewClipMotion(m_timeline, timelineSec,
-                                                 m_compositeBakedMode,
+                                                 compositeBaked,
                                                  m_videoSourceScale,
                                                  m_videoSourceDx,
                                                  m_videoSourceDy);
@@ -1916,13 +2057,13 @@ void GLPreview::paintGL()
     double renderDx = m_videoSourceDx;
     double renderDy = m_videoSourceDy;
     double clipOpacity = 1.0;
-    QImage uploadFrame = m_currentFrame;
-    if (m_brushAnimation) {
+    QImage uploadFrame = cameraBaked ? m_projectCameraFrame : m_currentFrame;
+    if (m_brushAnimation && !cameraBaked) {
         OverlayRenderer::renderBrushOverlay(uploadFrame,
                                             m_brushAnimation,
                                             m_brushAnimationProgress);
     }
-    if (previewMotion.valid) {
+    if (previewMotion.valid && !cameraBaked) {
         renderScale = previewMotion.scale;
         renderDx = previewMotion.dx;
         renderDy = previewMotion.dy;
@@ -1932,15 +2073,23 @@ void GLPreview::paintGL()
             m_videoSourceDx = renderDx;
             m_videoSourceDy = renderDy;
         }
-        if (!m_compositeBakedMode
-            && (std::abs(previewMotion.rotation2D) > 1e-4 || previewMotion.is3DLayer)) {
-            uploadFrame = applyPlanarRotation(uploadFrame, previewMotion.rotation2D);
-            if (previewMotion.is3DLayer) {
-                Camera3DState cameraState;
-                uploadFrame = Camera3D::applyPerspective(uploadFrame,
-                                                         previewMotion.layer3D,
-                                                         cameraState,
-                                                         uploadFrame.size());
+        if (!compositeBaked
+            && (std::abs(previewMotion.rotation2D) > 1e-4 || previewMotion.is3DLayer
+                || (projectCamera.trueProjection && !previewMotion.layer3D.isDefault()))) {
+            if (projectCamera.trueProjection) {
+                uploadFrame = applyProjectCameraProjection(
+                    uploadFrame, previewMotion.layer3D, previewMotion.is3DLayer,
+                    projectCamera, uploadFrame.size());
+                uploadFrame = applyPlanarRotation(uploadFrame, previewMotion.rotation2D);
+            } else {
+                uploadFrame = applyPlanarRotation(uploadFrame, previewMotion.rotation2D);
+                if (previewMotion.is3DLayer) {
+                    Camera3DState cameraState;
+                    uploadFrame = Camera3D::applyPerspective(uploadFrame,
+                                                             previewMotion.layer3D,
+                                                             cameraState,
+                                                             uploadFrame.size());
+                }
             }
         }
     }
@@ -1953,7 +2102,7 @@ void GLPreview::paintGL()
     // this guard, the per-tick composite pass would either clobber the
     // user's drag state (if it called setVideoSourceTransform(1, 0, 0))
     // or apply the transform twice on top of the baked canvas.
-    if (!m_compositeBakedMode
+    if (!compositeBaked
         && (renderScale != 1.0 || renderDx != 0.0 || renderDy != 0.0)) {
         const int baseW = viewportW;
         const int baseH = viewportH;
@@ -2065,6 +2214,7 @@ void GLPreview::paintGL()
 
     // Set uniforms
     m_program->setUniformValue(m_locTexture, 0);
+    m_program->setUniformValue("uProjectCameraBaked", cameraBaked);
     m_program->setUniformValue(m_locEffectsEnabled, m_effectsEnabled);
     if (m_locClipOpacity != -1)
         m_program->setUniformValue(m_locClipOpacity, static_cast<float>(clipOpacity));
@@ -2320,6 +2470,27 @@ void GLPreview::paintGL()
                   static_cast<float>(effLgg[2][1]),
                   static_cast<float>(effLgg[2][2]),
                   static_cast<float>(effLgg[2][3])));
+    m_program->setUniformValue("uHueSatWarpEnabled", !m_cc.hueSatWarp.isDefault());
+    if (!m_cc.hueSatWarp.isDefault()) {
+        QVector2D nodes[36];
+        for (int r = 0; r < 3; ++r)
+            for (int h = 0; h < 12; ++h)
+                nodes[r*12+h] = QVector2D(m_cc.hueSatWarp.hueShiftDeg[r][h],
+                                           m_cc.hueSatWarp.satScale[r][h]);
+        m_program->setUniformValueArray("uHueSatWarp", nodes, 36);
+    }
+    m_program->setUniformValue(m_locLogShadow,
+        QVector3D(static_cast<float>(m_logWheels[0][0]),
+                  static_cast<float>(m_logWheels[0][1]),
+                  static_cast<float>(m_logWheels[0][2])));
+    m_program->setUniformValue(m_locLogMid,
+        QVector3D(static_cast<float>(m_logWheels[1][0]),
+                  static_cast<float>(m_logWheels[1][1]),
+                  static_cast<float>(m_logWheels[1][2])));
+    m_program->setUniformValue(m_locLogHigh,
+        QVector3D(static_cast<float>(m_logWheels[2][0]),
+                  static_cast<float>(m_logWheels[2][1]),
+                  static_cast<float>(m_logWheels[2][2])));
 
     // LUT
     m_program->setUniformValue(m_locLutEnabled, m_lutEnabled);
@@ -2424,6 +2595,9 @@ void GLPreview::paintGL()
     m_texture->release();
     m_program->release();
     glViewport(0, 0, physW, physH);
+
+    if (m_timecodeBurnInRenderer.settings().enabled)
+        paintTimecodeBurnInOverlay();
 
     // Adobe-style text tool overlay: draw the dashed marquee plus 8 resize
     // handles while the tool is active and a rect is present (either being
@@ -2555,6 +2729,32 @@ void GLPreview::paintGL()
         m_surfaceTool->paintOverlay(spainter, letterboxRect());
     }
     undotrace::log("gl:paintGL:exit");
+}
+
+void GLPreview::setTimecodeBurnIn(
+    const TimecodeBurnInSettings &settings,
+    double frameRate)
+{
+    m_timecodeBurnInRenderer.setSettings(settings);
+    m_timecodeBurnInFrameRate = std::isfinite(frameRate) && frameRate > 0.0
+        ? frameRate : 30.0;
+    update();
+}
+
+void GLPreview::paintTimecodeBurnInOverlay()
+{
+    if (!m_timecodeBurnInRenderer.settings().enabled)
+        return;
+
+    double timelineSec = m_timeline ? m_timeline->playheadPosition() : 0.0;
+    if (auto *player = qobject_cast<VideoPlayer *>(parentWidget()))
+        timelineSec = static_cast<double>(player->timelinePositionUs())
+            / AV_TIME_BASE;
+
+    QPainter painter(this);
+    m_timecodeBurnInRenderer.paintOnto(
+        painter, letterboxRect(), timelineSec, m_timecodeBurnInFrameRate,
+        timecodeBurnInClipNameAt(m_timeline, timelineSec));
 }
 
 QRectF GLPreview::letterboxRect() const
@@ -3769,6 +3969,12 @@ void GLPreview::setLiftGammaGain(const std::array<std::array<double,4>,3> &value
         m_liftGammaGain[1][ch] = values[1][ch];
         m_liftGammaGain[2][ch] = std::pow(2.0, values[2][ch] * 2.0);
     }
+    update();
+}
+
+void GLPreview::setLogWheels(const std::array<std::array<double,3>,3> &values)
+{
+    m_logWheels = values;
     update();
 }
 

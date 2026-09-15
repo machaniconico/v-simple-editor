@@ -3,12 +3,15 @@
 #include <QObject>
 #include <QThread>
 #include <atomic>
+#include <optional>
 #include "ExportDialog.h"
 #include "PremiereXmlExporter.h"
+#include "TimecodeBurnIn.h"
 #include "Timeline.h"
 
 class SmartReframe;
 class SubtitleTrackRenderer;
+class QImage;
 
 // ===========================================================================
 // LEGACY — bypasses the SSOT edit graph; do not use for new code.
@@ -35,6 +38,33 @@ extern "C" {
 #include <libswresample/swresample.h>
 }
 
+namespace exporterframe {
+
+enum class RgbConversionPath {
+    LegacyFixedYuv420P,
+    EncoderPixelFormat
+};
+
+// TC disabled must retain the pre-burn-in fixed-YUV420P conversion byte path.
+// Keeping this decision pure makes the no-op compatibility rule testable.
+RgbConversionPath selectRgbConversionPath(bool timecodeBurnInEnabled) noexcept;
+
+// TC-enabled RGB24 -> encoder-frame conversion. The caller owns an allocated
+// outputFrame; its format, dimensions, and colour metadata are preserved and
+// define the swscale target.
+bool convertRgbImageToFrame(const QImage &image, AVFrame *outputFrame,
+                            bool configureColorMatrix);
+
+} // namespace exporterframe
+
+namespace exportertimecode {
+
+// Absolute timeline time for a frame in the legacy sequential exporter.
+double timelineSeconds(double processedDuration, double leadInSec,
+                       double sourceOffsetSec, double speed) noexcept;
+
+} // namespace exportertimecode
+
 class Exporter : public QObject
 {
     Q_OBJECT
@@ -47,6 +77,7 @@ public:
 
     void setSmartReframe(SmartReframe *reframe);
     void setSubtitleRenderer(SubtitleTrackRenderer *renderer);
+    void setTimecodeBurnIn(const TimecodeBurnInSettings &settings);
     void setLoudnessGainDb(double gainDb);
 
     // Premiere Pro XML (FCP7) export dispatcher.
@@ -62,7 +93,8 @@ signals:
     void exportFinished(bool success, const QString &message);
 
 private:
-    void doExport(const ExportConfig &config, const QVector<ClipInfo> &clips);
+    void doExport(const ExportConfig &config, const QVector<ClipInfo> &clips,
+                  const std::optional<TimecodeBurnInSettings> &timecodeBurnIn);
     bool openInputFile(const QString &path, AVFormatContext **fmtCtx, AVCodecContext **decCtx, int *streamIndex);
     bool transcodeClip(const ClipInfo &clip, AVFormatContext *outFmt, AVCodecContext *encCtx,
                        AVStream *outStream, SwsContext *swsCtx, int64_t &pts);
@@ -72,5 +104,6 @@ private:
 
     SmartReframe *m_smartReframe = nullptr;
     SubtitleTrackRenderer *m_subtitleRenderer = nullptr;
+    std::optional<TimecodeBurnInSettings> m_timecodeBurnIn;
     double m_loudnessGainDb = 0.0;
 };

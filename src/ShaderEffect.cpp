@@ -303,6 +303,50 @@ void main() {
 }
 )";
 
+// US-304: pixel-center inverse mapping, shared formula with CPU applyLensDistortion.
+// Kept separate from the legacy Barrel Distortion shader and preview knob.
+static const char *kFragLensDistortion = R"(
+#version 330 core
+in vec2 vTexCoord;
+out vec4 fragColor;
+uniform sampler2D uTexture;
+uniform float uK1;
+uniform float uK2;
+uniform float uScale;
+uniform float uCenterX;
+uniform float uCenterY;
+
+void main() {
+    if (uK1 == 0.0 && uK2 == 0.0 && uScale == 1.0
+        && uCenterX == 0.0 && uCenterY == 0.0) {
+        fragColor = texture(uTexture, vTexCoord);
+        return;
+    }
+    vec2 size = vec2(textureSize(uTexture, 0));
+    float shortSide = min(size.x, size.y);
+    float radius = shortSide * 0.5;
+    vec2 c = (size - 1.0) * 0.5 + vec2(uCenterX, uCenterY) * shortSide;
+    vec2 p = vTexCoord * size - 0.5;
+    vec2 xy = (p - c) / radius;
+    float r2 = dot(xy, xy);
+    float factor = (1.0 + uK1 * r2 + uK2 * r2 * r2) / uScale;
+    vec2 src = c + radius * xy * factor;
+    if (any(lessThan(src, vec2(0.0))) || any(greaterThan(src, size - 1.0))) {
+        fragColor = vec4(0.0, 0.0, 0.0, 1.0);
+        return;
+    }
+    // Explicit bilinear taps avoid dependence on the texture's filter/wrap state.
+    ivec2 a = ivec2(floor(src));
+    ivec2 b = min(a + ivec2(1), ivec2(size) - ivec2(1));
+    vec2 f = fract(src);
+    vec3 top = mix(texelFetch(uTexture, a, 0).rgb,
+                   texelFetch(uTexture, ivec2(b.x, a.y), 0).rgb, f.x);
+    vec3 bottom = mix(texelFetch(uTexture, ivec2(a.x, b.y), 0).rgb,
+                      texelFetch(uTexture, b, 0).rgb, f.x);
+    fragColor = vec4(floor(mix(top, bottom, f.y) * 255.0 + 0.5) / 255.0, 1.0);
+}
+)";
+
 static const char *kFragRipple = R"(
 #version 330 core
 in vec2 vTexCoord;
@@ -797,6 +841,22 @@ void ShaderEffectLibrary::registerBuiltins()
 
     {
         ShaderEffectDef d;
+        d.name = "レンズ歪み補正";
+        d.category = "ディストーション";
+        d.description = "径方向のレンズ歪み・拡大率・中心位置を補正";
+        d.fragmentShaderSource = kFragLensDistortion;
+        d.params = {
+            {"uK1", ParamType::Float, -0.5f, 0.5f, 0.0f},
+            {"uK2", ParamType::Float, -0.5f, 0.5f, 0.0f},
+            {"uScale", ParamType::Float, 0.5f, 2.0f, 1.0f},
+            {"uCenterX", ParamType::Float, -0.5f, 0.5f, 0.0f},
+            {"uCenterY", ParamType::Float, -0.5f, 0.5f, 0.0f}
+        };
+        m_effects.append(d);
+    }
+
+    {
+        ShaderEffectDef d;
         d.name        = "Ripple";
         d.category    = "Distort";
         d.description = "Animated water ripple distortion";
@@ -939,6 +999,11 @@ QStringList ShaderEffectLibrary::categories() const
 
 ShaderEffectDef ShaderEffectLibrary::findByName(const QString &name) const
 {
+    // RollingShutterRepair is CPU-only: temporal optical flow is dispatched
+    // through tlrender::applyRollingShutterFromSource, like Echo.
+    if (name == QStringLiteral("RollingShutterRepair")
+        || name == QStringLiteral("ローリングシャッター補正"))
+        return {};
     for (const ShaderEffectDef &d : m_effects) {
         if (d.name == name)
             return d;

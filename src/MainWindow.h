@@ -24,12 +24,14 @@
 #include "ProjectSettings.h"
 #include "Exporter.h"
 #include "ProjectFile.h"
+#include "CameraSolver.h"
 #include "AutoEdit.h"
 #include "ThemeManager.h"
 #include "MultiCam.h"
 #include "WorkspaceManager.h"  // WS-3: 名前付きワークスペース (ドックレイアウト) モデル SSOT
 #include "MotionTracker.h"
 #include "NoiseReduction.h"
+#include "NoisePrint.h"
 #include "SubtitleGenerator.h"
 #include "EffectPreset.h"
 #include "EffectLibraryPanel.h"
@@ -93,10 +95,15 @@
 #include "AcesColor.h"             // AC-4: ACES カラーマネジメント パイプライン SSOT
 #include "DolbyVisionMetadata.h"   // DV-4: Dolby Vision メタデータ SSOT
 #include "BroadcastCaption.h"      // CC-4: 放送CC (CEA-608/708) メタデータ SSOT
+#include "TimecodeBurnIn.h"
+#include "StillStore.h"
+#include "StillCompare.h"
 
 class VideoPlayer;
 class Timeline;
+class TimelineTrack;
 class SourceMonitorDock;
+class StillGalleryDock;
 class AudioBusPanel;
 class ExportDialog;
 class BrushAnimation;
@@ -114,6 +121,7 @@ class DolbyVisionDialog;       // DV-4: Dolby Vision メタデータ ダイア�
 class BroadcastCaptionDialog;  // CC-4: 放送CC (CEA-608/708) ダイアログ
 class ProjectCollectorDialog;
 class HDRSettingsDialog;
+class TimecodeBurnInDialog;
 class AIProcessingDialog;
 class PluginBrowserDialog;
 class AIMaskDialog;
@@ -149,7 +157,6 @@ class InstagramPublishDialog;
 class ProjectTemplateDialog;
 class LoudnessMasterDialog;
 class HdrGradingDialog;
-class MultiCamSyncDialog;
 class BatchExportDialog;
 
 // US-INT-2: Sprint 22 — keying / restoration / animated export / easing /
@@ -235,6 +242,7 @@ class MainWindow : public QMainWindow
     // Timeline) を読み書きするため friend にしている。GUI スレッド上でしか
     // 呼ばれない (McpHttpServer が GUI スレッドのイベントループで動く)。
     friend class mcp::McpEditorTools;
+    friend int runMcpSelftest();
 
 public:
     explicit MainWindow(QWidget *parent = nullptr);
@@ -302,6 +310,7 @@ private slots:
     void importVideoFromUrl();
     void saveProject();
     void saveProjectAs();
+    void compareSavedProject();
     void openProject();
     void exportVideo();
     void splitClip();
@@ -324,6 +333,7 @@ private slots:
     void markIn();
     void markOut();
     void setClipSpeed();
+    void toggleClipReversed(bool reversed);
     void addTextOverlay();
     void manageTextOverlays();
     void exportTextOverlays();
@@ -365,6 +375,7 @@ private slots:
     void addTextAnimation();
     void addBrushAnimation();
     void editTransformKeyframes();
+    void openDynamicZoom();
     void addMask();
     void applyWarpEffect();
     void editExpressions();
@@ -396,6 +407,7 @@ private slots:
     void addMarker();
     void showMarkers();
     void exportChapters();
+    void renderClipInPlaceDialog(int trackIndex, int clipIndex);
     void openRenderQueue();
     void startScreenRecording();
     void stopScreenRecording();
@@ -505,6 +517,7 @@ private slots:
 
     // US-EXT-10: Sprint 10 pro extensions — 3 new menu actions
     void onHDRSettings();
+    void onTimecodeBurnInSettings();
     void onAIProcessing();
     void onPluginBrowser();
 
@@ -515,6 +528,7 @@ private slots:
 
     // US-PT-B: Sprint 15 — Planar (4-corner) tracker dialog
     void openPlanarTrackerDialog();
+    void applyCameraSolve(const QVector<camsolve::Pose>& poses, double fps, double startSec);
 
     // US-TP-6: PRD-TP — モーショントラッカー preset 適用ダイアログ
     void showMotionTrackerDialog();
@@ -553,7 +567,12 @@ private slots:
     // SM-5: ソースモニター + 3点編集。メディアプールのダブルクリックは
     // 直接タイムラインへ取り込まず、いったんソースモニターへロードして
     // マークイン/アウト → 挿入/上書きの 3 点編集ワークフローに乗せる。
-    void openInSourceMonitor(const QString &filePath);
+    void openInSourceMonitor(const QString &filePath,
+                             double positionSec = 0.0);
+    // 再生ヘッド直下の素材をソースモニターで同じフレーム位置に開く。
+    void matchFrame();
+    // 選択クリップを、メディアプールで選択中の素材へ置き換える。
+    void replaceSelectedClipFromMediaPool();
     // ソースモニターの「挿入 (Insert)」押下。選択範囲を検証して
     // insertClip3PointActive で再生ヘッド位置へリップル挿入する。
     void onSourceInsertRequested(const threepoint::SourceSelection &sel);
@@ -595,7 +614,6 @@ private slots:
     void openProjectTemplateDialog();
     void openLoudnessDialog();
     void openHdrDialog();
-    void openMultiCamSyncDialog();
     void openBatchExportDialog();
 
     // US-INT-2: Sprint 22 — keying / restoration / animated export / easing /
@@ -643,12 +661,20 @@ private slots:
     void showMcpConnectionInfo();
 
 protected:
+    bool eventFilter(QObject *watched, QEvent *event) override;
     void dragEnterEvent(QDragEnterEvent *event) override;
     void dropEvent(QDropEvent *event) override;
     void closeEvent(QCloseEvent *event) override;
     void showEvent(QShowEvent *event) override;
 
 private:
+    noiseprint::NoisePrint m_noisePrint;
+    QPointer<TimelineTrack> m_noisePrintMenuTrack;
+    int m_noisePrintMenuClip = -1;
+    bool noisePrintRange(TimelineTrack *track, int clipIndex, double *start, double *end) const;
+    void processNoisePrint(TimelineTrack *track, int clipIndex, bool captureOnly);
+    void pushAnimatedHslPreview(double seconds);
+    bool m_animatedHslPreview = false;
     void setupMenuBar();
     // Beginner-friendly Japanese hover help for menu items. Iterates
     // m_menuHelpEntries and either sets each QAction's tooltip to its
@@ -678,7 +704,9 @@ private:
     void hideWelcomeScreen();
     void loadMediaFile(const QString &filePath, bool addToTimeline, const QString &statusPrefix);
     bool saveProjectToPath(const QString &filePath, QString *errorMessage = nullptr);
-    bool openProjectFromPath(const QString &filePath, QString *errorMessage = nullptr);
+    bool openProjectFromPath(const QString &filePath,
+                             QString *errorMessage = nullptr,
+                             bool promptForMissingMedia = true);
     void updateStatusInfo();
     void updateAcesUiState();
     void updateEditActions();
@@ -688,6 +716,8 @@ private:
     // 成功で true、*appliedCount に overlay 数。失敗時は *err に日本語メッセージ。
     bool applyCaptionEditorTrackToTimeline(QString *err, int *appliedCount);
     void applyProjectConfig(const ProjectConfig &config);
+    void applyTimecodeBurnInSettings(
+        const TimecodeBurnInSettings &settings);
     void syncProjectLightingToTimeline();
     // 書き出し用の音声ミックス (.m4a) を temp に作り、そのパスを返す。ミックスが
     // 不要 (パススルーで正しい) なら空文字列。失敗時は *error に日本語メッセージ。
@@ -696,17 +726,27 @@ private:
     void updateTitle();
     void populateProjectData(ProjectData &data);
     void applyLoadedProjectData(const ProjectData &data, const QString &filePath);
+    bool relinkMediaPaths(const QHash<QString, QString> &oldToNew,
+                          QString *errorOut = nullptr);
+    bool relinkMediaSidecars(const QHash<QString, QString> &oldToNew);
+    void captureMediaRelinkSidecarsAtCurrentUndoIndex();
+    void handleMediaRelinkHistoryChanged();
     void collectAudioState(ProjectData &data);
     void applyAudioState(const ProjectData &data);
+    bool m_promptForMissingMedia = true;
     static QString brushClipId(int trackIdx, int clipIdx);
     static QString particleClipKey(const ClipInfo &clip);
     bool selectedVideoClipRef(int &trackIdx, int &clipIdx, ClipInfo *clip = nullptr) const;
+    bool selectedClipRef(TrackKind &kind, int &trackIdx, int &clipIdx,
+                         ClipInfo *clip = nullptr) const;
+    void replaceClipFromMediaPool(TrackKind kind, int trackIdx, int clipIdx);
     double clipTimelineStartSeconds(int trackIdx, int clipIdx) const;
     double clipSourceTimeAtPlayheadSeconds(int trackIdx, int clipIdx, const ClipInfo &clip) const;
     QImage decodeClipFrameAtSourceTime(const ClipInfo &clip, double sourceTimeSeconds) const;
     QImage decodeClipFrameByIndex(const ClipInfo &clip, int sourceFrameIndex, double sourceFps) const;
     void refreshSpecialClipPreview();
     void refreshEffectLibraryPreview();
+    void applyStillCompareConfig();
     void applyEffectLibraryEntry(const QString &entryId,
                                  int trackIdx = -1, int clipIdx = -1);
     void addEffectLibraryKeyframe(const QString &entryId,
@@ -771,7 +811,15 @@ private:
     QStringList m_supportedFormats;
     ProjectConfig m_projectConfig;
     QVector<BrushAnimationEntry> m_brushAnimationEntries;
+    QVector<OverlayItem> m_projectOverlays;
     QHash<QString, ParticleEmitterConfig> m_particleClipConfigs;
+    struct MediaRelinkSidecarState {
+        QVector<OverlayItem> overlays;
+        QHash<QString, ParticleEmitterConfig> particleClipConfigs;
+    };
+    QVector<MediaRelinkSidecarState> m_mediaRelinkSidecarHistory;
+    quint64 m_mediaRelinkObservedSaveSerial = 0;
+    int m_mediaRelinkObservedUndoIndex = -1;
     QHash<QString, BrushAnimation *> m_liveBrushAnimations;
     QHash<QString, RotoClipEntry> m_rotoClipEntries;
     QHash<QString, TimeRemapClipEntry> m_timeRemapClipEntries;
@@ -781,6 +829,9 @@ private:
     QHash<QString, exprbind::ClipExpressionBindings> m_clipExpressionBindings;
     QHash<QString, wiggle::WiggleParams> m_clipWiggleParams;
     Camera3D m_projectCamera;                                 // single per-project camera
+    QJsonObject m_projectCameraUndoSlot;
+    int m_projectCameraUndoTimelineDepth = -1;
+    quint64 m_projectCameraUndoSaveSerial = 0;
     QVector<Light3D> m_projectLights;                         // project-level 3D lights
     QPointer<Light3DDialog> m_light3DDialog;
     int m_selectedVideoTrackIndex = -1;
@@ -795,6 +846,7 @@ private:
     // is defined in AIProcessingDialog.h.
     HDRSettings           m_hdrSettings;
     AIProcessingSettings  m_aiSettings;
+    TimecodeBurnInSettings m_tcBurnIn;
 
     // US-AETEXT-12: AE text feature objects
     QVector<PathText *> m_pathTexts;
@@ -818,6 +870,7 @@ private:
     QAction *m_undoAction;
     QAction *m_redoAction;
     QAction *m_snapAction;
+    QAction *m_reverseClipAction = nullptr;
     QAction *m_colorManagementAction = nullptr;
     Exporter *m_exporter;
     QString m_projectFilePath; // current .veditor file
@@ -865,6 +918,13 @@ private:
     // SM-5: ソースモニター ドック (右側)。素材を VideoPlayer でプレビューし、
     // マークイン/アウト後に insertRequested/overwriteRequested で 3 点編集する。
     SourceMonitorDock *m_sourceMonitorDock = nullptr;
+
+    // STILLS-WIPE: AppData のスチル一覧と、その表示専用比較状態。
+    stillstore::StillStore m_stillStore;
+    StillGalleryDock *m_stillGalleryDock = nullptr;
+    stillcompare::Config m_stillCompare;
+    QString m_activeStillId;
+    QAction *m_stillCompareAction = nullptr;
 
     // AB-5: オーディオ バス パネル ドック (右側)。m_audioBusRouting が SSOT で、
     // パネルはそれをポインタで指すビュー。routingChanged を受けて AudioMixer へ
@@ -1068,7 +1128,6 @@ private:
     ProjectTemplateDialog              *m_projectTemplateDialog;
     LoudnessMasterDialog               *m_loudnessDialog;
     HdrGradingDialog                   *m_hdrDialog;
-    MultiCamSyncDialog                 *m_multiCamSyncDialog;
     BatchExportDialog                  *m_batchExportDialog;
 
     // US-INT-2: Sprint 22 — keying / restoration / animated export / easing /

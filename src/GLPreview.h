@@ -10,6 +10,7 @@
 #include <QVector>
 #include <QPoint>
 #include <QRectF>
+#include "TimecodeBurnIn.h"
 #include <QString>
 #include <QTimer>
 #include <QFont>
@@ -18,6 +19,7 @@
 #include "VideoEffect.h"
 #include "LutImporter.h"
 #include "MotionStabilizer.h"
+#include "Camera3D.h"
 
 class Timeline;
 class SurfaceTool;
@@ -32,6 +34,8 @@ public:
     ~GLPreview();
 
     void displayFrame(const QImage &frame);
+    void setProjectCamera(const Camera3D &camera);
+    void setProjectCamera(const Camera3DState &camera) { setProjectCamera(Camera3D{camera}); }
     void setBrushAnimation(BrushAnimation *animation);
     void clearBrushAnimation();
     void setBrushAnimationProgress(double progress);
@@ -54,12 +58,14 @@ public:
     void clearLut();
     // US-WIRE-2: Lift/Gamma/Gain color wheels from ColorGradingPanel
     void setLiftGammaGain(const std::array<std::array<double,4>,3> &values);
+    // Log range wheels: Shadow / Midtone / Highlight RGB adjustments.
+    void setLogWheels(const std::array<std::array<double,3>,3> &values);
     // US-CG-1: RGB curves editor — 4 channels (R, G, B, Luma) of 256 ints
     // each in [0,255]. Uploaded as a 256x4 GL_RGBA8 texture and applied
-    // in the fragment shader after Lift/Gamma/Gain and before the .cube LUT.
+    // in the fragment shader after Lift/Gamma/Gain and Log wheels, before the .cube LUT.
     void setRgbCurves(const QVector<QVector<int>> &curves);
     // US-CG-2: White-balance gain triple. Multiplied into c.rgb at the very
-    // top of the grade chain — BEFORE LGG, RGB curves, and the .cube LUT.
+    // top of the grade chain — BEFORE LGG, Log wheels, RGB curves, and the .cube LUT.
     // Identity = (1, 1, 1) → no-op.
     void setWhiteBalance(float r, float g, float b);
     // US-CG-3: Radial vignette / Power Window. Applied AFTER RGB curves and
@@ -84,7 +90,7 @@ public:
                       float hueTol, float satTol, float lumTol,
                       float spill, float softness);
     // US-EF-2: Mask Animation (DaVinci Power Window simplified). Wraps the
-    // entire grade chain (chroma key → WB → LGG → curves → vignette → LUT)
+    // entire grade chain (chroma key → WB → LGG → Log → curves → vignette → LUT)
     // so the colour grade applies INSIDE the mask region; outside stays raw
     // (or vice versa when invert=true). enabled=false is a free no-op (the
     // shader test branches around the mix() so the previous output is
@@ -169,8 +175,13 @@ public:
     // US-INT-1: non-owning Timeline pointer used to query
     // composeAdjustmentLayersAt(timelineUs) in paintGL. nullptr → no-op
     // (preview is bit-identical to pre-INT-1 baseline).
-    void setTimeline(Timeline *t) { m_timeline = t; }
+    void setTimeline(Timeline *t);
     const Timeline *timeline() const { return m_timeline; }
+
+    // Project-level data burn-in. The renderer is shared with both export
+    // paths; disabled settings retain the pre-feature paint path.
+    void setTimecodeBurnIn(const TimecodeBurnInSettings &settings,
+                           double frameRate);
 
     // Phase 1e — true only when VEDITOR_GL_INTEROP=1 AND WGL_NV_DX_interop2
     // is supported AND all 6 wglDX*NV procs resolved during initializeGL().
@@ -307,6 +318,7 @@ private:
     bool ensureInteropDeviceForPaint();
     void releaseRegisteredTexturesLocked();
     void renderPendingD3D11Frame();
+    void paintTimecodeBurnInOverlay();
     // letterboxRect() moved to public section (US-T32).
 
     QOpenGLShaderProgram *m_program = nullptr;
@@ -314,6 +326,9 @@ private:
     QOpenGLBuffer m_vbo;
     QOpenGLVertexArrayObject m_vao;
 
+    Camera3D m_projectCamera;
+    QImage m_projectCameraFrame;
+    qint64 m_projectCameraFrameTimeUs = -1;
     QImage m_currentFrame;
     BrushAnimation *m_brushAnimation = nullptr;
     double m_brushAnimationProgress = 0.0;
@@ -435,6 +450,12 @@ private:
         {0.0, 0.0, 0.0, 0.0},
         {1.0, 1.0, 1.0, 1.0},
         {1.0, 1.0, 1.0, 1.0}
+    }};
+    int m_locLogShadow = -1, m_locLogMid = -1, m_locLogHigh = -1;
+    std::array<std::array<double,3>,3> m_logWheels = {{
+        {0.0, 0.0, 0.0},
+        {0.0, 0.0, 0.0},
+        {0.0, 0.0, 0.0}
     }};
 
     // LUT uniform locations and texture
@@ -608,6 +629,9 @@ private:
 
     // US-INT-1: non-owning Timeline pointer for adjustment-layer composition.
     Timeline *m_timeline = nullptr;
+
+    TimecodeBurnInRenderer m_timecodeBurnInRenderer;
+    double m_timecodeBurnInFrameRate = 30.0;
 
     // Phase 1e — m_interopDevice holds the wglDXOpenDeviceNV HANDLE once
     // Section B opens it lazily in paintGL; void* avoids leaking windows.h.

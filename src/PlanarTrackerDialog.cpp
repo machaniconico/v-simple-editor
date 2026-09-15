@@ -347,6 +347,12 @@ PlanarTrackerDialog::PlanarTrackerDialog(QWidget* parent)
     rightLayout->addLayout(form);
     rightLayout->addWidget(m_resetButton);
     rightLayout->addWidget(m_trackButton);
+    m_cameraSolveButton = new QPushButton(tr("3D カメラを解析"), this);
+    m_cameraSolveButton->setObjectName(QStringLiteral("cameraSolveButton"));
+    m_cameraSolveButton->setEnabled(false);
+    rightLayout->addWidget(m_cameraSolveButton);
+    connect(m_cameraSolveButton, &QPushButton::clicked,
+            this, &PlanarTrackerDialog::onCameraSolveClicked);
     rightLayout->addWidget(m_progress);
     rightLayout->addWidget(m_summaryLabel);
     rightLayout->addStretch();
@@ -361,6 +367,7 @@ PlanarTrackerDialog::PlanarTrackerDialog(QWidget* parent)
     connect(m_cornerWidget, &PlanarCornerWidget::cornersChanged,
             this, [this](const planar::CornerSet& c) {
                 m_corners = c;
+                m_result.clear();
                 rebuildSummary();
             });
 
@@ -405,6 +412,7 @@ PlanarTrackerDialog::PlanarTrackerDialog(QWidget* parent)
 // ---------------------------------------------------------------------------
 void PlanarTrackerDialog::setReferenceFrame(const QImage& frame)
 {
+    m_result.clear();
     m_reference = frame;
     m_cornerWidget->setReferenceImage(frame);
     onResetCorners();   // reset corners to new image bounds
@@ -413,6 +421,7 @@ void PlanarTrackerDialog::setReferenceFrame(const QImage& frame)
 // ---------------------------------------------------------------------------
 void PlanarTrackerDialog::setFrames(const QList<QImage>& frames)
 {
+    m_result.clear();
     m_frames = frames;
     if (!frames.isEmpty() && m_reference.isNull())
         setReferenceFrame(frames.first());
@@ -428,8 +437,10 @@ planar::CornerSet PlanarTrackerDialog::currentCorners() const
 // ---------------------------------------------------------------------------
 void PlanarTrackerDialog::setCorners(const planar::CornerSet& corners)
 {
+    m_result.clear();
     m_corners = corners;
     m_cornerWidget->setCorners(corners);
+    rebuildSummary();
 }
 
 // ---------------------------------------------------------------------------
@@ -764,6 +775,7 @@ int PlanarTrackerDialog::currentPresetIndex() const
 // ---------------------------------------------------------------------------
 void PlanarTrackerDialog::onResetCorners()
 {
+    m_result.clear();
     const double w = m_reference.isNull() ? 640.0 : m_reference.width();
     const double h = m_reference.isNull() ? 360.0 : m_reference.height();
     m_corners = planar::CornerSet::rectangle(
@@ -796,9 +808,10 @@ void PlanarTrackerDialog::onTrackClicked()
 
     // First frame is the reference
     tracker.setReferenceFrame(m_frames.first(), m_corners);
+    m_result.append(planar::Frame{0, 0, m_corners, 1.0});
 
     for (int i = 1; i < m_frames.size(); ++i) {
-        const qint64 timeMs = static_cast<qint64>(i) * 33LL;   // ~30 fps
+        const qint64 timeMs = qRound64(double(i) * 1000.0 / m_cameraFps);
         planar::Frame f = tracker.trackNextFrame(m_frames[i], i, timeMs);
         m_result.append(f);
         m_progress->setValue(i);
@@ -808,6 +821,49 @@ void PlanarTrackerDialog::onTrackClicked()
     m_progress->setVisible(false);
     rebuildSummary();
     emit trackComputed(m_result);
+}
+
+void PlanarTrackerDialog::setCameraSolveContext(QSize canvas, double fov,
+                                               double fps, double startSec)
+{
+    m_cameraCanvas = canvas;
+    m_cameraFov = fov;
+    m_cameraFps = fps > 0 ? fps : 30.0;
+    m_cameraStartSec = startSec;
+}
+
+void PlanarTrackerDialog::onCameraSolveClicked()
+{
+    if (m_result.isEmpty())
+        return;
+    QVector<QPolygonF> corners;
+    QVector<double> confidence;
+    for (const auto& frame : m_result) {
+        const auto& c = frame.corners;
+        corners.append(QPolygonF{c.tl, c.tr, c.br, c.bl});
+        confidence.append(frame.confidence);
+    }
+    const auto poses = camsolve::solveSequence(corners, confidence, 0,
+        camsolve::makeIntrinsicsFromFocalPx(m_cameraFov, m_cameraCanvas));
+    int valid = 0;
+    double residual = 0;
+    for (const auto& pose : poses) {
+        if (pose.valid) {
+            ++valid;
+            residual += pose.residual;
+        }
+    }
+    const QString summary = tr("有効フレーム: %1 / %2\n平均残差: %3")
+        .arg(valid).arg(poses.size())
+        .arg(valid ? QString::number(residual / valid, 'g', 6) : tr("算出不可"));
+    if (!valid) {
+        QMessageBox::information(this, tr("3D カメラ解析"), summary);
+        return;
+    }
+    if (QMessageBox::question(this, tr("3D カメラ解析"),
+            summary + tr("\nカメラのキーフレームとして適用しますか？"),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No) == QMessageBox::Yes)
+        emit cameraSolveApplied(poses, m_cameraFps, m_cameraStartSec);
 }
 
 // ---------------------------------------------------------------------------
@@ -831,6 +887,7 @@ void PlanarTrackerDialog::onDampingChanged(int value)
 // ---------------------------------------------------------------------------
 void PlanarTrackerDialog::rebuildSummary()
 {
+    m_cameraSolveButton->setEnabled(!m_result.isEmpty());
     const int total   = m_frames.size();
     const int tracked = m_result.size();
 

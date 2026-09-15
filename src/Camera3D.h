@@ -7,6 +7,7 @@
 #include <QJsonObject>
 #include <QJsonArray>
 #include <QPointF>
+#include <QPolygonF>
 #include <QSize>
 #include <QVector>
 #include <QVector3D>
@@ -16,16 +17,18 @@
 struct Camera3DState {
     QVector3D position  = QVector3D(0.0f, 0.0f, 0.0f);
     QVector3D target    = QVector3D(0.0f, 0.0f, -1.0f);
-    double fov          = 60.0;    // degrees
+    double fov          = 60.0;    // focal length in canvas pixels (legacy semantics)
     double nearPlane    = 0.1;
     double farPlane     = 1000.0;
     double roll         = 0.0;     // degrees
+
+    bool trueProjection = false;
 
     bool isDefault() const {
         return position == QVector3D(0.0f, 0.0f, 0.0f)
             && target == QVector3D(0.0f, 0.0f, -1.0f)
             && fov == 60.0 && nearPlane == 0.1
-            && farPlane == 1000.0 && roll == 0.0;
+            && farPlane == 1000.0 && roll == 0.0 && !trueProjection;
     }
 
     void reset() { *this = Camera3DState{}; }
@@ -65,6 +68,7 @@ class Camera3D
 {
 public:
     Camera3D();
+    explicit Camera3D(const Camera3DState &state);
 
     // --- Camera state ---
 
@@ -96,6 +100,17 @@ public:
                                    const Layer3DTransform &layer3D,
                                    const Camera3DState &cameraState,
                                    const QSize &canvasSize);
+
+    static QPolygonF projectLayerQuad(const Layer3DTransform &layer3D,
+                                      const Camera3DState &cameraState,
+                                      const QSize &canvasSize);
+    static QImage applyTrueProjection(const QImage &image,
+                                      const Layer3DTransform &layer3D,
+                                      const Camera3DState &cameraState,
+                                      const QSize &canvasSize);
+    // Calling-thread-only selftest controls; disabled mode bypasses the new step.
+    static void setTrueProjectionEnabledForTest(bool enabled);
+    static int trueProjectionCallCountForTest();
 
     // --- Camera keyframes ---
 
@@ -164,3 +179,10 @@ private:
     int trackIndex(Camera3DProperty property) const;
     void ensureLayerIndex(int index);
 };
+
+// Shared opt-in compositing step for preview and export.
+QImage applyProjectCameraProjection(const QImage &image,
+                                    const Layer3DTransform &layer3D,
+                                    bool is3DLayer,
+                                    const Camera3DState &camera,
+                                    const QSize &canvasSize);

@@ -84,6 +84,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     # PRD-SPLIT-MAIN-1: selftest registry (table + dispatch helpers).
     src/selftests/SelftestRegistry.h
     src/selftests/SelftestRegistry.cpp
+    src/selftests/render_fixture_selftest.cpp
 
     # PRD-PHASE5B-OAUTH-MOCK-HARNESS: localhost OAuth/upload mock server for e2e selftests.
     src/selftests/oauth_mock_server.h
@@ -122,13 +123,23 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/DeflickerSelftest.cpp
     src/selftests/ObjectRemovalSelftest.cpp
     src/selftests/Light3DSelftest.cpp
+    src/selftests/camera3d_selftest.cpp
+    src/selftests/camera_solve_selftest.cpp
+    src/selftests/feature_tracker_selftest.cpp
     src/selftests/VoiceIsolationSelftest.cpp
+    src/selftests/noise_print_selftest.cpp
     src/selftests/GradeLggSerializationSelftest.cpp
+    src/selftests/color_warper_selftest.cpp
+    src/selftests/GradeLogWheelSelftest.cpp
     src/selftests/GradeKeyframeSelftest.cpp
+    src/selftests/grade_keyframe_ext_selftest.cpp
     src/selftests/GradeWheelWiringSelftest.cpp
     src/selftests/MediaPoolDragSelftest.cpp
     src/selftests/TextSpacingSelftest.cpp
     src/selftests/VersionedSaveSelftest.cpp
+    src/selftests/project_diff_selftest.cpp
+    src/selftests/tcburn_selftest.cpp
+    src/selftests/dynzoom_selftest.cpp
 
     # PRD-SPLIT-MAIN-3 Phase 3-A: libavcore-backed selftests (moved from src/main.cpp).
     src/selftests/libavcore_selftests.cpp
@@ -139,10 +150,13 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/AeFxBlurSelftest.cpp
     src/selftests/AeFxColorSelftest.cpp
     src/selftests/AeFxColor2Selftest.cpp
+    src/selftests/lens_distort_selftest.cpp
     src/selftests/AeFxDistortSelftest.cpp
     src/selftests/AeFxDistort2Selftest.cpp
     src/selftests/AeFxGenerateSelftest.cpp
     src/selftests/AeFxStylizeSelftest.cpp
+    src/selftests/rolling_shutter_selftest.cpp
+    src/selftests/fxgrain_echo_selftest.cpp
 
     # PRD-SPLIT-MAIN-3 Phase 3-C: Sprint 11-22 サービス selftests (moved from src/main.cpp).
     src/selftests/sprint_selftests.cpp
@@ -154,6 +168,10 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/util/CrashHandler.cpp
     src/util/Logger.cpp
     src/util/RcPause.h
+    src/DynamicZoom.h
+    src/DynamicZoom.cpp
+    src/DynamicZoomDialog.h
+    src/DynamicZoomDialog.cpp
     src/MainWindow.cpp
     src/VideoPlayer.cpp
     src/Timeline.cpp
@@ -165,6 +183,10 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/ExportRange.h
     src/ExportRange.cpp
     src/Exporter.cpp
+    src/TimecodeBurnIn.h
+    src/TimecodeBurnIn.cpp
+    src/TimecodeBurnInDialog.h
+    src/TimecodeBurnInDialog.cpp
     src/FrameDiff.cpp
     src/FrameExport.h
     src/FrameExport.cpp
@@ -192,6 +214,10 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/UndoTrace.cpp
     src/VersionedSave.h
     src/VersionedSave.cpp
+    src/ProjectDiff.h
+    src/ProjectDiff.cpp
+    src/ProjectDiffDialog.h
+    src/ProjectDiffDialog.cpp
     src/UndoManager.cpp
     src/Overlay.cpp
     src/OverlayDialogs.cpp
@@ -206,6 +232,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/EffectParamSchema.cpp
     src/VideoEffectDialogs.cpp
     src/ColorGradingPanel.cpp
+    src/HueSatWarpWidget.h
+    src/HueSatWarpWidget.cpp
     src/ColorWheelWidget.cpp
     src/CredentialDialog.cpp
     src/CredentialVault.h
@@ -249,8 +277,16 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/playback/smartrender_flag.h
     src/SilenceCut.cpp
     src/BeatDetect.cpp
+    src/MusicRemix.cpp
+    src/MusicRemixDialog.cpp
+    src/DialogueLeveler.cpp
+    src/DialogueLevelerDialog.cpp
     src/AudioBusPanel.cpp
     src/selftests/audio_bus_selftest.cpp
+    src/selftests/audio_xfade_selftest.cpp
+    src/selftests/morph_cut_selftest.cpp
+    src/selftests/transition_export_selftest.cpp
+    src/selftests/transition_params_selftest.cpp
     src/selftests/AutoDuckingSelftest.cpp
     src/selftests/AudioChannelMapSelftest.cpp
     src/selftests/StereoPanSelftest.cpp
@@ -266,10 +302,21 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/atempo_resolve_selftest.cpp
     src/selftests/silence_cut_selftest.cpp
     src/selftests/beat_detect_selftest.cpp
+    src/selftests/music_remix_selftest.cpp
+    src/selftests/whisper_guide_selftest.cpp
+    src/selftests/dialogue_leveler_selftest.cpp
     src/selftests/safe_zone_selftest.cpp
+    src/selftests/shape_clip_selftest.cpp
+    src/selftests/StillCompareSelftest.cpp
     src/selftests/onion_skin_selftests.cpp
     src/SafeZone.h
     src/SafeZone.cpp
+    src/StillCompare.h
+    src/StillCompare.cpp
+    src/StillStore.h
+    src/StillStore.cpp
+    src/StillGalleryDock.h
+    src/StillGalleryDock.cpp
     src/OnionSkin.h
     src/OnionSkin.cpp
     src/selftests/subtitle_karaoke_selftest.cpp
@@ -280,6 +327,10 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/VoiceIsolation.cpp
     src/VoiceIsolationDialog.h
     src/VoiceIsolationDialog.cpp
+    src/NoisePrint.h
+    src/NoisePrint.cpp
+    src/NoisePrintDialog.h
+    src/NoisePrintDialog.cpp
     src/SpectrogramWidget.cpp
     src/SpectralEditDialog.cpp
     src/selftests/spectral_edit_selftest.cpp
@@ -353,6 +404,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/HslSecondarySelftest.cpp
     src/selftests/ClipLutSelftest.cpp
     src/selftests/ColorMatchApplySelftest.cpp
+    src/selftests/reverse_clip_selftest.cpp
     src/selftests/clip_idt_selftest.cpp
     src/selftests/clip_odt_selftest.cpp
     src/selftests/sws_color_selftest.cpp
@@ -458,6 +510,10 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/AIUpscale.cpp
     src/FrameInterpolator.cpp
     src/ProjectFile.cpp
+    src/MediaPaths.h
+    src/MediaPaths.cpp
+    src/MediaRelinkDialog.h
+    src/MediaRelinkDialog.cpp
     src/ProjectCollector.cpp
     src/ProjectCollector.h
     src/ProjectCollectorDialog.h
@@ -525,6 +581,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/whisper_transcribe_selftest.cpp
     src/selftests/transcript_highlighter_selftest.cpp
     src/selftests/transcript_highlighter_offline_selftest.cpp
+    src/selftests/media_relink_selftest.cpp
     src/selftests/mcp_selftest.cpp
     src/MotionTracker.cpp
     src/MotionTrackerDialog.h
@@ -548,6 +605,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/DecoderSlotManager.cpp
     src/AudioMixer.cpp
     src/PlanarTracker.cpp
+    src/FeatureTracker.cpp
+    src/FeatureTracker.h
     src/PlanarTracker.h
     src/PlanarTrackerDialog.cpp
     src/PlanarTrackerDialog.h
@@ -581,6 +640,9 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/SpeedRamp.cpp
     src/SpeedRampData.cpp
     src/SpeedRampData.h
+    src/RenderInPlace.h
+    src/RenderInPlace.cpp
+    src/selftests/render_in_place_selftest.cpp
     src/RenderQueue.cpp
     src/RenderQueueDialog.cpp
     src/RenderQueueDialog.h
@@ -656,7 +718,11 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/SmartReframeDialog.h
     src/SmartReframeDialog.cpp
     src/ShapeLayer.cpp
+    src/ShapeModifierDialog.h
+    src/ShapeModifierDialog.cpp
     src/Camera3D.cpp
+    src/CameraSolver.h
+    src/CameraSolver.cpp
     src/Expression.cpp
     src/Precompose.cpp
     src/Rotoscope.cpp
@@ -838,8 +904,6 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/HdrGradingDialog.cpp
     src/MultiCamSync.h
     src/MultiCamSync.cpp
-    src/MultiCamSyncDialog.h
-    src/MultiCamSyncDialog.cpp
     src/BatchExportQueue.h
     src/BatchExportQueue.cpp
     src/BatchExportDialog.h

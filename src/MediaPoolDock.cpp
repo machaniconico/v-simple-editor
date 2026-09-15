@@ -163,6 +163,13 @@ void MediaPoolDock::refresh()
     }
 }
 
+QString MediaPoolDock::selectedAssetPath() const
+{
+    const QListWidgetItem *item = m_assetList ? m_assetList->currentItem() : nullptr;
+    return item && item->isSelected()
+        ? item->data(kAssetPathRole).toString() : QString();
+}
+
 void MediaPoolDock::rebuildBinTree()
 {
     m_rebuilding = true;

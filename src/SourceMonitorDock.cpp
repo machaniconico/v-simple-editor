@@ -14,12 +14,24 @@
 #include <QWidget>
 
 #include <cmath>
+#include <limits>
 
 namespace {
 
 // durationSec 不明 (<=0) のときに張る暫定スクラブレンジ (1 時間)。実尺が
 // durationChanged で判明したら applyDurationToSlider() で張り直す。
 constexpr int kFallbackDurationMs = 60 * 60 * 1000;
+
+double boundedPositionSeconds(double seconds, double durationSeconds)
+{
+    if (!std::isfinite(seconds) || seconds <= 0.0)
+        return 0.0;
+    if (std::isfinite(durationSeconds) && durationSeconds > 0.0)
+        seconds = qMin(seconds, durationSeconds);
+    const double largestSliderSecond =
+        static_cast<double>(std::numeric_limits<int>::max()) / 1000.0;
+    return qMin(seconds, largestSliderSecond);
+}
 
 // 秒を MM:SS.mmm 形式に整形する。負値は 0 として扱う。
 QString formatSeconds(double sec)
@@ -54,7 +66,7 @@ void SourceMonitorDock::setupUI()
     outer->setSpacing(4);
 
     // 2 個目の VideoPlayer。singleton ではないので生成可。MainWindow 固有
-    // シグナルには接続せず、loadFile/previewSeek のみ使う。
+    // シグナルには接続せず、loadFile/seek/previewSeek のみ使う。
     m_viewer = new VideoPlayer(central);
     outer->addWidget(m_viewer, /*stretch=*/1);
 
@@ -114,27 +126,33 @@ void SourceMonitorDock::setupUI()
     setWidget(central);
 }
 
-void SourceMonitorDock::loadSource(const threepoint::SourceSelection &sel)
+void SourceMonitorDock::loadSource(const threepoint::SourceSelection &sel,
+                                   double initialPositionSec)
 {
-    loadSource(sel.filePath, sel.durationSec, sel.displayName);
+    loadSource(sel.filePath, sel.durationSec, sel.displayName,
+               initialPositionSec);
     // SourceSelection 側に既存マークがあれば引き継ぐ。
     if (m_loaded) {
-        m_sourceInSec = (sel.sourceInSec > 0.0) ? sel.sourceInSec : 0.0;
-        m_sourceOutSec = (sel.sourceOutSec > 0.0) ? sel.sourceOutSec : 0.0;
+        m_sourceInSec = boundedPositionSeconds(sel.sourceInSec, m_durationSec);
+        m_sourceOutSec = boundedPositionSeconds(sel.sourceOutSec, m_durationSec);
+        if (m_sourceOutSec > 0.0 && m_sourceOutSec <= m_sourceInSec)
+            m_sourceOutSec = 0.0;
         updateControls();
     }
 }
 
 void SourceMonitorDock::loadSource(const QString &filePath, double durationSec,
-                                   const QString &displayName)
+                                   const QString &displayName,
+                                   double initialPositionSec)
 {
     if (filePath.isEmpty())
         return;
 
     m_filePath = filePath;
     m_displayName = displayName.isEmpty() ? filePath : displayName;
-    m_durationSec = (durationSec > 0.0) ? durationSec : 0.0;
-    m_scrubSec = 0.0;
+    m_durationSec = (std::isfinite(durationSec) && durationSec > 0.0)
+        ? durationSec : 0.0;
+    m_scrubSec = boundedPositionSeconds(initialPositionSec, m_durationSec);
     m_sourceInSec = 0.0;
     m_sourceOutSec = 0.0;
     m_loaded = true;
@@ -144,11 +162,16 @@ void SourceMonitorDock::loadSource(const QString &filePath, double durationSec,
 
     applyDurationToSlider();
 
-    // スクラブを先頭へ戻す (valueChanged 経由で previewSeek が走る)。
+    // 指定位置へ移動する。マッチフレームでは loadFile() 直後に同じ
+    // VideoPlayer へ seek し、通常のメディアプール起動は既定値 0 秒のまま。
+    const int initialPositionMs = static_cast<int>(
+        std::llround(m_scrubSec * 1000.0));
     if (m_scrubBar) {
         const QSignalBlocker blocker(m_scrubBar);
-        m_scrubBar->setValue(0);
+        m_scrubBar->setValue(initialPositionMs);
     }
+    if (m_viewer)
+        m_viewer->seek(initialPositionMs);
 
     updateControls();
 }
@@ -157,8 +180,9 @@ void SourceMonitorDock::applyDurationToSlider()
 {
     if (!m_scrubBar)
         return;
-    const int maxMs = (m_durationSec > 0.0)
-        ? static_cast<int>(std::llround(m_durationSec * 1000.0))
+    const double boundedDurationSec = boundedPositionSeconds(m_durationSec, 0.0);
+    const int maxMs = (boundedDurationSec > 0.0)
+        ? static_cast<int>(std::llround(boundedDurationSec * 1000.0))
         : kFallbackDurationMs;
     const QSignalBlocker blocker(m_scrubBar);
     m_scrubBar->setMaximum(maxMs > 0 ? maxMs : kFallbackDurationMs);
@@ -168,12 +192,20 @@ void SourceMonitorDock::onPlayerDurationChanged(double durationSeconds)
 {
     // 起動時に durationSec=0 で読み込まれた素材の実尺が判明したケース。
     // 既に明示尺を持っているときは上書きしない。
-    if (!m_loaded || durationSeconds <= 0.0)
+    if (!m_loaded || !std::isfinite(durationSeconds) || durationSeconds <= 0.0)
         return;
     if (m_durationSec > 0.0)
         return;
     m_durationSec = durationSeconds;
+    m_scrubSec = boundedPositionSeconds(m_scrubSec, m_durationSec);
     applyDurationToSlider();
+    const int positionMs = static_cast<int>(std::llround(m_scrubSec * 1000.0));
+    if (m_scrubBar) {
+        const QSignalBlocker blocker(m_scrubBar);
+        m_scrubBar->setValue(positionMs);
+    }
+    if (m_viewer)
+        m_viewer->seek(positionMs);
     updateControls();
 }
 

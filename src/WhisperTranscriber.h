@@ -6,6 +6,31 @@
 
 #include <QByteArray>
 #include <QString>
+#include <QStringList>
+
+class QSettings;
+
+namespace whisperpath {
+
+struct Resolution {
+    QString executablePath;
+    QStringList candidatePaths;
+};
+
+// Deterministic resolution seam used by selftests. Values supplied by callers
+// are already considered usable; existingKnownLocations controls which fixed
+// candidates are eligible.
+Resolution resolveWhisperCli(QSettings& settings,
+                             const QString& environmentPath,
+                             const QString& pathExecutable,
+                             const QStringList& knownLocations,
+                             const QStringList& existingKnownLocations);
+
+// Runtime resolver: settings -> environment -> PATH -> known locations.
+Resolution resolveWhisperCli();
+QStringList whisperCliCandidatePaths();
+
+} // namespace whisperpath
 
 namespace whisper {
 

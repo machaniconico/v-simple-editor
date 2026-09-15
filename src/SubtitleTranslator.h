@@ -5,6 +5,8 @@
 #include <QString>
 #include <QNetworkAccessManager>
 
+class QSettings;
+
 namespace subxlat {
 
 enum class Provider { Stub, GoogleV2, DeepL };
@@ -16,7 +18,16 @@ struct TranslateConfig {
     QString  targetLang = "ja";
 
     static TranslateConfig defaultConfig();
+    static TranslateConfig defaultConfig(QSettings &settings,
+                                         const QString &environmentKey);
 };
+
+Provider providerFromSettings(QSettings &settings,
+                              Provider fallback = Provider::Stub);
+void saveDialogSettings(QSettings &settings,
+                        Provider provider,
+                        const QString &apiKey,
+                        bool saveApiKey);
 
 class TranslatorClient : public QObject {
     Q_OBJECT

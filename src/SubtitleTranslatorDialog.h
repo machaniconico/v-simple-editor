@@ -7,6 +7,7 @@
 
 class QLabel;
 class QLineEdit;
+class QCheckBox;
 
 class SubtitleTranslatorDialog : public QDialog {
     Q_OBJECT
@@ -25,6 +26,7 @@ private:
     QComboBox                 *m_providerCombo;
     QComboBox                 *m_targetLangCombo;
     QLineEdit                 *m_apiKeyEdit;
+    QCheckBox                 *m_saveApiKeyCheck;
     QLabel                    *m_apiWarningLabel;
     QPlainTextEdit            *m_preview;
     caption::Track             m_track;

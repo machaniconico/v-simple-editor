@@ -5,6 +5,8 @@
 #include "color/ClipColor.h"
 #include "mask/ClipMask.h"
 #include "CaptionOverlayBuilder.h"
+#include "TimecodeBurnIn.h"
+#include "ShapeLayer.h"
 #include <QBuffer>
 #include <QFile>
 #include <QJsonDocument>
@@ -14,6 +16,18 @@
 #include <cstring>
 
 namespace {
+
+// Keep legacy camera JSON unchanged; the opt-in flag is written only as true.
+QJsonObject projectCameraJsonForSave(QJsonObject camera)
+{
+    QJsonObject state = camera.value(QStringLiteral("cameraState")).toObject();
+    const QString key = QStringLiteral("trueProjection");
+    if (state.contains(key) && !state.value(key).toBool(false)) {
+        state.remove(key);
+        camera[QStringLiteral("cameraState")] = state;
+    }
+    return camera;
+}
 
 void appendPngU32(QByteArray &bytes, quint32 value)
 {
@@ -597,6 +611,7 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
     root["config"] = configToJson(data.config);
     root["videoTracks"] = tracksToJson(data.videoTracks);
     root["audioTracks"] = tracksToJson(data.audioTracks);
+    root["trackFlags"] = trackFlagsToJson(data);
     root["generatedCaptionOverlays"] = TextManager::toJson(data.generatedCaptionOverlays);
     root["playheadPos"] = data.playheadPos;
     root["markIn"] = data.markIn;
@@ -722,7 +737,19 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
         root["subtitleSegments"] = subArr;
     }
     root["subtitleStyle"] = data.subtitleStyle;
-    root["loudnessSettings"] = data.loudnessSettings;
+    {
+        // ProjectData has no dedicated extension slot in the locked header.
+        // MainWindow carries this setting in loudnessSettings only while the
+        // value is in memory; strip that private carrier so the on-disk schema
+        // has the requested top-level timecodeBurnIn object and no pollution
+        // under loudnessSettings.
+        QJsonObject loudness = data.loudnessSettings;
+        const QJsonObject timecode = loudness.take(
+            QStringLiteral("_timecodeBurnIn")).toObject();
+        root["loudnessSettings"] = loudness;
+        root["timecodeBurnIn"] =
+            TimecodeBurnInSettings::fromJson(timecode).toJson();
+    }
     {
         QJsonArray particleArr;
         for (const auto &entry : data.particleClipEntries)
@@ -787,7 +814,7 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
         root["wiggleClipEntries"] = wigArr;
     }
     if (!data.projectCamera.isEmpty())
-        root["projectCamera"] = data.projectCamera;
+        root["projectCamera"] = projectCameraJsonForSave(data.projectCamera);
     if (!data.projectLights.isEmpty())
         root["projectLights"] = data.projectLights;
 
@@ -906,6 +933,7 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
     data.config = configFromJson(root["config"].toObject());
     data.videoTracks = tracksFromJson(root["videoTracks"].toArray());
     data.audioTracks = tracksFromJson(root["audioTracks"].toArray());
+    trackFlagsFromJson(root.value("trackFlags").toObject(), data);
     data.generatedCaptionOverlays = TextManager::fromJson(
         root.value("generatedCaptionOverlays").toArray());
     migrateGeneratedCaptionsToProjectLevel(data);
@@ -1018,6 +1046,10 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
     data.loudnessSettings = QJsonObject{};
     if (root.contains("loudnessSettings"))
         data.loudnessSettings = root["loudnessSettings"].toObject();
+    data.loudnessSettings.insert(
+        QStringLiteral("_timecodeBurnIn"),
+        TimecodeBurnInSettings::fromJson(
+            root.value(QStringLiteral("timecodeBurnIn")).toObject()).toJson());
     data.particleClipEntries.clear();
     if (root.contains("particleClipEntries")) {
         for (const auto &v : root["particleClipEntries"].toArray())
@@ -1190,6 +1222,7 @@ QString ProjectFile::toJsonString(const ProjectData &data)
     root["config"] = configToJson(data.config);
     root["videoTracks"] = tracksToJson(data.videoTracks);
     root["audioTracks"] = tracksToJson(data.audioTracks);
+    root["trackFlags"] = trackFlagsToJson(data);
     root["generatedCaptionOverlays"] = TextManager::toJson(data.generatedCaptionOverlays);
     root["playheadPos"] = data.playheadPos;
     root["markIn"] = data.markIn;
@@ -1306,7 +1339,14 @@ QString ProjectFile::toJsonString(const ProjectData &data)
         root["subtitleSegments"] = subArr;
     }
     root["subtitleStyle"] = data.subtitleStyle;
-    root["loudnessSettings"] = data.loudnessSettings;
+    {
+        QJsonObject loudness = data.loudnessSettings;
+        const QJsonObject timecode = loudness.take(
+            QStringLiteral("_timecodeBurnIn")).toObject();
+        root["loudnessSettings"] = loudness;
+        root["timecodeBurnIn"] =
+            TimecodeBurnInSettings::fromJson(timecode).toJson();
+    }
     {
         QJsonArray particleArr;
         for (const auto &entry : data.particleClipEntries)
@@ -1371,7 +1411,7 @@ QString ProjectFile::toJsonString(const ProjectData &data)
         root["wiggleClipEntries"] = wigArr;
     }
     if (!data.projectCamera.isEmpty())
-        root["projectCamera"] = data.projectCamera;
+        root["projectCamera"] = projectCameraJsonForSave(data.projectCamera);
     if (!data.projectLights.isEmpty())
         root["projectLights"] = data.projectLights;
 
@@ -1474,6 +1514,7 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
     data.config = configFromJson(root["config"].toObject());
     data.videoTracks = tracksFromJson(root["videoTracks"].toArray());
     data.audioTracks = tracksFromJson(root["audioTracks"].toArray());
+    trackFlagsFromJson(root.value("trackFlags").toObject(), data);
     data.generatedCaptionOverlays = TextManager::fromJson(
         root.value("generatedCaptionOverlays").toArray());
     migrateGeneratedCaptionsToProjectLevel(data);
@@ -1586,6 +1627,10 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
     data.loudnessSettings = QJsonObject{};
     if (root.contains("loudnessSettings"))
         data.loudnessSettings = root["loudnessSettings"].toObject();
+    data.loudnessSettings.insert(
+        QStringLiteral("_timecodeBurnIn"),
+        TimecodeBurnInSettings::fromJson(
+            root.value(QStringLiteral("timecodeBurnIn")).toObject()).toJson());
     data.particleClipEntries.clear();
     if (root.contains("particleClipEntries")) {
         for (const auto &v : root["particleClipEntries"].toArray())
@@ -1779,6 +1824,12 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
     QJsonObject obj;
     obj["filePath"] = clip.filePath;
     obj["displayName"] = clip.displayName;
+    if (!clip.shapes.isEmpty()) {
+        QJsonArray shapes;
+        for (const Shape &shape : clip.shapes)
+            shapes.append(shape.toJson());
+        obj["shapes"] = shapes;
+    }
     if (!clip.sequenceRefId.isEmpty())
         obj["sequenceRefId"] = clip.sequenceRefId;
     obj["duration"] = clip.duration;
@@ -1788,7 +1839,11 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
         obj["leadInSec"] = clip.leadInSec;
     if (clip.linkGroup != 0)
         obj["linkGroup"] = clip.linkGroup;
+    if (clip.label != ClipLabel::None)
+        obj["label"] = clipLabelToString(clip.label);
     obj["speed"] = clip.speed;
+    if (clip.reversed)
+        obj["reversed"] = true;
     obj["volume"] = clip.volume;
     if (clip.pan != 0.0)
         obj["pan"] = clip.pan;
@@ -1813,6 +1868,8 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
         obj["layerMaterial"] = clip.material.toJson();
     if (clip.motionBlurEnabled)
         obj["motionBlurEnabled"] = true;
+    if (clip.autoOrientEnabled)
+        obj["autoOrientEnabled"] = true;
     if (clip.fitContain)
         obj["fitContain"] = true;
     if (clip.fitCover)
@@ -1872,6 +1929,11 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
     if (!clip.speedRamp.isIdentity())
         obj["speedRamp"] = clip.speedRamp.toJson();
     obj["atempoEnabled"] = clip.atempoEnabled;
+    if (clip.renderInPlaceOriginal) {
+        ClipInfo original = *clip.renderInPlaceOriginal;
+        original.renderInPlaceOriginal.reset();
+        obj["renderInPlaceOriginal"] = clipToJson(original);
+    }
 
     return obj;
 }
@@ -1881,6 +1943,10 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
     ClipInfo clip;
     clip.filePath = obj["filePath"].toString();
     clip.displayName = obj["displayName"].toString();
+    if (obj.contains("shapes")) {
+        for (const QJsonValue &value : obj["shapes"].toArray())
+            clip.shapes.append(Shape::fromJson(value.toObject()));
+    }
     clip.sequenceRefId = obj["sequenceRefId"].toString();
     if (clip.sequenceRefId.isEmpty())
         clip.sequenceRefId = timeline_nesting::sequenceIdFromClipFilePath(clip.filePath);
@@ -1889,7 +1955,9 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
     clip.outPoint = obj["outPoint"].toDouble();
     clip.leadInSec = obj["leadInSec"].toDouble(0.0);
     clip.linkGroup = obj["linkGroup"].toInt(0);
+    clip.label = clipLabelFromString(obj["label"].toString());
     clip.speed = obj["speed"].toDouble(1.0);
+    clip.reversed = obj["reversed"].toBool(false);
     clip.volume = obj["volume"].toDouble(1.0);
     clip.pan = obj["pan"].toDouble(0.0);
     clip.audioChannelMode = obj.contains("audioChannelMode")
@@ -1913,6 +1981,7 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
     if (obj.contains("layerMaterial"))
         clip.material = LayerMaterial::fromJson(obj["layerMaterial"].toObject());
     clip.motionBlurEnabled = obj["motionBlurEnabled"].toBool(false);
+    clip.autoOrientEnabled = obj["autoOrientEnabled"].toBool(false);
     clip.fitContain = obj["fitContain"].toBool(false);
     clip.fitCover = obj["fitCover"].toBool(false);
     clip.lutFilePath = obj["lutFilePath"].toString();
@@ -1969,6 +2038,11 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
     if (obj.contains("speedRamp"))
         clip.speedRamp = speedramp::SpeedRamp::fromJson(obj["speedRamp"].toObject());
     clip.atempoEnabled = obj["atempoEnabled"].toBool(false);
+    if (obj.value("renderInPlaceOriginal").isObject()) {
+        QJsonObject original = obj.value("renderInPlaceOriginal").toObject();
+        original.remove("renderInPlaceOriginal");
+        clip.renderInPlaceOriginal = std::make_shared<ClipInfo>(clipFromJson(original));
+    }
 
     return clip;
 }
@@ -2002,6 +2076,24 @@ QJsonObject ProjectFile::colorCorrectionToJson(const ColorCorrection &cc)
     addIfNonZero(QStringLiteral("gainR"), cc.gainR);
     addIfNonZero(QStringLiteral("gainG"), cc.gainG);
     addIfNonZero(QStringLiteral("gainB"), cc.gainB);
+    addIfNonZero(QStringLiteral("logShadowR"), cc.logShadowR);
+    addIfNonZero(QStringLiteral("logShadowG"), cc.logShadowG);
+    addIfNonZero(QStringLiteral("logShadowB"), cc.logShadowB);
+    addIfNonZero(QStringLiteral("logMidR"), cc.logMidR);
+    addIfNonZero(QStringLiteral("logMidG"), cc.logMidG);
+    addIfNonZero(QStringLiteral("logMidB"), cc.logMidB);
+    addIfNonZero(QStringLiteral("logHighR"), cc.logHighR);
+    addIfNonZero(QStringLiteral("logHighG"), cc.logHighG);
+    addIfNonZero(QStringLiteral("logHighB"), cc.logHighB);
+    if (!cc.hueSatWarp.isDefault()) {
+        QJsonArray shifts, scales;
+        for (int r = 0; r < HueSatWarp::kSatRings; ++r)
+            for (int h = 0; h < HueSatWarp::kHueNodes; ++h) {
+                shifts.append(cc.hueSatWarp.hueShiftDeg[r][h]);
+                scales.append(cc.hueSatWarp.satScale[r][h]);
+            }
+        obj["hueSatWarp"] = QJsonObject{{"hueShift", shifts}, {"satScale", scales}};
+    }
     return obj;
 }
 
@@ -2027,6 +2119,26 @@ ColorCorrection ProjectFile::colorCorrectionFromJson(const QJsonObject &obj)
     cc.gainR = obj["gainR"].toDouble(0.0);
     cc.gainG = obj["gainG"].toDouble(0.0);
     cc.gainB = obj["gainB"].toDouble(0.0);
+    cc.logShadowR = obj["logShadowR"].toDouble(0.0);
+    cc.logShadowG = obj["logShadowG"].toDouble(0.0);
+    cc.logShadowB = obj["logShadowB"].toDouble(0.0);
+    cc.logMidR = obj["logMidR"].toDouble(0.0);
+    cc.logMidG = obj["logMidG"].toDouble(0.0);
+    cc.logMidB = obj["logMidB"].toDouble(0.0);
+    cc.logHighR = obj["logHighR"].toDouble(0.0);
+    cc.logHighG = obj["logHighG"].toDouble(0.0);
+    cc.logHighB = obj["logHighB"].toDouble(0.0);
+    const QJsonObject warp = obj["hueSatWarp"].toObject();
+    const QJsonArray shifts = warp["hueShift"].toArray();
+    const QJsonArray scales = warp["satScale"].toArray();
+    for (int r = 0; r < HueSatWarp::kSatRings; ++r)
+        for (int h = 0; h < HueSatWarp::kHueNodes; ++h) {
+            const int i = r * HueSatWarp::kHueNodes + h;
+            if (i < shifts.size())
+                cc.hueSatWarp.hueShiftDeg[r][h] = static_cast<float>(qBound(-60.0, shifts[i].toDouble(0.0), 60.0));
+            if (i < scales.size())
+                cc.hueSatWarp.satScale[r][h] = static_cast<float>(qBound(0.0, scales[i].toDouble(1.0), 2.0));
+        }
     return cc;
 }
 
@@ -2118,6 +2230,9 @@ QJsonObject ProjectFile::transitionToJson(const Transition &t)
     obj["duration"] = t.duration;
     obj["alignment"] = static_cast<int>(t.alignment);
     obj["easing"] = static_cast<int>(t.easing);
+    if (t.softness != 0.0) obj["softness"] = t.softness;
+    if (t.borderWidth != 0.0) obj["borderWidth"] = t.borderWidth;
+    if (t.borderColor != QColor(Qt::white)) obj["borderColor"] = t.borderColor.name();
     return obj;
 }
 
@@ -2136,6 +2251,10 @@ Transition ProjectFile::transitionFromJson(const QJsonObject &obj)
     // every transition advanced its progress with no curve applied.
     t.easing = static_cast<TransitionEasing>(
         obj["easing"].toInt(static_cast<int>(TransitionEasing::Linear)));
+    t.softness = qBound(0.0, obj["softness"].toDouble(0.0), 1.0);
+    t.borderWidth = qBound(0.0, obj["borderWidth"].toDouble(0.0), 50.0);
+    const QColor border(obj["borderColor"].toString(QStringLiteral("#ffffff")));
+    if (border.isValid()) t.borderColor = border;
     return t;
 }
 
@@ -2163,6 +2282,57 @@ QVector<QVector<ClipInfo>> ProjectFile::tracksFromJson(const QJsonArray &arr)
         tracks.append(clips);
     }
     return tracks;
+}
+
+QJsonObject ProjectFile::trackFlagsToJson(const ProjectData &data)
+{
+    QJsonObject source = data.trackFlags;
+    if (source.isEmpty())
+        source = data.videoTracks.trackFlagsSnapshot;
+    if (source.isEmpty())
+        source = data.audioTracks.trackFlagsSnapshot;
+
+    auto normalizedArray = [](const QJsonArray &flags, int trackCount) {
+        QJsonArray result;
+        for (int index = 0; index < trackCount; ++index) {
+            const QJsonObject candidate = index < flags.size()
+                ? flags.at(index).toObject() : QJsonObject{};
+            QJsonObject item;
+            const bool locked = candidate.value(QStringLiteral("locked")).toBool(false);
+            const bool muted = candidate.value(QStringLiteral("muted")).toBool(false);
+            const bool solo = candidate.value(QStringLiteral("solo")).toBool(false);
+            const bool hidden = candidate.value(QStringLiteral("hidden")).toBool(false);
+            if (locked || muted || solo || hidden) {
+                item.insert(QStringLiteral("locked"), locked);
+                item.insert(QStringLiteral("muted"), muted);
+                item.insert(QStringLiteral("solo"), solo);
+                item.insert(QStringLiteral("hidden"), hidden);
+            }
+            // Keep one array entry per track even when every flag is false.
+            result.append(item);
+        }
+        return result;
+    };
+
+    return QJsonObject{
+        {QStringLiteral("video"),
+         normalizedArray(source.value(QStringLiteral("video")).toArray(),
+                         data.videoTracks.size())},
+        {QStringLiteral("audio"),
+         normalizedArray(source.value(QStringLiteral("audio")).toArray(),
+                         data.audioTracks.size())}
+    };
+}
+
+void ProjectFile::trackFlagsFromJson(const QJsonObject &obj, ProjectData &data)
+{
+    ProjectData normalizedSource;
+    normalizedSource.videoTracks.resize(data.videoTracks.size());
+    normalizedSource.audioTracks.resize(data.audioTracks.size());
+    normalizedSource.trackFlags = obj;
+    data.trackFlags = trackFlagsToJson(normalizedSource);
+    data.videoTracks.trackFlagsSnapshot = data.trackFlags;
+    data.audioTracks.trackFlagsSnapshot = data.trackFlags;
 }
 
 // --- Audio Mixer: Track EQ ---

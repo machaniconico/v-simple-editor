@@ -26,6 +26,7 @@
 #include "ExposureAids.h"  // EXP-AID: 露出/フォーカス確認エイド (プレビュー表示専用)
 #include "SafeZone.h"      // SAFE-ZONE: SNS セーフゾーンオーバーレイ (プレビュー表示専用)
 #include "OnionSkin.h"     // ONION-SKIN: 前後フレーム半透明オーバーレイ (プレビュー表示専用)
+#include "StillCompare.h"  // STILLS-WIPE: 保存スチル比較 (プレビュー表示専用)
 #include "playback/CompositeFrameCache.h"     // ADAPTIVE-1: 合成フレーム LRU キャッシュ
 #include "playback/PlaybackQualityPolicy.h"   // ADAPTIVE-1: 再生品質ヒステリシスポリシー
 #include "playback/GpuLayerCompositor.h"      // STAGE3-GPU: マルチトラック GPU 合成 (既定 OFF)
@@ -69,8 +70,52 @@ inline uint qHash(const TrackKey &k, uint seed = 0) noexcept
          ^ qHash(k.sourceClipIndex, seed + 0x85ebca6bu);
 }
 
+struct ReversePlaybackKey {
+    TrackKey trackKey;
+    qint64 timelineStartUs = 0;
+    bool operator==(const ReversePlaybackKey &other) const noexcept
+    {
+        return trackKey == other.trackKey
+            && timelineStartUs == other.timelineStartUs;
+    }
+};
+
+inline uint qHash(const ReversePlaybackKey &k, uint seed = 0) noexcept
+{
+    return qHash(k.trackKey, seed)
+         ^ qHash(k.timelineStartUs, seed + 0x27d4eb2du);
+}
+
+class Timeline;
 class GLPreview;
 class QResizeEvent;
+struct ClipInfo;
+
+namespace videopreview {
+// The GL preview implements only a small effect subset. If an enabled stack
+// contains anything outside that subset (or a timed effect), the complete
+// ordered stack must run on the clip before mask/transform/composition.
+bool stackRequiresClipLocalCpu(const QVector<VideoEffect> &effects,
+                               bool gpuAvailable = true);
+// Canvas-level transient preview may only apply stacks that are NOT defined to
+// run clip-locally. During sequence playback a clip-local stack is either
+// already baked per clip (clipFxHandledPerClip) or belongs to a clip that is
+// not visible at the current time, so applying it to the composited canvas
+// would leak FX onto sibling tracks. Single-file playback keeps the legacy
+// canvas semantics.
+bool shouldApplyCanvasPreviewStack(const QVector<VideoEffect> &evaluated,
+                                   bool gpuAvailable,
+                                   bool clipFxHandledPerClip,
+                                   bool sequencePlayback);
+// Pure clip-local preview seam used before layer transform/composition. It is
+// public so headless parity tests can exercise the production VideoPlayer
+// ordering without constructing QWidget/QApplication state.
+QImage prepareEchoClipForComposite(
+    const QImage &source, const ClipInfo &clip, double clipLocalSeconds,
+    double sourceSeconds,
+    const std::function<QImage(double, double)> &frameProvider,
+    const QVector<Mask> &masks);
+}
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -100,7 +145,8 @@ public:
     // non-empty, seek/playback are interpreted in timeline-space and files are
     // switched automatically at clip boundaries. Empty argument falls back to
     // single-file mode (current loaded file is left intact).
-    void setSequence(const QVector<PlaybackEntry> &entries);
+    void setSequence(const QVector<PlaybackEntry> &entries,
+                     const QVector<bool> &reversedFlags = {});
     // Parallel speed-ramp array for the video sequence. Must be called
     // after setSequence with the same index alignment. Identity ramps are
     // the default so callers may omit this call for non-ramped sequences.
@@ -109,7 +155,8 @@ public:
     // FFmpeg decoder pool + ring buffers and mixes every active entry into
     // a single QAudioSink output, so unlinked J-cut/L-cut clips and stacked
     // A2/A3/... tracks all sound simultaneously.
-    void setAudioSequence(const QVector<PlaybackEntry> &entries);
+    void setAudioSequence(const QVector<PlaybackEntry> &entries,
+                          const QVector<bool> &reversedFlags = {});
     AudioMixer *audioMixer() { return m_mixer; }
     void setMuted(bool muted);
     bool isMuted() const { return m_muted; }
@@ -134,6 +181,17 @@ public:
     void setExposureAidConfig(const exposureaid::AidConfig &cfg);
     void setSafeZonePlatform(safezone::Platform p);  // SAFE-ZONE
     void setOnionSkinConfig(const onionskin::Config &cfg);
+    void setStillCompare(const stillcompare::Config &cfg);
+    QImage applyStillCompareForDisplay(const QImage &image,
+                                       qint64 displayTimelineUsec,
+                                       bool externalPreview = false);
+    void setPreviewEffectsPack(float sharpen, float blur, float lens);
+    void setPreviewGlow(bool enabled, float threshold, float radius, float intensity);
+    void setPreviewBloom(bool enabled, float threshold, float intensity, float spread);
+    void setPreviewChromaticAberration(bool enabled, float amount, float radialFalloff);
+    void setPreviewLightWrap(bool enabled, float amount, float radius);
+    void setPreviewRotation3D(float xDeg, float yDeg, float zDeg,
+                              float perspectiveDist);
     onionskin::Config onionSkinConfig() const { return m_onionSkin; }
     // PV-C: プレビュー表示の長辺上限(px)。0=無制限。display専用(書き出し非変更)。
     void setPreviewMaxLongSide(int px);
@@ -254,6 +312,18 @@ public:
         const QVector<double> &overlayDy,
         const QVector<double> &overlayRotationDeg = {},
         const QVector<LayerStyle> &overlayStyle = {}) const;
+    // Headless two-track seam for CPU-only FX routing. This executes the same
+    // stack-routing and clip-local preparation helpers as live VideoPlayer,
+    // but needs no QWidget/QApplication and is therefore safe for selftests.
+    static QImage composeCpuPreviewForTest(
+        const QImage &v1Source, const ClipInfo &v1Clip,
+        const std::function<QImage(double, double)> &v1FrameProvider,
+        const QImage &v2Source, const ClipInfo &v2Clip,
+        const std::function<QImage(double, double)> &v2FrameProvider,
+        double clipLocalSeconds, double sourceSeconds, QSize canvasSize);
+    static QImage displayFrameForTest(const QImage &composed,
+        const QImage &neighbourLayer, const QVector<PlaybackEntry> &sequence,
+        int activeEntry, qint64 timelineUsec, bool transitionsAlreadyApplied = false);
     // Test-only seam for grade-keyframe GPU-preview wiring.
     bool pushActiveClipColorCorrectionToGlPreviewForTest(qint64 timelineUsec);
 
@@ -326,6 +396,7 @@ private:
     double effectiveDisplayAspectRatio() const;
     double streamDisplayAspectRatio() const;
     void refreshDisplayedFrame();
+    bool refreshPreviewClipCpuComposite();
     void setupUI();
     void resetDecoder();
     void scheduleNextFrame();
@@ -359,8 +430,10 @@ private:
     // `overlaysAlreadyBaked` is used only by the nested-sequence SSOT path:
     // tlrender::renderFrameAt has already applied the parent timeline's text,
     // so composing m_textOverlays again would darken/double every caption.
-    void displayFrame(const QImage &image, bool overlaysAlreadyBaked = false);
-    void displaySeekFrameConformed(const QImage &v1Image);
+    void displayFrame(const QImage &image, bool overlaysAlreadyBaked,
+                      qint64 displayTimelineUsec);
+    void displaySeekFrameConformed(const QImage &v1Image,
+                                   qint64 displayTimelineUsec);
 
     // Sequence helpers (Phase A/B). When m_sequence is empty, the player runs
     // in single-file legacy mode and these are unused.
@@ -375,6 +448,8 @@ private:
     QVector<int> findActiveEntriesAt(int64_t timelineUs) const;
     int64_t entryLocalPositionUs(int entryIdx, int64_t timelineUs) const;
     int64_t fileLocalToTimelineUs(int entryIdx, int64_t fileLocalUs) const;
+    bool displayNestedSequenceFrameAt(const Timeline *timeline,
+                                      int64_t timelineUs);
     bool seekToTimelineUs(int64_t timelineUs, bool precise);
     bool advanceToEntry(int newEntryIdx);
     // Phase 1e Win #16 (Iteration 9) — Premiere Pro-style decoder hot-swap.
@@ -506,7 +581,8 @@ private:
     // the per-decoder TrackDecoder state — no pool / sequence / Qt object
     // access — so it is safe to invoke from a QtConcurrent worker thread.
     bool runOverlayDecodeForDecoder(TrackDecoder *d, qint64 expectedFileLocalUs,
-                                    qint64 clipInUs, qint64 clipOutUs);
+                                    qint64 clipInUs, qint64 clipOutUs,
+                                    bool reverseSourceOrder);
     // Main-thread post-processing: builds DecodedLayer fields from the
     // decoder's lastFrameRgb, falling back to the eviction grace pool when
     // the decoder produced nothing.
@@ -635,6 +711,12 @@ private:
     // the existing decoder loop is untouched); m_timelinePositionUs tracks the
     // resolved timeline position when sequence mode is active.
     QVector<PlaybackEntry> m_sequence;
+    QImage m_transitionNeighbourForTest;
+    // Last reverse state per resolved playback entry. PlaybackEntry itself
+    // intentionally stays unchanged, so this side table lets setSequence()
+    // detect a reverse toggle and refresh a paused preview at the same
+    // playhead instead of treating the update as structurally identical.
+    QHash<ReversePlaybackKey, bool> m_reverseStates;
     int m_activeEntry = -1;
     // Phase 1e Win #16 (Iteration 9) — boundary preroll de-dup. Set to the
     // sequence index of the entry we last asked acquireDecoderForClip to
@@ -690,8 +772,14 @@ private:
     // on top of every composed frame while the dialog is open; empty in the
     // default/committed state.
     QVector<VideoEffect> m_previewEffects;
+    // Original ordered stack before GPU/CPU partitioning. If any enabled
+    // GPU-unsupported FX forces clip-local CPU preview, this stack preserves
+    // GPU-capable effects and their order instead of splitting/reordering it.
+    QVector<VideoEffect> m_fullPreviewEffects;
+    QVector<VideoEffect> m_gpuPreviewEffects;
     bool m_previewEffectsLive = false;
     bool m_gpuEffectsEnabled = true;
+    bool m_clipCpuDisabledGlGrade = false;
     // Preview proxy divisor (1=Full, 2=1/2, 4=1/4, 8=1/8). Applied only when
     // CPU-path effects are active during playback, so heavy Sharpen/Mosaic/
     // ChromaKey stay smooth. Persisted via QSettings "proxyDivisor".
@@ -706,6 +794,8 @@ private:
     // 既存のプレビュー出力とビット同一 (回帰ゼロ)。
     aces::AcesPipeline m_acesPipeline;
     bool m_lastFrameOdtApplied{false};
+    // Consumed by displayFrame: renderFrameAt already applied transitions.
+    bool m_lastFrameTransitionsApplied{false};
 
     // EXP-AID: 露出/フォーカス確認エイド。既定 None なので displayFrame は apply を
     // 一切呼ばず従来出力とビット同一 (性能無影響・回帰ゼロ)。None 以外のときだけ
@@ -714,6 +804,33 @@ private:
     exposureaid::AidMode m_exposureAidMode = exposureaid::AidMode::None;
     safezone::Platform m_safeZonePlatform = safezone::Platform::None;  // SAFE-ZONE
     onionskin::Config m_onionSkin;  // ONION-SKIN: display-only、既定 OFF。
+    stillcompare::Config m_stillCompare;  // STILLS-WIPE: display-only、既定 OFF。
+    const Timeline *m_stillCompareGlTimeline = nullptr;
+    bool m_stillCompareGlBypassActive = false;
+    // Keep the mode required by the normal preview path while comparison
+    // forces GL into baked mode for the display-only composite.
+    bool m_stillCompareNormalCompositeBakedMode = false;
+    float m_previewSharpen = 0.0f;
+    float m_previewBlur = 0.0f;
+    float m_previewLens = 0.0f;
+    bool m_previewGlowEnabled = false;
+    float m_previewGlowThreshold = 0.8f;
+    float m_previewGlowRadius = 0.0f;
+    float m_previewGlowIntensity = 0.0f;
+    bool m_previewBloomEnabled = false;
+    float m_previewBloomThreshold = 0.8f;
+    float m_previewBloomIntensity = 0.0f;
+    float m_previewBloomSpread = 0.0f;
+    bool m_previewChromAbEnabled = false;
+    float m_previewChromAbAmount = 0.0f;
+    float m_previewChromAbFalloff = 2.0f;
+    bool m_previewLightWrapEnabled = false;
+    float m_previewLightWrapAmount = 0.0f;
+    float m_previewLightWrapRadius = 0.0f;
+    float m_previewRot3DX = 0.0f;
+    float m_previewRot3DY = 0.0f;
+    float m_previewRot3DZ = 0.0f;
+    float m_previewPerspectiveDist = 2.0f;
     int m_previewMaxLongSide = 0;  // PV-C: 0=無制限。display専用の長辺上限。
     exposureaid::AidConfig m_exposureAidConfig;
 
@@ -805,6 +922,31 @@ private:
     // unmodified when the overlay list is empty.
     QImage composeFrameWithOverlays(const QImage &source,
                                     bool textAlreadyBaked = false) const;
+    const Timeline *previewTimeline() const;
+    qint64 resolvedDisplayTimelineUsec(qint64 requestedUsec) const;
+    bool stillCompareActive() const;
+    QImage stillCompareDisplaySource(const QImage &fallback,
+                                     qint64 displayTimelineUsec) const;
+    QImage compositeStillCompare(const QImage &display) const;
+    void setCompositeBakedModeForDisplay(bool baked);
+    void beginStillCompareGlBypass();
+    void applyStillCompareGlBypass();
+    void restoreStillCompareGlState();
+    void restorePreviewPostEffects();
+    bool updateGlEffectsForBakedDisplay(qint64 timelineUsec);
+    int previewEffectTargetEntryIndex(const Timeline *timeline) const;
+    bool activePreviewClipCpuStack(qint64 timelineUsec,
+                                   int *targetEntryIndex = nullptr) const;
+    bool hasClipLocalCpuFxAt(qint64 timelineUsec) const;
+    // When any active stack requires CPU, every clip takes the CPU SSOT before
+    // its mask and transform. Effect-free frames keep the historical path.
+    QImage preparePreviewClipFrame(const QImage &source,
+                                   const PlaybackEntry &entry,
+                                   int entryIndex,
+                                   double sourceSeconds,
+                                   QSize sourceSize,
+                                   qint64 timelineUsec,
+                                   bool *clipFxApplied = nullptr) const;
 
     // VEDITOR_TICK_TRACE accumulators (Phase 1e Sprint US-1). Populated only
     // when tickTraceEnabled() is true; flushed and reset every 30 ticks.

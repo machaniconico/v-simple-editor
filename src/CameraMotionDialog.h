@@ -60,6 +60,8 @@ private:
     QDoubleSpinBox  *m_fov              = nullptr;
     QDoubleSpinBox  *m_roll             = nullptr;
 
+    QCheckBox       *m_trueProjection   = nullptr;
+
     // Keyframes group
     QGroupBox       *m_kfGroup          = nullptr;
     QTableWidget    *m_kfTable          = nullptr;

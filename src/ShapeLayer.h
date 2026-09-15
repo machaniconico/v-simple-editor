@@ -97,6 +97,28 @@ struct ShapeProperties {
     static ShapeProperties fromJson(const QJsonObject &obj);
 };
 
+// Per-shape modifiers; disabled defaults preserve legacy rendering/JSON.
+struct ShapeModifiers {
+    struct RepeaterConfig {
+        bool enabled = false;
+        int copies = 3;
+        QPointF offset = QPointF(40.0, 0.0);
+        double rotationDeg = 0.0;
+        double scale = 1.0;
+        double opacityEnd = 1.0;
+    } repeater;
+    struct TrimConfig {
+        bool enabled = false;
+        double startPct = 0.0;
+        double endPct = 100.0;
+        double offsetPct = 0.0;
+    } trim;
+
+    bool isDefault() const;
+    QJsonObject toJson() const;
+    static ShapeModifiers fromJson(const QJsonObject &obj);
+};
+
 // --- Shape ---
 
 struct Shape {
@@ -104,6 +126,7 @@ struct Shape {
     ShapeProperties properties;
     ShapeFill fill;
     ShapeStroke stroke;
+    ShapeModifiers modifiers;
 
     QPointF position = QPointF(0.0, 0.0);
     double rotation = 0.0;     // degrees
@@ -135,8 +158,17 @@ public:
     // Render all shapes onto a transparent QImage
     QImage renderShapes(const QSize &canvasSize) const;
 
+    // Shape-clip preview/export SSOT. Renders the supplied shapes onto a
+    // transparent canvas without requiring a mutable ShapeLayer instance.
+    static QImage renderShapesToImage(const QVector<Shape> &shapes,
+                                      const QSize &canvasSize);
+
     // Render a single shape using the given painter
     static void renderShape(const Shape &shape, QPainter &painter);
+
+    // Length-based, cyclic trim. Full ranges return the original path.
+    static QPainterPath trimPathRange(const QPainterPath &path, double startPct,
+                                      double endPct, double offsetPct);
 
     // Create a gradient brush from fill config
     static QBrush createGradientBrush(const ShapeFill &fill, const QRectF &boundingRect);

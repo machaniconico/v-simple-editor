@@ -84,6 +84,29 @@ static inline std::uint32_t glitchHash(int row, int seed)
     return x;
 }
 
+static inline std::uint32_t grainHash(std::uint32_t value)
+{
+    value ^= value >> 16;
+    value *= 0x7feb352du;
+    value ^= value >> 15;
+    value *= 0x846ca68bu;
+    value ^= value >> 16;
+    return value;
+}
+
+static std::uint32_t grainImageSeed(const QImage &image)
+{
+    std::uint32_t hash = 2166136261u;
+    hash = (hash ^ static_cast<std::uint32_t>(image.width())) * 16777619u;
+    hash = (hash ^ static_cast<std::uint32_t>(image.height())) * 16777619u;
+    for (int y = 0; y < image.height(); ++y) {
+        const QRgb *line = reinterpret_cast<const QRgb *>(image.constScanLine(y));
+        for (int x = 0; x < image.width(); ++x)
+            hash = (hash ^ static_cast<std::uint32_t>(line[x])) * 16777619u;
+    }
+    return grainHash(hash);
+}
+
 static inline void addPremultipliedArgbSample(const QImage &img, int x, int y,
                                               double &rSum, double &gSum,
                                               double &bSum, double &aSum)
@@ -443,6 +466,10 @@ QString VideoEffect::typeName(VideoEffectType t)
     case VideoEffectType::PolarCoordinates: return "極座標";
     case VideoEffectType::MotionTile: return "モーションタイル";
     case VideoEffectType::CornerPinSimple: return "コーナーピン(簡易)";
+    case VideoEffectType::FilmGrain: return "フィルムグレイン";
+    case VideoEffectType::RollingShutterRepair: return "ローリングシャッター補正";
+    case VideoEffectType::Echo: return "エコー(残像)";
+    case VideoEffectType::LensDistortion: return "レンズ歪み補正";
     }
     return "Unknown";
 }
@@ -470,7 +497,9 @@ QVector<VideoEffectType> VideoEffect::allTypes()
              VideoEffectType::BrightnessContrast, VideoEffectType::Bulge,
              VideoEffectType::Twirl, VideoEffectType::Mirror,
              VideoEffectType::PolarCoordinates, VideoEffectType::MotionTile,
-             VideoEffectType::CornerPinSimple };
+             VideoEffectType::CornerPinSimple, VideoEffectType::FilmGrain,
+             VideoEffectType::Echo, VideoEffectType::LensDistortion,
+             VideoEffectType::RollingShutterRepair };
 }
 
 VideoEffect VideoEffect::createBlur(double r)
@@ -565,6 +594,33 @@ VideoEffect VideoEffect::createMotionTile(int x, int y, bool m)
     { VideoEffect e; e.type = VideoEffectType::MotionTile; e.param1 = static_cast<double>(x); e.param2 = static_cast<double>(y); e.param3 = m ? 1.0 : 0.0; return e; }
 VideoEffect VideoEffect::createCornerPinSimple(double h, double v)
     { VideoEffect e; e.type = VideoEffectType::CornerPinSimple; e.param1 = h; e.param2 = v; return e; }
+VideoEffect VideoEffect::createFilmGrain(double a, int s, double c, bool perFrame)
+    { VideoEffect e; e.type = VideoEffectType::FilmGrain; e.param1 = a; e.param2 = static_cast<double>(s); e.param3 = c; e.keyColor = QColor(perFrame ? 1 : 0, 0, 0); return e; }
+VideoEffect VideoEffect::createLensDistortion(double k1, double k2, double scale,
+                                               double centerX, double centerY)
+{
+    VideoEffect e;
+    e.type = VideoEffectType::LensDistortion;
+    effectctrl::setParamValue(e, QStringLiteral("k1"), k1);
+    effectctrl::setParamValue(e, QStringLiteral("k2"), k2);
+    effectctrl::setParamValue(e, QStringLiteral("scale"), scale);
+    effectctrl::setParamValue(e, QStringLiteral("centerX"), centerX);
+    effectctrl::setParamValue(e, QStringLiteral("centerY"), centerY);
+    return e;
+}
+
+VideoEffect VideoEffect::createRollingShutterRepair(double rate, int direction, double strength)
+{
+    VideoEffect e;
+    e.type = VideoEffectType::RollingShutterRepair;
+    e.param1 = qBound(0.0, rate, 1.0);
+    e.param2 = qBound(0, direction, 1);
+    e.param3 = qBound(0.0, strength, 1.0);
+    return e;
+}
+
+VideoEffect VideoEffect::createEcho(double delay, int count, double decay, int blend)
+    { VideoEffect e; e.type = VideoEffectType::Echo; e.param1 = delay; e.param2 = static_cast<double>(count); e.param3 = decay; e.keyColor = QColor(qBound(0, blend, 3), 0, 0); return e; }
 
 // ===== EffectParamSchema helper accessors =====
 
@@ -601,6 +657,14 @@ static QColor defaultColorForParam(const VideoEffect &effect, const QString &par
 
 double paramValue(const VideoEffect &effect, const QString &paramName)
 {
+    if (effect.type == VideoEffectType::LensDistortion) {
+        if (paramName == "k1") return effect.param1;
+        if (paramName == "k2") return effect.param2;
+        if (paramName == "scale") return effect.param3;
+        const unsigned packed = effect.keyColor.rgb() & 0xffffffu;
+        if (paramName == "centerX") return (int(packed >> 12) - 2000) / 4000.0;
+        if (paramName == "centerY") return (int(packed & 4095u) - 2000) / 4000.0;
+    }
     auto schema = paramSchemaFor(effect.type);
     for (const auto &def : schema) {
         if (def.name == paramName) {
@@ -765,6 +829,28 @@ double paramValue(const VideoEffect &effect, const QString &paramName)
                 return effect.param1;
             if (paramName == "verticalTilt" && effect.type == VideoEffectType::CornerPinSimple)
                 return effect.param2;
+            if (paramName == "amount" && effect.type == VideoEffectType::FilmGrain)
+                return effect.param1;
+            if (paramName == "size" && effect.type == VideoEffectType::FilmGrain)
+                return effect.param2;
+            if (paramName == "colorAmount" && effect.type == VideoEffectType::FilmGrain)
+                return effect.param3;
+            if (paramName == "seedPerFrame" && effect.type == VideoEffectType::FilmGrain)
+                return effect.keyColor.red() != 0 ? 1.0 : 0.0;
+            if (paramName == "rate" && effect.type == VideoEffectType::RollingShutterRepair)
+                return effect.param1;
+            if (paramName == "direction" && effect.type == VideoEffectType::RollingShutterRepair)
+                return effect.param2;
+            if (paramName == "strength" && effect.type == VideoEffectType::RollingShutterRepair)
+                return effect.param3;
+            if (paramName == "delaySec" && effect.type == VideoEffectType::Echo)
+                return effect.param1;
+            if (paramName == "count" && effect.type == VideoEffectType::Echo)
+                return effect.param2;
+            if (paramName == "decay" && effect.type == VideoEffectType::Echo)
+                return effect.param3;
+            if (paramName == "blend" && effect.type == VideoEffectType::Echo)
+                return static_cast<double>(qBound(0, effect.keyColor.red(), 3));
             return def.defaultVal;
         }
     }
@@ -773,6 +859,22 @@ double paramValue(const VideoEffect &effect, const QString &paramName)
 
 void setParamValue(VideoEffect &effect, const QString &paramName, double value)
 {
+    if (effect.type == VideoEffectType::LensDistortion) {
+        if (!std::isfinite(value)) value = paramName == "scale" ? 1.0 : 0.0;
+        if (paramName == "k1") { effect.param1 = qBound(-0.5, value, 0.5); return; }
+        if (paramName == "k2") { effect.param2 = qBound(-0.5, value, 0.5); return; }
+        if (paramName == "scale") { effect.param3 = qBound(0.5, value, 2.0); return; }
+        if (paramName == "centerX" || paramName == "centerY") {
+            const unsigned encoded = static_cast<unsigned>(
+                std::lround(qBound(-0.5, value, 0.5) * 4000.0) + 2000);
+            unsigned packed = effect.keyColor.rgb() & 0xffffffu;
+            packed = paramName == "centerX"
+                ? (packed & 4095u) | (encoded << 12)
+                : (packed & 0xfff000u) | encoded;
+            effect.keyColor = QColor::fromRgb(0xff000000u | packed);
+            return;
+        }
+    }
     auto schema = paramSchemaFor(effect.type);
     for (const auto &def : schema) {
         if (def.name == paramName) {
@@ -1020,6 +1122,45 @@ void setParamValue(VideoEffect &effect, const QString &paramName, double value)
             if (paramName == "verticalTilt" && effect.type == VideoEffectType::CornerPinSimple) {
                 effect.param2 = value; return;
             }
+            if (paramName == "amount" && effect.type == VideoEffectType::FilmGrain) {
+                effect.param1 = value; return;
+            }
+            if (paramName == "size" && effect.type == VideoEffectType::FilmGrain) {
+                effect.param2 = value; return;
+            }
+            if (paramName == "colorAmount" && effect.type == VideoEffectType::FilmGrain) {
+                effect.param3 = value; return;
+            }
+            if (paramName == "seedPerFrame" && effect.type == VideoEffectType::FilmGrain) {
+                QColor storage = effect.keyColor.isValid() ? effect.keyColor : QColor(0, 0, 0);
+                storage.setRed(value >= 0.5 ? 1 : 0);
+                effect.keyColor = storage;
+                return;
+            }
+            if (paramName == "rate" && effect.type == VideoEffectType::RollingShutterRepair) {
+                effect.param1 = value; return;
+            }
+            if (paramName == "direction" && effect.type == VideoEffectType::RollingShutterRepair) {
+                effect.param2 = value; return;
+            }
+            if (paramName == "strength" && effect.type == VideoEffectType::RollingShutterRepair) {
+                effect.param3 = value; return;
+            }
+            if (paramName == "delaySec" && effect.type == VideoEffectType::Echo) {
+                effect.param1 = value; return;
+            }
+            if (paramName == "count" && effect.type == VideoEffectType::Echo) {
+                effect.param2 = value; return;
+            }
+            if (paramName == "decay" && effect.type == VideoEffectType::Echo) {
+                effect.param3 = value; return;
+            }
+            if (paramName == "blend" && effect.type == VideoEffectType::Echo) {
+                QColor storage = effect.keyColor.isValid() ? effect.keyColor : QColor(0, 0, 0);
+                storage.setRed(qBound(0, static_cast<int>(std::round(value)), 3));
+                effect.keyColor = storage;
+                return;
+            }
             return;
         }
     }
@@ -1060,6 +1201,59 @@ void setColorParam(VideoEffect &effect, const QString &paramName, QColor color)
 
 } // namespace effectctrl
 
+namespace colorwarper {
+namespace {
+thread_local bool disabledForTest = false;
+thread_local int callsForTest = 0;
+}
+void setDisabledForTest(bool disabled) { disabledForTest = disabled; }
+void resetCallCountForTest() { callsForTest = 0; }
+int callCountForTest() { return callsForTest; }
+void apply(float &r, float &g, float &b, const HueSatWarp &warp)
+{
+    const float mx = std::max(r, std::max(g, b));
+    const float mn = std::min(r, std::min(g, b));
+    const float dl = mx - mn;
+    const float v = mx;
+    const float s = mx > 0.0f ? dl / mx : 0.0f;
+    float h = dl <= 1e-6f ? 0.0f : (mx == r ? 60.0f * ((g-b)/dl)
+        : mx == g ? 60.0f * ((b-r)/dl) + 120.0f : 60.0f * ((r-g)/dl) + 240.0f);
+    if (h < 0.0f) h += 360.0f;
+    // Achromatic pixels have undefined hue, but s'=0: leave them unchanged.
+    if (s == 0.0f) return;
+    const float hi = h / 30.0f;
+    const int h0 = static_cast<int>(std::floor(hi)) % 12;
+    const int h1 = (h0 + 1) % 12;
+    const float fh = hi - std::floor(hi);
+    const float ri = std::clamp(s, 0.0f, 1.0f) * 2.0f;
+    const int r0 = std::clamp(static_cast<int>(std::floor(ri)), 0, 1);
+    const int r1 = r0 + 1;
+    const float fr = ri - static_cast<float>(r0);
+    auto interpolate = [&](const float (&nodes)[3][12]) {
+        const float a = nodes[r0][h0] * (1.0f-fh) + nodes[r0][h1] * fh;
+        const float b = nodes[r1][h0] * (1.0f-fh) + nodes[r1][h1] * fh;
+        return a * (1.0f-fr) + b * fr;
+    };
+    const float shift = interpolate(warp.hueShiftDeg);
+    const float scale = interpolate(warp.satScale);
+    if (shift == 0.0f && scale == 1.0f) return;
+    h = std::fmod(h + shift + 360.0f, 360.0f);
+    const float sat = std::clamp(s * scale, 0.0f, 1.0f);
+    const float c = v * sat;
+    const float x = c * (1.0f - std::abs(std::fmod(h / 60.0f, 2.0f) - 1.0f));
+    const float m = v - c;
+    switch (static_cast<int>(std::floor(h / 60.0f))) {
+    case 0: r=c; g=x; b=0; break;
+    case 1: r=x; g=c; b=0; break;
+    case 2: r=0; g=c; b=x; break;
+    case 3: r=0; g=x; b=c; break;
+    case 4: r=x; g=0; b=c; break;
+    default: r=c; g=0; b=x; break;
+    }
+    r += m; g += m; b += m;
+}
+} // namespace colorwarper
+
 // ===== Color Correction Processing =====
 
 QImage VideoEffectProcessor::applyColorCorrection(const QImage &input, const ColorCorrection &cc)
@@ -1067,26 +1261,36 @@ QImage VideoEffectProcessor::applyColorCorrection(const QImage &input, const Col
     if (cc.isDefault()) return input;
     QImage img = input.convertToFormat(QImage::Format_RGB888);
 
+    const bool hasWarp = !colorwarper::disabledForTest && !cc.hueSatWarp.isDefault();
+    const bool hasLog = cc.logShadowR != 0.0 || cc.logShadowG != 0.0 || cc.logShadowB != 0.0
+                     || cc.logMidR != 0.0 || cc.logMidG != 0.0 || cc.logMidB != 0.0
+                     || cc.logHighR != 0.0 || cc.logHighG != 0.0 || cc.logHighB != 0.0;
+
     if (cc.exposure != 0.0)
         adjustExposure(img, cc.exposure);
     if (cc.brightness != 0.0 || cc.contrast != 0.0)
         adjustBrightnessContrast(img, cc.brightness, cc.contrast);
     if (cc.highlights != 0.0 || cc.shadows != 0.0)
         adjustHighlightsShadows(img, cc.highlights, cc.shadows);
-    if (cc.saturation != 0.0)
+    if (!hasLog && !hasWarp && cc.saturation != 0.0)
         adjustSaturation(img, cc.saturation);
     if (cc.hue != 0.0)
         adjustHue(img, cc.hue);
-    if (cc.temperature != 0.0 || cc.tint != 0.0)
+    if (!hasLog && !hasWarp && (cc.temperature != 0.0 || cc.tint != 0.0))
         adjustTemperatureTint(img, cc.temperature, cc.tint);
     if (cc.gamma != 1.0)
         adjustGamma(img, cc.gamma);
 
-    // Lift/Gamma/Gain (DaVinci Resolve style) — must match GLSL applyLiftGammaGain()
-    bool hasLGG = cc.liftR != 0.0 || cc.liftG != 0.0 || cc.liftB != 0.0
-               || cc.gammaR != 0.0 || cc.gammaG != 0.0 || cc.gammaB != 0.0
-               || cc.gainR != 0.0 || cc.gainG != 0.0 || cc.gainB != 0.0;
-    if (hasLGG) {
+    // Lift/Gamma/Gain followed by Log range wheels — must match GLSL
+    // applyLiftGammaGain() and applyLogWheels().
+    const bool hasLGG = cc.liftR != 0.0 || cc.liftG != 0.0 || cc.liftB != 0.0
+                     || cc.gammaR != 0.0 || cc.gammaG != 0.0 || cc.gammaB != 0.0
+                     || cc.gainR != 0.0 || cc.gainG != 0.0 || cc.gainB != 0.0;
+    if (hasLGG || hasLog) {
+        auto smoothstep = [](double edge0, double edge1, double value) {
+            const double t = qBound(0.0, (value - edge0) / (edge1 - edge0), 1.0);
+            return t * t * (3.0 - 2.0 * t);
+        };
         const int w = img.width(), h = img.height();
         for (int y = 0; y < h; ++y) {
             uint8_t *line = img.scanLine(y);
@@ -1095,25 +1299,40 @@ QImage VideoEffectProcessor::applyColorCorrection(const QImage &input, const Col
                 double g = line[x * 3 + 1] / 255.0;
                 double b = line[x * 3 + 2] / 255.0;
 
-                // Stage 1 — Lift: additive offset (matches GLSL: color + uLift where uLift = liftR*0.5)
-                r += cc.liftR * 0.5;
-                g += cc.liftG * 0.5;
-                b += cc.liftB * 0.5;
+                if (hasLGG) {
+                    // Stage 1 — Lift: additive offset (matches GLSL: color + uLift where uLift = liftR*0.5)
+                    r += cc.liftR * 0.5;
+                    g += cc.liftG * 0.5;
+                    b += cc.liftB * 0.5;
 
-                // Stage 2 — Gamma: power curve; internalGamma = pow(2, gammaR) — matches GPU contract
-                // cc.gammaR in [-1,1], neutral=0 → internalGamma=1 → identity pow(in,1)
-                double igR = std::max(std::pow(2.0, cc.gammaR), 1e-3);
-                double igG = std::max(std::pow(2.0, cc.gammaG), 1e-3);
-                double igB = std::max(std::pow(2.0, cc.gammaB), 1e-3);
-                r = std::pow(std::max(r, 0.0), 1.0 / igR);
-                g = std::pow(std::max(g, 0.0), 1.0 / igG);
-                b = std::pow(std::max(b, 0.0), 1.0 / igB);
+                    // Stage 2 — Gamma: power curve; internalGamma = pow(2, gammaR) — matches GPU contract
+                    // cc.gammaR in [-1,1], neutral=0 → internalGamma=1 → identity pow(in,1)
+                    double igR = std::max(std::pow(2.0, cc.gammaR), 1e-3);
+                    double igG = std::max(std::pow(2.0, cc.gammaG), 1e-3);
+                    double igB = std::max(std::pow(2.0, cc.gammaB), 1e-3);
+                    r = std::pow(std::max(r, 0.0), 1.0 / igR);
+                    g = std::pow(std::max(g, 0.0), 1.0 / igG);
+                    b = std::pow(std::max(b, 0.0), 1.0 / igB);
 
-                // Stage 3 — Gain: multiplicative scaling; matches GPU pow(2, gainR*2)
-                // cc.gainR in [-1,1], neutral=0 → factor=1 → identity
-                r *= std::pow(2.0, cc.gainR * 2.0);
-                g *= std::pow(2.0, cc.gainG * 2.0);
-                b *= std::pow(2.0, cc.gainB * 2.0);
+                    // Stage 3 — Gain: multiplicative scaling; matches GPU pow(2, gainR*2)
+                    // cc.gainR in [-1,1], neutral=0 → factor=1 → identity
+                    r *= std::pow(2.0, cc.gainR * 2.0);
+                    g *= std::pow(2.0, cc.gainG * 2.0);
+                    b *= std::pow(2.0, cc.gainB * 2.0);
+                }
+
+                if (hasLog) {
+                    r = qBound(0.0, r, 1.0);
+                    g = qBound(0.0, g, 1.0);
+                    b = qBound(0.0, b, 1.0);
+                    const double luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+                    const double wS = 1.0 - smoothstep(0.15, 0.45, luminance);
+                    const double wH = smoothstep(0.55, 0.85, luminance);
+                    const double wM = qBound(0.0, 1.0 - wS - wH, 1.0);
+                    r += 0.5 * (wS * cc.logShadowR + wM * cc.logMidR + wH * cc.logHighR);
+                    g += 0.5 * (wS * cc.logShadowG + wM * cc.logMidG + wH * cc.logHighG);
+                    b += 0.5 * (wS * cc.logShadowB + wM * cc.logMidB + wH * cc.logHighB);
+                }
 
                 line[x * 3 + 0] = static_cast<uint8_t>(qBound(0.0, r, 1.0) * 255.0);
                 line[x * 3 + 1] = static_cast<uint8_t>(qBound(0.0, g, 1.0) * 255.0);
@@ -1121,6 +1340,28 @@ QImage VideoEffectProcessor::applyColorCorrection(const QImage &input, const Col
             }
         }
     }
+
+    if (hasWarp) {
+        // Count branch entries, not pixels, to keep instrumentation inexpensive.
+        if (colorwarper::callsForTest < 2147483647) ++colorwarper::callsForTest;
+        for (int y = 0; y < img.height(); ++y) {
+            uchar *line = img.scanLine(y);
+            for (int x = 0; x < img.width(); ++x) {
+                float r = line[3*x] / 255.0f;
+                float g = line[3*x+1] / 255.0f;
+                float b = line[3*x+2] / 255.0f;
+                colorwarper::apply(r, g, b, cc.hueSatWarp);
+                line[3*x] = static_cast<uchar>(std::clamp(r, 0.0f, 1.0f) * 255.0f + 0.5f);
+                line[3*x+1] = static_cast<uchar>(std::clamp(g, 0.0f, 1.0f) * 255.0f + 0.5f);
+                line[3*x+2] = static_cast<uchar>(std::clamp(b, 0.0f, 1.0f) * 255.0f + 0.5f);
+            }
+        }
+    }
+
+    if ((hasLog || hasWarp) && cc.saturation != 0.0)
+        adjustSaturation(img, cc.saturation);
+    if ((hasLog || hasWarp) && (cc.temperature != 0.0 || cc.tint != 0.0))
+        adjustTemperatureTint(img, cc.temperature, cc.tint);
 
     return img;
 }
@@ -1431,6 +1672,15 @@ QImage VideoEffectProcessor::applyEffect(const QImage &input, const VideoEffect 
                                                              static_cast<int>(std::round(effect.param2)),
                                                              std::round(effect.param3) != 0.0);
     case VideoEffectType::CornerPinSimple: return applyCornerPinSimple(input, effect.param1, effect.param2);
+    case VideoEffectType::LensDistortion: return applyLensDistortion(input, effect);
+    case VideoEffectType::FilmGrain: return applyFilmGrain(
+        input, effect.param1, static_cast<int>(std::round(effect.param2)),
+        effect.param3, effect.keyColor.red() != 0);
+    case VideoEffectType::RollingShutterRepair: // CPU temporal SSOT in tlrender.
+    case VideoEffectType::Echo:
+        // Echo needs random-access source frames and is therefore composed by
+        // TimelineFrameRenderer. The single-frame CPU effect remains a no-op.
+        return input;
     default: return input;
     }
 }
@@ -3148,6 +3398,59 @@ QImage VideoEffectProcessor::applyMotionTile(const QImage &input, int tilesX, in
     return result;
 }
 
+QImage VideoEffectProcessor::applyFilmGrain(const QImage &input, double amount,
+                                            int size, double colorAmount,
+                                            bool seedPerFrame)
+{
+    const double strength = qBound(0.0, amount, 1.0);
+    if (input.isNull() || strength <= 0.0)
+        return input;
+
+    const int grainSize = qBound(1, size, 4);
+    const double chroma = qBound(0.0, colorAmount, 1.0);
+    QImage source = input.convertToFormat(QImage::Format_ARGB32);
+    QImage result = source.copy();
+
+    // applyEffect has no frame timestamp. When per-frame seeding is enabled,
+    // derive the seed from the decoded pixels so preview/export calls with the
+    // same source frame produce exactly the same grain without mutable state.
+    const std::uint32_t frameSeed = seedPerFrame
+        ? grainImageSeed(source)
+        : 0x6d2b79f5u;
+    const double amplitude = strength * 64.0;
+
+    auto signedNoise = [](std::uint32_t value) -> double {
+        const int centered = static_cast<int>(value & 0xffffu) - 32768;
+        return static_cast<double>(centered) / 32768.0;
+    };
+
+    for (int y = 0; y < result.height(); ++y) {
+        const QRgb *srcLine = reinterpret_cast<const QRgb *>(source.constScanLine(y));
+        QRgb *dstLine = reinterpret_cast<QRgb *>(result.scanLine(y));
+        const std::uint32_t cellY = static_cast<std::uint32_t>(y / grainSize);
+        for (int x = 0; x < result.width(); ++x) {
+            const std::uint32_t cellX = static_cast<std::uint32_t>(x / grainSize);
+            const std::uint32_t pixelSeed = grainHash(
+                frameSeed ^ (cellX * 0x9e3779b9u) ^ (cellY * 0x85ebca6bu));
+            const double lumaNoise = signedNoise(pixelSeed);
+            const double redNoise = signedNoise(grainHash(pixelSeed ^ 0xa511e9b3u));
+            const double greenNoise = signedNoise(grainHash(pixelSeed ^ 0x63d83595u));
+            const double blueNoise = signedNoise(grainHash(pixelSeed ^ 0xc2b2ae35u));
+            const double lumaWeight = 1.0 - chroma;
+            const QRgb pixel = srcLine[x];
+            const int r = clamp255d(qRed(pixel) + amplitude
+                                    * (lumaNoise * lumaWeight + redNoise * chroma));
+            const int g = clamp255d(qGreen(pixel) + amplitude
+                                    * (lumaNoise * lumaWeight + greenNoise * chroma));
+            const int b = clamp255d(qBlue(pixel) + amplitude
+                                    * (lumaNoise * lumaWeight + blueNoise * chroma));
+            dstLine[x] = qRgba(r, g, b, qAlpha(pixel));
+        }
+    }
+
+    return result;
+}
+
 QImage VideoEffectProcessor::applyCornerPinSimple(const QImage &input,
                                                   double horizontalTilt,
                                                   double verticalTilt)
@@ -3180,4 +3483,79 @@ QImage VideoEffectProcessor::applyCornerPinSimple(const QImage &input,
     }
 
     return result;
+}
+
+namespace {
+thread_local bool lensDistortionEnabled = true;
+thread_local int lensDistortionCalls = 0;
+}
+
+void VideoEffectProcessor::setLensDistortionEnabledForTesting(bool enabled)
+{
+    lensDistortionEnabled = enabled;
+}
+
+void VideoEffectProcessor::resetLensDistortionInvocationCount()
+{
+    lensDistortionCalls = 0;
+}
+
+int VideoEffectProcessor::lensDistortionInvocationCount()
+{
+    return lensDistortionCalls;
+}
+
+QImage VideoEffectProcessor::applyLensDistortion(const QImage &input,
+                                                 const VideoEffect &effect)
+{
+    auto parameter = [&](const char *name, double lo, double hi, double fallback) {
+        const double v = effectctrl::paramValue(effect, QString::fromLatin1(name));
+        return std::isfinite(v) ? qBound(lo, v, hi) : fallback;
+    };
+    const double k1 = parameter("k1", -0.5, 0.5, 0.0);
+    const double k2 = parameter("k2", -0.5, 0.5, 0.0);
+    const double scale = parameter("scale", 0.5, 2.0, 1.0);
+    const double centerX = parameter("centerX", -0.5, 0.5, 0.0);
+    const double centerY = parameter("centerY", -0.5, 0.5, 0.0);
+    // Return the original storage, including format, alpha and row padding.
+    if (!lensDistortionEnabled || input.isNull()
+        || (k1 == 0.0 && k2 == 0.0 && scale == 1.0
+            && centerX == 0.0 && centerY == 0.0))
+        return input;
+    ++lensDistortionCalls;
+    const QImage src = input.convertToFormat(QImage::Format_RGB888);
+    QImage out(src.size(), QImage::Format_RGB888);
+    out.fill(Qt::black);
+    const double shortSide = std::min(src.width(), src.height());
+    const double radius = shortSide * 0.5;
+    // Integer coordinates denote pixel centers. GLSL uses uv*size - 0.5.
+    const double cx = (src.width() - 1) * 0.5 + centerX * shortSide;
+    const double cy = (src.height() - 1) * 0.5 + centerY * shortSide;
+    for (int py = 0; py < out.height(); ++py) {
+        uchar *dst = out.scanLine(py);
+        for (int px = 0; px < out.width(); ++px) {
+            const double x = (px - cx) / radius;
+            const double y = (py - cy) / radius;
+            const double r2 = x * x + y * y;
+            const double factor = (1.0 + k1 * r2 + k2 * r2 * r2) / scale;
+            const double sx = cx + radius * x * factor;
+            const double sy = cy + radius * y * factor;
+            if (sx < 0.0 || sy < 0.0 || sx > src.width() - 1.0
+                || sy > src.height() - 1.0)
+                continue; // Opaque black, exactly as kFragLensDistortion.
+            const int x0 = static_cast<int>(std::floor(sx));
+            const int y0 = static_cast<int>(std::floor(sy));
+            const int x1 = std::min(x0 + 1, src.width() - 1);
+            const int y1 = std::min(y0 + 1, src.height() - 1);
+            const double fx = sx - x0, fy = sy - y0;
+            const uchar *a = src.constScanLine(y0);
+            const uchar *b = src.constScanLine(y1);
+            for (int ch = 0; ch < 3; ++ch) {
+                const double top = a[x0 * 3 + ch] * (1.0 - fx) + a[x1 * 3 + ch] * fx;
+                const double bottom = b[x0 * 3 + ch] * (1.0 - fx) + b[x1 * 3 + ch] * fx;
+                dst[px * 3 + ch] = static_cast<uchar>(clamp255d(top * (1.0 - fy) + bottom * fy));
+            }
+        }
+    }
+    return out;
 }

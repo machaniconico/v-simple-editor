@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QString>
+#include <QStringList>
 #include <QColor>
 #include <QFont>
 #include <QRectF>
@@ -89,7 +90,8 @@ enum class TransitionType {
     Pixelate,
     BlurDissolve,
     CameraShake,
-    ColorChannelShift
+    ColorChannelShift,
+    MorphCut
 };
 
 // True when the type renders as a "boundary" blend between two clips:
@@ -131,6 +133,7 @@ inline bool isOverlapTransition(TransitionType t) {
         case TransitionType::WhipPanLeft:
         case TransitionType::WhipPanRight:
         case TransitionType::Glitch:
+        case TransitionType::MorphCut:
         case TransitionType::LightLeak:
         case TransitionType::FlipHorizontal:
         case TransitionType::FlipVertical:
@@ -187,11 +190,50 @@ enum class TransitionAlignment {
     End,    // entire transition BEFORE the cut, consumes B.leadHandle
 };
 
+// Stable enum identifiers for scripting; index equals the persisted ordinal.
+inline const QStringList& transitionAlignmentNames()
+{
+    static const QStringList names{
+        QStringLiteral("Center"), QStringLiteral("Start"), QStringLiteral("End")
+    };
+    return names;
+}
+
+inline const QStringList& transitionEasingNames()
+{
+    static const QStringList names{
+        QStringLiteral("Linear"), QStringLiteral("EaseIn"),
+        QStringLiteral("EaseOut"), QStringLiteral("EaseInOut")
+    };
+    return names;
+}
+
+inline bool supportsEdgeParams(TransitionType type) {
+    switch (type) {
+    case TransitionType::WipeLeft: case TransitionType::WipeRight:
+    case TransitionType::WipeUp: case TransitionType::WipeDown:
+    case TransitionType::BarnDoorHorizontal: case TransitionType::BarnDoorVertical:
+    case TransitionType::BarnDoorHClose: case TransitionType::BarnDoorVClose:
+    case TransitionType::IrisRound: case TransitionType::IrisBox:
+    case TransitionType::IrisRoundClose: case TransitionType::IrisBoxClose:
+    case TransitionType::ClockWipe: case TransitionType::ClockWipeCCW:
+        return true;
+    default: return false;
+    }
+}
+
 struct Transition {
     TransitionType type = TransitionType::None;
     double duration = 0.5; // seconds
     TransitionAlignment alignment = TransitionAlignment::Center;
     TransitionEasing easing = TransitionEasing::Linear;
+
+    double softness = 0.0;
+    double borderWidth = 0.0;
+    QColor borderColor = Qt::white;
+    bool hasDefaultEdgeParams() const {
+        return softness == 0.0 && borderWidth == 0.0 && borderColor == QColor(Qt::white);
+    }
 
     static QString typeName(TransitionType t) {
         switch (t) {
@@ -231,6 +273,7 @@ struct Transition {
             case TransitionType::WhipPanLeft:        return "Whip Pan Left";
             case TransitionType::WhipPanRight:       return "Whip Pan Right";
             case TransitionType::Glitch:             return "Glitch";
+            case TransitionType::MorphCut:           return "Morph Cut";
             case TransitionType::LightLeak:          return "Light Leak";
             case TransitionType::FlipHorizontal:     return "Flip Horizontal";
             case TransitionType::FlipVertical:       return "Flip Vertical";
@@ -330,5 +373,10 @@ public:
     static void renderBrushOverlay(QImage &frame, const BrushOverlay &overlay, double currentTime);
     static void renderBrushOverlay(QImage &frame, BrushAnimation *brushAnimation, double progress);
     static void renderPip(QImage &frame, const QImage &pipSource, const PipConfig &config);
+    static void clearMorphCutCacheForTest();
     static QImage applyTransition(const QImage &from, const QImage &to, TransitionType type, double progress);
+    static QImage applyTransition(const QImage &from, const QImage &to,
+                                  const Transition &transition, double progress);
+    static void setEdgeParamsEnabledForTest(bool enabled);
+    static int edgeParamsCallCountForTest();
 };

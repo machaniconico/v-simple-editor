@@ -1,9 +1,15 @@
+#include "RenderInPlace.h"
 #include "MainWindow.h"
 #include "VideoPlayer.h"
 #include "Timeline.h"
 #include "UndoTrace.h"
 #include "AutoColor.h"
 #include "VersionedSave.h"
+#include "ProjectDiff.h"
+#include "ProjectDiffDialog.h"
+#include "DynamicZoomDialog.h"
+#include "MediaPaths.h"
+#include "MediaRelinkDialog.h"
 
 // AR-2: レガシー Exporter 経路へ ACES 色管理パイプラインを渡すフリー関数。実体は
 // Exporter.cpp に TU ローカル状態とともに定義 (Exporter.h は touchedFiles 外のため
@@ -25,6 +31,8 @@ double exporter_loudnessGainDb();
 #include "EffectClipboard.h"
 #include "PasteAttributesDialog.h"
 #include <QDockWidget>
+#include <QScopedValueRollback>
+#include <QVariant>
 #include "AiChatDock.h"
 #include "mcp/McpConnectionInfoDialog.h"
 #include "mcp/McpEditorTools.h"
@@ -59,6 +67,7 @@ double exporter_loudnessGainDb();
 #include "TimelineFrameRenderer.h"
 #include "SequenceSettingsDialog.h"
 #include "HDRSettingsDialog.h"
+#include "TimecodeBurnInDialog.h"
 #include "AIProcessingDialog.h"
 #include "PluginBrowserDialog.h"
 #include "AIMaskDialog.h"
@@ -86,6 +95,7 @@ double exporter_loudnessGainDb();
 #include "AspectReframer.h"
 #include "ClipGeometry.h"
 #include "SourceMonitorDock.h"
+#include "StillGalleryDock.h"
 #include "AudioBusPanel.h"   // AB-5: オーディオ バス パネル ドック
 #include "util/RcPause.h"
 
@@ -184,10 +194,6 @@ double exporter_loudnessGainDb();
   #include "HdrGradingDialog.h"
   #define HAVE_HDR_GRADING 1
 #endif
-#if __has_include("MultiCamSyncDialog.h")
-  #include "MultiCamSyncDialog.h"
-  #define HAVE_MULTICAM_SYNC 1
-#endif
 #if __has_include("BatchExportDialog.h")
   #include "BatchExportDialog.h"
   #define HAVE_BATCH_EXPORT 1
@@ -210,6 +216,8 @@ double exporter_loudnessGainDb();
   #define HAVE_AUDIO_RESTORATION_DIALOG 1
 #endif
 #include "VoiceIsolationDialog.h"
+#include "NoisePrintDialog.h"
+#include "libavcore/AudioExtract.h"
 #if __has_include("AnimatedExportDialog.h")
   #include "AnimatedExportDialog.h"
   #define HAVE_ANIMATED_EXPORT_DIALOG 1
@@ -276,6 +284,7 @@ double exporter_loudnessGainDb();
 #include <QDir>
 #include <QThread>
 #include <algorithm>
+#include <utility>
 #include <cmath>
 #include <array>
 #include <limits>
@@ -289,6 +298,7 @@ double exporter_loudnessGainDb();
 #include "VariableFontAxis.h"
 #include "MographText.h"
 #include "Keyframe.h"
+#include "clipanim/ClipAnim.h"
 #include "SmartReframe.h"
 #include "SmartReframeDialog.h"
 #include "LoudnessAnalyzer.h"
@@ -770,6 +780,7 @@ bool timelineAudioMatchesPassthrough(Timeline *timeline)
         && qAbs(a.inPoint) < 1e-6
         && sourceEnd + 1e-6 >= a.duration
         && qAbs(a.speed - 1.0) < 1e-6
+        && !a.reversed
         && qAbs(a.volume - 1.0) < 1e-6
         && qAbs(a.pan) < 1e-6
         && a.volumeEnvelope.isEmpty()
@@ -830,7 +841,8 @@ QString nextExportAudioMixPath()
 
 QString exportAudioFilterChainForEntry(int inputIndex,
                                        const PlaybackEntry &entry,
-                                       AudioChannelMode channelMode)
+                                       AudioChannelMode channelMode,
+                                       bool reversed)
 {
     const int delayMs = qMax(0, qRound(entry.timelineStart * 1000.0));
     return buildExportAudioMixEntryFilterChain(
@@ -839,7 +851,13 @@ QString exportAudioFilterChainForEntry(int inputIndex,
         ffmpegNumber(entry.clipOut),
         delayMs,
         volumeExpressionForEntry(entry),
-        channelMode);
+        channelMode,
+        reversed,
+        entry.speed,
+        entry.leadInType,
+        entry.leadInDuration,
+        entry.trailOutType,
+        entry.trailOutDuration);
 }
 
 bool runFfmpegForAudioMix(const QStringList &args, QString *error)
@@ -869,21 +887,31 @@ bool runFfmpegForAudioMix(const QStringList &args, QString *error)
     return true;
 }
 
-QString prepareTimelineAudioMixForExport(Timeline *timeline, QString *error)
+QString prepareTimelineAudioMixForExport(Timeline *timeline, QString *error,
+                                         const QString &forcedOutputPath = {},
+                                         double forcedDurationSeconds = 0.0)
 {
-    if (!timelineNeedsAudioMixForExport(timeline))
+    if (forcedOutputPath.isEmpty() && !timelineNeedsAudioMixForExport(timeline))
         return {};
 
     const QVector<PlaybackEntry> entries = timeline->computeAudioPlaybackSequence();
-    const double durationSeconds = qMax(0.001, timeline->totalDuration());
-    const QString outputPath = nextExportAudioMixPath();
+    const bool renderInPlace = !forcedOutputPath.isEmpty();
+    const double durationSeconds = qMax(0.001, renderInPlace
+        ? forcedDurationSeconds : timeline->totalDuration());
+    const QString outputPath = forcedOutputPath.isEmpty()
+        ? nextExportAudioMixPath() : forcedOutputPath;
 
     QStringList args;
     args << QStringLiteral("-y");
 
     QVector<PlaybackEntry> validEntries;
+    QVector<bool> validReversedFlags;
+    const QVector<bool> reversedFlags =
+        audioReversedFlagsForPlaybackEntries(entries);
     validEntries.reserve(entries.size());
-    for (const PlaybackEntry &entry : entries) {
+    validReversedFlags.reserve(entries.size());
+    for (int entryIndex = 0; entryIndex < entries.size(); ++entryIndex) {
+        const PlaybackEntry &entry = entries[entryIndex];
         if (entry.audioMuted)
             continue;
         if (entry.timelineEnd <= entry.timelineStart)
@@ -892,7 +920,15 @@ QString prepareTimelineAudioMixForExport(Timeline *timeline, QString *error)
             continue;
         if (!QFileInfo::exists(entry.filePath))
             continue;
+        const bool reversed = reversedFlags.value(entryIndex, false);
+        if (reversed && entry.clipOut - entry.clipIn > 10.0 * 60.0) {
+            qWarning().noquote()
+                << QStringLiteral("音声の逆再生クリップが10分の上限を超えたため、書き出しでは無音にします: %1")
+                       .arg(entry.filePath);
+            continue;
+        }
         validEntries.append(entry);
+        validReversedFlags.append(reversed);
         args << QStringLiteral("-i") << entry.filePath;
     }
 
@@ -916,15 +952,25 @@ QString prepareTimelineAudioMixForExport(Timeline *timeline, QString *error)
         chains << exportAudioFilterChainForEntry(
             i,
             entry,
-            audioChannelModeForPlaybackEntry(entry));
-        mixInputs << QStringLiteral("[a%1]").arg(i);
+            audioChannelModeForPlaybackEntry(entry),
+            validReversedFlags.value(i, false));
+        if (renderInPlace) {
+            // adelay can leave unset timestamps on its generated silence.
+            // amix propagates them; atrim then cuts at the first real PTS.
+            // Count samples after delay so both silence and content are 0-origin.
+            chains << QStringLiteral("[a%1]asetpts=N/SR/TB[rip%1]").arg(i);
+            mixInputs << QStringLiteral("[rip%1]").arg(i);
+        } else {
+            mixInputs << QStringLiteral("[a%1]").arg(i);
+        }
     }
 
     chains << QStringLiteral("%1amix=inputs=%2:normalize=0:duration=longest,"
-                             "atrim=duration=%3,"
+                             "%4atrim=duration=%3,"
                              "asetpts=PTS-STARTPTS[aout]")
         .arg(mixInputs.join(QString()), QString::number(validEntries.size()),
-             ffmpegNumber(durationSeconds));
+             ffmpegNumber(durationSeconds),
+             renderInPlace ? QStringLiteral("asetpts=N/SR/TB,apad,") : QString());
 
     args << QStringLiteral("-filter_complex") << chains.join(QStringLiteral(";"))
          << QStringLiteral("-map") << QStringLiteral("[aout]")
@@ -2648,6 +2694,12 @@ LoudnessMeasureResult measureTimelineLoudness(const QVector<PlaybackEntry> &entr
 
 } // namespace
 
+QString renderinplace::prepareAudioMix(Timeline *timeline, const QString &outputPath,
+                                      double durationSeconds, QString *error)
+{
+    return prepareTimelineAudioMixForExport(timeline, error, outputPath, durationSeconds);
+}
+
 void syncTimeRemapEntriesToTimeline(
     Timeline *timeline,
     const QHash<QString, TimeRemapClipEntry> &source)
@@ -2670,7 +2722,6 @@ MainWindow::MainWindow(QWidget *parent)
     , m_projectTemplateDialog(nullptr)
     , m_loudnessDialog(nullptr)
     , m_hdrDialog(nullptr)
-    , m_multiCamSyncDialog(nullptr)
     , m_batchExportDialog(nullptr)
     , m_chromaKeyDialog(nullptr)
     , m_audioRestoreDialog(nullptr)
@@ -2790,6 +2841,12 @@ MainWindow::MainWindow(QWidget *parent)
     connect(m_timeline, &Timeline::clipSelected, this, [this](int /*index*/) {
         updateEditActions();
     });
+    connect(m_timeline, &Timeline::renderInPlaceRequested,
+            this, &MainWindow::renderClipInPlaceDialog);
+    connect(m_timeline, &Timeline::replaceClipRequested, this,
+            [this](TrackKind kind, int trackIndex, int clipIndex) {
+                replaceClipFromMediaPool(kind, trackIndex, clipIndex);
+            });
     // V3 sprint — preview drag handle の edit target を選択 clip に同期。
     // Timeline 側で (sourceTrack, sourceClipIndex) を直接運んでくれる
     // track-aware overload にスイッチ。playhead heuristic は
@@ -2806,6 +2863,11 @@ MainWindow::MainWindow(QWidget *parent)
     connect(m_timeline->undoManager(), &UndoManager::stateChanged, this, [this]() {
         updateEditActions();
     });
+    m_mediaRelinkObservedSaveSerial = m_timeline->undoManager()->saveSerial();
+    m_mediaRelinkObservedUndoIndex = m_timeline->undoManager()->currentIndex();
+    captureMediaRelinkSidecarsAtCurrentUndoIndex();
+    connect(m_timeline->undoManager(), &UndoManager::historyChanged,
+            this, &MainWindow::handleMediaRelinkHistoryChanged);
     connect(m_timeline->undoManager(), &UndoManager::stateJumpRequested,
             m_timeline, &Timeline::restoreState);
     // undo/redo/履歴ジャンプでプロジェクト出力ジオメトリが復元されたら、canvas +
@@ -2892,6 +2954,7 @@ MainWindow::MainWindow(QWidget *parent)
 
 MainWindow::~MainWindow()
 {
+    qApp->removeEventFilter(this);
     // MainWindow's value members are destroyed before QMainWindow deletes its
     // QObject children. Detach every child that stores a non-owning pointer
     // to one of those values while the values are still alive.
@@ -2912,7 +2975,7 @@ MainWindow::~MainWindow()
         m_exporter->setSmartReframe(nullptr);
     }
 
-    // These two docks directly dereference MainWindow-owned models from their
+    // These docks directly dereference MainWindow-owned models from their
     // refresh/child-widget teardown paths, so destroy them before member
     // destruction and clear the owning pointer after delete.
     if (m_audioBusPanel) {
@@ -2926,6 +2989,12 @@ MainWindow::~MainWindow()
         m_mediaPoolDock->setPool(nullptr);
         delete m_mediaPoolDock;
         m_mediaPoolDock = nullptr;
+    }
+    if (m_stillGalleryDock) {
+        detachFromMainWindow(m_stillGalleryDock);
+        m_stillGalleryDock->setStore(nullptr);
+        delete m_stillGalleryDock;
+        m_stillGalleryDock = nullptr;
     }
 
     if (m_aiChatDock) {
@@ -3072,6 +3141,36 @@ double MainWindow::currentPlayheadSeconds() const
     return m_timeline ? m_timeline->playheadPosition() : 0.0;
 }
 
+void MainWindow::applyStillCompareConfig()
+{
+    if (!m_player)
+        return;
+
+    m_player->setStillCompare(m_stillCompare);
+    if (m_player->isPlaying() || !m_player->glPreview())
+        return;
+
+    // setStillCompare() refreshes the normal frame. Reassert any paused
+    // preview that intentionally bypasses VideoPlayer::displayFrame so the
+    // compared image remains the last upload to GLPreview.
+    if (m_nodeModeActive) {
+        onNodeGraphChanged();
+        return;
+    }
+    if (m_effectLibraryPanel && m_effectLibraryPanel->previewEnabled()) {
+        refreshEffectLibraryPreview();
+        return;
+    }
+    if (!m_timeline)
+        return;
+    const QImage special = buildSpecialClipComposite(m_timeline->playheadPosition());
+    if (!special.isNull()) {
+        m_player->glPreview()->displayFrame(
+            m_player->applyStillCompareForDisplay(
+                special, m_player->timelinePositionUs(), true));
+    }
+}
+
 QString MainWindow::projectDirectory() const
 {
     if (m_projectFilePath.isEmpty())
@@ -3093,7 +3192,9 @@ void MainWindow::refreshEffectLibraryPreview()
     QImage preview;
     if (m_effectLibraryPanel->model().applyToImage(
             entryId, m_lastCompositedFrame, &preview) && !preview.isNull()) {
-        m_player->glPreview()->displayFrame(preview);
+        m_player->glPreview()->displayFrame(
+            m_player->applyStillCompareForDisplay(
+                preview, m_player->timelinePositionUs(), true));
     }
 }
 
@@ -3537,6 +3638,7 @@ void MainWindow::setupUI()
         menu.exec(gp);
     });
     m_timeline = new Timeline(this);
+    qApp->installEventFilter(this);
     syncProjectLightingToTimeline();
     // US-INT-1: hand the Timeline to GLPreview so paintGL can compose any
     // adjustment layers covering the current timeline position.
@@ -3667,16 +3769,22 @@ void MainWindow::setupUI()
         }
     });
 
+    connect(m_player, &VideoPlayer::frameComposited, this, [this](const QImage &) {
+        pushAnimatedHslPreview(static_cast<double>(m_player->timelinePositionUs()) / 1000000.0);
+    });
     connect(m_player, &VideoPlayer::positionChanged, this, [this](double seconds) {
         if (m_timeline) {
             m_timeline->setPlayheadPosition(seconds);
         }
+        pushAnimatedHslPreview(seconds);
         emit playheadSecondsChanged(seconds);
     });
     connect(m_timeline, &Timeline::scrubPositionChanged, this, [this](double seconds) {
+        pushAnimatedHslPreview(seconds);
         m_player->previewSeek(qRound(static_cast<double>(seconds) * 1000.0));
     });
     connect(m_timeline, &Timeline::positionChanged, this, [this](double seconds) {
+        pushAnimatedHslPreview(seconds);
         m_player->seek(qRound(static_cast<double>(seconds) * 1000.0));
     });
     // Multi-clip playback: forward Timeline's resolved schedule to VideoPlayer.
@@ -3684,12 +3792,16 @@ void MainWindow::setupUI()
     connect(m_timeline, &Timeline::sequenceChanged, this, [this](const QVector<PlaybackEntry> &entries) {
         if (!m_player) return;
         QVector<PlaybackEntry> resolved = entries;
+        QVector<bool> videoReversedFlags;
+        videoReversedFlags.reserve(entries.size());
+        for (const PlaybackEntry &entry : entries)
+            videoReversedFlags.append(videoReversedForPlaybackEntry(entry));
         // プロキシ解決 (プレビュー専用)。手動 isProxyMode と マルチトラック自動
         // プロキシの両方をこの 1 箇所で適用する。書き出し経路はここを通らない。
         resolvePreviewProxies(resolved, true);
         qInfo() << "MainWindow: forwarding sequenceChanged entries=" << resolved.size();
         undotrace::log("mw:beforeSetSequence");
-        m_player->setSequence(resolved);
+        m_player->setSequence(resolved, videoReversedFlags);
         // US-INT-2 Phase A: gather per-entry speed ramps in lockstep with
         // setSequence. Key by (sourceTrack, sourceClipIndex) — positional
         // alignment between resolved[] and any single track's clips() is
@@ -3723,31 +3835,40 @@ void MainWindow::setupUI()
     connect(m_timeline, &Timeline::audioSequenceChanged, this, [this](const QVector<PlaybackEntry> &entries) {
         if (!m_player) return;
         QVector<PlaybackEntry> resolved = entries;
+        const QVector<bool> sourceReversedFlags =
+            audioReversedFlagsForPlaybackEntries(entries);
         // プロキシ解決 (プレビュー専用)。映像側と同じ単一経路。書き出しは非経由。
         resolvePreviewProxies(resolved, false);
         qInfo() << "MainWindow: forwarding audioSequenceChanged entries=" << resolved.size();
-        m_player->setAudioSequence(resolved);
         // US-INT-2 Phase A: forward audio-side speed ramps (stored only for
         // now; AudioMixer Phase B will read them under m_controlMutex when
         // per-fragment atempo lands).
         QVector<speedramp::SpeedRamp> audioRamps;
         QVector<bool> audioAtempoFlags;
+        QVector<bool> audioReversedFlags;
         audioRamps.reserve(resolved.size());
         audioAtempoFlags.reserve(resolved.size());
+        audioReversedFlags.reserve(resolved.size());
         const auto &aTracks = m_timeline->audioTracks();
-        for (const auto &e : resolved) {
+        for (int entryIndex = 0; entryIndex < resolved.size(); ++entryIndex) {
+            const auto &e = resolved[entryIndex];
             if (e.sourceTrack >= 0 && e.sourceTrack < aTracks.size()) {
                 const auto &clips = aTracks[e.sourceTrack]->clips();
                 if (e.sourceClipIndex >= 0
                     && e.sourceClipIndex < clips.size()) {
                     audioRamps.append(clips[e.sourceClipIndex].speedRamp);
                     audioAtempoFlags.append(clips[e.sourceClipIndex].atempoEnabled);
+                    audioReversedFlags.append(
+                        sourceReversedFlags.value(entryIndex, false));
                     continue;
                 }
             }
             audioRamps.append(speedramp::SpeedRamp::identity());
             audioAtempoFlags.append(false);
+            audioReversedFlags.append(
+                sourceReversedFlags.value(entryIndex, false));
         }
+        m_player->setAudioSequence(resolved, audioReversedFlags);
         if (auto *mix = m_player->audioMixer()) {
             mix->setSpeedRamps(audioRamps);
             mix->setAtempoFlags(audioAtempoFlags);
@@ -3837,7 +3958,9 @@ void MainWindow::setupUI()
         // stopped and creating a self-sustaining repaint loop.
         const QImage composed = buildSpecialClipComposite(m_timeline->playheadPosition());
         if (!composed.isNull())
-            m_player->glPreview()->displayFrame(composed);
+            m_player->glPreview()->displayFrame(
+                m_player->applyStillCompareForDisplay(
+                    composed, m_player->timelinePositionUs(), true));
         if (m_effectLibraryPanel && m_effectLibraryPanel->previewEnabled())
             refreshEffectLibraryPreview();
     });
@@ -3908,6 +4031,10 @@ void MainWindow::setupMenuBar()
     m_menuHelpEntries.append({saveAsAction,
         QStringLiteral("別名でプロジェクトを保存します。元のファイルを残したまま別バージョンを作りたいときに使います。")});
 
+    auto *compareProjectAction = fileMenu->addAction(QStringLiteral("保存版と比較…"));
+    compareProjectAction->setObjectName(QStringLiteral("action_compare_project"));
+    connect(compareProjectAction, &QAction::triggered, this, &MainWindow::compareSavedProject);
+
     auto *versionedSaveAction = fileMenu->addAction(QStringLiteral("インクリメンタル保存(&I)"));
     versionedSaveAction->setObjectName(QStringLiteral("action_versioned_save"));
     versionedSaveAction->setShortcut(QKeySequence(Qt::CTRL | Qt::ALT | Qt::SHIFT | Qt::Key_S));
@@ -3948,7 +4075,7 @@ void MainWindow::setupMenuBar()
     auto *multiCamDialogAction = fileMenu->addAction("マルチカメラ...");
     connect(multiCamDialogAction, &QAction::triggered, this, &MainWindow::openMultiCamDialog);
     m_menuHelpEntries.append({multiCamDialogAction,
-        QStringLiteral("複数カメラで撮った同じ場面の映像を切り替えながら 1 本にまとめます。")});
+        QStringLiteral("複数カメラの映像を音声で同期し、切り替えながら 1 本にまとめます。")});
 
     // Premiere Media Encoder / Resolve Deliver page parity — modeless
     // dialog that lists pending / running / completed export jobs.
@@ -4065,6 +4192,15 @@ void MainWindow::setupMenuBar()
     m_menuHelpEntries.append({hdrSettingsAction,
         QStringLiteral("HDR (HDR10 / HLG) 書き出しのメタデータと表示プレビュー設定を編集する。")});
 
+    auto *timecodeBurnInAction = fileMenu->addAction(
+        QStringLiteral("タイムコード焼き込み設定…"));
+    timecodeBurnInAction->setObjectName(
+        QStringLiteral("action_timecode_burn_in_settings"));
+    connect(timecodeBurnInAction, &QAction::triggered,
+            this, &MainWindow::onTimecodeBurnInSettings);
+    m_menuHelpEntries.append({timecodeBurnInAction,
+        QStringLiteral("プレビューと動画書き出しに表示するタイムコードの位置と書式を設定します。")});
+
     // US-HW-10: collect project + referenced media into a single folder.
     auto *collectAction = fileMenu->addAction("プロジェクトを収集 (Collect Files)...");
     collectAction->setObjectName("action_collect_project");
@@ -4174,6 +4310,22 @@ void MainWindow::setupMenuBar()
     m_menuHelpEntries.append({m_rippleDeleteAction,
         QStringLiteral("クリップを消して、空いた隙間を後ろのクリップが詰めて埋めます。間を空けたくないときに。")});
 
+    auto *matchFrameAction = editMenu->addAction(QStringLiteral("マッチフレーム"));
+    matchFrameAction->setObjectName(QStringLiteral("action_match_frame"));
+    matchFrameAction->setShortcut(QKeySequence(Qt::Key_F));
+    connect(matchFrameAction, &QAction::triggered,
+            this, &MainWindow::matchFrame);
+    m_menuHelpEntries.append({matchFrameAction,
+        QStringLiteral("再生ヘッド位置のクリップを、対応するソース時刻でソースモニターに開きます。")});
+
+    auto *replaceClipAction = editMenu->addAction(
+        QStringLiteral("クリップをメディアプールの素材で置き換え"));
+    replaceClipAction->setObjectName(QStringLiteral("action_replace_clip_media"));
+    connect(replaceClipAction, &QAction::triggered,
+            this, &MainWindow::replaceSelectedClipFromMediaPool);
+    m_menuHelpEntries.append({replaceClipAction,
+        QStringLiteral("選んだクリップの位置とトリムを保ったまま、メディアプールで選択中の素材へ差し替えます。")});
+
     // US-WF-D: Sprint 11 workflow — magnetic timeline closeGaps demo.
     auto *magTlDemoAction = editMenu->addAction("タイムラインギャップを詰める (Demo)");
     magTlDemoAction->setObjectName("action_magnetic_timeline_demo");
@@ -4240,6 +4392,14 @@ void MainWindow::setupMenuBar()
     auto *speedRampDialogAction = editMenu->addAction("速度 / 持続時間...");
     speedRampDialogAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_R));
     connect(speedRampDialogAction, &QAction::triggered, this, &MainWindow::openSpeedRampDialog);
+
+    m_reverseClipAction = editMenu->addAction(QStringLiteral("逆再生"));
+    m_reverseClipAction->setObjectName(QStringLiteral("action_reverse_clip"));
+    m_reverseClipAction->setCheckable(true);
+    connect(m_reverseClipAction, &QAction::triggered,
+            this, &MainWindow::toggleClipReversed);
+    m_menuHelpEntries.append({m_reverseClipAction,
+        QStringLiteral("選んだクリップを後ろから再生します。リンクした映像と音声にも同時に適用します。")});
 
     editMenu->addSeparator();
 
@@ -4604,6 +4764,12 @@ void MainWindow::setupMenuBar()
     connect(addAdjustmentAction, &QAction::triggered, this, &MainWindow::addAdjustmentLayerCmd);
     m_menuHelpEntries.append({addAdjustmentAction,
         QStringLiteral("その下にある全部の映像にまとめて色補正やエフェクトをかけられる特別なレイヤーを追加します。")});
+
+    auto *addShapeClipAction = insertMenu->addAction(QStringLiteral("シェイプクリップ"));
+    connect(addShapeClipAction, &QAction::triggered,
+            this, &MainWindow::addShapeLayer);
+    m_menuHelpEntries.append({addShapeClipAction,
+        QStringLiteral("選択中の動画トラックへ、図形を描画する5秒のクリップを挿入します。")});
 
     // US-AETEXT-12: AE Text Parity — 11 new menu actions
     insertMenu->addSeparator();
@@ -5572,14 +5738,6 @@ void MainWindow::setupMenuBar()
     m_menuHelpEntries.append({broadcastCaptionAction,
         QStringLiteral("放送納品向けの CEA-608/708 クローズドキャプションを設定し、SCC サイドカーを書き出します。")});
 
-    auto *multiCamSyncAction = toolsMenu->addAction(
-        QStringLiteral("マルチカム同期(&M)…"));
-    multiCamSyncAction->setObjectName("action_multicam_sync");
-    connect(multiCamSyncAction, &QAction::triggered,
-            this, &MainWindow::openMultiCamSyncDialog);
-    m_menuHelpEntries.append({multiCamSyncAction,
-        QStringLiteral("複数カメラのクリップを音声波形で自動同期し、マルチカムシーケンスを作成します。")});
-
     auto *batchExportAction = toolsMenu->addAction(
         QStringLiteral("バッチエクスポート(&B)…"));
     batchExportAction->setObjectName("action_batch_export");
@@ -5755,6 +5913,42 @@ void MainWindow::setupMenuBar()
     connect(m_sourceMonitorDock, &SourceMonitorDock::overwriteRequested,
             this, &MainWindow::onSourceOverwriteRequested);
 
+    // STILLS-WIPE: 保存済みフレームのギャラリー。比較合成は VideoPlayer の
+    // display-local 経路だけで行い、Timeline / renderFrameAt は変更しない。
+    m_stillGalleryDock = new StillGalleryDock(this);
+    m_stillGalleryDock->setStore(&m_stillStore);
+    addDockWidget(Qt::RightDockWidgetArea, m_stillGalleryDock);
+    m_stillGalleryDock->setVisible(false);
+    connect(m_stillGalleryDock, &StillGalleryDock::stillSelected,
+            this, [this](const QString &id, const QImage &image) {
+        m_activeStillId = id;
+        m_stillCompare.still = image;
+        applyStillCompareConfig();
+        statusBar()->showMessage(QStringLiteral("比較対象のスチルを設定しました。"), 3000);
+    });
+    connect(m_stillGalleryDock, &StillGalleryDock::stillRemoved,
+            this, [this](const QString &id) {
+        if (id != m_activeStillId)
+            return;
+        m_activeStillId.clear();
+        m_stillCompare.still = QImage();
+        m_stillCompare.enabled = false;
+        if (m_stillCompareAction)
+            m_stillCompareAction->setChecked(false);
+        applyStillCompareConfig();
+    });
+    connect(m_stillGalleryDock, &StillGalleryDock::comparisonModeChanged,
+            this, [this](int modeIndex) {
+        m_stillCompare.mode = static_cast<stillcompare::Mode>(
+            qBound(0, modeIndex, 2));
+        applyStillCompareConfig();
+    });
+    connect(m_stillGalleryDock, &StillGalleryDock::comparisonPositionChanged,
+            this, [this](double position) {
+        m_stillCompare.position = qBound(0.0, position, 1.0);
+        applyStillCompareConfig();
+    });
+
     // AB-5: オーディオ バス パネル ドック (右側)。m_audioBusRouting が SSOT で、
     // パネルはそのポインタを指すビュー。ユーザ操作 → routingChanged →
     // onAudioBusRoutingChanged で AudioMixer へ反映する。既定では非表示にして
@@ -5813,6 +6007,12 @@ void MainWindow::setupMenuBar()
     connect(transformKfAction, &QAction::triggered, this, &MainWindow::editTransformKeyframes);
     m_menuHelpEntries.append({transformKfAction,
         QStringLiteral("位置・大きさ・回転を時間に沿って変化させ、動くアニメーションを作ります。")});
+
+    auto *dynamicZoomAction = compMenu->addAction(QStringLiteral("ダイナミックズーム…"));
+    connect(dynamicZoomAction, &QAction::triggered,
+            this, &MainWindow::openDynamicZoom);
+    m_menuHelpEntries.append({dynamicZoomAction,
+        QStringLiteral("開始枠と終了枠を指定し、パンやズームのキーフレームを一度に作成します。")});
 
     auto *maskAction = compMenu->addAction("マスク追加...");
     connect(maskAction, &QAction::triggered, this, &MainWindow::addMask);
@@ -5890,6 +6090,10 @@ void MainWindow::setupMenuBar()
     m_colorGradingPanel->close(); // 初期非表示を確実にする
 
     auto sameColorCorrection = [](const ColorCorrection &a, const ColorCorrection &b) {
+        for (int r = 0; r < 3; ++r)
+            for (int h = 0; h < 12; ++h)
+                if (a.hueSatWarp.hueShiftDeg[r][h] != b.hueSatWarp.hueShiftDeg[r][h]
+                    || a.hueSatWarp.satScale[r][h] != b.hueSatWarp.satScale[r][h]) return false;
         auto near = [](double x, double y) { return std::abs(x - y) <= 1e-9; };
         return near(a.brightness, b.brightness)
             && near(a.contrast, b.contrast)
@@ -5909,7 +6113,16 @@ void MainWindow::setupMenuBar()
             && near(a.gammaB, b.gammaB)
             && near(a.gainR, b.gainR)
             && near(a.gainG, b.gainG)
-            && near(a.gainB, b.gainB);
+            && near(a.gainB, b.gainB)
+            && near(a.logShadowR, b.logShadowR)
+            && near(a.logShadowG, b.logShadowG)
+            && near(a.logShadowB, b.logShadowB)
+            && near(a.logMidR, b.logMidR)
+            && near(a.logMidG, b.logMidG)
+            && near(a.logMidB, b.logMidB)
+            && near(a.logHighR, b.logHighR)
+            && near(a.logHighG, b.logHighG)
+            && near(a.logHighB, b.logHighB);
     };
     auto writeSelectedClipColorCorrection = [this, sameColorCorrection](const ColorCorrection &cc) {
         if (!m_timeline || !m_timeline->hasSelection())
@@ -5936,6 +6149,18 @@ void MainWindow::setupMenuBar()
                      static_cast<double>(cw.gain.z()),
                      cw.gainLuma};
         m_player->glPreview()->setLiftGammaGain(values);
+        const std::array<std::array<double,3>,3> logValues = {{
+            {static_cast<double>(cw.logShadow.x()),
+             static_cast<double>(cw.logShadow.y()),
+             static_cast<double>(cw.logShadow.z())},
+            {static_cast<double>(cw.logMid.x()),
+             static_cast<double>(cw.logMid.y()),
+             static_cast<double>(cw.logMid.z())},
+            {static_cast<double>(cw.logHigh.x()),
+             static_cast<double>(cw.logHigh.y()),
+             static_cast<double>(cw.logHigh.z())}
+        }};
+        m_player->glPreview()->setLogWheels(logValues);
     };
     auto applyWhiteBalanceToPreview = [this](const ColorCorrection &cc) {
         if (!m_player || !m_player->glPreview())
@@ -5949,6 +6174,67 @@ void MainWindow::setupMenuBar()
                                                static_cast<float>(bGain));
     };
 
+    connect(m_colorGradingPanel, &ColorGradingPanel::gradeKeyframeRequested,
+            this, [this](const QString &section) {
+        int trackIdx = -1, clipIdx = -1;
+        ClipInfo selected;
+        if (!selectedVideoClipRef(trackIdx, clipIdx, &selected)) return;
+        auto *track = m_timeline->videoTracks().value(trackIdx, nullptr);
+        if (!track || track->isLocked()) return;
+        const double localSec = qBound(0.0, m_timeline->playheadPosition()
+            - clipTimelineStartSeconds(trackIdx, clipIdx), selected.effectiveDuration());
+        auto km = selected.keyframes;
+        const auto add = [&](const QString &name, double value) {
+            if (!km.hasTrack(name)) km.addTrack(KeyframeTrack(name, value));
+            km.track(name)->addKeyframe(localSec, value);
+        };
+        const ColorCorrection cc = m_colorGradingPanel->colorCorrection();
+        if (section == QStringLiteral("hsl")) {
+            for (const auto &field : clipanim::hslGradeTracks())
+                add(field.name, selected.hslSecondary.*(field.member));
+        } else if (section == QStringLiteral("warp")) {
+            for (const auto &field : clipanim::warpGradeTracks())
+                add(field.name, field.shift ? cc.hueSatWarp.hueShiftDeg[field.ring][field.hue]
+                                          : cc.hueSatWarp.satScale[field.ring][field.hue]);
+        } else {
+            for (const auto &field : clipanim::sectionGradeTracks(section == QStringLiteral("log")))
+                add(field.name, cc.*(field.member));
+        }
+        const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
+        auto clips = track->clips();
+        clips[clipIdx].keyframes = km;
+        track->setClips(clips);
+        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
+        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+        m_timeline->saveUndoState(QStringLiteral("グレードのキーフレーム追加"));
+        m_timeline->refreshPlaybackSequence();
+        pushAnimatedHslPreview(m_timeline->playheadPosition());
+    });
+
+    connect(m_colorGradingPanel, &ColorGradingPanel::hueSatWarpChanged,
+            this, [this, sameColorCorrection, dirty = false](const ColorCorrection &cc, bool finished) mutable {
+        if (finished) {
+            if (dirty) m_timeline->saveUndoState(QStringLiteral("カラーワーパー"));
+            dirty = false;
+            return;
+        }
+        int trackIdx = -1, clipIdx = -1;
+        ClipInfo selected;
+        if (!selectedVideoClipRef(trackIdx, clipIdx, &selected)) return;
+        if (sameColorCorrection(selected.colorCorrection, cc)) return;
+        auto *track = m_timeline->videoTracks().value(trackIdx, nullptr);
+        if (!track) return;
+        auto clips = track->clips();
+        if (clipIdx < 0 || clipIdx >= clips.size()) return;
+        const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
+        clips[clipIdx].colorCorrection = cc;
+        track->setClips(clips);
+        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
+        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+        dirty = true;
+        m_timeline->refreshPlaybackSequence();
+        m_player->setColorCorrection(cc);
+    });
     connect(m_colorGradingPanel, &ColorGradingPanel::colorCorrectionChanged,
             this, [this, writeSelectedClipColorCorrection](const ColorCorrection &cc) {
         if (m_timeline->hasSelection()) {
@@ -6040,7 +6326,8 @@ void MainWindow::setupMenuBar()
         }
     });
     connect(m_timeline, &Timeline::clipSelectedOnTrack,
-            this, [this, applyColorWheelsToPreview, applyWhiteBalanceToPreview](int /*trackIdx*/, int /*clipIdx*/) {
+            this, [this, applyColorWheelsToPreview,
+                   applyWhiteBalanceToPreview](int /*trackIdx*/, int /*clipIdx*/) {
         if (!m_colorGradingPanel || !m_timeline || !m_timeline->hasSelection())
             return;
         const ColorCorrection cc = m_timeline->clipColorCorrection();
@@ -6177,11 +6464,9 @@ void MainWindow::setupMenuBar()
     // |amount|>eps tests skip each kernel/transform entirely).
     connect(m_colorGradingPanel, &ColorGradingPanel::effectsPackChanged,
             this, [this](float sharpen, float blur, float lens) {
-        if (!m_player || !m_player->glPreview())
+        if (!m_player)
             return;
-        m_player->glPreview()->setSharpen(sharpen);
-        m_player->glPreview()->setBlur(blur);
-        m_player->glPreview()->setLensDistortion(lens);
+        m_player->setPreviewEffectsPack(sharpen, blur, lens);
     });
 
     // US-EFC-1: Effect Controls panel — per-clip effect parameter panel.
@@ -6211,7 +6496,9 @@ void MainWindow::setupMenuBar()
         if (enabled)
             refreshEffectLibraryPreview();
         else if (m_player && m_player->glPreview() && !m_lastCompositedFrame.isNull())
-            m_player->glPreview()->displayFrame(m_lastCompositedFrame);
+            m_player->glPreview()->displayFrame(
+                m_player->applyStillCompareForDisplay(
+                    m_lastCompositedFrame, m_player->timelinePositionUs(), true));
     });
     connect(m_effectLibraryPanel, &EffectLibraryPanel::keyframeRequested,
             this, &MainWindow::addEffectLibraryKeyframe);
@@ -6252,27 +6539,27 @@ void MainWindow::setupMenuBar()
 
     connect(m_vfxControlsPanel, &VfxControlsPanel::glowChanged,
             this, [this](bool enabled, float threshold, float radius, float intensity) {
-        if (!m_player || !m_player->glPreview())
+        if (!m_player)
             return;
-        m_player->glPreview()->setGlow(enabled, threshold, radius, intensity);
+        m_player->setPreviewGlow(enabled, threshold, radius, intensity);
     });
     connect(m_vfxControlsPanel, &VfxControlsPanel::bloomChanged,
             this, [this](bool enabled, float threshold, float intensity, float spread) {
-        if (!m_player || !m_player->glPreview())
+        if (!m_player)
             return;
-        m_player->glPreview()->setBloom(enabled, threshold, intensity, spread);
+        m_player->setPreviewBloom(enabled, threshold, intensity, spread);
     });
     connect(m_vfxControlsPanel, &VfxControlsPanel::chromaticAberrationChanged,
             this, [this](bool enabled, float amount, float radialFalloff) {
-        if (!m_player || !m_player->glPreview())
+        if (!m_player)
             return;
-        m_player->glPreview()->setChromaticAberration(enabled, amount, radialFalloff);
+        m_player->setPreviewChromaticAberration(enabled, amount, radialFalloff);
     });
     connect(m_vfxControlsPanel, &VfxControlsPanel::lightWrapChanged,
             this, [this](bool enabled, float amount, float radius) {
-        if (!m_player || !m_player->glPreview())
+        if (!m_player)
             return;
-        m_player->glPreview()->setLightWrap(enabled, amount, radius);
+        m_player->setPreviewLightWrap(enabled, amount, radius);
     });
 
     // US-3D: 3-axis rotation + perspective foreshortening (Premiere "Basic
@@ -6283,9 +6570,9 @@ void MainWindow::setupMenuBar()
     // and skips the warp entirely.
     connect(m_colorGradingPanel, &ColorGradingPanel::rotation3DChanged,
             this, [this](float xDeg, float yDeg, float zDeg, float persDist) {
-        if (!m_player || !m_player->glPreview())
+        if (!m_player)
             return;
-        m_player->glPreview()->setRotation3D(xDeg, yDeg, zDeg, persDist);
+        m_player->setPreviewRotation3D(xDeg, yDeg, zDeg, persDist);
     });
 
     // US-EF-2: "マスクを描画" → enter the mask drawing overlay on the
@@ -6307,6 +6594,84 @@ void MainWindow::setupMenuBar()
             panel->setMaskRect(normalizedRect);
         });
     });
+
+    viewMenu->addSeparator();
+    auto *saveStillAction = viewMenu->addAction(QStringLiteral("スチルを保存"));
+    connect(saveStillAction, &QAction::triggered, this, [this]() {
+        if (!m_timeline) {
+            QMessageBox::warning(this, QStringLiteral("スチルを保存"),
+                                 QStringLiteral("タイムラインがありません。"));
+            return;
+        }
+
+        const qint64 usec = qMax<qint64>(
+            0, qRound64(currentPlayheadSeconds() * 1000000.0));
+        const QSize canvasSize(qMax(1, m_projectConfig.width),
+                               qMax(1, m_projectConfig.height));
+        QImage frame = tlrender::renderFrameAt(m_timeline, usec, canvasSize);
+        if (frame.isNull()) {
+            QMessageBox::warning(
+                this, QStringLiteral("スチルを保存"),
+                QStringLiteral("現在位置の合成フレームをレンダリングできませんでした。"));
+            return;
+        }
+        frame = frame.convertToFormat(QImage::Format_RGBA8888);
+
+        QString projectName = m_projectConfig.name;
+        if (projectName.isEmpty() && !m_projectFilePath.isEmpty())
+            projectName = QFileInfo(m_projectFilePath).completeBaseName();
+        if (projectName.isEmpty())
+            projectName = QStringLiteral("無題");
+        stillstore::Still saved;
+        QString error;
+        if (!m_stillStore.save(frame, projectName, QString(), &saved, &error)) {
+            QMessageBox::warning(this, QStringLiteral("スチルを保存"), error);
+            return;
+        }
+
+        m_activeStillId = saved.id;
+        m_stillCompare.still = frame;
+        applyStillCompareConfig();
+        if (m_stillGalleryDock) {
+            m_stillGalleryDock->refresh();
+            m_stillGalleryDock->selectStill(saved.id);
+            m_stillGalleryDock->show();
+            m_stillGalleryDock->raise();
+        }
+        statusBar()->showMessage(QStringLiteral("スチルを保存しました。"), 3000);
+    });
+    m_menuHelpEntries.append({saveStillAction,
+        QStringLiteral("現在のタイムラインフレームをスチルギャラリーへ PNG で保存します。")});
+
+    m_stillCompareAction = viewMenu->addAction(QStringLiteral("ワイプ比較 (オン/オフ)"));
+    m_stillCompareAction->setCheckable(true);
+    m_stillCompareAction->setChecked(false);
+    connect(m_stillCompareAction, &QAction::toggled, this, [this](bool enabled) {
+        if (enabled && m_stillCompare.still.isNull()) {
+            QMessageBox::information(
+                this, QStringLiteral("ワイプ比較"),
+                QStringLiteral("スチルギャラリーで比較するスチルをダブルクリックしてください。"));
+            const QSignalBlocker blocker(m_stillCompareAction);
+            m_stillCompareAction->setChecked(false);
+            return;
+        }
+        m_stillCompare.enabled = enabled;
+        applyStillCompareConfig();
+    });
+    m_menuHelpEntries.append({m_stillCompareAction,
+        QStringLiteral("保存したスチルと現在のプレビューを比較します。書き出しには影響しません。")});
+
+    if (m_stillGalleryDock) {
+        auto *stillGalleryAction = viewMenu->addAction(QStringLiteral("スチルギャラリー"));
+        stillGalleryAction->setCheckable(true);
+        stillGalleryAction->setChecked(m_stillGalleryDock->isVisible());
+        connect(stillGalleryAction, &QAction::toggled,
+                m_stillGalleryDock, &QDockWidget::setVisible);
+        connect(m_stillGalleryDock, &QDockWidget::visibilityChanged,
+                stillGalleryAction, &QAction::setChecked);
+        m_menuHelpEntries.append({stillGalleryAction,
+            QStringLiteral("保存したスチルの一覧とワイプ位置を表示します。")});
+    }
 
     viewMenu->addSeparator();
     auto *colorPanelAction = viewMenu->addAction("カラーグレーディングパネル(&G)");
@@ -7278,8 +7643,22 @@ void MainWindow::updateEditActions()
     m_rippleDeleteAction->setEnabled(hasAnySel);
     m_copyAction->setEnabled(hasSel);
     m_pasteAction->setEnabled(m_timeline->hasClipboard());
-    m_undoAction->setEnabled(m_timeline->canUndo());
+    m_undoAction->setEnabled(m_timeline->canUndo()
+        || (!m_projectCameraUndoSlot.isEmpty()
+            && m_timeline->undoManager()->currentIndex() == m_projectCameraUndoTimelineDepth
+            && m_timeline->undoManager()->saveSerial() == m_projectCameraUndoSaveSerial));
     m_redoAction->setEnabled(m_timeline->canRedo());
+    if (m_reverseClipAction) {
+        TrackKind kind = TrackKind::Video;
+        int trackIndex = -1;
+        int clipIndex = -1;
+        ClipInfo selectedClip;
+        const bool canReverse = selectedClipRef(
+            kind, trackIndex, clipIndex, &selectedClip);
+        const QSignalBlocker blocker(m_reverseClipAction);
+        m_reverseClipAction->setEnabled(canReverse);
+        m_reverseClipAction->setChecked(canReverse && selectedClip.reversed);
+    }
 }
 
 void MainWindow::updateTitle()
@@ -7306,6 +7685,7 @@ void MainWindow::applyProjectConfig(const ProjectConfig &config)
     if (m_timeline)
         m_timeline->setProjectOutputConfig(config.width, config.height,
                                            config.explicitOutputResolution);
+    applyTimecodeBurnInSettings(m_tcBurnIn);
     updateTitle();
     statusBar()->showMessage(QString("Project: %1 — %2 %3fps")
         .arg(config.name).arg(config.resolutionLabel()).arg(config.fps));
@@ -7317,6 +7697,9 @@ void MainWindow::syncProjectLightingToTimeline()
         return;
     m_timeline->setProjectLights(m_projectLights);
     m_timeline->setProjectLightViewPosition(m_projectCamera.camera().position);
+    m_timeline->setProjectCamera(m_projectCamera);
+    if (m_player && m_player->glPreview())
+        m_player->glPreview()->setProjectCamera(m_projectCamera);
 }
 
 QString MainWindow::particleClipKey(const ClipInfo &clip)
@@ -7490,17 +7873,68 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
                     : clip.timeRemapCurve;
                 if (curve.sourceFps <= 0.0)
                     curve.sourceFps = fps;
-                sourceFrameIndex = qMax(0, static_cast<int>(std::llround(
-                    (clip.inPoint + curve.srcTimeAt(localSeconds)) * curve.sourceFps)));
-                frame = timeremap::resolveFrame(curve, localSeconds, [this, clip, curve](int srcFrameIndex) {
-                    return decodeClipFrameByIndex(clip, srcFrameIndex, curve.sourceFps);
-                });
+                if (clip.reversed) {
+                    ClipInfo mappedClip = clip;
+                    mappedClip.timeRemapCurve = curve;
+                    double sourceTime =
+                        mappedClip.sourceSecondAtLocalTime(localSeconds);
+                    if (mappedClip.sourceTimeRunsBackwardAtLocalTime(
+                            localSeconds)) {
+                        sourceTime = qMax(mappedClip.inPoint,
+                                          sourceTime - 1.0 / curve.sourceFps);
+                    }
+                    sourceFrameIndex = qMax(
+                        0, static_cast<int>(std::llround(
+                               sourceTime * curve.sourceFps)));
+
+                    // resolveFrame consumes clip-relative source seconds. Pin
+                    // a one-key sampling curve to the already-composed source
+                    // time so its blend/optical-flow mode is retained.
+                    timeremap::TimeRemapCurve samplingCurve = curve;
+                    samplingCurve.keys.clear();
+                    samplingCurve.addKey(
+                        0.0, qMax(0.0, sourceTime - mappedClip.inPoint));
+                    frame = timeremap::resolveFrame(
+                        samplingCurve, 0.0,
+                        [this, clip, curve](int srcFrameIndex) {
+                            return decodeClipFrameByIndex(
+                                clip, srcFrameIndex, curve.sourceFps);
+                        });
+                } else {
+                    // Keep the pre-US-004 path byte-identical while reverse
+                    // is OFF, including its existing time-remap sampling.
+                    sourceFrameIndex = qMax(
+                        0, static_cast<int>(std::llround(
+                               (clip.inPoint
+                                + curve.srcTimeAt(localSeconds))
+                               * curve.sourceFps)));
+                    frame = timeremap::resolveFrame(
+                        curve, localSeconds,
+                        [this, clip, curve](int srcFrameIndex) {
+                            return decodeClipFrameByIndex(
+                                clip, srcFrameIndex, curve.sourceFps);
+                        });
+                }
+            } else if (clip.reversed) {
+                double sourceTime = clip.sourceSecondAtLocalTime(localSeconds);
+                if (clip.sourceTimeRunsBackwardAtLocalTime(localSeconds)) {
+                    sourceTime = qMax(clip.inPoint,
+                                      sourceTime - 1.0 / fps);
+                }
+                sourceFrameIndex = qMax(
+                    0, static_cast<int>(std::llround(sourceTime * fps)));
+                frame = decodeClipFrameAtSourceTime(clip, sourceTime);
             } else {
+                // Preserve the legacy special-compositor mapping exactly for
+                // every existing project where reverse remains OFF.
                 const double clipOut = clipSourceOutPoint(clip);
-                const double sourceTime = qBound(clip.inPoint,
-                                                 clip.inPoint + localSeconds * qMax(clip.speed, 0.0001),
-                                                 clipOut);
-                sourceFrameIndex = qMax(0, static_cast<int>(std::llround(sourceTime * fps)));
+                const double sourceTime = qBound(
+                    clip.inPoint,
+                    clip.inPoint
+                        + localSeconds * qMax(clip.speed, 0.0001),
+                    clipOut);
+                sourceFrameIndex = qMax(
+                    0, static_cast<int>(std::llround(sourceTime * fps)));
                 frame = decodeClipFrameAtSourceTime(clip, sourceTime);
             }
 
@@ -7704,7 +8138,9 @@ void MainWindow::refreshSpecialClipPreview()
     const QImage composed = buildSpecialClipComposite(playheadSeconds);
     if (!composed.isNull()) {
         s_refreshingPreview = true;
-        m_player->glPreview()->displayFrame(composed);
+        m_player->glPreview()->displayFrame(
+            m_player->applyStillCompareForDisplay(
+                composed, m_player->timelinePositionUs(), true));
         s_refreshingPreview = false;
     } else if (!m_player->isPlaying()) {
         s_refreshingPreview = true;
@@ -7720,6 +8156,7 @@ void MainWindow::populateProjectData(ProjectData &data)
     data.videoTracks = m_timeline->allVideoTracks();
     data.audioTracks = m_timeline->allAudioTracks();
     data.generatedCaptionOverlays = m_timeline->generatedCaptionOverlays();
+    data.overlays = m_projectOverlays;
     data.playheadPos = m_timeline->playheadPosition();
     data.markIn = m_timeline->markedIn();
     data.markOut = m_timeline->markedOut();
@@ -7860,6 +8297,7 @@ void MainWindow::populateProjectData(ProjectData &data)
     QJsonObject loudnessJson;
     loudnessJson["normalizerAmount"] = 0.0;
     loudnessJson["loudnessGainDb"] = 0.0;
+    loudnessJson[QStringLiteral("_timecodeBurnIn")] = m_tcBurnIn.toJson();
     data.loudnessSettings = loudnessJson;
 
     data.particleClipEntries.clear();
@@ -7917,20 +8355,36 @@ void MainWindow::applyVfxProjectState(const ProjectVfxState &state)
 {
     setVfxPanelState(m_vfxControlsPanel, state);
 
-    if (!m_player || !m_player->glPreview())
+    if (!m_player)
         return;
 
-    auto *preview = m_player->glPreview();
-    preview->setGlow(state.glow.enabled, state.glow.threshold, state.glow.radius, state.glow.intensity);
-    preview->setBloom(state.bloom.enabled, state.bloom.threshold, state.bloom.intensity, state.bloom.spread);
-    preview->setChromaticAberration(state.chromaticAberration.enabled,
-                                    state.chromaticAberration.amount,
-                                    state.chromaticAberration.radialFalloff);
-    preview->setLightWrap(state.lightWrap.enabled, state.lightWrap.amount, state.lightWrap.radius);
+    m_player->setPreviewGlow(state.glow.enabled, state.glow.threshold,
+                             state.glow.radius, state.glow.intensity);
+    m_player->setPreviewBloom(state.bloom.enabled, state.bloom.threshold,
+                              state.bloom.intensity, state.bloom.spread);
+    m_player->setPreviewChromaticAberration(
+        state.chromaticAberration.enabled,
+        state.chromaticAberration.amount,
+        state.chromaticAberration.radialFalloff);
+    m_player->setPreviewLightWrap(state.lightWrap.enabled,
+                                  state.lightWrap.amount,
+                                  state.lightWrap.radius);
 }
 
-void MainWindow::applyLoadedProjectData(const ProjectData &data, const QString &filePath)
+void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
+                                        const QString &filePath)
 {
+    ProjectData data = loadedData;
+    QHash<QString, QString> relinkMapping;
+    if (m_promptForMissingMedia) {
+        const QStringList missing = mediapaths::missingFiles(data);
+        if (!missing.isEmpty()) {
+            MediaRelinkDialog dialog(missing, this);
+            if (dialog.exec() == QDialog::Accepted)
+                relinkMapping = dialog.mapping();
+        }
+    }
+
     if (m_light3DDialog)
         m_light3DDialog->close();
     m_projectFilePath = filePath;
@@ -7983,6 +8437,9 @@ void MainWindow::applyLoadedProjectData(const ProjectData &data, const QString &
             m_clipWiggleParams.insert(entry.clipId, entry.params);
     }
     m_projectCamera = Camera3D{};
+    m_projectCameraUndoSlot = QJsonObject{};
+    m_projectCameraUndoTimelineDepth = -1;
+    m_projectCameraUndoSaveSerial = 0;
     if (!data.projectCamera.isEmpty())
         m_projectCamera.fromJson(data.projectCamera);
     m_projectLights.clear();
@@ -7995,6 +8452,9 @@ void MainWindow::applyLoadedProjectData(const ProjectData &data, const QString &
     // US-EXT-10: restore project-level HDR + AI processing settings.
     m_hdrSettings = data.hdrSettings;
     m_aiSettings  = data.aiSettings;
+    applyTimecodeBurnInSettings(TimecodeBurnInSettings::fromJson(
+        data.loudnessSettings.value(
+            QStringLiteral("_timecodeBurnIn")).toObject()));
 
     // PRD-PROJECT-PRESET US-PP-4: restore tracker dialog states.
     m_motionTrackerState = data.motionTrackerState;
@@ -8012,13 +8472,15 @@ void MainWindow::applyLoadedProjectData(const ProjectData &data, const QString &
     if (m_timeline) {
         m_timeline->restoreGeneratedCaptionOverlays(data.generatedCaptionOverlays);
         m_timeline->restoreFromProject(data.videoTracks, data.audioTracks,
-                                       data.playheadPos, data.markIn, data.markOut, data.zoomLevel);
+                                       data.playheadPos, data.markIn,
+                                       data.markOut, data.zoomLevel);
         syncTimeRemapEntriesToTimeline(m_timeline, m_timeRemapClipEntries);
     }
 
     rebuildAudioMeters();
     applyAudioState(data);
 
+    m_projectOverlays = data.overlays;
     m_particleClipConfigs.clear();
     for (const auto &entry : data.particleClipEntries) {
         QString key = entry.clipFilePath;
@@ -8133,6 +8595,19 @@ void MainWindow::applyLoadedProjectData(const ProjectData &data, const QString &
         m_timeline->undoManager()->saveState(m_timeline->currentState(),
                                              QStringLiteral("Project loaded"));
     }
+    if (m_timeline && !relinkMapping.isEmpty()) {
+        QString relinkError;
+        if (!relinkMediaPaths(relinkMapping, &relinkError)) {
+            statusBar()->showMessage(
+                QStringLiteral("メディアの再リンクに失敗しました: %1")
+                    .arg(relinkError),
+                5000);
+        } else {
+            // The loaded file still contains the old paths. Keep the project
+            // dirty until the successful relink is explicitly saved.
+            setWindowModified(true);
+        }
+    }
 
     updateTitle();
     hideWelcomeScreen();
@@ -8140,6 +8615,103 @@ void MainWindow::applyLoadedProjectData(const ProjectData &data, const QString &
     updateEditActions();
     syncBrushAnimationPreviewForClip(0, m_timeline ? m_timeline->selectedVideoClipIndex() : -1);
     refreshSpecialClipPreview();
+}
+
+bool MainWindow::relinkMediaPaths(
+    const QHash<QString, QString> &oldToNew, QString *errorOut)
+{
+    if (!m_timeline) {
+        if (errorOut)
+            *errorOut = QStringLiteral("タイムラインを利用できません");
+        return false;
+    }
+
+    // Preserve the exact pre-operation sidecars for the current undo entry.
+    // This also covers programmatic callers that populated sidecars after the
+    // baseline TimelineState was created.
+    captureMediaRelinkSidecarsAtCurrentUndoIndex();
+    return m_timeline->relinkMediaPaths(
+        oldToNew, errorOut,
+        [this](const QHash<QString, QString> &mapping) {
+            return relinkMediaSidecars(mapping);
+        });
+}
+
+bool MainWindow::relinkMediaSidecars(
+    const QHash<QString, QString> &oldToNew)
+{
+    bool changed = false;
+    for (OverlayItem &overlay : m_projectOverlays) {
+        if (overlay.type != QLatin1String("image"))
+            continue;
+        const auto replacement = oldToNew.constFind(overlay.text);
+        if (replacement == oldToNew.cend() || replacement.value() == overlay.text)
+            continue;
+        overlay.text = replacement.value();
+        changed = true;
+    }
+
+    QHash<QString, ParticleEmitterConfig> remappedParticleConfigs;
+    remappedParticleConfigs.reserve(m_particleClipConfigs.size());
+    for (auto it = m_particleClipConfigs.cbegin();
+         it != m_particleClipConfigs.cend(); ++it) {
+        const QString replacement = oldToNew.value(it.key(), it.key());
+        remappedParticleConfigs.insert(replacement, it.value());
+        changed = changed || replacement != it.key();
+    }
+    if (changed)
+        m_particleClipConfigs = std::move(remappedParticleConfigs);
+    return changed;
+}
+
+void MainWindow::captureMediaRelinkSidecarsAtCurrentUndoIndex()
+{
+    if (!m_timeline || !m_timeline->undoManager())
+        return;
+    const int index = m_timeline->undoManager()->currentIndex();
+    if (index < 0)
+        return;
+    if (m_mediaRelinkSidecarHistory.size() <= index)
+        m_mediaRelinkSidecarHistory.resize(index + 1);
+    m_mediaRelinkSidecarHistory[index] = {
+        m_projectOverlays, m_particleClipConfigs
+    };
+}
+
+void MainWindow::handleMediaRelinkHistoryChanged()
+{
+    if (!m_timeline || !m_timeline->undoManager())
+        return;
+    UndoManager *undo = m_timeline->undoManager();
+    const quint64 saveSerial = undo->saveSerial();
+    const int index = undo->currentIndex();
+
+    if (index < 0) {
+        m_mediaRelinkSidecarHistory.clear();
+    } else if (saveSerial != m_mediaRelinkObservedSaveSerial) {
+        // A new edit invalidates redo snapshots. At MAX_UNDO the index stays
+        // fixed while the oldest TimelineState is removed, so mirror that
+        // left shift before appending the current sidecars.
+        if (index == m_mediaRelinkObservedUndoIndex
+            && index == UndoManager::MAX_UNDO - 1
+            && m_mediaRelinkSidecarHistory.size() == UndoManager::MAX_UNDO) {
+            m_mediaRelinkSidecarHistory.removeFirst();
+        } else if (m_mediaRelinkSidecarHistory.size() > index) {
+            m_mediaRelinkSidecarHistory.resize(index);
+        }
+        m_mediaRelinkSidecarHistory.resize(index + 1);
+        m_mediaRelinkSidecarHistory[index] = {
+            m_projectOverlays, m_particleClipConfigs
+        };
+    } else if (index < m_mediaRelinkSidecarHistory.size()) {
+        const MediaRelinkSidecarState &state =
+            m_mediaRelinkSidecarHistory.at(index);
+        m_projectOverlays = state.overlays;
+        m_particleClipConfigs = state.particleClipConfigs;
+    }
+
+    m_mediaRelinkObservedSaveSerial = saveSerial;
+    m_mediaRelinkObservedUndoIndex = index;
 }
 
 void MainWindow::collectAudioState(ProjectData &data)
@@ -8228,8 +8800,14 @@ void MainWindow::newProject()
         if (m_light3DDialog)
             m_light3DDialog->close();
         m_projectCamera = Camera3D{};
+        m_projectCameraUndoSlot = QJsonObject{};
+        m_projectCameraUndoTimelineDepth = -1;
+        m_projectCameraUndoSaveSerial = 0;
         m_projectLights.clear();
+        m_projectOverlays.clear();
+        m_particleClipConfigs.clear();
         syncProjectLightingToTimeline();
+        m_tcBurnIn = TimecodeBurnInSettings{};
         applyProjectConfig(dialog.config());
         // Undo ベースラインを実プロジェクトサイズで張り直す。Timeline 構築時の
         // "Initial state" は projectWidth=-1 で積まれており、これを唯一のベースラインの
@@ -8302,6 +8880,42 @@ void MainWindow::editProjectSettings()
     }
 }
 
+void MainWindow::compareSavedProject()
+{
+    const QString path = QFileDialog::getOpenFileName(this, QStringLiteral("保存版と比較"),
+        m_projectFilePath, QStringLiteral("プロジェクト (*.veditor)"));
+    if (path.isEmpty() || !m_timeline) return;
+    ProjectData saved;
+    if (!ProjectFile::load(path, saved)) {
+        QMessageBox::warning(this, QStringLiteral("保存版と比較"),
+                             QStringLiteral("プロジェクトを読み込めませんでした: %1").arg(path));
+        return;
+    }
+    ProjectData current;
+    current.videoTracks = m_timeline->allVideoTracks();
+    current.audioTracks = m_timeline->allAudioTracks();
+    current.trackFlags = m_timeline->trackFlagsToJson();
+    ProjectDiffDialog dialog(projdiff::diff(saved, current), this);
+    connect(&dialog, &ProjectDiffDialog::clipActivated, this,
+            [this](bool audio, int trackIndex, int clipIndex) {
+        const auto &tracks = audio ? m_timeline->audioTracks() : m_timeline->videoTracks();
+        if (trackIndex < 0 || trackIndex >= tracks.size() || !tracks[trackIndex]) return;
+        const auto &clips = tracks[trackIndex]->clips();
+        if (clipIndex < 0 || clipIndex >= clips.size()) return;
+        double start = 0.0;
+        for (int i = 0; i <= clipIndex; ++i) {
+            start += qMax(0.0, clips[i].leadInSec);
+            if (i < clipIndex) start += clips[i].effectiveDuration();
+        }
+        QString error;
+        if (m_timeline->selectClipByIndex(audio, trackIndex, clipIndex, &error)) {
+            m_timeline->setPlayheadPosition(start);
+            if (m_player) m_player->seek(qRound(start * 1000.0));
+        }
+    });
+    dialog.exec();
+}
+
 void MainWindow::saveProject()
 {
     if (m_projectFilePath.isEmpty()) {
@@ -8372,7 +8986,38 @@ bool MainWindow::saveProjectToPath(const QString &filePath, QString *errorMessag
     return true;
 }
 
-bool MainWindow::openProjectFromPath(const QString &filePath, QString *errorMessage)
+bool MainWindow::selectedClipRef(TrackKind &kind, int &trackIdx, int &clipIdx,
+                                 ClipInfo *clip) const
+{
+    if (!m_timeline)
+        return false;
+
+    const auto findSelected = [&](const QVector<TimelineTrack *> &tracks,
+                                  TrackKind candidateKind) {
+        for (int i = 0; i < tracks.size(); ++i) {
+            const TimelineTrack *track = tracks.at(i);
+            const int selected = track ? track->selectedClip() : -1;
+            if (!track || selected < 0 || selected >= track->clipCount())
+                continue;
+            kind = candidateKind;
+            trackIdx = i;
+            clipIdx = selected;
+            if (clip)
+                *clip = track->clips().at(selected);
+            return true;
+        }
+        return false;
+    };
+    if (findSelected(m_timeline->videoTracks(), TrackKind::Video))
+        return true;
+    if (findSelected(m_timeline->audioTracks(), TrackKind::Audio))
+        return true;
+    return false;
+}
+
+bool MainWindow::openProjectFromPath(const QString &filePath,
+                                     QString *errorMessage,
+                                     bool promptForMissingMedia)
 {
     const QString path = filePath.trimmed();
     if (path.isEmpty()) {
@@ -8396,8 +9041,10 @@ bool MainWindow::openProjectFromPath(const QString &filePath, QString *errorMess
 
     // MCP 経路では未保存変更を確認ダイアログなしで破棄し、指定されたプロジェクトを
     // 開く。確認モーダルを出すと MCP 呼び出しが応答待ちのまま詰まるためである。
-    applyLoadedProjectData(data, path);
+    const QScopedValueRollback<bool> promptGuard(
+        m_promptForMissingMedia, promptForMissingMedia);
     setWindowModified(false);
+    applyLoadedProjectData(data, path);
     return true;
 }
 
@@ -8494,7 +9141,8 @@ void MainWindow::onMediaPoolAssetActivated(const QString &filePath)
 // SM-5: 素材をソースモニターへロードする。長さ/表示名はメディアプールに
 // 登録済みなら MediaAsset から取得し、無ければファイル名 + 長さ 0 で渡す
 // (SourceMonitorDock 側で VideoPlayer の durationChanged から実尺を補正する)。
-void MainWindow::openInSourceMonitor(const QString &filePath)
+void MainWindow::openInSourceMonitor(const QString &filePath,
+                                     double positionSec)
 {
     if (filePath.isEmpty() || !m_sourceMonitorDock)
         return;
@@ -8512,11 +9160,156 @@ void MainWindow::openInSourceMonitor(const QString &filePath)
     if (displayName.isEmpty())
         displayName = QFileInfo(filePath).fileName();
 
-    m_sourceMonitorDock->loadSource(filePath, durationSec, displayName);
+    m_sourceMonitorDock->loadSource(filePath, durationSec, displayName,
+                                    positionSec);
     m_sourceMonitorDock->show();
     m_sourceMonitorDock->raise();
     statusBar()->showMessage(
         QStringLiteral("ソースモニターに読み込みました: %1").arg(displayName));
+}
+
+void MainWindow::matchFrame()
+{
+    if (!m_timeline) {
+        statusBar()->showMessage(QStringLiteral("タイムラインがありません"));
+        return;
+    }
+
+    Timeline::MatchFrameResult match;
+    QString error;
+    if (!m_timeline->matchFrame(currentPlayheadSeconds(), &match, &error)) {
+        statusBar()->showMessage(
+            QStringLiteral("マッチフレームできません: %1").arg(error), 5000);
+        return;
+    }
+
+    openInSourceMonitor(match.filePath, match.sourceSec);
+    statusBar()->showMessage(
+        QStringLiteral("マッチフレーム: %1 (%2 秒)")
+            .arg(QFileInfo(match.filePath).fileName())
+            .arg(match.sourceSec, 0, 'f', 3),
+        5000);
+}
+
+void MainWindow::replaceSelectedClipFromMediaPool()
+{
+    TrackKind kind = TrackKind::Video;
+    int trackIndex = -1;
+    int clipIndex = -1;
+    if (!selectedClipRef(kind, trackIndex, clipIndex)) {
+        statusBar()->showMessage(
+            QStringLiteral("置き換えるクリップを選択してください"), 5000);
+        return;
+    }
+    replaceClipFromMediaPool(kind, trackIndex, clipIndex);
+}
+
+void MainWindow::renderClipInPlaceDialog(int trackIndex, int clipIndex)
+{
+    QDialog dialog(this);
+    dialog.setWindowTitle(QStringLiteral("効果を焼き込んで差し替え"));
+    auto *form = new QFormLayout(&dialog);
+    auto *codec = new QComboBox(&dialog);
+    codec->addItem(QStringLiteral("H.264（MP4）"), QStringLiteral("h264"));
+    codec->addItem(QStringLiteral("ProRes（MOV）"), QStringLiteral("prores"));
+    auto *handles = new QDoubleSpinBox(&dialog);
+    handles->setRange(0.0, 5.0);
+    handles->setDecimals(3);
+    handles->setSuffix(QStringLiteral(" 秒"));
+    const QString base = m_projectFilePath.isEmpty()
+        ? QStandardPaths::writableLocation(QStandardPaths::AppDataLocation)
+        : QFileInfo(m_projectFilePath).absolutePath();
+    auto *directory = new QLineEdit(QDir(base).filePath(QStringLiteral("RenderInPlace")), &dialog);
+    auto *browse = new QPushButton(QStringLiteral("参照…"), &dialog);
+    auto *outputRow = new QHBoxLayout;
+    outputRow->addWidget(directory);
+    outputRow->addWidget(browse);
+    connect(browse, &QPushButton::clicked, &dialog, [&]() {
+        const QString selected = QFileDialog::getExistingDirectory(&dialog,
+            QStringLiteral("出力先を選択"), directory->text());
+        if (!selected.isEmpty()) directory->setText(selected);
+    });
+    form->addRow(QStringLiteral("コーデック"), codec);
+    form->addRow(QStringLiteral("ハンドル秒"), handles);
+    form->addRow(QStringLiteral("出力先"), outputRow);
+    auto *buttons = new QDialogButtonBox(&dialog);
+    buttons->addButton(QStringLiteral("焼き込んで差し替え"), QDialogButtonBox::AcceptRole);
+    buttons->addButton(QStringLiteral("キャンセル"), QDialogButtonBox::RejectRole);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    form->addRow(buttons);
+    if (dialog.exec() != QDialog::Accepted) return;
+
+    renderinplace::Options options;
+    options.codec = codec->currentData().toString();
+    options.handlesSec = handles->value();
+    options.outputDir = directory->text();
+    options.projectFilePath = m_projectFilePath;
+    options.outputSize = QSize(m_projectConfig.width, m_projectConfig.height);
+    options.fps = m_projectConfig.fps;
+    QProgressDialog progress(QStringLiteral("効果を焼き込んでいます…"),
+                             QStringLiteral("キャンセル"), 0, 100, this);
+    progress.setWindowModality(Qt::ApplicationModal);
+    progress.setMinimumDuration(0);
+    progress.setAutoClose(false);
+    progress.setAutoReset(false);
+    options.connectProgress = [&progress](RenderQueue &queue) {
+        QObject::connect(&queue, &RenderQueue::jobProgressUuid, &progress,
+                         [&progress](const QString &, int percent) { progress.setValue(percent); });
+        QObject::connect(&progress, &QProgressDialog::canceled, &queue, &RenderQueue::stop);
+    };
+    progress.show();
+    QString path, error;
+    const bool ok = renderinplace::renderClipInPlace(*m_timeline, trackIndex, clipIndex,
+                                                   options, &path, &error);
+    progress.close();
+    if (!ok) QMessageBox::warning(this, QStringLiteral("焼き込み"), error);
+    else statusBar()->showMessage(QStringLiteral("差し替えました: %1").arg(path), 5000);
+}
+
+void MainWindow::replaceClipFromMediaPool(TrackKind kind, int trackIndex,
+                                          int clipIndex)
+{
+    if (!m_timeline || !m_mediaPoolDock)
+        return;
+
+    const QString filePath = m_mediaPoolDock->selectedAssetPath();
+    if (filePath.isEmpty()) {
+        statusBar()->showMessage(
+            QStringLiteral("メディアプールで置き換え素材を選択してください"), 5000);
+        return;
+    }
+
+    QString displayName = QFileInfo(filePath).fileName();
+    double durationSec = 0.0;
+    for (const mediapool::MediaAsset &asset : m_mediaPool.assets()) {
+        if (asset.filePath != filePath)
+            continue;
+        if (!asset.displayName.isEmpty())
+            displayName = asset.displayName;
+        if (asset.durationMs > 0)
+            durationSec = static_cast<double>(asset.durationMs) / 1000.0;
+        break;
+    }
+
+    QString message;
+    if (!m_timeline->replaceClipMedia(kind, trackIndex, clipIndex,
+                                      filePath, displayName, durationSec,
+                                      &message)) {
+        statusBar()->showMessage(
+            QStringLiteral("クリップを置き換えられません: %1").arg(message),
+            6000);
+        return;
+    }
+
+    setWindowModified(true);
+    updateStatusInfo();
+    updateEditActions();
+    statusBar()->showMessage(
+        message.isEmpty()
+            ? QStringLiteral("クリップを置き換えました: %1").arg(displayName)
+            : message,
+        6000);
 }
 
 // SM-5: ソースモニターの「挿入 (Insert)」押下。選択範囲を検証してから
@@ -8814,6 +9607,7 @@ void MainWindow::exportVideo()
     cfg["audioCodec"]   = exportCfg.audioCodec;
     cfg["audioBitrate"] = exportCfg.audioBitrate;
     cfg["exportMarkedRangeOnly"] = exportCfg.exportMarkedRangeOnly;
+    cfg["timecodeBurnIn"] = m_tcBurnIn.toJson();
     const double loudnessGainDb = exporter_loudnessGainDb();
     job.loudnessGainDb = loudnessGainDb;
     cfg["loudnessGainDb"] = loudnessGainDb;
@@ -9090,6 +9884,22 @@ void MainWindow::pasteAttributes()
 
 void MainWindow::undoAction()
 {
+    if (!m_projectCameraUndoSlot.isEmpty()
+        && m_timeline->undoManager()->currentIndex() == m_projectCameraUndoTimelineDepth
+        && m_timeline->undoManager()->saveSerial() == m_projectCameraUndoSaveSerial) {
+        // fromJson only replaces tracks present in JSON; clear newly added tracks
+        // before restoring a slot whose camera originally had no animation.
+        m_projectCamera = Camera3D{};
+        m_projectCamera.fromJson(m_projectCameraUndoSlot);
+        m_projectCameraUndoSlot = QJsonObject{};
+        m_projectCameraUndoTimelineDepth = -1;
+        m_projectCameraUndoSaveSerial = 0;
+        syncProjectLightingToTimeline();
+        refreshSpecialClipPreview();
+        statusBar()->showMessage(QStringLiteral("カメラ解析の適用を元に戻しました"));
+        updateEditActions();
+        return;
+    }
     m_timeline->undo();
     statusBar()->showMessage("Undo");
     updateEditActions();
@@ -9157,6 +9967,28 @@ void MainWindow::setClipSpeed()
         m_timeline->setClipSpeed(speed);
         statusBar()->showMessage(QString("Clip speed: %1x").arg(speed));
     }
+}
+
+void MainWindow::toggleClipReversed(bool reversed)
+{
+    TrackKind kind = TrackKind::Video;
+    int trackIndex = -1;
+    int clipIndex = -1;
+    ClipInfo clip;
+    if (!m_timeline
+        || !selectedClipRef(kind, trackIndex, clipIndex, &clip)
+        || !m_timeline->setClipReversed(kind, trackIndex,
+                                        clipIndex, reversed, true)) {
+        updateEditActions();
+        statusBar()->showMessage(QStringLiteral("逆再生を変更できるクリップを選択してください"),
+                                 3000);
+        return;
+    }
+    statusBar()->showMessage(
+        reversed ? QStringLiteral("逆再生を有効にしました")
+                 : QStringLiteral("逆再生を解除しました"),
+        3000);
+    updateEditActions();
 }
 
 void MainWindow::setClipVolume()
@@ -9937,6 +10769,7 @@ void MainWindow::editDefaultTransition()
         TransitionType::WhipPanRight,
         TransitionType::Glitch,
         TransitionType::LightLeak,
+        TransitionType::MorphCut,
         TransitionType::LensFlare,
         TransitionType::FilmBurn,
         TransitionType::CameraShake,
@@ -9953,7 +10786,7 @@ void MainWindow::editDefaultTransition()
     };
     int curIdx = 0;
     for (size_t i = 0; i < sizeof(options) / sizeof(options[0]); ++i) {
-        typeCombo->addItem(Transition::typeName(options[i]), static_cast<int>(options[i]));
+        typeCombo->addItem(options[i] == TransitionType::MorphCut ? QStringLiteral("モーフカット") : Transition::typeName(options[i]), static_cast<int>(options[i]));
         if (static_cast<int>(options[i]) == curType) curIdx = static_cast<int>(i);
     }
     typeCombo->setCurrentIndex(curIdx);
@@ -10315,14 +11148,14 @@ void MainWindow::multiCamSetup()
 
     if (reply == QMessageBox::Yes) {
         statusBar()->showMessage("Syncing cameras by audio...");
-        m_multiCam->autoSyncByAudio();
-        QString info;
+        const auto report = m_multiCam->autoSyncByAudio();
+        QString info = report.message + QLatin1Char('\n');
         for (int i = 0; i < m_multiCam->sourceCount(); ++i) {
             info += QString("%1: offset %2s\n")
                 .arg(m_multiCam->sources()[i].label)
                 .arg(m_multiCam->sources()[i].syncOffset, 0, 'f', 2);
         }
-        statusBar()->showMessage("Sync complete");
+        statusBar()->showMessage(report.message);
         QMessageBox::information(this, "Sync Results", info);
     }
 }
@@ -11966,13 +12799,22 @@ void MainWindow::analyzeHighlights()
 
 void MainWindow::addShapeLayer()
 {
-    QStringList shapes = {"Rectangle", "Rounded Rectangle", "Ellipse", "Polygon", "Star", "Line", "Arrow"};
+    const QStringList shapes = {
+        QStringLiteral("長方形"),
+        QStringLiteral("角丸長方形"),
+        QStringLiteral("楕円"),
+        QStringLiteral("多角形"),
+        QStringLiteral("星形"),
+        QStringLiteral("線"),
+        QStringLiteral("矢印")
+    };
     bool ok;
-    QString selected = QInputDialog::getItem(this, "Add Shape Layer",
-        "Shape type:", shapes, 0, false, &ok);
-    if (!ok) return;
+    const QString selected = QInputDialog::getItem(
+        this, QStringLiteral("シェイプクリップを追加"),
+        QStringLiteral("シェイプの種類:"), shapes, 0, false, &ok);
+    if (!ok)
+        return;
 
-    ShapeLayer shapeLayer;
     ShapeFill fill;
     fill.color = QColor(65, 105, 225); // Royal blue
     fill.enabled = true;
@@ -11981,15 +12823,57 @@ void MainWindow::addShapeLayer()
     stroke.width = 2.0;
     stroke.enabled = true;
 
-    if (selected == "Star") {
-        shapeLayer.addShape(ShapeLayer::createStar(5, 80, 40, fill, stroke));
-    } else if (selected == "Ellipse") {
-        shapeLayer.addShape(ShapeLayer::createCircle(60, fill, stroke));
+    Shape shape;
+    if (selected == QStringLiteral("星形")) {
+        shape = ShapeLayer::createStar(5, 80, 40, fill, stroke);
+    } else if (selected == QStringLiteral("楕円")) {
+        shape = ShapeLayer::createCircle(60, fill, stroke);
+    } else if (selected == QStringLiteral("角丸長方形")) {
+        shape = ShapeLayer::createRectangle(QSizeF(200, 120), fill, stroke);
+        shape.type = ShapeType::RoundedRect;
+        shape.properties.cornerRadius = 24.0;
+        shape.name = QStringLiteral("角丸長方形");
+    } else if (selected == QStringLiteral("多角形")) {
+        shape.type = ShapeType::Polygon;
+        shape.properties.radius = 80.0;
+        shape.properties.sides = 6;
+        shape.fill = fill;
+        shape.stroke = stroke;
+        shape.name = QStringLiteral("多角形");
+    } else if (selected == QStringLiteral("線")) {
+        shape.type = ShapeType::Line;
+        shape.properties.startPoint = QPointF(-100.0, 0.0);
+        shape.properties.endPoint = QPointF(100.0, 0.0);
+        shape.fill.enabled = false;
+        shape.stroke = stroke;
+        shape.name = QStringLiteral("線");
+    } else if (selected == QStringLiteral("矢印")) {
+        shape = ShapeLayer::createArrow(
+            QPointF(-100.0, 0.0), QPointF(100.0, 0.0), 20.0, stroke);
+        shape.name = QStringLiteral("矢印");
     } else {
-        shapeLayer.addShape(ShapeLayer::createRectangle(QSizeF(200, 120), fill, stroke));
+        shape = ShapeLayer::createRectangle(QSizeF(200, 120), fill, stroke);
     }
 
-    statusBar()->showMessage(QString("Added shape layer: %1").arg(selected));
+    shape.position = QPointF(m_projectConfig.width * 0.5,
+                             m_projectConfig.height * 0.5);
+
+    ClipInfo clip;
+    clip.displayName = QStringLiteral("シェイプ: %1").arg(selected);
+    clip.duration = 5.0;
+    clip.inPoint = 0.0;
+    clip.outPoint = 5.0;
+    clip.shapes.append(shape);
+
+    if (!m_timeline || !m_timeline->insertShapeClipAtPlayhead(clip)) {
+        QMessageBox::warning(this, QStringLiteral("シェイプクリップ"),
+                             QStringLiteral("シェイプクリップを挿入できる動画トラックがありません。"));
+        return;
+    }
+
+    statusBar()->showMessage(
+        QStringLiteral("シェイプクリップを追加しました: %1").arg(selected),
+        4000);
 }
 
 void MainWindow::addParticleEffect()
@@ -12847,7 +13731,12 @@ void MainWindow::openCameraMotionDialog()
     if (dialog.exec() != QDialog::Accepted)
         return;
     m_projectCamera = dialog.camera();
+    m_projectCameraUndoSlot = QJsonObject{};
+    m_projectCameraUndoTimelineDepth = -1;
+    m_projectCameraUndoSaveSerial = 0;
+    updateEditActions();
     syncProjectLightingToTimeline();
+    refreshSpecialClipPreview();
     statusBar()->showMessage(QStringLiteral("カメラモーションを更新しました"), 4000);
 }
 
@@ -13171,6 +14060,40 @@ void MainWindow::onHDRSettings()
         4000);
 }
 
+void MainWindow::onTimecodeBurnInSettings()
+{
+    TimecodeBurnInDialog dlg(m_tcBurnIn, this);
+    if (dlg.exec() != QDialog::Accepted)
+        return;
+
+    applyTimecodeBurnInSettings(dlg.settings());
+    setWindowModified(true);
+    statusBar()->showMessage(
+        m_tcBurnIn.enabled
+            ? QStringLiteral("タイムコード焼き込みを有効にしました。")
+            : QStringLiteral("タイムコード焼き込みを無効にしました。"),
+        4000);
+}
+
+void MainWindow::applyTimecodeBurnInSettings(
+    const TimecodeBurnInSettings &settings)
+{
+    // Normalize every entry point through one parser so project load, UI,
+    // MCP, preview, and export share bounds and defaults.
+    m_tcBurnIn = TimecodeBurnInSettings::fromJson(settings.toJson());
+    if (m_exporter)
+        m_exporter->setTimecodeBurnIn(m_tcBurnIn);
+    if (m_timeline) {
+        m_timeline->setProperty(
+            "timecodeBurnIn", QVariant::fromValue(m_tcBurnIn.toJson()));
+    }
+    if (m_player && m_player->glPreview()) {
+        m_player->glPreview()->setTimecodeBurnIn(
+            m_tcBurnIn,
+            m_projectConfig.fps > 0 ? m_projectConfig.fps : 30.0);
+    }
+}
+
 void MainWindow::onAIProcessing()
 {
     AIProcessingDialog dlg(m_aiSettings, this);
@@ -13211,9 +14134,46 @@ void MainWindow::openAIMaskDialog()
 
 void MainWindow::openPlanarTrackerDialog()
 {
+    int trackIndex = -1;
+    int clipIndex = -1;
+    ClipInfo clip;
+    if (!selectedVideoClipRef(trackIndex, clipIndex, &clip)) {
+        QMessageBox::information(this, QStringLiteral("プラナートラッカー"),
+                                 QStringLiteral("解析する動画クリップを選択してください。"));
+        return;
+    }
+    const double fps = m_projectConfig.fps;
+    const double startSec = clipTimelineStartSeconds(trackIndex, clipIndex);
+    const QSize canvas(m_projectConfig.width, m_projectConfig.height);
+    const double frameCount = std::ceil(clip.effectiveDuration() * fps);
+    if (!std::isfinite(fps) || fps <= 0 || !std::isfinite(frameCount)
+        || frameCount < 1 || frameCount > std::numeric_limits<int>::max())
+        return;
+    QList<QImage> frames;
+    QProgressDialog progress(QStringLiteral("解析用フレームを読み込み中…"),
+                             QStringLiteral("キャンセル"), 0, int(frameCount), this);
+    progress.setWindowModality(Qt::ApplicationModal);
+    for (int i = 0; i < int(frameCount); ++i) {
+        progress.setValue(i);
+        if (progress.wasCanceled())
+            return;
+        // Canvas-space input keeps corner coordinates consistent with intrinsics,
+        // including clip speed, reverse, transforms and the project output size.
+        QImage frame = tlrender::renderFrameAt(m_timeline,
+            qRound64((startSec + double(i) / fps) * 1000000.0), canvas);
+        if (frame.isNull()) {
+            QMessageBox::warning(this, QStringLiteral("プラナートラッカー"),
+                                 QStringLiteral("解析用フレームを読み込めませんでした。"));
+            return;
+        }
+        frames.append(frame);
+    }
+    progress.setValue(int(frameCount));
     if (!m_planarTrackerDialog) {
         m_planarTrackerDialog = new PlanarTrackerDialog(this);
         m_planarTrackerDialog->setObjectName(QStringLiteral("planarTrackerDialog"));
+        connect(m_planarTrackerDialog, &PlanarTrackerDialog::cameraSolveApplied,
+                this, &MainWindow::applyCameraSolve);
 
         // PRD-PROJECT-PRESET US-PP-4: write back state when dialog is closed.
         connect(m_planarTrackerDialog, &QDialog::finished, this,
@@ -13226,10 +14186,32 @@ void MainWindow::openPlanarTrackerDialog()
 
     // PRD-PROJECT-PRESET US-PP-4: restore state before showing.
     m_planarTrackerDialog->setInitialState(m_planarTrackerState);
+    m_planarTrackerDialog->setCameraSolveContext(
+        canvas, m_projectCamera.camera().fov, fps, startSec);
+    m_planarTrackerDialog->setReferenceFrame(frames.first());
+    m_planarTrackerDialog->setFrames(frames);
+    m_planarTrackerDialog->setWindowModality(Qt::ApplicationModal);
 
     m_planarTrackerDialog->show();
     m_planarTrackerDialog->raise();
     m_planarTrackerDialog->activateWindow();
+}
+
+void MainWindow::applyCameraSolve(const QVector<camsolve::Pose>& poses,
+                                 double fps, double startSec)
+{
+    if (!m_timeline || !std::isfinite(fps) || fps <= 0 || !std::isfinite(startSec)
+        || !std::any_of(poses.cbegin(), poses.cend(),
+                        [](const camsolve::Pose& p) { return p.valid; }))
+        return;
+    m_projectCameraUndoSlot = m_projectCamera.toJson();
+    m_projectCameraUndoTimelineDepth = m_timeline->undoManager()->currentIndex();
+    m_projectCameraUndoSaveSerial = m_timeline->undoManager()->saveSerial();
+    camsolve::applyPosesToCamera(m_projectCamera, poses, fps, startSec);
+    syncProjectLightingToTimeline();
+    refreshSpecialClipPreview();
+    updateEditActions();
+    statusBar()->showMessage(QStringLiteral("3D カメラ解析を適用しました"), 4000);
 }
 
 // US-TP-6: PRD-TP — open the motion-tracker preset dialog modally and, on
@@ -13358,6 +14340,33 @@ void MainWindow::editTransformKeyframes()
 
     statusBar()->showMessage(QString("Set keyframe: %1 = %2 at %3s")
         .arg(prop).arg(value).arg(time, 0, 'f', 1));
+}
+
+void MainWindow::openDynamicZoom()
+{
+    int trackIndex = -1;
+    int clipIndex = -1;
+    if (!selectedVideoClipRef(trackIndex, clipIndex)) {
+        QMessageBox::information(this, QStringLiteral("ダイナミックズーム"),
+                                 QStringLiteral("動画クリップを選択してください。"));
+        return;
+    }
+
+    DynamicZoomDialog dialog(this);
+    if (dialog.exec() != QDialog::Accepted)
+        return;
+    if (!m_timeline->applyDynamicZoom(
+            TrackKind::Video, trackIndex, clipIndex,
+            dialog.startRect(), dialog.endRect(), dialog.easing())) {
+        QMessageBox::warning(this, QStringLiteral("ダイナミックズーム"),
+                             QStringLiteral("ダイナミックズームを適用できませんでした。クリップまたはトラックの状態を確認してください。"));
+        return;
+    }
+
+    setWindowModified(true);
+    statusBar()->showMessage(
+        QStringLiteral("ダイナミックズームを適用しました（8 キーフレーム）"),
+        3000);
 }
 
 void MainWindow::addMask()
@@ -14584,6 +15593,7 @@ void MainWindow::onMobileExport()
                     jcfg["videoBitrate"] = cfg.videoBitrate;
                     jcfg["audioCodec"]   = cfg.audioCodec;
                     jcfg["audioBitrate"] = cfg.audioBitrate;
+                    jcfg["timecodeBurnIn"] = m_tcBurnIn.toJson();
                     const double loudnessGainDb = exporter_loudnessGainDb();
                     job.loudnessGainDb = loudnessGainDb;
                     jcfg["loudnessGainDb"] = loudnessGainDb;
@@ -15324,22 +16334,6 @@ void MainWindow::openHdrDialog()
 #endif
 }
 
-void MainWindow::openMultiCamSyncDialog()
-{
-#ifdef HAVE_MULTICAM_SYNC
-    if (!m_multiCamSyncDialog) {
-        m_multiCamSyncDialog = new MultiCamSyncDialog(this);
-        m_multiCamSyncDialog->setObjectName(QStringLiteral("multiCamSyncDialog"));
-    }
-    m_multiCamSyncDialog->show();
-    m_multiCamSyncDialog->raise();
-    m_multiCamSyncDialog->activateWindow();
-#else
-    QMessageBox::information(this, QStringLiteral("マルチカム同期"),
-        QStringLiteral("MultiCamSyncDialog がビルドに含まれていません。"));
-#endif
-}
-
 void MainWindow::openBatchExportDialog()
 {
 #ifdef HAVE_BATCH_EXPORT
@@ -15734,7 +16728,6 @@ void MainWindow::openAudioRestoreDialog()
 #endif
 }
 
-#ifdef HAVE_SPECTRAL_EDIT_DIALOG
 namespace {
 
 // 16bit PCM WAV (RIFF/fmt/data) を読み込み mono の double サンプル列へ展開する。
@@ -15895,7 +16888,6 @@ bool readPcm16WavToMono(const QString &wavPath,
 }
 
 } // namespace
-#endif // HAVE_SPECTRAL_EDIT_DIALOG
 
 void MainWindow::openVoiceIsolationDialog()
 {
@@ -16537,6 +17529,7 @@ void MainWindow::openRecentFile(const QString &filePath)
     if (filePath.endsWith(".veditor", Qt::CaseInsensitive)) {
         ProjectData data;
         if (ProjectFile::load(filePath, data)) {
+            setWindowModified(false);
             applyLoadedProjectData(data, filePath);
             statusBar()->showMessage("Opened project: " + fi.fileName());
         }
@@ -16988,6 +17981,7 @@ void MainWindow::dropEvent(QDropEvent *event)
             // Open as project
             ProjectData data;
             if (ProjectFile::load(filePath, data)) {
+                setWindowModified(false);
                 applyLoadedProjectData(data, filePath);
                 statusBar()->showMessage("Opened project: " + QFileInfo(filePath).fileName());
             }
@@ -18864,7 +19858,9 @@ void MainWindow::onNodeGraphChanged()
     // Quick evaluation at time=0 to push a result to GLPreview
     QImage result = m_nodeEvaluator->render(0.0);
     if (!result.isNull() && m_player->glPreview()) {
-        m_player->glPreview()->displayFrame(result);
+        m_player->glPreview()->displayFrame(
+            m_player->applyStillCompareForDisplay(
+                result, m_player->timelinePositionUs(), true));
         m_player->glPreview()->update();
     }
 }
@@ -18874,4 +19870,208 @@ void MainWindow::onNodeSelected(int id)
     if (!m_nodePropsPanel || !m_activeNodeGraph)
         return;
     m_nodePropsPanel->setSelection(m_activeNodeGraph, id);
+}
+
+// The same clip-local evaluator is used by gradeClipNativeFrame for export.
+void MainWindow::pushAnimatedHslPreview(double seconds)
+{
+    if (!m_timeline || !m_player || !m_player->isGLAccelerated()) return;
+    auto *gl = m_player->glPreview();
+    if (!gl || gl->compositeBakedMode() || !gl->effectsEnabled()) return;
+    const auto entries = m_timeline->computePlaybackSequence();
+    const ClipInfo *active = nullptr;
+    double localSec = 0.0;
+    for (const auto &entry : entries) {
+        if (seconds < entry.timelineStart || seconds >= entry.timelineEnd) continue;
+        const auto *track = m_timeline->videoTracks().value(entry.sourceTrack, nullptr);
+        if (!track || entry.sourceClipIndex < 0 || entry.sourceClipIndex >= track->clips().size()) continue;
+        active = &track->clips().at(entry.sourceClipIndex);
+        localSec = qMax(0.0, seconds - entry.timelineStart);
+        break;
+    }
+    const bool animated = active && clipanim::hasHslSecondaryKeyframes(*active);
+    // Restore static uniforms once on leaving an animated clip (including undo).
+    if (!animated && !m_animatedHslPreview) return;
+    const HslSecondaryGrade hsl = active
+        ? clipanim::effectiveHslSecondaryAt(*active, localSec) : HslSecondaryGrade{};
+    gl->setHslQualifier(hsl.enabled, hsl.hueCenter, hsl.hueRange,
+        hsl.satMin, hsl.satMax, hsl.lumaMin, hsl.lumaMax, hsl.softness,
+        hsl.liftR, hsl.liftG, hsl.liftB, hsl.gammaR, hsl.gammaG, hsl.gammaB,
+        hsl.gainR, hsl.gainG, hsl.gainB);
+    m_animatedHslPreview = animated;
+}
+
+bool MainWindow::noisePrintRange(TimelineTrack *track, int clipIndex,
+                                 double *start, double *end) const
+{
+    if (!m_timeline || !track || clipIndex < 0 || clipIndex >= track->clips().size()
+        || !m_timeline->hasMarkedRange()) return false;
+    double cursor = 0.0;
+    for (int i = 0; i < clipIndex; ++i)
+        cursor += qMax(0.0, track->clips()[i].leadInSec) + track->clips()[i].effectiveDuration();
+    const auto &clip = track->clips()[clipIndex];
+    cursor += qMax(0.0, clip.leadInSec);
+    if (m_timeline->markedIn() < cursor
+        || m_timeline->markedOut() > cursor + clip.effectiveDuration()) return false;
+    *start = clip.sourceSecondAtLocalTime(m_timeline->markedIn() - cursor);
+    *end = clip.sourceSecondAtLocalTime(m_timeline->markedOut() - cursor);
+    if (*start > *end) std::swap(*start, *end);
+    return std::isfinite(*start) && std::isfinite(*end) && *end > *start;
+}
+
+bool MainWindow::eventFilter(QObject *watched, QEvent *event)
+{
+    // Timeline owns its menu. Observe the initiating right press and extend
+    // only the immediately opened root menu, preserving every existing action.
+    if (event->type() == QEvent::MouseButtonPress && m_timeline) {
+        m_noisePrintMenuTrack.clear();
+        auto *track = qobject_cast<TimelineTrack *>(watched);
+        auto *mouse = static_cast<QMouseEvent *>(event);
+        if (track && m_timeline->audioTracks().contains(track) && !track->isLocked()
+            && mouse->button() == Qt::RightButton) {
+            const int index = track->clipAtX(mouse->pos().x());
+            if (index >= 0) {
+                m_noisePrintMenuTrack = track;
+                m_noisePrintMenuClip = index;
+                QTimer::singleShot(0, this, [this]() { m_noisePrintMenuTrack.clear(); });
+            }
+        }
+    } else if (event->type() == QEvent::Show && m_noisePrintMenuTrack) {
+        if (auto *menu = qobject_cast<QMenu *>(watched)) {
+            const QPointer<TimelineTrack> track = m_noisePrintMenuTrack;
+            const int index = m_noisePrintMenuClip;
+            m_noisePrintMenuTrack.clear();
+            if (index >= track->clips().size()) return false;
+            const auto &clip = track->clips()[index];
+            const bool usable = !clip.filePath.isEmpty() && clip.sequenceRefId.isEmpty();
+            double start = 0, end = 0;
+            const bool range = usable && noisePrintRange(track, index, &start, &end);
+            menu->addSeparator();
+            auto *captureAction = menu->addAction(QStringLiteral("ノイズプリントを取得 (イン点〜アウト点)"));
+            captureAction->setEnabled(range);
+            if (!range) {
+                auto *hint = menu->addAction(QStringLiteral("イン点とアウト点をクリップ内に設定してください"));
+                hint->setEnabled(false);
+            }
+            auto *subtractAction = menu->addAction(QStringLiteral("ノイズプリントで除去…"));
+            subtractAction->setEnabled(usable && m_noisePrint.isValid());
+            auto schedule = [this, track, index](bool captureOnly) {
+                QTimer::singleShot(0, this, [this, track, index, captureOnly]() {
+                    if (track) processNoisePrint(track, index, captureOnly);
+                });
+            };
+            connect(captureAction, &QAction::triggered, this, [schedule]() { schedule(true); });
+            connect(subtractAction, &QAction::triggered, this, [schedule]() { schedule(false); });
+        }
+    }
+    return QMainWindow::eventFilter(watched, event);
+}
+
+void MainWindow::processNoisePrint(TimelineTrack *track, int clipIndex, bool captureOnly)
+{
+    if (!m_timeline || !track || track->isLocked()
+        || !m_timeline->audioTracks().contains(track)
+        || clipIndex < 0 || clipIndex >= track->clips().size()) return;
+    const QPointer<TimelineTrack> target(track);
+    const ClipInfo clip = track->clips()[clipIndex];
+    const auto targetUnchanged = [&]() {
+        if (!target || target->isLocked() || !m_timeline->audioTracks().contains(target.data())
+            || clipIndex >= target->clips().size()) return false;
+        const auto &current = target->clips()[clipIndex];
+        return current.filePath == clip.filePath && current.inPoint == clip.inPoint
+            && current.outPoint == clip.outPoint && current.leadInSec == clip.leadInSec;
+    };
+    if (clip.filePath.isEmpty() || !clip.sequenceRefId.isEmpty()) return;
+    auto report = [this](const QString &message) {
+        QMessageBox::warning(this, QStringLiteral("ノイズプリント"), message);
+    };
+    double start = 0, end = 0;
+    if (captureOnly && !noisePrintRange(track, clipIndex, &start, &end)) {
+        report(QStringLiteral("イン点とアウト点をクリップ内に設定してください"));
+        return;
+    }
+    double amount = 12, floor = -20;
+    if (!captureOnly) {
+        if (!m_noisePrint.isValid()) return;
+        NoisePrintDialog dialog(this);
+        if (dialog.exec() != QDialog::Accepted) return;
+        amount = dialog.amountDb();
+        floor = dialog.floorDb();
+    }
+    // Decode the entire source, preserving the source-time origin used by
+    // trimmed/reversed clips. Never replace it with just the selected range.
+    // Use the same in-process mono extraction as voice isolation.
+    QTemporaryDir temp;
+    if (!temp.isValid()) {
+        report(QStringLiteral("音声抽出用の一時ディレクトリを作成できません。"));
+        return;
+    }
+    constexpr int kSampleRate = 48000;
+    const QString sourceWav = temp.filePath(QStringLiteral("noiseprint-source.wav"));
+    QString error;
+    if (!libavcore::extractAudioToWav(clip.filePath, sourceWav, kSampleRate, &error)) {
+        report(QStringLiteral("音声の抽出に失敗しました:\n%1")
+                   .arg(error.isEmpty() ? clip.filePath : error));
+        return;
+    }
+    std::vector<double> input;
+    int sampleRate = kSampleRate;
+    if (!readPcm16WavToMono(sourceWav, input, sampleRate, &error) || input.empty()) {
+        report(QStringLiteral("抽出した音声を読み込めませんでした:\n%1")
+                   .arg(error.isEmpty() ? QStringLiteral("サンプルがありません") : error));
+        return;
+    }
+    if (captureOnly) {
+        auto captured = noiseprint::capture(input, sampleRate, start, end);
+        if (!captured.isValid()) {
+            report(QStringLiteral("取得範囲には少なくとも 2048 サンプルの音声が必要です。"));
+            return;
+        }
+        m_noisePrint = std::move(captured);
+        statusBar()->showMessage(QStringLiteral("ノイズプリントを取得しました。"), 5000);
+        return;
+    }
+    std::vector<double> output;
+    if (!noiseprint::subtract(input, output, m_noisePrint, amount, floor, sampleRate, &error)) {
+        report(error); return;
+    }
+    if (output.size() > static_cast<size_t>(std::numeric_limits<int>::max() / 2)) {
+        report(QStringLiteral("処理結果が大きすぎます。"));
+        return;
+    }
+    QByteArray pcm;
+    pcm.resize(static_cast<int>(output.size()) * 2);
+    for (size_t i = 0; i < output.size(); ++i) {
+        const double sample = std::isfinite(output[i]) ? output[i] : 0.0;
+        const qint16 value = static_cast<qint16>(std::lround(std::clamp(sample, -1.0, 1.0) * 32767.0));
+        const auto offset = static_cast<qsizetype>(i * 2);
+        pcm[offset] = static_cast<char>(value & 0xff);
+        pcm[offset + 1] = static_cast<char>((value >> 8) & 0xff);
+    }
+    const QFileInfo source(clip.filePath);
+    const QString outputPath = QFileDialog::getSaveFileName(this, QStringLiteral("除去済み音声を保存"),
+        source.absolutePath() + QLatin1Char('/') + source.completeBaseName() + QStringLiteral("_noiseprint.wav"),
+        QStringLiteral("WAV ファイル (*.wav)"));
+    if (outputPath.isEmpty()) return;
+    // Existing media must remain intact for undo, including earlier processed WAVs.
+    const QFileInfo destination(outputPath);
+    for (auto *existingTrack : m_timeline->audioTracks() + m_timeline->videoTracks()) {
+        if (!existingTrack) continue;
+        for (const auto &existingClip : existingTrack->clips()) {
+            if (destination.exists() && destination.canonicalFilePath() == QFileInfo(existingClip.filePath).canonicalFilePath()) {
+                report(QStringLiteral("元に戻せるよう、使用中の音源とは別のファイル名を指定してください。"));
+                return;
+            }
+        }
+    }
+    if (!targetUnchanged()) {
+        report(QStringLiteral("処理中に対象クリップが変更されました。もう一度実行してください。")); return;
+    }
+    if (!libavcore::writePcm16AsWav(outputPath, pcm, sampleRate, /*channels=*/1, &error)) { report(error); return; }
+    if (!m_timeline->replaceAudioClipMedia(m_timeline->audioTracks().indexOf(track), clipIndex, outputPath)) {
+        report(QStringLiteral("クリップの音源を差し替えられませんでした。")); return;
+    }
+    // replaceAudioClipMedia owns the single undo entry.
+    setWindowModified(true);
+    statusBar()->showMessage(QStringLiteral("ノイズプリントで除去した音声を適用しました。"), 5000);
 }
