@@ -45,6 +45,8 @@
 #include "VideoStabilizer.h"
 #include "SpeedRamp.h"
 #include "AudioEQ.h"
+#include "AudioMixer.h"
+#include <vector>
 #include "TimelineMarker.h"
 #include "RenderQueue.h"
 #include "ScreenRecorder.h"
@@ -1197,3 +1199,15 @@ private:
     void onNodeGraphChanged();
     void onNodeSelected(int id);
 };
+
+// Shared by audio export and its DSP regression gates. Entries are stereo 48kHz
+// PreFx buffers; processing retains per-track histories and skips timeline gaps.
+namespace audioexport {
+struct DspEntry {
+    qint64 frameStart = 0;
+    std::vector<float> samples;
+};
+void processTrackEntries(std::vector<DspEntry> &entries, const trackfx::Chain &chain,
+                         const std::array<AudioMixer::EqBandCoefs, 3> &coeffs,
+                         bool eqEnabled, double preampDb);
+}

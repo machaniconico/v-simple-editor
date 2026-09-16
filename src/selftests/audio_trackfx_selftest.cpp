@@ -2,6 +2,8 @@
 #include "../AudioMixer.h"
 #include "../SpectralEngine.h"
 #include "../Timeline.h"
+#include "../MainWindow.h"
+#include "../RenderInPlace.h"
 #include "../libavcore/AudioExtract.h"
 #include <QFile>
 #include <QTemporaryDir>
@@ -318,6 +320,97 @@ int runAudioTrackFxSelftest()
     orderOk = orderOk && !playbackComp->trackEqEnabled(0);
     std::fprintf(stderr, "Compressor gain-order difference: %.3f dB\n", orderDb);
     gate(10, orderOk && std::abs(orderDb) > 1.0);
+    // Exercise the actual export cascade with headroom above full scale between
+    // the peaking band and preamp. PCM16 at that boundary would lose ~6 dB.
+    AudioEQConfig boostEq;
+    boostEq.bands = {{80.0, 0.0, 0.7}, {100.0, 12.0, 1.0}, {10000.0, 0.0, 0.7}};
+    boostEq.preamp = -12.0;
+    playbackComp->setTrackEqConfig(0, boostEq);
+    playbackComp->setTrackEqEnabled(0, true);
+    std::vector<float> lowTone(kFrames * 2);
+    for (int f = 0; f < kFrames; ++f)
+        lowTone[2 * f] = lowTone[2 * f + 1] = static_cast<float>(0.5 * std::sin(2 * kPi * 100 * f / kRate));
+    std::vector<audioexport::DspEntry> boosted{{0, lowTone}};
+    audioexport::processTrackEntries(boosted, {}, playbackComp->trackEqCoeffs(0),
+                                     true, boostEq.preamp);
+    double peak = 0;
+    for (float value : boosted[0].samples) peak = std::max(peak, std::abs(static_cast<double>(value)));
+    const double boostDb = 20 * std::log10(spectralAmplitude(boosted[0].samples, 100)
+                                          / spectralAmplitude(lowTone, 100));
+    std::fprintf(stderr, "Legacy EQ headroom: peak %.6f, 100Hz %.3f dB\n", peak, boostDb);
+    gate(11, peak <= 0.55 && std::abs(boostDb) <= 0.5);
+
+    // A: 0..2s, B: 1..3s. Different source levels expose incorrect compressor
+    // history when a whole clip is processed ahead of an overlapping clip.
+    auto quiet = sine;
+    for (float &value : quiet)
+        value = static_cast<int16_t>(value * 32768.0f * 0.125f) / 32768.0f;
+    std::vector<audioexport::DspEntry> overlapping{{0, sine}, {kRate, quiet}};
+    auto overlapPlayback = std::make_unique<AudioMixer>();
+    configure(*overlapPlayback, comp);
+    std::array<std::vector<int16_t>, 2> oracle;
+    for (int entry = 0; entry < 2; ++entry) {
+        oracle[entry].resize(overlapping[entry].samples.size());
+        for (size_t i = 0; i < oracle[entry].size(); ++i)
+            oracle[entry][i] = static_cast<int16_t>(overlapping[entry].samples[i] * 32768.0f);
+    }
+    for (int t = 0; t < 3 * kRate; t += 1024) {
+        for (int entry = 0; entry < 2; ++entry) {
+            const int start = entry * kRate;
+            const int first = std::max(t, start);
+            const int last = std::min(t + 1024, start + kFrames);
+            if (first < last)
+                overlapPlayback->processTrackFxForTest(1,
+                    oracle[entry].data() + 2 * (first - start), last - first);
+        }
+    }
+    audioexport::processTrackEntries(overlapping, comp, {}, false, 0.0);
+    bool overlapOk = true;
+    for (int entry = 0; entry < 2; ++entry)
+        for (size_t i = 0; i < oracle[entry].size(); ++i)
+            overlapOk = overlapOk && overlapping[entry].samples[i] == oracle[entry][i] / 32768.0f;
+    gate(12, overlapOk);
+
+    // End-to-end export: the public wrapper runs the production FFmpeg PreFx,
+    // persisted EQ and PostFx/master mix path. Its WAV intermediate is PCM16.
+    const QString sourcePath = directory.filePath(QStringLiteral("export-source.wav"));
+    const QString outputPath = directory.filePath(QStringLiteral("export-eq.wav"));
+    QString exportError;
+    bool exportOk = directory.isValid()
+        && libavcore::writeWavFloatInterleaved(sourcePath, input, kRate, 2, &exportError);
+    auto exportMixer = std::make_unique<AudioMixer>();
+    Timeline exportTimeline;
+    ClipInfo audioClip;
+    audioClip.filePath = sourcePath;
+    audioClip.duration = 2.0;
+    audioClip.inPoint = 0.0;
+    audioClip.outPoint = 2.0;
+    exportTimeline.restoreFromProject(QVector<QVector<ClipInfo>>{{}},
+        QVector<QVector<ClipInfo>>{{audioClip}}, 0, -1, -1, 10);
+    exportTimeline.setAudioMixer(exportMixer.get());
+    AudioEQConfig cutEq;
+    cutEq.bands = {{80.0, 0.0, 0.7}, {100.0, -12.0, 1.0}, {10000.0, 0.0, 0.7}};
+    exportMixer->setTrackEqConfig(0, cutEq);
+    exportMixer->setTrackEqEnabled(0, true);
+    exportOk = exportOk && renderinplace::prepareAudioMix(&exportTimeline, outputPath,
+                                                         2.0, &exportError) == outputPath;
+    std::vector<double> exportedMono;
+    int exportRate = 0;
+    exportOk = exportOk && libavcore::readPcm16WavToMono(outputPath, exportedMono,
+                                                       exportRate, &exportError);
+    double exportLowDb = 0.0, exportMidDb = 0.0;
+    exportOk = exportOk && exportRate == kRate && exportedMono.size() >= kFrames;
+    if (exportOk) {
+        std::vector<float> exportedStereo(kFrames * 2);
+        for (int f = 0; f < kFrames; ++f)
+            exportedStereo[2 * f] = exportedStereo[2 * f + 1] = static_cast<float>(exportedMono[f]);
+        exportLowDb = 20 * std::log10(spectralAmplitude(exportedStereo, 100) / spectralAmplitude(input, 100));
+        exportMidDb = 20 * std::log10(spectralAmplitude(exportedStereo, 1000) / spectralAmplitude(input, 1000));
+        exportOk = std::abs(exportLowDb + 12) <= 1.5 && std::abs(exportMidDb) <= 1.0;
+    }
+    std::fprintf(stderr, "Export persisted EQ: 100Hz %.3f dB, 1kHz %.3f dB, error: %s\n",
+                 exportLowDb, exportMidDb, exportError.toUtf8().constData());
+    gate(13, exportOk && exportError.isEmpty());
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", pass, fail);
     return fail;
 }

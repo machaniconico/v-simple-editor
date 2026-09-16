@@ -910,6 +910,7 @@ QString prepareTimelineAudioMixForExport(Timeline *timeline, QString *error,
         return {};
     QMap<int, trackfx::Chain> trackChains;
     QMap<int, AudioEQConfig> legacyEqConfigs;
+    QMap<int, std::array<AudioMixer::EqBandCoefs, 3>> legacyEqCoeffs;
     QMap<int, bool> legacyEqEnabled;
     QMap<int, double> trackGains;
     bool useTrackFx = false;
@@ -918,6 +919,7 @@ QString prepareTimelineAudioMixForExport(Timeline *timeline, QString *error,
             const trackfx::Chain chain = mixer->trackChain(track);
             trackChains.insert(track, chain);
             legacyEqConfigs.insert(track, mixer->trackEqConfig(track));
+            legacyEqCoeffs.insert(track, mixer->trackEqCoeffs(track));
             legacyEqEnabled.insert(track, mixer->trackEqEnabled(track));
             trackGains.insert(track, mixer->trackGain(track));
             useTrackFx = useTrackFx || chain.eqEnabled || chain.compEnabled
@@ -1011,22 +1013,8 @@ QString prepareTimelineAudioMixForExport(Timeline *timeline, QString *error,
         QVector<QString> clipPaths(validEntries.size());
         for (auto it = entriesByTrack.cbegin(); it != entriesByTrack.cend(); ++it) {
             const int track = it.key();
-            trackfx::Processor processor(trackChains.value(track), AudioMixer::kSampleRateHz,
-                                         AudioMixer::kChannels);
-            const AudioEQConfig cfg = legacyEqConfigs.value(track);
-            trackfx::Chain legacyEq;
-            legacyEq.eqEnabled = legacyEqEnabled.value(track, false);
-            // The legacy cascade is low shelf -> peaking -> high shelf.
-            trackfx::EqBand *bands[] = {&legacyEq.eq.low, &legacyEq.eq.lowMid, &legacyEq.eq.high};
-            for (int b = 0; b < 3 && b < cfg.bands.size(); ++b) {
-                const auto &band = cfg.bands[b];
-                *bands[b] = {band.frequency, band.gain, band.q, true};
-            }
-            trackfx::Processor legacyProcessor(legacyEq, AudioMixer::kSampleRateHz,
-                                               AudioMixer::kChannels);
-            processor.reset();
-            legacyProcessor.reset();
-            const double preamp = legacyEq.eqEnabled ? std::pow(10.0, cfg.preamp / 20.0) : 1.0;
+            std::vector<audioexport::DspEntry> buffers;
+            buffers.reserve(it.value().size());
             for (int i : it.value()) {
                 const PlaybackEntry &entry = validEntries[i];
                 const QString clipPath = temporary.filePath(QStringLiteral("clip_%1.wav").arg(i));
@@ -1048,18 +1036,17 @@ QString prepareTimelineAudioMixForExport(Timeline *timeline, QString *error,
                     if (error) *error = QStringLiteral("トラック音声の形式が不正です。");
                     return {};
                 }
-                const size_t frames = samples.size() / channels;
-                for (size_t frame = 0; frame < frames; frame += 1024) {
-                    float *block = samples.data() + frame * channels;
-                    const int count = static_cast<int>(std::min<size_t>(1024, frames - frame));
-                    processor.process(block, count);
-                    legacyProcessor.process(block, count);
-                }
-                for (float &sample : samples)
-                    sample = static_cast<float>(sample * preamp);
-                if (!libavcore::writeWavFloatInterleaved(clipPath, samples, rate, channels, error))
-                    return {};
+                buffers.push_back({qRound64(entry.timelineStart * AudioMixer::kSampleRateHz),
+                                   std::move(samples)});
                 clipPaths[i] = clipPath;
+            }
+            audioexport::processTrackEntries(buffers, trackChains.value(track),
+                legacyEqCoeffs.value(track), legacyEqEnabled.value(track, false),
+                legacyEqConfigs.value(track).preamp);
+            for (size_t index = 0; index < buffers.size(); ++index) {
+                if (!libavcore::writeWavFloatInterleaved(clipPaths[it.value()[static_cast<int>(index)]],
+                        buffers[index].samples, AudioMixer::kSampleRateHz, AudioMixer::kChannels, error))
+                    return {};
             }
         }
         QStringList finalArgs{QStringLiteral("-y")};
@@ -2847,6 +2834,62 @@ LoudnessMeasureResult measureTimelineLoudness(const QVector<PlaybackEntry> &entr
 }
 
 } // namespace
+
+void audioexport::processTrackEntries(std::vector<DspEntry> &entries,
+                                      const trackfx::Chain &chain,
+                                      const std::array<AudioMixer::EqBandCoefs, 3> &coeffs,
+                                      bool eqEnabled, double preampDb)
+{
+    // Sort indices so callers retain their clip-to-buffer mapping.
+    std::vector<size_t> order;
+    for (size_t i = 0; i < entries.size(); ++i)
+        if (!entries[i].samples.empty()) order.push_back(i);
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return entries[a].frameStart < entries[b].frameStart;
+    });
+    if (order.empty()) return;
+    trackfx::Processor processor(chain, AudioMixer::kSampleRateHz, AudioMixer::kChannels);
+    processor.reset();
+    std::array<std::array<double, 4>, 3> z{};
+    const double preamp = std::pow(10.0, preampDb / 20.0);
+    qint64 end = entries[order.front()].frameStart;
+    for (size_t i : order)
+        end = std::max(end, entries[i].frameStart + static_cast<qint64>(entries[i].samples.size() / 2));
+    for (qint64 t = entries[order.front()].frameStart; t < end;) {
+        const qint64 blockEnd = std::min(t + 1024, end);
+        qint64 next = end;
+        bool active = false;
+        for (size_t i : order) {
+            auto &entry = entries[i];
+            const qint64 first = std::max(t, entry.frameStart);
+            const qint64 last = std::min(blockEnd,
+                entry.frameStart + static_cast<qint64>(entry.samples.size() / 2));
+            if (entry.frameStart >= blockEnd) next = std::min(next, entry.frameStart);
+            if (first >= last) continue;
+            active = true;
+            float *block = entry.samples.data() + 2 * static_cast<size_t>(first - entry.frameStart);
+            const int count = static_cast<int>(last - first);
+            processor.process(block, count);
+            if (!eqEnabled) continue;
+            // Same double cascade as MixerIODevice::readData. In particular,
+            // never saturate/quantize between the legacy EQ and preamp/gain.
+            for (int sample = 0; sample < count * 2; ++sample) {
+                double value = block[sample];
+                const int ch = sample & 1;
+                for (int b = 0; b < 3; ++b) {
+                    const auto &c = coeffs[b];
+                    const double w = value - c.a1 * z[b][ch] - c.a2 * z[b][ch + 2];
+                    value = c.b0 * w + c.b1 * z[b][ch] + c.b2 * z[b][ch + 2];
+                    z[b][ch + 2] = z[b][ch];
+                    z[b][ch] = w;
+                }
+                block[sample] = static_cast<float>(value * preamp);
+            }
+        }
+        // Gaps do not advance DSP histories or feed silence to NR/reverb.
+        t = active ? blockEnd : next;
+    }
+}
 
 QString renderinplace::prepareAudioMix(Timeline *timeline, const QString &outputPath,
                                       double durationSeconds, QString *error)

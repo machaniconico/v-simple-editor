@@ -313,11 +313,19 @@ private:
     friend class MixerIODevice;
     friend class AudioDecodeRunner;
 
+public:
     struct EqBandCoefs {
         double b0 = 1.0, b1 = 0.0, b2 = 0.0, a1 = 0.0, a2 = 0.0;
     };
 
-public:
+    std::array<EqBandCoefs, 3> trackEqCoeffs(int trackIdx) const
+    {
+        QMutexLocker lock(&m_controlMutex);
+        if (trackIdx < 0 || trackIdx >= m_trackStates.size())
+            return {};
+        return m_trackStates[trackIdx].eqCoeffs;
+    }
+
     struct EqBandCache {
         double frequency = 0;
         double q = 0;
