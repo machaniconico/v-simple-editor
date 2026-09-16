@@ -57,6 +57,7 @@
 #include "Light3D.h"
 #include "Expression.h"
 #include "ClipExpressionBindings.h"
+#include "AudioKeyframes.h"
 #include "WiggleTransform.h"
 #include "ShapeLayer.h"
 #include "TextAnimator.h"
@@ -296,6 +297,7 @@ public:
     // for keyframe insertion at the current timeline position.
     double currentPlayheadSeconds() const;
     QString projectDirectory() const;
+    void convertAudioToKeyframes(int trackIndex, int clipIndex);
     // MCP の選択確認とセルフテストが、Timeline 側と同じ追跡値を確認できるようにする。
     int selectedVideoTrackIndex() const { return m_selectedVideoTrackIndex; }
     int selectedVideoClipIndexTracked() const { return m_selectedVideoClipIndexTracked; }
@@ -828,6 +830,10 @@ private:
     QHash<QString, TrackMatteClipEntry> m_trackMatteClipEntries;
     // US-3D-11: per-clip motion-graphics sidecars, keyed by "trackIdx:clipIdx"
     QHash<QString, QJsonObject> m_text3DClipConfigs;          // Text3DLayer::toJson() blobs
+    std::function<double(double)> linkedAudioSampler(const ClipInfo &clip,
+                                                    double clipStart) const;
+    std::shared_ptr<audiokf::EnvelopeCache> m_audioEnvelopeCache =
+        std::make_shared<audiokf::EnvelopeCache>();
     QHash<QString, exprbind::ClipExpressionBindings> m_clipExpressionBindings;
     QHash<QString, wiggle::WiggleParams> m_clipWiggleParams;
     Camera3D m_projectCamera;                                 // single per-project camera

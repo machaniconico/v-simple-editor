@@ -13822,6 +13822,151 @@ void MainWindow::open3DExtrudedText()
     statusBar()->showMessage(QStringLiteral("3D 押し出しテキストを %1 に設定しました").arg(clip.displayName), 4000);
 }
 
+std::function<double(double)> MainWindow::linkedAudioSampler(
+    const ClipInfo &clip, double clipStart) const
+{
+    if (!m_timeline || clip.linkGroup <= 0) return {};
+    for (const auto *track : m_timeline->audioTracks()) {
+        if (!track) continue;
+        double cursor = 0.0;
+        for (const ClipInfo &audio : track->clips()) {
+            const double start = cursor + qMax(0.0, audio.leadInSec);
+            cursor = start + audio.effectiveDuration();
+            if (audio.linkGroup != clip.linkGroup || audio.filePath.isEmpty()) continue;
+            // Only audioLevel() invokes this closure: ordinary expressions never decode.
+            return [cache = m_audioEnvelopeCache, audio, start, clipStart](double local) {
+                const double audioLocal = clipStart + local - start;
+                if (!std::isfinite(audioLocal) || audioLocal < 0.0
+                    || audioLocal >= audio.effectiveDuration()) return 0.0;
+                const auto envelope = cache->envelope(audio.filePath);
+                return audiokf::levelAt(*envelope, audio.sourceSecondAtLocalTime(audioLocal));
+            };
+        }
+    }
+    return {};
+}
+
+void MainWindow::convertAudioToKeyframes(int trackIndex, int clipIndex)
+{
+    if (!m_timeline) return;
+    auto *track = m_timeline->videoTracks().value(trackIndex, nullptr);
+    if (!track || clipIndex < 0 || clipIndex >= track->clips().size()) return;
+    const ClipInfo target = track->clips()[clipIndex];
+    const double targetStart = clipTimelineStartSeconds(trackIndex, clipIndex);
+    const double targetEnd = targetStart + target.effectiveDuration();
+    const QString title = QStringLiteral("オーディオをキーフレームに変換");
+    struct Source { ClipInfo clip; double start; };
+    QVector<Source> sources;
+    QDialog dialog(this);
+    dialog.setWindowTitle(title);
+    auto *form = new QFormLayout(&dialog);
+    auto *sourceChoice = new QComboBox(&dialog);
+    for (int ti = 0; ti < m_timeline->audioTracks().size(); ++ti) {
+        const auto *audioTrack = m_timeline->audioTracks()[ti];
+        if (!audioTrack) continue;
+        double cursor = 0.0;
+        for (const ClipInfo &audio : audioTrack->clips()) {
+            const double start = cursor + qMax(0.0, audio.leadInSec);
+            cursor = start + audio.effectiveDuration();
+            const bool linked = target.linkGroup > 0 && audio.linkGroup == target.linkGroup;
+            if (audio.filePath.isEmpty() || (!linked && (start >= targetEnd || cursor <= targetStart))) continue;
+            sources.append({audio, start});
+            sourceChoice->addItem(QStringLiteral("%1A%2 — %3")
+                .arg(linked ? QStringLiteral("リンク音声: ") : QString())
+                .arg(ti + 1).arg(audio.displayName.isEmpty() ? QFileInfo(audio.filePath).fileName() : audio.displayName));
+            if (linked) sourceChoice->setCurrentIndex(int(sources.size()) - 1);
+        }
+    }
+    if (sources.isEmpty()) {
+        QMessageBox::information(this, title, QStringLiteral("リンク音声または同時刻の音声クリップがありません。"));
+        return;
+    }
+    form->addRow(QStringLiteral("音源"), sourceChoice);
+    auto *property = new QComboBox(&dialog);
+    const QStringList paths = {QStringLiteral("transform.opacity"), QStringLiteral("transform.scale"),
+        QStringLiteral("transform.rotation"), QStringLiteral("transform.position.x"), QStringLiteral("transform.position.y")};
+    const QStringList labels = {QStringLiteral("不透明度"), QStringLiteral("スケール"), QStringLiteral("回転"),
+        QStringLiteral("位置 X"), QStringLiteral("位置 Y")};
+    for (int i = 0; i < paths.size(); ++i) {
+        if (exprbind::validatePath(paths[i]).isEmpty()) property->addItem(labels[i], paths[i]);
+    }
+    form->addRow(QStringLiteral("対象プロパティ"), property);
+    const auto spin = [&](const QString &label, double low, double high, double initial) {
+        auto *box = new QDoubleSpinBox(&dialog);
+        box->setDecimals(3);
+        box->setRange(low, high);
+        box->setValue(initial);
+        form->addRow(label, box);
+        return box;
+    };
+    auto *minimum = spin(QStringLiteral("最小値"), -100000.0, 100000.0, 0.0);
+    auto *maximum = spin(QStringLiteral("最大値"), -100000.0, 100000.0, 100.0);
+    auto *fps = spin(QStringLiteral("フレームレート (fps)"), 1.0, 240.0,
+        m_projectConfig.fps > 0.0 ? m_projectConfig.fps : 30.0);
+    auto *smoothing = spin(QStringLiteral("平滑化 (ms)"), 0.0, 10000.0, 50.0);
+    auto *threshold = spin(QStringLiteral("しきい値 (0～1)"), 0.0, 1.0, 0.0);
+    connect(property, qOverload<int>(&QComboBox::currentIndexChanged), &dialog, [=](int) {
+        const QString path = property->currentData().toString();
+        maximum->setValue(path == QStringLiteral("transform.opacity") ? 100.0
+            : path == QStringLiteral("transform.rotation") ? 360.0 : 1.0);
+    });
+    auto *buttons = new QDialogButtonBox(&dialog);
+    buttons->addButton(QStringLiteral("変換"), QDialogButtonBox::AcceptRole);
+    buttons->addButton(QStringLiteral("キャンセル"), QDialogButtonBox::RejectRole);
+    form->addRow(buttons);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    if (dialog.exec() != QDialog::Accepted) return;
+
+    const Source source = sources[sourceChoice->currentIndex()];
+    QVector<float> mono;
+    int sampleRate = 0;
+    QString error;
+    if (!audiokf::decodeMono(source.clip.filePath, mono, sampleRate, &error)) {
+        QMessageBox::warning(this, title, QStringLiteral("音声を読み込めません。\n%1").arg(error));
+        return;
+    }
+    const double sampleCount = std::ceil(target.effectiveDuration() * sampleRate);
+    if (!std::isfinite(sampleCount) || sampleCount <= 0.0 || sampleCount > 128.0 * 1024.0 * 1024.0) {
+        QMessageBox::warning(this, title, QStringLiteral("対象クリップの長さが変換可能な範囲を超えています。"));
+        return;
+    }
+    // Resample into target-local time before RMS/EMA: trims, gaps, speed/ramp
+    // and reverse use the same ClipInfo mapping as timeline playback.
+    QVector<float> aligned(qsizetype(sampleCount), 0.0f);
+    for (qsizetype i = 0; i < aligned.size(); ++i) {
+        const double local = targetStart + double(i) / sampleRate - source.start;
+        if (local < 0.0 || local >= source.clip.effectiveDuration()) continue;
+        const double index = source.clip.sourceSecondAtLocalTime(local) * sampleRate;
+        if (index >= 0.0 && index < double(mono.size())) aligned[i] = mono[qsizetype(index)];
+    }
+    const auto envelope = audiokf::computeEnvelope(aligned, sampleRate, fps->value(), smoothing->value());
+    const auto points = audiokf::toKeyframes(envelope, minimum->value(), maximum->value(), threshold->value(), 0.0);
+    if (points.isEmpty()) return;
+    // The modal dialog can process external edits; never overwrite a changed clip.
+    if (trackIndex >= m_timeline->videoTracks().size()
+        || m_timeline->videoTracks()[trackIndex] != track
+        || clipIndex >= track->clips().size()
+        || track->clips()[clipIndex].filePath != target.filePath
+        || track->clips()[clipIndex].inPoint != target.inPoint
+        || track->clips()[clipIndex].effectiveDuration() != target.effectiveDuration()
+        || clipTimelineStartSeconds(trackIndex, clipIndex) != targetStart) {
+        QMessageBox::warning(this, title, QStringLiteral("クリップが変更されたため、もう一度変換してください。"));
+        return;
+    }
+    const KeyframeTrack keys = audiokf::propertyTrack(property->currentData().toString(),
+                                                    points, minimum->value());
+    const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
+    auto clips = track->clips();
+    clips[clipIndex].keyframes.removeTrack(keys.propertyName());
+    clips[clipIndex].keyframes.addTrack(keys);
+    track->setClips(clips);
+    remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
+    syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+    m_timeline->saveUndoState(title);
+    m_timeline->refreshPlaybackSequence();
+}
+
 void MainWindow::editClipExpressionBindings()
 {
     if (!m_timeline) {
@@ -16987,166 +17132,7 @@ void MainWindow::openAudioRestoreDialog()
 #endif
 }
 
-namespace {
 
-// 16bit PCM WAV (RIFF/fmt/data) を読み込み mono の double サンプル列へ展開する。
-// 多チャンネルは平均してモノラル化。成功時 true、sampleRate を *sampleRate へ。
-// 簡易パーサ — float WAV や 24/32bit は非対応 (抽出側を 16bit に固定する前提)。
-bool readPcm16WavToMono(const QString &wavPath,
-                        std::vector<double> &outSamples,
-                        int &sampleRate,
-                        QString *error)
-{
-    outSamples.clear();
-    sampleRate = 0;
-
-    constexpr qint64 kMaxWavBytes = 512LL * 1024LL * 1024LL;
-    const QFileInfo info(wavPath);
-    if (!info.exists()) {
-        if (error) *error = QStringLiteral("WAV が存在しません: %1").arg(wavPath);
-        return false;
-    }
-    if (info.size() <= 0) {
-        if (error) *error = QStringLiteral("WAV が空です: %1").arg(wavPath);
-        return false;
-    }
-    if (info.size() > kMaxWavBytes) {
-        if (error) *error =
-            QStringLiteral("WAV が大きすぎます (%1 MB、上限 %2 MB)。")
-                .arg(info.size() / (1024.0 * 1024.0), 0, 'f', 1)
-                .arg(kMaxWavBytes / (1024 * 1024));
-        return false;
-    }
-
-    QFile f(wavPath);
-    if (!f.open(QIODevice::ReadOnly)) {
-        if (error) *error = QStringLiteral("WAV を開けません: %1").arg(wavPath);
-        return false;
-    }
-    const QByteArray data = f.readAll();
-    f.close();
-
-    if (data.size() != info.size()) {
-        if (error) *error =
-            QStringLiteral("WAV の読み込みが途中で終了しました (%1/%2 bytes)。")
-                .arg(data.size()).arg(info.size());
-        return false;
-    }
-    if (data.size() < 44 || !data.startsWith("RIFF") ||
-        data.mid(8, 4) != QByteArray("WAVE")) {
-        if (error) *error = QStringLiteral("RIFF/WAVE ヘッダが不正です。");
-        return false;
-    }
-
-    const auto rdU16 = [&](int off) -> quint16 {
-        return static_cast<quint16>(static_cast<unsigned char>(data[off])) |
-               (static_cast<quint16>(static_cast<unsigned char>(data[off + 1])) << 8);
-    };
-    const auto rdU32 = [&](int off) -> quint32 {
-        return static_cast<quint32>(static_cast<unsigned char>(data[off])) |
-               (static_cast<quint32>(static_cast<unsigned char>(data[off + 1])) << 8) |
-               (static_cast<quint32>(static_cast<unsigned char>(data[off + 2])) << 16) |
-               (static_cast<quint32>(static_cast<unsigned char>(data[off + 3])) << 24);
-    };
-
-    int channels = 1;
-    int sr = 0;
-    int bitsPerSample = 16;
-    int audioFormat = 1;
-    int blockAlign = 0;
-    bool haveFmt = false;
-    int dataOff = -1;
-    int dataLen = 0;
-
-    // チャンク走査 (fmt と data を探す)。
-    int pos = 12;
-    while (pos + 8 <= data.size()) {
-        const QByteArray id = data.mid(pos, 4);
-        const quint32 sz = rdU32(pos + 4);
-        const int body = pos + 8;
-        const qint64 chunkEnd = static_cast<qint64>(body) + static_cast<qint64>(sz);
-        const qint64 nextChunk = chunkEnd + ((sz & 1u) ? 1 : 0);
-        if (chunkEnd > data.size()) {
-            if (error) *error =
-                QStringLiteral("WAV チャンク '%1' がファイル終端を越えています。")
-                    .arg(QString::fromLatin1(id.constData(), id.size()));
-            return false;
-        }
-
-        if (id == QByteArray("fmt ")) {
-            if (sz < 16) {
-                if (error) *error = QStringLiteral("WAV fmt チャンクが短すぎます。");
-                return false;
-            }
-            audioFormat   = rdU16(body);
-            channels      = rdU16(body + 2);
-            const quint32 parsedSr = rdU32(body + 4);
-            if (parsedSr > static_cast<quint32>(std::numeric_limits<int>::max())) {
-                if (error) *error = QStringLiteral("WAV の sample rate が大きすぎます。");
-                return false;
-            }
-            sr            = static_cast<int>(parsedSr);
-            blockAlign    = rdU16(body + 12);
-            bitsPerSample = rdU16(body + 14);
-            haveFmt = true;
-        } else if (id == QByteArray("data")) {
-            dataOff = body;
-            dataLen = static_cast<int>(sz);
-        }
-        // チャンクは 2byte 境界 (奇数長は +1 パディング)。
-        pos = static_cast<int>(std::min<qint64>(nextChunk, data.size()));
-        if (dataOff >= 0 && haveFmt) break;
-    }
-
-    if (audioFormat != 1 || bitsPerSample != 16) {
-        if (error) *error =
-            QStringLiteral("対応するのは 16bit PCM WAV のみです (format=%1, bits=%2)。")
-                .arg(audioFormat).arg(bitsPerSample);
-        return false;
-    }
-    if (!haveFmt || dataOff < 0 || dataLen <= 0 || sr <= 0 || channels <= 0) {
-        if (error) *error = QStringLiteral("WAV の data/fmt チャンクが見つかりません。");
-        return false;
-    }
-
-    if (channels > 64) {
-        if (error) *error = QStringLiteral("WAV の channel 数が大きすぎます (%1)。").arg(channels);
-        return false;
-    }
-
-    const int frameBytes = 2 * channels;
-    if (blockAlign != frameBytes) {
-        if (error) *error =
-            QStringLiteral("WAV の block align が不正です (blockAlign=%1, expected=%2)。")
-                .arg(blockAlign).arg(frameBytes);
-        return false;
-    }
-
-    const int frameCount = dataLen / frameBytes;
-    if (frameCount <= 0) {
-        if (error) *error = QStringLiteral("WAV の data チャンクにサンプルがありません。");
-        return false;
-    }
-
-    outSamples.clear();
-    outSamples.reserve(frameCount);
-    const char *p = data.constData() + dataOff;
-    for (int i = 0; i < frameCount; ++i) {
-        double acc = 0.0;
-        for (int c = 0; c < channels; ++c) {
-            const int o = i * frameBytes + c * 2;
-            const qint16 s = static_cast<qint16>(
-                static_cast<quint16>(static_cast<unsigned char>(p[o])) |
-                (static_cast<quint16>(static_cast<unsigned char>(p[o + 1])) << 8));
-            acc += static_cast<double>(s) / 32768.0;
-        }
-        outSamples.push_back(acc / channels);
-    }
-    sampleRate = sr;
-    return true;
-}
-
-} // namespace
 
 void MainWindow::openVoiceIsolationDialog()
 {
@@ -17258,7 +17244,7 @@ void MainWindow::openVoiceIsolationDialog()
     std::vector<double> decoded;
     int sampleRate = kSampleRate;
     QString readError;
-    if (!readPcm16WavToMono(sourceWav, decoded, sampleRate, &readError)
+    if (!libavcore::readPcm16WavToMono(sourceWav, decoded, sampleRate, &readError)
         || decoded.empty()) {
         QMessageBox::warning(this, QStringLiteral("音声分離"),
                              QStringLiteral("抽出した音声を読み込めませんでした:\n%1")
@@ -17430,7 +17416,7 @@ void MainWindow::openSpectralRepair()
     std::vector<double> samples;
     int sr = kSampleRate;
     QString readErr;
-    if (!readPcm16WavToMono(tmpWav, samples, sr, &readErr) || samples.empty()) {
+    if (!libavcore::readPcm16WavToMono(tmpWav, samples, sr, &readErr) || samples.empty()) {
         QMessageBox::warning(this, QStringLiteral("スペクトル音声修復"),
             QStringLiteral("抽出した音声を読み込めませんでした:\n%1")
                 .arg(readErr.isEmpty() ? QStringLiteral("(空のサンプル列)") : readErr));
@@ -20275,7 +20261,7 @@ void MainWindow::processNoisePrint(TimelineTrack *track, int clipIndex, bool cap
     }
     std::vector<double> input;
     int sampleRate = kSampleRate;
-    if (!readPcm16WavToMono(sourceWav, input, sampleRate, &error) || input.empty()) {
+    if (!libavcore::readPcm16WavToMono(sourceWav, input, sampleRate, &error) || input.empty()) {
         report(QStringLiteral("抽出した音声を読み込めませんでした:\n%1")
                    .arg(error.isEmpty() ? QStringLiteral("サンプルがありません") : error));
         return;

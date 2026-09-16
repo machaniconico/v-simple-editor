@@ -731,6 +731,9 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/Camera3D.cpp
     src/CameraSolver.h
     src/CameraSolver.cpp
+    src/AudioKeyframes.h
+    src/AudioKeyframes.cpp
+    src/selftests/audio_keyframes_selftest.cpp
     src/Expression.cpp
     src/Precompose.cpp
     src/Rotoscope.cpp

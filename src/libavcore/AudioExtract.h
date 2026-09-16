@@ -2,8 +2,13 @@
 
 #include <QByteArray>
 #include <QString>
+#include <vector>
 
 namespace libavcore {
+
+bool readPcm16WavToMono(const QString &wavPath,
+                        std::vector<double> &outSamples,
+                        int &sampleRate, QString *error = nullptr);
 
 bool writePcm16AsWav(const QString& wavPath,
                      const QByteArray& pcmS16le,
