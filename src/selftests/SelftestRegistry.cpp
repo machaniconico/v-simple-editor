@@ -100,6 +100,7 @@ int runEffectTimingSelftest();
 int runExposureAidsSelftest();
 int runExportAuditSelftest();
 int runExportRangeSelftest();
+int runFlipSolidSelftest();
 int runFrameClipboardSelftest();
 int runFrameExportSelftest();
 int runFcpxmlSelftest();
@@ -586,6 +587,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Rolling shutter: bypass, repair, direction, last frame, determinism, presets (G1-G6)" },
     { "fxgrain-echo",      "VEDITOR_FXGRAIN_ECHO_SELFTEST",       runFxGrainEchoSelftest,         false,
       "FilmGrain deterministic CPU effect + Echo temporal compositor + preview routing gates (G1-G16)" },
+    { "flip-solid", "VEDITOR_FLIP_SOLID_SELFTEST", runFlipSolidSelftest, true,
+      "Flip CPU parity, involution, preset round-trip and solid insertion/undo (G1-G5)" },
     { "effect-preset", "VEDITOR_EFFECT_PRESET_SELFTEST", runEffectPresetSelftest, false,
       "FXP-1 effect preset stack JSON save/load/apply with optional effect keyframes (5 gates)" },
     { "effect-library", "VEDITOR_EFFECT_LIBRARY_SELFTEST", runEffectLibrarySelftest, false,

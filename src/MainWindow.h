@@ -369,6 +369,7 @@ private slots:
     void saveEffectPreset();
     void manageEffectPresets();
     void addShapeLayer();
+    void addSolidLayer();
     void addParticleEffect();
     void addVfxGenerator();
     void addVfxGeneratorForType(int typeIndex);

@@ -172,7 +172,8 @@ enum class VideoEffectType {
     FilmGrain,
     Echo,
     LensDistortion,
-    RollingShutterRepair
+    RollingShutterRepair,
+    Flip
 };
 
 struct VideoEffect {
@@ -220,6 +221,7 @@ struct VideoEffect {
     //   BrightnessContrast: p1=brightness(-100..100), p2=contrast(-100..100)
     //   Bulge: p1=amount(-100..100), p2=radius(0..1)
     //   Twirl: p1=angleDegrees, p2=radius(0..1)
+    //   Flip: p1=mode(0=horizontal,1=vertical,2=both), p2/p3 unused.
     //   Mirror: p1=mode(0=left->right,1=right->left,2=top->bottom,3=bottom->top). No neutral mode; mode<0 is no-op.
     //   PolarCoordinates: p1=type(0=rect->polar,1=polar->rect), p2=amount(0..1)
     //   MotionTile: p1=tilesX(1..10), p2=tilesY(1..10), p3=mirrorEdges(0/1). 1x1 is no-op.
@@ -315,6 +317,9 @@ public:
     static void setLensDistortionEnabledForTesting(bool enabled);
     static void resetLensDistortionInvocationCount();
     static int lensDistortionInvocationCount();
+    // Calling-thread switch; also resets the Flip observation counter.
+    static void setFlipEnabledForTesting(bool enabled);
+    static int flipInvocationCountForTesting();
     static QImage applyEffect(const QImage &input, const VideoEffect &effect);
     static QImage applyEffectStack(const QImage &input, const ColorCorrection &cc,
                                    const QVector<VideoEffect> &effects);
@@ -371,6 +376,7 @@ private:
     static QImage applyBrightnessContrastEffect(const QImage &img, double brightness, double contrast);
     static QImage applyBulge(const QImage &img, double amount, double radius);
     static QImage applyTwirl(const QImage &img, double angleDegrees, double radius);
+    static QImage applyFlip(const QImage &img, int mode);
     static QImage applyMirror(const QImage &img, int mode);
     static QImage applyPolarCoordinates(const QImage &img, int type, double amount);
     static QImage applyMotionTile(const QImage &img, int tilesX, int tilesY, bool mirrorEdges);

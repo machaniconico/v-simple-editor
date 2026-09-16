@@ -110,6 +110,7 @@ QString videoCategory(VideoEffectType type)
     case VideoEffectType::GlitchVHS:
     case VideoEffectType::Bulge:
     case VideoEffectType::Twirl:
+    case VideoEffectType::Flip:
     case VideoEffectType::Mirror:
     case VideoEffectType::PolarCoordinates:
     case VideoEffectType::MotionTile:

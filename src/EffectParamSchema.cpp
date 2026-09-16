@@ -223,6 +223,9 @@ QVector<ParamDef> paramSchemaFor(VideoEffectType type)
             { "radius", "半径", ParamType::Float, 0.0, 1.0, 0.5 }
         };
 
+    case VideoEffectType::Flip:
+        return { { "mode", "方向 (0=水平 / 1=垂直 / 2=両方)", ParamType::Int, 0.0, 2.0, 0.0 } };
+
     case VideoEffectType::Mirror:
         return { { "mode", "モード", ParamType::Int, 0.0, 3.0, 0.0 } };
 

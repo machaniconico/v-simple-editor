@@ -81,6 +81,7 @@ QString effectTypeKey(VideoEffectType type)
     case VideoEffectType::BrightnessContrast: return QStringLiteral("BrightnessContrast");
     case VideoEffectType::Bulge: return QStringLiteral("Bulge");
     case VideoEffectType::Twirl: return QStringLiteral("Twirl");
+    case VideoEffectType::Flip: return QStringLiteral("Flip");
     case VideoEffectType::Mirror: return QStringLiteral("Mirror");
     case VideoEffectType::PolarCoordinates: return QStringLiteral("PolarCoordinates");
     case VideoEffectType::MotionTile: return QStringLiteral("MotionTile");

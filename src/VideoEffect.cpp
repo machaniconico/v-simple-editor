@@ -462,6 +462,7 @@ QString VideoEffect::typeName(VideoEffectType t)
     case VideoEffectType::BrightnessContrast: return "明るさ・コントラスト";
     case VideoEffectType::Bulge: return "バルジ(球面)";
     case VideoEffectType::Twirl: return "ツイスト(渦)";
+    case VideoEffectType::Flip: return "反転 (Flip/Flop)";
     case VideoEffectType::Mirror: return "ミラー";
     case VideoEffectType::PolarCoordinates: return "極座標";
     case VideoEffectType::MotionTile: return "モーションタイル";
@@ -499,7 +500,7 @@ QVector<VideoEffectType> VideoEffect::allTypes()
              VideoEffectType::PolarCoordinates, VideoEffectType::MotionTile,
              VideoEffectType::CornerPinSimple, VideoEffectType::FilmGrain,
              VideoEffectType::Echo, VideoEffectType::LensDistortion,
-             VideoEffectType::RollingShutterRepair };
+             VideoEffectType::RollingShutterRepair, VideoEffectType::Flip };
 }
 
 VideoEffect VideoEffect::createBlur(double r)
@@ -813,7 +814,8 @@ double paramValue(const VideoEffect &effect, const QString &paramName)
                 return effect.param1;
             if (paramName == "radius" && effect.type == VideoEffectType::Twirl)
                 return effect.param2;
-            if (paramName == "mode" && effect.type == VideoEffectType::Mirror)
+            if (paramName == "mode" && (effect.type == VideoEffectType::Mirror
+                                      || effect.type == VideoEffectType::Flip))
                 return effect.param1;
             if (paramName == "type" && effect.type == VideoEffectType::PolarCoordinates)
                 return effect.param1;
@@ -1098,7 +1100,8 @@ void setParamValue(VideoEffect &effect, const QString &paramName, double value)
             if (paramName == "radius" && effect.type == VideoEffectType::Twirl) {
                 effect.param2 = value; return;
             }
-            if (paramName == "mode" && effect.type == VideoEffectType::Mirror) {
+            if (paramName == "mode" && (effect.type == VideoEffectType::Mirror
+                                      || effect.type == VideoEffectType::Flip)) {
                 effect.param1 = value; return;
             }
             if (paramName == "type" && effect.type == VideoEffectType::PolarCoordinates) {
@@ -1665,6 +1668,8 @@ QImage VideoEffectProcessor::applyEffect(const QImage &input, const VideoEffect 
     case VideoEffectType::BrightnessContrast: return applyBrightnessContrastEffect(input, effect.param1, effect.param2);
     case VideoEffectType::Bulge: return applyBulge(input, effect.param1, effect.param2);
     case VideoEffectType::Twirl: return applyTwirl(input, effect.param1, effect.param2);
+    case VideoEffectType::Flip: return applyFlip(input, static_cast<int>(std::round(
+        std::isfinite(effect.param1) ? std::clamp(effect.param1, 0.0, 2.0) : 0.0)));
     case VideoEffectType::Mirror: return applyMirror(input, static_cast<int>(std::round(effect.param1)));
     case VideoEffectType::PolarCoordinates: return applyPolarCoordinates(input, static_cast<int>(std::round(effect.param1)), effect.param2);
     case VideoEffectType::MotionTile: return applyMotionTile(input,
@@ -3269,6 +3274,31 @@ QImage VideoEffectProcessor::applyTwirl(const QImage &input, double angleDegrees
     }
 
     return result;
+}
+
+namespace {
+thread_local bool flipEnabledForTesting = true;
+thread_local int flipCallsForTesting = 0;
+}
+
+void VideoEffectProcessor::setFlipEnabledForTesting(bool enabled)
+{
+    flipEnabledForTesting = enabled;
+    flipCallsForTesting = 0;
+}
+
+int VideoEffectProcessor::flipInvocationCountForTesting()
+{
+    return flipCallsForTesting;
+}
+
+QImage VideoEffectProcessor::applyFlip(const QImage &input, int mode)
+{
+    if (!flipEnabledForTesting || input.isNull())
+        return input;
+    ++flipCallsForTesting;
+    // Preserve the source format and alpha; both preview and export use this CPU path.
+    return input.mirrored(mode != 1, mode != 0);
 }
 
 QImage VideoEffectProcessor::applyMirror(const QImage &input, int mode)

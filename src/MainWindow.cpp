@@ -4886,6 +4886,9 @@ void MainWindow::setupMenuBar()
     m_menuHelpEntries.append({addAdjustmentAction,
         QStringLiteral("その下にある全部の映像にまとめて色補正やエフェクトをかけられる特別なレイヤーを追加します。")});
 
+    auto *addSolidClipAction = insertMenu->addAction(QStringLiteral("平面レイヤー (単色)…"));
+    connect(addSolidClipAction, &QAction::triggered,
+            this, &MainWindow::addSolidLayer);
     auto *addShapeClipAction = insertMenu->addAction(QStringLiteral("シェイプクリップ"));
     connect(addShapeClipAction, &QAction::triggered,
             this, &MainWindow::addShapeLayer);
@@ -12891,6 +12894,42 @@ void MainWindow::analyzeHighlights()
 
     m_aiHighlight->analyze(clip.filePath, config);
     statusBar()->showMessage("Analyzing video for highlights...");
+}
+
+void MainWindow::addSolidLayer()
+{
+    const QColor color = QColorDialog::getColor(
+        Qt::white, this, QStringLiteral("平面レイヤーの色"));
+    if (!color.isValid())
+        return;
+    bool ok = false;
+    const double duration = QInputDialog::getDouble(
+        this, QStringLiteral("平面レイヤー (単色)"), QStringLiteral("尺 (秒):"),
+        5.0, 0.01, 86400.0, 2, &ok);
+    if (!ok)
+        return;
+
+    ShapeFill fill;
+    fill.color = color;
+    fill.enabled = true;
+    ShapeStroke stroke;
+    stroke.enabled = false;
+    Shape shape = ShapeLayer::createRectangle(
+        QSizeF(m_projectConfig.width, m_projectConfig.height), fill, stroke);
+    shape.position = QPointF(m_projectConfig.width * 0.5,
+                             m_projectConfig.height * 0.5);
+    ClipInfo clip;
+    clip.displayName = QStringLiteral("平面 %1").arg(color.name(QColor::HexRgb).toUpper());
+    clip.duration = duration;
+    clip.inPoint = 0.0;
+    clip.outPoint = duration;
+    clip.shapes.append(shape);
+    if (!m_timeline || !m_timeline->insertShapeClipAtPlayhead(clip)) {
+        QMessageBox::warning(this, QStringLiteral("平面レイヤー"),
+                             QStringLiteral("平面レイヤーを挿入できる動画トラックがありません。"));
+        return;
+    }
+    statusBar()->showMessage(QStringLiteral("%1 を追加しました").arg(clip.displayName), 4000);
 }
 
 void MainWindow::addShapeLayer()
