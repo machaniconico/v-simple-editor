@@ -39,6 +39,9 @@ struct HDRSettings {
 };
 
 struct ExportConfig {
+    enum class RateControl { Bitrate, Crf };
+    RateControl rateControl = RateControl::Bitrate;
+    int crf = -1; // -1: codec default (23, or 30 for AV1)
     QString outputPath;
     QString videoCodec = "libx264";
     QString audioCodec = "aac";
@@ -90,6 +93,7 @@ private slots:
 private:
     void setupUI();
     void updateSummary();
+    void updateRateControlControls();
     void updateMarkedRangeCheckboxEnabled();
     void regenerateChapters();
     QString defaultExtension() const;
@@ -103,6 +107,8 @@ private:
     QComboBox *m_videoCodecCombo;
     QComboBox *m_audioCodecCombo;
     QComboBox *m_hwEncoderCombo;
+    QComboBox *m_rateControlCombo = nullptr;
+    QSpinBox *m_crfSpin = nullptr;
     QSpinBox *m_videoBitrateSpin;
     QSpinBox *m_audioBitrateSpin;
     QLineEdit *m_outputEdit;

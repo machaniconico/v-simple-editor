@@ -99,6 +99,7 @@ int runEffectPresetSelftest();
 int runEffectTimingSelftest();
 int runExposureAidsSelftest();
 int runExportAuditSelftest();
+int runExportProSelftest();
 int runExportRangeSelftest();
 int runFlipSolidSelftest();
 int runFrameClipboardSelftest();
@@ -502,6 +503,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Increment and Save filename resolver: numbered suffix, unnumbered v002, collision skip, digit width" },
     { "project-diff", "VEDITOR_PROJECT_DIFF_SELFTEST", runProjectDiffSelftest, false,
       "Structural project comparison: matching, properties, effects, transitions and epsilon (7 gates)" },
+    { "export-pro",        "VEDITOR_EXPORT_PRO_SELFTEST",         runExportProSelftest,         false,
+      "Export rate control options and queue persistence" },
     { "export-range",      "VEDITOR_EXPORT_RANGE_SELFTEST",       runExportRangeSelftest,       false,
       "Marked In/Out export frame-range helper (5 gates)" },
     { "tracker-preset",    "VEDITOR_TRACKER_PRESET_SELFTEST",     runTrackerPresetSelftest,      false,

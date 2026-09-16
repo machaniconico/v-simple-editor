@@ -793,7 +793,12 @@ bool RenderQueue::saveQueue(const QString &filePath) const
         obj["startUs"] = static_cast<qint64>(job.startUs);
         obj["endUs"] = static_cast<qint64>(job.endUs);
         obj["passes"] = job.passes;
-        obj["exportConfig"] = job.exportConfig;
+        QJsonObject exportConfig = job.exportConfig;
+        if (exportConfig.value("rateControl").toString("bitrate") == "bitrate")
+            exportConfig.remove("rateControl");
+        if (exportConfig.value("crf").toInt(-1) == -1)
+            exportConfig.remove("crf");
+        obj["exportConfig"] = exportConfig;
         obj["loudnessGainDb"] = job.loudnessGainDb;
         obj["status"] = static_cast<int>(job.status);
         obj["statusString"] = job.statusString();
@@ -1229,6 +1234,10 @@ void RenderQueue::startRenderPipe(int jobIndex)
                     : "timeline contains project lighting");
     }
 
+    request.rateControl = cfg.value("rateControl").toString() == "crf"
+        ? libavcore::EncodeRequest::RateControl::Crf
+        : libavcore::EncodeRequest::RateControl::Bitrate;
+    request.crf = cfg.value("crf").toInt(-1);
     request.videoBitrateBits = jobCopy.bitrateBps;
     if (request.videoBitrateBits <= 0) {
         int videoBitrateKbps = cfg.value("videoBitrate").toInt(0);
@@ -1624,9 +1633,15 @@ void RenderQueue::startRenderPipeSubprocess(int jobIndex)
     if (haveAudio)
         args << QStringLiteral("-map") << QStringLiteral("1:a?");
 
-    // Video codec + bitrate.
+    // Video codec + rate control.
     args << QStringLiteral("-c:v") << videoCodec;
-    {
+    if (cfg.value("rateControl").toString() == "crf") {
+        libavcore::EncodeRequest qualityRequest;
+        qualityRequest.rateControl = libavcore::EncodeRequest::RateControl::Crf;
+        qualityRequest.crf = cfg.value("crf").toInt(-1);
+        for (const auto& option : libavcore::codecOptionsFor(qualityRequest, videoCodec))
+            args << (QStringLiteral("-") + option.first) << option.second;
+    } else {
         int videoBitrateKbps = cfg.value("videoBitrate").toInt(0);
         if (videoBitrateKbps <= 0)
             videoBitrateKbps = jobCopy.bitrateBps > 0

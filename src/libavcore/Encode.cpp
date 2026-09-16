@@ -404,6 +404,75 @@ void FrameEncoder::releaseAll()
     m_audioEncode = false;
 }
 
+QList<QPair<QString, QString>> codecOptionsFor(
+    const EncodeRequest& req, const QString& resolvedEncoderName)
+{
+    QList<QPair<QString, QString>> options;
+    const std::string name = resolvedEncoderName.toStdString();
+    const bool av1 = resolvedEncoderName.contains(QStringLiteral("av1"));
+    const int defaultCrf = av1 ? 30 : 23;
+    const int crf = req.rateControl == EncodeRequest::RateControl::Crf && req.crf != -1
+        ? qBound(0, req.crf, av1 ? 63 : 51) : defaultCrf;
+    const std::string quality = std::to_string(crf);
+    auto add = [&options](const char* key, const char* value) {
+        options.append(qMakePair(QString::fromUtf8(key), QString::fromUtf8(value)));
+    };
+    if (req.rateControl == EncodeRequest::RateControl::Bitrate)
+        options.append(qMakePair(QStringLiteral("bit_rate"),
+                                 QString::number(static_cast<qlonglong>(req.videoBitrateBits))));
+    if (name == "h264_nvenc" || name == "hevc_nvenc"
+        || (name == "av1_nvenc" && req.rateControl == EncodeRequest::RateControl::Crf)) {
+        add("preset", "p4");
+        add("rc", "vbr");
+        add("cq", quality.c_str());
+    } else if (name == "h264_qsv" || name == "hevc_qsv") {
+        add("preset", "medium");
+    } else if (name == "h264_amf" || name == "hevc_amf") {
+        add("quality", "balanced");
+    } else if (name == "libx264" || name == "libx265") {
+        add("preset", "medium");
+        add("crf", quality.c_str());
+        if (name == "libx265") {
+            if (req.isHdr10) {
+                add("profile", "main10");
+                const std::string x265p = buildX265Hdr10Params(
+                    req.hdrMasterMaxNits, req.hdrMasterMinNits,
+                    req.hdrMaxCll, req.hdrMaxFall);
+                add("x265-params", x265p.c_str());
+            } else if (req.isHlg) {
+                add("profile", "main10");
+                add("x265-params", "repeat-headers=1:colorprim=bt2020:"
+                            "transfer=arib-std-b67:colormatrix=bt2020nc");
+            }
+        }
+    } else if (name == "h264_mf" || name == "hevc_mf") {
+        // Windows Media Foundation H.264/HEVC. Without explicit rate control
+        // mfenc defaults to a CBR-style mode that pads easy frames and starves
+        // hard ones, raising decoded-vs-source MSE at a fixed bitrate.
+        // u_vbr (unconstrained VBR) treats bit_rate as an average target and
+        // lets the encoder reallocate bits toward harder frames; the archive
+        // scenario is a fidelity-priority hint (vs latency-priority scenarios
+        // like video_conference / live_streaming). Together they lower the
+        // decoded-vs-source error at the same configured bitrate.
+        add("rate_control", "u_vbr");
+        add("scenario", "archive");
+        add("quality", "100");
+    } else if (name == "libsvtav1") {
+        add("preset", "8");
+        add("crf", quality.c_str());
+    } else if (name == "libvpx-vp9") {
+        add("quality", "good");
+        add("cpu-used", "4");
+        if (req.rateControl == EncodeRequest::RateControl::Crf)
+            add("crf", quality.c_str());
+    } else if (name.rfind("prores", 0) == 0 && req.proresProfile >= 0) {
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "%d", req.proresProfile);
+        add("profile", buf);
+    }
+    return options;
+}
+
 bool FrameEncoder::configureEncoderContext(const EncodeRequest& req,
                                             const AVCodec* encoder,
                                             AVDictionary** outOpts)
@@ -454,7 +523,7 @@ bool FrameEncoder::configureEncoderContext(const EncodeRequest& req,
     }
     m_encCtx->pix_fmt = targetPixFmt;
     m_pixFmt = targetPixFmt;
-    m_encCtx->bit_rate = req.videoBitrateBits;
+    m_encCtx->bit_rate = 0; // CRF has no target bitrate.
 
     if (req.isHdr10) {
         m_encCtx->color_primaries = AVCOL_PRI_BT2020;
@@ -511,57 +580,13 @@ bool FrameEncoder::configureEncoderContext(const EncodeRequest& req,
         m_encCtx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
     }
 
-    // Codec-specific opts — mirrors Exporter.cpp 1:1. `name` was bound to
-    // m_activeEncoderName above for the pixel-format / profile decisions.
-    if (name == "h264_nvenc" || name == "hevc_nvenc") {
-        av_dict_set(outOpts, "preset", "p4", 0);
-        av_dict_set(outOpts, "rc", "vbr", 0);
-        av_dict_set(outOpts, "cq", "23", 0);
-    } else if (name == "h264_qsv" || name == "hevc_qsv") {
-        av_dict_set(outOpts, "preset", "medium", 0);
-    } else if (name == "h264_amf" || name == "hevc_amf") {
-        av_dict_set(outOpts, "quality", "balanced", 0);
-    } else if (name == "libx264" || name == "libx265") {
-        av_dict_set(outOpts, "preset", "medium", 0);
-        av_dict_set(outOpts, "crf", "23", 0);
-        if (name == "libx265") {
-            if (req.isHdr10) {
-                av_dict_set(outOpts, "profile", "main10", 0);
-                const std::string x265p = buildX265Hdr10Params(
-                    req.hdrMasterMaxNits, req.hdrMasterMinNits,
-                    req.hdrMaxCll, req.hdrMaxFall);
-                av_dict_set(outOpts, "x265-params", x265p.c_str(), 0);
-            } else if (req.isHlg) {
-                av_dict_set(outOpts, "profile", "main10", 0);
-                av_dict_set(outOpts,
-                            "x265-params",
-                            "repeat-headers=1:colorprim=bt2020:"
-                            "transfer=arib-std-b67:colormatrix=bt2020nc",
-                            0);
-            }
-        }
-    } else if (name == "h264_mf" || name == "hevc_mf") {
-        // Windows Media Foundation H.264/HEVC. Without explicit rate control
-        // mfenc defaults to a CBR-style mode that pads easy frames and starves
-        // hard ones, raising decoded-vs-source MSE at a fixed bitrate.
-        // u_vbr (unconstrained VBR) treats bit_rate as an average target and
-        // lets the encoder reallocate bits toward harder frames; the archive
-        // scenario is a fidelity-priority hint (vs latency-priority scenarios
-        // like video_conference / live_streaming). Together they lower the
-        // decoded-vs-source error at the same configured bitrate.
-        av_dict_set(outOpts, "rate_control", "u_vbr", 0);
-        av_dict_set(outOpts, "scenario", "archive", 0);
-        av_dict_set(outOpts, "quality", "100", 0);
-    } else if (name == "libsvtav1") {
-        av_dict_set(outOpts, "preset", "8", 0);
-        av_dict_set(outOpts, "crf", "30", 0);
-    } else if (name == "libvpx-vp9") {
-        av_dict_set(outOpts, "quality", "good", 0);
-        av_dict_set(outOpts, "cpu-used", "4", 0);
-    } else if (name.rfind("prores", 0) == 0 && req.proresProfile >= 0) {
-        char buf[16];
-        std::snprintf(buf, sizeof(buf), "%d", req.proresProfile);
-        av_dict_set(outOpts, "profile", buf, 0);
+    for (const auto& option : codecOptionsFor(req, QString::fromStdString(name))) {
+        // bit_rate is a context field, not an encoder private dictionary option.
+        if (option.first == QStringLiteral("bit_rate"))
+            m_encCtx->bit_rate = option.second.toLongLong();
+        else
+            av_dict_set(outOpts, option.first.toUtf8().constData(),
+                        option.second.toUtf8().constData(), 0);
     }
     return true;
 }
@@ -609,6 +634,14 @@ bool FrameEncoder::openEncoderWithFallback(const EncodeRequest& req)
     }
 
     for (const std::string& candidateName : candidates) {
+        // Quality mode must not silently fall back to a bitrate-only encoder.
+        // Unsupported HW candidates fall through to the family's software encoder.
+        if (req.rateControl == EncodeRequest::RateControl::Crf
+            && candidateName != "libx264" && candidateName != "libx265"
+            && candidateName != "libsvtav1" && candidateName != "libvpx-vp9"
+            && candidateName != "h264_nvenc" && candidateName != "hevc_nvenc"
+            && candidateName != "av1_nvenc")
+            continue;
         const AVCodec* encoder = findAllowedEncoderByName(req, candidateName);
         if (!encoder) continue;
 

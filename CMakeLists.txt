@@ -375,6 +375,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     # ED (EDL エクスポート): CMX3600 EDL の純粋書き出しエンジン (放送/Avid/DaVinci 互換)。
     src/EdlExport.h
     src/EdlExport.cpp
+    src/selftests/export_pro_selftest.cpp
     src/selftests/edl_export_selftest.cpp
     # WS (ワークスペース): 名前付きドックレイアウトの純粋モデル (Premiere/Resolve 相当)。
     src/WorkspaceManager.h

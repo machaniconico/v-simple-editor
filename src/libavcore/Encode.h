@@ -13,6 +13,10 @@
 // wrapper is provided behind VEDITOR_LIBAVCORE_WITH_QIMAGE.
 // ===========================================================================
 
+#include <QList>
+#include <QPair>
+#include <QString>
+
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -43,9 +47,11 @@ namespace libavcore {
 std::string hdr10MasterDisplayString(double masterMaxNits, double masterMinNits);
 
 // Request descriptor mirroring the relevant fields of Exporter's ExportConfig.
-// All fields here are pure data (no Qt types) so the header can be included
-// from non-Qt callers.
+// The descriptor uses standard C++ types; codecOptionsFor exposes Qt pairs.
 struct EncodeRequest {
+    enum class RateControl { Bitrate, Crf };
+    RateControl rateControl = RateControl::Bitrate;
+    int crf = -1;
     int width = 0;
     int height = 0;
     int fps = 30;                       // Legacy integral fps fallback.
@@ -92,9 +98,13 @@ struct EncodeRequest {
     // Used by Exporter to restore CodecDetector::isEncoderAvailable()
     // functional-probe semantics that were dropped during the libavcore
     // refactor. Kept as std::function (not Qt callable) so the header stays
-    // Qt-free.
+    // independent of Qt callbacks.
     std::function<bool(const std::string&)> encoderAvailableHook;
 };
+
+// Resolved encoder options; bit_rate denotes AVCodecContext::bit_rate.
+QList<QPair<QString, QString>> codecOptionsFor(
+    const EncodeRequest& req, const QString& resolvedEncoderName);
 
 // RAII encoder session. Construct, then call open(), then pushFrameRgb24()
 // repeatedly with monotonically-increasing pts, then finalize() once.

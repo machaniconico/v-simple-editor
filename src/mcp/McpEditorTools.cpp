@@ -2309,6 +2309,16 @@ void McpEditorTools::registerWriteTools()
             {QStringLiteral("videoCodec"), QJsonObject{
                 {QStringLiteral("type"), QStringLiteral("string")}
             }},
+            {QStringLiteral("rateControl"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("string")},
+                {QStringLiteral("enum"), QJsonArray{QStringLiteral("bitrate"), QStringLiteral("crf")}}
+            }},
+            {QStringLiteral("crf"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("integer")},
+                {QStringLiteral("minimum"), -1},
+                {QStringLiteral("maximum"), 63},
+                {QStringLiteral("description"), QStringLiteral("品質。-1 は既定、H.264/H.265 は 0..51、AV1 は 0..63")}
+            }},
             {QStringLiteral("videoBitrate"), QJsonObject{
                 {QStringLiteral("type"), QStringLiteral("integer")},
                 {QStringLiteral("minimum"), 1},
@@ -2333,6 +2343,8 @@ void McpEditorTools::registerWriteTools()
                                          QStringLiteral("fps"),
                                          QStringLiteral("videoCodec"),
                                          QStringLiteral("videoBitrate"),
+                                         QStringLiteral("rateControl"),
+                                         QStringLiteral("crf"),
                                          QStringLiteral("audioCodec"),
                                          QStringLiteral("audioBitrate")}, err))
                 return {};
@@ -2393,6 +2405,25 @@ void McpEditorTools::registerWriteTools()
                 videoCodec = value.toString().trimmed();
             }
 
+            QString rateControl = QStringLiteral("bitrate");
+            if (args.contains(QStringLiteral("rateControl"))) {
+                const QJsonValue value = args.value(QStringLiteral("rateControl"));
+                if (!value.isString() || (value.toString() != QStringLiteral("bitrate")
+                    && value.toString() != QStringLiteral("crf")))
+                    return setError(err, QStringLiteral("rateControl は bitrate または crf で指定してください")), QJsonObject();
+                rateControl = value.toString();
+            }
+            int crf = -1;
+            if (args.contains(QStringLiteral("crf"))) {
+                const QJsonValue value = args.value(QStringLiteral("crf"));
+                const double number = value.toDouble(-2);
+                const int maximum = videoCodec.contains(QStringLiteral("av1")) ? 63 : 51;
+                if (!value.isDouble() || !std::isfinite(number) || std::floor(number) != number
+                    || number < -1 || number > maximum)
+                    return setError(err, QStringLiteral("crf は -1 または 0..%1 の整数で指定してください").arg(maximum)), QJsonObject();
+                crf = static_cast<int>(number);
+            }
+
             int videoBitrate = 10000; // kbps。ExportConfig の既定値と合わせる。
             if (!positiveInteger(args, QStringLiteral("videoBitrate"),
                                  videoBitrate, &videoBitrate, err))
@@ -2445,6 +2476,10 @@ void McpEditorTools::registerWriteTools()
                 {QStringLiteral("audioBitrate"), audioBitrate},
                 {QStringLiteral("loudnessGainDb"), loudnessGainDb}
             };
+            if (rateControl != QStringLiteral("bitrate"))
+                job.exportConfig.insert(QStringLiteral("rateControl"), rateControl);
+            if (crf != -1)
+                job.exportConfig.insert(QStringLiteral("crf"), crf);
             job.exportConfig.insert(
                 QStringLiteral("timecodeBurnIn"),
                 m_window->m_tcBurnIn.toJson());

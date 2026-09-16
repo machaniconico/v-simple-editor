@@ -135,6 +135,16 @@ void ExportDialog::setupUI()
     }
     codecForm->addRow("Audio Codec:", m_audioCodecCombo);
 
+    m_rateControlCombo = new QComboBox(this);
+    m_rateControlCombo->addItem(tr("ビットレート"));
+    m_rateControlCombo->addItem(tr("品質 (CRF)"));
+    codecForm->addRow(tr("レート制御:"), m_rateControlCombo);
+    m_crfSpin = new QSpinBox(this);
+    m_crfSpin->setRange(0, 51);
+    m_crfSpin->setValue(23);
+    m_crfSpin->setEnabled(false);
+    codecForm->addRow(tr("品質 (CRF):"), m_crfSpin);
+
     m_videoBitrateSpin = new QSpinBox(this);
     m_videoBitrateSpin->setRange(500, 100000);
     m_videoBitrateSpin->setValue(10000);
@@ -254,7 +264,18 @@ void ExportDialog::setupUI()
     connect(exportBtn, &QPushButton::clicked, this, &ExportDialog::onExport);
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
 
-    connect(m_videoCodecCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this]() { updateSummary(); });
+    connect(m_videoCodecCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this]() {
+        const bool av1 = m_videoCodecCombo->currentData().toString().contains("av1");
+        m_crfSpin->setRange(0, av1 ? 63 : 51);
+        m_crfSpin->setValue(av1 ? 30 : 23);
+        updateRateControlControls();
+        updateSummary();
+    });
+    connect(m_rateControlCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this]() {
+        updateRateControlControls();
+        updateSummary();
+    });
+    connect(m_crfSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this]() { updateSummary(); });
     connect(m_videoBitrateSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this]() { updateSummary(); });
     connect(m_audioBitrateSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this]() { updateSummary(); });
     connect(m_hwEncoderCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this]() {
@@ -314,7 +335,7 @@ void ExportDialog::onPresetChanged(int index)
 
     m_videoCodecCombo->setEnabled(isCustom);
     m_audioCodecCombo->setEnabled(isCustom);
-    m_videoBitrateSpin->setEnabled(isCustom);
+    updateRateControlControls();
     m_audioBitrateSpin->setEnabled(isCustom);
 
     if (!isCustom && index < presetList.size()) {
@@ -378,7 +399,7 @@ void ExportDialog::onExportTypeChanged(int index)
     if (m_presetCombo) m_presetCombo->setEnabled(isVideo);
     if (m_videoCodecCombo) m_videoCodecCombo->setEnabled(isVideo);
     if (m_audioCodecCombo) m_audioCodecCombo->setEnabled(isVideo);
-    if (m_videoBitrateSpin) m_videoBitrateSpin->setEnabled(isVideo);
+    updateRateControlControls();
     if (m_audioBitrateSpin) m_audioBitrateSpin->setEnabled(isVideo);
     if (m_hwEncoderCombo) m_hwEncoderCombo->setEnabled(isVideo);
     updateMarkedRangeCheckboxEnabled();
@@ -451,6 +472,10 @@ void ExportDialog::onExport()
     m_config.audioCodec = m_audioCodecCombo->currentData().toString();
     m_config.container = defaultExtension();
     m_config.videoBitrate = m_videoBitrateSpin->value();
+    m_config.rateControl = m_rateControlCombo->currentIndex() == 1
+        ? ExportConfig::RateControl::Crf : ExportConfig::RateControl::Bitrate;
+    m_config.crf = m_config.rateControl == ExportConfig::RateControl::Crf
+        ? m_crfSpin->value() : -1;
     m_config.audioBitrate = m_audioBitrateSpin->value();
     m_config.hwEncoder = m_hwEncoderCombo->currentData().toString();
     m_config.useHardwareAccel = (m_config.hwEncoder != "none");
@@ -513,6 +538,18 @@ QString ExportDialog::defaultExtension() const
     return "mp4";
 }
 
+void ExportDialog::updateRateControlControls()
+{
+    const bool video = static_cast<ExportType>(m_exportTypeCombo->currentData().toInt()) == ExportType::Video;
+    const bool supportsQuality = !m_videoCodecCombo->currentData().toString().startsWith("prores");
+    if (!supportsQuality && m_rateControlCombo->currentIndex() != 0)
+        m_rateControlCombo->setCurrentIndex(0);
+    m_rateControlCombo->setEnabled(video && supportsQuality);
+    const bool crf = m_rateControlCombo->currentIndex() == 1;
+    m_videoBitrateSpin->setEnabled(video && !crf);
+    m_crfSpin->setEnabled(video && crf);
+}
+
 void ExportDialog::updateSummary()
 {
     QString vc = m_videoCodecCombo->currentData().toString();
@@ -526,9 +563,11 @@ void ExportDialog::updateSummary()
         .arg(m_config.hwEncoder.isEmpty() ? "none" : m_config.hwEncoder)
         .arg(m_hwEncoderCombo->currentText());
 
-    m_summaryLabel->setText(QString("%1x%2 %3fps | %4 %5kbps | %6 %7kbps | .%8 | %9")
+    m_summaryLabel->setText(QString("%1x%2 %3fps | %4 %5 | %6 %7kbps | .%8 | %9")
         .arg(m_projectConfig.width).arg(m_projectConfig.height).arg(m_projectConfig.fps)
-        .arg(codecName).arg(m_videoBitrateSpin->value())
+        .arg(codecName).arg(m_rateControlCombo->currentIndex() == 1
+            ? QStringLiteral("CRF %1").arg(m_crfSpin->value())
+            : QStringLiteral("%1kbps").arg(m_videoBitrateSpin->value()))
         .arg(m_audioCodecCombo->currentText()).arg(m_audioBitrateSpin->value())
         .arg(defaultExtension())
         .arg(hwInfo));

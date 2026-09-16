@@ -3750,6 +3750,64 @@ int runMcpSelftest()
         : fail("G56 export_video returns jobId without waiting",
                QStringLiteral("export_video did not return a queued job promptly"));
 
+    // G161: observe the actual RenderJob after the deferred MCP enqueue.
+    // Clear captured jobs synchronously so this argument test starts no encoder.
+    {
+        bool g161 = exportRootReady && timelineReady;
+        const QString qualityPath = exportRoot.filePath(QStringLiteral("quality.mp4"));
+        const QJsonObject qualityResponse = callProjectInfoTool(
+            1610, QStringLiteral("export_video"), QJsonObject{
+                {QStringLiteral("outputPath"), qualityPath},
+                {QStringLiteral("rateControl"), QStringLiteral("crf")},
+                {QStringLiteral("crf"), 20}});
+        const QString qualityId = toolPayload(qualityResponse).value(QStringLiteral("jobId")).toString();
+        g161 &= !qualityId.isEmpty()
+            && !toolResult(qualityResponse).value(QStringLiteral("isError")).toBool(true);
+        const QList<QJsonObject> invalidArguments{
+            {{QStringLiteral("rateControl"), QStringLiteral("invalid")}},
+            {{QStringLiteral("rateControl"), 1}},
+            {{QStringLiteral("crf"), 52}},
+            {{QStringLiteral("crf"), -2}},
+            {{QStringLiteral("crf"), 20.5}},
+            {{QStringLiteral("crf"), QStringLiteral("20")}},
+            {{QStringLiteral("videoCodec"), QStringLiteral("libsvtav1")}, {QStringLiteral("crf"), 64}}
+        };
+        int requestId = 1611;
+        for (auto args : invalidArguments) {
+            args.insert(QStringLiteral("outputPath"), qualityPath);
+            const auto response = callProjectInfoTool(requestId++, QStringLiteral("export_video"), args);
+            g161 &= toolResult(response).value(QStringLiteral("isError")).toBool(false)
+                && toolPayload(response).isEmpty();
+        }
+        auto* queue = projectInfoWindow.findChild<RenderQueue*>();
+        QHash<QString, QJsonObject> captured;
+        if (queue) {
+            const auto connection = QObject::connect(queue, &RenderQueue::jobsChanged,
+                queue, [&]() {
+                    const auto jobs = queue->jobs();
+                    if (jobs.isEmpty()) return;
+                    for (const auto& job : jobs)
+                        captured.insert(job.uuid, job.exportConfig);
+                    queue->clear();
+                });
+            // The test-owned tool instance is allowed through the lifetime guard
+            // only while delivering its queued callbacks.
+            auto* previousTools = projectInfoWindow.m_mcpTools;
+            projectInfoWindow.m_mcpTools = &projectInfoTools;
+            QCoreApplication::processEvents(QEventLoop::AllEvents);
+            projectInfoWindow.m_mcpTools = previousTools;
+            QObject::disconnect(connection);
+        }
+        g161 &= captured.contains(qualityId) && captured.contains(exportJobId)
+            && captured.value(qualityId).value(QStringLiteral("rateControl")).toString() == QStringLiteral("crf")
+            && captured.value(qualityId).value(QStringLiteral("crf")).toInt(-1) == 20
+            && captured.value(exportJobId).value(QStringLiteral("rateControl")).toString(QStringLiteral("bitrate")) == QStringLiteral("bitrate")
+            && captured.value(exportJobId).value(QStringLiteral("crf")).toInt(-1) == -1;
+        g161 ? pass("G161 export_video rate control validation and queue wiring")
+             : fail("G161 export_video rate control validation and queue wiring",
+                    QStringLiteral("CRF validation, queued settings, or bitrate default did not match"));
+    }
+
     QJsonObject knownStatusResponse;
     if (!exportJobId.isEmpty()) {
         knownStatusResponse = callProjectInfoTool(
