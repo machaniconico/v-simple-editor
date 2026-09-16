@@ -902,6 +902,19 @@ QString prepareTimelineAudioMixForExport(Timeline *timeline, QString *error,
         ? forcedDurationSeconds : timeline->totalDuration());
     const QString outputPath = forcedOutputPath.isEmpty()
         ? nextExportAudioMixPath() : forcedOutputPath;
+    // Audio-only export uses a PCM intermediate so lossy encoding happens only
+    // at the final output. Keep the default video-export arguments unchanged.
+    const bool pcmIntermediate = renderInPlace
+        && QFileInfo(outputPath).suffix().compare(QStringLiteral("wav"), Qt::CaseInsensitive) == 0;
+    QStringList outputArgs;
+    if (pcmIntermediate) {
+        outputArgs << QStringLiteral("-c:a") << QStringLiteral("pcm_s16le");
+    } else {
+        outputArgs << QStringLiteral("-c:a") << QStringLiteral("aac")
+                   << QStringLiteral("-b:a") << QStringLiteral("192k")
+                   << QStringLiteral("-movflags") << QStringLiteral("+faststart");
+    }
+    outputArgs << outputPath;
 
     QStringList args;
     args << QStringLiteral("-y");
@@ -939,11 +952,8 @@ QString prepareTimelineAudioMixForExport(Timeline *timeline, QString *error,
              << QStringLiteral("-i")
              << QStringLiteral("anullsrc=channel_layout=stereo:sample_rate=48000")
              << QStringLiteral("-t") << ffmpegNumber(durationSeconds)
-             << QStringLiteral("-vn")
-             << QStringLiteral("-c:a") << QStringLiteral("aac")
-             << QStringLiteral("-b:a") << QStringLiteral("192k")
-             << QStringLiteral("-movflags") << QStringLiteral("+faststart")
-             << outputPath;
+             << QStringLiteral("-vn");
+        args << outputArgs;
         return runFfmpegForAudioMix(args, error) ? outputPath : QString();
     }
 
@@ -976,11 +986,8 @@ QString prepareTimelineAudioMixForExport(Timeline *timeline, QString *error,
 
     args << QStringLiteral("-filter_complex") << chains.join(QStringLiteral(";"))
          << QStringLiteral("-map") << QStringLiteral("[aout]")
-         << QStringLiteral("-vn")
-         << QStringLiteral("-c:a") << QStringLiteral("aac")
-         << QStringLiteral("-b:a") << QStringLiteral("192k")
-         << QStringLiteral("-movflags") << QStringLiteral("+faststart")
-         << outputPath;
+         << QStringLiteral("-vn");
+    args << outputArgs;
 
     return runFfmpegForAudioMix(args, error) ? outputPath : QString();
 }
@@ -9693,7 +9700,7 @@ bool MainWindow::exportAudioOnly(const ExportConfig &config, QString *error)
         return fail(tr("書き出し用の一時フォルダを作成できません。"));
     // Force a complete mix even for a single clip; render no video frames.
     const QString mix = prepareTimelineAudioMixForExport(
-        m_timeline, error, temporary.filePath(QStringLiteral("mix.m4a")), end);
+        m_timeline, error, temporary.filePath(QStringLiteral("mix.wav")), end);
     if (mix.isEmpty()) return false;
     QStringList args{QStringLiteral("-y"), QStringLiteral("-i"), mix,
         QStringLiteral("-ss"), ffmpegNumber(start),

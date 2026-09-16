@@ -95,7 +95,7 @@ private slots:
 private:
     void setupUI();
     void updateSummary();
-    void updateAudioOnlyControls();
+    void updateAudioOnlyControls(bool exportTypeChanged = false);
     void updateRateControlControls();
     void updateMarkedRangeCheckboxEnabled();
     void regenerateChapters();

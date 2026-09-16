@@ -424,21 +424,30 @@ void ExportDialog::setSourceIsHdr(bool hdr)
     }
 }
 
-void ExportDialog::updateAudioOnlyControls()
+void ExportDialog::updateAudioOnlyControls(bool exportTypeChanged)
 {
     const bool video = static_cast<ExportType>(m_exportTypeCombo->currentData().toInt()) == ExportType::Video;
     const bool audio = video && m_audioOnlyCheckbox->isChecked();
     m_audioOnlyCheckbox->setEnabled(video);
     m_audioContainerCombo->setVisible(audio);
-    onPresetChanged(m_presetCombo->currentIndex());
-    m_presetCombo->setEnabled(video && !audio);
-    if (audio) m_hdrWarningLabel->hide();
-    if (!video || audio) {
-        m_videoCodecCombo->setEnabled(false);
-        m_audioCodecCombo->setEnabled(false);
-        m_hwEncoderCombo->setEnabled(false);
+    // Type changes retain the baseline enabled states set by onExportTypeChanged.
+    // Never reapply preset values here: the user may have edited the bitrates.
+    if (exportTypeChanged && !m_audioOnlyCheckbox->isChecked()) {
+        updateSummary();
+        return;
     }
-    m_audioBitrateSpin->setEnabled(video && (audio || m_presetCombo->currentIndex() == presets().size() - 1));
+    const auto presetList = presets();
+    const int index = m_presetCombo->currentIndex();
+    const bool isCustom = index >= presetList.size() - 1;
+    const bool isProRes = !isCustom && index >= 0 && presetList[index].proresProfile >= 0;
+    m_presetCombo->setEnabled(video && !audio);
+    m_hdrWarningLabel->setVisible(!audio && !isCustom && index >= 0
+                                 && presetList[index].hdr10 && !m_sourceIsHdr);
+    m_videoCodecCombo->setEnabled(video && !audio && isCustom);
+    m_audioCodecCombo->setEnabled(video && !audio && isCustom);
+    m_hwEncoderCombo->setEnabled(video && !audio && !isProRes
+                                && !CodecDetector::hwAccelVideoEncoders().isEmpty());
+    m_audioBitrateSpin->setEnabled(video && (audio || isCustom));
     updateRateControlControls();
     updateSummary();
 }
@@ -456,7 +465,7 @@ void ExportDialog::onExportTypeChanged(int index)
     if (m_audioBitrateSpin) m_audioBitrateSpin->setEnabled(isVideo);
     if (m_hwEncoderCombo) m_hwEncoderCombo->setEnabled(isVideo);
     updateMarkedRangeCheckboxEnabled();
-    updateAudioOnlyControls();
+    updateAudioOnlyControls(true);
 }
 
 void ExportDialog::onBrowseOutput()

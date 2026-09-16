@@ -3722,9 +3722,11 @@ int runMcpSelftest()
         bool g162 = exportRootReady && frameFixtureReady;
         auto *queueBefore = projectInfoWindow.m_renderQueue;
         const int jobsBefore = queueBefore ? queueBefore->jobs().size() : 0;
-        const QString audioPath = exportRoot.filePath(QStringLiteral("audio-only.m4a"));
-        if (g162) {
-            const auto response = callProjectInfoTool(1620, QStringLiteral("export_video"), QJsonObject{
+        for (const QString &container : {QStringLiteral("m4a"), QStringLiteral("wav")}) {
+            if (!exportRootReady || !frameFixtureReady) break;
+            const bool wav = container == QStringLiteral("wav");
+            const QString audioPath = exportRoot.filePath(QStringLiteral("audio-only.") + container);
+            const auto response = callProjectInfoTool(wav ? 1622 : 1620, QStringLiteral("export_video"), QJsonObject{
                 {QStringLiteral("audioOnly"), true}, {QStringLiteral("outputPath"), audioPath},
                 {QStringLiteral("width"), 640}});
             const auto payload = toolPayload(response);
@@ -3736,20 +3738,23 @@ int runMcpSelftest()
                 && requiredOutputFieldsPresent(QStringLiteral("export_video"), payload)
                 && QFileInfo(audioPath).size() > 0;
             AVFormatContext *format = nullptr;
-            bool audio = false, video = false;
+            bool audio = false, video = false, expectedCodec = false;
             if (avformat_open_input(&format, audioPath.toUtf8().constData(), nullptr, nullptr) >= 0) {
                 if (avformat_find_stream_info(format, nullptr) >= 0) {
                     for (unsigned int i = 0; i < format->nb_streams; ++i) {
                         audio |= format->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO;
                         video |= format->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO;
+                        expectedCodec |= format->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO
+                            && format->streams[i]->codecpar->codec_id
+                                == (wav ? AV_CODEC_ID_PCM_S16LE : AV_CODEC_ID_AAC);
                     }
                 }
                 avformat_close_input(&format);
             }
             const auto duration = libavcore::probeDurationMicroseconds(audioPath.toStdString());
-            g162 &= audio && !video && duration.has_value()
+            g162 &= audio && !video && expectedCodec && duration.has_value()
                 && std::abs(double(duration.value_or(0)) / 1000000.0 - projectTimeline->totalDuration()) <= 0.1;
-            const auto invalid = callProjectInfoTool(1621, QStringLiteral("export_video"), QJsonObject{
+            const auto invalid = callProjectInfoTool(wav ? 1623 : 1621, QStringLiteral("export_video"), QJsonObject{
                 {QStringLiteral("audioOnly"), QStringLiteral("true")}, {QStringLiteral("outputPath"), audioPath}});
             g162 &= toolResult(invalid).value(QStringLiteral("isError")).toBool(false);
         }
@@ -3757,7 +3762,7 @@ int runMcpSelftest()
             && (!queueBefore || queueBefore->jobs().size() == jobsBefore);
         g162 ? pass("G162 synchronous audio-only export and video-setting warning")
              : fail("G162 synchronous audio-only export and video-setting warning",
-                    QStringLiteral("音声ストリーム、尺、同期応答、警告、またはキュー非起動の検証に失敗"));
+                    QStringLiteral("音声ストリーム、AAC/PCM コーデック、尺、同期応答、警告、またはキュー非起動の検証に失敗"));
     }
 
     const QString exportOutputPath = exportRootReady
