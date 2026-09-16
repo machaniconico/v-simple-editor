@@ -6015,6 +6015,15 @@ void MainWindow::setupMenuBar()
                         paths.insert(clip.filePath);
                 }
             }
+            // Precomposed media lives in child sequences; sequences() includes all nesting levels.
+            for (const TimelineSequence &sequence : m_timeline->sequences()) {
+                for (const auto &tracks : {sequence.videoTracks, sequence.audioTracks}) {
+                    for (const QVector<ClipInfo> &clips : tracks) {
+                        for (const ClipInfo &clip : clips)
+                            paths.insert(clip.filePath);
+                    }
+                }
+            }
         }
         return paths;
     });
