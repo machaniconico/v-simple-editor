@@ -106,6 +106,31 @@ int runExportProSelftest()
     const ExportConfig config;
     roundtrip &= config.rateControl == ExportConfig::RateControl::Bitrate && config.crf == -1;
     gate(4, roundtrip);
+
+    bool av1Fallback = directory.isValid();
+    for (const char* hardwareEncoder : {"av1_qsv", "av1_amf"}) {
+        if (!avcodec_find_encoder_by_name(hardwareEncoder)) {
+            std::fprintf(stderr, "SKIP G5 (%s not registered)\n", hardwareEncoder);
+            continue;
+        }
+        Request fallbackRequest;
+        fallbackRequest.videoCodecName = hardwareEncoder;
+        fallbackRequest.rateControl = Request::RateControl::Crf;
+        fallbackRequest.crf = 30;
+        fallbackRequest.width = 128;
+        fallbackRequest.height = 128;
+        fallbackRequest.outputPath = directory.filePath(
+            QString::fromLatin1(hardwareEncoder) + ".mp4").toStdString();
+        fallbackRequest.encoderAvailableHook = [hardwareEncoder](const std::string& name) {
+            return name == hardwareEncoder || name == "libsvtav1";
+        };
+        libavcore::FrameEncoder encoder;
+        const auto error = encoder.open(fallbackRequest);
+        if (error)
+            std::fprintf(stderr, "G5 %s: %s\n", hardwareEncoder, error->c_str());
+        av1Fallback &= !error.has_value() && encoder.activeEncoderName() == "libsvtav1";
+    }
+    gate(5, av1Fallback);
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
     return failed;
 }

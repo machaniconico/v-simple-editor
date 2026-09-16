@@ -633,6 +633,12 @@ bool FrameEncoder::openEncoderWithFallback(const EncodeRequest& req)
         appendOrderedFamilyFallbacks(candidates, family);
     }
 
+    // Quality mode: an AV1 hardware candidate the CRF filter rejects must fall
+    // through to the family's software encoder, mirroring the H.264/H.265 chain.
+    if (req.rateControl == EncodeRequest::RateControl::Crf
+        && family == EncoderFamily::AV1)
+        appendUnique(candidates, primarySoftwareEncoderName(family));
+
     for (const std::string& candidateName : candidates) {
         // Quality mode must not silently fall back to a bitrate-only encoder.
         // Unsupported HW candidates fall through to the family's software encoder.
