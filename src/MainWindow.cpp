@@ -23,6 +23,7 @@ double exporter_loudnessGainDb();
 #include "UndoManager.h"
 #include "OverlayDialogs.h"
 #include "VideoEffectDialogs.h"
+#include "EffectParamSchema.h"
 #include "EffectPlugin.h"
 #include "ColorGradingPanel.h"
 #include "EffectControlsPanel.h"
@@ -14587,23 +14588,44 @@ void MainWindow::addMask()
 
 void MainWindow::applyWarpEffect()
 {
-    if (!m_timeline->hasSelection()) {
-        QMessageBox::information(this, "Warp", "Select a clip first.");
+    int trackIndex = -1, clipIndex = -1;
+    if (!selectedVideoClipRef(trackIndex, clipIndex)) {
+        QMessageBox::information(this, QStringLiteral("ワープを適用"),
+                                 QStringLiteral("動画クリップを選択してください。"));
         return;
     }
-
-    QStringList warps = {"Mesh Warp", "Puppet Pin", "Bulge", "Pinch", "Twirl",
-                         "Wave", "Ripple", "Spherize", "Fisheye"};
-    bool ok;
-    QString selected = QInputDialog::getItem(this, "Warp / Distortion",
-        "Effect type:", warps, 0, false, &ok);
+    const QVector<VideoEffectType> types = {
+        VideoEffectType::WarpWave, VideoEffectType::WarpRipple,
+        VideoEffectType::WarpSpherize, VideoEffectType::WarpFisheye,
+        VideoEffectType::WarpPinch
+    };
+    QStringList names;
+    for (auto type : types) names.append(VideoEffect::typeName(type));
+    bool ok = false;
+    const QString selected = QInputDialog::getItem(this, QStringLiteral("ワープを適用"),
+        QStringLiteral("種類:"), names, 0, false, &ok);
     if (!ok) return;
-
-    double amount = QInputDialog::getDouble(this, "Warp Amount",
-        "Amount (0.0-1.0):", 0.5, 0.0, 2.0, 2, &ok);
+    const int index = names.indexOf(selected);
+    if (index < 0) return;
+    VideoEffect effect;
+    effect.type = types[index];
+    const auto schema = effectctrl::paramSchemaFor(effect.type);
+    for (const auto &def : schema)
+        effectctrl::setParamValue(effect, def.name, def.defaultVal);
+    const auto &amountDef = schema.first();
+    const double amount = QInputDialog::getDouble(this, QStringLiteral("ワープを適用"),
+        amountDef.displayLabel, amountDef.defaultVal, amountDef.minVal, amountDef.maxVal, 2, &ok);
     if (!ok) return;
-
-    statusBar()->showMessage(QString("Applied %1 (amount: %2)").arg(selected).arg(amount, 0, 'f', 2));
+    effectctrl::setParamValue(effect, amountDef.name, amount);
+    const auto &tracks = m_timeline->videoTracks();
+    if (trackIndex >= tracks.size() || !tracks[trackIndex]
+        || clipIndex >= tracks[trackIndex]->clips().size()) return;
+    const ClipInfo clip = tracks[trackIndex]->clips().at(clipIndex);
+    auto effects = clip.effects;
+    effects.append(effect);
+    // Existing effect-library mutation saves the targeted stack as one undo.
+    m_timeline->setClipEffectsAndKeyframes(trackIndex, clipIndex, effects, clip.keyframes);
+    statusBar()->showMessage(QStringLiteral("ワープを適用しました: %1").arg(selected), 3000);
 }
 
 void MainWindow::editExpressions()

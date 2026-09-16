@@ -1,7 +1,9 @@
 #include "VideoEffect.h"
 #include "EffectParamSchema.h"
 #include "FractalNoise.h"
+#include "WarpDistortion.h"
 #include <QPainter>
+#include <QTransform>
 #include <QtMath>
 #include <QRandomGenerator>
 #include <algorithm>
@@ -473,6 +475,11 @@ QString VideoEffect::typeName(VideoEffectType t)
     case VideoEffectType::RollingShutterRepair: return "ローリングシャッター補正";
     case VideoEffectType::Echo: return "エコー(残像)";
     case VideoEffectType::LogToRec709: return "カメラ Log → Rec.709";
+    case VideoEffectType::WarpWave: return "ワープ: ウェーブ";
+    case VideoEffectType::WarpRipple: return "ワープ: リップル";
+    case VideoEffectType::WarpSpherize: return "ワープ: 球面化";
+    case VideoEffectType::WarpFisheye: return "ワープ: 魚眼";
+    case VideoEffectType::WarpPinch: return "ワープ: ピンチ";
     case VideoEffectType::LensDistortion: return "レンズ歪み補正";
     }
     return "Unknown";
@@ -504,7 +511,10 @@ QVector<VideoEffectType> VideoEffect::allTypes()
              VideoEffectType::CornerPinSimple, VideoEffectType::FilmGrain,
              VideoEffectType::Echo, VideoEffectType::LensDistortion,
              VideoEffectType::RollingShutterRepair, VideoEffectType::Flip,
-             VideoEffectType::LumaKey, VideoEffectType::ColorKey, VideoEffectType::LogToRec709 };
+             VideoEffectType::LumaKey, VideoEffectType::ColorKey, VideoEffectType::LogToRec709,
+             VideoEffectType::WarpWave, VideoEffectType::WarpRipple,
+             VideoEffectType::WarpSpherize, VideoEffectType::WarpFisheye,
+             VideoEffectType::WarpPinch };
 }
 
 VideoEffect VideoEffect::createLogToRec709(int input, double exposure, int output)
@@ -683,6 +693,13 @@ static QColor defaultColorForParam(const VideoEffect &effect, const QString &par
 
 double paramValue(const VideoEffect &effect, const QString &paramName)
 {
+    if (effect.type >= VideoEffectType::WarpWave && effect.type <= VideoEffectType::WarpPinch) {
+        const auto schema = paramSchemaFor(effect.type);
+        for (int i = 0; i < schema.size(); ++i)
+            if (schema[i].name == paramName)
+                return i == 0 ? effect.param1 : (i == 1 ? effect.param2 : effect.param3);
+        return 0.0;
+    }
     if (effect.type == VideoEffectType::LogToRec709) {
         if (paramName == "input") return effect.param1;
         if (paramName == "exposure") return effect.param2;
@@ -900,6 +917,18 @@ double paramValue(const VideoEffect &effect, const QString &paramName)
 
 void setParamValue(VideoEffect &effect, const QString &paramName, double value)
 {
+    if (effect.type >= VideoEffectType::WarpWave && effect.type <= VideoEffectType::WarpPinch) {
+        const auto schema = paramSchemaFor(effect.type);
+        for (int i = 0; i < schema.size(); ++i) {
+            const auto &def = schema[i];
+            if (def.name != paramName) continue;
+            if (!std::isfinite(value)) value = def.defaultVal;
+            double &target = i == 0 ? effect.param1 : (i == 1 ? effect.param2 : effect.param3);
+            target = std::clamp(value, def.minVal, def.maxVal);
+            return;
+        }
+        return;
+    }
     if (effect.type == VideoEffectType::LogToRec709) {
         if (!std::isfinite(value)) value = 0.0;
         if (paramName == "input") effect.param1 = std::round(std::clamp(value, 0.0, 3.0));
@@ -1687,6 +1716,11 @@ QImage VideoEffectProcessor::applyEffect(const QImage &input, const VideoEffect 
     if (!effect.enabled || effect.type == VideoEffectType::None) return input;
 
     switch (effect.type) {
+    case VideoEffectType::WarpWave: return applyWarpWave(input, effect);
+    case VideoEffectType::WarpRipple: return applyWarpRipple(input, effect);
+    case VideoEffectType::WarpSpherize: return applyWarpSpherize(input, effect);
+    case VideoEffectType::WarpFisheye: return applyWarpFisheye(input, effect);
+    case VideoEffectType::WarpPinch: return applyWarpPinch(input, effect);
     case VideoEffectType::Blur:      return applyBlur(input, effect.param1);
     case VideoEffectType::Sharpen:   return applySharpen(input, effect.param1);
     case VideoEffectType::Mosaic:    return applyMosaic(input, effect.param1);
@@ -3817,4 +3851,120 @@ QImage VideoEffectProcessor::applyLogToRec709(const QImage &input, const VideoEf
         }
     }
     return result;
+}
+
+// US-404: shared CPU kernels for clip-local preview and timeline export.
+namespace {
+thread_local bool g_warpEnabled = true;
+thread_local int g_warpInvocations = 0;
+constexpr double kWarpTau = 6.28318530717958647692;
+
+double warpParam(double value, double low, double high)
+{
+    return std::isfinite(value) ? std::clamp(value, low, high) : low;
+}
+
+bool skipWarp(const QImage &image, const VideoEffect &effect)
+{
+    return !g_warpEnabled || image.isNull() || !std::isfinite(effect.param1)
+        || effect.param1 == 0.0;
+}
+
+WarpConfig radialWarpConfig(const QImage &image, WarpType type, double radius)
+{
+    WarpConfig config;
+    config.type = type;
+    // Individual WarpDistortion kernels take pixel coordinates and radii.
+    config.center = QPointF(image.width() * 0.5, image.height() * 0.5);
+    config.radius = warpParam(radius, 0.0, 1.0) * std::min(image.width(), image.height());
+    return config;
+}
+}
+
+void VideoEffectProcessor::setWarpEnabledForTesting(bool enabled)
+{
+    g_warpEnabled = enabled;
+    g_warpInvocations = 0;
+}
+
+int VideoEffectProcessor::warpInvocationCountForTesting()
+{
+    return g_warpInvocations;
+}
+
+QImage VideoEffectProcessor::applyWarpWave(const QImage &input, const VideoEffect &effect)
+{
+    if (skipWarp(input, effect)) return input;
+    WarpConfig config;
+    config.type = WarpType::Wave;
+    config.amplitude = warpParam(effect.param1, 0.0, 100.0);
+    if (config.amplitude == 0.0) return input;
+    // UI frequency is cycles over image height; phase is cycles, not radians.
+    config.frequency = kWarpTau * warpParam(effect.param2, 0.1, 20.0) / input.height();
+    config.phase = kWarpTau * warpParam(effect.param3, 0.0, 1.0);
+    ++g_warpInvocations;
+    // The legacy kernel offsets Y as a function of X. Transposing both sides
+    // gives horizontal displacement per row without changing that kernel.
+    const QTransform transpose(0, 1, 1, 0, 0, 0);
+    return WarpDistortion::applyWave(input.transformed(transpose), config.amplitude,
+                                    config.frequency, config.phase).transformed(transpose);
+}
+
+QImage VideoEffectProcessor::applyWarpRipple(const QImage &input, const VideoEffect &effect)
+{
+    if (skipWarp(input, effect)) return input;
+    WarpConfig config = radialWarpConfig(input, WarpType::Ripple, effect.param3);
+    config.amplitude = warpParam(effect.param1, 0.0, 100.0);
+    if (config.radius == 0.0 || config.amplitude == 0.0) return input;
+    config.frequency = kWarpTau * warpParam(effect.param2, 0.1, 20.0)
+        / std::min(input.width(), input.height());
+    ++g_warpInvocations;
+    QImage result = WarpDistortion::applyRipple(input, config.center,
+                                               config.amplitude, config.frequency);
+    // Ripple's legacy signature has no radius. Restore the exterior exactly.
+    const QImage source = input.convertToFormat(QImage::Format_ARGB32);
+    for (int y = 0; y < result.height(); ++y) {
+        auto *row = reinterpret_cast<QRgb *>(result.scanLine(y));
+        const auto *original = reinterpret_cast<const QRgb *>(source.constScanLine(y));
+        for (int x = 0; x < result.width(); ++x) {
+            const double dx = x - config.center.x(), dy = y - config.center.y();
+            if (dx * dx + dy * dy >= config.radius * config.radius)
+                row[x] = original[x];
+        }
+    }
+    return result;
+}
+
+QImage VideoEffectProcessor::applyWarpSpherize(const QImage &input, const VideoEffect &effect)
+{
+    if (skipWarp(input, effect)) return input;
+    WarpConfig config = radialWarpConfig(input, WarpType::Spherize, effect.param2);
+    if (config.radius == 0.0) return input;
+    config.amount = warpParam(effect.param1, -1.0, 1.0);
+    ++g_warpInvocations;
+    return WarpDistortion::applySpherize(input, config.center, config.radius, config.amount);
+}
+
+QImage VideoEffectProcessor::applyWarpFisheye(const QImage &input, const VideoEffect &effect)
+{
+    if (skipWarp(input, effect)) return input;
+    WarpConfig config = radialWarpConfig(input, WarpType::Fisheye, 0.5);
+    const double amount = warpParam(effect.param1, 0.0, 1.0);
+    if (amount == 0.0) return input;
+    // Kernel power=1 is identity; >1 samples inward, moving features outward.
+    config.amount = 1.0 + amount;
+    ++g_warpInvocations;
+    return WarpDistortion::applyFisheye(input, config.center, config.radius, config.amount);
+}
+
+QImage VideoEffectProcessor::applyWarpPinch(const QImage &input, const VideoEffect &effect)
+{
+    if (skipWarp(input, effect)) return input;
+    WarpConfig config = radialWarpConfig(input, WarpType::Pinch, effect.param2);
+    const double amount = warpParam(effect.param1, 0.0, 1.0);
+    if (config.radius == 0.0 || amount == 0.0) return input;
+    // Kernel exponent=1/amount: >1 samples outward, moving features inward.
+    config.amount = 1.0 + amount;
+    ++g_warpInvocations;
+    return WarpDistortion::applyPinch(input, config.center, config.radius, config.amount);
 }

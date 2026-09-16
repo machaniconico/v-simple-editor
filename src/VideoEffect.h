@@ -176,7 +176,12 @@ enum class VideoEffectType {
     Flip,
     LumaKey,
     ColorKey,
-    LogToRec709
+    LogToRec709,
+    WarpWave,
+    WarpRipple,
+    WarpSpherize,
+    WarpFisheye,
+    WarpPinch
 };
 
 struct VideoEffect {
@@ -230,6 +235,11 @@ struct VideoEffect {
     //   MotionTile: p1=tilesX(1..10), p2=tilesY(1..10), p3=mirrorEdges(0/1). 1x1 is no-op.
     //   CornerPinSimple: p1=horizontalTilt(-100..100), p2=verticalTilt(-100..100)
     //   FilmGrain: p1=amount(0..1), p2=size(1..4), p3=colorAmount(0..1), keyColor.red=seedPerFrame(0/1)
+    //   WarpWave: p1=amplitude px(0..100), p2=cycles over height(0.1..20), p3=phase cycles(0..1)
+    //   WarpRipple: p1=amplitude px(0..100), p2=cycles over short side(0.1..20), p3=radius/short side(0..1)
+    //   WarpSpherize: p1=amount(-1..1), p2=radius/short side(0..1)
+    //   WarpFisheye: p1=amount(0..1), fixed radius=short side/2
+    //   WarpPinch: p1=amount(0..1), p2=radius/short side(0..1)
     //   LensDistortion: p1=k1, p2=k2, p3=scale (factory default 1).
     //     keyColor RGB packs two 12-bit centers: round(center*4000)+2000,
     //     X in high 12 bits, Y in low 12 bits (0.00025 precision, HexRgb-safe).
@@ -337,12 +347,20 @@ public:
     static int logToRec709InvocationCountForTesting();
     // Scene-linear gamut conversion, shared by the CPU kernel and numerical gates.
     static void logToRec709Gamut(int input, float &r, float &g, float &b);
+    // Calling-thread switch; resets the shared Warp kernel invocation counter.
+    static void setWarpEnabledForTesting(bool enabled);
+    static int warpInvocationCountForTesting();
     static QImage applyEffect(const QImage &input, const VideoEffect &effect);
     static QImage applyEffectStack(const QImage &input, const ColorCorrection &cc,
                                    const QVector<VideoEffect> &effects);
     static void adjustTemperatureTint(QImage &img, double temperature, double tint);
 
 private:
+    static QImage applyWarpWave(const QImage &input, const VideoEffect &effect);
+    static QImage applyWarpRipple(const QImage &input, const VideoEffect &effect);
+    static QImage applyWarpSpherize(const QImage &input, const VideoEffect &effect);
+    static QImage applyWarpFisheye(const QImage &input, const VideoEffect &effect);
+    static QImage applyWarpPinch(const QImage &input, const VideoEffect &effect);
     static QImage applyLogToRec709(const QImage &input, const VideoEffect &effect);
     static void adjustBrightnessContrast(QImage &img, double brightness, double contrast);
     static void adjustSaturation(QImage &img, double saturation);

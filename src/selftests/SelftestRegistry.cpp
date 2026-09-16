@@ -213,6 +213,7 @@ int runVersionedSaveSelftest();
 int runProjectDiffSelftest();
 int runVideostabDeshakeSelftest();
 int runVimeoSelftest();
+int runWarpFxSelftest();
 int runWatermarkSelftest();
 int runWbEyedropperSelftest();
 int runWhisperGuideSelftest();
@@ -882,6 +883,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Subtitle translation pipeline smoke (locale map + subtitle track swap)" },
     { "lowerthird",        "VEDITOR_LOWERTHIRD_SELFTEST",         runLowerThirdSelftest,         true,
       "Lower-third title module smoke (template render + animator keyframes)" },
+    { "warp-fx", "VEDITOR_WARP_FX_SELFTEST", runWarpFxSelftest, false,
+      "Parametric CPU warps: identity, geometry, determinism, presets and shared render path (7 gates)" },
     { "watermark",         "VEDITOR_WATERMARK_SELFTEST",          runWatermarkSelftest,          true,
       "Watermark overlay smoke (tile / corner placement + opacity blend)" },
     { "libavcore-encode",  "VEDITOR_LIBAVCORE_ENCODE_SELFTEST",   runLibavcoreEncodeSelftest,    true,

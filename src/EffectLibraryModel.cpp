@@ -118,6 +118,11 @@ QString videoCategory(VideoEffectType type)
     case VideoEffectType::PolarCoordinates:
     case VideoEffectType::MotionTile:
     case VideoEffectType::RollingShutterRepair:
+    case VideoEffectType::WarpWave:
+    case VideoEffectType::WarpRipple:
+    case VideoEffectType::WarpSpherize:
+    case VideoEffectType::WarpFisheye:
+    case VideoEffectType::WarpPinch:
     case VideoEffectType::LensDistortion:
     case VideoEffectType::CornerPinSimple:
         return QStringLiteral("ディストーション");

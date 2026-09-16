@@ -326,7 +326,7 @@ int runEffectPresetSelftest()
           loadedInclude
               && includePreset.includesKeyframes
               && includePreset.effects.size() == supportedTypes().size()
-              && supportedTypes().size() == 55
+              && supportedTypes().size() == 60
               && sameColorCorrection(includePreset.colorCorrection, source.colorCorrection)
               && sameEffects(includePreset.effects, source.effects)
               && sameKeyframes(includePreset.keyframes, sourceEffectKf),

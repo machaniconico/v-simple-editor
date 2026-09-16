@@ -131,6 +131,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/noise_print_selftest.cpp
     src/selftests/GradeLggSerializationSelftest.cpp
     src/selftests/color_warper_selftest.cpp
+    src/selftests/warp_fx_selftest.cpp
     src/selftests/GradeLogWheelSelftest.cpp
     src/selftests/GradeKeyframeSelftest.cpp
     src/selftests/grade_keyframe_ext_selftest.cpp

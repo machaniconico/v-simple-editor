@@ -92,6 +92,11 @@ QString effectTypeKey(VideoEffectType type)
     case VideoEffectType::LogToRec709: return QStringLiteral("LogToRec709");
     case VideoEffectType::RollingShutterRepair: return QStringLiteral("RollingShutterRepair");
     case VideoEffectType::Echo: return QStringLiteral("Echo");
+    case VideoEffectType::WarpWave: return QStringLiteral("WarpWave");
+    case VideoEffectType::WarpRipple: return QStringLiteral("WarpRipple");
+    case VideoEffectType::WarpSpherize: return QStringLiteral("WarpSpherize");
+    case VideoEffectType::WarpFisheye: return QStringLiteral("WarpFisheye");
+    case VideoEffectType::WarpPinch: return QStringLiteral("WarpPinch");
     case VideoEffectType::LensDistortion: return QStringLiteral("LensDistortion");
     }
     return QStringLiteral("None");

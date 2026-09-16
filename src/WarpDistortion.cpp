@@ -837,9 +837,7 @@ QImage WarpDistortion::applyRipple(const QImage &image, QPointF center,
             double srcX = px + (dx / dist) * offset;
             double srcY = py + (dy / dist) * offset;
 
-            if (srcX >= 0 && srcX < w && srcY >= 0 && srcY < h) {
-                scanline[px] = bilinearSample(src, srcX, srcY);
-            }
+            scanline[px] = bilinearSample(src, srcX, srcY);
         }
     }
 

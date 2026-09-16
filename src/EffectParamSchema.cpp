@@ -285,6 +285,31 @@ QVector<ParamDef> paramSchemaFor(VideoEffectType type)
             { "seedPerFrame", "フレーム毎にシード", ParamType::Bool, 0.0, 1.0, 1.0 }
         };
 
+    case VideoEffectType::WarpWave:
+        return {
+            { "amplitude", "振幅 (px)", ParamType::Float, 0.0, 100.0, 10.0 },
+            { "frequency", "周波数", ParamType::Float, 0.1, 20.0, 2.0 },
+            { "phase", "位相", ParamType::Float, 0.0, 1.0, 0.0 }
+        };
+    case VideoEffectType::WarpRipple:
+        return {
+            { "amplitude", "振幅 (px)", ParamType::Float, 0.0, 100.0, 10.0 },
+            { "frequency", "周波数", ParamType::Float, 0.1, 20.0, 2.0 },
+            { "radius", "半径 (短辺比)", ParamType::Float, 0.0, 1.0, 0.5 }
+        };
+    case VideoEffectType::WarpSpherize:
+        return {
+            { "amount", "量", ParamType::Float, -1.0, 1.0, 0.5 },
+            { "radius", "半径 (短辺比)", ParamType::Float, 0.0, 1.0, 0.5 }
+        };
+    case VideoEffectType::WarpFisheye:
+        return { { "amount", "量", ParamType::Float, 0.0, 1.0, 0.5 } };
+    case VideoEffectType::WarpPinch:
+        return {
+            { "amount", "量", ParamType::Float, 0.0, 1.0, 0.5 },
+            { "radius", "半径 (短辺比)", ParamType::Float, 0.0, 1.0, 0.5 }
+        };
+
     case VideoEffectType::RollingShutterRepair:
         return {
             { "rate", "走査時間", ParamType::Float, 0.0, 1.0, 0.5 },
