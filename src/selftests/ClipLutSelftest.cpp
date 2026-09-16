@@ -3,8 +3,10 @@
 // Verifies the GAP-4 contract: ProjectFile persists per-clip LUT fields,
 // renderFrameAt consumes them, and clips without LUT state stay byte-identical.
 
+#include "../MainWindow.h"
 #include "../ProjectFile.h"
 #include "../Timeline.h"
+#include "../UndoManager.h"
 #include "../TimelineFrameRenderer.h"
 #include "../libavcore/Encode.h"
 
@@ -270,6 +272,63 @@ int runClipLutSelftest()
           !untouchedFrame.isNull()
               && !untouchedBaseline.isNull()
               && equalRgbaBytes(untouchedFrame, untouchedBaseline));
+
+    // US-500: exercise the same non-dialog entry point as both LUT menus.
+    MainWindow window;
+    Timeline *menuTimeline = window.findChild<Timeline *>();
+    bool menuOk = menuTimeline && menuTimeline->undoManager();
+    if (menuOk) {
+        setTimelineClips(*menuTimeline, QVector<ClipInfo>{plain});
+        menuTimeline->clearSelection();
+        const quint64 beforeRejected = menuTimeline->undoManager()->saveSerial();
+        menuOk = !window.applyLutFileToSelectedClip(lutPath)
+            && menuTimeline->videoClips().first().lutFilePath.isEmpty()
+            && menuTimeline->undoManager()->saveSerial() == beforeRejected
+            && window.statusBar()->currentMessage()
+                == QStringLiteral("映像クリップを選択してください。");
+        menuOk = menuTimeline->selectClipByIndex(false, 0, 0, &error) && menuOk;
+        menuTimeline->undoManager()->clear();
+        menuTimeline->undoManager()->saveState(menuTimeline->currentState(),
+                                              QStringLiteral("Menu LUT baseline"));
+        const quint64 beforeApply = menuTimeline->undoManager()->saveSerial();
+        const QImage before = tlrender::renderFrameAt(menuTimeline, 200000, outSize);
+        const bool applied = window.applyLutFileToSelectedClip(lutPath);
+        const QImage after = tlrender::renderFrameAt(menuTimeline, 200000, outSize);
+        const ClipInfo appliedClip = menuTimeline->videoClips().first();
+        menuOk = menuOk && applied
+            && appliedClip.lutFilePath == lutPath
+            && near(appliedClip.lutIntensity, 1.0)
+            && menuTimeline->undoManager()->saveSerial() == beforeApply + 1
+            && !before.isNull() && !after.isNull()
+            && !equalRgbaBytes(before, after);
+
+        ProjectData menuReloaded;
+        const QString menuProjectPath = tmpDir.filePath(QStringLiteral("menu_lut.veditor"));
+        const bool roundtrip = ProjectFile::save(
+            menuProjectPath, projectWithTrack(menuTimeline->videoClips()))
+            && ProjectFile::load(menuProjectPath, menuReloaded)
+            && menuReloaded.videoTracks.size() == 1
+            && menuReloaded.videoTracks.first().size() == 1
+            && menuReloaded.videoTracks.first().first().lutFilePath == lutPath
+            && near(menuReloaded.videoTracks.first().first().lutIntensity, 1.0);
+        menuOk = menuOk && roundtrip;
+        if (roundtrip) {
+            Timeline restored;
+            setTimelineClips(restored, menuReloaded.videoTracks.first());
+            menuOk = equalRgbaBytes(after,
+                tlrender::renderFrameAt(&restored, 200000, outSize)) && menuOk;
+        }
+        // Reapplying the same LUT must not create a second undo entry.
+        const bool reapplied = window.applyLutFileToSelectedClip(lutPath);
+        menuOk = menuOk && reapplied
+            && menuTimeline->undoManager()->saveSerial() == beforeApply + 1;
+        menuTimeline->undo();
+        menuOk = menuOk && menuTimeline->videoClips().first().lutFilePath.isEmpty()
+            && !menuTimeline->undoManager()->canUndo()
+            && equalRgbaBytes(before,
+                tlrender::renderFrameAt(menuTimeline, 200000, outSize));
+    }
+    check(10, "MainWindow menu LUT: selection, one undo, save/load and render", menuOk);
 
     qInfo().noquote() << QStringLiteral("[clip-lut] summary: %1 PASS, %2 FAIL")
         .arg(passed).arg(failed);

@@ -5494,9 +5494,10 @@ void MainWindow::setupMenuBar()
     effectsMenu->addSeparator();
 
     auto *lutAction = effectsMenu->addAction("LUT適用 (.cube)...");
+    lutAction->setToolTip(QStringLiteral("選択クリップに適用 (書き出しにも反映)"));
     connect(lutAction, &QAction::triggered, this, &MainWindow::applyLut);
     m_menuHelpEntries.append({lutAction,
-        QStringLiteral("用意された色味のレシピ（LUT ファイル）を読み込んで、映像の色を一発で変えます。")});
+        QStringLiteral("用意された色味のレシピ（LUT ファイル）を読み込んで、映像の色を一発で変えます。選択クリップに適用 (書き出しにも反映)")});
 
     auto *manageLutAction = effectsMenu->addAction("LUT管理...");
     connect(manageLutAction, &QAction::triggered, this, &MainWindow::manageLuts);
@@ -12207,14 +12208,45 @@ void MainWindow::openDeflicker()
     dialog.exec();
 }
 
+bool MainWindow::applyLutFileToSelectedClip(const QString &path)
+{
+    int trackIdx = -1;
+    int clipIdx = -1;
+    if (!selectedVideoClipRef(trackIdx, clipIdx)
+        || m_timeline->videoTracks().at(trackIdx)->selectedClip() != clipIdx) {
+        statusBar()->showMessage(QStringLiteral("映像クリップを選択してください。"), 3000);
+        return false;
+    }
+
+    LutData lut = LutImporter::loadCubeFile(path);
+    if (!lut.isValid()) {
+        statusBar()->showMessage(QStringLiteral("LUT ファイルを読み込めませんでした。"), 3000);
+        return false;
+    }
+    lut.intensity = 1.0;
+    if (!m_timeline->setClipLut(trackIdx, clipIdx, path, 1.0))
+        return false;
+
+    // US-500: persist for export, then seed the preview just like the grading panel.
+    if (m_player && m_player->glPreview())
+        m_player->glPreview()->setLut(lut);
+    if (m_lutIntensitySlider)
+        m_lutIntensitySlider->setValue(100);
+    statusBar()->showMessage(QStringLiteral("選択クリップに LUT を適用: %1").arg(lut.name));
+    return true;
+}
+
 void MainWindow::applyLut()
 {
-    if (!m_timeline->hasSelection()) {
-        QMessageBox::information(this, "LUT", "Select a clip first.");
+    int trackIdx = -1;
+    int clipIdx = -1;
+    if (!selectedVideoClipRef(trackIdx, clipIdx)
+        || m_timeline->videoTracks().at(trackIdx)->selectedClip() != clipIdx) {
+        statusBar()->showMessage(QStringLiteral("映像クリップを選択してください。"), 3000);
         return;
     }
 
-    // Offer built-in or custom LUT
+    // Offer built-in or custom LUT; both now persist on the selected clip.
     QStringList options;
     for (const auto &lut : LutLibrary::instance().allLuts())
         options << lut.name;
@@ -12225,64 +12257,43 @@ void MainWindow::applyLut()
         "Select LUT:", options, 0, false, &ok);
     if (!ok) return;
 
-    LutData lut;
     if (selected == "Load .cube file...") {
         QString path = QFileDialog::getOpenFileName(this, "Load LUT",
             QString(), "Cube LUT (*.cube);;All Files (*)");
-        if (path.isEmpty()) return;
-        lut = LutImporter::loadCubeFile(path);
-        if (!lut.isValid()) {
-            QMessageBox::warning(this, "LUT Error", "Could not parse LUT file.");
-            return;
-        }
+        if (path.isEmpty() || !applyLutFileToSelectedClip(path)) return;
         LutLibrary::instance().addLut(path);
         LutLibrary::instance().savePaths();
         if (m_colorGradingPanel)
             m_colorGradingPanel->setLutList(LutLibrary::instance().allLuts());
     } else {
-        auto found = LutLibrary::instance().findByName(selected);
-        if (!found.isValid()) return;
-        lut = found;
+        const LutData lut = LutLibrary::instance().findByName(selected);
+        const QString path = lutPathForClipExport(lut);
+        if (path.isEmpty()) {
+            statusBar()->showMessage(QStringLiteral("LUT ファイルを準備できませんでした。"), 3000);
+            return;
+        }
+        applyLutFileToSelectedClip(path);
     }
-
-    double intensity = QInputDialog::getDouble(this, "LUT Intensity",
-        "Intensity (0.0-1.0):", 1.0, 0.0, 1.0, 2, &ok);
-    if (!ok) return;
-    lut.intensity = intensity;
-
-    if (m_player)
-        m_player->glPreview()->setLut(lut);
-    if (m_lutIntensitySlider)
-        m_lutIntensitySlider->setValue(static_cast<int>(intensity * 100.0));
-
-    statusBar()->showMessage(QString("Applied LUT: %1 (intensity %2)")
-        .arg(lut.name).arg(intensity, 0, 'f', 1));
 }
 
 void MainWindow::loadLutCubeFile()
 {
-    QString path = QFileDialog::getOpenFileName(this, "LUT を読み込み",
-        QString(), "Cube LUT (*.cube);;All Files (*)");
-    if (path.isEmpty()) return;
-
-    LutData lut = LutImporter::loadCubeFile(path);
-    if (!lut.isValid()) {
-        QMessageBox::warning(this, "LUT Error", "Could not parse LUT file.");
+    int trackIdx = -1;
+    int clipIdx = -1;
+    if (!selectedVideoClipRef(trackIdx, clipIdx)
+        || m_timeline->videoTracks().at(trackIdx)->selectedClip() != clipIdx) {
+        statusBar()->showMessage(QStringLiteral("映像クリップを選択してください。"), 3000);
         return;
     }
 
-    if (m_player)
-        m_player->glPreview()->setLut(lut);
-
-    if (m_lutIntensitySlider)
-        m_lutIntensitySlider->setValue(100);
+    QString path = QFileDialog::getOpenFileName(this, "LUT を読み込み",
+        QString(), "Cube LUT (*.cube);;All Files (*)");
+    if (path.isEmpty() || !applyLutFileToSelectedClip(path)) return;
 
     LutLibrary::instance().addLut(path);
     LutLibrary::instance().savePaths();
     if (m_colorGradingPanel)
         m_colorGradingPanel->setLutList(LutLibrary::instance().allLuts());
-
-    statusBar()->showMessage(QString("LUT 読み込み: %1").arg(lut.name));
 }
 
 void MainWindow::clearLutIntensity()

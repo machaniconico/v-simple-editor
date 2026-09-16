@@ -251,6 +251,9 @@ public:
     explicit MainWindow(QWidget *parent = nullptr);
     ~MainWindow() override;
 
+    // Apply a file LUT to the selected video clip with one undo step.
+    bool applyLutFileToSelectedClip(const QString &path);
+
     struct PrecomposeResult {
         bool success = false;
         QString failureReason;

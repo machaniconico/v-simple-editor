@@ -742,7 +742,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "hsl-secondary",     "VEDITOR_HSL_SECONDARY_SELFTEST",       runHslSecondarySelftest,       true,
       "HSL secondary qualifier: per-clip ProjectFile round-trip + renderFrameAt reflection + off-path byte identity" },
     { "clip-lut",          "VEDITOR_CLIP_LUT_SELFTEST",            runClipLutSelftest,            true,
-      "Clip LUT: per-clip ProjectFile round-trip + renderFrameAt LUT reflection + no-LUT byte-identical gate" },
+      "Clip LUT G1-G10: ProjectFile round-trip, render reflection, no-LUT identity, MainWindow menu application + undo" },
     { "shape-clip",        "VEDITOR_SHAPE_CLIP_SELFTEST",          runShapeClipSelftest,          true,
       "Shape clip G1-G10: JSON, raster SSOT, preview/export, trim/repeater, modifier dialog + undo, legacy brush byte identity" },
     { "colormatch-apply",  "VEDITOR_COLORMATCH_APPLY_SELFTEST",    runColorMatchApplySelftest,    true,
