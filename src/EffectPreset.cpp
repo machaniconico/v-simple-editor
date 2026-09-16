@@ -42,6 +42,8 @@ QString effectTypeKey(VideoEffectType type)
     case VideoEffectType::Blur: return QStringLiteral("Blur");
     case VideoEffectType::Sharpen: return QStringLiteral("Sharpen");
     case VideoEffectType::Mosaic: return QStringLiteral("Mosaic");
+    case VideoEffectType::LumaKey: return QStringLiteral("LumaKey");
+    case VideoEffectType::ColorKey: return QStringLiteral("ColorKey");
     case VideoEffectType::ChromaKey: return QStringLiteral("ChromaKey");
     case VideoEffectType::Vignette: return QStringLiteral("Vignette");
     case VideoEffectType::Sepia: return QStringLiteral("Sepia");

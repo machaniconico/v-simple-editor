@@ -173,7 +173,9 @@ enum class VideoEffectType {
     Echo,
     LensDistortion,
     RollingShutterRepair,
-    Flip
+    Flip,
+    LumaKey,
+    ColorKey
 };
 
 struct VideoEffect {
@@ -246,6 +248,11 @@ struct VideoEffect {
     static VideoEffect createBlur(double radius = 5.0);
     static VideoEffect createSharpen(double amount = 1.5);
     static VideoEffect createMosaic(double blockSize = 10.0);
+    // LumaKey: p1=lower, p2=upper, p3=softness; ColorKey: p1=tolerance, p2=softness.
+    static VideoEffect createLumaKey(double lower = 0.0, double upper = 0.3,
+                                     double softness = 0.05);
+    static VideoEffect createColorKey(QColor color = QColor(0, 255, 0),
+                                      double tolerance = 0.1, double softness = 0.05);
     static VideoEffect createChromaKey(QColor color = QColor(0, 255, 0),
                                        double tolerance = 40.0, double softness = 10.0);
     static VideoEffect createVignette(double intensity = 0.5, double radius = 0.8);
@@ -320,6 +327,9 @@ public:
     // Calling-thread switch; also resets the Flip observation counter.
     static void setFlipEnabledForTesting(bool enabled);
     static int flipInvocationCountForTesting();
+    // Calling-thread switch; resets the observation counter for both keyers.
+    static void setKeyersEnabledForTesting(bool enabled);
+    static int keyersInvocationCountForTesting();
     static QImage applyEffect(const QImage &input, const VideoEffect &effect);
     static QImage applyEffectStack(const QImage &input, const ColorCorrection &cc,
                                    const QVector<VideoEffect> &effects);
@@ -336,6 +346,8 @@ private:
     static QImage applyBlur(const QImage &img, double radius);
     static QImage applySharpen(const QImage &img, double amount);
     static QImage applyMosaic(const QImage &img, double blockSize);
+    static QImage applyLumaKey(const QImage &img, double lower, double upper, double softness);
+    static QImage applyColorKey(const QImage &img, QColor color, double tolerance, double softness);
     static QImage applyChromaKey(const QImage &img, QColor keyColor,
                                   double tolerance, double softness);
     static QImage applyVignette(const QImage &img, double intensity, double radius);

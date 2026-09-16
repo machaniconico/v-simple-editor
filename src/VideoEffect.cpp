@@ -423,6 +423,8 @@ QString VideoEffect::typeName(VideoEffectType t)
     case VideoEffectType::Blur:      return "Blur";
     case VideoEffectType::Sharpen:   return "Sharpen";
     case VideoEffectType::Mosaic:    return "Mosaic";
+    case VideoEffectType::LumaKey: return "ルマキー";
+    case VideoEffectType::ColorKey: return "カラーキー";
     case VideoEffectType::ChromaKey: return "Chroma Key";
     case VideoEffectType::Vignette:  return "Vignette";
     case VideoEffectType::Sepia:     return "Sepia";
@@ -500,7 +502,8 @@ QVector<VideoEffectType> VideoEffect::allTypes()
              VideoEffectType::PolarCoordinates, VideoEffectType::MotionTile,
              VideoEffectType::CornerPinSimple, VideoEffectType::FilmGrain,
              VideoEffectType::Echo, VideoEffectType::LensDistortion,
-             VideoEffectType::RollingShutterRepair, VideoEffectType::Flip };
+             VideoEffectType::RollingShutterRepair, VideoEffectType::Flip,
+             VideoEffectType::LumaKey, VideoEffectType::ColorKey };
 }
 
 VideoEffect VideoEffect::createBlur(double r)
@@ -509,6 +512,17 @@ VideoEffect VideoEffect::createSharpen(double a)
     { VideoEffect e; e.type = VideoEffectType::Sharpen; e.param1 = a; return e; }
 VideoEffect VideoEffect::createMosaic(double b)
     { VideoEffect e; e.type = VideoEffectType::Mosaic; e.param1 = b; return e; }
+VideoEffect VideoEffect::createLumaKey(double lower, double upper, double softness)
+{
+    VideoEffect e; e.type = VideoEffectType::LumaKey;
+    e.param1 = lower; e.param2 = upper; e.param3 = softness; return e;
+}
+VideoEffect VideoEffect::createColorKey(QColor color, double tolerance, double softness)
+{
+    VideoEffect e; e.type = VideoEffectType::ColorKey; e.keyColor = color;
+    e.param1 = tolerance; e.param2 = softness; return e;
+}
+
 VideoEffect VideoEffect::createChromaKey(QColor c, double tol, double soft)
     { VideoEffect e; e.type = VideoEffectType::ChromaKey; e.keyColor = c; e.param1 = tol; e.param2 = soft; return e; }
 VideoEffect VideoEffect::createVignette(double i, double r)
@@ -658,6 +672,15 @@ static QColor defaultColorForParam(const VideoEffect &effect, const QString &par
 
 double paramValue(const VideoEffect &effect, const QString &paramName)
 {
+    if (effect.type == VideoEffectType::LumaKey) {
+        if (paramName == "lower") return effect.param1;
+        if (paramName == "upper") return effect.param2;
+        if (paramName == "softness") return effect.param3;
+    }
+    if (effect.type == VideoEffectType::ColorKey) {
+        if (paramName == "tolerance") return effect.param1;
+        if (paramName == "softness") return effect.param2;
+    }
     if (effect.type == VideoEffectType::LensDistortion) {
         if (paramName == "k1") return effect.param1;
         if (paramName == "k2") return effect.param2;
@@ -861,6 +884,17 @@ double paramValue(const VideoEffect &effect, const QString &paramName)
 
 void setParamValue(VideoEffect &effect, const QString &paramName, double value)
 {
+    if (effect.type == VideoEffectType::LumaKey || effect.type == VideoEffectType::ColorKey) {
+        if (!std::isfinite(value)) value = 0.0;
+        if (effect.type == VideoEffectType::LumaKey) {
+            if (paramName == "lower") { effect.param1 = qBound(0.0, value, 1.0); return; }
+            if (paramName == "upper") { effect.param2 = qBound(0.0, value, 1.0); return; }
+            if (paramName == "softness") { effect.param3 = qBound(0.0, value, 0.5); return; }
+        } else {
+            if (paramName == "tolerance") { effect.param1 = qBound(0.0, value, 1.0); return; }
+            if (paramName == "softness") { effect.param2 = qBound(0.0, value, 0.5); return; }
+        }
+    }
     if (effect.type == VideoEffectType::LensDistortion) {
         if (!std::isfinite(value)) value = paramName == "scale" ? 1.0 : 0.0;
         if (paramName == "k1") { effect.param1 = qBound(-0.5, value, 0.5); return; }
@@ -1171,6 +1205,8 @@ void setParamValue(VideoEffect &effect, const QString &paramName, double value)
 
 QColor colorParamValue(const VideoEffect &effect, const QString &paramName)
 {
+    if (paramName == "color" && effect.type == VideoEffectType::ColorKey)
+        return effect.keyColor;
     if (paramName == "color" && effect.type == VideoEffectType::ChromaKey)
         return effect.keyColor;
     if ((paramName == "keyColor" || paramName == "color") && effect.type == VideoEffectType::Tint)
@@ -1188,6 +1224,8 @@ QColor colorParamValue(const VideoEffect &effect, const QString &paramName)
 
 void setColorParam(VideoEffect &effect, const QString &paramName, QColor color)
 {
+    if (paramName == "color" && effect.type == VideoEffectType::ColorKey)
+        effect.keyColor = color;
     if (paramName == "color" && effect.type == VideoEffectType::ChromaKey)
         effect.keyColor = color;
     if ((paramName == "keyColor" || paramName == "color") && effect.type == VideoEffectType::Tint)
@@ -1629,6 +1667,8 @@ QImage VideoEffectProcessor::applyEffect(const QImage &input, const VideoEffect 
     case VideoEffectType::Blur:      return applyBlur(input, effect.param1);
     case VideoEffectType::Sharpen:   return applySharpen(input, effect.param1);
     case VideoEffectType::Mosaic:    return applyMosaic(input, effect.param1);
+    case VideoEffectType::LumaKey: return applyLumaKey(input, effect.param1, effect.param2, effect.param3);
+    case VideoEffectType::ColorKey: return applyColorKey(input, effect.keyColor, effect.param1, effect.param2);
     case VideoEffectType::ChromaKey: return applyChromaKey(input, effect.keyColor, effect.param1, effect.param2);
     case VideoEffectType::Vignette:  return applyVignette(input, effect.param1, effect.param2);
     case VideoEffectType::Sepia:     return applySepia(input, effect.param1);
@@ -1808,6 +1848,77 @@ QImage VideoEffectProcessor::applyMosaic(const QImage &input, double blockSize)
                     line[x * 3 + 2] = avgB;
                 }
             }
+        }
+    }
+    return img;
+}
+
+namespace {
+thread_local bool keyersEnabledForTesting = true;
+thread_local int keyersCallsForTesting = 0;
+
+double keyerBound(double value, double maximum)
+{
+    return std::isfinite(value) ? qBound(0.0, value, maximum) : 0.0;
+}
+}
+
+void VideoEffectProcessor::setKeyersEnabledForTesting(bool enabled)
+{
+    keyersEnabledForTesting = enabled;
+    keyersCallsForTesting = 0;
+}
+
+int VideoEffectProcessor::keyersInvocationCountForTesting()
+{
+    return keyersCallsForTesting;
+}
+
+QImage VideoEffectProcessor::applyLumaKey(const QImage &input, double lower,
+                                         double upper, double softness)
+{
+    if (!keyersEnabledForTesting || input.isNull()) return input;
+    if (keyersCallsForTesting < 2147483647) ++keyersCallsForTesting;
+    lower = keyerBound(lower, 1.0);
+    upper = keyerBound(upper, 1.0);
+    if (lower > upper) std::swap(lower, upper);
+    softness = keyerBound(softness, 0.5);
+    QImage img = input.convertToFormat(QImage::Format_ARGB32);
+    for (int y = 0; y < img.height(); ++y) {
+        auto *line = reinterpret_cast<QRgb *>(img.scanLine(y));
+        for (int x = 0; x < img.width(); ++x) {
+            const QRgb pixel = line[x];
+            const double luma = luma709(qRed(pixel), qGreen(pixel), qBlue(pixel)) / 255.0;
+            const double distance = luma < lower ? lower - luma : (luma > upper ? luma - upper : 0.0);
+            const double alpha = distance == 0.0 ? 0.0
+                : (softness > 0.0 ? qMin(1.0, distance / softness) : 1.0);
+            line[x] = qRgba(qRed(pixel), qGreen(pixel), qBlue(pixel),
+                            clamp255d(qAlpha(pixel) * alpha));
+        }
+    }
+    return img;
+}
+
+QImage VideoEffectProcessor::applyColorKey(const QImage &input, QColor color,
+                                          double tolerance, double softness)
+{
+    if (!keyersEnabledForTesting || input.isNull()) return input;
+    if (keyersCallsForTesting < 2147483647) ++keyersCallsForTesting;
+    tolerance = keyerBound(tolerance, 1.0);
+    softness = keyerBound(softness, 0.5);
+    QImage img = input.convertToFormat(QImage::Format_ARGB32);
+    for (int y = 0; y < img.height(); ++y) {
+        auto *line = reinterpret_cast<QRgb *>(img.scanLine(y));
+        for (int x = 0; x < img.width(); ++x) {
+            const QRgb pixel = line[x];
+            const double r = (qRed(pixel) - color.red()) / 255.0;
+            const double g = (qGreen(pixel) - color.green()) / 255.0;
+            const double b = (qBlue(pixel) - color.blue()) / 255.0;
+            const double distance = std::sqrt((r*r + g*g + b*b) / 3.0);
+            const double alpha = distance <= tolerance ? 0.0
+                : (softness > 0.0 ? qMin(1.0, (distance - tolerance) / softness) : 1.0);
+            line[x] = qRgba(qRed(pixel), qGreen(pixel), qBlue(pixel),
+                            clamp255d(qAlpha(pixel) * alpha));
         }
     }
     return img;

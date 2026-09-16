@@ -122,6 +122,7 @@ int runHwPerfSelftest();
 int runImportIngestSelftest();
 int runImportSelftest();
 int runInstagramSelftest();
+int runKeyersSelftest();
 int runKeyframeAnimParitySelftest();
 int runKeyframeLoopSelftest();
 int runLayerStyleSelftest();
@@ -549,6 +550,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Per-keyframe cubic-bezier easing: legacy invariance, identity curve, ease-in, JSON round-trip (4 gates)" },
     { "easing-presets",    "VEDITOR_EASING_PRESETS_SELFTEST",     runEasingPresetsSelftest,      false,
       "Elastic/Bounce/Back keyframe easing presets: math, overshoot, legacy invariance, JSON round-trip (6 gates)" },
+    { "keyers", "VEDITOR_KEYERS_SELFTEST", runKeyersSelftest, false,
+      "ルマキー・カラーキー: CPU alpha、合成、プリセット、スタック順序 (7 gates)" },
     { "keyframe-loop",     "VEDITOR_KEYFRAME_LOOP_SELFTEST",       runKeyframeLoopSelftest,       false,
       "AE-ANIM-3 loopOut motion keyframes: None/Cycle/PingPong/Continue sampling + JSON omission (6 gates)" },
     { "motion-preset",     "VEDITOR_MOTION_PRESET_SELFTEST",       runMotionPresetSelftest,       false,

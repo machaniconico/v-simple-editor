@@ -85,6 +85,8 @@ QString videoCategory(VideoEffectType type)
     case VideoEffectType::DirectionalBlur:
     case VideoEffectType::RadialBlur:
         return QStringLiteral("ブラー");
+    case VideoEffectType::LumaKey:
+    case VideoEffectType::ColorKey:
     case VideoEffectType::ChromaKey:
     case VideoEffectType::Sepia:
     case VideoEffectType::Grayscale:
@@ -422,6 +424,8 @@ void EffectLibraryModel::registerAll()
         data.entry.kind = SourceKind::AeFx;
         data.sourceName = sourceName;
         data.videoType = type;
+        if (type == VideoEffectType::LumaKey || type == VideoEffectType::ColorKey)
+            data.entry.tags.append(QStringLiteral("スタックの最後に置いてください (後続の効果で透明部分が失われます)"));
         addCommonTags(data.entry, sourceName);
         addEntry(data);
     }
