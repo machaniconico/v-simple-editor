@@ -9725,7 +9725,7 @@ void MainWindow::exportVideo()
     job.timeline = m_timeline;
 
     // RenderQueue::startRenderPipe consumes these JSON fields directly
-    // (videoCodec/videoBitrate/fps/audioCodec/audioBitrate, plus the HDR10 /
+    // (videoCodec/videoBitrate/rateControl/crf/fps/audioCodec/audioBitrate, plus the HDR10 /
     // ProRes branch keys). Pass ExportDialog's resolved encoder verbatim.
     QJsonObject cfg;
     cfg["width"]        = job.width;
@@ -9733,6 +9733,10 @@ void MainWindow::exportVideo()
     cfg["fps"]          = exportCfg.fps > 0 ? exportCfg.fps : 30;
     cfg["videoCodec"]   = exportCfg.videoCodec;     // already ffmpeg-named
     cfg["videoBitrate"] = exportCfg.videoBitrate;   // kbps
+    if (exportCfg.rateControl == ExportConfig::RateControl::Crf) {
+        cfg["rateControl"] = QStringLiteral("crf");
+        if (exportCfg.crf != -1) cfg["crf"] = exportCfg.crf;
+    }
     cfg["audioCodec"]   = exportCfg.audioCodec;
     cfg["audioBitrate"] = exportCfg.audioBitrate;
     cfg["exportMarkedRangeOnly"] = exportCfg.exportMarkedRangeOnly;
