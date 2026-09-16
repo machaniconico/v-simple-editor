@@ -6004,6 +6004,26 @@ void MainWindow::setupMenuBar()
     // MP-5: メディアプール ドック (左側)。SSOT モデル m_mediaPool を指すだけ。
     m_mediaPoolDock = new MediaPoolDock(this);
     m_mediaPoolDock->setPool(&m_mediaPool);
+    m_mediaPoolDock->setUsedPathsProvider([this] {
+        QSet<QString> paths;
+        if (m_timeline) {
+            for (const auto &tracks : {m_timeline->videoTracks(), m_timeline->audioTracks()}) {
+                for (const TimelineTrack *track : tracks) {
+                    if (!track)
+                        continue;
+                    for (const ClipInfo &clip : track->clips())
+                        paths.insert(clip.filePath);
+                }
+            }
+        }
+        return paths;
+    });
+    connect(m_mediaPoolDock, &MediaPoolDock::poolChanged,
+            this, [this] { setWindowModified(true); });
+    connect(m_timeline, &Timeline::sequenceChanged,
+            m_mediaPoolDock, &MediaPoolDock::refreshUsedPaths);
+    connect(m_timeline, &Timeline::audioSequenceChanged,
+            m_mediaPoolDock, &MediaPoolDock::refreshUsedPaths);
     addDockWidget(Qt::LeftDockWidgetArea, m_mediaPoolDock);
     connect(m_mediaPoolDock, &MediaPoolDock::assetActivated,
             this, &MainWindow::onMediaPoolAssetActivated);
