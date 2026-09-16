@@ -175,7 +175,8 @@ enum class VideoEffectType {
     RollingShutterRepair,
     Flip,
     LumaKey,
-    ColorKey
+    ColorKey,
+    LogToRec709
 };
 
 struct VideoEffect {
@@ -307,6 +308,8 @@ struct VideoEffect {
     static VideoEffect createRollingShutterRepair(double rate = 0.5,
                                                   int direction = 0,
                                                   double strength = 1.0);
+    // p1=input Log (0..3), p2=exposure stops, p3=output (0..2).
+    static VideoEffect createLogToRec709(int input = 0, double exposure = 0.0, int output = 0);
     static VideoEffect createEcho(double delaySec = 0.1, int count = 3,
                                   double decay = 0.5, int blend = 2);
 };
@@ -330,12 +333,17 @@ public:
     // Calling-thread switch; resets the observation counter for both keyers.
     static void setKeyersEnabledForTesting(bool enabled);
     static int keyersInvocationCountForTesting();
+    static void setLogToRec709EnabledForTesting(bool enabled);
+    static int logToRec709InvocationCountForTesting();
+    // Scene-linear gamut conversion, shared by the CPU kernel and numerical gates.
+    static void logToRec709Gamut(int input, float &r, float &g, float &b);
     static QImage applyEffect(const QImage &input, const VideoEffect &effect);
     static QImage applyEffectStack(const QImage &input, const ColorCorrection &cc,
                                    const QVector<VideoEffect> &effects);
     static void adjustTemperatureTint(QImage &img, double temperature, double tint);
 
 private:
+    static QImage applyLogToRec709(const QImage &input, const VideoEffect &effect);
     static void adjustBrightnessContrast(QImage &img, double brightness, double contrast);
     static void adjustSaturation(QImage &img, double saturation);
     static void adjustHue(QImage &img, double hue);

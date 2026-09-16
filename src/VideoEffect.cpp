@@ -472,6 +472,7 @@ QString VideoEffect::typeName(VideoEffectType t)
     case VideoEffectType::FilmGrain: return "フィルムグレイン";
     case VideoEffectType::RollingShutterRepair: return "ローリングシャッター補正";
     case VideoEffectType::Echo: return "エコー(残像)";
+    case VideoEffectType::LogToRec709: return "カメラ Log → Rec.709";
     case VideoEffectType::LensDistortion: return "レンズ歪み補正";
     }
     return "Unknown";
@@ -503,7 +504,17 @@ QVector<VideoEffectType> VideoEffect::allTypes()
              VideoEffectType::CornerPinSimple, VideoEffectType::FilmGrain,
              VideoEffectType::Echo, VideoEffectType::LensDistortion,
              VideoEffectType::RollingShutterRepair, VideoEffectType::Flip,
-             VideoEffectType::LumaKey, VideoEffectType::ColorKey };
+             VideoEffectType::LumaKey, VideoEffectType::ColorKey, VideoEffectType::LogToRec709 };
+}
+
+VideoEffect VideoEffect::createLogToRec709(int input, double exposure, int output)
+{
+    VideoEffect e;
+    e.type = VideoEffectType::LogToRec709;
+    effectctrl::setParamValue(e, "input", input);
+    effectctrl::setParamValue(e, "exposure", exposure);
+    effectctrl::setParamValue(e, "output", output);
+    return e;
 }
 
 VideoEffect VideoEffect::createBlur(double r)
@@ -672,6 +683,11 @@ static QColor defaultColorForParam(const VideoEffect &effect, const QString &par
 
 double paramValue(const VideoEffect &effect, const QString &paramName)
 {
+    if (effect.type == VideoEffectType::LogToRec709) {
+        if (paramName == "input") return effect.param1;
+        if (paramName == "exposure") return effect.param2;
+        if (paramName == "output") return effect.param3;
+    }
     if (effect.type == VideoEffectType::LumaKey) {
         if (paramName == "lower") return effect.param1;
         if (paramName == "upper") return effect.param2;
@@ -884,6 +900,13 @@ double paramValue(const VideoEffect &effect, const QString &paramName)
 
 void setParamValue(VideoEffect &effect, const QString &paramName, double value)
 {
+    if (effect.type == VideoEffectType::LogToRec709) {
+        if (!std::isfinite(value)) value = 0.0;
+        if (paramName == "input") effect.param1 = std::round(std::clamp(value, 0.0, 3.0));
+        if (paramName == "exposure") effect.param2 = std::clamp(value, -3.0, 3.0);
+        if (paramName == "output") effect.param3 = std::round(std::clamp(value, 0.0, 2.0));
+        return;
+    }
     if (effect.type == VideoEffectType::LumaKey || effect.type == VideoEffectType::ColorKey) {
         if (!std::isfinite(value)) value = 0.0;
         if (effect.type == VideoEffectType::LumaKey) {
@@ -1717,6 +1740,7 @@ QImage VideoEffectProcessor::applyEffect(const QImage &input, const VideoEffect 
                                                              static_cast<int>(std::round(effect.param2)),
                                                              std::round(effect.param3) != 0.0);
     case VideoEffectType::CornerPinSimple: return applyCornerPinSimple(input, effect.param1, effect.param2);
+    case VideoEffectType::LogToRec709: return applyLogToRec709(input, effect);
     case VideoEffectType::LensDistortion: return applyLensDistortion(input, effect);
     case VideoEffectType::FilmGrain: return applyFilmGrain(
         input, effect.param1, static_cast<int>(std::round(effect.param2)),
@@ -3699,4 +3723,98 @@ QImage VideoEffectProcessor::applyLensDistortion(const QImage &input,
         }
     }
     return out;
+}
+
+namespace {
+thread_local bool logToRec709Enabled = true;
+thread_local int logToRec709Calls = 0;
+
+float decodeCameraLog(float v, int input)
+{
+    switch (input) {
+    case 0:
+        return v >= 171.2102946929f / 1023.0f
+            ? std::pow(10.0f, (v * 1023.0f - 420.0f) / 261.5f) * 0.19f - 0.01f
+            : (v * 1023.0f - 95.0f) * 0.01125f / (171.2102946929f - 95.0f);
+    case 1:
+        return v > 5.367655f * 0.010591f + 0.092809f
+            ? (std::pow(10.0f, (v - 0.385537f) / 0.247190f) - 0.052272f) / 5.555556f
+            : (v - 0.092809f) / 5.367655f;
+    case 2:
+        return v >= 0.181f
+            ? std::pow(10.0f, (v - 0.598206f) / 0.241514f) - 0.00873f
+            : (v - 0.125f) / 5.6f;
+    default: {
+        const float black = std::pow(10.0f, (95.0f - 685.0f) * 0.002f / 0.6f);
+        return (std::pow(10.0f, (v * 1023.0f - 685.0f) * 0.002f / 0.6f) - black)
+            / (1.0f - black);
+    }
+    }
+}
+}
+
+void VideoEffectProcessor::setLogToRec709EnabledForTesting(bool enabled)
+{
+    logToRec709Enabled = enabled;
+    logToRec709Calls = 0;
+}
+
+int VideoEffectProcessor::logToRec709InvocationCountForTesting()
+{
+    return logToRec709Calls;
+}
+
+void VideoEffectProcessor::logToRec709Gamut(int input, float &r, float &g, float &b)
+{
+    static constexpr float matrices[4][3][3] = {
+        {{1.6269474f, -0.5401385f, -0.0868088f},
+         {-0.1785155f, 1.4179409f, -0.2394254f},
+         {-0.0444361f, -0.1959718f, 1.2404079f}},
+        {{1.617523f, -0.537287f, -0.080237f},
+         {-0.070573f, 1.334613f, -0.264040f},
+         {-0.021102f, -0.226954f, 1.248056f}},
+        {{1.806576f, -0.695697f, -0.110879f},
+         {-0.170090f, 1.305955f, -0.135865f},
+         {-0.025206f, -0.154468f, 1.179674f}},
+        {{1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 1.0f}}
+    };
+    const auto &m = matrices[std::clamp(input, 0, 3)];
+    const float nr = m[0][0] * r + m[0][1] * g + m[0][2] * b;
+    const float ng = m[1][0] * r + m[1][1] * g + m[1][2] * b;
+    const float nb = m[2][0] * r + m[2][1] * g + m[2][2] * b;
+    r = nr; g = ng; b = nb;
+}
+
+QImage VideoEffectProcessor::applyLogToRec709(const QImage &input, const VideoEffect &effect)
+{
+    if (!logToRec709Enabled || input.isNull()) return input;
+    if (logToRec709Calls < 2147483647) ++logToRec709Calls;
+    const auto bounded = [](double v, double low, double high) {
+        return std::isfinite(v) ? std::clamp(v, low, high) : 0.0;
+    };
+    const int camera = static_cast<int>(std::round(bounded(effect.param1, 0.0, 3.0)));
+    const int output = static_cast<int>(std::round(bounded(effect.param3, 0.0, 2.0)));
+    const float exposure = std::exp2(static_cast<float>(bounded(effect.param2, -3.0, 3.0)));
+    const auto encode = [output](float linear) {
+        float v = std::clamp(linear, 0.0f, 1.0f);
+        if (output == 0) v = std::pow(v, 1.0f / 2.4f);
+        else if (output == 2)
+            v = v < 0.018f ? 4.5f * v : 1.099f * std::pow(v, 0.45f) - 0.099f;
+        return static_cast<uchar>(std::clamp(std::lround(v * 255.0f), 0L, 255L));
+    };
+    // CPU SSOT: VideoPlayer and tlrender both reach this through applyEffectStack.
+    // Preserve alpha here without changing any other effect's format contract.
+    QImage result = input.convertToFormat(QImage::Format_ARGB32);
+    for (int y = 0; y < result.height(); ++y) {
+        auto *pixels = reinterpret_cast<QRgb *>(result.scanLine(y));
+        for (int x = 0; x < result.width(); ++x) {
+            const QRgb p = pixels[x];
+            float r = decodeCameraLog(qRed(p) / 255.0f, camera) * exposure;
+            float g = decodeCameraLog(qGreen(p) / 255.0f, camera) * exposure;
+            float b = decodeCameraLog(qBlue(p) / 255.0f, camera) * exposure;
+            logToRec709Gamut(camera, r, g, b);
+            pixels[x] = qRgba(encode(r), encode(g), encode(b), qAlpha(p));
+        }
+    }
+    return result;
 }

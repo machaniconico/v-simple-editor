@@ -89,6 +89,7 @@ QString effectTypeKey(VideoEffectType type)
     case VideoEffectType::MotionTile: return QStringLiteral("MotionTile");
     case VideoEffectType::CornerPinSimple: return QStringLiteral("CornerPinSimple");
     case VideoEffectType::FilmGrain: return QStringLiteral("FilmGrain");
+    case VideoEffectType::LogToRec709: return QStringLiteral("LogToRec709");
     case VideoEffectType::RollingShutterRepair: return QStringLiteral("RollingShutterRepair");
     case VideoEffectType::Echo: return QStringLiteral("Echo");
     case VideoEffectType::LensDistortion: return QStringLiteral("LensDistortion");
@@ -799,6 +800,20 @@ VideoEffect PresetLibrary::videoEffectFromJson(const QJsonObject &obj)
 void PresetLibrary::registerBuiltins()
 {
     QDateTime now = QDateTime::currentDateTime();
+
+    const char *logNames[] = { "S-Log3 → Rec.709", "LogC3 → Rec.709", "V-Log → Rec.709" };
+    for (int input = 0; input < 3; ++input) {
+        EffectPreset p;
+        p.name = QString::fromUtf8(logNames[input]);
+        p.description = QStringLiteral("カメラ Log を Rec.709 ガンマ2.4 に変換します。");
+        p.category = QStringLiteral("カラー");
+        p.author = QStringLiteral("v-editor");
+        p.isBuiltIn = true;
+        p.createdAt = now;
+        p.modifiedAt = now;
+        p.effects.append(VideoEffect::createLogToRec709(input));
+        m_presets.append(p);
+    }
 
     // Approximate starting points, not calibrated camera/lens profiles.
     const struct LensPreset { const char *name; double k1; double k2; } lenses[] = {

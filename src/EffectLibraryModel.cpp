@@ -101,6 +101,7 @@ QString videoCategory(VideoEffectType type)
     case VideoEffectType::Vibrance:
     case VideoEffectType::PhotoFilter:
     case VideoEffectType::Tritone:
+    case VideoEffectType::LogToRec709:
     case VideoEffectType::BrightnessContrast:
         return QStringLiteral("カラー");
     case VideoEffectType::Mosaic:

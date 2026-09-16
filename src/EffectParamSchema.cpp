@@ -261,6 +261,13 @@ QVector<ParamDef> paramSchemaFor(VideoEffectType type)
             { "verticalTilt", "垂直チルト", ParamType::Float, -100.0, 100.0, 0.0 }
         };
 
+    case VideoEffectType::LogToRec709:
+        return {
+            { "input", "入力 (0=S-Log3 / 1=LogC3 EI800 / 2=V-Log / 3=Cineon)", ParamType::Int, 0.0, 3.0, 0.0 },
+            { "exposure", "露出オフセット (stop)", ParamType::Float, -3.0, 3.0, 0.0 },
+            { "output", "出力 (0=ガンマ2.4 / 1=リニア / 2=Rec.709 OETF)", ParamType::Int, 0.0, 2.0, 0.0 }
+        };
+
     case VideoEffectType::LensDistortion:
         return {
             { "k1", "径方向２次", ParamType::Float, -0.5, 0.5, 0.0 },
