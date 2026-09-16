@@ -114,6 +114,55 @@ int runAudioKeyframesSelftest()
     gate(5, deterministic && wavOk && audiokf::computeEnvelope(mono, 0, fps, 0).rms.isEmpty()
         && audiokf::computeEnvelope(mono, sr, 0, 0).rms.isEmpty()
         && audiokf::levelAt(raw, -0.1) == 0.0 && audiokf::levelAt(raw, 2.0) == 0.0);
+    // Exercise the same link lookup, lazy cache and source-time mapping as MainWindow.
+    const QString linkedWav = temp.filePath(QStringLiteral("linked.wav"));
+    QByteArray linkedPcm;
+    linkedPcm.reserve(sr * 2 * 2);
+    for (int i = 0; i < sr * 2; ++i) {
+        linkedPcm.append(char(0x00));
+        linkedPcm.append(i < sr / 2 ? char(0x00) : char(0x40));
+    }
+    const bool linkedWavOk = temp.isValid()
+        && libavcore::writePcm16AsWav(linkedWav, linkedPcm, sr, 1, &error);
+    ClipInfo unrelated{};
+    unrelated.duration = 0.25;
+    unrelated.linkGroup = 8;
+    unrelated.filePath = linkedWav;
+    ClipInfo linked{};
+    linked.duration = 2.0;
+    linked.inPoint = 0.5;
+    linked.outPoint = 1.5;
+    linked.speed = 2.0;
+    linked.leadInSec = 0.5;
+    linked.linkGroup = 7;
+    linked.filePath = linkedWav;
+    const QVector<ClipInfo> firstTrack{unrelated};
+    const QVector<ClipInfo> secondTrack{unrelated, linked};
+    const QVector<const QVector<ClipInfo>*> audioTracks{nullptr, &firstTrack, &secondTrack};
+    const auto linkedCache = std::make_shared<audiokf::EnvelopeCache>();
+    audiokf::resetInvocationCountForTest();
+    const auto unlinked = audiokf::makeLinkedAudioSampler(0, 1.0, audioTracks, linkedCache);
+    const auto missing = audiokf::makeLinkedAudioSampler(99, 1.0, audioTracks, linkedCache);
+    ExpressionContext linkedContext;
+    linkedContext.audioLevelAtTime = audiokf::makeLinkedAudioSampler(7, 1.0, audioTracks, linkedCache);
+    const auto ordinary = Expression::evaluate(QStringLiteral("time + 1"), linkedContext);
+    bool linkedOk = linkedWavOk && !unlinked && !missing && linkedContext.audioLevelAtTime
+        && ordinary.success && ordinary.value == 1.0 && audiokf::invocationCountForTest() == 0;
+    // Audio occupies [0.75, 1.25); the target clip starts at 1.0.
+    for (double local : {-0.5, 0.25, 0.5}) {
+        linkedContext.time = local;
+        const auto outside = Expression::evaluate(QStringLiteral("audioLevel()"), linkedContext);
+        linkedOk = linkedOk && outside.success && outside.value == 0.0
+            && audiokf::invocationCountForTest() == 0;
+    }
+    linkedContext.time = 0.0;
+    const auto inside = Expression::evaluate(QStringLiteral("audioLevel()"), linkedContext);
+    const auto repeated = Expression::evaluate(QStringLiteral("audioLevel()"), linkedContext);
+    linkedOk = linkedOk && inside.success && std::abs(inside.value - 0.5) < 0.001
+        && repeated.success && repeated.value == inside.value
+        && audiokf::invocationCountForTest() == 2;
+    gate(6, linkedOk);
+
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", pass, fail);
     return fail;
 }

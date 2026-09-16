@@ -8115,6 +8115,7 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
                 ctx.duration = clip.effectiveDuration();
                 ctx.canvasWidth = canvasSize.width();
                 ctx.canvasHeight = canvasSize.height();
+                ctx.audioLevelAtTime = linkedAudioSampler(clip, clipStart);
                 posX = bindings.resolve(QStringLiteral("transform.position.x"), ctx, posX);
                 posY = bindings.resolve(QStringLiteral("transform.position.y"), ctx, posY);
                 layerScale = bindings.resolve(QStringLiteral("transform.scale"), ctx, layerScale);
@@ -13826,24 +13827,13 @@ std::function<double(double)> MainWindow::linkedAudioSampler(
     const ClipInfo &clip, double clipStart) const
 {
     if (!m_timeline || clip.linkGroup <= 0) return {};
+    QVector<const QVector<ClipInfo>*> audioTracks;
+    audioTracks.reserve(m_timeline->audioTracks().size());
     for (const auto *track : m_timeline->audioTracks()) {
-        if (!track) continue;
-        double cursor = 0.0;
-        for (const ClipInfo &audio : track->clips()) {
-            const double start = cursor + qMax(0.0, audio.leadInSec);
-            cursor = start + audio.effectiveDuration();
-            if (audio.linkGroup != clip.linkGroup || audio.filePath.isEmpty()) continue;
-            // Only audioLevel() invokes this closure: ordinary expressions never decode.
-            return [cache = m_audioEnvelopeCache, audio, start, clipStart](double local) {
-                const double audioLocal = clipStart + local - start;
-                if (!std::isfinite(audioLocal) || audioLocal < 0.0
-                    || audioLocal >= audio.effectiveDuration()) return 0.0;
-                const auto envelope = cache->envelope(audio.filePath);
-                return audiokf::levelAt(*envelope, audio.sourceSecondAtLocalTime(audioLocal));
-            };
-        }
+        if (track) audioTracks.append(&track->clips());
     }
-    return {};
+    return audiokf::makeLinkedAudioSampler(clip.linkGroup, clipStart,
+                                          audioTracks, m_audioEnvelopeCache);
 }
 
 void MainWindow::convertAudioToKeyframes(int trackIndex, int clipIndex)

@@ -1,4 +1,5 @@
 #include "AudioKeyframes.h"
+#include "Timeline.h"
 #include "libavcore/AudioExtract.h"
 #include <QDateTime>
 #include <QFileInfo>
@@ -140,5 +141,31 @@ std::shared_ptr<const Envelope> EnvelopeCache::envelope(const QString& filePath)
     m_entries.insert(key, Entry{value, info.size(), modified});
     m_lru.append(key);
     return value;
+}
+
+std::function<double(double)> makeLinkedAudioSampler(
+    int linkGroup, double clipStart,
+    const QVector<const QVector<ClipInfo>*>& audioTracks,
+    const std::shared_ptr<EnvelopeCache>& cache)
+{
+    if (linkGroup <= 0 || !cache) return {};
+    for (const auto* clips : audioTracks) {
+        if (!clips) continue;
+        double cursor = 0.0;
+        for (const ClipInfo& audio : *clips) {
+            const double start = cursor + qMax(0.0, audio.leadInSec);
+            cursor = start + audio.effectiveDuration();
+            if (audio.linkGroup != linkGroup || audio.filePath.isEmpty()) continue;
+            // Only audioLevel() invokes this closure: ordinary expressions never decode.
+            return [cache, audio, start, clipStart](double local) {
+                const double audioLocal = clipStart + local - start;
+                if (!std::isfinite(audioLocal) || audioLocal < 0.0
+                    || audioLocal >= audio.effectiveDuration()) return 0.0;
+                const auto envelope = cache->envelope(audio.filePath);
+                return levelAt(*envelope, audio.sourceSecondAtLocalTime(audioLocal));
+            };
+        }
+    }
+    return {};
 }
 } // namespace audiokf

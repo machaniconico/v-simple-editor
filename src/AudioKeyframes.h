@@ -3,8 +3,11 @@
 #include "Keyframe.h"
 #include <QHash>
 #include <QStringList>
+#include <functional>
 #include <memory>
 #include <mutex>
+
+struct ClipInfo;
 
 namespace audiokf {
 struct Envelope {
@@ -42,6 +45,13 @@ private:
     QHash<QString, Entry> m_entries;
     QStringList m_lru;
 };
+
+// Clip lists are inspected only during construction; the sampler owns its source
+// snapshot and cache. No timeline widgets are needed, and decoding stays lazy.
+std::function<double(double)> makeLinkedAudioSampler(
+    int linkGroup, double clipStart,
+    const QVector<const QVector<ClipInfo>*>& audioTracks,
+    const std::shared_ptr<EnvelopeCache>& cache);
 
 // Acceptance instrumentation: bypass/cache observation for unused-feature checks.
 void setDisabledForTest(bool disabled);
