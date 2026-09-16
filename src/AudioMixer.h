@@ -5,6 +5,7 @@
 #include <QString>
 #include <QHash>
 #include <QMutex>
+#include <QMutexLocker>
 #include <QIODevice>
 #include <QAudioSink>
 #include <QAudioFormat>
@@ -176,6 +177,11 @@ public:
     // Per-track realtime EQ (3-band biquad, applied before effectiveGain).
     void setTrackEqConfig(int trackIdx, const AudioEQConfig &cfg);
     AudioEQConfig trackEqConfig(int trackIdx) const;
+    bool trackEqEnabled(int trackIdx) const {
+        QMutexLocker lock(&m_controlMutex);
+        return trackIdx >= 0 && trackIdx < m_trackStates.size()
+            && m_trackStates[trackIdx].eqEnabled;
+    }
     void setTrackEqEnabled(int trackIdx, bool enabled);
 
     // Per-track 4-band parametric EQ (Premiere/Audition parity). Independent

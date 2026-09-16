@@ -180,12 +180,15 @@ QString buildExportAudioMixEntryFilterChain(int inputIndex,
                                             TransitionType trailOutType = TransitionType::None,
                                             double trailOutDuration = 0.0);
 
-// trackIndex is the zero-based PlaybackEntry::sourceTrack. Input indices and
-// volume expressions refer to the complete entries array. Output: [trackN].
-// Only the intra-track amix is emitted; the caller owns the final master mix.
-QString buildPerTrackExportFilterChain(int trackIndex,
-    const QVector<PlaybackEntry> &entries, const QStringList &volumeExpressions,
-    const QVector<bool> &reversedFlags, bool resetDelayTimestamps = false);
+// DSP boundary: PreFx ends at [prefxN], PostFx reads [N:a] and ends at [aN].
+// Gain, fades and timeline silence must only be applied after track DSP.
+QString buildExportAudioMixEntryPreFxFilterChain(int inputIndex,
+    const QString &clipIn, const QString &clipOut, AudioChannelMode mode,
+    bool reversed = false, double speed = 1.0);
+QString buildExportAudioMixEntryPostFxFilterChain(int inputIndex,
+    int delayMs, const QString &volumeExpression, double clipDuration,
+    TransitionType leadInType = TransitionType::None, double leadInDuration = 0.0,
+    TransitionType trailOutType = TransitionType::None, double trailOutDuration = 0.0);
 
 struct ClipInfo {
     QString filePath;

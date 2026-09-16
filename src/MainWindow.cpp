@@ -221,6 +221,7 @@ double exporter_loudnessGainDb();
 #include "NoisePrintDialog.h"
 #include "libavcore/AudioExtract.h"
 #include "AudioMixer.h"
+#include "playback/AudioPan.h"
 #include "AudioTrackFx.h"
 #include <QMap>
 #include <vector>
@@ -802,7 +803,8 @@ bool timelineNeedsAudioMixForExport(Timeline *timeline)
     if (AudioMixer *mixer = timeline->audioMixer()) {
         for (int track = 0; track < timeline->audioTracks().size(); ++track) {
             const trackfx::Chain chain = mixer->trackChain(track);
-            if (chain.eqEnabled || chain.compEnabled || chain.reverbEnabled || chain.nrEnabled)
+            if (chain.eqEnabled || chain.compEnabled || chain.reverbEnabled || chain.nrEnabled
+                || (mixer->trackEqEnabled(track) && !mixer->trackEqConfig(track).isDefault()))
                 return true;
         }
     }
@@ -907,13 +909,20 @@ QString prepareTimelineAudioMixForExport(Timeline *timeline, QString *error,
     if (!timeline)
         return {};
     QMap<int, trackfx::Chain> trackChains;
+    QMap<int, AudioEQConfig> legacyEqConfigs;
+    QMap<int, bool> legacyEqEnabled;
+    QMap<int, double> trackGains;
     bool useTrackFx = false;
     if (AudioMixer *mixer = timeline->audioMixer()) {
         for (int track = 0; track < timeline->audioTracks().size(); ++track) {
             const trackfx::Chain chain = mixer->trackChain(track);
             trackChains.insert(track, chain);
+            legacyEqConfigs.insert(track, mixer->trackEqConfig(track));
+            legacyEqEnabled.insert(track, mixer->trackEqEnabled(track));
+            trackGains.insert(track, mixer->trackGain(track));
             useTrackFx = useTrackFx || chain.eqEnabled || chain.compEnabled
-                || chain.reverbEnabled || chain.nrEnabled;
+                || chain.reverbEnabled || chain.nrEnabled
+                || (legacyEqEnabled.value(track) && !legacyEqConfigs.value(track).isDefault());
         }
     }
     if (forcedOutputPath.isEmpty() && !useTrackFx && timelineAudioMatchesPassthrough(timeline))
@@ -988,53 +997,105 @@ QString prepareTimelineAudioMixForExport(Timeline *timeline, QString *error,
             if (error) *error = QStringLiteral("トラック音声の一時フォルダーを作成できません。");
             return {};
         }
-        QStringList volumes;
-        for (const PlaybackEntry &entry : validEntries)
-            volumes << volumeExpressionForEntry(entry);
-        QStringList finalArgs{QStringLiteral("-y")};
-        QStringList finalInputs;
-        for (auto it = trackChains.cbegin(); it != trackChains.cend(); ++it) {
-            const QString filter = buildPerTrackExportFilterChain(
-                it.key(), validEntries, volumes, validReversedFlags, renderInPlace);
-            if (filter.isEmpty())
-                continue;
-            const QString trackPath = temporary.filePath(QStringLiteral("track_%1.wav").arg(it.key()));
-            QStringList trackArgs = args;
-            trackArgs << QStringLiteral("-filter_complex") << filter
-                      << QStringLiteral("-map") << QStringLiteral("[track%1]").arg(it.key())
-                      << QStringLiteral("-t") << ffmpegNumber(durationSeconds)
-                      << QStringLiteral("-vn") << QStringLiteral("-c:a") << QStringLiteral("pcm_f32le")
-                      << trackPath;
-            if (!runFfmpegForAudioMix(trackArgs, error)) return {};
-            std::vector<float> samples;
-            int rate = 0, channels = 0;
-            if (!libavcore::readWavFloatInterleaved(trackPath, &samples, &rate, &channels, error))
-                return {};
-            if (rate != AudioMixer::kSampleRateHz || channels != AudioMixer::kChannels) {
-                if (error) *error = QStringLiteral("トラック音声の形式が不正です。");
-                return {};
+        // Process source clips in timeline order, retaining each track's DSP
+        // histories across clips. Gaps/delays never enter the DSP or NR detector.
+        QVector<int> orderedEntries;
+        for (int i = 0; i < validEntries.size(); ++i)
+            orderedEntries.append(i);
+        std::stable_sort(orderedEntries.begin(), orderedEntries.end(), [&](int a, int b) {
+            return validEntries[a].timelineStart < validEntries[b].timelineStart;
+        });
+        QMap<int, QVector<int>> entriesByTrack;
+        for (int i : orderedEntries)
+            entriesByTrack[validEntries[i].sourceTrack].append(i);
+        QVector<QString> clipPaths(validEntries.size());
+        for (auto it = entriesByTrack.cbegin(); it != entriesByTrack.cend(); ++it) {
+            const int track = it.key();
+            trackfx::Processor processor(trackChains.value(track), AudioMixer::kSampleRateHz,
+                                         AudioMixer::kChannels);
+            const AudioEQConfig cfg = legacyEqConfigs.value(track);
+            trackfx::Chain legacyEq;
+            legacyEq.eqEnabled = legacyEqEnabled.value(track, false);
+            // The legacy cascade is low shelf -> peaking -> high shelf.
+            trackfx::EqBand *bands[] = {&legacyEq.eq.low, &legacyEq.eq.lowMid, &legacyEq.eq.high};
+            for (int b = 0; b < 3 && b < cfg.bands.size(); ++b) {
+                const auto &band = cfg.bands[b];
+                *bands[b] = {band.frequency, band.gain, band.q, true};
             }
-            trackfx::Processor processor(it.value(), rate, channels);
+            trackfx::Processor legacyProcessor(legacyEq, AudioMixer::kSampleRateHz,
+                                               AudioMixer::kChannels);
             processor.reset();
-            const size_t frames = samples.size() / channels;
-            // Bounded fragments preserve state and allow NR auto-floor updates.
-            for (size_t frame = 0; frame < frames; frame += 1024)
-                processor.process(samples.data() + frame * channels,
-                                  static_cast<int>(std::min<size_t>(1024, frames - frame)));
-            if (!libavcore::writeWavFloatInterleaved(trackPath, samples, rate, channels, error))
-                return {};
-            finalInputs << QStringLiteral("[%1:a]").arg(finalInputs.size());
-            finalArgs << QStringLiteral("-i") << trackPath;
+            legacyProcessor.reset();
+            const double preamp = legacyEq.eqEnabled ? std::pow(10.0, cfg.preamp / 20.0) : 1.0;
+            for (int i : it.value()) {
+                const PlaybackEntry &entry = validEntries[i];
+                const QString clipPath = temporary.filePath(QStringLiteral("clip_%1.wav").arg(i));
+                const QString filter = buildExportAudioMixEntryPreFxFilterChain(0,
+                    ffmpegNumber(entry.clipIn), ffmpegNumber(entry.clipOut),
+                    audioChannelModeForPlaybackEntry(entry), validReversedFlags.value(i, false),
+                    entry.speed);
+                QStringList clipArgs{QStringLiteral("-y"), QStringLiteral("-i"), entry.filePath};
+                clipArgs << QStringLiteral("-filter_complex") << filter
+                         << QStringLiteral("-map") << QStringLiteral("[prefx0]")
+                         << QStringLiteral("-vn") << QStringLiteral("-c:a") << QStringLiteral("pcm_f32le")
+                         << clipPath;
+                if (!runFfmpegForAudioMix(clipArgs, error)) return {};
+                std::vector<float> samples;
+                int rate = 0, channels = 0;
+                if (!libavcore::readWavFloatInterleaved(clipPath, &samples, &rate, &channels, error))
+                    return {};
+                if (rate != AudioMixer::kSampleRateHz || channels != AudioMixer::kChannels) {
+                    if (error) *error = QStringLiteral("トラック音声の形式が不正です。");
+                    return {};
+                }
+                const size_t frames = samples.size() / channels;
+                for (size_t frame = 0; frame < frames; frame += 1024) {
+                    float *block = samples.data() + frame * channels;
+                    const int count = static_cast<int>(std::min<size_t>(1024, frames - frame));
+                    processor.process(block, count);
+                    legacyProcessor.process(block, count);
+                }
+                for (float &sample : samples)
+                    sample = static_cast<float>(sample * preamp);
+                if (!libavcore::writeWavFloatInterleaved(clipPath, samples, rate, channels, error))
+                    return {};
+                clipPaths[i] = clipPath;
+            }
         }
-        if (finalInputs.isEmpty()) {
-            if (error) *error = QStringLiteral("書き出す音声トラックがありません。");
-            return {};
+        QStringList finalArgs{QStringLiteral("-y")};
+        QStringList finalInputs, finalChains;
+        for (int i = 0; i < validEntries.size(); ++i) {
+            const PlaybackEntry &entry = validEntries[i];
+            finalArgs << QStringLiteral("-i") << clipPaths[i];
+            const double clipDuration = std::isfinite(entry.speed) && entry.speed > 0.0
+                ? qMax(0.0, (entry.clipOut - entry.clipIn) / entry.speed)
+                : qMax(0.0, entry.clipOut - entry.clipIn);
+            QString post = buildExportAudioMixEntryPostFxFilterChain(i,
+                qMax(0, qRound(entry.timelineStart * 1000.0)),
+                volumeExpressionForEntry(entry), clipDuration,
+                entry.leadInType, entry.leadInDuration, entry.trailOutType, entry.trailOutDuration);
+            // Static track gain and clip balance also belong after the DSP.
+            const auto pan = audiopan::balanceGains(entry.pan);
+            const double gain = trackGains.value(entry.sourceTrack, 1.0);
+            if (gain != 1.0 || entry.pan != 0.0) {
+                post.insert(QStringLiteral("[%1:a]").arg(i).size(),
+                    QStringLiteral("pan=stereo|c0=%1*c0|c1=%2*c1,")
+                        .arg(ffmpegNumber(gain * pan.left), ffmpegNumber(gain * pan.right)));
+            }
+            finalChains << post;
+            if (renderInPlace) {
+                finalChains << QStringLiteral("[a%1]asetpts=N/SR/TB[rip%1]").arg(i);
+                finalInputs << QStringLiteral("[rip%1]").arg(i);
+            } else {
+                finalInputs << QStringLiteral("[a%1]").arg(i);
+            }
         }
-        const QString finalFilter = QStringLiteral("%1amix=inputs=%2:normalize=0:duration=longest,"
-                                                   "%4atrim=duration=%3,asetpts=PTS-STARTPTS[aout]")
+        finalChains << QStringLiteral("%1amix=inputs=%2:normalize=0:duration=longest,"
+                                      "%4atrim=duration=%3,asetpts=PTS-STARTPTS[aout]")
             .arg(finalInputs.join(QString()), QString::number(finalInputs.size()),
                  ffmpegNumber(durationSeconds),
                  renderInPlace ? QStringLiteral("asetpts=N/SR/TB,apad,") : QString());
+        const QString finalFilter = finalChains.join(QLatin1Char(';'));
         finalArgs << QStringLiteral("-filter_complex") << finalFilter
                   << QStringLiteral("-map") << QStringLiteral("[aout]") << QStringLiteral("-vn");
         finalArgs << outputArgs;

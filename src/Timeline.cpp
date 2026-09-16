@@ -959,18 +959,9 @@ QString exportAudioChannelPanFilterForMode(AudioChannelMode mode)
     return {};
 }
 
-QString buildExportAudioMixEntryFilterChain(int inputIndex,
-                                            const QString &clipIn,
-                                            const QString &clipOut,
-                                            int delayMs,
-                                            const QString &volumeExpression,
-                                            AudioChannelMode mode,
-                                            bool reversed,
-                                            double speed,
-                                            TransitionType leadInType,
-                                            double leadInDuration,
-                                            TransitionType trailOutType,
-                                            double trailOutDuration)
+QString buildExportAudioMixEntryPreFxFilterChain(int inputIndex,
+    const QString &clipIn, const QString &clipOut, AudioChannelMode mode,
+    bool reversed, double speed)
 {
     QStringList filters;
     filters << QStringLiteral("atrim=start=%1:end=%2")
@@ -1004,6 +995,16 @@ QString buildExportAudioMixEntryFilterChain(int inputIndex,
     if (!panFilter.isEmpty())
         filters << panFilter;
 
+    return QStringLiteral("[%1:a]%2[prefx%1]").arg(inputIndex)
+        .arg(filters.join(QLatin1Char(',')));
+}
+
+QString buildExportAudioMixEntryPostFxFilterChain(int inputIndex,
+    int delayMs, const QString &volumeExpression, double clipDuration,
+    TransitionType leadInType, double leadInDuration,
+    TransitionType trailOutType, double trailOutDuration)
+{
+    QStringList filters;
     filters << QStringLiteral("volume='%1':eval=frame").arg(volumeExpression);
 
     // Audio-only fades use the same equal-power characteristic as
@@ -1022,9 +1023,6 @@ QString buildExportAudioMixEntryFilterChain(int inputIndex,
                        .arg(QString::number(leadInDuration, 'g', 15));
     }
     if (trailFade) {
-        const double clipDuration = std::isfinite(speed) && speed > 0.0
-            ? qMax(0.0, (clipOut.toDouble() - clipIn.toDouble()) / speed)
-            : qMax(0.0, clipOut.toDouble() - clipIn.toDouble());
         const double start = qMax(0.0, clipDuration - trailOutDuration);
         filters << QStringLiteral("afade=t=out:curve=qsin:st=%1:d=%2")
                        .arg(QString::number(start, 'g', 15),
@@ -1034,40 +1032,35 @@ QString buildExportAudioMixEntryFilterChain(int inputIndex,
     if (delayMs > 0)
         filters << QStringLiteral("adelay=%1:all=1").arg(delayMs);
 
-    return QStringLiteral("[%1:a]%2[a%1]")
-        .arg(inputIndex)
+    return QStringLiteral("[%1:a]%2[a%1]").arg(inputIndex)
         .arg(filters.join(QLatin1Char(',')));
 }
 
-QString buildPerTrackExportFilterChain(int trackIndex,
-    const QVector<PlaybackEntry> &entries, const QStringList &volumeExpressions,
-    const QVector<bool> &reversedFlags, bool resetDelayTimestamps)
+QString buildExportAudioMixEntryFilterChain(int inputIndex,
+                                            const QString &clipIn,
+                                            const QString &clipOut,
+                                            int delayMs,
+                                            const QString &volumeExpression,
+                                            AudioChannelMode mode,
+                                            bool reversed,
+                                            double speed,
+                                            TransitionType leadInType,
+                                            double leadInDuration,
+                                            TransitionType trailOutType,
+                                            double trailOutDuration)
 {
-    QStringList chains, inputs;
-    for (int i = 0; i < entries.size(); ++i) {
-        const PlaybackEntry &entry = entries[i];
-        if (entry.sourceTrack != trackIndex || entry.audioMuted)
-            continue;
-        chains << buildExportAudioMixEntryFilterChain(i,
-            QString::number(entry.clipIn, 'f', 6),
-            QString::number(entry.clipOut, 'f', 6),
-            qMax(0, qRound(entry.timelineStart * 1000.0)),
-            volumeExpressions.value(i, QString::number(qBound(0.0, entry.volume, 2.0), 'f', 6)),
-            audioChannelModeForPlaybackEntry(entry), reversedFlags.value(i, false),
-            entry.speed, entry.leadInType, entry.leadInDuration,
-            entry.trailOutType, entry.trailOutDuration);
-        if (resetDelayTimestamps) {
-            chains << QStringLiteral("[a%1]asetpts=N/SR/TB[rip%1]").arg(i);
-            inputs << QStringLiteral("[rip%1]").arg(i);
-        } else {
-            inputs << QStringLiteral("[a%1]").arg(i);
-        }
-    }
-    if (inputs.isEmpty())
-        return {};
-    chains << QStringLiteral("%1amix=inputs=%2:normalize=0:duration=longest[track%3]")
-        .arg(inputs.join(QString())).arg(inputs.size()).arg(trackIndex);
-    return chains.join(QLatin1Char(';'));
+    QString pre = buildExportAudioMixEntryPreFxFilterChain(
+        inputIndex, clipIn, clipOut, mode, reversed, speed);
+    QString post = buildExportAudioMixEntryPostFxFilterChain(inputIndex,
+        delayMs, volumeExpression,
+        std::isfinite(speed) && speed > 0.0
+            ? qMax(0.0, (clipOut.toDouble() - clipIn.toDouble()) / speed)
+            : qMax(0.0, clipOut.toDouble() - clipIn.toDouble()),
+        leadInType, leadInDuration, trailOutType, trailOutDuration);
+    // Join at the DSP boundary without changing the legacy graph text.
+    pre.chop(QStringLiteral("[prefx%1]").arg(inputIndex).size());
+    post.remove(0, QStringLiteral("[%1:a]").arg(inputIndex).size());
+    return pre + QLatin1Char(',') + post;
 }
 
 extern "C" {

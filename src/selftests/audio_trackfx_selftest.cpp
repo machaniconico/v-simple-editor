@@ -197,36 +197,34 @@ int runAudioTrackFxSelftest()
     processBlocks(processor, second);
     gate(6, identical(first, second));
 
-    PlaybackEntry entry;
-    entry.sourceTrack = 0;
-    entry.clipIn = 1.0;
-    entry.clipOut = 3.0;
-    entry.timelineStart = 0.5;
-    entry.timelineEnd = 2.5;
-    entry.volume = 0.5;
-    entry.leadInType = TransitionType::FadeIn;
-    entry.leadInDuration = 0.25;
-    auto otherTrack = entry;
-    otherTrack.sourceTrack = 1;
-    setAudioChannelModePlaybackBindings({{1000, 0, -1, AudioChannelMode::Swap}});
-    const QString perTrack = buildPerTrackExportFilterChain(0, {entry, otherTrack},
-        {QStringLiteral("0.500000"), QStringLiteral("1")}, {false, false});
+    const QString pre = buildExportAudioMixEntryPreFxFilterChain(0,
+        QStringLiteral("1.000000"), QStringLiteral("3.000000"),
+        AudioChannelMode::Swap, true, 2.0);
+    const QString post = buildExportAudioMixEntryPostFxFilterChain(0, 500,
+        QStringLiteral("0.500000"), 1.0, TransitionType::FadeIn, 0.25,
+        TransitionType::FadeOut, 0.25);
     const QString entryChain = buildExportAudioMixEntryFilterChain(0,
         QStringLiteral("1.000000"), QStringLiteral("3.000000"), 500,
-        QStringLiteral("0.500000"), AudioChannelMode::Swap, false, 1.0,
-        TransitionType::FadeIn, 0.25);
-    gate(7, perTrack.startsWith(entryChain + QLatin1Char(';'))
-        && perTrack.contains(QStringLiteral("atrim="))
-        && perTrack.contains(QStringLiteral("adelay=500"))
-        && perTrack.contains(QStringLiteral("volume='0.500000'"))
-        && perTrack.contains(QStringLiteral("afade="))
-        && perTrack.contains(exportAudioChannelPanFilterForMode(AudioChannelMode::Swap))
-        && perTrack.count(QStringLiteral("amix=")) == 1 // intra-track only
-        && perTrack.endsWith(QStringLiteral("[track0]"))
-        && !perTrack.contains(QStringLiteral("[aout]"))
-        && !perTrack.contains(QStringLiteral("[1:a]"))
-        && buildPerTrackExportFilterChain(2, {entry}, {}, {}).isEmpty());
-    setAudioChannelModePlaybackBindings({});
+        QStringLiteral("0.500000"), AudioChannelMode::Swap, true, 2.0,
+        TransitionType::FadeIn, 0.25, TransitionType::FadeOut, 0.25);
+    QString joined = pre;
+    joined.chop(QStringLiteral("[prefx0]").size());
+    joined += QLatin1Char(',') + post.mid(QStringLiteral("[0:a]").size());
+    gate(7, joined == entryChain
+        && pre.contains(QStringLiteral("atrim="))
+        && pre.contains(QStringLiteral("aresample=48000"))
+        && pre.contains(QStringLiteral("aformat="))
+        && pre.contains(QStringLiteral("areverse,atempo=2"))
+        && pre.contains(exportAudioChannelPanFilterForMode(AudioChannelMode::Swap))
+        && !pre.contains(QStringLiteral("volume="))
+        && !pre.contains(QStringLiteral("afade="))
+        && !pre.contains(QStringLiteral("adelay="))
+        && !pre.contains(QStringLiteral("amix="))
+        && post.contains(QStringLiteral("volume='0.500000'"))
+        && post.contains(QStringLiteral("afade=t=in"))
+        && post.contains(QStringLiteral("afade=t=out:curve=qsin:st=0.75:d=0.25"))
+        && post.contains(QStringLiteral("adelay=500"))
+        && !post.contains(QStringLiteral("atrim=")));
 
     QTemporaryDir directory;
     const QString wav = directory.filePath(QStringLiteral("float.wav"));
@@ -282,6 +280,44 @@ int runAudioTrackFxSelftest()
     }
     std::fprintf(stderr, "WAV EQ: 100Hz %.3f dB %s\n", wavDb, error.toUtf8().constData());
     gate(9, dspOk);
+    // Level-dependent DSP must see the source level, before clip gain/fades.
+    auto playbackComp = std::make_unique<AudioMixer>();
+    configure(*playbackComp, comp);
+    auto dspThenGain = sine;
+    auto gainThenDsp = sine;
+    std::vector<int16_t> playbackPcm(sine.size());
+    for (size_t i = 0; i < sine.size(); ++i) {
+        playbackPcm[i] = static_cast<int16_t>(sine[i] * 32768.0f);
+        gainThenDsp[i] *= 0.5f;
+    }
+    trackfx::Processor beforeGain(comp, kRate, 2), afterGain(comp, kRate, 2);
+    processBlocks(beforeGain, dspThenGain);
+    processBlocks(afterGain, gainThenDsp);
+    for (int f = 0; f < kFrames; f += 257)
+        playbackComp->processTrackFxForTest(1, playbackPcm.data() + 2 * f,
+                                           std::min(257, kFrames - f));
+    bool orderOk = true;
+    for (size_t i = 0; i < sine.size(); ++i) {
+        dspThenGain[i] *= 0.5f;
+        orderOk = orderOk && dspThenGain[i] == (playbackPcm[i] / 32768.0f) * 0.5f;
+    }
+    const double orderDb = 10 * std::log10(energy(gainThenDsp, kRate, kFrames)
+                                         / energy(dspThenGain, kRate, kFrames));
+    // Persisted EQ enablement is independent of the newer track Chain.
+    AudioEQConfig persistedEq;
+    persistedEq.bands = {{80.0, 0.0, 0.7}, {100.0, -12.0, 1.0}, {10000.0, 0.0, 0.7}};
+    persistedEq.preamp = -3.0;
+    playbackComp->setTrackEqConfig(0, persistedEq);
+    playbackComp->setTrackEqEnabled(0, true);
+    orderOk = orderOk && playbackComp->trackEqEnabled(0)
+        && !playbackComp->trackEqConfig(0).isDefault()
+        && playbackComp->trackEqConfig(0).preamp == -3.0
+        && !playbackComp->trackChain(0).eqEnabled
+        && !playbackComp->trackEqEnabled(-1) && !playbackComp->trackEqEnabled(99);
+    playbackComp->setTrackEqEnabled(0, false);
+    orderOk = orderOk && !playbackComp->trackEqEnabled(0);
+    std::fprintf(stderr, "Compressor gain-order difference: %.3f dB\n", orderDb);
+    gate(10, orderOk && std::abs(orderDb) > 1.0);
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", pass, fail);
     return fail;
 }
