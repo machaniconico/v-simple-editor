@@ -287,6 +287,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/DialogueLevelerDialog.cpp
     src/AudioBusPanel.cpp
     src/selftests/audio_bus_selftest.cpp
+    src/selftests/audio_trackfx_selftest.cpp
     src/selftests/audio_xfade_selftest.cpp
     src/selftests/morph_cut_selftest.cpp
     src/selftests/transition_export_selftest.cpp
@@ -611,6 +612,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/ProxyProgressDialog.cpp
     src/ProxyManagementDialog.cpp
     src/DecoderSlotManager.cpp
+    src/AudioTrackFx.h
+    src/AudioTrackFx.cpp
     src/AudioMixer.cpp
     src/PlanarTracker.cpp
     src/FeatureTracker.cpp
