@@ -1526,7 +1526,7 @@ int runMcpSelftest()
             };
             auto readTrack = [&]() {
                 const auto tracks = toolPayload(callProjectInfoTool(++requestId, QStringLiteral("get_timeline"), {}))
-                    .value(QStringLiteral("videoTracks")).toArray();
+                    .value(QStringLiteral("video")).toArray();
                 return tracks.isEmpty() ? QJsonObject{} : tracks.at(0).toObject();
             };
             const quint64 serial = projectTimeline->undoManager()->saveSerial();
@@ -1574,7 +1574,7 @@ int runMcpSelftest()
                 {QStringLiteral("color"), QStringLiteral("#ABCDEF")},
                 {QStringLiteral("muted"), true}, {QStringLiteral("solo"), true}}));
             const auto audioTracks = toolPayload(callProjectInfoTool(++requestId, QStringLiteral("get_timeline"), {}))
-                .value(QStringLiteral("audioTracks")).toArray();
+                .value(QStringLiteral("audio")).toArray();
             const auto audioTrack = audioTracks.isEmpty() ? QJsonObject{} : audioTracks.at(0).toObject();
             g160 = g160 && mixed.value(QStringLiteral("ok")).toBool()
                 && mixed.value(QStringLiteral("undoRecorded")).toBool()
