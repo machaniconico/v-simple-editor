@@ -2308,6 +2308,10 @@ QJsonObject ProjectFile::trackFlagsToJson(const ProjectData &data)
                 item.insert(QStringLiteral("solo"), solo);
                 item.insert(QStringLiteral("hidden"), hidden);
             }
+            const QString name = candidate.value(QStringLiteral("name")).toString();
+            const QColor color(candidate.value(QStringLiteral("color")).toString());
+            if (!name.isEmpty()) item.insert(QStringLiteral("name"), name);
+            if (color.isValid()) item.insert(QStringLiteral("color"), color.name());
             // Keep one array entry per track even when every flag is false.
             result.append(item);
         }

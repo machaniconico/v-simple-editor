@@ -1193,7 +1193,7 @@ int runMcpSelftest()
             rpcRequest(73, QStringLiteral("tools/list")))))
         .value(QStringLiteral("result")).toObject()
         .value(QStringLiteral("tools")).toArray();
-    constexpr int kExpectedProjectInfoToolCount = 36 + 1 + 2 + 2; // US-308: compare_project; US-312: render/decompose; US-400: color/LUT
+    constexpr int kExpectedProjectInfoToolCount = 36 + 1 + 2 + 2 + 1; // US-308: compare_project; US-312: render/decompose; US-400: color/LUT; US-406: track properties
     bool outputSchemasDeclared = projectInfoToolDescriptors.size()
         == kExpectedProjectInfoToolCount;
     for (const QJsonValue& value : projectInfoToolDescriptors) {
@@ -1512,6 +1512,85 @@ int runMcpSelftest()
             projectTimeline->undoManager()->saveState(
                 projectTimeline->currentState(), QStringLiteral("MCP selftest baseline"));
         };
+
+        // US-406 reserved G159-G160: track appearance is one undo; flags are not.
+        {
+            const QJsonObject original = projectTimeline->trackFlagsToJson();
+            saveTestUndoBaseline();
+            int requestId = 15900;
+            auto callTrack = [&](const QJsonObject &values) {
+                QJsonObject args = values;
+                if (!args.contains(QStringLiteral("kind"))) args.insert(QStringLiteral("kind"), QStringLiteral("video"));
+                if (!args.contains(QStringLiteral("trackIndex"))) args.insert(QStringLiteral("trackIndex"), 0);
+                return callProjectInfoTool(++requestId, QStringLiteral("set_track_property"), args);
+            };
+            auto readTrack = [&]() {
+                const auto tracks = toolPayload(callProjectInfoTool(++requestId, QStringLiteral("get_timeline"), {}))
+                    .value(QStringLiteral("videoTracks")).toArray();
+                return tracks.isEmpty() ? QJsonObject{} : tracks.at(0).toObject();
+            };
+            const quint64 serial = projectTimeline->undoManager()->saveSerial();
+            const auto changed = toolPayload(callTrack(QJsonObject{
+                {QStringLiteral("name"), QStringLiteral("MCP 映像")},
+                {QStringLiteral("color"), QStringLiteral("#123abc")}}));
+            const auto track = readTrack();
+            bool g159 = changed.value(QStringLiteral("ok")).toBool()
+                && changed.value(QStringLiteral("undoRecorded")).toBool()
+                && requiredOutputFieldsPresent(QStringLiteral("set_track_property"), changed)
+                && track.value(QStringLiteral("name")).toString() == QStringLiteral("MCP 映像")
+                && track.value(QStringLiteral("color")).toString() == QStringLiteral("#123abc")
+                && projectTimeline->undoManager()->saveSerial() == serial + 1;
+            const auto undone = toolPayload(callProjectInfoTool(++requestId, QStringLiteral("undo"), {}));
+            g159 = g159 && undone.value(QStringLiteral("ok")).toBool()
+                && projectTimeline->trackFlagsToJson() == original;
+            g159 ? pass("G159 track name/color readback and single undo")
+                 : fail("G159 track name/color readback and single undo", QStringLiteral("appearance/undo mismatch"));
+            const quint64 flagSerial = projectTimeline->undoManager()->saveSerial();
+            const auto flags = toolPayload(callTrack(QJsonObject{
+                {QStringLiteral("muted"), true}, {QStringLiteral("solo"), true}, {QStringLiteral("hidden"), true}}));
+            const auto flagTrack = readTrack();
+            bool g160 = flags.value(QStringLiteral("ok")).toBool()
+                && !flags.value(QStringLiteral("undoRecorded")).toBool()
+                && flagTrack.value(QStringLiteral("muted")).toBool()
+                && flagTrack.value(QStringLiteral("solo")).toBool()
+                && flagTrack.value(QStringLiteral("hidden")).toBool()
+                && projectTimeline->undoManager()->saveSerial() == flagSerial;
+            const auto beforeInvalid = projectTimeline->trackFlagsToJson();
+            for (const QJsonObject &invalid : {
+                QJsonObject{{QStringLiteral("trackIndex"), 99999}},
+                QJsonObject{{QStringLiteral("name"), QStringLiteral("must not apply")}, {QStringLiteral("color"), QStringLiteral("red")}},
+                QJsonObject{{QStringLiteral("color"), QStringLiteral("#12345z")}},
+                QJsonObject{{QStringLiteral("color"), QStringLiteral("#12345678")}},
+                QJsonObject{{QStringLiteral("muted"), QStringLiteral("true")}}}) {
+                const auto response = callTrack(invalid);
+                g160 = g160 && (response.contains(QStringLiteral("error"))
+                    || toolResult(response).value(QStringLiteral("isError")).toBool());
+            }
+            g160 = g160 && projectTimeline->trackFlagsToJson() == beforeInvalid
+                && projectTimeline->undoManager()->saveSerial() == flagSerial;
+            const auto mixed = toolPayload(callTrack(QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("audio")},
+                {QStringLiteral("name"), QStringLiteral("MCP 音声")},
+                {QStringLiteral("color"), QStringLiteral("#ABCDEF")},
+                {QStringLiteral("muted"), true}, {QStringLiteral("solo"), true}}));
+            const auto audioTracks = toolPayload(callProjectInfoTool(++requestId, QStringLiteral("get_timeline"), {}))
+                .value(QStringLiteral("audioTracks")).toArray();
+            const auto audioTrack = audioTracks.isEmpty() ? QJsonObject{} : audioTracks.at(0).toObject();
+            g160 = g160 && mixed.value(QStringLiteral("ok")).toBool()
+                && mixed.value(QStringLiteral("undoRecorded")).toBool()
+                && audioTrack.value(QStringLiteral("name")).toString() == QStringLiteral("MCP 音声")
+                && audioTrack.value(QStringLiteral("color")).toString() == QStringLiteral("#abcdef");
+            const auto mixedUndo = toolPayload(callProjectInfoTool(++requestId, QStringLiteral("undo"), {}));
+            g160 = g160 && mixedUndo.value(QStringLiteral("ok")).toBool()
+                && projectTimeline->trackAt(true, 0)->isMuted()
+                && projectTimeline->trackAt(true, 0)->isSolo()
+                && projectTimeline->trackAt(true, 0)->customName
+                    == original.value(QStringLiteral("audio")).toArray().at(0).toObject().value(QStringLiteral("name")).toString();
+            g160 ? pass("G160 track flags and invalid arguments")
+                 : fail("G160 track flags and invalid arguments", QStringLiteral("flags/validation mismatch"));
+            projectTimeline->applyTrackFlagsFromJson(original);
+            saveTestUndoBaseline();
+        }
 
         // US-400 reserved G156-G158: actual MCP writes, reads and single-step undo.
         {
@@ -5061,6 +5140,8 @@ int runMcpSelftest()
                QStringLiteral("id presence was not distinguished"));
 
     if (!timelineReady) {
+        fail("G159 track name/color readback and single undo", QStringLiteral("Timeline was not available"));
+        fail("G160 track flags and invalid arguments", QStringLiteral("Timeline was not available"));
         fail("G156 color correction readback and single undo", QStringLiteral("Timeline was not available"));
         fail("G157 invalid color fields and hueSatWarp warning", QStringLiteral("Timeline was not available"));
         fail("G158 LUT apply clear and single-step undo", QStringLiteral("Timeline was not available"));

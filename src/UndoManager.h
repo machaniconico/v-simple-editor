@@ -34,6 +34,8 @@ struct TimelineState {
     int selectedAudioTrackIndex = -1;
     int selectedAudioClipIndex = -1;
     double playheadPos = 0.0;
+    QVector<QString> videoTrackNames, audioTrackNames;
+    QVector<QColor> videoTrackColors, audioTrackColors;
     QVector<double> audioTrackGains;
     QHash<QString, QString> clipParentEntries;
     // スナップショット時のプロジェクト出力ジオメトリ。SNS プリセット(プロジェクトを

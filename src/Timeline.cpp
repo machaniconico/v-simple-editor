@@ -46,6 +46,7 @@
 #include <QJsonValue>
 #include <QMessageBox>
 #include <QInputDialog>
+#include <QLineEdit>
 #include <QPushButton>
 #include <QSizePolicy>
 #include <QSpacerItem>
@@ -3793,7 +3794,14 @@ QWidget *Timeline::createTrackHeader(TimelineTrack *track, const QString &name, 
             "QPushButton:checked { background-color: #666; color: #888; border: 1px solid #999; }");
     }
 
+    auto *stripe = new QWidget(w);
+    stripe->setObjectName(QStringLiteral("timelineTrackColorStripe"));
+    stripe->setFixedWidth(6);
+    hbox->setContentsMargins(0, 4, 4, 4);
+    hbox->addWidget(stripe);
     auto *label = new QLabel(name, w);
+    label->setObjectName(QStringLiteral("timelineTrackName"));
+    label->setProperty("defaultName", name);
     label->setStyleSheet(isAudioRow
         ? "QLabel { background: transparent; border: none; color: #44AA88; font-weight: bold; font-size: 12px; }"
         : "QLabel { background: transparent; border: none; color: #4488CC; font-weight: bold; font-size: 12px; }");
@@ -3872,6 +3880,33 @@ QWidget *Timeline::createTrackHeader(TimelineTrack *track, const QString &name, 
         });
     }
 
+    w->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(w, &QWidget::customContextMenuRequested, this,
+            [this, w, trackPtr, isAudioRow](const QPoint &pos) {
+        if (!trackPtr) return;
+        const int idx = isAudioRow ? m_audioTracks.indexOf(trackPtr.data())
+                                   : m_videoTracks.indexOf(trackPtr.data());
+        if (idx < 0) return;
+        QMenu menu(w);
+        auto *rename = menu.addAction(QStringLiteral("名前を変更…"));
+        QMenu *colors = menu.addMenu(QStringLiteral("色"));
+        for (int i = int(ClipLabel::None); i <= int(ClipLabel::Pink); ++i) {
+            const QColor color = clipLabelColor(ClipLabel(i));
+            auto *action = colors->addAction(clipLabelName(ClipLabel(i)));
+            action->setCheckable(true);
+            action->setChecked(trackPtr->color == color);
+            connect(action, &QAction::triggered, this, [this, isAudioRow, idx, color] {
+                setTrackColor(isAudioRow, idx, color);
+            });
+        }
+        if (menu.exec(w->mapToGlobal(pos)) == rename && trackPtr) {
+            bool ok = false;
+            const QString value = QInputDialog::getText(this, QStringLiteral("名前を変更"),
+                QStringLiteral("トラック名（空欄で既定名）"), QLineEdit::Normal,
+                trackPtr->customName, &ok);
+            if (ok) setTrackCustomName(isAudioRow, idx, value);
+        }
+    });
     m_trackHeaders.insert(track, w);
     syncTrackHeaderFlags(track);
 
@@ -3883,6 +3918,14 @@ void Timeline::syncTrackHeaderFlags(TimelineTrack *track)
     QWidget *header = m_trackHeaders.value(track, nullptr);
     if (!track || !header)
         return;
+
+    if (auto *label = header->findChild<QLabel *>(QStringLiteral("timelineTrackName")))
+        label->setText(track->customName.isEmpty()
+            ? label->property("defaultName").toString() : track->customName);
+    if (auto *stripe = header->findChild<QWidget *>(QStringLiteral("timelineTrackColorStripe"))) {
+        stripe->setStyleSheet(QStringLiteral("background: %1; border: none;")
+            .arg(track->color.isValid() ? track->color.name() : QStringLiteral("transparent")));
+    }
 
     auto syncButton = [header](const QString &objectName, bool checked,
                                const QString &onText, const QString &offText) {
@@ -11401,6 +11444,14 @@ TimelineState Timeline::currentState() const
     state.audioTracks.reserve(m_audioTracks.size());
     for (const auto *t : m_audioTracks)
         state.audioTracks.append(t ? t->clips() : QVector<ClipInfo>{});
+    for (const auto *track : m_videoTracks) {
+        state.videoTrackNames.append(track ? track->customName : QString{});
+        state.videoTrackColors.append(track ? track->color : QColor{});
+    }
+    for (const auto *track : m_audioTracks) {
+        state.audioTrackNames.append(track ? track->customName : QString{});
+        state.audioTrackColors.append(track ? track->color : QColor{});
+    }
     state.generatedCaptionOverlays = m_generatedCaptionOverlays;
     state.selectedClip = m_videoTrack->selectedClip();
 
@@ -11456,6 +11507,9 @@ void Timeline::restoreState(const TimelineState &state)
                             ? state.videoTracks[i]
                             : QVector<ClipInfo>{};
         m_videoTracks[i]->setClips(clips);
+        m_videoTracks[i]->customName = state.videoTrackNames.value(i);
+        m_videoTracks[i]->color = state.videoTrackColors.value(i);
+        syncTrackHeaderFlags(m_videoTracks[i]);
         m_videoTracks[i]->update();
     }
     for (int i = 0; i < m_audioTracks.size(); ++i) {
@@ -11464,6 +11518,9 @@ void Timeline::restoreState(const TimelineState &state)
                             ? state.audioTracks[i]
                             : QVector<ClipInfo>{};
         m_audioTracks[i]->setClips(clips);
+        m_audioTracks[i]->customName = state.audioTrackNames.value(i);
+        m_audioTracks[i]->color = state.audioTrackColors.value(i);
+        syncTrackHeaderFlags(m_audioTracks[i]);
         m_audioTracks[i]->update();
     }
     m_generatedCaptionOverlays = state.generatedCaptionOverlays;
@@ -11568,6 +11625,37 @@ bool Timeline::setTrackLocked(TrackKind kind, int trackIndex, bool locked)
     return true;
 }
 
+bool Timeline::setTrackAppearance(bool audio, int idx, const QString &name,
+                                  const QColor &color, QString *err)
+{
+    TimelineTrack *track = trackAt(audio, idx);
+    if (!track) {
+        if (err) *err = QStringLiteral("トラック番号が範囲外です");
+        return false;
+    }
+    const QColor normalized = color.isValid() ? QColor(color.name()) : QColor{};
+    if (track->customName == name && track->color == normalized) return true;
+    // No clip mutation: clip identity/remapping is unchanged.
+    track->customName = name;
+    track->color = normalized;
+    syncTrackHeaderFlags(track);
+    saveUndoState(QStringLiteral("トラックの名前・色を変更"));
+    scheduleEmitSequenceChanged();
+    return true;
+}
+
+bool Timeline::setTrackCustomName(bool audio, int idx, const QString &name, QString *err)
+{
+    const auto *track = trackAt(audio, idx);
+    return setTrackAppearance(audio, idx, name, track ? track->color : QColor{}, err);
+}
+
+bool Timeline::setTrackColor(bool audio, int idx, const QColor &color, QString *err)
+{
+    const auto *track = trackAt(audio, idx);
+    return setTrackAppearance(audio, idx, track ? track->customName : QString{}, color, err);
+}
+
 QJsonObject Timeline::trackFlagsToJson() const
 {
     auto flagsForTracks = [](const QVector<TimelineTrack *> &tracks) {
@@ -11575,6 +11663,8 @@ QJsonObject Timeline::trackFlagsToJson() const
         for (const TimelineTrack *track : tracks) {
             QJsonObject flags;
             if (track) {
+                if (!track->customName.isEmpty()) flags.insert(QStringLiteral("name"), track->customName);
+                if (track->color.isValid()) flags.insert(QStringLiteral("color"), track->color.name());
                 const bool locked = track->isLocked();
                 const bool muted = track->isMuted();
                 const bool solo = track->isSolo();
@@ -11615,7 +11705,9 @@ void Timeline::applyTrackFlagsFromJson(const QJsonObject &flags)
             const bool hidden = item.value(QStringLiteral("hidden")).toBool(false);
             const bool soloChanged = track->isSolo() != solo;
             playbackFlagsChanged = playbackFlagsChanged
-                || track->isMuted() != muted || track->isHidden() != hidden;
+                || track->isMuted() != muted || track->isHidden() != hidden || soloChanged;
+            track->customName = item.value(QStringLiteral("name")).toString();
+            track->color = QColor(item.value(QStringLiteral("color")).toString());
             track->setLocked(locked);
             track->setMuted(muted);
             track->setSolo(solo);
@@ -11701,10 +11793,13 @@ void Timeline::restoreFromProject(const ProjectTrackClips &videoTracks,
     QJsonObject flags = videoTracks.trackFlagsSnapshot;
     if (flags.isEmpty())
         flags = audioTracks.trackFlagsSnapshot;
+    // Capture the loaded appearance in the load undo snapshot as well.
+    while (m_videoTracks.size() < videoTracks.size()) addVideoTrack();
+    while (m_audioTracks.size() < audioTracks.size()) addAudioTrack();
+    applyTrackFlagsFromJson(flags);
     restoreFromProject(static_cast<const QVector<QVector<ClipInfo>> &>(videoTracks),
                        static_cast<const QVector<QVector<ClipInfo>> &>(audioTracks),
                        playhead, markInVal, markOutVal, zoom);
-    applyTrackFlagsFromJson(flags);
 }
 
 // --- Timeline markers (Premiere Pro / DaVinci Resolve parity) ---

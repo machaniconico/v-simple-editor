@@ -460,6 +460,9 @@ class TimelineTrack : public QWidget
 public:
     explicit TimelineTrack(QWidget *parent = nullptr);
 
+    QString customName; // 空なら V1 / A1 などの既定名
+    QColor color; // 無効なら既定色
+
     void addClip(const ClipInfo &clip);
     void insertClip(int index, const ClipInfo &clip);
     void removeClip(int index);
@@ -904,6 +907,10 @@ public:
         return index >= 0 && index < tracks.size() ? tracks.at(index) : nullptr;
     }
     bool setTrackLocked(TrackKind kind, int trackIndex, bool locked);
+    bool setTrackCustomName(bool audio, int idx, const QString &name, QString *err = nullptr);
+    bool setTrackColor(bool audio, int idx, const QColor &color, QString *err = nullptr);
+    bool setTrackAppearance(bool audio, int idx, const QString &name, const QColor &color,
+                            QString *err = nullptr);
     QJsonObject trackFlagsToJson() const;
     void applyTrackFlagsFromJson(const QJsonObject &flags);
 

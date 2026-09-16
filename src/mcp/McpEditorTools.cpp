@@ -415,16 +415,40 @@ QJsonObject clipOutputItemSchema()
     });
 }
 
+QJsonObject trackPropertiesSchema()
+{
+    QJsonObject properties;
+    for (const QString &key : {QStringLiteral("name"), QStringLiteral("color")})
+        properties.insert(key, QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}});
+    for (const QString &key : {QStringLiteral("locked"), QStringLiteral("muted"),
+                              QStringLiteral("solo"), QStringLiteral("hidden")})
+        properties.insert(key, QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}});
+    properties.insert(QStringLiteral("index"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}});
+    return properties;
+}
+
+QJsonObject trackPropertiesToJson(const TimelineTrack *track, int index)
+{
+    return QJsonObject{
+        {QStringLiteral("index"), index},
+        {QStringLiteral("name"), track ? track->customName : QString{}},
+        {QStringLiteral("color"), track && track->color.isValid() ? track->color.name() : QString{}},
+        {QStringLiteral("locked"), track && track->isLocked()},
+        {QStringLiteral("muted"), track && track->isMuted()},
+        {QStringLiteral("solo"), track && track->isSolo()},
+        {QStringLiteral("hidden"), track && track->isHidden()}
+    };
+}
+
 QJsonObject trackOutputItemSchema()
 {
-    return outputSchemaOf(QJsonObject{
-        {QStringLiteral("index"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
-        {QStringLiteral("locked"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
-        {QStringLiteral("clips"), QJsonObject{
-            {QStringLiteral("type"), QStringLiteral("array")},
-            {QStringLiteral("items"), clipOutputItemSchema()}
-        }}
-    }, {QStringLiteral("index"), QStringLiteral("locked"), QStringLiteral("clips")});
+    QJsonObject properties = trackPropertiesSchema();
+    properties.insert(QStringLiteral("clips"), QJsonObject{
+        {QStringLiteral("type"), QStringLiteral("array")},
+        {QStringLiteral("items"), clipOutputItemSchema()}
+    });
+    return outputSchemaOf(properties,
+        {QStringLiteral("index"), QStringLiteral("locked"), QStringLiteral("clips")});
 }
 
 QJsonObject captionOutputItemSchema()
@@ -1094,11 +1118,9 @@ QJsonArray tracksToJson(const Timeline* timeline, TrackKind kind)
                                     overlaps.at(clipIndex)));
             cursorSec += clip.speed > 0.0 ? clip.effectiveDuration() : 0.0;
         }
-        result.append(QJsonObject{
-            {QStringLiteral("index"), trackIndex},
-            {QStringLiteral("locked"), trackObject && trackObject->isLocked()},
-            {QStringLiteral("clips"), clips}
-        });
+        QJsonObject item = trackPropertiesToJson(trackObject, trackIndex);
+        item.insert(QStringLiteral("clips"), clips);
+        result.append(item);
     }
     return result;
 }
@@ -2672,6 +2694,68 @@ void McpEditorTools::registerWriteTools()
             };
         })
     }, openProjectOutputSchema));
+
+    QJsonObject trackPropertyInputs = trackPropertiesSchema();
+    trackPropertyInputs.remove(QStringLiteral("index"));
+    trackPropertyInputs.remove(QStringLiteral("locked"));
+    m_registry->registerTool(withOutputSchema({
+        QStringLiteral("set_track_property"),
+        QStringLiteral("トラックの名前・色・再生フラグを設定。名前と色はまとめて1回のUndo、再生フラグはUndo対象外。空の名前・色で既定に戻す。"),
+        schemaWithRequired(mergedProperties(trackSelectorProperties(), trackPropertyInputs),
+                           {QStringLiteral("kind"), QStringLiteral("trackIndex")}),
+        guardedWrite(QStringLiteral("set_track_property"),
+            [this](const QJsonObject &args, QString *err) -> QJsonObject {
+            if (!rejectUnknownArguments(args, {QStringLiteral("kind"), QStringLiteral("trackIndex"),
+                    QStringLiteral("name"), QStringLiteral("color"), QStringLiteral("muted"),
+                    QStringLiteral("solo"), QStringLiteral("hidden")}, err)) return {};
+            TrackTarget target;
+            Timeline *currentTimeline = timeline();
+            if (!readTrackTarget(args, m_window, currentTimeline, &target, err)) return {};
+            for (const QString &key : {QStringLiteral("name"), QStringLiteral("color")}) {
+                if (args.contains(key) && !args.value(key).isString())
+                    return setError(err, key + QStringLiteral(" must be a string")), QJsonObject{};
+            }
+            for (const QString &key : {QStringLiteral("muted"), QStringLiteral("solo"), QStringLiteral("hidden")}) {
+                if (args.contains(key) && !args.value(key).isBool())
+                    return setError(err, key + QStringLiteral(" must be a boolean")), QJsonObject{};
+            }
+            QString name = args.contains(QStringLiteral("name"))
+                ? args.value(QStringLiteral("name")).toString() : target.track->customName;
+            QColor color = target.track->color;
+            if (args.contains(QStringLiteral("color"))) {
+                const QString text = args.value(QStringLiteral("color")).toString();
+                bool valid = text.isEmpty() || (text.size() == 7 && text.startsWith(QLatin1Char('#')));
+                for (int i = 1; valid && i < text.size(); ++i)
+                    valid = QStringLiteral("0123456789abcdefABCDEF").contains(text.at(i));
+                if (!valid) return setError(err, QStringLiteral("color must be #RRGGBB or empty")), QJsonObject{};
+                color = text.isEmpty() ? QColor{} : QColor(text);
+            }
+            const QJsonObject before = trackPropertiesToJson(target.track, target.trackIndex);
+            const bool undoRecorded = name != target.track->customName || color != target.track->color;
+            if (!currentTimeline->setTrackAppearance(target.kind == TrackKind::Audio,
+                    target.trackIndex, name, color, err)) return {};
+            QJsonObject flags = currentTimeline->trackFlagsToJson();
+            const QString kind = target.kindName;
+            QJsonArray items = flags.value(kind).toArray();
+            QJsonObject item = items.at(target.trackIndex).toObject();
+            for (const QString &key : {QStringLiteral("muted"), QStringLiteral("solo"), QStringLiteral("hidden")})
+                if (args.contains(key)) item.insert(key, args.value(key));
+            items[target.trackIndex] = item;
+            flags.insert(kind, items);
+            currentTimeline->applyTrackFlagsFromJson(flags);
+            const QJsonObject after = trackPropertiesToJson(target.track, target.trackIndex);
+            if (before != after) m_window->setWindowModified(true);
+            syncSelectionAfterEdit();
+            return QJsonObject{{QStringLiteral("ok"), true},
+                {QStringLiteral("track"), after}, {QStringLiteral("undoRecorded"), undoRecorded}};
+        })
+    }, outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("track"), outputSchemaOf(trackPropertiesSchema(),
+            {QStringLiteral("index"), QStringLiteral("name"), QStringLiteral("color"),
+             QStringLiteral("locked"), QStringLiteral("muted"), QStringLiteral("solo"), QStringLiteral("hidden")})},
+        {QStringLiteral("undoRecorded"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}}
+    }, {QStringLiteral("ok"), QStringLiteral("track"), QStringLiteral("undoRecorded")})));
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("set_track_locked"),
