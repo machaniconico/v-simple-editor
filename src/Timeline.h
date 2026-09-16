@@ -697,6 +697,10 @@ public:
     void selectAllClips();
     void selectClipsFromPlayhead(bool forward);
     void bladeAllTracksAtPlayhead();
+    void duplicateSelectedClips();
+    void nudgeSelectedClips(int frames);
+    void closeAllGaps();
+    void setNudgeFrameRate(double fps);
     // ---- index 指定の編集 (MCP / スクリプト経路) ----
     // GUI 経路と同じ「snapshot -> 変更 -> remap -> saveUndoState」の順序を
     // 内部で守る。選択状態には依存しない。失敗時は *err を埋めて false を返し、
@@ -1234,6 +1238,9 @@ private slots:
     void onPlayheadAutoScrollTick();
 
 private:
+    ClipInfo copyClipForPaste(const ClipInfo &source, QHash<int, int> &groups);
+    double m_nudgeFrameRate = 30.0;
+    bool m_nudgeBatchActive = false;
     void selectClipsForErgo(int direction); // 0: all, +1: forward, -1: backward
     QVector<PlaybackEntry> computePlaybackSequenceImpl(
         QVector<QVector<OverlapInterval>> *overlapIntervals) const;
@@ -1258,7 +1265,7 @@ private:
     QVector<TimeRangeSec> selectedClipTimeRanges() const;
     bool gapTimeRangeAt(TimelineTrack *track, double timeSec, TimeRangeSec *outRange) const;
     bool applyRippleDeleteTimeRangesToAllTracks(QVector<TimeRangeSec> ranges,
-                                                const QString &undoLabel);
+                                                const QString &undoLabel, bool skipLocked = false);
     void showGapContextMenu(TimelineTrack *track, double timeSec, const QPoint &globalPos);
     void captureZoomAnchor();
     void clearZoomAnchor();

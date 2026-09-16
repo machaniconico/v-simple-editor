@@ -94,7 +94,13 @@ QList<QPair<QString, QKeySequence>> ShortcutManager::presetBindingTable(Preset p
     table << P{"timeline.select_forward", QKeySequence()}
           << P{"timeline.select_backward", QKeySequence()}
           << P{"timeline.blade_all", QKeySequence("Ctrl+Shift+K")}
-          << P{"timeline.lift", QKeySequence()};
+          << P{"timeline.lift", QKeySequence()}
+          << P{"timeline.duplicate", QKeySequence("Ctrl+D")}
+          << P{"timeline.nudge_left", QKeySequence("Alt+Left")}
+          << P{"timeline.nudge_right", QKeySequence("Alt+Right")}
+          << P{"timeline.nudge_left10", QKeySequence("Alt+Shift+Left")}
+          << P{"timeline.nudge_right10", QKeySequence("Alt+Shift+Right")}
+          << P{"timeline.close_all_gaps", QKeySequence()};
     return table;
 }
 

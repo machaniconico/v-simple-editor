@@ -3124,6 +3124,18 @@ void MainWindow::registerCoreShortcuts()
         QStringLiteral("再生ヘッド以前を選択"), QStringLiteral("編集"));
     reg(m_bladeAllAction, "timeline.blade_all",
         QStringLiteral("全トラックを再生ヘッドで分割"), QStringLiteral("編集"));
+    reg(m_duplicateAction, "timeline.duplicate",
+        QStringLiteral("複製"), QStringLiteral("編集"));
+    reg(m_nudgeLeftAction, "timeline.nudge_left",
+        QStringLiteral("1フレーム左へ移動"), QStringLiteral("編集"));
+    reg(m_nudgeRightAction, "timeline.nudge_right",
+        QStringLiteral("1フレーム右へ移動"), QStringLiteral("編集"));
+    reg(m_nudgeLeft10Action, "timeline.nudge_left10",
+        QStringLiteral("10フレーム左へ移動"), QStringLiteral("編集"));
+    reg(m_nudgeRight10Action, "timeline.nudge_right10",
+        QStringLiteral("10フレーム右へ移動"), QStringLiteral("編集"));
+    reg(m_closeAllGapsAction, "timeline.close_all_gaps",
+        QStringLiteral("すべてのギャップを詰める"), QStringLiteral("編集"));
     reg(m_liftAction, "timeline.lift",
         QStringLiteral("リフト (ギャップを残して削除)"), QStringLiteral("編集"));
     reg(m_deleteAction,          "edit.delete",
@@ -4306,6 +4318,63 @@ void MainWindow::setupMenuBar()
     m_selectForwardAction = editMenu->addAction("再生ヘッド以降を選択");
     m_selectBackwardAction = editMenu->addAction("再生ヘッド以前を選択");
     m_bladeAllAction = editMenu->addAction("全トラックを再生ヘッドで分割");
+    m_duplicateAction = editMenu->addAction("複製");
+    m_duplicateAction->setShortcut(QKeySequence("Ctrl+D"));
+    connect(m_duplicateAction, &QAction::triggered, this, [this]() {
+        const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
+        m_timeline->duplicateSelectedClips();
+        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
+        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+        updateEditActions();
+    });
+    m_nudgeLeftAction = editMenu->addAction("1フレーム左へ移動");
+    m_nudgeLeftAction->setShortcut(QKeySequence("Alt+Left"));
+    connect(m_nudgeLeftAction, &QAction::triggered, this, [this]() {
+        const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
+        m_timeline->setNudgeFrameRate(m_projectConfig.fps);
+        m_timeline->nudgeSelectedClips(-1);
+        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
+        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+        updateEditActions();
+    });
+    m_nudgeRightAction = editMenu->addAction("1フレーム右へ移動");
+    m_nudgeRightAction->setShortcut(QKeySequence("Alt+Right"));
+    connect(m_nudgeRightAction, &QAction::triggered, this, [this]() {
+        const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
+        m_timeline->setNudgeFrameRate(m_projectConfig.fps);
+        m_timeline->nudgeSelectedClips(1);
+        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
+        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+        updateEditActions();
+    });
+    m_nudgeLeft10Action = editMenu->addAction("10フレーム左へ移動");
+    m_nudgeLeft10Action->setShortcut(QKeySequence("Alt+Shift+Left"));
+    connect(m_nudgeLeft10Action, &QAction::triggered, this, [this]() {
+        const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
+        m_timeline->setNudgeFrameRate(m_projectConfig.fps);
+        m_timeline->nudgeSelectedClips(-10);
+        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
+        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+        updateEditActions();
+    });
+    m_nudgeRight10Action = editMenu->addAction("10フレーム右へ移動");
+    m_nudgeRight10Action->setShortcut(QKeySequence("Alt+Shift+Right"));
+    connect(m_nudgeRight10Action, &QAction::triggered, this, [this]() {
+        const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
+        m_timeline->setNudgeFrameRate(m_projectConfig.fps);
+        m_timeline->nudgeSelectedClips(10);
+        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
+        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+        updateEditActions();
+    });
+    m_closeAllGapsAction = editMenu->addAction("すべてのギャップを詰める");
+    connect(m_closeAllGapsAction, &QAction::triggered, this, [this]() {
+        const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
+        m_timeline->closeAllGaps();
+        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
+        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+        updateEditActions();
+    });
     m_liftAction = editMenu->addAction("リフト (ギャップを残して削除)");
     m_selectAllClipsAction->setShortcut(QKeySequence("Ctrl+A"));
     m_bladeAllAction->setShortcut(QKeySequence("Ctrl+Shift+K"));

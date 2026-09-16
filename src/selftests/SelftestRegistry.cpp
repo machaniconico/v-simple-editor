@@ -756,7 +756,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "mainwindow-lifecycle", "VEDITOR_MAINWINDOW_LIFECYCLE_SELFTEST", runMainWindowLifecycleSelftest, true,
       "MainWindow lifecycle: construct/destroy once, repeat three times, and clear dependent dock objects (3 gates)" },
     { "timeline-ergo", "VEDITOR_TIMELINE_ERGO_SELFTEST", runTimelineErgoSelftest, true,
-      "Timeline selection boundaries, track eligibility, blade all tracks, selection notifications and one-step undo (4 gates)" },
+      "Timeline selection, blade, common gaps, duplicate, frame nudge and one-step undo (6 gates)" },
     { "ripple-delete", "VEDITOR_RIPPLE_DELETE_SELFTEST", runRippleDeleteSelftest, true,
       "Ripple delete and gap close: all-track time-range ripple, one-step undo, and no-selection no-op" },
     { "e2e",               "VEDITOR_E2E_SELFTEST",                runE2eSelftest,                true,

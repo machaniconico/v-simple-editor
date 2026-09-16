@@ -1,5 +1,9 @@
 #include "../Timeline.h"
 #include "../UndoManager.h"
+#include "../ProjectFile.h"
+
+#include <QJsonObject>
+#include <QSignalBlocker>
 
 #include <cmath>
 #include <cstdio>
@@ -100,6 +104,7 @@ int runTimelineErgoSelftest()
         gate(2, ok && !timeline.canUndo());
     }
 
+    bool bladeOk = false;
     {
         Timeline timeline;
         const QVector<ClipInfo> clips{clip(4.0, 1.0, 1), clip(2.0, 1.0)};
@@ -146,7 +151,7 @@ int runTimelineErgoSelftest()
         ok = ok && noOpMessages == 5 && !timeline.canUndo()
             && sameTracks(before.videoTracks, timeline.currentState().videoTracks)
             && sameTracks(before.audioTracks, timeline.currentState().audioTracks);
-        gate(3, ok);
+        bladeOk = ok;
     }
     {
         Timeline timeline;
@@ -177,7 +182,118 @@ int runTimelineErgoSelftest()
             && sameTracks(before.audioTracks, restored.audioTracks)
             && timeline.videoTracks()[0]->selectedClips() == QList<int>({1})
             && timeline.undoManager()->currentIndex() == undoIndex && !timeline.canUndo();
+        gate(3, bladeOk && ok);
+    }
+    {
+        Timeline timeline;
+        // Common gaps [2,4), [6,8); only V2 is empty at [0.5,1).
+        const QVector<ClipInfo> full{clip(2.0), clip(2.0, 2.0), clip(2.0, 2.0)};
+        const QVector<ClipInfo> partial{clip(0.5), clip(1.0, 0.5), clip(2.0, 2.0), clip(2.0, 2.0)};
+        timeline.restoreFromProject({full, partial}, {full, full}, 0.0, -1.0, -1.0, 100);
+        timeline.audioTracks()[1]->setLocked(true);
+        baseline(timeline);
+        const auto before = timeline.currentState();
+        const auto serial = timeline.undoManager()->saveSerial();
+        timeline.closeAllGaps();
+        bool ok = timeline.undoManager()->saveSerial() == serial + 1;
+        for (auto *track : {timeline.videoTracks()[0], timeline.audioTracks()[0]}) {
+            const auto &c = track->clips();
+            ok = ok && c.size() == 3 && near(c[1].leadInSec, 0.0) && near(c[2].leadInSec, 0.0);
+        }
+        const auto &v2 = timeline.videoTracks()[1]->clips();
+        ok = ok && v2.size() == 4 && near(v2[1].leadInSec, 0.5)
+            && near(v2[2].leadInSec, 0.0) && near(v2[3].leadInSec, 0.0)
+            && sameTracks({full}, {timeline.audioTracks()[1]->clips()});
+        timeline.closeAllGaps();
+        ok = ok && timeline.undoManager()->saveSerial() == serial + 1;
+        timeline.undo();
+        ok = ok && sameTracks(before.videoTracks, timeline.currentState().videoTracks)
+            && sameTracks(before.audioTracks, timeline.currentState().audioTracks) && !timeline.canUndo();
         gate(4, ok);
+    }
+    {
+        Timeline timeline;
+        ClipInfo source = clip(2.0, 1.0, 7);
+        source.opacity = 0.65;
+        source.videoScale = 1.3;
+        const QVector<ClipInfo> linked{source, clip(1.0, 4.0)};
+        const QVector<ClipInfo> crowded{clip(2.0), clip(3.0)};
+        timeline.restoreFromProject({linked, crowded}, {linked}, 0.0, -1.0, -1.0, 100);
+        timeline.clearSelection();
+        timeline.videoTracks()[0]->setSelectedClip(0);
+        // Block cross-track selection clearing to explicitly exercise multi-selection.
+        {
+            const QSignalBlocker blocker(timeline.videoTracks()[1]);
+            timeline.videoTracks()[1]->setSelectedClip(0);
+        }
+        baseline(timeline);
+        const auto before = timeline.currentState();
+        const auto serial = timeline.undoManager()->saveSerial();
+        timeline.duplicateSelectedClips();
+        const auto &v = timeline.videoTracks()[0]->clips();
+        const auto &a = timeline.audioTracks()[0]->clips();
+        const auto &v2 = timeline.videoTracks()[1]->clips();
+        bool ok = v.size() == 3 && a.size() == 3 && v2.size() == 3
+            && timeline.undoManager()->saveSerial() == serial + 1;
+        if (v.size() == 3 && a.size() == 3 && v2.size() == 3) {
+            auto payload = [](ClipInfo c) {
+                c.leadInSec = 0.0;
+                c.linkGroup = 0;
+                return ProjectFile::clipToJson(c);
+            };
+            ok = ok && near(v[1].leadInSec, 0.0) && near(v[2].leadInSec, 2.0)
+                && v[1].linkGroup > 0 && v[1].linkGroup != 7 && v[1].linkGroup == a[1].linkGroup
+                && payload(source) == payload(v[1]) && payload(source) == payload(a[1])
+                && payload(crowded[0]) == payload(v2[2]) && near(v2[2].leadInSec, 0.0);
+        }
+        timeline.undo();
+        ok = ok && sameTracks(before.videoTracks, timeline.currentState().videoTracks)
+            && sameTracks(before.audioTracks, timeline.currentState().audioTracks) && !timeline.canUndo();
+        gate(5, ok);
+    }
+    {
+        bool ok = true;
+        for (double fps : {24.0, 30.0, 60.0}) {
+            for (int frames : {1, -1, 10}) {
+                Timeline timeline;
+                const QVector<ClipInfo> clips{clip(2.0, 1.0, 9), clip(2.0, 5.0)};
+                timeline.restoreFromProject({clips}, {clips}, 0.0, -1.0, -1.0, 100);
+                timeline.setNudgeFrameRate(fps);
+                timeline.selectAllClips();
+                baseline(timeline);
+                const auto before = timeline.currentState();
+                const auto serial = timeline.undoManager()->saveSerial();
+                timeline.nudgeSelectedClips(frames);
+                const auto &v = timeline.videoTracks()[0]->clips();
+                const auto &a = timeline.audioTracks()[0]->clips();
+                ok = ok && near(v[0].leadInSec, 1.0 + double(frames) / fps)
+                    && near(v[1].leadInSec, 5.0) && near(a[0].leadInSec, v[0].leadInSec)
+                    && near(a[1].leadInSec, 5.0)
+                    && timeline.videoTracks()[0]->selectedClips().size() == 2
+                    && timeline.undoManager()->saveSerial() == serial + 1;
+                timeline.undo();
+                ok = ok && sameTracks(before.videoTracks, timeline.currentState().videoTracks)
+                    && sameTracks(before.audioTracks, timeline.currentState().audioTracks) && !timeline.canUndo();
+            }
+        }
+        Timeline timeline;
+        timeline.restoreFromProject({{clip(2.0, 0.01), clip(2.0, 0.01)}}, {}, 0.0, -1.0, -1.0, 100);
+        timeline.videoTracks()[0]->setSelectedClip(0);
+        timeline.setNudgeFrameRate(30.0);
+        baseline(timeline);
+        const auto before = timeline.currentState();
+        int messages = 0;
+        QObject::connect(&timeline, &Timeline::statusMessageRequested, &timeline,
+                         [&](const QString &, int) { ++messages; });
+        timeline.nudgeSelectedClips(1); // Collision: rejected, candidate reported, no undo.
+        ok = ok && messages == 1 && !timeline.canUndo()
+            && sameTracks(before.videoTracks, timeline.currentState().videoTracks);
+        timeline.nudgeSelectedClips(-1); // Clamp the requested negative start to zero.
+        ok = ok && messages == 2 && near(timeline.videoTracks()[0]->clips()[0].leadInSec, 0.0)
+            && timeline.canUndo();
+        timeline.undo();
+        ok = ok && !timeline.canUndo() && sameTracks(before.videoTracks, timeline.currentState().videoTracks);
+        gate(6, ok);
     }
     std::fprintf(stderr, "[timeline-ergo] summary: %d PASS, %d FAIL\n", passed, failed);
     return failed;

@@ -5201,7 +5201,7 @@ bool Timeline::moveClipByIndex(bool audio, int trackIndex, int clipIndex,
     }
     TimelineTrack *oppositeDestination = nullptr;
     bool createOppositeTrack = false;
-    if (needsOppositeTrack) {
+    if (needsOppositeTrack && !m_nudgeBatchActive) {
         oppositeDestination = trackAt(!audio, newTrackIndex);
         createOppositeTrack = !oppositeDestination;
         if (oppositeDestination && oppositeDestination->isLocked())
@@ -5211,8 +5211,8 @@ bool Timeline::moveClipByIndex(bool audio, int trackIndex, int clipIndex,
     int selectedMemberIndex = -1;
     for (int i = 0; i < members.size(); ++i) {
         MovingMember &member = members[i];
-        member.destinationTrack = member.sourceTrack->isAudioTrack() == audio
-            ? destinationTrack : oppositeDestination;
+        member.destinationTrack = m_nudgeBatchActive ? member.sourceTrack
+            : (member.sourceTrack->isAudioTrack() == audio ? destinationTrack : oppositeDestination);
         if (member.sourceTrack == sourceTrack && member.sourceIndex == clipIndex)
             selectedMemberIndex = i;
     }
@@ -5280,9 +5280,16 @@ bool Timeline::moveClipByIndex(bool audio, int trackIndex, int clipIndex,
         }
         QVector<ClipInfo> remaining;
         remaining.reserve(plan.clips.size());
+        double removedSpan = 0.0;
         for (int i = 0; i < plan.clips.size(); ++i) {
-            if (!removed[i])
-                remaining.append(plan.clips.at(i));
+            if (!removed[i]) {
+                ClipInfo clip = plan.clips.at(i);
+                if (m_nudgeBatchActive) clip.leadInSec += removedSpan;
+                remaining.append(clip);
+                removedSpan = 0.0;
+            } else {
+                removedSpan += plan.clips.at(i).leadInSec + plan.clips.at(i).effectiveDuration();
+            }
         }
         plan.clips = remaining;
         std::sort(plan.memberIndices.begin(), plan.memberIndices.end(),
@@ -5292,7 +5299,7 @@ bool Timeline::moveClipByIndex(bool audio, int trackIndex, int clipIndex,
                   });
     }
 
-    auto nearestAvailableStart = [](const QVector<ClipInfo> &clips,
+    auto nearestAvailableStart = [this](const QVector<ClipInfo> &clips,
                                     double duration, double desired) {
         constexpr double kEps = 1e-6;
         double cursor = 0.0;
@@ -5312,7 +5319,7 @@ bool Timeline::moveClipByIndex(bool audio, int trackIndex, int clipIndex,
             const double clipStart = cursor + qMax(0.0, clip.leadInSec);
             const double clipDuration = qMax(0.0, clip.effectiveDuration());
             // 境界への挿入は後続を右へ押し出す並べ替えとして許可する。
-            consider(clipStart, clipStart);
+            if (!m_nudgeBatchActive) consider(clipStart, clipStart);
             consider(cursor, clipStart - duration);
             cursor = clipStart + clipDuration;
         }
@@ -5322,7 +5329,7 @@ bool Timeline::moveClipByIndex(bool audio, int trackIndex, int clipIndex,
         return best;
     };
 
-    auto insertAtRequestedTime = [](PendingTrack &plan, MovingMember &member) {
+    auto insertAtRequestedTime = [this](PendingTrack &plan, MovingMember &member) {
         constexpr double kEps = 1e-6;
         const double duration = member.clip.effectiveDuration();
         double cursor = 0.0;
@@ -5332,7 +5339,7 @@ bool Timeline::moveClipByIndex(bool audio, int trackIndex, int clipIndex,
             // 連続配置の境界は空き時間が無くても挿入位置として有効にする。
             // 現在のクリップを一つ右へ押し出すことで、A/B/C の A を時刻 5
             // に置くような並べ替えを可能にする。
-            if (qAbs(member.desiredStartSec - clipStart) <= kEps) {
+            if (!m_nudgeBatchActive && qAbs(member.desiredStartSec - clipStart) <= kEps) {
                 ClipInfo inserted = member.clip;
                 inserted.leadInSec = qMax(0.0, member.desiredStartSec - cursor);
                 plan.clips.insert(i, inserted);
@@ -5468,7 +5475,7 @@ bool Timeline::moveClipByIndex(bool audio, int trackIndex, int clipIndex,
         plan.track->setClips(plan.clips);
     remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
     remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
-    if (selectionTrack && selectionIndex >= 0
+    if (!m_nudgeBatchActive && selectionTrack && selectionIndex >= 0
         && selectionIndex < selectionTrack->clipCount()) {
         // 選択中のクリップを動かした場合も、並べ替えで index だけ変わった
         // クリップの場合も、GUI と同じく対象を選択し直す。リンク済み V/A
@@ -5476,7 +5483,7 @@ bool Timeline::moveClipByIndex(bool audio, int trackIndex, int clipIndex,
         clearAllSelections();
         selectionTrack->setSelectedClip(selectionIndex);
     }
-    saveUndoState(QStringLiteral("Move clip (MCP)"));
+    if (!m_nudgeBatchActive) saveUndoState(QStringLiteral("Move clip (MCP)"));
     moveResult.moved = true;
     updateInfoLabel();
     scheduleEmitSequenceChanged();
@@ -6190,7 +6197,7 @@ bool Timeline::gapTimeRangeAt(TimelineTrack *track, double timeSec, TimeRangeSec
 }
 
 bool Timeline::applyRippleDeleteTimeRangesToAllTracks(QVector<TimeRangeSec> ranges,
-                                                      const QString &undoLabel)
+                                                      const QString &undoLabel, bool skipLocked)
 {
     constexpr double kEps = 1e-6;
     QVector<TimeRangeSec> valid;
@@ -6222,11 +6229,11 @@ bool Timeline::applyRippleDeleteTimeRangesToAllTracks(QVector<TimeRangeSec> rang
     for (int i = merged.size() - 1; i >= 0; --i) {
         const TimeRangeSec range = merged[i];
         for (auto *track : m_videoTracks) {
-            if (track)
+            if (track && (!skipLocked || !track->isLocked()))
                 changed = track->rippleDeleteTimeRange(range.startSec, range.endSec, false) || changed;
         }
         for (auto *track : m_audioTracks) {
-            if (track)
+            if (track && (!skipLocked || !track->isLocked()))
                 changed = track->rippleDeleteTimeRange(range.startSec, range.endSec, false) || changed;
         }
     }
@@ -6253,6 +6260,187 @@ void Timeline::rippleDeleteSelectedClip()
 {
     applyRippleDeleteTimeRangesToAllTracks(selectedClipTimeRanges(),
                                            QStringLiteral("リップル削除"));
+}
+
+void Timeline::closeAllGaps()
+{
+    QVector<TimeRangeSec> occupied;
+    for (TimelineTrack *track : timelineTracks(this)) {
+        if (!track || track->isLocked()) continue;
+        for (int i = 0; i < track->clipCount(); ++i) {
+            double start = 0.0, end = 0.0;
+            if (trackClipTimeRangeAt(track, i, &start, &end) && end > start)
+                occupied.append(TimeRangeSec{start, end});
+        }
+    }
+    std::sort(occupied.begin(), occupied.end(), [](const TimeRangeSec &a, const TimeRangeSec &b) {
+        return a.startSec < b.startSec;
+    });
+    QVector<TimeRangeSec> gaps;
+    double end = 0.0;
+    for (const auto &range : occupied) {
+        if (range.startSec > end + 1e-6)
+            gaps.append(TimeRangeSec{end, range.startSec});
+        end = qMax(end, range.endSec);
+    }
+    // The shared primitive merges ranges and applies them back to front,
+    // then remaps carriers and records exactly one undo state.
+    applyRippleDeleteTimeRangesToAllTracks(gaps, QStringLiteral("すべてのギャップを詰める"), true);
+}
+
+void Timeline::duplicateSelectedClips()
+{
+    struct Copy { TimelineTrack *track; ClipInfo clip; double end; };
+    QVector<Copy> copies;
+    QSet<int> groups;
+    const auto tracks = timelineTracks(this);
+    for (auto *track : tracks) {
+        if (!track || track->isLocked()) continue;
+        for (int i : track->selectedClips())
+            if (i >= 0 && i < track->clipCount() && track->clips()[i].linkGroup > 0)
+                groups.insert(track->clips()[i].linkGroup);
+    }
+    // A locked partner makes the entire linked operation ineligible.
+    for (auto *track : tracks)
+        if (track && track->isLocked())
+            for (const auto &clip : track->clips()) groups.remove(clip.linkGroup);
+    for (auto *track : tracks) {
+        if (!track || track->isLocked()) continue;
+        for (int i = 0; i < track->clipCount(); ++i) {
+            const auto &clip = track->clips()[i];
+            if (clip.linkGroup > 0 ? !groups.contains(clip.linkGroup) : !track->isClipSelected(i)) continue;
+            double start = 0.0, end = 0.0;
+            if (trackClipTimeRangeAt(track, i, &start, &end)) copies.append({track, clip, end});
+        }
+    }
+    if (copies.isEmpty()) return;
+    const TrackClipSnapshot before = snapshotTrackClips(this);
+    QHash<int, int> newGroups;
+    for (const auto &copy : copies) {
+        const ClipInfo duplicate = copyClipForPaste(copy.clip, newGroups);
+        double cursor = 0.0;
+        int insertAt = copy.track->clipCount();
+        double start = copy.end;
+        for (int i = 0; i < copy.track->clipCount(); ++i) {
+            const auto &existing = copy.track->clips()[i];
+            const double nextStart = cursor + qMax(0.0, existing.leadInSec);
+            if (start >= cursor - 1e-6 && start + duplicate.effectiveDuration() <= nextStart + 1e-6) {
+                insertAt = i;
+                break;
+            }
+            cursor = nextStart + existing.effectiveDuration();
+        }
+        start = qMax(start, cursor);
+        // Shared paste/insert primitive preserves the complete ClipInfo payload.
+        copy.track->insertClipPreservingDownstream(insertAt, duplicate, start - cursor);
+    }
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, before);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, before);
+    saveUndoState(QStringLiteral("複製"));
+    ensureSequenceFitsViewport();
+    scheduleEmitSequenceChanged();
+    updateInfoLabel();
+}
+
+void Timeline::setNudgeFrameRate(double fps)
+{
+    if (std::isfinite(fps) && fps > 0.0) m_nudgeFrameRate = fps;
+}
+
+void Timeline::nudgeSelectedClips(int frames)
+{
+    if (!frames) return;
+    struct Target { TimelineTrack *track; int index; double start; int group; };
+    QVector<Target> targets;
+    QVector<Target> selection;
+    QSet<int> groups;
+    for (auto *track : timelineTracks(this)) {
+        if (!track || track->isLocked()) continue;
+        for (int i : track->selectedClips()) {
+            if (i < 0 || i >= track->clipCount()) continue;
+            const int group = track->clips()[i].linkGroup;
+            double start = 0.0, end = 0.0;
+            if (!trackClipTimeRangeAt(track, i, &start, &end)) continue;
+            selection.append({track, i, start, group});
+            if (group > 0 && groups.contains(group)) continue;
+            targets.append({track, i, start, group});
+            if (group > 0) groups.insert(group);
+        }
+    }
+    std::sort(targets.begin(), targets.end(), [frames](const Target &a, const Target &b) {
+        return frames > 0 ? a.start > b.start : a.start < b.start;
+    });
+    bool changed = false;
+    m_nudgeBatchActive = true;
+    for (const auto &target : targets) {
+        const bool audio = target.track->isAudioTrack();
+        const int trackIndex = audio ? m_audioTracks.indexOf(target.track) : m_videoTracks.indexOf(target.track);
+        int index = -1;
+        for (int i = 0; i < target.track->clipCount(); ++i) {
+            double start = 0.0, end = 0.0;
+            if (trackClipTimeRangeAt(target.track, i, &start, &end)
+                && qAbs(start - target.start) < 1e-6) { index = i; break; }
+        }
+        if (index < 0) continue;
+        const double requested = target.start + double(frames) / m_nudgeFrameRate;
+        MoveClipResult result;
+        QString error;
+        double boundedStart = qMax(0.0, requested);
+        if (target.group > 0) {
+            // Clamp the whole linked group at its earliest member, preserving offsets.
+            for (auto *track : timelineTracks(this)) {
+                if (!track) continue;
+                for (int i = 0; i < track->clipCount(); ++i) {
+                    if (track->clips()[i].linkGroup != target.group) continue;
+                    double start = 0.0, end = 0.0;
+                    if (trackClipTimeRangeAt(track, i, &start, &end))
+                        boundedStart = qMax(boundedStart, target.start - start);
+                }
+            }
+        }
+        const bool valid = moveClipByIndex(audio, trackIndex, index,
+            boundedStart, trackIndex, &result, &error);
+        changed = changed || result.moved;
+        if (result.moved) {
+            for (auto &selected : selection)
+                if ((target.group > 0 && selected.group == target.group)
+                    || (selected.track == target.track && selected.index == target.index))
+                    selected.start += result.actualStartSec - target.start;
+        }
+        if (!valid || !result.reason.isEmpty())
+            emit statusMessageRequested(QStringLiteral("指定位置へ移動できません。候補: %1 秒 %2")
+                .arg(result.actualStartSec, 0, 'f', 6).arg(error.isEmpty() ? result.reason : error), 3000);
+        else if (qAbs(result.actualStartSec - requested) > 1e-6)
+            emit statusMessageRequested(QStringLiteral("ナッジ位置を %1 秒に調整しました。")
+                .arg(result.actualStartSec, 0, 'f', 6), 3000);
+    }
+    m_nudgeBatchActive = false;
+    // Keep the complete multi-selection for repeated keyboard nudges.
+    for (auto *track : timelineTracks(this)) {
+        if (!track || track->isLocked()) continue;
+        const QSignalBlocker blocker(track);
+        track->clearClipSelection();
+        for (const auto &selected : selection) {
+            if (selected.track != track) continue;
+            for (int i = 0; i < track->clipCount(); ++i) {
+                double start = 0.0, end = 0.0;
+                if (trackClipTimeRangeAt(track, i, &start, &end)
+                    && qAbs(start - selected.start) < 1e-6) {
+                    track->toggleClipSelection(i);
+                    break;
+                }
+            }
+        }
+    }
+    if (changed) {
+        saveUndoState(QStringLiteral("ナッジ"));
+        ensureSequenceFitsViewport();
+        updateInfoLabel();
+        const auto *active = trackAt(false, m_activeVideoTrackIndex);
+        const int primary = active ? active->selectedClip() : -1;
+        emit clipSelected(primary);
+        emit clipSelectedOnTrack(m_activeVideoTrackIndex, primary);
+    }
 }
 
 bool Timeline::closeGapAt(TimelineTrack *track, double timeSec)
@@ -6931,6 +7119,23 @@ void Timeline::copySelectedClip()
     m_clipboard = m_videoTrack->clips()[sel];
 }
 
+ClipInfo Timeline::copyClipForPaste(const ClipInfo &source, QHash<int, int> &groups)
+{
+    ClipInfo result = source;
+    if (source.linkGroup <= 0) return result;
+    if (!groups.contains(source.linkGroup)) {
+        QSet<int> used;
+        for (auto *track : timelineTracks(this))
+            if (track) for (const auto &clip : track->clips()) used.insert(clip.linkGroup);
+        for (auto it = groups.cbegin(); it != groups.cend(); ++it) used.insert(it.value());
+        int fresh = allocateLinkGroup();
+        while (used.contains(fresh)) fresh = allocateLinkGroup();
+        groups.insert(source.linkGroup, fresh);
+    }
+    result.linkGroup = groups.value(source.linkGroup);
+    return result;
+}
+
 void Timeline::pasteClip()
 {
     if (!m_clipboard.has_value()) return;
@@ -6943,13 +7148,9 @@ void Timeline::pasteClip()
     // Give the pasted V/A pair a fresh linkGroup so it forms its own link
     // instead of aliasing the source clip's group (which would drag/select the
     // original together with the copy).
-    ClipInfo pastedVideo = m_clipboard.value();
-    ClipInfo pastedAudio = m_clipboard.value();
-    if (pastedVideo.linkGroup > 0) {
-        const int freshGroup = allocateLinkGroup();
-        pastedVideo.linkGroup = freshGroup;
-        pastedAudio.linkGroup = freshGroup;
-    }
+    QHash<int, int> groups;
+    const ClipInfo pastedVideo = copyClipForPaste(m_clipboard.value(), groups);
+    const ClipInfo pastedAudio = pastedVideo;
     m_videoTrack->insertClip(insertAt, pastedVideo);
     m_audioTrack->insertClip(insertAt, pastedAudio);
     m_videoTrack->setSelectedClip(insertAt);
