@@ -22,6 +22,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QSlider>
 #include <QString>
 #include <QTemporaryDir>
 #include <QTextStream>
@@ -327,8 +328,63 @@ int runClipLutSelftest()
             && !menuTimeline->undoManager()->canUndo()
             && equalRgbaBytes(before,
                 tlrender::renderFrameAt(menuTimeline, 200000, outSize));
+
+        // Clear persists once; resetting the slider must not add another undo.
+        menuOk = window.applyLutFileToSelectedClip(lutPath) && menuOk;
+        const quint64 beforeClear = menuTimeline->undoManager()->saveSerial();
+        window.clearLutIntensity();
+        menuOk = menuOk && menuTimeline->videoClips().first().lutFilePath.isEmpty()
+            && near(menuTimeline->videoClips().first().lutIntensity, 1.0)
+            && menuTimeline->undoManager()->saveSerial() == beforeClear + 1
+            && equalRgbaBytes(before,
+                tlrender::renderFrameAt(menuTimeline, 200000, outSize));
+        menuTimeline->undo();
+        menuOk = menuOk && menuTimeline->videoClips().first().lutFilePath == lutPath
+            && near(menuTimeline->videoClips().first().lutIntensity, 1.0)
+            && equalRgbaBytes(after,
+                tlrender::renderFrameAt(menuTimeline, 200000, outSize));
+
+        auto *slider = window.findChild<QSlider *>(QStringLiteral("menuLutIntensitySlider"));
+        menuOk = menuOk && slider;
+        if (slider) {
+            const quint64 beforeIntensity = menuTimeline->undoManager()->saveSerial();
+            slider->setValue(50);
+            const QImage half = tlrender::renderFrameAt(menuTimeline, 200000, outSize);
+            menuOk = menuOk && near(menuTimeline->videoClips().first().lutIntensity, 0.5)
+                && menuTimeline->videoClips().first().lutFilePath == lutPath
+                && menuTimeline->undoManager()->saveSerial() == beforeIntensity + 1
+                && !half.isNull() && !equalRgbaBytes(half, before)
+                && !equalRgbaBytes(half, after);
+            ProjectData intensityReloaded;
+            menuOk = ProjectFile::fromJsonString(ProjectFile::toJsonString(
+                projectWithTrack(menuTimeline->videoClips())), intensityReloaded)
+                && intensityReloaded.videoTracks.size() == 1
+                && intensityReloaded.videoTracks.first().size() == 1
+                && intensityReloaded.videoTracks.first().first().lutFilePath == lutPath
+                && near(intensityReloaded.videoTracks.first().first().lutIntensity, 0.5)
+                && menuOk;
+            menuTimeline->undo();
+            menuOk = menuOk && near(menuTimeline->videoClips().first().lutIntensity, 1.0);
+
+            // Applying at slider=25 resets to 100 without a duplicate undo entry.
+            slider->setValue(25);
+            const quint64 beforeReset = menuTimeline->undoManager()->saveSerial();
+            const bool reset = window.applyLutFileToSelectedClip(lutPath);
+            menuOk = menuOk && reset && slider->value() == 100
+                && near(menuTimeline->videoClips().first().lutIntensity, 1.0)
+                && menuTimeline->undoManager()->saveSerial() == beforeReset + 1;
+
+            // No selection keeps clip state intact for preview-only menu operations.
+            menuTimeline->clearSelection();
+            const quint64 beforeUnselected = menuTimeline->undoManager()->saveSerial();
+            slider->setValue(50);
+            window.clearLutIntensity();
+            menuOk = menuOk && menuTimeline->videoClips().first().lutFilePath == lutPath
+                && near(menuTimeline->videoClips().first().lutIntensity, 1.0)
+                && menuTimeline->undoManager()->saveSerial() == beforeUnselected;
+        }
     }
-    check(10, "MainWindow menu LUT: selection, one undo, save/load and render", menuOk);
+    check(10, "MainWindow menu LUT: apply/clear/intensity, selection, undo, save/load and render", menuOk);
 
     qInfo().noquote() << QStringLiteral("[clip-lut] summary: %1 PASS, %2 FAIL")
         .arg(passed).arg(failed);

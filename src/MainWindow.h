@@ -253,6 +253,7 @@ public:
 
     // Apply a file LUT to the selected video clip with one undo step.
     bool applyLutFileToSelectedClip(const QString &path);
+    void clearLutIntensity();
 
     struct PrecomposeResult {
         bool success = false;
@@ -393,7 +394,6 @@ private slots:
     void openDeflicker();
     void applyLut();
     void loadLutCubeFile();
-    void clearLutIntensity();
     void manageLuts();
     void toggleProxyMode();
     void generateProxies();

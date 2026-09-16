@@ -5510,11 +5510,22 @@ void MainWindow::setupMenuBar()
     connect(loadLutCubeAction, &QAction::triggered, this, &MainWindow::loadLutCubeFile);
 
     m_lutIntensitySlider = new QSlider(Qt::Horizontal, this);
+    m_lutIntensitySlider->setObjectName(QStringLiteral("menuLutIntensitySlider"));
     m_lutIntensitySlider->setRange(0, 100);
+    m_lutIntensitySlider->setTracking(false);
     m_lutIntensitySlider->setValue(100);
     m_lutIntensitySlider->setToolTip("LUT Intensity (0-100%)");
     connect(m_lutIntensitySlider, &QSlider::valueChanged, this, [this](int value) {
-        if (m_player)
+        int trackIdx = -1;
+        int clipIdx = -1;
+        ClipInfo clip;
+        if (selectedVideoClipRef(trackIdx, clipIdx, &clip)
+            && m_timeline->videoTracks().at(trackIdx)->selectedClip() == clipIdx
+            && !clip.lutFilePath.isEmpty()) {
+            if (!m_timeline->setClipLut(trackIdx, clipIdx, clip.lutFilePath, value / 100.0))
+                return;
+        }
+        if (m_player && m_player->glPreview())
             m_player->glPreview()->setLutIntensity(value / 100.0);
     });
     auto *lutSliderAction = new QWidgetAction(this);
@@ -12298,7 +12309,14 @@ void MainWindow::loadLutCubeFile()
 
 void MainWindow::clearLutIntensity()
 {
-    if (m_player)
+    int trackIdx = -1;
+    int clipIdx = -1;
+    if (selectedVideoClipRef(trackIdx, clipIdx)
+        && m_timeline->videoTracks().at(trackIdx)->selectedClip() == clipIdx) {
+        if (!m_timeline->setClipLut(trackIdx, clipIdx, QString(), 1.0))
+            return;
+    }
+    if (m_player && m_player->glPreview())
         m_player->glPreview()->clearLut();
     if (m_lutIntensitySlider)
         m_lutIntensitySlider->setValue(0);
