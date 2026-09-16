@@ -794,6 +794,8 @@ bool RenderQueue::saveQueue(const QString &filePath) const
         obj["endUs"] = static_cast<qint64>(job.endUs);
         obj["passes"] = job.passes;
         QJsonObject exportConfig = job.exportConfig;
+        if (!exportConfig.value("audioOnly").toBool(false))
+            exportConfig.remove("audioOnly");
         if (exportConfig.value("rateControl").toString("bitrate") == "bitrate")
             exportConfig.remove("rateControl");
         if (exportConfig.value("crf").toInt(-1) == -1)

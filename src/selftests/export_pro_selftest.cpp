@@ -134,7 +134,42 @@ int runExportProSelftest()
             av1Fallback &= !error.has_value() && encoder.activeEncoderName() == "libsvtav1";
         }
     }
-    gate(5, av1Fallback);
+    // US-415: defaults stay absent on disk, opt-in survives the real queue JSON path.
+    RenderQueue audioQueue;
+    RenderJob audioDefault;
+    audioDefault.uuid = "audio-default";
+    audioDefault.exportConfig = {{"audioOnly", ExportConfig{}.audioOnly}};
+    audioQueue.addJob(audioDefault);
+    ExportConfig audioConfig;
+    audioConfig.audioOnly = true;
+    RenderJob audioEnabled;
+    audioEnabled.uuid = "audio-enabled";
+    audioEnabled.exportConfig = {{"audioOnly", audioConfig.audioOnly}};
+    audioQueue.addJob(audioEnabled);
+    const QString audioPath = directory.filePath("audio-queue.json");
+    bool audioRoundtrip = audioQueue.saveQueue(audioPath);
+    QFile audioFile(audioPath);
+    audioRoundtrip &= audioFile.open(QIODevice::ReadOnly);
+    const auto audioJobs = QJsonDocument::fromJson(audioFile.readAll()).object().value("jobs").toArray();
+    audioFile.close();
+    audioRoundtrip &= audioJobs.size() == 2 && !ExportConfig{}.audioOnly;
+    if (audioJobs.size() == 2) {
+        audioRoundtrip &= !audioJobs.at(0).toObject().value("exportConfig").toObject().contains("audioOnly")
+            && audioJobs.at(1).toObject().value("exportConfig").toObject().value("audioOnly").toBool(false);
+    }
+    RenderQueue audioRestored;
+    audioRoundtrip &= audioRestored.loadQueue(audioPath);
+    const auto restoredAudioJobs = audioRestored.jobs();
+    audioRoundtrip &= restoredAudioJobs.size() == 2;
+    if (restoredAudioJobs.size() == 2) {
+        audioRoundtrip &= !restoredAudioJobs.at(0).exportConfig.value("audioOnly").toBool(false)
+            && restoredAudioJobs.at(1).exportConfig.value("audioOnly").toBool(false);
+    }
+    gate(5, av1Fallback && audioRoundtrip);
+    gate(6, ExportConfig::audioCodecForContainer("m4a") == "aac"
+        && ExportConfig::audioCodecForContainer("wav") == "pcm_s16le"
+        && ExportConfig::audioCodecForContainer("mp3") == "libmp3lame"
+        && ExportConfig::audioCodecForContainer("mp4").isEmpty());
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
     return failed;
 }

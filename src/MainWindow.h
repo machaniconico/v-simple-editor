@@ -724,6 +724,7 @@ private:
     // 不要 (パススルーで正しい) なら空文字列。失敗時は *error に日本語メッセージ。
     // GUI の exportVideo と MCP の export_video が同じ経路で使う。
     QString prepareExportAudioMix(QString *error);
+    bool exportAudioOnly(const ExportConfig &config, QString *error);
     void updateTitle();
     void populateProjectData(ProjectData &data);
     void applyLoadedProjectData(const ProjectData &data, const QString &filePath);

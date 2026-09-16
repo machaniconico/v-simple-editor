@@ -18,6 +18,7 @@ void exporter_setAcesPipeline(const aces::AcesPipeline &pipeline);
 double exporter_loudnessGainDb();
 #include "TrimOps.h"
 #include "ExportDialog.h"
+#include "CodecDetector.h"
 #include "FrameExport.h"
 #include "FrameClipboard.h"
 #include "UndoManager.h"
@@ -9664,6 +9665,52 @@ QString MainWindow::prepareExportAudioMix(QString *error)
     return prepareTimelineAudioMixForExport(m_timeline, error);
 }
 
+bool MainWindow::exportAudioOnly(const ExportConfig &config, QString *error)
+{
+    if (error) error->clear();
+    auto fail = [&](const QString &message) {
+        if (error) *error = message;
+        return false;
+    };
+    if (!m_timeline || m_timeline->totalDuration() <= 0.0)
+        return fail(tr("書き出す音声がありません。"));
+    const QString codec = ExportConfig::audioCodecForContainer(config.container);
+    if (codec.isEmpty() || !CodecDetector::isEncoderAvailable(codec))
+        return fail(tr("書き出し用の音声エンコーダを利用できません: %1").arg(codec));
+    if (config.audioBitrate <= 0 || config.outputPath.isEmpty())
+        return fail(tr("書き出し先と音声ビットレートを確認してください。"));
+
+    double start = 0.0;
+    double end = m_timeline->totalDuration();
+    if (config.exportMarkedRangeOnly && m_timeline->hasMarkedRange()) {
+        start = qBound(0.0, m_timeline->markedIn(), end);
+        end = qBound(start, m_timeline->markedOut(), end);
+    }
+    if (end <= start)
+        return fail(tr("書き出し範囲が空です。"));
+    QTemporaryDir temporary;
+    if (!temporary.isValid())
+        return fail(tr("書き出し用の一時フォルダを作成できません。"));
+    // Force a complete mix even for a single clip; render no video frames.
+    const QString mix = prepareTimelineAudioMixForExport(
+        m_timeline, error, temporary.filePath(QStringLiteral("mix.m4a")), end);
+    if (mix.isEmpty()) return false;
+    QStringList args{QStringLiteral("-y"), QStringLiteral("-i"), mix,
+        QStringLiteral("-ss"), ffmpegNumber(start),
+        QStringLiteral("-t"), ffmpegNumber(end - start),
+        QStringLiteral("-map"), QStringLiteral("0:a:0"), QStringLiteral("-vn"),
+        QStringLiteral("-c:a"), codec};
+    if (codec != QStringLiteral("pcm_s16le"))
+        args << QStringLiteral("-b:a") << QString::number(config.audioBitrate) + QStringLiteral("k");
+    const double gain = exporter_loudnessGainDb();
+    if (gain != 0.0)
+        args << QStringLiteral("-af") << QStringLiteral("volume=%1dB").arg(ffmpegNumber(gain));
+    args << QStringLiteral("-f")
+         << (config.container.toLower() == QStringLiteral("m4a") ? QStringLiteral("ipod") : config.container.toLower())
+         << config.outputPath;
+    return runFfmpegForAudioMix(args, error);
+}
+
 void MainWindow::exportVideo()
 {
     ExportDialog dialog(m_projectConfig, this);
@@ -9676,6 +9723,21 @@ void MainWindow::exportVideo()
     if (dialog.exec() != QDialog::Accepted) return;
 
     ExportConfig exportCfg = dialog.config();
+    if (exportCfg.audioOnly) {
+        QProgressDialog progress(tr("音声を書き出しています…"), QString(), 0, 0, this);
+        progress.setWindowTitle(tr("書き出し"));
+        progress.setWindowModality(Qt::ApplicationModal);
+        progress.setCancelButton(nullptr);
+        progress.setMinimumDuration(0);
+        progress.show();
+        progress.repaint();
+        QString error;
+        const bool ok = exportAudioOnly(exportCfg, &error);
+        progress.close();
+        if (!ok) QMessageBox::warning(this, tr("書き出し"), error);
+        else statusBar()->showMessage(tr("音声の書き出しが完了しました: %1").arg(exportCfg.outputPath), 10000);
+        return;
+    }
     const auto &clips = m_timeline->videoClips();
 
     if (clips.isEmpty()) {

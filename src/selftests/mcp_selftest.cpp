@@ -3717,6 +3717,49 @@ int runMcpSelftest()
         : fail("G55 export_video rejects missing parent directory",
                QStringLiteral("an output path below a missing directory was accepted"));
 
+    // US-415 G162: the synchronous branch must neither submit a job nor emit video.
+    {
+        bool g162 = exportRootReady && frameFixtureReady;
+        auto *queueBefore = projectInfoWindow.m_renderQueue;
+        const int jobsBefore = queueBefore ? queueBefore->jobs().size() : 0;
+        const QString audioPath = exportRoot.filePath(QStringLiteral("audio-only.m4a"));
+        if (g162) {
+            const auto response = callProjectInfoTool(1620, QStringLiteral("export_video"), QJsonObject{
+                {QStringLiteral("audioOnly"), true}, {QStringLiteral("outputPath"), audioPath},
+                {QStringLiteral("width"), 640}});
+            const auto payload = toolPayload(response);
+            g162 &= !toolResult(response).value(QStringLiteral("isError")).toBool(true)
+                && payload.value(QStringLiteral("ok")).toBool(false)
+                && payload.value(QStringLiteral("outputPath")).toString() == audioPath
+                && !payload.contains(QStringLiteral("jobId"))
+                && !payload.value(QStringLiteral("warnings")).toArray().isEmpty()
+                && requiredOutputFieldsPresent(QStringLiteral("export_video"), payload)
+                && QFileInfo(audioPath).size() > 0;
+            AVFormatContext *format = nullptr;
+            bool audio = false, video = false;
+            if (avformat_open_input(&format, audioPath.toUtf8().constData(), nullptr, nullptr) >= 0) {
+                if (avformat_find_stream_info(format, nullptr) >= 0) {
+                    for (unsigned int i = 0; i < format->nb_streams; ++i) {
+                        audio |= format->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO;
+                        video |= format->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO;
+                    }
+                }
+                avformat_close_input(&format);
+            }
+            const auto duration = libavcore::probeDurationMicroseconds(audioPath.toStdString());
+            g162 &= audio && !video && duration.has_value()
+                && std::abs(double(duration.value_or(0)) / 1000000.0 - projectTimeline->totalDuration()) <= 0.1;
+            const auto invalid = callProjectInfoTool(1621, QStringLiteral("export_video"), QJsonObject{
+                {QStringLiteral("audioOnly"), QStringLiteral("true")}, {QStringLiteral("outputPath"), audioPath}});
+            g162 &= toolResult(invalid).value(QStringLiteral("isError")).toBool(false);
+        }
+        g162 &= projectInfoWindow.m_renderQueue == queueBefore
+            && (!queueBefore || queueBefore->jobs().size() == jobsBefore);
+        g162 ? pass("G162 synchronous audio-only export and video-setting warning")
+             : fail("G162 synchronous audio-only export and video-setting warning",
+                    QStringLiteral("音声ストリーム、尺、同期応答、警告、またはキュー非起動の検証に失敗"));
+    }
+
     const QString exportOutputPath = exportRootReady
         ? QDir(exportRoot.path()).filePath(QStringLiteral("output.mp4"))
         : QString();

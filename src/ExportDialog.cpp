@@ -9,10 +9,20 @@
 #include <QDialogButtonBox>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QDir>
 #include <QMessageBox>
 #include <QStandardItemModel>
 #include <QClipboard>
 #include <QGuiApplication>
+
+QString ExportConfig::audioCodecForContainer(const QString &container)
+{
+    const QString value = container.toLower();
+    if (value == "m4a") return "aac";
+    if (value == "wav") return "pcm_s16le";
+    if (value == "mp3") return "libmp3lame";
+    return {};
+}
 
 QString ExportConfig::codecDisplayName() const
 {
@@ -71,6 +81,18 @@ void ExportDialog::setupUI()
     m_exportTypeCombo->addItem("動画ファイル (Video)", static_cast<int>(ExportType::Video));
     m_exportTypeCombo->addItem("Premiere Pro XML (FCP7)", static_cast<int>(ExportType::PremiereXml));
     typeLayout->addWidget(m_exportTypeCombo);
+    m_audioOnlyCheckbox = new QCheckBox(tr("音声のみ (映像なし)"), this);
+    typeLayout->addWidget(m_audioOnlyCheckbox);
+    m_audioContainerCombo = new QComboBox(this);
+    for (const QString &container : {QString("m4a"), QString("wav"), QString("mp3")}) {
+        m_audioContainerCombo->addItem(container, container);
+        if (!CodecDetector::isEncoderAvailable(ExportConfig::audioCodecForContainer(container))) {
+            auto *model = qobject_cast<QStandardItemModel*>(m_audioContainerCombo->model());
+            if (model) model->item(m_audioContainerCombo->count() - 1)->setEnabled(false);
+        }
+    }
+    m_audioContainerCombo->setVisible(false);
+    typeLayout->addWidget(m_audioContainerCombo);
     mainLayout->addWidget(typeGroup);
 
     // Preset
@@ -258,6 +280,18 @@ void ExportDialog::setupUI()
     mainLayout->addWidget(buttons);
 
     // Connections
+    connect(m_audioOnlyCheckbox, &QCheckBox::toggled, this, [this]() {
+        updateAudioOnlyControls();
+        const QFileInfo output(m_outputEdit->text());
+        if (!m_outputEdit->text().isEmpty())
+            m_outputEdit->setText(output.dir().filePath(output.completeBaseName() + "." + defaultExtension()));
+    });
+    connect(m_audioContainerCombo, &QComboBox::currentIndexChanged, this, [this]() {
+        const QFileInfo output(m_outputEdit->text());
+        if (!m_outputEdit->text().isEmpty())
+            m_outputEdit->setText(output.dir().filePath(output.completeBaseName() + "." + defaultExtension()));
+        updateSummary();
+    });
     connect(m_exportTypeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &ExportDialog::onExportTypeChanged);
     connect(m_presetCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &ExportDialog::onPresetChanged);
     connect(browseBtn, &QPushButton::clicked, this, &ExportDialog::onBrowseOutput);
@@ -390,6 +424,25 @@ void ExportDialog::setSourceIsHdr(bool hdr)
     }
 }
 
+void ExportDialog::updateAudioOnlyControls()
+{
+    const bool video = static_cast<ExportType>(m_exportTypeCombo->currentData().toInt()) == ExportType::Video;
+    const bool audio = video && m_audioOnlyCheckbox->isChecked();
+    m_audioOnlyCheckbox->setEnabled(video);
+    m_audioContainerCombo->setVisible(audio);
+    onPresetChanged(m_presetCombo->currentIndex());
+    m_presetCombo->setEnabled(video && !audio);
+    if (audio) m_hdrWarningLabel->hide();
+    if (!video || audio) {
+        m_videoCodecCombo->setEnabled(false);
+        m_audioCodecCombo->setEnabled(false);
+        m_hwEncoderCombo->setEnabled(false);
+    }
+    m_audioBitrateSpin->setEnabled(video && (audio || m_presetCombo->currentIndex() == presets().size() - 1));
+    updateRateControlControls();
+    updateSummary();
+}
+
 void ExportDialog::onExportTypeChanged(int index)
 {
     const auto type = static_cast<ExportType>(m_exportTypeCombo->itemData(index).toInt());
@@ -403,6 +456,7 @@ void ExportDialog::onExportTypeChanged(int index)
     if (m_audioBitrateSpin) m_audioBitrateSpin->setEnabled(isVideo);
     if (m_hwEncoderCombo) m_hwEncoderCombo->setEnabled(isVideo);
     updateMarkedRangeCheckboxEnabled();
+    updateAudioOnlyControls();
 }
 
 void ExportDialog::onBrowseOutput()
@@ -413,7 +467,8 @@ void ExportDialog::onBrowseOutput()
         filter = "Premiere XML (*.xml)";
     } else {
         QString ext = defaultExtension();
-        if (ext == "mp4") filter = "MP4 (*.mp4)";
+        if (m_audioOnlyCheckbox->isChecked()) filter = tr("音声ファイル (*.%1)").arg(ext);
+        else if (ext == "mp4") filter = "MP4 (*.mp4)";
         else if (ext == "mkv") filter = "MKV (*.mkv)";
         else if (ext == "webm") filter = "WebM (*.webm)";
         else filter = "All Files (*)";
@@ -462,6 +517,17 @@ void ExportDialog::onExport()
             return;
         }
 
+        accept();
+        return;
+    }
+
+    if (m_audioOnlyCheckbox->isChecked()) {
+        m_config.audioOnly = true;
+        m_config.container = m_audioContainerCombo->currentData().toString();
+        m_config.audioCodec = ExportConfig::audioCodecForContainer(m_config.container);
+        m_config.audioBitrate = m_audioBitrateSpin->value();
+        m_config.outputPath = m_outputEdit->text();
+        m_config.exportMarkedRangeOnly = m_markedRangeCheckbox->isChecked();
         accept();
         return;
     }
@@ -531,6 +597,7 @@ void ExportDialog::updateMarkedRangeCheckboxEnabled()
 
 QString ExportDialog::defaultExtension() const
 {
+    if (m_audioOnlyCheckbox->isChecked()) return m_audioContainerCombo->currentData().toString();
     QString vc = m_videoCodecCombo->currentData().toString();
     if (vc == "libvpx-vp9") return "webm";
     if (vc.startsWith("prores")) return "mov";
@@ -540,7 +607,8 @@ QString ExportDialog::defaultExtension() const
 
 void ExportDialog::updateRateControlControls()
 {
-    const bool video = static_cast<ExportType>(m_exportTypeCombo->currentData().toInt()) == ExportType::Video;
+    const bool video = static_cast<ExportType>(m_exportTypeCombo->currentData().toInt()) == ExportType::Video
+        && !m_audioOnlyCheckbox->isChecked();
     const bool supportsQuality = !m_videoCodecCombo->currentData().toString().startsWith("prores");
     if (!supportsQuality && m_rateControlCombo->currentIndex() != 0)
         m_rateControlCombo->setCurrentIndex(0);
@@ -552,6 +620,12 @@ void ExportDialog::updateRateControlControls()
 
 void ExportDialog::updateSummary()
 {
+    if (m_audioOnlyCheckbox->isChecked()) {
+        m_summaryLabel->setText(tr("音声のみ | %1 | %2 kbps | .%3")
+            .arg(ExportConfig::audioCodecForContainer(defaultExtension()))
+            .arg(m_audioBitrateSpin->value()).arg(defaultExtension()));
+        return;
+    }
     QString vc = m_videoCodecCombo->currentData().toString();
     QString codecName;
     if (vc == "libx264") codecName = "H.264";

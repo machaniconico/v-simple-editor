@@ -1891,7 +1891,7 @@ void McpEditorTools::registerWriteTools()
 
     const QJsonObject clipProperties = clipSelectorProperties();
 
-    const QJsonObject exportVideoOutputSchema = outputSchemaOf(QJsonObject{
+    QJsonObject exportVideoOutputSchema = outputSchemaOf(QJsonObject{
         {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
         {QStringLiteral("jobId"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
         {QStringLiteral("status"), QJsonObject{
@@ -1906,12 +1906,20 @@ void McpEditorTools::registerWriteTools()
         {QStringLiteral("videoCodec"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
         {QStringLiteral("videoBitrate"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
         {QStringLiteral("audioCodec"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
-        {QStringLiteral("audioBitrate"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}}
-    }, {QStringLiteral("ok"), QStringLiteral("jobId"),
-        QStringLiteral("status"), QStringLiteral("progress"),
-        QStringLiteral("outputPath"), QStringLiteral("width"),
-        QStringLiteral("height"), QStringLiteral("fps"),
-        QStringLiteral("videoCodec"), QStringLiteral("videoBitrate")});
+        {QStringLiteral("audioBitrate"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+        {QStringLiteral("warnings"), QJsonObject{{QStringLiteral("type"), QStringLiteral("array")},
+            {QStringLiteral("items"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}}}}
+    }, {QStringLiteral("ok")});
+
+    // Keep the queued-video contract explicit while admitting a disjoint synchronous result.
+    exportVideoOutputSchema.insert(QStringLiteral("oneOf"), QJsonArray{
+        QJsonObject{{QStringLiteral("required"), QJsonArray{
+            QStringLiteral("jobId"), QStringLiteral("status"), QStringLiteral("progress"),
+            QStringLiteral("outputPath"), QStringLiteral("width"), QStringLiteral("height"),
+            QStringLiteral("fps"), QStringLiteral("videoCodec"), QStringLiteral("videoBitrate")}}},
+        QJsonObject{{QStringLiteral("required"), QJsonArray{QStringLiteral("outputPath")}},
+            {QStringLiteral("not"), QJsonObject{{QStringLiteral("required"), QJsonArray{QStringLiteral("jobId")}}}}}
+    });
 
     const QJsonObject importMediaOutputSchema = outputSchemaOf(QJsonObject{
         {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
@@ -2289,10 +2297,14 @@ void McpEditorTools::registerWriteTools()
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("export_video"),
-        QStringLiteral("現在のタイムラインを動画ファイルへ非同期で書き出す。tools/call はジョブ投入後すぐに jobId を返し、完了は get_export_status で確認する。width / height / fps の省略時は現在のプロジェクト設定を使い、videoBitrate / audioBitrate は kbps (既定 10000 / 192)、videoCodec / audioCodec は ffmpeg のエンコーダ名 (既定 libx264 / aac)。音声はトリム・分割・並べ替え・音量・ミュートを反映したタイムラインのミックスを ffmpeg で作ってから多重化する (ffmpeg が PATH に無いと単純な 1 クリップ構成以外は failed になる)。"),
+        QStringLiteral("audioOnly=true は m4a / wav / mp3 の音声のみを同期で書き出し、ok と outputPath を返す (jobId なし)。映像設定は無視して warnings を返す。通常は現在のタイムラインを動画ファイルへ非同期で書き出す。tools/call はジョブ投入後すぐに jobId を返し、完了は get_export_status で確認する。width / height / fps の省略時は現在のプロジェクト設定を使い、videoBitrate / audioBitrate は kbps (既定 10000 / 192)、videoCodec / audioCodec は ffmpeg のエンコーダ名 (既定 libx264 / aac)。音声はトリム・分割・並べ替え・音量・ミュートを反映したタイムラインのミックスを ffmpeg で作ってから多重化する (ffmpeg が PATH に無いと単純な 1 クリップ構成以外は failed になる)。"),
         schemaWithRequired(QJsonObject{
             {QStringLiteral("outputPath"), QJsonObject{
                 {QStringLiteral("type"), QStringLiteral("string")}
+            }},
+            {QStringLiteral("audioOnly"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("boolean")},
+                {QStringLiteral("default"), false}
             }},
             {QStringLiteral("width"), QJsonObject{
                 {QStringLiteral("type"), QStringLiteral("integer")},
@@ -2338,6 +2350,7 @@ void McpEditorTools::registerWriteTools()
                      [this](const QJsonObject& args, QString* err) -> QJsonObject {
             if (!rejectUnknownArguments(args,
                                         {QStringLiteral("outputPath"),
+                                         QStringLiteral("audioOnly"),
                                          QStringLiteral("width"),
                                          QStringLiteral("height"),
                                          QStringLiteral("fps"),
@@ -2374,6 +2387,34 @@ void McpEditorTools::registerWriteTools()
             if (timeline()->totalDuration() <= 0.0)
                 return setError(err, QStringLiteral("タイムラインが空です。import_media で素材を追加してください")),
                        QJsonObject();
+
+            if (args.contains(QStringLiteral("audioOnly")) && !args.value(QStringLiteral("audioOnly")).isBool())
+                return setError(err, QStringLiteral("audioOnly は真偽値で指定してください")), QJsonObject();
+            if (args.value(QStringLiteral("audioOnly")).toBool(false)) {
+                ExportConfig config;
+                config.audioOnly = true;
+                config.outputPath = outputPath;
+                config.container = outputInfo.suffix().toLower();
+                config.audioCodec = ExportConfig::audioCodecForContainer(config.container);
+                if (config.audioCodec.isEmpty())
+                    return setError(err, QStringLiteral("音声の書き出し先には .m4a / .wav / .mp3 を指定してください")), QJsonObject();
+                if (!positiveInteger(args, QStringLiteral("audioBitrate"), 192, &config.audioBitrate, err))
+                    return {};
+                if (args.contains(QStringLiteral("audioCodec"))
+                    && (!args.value(QStringLiteral("audioCodec")).isString()
+                        || args.value(QStringLiteral("audioCodec")).toString() != config.audioCodec))
+                    return setError(err, QStringLiteral("音声コーデックはコンテナに対応する %1 を指定してください").arg(config.audioCodec)), QJsonObject();
+                QJsonArray warnings;
+                for (const QString &key : {QStringLiteral("width"), QStringLiteral("height"), QStringLiteral("fps"),
+                        QStringLiteral("videoCodec"), QStringLiteral("videoBitrate"), QStringLiteral("rateControl"), QStringLiteral("crf")}) {
+                    if (args.contains(key))
+                        warnings.append(QStringLiteral("音声のみの書き出しでは %1 は無視されます").arg(key));
+                }
+                if (!m_window->exportAudioOnly(config, err)) return {};
+                QJsonObject result{{QStringLiteral("ok"), true}, {QStringLiteral("outputPath"), outputPath}};
+                if (!warnings.isEmpty()) result.insert(QStringLiteral("warnings"), warnings);
+                return result;
+            }
 
             const int defaultWidth = qMax(2, m_window->m_projectConfig.width);
             const int defaultHeight = qMax(2, m_window->m_projectConfig.height);

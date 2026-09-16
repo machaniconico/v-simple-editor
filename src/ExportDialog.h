@@ -58,6 +58,8 @@ struct ExportConfig {
     int proresProfile = -1;  // -1 = not ProRes; 0..5 = Proxy/LT/SQ/HQ/4444/4444XQ
     HDRSettings hdrSettings; // extended HDR metadata
     bool exportMarkedRangeOnly = false;
+    bool audioOnly = false;
+    static QString audioCodecForContainer(const QString &container);
 
     QString codecDisplayName() const;
 };
@@ -93,6 +95,7 @@ private slots:
 private:
     void setupUI();
     void updateSummary();
+    void updateAudioOnlyControls();
     void updateRateControlControls();
     void updateMarkedRangeCheckboxEnabled();
     void regenerateChapters();
@@ -102,6 +105,8 @@ private:
     ProjectConfig m_projectConfig;
     QVector<ClipInfo> m_clips;
 
+    QCheckBox *m_audioOnlyCheckbox = nullptr;
+    QComboBox *m_audioContainerCombo = nullptr;
     QComboBox *m_exportTypeCombo = nullptr;
     QComboBox *m_presetCombo;
     QComboBox *m_videoCodecCombo;
