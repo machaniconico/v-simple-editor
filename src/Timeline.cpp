@@ -1039,6 +1039,37 @@ QString buildExportAudioMixEntryFilterChain(int inputIndex,
         .arg(filters.join(QLatin1Char(',')));
 }
 
+QString buildPerTrackExportFilterChain(int trackIndex,
+    const QVector<PlaybackEntry> &entries, const QStringList &volumeExpressions,
+    const QVector<bool> &reversedFlags, bool resetDelayTimestamps)
+{
+    QStringList chains, inputs;
+    for (int i = 0; i < entries.size(); ++i) {
+        const PlaybackEntry &entry = entries[i];
+        if (entry.sourceTrack != trackIndex || entry.audioMuted)
+            continue;
+        chains << buildExportAudioMixEntryFilterChain(i,
+            QString::number(entry.clipIn, 'f', 6),
+            QString::number(entry.clipOut, 'f', 6),
+            qMax(0, qRound(entry.timelineStart * 1000.0)),
+            volumeExpressions.value(i, QString::number(qBound(0.0, entry.volume, 2.0), 'f', 6)),
+            audioChannelModeForPlaybackEntry(entry), reversedFlags.value(i, false),
+            entry.speed, entry.leadInType, entry.leadInDuration,
+            entry.trailOutType, entry.trailOutDuration);
+        if (resetDelayTimestamps) {
+            chains << QStringLiteral("[a%1]asetpts=N/SR/TB[rip%1]").arg(i);
+            inputs << QStringLiteral("[rip%1]").arg(i);
+        } else {
+            inputs << QStringLiteral("[a%1]").arg(i);
+        }
+    }
+    if (inputs.isEmpty())
+        return {};
+    chains << QStringLiteral("%1amix=inputs=%2:normalize=0:duration=longest[track%3]")
+        .arg(inputs.join(QString())).arg(inputs.size()).arg(trackIndex);
+    return chains.join(QLatin1Char(';'));
+}
+
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavcodec/packet.h>

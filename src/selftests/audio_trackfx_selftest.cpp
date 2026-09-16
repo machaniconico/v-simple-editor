@@ -1,6 +1,10 @@
 #include "../AudioTrackFx.h"
 #include "../AudioMixer.h"
 #include "../SpectralEngine.h"
+#include "../Timeline.h"
+#include "../libavcore/AudioExtract.h"
+#include <QFile>
+#include <QTemporaryDir>
 
 #include <algorithm>
 #include <cmath>
@@ -192,6 +196,92 @@ int runAudioTrackFxSelftest()
     auto second = input;
     processBlocks(processor, second);
     gate(6, identical(first, second));
+
+    PlaybackEntry entry;
+    entry.sourceTrack = 0;
+    entry.clipIn = 1.0;
+    entry.clipOut = 3.0;
+    entry.timelineStart = 0.5;
+    entry.timelineEnd = 2.5;
+    entry.volume = 0.5;
+    entry.leadInType = TransitionType::FadeIn;
+    entry.leadInDuration = 0.25;
+    auto otherTrack = entry;
+    otherTrack.sourceTrack = 1;
+    setAudioChannelModePlaybackBindings({{1000, 0, -1, AudioChannelMode::Swap}});
+    const QString perTrack = buildPerTrackExportFilterChain(0, {entry, otherTrack},
+        {QStringLiteral("0.500000"), QStringLiteral("1")}, {false, false});
+    const QString entryChain = buildExportAudioMixEntryFilterChain(0,
+        QStringLiteral("1.000000"), QStringLiteral("3.000000"), 500,
+        QStringLiteral("0.500000"), AudioChannelMode::Swap, false, 1.0,
+        TransitionType::FadeIn, 0.25);
+    gate(7, perTrack.startsWith(entryChain + QLatin1Char(';'))
+        && perTrack.contains(QStringLiteral("atrim="))
+        && perTrack.contains(QStringLiteral("adelay=500"))
+        && perTrack.contains(QStringLiteral("volume='0.500000'"))
+        && perTrack.contains(QStringLiteral("afade="))
+        && perTrack.contains(exportAudioChannelPanFilterForMode(AudioChannelMode::Swap))
+        && perTrack.count(QStringLiteral("amix=")) == 1 // intra-track only
+        && perTrack.endsWith(QStringLiteral("[track0]"))
+        && !perTrack.contains(QStringLiteral("[aout]"))
+        && !perTrack.contains(QStringLiteral("[1:a]"))
+        && buildPerTrackExportFilterChain(2, {entry}, {}, {}).isEmpty());
+    setAudioChannelModePlaybackBindings({});
+
+    QTemporaryDir directory;
+    const QString wav = directory.filePath(QStringLiteral("float.wav"));
+    auto precise = input;
+    precise[0] = 0.1234567f;
+    precise[1] = -0.0f;
+    precise[2] = 1.25f; // no clipping at WAV boundaries
+    std::vector<float> roundtrip;
+    int rate = 0, channels = 0;
+    QString error;
+    const bool wrote = directory.isValid()
+        && libavcore::writeWavFloatInterleaved(wav, precise, kRate, 2, &error);
+    const bool read = wrote
+        && libavcore::readWavFloatInterleaved(wav, &roundtrip, &rate, &channels, &error);
+    bool wavOk = read && rate == kRate && channels == 2 && identical(precise, roundtrip);
+    // The export decoder must also accept FFmpeg's extensible float header.
+    QFile original(wav);
+    QByteArray extensible;
+    if (original.open(QIODevice::ReadOnly)) extensible = original.readAll();
+    original.close();
+    if (extensible.size() >= 56) {
+        const QByteArray extension = QByteArray::fromHex("16002000030000000300000000001000800000aa00389b71");
+        extensible.insert(36, extension);
+        extensible[16] = 40;
+        extensible[20] = char(0xfe); extensible[21] = char(0xff);
+        const quint32 riffSize = static_cast<quint32>(extensible.size() - 8);
+        for (int i = 0; i < 4; ++i) extensible[4 + i] = char(riffSize >> (8 * i));
+        QFile alternate(directory.filePath(QStringLiteral("extensible.wav")));
+        const bool saved = alternate.open(QIODevice::WriteOnly)
+            && alternate.write(extensible) == extensible.size();
+        alternate.close();
+        wavOk = wavOk && saved && libavcore::readWavFloatInterleaved(alternate.fileName(),
+            &roundtrip, &rate, &channels, &error) && identical(precise, roundtrip);
+    } else {
+        wavOk = false;
+    }
+    gate(8, wavOk);
+
+    std::vector<float> fromWav, processedWav;
+    bool dspOk = libavcore::writeWavFloatInterleaved(wav, input, kRate, 2, &error)
+        && libavcore::readWavFloatInterleaved(wav, &fromWav, &rate, &channels, &error);
+    double wavDb = 0.0;
+    if (dspOk) {
+        trackfx::Processor exportProcessor(eq, rate, channels);
+        exportProcessor.reset();
+        processBlocks(exportProcessor, fromWav);
+        dspOk = libavcore::writeWavFloatInterleaved(wav, fromWav, rate, channels, &error)
+            && libavcore::readWavFloatInterleaved(wav, &processedWav, &rate, &channels, &error);
+        if (dspOk) {
+            wavDb = 20 * std::log10(spectralAmplitude(processedWav, 100) / spectralAmplitude(input, 100));
+            dspOk = std::abs(wavDb + 12) <= 1.5 && identical(fromWav, processedWav);
+        }
+    }
+    std::fprintf(stderr, "WAV EQ: 100Hz %.3f dB %s\n", wavDb, error.toUtf8().constData());
+    gate(9, dspOk);
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", pass, fail);
     return fail;
 }

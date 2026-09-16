@@ -14,6 +14,7 @@
 #include <QElapsedTimer>
 #include <QColor>
 #include <QString>
+#include <QStringList>
 #include <QJsonObject>
 #include <cstdint>
 #include <functional>
@@ -178,6 +179,13 @@ QString buildExportAudioMixEntryFilterChain(int inputIndex,
                                             double leadInDuration = 0.0,
                                             TransitionType trailOutType = TransitionType::None,
                                             double trailOutDuration = 0.0);
+
+// trackIndex is the zero-based PlaybackEntry::sourceTrack. Input indices and
+// volume expressions refer to the complete entries array. Output: [trackN].
+// Only the intra-track amix is emitted; the caller owns the final master mix.
+QString buildPerTrackExportFilterChain(int trackIndex,
+    const QVector<PlaybackEntry> &entries, const QStringList &volumeExpressions,
+    const QVector<bool> &reversedFlags, bool resetDelayTimestamps = false);
 
 struct ClipInfo {
     QString filePath;
