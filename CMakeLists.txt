@@ -179,6 +179,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/MainWindow.cpp
     src/VideoPlayer.cpp
     src/Timeline.cpp
+    src/Timecode.cpp
+    src/Timecode.h
     src/SnapEngine.cpp
     src/ProjectSettings.cpp
     src/SequenceSettingsDialog.h

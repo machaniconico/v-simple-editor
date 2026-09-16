@@ -871,6 +871,9 @@ private:
 
     QAction *m_trackMotionAction = nullptr; // US-FEAT-D: motion tracking UI
     class QSlider *m_lutIntensitySlider = nullptr; // LUT intensity slider (0..100)
+    QAction *m_zoomToFitSequenceAction = nullptr;
+    QAction *m_zoomToSelectionAction = nullptr;
+    QAction *m_jumpTimecodeAction = nullptr;
     QAction *m_selectAllClipsAction = nullptr;
     QAction *m_selectForwardAction = nullptr;
     QAction *m_selectBackwardAction = nullptr;

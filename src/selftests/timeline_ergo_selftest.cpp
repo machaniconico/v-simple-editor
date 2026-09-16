@@ -1,5 +1,8 @@
 #include "../Timeline.h"
 #include "../UndoManager.h"
+#include "../Timecode.h"
+#include <QApplication>
+#include <QScrollBar>
 
 #include <QSignalBlocker>
 
@@ -309,6 +312,73 @@ int runTimelineErgoSelftest()
         timeline.undo();
         ok = ok && !timeline.canUndo() && sameTracks(before.videoTracks, timeline.currentState().videoTracks);
         gate(6, ok);
+    }
+    {
+        Timeline timeline;
+        const QVector<ClipInfo> video{clip(0.5), clip(2.5, 0.25, 17), clip(1.0, 2.0)};
+        const QVector<ClipInfo> audio{clip(0.5), clip(1.0, 1.5), clip(1.0, 3.0, 17)};
+        timeline.restoreFromProject(QVector<QVector<ClipInfo>>{video, video, video},
+                                    QVector<QVector<ClipInfo>>{audio}, 0.0, -1.0, -1.0, 100);
+        timeline.videoTracks()[1]->setLocked(true);
+        timeline.videoTracks()[2]->setHidden(true);
+        baseline(timeline);
+        const auto serial = timeline.undoManager()->saveSerial();
+        timeline.selectClipsInRange(1.0, 3.0, 0, 3, false);
+        bool ok = timeline.videoTracks()[0]->selectedClips() == QList<int>({1})
+            && timeline.videoTracks()[1]->selectedClips().isEmpty()
+            && timeline.videoTracks()[2]->selectedClips().isEmpty()
+            && timeline.audioTracks()[0]->selectedClips() == QList<int>({1, 2});
+        timeline.selectClipsInRange(5.0, 6.0, 0, 0, true);
+        ok = ok && timeline.videoTracks()[0]->selectedClips() == QList<int>({1, 2})
+            && timeline.audioTracks()[0]->selectedClips() == QList<int>({1, 2});
+        timeline.selectClipsInRange(0.0, 0.5, 0, 0, false);
+        ok = ok && timeline.videoTracks()[0]->selectedClips() == QList<int>({0})
+            && timeline.audioTracks()[0]->selectedClips().isEmpty();
+        gate(7, ok && timeline.undoManager()->saveSerial() == serial && !timeline.canUndo());
+    }
+    {
+        Timeline timeline;
+        timeline.restoreFromProject(QVector<QVector<ClipInfo>>{{clip(10.0), clip(20.0, 40.0), clip(50.0)}},
+                                    QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 100);
+        timeline.resize(1200, 400);
+        timeline.show();
+        QApplication::processEvents();
+        auto *scroll = timeline.findChild<QScrollArea *>();
+        auto *track = timeline.videoTracks()[0];
+        timeline.setZoomLevel(1.0);
+        timeline.zoomToFitSequence();
+        bool ok = scroll && track->pixelsPerSecond() > 1.0
+            && timeline.totalDuration() * track->pixelsPerSecond() <= scroll->viewport()->width()
+            && scroll->horizontalScrollBar()->value() == 0;
+        track->setSelectedClip(1);
+        ok = timeline.zoomToSelection() && ok;
+        QApplication::processEvents();
+        if (scroll) {
+            const int left = scroll->horizontalScrollBar()->value();
+            ok = ok && 50.0 * track->pixelsPerSecond() >= left
+                && 70.0 * track->pixelsPerSecond() <= left + scroll->viewport()->width()
+                && left > 0;
+        }
+        timeline.clearSelection();
+        gate(8, ok && !timeline.zoomToSelection());
+    }
+    {
+        double result = 0.0;
+        const auto parses = [&](const QString &text, double fps, double current, double expected) {
+            return parseTimecodeInput(text, fps, current, &result) && near(result, expected);
+        };
+        bool ok = parses(QStringLiteral("00:01:30:15"), 30.0, 0.0, 90.5)
+            && parses(QStringLiteral("1:30"), 30.0, 0.0, 90.0)
+            && parses(QStringLiteral("12.5"), 30.0, 0.0, 12.5)
+            && parses(QStringLiteral("+1:00"), 30.0, 12.0, 72.0)
+            && parses(QStringLiteral("-10"), 30.0, 12.0, 2.0)
+            && parses(QStringLiteral("00:01:30:15"), 29.97, 0.0, 90.0 + 15.0 / 29.97)
+            && parses(QStringLiteral("01:30:15"), 30.0, 0.0, 90.5)
+            && !parseTimecodeInput(QStringLiteral("abc"), 30.0, 0.0, &result);
+        for (const QString &invalid : {QString(), QStringLiteral("1:60"), QStringLiteral("0:00:30"),
+                                      QStringLiteral("1::2"), QStringLiteral("nan"), QStringLiteral("--10")})
+            ok = ok && !parseTimecodeInput(invalid, 30.0, 0.0, &result);
+        gate(9, ok && !parseTimecodeInput(QStringLiteral("1"), 0.0, 0.0, &result));
     }
     std::fprintf(stderr, "[timeline-ergo] summary: %d PASS, %d FAIL\n", passed, failed);
     return failed;

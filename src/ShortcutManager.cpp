@@ -91,7 +91,10 @@ QList<QPair<QString, QKeySequence>> ShortcutManager::presetBindingTable(Preset p
     }
 
     // Common timeline operations are available in every preset.
-    table << P{"timeline.select_forward", QKeySequence()}
+    table << P{"timeline.jump_timecode", QKeySequence("Ctrl+Shift+G")}
+          << P{"timeline.zoom_fit_sequence", QKeySequence()}
+          << P{"timeline.zoom_selection", QKeySequence()}
+          << P{"timeline.select_forward", QKeySequence()}
           << P{"timeline.select_backward", QKeySequence()}
           << P{"timeline.blade_all", QKeySequence("Ctrl+Shift+K")}
           << P{"timeline.lift", QKeySequence()}

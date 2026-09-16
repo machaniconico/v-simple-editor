@@ -581,6 +581,7 @@ signals:
     void clipClicked(int index);
     void selectionChanged(int primaryIndex, bool additive);
     void emptyAreaClicked();
+    void marqueeDragged(QPoint startGlobal, QPoint endGlobal, bool additive, bool finished);
     void clipMoved(int fromIndex, int toIndex);
     void modified();
     // Fired only at the end of a discrete user interaction (drag, trim,
@@ -638,6 +639,11 @@ private:
     bool m_snapEnabled = true;
     int m_dropTargetIndex = -1;
 
+    bool m_marqueeCandidate = false;
+    bool m_marqueeActive = false;
+    bool m_marqueeAdditive = false;
+    bool m_marqueeClearOnClick = true;
+    QPoint m_marqueeStartGlobal;
     double m_pixelsPerSecond = 10.0;
     bool m_muted = false;
     bool m_locked = false;
@@ -878,6 +884,10 @@ public:
     // Zoom
     void zoomIn();
     void zoomOut();
+    void zoomToFitSequence();
+    bool zoomToSelection();
+    // Rows are zero-based: V1..Vn followed by A1..An (including excluded rows).
+    void selectClipsInRange(double startSec, double endSec, int firstRow, int lastRow, bool additive);
     void setZoomLevel(double pixelsPerSecond);
 
     // I/O markers

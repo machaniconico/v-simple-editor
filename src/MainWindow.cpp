@@ -258,6 +258,7 @@ double exporter_loudnessGainDb();
 #include <QProgressDialog>
 #include <QShortcut>
 #include <QInputDialog>
+#include "Timecode.h"
 #include <QCloseEvent>
 #include <QFile>
 #include <QFileDialog>      // DV-4: DV XML 保存ダイアログ
@@ -3346,6 +3347,13 @@ void MainWindow::registerCoreShortcuts()
     reg(m_pasteAttributesAction, "edit.paste_attributes",
         QStringLiteral("属性を貼り付け"),      QStringLiteral("編集"));
 
+    reg(m_jumpTimecodeAction, "timeline.jump_timecode",
+        QStringLiteral("タイムコードへジャンプ…"), QStringLiteral("編集"));
+    reg(m_zoomToFitSequenceAction, "timeline.zoom_fit_sequence",
+        QStringLiteral("シーケンス全体を表示"), QStringLiteral("表示"));
+    reg(m_zoomToSelectionAction, "timeline.zoom_selection",
+        QStringLiteral("選択範囲にズーム"), QStringLiteral("表示"));
+
     // タイムライン / 表示
     reg(m_snapAction,         "timeline.snap_toggle",
         QStringLiteral("スナップ切替"),       QStringLiteral("タイムライン"));
@@ -4445,6 +4453,21 @@ void MainWindow::setupMenuBar()
 
     // 編集 メニュー
     auto *editMenu = menuBar()->addMenu("編集(&E)");
+    m_jumpTimecodeAction = editMenu->addAction(QStringLiteral("タイムコードへジャンプ…"));
+    m_jumpTimecodeAction->setShortcut(QKeySequence("Ctrl+Shift+G"));
+    connect(m_jumpTimecodeAction, &QAction::triggered, this, [this]() {
+        bool accepted = false;
+        const QString text = QInputDialog::getText(this, QStringLiteral("タイムコードへジャンプ"),
+            QStringLiteral("時:分:秒:フレーム / 分:秒 / 秒（先頭の +・- で相対指定）"),
+            QLineEdit::Normal, QString(), &accepted);
+        if (!accepted) return;
+        double seconds = 0.0;
+        if (!parseTimecodeInput(text, m_projectConfig.fps, m_timeline->playheadPosition(), &seconds)) {
+            statusBar()->showMessage(QStringLiteral("タイムコードを解釈できません: %1").arg(text), 5000);
+            return;
+        }
+        m_timeline->setPlayheadPosition(qBound(0.0, seconds, m_timeline->totalDuration()));
+    });
 
     m_copyCurrentFrameAction =
         editMenu->addAction(QStringLiteral("現在のフレームをクリップボードへコピー"));
@@ -4776,6 +4799,20 @@ void MainWindow::setupMenuBar()
 
     // 表示 メニュー
     auto *viewMenu = menuBar()->addMenu("表示(&V)");
+    m_zoomToFitSequenceAction = viewMenu->addAction(QStringLiteral("シーケンス全体を表示"));
+    connect(m_zoomToFitSequenceAction, &QAction::triggered, this, [this]() {
+        m_timeline->zoomToFitSequence();
+    });
+    m_zoomToSelectionAction = viewMenu->addAction(QStringLiteral("選択範囲にズーム"));
+    m_zoomToSelectionAction->setEnabled(m_timeline->hasAnySelection());
+    connect(m_zoomToSelectionAction, &QAction::triggered, this, [this]() {
+        m_timeline->zoomToSelection();
+    });
+    const auto updateZoomSelection = [this]() {
+        m_zoomToSelectionAction->setEnabled(m_timeline->hasAnySelection());
+    };
+    connect(viewMenu, &QMenu::aboutToShow, this, updateZoomSelection);
+    connect(m_timeline, &Timeline::clipSelected, this, updateZoomSelection);
 
     auto *zoomInAction = viewMenu->addAction("拡大(&I)");
     zoomInAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_Equal));

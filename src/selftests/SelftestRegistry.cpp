@@ -782,7 +782,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "track-manage", "VEDITOR_TRACK_MANAGE_SELFTEST", runTrackManageSelftest, true,
       "Track names/colors: project roundtrip, single-step undo and invalid targets (3 gates)" },
     { "timeline-ergo", "VEDITOR_TIMELINE_ERGO_SELFTEST", runTimelineErgoSelftest, true,
-      "Timeline selection, blade, common gaps, duplicate, frame nudge and one-step undo (6 gates)" },
+      "Timeline selection, blade, gaps, duplicate, nudge, marquee, zoom and timecode (9 gates)" },
     { "ripple-delete", "VEDITOR_RIPPLE_DELETE_SELFTEST", runRippleDeleteSelftest, true,
       "Ripple delete and gap close: all-track time-range ripple, one-step undo, and no-selection no-op" },
     { "e2e",               "VEDITOR_E2E_SELFTEST",                runE2eSelftest,                true,

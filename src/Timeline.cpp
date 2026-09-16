@@ -38,6 +38,7 @@
 #include <utility>
 #include <QFileInfo>
 #include <QSignalBlocker>
+#include <QRubberBand>
 #include <QSet>
 #include <QDir>
 #include <QFont>
@@ -2618,6 +2619,15 @@ void TimelineTrack::mousePressEvent(QMouseEvent *event)
         event->accept(); return;
     }
     const int clipIndex = clipAtX(event->pos().x());
+    if (event->button() == Qt::LeftButton && clipIndex < 0) {
+        m_marqueeCandidate = true;
+        m_marqueeActive = false;
+        m_marqueeAdditive = event->modifiers().testFlag(Qt::ShiftModifier);
+        m_marqueeClearOnClick = !(event->modifiers() & (Qt::ShiftModifier | Qt::ControlModifier));
+        m_marqueeStartGlobal = event->globalPosition().toPoint();
+        event->accept();
+        return;
+    }
     if (tryHitEnvelopeKeyframe(event, clipIndex)) return;
     const bool additive = event->modifiers() & (Qt::ShiftModifier | Qt::ControlModifier);
     if (event->button() == Qt::RightButton) {
@@ -2856,6 +2866,15 @@ void TimelineTrack::handleBodyClick(QMouseEvent *ev, int clipIndex)
 
 void TimelineTrack::mouseMoveEvent(QMouseEvent *event)
 {
+    if (m_marqueeCandidate) {
+        const QPoint end = event->globalPosition().toPoint();
+        if ((end - m_marqueeStartGlobal).manhattanLength() >= 4)
+            m_marqueeActive = true;
+        if (m_marqueeActive)
+            emit marqueeDragged(m_marqueeStartGlobal, end, m_marqueeAdditive, false);
+        event->accept();
+        return;
+    }
     if (m_resizingHeight) {
         const int globalY = event->globalPosition().toPoint().y();
         const int delta = globalY - m_resizeStartY;
@@ -3135,6 +3154,20 @@ void TimelineTrack::mouseMoveEvent(QMouseEvent *event)
 
 void TimelineTrack::mouseReleaseEvent(QMouseEvent *event)
 {
+    if (m_marqueeCandidate && event && event->button() == Qt::LeftButton) {
+        m_marqueeCandidate = false;
+        if (m_marqueeActive) {
+            m_marqueeActive = false;
+            emit marqueeDragged(m_marqueeStartGlobal, event->globalPosition().toPoint(),
+                                m_marqueeAdditive, true);
+        } else if (m_marqueeClearOnClick) {
+            setSelectedClip(-1);
+            emit emptyAreaClicked();
+            emit seekRequested(qMax(0.0, xToSeconds(mapFromGlobal(m_marqueeStartGlobal).x())));
+        }
+        event->accept();
+        return;
+    }
     if (m_resizingHeight) {
         m_resizingHeight = false;
         releaseMouse();
@@ -4993,6 +5026,51 @@ QVector<TimelineTrack *> timelineTracks(const Timeline *timeline)
 }
 
 } // namespace
+
+void Timeline::selectClipsInRange(double startSec, double endSec, int firstRow,
+                                  int lastRow, bool additive)
+{
+    if (!std::isfinite(startSec) || !std::isfinite(endSec)) return;
+    if (startSec > endSec) std::swap(startSec, endSec);
+    if (firstRow > lastRow) std::swap(firstRow, lastRow);
+    const auto tracks = timelineTracks(this);
+    QSet<int> groups;
+    QVector<QSet<int>> selected(tracks.size());
+    for (int row = 0; row < tracks.size(); ++row) {
+        auto *track = tracks[row];
+        if (track->isLocked() || track->isHidden()) continue;
+        for (int i = 0; i < track->clipCount(); ++i) {
+            double start = 0.0, end = 0.0;
+            const bool hit = row >= firstRow && row <= lastRow
+                && trackClipTimeRangeAt(track, i, &start, &end)
+                && start < endSec && end > startSec;
+            if (hit || (additive && track->isClipSelected(i))) {
+                selected[row].insert(i);
+                if (track->clips()[i].linkGroup > 0)
+                    groups.insert(track->clips()[i].linkGroup);
+            }
+        }
+    }
+    int primary = -1;
+    m_activeVideoTrackIndex = -1;
+    for (int row = 0; row < tracks.size(); ++row) {
+        auto *track = tracks[row];
+        const QSignalBlocker blocker(track);
+        track->clearClipSelection();
+        if (track->isLocked() || track->isHidden()) continue;
+        for (int i = 0; i < track->clipCount(); ++i) {
+            if (!selected[row].contains(i) && !groups.contains(track->clips()[i].linkGroup)) continue;
+            track->toggleClipSelection(i);
+            const int videoIndex = m_videoTracks.indexOf(track);
+            if (primary < 0 || videoIndex >= 0) {
+                primary = i;
+                m_activeVideoTrackIndex = videoIndex;
+            }
+        }
+    }
+    emit clipSelected(primary);
+    emit clipSelectedOnTrack(m_activeVideoTrackIndex, primary);
+}
 
 bool Timeline::splitClipByIndex(bool audio, int trackIndex, int clipIndex,
                                 double timelineSeconds, QString *err)
@@ -8574,6 +8652,42 @@ int Timeline::snapLineAlpha() const
 void Timeline::zoomIn() { setZoomLevel(m_zoomLevel * 1.25); }
 void Timeline::zoomOut() { setZoomLevel(m_zoomLevel / 1.25); }
 
+void Timeline::zoomToFitSequence()
+{
+    if (!m_scrollArea || totalDuration() <= 0.0) return;
+    clearZoomAnchor();
+    setZoomLevel(qMax(1, m_scrollArea->viewport()->width() - 60) / totalDuration());
+    m_scrollArea->horizontalScrollBar()->setValue(0);
+}
+
+bool Timeline::zoomToSelection()
+{
+    double first = std::numeric_limits<double>::max(), last = 0.0;
+    for (auto *track : timelineTracks(this)) {
+        for (int i : track->selectedClips()) {
+            double start = 0.0, end = 0.0;
+            if (trackClipTimeRangeAt(track, i, &start, &end)) {
+                first = qMin(first, start);
+                last = qMax(last, end);
+            }
+        }
+    }
+    if (last <= first || !m_scrollArea) return false;
+    const double margin = (last - first) * 0.05;
+    const double left = qMax(0.0, first - margin);
+    clearZoomAnchor();
+    setZoomLevel(qMax(1, m_scrollArea->viewport()->width() - 2) / (last + margin - left));
+    if (m_tracksWidget && m_tracksWidget->layout()) m_tracksWidget->layout()->activate();
+    if (auto *content = m_scrollArea->widget()) {
+        if (content->layout()) content->layout()->activate();
+        content->adjustSize();
+    }
+    QEvent layoutEvent(QEvent::LayoutRequest);
+    QCoreApplication::sendEvent(m_scrollArea, &layoutEvent);
+    m_scrollArea->horizontalScrollBar()->setValue(static_cast<int>(left * m_zoomLevel));
+    return true;
+}
+
 void Timeline::captureZoomAnchor()
 {
     // Record the playhead's current viewport column (or the viewport center
@@ -9932,6 +10046,37 @@ void Timeline::wireTrackSelection(TimelineTrack *track)
 {
     if (track)
         track->installEventFilter(this);
+
+    // The viewport owns the overlay; global points keep the drag continuous across rows.
+    auto *marquee = new QRubberBand(QRubberBand::Rectangle, m_scrollArea->viewport());
+    marquee->setAttribute(Qt::WA_TransparentForMouseEvents);
+    connect(track, &QObject::destroyed, marquee, &QObject::deleteLater);
+    connect(track, &TimelineTrack::marqueeDragged, this,
+            [this, track, marquee](QPoint start, QPoint end, bool additive, bool finished) {
+        const QRect rect(m_scrollArea->viewport()->mapFromGlobal(start),
+                         m_scrollArea->viewport()->mapFromGlobal(end));
+        marquee->setGeometry(rect.normalized());
+        if (!finished) {
+            marquee->show();
+            marquee->raise();
+            return;
+        }
+        marquee->hide();
+        int first = -1, last = -1;
+        const auto tracks = timelineTracks(this);
+        const int top = qMin(start.y(), end.y()), bottom = qMax(start.y(), end.y());
+        for (int row = 0; row < tracks.size(); ++row) {
+            const int y = tracks[row]->mapToGlobal(QPoint(0, 0)).y();
+            if (y <= bottom && y + tracks[row]->height() > top) {
+                if (first < 0) first = row;
+                last = row;
+            }
+        }
+        if (first >= 0)
+            selectClipsInRange(track->xToSeconds(track->mapFromGlobal(start).x()),
+                               track->xToSeconds(track->mapFromGlobal(end).x()),
+                               first, last, additive);
+    });
 
     connect(track, &TimelineTrack::selectionChanged, this, [this, track](int index, bool additive) {
         if (m_inLinkedSelectionSync) return;
