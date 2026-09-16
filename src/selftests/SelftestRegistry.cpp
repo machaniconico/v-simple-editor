@@ -175,6 +175,7 @@ int runRightclickPausePrefSelftest();
 int runReverseClipSelftest();
 int runRippleDeleteSelftest();
 int runRgbParadeSelftest();
+int runSfmTwoViewSelftest();
 int runShortcutSelftest();
 int runSilenceCutSelftest();
 int runBeatDetectSelftest();
@@ -623,6 +624,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "AutoMatte: difference matte, morphology, feather, composite" },
     { "object-removal",    "VEDITOR_OBJECT_REMOVAL_SELFTEST",     runObjectRemovalSelftest,      false,
       "ObjectRemoval: temporal trust, background alignment, bounds, dilation, cache, composite (14 gates)" },
+    { "sfm-two-view", "VEDITOR_SFM_TWO_VIEW_SELFTEST", runSfmTwoViewSelftest, false,
+      "Two-view essential pose, RANSAC, triangulation, degeneracy and determinism (6 gates)" },
     { "feature-tracker", "VEDITOR_FEATURE_TRACKER_SELFTEST", runFeatureTrackerSelftest, false,
       "Shi-Tomasi 特徴点検出とピラミッド LK 多点追跡 (G1-G6)" },
     { "camera-solve",      "VEDITOR_CAMERA_SOLVE_SELFTEST",       runCameraSolveSelftest,        true,

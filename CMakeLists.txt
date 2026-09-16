@@ -127,6 +127,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/camera3d_selftest.cpp
     src/selftests/camera_solve_selftest.cpp
     src/selftests/feature_tracker_selftest.cpp
+    src/selftests/sfm_two_view_selftest.cpp
     src/selftests/VoiceIsolationSelftest.cpp
     src/selftests/noise_print_selftest.cpp
     src/selftests/GradeLggSerializationSelftest.cpp
@@ -734,6 +735,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/Camera3D.cpp
     src/CameraSolver.h
     src/CameraSolver.cpp
+    src/TwoViewGeometry.h
+    src/TwoViewGeometry.cpp
     src/AudioKeyframes.h
     src/AudioKeyframes.cpp
     src/selftests/audio_keyframes_selftest.cpp
