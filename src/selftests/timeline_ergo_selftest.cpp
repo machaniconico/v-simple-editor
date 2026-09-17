@@ -334,7 +334,23 @@ int runTimelineErgoSelftest()
         timeline.selectClipsInRange(0.0, 0.5, 0, 0, false);
         ok = ok && timeline.videoTracks()[0]->selectedClips() == QList<int>({0})
             && timeline.audioTracks()[0]->selectedClips().isEmpty();
-        gate(7, ok && timeline.undoManager()->saveSerial() == serial && !timeline.canUndo());
+        ok = ok && timeline.undoManager()->saveSerial() == serial && !timeline.canUndo();
+
+        Timeline zoomedOut;
+        zoomedOut.restoreFromProject(
+            QVector<QVector<ClipInfo>>{{clip(0.5), clip(0.5), clip(0.5)}},
+            QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 1);
+        baseline(zoomedOut);
+        const auto zoomedSerial = zoomedOut.undoManager()->saveSerial();
+        auto *track = zoomedOut.videoTracks()[0];
+        // The second clip is painted at [20, 40), despite its time range [0.5, 1).
+        const int left = track->clipStartX(1);
+        const int right = track->clipStartX(2);
+        zoomedOut.selectClipsInRange(track->xToSeconds(left), track->xToSeconds(right),
+                                     0, 0, false);
+        gate(7, ok && near(track->pixelsPerSecond(), 1.0) && left == 20 && right == 40
+                && track->selectedClips() == QList<int>({1})
+                && zoomedOut.undoManager()->saveSerial() == zoomedSerial && !zoomedOut.canUndo());
     }
     {
         Timeline timeline;

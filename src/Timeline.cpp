@@ -5039,11 +5039,15 @@ void Timeline::selectClipsInRange(double startSec, double endSec, int firstRow,
     for (int row = 0; row < tracks.size(); ++row) {
         auto *track = tracks[row];
         if (track->isLocked() || track->isHidden()) continue;
+        const int x0 = track->secondsToX(startSec);
+        const int x1 = track->secondsToX(endSec);
         for (int i = 0; i < track->clipCount(); ++i) {
-            double start = 0.0, end = 0.0;
+            // Match painting and clipAtX, including the minimum visible clip width.
+            const int cx = track->clipStartX(i);
+            const int cw = qMax(20, static_cast<int>(
+                track->clips()[i].effectiveDuration() * track->pixelsPerSecond()));
             const bool hit = row >= firstRow && row <= lastRow
-                && trackClipTimeRangeAt(track, i, &start, &end)
-                && start < endSec && end > startSec;
+                && cx < x1 && cx + cw > x0;
             if (hit || (additive && track->isClipSelected(i))) {
                 selected[row].insert(i);
                 if (track->clips()[i].linkGroup > 0)

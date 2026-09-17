@@ -4454,7 +4454,7 @@ void MainWindow::setupMenuBar()
     // 編集 メニュー
     auto *editMenu = menuBar()->addMenu("編集(&E)");
     m_jumpTimecodeAction = editMenu->addAction(QStringLiteral("タイムコードへジャンプ…"));
-    m_jumpTimecodeAction->setShortcut(QKeySequence("Ctrl+Shift+G"));
+    m_jumpTimecodeAction->setShortcut(QKeySequence("Ctrl+Shift+J"));
     connect(m_jumpTimecodeAction, &QAction::triggered, this, [this]() {
         bool accepted = false;
         const QString text = QInputDialog::getText(this, QStringLiteral("タイムコードへジャンプ"),
@@ -4466,7 +4466,9 @@ void MainWindow::setupMenuBar()
             statusBar()->showMessage(QStringLiteral("タイムコードを解釈できません: %1").arg(text), 5000);
             return;
         }
-        m_timeline->setPlayheadPosition(qBound(0.0, seconds, m_timeline->totalDuration()));
+        const double clamped = qBound(0.0, seconds, m_timeline->totalDuration());
+        m_timeline->setPlayheadPosition(clamped);
+        if (m_player) m_player->seek(qRound(clamped * 1000.0));
     });
 
     m_copyCurrentFrameAction =
