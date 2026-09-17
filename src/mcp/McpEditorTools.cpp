@@ -1,4 +1,5 @@
 #include "McpEditorTools.h"
+#include "../ExportUserPresets.h"
 
 #include "McpToolRegistry.h"
 #include "../CaptionEditorDialog.h"
@@ -1892,6 +1893,7 @@ void McpEditorTools::registerWriteTools()
     const QJsonObject clipProperties = clipSelectorProperties();
 
     QJsonObject exportVideoOutputSchema = outputSchemaOf(QJsonObject{
+        {QStringLiteral("preset"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
         {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
         {QStringLiteral("jobId"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
         {QStringLiteral("status"), QJsonObject{
@@ -2299,6 +2301,7 @@ void McpEditorTools::registerWriteTools()
         QStringLiteral("export_video"),
         QStringLiteral("audioOnly=true は m4a / wav / mp3 の音声のみを同期で書き出し、ok と outputPath を返す (jobId なし)。映像設定は無視して warnings を返す。通常は現在のタイムラインを動画ファイルへ非同期で書き出す。tools/call はジョブ投入後すぐに jobId を返し、完了は get_export_status で確認する。width / height / fps の省略時は現在のプロジェクト設定を使い、videoBitrate / audioBitrate は kbps (既定 10000 / 192)、videoCodec / audioCodec は ffmpeg のエンコーダ名 (既定 libx264 / aac)。音声はトリム・分割・並べ替え・音量・ミュートを反映したタイムラインのミックスを ffmpeg で作ってから多重化する (ffmpeg が PATH に無いと単純な 1 クリップ構成以外は failed になる)。"),
         schemaWithRequired(QJsonObject{
+            {QStringLiteral("preset"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
             {QStringLiteral("outputPath"), QJsonObject{
                 {QStringLiteral("type"), QStringLiteral("string")}
             }},
@@ -2350,6 +2353,7 @@ void McpEditorTools::registerWriteTools()
                      [this](const QJsonObject& args, QString* err) -> QJsonObject {
             if (!rejectUnknownArguments(args,
                                         {QStringLiteral("outputPath"),
+                                         QStringLiteral("preset"),
                                          QStringLiteral("audioOnly"),
                                          QStringLiteral("width"),
                                          QStringLiteral("height"),
@@ -2388,17 +2392,26 @@ void McpEditorTools::registerWriteTools()
                 return setError(err, QStringLiteral("タイムラインが空です。import_media で素材を追加してください")),
                        QJsonObject();
 
+            ExportConfig baseConfig;
+            baseConfig.width = qMax(2, m_window->m_projectConfig.width);
+            baseConfig.height = qMax(2, m_window->m_projectConfig.height);
+            baseConfig.fps = qMax(1, m_window->m_projectConfig.fps);
+            QString presetName;
+            if (args.contains(QStringLiteral("preset"))) {
+                if (!requiredString(args, QStringLiteral("preset"), &presetName, err)) return {};
+                if (!ExportUserPresets::resolve(presetName, &baseConfig, err)) return {};
+            }
             if (args.contains(QStringLiteral("audioOnly")) && !args.value(QStringLiteral("audioOnly")).isBool())
                 return setError(err, QStringLiteral("audioOnly は真偽値で指定してください")), QJsonObject();
-            if (args.value(QStringLiteral("audioOnly")).toBool(false)) {
-                ExportConfig config;
+            if (args.value(QStringLiteral("audioOnly")).toBool(baseConfig.audioOnly)) {
+                ExportConfig config = baseConfig;
                 config.audioOnly = true;
                 config.outputPath = outputPath;
                 config.container = outputInfo.suffix().toLower();
                 config.audioCodec = ExportConfig::audioCodecForContainer(config.container);
                 if (config.audioCodec.isEmpty())
                     return setError(err, QStringLiteral("音声の書き出し先には .m4a / .wav / .mp3 を指定してください")), QJsonObject();
-                if (!positiveInteger(args, QStringLiteral("audioBitrate"), 192, &config.audioBitrate, err))
+                if (!positiveInteger(args, QStringLiteral("audioBitrate"), config.audioBitrate, &config.audioBitrate, err))
                     return {};
                 if (args.contains(QStringLiteral("audioCodec"))
                     && (!args.value(QStringLiteral("audioCodec")).isString()
@@ -2412,13 +2425,14 @@ void McpEditorTools::registerWriteTools()
                 }
                 if (!m_window->exportAudioOnly(config, err)) return {};
                 QJsonObject result{{QStringLiteral("ok"), true}, {QStringLiteral("outputPath"), outputPath}};
+                if (!presetName.isEmpty()) result.insert(QStringLiteral("preset"), presetName);
                 if (!warnings.isEmpty()) result.insert(QStringLiteral("warnings"), warnings);
                 return result;
             }
 
-            const int defaultWidth = qMax(2, m_window->m_projectConfig.width);
-            const int defaultHeight = qMax(2, m_window->m_projectConfig.height);
-            const double defaultFps = qMax(1, m_window->m_projectConfig.fps);
+            const int defaultWidth = baseConfig.width;
+            const int defaultHeight = baseConfig.height;
+            const double defaultFps = baseConfig.fps;
             int width = defaultWidth;
             int height = defaultHeight;
             if (!positiveInteger(args, QStringLiteral("width"), defaultWidth,
@@ -2437,7 +2451,7 @@ void McpEditorTools::registerWriteTools()
 
             // ProjectConfig が保持する書き出し設定は現状サイズと fps までなので、
             // codec / bitrate は ExportConfig と同じ既定値を使う。
-            QString videoCodec = QStringLiteral("libx264");
+            QString videoCodec = baseConfig.videoCodec;
             if (args.contains(QStringLiteral("videoCodec"))) {
                 const QJsonValue value = args.value(QStringLiteral("videoCodec"));
                 if (!value.isString() || value.toString().trimmed().isEmpty())
@@ -2446,7 +2460,8 @@ void McpEditorTools::registerWriteTools()
                 videoCodec = value.toString().trimmed();
             }
 
-            QString rateControl = QStringLiteral("bitrate");
+            QString rateControl = baseConfig.rateControl == ExportConfig::RateControl::Crf
+                ? QStringLiteral("crf") : QStringLiteral("bitrate");
             if (args.contains(QStringLiteral("rateControl"))) {
                 const QJsonValue value = args.value(QStringLiteral("rateControl"));
                 if (!value.isString() || (value.toString() != QStringLiteral("bitrate")
@@ -2454,7 +2469,7 @@ void McpEditorTools::registerWriteTools()
                     return setError(err, QStringLiteral("rateControl は bitrate または crf で指定してください")), QJsonObject();
                 rateControl = value.toString();
             }
-            int crf = -1;
+            int crf = baseConfig.crf;
             if (args.contains(QStringLiteral("crf"))) {
                 const QJsonValue value = args.value(QStringLiteral("crf"));
                 const double number = value.toDouble(-2);
@@ -2465,12 +2480,12 @@ void McpEditorTools::registerWriteTools()
                 crf = static_cast<int>(number);
             }
 
-            int videoBitrate = 10000; // kbps。ExportConfig の既定値と合わせる。
+            int videoBitrate = baseConfig.videoBitrate; // kbps。ExportConfig の既定値と合わせる。
             if (!positiveInteger(args, QStringLiteral("videoBitrate"),
                                  videoBitrate, &videoBitrate, err))
                 return {};
 
-            QString audioCodec = QStringLiteral("aac");
+            QString audioCodec = baseConfig.audioCodec;
             if (args.contains(QStringLiteral("audioCodec"))) {
                 const QJsonValue value = args.value(QStringLiteral("audioCodec"));
                 if (!value.isString() || value.toString().trimmed().isEmpty())
@@ -2478,7 +2493,7 @@ void McpEditorTools::registerWriteTools()
                            QJsonObject();
                 audioCodec = value.toString().trimmed();
             }
-            int audioBitrate = 192; // kbps。ExportConfig の既定値と合わせる。
+            int audioBitrate = baseConfig.audioBitrate; // kbps。ExportConfig の既定値と合わせる。
             if (!positiveInteger(args, QStringLiteral("audioBitrate"),
                                  audioBitrate, &audioBitrate, err))
                 return {};
@@ -2517,6 +2532,21 @@ void McpEditorTools::registerWriteTools()
                 {QStringLiteral("audioBitrate"), audioBitrate},
                 {QStringLiteral("loudnessGainDb"), loudnessGainDb}
             };
+            if (!presetName.isEmpty()) {
+                // Preserve all preset options, then apply the validated explicit overrides.
+                QJsonObject merged = ExportUserPresets::toJson(baseConfig);
+                for (auto it = job.exportConfig.constBegin(); it != job.exportConfig.constEnd(); ++it)
+                    merged.insert(it.key(), it.value());
+                merged.insert(QStringLiteral("audioOnly"), false);
+                merged.insert(QStringLiteral("rateControl"), rateControl);
+                merged.insert(QStringLiteral("crf"), crf);
+                merged.insert(QStringLiteral("hdrMode"), baseConfig.hdrSettings.mode);
+                merged.insert(QStringLiteral("hdrMasterMinLum"), baseConfig.hdrSettings.masterDisplayLuminanceMin);
+                merged.insert(QStringLiteral("hdrMasterMaxLum"), baseConfig.hdrSettings.masterDisplayLuminanceMax);
+                merged.insert(QStringLiteral("hdrMaxCll"), baseConfig.hdrSettings.maxCll);
+                merged.insert(QStringLiteral("hdrMaxFall"), baseConfig.hdrSettings.maxFall);
+                job.exportConfig = merged;
+            }
             if (rateControl != QStringLiteral("bitrate"))
                 job.exportConfig.insert(QStringLiteral("rateControl"), rateControl);
             if (crf != -1)
@@ -2567,7 +2597,7 @@ void McpEditorTools::registerWriteTools()
                 queueGuard->start();
             });
 
-            return QJsonObject{
+            QJsonObject result{
                 {QStringLiteral("ok"), true},
                 {QStringLiteral("jobId"), job.uuid},
                 {QStringLiteral("status"), QStringLiteral("queued")},
@@ -2581,6 +2611,8 @@ void McpEditorTools::registerWriteTools()
                 {QStringLiteral("audioCodec"), audioCodec},
                 {QStringLiteral("audioBitrate"), audioBitrate}
             };
+            if (!presetName.isEmpty()) result.insert(QStringLiteral("preset"), presetName);
+            return result;
         })
     }, exportVideoOutputSchema));
 

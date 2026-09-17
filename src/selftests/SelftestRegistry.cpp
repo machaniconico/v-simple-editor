@@ -101,6 +101,7 @@ int runEffectPresetSelftest();
 int runEffectTimingSelftest();
 int runExposureAidsSelftest();
 int runExportAuditSelftest();
+int runExportPresetsSelftest();
 int runExportProSelftest();
 int runExportRangeSelftest();
 int runFlipSolidSelftest();
@@ -506,6 +507,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Increment and Save filename resolver: numbered suffix, unnumbered v002, collision skip, digit width" },
     { "project-diff", "VEDITOR_PROJECT_DIFF_SELFTEST", runProjectDiffSelftest, false,
       "Structural project comparison: matching, properties, effects, transitions and epsilon (7 gates)" },
+    { "export-presets", "VEDITOR_EXPORT_PRESETS_SELFTEST", runExportPresetsSelftest, false,
+      "Export user preset persistence and name resolution (4 gates)" },
     { "export-pro",        "VEDITOR_EXPORT_PRO_SELFTEST",         runExportProSelftest,         false,
       "Export rate control options and queue persistence" },
     { "export-range",      "VEDITOR_EXPORT_RANGE_SELFTEST",       runExportRangeSelftest,       false,

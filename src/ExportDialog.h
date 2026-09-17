@@ -94,6 +94,9 @@ private slots:
 
 private:
     void setupUI();
+    void reloadUserPresets(const QString &selected = {});
+    void applyPreset(const ExportConfig &config, bool userPreset = true);
+    ExportConfig currentSettings() const;
     void updateSummary();
     void updateAudioOnlyControls(bool exportTypeChanged = false);
     void updateRateControlControls();

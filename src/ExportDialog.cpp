@@ -1,4 +1,7 @@
 #include "ExportDialog.h"
+#include "ExportUserPresets.h"
+#include <QInputDialog>
+#include <QSignalBlocker>
 #include "CodecDetector.h"
 #include "PremiereXmlExporter.h"
 #include "YoutubeChapterGen.h"
@@ -103,6 +106,42 @@ void ExportDialog::setupUI()
     for (const auto &p : presetList)
         m_presetCombo->addItem(p.name);
     presetLayout->addWidget(m_presetCombo);
+    auto *savePreset = new QPushButton(tr("現在の設定をプリセットに保存…"), this);
+    auto *deletePreset = new QPushButton(tr("プリセットを削除"), this);
+    presetLayout->addWidget(savePreset);
+    presetLayout->addWidget(deletePreset);
+    connect(savePreset, &QPushButton::clicked, this, [this]() {
+        bool ok = false;
+        const QString name = QInputDialog::getText(this, tr("プリセットを保存"),
+            tr("プリセット名:"), QLineEdit::Normal, {}, &ok).trimmed();
+        if (!ok || name.isEmpty()) return;
+        for (const auto &p : presets()) {
+            if (p.name == name) {
+                QMessageBox::warning(this, tr("プリセットを保存"), tr("組み込みプリセットとは別の名前を指定してください"));
+                return;
+            }
+        }
+        for (const auto &p : ExportUserPresets::load()) {
+            if (p.name == name && QMessageBox::question(this, tr("上書き確認"),
+                tr("同名のプリセットを上書きしますか？")) != QMessageBox::Yes) return;
+        }
+        QString error;
+        if (!ExportUserPresets::save({name, currentSettings()}, &error))
+            QMessageBox::warning(this, tr("保存に失敗しました"), error);
+        else reloadUserPresets(name);
+    });
+    connect(deletePreset, &QPushButton::clicked, this, [this]() {
+        const QString name = m_presetCombo->currentData().toString();
+        if (name.isEmpty()) return;
+        QString error;
+        if (!ExportUserPresets::remove(name, &error))
+            QMessageBox::warning(this, tr("削除に失敗しました"), error);
+        else { reloadUserPresets(); m_presetCombo->setCurrentIndex(0); onPresetChanged(0); }
+    });
+    connect(m_presetCombo, &QComboBox::currentIndexChanged, this, [this, deletePreset]() {
+        deletePreset->setEnabled(!m_presetCombo->currentData().toString().isEmpty());
+    });
+    deletePreset->setEnabled(false);
 
     m_hdrWarningLabel = new QLabel(
         "Warning: source is SDR; output will be tagged HDR10 but not actually HDR",
@@ -329,6 +368,7 @@ void ExportDialog::setupUI()
             cb->setText(m_chapterText->toPlainText());
     });
 
+    reloadUserPresets();
     onPresetChanged(0);
     updateMarkedRangeCheckboxEnabled();
     updateSummary();
@@ -364,6 +404,14 @@ void ExportDialog::regenerateChapters()
 
 void ExportDialog::onPresetChanged(int index)
 {
+    if (index < 0) return;
+    const QString userName = m_presetCombo->itemData(index).toString();
+    if (!userName.isEmpty()) {
+        for (const auto &p : ExportUserPresets::load()) {
+            if (p.name == userName) { applyPreset(p.config); return; }
+        }
+        return;
+    }
     const auto presetList = presets();
     bool isCustom = (index >= presetList.size() - 1);
 
@@ -374,12 +422,12 @@ void ExportDialog::onPresetChanged(int index)
 
     if (!isCustom && index < presetList.size()) {
         const auto &p = presetList[index];
-        int vcIdx = m_videoCodecCombo->findData(p.videoCodec);
-        if (vcIdx >= 0) m_videoCodecCombo->setCurrentIndex(vcIdx);
-        int acIdx = m_audioCodecCombo->findData(p.audioCodec);
-        if (acIdx >= 0) m_audioCodecCombo->setCurrentIndex(acIdx);
-        m_videoBitrateSpin->setValue(p.videoBitrate);
-        m_audioBitrateSpin->setValue(p.audioBitrate);
+        ExportConfig config;
+        config.videoCodec = p.videoCodec;
+        config.audioCodec = p.audioCodec;
+        config.videoBitrate = p.videoBitrate;
+        config.audioBitrate = p.audioBitrate;
+        applyPreset(config, false);
     }
 
     if (m_hdrWarningLabel) {
@@ -439,10 +487,12 @@ void ExportDialog::updateAudioOnlyControls(bool exportTypeChanged)
     const auto presetList = presets();
     const int index = m_presetCombo->currentIndex();
     const bool isCustom = index >= presetList.size() - 1;
-    const bool isProRes = !isCustom && index >= 0 && presetList[index].proresProfile >= 0;
-    m_presetCombo->setEnabled(video && !audio);
-    m_hdrWarningLabel->setVisible(!audio && !isCustom && index >= 0
-                                 && presetList[index].hdr10 && !m_sourceIsHdr);
+    const bool user = !m_presetCombo->currentData().toString().isEmpty();
+    const bool isProRes = user ? m_config.proresProfile >= 0
+        : (!isCustom && index >= 0 && presetList[index].proresProfile >= 0);
+    m_presetCombo->setEnabled(video);
+    m_hdrWarningLabel->setVisible(!audio && !m_sourceIsHdr
+        && (user ? m_config.hdr10 : (!isCustom && index >= 0 && presetList[index].hdr10)));
     m_videoCodecCombo->setEnabled(video && !audio && isCustom);
     m_audioCodecCombo->setEnabled(video && !audio && isCustom);
     m_hwEncoderCombo->setEnabled(video && !audio && !isProRes
@@ -530,48 +580,95 @@ void ExportDialog::onExport()
         return;
     }
 
-    if (m_audioOnlyCheckbox->isChecked()) {
-        m_config.audioOnly = true;
-        m_config.container = m_audioContainerCombo->currentData().toString();
-        m_config.audioCodec = ExportConfig::audioCodecForContainer(m_config.container);
-        m_config.audioBitrate = m_audioBitrateSpin->value();
-        m_config.outputPath = m_outputEdit->text();
-        m_config.exportMarkedRangeOnly = m_markedRangeCheckbox->isChecked();
-        accept();
-        return;
-    }
-
-    // --- 既存 Video encode path ---
-    m_config.outputPath = m_outputEdit->text();
-    m_config.videoCodec = m_videoCodecCombo->currentData().toString();
-    m_config.audioCodec = m_audioCodecCombo->currentData().toString();
-    m_config.container = defaultExtension();
-    m_config.videoBitrate = m_videoBitrateSpin->value();
-    m_config.rateControl = m_rateControlCombo->currentIndex() == 1
-        ? ExportConfig::RateControl::Crf : ExportConfig::RateControl::Bitrate;
-    m_config.crf = m_config.rateControl == ExportConfig::RateControl::Crf
-        ? m_crfSpin->value() : -1;
-    m_config.audioBitrate = m_audioBitrateSpin->value();
-    m_config.hwEncoder = m_hwEncoderCombo->currentData().toString();
-    m_config.useHardwareAccel = (m_config.hwEncoder != "none");
-    m_config.width = m_projectConfig.width;
-    m_config.height = m_projectConfig.height;
-    m_config.fps = m_projectConfig.fps;
-    m_config.exportMarkedRangeOnly =
-        m_markedRangeCheckbox && m_markedRangeCheckbox->isChecked();
-
-    const auto presetList = presets();
-    int idx = m_presetCombo->currentIndex();
-    if (idx < presetList.size()) {
-        m_config.maxFileSizeMB = presetList[idx].maxFileSizeMB;
-        m_config.hdr10 = presetList[idx].hdr10;
-        m_config.proresProfile = presetList[idx].proresProfile;
-    } else {
-        m_config.hdr10 = false;
-        m_config.proresProfile = -1;
-    }
+    m_config = currentSettings();
 
     accept();
+}
+
+void ExportDialog::reloadUserPresets(const QString &selected)
+{
+    {
+        const QSignalBlocker blocker(m_presetCombo);
+        while (m_presetCombo->count() > presets().size())
+            m_presetCombo->removeItem(m_presetCombo->count() - 1);
+        const auto users = ExportUserPresets::load();
+        if (!users.isEmpty()) m_presetCombo->insertSeparator(m_presetCombo->count());
+        for (const auto &p : users) m_presetCombo->addItem(p.name, p.name);
+        m_presetCombo->setCurrentIndex(-1);
+    }
+    m_presetCombo->setCurrentIndex(selected.isEmpty() ? 0 : m_presetCombo->findData(selected));
+}
+
+void ExportDialog::applyPreset(const ExportConfig &config, bool userPreset)
+{
+    if (!userPreset) {
+        const int vcIdx = m_videoCodecCombo->findData(config.videoCodec);
+        if (vcIdx >= 0) m_videoCodecCombo->setCurrentIndex(vcIdx);
+        const int acIdx = m_audioCodecCombo->findData(config.audioCodec);
+        if (acIdx >= 0) m_audioCodecCombo->setCurrentIndex(acIdx);
+        m_videoBitrateSpin->setValue(config.videoBitrate);
+        m_audioBitrateSpin->setValue(config.audioBitrate);
+        return;
+    }
+    const QString output = m_outputEdit->text();
+    const QSignalBlocker videoBlock(m_videoCodecCombo), audioBlock(m_audioCodecCombo),
+        hwBlock(m_hwEncoderCombo), onlyBlock(m_audioOnlyCheckbox), containerBlock(m_audioContainerCombo),
+        rateBlock(m_rateControlCombo);
+    auto select = [](QComboBox *combo, const QString &value) {
+        int index = combo->findData(value);
+        if (index < 0) { combo->addItem(value, value); index = combo->count() - 1; }
+        combo->setCurrentIndex(index);
+    };
+    m_config = config;
+    select(m_videoCodecCombo, config.videoCodec);
+    select(m_audioCodecCombo, config.audioCodec);
+    select(m_hwEncoderCombo, config.hwEncoder);
+    m_videoBitrateSpin->setRange(1, qMax(100000, config.videoBitrate));
+    m_audioBitrateSpin->setRange(1, qMax(1536, config.audioBitrate));
+    m_videoBitrateSpin->setValue(config.videoBitrate);
+    m_audioBitrateSpin->setValue(config.audioBitrate);
+    m_crfSpin->setRange(-1, config.videoCodec.contains("av1") ? 63 : 51);
+    m_crfSpin->setValue(config.crf);
+    m_rateControlCombo->setCurrentIndex(config.rateControl == ExportConfig::RateControl::Crf ? 1 : 0);
+    m_audioOnlyCheckbox->setChecked(config.audioOnly);
+    if (config.audioOnly) select(m_audioContainerCombo, config.container);
+    m_markedRangeCheckbox->setChecked(config.exportMarkedRangeOnly);
+    m_outputEdit->setText(output);
+    updateAudioOnlyControls();
+    m_presetCombo->setEnabled(true);
+    updateMarkedRangeCheckboxEnabled();
+    updateSummary();
+}
+
+ExportConfig ExportDialog::currentSettings() const
+{
+    ExportConfig c = m_config;
+    const bool user = !m_presetCombo->currentData().toString().isEmpty();
+    c.outputPath = m_outputEdit->text();
+    c.audioOnly = m_audioOnlyCheckbox->isChecked();
+    c.videoCodec = m_videoCodecCombo->currentData().toString();
+    c.audioCodec = m_audioCodecCombo->currentData().toString();
+    c.container = defaultExtension();
+    c.videoBitrate = m_videoBitrateSpin->value();
+    c.audioBitrate = m_audioBitrateSpin->value();
+    c.rateControl = m_rateControlCombo->currentIndex() == 1
+        ? ExportConfig::RateControl::Crf : ExportConfig::RateControl::Bitrate;
+    c.crf = (user || c.rateControl == ExportConfig::RateControl::Crf) ? m_crfSpin->value() : -1;
+    c.hwEncoder = m_hwEncoderCombo->currentData().toString();
+    if (!user || c.hwEncoder != m_config.hwEncoder) c.useHardwareAccel = c.hwEncoder != "none";
+    c.exportMarkedRangeOnly = m_markedRangeCheckbox->isChecked();
+    if (!user) {
+        c.width = m_projectConfig.width; c.height = m_projectConfig.height; c.fps = m_projectConfig.fps;
+        const int index = m_presetCombo->currentIndex();
+        const auto list = presets();
+        if (index >= 0 && index < list.size()) {
+            c.maxFileSizeMB = list[index].maxFileSizeMB;
+            c.hdr10 = list[index].hdr10;
+            c.proresProfile = list[index].proresProfile;
+        }
+    }
+    if (c.audioOnly) c.audioCodec = ExportConfig::audioCodecForContainer(c.container);
+    return c;
 }
 
 void ExportDialog::setMarkedRangeAvailable(bool hasRange)
@@ -607,6 +704,8 @@ void ExportDialog::updateMarkedRangeCheckboxEnabled()
 QString ExportDialog::defaultExtension() const
 {
     if (m_audioOnlyCheckbox->isChecked()) return m_audioContainerCombo->currentData().toString();
+    if (!m_presetCombo->currentData().toString().isEmpty()
+        && m_videoCodecCombo->currentData().toString() == m_config.videoCodec) return m_config.container;
     QString vc = m_videoCodecCombo->currentData().toString();
     if (vc == "libvpx-vp9") return "webm";
     if (vc.startsWith("prores")) return "mov";
@@ -647,7 +746,7 @@ void ExportDialog::updateSummary()
         .arg(m_hwEncoderCombo->currentText());
 
     m_summaryLabel->setText(QString("%1x%2 %3fps | %4 %5 | %6 %7kbps | .%8 | %9")
-        .arg(m_projectConfig.width).arg(m_projectConfig.height).arg(m_projectConfig.fps)
+        .arg(currentSettings().width).arg(currentSettings().height).arg(currentSettings().fps)
         .arg(codecName).arg(m_rateControlCombo->currentIndex() == 1
             ? QStringLiteral("CRF %1").arg(m_crfSpin->value())
             : QStringLiteral("%1kbps").arg(m_videoBitrateSpin->value()))

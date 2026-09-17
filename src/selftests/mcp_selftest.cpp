@@ -55,6 +55,7 @@
 #include "../MainWindow.h"
 #include "../MusicRemix.h"
 #include "../RenderQueue.h"
+#include "../ExportUserPresets.h"
 #include "../Timeline.h"
 #include "../TimelineFrameRenderer.h"
 #include "../libavcore/Probe.h"
@@ -3854,6 +3855,67 @@ int runMcpSelftest()
         g161 ? pass("G161 export_video rate control validation and queue wiring")
              : fail("G161 export_video rate control validation and queue wiring",
                     QStringLiteral("CRF validation, queued settings, or bitrate default did not match"));
+    }
+
+    // US-503: capture queued jobs without launching an encoder (same observation as G161).
+    {
+        const bool hadEnv = qEnvironmentVariableIsSet("VEDITOR_EXPORT_PRESET_DIR");
+        const QByteArray previousDir = qgetenv("VEDITOR_EXPORT_PRESET_DIR");
+        QTemporaryDir presetDir;
+        qputenv("VEDITOR_EXPORT_PRESET_DIR", presetDir.path().toUtf8());
+        ExportConfig userConfig;
+        userConfig.width = 1280; userConfig.height = 720; userConfig.fps = 24;
+        userConfig.videoCodec = "libx265"; userConfig.videoBitrate = 17000;
+        userConfig.rateControl = ExportConfig::RateControl::Crf; userConfig.crf = 18;
+        const QString userName = QStringLiteral("MCP/ユーザー:プリセット");
+        bool g164 = presetDir.isValid() && ExportUserPresets::save({userName, userConfig});
+        const auto missing = callProjectInfoTool(1640, QStringLiteral("export_video"), QJsonObject{
+            {"outputPath", exportRoot.filePath("missing.mp4")}, {"preset", "US503-missing"}});
+        g164 &= toolResult(missing).value("isError").toBool(false) && toolPayload(missing).isEmpty()
+            && QJsonDocument(missing).toJson().contains(QStringLiteral("プリセットが見つかりません: US503-missing").toUtf8());
+        const QString builtinName = QStringLiteral("YouTube (1440p H.264)");
+        const auto builtin = callProjectInfoTool(1630, QStringLiteral("export_video"), QJsonObject{
+            {"outputPath", exportRoot.filePath("preset-builtin.mp4")}, {"preset", builtinName},
+            {"rateControl", "crf"}, {"crf", 20}});
+        const auto user = callProjectInfoTool(1641, QStringLiteral("export_video"), QJsonObject{
+            {"outputPath", exportRoot.filePath("preset-user.mp4")}, {"preset", userName}, {"audioBitrate", 256}});
+        const QString builtinId = toolPayload(builtin).value("jobId").toString();
+        const QString userId = toolPayload(user).value("jobId").toString();
+        QHash<QString, QJsonObject> captured;
+        auto *queue = projectInfoWindow.findChild<RenderQueue*>();
+        if (queue) {
+            const auto connection = QObject::connect(queue, &RenderQueue::jobsChanged, queue, [&]() {
+                const auto jobs = queue->jobs();
+                if (jobs.isEmpty()) return;
+                for (const auto &job : jobs) captured.insert(job.uuid, job.exportConfig);
+                queue->clear();
+            });
+            auto *previousTools = projectInfoWindow.m_mcpTools;
+            projectInfoWindow.m_mcpTools = &projectInfoTools;
+            QCoreApplication::processEvents(QEventLoop::AllEvents);
+            projectInfoWindow.m_mcpTools = previousTools;
+            QObject::disconnect(connection);
+        }
+        const auto b = captured.value(builtinId);
+        const bool g163 = exportRootReady && timelineReady && !builtinId.isEmpty()
+            && captured.contains(builtinId) && toolPayload(builtin).value("preset").toString() == builtinName
+            && b.value("width").toInt() == qMax(2, projectInfoWindow.m_projectConfig.width)
+            && b.value("height").toInt() == qMax(2, projectInfoWindow.m_projectConfig.height)
+            && b.value("videoCodec").toString() == "libx264" && b.value("videoBitrate").toInt() == 16000
+            && b.value("rateControl").toString() == "crf" && b.value("crf").toInt() == 20;
+        const auto u = captured.value(userId);
+        g164 &= captured.size() == 2 && !userId.isEmpty() && captured.contains(userId)
+            && toolPayload(user).value("preset").toString() == userName
+            && u.value("width").toInt() == 1280 && u.value("height").toInt() == 720
+            && u.value("fps").toInt() == 24 && u.value("videoCodec").toString() == "libx265"
+            && u.value("videoBitrate").toInt() == 17000 && u.value("audioBitrate").toInt() == 256
+            && u.value("rateControl").toString() == "crf" && u.value("crf").toInt() == 18;
+        g163 ? pass("G163 built-in export preset and explicit overrides")
+             : fail("G163 built-in export preset and explicit overrides", QStringLiteral("queued preset config mismatch"));
+        g164 ? pass("G164 user export preset and missing preset rejection")
+             : fail("G164 user export preset and missing preset rejection", QStringLiteral("user preset resolution or unexpected job"));
+        if (hadEnv) qputenv("VEDITOR_EXPORT_PRESET_DIR", previousDir);
+        else qunsetenv("VEDITOR_EXPORT_PRESET_DIR");
     }
 
     QJsonObject knownStatusResponse;
