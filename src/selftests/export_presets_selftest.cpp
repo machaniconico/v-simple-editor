@@ -1,3 +1,4 @@
+#include "../CodecDetector.h"
 #include "../ExportUserPresets.h"
 #include <QDir>
 #include <QFileInfo>
@@ -126,6 +127,10 @@ int runExportPresetsSelftest()
     // Save actual bitrate-mode dialog settings, then reopen to exercise the
     // persisted unset CRF sentinel with both H.264 and AV1.
     for (const int builtinIndex : {0, 9}) {
+        if (builtinIndex == 9 && !CodecDetector::isEncoderAvailable("libsvtav1")) {
+            std::fprintf(stderr, "SKIP G3 AV1 (libsvtav1 not registered)\n");
+            continue;
+        }
         const int defaultCrf = builtinIndex == 9 ? 30 : 23;
         const QString savedName = QStringLiteral("未設定CRF-%1").arg(builtinIndex);
         for (int phase = 0; phase < 2; ++phase) {
