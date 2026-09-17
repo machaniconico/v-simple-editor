@@ -1,5 +1,6 @@
 #include "FrameGrab.h"
 #include <QFileInfo>
+#include <QImageReader>
 #include <QStringList>
 #include <cmath>
 #include <cstring>
@@ -19,6 +20,15 @@ bool libavcore::isStillImage(const QString &path)
 }
 
 namespace {
+QImage scaledFrame(QImage result, QSize maxSize)
+{
+    if (!result.isNull() && maxSize.isValid() && !maxSize.isEmpty()
+        && (result.width() > maxSize.width() || result.height() > maxSize.height()))
+        result = result.scaled(maxSize, Qt::KeepAspectRatio, Qt::SmoothTransformation)
+                     .convertToFormat(QImage::Format_RGBA8888);
+    return result;
+}
+
 bool openVideoDecoder(const QString &filePath,
                       AVFormatContext **fmtCtx,
                       AVCodecContext **decCtx,
@@ -119,6 +129,13 @@ QImage avFrameToQImage(const AVFrame *frame, AVCodecContext *decCtx)
 
 QImage libavcore::grabFrameAt(const QString &filePath, double sourceTimeSeconds, QSize maxSize)
 {
+    if (isStillImage(filePath)) {
+        QImageReader reader(filePath);
+        if (!reader.canRead())
+            return {};
+        return scaledFrame(reader.read().convertToFormat(QImage::Format_RGBA8888), maxSize);
+    }
+
     AVFormatContext *fmtCtx = nullptr;
     AVCodecContext *decCtx = nullptr;
     int streamIndex = -1;
@@ -126,17 +143,14 @@ QImage libavcore::grabFrameAt(const QString &filePath, double sourceTimeSeconds,
         return {};
 
     AVStream *stream = fmtCtx->streams[streamIndex];
-    const bool still = isStillImage(filePath);
-    const double targetSeconds = still || !std::isfinite(sourceTimeSeconds)
+    const double targetSeconds = !std::isfinite(sourceTimeSeconds)
         ? 0.0 : qBound(0.0, sourceTimeSeconds, 1.0e10);
     const int64_t seekTarget = av_rescale_q(
         static_cast<int64_t>(targetSeconds * AV_TIME_BASE),
         AVRational{1, AV_TIME_BASE},
         stream->time_base);
-    if (!still) {
-        av_seek_frame(fmtCtx, streamIndex, seekTarget, AVSEEK_FLAG_BACKWARD);
-        avcodec_flush_buffers(decCtx);
-    }
+    av_seek_frame(fmtCtx, streamIndex, seekTarget, AVSEEK_FLAG_BACKWARD);
+    avcodec_flush_buffers(decCtx);
 
     AVPacket *packet = av_packet_alloc();
     AVFrame *frame = av_frame_alloc();
@@ -163,7 +177,7 @@ QImage libavcore::grabFrameAt(const QString &filePath, double sourceTimeSeconds,
                 ? pts * av_q2d(stream->time_base)
                 : targetSeconds;
             result = avFrameToQImage(frame, decCtx);
-            if (result.isNull() || (!still && frameSeconds + 1.0 / 120.0 < targetSeconds))
+            if (result.isNull() || frameSeconds + 1.0 / 120.0 < targetSeconds)
                 continue;
             goto decode_done;
         }
@@ -174,9 +188,5 @@ decode_done:
     av_packet_free(&packet);
     avcodec_free_context(&decCtx);
     avformat_close_input(&fmtCtx);
-    if (!result.isNull() && maxSize.isValid() && !maxSize.isEmpty()
-        && (result.width() > maxSize.width() || result.height() > maxSize.height()))
-        result = result.scaled(maxSize, Qt::KeepAspectRatio, Qt::SmoothTransformation)
-                     .convertToFormat(QImage::Format_RGBA8888);
-    return result;
+    return scaledFrame(result, maxSize);
 }
