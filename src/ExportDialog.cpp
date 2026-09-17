@@ -26,6 +26,11 @@ constexpr int kAudioBitrateMax = 512;
 constexpr int kCrfMin = 0;
 constexpr int kCrfMax = 51;
 constexpr int kAv1CrfMax = 63;
+
+int defaultCrfFor(const QString &codec)
+{
+    return codec.contains("av1") ? 30 : 23;
+}
 }
 
 QString ExportConfig::audioCodecForContainer(const QString &container)
@@ -212,7 +217,7 @@ void ExportDialog::setupUI()
     codecForm->addRow(tr("レート制御:"), m_rateControlCombo);
     m_crfSpin = new QSpinBox(this);
     m_crfSpin->setRange(kCrfMin, kCrfMax);
-    m_crfSpin->setValue(23);
+    m_crfSpin->setValue(defaultCrfFor(m_videoCodecCombo->currentData().toString()));
     m_crfSpin->setEnabled(false);
     codecForm->addRow(tr("品質 (CRF):"), m_crfSpin);
 
@@ -350,7 +355,7 @@ void ExportDialog::setupUI()
     connect(m_videoCodecCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this]() {
         const bool av1 = m_videoCodecCombo->currentData().toString().contains("av1");
         m_crfSpin->setRange(kCrfMin, av1 ? kAv1CrfMax : kCrfMax);
-        m_crfSpin->setValue(av1 ? 30 : 23);
+        m_crfSpin->setValue(defaultCrfFor(m_videoCodecCombo->currentData().toString()));
         updateRateControlControls();
         updateSummary();
     });
@@ -433,6 +438,10 @@ void ExportDialog::onPresetChanged(int index)
     // Restore built-in limits before applying values, including for Custom.
     m_videoBitrateSpin->setRange(kVideoBitrateMin, kVideoBitrateMax);
     m_audioBitrateSpin->setRange(kAudioBitrateMin, kAudioBitrateMax);
+    // Resolve the user preset's unset sentinel before the built-in range clamps it.
+    // Keep manually entered CRF values when switching within the same codec.
+    if (m_crfSpin->value() < kCrfMin)
+        m_crfSpin->setValue(defaultCrfFor(m_videoCodecCombo->currentData().toString()));
     m_crfSpin->setRange(kCrfMin, m_videoCodecCombo->currentData().toString().contains("av1")
         ? kAv1CrfMax : kCrfMax);
     // Keep toggled connected so the output extension and enabled controls follow.

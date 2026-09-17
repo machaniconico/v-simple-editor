@@ -123,6 +123,58 @@ int runExportPresetsSelftest()
             }
         }
     }
+    // Save actual bitrate-mode dialog settings, then reopen to exercise the
+    // persisted unset CRF sentinel with both H.264 and AV1.
+    for (const int builtinIndex : {0, 9}) {
+        const int defaultCrf = builtinIndex == 9 ? 30 : 23;
+        const QString savedName = QStringLiteral("未設定CRF-%1").arg(builtinIndex);
+        for (int phase = 0; phase < 2; ++phase) {
+            ExportDialog dialog(ProjectConfig{});
+            QComboBox *presetCombo = nullptr;
+            QComboBox *rateControl = nullptr;
+            QSpinBox *crf = nullptr;
+            QLineEdit *output = nullptr;
+            for (auto *combo : dialog.findChildren<QComboBox *>()) {
+                if (combo->findText(names.first()) >= 0) presetCombo = combo;
+                if (combo->findText(QStringLiteral("品質 (CRF)")) >= 0) rateControl = combo;
+            }
+            for (auto *spin : dialog.findChildren<QSpinBox *>())
+                if (spin->suffix().isEmpty()) crf = spin;
+            for (auto *edit : dialog.findChildren<QLineEdit *>())
+                if (edit->placeholderText() == QStringLiteral("Select output file...")) output = edit;
+            restored &= presetCombo && rateControl && crf && output;
+            if (!presetCombo || !rateControl || !crf || !output) continue;
+            output->setText(temp.filePath("crf-export.mp4"));
+            presetCombo->setCurrentIndex(builtinIndex);
+            if (phase == 0) {
+                // Same-codec built-in changes must preserve manually entered CRF.
+                rateControl->setCurrentIndex(1);
+                crf->setValue(27);
+                presetCombo->setCurrentIndex(names.size() - 1); // Custom retains codec.
+                presetCombo->setCurrentIndex(builtinIndex);
+                restored &= crf->value() == 27;
+                rateControl->setCurrentIndex(0);
+                restored &= QMetaObject::invokeMethod(&dialog, "onExport", Qt::DirectConnection);
+                const auto bitrateConfig = dialog.config();
+                restored &= bitrateConfig.rateControl == ExportConfig::RateControl::Bitrate
+                    && bitrateConfig.crf == -1;
+                restored &= ExportUserPresets::save({savedName, bitrateConfig});
+            } else {
+                const int userIndex = presetCombo->findData(savedName);
+                restored &= userIndex >= 0;
+                if (userIndex < 0) continue;
+                presetCombo->setCurrentIndex(userIndex);
+                restored &= crf->value() == -1;
+                presetCombo->setCurrentIndex(builtinIndex);
+                restored &= crf->minimum() == 0 && crf->value() == defaultCrf
+                    && crf->maximum() == (builtinIndex == 9 ? 63 : 51);
+                rateControl->setCurrentIndex(1);
+                restored &= QMetaObject::invokeMethod(&dialog, "onExport", Qt::DirectConnection);
+                restored &= dialog.config().rateControl == ExportConfig::RateControl::Crf
+                    && dialog.config().crf == defaultCrf;
+            }
+        }
+    }
     gate(3, actual.size() == 20 && actual == names && restored);
     ExportConfig resolved;
     QString error;
