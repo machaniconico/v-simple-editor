@@ -41,6 +41,8 @@ const char *kRootName = "すべてのメディア";
 // QListWidgetItem に asset id を持たせるための role。
 constexpr int kAssetIdRole   = Qt::UserRole;
 constexpr int kAssetPathRole = Qt::UserRole + 1;
+constexpr int kAssetDurationRole = Qt::UserRole + 2;
+constexpr int kAssetTypeRole = Qt::UserRole + 3;
 // QTreeWidgetItem に bin id を持たせるための role。
 constexpr int kBinIdRole     = Qt::UserRole;
 } // namespace
@@ -297,6 +299,8 @@ void MediaPoolDock::showAssets(const QVector<mediapool::MediaAsset> &assets)
             item->setForeground(QBrush(Qt::gray));
         item->setData(kAssetIdRole, asset.id);
         item->setData(kAssetPathRole, asset.filePath);
+        item->setData(kAssetDurationRole, asset.durationMs);
+        item->setData(kAssetTypeRole, static_cast<int>(asset.type));
         item->setToolTip(asset.filePath);
         if (m_thumbnailsEnabled && asset.type != mediapool::MediaType::Audio) {
             setThumbnail(item);
@@ -540,7 +544,13 @@ bool MediaPoolDock::eventFilter(QObject *watched, QEvent *event)
                 m_hoverItem = item;
             }
             if (item) {
-                const auto frames = m_thumbnailCache->frames(item->data(kAssetPathRole).toString());
+                const QString path = item->data(kAssetPathRole).toString();
+                const auto frames = m_thumbnailCache->frames(path);
+                if (frames.isEmpty()
+                    && item->data(kAssetTypeRole).toInt() != static_cast<int>(mediapool::MediaType::Audio)) {
+                    m_thumbnailCache->request(path, path,
+                        item->data(kAssetDurationRole).toLongLong() / 1000.0);
+                }
                 const QRect rect = m_assetList->visualItemRect(item);
                 setThumbnail(item, ThumbnailCache::skimIndex(pos.x() - rect.x(), rect.width(), int(frames.size())));
             }

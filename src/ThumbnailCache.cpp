@@ -1,5 +1,6 @@
 #include "ThumbnailCache.h"
 #include "libavcore/FrameGrab.h"
+#include "libavcore/Probe.h"
 #include <QFutureWatcher>
 #include <QtConcurrent/QtConcurrentRun>
 #include <cmath>
@@ -75,10 +76,19 @@ void ThumbnailCache::startNext()
         });
         watcher->setFuture(QtConcurrent::run([request, cancel] {
             QVector<QImage> result;
-            const int count = libavcore::isStillImage(request.path) ? 1 : request.count;
+            const bool stillImage = libavcore::isStillImage(request.path);
+            const int count = stillImage ? 1 : request.count;
+            double duration = request.duration;
+            // Imported assets may not have duration metadata. Probe only here,
+            // on the worker, so importing and hovering never block the UI.
+            if (!stillImage && duration <= 0.0 && !cancel->load()) {
+                const auto microseconds = libavcore::probeDurationMicroseconds(request.path.toStdString());
+                if (microseconds && *microseconds > 0)
+                    duration = *microseconds / 1000000.0;
+            }
             for (int i = 0; i < count && !cancel->load(); ++i) {
                 QImage image = libavcore::grabFrameAt(request.path,
-                    request.duration * i / count, request.size);
+                    duration * i / count, request.size);
                 if (image.isNull())
                     return QVector<QImage>();
                 result.append(image);

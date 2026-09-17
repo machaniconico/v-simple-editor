@@ -90,6 +90,14 @@ int runMediaPoolThumbsSelftest()
     cache.request(png, png, 0.0);
     g2 = g2 && cache.activeCount() <= 2 && waitUntil([&] { return cache.activeCount() == 0; })
         && readyCount == 3 && cache.frames(video).isEmpty() && cache.frames(png).size() == 1;
+    // Normal imports leave duration unset: the worker must discover it.
+    cache.request(video, video, 0.0);
+    cache.request(video, video, 0.0);
+    const bool unknownDurationReady = waitUntil([&] { return cache.activeCount() == 0; });
+    const auto unknownDurationFrames = cache.frames(video);
+    g2 = g2 && unknownDurationReady && readyCount == 4
+        && unknownDurationFrames.size() == 8
+        && unknownDurationFrames.first() != unknownDurationFrames.last();
     // Room for two PNGs: touching a keeps it when c evicts b.
     const int entryBytes = int(source.sizeInBytes()) + 1;
     ThumbnailCache lru(nullptr, 2 * entryBytes);
@@ -120,7 +128,7 @@ int runMediaPoolThumbsSelftest()
     mediapool::MediaAsset asset;
     asset.filePath = video;
     asset.type = mediapool::MediaType::Video;
-    asset.durationMs = 1000;
+    // Match importToMediaPool: durationMs remains its default of zero.
     pool.addAsset(asset);
     MediaPoolDock dock;
     dock.resize(640, 400);
@@ -131,15 +139,27 @@ int runMediaPoolThumbsSelftest()
     bool g4 = list && dockCache && waitUntil([&] { return list->count() == 1 && !list->item(0)->icon().isNull(); });
     if (g4) {
         const auto frames = dockCache->frames(video);
-        g4 = frames.size() == 8;
+        g4 = frames.size() == 8 && frames.first() != frames.last();
         if (g4) {
             const QRect rect = list->visualItemRect(list->item(0));
             const QPointF pos(rect.right() - 1, rect.center().y());
             QMouseEvent move(QEvent::MouseMove, pos, pos, Qt::NoButton, Qt::NoButton, Qt::NoModifier);
+            const auto requests = dockCache->requestCount();
             QCoreApplication::sendEvent(list->viewport(), &move);
             const auto iconImage = [&] { return list->item(0)->icon().pixmap(frames[0].size()).toImage().convertToFormat(QImage::Format_RGBA8888); };
-            g4 = iconImage() == frames[7];
+            g4 = iconImage() == frames[7] && dockCache->requestCount() == requests;
             QEvent leave(QEvent::Leave);
+            QCoreApplication::sendEvent(list->viewport(), &leave);
+            g4 = g4 && iconImage() == frames[0];
+            // clear() models eviction while the item's existing icon survives.
+            dockCache->clear();
+            QCoreApplication::sendEvent(list->viewport(), &move);
+            QCoreApplication::sendEvent(list->viewport(), &move);
+            g4 = g4 && dockCache->requestCount() == requests + 1;
+            const bool reloaded = waitUntil([&] { return dockCache->frames(video).size() == 8; });
+            g4 = g4 && reloaded;
+            QCoreApplication::sendEvent(list->viewport(), &move);
+            g4 = g4 && iconImage() == frames[7] && dockCache->requestCount() == requests + 1;
             QCoreApplication::sendEvent(list->viewport(), &leave);
             g4 = g4 && iconImage() == frames[0];
         }
