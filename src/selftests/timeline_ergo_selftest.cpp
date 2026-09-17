@@ -376,7 +376,56 @@ int runTimelineErgoSelftest()
                 && left > 0;
         }
         timeline.clearSelection();
-        gate(8, ok && !timeline.zoomToSelection());
+        ok = ok && !timeline.zoomToSelection();
+
+        QVector<ClipInfo> shortClips;
+        for (int i = 0; i < 100; ++i) shortClips.append(clip(0.1));
+        shortClips.append(clip(10.0));
+        timeline.restoreFromProject(QVector<QVector<ClipInfo>>{shortClips},
+                                    QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 100);
+        track = timeline.videoTracks()[0];
+        track->setSelectedClip(100);
+        ok = timeline.zoomToSelection() && ok;
+        const auto drawnSelectionFits = [&](int firstIndex, int lastIndex) {
+            if (!scroll) return false;
+            const int leftPx = scroll->horizontalScrollBar()->value();
+            const int rightPx = track->clipStartX(lastIndex)
+                + qMax(20, static_cast<int>(track->clips()[lastIndex].effectiveDuration()
+                                          * track->pixelsPerSecond()));
+            return track->clipStartX(firstIndex) >= leftPx
+                && rightPx <= leftPx + scroll->viewport()->width();
+        };
+        ok = drawnSelectionFits(100, 100) && ok;
+        // Also exercise zoom reduction when the selected span contains clamps.
+        {
+            const QSignalBlocker blocker(track);
+            for (int i = 80; i < 100; ++i) track->toggleClipSelection(i);
+        }
+        ok = timeline.zoomToSelection() && ok;
+        ok = drawnSelectionFits(80, 100) && ok;
+
+        QVector<ClipInfo> fitClips;
+        for (int i = 0; i < 20; ++i) fitClips.append(clip(2.0));
+        timeline.restoreFromProject(QVector<QVector<ClipInfo>>{fitClips},
+                                    QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 100);
+        track = timeline.videoTracks()[0];
+        timeline.zoomToFitSequence();
+        ok = drawnSelectionFits(0, 19) && ok;
+        ok = ok && scroll && scroll->horizontalScrollBar()->value() == 0;
+
+        // A mixture of clamped and long clips requires correcting the initial
+        // duration-based fit. Audio has the same duration but a wider drawing.
+        fitClips.clear();
+        for (int i = 0; i < 20; ++i) fitClips.append(clip(0.1));
+        fitClips.append(clip(40.0));
+        timeline.restoreFromProject(QVector<QVector<ClipInfo>>{{clip(42.0)}},
+                                    QVector<QVector<ClipInfo>>{fitClips}, 0.0, -1.0, -1.0, 100);
+        timeline.zoomToFitSequence();
+        for (auto *fitTrack : {timeline.videoTracks()[0], timeline.audioTracks()[0]}) {
+            track = fitTrack;
+            ok = drawnSelectionFits(0, track->clipCount() - 1) && ok;
+        }
+        gate(8, ok && scroll && scroll->horizontalScrollBar()->value() == 0);
     }
     {
         double result = 0.0;

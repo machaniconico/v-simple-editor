@@ -8661,6 +8661,35 @@ void Timeline::zoomToFitSequence()
     if (!m_scrollArea || totalDuration() <= 0.0) return;
     clearZoomAnchor();
     setZoomLevel(qMax(1, m_scrollArea->viewport()->width() - 60) / totalDuration());
+    // Short clips occupy at least 20 px, so duration alone can underestimate
+    // the drawn sequence width. Include audio tracks without changing totalDuration().
+    const int available = qMax(1, m_scrollArea->viewport()->width() - 60);
+    for (;;) {
+        double nextZoom = m_zoomLevel;
+        for (auto *track : timelineTracks(this)) {
+            const auto &clips = track->clips();
+            if (clips.isEmpty()) continue;
+            const int end = track->clipStartX(clips.size() - 1)
+                + qMax(20, static_cast<int>(clips.last().effectiveDuration() * m_zoomLevel));
+            if (end <= available) continue;
+            int fixedWidth = 0;
+            double scalableDuration = 0.0;
+            for (const auto &clip : clips) {
+                scalableDuration += qMax(0.0, clip.leadInSec);
+                if (clip.effectiveDuration() * m_zoomLevel < 20.0)
+                    fixedWidth += 20;
+                else
+                    scalableDuration += clip.effectiveDuration();
+            }
+            const double fittingZoom = scalableDuration > 0.0
+                ? (available - fixedWidth) / scalableDuration : 0.02;
+            nextZoom = qMin(nextZoom, qMax(0.02, fittingZoom));
+        }
+        // At the lower bound, sequences with too many 20 px clips can only
+        // be fitted on a best-effort basis.
+        if (nextZoom >= m_zoomLevel) break;
+        setZoomLevel(nextZoom);
+    }
     m_scrollArea->horizontalScrollBar()->setValue(0);
 }
 
@@ -8681,6 +8710,44 @@ bool Timeline::zoomToSelection()
     const double left = qMax(0.0, first - margin);
     clearZoomAnchor();
     setZoomLevel(qMax(1, m_scrollArea->viewport()->width() - 2) / (last + margin - left));
+    const auto selectionBounds = [&]() {
+        int leftPx = std::numeric_limits<int>::max(), rightPx = 0;
+        for (auto *track : timelineTracks(this)) {
+            for (int i : track->selectedClips()) {
+                if (i < 0 || i >= track->clipCount()) continue;
+                const int start = track->clipStartX(i);
+                const int end = start
+                    + qMax(20, static_cast<int>(track->clips()[i].effectiveDuration() * m_zoomLevel));
+                leftPx = qMin(leftPx, start);
+                rightPx = qMax(rightPx, end);
+            }
+        }
+        return qMakePair(leftPx, rightPx);
+    };
+    auto bounds = selectionBounds();
+    const int available = qMax(1, m_scrollArea->viewport()->width() - 2);
+    const int targetWidth = qMax(1, static_cast<int>(available / 1.1));
+    if (bounds.second - bounds.first > available) {
+        double upper = m_zoomLevel;
+        double lower = 0.02;
+        setZoomLevel(lower);
+        bounds = selectionBounds();
+        if (bounds.second - bounds.first <= targetWidth) {
+            // Use the actual drawn span, including intervening minimum-width
+            // clips, to find a fitting zoom with 5% padding on each side.
+            for (int iteration = 0; iteration < 24; ++iteration) {
+                const double candidate = (lower + upper) * 0.5;
+                setZoomLevel(candidate);
+                bounds = selectionBounds();
+                if (bounds.second - bounds.first <= targetWidth)
+                    lower = candidate;
+                else
+                    upper = candidate;
+            }
+        }
+        setZoomLevel(lower);
+        bounds = selectionBounds();
+    }
     if (m_tracksWidget && m_tracksWidget->layout()) m_tracksWidget->layout()->activate();
     if (auto *content = m_scrollArea->widget()) {
         if (content->layout()) content->layout()->activate();
@@ -8688,7 +8755,9 @@ bool Timeline::zoomToSelection()
     }
     QEvent layoutEvent(QEvent::LayoutRequest);
     QCoreApplication::sendEvent(m_scrollArea, &layoutEvent);
-    m_scrollArea->horizontalScrollBar()->setValue(static_cast<int>(left * m_zoomLevel));
+    const int padding = qMin(static_cast<int>((bounds.second - bounds.first) * 0.05),
+                             qMax(0, (available - (bounds.second - bounds.first)) / 2));
+    m_scrollArea->horizontalScrollBar()->setValue(qMax(0, bounds.first - padding));
     return true;
 }
 
