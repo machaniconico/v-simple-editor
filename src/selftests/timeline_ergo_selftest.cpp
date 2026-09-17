@@ -425,6 +425,44 @@ int runTimelineErgoSelftest()
             track = fitTrack;
             ok = drawnSelectionFits(0, track->clipCount() - 1) && ok;
         }
+        ok = ok && scroll && scroll->horizontalScrollBar()->value() == 0;
+
+        // Across tracks the drawn span can shrink as pps increases, because
+        // V1's 100 short clips clamp while V2's long leading clip scales.
+        timeline.resize(700, 400);
+        QApplication::processEvents();
+        shortClips.clear();
+        for (int i = 0; i < 100; ++i) shortClips.append(clip(0.1));
+        shortClips.append(clip(1.0));
+        timeline.restoreFromProject(
+            QVector<QVector<ClipInfo>>{shortClips, {clip(100.0), clip(1.0)}},
+            QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 100);
+        for (int row = 0; row < 2; ++row) {
+            track = timeline.videoTracks()[row];
+            const QSignalBlocker blocker(track);
+            track->toggleClipSelection(row == 0 ? 100 : 1);
+        }
+        ok = timeline.zoomToSelection() && ok;
+        QApplication::processEvents();
+        for (int row = 0; row < 2; ++row) {
+            track = timeline.videoTracks()[row];
+            const int index = row == 0 ? 100 : 1;
+            ok = drawnSelectionFits(index, index) && ok;
+        }
+
+        // Seventy minimum-width clips cannot fit: retain a useful time scale
+        // and scroll to the first selection instead of collapsing to 0.02 pps.
+        shortClips.clear();
+        for (int i = 0; i < 70; ++i) shortClips.append(clip(0.5));
+        timeline.restoreFromProject(QVector<QVector<ClipInfo>>{shortClips},
+                                    QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 100);
+        track = timeline.videoTracks()[0];
+        timeline.selectAllClips();
+        ok = timeline.zoomToSelection() && ok;
+        QApplication::processEvents();
+        ok = ok && track->pixelsPerSecond() > 1.0 && scroll
+            && scroll->horizontalScrollBar()->value() == 0
+            && track->clipStartX(0) >= scroll->horizontalScrollBar()->value();
         gate(8, ok && scroll && scroll->horizontalScrollBar()->value() == 0);
     }
     {

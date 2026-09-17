@@ -8708,46 +8708,56 @@ bool Timeline::zoomToSelection()
     if (last <= first || !m_scrollArea) return false;
     const double margin = (last - first) * 0.05;
     const double left = qMax(0.0, first - margin);
-    clearZoomAnchor();
-    setZoomLevel(qMax(1, m_scrollArea->viewport()->width() - 2) / (last + margin - left));
-    const auto selectionBounds = [&]() {
+    const int available = qMax(1, m_scrollArea->viewport()->width() - 2);
+    const int targetWidth = qMax(1, static_cast<int>(available / 1.1));
+    const double initialZoom = qBound(0.02, available / (last + margin - left), 200.0);
+    const auto tracks = timelineTracks(this);
+    // Match clipStartX and the painted width without mutating zoom or layout.
+    const auto boundsAt = [&](double pps) {
         int leftPx = std::numeric_limits<int>::max(), rightPx = 0;
-        for (auto *track : timelineTracks(this)) {
-            for (int i : track->selectedClips()) {
-                if (i < 0 || i >= track->clipCount()) continue;
-                const int start = track->clipStartX(i);
-                const int end = start
-                    + qMax(20, static_cast<int>(track->clips()[i].effectiveDuration() * m_zoomLevel));
-                leftPx = qMin(leftPx, start);
-                rightPx = qMax(rightPx, end);
+        for (auto *track : tracks) {
+            int x = 0;
+            const auto &clips = track->clips();
+            for (int i = 0; i < clips.size(); ++i) {
+                x += qMax(0, static_cast<int>(clips[i].leadInSec * pps));
+                const int width = qMax(20, static_cast<int>(clips[i].effectiveDuration() * pps));
+                if (track->isClipSelected(i)) {
+                    leftPx = qMin(leftPx, x);
+                    rightPx = qMax(rightPx, x + width);
+                }
+                x += width;
             }
         }
         return qMakePair(leftPx, rightPx);
     };
-    auto bounds = selectionBounds();
-    const int available = qMax(1, m_scrollArea->viewport()->width() - 2);
-    const int targetWidth = qMax(1, static_cast<int>(available / 1.1));
-    if (bounds.second - bounds.first > available) {
-        double upper = m_zoomLevel;
-        double lower = 0.02;
-        setZoomLevel(lower);
-        bounds = selectionBounds();
-        if (bounds.second - bounds.first <= targetWidth) {
-            // Use the actual drawn span, including intervening minimum-width
-            // clips, to find a fitting zoom with 5% padding on each side.
-            for (int iteration = 0; iteration < 24; ++iteration) {
-                const double candidate = (lower + upper) * 0.5;
-                setZoomLevel(candidate);
-                bounds = selectionBounds();
-                if (bounds.second - bounds.first <= targetWidth)
-                    lower = candidate;
+    const auto fitsAt = [&](double pps) {
+        const auto bounds = boundsAt(pps);
+        return bounds.second - bounds.first <= targetWidth;
+    };
+    double fittingZoom = initialZoom;
+    double upper = 200.0;
+    // Different tracks accumulate different minimum-width clips: the span is
+    // not monotonic in pps. Scan the whole range, including its lower endpoint.
+    for (double candidate = 200.0;; candidate = qMax(0.02, candidate * 0.95)) {
+        if (fitsAt(candidate)) {
+            double lower = candidate;
+            for (int iteration = 0; iteration < 10; ++iteration) {
+                const double midpoint = (lower + upper) * 0.5;
+                if (fitsAt(midpoint))
+                    lower = midpoint;
                 else
-                    upper = candidate;
+                    upper = midpoint;
             }
+            fittingZoom = lower; // Always retain a value verified to fit.
+            break;
         }
-        setZoomLevel(lower);
-        bounds = selectionBounds();
+        if (candidate <= 0.02) break;
+        upper = candidate;
     }
+    // If minimum widths prevent fitting, keep the duration-based best effort.
+    clearZoomAnchor();
+    setZoomLevel(fittingZoom);
+    const auto bounds = boundsAt(m_zoomLevel);
     if (m_tracksWidget && m_tracksWidget->layout()) m_tracksWidget->layout()->activate();
     if (auto *content = m_scrollArea->widget()) {
         if (content->layout()) content->layout()->activate();
