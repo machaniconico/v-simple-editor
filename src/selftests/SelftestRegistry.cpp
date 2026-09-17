@@ -142,6 +142,7 @@ int runMatte16ParitySelftest();
 int runMediaPoolDragSelftest();
 int runMediaPoolRatingSelftest();
 int runMediaPoolSelftest();
+int runMediaPoolThumbsSelftest();
 int runMediaRelinkSelftest();
 int runMobileSelftest();
 int runMographSelftest();
@@ -543,6 +544,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Premiere XML (FCP7) exporter stub (Phase 6 Wave 1 FOUNDATION, filled in US-6E-3: 4 gate combined / individual / multi-sequence / DOCTYPE)" },
     { "youtube-chapter",   "VEDITOR_YOUTUBE_CHAPTER_SELFTEST",    runYoutubeChapterSelftest,     false,
       "YouTube chapter generator stub (Phase 6 Wave 1 FOUNDATION, filled in US-6F-3: 3 gate M:SS / H:MM:SS / intro auto-insert)" },
+    { "media-pool-thumbs", "VEDITOR_MEDIA_POOL_THUMBS_SELFTEST", runMediaPoolThumbsSelftest, true,
+      "Media pool asynchronous thumbnails, RGBA frame grab and hover skimming" },
     { "media-pool-rating", "VEDITOR_MEDIA_POOL_RATING_SELFTEST", runMediaPoolRatingSelftest, false,
       "MediaPool ratings: JSON defaults/round-trip, filters, rename and search" },
     { "media-pool",        "VEDITOR_MEDIA_POOL_SELFTEST",         runMediaPoolSelftest,          false,

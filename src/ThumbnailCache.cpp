@@ -1,0 +1,89 @@
+#include "ThumbnailCache.h"
+#include "libavcore/FrameGrab.h"
+#include <QFutureWatcher>
+#include <QtConcurrent/QtConcurrentRun>
+#include <cmath>
+
+ThumbnailCache::ThumbnailCache(QObject *parent, int maxBytes)
+    : QObject(parent), m_cache(qMax(0, maxBytes)),
+      m_cancel(std::make_shared<std::atomic_bool>(false))
+{
+}
+
+ThumbnailCache::~ThumbnailCache()
+{
+    m_cancel->store(true);
+}
+
+int ThumbnailCache::skimIndex(double x, double width, int count)
+{
+    if (count <= 1 || width <= 0 || !std::isfinite(width) || !std::isfinite(x))
+        return 0;
+    return static_cast<int>(qBound(0.0, x / width * count, double(count - 1)));
+}
+
+QVector<QImage> ThumbnailCache::frames(const QString &key)
+{
+    const auto *value = m_cache.object(key); // QCache access updates LRU order.
+    return value ? *value : QVector<QImage>();
+}
+
+void ThumbnailCache::request(const QString &key, const QString &filePath,
+                             double durationSec, int count, QSize size)
+{
+    if (key.isEmpty() || filePath.isEmpty() || m_pending.contains(key) || m_cache.contains(key))
+        return;
+    ++m_requestCount;
+    m_pending.insert(key);
+    m_queue.enqueue({key, filePath, std::isfinite(durationSec) ? qMax(0.0, durationSec) : 0.0,
+                     qBound(1, count, 256), size.isValid() && !size.isEmpty() ? size : QSize(128, 72)});
+    startNext();
+}
+
+void ThumbnailCache::clear()
+{
+    m_cancel->store(true);
+    m_cancel = std::make_shared<std::atomic_bool>(false);
+    m_queue.clear();
+    m_pending.clear();
+    m_cache.clear();
+    // Cancelled workers still occupy slots until finished: never exceed two.
+}
+
+void ThumbnailCache::startNext()
+{
+    while (m_active < 2 && !m_queue.isEmpty()) {
+        const Request request = m_queue.dequeue();
+        const auto cancel = m_cancel;
+        ++m_active;
+        auto *watcher = new QFutureWatcher<QVector<QImage>>(this);
+        connect(watcher, &QFutureWatcher<QVector<QImage>>::finished, this,
+                [this, watcher, request, cancel] {
+            const auto result = watcher->result();
+            watcher->deleteLater();
+            --m_active;
+            if (!cancel->load()) {
+                m_pending.remove(request.key);
+                qint64 bytes = 1; // Also cache failed/unsupported sources.
+                for (const auto &frame : result)
+                    bytes += frame.sizeInBytes();
+                if (bytes <= m_cache.maxCost())
+                    m_cache.insert(request.key, new QVector<QImage>(result), static_cast<int>(bytes));
+                emit ready(request.key, result);
+            }
+            startNext();
+        });
+        watcher->setFuture(QtConcurrent::run([request, cancel] {
+            QVector<QImage> result;
+            const int count = libavcore::isStillImage(request.path) ? 1 : request.count;
+            for (int i = 0; i < count && !cancel->load(); ++i) {
+                QImage image = libavcore::grabFrameAt(request.path,
+                    request.duration * i / count, request.size);
+                if (image.isNull())
+                    return QVector<QImage>();
+                result.append(image);
+            }
+            return cancel->load() ? QVector<QImage>() : result;
+        }));
+    }
+}

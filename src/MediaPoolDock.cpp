@@ -1,4 +1,9 @@
 #include "MediaPoolDock.h"
+#include "ThumbnailCache.h"
+#include <QSettings>
+#include <QMouseEvent>
+#include <QPixmap>
+#include <QIcon>
 
 #include <QAbstractItemView>
 #include <QWidget>
@@ -114,13 +119,27 @@ MediaPoolDock::MediaPoolDock(QWidget *parent)
     m_assetList->setViewMode(QListView::IconMode);
     m_assetList->setResizeMode(QListView::Adjust);
     m_assetList->setMovement(QListView::Static);
-    m_assetList->setIconSize(QSize(64, 64));
-    m_assetList->setGridSize(QSize(96, 96));
+    m_assetList->setIconSize(QSize(96, 54));
+    m_assetList->setGridSize(QSize(112, 96));
     m_assetList->setWordWrap(true);
     m_assetList->setSelectionMode(QAbstractItemView::ExtendedSelection);
     m_assetList->setDragEnabled(true);
     m_assetList->setDragDropMode(QAbstractItemView::DragOnly);
     m_assetList->setDefaultDropAction(Qt::CopyAction);
+
+    m_thumbnailsEnabled = QSettings().value(QStringLiteral("mediaPool/showThumbnails"), true).toBool();
+    m_thumbnailCache = new ThumbnailCache(this);
+    m_assetList->viewport()->setMouseTracking(true);
+    m_assetList->viewport()->installEventFilter(this);
+    connect(m_thumbnailCache, &ThumbnailCache::ready, this,
+            [this](const QString &key, const QVector<QImage> &frames) {
+        if (!m_thumbnailsEnabled || frames.isEmpty()) return;
+        for (int i = 0; i < m_assetList->count(); ++i) {
+            auto *item = m_assetList->item(i);
+            if (item->data(kAssetPathRole).toString() == key)
+                item->setIcon(QIcon(QPixmap::fromImage(frames.first())));
+        }
+    });
 
     splitter->addWidget(m_binTree);
     splitter->addWidget(m_assetList);
@@ -171,6 +190,8 @@ MediaPoolDock::MediaPoolDock(QWidget *parent)
 
 void MediaPoolDock::setPool(mediapool::MediaPool *pool)
 {
+    m_hoverItem = nullptr;
+    m_thumbnailCache->clear();
     m_pool = pool;
     refresh();
 }
@@ -241,6 +262,7 @@ void MediaPoolDock::addBinItems(QTreeWidgetItem *parentItem, const QString &pare
 void MediaPoolDock::showAssetsForCurrentBin()
 {
     if (!m_pool) {
+        m_hoverItem = nullptr;
         m_assetList->clear();
         return;
     }
@@ -260,6 +282,7 @@ void MediaPoolDock::showAssetsForCurrentBin()
 
 void MediaPoolDock::showAssets(const QVector<mediapool::MediaAsset> &assets)
 {
+    m_hoverItem = nullptr;
     m_assetList->clear();
     for (const mediapool::MediaAsset &asset : assets) {
         QString label =
@@ -275,6 +298,10 @@ void MediaPoolDock::showAssets(const QVector<mediapool::MediaAsset> &assets)
         item->setData(kAssetIdRole, asset.id);
         item->setData(kAssetPathRole, asset.filePath);
         item->setToolTip(asset.filePath);
+        if (m_thumbnailsEnabled && asset.type != mediapool::MediaType::Audio) {
+            setThumbnail(item);
+            m_thumbnailCache->request(asset.filePath, asset.filePath, asset.durationMs / 1000.0);
+        }
     }
 }
 
@@ -482,4 +509,45 @@ void MediaPoolDock::showBinContextMenu(const QPoint &pos)
         emit poolChanged();
         refresh();
     }
+}
+
+void MediaPoolDock::setThumbnailsEnabled(bool enabled)
+{
+    QSettings().setValue(QStringLiteral("mediaPool/showThumbnails"), enabled);
+    if (m_thumbnailsEnabled == enabled) return;
+    m_thumbnailsEnabled = enabled;
+    m_hoverItem = nullptr;
+    m_thumbnailCache->clear();
+    showAssetsForCurrentBin();
+}
+
+void MediaPoolDock::setThumbnail(QListWidgetItem *item, int index)
+{
+    if (!m_thumbnailsEnabled || !item) return;
+    const auto frames = m_thumbnailCache->frames(item->data(kAssetPathRole).toString());
+    if (!frames.isEmpty())
+        item->setIcon(QIcon(QPixmap::fromImage(frames[qBound(0, index, int(frames.size()) - 1)])));
+}
+
+bool MediaPoolDock::eventFilter(QObject *watched, QEvent *event)
+{
+    if (watched == m_assetList->viewport() && m_thumbnailsEnabled) {
+        if (event->type() == QEvent::MouseMove) {
+            const auto pos = static_cast<QMouseEvent *>(event)->position().toPoint();
+            auto *item = m_assetList->itemAt(pos);
+            if (m_hoverItem != item) {
+                setThumbnail(m_hoverItem);
+                m_hoverItem = item;
+            }
+            if (item) {
+                const auto frames = m_thumbnailCache->frames(item->data(kAssetPathRole).toString());
+                const QRect rect = m_assetList->visualItemRect(item);
+                setThumbnail(item, ThumbnailCache::skimIndex(pos.x() - rect.x(), rect.width(), int(frames.size())));
+            }
+        } else if (event->type() == QEvent::Leave) {
+            setThumbnail(m_hoverItem);
+            m_hoverItem = nullptr;
+        }
+    }
+    return QDockWidget::eventFilter(watched, event);
 }

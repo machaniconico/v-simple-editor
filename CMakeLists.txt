@@ -57,6 +57,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/libavcore/Encode.cpp
     src/libavcore/Concat.h
     src/libavcore/Concat.cpp
+    src/libavcore/FrameGrab.h
+    src/libavcore/FrameGrab.cpp
     src/libavcore/Decode.h
     src/libavcore/Decode.cpp
     src/libavcore/VideoFilterGraph.h
@@ -271,6 +273,9 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/MediaPool.h
     src/MediaPool.cpp
     src/MediaPoolDock.cpp
+    src/ThumbnailCache.h
+    src/ThumbnailCache.cpp
+    src/selftests/media_pool_thumbs_selftest.cpp
     # SM (ソースモニター3点編集): 純粋エンジン + ドック (SM-2 で本体実装)。
     src/ThreePointEdit.h
     src/ThreePointEdit.cpp

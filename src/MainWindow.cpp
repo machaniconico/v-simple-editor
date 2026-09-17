@@ -1,3 +1,4 @@
+#include "libavcore/FrameGrab.h"
 #include "RenderInPlace.h"
 #include "MainWindow.h"
 #include "VideoPlayer.h"
@@ -2305,106 +2306,9 @@ playback::AutoProxyClip probeAutoProxyClipMetadata(const QString &filePath)
     return clip;
 }
 
-bool scaleFrameToQImagePadded(SwsContext *ctx,
-                              const AVFrame *frame,
-                              AVPixelFormat dstPixFmt,
-                              QImage &image)
-{
-    if (!ctx || !frame || image.isNull())
-        return false;
-
-    const int rowBytes = av_image_get_linesize(dstPixFmt, image.width(), 0);
-    if (rowBytes <= 0 || rowBytes > image.bytesPerLine())
-        return false;
-
-    uint8_t *tmpData[4] = { nullptr, nullptr, nullptr, nullptr };
-    int tmpStride[4] = { 0, 0, 0, 0 };
-    if (av_image_alloc(tmpData, tmpStride, image.width(), image.height(),
-                       dstPixFmt, 64) < 0)
-        return false;
-
-    sws_scale(ctx, frame->data, frame->linesize, 0, frame->height,
-              tmpData, tmpStride);
-    for (int y = 0; y < image.height(); ++y) {
-        std::memcpy(image.scanLine(y), tmpData[0] + y * tmpStride[0],
-                    static_cast<std::size_t>(rowBytes));
-    }
-    av_freep(&tmpData[0]);
-    return true;
-}
-
-QImage avFrameToQImage(const AVFrame *frame, AVCodecContext *decCtx)
-{
-    if (!frame || !decCtx)
-        return {};
-
-    SwsContext *toRgbCtx = sws_getContext(frame->width, frame->height, decCtx->pix_fmt,
-                                          frame->width, frame->height, AV_PIX_FMT_RGBA,
-                                          SWS_BILINEAR, nullptr, nullptr, nullptr);
-    if (!toRgbCtx)
-        return {};
-
-    QImage image(frame->width, frame->height, QImage::Format_RGBA8888);
-    if (!scaleFrameToQImagePadded(toRgbCtx, frame, AV_PIX_FMT_RGBA, image)) {
-        sws_freeContext(toRgbCtx);
-        return {};
-    }
-    sws_freeContext(toRgbCtx);
-    return image;
-}
-
 QImage decodeFrameAtSecondsFromFile(const QString &filePath, double sourceTimeSeconds)
 {
-    AVFormatContext *fmtCtx = nullptr;
-    AVCodecContext *decCtx = nullptr;
-    int streamIndex = -1;
-    if (!openVideoDecoder(filePath, &fmtCtx, &decCtx, &streamIndex))
-        return {};
-
-    AVStream *stream = fmtCtx->streams[streamIndex];
-    const double targetSeconds = qMax(0.0, sourceTimeSeconds);
-    const int64_t seekTarget = av_rescale_q(
-        static_cast<int64_t>(targetSeconds * AV_TIME_BASE),
-        AVRational{1, AV_TIME_BASE},
-        stream->time_base);
-    av_seek_frame(fmtCtx, streamIndex, seekTarget, AVSEEK_FLAG_BACKWARD);
-    avcodec_flush_buffers(decCtx);
-
-    AVPacket *packet = av_packet_alloc();
-    AVFrame *frame = av_frame_alloc();
-    QImage result;
-
-    while (av_read_frame(fmtCtx, packet) >= 0) {
-        if (packet->stream_index != streamIndex) {
-            av_packet_unref(packet);
-            continue;
-        }
-        if (avcodec_send_packet(decCtx, packet) < 0) {
-            av_packet_unref(packet);
-            continue;
-        }
-        av_packet_unref(packet);
-
-        while (avcodec_receive_frame(decCtx, frame) == 0) {
-            const int64_t pts = (frame->best_effort_timestamp != AV_NOPTS_VALUE)
-                ? frame->best_effort_timestamp
-                : frame->pts;
-            const double frameSeconds = (pts != AV_NOPTS_VALUE)
-                ? pts * av_q2d(stream->time_base)
-                : targetSeconds;
-            result = avFrameToQImage(frame, decCtx);
-            if (result.isNull() || frameSeconds + 1.0 / 120.0 < targetSeconds)
-                continue;
-            goto decode_done;
-        }
-    }
-
-decode_done:
-    av_frame_free(&frame);
-    av_packet_free(&packet);
-    avcodec_free_context(&decCtx);
-    avformat_close_input(&fmtCtx);
-    return result;
+    return libavcore::grabFrameAt(filePath, sourceTimeSeconds);
 }
 
 QImage combineMasksMax(const QImage &a, const QImage &b)
@@ -7450,6 +7354,10 @@ void MainWindow::setupMenuBar()
 
     // MP-5: メディアプール ドックの表示トグル
     if (m_mediaPoolDock) {
+        auto *thumbsAction = viewMenu->addAction(QStringLiteral("メディアプールのサムネイルを表示"));
+        thumbsAction->setCheckable(true);
+        thumbsAction->setChecked(m_mediaPoolDock->thumbnailsEnabled());
+        connect(thumbsAction, &QAction::toggled, m_mediaPoolDock, &MediaPoolDock::setThumbnailsEnabled);
         auto *mediaPoolAction = viewMenu->addAction("メディアプール");
         mediaPoolAction->setCheckable(true);
         mediaPoolAction->setChecked(m_mediaPoolDock->isVisible());
