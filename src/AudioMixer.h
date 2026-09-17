@@ -198,6 +198,8 @@ public:
     void processTrackFxForTest(int trackId, int16_t *samples, int frames);
     // Per-thread snapshot, valid until the next trackChain call on this thread.
     const trackfx::Chain &trackChain(int trackId) const;
+    void setTrackChain(int trackId, const trackfx::Chain &chain);
+    void clearTrackFx();
 
     trackfx::Chain masterChain() const;
     void setMasterEq(const EqSettings &eq, bool enabled = true);

@@ -84,6 +84,160 @@ EqBandCoefsParam computeEqBand(const EqBand &band,
 }
 } // namespace
 
+// Persist stage gates separately from settings.enabled, including dormant settings.
+QJsonObject Chain::toJson() const
+{
+    const Chain defaults;
+    QJsonObject object;
+    if (nrEnabled != defaults.nrEnabled) object["nrEnabled"] = nrEnabled;
+    if (eqEnabled != defaults.eqEnabled) object["eqEnabled"] = eqEnabled;
+    if (compEnabled != defaults.compEnabled) object["compEnabled"] = compEnabled;
+    if (reverbEnabled != defaults.reverbEnabled) object["reverbEnabled"] = reverbEnabled;
+    QJsonObject eqObject;
+    {
+        QJsonObject stage;
+        if (eq.low.freq != defaults.eq.low.freq) stage["freq"] = eq.low.freq;
+        if (eq.low.gainDb != defaults.eq.low.gainDb) stage["gainDb"] = eq.low.gainDb;
+        if (eq.low.q != defaults.eq.low.q) stage["q"] = eq.low.q;
+        if (eq.low.enabled != defaults.eq.low.enabled) stage["enabled"] = eq.low.enabled;
+        if (!stage.isEmpty()) eqObject["low"] = stage;
+    }
+    {
+        QJsonObject stage;
+        if (eq.lowMid.freq != defaults.eq.lowMid.freq) stage["freq"] = eq.lowMid.freq;
+        if (eq.lowMid.gainDb != defaults.eq.lowMid.gainDb) stage["gainDb"] = eq.lowMid.gainDb;
+        if (eq.lowMid.q != defaults.eq.lowMid.q) stage["q"] = eq.lowMid.q;
+        if (eq.lowMid.enabled != defaults.eq.lowMid.enabled) stage["enabled"] = eq.lowMid.enabled;
+        if (!stage.isEmpty()) eqObject["lowMid"] = stage;
+    }
+    {
+        QJsonObject stage;
+        if (eq.highMid.freq != defaults.eq.highMid.freq) stage["freq"] = eq.highMid.freq;
+        if (eq.highMid.gainDb != defaults.eq.highMid.gainDb) stage["gainDb"] = eq.highMid.gainDb;
+        if (eq.highMid.q != defaults.eq.highMid.q) stage["q"] = eq.highMid.q;
+        if (eq.highMid.enabled != defaults.eq.highMid.enabled) stage["enabled"] = eq.highMid.enabled;
+        if (!stage.isEmpty()) eqObject["highMid"] = stage;
+    }
+    {
+        QJsonObject stage;
+        if (eq.high.freq != defaults.eq.high.freq) stage["freq"] = eq.high.freq;
+        if (eq.high.gainDb != defaults.eq.high.gainDb) stage["gainDb"] = eq.high.gainDb;
+        if (eq.high.q != defaults.eq.high.q) stage["q"] = eq.high.q;
+        if (eq.high.enabled != defaults.eq.high.enabled) stage["enabled"] = eq.high.enabled;
+        if (!stage.isEmpty()) eqObject["high"] = stage;
+    }
+    {
+        QJsonObject stage;
+        if (comp.thresholdDb != defaults.comp.thresholdDb) stage["thresholdDb"] = comp.thresholdDb;
+        if (comp.ratio != defaults.comp.ratio) stage["ratio"] = comp.ratio;
+        if (comp.attackMs != defaults.comp.attackMs) stage["attackMs"] = comp.attackMs;
+        if (comp.releaseMs != defaults.comp.releaseMs) stage["releaseMs"] = comp.releaseMs;
+        if (comp.kneeDb != defaults.comp.kneeDb) stage["kneeDb"] = comp.kneeDb;
+        if (comp.makeupDb != defaults.comp.makeupDb) stage["makeupDb"] = comp.makeupDb;
+        if (comp.enabled != defaults.comp.enabled) stage["enabled"] = comp.enabled;
+        if (!stage.isEmpty()) object["comp"] = stage;
+    }
+    {
+        QJsonObject stage;
+        if (reverb.mixRatio != defaults.reverb.mixRatio) stage["mixRatio"] = reverb.mixRatio;
+        if (reverb.decaySeconds != defaults.reverb.decaySeconds) stage["decaySeconds"] = reverb.decaySeconds;
+        if (reverb.preDelayMs != defaults.reverb.preDelayMs) stage["preDelayMs"] = reverb.preDelayMs;
+        if (reverb.dampingHF != defaults.reverb.dampingHF) stage["dampingHF"] = reverb.dampingHF;
+        if (reverb.widthPercent != defaults.reverb.widthPercent) stage["widthPercent"] = reverb.widthPercent;
+        if (reverb.enabled != defaults.reverb.enabled) stage["enabled"] = reverb.enabled;
+        if (!stage.isEmpty()) object["reverb"] = stage;
+    }
+    {
+        QJsonObject stage;
+        if (nr.thresholdDb != defaults.nr.thresholdDb) stage["thresholdDb"] = nr.thresholdDb;
+        if (nr.reductionDb != defaults.nr.reductionDb) stage["reductionDb"] = nr.reductionDb;
+        if (nr.attackMs != defaults.nr.attackMs) stage["attackMs"] = nr.attackMs;
+        if (nr.releaseMs != defaults.nr.releaseMs) stage["releaseMs"] = nr.releaseMs;
+        if (nr.manualFloorDb != defaults.nr.manualFloorDb) stage["manualFloorDb"] = nr.manualFloorDb;
+        if (nr.autoFloor != defaults.nr.autoFloor) stage["autoFloor"] = nr.autoFloor;
+        if (nr.enabled != defaults.nr.enabled) stage["enabled"] = nr.enabled;
+        if (!stage.isEmpty()) object["nr"] = stage;
+    }
+    if (!eqObject.isEmpty()) object["eq"] = eqObject;
+    return object;
+}
+
+bool Chain::isDefault() const
+{
+    return toJson().isEmpty();
+}
+
+Chain Chain::fromJson(const QJsonObject &object)
+{
+    Chain chain;
+    const auto number = [](const QJsonValue &value, double fallback, double low, double high) {
+        const double result = value.toDouble(fallback);
+        return std::isfinite(result) ? std::clamp(result, low, high) : fallback;
+    };
+    chain.nrEnabled = object["nrEnabled"].toBool(chain.nrEnabled);
+    chain.eqEnabled = object["eqEnabled"].toBool(chain.eqEnabled);
+    chain.compEnabled = object["compEnabled"].toBool(chain.compEnabled);
+    chain.reverbEnabled = object["reverbEnabled"].toBool(chain.reverbEnabled);
+    {
+        const QJsonObject stage = object["eq"].toObject()["low"].toObject();
+        chain.eq.low.freq = number(stage["freq"], chain.eq.low.freq, 20.0, 20000.0);
+        chain.eq.low.gainDb = number(stage["gainDb"], chain.eq.low.gainDb, -24.0, 24.0);
+        chain.eq.low.q = number(stage["q"], chain.eq.low.q, 0.1, 10.0);
+        chain.eq.low.enabled = stage["enabled"].toBool(chain.eq.low.enabled);
+    }
+    {
+        const QJsonObject stage = object["eq"].toObject()["lowMid"].toObject();
+        chain.eq.lowMid.freq = number(stage["freq"], chain.eq.lowMid.freq, 20.0, 20000.0);
+        chain.eq.lowMid.gainDb = number(stage["gainDb"], chain.eq.lowMid.gainDb, -24.0, 24.0);
+        chain.eq.lowMid.q = number(stage["q"], chain.eq.lowMid.q, 0.1, 10.0);
+        chain.eq.lowMid.enabled = stage["enabled"].toBool(chain.eq.lowMid.enabled);
+    }
+    {
+        const QJsonObject stage = object["eq"].toObject()["highMid"].toObject();
+        chain.eq.highMid.freq = number(stage["freq"], chain.eq.highMid.freq, 20.0, 20000.0);
+        chain.eq.highMid.gainDb = number(stage["gainDb"], chain.eq.highMid.gainDb, -24.0, 24.0);
+        chain.eq.highMid.q = number(stage["q"], chain.eq.highMid.q, 0.1, 10.0);
+        chain.eq.highMid.enabled = stage["enabled"].toBool(chain.eq.highMid.enabled);
+    }
+    {
+        const QJsonObject stage = object["eq"].toObject()["high"].toObject();
+        chain.eq.high.freq = number(stage["freq"], chain.eq.high.freq, 20.0, 20000.0);
+        chain.eq.high.gainDb = number(stage["gainDb"], chain.eq.high.gainDb, -24.0, 24.0);
+        chain.eq.high.q = number(stage["q"], chain.eq.high.q, 0.1, 10.0);
+        chain.eq.high.enabled = stage["enabled"].toBool(chain.eq.high.enabled);
+    }
+    {
+        const QJsonObject stage = object["comp"].toObject();
+        chain.comp.thresholdDb = number(stage["thresholdDb"], chain.comp.thresholdDb, -60.0, 0.0);
+        chain.comp.ratio = number(stage["ratio"], chain.comp.ratio, 1.0, 50.0);
+        chain.comp.attackMs = number(stage["attackMs"], chain.comp.attackMs, 0.1, 100.0);
+        chain.comp.releaseMs = number(stage["releaseMs"], chain.comp.releaseMs, 10.0, 1000.0);
+        chain.comp.kneeDb = number(stage["kneeDb"], chain.comp.kneeDb, 0.0, 10.0);
+        chain.comp.makeupDb = number(stage["makeupDb"], chain.comp.makeupDb, 0.0, 24.0);
+        chain.comp.enabled = stage["enabled"].toBool(chain.comp.enabled);
+    }
+    {
+        const QJsonObject stage = object["reverb"].toObject();
+        chain.reverb.mixRatio = number(stage["mixRatio"], chain.reverb.mixRatio, 0.0, 1.0);
+        chain.reverb.decaySeconds = number(stage["decaySeconds"], chain.reverb.decaySeconds, 0.1, 5.0);
+        chain.reverb.preDelayMs = number(stage["preDelayMs"], chain.reverb.preDelayMs, 0.0, 200.0);
+        chain.reverb.dampingHF = number(stage["dampingHF"], chain.reverb.dampingHF, 0.0, 100.0);
+        chain.reverb.widthPercent = number(stage["widthPercent"], chain.reverb.widthPercent, 0.0, 100.0);
+        chain.reverb.enabled = stage["enabled"].toBool(chain.reverb.enabled);
+    }
+    {
+        const QJsonObject stage = object["nr"].toObject();
+        chain.nr.thresholdDb = number(stage["thresholdDb"], chain.nr.thresholdDb, -60.0, 0.0);
+        chain.nr.reductionDb = number(stage["reductionDb"], chain.nr.reductionDb, 0.0, 40.0);
+        chain.nr.attackMs = number(stage["attackMs"], chain.nr.attackMs, 0.1, 50.0);
+        chain.nr.releaseMs = number(stage["releaseMs"], chain.nr.releaseMs, 10.0, 1000.0);
+        chain.nr.manualFloorDb = number(stage["manualFloorDb"], chain.nr.manualFloorDb, -80.0, -30.0);
+        chain.nr.autoFloor = stage["autoFloor"].toBool(chain.nr.autoFloor);
+        chain.nr.enabled = stage["enabled"].toBool(chain.nr.enabled);
+    }
+    return chain;
+}
+
 Processor::Processor() : Processor(Chain{}, 48000, 2) {}
 Processor::Processor(const Chain &chain, int sampleRate, int channels)
     : m_sampleRate(sampleRate), m_channels(channels)

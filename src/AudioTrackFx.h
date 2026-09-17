@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QVector>
+#include <QJsonObject>
 #include <array>
 #include <cstdint>
 
@@ -75,6 +76,10 @@ struct Chain {
     bool eqEnabled = false;
     bool compEnabled = false;
     bool reverbEnabled = false;
+
+    QJsonObject toJson() const;
+    static Chain fromJson(const QJsonObject &object);
+    bool isDefault() const;
 };
 
 // Normalized interleaved float input/output. Active stages deliberately retain

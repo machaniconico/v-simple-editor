@@ -2439,6 +2439,53 @@ void AudioMixer::MasterEqFilter::process(int32_t *samples, int frames)
         }
 }
 
+void AudioMixer::clearTrackFx()
+{
+    QMutexLocker lock(&m_controlMutex);
+    m_trackFxChains.clear();
+    m_trackFxProcessors.clear();
+    m_masterFxChain = trackfx::Chain{};
+    m_masterEqFilter.setEq(EqSettings{});
+    m_masterEqFilter.reset();
+    m_trackEq.clear();
+    m_trackEqCoefs.clear();
+    m_trackEqHist.clear();
+    m_trackComp.clear();
+    m_trackCompState.clear();
+    m_trackReverb.clear();
+    m_trackReverbState.clear();
+    m_trackNoiseReduction.clear();
+    m_trackNoiseReductionState.clear();
+    for (auto &state : m_trackStates) {
+        state.eq = AudioEQConfig{};
+        state.eqEnabled = false;
+        state.eqCoeffs = {};
+        state.z = {};
+        state.eqCache = {};
+    }
+}
+
+void AudioMixer::setTrackChain(int trackId, const trackfx::Chain &chain)
+{
+    if (trackId < 0 || trackId >= kMaxAudioTracks) return;
+    // Restore both independent enable layers atomically. Panel setters infer
+    // gates from settings and would lose disabled-but-configured stages.
+    const auto restored = trackfx::Chain::fromJson(chain.toJson());
+    std::array<EqBandCoefsParam, 4> coefs{};
+    coefs[0] = computeEqBand(restored.eq.low, 0, kSampleRateHz);
+    coefs[1] = computeEqBand(restored.eq.lowMid, 1, kSampleRateHz);
+    coefs[2] = computeEqBand(restored.eq.highMid, 2, kSampleRateHz);
+    coefs[3] = computeEqBand(restored.eq.high, 3, kSampleRateHz);
+    QMutexLocker lock(&m_controlMutex);
+    m_trackFxChains[trackId] = restored;
+    m_trackFxProcessors[trackId].setChain(restored);
+    m_trackEq[trackId] = restored.eq;
+    m_trackEqCoefs[trackId] = coefs;
+    m_trackComp[trackId] = restored.comp;
+    m_trackReverb[trackId] = restored.reverb;
+    m_trackNoiseReduction[trackId] = restored.nr;
+}
+
 trackfx::Chain AudioMixer::masterChain() const
 {
     QMutexLocker lock(&m_controlMutex);

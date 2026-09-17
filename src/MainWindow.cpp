@@ -9182,9 +9182,16 @@ void MainWindow::handleMediaRelinkHistoryChanged()
 
 void MainWindow::collectAudioState(ProjectData &data)
 {
+    data.trackFx.clear();
+    data.masterFx = trackfx::Chain{};
     if (auto *mixer = m_player ? m_player->audioMixer() : nullptr) {
         const int n = m_timeline ? m_timeline->audioTrackCount() : 0;
         data.trackEqStates.resize(n);
+        data.masterFx = mixer->masterChain();
+        for (int i = 0; i < n; ++i) {
+            const trackfx::Chain chain = mixer->trackChain(i);
+            if (!chain.isDefault()) data.trackFx.insert(i, chain);
+        }
         for (int i = 0; i < n; ++i) {
             AudioEQConfig cfg = mixer->trackEqConfig(i);
             TrackEqState &s = data.trackEqStates[i];
@@ -9224,6 +9231,11 @@ void MainWindow::collectAudioState(ProjectData &data)
 void MainWindow::applyAudioState(const ProjectData &data)
 {
     if (auto *mixer = m_player ? m_player->audioMixer() : nullptr) {
+        // Project audio FX are not part of TimelineState/Undo.
+        mixer->clearTrackFx();
+        for (auto it = data.trackFx.cbegin(); it != data.trackFx.cend(); ++it)
+            mixer->setTrackChain(it.key(), it.value());
+        mixer->setMasterEq(data.masterFx.eq, data.masterFx.eqEnabled);
         for (const auto &s : data.trackEqStates) {
             AudioEQConfig cfg;
             cfg.bands.resize(3);
@@ -9263,6 +9275,7 @@ void MainWindow::newProject()
 {
     ProjectSettingsDialog dialog(this);
     if (dialog.exec() == QDialog::Accepted) {
+        applyAudioState(ProjectData{});
         if (m_light3DDialog)
             m_light3DDialog->close();
         m_projectCamera = Camera3D{};

@@ -629,6 +629,16 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
         am["trackEq"] = teArr;
         am["compressor"] = compressorToJson(data.masterCompressor);
         am["autoDuck"] = autoDuckToJson(data.autoDuck);
+        QJsonArray fxArray;
+        for (auto it = data.trackFx.cbegin(); it != data.trackFx.cend(); ++it) {
+            QJsonObject chain = it.value().toJson();
+            if (it.key() < 0 || chain.isEmpty()) continue;
+            chain["track"] = it.key();
+            fxArray.append(chain);
+        }
+        if (!fxArray.isEmpty()) am["trackFx"] = fxArray;
+        const QJsonObject masterFx = data.masterFx.toJson();
+        if (!masterFx.isEmpty()) am["masterFx"] = masterFx;
         root["audioMixer"] = am;
     }
 
@@ -949,8 +959,18 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
 
     // Audio mixer (tolerate missing keys)
     data.trackEqStates.clear();
+    data.trackFx.clear();
+    data.masterFx = trackfx::Chain{};
     if (root.contains("audioMixer")) {
         QJsonObject am = root["audioMixer"].toObject();
+        for (const auto &value : am["trackFx"].toArray()) {
+            const QJsonObject object = value.toObject();
+            const int track = object["track"].toInt(-1);
+            if (track < 0) continue;
+            const auto chain = trackfx::Chain::fromJson(object);
+            if (!chain.isDefault()) data.trackFx.insert(track, chain);
+        }
+        data.masterFx = trackfx::Chain::fromJson(am["masterFx"].toObject());
         if (am.contains("trackEq")) {
             for (const auto &v : am["trackEq"].toArray())
                 data.trackEqStates.append(trackEqFromJson(v.toObject()));
@@ -1240,6 +1260,16 @@ QString ProjectFile::toJsonString(const ProjectData &data)
         am["trackEq"] = teArr;
         am["compressor"] = compressorToJson(data.masterCompressor);
         am["autoDuck"] = autoDuckToJson(data.autoDuck);
+        QJsonArray fxArray;
+        for (auto it = data.trackFx.cbegin(); it != data.trackFx.cend(); ++it) {
+            QJsonObject chain = it.value().toJson();
+            if (it.key() < 0 || chain.isEmpty()) continue;
+            chain["track"] = it.key();
+            fxArray.append(chain);
+        }
+        if (!fxArray.isEmpty()) am["trackFx"] = fxArray;
+        const QJsonObject masterFx = data.masterFx.toJson();
+        if (!masterFx.isEmpty()) am["masterFx"] = masterFx;
         root["audioMixer"] = am;
     }
 
@@ -1530,8 +1560,18 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
 
     // Audio mixer (tolerate missing keys)
     data.trackEqStates.clear();
+    data.trackFx.clear();
+    data.masterFx = trackfx::Chain{};
     if (root.contains("audioMixer")) {
         QJsonObject am = root["audioMixer"].toObject();
+        for (const auto &value : am["trackFx"].toArray()) {
+            const QJsonObject object = value.toObject();
+            const int track = object["track"].toInt(-1);
+            if (track < 0) continue;
+            const auto chain = trackfx::Chain::fromJson(object);
+            if (!chain.isDefault()) data.trackFx.insert(track, chain);
+        }
+        data.masterFx = trackfx::Chain::fromJson(am["masterFx"].toObject());
         if (am.contains("trackEq")) {
             for (const auto &v : am["trackEq"].toArray())
                 data.trackEqStates.append(trackEqFromJson(v.toObject()));

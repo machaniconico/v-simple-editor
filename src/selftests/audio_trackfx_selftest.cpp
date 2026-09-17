@@ -1,4 +1,6 @@
 #include "../AudioTrackFx.h"
+#include "../ProjectFile.h"
+#include <QJsonDocument>
 #include "../AudioMixer.h"
 #include "../SpectralEngine.h"
 #include "../Timeline.h"
@@ -77,6 +79,38 @@ double energy(const std::vector<float> &samples, int firstFrame, int lastFrame)
     for (int i = 2 * firstFrame; i < 2 * lastFrame; ++i)
         sum += static_cast<double>(samples[i]) * samples[i];
     return sum;
+}
+bool sameChain(const trackfx::Chain &a, const trackfx::Chain &b)
+{
+    const auto band = [](const trackfx::EqBand &x, const trackfx::EqBand &y) {
+        return x.freq == y.freq && x.gainDb == y.gainDb && x.q == y.q && x.enabled == y.enabled;
+    };
+    return band(a.eq.low, b.eq.low) && band(a.eq.lowMid, b.eq.lowMid)
+        && band(a.eq.highMid, b.eq.highMid) && band(a.eq.high, b.eq.high)
+        && a.nrEnabled == b.nrEnabled
+        && a.eqEnabled == b.eqEnabled
+        && a.compEnabled == b.compEnabled
+        && a.reverbEnabled == b.reverbEnabled
+        && a.comp.thresholdDb == b.comp.thresholdDb
+        && a.comp.ratio == b.comp.ratio
+        && a.comp.attackMs == b.comp.attackMs
+        && a.comp.releaseMs == b.comp.releaseMs
+        && a.comp.kneeDb == b.comp.kneeDb
+        && a.comp.makeupDb == b.comp.makeupDb
+        && a.comp.enabled == b.comp.enabled
+        && a.reverb.mixRatio == b.reverb.mixRatio
+        && a.reverb.decaySeconds == b.reverb.decaySeconds
+        && a.reverb.preDelayMs == b.reverb.preDelayMs
+        && a.reverb.dampingHF == b.reverb.dampingHF
+        && a.reverb.widthPercent == b.reverb.widthPercent
+        && a.reverb.enabled == b.reverb.enabled
+        && a.nr.thresholdDb == b.nr.thresholdDb
+        && a.nr.reductionDb == b.nr.reductionDb
+        && a.nr.attackMs == b.nr.attackMs
+        && a.nr.releaseMs == b.nr.releaseMs
+        && a.nr.manualFloorDb == b.nr.manualFloorDb
+        && a.nr.autoFloor == b.nr.autoFloor
+        && a.nr.enabled == b.nr.enabled;
 }
 } // namespace
 
@@ -646,6 +680,114 @@ int runAudioTrackFxSelftest()
         && masterExportOk && audiofxexport::masterEqPassesForTest() == 2;
     audiofxexport::setMasterEqBypassForTest(false);
     gate(16, masterExportOk && exportError.isEmpty());
+    // G17: every parameter and both enable layers survive serialization.
+    trackfx::Chain savedChain;
+    savedChain.eqEnabled = savedChain.compEnabled = savedChain.reverbEnabled = savedChain.nrEnabled = true;
+    savedChain.eq.low = {90.0, 3.0, 0.9, false};
+    savedChain.eq.lowMid = {400.0, -6.0, 1.2, false};
+    savedChain.eq.highMid = {4000.0, 2.0, 1.4, false};
+    savedChain.eq.high = {12000.0, -2.0, 0.8, false};
+    savedChain.comp = {-18.0, 3.0, 8.0, 150.0, 4.0, 2.0, true};
+    savedChain.reverb = {0.3, 0.7, 35.0, 45.0, 75.0, true};
+    savedChain.nr = {-15.0, 18.0, 7.0, 250.0, -55.0, false, true};
+    const auto chainJson = savedChain.toJson();
+    auto dormantChain = savedChain;
+    dormantChain.eqEnabled = dormantChain.compEnabled = dormantChain.reverbEnabled = dormantChain.nrEnabled = false;
+    bool jsonOk = sameChain(savedChain, trackfx::Chain::fromJson(chainJson))
+        && sameChain(dormantChain, trackfx::Chain::fromJson(dormantChain.toJson()))
+        && !savedChain.isDefault() && !dormantChain.isDefault()
+        && trackfx::Chain{}.toJson().isEmpty()
+        && sameChain(trackfx::Chain::fromJson(QJsonObject{}), trackfx::Chain{});
+    auto parameterOnly = trackfx::Chain{};
+    parameterOnly.eq.high.q = 1.5;
+    jsonOk = jsonOk && !parameterOnly.isDefault();
+    const auto invalidChain = trackfx::Chain::fromJson(QJsonObject{
+        {"comp", QJsonObject{{"attackMs", -10.0}, {"ratio", 999.0}}},
+        {"eq", QJsonObject{{"lowMid", QJsonObject{{"q", 0.0}}}}}});
+    jsonOk = jsonOk && invalidChain.comp.attackMs == 0.1
+        && invalidChain.comp.ratio == 50.0 && invalidChain.eq.lowMid.q == 0.1;
+    gate(17, jsonOk);
+
+    // G18: string and disk entry points use identical optional audio keys.
+    ProjectData fxProject;
+    fxProject.trackFx.insert(0, savedChain);
+    fxProject.trackFx.insert(2, dormantChain);
+    fxProject.trackFx.insert(1, trackfx::Chain{});
+    fxProject.masterFx.eq = masterEq;
+    fxProject.masterFx.eqEnabled = true;
+    const QString fxJson = ProjectFile::toJsonString(fxProject);
+    const auto audioJson = QJsonDocument::fromJson(fxJson.toUtf8()).object()["audioMixer"].toObject();
+    ProjectData restoredProject;
+    bool projectOk = ProjectFile::fromJsonString(fxJson, restoredProject)
+        && audioJson["trackFx"].toArray().size() == 2 && audioJson.contains("masterFx")
+        && restoredProject.trackFx.size() == 2
+        && sameChain(restoredProject.trackFx.value(0), savedChain)
+        && sameChain(restoredProject.trackFx.value(2), dormantChain)
+        && sameChain(restoredProject.masterFx, fxProject.masterFx);
+    const QString fxPath = directory.filePath(QStringLiteral("track-fx.veditor"));
+    ProjectData diskProject;
+    projectOk = ProjectFile::save(fxPath, fxProject) && ProjectFile::load(fxPath, diskProject)
+        && sameChain(diskProject.trackFx.value(0), savedChain)
+        && sameChain(diskProject.trackFx.value(2), dormantChain)
+        && sameChain(diskProject.masterFx, fxProject.masterFx) && projectOk;
+    const QString defaultJson = ProjectFile::toJsonString(ProjectData{});
+    const auto defaultAudio = QJsonDocument::fromJson(defaultJson.toUtf8()).object()["audioMixer"].toObject();
+    projectOk = !defaultAudio.contains("trackFx") && !defaultAudio.contains("masterFx")
+        && ProjectFile::fromJsonString(defaultJson, restoredProject)
+        && restoredProject.trackFx.isEmpty() && restoredProject.masterFx.isDefault() && projectOk;
+    auto oldRoot = QJsonDocument::fromJson(defaultJson.toUtf8()).object();
+    oldRoot.remove("audioMixer");
+    restoredProject = fxProject;
+    projectOk = ProjectFile::fromJsonString(QString::fromUtf8(QJsonDocument(oldRoot).toJson()), restoredProject)
+        && restoredProject.trackFx.isEmpty() && restoredProject.masterFx.isDefault() && projectOk;
+    trackfx::Processor restoredDsp(diskProject.trackFx.value(0), kRate, 2);
+    trackfx::Processor savedDsp(savedChain, kRate, 2);
+    auto restoredSamples = input;
+    auto savedSamples = input;
+    processBlocks(restoredDsp, restoredSamples);
+    processBlocks(savedDsp, savedSamples);
+    projectOk = projectOk && identical(restoredSamples, savedSamples)
+        && !identical(restoredSamples, input);
+    gate(18, projectOk);
+
+    // G19: project switching clears modern/legacy settings and DSP histories.
+    auto resetMixer = std::make_unique<AudioMixer>();
+    resetMixer->setTrackChain(0, diskProject.trackFx.value(0));
+    resetMixer->setTrackChain(2, diskProject.trackFx.value(2));
+    resetMixer->setMasterEq(diskProject.masterFx.eq, diskProject.masterFx.eqEnabled);
+    resetMixer->setTrackEqConfig(0, persistedEq);
+    resetMixer->setTrackEqEnabled(0, true);
+    bool resetOk = sameChain(resetMixer->trackChain(0), savedChain)
+        && sameChain(resetMixer->trackChain(2), dormantChain)
+        && sameChain(resetMixer->masterChain(), fxProject.masterFx);
+    auto warmPcm = originalOne;
+    resetMixer->processTrackFxForTest(0, warmPcm.data(), kFrames);
+    auto warmMaster = masterDry;
+    resetMixer->processMasterEqForTest(warmMaster.data(), kFrames);
+    resetMixer->clearTrackFx();
+    resetMixer->setLegacyTrackFxPathForTest(false); // zero the call counter
+    resetMixer->setMasterEqBypassForTest(false);
+    auto dryPcm = originalOne;
+    resetMixer->processTrackFxForTest(0, dryPcm.data(), kFrames);
+    auto dryMaster = masterDry;
+    resetMixer->processMasterEqForTest(dryMaster.data(), kFrames);
+    auto preciseBypass = exact;
+    trackfx::Processor resetTrack(resetMixer->trackChain(0), kRate, 2);
+    trackfx::Processor resetMaster(resetMixer->masterChain(), kRate, 2);
+    processBlocks(resetTrack, preciseBypass);
+    processBlocks(resetMaster, preciseBypass);
+    resetOk = resetOk && resetMixer->trackChain(0).isDefault()
+        && resetMixer->trackChain(2).isDefault() && resetMixer->masterChain().isDefault()
+        && resetMixer->trackEqConfig(0).isDefault() && !resetMixer->trackEqEnabled(0)
+        && !resetMixer->compressorForTrack(0).enabled && !resetMixer->reverbForTrack(0).enabled
+        && !resetMixer->noiseReductionForTrack(0).enabled
+        && resetMixer->eqForTrack(0).lowMid.gainDb == 0.0
+        && resetMixer->currentGainReductionDb(0) == 0.0
+        && resetMixer->trackFxProcessCallsForTest() == 0
+        && resetMixer->masterEqProcessCallsForTest() == 0
+        && dryPcm == originalOne && dryMaster == masterDry && identical(exact, preciseBypass);
+    resetMixer->clearTrackFx(); // idempotent on an FX-free project
+    gate(19, resetOk && resetMixer->trackChain(0).isDefault());
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", pass, fail);
     return fail;
 }
