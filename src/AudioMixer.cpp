@@ -2164,7 +2164,7 @@ void AudioMixer::seekTo(int64_t timelineUs) {
             QMutexLocker lock(&m_controlMutex);
             for (auto it = m_trackFxProcessors.begin(); it != m_trackFxProcessors.end(); ++it)
                 it.value().resetFeedback();
-            m_masterFxProcessor.resetFeedback();
+            m_masterEqFilter.reset();
             for (auto it = m_trackReverbState.begin();
                  it != m_trackReverbState.end(); ++it) {
                 ReverbState &st = it.value();
@@ -2392,6 +2392,53 @@ AudioMixer::EqBandCoefsParam computeEqBand(const AudioMixer::EqBand &band,
 }
 } // namespace
 
+void AudioMixer::MasterEqFilter::setEq(const EqSettings &eq)
+{
+    m_coefs[0] = computeEqBand(eq.low, 0, kSampleRateHz);
+    m_coefs[1] = computeEqBand(eq.lowMid, 1, kSampleRateHz);
+    m_coefs[2] = computeEqBand(eq.highMid, 2, kSampleRateHz);
+    m_coefs[3] = computeEqBand(eq.high, 3, kSampleRateHz);
+}
+
+void AudioMixer::MasterEqFilter::reset()
+{
+    m_history.fill(0.0);
+}
+
+double AudioMixer::MasterEqFilter::processSample(double sample, int channel)
+{
+    for (int band = 0; band < 4; ++band) {
+        const auto &c = m_coefs[band];
+        if (!c.active) continue;
+        const int base = band * 4 + channel * 2;
+        double &z1 = m_history[base];
+        double &z2 = m_history[base + 1];
+        const double output = c.b0 * sample + z1;
+        z1 = c.b1 * sample - c.a1 * output + z2;
+        z2 = c.b2 * sample - c.a2 * output;
+        sample = output;
+    }
+    return sample;
+}
+
+void AudioMixer::MasterEqFilter::process(float *samples, int frames)
+{
+    for (int frame = 0; frame < frames; ++frame)
+        for (int ch = 0; ch < kChannels; ++ch) {
+            const int i = frame * kChannels + ch;
+            samples[i] = static_cast<float>(processSample(samples[i], ch));
+        }
+}
+
+void AudioMixer::MasterEqFilter::process(int32_t *samples, int frames)
+{
+    for (int frame = 0; frame < frames; ++frame)
+        for (int ch = 0; ch < kChannels; ++ch) {
+            const int i = frame * kChannels + ch;
+            samples[i] = static_cast<int32_t>(processSample(samples[i], ch));
+        }
+}
+
 trackfx::Chain AudioMixer::masterChain() const
 {
     QMutexLocker lock(&m_controlMutex);
@@ -2404,19 +2451,14 @@ void AudioMixer::setMasterEq(const EqSettings &eq, bool enabled)
     m_masterFxChain = trackfx::Chain{}; // Only EQ is supported on this bus.
     m_masterFxChain.eq = eq;
     m_masterFxChain.eqEnabled = enabled;
-    m_masterFxProcessor.setChain(m_masterFxChain);
+    m_masterEqFilter.setEq(eq);
 }
 
 void AudioMixer::processMasterEqLocked(int32_t *samples, int frames)
 {
     if (m_masterEqBypassForTest || !m_masterFxChain.eqEnabled) return;
-    QVarLengthArray<float, 8192> normalized(frames * kChannels);
-    for (int i = 0; i < normalized.size(); ++i)
-        normalized[i] = samples[i] / 32768.0f;
     ++m_masterEqProcessCalls;
-    m_masterFxProcessor.process(normalized.data(), frames);
-    for (int i = 0; i < normalized.size(); ++i)
-        samples[i] = static_cast<int32_t>(normalized[i] * 32768.0f);
+    m_masterEqFilter.process(samples, frames);
 }
 
 void AudioMixer::setMasterEqBypassForTest(bool bypass)
@@ -2424,7 +2466,7 @@ void AudioMixer::setMasterEqBypassForTest(bool bypass)
     QMutexLocker lock(&m_controlMutex);
     m_masterEqBypassForTest = bypass;
     m_masterEqProcessCalls = 0;
-    m_masterFxProcessor.reset();
+    m_masterEqFilter.reset();
 }
 
 quint64 AudioMixer::masterEqProcessCallsForTest() const

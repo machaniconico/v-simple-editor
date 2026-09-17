@@ -994,10 +994,8 @@ QString prepareTimelineAudioMixForExport(Timeline *timeline, QString *error,
             if (error) *error = QStringLiteral("マスター音声の形式が不正です。");
             return {};
         }
-        trackfx::Chain eqOnly;
-        eqOnly.eq = masterChain.eq;
-        eqOnly.eqEnabled = true;
-        trackfx::Processor masterProcessor(eqOnly, rate, channels);
+        AudioMixer::MasterEqFilter masterProcessor;
+        masterProcessor.setEq(masterChain.eq);
         const size_t frames = samples.size() / channels;
         for (size_t frame = 0; frame < frames; frame += 4096)
             masterProcessor.process(samples.data() + frame * channels,

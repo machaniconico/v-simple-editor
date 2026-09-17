@@ -523,9 +523,70 @@ int runAudioTrackFxSelftest()
     for (size_t i = 0; i < masterWet.size(); ++i)
         masterOutput[i] = masterWet[i] / 32768.0f;
     const auto masterSettings = masterMixer->masterChain();
+
+    // Two in-phase tracks exceed s16 before the master cut. Neither the
+    // input nor the output of the master filter may clip to that range.
+    std::vector<float> loudTrack(input.size()), loudDry(input.size());
+    std::vector<int32_t> loudSum(input.size());
+    for (int f = 0; f < kFrames; ++f) {
+        const auto sample = static_cast<int16_t>(24000 * std::sin(2 * kPi * 100 * f / kRate));
+        for (int ch = 0; ch < 2; ++ch) {
+            const int i = 2 * f + ch;
+            loudTrack[i] = sample / 32768.0f;
+            loudSum[i] = 2 * static_cast<int32_t>(sample);
+            loudDry[i] = loudSum[i] / 32768.0f;
+        }
+    }
+    AudioMixer::MasterEqFilter flatMaster;
+    flatMaster.setEq(AudioMixer::EqSettings{});
+    auto flatInt = loudSum;
+    auto flatFloat = loudDry;
+    flatMaster.process(flatInt.data(), kFrames);
+    flatMaster.process(flatFloat.data(), kFrames);
+    bool headroomOk = flatInt == loudSum && identical(flatFloat, loudDry);
+    auto loudMixer = std::make_unique<AudioMixer>();
+    loudMixer->setMasterEq(masterEq, true);
+    for (int f = 0; f < kFrames; f += 257)
+        loudMixer->processMasterEqForTest(loudSum.data() + 2 * f, std::min(257, kFrames - f));
+    std::vector<float> loudWet(input.size());
+    double loudPeak = 0;
+    for (size_t i = 0; i < loudWet.size(); ++i) {
+        loudWet[i] = loudSum[i] / 32768.0f;
+        loudPeak = std::max(loudPeak, std::abs(static_cast<double>(loudSum[i])));
+    }
+    const double loudAmplitude = spectralAmplitude(loudWet, 100);
+    const double loudCutDb = 20 * std::log10(loudAmplitude / spectralAmplitude(loudDry, 100));
+    headroomOk = headroomOk && loudPeak < 32767 && std::abs(loudCutDb + 12) <= 0.1;
+
+    const QString loudPath = directory.filePath(QStringLiteral("master-headroom-source.wav"));
+    const QString loudOutputPath = directory.filePath(QStringLiteral("master-headroom-output.wav"));
+    QString loudError;
+    bool loudExportOk = libavcore::writeWavFloatInterleaved(loudPath, loudTrack, kRate, 2, &loudError);
+    Timeline loudTimeline;
+    ClipInfo loudClip = audioClip;
+    loudClip.filePath = loudPath;
+    loudTimeline.restoreFromProject(QVector<QVector<ClipInfo>>{{}},
+        QVector<QVector<ClipInfo>>{{loudClip}, {loudClip}}, 0, -1, -1, 10);
+    loudTimeline.setAudioMixer(loudMixer.get());
+    loudExportOk = loudExportOk && renderinplace::prepareAudioMix(&loudTimeline,
+        loudOutputPath, 2.0, &loudError) == loudOutputPath;
+    std::vector<double> loudMono;
+    int loudRate = 0;
+    loudExportOk = loudExportOk && libavcore::readPcm16WavToMono(loudOutputPath,
+        loudMono, loudRate, &loudError) && loudRate == kRate && loudMono.size() >= kFrames;
+    double loudExportDeltaDb = 100.0;
+    if (loudExportOk) {
+        std::vector<float> loudExport(input.size());
+        for (int f = 0; f < kFrames; ++f)
+            loudExport[2 * f] = loudExport[2 * f + 1] = static_cast<float>(loudMono[f]);
+        loudExportDeltaDb = 20 * std::log10(spectralAmplitude(loudExport, 100) / loudAmplitude);
+    }
+    std::fprintf(stderr, "Master EQ headroom: peak %.0f, 100Hz %.3f dB, export delta %.3f dB, error: %s\n",
+        loudPeak, loudCutDb, loudExportDeltaDb, loudError.toUtf8().constData());
     gate(15, masterOk && masterMixer->masterEqProcessCallsForTest() > 0
         && hasCut(masterOutput, drySum) && masterSettings.eqEnabled
-        && !masterSettings.compEnabled && !masterSettings.reverbEnabled && !masterSettings.nrEnabled);
+        && !masterSettings.compEnabled && !masterSettings.reverbEnabled && !masterSettings.nrEnabled
+        && headroomOk && loudExportOk && loudError.isEmpty() && std::abs(loudExportDeltaDb) <= 0.1);
 
     // G16: G13's real export, with the new branch disabled explicitly and
     // implicitly, must produce the very same WAV bytes and take zero EQ passes.

@@ -214,6 +214,19 @@ public:
     // before the GUI thread takes m_controlMutex.
     using EqBandCoefsParam = trackfx::EqBandCoefsParam;
 
+    // Shared 48 kHz stereo master EQ. Both sample formats retain bus
+    // headroom; only the final output conversion may clamp to s16.
+    struct MasterEqFilter {
+        void setEq(const EqSettings &eq);
+        void reset();
+        void process(float *samples, int frames);
+        void process(int32_t *samples, int frames);
+    private:
+        double processSample(double sample, int channel);
+        std::array<EqBandCoefsParam, 4> m_coefs{};
+        std::array<double, 16> m_history{};
+    };
+
     // Per-track feed-forward compressor / limiter (Audition / Resolve
     // Fairlight parity). Cascaded AFTER the 4-band EQ stage and BEFORE the
     // legacy 3-band / preamp / gain stages, so meters and the master bus
@@ -405,7 +418,7 @@ private:
     void processTrackFxLocked(int trackIdx, const int16_t *src, int16_t *output, int samples);
     void processMasterEqLocked(int32_t *samples, int frames);
     trackfx::Chain m_masterFxChain;
-    trackfx::Processor m_masterFxProcessor;
+    MasterEqFilter m_masterEqFilter;
     bool m_masterEqBypassForTest = false;
     quint64 m_masterEqProcessCalls = 0;
     QHash<int, trackfx::Chain> m_trackFxChains;
