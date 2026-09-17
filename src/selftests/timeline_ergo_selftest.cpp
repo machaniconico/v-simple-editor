@@ -483,6 +483,135 @@ int runTimelineErgoSelftest()
             ok = ok && !parseTimecodeInput(invalid, 30.0, 0.0, &result);
         gate(9, ok && !parseTimecodeInput(QStringLiteral("1"), 0.0, 0.0, &result));
     }
+    {
+        bool ok = true;
+        // Exercise the menu's shared entry point, including effective duration,
+        // zero clamping, linked movement while linked selection is disabled.
+        for (bool tail : {false, true}) {
+            for (double playhead : {0.5, 8.0}) {
+                Timeline timeline;
+                ClipInfo source = clip(4.0, 1.0, 51);
+                source.speed = 2.0;
+                timeline.restoreFromProject(QVector<QVector<ClipInfo>>{{source}},
+                                            QVector<QVector<ClipInfo>>{{source}},
+                                            playhead, -1.0, -1.0, 100);
+                timeline.setLinkedSelectionEnabled(false);
+                timeline.videoTracks()[0]->setSelectedClip(0);
+                baseline(timeline);
+                const auto before = timeline.currentState();
+                const auto serial = timeline.undoManager()->saveSerial();
+                timeline.moveSelectedClipToPlayhead(tail);
+                const double expected = qMax(0.0, playhead - (tail ? source.effectiveDuration() : 0.0));
+                ok = ok && near(timeline.videoTracks()[0]->clips()[0].leadInSec, expected)
+                    && near(timeline.audioTracks()[0]->clips()[0].leadInSec, expected)
+                    && timeline.undoManager()->saveSerial() == serial + 1;
+                timeline.undo();
+                ok = ok && sameTracks(before.videoTracks, timeline.currentState().videoTracks)
+                    && sameTracks(before.audioTracks, timeline.currentState().audioTracks)
+                    && !timeline.canUndo();
+            }
+        }
+        for (bool audio : {false, true}) {
+            Timeline active;
+            const QVector<ClipInfo> clips{clip(2.0, 1.0)};
+            active.restoreFromProject(QVector<QVector<ClipInfo>>{clips, clips},
+                                      QVector<QVector<ClipInfo>>{clips, clips},
+                                      7.0, -1.0, -1.0, 100);
+            auto *target = audio ? active.audioTracks()[1] : active.videoTracks()[1];
+            target->setSelectedClip(0);
+            baseline(active);
+            const auto before = active.currentState();
+            active.moveSelectedClipToPlayhead(false);
+            ok = ok && near(target->clips()[0].leadInSec, 7.0)
+                && near(active.videoTracks()[0]->clips()[0].leadInSec, 1.0)
+                && near(active.audioTracks()[0]->clips()[0].leadInSec, 1.0);
+            active.undo();
+            ok = ok && sameTracks(before.videoTracks, active.currentState().videoTracks)
+                && sameTracks(before.audioTracks, active.currentState().audioTracks) && !active.canUndo();
+            target = audio ? active.audioTracks()[1] : active.videoTracks()[1];
+            target->setSelectedClip(0);
+            target->setLocked(true);
+            const auto serial = active.undoManager()->saveSerial();
+            active.moveSelectedClipToPlayhead(false);
+            ok = ok && active.undoManager()->saveSerial() == serial;
+        }
+        Timeline timeline;
+        ClipInfo source = clip(2.0, 1.0);
+        source.displayName = QStringLiteral("移動対象");
+        timeline.restoreFromProject(QVector<QVector<ClipInfo>>{{source, clip(4.0)}},
+                                    QVector<QVector<ClipInfo>>{}, 3.0, -1.0, -1.0, 100);
+        timeline.videoTracks()[0]->setSelectedClip(0);
+        baseline(timeline);
+        const auto before = timeline.currentState();
+        const auto serial = timeline.undoManager()->saveSerial();
+        QString message;
+        QObject::connect(&timeline, &Timeline::statusMessageRequested, &timeline,
+                         [&](const QString &text, int) { message = text; });
+        timeline.moveSelectedClipToPlayhead(false); // Collision candidate is 4 s.
+        const auto &moved = timeline.videoTracks()[0]->clips();
+        ok = ok && moved.size() == 2 && moved[1].displayName == source.displayName
+            && near(moved[1].leadInSec, 0.0) && near(moved[0].effectiveDuration(), 4.0)
+            && message == QStringLiteral("移動先を 4.000 秒に調整しました。")
+            && timeline.undoManager()->saveSerial() == serial + 1;
+        timeline.undo();
+        gate(10, ok && sameTracks(before.videoTracks, timeline.currentState().videoTracks)
+                 && !timeline.canUndo());
+    }
+    {
+        Timeline timeline;
+        ClipInfo red = clip(2.0, 0.0, 61);
+        red.label = ClipLabel::Red;
+        ClipInfo blue = clip(2.0, 0.0, 61); // A linked non-matching clip must stay unselected.
+        blue.label = ClipLabel::Blue;
+        const QVector<ClipInfo> clips{red, blue, clip(2.0)};
+        timeline.restoreFromProject(QVector<QVector<ClipInfo>>{clips, clips, clips, clips},
+                                    QVector<QVector<ClipInfo>>{clips}, 0.0, -1.0, -1.0, 100);
+        timeline.videoTracks()[2]->setLocked(true);
+        timeline.videoTracks()[3]->setHidden(true);
+        timeline.videoTracks()[0]->setSelectedClip(0);
+        baseline(timeline);
+        const auto serial = timeline.undoManager()->saveSerial();
+        timeline.selectClipsWithSameLabel();
+        bool ok = timeline.videoTracks()[0]->selectedClips() == QList<int>({0})
+            && timeline.videoTracks()[1]->selectedClips() == QList<int>({0})
+            && timeline.audioTracks()[0]->selectedClips() == QList<int>({0})
+            && timeline.videoTracks()[2]->selectedClips().isEmpty()
+            && timeline.videoTracks()[3]->selectedClips().isEmpty()
+            && timeline.undoManager()->saveSerial() == serial;
+        timeline.videoTracks()[0]->setSelectedClip(2);
+        QString message;
+        QObject::connect(&timeline, &Timeline::statusMessageRequested, &timeline,
+                         [&](const QString &text, int) { message = text; });
+        timeline.selectClipsWithSameLabel();
+        ok = ok && message == QStringLiteral("ラベルの無いクリップは対象外です。")
+            && timeline.videoTracks()[0]->selectedClips() == QList<int>({2})
+            && timeline.videoTracks()[1]->selectedClips().isEmpty()
+            && timeline.audioTracks()[0]->selectedClips().isEmpty();
+        gate(11, ok && timeline.undoManager()->saveSerial() == serial && !timeline.canUndo());
+    }
+    {
+        Timeline timeline;
+        const QVector<ClipInfo> clips{clip(2.0, 0.0, 71)};
+        timeline.restoreFromProject(QVector<QVector<ClipInfo>>{clips},
+                                    QVector<QVector<ClipInfo>>{clips}, 0.0, -1.0, -1.0, 100);
+        baseline(timeline);
+        const auto serial = timeline.undoManager()->saveSerial();
+        bool ok = timeline.linkedSelectionEnabled();
+        timeline.videoTracks()[0]->setSelectedClip(0);
+        ok = ok && timeline.audioTracks()[0]->selectedClip() == 0;
+        timeline.clearSelection();
+        timeline.setLinkedSelectionEnabled(false);
+        timeline.videoTracks()[0]->setSelectedClip(0);
+        ok = ok && !timeline.linkedSelectionEnabled()
+            && timeline.videoTracks()[0]->selectedClip() == 0
+            && timeline.audioTracks()[0]->selectedClips().isEmpty();
+        timeline.clearSelection();
+        timeline.setLinkedSelectionEnabled(true);
+        timeline.videoTracks()[0]->setSelectedClip(0);
+        gate(12, ok && timeline.linkedSelectionEnabled()
+                 && timeline.audioTracks()[0]->selectedClip() == 0
+                 && timeline.undoManager()->saveSerial() == serial && !timeline.canUndo());
+    }
     std::fprintf(stderr, "[timeline-ergo] summary: %d PASS, %d FAIL\n", passed, failed);
     return failed;
 }

@@ -94,6 +94,9 @@ QList<QPair<QString, QKeySequence>> ShortcutManager::presetBindingTable(Preset p
     table << P{"timeline.jump_timecode", QKeySequence("Ctrl+Shift+J")}
           << P{"timeline.zoom_fit_sequence", QKeySequence()}
           << P{"timeline.zoom_selection", QKeySequence()}
+          << P{"timeline.move_head_to_playhead", QKeySequence()}
+          << P{"timeline.move_tail_to_playhead", QKeySequence()}
+          << P{"timeline.select_same_label", QKeySequence()}
           << P{"timeline.select_forward", QKeySequence()}
           << P{"timeline.select_backward", QKeySequence()}
           << P{"timeline.blade_all", QKeySequence("Ctrl+Shift+K")}

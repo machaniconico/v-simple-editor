@@ -714,6 +714,10 @@ public:
                      ImportMediaKind kind = ImportMediaKind::LinkedPair);
     void addClip(const QString &filePath);
     void splitAtPlayhead();
+    void moveSelectedClipToPlayhead(bool tail);
+    void selectClipsWithSameLabel();
+    void setLinkedSelectionEnabled(bool enabled) { m_linkedSelectionEnabled = enabled; }
+    bool linkedSelectionEnabled() const { return m_linkedSelectionEnabled; }
     void selectAllClips();
     void selectClipsFromPlayhead(bool forward);
     void bladeAllTracksAtPlayhead();
@@ -1269,7 +1273,8 @@ private:
     ClipInfo copyClipForPaste(const ClipInfo &source, QHash<int, int> &groups);
     double m_nudgeFrameRate = 30.0;
     bool m_nudgeBatchActive = false;
-    void selectClipsForErgo(int direction); // 0: all, +1: forward, -1: backward
+    TimelineTrack *primaryErgoTrack() const;
+    void selectClipsForErgo(int direction, ClipLabel label = ClipLabel::None); // 0: all, +1: forward, -1: backward
     QVector<PlaybackEntry> computePlaybackSequenceImpl(
         QVector<QVector<OverlapInterval>> *overlapIntervals) const;
     struct TimeRangeSec {
@@ -1388,6 +1393,8 @@ private:
     // Monotonic counter for generating new linkGroup IDs. Zero is reserved
     // for "unlinked" so the next usable id is 1.
     int m_nextLinkGroup = 1;
+    bool m_linkedSelectionEnabled = true;
+    int m_activeAudioTrackIndex = -1;
     // Re-entrancy guard so propagating a selection to linked clips doesn't
     // bounce back through the selectionChanged signals and recurse forever.
     bool m_inLinkedSelectionSync = false;

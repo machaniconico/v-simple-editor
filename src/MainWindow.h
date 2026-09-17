@@ -874,6 +874,9 @@ private:
     QAction *m_zoomToFitSequenceAction = nullptr;
     QAction *m_zoomToSelectionAction = nullptr;
     QAction *m_jumpTimecodeAction = nullptr;
+    QAction *m_moveClipHeadAction = nullptr;
+    QAction *m_moveClipTailAction = nullptr;
+    QAction *m_selectSameLabelAction = nullptr;
     QAction *m_selectAllClipsAction = nullptr;
     QAction *m_selectForwardAction = nullptr;
     QAction *m_selectBackwardAction = nullptr;

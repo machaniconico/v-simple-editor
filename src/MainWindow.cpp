@@ -3314,6 +3314,12 @@ void MainWindow::registerCoreShortcuts()
         QStringLiteral("クリップを貼り付け"),  QStringLiteral("編集"));
     reg(m_splitAction,           "edit.split",
         QStringLiteral("再生ヘッドで分割"),    QStringLiteral("編集"));
+    reg(m_moveClipHeadAction, "timeline.move_head_to_playhead",
+        QStringLiteral("クリップの先頭を再生ヘッドへ移動"), QStringLiteral("編集"));
+    reg(m_moveClipTailAction, "timeline.move_tail_to_playhead",
+        QStringLiteral("クリップの末尾を再生ヘッドへ移動"), QStringLiteral("編集"));
+    reg(m_selectSameLabelAction, "timeline.select_same_label",
+        QStringLiteral("同じラベルのクリップを選択"), QStringLiteral("編集"));
     reg(m_selectAllClipsAction, "timeline.select_all",
         QStringLiteral("すべて選択"), QStringLiteral("編集"));
     reg(m_selectForwardAction, "timeline.select_forward",
@@ -4535,6 +4541,36 @@ void MainWindow::setupMenuBar()
         QStringLiteral("コピーしたクリップを再生ヘッドの位置に貼り付けます。")});
 
     editMenu->addSeparator();
+
+    m_moveClipHeadAction = editMenu->addAction("クリップの先頭を再生ヘッドへ移動");
+    m_moveClipTailAction = editMenu->addAction("クリップの末尾を再生ヘッドへ移動");
+    auto moveToPlayhead = [this](bool tail) {
+        const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
+        m_timeline->moveSelectedClipToPlayhead(tail);
+        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
+        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+        updateEditActions();
+    };
+    connect(m_moveClipHeadAction, &QAction::triggered, this,
+            [moveToPlayhead]() { moveToPlayhead(false); });
+    connect(m_moveClipTailAction, &QAction::triggered, this,
+            [moveToPlayhead]() { moveToPlayhead(true); });
+    m_selectSameLabelAction = editMenu->addAction("同じラベルのクリップを選択");
+    connect(m_selectSameLabelAction, &QAction::triggered, this, [this]() {
+        m_timeline->selectClipsWithSameLabel();
+        updateEditActions();
+    });
+    auto *linkedSelectionAction = editMenu->addAction("リンク選択");
+    linkedSelectionAction->setCheckable(true);
+    QSettings ergoSettings(QStringLiteral("VSimpleEditor"), QStringLiteral("Preferences"));
+    const bool linkedSelection = ergoSettings.value(QStringLiteral("timeline/linkedSelection"), true).toBool();
+    linkedSelectionAction->setChecked(linkedSelection);
+    m_timeline->setLinkedSelectionEnabled(linkedSelection);
+    connect(linkedSelectionAction, &QAction::toggled, this, [this](bool enabled) {
+        m_timeline->setLinkedSelectionEnabled(enabled);
+        QSettings settings(QStringLiteral("VSimpleEditor"), QStringLiteral("Preferences"));
+        settings.setValue(QStringLiteral("timeline/linkedSelection"), enabled);
+    });
 
     m_selectAllClipsAction = editMenu->addAction("すべて選択");
     m_selectForwardAction = editMenu->addAction("再生ヘッド以降を選択");

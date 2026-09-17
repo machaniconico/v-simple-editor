@@ -4674,6 +4674,74 @@ void Timeline::addClip(const QString &filePath)
     importMedia(filePath);
 }
 
+TimelineTrack *Timeline::primaryErgoTrack() const
+{
+    auto selected = [](TimelineTrack *track) {
+        return track && track->selectedClip() >= 0 && track->selectedClip() < track->clipCount();
+    };
+    auto *video = m_videoTracks.value(m_activeVideoTrackIndex, nullptr);
+    if (selected(video)) return video;
+    auto *audio = m_audioTracks.value(m_activeAudioTrackIndex, nullptr);
+    if (selected(audio)) return audio;
+    for (auto *track : m_videoTracks) if (selected(track)) return track;
+    for (auto *track : m_audioTracks) if (selected(track)) return track;
+    return nullptr;
+}
+
+void Timeline::moveSelectedClipToPlayhead(bool tail)
+{
+    auto *track = primaryErgoTrack();
+    if (!track) {
+        emit statusMessageRequested(QStringLiteral("移動するクリップを選択してください。"), 3000);
+        return;
+    }
+    const int index = track->selectedClip();
+    const bool audio = track->isAudioTrack();
+    const int row = audio ? m_audioTracks.indexOf(track) : m_videoTracks.indexOf(track);
+    const double requested = qMax(0.0, m_playheadPos
+        - (tail ? track->clips()[index].effectiveDuration() : 0.0));
+    double target = requested;
+    QVector<double> attempted;
+    // Collision candidates do not mutate or save undo. Only the successful
+    // move commits, including linked audio and the existing carrier remapping.
+    for (int attempt = 0; attempt < 64; ++attempt) {
+        attempted.append(target);
+        double settled = target;
+        QString error;
+        if (!moveClipByIndex(audio, row, index, target, &settled, &error)) {
+            emit statusMessageRequested(QStringLiteral("クリップを移動できませんでした。ロック状態を確認してください。"), 3000);
+            return;
+        }
+        if (qAbs(settled - target) <= 1e-6) {
+            if (qAbs(settled - requested) > 1e-6)
+                emit statusMessageRequested(QStringLiteral("移動先を %1 秒に調整しました。")
+                                                .arg(settled, 0, 'f', 3), 3000);
+            return;
+        }
+        bool repeated = false;
+        for (double previous : attempted)
+            if (qAbs(previous - settled) <= 1e-6) repeated = true;
+        if (repeated) break;
+        target = settled;
+    }
+    emit statusMessageRequested(QStringLiteral("リンクしたクリップを配置できる移動先がありません。"), 3000);
+}
+
+void Timeline::selectClipsWithSameLabel()
+{
+    auto *track = primaryErgoTrack();
+    if (!track) {
+        emit statusMessageRequested(QStringLiteral("基準となるクリップを選択してください。"), 3000);
+        return;
+    }
+    const ClipLabel label = track->clips()[track->selectedClip()].label;
+    if (label == ClipLabel::None) {
+        emit statusMessageRequested(QStringLiteral("ラベルの無いクリップは対象外です。"), 3000);
+        return;
+    }
+    selectClipsForErgo(0, label);
+}
+
 void Timeline::selectAllClips()
 {
     selectClipsForErgo(0);
@@ -4684,11 +4752,12 @@ void Timeline::selectClipsFromPlayhead(bool forward)
     selectClipsForErgo(forward ? 1 : -1);
 }
 
-void Timeline::selectClipsForErgo(int direction)
+void Timeline::selectClipsForErgo(int direction, ClipLabel label)
 {
     // Block linked-selection propagation: eligibility is per clip and track.
     int primary = -1;
     m_activeVideoTrackIndex = -1;
+    m_activeAudioTrackIndex = -1;
     auto selectTrack = [&](TimelineTrack *track, int videoIndex) {
         if (!track) return;
         const QSignalBlocker blocker(track);
@@ -4699,12 +4768,14 @@ void Timeline::selectClipsForErgo(int direction)
             const ClipInfo &clip = track->clips()[i];
             const double start = cursor + clip.leadInSec;
             const double end = start + clip.effectiveDuration();
-            if (direction == 0 || (direction > 0 && start >= m_playheadPos)
-                || (direction < 0 && end <= m_playheadPos)) {
+            if ((label == ClipLabel::None || clip.label == label)
+                && (direction == 0 || (direction > 0 && start >= m_playheadPos)
+                    || (direction < 0 && end <= m_playheadPos))) {
                 track->toggleClipSelection(i);
                 if (primary < 0 || videoIndex >= 0) {
                     primary = i;
                     m_activeVideoTrackIndex = videoIndex;
+                    m_activeAudioTrackIndex = videoIndex < 0 ? m_audioTracks.indexOf(track) : -1;
                 }
             }
             cursor = end;
@@ -10181,7 +10252,7 @@ void Timeline::wireTrackSelection(TimelineTrack *track)
         // moves as a unit.
         if (index >= 0 && index < track->clips().size()) {
             const int linkGroup = track->clips()[index].linkGroup;
-            if (linkGroup > 0) {
+            if (linkGroup > 0 && m_linkedSelectionEnabled) {
                 auto syncLinked = [linkGroup, additive](TimelineTrack *t) {
                     if (!t) return;
                     const auto &clips = t->clips();
@@ -10202,6 +10273,7 @@ void Timeline::wireTrackSelection(TimelineTrack *track)
         // V3 sprint — track-aware overload. Resolve which video-track row
         // the click landed on; audio-track clicks emit trackIdx=-1 so the
         // edit target falls back to follow-active.
+        m_activeAudioTrackIndex = index >= 0 ? m_audioTracks.indexOf(track) : -1;
         int videoTrackIdx = m_videoTracks.indexOf(track);
         m_activeVideoTrackIndex = (index >= 0 && videoTrackIdx >= 0) ? videoTrackIdx : -1;
         emit clipSelectedOnTrack(index < 0 ? -1 : videoTrackIdx, index);
