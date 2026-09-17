@@ -1,5 +1,6 @@
 #include "../ExportUserPresets.h"
 #include <QDir>
+#include <QFileInfo>
 #include <QTemporaryDir>
 #include <cstdio>
 
@@ -59,7 +60,48 @@ int runExportPresetsSelftest()
         "Discord (25MB制限)", "ニコニコ動画", "H.265 高画質", "VP9 WebM", "Custom"};
     QStringList actual;
     for (const auto &p : ExportDialog::presets()) actual.append(p.name);
-    gate(3, actual.size() == 20 && actual == names);
+    bool restored = ExportUserPresets::save({name, config});
+    {
+        ExportDialog dialog(ProjectConfig{});
+        QComboBox *presetCombo = nullptr;
+        QCheckBox *audioOnly = nullptr;
+        for (auto *combo : dialog.findChildren<QComboBox *>())
+            if (combo->findText(names.first()) >= 0) presetCombo = combo;
+        for (auto *checkbox : dialog.findChildren<QCheckBox *>())
+            if (checkbox->text() == QStringLiteral("音声のみ (映像なし)")) audioOnly = checkbox;
+        QLineEdit *output = nullptr;
+        for (auto *edit : dialog.findChildren<QLineEdit *>())
+            if (edit->placeholderText() == QStringLiteral("Select output file...")) output = edit;
+        restored &= presetCombo && audioOnly && output;
+        if (presetCombo && audioOnly && output) {
+            const int userIndex = presetCombo->findData(name);
+            restored &= userIndex >= 0;
+            if (userIndex >= 0) {
+                output->setText(temp.filePath("export.wav"));
+                presetCombo->setCurrentIndex(userIndex);
+                restored &= audioOnly->isChecked();
+                audioOnly->setChecked(false);
+                restored &= QFileInfo(output->text()).suffix() == "mkv";
+                restored &= QMetaObject::invokeMethod(&dialog, "onExport", Qt::DirectConnection);
+                restored &= !dialog.config().audioOnly && dialog.config().container == "mkv";
+
+                // Exercise every built-in, including Custom, after loading HLG metadata.
+                for (int index = 0; index < names.size(); ++index) {
+                    presetCombo->setCurrentIndex(index);
+                    presetCombo->setCurrentIndex(userIndex);
+                    audioOnly->setChecked(false);
+                    presetCombo->setCurrentIndex(index);
+                    restored &= QMetaObject::invokeMethod(&dialog, "onExport", Qt::DirectConnection);
+                    const auto selected = dialog.config();
+                    restored &= ExportUserPresets::toJson(selected).value("hdrSettings")
+                        == ExportUserPresets::toJson(ExportConfig{}).value("hdrSettings");
+                    restored &= !selected.audioOnly
+                        && QStringList{"mp4", "mkv", "webm", "mov"}.contains(selected.container);
+                }
+            }
+        }
+    }
+    gate(3, actual.size() == 20 && actual == names && restored);
     ExportConfig resolved;
     QString error;
     bool priority = ExportUserPresets::save({names.first(), config})

@@ -412,6 +412,14 @@ void ExportDialog::onPresetChanged(int index)
         }
         return;
     }
+    // Built-ins (including Custom) must not inherit hidden user-preset metadata.
+    ExportConfig fresh;
+    fresh.width = m_projectConfig.width;
+    fresh.height = m_projectConfig.height;
+    fresh.fps = m_projectConfig.fps;
+    fresh.hwEncoder = m_config.hwEncoder;
+    fresh.useHardwareAccel = m_config.useHardwareAccel;
+    m_config = fresh;
     const auto presetList = presets();
     bool isCustom = (index >= presetList.size() - 1);
 
@@ -705,6 +713,7 @@ QString ExportDialog::defaultExtension() const
 {
     if (m_audioOnlyCheckbox->isChecked()) return m_audioContainerCombo->currentData().toString();
     if (!m_presetCombo->currentData().toString().isEmpty()
+        && !m_config.audioOnly
         && m_videoCodecCombo->currentData().toString() == m_config.videoCodec) return m_config.container;
     QString vc = m_videoCodecCombo->currentData().toString();
     if (vc == "libvpx-vp9") return "webm";
