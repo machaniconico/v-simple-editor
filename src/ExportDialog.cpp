@@ -18,6 +18,16 @@
 #include <QClipboard>
 #include <QGuiApplication>
 
+namespace {
+constexpr int kVideoBitrateMin = 500;
+constexpr int kVideoBitrateMax = 100000;
+constexpr int kAudioBitrateMin = 64;
+constexpr int kAudioBitrateMax = 512;
+constexpr int kCrfMin = 0;
+constexpr int kCrfMax = 51;
+constexpr int kAv1CrfMax = 63;
+}
+
 QString ExportConfig::audioCodecForContainer(const QString &container)
 {
     const QString value = container.toLower();
@@ -201,20 +211,20 @@ void ExportDialog::setupUI()
     m_rateControlCombo->addItem(tr("品質 (CRF)"));
     codecForm->addRow(tr("レート制御:"), m_rateControlCombo);
     m_crfSpin = new QSpinBox(this);
-    m_crfSpin->setRange(0, 51);
+    m_crfSpin->setRange(kCrfMin, kCrfMax);
     m_crfSpin->setValue(23);
     m_crfSpin->setEnabled(false);
     codecForm->addRow(tr("品質 (CRF):"), m_crfSpin);
 
     m_videoBitrateSpin = new QSpinBox(this);
-    m_videoBitrateSpin->setRange(500, 100000);
+    m_videoBitrateSpin->setRange(kVideoBitrateMin, kVideoBitrateMax);
     m_videoBitrateSpin->setValue(10000);
     m_videoBitrateSpin->setSuffix(" kbps");
     m_videoBitrateSpin->setSingleStep(500);
     codecForm->addRow("Video Bitrate:", m_videoBitrateSpin);
 
     m_audioBitrateSpin = new QSpinBox(this);
-    m_audioBitrateSpin->setRange(64, 512);
+    m_audioBitrateSpin->setRange(kAudioBitrateMin, kAudioBitrateMax);
     m_audioBitrateSpin->setValue(192);
     m_audioBitrateSpin->setSuffix(" kbps");
     codecForm->addRow("Audio Bitrate:", m_audioBitrateSpin);
@@ -339,7 +349,7 @@ void ExportDialog::setupUI()
 
     connect(m_videoCodecCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this]() {
         const bool av1 = m_videoCodecCombo->currentData().toString().contains("av1");
-        m_crfSpin->setRange(0, av1 ? 63 : 51);
+        m_crfSpin->setRange(kCrfMin, av1 ? kAv1CrfMax : kCrfMax);
         m_crfSpin->setValue(av1 ? 30 : 23);
         updateRateControlControls();
         updateSummary();
@@ -420,6 +430,13 @@ void ExportDialog::onPresetChanged(int index)
     fresh.hwEncoder = m_config.hwEncoder;
     fresh.useHardwareAccel = m_config.useHardwareAccel;
     m_config = fresh;
+    // Restore built-in limits before applying values, including for Custom.
+    m_videoBitrateSpin->setRange(kVideoBitrateMin, kVideoBitrateMax);
+    m_audioBitrateSpin->setRange(kAudioBitrateMin, kAudioBitrateMax);
+    m_crfSpin->setRange(kCrfMin, m_videoCodecCombo->currentData().toString().contains("av1")
+        ? kAv1CrfMax : kCrfMax);
+    // Keep toggled connected so the output extension and enabled controls follow.
+    m_audioOnlyCheckbox->setChecked(false);
     const auto presetList = presets();
     bool isCustom = (index >= presetList.size() - 1);
 
@@ -498,7 +515,7 @@ void ExportDialog::updateAudioOnlyControls(bool exportTypeChanged)
     const bool user = !m_presetCombo->currentData().toString().isEmpty();
     const bool isProRes = user ? m_config.proresProfile >= 0
         : (!isCustom && index >= 0 && presetList[index].proresProfile >= 0);
-    m_presetCombo->setEnabled(video);
+    m_presetCombo->setEnabled(video && !audio);
     m_hdrWarningLabel->setVisible(!audio && !m_sourceIsHdr
         && (user ? m_config.hdr10 : (!isCustom && index >= 0 && presetList[index].hdr10)));
     m_videoCodecCombo->setEnabled(video && !audio && isCustom);
@@ -643,7 +660,6 @@ void ExportDialog::applyPreset(const ExportConfig &config, bool userPreset)
     m_markedRangeCheckbox->setChecked(config.exportMarkedRangeOnly);
     m_outputEdit->setText(output);
     updateAudioOnlyControls();
-    m_presetCombo->setEnabled(true);
     updateMarkedRangeCheckboxEnabled();
     updateSummary();
 }

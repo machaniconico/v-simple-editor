@@ -74,6 +74,11 @@ int runExportPresetsSelftest()
             if (edit->placeholderText() == QStringLiteral("Select output file...")) output = edit;
         restored &= presetCombo && audioOnly && output;
         if (presetCombo && audioOnly && output) {
+            // Without using a user preset, audio-only mode must still lock the combo.
+            audioOnly->setChecked(true);
+            restored &= !presetCombo->isEnabled();
+            audioOnly->setChecked(false);
+            restored &= presetCombo->isEnabled();
             const int userIndex = presetCombo->findData(name);
             restored &= userIndex >= 0;
             if (userIndex >= 0) {
@@ -85,18 +90,35 @@ int runExportPresetsSelftest()
                 restored &= QMetaObject::invokeMethod(&dialog, "onExport", Qt::DirectConnection);
                 restored &= !dialog.config().audioOnly && dialog.config().container == "mkv";
 
-                // Exercise every built-in, including Custom, after loading HLG metadata.
+                // Programmatic selection also exercises the built-in reset while
+                // audio-only mode disables interactive selection. Do not uncheck it.
                 for (int index = 0; index < names.size(); ++index) {
                     presetCombo->setCurrentIndex(index);
                     presetCombo->setCurrentIndex(userIndex);
-                    audioOnly->setChecked(false);
+                    restored &= audioOnly->isChecked() && !presetCombo->isEnabled();
                     presetCombo->setCurrentIndex(index);
+                    restored &= !audioOnly->isChecked() && presetCombo->isEnabled();
+                    restored &= QFileInfo(output->text()).suffix() != "wav";
                     restored &= QMetaObject::invokeMethod(&dialog, "onExport", Qt::DirectConnection);
                     const auto selected = dialog.config();
                     restored &= ExportUserPresets::toJson(selected).value("hdrSettings")
                         == ExportUserPresets::toJson(ExportConfig{}).value("hdrSettings");
                     restored &= !selected.audioOnly
                         && QStringList{"mp4", "mkv", "webm", "mov"}.contains(selected.container);
+                    const auto spins = dialog.findChildren<QSpinBox *>();
+                    restored &= spins.size() == 3;
+                    for (auto *spin : spins) {
+                        if (spin->suffix().isEmpty()) {
+                            restored &= spin->minimum() == 0
+                                && spin->maximum() == (selected.videoCodec.contains("av1") ? 63 : 51);
+                        } else if (spin->singleStep() == 500) {
+                            restored &= spin->minimum() == 500 && spin->maximum() == 100000;
+                        } else {
+                            restored &= spin->minimum() == 64 && spin->maximum() == 512;
+                        }
+                    }
+                    if (names[index] == "ProRes 4444")
+                        restored &= selected.audioBitrate == 512 && selected.videoBitrate == 100000;
                 }
             }
         }
