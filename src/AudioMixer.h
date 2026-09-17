@@ -187,10 +187,9 @@ public:
     // Per-track 4-band parametric EQ (Premiere/Audition parity). Independent
     // of the legacy 3-band path above; cascaded BEFORE volume/pan stages
     // (signal flow: 4-band EQ → existing 3-band EQ → preamp → gain).
-    // trackId convention: 0 = master, 1 = A1, 2 = A2, ... (the audio mix
-    // path uses sourceTrack which is 1-based for tracks; trackId=0 is
-    // reserved for a future master-bus EQ and currently no-ops in the
-    // mix loop, so it is safe to call with 0 from the panel).
+    // Engine IDs are sourceTrack: 0 = A1, 1 = A2, ... . The master
+    // sentinel is UI-only and never indexes m_trackFxChains.
+    static constexpr int kMasterTrackId = -1;
     using EqBand = trackfx::EqBand;
     using EqSettings = trackfx::EqSettings;
     // Test switch selects the retained production legacy branch (default: new).
@@ -199,6 +198,13 @@ public:
     void processTrackFxForTest(int trackId, int16_t *samples, int frames);
     // Per-thread snapshot, valid until the next trackChain call on this thread.
     const trackfx::Chain &trackChain(int trackId) const;
+
+    trackfx::Chain masterChain() const;
+    void setMasterEq(const EqSettings &eq, bool enabled = true);
+    void setMasterEqBypassForTest(bool bypass);
+    quint64 masterEqProcessCallsForTest() const;
+    // Exercises the same post-sum, pre-normalizer stage as readData.
+    void processMasterEqForTest(int32_t *samples, int frames);
 
     void setEqForTrack(int trackId, const EqSettings &eq);
     EqSettings eqForTrack(int trackId) const;
@@ -397,6 +403,11 @@ private:
     // 2 history samples = 16 doubles). Coefs cached in m_trackEqCoefs to
     // avoid recomputing inside readData.
     void processTrackFxLocked(int trackIdx, const int16_t *src, int16_t *output, int samples);
+    void processMasterEqLocked(int32_t *samples, int frames);
+    trackfx::Chain m_masterFxChain;
+    trackfx::Processor m_masterFxProcessor;
+    bool m_masterEqBypassForTest = false;
+    quint64 m_masterEqProcessCalls = 0;
     QHash<int, trackfx::Chain> m_trackFxChains;
     QHash<int, trackfx::Processor> m_trackFxProcessors;
     bool m_legacyTrackFxPath = false;

@@ -3,6 +3,13 @@
 #include "../SpectralEngine.h"
 #include "../Timeline.h"
 #include "../MainWindow.h"
+#include "../EqualizerPanel.h"
+#include "../CompressorPanel.h"
+#include "../ReverbPanel.h"
+#include "../NoiseReductionPanel.h"
+#include <QComboBox>
+#include <QSignalBlocker>
+#include <QSlider>
 #include "../RenderInPlace.h"
 #include "../libavcore/AudioExtract.h"
 #include <QFile>
@@ -411,6 +418,173 @@ int runAudioTrackFxSelftest()
     std::fprintf(stderr, "Export persisted EQ: 100Hz %.3f dB, 1kHz %.3f dB, error: %s\n",
                  exportLowDb, exportMidDb, exportError.toUtf8().constData());
     gate(13, exportOk && exportError.isEmpty());
+    // G14: use the actual list builder/selector adapter used by all panels.
+    QStringList panelNames;
+    QList<int> panelIds;
+    audiofxui::buildAudioTrackList(2, panelNames, panelIds);
+    bool idsOk = panelNames == QStringList{QStringLiteral("マスター"),
+        QStringLiteral("A1"), QStringLiteral("A2")}
+        && panelIds == QList<int>{AudioMixer::kMasterTrackId, 0, 1};
+    EqualizerPanel eqPanel;
+    audiofxui::suppressEqualizerSelectionWrites(&eqPanel);
+    int eqWrites = 0;
+    int lastEqId = 99;
+    QObject::connect(&eqPanel, &EqualizerPanel::eqChanged, &eqPanel,
+        [&](int id, AudioMixer::EqSettings) { ++eqWrites; lastEqId = id; });
+    {
+        const QSignalBlocker blocker(&eqPanel);
+        eqPanel.setTracks(panelNames, panelIds);
+    }
+    auto *eqCombo = eqPanel.findChild<QComboBox *>();
+    idsOk = idsOk && eqCombo && eqCombo->itemData(0).toInt() == AudioMixer::kMasterTrackId
+        && eqCombo->itemData(1).toInt() == 0 && eqCombo->itemData(2).toInt() == 1;
+    if (eqCombo) {
+        eqCombo->setCurrentIndex(1);
+        eqCombo->setCurrentIndex(0);
+        idsOk = idsOk && eqWrites == 0;
+        auto *gain = eqPanel.findChild<QSlider *>();
+        if (gain) gain->setValue(-12);
+        idsOk = idsOk && eqWrites == 1 && lastEqId == AudioMixer::kMasterTrackId;
+        eqCombo->setCurrentIndex(1);
+        if (gain) gain->setValue(-6);
+        idsOk = idsOk && eqWrites == 2 && lastEqId == 0;
+    }
+    audiofxui::buildAudioTrackList(2, panelNames, panelIds, false);
+    CompressorPanel compPanel;
+    ReverbPanel reverbPanel;
+    NoiseReductionPanel nrPanel;
+    const auto checkPanel = [&](auto &panel) {
+        auto *combo = panel.template findChild<QComboBox *>();
+        audiofxui::setTrackComboItems(combo, panelNames, panelIds);
+        if (!combo || combo->count() != 2 || combo->findData(AudioMixer::kMasterTrackId) >= 0)
+            return false;
+        for (int i = 0; i < 2; ++i) {
+            combo->setCurrentIndex(i);
+            if (panel.currentTrackId() != i || combo->currentText() != QStringLiteral("A%1").arg(i + 1))
+                return false;
+        }
+        audiofxui::setTrackComboItems(combo, {}, {});
+        return combo->count() == 0;
+    };
+    idsOk = checkPanel(compPanel) && checkPanel(reverbPanel) && checkPanel(nrPanel) && idsOk;
+    AudioMixer::EqSettings masterEq;
+    masterEq.lowMid = {100.0, -12.0, 1.0, true};
+    std::vector<int16_t> trackOne(input.size()), trackTwo(input.size());
+    std::vector<float> drySum(input.size());
+    for (int f = 0; f < kFrames; ++f) {
+        const double t = static_cast<double>(f) / kRate;
+        for (int ch = 0; ch < 2; ++ch) {
+            trackOne[2 * f + ch] = static_cast<int16_t>(6000 * std::sin(2 * kPi * 100 * t));
+            trackTwo[2 * f + ch] = static_cast<int16_t>(6000 * std::sin(2 * kPi * 1000 * t));
+            drySum[2 * f + ch] = (trackOne[2 * f + ch] + trackTwo[2 * f + ch]) / 32768.0f;
+        }
+    }
+    const auto originalOne = trackOne;
+    const auto originalTwo = trackTwo;
+    auto indexedMixer = std::make_unique<AudioMixer>();
+    indexedMixer->setEqForTrack(0, masterEq);
+    indexedMixer->processTrackFxForTest(0, trackOne.data(), kFrames);
+    indexedMixer->processTrackFxForTest(1, trackTwo.data(), kFrames);
+    std::vector<float> trackSum(input.size());
+    for (size_t i = 0; i < trackSum.size(); ++i)
+        trackSum[i] = (trackOne[i] + trackTwo[i]) / 32768.0f;
+    const auto hasCut = [&](const std::vector<float> &wet, const std::vector<float> &dry) {
+        const double low = 20 * std::log10(spectralAmplitude(wet, 100) / spectralAmplitude(dry, 100));
+        const double mid = 20 * std::log10(spectralAmplitude(wet, 1000) / spectralAmplitude(dry, 1000));
+        return std::abs(low + 12) <= 1.5 && std::abs(mid) <= 1.0;
+    };
+    gate(14, idsOk && trackOne != originalOne && trackTwo == originalTwo
+        && hasCut(trackSum, drySum) && !indexedMixer->masterChain().eqEnabled);
+
+    // G15: bypass the new production branch, rather than duplicating old DSP.
+    // These are the same int32 post-sum buffers consumed by readData.
+    auto masterMixer = std::make_unique<AudioMixer>();
+    std::vector<int32_t> masterDry(input.size());
+    for (size_t i = 0; i < masterDry.size(); ++i)
+        masterDry[i] = originalOne[i] + originalTwo[i];
+    auto masterReference = masterDry;
+    masterMixer->setMasterEqBypassForTest(true);
+    masterMixer->processMasterEqForTest(masterReference.data(), kFrames);
+    bool masterOk = masterMixer->masterEqProcessCallsForTest() == 0;
+    masterMixer->setMasterEqBypassForTest(false);
+    auto masterDisabled = masterDry;
+    masterMixer->processMasterEqForTest(masterDisabled.data(), kFrames);
+    masterOk = masterOk && masterReference == masterDisabled
+        && masterMixer->masterEqProcessCallsForTest() == 0;
+    masterMixer->setMasterEq(masterEq, false);
+    masterMixer->processMasterEqForTest(masterDisabled.data(), kFrames);
+    masterOk = masterOk && masterReference == masterDisabled
+        && masterMixer->masterEqProcessCallsForTest() == 0;
+    masterMixer->setMasterEq(masterEq, true);
+    auto masterWet = masterDry;
+    for (int f = 0; f < kFrames; f += 257)
+        masterMixer->processMasterEqForTest(masterWet.data() + 2 * f, std::min(257, kFrames - f));
+    std::vector<float> masterOutput(masterWet.size());
+    for (size_t i = 0; i < masterWet.size(); ++i)
+        masterOutput[i] = masterWet[i] / 32768.0f;
+    const auto masterSettings = masterMixer->masterChain();
+    gate(15, masterOk && masterMixer->masterEqProcessCallsForTest() > 0
+        && hasCut(masterOutput, drySum) && masterSettings.eqEnabled
+        && !masterSettings.compEnabled && !masterSettings.reverbEnabled && !masterSettings.nrEnabled);
+
+    // G16: G13's real export, with the new branch disabled explicitly and
+    // implicitly, must produce the very same WAV bytes and take zero EQ passes.
+    const auto wavBytes = [](const QString &path) {
+        QFile file(path);
+        return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray{};
+    };
+    const QString bypassPath = directory.filePath(QStringLiteral("master-bypass.wav"));
+    const QString disabledPath = directory.filePath(QStringLiteral("master-disabled.wav"));
+    exportMixer->setMasterEq(masterEq, true);
+    audiofxexport::setMasterEqBypassForTest(true);
+    bool masterExportOk = renderinplace::prepareAudioMix(&exportTimeline, bypassPath,
+        2.0, &exportError) == bypassPath && audiofxexport::masterEqPassesForTest() == 0;
+    audiofxexport::setMasterEqBypassForTest(false);
+    exportMixer->setMasterEq(masterEq, false);
+    masterExportOk = renderinplace::prepareAudioMix(&exportTimeline, disabledPath,
+        2.0, &exportError) == disabledPath && masterExportOk
+        && audiofxexport::masterEqPassesForTest() == 0;
+    const auto g13Bytes = wavBytes(outputPath);
+    masterExportOk = masterExportOk && !g13Bytes.isEmpty()
+        && wavBytes(bypassPath) == g13Bytes && wavBytes(disabledPath) == g13Bytes;
+
+    // Two independent source tracks; master-only also exercises the non-track-FX mix.
+    const QString lowPath = directory.filePath(QStringLiteral("master-low.wav"));
+    const QString midPath = directory.filePath(QStringLiteral("master-mid.wav"));
+    std::vector<float> lowSamples(input.size()), midSamples(input.size());
+    for (size_t i = 0; i < input.size(); ++i) {
+        lowSamples[i] = originalOne[i] / 32768.0f;
+        midSamples[i] = originalTwo[i] / 32768.0f;
+    }
+    masterExportOk = libavcore::writeWavFloatInterleaved(lowPath, lowSamples, kRate, 2, &exportError)
+        && libavcore::writeWavFloatInterleaved(midPath, midSamples, kRate, 2, &exportError) && masterExportOk;
+    ClipInfo lowClip = audioClip, midClip = audioClip;
+    lowClip.filePath = lowPath;
+    midClip.filePath = midPath;
+    exportTimeline.restoreFromProject(QVector<QVector<ClipInfo>>{{}},
+        QVector<QVector<ClipInfo>>{{lowClip}, {midClip}}, 0, -1, -1, 10);
+    exportMixer->setTrackEqEnabled(0, false);
+    exportMixer->setMasterEq(masterEq, true);
+    const auto checkMasterExport = [&](const QString &path) {
+        if (renderinplace::prepareAudioMix(&exportTimeline, path, 2.0, &exportError) != path)
+            return false;
+        std::vector<double> mono;
+        int rate = 0;
+        if (!libavcore::readPcm16WavToMono(path, mono, rate, &exportError)
+            || rate != kRate || mono.size() < kFrames) return false;
+        std::vector<float> stereo(kFrames * 2);
+        for (int f = 0; f < kFrames; ++f)
+            stereo[2 * f] = stereo[2 * f + 1] = static_cast<float>(mono[f]);
+        return hasCut(stereo, drySum);
+    };
+    masterExportOk = checkMasterExport(directory.filePath(QStringLiteral("master-only.wav")))
+        && masterExportOk && audiofxexport::masterEqPassesForTest() == 1;
+    // And the existing per-track DSP export branch followed by master EQ.
+    exportMixer->setEqForTrack(0, AudioMixer::EqSettings{});
+    masterExportOk = checkMasterExport(directory.filePath(QStringLiteral("track-and-master.wav")))
+        && masterExportOk && audiofxexport::masterEqPassesForTest() == 2;
+    audiofxexport::setMasterEqBypassForTest(false);
+    gate(16, masterExportOk && exportError.isEmpty());
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", pass, fail);
     return fail;
 }

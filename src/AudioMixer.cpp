@@ -1257,6 +1257,10 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
         }
     }
 
+    // Master EQ sees the sum of all tracks, before normalization/compression.
+    if (anyMixed)
+        m_mixer->processMasterEqLocked(accum.data(), frameCount);
+
     // Master loudness normalizer (FCP-style). Applies after sum-mix, before
     // s16 clamp. amount=0 bypasses entirely; amount=1 fully follows the
     // running RMS toward kTargetLevel. uniformity controls smoothing time.
@@ -2160,6 +2164,7 @@ void AudioMixer::seekTo(int64_t timelineUs) {
             QMutexLocker lock(&m_controlMutex);
             for (auto it = m_trackFxProcessors.begin(); it != m_trackFxProcessors.end(); ++it)
                 it.value().resetFeedback();
+            m_masterFxProcessor.resetFeedback();
             for (auto it = m_trackReverbState.begin();
                  it != m_trackReverbState.end(); ++it) {
                 ReverbState &st = it.value();
@@ -2386,6 +2391,54 @@ AudioMixer::EqBandCoefsParam computeEqBand(const AudioMixer::EqBand &band,
     return out;
 }
 } // namespace
+
+trackfx::Chain AudioMixer::masterChain() const
+{
+    QMutexLocker lock(&m_controlMutex);
+    return m_masterFxChain;
+}
+
+void AudioMixer::setMasterEq(const EqSettings &eq, bool enabled)
+{
+    QMutexLocker lock(&m_controlMutex);
+    m_masterFxChain = trackfx::Chain{}; // Only EQ is supported on this bus.
+    m_masterFxChain.eq = eq;
+    m_masterFxChain.eqEnabled = enabled;
+    m_masterFxProcessor.setChain(m_masterFxChain);
+}
+
+void AudioMixer::processMasterEqLocked(int32_t *samples, int frames)
+{
+    if (m_masterEqBypassForTest || !m_masterFxChain.eqEnabled) return;
+    QVarLengthArray<float, 8192> normalized(frames * kChannels);
+    for (int i = 0; i < normalized.size(); ++i)
+        normalized[i] = samples[i] / 32768.0f;
+    ++m_masterEqProcessCalls;
+    m_masterFxProcessor.process(normalized.data(), frames);
+    for (int i = 0; i < normalized.size(); ++i)
+        samples[i] = static_cast<int32_t>(normalized[i] * 32768.0f);
+}
+
+void AudioMixer::setMasterEqBypassForTest(bool bypass)
+{
+    QMutexLocker lock(&m_controlMutex);
+    m_masterEqBypassForTest = bypass;
+    m_masterEqProcessCalls = 0;
+    m_masterFxProcessor.reset();
+}
+
+quint64 AudioMixer::masterEqProcessCallsForTest() const
+{
+    QMutexLocker lock(&m_controlMutex);
+    return m_masterEqProcessCalls;
+}
+
+void AudioMixer::processMasterEqForTest(int32_t *samples, int frames)
+{
+    if (!samples || frames <= 0 || frames > std::numeric_limits<int>::max() / kChannels) return;
+    QMutexLocker lock(&m_controlMutex);
+    processMasterEqLocked(samples, frames);
+}
 
 void AudioMixer::setEqForTrack(int trackId, const EqSettings &eq) {
     if (trackId < 0 || trackId > kMaxAudioTracks) return;

@@ -21,6 +21,8 @@
 #include <QPointer>
 #include <QRectF>
 #include <QString>
+#include <QStringList>
+#include <QList>
 #include "ProjectSettings.h"
 #include "Exporter.h"
 #include "ProjectFile.h"
@@ -1219,4 +1221,20 @@ struct DspEntry {
 void processTrackEntries(std::vector<DspEntry> &entries, const trackfx::Chain &chain,
                          const std::array<AudioMixer::EqBandCoefs, 3> &coeffs,
                          bool eqEnabled, double preampDb);
+}
+
+class QComboBox;
+class EqualizerPanel;
+
+// Shared by the four audio panels and their headless regression gate.
+namespace audiofxui {
+void suppressEqualizerSelectionWrites(EqualizerPanel *panel);
+void buildAudioTrackList(int audioTrackCount, QStringList &names,
+                        QList<int> &ids, bool includeMaster = true);
+void setTrackComboItems(QComboBox *combo, const QStringList &names,
+                       const QList<int> &ids);
+}
+namespace audiofxexport {
+void setMasterEqBypassForTest(bool bypass);
+quint64 masterEqPassesForTest();
 }

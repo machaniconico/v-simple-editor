@@ -368,6 +368,18 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 
+namespace audiofxexport {
+// Thread-local instrumentation: export tests cannot alter another worker.
+thread_local bool masterEqBypass = false;
+thread_local quint64 masterEqPasses = 0;
+void setMasterEqBypassForTest(bool bypass)
+{
+    masterEqBypass = bypass;
+    masterEqPasses = 0;
+}
+quint64 masterEqPassesForTest() { return masterEqPasses; }
+} // namespace audiofxexport
+
 namespace {
 
 constexpr const char *kTextToolLetterSpacingSpinName = "textToolLetterSpacingSpin";
@@ -915,7 +927,9 @@ QString prepareTimelineAudioMixForExport(Timeline *timeline, QString *error,
     QMap<int, bool> legacyEqEnabled;
     QMap<int, double> trackGains;
     bool useTrackFx = false;
+    trackfx::Chain masterChain;
     if (AudioMixer *mixer = timeline->audioMixer()) {
+        masterChain = mixer->masterChain();
         for (int track = 0; track < timeline->audioTracks().size(); ++track) {
             const trackfx::Chain chain = mixer->trackChain(track);
             trackChains.insert(track, chain);
@@ -928,7 +942,9 @@ QString prepareTimelineAudioMixForExport(Timeline *timeline, QString *error,
                 || (legacyEqEnabled.value(track) && !legacyEqConfigs.value(track).isDefault());
         }
     }
-    if (forcedOutputPath.isEmpty() && !useTrackFx && timelineAudioMatchesPassthrough(timeline))
+    const bool useMasterEq = masterChain.eqEnabled && !audiofxexport::masterEqBypass;
+    if (forcedOutputPath.isEmpty() && !useTrackFx && !useMasterEq
+        && timelineAudioMatchesPassthrough(timeline))
         return {};
 
     const QVector<PlaybackEntry> entries = timeline->computeAudioPlaybackSequence();
@@ -950,6 +966,49 @@ QString prepareTimelineAudioMixForExport(Timeline *timeline, QString *error,
                    << QStringLiteral("-movflags") << QStringLiteral("+faststart");
     }
     outputArgs << outputPath;
+
+    // Default path retains precisely the original single-pass arguments.
+    // Enabled master EQ is applied once to the final amix output, including
+    // every track's clip/track gain and pan, using the playback EQ processor.
+    const auto finishMix = [&](QStringList mixArgs) -> QString {
+        if (!useMasterEq) {
+            mixArgs << outputArgs;
+            return runFfmpegForAudioMix(mixArgs, error) ? outputPath : QString();
+        }
+        ++audiofxexport::masterEqPasses;
+        QTemporaryDir masterTemporary;
+        if (!masterTemporary.isValid()) {
+            if (error) *error = QStringLiteral("マスター EQ の一時フォルダーを作成できません。");
+            return {};
+        }
+        const QString mixPath = masterTemporary.filePath(QStringLiteral("master.wav"));
+        mixArgs << QStringLiteral("-ar") << QString::number(AudioMixer::kSampleRateHz)
+                << QStringLiteral("-ac") << QString::number(AudioMixer::kChannels)
+                << QStringLiteral("-c:a") << QStringLiteral("pcm_f32le") << mixPath;
+        if (!runFfmpegForAudioMix(mixArgs, error)) return {};
+        std::vector<float> samples;
+        int rate = 0, channels = 0;
+        if (!libavcore::readWavFloatInterleaved(mixPath, &samples, &rate, &channels, error))
+            return {};
+        if (rate != AudioMixer::kSampleRateHz || channels != AudioMixer::kChannels) {
+            if (error) *error = QStringLiteral("マスター音声の形式が不正です。");
+            return {};
+        }
+        trackfx::Chain eqOnly;
+        eqOnly.eq = masterChain.eq;
+        eqOnly.eqEnabled = true;
+        trackfx::Processor masterProcessor(eqOnly, rate, channels);
+        const size_t frames = samples.size() / channels;
+        for (size_t frame = 0; frame < frames; frame += 4096)
+            masterProcessor.process(samples.data() + frame * channels,
+                static_cast<int>(std::min<size_t>(4096, frames - frame)));
+        if (!libavcore::writeWavFloatInterleaved(mixPath, samples, rate, channels, error))
+            return {};
+        QStringList encodeArgs{QStringLiteral("-y"), QStringLiteral("-i"), mixPath,
+                               QStringLiteral("-vn")};
+        encodeArgs << outputArgs;
+        return runFfmpegForAudioMix(encodeArgs, error) ? outputPath : QString();
+    };
 
     QStringList args;
     args << QStringLiteral("-y");
@@ -988,8 +1047,7 @@ QString prepareTimelineAudioMixForExport(Timeline *timeline, QString *error,
              << QStringLiteral("anullsrc=channel_layout=stereo:sample_rate=48000")
              << QStringLiteral("-t") << ffmpegNumber(durationSeconds)
              << QStringLiteral("-vn");
-        args << outputArgs;
-        return runFfmpegForAudioMix(args, error) ? outputPath : QString();
+        return finishMix(args);
     }
 
     if (useTrackFx) {
@@ -1086,8 +1144,7 @@ QString prepareTimelineAudioMixForExport(Timeline *timeline, QString *error,
         const QString finalFilter = finalChains.join(QLatin1Char(';'));
         finalArgs << QStringLiteral("-filter_complex") << finalFilter
                   << QStringLiteral("-map") << QStringLiteral("[aout]") << QStringLiteral("-vn");
-        finalArgs << outputArgs;
-        return runFfmpegForAudioMix(finalArgs, error) ? outputPath : QString();
+        return finishMix(finalArgs);
     }
 
     QStringList chains;
@@ -1120,9 +1177,7 @@ QString prepareTimelineAudioMixForExport(Timeline *timeline, QString *error,
     args << QStringLiteral("-filter_complex") << chains.join(QStringLiteral(";"))
          << QStringLiteral("-map") << QStringLiteral("[aout]")
          << QStringLiteral("-vn");
-    args << outputArgs;
-
-    return runFfmpegForAudioMix(args, error) ? outputPath : QString();
+    return finishMix(args);
 }
 
 QGroupBox *findVfxGroup(VfxControlsPanel *panel, const QString &title)
@@ -19027,26 +19082,54 @@ void MainWindow::onMeterRequestResetAllMeters()
 // earlier sprint stories into the menu bar.
 // =============================================================
 
-namespace {
-// Build the (itemNames, trackIds) lists EqualizerPanel::setTracks expects.
-// Convention: id 0 = Master, ids 1..N = A1..An audio tracks (in order).
-static void buildAudioTrackList(int audioTrackCount,
-                                QStringList &itemNames,
-                                QList<int> &trackIds,
-                                bool includeMaster = true)
+namespace audiofxui {
+void suppressEqualizerSelectionWrites(EqualizerPanel *panel)
+{
+    auto *combo = panel->findChild<QComboBox *>();
+    if (!combo) return;
+    // EqualizerPanel's selection slot calls setEqSettings, which emits
+    // eqChanged after rounding dial values. Selection must never enable DSP.
+    QObject::disconnect(combo, nullptr, panel, nullptr);
+    QObject::connect(combo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+        panel, [panel](int index) {
+            const QSignalBlocker blocker(panel);
+            QMetaObject::invokeMethod(panel, "onTrackSelectionChanged", Qt::DirectConnection,
+                                      Q_ARG(int, index));
+        });
+}
+
+void buildAudioTrackList(int audioTrackCount, QStringList &itemNames,
+                        QList<int> &trackIds, bool includeMaster)
 {
     itemNames.clear();
     trackIds.clear();
     if (includeMaster) {
-        itemNames << QStringLiteral("Master");
-        trackIds << 0;
+        itemNames << QStringLiteral("マスター");
+        trackIds << AudioMixer::kMasterTrackId;
     }
     for (int i = 0; i < audioTrackCount; ++i) {
         itemNames << QStringLiteral("A%1").arg(i + 1);
-        trackIds << (i + 1);
+        trackIds << i;
     }
 }
-} // namespace
+
+void setTrackComboItems(QComboBox *combo, const QStringList &names,
+                       const QList<int> &ids)
+{
+    if (!combo) return;
+    const int previousId = combo->currentData().toInt();
+    const QSignalBlocker blocker(combo);
+    combo->clear();
+    for (int i = 0; i < qMin(names.size(), ids.size()); ++i) {
+        combo->addItem(names[i], ids[i]);
+        if (ids[i] == AudioMixer::kMasterTrackId)
+            combo->setItemData(i, QStringLiteral(
+                "すべてのトラックをミックスした後に掛かります (書き出しにも反映)"), Qt::ToolTipRole);
+    }
+    const int previousIndex = combo->findData(previousId);
+    combo->setCurrentIndex(previousIndex >= 0 ? previousIndex : (ids.isEmpty() ? -1 : 0));
+}
+} // namespace audiofxui
 
 void MainWindow::openEqualizerPanel()
 {
@@ -19061,26 +19144,39 @@ void MainWindow::openEqualizerPanel()
         m_equalizerDock = new QDockWidget(tr("EQ"), this);
         m_equalizerDock->setObjectName("EqualizerDock");
         auto *panel = new EqualizerPanel(m_equalizerDock);
+        audiofxui::suppressEqualizerSelectionWrites(panel);
         m_equalizerDock->setWidget(panel);
         addDockWidget(Qt::RightDockWidgetArea, m_equalizerDock);
 
         connect(panel, &EqualizerPanel::eqChanged,
                 this, [this](int trackId, AudioMixer::EqSettings eq) {
-            if (auto *mx = m_player ? m_player->audioMixer() : nullptr)
-                mx->setEqForTrack(trackId, eq);
+            if (auto *mx = m_player ? m_player->audioMixer() : nullptr) {
+                if (trackId == AudioMixer::kMasterTrackId)
+                    mx->setMasterEq(eq);
+                else
+                    mx->setEqForTrack(trackId, eq);
+            }
         });
     }
 
     // Re-seed track list and current per-track settings on every show
     // so newly added audio tracks appear without restart.
     if (auto *panel = qobject_cast<EqualizerPanel *>(m_equalizerDock->widget())) {
+        const QSignalBlocker seedBlocker(panel);
         QStringList names;
         QList<int> ids;
         const int trackCount = m_timeline ? m_timeline->audioTrackCount() : 0;
-        buildAudioTrackList(trackCount, names, ids);
+        audiofxui::buildAudioTrackList(trackCount, names, ids);
         panel->setTracks(names, ids);
+        if (auto *combo = panel->findChild<QComboBox *>()) {
+            const int masterIndex = combo->findData(AudioMixer::kMasterTrackId);
+            if (masterIndex >= 0)
+                combo->setItemData(masterIndex, tr(
+                    "すべてのトラックをミックスした後に掛かります (書き出しにも反映)"), Qt::ToolTipRole);
+        }
         for (int id : ids)
-            panel->setEqSettings(id, mixer->eqForTrack(id));
+            panel->setEqSettings(id, id == AudioMixer::kMasterTrackId
+                ? mixer->masterChain().eq : mixer->eqForTrack(id));
     }
     m_equalizerDock->setVisible(true);
     m_equalizerDock->raise();
@@ -19114,13 +19210,14 @@ void MainWindow::openCompressorPanel()
         QStringList names;
         QList<int> ids;
         const int trackCount = m_timeline ? m_timeline->audioTrackCount() : 0;
-        buildAudioTrackList(trackCount, names, ids, /*includeMaster=*/false);
-        // CompressorPanel::setTrackList accepts the active track ids and
-        // inserts the master row (id 0) itself.
-        panel->setTrackList(ids);
+        audiofxui::buildAudioTrackList(trackCount, names, ids, /*includeMaster=*/false);
+        // Legacy panel builders reserve 0 for Master; install engine IDs here.
+        audiofxui::setTrackComboItems(panel->findChild<QComboBox *>(), names, ids);
+        panel->setEnabled(!ids.isEmpty());
         for (int id : ids)
             panel->loadSettings(id, mixer->compressorForTrack(id));
-        panel->loadSettings(0, mixer->compressorForTrack(0));
+        if (!ids.isEmpty())
+            panel->loadSettings(ids.first(), mixer->compressorForTrack(ids.first()));
     }
     m_compressorDock->setVisible(true);
     m_compressorDock->raise();
@@ -19154,11 +19251,14 @@ void MainWindow::openReverbPanel()
         QStringList names;
         QList<int> ids;
         const int trackCount = m_timeline ? m_timeline->audioTrackCount() : 0;
-        buildAudioTrackList(trackCount, names, ids, /*includeMaster=*/false);
-        panel->setTrackList(ids);
+        audiofxui::buildAudioTrackList(trackCount, names, ids, /*includeMaster=*/false);
+        // Legacy panel builders reserve 0 for Master; install engine IDs here.
+        audiofxui::setTrackComboItems(panel->findChild<QComboBox *>(), names, ids);
+        panel->setEnabled(!ids.isEmpty());
         for (int id : ids)
             panel->loadSettings(id, mixer->reverbForTrack(id));
-        panel->loadSettings(0, mixer->reverbForTrack(0));
+        if (!ids.isEmpty())
+            panel->loadSettings(ids.first(), mixer->reverbForTrack(ids.first()));
     }
     m_reverbDock->setVisible(true);
     m_reverbDock->raise();
@@ -19192,11 +19292,14 @@ void MainWindow::openNoiseReductionPanel()
         QStringList names;
         QList<int> ids;
         const int trackCount = m_timeline ? m_timeline->audioTrackCount() : 0;
-        buildAudioTrackList(trackCount, names, ids, /*includeMaster=*/false);
-        panel->setTrackList(ids);
+        audiofxui::buildAudioTrackList(trackCount, names, ids, /*includeMaster=*/false);
+        // Legacy panel builders reserve 0 for Master; install engine IDs here.
+        audiofxui::setTrackComboItems(panel->findChild<QComboBox *>(), names, ids);
+        panel->setEnabled(!ids.isEmpty());
         for (int id : ids)
             panel->loadSettings(id, mixer->noiseReductionForTrack(id));
-        panel->loadSettings(0, mixer->noiseReductionForTrack(0));
+        if (!ids.isEmpty())
+            panel->loadSettings(ids.first(), mixer->noiseReductionForTrack(ids.first()));
     }
     m_noiseReductionDock->setVisible(true);
     m_noiseReductionDock->raise();

@@ -924,7 +924,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "transition-export", "VEDITOR_TRANSITION_EXPORT_SELFTEST", runTransitionExportSelftest, true,
       "Video transition export/preview shared steps and no-transition identity (9 gates)" },
     { "audio-trackfx", "VEDITOR_AUDIO_TRACKFX_SELFTEST", runAudioTrackFxSelftest, true,
-      "Track DSP parity, headroom, overlap ordering and real audio export (13 gates)" },
+      "Track DSP parity, headroom, overlap ordering, panel IDs and master EQ playback/export (16 gates)" },
     { "audio-xfade",       "VEDITOR_AUDIO_XFADE_SELFTEST",         runAudioXfadeSelftest,       true,
       "Audio constant-power crossfade/fade API and export afade=qsin contract (11 gates); QApplication required for Timeline undo/mirror checks" },
     { "oauth-mock-e2e",   "VEDITOR_OAUTH_MOCK_SELFTEST",        runOAuthMockE2eSelftest,       true,
