@@ -299,6 +299,9 @@ void ExportDialog::setupUI()
     mainLayout->addWidget(outputGroup);
 
     // Marked range
+    m_keepAlphaCheckbox = new QCheckBox(tr("アルファチャンネルを保持 (ProRes 4444 のみ)"), this);
+    mainLayout->addWidget(m_keepAlphaCheckbox);
+
     m_markedRangeCheckbox = new QCheckBox(tr("マークした In/Out 範囲のみ書き出す"), this);
     m_markedRangeCheckbox->setChecked(false);
     mainLayout->addWidget(m_markedRangeCheckbox);
@@ -427,6 +430,7 @@ void ExportDialog::onPresetChanged(int index)
         }
         return;
     }
+    m_keepAlphaCheckbox->setChecked(false);
     // Built-ins (including Custom) must not inherit hidden user-preset metadata.
     ExportConfig fresh;
     fresh.width = m_projectConfig.width;
@@ -666,6 +670,7 @@ void ExportDialog::applyPreset(const ExportConfig &config, bool userPreset)
     m_rateControlCombo->setCurrentIndex(config.rateControl == ExportConfig::RateControl::Crf ? 1 : 0);
     m_audioOnlyCheckbox->setChecked(config.audioOnly);
     if (config.audioOnly) select(m_audioContainerCombo, config.container);
+    m_keepAlphaCheckbox->setChecked(config.keepAlpha);
     m_markedRangeCheckbox->setChecked(config.exportMarkedRangeOnly);
     m_outputEdit->setText(output);
     updateAudioOnlyControls();
@@ -700,6 +705,8 @@ ExportConfig ExportDialog::currentSettings() const
             c.proresProfile = list[index].proresProfile;
         }
     }
+    c.keepAlpha = m_keepAlphaCheckbox->isChecked() && !c.audioOnly
+        && c.videoCodec.startsWith("prores") && c.proresProfile >= 4;
     if (c.audioOnly) c.audioCodec = ExportConfig::audioCodecForContainer(c.container);
     return c;
 }
@@ -762,6 +769,14 @@ void ExportDialog::updateRateControlControls()
 
 void ExportDialog::updateSummary()
 {
+    if (m_keepAlphaCheckbox) {
+        const auto c = currentSettings();
+        const bool enabled = !c.audioOnly && c.videoCodec.startsWith("prores")
+            && c.proresProfile >= 4
+            && static_cast<ExportType>(m_exportTypeCombo->currentData().toInt()) == ExportType::Video;
+        m_keepAlphaCheckbox->setEnabled(enabled);
+        if (!enabled) m_keepAlphaCheckbox->setChecked(false);
+    }
     if (m_audioOnlyCheckbox->isChecked()) {
         m_summaryLabel->setText(tr("音声のみ | %1 | %2 kbps | .%3")
             .arg(ExportConfig::audioCodecForContainer(defaultExtension()))

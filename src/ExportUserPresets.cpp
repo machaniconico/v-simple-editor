@@ -42,6 +42,7 @@ QJsonObject toJson(const ExportConfig &c)
     j.insert("maxFileSizeMB", c.maxFileSizeMB);
     j.insert("hdr10", c.hdr10);
     j.insert("proresProfile", c.proresProfile);
+    if (c.keepAlpha) j.insert("keepAlpha", true);
     j.insert("exportMarkedRangeOnly", c.exportMarkedRangeOnly);
     j.insert("audioOnly", c.audioOnly);
     j.insert("crf", c.crf);
@@ -73,6 +74,7 @@ ExportConfig fromJson(const QJsonObject &j)
     c.maxFileSizeMB = j.value("maxFileSizeMB").toInt(c.maxFileSizeMB);
     c.hdr10 = j.value("hdr10").toBool(c.hdr10);
     c.proresProfile = j.value("proresProfile").toInt(c.proresProfile);
+    c.keepAlpha = j.value("keepAlpha").toBool(false);
     c.exportMarkedRangeOnly = j.value("exportMarkedRangeOnly").toBool(c.exportMarkedRangeOnly);
     c.audioOnly = j.value("audioOnly").toBool(c.audioOnly);
     c.crf = j.value("crf").toInt(c.crf);

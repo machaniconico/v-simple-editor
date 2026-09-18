@@ -2305,6 +2305,16 @@ void McpEditorTools::registerWriteTools()
             {QStringLiteral("outputPath"), QJsonObject{
                 {QStringLiteral("type"), QStringLiteral("string")}
             }},
+            {QStringLiteral("keepAlpha"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("boolean")},
+                {QStringLiteral("default"), false}
+            }},
+            {QStringLiteral("proresProfile"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("integer")},
+                {QStringLiteral("minimum"), 0}, {QStringLiteral("maximum"), 5},
+                {QStringLiteral("default"), 1},
+                {QStringLiteral("description"), QStringLiteral("ProRes プロファイル。省略時は既存の既定値 1")}
+            }},
             {QStringLiteral("audioOnly"), QJsonObject{
                 {QStringLiteral("type"), QStringLiteral("boolean")},
                 {QStringLiteral("default"), false}
@@ -2354,6 +2364,8 @@ void McpEditorTools::registerWriteTools()
             if (!rejectUnknownArguments(args,
                                         {QStringLiteral("outputPath"),
                                          QStringLiteral("preset"),
+                                         QStringLiteral("keepAlpha"),
+                                         QStringLiteral("proresProfile"),
                                          QStringLiteral("audioOnly"),
                                          QStringLiteral("width"),
                                          QStringLiteral("height"),
@@ -2401,6 +2413,20 @@ void McpEditorTools::registerWriteTools()
                 if (!requiredString(args, QStringLiteral("preset"), &presetName, err)) return {};
                 if (!ExportUserPresets::resolve(presetName, &baseConfig, err)) return {};
             }
+            if (args.contains(QStringLiteral("keepAlpha")) && !args.value(QStringLiteral("keepAlpha")).isBool())
+                return setError(err, QStringLiteral("keepAlpha は真偽値で指定してください")), QJsonObject();
+            const bool keepAlpha = args.value(QStringLiteral("keepAlpha")).toBool(baseConfig.keepAlpha);
+            int proresProfile = baseConfig.proresProfile >= 0 ? baseConfig.proresProfile : 1;
+            if (args.contains(QStringLiteral("proresProfile"))) {
+                const auto value = args.value(QStringLiteral("proresProfile"));
+                const double number = value.toDouble(-1);
+                if (!value.isDouble() || !std::isfinite(number) || std::floor(number) != number
+                    || number < 0 || number > 5)
+                    return setError(err, QStringLiteral("proresProfile は 0..5 の整数で指定してください")), QJsonObject();
+                proresProfile = static_cast<int>(number);
+            }
+            if (keepAlpha && args.value(QStringLiteral("audioOnly")).toBool(baseConfig.audioOnly))
+                return setError(err, QStringLiteral("音声のみの書き出しではアルファを保持できません")), QJsonObject();
             if (args.contains(QStringLiteral("audioOnly")) && !args.value(QStringLiteral("audioOnly")).isBool())
                 return setError(err, QStringLiteral("audioOnly は真偽値で指定してください")), QJsonObject();
             if (args.value(QStringLiteral("audioOnly")).toBool(baseConfig.audioOnly)) {
@@ -2459,6 +2485,12 @@ void McpEditorTools::registerWriteTools()
                            QJsonObject();
                 videoCodec = value.toString().trimmed();
             }
+
+            const QString alphaError = RenderQueue::alphaExportError(QJsonObject{
+                {QStringLiteral("keepAlpha"), keepAlpha},
+                {QStringLiteral("videoCodec"), videoCodec},
+                {QStringLiteral("proresProfile"), proresProfile}});
+            if (!alphaError.isEmpty()) return setError(err, alphaError), QJsonObject();
 
             QString rateControl = baseConfig.rateControl == ExportConfig::RateControl::Crf
                 ? QStringLiteral("crf") : QStringLiteral("bitrate");
@@ -2547,6 +2579,10 @@ void McpEditorTools::registerWriteTools()
                 merged.insert(QStringLiteral("hdrMaxFall"), baseConfig.hdrSettings.maxFall);
                 job.exportConfig = merged;
             }
+            if (keepAlpha || args.contains(QStringLiteral("keepAlpha")))
+                job.exportConfig.insert(QStringLiteral("keepAlpha"), keepAlpha);
+            if (args.contains(QStringLiteral("proresProfile")) || keepAlpha)
+                job.exportConfig.insert(QStringLiteral("proresProfile"), proresProfile);
             if (rateControl != QStringLiteral("bitrate"))
                 job.exportConfig.insert(QStringLiteral("rateControl"), rateControl);
             if (crf != -1)

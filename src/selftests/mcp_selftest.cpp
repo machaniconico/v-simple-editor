@@ -3918,6 +3918,53 @@ int runMcpSelftest()
         else qunsetenv("VEDITOR_EXPORT_PRESET_DIR");
     }
 
+    // US-504 G165: validate before enqueue, then inspect the real deferred job.
+    {
+        bool ok = exportRootReady && timelineReady;
+        const QString path = exportRoot.filePath("alpha.mov");
+        const QJsonObject valid{{"outputPath", path}, {"keepAlpha", true},
+            {"videoCodec", "prores"}, {"proresProfile", 4}};
+        const auto response = callProjectInfoTool(1650, QStringLiteral("export_video"), valid);
+        const QString id = toolPayload(response).value("jobId").toString();
+        ok &= !id.isEmpty() && !toolResult(response).value("isError").toBool(true);
+        const QList<QJsonObject> invalid{
+            {{"videoCodec", "h264"}}, {{"proresProfile", 2}},
+            {{"keepAlpha", "true"}}, {{"keepAlpha", 1}},
+            {{"proresProfile", -1}}, {{"proresProfile", 6}},
+            {{"proresProfile", 4.5}}, {{"proresProfile", "4"}},
+            {{"audioOnly", true}}
+        };
+        int requestId = 1651;
+        for (const auto &overrides : invalid) {
+            auto args = valid;
+            for (auto it = overrides.begin(); it != overrides.end(); ++it)
+                args.insert(it.key(), it.value());
+            const auto rejected = callProjectInfoTool(requestId++, QStringLiteral("export_video"), args);
+            ok &= toolResult(rejected).value("isError").toBool(false)
+                && toolPayload(rejected).isEmpty();
+        }
+        QHash<QString, QJsonObject> captured;
+        auto *queue = projectInfoWindow.findChild<RenderQueue*>();
+        if (queue) {
+            const auto connection = QObject::connect(queue, &RenderQueue::jobsChanged, queue, [&]() {
+                const auto jobs = queue->jobs();
+                if (jobs.isEmpty()) return;
+                for (const auto &job : jobs) captured.insert(job.uuid, job.exportConfig);
+                queue->clear();
+            });
+            auto *previousTools = projectInfoWindow.m_mcpTools;
+            projectInfoWindow.m_mcpTools = &projectInfoTools;
+            QCoreApplication::processEvents(QEventLoop::AllEvents);
+            projectInfoWindow.m_mcpTools = previousTools;
+            QObject::disconnect(connection);
+        }
+        ok &= captured.size() == 1 && captured.contains(id)
+            && captured.value(id).value("keepAlpha").toBool(false)
+            && captured.value(id).value("proresProfile").toInt(-1) == 4;
+        ok ? pass("G165 alpha export validation and queue wiring")
+           : fail("G165 alpha export validation and queue wiring", QStringLiteral("alpha validation or queued settings mismatch"));
+    }
+
     QJsonObject knownStatusResponse;
     if (!exportJobId.isEmpty()) {
         knownStatusResponse = callProjectInfoTool(

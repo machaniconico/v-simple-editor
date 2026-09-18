@@ -56,6 +56,7 @@ struct ExportConfig {
     int maxFileSizeMB = 0;
     bool hdr10 = false;  // 10-bit BT.2020/PQ output when true (preserved for backward compat)
     int proresProfile = -1;  // -1 = not ProRes; 0..5 = Proxy/LT/SQ/HQ/4444/4444XQ
+    bool keepAlpha = false;
     HDRSettings hdrSettings; // extended HDR metadata
     bool exportMarkedRangeOnly = false;
     bool audioOnly = false;
@@ -108,6 +109,7 @@ private:
     ProjectConfig m_projectConfig;
     QVector<ClipInfo> m_clips;
 
+    QCheckBox *m_keepAlphaCheckbox = nullptr;
     QCheckBox *m_audioOnlyCheckbox = nullptr;
     QComboBox *m_audioContainerCombo = nullptr;
     QComboBox *m_exportTypeCombo = nullptr;

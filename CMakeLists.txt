@@ -387,6 +387,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/EdlExport.h
     src/EdlExport.cpp
     src/selftests/export_pro_selftest.cpp
+    src/selftests/export_alpha_selftest.cpp
     src/selftests/export_presets_selftest.cpp
     src/selftests/edl_export_selftest.cpp
     # WS (ワークスペース): 名前付きドックレイアウトの純粋モデル (Premiere/Resolve 相当)。

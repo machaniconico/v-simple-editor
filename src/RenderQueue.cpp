@@ -1,4 +1,5 @@
 #include "RenderQueue.h"
+#include <atomic>
 #include "TimelineFrameRenderer.h"
 #include "ProjectFile.h"
 #include "Timeline.h"
@@ -462,9 +463,35 @@ QStringList RenderQueue::buildLoudnessAudioFilterArgs(double gainDb)
     };
 }
 
+namespace {
+std::atomic<int> s_blackCompositeCount{0};
+}
+void RenderQueue::resetBlackCompositeCountForTest() { s_blackCompositeCount.store(0); }
+int RenderQueue::blackCompositeCountForTest() { return s_blackCompositeCount.load(); }
+
+QString RenderQueue::alphaExportError(const QJsonObject &config)
+{
+    const auto alpha = config.value("keepAlpha");
+    if (!alpha.isUndefined() && !alpha.isBool())
+        return QStringLiteral("keepAlpha は真偽値で指定してください");
+    if (!alpha.toBool()) return {};
+    const QString codec = config.value("videoCodec").toString();
+    const auto profile = config.value("proresProfile");
+    if ((codec != "prores" && codec != "prores_ks")
+        || (profile.toDouble(-1) != 4 && profile.toDouble(-1) != 5)
+        || config.value("audioOnly").toBool())
+        return QStringLiteral("このコーデックはアルファを保持できません");
+    return {};
+}
+
 int RenderQueue::addJob(const QString &name, const QString &projectFilePath,
                         const QString &outputPath, const QJsonObject &exportConfig)
 {
+    const QString alphaError = alphaExportError(exportConfig);
+    if (!alphaError.isEmpty()) {
+        emit jobFailed(-1, alphaError);
+        return -1;
+    }
     RenderJob job;
     job.id = m_nextId++;
     job.uuid = makeUuid();
@@ -524,6 +551,12 @@ void RenderQueue::addJob(const RenderJob &job)
     if (hadLoudnessGain || hasLoudnessGain(copy.loudnessGainDb))
         cfg[QStringLiteral("loudnessGainDb")] = copy.loudnessGainDb;
     copy.exportConfig = cfg;
+    const QString alphaError = alphaExportError(cfg);
+    if (!alphaError.isEmpty()) {
+        emit jobFailed(copy.id, alphaError);
+        emit jobCompletedUuid(copy.uuid, false, alphaError);
+        return;
+    }
 
     m_jobs.append(copy);
     emit jobsChanged();
@@ -959,6 +992,11 @@ void RenderQueue::startNextJob()
 void RenderQueue::startRenderPipe(int jobIndex)
 {
     const RenderJob jobCopy = m_jobs[jobIndex];
+    const QString alphaError = alphaExportError(jobCopy.exportConfig);
+    if (!alphaError.isEmpty()) {
+        finishCurrentJob(false, alphaError);
+        return;
+    }
 
     // US-MF-6 / US-B3-7 dispatch: decide HDR10/HLG from the SAME job-config
     // values the in-process branch uses for request.isHdr10 / request.isHlg,
@@ -1112,6 +1150,9 @@ void RenderQueue::startRenderPipe(int jobIndex)
             ? QStringLiteral("h264") : jobCopy.codec);
     }
 
+    if (cfg.value("keepAlpha").toBool(false) && videoCodec == QLatin1String("prores"))
+        videoCodec = QStringLiteral("prores_ks");
+
     const bool isProRes = (videoCodec == QLatin1String("prores_ks")
                            || videoCodec == QLatin1String("prores"));
     const QString hdrMode = cfg.value("hdrMode").toString().toLower();
@@ -1164,6 +1205,7 @@ void RenderQueue::startRenderPipe(int jobIndex)
         timelineHasSequenceRenderModel(tl);
     const bool blockSmartRenderForLighting = timelineHasProjectLighting(tl);
     if (smartrender::enabledFromEnv()
+        && !cfg.value("keepAlpha").toBool(false)
         && !applyLoudnessFilter
         && !timecodeRenderer.has_value()
         && !blockSmartRenderForSequences
@@ -1252,6 +1294,7 @@ void RenderQueue::startRenderPipe(int jobIndex)
     request.isHdr10 = isHdr10;
     request.isHlg = isHlg;
     request.proresProfile = proresProfile;
+    request.keepAlpha = cfg.value("keepAlpha").toBool(false);
     request.hdrMasterMaxNits =
         cfg.value("hdrMasterMaxLum").toDouble(1000.0);
     request.hdrMasterMinNits =
@@ -1335,6 +1378,8 @@ void RenderQueue::startRenderPipe(int jobIndex)
                 if (applyAces)
                     frame = aces::applyPipelineToImage(frame, acesPipe);
 
+                if (!request.keepAlpha) {
+                ++s_blackCompositeCount;
                 // A video file is OPAQUE — it has no alpha channel. The SSOT
                 // frame can be partially transparent (a per-clip mask with no
                 // lower track leaves alpha=0 regions). The genuine preview
@@ -1379,6 +1424,22 @@ void RenderQueue::startRenderPipe(int jobIndex)
                     failMsg = QStringLiteral("encoder frame push failed");
                     encodeOk = false;
                     break;
+                }
+
+                } else {
+                    frame = frame.convertToFormat(QImage::Format_RGBA8888);
+                    if (timecodeRenderer.has_value()) {
+                        QPainter pp(&frame);
+                        const double timelineSec = static_cast<double>(usec) / 1'000'000.0;
+                        timecodeRenderer->paintOnto(
+                            pp, QRectF(0, 0, outW, outH), timelineSec, fps,
+                            timecodeBurnInClipNameAt(tl, timelineSec));
+                    }
+                    if (!encoder.pushFrameRgba32(frame.constBits(), frame.bytesPerLine(), pts++)) {
+                        failMsg = QStringLiteral("アルファ付きフレームの書き出しに失敗しました");
+                        encodeOk = false;
+                        break;
+                    }
                 }
 
                 const int pct = qBound(0, static_cast<int>(
@@ -1455,6 +1516,10 @@ void RenderQueue::startRenderPipe(int jobIndex)
 void RenderQueue::startRenderPipeSubprocess(int jobIndex)
 {
     const RenderJob jobCopy = m_jobs[jobIndex];
+    if (jobCopy.exportConfig.value("keepAlpha").toBool()) {
+        finishCurrentJob(false, QStringLiteral("HDR 代替経路ではアルファを保持できません"));
+        return;
+    }
 
     // AC: ACES は 8bit RGBA 出力。この経路は定義上 10bit HDR (HDR10/HLG) 専用
     // (startRenderPipe が 10bit HEVC encoder 不在のときだけ委譲する) なので

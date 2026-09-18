@@ -83,6 +83,7 @@ struct EncodeRequest {
 
     // ProRes profile index (-1 = not ProRes, 0..5 = prores_ks profile id).
     int proresProfile = -1;
+    bool keepAlpha = false;
 
     // HDR10 mastering metadata (used by x265 only when isHdr10 is true).
     double hdrMasterMaxNits = 1000.0;
@@ -127,6 +128,12 @@ public:
     // EncodeRequest. stride is bytes per row in src. pts increments once per
     // output frame and is interpreted in encoderTimeBase().
     bool pushFrameRgb24(const uint8_t* src, int stride, int64_t pts);
+    // Packed straight RGBA; valid only for an open keepAlpha session.
+    bool pushFrameRgba32(const uchar* rgba, int stride, int64_t pts);
+    // Test seam: disabling RGBA input must leave opaque exports unaffected.
+    static void setAlphaInputEnabledForTest(bool enabled);
+    static void resetAlphaFrameCountForTest();
+    static int alphaFrameCountForTest();
 
 #ifdef VEDITOR_LIBAVCORE_WITH_QIMAGE
     // Convenience wrapper: pushes a QImage. The image is converted to
@@ -190,6 +197,8 @@ private:
     AVStream* m_audioInStream = nullptr;
     AVStream* m_audioOutStream = nullptr;
     AVAudioFifo* m_audioFifo = nullptr;
+    SwsContext* m_rgbaToYuvCtx = nullptr;
+    bool m_keepAlpha = false;
     SwsContext* m_rgbToYuvCtx = nullptr;   // used by pushFrameRgb24
     AVFrame* m_scratchFrame = nullptr;     // pre-allocated YUV frame for RGB path
     AVFrame* m_audioScratchFrame = nullptr;

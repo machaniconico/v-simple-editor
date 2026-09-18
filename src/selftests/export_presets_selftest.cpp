@@ -18,7 +18,7 @@ int runExportPresetsSelftest()
         {"videoBitrate", 35000}, {"audioBitrate", 1536},
         {"width", 2560}, {"height", 1440}, {"fps", 60},
         {"useHardwareAccel", true}, {"hwEncoder", "qsv"},
-        {"maxFileSizeMB", 25}, {"hdr10", true}, {"proresProfile", 4},
+        {"maxFileSizeMB", 25}, {"hdr10", true}, {"proresProfile", 4}, {"keepAlpha", true},
         {"exportMarkedRangeOnly", true}, {"audioOnly", true},
         {"hdrSettings", QJsonObject{{"mode", "hlg"},
             {"masterDisplayLuminanceMin", 0.02}, {"masterDisplayLuminanceMax", 2000.0},
@@ -29,7 +29,9 @@ int runExportPresetsSelftest()
     const auto json = ExportUserPresets::toJson(config);
     auto withPath = json;
     withPath.insert("outputPath", "ignored.wav");
-    gate(1, json == expected && !json.contains("outputPath")
+    gate(1, config.keepAlpha && !ExportUserPresets::fromJson({}).keepAlpha
+        && !ExportUserPresets::toJson(ExportConfig{}).contains("keepAlpha")
+        && json == expected && !json.contains("outputPath")
         && ExportUserPresets::fromJson(withPath).outputPath.isEmpty()
         && ExportUserPresets::toJson(ExportUserPresets::fromJson(json)) == expected);
 

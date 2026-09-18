@@ -1,4 +1,5 @@
 #include "Encode.h"
+#include <atomic>
 
 #include "color/SwsColorParams.h"
 #include "playback/swsmatrix_flag.h"
@@ -381,6 +382,7 @@ AVRational FrameEncoder::encoderTimeBase() const
 
 void FrameEncoder::releaseAll()
 {
+    if (m_rgbaToYuvCtx) { sws_freeContext(m_rgbaToYuvCtx); m_rgbaToYuvCtx = nullptr; }
     if (m_rgbToYuvCtx) { sws_freeContext(m_rgbToYuvCtx); m_rgbToYuvCtx = nullptr; }
     if (m_scratchFrame) { av_frame_free(&m_scratchFrame); }
     if (m_audioScratchFrame) { av_frame_free(&m_audioScratchFrame); }
@@ -521,6 +523,8 @@ bool FrameEncoder::configureEncoderContext(const EncodeRequest& req,
         if (list && list[0] != AV_PIX_FMT_NONE) targetPixFmt = list[0];
         av_free(const_cast<AVPixelFormat*>(list));
     }
+    if (req.keepAlpha && targetPixFmt != AV_PIX_FMT_YUVA444P10LE)
+        return false;
     m_encCtx->pix_fmt = targetPixFmt;
     m_pixFmt = targetPixFmt;
     m_encCtx->bit_rate = 0; // CRF has no target bitrate.
@@ -1110,6 +1114,10 @@ void FrameEncoder::muxAudioPassthroughPackets()
 std::optional<std::string> FrameEncoder::open(const EncodeRequest& req)
 {
     if (m_opened) return std::string("FrameEncoder already opened");
+    if (req.keepAlpha && (req.videoCodecName.rfind("prores", 0) != 0
+        || req.proresProfile < 4 || req.proresProfile > 5))
+        return std::string("このコーデックはアルファを保持できません");
+    m_keepAlpha = req.keepAlpha;
     const AVRational fps = effectiveFpsRational(req);
     if (req.width <= 0 || req.height <= 0
         || fps.num <= 0 || fps.den <= 0) {
@@ -1379,6 +1387,48 @@ bool FrameEncoder::pushAudioFrame(AVFrame* frame, int64_t pts)
     }
 
     return true;
+}
+
+namespace {
+std::atomic<int> s_alphaFrameCount{0};
+std::atomic<bool> s_alphaInputEnabled{true};
+}
+
+void FrameEncoder::setAlphaInputEnabledForTest(bool enabled) { s_alphaInputEnabled.store(enabled); }
+void FrameEncoder::resetAlphaFrameCountForTest() { s_alphaFrameCount.store(0); }
+int FrameEncoder::alphaFrameCountForTest() { return s_alphaFrameCount.load(); }
+
+bool FrameEncoder::pushFrameRgba32(const uchar* rgba, int stride, int64_t pts)
+{
+    ++s_alphaFrameCount;
+    if (!s_alphaInputEnabled.load() || !isOpen() || !m_keepAlpha || !m_encCtx || !rgba
+        || stride < m_encCtx->width * 4) return false;
+    if (!m_rgbaToYuvCtx) {
+        m_rgbaToYuvCtx = sws_getContext(
+            m_encCtx->width, m_encCtx->height, AV_PIX_FMT_RGBA,
+            m_encCtx->width, m_encCtx->height, m_pixFmt,
+            SWS_BILINEAR, nullptr, nullptr, nullptr);
+        if (!m_rgbaToYuvCtx) return false;
+    }
+    AVFrame* frame = av_frame_alloc();
+    if (!frame) return false;
+    frame->format = m_pixFmt;
+    frame->width = m_encCtx->width;
+    frame->height = m_encCtx->height;
+    frame->color_primaries = m_encCtx->color_primaries;
+    frame->color_trc = m_encCtx->color_trc;
+    frame->colorspace = m_encCtx->colorspace;
+    frame->color_range = m_encCtx->color_range;
+    bool ok = av_frame_get_buffer(frame, 0) >= 0;
+    if (ok) {
+        const uint8_t* slices[4] = {rgba, nullptr, nullptr, nullptr};
+        const int strides[4] = {stride, 0, 0, 0};
+        ok = sws_scale(m_rgbaToYuvCtx, slices, strides, 0, m_encCtx->height,
+                       frame->data, frame->linesize) == m_encCtx->height;
+        if (ok) ok = pushFrameNative(frame, pts);
+    }
+    av_frame_free(&frame);
+    return ok;
 }
 
 bool FrameEncoder::pushFrameRgb24(const uint8_t* src, int stride, int64_t pts)

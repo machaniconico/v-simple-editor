@@ -100,6 +100,7 @@ int runVfxFootageSelftest();
 int runEffectPresetSelftest();
 int runEffectTimingSelftest();
 int runExposureAidsSelftest();
+int runExportAlphaSelftest();
 int runExportAuditSelftest();
 int runExportPresetsSelftest();
 int runExportProSelftest();
@@ -508,6 +509,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Increment and Save filename resolver: numbered suffix, unnumbered v002, collision skip, digit width" },
     { "project-diff", "VEDITOR_PROJECT_DIFF_SELFTEST", runProjectDiffSelftest, false,
       "Structural project comparison: matching, properties, effects, transitions and epsilon (7 gates)" },
+    { "export-alpha", "VEDITOR_EXPORT_ALPHA_SELFTEST", runExportAlphaSelftest, true,
+      "ProRes alpha export and opaque default path (4 gates)" },
     { "export-presets", "VEDITOR_EXPORT_PRESETS_SELFTEST", runExportPresetsSelftest, true,
       "Export user preset persistence and name resolution (4 gates)" },
     { "export-pro",        "VEDITOR_EXPORT_PRO_SELFTEST",         runExportProSelftest,         false,
