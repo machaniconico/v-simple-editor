@@ -1,11 +1,15 @@
 #include "MediaPoolDock.h"
 #include "ThumbnailCache.h"
 #include <QSettings>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QFormLayout>
 #include <QMouseEvent>
 #include <QPixmap>
 #include <QIcon>
 
 #include <QAbstractItemView>
+#include <QItemSelectionModel>
 #include <QWidget>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -45,6 +49,8 @@ constexpr int kAssetDurationRole = Qt::UserRole + 2;
 constexpr int kAssetTypeRole = Qt::UserRole + 3;
 // QTreeWidgetItem に bin id を持たせるための role。
 constexpr int kBinIdRole     = Qt::UserRole;
+constexpr int kBinKindRole = Qt::UserRole + 1;
+enum BinKind { Folder = 0, Keyword, Smart, Section };
 } // namespace
 
 MediaPoolAssetListWidget::MediaPoolAssetListWidget(QWidget *parent)
@@ -113,6 +119,7 @@ MediaPoolDock::MediaPoolDock(QWidget *parent)
     QSplitter *splitter = new QSplitter(Qt::Horizontal, root);
 
     m_binTree = new QTreeWidget(splitter);
+    m_binTree->setObjectName(QStringLiteral("MediaPoolBinTree"));
     m_binTree->setHeaderHidden(true);
     m_binTree->setColumnCount(1);
 
@@ -218,7 +225,9 @@ QString MediaPoolDock::selectedAssetPath() const
 
 void MediaPoolDock::rebuildBinTree()
 {
-    const QString selectedBin = currentBinId();
+    const auto *current = m_binTree->currentItem();
+    const QString selectedBin = current ? current->data(0, kBinIdRole).toString() : QString();
+    const int selectedKind = current ? current->data(0, kBinKindRole).toInt() : Folder;
     m_rebuilding = true;
     m_binTree->clear();
 
@@ -229,12 +238,42 @@ void MediaPoolDock::rebuildBinTree()
 
     if (m_pool) {
         addBinItems(rootItem, QString());
+        QStringList keywords;
+        for (const auto &asset : m_pool->assets())
+            keywords.append(asset.tags);
+        keywords.removeAll(QString());
+        keywords.removeDuplicates();
+        keywords.sort();
+        const auto addSection = [this](const QString &name) {
+            auto *section = new QTreeWidgetItem(m_binTree, {name});
+            section->setData(0, kBinKindRole, Section);
+            section->setFlags(section->flags() & ~Qt::ItemIsSelectable);
+            section->setExpanded(true);
+            return section;
+        };
+        if (!keywords.isEmpty()) {
+            auto *section = addSection(tr("キーワード"));
+            for (const auto &tag : keywords) {
+                auto *item = new QTreeWidgetItem(section, {tag});
+                item->setData(0, kBinKindRole, Keyword);
+                item->setData(0, kBinIdRole, tag);
+            }
+        }
+        if (!m_pool->smartBins().isEmpty()) {
+            auto *section = addSection(tr("スマートビン"));
+            for (const auto &bin : m_pool->smartBins()) {
+                auto *item = new QTreeWidgetItem(section, {bin.name});
+                item->setData(0, kBinKindRole, Smart);
+                item->setData(0, kBinIdRole, bin.id);
+            }
+        }
     }
 
     rootItem->setExpanded(true);
     m_binTree->setCurrentItem(rootItem);
     for (QTreeWidgetItemIterator it(m_binTree); *it; ++it) {
-        if ((*it)->data(0, kBinIdRole).toString() == selectedBin) {
+        if ((*it)->data(0, kBinIdRole).toString() == selectedBin
+            && (*it)->data(0, kBinKindRole).toInt() == selectedKind) {
             m_binTree->setCurrentItem(*it);
             break;
         }
@@ -275,8 +314,18 @@ void MediaPoolDock::showAssetsForCurrentBin()
     const auto filtered = m_pool->filtered(m_searchEdit->text(), mode, usedPaths);
     QVector<mediapool::MediaAsset> visible;
     const QString binId = currentBinId();
+    const auto *current = m_binTree->currentItem();
+    const int kind = current ? current->data(0, kBinKindRole).toInt() : Folder;
+    const QString value = current ? current->data(0, kBinIdRole).toString() : QString();
+    QSet<int> smartIds;
+    if (kind == Smart) {
+        for (const auto &asset : m_pool->evaluateSmartBin(value))
+            smartIds.insert(asset.id);
+    }
     for (const auto &asset : filtered) {
-        if (binId.isEmpty() || asset.binId == binId)
+        if ((kind == Smart && smartIds.contains(asset.id))
+            || (kind == Keyword && asset.tags.contains(value))
+            || (kind == Folder && (binId.isEmpty() || asset.binId == binId)))
             visible.append(asset);
     }
     showAssets(visible);
@@ -312,7 +361,7 @@ void MediaPoolDock::showAssets(const QVector<mediapool::MediaAsset> &assets)
 QString MediaPoolDock::currentBinId() const
 {
     QTreeWidgetItem *cur = m_binTree ? m_binTree->currentItem() : nullptr;
-    if (!cur) {
+    if (!cur || cur->data(0, kBinKindRole).toInt() != Folder) {
         return QString();
     }
     return cur->data(0, kBinIdRole).toString();
@@ -421,7 +470,8 @@ void MediaPoolDock::showAssetContextMenu(const QPoint &pos)
     QListWidgetItem *item = m_assetList->itemAt(pos);
     if (!item)
         return;
-    m_assetList->setCurrentItem(item);
+    m_assetList->setCurrentItem(item, item->isSelected()
+        ? QItemSelectionModel::NoUpdate : QItemSelectionModel::ClearAndSelect);
     const int id = item->data(kAssetIdRole).toInt();
     const auto *asset = m_pool->getAsset(id);
     if (!asset)
@@ -430,6 +480,7 @@ void MediaPoolDock::showAssetContextMenu(const QPoint &pos)
     const auto selected = *asset;
     QMenu menu(this);
     QAction *rename = menu.addAction(tr("名前を変更…"));
+    QAction *keywords = menu.addAction(tr("キーワードを編集…"));
     QAction *favorite = menu.addAction(tr("お気に入り"));
     favorite->setCheckable(true);
     favorite->setChecked(selected.flag == mediapool::AssetFlag::Favorite);
@@ -453,7 +504,10 @@ void MediaPoolDock::showAssetContextMenu(const QPoint &pos)
     if (!chosen || !m_pool)
         return;
     bool changed = false;
-    if (chosen == rename) {
+    if (chosen == keywords) {
+        editSelectedKeywords();
+        return;
+    } else if (chosen == rename) {
         bool ok = false;
         const QString name = QInputDialog::getText(this, tr("名前を変更…"), tr("素材名:"),
                                                    QLineEdit::Normal, selected.displayName, &ok).trimmed();
@@ -479,7 +533,7 @@ void MediaPoolDock::showAssetContextMenu(const QPoint &pos)
     }
     if (changed) {
         emit poolChanged();
-        showAssetsForCurrentBin();
+        refresh();
     }
 }
 
@@ -488,17 +542,24 @@ void MediaPoolDock::showBinContextMenu(const QPoint &pos)
     if (!m_pool)
         return;
     QTreeWidgetItem *item = m_binTree->itemAt(pos);
-    if (!item || !item->parent())
-        return;
-    m_binTree->setCurrentItem(item);
-    const QString id = item->data(0, kBinIdRole).toString();
-    const QString oldName = item->text(0);
+    if (item)
+        m_binTree->setCurrentItem(item);
+    const int kind = item ? item->data(0, kBinKindRole).toInt() : Section;
+    const QString id = item ? item->data(0, kBinIdRole).toString() : QString();
+    const QString oldName = item ? item->text(0) : QString();
     QMenu menu(this);
-    QAction *rename = menu.addAction(tr("名前を変更…"));
-    QAction *remove = menu.addAction(tr("削除"));
+    QAction *createSmart = menu.addAction(tr("スマートビンを作成…"));
+    QAction *editSmart = kind == Smart ? menu.addAction(tr("スマートビンを編集…")) : nullptr;
+    QAction *rename = kind == Folder && !id.isEmpty() ? menu.addAction(tr("名前を変更…")) : nullptr;
+    QAction *remove = (kind == Folder || kind == Smart) && !id.isEmpty()
+        ? menu.addAction(tr("削除")) : nullptr;
     QAction *chosen = menu.exec(m_binTree->viewport()->mapToGlobal(pos));
     if (!chosen || !m_pool)
         return;
+    if (chosen == createSmart || chosen == editSmart) {
+        editSmartBin(chosen == createSmart ? QString() : id);
+        return;
+    }
     bool changed = false;
     if (chosen == rename) {
         bool ok = false;
@@ -507,12 +568,111 @@ void MediaPoolDock::showBinContextMenu(const QPoint &pos)
         if (m_pool && ok && !name.isEmpty() && name != oldName)
             changed = m_pool->renameBin(id, name);
     } else if (chosen == remove) {
-        changed = m_pool->removeBin(id);
+        changed = kind == Smart ? m_pool->removeSmartBin(id) : m_pool->removeBin(id);
     }
     if (changed) {
         emit poolChanged();
         refresh();
     }
+}
+
+void MediaPoolDock::editSelectedKeywords()
+{
+    if (!m_pool) return;
+    auto *pool = m_pool;
+    QVector<int> ids;
+    QStringList common;
+    for (const auto *item : m_assetList->selectedItems()) {
+        const int id = item->data(kAssetIdRole).toInt();
+        const auto *asset = pool->getAsset(id);
+        if (!asset) continue;
+        if (ids.isEmpty()) common = asset->tags;
+        else {
+            for (int i = int(common.size()) - 1; i >= 0; --i)
+                if (!asset->tags.contains(common[i])) common.removeAt(i);
+        }
+        ids.append(id);
+    }
+    if (ids.isEmpty()) return;
+    bool ok = false;
+    const QString text = QInputDialog::getMultiLineText(this, tr("キーワードを編集…"),
+        tr("共通キーワード（1行に1つ）:\n削除した行は全選択素材から削除し、追加した行は全選択素材に追加します。\n素材ごとの固有キーワードは保持します。"),
+        common.join(QLatin1Char('\n')), &ok);
+    if (!ok || m_pool != pool) return;
+    QStringList tags;
+    for (const auto &line : text.split(QLatin1Char('\n'))) {
+        const auto tag = line.trimmed();
+        if (!tag.isEmpty() && !tags.contains(tag)) tags.append(tag);
+    }
+    bool changed = false;
+    for (int id : ids) {
+        const auto *asset = pool->getAsset(id);
+        if (!asset) continue;
+        auto updated = asset->tags;
+        for (const auto &tag : common)
+            if (!tags.contains(tag)) updated.removeAll(tag);
+        for (const auto &tag : tags)
+            if (!updated.contains(tag)) updated.append(tag);
+        if (updated != asset->tags)
+            changed = pool->setAssetTags(id, updated) || changed;
+    }
+    if (changed) {
+        emit poolChanged();
+        refresh();
+    }
+}
+
+void MediaPoolDock::editSmartBin(const QString &id)
+{
+    if (!m_pool) return;
+    auto *pool = m_pool;
+    mediapool::SmartBin bin;
+    if (!id.isEmpty()) {
+        bool found = false;
+        for (const auto &existing : pool->smartBins()) {
+            if (existing.id == id) { bin = existing; found = true; break; }
+        }
+        if (!found) return;
+    }
+    QDialog dialog(this);
+    dialog.setWindowTitle(id.isEmpty() ? tr("スマートビンを作成…") : tr("スマートビンを編集…"));
+    QFormLayout layout(&dialog);
+    QLineEdit name(bin.name, &dialog);
+    name.setObjectName(QStringLiteral("SmartBinName"));
+    QLineEdit tag(bin.tagFilter, &dialog);
+    tag.setObjectName(QStringLiteral("SmartBinTag"));
+    QLineEdit query(bin.nameQuery, &dialog);
+    query.setObjectName(QStringLiteral("SmartBinQuery"));
+    QComboBox type(&dialog);
+    type.setObjectName(QStringLiteral("SmartBinType"));
+    type.addItem(tr("すべて"), static_cast<int>(mediapool::MediaType::Unknown));
+    type.addItem(tr("映像"), static_cast<int>(mediapool::MediaType::Video));
+    type.addItem(tr("音声"), static_cast<int>(mediapool::MediaType::Audio));
+    type.addItem(tr("画像"), static_cast<int>(mediapool::MediaType::Image));
+    type.setCurrentIndex(type.findData(static_cast<int>(bin.typeFilter)));
+    layout.addRow(tr("ビン名:"), &name);
+    layout.addRow(tr("キーワード（部分一致、空欄は条件なし）:"), &tag);
+    layout.addRow(tr("素材名（部分一致）:"), &query);
+    layout.addRow(tr("種類:"), &type);
+    QDialogButtonBox buttons(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+    buttons.button(QDialogButtonBox::Ok)->setText(tr("保存"));
+    buttons.button(QDialogButtonBox::Cancel)->setText(tr("キャンセル"));
+    buttons.button(QDialogButtonBox::Ok)->setEnabled(!name.text().trimmed().isEmpty());
+    connect(&name, &QLineEdit::textChanged, &dialog, [&buttons](const QString &text) {
+        buttons.button(QDialogButtonBox::Ok)->setEnabled(!text.trimmed().isEmpty());
+    });
+    layout.addRow(&buttons);
+    connect(&buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(&buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    if (dialog.exec() != QDialog::Accepted || m_pool != pool || name.text().trimmed().isEmpty()) return;
+    bin.name = name.text().trimmed();
+    bin.tagFilter = tag.text().trimmed();
+    bin.nameQuery = query.text().trimmed();
+    bin.typeFilter = static_cast<mediapool::MediaType>(type.currentData().toInt());
+    if (id.isEmpty()) pool->addSmartBin(bin);
+    else if (!pool->updateSmartBin(id, bin)) return;
+    emit poolChanged();
+    refresh();
 }
 
 void MediaPoolDock::setThumbnailsEnabled(bool enabled)

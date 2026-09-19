@@ -269,6 +269,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/auto_clip_gen_selftest.cpp
     src/selftests/command_search_selftest.cpp
     src/selftests/import_ingest_selftest.cpp
+    src/selftests/keyword_bins_selftest.cpp
     src/selftests/media_pool_selftest.cpp
     src/selftests/media_pool_rating_selftest.cpp
     src/selftests/three_point_edit_selftest.cpp

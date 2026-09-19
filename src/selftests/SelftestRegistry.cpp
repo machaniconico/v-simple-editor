@@ -133,6 +133,7 @@ int runInstagramSelftest();
 int runKeyersSelftest();
 int runKeyframeAnimParitySelftest();
 int runKeyframeLoopSelftest();
+int runKeywordBinsSelftest();
 int runLayerStyleSelftest();
 int runLayerStyleUiSelftest();
 int runLibavcoreDecodeSelftest();
@@ -559,6 +560,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "YouTube chapter generator stub (Phase 6 Wave 1 FOUNDATION, filled in US-6F-3: 3 gate M:SS / H:MM:SS / intro auto-insert)" },
     { "clip-filmstrip", "VEDITOR_CLIP_FILMSTRIP_SELFTEST", runClipFilmstripSelftest, true,
       "Timeline filmstrip: disabled path, shared thumbnails and tile/time mapping" },
+    { "keyword-bins", "VEDITOR_KEYWORD_BINS_SELFTEST", runKeywordBinsSelftest, true,
+      "Keyword bins: tag editing, virtual bins, SmartBin evaluation and defaults" },
     { "media-pool-thumbs", "VEDITOR_MEDIA_POOL_THUMBS_SELFTEST", runMediaPoolThumbsSelftest, true,
       "Media pool asynchronous thumbnails, RGBA frame grab and hover skimming" },
     { "media-pool-rating", "VEDITOR_MEDIA_POOL_RATING_SELFTEST", runMediaPoolRatingSelftest, false,

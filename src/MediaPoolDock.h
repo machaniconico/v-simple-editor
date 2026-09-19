@@ -70,6 +70,8 @@ private slots:
     void onAddBin();
     void onRemoveSelected();
     void onImportClicked();
+    void editSelectedKeywords();
+    void editSmartBin(const QString &id);
 
 private:
     void showAssetContextMenu(const QPoint &pos);

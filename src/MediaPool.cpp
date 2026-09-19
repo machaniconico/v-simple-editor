@@ -129,6 +129,19 @@ bool MediaPool::removeAsset(int id)
     return false;
 }
 
+bool MediaPool::setAssetTags(int id, const QStringList& tags)
+{
+    for (MediaAsset& asset : m_assets) {
+        if (asset.id == id) {
+            asset.tags = tags;
+            asset.tags.removeAll(QString());
+            asset.tags.removeDuplicates();
+            return true;
+        }
+    }
+    return false;
+}
+
 bool MediaPool::setAssetFlag(int id, AssetFlag flag)
 {
     if (flag != AssetFlag::None && flag != AssetFlag::Favorite && flag != AssetFlag::Rejected)
@@ -318,6 +331,30 @@ QString MediaPool::addSmartBin(const SmartBin& smartBin)
     copy.id = QStringLiteral("smart-%1").arg(m_nextSmartBinId++);
     m_smartBins.append(copy);
     return copy.id;
+}
+
+bool MediaPool::removeSmartBin(const QString& id)
+{
+    for (int i = 0; i < m_smartBins.size(); ++i) {
+        if (m_smartBins[i].id == id) {
+            m_smartBins.removeAt(i);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool MediaPool::updateSmartBin(const QString& id, const SmartBin& smartBin)
+{
+    for (SmartBin& bin : m_smartBins) {
+        if (bin.id == id) {
+            const QString existingId = bin.id;
+            bin = smartBin;
+            bin.id = existingId;
+            return true;
+        }
+    }
+    return false;
 }
 
 const QVector<SmartBin>& MediaPool::smartBins() const

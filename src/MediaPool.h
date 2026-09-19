@@ -77,6 +77,7 @@ public:
     bool removeAsset(int id);
     bool setAssetFlag(int id, AssetFlag flag);
     bool setAssetStars(int id, int stars); // 0..5 に制限する。
+    bool setAssetTags(int id, const QStringList& tags);
     bool renameAsset(int id, const QString& name);
     const QVector<MediaAsset>& assets() const;
     const MediaAsset* getAsset(int id) const;   // 無ければ nullptr
@@ -101,6 +102,8 @@ public:
 
     // --- smart bin ---------------------------------------------------------
     QString addSmartBin(const SmartBin& smartBin);   // id 採番して返す
+    bool removeSmartBin(const QString& id);
+    bool updateSmartBin(const QString& id, const SmartBin& smartBin);
     const QVector<SmartBin>& smartBins() const;
     // nameQuery (displayName 部分一致) AND typeFilter (Unknown 以外なら一致)
     // AND tagFilter (空でなければ tags に含む) で絞り込み。
