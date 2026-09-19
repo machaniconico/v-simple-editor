@@ -5,6 +5,7 @@
 #include <QVector>
 #include <QString>
 #include <QPointF>
+#include <functional>
 #include "MaskSystem.h"
 
 // --- Color Correction / Grading ---
@@ -440,3 +441,15 @@ private:
     static QImage applyFilmGrain(const QImage &img, double amount, int size,
                                  double colorAmount, bool seedPerFrame);
 };
+
+// Shared dialog acceptance path; callback is VideoPlayer::setPreviewEffects in the UI.
+class Timeline;
+struct ClipInfo;
+struct RotoPath;
+namespace effectmaskui {
+bool updateMask(VideoEffect &effect, const RotoPath &path, const QSize &frameSize,
+                double featherPercent, bool hasBrushResult);
+void commitEffects(Timeline &timeline, int trackIndex, int clipIndex,
+                   const ClipInfo &clip, int selectedTrack, int selectedClip,
+                   const std::function<void(const QVector<VideoEffect> &, bool)> &setPreviewEffects);
+}

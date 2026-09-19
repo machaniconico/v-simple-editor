@@ -2875,6 +2875,52 @@ void syncTimeRemapEntriesToTimeline(
     syncTimeRemapEntriesToTimelineImpl(timeline, source);
 }
 
+namespace effectmaskui {
+bool updateMask(VideoEffect &effect, const RotoPath &path, const QSize &frameSize,
+                double featherPercent, bool hasBrushResult)
+{
+    // MaskSystem stores vector masks only. Never erase a mask for an unsupported result.
+    if (hasBrushResult || path.points.size() < 3 || frameSize.isEmpty())
+        return false;
+    Mask mask = effect.mask.isDefault() ? Mask() : effect.mask.masks().first();
+    mask.shape = MaskShape::Polygon;
+    mask.points.clear();
+    mask.feather.amount = featherPercent / 100.0;
+    QPainterPath outline;
+    outline.moveTo(path.points.first().position);
+    for (int i = 0; i < path.points.size(); ++i) {
+        const RotoPoint &a = path.points[i];
+        const RotoPoint &b = path.points[(i + 1) % path.points.size()];
+        outline.cubicTo(a.handleOut, b.handleIn, b.position);
+    }
+    outline.closeSubpath();
+    for (const QPointF &point : outline.toFillPolygon())
+        mask.points.append(QPointF(qBound(0.0, point.x() / frameSize.width(), 1.0),
+                                  qBound(0.0, point.y() / frameSize.height(), 1.0)));
+    if (mask.points.size() < 3)
+        return false;
+    MaskSystem system;
+    system.addMask(mask);
+    for (int i = 1; i < effect.mask.masks().size(); ++i)
+        system.addMask(effect.mask.masks()[i]);
+    effect.mask = system;
+    return true;
+}
+
+void commitEffects(Timeline &timeline, int trackIndex, int clipIndex,
+                   const ClipInfo &clip, int selectedTrack, int selectedClip,
+                   const std::function<void(const QVector<VideoEffect> &, bool)> &setPreviewEffects)
+{
+    timeline.setClipEffectsAndKeyframes(trackIndex, clipIndex, clip.effects, clip.keyframes);
+    const auto *track = timeline.videoTracks().value(trackIndex, nullptr);
+    // hasSelection() only checks V1; use the target track for V2+ as well.
+    const bool selected = track && track->selectedClip() == clipIndex
+        && selectedTrack == trackIndex && selectedClip == clipIndex;
+    // Clearing an override makes playback read effects from the timeline again.
+    setPreviewEffects(selected ? clip.effects : QVector<VideoEffect>{}, selected);
+}
+} // namespace effectmaskui
+
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
     , m_vimeoUploadDialog(nullptr)
@@ -7105,31 +7151,18 @@ void MainWindow::setupMenuBar()
             QStringLiteral("フェザー（フレーム短辺の %）"),
             100.0 * path.feather / qMin(frame.width(), frame.height()), 0.0, 100.0, 2, &accepted);
         if (!accepted) return;
-        MaskSystem system;
-        if (path.points.size() >= 3) {
-            Mask mask = clip.effects[index].mask.isDefault()
-                ? Mask() : clip.effects[index].mask.masks().first();
-            mask.shape = MaskShape::Polygon;
-            mask.points.clear();
-            mask.feather.amount = featherPercent / 100.0;
-            // Rasterizer consumes polygons: flatten the edited cubic path before normalizing.
-            QPainterPath outline;
-            outline.moveTo(path.points.first().position);
-            for (int i = 0; i < path.points.size(); ++i) {
-                const RotoPoint &a = path.points[i];
-                const RotoPoint &b = path.points[(i + 1) % path.points.size()];
-                outline.cubicTo(a.handleOut, b.handleIn, b.position);
-            }
-            outline.closeSubpath();
-            for (const QPointF &point : outline.toFillPolygon())
-                mask.points.append(QPointF(qBound(0.0, point.x() / frame.width(), 1.0),
-                                          qBound(0.0, point.y() / frame.height(), 1.0)));
-            system.addMask(mask);
+        if (!effectmaskui::updateMask(clip.effects[index], path, frame.size(),
+                                      featherPercent, !dialog.brushMask().isNull())) {
+            statusBar()->showMessage(QStringLiteral(
+                "マスクは変更されませんでした。ブラシではなく、3 点以上のパスを作成してください。"), 5000);
+            return;
         }
-        for (int i = 1; i < clip.effects[index].mask.masks().size(); ++i)
-            system.addMask(clip.effects[index].mask.masks()[i]);
-        clip.effects[index].mask = system;
-        m_timeline->setClipEffectsAndKeyframes(trackIdx, clipIdx, clip.effects, clip.keyframes);
+        int selectedTrack = -1, selectedClip = -1;
+        selectedVideoClipRef(selectedTrack, selectedClip);
+        effectmaskui::commitEffects(*m_timeline, trackIdx, clipIdx, clip,
+            selectedTrack, selectedClip, [this](const QVector<VideoEffect> &effects, bool live) {
+                if (m_player) m_player->setPreviewEffects(effects, live);
+            });
         m_effectControlsPanel->refreshFromCurrentClip();
         refreshSpecialClipPreview();
     });

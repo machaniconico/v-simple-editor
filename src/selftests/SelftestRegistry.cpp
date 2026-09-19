@@ -642,7 +642,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "flip-solid", "VEDITOR_FLIP_SOLID_SELFTEST", runFlipSolidSelftest, true,
       "Flip CPU parity, involution, preset round-trip and solid insertion/undo (G1-G5)" },
     { "effect-mask", "VEDITOR_EFFECT_MASK_SELFTEST", runEffectMaskSelftest, true,
-      "エフェクト単位マスク・保存・CPUパリティ・正規化座標 (G1-G6)" },
+      "エフェクト単位マスク・保存・CPUパリティ・正規化座標・UI確定とプレビュー同期 (G1-G8)" },
     { "effect-preset", "VEDITOR_EFFECT_PRESET_SELFTEST", runEffectPresetSelftest, false,
       "FXP-1 effect preset stack JSON save/load/apply with optional effect keyframes (5 gates)" },
     { "effect-library", "VEDITOR_EFFECT_LIBRARY_SELFTEST", runEffectLibrarySelftest, false,

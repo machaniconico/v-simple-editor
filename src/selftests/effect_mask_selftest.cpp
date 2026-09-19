@@ -5,6 +5,7 @@
 #include "../UndoManager.h"
 #include "../TimelineFrameRenderer.h"
 #include "../VideoPlayer.h"
+#include "../Rotoscope.h"
 #include "../libavcore/Encode.h"
 #include "../libavcore/FrameGrab.h"
 
@@ -167,6 +168,71 @@ int runEffectMaskSelftest()
     gate(6, scaled && presetStack && reloaded.mask.toJson() == maskedEffect(0.05).mask.toJson()
         && same(feathered, VideoEffectProcessor::applyEffect(input, reloaded))
         && !PresetLibrary::videoEffectToJson(plain).contains(QStringLiteral("mask")));
+    // Exercise the dialog's shared commit path, with the preview sink captured so
+    // the test can inspect exactly what is sent to VideoPlayer::setPreviewEffects.
+    Timeline editTimeline;
+    ClipInfo editClip;
+    editClip.filePath = video;
+    editClip.duration = editClip.outPoint = 1.0;
+    editClip.effects = {plain};
+    editTimeline.restoreFromProject(QVector<QVector<ClipInfo>>{{editClip, editClip}, {editClip}},
+        QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 100);
+    QString selectionError;
+    bool sync = editTimeline.selectClipByIndex(false, 0, 0, &selectionError);
+    QVector<VideoEffect> previewStack = editClip.effects; // stale menu preview
+    bool previewLive = true;
+    int previewWrites = 0;
+    bool timelineUpdatedFirst = false;
+    auto previewSink = [&](const QVector<VideoEffect> &effects, bool live) {
+        ++previewWrites;
+        timelineUpdatedFirst = editTimeline.videoTracks().first()->clips().first()
+            .effects.first().mask.toJson() == effect.mask.toJson();
+        previewStack = effects;
+        previewLive = live;
+    };
+    sync &= !videopreview::stackRequiresClipLocalCpu(previewStack, true);
+    editClip.effects = {effect};
+    effectmaskui::commitEffects(editTimeline, 0, 0, editClip, 0, 0, previewSink);
+    sync &= previewWrites == 1 && timelineUpdatedFirst && previewLive
+        && previewStack.size() == 1
+        && previewStack.first().mask.toJson() == effect.mask.toJson()
+        && videopreview::stackRequiresClipLocalCpu(previewStack, true);
+    sync &= editTimeline.selectClipByIndex(false, 0, 1, &selectionError);
+    effectmaskui::commitEffects(editTimeline, 0, 0, editClip, 0, 1, previewSink);
+    sync &= previewWrites == 2 && previewStack.isEmpty() && !previewLive;
+    editTimeline.clearSelection();
+    previewStack = {plain};
+    effectmaskui::commitEffects(editTimeline, 0, 0, editClip, 0, 0, previewSink);
+    sync &= previewWrites == 3 && previewStack.isEmpty() && !previewLive;
+    sync &= editTimeline.selectClipByIndex(false, 1, 0, &selectionError);
+    effectmaskui::commitEffects(editTimeline, 1, 0, editClip, 1, 0, previewSink);
+    gate(7, sync && previewWrites == 4 && previewLive && previewStack.size() == 1
+        && previewStack.first().mask.toJson() == effect.mask.toJson()
+        && editTimeline.videoTracks()[1]->clips().first().effects.first().mask.toJson()
+            == effect.mask.toJson()
+        && videopreview::stackRequiresClipLocalCpu(previewStack, true));
+
+    VideoEffect edited = effect;
+    const QJsonObject originalMask = edited.mask.toJson();
+    RotoPath editedPath;
+    bool preserved = true;
+    for (int count = 0; count < 3; ++count) {
+        editedPath.points.resize(count);
+        preserved &= !effectmaskui::updateMask(edited, editedPath, QSize(640, 360), 5.0, false)
+            && edited.mask.toJson() == originalMask;
+    }
+    editedPath.points.clear();
+    for (const QPointF &position : {QPointF(160, 90), QPointF(480, 90), QPointF(320, 270)}) {
+        RotoPoint point;
+        point.position = point.handleIn = point.handleOut = position;
+        editedPath.points.append(point);
+    }
+    // Brush output must also preserve an existing valid polygon, not silently ignore the brush.
+    preserved &= !effectmaskui::updateMask(edited, editedPath, QSize(640, 360), 5.0, true)
+        && edited.mask.toJson() == originalMask;
+    preserved &= effectmaskui::updateMask(edited, editedPath, QSize(640, 360), 5.0, false)
+        && !edited.mask.isDefault() && edited.mask.toJson() != originalMask;
+    gate(8, preserved);
     VideoEffectProcessor::setEffectMaskDisabledForTesting(false);
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
     return failed;
