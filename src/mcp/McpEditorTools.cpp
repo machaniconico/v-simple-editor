@@ -1,4 +1,5 @@
 #include "McpEditorTools.h"
+#include "../ExportUserPresets.h"
 
 #include "McpToolRegistry.h"
 #include "../CaptionEditorDialog.h"
@@ -285,9 +286,93 @@ ToolDescriptor withOutputSchema(ToolDescriptor tool,
     return tool;
 }
 
+// ColorGradingPanel basic sliders (including their scale factors) and
+// ColorWheelWidget RGB controls. hueSatWarp is deliberately not exposed.
+struct McpColorField {
+    const char *name;
+    double ColorCorrection::*member;
+    double minimum;
+    double maximum;
+};
+
+const McpColorField kMcpColorFields[] = {
+    {"brightness", &ColorCorrection::brightness, -100, 100},
+    {"contrast", &ColorCorrection::contrast, -100, 100},
+    {"saturation", &ColorCorrection::saturation, -100, 100},
+    {"hue", &ColorCorrection::hue, -180, 180},
+    {"temperature", &ColorCorrection::temperature, -100, 100},
+    {"tint", &ColorCorrection::tint, -100, 100},
+    {"gamma", &ColorCorrection::gamma, 0.1, 3},
+    {"highlights", &ColorCorrection::highlights, -100, 100},
+    {"shadows", &ColorCorrection::shadows, -100, 100},
+    {"exposure", &ColorCorrection::exposure, -3, 3},
+    // ColorGradingPanel::syncColorCorrectionFromWheels adds RGB and luma
+    // lift/gain (-1..1 each). sliderToGamma supplies 0.1..4.0 for both
+    // gamma factors, stored by syncColorCorrectionFromWheels as log2(RGB * luma).
+    {"liftR", &ColorCorrection::liftR, -2, 2},
+    {"liftG", &ColorCorrection::liftG, -2, 2},
+    {"liftB", &ColorCorrection::liftB, -2, 2},
+    {"gammaR", &ColorCorrection::gammaR, std::log2(0.01), std::log2(16.0)},
+    {"gammaG", &ColorCorrection::gammaG, std::log2(0.01), std::log2(16.0)},
+    {"gammaB", &ColorCorrection::gammaB, std::log2(0.01), std::log2(16.0)},
+    {"gainR", &ColorCorrection::gainR, -2, 2},
+    {"gainG", &ColorCorrection::gainG, -2, 2},
+    {"gainB", &ColorCorrection::gainB, -2, 2},
+    {"logShadowR", &ColorCorrection::logShadowR, -1, 1},
+    {"logShadowG", &ColorCorrection::logShadowG, -1, 1},
+    {"logShadowB", &ColorCorrection::logShadowB, -1, 1},
+    {"logMidR", &ColorCorrection::logMidR, -1, 1},
+    {"logMidG", &ColorCorrection::logMidG, -1, 1},
+    {"logMidB", &ColorCorrection::logMidB, -1, 1},
+    {"logHighR", &ColorCorrection::logHighR, -1, 1},
+    {"logHighG", &ColorCorrection::logHighG, -1, 1},
+    {"logHighB", &ColorCorrection::logHighB, -1, 1},
+};
+
+QJsonObject colorCorrectionToJson(const ColorCorrection &cc)
+{
+    QJsonObject result;
+    for (const auto &field : kMcpColorFields)
+        result.insert(QString::fromLatin1(field.name), cc.*(field.member));
+    return result;
+}
+
+QJsonObject colorCorrectionSchema(bool input = false)
+{
+    QJsonObject properties;
+    for (const auto &field : kMcpColorFields) {
+        QJsonObject property{{QStringLiteral("type"), QStringLiteral("number")}};
+        if (input) {
+            property.insert(QStringLiteral("minimum"), field.minimum);
+            property.insert(QStringLiteral("maximum"), field.maximum);
+        }
+        properties.insert(QString::fromLatin1(field.name), property);
+    }
+    if (input)
+        properties.insert(QStringLiteral("hueSatWarp"), QJsonObject{
+            {QStringLiteral("description"), QStringLiteral("対象外。指定された場合は無視し、warning を返します。")}});
+    return objectSchema(properties);
+}
+
+QJsonObject lutOutputSchema()
+{
+    return outputSchemaOf(QJsonObject{
+        {QStringLiteral("filePath"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
+        {QStringLiteral("intensity"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}}
+    }, {QStringLiteral("filePath"), QStringLiteral("intensity")});
+}
+
+QJsonObject lutToJson(const ClipInfo &clip)
+{
+    return QJsonObject{{QStringLiteral("filePath"), clip.lutFilePath},
+                       {QStringLiteral("intensity"), clip.lutIntensity}};
+}
+
 QJsonObject clipOutputItemSchema()
 {
     const QJsonObject properties{
+        {QStringLiteral("colorCorrection"), colorCorrectionSchema()},
+        {QStringLiteral("lut"), lutOutputSchema()},
         {QStringLiteral("index"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
         {QStringLiteral("displayName"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
         {QStringLiteral("filePath"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
@@ -331,16 +416,40 @@ QJsonObject clipOutputItemSchema()
     });
 }
 
+QJsonObject trackPropertiesSchema()
+{
+    QJsonObject properties;
+    for (const QString &key : {QStringLiteral("name"), QStringLiteral("color")})
+        properties.insert(key, QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}});
+    for (const QString &key : {QStringLiteral("locked"), QStringLiteral("muted"),
+                              QStringLiteral("solo"), QStringLiteral("hidden")})
+        properties.insert(key, QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}});
+    properties.insert(QStringLiteral("index"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}});
+    return properties;
+}
+
+QJsonObject trackPropertiesToJson(const TimelineTrack *track, int index)
+{
+    return QJsonObject{
+        {QStringLiteral("index"), index},
+        {QStringLiteral("name"), track ? track->customName : QString{}},
+        {QStringLiteral("color"), track && track->color.isValid() ? track->color.name() : QString{}},
+        {QStringLiteral("locked"), track && track->isLocked()},
+        {QStringLiteral("muted"), track && track->isMuted()},
+        {QStringLiteral("solo"), track && track->isSolo()},
+        {QStringLiteral("hidden"), track && track->isHidden()}
+    };
+}
+
 QJsonObject trackOutputItemSchema()
 {
-    return outputSchemaOf(QJsonObject{
-        {QStringLiteral("index"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
-        {QStringLiteral("locked"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
-        {QStringLiteral("clips"), QJsonObject{
-            {QStringLiteral("type"), QStringLiteral("array")},
-            {QStringLiteral("items"), clipOutputItemSchema()}
-        }}
-    }, {QStringLiteral("index"), QStringLiteral("locked"), QStringLiteral("clips")});
+    QJsonObject properties = trackPropertiesSchema();
+    properties.insert(QStringLiteral("clips"), QJsonObject{
+        {QStringLiteral("type"), QStringLiteral("array")},
+        {QStringLiteral("items"), clipOutputItemSchema()}
+    });
+    return outputSchemaOf(properties,
+        {QStringLiteral("index"), QStringLiteral("locked"), QStringLiteral("clips")});
 }
 
 QJsonObject captionOutputItemSchema()
@@ -916,6 +1025,8 @@ QJsonObject clipToJson(const ClipInfo& clip, int clipIndex, double startSec,
             {QStringLiteral("startSec"), effect.startSec}, {QStringLiteral("endSec"), effect.endSec}});
     }
     return QJsonObject{
+        {QStringLiteral("colorCorrection"), colorCorrectionToJson(clip.colorCorrection)},
+        {QStringLiteral("lut"), lutToJson(clip)},
         {QStringLiteral("effects"), effects},
         {QStringLiteral("index"), clipIndex},
         {QStringLiteral("displayName"), clip.displayName},
@@ -1008,11 +1119,9 @@ QJsonArray tracksToJson(const Timeline* timeline, TrackKind kind)
                                     overlaps.at(clipIndex)));
             cursorSec += clip.speed > 0.0 ? clip.effectiveDuration() : 0.0;
         }
-        result.append(QJsonObject{
-            {QStringLiteral("index"), trackIndex},
-            {QStringLiteral("locked"), trackObject && trackObject->isLocked()},
-            {QStringLiteral("clips"), clips}
-        });
+        QJsonObject item = trackPropertiesToJson(trackObject, trackIndex);
+        item.insert(QStringLiteral("clips"), clips);
+        result.append(item);
     }
     return result;
 }
@@ -1305,6 +1414,37 @@ void McpEditorTools::registerReadTools()
 {
     if (!m_registry)
         return;
+
+    m_registry->registerTool(withOutputSchema({
+        QStringLiteral("get_sequences"),
+        QStringLiteral("メインを含むシーケンス一覧とアクティブIDを返す。"),
+        objectSchema(QJsonObject{}),
+        [this](const QJsonObject &args, QString *err) -> QJsonObject {
+            if (!rejectUnknownArguments(args, {}, err)) return {};
+            const Timeline *current = timeline();
+            if (!current) return setError(err, QStringLiteral("エディターを利用できません")), QJsonObject{};
+            QJsonArray sequences;
+            for (const auto &sequence : current->sequenceList()) {
+                int clipCount = 0;
+                for (const auto &track : sequence.videoTracks) clipCount += int(track.size());
+                for (const auto &track : sequence.audioTracks) clipCount += int(track.size());
+                sequences.append(QJsonObject{{"id", sequence.id}, {"name", sequence.name},
+                    {"videoTrackCount", int(sequence.videoTracks.size())},
+                    {"audioTrackCount", int(sequence.audioTracks.size())}, {"clipCount", clipCount}});
+            }
+            return {{"ok", true}, {"activeId", current->activeSequenceId().isEmpty()
+                ? QStringLiteral("main") : current->activeSequenceId()}, {"sequences", sequences}};
+        }
+    }, outputSchemaOf(QJsonObject{
+        {"ok", QJsonObject{{"type", "boolean"}}},
+        {"activeId", QJsonObject{{"type", "string"}}},
+        {"sequences", QJsonObject{{"type", "array"}, {"items", outputSchemaOf(QJsonObject{
+            {"id", QJsonObject{{"type", "string"}}}, {"name", QJsonObject{{"type", "string"}}},
+            {"videoTrackCount", QJsonObject{{"type", "integer"}}},
+            {"audioTrackCount", QJsonObject{{"type", "integer"}}},
+            {"clipCount", QJsonObject{{"type", "integer"}}}},
+            {"id", "name", "videoTrackCount", "audioTrackCount", "clipCount"})}}}
+    }, {"ok", "activeId", "sequences"})));
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("compare_project"),
@@ -1781,9 +1921,28 @@ void McpEditorTools::registerWriteTools()
     if (!m_registry)
         return;
 
+    m_registry->registerTool(withOutputSchema({
+        QStringLiteral("set_active_sequence"),
+        QStringLiteral("指定IDのシーケンスへ切り替える。Undoは追加しない。"),
+        schemaWithRequired(QJsonObject{{"id", QJsonObject{{"type", "string"}}}}, {"id"}),
+        guardedWrite(QStringLiteral("set_active_sequence"),
+            [this](const QJsonObject &args, QString *err) -> QJsonObject {
+                if (!rejectUnknownArguments(args, {QStringLiteral("id")}, err)) return {};
+                QString id;
+                if (!requiredString(args, QStringLiteral("id"), &id, err)) return {};
+                Timeline *current = timeline();
+                if (!current) return setError(err, QStringLiteral("エディターを利用できません")), QJsonObject{};
+                if (!current->setActiveSequence(id))
+                    return setError(err, QStringLiteral("シーケンスが見つかりません: %1").arg(id)), QJsonObject{};
+                return {{"ok", true}, {"activeId", id}};
+            })
+    }, outputSchemaOf(QJsonObject{{"ok", QJsonObject{{"type", "boolean"}}},
+        {"activeId", QJsonObject{{"type", "string"}}}}, {"ok", "activeId"})));
+
     const QJsonObject clipProperties = clipSelectorProperties();
 
-    const QJsonObject exportVideoOutputSchema = outputSchemaOf(QJsonObject{
+    QJsonObject exportVideoOutputSchema = outputSchemaOf(QJsonObject{
+        {QStringLiteral("preset"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
         {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
         {QStringLiteral("jobId"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
         {QStringLiteral("status"), QJsonObject{
@@ -1798,12 +1957,20 @@ void McpEditorTools::registerWriteTools()
         {QStringLiteral("videoCodec"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
         {QStringLiteral("videoBitrate"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
         {QStringLiteral("audioCodec"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
-        {QStringLiteral("audioBitrate"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}}
-    }, {QStringLiteral("ok"), QStringLiteral("jobId"),
-        QStringLiteral("status"), QStringLiteral("progress"),
-        QStringLiteral("outputPath"), QStringLiteral("width"),
-        QStringLiteral("height"), QStringLiteral("fps"),
-        QStringLiteral("videoCodec"), QStringLiteral("videoBitrate")});
+        {QStringLiteral("audioBitrate"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+        {QStringLiteral("warnings"), QJsonObject{{QStringLiteral("type"), QStringLiteral("array")},
+            {QStringLiteral("items"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}}}}
+    }, {QStringLiteral("ok")});
+
+    // Keep the queued-video contract explicit while admitting a disjoint synchronous result.
+    exportVideoOutputSchema.insert(QStringLiteral("oneOf"), QJsonArray{
+        QJsonObject{{QStringLiteral("required"), QJsonArray{
+            QStringLiteral("jobId"), QStringLiteral("status"), QStringLiteral("progress"),
+            QStringLiteral("outputPath"), QStringLiteral("width"), QStringLiteral("height"),
+            QStringLiteral("fps"), QStringLiteral("videoCodec"), QStringLiteral("videoBitrate")}}},
+        QJsonObject{{QStringLiteral("required"), QJsonArray{QStringLiteral("outputPath")}},
+            {QStringLiteral("not"), QJsonObject{{QStringLiteral("required"), QJsonArray{QStringLiteral("jobId")}}}}}
+    });
 
     const QJsonObject importMediaOutputSchema = outputSchemaOf(QJsonObject{
         {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
@@ -2181,10 +2348,25 @@ void McpEditorTools::registerWriteTools()
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("export_video"),
-        QStringLiteral("現在のタイムラインを動画ファイルへ非同期で書き出す。tools/call はジョブ投入後すぐに jobId を返し、完了は get_export_status で確認する。width / height / fps の省略時は現在のプロジェクト設定を使い、videoBitrate / audioBitrate は kbps (既定 10000 / 192)、videoCodec / audioCodec は ffmpeg のエンコーダ名 (既定 libx264 / aac)。音声はトリム・分割・並べ替え・音量・ミュートを反映したタイムラインのミックスを ffmpeg で作ってから多重化する (ffmpeg が PATH に無いと単純な 1 クリップ構成以外は failed になる)。"),
+        QStringLiteral("audioOnly=true は m4a / wav / mp3 の音声のみを同期で書き出し、ok と outputPath を返す (jobId なし)。映像設定は無視して warnings を返す。通常は現在のタイムラインを動画ファイルへ非同期で書き出す。tools/call はジョブ投入後すぐに jobId を返し、完了は get_export_status で確認する。width / height / fps の省略時は現在のプロジェクト設定を使い、videoBitrate / audioBitrate は kbps (既定 10000 / 192)、videoCodec / audioCodec は ffmpeg のエンコーダ名 (既定 libx264 / aac)。音声はトリム・分割・並べ替え・音量・ミュートを反映したタイムラインのミックスを ffmpeg で作ってから多重化する (ffmpeg が PATH に無いと単純な 1 クリップ構成以外は failed になる)。"),
         schemaWithRequired(QJsonObject{
+            {QStringLiteral("preset"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
             {QStringLiteral("outputPath"), QJsonObject{
                 {QStringLiteral("type"), QStringLiteral("string")}
+            }},
+            {QStringLiteral("keepAlpha"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("boolean")},
+                {QStringLiteral("default"), false}
+            }},
+            {QStringLiteral("proresProfile"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("integer")},
+                {QStringLiteral("minimum"), 0}, {QStringLiteral("maximum"), 5},
+                {QStringLiteral("default"), 1},
+                {QStringLiteral("description"), QStringLiteral("ProRes プロファイル。省略時は既存の既定値 1")}
+            }},
+            {QStringLiteral("audioOnly"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("boolean")},
+                {QStringLiteral("default"), false}
             }},
             {QStringLiteral("width"), QJsonObject{
                 {QStringLiteral("type"), QStringLiteral("integer")},
@@ -2200,6 +2382,16 @@ void McpEditorTools::registerWriteTools()
             }},
             {QStringLiteral("videoCodec"), QJsonObject{
                 {QStringLiteral("type"), QStringLiteral("string")}
+            }},
+            {QStringLiteral("rateControl"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("string")},
+                {QStringLiteral("enum"), QJsonArray{QStringLiteral("bitrate"), QStringLiteral("crf")}}
+            }},
+            {QStringLiteral("crf"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("integer")},
+                {QStringLiteral("minimum"), -1},
+                {QStringLiteral("maximum"), 63},
+                {QStringLiteral("description"), QStringLiteral("品質。-1 は既定、H.264/H.265 は 0..51、AV1 は 0..63")}
             }},
             {QStringLiteral("videoBitrate"), QJsonObject{
                 {QStringLiteral("type"), QStringLiteral("integer")},
@@ -2220,11 +2412,17 @@ void McpEditorTools::registerWriteTools()
                      [this](const QJsonObject& args, QString* err) -> QJsonObject {
             if (!rejectUnknownArguments(args,
                                         {QStringLiteral("outputPath"),
+                                         QStringLiteral("preset"),
+                                         QStringLiteral("keepAlpha"),
+                                         QStringLiteral("proresProfile"),
+                                         QStringLiteral("audioOnly"),
                                          QStringLiteral("width"),
                                          QStringLiteral("height"),
                                          QStringLiteral("fps"),
                                          QStringLiteral("videoCodec"),
                                          QStringLiteral("videoBitrate"),
+                                         QStringLiteral("rateControl"),
+                                         QStringLiteral("crf"),
                                          QStringLiteral("audioCodec"),
                                          QStringLiteral("audioBitrate")}, err))
                 return {};
@@ -2255,9 +2453,61 @@ void McpEditorTools::registerWriteTools()
                 return setError(err, QStringLiteral("タイムラインが空です。import_media で素材を追加してください")),
                        QJsonObject();
 
-            const int defaultWidth = qMax(2, m_window->m_projectConfig.width);
-            const int defaultHeight = qMax(2, m_window->m_projectConfig.height);
-            const double defaultFps = qMax(1, m_window->m_projectConfig.fps);
+            ExportConfig baseConfig;
+            baseConfig.width = qMax(2, m_window->m_projectConfig.width);
+            baseConfig.height = qMax(2, m_window->m_projectConfig.height);
+            baseConfig.fps = qMax(1, m_window->m_projectConfig.fps);
+            QString presetName;
+            if (args.contains(QStringLiteral("preset"))) {
+                if (!requiredString(args, QStringLiteral("preset"), &presetName, err)) return {};
+                if (!ExportUserPresets::resolve(presetName, &baseConfig, err)) return {};
+            }
+            if (args.contains(QStringLiteral("keepAlpha")) && !args.value(QStringLiteral("keepAlpha")).isBool())
+                return setError(err, QStringLiteral("keepAlpha は真偽値で指定してください")), QJsonObject();
+            const bool keepAlpha = args.value(QStringLiteral("keepAlpha")).toBool(baseConfig.keepAlpha);
+            int proresProfile = baseConfig.proresProfile >= 0 ? baseConfig.proresProfile : 1;
+            if (args.contains(QStringLiteral("proresProfile"))) {
+                const auto value = args.value(QStringLiteral("proresProfile"));
+                const double number = value.toDouble(-1);
+                if (!value.isDouble() || !std::isfinite(number) || std::floor(number) != number
+                    || number < 0 || number > 5)
+                    return setError(err, QStringLiteral("proresProfile は 0..5 の整数で指定してください")), QJsonObject();
+                proresProfile = static_cast<int>(number);
+            }
+            if (keepAlpha && args.value(QStringLiteral("audioOnly")).toBool(baseConfig.audioOnly))
+                return setError(err, QStringLiteral("音声のみの書き出しではアルファを保持できません")), QJsonObject();
+            if (args.contains(QStringLiteral("audioOnly")) && !args.value(QStringLiteral("audioOnly")).isBool())
+                return setError(err, QStringLiteral("audioOnly は真偽値で指定してください")), QJsonObject();
+            if (args.value(QStringLiteral("audioOnly")).toBool(baseConfig.audioOnly)) {
+                ExportConfig config = baseConfig;
+                config.audioOnly = true;
+                config.outputPath = outputPath;
+                config.container = outputInfo.suffix().toLower();
+                config.audioCodec = ExportConfig::audioCodecForContainer(config.container);
+                if (config.audioCodec.isEmpty())
+                    return setError(err, QStringLiteral("音声の書き出し先には .m4a / .wav / .mp3 を指定してください")), QJsonObject();
+                if (!positiveInteger(args, QStringLiteral("audioBitrate"), config.audioBitrate, &config.audioBitrate, err))
+                    return {};
+                if (args.contains(QStringLiteral("audioCodec"))
+                    && (!args.value(QStringLiteral("audioCodec")).isString()
+                        || args.value(QStringLiteral("audioCodec")).toString() != config.audioCodec))
+                    return setError(err, QStringLiteral("音声コーデックはコンテナに対応する %1 を指定してください").arg(config.audioCodec)), QJsonObject();
+                QJsonArray warnings;
+                for (const QString &key : {QStringLiteral("width"), QStringLiteral("height"), QStringLiteral("fps"),
+                        QStringLiteral("videoCodec"), QStringLiteral("videoBitrate"), QStringLiteral("rateControl"), QStringLiteral("crf")}) {
+                    if (args.contains(key))
+                        warnings.append(QStringLiteral("音声のみの書き出しでは %1 は無視されます").arg(key));
+                }
+                if (!m_window->exportAudioOnly(config, err)) return {};
+                QJsonObject result{{QStringLiteral("ok"), true}, {QStringLiteral("outputPath"), outputPath}};
+                if (!presetName.isEmpty()) result.insert(QStringLiteral("preset"), presetName);
+                if (!warnings.isEmpty()) result.insert(QStringLiteral("warnings"), warnings);
+                return result;
+            }
+
+            const int defaultWidth = baseConfig.width;
+            const int defaultHeight = baseConfig.height;
+            const double defaultFps = baseConfig.fps;
             int width = defaultWidth;
             int height = defaultHeight;
             if (!positiveInteger(args, QStringLiteral("width"), defaultWidth,
@@ -2276,7 +2526,7 @@ void McpEditorTools::registerWriteTools()
 
             // ProjectConfig が保持する書き出し設定は現状サイズと fps までなので、
             // codec / bitrate は ExportConfig と同じ既定値を使う。
-            QString videoCodec = QStringLiteral("libx264");
+            QString videoCodec = baseConfig.videoCodec;
             if (args.contains(QStringLiteral("videoCodec"))) {
                 const QJsonValue value = args.value(QStringLiteral("videoCodec"));
                 if (!value.isString() || value.toString().trimmed().isEmpty())
@@ -2285,12 +2535,38 @@ void McpEditorTools::registerWriteTools()
                 videoCodec = value.toString().trimmed();
             }
 
-            int videoBitrate = 10000; // kbps。ExportConfig の既定値と合わせる。
+            const QString alphaError = RenderQueue::alphaExportError(QJsonObject{
+                {QStringLiteral("keepAlpha"), keepAlpha},
+                {QStringLiteral("videoCodec"), videoCodec},
+                {QStringLiteral("proresProfile"), proresProfile}});
+            if (!alphaError.isEmpty()) return setError(err, alphaError), QJsonObject();
+
+            QString rateControl = baseConfig.rateControl == ExportConfig::RateControl::Crf
+                ? QStringLiteral("crf") : QStringLiteral("bitrate");
+            if (args.contains(QStringLiteral("rateControl"))) {
+                const QJsonValue value = args.value(QStringLiteral("rateControl"));
+                if (!value.isString() || (value.toString() != QStringLiteral("bitrate")
+                    && value.toString() != QStringLiteral("crf")))
+                    return setError(err, QStringLiteral("rateControl は bitrate または crf で指定してください")), QJsonObject();
+                rateControl = value.toString();
+            }
+            int crf = baseConfig.crf;
+            if (args.contains(QStringLiteral("crf"))) {
+                const QJsonValue value = args.value(QStringLiteral("crf"));
+                const double number = value.toDouble(-2);
+                const int maximum = videoCodec.contains(QStringLiteral("av1")) ? 63 : 51;
+                if (!value.isDouble() || !std::isfinite(number) || std::floor(number) != number
+                    || number < -1 || number > maximum)
+                    return setError(err, QStringLiteral("crf は -1 または 0..%1 の整数で指定してください").arg(maximum)), QJsonObject();
+                crf = static_cast<int>(number);
+            }
+
+            int videoBitrate = baseConfig.videoBitrate; // kbps。ExportConfig の既定値と合わせる。
             if (!positiveInteger(args, QStringLiteral("videoBitrate"),
                                  videoBitrate, &videoBitrate, err))
                 return {};
 
-            QString audioCodec = QStringLiteral("aac");
+            QString audioCodec = baseConfig.audioCodec;
             if (args.contains(QStringLiteral("audioCodec"))) {
                 const QJsonValue value = args.value(QStringLiteral("audioCodec"));
                 if (!value.isString() || value.toString().trimmed().isEmpty())
@@ -2298,7 +2574,7 @@ void McpEditorTools::registerWriteTools()
                            QJsonObject();
                 audioCodec = value.toString().trimmed();
             }
-            int audioBitrate = 192; // kbps。ExportConfig の既定値と合わせる。
+            int audioBitrate = baseConfig.audioBitrate; // kbps。ExportConfig の既定値と合わせる。
             if (!positiveInteger(args, QStringLiteral("audioBitrate"),
                                  audioBitrate, &audioBitrate, err))
                 return {};
@@ -2337,6 +2613,29 @@ void McpEditorTools::registerWriteTools()
                 {QStringLiteral("audioBitrate"), audioBitrate},
                 {QStringLiteral("loudnessGainDb"), loudnessGainDb}
             };
+            if (!presetName.isEmpty()) {
+                // Preserve all preset options, then apply the validated explicit overrides.
+                QJsonObject merged = ExportUserPresets::toJson(baseConfig);
+                for (auto it = job.exportConfig.constBegin(); it != job.exportConfig.constEnd(); ++it)
+                    merged.insert(it.key(), it.value());
+                merged.insert(QStringLiteral("audioOnly"), false);
+                merged.insert(QStringLiteral("rateControl"), rateControl);
+                merged.insert(QStringLiteral("crf"), crf);
+                merged.insert(QStringLiteral("hdrMode"), baseConfig.hdrSettings.mode);
+                merged.insert(QStringLiteral("hdrMasterMinLum"), baseConfig.hdrSettings.masterDisplayLuminanceMin);
+                merged.insert(QStringLiteral("hdrMasterMaxLum"), baseConfig.hdrSettings.masterDisplayLuminanceMax);
+                merged.insert(QStringLiteral("hdrMaxCll"), baseConfig.hdrSettings.maxCll);
+                merged.insert(QStringLiteral("hdrMaxFall"), baseConfig.hdrSettings.maxFall);
+                job.exportConfig = merged;
+            }
+            if (keepAlpha || args.contains(QStringLiteral("keepAlpha")))
+                job.exportConfig.insert(QStringLiteral("keepAlpha"), keepAlpha);
+            if (args.contains(QStringLiteral("proresProfile")) || keepAlpha)
+                job.exportConfig.insert(QStringLiteral("proresProfile"), proresProfile);
+            if (rateControl != QStringLiteral("bitrate"))
+                job.exportConfig.insert(QStringLiteral("rateControl"), rateControl);
+            if (crf != -1)
+                job.exportConfig.insert(QStringLiteral("crf"), crf);
             job.exportConfig.insert(
                 QStringLiteral("timecodeBurnIn"),
                 m_window->m_tcBurnIn.toJson());
@@ -2383,7 +2682,7 @@ void McpEditorTools::registerWriteTools()
                 queueGuard->start();
             });
 
-            return QJsonObject{
+            QJsonObject result{
                 {QStringLiteral("ok"), true},
                 {QStringLiteral("jobId"), job.uuid},
                 {QStringLiteral("status"), QStringLiteral("queued")},
@@ -2397,6 +2696,8 @@ void McpEditorTools::registerWriteTools()
                 {QStringLiteral("audioCodec"), audioCodec},
                 {QStringLiteral("audioBitrate"), audioBitrate}
             };
+            if (!presetName.isEmpty()) result.insert(QStringLiteral("preset"), presetName);
+            return result;
         })
     }, exportVideoOutputSchema));
 
@@ -2586,6 +2887,148 @@ void McpEditorTools::registerWriteTools()
             };
         })
     }, openProjectOutputSchema));
+
+    m_registry->registerTool(withOutputSchema({
+        QStringLiteral("add_track"),
+        QStringLiteral("映像または音声トラックを末尾に追加する。1回のUndoで戻せる。"),
+        schemaWithRequired(QJsonObject{{QStringLiteral("kind"),
+            trackSelectorProperties().value(QStringLiteral("kind"))}}, {QStringLiteral("kind")}),
+        guardedWrite(QStringLiteral("add_track"),
+            [this](const QJsonObject &args, QString *err) -> QJsonObject {
+            if (!rejectUnknownArguments(args, {QStringLiteral("kind")}, err)) return {};
+            QString kind;
+            if (!requiredString(args, QStringLiteral("kind"), &kind, err)) return {};
+            if (kind != QStringLiteral("video") && kind != QStringLiteral("audio"))
+                return setError(err, QStringLiteral("kind must be video or audio")), QJsonObject{};
+            auto *currentTimeline = timeline();
+            if (!m_window || !currentTimeline)
+                return setError(err, QStringLiteral("editor not available")), QJsonObject{};
+            const bool audio = kind == QStringLiteral("audio");
+            if (audio) currentTimeline->addAudioTrack();
+            else currentTimeline->addVideoTrack();
+            const int count = audio ? currentTimeline->audioTrackCount() : currentTimeline->videoTrackCount();
+            m_window->setWindowModified(true);
+            syncSelectionAfterEdit();
+            return QJsonObject{{QStringLiteral("ok"), true},
+                {QStringLiteral("trackIndex"), count - 1}, {QStringLiteral("trackCount"), count}};
+        })
+    }, outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("trackIndex"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+        {QStringLiteral("trackCount"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}}
+    }, {QStringLiteral("ok"), QStringLiteral("trackIndex"), QStringLiteral("trackCount")})));
+
+    m_registry->registerTool(withOutputSchema({
+        QStringLiteral("remove_track"),
+        QStringLiteral("指定トラックと全クリップを削除する。最後の1本とロック中は拒否。1回のUndoで戻せる。"),
+        schemaWithRequired(trackSelectorProperties(), {QStringLiteral("kind"), QStringLiteral("trackIndex")}),
+        guardedWrite(QStringLiteral("remove_track"),
+            [this](const QJsonObject &args, QString *err) -> QJsonObject {
+            if (!rejectUnknownArguments(args, {QStringLiteral("kind"), QStringLiteral("trackIndex")}, err)) return {};
+            TrackTarget target;
+            auto *currentTimeline = timeline();
+            if (!readTrackTarget(args, m_window, currentTimeline, &target, err)) return {};
+            const bool audio = target.kind == TrackKind::Audio;
+            if (!currentTimeline->removeTrack(audio, target.trackIndex, err)) return {};
+            m_window->setWindowModified(true);
+            syncSelectionAfterEdit();
+            return QJsonObject{{QStringLiteral("ok"), true}, {QStringLiteral("trackCount"),
+                audio ? currentTimeline->audioTrackCount() : currentTimeline->videoTrackCount()}};
+        })
+    }, outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("trackCount"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}}
+    }, {QStringLiteral("ok"), QStringLiteral("trackCount")})));
+
+    m_registry->registerTool(withOutputSchema({
+        QStringLiteral("move_track"),
+        QStringLiteral("指定トラックを同じ種類の指定位置へ移動する。1回のUndoで戻せる。"),
+        schemaWithRequired(mergedProperties(trackSelectorProperties(), QJsonObject{
+            {QStringLiteral("newTrackIndex"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")},
+                {QStringLiteral("minimum"), 0}}}}),
+            {QStringLiteral("kind"), QStringLiteral("trackIndex"), QStringLiteral("newTrackIndex")}),
+        guardedWrite(QStringLiteral("move_track"),
+            [this](const QJsonObject &args, QString *err) -> QJsonObject {
+            if (!rejectUnknownArguments(args, {QStringLiteral("kind"), QStringLiteral("trackIndex"),
+                    QStringLiteral("newTrackIndex")}, err)) return {};
+            TrackTarget target;
+            auto *currentTimeline = timeline();
+            if (!readTrackTarget(args, m_window, currentTimeline, &target, err)) return {};
+            int destination = -1;
+            if (!args.contains(QStringLiteral("newTrackIndex")))
+                return setError(err, QStringLiteral("newTrackIndex is required")), QJsonObject{};
+            if (!nonNegativeInteger(args, QStringLiteral("newTrackIndex"), -1, &destination, err)) return {};
+            if (!currentTimeline->moveTrack(target.kind == TrackKind::Audio, target.trackIndex, destination, err)) return {};
+            if (target.trackIndex != destination) m_window->setWindowModified(true);
+            syncSelectionAfterEdit();
+            return QJsonObject{{QStringLiteral("ok"), true}, {QStringLiteral("trackIndex"), destination}};
+        })
+    }, outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("trackIndex"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}}
+    }, {QStringLiteral("ok"), QStringLiteral("trackIndex")})));
+
+    QJsonObject trackPropertyInputs = trackPropertiesSchema();
+    trackPropertyInputs.remove(QStringLiteral("index"));
+    trackPropertyInputs.remove(QStringLiteral("locked"));
+    m_registry->registerTool(withOutputSchema({
+        QStringLiteral("set_track_property"),
+        QStringLiteral("トラックの名前・色・再生フラグを設定。名前と色はまとめて1回のUndo、再生フラグはUndo対象外。空の名前・色で既定に戻す。"),
+        schemaWithRequired(mergedProperties(trackSelectorProperties(), trackPropertyInputs),
+                           {QStringLiteral("kind"), QStringLiteral("trackIndex")}),
+        guardedWrite(QStringLiteral("set_track_property"),
+            [this](const QJsonObject &args, QString *err) -> QJsonObject {
+            if (!rejectUnknownArguments(args, {QStringLiteral("kind"), QStringLiteral("trackIndex"),
+                    QStringLiteral("name"), QStringLiteral("color"), QStringLiteral("muted"),
+                    QStringLiteral("solo"), QStringLiteral("hidden")}, err)) return {};
+            TrackTarget target;
+            Timeline *currentTimeline = timeline();
+            if (!readTrackTarget(args, m_window, currentTimeline, &target, err)) return {};
+            for (const QString &key : {QStringLiteral("name"), QStringLiteral("color")}) {
+                if (args.contains(key) && !args.value(key).isString())
+                    return setError(err, key + QStringLiteral(" must be a string")), QJsonObject{};
+            }
+            for (const QString &key : {QStringLiteral("muted"), QStringLiteral("solo"), QStringLiteral("hidden")}) {
+                if (args.contains(key) && !args.value(key).isBool())
+                    return setError(err, key + QStringLiteral(" must be a boolean")), QJsonObject{};
+            }
+            QString name = args.contains(QStringLiteral("name"))
+                ? args.value(QStringLiteral("name")).toString() : target.track->customName;
+            QColor color = target.track->color;
+            if (args.contains(QStringLiteral("color"))) {
+                const QString text = args.value(QStringLiteral("color")).toString();
+                bool valid = text.isEmpty() || (text.size() == 7 && text.startsWith(QLatin1Char('#')));
+                for (int i = 1; valid && i < text.size(); ++i)
+                    valid = QStringLiteral("0123456789abcdefABCDEF").contains(text.at(i));
+                if (!valid) return setError(err, QStringLiteral("color must be #RRGGBB or empty")), QJsonObject{};
+                color = text.isEmpty() ? QColor{} : QColor(text);
+            }
+            const QJsonObject before = trackPropertiesToJson(target.track, target.trackIndex);
+            const bool undoRecorded = name != target.track->customName || color != target.track->color;
+            if (!currentTimeline->setTrackAppearance(target.kind == TrackKind::Audio,
+                    target.trackIndex, name, color, err)) return {};
+            QJsonObject flags = currentTimeline->trackFlagsToJson();
+            const QString kind = target.kindName;
+            QJsonArray items = flags.value(kind).toArray();
+            QJsonObject item = items.at(target.trackIndex).toObject();
+            for (const QString &key : {QStringLiteral("muted"), QStringLiteral("solo"), QStringLiteral("hidden")})
+                if (args.contains(key)) item.insert(key, args.value(key));
+            items[target.trackIndex] = item;
+            flags.insert(kind, items);
+            currentTimeline->applyTrackFlagsFromJson(flags);
+            const QJsonObject after = trackPropertiesToJson(target.track, target.trackIndex);
+            if (before != after) m_window->setWindowModified(true);
+            syncSelectionAfterEdit();
+            return QJsonObject{{QStringLiteral("ok"), true},
+                {QStringLiteral("track"), after}, {QStringLiteral("undoRecorded"), undoRecorded}};
+        })
+    }, outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("track"), outputSchemaOf(trackPropertiesSchema(),
+            {QStringLiteral("index"), QStringLiteral("name"), QStringLiteral("color"),
+             QStringLiteral("locked"), QStringLiteral("muted"), QStringLiteral("solo"), QStringLiteral("hidden")})},
+        {QStringLiteral("undoRecorded"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}}
+    }, {QStringLiteral("ok"), QStringLiteral("track"), QStringLiteral("undoRecorded")})));
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("set_track_locked"),
@@ -3124,6 +3567,106 @@ void McpEditorTools::registerWriteTools()
             };
         })
     }, relinkMediaOutputSchema));
+
+    m_registry->registerTool(withOutputSchema({
+        QStringLiteral("set_color_correction"),
+        QStringLiteral("映像クリップの色補正を部分更新する。reset=true は既定値へ戻してから values を適用する。hueSatWarp は無視して警告を返す。Ctrl+Z / undo で戻せる。"),
+        schemaWithRequired(mergedProperties(clipProperties, QJsonObject{
+            {QStringLiteral("values"), colorCorrectionSchema(true)},
+            {QStringLiteral("reset"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}}
+        }), {QStringLiteral("clipIndex"), QStringLiteral("values")}),
+        guardedWrite(QStringLiteral("set_color_correction"),
+                     [this](const QJsonObject &args, QString *err) -> QJsonObject {
+            if (!rejectUnknownArguments(args, {QStringLiteral("kind"), QStringLiteral("trackIndex"),
+                    QStringLiteral("clipIndex"), QStringLiteral("values"), QStringLiteral("reset")}, err))
+                return {};
+            if (!args.value(QStringLiteral("values")).isObject())
+                return setError(err, QStringLiteral("values にはオブジェクトを指定してください")), QJsonObject{};
+            if (args.contains(QStringLiteral("reset")) && !args.value(QStringLiteral("reset")).isBool())
+                return setError(err, QStringLiteral("reset には真偽値を指定してください")), QJsonObject{};
+            ClipTarget target;
+            if (!readClipTarget(args, m_window, timeline(), &target, err)) return {};
+            if (target.audio)
+                return setError(err, QStringLiteral("色補正は映像クリップにのみ設定できます")), QJsonObject{};
+            ColorCorrection cc = args.value(QStringLiteral("reset")).toBool(false)
+                ? ColorCorrection{} : target.track->clips().at(target.clipIndex).colorCorrection;
+            const QJsonObject values = args.value(QStringLiteral("values")).toObject();
+            bool warpIgnored = false;
+            for (auto it = values.constBegin(); it != values.constEnd(); ++it) {
+                if (it.key() == QStringLiteral("hueSatWarp")) {
+                    warpIgnored = true;
+                    continue;
+                }
+                const McpColorField *matched = nullptr;
+                for (const auto &field : kMcpColorFields) {
+                    if (it.key() == QString::fromLatin1(field.name)) {
+                        matched = &field;
+                        break;
+                    }
+                }
+                if (!matched)
+                    return setError(err, QStringLiteral("未知の色補正フィールド: %1").arg(it.key())), QJsonObject{};
+                const double value = it.value().toDouble();
+                if (!it.value().isDouble() || !std::isfinite(value)
+                    || value < matched->minimum || value > matched->maximum)
+                    return setError(err, QStringLiteral("%1 は %2 以上 %3 以下の数値で指定してください")
+                        .arg(it.key()).arg(matched->minimum).arg(matched->maximum)), QJsonObject{};
+                cc.*(matched->member) = value;
+            }
+            timeline()->setClipColorCorrection(target.trackIndex, target.clipIndex, cc);
+            syncSelectionAfterEdit();
+            QJsonObject result{{QStringLiteral("ok"), true},
+                               {QStringLiteral("colorCorrection"), colorCorrectionToJson(cc)}};
+            if (warpIgnored)
+                result.insert(QStringLiteral("warning"), QStringLiteral("hueSatWarp は対象外のため無視しました"));
+            return result;
+        })
+    }, outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("colorCorrection"), colorCorrectionSchema()},
+        {QStringLiteral("warning"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}}
+    }, {QStringLiteral("ok"), QStringLiteral("colorCorrection")})));
+
+    m_registry->registerTool(withOutputSchema({
+        QStringLiteral("apply_lut"),
+        QStringLiteral("映像クリップに LUT ファイルを適用する。filePath が空文字なら解除。intensity は 0..1、既定 1。Ctrl+Z / undo で戻せる。"),
+        schemaWithRequired(mergedProperties(clipProperties, QJsonObject{
+            {QStringLiteral("filePath"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
+            {QStringLiteral("intensity"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("number")},
+                {QStringLiteral("minimum"), 0}, {QStringLiteral("maximum"), 1},
+                {QStringLiteral("default"), 1}}}
+        }), {QStringLiteral("clipIndex"), QStringLiteral("filePath")}),
+        guardedWrite(QStringLiteral("apply_lut"),
+                     [this](const QJsonObject &args, QString *err) -> QJsonObject {
+            if (!rejectUnknownArguments(args, {QStringLiteral("kind"), QStringLiteral("trackIndex"),
+                    QStringLiteral("clipIndex"), QStringLiteral("filePath"), QStringLiteral("intensity")}, err))
+                return {};
+            if (!args.value(QStringLiteral("filePath")).isString())
+                return setError(err, QStringLiteral("filePath には文字列を指定してください")), QJsonObject{};
+            const QString path = args.value(QStringLiteral("filePath")).toString();
+            double intensity = 1.0;
+            if (args.contains(QStringLiteral("intensity"))) {
+                const auto raw = args.value(QStringLiteral("intensity"));
+                intensity = raw.toDouble();
+                if (!raw.isDouble() || !std::isfinite(intensity) || intensity < 0.0 || intensity > 1.0)
+                    return setError(err, QStringLiteral("intensity は 0 以上 1 以下の数値で指定してください")), QJsonObject{};
+            }
+            ClipTarget target;
+            if (!readClipTarget(args, m_window, timeline(), &target, err)) return {};
+            if (target.audio)
+                return setError(err, QStringLiteral("LUT は映像クリップにのみ設定できます")), QJsonObject{};
+            if (!path.isEmpty() && !QFileInfo(path).isFile())
+                return setError(err, QStringLiteral("LUT ファイルが見つかりません: %1").arg(path)), QJsonObject{};
+            if (!timeline()->setClipLut(target.trackIndex, target.clipIndex, path, intensity, err)) return {};
+            syncSelectionAfterEdit();
+            return QJsonObject{{QStringLiteral("ok"), true},
+                {QStringLiteral("lut"), lutToJson(target.track->clips().at(target.clipIndex))}};
+        })
+    }, outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("lut"), lutOutputSchema()}
+    }, {QStringLiteral("ok"), QStringLiteral("lut")})));
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("set_clip_property"),

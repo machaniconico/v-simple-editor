@@ -1,7 +1,9 @@
 #include "VideoEffect.h"
 #include "EffectParamSchema.h"
 #include "FractalNoise.h"
+#include "WarpDistortion.h"
 #include <QPainter>
+#include <QTransform>
 #include <QtMath>
 #include <QRandomGenerator>
 #include <algorithm>
@@ -423,6 +425,8 @@ QString VideoEffect::typeName(VideoEffectType t)
     case VideoEffectType::Blur:      return "Blur";
     case VideoEffectType::Sharpen:   return "Sharpen";
     case VideoEffectType::Mosaic:    return "Mosaic";
+    case VideoEffectType::LumaKey: return "ルマキー";
+    case VideoEffectType::ColorKey: return "カラーキー";
     case VideoEffectType::ChromaKey: return "Chroma Key";
     case VideoEffectType::Vignette:  return "Vignette";
     case VideoEffectType::Sepia:     return "Sepia";
@@ -462,6 +466,7 @@ QString VideoEffect::typeName(VideoEffectType t)
     case VideoEffectType::BrightnessContrast: return "明るさ・コントラスト";
     case VideoEffectType::Bulge: return "バルジ(球面)";
     case VideoEffectType::Twirl: return "ツイスト(渦)";
+    case VideoEffectType::Flip: return "反転 (Flip/Flop)";
     case VideoEffectType::Mirror: return "ミラー";
     case VideoEffectType::PolarCoordinates: return "極座標";
     case VideoEffectType::MotionTile: return "モーションタイル";
@@ -469,6 +474,14 @@ QString VideoEffect::typeName(VideoEffectType t)
     case VideoEffectType::FilmGrain: return "フィルムグレイン";
     case VideoEffectType::RollingShutterRepair: return "ローリングシャッター補正";
     case VideoEffectType::Echo: return "エコー(残像)";
+    case VideoEffectType::LogToRec709: return "カメラ Log → Rec.709";
+    case VideoEffectType::WarpWave: return "ワープ: ウェーブ";
+    case VideoEffectType::WarpRipple: return "ワープ: リップル";
+    case VideoEffectType::WarpSpherize: return "ワープ: 球面化";
+    case VideoEffectType::WarpFisheye: return "ワープ: 魚眼";
+    case VideoEffectType::WarpPinch: return "ワープ: ピンチ";
+    case VideoEffectType::BroadcastSafe: return "放送セーフ";
+    case VideoEffectType::LeaveColor: return "色を残す";
     case VideoEffectType::LensDistortion: return "レンズ歪み補正";
     }
     return "Unknown";
@@ -499,7 +512,41 @@ QVector<VideoEffectType> VideoEffect::allTypes()
              VideoEffectType::PolarCoordinates, VideoEffectType::MotionTile,
              VideoEffectType::CornerPinSimple, VideoEffectType::FilmGrain,
              VideoEffectType::Echo, VideoEffectType::LensDistortion,
-             VideoEffectType::RollingShutterRepair };
+             VideoEffectType::RollingShutterRepair, VideoEffectType::Flip,
+             VideoEffectType::LumaKey, VideoEffectType::ColorKey, VideoEffectType::LogToRec709,
+             VideoEffectType::WarpWave, VideoEffectType::WarpRipple,
+             VideoEffectType::WarpSpherize, VideoEffectType::WarpFisheye,
+             VideoEffectType::WarpPinch, VideoEffectType::BroadcastSafe,
+             VideoEffectType::LeaveColor };
+}
+
+VideoEffect VideoEffect::createBroadcastSafe(int standard, double maxChroma)
+{
+    VideoEffect effect;
+    effect.type = VideoEffectType::BroadcastSafe;
+    effect.param1 = standard;
+    effect.param2 = maxChroma;
+    return effect;
+}
+
+VideoEffect VideoEffect::createLeaveColor(QColor color, double tolerance, double desaturation)
+{
+    VideoEffect effect;
+    effect.type = VideoEffectType::LeaveColor;
+    effect.keyColor = color;
+    effect.param1 = tolerance;
+    effect.param2 = desaturation;
+    return effect;
+}
+
+VideoEffect VideoEffect::createLogToRec709(int input, double exposure, int output)
+{
+    VideoEffect e;
+    e.type = VideoEffectType::LogToRec709;
+    effectctrl::setParamValue(e, "input", input);
+    effectctrl::setParamValue(e, "exposure", exposure);
+    effectctrl::setParamValue(e, "output", output);
+    return e;
 }
 
 VideoEffect VideoEffect::createBlur(double r)
@@ -508,6 +555,17 @@ VideoEffect VideoEffect::createSharpen(double a)
     { VideoEffect e; e.type = VideoEffectType::Sharpen; e.param1 = a; return e; }
 VideoEffect VideoEffect::createMosaic(double b)
     { VideoEffect e; e.type = VideoEffectType::Mosaic; e.param1 = b; return e; }
+VideoEffect VideoEffect::createLumaKey(double lower, double upper, double softness)
+{
+    VideoEffect e; e.type = VideoEffectType::LumaKey;
+    e.param1 = lower; e.param2 = upper; e.param3 = softness; return e;
+}
+VideoEffect VideoEffect::createColorKey(QColor color, double tolerance, double softness)
+{
+    VideoEffect e; e.type = VideoEffectType::ColorKey; e.keyColor = color;
+    e.param1 = tolerance; e.param2 = softness; return e;
+}
+
 VideoEffect VideoEffect::createChromaKey(QColor c, double tol, double soft)
     { VideoEffect e; e.type = VideoEffectType::ChromaKey; e.keyColor = c; e.param1 = tol; e.param2 = soft; return e; }
 VideoEffect VideoEffect::createVignette(double i, double r)
@@ -657,6 +715,36 @@ static QColor defaultColorForParam(const VideoEffect &effect, const QString &par
 
 double paramValue(const VideoEffect &effect, const QString &paramName)
 {
+    if (effect.type == VideoEffectType::BroadcastSafe || effect.type == VideoEffectType::LeaveColor) {
+        const auto schema = paramSchemaFor(effect.type);
+        for (int i = 0; i < schema.size(); ++i) {
+            if (schema[i].name != paramName) continue;
+            if (schema[i].type == ParamType::Color) return encodedColorValue(effect.keyColor);
+            return i == 0 ? effect.param1 : effect.param2;
+        }
+        return 0.0;
+    }
+    if (effect.type >= VideoEffectType::WarpWave && effect.type <= VideoEffectType::WarpPinch) {
+        const auto schema = paramSchemaFor(effect.type);
+        for (int i = 0; i < schema.size(); ++i)
+            if (schema[i].name == paramName)
+                return i == 0 ? effect.param1 : (i == 1 ? effect.param2 : effect.param3);
+        return 0.0;
+    }
+    if (effect.type == VideoEffectType::LogToRec709) {
+        if (paramName == "input") return effect.param1;
+        if (paramName == "exposure") return effect.param2;
+        if (paramName == "output") return effect.param3;
+    }
+    if (effect.type == VideoEffectType::LumaKey) {
+        if (paramName == "lower") return effect.param1;
+        if (paramName == "upper") return effect.param2;
+        if (paramName == "softness") return effect.param3;
+    }
+    if (effect.type == VideoEffectType::ColorKey) {
+        if (paramName == "tolerance") return effect.param1;
+        if (paramName == "softness") return effect.param2;
+    }
     if (effect.type == VideoEffectType::LensDistortion) {
         if (paramName == "k1") return effect.param1;
         if (paramName == "k2") return effect.param2;
@@ -813,7 +901,8 @@ double paramValue(const VideoEffect &effect, const QString &paramName)
                 return effect.param1;
             if (paramName == "radius" && effect.type == VideoEffectType::Twirl)
                 return effect.param2;
-            if (paramName == "mode" && effect.type == VideoEffectType::Mirror)
+            if (paramName == "mode" && (effect.type == VideoEffectType::Mirror
+                                      || effect.type == VideoEffectType::Flip))
                 return effect.param1;
             if (paramName == "type" && effect.type == VideoEffectType::PolarCoordinates)
                 return effect.param1;
@@ -859,6 +948,53 @@ double paramValue(const VideoEffect &effect, const QString &paramName)
 
 void setParamValue(VideoEffect &effect, const QString &paramName, double value)
 {
+    if (effect.type == VideoEffectType::BroadcastSafe || effect.type == VideoEffectType::LeaveColor) {
+        const auto schema = paramSchemaFor(effect.type);
+        for (int i = 0; i < schema.size(); ++i) {
+            const auto &def = schema[i];
+            if (def.name != paramName) continue;
+            if (!std::isfinite(value)) value = def.defaultVal;
+            if (def.type == ParamType::Color) {
+                effect.keyColor = defaultColorForParam(effect, paramName, value);
+            } else {
+                double &target = i == 0 ? effect.param1 : effect.param2;
+                target = std::clamp(value, def.minVal, def.maxVal);
+                if (def.type == ParamType::Int) target = std::round(target);
+            }
+            return;
+        }
+        return;
+    }
+    if (effect.type >= VideoEffectType::WarpWave && effect.type <= VideoEffectType::WarpPinch) {
+        const auto schema = paramSchemaFor(effect.type);
+        for (int i = 0; i < schema.size(); ++i) {
+            const auto &def = schema[i];
+            if (def.name != paramName) continue;
+            if (!std::isfinite(value)) value = def.defaultVal;
+            double &target = i == 0 ? effect.param1 : (i == 1 ? effect.param2 : effect.param3);
+            target = std::clamp(value, def.minVal, def.maxVal);
+            return;
+        }
+        return;
+    }
+    if (effect.type == VideoEffectType::LogToRec709) {
+        if (!std::isfinite(value)) value = 0.0;
+        if (paramName == "input") effect.param1 = std::round(std::clamp(value, 0.0, 3.0));
+        if (paramName == "exposure") effect.param2 = std::clamp(value, -3.0, 3.0);
+        if (paramName == "output") effect.param3 = std::round(std::clamp(value, 0.0, 2.0));
+        return;
+    }
+    if (effect.type == VideoEffectType::LumaKey || effect.type == VideoEffectType::ColorKey) {
+        if (!std::isfinite(value)) value = 0.0;
+        if (effect.type == VideoEffectType::LumaKey) {
+            if (paramName == "lower") { effect.param1 = qBound(0.0, value, 1.0); return; }
+            if (paramName == "upper") { effect.param2 = qBound(0.0, value, 1.0); return; }
+            if (paramName == "softness") { effect.param3 = qBound(0.0, value, 0.5); return; }
+        } else {
+            if (paramName == "tolerance") { effect.param1 = qBound(0.0, value, 1.0); return; }
+            if (paramName == "softness") { effect.param2 = qBound(0.0, value, 0.5); return; }
+        }
+    }
     if (effect.type == VideoEffectType::LensDistortion) {
         if (!std::isfinite(value)) value = paramName == "scale" ? 1.0 : 0.0;
         if (paramName == "k1") { effect.param1 = qBound(-0.5, value, 0.5); return; }
@@ -1098,7 +1234,8 @@ void setParamValue(VideoEffect &effect, const QString &paramName, double value)
             if (paramName == "radius" && effect.type == VideoEffectType::Twirl) {
                 effect.param2 = value; return;
             }
-            if (paramName == "mode" && effect.type == VideoEffectType::Mirror) {
+            if (paramName == "mode" && (effect.type == VideoEffectType::Mirror
+                                      || effect.type == VideoEffectType::Flip)) {
                 effect.param1 = value; return;
             }
             if (paramName == "type" && effect.type == VideoEffectType::PolarCoordinates) {
@@ -1168,6 +1305,9 @@ void setParamValue(VideoEffect &effect, const QString &paramName, double value)
 
 QColor colorParamValue(const VideoEffect &effect, const QString &paramName)
 {
+    if (paramName == "color" && (effect.type == VideoEffectType::ColorKey
+        || effect.type == VideoEffectType::LeaveColor))
+        return effect.keyColor;
     if (paramName == "color" && effect.type == VideoEffectType::ChromaKey)
         return effect.keyColor;
     if ((paramName == "keyColor" || paramName == "color") && effect.type == VideoEffectType::Tint)
@@ -1185,6 +1325,9 @@ QColor colorParamValue(const VideoEffect &effect, const QString &paramName)
 
 void setColorParam(VideoEffect &effect, const QString &paramName, QColor color)
 {
+    if (paramName == "color" && (effect.type == VideoEffectType::ColorKey
+        || effect.type == VideoEffectType::LeaveColor))
+        effect.keyColor = color;
     if (paramName == "color" && effect.type == VideoEffectType::ChromaKey)
         effect.keyColor = color;
     if ((paramName == "keyColor" || paramName == "color") && effect.type == VideoEffectType::Tint)
@@ -1618,14 +1761,88 @@ void VideoEffectProcessor::adjustExposure(QImage &img, double exposure)
 
 // ===== Video Effect Processing =====
 
+namespace {
+thread_local bool safeLeaveColorEnabled = true;
+thread_local int safeLeaveColorCalls = 0;
+
+double safeUnit(double value, double fallback)
+{
+    return std::isfinite(value) ? std::clamp(value, 0.0, 1.0) : fallback;
+}
+
+QImage applySafeLeaveColor(const QImage &input, const VideoEffect &effect)
+{
+    if (!safeLeaveColorEnabled || input.isNull()) return input;
+    if (safeLeaveColorCalls < 2147483647) ++safeLeaveColorCalls;
+    const bool broadcast = effect.type == VideoEffectType::BroadcastSafe;
+    if (broadcast && effect.param1 >= 0.5) return input; // Already 8-bit RGB.
+    const double amount = safeUnit(effect.param2, 1.0);
+    if (!broadcast && amount == 0.0) return input;
+    const double tolerance = safeUnit(effect.param1, 0.15) * 180.0;
+    const double targetHue = std::max(0.0, double(effect.keyColor.hsvHueF()) * 360.0);
+    QImage result = input.convertToFormat(QImage::Format_ARGB32);
+    for (int y = 0; y < result.height(); ++y) {
+        auto *row = reinterpret_cast<QRgb *>(result.scanLine(y));
+        for (int x = 0; x < result.width(); ++x) {
+            const QRgb pixel = row[x];
+            if (broadcast) {
+                // Full-scale BT.709 Y'CbCr code values: clamp, don't rescale
+                // the entire image into studio range (legal pixels stay intact).
+                const double luma = luma709(qRed(pixel), qGreen(pixel), qBlue(pixel));
+                const double cb = (qBlue(pixel) - luma) / 1.8556;
+                const double cr = (qRed(pixel) - luma) / 1.5748;
+                const double limit = 112.0 * amount;
+                const double Y = std::clamp(luma, 16.0, 235.0);
+                const double Cb = std::clamp(cb, -limit, limit);
+                const double Cr = std::clamp(cr, -limit, limit);
+                if (Y == luma && Cb == cb && Cr == cr) continue;
+                const double r = Y + 1.5748 * Cr;
+                const double b = Y + 1.8556 * Cb;
+                const double g = (Y - 0.2126 * r - 0.0722 * b) / 0.7152;
+                row[x] = qRgba(clamp255d(r), clamp255d(g), clamp255d(b), qAlpha(pixel));
+            } else {
+                const QColor color = QColor::fromRgba(pixel);
+                if (color.hsvSaturationF() == 0.0) continue;
+                const double distance = std::abs(double(color.hsvHueF()) * 360.0 - targetHue);
+                if (std::min(distance, 360.0 - distance) <= tolerance) continue;
+                const QColor muted = QColor::fromHsvF(color.hsvHueF(),
+                    color.hsvSaturationF() * (1.0 - amount), color.valueF());
+                row[x] = qRgba(muted.red(), muted.green(), muted.blue(), qAlpha(pixel));
+            }
+        }
+    }
+    return result;
+}
+} // namespace
+
+void VideoEffectProcessor::setSafeLeaveColorEnabledForTesting(bool enabled)
+{
+    safeLeaveColorEnabled = enabled;
+    safeLeaveColorCalls = 0;
+}
+
+int VideoEffectProcessor::safeLeaveColorInvocationCountForTesting()
+{
+    return safeLeaveColorCalls;
+}
+
 QImage VideoEffectProcessor::applyEffect(const QImage &input, const VideoEffect &effect)
 {
     if (!effect.enabled || effect.type == VideoEffectType::None) return input;
 
     switch (effect.type) {
+    case VideoEffectType::BroadcastSafe:
+    case VideoEffectType::LeaveColor: return applySafeLeaveColor(input, effect);
+    case VideoEffectType::WarpWave: return applyWarpWave(input, effect);
+    case VideoEffectType::WarpRipple: return applyWarpRipple(input, effect);
+    case VideoEffectType::WarpSpherize: return applyWarpSpherize(input, effect);
+    case VideoEffectType::WarpFisheye: return applyWarpFisheye(input, effect);
+    case VideoEffectType::WarpPinch: return applyWarpPinch(input, effect);
     case VideoEffectType::Blur:      return applyBlur(input, effect.param1);
     case VideoEffectType::Sharpen:   return applySharpen(input, effect.param1);
     case VideoEffectType::Mosaic:    return applyMosaic(input, effect.param1);
+    case VideoEffectType::LumaKey: return applyLumaKey(input, effect.param1, effect.param2, effect.param3);
+    case VideoEffectType::ColorKey: return applyColorKey(input, effect.keyColor, effect.param1, effect.param2);
     case VideoEffectType::ChromaKey: return applyChromaKey(input, effect.keyColor, effect.param1, effect.param2);
     case VideoEffectType::Vignette:  return applyVignette(input, effect.param1, effect.param2);
     case VideoEffectType::Sepia:     return applySepia(input, effect.param1);
@@ -1665,6 +1882,8 @@ QImage VideoEffectProcessor::applyEffect(const QImage &input, const VideoEffect 
     case VideoEffectType::BrightnessContrast: return applyBrightnessContrastEffect(input, effect.param1, effect.param2);
     case VideoEffectType::Bulge: return applyBulge(input, effect.param1, effect.param2);
     case VideoEffectType::Twirl: return applyTwirl(input, effect.param1, effect.param2);
+    case VideoEffectType::Flip: return applyFlip(input, static_cast<int>(std::round(
+        std::isfinite(effect.param1) ? std::clamp(effect.param1, 0.0, 2.0) : 0.0)));
     case VideoEffectType::Mirror: return applyMirror(input, static_cast<int>(std::round(effect.param1)));
     case VideoEffectType::PolarCoordinates: return applyPolarCoordinates(input, static_cast<int>(std::round(effect.param1)), effect.param2);
     case VideoEffectType::MotionTile: return applyMotionTile(input,
@@ -1672,6 +1891,7 @@ QImage VideoEffectProcessor::applyEffect(const QImage &input, const VideoEffect 
                                                              static_cast<int>(std::round(effect.param2)),
                                                              std::round(effect.param3) != 0.0);
     case VideoEffectType::CornerPinSimple: return applyCornerPinSimple(input, effect.param1, effect.param2);
+    case VideoEffectType::LogToRec709: return applyLogToRec709(input, effect);
     case VideoEffectType::LensDistortion: return applyLensDistortion(input, effect);
     case VideoEffectType::FilmGrain: return applyFilmGrain(
         input, effect.param1, static_cast<int>(std::round(effect.param2)),
@@ -1803,6 +2023,77 @@ QImage VideoEffectProcessor::applyMosaic(const QImage &input, double blockSize)
                     line[x * 3 + 2] = avgB;
                 }
             }
+        }
+    }
+    return img;
+}
+
+namespace {
+thread_local bool keyersEnabledForTesting = true;
+thread_local int keyersCallsForTesting = 0;
+
+double keyerBound(double value, double maximum)
+{
+    return std::isfinite(value) ? qBound(0.0, value, maximum) : 0.0;
+}
+}
+
+void VideoEffectProcessor::setKeyersEnabledForTesting(bool enabled)
+{
+    keyersEnabledForTesting = enabled;
+    keyersCallsForTesting = 0;
+}
+
+int VideoEffectProcessor::keyersInvocationCountForTesting()
+{
+    return keyersCallsForTesting;
+}
+
+QImage VideoEffectProcessor::applyLumaKey(const QImage &input, double lower,
+                                         double upper, double softness)
+{
+    if (!keyersEnabledForTesting || input.isNull()) return input;
+    if (keyersCallsForTesting < 2147483647) ++keyersCallsForTesting;
+    lower = keyerBound(lower, 1.0);
+    upper = keyerBound(upper, 1.0);
+    if (lower > upper) std::swap(lower, upper);
+    softness = keyerBound(softness, 0.5);
+    QImage img = input.convertToFormat(QImage::Format_ARGB32);
+    for (int y = 0; y < img.height(); ++y) {
+        auto *line = reinterpret_cast<QRgb *>(img.scanLine(y));
+        for (int x = 0; x < img.width(); ++x) {
+            const QRgb pixel = line[x];
+            const double luma = luma709(qRed(pixel), qGreen(pixel), qBlue(pixel)) / 255.0;
+            const double distance = luma < lower ? lower - luma : (luma > upper ? luma - upper : 0.0);
+            const double alpha = distance == 0.0 ? 0.0
+                : (softness > 0.0 ? qMin(1.0, distance / softness) : 1.0);
+            line[x] = qRgba(qRed(pixel), qGreen(pixel), qBlue(pixel),
+                            clamp255d(qAlpha(pixel) * alpha));
+        }
+    }
+    return img;
+}
+
+QImage VideoEffectProcessor::applyColorKey(const QImage &input, QColor color,
+                                          double tolerance, double softness)
+{
+    if (!keyersEnabledForTesting || input.isNull()) return input;
+    if (keyersCallsForTesting < 2147483647) ++keyersCallsForTesting;
+    tolerance = keyerBound(tolerance, 1.0);
+    softness = keyerBound(softness, 0.5);
+    QImage img = input.convertToFormat(QImage::Format_ARGB32);
+    for (int y = 0; y < img.height(); ++y) {
+        auto *line = reinterpret_cast<QRgb *>(img.scanLine(y));
+        for (int x = 0; x < img.width(); ++x) {
+            const QRgb pixel = line[x];
+            const double r = (qRed(pixel) - color.red()) / 255.0;
+            const double g = (qGreen(pixel) - color.green()) / 255.0;
+            const double b = (qBlue(pixel) - color.blue()) / 255.0;
+            const double distance = std::sqrt((r*r + g*g + b*b) / 3.0);
+            const double alpha = distance <= tolerance ? 0.0
+                : (softness > 0.0 ? qMin(1.0, (distance - tolerance) / softness) : 1.0);
+            line[x] = qRgba(qRed(pixel), qGreen(pixel), qBlue(pixel),
+                            clamp255d(qAlpha(pixel) * alpha));
         }
     }
     return img;
@@ -3271,6 +3562,31 @@ QImage VideoEffectProcessor::applyTwirl(const QImage &input, double angleDegrees
     return result;
 }
 
+namespace {
+thread_local bool flipEnabledForTesting = true;
+thread_local int flipCallsForTesting = 0;
+}
+
+void VideoEffectProcessor::setFlipEnabledForTesting(bool enabled)
+{
+    flipEnabledForTesting = enabled;
+    flipCallsForTesting = 0;
+}
+
+int VideoEffectProcessor::flipInvocationCountForTesting()
+{
+    return flipCallsForTesting;
+}
+
+QImage VideoEffectProcessor::applyFlip(const QImage &input, int mode)
+{
+    if (!flipEnabledForTesting || input.isNull())
+        return input;
+    ++flipCallsForTesting;
+    // Preserve the source format and alpha; both preview and export use this CPU path.
+    return input.mirrored(mode != 1, mode != 0);
+}
+
 QImage VideoEffectProcessor::applyMirror(const QImage &input, int mode)
 {
     // Mirror has no neutral mode: adding it intentionally transforms the frame.
@@ -3558,4 +3874,214 @@ QImage VideoEffectProcessor::applyLensDistortion(const QImage &input,
         }
     }
     return out;
+}
+
+namespace {
+thread_local bool logToRec709Enabled = true;
+thread_local int logToRec709Calls = 0;
+
+float decodeCameraLog(float v, int input)
+{
+    switch (input) {
+    case 0:
+        return v >= 171.2102946929f / 1023.0f
+            ? std::pow(10.0f, (v * 1023.0f - 420.0f) / 261.5f) * 0.19f - 0.01f
+            : (v * 1023.0f - 95.0f) * 0.01125f / (171.2102946929f - 95.0f);
+    case 1:
+        return v > 5.367655f * 0.010591f + 0.092809f
+            ? (std::pow(10.0f, (v - 0.385537f) / 0.247190f) - 0.052272f) / 5.555556f
+            : (v - 0.092809f) / 5.367655f;
+    case 2:
+        return v >= 0.181f
+            ? std::pow(10.0f, (v - 0.598206f) / 0.241514f) - 0.00873f
+            : (v - 0.125f) / 5.6f;
+    default: {
+        const float black = std::pow(10.0f, (95.0f - 685.0f) * 0.002f / 0.6f);
+        return (std::pow(10.0f, (v * 1023.0f - 685.0f) * 0.002f / 0.6f) - black)
+            / (1.0f - black);
+    }
+    }
+}
+}
+
+void VideoEffectProcessor::setLogToRec709EnabledForTesting(bool enabled)
+{
+    logToRec709Enabled = enabled;
+    logToRec709Calls = 0;
+}
+
+int VideoEffectProcessor::logToRec709InvocationCountForTesting()
+{
+    return logToRec709Calls;
+}
+
+void VideoEffectProcessor::logToRec709Gamut(int input, float &r, float &g, float &b)
+{
+    static constexpr float matrices[4][3][3] = {
+        {{1.6269474f, -0.5401385f, -0.0868088f},
+         {-0.1785155f, 1.4179409f, -0.2394254f},
+         {-0.0444361f, -0.1959718f, 1.2404079f}},
+        {{1.617523f, -0.537287f, -0.080237f},
+         {-0.070573f, 1.334613f, -0.264040f},
+         {-0.021102f, -0.226954f, 1.248056f}},
+        {{1.806576f, -0.695697f, -0.110879f},
+         {-0.170090f, 1.305955f, -0.135865f},
+         {-0.025206f, -0.154468f, 1.179674f}},
+        {{1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 1.0f}}
+    };
+    const auto &m = matrices[std::clamp(input, 0, 3)];
+    const float nr = m[0][0] * r + m[0][1] * g + m[0][2] * b;
+    const float ng = m[1][0] * r + m[1][1] * g + m[1][2] * b;
+    const float nb = m[2][0] * r + m[2][1] * g + m[2][2] * b;
+    r = nr; g = ng; b = nb;
+}
+
+QImage VideoEffectProcessor::applyLogToRec709(const QImage &input, const VideoEffect &effect)
+{
+    if (!logToRec709Enabled || input.isNull()) return input;
+    if (logToRec709Calls < 2147483647) ++logToRec709Calls;
+    const auto bounded = [](double v, double low, double high) {
+        return std::isfinite(v) ? std::clamp(v, low, high) : 0.0;
+    };
+    const int camera = static_cast<int>(std::round(bounded(effect.param1, 0.0, 3.0)));
+    const int output = static_cast<int>(std::round(bounded(effect.param3, 0.0, 2.0)));
+    const float exposure = std::exp2(static_cast<float>(bounded(effect.param2, -3.0, 3.0)));
+    const auto encode = [output](float linear) {
+        float v = std::clamp(linear, 0.0f, 1.0f);
+        if (output == 0) v = std::pow(v, 1.0f / 2.4f);
+        else if (output == 2)
+            v = v < 0.018f ? 4.5f * v : 1.099f * std::pow(v, 0.45f) - 0.099f;
+        return static_cast<uchar>(std::clamp(std::lround(v * 255.0f), 0L, 255L));
+    };
+    // CPU SSOT: VideoPlayer and tlrender both reach this through applyEffectStack.
+    // Preserve alpha here without changing any other effect's format contract.
+    QImage result = input.convertToFormat(QImage::Format_ARGB32);
+    for (int y = 0; y < result.height(); ++y) {
+        auto *pixels = reinterpret_cast<QRgb *>(result.scanLine(y));
+        for (int x = 0; x < result.width(); ++x) {
+            const QRgb p = pixels[x];
+            float r = decodeCameraLog(qRed(p) / 255.0f, camera) * exposure;
+            float g = decodeCameraLog(qGreen(p) / 255.0f, camera) * exposure;
+            float b = decodeCameraLog(qBlue(p) / 255.0f, camera) * exposure;
+            logToRec709Gamut(camera, r, g, b);
+            pixels[x] = qRgba(encode(r), encode(g), encode(b), qAlpha(p));
+        }
+    }
+    return result;
+}
+
+// US-404: shared CPU kernels for clip-local preview and timeline export.
+namespace {
+thread_local bool g_warpEnabled = true;
+thread_local int g_warpInvocations = 0;
+constexpr double kWarpTau = 6.28318530717958647692;
+
+double warpParam(double value, double low, double high)
+{
+    return std::isfinite(value) ? std::clamp(value, low, high) : low;
+}
+
+bool skipWarp(const QImage &image, const VideoEffect &effect)
+{
+    return !g_warpEnabled || image.isNull() || !std::isfinite(effect.param1)
+        || effect.param1 == 0.0;
+}
+
+WarpConfig radialWarpConfig(const QImage &image, WarpType type, double radius)
+{
+    WarpConfig config;
+    config.type = type;
+    // Individual WarpDistortion kernels take pixel coordinates and radii.
+    config.center = QPointF(image.width() * 0.5, image.height() * 0.5);
+    config.radius = warpParam(radius, 0.0, 1.0) * std::min(image.width(), image.height());
+    return config;
+}
+}
+
+void VideoEffectProcessor::setWarpEnabledForTesting(bool enabled)
+{
+    g_warpEnabled = enabled;
+    g_warpInvocations = 0;
+}
+
+int VideoEffectProcessor::warpInvocationCountForTesting()
+{
+    return g_warpInvocations;
+}
+
+QImage VideoEffectProcessor::applyWarpWave(const QImage &input, const VideoEffect &effect)
+{
+    if (skipWarp(input, effect)) return input;
+    WarpConfig config;
+    config.type = WarpType::Wave;
+    config.amplitude = warpParam(effect.param1, 0.0, 100.0);
+    if (config.amplitude == 0.0) return input;
+    // UI frequency is cycles over image height; phase is cycles, not radians.
+    config.frequency = kWarpTau * warpParam(effect.param2, 0.1, 20.0) / input.height();
+    config.phase = kWarpTau * warpParam(effect.param3, 0.0, 1.0);
+    ++g_warpInvocations;
+    // The legacy kernel offsets Y as a function of X. Transposing both sides
+    // gives horizontal displacement per row without changing that kernel.
+    const QTransform transpose(0, 1, 1, 0, 0, 0);
+    return WarpDistortion::applyWave(input.transformed(transpose), config.amplitude,
+                                    config.frequency, config.phase).transformed(transpose);
+}
+
+QImage VideoEffectProcessor::applyWarpRipple(const QImage &input, const VideoEffect &effect)
+{
+    if (skipWarp(input, effect)) return input;
+    WarpConfig config = radialWarpConfig(input, WarpType::Ripple, effect.param3);
+    config.amplitude = warpParam(effect.param1, 0.0, 100.0);
+    if (config.radius == 0.0 || config.amplitude == 0.0) return input;
+    config.frequency = kWarpTau * warpParam(effect.param2, 0.1, 20.0)
+        / std::min(input.width(), input.height());
+    ++g_warpInvocations;
+    QImage result = WarpDistortion::applyRipple(input, config.center,
+                                               config.amplitude, config.frequency);
+    // Ripple's legacy signature has no radius. Restore the exterior exactly.
+    const QImage source = input.convertToFormat(QImage::Format_ARGB32);
+    for (int y = 0; y < result.height(); ++y) {
+        auto *row = reinterpret_cast<QRgb *>(result.scanLine(y));
+        const auto *original = reinterpret_cast<const QRgb *>(source.constScanLine(y));
+        for (int x = 0; x < result.width(); ++x) {
+            const double dx = x - config.center.x(), dy = y - config.center.y();
+            if (dx * dx + dy * dy >= config.radius * config.radius)
+                row[x] = original[x];
+        }
+    }
+    return result;
+}
+
+QImage VideoEffectProcessor::applyWarpSpherize(const QImage &input, const VideoEffect &effect)
+{
+    if (skipWarp(input, effect)) return input;
+    WarpConfig config = radialWarpConfig(input, WarpType::Spherize, effect.param2);
+    if (config.radius == 0.0) return input;
+    config.amount = warpParam(effect.param1, -1.0, 1.0);
+    ++g_warpInvocations;
+    return WarpDistortion::applySpherize(input, config.center, config.radius, config.amount);
+}
+
+QImage VideoEffectProcessor::applyWarpFisheye(const QImage &input, const VideoEffect &effect)
+{
+    if (skipWarp(input, effect)) return input;
+    WarpConfig config = radialWarpConfig(input, WarpType::Fisheye, 0.5);
+    const double amount = warpParam(effect.param1, 0.0, 1.0);
+    if (amount == 0.0) return input;
+    // Kernel power=1 is identity; >1 samples inward, moving features outward.
+    config.amount = 1.0 + amount;
+    ++g_warpInvocations;
+    return WarpDistortion::applyFisheye(input, config.center, config.radius, config.amount);
+}
+
+QImage VideoEffectProcessor::applyWarpPinch(const QImage &input, const VideoEffect &effect)
+{
+    if (skipWarp(input, effect)) return input;
+    WarpConfig config = radialWarpConfig(input, WarpType::Pinch, effect.param2);
+    const double amount = warpParam(effect.param1, 0.0, 1.0);
+    if (config.radius == 0.0 || amount == 0.0) return input;
+    // Kernel exponent=1/amount: >1 samples outward, moving features inward.
+    config.amount = 1.0 + amount;
+    ++g_warpInvocations;
+    return WarpDistortion::applyPinch(input, config.center, config.radius, config.amount);
 }

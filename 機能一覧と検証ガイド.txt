@@ -1,14 +1,14 @@
 ================================================================================
  V Simple Editor — 機能一覧と LLM(MCP) 検証ガイド
- 作成日: 2026-08-29   更新日: 2026-09-16 (Wave 4 実装済み)   対象ブランチ: feat/ai-chat-connection
+ 作成日: 2026-08-29   更新日: 2026-09-19 (Wave 6 実装済み)   対象ブランチ: feat/ai-chat-connection
 ================================================================================
 
 このファイルは 3 部構成です。
   第1部  今ある機能の一覧 (Premiere / After Effects / DaVinci Resolve との対応つき)
-  第2部  今後実装していく機能の一覧 (Wave 1 〜 Wave 4 = 実装済み / Wave 5 候補)
+  第2部  今後実装していく機能の一覧 (Wave 1 〜 Wave 6 = 実装済み / Wave 7 候補)
   第3部  LLM と MCP 連携しながら検証する手順 (準備 → 共通手順 → 機能別チェックリスト)
 
-凡例:  ○=同等機能あり  △=部分的  ×=無い  ★=Wave 1 追加  ☆=Wave 2 追加  ◆=Wave 3 追加  ◇=Wave 4 追加 (今回)
+凡例:  ○=同等機能あり  △=部分的  ×=無い  ★=Wave 1 追加  ☆=Wave 2 追加  ◆=Wave 3 追加  ◇=Wave 4 追加  ◈=Wave 5 追加  ✦=Wave 6 追加 (今回)
        [P]=Premiere Pro  [AE]=After Effects  [R]=DaVinci Resolve
 
 --------------------------------------------------------------------------------
@@ -19,6 +19,8 @@
   ○ リップル / ロール / スリップ / スライド トリム        [P][R]  トリムメニュー Q/W/R
   ○ 3点編集 (ソースモニターから挿入/上書き)               [P][R]  表示>ソースモニター
   ○ 再生ヘッドで分割 / 削除 / リップル削除 / ギャップを詰める
+  ◈ すべて選択 (Ctrl+A) / 再生ヘッド以降・以前を選択 / 全トラックを再生ヘッドで分割 (Ctrl+Shift+K) / リフト (ギャップを残して削除)  [P][R]
+  ◈ 複製 (Ctrl+D) / 1・10 フレーム移動 (Alt+←→, Alt+Shift+←→) / すべてのギャップを詰める (全トラック共通の空きだけ)  [P][R]
   ○ スナップ / J-K-L 再生 / イン点・アウト点
   ○ ネスト (プリコンポーズ) / パンくずナビ                   [P][AE][R] コンポジション>選択をプリコンポーズ
   ○ 調整レイヤー                                            [P][AE][R] 挿入>調整レイヤー
@@ -30,12 +32,18 @@
   ○ マルチカメラ (☆ 音声相関同期を基本ダイアログへ統合、角度ごとの ms 微調整、◇ 旧セットアップも実同期に修正)  [P][R]
   ◇ 効果を焼き込んで差し替え (Render in Place。リンク音声も同時、「元のクリップに戻す」で復元)  [P] Render and Replace / [R] Render in Place
   ○ テキストベース編集 / 無音検出 / 自動ジャンプカット / シーン検出  [P][R]
-  ○ メディアプール (ビン / スマートビン / ドラッグ&ドロップ配置)     [P][R]
+  ○ メディアプール (ビン / スマートビン / ドラッグ&ドロップ配置、◈ お気に入り / 却下 / 星、フィルタ (すべて / お気に入り / 却下を除く / 未使用)、名前変更、エクスプローラーで表示)  [P][R]
+  ◈ トラックの名前と色 (トラックヘッダ右クリック / MCP set_track_property)  [P][AE][R]
   ○ マーカー (色付き / 一覧パネル / YouTube チャプター出力)
   ○ Undo / Redo + ヒストリーパネル
   ○ 自動保存 / 復旧 / インクリメンタル保存 / プロジェクト収集 (☆ 収集漏れ修正)
   ◇ 保存版と比較 (現在のタイムラインと保存済み .veditor の構造差分 / MCP compare_project)  [P] Compare Project
   ☆ オフラインメディアの検出と再リンク (プロジェクトを開いたとき自動検出 / MCP relink_media)  [P][R]
+  ✦ 範囲ドラッグ選択 (マーキー) / シーケンス全体を表示 / 選択範囲にズーム / タイムコードへジャンプ (Ctrl+Shift+J)  [P][R]
+  ✦ クリップの先頭・末尾を再生ヘッドへ移動 / 同じラベルのクリップを選択 / リンク選択の切替  [P][R]
+  ✦ トラックの削除 / 上下移動 (ヘッダ右クリック・トラックメニュー・MCP。マット / 親子付け / ミキサー参照も追従、undo 1 回)  [P][AE][R]
+  ✦ シーケンス一覧 Dock (切替 / 新規 / 名前変更 / MCP get_sequences・set_active_sequence)  [P][R]
+  ✦ タイムラインの映像クリップにフィルムストリップ (既定 OFF) / メディアプールのサムネイルとホバースキミング  [P][R]
   ○ ワークスペース保存 / ショートカット設定 (Premiere/FCP/DaVinci プリセット)
   ○ コマンドパレット (Ctrl+Shift+P)
 
@@ -43,7 +51,8 @@
   ○ キーフレーム (位置/スケール/回転/不透明度/アンカー/スキュー)
   ○ グラフエディタ / イージングプリセット / ベジェ / モーションパス / ループ
   ☆ パスに沿った自動回転 (Auto-Orient)                      [AE]
-  ○ ペアレント (ヌルオブジェクト) / エクスプレッション      [AE]
+  ○ ペアレント (ヌルオブジェクト) / エクスプレッション (◈ audioLevel() でリンク音声の音量を参照)      [AE]
+  ◈ オーディオをキーフレームに変換 (不透明度 / スケール / 回転 / 位置へ RMS 包絡を書き込む)  [AE] Convert Audio to Keyframes
   ○ モーションブラー                                        [AE][P]
   ○ ウィグル / 手持ちカメラ風 / カメラモーション
   ○ 3D カメラ / 3D ライト / 3D テキスト押し出し             [AE]
@@ -54,15 +63,19 @@
   ○ ベジェマスク + プラナートラッカー連携 / ロト / 自動マット / AI マスク  [AE][R]
   ○ モーショントラッカー / プラナートラッカー (Mocha 風)      [AE]
   ◇ 特徴点検出 (Shi-Tomasi) + ピラミッド KLT 多点トラッカー (数値基盤、UI なし。フル 3D カメラトラッカーの土台)
+  ◈ 2 視点相対姿勢 (正規化 8 点法 + RANSAC + E 分解) と線形三角測量 (数値基盤、UI なし)
   ○ クロマキー (精緻化ダイアログ)
-  ○ パペット / ワープ / 歪み / ディストーション系
+  ◈ ルマキー / カラーキー (CPU 専用。透明部分が合成と書き出しまで生きる。スタックの最後に置く)  [P] Luma Key / Color Key  [AE] Luma Key  [R] Luma Keyer
+  ○ パペット / ワープ / 歪み / ディストーション系 (◈ ワープ: ウェーブ / リップル / 球面化 / 魚眼 / ピンチ の 5 種を実装、stub 置換)  [AE] Wave Warp / Ripple / Spherize
+  ◈ 反転 (Flip/Flop。水平 / 垂直 / 両方)  [P] Horizontal Flip / Vertical Flip  [R] Flip
+  ◈ 平面レイヤー (単色クリップを再生ヘッドに挿入。色と尺を指定)  [AE] Solid  [P] Color Matte  [R] Solid Color
   ○ パーティクル / フラクタルノイズ / シェイプレイヤー / レイヤースタイル
   ☆ シェイプクリップ (シェイプレイヤーをタイムラインのクリップとして永続化・描画)  [AE]
   ☆ シェイプモディファイア (Repeater / Trim Paths)          [AE]
   ○ コンテンツに応じた塗りつぶし (オブジェクト除去)          [AE][R]
   ○ 手ブレ補正 / フリッカー除去 / ノイズ除去
   ○ ノードコンポジットモード (Fusion 風、線形チェーン)      [R]
-  ○ ビデオエフェクト 46 種 (Blur/Glow/Glitch/Halftone/Curves/... ) ★Wave 1 で 48 種 ◇Wave 4 で 50 種
+  ○ ビデオエフェクト 46 種 (Blur/Glow/Glitch/Halftone/Curves/... ) ★Wave 1 で 48 種 ◇Wave 4 で 50 種 ◈Wave 5 で +9 種 (反転 / ルマキー / カラーキー / カメラ Log / ワープ 5 種、いずれも CPU 専用)
   ◇ レンズ歪み補正 (径方向 k1/k2、拡大率、中心。CPU / GPU 同一式、書き出し対応)  [AE] Optics Compensation / [R] Lens Distortion
   ◇ ローリングシャッター補正 (オプティカルフロー Warp。走査時間 / 方向 / 強度)  [AE] Rolling Shutter Repair
   ○ トランジション 45 種 (Dissolve/Wipe/Push/Iris/LightLeak/... ◆モーフカット追加)
@@ -70,19 +83,27 @@
   ◆ ビデオトランジションの書き出し対応 (従来はプレビューのみ。書き出しにも同じ合成が出る欠陥修正)
   ○ GPU シェーダーエフェクト / プラグインエフェクト / エフェクトプリセット / エフェクトライブラリ
   ○ VFX ジェネレータ / VFX 素材合成 / ブラシ書き起こしアニメ / Mograph テンプレート / ローワーサード / ウォーターマーク
+  ✦ メッシュワープ (クリップ属性 + プレビュー上のグリッドハンドル編集。CPU 経路でプレビューと書き出しが一致)  [AE] Mesh Warp / [R] Warper
+  ✦ 多フレーム特徴点追跡・2 視点姿勢の連結・小規模バンドル調整 (数値基盤、UI なし)  [AE]
 
 ■ 4. カラー
   ○ カラーホイール (Lift/Gamma/Gain) / RGB・Luma カーブ / HSL セカンダリ  [P][R]
   ☆ Log ホイール (Shadow / Midtone / Highlight の Log レンジ)   [R]
   ◆ カラーワーパー (色相 12 × 彩度 3 のメッシュを引っ張って色相/彩度を変形)  [R]
   ☆ スチル保存 + ワイプ比較 (スチルギャラリー / 分割画面)       [R]
-  ○ LUT 適用・管理 / ASC CDL 書き出し / カラーマッチ / 自動カラー
+  ○ LUT 適用・管理 / ASC CDL 書き出し / カラーマッチ / 自動カラー (◈ MCP set_color_correction / apply_lut、get_timeline に colorCorrection / lut)
+  ◈ カメラ Log → Rec.709 変換 (S-Log3 / LogC3 / V-Log / Cineon、露出オフセット、出力 ガンマ 2.4 / リニア / Rec.709 OETF)  [R] Color Space Transform  [P] Lumetri 入力 LUT 相当
   ○ ACES カラーマネジメント / HDR (HDR10/HLG) 出力 / Dolby Vision メタデータ (サイドカー)
   ○ Lumetri 風スコープ (波形/ベクトル) / 露出補助 (フォルスカラー/ゼブラ/ピーキング)
   ○ カラーパラメータのキーフレーム (◇ HSL セカンダリ / Log ホイール / カラーワーパーも「キーフレーム追加」で対応)
+  ✦ メニューの「LUT適用 (.cube)…」が選択クリップに保存され書き出しにも反映 (欠陥修正。メニュー LUT を使うプロジェクトは書き出しの絵が変わる)  [P][R]
+  ✦ 放送セーフ (Rec.709 リーガル / RGB 全域のリミッター) と 色を残す (Leave Color)。CPU 専用でプレビューと書き出しが一致  [R] Broadcast Safe / [AE] Leave Color
 
 ■ 5. オーディオ
   ○ ミキサー / バス・サブミックス / トラック EQ / コンプレッサー / リミッター / リバーブ
+  ◈ トラック音声効果 (4 band EQ / コンプ / リバーブ / NR) を書き出しにも適用 (欠陥修正。該当トラック効果を使うプロジェクトは書き出し音声が変わる。再生音は不変)  [P][R]
+  ✦ マスターバス EQ (ミックス後段、既定 OFF) と パネル行とエンジン側トラックの対応修正 (欠陥修正。A1 の効果が別トラックに掛かっていた)  [P][R]
+  ✦ トラック音声効果 / マスター EQ のプロジェクト保存・復元とプロジェクト切替時のリセット (欠陥修正。以前は保存されず別プロジェクトへ持ち越していた)  [P][R]
   ○ 自動ダッキング (BGM) / ボリュームエンベロープ / ステレオパン / チャンネルマッピング
   ○ ラウドネス (BS.1770) 計測・正規化 / 音声リストア / スペクトル修復 / 音声分離 (スピーチ強調)
   ◇ ノイズプリント (イン点〜アウト点からノイズを採取し、クリップ全体からスペクトル減算)  [P] Adaptive Noise Reduction / [R] Noise Removal / [AE] Audition Noise Print
@@ -99,6 +120,9 @@
 
 ■ 7. 書き出し / 連携
   ○ レンダーキュー / バッチ書き出し / SNS 向け / モバイル向け / GIF・WebP / 現在フレーム
+  ◈ 書き出しのレート制御 (ビットレート / 品質 CRF。H.264 / H.265 / AV1 / VP9。AV1 の CRF はハードウェア不可ならソフトウェアへ) と 音声のみ書き出し (m4a / wav / mp3)  [P][R]
+  ✦ 書き出しのユーザープリセット保存 / 削除 (MCP export_video の preset で名前指定)  [P][R]
+  ✦ ProRes 4444 / 4444 XQ のアルファ付き書き出し (keepAlpha、既定 OFF。透明部分が透明のまま MOV に残る)  [P][AE][R]
   ○ Premiere XML / FCPXML / DaVinci XML / EDL / PPTX / Remotion 形式
   ○ 取り込みハブ (Affinity PSD/SVG, Blender, OBS, Frame.io, URL(yt-dlp))
   △ YouTube / Vimeo / Instagram / X 直送 (認証情報が必要)
@@ -108,8 +132,9 @@
 ■ 8. AI / 自動化
   ○ AI アップスケール / フレーム補間 / AI ハイライト / 自動カット / スマートエディット
   ○ 文字起こしからハイライト検出 (Anthropic/OpenAI/Gemini/オフライン)
-  ○ MCP サーバ内蔵 (27 ツール ★Wave 1 で 33 ツール ☆Wave 2 で 36 ツール ◇Wave 4 で 39 ツール、selftest --selftest=mcp は
-    ★Wave 1 で G1..G134 ☆Wave 2 で G1..G145 ◆Wave 3 で G1..G147 ◇Wave 4 で G1..G155 の 155 ゲート) + AI チャット Dock (Claude Code / Codex CLI)
+  ○ MCP サーバ内蔵 (27 ツール ★Wave 1 で 33 ツール ☆Wave 2 で 36 ツール ◇Wave 4 で 39 ツール ◈Wave 5 で 42 ツール
+    ✦Wave 6 で 47 ツール、selftest --selftest=mcp は
+    ★Wave 1 で G1..G134 ☆Wave 2 で G1..G145 ◆Wave 3 で G1..G147 ◇Wave 4 で G1..G155 ◈Wave 5 で G1..G162 ✦Wave 6 で G1..G170 の 170 ゲート) + AI チャット Dock (Claude Code / Codex CLI)
      → 競合 3 製品には無い、本アプリ独自の機能
 
 --------------------------------------------------------------------------------
@@ -157,7 +182,7 @@
   ◆ 受け入れ検証用 --selftest=render-fixture (旧 exe と新 exe の書き出し一致を機械的に比較)
   ※ 上記 2 件の欠陥修正を除き新機能は既定 OFF。該当要素を持たないプロジェクトの書き出しは Wave 2 と byte-identical。
 
-■ Wave 4 (今回実装)  — 詳細な検証手順は第3部 3.6
+■ Wave 4 (実装済み)  — 詳細な検証手順は第3部 3.6
   ◇ get_timeline のトランジション詳細 (alignment / easing / ソフトネス / 境界線) と実オーバーラップ秒 (MCP)
   ◇ 旧「マルチカメラセットアップ」の音声同期を実同期に (欠陥修正。同ダイアログのオフセットが変わる)  [P][R]
   ◇ ワイプ / バーンドア / アイリス / クロックワイプのソフトネスと境界線 (幅・色)  [P] Border / [R] Feather
@@ -173,8 +198,51 @@
   ※ 上記 1 件の欠陥修正を除き新機能は既定 OFF。該当要素を持たないプロジェクトの書き出しは Wave 3 と byte-identical
      (各 story で --selftest=render-fixture を Wave 3 exe と HEAD exe で実行し全ファイル一致を確認済み)。
 
-■ Wave 5 候補 (大型・要検討)
-  × フル 3D カメラトラッカー (特徴点 + KLT は Wave 4 で実装済み。残りはバンドル調整と一般シーンの解法)  [AE]
+■ Wave 5 (実装済み)  — 詳細な検証手順は第3部 3.7
+  ◈ MCP からの色補正 / LUT (set_color_correction / apply_lut、get_timeline に colorCorrection / lut)
+  ◈ タイムラインの基本操作 A: すべて選択 / 再生ヘッド以降・以前を選択 / 全トラックを再生ヘッドで分割 / リフト  [P][R]
+  ◈ タイムラインの基本操作 B: 複製 / 1・10 フレーム移動 (ナッジ) / すべてのギャップを詰める  [P][R]
+  ◈ 反転 (Flip/Flop) エフェクトと 平面レイヤー (単色) の挿入  [P][AE][R]
+  ◈ ルマキー / カラーキー (CPU 専用、alpha が書き出しまで生きる)  [P][AE][R]
+  ◈ カメラ Log → Rec.709 変換 (S-Log3 / LogC3 / V-Log / Cineon)  [R] CST
+  ◈ パラメトリック Warp 5 種 (ウェーブ / リップル / 球面化 / 魚眼 / ピンチ) の実装 (stub 置換)  [AE]
+  ◈ メディアプールのレーティング (お気に入り / 却下 / 星) とフィルタ、名前変更、エクスプローラーで表示  [P][R]
+  ◈ トラックの名前 / 色 (ヘッダ右クリック) と MCP set_track_property、get_timeline のトラック属性  [P][AE][R]
+  ◈ 書き出しのレート制御 (CRF / ビットレート) と export_video の rateControl / crf  [P][R]
+  ◈ 音声のみ書き出し (m4a / wav / mp3) と export_video の audioOnly  [P][R]
+  ◈ オーディオをキーフレームに変換 + エクスプレッション audioLevel()  [AE]
+  ◈ トラック音声 DSP (4 band EQ / コンプ / リバーブ / NR) の共有モジュール化 (再生音は不変)
+  ◈ トラック音声効果を書き出しにも適用 (欠陥修正。トラック効果を使うプロジェクトは書き出し音声が変わる)  [P][R]
+  ◈ 2 視点相対姿勢 (正規化 8 点法 + RANSAC + E 分解) と線形三角測量 (数値基盤、UI なし)  [AE]
+  ◈ MCP 新ツール: set_color_correction / apply_lut / set_track_property、
+                   export_video(rateControl / crf / audioOnly)、get_timeline(colorCorrection / lut / トラック name・color)
+  ※ 上記 1 件の欠陥修正を除き新機能は既定 OFF。該当要素を持たないプロジェクトの書き出しは Wave 4 と byte-identical
+     (各 story で --selftest=render-fixture を Wave 4 exe (3da4676) と HEAD exe で実行し全ファイル一致を確認済み)。
+
+■ Wave 6 (今回実装)  — 詳細な検証手順は第3部 3.8
+  ✦ メニューの「LUT適用 (.cube)…」が書き出しにも反映 (欠陥修正。メニュー LUT を使うプロジェクトは書き出しが変わる)  [P][R]
+  ✦ 範囲ドラッグ選択 (マーキー) / シーケンス全体を表示 / 選択範囲にズーム / タイムコードへジャンプ (Ctrl+Shift+J)  [P][R]
+  ✦ クリップの先頭・末尾を再生ヘッドへ移動 / 同じラベルのクリップを選択 / リンク選択の切替  [P][R]
+  ✦ トラック音声効果の対象トラック修正とマスターバス EQ (欠陥修正。A1 の効果が別トラックに掛かっていた)  [P][R]
+  ✦ トラック音声効果 / マスター EQ のプロジェクト保存・復元とプロジェクト切替時のリセット (欠陥修正)  [P][R]
+  ✦ 書き出しのユーザープリセット保存・削除と export_video の preset  [P][R]
+  ✦ ProRes 4444 / 4444 XQ のアルファ付き書き出し (keepAlpha、既定 OFF)  [P][AE][R]
+  ✦ メディアプールの素材サムネイル (非同期) とホバースキミング  [P][R]
+  ✦ タイムラインの映像クリップにフィルムストリップ (サムネイル列、既定 OFF)  [P][R]
+  ✦ シーケンス一覧 Dock (切替 / 新規 / 名前変更) と MCP get_sequences / set_active_sequence  [P][R]
+  ✦ 放送セーフ (ビデオリミッター) と 色を残す (Leave Color) の 2 エフェクト (CPU 専用)  [R] Broadcast Safe / [AE] Leave Color
+  ✦ メッシュワープ (クリップ属性 + プレビュー上のグリッドハンドル編集、既定 OFF)  [AE] Mesh Warp / [R] Warper
+  ✦ トラックの削除 / 上下移動 (ヘッダ右クリック・トラックメニュー・MCP) と undo 1 回での完全復元  [P][AE][R]
+  ✦ 多フレーム特徴点追跡・2 視点姿勢の連結と小規模バンドル調整 (数値基盤、UI なし)  [AE]
+  ✦ MCP 新ツール: get_sequences / set_active_sequence / add_track / remove_track / move_track、
+                   export_video(preset / keepAlpha / proresProfile)
+  ※ 上記 3 件の欠陥修正を除き新機能は既定 OFF。該当要素を持たないプロジェクトの書き出しは Wave 5 と byte-identical
+     (各 story で --selftest=render-fixture を Wave 5 exe (29188ac) と HEAD exe で実行し全ファイル一致を確認済み)。
+
+■ Wave 7 候補 (大型・要検討)
+  × フル 3D カメラトラッカー (特徴点 + KLT + 2 視点姿勢 + 三角測量 + 小規模バンドル調整まで実装済み。
+    残りは多視点の統合と UI)  [AE]
+  × VP9 アルファ / PNG 連番でのアルファ書き出し (Wave 6 は ProRes 4444 系のみ)  [AE][R]
   × Generative Extend / Depth Map / Relight (ML モデル前提のため対象外)
 
 --------------------------------------------------------------------------------
@@ -212,7 +280,7 @@
     「先に list_commands で確認してから」と付けると安全です。
   ・危険なコマンド: 終了系は MCP から実行不可。モーダルダイアログ系は allowBlocking が必要。
 
-■ 3.2 既存機能のスモークテスト (MCP 39 ツール)
+■ 3.2 既存機能のスモークテスト (MCP 47 ツール)
   □ 「プロジェクト情報を教えて」                      → get_project_info
   □ 「検証動画フォルダの xxx.mp4 を V1 に取り込んで」  → import_media (V/A ペアで入る)
   □ 「2 番目のクリップを 3 秒の位置で分割して」        → split_clip、Ctrl+Z で戻る
@@ -616,7 +684,309 @@
      手動:  操作なし (フル 3D カメラトラッカーの土台。src/FeatureTracker.h の detectShiTomasi / trackPyramidalLK)
      selftest: --selftest=feature-tracker (6 ゲート。並進 ≥95% が 0.3px 以内、回転+拡大 ≥80% が 1px 以内、遮蔽の棄却)
 
-■ 3.7 回帰確認 (Wave 1 / 2 / 3 / 4 後に必ず)
+■ 3.7 Wave 5 新機能の検証チェックリスト
+
+  ※ Wave 5 で MCP に増えたのは set_color_correction / apply_lut / set_track_property の 3 ツール (39 → 42)。
+     export_video に rateControl / crf / audioOnly、get_timeline に各クリップの colorCorrection / lut と各トラックの
+     name / color が増えた (既存フィールドと required は不変)。mcp selftest は G156..G162 が追加 (G1..G162)。
+  ※ 1 件は既存欠陥の修正で結果が変わる: (14) トラック音声効果の書き出し反映。これまでオーディオ メニューの
+     EQ パネル / コンプレッサー / リバーブ / ノイズリダクションはプレビュー再生にだけ効き、書き出しでは無視されていた。
+     Wave 5 からは書き出し音声にも同じ DSP (再生と同じ順序・ヘッドルーム) が掛かるので、これらを有効にした
+     プロジェクトは書き出し音声が変わる。再生音は不変。トラック効果を使っていないプロジェクトは byte-identical。
+
+  ▼ (1) MCP からの色補正 / LUT  (MCP のみ。UI はエフェクト > 色補正 / LUT 適用 と同じ値)
+     LLM:   「クリップ 1 を少し明るくして暖色に」→ set_color_correction、「クリップ 1 に xxx.cube を 65% で当てて」→ apply_lut
+     呼び出し例:      set_color_correction {"clipIndex":0,"values":{"exposure":0.5,"temperature":20,"liftR":0.1}}
+                      apply_lut {"clipIndex":0,"filePath":"D:/luts/film.cube","intensity":0.65}   /   解除: {"clipIndex":0,"filePath":""}
+     期待レスポンス:  {"ok":true,"colorCorrection":{...28 項目...}} / {"ok":true,"lut":{"filePath":"...","intensity":0.65}}
+                      get_timeline の clips[] に colorCorrection と lut が載る。範囲外 (gamma 5) や未知の項目は何も変えずエラー、
+                      hueSatWarp は無視して warning。存在しない LUT パスは「LUT ファイルが見つかりません」。音声クリップは拒否。
+                      reset:true は既定値へ戻してから values を適用。
+     Undo:  set_color_correction 1 回 = Ctrl+Z 1 回、apply_lut は適用・解除それぞれ 1 回 (同じ値の再設定は積まない)
+     selftest: --selftest=mcp G156 (部分更新と reset、undo 1 回) / G157 (不正値の原子的拒否) / G158 (LUT 適用・解除・undo)
+
+  ▼ (2) タイムラインの基本操作 A  (編集 > すべて選択 / 再生ヘッド以降を選択 / 再生ヘッド以前を選択 / 全トラックを再生ヘッドで分割 / リフト)
+     手動:  V1 / V2 / A1 にクリップを置き、A1 をロック → Ctrl+A
+            期待: ロック / 非表示トラック以外の全クリップが選択される。「再生ヘッド以降を選択」は再生ヘッドにかかるクリップも含む。
+                  Ctrl+Shift+K で再生ヘッド位置にある全トラックのクリップが同時に分割される (ロックは除外、リンクは維持)。
+                  「リフト (ギャップを残して削除)」は選択クリップを消して後続を詰めない。
+                  分割対象が無いと「再生ヘッド位置に分割できるクリップがありません。」がステータスバーに出る。
+     LLM:   MCP ツール無し (run_command で編集メニューの項目を実行可)。
+     Undo:  分割 / リフトは Ctrl+Z 1 回。選択操作は undo を積まない。
+     selftest: --selftest=timeline-ergo G1 (全選択とロック / 非表示の除外) / G2 (前後選択の境界) / G3 (ブレードオールと undo)
+
+  ▼ (3) タイムラインの基本操作 B  (編集 > 複製 (Ctrl+D) / 1・10 フレーム左右へ移動 (Alt+←→, Alt+Shift+←→) / すべてのギャップを詰める)
+     手動:  クリップを選んで Ctrl+D → 直後に同じクリップが複製される (リンクした音声も一緒、linkGroup は新番号)。
+            Alt+→ で 1 フレーム (1/fps 秒) 右へ、Alt+Shift+← で 10 フレーム左へ。隣接クリップにぶつかると
+            「指定位置へ移動できません。候補: N 秒」、0 秒未満は 0 に丸めて「ナッジ位置を N 秒に調整しました。」。
+            「すべてのギャップを詰める」は全トラック (ロック除く) で同時に空いている区間だけを詰め、
+            1 トラックだけの空きは残る (他トラックを壊さないため)。
+     LLM:   MCP ツール無し (move_clip で同等の移動は可能)。
+     Undo:  複製 / ナッジ 1 回 / ギャップ詰め はそれぞれ Ctrl+Z 1 回
+     selftest: --selftest=timeline-ergo G4 (共通ギャップのみ、ロック不変、undo) / G5 (複製の位置と内容) / G6 (fps 単位、衝突、0 クランプ)
+
+  ▼ (4) 反転 (Flip/Flop) と 平面レイヤー  (エフェクト > ビデオエフェクト > ディストーション > 反転 (Flip/Flop) / 挿入 > 平面レイヤー (単色)…)
+     手動:  「反転」を適用し 方向 を 0 (水平) / 1 (垂直) / 2 (両方) に変える
+            期待: 絵が鏡像になる。2 回適用すると元に戻る。プレビューと書き出しが同じ絵 (CPU 経路)。
+            「平面レイヤー (単色)…」で色 (既定 白) と尺 (既定 5 秒) を指定
+            期待: 再生ヘッド位置に「平面 #RRGGBB」クリップが入り、全面がその色。再生ヘッドが既存クリップの内部なら
+                  そのクリップの直後に入る (分割はしない。シェイプクリップと同じ規則)。
+     LLM:   MCP ツール無し。get_frame で確認。
+     Undo:  平面レイヤー挿入は Ctrl+Z 1 回で消える
+     selftest: --selftest=flip-solid (5 ゲート。G2 でプレビュー / 書き出し一致、G3 対合性、G5 挿入と undo) / --selftest=effect-preset
+
+  ▼ (5) ルマキー / カラーキー  (エフェクト > ビデオエフェクト > カラー > ルマキー / カラーキー)
+     手動:  V2 のクリップにルマキー (下限 0 / 上限 0.3 / ソフトネス 0.05) → 暗部が抜けて V1 が透ける。
+            カラーキー (キーカラー 緑、許容度 0.1) でグリーンバックが抜ける。
+            期待: プレビューと書き出しが同じ絵 (CPU 経路)。キーヤーの後ろにブラー等を置くと透明部分が失われるので
+                  スタックの最後に置く (ライブラリのタグにも明記)。既定 (効果なし) なら byte-identical。
+     LLM:   MCP ツール無し。get_frame で確認。
+     selftest: --selftest=keyers (7 ゲート。G4 合成、G6 スタック順序、G7 CPU 強制) / --selftest=effect-preset / gpu-composite-parity
+
+  ▼ (6) カメラ Log → Rec.709  (エフェクト > ビデオエフェクト > カラー > カメラ Log → Rec.709)
+     手動:  Log 収録素材に適用し 入力 を 0 (S-Log3) / 1 (LogC3 EI800) / 2 (V-Log) / 3 (Cineon) から選ぶ
+            期待: 眠い絵が Rec.709 のコントラストになる。露出オフセット (stop) で明るさ、出力 0 (ガンマ 2.4) / 1 (リニア) / 2 (Rec.709 OETF)。
+                  18% グレーはリニア 0.18、ガンマ 2.4 で 0.489、OETF で 0.409 に写る。既存の HDR 変換 / ACES は不変。
+     LLM:   MCP ツール無し。
+     selftest: --selftest=log-to-rec709 (8 ゲート。G2/G3/G3b が 4 種の 18% グレー、G7 ガマット行列) / --selftest=effect-preset
+
+  ▼ (7) パラメトリック Warp 5 種  (エフェクト > ビデオエフェクト > ディストーション > ワープ: ウェーブ / リップル / 球面化 / 魚眼 / ピンチ、
+                                    または コンポジション > ワープ / 歪みエフェクト… で種類と量を指定)
+     手動:  「ワープ: 球面化」量 0.5 → 中央が膨らむ。ピンチは量 0.5 で中央が縮む。ウェーブは振幅 (px) / 周波数 / 位相。
+            期待: 量 0 / 無効なら byte-identical。プレビューと書き出しが同じ絵 (CPU 専用)。既存のバルジ / 渦巻きは不変。
+     LLM:   MCP ツール無し。
+     Undo:  「ワープ / 歪みエフェクト…」からの適用は Ctrl+Z 1 回
+     selftest: --selftest=warp-fx (7 ゲート。G7 で 3 経路の一致) / --selftest=ae-fx-distort / effect-preset (型数 60)
+
+  ▼ (8) メディアプールのレーティングとフィルタ  (メディアプール Dock: 素材右クリック / フィルタコンボ)
+     手動:  素材を右クリック → お気に入り / 却下 / 星 (なし〜★5) / 名前を変更… / エクスプローラーで表示
+            フィルタを すべて / お気に入り / 却下を除く / 未使用 に切り替え、検索欄と組み合わせる
+            期待: お気に入りと却下は排他。「未使用」はタイムライン (ネストシーケンス内を含む) に置かれていない素材だけ。
+                  名前変更は表示名だけでファイルパスは変わらない。保存 → 再読込でレーティングが残る。
+                  レーティングを付けていないプロジェクトの JSON は従来と同一。
+     LLM:   MCP ツール無し。
+     selftest: --selftest=media-pool-rating (4 ゲート) / --selftest=media-pool / mediapool-drag
+
+  ▼ (9) トラックの名前と色  (トラックヘッダ右クリック > 名前を変更… / 色 / MCP set_track_property)
+     手動:  V1 のヘッダを右クリック → 「名前を変更…」で「メイン」、「色」で 青
+            期待: ヘッダのラベルと色ストライプが変わる。空欄で既定名に戻る。保存 → 再読込で保持。
+     LLM:   「V1 の名前を『メイン』、色を青にして」→ set_track_property
+     呼び出し例:      set_track_property {"kind":"video","trackIndex":0,"name":"メイン","color":"#3366ff"}
+     期待レスポンス:  {"ok":true,"track":{"index":0,"name":"メイン","color":"#3366ff","locked":false,"muted":false,"solo":false,"hidden":false},"undoRecorded":true}
+                      get_timeline の tracks[] に name / color が載る。color は #RRGGBB か空文字以外はエラー。
+                      muted / solo / hidden も同じ呼び出しで変えられるが undo 対象外 (undoRecorded は名前・色の変化だけを示す)。
+     Undo:  名前と色はまとめて Ctrl+Z 1 回 (mcp G159)
+     selftest: --selftest=track-manage (3 ゲート) / --selftest=mcp G159-G160
+
+  ▼ (10) 書き出しのレート制御 (CRF)  (ファイル > エクスポート > レート制御: ビットレート / 品質 (CRF) / MCP export_video)
+     手動:  レート制御を「品質 (CRF)」にし CRF 20 (H.264 / H.265 / VP9 は 0..51 既定 23、AV1 は 0..63 既定 30) で書き出す
+            期待: ビットレート欄は無視され、ファイルサイズが内容に応じて変わる。ProRes ではグレーアウト。
+                  AV1 でハードウェアエンコーダが CRF に対応しない環境ではソフトウェア (libsvtav1) に自動で切り替わる。
+                  レンダーキューに入れても rateControl / crf が保持される。
+     LLM:   「CRF 20 で mp4 に書き出して」→ export_video
+     呼び出し例:      export_video {"outputPath":"D:/out/quality.mp4","rateControl":"crf","crf":20}
+     期待レスポンス:  {"ok":true,"jobId":...}。crf 99 / rateControl "vbr" はエラー。rateControl 省略時は従来どおりビットレート。
+     selftest: --selftest=export-pro (6 ゲート。G5 は libsvtav1 が無いビルドでは SKIP) / --selftest=mcp G161 / batchexport-e2e
+
+  ▼ (11) 音声のみ書き出し  (ファイル > エクスポート > 「音声のみ (映像なし)」 / MCP export_video audioOnly)
+     手動:  「音声のみ (映像なし)」にチェックし コンテナ m4a / wav / mp3 を選んで書き出す
+            期待: 映像の無い音声ファイルができる (m4a=AAC / wav=PCM 16bit / mp3)。尺はタイムラインと同じ。
+                  中間ミックスは PCM なので損失圧縮は最後の 1 回だけ。チェックを外しても編集したビットレート等は消えない。
+     LLM:   「音声だけ wav で書き出して」→ export_video
+     呼び出し例:      export_video {"outputPath":"D:/out/audio-only.wav","audioOnly":true}
+     期待レスポンス:  {"ok":true,"outputPath":"...","warnings":[...]} (同期実行、jobId は無し)。width / videoCodec 等を付けると無視して warnings に列挙。
+     selftest: --selftest=export-pro G5-G6 (コンテナ → コーデック対応) / --selftest=mcp G162
+
+  ▼ (12) オーディオをキーフレームに変換 / audioLevel()  (エフェクトコントロール パネル > Presets > オーディオをキーフレームに変換…)
+     手動:  リンク音声のある映像クリップを選び、音源 (リンク音声が既定) / 対象プロパティ (不透明度 / スケール / 回転 / 位置 X / Y) /
+            最小値・最大値 / フレームレート / 平滑化 (ms、既定 50) / しきい値 を指定して「変換」
+            期待: 音の大きさに合わせてプロパティのキーフレームが並ぶ (グラフエディタで確認)。
+                  エクスプレッションで audioLevel() (0..1、audioLevel(0.1) で 0.1 秒先) を使うとリンク音声の RMS 包絡が返る。
+                  リンク音声が無いクリップでは 0。
+     LLM:   MCP ツール無し。get_frame で中間時刻の不透明度を確認。
+     Undo:  「変換」1 回 = Ctrl+Z 1 回
+     selftest: --selftest=audio-keyframes (6 ゲート。G4 が audioLevel() の評価、G6 リンク音声の解決)
+
+  ▼ (13) トラック音声 DSP の共有モジュール化  (オーディオ > EQ パネル… / コンプレッサー / リミッター… / リバーブ… / ノイズリダクション…)
+     手動:  操作なし (内部変更)。A1 に EQ を掛けて再生した音が Wave 4 と同じであること。
+     selftest: --selftest=audio-trackfx G1 (旧 AudioMixer 経路と bit 一致) / G2 (全無効で完全バイパス) / G3-G6
+
+  ▼ (14) トラック音声効果の書き出し反映 (欠陥修正)  (上記パネルで効果を有効にして ファイル > エクスポート)
+     手動:  A1 の EQ パネルで 100Hz を -12dB にして書き出す
+            期待: 書き出した音声でも 100Hz が下がっている (これまでは書き出しに反映されなかった)。
+                  複数クリップが重なる区間や音量 / フェード付きでも再生と同じ順序で処理される。
+                  トラック効果を一切使わないプロジェクトの書き出しは byte-identical。
+     LLM:   「mp4 に書き出して」→ export_video (効果は自動で反映)
+     selftest: --selftest=audio-trackfx (13 ゲート。G9 が WAV 経路、G13 が実書き出しで -12dB を確認) / render-fixture IDENTICAL
+
+  ▼ (15) 2 視点相対姿勢と三角測量  (UI なし、数値基盤)
+     手動:  操作なし (フル 3D カメラトラッカーの次段。src/TwoViewGeometry.h の sfm::estimateRelativePose / sfm::triangulate)
+     selftest: --selftest=sfm-two-view (6 ゲート。ノイズ 0.5px で R/t が 0.5°/3° 以内、外れ値 20% で RANSAC、退化入力の拒否)
+
+■ 3.8 Wave 6 新機能の検証チェックリスト
+
+  ※ Wave 6 で MCP に増えたのは get_sequences / set_active_sequence / add_track / remove_track / move_track の
+     5 ツール (42 → 47)。export_video に preset / keepAlpha / proresProfile が増えた (既存フィールドと required は不変)。
+     mcp selftest は G163..G170 が追加 (G1..G170)。
+  ※ 3 件は既存欠陥の修正で結果が変わる:
+     (1) メニューの「LUT適用 (.cube)…」。これまでプレビューにしか効かず書き出しには乗らなかったが、Wave 6 からは
+         選択クリップの LUT として保存され書き出しにも反映される。メニュー LUT を使っていたプロジェクトは
+         書き出しの絵が変わる。あわせて映像クリップ未選択のときは「映像クリップを選択してください。」を出して
+         何もしない (以前は無選択でもプレビューだけ変わった)。
+     (4) トラック音声効果の対象トラック。パネルの行とエンジン側トラックの対応が 1 つずれており、A1 の EQ が
+         別トラックに掛かっていた。Wave 6 からは A1 = エンジン側トラック 0 に一致する。ずれた状態で作った
+         プロジェクトは、聞こえ方が「意図したとおり」に変わる。
+     (5) トラック音声効果とマスター EQ の保存。これまで一切保存されず、さらに別プロジェクトを開いても前の
+         プロジェクトの設定が残っていた。Wave 6 からは保存・復元され、プロジェクト切替でリセットされる。
+         Wave 5 以前に保存した .veditor には該当キーが無いため、開いた直後は効果がすべて既定 (無効) になる。
+
+  ▼ (1) メニュー LUT の書き出し反映  (エフェクト > LUT適用 (.cube)… / LUT強度 / LUT 解除)  ★欠陥修正
+     手動:  V1 のクリップを選択 → 「LUT適用 (.cube)…」で .cube を当てる → 強度スライダーを 60% → 書き出す
+            期待: プレビューと書き出しの絵が一致する。保存して開き直しても LUT と強度が残る。
+                  「LUT 解除」で外れ、これも書き出しに反映される。映像クリップを選んでいないときは
+                  「映像クリップを選択してください。」だけが出て何も変わらない。
+     LLM:   「クリップ 1 に xxx.cube を 60% で当てて」→ apply_lut (Wave 5 から。メニューと同じクリップ属性を触る)
+     Undo:  適用 / 解除 / 強度変更はそれぞれ Ctrl+Z 1 回 (同じ値の再適用は積まない)
+     selftest: --selftest=clip-lut (10 ゲート。G10 がメニュー適用・保存復元・undo・同値再適用を確認)
+
+  ▼ (2) 範囲選択とズーム、タイムコードジャンプ  (編集 > タイムコードへジャンプ… (Ctrl+Shift+J) / 表示 > シーケンス全体を表示 / 選択範囲にズーム)
+     手動:  タイムラインの空き領域からドラッグして複数クリップを囲む (マーキー)
+            期待: 矩形に重なったクリップだけが選択される。ロック / 非表示トラックは対象外。Shift ドラッグは追加選択。
+                  「シーケンス全体を表示」で全クリップが画面内に収まる。クリップを選んで「選択範囲にズーム」で
+                  選択範囲が画面幅いっぱいになる (未選択時はメニューが無効)。
+                  Ctrl+Shift+J は「時:分:秒:フレーム」「分:秒」「秒」を受け付け、先頭に + / - を付けると相対移動。
+                  範囲外の値はシーケンス長でクランプされ、再生ヘッドと表示位置の両方が動く。
+     LLM:   MCP ツール無し (set_playhead で再生ヘッドだけは動かせる)。
+     Undo:  選択 / ズーム / ジャンプはいずれも undo を積まない
+     selftest: --selftest=timeline-ergo G1 / G7 (マーキーの判定範囲) / G8 / G9 (ズームの収まりとクランプ)
+
+  ▼ (3) クリップ端の移動とラベル選択、リンク選択  (編集 > クリップの先頭/末尾を再生ヘッドへ移動 / 同じラベルのクリップを選択 / リンク選択)
+     手動:  クリップを選び再生ヘッドを別位置へ → 「クリップの先頭を再生ヘッドへ移動」
+            期待: クリップが再生ヘッド位置まで動く。リンクした音声も一緒に動き、衝突する場合は動かせる位置へ寄せる。
+                  「同じラベルのクリップを選択」は同じラベルカラーのクリップをまとめて選ぶ (undo は積まない)。
+                  「リンク選択」は既定 ON。OFF にすると映像だけを選んでも音声が付いてこない。設定は次回起動でも残る
+                  (QSettings timeline/linkedSelection)。
+     LLM:   MCP ツール無し。
+     Undo:  端の移動は Ctrl+Z 1 回で完全に戻る。選択系とリンク選択の切替は undo を積まない。
+     selftest: --selftest=timeline-ergo G10 (移動と undo) / G11 (ラベル選択は保存回数不変) / G12 (リンク選択 ON/OFF)
+
+  ▼ (4) トラック音声効果の対象トラックとマスター EQ  (オーディオ > EQ パネル… のトラック選択に「マスター」)  ★欠陥修正
+     手動:  A1 と A2 に別々の素材を置き、EQ パネルで A1 を選んで 100Hz を -12dB
+            期待: A1 だけが変わり A2 は変わらない (以前はずれて別トラックに掛かっていた)。
+                  トラック選択で「マスター」を選ぶと、すべてをミックスした後段に掛かる EQ になる
+                  (ツールチップ「すべてのトラックをミックスした後に掛かります (書き出しにも反映)」)。
+                  マスターはスライダーを触るまで OFF のまま。コンプレッサー / リバーブ / ノイズリダクションの
+                  パネルには「マスター」行が出ない (マスターは EQ のみ)。
+     LLM:   MCP ツール無し。「mp4 に書き出して」→ export_video (効果は自動で反映)
+     Undo:  効果パネルの操作は undo を積まない (プロジェクト保存で残る)
+     selftest: --selftest=audio-trackfx (19 ゲート。G14 が対象トラックの分離、G15 が再生と書き出しの一致、G16 が既定 OFF 時の byte 一致)
+
+  ▼ (5) トラック音声効果 / マスター EQ の保存と復元  (保存・読込・新規プロジェクト)  ★欠陥修正
+     手動:  A1 に EQ とコンプ、マスターに EQ を掛けて保存 → 別プロジェクトを開く → 元のプロジェクトを開き直す
+            期待: 開き直すと効果が保存時のまま戻る。別プロジェクトを開いた時点では効果が全部クリアされている
+                  (以前は前のプロジェクトの設定が残っていた)。「新規プロジェクト」でもクリアされる。
+                  Wave 5 以前に保存した .veditor は該当キーが無いので、開いた直後は全部既定 (無効)。
+     LLM:   「保存して」「開いて」→ save_project / open_project
+     Undo:  対象外 (プロジェクト状態)
+     selftest: --selftest=audio-trackfx G17 (JSON 往復) / G18 (保存・読込の両系統と DSP 出力一致) / G19 (切替時リセット)
+
+  ▼ (6) 書き出しのユーザープリセット  (書き出しダイアログ > 現在の設定をプリセットに保存… / プリセットを削除)
+     手動:  解像度・コーデック・CRF などを決めて「現在の設定をプリセットに保存…」→ 名前を付ける
+            期待: プリセット一覧に区切り線付きで並び、選ぶと全項目が復元される。組み込みと同名は
+                  「組み込みプリセットとは別の名前を指定してください」で拒否、既存ユーザー名は上書き確認が出る。
+                  「プリセットを削除」はユーザープリセット選択時だけ有効。組み込みプリセットに戻すと
+                  CRF / ビットレート範囲・音声のみチェックも既定へ戻る。
+     LLM:   「『配信用』プリセットで書き出して」→ export_video {"preset":"配信用"}
+            期待レスポンス: 組み込み → ユーザーの順に名前解決。他の引数を併記するとプリセットより優先。
+                            存在しない名前は「プリセットが見つかりません: <name>」。
+     Undo:  対象外 (アプリ設定)
+     selftest: --selftest=export-presets (4 ゲート。G1 が JSON 往復、G3 が組み込み 20 件の不変) / --selftest=mcp G163 / G164
+
+  ▼ (7) ProRes 4444 のアルファ付き書き出し  (書き出しダイアログ > アルファチャンネルを保持 (ProRes 4444 のみ))
+     手動:  V1 に画面の半分だけを覆う平面レイヤーやキーヤーを置き、コーデックに ProRes 4444 を選ぶ
+            期待: 「アルファチャンネルを保持 (ProRes 4444 のみ)」が押せるようになる (既定 OFF)。
+                  ON で書き出した MOV は、覆われていない部分が透明 (alpha 0) のまま残る。
+                  ProRes 422 や H.264 に切り替えるとチェックは自動で外れて無効になり、
+                  その組み合わせで指定すると「このコーデックはアルファを保持できません」で拒否される。
+                  OFF (既定) の書き出しは従来どおり黒で塗り潰した不透明の絵。
+     LLM:   「ProRes 4444 でアルファ付きで書き出して」→ export_video {"videoCodec":"prores","proresProfile":4,"keepAlpha":true}
+            期待レスポンス: prores かつ proresProfile 4 / 5 のときだけ受理。それ以外はエラー。
+     Undo:  対象外 (書き出し設定)
+     selftest: --selftest=export-alpha (4 ゲート。G2 が書き出した MOV を読み戻して透明部 alpha 0 / 被覆部 255 を確認、
+               G1 / G3 が既定 OFF 時の従来経路、G4 が非対応コーデックの拒否) / --selftest=mcp G165
+
+  ▼ (8) メディアプールのサムネイルとホバースキミング  (表示 > メディアプールのサムネイルを表示)
+     手動:  メディアプールに動画を取り込み、素材の上でマウスを左右に動かす
+            期待: 一覧にサムネイルが出る (既定 ON)。素材の上を左から右へなぞるとフレームが 8 段階で切り替わり、
+                  右端で終盤のフレームになる。取り込んだ直後やしばらく使わなかった素材でも同じように動く。
+                  表示メニューでチェックを外すとサムネイルが消え、読み込みも走らなくなる。
+     LLM:   MCP ツール無し。
+     Undo:  対象外 (表示設定)
+     selftest: --selftest=media-pool-thumbs (4 ゲート。非同期取得、尺の補完、退避後の再取得、OFF 時の無動作)
+
+  ▼ (9) タイムラインのフィルムストリップ  (表示 > クリップのサムネイルを表示)
+     手動:  表示メニューで「クリップのサムネイルを表示」をチェック
+            期待: 既定は OFF。ON にすると映像クリップの矩形内にサムネイルが並ぶ (最大 8 枚)。
+                  メディアプールと同じキャッシュを使うので、同じ素材で二重に読み込まれない。
+                  クリップを短くしてもサムネイルの時刻対応が素材全体基準のままずれない。OFF に戻すと描画も要求も止まる。
+     LLM:   MCP ツール無し。
+     Undo:  対象外 (表示設定)
+     selftest: --selftest=clip-filmstrip (3 ゲート。OFF 時の無描画・無要求、ON 時の描画、キャッシュ共有と時刻対応)
+
+  ▼ (10) シーケンス一覧 Dock  (表示 > シーケンス一覧)
+     手動:  表示メニューで「シーケンス一覧」を出す (既定は非表示)
+            期待: 全シーケンスが並び、アクティブなものが太字。ダブルクリックで切り替わる。
+                  下部の「新規シーケンス」で追加、右クリック「名前を変更…」でリネーム。
+     LLM:   「シーケンス一覧を見せて」→ get_sequences、「2 番目のシーケンスに切り替えて」→ set_active_sequence
+            期待レスポンス: get_sequences は id / name / アクティブ判定を返す。set_active_sequence は存在しない id を拒否。
+     Undo:  新規作成 / 名前変更はそれぞれ Ctrl+Z 1 回。切り替えは undo を積まない。
+     selftest: --selftest=sequence-dock (4 ゲート) / --selftest=mcp G166 / G167
+
+  ▼ (11) 放送セーフ と 色を残す  (エフェクト > ビデオエフェクト… > カラー)
+     手動:  彩度の高い素材に「放送セーフ」を適用し、規格を 0 (Rec.709 リーガル) にする
+            期待: 放送規格を超える輝度・彩度が範囲内に収まる。1 (RGB 全域) では制限が緩む。
+                  「色を残す」は「残す色」(既定 赤) に近い色だけを残して他をモノクロにする。
+                  許容度を上げると残る色域が広がり、彩度の減衰を下げると背景に色が残る。
+                  どちらも CPU 専用なのでプレビューと書き出しの絵が一致する。
+     LLM:   MCP ツール無し。get_frame で確認。
+     Undo:  エフェクトの追加 / パラメータ変更は Ctrl+Z 1 回
+     selftest: --selftest=safe-leavecolor (6 ゲート。数値仕様 3 件と、G6 が書き出しとプレビューのビット一致)
+
+  ▼ (12) メッシュワープ  (コンポジション > メッシュワープを編集 / メッシュワープをリセット…)
+     手動:  映像クリップを選び「メッシュワープを編集」をチェック
+            期待: プレビューにグリッドのハンドルが出る。ハンドルをドラッグすると絵が引き伸ばされ、
+                  プレビューと書き出しが一致する (CPU 経路に固定される)。
+                  「メッシュワープをリセット…」でグリッドを 3 / 4 / 6 から選び直せる (既定 4)。
+                  クリップ未選択やロック中は「映像クリップを選択してください。」で ON にできない。
+                  別プロジェクトを開く / 新規作成 / 別クリップを選ぶと編集モードは自動で解除される。
+     LLM:   MCP ツール無し。get_frame で確認。
+     Undo:  ハンドル 1 回のドラッグ = Ctrl+Z 1 回 (ドラッグ中の途中経過は積まない)。リセットも 1 回。
+     selftest: --selftest=mesh-warp (7 ゲート。G5 がプレビューと書き出しの一致、G6 がハンドル移動量と undo / 対象置換、G7 が 4 隅ピン)
+
+  ▼ (13) トラックの削除と並べ替え  (トラックヘッダ右クリック / トラック > 選択トラックを削除・上へ移動・下へ移動)
+     手動:  V2 を作ってクリップを置き、V2 のヘッダを右クリック → 「トラックを削除」
+            期待: クリップがある場合は「N 個のクリップも削除されます。トラックを削除しますか？」が出る (既定は「いいえ」)。
+                  削除すると下のトラックが繰り上がり、トラックマット / 親子付け / 調整レイヤー / ミキサー / バス送りの
+                  参照も一緒に付け替わる。Ctrl+Z 1 回で本数も中身も完全に戻る。
+                  最後の 1 本とロック中のトラックは削除できずメニューが無効 (「最後のトラックまたはロック中のトラックは削除できません」)。
+                  「上へ移動」「下へ移動」は端で無効。並べ替えてもトラック名・色は付いて動く。
+            注意: トラックを消した直後に Ctrl+Z で戻したとき、ソロ / ミュートなどの再生フラグは undo の対象外なので
+                  その時点の値のまま維持される (Wave 5 以前と同じ扱い)。
+     LLM:   「A2 を追加して」→ add_track {"kind":"audio"}、「V2 を消して」→ remove_track {"kind":"video","trackIndex":1}
+            「V1 を一番下へ」→ move_track {"kind":"video","trackIndex":0,"newTrackIndex":1}
+            期待レスポンス: 最後の 1 本とロック中は拒否。いずれも 1 回の undo で戻せる。
+     Undo:  削除 / 移動 / 追加はそれぞれ Ctrl+Z 1 回
+     selftest: --selftest=track-ops (12 ゲート。G8 が実メニュー操作と確認ダイアログ、G11 がマット編集を跨ぐ undo、
+               G12 が複合操作前の外部状態保持) / --selftest=mcp G168 / G169 / G170
+
+  ▼ (14) 多フレーム追跡・姿勢連結とバンドル調整  (UI なし、数値基盤)
+     手動:  操作なし (フル 3D カメラトラッカーの土台。src/BundleAdjustment.h の solveDenseLinearSystem /
+            trackAcrossFrames / chainTwoViewPoses / bundleAdjust)
+     selftest: --selftest=bundle-adjust (6 ゲート。G1..G3 が線形ソルバ・多フレーム追跡・姿勢連結、
+               G4..G6 が Levenberg-Marquardt の収束 (回転 0.2° / 方向 1° / RMS 0.05px 以内)、
+               反復ごとの残差が増えないこと、30 フレーム × 150 点の上限拒否)
+
+■ 3.9 回帰確認 (Wave 1 〜 Wave 6 後に必ず)
   □ 新機能を一切使わないプロジェクトの書き出しが以前と同一 (byte-identical)
      → 旧 exe と新 exe で同じプロジェクトを書き出し、fc /b で比較
   □ --selftest=mcp / trackmatte-parity / gpu-composite-parity / effect-preset / effect-library が全 PASS
@@ -627,13 +997,23 @@
      camera3d (9) / camera-solve (8) / render-fixture (3) / parity S1..S10 が全 PASS
   □ Wave 4 分: --selftest=transition-params (10) / grade-keyframe-ext (5) / lens-distort (6) / rolling-shutter (6) /
      noise-print (6) / render-in-place (8) / project-diff (7) / feature-tracker (6) / multicam / effect-preset (5、型数 51)
-     が全 PASS (mcp は G1..G155 の 155 PASS)
+     が全 PASS
+  □ Wave 5 分: --selftest=timeline-ergo (6) / flip-solid (5) / keyers (7) / log-to-rec709 (8) / warp-fx (7) / media-pool-rating (4) /
+     track-manage (3) / export-pro (6、G5 は libsvtav1 無しで SKIP) / audio-keyframes (6) / audio-trackfx (13) / sfm-two-view (6) /
+     effect-preset (5、型数 60) が全 PASS (mcp は G1..G162 の 162 PASS)
+  □ Wave 6 分: --selftest=export-alpha (4) / export-presets (4) / clip-filmstrip (3) / media-pool-thumbs (4) /
+     safe-leavecolor (6) / sequence-dock (4) / mesh-warp (7) / track-ops (12) / bundle-adjust (6) /
+     timeline-ergo (12) / audio-trackfx (19) / clip-lut (10) / effect-preset (5、型数 62) が全 PASS
+     (mcp は G1..G170 の 170 PASS)
   □ 旧 exe と新 exe の書き出し一致は --selftest=render-fixture で機械的に確認できる:
      両方の exe で VEDITOR_RENDER_FIXTURE_OUT=<別フォルダ> を付けて実行し、フォルダ同士を比較 (diff -r / fc)。
      fixture (b) (CrossDissolve 付き) だけは Wave 3 以降の exe で変わるのが正しい。
+     トラック音声効果 (EQ / コンプ / リバーブ / NR) を有効にしたプロジェクトの音声は Wave 5 以降の exe で変わるのが正しい。
+     メニューの LUT 適用を使ったプロジェクトの絵と、トラック音声効果の対象トラックがずれていたプロジェクトの音声は
+     Wave 6 以降の exe で変わるのが正しい。
   □ 旧 .veditor プロジェクトが警告なく開ける
 
-■ 3.8 不具合を見つけたとき
+■ 3.10 不具合を見つけたとき
   ・AI チャット Dock のログ (ツール名・引数・応答) をそのまま貼る
   ・再現に使った指示文、期待した結果、実際の結果、Ctrl+Z で戻ったか を添える
   ・selftest が FAIL なら stderr の FAIL Gn 行を添える

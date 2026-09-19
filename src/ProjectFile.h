@@ -4,6 +4,8 @@
 #include <QJsonObject>
 #include <QJsonArray>
 #include <QImage>
+#include <QMap>
+#include "AudioTrackFx.h"
 #include "ProjectSettings.h"
 #include "Timeline.h"
 #include "VideoEffect.h"
@@ -236,6 +238,8 @@ struct ProjectData {
 
     // Audio mixer state
     QVector<TrackEqState> trackEqStates;
+    QMap<int, trackfx::Chain> trackFx; // Engine audio track indices (A1 = 0).
+    trackfx::Chain masterFx;
     CompressorState masterCompressor;
     AutoDuckState autoDuck;
     bool audioMetersDockVisible = true;

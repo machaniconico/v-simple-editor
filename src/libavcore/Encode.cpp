@@ -1,4 +1,5 @@
 #include "Encode.h"
+#include <atomic>
 
 #include "color/SwsColorParams.h"
 #include "playback/swsmatrix_flag.h"
@@ -381,6 +382,7 @@ AVRational FrameEncoder::encoderTimeBase() const
 
 void FrameEncoder::releaseAll()
 {
+    if (m_rgbaToYuvCtx) { sws_freeContext(m_rgbaToYuvCtx); m_rgbaToYuvCtx = nullptr; }
     if (m_rgbToYuvCtx) { sws_freeContext(m_rgbToYuvCtx); m_rgbToYuvCtx = nullptr; }
     if (m_scratchFrame) { av_frame_free(&m_scratchFrame); }
     if (m_audioScratchFrame) { av_frame_free(&m_audioScratchFrame); }
@@ -402,6 +404,75 @@ void FrameEncoder::releaseAll()
     m_audioNextPts = 0;
     m_audioPtsInitialized = false;
     m_audioEncode = false;
+}
+
+QList<QPair<QString, QString>> codecOptionsFor(
+    const EncodeRequest& req, const QString& resolvedEncoderName)
+{
+    QList<QPair<QString, QString>> options;
+    const std::string name = resolvedEncoderName.toStdString();
+    const bool av1 = resolvedEncoderName.contains(QStringLiteral("av1"));
+    const int defaultCrf = av1 ? 30 : 23;
+    const int crf = req.rateControl == EncodeRequest::RateControl::Crf && req.crf != -1
+        ? qBound(0, req.crf, av1 ? 63 : 51) : defaultCrf;
+    const std::string quality = std::to_string(crf);
+    auto add = [&options](const char* key, const char* value) {
+        options.append(qMakePair(QString::fromUtf8(key), QString::fromUtf8(value)));
+    };
+    if (req.rateControl == EncodeRequest::RateControl::Bitrate)
+        options.append(qMakePair(QStringLiteral("bit_rate"),
+                                 QString::number(static_cast<qlonglong>(req.videoBitrateBits))));
+    if (name == "h264_nvenc" || name == "hevc_nvenc"
+        || (name == "av1_nvenc" && req.rateControl == EncodeRequest::RateControl::Crf)) {
+        add("preset", "p4");
+        add("rc", "vbr");
+        add("cq", quality.c_str());
+    } else if (name == "h264_qsv" || name == "hevc_qsv") {
+        add("preset", "medium");
+    } else if (name == "h264_amf" || name == "hevc_amf") {
+        add("quality", "balanced");
+    } else if (name == "libx264" || name == "libx265") {
+        add("preset", "medium");
+        add("crf", quality.c_str());
+        if (name == "libx265") {
+            if (req.isHdr10) {
+                add("profile", "main10");
+                const std::string x265p = buildX265Hdr10Params(
+                    req.hdrMasterMaxNits, req.hdrMasterMinNits,
+                    req.hdrMaxCll, req.hdrMaxFall);
+                add("x265-params", x265p.c_str());
+            } else if (req.isHlg) {
+                add("profile", "main10");
+                add("x265-params", "repeat-headers=1:colorprim=bt2020:"
+                            "transfer=arib-std-b67:colormatrix=bt2020nc");
+            }
+        }
+    } else if (name == "h264_mf" || name == "hevc_mf") {
+        // Windows Media Foundation H.264/HEVC. Without explicit rate control
+        // mfenc defaults to a CBR-style mode that pads easy frames and starves
+        // hard ones, raising decoded-vs-source MSE at a fixed bitrate.
+        // u_vbr (unconstrained VBR) treats bit_rate as an average target and
+        // lets the encoder reallocate bits toward harder frames; the archive
+        // scenario is a fidelity-priority hint (vs latency-priority scenarios
+        // like video_conference / live_streaming). Together they lower the
+        // decoded-vs-source error at the same configured bitrate.
+        add("rate_control", "u_vbr");
+        add("scenario", "archive");
+        add("quality", "100");
+    } else if (name == "libsvtav1") {
+        add("preset", "8");
+        add("crf", quality.c_str());
+    } else if (name == "libvpx-vp9") {
+        add("quality", "good");
+        add("cpu-used", "4");
+        if (req.rateControl == EncodeRequest::RateControl::Crf)
+            add("crf", quality.c_str());
+    } else if (name.rfind("prores", 0) == 0 && req.proresProfile >= 0) {
+        char buf[16];
+        std::snprintf(buf, sizeof(buf), "%d", req.proresProfile);
+        add("profile", buf);
+    }
+    return options;
 }
 
 bool FrameEncoder::configureEncoderContext(const EncodeRequest& req,
@@ -452,9 +523,11 @@ bool FrameEncoder::configureEncoderContext(const EncodeRequest& req,
         if (list && list[0] != AV_PIX_FMT_NONE) targetPixFmt = list[0];
         av_free(const_cast<AVPixelFormat*>(list));
     }
+    if (req.keepAlpha && targetPixFmt != AV_PIX_FMT_YUVA444P10LE)
+        return false;
     m_encCtx->pix_fmt = targetPixFmt;
     m_pixFmt = targetPixFmt;
-    m_encCtx->bit_rate = req.videoBitrateBits;
+    m_encCtx->bit_rate = 0; // CRF has no target bitrate.
 
     if (req.isHdr10) {
         m_encCtx->color_primaries = AVCOL_PRI_BT2020;
@@ -511,57 +584,13 @@ bool FrameEncoder::configureEncoderContext(const EncodeRequest& req,
         m_encCtx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
     }
 
-    // Codec-specific opts — mirrors Exporter.cpp 1:1. `name` was bound to
-    // m_activeEncoderName above for the pixel-format / profile decisions.
-    if (name == "h264_nvenc" || name == "hevc_nvenc") {
-        av_dict_set(outOpts, "preset", "p4", 0);
-        av_dict_set(outOpts, "rc", "vbr", 0);
-        av_dict_set(outOpts, "cq", "23", 0);
-    } else if (name == "h264_qsv" || name == "hevc_qsv") {
-        av_dict_set(outOpts, "preset", "medium", 0);
-    } else if (name == "h264_amf" || name == "hevc_amf") {
-        av_dict_set(outOpts, "quality", "balanced", 0);
-    } else if (name == "libx264" || name == "libx265") {
-        av_dict_set(outOpts, "preset", "medium", 0);
-        av_dict_set(outOpts, "crf", "23", 0);
-        if (name == "libx265") {
-            if (req.isHdr10) {
-                av_dict_set(outOpts, "profile", "main10", 0);
-                const std::string x265p = buildX265Hdr10Params(
-                    req.hdrMasterMaxNits, req.hdrMasterMinNits,
-                    req.hdrMaxCll, req.hdrMaxFall);
-                av_dict_set(outOpts, "x265-params", x265p.c_str(), 0);
-            } else if (req.isHlg) {
-                av_dict_set(outOpts, "profile", "main10", 0);
-                av_dict_set(outOpts,
-                            "x265-params",
-                            "repeat-headers=1:colorprim=bt2020:"
-                            "transfer=arib-std-b67:colormatrix=bt2020nc",
-                            0);
-            }
-        }
-    } else if (name == "h264_mf" || name == "hevc_mf") {
-        // Windows Media Foundation H.264/HEVC. Without explicit rate control
-        // mfenc defaults to a CBR-style mode that pads easy frames and starves
-        // hard ones, raising decoded-vs-source MSE at a fixed bitrate.
-        // u_vbr (unconstrained VBR) treats bit_rate as an average target and
-        // lets the encoder reallocate bits toward harder frames; the archive
-        // scenario is a fidelity-priority hint (vs latency-priority scenarios
-        // like video_conference / live_streaming). Together they lower the
-        // decoded-vs-source error at the same configured bitrate.
-        av_dict_set(outOpts, "rate_control", "u_vbr", 0);
-        av_dict_set(outOpts, "scenario", "archive", 0);
-        av_dict_set(outOpts, "quality", "100", 0);
-    } else if (name == "libsvtav1") {
-        av_dict_set(outOpts, "preset", "8", 0);
-        av_dict_set(outOpts, "crf", "30", 0);
-    } else if (name == "libvpx-vp9") {
-        av_dict_set(outOpts, "quality", "good", 0);
-        av_dict_set(outOpts, "cpu-used", "4", 0);
-    } else if (name.rfind("prores", 0) == 0 && req.proresProfile >= 0) {
-        char buf[16];
-        std::snprintf(buf, sizeof(buf), "%d", req.proresProfile);
-        av_dict_set(outOpts, "profile", buf, 0);
+    for (const auto& option : codecOptionsFor(req, QString::fromStdString(name))) {
+        // bit_rate is a context field, not an encoder private dictionary option.
+        if (option.first == QStringLiteral("bit_rate"))
+            m_encCtx->bit_rate = option.second.toLongLong();
+        else
+            av_dict_set(outOpts, option.first.toUtf8().constData(),
+                        option.second.toUtf8().constData(), 0);
     }
     return true;
 }
@@ -608,7 +637,21 @@ bool FrameEncoder::openEncoderWithFallback(const EncodeRequest& req)
         appendOrderedFamilyFallbacks(candidates, family);
     }
 
+    // Quality mode: an AV1 hardware candidate the CRF filter rejects must fall
+    // through to the family's software encoder, mirroring the H.264/H.265 chain.
+    if (req.rateControl == EncodeRequest::RateControl::Crf
+        && family == EncoderFamily::AV1)
+        appendUnique(candidates, primarySoftwareEncoderName(family));
+
     for (const std::string& candidateName : candidates) {
+        // Quality mode must not silently fall back to a bitrate-only encoder.
+        // Unsupported HW candidates fall through to the family's software encoder.
+        if (req.rateControl == EncodeRequest::RateControl::Crf
+            && candidateName != "libx264" && candidateName != "libx265"
+            && candidateName != "libsvtav1" && candidateName != "libvpx-vp9"
+            && candidateName != "h264_nvenc" && candidateName != "hevc_nvenc"
+            && candidateName != "av1_nvenc")
+            continue;
         const AVCodec* encoder = findAllowedEncoderByName(req, candidateName);
         if (!encoder) continue;
 
@@ -1071,6 +1114,10 @@ void FrameEncoder::muxAudioPassthroughPackets()
 std::optional<std::string> FrameEncoder::open(const EncodeRequest& req)
 {
     if (m_opened) return std::string("FrameEncoder already opened");
+    if (req.keepAlpha && (req.videoCodecName.rfind("prores", 0) != 0
+        || req.proresProfile < 4 || req.proresProfile > 5))
+        return std::string("このコーデックはアルファを保持できません");
+    m_keepAlpha = req.keepAlpha;
     const AVRational fps = effectiveFpsRational(req);
     if (req.width <= 0 || req.height <= 0
         || fps.num <= 0 || fps.den <= 0) {
@@ -1340,6 +1387,75 @@ bool FrameEncoder::pushAudioFrame(AVFrame* frame, int64_t pts)
     }
 
     return true;
+}
+
+namespace {
+std::atomic<int> s_alphaFrameCount{0};
+std::atomic<bool> s_alphaInputEnabled{true};
+}
+
+void FrameEncoder::setAlphaInputEnabledForTest(bool enabled) { s_alphaInputEnabled.store(enabled); }
+void FrameEncoder::resetAlphaFrameCountForTest() { s_alphaFrameCount.store(0); }
+int FrameEncoder::alphaFrameCountForTest() { return s_alphaFrameCount.load(); }
+
+bool FrameEncoder::pushFrameRgba32(const uchar* rgba, int stride, int64_t pts)
+{
+    ++s_alphaFrameCount;
+    if (!s_alphaInputEnabled.load() || !isOpen() || !m_keepAlpha || !m_encCtx || !rgba
+        || stride < m_encCtx->width * 4) return false;
+    if (!m_rgbaToYuvCtx) {
+        m_rgbaToYuvCtx = sws_getContext(
+            m_encCtx->width, m_encCtx->height, AV_PIX_FMT_RGBA,
+            m_encCtx->width, m_encCtx->height, m_pixFmt,
+            SWS_BILINEAR, nullptr, nullptr, nullptr);
+        if (!m_rgbaToYuvCtx) return false;
+        if (swscolor::matrixEnabledFromEnv()) {
+            const AVColorSpace dstCs = swscolor::resolveColorspace(
+                m_encCtx->colorspace, m_encCtx->width, m_encCtx->height);
+            const AVColorRange dstRange =
+                swscolor::resolveRange(m_encCtx->color_range);
+            int *currentInvTable = nullptr;
+            int *currentTable = nullptr;
+            int currentSrcRange = 0;
+            int currentDstRange = 0;
+            int brightness = 0;
+            int contrast = 0;
+            int saturation = 0;
+            if (sws_getColorspaceDetails(m_rgbaToYuvCtx, &currentInvTable,
+                                          &currentSrcRange, &currentTable,
+                                          &currentDstRange, &brightness,
+                                          &contrast, &saturation) >= 0) {
+                const int *srcCoeffs = sws_getCoefficients(SWS_CS_DEFAULT);
+                const int *dstCoeffs =
+                    sws_getCoefficients(swscolor::swsCoeffsId(dstCs));
+                if (srcCoeffs && dstCoeffs) {
+                    (void)sws_setColorspaceDetails(
+                        m_rgbaToYuvCtx, srcCoeffs, 1, dstCoeffs,
+                        dstRange == AVCOL_RANGE_JPEG ? 1 : 0,
+                        brightness, contrast, saturation);
+                }
+            }
+        }
+    }
+    AVFrame* frame = av_frame_alloc();
+    if (!frame) return false;
+    frame->format = m_pixFmt;
+    frame->width = m_encCtx->width;
+    frame->height = m_encCtx->height;
+    frame->color_primaries = m_encCtx->color_primaries;
+    frame->color_trc = m_encCtx->color_trc;
+    frame->colorspace = m_encCtx->colorspace;
+    frame->color_range = m_encCtx->color_range;
+    bool ok = av_frame_get_buffer(frame, 0) >= 0;
+    if (ok) {
+        const uint8_t* slices[4] = {rgba, nullptr, nullptr, nullptr};
+        const int strides[4] = {stride, 0, 0, 0};
+        ok = sws_scale(m_rgbaToYuvCtx, slices, strides, 0, m_encCtx->height,
+                       frame->data, frame->linesize) == m_encCtx->height;
+        if (ok) ok = pushFrameNative(frame, pts);
+    }
+    av_frame_free(&frame);
+    return ok;
 }
 
 bool FrameEncoder::pushFrameRgb24(const uint8_t* src, int stride, int64_t pts)

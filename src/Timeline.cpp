@@ -37,6 +37,9 @@
 #include <numeric>
 #include <utility>
 #include <QFileInfo>
+#include <QSignalBlocker>
+#include <QRubberBand>
+#include <QSet>
 #include <QDir>
 #include <QFont>
 #include <QJsonArray>
@@ -44,6 +47,7 @@
 #include <QJsonValue>
 #include <QMessageBox>
 #include <QInputDialog>
+#include <QLineEdit>
 #include <QPushButton>
 #include <QSizePolicy>
 #include <QSpacerItem>
@@ -956,18 +960,9 @@ QString exportAudioChannelPanFilterForMode(AudioChannelMode mode)
     return {};
 }
 
-QString buildExportAudioMixEntryFilterChain(int inputIndex,
-                                            const QString &clipIn,
-                                            const QString &clipOut,
-                                            int delayMs,
-                                            const QString &volumeExpression,
-                                            AudioChannelMode mode,
-                                            bool reversed,
-                                            double speed,
-                                            TransitionType leadInType,
-                                            double leadInDuration,
-                                            TransitionType trailOutType,
-                                            double trailOutDuration)
+QString buildExportAudioMixEntryPreFxFilterChain(int inputIndex,
+    const QString &clipIn, const QString &clipOut, AudioChannelMode mode,
+    bool reversed, double speed)
 {
     QStringList filters;
     filters << QStringLiteral("atrim=start=%1:end=%2")
@@ -1001,6 +996,16 @@ QString buildExportAudioMixEntryFilterChain(int inputIndex,
     if (!panFilter.isEmpty())
         filters << panFilter;
 
+    return QStringLiteral("[%1:a]%2[prefx%1]").arg(inputIndex)
+        .arg(filters.join(QLatin1Char(',')));
+}
+
+QString buildExportAudioMixEntryPostFxFilterChain(int inputIndex,
+    int delayMs, const QString &volumeExpression, double clipDuration,
+    TransitionType leadInType, double leadInDuration,
+    TransitionType trailOutType, double trailOutDuration)
+{
+    QStringList filters;
     filters << QStringLiteral("volume='%1':eval=frame").arg(volumeExpression);
 
     // Audio-only fades use the same equal-power characteristic as
@@ -1019,9 +1024,6 @@ QString buildExportAudioMixEntryFilterChain(int inputIndex,
                        .arg(QString::number(leadInDuration, 'g', 15));
     }
     if (trailFade) {
-        const double clipDuration = std::isfinite(speed) && speed > 0.0
-            ? qMax(0.0, (clipOut.toDouble() - clipIn.toDouble()) / speed)
-            : qMax(0.0, clipOut.toDouble() - clipIn.toDouble());
         const double start = qMax(0.0, clipDuration - trailOutDuration);
         filters << QStringLiteral("afade=t=out:curve=qsin:st=%1:d=%2")
                        .arg(QString::number(start, 'g', 15),
@@ -1031,9 +1033,35 @@ QString buildExportAudioMixEntryFilterChain(int inputIndex,
     if (delayMs > 0)
         filters << QStringLiteral("adelay=%1:all=1").arg(delayMs);
 
-    return QStringLiteral("[%1:a]%2[a%1]")
-        .arg(inputIndex)
+    return QStringLiteral("[%1:a]%2[a%1]").arg(inputIndex)
         .arg(filters.join(QLatin1Char(',')));
+}
+
+QString buildExportAudioMixEntryFilterChain(int inputIndex,
+                                            const QString &clipIn,
+                                            const QString &clipOut,
+                                            int delayMs,
+                                            const QString &volumeExpression,
+                                            AudioChannelMode mode,
+                                            bool reversed,
+                                            double speed,
+                                            TransitionType leadInType,
+                                            double leadInDuration,
+                                            TransitionType trailOutType,
+                                            double trailOutDuration)
+{
+    QString pre = buildExportAudioMixEntryPreFxFilterChain(
+        inputIndex, clipIn, clipOut, mode, reversed, speed);
+    QString post = buildExportAudioMixEntryPostFxFilterChain(inputIndex,
+        delayMs, volumeExpression,
+        std::isfinite(speed) && speed > 0.0
+            ? qMax(0.0, (clipOut.toDouble() - clipIn.toDouble()) / speed)
+            : qMax(0.0, clipOut.toDouble() - clipIn.toDouble()),
+        leadInType, leadInDuration, trailOutType, trailOutDuration);
+    // Join at the DSP boundary without changing the legacy graph text.
+    pre.chop(QStringLiteral("[prefx%1]").arg(inputIndex).size());
+    post.remove(0, QStringLiteral("[%1:a]").arg(inputIndex).size());
+    return pre + QLatin1Char(',') + post;
 }
 
 extern "C" {
@@ -2246,8 +2274,92 @@ void TimelineTrack::updateMinimumWidth()
     setMinimumWidth(static_cast<int>(totalWidth) + kTrailingPadPx);
 }
 
+int TimelineTrack::filmstripTileCount(int width, int thumbnailWidth)
+{
+    return width > 0 && thumbnailWidth > 0 ? 1 + (width - 1) / thumbnailWidth : 0;
+}
+
+int TimelineTrack::filmstripImageIndex(double sourceSeconds, double mediaDuration, int count)
+{
+    if (count <= 1 || !std::isfinite(sourceSeconds) || !std::isfinite(mediaDuration)
+        || mediaDuration <= 0.0) return 0;
+    return int(qBound(0.0, std::floor(sourceSeconds / mediaDuration * count + 0.5),
+                      double(count - 1)));
+}
+
+QVector<TimelineTrack::FilmstripTile> TimelineTrack::filmstripTilesForTest(int clipIndex) const
+{
+    if (!m_timeline || !m_timeline->filmstripEnabled()) return {};
+    return m_filmstripTiles.value(clipIndex);
+}
+
+void TimelineTrack::paintFilmstrip(QPainter &painter, int clipIndex, const QRect &clipRect,
+                                  const QRect &visibleRect)
+{
+    ++m_filmstripBranchCount;
+    auto &tiles = m_filmstripTiles[clipIndex];
+    tiles.clear();
+    const auto &clip = m_clips[clipIndex];
+    if (m_isAudioTrack || clip.filePath.isEmpty() || !clip.sequenceRefId.isEmpty()
+        || !clip.shapes.isEmpty() || !clipRect.intersects(visibleRect)) return;
+    auto *cache = m_timeline->filmstripCache();
+    if (!cache) return;
+    // Same key, count and size as MediaPoolDock; pending/cached requests coalesce.
+    // Probe the full source duration: a clip may end before the source does.
+    cache->request(clip.filePath, clip.filePath, 0.0, 8);
+    const auto frames = cache->frames(clip.filePath);
+    if (frames.isEmpty()) return;
+    const QRect body = clipRect.adjusted(0, 4, 0, -4);
+    const int tileWidth = qMax(1, qRound(body.height() * 16.0 / 9.0));
+    const int count = filmstripTileCount(body.width(), tileWidth);
+    if (body.height() <= 0) return;
+    const int first = qMax(0, (visibleRect.left() - body.left()) / tileWidth);
+    const int last = qMin(count, (visibleRect.right() - body.left()) / tileWidth + 1);
+    for (int i = first; i < last; ++i) {
+        const QRect rect = QRect(body.left() + i * tileWidth, body.top(), tileWidth,
+                                 body.height()).intersected(body);
+        double fraction = double(rect.center().x() - body.left()) / body.width();
+        if (clip.reversed) fraction = 1.0 - fraction;
+        const double end = clip.outPoint > clip.inPoint ? clip.outPoint : clip.duration;
+        const double sourceSeconds = clip.inPoint + fraction * qMax(0.0, end - clip.inPoint);
+        const int index = filmstripImageIndex(sourceSeconds, cache->duration(clip.filePath),
+                                              int(frames.size()));
+        tiles.append({rect, index});
+        const auto &image = frames[index];
+        painter.drawImage(rect, image, QRectF(0, 0,
+            image.width() * double(rect.width()) / tileWidth, image.height()));
+        ++m_filmstripDrawCount;
+    }
+}
+
+void Timeline::setFilmstripCache(ThumbnailCache *cache)
+{
+    if (m_filmstripCache == cache) return;
+    disconnect(m_filmstripReadyConnection);
+    m_filmstripCache = cache;
+    if (cache) {
+        m_filmstripReadyConnection = connect(cache, &ThumbnailCache::ready, this,
+            [this](const QString &key, const QVector<QImage> &) {
+                if (!m_filmstripEnabled) return;
+                for (auto *track : m_videoTracks)
+                    for (const auto &clip : track->clips())
+                        if (clip.filePath == key) { track->update(); break; }
+            });
+    }
+    for (auto *track : m_videoTracks) track->update();
+}
+
+void Timeline::setFilmstripEnabled(bool enabled)
+{
+    if (m_filmstripEnabled == enabled) return;
+    m_filmstripEnabled = enabled;
+    if (enabled && !m_filmstripCache) setFilmstripCache(new ThumbnailCache(this));
+    for (auto *track : m_videoTracks) track->update();
+}
+
 void TimelineTrack::paintEvent(QPaintEvent *event)
 {
+    ++m_paintCount;
     static int paintCount = 0;
     if (++paintCount <= 5) {
         qInfo() << "TimelineTrack::paintEvent #" << paintCount
@@ -2291,6 +2403,8 @@ void TimelineTrack::paintEvent(QPaintEvent *event)
             painter.drawLine(x, 0, x, m_rowHeight);
         }
         painter.fillRect(clipRect, color);
+        if (m_timeline && m_timeline->filmstripEnabled())
+            paintFilmstrip(painter, i, clipRect, visibleRect);
         if (m_clips[i].label != ClipLabel::None) {
             labelBars.append(qMakePair(
                 QRect(x, clipRect.bottom() - 2, clipWidth, 3),
@@ -2591,6 +2705,15 @@ void TimelineTrack::mousePressEvent(QMouseEvent *event)
         event->accept(); return;
     }
     const int clipIndex = clipAtX(event->pos().x());
+    if (event->button() == Qt::LeftButton && clipIndex < 0) {
+        m_marqueeCandidate = true;
+        m_marqueeActive = false;
+        m_marqueeAdditive = event->modifiers().testFlag(Qt::ShiftModifier);
+        m_marqueeClearOnClick = !(event->modifiers() & (Qt::ShiftModifier | Qt::ControlModifier));
+        m_marqueeStartGlobal = event->globalPosition().toPoint();
+        event->accept();
+        return;
+    }
     if (tryHitEnvelopeKeyframe(event, clipIndex)) return;
     const bool additive = event->modifiers() & (Qt::ShiftModifier | Qt::ControlModifier);
     if (event->button() == Qt::RightButton) {
@@ -2829,6 +2952,15 @@ void TimelineTrack::handleBodyClick(QMouseEvent *ev, int clipIndex)
 
 void TimelineTrack::mouseMoveEvent(QMouseEvent *event)
 {
+    if (m_marqueeCandidate) {
+        const QPoint end = event->globalPosition().toPoint();
+        if ((end - m_marqueeStartGlobal).manhattanLength() >= 4)
+            m_marqueeActive = true;
+        if (m_marqueeActive)
+            emit marqueeDragged(m_marqueeStartGlobal, end, m_marqueeAdditive, false);
+        event->accept();
+        return;
+    }
     if (m_resizingHeight) {
         const int globalY = event->globalPosition().toPoint().y();
         const int delta = globalY - m_resizeStartY;
@@ -3108,6 +3240,20 @@ void TimelineTrack::mouseMoveEvent(QMouseEvent *event)
 
 void TimelineTrack::mouseReleaseEvent(QMouseEvent *event)
 {
+    if (m_marqueeCandidate && event && event->button() == Qt::LeftButton) {
+        m_marqueeCandidate = false;
+        if (m_marqueeActive) {
+            m_marqueeActive = false;
+            emit marqueeDragged(m_marqueeStartGlobal, event->globalPosition().toPoint(),
+                                m_marqueeAdditive, true);
+        } else if (m_marqueeClearOnClick) {
+            setSelectedClip(-1);
+            emit emptyAreaClicked();
+            emit seekRequested(qMax(0.0, xToSeconds(mapFromGlobal(m_marqueeStartGlobal).x())));
+        }
+        event->accept();
+        return;
+    }
     if (m_resizingHeight) {
         m_resizingHeight = false;
         releaseMouse();
@@ -3791,7 +3937,14 @@ QWidget *Timeline::createTrackHeader(TimelineTrack *track, const QString &name, 
             "QPushButton:checked { background-color: #666; color: #888; border: 1px solid #999; }");
     }
 
+    auto *stripe = new QWidget(w);
+    stripe->setObjectName(QStringLiteral("timelineTrackColorStripe"));
+    stripe->setFixedWidth(6);
+    hbox->setContentsMargins(0, 4, 4, 4);
+    hbox->addWidget(stripe);
     auto *label = new QLabel(name, w);
+    label->setObjectName(QStringLiteral("timelineTrackName"));
+    label->setProperty("defaultName", name);
     label->setStyleSheet(isAudioRow
         ? "QLabel { background: transparent; border: none; color: #44AA88; font-weight: bold; font-size: 12px; }"
         : "QLabel { background: transparent; border: none; color: #4488CC; font-weight: bold; font-size: 12px; }");
@@ -3870,6 +4023,52 @@ QWidget *Timeline::createTrackHeader(TimelineTrack *track, const QString &name, 
         });
     }
 
+    w->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(w, &QWidget::customContextMenuRequested, this,
+            [this, w, trackPtr, isAudioRow](const QPoint &pos) {
+        if (!trackPtr) return;
+        const int idx = isAudioRow ? m_audioTracks.indexOf(trackPtr.data())
+                                   : m_videoTracks.indexOf(trackPtr.data());
+        if (idx < 0) return;
+        QMenu menu(w);
+        auto *rename = menu.addAction(QStringLiteral("名前を変更…"));
+        QMenu *colors = menu.addMenu(QStringLiteral("色"));
+        for (int i = int(ClipLabel::None); i <= int(ClipLabel::Pink); ++i) {
+            const QColor color = clipLabelColor(ClipLabel(i));
+            auto *action = colors->addAction(clipLabelName(ClipLabel(i)));
+            action->setCheckable(true);
+            action->setChecked(trackPtr->color == color);
+            connect(action, &QAction::triggered, this, [this, isAudioRow, idx, color] {
+                setTrackColor(isAudioRow, idx, color);
+            });
+        }
+        menu.addSeparator();
+        auto *remove = menu.addAction(QStringLiteral("トラックを削除"));
+        auto *up = menu.addAction(QStringLiteral("上へ移動"));
+        auto *down = menu.addAction(QStringLiteral("下へ移動"));
+        const int count = isAudioRow ? audioTrackCount() : videoTrackCount();
+        remove->setEnabled(count > 1 && !trackPtr->isLocked());
+        up->setEnabled(idx > 0);
+        down->setEnabled(idx + 1 < count);
+        connect(remove, &QAction::triggered, this, [this, isAudioRow, trackPtr] {
+            if (trackPtr) requestRemoveTrack(isAudioRow,
+                (isAudioRow ? m_audioTracks : m_videoTracks).indexOf(trackPtr.data()));
+        });
+        auto move = [this, isAudioRow, trackPtr](int offset) {
+            if (!trackPtr) return;
+            const int index = (isAudioRow ? m_audioTracks : m_videoTracks).indexOf(trackPtr.data());
+            moveTrack(isAudioRow, index, index + offset);
+        };
+        connect(up, &QAction::triggered, this, [move] { move(-1); });
+        connect(down, &QAction::triggered, this, [move] { move(1); });
+        if (menu.exec(w->mapToGlobal(pos)) == rename && trackPtr) {
+            bool ok = false;
+            const QString value = QInputDialog::getText(this, QStringLiteral("名前を変更"),
+                QStringLiteral("トラック名（空欄で既定名）"), QLineEdit::Normal,
+                trackPtr->customName, &ok);
+            if (ok) setTrackCustomName(isAudioRow, idx, value);
+        }
+    });
     m_trackHeaders.insert(track, w);
     syncTrackHeaderFlags(track);
 
@@ -3881,6 +4080,14 @@ void Timeline::syncTrackHeaderFlags(TimelineTrack *track)
     QWidget *header = m_trackHeaders.value(track, nullptr);
     if (!track || !header)
         return;
+
+    if (auto *label = header->findChild<QLabel *>(QStringLiteral("timelineTrackName")))
+        label->setText(track->customName.isEmpty()
+            ? label->property("defaultName").toString() : track->customName);
+    if (auto *stripe = header->findChild<QWidget *>(QStringLiteral("timelineTrackColorStripe"))) {
+        stripe->setStyleSheet(QStringLiteral("background: %1; border: none;")
+            .arg(track->color.isValid() ? track->color.name() : QStringLiteral("transparent")));
+    }
 
     auto syncButton = [header](const QString &objectName, bool checked,
                                const QString &onText, const QString &offText) {
@@ -3907,8 +4114,9 @@ void Timeline::syncTrackHeaderFlags(TimelineTrack *track)
                QString::fromUtf8("\xE2\x97\x89")); // ◉
 }
 
-void Timeline::addVideoTrack()
+void Timeline::addVideoTrack(bool recordUndo)
 {
+    if (recordUndo) captureExternalTrackState();
     int num = m_videoTracks.size() + 1;
     auto *track = new TimelineTrack(this);
     track->setPixelsPerSecond(m_zoomLevel);
@@ -3926,8 +4134,10 @@ void Timeline::addVideoTrack()
         createTrackHeader(track, QString("V%1").arg(num), false));
 
     m_videoTracks.append(track);
+    m_trackStructureRevision = ++m_nextTrackStructureRevision;
     wireTrackSelection(track);
     updateInfoLabel();
+    if (recordUndo) saveUndoState(QStringLiteral("トラックを追加"));
 }
 
 bool Timeline::insertVfxFootageAtPlayhead(const ClipInfo &clip,
@@ -3944,7 +4154,7 @@ bool Timeline::insertVfxFootageAtPlayhead(const ClipInfo &clip,
     // A footage overlay belongs above the base V1. If the project has no
     // tracks yet, create V1 as the eventual base row and V2 as the target.
     if (m_videoTracks.isEmpty())
-        addVideoTrack();
+        addVideoTrack(false);
 
     const double dropTime = qMax(0.0, m_playheadPos);
     int targetTrack = -1;
@@ -3963,7 +4173,7 @@ bool Timeline::insertVfxFootageAtPlayhead(const ClipInfo &clip,
     }
 
     if (targetTrack < 0) {
-        addVideoTrack();
+        addVideoTrack(false);
         targetTrack = static_cast<int>(m_videoTracks.size()) - 1;
         TimelineTrack *candidate = m_videoTracks.value(targetTrack, nullptr);
         if (!candidate)
@@ -3988,8 +4198,9 @@ bool Timeline::insertVfxFootageAtPlayhead(const ClipInfo &clip,
     return true;
 }
 
-void Timeline::addAudioTrack()
+void Timeline::addAudioTrack(bool recordUndo)
 {
+    if (recordUndo) captureExternalTrackState();
     int num = m_audioTracks.size() + 1;
     auto *track = new TimelineTrack(this);
     track->setIsAudioTrack(true);
@@ -4008,8 +4219,159 @@ void Timeline::addAudioTrack()
         createTrackHeader(track, QString("A%1").arg(num), true));
 
     m_audioTracks.append(track);
+    m_trackStructureRevision = ++m_nextTrackStructureRevision;
     wireTrackSelection(track);
     updateInfoLabel();
+    if (recordUndo) saveUndoState(QStringLiteral("トラックを追加"));
+}
+
+bool Timeline::requestRemoveTrack(bool audio, int index)
+{
+    QPointer<TimelineTrack> track = trackAt(audio, index);
+    if (!track || track->isLocked()
+        || (audio ? audioTrackCount() : videoTrackCount()) <= 1) return false;
+    const int clipCount = track->clips().size();
+    if (clipCount > 0 && QMessageBox::question(this, QStringLiteral("トラックを削除"),
+            QStringLiteral("%1 個のクリップも削除されます。トラックを削除しますか？").arg(clipCount),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes)
+        return false;
+    if (!track) return false;
+    return removeTrack(audio, (audio ? m_audioTracks : m_videoTracks).indexOf(track.data()));
+}
+
+bool Timeline::removeTrack(bool audio, int index, QString *err)
+{
+    if (err) err->clear();
+    const auto &tracks = audio ? m_audioTracks : m_videoTracks;
+    if (index < 0 || index >= tracks.size()) {
+        if (err) *err = QStringLiteral("トラック番号が範囲外です");
+        return false;
+    }
+    if (tracks.size() <= 1 || tracks[index]->isLocked()) {
+        if (err) *err = QStringLiteral("最後のトラックまたはロック中のトラックは削除できません");
+        return false;
+    }
+    captureExternalTrackState();
+    removeTrackInternal(audio, index);
+    saveUndoState(QStringLiteral("トラックを削除"));
+    return true;
+}
+
+void Timeline::removeTrackInternal(bool audio, int index)
+{
+    const auto &tracks = audio ? m_audioTracks : m_videoTracks;
+    QVector<int> oldToNew(tracks.size());
+    for (int i = 0; i < oldToNew.size(); ++i)
+        oldToNew[i] = i == index ? -1 : (i > index ? i - 1 : i);
+    remapTrackIndices(audio, oldToNew);
+    emit trackIndicesRemapped(audio, oldToNew);
+}
+
+bool Timeline::moveTrack(bool audio, int from, int to, QString *err)
+{
+    if (err) err->clear();
+    const auto &tracks = audio ? m_audioTracks : m_videoTracks;
+    if (from < 0 || from >= tracks.size() || to < 0 || to >= tracks.size()) {
+        if (err) *err = QStringLiteral("トラック番号が範囲外です");
+        return false;
+    }
+    if (from == to) return true;
+    captureExternalTrackState();
+    QVector<int> oldToNew(tracks.size());
+    for (int i = 0; i < oldToNew.size(); ++i) {
+        oldToNew[i] = i;
+        if (i == from) oldToNew[i] = to;
+        else if (from < to && i > from && i <= to) oldToNew[i] = i - 1;
+        else if (from > to && i >= to && i < from) oldToNew[i] = i + 1;
+    }
+    remapTrackIndices(audio, oldToNew);
+    emit trackIndicesRemapped(audio, oldToNew);
+    saveUndoState(QStringLiteral("トラックを移動"));
+    return true;
+}
+
+void Timeline::remapTrackIndices(bool audio, const QVector<int> &oldToNew)
+{
+    m_trackStructureRevision = ++m_nextTrackStructureRevision;
+    // Track identity is the widget during this operation. Clip order within
+    // each widget is unchanged; clip-order survivor remapping must not run.
+    auto &tracks = audio ? m_audioTracks : m_videoTracks;
+    const auto before = tracks;
+    int count = 0;
+    for (int index : oldToNew) if (index >= 0) ++count;
+    tracks = QVector<TimelineTrack *>(count, nullptr);
+    m_linkedDragPartners.clear();
+    auto detach = [](QVBoxLayout *layout, QWidget *widget) {
+        const int index = layout->indexOf(widget);
+        if (index >= 0) delete layout->takeAt(index);
+    };
+    for (int i = 0; i < before.size(); ++i) {
+        auto *track = before[i];
+        auto *header = m_trackHeaders.value(track, nullptr);
+        detach(m_tracksLayout, track);
+        if (header) detach(m_headerLayout, header);
+        if (oldToNew[i] < 0) {
+            m_trackHeaders.remove(track);
+            if (header) { header->hide(); header->deleteLater(); }
+            track->hide();
+            track->disconnect();
+            track->deleteLater();
+        } else {
+            tracks[oldToNew[i]] = track;
+        }
+    }
+    m_videoTrack = m_videoTracks.first();
+    m_audioTrack = m_audioTracks.first();
+    for (int i = 0; i < tracks.size(); ++i) {
+        auto *track = tracks[i];
+        auto *header = m_trackHeaders.value(track, nullptr);
+        const int row = audio ? int(m_videoTracks.size()) + 2 + i : 1 + i;
+        m_tracksLayout->insertWidget(row, track);
+        if (header) {
+            m_headerLayout->insertWidget(row + 1, header);
+            if (auto *label = header->findChild<QLabel *>(QStringLiteral("timelineTrackName")))
+                label->setProperty("defaultName", QStringLiteral("%1%2")
+                    .arg(audio ? QStringLiteral("A") : QStringLiteral("V")).arg(i + 1));
+            syncTrackHeaderFlags(track);
+        }
+    }
+    int &active = audio ? m_activeAudioTrackIndex : m_activeVideoTrackIndex;
+    active = oldToNew.value(active, -1);
+    // Selection is owned by surviving widgets and follows their new row.
+    if (!audio) {
+        auto remapKey = [&oldToNew](const QString &key) -> QString {
+            const int colon = key.indexOf(QLatin1Char(':'));
+            bool ok = false;
+            const int oldTrack = key.left(colon).toInt(&ok);
+            if (colon < 0 || !ok) return key;
+            const int newTrack = oldToNew.value(oldTrack, -1);
+            return newTrack < 0 ? QString() : QString::number(newTrack) + key.mid(colon);
+        };
+        QHash<QString, TimelineTrackMatteEntry> mattes;
+        for (auto it = m_trackMatteEntries.cbegin(); it != m_trackMatteEntries.cend(); ++it) {
+            const QString key = remapKey(it.key());
+            auto entry = it.value();
+            const QString source = remapKey(entry.matteSourceClipId);
+            if (key.isEmpty() || (!entry.matteSourceClipId.isEmpty() && source.isEmpty())) continue;
+            entry.matteSourceClipId = source;
+            mattes.insert(key, entry);
+        }
+        m_trackMatteEntries = mattes;
+        QHash<QString, QString> parents;
+        for (auto it = m_clipParentEntries.cbegin(); it != m_clipParentEntries.cend(); ++it) {
+            const QString child = remapKey(it.key()), parent = remapKey(it.value());
+            if (!child.isEmpty() && !parent.isEmpty()) parents.insert(child, parent);
+        }
+        m_clipParentEntries = parents;
+    }
+    // Only the active sequence is updated; inactive sequence arrays are untouched.
+    syncActiveSequenceFromCurrentTracks();
+    const auto *selected = m_videoTracks.value(m_activeVideoTrackIndex, nullptr);
+    emit clipSelected(selected ? selected->selectedClip() : -1);
+    emit clipSelectedOnTrack(m_activeVideoTrackIndex, selected ? selected->selectedClip() : -1);
+    updateInfoLabel();
+    refreshTextStrip();
+    scheduleEmitSequenceChanged();
 }
 
 void Timeline::repaintAudioTracks()
@@ -4374,9 +4736,9 @@ bool Timeline::importMedia(const QString &filePath,
         // 片方だけ増やすとリンク済み素材が孤立するため、必要なら両方を同時に作る
         // (片側だけ置く kind ではその側だけ)。
         while (placeVideo && m_videoTracks.size() <= requestedTrackIndex)
-            addVideoTrack();
+            addVideoTrack(false);
         while (placeAudio && m_audioTracks.size() <= requestedTrackIndex)
-            addAudioTrack();
+            addAudioTrack(false);
         videoTrackIdx = requestedTrackIndex;
         audioTrackIdx = requestedTrackIndex;
     } else if (placement == ImportPlacement::AppendToFirstTrack) {
@@ -4384,9 +4746,9 @@ bool Timeline::importMedia(const QString &filePath,
         // whatever clips already live there. Create V1/A1 if the project
         // starts with zero tracks.
         if (placeVideo && m_videoTracks.isEmpty())
-            addVideoTrack();
+            addVideoTrack(false);
         if (placeAudio && m_audioTracks.isEmpty())
-            addAudioTrack();
+            addAudioTrack(false);
         videoTrackIdx = 0;
         audioTrackIdx = 0;
     } else {
@@ -4401,7 +4763,7 @@ bool Timeline::importMedia(const QString &filePath,
                 }
             }
             if (videoTrackIdx < 0) {
-                addVideoTrack();
+                addVideoTrack(false);
                 videoTrackIdx = m_videoTracks.size() - 1;
             }
         }
@@ -4413,7 +4775,7 @@ bool Timeline::importMedia(const QString &filePath,
                 }
             }
             if (audioTrackIdx < 0) {
-                addAudioTrack();
+                addAudioTrack(false);
                 audioTrackIdx = m_audioTracks.size() - 1;
             }
         }
@@ -4570,6 +4932,201 @@ void Timeline::addClip(const QString &filePath)
     // GUI の従来経路も MCP と同じ取り込み実装を使い、配置・リンク・Undo が
     // 別々に進化しないようにする。GUI 側は失敗理由を表示する契約を持たない。
     importMedia(filePath);
+}
+
+TimelineTrack *Timeline::primaryErgoTrack() const
+{
+    auto selected = [](TimelineTrack *track) {
+        return track && track->selectedClip() >= 0 && track->selectedClip() < track->clipCount();
+    };
+    auto *video = m_videoTracks.value(m_activeVideoTrackIndex, nullptr);
+    if (selected(video)) return video;
+    auto *audio = m_audioTracks.value(m_activeAudioTrackIndex, nullptr);
+    if (selected(audio)) return audio;
+    for (auto *track : m_videoTracks) if (selected(track)) return track;
+    for (auto *track : m_audioTracks) if (selected(track)) return track;
+    return nullptr;
+}
+
+void Timeline::moveSelectedClipToPlayhead(bool tail)
+{
+    auto *track = primaryErgoTrack();
+    if (!track) {
+        emit statusMessageRequested(QStringLiteral("移動するクリップを選択してください。"), 3000);
+        return;
+    }
+    const int index = track->selectedClip();
+    const bool audio = track->isAudioTrack();
+    const int row = audio ? m_audioTracks.indexOf(track) : m_videoTracks.indexOf(track);
+    const double requested = qMax(0.0, m_playheadPos
+        - (tail ? track->clips()[index].effectiveDuration() : 0.0));
+    double target = requested;
+    QVector<double> attempted;
+    // Collision candidates do not mutate or save undo. Only the successful
+    // move commits, including linked audio and the existing carrier remapping.
+    for (int attempt = 0; attempt < 64; ++attempt) {
+        attempted.append(target);
+        double settled = target;
+        QString error;
+        if (!moveClipByIndex(audio, row, index, target, &settled, &error)) {
+            emit statusMessageRequested(QStringLiteral("クリップを移動できませんでした。ロック状態を確認してください。"), 3000);
+            return;
+        }
+        if (qAbs(settled - target) <= 1e-6) {
+            if (qAbs(settled - requested) > 1e-6)
+                emit statusMessageRequested(QStringLiteral("移動先を %1 秒に調整しました。")
+                                                .arg(settled, 0, 'f', 3), 3000);
+            return;
+        }
+        bool repeated = false;
+        for (double previous : attempted)
+            if (qAbs(previous - settled) <= 1e-6) repeated = true;
+        if (repeated) break;
+        target = settled;
+    }
+    emit statusMessageRequested(QStringLiteral("リンクしたクリップを配置できる移動先がありません。"), 3000);
+}
+
+void Timeline::selectClipsWithSameLabel()
+{
+    auto *track = primaryErgoTrack();
+    if (!track) {
+        emit statusMessageRequested(QStringLiteral("基準となるクリップを選択してください。"), 3000);
+        return;
+    }
+    const ClipLabel label = track->clips()[track->selectedClip()].label;
+    if (label == ClipLabel::None) {
+        emit statusMessageRequested(QStringLiteral("ラベルの無いクリップは対象外です。"), 3000);
+        return;
+    }
+    selectClipsForErgo(0, label);
+}
+
+void Timeline::selectAllClips()
+{
+    selectClipsForErgo(0);
+}
+
+void Timeline::selectClipsFromPlayhead(bool forward)
+{
+    selectClipsForErgo(forward ? 1 : -1);
+}
+
+void Timeline::selectClipsForErgo(int direction, ClipLabel label)
+{
+    // Block linked-selection propagation: eligibility is per clip and track.
+    int primary = -1;
+    m_activeVideoTrackIndex = -1;
+    m_activeAudioTrackIndex = -1;
+    auto selectTrack = [&](TimelineTrack *track, int videoIndex) {
+        if (!track) return;
+        const QSignalBlocker blocker(track);
+        track->clearClipSelection();
+        if (track->isLocked() || track->isHidden()) return;
+        double cursor = 0.0;
+        for (int i = 0; i < track->clipCount(); ++i) {
+            const ClipInfo &clip = track->clips()[i];
+            const double start = cursor + clip.leadInSec;
+            const double end = start + clip.effectiveDuration();
+            if ((label == ClipLabel::None || clip.label == label)
+                && (direction == 0 || (direction > 0 && start >= m_playheadPos)
+                    || (direction < 0 && end <= m_playheadPos))) {
+                track->toggleClipSelection(i);
+                if (primary < 0 || videoIndex >= 0) {
+                    primary = i;
+                    m_activeVideoTrackIndex = videoIndex;
+                    m_activeAudioTrackIndex = videoIndex < 0 ? m_audioTracks.indexOf(track) : -1;
+                }
+            }
+            cursor = end;
+        }
+    };
+    for (int i = 0; i < m_videoTracks.size(); ++i) selectTrack(m_videoTracks[i], i);
+    for (auto *track : m_audioTracks) selectTrack(track, -1);
+    emit clipSelected(primary);
+    emit clipSelectedOnTrack(m_activeVideoTrackIndex, primary);
+    if (primary < 0)
+        emit statusMessageRequested(QStringLiteral("選択できるクリップがありません。"), 3000);
+}
+
+void Timeline::bladeAllTracksAtPlayhead()
+{
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    QHash<int, int> oldGroupToNewGroup;
+    // Loaded projects may contain groups beyond the allocator's current value.
+    QSet<int> usedGroups;
+    auto collectGroups = [&](TimelineTrack *track) {
+        if (!track) return;
+        for (const auto &clip : track->clips())
+            if (clip.linkGroup > 0) usedGroups.insert(clip.linkGroup);
+    };
+    for (auto *track : m_videoTracks) collectGroups(track);
+    for (auto *track : m_audioTracks) collectGroups(track);
+    bool anySplit = false;
+    auto splitTrack = [&](TimelineTrack *track) {
+        if (!track || track->isLocked()) return;
+        const auto clips = track->clips();
+        double cursor = 0.0;
+        for (int i = 0; i < clips.size(); ++i) {
+            const double start = cursor + clips[i].leadInSec;
+            const double end = start + clips[i].effectiveDuration();
+            if (m_playheadPos > start && m_playheadPos < end) {
+                track->splitClipAt(i, m_playheadPos - start, false);
+                if (track->clipCount() == clips.size()) return;
+                auto updated = track->clips();
+                const int oldGroup = updated[i + 1].linkGroup;
+                if (oldGroup > 0) {
+                    auto it = oldGroupToNewGroup.find(oldGroup);
+                    if (it == oldGroupToNewGroup.end()) {
+                        int newGroup = allocateLinkGroup();
+                        while (usedGroups.contains(newGroup)) newGroup = allocateLinkGroup();
+                        usedGroups.insert(newGroup);
+                        it = oldGroupToNewGroup.insert(oldGroup, newGroup);
+                    }
+                    updated[i + 1].linkGroup = it.value();
+                }
+                track->setClips(updated);
+                // Keep selected downstream clips attached to their new indices.
+                const auto selected = track->selectedClips();
+                const QSignalBlocker blocker(track);
+                track->clearClipSelection();
+                for (int index : selected)
+                    track->toggleClipSelection(index > i ? index + 1 : index);
+                anySplit = true;
+                return;
+            }
+            cursor = end;
+        }
+    };
+    for (auto *track : m_videoTracks) splitTrack(track);
+    for (auto *track : m_audioTracks) splitTrack(track);
+    if (!anySplit) {
+        emit statusMessageRequested(QStringLiteral("再生ヘッド位置に分割できるクリップがありません。"), 3000);
+        return;
+    }
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+    saveUndoState(QStringLiteral("全トラックを再生ヘッドで分割"));
+    // Refresh edit targets without triggering linked-selection propagation.
+    int primary = -1;
+    int videoTrackIndex = -1;
+    if (m_activeVideoTrackIndex >= 0 && m_activeVideoTrackIndex < m_videoTracks.size()
+        && m_videoTracks[m_activeVideoTrackIndex]) {
+        videoTrackIndex = m_activeVideoTrackIndex;
+        primary = m_videoTracks[videoTrackIndex]->selectedClip();
+    } else {
+        for (auto *track : m_audioTracks) {
+            if (track && track->selectedClip() >= 0) {
+                primary = track->selectedClip();
+                break;
+            }
+        }
+    }
+    emit clipSelected(primary);
+    emit clipSelectedOnTrack(videoTrackIndex, primary);
+    onTrackModified();
+    updateInfoLabel();
+    emit positionChanged(m_playheadPos);
 }
 
 void Timeline::splitAtPlayhead()
@@ -4800,6 +5357,55 @@ QVector<TimelineTrack *> timelineTracks(const Timeline *timeline)
 }
 
 } // namespace
+
+void Timeline::selectClipsInRange(double startSec, double endSec, int firstRow,
+                                  int lastRow, bool additive)
+{
+    if (!std::isfinite(startSec) || !std::isfinite(endSec)) return;
+    if (startSec > endSec) std::swap(startSec, endSec);
+    if (firstRow > lastRow) std::swap(firstRow, lastRow);
+    const auto tracks = timelineTracks(this);
+    QSet<int> groups;
+    QVector<QSet<int>> selected(tracks.size());
+    for (int row = 0; row < tracks.size(); ++row) {
+        auto *track = tracks[row];
+        if (track->isLocked() || track->isHidden()) continue;
+        const int x0 = track->secondsToX(startSec);
+        const int x1 = track->secondsToX(endSec);
+        for (int i = 0; i < track->clipCount(); ++i) {
+            // Match painting and clipAtX, including the minimum visible clip width.
+            const int cx = track->clipStartX(i);
+            const int cw = qMax(20, static_cast<int>(
+                track->clips()[i].effectiveDuration() * track->pixelsPerSecond()));
+            const bool hit = row >= firstRow && row <= lastRow
+                && cx < x1 && cx + cw > x0;
+            if (hit || (additive && track->isClipSelected(i))) {
+                selected[row].insert(i);
+                if (track->clips()[i].linkGroup > 0)
+                    groups.insert(track->clips()[i].linkGroup);
+            }
+        }
+    }
+    int primary = -1;
+    m_activeVideoTrackIndex = -1;
+    for (int row = 0; row < tracks.size(); ++row) {
+        auto *track = tracks[row];
+        const QSignalBlocker blocker(track);
+        track->clearClipSelection();
+        if (track->isLocked() || track->isHidden()) continue;
+        for (int i = 0; i < track->clipCount(); ++i) {
+            if (!selected[row].contains(i) && !groups.contains(track->clips()[i].linkGroup)) continue;
+            track->toggleClipSelection(i);
+            const int videoIndex = m_videoTracks.indexOf(track);
+            if (primary < 0 || videoIndex >= 0) {
+                primary = i;
+                m_activeVideoTrackIndex = videoIndex;
+            }
+        }
+    }
+    emit clipSelected(primary);
+    emit clipSelectedOnTrack(m_activeVideoTrackIndex, primary);
+}
 
 bool Timeline::splitClipByIndex(bool audio, int trackIndex, int clipIndex,
                                 double timelineSeconds, QString *err)
@@ -5075,7 +5681,7 @@ bool Timeline::moveClipByIndex(bool audio, int trackIndex, int clipIndex,
     }
     TimelineTrack *oppositeDestination = nullptr;
     bool createOppositeTrack = false;
-    if (needsOppositeTrack) {
+    if (needsOppositeTrack && !m_nudgeBatchActive) {
         oppositeDestination = trackAt(!audio, newTrackIndex);
         createOppositeTrack = !oppositeDestination;
         if (oppositeDestination && oppositeDestination->isLocked())
@@ -5085,8 +5691,8 @@ bool Timeline::moveClipByIndex(bool audio, int trackIndex, int clipIndex,
     int selectedMemberIndex = -1;
     for (int i = 0; i < members.size(); ++i) {
         MovingMember &member = members[i];
-        member.destinationTrack = member.sourceTrack->isAudioTrack() == audio
-            ? destinationTrack : oppositeDestination;
+        member.destinationTrack = m_nudgeBatchActive ? member.sourceTrack
+            : (member.sourceTrack->isAudioTrack() == audio ? destinationTrack : oppositeDestination);
         if (member.sourceTrack == sourceTrack && member.sourceIndex == clipIndex)
             selectedMemberIndex = i;
     }
@@ -5154,9 +5760,16 @@ bool Timeline::moveClipByIndex(bool audio, int trackIndex, int clipIndex,
         }
         QVector<ClipInfo> remaining;
         remaining.reserve(plan.clips.size());
+        double removedSpan = 0.0;
         for (int i = 0; i < plan.clips.size(); ++i) {
-            if (!removed[i])
-                remaining.append(plan.clips.at(i));
+            if (!removed[i]) {
+                ClipInfo clip = plan.clips.at(i);
+                if (m_nudgeBatchActive) clip.leadInSec += removedSpan;
+                remaining.append(clip);
+                removedSpan = 0.0;
+            } else {
+                removedSpan += plan.clips.at(i).leadInSec + plan.clips.at(i).effectiveDuration();
+            }
         }
         plan.clips = remaining;
         std::sort(plan.memberIndices.begin(), plan.memberIndices.end(),
@@ -5166,7 +5779,7 @@ bool Timeline::moveClipByIndex(bool audio, int trackIndex, int clipIndex,
                   });
     }
 
-    auto nearestAvailableStart = [](const QVector<ClipInfo> &clips,
+    auto nearestAvailableStart = [this](const QVector<ClipInfo> &clips,
                                     double duration, double desired) {
         constexpr double kEps = 1e-6;
         double cursor = 0.0;
@@ -5186,7 +5799,7 @@ bool Timeline::moveClipByIndex(bool audio, int trackIndex, int clipIndex,
             const double clipStart = cursor + qMax(0.0, clip.leadInSec);
             const double clipDuration = qMax(0.0, clip.effectiveDuration());
             // 境界への挿入は後続を右へ押し出す並べ替えとして許可する。
-            consider(clipStart, clipStart);
+            if (!m_nudgeBatchActive) consider(clipStart, clipStart);
             consider(cursor, clipStart - duration);
             cursor = clipStart + clipDuration;
         }
@@ -5196,7 +5809,7 @@ bool Timeline::moveClipByIndex(bool audio, int trackIndex, int clipIndex,
         return best;
     };
 
-    auto insertAtRequestedTime = [](PendingTrack &plan, MovingMember &member) {
+    auto insertAtRequestedTime = [this](PendingTrack &plan, MovingMember &member) {
         constexpr double kEps = 1e-6;
         const double duration = member.clip.effectiveDuration();
         double cursor = 0.0;
@@ -5206,7 +5819,7 @@ bool Timeline::moveClipByIndex(bool audio, int trackIndex, int clipIndex,
             // 連続配置の境界は空き時間が無くても挿入位置として有効にする。
             // 現在のクリップを一つ右へ押し出すことで、A/B/C の A を時刻 5
             // に置くような並べ替えを可能にする。
-            if (qAbs(member.desiredStartSec - clipStart) <= kEps) {
+            if (!m_nudgeBatchActive && qAbs(member.desiredStartSec - clipStart) <= kEps) {
                 ClipInfo inserted = member.clip;
                 inserted.leadInSec = qMax(0.0, member.desiredStartSec - cursor);
                 plan.clips.insert(i, inserted);
@@ -5282,11 +5895,11 @@ bool Timeline::moveClipByIndex(bool audio, int trackIndex, int clipIndex,
         // 空トラックだけが残ってしまう。
         if (audio) {
             while (m_videoTracks.size() <= newTrackIndex)
-                addVideoTrack();
+                addVideoTrack(false);
             oppositeDestination = trackAt(false, newTrackIndex);
         } else {
             while (m_audioTracks.size() <= newTrackIndex)
-                addAudioTrack();
+                addAudioTrack(false);
             oppositeDestination = trackAt(true, newTrackIndex);
         }
         if (!oppositeDestination)
@@ -5342,7 +5955,7 @@ bool Timeline::moveClipByIndex(bool audio, int trackIndex, int clipIndex,
         plan.track->setClips(plan.clips);
     remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
     remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
-    if (selectionTrack && selectionIndex >= 0
+    if (!m_nudgeBatchActive && selectionTrack && selectionIndex >= 0
         && selectionIndex < selectionTrack->clipCount()) {
         // 選択中のクリップを動かした場合も、並べ替えで index だけ変わった
         // クリップの場合も、GUI と同じく対象を選択し直す。リンク済み V/A
@@ -5350,7 +5963,7 @@ bool Timeline::moveClipByIndex(bool audio, int trackIndex, int clipIndex,
         clearAllSelections();
         selectionTrack->setSelectedClip(selectionIndex);
     }
-    saveUndoState(QStringLiteral("Move clip (MCP)"));
+    if (!m_nudgeBatchActive) saveUndoState(QStringLiteral("Move clip (MCP)"));
     moveResult.moved = true;
     updateInfoLabel();
     scheduleEmitSequenceChanged();
@@ -6064,7 +6677,7 @@ bool Timeline::gapTimeRangeAt(TimelineTrack *track, double timeSec, TimeRangeSec
 }
 
 bool Timeline::applyRippleDeleteTimeRangesToAllTracks(QVector<TimeRangeSec> ranges,
-                                                      const QString &undoLabel)
+                                                      const QString &undoLabel, bool skipLocked)
 {
     constexpr double kEps = 1e-6;
     QVector<TimeRangeSec> valid;
@@ -6096,11 +6709,11 @@ bool Timeline::applyRippleDeleteTimeRangesToAllTracks(QVector<TimeRangeSec> rang
     for (int i = merged.size() - 1; i >= 0; --i) {
         const TimeRangeSec range = merged[i];
         for (auto *track : m_videoTracks) {
-            if (track)
+            if (track && (!skipLocked || !track->isLocked()))
                 changed = track->rippleDeleteTimeRange(range.startSec, range.endSec, false) || changed;
         }
         for (auto *track : m_audioTracks) {
-            if (track)
+            if (track && (!skipLocked || !track->isLocked()))
                 changed = track->rippleDeleteTimeRange(range.startSec, range.endSec, false) || changed;
         }
     }
@@ -6127,6 +6740,187 @@ void Timeline::rippleDeleteSelectedClip()
 {
     applyRippleDeleteTimeRangesToAllTracks(selectedClipTimeRanges(),
                                            QStringLiteral("リップル削除"));
+}
+
+void Timeline::closeAllGaps()
+{
+    QVector<TimeRangeSec> occupied;
+    for (TimelineTrack *track : timelineTracks(this)) {
+        if (!track || track->isLocked()) continue;
+        for (int i = 0; i < track->clipCount(); ++i) {
+            double start = 0.0, end = 0.0;
+            if (trackClipTimeRangeAt(track, i, &start, &end) && end > start)
+                occupied.append(TimeRangeSec{start, end});
+        }
+    }
+    std::sort(occupied.begin(), occupied.end(), [](const TimeRangeSec &a, const TimeRangeSec &b) {
+        return a.startSec < b.startSec;
+    });
+    QVector<TimeRangeSec> gaps;
+    double end = 0.0;
+    for (const auto &range : occupied) {
+        if (range.startSec > end + 1e-6)
+            gaps.append(TimeRangeSec{end, range.startSec});
+        end = qMax(end, range.endSec);
+    }
+    // The shared primitive merges ranges and applies them back to front,
+    // then remaps carriers and records exactly one undo state.
+    applyRippleDeleteTimeRangesToAllTracks(gaps, QStringLiteral("すべてのギャップを詰める"), true);
+}
+
+void Timeline::duplicateSelectedClips()
+{
+    struct Copy { TimelineTrack *track; ClipInfo clip; double end; };
+    QVector<Copy> copies;
+    QSet<int> groups;
+    const auto tracks = timelineTracks(this);
+    for (auto *track : tracks) {
+        if (!track || track->isLocked()) continue;
+        for (int i : track->selectedClips())
+            if (i >= 0 && i < track->clipCount() && track->clips()[i].linkGroup > 0)
+                groups.insert(track->clips()[i].linkGroup);
+    }
+    // A locked partner makes the entire linked operation ineligible.
+    for (auto *track : tracks)
+        if (track && track->isLocked())
+            for (const auto &clip : track->clips()) groups.remove(clip.linkGroup);
+    for (auto *track : tracks) {
+        if (!track || track->isLocked()) continue;
+        for (int i = 0; i < track->clipCount(); ++i) {
+            const auto &clip = track->clips()[i];
+            if (clip.linkGroup > 0 ? !groups.contains(clip.linkGroup) : !track->isClipSelected(i)) continue;
+            double start = 0.0, end = 0.0;
+            if (trackClipTimeRangeAt(track, i, &start, &end)) copies.append({track, clip, end});
+        }
+    }
+    if (copies.isEmpty()) return;
+    const TrackClipSnapshot before = snapshotTrackClips(this);
+    QHash<int, int> newGroups;
+    for (const auto &copy : copies) {
+        const ClipInfo duplicate = copyClipForPaste(copy.clip, newGroups);
+        double cursor = 0.0;
+        int insertAt = copy.track->clipCount();
+        double start = copy.end;
+        for (int i = 0; i < copy.track->clipCount(); ++i) {
+            const auto &existing = copy.track->clips()[i];
+            const double nextStart = cursor + qMax(0.0, existing.leadInSec);
+            if (start >= cursor - 1e-6 && start + duplicate.effectiveDuration() <= nextStart + 1e-6) {
+                insertAt = i;
+                break;
+            }
+            cursor = nextStart + existing.effectiveDuration();
+        }
+        start = qMax(start, cursor);
+        // Shared paste/insert primitive preserves the complete ClipInfo payload.
+        copy.track->insertClipPreservingDownstream(insertAt, duplicate, start - cursor);
+    }
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, before);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, before);
+    saveUndoState(QStringLiteral("複製"));
+    ensureSequenceFitsViewport();
+    scheduleEmitSequenceChanged();
+    updateInfoLabel();
+}
+
+void Timeline::setNudgeFrameRate(double fps)
+{
+    if (std::isfinite(fps) && fps > 0.0) m_nudgeFrameRate = fps;
+}
+
+void Timeline::nudgeSelectedClips(int frames)
+{
+    if (!frames) return;
+    struct Target { TimelineTrack *track; int index; double start; int group; };
+    QVector<Target> targets;
+    QVector<Target> selection;
+    QSet<int> groups;
+    for (auto *track : timelineTracks(this)) {
+        if (!track || track->isLocked()) continue;
+        for (int i : track->selectedClips()) {
+            if (i < 0 || i >= track->clipCount()) continue;
+            const int group = track->clips()[i].linkGroup;
+            double start = 0.0, end = 0.0;
+            if (!trackClipTimeRangeAt(track, i, &start, &end)) continue;
+            selection.append({track, i, start, group});
+            if (group > 0 && groups.contains(group)) continue;
+            targets.append({track, i, start, group});
+            if (group > 0) groups.insert(group);
+        }
+    }
+    std::sort(targets.begin(), targets.end(), [frames](const Target &a, const Target &b) {
+        return frames > 0 ? a.start > b.start : a.start < b.start;
+    });
+    bool changed = false;
+    m_nudgeBatchActive = true;
+    for (const auto &target : targets) {
+        const bool audio = target.track->isAudioTrack();
+        const int trackIndex = audio ? m_audioTracks.indexOf(target.track) : m_videoTracks.indexOf(target.track);
+        int index = -1;
+        for (int i = 0; i < target.track->clipCount(); ++i) {
+            double start = 0.0, end = 0.0;
+            if (trackClipTimeRangeAt(target.track, i, &start, &end)
+                && qAbs(start - target.start) < 1e-6) { index = i; break; }
+        }
+        if (index < 0) continue;
+        const double requested = target.start + double(frames) / m_nudgeFrameRate;
+        MoveClipResult result;
+        QString error;
+        double boundedStart = qMax(0.0, requested);
+        if (target.group > 0) {
+            // Clamp the whole linked group at its earliest member, preserving offsets.
+            for (auto *track : timelineTracks(this)) {
+                if (!track) continue;
+                for (int i = 0; i < track->clipCount(); ++i) {
+                    if (track->clips()[i].linkGroup != target.group) continue;
+                    double start = 0.0, end = 0.0;
+                    if (trackClipTimeRangeAt(track, i, &start, &end))
+                        boundedStart = qMax(boundedStart, target.start - start);
+                }
+            }
+        }
+        const bool valid = moveClipByIndex(audio, trackIndex, index,
+            boundedStart, trackIndex, &result, &error);
+        changed = changed || result.moved;
+        if (result.moved) {
+            for (auto &selected : selection)
+                if ((target.group > 0 && selected.group == target.group)
+                    || (selected.track == target.track && selected.index == target.index))
+                    selected.start += result.actualStartSec - target.start;
+        }
+        if (!valid || !result.reason.isEmpty())
+            emit statusMessageRequested(QStringLiteral("指定位置へ移動できません。候補: %1 秒 %2")
+                .arg(result.actualStartSec, 0, 'f', 6).arg(error.isEmpty() ? result.reason : error), 3000);
+        else if (qAbs(result.actualStartSec - requested) > 1e-6)
+            emit statusMessageRequested(QStringLiteral("ナッジ位置を %1 秒に調整しました。")
+                .arg(result.actualStartSec, 0, 'f', 6), 3000);
+    }
+    m_nudgeBatchActive = false;
+    // Keep the complete multi-selection for repeated keyboard nudges.
+    for (auto *track : timelineTracks(this)) {
+        if (!track || track->isLocked()) continue;
+        const QSignalBlocker blocker(track);
+        track->clearClipSelection();
+        for (const auto &selected : selection) {
+            if (selected.track != track) continue;
+            for (int i = 0; i < track->clipCount(); ++i) {
+                double start = 0.0, end = 0.0;
+                if (trackClipTimeRangeAt(track, i, &start, &end)
+                    && qAbs(start - selected.start) < 1e-6) {
+                    track->toggleClipSelection(i);
+                    break;
+                }
+            }
+        }
+    }
+    if (changed) {
+        saveUndoState(QStringLiteral("ナッジ"));
+        ensureSequenceFitsViewport();
+        updateInfoLabel();
+        const auto *active = trackAt(false, m_activeVideoTrackIndex);
+        const int primary = active ? active->selectedClip() : -1;
+        emit clipSelected(primary);
+        emit clipSelectedOnTrack(m_activeVideoTrackIndex, primary);
+    }
 }
 
 bool Timeline::closeGapAt(TimelineTrack *track, double timeSec)
@@ -6805,6 +7599,23 @@ void Timeline::copySelectedClip()
     m_clipboard = m_videoTrack->clips()[sel];
 }
 
+ClipInfo Timeline::copyClipForPaste(const ClipInfo &source, QHash<int, int> &groups)
+{
+    ClipInfo result = source;
+    if (source.linkGroup <= 0) return result;
+    if (!groups.contains(source.linkGroup)) {
+        QSet<int> used;
+        for (auto *track : timelineTracks(this))
+            if (track) for (const auto &clip : track->clips()) used.insert(clip.linkGroup);
+        for (auto it = groups.cbegin(); it != groups.cend(); ++it) used.insert(it.value());
+        int fresh = allocateLinkGroup();
+        while (used.contains(fresh)) fresh = allocateLinkGroup();
+        groups.insert(source.linkGroup, fresh);
+    }
+    result.linkGroup = groups.value(source.linkGroup);
+    return result;
+}
+
 void Timeline::pasteClip()
 {
     if (!m_clipboard.has_value()) return;
@@ -6817,13 +7628,9 @@ void Timeline::pasteClip()
     // Give the pasted V/A pair a fresh linkGroup so it forms its own link
     // instead of aliasing the source clip's group (which would drag/select the
     // original together with the copy).
-    ClipInfo pastedVideo = m_clipboard.value();
-    ClipInfo pastedAudio = m_clipboard.value();
-    if (pastedVideo.linkGroup > 0) {
-        const int freshGroup = allocateLinkGroup();
-        pastedVideo.linkGroup = freshGroup;
-        pastedAudio.linkGroup = freshGroup;
-    }
+    QHash<int, int> groups;
+    const ClipInfo pastedVideo = copyClipForPaste(m_clipboard.value(), groups);
+    const ClipInfo pastedAudio = pastedVideo;
     m_videoTrack->insertClip(insertAt, pastedVideo);
     m_audioTrack->insertClip(insertAt, pastedAudio);
     m_videoTrack->setSelectedClip(insertAt);
@@ -8180,6 +8987,121 @@ int Timeline::snapLineAlpha() const
 void Timeline::zoomIn() { setZoomLevel(m_zoomLevel * 1.25); }
 void Timeline::zoomOut() { setZoomLevel(m_zoomLevel / 1.25); }
 
+void Timeline::zoomToFitSequence()
+{
+    if (!m_scrollArea || totalDuration() <= 0.0) return;
+    clearZoomAnchor();
+    setZoomLevel(qMax(1, m_scrollArea->viewport()->width() - 60) / totalDuration());
+    // Short clips occupy at least 20 px, so duration alone can underestimate
+    // the drawn sequence width. Include audio tracks without changing totalDuration().
+    const int available = qMax(1, m_scrollArea->viewport()->width() - 60);
+    for (;;) {
+        double nextZoom = m_zoomLevel;
+        for (auto *track : timelineTracks(this)) {
+            const auto &clips = track->clips();
+            if (clips.isEmpty()) continue;
+            const int end = track->clipStartX(clips.size() - 1)
+                + qMax(20, static_cast<int>(clips.last().effectiveDuration() * m_zoomLevel));
+            if (end <= available) continue;
+            int fixedWidth = 0;
+            double scalableDuration = 0.0;
+            for (const auto &clip : clips) {
+                scalableDuration += qMax(0.0, clip.leadInSec);
+                if (clip.effectiveDuration() * m_zoomLevel < 20.0)
+                    fixedWidth += 20;
+                else
+                    scalableDuration += clip.effectiveDuration();
+            }
+            const double fittingZoom = scalableDuration > 0.0
+                ? (available - fixedWidth) / scalableDuration : 0.02;
+            nextZoom = qMin(nextZoom, qMax(0.02, fittingZoom));
+        }
+        // At the lower bound, sequences with too many 20 px clips can only
+        // be fitted on a best-effort basis.
+        if (nextZoom >= m_zoomLevel) break;
+        setZoomLevel(nextZoom);
+    }
+    m_scrollArea->horizontalScrollBar()->setValue(0);
+}
+
+bool Timeline::zoomToSelection()
+{
+    double first = std::numeric_limits<double>::max(), last = 0.0;
+    for (auto *track : timelineTracks(this)) {
+        for (int i : track->selectedClips()) {
+            double start = 0.0, end = 0.0;
+            if (trackClipTimeRangeAt(track, i, &start, &end)) {
+                first = qMin(first, start);
+                last = qMax(last, end);
+            }
+        }
+    }
+    if (last <= first || !m_scrollArea) return false;
+    const double margin = (last - first) * 0.05;
+    const double left = qMax(0.0, first - margin);
+    const int available = qMax(1, m_scrollArea->viewport()->width() - 2);
+    const int targetWidth = qMax(1, static_cast<int>(available / 1.1));
+    const double initialZoom = qBound(0.02, available / (last + margin - left), 200.0);
+    const auto tracks = timelineTracks(this);
+    // Match clipStartX and the painted width without mutating zoom or layout.
+    const auto boundsAt = [&](double pps) {
+        int leftPx = std::numeric_limits<int>::max(), rightPx = 0;
+        for (auto *track : tracks) {
+            int x = 0;
+            const auto &clips = track->clips();
+            for (int i = 0; i < clips.size(); ++i) {
+                x += qMax(0, static_cast<int>(clips[i].leadInSec * pps));
+                const int width = qMax(20, static_cast<int>(clips[i].effectiveDuration() * pps));
+                if (track->isClipSelected(i)) {
+                    leftPx = qMin(leftPx, x);
+                    rightPx = qMax(rightPx, x + width);
+                }
+                x += width;
+            }
+        }
+        return qMakePair(leftPx, rightPx);
+    };
+    const auto fitsAt = [&](double pps) {
+        const auto bounds = boundsAt(pps);
+        return bounds.second - bounds.first <= targetWidth;
+    };
+    double fittingZoom = initialZoom;
+    double upper = 200.0;
+    // Different tracks accumulate different minimum-width clips: the span is
+    // not monotonic in pps. Scan the whole range, including its lower endpoint.
+    for (double candidate = 200.0;; candidate = qMax(0.02, candidate * 0.95)) {
+        if (fitsAt(candidate)) {
+            double lower = candidate;
+            for (int iteration = 0; iteration < 10; ++iteration) {
+                const double midpoint = (lower + upper) * 0.5;
+                if (fitsAt(midpoint))
+                    lower = midpoint;
+                else
+                    upper = midpoint;
+            }
+            fittingZoom = lower; // Always retain a value verified to fit.
+            break;
+        }
+        if (candidate <= 0.02) break;
+        upper = candidate;
+    }
+    // If minimum widths prevent fitting, keep the duration-based best effort.
+    clearZoomAnchor();
+    setZoomLevel(fittingZoom);
+    const auto bounds = boundsAt(m_zoomLevel);
+    if (m_tracksWidget && m_tracksWidget->layout()) m_tracksWidget->layout()->activate();
+    if (auto *content = m_scrollArea->widget()) {
+        if (content->layout()) content->layout()->activate();
+        content->adjustSize();
+    }
+    QEvent layoutEvent(QEvent::LayoutRequest);
+    QCoreApplication::sendEvent(m_scrollArea, &layoutEvent);
+    const int padding = qMin(static_cast<int>((bounds.second - bounds.first) * 0.05),
+                             qMax(0, (available - (bounds.second - bounds.first)) / 2));
+    m_scrollArea->horizontalScrollBar()->setValue(qMax(0, bounds.first - padding));
+    return true;
+}
+
 void Timeline::captureZoomAnchor()
 {
     // Record the playhead's current viewport column (or the viewport center
@@ -8362,6 +9284,33 @@ void Timeline::setClipColorCorrection(int trackIdx, int clipIdx,
     scheduleEmitSequenceChanged();
 }
 
+bool Timeline::setClipLut(int trackIdx, int clipIdx, const QString &lutFilePath,
+                          double intensity, QString *err)
+{
+    auto fail = [err](const QString &message) {
+        if (err) *err = message;
+        return false;
+    };
+    auto *track = m_videoTracks.value(trackIdx, nullptr);
+    if (!track || clipIdx < 0 || clipIdx >= track->clipCount())
+        return fail(QStringLiteral("映像クリップが見つかりません"));
+    if (!std::isfinite(intensity))
+        return fail(QStringLiteral("LUT 強度には有限の数値を指定してください"));
+    const double clampedIntensity = lutFilePath.isEmpty()
+        ? 1.0 : qBound(0.0, intensity, 1.0);
+    auto clips = track->clips();
+    auto &clip = clips[clipIdx];
+    if (clip.lutFilePath == lutFilePath
+        && std::abs(clip.lutIntensity - clampedIntensity) <= 1e-9)
+        return true;
+    clip.lutFilePath = lutFilePath;
+    clip.lutIntensity = clampedIntensity;
+    track->setClips(clips);
+    saveUndoState("Clip LUT");
+    refreshPlaybackSequence();
+    return true;
+}
+
 void Timeline::setClipLayerStyle(const LayerStyle &style)
 {
     int sel = m_videoTrack->selectedClip();
@@ -8411,6 +9360,65 @@ void Timeline::setClipLayerMaterial(int trackIdx, int clipIdx,
     if (recordUndo)
         saveUndoState("Layer material");
     scheduleEmitSequenceChanged();
+}
+
+bool ClipInfo::hasMeshWarp() const
+{
+    if (meshWarp.rows < 2 || meshWarp.cols < 2
+        || meshWarp.controlPoints.size() != meshWarp.rows)
+        return false;
+    bool changed = false;
+    for (int r = 0; r < meshWarp.rows; ++r) {
+        if (meshWarp.controlPoints[r].size() != meshWarp.cols)
+            return false;
+        for (int c = 0; c < meshWarp.cols; ++c) {
+            const QPointF &p = meshWarp.controlPoints[r][c];
+            if (!std::isfinite(p.x()) || !std::isfinite(p.y()))
+                return false;
+            changed |= std::abs(p.x() - double(c) / (meshWarp.cols - 1)) >= 1e-6
+                || std::abs(p.y() - double(r) / (meshWarp.rows - 1)) >= 1e-6;
+        }
+    }
+    return changed;
+}
+
+void Timeline::setClipMeshWarp(int trackIdx, int clipIdx, const MeshGrid &grid)
+{
+    if (trackIdx < 0 || trackIdx >= m_videoTracks.size()) return;
+    auto *track = m_videoTracks[trackIdx];
+    if (!track || track->isLocked()) return;
+    auto clips = track->clips();
+    if (clipIdx < 0 || clipIdx >= clips.size()) return;
+    const MeshGrid &old = clips[clipIdx].meshWarp;
+    if (old.rows == grid.rows && old.cols == grid.cols
+        && old.controlPoints == grid.controlPoints) return;
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    clips[clipIdx].meshWarp = grid;
+    track->setClips(clips);
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+    saveUndoState(QStringLiteral("メッシュワープ"));
+    refreshPlaybackSequence();
+}
+
+// Drag preview only; the tool restores its baseline before the undoable commit.
+void Timeline::previewClipMeshWarp(int trackIdx, int clipIdx, const MeshGrid &grid)
+{
+    if (trackIdx < 0 || trackIdx >= m_videoTracks.size()) return;
+    auto *track = m_videoTracks[trackIdx];
+    if (!track || track->isLocked()) return;
+    auto clips = track->clips();
+    if (clipIdx < 0 || clipIdx >= clips.size()) return;
+    clips[clipIdx].meshWarp = grid;
+    track->setClips(clips);
+    refreshPlaybackSequence();
+}
+
+void Timeline::resetClipMeshWarp(int trackIdx, int clipIdx, int rows, int cols)
+{
+    if (rows < 2 || cols < 2) return;
+    setClipMeshWarp(trackIdx, clipIdx,
+                   WarpDistortion::createDefaultMesh(QSize(1, 1), rows, cols));
 }
 
 void Timeline::setClipShapeModifiers(int trackIdx, int clipIdx,
@@ -9041,7 +10049,7 @@ void Timeline::insertAudioClipAtPlayhead(const QString &wavPath, int trackIdx)
     if (targetIndex < 0 || targetIndex >= m_audioTracks.size()) {
         // Create tracks up to the requested one
         while (m_audioTracks.size() <= targetIndex) {
-            addAudioTrack();
+            addAudioTrack(false);
         }
     }
 
@@ -9512,6 +10520,37 @@ void Timeline::wireTrackSelection(TimelineTrack *track)
     if (track)
         track->installEventFilter(this);
 
+    // The viewport owns the overlay; global points keep the drag continuous across rows.
+    auto *marquee = new QRubberBand(QRubberBand::Rectangle, m_scrollArea->viewport());
+    marquee->setAttribute(Qt::WA_TransparentForMouseEvents);
+    connect(track, &QObject::destroyed, marquee, &QObject::deleteLater);
+    connect(track, &TimelineTrack::marqueeDragged, this,
+            [this, track, marquee](QPoint start, QPoint end, bool additive, bool finished) {
+        const QRect rect(m_scrollArea->viewport()->mapFromGlobal(start),
+                         m_scrollArea->viewport()->mapFromGlobal(end));
+        marquee->setGeometry(rect.normalized());
+        if (!finished) {
+            marquee->show();
+            marquee->raise();
+            return;
+        }
+        marquee->hide();
+        int first = -1, last = -1;
+        const auto tracks = timelineTracks(this);
+        const int top = qMin(start.y(), end.y()), bottom = qMax(start.y(), end.y());
+        for (int row = 0; row < tracks.size(); ++row) {
+            const int y = tracks[row]->mapToGlobal(QPoint(0, 0)).y();
+            if (y <= bottom && y + tracks[row]->height() > top) {
+                if (first < 0) first = row;
+                last = row;
+            }
+        }
+        if (first >= 0)
+            selectClipsInRange(track->xToSeconds(track->mapFromGlobal(start).x()),
+                               track->xToSeconds(track->mapFromGlobal(end).x()),
+                               first, last, additive);
+    });
+
     connect(track, &TimelineTrack::selectionChanged, this, [this, track](int index, bool additive) {
         if (m_inLinkedSelectionSync) return;
         m_inLinkedSelectionSync = true;
@@ -9532,7 +10571,7 @@ void Timeline::wireTrackSelection(TimelineTrack *track)
         // moves as a unit.
         if (index >= 0 && index < track->clips().size()) {
             const int linkGroup = track->clips()[index].linkGroup;
-            if (linkGroup > 0) {
+            if (linkGroup > 0 && m_linkedSelectionEnabled) {
                 auto syncLinked = [linkGroup, additive](TimelineTrack *t) {
                     if (!t) return;
                     const auto &clips = t->clips();
@@ -9553,6 +10592,7 @@ void Timeline::wireTrackSelection(TimelineTrack *track)
         // V3 sprint — track-aware overload. Resolve which video-track row
         // the click landed on; audio-track clicks emit trackIdx=-1 so the
         // edit target falls back to follow-active.
+        m_activeAudioTrackIndex = index >= 0 ? m_audioTracks.indexOf(track) : -1;
         int videoTrackIdx = m_videoTracks.indexOf(track);
         m_activeVideoTrackIndex = (index >= 0 && videoTrackIdx >= 0) ? videoTrackIdx : -1;
         emit clipSelectedOnTrack(index < 0 ? -1 : videoTrackIdx, index);
@@ -9750,9 +10790,9 @@ void Timeline::handleCrossTrackLinkedDrop(TimelineTrack *destTrack, int linkGrou
             auto &targetTracks = destIsVideo ? m_audioTracks : m_videoTracks;
             while (targetTracks.size() <= destIdx) {
                 if (destIsVideo)
-                    addAudioTrack();
+                    addAudioTrack(false);
                 else
-                    addVideoTrack();
+                    addVideoTrack(false);
             }
             TimelineTrack *targetTrack = targetTracks[destIdx];
 
@@ -10739,6 +11779,25 @@ void Timeline::refreshPlaybackSequence()
     scheduleEmitSequenceChanged();
 }
 
+void Timeline::setExternalTrackStateHooks(std::function<QJsonObject()> collect,
+                                          std::function<void(const QJsonObject&)> apply)
+{
+    m_collectExternalTrackState = std::move(collect);
+    m_applyExternalTrackState = std::move(apply);
+    captureExternalTrackState();
+}
+
+void Timeline::captureExternalTrackStateForCompoundEdit()
+{
+    captureExternalTrackState();
+}
+
+void Timeline::captureExternalTrackState()
+{
+    if (m_collectExternalTrackState)
+        m_undoManager->updateCurrentExternalTrackState(m_collectExternalTrackState());
+}
+
 void Timeline::saveUndoState(const QString &description)
 {
     m_undoManager->saveState(currentState(), description);
@@ -10826,6 +11885,56 @@ QVector<TimelineSequence> Timeline::sequences() const
     return snapshot;
 }
 
+QVector<TimelineSequence> Timeline::sequenceList() const
+{
+    if (!m_sequenceModelEnabled)
+        return {currentSequenceSnapshot(QString::fromLatin1(kDefaultSequenceId),
+                                        QStringLiteral("メインシーケンス"))};
+    auto result = sequences();
+    for (auto &sequence : result) {
+        if (sequence.id == QLatin1String(kDefaultSequenceId)
+            && sequence.name == QStringLiteral("Sequence 1"))
+            sequence.name = QStringLiteral("メインシーケンス");
+    }
+    return result;
+}
+
+bool Timeline::renameSequence(const QString &id, const QString &name)
+{
+    const QString trimmed = name.trimmed();
+    if (trimmed.isEmpty()) return false;
+    if (!m_sequenceModelEnabled) {
+        if (id != QLatin1String(kDefaultSequenceId)) return false;
+        if (trimmed == QStringLiteral("メインシーケンス")) return true;
+        m_sequenceModelEnabled = true;
+        m_activeSequenceId = id;
+        upsertSequenceSnapshot(currentSequenceSnapshot(id, trimmed));
+    } else {
+        auto *sequence = sequenceById(id);
+        if (!sequence) return false;
+        if (sequence->name == trimmed) return true;
+        sequence->name = trimmed;
+    }
+    // Metadata only: clip indices and their carrier bindings do not change.
+    saveUndoState(QStringLiteral("シーケンスの名前を変更"));
+    rebuildTimelineBreadcrumbBar(this);
+    emit sequencesChanged();
+    return true;
+}
+
+bool Timeline::createSequence(const QString &name)
+{
+    if (name.trimmed().isEmpty()) return false;
+    TimelineSequence sequence;
+    sequence.id = uniqueSequenceId(m_sequences, QStringLiteral("sequence"), m_sequences.size());
+    sequence.name = name.trimmed();
+    sequence.videoTracks.append(QVector<ClipInfo>{});
+    sequence.audioTracks.append(QVector<ClipInfo>{});
+    if (!addSequence(sequence) || !setActiveSequence(sequence.id)) return false;
+    saveUndoState(QStringLiteral("新規シーケンス"));
+    return true;
+}
+
 void Timeline::setSequences(const QVector<TimelineSequence> &sequences,
                             const QString &activeSequenceId)
 {
@@ -10835,8 +11944,10 @@ void Timeline::setSequences(const QVector<TimelineSequence> &sequences,
     m_activeSequenceId = m_sequenceModelEnabled ? active : QString();
 
     const TimelineSequence *sequence = sequenceById(m_activeSequenceId);
-    if (!sequence)
+    if (!sequence) {
+        emit sequencesChanged();
         return;
+    }
 
     m_generatedCaptionOverlays = sequence->generatedCaptionOverlays;
     restoreFromProject(sequence->videoTracks, sequence->audioTracks,
@@ -10844,6 +11955,7 @@ void Timeline::setSequences(const QVector<TimelineSequence> &sequences,
     m_activeSequenceId = sequence->id;
     m_sequenceModelEnabled = true;
     syncActiveSequenceFromCurrentTracks();
+    emit sequencesChanged();
 }
 
 bool Timeline::addSequence(const TimelineSequence &sequence)
@@ -10861,6 +11973,7 @@ bool Timeline::addSequence(const TimelineSequence &sequence)
     if (normalized.name.trimmed().isEmpty())
         normalized.name = QStringLiteral("Sequence %1").arg(existing.size() + 1);
     upsertSequenceSnapshot(normalized);
+    emit sequencesChanged();
     return true;
 }
 
@@ -10869,7 +11982,7 @@ bool Timeline::setActiveSequence(const QString &sequenceId)
     if (sequenceId.isEmpty())
         return false;
     if (!m_sequenceModelEnabled)
-        return false;
+        return sequenceId == QLatin1String(kDefaultSequenceId);
     const TimelineSequence *target = sequenceById(sequenceId);
     if (!target)
         return false;
@@ -10884,9 +11997,9 @@ bool Timeline::setActiveSequence(const QString &sequenceId)
     const TimelineSequence targetCopy = *target;
     m_activeSequenceId = sequenceId;
     while (m_videoTracks.size() < targetCopy.videoTracks.size())
-        addVideoTrack();
+        addVideoTrack(false);
     while (m_audioTracks.size() < targetCopy.audioTracks.size())
-        addAudioTrack();
+        addAudioTrack(false);
 
     for (int i = 0; i < m_videoTracks.size(); ++i) {
         if (!m_videoTracks[i])
@@ -10915,6 +12028,7 @@ bool Timeline::setActiveSequence(const QString &sequenceId)
     ensureSequenceFitsViewport();
     scheduleEmitSequenceChanged();
     rebuildTimelineBreadcrumbBar(this);
+    emit sequencesChanged();
     return true;
 }
 
@@ -10950,7 +12064,7 @@ bool Timeline::addSequenceClip(const QString &sequenceId, int videoTrackIndex)
         return false;
     const int targetTrackIndex = qMax(0, videoTrackIndex);
     while (m_videoTracks.size() <= targetTrackIndex)
-        addVideoTrack();
+        addVideoTrack(false);
     TimelineTrack *track = m_videoTracks.value(targetTrackIndex, nullptr);
     if (!track)
         return false;
@@ -10961,7 +12075,7 @@ bool Timeline::addSequenceClip(const QString &sequenceId, int videoTrackIndex)
     track->addClip(clip);
 
     while (m_audioTracks.size() <= targetTrackIndex)
-        addAudioTrack();
+        addAudioTrack(false);
     if (TimelineTrack *audioTrack = m_audioTracks.value(targetTrackIndex, nullptr))
         audioTrack->addClip(clip);
 
@@ -10998,6 +12112,7 @@ void Timeline::setClipParentEntries(const QHash<QString, QString> &entries)
         m_sequenceModelEnabled = false;
     }
     rebuildTimelineBreadcrumbBar(this);
+    emit sequencesChanged();
 }
 
 QHash<QString, QString> Timeline::clipParentEntries() const
@@ -11047,6 +12162,14 @@ TimelineState Timeline::currentState() const
     state.audioTracks.reserve(m_audioTracks.size());
     for (const auto *t : m_audioTracks)
         state.audioTracks.append(t ? t->clips() : QVector<ClipInfo>{});
+    for (const auto *track : m_videoTracks) {
+        state.videoTrackNames.append(track ? track->customName : QString{});
+        state.videoTrackColors.append(track ? track->color : QColor{});
+    }
+    for (const auto *track : m_audioTracks) {
+        state.audioTrackNames.append(track ? track->customName : QString{});
+        state.audioTrackColors.append(track ? track->color : QColor{});
+    }
     state.generatedCaptionOverlays = m_generatedCaptionOverlays;
     state.selectedClip = m_videoTrack->selectedClip();
 
@@ -11069,8 +12192,12 @@ TimelineState Timeline::currentState() const
         }
     }
 
+    state.activeVideoTrackIndex = m_activeVideoTrackIndex;
+    state.activeAudioTrackIndex = m_activeAudioTrackIndex;
     state.playheadPos = m_playheadPos;
     state.clipParentEntries = clipParentEntries();
+    state.trackMatteEntries = m_trackMatteEntries;
+    state.trackStructureRevision = m_trackStructureRevision;
 
     if (m_audioMixer) {
         const int n = audioTrackCount();
@@ -11079,6 +12206,7 @@ TimelineState Timeline::currentState() const
             state.audioTrackGains[i] = m_audioMixer->trackGain(i);
     }
 
+    if (m_collectExternalTrackState) state.externalTrackState = m_collectExternalTrackState();
     state.projectWidth = m_projectWidth;
     state.projectHeight = m_projectHeight;
     state.projectExplicitOutput = m_projectExplicitOutput;
@@ -11089,12 +12217,16 @@ TimelineState Timeline::currentState() const
 void Timeline::restoreState(const TimelineState &state)
 {
     undotrace::log("restoreState:enter");
-    // Make sure the editor has at least as many rows as the snapshot. We
-    // only ADD here — never remove — because deleting a track widget
-    // mid-undo invalidates pointers other UI code may already hold (the
-    // undo path is reached from a menu callback, not a clean teardown).
-    while (m_videoTracks.size() < state.videoTracks.size()) addVideoTrack();
-    while (m_audioTracks.size() < state.audioTracks.size()) addAudioTrack();
+    const bool structureChanged = m_trackStructureRevision != state.trackStructureRevision
+        || m_videoTracks.size() != state.videoTracks.size()
+        || m_audioTracks.size() != state.audioTracks.size();
+    // Deferred deletion keeps menu callbacks safe; remap receivers clear retained pointers.
+    while (m_videoTracks.size() > qMax(1, int(state.videoTracks.size())))
+        removeTrackInternal(false, m_videoTracks.size() - 1);
+    while (m_audioTracks.size() > qMax(1, int(state.audioTracks.size())))
+        removeTrackInternal(true, m_audioTracks.size() - 1);
+    while (m_videoTracks.size() < state.videoTracks.size()) addVideoTrack(false);
+    while (m_audioTracks.size() < state.audioTracks.size()) addAudioTrack(false);
 
     for (int i = 0; i < m_videoTracks.size(); ++i) {
         if (!m_videoTracks[i]) continue;
@@ -11102,6 +12234,9 @@ void Timeline::restoreState(const TimelineState &state)
                             ? state.videoTracks[i]
                             : QVector<ClipInfo>{};
         m_videoTracks[i]->setClips(clips);
+        m_videoTracks[i]->customName = state.videoTrackNames.value(i);
+        m_videoTracks[i]->color = state.videoTrackColors.value(i);
+        syncTrackHeaderFlags(m_videoTracks[i]);
         m_videoTracks[i]->update();
     }
     for (int i = 0; i < m_audioTracks.size(); ++i) {
@@ -11110,9 +12245,13 @@ void Timeline::restoreState(const TimelineState &state)
                             ? state.audioTracks[i]
                             : QVector<ClipInfo>{};
         m_audioTracks[i]->setClips(clips);
+        m_audioTracks[i]->customName = state.audioTrackNames.value(i);
+        m_audioTracks[i]->color = state.audioTrackColors.value(i);
+        syncTrackHeaderFlags(m_audioTracks[i]);
         m_audioTracks[i]->update();
     }
     m_generatedCaptionOverlays = state.generatedCaptionOverlays;
+    m_trackMatteEntries = state.trackMatteEntries;
     setClipParentEntries(state.clipParentEntries);
     rebuildTimelineBreadcrumbBar(this);
 
@@ -11145,12 +12284,13 @@ void Timeline::restoreState(const TimelineState &state)
     // A1 for genuinely legacy snapshots that predate the track-aware fields.
     if (!videoSelSet && (legacySelectionState || state.selectedVideoTrackIndex < 0)) {
         const bool vWas = m_videoTrack->blockSignals(true);
-        m_videoTrack->setSelectedClip(state.selectedClip);
+        const int selected = state.selectedClip >= 0 && state.selectedClip < m_videoTrack->clipCount()
+            ? state.selectedClip : -1;
+        m_videoTrack->setSelectedClip(selected);
         m_videoTrack->blockSignals(vWas);
-        emit clipSelected(state.selectedClip);
-        m_activeVideoTrackIndex = state.selectedClip < 0 ? -1 : 0;
-        emit clipSelectedOnTrack(state.selectedClip < 0 ? -1 : 0,
-                                 state.selectedClip);
+        emit clipSelected(selected);
+        m_activeVideoTrackIndex = selected < 0 ? -1 : 0;
+        emit clipSelectedOnTrack(m_activeVideoTrackIndex, selected);
     }
 
     if (state.selectedAudioTrackIndex >= 0
@@ -11169,9 +12309,16 @@ void Timeline::restoreState(const TimelineState &state)
         // Legacy fallback: old undo entries predating the V2 track-aware
         // fields restore selection on A1 the same as V1.
         const bool aWas = m_audioTrack->blockSignals(true);
-        m_audioTrack->setSelectedClip(state.selectedClip);
+        m_audioTrack->setSelectedClip(state.selectedClip >= 0 && state.selectedClip < m_audioTrack->clipCount()
+            ? state.selectedClip : -1);
         m_audioTrack->blockSignals(aWas);
     }
+
+    // Preserve the active row independently of the first selected row.
+    if (state.activeVideoTrackIndex >= 0 && state.activeVideoTrackIndex < m_videoTracks.size())
+        m_activeVideoTrackIndex = state.activeVideoTrackIndex;
+    m_activeAudioTrackIndex = state.activeAudioTrackIndex >= 0
+        && state.activeAudioTrackIndex < m_audioTracks.size() ? state.activeAudioTrackIndex : -1;
 
     m_playheadPos = state.playheadPos;
     syncPlayheadOverlay();
@@ -11199,6 +12346,14 @@ void Timeline::restoreState(const TimelineState &state)
     // VideoPlayer rebuilds its sequence after undo/redo.
     refreshTextStrip();
     scheduleEmitSequenceChanged();
+    m_trackStructureRevision = state.trackStructureRevision;
+    m_nextTrackStructureRevision = qMax(m_nextTrackStructureRevision, m_trackStructureRevision);
+    // Playback flags and mixer edits are not ordinary timeline undo state.
+    // Restore external owners only when crossing a track-structure change.
+    if (structureChanged && m_applyExternalTrackState)
+        m_applyExternalTrackState(state.externalTrackState);
+    emit trackStateRestored();
+    syncActiveSequenceFromCurrentTracks();
     undotrace::log("restoreState:exit");
 }
 
@@ -11214,6 +12369,37 @@ bool Timeline::setTrackLocked(TrackKind kind, int trackIndex, bool locked)
     return true;
 }
 
+bool Timeline::setTrackAppearance(bool audio, int idx, const QString &name,
+                                  const QColor &color, QString *err)
+{
+    TimelineTrack *track = trackAt(audio, idx);
+    if (!track) {
+        if (err) *err = QStringLiteral("トラック番号が範囲外です");
+        return false;
+    }
+    const QColor normalized = color.isValid() ? QColor(color.name()) : QColor{};
+    if (track->customName == name && track->color == normalized) return true;
+    // No clip mutation: clip identity/remapping is unchanged.
+    track->customName = name;
+    track->color = normalized;
+    syncTrackHeaderFlags(track);
+    saveUndoState(QStringLiteral("トラックの名前・色を変更"));
+    scheduleEmitSequenceChanged();
+    return true;
+}
+
+bool Timeline::setTrackCustomName(bool audio, int idx, const QString &name, QString *err)
+{
+    const auto *track = trackAt(audio, idx);
+    return setTrackAppearance(audio, idx, name, track ? track->color : QColor{}, err);
+}
+
+bool Timeline::setTrackColor(bool audio, int idx, const QColor &color, QString *err)
+{
+    const auto *track = trackAt(audio, idx);
+    return setTrackAppearance(audio, idx, track ? track->customName : QString{}, color, err);
+}
+
 QJsonObject Timeline::trackFlagsToJson() const
 {
     auto flagsForTracks = [](const QVector<TimelineTrack *> &tracks) {
@@ -11221,6 +12407,8 @@ QJsonObject Timeline::trackFlagsToJson() const
         for (const TimelineTrack *track : tracks) {
             QJsonObject flags;
             if (track) {
+                if (!track->customName.isEmpty()) flags.insert(QStringLiteral("name"), track->customName);
+                if (track->color.isValid()) flags.insert(QStringLiteral("color"), track->color.name());
                 const bool locked = track->isLocked();
                 const bool muted = track->isMuted();
                 const bool solo = track->isSolo();
@@ -11261,7 +12449,9 @@ void Timeline::applyTrackFlagsFromJson(const QJsonObject &flags)
             const bool hidden = item.value(QStringLiteral("hidden")).toBool(false);
             const bool soloChanged = track->isSolo() != solo;
             playbackFlagsChanged = playbackFlagsChanged
-                || track->isMuted() != muted || track->isHidden() != hidden;
+                || track->isMuted() != muted || track->isHidden() != hidden || soloChanged;
+            track->customName = item.value(QStringLiteral("name")).toString();
+            track->color = QColor(item.value(QStringLiteral("color")).toString());
             track->setLocked(locked);
             track->setMuted(muted);
             track->setSolo(solo);
@@ -11306,8 +12496,8 @@ void Timeline::restoreFromProject(const QVector<QVector<ClipInfo>> &videoTracks,
     // Grow to fit the incoming track counts, then rewrite EVERY existing
     // track. Tracks beyond the incoming set are cleared (empty clips) so
     // leftovers from a previously loaded project don't linger.
-    while (m_videoTracks.size() < videoTracks.size()) addVideoTrack();
-    while (m_audioTracks.size() < audioTracks.size()) addAudioTrack();
+    while (m_videoTracks.size() < videoTracks.size()) addVideoTrack(false);
+    while (m_audioTracks.size() < audioTracks.size()) addAudioTrack(false);
 
     for (int i = 0; i < m_videoTracks.size(); ++i) {
         if (!m_videoTracks[i]) continue;
@@ -11347,10 +12537,13 @@ void Timeline::restoreFromProject(const ProjectTrackClips &videoTracks,
     QJsonObject flags = videoTracks.trackFlagsSnapshot;
     if (flags.isEmpty())
         flags = audioTracks.trackFlagsSnapshot;
+    // Capture the loaded appearance in the load undo snapshot as well.
+    while (m_videoTracks.size() < videoTracks.size()) addVideoTrack(false);
+    while (m_audioTracks.size() < audioTracks.size()) addAudioTrack(false);
+    applyTrackFlagsFromJson(flags);
     restoreFromProject(static_cast<const QVector<QVector<ClipInfo>> &>(videoTracks),
                        static_cast<const QVector<QVector<ClipInfo>> &>(audioTracks),
                        playhead, markInVal, markOutVal, zoom);
-    applyTrackFlagsFromJson(flags);
 }
 
 // --- Timeline markers (Premiere Pro / DaVinci Resolve parity) ---

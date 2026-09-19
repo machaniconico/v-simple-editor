@@ -9,6 +9,8 @@
 #include <QThread>
 #include <QVarLengthArray>
 #include <QSet>
+#include <QJsonArray>
+#include <type_traits>
 #include <QStringList>
 #include <QWaitCondition>
 #include <QMediaDevices>
@@ -1097,425 +1099,9 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
         }
         const int copySamples = copyBytes / static_cast<int>(sizeof(int16_t));
 
-        // Per-track noise reduction (Audition Voice Isolation / Resolve
-        // Fairlight noise gate parity, simplified expander). Runs FIRST in
-        // the per-track chain so downstream EQ / compressor / reverb
-        // amplify the de-noised signal rather than the noise. Stereo-link
-        // detector with attack / release envelope; static curve compares
-        // the envelope (in dBFS) to a noise floor (auto-estimated as the
-        // 5th-percentile of a rolling window OR user-set manual floor) and
-        // applies a smooth ramp between full pass-through and reductionDb
-        // of attenuation across the user-configured threshold band.
-        // Disabled = bit-exact bypass (skip the entire DSP path; do not
-        // touch state).
-        QVarLengthArray<int16_t, 8192> scratchNr;
-        auto nrIt = (trackIdx >= 0)
-            ? m_mixer->m_trackNoiseReduction.constFind(trackIdx)
-            : m_mixer->m_trackNoiseReduction.constEnd();
-        if (nrIt != m_mixer->m_trackNoiseReduction.constEnd()
-            && nrIt.value().enabled
-            && nrIt.value().reductionDb > 1e-6) {
-            const auto &nr = nrIt.value();
-            const double fs       = static_cast<double>(AudioMixer::kSampleRateHz);
-            const double atkCoef  = std::exp(-1.0 / (nr.attackMs  * fs * 0.001));
-            const double relCoef  = std::exp(-1.0 / (nr.releaseMs * fs * 0.001));
-
-            auto stateIt = m_mixer->m_trackNoiseReductionState.find(trackIdx);
-            if (stateIt == m_mixer->m_trackNoiseReductionState.end()) {
-                stateIt = m_mixer->m_trackNoiseReductionState.insert(
-                    trackIdx, AudioMixer::NRState{});
-            }
-            AudioMixer::NRState &nrState = stateIt.value();
-            double env = nrState.env;
-
-            // Determine the active noise floor for this fragment. Auto
-            // mode pulls the 5th-percentile of the rolling envelope-dBFS
-            // history; manual mode uses the user-set value directly.
-            double floorDb = nr.manualFloorDb;
-            if (nr.autoFloor && !nrState.recentEnvs.isEmpty()) {
-                QVector<double> sorted = nrState.recentEnvs;
-                std::sort(sorted.begin(), sorted.end());
-                const int idx = qBound(0,
-                    static_cast<int>(sorted.size() * 0.05),
-                    sorted.size() - 1);
-                floorDb = sorted[idx];
-            }
-            nrState.estimatedFloorDb = floorDb;
-
-            // Threshold sets the band where we transition from full
-            // attenuation to full pass-through. We center the smooth
-            // ramp around (floorDb + thresholdDb) with a fixed 12 dB
-            // wide ramp width (perceived smoothness target — narrower
-            // pumps audibly, wider weakens the gating action).
-            const double thresholdAbsDb = floorDb + nr.thresholdDb;
-            constexpr double kRampWidthDb = 12.0;
-            const double rampLo = thresholdAbsDb - 0.5 * kRampWidthDb;
-            const double rampHi = thresholdAbsDb + 0.5 * kRampWidthDb;
-            const double minGainLin = std::pow(10.0, -nr.reductionDb / 20.0);
-
-            scratchNr.resize(copySamples);
-            // Per stereo frame: linked level → envelope → static curve.
-            for (int i = 0; i + 1 < copySamples; i += 2) {
-                const double xL = static_cast<double>(src[i]);
-                const double xR = static_cast<double>(src[i + 1]);
-                const double level = std::max(std::abs(xL), std::abs(xR));
-                if (level > env) {
-                    env = level + (env - level) * atkCoef;
-                } else {
-                    env = level + (env - level) * relCoef;
-                }
-
-                // dBFS reference 32768 = 0 dBFS.
-                const double envDb = 20.0
-                    * std::log10(std::max(env, 1e-9) / 32768.0);
-
-                double nrGain;
-                if (envDb >= rampHi) {
-                    nrGain = 1.0;            // signal loud enough — no NR
-                } else if (envDb <= rampLo) {
-                    nrGain = minGainLin;     // signal at/below floor — full NR
-                } else {
-                    // Smooth linear ramp in dB domain → exponential in linear.
-                    const double t = (envDb - rampLo) / kRampWidthDb;
-                    const double curveDb = -nr.reductionDb * (1.0 - t);
-                    nrGain = std::pow(10.0, curveDb / 20.0);
-                }
-
-                double yL = xL * nrGain;
-                double yR = xR * nrGain;
-                if (yL > 32767.0) yL = 32767.0;
-                else if (yL < -32768.0) yL = -32768.0;
-                if (yR > 32767.0) yR = 32767.0;
-                else if (yR < -32768.0) yR = -32768.0;
-                scratchNr[i]     = static_cast<int16_t>(yL);
-                scratchNr[i + 1] = static_cast<int16_t>(yR);
-            }
-            // Odd-sample tail (mono runt) — pass through unchanged.
-            for (int i = copySamples & ~1; i < copySamples; ++i) {
-                scratchNr[i] = src[i];
-            }
-            nrState.env = env;
-
-            // Append the post-fragment envelope-in-dBFS into the rolling
-            // window (used next fragment for auto-floor estimation). One
-            // entry per fragment keeps the percentile sort cheap; with
-            // kAutoFloorWindowSize=256 entries that's ~85 s of history
-            // worst case, ~5 s typical.
-            const double tailEnvDb = 20.0
-                * std::log10(std::max(env, 1e-9) / 32768.0);
-            if (nrState.recentEnvs.size() < AudioMixer::kAutoFloorWindowSize) {
-                nrState.recentEnvs.append(tailEnvDb);
-            } else {
-                if (nrState.recentEnvsHead < 0
-                    || nrState.recentEnvsHead >= AudioMixer::kAutoFloorWindowSize) {
-                    nrState.recentEnvsHead = 0;
-                }
-                nrState.recentEnvs[nrState.recentEnvsHead] = tailEnvDb;
-                nrState.recentEnvsHead =
-                    (nrState.recentEnvsHead + 1) % AudioMixer::kAutoFloorWindowSize;
-            }
-            src = scratchNr.data();
-        }
-
-        // Per-track 4-band parametric EQ cascade (Premiere/Audition parity).
-        // Runs BEFORE the legacy 3-band path and gain/preamp stages; signal
-        // flow: 4-band → 3-band → preamp → gain. When all 4 bands are flat
-        // or disabled, src points at the ring buffer unchanged (bit-exact
-        // bypass). When any band is active, scratchEq holds the filtered
-        // samples and src is rebound to it. Disabled bands skip math
-        // entirely AND skip history updates so re-enabling has no transient.
-        QVarLengthArray<int16_t, 8192> scratchEq;
-        auto coefsIt = (trackIdx >= 0)
-            ? m_mixer->m_trackEqCoefs.constFind(trackIdx)
-            : m_mixer->m_trackEqCoefs.constEnd();
-        if (coefsIt != m_mixer->m_trackEqCoefs.constEnd()) {
-            const auto &coefs = coefsIt.value();
-            const bool anyActive = coefs[0].active || coefs[1].active
-                                || coefs[2].active || coefs[3].active;
-            if (anyActive) {
-                auto histIt = m_mixer->m_trackEqHist.find(trackIdx);
-                if (histIt == m_mixer->m_trackEqHist.end()) {
-                    histIt = m_mixer->m_trackEqHist.insert(
-                        trackIdx, std::array<double, 16>{});
-                }
-                auto &hist = histIt.value();
-                scratchEq.resize(copySamples);
-                // hist layout per band b, channel ch: x1=hist[b*4+ch],
-                // x2=hist[b*4+2+ch], y1=hist[b*4+ch] ... actually we use
-                // 4 doubles per band (2 channels x x1/x2 OR y1/y2)? We need
-                // 4 doubles per band per channel for a direct-form-I biquad
-                // (x1, x2, y1, y2). But we only allocated 16 = 4 bands x
-                // 2 channels x 2 history samples — encode x1/y1 in pairs by
-                // using a transposed direct-form-II (z1, z2 per channel).
-                // hist[b*4 + ch*2 + 0] = z1[ch], hist[b*4 + ch*2 + 1] = z2[ch].
-                for (int i = 0; i < copySamples; ++i) {
-                    const int ch = i & 1;
-                    double s = static_cast<double>(src[i]);
-                    for (int b = 0; b < 4; ++b) {
-                        const auto &c = coefs[b];
-                        if (!c.active) continue; // skip math + history
-                        const int base = b * 4 + ch * 2;
-                        double &z1 = hist[base];
-                        double &z2 = hist[base + 1];
-                        // Transposed direct-form-II:
-                        //   y = b0*x + z1
-                        //   z1 = b1*x - a1*y + z2
-                        //   z2 = b2*x - a2*y
-                        const double y = c.b0 * s + z1;
-                        z1 = c.b1 * s - c.a1 * y + z2;
-                        z2 = c.b2 * s - c.a2 * y;
-                        s = y;
-                    }
-                    // Soft saturation to s16 range — high gain peak boost on
-                    // a band can exceed s16 momentarily. Clamp before re-cast
-                    // so the existing 3-band path receives a valid s16.
-                    if (s > 32767.0) s = 32767.0;
-                    else if (s < -32768.0) s = -32768.0;
-                    scratchEq[i] = static_cast<int16_t>(s);
-                }
-                src = scratchEq.data();
-            }
-        }
-
-        // Per-track feed-forward compressor / limiter (Audition / Resolve
-        // Fairlight parity). Runs AFTER the 4-band EQ stage and BEFORE the
-        // 3-band / preamp / gain stages so per-track meters and the master
-        // bus see post-compression peaks. Stereo-link detector,
-        // transposed envelope follower, Cherny-style soft knee.
-        // Disabled or 1:1 ratio = bit-exact bypass (skip envelope + curve).
-        QVarLengthArray<int16_t, 8192> scratchComp;
-        auto compIt = (trackIdx >= 0)
-            ? m_mixer->m_trackComp.constFind(trackIdx)
-            : m_mixer->m_trackComp.constEnd();
-        if (compIt != m_mixer->m_trackComp.constEnd()
-            && compIt.value().enabled
-            && compIt.value().ratio > 1.0001) {
-            const auto &comp = compIt.value();
-            // Limiter mode collapses to 1000:1 with a fixed 0.5 ms attack.
-            const bool limiter   = comp.ratio >= 20.0;
-            const double effRatio = limiter ? 1000.0 : comp.ratio;
-            const double effAttackMs = limiter ? 0.5 : comp.attackMs;
-
-            const double fs       = static_cast<double>(AudioMixer::kSampleRateHz);
-            const double atkCoef  = std::exp(-1.0 / (effAttackMs * fs * 0.001));
-            const double relCoef  = std::exp(-1.0 / (comp.releaseMs * fs * 0.001));
-            const double slope    = 1.0 - 1.0 / effRatio; // dB-per-dB above thresh
-            const double makeupLin = std::pow(10.0, comp.makeupDb / 20.0);
-            const double thresh   = comp.thresholdDb;
-            const double kneeHalf = 0.5 * comp.kneeDb;
-
-            auto stateIt = m_mixer->m_trackCompState.find(trackIdx);
-            if (stateIt == m_mixer->m_trackCompState.end()) {
-                stateIt = m_mixer->m_trackCompState.insert(
-                    trackIdx, AudioMixer::CompressorState{});
-            }
-            double env = stateIt.value().env;
-            double lastGrDb = stateIt.value().currentGrDb;
-
-            scratchComp.resize(copySamples);
-            // copySamples is interleaved L/R (stereo), so iterate by frame.
-            for (int i = 0; i + 1 < copySamples; i += 2) {
-                const double xL = static_cast<double>(src[i]);
-                const double xR = static_cast<double>(src[i + 1]);
-                const double level = std::max(std::abs(xL), std::abs(xR));
-                // Envelope follower: attack on rising, release on falling.
-                if (level > env) {
-                    env = level + (env - level) * atkCoef;
-                } else {
-                    env = level + (env - level) * relCoef;
-                }
-
-                // Static gain curve in dB. Reference 0 dBFS at 32768.
-                const double envDb = 20.0 * std::log10(std::max(env, 1e-9) / 32768.0);
-                double grDb = 0.0;
-                if (kneeHalf > 1e-6 && envDb > thresh - kneeHalf
-                    && envDb < thresh + kneeHalf) {
-                    // Soft knee: quadratic spline between (thresh - knee/2, 0)
-                    // and (thresh + knee/2, knee/2 * slope).
-                    const double x = envDb - (thresh - kneeHalf);
-                    grDb = slope * (x * x) / (2.0 * comp.kneeDb);
-                } else if (envDb > thresh + kneeHalf) {
-                    grDb = slope * (envDb - thresh);
-                }
-                lastGrDb = grDb;
-
-                const double gainLin = std::pow(10.0, (comp.makeupDb - grDb) / 20.0);
-                // Skip the makeup multiply collapse — combine into one mul.
-                (void)makeupLin;
-                double yL = xL * gainLin;
-                double yR = xR * gainLin;
-                if (yL > 32767.0) yL = 32767.0;
-                else if (yL < -32768.0) yL = -32768.0;
-                if (yR > 32767.0) yR = 32767.0;
-                else if (yR < -32768.0) yR = -32768.0;
-                scratchComp[i]     = static_cast<int16_t>(yL);
-                scratchComp[i + 1] = static_cast<int16_t>(yR);
-            }
-            // Odd-sample tail (mono runt) — extremely unlikely with stereo
-            // s16 fragments but guarded for safety.
-            for (int i = copySamples & ~1; i < copySamples; ++i) {
-                scratchComp[i] = src[i];
-            }
-            stateIt.value().env = env;
-            stateIt.value().currentGrDb = lastGrDb;
-            src = scratchComp.data();
-        }
-
-        // Per-track reverb (Audition / Fairlight Multitap parity, simplified
-        // Schroeder topology). Cascaded AFTER the compressor stage and BEFORE
-        // the legacy 3-band / preamp / gain stages so meters and the master
-        // bus see the post-reverb signal. Disabled or mixRatio=0 = bit-exact
-        // bypass (skip the entire DSP path; do not touch state).
-        //
-        // Signal flow per channel:
-        //   in → preDelay buffer → sum(comb1..4 with damped feedback)
-        //      → allpass1 → allpass2 → wet
-        //   out = dry * (1 - mix) + wet * mix
-        // Width is applied as a stereo cross-feed between the two channel
-        // wet outputs (0=mono, 100=fully decorrelated).
-        QVarLengthArray<int16_t, 8192> scratchRev;
-        auto revIt = (trackIdx >= 0)
-            ? m_mixer->m_trackReverb.constFind(trackIdx)
-            : m_mixer->m_trackReverb.constEnd();
-        if (revIt != m_mixer->m_trackReverb.constEnd()
-            && revIt.value().enabled
-            && revIt.value().mixRatio > 1e-6) {
-            const auto &rev = revIt.value();
-            // Comb / allpass delays: Freeverb defaults @ 44.1 kHz, scaled to
-            // current sample rate so reverb character is consistent across
-            // hardware. Stereo offset (~23 samples) decorrelates L/R combs.
-            constexpr int kCombDelays44k1[AudioMixer::kReverbCombCount]    = {1116, 1188, 1277, 1356};
-            constexpr int kCombStereoOffset44k1                = 23;
-            constexpr int kAllpassDelays44k1[AudioMixer::kReverbAllpassCount] = {556, 441};
-            const double srScale = static_cast<double>(AudioMixer::kSampleRateHz) / 44100.0;
-            auto scaleDelay = [srScale](int n) {
-                return std::max(1, static_cast<int>(std::lround(n * srScale)));
-            };
-
-            auto stateIt = m_mixer->m_trackReverbState.find(trackIdx);
-            if (stateIt == m_mixer->m_trackReverbState.end()) {
-                stateIt = m_mixer->m_trackReverbState.insert(
-                    trackIdx, AudioMixer::ReverbState{});
-            }
-            AudioMixer::ReverbState &st = stateIt.value();
-            // Lazy buffer initialization on first activation. Subsequent
-            // calls preserve buffer contents so live tweaks don't pop.
-            if (!st.initialized) {
-                for (int ch = 0; ch < AudioMixer::kChannels; ++ch) {
-                    for (int b = 0; b < AudioMixer::kReverbCombCount; ++b) {
-                        const int sz = scaleDelay(kCombDelays44k1[b]
-                            + (ch == 1 ? kCombStereoOffset44k1 : 0));
-                        st.comb[ch][b].assign(sz, 0.0f);
-                        st.combIdx[ch][b] = 0;
-                        st.combLP[ch][b]  = 0.0f;
-                    }
-                    for (int a = 0; a < AudioMixer::kReverbAllpassCount; ++a) {
-                        const int sz = scaleDelay(kAllpassDelays44k1[a]
-                            + (ch == 1 ? kCombStereoOffset44k1 / 2 : 0));
-                        st.ap[ch][a].assign(sz, 0.0f);
-                        st.apIdx[ch][a] = 0;
-                    }
-                    std::fill(st.preDelay[ch].begin(),
-                              st.preDelay[ch].end(), 0.0f);
-                    st.preDelayIdx[ch] = 0;
-                }
-                st.initialized = true;
-            }
-
-            // Pre-delay length in samples (clamped to buffer size).
-            const int preDelaySamples = std::clamp(
-                static_cast<int>(std::lround(rev.preDelayMs * AudioMixer::kSampleRateHz / 1000.0)),
-                0, AudioMixer::kReverbPreDelayMaxSamples - 1);
-            // Comb feedback gain: g = 0.7 * decay / standardDecay (1.0 sec).
-            // Clamped to <0.98 for unconditional stability across the comb
-            // bank (each comb's pole magnitude must stay inside the unit
-            // circle even with HF damping subtracting energy).
-            const float fbGain = static_cast<float>(
-                std::clamp(0.7 * rev.decaySeconds / 1.0, 0.0, 0.97));
-            // HF damping coefficient: 0 = no LP (bright tail), ~1 = heavy
-            // LP (dark tail). Implemented as one-pole LP inside the comb
-            // feedback path: y = (1-d)*x + d*y_prev.
-            const float damp = static_cast<float>(
-                std::clamp(rev.dampingHF / 100.0, 0.0, 0.95));
-            const float dampInv = 1.0f - damp;
-            constexpr float kAllpassGain = 0.5f;
-            const float mix = static_cast<float>(std::clamp(rev.mixRatio, 0.0, 1.0));
-            const float dry = 1.0f - mix;
-            // Width: 0 = mono sum (collapse), 100 = pass-through.
-            // We blend each channel's wet with the cross-channel wet.
-            const float width = static_cast<float>(
-                std::clamp(rev.widthPercent / 100.0, 0.0, 1.0));
-            const float crossFeed = 0.5f * (1.0f - width); // 0 at width=100, 0.5 at width=0
-            const float selfFeed  = 1.0f - crossFeed;
-
-            scratchRev.resize(copySamples);
-            // Process per stereo frame so we can apply width cross-feed.
-            for (int i = 0; i + 1 < copySamples; i += 2) {
-                float wet[AudioMixer::kChannels];
-                for (int ch = 0; ch < AudioMixer::kChannels; ++ch) {
-                    const float xin = static_cast<float>(src[i + ch]);
-                    // Pre-delay: write input, read N samples back.
-                    auto &pd = st.preDelay[ch];
-                    int &pdIdx = st.preDelayIdx[ch];
-                    pd[pdIdx] = xin;
-                    int readIdx = pdIdx - preDelaySamples;
-                    if (readIdx < 0) readIdx += AudioMixer::kReverbPreDelayMaxSamples;
-                    const float xPre = pd[readIdx];
-                    pdIdx = (pdIdx + 1) % AudioMixer::kReverbPreDelayMaxSamples;
-
-                    // Sum 4 parallel comb filters with damped feedback.
-                    float combSum = 0.0f;
-                    for (int b = 0; b < AudioMixer::kReverbCombCount; ++b) {
-                        auto &buf = st.comb[ch][b];
-                        const int sz = buf.size();
-                        if (sz <= 0) continue;
-                        int &idx = st.combIdx[ch][b];
-                        const float yDelayed = buf[idx];
-                        // One-pole LP on the feedback tap.
-                        float &lp = st.combLP[ch][b];
-                        lp = dampInv * yDelayed + damp * lp;
-                        buf[idx] = xPre + lp * fbGain;
-                        idx = (idx + 1) % sz;
-                        combSum += yDelayed;
-                    }
-                    // Normalise comb output (4 parallel paths).
-                    combSum *= 0.25f;
-
-                    // Series allpass filters (decorrelation).
-                    float ap = combSum;
-                    for (int a = 0; a < AudioMixer::kReverbAllpassCount; ++a) {
-                        auto &buf = st.ap[ch][a];
-                        const int sz = buf.size();
-                        if (sz <= 0) continue;
-                        int &idx = st.apIdx[ch][a];
-                        const float bufIn = ap + buf[idx] * kAllpassGain;
-                        const float yOut  = buf[idx] - bufIn * kAllpassGain;
-                        buf[idx] = bufIn;
-                        idx = (idx + 1) % sz;
-                        ap = yOut;
-                    }
-                    wet[ch] = ap;
-                }
-
-                // Stereo width cross-feed: collapse toward mono as width→0.
-                const float wetL = selfFeed * wet[0] + crossFeed * wet[1];
-                const float wetR = selfFeed * wet[1] + crossFeed * wet[0];
-
-                float yL = dry * static_cast<float>(src[i])     + mix * wetL;
-                float yR = dry * static_cast<float>(src[i + 1]) + mix * wetR;
-                if (yL > 32767.0f) yL = 32767.0f;
-                else if (yL < -32768.0f) yL = -32768.0f;
-                if (yR > 32767.0f) yR = 32767.0f;
-                else if (yR < -32768.0f) yR = -32768.0f;
-                scratchRev[i]     = static_cast<int16_t>(yL);
-                scratchRev[i + 1] = static_cast<int16_t>(yR);
-            }
-            // Odd-sample tail (mono runt) — pass through unchanged.
-            for (int i = copySamples & ~1; i < copySamples; ++i) {
-                scratchRev[i] = src[i];
-            }
-            src = scratchRev.data();
-        }
+        QVarLengthArray<int16_t, 8192> scratchTrackFx(copySamples);
+        m_mixer->processTrackFxLocked(trackIdx, src, scratchTrackFx.data(), copySamples);
+        src = scratchTrackFx.constData();
 
         // Per-sample 5ms gain ramp at fragment seam to suppress click at entry
         // transitions (volume / fade / mute step). Ramps from prevGain → gain over
@@ -1672,6 +1258,10 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
             e->ringHead = 0;
         }
     }
+
+    // Master EQ sees the sum of all tracks, before normalization/compression.
+    if (anyMixed)
+        m_mixer->processMasterEqLocked(accum.data(), frameCount);
 
     // Master loudness normalizer (FCP-style). Applies after sum-mix, before
     // s16 clamp. amount=0 bypasses entirely; amount=1 fully follows the
@@ -2574,6 +2164,9 @@ void AudioMixer::seekTo(int64_t timelineUs) {
         // clamp bypass. Both fixes are required for a clean post-seek start.
         {
             QMutexLocker lock(&m_controlMutex);
+            for (auto it = m_trackFxProcessors.begin(); it != m_trackFxProcessors.end(); ++it)
+                it.value().resetFeedback();
+            m_masterEqFilter.reset();
             for (auto it = m_trackReverbState.begin();
                  it != m_trackReverbState.end(); ++it) {
                 ReverbState &st = it.value();
@@ -2801,6 +2394,143 @@ AudioMixer::EqBandCoefsParam computeEqBand(const AudioMixer::EqBand &band,
 }
 } // namespace
 
+void AudioMixer::MasterEqFilter::setEq(const EqSettings &eq)
+{
+    m_coefs[0] = computeEqBand(eq.low, 0, kSampleRateHz);
+    m_coefs[1] = computeEqBand(eq.lowMid, 1, kSampleRateHz);
+    m_coefs[2] = computeEqBand(eq.highMid, 2, kSampleRateHz);
+    m_coefs[3] = computeEqBand(eq.high, 3, kSampleRateHz);
+}
+
+void AudioMixer::MasterEqFilter::reset()
+{
+    m_history.fill(0.0);
+}
+
+double AudioMixer::MasterEqFilter::processSample(double sample, int channel)
+{
+    for (int band = 0; band < 4; ++band) {
+        const auto &c = m_coefs[band];
+        if (!c.active) continue;
+        const int base = band * 4 + channel * 2;
+        double &z1 = m_history[base];
+        double &z2 = m_history[base + 1];
+        const double output = c.b0 * sample + z1;
+        z1 = c.b1 * sample - c.a1 * output + z2;
+        z2 = c.b2 * sample - c.a2 * output;
+        sample = output;
+    }
+    return sample;
+}
+
+void AudioMixer::MasterEqFilter::process(float *samples, int frames)
+{
+    for (int frame = 0; frame < frames; ++frame)
+        for (int ch = 0; ch < kChannels; ++ch) {
+            const int i = frame * kChannels + ch;
+            samples[i] = static_cast<float>(processSample(samples[i], ch));
+        }
+}
+
+void AudioMixer::MasterEqFilter::process(int32_t *samples, int frames)
+{
+    for (int frame = 0; frame < frames; ++frame)
+        for (int ch = 0; ch < kChannels; ++ch) {
+            const int i = frame * kChannels + ch;
+            samples[i] = static_cast<int32_t>(processSample(samples[i], ch));
+        }
+}
+
+void AudioMixer::clearTrackFx()
+{
+    QMutexLocker lock(&m_controlMutex);
+    m_trackFxChains.clear();
+    m_trackFxProcessors.clear();
+    m_masterFxChain = trackfx::Chain{};
+    m_masterEqFilter.setEq(EqSettings{});
+    m_masterEqFilter.reset();
+    m_trackEq.clear();
+    m_trackEqCoefs.clear();
+    m_trackEqHist.clear();
+    m_trackComp.clear();
+    m_trackCompState.clear();
+    m_trackReverb.clear();
+    m_trackReverbState.clear();
+    m_trackNoiseReduction.clear();
+    m_trackNoiseReductionState.clear();
+    for (auto &state : m_trackStates) {
+        state.eq = AudioEQConfig{};
+        state.eqEnabled = false;
+        state.eqCoeffs = {};
+        state.z = {};
+        state.eqCache = {};
+    }
+}
+
+void AudioMixer::setTrackChain(int trackId, const trackfx::Chain &chain)
+{
+    if (trackId < 0 || trackId >= kMaxAudioTracks) return;
+    // Restore both independent enable layers atomically. Panel setters infer
+    // gates from settings and would lose disabled-but-configured stages.
+    const auto restored = trackfx::Chain::fromJson(chain.toJson());
+    std::array<EqBandCoefsParam, 4> coefs{};
+    coefs[0] = computeEqBand(restored.eq.low, 0, kSampleRateHz);
+    coefs[1] = computeEqBand(restored.eq.lowMid, 1, kSampleRateHz);
+    coefs[2] = computeEqBand(restored.eq.highMid, 2, kSampleRateHz);
+    coefs[3] = computeEqBand(restored.eq.high, 3, kSampleRateHz);
+    QMutexLocker lock(&m_controlMutex);
+    m_trackFxChains[trackId] = restored;
+    m_trackFxProcessors[trackId].setChain(restored);
+    m_trackEq[trackId] = restored.eq;
+    m_trackEqCoefs[trackId] = coefs;
+    m_trackComp[trackId] = restored.comp;
+    m_trackReverb[trackId] = restored.reverb;
+    m_trackNoiseReduction[trackId] = restored.nr;
+}
+
+trackfx::Chain AudioMixer::masterChain() const
+{
+    QMutexLocker lock(&m_controlMutex);
+    return m_masterFxChain;
+}
+
+void AudioMixer::setMasterEq(const EqSettings &eq, bool enabled)
+{
+    QMutexLocker lock(&m_controlMutex);
+    m_masterFxChain = trackfx::Chain{}; // Only EQ is supported on this bus.
+    m_masterFxChain.eq = eq;
+    m_masterFxChain.eqEnabled = enabled;
+    m_masterEqFilter.setEq(eq);
+}
+
+void AudioMixer::processMasterEqLocked(int32_t *samples, int frames)
+{
+    if (m_masterEqBypassForTest || !m_masterFxChain.eqEnabled) return;
+    ++m_masterEqProcessCalls;
+    m_masterEqFilter.process(samples, frames);
+}
+
+void AudioMixer::setMasterEqBypassForTest(bool bypass)
+{
+    QMutexLocker lock(&m_controlMutex);
+    m_masterEqBypassForTest = bypass;
+    m_masterEqProcessCalls = 0;
+    m_masterEqFilter.reset();
+}
+
+quint64 AudioMixer::masterEqProcessCallsForTest() const
+{
+    QMutexLocker lock(&m_controlMutex);
+    return m_masterEqProcessCalls;
+}
+
+void AudioMixer::processMasterEqForTest(int32_t *samples, int frames)
+{
+    if (!samples || frames <= 0 || frames > std::numeric_limits<int>::max() / kChannels) return;
+    QMutexLocker lock(&m_controlMutex);
+    processMasterEqLocked(samples, frames);
+}
+
 void AudioMixer::setEqForTrack(int trackId, const EqSettings &eq) {
     if (trackId < 0 || trackId > kMaxAudioTracks) return;
     constexpr double fs = kSampleRateHz;
@@ -2814,6 +2544,10 @@ void AudioMixer::setEqForTrack(int trackId, const EqSettings &eq) {
 
     QMutexLocker lock(&m_controlMutex);
     m_trackEq[trackId] = eq;
+    auto &chain = m_trackFxChains[trackId];
+    chain.eq = eq;
+    chain.eqEnabled = true;
+    m_trackFxProcessors[trackId].setChain(chain);
     // Atomic replace: insert overwrites the previous EqSettings/coefs in a
     // single hash slot under the mutex held by readData, so in-flight audio
     // sees either the old or new coefs but never a torn struct. History is
@@ -2847,6 +2581,10 @@ void AudioMixer::setCompressorForTrack(int trackId, const CompressorSettings &c)
 
     QMutexLocker lock(&m_controlMutex);
     m_trackComp[trackId] = clamped;
+    auto &chain = m_trackFxChains[trackId];
+    chain.comp = clamped;
+    chain.compEnabled = clamped.enabled;
+    m_trackFxProcessors[trackId].setChain(chain);
     // Initialise state on first touch; subsequent setCompressorForTrack
     // calls leave envelope untouched so live tweaking is glitch-free.
     if (!m_trackCompState.contains(trackId))
@@ -2860,6 +2598,10 @@ AudioMixer::CompressorSettings AudioMixer::compressorForTrack(int trackId) const
 
 double AudioMixer::currentGainReductionDb(int trackId) const {
     QMutexLocker lock(&m_controlMutex);
+    if (!m_legacyTrackFxPath) {
+        const auto p = m_trackFxProcessors.constFind(trackId);
+        return p == m_trackFxProcessors.constEnd() ? 0.0 : p.value().currentGainReductionDb();
+    }
     auto it = m_trackCompState.constFind(trackId);
     if (it == m_trackCompState.constEnd()) return 0.0;
     return it.value().currentGrDb;
@@ -2885,6 +2627,10 @@ void AudioMixer::setReverbForTrack(int trackId, const ReverbSettings &r) {
 
     QMutexLocker lock(&m_controlMutex);
     m_trackReverb[trackId] = clamped;
+    auto &chain = m_trackFxChains[trackId];
+    chain.reverb = clamped;
+    chain.reverbEnabled = clamped.enabled;
+    m_trackFxProcessors[trackId].setChain(chain);
     // Initialise state on first touch; subsequent setReverbForTrack calls
     // leave buffers untouched so live tweaking is glitch-free.
     if (!m_trackReverbState.contains(trackId))
@@ -2918,6 +2664,10 @@ void AudioMixer::setNoiseReductionForTrack(int trackId,
 
     QMutexLocker lock(&m_controlMutex);
     m_trackNoiseReduction[trackId] = clamped;
+    auto &chain = m_trackFxChains[trackId];
+    chain.nr = clamped;
+    chain.nrEnabled = clamped.enabled;
+    m_trackFxProcessors[trackId].setChain(chain);
     // Initialise state on first touch; subsequent setNoiseReductionForTrack
     // calls leave envelope + history untouched so live tweaking is
     // glitch-free.
@@ -2933,6 +2683,10 @@ AudioMixer::noiseReductionForTrack(int trackId) const {
 
 double AudioMixer::estimatedNoiseFloorDb(int trackId) const {
     QMutexLocker lock(&m_controlMutex);
+    if (!m_legacyTrackFxPath) {
+        const auto p = m_trackFxProcessors.constFind(trackId);
+        return p == m_trackFxProcessors.constEnd() ? -60.0 : p.value().estimatedNoiseFloorDb();
+    }
     auto it = m_trackNoiseReductionState.constFind(trackId);
     if (it == m_trackNoiseReductionState.constEnd()) return -60.0;
     return it.value().estimatedFloorDb;
@@ -3605,4 +3359,584 @@ int64_t AudioMixer::audibleClockUs() const {
     const int64_t cursor = m_writeCursorUs.load(std::memory_order_acquire);
     const int64_t lag = m_audibleLagUs.load(std::memory_order_acquire);
     return qMax<int64_t>(0, cursor - lag);
+}
+
+// Retained legacy DSP arithmetic for the Wave 5 same-binary playback oracle.
+// Called under m_controlMutex by readData and the headless selftest entry.
+void AudioMixer::processTrackFxLocked(int trackIdx, const int16_t *src,
+                                     int16_t *output, int copySamples)
+{
+    if (!m_legacyTrackFxPath) {
+        auto it = m_trackFxProcessors.find(trackIdx);
+        if (trackIdx >= 0 && it != m_trackFxProcessors.end()) {
+            QVarLengthArray<float, 8192> samples(copySamples);
+            for (int i = 0; i < copySamples; ++i) samples[i] = src[i] / 32768.0f;
+            ++m_trackFxProcessCalls;
+            it.value().process(samples.data(), copySamples / kChannels);
+            for (int i = 0; i < copySamples; ++i)
+                output[i] = static_cast<int16_t>(samples[i] * 32768.0f);
+        } else {
+            if (src != output) std::copy_n(src, copySamples, output);
+        }
+        return;
+    }
+    // Per-track noise reduction (Audition Voice Isolation / Resolve
+    // Fairlight noise gate parity, simplified expander). Runs FIRST in
+    // the per-track chain so downstream EQ / compressor / reverb
+    // amplify the de-noised signal rather than the noise. Stereo-link
+    // detector with attack / release envelope; static curve compares
+    // the envelope (in dBFS) to a noise floor (auto-estimated as the
+    // 5th-percentile of a rolling window OR user-set manual floor) and
+    // applies a smooth ramp between full pass-through and reductionDb
+    // of attenuation across the user-configured threshold band.
+    // Disabled = bit-exact bypass (skip the entire DSP path; do not
+    // touch state).
+    QVarLengthArray<int16_t, 8192> scratchNr;
+    auto nrIt = (trackIdx >= 0)
+        ? m_trackNoiseReduction.constFind(trackIdx)
+        : m_trackNoiseReduction.constEnd();
+    if (nrIt != m_trackNoiseReduction.constEnd()
+        && nrIt.value().enabled
+        && nrIt.value().reductionDb > 1e-6) {
+        const auto &nr = nrIt.value();
+        const double fs       = static_cast<double>(AudioMixer::kSampleRateHz);
+        const double atkCoef  = std::exp(-1.0 / (nr.attackMs  * fs * 0.001));
+        const double relCoef  = std::exp(-1.0 / (nr.releaseMs * fs * 0.001));
+
+        auto stateIt = m_trackNoiseReductionState.find(trackIdx);
+        if (stateIt == m_trackNoiseReductionState.end()) {
+            stateIt = m_trackNoiseReductionState.insert(
+                trackIdx, AudioMixer::NRState{});
+        }
+        AudioMixer::NRState &nrState = stateIt.value();
+        double env = nrState.env;
+
+        // Determine the active noise floor for this fragment. Auto
+        // mode pulls the 5th-percentile of the rolling envelope-dBFS
+        // history; manual mode uses the user-set value directly.
+        double floorDb = nr.manualFloorDb;
+        if (nr.autoFloor && !nrState.recentEnvs.isEmpty()) {
+            QVector<double> sorted = nrState.recentEnvs;
+            std::sort(sorted.begin(), sorted.end());
+            const int idx = qBound(0,
+                static_cast<int>(sorted.size() * 0.05),
+                sorted.size() - 1);
+            floorDb = sorted[idx];
+        }
+        nrState.estimatedFloorDb = floorDb;
+
+        // Threshold sets the band where we transition from full
+        // attenuation to full pass-through. We center the smooth
+        // ramp around (floorDb + thresholdDb) with a fixed 12 dB
+        // wide ramp width (perceived smoothness target — narrower
+        // pumps audibly, wider weakens the gating action).
+        const double thresholdAbsDb = floorDb + nr.thresholdDb;
+        constexpr double kRampWidthDb = 12.0;
+        const double rampLo = thresholdAbsDb - 0.5 * kRampWidthDb;
+        const double rampHi = thresholdAbsDb + 0.5 * kRampWidthDb;
+        const double minGainLin = std::pow(10.0, -nr.reductionDb / 20.0);
+
+        scratchNr.resize(copySamples);
+        // Per stereo frame: linked level → envelope → static curve.
+        for (int i = 0; i + 1 < copySamples; i += 2) {
+            const double xL = static_cast<double>(src[i]);
+            const double xR = static_cast<double>(src[i + 1]);
+            const double level = std::max(std::abs(xL), std::abs(xR));
+            if (level > env) {
+                env = level + (env - level) * atkCoef;
+            } else {
+                env = level + (env - level) * relCoef;
+            }
+
+            // dBFS reference 32768 = 0 dBFS.
+            const double envDb = 20.0
+                * std::log10(std::max(env, 1e-9) / 32768.0);
+
+            double nrGain;
+            if (envDb >= rampHi) {
+                nrGain = 1.0;            // signal loud enough — no NR
+            } else if (envDb <= rampLo) {
+                nrGain = minGainLin;     // signal at/below floor — full NR
+            } else {
+                // Smooth linear ramp in dB domain → exponential in linear.
+                const double t = (envDb - rampLo) / kRampWidthDb;
+                const double curveDb = -nr.reductionDb * (1.0 - t);
+                nrGain = std::pow(10.0, curveDb / 20.0);
+            }
+
+            double yL = xL * nrGain;
+            double yR = xR * nrGain;
+            if (yL > 32767.0) yL = 32767.0;
+            else if (yL < -32768.0) yL = -32768.0;
+            if (yR > 32767.0) yR = 32767.0;
+            else if (yR < -32768.0) yR = -32768.0;
+            scratchNr[i]     = static_cast<int16_t>(yL);
+            scratchNr[i + 1] = static_cast<int16_t>(yR);
+        }
+        // Odd-sample tail (mono runt) — pass through unchanged.
+        for (int i = copySamples & ~1; i < copySamples; ++i) {
+            scratchNr[i] = src[i];
+        }
+        nrState.env = env;
+
+        // Append the post-fragment envelope-in-dBFS into the rolling
+        // window (used next fragment for auto-floor estimation). One
+        // entry per fragment keeps the percentile sort cheap; with
+        // kAutoFloorWindowSize=256 entries that's ~85 s of history
+        // worst case, ~5 s typical.
+        const double tailEnvDb = 20.0
+            * std::log10(std::max(env, 1e-9) / 32768.0);
+        if (nrState.recentEnvs.size() < AudioMixer::kAutoFloorWindowSize) {
+            nrState.recentEnvs.append(tailEnvDb);
+        } else {
+            if (nrState.recentEnvsHead < 0
+                || nrState.recentEnvsHead >= AudioMixer::kAutoFloorWindowSize) {
+                nrState.recentEnvsHead = 0;
+            }
+            nrState.recentEnvs[nrState.recentEnvsHead] = tailEnvDb;
+            nrState.recentEnvsHead =
+                (nrState.recentEnvsHead + 1) % AudioMixer::kAutoFloorWindowSize;
+        }
+        src = scratchNr.data();
+    }
+
+    // Per-track 4-band parametric EQ cascade (Premiere/Audition parity).
+    // Runs BEFORE the legacy 3-band path and gain/preamp stages; signal
+    // flow: 4-band → 3-band → preamp → gain. When all 4 bands are flat
+    // or disabled, src points at the ring buffer unchanged (bit-exact
+    // bypass). When any band is active, scratchEq holds the filtered
+    // samples and src is rebound to it. Disabled bands skip math
+    // entirely AND skip history updates so re-enabling has no transient.
+    QVarLengthArray<int16_t, 8192> scratchEq;
+    auto coefsIt = (trackIdx >= 0)
+        ? m_trackEqCoefs.constFind(trackIdx)
+        : m_trackEqCoefs.constEnd();
+    if (coefsIt != m_trackEqCoefs.constEnd()) {
+        const auto &coefs = coefsIt.value();
+        const bool anyActive = coefs[0].active || coefs[1].active
+                            || coefs[2].active || coefs[3].active;
+        if (anyActive) {
+            auto histIt = m_trackEqHist.find(trackIdx);
+            if (histIt == m_trackEqHist.end()) {
+                histIt = m_trackEqHist.insert(
+                    trackIdx, std::array<double, 16>{});
+            }
+            auto &hist = histIt.value();
+            scratchEq.resize(copySamples);
+            // hist layout per band b, channel ch: x1=hist[b*4+ch],
+            // x2=hist[b*4+2+ch], y1=hist[b*4+ch] ... actually we use
+            // 4 doubles per band (2 channels x x1/x2 OR y1/y2)? We need
+            // 4 doubles per band per channel for a direct-form-I biquad
+            // (x1, x2, y1, y2). But we only allocated 16 = 4 bands x
+            // 2 channels x 2 history samples — encode x1/y1 in pairs by
+            // using a transposed direct-form-II (z1, z2 per channel).
+            // hist[b*4 + ch*2 + 0] = z1[ch], hist[b*4 + ch*2 + 1] = z2[ch].
+            for (int i = 0; i < copySamples; ++i) {
+                const int ch = i & 1;
+                double s = static_cast<double>(src[i]);
+                for (int b = 0; b < 4; ++b) {
+                    const auto &c = coefs[b];
+                    if (!c.active) continue; // skip math + history
+                    const int base = b * 4 + ch * 2;
+                    double &z1 = hist[base];
+                    double &z2 = hist[base + 1];
+                    // Transposed direct-form-II:
+                    //   y = b0*x + z1
+                    //   z1 = b1*x - a1*y + z2
+                    //   z2 = b2*x - a2*y
+                    const double y = c.b0 * s + z1;
+                    z1 = c.b1 * s - c.a1 * y + z2;
+                    z2 = c.b2 * s - c.a2 * y;
+                    s = y;
+                }
+                // Soft saturation to s16 range — high gain peak boost on
+                // a band can exceed s16 momentarily. Clamp before re-cast
+                // so the existing 3-band path receives a valid s16.
+                if (s > 32767.0) s = 32767.0;
+                else if (s < -32768.0) s = -32768.0;
+                scratchEq[i] = static_cast<int16_t>(s);
+            }
+            src = scratchEq.data();
+        }
+    }
+
+    // Per-track feed-forward compressor / limiter (Audition / Resolve
+    // Fairlight parity). Runs AFTER the 4-band EQ stage and BEFORE the
+    // 3-band / preamp / gain stages so per-track meters and the master
+    // bus see post-compression peaks. Stereo-link detector,
+    // transposed envelope follower, Cherny-style soft knee.
+    // Disabled or 1:1 ratio = bit-exact bypass (skip envelope + curve).
+    QVarLengthArray<int16_t, 8192> scratchComp;
+    auto compIt = (trackIdx >= 0)
+        ? m_trackComp.constFind(trackIdx)
+        : m_trackComp.constEnd();
+    if (compIt != m_trackComp.constEnd()
+        && compIt.value().enabled
+        && compIt.value().ratio > 1.0001) {
+        const auto &comp = compIt.value();
+        // Limiter mode collapses to 1000:1 with a fixed 0.5 ms attack.
+        const bool limiter   = comp.ratio >= 20.0;
+        const double effRatio = limiter ? 1000.0 : comp.ratio;
+        const double effAttackMs = limiter ? 0.5 : comp.attackMs;
+
+        const double fs       = static_cast<double>(AudioMixer::kSampleRateHz);
+        const double atkCoef  = std::exp(-1.0 / (effAttackMs * fs * 0.001));
+        const double relCoef  = std::exp(-1.0 / (comp.releaseMs * fs * 0.001));
+        const double slope    = 1.0 - 1.0 / effRatio; // dB-per-dB above thresh
+        const double makeupLin = std::pow(10.0, comp.makeupDb / 20.0);
+        const double thresh   = comp.thresholdDb;
+        const double kneeHalf = 0.5 * comp.kneeDb;
+
+        auto stateIt = m_trackCompState.find(trackIdx);
+        if (stateIt == m_trackCompState.end()) {
+            stateIt = m_trackCompState.insert(
+                trackIdx, AudioMixer::CompressorState{});
+        }
+        double env = stateIt.value().env;
+        double lastGrDb = stateIt.value().currentGrDb;
+
+        scratchComp.resize(copySamples);
+        // copySamples is interleaved L/R (stereo), so iterate by frame.
+        for (int i = 0; i + 1 < copySamples; i += 2) {
+            const double xL = static_cast<double>(src[i]);
+            const double xR = static_cast<double>(src[i + 1]);
+            const double level = std::max(std::abs(xL), std::abs(xR));
+            // Envelope follower: attack on rising, release on falling.
+            if (level > env) {
+                env = level + (env - level) * atkCoef;
+            } else {
+                env = level + (env - level) * relCoef;
+            }
+
+            // Static gain curve in dB. Reference 0 dBFS at 32768.
+            const double envDb = 20.0 * std::log10(std::max(env, 1e-9) / 32768.0);
+            double grDb = 0.0;
+            if (kneeHalf > 1e-6 && envDb > thresh - kneeHalf
+                && envDb < thresh + kneeHalf) {
+                // Soft knee: quadratic spline between (thresh - knee/2, 0)
+                // and (thresh + knee/2, knee/2 * slope).
+                const double x = envDb - (thresh - kneeHalf);
+                grDb = slope * (x * x) / (2.0 * comp.kneeDb);
+            } else if (envDb > thresh + kneeHalf) {
+                grDb = slope * (envDb - thresh);
+            }
+            lastGrDb = grDb;
+
+            const double gainLin = std::pow(10.0, (comp.makeupDb - grDb) / 20.0);
+            // Skip the makeup multiply collapse — combine into one mul.
+            (void)makeupLin;
+            double yL = xL * gainLin;
+            double yR = xR * gainLin;
+            if (yL > 32767.0) yL = 32767.0;
+            else if (yL < -32768.0) yL = -32768.0;
+            if (yR > 32767.0) yR = 32767.0;
+            else if (yR < -32768.0) yR = -32768.0;
+            scratchComp[i]     = static_cast<int16_t>(yL);
+            scratchComp[i + 1] = static_cast<int16_t>(yR);
+        }
+        // Odd-sample tail (mono runt) — extremely unlikely with stereo
+        // s16 fragments but guarded for safety.
+        for (int i = copySamples & ~1; i < copySamples; ++i) {
+            scratchComp[i] = src[i];
+        }
+        stateIt.value().env = env;
+        stateIt.value().currentGrDb = lastGrDb;
+        src = scratchComp.data();
+    }
+
+    // Per-track reverb (Audition / Fairlight Multitap parity, simplified
+    // Schroeder topology). Cascaded AFTER the compressor stage and BEFORE
+    // the legacy 3-band / preamp / gain stages so meters and the master
+    // bus see the post-reverb signal. Disabled or mixRatio=0 = bit-exact
+    // bypass (skip the entire DSP path; do not touch state).
+    //
+    // Signal flow per channel:
+    //   in → preDelay buffer → sum(comb1..4 with damped feedback)
+    //      → allpass1 → allpass2 → wet
+    //   out = dry * (1 - mix) + wet * mix
+    // Width is applied as a stereo cross-feed between the two channel
+    // wet outputs (0=mono, 100=fully decorrelated).
+    QVarLengthArray<int16_t, 8192> scratchRev;
+    auto revIt = (trackIdx >= 0)
+        ? m_trackReverb.constFind(trackIdx)
+        : m_trackReverb.constEnd();
+    if (revIt != m_trackReverb.constEnd()
+        && revIt.value().enabled
+        && revIt.value().mixRatio > 1e-6) {
+        const auto &rev = revIt.value();
+        // Comb / allpass delays: Freeverb defaults @ 44.1 kHz, scaled to
+        // current sample rate so reverb character is consistent across
+        // hardware. Stereo offset (~23 samples) decorrelates L/R combs.
+        constexpr int kCombDelays44k1[AudioMixer::kReverbCombCount]    = {1116, 1188, 1277, 1356};
+        constexpr int kCombStereoOffset44k1                = 23;
+        constexpr int kAllpassDelays44k1[AudioMixer::kReverbAllpassCount] = {556, 441};
+        const double srScale = static_cast<double>(AudioMixer::kSampleRateHz) / 44100.0;
+        auto scaleDelay = [srScale](int n) {
+            return std::max(1, static_cast<int>(std::lround(n * srScale)));
+        };
+
+        auto stateIt = m_trackReverbState.find(trackIdx);
+        if (stateIt == m_trackReverbState.end()) {
+            stateIt = m_trackReverbState.insert(
+                trackIdx, AudioMixer::ReverbState{});
+        }
+        AudioMixer::ReverbState &st = stateIt.value();
+        // Lazy buffer initialization on first activation. Subsequent
+        // calls preserve buffer contents so live tweaks don't pop.
+        if (!st.initialized) {
+            for (int ch = 0; ch < AudioMixer::kChannels; ++ch) {
+                for (int b = 0; b < AudioMixer::kReverbCombCount; ++b) {
+                    const int sz = scaleDelay(kCombDelays44k1[b]
+                        + (ch == 1 ? kCombStereoOffset44k1 : 0));
+                    st.comb[ch][b].assign(sz, 0.0f);
+                    st.combIdx[ch][b] = 0;
+                    st.combLP[ch][b]  = 0.0f;
+                }
+                for (int a = 0; a < AudioMixer::kReverbAllpassCount; ++a) {
+                    const int sz = scaleDelay(kAllpassDelays44k1[a]
+                        + (ch == 1 ? kCombStereoOffset44k1 / 2 : 0));
+                    st.ap[ch][a].assign(sz, 0.0f);
+                    st.apIdx[ch][a] = 0;
+                }
+                std::fill(st.preDelay[ch].begin(),
+                          st.preDelay[ch].end(), 0.0f);
+                st.preDelayIdx[ch] = 0;
+            }
+            st.initialized = true;
+        }
+
+        // Pre-delay length in samples (clamped to buffer size).
+        const int preDelaySamples = std::clamp(
+            static_cast<int>(std::lround(rev.preDelayMs * AudioMixer::kSampleRateHz / 1000.0)),
+            0, AudioMixer::kReverbPreDelayMaxSamples - 1);
+        // Comb feedback gain: g = 0.7 * decay / standardDecay (1.0 sec).
+        // Clamped to <0.98 for unconditional stability across the comb
+        // bank (each comb's pole magnitude must stay inside the unit
+        // circle even with HF damping subtracting energy).
+        const float fbGain = static_cast<float>(
+            std::clamp(0.7 * rev.decaySeconds / 1.0, 0.0, 0.97));
+        // HF damping coefficient: 0 = no LP (bright tail), ~1 = heavy
+        // LP (dark tail). Implemented as one-pole LP inside the comb
+        // feedback path: y = (1-d)*x + d*y_prev.
+        const float damp = static_cast<float>(
+            std::clamp(rev.dampingHF / 100.0, 0.0, 0.95));
+        const float dampInv = 1.0f - damp;
+        constexpr float kAllpassGain = 0.5f;
+        const float mix = static_cast<float>(std::clamp(rev.mixRatio, 0.0, 1.0));
+        const float dry = 1.0f - mix;
+        // Width: 0 = mono sum (collapse), 100 = pass-through.
+        // We blend each channel's wet with the cross-channel wet.
+        const float width = static_cast<float>(
+            std::clamp(rev.widthPercent / 100.0, 0.0, 1.0));
+        const float crossFeed = 0.5f * (1.0f - width); // 0 at width=100, 0.5 at width=0
+        const float selfFeed  = 1.0f - crossFeed;
+
+        scratchRev.resize(copySamples);
+        // Process per stereo frame so we can apply width cross-feed.
+        for (int i = 0; i + 1 < copySamples; i += 2) {
+            float wet[AudioMixer::kChannels];
+            for (int ch = 0; ch < AudioMixer::kChannels; ++ch) {
+                const float xin = static_cast<float>(src[i + ch]);
+                // Pre-delay: write input, read N samples back.
+                auto &pd = st.preDelay[ch];
+                int &pdIdx = st.preDelayIdx[ch];
+                pd[pdIdx] = xin;
+                int readIdx = pdIdx - preDelaySamples;
+                if (readIdx < 0) readIdx += AudioMixer::kReverbPreDelayMaxSamples;
+                const float xPre = pd[readIdx];
+                pdIdx = (pdIdx + 1) % AudioMixer::kReverbPreDelayMaxSamples;
+
+                // Sum 4 parallel comb filters with damped feedback.
+                float combSum = 0.0f;
+                for (int b = 0; b < AudioMixer::kReverbCombCount; ++b) {
+                    auto &buf = st.comb[ch][b];
+                    const int sz = buf.size();
+                    if (sz <= 0) continue;
+                    int &idx = st.combIdx[ch][b];
+                    const float yDelayed = buf[idx];
+                    // One-pole LP on the feedback tap.
+                    float &lp = st.combLP[ch][b];
+                    lp = dampInv * yDelayed + damp * lp;
+                    buf[idx] = xPre + lp * fbGain;
+                    idx = (idx + 1) % sz;
+                    combSum += yDelayed;
+                }
+                // Normalise comb output (4 parallel paths).
+                combSum *= 0.25f;
+
+                // Series allpass filters (decorrelation).
+                float ap = combSum;
+                for (int a = 0; a < AudioMixer::kReverbAllpassCount; ++a) {
+                    auto &buf = st.ap[ch][a];
+                    const int sz = buf.size();
+                    if (sz <= 0) continue;
+                    int &idx = st.apIdx[ch][a];
+                    const float bufIn = ap + buf[idx] * kAllpassGain;
+                    const float yOut  = buf[idx] - bufIn * kAllpassGain;
+                    buf[idx] = bufIn;
+                    idx = (idx + 1) % sz;
+                    ap = yOut;
+                }
+                wet[ch] = ap;
+            }
+
+            // Stereo width cross-feed: collapse toward mono as width→0.
+            const float wetL = selfFeed * wet[0] + crossFeed * wet[1];
+            const float wetR = selfFeed * wet[1] + crossFeed * wet[0];
+
+            float yL = dry * static_cast<float>(src[i])     + mix * wetL;
+            float yR = dry * static_cast<float>(src[i + 1]) + mix * wetR;
+            if (yL > 32767.0f) yL = 32767.0f;
+            else if (yL < -32768.0f) yL = -32768.0f;
+            if (yR > 32767.0f) yR = 32767.0f;
+            else if (yR < -32768.0f) yR = -32768.0f;
+            scratchRev[i]     = static_cast<int16_t>(yL);
+            scratchRev[i + 1] = static_cast<int16_t>(yR);
+        }
+        // Odd-sample tail (mono runt) — pass through unchanged.
+        for (int i = copySamples & ~1; i < copySamples; ++i) {
+            scratchRev[i] = src[i];
+        }
+        src = scratchRev.data();
+    }
+
+    if (src != output) std::copy_n(src, copySamples, output);
+}
+
+void AudioMixer::setLegacyTrackFxPathForTest(bool legacy)
+{
+    QMutexLocker lock(&m_controlMutex);
+    m_legacyTrackFxPath = legacy;
+    m_trackFxProcessCalls = 0;
+}
+
+quint64 AudioMixer::trackFxProcessCallsForTest() const
+{
+    QMutexLocker lock(&m_controlMutex);
+    return m_trackFxProcessCalls;
+}
+
+void AudioMixer::processTrackFxForTest(int trackId, int16_t *samples, int frames)
+{
+    if (!samples || frames <= 0 || frames > std::numeric_limits<int>::max() / kChannels) return;
+    QMutexLocker lock(&m_controlMutex);
+    processTrackFxLocked(trackId, samples, samples, frames * kChannels);
+}
+
+const trackfx::Chain &AudioMixer::trackChain(int trackId) const
+{
+    // Return a per-thread snapshot: no reference into a QHash that setters can
+    // invalidate after unlocking. Copy before requesting another track on this thread.
+    thread_local trackfx::Chain snapshot;
+    QMutexLocker lock(&m_controlMutex);
+    snapshot = m_trackFxChains.value(trackId);
+    return snapshot;
+}
+
+QJsonObject AudioMixer::collectTrackState() const
+{
+    QMutexLocker lock(&m_controlMutex);
+    QJsonArray states;
+    for (const auto &state : m_trackStates) {
+        QJsonArray bands;
+        for (const auto &band : state.eq.bands)
+            bands.append(QJsonObject{{"frequency", band.frequency}, {"gain", band.gain}, {"q", band.q}});
+        states.append(QJsonObject{{"gain", state.gain}, {"mute", state.muted},
+            {"solo", state.solo}, {"eqEnabled", state.eqEnabled},
+            {"preamp", state.eq.preamp}, {"bands", bands}});
+    }
+    QJsonObject chains;
+    for (auto it = m_trackFxChains.cbegin(); it != m_trackFxChains.cend(); ++it)
+        chains.insert(QString::number(it.key()), it.value().toJson());
+    return QJsonObject{{"states", states}, {"chains", chains}};
+}
+
+void AudioMixer::applyTrackState(const QJsonObject &snapshot)
+{
+    QVector<TrackState> restoredStates;
+    const auto states = snapshot.value("states").toArray();
+    for (int i = 0; i < states.size() && i < kMaxAudioTracks; ++i) {
+        const auto obj = states[i].toObject();
+        TrackState state;
+        state.gain = qBound(0.0, obj.value("gain").toDouble(1.0), 4.0);
+        state.muted = obj.value("mute").toBool();
+        state.solo = obj.value("solo").toBool();
+        state.eqEnabled = obj.value("eqEnabled").toBool();
+        state.eq.preamp = obj.value("preamp").toDouble();
+        for (const auto &value : obj.value("bands").toArray()) {
+            const auto band = value.toObject();
+            state.eq.bands.append(EQBand{band.value("frequency").toDouble(1000.0),
+                band.value("gain").toDouble(), band.value("q").toDouble(1.0)});
+        }
+        recomputeEqCoefficients(state);
+        restoredStates.append(state);
+    }
+    QHash<int, trackfx::Chain> restoredChains;
+    QHash<int, std::array<EqBandCoefsParam, 4>> restoredCoefs;
+    const auto chains = snapshot.value("chains").toObject();
+    for (auto it = chains.begin(); it != chains.end(); ++it) {
+        bool valid = false;
+        const int index = it.key().toInt(&valid);
+        if (!valid || index < 0 || index >= kMaxAudioTracks) continue;
+        const auto chain = trackfx::Chain::fromJson(it.value().toObject());
+        restoredChains.insert(index, chain);
+        restoredCoefs.insert(index, {computeEqBand(chain.eq.low, 0, kSampleRateHz),
+            computeEqBand(chain.eq.lowMid, 1, kSampleRateHz),
+            computeEqBand(chain.eq.highMid, 2, kSampleRateHz),
+            computeEqBand(chain.eq.high, 3, kSampleRateHz)});
+    }
+    // Publish one complete snapshot to the audio callback. Master FX remain intact.
+    QMutexLocker lock(&m_controlMutex);
+    m_trackStates = std::move(restoredStates);
+    m_trackFxChains = std::move(restoredChains);
+    m_trackEqCoefs = std::move(restoredCoefs);
+    m_trackFxProcessors.clear();
+    m_trackEq.clear();
+    m_trackEqHist.clear();
+    m_trackComp.clear();
+    m_trackCompState.clear();
+    m_trackReverb.clear();
+    m_trackReverbState.clear();
+    m_trackNoiseReduction.clear();
+    m_trackNoiseReductionState.clear();
+    for (auto it = m_trackFxChains.cbegin(); it != m_trackFxChains.cend(); ++it) {
+        const int index = it.key();
+        const auto &chain = it.value();
+        m_trackFxProcessors[index].setChain(chain);
+        m_trackEq.insert(index, chain.eq);
+        m_trackComp.insert(index, chain.comp);
+        m_trackReverb.insert(index, chain.reverb);
+        m_trackNoiseReduction.insert(index, chain.nr);
+    }
+    recomputeEffectiveGainsLocked();
+}
+
+void AudioMixer::remapTrackIndices(const QVector<int> &oldToNew)
+{
+    QMutexLocker lock(&m_controlMutex);
+    QVector<TrackState> states;
+    for (int index : oldToNew) if (index >= states.size()) states.resize(index + 1);
+    for (int i = 0; i < oldToNew.size(); ++i)
+        if (oldToNew[i] >= 0 && i < m_trackStates.size()) states[oldToNew[i]] = m_trackStates[i];
+    m_trackStates = std::move(states);
+    auto remap = [&oldToNew](auto &map) {
+        std::decay_t<decltype(map)> result;
+        for (auto it = map.cbegin(); it != map.cend(); ++it) {
+            const int index = oldToNew.value(it.key(), -1);
+            if (index >= 0) result.insert(index, it.value());
+        }
+        map = std::move(result);
+    };
+    remap(m_trackFxChains);
+    remap(m_trackFxProcessors);
+    remap(m_trackEq);
+    remap(m_trackEqCoefs);
+    remap(m_trackEqHist);
+    remap(m_trackComp);
+    remap(m_trackCompState);
+    remap(m_trackReverb);
+    remap(m_trackReverbState);
+    remap(m_trackNoiseReduction);
+    remap(m_trackNoiseReductionState);
+    recomputeEffectiveGainsLocked();
 }

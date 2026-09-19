@@ -13,6 +13,10 @@
 // wrapper is provided behind VEDITOR_LIBAVCORE_WITH_QIMAGE.
 // ===========================================================================
 
+#include <QList>
+#include <QPair>
+#include <QString>
+
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -43,9 +47,11 @@ namespace libavcore {
 std::string hdr10MasterDisplayString(double masterMaxNits, double masterMinNits);
 
 // Request descriptor mirroring the relevant fields of Exporter's ExportConfig.
-// All fields here are pure data (no Qt types) so the header can be included
-// from non-Qt callers.
+// The descriptor uses standard C++ types; codecOptionsFor exposes Qt pairs.
 struct EncodeRequest {
+    enum class RateControl { Bitrate, Crf };
+    RateControl rateControl = RateControl::Bitrate;
+    int crf = -1;
     int width = 0;
     int height = 0;
     int fps = 30;                       // Legacy integral fps fallback.
@@ -77,6 +83,7 @@ struct EncodeRequest {
 
     // ProRes profile index (-1 = not ProRes, 0..5 = prores_ks profile id).
     int proresProfile = -1;
+    bool keepAlpha = false;
 
     // HDR10 mastering metadata (used by x265 only when isHdr10 is true).
     double hdrMasterMaxNits = 1000.0;
@@ -92,9 +99,13 @@ struct EncodeRequest {
     // Used by Exporter to restore CodecDetector::isEncoderAvailable()
     // functional-probe semantics that were dropped during the libavcore
     // refactor. Kept as std::function (not Qt callable) so the header stays
-    // Qt-free.
+    // independent of Qt callbacks.
     std::function<bool(const std::string&)> encoderAvailableHook;
 };
+
+// Resolved encoder options; bit_rate denotes AVCodecContext::bit_rate.
+QList<QPair<QString, QString>> codecOptionsFor(
+    const EncodeRequest& req, const QString& resolvedEncoderName);
 
 // RAII encoder session. Construct, then call open(), then pushFrameRgb24()
 // repeatedly with monotonically-increasing pts, then finalize() once.
@@ -117,6 +128,12 @@ public:
     // EncodeRequest. stride is bytes per row in src. pts increments once per
     // output frame and is interpreted in encoderTimeBase().
     bool pushFrameRgb24(const uint8_t* src, int stride, int64_t pts);
+    // Packed straight RGBA; valid only for an open keepAlpha session.
+    bool pushFrameRgba32(const uchar* rgba, int stride, int64_t pts);
+    // Test seam: disabling RGBA input must leave opaque exports unaffected.
+    static void setAlphaInputEnabledForTest(bool enabled);
+    static void resetAlphaFrameCountForTest();
+    static int alphaFrameCountForTest();
 
 #ifdef VEDITOR_LIBAVCORE_WITH_QIMAGE
     // Convenience wrapper: pushes a QImage. The image is converted to
@@ -180,6 +197,8 @@ private:
     AVStream* m_audioInStream = nullptr;
     AVStream* m_audioOutStream = nullptr;
     AVAudioFifo* m_audioFifo = nullptr;
+    SwsContext* m_rgbaToYuvCtx = nullptr;
+    bool m_keepAlpha = false;
     SwsContext* m_rgbToYuvCtx = nullptr;   // used by pushFrameRgb24
     AVFrame* m_scratchFrame = nullptr;     // pre-allocated YUV frame for RGB path
     AVFrame* m_audioScratchFrame = nullptr;

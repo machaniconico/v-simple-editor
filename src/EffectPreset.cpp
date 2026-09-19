@@ -42,6 +42,8 @@ QString effectTypeKey(VideoEffectType type)
     case VideoEffectType::Blur: return QStringLiteral("Blur");
     case VideoEffectType::Sharpen: return QStringLiteral("Sharpen");
     case VideoEffectType::Mosaic: return QStringLiteral("Mosaic");
+    case VideoEffectType::LumaKey: return QStringLiteral("LumaKey");
+    case VideoEffectType::ColorKey: return QStringLiteral("ColorKey");
     case VideoEffectType::ChromaKey: return QStringLiteral("ChromaKey");
     case VideoEffectType::Vignette: return QStringLiteral("Vignette");
     case VideoEffectType::Sepia: return QStringLiteral("Sepia");
@@ -81,13 +83,22 @@ QString effectTypeKey(VideoEffectType type)
     case VideoEffectType::BrightnessContrast: return QStringLiteral("BrightnessContrast");
     case VideoEffectType::Bulge: return QStringLiteral("Bulge");
     case VideoEffectType::Twirl: return QStringLiteral("Twirl");
+    case VideoEffectType::Flip: return QStringLiteral("Flip");
     case VideoEffectType::Mirror: return QStringLiteral("Mirror");
     case VideoEffectType::PolarCoordinates: return QStringLiteral("PolarCoordinates");
     case VideoEffectType::MotionTile: return QStringLiteral("MotionTile");
     case VideoEffectType::CornerPinSimple: return QStringLiteral("CornerPinSimple");
     case VideoEffectType::FilmGrain: return QStringLiteral("FilmGrain");
+    case VideoEffectType::LogToRec709: return QStringLiteral("LogToRec709");
     case VideoEffectType::RollingShutterRepair: return QStringLiteral("RollingShutterRepair");
     case VideoEffectType::Echo: return QStringLiteral("Echo");
+    case VideoEffectType::WarpWave: return QStringLiteral("WarpWave");
+    case VideoEffectType::WarpRipple: return QStringLiteral("WarpRipple");
+    case VideoEffectType::WarpSpherize: return QStringLiteral("WarpSpherize");
+    case VideoEffectType::WarpFisheye: return QStringLiteral("WarpFisheye");
+    case VideoEffectType::WarpPinch: return QStringLiteral("WarpPinch");
+    case VideoEffectType::BroadcastSafe: return QStringLiteral("BroadcastSafe");
+    case VideoEffectType::LeaveColor: return QStringLiteral("LeaveColor");
     case VideoEffectType::LensDistortion: return QStringLiteral("LensDistortion");
     }
     return QStringLiteral("None");
@@ -796,6 +807,20 @@ VideoEffect PresetLibrary::videoEffectFromJson(const QJsonObject &obj)
 void PresetLibrary::registerBuiltins()
 {
     QDateTime now = QDateTime::currentDateTime();
+
+    const char *logNames[] = { "S-Log3 → Rec.709", "LogC3 → Rec.709", "V-Log → Rec.709" };
+    for (int input = 0; input < 3; ++input) {
+        EffectPreset p;
+        p.name = QString::fromUtf8(logNames[input]);
+        p.description = QStringLiteral("カメラ Log を Rec.709 ガンマ2.4 に変換します。");
+        p.category = QStringLiteral("カラー");
+        p.author = QStringLiteral("v-editor");
+        p.isBuiltIn = true;
+        p.createdAt = now;
+        p.modifiedAt = now;
+        p.effects.append(VideoEffect::createLogToRec709(input));
+        m_presets.append(p);
+    }
 
     // Approximate starting points, not calibrated camera/lens profiles.
     const struct LensPreset { const char *name; double k1; double k2; } lenses[] = {

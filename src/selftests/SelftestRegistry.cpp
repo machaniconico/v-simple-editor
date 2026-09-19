@@ -45,8 +45,10 @@ int runAudioXfadeSelftest();
 int runMorphCutSelftest();
 int runTransitionExportSelftest();
 int runTransitionParamsSelftest();
+int runAudioKeyframesSelftest();
 int runAudioMixerSelftest();
 int runAudioRestoreSelftest();
+int runAudioTrackFxSelftest();
 int runAutoClipGenSelftest();
 int runAutoColorSelftest();
 int runAutoColorPreserveGradeSelftest();
@@ -65,11 +67,13 @@ int runBatchExportE2ESelftest();
 int runBezierEasingSelftest();
 int runBlenderSelftest();
 int runBroadcastCaptionSelftest();
+int runBundleAdjustSelftest();
 int runCapcutCaptionSelftest();
 int runCaptionSelftest();
 int runChromaSelftest();
 int runClipColorSelftest();
 int runClipCurvesSelftest();
+int runClipFilmstripSelftest();
 int runClipLutSelftest();
 int runClipMaskSelftest();
 int runClipParentParitySelftest();
@@ -98,8 +102,12 @@ int runVfxFootageSelftest();
 int runEffectPresetSelftest();
 int runEffectTimingSelftest();
 int runExposureAidsSelftest();
+int runExportAlphaSelftest();
 int runExportAuditSelftest();
+int runExportPresetsSelftest();
+int runExportProSelftest();
 int runExportRangeSelftest();
+int runFlipSolidSelftest();
 int runFrameClipboardSelftest();
 int runFrameExportSelftest();
 int runFcpxmlSelftest();
@@ -121,6 +129,7 @@ int runHwPerfSelftest();
 int runImportIngestSelftest();
 int runImportSelftest();
 int runInstagramSelftest();
+int runKeyersSelftest();
 int runKeyframeAnimParitySelftest();
 int runKeyframeLoopSelftest();
 int runLayerStyleSelftest();
@@ -128,13 +137,17 @@ int runLayerStyleUiSelftest();
 int runLibavcoreDecodeSelftest();
 int runLibavcoreEncodeSelftest();
 int runLiveMatteResolveSelftest();
+int runLogToRec709Selftest();
 int runLoudnessExportWireSelftest();
 int runLoudnessSelftest();
 int runLowerThirdSelftest();
 int runMatte16ParitySelftest();
 int runMediaPoolDragSelftest();
+int runMediaPoolRatingSelftest();
 int runMediaPoolSelftest();
+int runMediaPoolThumbsSelftest();
 int runMediaRelinkSelftest();
+int runMeshWarpSelftest();
 int runMobileSelftest();
 int runMographSelftest();
 int runMotionBlurP2Selftest();
@@ -168,9 +181,12 @@ int runRightclickPausePrefSelftest();
 int runReverseClipSelftest();
 int runRippleDeleteSelftest();
 int runRgbParadeSelftest();
+int runSequenceDockSelftest();
+int runSfmTwoViewSelftest();
 int runShortcutSelftest();
 int runSilenceCutSelftest();
 int runBeatDetectSelftest();
+int runSafeLeaveColorSelftest();
 int runSafeZoneSelftest();
 int runShapeClipSelftest();
 int runStillCompareSelftest();
@@ -192,11 +208,14 @@ int runText3dPreviewSelftest();
 int runTextExportSelftest();
 int runTcburnSelftest();
 int runThreePointEditSelftest();
+int runTimelineErgoSelftest();
+int runTrackManageSelftest();
 int runTrackMatteExportIntegrationSelftest();
 int runTrackMatteParitySelftest();
 int runTrackMatteReindexSelftest();
 int runTrackMatteRm5ReorderSelftest();
 int runTrackMatteRm6DuplicateSelftest();
+int runTrackOpsSelftest();
 int runTranscriptHighlighterOfflineSelftest();
 int runTranscriptHighlighterSelftest();
 int runMcpSelftest();
@@ -209,6 +228,7 @@ int runVersionedSaveSelftest();
 int runProjectDiffSelftest();
 int runVideostabDeshakeSelftest();
 int runVimeoSelftest();
+int runWarpFxSelftest();
 int runWatermarkSelftest();
 int runWbEyedropperSelftest();
 int runWhisperGuideSelftest();
@@ -495,6 +515,12 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Increment and Save filename resolver: numbered suffix, unnumbered v002, collision skip, digit width" },
     { "project-diff", "VEDITOR_PROJECT_DIFF_SELFTEST", runProjectDiffSelftest, false,
       "Structural project comparison: matching, properties, effects, transitions and epsilon (7 gates)" },
+    { "export-alpha", "VEDITOR_EXPORT_ALPHA_SELFTEST", runExportAlphaSelftest, true,
+      "ProRes alpha export and opaque default path (4 gates)" },
+    { "export-presets", "VEDITOR_EXPORT_PRESETS_SELFTEST", runExportPresetsSelftest, true,
+      "Export user preset persistence and name resolution (4 gates)" },
+    { "export-pro",        "VEDITOR_EXPORT_PRO_SELFTEST",         runExportProSelftest,         false,
+      "Export rate control options and queue persistence" },
     { "export-range",      "VEDITOR_EXPORT_RANGE_SELFTEST",       runExportRangeSelftest,       false,
       "Marked In/Out export frame-range helper (5 gates)" },
     { "tracker-preset",    "VEDITOR_TRACKER_PRESET_SELFTEST",     runTrackerPresetSelftest,      false,
@@ -527,12 +553,20 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Premiere XML (FCP7) exporter stub (Phase 6 Wave 1 FOUNDATION, filled in US-6E-3: 4 gate combined / individual / multi-sequence / DOCTYPE)" },
     { "youtube-chapter",   "VEDITOR_YOUTUBE_CHAPTER_SELFTEST",    runYoutubeChapterSelftest,     false,
       "YouTube chapter generator stub (Phase 6 Wave 1 FOUNDATION, filled in US-6F-3: 3 gate M:SS / H:MM:SS / intro auto-insert)" },
+    { "clip-filmstrip", "VEDITOR_CLIP_FILMSTRIP_SELFTEST", runClipFilmstripSelftest, true,
+      "Timeline filmstrip: disabled path, shared thumbnails and tile/time mapping" },
+    { "media-pool-thumbs", "VEDITOR_MEDIA_POOL_THUMBS_SELFTEST", runMediaPoolThumbsSelftest, true,
+      "Media pool asynchronous thumbnails, RGBA frame grab and hover skimming" },
+    { "media-pool-rating", "VEDITOR_MEDIA_POOL_RATING_SELFTEST", runMediaPoolRatingSelftest, false,
+      "MediaPool ratings: JSON defaults/round-trip, filters, rename and search" },
     { "media-pool",        "VEDITOR_MEDIA_POOL_SELFTEST",         runMediaPoolSelftest,          false,
       "MediaPool model: asset/bin/smartbin CRUD + search + JSON round-trip" },
     { "three-point-edit",  "VEDITOR_THREE_POINT_EDIT_SELFTEST",   runThreePointEditSelftest,     false,
       "ThreePointEdit engine: selection->clip, validate, overwrite plan" },
     { "trim-ops",          "VEDITOR_TRIM_OPS_SELFTEST",           runTrimOpsSelftest,            false,
       "TrimOps engine: ripple/roll/slip/slide + bounds" },
+    { "audio-keyframes", "VEDITOR_AUDIO_KEYFRAMES_SELFTEST", runAudioKeyframesSelftest, false,
+      "Audio RMS envelope, keyframe mapping, smoothing, audioLevel expressions and determinism" },
     { "audio-bus",         "VEDITOR_AUDIO_BUS_SELFTEST",          runAudioBusSelftest,           false,
       "AudioBusRouting: bus/submix/aux-send gain resolution + cycle guard" },
     { "audio-channel-map", "VEDITOR_AUDIO_CHANNEL_MAP_SELFTEST",  runAudioChannelMapSelftest,    false,
@@ -547,6 +581,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Per-keyframe cubic-bezier easing: legacy invariance, identity curve, ease-in, JSON round-trip (4 gates)" },
     { "easing-presets",    "VEDITOR_EASING_PRESETS_SELFTEST",     runEasingPresetsSelftest,      false,
       "Elastic/Bounce/Back keyframe easing presets: math, overshoot, legacy invariance, JSON round-trip (6 gates)" },
+    { "keyers", "VEDITOR_KEYERS_SELFTEST", runKeyersSelftest, false,
+      "ルマキー・カラーキー: CPU alpha、合成、プリセット、スタック順序 (7 gates)" },
     { "keyframe-loop",     "VEDITOR_KEYFRAME_LOOP_SELFTEST",       runKeyframeLoopSelftest,       false,
       "AE-ANIM-3 loopOut motion keyframes: None/Cycle/PingPong/Continue sampling + JSON omission (6 gates)" },
     { "motion-preset",     "VEDITOR_MOTION_PRESET_SELFTEST",       runMotionPresetSelftest,       false,
@@ -571,6 +607,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "AE-FX-3 Color Family: levels, tint, blackwhite, exposure, hue/saturation gates (G1-G6)" },
     { "ae-fx-color2",      "VEDITOR_AE_FX_COLOR2_SELFTEST",       runAeFxColor2Selftest,         true,
       "AE-FX-6 Color/Channel Family: curves, mixer, vibrance, filter, tritone, brightness/contrast gates (G1-G6)" },
+    { "log-to-rec709", "VEDITOR_LOG_TO_REC709_SELFTEST", runLogToRec709Selftest, false,
+      "Camera Log decoding, output transfer, gamut and presets (G1-G7)" },
     { "lens-distort", "VEDITOR_LENS_DISTORT_SELFTEST", runLensDistortSelftest, false,
       "Lens distortion identity, geometry and preset round-trip (G1-G6)" },
     { "ae-fx-distort",     "VEDITOR_AE_FX_DISTORT_SELFTEST",      runAeFxDistortSelftest,        false,
@@ -581,10 +619,14 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "AE-FX-5 Generate Family: gradient ramp, fill, bloom, scanlines, halftone gates (G1-G6)" },
     { "ae-fx-stylize",     "VEDITOR_AE_FX_STYLIZE_SELFTEST",      runAeFxStylizeSelftest,        false,
       "AE-FX-2 Stylize Family: glow, edges, emboss, posterize, threshold, solarize gates (G1-G7)" },
+    { "mesh-warp", "VEDITOR_MESH_WARP_SELFTEST", runMeshWarpSelftest, true,
+      "正規化メッシュワープ・描画・保存・Undo・グリッド編集・4隅ピン (G1-G7)" },
     { "rolling-shutter", "VEDITOR_ROLLING_SHUTTER_SELFTEST", runRollingShutterSelftest, true,
       "Rolling shutter: bypass, repair, direction, last frame, determinism, presets (G1-G6)" },
     { "fxgrain-echo",      "VEDITOR_FXGRAIN_ECHO_SELFTEST",       runFxGrainEchoSelftest,         false,
       "FilmGrain deterministic CPU effect + Echo temporal compositor + preview routing gates (G1-G16)" },
+    { "flip-solid", "VEDITOR_FLIP_SOLID_SELFTEST", runFlipSolidSelftest, true,
+      "Flip CPU parity, involution, preset round-trip and solid insertion/undo (G1-G5)" },
     { "effect-preset", "VEDITOR_EFFECT_PRESET_SELFTEST", runEffectPresetSelftest, false,
       "FXP-1 effect preset stack JSON save/load/apply with optional effect keyframes (5 gates)" },
     { "effect-library", "VEDITOR_EFFECT_LIBRARY_SELFTEST", runEffectLibrarySelftest, false,
@@ -601,6 +643,10 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "AutoMatte: difference matte, morphology, feather, composite" },
     { "object-removal",    "VEDITOR_OBJECT_REMOVAL_SELFTEST",     runObjectRemovalSelftest,      false,
       "ObjectRemoval: temporal trust, background alignment, bounds, dilation, cache, composite (14 gates)" },
+    { "bundle-adjust", "VEDITOR_BUNDLE_ADJUST_SELFTEST", runBundleAdjustSelftest, false,
+      "可変サイズ線形ソルバ、多フレーム追跡、姿勢連結、LMバンドル調整 (G1-G6)" },
+    { "sfm-two-view", "VEDITOR_SFM_TWO_VIEW_SELFTEST", runSfmTwoViewSelftest, false,
+      "Two-view essential pose, RANSAC, triangulation, degeneracy and determinism (6 gates)" },
     { "feature-tracker", "VEDITOR_FEATURE_TRACKER_SELFTEST", runFeatureTrackerSelftest, false,
       "Shi-Tomasi 特徴点検出とピラミッド LK 多点追跡 (G1-G6)" },
     { "camera-solve",      "VEDITOR_CAMERA_SOLVE_SELFTEST",       runCameraSolveSelftest,        true,
@@ -639,6 +685,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "SilenceCut RMS silence detection: keep/silence segmentation + consistency (9 gates)" },
     { "beat-detect",      "VEDITOR_BEAT_DETECT_SELFTEST",         runBeatDetectSelftest,         false,
       "BeatDetect energy-flux onset detection + median-interval BPM estimate (7 gates)" },
+    { "safe-leavecolor", "VEDITOR_SAFE_LEAVECOLOR_SELFTEST", runSafeLeaveColorSelftest, false,
+      "放送セーフと色を残す (6 gates)" },
     { "safe-zone",        "VEDITOR_SAFE_ZONE_SELFTEST",           runSafeZoneSelftest,           false,
       "SafeZone: SNS platform UI guide rects + apply display-local overlay (9 gates)" },
     { "still-compare",    "VEDITOR_STILL_COMPARE_SELFTEST",       runStillCompareSelftest,       false,
@@ -717,7 +765,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "hsl-secondary",     "VEDITOR_HSL_SECONDARY_SELFTEST",       runHslSecondarySelftest,       true,
       "HSL secondary qualifier: per-clip ProjectFile round-trip + renderFrameAt reflection + off-path byte identity" },
     { "clip-lut",          "VEDITOR_CLIP_LUT_SELFTEST",            runClipLutSelftest,            true,
-      "Clip LUT: per-clip ProjectFile round-trip + renderFrameAt LUT reflection + no-LUT byte-identical gate" },
+      "Clip LUT G1-G10: ProjectFile round-trip, render reflection, no-LUT identity, MainWindow menu application + undo" },
     { "shape-clip",        "VEDITOR_SHAPE_CLIP_SELFTEST",          runShapeClipSelftest,          true,
       "Shape clip G1-G10: JSON, raster SSOT, preview/export, trim/repeater, modifier dialog + undo, legacy brush byte identity" },
     { "colormatch-apply",  "VEDITOR_COLORMATCH_APPLY_SELFTEST",    runColorMatchApplySelftest,    true,
@@ -748,12 +796,20 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "ColorCorrection grade.* keyframes: render evaluation, byte identity, undo, and roundtrip" },
     { "graph-editor", "VEDITOR_GRAPH_EDITOR_SELFTEST", runGraphEditorSelftest, true,
       "GraphEditor edit/undo, per-track Loop Out UI, ProjectFile persistence, and ClipAnim evaluation parity" },
+    { "sequence-dock", "VEDITOR_SEQUENCE_DOCK_SELFTEST", runSequenceDockSelftest, true,
+      "Sequence dock: list, rename/create undo, active tracks and project persistence (4 gates)" },
     { "nest-sequence", "VEDITOR_NEST_SEQUENCE_SELFTEST", runNestSequenceSelftest, true,
       "Nested sequences: recursive render, cycle/depth guards, audio flatten, store roundtrip, no-nest byte identity" },
     { "precompose-e2e", "VEDITOR_PRECOMPOSE_E2E_SELFTEST", runPrecomposeE2ESelftest, true,
       "MainWindow precompose UI-flow backend: sequence ref replacement plus single/double undo store cleanup (4 gates)" },
     { "mainwindow-lifecycle", "VEDITOR_MAINWINDOW_LIFECYCLE_SELFTEST", runMainWindowLifecycleSelftest, true,
       "MainWindow lifecycle: construct/destroy once, repeat three times, and clear dependent dock objects (3 gates)" },
+    { "track-ops", "VEDITOR_TRACK_OPS_SELFTEST", runTrackOpsSelftest, true,
+      "Track removal/reorder: header menus, external state undo, exact row restoration and project persistence (12 gates)" },
+    { "track-manage", "VEDITOR_TRACK_MANAGE_SELFTEST", runTrackManageSelftest, true,
+      "Track names/colors: project roundtrip, single-step undo and invalid targets (3 gates)" },
+    { "timeline-ergo", "VEDITOR_TIMELINE_ERGO_SELFTEST", runTimelineErgoSelftest, true,
+      "Timeline selection, blade, gaps, duplicate, nudge, marquee, zoom, timecode, playhead moves, labels and linked selection (12 gates)" },
     { "ripple-delete", "VEDITOR_RIPPLE_DELETE_SELFTEST", runRippleDeleteSelftest, true,
       "Ripple delete and gap close: all-track time-range ripple, one-step undo, and no-selection no-op" },
     { "e2e",               "VEDITOR_E2E_SELFTEST",                runE2eSelftest,                true,
@@ -870,6 +926,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Subtitle translation pipeline smoke (locale map + subtitle track swap)" },
     { "lowerthird",        "VEDITOR_LOWERTHIRD_SELFTEST",         runLowerThirdSelftest,         true,
       "Lower-third title module smoke (template render + animator keyframes)" },
+    { "warp-fx", "VEDITOR_WARP_FX_SELFTEST", runWarpFxSelftest, false,
+      "Parametric CPU warps: identity, geometry, determinism, presets and shared render path (7 gates)" },
     { "watermark",         "VEDITOR_WATERMARK_SELFTEST",          runWatermarkSelftest,          true,
       "Watermark overlay smoke (tile / corner placement + opacity blend)" },
     { "libavcore-encode",  "VEDITOR_LIBAVCORE_ENCODE_SELFTEST",   runLibavcoreEncodeSelftest,    true,
@@ -892,6 +950,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Wipe, barn-door, iris and clock softness, border, persistence and shared render step (10 gates)" },
     { "transition-export", "VEDITOR_TRANSITION_EXPORT_SELFTEST", runTransitionExportSelftest, true,
       "Video transition export/preview shared steps and no-transition identity (9 gates)" },
+    { "audio-trackfx", "VEDITOR_AUDIO_TRACKFX_SELFTEST", runAudioTrackFxSelftest, true,
+      "Track DSP parity, headroom, overlap ordering, panel IDs and master EQ playback/export (16 gates)" },
     { "audio-xfade",       "VEDITOR_AUDIO_XFADE_SELFTEST",         runAudioXfadeSelftest,       true,
       "Audio constant-power crossfade/fade API and export afade=qsin contract (11 gates); QApplication required for Timeline undo/mirror checks" },
     { "oauth-mock-e2e",   "VEDITOR_OAUTH_MOCK_SELFTEST",        runOAuthMockE2eSelftest,       true,

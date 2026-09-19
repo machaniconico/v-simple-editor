@@ -3,8 +3,10 @@
 // Verifies the GAP-4 contract: ProjectFile persists per-clip LUT fields,
 // renderFrameAt consumes them, and clips without LUT state stay byte-identical.
 
+#include "../MainWindow.h"
 #include "../ProjectFile.h"
 #include "../Timeline.h"
+#include "../UndoManager.h"
 #include "../TimelineFrameRenderer.h"
 #include "../libavcore/Encode.h"
 
@@ -20,6 +22,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QSlider>
 #include <QString>
 #include <QTemporaryDir>
 #include <QTextStream>
@@ -270,6 +273,118 @@ int runClipLutSelftest()
           !untouchedFrame.isNull()
               && !untouchedBaseline.isNull()
               && equalRgbaBytes(untouchedFrame, untouchedBaseline));
+
+    // US-500: exercise the same non-dialog entry point as both LUT menus.
+    MainWindow window;
+    Timeline *menuTimeline = window.findChild<Timeline *>();
+    bool menuOk = menuTimeline && menuTimeline->undoManager();
+    if (menuOk) {
+        setTimelineClips(*menuTimeline, QVector<ClipInfo>{plain});
+        menuTimeline->clearSelection();
+        const quint64 beforeRejected = menuTimeline->undoManager()->saveSerial();
+        menuOk = !window.applyLutFileToSelectedClip(lutPath)
+            && menuTimeline->videoClips().first().lutFilePath.isEmpty()
+            && menuTimeline->undoManager()->saveSerial() == beforeRejected
+            && window.statusBar()->currentMessage()
+                == QStringLiteral("映像クリップを選択してください。");
+        menuOk = menuTimeline->selectClipByIndex(false, 0, 0, &error) && menuOk;
+        menuTimeline->undoManager()->clear();
+        menuTimeline->undoManager()->saveState(menuTimeline->currentState(),
+                                              QStringLiteral("Menu LUT baseline"));
+        const quint64 beforeApply = menuTimeline->undoManager()->saveSerial();
+        const QImage before = tlrender::renderFrameAt(menuTimeline, 200000, outSize);
+        const bool applied = window.applyLutFileToSelectedClip(lutPath);
+        const QImage after = tlrender::renderFrameAt(menuTimeline, 200000, outSize);
+        const ClipInfo appliedClip = menuTimeline->videoClips().first();
+        menuOk = menuOk && applied
+            && appliedClip.lutFilePath == lutPath
+            && near(appliedClip.lutIntensity, 1.0)
+            && menuTimeline->undoManager()->saveSerial() == beforeApply + 1
+            && !before.isNull() && !after.isNull()
+            && !equalRgbaBytes(before, after);
+
+        ProjectData menuReloaded;
+        const QString menuProjectPath = tmpDir.filePath(QStringLiteral("menu_lut.veditor"));
+        const bool roundtrip = ProjectFile::save(
+            menuProjectPath, projectWithTrack(menuTimeline->videoClips()))
+            && ProjectFile::load(menuProjectPath, menuReloaded)
+            && menuReloaded.videoTracks.size() == 1
+            && menuReloaded.videoTracks.first().size() == 1
+            && menuReloaded.videoTracks.first().first().lutFilePath == lutPath
+            && near(menuReloaded.videoTracks.first().first().lutIntensity, 1.0);
+        menuOk = menuOk && roundtrip;
+        if (roundtrip) {
+            Timeline restored;
+            setTimelineClips(restored, menuReloaded.videoTracks.first());
+            menuOk = equalRgbaBytes(after,
+                tlrender::renderFrameAt(&restored, 200000, outSize)) && menuOk;
+        }
+        // Reapplying the same LUT must not create a second undo entry.
+        const bool reapplied = window.applyLutFileToSelectedClip(lutPath);
+        menuOk = menuOk && reapplied
+            && menuTimeline->undoManager()->saveSerial() == beforeApply + 1;
+        menuTimeline->undo();
+        menuOk = menuOk && menuTimeline->videoClips().first().lutFilePath.isEmpty()
+            && !menuTimeline->undoManager()->canUndo()
+            && equalRgbaBytes(before,
+                tlrender::renderFrameAt(menuTimeline, 200000, outSize));
+
+        // Clear persists once; resetting the slider must not add another undo.
+        menuOk = window.applyLutFileToSelectedClip(lutPath) && menuOk;
+        const quint64 beforeClear = menuTimeline->undoManager()->saveSerial();
+        window.clearLutIntensity();
+        menuOk = menuOk && menuTimeline->videoClips().first().lutFilePath.isEmpty()
+            && near(menuTimeline->videoClips().first().lutIntensity, 1.0)
+            && menuTimeline->undoManager()->saveSerial() == beforeClear + 1
+            && equalRgbaBytes(before,
+                tlrender::renderFrameAt(menuTimeline, 200000, outSize));
+        menuTimeline->undo();
+        menuOk = menuOk && menuTimeline->videoClips().first().lutFilePath == lutPath
+            && near(menuTimeline->videoClips().first().lutIntensity, 1.0)
+            && equalRgbaBytes(after,
+                tlrender::renderFrameAt(menuTimeline, 200000, outSize));
+
+        auto *slider = window.findChild<QSlider *>(QStringLiteral("menuLutIntensitySlider"));
+        menuOk = menuOk && slider;
+        if (slider) {
+            const quint64 beforeIntensity = menuTimeline->undoManager()->saveSerial();
+            slider->setValue(50);
+            const QImage half = tlrender::renderFrameAt(menuTimeline, 200000, outSize);
+            menuOk = menuOk && near(menuTimeline->videoClips().first().lutIntensity, 0.5)
+                && menuTimeline->videoClips().first().lutFilePath == lutPath
+                && menuTimeline->undoManager()->saveSerial() == beforeIntensity + 1
+                && !half.isNull() && !equalRgbaBytes(half, before)
+                && !equalRgbaBytes(half, after);
+            ProjectData intensityReloaded;
+            menuOk = ProjectFile::fromJsonString(ProjectFile::toJsonString(
+                projectWithTrack(menuTimeline->videoClips())), intensityReloaded)
+                && intensityReloaded.videoTracks.size() == 1
+                && intensityReloaded.videoTracks.first().size() == 1
+                && intensityReloaded.videoTracks.first().first().lutFilePath == lutPath
+                && near(intensityReloaded.videoTracks.first().first().lutIntensity, 0.5)
+                && menuOk;
+            menuTimeline->undo();
+            menuOk = menuOk && near(menuTimeline->videoClips().first().lutIntensity, 1.0);
+
+            // Applying at slider=25 resets to 100 without a duplicate undo entry.
+            slider->setValue(25);
+            const quint64 beforeReset = menuTimeline->undoManager()->saveSerial();
+            const bool reset = window.applyLutFileToSelectedClip(lutPath);
+            menuOk = menuOk && reset && slider->value() == 100
+                && near(menuTimeline->videoClips().first().lutIntensity, 1.0)
+                && menuTimeline->undoManager()->saveSerial() == beforeReset + 1;
+
+            // No selection keeps clip state intact for preview-only menu operations.
+            menuTimeline->clearSelection();
+            const quint64 beforeUnselected = menuTimeline->undoManager()->saveSerial();
+            slider->setValue(50);
+            window.clearLutIntensity();
+            menuOk = menuOk && menuTimeline->videoClips().first().lutFilePath == lutPath
+                && near(menuTimeline->videoClips().first().lutIntensity, 1.0)
+                && menuTimeline->undoManager()->saveSerial() == beforeUnselected;
+        }
+    }
+    check(10, "MainWindow menu LUT: apply/clear/intensity, selection, undo, save/load and render", menuOk);
 
     qInfo().noquote() << QStringLiteral("[clip-lut] summary: %1 PASS, %2 FAIL")
         .arg(passed).arg(failed);

@@ -6,6 +6,7 @@
 #include <QMouseEvent>
 #include <QApplication>
 #include <cmath>
+#include <algorithm>
 
 SurfaceTool::SurfaceTool(GLPreview *preview, QObject *parent)
     : QObject(parent)
@@ -165,7 +166,8 @@ bool SurfaceTool::handleMousePress(const QPoint &widgetPos, Qt::MouseButton butt
     if (!m_enabled)
         return false;
 
-    const QRectF letterbox = m_preview->letterboxRect();
+    const QRectF letterbox = m_preview ? m_preview->letterboxRect() : m_viewRect;
+    if (letterbox.isEmpty()) return false;
     const int corner = hitTestCorner(widgetPos, letterbox);
 
     if (button == Qt::RightButton && corner >= 0) {
@@ -182,7 +184,7 @@ bool SurfaceTool::handleMousePress(const QPoint &widgetPos, Qt::MouseButton butt
                 m_preview->update();
             emit cornersChanged(currentQuad());
         });
-        m_contextMenu->popup(m_preview->mapToGlobal(widgetPos));
+        m_contextMenu->popup(m_preview ? m_preview->mapToGlobal(widgetPos) : widgetPos);
         return true;
     }
 
@@ -199,7 +201,8 @@ bool SurfaceTool::handleMouseMove(const QPoint &widgetPos, Qt::KeyboardModifiers
     if (!m_enabled || m_draggingCorner < 0)
         return false;
 
-    const QRectF letterbox = m_preview->letterboxRect();
+    const QRectF letterbox = m_preview ? m_preview->letterboxRect() : m_viewRect;
+    if (letterbox.isEmpty()) return false;
     QPointF newUv = widgetToUv(widgetPos, letterbox);
 
     // Clamp to [0,1]

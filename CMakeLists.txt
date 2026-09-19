@@ -17,7 +17,7 @@ set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
 # Qt6
-find_package(Qt6 REQUIRED COMPONENTS Widgets Gui Multimedia MultimediaWidgets OpenGL OpenGLWidgets Network Concurrent)
+find_package(Qt6 REQUIRED COMPONENTS Widgets Gui Multimedia MultimediaWidgets OpenGL OpenGLWidgets Network Concurrent Test)
 
 # Sprint 16 / US-AFF-1: SVG rasterization for affinity::vector::loadSvg().
 # Optional: when not present, AffinityVectorImporter.cpp returns a null QImage
@@ -57,6 +57,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/libavcore/Encode.cpp
     src/libavcore/Concat.h
     src/libavcore/Concat.cpp
+    src/libavcore/FrameGrab.h
+    src/libavcore/FrameGrab.cpp
     src/libavcore/Decode.h
     src/libavcore/Decode.cpp
     src/libavcore/VideoFilterGraph.h
@@ -103,6 +105,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/motion_blur_parity_selftest.cpp
     src/selftests/MotionBlurP2Selftest.cpp
     src/selftests/effect_keyframe_parity_selftest.cpp
+    src/selftests/safe_leavecolor_selftest.cpp
+    src/selftests/keyers_selftest.cpp
     src/selftests/EffectPresetSelftest.cpp
     src/selftests/EffectLibrarySelftest.cpp
     src/selftests/VfxFootageSelftest.cpp
@@ -115,6 +119,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/LoudnessExportWireSelftest.cpp
     src/selftests/FrameExportSelftest.cpp
     src/selftests/FrameClipboardSelftest.cpp
+    src/selftests/sequence_dock_selftest.cpp
     src/selftests/NestSequenceSelftest.cpp
     src/selftests/PrecomposeE2ESelftest.cpp
     src/selftests/BatchExportE2ESelftest.cpp
@@ -126,10 +131,13 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/camera3d_selftest.cpp
     src/selftests/camera_solve_selftest.cpp
     src/selftests/feature_tracker_selftest.cpp
+    src/selftests/sfm_two_view_selftest.cpp
+    src/selftests/bundle_adjust_selftest.cpp
     src/selftests/VoiceIsolationSelftest.cpp
     src/selftests/noise_print_selftest.cpp
     src/selftests/GradeLggSerializationSelftest.cpp
     src/selftests/color_warper_selftest.cpp
+    src/selftests/warp_fx_selftest.cpp
     src/selftests/GradeLogWheelSelftest.cpp
     src/selftests/GradeKeyframeSelftest.cpp
     src/selftests/grade_keyframe_ext_selftest.cpp
@@ -150,11 +158,13 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/AeFxBlurSelftest.cpp
     src/selftests/AeFxColorSelftest.cpp
     src/selftests/AeFxColor2Selftest.cpp
+    src/selftests/log_to_rec709_selftest.cpp
     src/selftests/lens_distort_selftest.cpp
     src/selftests/AeFxDistortSelftest.cpp
     src/selftests/AeFxDistort2Selftest.cpp
     src/selftests/AeFxGenerateSelftest.cpp
     src/selftests/AeFxStylizeSelftest.cpp
+    src/selftests/mesh_warp_selftest.cpp
     src/selftests/rolling_shutter_selftest.cpp
     src/selftests/fxgrain_echo_selftest.cpp
 
@@ -175,11 +185,15 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/MainWindow.cpp
     src/VideoPlayer.cpp
     src/Timeline.cpp
+    src/Timecode.cpp
+    src/Timecode.h
     src/SnapEngine.cpp
     src/ProjectSettings.cpp
     src/SequenceSettingsDialog.h
     src/SequenceSettingsDialog.cpp
     src/ExportDialog.cpp
+    src/ExportUserPresets.h
+    src/ExportUserPresets.cpp
     src/ExportRange.h
     src/ExportRange.cpp
     src/Exporter.cpp
@@ -255,6 +269,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/command_search_selftest.cpp
     src/selftests/import_ingest_selftest.cpp
     src/selftests/media_pool_selftest.cpp
+    src/selftests/media_pool_rating_selftest.cpp
     src/selftests/three_point_edit_selftest.cpp
     src/selftests/trim_ops_selftest.cpp
     src/CommandSearch.h
@@ -262,6 +277,10 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/MediaPool.h
     src/MediaPool.cpp
     src/MediaPoolDock.cpp
+    src/ThumbnailCache.h
+    src/ThumbnailCache.cpp
+    src/selftests/clip_filmstrip_selftest.cpp
+    src/selftests/media_pool_thumbs_selftest.cpp
     # SM (ソースモニター3点編集): 純粋エンジン + ドック (SM-2 で本体実装)。
     src/ThreePointEdit.h
     src/ThreePointEdit.cpp
@@ -283,6 +302,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/DialogueLevelerDialog.cpp
     src/AudioBusPanel.cpp
     src/selftests/audio_bus_selftest.cpp
+    src/selftests/audio_trackfx_selftest.cpp
     src/selftests/audio_xfade_selftest.cpp
     src/selftests/morph_cut_selftest.cpp
     src/selftests/transition_export_selftest.cpp
@@ -306,6 +326,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/whisper_guide_selftest.cpp
     src/selftests/dialogue_leveler_selftest.cpp
     src/selftests/safe_zone_selftest.cpp
+    src/selftests/flip_solid_selftest.cpp
     src/selftests/shape_clip_selftest.cpp
     src/selftests/StillCompareSelftest.cpp
     src/selftests/onion_skin_selftests.cpp
@@ -315,6 +336,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/StillCompare.cpp
     src/StillStore.h
     src/StillStore.cpp
+    src/SequenceListDock.h
+    src/SequenceListDock.cpp
     src/StillGalleryDock.h
     src/StillGalleryDock.cpp
     src/OnionSkin.h
@@ -370,6 +393,9 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     # ED (EDL エクスポート): CMX3600 EDL の純粋書き出しエンジン (放送/Avid/DaVinci 互換)。
     src/EdlExport.h
     src/EdlExport.cpp
+    src/selftests/export_pro_selftest.cpp
+    src/selftests/export_alpha_selftest.cpp
+    src/selftests/export_presets_selftest.cpp
     src/selftests/edl_export_selftest.cpp
     # WS (ワークスペース): 名前付きドックレイアウトの純粋モデル (Premiere/Resolve 相当)。
     src/WorkspaceManager.h
@@ -483,6 +509,9 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/GraphEditorPanel.cpp
     src/selftests/GraphEditorSelftest.cpp
     src/selftests/RippleDeleteSelftest.cpp
+    src/selftests/track_manage_selftest.cpp
+    src/selftests/track_ops_selftest.cpp
+    src/selftests/timeline_ergo_selftest.cpp
     src/selftests/FreezeFrameSelftest.cpp
     src/MotionSectionWidget.h
     src/MotionSectionWidget.cpp
@@ -603,10 +632,14 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/ProxyProgressDialog.cpp
     src/ProxyManagementDialog.cpp
     src/DecoderSlotManager.cpp
+    src/AudioTrackFx.h
+    src/AudioTrackFx.cpp
     src/AudioMixer.cpp
     src/PlanarTracker.cpp
     src/FeatureTracker.cpp
     src/FeatureTracker.h
+    src/BundleAdjustment.cpp
+    src/BundleAdjustment.h
     src/PlanarTracker.h
     src/PlanarTrackerDialog.cpp
     src/PlanarTrackerDialog.h
@@ -616,6 +649,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/ColorMatchLutGenerator.h
     src/SurfaceTool.cpp
     src/SurfaceTool.h
+    src/MeshEditTool.cpp
+    src/MeshEditTool.h
     src/EqualizerPanel.cpp
     src/EqualizerPanel.h
     src/CompressorPanel.cpp
@@ -723,6 +758,11 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/Camera3D.cpp
     src/CameraSolver.h
     src/CameraSolver.cpp
+    src/TwoViewGeometry.h
+    src/TwoViewGeometry.cpp
+    src/AudioKeyframes.h
+    src/AudioKeyframes.cpp
+    src/selftests/audio_keyframes_selftest.cpp
     src/Expression.cpp
     src/Precompose.cpp
     src/Rotoscope.cpp
@@ -971,6 +1011,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     Qt6::OpenGLWidgets
     Qt6::Network
     Qt6::Concurrent
+    Qt6::Test
     ${AVFORMAT_LIBRARY}
     ${AVCODEC_LIBRARY}
     ${AVUTIL_LIBRARY}

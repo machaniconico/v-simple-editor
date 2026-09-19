@@ -86,6 +86,12 @@ QImage composeEcho(const QImage &base, const QVector<QImage> &echoes,
 using EchoFrameProvider =
     std::function<QImage(double sourceSeconds, double clipLocalSeconds)>;
 
+// Clip mesh is applied once after the ordered FX stack, before masks/geometry.
+bool hasActiveMeshWarp(const ClipInfo &clip);
+void setMeshWarpDisabledForTesting(bool disabled);
+void resetMeshWarpInvocationCountForTesting();
+quint64 meshWarpInvocationCountForTesting();
+
 // CPU-only temporal repair. Source and provider must have the same FX prefix.
 // sourceFps=0 probes the source stream (generated sources fall back to 30 Hz).
 bool hasActiveRollingShutter(const ClipInfo &clip, double clipLocalSeconds);

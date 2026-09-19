@@ -8,6 +8,7 @@
 #include <QDockWidget>
 #include <QListWidget>
 #include <QStringList>
+#include <functional>
 
 #include "MediaPool.h"
 
@@ -16,7 +17,9 @@ class QTreeWidgetItem;
 class QListWidgetItem;
 class QLineEdit;
 class QMimeData;
+class QComboBox;
 class QPushButton;
+class ThumbnailCache;
 
 class MediaPoolAssetListWidget : public QListWidget
 {
@@ -42,6 +45,10 @@ public:
 
     // pool の状態からビンツリーと素材一覧を再描画する。
     void refresh();
+    void setUsedPathsProvider(std::function<QSet<QString>()> provider);
+    void refreshUsedPaths();
+    bool thumbnailsEnabled() const { return m_thumbnailsEnabled; }
+    void setThumbnailsEnabled(bool enabled);
 
     // 素材一覧で現在選択されている項目のパス。選択なしは空文字列。
     QString selectedAssetPath() const;
@@ -51,6 +58,10 @@ signals:
     void assetActivated(const QString &filePath);
     // 「読み込み...」ボタン押下時。
     void importRequested();
+    void poolChanged();
+
+protected:
+    bool eventFilter(QObject *watched, QEvent *event) override;
 
 private slots:
     void onSearchTextChanged(const QString &text);
@@ -61,6 +72,8 @@ private slots:
     void onImportClicked();
 
 private:
+    void showAssetContextMenu(const QPoint &pos);
+    void showBinContextMenu(const QPoint &pos);
     void rebuildBinTree();
     void showAssets(const QVector<mediapool::MediaAsset> &assets);
     void showAssetsForCurrentBin();
@@ -70,6 +83,13 @@ private:
     QString currentBinId() const;
 
     mediapool::MediaPool *m_pool = nullptr;
+    ThumbnailCache *m_thumbnailCache = nullptr;
+    bool m_thumbnailsEnabled = true;
+    QListWidgetItem *m_hoverItem = nullptr;
+    void setThumbnail(QListWidgetItem *item, int index = 0);
+
+    std::function<QSet<QString>()> m_usedPathsProvider;
+    QComboBox *m_filterCombo = nullptr;
 
     QLineEdit   *m_searchEdit  = nullptr;
     QTreeWidget *m_binTree     = nullptr;

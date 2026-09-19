@@ -15,7 +15,7 @@ QList<QPair<QString, QKeySequence>> ShortcutManager::presetBindingTable(Preset p
 
     switch (p) {
     case Preset::VEditor:
-        // VEditor default — returns empty; defaults come from registerAction
+        // VEditor defaults come from registerAction; new operations are below.
         break;
 
     case Preset::Premiere:
@@ -90,6 +90,23 @@ QList<QPair<QString, QKeySequence>> ShortcutManager::presetBindingTable(Preset p
         break;
     }
 
+    // Common timeline operations are available in every preset.
+    table << P{"timeline.jump_timecode", QKeySequence("Ctrl+Shift+J")}
+          << P{"timeline.zoom_fit_sequence", QKeySequence()}
+          << P{"timeline.zoom_selection", QKeySequence()}
+          << P{"timeline.move_head_to_playhead", QKeySequence()}
+          << P{"timeline.move_tail_to_playhead", QKeySequence()}
+          << P{"timeline.select_same_label", QKeySequence()}
+          << P{"timeline.select_forward", QKeySequence()}
+          << P{"timeline.select_backward", QKeySequence()}
+          << P{"timeline.blade_all", QKeySequence("Ctrl+Shift+K")}
+          << P{"timeline.lift", QKeySequence()}
+          << P{"timeline.duplicate", QKeySequence("Ctrl+D")}
+          << P{"timeline.nudge_left", QKeySequence("Alt+Left")}
+          << P{"timeline.nudge_right", QKeySequence("Alt+Right")}
+          << P{"timeline.nudge_left10", QKeySequence("Alt+Shift+Left")}
+          << P{"timeline.nudge_right10", QKeySequence("Alt+Shift+Right")}
+          << P{"timeline.close_all_gaps", QKeySequence()};
     return table;
 }
 

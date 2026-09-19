@@ -117,6 +117,10 @@ public:
     void setAcesPipeline(const aces::AcesPipeline &p);
     void setLoudnessGainDb(double gainDb);
 
+    static QString alphaExportError(const QJsonObject &config);
+    static void resetBlackCompositeCountForTest();
+    static int blackCompositeCountForTest();
+
     static QStringList buildLoudnessAudioFilterArgs(double gainDb);
 
     // RenderJob::projectFilePath は音声 mux 元 (メディア or 事前ミックス) を兼ねる。

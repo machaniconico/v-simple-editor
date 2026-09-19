@@ -20,6 +20,30 @@ QVector<ParamDef> paramSchemaFor(VideoEffectType type)
     case VideoEffectType::Mosaic:
         return { { "blockSize", "Block Size", ParamType::Float, 2.0, 100.0, 10.0 } };
 
+    case VideoEffectType::BroadcastSafe:
+        return {
+            { "standard", "規格 (0=Rec.709 リーガル / 1=RGB 全域)", ParamType::Int, 0.0, 1.0, 0.0 },
+            { "maxChroma", "上限クロマ", ParamType::Float, 0.0, 1.0, 1.0 }
+        };
+    case VideoEffectType::LeaveColor:
+        return {
+            { "tolerance", "許容度", ParamType::Float, 0.0, 1.0, 0.15 },
+            { "desaturation", "彩度の減衰", ParamType::Float, 0.0, 1.0, 1.0 },
+            { "color", "残す色", ParamType::Color, 0.0, 0.0, encodedColorDefault(QColor(255, 0, 0)) }
+        };
+    case VideoEffectType::LumaKey:
+        return {
+            { "lower", "下限しきい値", ParamType::Float, 0.0, 1.0, 0.0 },
+            { "upper", "上限しきい値", ParamType::Float, 0.0, 1.0, 0.3 },
+            { "softness", "ソフトネス", ParamType::Float, 0.0, 0.5, 0.05 }
+        };
+    case VideoEffectType::ColorKey:
+        return {
+            { "tolerance", "許容度", ParamType::Float, 0.0, 1.0, 0.1 },
+            { "softness", "ソフトネス", ParamType::Float, 0.0, 0.5, 0.05 },
+            { "color", "キーカラー", ParamType::Color, 0.0, 0.0, encodedColorDefault(QColor(0, 255, 0)) }
+        };
+
     case VideoEffectType::ChromaKey:
         return {
             { "tolerance", "Tolerance", ParamType::Float, 0.0, 100.0, 40.0 },
@@ -223,6 +247,9 @@ QVector<ParamDef> paramSchemaFor(VideoEffectType type)
             { "radius", "半径", ParamType::Float, 0.0, 1.0, 0.5 }
         };
 
+    case VideoEffectType::Flip:
+        return { { "mode", "方向 (0=水平 / 1=垂直 / 2=両方)", ParamType::Int, 0.0, 2.0, 0.0 } };
+
     case VideoEffectType::Mirror:
         return { { "mode", "モード", ParamType::Int, 0.0, 3.0, 0.0 } };
 
@@ -245,6 +272,13 @@ QVector<ParamDef> paramSchemaFor(VideoEffectType type)
             { "verticalTilt", "垂直チルト", ParamType::Float, -100.0, 100.0, 0.0 }
         };
 
+    case VideoEffectType::LogToRec709:
+        return {
+            { "input", "入力 (0=S-Log3 / 1=LogC3 EI800 / 2=V-Log / 3=Cineon)", ParamType::Int, 0.0, 3.0, 0.0 },
+            { "exposure", "露出オフセット (stop)", ParamType::Float, -3.0, 3.0, 0.0 },
+            { "output", "出力 (0=ガンマ2.4 / 1=リニア / 2=Rec.709 OETF)", ParamType::Int, 0.0, 2.0, 0.0 }
+        };
+
     case VideoEffectType::LensDistortion:
         return {
             { "k1", "径方向２次", ParamType::Float, -0.5, 0.5, 0.0 },
@@ -260,6 +294,31 @@ QVector<ParamDef> paramSchemaFor(VideoEffectType type)
             { "size", "サイズ", ParamType::Int, 1.0, 4.0, 1.0 },
             { "colorAmount", "カラー量", ParamType::Float, 0.0, 1.0, 0.0 },
             { "seedPerFrame", "フレーム毎にシード", ParamType::Bool, 0.0, 1.0, 1.0 }
+        };
+
+    case VideoEffectType::WarpWave:
+        return {
+            { "amplitude", "振幅 (px)", ParamType::Float, 0.0, 100.0, 10.0 },
+            { "frequency", "周波数", ParamType::Float, 0.1, 20.0, 2.0 },
+            { "phase", "位相", ParamType::Float, 0.0, 1.0, 0.0 }
+        };
+    case VideoEffectType::WarpRipple:
+        return {
+            { "amplitude", "振幅 (px)", ParamType::Float, 0.0, 100.0, 10.0 },
+            { "frequency", "周波数", ParamType::Float, 0.1, 20.0, 2.0 },
+            { "radius", "半径 (短辺比)", ParamType::Float, 0.0, 1.0, 0.5 }
+        };
+    case VideoEffectType::WarpSpherize:
+        return {
+            { "amount", "量", ParamType::Float, -1.0, 1.0, 0.5 },
+            { "radius", "半径 (短辺比)", ParamType::Float, 0.0, 1.0, 0.5 }
+        };
+    case VideoEffectType::WarpFisheye:
+        return { { "amount", "量", ParamType::Float, 0.0, 1.0, 0.5 } };
+    case VideoEffectType::WarpPinch:
+        return {
+            { "amount", "量", ParamType::Float, 0.0, 1.0, 0.5 },
+            { "radius", "半径 (短辺比)", ParamType::Float, 0.0, 1.0, 0.5 }
         };
 
     case VideoEffectType::RollingShutterRepair:

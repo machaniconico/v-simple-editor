@@ -5,6 +5,7 @@
 #include <QString>
 #include <QHash>
 #include <QMutex>
+#include <QMutexLocker>
 #include <QIODevice>
 #include <QAudioSink>
 #include <QAudioFormat>
@@ -16,6 +17,7 @@
 
 #include "PlaybackTypes.h"
 #include "AudioEQ.h"
+#include "AudioTrackFx.h"
 #include "AudioBusRouting.h"
 
 // AudioMixer — sums up to MAX_AUDIO_TRACKS independent FFmpeg-decoded
@@ -175,36 +177,59 @@ public:
     // Per-track realtime EQ (3-band biquad, applied before effectiveGain).
     void setTrackEqConfig(int trackIdx, const AudioEQConfig &cfg);
     AudioEQConfig trackEqConfig(int trackIdx) const;
+    bool trackEqEnabled(int trackIdx) const {
+        QMutexLocker lock(&m_controlMutex);
+        return trackIdx >= 0 && trackIdx < m_trackStates.size()
+            && m_trackStates[trackIdx].eqEnabled;
+    }
     void setTrackEqEnabled(int trackIdx, bool enabled);
 
     // Per-track 4-band parametric EQ (Premiere/Audition parity). Independent
     // of the legacy 3-band path above; cascaded BEFORE volume/pan stages
     // (signal flow: 4-band EQ → existing 3-band EQ → preamp → gain).
-    // trackId convention: 0 = master, 1 = A1, 2 = A2, ... (the audio mix
-    // path uses sourceTrack which is 1-based for tracks; trackId=0 is
-    // reserved for a future master-bus EQ and currently no-ops in the
-    // mix loop, so it is safe to call with 0 from the panel).
-    struct EqBand {
-        double freq;
-        double gainDb;
-        double q;
-        bool enabled = true;
-    };
-    struct EqSettings {
-        EqBand low{80.0, 0.0, 0.7};
-        EqBand lowMid{250.0, 0.0, 1.0};
-        EqBand highMid{3000.0, 0.0, 1.0};
-        EqBand high{10000.0, 0.0, 0.7};
-    };
+    // Engine IDs are sourceTrack: 0 = A1, 1 = A2, ... . The master
+    // sentinel is UI-only and never indexes m_trackFxChains.
+    static constexpr int kMasterTrackId = -1;
+    using EqBand = trackfx::EqBand;
+    using EqSettings = trackfx::EqSettings;
+    // Test switch selects the retained production legacy branch (default: new).
+    void setLegacyTrackFxPathForTest(bool legacy);
+    quint64 trackFxProcessCallsForTest() const;
+    void processTrackFxForTest(int trackId, int16_t *samples, int frames);
+    // Per-thread snapshot, valid until the next trackChain call on this thread.
+    const trackfx::Chain &trackChain(int trackId) const;
+    void setTrackChain(int trackId, const trackfx::Chain &chain);
+    void clearTrackFx();
+    QJsonObject collectTrackState() const;
+    void applyTrackState(const QJsonObject &state);
+    void remapTrackIndices(const QVector<int> &oldToNew);
+
+    trackfx::Chain masterChain() const;
+    void setMasterEq(const EqSettings &eq, bool enabled = true);
+    void setMasterEqBypassForTest(bool bypass);
+    quint64 masterEqProcessCallsForTest() const;
+    // Exercises the same post-sum, pre-normalizer stage as readData.
+    void processMasterEqForTest(int32_t *samples, int frames);
+
     void setEqForTrack(int trackId, const EqSettings &eq);
     EqSettings eqForTrack(int trackId) const;
 
     // Cached biquad coefficients for the 4-band path. Kept public so the
     // namespace-scoped computeEqBand helper in AudioMixer.cpp can return it
     // before the GUI thread takes m_controlMutex.
-    struct EqBandCoefsParam {
-        double b0 = 1.0, b1 = 0.0, b2 = 0.0, a1 = 0.0, a2 = 0.0;
-        bool active = false; // false = pass-through (skip math, keep history pristine)
+    using EqBandCoefsParam = trackfx::EqBandCoefsParam;
+
+    // Shared 48 kHz stereo master EQ. Both sample formats retain bus
+    // headroom; only the final output conversion may clamp to s16.
+    struct MasterEqFilter {
+        void setEq(const EqSettings &eq);
+        void reset();
+        void process(float *samples, int frames);
+        void process(int32_t *samples, int frames);
+    private:
+        double processSample(double sample, int channel);
+        std::array<EqBandCoefsParam, 4> m_coefs{};
+        std::array<double, 16> m_history{};
     };
 
     // Per-track feed-forward compressor / limiter (Audition / Resolve
@@ -220,19 +245,8 @@ public:
     // 1000:1 ratio and forces attack to 0.5 ms regardless of attackMs, so
     // any ratio knob value of 20+ becomes a brick-wall limit at threshold
     // (overshoot bounded by the 0.5 ms attack, ≤0.5 dB at typical material).
-    struct CompressorSettings {
-        double thresholdDb = 0.0;     // 0 = no compression at any signal level
-        double ratio = 1.0;           // 1:1 = no compression (pass-through)
-        double attackMs = 5.0;
-        double releaseMs = 100.0;
-        double kneeDb = 2.0;
-        double makeupDb = 0.0;
-        bool enabled = false;
-    };
-    struct CompressorState {
-        double env = 0.0;        // envelope follower (linear amplitude)
-        double currentGrDb = 0.0;// last gain reduction in dB (for meter)
-    };
+    using CompressorSettings = trackfx::CompressorSettings;
+    using CompressorState = trackfx::CompressorState;
     void setCompressorForTrack(int trackId, const CompressorSettings &c);
     CompressorSettings compressorForTrack(int trackId) const;
     double currentGainReductionDb(int trackId) const;
@@ -250,14 +264,7 @@ public:
     // 1.0 sec reference. High-freq damping = LP coefficient inside the
     // comb feedback loop (0=none, 1=heavy damping). Width controls
     // stereo cross-feed (0=mono sum, 100=fully decorrelated channels).
-    struct ReverbSettings {
-        double mixRatio = 0.0;       // 0.0..1.0  (UI 0..100 / 100)
-        double decaySeconds = 1.0;   // 0.1..5.0
-        double preDelayMs = 20.0;    // 0..200
-        double dampingHF = 30.0;     // 0..100
-        double widthPercent = 50.0;  // 0..100
-        bool enabled = false;
-    };
+    using ReverbSettings = trackfx::ReverbSettings;
     void setReverbForTrack(int trackId, const ReverbSettings &r);
     ReverbSettings reverbForTrack(int trackId) const;
 
@@ -275,24 +282,11 @@ public:
     //
     // Disabled = bit-exact bypass (skip the entire envelope + curve math
     // and do not touch state, mirroring the compressor / reverb stages).
-    struct NoiseReductionSettings {
-        double thresholdDb = -20.0;   // gate engages this many dB above floor
-        double reductionDb = 12.0;    // max attenuation when fully gated
-        double attackMs = 5.0;        // envelope attack
-        double releaseMs = 200.0;     // envelope release
-        double manualFloorDb = -50.0; // used when autoFloor == false
-        bool autoFloor = true;
-        bool enabled = false;
-    };
+    using NoiseReductionSettings = trackfx::NoiseReductionSettings;
     // Per-track NR DSP state. recentEnvs is a rolling-window envelope
     // history (in dBFS) used to compute the 5th-percentile auto-floor;
     // capacity is sized to ~5 seconds at the readData fragment cadence.
-    struct NRState {
-        double env = 0.0;                  // envelope follower (linear amplitude)
-        double estimatedFloorDb = -60.0;   // last computed auto-floor
-        QVector<double> recentEnvs;        // rolling-window dBFS samples
-        int recentEnvsHead = 0;            // circular write index
-    };
+    using NRState = trackfx::NRState;
     void setNoiseReductionForTrack(int trackId, const NoiseReductionSettings &nr);
     NoiseReductionSettings noiseReductionForTrack(int trackId) const;
     double estimatedNoiseFloorDb(int trackId) const;
@@ -343,11 +337,19 @@ private:
     friend class MixerIODevice;
     friend class AudioDecodeRunner;
 
+public:
     struct EqBandCoefs {
         double b0 = 1.0, b1 = 0.0, b2 = 0.0, a1 = 0.0, a2 = 0.0;
     };
 
-public:
+    std::array<EqBandCoefs, 3> trackEqCoeffs(int trackIdx) const
+    {
+        QMutexLocker lock(&m_controlMutex);
+        if (trackIdx < 0 || trackIdx >= m_trackStates.size())
+            return {};
+        return m_trackStates[trackIdx].eqCoeffs;
+    }
+
     struct EqBandCache {
         double frequency = 0;
         double q = 0;
@@ -418,6 +420,16 @@ private:
     // Per-track config + per-channel biquad history (4 bands x 2 channels x
     // 2 history samples = 16 doubles). Coefs cached in m_trackEqCoefs to
     // avoid recomputing inside readData.
+    void processTrackFxLocked(int trackIdx, const int16_t *src, int16_t *output, int samples);
+    void processMasterEqLocked(int32_t *samples, int frames);
+    trackfx::Chain m_masterFxChain;
+    MasterEqFilter m_masterEqFilter;
+    bool m_masterEqBypassForTest = false;
+    quint64 m_masterEqProcessCalls = 0;
+    QHash<int, trackfx::Chain> m_trackFxChains;
+    QHash<int, trackfx::Processor> m_trackFxProcessors;
+    bool m_legacyTrackFxPath = false;
+    quint64 m_trackFxProcessCalls = 0;
     QHash<int, EqSettings> m_trackEq;
     QHash<int, std::array<double, 16>> m_trackEqHist;
     QHash<int, std::array<EqBandCoefsParam, 4>> m_trackEqCoefs;

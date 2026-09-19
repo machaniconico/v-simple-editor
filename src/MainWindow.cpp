@@ -1,3 +1,5 @@
+#include "MeshEditTool.h"
+#include "libavcore/FrameGrab.h"
 #include "RenderInPlace.h"
 #include "MainWindow.h"
 #include "VideoPlayer.h"
@@ -18,11 +20,13 @@ void exporter_setAcesPipeline(const aces::AcesPipeline &pipeline);
 double exporter_loudnessGainDb();
 #include "TrimOps.h"
 #include "ExportDialog.h"
+#include "CodecDetector.h"
 #include "FrameExport.h"
 #include "FrameClipboard.h"
 #include "UndoManager.h"
 #include "OverlayDialogs.h"
 #include "VideoEffectDialogs.h"
+#include "EffectParamSchema.h"
 #include "EffectPlugin.h"
 #include "ColorGradingPanel.h"
 #include "EffectControlsPanel.h"
@@ -96,6 +100,7 @@ double exporter_loudnessGainDb();
 #include "ClipGeometry.h"
 #include "SourceMonitorDock.h"
 #include "StillGalleryDock.h"
+#include "SequenceListDock.h"
 #include "AudioBusPanel.h"   // AB-5: オーディオ バス パネル ドック
 #include "util/RcPause.h"
 
@@ -218,6 +223,11 @@ double exporter_loudnessGainDb();
 #include "VoiceIsolationDialog.h"
 #include "NoisePrintDialog.h"
 #include "libavcore/AudioExtract.h"
+#include "AudioMixer.h"
+#include "playback/AudioPan.h"
+#include "AudioTrackFx.h"
+#include <QMap>
+#include <vector>
 #if __has_include("AnimatedExportDialog.h")
   #include "AnimatedExportDialog.h"
   #define HAVE_ANIMATED_EXPORT_DIALOG 1
@@ -251,6 +261,7 @@ double exporter_loudnessGainDb();
 #include <QProgressDialog>
 #include <QShortcut>
 #include <QInputDialog>
+#include "Timecode.h"
 #include <QCloseEvent>
 #include <QFile>
 #include <QFileDialog>      // DV-4: DV XML 保存ダイアログ
@@ -359,6 +370,18 @@ extern "C" {
 #include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
 }
+
+namespace audiofxexport {
+// Thread-local instrumentation: export tests cannot alter another worker.
+thread_local bool masterEqBypass = false;
+thread_local quint64 masterEqPasses = 0;
+void setMasterEqBypassForTest(bool bypass)
+{
+    masterEqBypass = bypass;
+    masterEqPasses = 0;
+}
+quint64 masterEqPassesForTest() { return masterEqPasses; }
+} // namespace audiofxexport
 
 namespace {
 
@@ -793,6 +816,14 @@ bool timelineNeedsAudioMixForExport(Timeline *timeline)
 {
     if (!timeline)
         return false;
+    if (AudioMixer *mixer = timeline->audioMixer()) {
+        for (int track = 0; track < timeline->audioTracks().size(); ++track) {
+            const trackfx::Chain chain = mixer->trackChain(track);
+            if (chain.eqEnabled || chain.compEnabled || chain.reverbEnabled || chain.nrEnabled
+                || (mixer->trackEqEnabled(track) && !mixer->trackEqConfig(track).isDefault()))
+                return true;
+        }
+    }
     return !timelineAudioMatchesPassthrough(timeline);
 }
 
@@ -891,7 +922,32 @@ QString prepareTimelineAudioMixForExport(Timeline *timeline, QString *error,
                                          const QString &forcedOutputPath = {},
                                          double forcedDurationSeconds = 0.0)
 {
-    if (forcedOutputPath.isEmpty() && !timelineNeedsAudioMixForExport(timeline))
+    if (!timeline)
+        return {};
+    QMap<int, trackfx::Chain> trackChains;
+    QMap<int, AudioEQConfig> legacyEqConfigs;
+    QMap<int, std::array<AudioMixer::EqBandCoefs, 3>> legacyEqCoeffs;
+    QMap<int, bool> legacyEqEnabled;
+    QMap<int, double> trackGains;
+    bool useTrackFx = false;
+    trackfx::Chain masterChain;
+    if (AudioMixer *mixer = timeline->audioMixer()) {
+        masterChain = mixer->masterChain();
+        for (int track = 0; track < timeline->audioTracks().size(); ++track) {
+            const trackfx::Chain chain = mixer->trackChain(track);
+            trackChains.insert(track, chain);
+            legacyEqConfigs.insert(track, mixer->trackEqConfig(track));
+            legacyEqCoeffs.insert(track, mixer->trackEqCoeffs(track));
+            legacyEqEnabled.insert(track, mixer->trackEqEnabled(track));
+            trackGains.insert(track, mixer->trackGain(track));
+            useTrackFx = useTrackFx || chain.eqEnabled || chain.compEnabled
+                || chain.reverbEnabled || chain.nrEnabled
+                || (legacyEqEnabled.value(track) && !legacyEqConfigs.value(track).isDefault());
+        }
+    }
+    const bool useMasterEq = masterChain.eqEnabled && !audiofxexport::masterEqBypass;
+    if (forcedOutputPath.isEmpty() && !useTrackFx && !useMasterEq
+        && timelineAudioMatchesPassthrough(timeline))
         return {};
 
     const QVector<PlaybackEntry> entries = timeline->computeAudioPlaybackSequence();
@@ -900,6 +956,60 @@ QString prepareTimelineAudioMixForExport(Timeline *timeline, QString *error,
         ? forcedDurationSeconds : timeline->totalDuration());
     const QString outputPath = forcedOutputPath.isEmpty()
         ? nextExportAudioMixPath() : forcedOutputPath;
+    // Audio-only export uses a PCM intermediate so lossy encoding happens only
+    // at the final output. Keep the default video-export arguments unchanged.
+    const bool pcmIntermediate = renderInPlace
+        && QFileInfo(outputPath).suffix().compare(QStringLiteral("wav"), Qt::CaseInsensitive) == 0;
+    QStringList outputArgs;
+    if (pcmIntermediate) {
+        outputArgs << QStringLiteral("-c:a") << QStringLiteral("pcm_s16le");
+    } else {
+        outputArgs << QStringLiteral("-c:a") << QStringLiteral("aac")
+                   << QStringLiteral("-b:a") << QStringLiteral("192k")
+                   << QStringLiteral("-movflags") << QStringLiteral("+faststart");
+    }
+    outputArgs << outputPath;
+
+    // Default path retains precisely the original single-pass arguments.
+    // Enabled master EQ is applied once to the final amix output, including
+    // every track's clip/track gain and pan, using the playback EQ processor.
+    const auto finishMix = [&](QStringList mixArgs) -> QString {
+        if (!useMasterEq) {
+            mixArgs << outputArgs;
+            return runFfmpegForAudioMix(mixArgs, error) ? outputPath : QString();
+        }
+        ++audiofxexport::masterEqPasses;
+        QTemporaryDir masterTemporary;
+        if (!masterTemporary.isValid()) {
+            if (error) *error = QStringLiteral("マスター EQ の一時フォルダーを作成できません。");
+            return {};
+        }
+        const QString mixPath = masterTemporary.filePath(QStringLiteral("master.wav"));
+        mixArgs << QStringLiteral("-ar") << QString::number(AudioMixer::kSampleRateHz)
+                << QStringLiteral("-ac") << QString::number(AudioMixer::kChannels)
+                << QStringLiteral("-c:a") << QStringLiteral("pcm_f32le") << mixPath;
+        if (!runFfmpegForAudioMix(mixArgs, error)) return {};
+        std::vector<float> samples;
+        int rate = 0, channels = 0;
+        if (!libavcore::readWavFloatInterleaved(mixPath, &samples, &rate, &channels, error))
+            return {};
+        if (rate != AudioMixer::kSampleRateHz || channels != AudioMixer::kChannels) {
+            if (error) *error = QStringLiteral("マスター音声の形式が不正です。");
+            return {};
+        }
+        AudioMixer::MasterEqFilter masterProcessor;
+        masterProcessor.setEq(masterChain.eq);
+        const size_t frames = samples.size() / channels;
+        for (size_t frame = 0; frame < frames; frame += 4096)
+            masterProcessor.process(samples.data() + frame * channels,
+                static_cast<int>(std::min<size_t>(4096, frames - frame)));
+        if (!libavcore::writeWavFloatInterleaved(mixPath, samples, rate, channels, error))
+            return {};
+        QStringList encodeArgs{QStringLiteral("-y"), QStringLiteral("-i"), mixPath,
+                               QStringLiteral("-vn")};
+        encodeArgs << outputArgs;
+        return runFfmpegForAudioMix(encodeArgs, error) ? outputPath : QString();
+    };
 
     QStringList args;
     args << QStringLiteral("-y");
@@ -937,12 +1047,105 @@ QString prepareTimelineAudioMixForExport(Timeline *timeline, QString *error,
              << QStringLiteral("-i")
              << QStringLiteral("anullsrc=channel_layout=stereo:sample_rate=48000")
              << QStringLiteral("-t") << ffmpegNumber(durationSeconds)
-             << QStringLiteral("-vn")
-             << QStringLiteral("-c:a") << QStringLiteral("aac")
-             << QStringLiteral("-b:a") << QStringLiteral("192k")
-             << QStringLiteral("-movflags") << QStringLiteral("+faststart")
-             << outputPath;
-        return runFfmpegForAudioMix(args, error) ? outputPath : QString();
+             << QStringLiteral("-vn");
+        return finishMix(args);
+    }
+
+    if (useTrackFx) {
+        // Snapshot settings above, before starting any potentially long render.
+        // Every track (including dry tracks) remains float until the master mix.
+        QTemporaryDir temporary;
+        if (!temporary.isValid()) {
+            if (error) *error = QStringLiteral("トラック音声の一時フォルダーを作成できません。");
+            return {};
+        }
+        // Process source clips in timeline order, retaining each track's DSP
+        // histories across clips. Gaps/delays never enter the DSP or NR detector.
+        QVector<int> orderedEntries;
+        for (int i = 0; i < validEntries.size(); ++i)
+            orderedEntries.append(i);
+        std::stable_sort(orderedEntries.begin(), orderedEntries.end(), [&](int a, int b) {
+            return validEntries[a].timelineStart < validEntries[b].timelineStart;
+        });
+        QMap<int, QVector<int>> entriesByTrack;
+        for (int i : orderedEntries)
+            entriesByTrack[validEntries[i].sourceTrack].append(i);
+        QVector<QString> clipPaths(validEntries.size());
+        for (auto it = entriesByTrack.cbegin(); it != entriesByTrack.cend(); ++it) {
+            const int track = it.key();
+            std::vector<audioexport::DspEntry> buffers;
+            buffers.reserve(it.value().size());
+            for (int i : it.value()) {
+                const PlaybackEntry &entry = validEntries[i];
+                const QString clipPath = temporary.filePath(QStringLiteral("clip_%1.wav").arg(i));
+                const QString filter = buildExportAudioMixEntryPreFxFilterChain(0,
+                    ffmpegNumber(entry.clipIn), ffmpegNumber(entry.clipOut),
+                    audioChannelModeForPlaybackEntry(entry), validReversedFlags.value(i, false),
+                    entry.speed);
+                QStringList clipArgs{QStringLiteral("-y"), QStringLiteral("-i"), entry.filePath};
+                clipArgs << QStringLiteral("-filter_complex") << filter
+                         << QStringLiteral("-map") << QStringLiteral("[prefx0]")
+                         << QStringLiteral("-vn") << QStringLiteral("-c:a") << QStringLiteral("pcm_f32le")
+                         << clipPath;
+                if (!runFfmpegForAudioMix(clipArgs, error)) return {};
+                std::vector<float> samples;
+                int rate = 0, channels = 0;
+                if (!libavcore::readWavFloatInterleaved(clipPath, &samples, &rate, &channels, error))
+                    return {};
+                if (rate != AudioMixer::kSampleRateHz || channels != AudioMixer::kChannels) {
+                    if (error) *error = QStringLiteral("トラック音声の形式が不正です。");
+                    return {};
+                }
+                buffers.push_back({qRound64(entry.timelineStart * AudioMixer::kSampleRateHz),
+                                   std::move(samples)});
+                clipPaths[i] = clipPath;
+            }
+            audioexport::processTrackEntries(buffers, trackChains.value(track),
+                legacyEqCoeffs.value(track), legacyEqEnabled.value(track, false),
+                legacyEqConfigs.value(track).preamp);
+            for (size_t index = 0; index < buffers.size(); ++index) {
+                if (!libavcore::writeWavFloatInterleaved(clipPaths[it.value()[static_cast<int>(index)]],
+                        buffers[index].samples, AudioMixer::kSampleRateHz, AudioMixer::kChannels, error))
+                    return {};
+            }
+        }
+        QStringList finalArgs{QStringLiteral("-y")};
+        QStringList finalInputs, finalChains;
+        for (int i = 0; i < validEntries.size(); ++i) {
+            const PlaybackEntry &entry = validEntries[i];
+            finalArgs << QStringLiteral("-i") << clipPaths[i];
+            const double clipDuration = std::isfinite(entry.speed) && entry.speed > 0.0
+                ? qMax(0.0, (entry.clipOut - entry.clipIn) / entry.speed)
+                : qMax(0.0, entry.clipOut - entry.clipIn);
+            QString post = buildExportAudioMixEntryPostFxFilterChain(i,
+                qMax(0, qRound(entry.timelineStart * 1000.0)),
+                volumeExpressionForEntry(entry), clipDuration,
+                entry.leadInType, entry.leadInDuration, entry.trailOutType, entry.trailOutDuration);
+            // Static track gain and clip balance also belong after the DSP.
+            const auto pan = audiopan::balanceGains(entry.pan);
+            const double gain = trackGains.value(entry.sourceTrack, 1.0);
+            if (gain != 1.0 || entry.pan != 0.0) {
+                post.insert(QStringLiteral("[%1:a]").arg(i).size(),
+                    QStringLiteral("pan=stereo|c0=%1*c0|c1=%2*c1,")
+                        .arg(ffmpegNumber(gain * pan.left), ffmpegNumber(gain * pan.right)));
+            }
+            finalChains << post;
+            if (renderInPlace) {
+                finalChains << QStringLiteral("[a%1]asetpts=N/SR/TB[rip%1]").arg(i);
+                finalInputs << QStringLiteral("[rip%1]").arg(i);
+            } else {
+                finalInputs << QStringLiteral("[a%1]").arg(i);
+            }
+        }
+        finalChains << QStringLiteral("%1amix=inputs=%2:normalize=0:duration=longest,"
+                                      "%4atrim=duration=%3,asetpts=PTS-STARTPTS[aout]")
+            .arg(finalInputs.join(QString()), QString::number(finalInputs.size()),
+                 ffmpegNumber(durationSeconds),
+                 renderInPlace ? QStringLiteral("asetpts=N/SR/TB,apad,") : QString());
+        const QString finalFilter = finalChains.join(QLatin1Char(';'));
+        finalArgs << QStringLiteral("-filter_complex") << finalFilter
+                  << QStringLiteral("-map") << QStringLiteral("[aout]") << QStringLiteral("-vn");
+        return finishMix(finalArgs);
     }
 
     QStringList chains;
@@ -974,13 +1177,8 @@ QString prepareTimelineAudioMixForExport(Timeline *timeline, QString *error,
 
     args << QStringLiteral("-filter_complex") << chains.join(QStringLiteral(";"))
          << QStringLiteral("-map") << QStringLiteral("[aout]")
-         << QStringLiteral("-vn")
-         << QStringLiteral("-c:a") << QStringLiteral("aac")
-         << QStringLiteral("-b:a") << QStringLiteral("192k")
-         << QStringLiteral("-movflags") << QStringLiteral("+faststart")
-         << outputPath;
-
-    return runFfmpegForAudioMix(args, error) ? outputPath : QString();
+         << QStringLiteral("-vn");
+    return finishMix(args);
 }
 
 QGroupBox *findVfxGroup(VfxControlsPanel *panel, const QString &title)
@@ -2110,106 +2308,9 @@ playback::AutoProxyClip probeAutoProxyClipMetadata(const QString &filePath)
     return clip;
 }
 
-bool scaleFrameToQImagePadded(SwsContext *ctx,
-                              const AVFrame *frame,
-                              AVPixelFormat dstPixFmt,
-                              QImage &image)
-{
-    if (!ctx || !frame || image.isNull())
-        return false;
-
-    const int rowBytes = av_image_get_linesize(dstPixFmt, image.width(), 0);
-    if (rowBytes <= 0 || rowBytes > image.bytesPerLine())
-        return false;
-
-    uint8_t *tmpData[4] = { nullptr, nullptr, nullptr, nullptr };
-    int tmpStride[4] = { 0, 0, 0, 0 };
-    if (av_image_alloc(tmpData, tmpStride, image.width(), image.height(),
-                       dstPixFmt, 64) < 0)
-        return false;
-
-    sws_scale(ctx, frame->data, frame->linesize, 0, frame->height,
-              tmpData, tmpStride);
-    for (int y = 0; y < image.height(); ++y) {
-        std::memcpy(image.scanLine(y), tmpData[0] + y * tmpStride[0],
-                    static_cast<std::size_t>(rowBytes));
-    }
-    av_freep(&tmpData[0]);
-    return true;
-}
-
-QImage avFrameToQImage(const AVFrame *frame, AVCodecContext *decCtx)
-{
-    if (!frame || !decCtx)
-        return {};
-
-    SwsContext *toRgbCtx = sws_getContext(frame->width, frame->height, decCtx->pix_fmt,
-                                          frame->width, frame->height, AV_PIX_FMT_RGBA,
-                                          SWS_BILINEAR, nullptr, nullptr, nullptr);
-    if (!toRgbCtx)
-        return {};
-
-    QImage image(frame->width, frame->height, QImage::Format_RGBA8888);
-    if (!scaleFrameToQImagePadded(toRgbCtx, frame, AV_PIX_FMT_RGBA, image)) {
-        sws_freeContext(toRgbCtx);
-        return {};
-    }
-    sws_freeContext(toRgbCtx);
-    return image;
-}
-
 QImage decodeFrameAtSecondsFromFile(const QString &filePath, double sourceTimeSeconds)
 {
-    AVFormatContext *fmtCtx = nullptr;
-    AVCodecContext *decCtx = nullptr;
-    int streamIndex = -1;
-    if (!openVideoDecoder(filePath, &fmtCtx, &decCtx, &streamIndex))
-        return {};
-
-    AVStream *stream = fmtCtx->streams[streamIndex];
-    const double targetSeconds = qMax(0.0, sourceTimeSeconds);
-    const int64_t seekTarget = av_rescale_q(
-        static_cast<int64_t>(targetSeconds * AV_TIME_BASE),
-        AVRational{1, AV_TIME_BASE},
-        stream->time_base);
-    av_seek_frame(fmtCtx, streamIndex, seekTarget, AVSEEK_FLAG_BACKWARD);
-    avcodec_flush_buffers(decCtx);
-
-    AVPacket *packet = av_packet_alloc();
-    AVFrame *frame = av_frame_alloc();
-    QImage result;
-
-    while (av_read_frame(fmtCtx, packet) >= 0) {
-        if (packet->stream_index != streamIndex) {
-            av_packet_unref(packet);
-            continue;
-        }
-        if (avcodec_send_packet(decCtx, packet) < 0) {
-            av_packet_unref(packet);
-            continue;
-        }
-        av_packet_unref(packet);
-
-        while (avcodec_receive_frame(decCtx, frame) == 0) {
-            const int64_t pts = (frame->best_effort_timestamp != AV_NOPTS_VALUE)
-                ? frame->best_effort_timestamp
-                : frame->pts;
-            const double frameSeconds = (pts != AV_NOPTS_VALUE)
-                ? pts * av_q2d(stream->time_base)
-                : targetSeconds;
-            result = avFrameToQImage(frame, decCtx);
-            if (result.isNull() || frameSeconds + 1.0 / 120.0 < targetSeconds)
-                continue;
-            goto decode_done;
-        }
-    }
-
-decode_done:
-    av_frame_free(&frame);
-    av_packet_free(&packet);
-    avcodec_free_context(&decCtx);
-    avformat_close_input(&fmtCtx);
-    return result;
+    return libavcore::grabFrameAt(filePath, sourceTimeSeconds);
 }
 
 QImage combineMasksMax(const QImage &a, const QImage &b)
@@ -2694,6 +2795,62 @@ LoudnessMeasureResult measureTimelineLoudness(const QVector<PlaybackEntry> &entr
 
 } // namespace
 
+void audioexport::processTrackEntries(std::vector<DspEntry> &entries,
+                                      const trackfx::Chain &chain,
+                                      const std::array<AudioMixer::EqBandCoefs, 3> &coeffs,
+                                      bool eqEnabled, double preampDb)
+{
+    // Sort indices so callers retain their clip-to-buffer mapping.
+    std::vector<size_t> order;
+    for (size_t i = 0; i < entries.size(); ++i)
+        if (!entries[i].samples.empty()) order.push_back(i);
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return entries[a].frameStart < entries[b].frameStart;
+    });
+    if (order.empty()) return;
+    trackfx::Processor processor(chain, AudioMixer::kSampleRateHz, AudioMixer::kChannels);
+    processor.reset();
+    std::array<std::array<double, 4>, 3> z{};
+    const double preamp = std::pow(10.0, preampDb / 20.0);
+    qint64 end = entries[order.front()].frameStart;
+    for (size_t i : order)
+        end = std::max(end, entries[i].frameStart + static_cast<qint64>(entries[i].samples.size() / 2));
+    for (qint64 t = entries[order.front()].frameStart; t < end;) {
+        const qint64 blockEnd = std::min(t + 1024, end);
+        qint64 next = end;
+        bool active = false;
+        for (size_t i : order) {
+            auto &entry = entries[i];
+            const qint64 first = std::max(t, entry.frameStart);
+            const qint64 last = std::min(blockEnd,
+                entry.frameStart + static_cast<qint64>(entry.samples.size() / 2));
+            if (entry.frameStart >= blockEnd) next = std::min(next, entry.frameStart);
+            if (first >= last) continue;
+            active = true;
+            float *block = entry.samples.data() + 2 * static_cast<size_t>(first - entry.frameStart);
+            const int count = static_cast<int>(last - first);
+            processor.process(block, count);
+            if (!eqEnabled) continue;
+            // Same double cascade as MixerIODevice::readData. In particular,
+            // never saturate/quantize between the legacy EQ and preamp/gain.
+            for (int sample = 0; sample < count * 2; ++sample) {
+                double value = block[sample];
+                const int ch = sample & 1;
+                for (int b = 0; b < 3; ++b) {
+                    const auto &c = coeffs[b];
+                    const double w = value - c.a1 * z[b][ch] - c.a2 * z[b][ch + 2];
+                    value = c.b0 * w + c.b1 * z[b][ch] + c.b2 * z[b][ch + 2];
+                    z[b][ch + 2] = z[b][ch];
+                    z[b][ch] = w;
+                }
+                block[sample] = static_cast<float>(value * preamp);
+            }
+        }
+        // Gaps do not advance DSP histories or feed silence to NR/reverb.
+        t = active ? blockEnd : next;
+    }
+}
+
 QString renderinplace::prepareAudioMix(Timeline *timeline, const QString &outputPath,
                                       double durationSeconds, QString *error)
 {
@@ -2898,6 +3055,13 @@ MainWindow::MainWindow(QWidget *parent)
     loadWorkspacesFromSettings();
 
     m_timeline->setAudioMixer(m_player->audioMixer());
+    m_timeline->setExternalTrackStateHooks(
+        [this]() { return collectExternalTrackState(); },
+        [this](const QJsonObject &state) { applyExternalTrackState(state); });
+    connect(m_timeline, &Timeline::trackIndicesRemapped,
+            this, &MainWindow::remapExternalTrackIndices);
+    connect(m_timeline, &Timeline::trackStateRestored,
+            this, &MainWindow::syncTrackMatteEntriesFromTimeline);
 
     rebuildAudioMeters();
 
@@ -3116,6 +3280,34 @@ void MainWindow::registerCoreShortcuts()
         QStringLiteral("クリップを貼り付け"),  QStringLiteral("編集"));
     reg(m_splitAction,           "edit.split",
         QStringLiteral("再生ヘッドで分割"),    QStringLiteral("編集"));
+    reg(m_moveClipHeadAction, "timeline.move_head_to_playhead",
+        QStringLiteral("クリップの先頭を再生ヘッドへ移動"), QStringLiteral("編集"));
+    reg(m_moveClipTailAction, "timeline.move_tail_to_playhead",
+        QStringLiteral("クリップの末尾を再生ヘッドへ移動"), QStringLiteral("編集"));
+    reg(m_selectSameLabelAction, "timeline.select_same_label",
+        QStringLiteral("同じラベルのクリップを選択"), QStringLiteral("編集"));
+    reg(m_selectAllClipsAction, "timeline.select_all",
+        QStringLiteral("すべて選択"), QStringLiteral("編集"));
+    reg(m_selectForwardAction, "timeline.select_forward",
+        QStringLiteral("再生ヘッド以降を選択"), QStringLiteral("編集"));
+    reg(m_selectBackwardAction, "timeline.select_backward",
+        QStringLiteral("再生ヘッド以前を選択"), QStringLiteral("編集"));
+    reg(m_bladeAllAction, "timeline.blade_all",
+        QStringLiteral("全トラックを再生ヘッドで分割"), QStringLiteral("編集"));
+    reg(m_duplicateAction, "timeline.duplicate",
+        QStringLiteral("複製"), QStringLiteral("編集"));
+    reg(m_nudgeLeftAction, "timeline.nudge_left",
+        QStringLiteral("1フレーム左へ移動"), QStringLiteral("編集"));
+    reg(m_nudgeRightAction, "timeline.nudge_right",
+        QStringLiteral("1フレーム右へ移動"), QStringLiteral("編集"));
+    reg(m_nudgeLeft10Action, "timeline.nudge_left10",
+        QStringLiteral("10フレーム左へ移動"), QStringLiteral("編集"));
+    reg(m_nudgeRight10Action, "timeline.nudge_right10",
+        QStringLiteral("10フレーム右へ移動"), QStringLiteral("編集"));
+    reg(m_closeAllGapsAction, "timeline.close_all_gaps",
+        QStringLiteral("すべてのギャップを詰める"), QStringLiteral("編集"));
+    reg(m_liftAction, "timeline.lift",
+        QStringLiteral("リフト (ギャップを残して削除)"), QStringLiteral("編集"));
     reg(m_deleteAction,          "edit.delete",
         QStringLiteral("クリップを削除"),      QStringLiteral("編集"));
     reg(m_rippleDeleteAction,    "timeline.ripple_delete",
@@ -3126,6 +3318,13 @@ void MainWindow::registerCoreShortcuts()
         QStringLiteral("エフェクトを貼り付け"), QStringLiteral("編集"));
     reg(m_pasteAttributesAction, "edit.paste_attributes",
         QStringLiteral("属性を貼り付け"),      QStringLiteral("編集"));
+
+    reg(m_jumpTimecodeAction, "timeline.jump_timecode",
+        QStringLiteral("タイムコードへジャンプ…"), QStringLiteral("編集"));
+    reg(m_zoomToFitSequenceAction, "timeline.zoom_fit_sequence",
+        QStringLiteral("シーケンス全体を表示"), QStringLiteral("表示"));
+    reg(m_zoomToSelectionAction, "timeline.zoom_selection",
+        QStringLiteral("選択範囲にズーム"), QStringLiteral("表示"));
 
     // タイムライン / 表示
     reg(m_snapAction,         "timeline.snap_toggle",
@@ -4226,6 +4425,23 @@ void MainWindow::setupMenuBar()
 
     // 編集 メニュー
     auto *editMenu = menuBar()->addMenu("編集(&E)");
+    m_jumpTimecodeAction = editMenu->addAction(QStringLiteral("タイムコードへジャンプ…"));
+    m_jumpTimecodeAction->setShortcut(QKeySequence("Ctrl+Shift+J"));
+    connect(m_jumpTimecodeAction, &QAction::triggered, this, [this]() {
+        bool accepted = false;
+        const QString text = QInputDialog::getText(this, QStringLiteral("タイムコードへジャンプ"),
+            QStringLiteral("時:分:秒:フレーム / 分:秒 / 秒（先頭の +・- で相対指定）"),
+            QLineEdit::Normal, QString(), &accepted);
+        if (!accepted) return;
+        double seconds = 0.0;
+        if (!parseTimecodeInput(text, m_projectConfig.fps, m_timeline->playheadPosition(), &seconds)) {
+            statusBar()->showMessage(QStringLiteral("タイムコードを解釈できません: %1").arg(text), 5000);
+            return;
+        }
+        const double clamped = qBound(0.0, seconds, m_timeline->totalDuration());
+        m_timeline->setPlayheadPosition(clamped);
+        if (m_player) m_player->seek(qRound(clamped * 1000.0));
+    });
 
     m_copyCurrentFrameAction =
         editMenu->addAction(QStringLiteral("現在のフレームをクリップボードへコピー"));
@@ -4290,6 +4506,135 @@ void MainWindow::setupMenuBar()
     m_menuHelpEntries.append({m_pasteAction,
         QStringLiteral("コピーしたクリップを再生ヘッドの位置に貼り付けます。")});
 
+    editMenu->addSeparator();
+
+    m_moveClipHeadAction = editMenu->addAction("クリップの先頭を再生ヘッドへ移動");
+    m_moveClipTailAction = editMenu->addAction("クリップの末尾を再生ヘッドへ移動");
+    auto moveToPlayhead = [this](bool tail) {
+        const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
+        m_timeline->moveSelectedClipToPlayhead(tail);
+        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
+        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+        updateEditActions();
+    };
+    connect(m_moveClipHeadAction, &QAction::triggered, this,
+            [moveToPlayhead]() { moveToPlayhead(false); });
+    connect(m_moveClipTailAction, &QAction::triggered, this,
+            [moveToPlayhead]() { moveToPlayhead(true); });
+    m_selectSameLabelAction = editMenu->addAction("同じラベルのクリップを選択");
+    connect(m_selectSameLabelAction, &QAction::triggered, this, [this]() {
+        m_timeline->selectClipsWithSameLabel();
+        updateEditActions();
+    });
+    auto *linkedSelectionAction = editMenu->addAction("リンク選択");
+    linkedSelectionAction->setCheckable(true);
+    QSettings ergoSettings(QStringLiteral("VSimpleEditor"), QStringLiteral("Preferences"));
+    const bool linkedSelection = ergoSettings.value(QStringLiteral("timeline/linkedSelection"), true).toBool();
+    linkedSelectionAction->setChecked(linkedSelection);
+    m_timeline->setLinkedSelectionEnabled(linkedSelection);
+    connect(linkedSelectionAction, &QAction::toggled, this, [this](bool enabled) {
+        m_timeline->setLinkedSelectionEnabled(enabled);
+        QSettings settings(QStringLiteral("VSimpleEditor"), QStringLiteral("Preferences"));
+        settings.setValue(QStringLiteral("timeline/linkedSelection"), enabled);
+    });
+
+    m_selectAllClipsAction = editMenu->addAction("すべて選択");
+    m_selectForwardAction = editMenu->addAction("再生ヘッド以降を選択");
+    m_selectBackwardAction = editMenu->addAction("再生ヘッド以前を選択");
+    m_bladeAllAction = editMenu->addAction("全トラックを再生ヘッドで分割");
+    m_duplicateAction = editMenu->addAction("複製");
+    m_duplicateAction->setShortcut(QKeySequence("Ctrl+D"));
+    connect(m_duplicateAction, &QAction::triggered, this, [this]() {
+        const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
+        m_timeline->duplicateSelectedClips();
+        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
+        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+        updateEditActions();
+    });
+    m_nudgeLeftAction = editMenu->addAction("1フレーム左へ移動");
+    m_nudgeLeftAction->setShortcut(QKeySequence("Alt+Left"));
+    connect(m_nudgeLeftAction, &QAction::triggered, this, [this]() {
+        const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
+        m_timeline->setNudgeFrameRate(m_projectConfig.fps);
+        m_timeline->nudgeSelectedClips(-1);
+        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
+        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+        updateEditActions();
+    });
+    m_nudgeRightAction = editMenu->addAction("1フレーム右へ移動");
+    m_nudgeRightAction->setShortcut(QKeySequence("Alt+Right"));
+    connect(m_nudgeRightAction, &QAction::triggered, this, [this]() {
+        const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
+        m_timeline->setNudgeFrameRate(m_projectConfig.fps);
+        m_timeline->nudgeSelectedClips(1);
+        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
+        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+        updateEditActions();
+    });
+    m_nudgeLeft10Action = editMenu->addAction("10フレーム左へ移動");
+    m_nudgeLeft10Action->setShortcut(QKeySequence("Alt+Shift+Left"));
+    connect(m_nudgeLeft10Action, &QAction::triggered, this, [this]() {
+        const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
+        m_timeline->setNudgeFrameRate(m_projectConfig.fps);
+        m_timeline->nudgeSelectedClips(-10);
+        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
+        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+        updateEditActions();
+    });
+    m_nudgeRight10Action = editMenu->addAction("10フレーム右へ移動");
+    m_nudgeRight10Action->setShortcut(QKeySequence("Alt+Shift+Right"));
+    connect(m_nudgeRight10Action, &QAction::triggered, this, [this]() {
+        const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
+        m_timeline->setNudgeFrameRate(m_projectConfig.fps);
+        m_timeline->nudgeSelectedClips(10);
+        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
+        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+        updateEditActions();
+    });
+    m_closeAllGapsAction = editMenu->addAction("すべてのギャップを詰める");
+    connect(m_closeAllGapsAction, &QAction::triggered, this, [this]() {
+        const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
+        m_timeline->closeAllGaps();
+        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
+        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+        updateEditActions();
+    });
+    m_liftAction = editMenu->addAction("リフト (ギャップを残して削除)");
+    m_selectAllClipsAction->setShortcut(QKeySequence("Ctrl+A"));
+    m_bladeAllAction->setShortcut(QKeySequence("Ctrl+Shift+K"));
+    connect(m_timeline, &Timeline::statusMessageRequested, this,
+            [this](const QString &message, int timeout) { statusBar()->showMessage(message, timeout); });
+    connect(m_selectAllClipsAction, &QAction::triggered, this, [this]() {
+        m_timeline->selectAllClips();
+        updateEditActions();
+    });
+    connect(m_selectForwardAction, &QAction::triggered, this, [this]() {
+        m_timeline->selectClipsFromPlayhead(true);
+        updateEditActions();
+    });
+    connect(m_selectBackwardAction, &QAction::triggered, this, [this]() {
+        m_timeline->selectClipsFromPlayhead(false);
+        updateEditActions();
+    });
+    connect(m_bladeAllAction, &QAction::triggered, this, [this]() {
+        const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
+        m_timeline->bladeAllTracksAtPlayhead();
+        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
+        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+        updateEditActions();
+    });
+    connect(m_liftAction, &QAction::triggered, this, [this]() {
+        if (!m_timeline->hasAnySelection()) {
+            statusBar()->showMessage(QStringLiteral("削除するクリップを選択してください。"), 3000);
+            return;
+        }
+        const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
+        m_timeline->deleteSelectedClip();
+        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
+        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+        statusBar()->showMessage(QStringLiteral("クリップをリフトしました。"), 3000);
+        updateEditActions();
+    });
     editMenu->addSeparator();
 
     m_splitAction = editMenu->addAction("再生ヘッドで分割(&S)");
@@ -4458,6 +4803,30 @@ void MainWindow::setupMenuBar()
 
     // 表示 メニュー
     auto *viewMenu = menuBar()->addMenu("表示(&V)");
+    auto *filmstripAction = viewMenu->addAction(QStringLiteral("クリップのサムネイルを表示"));
+    filmstripAction->setCheckable(true);
+    filmstripAction->setChecked(QSettings(QStringLiteral("VSimpleEditor"),
+        QStringLiteral("Preferences")).value(QStringLiteral("timeline/showFilmstrip"), false).toBool());
+    m_timeline->setFilmstripEnabled(filmstripAction->isChecked());
+    connect(filmstripAction, &QAction::toggled, this, [this](bool enabled) {
+        m_timeline->setFilmstripEnabled(enabled);
+        QSettings(QStringLiteral("VSimpleEditor"), QStringLiteral("Preferences"))
+            .setValue(QStringLiteral("timeline/showFilmstrip"), enabled);
+    });
+    m_zoomToFitSequenceAction = viewMenu->addAction(QStringLiteral("シーケンス全体を表示"));
+    connect(m_zoomToFitSequenceAction, &QAction::triggered, this, [this]() {
+        m_timeline->zoomToFitSequence();
+    });
+    m_zoomToSelectionAction = viewMenu->addAction(QStringLiteral("選択範囲にズーム"));
+    m_zoomToSelectionAction->setEnabled(m_timeline->hasAnySelection());
+    connect(m_zoomToSelectionAction, &QAction::triggered, this, [this]() {
+        m_timeline->zoomToSelection();
+    });
+    const auto updateZoomSelection = [this]() {
+        m_zoomToSelectionAction->setEnabled(m_timeline->hasAnySelection());
+    };
+    connect(viewMenu, &QMenu::aboutToShow, this, updateZoomSelection);
+    connect(m_timeline, &Timeline::clipSelected, this, updateZoomSelection);
 
     auto *zoomInAction = viewMenu->addAction("拡大(&I)");
     zoomInAction->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_Equal));
@@ -4686,6 +5055,33 @@ void MainWindow::setupMenuBar()
     m_menuHelpEntries.append({addATrack,
         QStringLiteral("音声を重ねるための段を増やします。ナレーションと BGM を別々の段に置けます。")});
 
+    trackMenu->addSeparator();
+    auto *removeTrackAction = trackMenu->addAction(QStringLiteral("選択トラックを削除"));
+    auto *moveTrackUpAction = trackMenu->addAction(QStringLiteral("選択トラックを上へ移動"));
+    auto *moveTrackDownAction = trackMenu->addAction(QStringLiteral("選択トラックを下へ移動"));
+    connect(trackMenu, &QMenu::aboutToShow, this,
+            [this, removeTrackAction, moveTrackUpAction, moveTrackDownAction] {
+        const int index = m_timeline ? m_timeline->activeVideoTrackIndex() : -1;
+        auto *track = m_timeline ? m_timeline->trackAt(false, index) : nullptr;
+        const int count = m_timeline ? m_timeline->videoTrackCount() : 0;
+        removeTrackAction->setEnabled(track && count > 1 && !track->isLocked());
+        moveTrackUpAction->setEnabled(track && index > 0);
+        moveTrackDownAction->setEnabled(track && index + 1 < count);
+    });
+    connect(removeTrackAction, &QAction::triggered, this, [this] {
+        if (m_timeline) m_timeline->requestRemoveTrack(false, m_timeline->activeVideoTrackIndex());
+    });
+    connect(moveTrackUpAction, &QAction::triggered, this, [this] {
+        if (!m_timeline) return;
+        const int index = m_timeline->activeVideoTrackIndex();
+        m_timeline->moveTrack(false, index, index - 1);
+    });
+    connect(moveTrackDownAction, &QAction::triggered, this, [this] {
+        if (!m_timeline) return;
+        const int index = m_timeline->activeVideoTrackIndex();
+        m_timeline->moveTrack(false, index, index + 1);
+    });
+
     // 挿入 メニュー
     auto *insertMenu = menuBar()->addMenu("挿入(&I)");
 
@@ -4765,6 +5161,9 @@ void MainWindow::setupMenuBar()
     m_menuHelpEntries.append({addAdjustmentAction,
         QStringLiteral("その下にある全部の映像にまとめて色補正やエフェクトをかけられる特別なレイヤーを追加します。")});
 
+    auto *addSolidClipAction = insertMenu->addAction(QStringLiteral("平面レイヤー (単色)…"));
+    connect(addSolidClipAction, &QAction::triggered,
+            this, &MainWindow::addSolidLayer);
     auto *addShapeClipAction = insertMenu->addAction(QStringLiteral("シェイプクリップ"));
     connect(addShapeClipAction, &QAction::triggered,
             this, &MainWindow::addShapeLayer);
@@ -5173,9 +5572,10 @@ void MainWindow::setupMenuBar()
     effectsMenu->addSeparator();
 
     auto *lutAction = effectsMenu->addAction("LUT適用 (.cube)...");
+    lutAction->setToolTip(QStringLiteral("選択クリップに適用 (書き出しにも反映)"));
     connect(lutAction, &QAction::triggered, this, &MainWindow::applyLut);
     m_menuHelpEntries.append({lutAction,
-        QStringLiteral("用意された色味のレシピ（LUT ファイル）を読み込んで、映像の色を一発で変えます。")});
+        QStringLiteral("用意された色味のレシピ（LUT ファイル）を読み込んで、映像の色を一発で変えます。選択クリップに適用 (書き出しにも反映)")});
 
     auto *manageLutAction = effectsMenu->addAction("LUT管理...");
     connect(manageLutAction, &QAction::triggered, this, &MainWindow::manageLuts);
@@ -5188,11 +5588,22 @@ void MainWindow::setupMenuBar()
     connect(loadLutCubeAction, &QAction::triggered, this, &MainWindow::loadLutCubeFile);
 
     m_lutIntensitySlider = new QSlider(Qt::Horizontal, this);
+    m_lutIntensitySlider->setObjectName(QStringLiteral("menuLutIntensitySlider"));
     m_lutIntensitySlider->setRange(0, 100);
+    m_lutIntensitySlider->setTracking(false);
     m_lutIntensitySlider->setValue(100);
     m_lutIntensitySlider->setToolTip("LUT Intensity (0-100%)");
     connect(m_lutIntensitySlider, &QSlider::valueChanged, this, [this](int value) {
-        if (m_player)
+        int trackIdx = -1;
+        int clipIdx = -1;
+        ClipInfo clip;
+        if (selectedVideoClipRef(trackIdx, clipIdx, &clip)
+            && m_timeline->videoTracks().at(trackIdx)->selectedClip() == clipIdx
+            && !clip.lutFilePath.isEmpty()) {
+            if (!m_timeline->setClipLut(trackIdx, clipIdx, clip.lutFilePath, value / 100.0))
+                return;
+        }
+        if (m_player && m_player->glPreview())
             m_player->glPreview()->setLutIntensity(value / 100.0);
     });
     auto *lutSliderAction = new QWidgetAction(this);
@@ -5878,7 +6289,37 @@ void MainWindow::setupMenuBar()
 
     // MP-5: メディアプール ドック (左側)。SSOT モデル m_mediaPool を指すだけ。
     m_mediaPoolDock = new MediaPoolDock(this);
+    m_timeline->setFilmstripCache(m_mediaPoolDock->findChild<ThumbnailCache *>());
     m_mediaPoolDock->setPool(&m_mediaPool);
+    m_mediaPoolDock->setUsedPathsProvider([this] {
+        QSet<QString> paths;
+        if (m_timeline) {
+            for (const auto &tracks : {m_timeline->videoTracks(), m_timeline->audioTracks()}) {
+                for (const TimelineTrack *track : tracks) {
+                    if (!track)
+                        continue;
+                    for (const ClipInfo &clip : track->clips())
+                        paths.insert(clip.filePath);
+                }
+            }
+            // Precomposed media lives in child sequences; sequences() includes all nesting levels.
+            for (const TimelineSequence &sequence : m_timeline->sequences()) {
+                for (const auto &tracks : {sequence.videoTracks, sequence.audioTracks}) {
+                    for (const QVector<ClipInfo> &clips : tracks) {
+                        for (const ClipInfo &clip : clips)
+                            paths.insert(clip.filePath);
+                    }
+                }
+            }
+        }
+        return paths;
+    });
+    connect(m_mediaPoolDock, &MediaPoolDock::poolChanged,
+            this, [this] { setWindowModified(true); });
+    connect(m_timeline, &Timeline::sequenceChanged,
+            m_mediaPoolDock, &MediaPoolDock::refreshUsedPaths);
+    connect(m_timeline, &Timeline::audioSequenceChanged,
+            m_mediaPoolDock, &MediaPoolDock::refreshUsedPaths);
     addDockWidget(Qt::LeftDockWidgetArea, m_mediaPoolDock);
     connect(m_mediaPoolDock, &MediaPoolDock::assetActivated,
             this, &MainWindow::onMediaPoolAssetActivated);
@@ -5912,6 +6353,15 @@ void MainWindow::setupMenuBar()
             this, &MainWindow::onSourceInsertRequested);
     connect(m_sourceMonitorDock, &SourceMonitorDock::overwriteRequested,
             this, &MainWindow::onSourceOverwriteRequested);
+
+    m_sequenceListDock = new SequenceListDock(m_timeline, this);
+    addDockWidget(Qt::RightDockWidgetArea, m_sequenceListDock);
+    m_sequenceListDock->hide();
+    auto *sequenceListAction = viewMenu->addAction(QStringLiteral("シーケンス一覧"));
+    sequenceListAction->setCheckable(true);
+    sequenceListAction->setChecked(false);
+    connect(sequenceListAction, &QAction::toggled, m_sequenceListDock, &QDockWidget::setVisible);
+    connect(m_sequenceListDock, &QDockWidget::visibilityChanged, sequenceListAction, &QAction::setChecked);
 
     // STILLS-WIPE: 保存済みフレームのギャラリー。比較合成は VideoPlayer の
     // display-local 経路だけで行い、Timeline / renderFrameAt は変更しない。
@@ -5985,6 +6435,57 @@ void MainWindow::setupMenuBar()
 
     // コンポジション メニュー (After Effects風)
     auto *compMenu = menuBar()->addMenu("コンポジション(&C)");
+
+    auto *meshEditAction = compMenu->addAction(QStringLiteral("メッシュワープを編集"));
+    meshEditAction->setCheckable(true);
+    m_meshEditAction = meshEditAction;
+    connect(meshEditAction, &QAction::triggered, this,
+            [this, meshEditAction](bool checked) {
+        if (!checked) { stopMeshEditTool(); return; }
+        int trackIdx = -1, clipIdx = -1;
+        if (!selectedVideoClipRef(trackIdx, clipIdx)
+            || !m_timeline->videoTracks()[trackIdx]->isClipSelected(clipIdx)) {
+            meshEditAction->setChecked(false);
+            QMessageBox::information(this, QStringLiteral("メッシュワープ"),
+                                     QStringLiteral("映像クリップを選択してください。"));
+            return;
+        }
+        if (!m_player || !m_player->glPreview()
+            || m_timeline->videoTracks()[trackIdx]->isLocked()) {
+            meshEditAction->setChecked(false);
+            return;
+        }
+        auto *tool = new MeshEditTool(m_timeline, trackIdx, clipIdx, this);
+        m_meshEditTool = tool;
+        tool->setViewRect(m_player->glPreview()->letterboxRect());
+        connect(tool, &MeshEditTool::previewChanged, this, [this]() {
+            refreshSpecialClipPreview();
+            if (m_player && m_player->glPreview()) m_player->glPreview()->update();
+        });
+        m_player->glPreview()->installSurfaceTool(tool);
+    });
+    connect(m_timeline, &Timeline::clipSelectedOnTrack, this,
+            [this](int, int) { stopMeshEditTool(); });
+
+    auto *meshResetAction = compMenu->addAction(QStringLiteral("メッシュワープをリセット…"));
+    connect(meshResetAction, &QAction::triggered, this, [this]() {
+        int trackIdx = -1, clipIdx = -1;
+        if (!selectedVideoClipRef(trackIdx, clipIdx)
+            || !m_timeline->videoTracks()[trackIdx]->isClipSelected(clipIdx)) {
+            QMessageBox::information(this, QStringLiteral("メッシュワープ"),
+                                     QStringLiteral("映像クリップを選択してください。"));
+            return;
+        }
+        stopMeshEditTool();
+        bool ok = false;
+        const QString choice = QInputDialog::getItem(this, QStringLiteral("メッシュワープをリセット"),
+            QStringLiteral("グリッド数（行・列）"),
+            {QStringLiteral("3"), QStringLiteral("4"), QStringLiteral("6")}, 1, false, &ok);
+        if (ok) {
+            m_timeline->resetClipMeshWarp(trackIdx, clipIdx, choice.toInt(), choice.toInt());
+            refreshSpecialClipPreview();
+        }
+    });
 
     auto *addShapeAction = compMenu->addAction("シェイプレイヤー追加...");
     connect(addShapeAction, &QAction::triggered, this, &MainWindow::addShapeLayer);
@@ -6252,32 +6753,7 @@ void MainWindow::setupMenuBar()
         if (!selectedVideoClipRef(trackIdx, clipIdx, &selected))
             return false;
 
-        TimelineTrack *track = m_timeline->videoTracks().value(trackIdx, nullptr);
-        if (!track)
-            return false;
-
-        QVector<ClipInfo> clips = track->clips();
-        if (clipIdx < 0 || clipIdx >= clips.size())
-            return false;
-
-        const double clampedIntensity = lutPath.isEmpty()
-            ? 1.0
-            : qBound(0.0, intensity, 1.0);
-        ClipInfo &clip = clips[clipIdx];
-        if (clip.lutFilePath == lutPath
-            && std::abs(clip.lutIntensity - clampedIntensity) <= 1e-9) {
-            return true;
-        }
-
-        clip.lutFilePath = lutPath;
-        clip.lutIntensity = clampedIntensity;
-        track->setClips(clips);
-
-        if (m_timeline->undoManager())
-            m_timeline->undoManager()->saveState(
-                m_timeline->currentState(), QStringLiteral("Clip LUT"));
-        m_timeline->refreshPlaybackSequence();
-        return true;
+        return m_timeline->setClipLut(trackIdx, clipIdx, lutPath, intensity);
     };
     connect(m_colorGradingPanel, &ColorGradingPanel::lutSelected,
             this, [this, writeSelectedClipLut](const QString &name) {
@@ -6985,6 +7461,10 @@ void MainWindow::setupMenuBar()
 
     // MP-5: メディアプール ドックの表示トグル
     if (m_mediaPoolDock) {
+        auto *thumbsAction = viewMenu->addAction(QStringLiteral("メディアプールのサムネイルを表示"));
+        thumbsAction->setCheckable(true);
+        thumbsAction->setChecked(m_mediaPoolDock->thumbnailsEnabled());
+        connect(thumbsAction, &QAction::toggled, m_mediaPoolDock, &MediaPoolDock::setThumbnailsEnabled);
         auto *mediaPoolAction = viewMenu->addAction("メディアプール");
         mediaPoolAction->setCheckable(true);
         mediaPoolAction->setChecked(m_mediaPoolDock->isVisible());
@@ -7978,6 +8458,7 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
                 ctx.duration = clip.effectiveDuration();
                 ctx.canvasWidth = canvasSize.width();
                 ctx.canvasHeight = canvasSize.height();
+                ctx.audioLevelAtTime = linkedAudioSampler(clip, clipStart);
                 posX = bindings.resolve(QStringLiteral("transform.position.x"), ctx, posX);
                 posY = bindings.resolve(QStringLiteral("transform.position.y"), ctx, posY);
                 layerScale = bindings.resolve(QStringLiteral("transform.scale"), ctx, layerScale);
@@ -8371,6 +8852,20 @@ void MainWindow::applyVfxProjectState(const ProjectVfxState &state)
                                   state.lightWrap.radius);
 }
 
+void MainWindow::stopMeshEditTool()
+{
+    if (m_meshEditTool) {
+        m_meshEditTool->cancelDrag();
+        m_meshEditTool->setEnabled(false);
+        if (m_player && m_player->glPreview())
+            m_player->glPreview()->installSurfaceTool(nullptr);
+        m_meshEditTool->deleteLater();
+        m_meshEditTool = nullptr;
+    }
+    if (m_meshEditAction)
+        m_meshEditAction->setChecked(false);
+}
+
 void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
                                         const QString &filePath)
 {
@@ -8387,6 +8882,7 @@ void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
 
     if (m_light3DDialog)
         m_light3DDialog->close();
+    stopMeshEditTool();
     m_projectFilePath = filePath;
     if (m_recentFilesManager && !filePath.isEmpty())
         m_recentFilesManager->addFile(filePath);
@@ -8714,11 +9210,129 @@ void MainWindow::handleMediaRelinkHistoryChanged()
     m_mediaRelinkObservedUndoIndex = index;
 }
 
+QJsonObject MainWindow::collectExternalTrackState() const
+{
+    QJsonObject state;
+    if (auto *mixer = m_timeline->audioMixer()) state["mixer"] = mixer->collectTrackState();
+    state["buses"] = m_audioBusRouting.toJson();
+    // Timeline playback flags (muted/solo/hidden) are not undoable.
+    state["adjustments"] = adjustmentLayersToJsonArray(m_timeline->adjustmentLayers());
+    // Capture live carrier references, including matte edits without an undo entry.
+    QJsonArray mattes;
+    const auto entries = m_timeline->trackMatteEntries();
+    for (auto it = entries.cbegin(); it != entries.cend(); ++it)
+        mattes.append(QJsonObject{{"clipId", it.key()},
+            {"source", it.value().matteSourceClipId}, {"type", int(it.value().matteType)}});
+    state["mattes"] = mattes;
+    // The live particle owner is keyed by media path, not row. ProjectFile
+    // provides the canonical config serializer and captures row references.
+    ProjectData particles;
+    for (int t = 0; t < m_timeline->videoTrackCount(); ++t) {
+        const auto &clips = m_timeline->videoTracks()[t]->clips();
+        for (int c = 0; c < clips.size(); ++c) {
+            const QString key = particleClipKey(clips[c]);
+            if (!m_particleClipConfigs.contains(key)) continue;
+            ParticleClipEntry entry;
+            entry.trackIndex = t;
+            entry.clipIndex = c;
+            entry.clipFilePath = key;
+            entry.config = m_particleClipConfigs.value(key);
+            particles.particleClipEntries.append(entry);
+        }
+    }
+    state["particles"] = ProjectFile::toJsonString(particles);
+    return state;
+}
+
+void MainWindow::applyExternalTrackState(const QJsonObject &state)
+{
+    if (state.isEmpty()) return; // snapshots predating hook registration
+    if (auto *mixer = m_timeline->audioMixer())
+        mixer->applyTrackState(state.value("mixer").toObject());
+    m_audioBusRouting.fromJson(state.value("buses").toObject());
+    if (auto *mixer = m_timeline->audioMixer()) mixer->setBusRouting(m_audioBusRouting);
+    m_timeline->setAdjustmentLayers(adjustmentLayersFromJsonArray(state.value("adjustments").toArray()));
+    if (state.contains("mattes")) {
+        m_trackMatteClipEntries.clear();
+        for (const auto &value : state.value("mattes").toArray()) {
+            const auto obj = value.toObject();
+            TrackMatteClipEntry entry;
+            entry.clipId = obj.value("clipId").toString();
+            entry.matteSourceClipId = obj.value("source").toString();
+            entry.matteType = static_cast<TrackMatteType>(obj.value("type").toInt());
+            m_trackMatteClipEntries.insert(entry.clipId, entry);
+        }
+        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+    }
+    ProjectData particles;
+    if (ProjectFile::fromJsonString(state.value("particles").toString(), particles)) {
+        m_particleClipConfigs.clear();
+        for (const auto &entry : particles.particleClipEntries)
+            m_particleClipConfigs.insert(entry.clipFilePath, entry.config);
+    }
+    if (m_audioBusPanel) m_audioBusPanel->refresh();
+    rebuildAudioMeters();
+}
+
+void MainWindow::syncTrackMatteEntriesFromTimeline()
+{
+    // The Timeline carrier is authoritative after remapping and undo/redo.
+    m_trackMatteClipEntries.clear();
+    const auto mattes = m_timeline->trackMatteEntries();
+    for (auto it = mattes.cbegin(); it != mattes.cend(); ++it) {
+        TrackMatteClipEntry entry;
+        entry.clipId = it.key();
+        entry.matteSourceClipId = it.value().matteSourceClipId;
+        entry.matteType = it.value().matteType;
+        m_trackMatteClipEntries.insert(entry.clipId, entry);
+    }
+}
+
+void MainWindow::remapExternalTrackIndices(bool audio, const QVector<int> &oldToNew)
+{
+    // Audit: the only retained TimelineTrack pointer outside Timeline is
+    // this menu QPointer. VideoPlayer and docks retain no track widgets.
+    m_noisePrintMenuTrack = nullptr;
+    m_noisePrintMenuClip = -1;
+    if (audio) {
+        m_audioBusRouting.remapTrackIndices(oldToNew);
+        if (auto *mixer = m_timeline->audioMixer()) {
+            mixer->remapTrackIndices(oldToNew);
+            mixer->setBusRouting(m_audioBusRouting);
+        }
+        if (m_audioBusPanel) m_audioBusPanel->refresh();
+        rebuildAudioMeters();
+        return;
+    }
+    QVector<AdjustmentLayer> layers;
+    for (auto layer : m_timeline->adjustmentLayers()) {
+        layer.trackIndex = oldToNew.value(layer.trackIndex, -1);
+        if (layer.trackIndex >= 0) layers.append(layer);
+    }
+    m_timeline->setAdjustmentLayers(layers);
+    syncTrackMatteEntriesFromTimeline();
+    QHash<QString, ParticleEmitterConfig> particles;
+    for (const auto *track : m_timeline->videoTracks()) {
+        for (const auto &clip : track->clips()) {
+            const QString key = particleClipKey(clip);
+            if (m_particleClipConfigs.contains(key)) particles.insert(key, m_particleClipConfigs.value(key));
+        }
+    }
+    m_particleClipConfigs = std::move(particles);
+}
+
 void MainWindow::collectAudioState(ProjectData &data)
 {
+    data.trackFx.clear();
+    data.masterFx = trackfx::Chain{};
     if (auto *mixer = m_player ? m_player->audioMixer() : nullptr) {
         const int n = m_timeline ? m_timeline->audioTrackCount() : 0;
         data.trackEqStates.resize(n);
+        data.masterFx = mixer->masterChain();
+        for (int i = 0; i < n; ++i) {
+            const trackfx::Chain chain = mixer->trackChain(i);
+            if (!chain.isDefault()) data.trackFx.insert(i, chain);
+        }
         for (int i = 0; i < n; ++i) {
             AudioEQConfig cfg = mixer->trackEqConfig(i);
             TrackEqState &s = data.trackEqStates[i];
@@ -8758,6 +9372,11 @@ void MainWindow::collectAudioState(ProjectData &data)
 void MainWindow::applyAudioState(const ProjectData &data)
 {
     if (auto *mixer = m_player ? m_player->audioMixer() : nullptr) {
+        // Project audio FX are not part of TimelineState/Undo.
+        mixer->clearTrackFx();
+        for (auto it = data.trackFx.cbegin(); it != data.trackFx.cend(); ++it)
+            mixer->setTrackChain(it.key(), it.value());
+        mixer->setMasterEq(data.masterFx.eq, data.masterFx.eqEnabled);
         for (const auto &s : data.trackEqStates) {
             AudioEQConfig cfg;
             cfg.bands.resize(3);
@@ -8797,6 +9416,8 @@ void MainWindow::newProject()
 {
     ProjectSettingsDialog dialog(this);
     if (dialog.exec() == QDialog::Accepted) {
+        stopMeshEditTool();
+        applyAudioState(ProjectData{});
         if (m_light3DDialog)
             m_light3DDialog->close();
         m_projectCamera = Camera3D{};
@@ -9535,6 +10156,52 @@ QString MainWindow::prepareExportAudioMix(QString *error)
     return prepareTimelineAudioMixForExport(m_timeline, error);
 }
 
+bool MainWindow::exportAudioOnly(const ExportConfig &config, QString *error)
+{
+    if (error) error->clear();
+    auto fail = [&](const QString &message) {
+        if (error) *error = message;
+        return false;
+    };
+    if (!m_timeline || m_timeline->totalDuration() <= 0.0)
+        return fail(tr("書き出す音声がありません。"));
+    const QString codec = ExportConfig::audioCodecForContainer(config.container);
+    if (codec.isEmpty() || !CodecDetector::isEncoderAvailable(codec))
+        return fail(tr("書き出し用の音声エンコーダを利用できません: %1").arg(codec));
+    if (config.audioBitrate <= 0 || config.outputPath.isEmpty())
+        return fail(tr("書き出し先と音声ビットレートを確認してください。"));
+
+    double start = 0.0;
+    double end = m_timeline->totalDuration();
+    if (config.exportMarkedRangeOnly && m_timeline->hasMarkedRange()) {
+        start = qBound(0.0, m_timeline->markedIn(), end);
+        end = qBound(start, m_timeline->markedOut(), end);
+    }
+    if (end <= start)
+        return fail(tr("書き出し範囲が空です。"));
+    QTemporaryDir temporary;
+    if (!temporary.isValid())
+        return fail(tr("書き出し用の一時フォルダを作成できません。"));
+    // Force a complete mix even for a single clip; render no video frames.
+    const QString mix = prepareTimelineAudioMixForExport(
+        m_timeline, error, temporary.filePath(QStringLiteral("mix.wav")), end);
+    if (mix.isEmpty()) return false;
+    QStringList args{QStringLiteral("-y"), QStringLiteral("-i"), mix,
+        QStringLiteral("-ss"), ffmpegNumber(start),
+        QStringLiteral("-t"), ffmpegNumber(end - start),
+        QStringLiteral("-map"), QStringLiteral("0:a:0"), QStringLiteral("-vn"),
+        QStringLiteral("-c:a"), codec};
+    if (codec != QStringLiteral("pcm_s16le"))
+        args << QStringLiteral("-b:a") << QString::number(config.audioBitrate) + QStringLiteral("k");
+    const double gain = exporter_loudnessGainDb();
+    if (gain != 0.0)
+        args << QStringLiteral("-af") << QStringLiteral("volume=%1dB").arg(ffmpegNumber(gain));
+    args << QStringLiteral("-f")
+         << (config.container.toLower() == QStringLiteral("m4a") ? QStringLiteral("ipod") : config.container.toLower())
+         << config.outputPath;
+    return runFfmpegForAudioMix(args, error);
+}
+
 void MainWindow::exportVideo()
 {
     ExportDialog dialog(m_projectConfig, this);
@@ -9547,6 +10214,21 @@ void MainWindow::exportVideo()
     if (dialog.exec() != QDialog::Accepted) return;
 
     ExportConfig exportCfg = dialog.config();
+    if (exportCfg.audioOnly) {
+        QProgressDialog progress(tr("音声を書き出しています…"), QString(), 0, 0, this);
+        progress.setWindowTitle(tr("書き出し"));
+        progress.setWindowModality(Qt::ApplicationModal);
+        progress.setCancelButton(nullptr);
+        progress.setMinimumDuration(0);
+        progress.show();
+        progress.repaint();
+        QString error;
+        const bool ok = exportAudioOnly(exportCfg, &error);
+        progress.close();
+        if (!ok) QMessageBox::warning(this, tr("書き出し"), error);
+        else statusBar()->showMessage(tr("音声の書き出しが完了しました: %1").arg(exportCfg.outputPath), 10000);
+        return;
+    }
     const auto &clips = m_timeline->videoClips();
 
     if (clips.isEmpty()) {
@@ -9596,14 +10278,19 @@ void MainWindow::exportVideo()
     job.timeline = m_timeline;
 
     // RenderQueue::startRenderPipe consumes these JSON fields directly
-    // (videoCodec/videoBitrate/fps/audioCodec/audioBitrate, plus the HDR10 /
+    // (videoCodec/videoBitrate/rateControl/crf/fps/audioCodec/audioBitrate, plus the HDR10 /
     // ProRes branch keys). Pass ExportDialog's resolved encoder verbatim.
     QJsonObject cfg;
     cfg["width"]        = job.width;
     cfg["height"]       = job.height;
     cfg["fps"]          = exportCfg.fps > 0 ? exportCfg.fps : 30;
     cfg["videoCodec"]   = exportCfg.videoCodec;     // already ffmpeg-named
+    job.codec = exportCfg.videoCodec;
     cfg["videoBitrate"] = exportCfg.videoBitrate;   // kbps
+    if (exportCfg.rateControl == ExportConfig::RateControl::Crf) {
+        cfg["rateControl"] = QStringLiteral("crf");
+        if (exportCfg.crf != -1) cfg["crf"] = exportCfg.crf;
+    }
     cfg["audioCodec"]   = exportCfg.audioCodec;
     cfg["audioBitrate"] = exportCfg.audioBitrate;
     cfg["exportMarkedRangeOnly"] = exportCfg.exportMarkedRangeOnly;
@@ -9619,6 +10306,7 @@ void MainWindow::exportVideo()
     }
     if (exportCfg.proresProfile >= 0)
         cfg["proresProfile"] = exportCfg.proresProfile;
+    if (exportCfg.keepAlpha) cfg["keepAlpha"] = true;
     job.exportConfig = cfg;
 
     if (isHdrExport && dvxml::enabledFromEnv()) {
@@ -10023,7 +10711,7 @@ void MainWindow::addBgm()
     if (!filePath.isEmpty()) {
         // Ensure we have a second audio track for BGM
         if (m_timeline->audioTrackCount() < 2)
-            m_timeline->addAudioTrack();
+            m_timeline->addAudioTrack(false);
         m_timeline->addAudioFile(filePath);
         statusBar()->showMessage("Added BGM: " + filePath);
     }
@@ -11816,14 +12504,45 @@ void MainWindow::openDeflicker()
     dialog.exec();
 }
 
+bool MainWindow::applyLutFileToSelectedClip(const QString &path)
+{
+    int trackIdx = -1;
+    int clipIdx = -1;
+    if (!selectedVideoClipRef(trackIdx, clipIdx)
+        || m_timeline->videoTracks().at(trackIdx)->selectedClip() != clipIdx) {
+        statusBar()->showMessage(QStringLiteral("映像クリップを選択してください。"), 3000);
+        return false;
+    }
+
+    LutData lut = LutImporter::loadCubeFile(path);
+    if (!lut.isValid()) {
+        statusBar()->showMessage(QStringLiteral("LUT ファイルを読み込めませんでした。"), 3000);
+        return false;
+    }
+    lut.intensity = 1.0;
+    if (!m_timeline->setClipLut(trackIdx, clipIdx, path, 1.0))
+        return false;
+
+    // US-500: persist for export, then seed the preview just like the grading panel.
+    if (m_player && m_player->glPreview())
+        m_player->glPreview()->setLut(lut);
+    if (m_lutIntensitySlider)
+        m_lutIntensitySlider->setValue(100);
+    statusBar()->showMessage(QStringLiteral("選択クリップに LUT を適用: %1").arg(lut.name));
+    return true;
+}
+
 void MainWindow::applyLut()
 {
-    if (!m_timeline->hasSelection()) {
-        QMessageBox::information(this, "LUT", "Select a clip first.");
+    int trackIdx = -1;
+    int clipIdx = -1;
+    if (!selectedVideoClipRef(trackIdx, clipIdx)
+        || m_timeline->videoTracks().at(trackIdx)->selectedClip() != clipIdx) {
+        statusBar()->showMessage(QStringLiteral("映像クリップを選択してください。"), 3000);
         return;
     }
 
-    // Offer built-in or custom LUT
+    // Offer built-in or custom LUT; both now persist on the selected clip.
     QStringList options;
     for (const auto &lut : LutLibrary::instance().allLuts())
         options << lut.name;
@@ -11834,69 +12553,55 @@ void MainWindow::applyLut()
         "Select LUT:", options, 0, false, &ok);
     if (!ok) return;
 
-    LutData lut;
     if (selected == "Load .cube file...") {
         QString path = QFileDialog::getOpenFileName(this, "Load LUT",
             QString(), "Cube LUT (*.cube);;All Files (*)");
-        if (path.isEmpty()) return;
-        lut = LutImporter::loadCubeFile(path);
-        if (!lut.isValid()) {
-            QMessageBox::warning(this, "LUT Error", "Could not parse LUT file.");
-            return;
-        }
+        if (path.isEmpty() || !applyLutFileToSelectedClip(path)) return;
         LutLibrary::instance().addLut(path);
         LutLibrary::instance().savePaths();
         if (m_colorGradingPanel)
             m_colorGradingPanel->setLutList(LutLibrary::instance().allLuts());
     } else {
-        auto found = LutLibrary::instance().findByName(selected);
-        if (!found.isValid()) return;
-        lut = found;
+        const LutData lut = LutLibrary::instance().findByName(selected);
+        const QString path = lutPathForClipExport(lut);
+        if (path.isEmpty()) {
+            statusBar()->showMessage(QStringLiteral("LUT ファイルを準備できませんでした。"), 3000);
+            return;
+        }
+        applyLutFileToSelectedClip(path);
     }
-
-    double intensity = QInputDialog::getDouble(this, "LUT Intensity",
-        "Intensity (0.0-1.0):", 1.0, 0.0, 1.0, 2, &ok);
-    if (!ok) return;
-    lut.intensity = intensity;
-
-    if (m_player)
-        m_player->glPreview()->setLut(lut);
-    if (m_lutIntensitySlider)
-        m_lutIntensitySlider->setValue(static_cast<int>(intensity * 100.0));
-
-    statusBar()->showMessage(QString("Applied LUT: %1 (intensity %2)")
-        .arg(lut.name).arg(intensity, 0, 'f', 1));
 }
 
 void MainWindow::loadLutCubeFile()
 {
-    QString path = QFileDialog::getOpenFileName(this, "LUT を読み込み",
-        QString(), "Cube LUT (*.cube);;All Files (*)");
-    if (path.isEmpty()) return;
-
-    LutData lut = LutImporter::loadCubeFile(path);
-    if (!lut.isValid()) {
-        QMessageBox::warning(this, "LUT Error", "Could not parse LUT file.");
+    int trackIdx = -1;
+    int clipIdx = -1;
+    if (!selectedVideoClipRef(trackIdx, clipIdx)
+        || m_timeline->videoTracks().at(trackIdx)->selectedClip() != clipIdx) {
+        statusBar()->showMessage(QStringLiteral("映像クリップを選択してください。"), 3000);
         return;
     }
 
-    if (m_player)
-        m_player->glPreview()->setLut(lut);
-
-    if (m_lutIntensitySlider)
-        m_lutIntensitySlider->setValue(100);
+    QString path = QFileDialog::getOpenFileName(this, "LUT を読み込み",
+        QString(), "Cube LUT (*.cube);;All Files (*)");
+    if (path.isEmpty() || !applyLutFileToSelectedClip(path)) return;
 
     LutLibrary::instance().addLut(path);
     LutLibrary::instance().savePaths();
     if (m_colorGradingPanel)
         m_colorGradingPanel->setLutList(LutLibrary::instance().allLuts());
-
-    statusBar()->showMessage(QString("LUT 読み込み: %1").arg(lut.name));
 }
 
 void MainWindow::clearLutIntensity()
 {
-    if (m_player)
+    int trackIdx = -1;
+    int clipIdx = -1;
+    if (selectedVideoClipRef(trackIdx, clipIdx)
+        && m_timeline->videoTracks().at(trackIdx)->selectedClip() == clipIdx) {
+        if (!m_timeline->setClipLut(trackIdx, clipIdx, QString(), 1.0))
+            return;
+    }
+    if (m_player && m_player->glPreview())
         m_player->glPreview()->clearLut();
     if (m_lutIntensitySlider)
         m_lutIntensitySlider->setValue(0);
@@ -12797,6 +13502,42 @@ void MainWindow::analyzeHighlights()
     statusBar()->showMessage("Analyzing video for highlights...");
 }
 
+void MainWindow::addSolidLayer()
+{
+    const QColor color = QColorDialog::getColor(
+        Qt::white, this, QStringLiteral("平面レイヤーの色"));
+    if (!color.isValid())
+        return;
+    bool ok = false;
+    const double duration = QInputDialog::getDouble(
+        this, QStringLiteral("平面レイヤー (単色)"), QStringLiteral("尺 (秒):"),
+        5.0, 0.01, 86400.0, 2, &ok);
+    if (!ok)
+        return;
+
+    ShapeFill fill;
+    fill.color = color;
+    fill.enabled = true;
+    ShapeStroke stroke;
+    stroke.enabled = false;
+    Shape shape = ShapeLayer::createRectangle(
+        QSizeF(m_projectConfig.width, m_projectConfig.height), fill, stroke);
+    shape.position = QPointF(m_projectConfig.width * 0.5,
+                             m_projectConfig.height * 0.5);
+    ClipInfo clip;
+    clip.displayName = QStringLiteral("平面 %1").arg(color.name(QColor::HexRgb).toUpper());
+    clip.duration = duration;
+    clip.inPoint = 0.0;
+    clip.outPoint = duration;
+    clip.shapes.append(shape);
+    if (!m_timeline || !m_timeline->insertShapeClipAtPlayhead(clip)) {
+        QMessageBox::warning(this, QStringLiteral("平面レイヤー"),
+                             QStringLiteral("平面レイヤーを挿入できる動画トラックがありません。"));
+        return;
+    }
+    statusBar()->showMessage(QStringLiteral("%1 を追加しました").arg(clip.displayName), 4000);
+}
+
 void MainWindow::addShapeLayer()
 {
     const QStringList shapes = {
@@ -13518,7 +14259,7 @@ void MainWindow::createNullObjectForSelection()
     nullClip.videoDy = 0.0;
     nullClip.rotation2DDegrees = 0.0;
 
-    m_timeline->addVideoTrack();
+    m_timeline->addVideoTrack(false);
     const int nullTrackIdx = m_timeline->videoTracks().size() - 1;
     TimelineTrack *nullTrack = m_timeline->videoTracks().value(nullTrackIdx, nullptr);
     if (!nullTrack)
@@ -13582,6 +14323,140 @@ void MainWindow::open3DExtrudedText()
 
     refreshSpecialClipPreview();
     statusBar()->showMessage(QStringLiteral("3D 押し出しテキストを %1 に設定しました").arg(clip.displayName), 4000);
+}
+
+std::function<double(double)> MainWindow::linkedAudioSampler(
+    const ClipInfo &clip, double clipStart) const
+{
+    if (!m_timeline || clip.linkGroup <= 0) return {};
+    QVector<const QVector<ClipInfo>*> audioTracks;
+    audioTracks.reserve(m_timeline->audioTracks().size());
+    for (const auto *track : m_timeline->audioTracks()) {
+        if (track) audioTracks.append(&track->clips());
+    }
+    return audiokf::makeLinkedAudioSampler(clip.linkGroup, clipStart,
+                                          audioTracks, m_audioEnvelopeCache);
+}
+
+void MainWindow::convertAudioToKeyframes(int trackIndex, int clipIndex)
+{
+    if (!m_timeline) return;
+    auto *track = m_timeline->videoTracks().value(trackIndex, nullptr);
+    if (!track || clipIndex < 0 || clipIndex >= track->clips().size()) return;
+    const ClipInfo target = track->clips()[clipIndex];
+    const double targetStart = clipTimelineStartSeconds(trackIndex, clipIndex);
+    const double targetEnd = targetStart + target.effectiveDuration();
+    const QString title = QStringLiteral("オーディオをキーフレームに変換");
+    struct Source { ClipInfo clip; double start; };
+    QVector<Source> sources;
+    QDialog dialog(this);
+    dialog.setWindowTitle(title);
+    auto *form = new QFormLayout(&dialog);
+    auto *sourceChoice = new QComboBox(&dialog);
+    for (int ti = 0; ti < m_timeline->audioTracks().size(); ++ti) {
+        const auto *audioTrack = m_timeline->audioTracks()[ti];
+        if (!audioTrack) continue;
+        double cursor = 0.0;
+        for (const ClipInfo &audio : audioTrack->clips()) {
+            const double start = cursor + qMax(0.0, audio.leadInSec);
+            cursor = start + audio.effectiveDuration();
+            const bool linked = target.linkGroup > 0 && audio.linkGroup == target.linkGroup;
+            if (audio.filePath.isEmpty() || (!linked && (start >= targetEnd || cursor <= targetStart))) continue;
+            sources.append({audio, start});
+            sourceChoice->addItem(QStringLiteral("%1A%2 — %3")
+                .arg(linked ? QStringLiteral("リンク音声: ") : QString())
+                .arg(ti + 1).arg(audio.displayName.isEmpty() ? QFileInfo(audio.filePath).fileName() : audio.displayName));
+            if (linked) sourceChoice->setCurrentIndex(int(sources.size()) - 1);
+        }
+    }
+    if (sources.isEmpty()) {
+        QMessageBox::information(this, title, QStringLiteral("リンク音声または同時刻の音声クリップがありません。"));
+        return;
+    }
+    form->addRow(QStringLiteral("音源"), sourceChoice);
+    auto *property = new QComboBox(&dialog);
+    const QStringList paths = {QStringLiteral("transform.opacity"), QStringLiteral("transform.scale"),
+        QStringLiteral("transform.rotation"), QStringLiteral("transform.position.x"), QStringLiteral("transform.position.y")};
+    const QStringList labels = {QStringLiteral("不透明度"), QStringLiteral("スケール"), QStringLiteral("回転"),
+        QStringLiteral("位置 X"), QStringLiteral("位置 Y")};
+    for (int i = 0; i < paths.size(); ++i) {
+        if (exprbind::validatePath(paths[i]).isEmpty()) property->addItem(labels[i], paths[i]);
+    }
+    form->addRow(QStringLiteral("対象プロパティ"), property);
+    const auto spin = [&](const QString &label, double low, double high, double initial) {
+        auto *box = new QDoubleSpinBox(&dialog);
+        box->setDecimals(3);
+        box->setRange(low, high);
+        box->setValue(initial);
+        form->addRow(label, box);
+        return box;
+    };
+    auto *minimum = spin(QStringLiteral("最小値"), -100000.0, 100000.0, 0.0);
+    auto *maximum = spin(QStringLiteral("最大値"), -100000.0, 100000.0, 100.0);
+    auto *fps = spin(QStringLiteral("フレームレート (fps)"), 1.0, 240.0,
+        m_projectConfig.fps > 0.0 ? m_projectConfig.fps : 30.0);
+    auto *smoothing = spin(QStringLiteral("平滑化 (ms)"), 0.0, 10000.0, 50.0);
+    auto *threshold = spin(QStringLiteral("しきい値 (0～1)"), 0.0, 1.0, 0.0);
+    connect(property, qOverload<int>(&QComboBox::currentIndexChanged), &dialog, [=](int) {
+        const QString path = property->currentData().toString();
+        maximum->setValue(path == QStringLiteral("transform.opacity") ? 100.0
+            : path == QStringLiteral("transform.rotation") ? 360.0 : 1.0);
+    });
+    auto *buttons = new QDialogButtonBox(&dialog);
+    buttons->addButton(QStringLiteral("変換"), QDialogButtonBox::AcceptRole);
+    buttons->addButton(QStringLiteral("キャンセル"), QDialogButtonBox::RejectRole);
+    form->addRow(buttons);
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    if (dialog.exec() != QDialog::Accepted) return;
+
+    const Source source = sources[sourceChoice->currentIndex()];
+    QVector<float> mono;
+    int sampleRate = 0;
+    QString error;
+    if (!audiokf::decodeMono(source.clip.filePath, mono, sampleRate, &error)) {
+        QMessageBox::warning(this, title, QStringLiteral("音声を読み込めません。\n%1").arg(error));
+        return;
+    }
+    const double sampleCount = std::ceil(target.effectiveDuration() * sampleRate);
+    if (!std::isfinite(sampleCount) || sampleCount <= 0.0 || sampleCount > 128.0 * 1024.0 * 1024.0) {
+        QMessageBox::warning(this, title, QStringLiteral("対象クリップの長さが変換可能な範囲を超えています。"));
+        return;
+    }
+    // Resample into target-local time before RMS/EMA: trims, gaps, speed/ramp
+    // and reverse use the same ClipInfo mapping as timeline playback.
+    QVector<float> aligned(qsizetype(sampleCount), 0.0f);
+    for (qsizetype i = 0; i < aligned.size(); ++i) {
+        const double local = targetStart + double(i) / sampleRate - source.start;
+        if (local < 0.0 || local >= source.clip.effectiveDuration()) continue;
+        const double index = source.clip.sourceSecondAtLocalTime(local) * sampleRate;
+        if (index >= 0.0 && index < double(mono.size())) aligned[i] = mono[qsizetype(index)];
+    }
+    const auto envelope = audiokf::computeEnvelope(aligned, sampleRate, fps->value(), smoothing->value());
+    const auto points = audiokf::toKeyframes(envelope, minimum->value(), maximum->value(), threshold->value(), 0.0);
+    if (points.isEmpty()) return;
+    // The modal dialog can process external edits; never overwrite a changed clip.
+    if (trackIndex >= m_timeline->videoTracks().size()
+        || m_timeline->videoTracks()[trackIndex] != track
+        || clipIndex >= track->clips().size()
+        || track->clips()[clipIndex].filePath != target.filePath
+        || track->clips()[clipIndex].inPoint != target.inPoint
+        || track->clips()[clipIndex].effectiveDuration() != target.effectiveDuration()
+        || clipTimelineStartSeconds(trackIndex, clipIndex) != targetStart) {
+        QMessageBox::warning(this, title, QStringLiteral("クリップが変更されたため、もう一度変換してください。"));
+        return;
+    }
+    const KeyframeTrack keys = audiokf::propertyTrack(property->currentData().toString(),
+                                                    points, minimum->value());
+    const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
+    auto clips = track->clips();
+    clips[clipIndex].keyframes.removeTrack(keys.propertyName());
+    clips[clipIndex].keyframes.addTrack(keys);
+    track->setClips(clips);
+    remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
+    syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+    m_timeline->saveUndoState(title);
+    m_timeline->refreshPlaybackSequence();
 }
 
 void MainWindow::editClipExpressionBindings()
@@ -14452,23 +15327,44 @@ void MainWindow::addMask()
 
 void MainWindow::applyWarpEffect()
 {
-    if (!m_timeline->hasSelection()) {
-        QMessageBox::information(this, "Warp", "Select a clip first.");
+    int trackIndex = -1, clipIndex = -1;
+    if (!selectedVideoClipRef(trackIndex, clipIndex)) {
+        QMessageBox::information(this, QStringLiteral("ワープを適用"),
+                                 QStringLiteral("動画クリップを選択してください。"));
         return;
     }
-
-    QStringList warps = {"Mesh Warp", "Puppet Pin", "Bulge", "Pinch", "Twirl",
-                         "Wave", "Ripple", "Spherize", "Fisheye"};
-    bool ok;
-    QString selected = QInputDialog::getItem(this, "Warp / Distortion",
-        "Effect type:", warps, 0, false, &ok);
+    const QVector<VideoEffectType> types = {
+        VideoEffectType::WarpWave, VideoEffectType::WarpRipple,
+        VideoEffectType::WarpSpherize, VideoEffectType::WarpFisheye,
+        VideoEffectType::WarpPinch
+    };
+    QStringList names;
+    for (auto type : types) names.append(VideoEffect::typeName(type));
+    bool ok = false;
+    const QString selected = QInputDialog::getItem(this, QStringLiteral("ワープを適用"),
+        QStringLiteral("種類:"), names, 0, false, &ok);
     if (!ok) return;
-
-    double amount = QInputDialog::getDouble(this, "Warp Amount",
-        "Amount (0.0-1.0):", 0.5, 0.0, 2.0, 2, &ok);
+    const int index = names.indexOf(selected);
+    if (index < 0) return;
+    VideoEffect effect;
+    effect.type = types[index];
+    const auto schema = effectctrl::paramSchemaFor(effect.type);
+    for (const auto &def : schema)
+        effectctrl::setParamValue(effect, def.name, def.defaultVal);
+    const auto &amountDef = schema.first();
+    const double amount = QInputDialog::getDouble(this, QStringLiteral("ワープを適用"),
+        amountDef.displayLabel, amountDef.defaultVal, amountDef.minVal, amountDef.maxVal, 2, &ok);
     if (!ok) return;
-
-    statusBar()->showMessage(QString("Applied %1 (amount: %2)").arg(selected).arg(amount, 0, 'f', 2));
+    effectctrl::setParamValue(effect, amountDef.name, amount);
+    const auto &tracks = m_timeline->videoTracks();
+    if (trackIndex >= tracks.size() || !tracks[trackIndex]
+        || clipIndex >= tracks[trackIndex]->clips().size()) return;
+    const ClipInfo clip = tracks[trackIndex]->clips().at(clipIndex);
+    auto effects = clip.effects;
+    effects.append(effect);
+    // Existing effect-library mutation saves the targeted stack as one undo.
+    m_timeline->setClipEffectsAndKeyframes(trackIndex, clipIndex, effects, clip.keyframes);
+    statusBar()->showMessage(QStringLiteral("ワープを適用しました: %1").arg(selected), 3000);
 }
 
 void MainWindow::editExpressions()
@@ -14932,6 +15828,8 @@ void MainWindow::openSocialExportDialog()
                         return;
                     }
 
+                    if (m_timeline)
+                        m_timeline->captureExternalTrackStateForCompoundEdit();
                     ProjectConfig config = m_projectConfig;
                     config.width = targetSize.width();
                     config.height = targetSize.height();
@@ -14967,7 +15865,7 @@ void MainWindow::openSocialExportDialog()
                     bool addedV2 = false;
                     if (m_timeline) {
                         if (m_timeline->videoTrackCount() < 2) {
-                            addVideoTrack();
+                            m_timeline->addVideoTrack(false);
                             addedV2 = true;
                         }
                         m_timeline->refreshPlaybackSequence();
@@ -16728,166 +17626,7 @@ void MainWindow::openAudioRestoreDialog()
 #endif
 }
 
-namespace {
 
-// 16bit PCM WAV (RIFF/fmt/data) を読み込み mono の double サンプル列へ展開する。
-// 多チャンネルは平均してモノラル化。成功時 true、sampleRate を *sampleRate へ。
-// 簡易パーサ — float WAV や 24/32bit は非対応 (抽出側を 16bit に固定する前提)。
-bool readPcm16WavToMono(const QString &wavPath,
-                        std::vector<double> &outSamples,
-                        int &sampleRate,
-                        QString *error)
-{
-    outSamples.clear();
-    sampleRate = 0;
-
-    constexpr qint64 kMaxWavBytes = 512LL * 1024LL * 1024LL;
-    const QFileInfo info(wavPath);
-    if (!info.exists()) {
-        if (error) *error = QStringLiteral("WAV が存在しません: %1").arg(wavPath);
-        return false;
-    }
-    if (info.size() <= 0) {
-        if (error) *error = QStringLiteral("WAV が空です: %1").arg(wavPath);
-        return false;
-    }
-    if (info.size() > kMaxWavBytes) {
-        if (error) *error =
-            QStringLiteral("WAV が大きすぎます (%1 MB、上限 %2 MB)。")
-                .arg(info.size() / (1024.0 * 1024.0), 0, 'f', 1)
-                .arg(kMaxWavBytes / (1024 * 1024));
-        return false;
-    }
-
-    QFile f(wavPath);
-    if (!f.open(QIODevice::ReadOnly)) {
-        if (error) *error = QStringLiteral("WAV を開けません: %1").arg(wavPath);
-        return false;
-    }
-    const QByteArray data = f.readAll();
-    f.close();
-
-    if (data.size() != info.size()) {
-        if (error) *error =
-            QStringLiteral("WAV の読み込みが途中で終了しました (%1/%2 bytes)。")
-                .arg(data.size()).arg(info.size());
-        return false;
-    }
-    if (data.size() < 44 || !data.startsWith("RIFF") ||
-        data.mid(8, 4) != QByteArray("WAVE")) {
-        if (error) *error = QStringLiteral("RIFF/WAVE ヘッダが不正です。");
-        return false;
-    }
-
-    const auto rdU16 = [&](int off) -> quint16 {
-        return static_cast<quint16>(static_cast<unsigned char>(data[off])) |
-               (static_cast<quint16>(static_cast<unsigned char>(data[off + 1])) << 8);
-    };
-    const auto rdU32 = [&](int off) -> quint32 {
-        return static_cast<quint32>(static_cast<unsigned char>(data[off])) |
-               (static_cast<quint32>(static_cast<unsigned char>(data[off + 1])) << 8) |
-               (static_cast<quint32>(static_cast<unsigned char>(data[off + 2])) << 16) |
-               (static_cast<quint32>(static_cast<unsigned char>(data[off + 3])) << 24);
-    };
-
-    int channels = 1;
-    int sr = 0;
-    int bitsPerSample = 16;
-    int audioFormat = 1;
-    int blockAlign = 0;
-    bool haveFmt = false;
-    int dataOff = -1;
-    int dataLen = 0;
-
-    // チャンク走査 (fmt と data を探す)。
-    int pos = 12;
-    while (pos + 8 <= data.size()) {
-        const QByteArray id = data.mid(pos, 4);
-        const quint32 sz = rdU32(pos + 4);
-        const int body = pos + 8;
-        const qint64 chunkEnd = static_cast<qint64>(body) + static_cast<qint64>(sz);
-        const qint64 nextChunk = chunkEnd + ((sz & 1u) ? 1 : 0);
-        if (chunkEnd > data.size()) {
-            if (error) *error =
-                QStringLiteral("WAV チャンク '%1' がファイル終端を越えています。")
-                    .arg(QString::fromLatin1(id.constData(), id.size()));
-            return false;
-        }
-
-        if (id == QByteArray("fmt ")) {
-            if (sz < 16) {
-                if (error) *error = QStringLiteral("WAV fmt チャンクが短すぎます。");
-                return false;
-            }
-            audioFormat   = rdU16(body);
-            channels      = rdU16(body + 2);
-            const quint32 parsedSr = rdU32(body + 4);
-            if (parsedSr > static_cast<quint32>(std::numeric_limits<int>::max())) {
-                if (error) *error = QStringLiteral("WAV の sample rate が大きすぎます。");
-                return false;
-            }
-            sr            = static_cast<int>(parsedSr);
-            blockAlign    = rdU16(body + 12);
-            bitsPerSample = rdU16(body + 14);
-            haveFmt = true;
-        } else if (id == QByteArray("data")) {
-            dataOff = body;
-            dataLen = static_cast<int>(sz);
-        }
-        // チャンクは 2byte 境界 (奇数長は +1 パディング)。
-        pos = static_cast<int>(std::min<qint64>(nextChunk, data.size()));
-        if (dataOff >= 0 && haveFmt) break;
-    }
-
-    if (audioFormat != 1 || bitsPerSample != 16) {
-        if (error) *error =
-            QStringLiteral("対応するのは 16bit PCM WAV のみです (format=%1, bits=%2)。")
-                .arg(audioFormat).arg(bitsPerSample);
-        return false;
-    }
-    if (!haveFmt || dataOff < 0 || dataLen <= 0 || sr <= 0 || channels <= 0) {
-        if (error) *error = QStringLiteral("WAV の data/fmt チャンクが見つかりません。");
-        return false;
-    }
-
-    if (channels > 64) {
-        if (error) *error = QStringLiteral("WAV の channel 数が大きすぎます (%1)。").arg(channels);
-        return false;
-    }
-
-    const int frameBytes = 2 * channels;
-    if (blockAlign != frameBytes) {
-        if (error) *error =
-            QStringLiteral("WAV の block align が不正です (blockAlign=%1, expected=%2)。")
-                .arg(blockAlign).arg(frameBytes);
-        return false;
-    }
-
-    const int frameCount = dataLen / frameBytes;
-    if (frameCount <= 0) {
-        if (error) *error = QStringLiteral("WAV の data チャンクにサンプルがありません。");
-        return false;
-    }
-
-    outSamples.clear();
-    outSamples.reserve(frameCount);
-    const char *p = data.constData() + dataOff;
-    for (int i = 0; i < frameCount; ++i) {
-        double acc = 0.0;
-        for (int c = 0; c < channels; ++c) {
-            const int o = i * frameBytes + c * 2;
-            const qint16 s = static_cast<qint16>(
-                static_cast<quint16>(static_cast<unsigned char>(p[o])) |
-                (static_cast<quint16>(static_cast<unsigned char>(p[o + 1])) << 8));
-            acc += static_cast<double>(s) / 32768.0;
-        }
-        outSamples.push_back(acc / channels);
-    }
-    sampleRate = sr;
-    return true;
-}
-
-} // namespace
 
 void MainWindow::openVoiceIsolationDialog()
 {
@@ -16999,7 +17738,7 @@ void MainWindow::openVoiceIsolationDialog()
     std::vector<double> decoded;
     int sampleRate = kSampleRate;
     QString readError;
-    if (!readPcm16WavToMono(sourceWav, decoded, sampleRate, &readError)
+    if (!libavcore::readPcm16WavToMono(sourceWav, decoded, sampleRate, &readError)
         || decoded.empty()) {
         QMessageBox::warning(this, QStringLiteral("音声分離"),
                              QStringLiteral("抽出した音声を読み込めませんでした:\n%1")
@@ -17171,7 +17910,7 @@ void MainWindow::openSpectralRepair()
     std::vector<double> samples;
     int sr = kSampleRate;
     QString readErr;
-    if (!readPcm16WavToMono(tmpWav, samples, sr, &readErr) || samples.empty()) {
+    if (!libavcore::readPcm16WavToMono(tmpWav, samples, sr, &readErr) || samples.empty()) {
         QMessageBox::warning(this, QStringLiteral("スペクトル音声修復"),
             QStringLiteral("抽出した音声を読み込めませんでした:\n%1")
                 .arg(readErr.isEmpty() ? QStringLiteral("(空のサンプル列)") : readErr));
@@ -18500,26 +19239,54 @@ void MainWindow::onMeterRequestResetAllMeters()
 // earlier sprint stories into the menu bar.
 // =============================================================
 
-namespace {
-// Build the (itemNames, trackIds) lists EqualizerPanel::setTracks expects.
-// Convention: id 0 = Master, ids 1..N = A1..An audio tracks (in order).
-static void buildAudioTrackList(int audioTrackCount,
-                                QStringList &itemNames,
-                                QList<int> &trackIds,
-                                bool includeMaster = true)
+namespace audiofxui {
+void suppressEqualizerSelectionWrites(EqualizerPanel *panel)
+{
+    auto *combo = panel->findChild<QComboBox *>();
+    if (!combo) return;
+    // EqualizerPanel's selection slot calls setEqSettings, which emits
+    // eqChanged after rounding dial values. Selection must never enable DSP.
+    QObject::disconnect(combo, nullptr, panel, nullptr);
+    QObject::connect(combo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+        panel, [panel](int index) {
+            const QSignalBlocker blocker(panel);
+            QMetaObject::invokeMethod(panel, "onTrackSelectionChanged", Qt::DirectConnection,
+                                      Q_ARG(int, index));
+        });
+}
+
+void buildAudioTrackList(int audioTrackCount, QStringList &itemNames,
+                        QList<int> &trackIds, bool includeMaster)
 {
     itemNames.clear();
     trackIds.clear();
     if (includeMaster) {
-        itemNames << QStringLiteral("Master");
-        trackIds << 0;
+        itemNames << QStringLiteral("マスター");
+        trackIds << AudioMixer::kMasterTrackId;
     }
     for (int i = 0; i < audioTrackCount; ++i) {
         itemNames << QStringLiteral("A%1").arg(i + 1);
-        trackIds << (i + 1);
+        trackIds << i;
     }
 }
-} // namespace
+
+void setTrackComboItems(QComboBox *combo, const QStringList &names,
+                       const QList<int> &ids)
+{
+    if (!combo) return;
+    const int previousId = combo->currentData().toInt();
+    const QSignalBlocker blocker(combo);
+    combo->clear();
+    for (int i = 0; i < qMin(names.size(), ids.size()); ++i) {
+        combo->addItem(names[i], ids[i]);
+        if (ids[i] == AudioMixer::kMasterTrackId)
+            combo->setItemData(i, QStringLiteral(
+                "すべてのトラックをミックスした後に掛かります (書き出しにも反映)"), Qt::ToolTipRole);
+    }
+    const int previousIndex = combo->findData(previousId);
+    combo->setCurrentIndex(previousIndex >= 0 ? previousIndex : (ids.isEmpty() ? -1 : 0));
+}
+} // namespace audiofxui
 
 void MainWindow::openEqualizerPanel()
 {
@@ -18534,26 +19301,39 @@ void MainWindow::openEqualizerPanel()
         m_equalizerDock = new QDockWidget(tr("EQ"), this);
         m_equalizerDock->setObjectName("EqualizerDock");
         auto *panel = new EqualizerPanel(m_equalizerDock);
+        audiofxui::suppressEqualizerSelectionWrites(panel);
         m_equalizerDock->setWidget(panel);
         addDockWidget(Qt::RightDockWidgetArea, m_equalizerDock);
 
         connect(panel, &EqualizerPanel::eqChanged,
                 this, [this](int trackId, AudioMixer::EqSettings eq) {
-            if (auto *mx = m_player ? m_player->audioMixer() : nullptr)
-                mx->setEqForTrack(trackId, eq);
+            if (auto *mx = m_player ? m_player->audioMixer() : nullptr) {
+                if (trackId == AudioMixer::kMasterTrackId)
+                    mx->setMasterEq(eq);
+                else
+                    mx->setEqForTrack(trackId, eq);
+            }
         });
     }
 
     // Re-seed track list and current per-track settings on every show
     // so newly added audio tracks appear without restart.
     if (auto *panel = qobject_cast<EqualizerPanel *>(m_equalizerDock->widget())) {
+        const QSignalBlocker seedBlocker(panel);
         QStringList names;
         QList<int> ids;
         const int trackCount = m_timeline ? m_timeline->audioTrackCount() : 0;
-        buildAudioTrackList(trackCount, names, ids);
+        audiofxui::buildAudioTrackList(trackCount, names, ids);
         panel->setTracks(names, ids);
+        if (auto *combo = panel->findChild<QComboBox *>()) {
+            const int masterIndex = combo->findData(AudioMixer::kMasterTrackId);
+            if (masterIndex >= 0)
+                combo->setItemData(masterIndex, tr(
+                    "すべてのトラックをミックスした後に掛かります (書き出しにも反映)"), Qt::ToolTipRole);
+        }
         for (int id : ids)
-            panel->setEqSettings(id, mixer->eqForTrack(id));
+            panel->setEqSettings(id, id == AudioMixer::kMasterTrackId
+                ? mixer->masterChain().eq : mixer->eqForTrack(id));
     }
     m_equalizerDock->setVisible(true);
     m_equalizerDock->raise();
@@ -18587,13 +19367,14 @@ void MainWindow::openCompressorPanel()
         QStringList names;
         QList<int> ids;
         const int trackCount = m_timeline ? m_timeline->audioTrackCount() : 0;
-        buildAudioTrackList(trackCount, names, ids, /*includeMaster=*/false);
-        // CompressorPanel::setTrackList accepts the active track ids and
-        // inserts the master row (id 0) itself.
-        panel->setTrackList(ids);
+        audiofxui::buildAudioTrackList(trackCount, names, ids, /*includeMaster=*/false);
+        // Legacy panel builders reserve 0 for Master; install engine IDs here.
+        audiofxui::setTrackComboItems(panel->findChild<QComboBox *>(), names, ids);
+        panel->setEnabled(!ids.isEmpty());
         for (int id : ids)
             panel->loadSettings(id, mixer->compressorForTrack(id));
-        panel->loadSettings(0, mixer->compressorForTrack(0));
+        if (!ids.isEmpty())
+            panel->loadSettings(ids.first(), mixer->compressorForTrack(ids.first()));
     }
     m_compressorDock->setVisible(true);
     m_compressorDock->raise();
@@ -18627,11 +19408,14 @@ void MainWindow::openReverbPanel()
         QStringList names;
         QList<int> ids;
         const int trackCount = m_timeline ? m_timeline->audioTrackCount() : 0;
-        buildAudioTrackList(trackCount, names, ids, /*includeMaster=*/false);
-        panel->setTrackList(ids);
+        audiofxui::buildAudioTrackList(trackCount, names, ids, /*includeMaster=*/false);
+        // Legacy panel builders reserve 0 for Master; install engine IDs here.
+        audiofxui::setTrackComboItems(panel->findChild<QComboBox *>(), names, ids);
+        panel->setEnabled(!ids.isEmpty());
         for (int id : ids)
             panel->loadSettings(id, mixer->reverbForTrack(id));
-        panel->loadSettings(0, mixer->reverbForTrack(0));
+        if (!ids.isEmpty())
+            panel->loadSettings(ids.first(), mixer->reverbForTrack(ids.first()));
     }
     m_reverbDock->setVisible(true);
     m_reverbDock->raise();
@@ -18665,11 +19449,14 @@ void MainWindow::openNoiseReductionPanel()
         QStringList names;
         QList<int> ids;
         const int trackCount = m_timeline ? m_timeline->audioTrackCount() : 0;
-        buildAudioTrackList(trackCount, names, ids, /*includeMaster=*/false);
-        panel->setTrackList(ids);
+        audiofxui::buildAudioTrackList(trackCount, names, ids, /*includeMaster=*/false);
+        // Legacy panel builders reserve 0 for Master; install engine IDs here.
+        audiofxui::setTrackComboItems(panel->findChild<QComboBox *>(), names, ids);
+        panel->setEnabled(!ids.isEmpty());
         for (int id : ids)
             panel->loadSettings(id, mixer->noiseReductionForTrack(id));
-        panel->loadSettings(0, mixer->noiseReductionForTrack(0));
+        if (!ids.isEmpty())
+            panel->loadSettings(ids.first(), mixer->noiseReductionForTrack(ids.first()));
     }
     m_noiseReductionDock->setVisible(true);
     m_noiseReductionDock->raise();
@@ -18824,9 +19611,9 @@ void MainWindow::onMultiCamApplyToTimeline(const MultiCamProject &project)
     }
 
     while (m_timeline->videoTrackCount() < 1)
-        m_timeline->addVideoTrack();
+        m_timeline->addVideoTrack(false);
     while (m_timeline->audioTrackCount() < 1)
-        m_timeline->addAudioTrack();
+        m_timeline->addAudioTrack(false);
 
     m_timeline->videoTracks().first()->setClips(v1Clips);
     m_timeline->audioTracks().first()->setClips(a1Clips);
@@ -20016,7 +20803,7 @@ void MainWindow::processNoisePrint(TimelineTrack *track, int clipIndex, bool cap
     }
     std::vector<double> input;
     int sampleRate = kSampleRate;
-    if (!readPcm16WavToMono(sourceWav, input, sampleRate, &error) || input.empty()) {
+    if (!libavcore::readPcm16WavToMono(sourceWav, input, sampleRate, &error) || input.empty()) {
         report(QStringLiteral("抽出した音声を読み込めませんでした:\n%1")
                    .arg(error.isEmpty() ? QStringLiteral("サンプルがありません") : error));
         return;
