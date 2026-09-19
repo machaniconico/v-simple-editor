@@ -1,5 +1,9 @@
 #include "../Timeline.h"
 #include "../UndoManager.h"
+#include "../AudioMixer.h"
+#include "../AudioBusRouting.h"
+#include "../ProjectFile.h"
+#include <memory>
 
 #include <QCoreApplication>
 #include <QEvent>
@@ -95,13 +99,14 @@ int runTrackOpsSelftest()
         QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
         ok = ok && removed.isNull();
         t.undo();
-        ok = ok && t.videoTrackCount() >= 3 && order(t.currentState().videoTracks, {0, 1, 2})
+        ok = ok && t.videoTrackCount() == 3 && order(t.currentState().videoTracks, {0, 1, 2})
             && t.currentState().selectedVideoTrackIndex == 2;
         baseline(t);
         ok = t.removeTrack(true, 0, &err) && ok
             && order(t.currentState().audioTracks, {1, 2}) && layoutOrder(t, true);
         t.undo();
-        gate(1, ok && order(t.currentState().audioTracks, {0, 1, 2}));
+        gate(1, ok && t.audioTrackCount() == 3
+            && order(t.currentState().audioTracks, {0, 1, 2}));
     }
     {
         Timeline t;
@@ -194,6 +199,111 @@ int runTrackOpsSelftest()
                 && qvariant_cast<QVector<int>>(spy[0][1]) == QVector<int>({2, 0, 1});
         }
         gate(4, ok);
+    }
+    {
+        Timeline t;
+        setup(t);
+        QJsonObject external{{"trackIndex", 2}, {"payload", QStringLiteral("保持")}};
+        t.setExternalTrackStateHooks([&]() { return external; },
+            [&](const QJsonObject &state) { external = state; });
+        QObject::connect(&t, &Timeline::trackIndicesRemapped, &t,
+            [&](bool audio, const QVector<int> &map) {
+                if (!audio) external["trackIndex"] = map.value(external["trackIndex"].toInt(), -1);
+            });
+        baseline(t);
+        const QJsonObject original = external;
+        bool ok = t.removeTrack(false, 0) && external["trackIndex"].toInt() == 1;
+        t.undo();
+        ok = ok && external == original;
+        t.redo();
+        ok = ok && external["trackIndex"].toInt() == 1;
+        t.undo();
+        ok = t.moveTrack(false, 2, 0) && ok && external["trackIndex"].toInt() == 0;
+        t.undo();
+        ok = ok && external == original;
+        // Capture external edits made since the last timeline undo snapshot.
+        external["payload"] = QStringLiteral("更新");
+        ok = t.removeTrack(false, 2) && ok && external["trackIndex"].toInt() == -1;
+        t.undo();
+        gate(5, ok && external["trackIndex"].toInt() == 2
+            && external["payload"].toString() == QStringLiteral("更新"));
+    }
+    {
+        Timeline t;
+        baseline(t);
+        const auto serial = t.undoManager()->saveSerial();
+        t.addVideoTrack();
+        QPointer<TimelineTrack> added(t.videoTracks().last());
+        bool ok = t.videoTrackCount() == 2 && t.undoManager()->saveSerial() == serial + 1;
+        t.undo();
+        ok = ok && t.videoTrackCount() == 1 && added && added->QWidget::isHidden()
+            && t.currentState().activeVideoTrackIndex < t.videoTrackCount();
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+        ok = ok && added.isNull();
+        t.redo();
+        ok = ok && t.videoTrackCount() == 2;
+        ok = t.removeTrack(false, 1) && ok && t.videoTrackCount() == 1;
+        t.undo();
+        ok = ok && t.videoTrackCount() == 2;
+        t.redo();
+        ok = ok && t.videoTrackCount() == 1;
+        t.addAudioTrack();
+        ok = ok && t.audioTrackCount() == 2;
+        t.undo();
+        gate(6, ok && t.audioTrackCount() == 1 && layoutOrder(t, false) && layoutOrder(t, true));
+    }
+    {
+        Timeline t;
+        setup(t);
+        auto mixer = std::make_unique<AudioMixer>();
+        audiobus::AudioBusRouting routing;
+        const int bus = routing.addBus(QStringLiteral("バス"));
+        routing.assignTrackToBus(1, bus);
+        routing.addAuxSend(audiobus::AuxSend{1, bus, 0.25, true});
+        trackfx::Chain chain;
+        chain.eqEnabled = true;
+        chain.eq.low.gainDb = 3.0;
+        mixer->setTrackChain(1, chain);
+        mixer->setTrackGain(1, 0.4);
+        mixer->setTrackMute(1, true);
+        mixer->setTrackSolo(1, true);
+        const auto initialMixer = mixer->collectTrackState();
+        const auto initialRouting = routing.toJson();
+        t.setExternalTrackStateHooks([&]() {
+            return QJsonObject{{"mixer", mixer->collectTrackState()}, {"buses", routing.toJson()}};
+        }, [&](const QJsonObject &state) {
+            mixer->applyTrackState(state["mixer"].toObject());
+            routing.fromJson(state["buses"].toObject());
+        });
+        QObject::connect(&t, &Timeline::trackIndicesRemapped, &t,
+            [&](bool audio, const QVector<int> &map) {
+                if (audio) { mixer->remapTrackIndices(map); routing.remapTrackIndices(map); }
+            });
+        baseline(t);
+        bool ok = t.removeTrack(false, 0) && mixer->trackChain(1).toJson() == chain.toJson();
+        ok = t.removeTrack(true, 0) && ok && mixer->trackChain(0).toJson() == chain.toJson()
+            && mixer->trackChain(1).isDefault() && mixer->trackGain(0) == 0.4
+            && routing.trackBus(0) == bus && routing.auxSends().size() == 1
+            && routing.auxSends()[0].trackIndex == 0;
+        ProjectData saved, loaded;
+        saved.videoTracks = t.currentState().videoTracks;
+        saved.audioTracks = t.currentState().audioTracks;
+        saved.trackFx.insert(0, mixer->trackChain(0));
+        saved.audioBusRouting = routing;
+        ok = ProjectFile::fromJsonString(ProjectFile::toJsonString(saved), loaded) && ok
+            && loaded.videoTracks.size() == 2 && loaded.audioTracks.size() == 2
+            && order(loaded.videoTracks, {1, 2}) && order(loaded.audioTracks, {1, 2})
+            && loaded.trackFx.value(0).toJson() == chain.toJson()
+            && loaded.audioBusRouting.toJson() == routing.toJson();
+        t.undo();
+        ok = ok && t.audioTrackCount() == 3 && mixer->collectTrackState() == initialMixer
+            && routing.toJson() == initialRouting;
+        t.undo();
+        ok = ok && t.videoTrackCount() == 3;
+        ok = t.moveTrack(true, 1, 2) && ok && mixer->trackChain(2).toJson() == chain.toJson()
+            && routing.trackBus(2) == bus;
+        t.undo();
+        gate(7, ok && mixer->collectTrackState() == initialMixer && routing.toJson() == initialRouting);
     }
     std::fprintf(stderr, "[track-ops] summary: %d PASS, %d FAIL\n", passed, failed);
     return failed;

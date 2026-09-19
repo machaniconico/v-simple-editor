@@ -92,3 +92,8 @@ void UndoManager::clear()
     emit stateChanged();
     emit historyChanged();
 }
+
+void UndoManager::updateCurrentExternalTrackState(const QJsonObject &state)
+{
+    if (!m_undoStack.isEmpty()) m_undoStack.top().state.externalTrackState = state;
+}

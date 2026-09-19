@@ -745,6 +745,9 @@ private:
     bool relinkMediaSidecars(const QHash<QString, QString> &oldToNew);
     void captureMediaRelinkSidecarsAtCurrentUndoIndex();
     void handleMediaRelinkHistoryChanged();
+    QJsonObject collectExternalTrackState() const;
+    void applyExternalTrackState(const QJsonObject &state);
+    void remapExternalTrackIndices(bool audio, const QVector<int> &oldToNew);
     void collectAudioState(ProjectData &data);
     void applyAudioState(const ProjectData &data);
     bool m_promptForMissingMedia = true;

@@ -813,6 +813,9 @@ public:
     void redo();
     bool canUndo() const;
     bool canRedo() const;
+    // External index owners participate in the same undo transaction.
+    void setExternalTrackStateHooks(std::function<QJsonObject()> collect,
+                                    std::function<void(const QJsonObject&)> apply);
     // MCP の各変更ツールが、検証済みの 1 操作を正確な説明で記録するための入口。
     void saveUndoState(const QString &description);
 
@@ -931,14 +934,14 @@ public:
     bool hasMarkedRange() const { return m_markIn >= 0 && m_markOut > m_markIn; }
 
     // Multi-track
-    void addVideoTrack();
+    void addVideoTrack(bool recordUndo = true);
     // Insert a VFX footage clip at the current playhead on an upper video
     // track. Empty upper tracks are preferred; a new upper track is created
     // when the playhead is occupied everywhere.
     bool insertVfxFootageAtPlayhead(const ClipInfo &clip,
                                     int *trackIndex = nullptr,
                                     int *clipIndex = nullptr);
-    void addAudioTrack();
+    void addAudioTrack(bool recordUndo = true);
     bool removeTrack(bool audio, int index, QString *err = nullptr);
     bool moveTrack(bool audio, int from, int to, QString *err = nullptr);
     // Force every audio row to repaint. Used after global UI state changes
@@ -1321,6 +1324,10 @@ private:
 
     void setupUI();
     void remapTrackIndices(bool audio, const QVector<int> &oldToNew);
+    std::function<QJsonObject()> m_collectExternalTrackState;
+    std::function<void(const QJsonObject&)> m_applyExternalTrackState;
+    void captureExternalTrackState();
+    void removeTrackInternal(bool audio, int index);
 public:
     void restoreState(const TimelineState &state);
     TimelineState currentState() const;

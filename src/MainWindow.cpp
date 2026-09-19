@@ -3055,6 +3055,11 @@ MainWindow::MainWindow(QWidget *parent)
     loadWorkspacesFromSettings();
 
     m_timeline->setAudioMixer(m_player->audioMixer());
+    m_timeline->setExternalTrackStateHooks(
+        [this]() { return collectExternalTrackState(); },
+        [this](const QJsonObject &state) { applyExternalTrackState(state); });
+    connect(m_timeline, &Timeline::trackIndicesRemapped,
+            this, &MainWindow::remapExternalTrackIndices);
 
     rebuildAudioMeters();
 
@@ -9176,6 +9181,109 @@ void MainWindow::handleMediaRelinkHistoryChanged()
     m_mediaRelinkObservedUndoIndex = index;
 }
 
+QJsonObject MainWindow::collectExternalTrackState() const
+{
+    QJsonObject state;
+    if (auto *mixer = m_timeline->audioMixer()) state["mixer"] = mixer->collectTrackState();
+    state["buses"] = m_audioBusRouting.toJson();
+    state["trackFlags"] = m_timeline->trackFlagsToJson();
+    state["adjustments"] = adjustmentLayersToJsonArray(m_timeline->adjustmentLayers());
+    QJsonArray mattes;
+    for (const auto &entry : m_trackMatteClipEntries)
+        mattes.append(QJsonObject{{"clipId", entry.clipId},
+            {"source", entry.matteSourceClipId}, {"type", int(entry.matteType)}});
+    state["mattes"] = mattes;
+    // The live particle owner is keyed by media path, not row. ProjectFile
+    // provides the canonical config serializer and captures row references.
+    ProjectData particles;
+    for (int t = 0; t < m_timeline->videoTrackCount(); ++t) {
+        const auto &clips = m_timeline->videoTracks()[t]->clips();
+        for (int c = 0; c < clips.size(); ++c) {
+            const QString key = particleClipKey(clips[c]);
+            if (!m_particleClipConfigs.contains(key)) continue;
+            ParticleClipEntry entry;
+            entry.trackIndex = t;
+            entry.clipIndex = c;
+            entry.clipFilePath = key;
+            entry.config = m_particleClipConfigs.value(key);
+            particles.particleClipEntries.append(entry);
+        }
+    }
+    state["particles"] = ProjectFile::toJsonString(particles);
+    return state;
+}
+
+void MainWindow::applyExternalTrackState(const QJsonObject &state)
+{
+    if (state.isEmpty()) return; // snapshots predating hook registration
+    m_timeline->applyTrackFlagsFromJson(state.value("trackFlags").toObject());
+    if (auto *mixer = m_timeline->audioMixer())
+        mixer->applyTrackState(state.value("mixer").toObject());
+    m_audioBusRouting.fromJson(state.value("buses").toObject());
+    if (auto *mixer = m_timeline->audioMixer()) mixer->setBusRouting(m_audioBusRouting);
+    m_timeline->setAdjustmentLayers(adjustmentLayersFromJsonArray(state.value("adjustments").toArray()));
+    m_trackMatteClipEntries.clear();
+    for (const auto &value : state.value("mattes").toArray()) {
+        const auto obj = value.toObject();
+        TrackMatteClipEntry entry;
+        entry.clipId = obj.value("clipId").toString();
+        entry.matteSourceClipId = obj.value("source").toString();
+        entry.matteType = static_cast<TrackMatteType>(obj.value("type").toInt());
+        m_trackMatteClipEntries.insert(entry.clipId, entry);
+    }
+    syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+    ProjectData particles;
+    if (ProjectFile::fromJsonString(state.value("particles").toString(), particles)) {
+        m_particleClipConfigs.clear();
+        for (const auto &entry : particles.particleClipEntries)
+            m_particleClipConfigs.insert(entry.clipFilePath, entry.config);
+    }
+    if (m_audioBusPanel) m_audioBusPanel->refresh();
+    rebuildAudioMeters();
+}
+
+void MainWindow::remapExternalTrackIndices(bool audio, const QVector<int> &oldToNew)
+{
+    // Audit: the only retained TimelineTrack pointer outside Timeline is
+    // this menu QPointer. VideoPlayer and docks retain no track widgets.
+    m_noisePrintMenuTrack = nullptr;
+    m_noisePrintMenuClip = -1;
+    if (audio) {
+        m_audioBusRouting.remapTrackIndices(oldToNew);
+        if (auto *mixer = m_timeline->audioMixer()) {
+            mixer->remapTrackIndices(oldToNew);
+            mixer->setBusRouting(m_audioBusRouting);
+        }
+        if (m_audioBusPanel) m_audioBusPanel->refresh();
+        rebuildAudioMeters();
+        return;
+    }
+    QVector<AdjustmentLayer> layers;
+    for (auto layer : m_timeline->adjustmentLayers()) {
+        layer.trackIndex = oldToNew.value(layer.trackIndex, -1);
+        if (layer.trackIndex >= 0) layers.append(layer);
+    }
+    m_timeline->setAdjustmentLayers(layers);
+    // Timeline has already remapped both sides of each matte reference.
+    m_trackMatteClipEntries.clear();
+    const auto mattes = m_timeline->trackMatteEntries();
+    for (auto it = mattes.cbegin(); it != mattes.cend(); ++it) {
+        TrackMatteClipEntry entry;
+        entry.clipId = it.key();
+        entry.matteSourceClipId = it.value().matteSourceClipId;
+        entry.matteType = it.value().matteType;
+        m_trackMatteClipEntries.insert(entry.clipId, entry);
+    }
+    QHash<QString, ParticleEmitterConfig> particles;
+    for (const auto *track : m_timeline->videoTracks()) {
+        for (const auto &clip : track->clips()) {
+            const QString key = particleClipKey(clip);
+            if (m_particleClipConfigs.contains(key)) particles.insert(key, m_particleClipConfigs.value(key));
+        }
+    }
+    m_particleClipConfigs = std::move(particles);
+}
+
 void MainWindow::collectAudioState(ProjectData &data)
 {
     data.trackFx.clear();
@@ -10566,7 +10674,7 @@ void MainWindow::addBgm()
     if (!filePath.isEmpty()) {
         // Ensure we have a second audio track for BGM
         if (m_timeline->audioTrackCount() < 2)
-            m_timeline->addAudioTrack();
+            m_timeline->addAudioTrack(false);
         m_timeline->addAudioFile(filePath);
         statusBar()->showMessage("Added BGM: " + filePath);
     }
@@ -14114,7 +14222,7 @@ void MainWindow::createNullObjectForSelection()
     nullClip.videoDy = 0.0;
     nullClip.rotation2DDegrees = 0.0;
 
-    m_timeline->addVideoTrack();
+    m_timeline->addVideoTrack(false);
     const int nullTrackIdx = m_timeline->videoTracks().size() - 1;
     TimelineTrack *nullTrack = m_timeline->videoTracks().value(nullTrackIdx, nullptr);
     if (!nullTrack)
@@ -19464,9 +19572,9 @@ void MainWindow::onMultiCamApplyToTimeline(const MultiCamProject &project)
     }
 
     while (m_timeline->videoTrackCount() < 1)
-        m_timeline->addVideoTrack();
+        m_timeline->addVideoTrack(false);
     while (m_timeline->audioTrackCount() < 1)
-        m_timeline->addAudioTrack();
+        m_timeline->addAudioTrack(false);
 
     m_timeline->videoTracks().first()->setClips(v1Clips);
     m_timeline->audioTracks().first()->setClips(a1Clips);

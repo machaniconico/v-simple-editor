@@ -200,6 +200,9 @@ public:
     const trackfx::Chain &trackChain(int trackId) const;
     void setTrackChain(int trackId, const trackfx::Chain &chain);
     void clearTrackFx();
+    QJsonObject collectTrackState() const;
+    void applyTrackState(const QJsonObject &state);
+    void remapTrackIndices(const QVector<int> &oldToNew);
 
     trackfx::Chain masterChain() const;
     void setMasterEq(const EqSettings &eq, bool enabled = true);

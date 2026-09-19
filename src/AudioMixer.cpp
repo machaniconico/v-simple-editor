@@ -9,6 +9,8 @@
 #include <QThread>
 #include <QVarLengthArray>
 #include <QSet>
+#include <QJsonArray>
+#include <type_traits>
 #include <QStringList>
 #include <QWaitCondition>
 #include <QMediaDevices>
@@ -3829,4 +3831,112 @@ const trackfx::Chain &AudioMixer::trackChain(int trackId) const
     QMutexLocker lock(&m_controlMutex);
     snapshot = m_trackFxChains.value(trackId);
     return snapshot;
+}
+
+QJsonObject AudioMixer::collectTrackState() const
+{
+    QMutexLocker lock(&m_controlMutex);
+    QJsonArray states;
+    for (const auto &state : m_trackStates) {
+        QJsonArray bands;
+        for (const auto &band : state.eq.bands)
+            bands.append(QJsonObject{{"frequency", band.frequency}, {"gain", band.gain}, {"q", band.q}});
+        states.append(QJsonObject{{"gain", state.gain}, {"mute", state.muted},
+            {"solo", state.solo}, {"eqEnabled", state.eqEnabled},
+            {"preamp", state.eq.preamp}, {"bands", bands}});
+    }
+    QJsonObject chains;
+    for (auto it = m_trackFxChains.cbegin(); it != m_trackFxChains.cend(); ++it)
+        chains.insert(QString::number(it.key()), it.value().toJson());
+    return QJsonObject{{"states", states}, {"chains", chains}};
+}
+
+void AudioMixer::applyTrackState(const QJsonObject &snapshot)
+{
+    QVector<TrackState> restoredStates;
+    const auto states = snapshot.value("states").toArray();
+    for (int i = 0; i < states.size() && i < kMaxAudioTracks; ++i) {
+        const auto obj = states[i].toObject();
+        TrackState state;
+        state.gain = qBound(0.0, obj.value("gain").toDouble(1.0), 4.0);
+        state.muted = obj.value("mute").toBool();
+        state.solo = obj.value("solo").toBool();
+        state.eqEnabled = obj.value("eqEnabled").toBool();
+        state.eq.preamp = obj.value("preamp").toDouble();
+        for (const auto &value : obj.value("bands").toArray()) {
+            const auto band = value.toObject();
+            state.eq.bands.append(EQBand{band.value("frequency").toDouble(1000.0),
+                band.value("gain").toDouble(), band.value("q").toDouble(1.0)});
+        }
+        recomputeEqCoefficients(state);
+        restoredStates.append(state);
+    }
+    QHash<int, trackfx::Chain> restoredChains;
+    QHash<int, std::array<EqBandCoefsParam, 4>> restoredCoefs;
+    const auto chains = snapshot.value("chains").toObject();
+    for (auto it = chains.begin(); it != chains.end(); ++it) {
+        bool valid = false;
+        const int index = it.key().toInt(&valid);
+        if (!valid || index < 0 || index >= kMaxAudioTracks) continue;
+        const auto chain = trackfx::Chain::fromJson(it.value().toObject());
+        restoredChains.insert(index, chain);
+        restoredCoefs.insert(index, {computeEqBand(chain.eq.low, 0, kSampleRateHz),
+            computeEqBand(chain.eq.lowMid, 1, kSampleRateHz),
+            computeEqBand(chain.eq.highMid, 2, kSampleRateHz),
+            computeEqBand(chain.eq.high, 3, kSampleRateHz)});
+    }
+    // Publish one complete snapshot to the audio callback. Master FX remain intact.
+    QMutexLocker lock(&m_controlMutex);
+    m_trackStates = std::move(restoredStates);
+    m_trackFxChains = std::move(restoredChains);
+    m_trackEqCoefs = std::move(restoredCoefs);
+    m_trackFxProcessors.clear();
+    m_trackEq.clear();
+    m_trackEqHist.clear();
+    m_trackComp.clear();
+    m_trackCompState.clear();
+    m_trackReverb.clear();
+    m_trackReverbState.clear();
+    m_trackNoiseReduction.clear();
+    m_trackNoiseReductionState.clear();
+    for (auto it = m_trackFxChains.cbegin(); it != m_trackFxChains.cend(); ++it) {
+        const int index = it.key();
+        const auto &chain = it.value();
+        m_trackFxProcessors[index].setChain(chain);
+        m_trackEq.insert(index, chain.eq);
+        m_trackComp.insert(index, chain.comp);
+        m_trackReverb.insert(index, chain.reverb);
+        m_trackNoiseReduction.insert(index, chain.nr);
+    }
+    recomputeEffectiveGainsLocked();
+}
+
+void AudioMixer::remapTrackIndices(const QVector<int> &oldToNew)
+{
+    QMutexLocker lock(&m_controlMutex);
+    QVector<TrackState> states;
+    for (int index : oldToNew) if (index >= states.size()) states.resize(index + 1);
+    for (int i = 0; i < oldToNew.size(); ++i)
+        if (oldToNew[i] >= 0 && i < m_trackStates.size()) states[oldToNew[i]] = m_trackStates[i];
+    m_trackStates = std::move(states);
+    auto remap = [&oldToNew](auto &map) {
+        std::decay_t<decltype(map)> result;
+        for (auto it = map.cbegin(); it != map.cend(); ++it) {
+            const int index = oldToNew.value(it.key(), -1);
+            if (index >= 0) result.insert(index, it.value());
+        }
+        map = std::move(result);
+    };
+    remap(m_trackFxChains);
+    remap(m_trackFxProcessors);
+    remap(m_trackEq);
+    remap(m_trackEqCoefs);
+    remap(m_trackEqHist);
+    remap(m_trackComp);
+    remap(m_trackCompState);
+    remap(m_trackReverb);
+    remap(m_trackReverbState);
+    remap(m_trackNoiseReduction);
+    remap(m_trackNoiseReductionState);
+    recomputeEffectiveGainsLocked();
 }

@@ -39,6 +39,7 @@ struct TimelineState {
     QVector<QString> videoTrackNames, audioTrackNames;
     QVector<QColor> videoTrackColors, audioTrackColors;
     QVector<double> audioTrackGains;
+    QJsonObject externalTrackState;
     QHash<QString, QString> clipParentEntries;
     QHash<QString, TimelineTrackMatteEntry> trackMatteEntries;
     // スナップショット時のプロジェクト出力ジオメトリ。SNS プリセット(プロジェクトを
@@ -81,6 +82,7 @@ public:
     bool jumpTo(int index);
 
     void clear();
+    void updateCurrentExternalTrackState(const QJsonObject &state);
 
 signals:
     void stateChanged();

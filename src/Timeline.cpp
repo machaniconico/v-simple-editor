@@ -4095,8 +4095,9 @@ void Timeline::syncTrackHeaderFlags(TimelineTrack *track)
                QString::fromUtf8("\xE2\x97\x89")); // ◉
 }
 
-void Timeline::addVideoTrack()
+void Timeline::addVideoTrack(bool recordUndo)
 {
+    if (recordUndo) captureExternalTrackState();
     int num = m_videoTracks.size() + 1;
     auto *track = new TimelineTrack(this);
     track->setPixelsPerSecond(m_zoomLevel);
@@ -4116,6 +4117,7 @@ void Timeline::addVideoTrack()
     m_videoTracks.append(track);
     wireTrackSelection(track);
     updateInfoLabel();
+    if (recordUndo) saveUndoState(QStringLiteral("トラックを追加"));
 }
 
 bool Timeline::insertVfxFootageAtPlayhead(const ClipInfo &clip,
@@ -4132,7 +4134,7 @@ bool Timeline::insertVfxFootageAtPlayhead(const ClipInfo &clip,
     // A footage overlay belongs above the base V1. If the project has no
     // tracks yet, create V1 as the eventual base row and V2 as the target.
     if (m_videoTracks.isEmpty())
-        addVideoTrack();
+        addVideoTrack(false);
 
     const double dropTime = qMax(0.0, m_playheadPos);
     int targetTrack = -1;
@@ -4151,7 +4153,7 @@ bool Timeline::insertVfxFootageAtPlayhead(const ClipInfo &clip,
     }
 
     if (targetTrack < 0) {
-        addVideoTrack();
+        addVideoTrack(false);
         targetTrack = static_cast<int>(m_videoTracks.size()) - 1;
         TimelineTrack *candidate = m_videoTracks.value(targetTrack, nullptr);
         if (!candidate)
@@ -4176,8 +4178,9 @@ bool Timeline::insertVfxFootageAtPlayhead(const ClipInfo &clip,
     return true;
 }
 
-void Timeline::addAudioTrack()
+void Timeline::addAudioTrack(bool recordUndo)
 {
+    if (recordUndo) captureExternalTrackState();
     int num = m_audioTracks.size() + 1;
     auto *track = new TimelineTrack(this);
     track->setIsAudioTrack(true);
@@ -4198,6 +4201,7 @@ void Timeline::addAudioTrack()
     m_audioTracks.append(track);
     wireTrackSelection(track);
     updateInfoLabel();
+    if (recordUndo) saveUndoState(QStringLiteral("トラックを追加"));
 }
 
 bool Timeline::removeTrack(bool audio, int index, QString *err)
@@ -4212,13 +4216,20 @@ bool Timeline::removeTrack(bool audio, int index, QString *err)
         if (err) *err = QStringLiteral("最後のトラックまたはロック中のトラックは削除できません");
         return false;
     }
+    captureExternalTrackState();
+    removeTrackInternal(audio, index);
+    saveUndoState(QStringLiteral("トラックを削除"));
+    return true;
+}
+
+void Timeline::removeTrackInternal(bool audio, int index)
+{
+    const auto &tracks = audio ? m_audioTracks : m_videoTracks;
     QVector<int> oldToNew(tracks.size());
     for (int i = 0; i < oldToNew.size(); ++i)
         oldToNew[i] = i == index ? -1 : (i > index ? i - 1 : i);
     remapTrackIndices(audio, oldToNew);
     emit trackIndicesRemapped(audio, oldToNew);
-    saveUndoState(QStringLiteral("トラックを削除"));
-    return true;
 }
 
 bool Timeline::moveTrack(bool audio, int from, int to, QString *err)
@@ -4230,6 +4241,7 @@ bool Timeline::moveTrack(bool audio, int from, int to, QString *err)
         return false;
     }
     if (from == to) return true;
+    captureExternalTrackState();
     QVector<int> oldToNew(tracks.size());
     for (int i = 0; i < oldToNew.size(); ++i) {
         oldToNew[i] = i;
@@ -4688,9 +4700,9 @@ bool Timeline::importMedia(const QString &filePath,
         // 片方だけ増やすとリンク済み素材が孤立するため、必要なら両方を同時に作る
         // (片側だけ置く kind ではその側だけ)。
         while (placeVideo && m_videoTracks.size() <= requestedTrackIndex)
-            addVideoTrack();
+            addVideoTrack(false);
         while (placeAudio && m_audioTracks.size() <= requestedTrackIndex)
-            addAudioTrack();
+            addAudioTrack(false);
         videoTrackIdx = requestedTrackIndex;
         audioTrackIdx = requestedTrackIndex;
     } else if (placement == ImportPlacement::AppendToFirstTrack) {
@@ -4698,9 +4710,9 @@ bool Timeline::importMedia(const QString &filePath,
         // whatever clips already live there. Create V1/A1 if the project
         // starts with zero tracks.
         if (placeVideo && m_videoTracks.isEmpty())
-            addVideoTrack();
+            addVideoTrack(false);
         if (placeAudio && m_audioTracks.isEmpty())
-            addAudioTrack();
+            addAudioTrack(false);
         videoTrackIdx = 0;
         audioTrackIdx = 0;
     } else {
@@ -4715,7 +4727,7 @@ bool Timeline::importMedia(const QString &filePath,
                 }
             }
             if (videoTrackIdx < 0) {
-                addVideoTrack();
+                addVideoTrack(false);
                 videoTrackIdx = m_videoTracks.size() - 1;
             }
         }
@@ -4727,7 +4739,7 @@ bool Timeline::importMedia(const QString &filePath,
                 }
             }
             if (audioTrackIdx < 0) {
-                addAudioTrack();
+                addAudioTrack(false);
                 audioTrackIdx = m_audioTracks.size() - 1;
             }
         }
@@ -5847,11 +5859,11 @@ bool Timeline::moveClipByIndex(bool audio, int trackIndex, int clipIndex,
         // 空トラックだけが残ってしまう。
         if (audio) {
             while (m_videoTracks.size() <= newTrackIndex)
-                addVideoTrack();
+                addVideoTrack(false);
             oppositeDestination = trackAt(false, newTrackIndex);
         } else {
             while (m_audioTracks.size() <= newTrackIndex)
-                addAudioTrack();
+                addAudioTrack(false);
             oppositeDestination = trackAt(true, newTrackIndex);
         }
         if (!oppositeDestination)
@@ -10001,7 +10013,7 @@ void Timeline::insertAudioClipAtPlayhead(const QString &wavPath, int trackIdx)
     if (targetIndex < 0 || targetIndex >= m_audioTracks.size()) {
         // Create tracks up to the requested one
         while (m_audioTracks.size() <= targetIndex) {
-            addAudioTrack();
+            addAudioTrack(false);
         }
     }
 
@@ -10742,9 +10754,9 @@ void Timeline::handleCrossTrackLinkedDrop(TimelineTrack *destTrack, int linkGrou
             auto &targetTracks = destIsVideo ? m_audioTracks : m_videoTracks;
             while (targetTracks.size() <= destIdx) {
                 if (destIsVideo)
-                    addAudioTrack();
+                    addAudioTrack(false);
                 else
-                    addVideoTrack();
+                    addVideoTrack(false);
             }
             TimelineTrack *targetTrack = targetTracks[destIdx];
 
@@ -11731,6 +11743,20 @@ void Timeline::refreshPlaybackSequence()
     scheduleEmitSequenceChanged();
 }
 
+void Timeline::setExternalTrackStateHooks(std::function<QJsonObject()> collect,
+                                          std::function<void(const QJsonObject&)> apply)
+{
+    m_collectExternalTrackState = std::move(collect);
+    m_applyExternalTrackState = std::move(apply);
+    captureExternalTrackState();
+}
+
+void Timeline::captureExternalTrackState()
+{
+    if (m_collectExternalTrackState)
+        m_undoManager->updateCurrentExternalTrackState(m_collectExternalTrackState());
+}
+
 void Timeline::saveUndoState(const QString &description)
 {
     m_undoManager->saveState(currentState(), description);
@@ -11930,9 +11956,9 @@ bool Timeline::setActiveSequence(const QString &sequenceId)
     const TimelineSequence targetCopy = *target;
     m_activeSequenceId = sequenceId;
     while (m_videoTracks.size() < targetCopy.videoTracks.size())
-        addVideoTrack();
+        addVideoTrack(false);
     while (m_audioTracks.size() < targetCopy.audioTracks.size())
-        addAudioTrack();
+        addAudioTrack(false);
 
     for (int i = 0; i < m_videoTracks.size(); ++i) {
         if (!m_videoTracks[i])
@@ -11997,7 +12023,7 @@ bool Timeline::addSequenceClip(const QString &sequenceId, int videoTrackIndex)
         return false;
     const int targetTrackIndex = qMax(0, videoTrackIndex);
     while (m_videoTracks.size() <= targetTrackIndex)
-        addVideoTrack();
+        addVideoTrack(false);
     TimelineTrack *track = m_videoTracks.value(targetTrackIndex, nullptr);
     if (!track)
         return false;
@@ -12008,7 +12034,7 @@ bool Timeline::addSequenceClip(const QString &sequenceId, int videoTrackIndex)
     track->addClip(clip);
 
     while (m_audioTracks.size() <= targetTrackIndex)
-        addAudioTrack();
+        addAudioTrack(false);
     if (TimelineTrack *audioTrack = m_audioTracks.value(targetTrackIndex, nullptr))
         audioTrack->addClip(clip);
 
@@ -12138,6 +12164,7 @@ TimelineState Timeline::currentState() const
             state.audioTrackGains[i] = m_audioMixer->trackGain(i);
     }
 
+    if (m_collectExternalTrackState) state.externalTrackState = m_collectExternalTrackState();
     state.projectWidth = m_projectWidth;
     state.projectHeight = m_projectHeight;
     state.projectExplicitOutput = m_projectExplicitOutput;
@@ -12148,12 +12175,13 @@ TimelineState Timeline::currentState() const
 void Timeline::restoreState(const TimelineState &state)
 {
     undotrace::log("restoreState:enter");
-    // Make sure the editor has at least as many rows as the snapshot. We
-    // only ADD here — never remove — because deleting a track widget
-    // mid-undo invalidates pointers other UI code may already hold (the
-    // undo path is reached from a menu callback, not a clean teardown).
-    while (m_videoTracks.size() < state.videoTracks.size()) addVideoTrack();
-    while (m_audioTracks.size() < state.audioTracks.size()) addAudioTrack();
+    // Deferred deletion keeps menu callbacks safe; remap receivers clear retained pointers.
+    while (m_videoTracks.size() > qMax(1, int(state.videoTracks.size())))
+        removeTrackInternal(false, m_videoTracks.size() - 1);
+    while (m_audioTracks.size() > qMax(1, int(state.audioTracks.size())))
+        removeTrackInternal(true, m_audioTracks.size() - 1);
+    while (m_videoTracks.size() < state.videoTracks.size()) addVideoTrack(false);
+    while (m_audioTracks.size() < state.audioTracks.size()) addAudioTrack(false);
 
     for (int i = 0; i < m_videoTracks.size(); ++i) {
         if (!m_videoTracks[i]) continue;
@@ -12211,12 +12239,13 @@ void Timeline::restoreState(const TimelineState &state)
     // A1 for genuinely legacy snapshots that predate the track-aware fields.
     if (!videoSelSet && (legacySelectionState || state.selectedVideoTrackIndex < 0)) {
         const bool vWas = m_videoTrack->blockSignals(true);
-        m_videoTrack->setSelectedClip(state.selectedClip);
+        const int selected = state.selectedClip >= 0 && state.selectedClip < m_videoTrack->clipCount()
+            ? state.selectedClip : -1;
+        m_videoTrack->setSelectedClip(selected);
         m_videoTrack->blockSignals(vWas);
-        emit clipSelected(state.selectedClip);
-        m_activeVideoTrackIndex = state.selectedClip < 0 ? -1 : 0;
-        emit clipSelectedOnTrack(state.selectedClip < 0 ? -1 : 0,
-                                 state.selectedClip);
+        emit clipSelected(selected);
+        m_activeVideoTrackIndex = selected < 0 ? -1 : 0;
+        emit clipSelectedOnTrack(m_activeVideoTrackIndex, selected);
     }
 
     if (state.selectedAudioTrackIndex >= 0
@@ -12235,7 +12264,8 @@ void Timeline::restoreState(const TimelineState &state)
         // Legacy fallback: old undo entries predating the V2 track-aware
         // fields restore selection on A1 the same as V1.
         const bool aWas = m_audioTrack->blockSignals(true);
-        m_audioTrack->setSelectedClip(state.selectedClip);
+        m_audioTrack->setSelectedClip(state.selectedClip >= 0 && state.selectedClip < m_audioTrack->clipCount()
+            ? state.selectedClip : -1);
         m_audioTrack->blockSignals(aWas);
     }
 
@@ -12271,6 +12301,8 @@ void Timeline::restoreState(const TimelineState &state)
     // VideoPlayer rebuilds its sequence after undo/redo.
     refreshTextStrip();
     scheduleEmitSequenceChanged();
+    if (m_applyExternalTrackState) m_applyExternalTrackState(state.externalTrackState);
+    syncActiveSequenceFromCurrentTracks();
     undotrace::log("restoreState:exit");
 }
 
@@ -12413,8 +12445,8 @@ void Timeline::restoreFromProject(const QVector<QVector<ClipInfo>> &videoTracks,
     // Grow to fit the incoming track counts, then rewrite EVERY existing
     // track. Tracks beyond the incoming set are cleared (empty clips) so
     // leftovers from a previously loaded project don't linger.
-    while (m_videoTracks.size() < videoTracks.size()) addVideoTrack();
-    while (m_audioTracks.size() < audioTracks.size()) addAudioTrack();
+    while (m_videoTracks.size() < videoTracks.size()) addVideoTrack(false);
+    while (m_audioTracks.size() < audioTracks.size()) addAudioTrack(false);
 
     for (int i = 0; i < m_videoTracks.size(); ++i) {
         if (!m_videoTracks[i]) continue;
@@ -12455,8 +12487,8 @@ void Timeline::restoreFromProject(const ProjectTrackClips &videoTracks,
     if (flags.isEmpty())
         flags = audioTracks.trackFlagsSnapshot;
     // Capture the loaded appearance in the load undo snapshot as well.
-    while (m_videoTracks.size() < videoTracks.size()) addVideoTrack();
-    while (m_audioTracks.size() < audioTracks.size()) addAudioTrack();
+    while (m_videoTracks.size() < videoTracks.size()) addVideoTrack(false);
+    while (m_audioTracks.size() < audioTracks.size()) addAudioTrack(false);
     applyTrackFlagsFromJson(flags);
     restoreFromProject(static_cast<const QVector<QVector<ClipInfo>> &>(videoTracks),
                        static_cast<const QVector<QVector<ClipInfo>> &>(audioTracks),

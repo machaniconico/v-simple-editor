@@ -2,6 +2,7 @@
 // ルーティング & ゲイン解決エンジン。詳細仕様は AudioBusRouting.h を参照。
 
 #include "AudioBusRouting.h"
+#include <utility>
 
 #include <QJsonArray>
 #include <QJsonValue>
@@ -370,3 +371,19 @@ void AudioBusRouting::clear()
 }
 
 } // namespace audiobus
+
+void audiobus::AudioBusRouting::remapTrackIndices(const QVector<int> &oldToNew)
+{
+    QHash<int, int> buses;
+    for (auto it = m_trackBus.cbegin(); it != m_trackBus.cend(); ++it) {
+        const int index = oldToNew.value(it.key(), -1);
+        if (index >= 0) buses.insert(index, it.value());
+    }
+    m_trackBus = std::move(buses);
+    QVector<AuxSend> sends;
+    for (auto send : m_auxSends) {
+        send.trackIndex = oldToNew.value(send.trackIndex, -1);
+        if (send.trackIndex >= 0) sends.append(send);
+    }
+    m_auxSends = std::move(sends);
+}
