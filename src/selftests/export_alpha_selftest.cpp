@@ -155,35 +155,50 @@ int runExportAlphaSelftest()
             output->setText(temp.filePath("dialog.mov"));
             refusal &= QMetaObject::invokeMethod(&dialog, "onExport", Qt::DirectConnection)
                 && dialog.config().keepAlpha && dialog.config().proresProfile == 4;
-            // Mirror MainWindow's GUI job mapping: opt-in survives in the
-            // queued config; the default omits the key entirely.
-            const auto jobConfig = [](const ExportConfig &exportCfg) {
+            // Mirror MainWindow::exportVideo (MainWindow.cpp:10049-10079):
+            // codec and alpha config must be mapped together before addJob.
+            const auto makeGuiJob = [](const ExportConfig &exportCfg) -> RenderJob {
+                RenderJob job;
+                job.outputPath = exportCfg.outputPath;
                 QJsonObject cfg;
                 cfg["videoCodec"] = exportCfg.videoCodec;
+                job.codec = exportCfg.videoCodec;
                 if (exportCfg.proresProfile >= 0)
                     cfg["proresProfile"] = exportCfg.proresProfile;
                 if (exportCfg.keepAlpha) cfg["keepAlpha"] = true;
-                return cfg;
+                job.exportConfig = cfg;
+                return job;
             };
-            const QJsonObject cfg = jobConfig(dialog.config());
-            refusal &= cfg.value("videoCodec").toString() == QStringLiteral("prores_ks")
-                && cfg.value("proresProfile").toInt() == 4
-                && cfg.value("keepAlpha").toBool()
-                && !jobConfig(ExportConfig{}).contains("keepAlpha");
+            const RenderJob guiJob = makeGuiJob(dialog.config());
+            refusal &= !makeGuiJob(ExportConfig{}).exportConfig.contains("keepAlpha");
             RenderQueue guiQueue;
-            RenderJob guiJob;
-            guiJob.outputPath = dialog.config().outputPath;
-            guiJob.codec = dialog.config().videoCodec;
-            guiJob.exportConfig = cfg;
             guiQueue.addJob(guiJob);
             const auto jobs = guiQueue.jobs();
             refusal &= jobs.size() == 1;
             if (jobs.size() == 1)
-                refusal &= jobs.front().exportConfig.value("keepAlpha").toBool()
+                refusal &= jobs.front().exportConfig.value("videoCodec").toString()
+                        == QStringLiteral("prores_ks")
+                    && jobs.front().exportConfig.value("keepAlpha").toBool()
                     && jobs.front().exportConfig.value("proresProfile").toInt() == 4;
+
+            // Leaving the flat codec at its default overwrites the JSON codec
+            // with H.264 in addJob, so the same alpha config must be rejected.
+            RenderQueue missingCodecQueue;
+            QString missingCodecError;
+            QObject::connect(&missingCodecQueue, &RenderQueue::jobFailed,
+                &missingCodecQueue, [&](int, const QString &message) {
+                    missingCodecError = message;
+                });
+            RenderJob missingCodecJob;
+            missingCodecJob.outputPath = guiJob.outputPath;
+            missingCodecJob.exportConfig = guiJob.exportConfig;
+            missingCodecQueue.addJob(missingCodecJob);
+            refusal &= missingCodecQueue.jobs().isEmpty()
+                && missingCodecError == QStringLiteral("このコーデックはアルファを保持できません");
+
             ExportConfig opaqueConfig = dialog.config();
             opaqueConfig.keepAlpha = false;
-            refusal &= !jobConfig(opaqueConfig).contains("keepAlpha");
+            refusal &= !makeGuiJob(opaqueConfig).exportConfig.contains("keepAlpha");
         }
         presets->setCurrentIndex(presets->findText(QStringLiteral("ProRes 422")));
         refusal &= !checkbox->isEnabled() && !checkbox->isChecked();

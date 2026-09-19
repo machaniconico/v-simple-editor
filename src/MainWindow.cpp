@@ -10051,6 +10051,7 @@ void MainWindow::exportVideo()
     cfg["height"]       = job.height;
     cfg["fps"]          = exportCfg.fps > 0 ? exportCfg.fps : 30;
     cfg["videoCodec"]   = exportCfg.videoCodec;     // already ffmpeg-named
+    job.codec = exportCfg.videoCodec;
     cfg["videoBitrate"] = exportCfg.videoBitrate;   // kbps
     if (exportCfg.rateControl == ExportConfig::RateControl::Crf) {
         cfg["rateControl"] = QStringLiteral("crf");
