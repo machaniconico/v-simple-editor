@@ -3,6 +3,7 @@
 #include "../TimelineFrameRenderer.h"
 #include "../UndoManager.h"
 #include "../VideoPlayer.h"
+#include "../libavcore/Encode.h"
 
 #include <QTemporaryDir>
 #include <cmath>
@@ -12,6 +13,41 @@
 #include <limits>
 
 namespace {
+bool writeSyntheticClip(const QString &path, const QImage &frame)
+{
+    constexpr int fps = 10;
+    libavcore::EncodeRequest request;
+    request.width = frame.width();
+    request.height = frame.height();
+    request.fps = request.fpsNum = fps;
+    request.fpsDen = 1;
+    request.videoBitrateBits = 2000000;
+    request.outputPath = path.toStdString();
+    // Match ClipLutSelftest's supported software codec: acceptance libav
+    // builds need not contain a PNG decoder. G3 tolerates MPEG-4 noise.
+    request.videoCodecName = "mpeg4";
+    request.hwVendorHint = "none";
+    request.useHardwareAccel = false;
+
+    libavcore::FrameEncoder encoder;
+    if (const auto error = encoder.open(request)) {
+        std::cerr << "mesh-warp fixture open: " << *error << '\n';
+        return false;
+    }
+    const QImage rgb = frame.convertToFormat(QImage::Format_RGB888);
+    for (int i = 0; i < fps; ++i) {
+        if (!encoder.pushFrameRgb24(rgb.constBits(), rgb.bytesPerLine(), i)) {
+            std::cerr << "mesh-warp fixture encode failed at frame " << i << '\n';
+            return false;
+        }
+    }
+    if (const auto error = encoder.finalize()) {
+        std::cerr << "mesh-warp fixture finalize: " << *error << '\n';
+        return false;
+    }
+    return true;
+}
+
 bool identical(const QImage &a, const QImage &b)
 {
     if (a.isNull() || b.isNull() || a.size() != b.size()
@@ -65,8 +101,14 @@ int runMeshWarpSelftest()
         for (int x = 222; x <= 226; ++x)
             source.setPixelColor(x, y, Qt::white);
     QTemporaryDir directory;
-    const QString path = directory.filePath(QStringLiteral("mesh-source.png"));
-    const bool fixtureOk = directory.isValid() && source.save(path);
+    const QString path = directory.filePath(QStringLiteral("mesh-source.mp4"));
+    const bool fixtureOk = directory.isValid() && writeSyntheticClip(path, source);
+    // Feed preview the same native RGBA decode that renderFrameAt uses,
+    // including any codec quantization, rather than the pre-encode image.
+    const QImage decodedSource = fixtureOk
+        ? tlrender::detail::decodeClipFrameNativeForTest(path, 0.0) : QImage();
+    const bool decodeOk = !decodedSource.isNull() && decodedSource.size() == size
+        && decodedSource.format() == QImage::Format_RGBA8888;
     ClipInfo clip;
     clip.filePath = path;
     clip.duration = clip.outPoint = 1.0;
@@ -82,7 +124,7 @@ int runMeshWarpSelftest()
     const QImage bypass = render();
     tlrender::setMeshWarpDisabledForTesting(false);
     const QImage plain = render();
-    gate(1, fixtureOk && identical(bypass, plain)
+    gate(1, fixtureOk && decodeOk && identical(bypass, plain)
         && tlrender::meshWarpInvocationCountForTesting() == 0
         && !legacyJson.contains(QStringLiteral("\"meshWarp\"")));
 
@@ -144,8 +186,9 @@ int runMeshWarpSelftest()
     ClipInfo background;
     background.opacity = 0.0;
     const QImage preview = VideoPlayer::composeCpuPreviewForTest(
-        source, active, {}, source, background, {}, 0.0, 0.0, size);
-    undoOk &= tlrender::hasActiveMeshWarp(active) && identical(preview, render());
+        decodedSource, active, {}, decodedSource, background, {}, 0.0, 0.0, size);
+    undoOk &= decodeOk && tlrender::hasActiveMeshWarp(active)
+        && identical(preview, render());
     timeline.undo();
     undoOk &= !timeline.videoTracks()[0]->clips()[0].hasMeshWarp()
         && identical(plain, render());
