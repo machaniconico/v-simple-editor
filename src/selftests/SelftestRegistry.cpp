@@ -73,6 +73,7 @@ int runCaptionSelftest();
 int runChromaSelftest();
 int runClipColorSelftest();
 int runClipCurvesSelftest();
+int runClipEnableSelftest();
 int runClipFilmstripSelftest();
 int runClipLutSelftest();
 int runClipMaskSelftest();
@@ -675,6 +676,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "ClipColor: per-clip 色メタデータ模型 — defaultSdr / JSON round-trip / token 逆写像 / describe / codec transfer mapping (14 gates)" },
     { "clip-mask",        "VEDITOR_CLIP_MASK_SELFTEST",          runClipMaskSelftest,           false,
       "Bezier clip masks: model JSON, ProjectFile default omission, per-clip maskSystem round-trip" },
+    { "clip-enable", "VEDITOR_CLIP_ENABLE_SELFTEST", runClipEnableSelftest, true,
+      "Clip enable: rendering, persistence, undo, audio and Null Object parenting (5 gates)" },
     { "clip-parent-parity", "VEDITOR_CLIP_PARENT_PARITY_SELFTEST", runClipParentParitySelftest, true,
       "Clip parenting: render parity, composeParented math, cycle/self/null guards" },
     { "clip-idt",         "VEDITOR_CLIP_IDT_SELFTEST",           runClipIdtSelftest,            false,

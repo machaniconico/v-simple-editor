@@ -385,6 +385,7 @@ QJsonObject clipOutputItemSchema()
         {QStringLiteral("autoOrient"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
         {QStringLiteral("volume"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
         {QStringLiteral("opacity"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
+        {QStringLiteral("enabled"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
         {QStringLiteral("label"), QJsonObject{
             {QStringLiteral("type"), QStringLiteral("string")},
             {QStringLiteral("enum"), clipLabelEnum()}
@@ -1040,6 +1041,7 @@ QJsonObject clipToJson(const ClipInfo& clip, int clipIndex, double startSec,
         {QStringLiteral("autoOrient"), clip.autoOrientEnabled},
         {QStringLiteral("volume"), clip.volume},
         {QStringLiteral("opacity"), clip.opacity},
+        {QStringLiteral("enabled"), clip.visible},
         {QStringLiteral("label"), clipLabelToString(clip.label)},
         {QStringLiteral("linkGroup"), clip.linkGroup},
         {QStringLiteral("selected"), selected},
@@ -4067,6 +4069,33 @@ void McpEditorTools::registerWriteTools()
             return response;
         })
     }, dynamicZoomOutputSchema));
+
+    m_registry->registerTool(withOutputSchema({
+        QStringLiteral("set_clip_enabled"),
+        QStringLiteral("映像・音声クリップの有効状態を切り替える。Null Object は対象外。取り消し可能。"),
+        schemaWithRequired(mergedProperties(clipProperties, QJsonObject{
+            {QStringLiteral("enabled"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}}
+        }), {QStringLiteral("clipIndex"), QStringLiteral("enabled")}),
+        guardedWrite(QStringLiteral("set_clip_enabled"),
+            [this](const QJsonObject &args, QString *err) -> QJsonObject {
+                if (!rejectUnknownArguments(args, {QStringLiteral("kind"), QStringLiteral("trackIndex"),
+                        QStringLiteral("clipIndex"), QStringLiteral("enabled")}, err)) return {};
+                if (!args.value(QStringLiteral("enabled")).isBool())
+                    return setError(err, QStringLiteral("enabled must be a boolean")), QJsonObject();
+                ClipTarget target;
+                Timeline *currentTimeline = timeline();
+                if (!readClipTarget(args, m_window, currentTimeline, &target, err)) return {};
+                const bool enabled = args.value(QStringLiteral("enabled")).toBool();
+                if (!currentTimeline->setClipEnabled(target.audio ? TrackKind::Audio : TrackKind::Video,
+                        target.trackIndex, target.clipIndex, enabled))
+                    return setError(err, QStringLiteral("clip is locked or is a Null Object")), QJsonObject();
+                syncSelectionAfterEdit();
+                return QJsonObject{{QStringLiteral("ok"), true}, {QStringLiteral("enabled"), enabled}};
+            })
+    }, schemaWithRequired(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("enabled"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}}
+    }, {QStringLiteral("ok"), QStringLiteral("enabled")})));
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("set_clip_label"),

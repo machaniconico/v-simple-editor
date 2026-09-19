@@ -444,6 +444,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/composite_frame_cache_selftests.cpp
     src/selftests/playback_quality_policy_selftests.cpp
     src/selftests/sns_fit_selftest.cpp
+    src/selftests/clip_enable_selftest.cpp
     src/selftests/clip_parent_parity_selftest.cpp
     src/playback/AutoProxyPolicy.h
     src/playback/AutoProxyPolicy.cpp

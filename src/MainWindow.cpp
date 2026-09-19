@@ -787,6 +787,8 @@ bool timelineAudioMatchesPassthrough(Timeline *timeline)
         if (!track || track->isMuted())
             continue;
         for (const ClipInfo &clip : track->clips()) {
+            if (!clip.visible && !clipgeom::isNullObjectFilePath(clip.filePath))
+                return false; // Never resurrect disabled source audio.
             if (only)
                 return false; // 2 つ以上の音声クリップ
             only = &clip;

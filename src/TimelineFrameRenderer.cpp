@@ -61,6 +61,22 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 
+// Test seam: default projects never enter the disabled-clip branch.
+namespace clipenabletest {
+std::atomic<bool> bypass{false};
+std::atomic<quint64> skipped{0};
+void setBypass(bool value) { bypass = value; skipped = 0; }
+quint64 skipCount() { return skipped; }
+bool disabled(const ClipInfo &clip)
+{
+    if (!bypass && !clip.visible && !clipgeom::isNullObjectFilePath(clip.filePath)) {
+        ++skipped;
+        return true;
+    }
+    return false;
+}
+}
+
 namespace veditor {
 bool parentingEnabledFromEnv()
 {
@@ -1829,15 +1845,19 @@ QImage renderFrameFromTracks(const Timeline *timeline,
     auto selectClip = [&](int t, bool clamp, double *start) {
         if (overlapA[t] >= 0) {
             const auto &a = intervals[t][overlapA[t]];
-            *start = a.timelineStart;
-            return a.clipIdx;
+            const auto &selected = clipenabletest::disabled(tracks[t].clips[a.clipIdx])
+                ? intervals[t][overlapB[t]] : a;
+            *start = selected.timelineStart;
+            return selected.clipIdx;
         }
         return activeClipOnTrack(tracks[t].clips, targetSec, clamp, start);
     };
     auto sourceAt = [&](int t, const ClipInfo &c, double local, bool reverse) {
         if (overlapA[t] >= 0) {
             const auto &a = intervals[t][overlapA[t]];
-            return overlapSourceSecond(a, c, local, reverse);
+            const auto &selected = clipenabletest::disabled(tracks[t].clips[a.clipIdx])
+                ? intervals[t][overlapB[t]] : a;
+            return overlapSourceSecond(selected, c, local, reverse);
         }
         return sourceSecondForClipAtLocalTime(c, local, reverse);
     };
@@ -1854,6 +1874,7 @@ QImage renderFrameFromTracks(const Timeline *timeline,
             if (tracks[t].hidden) continue;
             for (int j = 0; j < intervals[t].size(); ++j) {
                 const auto &iv = intervals[t][j];
+                if (clipenabletest::disabled(tracks[t].clips[iv.clipIdx])) continue;
                 if (targetSec >= iv.timelineStart && targetSec < iv.timelineEnd
                     && iv.timelineStart < earliest) {
                     earliest = iv.timelineStart;
@@ -1875,6 +1896,7 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         if (overlapA[primaryTrack] != primaryIndex) return composed;
         const auto &b = intervals[primaryTrack][overlapB[primaryTrack]];
         const ClipInfo &c = tracks[primaryTrack].clips[b.clipIdx];
+        if (clipenabletest::disabled(c)) return composed;
         const double local = targetSec - b.timelineStart;
         const bool reverse = sampleFromLeftBoundary
             || clipParticipatesInReverseComposition(c, sequenceSnapshot);
@@ -1949,7 +1971,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
                 return QImage();
 
             const ClipInfo &v1Clip = v1Clips[v1Idx];
-            v1ClipPtr = &v1Clip;
+            const bool v1Disabled = clipenabletest::disabled(v1Clip);
+            v1ClipPtr = v1Disabled ? &hiddenV1Clip : &v1Clip;
         // Timeline-second -> source-second mapping. Empty time-remap curves keep
         // the legacy inPoint + local*speed path; one-key curves resolve to the
         // constant held source time used by computePlaybackSequence.
@@ -1969,7 +1992,10 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         v1NullObject = v1Clip.isAdjustment
             || (v1Clip.shapes.isEmpty()
                 && clipgeom::isNullObjectFilePath(v1Clip.filePath));
-        if (v1Clip.isAdjustment) {
+        if (v1Disabled) {
+            v1EffectiveOpacity = 0.0;
+            base = transparentFrame(outSize);
+        } else if (v1Clip.isAdjustment) {
             activeAdjustments.append(ActiveAdjustmentClip{0, &v1Clip, v1LocalSec});
             v1EffectiveOpacity = 0.0;
             base = QImage(outSize, QImage::Format_RGBA8888);
@@ -2142,6 +2168,7 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         if (idx < 0)
             continue;
         const ClipInfo &c = clips[idx];
+        if (clipenabletest::disabled(c)) continue;
         const double localSec = targetSec - start;            // >= 0
         const bool reverseComposition = sampleFromLeftBoundary
             || clipParticipatesInReverseComposition(c, sequenceSnapshot);

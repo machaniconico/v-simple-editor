@@ -392,7 +392,10 @@ bool isAdjustmentEntry(const Timeline *timeline, const PlaybackEntry &entry)
 bool isShapeClipEntry(const Timeline *timeline, const PlaybackEntry &entry)
 {
     const ClipInfo *clip = clipForPlaybackEntry(timeline, entry);
-    return clip && !clip->shapes.isEmpty();
+    // Keep disabled clip intervals as clock carriers, but never open their
+    // decoder: the canonical renderer supplies transparent pixels instead.
+    return clip && (!clip->shapes.isEmpty()
+        || (!clip->visible && !clipgeom::isNullObjectFilePath(clip->filePath)));
 }
 
 const ClipInfo *activeClipOnTrack(const QVector<ClipInfo> &clips,
@@ -437,6 +440,17 @@ bool timelineHasActiveShapeClip(const Timeline *timeline, qint64 timelineUsec)
 {
     if (!timeline)
         return false;
+    // Disabled clips require the canonical compositor, including empty V1 gaps.
+    const auto hasDisabled = [](const QVector<ClipInfo> &clips) {
+        return std::any_of(clips.cbegin(), clips.cend(), [](const ClipInfo &c) {
+            return !c.visible && !clipgeom::isNullObjectFilePath(c.filePath);
+        });
+    };
+    for (const auto *track : timeline->videoTracks())
+        if (track && hasDisabled(track->clips())) return true;
+    for (const auto &sequence : timeline->sequences())
+        for (const auto &clips : sequence.videoTracks)
+            if (hasDisabled(clips)) return true;
     const double targetSec = static_cast<double>(timelineUsec) / AV_TIME_BASE;
     for (const TimelineTrack *track : timeline->videoTracks()) {
         if (!track || track->isHidden())

@@ -1,4 +1,5 @@
 #include "ProjectFile.h"
+#include "ClipGeometry.h"
 #include "AudioMixer.h"
 #include "MarkerData.h"
 #include "AdjustmentLayer.h"
@@ -1862,6 +1863,8 @@ ProjectConfig ProjectFile::configFromJson(const QJsonObject &obj)
 QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
 {
     QJsonObject obj;
+    if (!clip.visible && !clipgeom::isNullObjectFilePath(clip.filePath))
+        obj["visible"] = false;
     obj["filePath"] = clip.filePath;
     obj["displayName"] = clip.displayName;
     if (!clip.shapes.isEmpty()) {
@@ -1984,6 +1987,8 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
 {
     ClipInfo clip;
     clip.filePath = obj["filePath"].toString();
+    clip.visible = !clipgeom::isNullObjectFilePath(clip.filePath)
+        && obj.value("visible").toBool(true);
     clip.displayName = obj["displayName"].toString();
     if (obj.contains("shapes")) {
         for (const QJsonValue &value : obj["shapes"].toArray())

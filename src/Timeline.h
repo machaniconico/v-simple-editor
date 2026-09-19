@@ -793,6 +793,7 @@ public:
                           QString *errorOut = nullptr,
                           const std::function<bool(
                               const QHash<QString, QString> &)> &relinkSidecars = {});
+    bool setClipEnabled(TrackKind kind, int trackIndex, int clipIndex, bool enabled);
     bool setClipLabel(TrackKind kind, int trackIndex, int clipIndex, ClipLabel label);
     bool selectClipByIndex(bool audio, int trackIndex, int clipIndex, QString *err);
     void clearSelection();

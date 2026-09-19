@@ -1,3 +1,4 @@
+#include "../ClipGeometry.h"
 #include <QEventLoop>
 #include <QElapsedTimer>
 #include <QAction>
@@ -1194,7 +1195,7 @@ int runMcpSelftest()
             rpcRequest(73, QStringLiteral("tools/list")))))
         .value(QStringLiteral("result")).toObject()
         .value(QStringLiteral("tools")).toArray();
-    constexpr int kExpectedProjectInfoToolCount = 36 + 1 + 2 + 2 + 1 + 2 + 3; // US-308: compare_project; US-312: render/decompose; US-400: color/LUT; US-406: track properties; US-509: sequences; US-511: track operations
+    constexpr int kExpectedProjectInfoToolCount = 36 + 1 + 2 + 2 + 1 + 2 + 3 + 1; // US-308: compare_project; US-312: render/decompose; US-400: color/LUT; US-406: track properties; US-509: sequences; US-511: track operations
     bool outputSchemasDeclared = projectInfoToolDescriptors.size()
         == kExpectedProjectInfoToolCount;
     for (const QJsonValue& value : projectInfoToolDescriptors) {
@@ -5680,6 +5681,55 @@ int runMcpSelftest()
         fail("G168 add_track and single undo", QStringLiteral("Timeline was not available"));
         fail("G169 remove_track clips, undo and rejection", QStringLiteral("Timeline was not available"));
         fail("G170 move_track appearance, undo and bounds", QStringLiteral("Timeline was not available"));
+    }
+    // US-600: the real transport must validate arguments and record one undo.
+    if (projectTimeline) {
+        const auto saved = projectTimeline->currentState();
+        Timeline clean;
+        projectTimeline->restoreState(clean.currentState());
+        ClipInfo clip;
+        clip.filePath = QStringLiteral("clip-enable-test.mp4");
+        clip.duration = clip.outPoint = 1.0;
+        projectTimeline->videoTracks().first()->setClips({clip});
+        projectTimeline->audioTracks().first()->setClips({clip});
+        projectTimeline->undoManager()->clear();
+        projectTimeline->undoManager()->saveState(projectTimeline->currentState(), QStringLiteral("基準"));
+        int requestId = 60000;
+        auto call = [&](const QString &name, const QJsonObject &args) {
+            return callProjectInfoTool(++requestId, name, args);
+        };
+        bool good = true;
+        for (const QString &kind : {QStringLiteral("video"), QStringLiteral("audio")}) {
+            const auto serial = projectTimeline->undoManager()->saveSerial();
+            const auto response = toolPayload(call(QStringLiteral("set_clip_enabled"),
+                {{"kind", kind}, {"clipIndex", 0}, {"enabled", false}}));
+            good = good && response.value("ok").toBool() && response.value("undoRecorded").toBool()
+                && projectTimeline->undoManager()->saveSerial() == serial + 1;
+            const auto tracks = toolPayload(call(QStringLiteral("get_timeline"), {}))
+                .value(kind).toArray();
+            const auto clips = tracks.isEmpty() ? QJsonArray{}
+                : tracks.first().toObject().value("clips").toArray();
+            good = good && !clips.isEmpty() && clips.first().toObject().contains("enabled")
+                && !clips.first().toObject().value("enabled").toBool(true);
+            projectTimeline->undo();
+            const auto *track = kind == QStringLiteral("audio")
+                ? projectTimeline->audioTracks().first() : projectTimeline->videoTracks().first();
+            good = good && track->clips().first().visible;
+        }
+        for (const QJsonObject &args : {
+                QJsonObject{{"clipIndex", 99}, {"enabled", false}},
+                QJsonObject{{"clipIndex", 0}, {"enabled", "false"}}})
+            good = toolResult(call(QStringLiteral("set_clip_enabled"), args)).value("isError").toBool() && good;
+        clip.filePath = clipgeom::nullObjectFilePath();
+        clip.visible = false;
+        projectTimeline->videoTracks().first()->setClips({clip});
+        good = toolResult(call(QStringLiteral("set_clip_enabled"),
+            {{"clipIndex", 0}, {"enabled", true}})).value("isError").toBool() && good;
+        good ? pass("G171 set_clip_enabled")
+             : fail("G171 set_clip_enabled", QStringLiteral("enable/undo/schema/validation mismatch"));
+        projectTimeline->restoreState(saved);
+    } else {
+        fail("G171 set_clip_enabled", QStringLiteral("Timeline was not available"));
     }
     server.stop();
     qInfo().noquote().nospace() << "[mcp] selftest end, passed=" << passed

@@ -2405,6 +2405,10 @@ void TimelineTrack::paintEvent(QPaintEvent *event)
         painter.fillRect(clipRect, color);
         if (m_timeline && m_timeline->filmstripEnabled())
             paintFilmstrip(painter, i, clipRect, visibleRect);
+        if (!m_clips[i].visible && !clipgeom::isNullObjectFilePath(m_clips[i].filePath)) {
+            painter.fillRect(clipRect, QColor(220, 220, 220, 140));
+            painter.fillRect(clipRect, QBrush(QColor(70, 70, 70, 140), Qt::BDiagPattern));
+        }
         if (m_clips[i].label != ClipLabel::None) {
             labelBars.append(qMakePair(
                 QRect(x, clipRect.bottom() - 2, clipWidth, 3),
@@ -6593,6 +6597,27 @@ bool Timeline::relinkMediaPaths(const QHash<QString, QString> &oldToNew,
     return true;
 }
 
+bool Timeline::setClipEnabled(TrackKind kind, int trackIndex, int clipIndex, bool enabled)
+{
+    TimelineTrack *track = trackAt(kind == TrackKind::Audio, trackIndex);
+    if (!track || track->isLocked() || clipIndex < 0 || clipIndex >= track->clipCount())
+        return false;
+    QVector<ClipInfo> clips = track->clips();
+    if (clipgeom::isNullObjectFilePath(clips[clipIndex].filePath))
+        return false;
+    if (clips[clipIndex].visible == enabled)
+        return true;
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    clips[clipIndex].visible = enabled;
+    track->setClips(clips);
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+    saveUndoState(QStringLiteral("クリップの有効切替"));
+    updateInfoLabel();
+    scheduleEmitSequenceChanged();
+    return true;
+}
+
 bool Timeline::setClipLabel(TrackKind kind, int trackIndex, int clipIndex,
                             ClipLabel label)
 {
@@ -8208,6 +8233,10 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
         QAction *aMonoAct = addAudioChannelModeAction(aChannelMenu, aClip.audioChannelMode,
                                                       AudioChannelMode::Mono);
         aMenu.addSeparator();
+        QAction *aEnabledAction = aMenu.addAction(QStringLiteral("クリップを有効にする"));
+        aEnabledAction->setCheckable(true);
+        aEnabledAction->setChecked(track->clips()[clipIndex].visible);
+        aEnabledAction->setEnabled(!track->isLocked() && !clipgeom::isNullObjectFilePath(track->clips()[clipIndex].filePath));
         QMenu *aLabelMenu = aMenu.addMenu(QStringLiteral("ラベルカラー"));
         const QList<QPair<QAction *, ClipLabel>> aLabelActions{
             {addClipLabelAction(aLabelMenu, aClip.label, ClipLabel::None), ClipLabel::None},
@@ -8233,6 +8262,11 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
         }
         QAction *aChosen = aMenu.exec(globalPos);
         if (!aChosen) return;
+        if (aChosen == aEnabledAction) {
+            setClipEnabled(TrackKind::Audio, m_audioTracks.indexOf(track), clipIndex, aEnabledAction->isChecked());
+            return;
+        }
+
         auto applyAudioAction = [&](AudioFadeEdge edge, bool crossfade) {
             bool accepted = false;
             const double defaultDuration = crossfade ? 1.0 : 0.5;
@@ -8525,6 +8559,10 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     QAction *monoAct = addAudioChannelModeAction(channelMenu, currentChannelMode,
                                                  AudioChannelMode::Mono);
     menu.addSeparator();
+    QAction *enabledAction = menu.addAction(QStringLiteral("クリップを有効にする"));
+    enabledAction->setCheckable(true);
+    enabledAction->setChecked(track->clips()[clipIndex].visible);
+    enabledAction->setEnabled(!track->isLocked() && !clipgeom::isNullObjectFilePath(track->clips()[clipIndex].filePath));
     QMenu *labelMenu = menu.addMenu(QStringLiteral("ラベルカラー"));
     const QList<QPair<QAction *, ClipLabel>> labelActions{
         {addClipLabelAction(labelMenu, clipInfo.label, ClipLabel::None), ClipLabel::None},
@@ -8675,6 +8713,11 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     };
 
     QAction *chosen = menu.exec(globalPos);
+    if (chosen == enabledAction) {
+        setClipEnabled(TrackKind::Video, m_videoTracks.indexOf(track), clipIndex, enabledAction->isChecked());
+        return;
+    }
+
     if (!chosen) return;
     for (const auto &labelAction : labelActions) {
         if (chosen == labelAction.first) {
@@ -11593,6 +11636,7 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
                 });
             for (const OverlapInterval &iv : intervals) {
                 const ClipInfo child = intervalClip(track[iv.clipIdx], iv);
+                if (!child.visible && !clipgeom::isNullObjectFilePath(child.filePath)) continue;
                 const double childAccum = iv.timelineStart;
 
                 const double overlapStart = qMax(sourceIn, childAccum);
@@ -11716,6 +11760,7 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
         for (const OverlapInterval &iv : intervals) {
             const int ci = iv.clipIdx;
             const ClipInfo c = intervalClip(clips[ci], iv);
+            if (!c.visible && !clipgeom::isNullObjectFilePath(c.filePath)) continue;
             const double accum = iv.timelineStart;
             QVector<QString> sequenceStack;
             if (!m_activeSequenceId.isEmpty())
