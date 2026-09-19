@@ -1,6 +1,8 @@
 #include "../BundleAdjustment.h"
 
+#include <QElapsedTimer>
 #include <algorithm>
+#include <cstring>
 #include <cmath>
 #include <iostream>
 #include <limits>
@@ -126,6 +128,141 @@ bool accuratePoses(const QVector<camsolve::Pose>& poses, const QVector<Camera>& 
     }
     return ok;
 }
+
+struct BundleScene {
+    sfm::MultiViewTracks tracks;
+    QVector<camsolve::Pose> truth, initial;
+    QVector<QVector3D> points;
+};
+
+BundleScene bundleScene(const camsolve::Intrinsics& k, bool noisy)
+{
+    BundleScene scene;
+    scene.tracks.frameCount = 20;
+    std::mt19937 rng(518);
+    const auto uniform = [&]() { return (double(rng())+0.5)/4294967296.0; };
+    for (int frame = 0; frame < 20; ++frame) {
+        const double angle = 0.025*frame;
+        const double c = std::cos(angle), s = std::sin(angle);
+        camsolve::Pose pose;
+        const double r[9] = {c,0,s, 0,1,0, -s,0,c};
+        std::copy(r,r+9,pose.R);
+        const double center[3] = {6*s,0.2*std::sin(2*angle),6*(1-c)};
+        for (int i = 0; i < 3; ++i) {
+            double t = 0;
+            for (int j = 0; j < 3; ++j) t -= r[3*i+j]*center[j];
+            pose.t[i] = float(t);
+        }
+        pose.valid = true;
+        pose.residual = 0;
+        scene.truth.append(pose);
+        if (frame) {
+            // Exactly five degrees about a varying axis, plus 10% translation noise.
+            double axis[3] = {uniform()-0.5,uniform()-0.5,uniform()-0.5};
+            const double length = std::sqrt(axis[0]*axis[0]+axis[1]*axis[1]+axis[2]*axis[2]);
+            for (double& value : axis) value /= length;
+            const double a = 5*pi/180, ca = std::cos(a), sa = std::sin(a);
+            const double skew[9] = {0,-axis[2],axis[1], axis[2],0,-axis[0], -axis[1],axis[0],0};
+            for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j) {
+                pose.R[3*i+j] = 0;
+                for (int q = 0; q < 3; ++q)
+                    pose.R[3*i+j] += ((i == q ? ca : 0)+(1-ca)*axis[i]*axis[q]+sa*skew[3*i+q])*r[3*q+j];
+            }
+            const double magnitude = pose.t.length()*0.1;
+            for (int j = 0; j < 3; ++j) pose.t[j] += float(magnitude*axis[j]);
+        }
+        scene.initial.append(pose);
+    }
+    for (int point = 0; point < 100; ++point) {
+        const QVector3D truth(float(3*uniform()-1.5),float(2*uniform()-1),float(5+3*uniform()));
+        sfm::Track2D track;
+        track.pointId = 1000+point*3;
+        for (int frame = 0; frame < 20; ++frame) {
+            const auto& pose = scene.truth[frame];
+            double p[3] = {};
+            for (int i = 0; i < 3; ++i) {
+                p[i] = pose.t[i];
+                for (int j = 0; j < 3; ++j) p[i] += pose.R[3*i+j]*truth[j];
+            }
+            // Uniform noise with standard deviation 0.5 px per coordinate.
+            const double nx = noisy ? (uniform()-0.5)*std::sqrt(3.0) : 0;
+            const double ny = noisy ? (uniform()-0.5)*std::sqrt(3.0) : 0;
+            track.observations.append(qMakePair(frame,QPointF(k.f*p[0]/p[2]+k.cx+nx,k.f*p[1]/p[2]+k.cy+ny)));
+        }
+        scene.tracks.tracks.append(track);
+        scene.points.append(truth*float(1+0.1*(2*uniform()-1)));
+    }
+    return scene;
+}
+
+double measuredBundleRms(const sfm::BundleResult& result, const sfm::MultiViewTracks& tracks,
+                         const camsolve::Intrinsics& k)
+{
+    if (!result.valid || result.points.size() != tracks.tracks.size()
+        || result.poses.size() != tracks.frameCount) return std::numeric_limits<double>::infinity();
+    double squared = 0;
+    int count = 0;
+    for (int point = 0; point < tracks.tracks.size(); ++point)
+        for (const auto& observation : tracks.tracks[point].observations) {
+            const auto& pose = result.poses[observation.first];
+            double p[3] = {};
+            for (int i = 0; i < 3; ++i) {
+                p[i] = pose.t[i];
+                for (int j = 0; j < 3; ++j) p[i] += pose.R[3*i+j]*result.points[point][j];
+            }
+            if (!(p[2] > 0)) return std::numeric_limits<double>::infinity();
+            const double dx = k.f*p[0]/p[2]+k.cx-observation.second.x();
+            const double dy = k.f*p[1]/p[2]+k.cy-observation.second.y();
+            squared += dx*dx+dy*dy;
+            ++count;
+        }
+    return count ? std::sqrt(squared/count) : std::numeric_limits<double>::infinity();
+}
+
+bool bundleAccuracy(const sfm::BundleResult& result, const BundleScene& scene)
+{
+    if (!result.valid || result.poses.size() != scene.truth.size()) return false;
+    double maxRotation = 0, maxDirection = 0;
+    for (int frame = 1; frame < result.poses.size(); ++frame) {
+        double trace = 0;
+        for (int i = 0; i < 9; ++i) trace += result.poses[frame].R[i]*scene.truth[frame].R[i];
+        maxRotation = std::max(maxRotation,std::acos(std::clamp((trace-1)/2,-1.0,1.0))*180/pi);
+        double dot = 0, aa = 0, bb = 0;
+        for (int j = 0; j < 3; ++j) {
+            const double a = result.poses[frame].t[j], b = scene.truth[frame].t[j];
+            dot += a*b; aa += a*a; bb += b*b;
+        }
+        if (!(aa > 0 && bb > 0)) return false;
+        maxDirection = std::max(maxDirection,std::acos(std::clamp(dot/std::sqrt(aa*bb),-1.0,1.0))*180/pi);
+    }
+    std::cerr << "bundle rotation=" << maxRotation << " deg, direction=" << maxDirection
+              << " deg, RMS=" << result.rms << " px\n";
+    return maxRotation < 0.2 && maxDirection < 1 && result.rms < 0.05;
+}
+
+bool samePoseBits(const camsolve::Pose& a, const camsolve::Pose& b)
+{
+    if (std::memcmp(a.R,b.R,sizeof(a.R)) || a.valid != b.valid
+        || std::memcmp(&a.residual,&b.residual,sizeof(double))) return false;
+    for (int j = 0; j < 3; ++j) {
+        const float at = a.t[j], bt = b.t[j], an = a.n[j], bn = b.n[j];
+        if (std::memcmp(&at,&bt,sizeof(float)) || std::memcmp(&an,&bn,sizeof(float))) return false;
+    }
+    return true;
+}
+
+bool sameBundleBits(const sfm::BundleResult& a, const sfm::BundleResult& b)
+{
+    if (!a.valid || !b.valid || a.reason != b.reason || a.poses.size() != b.poses.size()
+        || a.points.size() != b.points.size() || a.rmsHistory.size() != b.rmsHistory.size()
+        || std::memcmp(&a.rms,&b.rms,sizeof(double))) return false;
+    for (int i = 0; i < a.poses.size(); ++i) if (!samePoseBits(a.poses[i],b.poses[i])) return false;
+    for (int i = 0; i < a.points.size(); ++i) for (int j = 0; j < 3; ++j) {
+        const float x = a.points[i][j], y = b.points[i][j];
+        if (std::memcmp(&x,&y,sizeof(float))) return false;
+    }
+    return !std::memcmp(a.rmsHistory.constData(),b.rmsHistory.constData(),a.rmsHistory.size()*sizeof(double));
+}
 } // namespace
 
 int runBundleAdjustSelftest()
@@ -221,6 +358,47 @@ int runBundleAdjustSelftest()
     const auto badK = sfm::chainTwoViewPoses(observations,{0,960,540});
     for (const auto& pose : badK) chainOk = chainOk && !pose.valid;
     gate(3,chainOk);
+    const auto cleanScene = bundleScene(k,false);
+    QElapsedTimer timer;
+    timer.start();
+    const auto adjusted = sfm::bundleAdjust(cleanScene.tracks,cleanScene.initial,cleanScene.points,k);
+    const qint64 elapsedMs = timer.elapsed();
+    const auto cameraPoses = sfm::toCameraPoses(adjusted);
+    bool converted = cameraPoses.size() == cleanScene.truth.size();
+    for (int i = 0; converted && i < cameraPoses.size(); ++i)
+        converted = samePoseBits(cameraPoses[i],adjusted.poses[i]);
+    const double measuredClean = measuredBundleRms(adjusted,cleanScene.tracks,k);
+    gate(4,bundleAccuracy(adjusted,cleanScene) && converted && measuredClean < 0.05
+         && std::abs(measuredClean-adjusted.rms) < 1e-9
+         && samePoseBits(adjusted.poses[0],cleanScene.initial[0]));
+
+    const auto noisyScene = bundleScene(k,true);
+    const auto noisy = sfm::bundleAdjust(noisyScene.tracks,noisyScene.initial,noisyScene.points,k);
+    bool monotone = noisy.valid && noisy.rmsHistory.size() > 1 && noisy.rms < 1;
+    for (int i = 1; i < noisy.rmsHistory.size(); ++i)
+        monotone = monotone && noisy.rmsHistory[i] <= noisy.rmsHistory[i-1];
+    const auto initial = sfm::bundleAdjust(noisyScene.tracks,noisyScene.initial,noisyScene.points,k,0);
+    monotone = monotone && initial.valid && noisy.rms < initial.rms
+        && std::abs(measuredBundleRms(noisy,noisyScene.tracks,k)-noisy.rms) < 1e-9;
+    std::cerr << "noisy RMS: " << initial.rms << " -> " << noisy.rms << '\n';
+    gate(5,monotone);
+
+    const auto repeated = sfm::bundleAdjust(cleanScene.tracks,cleanScene.initial,cleanScene.points,k);
+    auto oversized = cleanScene.tracks;
+    oversized.frameCount = 31;
+    const auto rejected = sfm::bundleAdjust(oversized,cleanScene.initial,cleanScene.points,k);
+    oversized = cleanScene.tracks;
+    oversized.tracks.resize(151);
+    const auto tooManyPoints = sfm::bundleAdjust(oversized,cleanScene.initial,cleanScene.points,k);
+    auto malformed = cleanScene.tracks;
+    malformed.tracks[0].observations[0].first = -1;
+    const auto badObservation = sfm::bundleAdjust(malformed,cleanScene.initial,cleanScene.points,k);
+    const auto badIntrinsics = sfm::bundleAdjust(cleanScene.tracks,cleanScene.initial,cleanScene.points,{0,0,0});
+    std::cerr << "bundle 20 x 100 (414 parameters): " << elapsedMs << " ms (Release budget: 3000 ms)\n";
+    gate(6,sameBundleBits(adjusted,repeated) && elapsedMs <= 3000
+         && !rejected.valid && !rejected.reason.isEmpty() && sfm::toCameraPoses(rejected).isEmpty()
+         && !tooManyPoints.valid && !tooManyPoints.reason.isEmpty()
+         && !badObservation.valid && !badIntrinsics.valid);
     std::cerr << "summary: " << passed << " PASS, " << failed << " FAIL\n";
     return failed;
 }

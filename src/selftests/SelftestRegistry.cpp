@@ -644,7 +644,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "object-removal",    "VEDITOR_OBJECT_REMOVAL_SELFTEST",     runObjectRemovalSelftest,      false,
       "ObjectRemoval: temporal trust, background alignment, bounds, dilation, cache, composite (14 gates)" },
     { "bundle-adjust", "VEDITOR_BUNDLE_ADJUST_SELFTEST", runBundleAdjustSelftest, false,
-      "可変サイズ線形ソルバ、多フレーム特徴点追跡、2 視点姿勢連結 (G1-G3)" },
+      "可変サイズ線形ソルバ、多フレーム追跡、姿勢連結、LMバンドル調整 (G1-G6)" },
     { "sfm-two-view", "VEDITOR_SFM_TWO_VIEW_SELFTEST", runSfmTwoViewSelftest, false,
       "Two-view essential pose, RANSAC, triangulation, degeneracy and determinism (6 gates)" },
     { "feature-tracker", "VEDITOR_FEATURE_TRACKER_SELFTEST", runFeatureTrackerSelftest, false,

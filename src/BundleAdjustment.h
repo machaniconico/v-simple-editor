@@ -4,7 +4,9 @@
 #include <QImage>
 #include <QPair>
 #include <QPointF>
+#include <QString>
 #include <QVector>
+#include <limits>
 
 namespace sfm {
 
@@ -32,5 +34,26 @@ MultiViewTracks trackAcrossFrames(const QVector<QImage>& frames, int maxPoints =
 // Failure, including insufficient shared scale points, invalidates the suffix.
 QVector<camsolve::Pose> chainTwoViewPoses(const MultiViewTracks& tracks,
                                          const camsolve::Intrinsics& intrinsics);
+
+struct BundleResult {
+    bool valid = false;
+    QString reason;
+    QVector<camsolve::Pose> poses;
+    QVector<QVector3D> points;
+    double rms = std::numeric_limits<double>::infinity();
+    // Initial RMS followed by accepted double-precision iterations, in pixels
+    // per observation. rms also includes final QVector3D float rounding.
+    QVector<double> rmsHistory;
+};
+
+// Points correspond to tracks in vector order, not pointId. Frame 0 is fixed;
+// absolute monocular scale is unobservable (no metric scale is recovered).
+// Rotations use local axis-angle increments. No dense observation Jacobian.
+BundleResult bundleAdjust(const MultiViewTracks& tracks,
+                          QVector<camsolve::Pose> initialPoses,
+                          QVector<QVector3D> initialPoints,
+                          const camsolve::Intrinsics& intrinsics, int maxIters = 20);
+// World-to-camera poses suitable for camsolve::applyPosesToCamera.
+QVector<camsolve::Pose> toCameraPoses(const BundleResult& result);
 
 } // namespace sfm
