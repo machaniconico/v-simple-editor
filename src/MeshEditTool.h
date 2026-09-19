@@ -3,6 +3,7 @@
 #include "SurfaceTool.h"
 #include "WarpDistortion.h"
 #include <QPointer>
+#include <QString>
 
 class Timeline;
 
@@ -30,6 +31,8 @@ private:
     QPointer<Timeline> m_timeline;
     int m_trackIndex;
     int m_clipIndex;
+    QString m_targetFilePath;
+    double m_targetInPoint = 0.0;
     QRectF m_viewRect;
     MeshGrid m_before;
     MeshGrid m_dragGrid;

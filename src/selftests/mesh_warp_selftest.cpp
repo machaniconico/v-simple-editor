@@ -236,6 +236,32 @@ int runMeshWarpSelftest()
     meshTool.cancelDrag();
     dragOk &= sameGrid(duringDrag, timeline.videoTracks()[0]->clips()[0].meshWarp)
         && timeline.undoManager()->saveSerial() == dragSerial + 1;
+    // Replacing the target mid-drag must never write into the replacement,
+    // including cancellation when its mesh equals the last temporary preview.
+    const ClipInfo dragBaseline = timeline.videoTracks()[0]->clips()[0];
+    for (bool changePath : {true, false}) {
+        MeshEditTool replacementTool(&timeline, 0, 0);
+        replacementTool.setViewRect(QRectF(10, 20, 600, 300));
+        dragOk &= replacementTool.handleMousePress(handle + QPoint(40, 0), Qt::LeftButton, Qt::NoModifier)
+            && replacementTool.handleMouseMove(handle + QPoint(60, 0), Qt::NoModifier);
+        ClipInfo replacement = timeline.videoTracks()[0]->clips()[0];
+        if (changePath)
+            replacement.filePath += QStringLiteral(".replacement");
+        else
+            replacement.inPoint += 0.25;
+        timeline.restoreFromProject(QVector<QVector<ClipInfo>>{{replacement}},
+            QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 100);
+        const quint64 replacementSerial = timeline.undoManager()->saveSerial();
+        dragOk &= !replacementTool.isEnabled()
+            && !replacementTool.handleMouseMove(handle + QPoint(80, 0), Qt::NoModifier);
+        replacementTool.cancelDrag();
+        dragOk &= !replacementTool.handleMousePress(handle, Qt::LeftButton, Qt::NoModifier)
+            && !replacementTool.handleMouseRelease(handle, Qt::LeftButton, Qt::NoModifier)
+            && sameGrid(replacement.meshWarp, timeline.videoTracks()[0]->clips()[0].meshWarp)
+            && timeline.undoManager()->saveSerial() == replacementSerial;
+        timeline.restoreFromProject(QVector<QVector<ClipInfo>>{{dragBaseline}},
+            QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 100);
+    }
     gate(6, dragOk);
 
     SurfaceTool corners(nullptr);

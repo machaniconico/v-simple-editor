@@ -7,7 +7,14 @@ MeshEditTool::MeshEditTool(Timeline *timeline, int trackIndex, int clipIndex, QO
     : SurfaceTool(nullptr, parent), m_timeline(timeline),
       m_trackIndex(trackIndex), m_clipIndex(clipIndex)
 {
-    setEnabled(true);
+    auto *track = timeline ? timeline->videoTracks().value(trackIndex, nullptr) : nullptr;
+    const bool validTarget = track && clipIndex >= 0 && clipIndex < track->clips().size();
+    if (validTarget) {
+        const auto &clip = track->clips()[clipIndex];
+        m_targetFilePath = clip.filePath;
+        m_targetInPoint = clip.inPoint;
+    }
+    setEnabled(validTarget);
 }
 
 bool MeshEditTool::isEnabled() const
@@ -15,7 +22,9 @@ bool MeshEditTool::isEnabled() const
     if (!SurfaceTool::isEnabled() || !m_timeline) return false;
     auto *track = m_timeline->videoTracks().value(m_trackIndex, nullptr);
     return track && !track->isLocked() && m_clipIndex >= 0
-        && m_clipIndex < track->clips().size();
+        && m_clipIndex < track->clips().size()
+        && track->clips()[m_clipIndex].filePath == m_targetFilePath
+        && track->clips()[m_clipIndex].inPoint == m_targetInPoint;
 }
 
 MeshGrid MeshEditTool::currentGrid() const

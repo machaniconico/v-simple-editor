@@ -6404,20 +6404,10 @@ void MainWindow::setupMenuBar()
 
     auto *meshEditAction = compMenu->addAction(QStringLiteral("メッシュワープを編集"));
     meshEditAction->setCheckable(true);
-    const auto stopMeshEdit = [this, meshEditAction]() {
-        if (m_meshEditTool) {
-            m_meshEditTool->cancelDrag();
-            m_meshEditTool->setEnabled(false);
-            if (m_player && m_player->glPreview())
-                m_player->glPreview()->installSurfaceTool(nullptr);
-            m_meshEditTool->deleteLater();
-            m_meshEditTool = nullptr;
-        }
-        meshEditAction->setChecked(false);
-    };
+    m_meshEditAction = meshEditAction;
     connect(meshEditAction, &QAction::triggered, this,
-            [this, meshEditAction, stopMeshEdit](bool checked) {
-        if (!checked) { stopMeshEdit(); return; }
+            [this, meshEditAction](bool checked) {
+        if (!checked) { stopMeshEditTool(); return; }
         int trackIdx = -1, clipIdx = -1;
         if (!selectedVideoClipRef(trackIdx, clipIdx)
             || !m_timeline->videoTracks()[trackIdx]->isClipSelected(clipIdx)) {
@@ -6441,10 +6431,10 @@ void MainWindow::setupMenuBar()
         m_player->glPreview()->installSurfaceTool(tool);
     });
     connect(m_timeline, &Timeline::clipSelectedOnTrack, this,
-            [stopMeshEdit](int, int) { stopMeshEdit(); });
+            [this](int, int) { stopMeshEditTool(); });
 
     auto *meshResetAction = compMenu->addAction(QStringLiteral("メッシュワープをリセット…"));
-    connect(meshResetAction, &QAction::triggered, this, [this, stopMeshEdit]() {
+    connect(meshResetAction, &QAction::triggered, this, [this]() {
         int trackIdx = -1, clipIdx = -1;
         if (!selectedVideoClipRef(trackIdx, clipIdx)
             || !m_timeline->videoTracks()[trackIdx]->isClipSelected(clipIdx)) {
@@ -6452,7 +6442,7 @@ void MainWindow::setupMenuBar()
                                      QStringLiteral("映像クリップを選択してください。"));
             return;
         }
-        stopMeshEdit();
+        stopMeshEditTool();
         bool ok = false;
         const QString choice = QInputDialog::getItem(this, QStringLiteral("メッシュワープをリセット"),
             QStringLiteral("グリッド数（行・列）"),
@@ -8828,6 +8818,20 @@ void MainWindow::applyVfxProjectState(const ProjectVfxState &state)
                                   state.lightWrap.radius);
 }
 
+void MainWindow::stopMeshEditTool()
+{
+    if (m_meshEditTool) {
+        m_meshEditTool->cancelDrag();
+        m_meshEditTool->setEnabled(false);
+        if (m_player && m_player->glPreview())
+            m_player->glPreview()->installSurfaceTool(nullptr);
+        m_meshEditTool->deleteLater();
+        m_meshEditTool = nullptr;
+    }
+    if (m_meshEditAction)
+        m_meshEditAction->setChecked(false);
+}
+
 void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
                                         const QString &filePath)
 {
@@ -8844,6 +8848,7 @@ void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
 
     if (m_light3DDialog)
         m_light3DDialog->close();
+    stopMeshEditTool();
     m_projectFilePath = filePath;
     if (m_recentFilesManager && !filePath.isEmpty())
         m_recentFilesManager->addFile(filePath);
@@ -9266,6 +9271,7 @@ void MainWindow::newProject()
 {
     ProjectSettingsDialog dialog(this);
     if (dialog.exec() == QDialog::Accepted) {
+        stopMeshEditTool();
         applyAudioState(ProjectData{});
         if (m_light3DDialog)
             m_light3DDialog->close();

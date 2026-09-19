@@ -738,6 +738,7 @@ private:
     bool exportAudioOnly(const ExportConfig &config, QString *error);
     void updateTitle();
     void populateProjectData(ProjectData &data);
+    void stopMeshEditTool();
     void applyLoadedProjectData(const ProjectData &data, const QString &filePath);
     bool relinkMediaPaths(const QHash<QString, QString> &oldToNew,
                           QString *errorOut = nullptr);
@@ -852,6 +853,7 @@ private:
     QVector<Light3D> m_projectLights;                         // project-level 3D lights
     QPointer<Light3DDialog> m_light3DDialog;
     QPointer<MeshEditTool> m_meshEditTool;
+    QPointer<QAction> m_meshEditAction;
     int m_selectedVideoTrackIndex = -1;
     int m_selectedVideoClipIndexTracked = -1;
 
