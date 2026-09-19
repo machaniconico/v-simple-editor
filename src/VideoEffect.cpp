@@ -480,6 +480,8 @@ QString VideoEffect::typeName(VideoEffectType t)
     case VideoEffectType::WarpSpherize: return "ワープ: 球面化";
     case VideoEffectType::WarpFisheye: return "ワープ: 魚眼";
     case VideoEffectType::WarpPinch: return "ワープ: ピンチ";
+    case VideoEffectType::BroadcastSafe: return "放送セーフ";
+    case VideoEffectType::LeaveColor: return "色を残す";
     case VideoEffectType::LensDistortion: return "レンズ歪み補正";
     }
     return "Unknown";
@@ -514,7 +516,27 @@ QVector<VideoEffectType> VideoEffect::allTypes()
              VideoEffectType::LumaKey, VideoEffectType::ColorKey, VideoEffectType::LogToRec709,
              VideoEffectType::WarpWave, VideoEffectType::WarpRipple,
              VideoEffectType::WarpSpherize, VideoEffectType::WarpFisheye,
-             VideoEffectType::WarpPinch };
+             VideoEffectType::WarpPinch, VideoEffectType::BroadcastSafe,
+             VideoEffectType::LeaveColor };
+}
+
+VideoEffect VideoEffect::createBroadcastSafe(int standard, double maxChroma)
+{
+    VideoEffect effect;
+    effect.type = VideoEffectType::BroadcastSafe;
+    effect.param1 = standard;
+    effect.param2 = maxChroma;
+    return effect;
+}
+
+VideoEffect VideoEffect::createLeaveColor(QColor color, double tolerance, double desaturation)
+{
+    VideoEffect effect;
+    effect.type = VideoEffectType::LeaveColor;
+    effect.keyColor = color;
+    effect.param1 = tolerance;
+    effect.param2 = desaturation;
+    return effect;
 }
 
 VideoEffect VideoEffect::createLogToRec709(int input, double exposure, int output)
@@ -693,6 +715,15 @@ static QColor defaultColorForParam(const VideoEffect &effect, const QString &par
 
 double paramValue(const VideoEffect &effect, const QString &paramName)
 {
+    if (effect.type == VideoEffectType::BroadcastSafe || effect.type == VideoEffectType::LeaveColor) {
+        const auto schema = paramSchemaFor(effect.type);
+        for (int i = 0; i < schema.size(); ++i) {
+            if (schema[i].name != paramName) continue;
+            if (schema[i].type == ParamType::Color) return encodedColorValue(effect.keyColor);
+            return i == 0 ? effect.param1 : effect.param2;
+        }
+        return 0.0;
+    }
     if (effect.type >= VideoEffectType::WarpWave && effect.type <= VideoEffectType::WarpPinch) {
         const auto schema = paramSchemaFor(effect.type);
         for (int i = 0; i < schema.size(); ++i)
@@ -917,6 +948,23 @@ double paramValue(const VideoEffect &effect, const QString &paramName)
 
 void setParamValue(VideoEffect &effect, const QString &paramName, double value)
 {
+    if (effect.type == VideoEffectType::BroadcastSafe || effect.type == VideoEffectType::LeaveColor) {
+        const auto schema = paramSchemaFor(effect.type);
+        for (int i = 0; i < schema.size(); ++i) {
+            const auto &def = schema[i];
+            if (def.name != paramName) continue;
+            if (!std::isfinite(value)) value = def.defaultVal;
+            if (def.type == ParamType::Color) {
+                effect.keyColor = defaultColorForParam(effect, paramName, value);
+            } else {
+                double &target = i == 0 ? effect.param1 : effect.param2;
+                target = std::clamp(value, def.minVal, def.maxVal);
+                if (def.type == ParamType::Int) target = std::round(target);
+            }
+            return;
+        }
+        return;
+    }
     if (effect.type >= VideoEffectType::WarpWave && effect.type <= VideoEffectType::WarpPinch) {
         const auto schema = paramSchemaFor(effect.type);
         for (int i = 0; i < schema.size(); ++i) {
@@ -1257,7 +1305,8 @@ void setParamValue(VideoEffect &effect, const QString &paramName, double value)
 
 QColor colorParamValue(const VideoEffect &effect, const QString &paramName)
 {
-    if (paramName == "color" && effect.type == VideoEffectType::ColorKey)
+    if (paramName == "color" && (effect.type == VideoEffectType::ColorKey
+        || effect.type == VideoEffectType::LeaveColor))
         return effect.keyColor;
     if (paramName == "color" && effect.type == VideoEffectType::ChromaKey)
         return effect.keyColor;
@@ -1276,7 +1325,8 @@ QColor colorParamValue(const VideoEffect &effect, const QString &paramName)
 
 void setColorParam(VideoEffect &effect, const QString &paramName, QColor color)
 {
-    if (paramName == "color" && effect.type == VideoEffectType::ColorKey)
+    if (paramName == "color" && (effect.type == VideoEffectType::ColorKey
+        || effect.type == VideoEffectType::LeaveColor))
         effect.keyColor = color;
     if (paramName == "color" && effect.type == VideoEffectType::ChromaKey)
         effect.keyColor = color;
@@ -1711,11 +1761,78 @@ void VideoEffectProcessor::adjustExposure(QImage &img, double exposure)
 
 // ===== Video Effect Processing =====
 
+namespace {
+thread_local bool safeLeaveColorEnabled = true;
+thread_local int safeLeaveColorCalls = 0;
+
+double safeUnit(double value, double fallback)
+{
+    return std::isfinite(value) ? std::clamp(value, 0.0, 1.0) : fallback;
+}
+
+QImage applySafeLeaveColor(const QImage &input, const VideoEffect &effect)
+{
+    if (!safeLeaveColorEnabled || input.isNull()) return input;
+    if (safeLeaveColorCalls < 2147483647) ++safeLeaveColorCalls;
+    const bool broadcast = effect.type == VideoEffectType::BroadcastSafe;
+    if (broadcast && effect.param1 >= 0.5) return input; // Already 8-bit RGB.
+    const double amount = safeUnit(effect.param2, 1.0);
+    if (!broadcast && amount == 0.0) return input;
+    const double tolerance = safeUnit(effect.param1, 0.15) * 180.0;
+    const double targetHue = std::max(0.0, double(effect.keyColor.hsvHueF()) * 360.0);
+    QImage result = input.convertToFormat(QImage::Format_ARGB32);
+    for (int y = 0; y < result.height(); ++y) {
+        auto *row = reinterpret_cast<QRgb *>(result.scanLine(y));
+        for (int x = 0; x < result.width(); ++x) {
+            const QRgb pixel = row[x];
+            if (broadcast) {
+                // Full-scale BT.709 Y'CbCr code values: clamp, don't rescale
+                // the entire image into studio range (legal pixels stay intact).
+                const double luma = luma709(qRed(pixel), qGreen(pixel), qBlue(pixel));
+                const double cb = (qBlue(pixel) - luma) / 1.8556;
+                const double cr = (qRed(pixel) - luma) / 1.5748;
+                const double limit = 112.0 * amount;
+                const double Y = std::clamp(luma, 16.0, 235.0);
+                const double Cb = std::clamp(cb, -limit, limit);
+                const double Cr = std::clamp(cr, -limit, limit);
+                if (Y == luma && Cb == cb && Cr == cr) continue;
+                const double r = Y + 1.5748 * Cr;
+                const double b = Y + 1.8556 * Cb;
+                const double g = (Y - 0.2126 * r - 0.0722 * b) / 0.7152;
+                row[x] = qRgba(clamp255d(r), clamp255d(g), clamp255d(b), qAlpha(pixel));
+            } else {
+                const QColor color = QColor::fromRgba(pixel);
+                if (color.hsvSaturationF() == 0.0) continue;
+                const double distance = std::abs(double(color.hsvHueF()) * 360.0 - targetHue);
+                if (std::min(distance, 360.0 - distance) <= tolerance) continue;
+                const QColor muted = QColor::fromHsvF(color.hsvHueF(),
+                    color.hsvSaturationF() * (1.0 - amount), color.valueF());
+                row[x] = qRgba(muted.red(), muted.green(), muted.blue(), qAlpha(pixel));
+            }
+        }
+    }
+    return result;
+}
+} // namespace
+
+void VideoEffectProcessor::setSafeLeaveColorEnabledForTesting(bool enabled)
+{
+    safeLeaveColorEnabled = enabled;
+    safeLeaveColorCalls = 0;
+}
+
+int VideoEffectProcessor::safeLeaveColorInvocationCountForTesting()
+{
+    return safeLeaveColorCalls;
+}
+
 QImage VideoEffectProcessor::applyEffect(const QImage &input, const VideoEffect &effect)
 {
     if (!effect.enabled || effect.type == VideoEffectType::None) return input;
 
     switch (effect.type) {
+    case VideoEffectType::BroadcastSafe:
+    case VideoEffectType::LeaveColor: return applySafeLeaveColor(input, effect);
     case VideoEffectType::WarpWave: return applyWarpWave(input, effect);
     case VideoEffectType::WarpRipple: return applyWarpRipple(input, effect);
     case VideoEffectType::WarpSpherize: return applyWarpSpherize(input, effect);

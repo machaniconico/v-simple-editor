@@ -97,6 +97,8 @@ QString effectTypeKey(VideoEffectType type)
     case VideoEffectType::WarpSpherize: return QStringLiteral("WarpSpherize");
     case VideoEffectType::WarpFisheye: return QStringLiteral("WarpFisheye");
     case VideoEffectType::WarpPinch: return QStringLiteral("WarpPinch");
+    case VideoEffectType::BroadcastSafe: return QStringLiteral("BroadcastSafe");
+    case VideoEffectType::LeaveColor: return QStringLiteral("LeaveColor");
     case VideoEffectType::LensDistortion: return QStringLiteral("LensDistortion");
     }
     return QStringLiteral("None");

@@ -20,6 +20,17 @@ QVector<ParamDef> paramSchemaFor(VideoEffectType type)
     case VideoEffectType::Mosaic:
         return { { "blockSize", "Block Size", ParamType::Float, 2.0, 100.0, 10.0 } };
 
+    case VideoEffectType::BroadcastSafe:
+        return {
+            { "standard", "規格 (0=Rec.709 リーガル / 1=RGB 全域)", ParamType::Int, 0.0, 1.0, 0.0 },
+            { "maxChroma", "上限クロマ", ParamType::Float, 0.0, 1.0, 1.0 }
+        };
+    case VideoEffectType::LeaveColor:
+        return {
+            { "tolerance", "許容度", ParamType::Float, 0.0, 1.0, 0.15 },
+            { "desaturation", "彩度の減衰", ParamType::Float, 0.0, 1.0, 1.0 },
+            { "color", "残す色", ParamType::Color, 0.0, 0.0, encodedColorDefault(QColor(255, 0, 0)) }
+        };
     case VideoEffectType::LumaKey:
         return {
             { "lower", "下限しきい値", ParamType::Float, 0.0, 1.0, 0.0 },

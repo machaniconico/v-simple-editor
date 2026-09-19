@@ -181,7 +181,9 @@ enum class VideoEffectType {
     WarpRipple,
     WarpSpherize,
     WarpFisheye,
-    WarpPinch
+    WarpPinch,
+    BroadcastSafe,
+    LeaveColor
 };
 
 struct VideoEffect {
@@ -256,6 +258,11 @@ struct VideoEffect {
     static QString typeName(VideoEffectType t);
     static QVector<VideoEffectType> allTypes();
 
+    // BroadcastSafe: p1=standard (0=legal, 1=full RGB), p2=max chroma.
+    // LeaveColor: p1=hue tolerance (0..180 degrees), p2=desaturation.
+    static VideoEffect createBroadcastSafe(int standard = 0, double maxChroma = 1.0);
+    static VideoEffect createLeaveColor(QColor color = QColor(255, 0, 0),
+                                       double tolerance = 0.15, double desaturation = 1.0);
     static VideoEffect createBlur(double radius = 5.0);
     static VideoEffect createSharpen(double amount = 1.5);
     static VideoEffect createMosaic(double blockSize = 10.0);
@@ -340,6 +347,9 @@ public:
     // Calling-thread switch; also resets the Flip observation counter.
     static void setFlipEnabledForTesting(bool enabled);
     static int flipInvocationCountForTesting();
+    // Calling-thread switch; resets the counter for both new color effects.
+    static void setSafeLeaveColorEnabledForTesting(bool enabled);
+    static int safeLeaveColorInvocationCountForTesting();
     // Calling-thread switch; resets the observation counter for both keyers.
     static void setKeyersEnabledForTesting(bool enabled);
     static int keyersInvocationCountForTesting();

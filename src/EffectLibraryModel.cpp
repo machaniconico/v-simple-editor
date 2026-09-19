@@ -85,6 +85,8 @@ QString videoCategory(VideoEffectType type)
     case VideoEffectType::DirectionalBlur:
     case VideoEffectType::RadialBlur:
         return QStringLiteral("ブラー");
+    case VideoEffectType::BroadcastSafe:
+    case VideoEffectType::LeaveColor:
     case VideoEffectType::LumaKey:
     case VideoEffectType::ColorKey:
     case VideoEffectType::ChromaKey:

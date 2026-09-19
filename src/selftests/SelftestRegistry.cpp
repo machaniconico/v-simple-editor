@@ -182,6 +182,7 @@ int runSfmTwoViewSelftest();
 int runShortcutSelftest();
 int runSilenceCutSelftest();
 int runBeatDetectSelftest();
+int runSafeLeaveColorSelftest();
 int runSafeZoneSelftest();
 int runShapeClipSelftest();
 int runStillCompareSelftest();
@@ -673,6 +674,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "SilenceCut RMS silence detection: keep/silence segmentation + consistency (9 gates)" },
     { "beat-detect",      "VEDITOR_BEAT_DETECT_SELFTEST",         runBeatDetectSelftest,         false,
       "BeatDetect energy-flux onset detection + median-interval BPM estimate (7 gates)" },
+    { "safe-leavecolor", "VEDITOR_SAFE_LEAVECOLOR_SELFTEST", runSafeLeaveColorSelftest, false,
+      "放送セーフと色を残す (6 gates)" },
     { "safe-zone",        "VEDITOR_SAFE_ZONE_SELFTEST",           runSafeZoneSelftest,           false,
       "SafeZone: SNS platform UI guide rects + apply display-local overlay (9 gates)" },
     { "still-compare",    "VEDITOR_STILL_COMPARE_SELFTEST",       runStillCompareSelftest,       false,
