@@ -4200,6 +4200,132 @@ void Timeline::addAudioTrack()
     updateInfoLabel();
 }
 
+bool Timeline::removeTrack(bool audio, int index, QString *err)
+{
+    if (err) err->clear();
+    const auto &tracks = audio ? m_audioTracks : m_videoTracks;
+    if (index < 0 || index >= tracks.size()) {
+        if (err) *err = QStringLiteral("トラック番号が範囲外です");
+        return false;
+    }
+    if (tracks.size() <= 1 || tracks[index]->isLocked()) {
+        if (err) *err = QStringLiteral("最後のトラックまたはロック中のトラックは削除できません");
+        return false;
+    }
+    QVector<int> oldToNew(tracks.size());
+    for (int i = 0; i < oldToNew.size(); ++i)
+        oldToNew[i] = i == index ? -1 : (i > index ? i - 1 : i);
+    remapTrackIndices(audio, oldToNew);
+    emit trackIndicesRemapped(audio, oldToNew);
+    saveUndoState(QStringLiteral("トラックを削除"));
+    return true;
+}
+
+bool Timeline::moveTrack(bool audio, int from, int to, QString *err)
+{
+    if (err) err->clear();
+    const auto &tracks = audio ? m_audioTracks : m_videoTracks;
+    if (from < 0 || from >= tracks.size() || to < 0 || to >= tracks.size()) {
+        if (err) *err = QStringLiteral("トラック番号が範囲外です");
+        return false;
+    }
+    if (from == to) return true;
+    QVector<int> oldToNew(tracks.size());
+    for (int i = 0; i < oldToNew.size(); ++i) {
+        oldToNew[i] = i;
+        if (i == from) oldToNew[i] = to;
+        else if (from < to && i > from && i <= to) oldToNew[i] = i - 1;
+        else if (from > to && i >= to && i < from) oldToNew[i] = i + 1;
+    }
+    remapTrackIndices(audio, oldToNew);
+    emit trackIndicesRemapped(audio, oldToNew);
+    saveUndoState(QStringLiteral("トラックを移動"));
+    return true;
+}
+
+void Timeline::remapTrackIndices(bool audio, const QVector<int> &oldToNew)
+{
+    // Track identity is the widget during this operation. Clip order within
+    // each widget is unchanged; clip-order survivor remapping must not run.
+    auto &tracks = audio ? m_audioTracks : m_videoTracks;
+    const auto before = tracks;
+    int count = 0;
+    for (int index : oldToNew) if (index >= 0) ++count;
+    tracks = QVector<TimelineTrack *>(count, nullptr);
+    m_linkedDragPartners.clear();
+    auto detach = [](QVBoxLayout *layout, QWidget *widget) {
+        const int index = layout->indexOf(widget);
+        if (index >= 0) delete layout->takeAt(index);
+    };
+    for (int i = 0; i < before.size(); ++i) {
+        auto *track = before[i];
+        auto *header = m_trackHeaders.value(track, nullptr);
+        detach(m_tracksLayout, track);
+        if (header) detach(m_headerLayout, header);
+        if (oldToNew[i] < 0) {
+            m_trackHeaders.remove(track);
+            if (header) { header->hide(); header->deleteLater(); }
+            track->hide();
+            track->disconnect();
+            track->deleteLater();
+        } else {
+            tracks[oldToNew[i]] = track;
+        }
+    }
+    m_videoTrack = m_videoTracks.first();
+    m_audioTrack = m_audioTracks.first();
+    for (int i = 0; i < tracks.size(); ++i) {
+        auto *track = tracks[i];
+        auto *header = m_trackHeaders.value(track, nullptr);
+        const int row = audio ? int(m_videoTracks.size()) + 2 + i : 1 + i;
+        m_tracksLayout->insertWidget(row, track);
+        if (header) {
+            m_headerLayout->insertWidget(row + 1, header);
+            if (auto *label = header->findChild<QLabel *>(QStringLiteral("timelineTrackName")))
+                label->setProperty("defaultName", QStringLiteral("%1%2")
+                    .arg(audio ? QStringLiteral("A") : QStringLiteral("V")).arg(i + 1));
+            syncTrackHeaderFlags(track);
+        }
+    }
+    int &active = audio ? m_activeAudioTrackIndex : m_activeVideoTrackIndex;
+    active = oldToNew.value(active, -1);
+    // Selection is owned by surviving widgets and follows their new row.
+    if (!audio) {
+        auto remapKey = [&oldToNew](const QString &key) -> QString {
+            const int colon = key.indexOf(QLatin1Char(':'));
+            bool ok = false;
+            const int oldTrack = key.left(colon).toInt(&ok);
+            if (colon < 0 || !ok) return key;
+            const int newTrack = oldToNew.value(oldTrack, -1);
+            return newTrack < 0 ? QString() : QString::number(newTrack) + key.mid(colon);
+        };
+        QHash<QString, TimelineTrackMatteEntry> mattes;
+        for (auto it = m_trackMatteEntries.cbegin(); it != m_trackMatteEntries.cend(); ++it) {
+            const QString key = remapKey(it.key());
+            auto entry = it.value();
+            const QString source = remapKey(entry.matteSourceClipId);
+            if (key.isEmpty() || (!entry.matteSourceClipId.isEmpty() && source.isEmpty())) continue;
+            entry.matteSourceClipId = source;
+            mattes.insert(key, entry);
+        }
+        m_trackMatteEntries = mattes;
+        QHash<QString, QString> parents;
+        for (auto it = m_clipParentEntries.cbegin(); it != m_clipParentEntries.cend(); ++it) {
+            const QString child = remapKey(it.key()), parent = remapKey(it.value());
+            if (!child.isEmpty() && !parent.isEmpty()) parents.insert(child, parent);
+        }
+        m_clipParentEntries = parents;
+    }
+    // Only the active sequence is updated; inactive sequence arrays are untouched.
+    syncActiveSequenceFromCurrentTracks();
+    const auto *selected = m_videoTracks.value(m_activeVideoTrackIndex, nullptr);
+    emit clipSelected(selected ? selected->selectedClip() : -1);
+    emit clipSelectedOnTrack(m_activeVideoTrackIndex, selected ? selected->selectedClip() : -1);
+    updateInfoLabel();
+    refreshTextStrip();
+    scheduleEmitSequenceChanged();
+}
+
 void Timeline::repaintAudioTracks()
 {
     for (auto *t : m_audioTracks)
@@ -11999,8 +12125,11 @@ TimelineState Timeline::currentState() const
         }
     }
 
+    state.activeVideoTrackIndex = m_activeVideoTrackIndex;
+    state.activeAudioTrackIndex = m_activeAudioTrackIndex;
     state.playheadPos = m_playheadPos;
     state.clipParentEntries = clipParentEntries();
+    state.trackMatteEntries = m_trackMatteEntries;
 
     if (m_audioMixer) {
         const int n = audioTrackCount();
@@ -12049,6 +12178,7 @@ void Timeline::restoreState(const TimelineState &state)
         m_audioTracks[i]->update();
     }
     m_generatedCaptionOverlays = state.generatedCaptionOverlays;
+    m_trackMatteEntries = state.trackMatteEntries;
     setClipParentEntries(state.clipParentEntries);
     rebuildTimelineBreadcrumbBar(this);
 
@@ -12108,6 +12238,12 @@ void Timeline::restoreState(const TimelineState &state)
         m_audioTrack->setSelectedClip(state.selectedClip);
         m_audioTrack->blockSignals(aWas);
     }
+
+    // Preserve the active row independently of the first selected row.
+    if (state.activeVideoTrackIndex >= 0 && state.activeVideoTrackIndex < m_videoTracks.size())
+        m_activeVideoTrackIndex = state.activeVideoTrackIndex;
+    m_activeAudioTrackIndex = state.activeAudioTrackIndex >= 0
+        && state.activeAudioTrackIndex < m_audioTracks.size() ? state.activeAudioTrackIndex : -1;
 
     m_playheadPos = state.playheadPos;
     syncPlayheadOverlay();

@@ -939,6 +939,8 @@ public:
                                     int *trackIndex = nullptr,
                                     int *clipIndex = nullptr);
     void addAudioTrack();
+    bool removeTrack(bool audio, int index, QString *err = nullptr);
+    bool moveTrack(bool audio, int from, int to, QString *err = nullptr);
     // Force every audio row to repaint. Used after global UI state changes
     // (e.g. the volume-envelope edit-mode toggle) so the overlay flips
     // visibility on every track at once.
@@ -1243,6 +1245,7 @@ public:
         return m_trackMatteEntries;
     }
 signals:
+    void trackIndicesRemapped(bool audio, QVector<int> oldToNew);
     void renderInPlaceRequested(int trackIndex, int clipIndex);
     void clipSelected(int index);
     // V3 sprint — track-aware overload. emitted alongside the int-only
@@ -1317,6 +1320,7 @@ private:
     };
 
     void setupUI();
+    void remapTrackIndices(bool audio, const QVector<int> &oldToNew);
 public:
     void restoreState(const TimelineState &state);
     TimelineState currentState() const;

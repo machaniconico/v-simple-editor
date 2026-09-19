@@ -33,11 +33,14 @@ struct TimelineState {
     int selectedVideoClipIndex = -1;
     int selectedAudioTrackIndex = -1;
     int selectedAudioClipIndex = -1;
+    int activeVideoTrackIndex = -1;
+    int activeAudioTrackIndex = -1;
     double playheadPos = 0.0;
     QVector<QString> videoTrackNames, audioTrackNames;
     QVector<QColor> videoTrackColors, audioTrackColors;
     QVector<double> audioTrackGains;
     QHash<QString, QString> clipParentEntries;
+    QHash<QString, TimelineTrackMatteEntry> trackMatteEntries;
     // スナップショット時のプロジェクト出力ジオメトリ。SNS プリセット(プロジェクトを
     // 9:16 にリサイズする)適用後の Ctrl+Z が、クリップの fit だけでなく**元の
     // プロジェクトサイズも**復元できるよう捕捉する。これが無いと undo は fit を戻すが

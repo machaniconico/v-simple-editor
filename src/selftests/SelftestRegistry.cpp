@@ -214,6 +214,7 @@ int runTrackMatteParitySelftest();
 int runTrackMatteReindexSelftest();
 int runTrackMatteRm5ReorderSelftest();
 int runTrackMatteRm6DuplicateSelftest();
+int runTrackOpsSelftest();
 int runTranscriptHighlighterOfflineSelftest();
 int runTranscriptHighlighterSelftest();
 int runMcpSelftest();
@@ -800,6 +801,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "MainWindow precompose UI-flow backend: sequence ref replacement plus single/double undo store cleanup (4 gates)" },
     { "mainwindow-lifecycle", "VEDITOR_MAINWINDOW_LIFECYCLE_SELFTEST", runMainWindowLifecycleSelftest, true,
       "MainWindow lifecycle: construct/destroy once, repeat three times, and clear dependent dock objects (3 gates)" },
+    { "track-ops", "VEDITOR_TRACK_OPS_SELFTEST", runTrackOpsSelftest, true,
+      "Track removal/reorder: content undo, matte/parent remap, selection and index notifications (4 gates)" },
     { "track-manage", "VEDITOR_TRACK_MANAGE_SELFTEST", runTrackManageSelftest, true,
       "Track names/colors: project roundtrip, single-step undo and invalid targets (3 gates)" },
     { "timeline-ergo", "VEDITOR_TIMELINE_ERGO_SELFTEST", runTimelineErgoSelftest, true,
