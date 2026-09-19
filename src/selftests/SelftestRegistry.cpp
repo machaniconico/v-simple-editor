@@ -184,6 +184,7 @@ int runRightclickPausePrefSelftest();
 int runReverseClipSelftest();
 int runRippleDeleteSelftest();
 int runRgbParadeSelftest();
+int runSeqFromClipSelftest();
 int runSequenceDockSelftest();
 int runSfmTwoViewSelftest();
 int runShortcutSelftest();
@@ -805,6 +806,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "ColorCorrection grade.* keyframes: render evaluation, byte identity, undo, and roundtrip" },
     { "graph-editor", "VEDITOR_GRAPH_EDITOR_SELFTEST", runGraphEditorSelftest, true,
       "GraphEditor edit/undo, per-track Loop Out UI, ProjectFile persistence, and ClipAnim evaluation parity" },
+    { "seq-from-clip", "VEDITOR_SEQ_FROM_CLIP_SELFTEST", runSeqFromClipSelftest, true,
+      "Sequence from clip: placement, AV links, project notification and atomic undo (4 gates)" },
     { "sequence-dock", "VEDITOR_SEQUENCE_DOCK_SELFTEST", runSequenceDockSelftest, true,
       "Sequence dock: list, rename/create undo, active tracks and project persistence (4 gates)" },
     { "nest-sequence", "VEDITOR_NEST_SEQUENCE_SELFTEST", runNestSequenceSelftest, true,

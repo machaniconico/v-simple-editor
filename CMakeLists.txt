@@ -120,6 +120,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/loudness_persist_selftest.cpp
     src/selftests/FrameExportSelftest.cpp
     src/selftests/FrameClipboardSelftest.cpp
+    src/selftests/seq_from_clip_selftest.cpp
     src/selftests/sequence_dock_selftest.cpp
     src/selftests/NestSequenceSelftest.cpp
     src/selftests/PrecomposeE2ESelftest.cpp

@@ -3848,6 +3848,8 @@ void MainWindow::setupUI()
         menu.exec(gp);
     });
     m_timeline = new Timeline(this);
+    m_timeline->setProjectOutputConfig(m_projectConfig.width, m_projectConfig.height,
+                                      m_projectConfig.explicitOutputResolution, m_projectConfig.fps);
     qApp->installEventFilter(this);
     syncProjectLightingToTimeline();
     // US-INT-1: hand the Timeline to GLPreview so paintGL can compose any
@@ -6336,6 +6338,14 @@ void MainWindow::setupMenuBar()
             this, &MainWindow::onMediaPoolAssetActivated);
     connect(m_mediaPoolDock, &MediaPoolDock::importRequested,
             this, &MainWindow::importToMediaPool);
+    auto *sequenceFromMedia = new QAction(QStringLiteral("このクリップから新規シーケンス"), m_mediaPoolDock);
+    sequenceFromMedia->setObjectName(QStringLiteral("sequenceFromMedia"));
+    m_mediaPoolDock->addAction(sequenceFromMedia);
+    connect(sequenceFromMedia, &QAction::triggered, this, [this, sequenceFromMedia] {
+        const QStringList source = sequenceFromMedia->data().toStringList();
+        if (source.size() == 2)
+            m_timeline->createSequenceFromMedia(source[0], source[1]);
+    });
     m_mediaPoolDock->refresh();
 
     // MK-2: マーカー パネル ドック (右側)。Timeline のマーカーを表で常時表示する。
@@ -8175,7 +8185,7 @@ void MainWindow::applyProjectConfig(const ProjectConfig &config)
     // undo スナップショットがプロジェクトサイズを捕捉できるよう Timeline の複製を同期。
     if (m_timeline)
         m_timeline->setProjectOutputConfig(config.width, config.height,
-                                           config.explicitOutputResolution);
+                                           config.explicitOutputResolution, config.fps);
     applyTimecodeBurnInSettings(m_tcBurnIn);
     updateTitle();
     statusBar()->showMessage(QString("Project: %1 — %2 %3fps")
@@ -9098,7 +9108,7 @@ void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
     // 後の SNS プリセット undo で元サイズへ正しく戻る。
     if (m_timeline)
         m_timeline->setProjectOutputConfig(data.config.width, data.config.height,
-                                           data.config.explicitOutputResolution);
+                                           data.config.explicitOutputResolution, data.config.fps);
     if (m_timeline && m_timeline->undoManager()) {
         m_timeline->undoManager()->clear();
         m_timeline->undoManager()->saveState(m_timeline->currentState(),

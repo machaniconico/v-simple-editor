@@ -846,6 +846,12 @@ public:
     QVector<TimelineSequence> sequenceList() const;
     bool renameSequence(const QString &id, const QString &name);
     bool createSequence(const QString &name);
+    // Atomically create, populate and activate a sequence (one undo entry).
+    bool createSequence(const QString &name, const QVector<QVector<ClipInfo>> &videoTracks,
+                        const QVector<QVector<ClipInfo>> &audioTracks);
+    bool createSequenceFromClip(const ClipInfo &clip);
+    bool createSequenceFromMedia(const QString &filePath, const QString &displayName = QString());
+    double projectFrameRate() const { return m_projectFrameRate; }
     QString activeSequenceId() const { return m_activeSequenceId; }
     void setSequences(const QVector<TimelineSequence> &sequences,
                       const QString &activeSequenceId = QString());
@@ -1181,7 +1187,7 @@ public:
     // Timeline 側のプロジェクト出力ジオメトリ複製を最新に保つ。currentState() が
     // undo スナップショットへ捕捉できるよう、MainWindow がプロジェクト設定変更時
     // (applyProjectConfig / プロジェクト読込)に呼ぶ。
-    void setProjectOutputConfig(int width, int height, bool explicitOutput);
+    void setProjectOutputConfig(int width, int height, bool explicitOutput, double fps = 0.0);
 
     // Project-level Light3D state is carried by Timeline so every
     // renderFrameAt consumer (preview/export/smart-render fallback/nested
@@ -1415,6 +1421,7 @@ private:
     // プロジェクトサイズへ正しく戻れる(restoreState の projectWidth>0 ガード)。
     // explicit=false のため addClip の auto-contain 判定(m_projectExplicitOutput ゲート)
     // は不変。
+    double m_projectFrameRate = 30.0;
     int m_projectWidth = 1920;
     int m_projectHeight = 1080;
     bool m_projectExplicitOutput = false;

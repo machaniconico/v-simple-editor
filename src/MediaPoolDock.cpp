@@ -479,6 +479,15 @@ void MediaPoolDock::showAssetContextMenu(const QPoint &pos)
     // メニューのイベントループ中にモデルや一覧が更新されても参照を保持しない。
     const auto selected = *asset;
     QMenu menu(this);
+    // MainWindow owns the command; no additional dock signals are needed.
+    for (QAction *action : actions()) {
+        if (action->objectName() == QStringLiteral("sequenceFromMedia")) {
+            action->setData(QStringList{selected.filePath, selected.displayName});
+            menu.addAction(action);
+            menu.addSeparator();
+            break;
+        }
+    }
     QAction *rename = menu.addAction(tr("名前を変更…"));
     QAction *keywords = menu.addAction(tr("キーワードを編集…"));
     QAction *favorite = menu.addAction(tr("お気に入り"));

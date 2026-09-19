@@ -4545,6 +4545,7 @@ struct TimelineMediaProbe {
     bool audioStreamFound = false;
     bool wantsAutoProxy = false;
     double durationSec = 0.0;
+    double frameRate = 0.0;
     int videoWidth = 0;
     int videoHeight = 0;
     int primaries = 0;
@@ -4594,6 +4595,9 @@ TimelineMediaProbe probeTimelineMedia(const QString &filePath)
         }
 
         result.videoStreamFound = true;
+        const AVRational rate = stream->avg_frame_rate.num > 0 && stream->avg_frame_rate.den > 0
+            ? stream->avg_frame_rate : stream->r_frame_rate;
+        if (rate.num > 0 && rate.den > 0) result.frameRate = av_q2d(rate);
         result.videoWidth = stream->codecpar->width;
         result.videoHeight = stream->codecpar->height;
         const hdringest::ColorInputs colorInputs =
@@ -8260,7 +8264,13 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
             atMenu->addSeparator();
             aClearAct = atMenu->addAction(QStringLiteral("音声トランジション削除"));
         }
+        QAction *aSequence = aMenu.addAction(QStringLiteral("このクリップから新規シーケンス"));
+        const ClipInfo sequenceSource = aClip;
         QAction *aChosen = aMenu.exec(globalPos);
+        if (aChosen == aSequence) {
+            createSequenceFromClip(sequenceSource);
+            return;
+        }
         if (!aChosen) return;
         if (aChosen == aEnabledAction) {
             setClipEnabled(TrackKind::Audio, m_audioTracks.indexOf(track), clipIndex, aEnabledAction->isChecked());
@@ -8505,6 +8515,8 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     };
 
     QMenu menu;
+    QAction *sequenceFromClip = menu.addAction(QStringLiteral("このクリップから新規シーケンス"));
+    const ClipInfo sequenceSource = clipInfo;
     const int renderTrack = m_videoTracks.indexOf(track);
     if (renderTrack >= 0) {
         auto *bake = menu.addAction(QStringLiteral("効果を焼き込んで差し替え…"));
@@ -8713,6 +8725,10 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     };
 
     QAction *chosen = menu.exec(globalPos);
+    if (chosen == sequenceFromClip) {
+        createSequenceFromClip(sequenceSource);
+        return;
+    }
     if (chosen == enabledAction) {
         setClipEnabled(TrackKind::Video, m_videoTracks.indexOf(track), clipIndex, enabledAction->isChecked());
         return;
@@ -11848,11 +11864,12 @@ void Timeline::saveUndoState(const QString &description)
     m_undoManager->saveState(currentState(), description);
 }
 
-void Timeline::setProjectOutputConfig(int width, int height, bool explicitOutput)
+void Timeline::setProjectOutputConfig(int width, int height, bool explicitOutput, double fps)
 {
     m_projectWidth = width;
     m_projectHeight = height;
     m_projectExplicitOutput = explicitOutput;
+    if (std::isfinite(fps) && fps > 0.0) m_projectFrameRate = fps;
 }
 
 TimelineSequence Timeline::currentSequenceSnapshot(const QString &id,
@@ -11969,14 +11986,87 @@ bool Timeline::renameSequence(const QString &id, const QString &name)
 
 bool Timeline::createSequence(const QString &name)
 {
+    return createSequence(name, QVector<QVector<ClipInfo>>{QVector<ClipInfo>{}},
+                          QVector<QVector<ClipInfo>>{QVector<ClipInfo>{}});
+}
+
+bool Timeline::createSequence(const QString &name,
+                              const QVector<QVector<ClipInfo>> &videoTracks,
+                              const QVector<QVector<ClipInfo>> &audioTracks)
+{
     if (name.trimmed().isEmpty()) return false;
+    captureExternalTrackState();
+    // Sequence navigation does not push undo. Preserve the actual pre-create
+    // active ID in the existing top entry, including navigation since its save.
+    // externalTrackState is an undo-only carrier; this never enters project JSON.
+    if (m_sequenceModelEnabled) {
+        QJsonObject external = currentState().externalTrackState;
+        external.insert(QStringLiteral("_sequenceCreationActiveId"), m_activeSequenceId);
+        m_undoManager->updateCurrentExternalTrackState(external);
+    }
+    const TrackClipSnapshot before = snapshotTrackClips(this);
     TimelineSequence sequence;
     sequence.id = uniqueSequenceId(m_sequences, QStringLiteral("sequence"), m_sequences.size());
     sequence.name = name.trimmed();
-    sequence.videoTracks.append(QVector<ClipInfo>{});
-    sequence.audioTracks.append(QVector<ClipInfo>{});
+    sequence.videoTracks = videoTracks;
+    sequence.audioTracks = audioTracks;
+    if (sequence.videoTracks.isEmpty()) sequence.videoTracks.append(QVector<ClipInfo>{});
+    if (sequence.audioTracks.isEmpty()) sequence.audioTracks.append(QVector<ClipInfo>{});
     if (!addSequence(sequence) || !setActiveSequence(sequence.id)) return false;
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, before);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, before);
     saveUndoState(QStringLiteral("新規シーケンス"));
+    return true;
+}
+
+bool Timeline::createSequenceFromMedia(const QString &filePath, const QString &displayName)
+{
+    ClipInfo clip;
+    clip.filePath = filePath;
+    clip.displayName = displayName;
+    clip.duration = probeTimelineMedia(filePath).durationSec;
+    clip.outPoint = clip.duration;
+    return createSequenceFromClip(clip);
+}
+
+bool Timeline::createSequenceFromClip(const ClipInfo &source)
+{
+    const auto media = probeTimelineMedia(source.filePath);
+    if (!media.openedOk || (!media.videoStreamFound && !media.audioStreamFound)
+        || !std::isfinite(source.effectiveDuration()) || source.effectiveDuration() <= 0.0) {
+        emit statusMessageRequested(QStringLiteral("このクリップからシーケンスを作成できません。"), 5000);
+        return false;
+    }
+    ClipInfo clip = source;
+    clip.leadInSec = 0.0;
+    // Loaded sequences may contain groups beyond this session's allocator.
+    QSet<int> usedGroups;
+    const auto existingSequences = sequenceList();
+    for (const auto &sequence : existingSequences) {
+        for (const auto &track : sequence.videoTracks)
+            for (const auto &existing : track) usedGroups.insert(existing.linkGroup);
+        for (const auto &track : sequence.audioTracks)
+            for (const auto &existing : track) usedGroups.insert(existing.linkGroup);
+    }
+    do { clip.linkGroup = allocateLinkGroup(); } while (usedGroups.contains(clip.linkGroup));
+    QString name = clip.displayName.trimmed();
+    if (name.isEmpty()) name = QFileInfo(clip.filePath).completeBaseName();
+    const QString base = name;
+    QSet<QString> names;
+    for (const auto &sequence : existingSequences) names.insert(sequence.name);
+    for (int suffix = 2; names.contains(name); ++suffix)
+        name = QStringLiteral("%1 (%2)").arg(base).arg(suffix);
+    QVector<QVector<ClipInfo>> video{QVector<ClipInfo>{clip}};
+    QVector<QVector<ClipInfo>> audio{QVector<ClipInfo>{}};
+    if (media.audioStreamFound) audio[0].append(clip);
+    if (!createSequence(name, video, audio)) return false;
+    const QString info = QStringLiteral("素材 %1x%2 %3fps / プロジェクト %4x%5 %6fps")
+        .arg(media.videoWidth).arg(media.videoHeight).arg(media.frameRate, 0, 'g', 6)
+        .arg(m_projectWidth).arg(m_projectHeight).arg(m_projectFrameRate, 0, 'g', 6);
+    const bool differs = media.videoStreamFound && (media.videoWidth != m_projectWidth
+        || media.videoHeight != m_projectHeight || std::abs(media.frameRate - m_projectFrameRate) > 0.001);
+    emit statusMessageRequested(differs
+        ? QStringLiteral("プロジェクト設定と異なります (%1)").arg(info) : info, 8000);
     return true;
 }
 
@@ -12399,6 +12489,9 @@ void Timeline::restoreState(const TimelineState &state)
         m_applyExternalTrackState(state.externalTrackState);
     emit trackStateRestored();
     syncActiveSequenceFromCurrentTracks();
+    const QString beforeSequenceCreation = state.externalTrackState
+        .value(QStringLiteral("_sequenceCreationActiveId")).toString();
+    if (!beforeSequenceCreation.isEmpty()) setActiveSequence(beforeSequenceCreation);
     undotrace::log("restoreState:exit");
 }
 
