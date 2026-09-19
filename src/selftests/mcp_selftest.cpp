@@ -1194,7 +1194,7 @@ int runMcpSelftest()
             rpcRequest(73, QStringLiteral("tools/list")))))
         .value(QStringLiteral("result")).toObject()
         .value(QStringLiteral("tools")).toArray();
-    constexpr int kExpectedProjectInfoToolCount = 36 + 1 + 2 + 2 + 1 + 2; // US-308: compare_project; US-312: render/decompose; US-400: color/LUT; US-406: track properties; US-509: sequences
+    constexpr int kExpectedProjectInfoToolCount = 36 + 1 + 2 + 2 + 1 + 2 + 3; // US-308: compare_project; US-312: render/decompose; US-400: color/LUT; US-406: track properties; US-509: sequences; US-511: track operations
     bool outputSchemasDeclared = projectInfoToolDescriptors.size()
         == kExpectedProjectInfoToolCount;
     for (const QJsonValue& value : projectInfoToolDescriptors) {
@@ -5578,6 +5578,108 @@ int runMcpSelftest()
     } else {
         fail("G166 sequence list and schema", QStringLiteral("Timeline was not available"));
         fail("G167 sequence switch without undo and invalid id", QStringLiteral("Timeline was not available"));
+    }
+    // US-511 reserved G168-G170: structural operations through the real MCP transport.
+    if (projectTimeline) {
+        const auto savedState = projectTimeline->currentState();
+        int requestId = 51100;
+        auto call = [&](const QString &name, const QJsonObject &args) {
+            return callProjectInfoTool(++requestId, name, args);
+        };
+        auto tracks = [&]() {
+            return toolPayload(call(QStringLiteral("get_timeline"), {})).value(QStringLiteral("video")).toArray();
+        };
+        auto baseline = [&]() {
+            projectTimeline->undoManager()->clear();
+            projectTimeline->undoManager()->saveState(projectTimeline->currentState(), QStringLiteral("基準"));
+        };
+        const QVector<QVector<ClipInfo>> empty{{}};
+        Timeline cleanTimeline;
+        projectTimeline->restoreState(cleanTimeline.currentState());
+        baseline();
+        auto serial = projectTimeline->undoManager()->saveSerial();
+        const auto added = toolPayload(call(QStringLiteral("add_track"), {{"kind", "video"}}));
+        bool g168 = added.value("ok").toBool() && added.value("trackIndex").toInt(-1) == 1
+            && added.value("trackCount").toInt() == 2 && tracks().size() == 2
+            && requiredOutputFieldsPresent(QStringLiteral("add_track"), added)
+            && projectTimeline->undoManager()->saveSerial() == serial + 1;
+        call(QStringLiteral("undo"), {});
+        g168 = g168 && tracks().size() == 1 && !projectTimeline->canUndo();
+        serial = projectTimeline->undoManager()->saveSerial();
+        const auto audioAdded = toolPayload(call(QStringLiteral("add_track"), {{"kind", "audio"}}));
+        g168 = g168 && audioAdded.value("ok").toBool() && audioAdded.value("trackCount").toInt() == 2
+            && projectTimeline->audioTrackCount() == 2
+            && projectTimeline->undoManager()->saveSerial() == serial + 1;
+        call(QStringLiteral("undo"), {});
+        g168 = g168 && projectTimeline->audioTrackCount() == 1 && !projectTimeline->canUndo();
+        const auto invalidAdd = call(QStringLiteral("add_track"), {{"kind", "invalid"}});
+        g168 = g168 && toolResult(invalidAdd).value("isError").toBool();
+        g168 ? pass("G168 add_track and single undo")
+             : fail("G168 add_track and single undo", QStringLiteral("count/undo/schema mismatch"));
+
+        ClipInfo middle, last;
+        middle.filePath = QStringLiteral("mcp-track-middle.mov");
+        middle.displayName = QStringLiteral("middle");
+        middle.duration = middle.outPoint = 2.0;
+        last = middle;
+        last.filePath = QStringLiteral("mcp-track-last.mov");
+        last.displayName = QStringLiteral("last");
+        const QVector<QVector<ClipInfo>> rows{{}, {middle}, {last}};
+        projectTimeline->restoreFromProject(rows, empty, 0.0, -1.0, -1.0, 100);
+        baseline();
+        const auto original = tracks();
+        serial = projectTimeline->undoManager()->saveSerial();
+        const auto removed = toolPayload(call(QStringLiteral("remove_track"), {{"kind", "video"}, {"trackIndex", 1}}));
+        const auto afterRemove = tracks();
+        bool g169 = removed.value("ok").toBool() && removed.value("trackCount").toInt() == 2
+            && requiredOutputFieldsPresent(QStringLiteral("remove_track"), removed)
+            && afterRemove.size() == 2
+            && afterRemove[1].toObject().value("clips") == original[2].toObject().value("clips")
+            && projectTimeline->undoManager()->saveSerial() == serial + 1;
+        call(QStringLiteral("undo"), {});
+        g169 = g169 && tracks() == original && !projectTimeline->canUndo();
+        projectTimeline->trackAt(false, 1)->setLocked(true);
+        const auto locked = call(QStringLiteral("remove_track"), {{"kind", "video"}, {"trackIndex", 1}});
+        g169 = g169 && toolResult(locked).value("isError").toBool() && tracks().size() == 3;
+        projectTimeline->trackAt(false, 1)->setLocked(false);
+        const auto lastTrack = call(QStringLiteral("remove_track"), {{"kind", "audio"}, {"trackIndex", 0}});
+        g169 = g169 && toolResult(lastTrack).value("isError").toBool() && projectTimeline->audioTrackCount() == 1;
+        g169 ? pass("G169 remove_track clips, undo and rejection")
+             : fail("G169 remove_track clips, undo and rejection", QStringLiteral("remove/undo/validation mismatch"));
+
+        projectTimeline->setTrackAppearance(false, 1, QStringLiteral("中央"), QColor(QStringLiteral("#123abc")));
+        projectTimeline->setTrackAppearance(false, 2, QStringLiteral("末尾"), QColor(QStringLiteral("#abcdef")));
+        baseline();
+        const auto beforeMove = tracks();
+        serial = projectTimeline->undoManager()->saveSerial();
+        const auto moved = toolPayload(call(QStringLiteral("move_track"),
+            {{"kind", "video"}, {"trackIndex", 1}, {"newTrackIndex", 2}}));
+        const auto afterMove = tracks();
+        bool g170 = moved.value("ok").toBool() && moved.value("trackIndex").toInt(-1) == 2
+            && requiredOutputFieldsPresent(QStringLiteral("move_track"), moved)
+            && afterMove.size() == 3
+            && afterMove[1].toObject().value("name").toString() == QStringLiteral("末尾")
+            && afterMove[2].toObject().value("name").toString() == QStringLiteral("中央")
+            && afterMove[2].toObject().value("color").toString() == QStringLiteral("#123abc")
+            && projectTimeline->undoManager()->saveSerial() == serial + 1;
+        call(QStringLiteral("undo"), {});
+        g170 = g170 && tracks() == beforeMove && !projectTimeline->canUndo();
+        serial = projectTimeline->undoManager()->saveSerial();
+        for (const QJsonObject &args : {QJsonObject{{"kind", "video"}, {"trackIndex", 1}, {"newTrackIndex", 3}},
+                QJsonObject{{"kind", "video"}, {"trackIndex", 3}, {"newTrackIndex", 0}},
+                QJsonObject{{"kind", "video"}, {"trackIndex", 1}, {"newTrackIndex", -1}},
+                QJsonObject{{"kind", "video"}, {"trackIndex", 1}}}) {
+            const auto rejected = call(QStringLiteral("move_track"), args);
+            g170 = g170 && toolResult(rejected).value("isError").toBool();
+        }
+        g170 = g170 && tracks() == beforeMove && serial == projectTimeline->undoManager()->saveSerial();
+        g170 ? pass("G170 move_track appearance, undo and bounds")
+             : fail("G170 move_track appearance, undo and bounds", QStringLiteral("move/undo/validation mismatch"));
+        projectTimeline->restoreState(savedState);
+    } else {
+        fail("G168 add_track and single undo", QStringLiteral("Timeline was not available"));
+        fail("G169 remove_track clips, undo and rejection", QStringLiteral("Timeline was not available"));
+        fail("G170 move_track appearance, undo and bounds", QStringLiteral("Timeline was not available"));
     }
     server.stop();
     qInfo().noquote().nospace() << "[mcp] selftest end, passed=" << passed

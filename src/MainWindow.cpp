@@ -5055,6 +5055,33 @@ void MainWindow::setupMenuBar()
     m_menuHelpEntries.append({addATrack,
         QStringLiteral("音声を重ねるための段を増やします。ナレーションと BGM を別々の段に置けます。")});
 
+    trackMenu->addSeparator();
+    auto *removeTrackAction = trackMenu->addAction(QStringLiteral("選択トラックを削除"));
+    auto *moveTrackUpAction = trackMenu->addAction(QStringLiteral("選択トラックを上へ移動"));
+    auto *moveTrackDownAction = trackMenu->addAction(QStringLiteral("選択トラックを下へ移動"));
+    connect(trackMenu, &QMenu::aboutToShow, this,
+            [this, removeTrackAction, moveTrackUpAction, moveTrackDownAction] {
+        const int index = m_timeline ? m_timeline->activeVideoTrackIndex() : -1;
+        auto *track = m_timeline ? m_timeline->trackAt(false, index) : nullptr;
+        const int count = m_timeline ? m_timeline->videoTrackCount() : 0;
+        removeTrackAction->setEnabled(track && count > 1 && !track->isLocked());
+        moveTrackUpAction->setEnabled(track && index > 0);
+        moveTrackDownAction->setEnabled(track && index + 1 < count);
+    });
+    connect(removeTrackAction, &QAction::triggered, this, [this] {
+        if (m_timeline) m_timeline->requestRemoveTrack(false, m_timeline->activeVideoTrackIndex());
+    });
+    connect(moveTrackUpAction, &QAction::triggered, this, [this] {
+        if (!m_timeline) return;
+        const int index = m_timeline->activeVideoTrackIndex();
+        m_timeline->moveTrack(false, index, index - 1);
+    });
+    connect(moveTrackDownAction, &QAction::triggered, this, [this] {
+        if (!m_timeline) return;
+        const int index = m_timeline->activeVideoTrackIndex();
+        m_timeline->moveTrack(false, index, index + 1);
+    });
+
     // 挿入 メニュー
     auto *insertMenu = menuBar()->addMenu("挿入(&I)");
 

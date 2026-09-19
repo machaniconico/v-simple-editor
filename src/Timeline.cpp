@@ -4042,6 +4042,25 @@ QWidget *Timeline::createTrackHeader(TimelineTrack *track, const QString &name, 
                 setTrackColor(isAudioRow, idx, color);
             });
         }
+        menu.addSeparator();
+        auto *remove = menu.addAction(QStringLiteral("トラックを削除"));
+        auto *up = menu.addAction(QStringLiteral("上へ移動"));
+        auto *down = menu.addAction(QStringLiteral("下へ移動"));
+        const int count = isAudioRow ? audioTrackCount() : videoTrackCount();
+        remove->setEnabled(count > 1 && !trackPtr->isLocked());
+        up->setEnabled(idx > 0);
+        down->setEnabled(idx + 1 < count);
+        connect(remove, &QAction::triggered, this, [this, isAudioRow, trackPtr] {
+            if (trackPtr) requestRemoveTrack(isAudioRow,
+                (isAudioRow ? m_audioTracks : m_videoTracks).indexOf(trackPtr.data()));
+        });
+        auto move = [this, isAudioRow, trackPtr](int offset) {
+            if (!trackPtr) return;
+            const int index = (isAudioRow ? m_audioTracks : m_videoTracks).indexOf(trackPtr.data());
+            moveTrack(isAudioRow, index, index + offset);
+        };
+        connect(up, &QAction::triggered, this, [move] { move(-1); });
+        connect(down, &QAction::triggered, this, [move] { move(1); });
         if (menu.exec(w->mapToGlobal(pos)) == rename && trackPtr) {
             bool ok = false;
             const QString value = QInputDialog::getText(this, QStringLiteral("名前を変更"),
@@ -4204,6 +4223,20 @@ void Timeline::addAudioTrack(bool recordUndo)
     wireTrackSelection(track);
     updateInfoLabel();
     if (recordUndo) saveUndoState(QStringLiteral("トラックを追加"));
+}
+
+bool Timeline::requestRemoveTrack(bool audio, int index)
+{
+    QPointer<TimelineTrack> track = trackAt(audio, index);
+    if (!track || track->isLocked()
+        || (audio ? audioTrackCount() : videoTrackCount()) <= 1) return false;
+    const int clipCount = track->clips().size();
+    if (clipCount > 0 && QMessageBox::question(this, QStringLiteral("トラックを削除"),
+            QStringLiteral("%1 個のクリップも削除されます。トラックを削除しますか？").arg(clipCount),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes)
+        return false;
+    if (!track) return false;
+    return removeTrack(audio, (audio ? m_audioTracks : m_videoTracks).indexOf(track.data()));
 }
 
 bool Timeline::removeTrack(bool audio, int index, QString *err)

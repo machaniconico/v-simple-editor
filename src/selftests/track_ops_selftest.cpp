@@ -13,6 +13,10 @@
 #include <QDialog>
 #include <QEvent>
 #include <QLabel>
+#include <QMenu>
+#include <QMessageBox>
+#include <QAction>
+#include <QAbstractButton>
 #include <QPointer>
 #include <QSignalSpy>
 #include <QTimer>
@@ -55,6 +59,91 @@ bool order(const QVector<QVector<ClipInfo>> &rows, const QVector<int> &ids)
             || c.opacity != expected.opacity) return false;
     }
     return true;
+}
+
+// Open the actual header context menu and trigger its QAction, including the
+// nested confirmation dialog. No duplicate implementation of track mutation.
+bool headerAction(Timeline &t, bool audio, int index, const QString &text,
+                  bool enabled, bool trigger = false, bool confirm = true)
+{
+    QWidget *header = nullptr;
+    const QString name = QStringLiteral("%1%2").arg(audio ? QStringLiteral("A") : QStringLiteral("V")).arg(index + 1);
+    for (auto *label : t.findChildren<QLabel *>(QStringLiteral("timelineTrackName"))) {
+        auto *candidate = label->parentWidget();
+        if (label->property("defaultName").toString() == name
+            && candidate->parentWidget()->layout()->indexOf(candidate) >= 0) {
+            header = candidate;
+            break;
+        }
+    }
+    if (!header) return false;
+    bool checked = false;
+    QTimer::singleShot(0, &t, [&]() {
+        auto *menu = header->findChild<QMenu *>(QString(), Qt::FindDirectChildrenOnly);
+        if (!menu) return;
+        for (auto *action : menu->actions()) {
+            if (action->text() != text) continue;
+            checked = action->isEnabled() == enabled;
+            if (trigger && action->isEnabled()) {
+                if (text == QStringLiteral("トラックを削除") && !t.trackAt(audio, index)->clips().isEmpty()) {
+                    QTimer::singleShot(0, &t, [&]() {
+                        auto *box = qobject_cast<QMessageBox *>(QApplication::activeModalWidget());
+                        checked = checked && box && box->text().contains(QStringLiteral("1 個のクリップも削除されます"));
+                        if (box) box->button(confirm ? QMessageBox::Yes : QMessageBox::No)->click();
+                    });
+                }
+                action->trigger();
+            }
+            break;
+        }
+        menu->close();
+    });
+    QMetaObject::invokeMethod(header, "customContextMenuRequested", Qt::DirectConnection,
+                              Q_ARG(QPoint, QPoint(1, 1)));
+    return checked;
+}
+
+bool headerOperations()
+{
+    Timeline t;
+    setup(t);
+    bool ok = true;
+    for (bool audio : {false, true}) {
+        baseline(t);
+        auto serial = t.undoManager()->saveSerial();
+        ok = headerAction(t, audio, 0, QStringLiteral("上へ移動"), false) && ok;
+        ok = headerAction(t, audio, 2, QStringLiteral("下へ移動"), false) && ok;
+        ok = headerAction(t, audio, 1, QStringLiteral("トラックを削除"), true, true, false) && ok
+            && t.undoManager()->saveSerial() == serial;
+        ok = headerAction(t, audio, 1, QStringLiteral("トラックを削除"), true, true) && ok
+            && (audio ? t.audioTrackCount() : t.videoTrackCount()) == 2
+            && order(audio ? t.currentState().audioTracks : t.currentState().videoTracks, {0, 2})
+            && t.undoManager()->saveSerial() == serial + 1;
+        t.undo();
+        ok = ok && order(audio ? t.currentState().audioTracks : t.currentState().videoTracks, {0, 1, 2})
+            && !t.canUndo();
+        t.trackAt(audio, 1)->setLocked(true);
+        ok = headerAction(t, audio, 1, QStringLiteral("トラックを削除"), false) && ok;
+        t.trackAt(audio, 1)->setLocked(false);
+        for (int direction : {-1, 1}) {
+            baseline(t);
+            serial = t.undoManager()->saveSerial();
+            ok = headerAction(t, audio, 1, direction < 0 ? QStringLiteral("上へ移動") : QStringLiteral("下へ移動"), true, true) && ok
+                && order(audio ? t.currentState().audioTracks : t.currentState().videoTracks,
+                         direction < 0 ? QVector<int>{1, 0, 2} : QVector<int>{0, 2, 1})
+                && t.undoManager()->saveSerial() == serial + 1;
+            t.undo();
+            ok = ok && order(audio ? t.currentState().audioTracks : t.currentState().videoTracks, {0, 1, 2})
+                && !t.canUndo();
+        }
+    }
+    Timeline single;
+    for (bool audio : {false, true}) {
+        ok = headerAction(single, audio, 0, QStringLiteral("トラックを削除"), false) && ok;
+        ok = headerAction(single, audio, 0, QStringLiteral("上へ移動"), false) && ok;
+        ok = headerAction(single, audio, 0, QStringLiteral("下へ移動"), false) && ok;
+    }
+    return ok;
 }
 
 bool layoutOrder(Timeline &t, bool audio)
@@ -343,7 +432,8 @@ int runTrackOpsSelftest()
             && applied == 0 && mixer->collectTrackState() == live;
         ok = t.undoManager()->jumpTo(0) && ok && applied == 1;
         ok = t.undoManager()->jumpTo(2) && ok && applied == 2;
-        gate(8, ok);
+        const bool headerOk = headerOperations();
+        gate(8, ok && headerOk);
     }
     {
         // Exercise the real MainWindow hook, which used to overwrite the

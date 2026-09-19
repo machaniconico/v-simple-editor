@@ -945,6 +945,9 @@ public:
                                     int *clipIndex = nullptr);
     void addAudioTrack(bool recordUndo = true);
     bool removeTrack(bool audio, int index, QString *err = nullptr);
+    bool requestRemoveTrack(bool audio, int index);
+    int activeVideoTrackIndex() const { return m_activeVideoTrackIndex >= 0
+        ? m_activeVideoTrackIndex : 0; }
     bool moveTrack(bool audio, int from, int to, QString *err = nullptr);
     // Force every audio row to repaint. Used after global UI state changes
     // (e.g. the volume-envelope edit-mode toggle) so the overlay flips

@@ -2888,6 +2888,86 @@ void McpEditorTools::registerWriteTools()
         })
     }, openProjectOutputSchema));
 
+    m_registry->registerTool(withOutputSchema({
+        QStringLiteral("add_track"),
+        QStringLiteral("映像または音声トラックを末尾に追加する。1回のUndoで戻せる。"),
+        schemaWithRequired(QJsonObject{{QStringLiteral("kind"),
+            trackSelectorProperties().value(QStringLiteral("kind"))}}, {QStringLiteral("kind")}),
+        guardedWrite(QStringLiteral("add_track"),
+            [this](const QJsonObject &args, QString *err) -> QJsonObject {
+            if (!rejectUnknownArguments(args, {QStringLiteral("kind")}, err)) return {};
+            QString kind;
+            if (!requiredString(args, QStringLiteral("kind"), &kind, err)) return {};
+            if (kind != QStringLiteral("video") && kind != QStringLiteral("audio"))
+                return setError(err, QStringLiteral("kind must be video or audio")), QJsonObject{};
+            auto *currentTimeline = timeline();
+            if (!m_window || !currentTimeline)
+                return setError(err, QStringLiteral("editor not available")), QJsonObject{};
+            const bool audio = kind == QStringLiteral("audio");
+            if (audio) currentTimeline->addAudioTrack();
+            else currentTimeline->addVideoTrack();
+            const int count = audio ? currentTimeline->audioTrackCount() : currentTimeline->videoTrackCount();
+            m_window->setWindowModified(true);
+            syncSelectionAfterEdit();
+            return QJsonObject{{QStringLiteral("ok"), true},
+                {QStringLiteral("trackIndex"), count - 1}, {QStringLiteral("trackCount"), count}};
+        })
+    }, outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("trackIndex"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+        {QStringLiteral("trackCount"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}}
+    }, {QStringLiteral("ok"), QStringLiteral("trackIndex"), QStringLiteral("trackCount")})));
+
+    m_registry->registerTool(withOutputSchema({
+        QStringLiteral("remove_track"),
+        QStringLiteral("指定トラックと全クリップを削除する。最後の1本とロック中は拒否。1回のUndoで戻せる。"),
+        schemaWithRequired(trackSelectorProperties(), {QStringLiteral("kind"), QStringLiteral("trackIndex")}),
+        guardedWrite(QStringLiteral("remove_track"),
+            [this](const QJsonObject &args, QString *err) -> QJsonObject {
+            if (!rejectUnknownArguments(args, {QStringLiteral("kind"), QStringLiteral("trackIndex")}, err)) return {};
+            TrackTarget target;
+            auto *currentTimeline = timeline();
+            if (!readTrackTarget(args, m_window, currentTimeline, &target, err)) return {};
+            const bool audio = target.kind == TrackKind::Audio;
+            if (!currentTimeline->removeTrack(audio, target.trackIndex, err)) return {};
+            m_window->setWindowModified(true);
+            syncSelectionAfterEdit();
+            return QJsonObject{{QStringLiteral("ok"), true}, {QStringLiteral("trackCount"),
+                audio ? currentTimeline->audioTrackCount() : currentTimeline->videoTrackCount()}};
+        })
+    }, outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("trackCount"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}}
+    }, {QStringLiteral("ok"), QStringLiteral("trackCount")})));
+
+    m_registry->registerTool(withOutputSchema({
+        QStringLiteral("move_track"),
+        QStringLiteral("指定トラックを同じ種類の指定位置へ移動する。1回のUndoで戻せる。"),
+        schemaWithRequired(mergedProperties(trackSelectorProperties(), QJsonObject{
+            {QStringLiteral("newTrackIndex"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")},
+                {QStringLiteral("minimum"), 0}}}}),
+            {QStringLiteral("kind"), QStringLiteral("trackIndex"), QStringLiteral("newTrackIndex")}),
+        guardedWrite(QStringLiteral("move_track"),
+            [this](const QJsonObject &args, QString *err) -> QJsonObject {
+            if (!rejectUnknownArguments(args, {QStringLiteral("kind"), QStringLiteral("trackIndex"),
+                    QStringLiteral("newTrackIndex")}, err)) return {};
+            TrackTarget target;
+            auto *currentTimeline = timeline();
+            if (!readTrackTarget(args, m_window, currentTimeline, &target, err)) return {};
+            int destination = -1;
+            if (!args.contains(QStringLiteral("newTrackIndex")))
+                return setError(err, QStringLiteral("newTrackIndex is required")), QJsonObject{};
+            if (!nonNegativeInteger(args, QStringLiteral("newTrackIndex"), -1, &destination, err)) return {};
+            if (!currentTimeline->moveTrack(target.kind == TrackKind::Audio, target.trackIndex, destination, err)) return {};
+            if (target.trackIndex != destination) m_window->setWindowModified(true);
+            syncSelectionAfterEdit();
+            return QJsonObject{{QStringLiteral("ok"), true}, {QStringLiteral("trackIndex"), destination}};
+        })
+    }, outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("trackIndex"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}}
+    }, {QStringLiteral("ok"), QStringLiteral("trackIndex")})));
+
     QJsonObject trackPropertyInputs = trackPropertiesSchema();
     trackPropertyInputs.remove(QStringLiteral("index"));
     trackPropertyInputs.remove(QStringLiteral("locked"));
