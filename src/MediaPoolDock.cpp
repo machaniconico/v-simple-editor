@@ -22,6 +22,8 @@
 #include <QMimeData>
 #include <QPushButton>
 #include <QInputDialog>
+#include <QLabel>
+#include <QMessageBox>
 #include <QUrl>
 #include <QVariant>
 #include <QSize>
@@ -558,6 +560,8 @@ void MediaPoolDock::showBinContextMenu(const QPoint &pos)
     const QString oldName = item ? item->text(0) : QString();
     QMenu menu(this);
     QAction *createSmart = menu.addAction(tr("スマートビンを作成…"));
+    QAction *reduceProject = menu.addAction(tr("未使用素材を削除…"));
+    reduceProject->setEnabled(bool(m_usedPathsProvider));
     QAction *editSmart = kind == Smart ? menu.addAction(tr("スマートビンを編集…")) : nullptr;
     QAction *rename = kind == Folder && !id.isEmpty() ? menu.addAction(tr("名前を変更…")) : nullptr;
     QAction *remove = (kind == Folder || kind == Smart) && !id.isEmpty()
@@ -565,6 +569,10 @@ void MediaPoolDock::showBinContextMenu(const QPoint &pos)
     QAction *chosen = menu.exec(m_binTree->viewport()->mapToGlobal(pos));
     if (!chosen || !m_pool)
         return;
+    if (chosen == reduceProject) {
+        onRemoveUnused();
+        return;
+    }
     if (chosen == createSmart || chosen == editSmart) {
         editSmartBin(chosen == createSmart ? QString() : id);
         return;
@@ -578,6 +586,58 @@ void MediaPoolDock::showBinContextMenu(const QPoint &pos)
             changed = m_pool->renameBin(id, name);
     } else if (chosen == remove) {
         changed = kind == Smart ? m_pool->removeSmartBin(id) : m_pool->removeBin(id);
+    }
+    if (changed) {
+        emit poolChanged();
+        refresh();
+    }
+}
+
+void MediaPoolDock::onRemoveUnused()
+{
+    if (!m_pool || !m_usedPathsProvider)
+        return;
+    auto *pool = m_pool;
+    const auto unused = pool->filtered(QString(), mediapool::AssetFilterMode::Unused,
+                                       m_usedPathsProvider());
+    if (unused.isEmpty()) {
+        QMessageBox::information(this, tr("未使用素材を削除"), tr("未使用素材はありません。"));
+        return;
+    }
+
+    QDialog dialog(this);
+    dialog.setObjectName(QStringLiteral("ReduceProjectConfirmation"));
+    dialog.setWindowTitle(tr("未使用素材を削除"));
+    auto *layout = new QVBoxLayout(&dialog);
+    auto *message = new QLabel(tr("未使用素材 %1 件をメディアプールから削除しますか？\n"
+        "この操作は元に戻せません。ディスク上のファイルは削除されないので、必要になれば再度読み込めます")
+        .arg(unused.size()), &dialog);
+    message->setWordWrap(true);
+    layout->addWidget(message);
+    auto *list = new QListWidget(&dialog);
+    for (const auto &asset : unused)
+        list->addItem(QFileInfo(asset.filePath).fileName() + QStringLiteral("\n") + asset.filePath);
+    layout->addWidget(list);
+    auto *buttons = new QDialogButtonBox(&dialog);
+    auto *yes = buttons->addButton(tr("はい"), QDialogButtonBox::AcceptRole);
+    auto *no = buttons->addButton(tr("いいえ"), QDialogButtonBox::RejectRole);
+    yes->setAutoDefault(false);
+    no->setDefault(true);
+    no->setFocus();
+    connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    layout->addWidget(buttons);
+    dialog.resize(560, 400);
+    if (dialog.exec() != QDialog::Accepted || m_pool != pool || !m_usedPathsProvider)
+        return;
+
+    // Recheck through the same provider after the modal event loop.
+    const auto usedPaths = m_usedPathsProvider();
+    bool changed = false;
+    for (const auto &asset : unused) {
+        const auto *current = pool->getAsset(asset.id);
+        if (current && current->filePath == asset.filePath && !usedPaths.contains(current->filePath))
+            changed = pool->removeAsset(asset.id) || changed;
     }
     if (changed) {
         emit poolChanged();

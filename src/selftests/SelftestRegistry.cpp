@@ -176,6 +176,7 @@ int runProSelftest();
 int runProjTmplSelftest();
 int runProjectPresetSelftest();
 int runProxySelftestV2();
+int runReduceProjectSelftest();
 int runRenderFixtureSelftest();
 int runRenderInPlaceSelftest();
 int runRenderQueueAcesDecisionSelftest();
@@ -868,6 +869,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Transcript highlighter scaffold smoke" },
     { "media-relink",     "VEDITOR_MEDIA_RELINK_SELFTEST",       runMediaRelinkSelftest,         true,
       "Offline media path enumeration, nested sequences, undo-safe relink, and persistence (6 gates)" },
+    { "reduce-project", "VEDITOR_REDUCE_PROJECT_SELFTEST", runReduceProjectSelftest, true,
+      "Unused media removal: shared provider, nested/sidecar references, confirmation and disk preservation (4 gates)" },
     { "mcp",              "VEDITOR_MCP_SELFTEST",                runMcpSelftest,                true,
       "MCP server: JSON-RPC framing + tool registry dispatch + HTTP transport auth + write-tool validation + AI chat helpers (145 gates)" },
     { "music-remix",      nullptr,                                  runMusicRemixSelftest,        true,

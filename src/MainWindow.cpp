@@ -6306,24 +6306,44 @@ void MainWindow::setupMenuBar()
     m_mediaPoolDock->setPool(&m_mediaPool);
     m_mediaPoolDock->setUsedPathsProvider([this] {
         QSet<QString> paths;
+        QSet<QString> lutPaths;
         if (m_timeline) {
             for (const auto &tracks : {m_timeline->videoTracks(), m_timeline->audioTracks()}) {
                 for (const TimelineTrack *track : tracks) {
                     if (!track)
                         continue;
-                    for (const ClipInfo &clip : track->clips())
+                    for (const ClipInfo &clip : track->clips()) {
                         paths.insert(clip.filePath);
+                        if (!clip.lutFilePath.isEmpty())
+                            lutPaths.insert(clip.lutFilePath);
+                    }
                 }
             }
             // Precomposed media lives in child sequences; sequences() includes all nesting levels.
             for (const TimelineSequence &sequence : m_timeline->sequences()) {
                 for (const auto &tracks : {sequence.videoTracks, sequence.audioTracks}) {
                     for (const QVector<ClipInfo> &clips : tracks) {
-                        for (const ClipInfo &clip : clips)
+                        for (const ClipInfo &clip : clips) {
                             paths.insert(clip.filePath);
+                            if (!clip.lutFilePath.isEmpty())
+                                lutPaths.insert(clip.lutFilePath);
+                        }
                     }
                 }
             }
+        }
+        // Preserve the original provider only for the reduce-project regression gate.
+        // The property is unset in production, so the extended path is the default.
+        if (m_mediaPoolDock->property("reduceProjectLegacyPathsForSelftest").toBool())
+            return paths;
+        paths.unite(lutPaths);
+        for (const OverlayItem &overlay : m_projectOverlays) {
+            if (overlay.type == QLatin1String("image") && !overlay.text.isEmpty())
+                paths.insert(overlay.text);
+        }
+        for (auto it = m_particleClipConfigs.cbegin(); it != m_particleClipConfigs.cend(); ++it) {
+            if (!it.key().isEmpty())
+                paths.insert(it.key());
         }
         return paths;
     });

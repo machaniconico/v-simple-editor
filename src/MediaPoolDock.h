@@ -69,6 +69,7 @@ private slots:
     void onAssetDoubleClicked(QListWidgetItem *item);
     void onAddBin();
     void onRemoveSelected();
+    void onRemoveUnused();
     void onImportClicked();
     void editSelectedKeywords();
     void editSmartBin(const QString &id);
