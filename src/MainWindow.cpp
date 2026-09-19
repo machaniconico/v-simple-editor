@@ -384,6 +384,15 @@ quint64 masterEqPassesForTest() { return masterEqPasses; }
 } // namespace audiofxexport
 
 namespace {
+// US-601: AudioMixer has no public amount getter. Keep its project value
+// alongside the mixer; all MainWindow amount writes pass through this helper.
+void setProjectNormalizerAmount(AudioMixer *mixer, double amount)
+{
+    if (!mixer) return;
+    amount = std::isfinite(amount) ? qBound(0.0, amount, 1.0) : 0.0;
+    mixer->setNormalizerAmount(amount);
+    mixer->setProperty("projectNormalizerAmount", amount);
+}
 
 constexpr const char *kTextToolLetterSpacingSpinName = "textToolLetterSpacingSpin";
 constexpr const char *kTextToolLineSpacingSpinName = "textToolLineSpacingSpin";
@@ -4169,7 +4178,7 @@ void MainWindow::setupUI()
     // Restore master loudness normalizer settings on startup.
     if (auto *mixer = m_player ? m_player->audioMixer() : nullptr) {
         QSettings audioPrefs("VSimpleEditor", "Preferences");
-        mixer->setNormalizerAmount(
+        setProjectNormalizerAmount(mixer,
             audioPrefs.value("audio/normalizerAmount", 0.0).toDouble());
         mixer->setNormalizerUniformity(
             audioPrefs.value("audio/normalizerUniformity", 0.5).toDouble());
@@ -8778,8 +8787,10 @@ void MainWindow::populateProjectData(ProjectData &data)
     data.subtitleStyle = styleJson;
 
     QJsonObject loudnessJson;
-    loudnessJson["normalizerAmount"] = 0.0;
-    loudnessJson["loudnessGainDb"] = 0.0;
+    const auto *normalizerMixer = m_player ? m_player->audioMixer() : nullptr;
+    loudnessJson["normalizerAmount"] = normalizerMixer
+        ? normalizerMixer->property("projectNormalizerAmount").toDouble() : 0.0;
+    loudnessJson["loudnessGainDb"] = exporter_loudnessGainDb();
     loudnessJson[QStringLiteral("_timecodeBurnIn")] = m_tcBurnIn.toJson();
     data.loudnessSettings = loudnessJson;
 
@@ -9373,6 +9384,18 @@ void MainWindow::collectAudioState(ProjectData &data)
 
 void MainWindow::applyAudioState(const ProjectData &data)
 {
+    // US-601 defect fix: reopening normalized projects intentionally restores
+    // both export gain and playback normalization. Missing keys reset to OFF.
+    const double gainDb = data.loudnessSettings.value("loudnessGainDb").toDouble(0.0);
+    if (m_exporter) m_exporter->setLoudnessGainDb(gainDb);
+    if (m_renderQueue) m_renderQueue->setLoudnessGainDb(gainDb);
+    if (m_renderQueueDialog && m_renderQueueDialog->queue())
+        m_renderQueueDialog->queue()->setLoudnessGainDb(gainDb);
+    if (auto *mixer = m_player ? m_player->audioMixer() : nullptr) {
+        setProjectNormalizerAmount(mixer,
+            data.loudnessSettings.value("normalizerAmount").toDouble(0.0));
+        mixer->setNormalizerUniformity(0.5);
+    }
     if (auto *mixer = m_player ? m_player->audioMixer() : nullptr) {
         // Project audio FX are not part of TimelineState/Undo.
         mixer->clearTrackFx();
@@ -13109,8 +13132,9 @@ void MainWindow::generateProxies()
 void MainWindow::openLoudnessSettings()
 {
     QSettings prefs("VSimpleEditor", "Preferences");
-    const double initAmount =
-        prefs.value("audio/normalizerAmount", 0.0).toDouble();
+    const auto *projectMixer = m_player ? m_player->audioMixer() : nullptr;
+    const double initAmount = projectMixer
+        ? projectMixer->property("projectNormalizerAmount").toDouble() : 0.0;
     const double initUniformity =
         prefs.value("audio/normalizerUniformity", 0.5).toDouble();
 
@@ -13158,7 +13182,7 @@ void MainWindow::openLoudnessSettings()
 
     auto pushAmount = [mixer, amountValue](int v) {
         amountValue->setText(QString::number(v) + " %");
-        if (mixer) mixer->setNormalizerAmount(v / 100.0);
+        if (mixer) setProjectNormalizerAmount(mixer, v / 100.0);
     };
     auto pushUniformity = [mixer, uniformValue](int v) {
         uniformValue->setText(QString::number(v) + " %");
@@ -13179,14 +13203,14 @@ void MainWindow::openLoudnessSettings()
         prefs.setValue("audio/normalizerAmount", amount);
         prefs.setValue("audio/normalizerUniformity", uniformity);
         if (mixer) {
-            mixer->setNormalizerAmount(amount);
+            setProjectNormalizerAmount(mixer, amount);
             mixer->setNormalizerUniformity(uniformity);
         }
     } else {
         // Cancel restores the original values (they were live-applied during
         // slider drag).
         if (mixer) {
-            mixer->setNormalizerAmount(initAmount);
+            setProjectNormalizerAmount(mixer, initAmount);
             mixer->setNormalizerUniformity(initUniformity);
         }
     }
@@ -20527,7 +20551,7 @@ void MainWindow::applyLoudnessNormalize(double targetLUFS, double gainDb)
         // Set the master loudness normalizer target.
         // The normalizer amount controls how much of the target gain is applied.
         const double amount = (gainDb != 0.0) ? 1.0 : 0.0;
-        mixer->setNormalizerAmount(amount);
+        setProjectNormalizerAmount(mixer, amount);
         mixer->setNormalizerUniformity(0.5);
     }
 
