@@ -3,6 +3,7 @@
 #include "VideoEffect.h"
 
 #include <QAbstractItemView>
+#include <QAction>
 #include <QBrush>
 #include <QComboBox>
 #include <QFontMetrics>
@@ -12,6 +13,8 @@
 #include <QListWidget>
 #include <QListWidgetItem>
 #include <QMouseEvent>
+#include <QMenu>
+#include <QToolButton>
 #include <QPainter>
 #include <QPainterPath>
 #include <QPushButton>
@@ -282,6 +285,22 @@ public:
         update();
     }
 
+    GraphEditorPanel *panel() const
+    {
+        for (QWidget *widget = parentWidget(); widget; widget = widget->parentWidget()) {
+            if (auto *owner = qobject_cast<GraphEditorPanel *>(widget))
+                return owner;
+        }
+        return nullptr;
+    }
+
+    bool isCopySelected(int curve, int key) const
+    {
+        const auto *owner = panel();
+        return owner && owner->m_keyframeSelectionProperty == m_curves[curve].propertyName
+            && owner->m_selectedKeyframeIndices.contains(key);
+    }
+
     bool hasSelectedKeyframe() const
     {
         return m_selectedCurveIndex >= 0
@@ -466,7 +485,7 @@ protected:
                     painter.setPen(QPen(palette().color(QPalette::Window), 1));
                 }
 
-                if (i == m_selectedCurveIndex && k == m_selectedKeyframeIndex) {
+                if (isCopySelected(i, k) || (i == m_selectedCurveIndex && k == m_selectedKeyframeIndex)) {
                     painter.setBrush(Qt::NoBrush);
                     painter.setPen(QPen(palette().color(QPalette::HighlightedText), 1.3));
                     painter.drawEllipse(QPointF(kx, ky), 9, 9);
@@ -513,6 +532,29 @@ protected:
         if (hit.kind == DragKind::None) {
             QWidget::mousePressEvent(event);
             return;
+        }
+
+        if (hit.kind == DragKind::Keyframe) {
+            if (auto *owner = panel()) {
+                const QString property = m_curves[hit.curveIndex].propertyName;
+                QVector<int> indices;
+                const bool extend = event->modifiers().testFlag(Qt::ControlModifier)
+                    || event->modifiers().testFlag(Qt::ShiftModifier);
+                if (extend && owner->m_keyframeSelectionProperty == property)
+                    indices = owner->m_selectedKeyframeIndices;
+                if (indices.contains(hit.keyframeIndex))
+                    indices.removeOne(hit.keyframeIndex);
+                else
+                    indices.append(hit.keyframeIndex);
+                owner->selectKeyframes(property, indices);
+                if (extend) {
+                    m_selectedCurveIndex = -1;
+                    m_selectedKeyframeIndex = -1;
+                    event->accept();
+                    update();
+                    return;
+                }
+            }
         }
 
         if (m_graphMode == GraphMode::Speed) {
@@ -1224,12 +1266,31 @@ GraphEditorPanel::GraphEditorPanel(QWidget *parent)
     splitter->setStretchFactor(1, 1);
     layout->addWidget(splitter, 1);
 
+    auto *clipboardButton = new QToolButton(root);
+    clipboardButton->setText(QStringLiteral("キーフレーム編集"));
+    clipboardButton->setPopupMode(QToolButton::InstantPopup);
+    auto *clipboardMenu = new QMenu(clipboardButton);
+    auto *copyAction = clipboardMenu->addAction(QStringLiteral("選択キーフレームをコピー"));
+    auto *pasteAction = clipboardMenu->addAction(QStringLiteral("再生ヘッド位置にキーフレームを貼り付け"));
+    connect(copyAction, &QAction::triggered, this, [this]() { copySelectedKeyframes(); });
+    connect(pasteAction, &QAction::triggered, this, [this]() { pasteKeyframes(); });
+    connect(clipboardMenu, &QMenu::aboutToShow, this, [this, copyAction, pasteAction]() {
+        copyAction->setEnabled(!m_selectedKeyframeIndices.isEmpty());
+        pasteAction->setEnabled(!s_keyframeClipboard.isEmpty() && !m_tracks.isEmpty());
+    });
+    clipboardButton->setMenu(clipboardMenu);
+    clipboardButton->setToolTip(QStringLiteral("Ctrl／Shift クリックで同じパラメータのキーを複数選択。貼り付け先はトラック一覧で選択します。"));
+    layout->addWidget(clipboardButton);
     setWidget(root);
     showEmptyState(QStringLiteral("No clip selected"));
 }
 
 void GraphEditorPanel::setTimeline(Timeline *timeline)
 {
+    if (m_timeline != timeline) {
+        m_selectedKeyframeIndices.clear();
+        m_keyframeSelectionProperty.clear();
+    }
     m_timeline = timeline;
     m_playheadSeconds = m_timeline ? m_timeline->playheadPosition() : 0.0;
     rebuildForSelection();
@@ -1237,6 +1298,10 @@ void GraphEditorPanel::setTimeline(Timeline *timeline)
 
 void GraphEditorPanel::setSelectedClip(int trackIdx, int clipIdx)
 {
+    if (m_trackIdx != trackIdx || m_clipIdx != clipIdx) {
+        m_selectedKeyframeIndices.clear();
+        m_keyframeSelectionProperty.clear();
+    }
     m_trackIdx = trackIdx;
     m_clipIdx = clipIdx;
     rebuildForSelection();
@@ -1395,4 +1460,76 @@ void GraphEditorPanel::syncLoopOutControl()
     const int index = m_loopOutCombo->findData(static_cast<int>(mode));
     m_loopOutCombo->setCurrentIndex(index >= 0 ? index : 0);
     m_loopOutCombo->setEnabled(hasSelectedTrack);
+}
+
+QVector<KeyframePoint> GraphEditorPanel::s_keyframeClipboard;
+QString GraphEditorPanel::s_clipboardSourceProperty;
+
+bool GraphEditorPanel::selectKeyframes(const QString &property, const QVector<int> &indices)
+{
+    for (int row = 0; row < m_tracks.size(); ++row) {
+        if (m_tracks[row].propertyName != property)
+            continue;
+        for (int index : indices) {
+            if (index < 0 || index >= m_tracks[row].track.count())
+                return false;
+        }
+        m_keyframeSelectionProperty = property;
+        m_selectedKeyframeIndices = indices;
+        std::sort(m_selectedKeyframeIndices.begin(), m_selectedKeyframeIndices.end());
+        m_selectedKeyframeIndices.erase(std::unique(m_selectedKeyframeIndices.begin(),
+            m_selectedKeyframeIndices.end()), m_selectedKeyframeIndices.end());
+        m_trackList->setCurrentRow(row);
+        m_curveView->update();
+        return true;
+    }
+    return false;
+}
+
+bool GraphEditorPanel::copySelectedKeyframes()
+{
+    for (const auto &curve : m_tracks) {
+        if (curve.propertyName != m_keyframeSelectionProperty)
+            continue;
+        QVector<KeyframePoint> points;
+        for (int index : m_selectedKeyframeIndices) {
+            if (index < 0 || index >= curve.track.count())
+                return false;
+            points.append(curve.track.keyframes()[index]);
+        }
+        if (points.isEmpty())
+            return false;
+        s_keyframeClipboard = points;
+        s_clipboardSourceProperty = curve.propertyName;
+        return true;
+    }
+    return false;
+}
+
+bool GraphEditorPanel::pasteKeyframes()
+{
+    if (!m_timeline || s_keyframeClipboard.isEmpty())
+        return false;
+    auto *track = m_timeline->videoTracks().value(m_trackIdx, nullptr);
+    if (!track || m_clipIdx < 0 || m_clipIdx >= track->clips().size())
+        return false;
+    const auto clip = track->clips()[m_clipIdx];
+    auto manager = clip.keyframes;
+    auto *destination = manager.track(m_selectedProperty);
+    if (!destination)
+        return false;
+    // Preserve relative times, including beyond the clip end. Only the anchor
+    // is bounded at the clip start; values retain the existing evaluation rules.
+    const double anchor = qMax(0.0, m_playheadSeconds - m_clipStartSeconds);
+    const double shift = anchor - s_keyframeClipboard.first().time;
+    for (auto point : s_keyframeClipboard) {
+        point.time += shift;
+        destination->addKeyframe(point.time, point.value, point.interpolation,
+            point.bezX1, point.bezY1, point.bezX2, point.bezY2,
+            point.hasSpatialTangent, point.spatialOutX, point.spatialOutY,
+            point.spatialInX, point.spatialInY);
+    }
+    m_timeline->setClipEffectsAndKeyframes(m_trackIdx, m_clipIdx, clip.effects, manager);
+    rebuildForSelection();
+    return true;
 }

@@ -28,6 +28,9 @@ public:
     explicit GraphEditorPanel(QWidget *parent = nullptr);
 
     void setTimeline(Timeline *timeline);
+    bool selectKeyframes(const QString &property, const QVector<int> &indices);
+    bool copySelectedKeyframes();
+    bool pasteKeyframes();
 
 public slots:
     void setSelectedClip(int trackIdx, int clipIdx);
@@ -35,6 +38,12 @@ public slots:
     void refreshFromTimeline();
 
 private:
+    friend class GraphEditorCurveView;
+    QVector<int> m_selectedKeyframeIndices;
+    QString m_keyframeSelectionProperty;
+    static QVector<KeyframePoint> s_keyframeClipboard;
+    static QString s_clipboardSourceProperty;
+
     void rebuildForSelection();
     void showEmptyState(const QString &message);
     void syncLoopOutControl();

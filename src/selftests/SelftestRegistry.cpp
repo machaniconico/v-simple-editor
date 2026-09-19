@@ -134,6 +134,7 @@ int runImportSelftest();
 int runInstagramSelftest();
 int runKeyersSelftest();
 int runKeyframeAnimParitySelftest();
+int runKeyframeCopySelftest();
 int runKeyframeLoopSelftest();
 int runKeywordBinsSelftest();
 int runLayerStyleSelftest();
@@ -791,6 +792,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Deterministic acceptance-lane render/audio dump (G1-G3; VEDITOR_RENDER_FIXTURE_OUT required)" },
     { "parity",            "VEDITOR_PARITY_SELFTEST",             runParitySelftest,             true,
       "Preview vs export pixel-parity (S1-S11, framediff::mse, 10-bit HDR10)" },
+    { "keyframe-copy", "VEDITOR_KEYFRAME_COPY_SELFTEST", runKeyframeCopySelftest, true,
+      "Graph editor keyframe clipboard: payload, cross-clip paste, collision and undo (4 gates)" },
     { "keyframe-anim-parity", "VEDITOR_KEYFRAME_ANIM_PARITY_SELFTEST", runKeyframeAnimParitySelftest, true,
       "Render-time per-clip motion/opacity keyframe evaluation parity (5 gates, byte-identical no-keyframe guard)" },
     { "motion-blur-p2", "VEDITOR_MOTION_BLUR_P2_SELFTEST", runMotionBlurP2Selftest, true,
