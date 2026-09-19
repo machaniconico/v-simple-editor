@@ -4086,16 +4086,25 @@ void McpEditorTools::registerWriteTools()
                 Timeline *currentTimeline = timeline();
                 if (!readClipTarget(args, m_window, currentTimeline, &target, err)) return {};
                 const bool enabled = args.value(QStringLiteral("enabled")).toBool();
+                UndoManager *undoManager = currentTimeline->undoManager();
+                const quint64 undoSerialBefore = undoManager
+                    ? undoManager->saveSerial() : 0;
                 if (!currentTimeline->setClipEnabled(target.audio ? TrackKind::Audio : TrackKind::Video,
                         target.trackIndex, target.clipIndex, enabled))
                     return setError(err, QStringLiteral("clip is locked or is a Null Object")), QJsonObject();
+                const quint64 undoSerialAfter = undoManager
+                    ? undoManager->saveSerial() : 0;
+                const bool undoRecorded = undoManager
+                    && undoSerialAfter > undoSerialBefore;
                 syncSelectionAfterEdit();
-                return QJsonObject{{QStringLiteral("ok"), true}, {QStringLiteral("enabled"), enabled}};
+                return QJsonObject{{QStringLiteral("ok"), true}, {QStringLiteral("enabled"), enabled},
+                                   {QStringLiteral("undoRecorded"), undoRecorded}};
             })
     }, schemaWithRequired(QJsonObject{
         {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
-        {QStringLiteral("enabled"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}}
-    }, {QStringLiteral("ok"), QStringLiteral("enabled")})));
+        {QStringLiteral("enabled"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("undoRecorded"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}}
+    }, {QStringLiteral("ok"), QStringLiteral("enabled"), QStringLiteral("undoRecorded")})));
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("set_clip_label"),
