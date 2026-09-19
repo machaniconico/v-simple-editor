@@ -279,6 +279,11 @@ struct ClipInfo {
     // OFF and omitted from project JSON; renderFrameAt mirrors GLPreview's
     // HSL mask + secondary LGG math before the primary grade.
     HslSecondaryGrade hslSecondary;
+    QVector<WarpPin> puppetPins; // UV positions; radius / shorter frame side. Empty = disabled.
+    bool hasPuppetPins() const
+    {
+        return !isAdjustment && !puppetPins.isEmpty() && !puppetpin::disabledForTesting.load();
+    }
     // Source-relative coordinates; (1, 1) is the source width/height.
     MeshGrid meshWarp;
     bool hasMeshWarp() const;
@@ -1035,6 +1040,9 @@ public:
     void setClipLayerMaterial(int trackIdx, int clipIdx,
                               const LayerMaterial &material,
                               bool recordUndo = false);
+    // Normalized pins; preview is temporary, set records one undo entry.
+    void setClipPuppetPins(int trackIdx, int clipIdx, const QVector<WarpPin> &pins);
+    void previewClipPuppetPins(int trackIdx, int clipIdx, const QVector<WarpPin> &pins);
     // Normalized source mesh; one undo entry per changed grid.
     void setClipMeshWarp(int trackIdx, int clipIdx, const MeshGrid &grid);
     void previewClipMeshWarp(int trackIdx, int clipIdx, const MeshGrid &grid);

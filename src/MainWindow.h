@@ -2,6 +2,7 @@
 
 #include <QMainWindow>
 class MeshEditTool;
+class PuppetPinTool;
 #include <QMenuBar>
 #include <QActionGroup>  // WS-3: ワークスペース切替アクションの排他グループ
 #include <QToolBar>
@@ -739,6 +740,7 @@ private:
     void updateTitle();
     void populateProjectData(ProjectData &data);
     void stopMeshEditTool();
+    void stopPuppetPinTool();
     void applyLoadedProjectData(const ProjectData &data, const QString &filePath);
     bool relinkMediaPaths(const QHash<QString, QString> &oldToNew,
                           QString *errorOut = nullptr);
@@ -856,6 +858,8 @@ private:
     quint64 m_projectCameraUndoSaveSerial = 0;
     QVector<Light3D> m_projectLights;                         // project-level 3D lights
     QPointer<Light3DDialog> m_light3DDialog;
+    QPointer<PuppetPinTool> m_puppetPinTool;
+    QPointer<QAction> m_puppetPinAction;
     QPointer<MeshEditTool> m_meshEditTool;
     QPointer<QAction> m_meshEditAction;
     int m_selectedVideoTrackIndex = -1;

@@ -106,7 +106,7 @@ QImage prepareClipForCpuComposite(
 {
     const QImage effected = (tlrender::hasActiveEcho(clip, clipLocalSeconds)
         || tlrender::hasActiveRollingShutter(clip, clipLocalSeconds)
-        || tlrender::hasActiveMeshWarp(clip))
+        || tlrender::hasActiveMeshWarp(clip) || clip.hasPuppetPins())
         ? tlrender::applyClipFxStackWithEchoFromSource(
               source, clip, clipLocalSeconds, sourceSeconds, frameProvider)
         : tlrender::applyClipFxStackFromSource(
@@ -170,7 +170,8 @@ QImage VideoPlayer::composeCpuPreviewForTest(
         clipanim::effectiveEffectsAt(v1Clip, clipLocalSeconds);
     const QVector<VideoEffect> v2Effects =
         clipanim::effectiveEffectsAt(v2Clip, clipLocalSeconds);
-    if (!tlrender::hasActiveMeshWarp(v1Clip)
+    if (!v1Clip.hasPuppetPins() && !v2Clip.hasPuppetPins()
+        && !tlrender::hasActiveMeshWarp(v1Clip)
         && !tlrender::hasActiveMeshWarp(v2Clip)
         && !videopreview::stackRequiresClipLocalCpu(v1Effects)
         && !videopreview::stackRequiresClipLocalCpu(v2Effects)) {
@@ -3961,7 +3962,7 @@ bool VideoPlayer::hasClipLocalCpuFxAt(qint64 timelineUsec) const
                     effectivePreviewEffectsAt(
                         m_fullPreviewEffects, timeline, m_sequence,
                         timelineUsec, previewTarget);
-                if (tlrender::hasActiveMeshWarp(*clip)
+                if (clip->hasPuppetPins() || tlrender::hasActiveMeshWarp(*clip)
                     || videopreview::stackRequiresClipLocalCpu(
                         evaluated, gpuAvailable)) {
                     return true;
@@ -3980,7 +3981,7 @@ bool VideoPlayer::hasClipLocalCpuFxAt(qint64 timelineUsec) const
             continue;
         const QVector<VideoEffect> evaluated = clipanim::effectiveEffectsAt(
             *clip, entryClipLocalSeconds(entry, timelineUsec));
-        if (tlrender::hasActiveMeshWarp(*clip)
+        if (clip->hasPuppetPins() || tlrender::hasActiveMeshWarp(*clip)
             || videopreview::stackRequiresClipLocalCpu(
                 evaluated, gpuAvailable)) {
             return true;

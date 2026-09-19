@@ -1,4 +1,5 @@
 #include "MeshEditTool.h"
+#include "PuppetPinTool.h"
 #include "libavcore/FrameGrab.h"
 #include "RenderInPlace.h"
 #include "MainWindow.h"
@@ -6581,6 +6582,52 @@ void MainWindow::setupMenuBar()
     addArrangementAction(distributeMenu, QStringLiteral("水平"), Arrangement::DistributeHorizontal);
     addArrangementAction(distributeMenu, QStringLiteral("垂直"), Arrangement::DistributeVertical);
 
+    auto *puppetPinAction = compMenu->addAction(QStringLiteral("パペットピンを編集"));
+    puppetPinAction->setCheckable(true);
+    m_puppetPinAction = puppetPinAction;
+    connect(puppetPinAction, &QAction::triggered, this,
+            [this, puppetPinAction](bool checked) {
+        if (!checked) { stopPuppetPinTool(); return; }
+        int trackIdx = -1, clipIdx = -1;
+        if (!selectedVideoClipRef(trackIdx, clipIdx)
+            || !m_timeline->videoTracks()[trackIdx]->isClipSelected(clipIdx)) {
+            puppetPinAction->setChecked(false);
+            QMessageBox::information(this, QStringLiteral("パペットピン"),
+                                     QStringLiteral("映像クリップを選択してください。"));
+            return;
+        }
+        if (!m_player || !m_player->glPreview()
+            || m_timeline->videoTracks()[trackIdx]->isLocked()) {
+            puppetPinAction->setChecked(false);
+            return;
+        }
+        stopMeshEditTool();
+        auto *tool = new PuppetPinTool(m_timeline, trackIdx, clipIdx, this);
+        m_puppetPinTool = tool;
+        tool->setViewRect(m_player->glPreview()->letterboxRect());
+        connect(tool, &PuppetPinTool::previewChanged, this, [this]() {
+            refreshSpecialClipPreview();
+            if (m_player && m_player->glPreview()) m_player->glPreview()->update();
+        });
+        m_player->glPreview()->installSurfaceTool(tool);
+    });
+    connect(m_timeline, &Timeline::clipSelectedOnTrack, this,
+            [this](int, int) { stopPuppetPinTool(); });
+
+    connect(m_timeline, &Timeline::sequenceChanged, this, [this]() {
+        if (m_puppetPinTool && !m_puppetPinTool->isEnabled()) stopPuppetPinTool();
+    });
+
+    auto *puppetResetAction = compMenu->addAction(QStringLiteral("パペットピンをリセット"));
+    connect(puppetResetAction, &QAction::triggered, this, [this]() {
+        int trackIdx = -1, clipIdx = -1;
+        if (!selectedVideoClipRef(trackIdx, clipIdx)
+            || !m_timeline->videoTracks()[trackIdx]->isClipSelected(clipIdx)) return;
+        stopPuppetPinTool();
+        m_timeline->setClipPuppetPins(trackIdx, clipIdx, {});
+        refreshSpecialClipPreview();
+    });
+
     auto *meshEditAction = compMenu->addAction(QStringLiteral("メッシュワープを編集"));
     meshEditAction->setCheckable(true);
     m_meshEditAction = meshEditAction;
@@ -6600,6 +6647,7 @@ void MainWindow::setupMenuBar()
             meshEditAction->setChecked(false);
             return;
         }
+        stopPuppetPinTool();
         auto *tool = new MeshEditTool(m_timeline, trackIdx, clipIdx, this);
         m_meshEditTool = tool;
         tool->setViewRect(m_player->glPreview()->letterboxRect());
@@ -9072,6 +9120,20 @@ void MainWindow::applyVfxProjectState(const ProjectVfxState &state)
                                   state.lightWrap.radius);
 }
 
+void MainWindow::stopPuppetPinTool()
+{
+    if (m_puppetPinTool) {
+        m_puppetPinTool->cancelDrag();
+        m_puppetPinTool->setEnabled(false);
+        if (m_player && m_player->glPreview())
+            m_player->glPreview()->installSurfaceTool(nullptr);
+        m_puppetPinTool->deleteLater();
+        m_puppetPinTool = nullptr;
+    }
+    if (m_puppetPinAction)
+        m_puppetPinAction->setChecked(false);
+}
+
 void MainWindow::stopMeshEditTool()
 {
     if (m_meshEditTool) {
@@ -9103,6 +9165,7 @@ void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
     if (m_light3DDialog)
         m_light3DDialog->close();
     stopMeshEditTool();
+    stopPuppetPinTool();
     m_projectFilePath = filePath;
     if (m_recentFilesManager && !filePath.isEmpty())
         m_recentFilesManager->addFile(filePath);
@@ -9649,6 +9712,7 @@ void MainWindow::newProject()
     ProjectSettingsDialog dialog(this);
     if (dialog.exec() == QDialog::Accepted) {
         stopMeshEditTool();
+        stopPuppetPinTool();
         applyAudioState(ProjectData{});
         if (m_light3DDialog)
             m_light3DDialog->close();

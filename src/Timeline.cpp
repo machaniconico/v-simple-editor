@@ -9689,6 +9689,36 @@ bool ClipInfo::hasMeshWarp() const
     return changed;
 }
 
+void Timeline::setClipPuppetPins(int trackIdx, int clipIdx, const QVector<WarpPin> &pins)
+{
+    if (trackIdx < 0 || trackIdx >= m_videoTracks.size()) return;
+    auto *track = m_videoTracks[trackIdx];
+    if (!track || track->isLocked()) return;
+    auto clips = track->clips();
+    if (clipIdx < 0 || clipIdx >= clips.size()) return;
+    if (puppetpin::equal(clips[clipIdx].puppetPins, pins)) return;
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    clips[clipIdx].puppetPins = pins;
+    track->setClips(clips);
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+    saveUndoState(QStringLiteral("パペットピン"));
+    refreshPlaybackSequence();
+}
+
+// Drag preview only; the tool restores its baseline before the undoable commit.
+void Timeline::previewClipPuppetPins(int trackIdx, int clipIdx, const QVector<WarpPin> &pins)
+{
+    if (trackIdx < 0 || trackIdx >= m_videoTracks.size()) return;
+    auto *track = m_videoTracks[trackIdx];
+    if (!track || track->isLocked()) return;
+    auto clips = track->clips();
+    if (clipIdx < 0 || clipIdx >= clips.size()) return;
+    clips[clipIdx].puppetPins = pins;
+    track->setClips(clips);
+    refreshPlaybackSequence();
+}
+
 void Timeline::setClipMeshWarp(int trackIdx, int clipIdx, const MeshGrid &grid)
 {
     if (trackIdx < 0 || trackIdx >= m_videoTracks.size()) return;

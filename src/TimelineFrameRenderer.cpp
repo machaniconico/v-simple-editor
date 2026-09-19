@@ -821,8 +821,11 @@ std::atomic<quint64> meshWarpCalls{0};
 
 QImage applyClipMeshWarp(const QImage &source, const ClipInfo &clip)
 {
+    const auto puppet = [&](const QImage &frame) {
+        return clip.hasPuppetPins() ? puppetpin::applyNormalized(frame, clip.puppetPins) : frame;
+    };
     if (source.isNull() || !hasActiveMeshWarp(clip))
-        return source;
+        return puppet(source);
     MeshGrid pixels = clip.meshWarp;
     for (auto &row : pixels.controlPoints)
         for (QPointF &point : row) {
@@ -830,7 +833,7 @@ QImage applyClipMeshWarp(const QImage &source, const ClipInfo &clip)
             point.setY(point.y() * source.height());
         }
     ++meshWarpCalls;
-    return WarpDistortion::applyMeshWarp(source, pixels).convertToFormat(source.format());
+    return puppet(WarpDistortion::applyMeshWarp(source, pixels).convertToFormat(source.format()));
 }
 } // namespace
 

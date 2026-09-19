@@ -1937,6 +1937,11 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
         obj["colorCorrection"] = colorCorrectionToJson(clip.colorCorrection);
     if (clip.colorCurves.hasCurves())
         obj["colorCurves"] = clipCurvesToJson(clip.colorCurves);
+    if (!clip.puppetPins.isEmpty()) {
+        QJsonArray pins;
+        for (const auto &pin : clip.puppetPins) pins.append(pin.toJson());
+        obj["puppetPins"] = pins;
+    }
     if (clip.hasMeshWarp())
         obj["meshWarp"] = clip.meshWarp.toJson();
     if (!clip.hslSecondary.isDefault())
@@ -2056,6 +2061,16 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
         clip.colorCorrection = colorCorrectionFromJson(obj["colorCorrection"].toObject());
     if (obj.contains("colorCurves"))
         clip.colorCurves = clipCurvesFromJson(obj["colorCurves"].toObject());
+    for (const auto &value : obj["puppetPins"].toArray()) {
+        const WarpPin pin = WarpPin::fromJson(value.toObject());
+        const auto validUv = [](const QPointF &p) {
+            return p.x() >= 0.0 && p.x() <= 1.0 && p.y() >= 0.0 && p.y() <= 1.0;
+        };
+        if (validUv(pin.originalPos) && validUv(pin.deformedPos)
+            && pin.radius > 0.0 && pin.radius <= 2.0
+            && pin.stiffness >= 0.0 && pin.stiffness <= 1.0)
+            clip.puppetPins.append(pin);
+    }
     if (obj.contains("meshWarp"))
         clip.meshWarp = MeshGrid::fromJson(obj["meshWarp"].toObject());
     if (obj.contains("hslSecondary"))
