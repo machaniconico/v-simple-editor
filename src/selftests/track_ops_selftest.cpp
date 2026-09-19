@@ -8,10 +8,14 @@
 #include <memory>
 
 #include <QCoreApplication>
+#include <QApplication>
+#include <QComboBox>
+#include <QDialog>
 #include <QEvent>
 #include <QLabel>
 #include <QPointer>
 #include <QSignalSpy>
+#include <QTimer>
 #include <QVBoxLayout>
 #include <cstdio>
 
@@ -395,6 +399,88 @@ int runTrackOpsSelftest()
         gate(10, ok && t.videoTrackCount() == 2
             && t.currentState().projectWidth == 1080
             && t.currentState().projectHeight == 1920);
+    }
+    {
+        MainWindow window;
+        auto *t = window.findChild<Timeline *>();
+        bool ok = t != nullptr;
+        if (t) {
+            const QVector<QVector<ClipInfo>> video{{clip(0), clip(1)}, {clip(2)}};
+            const QVector<QVector<ClipInfo>> audio{{}};
+            t->restoreFromProject(video, audio, 0.0, -1.0, -1.0, 100);
+            baseline(*t);
+            t->restoreState(t->currentState());
+            t->videoTracks()[0]->setSelectedClip(1);
+            const auto serial = t->undoManager()->saveSerial();
+            bool configured = false;
+            QTimer::singleShot(0, &window, [&]() {
+                auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
+                if (!dialog) return;
+                const auto combos = dialog->findChildren<QComboBox *>();
+                if (combos.size() == 2) {
+                    const int type = combos[0]->findData(int(TrackMatteType::AlphaMatte));
+                    const int source = combos[1]->findData(QStringLiteral("1:0"));
+                    configured = type >= 0 && source >= 0;
+                    if (configured) {
+                        combos[0]->setCurrentIndex(type);
+                        combos[1]->setCurrentIndex(source);
+                    }
+                }
+                dialog->done(configured ? QDialog::Accepted : QDialog::Rejected);
+            });
+            ok = QMetaObject::invokeMethod(&window, "configureTrackMatte", Qt::DirectConnection) && ok;
+            const auto hasMatte = [&]() {
+                const auto entries = t->trackMatteEntries();
+                return entries.size() == 1 && entries.contains(QStringLiteral("0:1"))
+                    && entries.value(QStringLiteral("0:1")).matteType == TrackMatteType::AlphaMatte
+                    && entries.value(QStringLiteral("0:1")).matteSourceClipId == QStringLiteral("1:0");
+            };
+            // No baseline/restore/save after the dialog: capture must preserve
+            // the unrecorded matte edit, including its reference to deleted V2.
+            ok = ok && configured && hasMatte() && t->undoManager()->saveSerial() == serial;
+            ok = t->removeTrack(false, 1) && ok && t->trackMatteEntries().isEmpty();
+            t->undo();
+            ok = ok && t->videoTrackCount() == 2 && hasMatte() && !t->canUndo();
+            t->redo();
+            ok = ok && t->videoTrackCount() == 1 && t->trackMatteEntries().isEmpty();
+            t->undo();
+            ok = ok && hasMatte();
+        }
+        gate(11, ok);
+    }
+    {
+        Timeline t;
+        auto mixer = std::make_unique<AudioMixer>();
+        int applied = 0;
+        t.setExternalTrackStateHooks([&]() { return mixer->collectTrackState(); },
+            [&](const QJsonObject &state) { ++applied; mixer->applyTrackState(state); });
+        t.setProjectOutputConfig(1920, 1080, false);
+        baseline(t);
+        trackfx::Chain chain;
+        chain.eqEnabled = true;
+        chain.eq.low.gainDb = 3.0;
+        mixer->setTrackChain(0, chain);
+        mixer->setTrackSolo(0, true);
+        mixer->setTrackGain(0, 0.4);
+        const auto live = mixer->collectTrackState();
+        const auto serial = t.undoManager()->saveSerial();
+        t.captureExternalTrackStateForCompoundEdit();
+        bool ok = t.undoManager()->saveSerial() == serial && !t.canUndo();
+        t.setProjectOutputConfig(1080, 1920, true);
+        t.addVideoTrack(false);
+        t.undoManager()->saveState(t.currentState(), QStringLiteral("Apply SNS preset"));
+        ok = ok && t.videoTrackCount() == 2 && t.undoManager()->saveSerial() == serial + 1;
+        t.undo();
+        ok = ok && applied == 1 && mixer->collectTrackState() == live
+            && t.videoTrackCount() == 1 && !t.canUndo()
+            && t.currentState().projectWidth == 1920
+            && t.currentState().projectHeight == 1080
+            && !t.currentState().projectExplicitOutput;
+        t.redo();
+        gate(12, ok && applied == 2 && mixer->collectTrackState() == live
+            && t.videoTrackCount() == 2 && t.currentState().projectWidth == 1080
+            && t.currentState().projectHeight == 1920
+            && t.currentState().projectExplicitOutput);
     }
     std::fprintf(stderr, "[track-ops] summary: %d PASS, %d FAIL\n", passed, failed);
     return failed;

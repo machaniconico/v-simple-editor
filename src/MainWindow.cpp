@@ -9190,6 +9190,13 @@ QJsonObject MainWindow::collectExternalTrackState() const
     state["buses"] = m_audioBusRouting.toJson();
     // Timeline playback flags (muted/solo/hidden) are not undoable.
     state["adjustments"] = adjustmentLayersToJsonArray(m_timeline->adjustmentLayers());
+    // Capture live carrier references, including matte edits without an undo entry.
+    QJsonArray mattes;
+    const auto entries = m_timeline->trackMatteEntries();
+    for (auto it = entries.cbegin(); it != entries.cend(); ++it)
+        mattes.append(QJsonObject{{"clipId", it.key()},
+            {"source", it.value().matteSourceClipId}, {"type", int(it.value().matteType)}});
+    state["mattes"] = mattes;
     // The live particle owner is keyed by media path, not row. ProjectFile
     // provides the canonical config serializer and captures row references.
     ProjectData particles;
@@ -9218,6 +9225,18 @@ void MainWindow::applyExternalTrackState(const QJsonObject &state)
     m_audioBusRouting.fromJson(state.value("buses").toObject());
     if (auto *mixer = m_timeline->audioMixer()) mixer->setBusRouting(m_audioBusRouting);
     m_timeline->setAdjustmentLayers(adjustmentLayersFromJsonArray(state.value("adjustments").toArray()));
+    if (state.contains("mattes")) {
+        m_trackMatteClipEntries.clear();
+        for (const auto &value : state.value("mattes").toArray()) {
+            const auto obj = value.toObject();
+            TrackMatteClipEntry entry;
+            entry.clipId = obj.value("clipId").toString();
+            entry.matteSourceClipId = obj.value("source").toString();
+            entry.matteType = static_cast<TrackMatteType>(obj.value("type").toInt());
+            m_trackMatteClipEntries.insert(entry.clipId, entry);
+        }
+        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+    }
     ProjectData particles;
     if (ProjectFile::fromJsonString(state.value("particles").toString(), particles)) {
         m_particleClipConfigs.clear();
@@ -15782,6 +15801,8 @@ void MainWindow::openSocialExportDialog()
                         return;
                     }
 
+                    if (m_timeline)
+                        m_timeline->captureExternalTrackStateForCompoundEdit();
                     ProjectConfig config = m_projectConfig;
                     config.width = targetSize.width();
                     config.height = targetSize.height();

@@ -816,6 +816,8 @@ public:
     // External index owners participate in the same undo transaction.
     void setExternalTrackStateHooks(std::function<QJsonObject()> collect,
                                     std::function<void(const QJsonObject&)> apply);
+    // Call once before a compound edit that changes tracks without recording undo.
+    void captureExternalTrackStateForCompoundEdit();
     // MCP の各変更ツールが、検証済みの 1 操作を正確な説明で記録するための入口。
     void saveUndoState(const QString &description);
 

@@ -11754,6 +11754,11 @@ void Timeline::setExternalTrackStateHooks(std::function<QJsonObject()> collect,
     captureExternalTrackState();
 }
 
+void Timeline::captureExternalTrackStateForCompoundEdit()
+{
+    captureExternalTrackState();
+}
+
 void Timeline::captureExternalTrackState()
 {
     if (m_collectExternalTrackState)
