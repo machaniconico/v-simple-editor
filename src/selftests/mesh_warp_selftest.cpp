@@ -1,3 +1,4 @@
+#include "../MeshEditTool.h"
 #include "../ProjectFile.h"
 #include "../Timeline.h"
 #include "../TimelineFrameRenderer.h"
@@ -205,6 +206,56 @@ int runMeshWarpSelftest()
     timeline.undo();
     undoOk &= sameGrid(moved, timeline.videoTracks()[0]->clips()[0].meshWarp);
     gate(5, undoOk);
+    // Exercise virtual dispatch without constructing GLPreview.
+    timeline.restoreFromProject(QVector<QVector<ClipInfo>>{{legacy.videoTracks.value(0).value(0)}},
+        QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 100);
+    const MeshGrid beforeDrag = timeline.videoTracks()[0]->clips()[0].meshWarp;
+    MeshEditTool meshTool(&timeline, 0, 0);
+    meshTool.setViewRect(QRectF(10, 20, 600, 300));
+    SurfaceTool *dispatch = &meshTool;
+    const QPoint handle(210, 120);
+    const quint64 dragSerial = timeline.undoManager()->saveSerial();
+    bool dragOk = meshTool.hitTest(handle) == 5
+        && meshTool.hitTest(handle + QPoint(7, 0)) == -1
+        && dispatch->handleMousePress(handle, Qt::LeftButton, Qt::NoModifier)
+        && dispatch->handleMouseMove(handle + QPoint(40, 0), Qt::NoModifier);
+    dragOk &= timeline.undoManager()->saveSerial() == dragSerial;
+    const MeshGrid duringDrag = timeline.videoTracks()[0]->clips()[0].meshWarp;
+    dragOk &= duringDrag.controlPoints.size() == 4;
+    if (duringDrag.controlPoints.size() == 4)
+        dragOk &= std::abs(duringDrag.controlPoints[1][1].x() - (1.0 / 3.0 + 40.0 / 600.0)) < 1e-9;
+    dragOk &= dispatch->handleMouseRelease(handle + QPoint(40, 0), Qt::LeftButton, Qt::NoModifier)
+        && timeline.undoManager()->saveSerial() == dragSerial + 1;
+    timeline.undo();
+    dragOk &= sameGrid(beforeDrag, timeline.videoTracks()[0]->clips()[0].meshWarp);
+    timeline.redo();
+    dragOk &= sameGrid(duringDrag, timeline.videoTracks()[0]->clips()[0].meshWarp);
+    // Cancellation restores the baseline without a second undo record.
+    dragOk &= dispatch->handleMousePress(handle + QPoint(40, 0), Qt::LeftButton, Qt::NoModifier)
+        && dispatch->handleMouseMove(handle + QPoint(60, 0), Qt::NoModifier);
+    meshTool.cancelDrag();
+    dragOk &= sameGrid(duringDrag, timeline.videoTracks()[0]->clips()[0].meshWarp)
+        && timeline.undoManager()->saveSerial() == dragSerial + 1;
+    gate(6, dragOk);
+
+    SurfaceTool corners(nullptr);
+    corners.setSourceSize(QSize(1000, 500));
+    corners.setViewRect(QRectF(10, 20, 600, 300));
+    corners.setEnabled(true);
+    SurfaceTool *pinDispatch = &corners;
+    int cornerSignals = 0;
+    QObject::connect(&corners, &SurfaceTool::cornersChanged, &corners,
+                     [&](const planartrack::Quad &) { ++cornerSignals; });
+    bool pinsOk = pinDispatch->hitTestCorner(QPoint(70, 50), QRectF(10, 20, 600, 300)) == 0
+        && pinDispatch->handleMousePress(QPoint(70, 50), Qt::LeftButton, Qt::NoModifier)
+        && pinDispatch->handleMouseMove(QPoint(130, 80), Qt::NoModifier)
+        && cornerSignals == 0
+        && pinDispatch->handleMouseRelease(QPoint(130, 80), Qt::LeftButton, Qt::NoModifier);
+    const auto quad = corners.currentQuad();
+    pinsOk &= cornerSignals == 1 && std::abs(quad.tl.x - 200.0) < 1e-9
+        && std::abs(quad.tl.y - 100.0) < 1e-9
+        && std::abs(quad.br.x - 900.0) < 1e-9 && std::abs(quad.br.y - 450.0) < 1e-9;
+    gate(7, pinsOk);
     tlrender::setMeshWarpDisabledForTesting(false);
     std::cerr << "summary: " << pass << " PASS, " << fail << " FAIL\n";
     return fail;

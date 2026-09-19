@@ -9227,6 +9227,19 @@ void Timeline::setClipMeshWarp(int trackIdx, int clipIdx, const MeshGrid &grid)
     refreshPlaybackSequence();
 }
 
+// Drag preview only; the tool restores its baseline before the undoable commit.
+void Timeline::previewClipMeshWarp(int trackIdx, int clipIdx, const MeshGrid &grid)
+{
+    if (trackIdx < 0 || trackIdx >= m_videoTracks.size()) return;
+    auto *track = m_videoTracks[trackIdx];
+    if (!track || track->isLocked()) return;
+    auto clips = track->clips();
+    if (clipIdx < 0 || clipIdx >= clips.size()) return;
+    clips[clipIdx].meshWarp = grid;
+    track->setClips(clips);
+    refreshPlaybackSequence();
+}
+
 void Timeline::resetClipMeshWarp(int trackIdx, int clipIdx, int rows, int cols)
 {
     if (rows < 2 || cols < 2) return;

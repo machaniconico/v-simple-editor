@@ -1001,6 +1001,7 @@ public:
                               bool recordUndo = false);
     // Normalized source mesh; one undo entry per changed grid.
     void setClipMeshWarp(int trackIdx, int clipIdx, const MeshGrid &grid);
+    void previewClipMeshWarp(int trackIdx, int clipIdx, const MeshGrid &grid);
     void resetClipMeshWarp(int trackIdx, int clipIdx, int rows, int cols);
     // Shape-clip UI edits shapes[0]. Live changes do not create undo entries.
     void setClipShapeModifiers(int trackIdx, int clipIdx,

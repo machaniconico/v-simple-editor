@@ -645,6 +645,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/ColorMatchLutGenerator.h
     src/SurfaceTool.cpp
     src/SurfaceTool.h
+    src/MeshEditTool.cpp
+    src/MeshEditTool.h
     src/EqualizerPanel.cpp
     src/EqualizerPanel.h
     src/CompressorPanel.cpp

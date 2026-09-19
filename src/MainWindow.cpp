@@ -1,3 +1,4 @@
+#include "MeshEditTool.h"
 #include "libavcore/FrameGrab.h"
 #include "RenderInPlace.h"
 #include "MainWindow.h"
@@ -6400,6 +6401,67 @@ void MainWindow::setupMenuBar()
 
     // コンポジション メニュー (After Effects風)
     auto *compMenu = menuBar()->addMenu("コンポジション(&C)");
+
+    auto *meshEditAction = compMenu->addAction(QStringLiteral("メッシュワープを編集"));
+    meshEditAction->setCheckable(true);
+    const auto stopMeshEdit = [this, meshEditAction]() {
+        if (m_meshEditTool) {
+            m_meshEditTool->cancelDrag();
+            m_meshEditTool->setEnabled(false);
+            if (m_player && m_player->glPreview())
+                m_player->glPreview()->installSurfaceTool(nullptr);
+            m_meshEditTool->deleteLater();
+            m_meshEditTool = nullptr;
+        }
+        meshEditAction->setChecked(false);
+    };
+    connect(meshEditAction, &QAction::triggered, this,
+            [this, meshEditAction, stopMeshEdit](bool checked) {
+        if (!checked) { stopMeshEdit(); return; }
+        int trackIdx = -1, clipIdx = -1;
+        if (!selectedVideoClipRef(trackIdx, clipIdx)
+            || !m_timeline->videoTracks()[trackIdx]->isClipSelected(clipIdx)) {
+            meshEditAction->setChecked(false);
+            QMessageBox::information(this, QStringLiteral("メッシュワープ"),
+                                     QStringLiteral("映像クリップを選択してください。"));
+            return;
+        }
+        if (!m_player || !m_player->glPreview()
+            || m_timeline->videoTracks()[trackIdx]->isLocked()) {
+            meshEditAction->setChecked(false);
+            return;
+        }
+        auto *tool = new MeshEditTool(m_timeline, trackIdx, clipIdx, this);
+        m_meshEditTool = tool;
+        tool->setViewRect(m_player->glPreview()->letterboxRect());
+        connect(tool, &MeshEditTool::previewChanged, this, [this]() {
+            refreshSpecialClipPreview();
+            if (m_player && m_player->glPreview()) m_player->glPreview()->update();
+        });
+        m_player->glPreview()->installSurfaceTool(tool);
+    });
+    connect(m_timeline, &Timeline::clipSelectedOnTrack, this,
+            [stopMeshEdit](int, int) { stopMeshEdit(); });
+
+    auto *meshResetAction = compMenu->addAction(QStringLiteral("メッシュワープをリセット…"));
+    connect(meshResetAction, &QAction::triggered, this, [this, stopMeshEdit]() {
+        int trackIdx = -1, clipIdx = -1;
+        if (!selectedVideoClipRef(trackIdx, clipIdx)
+            || !m_timeline->videoTracks()[trackIdx]->isClipSelected(clipIdx)) {
+            QMessageBox::information(this, QStringLiteral("メッシュワープ"),
+                                     QStringLiteral("映像クリップを選択してください。"));
+            return;
+        }
+        stopMeshEdit();
+        bool ok = false;
+        const QString choice = QInputDialog::getItem(this, QStringLiteral("メッシュワープをリセット"),
+            QStringLiteral("グリッド数（行・列）"),
+            {QStringLiteral("3"), QStringLiteral("4"), QStringLiteral("6")}, 1, false, &ok);
+        if (ok) {
+            m_timeline->resetClipMeshWarp(trackIdx, clipIdx, choice.toInt(), choice.toInt());
+            refreshSpecialClipPreview();
+        }
+    });
 
     auto *addShapeAction = compMenu->addAction("シェイプレイヤー追加...");
     connect(addShapeAction, &QAction::triggered, this, &MainWindow::addShapeLayer);

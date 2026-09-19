@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QMainWindow>
+class MeshEditTool;
 #include <QMenuBar>
 #include <QActionGroup>  // WS-3: ワークスペース切替アクションの排他グループ
 #include <QToolBar>
@@ -850,6 +851,7 @@ private:
     quint64 m_projectCameraUndoSaveSerial = 0;
     QVector<Light3D> m_projectLights;                         // project-level 3D lights
     QPointer<Light3DDialog> m_light3DDialog;
+    QPointer<MeshEditTool> m_meshEditTool;
     int m_selectedVideoTrackIndex = -1;
     int m_selectedVideoClipIndexTracked = -1;
 

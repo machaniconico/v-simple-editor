@@ -2,6 +2,8 @@
 
 #include <QObject>
 #include <QSize>
+#include <QRectF>
+class QPainter;
 #include <QPoint>
 #include <QMenu>
 #include "PlanarTracker.h"
@@ -15,19 +17,23 @@ class SurfaceTool : public QObject
 public:
     explicit SurfaceTool(GLPreview *preview, QObject *parent = nullptr);
 
+    ~SurfaceTool() override = default;
+    void setViewRect(const QRectF &rect) { m_viewRect = rect; }
+    virtual int hitTestCorner(const QPoint &widgetPos, const QRectF &letterbox) const;
+
     void setSourceSize(QSize size);
     void setQuad(const planartrack::Quad &quad);
     planartrack::Quad currentQuad() const;
     void setEnabled(bool enabled);
-    bool isEnabled() const { return m_enabled; }
+    virtual bool isEnabled() const { return m_enabled; }
 
     // Called by GLPreview to paint the overlay via QPainter
-    void paintOverlay(QPainter &painter, const QRectF &letterbox);
+    virtual void paintOverlay(QPainter &painter, const QRectF &letterbox);
 
     // Mouse event dispatch — returns true if the event was consumed
-    bool handleMousePress(const QPoint &widgetPos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
-    bool handleMouseMove(const QPoint &widgetPos, Qt::KeyboardModifiers modifiers);
-    bool handleMouseRelease(const QPoint &widgetPos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
+    virtual bool handleMousePress(const QPoint &widgetPos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
+    virtual bool handleMouseMove(const QPoint &widgetPos, Qt::KeyboardModifiers modifiers);
+    virtual bool handleMouseRelease(const QPoint &widgetPos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
 
 signals:
     void cornersChanged(const planartrack::Quad &quad);
@@ -39,10 +45,10 @@ private:
     QPointF widgetToUv(const QPoint &widgetPos, const QRectF &letterbox) const;
     QPointF uvToSourcePx(const QPointF &uv) const;
     QPointF sourcePxToUv(const QPointF &px) const;
-    int hitTestCorner(const QPoint &widgetPos, const QRectF &letterbox) const;
     planartrack::Quad defaultQuad() const;
     void applyCtrlSnap(QPointF &uv, int draggedIndex, Qt::KeyboardModifiers modifiers) const;
 
+    QRectF m_viewRect;
     GLPreview *m_preview;
     QSize m_sourceSize;
     planartrack::Quad m_quad;       // stored in normalized UV [0,1]x[0,1]
