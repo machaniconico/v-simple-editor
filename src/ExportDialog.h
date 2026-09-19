@@ -103,6 +103,7 @@ private slots:
 
 private:
     void setupUI();
+    void ensureSequenceSettings();
     void reloadUserPresets(const QString &selected = {});
     void applyPreset(const ExportConfig &config, bool userPreset = true);
     ExportConfig currentSettings() const;

@@ -197,29 +197,40 @@ int runImgSequenceSelftest()
     gate(5, mapped);
 
     ExportDialog dialog(ProjectConfig{});
+    // Default video export must retain the three baseline rate-control spins.
+    bool ui = dialog.findChildren<QSpinBox *>().size() == 3
+        && !dialog.findChild<QComboBox *>("sequenceFormat")
+        && !dialog.findChild<QLineEdit *>("sequencePattern");
     QComboBox *type = nullptr;
     for (auto *combo : dialog.findChildren<QComboBox *>())
         if (combo->findText(QStringLiteral("連番静止画 (PNG / TIFF)")) >= 0) type = combo;
+    if (type)
+        type->setCurrentIndex(type->findData(static_cast<int>(ExportType::ImageSequence)));
     auto *formats = dialog.findChild<QComboBox *>("sequenceFormat");
     auto *pattern = dialog.findChild<QLineEdit *>("sequencePattern");
     auto *digits = dialog.findChild<QSpinBox *>("sequenceDigits");
     auto *start = dialog.findChild<QSpinBox *>("sequenceStart");
-    bool ui = type && formats && pattern && digits && start;
+    ui &= type && formats && pattern && digits && start;
     if (ui) {
         ui &= (formats->findData("tiff") >= 0) == QImageWriter::supportedImageFormats().contains("tiff");
-        type->setCurrentIndex(type->findData(static_cast<int>(ExportType::ImageSequence)));
         for (auto *spin : dialog.findChildren<QSpinBox *>())
             if (spin != digits && spin != start) ui &= !spin->isEnabled();
         for (auto *combo : dialog.findChildren<QComboBox *>())
             if (combo->findData("libx264") >= 0) ui &= !combo->isEnabled();
+        digits->setValue(5);
+        start->setValue(25);
+        ui &= pattern->text() == "name_%05d.png";
+        type->setCurrentIndex(type->findData(static_cast<int>(ExportType::Video)));
+        type->setCurrentIndex(type->findData(static_cast<int>(ExportType::ImageSequence)));
+        ui &= dialog.findChildren<QSpinBox *>().size() == 5
+            && dialog.findChild<QSpinBox *>("sequenceDigits") == digits
+            && digits->value() == 5 && start->value() == 25
+            && pattern->text() == "name_%05d.png";
         for (auto *check : dialog.findChildren<QCheckBox *>())
             if (check->text() == QStringLiteral("アルファチャンネルを保持 (ProRes 4444 / VP9)")) {
                 ui &= check->isEnabled();
                 check->setChecked(true);
             }
-        digits->setValue(5);
-        start->setValue(25);
-        ui &= pattern->text() == "name_%05d.png";
         for (auto *output : dialog.findChildren<QLineEdit *>())
             if (output->placeholderText() == QStringLiteral("Select output file..."))
                 output->setText(temp.filePath("dialog"));
