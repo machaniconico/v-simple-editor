@@ -132,6 +132,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/camera_solve_selftest.cpp
     src/selftests/feature_tracker_selftest.cpp
     src/selftests/sfm_two_view_selftest.cpp
+    src/selftests/bundle_adjust_selftest.cpp
     src/selftests/VoiceIsolationSelftest.cpp
     src/selftests/noise_print_selftest.cpp
     src/selftests/GradeLggSerializationSelftest.cpp
@@ -637,6 +638,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/PlanarTracker.cpp
     src/FeatureTracker.cpp
     src/FeatureTracker.h
+    src/BundleAdjustment.cpp
+    src/BundleAdjustment.h
     src/PlanarTracker.h
     src/PlanarTrackerDialog.cpp
     src/PlanarTrackerDialog.h
