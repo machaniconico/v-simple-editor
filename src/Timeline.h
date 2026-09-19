@@ -832,6 +832,10 @@ public:
     // sequence remains mirrored into the legacy video/audio track arrays so
     // single-sequence projects and old readers stay compatible.
     QVector<TimelineSequence> sequences() const;
+    // UI/API snapshot includes the implicit root without enabling nesting.
+    QVector<TimelineSequence> sequenceList() const;
+    bool renameSequence(const QString &id, const QString &name);
+    bool createSequence(const QString &name);
     QString activeSequenceId() const { return m_activeSequenceId; }
     void setSequences(const QVector<TimelineSequence> &sequences,
                       const QString &activeSequenceId = QString());
@@ -1241,6 +1245,7 @@ signals:
     void scrubPositionChanged(double seconds);
     void positionChanged(double seconds);
     void sequenceChanged(const QVector<PlaybackEntry> &entries);
+    void sequencesChanged();
     void audioSequenceChanged(const QVector<PlaybackEntry> &entries);
     // restoreState が、プロジェクト出力ジオメトリを持つ undo/redo スナップショットを
     // 復元したときに発火。MainWindow が canvas + 出力サイズを再適用し、SNS プリセット

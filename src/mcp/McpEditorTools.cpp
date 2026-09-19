@@ -1416,6 +1416,37 @@ void McpEditorTools::registerReadTools()
         return;
 
     m_registry->registerTool(withOutputSchema({
+        QStringLiteral("get_sequences"),
+        QStringLiteral("メインを含むシーケンス一覧とアクティブIDを返す。"),
+        objectSchema(QJsonObject{}),
+        [this](const QJsonObject &args, QString *err) -> QJsonObject {
+            if (!rejectUnknownArguments(args, {}, err)) return {};
+            const Timeline *current = timeline();
+            if (!current) return setError(err, QStringLiteral("エディターを利用できません")), QJsonObject{};
+            QJsonArray sequences;
+            for (const auto &sequence : current->sequenceList()) {
+                int clipCount = 0;
+                for (const auto &track : sequence.videoTracks) clipCount += int(track.size());
+                for (const auto &track : sequence.audioTracks) clipCount += int(track.size());
+                sequences.append(QJsonObject{{"id", sequence.id}, {"name", sequence.name},
+                    {"videoTrackCount", int(sequence.videoTracks.size())},
+                    {"audioTrackCount", int(sequence.audioTracks.size())}, {"clipCount", clipCount}});
+            }
+            return {{"ok", true}, {"activeId", current->activeSequenceId().isEmpty()
+                ? QStringLiteral("main") : current->activeSequenceId()}, {"sequences", sequences}};
+        }
+    }, outputSchemaOf(QJsonObject{
+        {"ok", QJsonObject{{"type", "boolean"}}},
+        {"activeId", QJsonObject{{"type", "string"}}},
+        {"sequences", QJsonObject{{"type", "array"}, {"items", outputSchemaOf(QJsonObject{
+            {"id", QJsonObject{{"type", "string"}}}, {"name", QJsonObject{{"type", "string"}}},
+            {"videoTrackCount", QJsonObject{{"type", "integer"}}},
+            {"audioTrackCount", QJsonObject{{"type", "integer"}}},
+            {"clipCount", QJsonObject{{"type", "integer"}}}},
+            {"id", "name", "videoTrackCount", "audioTrackCount", "clipCount"})}}}
+    }, {"ok", "activeId", "sequences"})));
+
+    m_registry->registerTool(withOutputSchema({
         QStringLiteral("compare_project"),
         QStringLiteral("保存版と現在のタイムラインの映像・音声クリップとトラック設定を比較する。読み取り専用。変更前は保存版、変更後は現在。Removed の場所は保存版、それ以外は現在のクリップ番号。"),
         schemaWithRequired(QJsonObject{
@@ -1889,6 +1920,24 @@ void McpEditorTools::registerWriteTools()
 {
     if (!m_registry)
         return;
+
+    m_registry->registerTool(withOutputSchema({
+        QStringLiteral("set_active_sequence"),
+        QStringLiteral("指定IDのシーケンスへ切り替える。Undoは追加しない。"),
+        schemaWithRequired(QJsonObject{{"id", QJsonObject{{"type", "string"}}}}, {"id"}),
+        guardedWrite(QStringLiteral("set_active_sequence"),
+            [this](const QJsonObject &args, QString *err) -> QJsonObject {
+                if (!rejectUnknownArguments(args, {QStringLiteral("id")}, err)) return {};
+                QString id;
+                if (!requiredString(args, QStringLiteral("id"), &id, err)) return {};
+                Timeline *current = timeline();
+                if (!current) return setError(err, QStringLiteral("エディターを利用できません")), QJsonObject{};
+                if (!current->setActiveSequence(id))
+                    return setError(err, QStringLiteral("シーケンスが見つかりません: %1").arg(id)), QJsonObject{};
+                return {{"ok", true}, {"activeId", id}};
+            })
+    }, outputSchemaOf(QJsonObject{{"ok", QJsonObject{{"type", "boolean"}}},
+        {"activeId", QJsonObject{{"type", "string"}}}}, {"ok", "activeId"})));
 
     const QJsonObject clipProperties = clipSelectorProperties();
 

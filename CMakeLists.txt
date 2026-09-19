@@ -17,7 +17,7 @@ set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
 # Qt6
-find_package(Qt6 REQUIRED COMPONENTS Widgets Gui Multimedia MultimediaWidgets OpenGL OpenGLWidgets Network Concurrent)
+find_package(Qt6 REQUIRED COMPONENTS Widgets Gui Multimedia MultimediaWidgets OpenGL OpenGLWidgets Network Concurrent Test)
 
 # Sprint 16 / US-AFF-1: SVG rasterization for affinity::vector::loadSvg().
 # Optional: when not present, AffinityVectorImporter.cpp returns a null QImage
@@ -119,6 +119,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/LoudnessExportWireSelftest.cpp
     src/selftests/FrameExportSelftest.cpp
     src/selftests/FrameClipboardSelftest.cpp
+    src/selftests/sequence_dock_selftest.cpp
     src/selftests/NestSequenceSelftest.cpp
     src/selftests/PrecomposeE2ESelftest.cpp
     src/selftests/BatchExportE2ESelftest.cpp
@@ -333,6 +334,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/StillCompare.cpp
     src/StillStore.h
     src/StillStore.cpp
+    src/SequenceListDock.h
+    src/SequenceListDock.cpp
     src/StillGalleryDock.h
     src/StillGalleryDock.cpp
     src/OnionSkin.h
@@ -1001,6 +1004,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     Qt6::OpenGLWidgets
     Qt6::Network
     Qt6::Concurrent
+    Qt6::Test
     ${AVFORMAT_LIBRARY}
     ${AVCODEC_LIBRARY}
     ${AVUTIL_LIBRARY}

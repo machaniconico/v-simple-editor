@@ -11633,6 +11633,56 @@ QVector<TimelineSequence> Timeline::sequences() const
     return snapshot;
 }
 
+QVector<TimelineSequence> Timeline::sequenceList() const
+{
+    if (!m_sequenceModelEnabled)
+        return {currentSequenceSnapshot(QString::fromLatin1(kDefaultSequenceId),
+                                        QStringLiteral("メインシーケンス"))};
+    auto result = sequences();
+    for (auto &sequence : result) {
+        if (sequence.id == QLatin1String(kDefaultSequenceId)
+            && sequence.name == QStringLiteral("Sequence 1"))
+            sequence.name = QStringLiteral("メインシーケンス");
+    }
+    return result;
+}
+
+bool Timeline::renameSequence(const QString &id, const QString &name)
+{
+    const QString trimmed = name.trimmed();
+    if (trimmed.isEmpty()) return false;
+    if (!m_sequenceModelEnabled) {
+        if (id != QLatin1String(kDefaultSequenceId)) return false;
+        if (trimmed == QStringLiteral("メインシーケンス")) return true;
+        m_sequenceModelEnabled = true;
+        m_activeSequenceId = id;
+        upsertSequenceSnapshot(currentSequenceSnapshot(id, trimmed));
+    } else {
+        auto *sequence = sequenceById(id);
+        if (!sequence) return false;
+        if (sequence->name == trimmed) return true;
+        sequence->name = trimmed;
+    }
+    // Metadata only: clip indices and their carrier bindings do not change.
+    saveUndoState(QStringLiteral("シーケンスの名前を変更"));
+    rebuildTimelineBreadcrumbBar(this);
+    emit sequencesChanged();
+    return true;
+}
+
+bool Timeline::createSequence(const QString &name)
+{
+    if (name.trimmed().isEmpty()) return false;
+    TimelineSequence sequence;
+    sequence.id = uniqueSequenceId(m_sequences, QStringLiteral("sequence"), m_sequences.size());
+    sequence.name = name.trimmed();
+    sequence.videoTracks.append(QVector<ClipInfo>{});
+    sequence.audioTracks.append(QVector<ClipInfo>{});
+    if (!addSequence(sequence) || !setActiveSequence(sequence.id)) return false;
+    saveUndoState(QStringLiteral("新規シーケンス"));
+    return true;
+}
+
 void Timeline::setSequences(const QVector<TimelineSequence> &sequences,
                             const QString &activeSequenceId)
 {
@@ -11642,8 +11692,10 @@ void Timeline::setSequences(const QVector<TimelineSequence> &sequences,
     m_activeSequenceId = m_sequenceModelEnabled ? active : QString();
 
     const TimelineSequence *sequence = sequenceById(m_activeSequenceId);
-    if (!sequence)
+    if (!sequence) {
+        emit sequencesChanged();
         return;
+    }
 
     m_generatedCaptionOverlays = sequence->generatedCaptionOverlays;
     restoreFromProject(sequence->videoTracks, sequence->audioTracks,
@@ -11651,6 +11703,7 @@ void Timeline::setSequences(const QVector<TimelineSequence> &sequences,
     m_activeSequenceId = sequence->id;
     m_sequenceModelEnabled = true;
     syncActiveSequenceFromCurrentTracks();
+    emit sequencesChanged();
 }
 
 bool Timeline::addSequence(const TimelineSequence &sequence)
@@ -11668,6 +11721,7 @@ bool Timeline::addSequence(const TimelineSequence &sequence)
     if (normalized.name.trimmed().isEmpty())
         normalized.name = QStringLiteral("Sequence %1").arg(existing.size() + 1);
     upsertSequenceSnapshot(normalized);
+    emit sequencesChanged();
     return true;
 }
 
@@ -11676,7 +11730,7 @@ bool Timeline::setActiveSequence(const QString &sequenceId)
     if (sequenceId.isEmpty())
         return false;
     if (!m_sequenceModelEnabled)
-        return false;
+        return sequenceId == QLatin1String(kDefaultSequenceId);
     const TimelineSequence *target = sequenceById(sequenceId);
     if (!target)
         return false;
@@ -11722,6 +11776,7 @@ bool Timeline::setActiveSequence(const QString &sequenceId)
     ensureSequenceFitsViewport();
     scheduleEmitSequenceChanged();
     rebuildTimelineBreadcrumbBar(this);
+    emit sequencesChanged();
     return true;
 }
 
@@ -11805,6 +11860,7 @@ void Timeline::setClipParentEntries(const QHash<QString, QString> &entries)
         m_sequenceModelEnabled = false;
     }
     rebuildTimelineBreadcrumbBar(this);
+    emit sequencesChanged();
 }
 
 QHash<QString, QString> Timeline::clipParentEntries() const

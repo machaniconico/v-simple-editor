@@ -99,6 +99,7 @@ double exporter_loudnessGainDb();
 #include "ClipGeometry.h"
 #include "SourceMonitorDock.h"
 #include "StillGalleryDock.h"
+#include "SequenceListDock.h"
 #include "AudioBusPanel.h"   // AB-5: オーディオ バス パネル ドック
 #include "util/RcPause.h"
 
@@ -6317,6 +6318,15 @@ void MainWindow::setupMenuBar()
             this, &MainWindow::onSourceInsertRequested);
     connect(m_sourceMonitorDock, &SourceMonitorDock::overwriteRequested,
             this, &MainWindow::onSourceOverwriteRequested);
+
+    m_sequenceListDock = new SequenceListDock(m_timeline, this);
+    addDockWidget(Qt::RightDockWidgetArea, m_sequenceListDock);
+    m_sequenceListDock->hide();
+    auto *sequenceListAction = viewMenu->addAction(QStringLiteral("シーケンス一覧"));
+    sequenceListAction->setCheckable(true);
+    sequenceListAction->setChecked(false);
+    connect(sequenceListAction, &QAction::toggled, m_sequenceListDock, &QDockWidget::setVisible);
+    connect(m_sequenceListDock, &QDockWidget::visibilityChanged, sequenceListAction, &QAction::setChecked);
 
     // STILLS-WIPE: 保存済みフレームのギャラリー。比較合成は VideoPlayer の
     // display-local 経路だけで行い、Timeline / renderFrameAt は変更しない。

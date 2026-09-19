@@ -1194,7 +1194,7 @@ int runMcpSelftest()
             rpcRequest(73, QStringLiteral("tools/list")))))
         .value(QStringLiteral("result")).toObject()
         .value(QStringLiteral("tools")).toArray();
-    constexpr int kExpectedProjectInfoToolCount = 36 + 1 + 2 + 2 + 1; // US-308: compare_project; US-312: render/decompose; US-400: color/LUT; US-406: track properties
+    constexpr int kExpectedProjectInfoToolCount = 36 + 1 + 2 + 2 + 1 + 2; // US-308: compare_project; US-312: render/decompose; US-400: color/LUT; US-406: track properties; US-509: sequences
     bool outputSchemasDeclared = projectInfoToolDescriptors.size()
         == kExpectedProjectInfoToolCount;
     for (const QJsonValue& value : projectInfoToolDescriptors) {
@@ -5517,6 +5517,67 @@ int runMcpSelftest()
     } else {
         fail("G152 render_in_place MCP picture and timeline", QStringLiteral("Timeline was not available"));
         fail("G153 decompose and undo restore media and effects", QStringLiteral("Timeline was not available"));
+    }
+    // US-509 reserved G166-G167: list and non-editing sequence switch.
+    if (projectTimeline) {
+        const auto savedState = projectTimeline->currentState();
+        TimelineSequence root;
+        root.id = QStringLiteral("main");
+        root.name = QStringLiteral("メインシーケンス");
+        root.videoTracks = savedState.videoTracks;
+        root.audioTracks = savedState.audioTracks;
+        TimelineSequence child;
+        child.id = QStringLiteral("mcp-sequence-child");
+        child.name = QStringLiteral("MCP 子シーケンス");
+        child.videoTracks.append(QVector<ClipInfo>{});
+        projectTimeline->setSequences(QVector<TimelineSequence>{root, child}, root.id);
+        const auto listed = toolPayload(callProjectInfoTool(5090, QStringLiteral("get_sequences"), {}));
+        const auto sequences = listed.value(QStringLiteral("sequences")).toArray();
+        bool schemaRequired = false;
+        for (const auto &value : projectInfoToolDescriptors) {
+            const auto descriptor = value.toObject();
+            if (descriptor.value(QStringLiteral("name")).toString() == QStringLiteral("get_sequences")) {
+                const auto required = descriptor.value(QStringLiteral("outputSchema")).toObject()
+                    .value(QStringLiteral("required")).toArray();
+                schemaRequired = required.contains(QStringLiteral("ok"))
+                    && required.contains(QStringLiteral("activeId"))
+                    && required.contains(QStringLiteral("sequences"));
+            }
+        }
+        const bool g166 = listed.value(QStringLiteral("ok")).toBool()
+            && listed.value(QStringLiteral("activeId")).toString() == root.id
+            && sequences.size() == 2 && schemaRequired
+            && sequences[1].toObject().value(QStringLiteral("id")).toString() == child.id
+            && sequences[1].toObject().value(QStringLiteral("name")).toString() == child.name
+            && sequences[1].toObject().value(QStringLiteral("videoTrackCount")).toInt() == 1
+            && sequences[1].toObject().value(QStringLiteral("clipCount")).toInt(-1) == 0;
+        g166 ? pass("G166 sequence list and schema")
+             : fail("G166 sequence list and schema", QStringLiteral("sequence list/schema mismatch"));
+        const auto serial = projectTimeline->undoManager()->saveSerial();
+        const auto switched = toolPayload(callProjectInfoTool(5091, QStringLiteral("set_active_sequence"),
+            QJsonObject{{"id", child.id}}));
+        const auto missing = callProjectInfoTool(5092, QStringLiteral("set_active_sequence"),
+            QJsonObject{{"id", QStringLiteral("missing-sequence")}});
+        const auto noId = callProjectInfoTool(5093, QStringLiteral("set_active_sequence"), {});
+        const auto after = toolPayload(callProjectInfoTool(5094, QStringLiteral("get_sequences"), {}));
+        const auto activeTimeline = toolPayload(callProjectInfoTool(5095, QStringLiteral("get_timeline"), {}));
+        const auto activeVideo = activeTimeline.value(QStringLiteral("video")).toArray();
+        const bool g167 = switched.value(QStringLiteral("ok")).toBool()
+            && switched.value(QStringLiteral("activeId")).toString() == child.id
+            && after.value(QStringLiteral("activeId")).toString() == child.id
+            && projectTimeline->activeSequenceId() == child.id
+            && !activeVideo.isEmpty()
+            && activeVideo[0].toObject().value(QStringLiteral("clips")).toArray().isEmpty()
+            && requiredOutputFieldsPresent(QStringLiteral("set_active_sequence"), switched)
+            && projectTimeline->undoManager()->saveSerial() == serial
+            && toolResult(missing).value(QStringLiteral("isError")).toBool()
+            && toolResult(noId).value(QStringLiteral("isError")).toBool();
+        g167 ? pass("G167 sequence switch without undo and invalid id")
+             : fail("G167 sequence switch without undo and invalid id", QStringLiteral("switch/undo/validation mismatch"));
+        projectTimeline->restoreState(savedState);
+    } else {
+        fail("G166 sequence list and schema", QStringLiteral("Timeline was not available"));
+        fail("G167 sequence switch without undo and invalid id", QStringLiteral("Timeline was not available"));
     }
     server.stop();
     qInfo().noquote().nospace() << "[mcp] selftest end, passed=" << passed

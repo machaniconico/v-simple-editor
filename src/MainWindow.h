@@ -109,6 +109,7 @@ class Timeline;
 class TimelineTrack;
 class SourceMonitorDock;
 class StillGalleryDock;
+class SequenceListDock;
 class AudioBusPanel;
 class ExportDialog;
 class BrushAnimation;
@@ -955,6 +956,7 @@ private:
     // STILLS-WIPE: AppData のスチル一覧と、その表示専用比較状態。
     stillstore::StillStore m_stillStore;
     StillGalleryDock *m_stillGalleryDock = nullptr;
+    SequenceListDock *m_sequenceListDock = nullptr;
     stillcompare::Config m_stillCompare;
     QString m_activeStillId;
     QAction *m_stillCompareAction = nullptr;
