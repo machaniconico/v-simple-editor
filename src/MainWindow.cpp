@@ -4794,6 +4794,16 @@ void MainWindow::setupMenuBar()
 
     // 表示 メニュー
     auto *viewMenu = menuBar()->addMenu("表示(&V)");
+    auto *filmstripAction = viewMenu->addAction(QStringLiteral("クリップのサムネイルを表示"));
+    filmstripAction->setCheckable(true);
+    filmstripAction->setChecked(QSettings(QStringLiteral("VSimpleEditor"),
+        QStringLiteral("Preferences")).value(QStringLiteral("timeline/showFilmstrip"), false).toBool());
+    m_timeline->setFilmstripEnabled(filmstripAction->isChecked());
+    connect(filmstripAction, &QAction::toggled, this, [this](bool enabled) {
+        m_timeline->setFilmstripEnabled(enabled);
+        QSettings(QStringLiteral("VSimpleEditor"), QStringLiteral("Preferences"))
+            .setValue(QStringLiteral("timeline/showFilmstrip"), enabled);
+    });
     m_zoomToFitSequenceAction = viewMenu->addAction(QStringLiteral("シーケンス全体を表示"));
     connect(m_zoomToFitSequenceAction, &QAction::triggered, this, [this]() {
         m_timeline->zoomToFitSequence();
@@ -6243,6 +6253,7 @@ void MainWindow::setupMenuBar()
 
     // MP-5: メディアプール ドック (左側)。SSOT モデル m_mediaPool を指すだけ。
     m_mediaPoolDock = new MediaPoolDock(this);
+    m_timeline->setFilmstripCache(m_mediaPoolDock->findChild<ThumbnailCache *>());
     m_mediaPoolDock->setPool(&m_mediaPool);
     m_mediaPoolDock->setUsedPathsProvider([this] {
         QSet<QString> paths;

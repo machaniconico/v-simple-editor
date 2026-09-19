@@ -2274,8 +2274,91 @@ void TimelineTrack::updateMinimumWidth()
     setMinimumWidth(static_cast<int>(totalWidth) + kTrailingPadPx);
 }
 
+int TimelineTrack::filmstripTileCount(int width, int thumbnailWidth)
+{
+    return width > 0 && thumbnailWidth > 0 ? 1 + (width - 1) / thumbnailWidth : 0;
+}
+
+int TimelineTrack::filmstripImageIndex(double sourceSeconds, double mediaDuration, int count)
+{
+    if (count <= 1 || !std::isfinite(sourceSeconds) || !std::isfinite(mediaDuration)
+        || mediaDuration <= 0.0) return 0;
+    return int(qBound(0.0, std::floor(sourceSeconds / mediaDuration * count + 0.5),
+                      double(count - 1)));
+}
+
+QVector<TimelineTrack::FilmstripTile> TimelineTrack::filmstripTilesForTest(int clipIndex) const
+{
+    if (!m_timeline || !m_timeline->filmstripEnabled()) return {};
+    return m_filmstripTiles.value(clipIndex);
+}
+
+void TimelineTrack::paintFilmstrip(QPainter &painter, int clipIndex, const QRect &clipRect,
+                                  const QRect &visibleRect)
+{
+    ++m_filmstripBranchCount;
+    auto &tiles = m_filmstripTiles[clipIndex];
+    tiles.clear();
+    const auto &clip = m_clips[clipIndex];
+    if (m_isAudioTrack || clip.filePath.isEmpty() || !clip.sequenceRefId.isEmpty()
+        || !clip.shapes.isEmpty() || !clipRect.intersects(visibleRect)) return;
+    auto *cache = m_timeline->filmstripCache();
+    if (!cache) return;
+    // Same key, count and size as MediaPoolDock; pending/cached requests coalesce.
+    cache->request(clip.filePath, clip.filePath, clip.duration, 8);
+    const auto frames = cache->frames(clip.filePath);
+    if (frames.isEmpty()) return;
+    const QRect body = clipRect.adjusted(0, 4, 0, -4);
+    const int tileWidth = qMax(1, qRound(body.height() * 16.0 / 9.0));
+    const int count = filmstripTileCount(body.width(), tileWidth);
+    if (body.height() <= 0) return;
+    const int first = qMax(0, (visibleRect.left() - body.left()) / tileWidth);
+    const int last = qMin(count, (visibleRect.right() - body.left()) / tileWidth + 1);
+    for (int i = first; i < last; ++i) {
+        const QRect rect = QRect(body.left() + i * tileWidth, body.top(), tileWidth,
+                                 body.height()).intersected(body);
+        double fraction = double(rect.center().x() - body.left()) / body.width();
+        if (clip.reversed) fraction = 1.0 - fraction;
+        const double end = clip.outPoint > clip.inPoint ? clip.outPoint : clip.duration;
+        const double sourceSeconds = clip.inPoint + fraction * qMax(0.0, end - clip.inPoint);
+        const int index = filmstripImageIndex(sourceSeconds, cache->duration(clip.filePath),
+                                              int(frames.size()));
+        tiles.append({rect, index});
+        const auto &image = frames[index];
+        painter.drawImage(rect, image, QRectF(0, 0,
+            image.width() * double(rect.width()) / tileWidth, image.height()));
+        ++m_filmstripDrawCount;
+    }
+}
+
+void Timeline::setFilmstripCache(ThumbnailCache *cache)
+{
+    if (m_filmstripCache == cache) return;
+    disconnect(m_filmstripReadyConnection);
+    m_filmstripCache = cache;
+    if (cache) {
+        m_filmstripReadyConnection = connect(cache, &ThumbnailCache::ready, this,
+            [this](const QString &key, const QVector<QImage> &) {
+                if (!m_filmstripEnabled) return;
+                for (auto *track : m_videoTracks)
+                    for (const auto &clip : track->clips())
+                        if (clip.filePath == key) { track->update(); break; }
+            });
+    }
+    for (auto *track : m_videoTracks) track->update();
+}
+
+void Timeline::setFilmstripEnabled(bool enabled)
+{
+    if (m_filmstripEnabled == enabled) return;
+    m_filmstripEnabled = enabled;
+    if (enabled && !m_filmstripCache) setFilmstripCache(new ThumbnailCache(this));
+    for (auto *track : m_videoTracks) track->update();
+}
+
 void TimelineTrack::paintEvent(QPaintEvent *event)
 {
+    ++m_paintCount;
     static int paintCount = 0;
     if (++paintCount <= 5) {
         qInfo() << "TimelineTrack::paintEvent #" << paintCount
@@ -2319,6 +2402,8 @@ void TimelineTrack::paintEvent(QPaintEvent *event)
             painter.drawLine(x, 0, x, m_rowHeight);
         }
         painter.fillRect(clipRect, color);
+        if (m_timeline && m_timeline->filmstripEnabled())
+            paintFilmstrip(painter, i, clipRect, visibleRect);
         if (m_clips[i].label != ClipLabel::None) {
             labelBars.append(qMakePair(
                 QRect(x, clipRect.bottom() - 2, clipWidth, 3),

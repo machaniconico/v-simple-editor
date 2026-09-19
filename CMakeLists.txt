@@ -276,6 +276,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/MediaPoolDock.cpp
     src/ThumbnailCache.h
     src/ThumbnailCache.cpp
+    src/selftests/clip_filmstrip_selftest.cpp
     src/selftests/media_pool_thumbs_selftest.cpp
     # SM (ソースモニター3点編集): 純粋エンジン + ドック (SM-2 で本体実装)。
     src/ThreePointEdit.h

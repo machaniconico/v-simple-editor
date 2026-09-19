@@ -72,6 +72,7 @@ int runCaptionSelftest();
 int runChromaSelftest();
 int runClipColorSelftest();
 int runClipCurvesSelftest();
+int runClipFilmstripSelftest();
 int runClipLutSelftest();
 int runClipMaskSelftest();
 int runClipParentParitySelftest();
@@ -548,6 +549,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Premiere XML (FCP7) exporter stub (Phase 6 Wave 1 FOUNDATION, filled in US-6E-3: 4 gate combined / individual / multi-sequence / DOCTYPE)" },
     { "youtube-chapter",   "VEDITOR_YOUTUBE_CHAPTER_SELFTEST",    runYoutubeChapterSelftest,     false,
       "YouTube chapter generator stub (Phase 6 Wave 1 FOUNDATION, filled in US-6F-3: 3 gate M:SS / H:MM:SS / intro auto-insert)" },
+    { "clip-filmstrip", "VEDITOR_CLIP_FILMSTRIP_SELFTEST", runClipFilmstripSelftest, true,
+      "Timeline filmstrip: disabled path, shared thumbnails and tile/time mapping" },
     { "media-pool-thumbs", "VEDITOR_MEDIA_POOL_THUMBS_SELFTEST", runMediaPoolThumbsSelftest, true,
       "Media pool asynchronous thumbnails, RGBA frame grab and hover skimming" },
     { "media-pool-rating", "VEDITOR_MEDIA_POOL_RATING_SELFTEST", runMediaPoolRatingSelftest, false,

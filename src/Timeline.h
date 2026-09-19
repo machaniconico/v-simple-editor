@@ -1,6 +1,8 @@
 #pragma once
 
 #include <QWidget>
+#include <QPointer>
+#include "ThumbnailCache.h"
 #include <QScrollArea>
 #include <QLabel>
 #include <QHBoxLayout>
@@ -470,6 +472,14 @@ class TimelineTrack : public QWidget
 
 public:
     explicit TimelineTrack(QWidget *parent = nullptr);
+    struct FilmstripTile { QRect rect; int imageIndex; };
+    QVector<FilmstripTile> filmstripTilesForTest(int clipIndex) const;
+    quint64 filmstripBranchCountForTest() const { return m_filmstripBranchCount; }
+    quint64 paintCountForTest() const { return m_paintCount; }
+    quint64 filmstripDrawCountForTest() const { return m_filmstripDrawCount; }
+    static int filmstripTileCount(int width, int thumbnailWidth);
+    static int filmstripImageIndex(double sourceSeconds, double mediaDuration, int count = 8);
+
 
     QString customName; // 空なら V1 / A1 などの既定名
     QColor color; // 無効なら既定色
@@ -620,6 +630,12 @@ private:
     bool tryHitTransitionBadge(QMouseEvent *ev, int clipIndex);
     void handleBodyClick(QMouseEvent *ev, int clipIndex);
 
+    void paintFilmstrip(QPainter &painter, int clipIndex, const QRect &clipRect,
+                        const QRect &visibleRect);
+    quint64 m_paintCount = 0;
+    quint64 m_filmstripDrawCount = 0;
+    quint64 m_filmstripBranchCount = 0;
+    QHash<int, QVector<FilmstripTile>> m_filmstripTiles;
     QVector<ClipInfo> m_clips;
     QList<int> m_selectedClips;
     DragMode m_dragMode = DragMode::None;
@@ -673,6 +689,11 @@ class Timeline : public QWidget
 
 public:
     explicit Timeline(QWidget *parent = nullptr);
+    void setFilmstripEnabled(bool enabled);
+    bool filmstripEnabled() const { return m_filmstripEnabled; }
+    void setFilmstripCache(ThumbnailCache *cache);
+    ThumbnailCache *filmstripCache() const { return m_filmstripCache.data(); }
+
 
     struct MediaImportResult {
         int videoTrackIndex = -1;
@@ -1372,6 +1393,9 @@ private:
     QVector3D m_projectLightViewPosition = QVector3D();
     double m_markIn = -1.0;
     double m_markOut = -1.0;
+    bool m_filmstripEnabled = false;
+    QPointer<ThumbnailCache> m_filmstripCache;
+    QMetaObject::Connection m_filmstripReadyConnection;
     double m_zoomLevel = 10.0; // pixels per second (double so we can go sub-1 for long clips)
     int m_trackHeight = 50; // default row height for new and existing tracks
     // Viewport-X of the playhead captured at the start of a zoom drag. While

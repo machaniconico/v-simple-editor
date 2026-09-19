@@ -26,7 +26,13 @@ int ThumbnailCache::skimIndex(double x, double width, int count)
 QVector<QImage> ThumbnailCache::frames(const QString &key)
 {
     const auto *value = m_cache.object(key); // QCache access updates LRU order.
-    return value ? *value : QVector<QImage>();
+    return value ? value->frames : QVector<QImage>();
+}
+
+double ThumbnailCache::duration(const QString &key) const
+{
+    const auto *value = m_cache.object(key);
+    return value ? value->duration : 0.0;
 }
 
 void ThumbnailCache::request(const QString &key, const QString &filePath,
@@ -57,8 +63,8 @@ void ThumbnailCache::startNext()
         const Request request = m_queue.dequeue();
         const auto cancel = m_cancel;
         ++m_active;
-        auto *watcher = new QFutureWatcher<QVector<QImage>>(this);
-        connect(watcher, &QFutureWatcher<QVector<QImage>>::finished, this,
+        auto *watcher = new QFutureWatcher<Result>(this);
+        connect(watcher, &QFutureWatcher<Result>::finished, this,
                 [this, watcher, request, cancel] {
             const auto result = watcher->result();
             watcher->deleteLater();
@@ -66,16 +72,16 @@ void ThumbnailCache::startNext()
             if (!cancel->load()) {
                 m_pending.remove(request.key);
                 qint64 bytes = 1; // Also cache failed/unsupported sources.
-                for (const auto &frame : result)
+                for (const auto &frame : result.frames)
                     bytes += frame.sizeInBytes();
                 if (bytes <= m_cache.maxCost())
-                    m_cache.insert(request.key, new QVector<QImage>(result), static_cast<int>(bytes));
-                emit ready(request.key, result);
+                    m_cache.insert(request.key, new Result(result), static_cast<int>(bytes));
+                emit ready(request.key, result.frames);
             }
             startNext();
         });
         watcher->setFuture(QtConcurrent::run([request, cancel] {
-            QVector<QImage> result;
+            Result result;
             const bool stillImage = libavcore::isStillImage(request.path);
             const int count = stillImage ? 1 : request.count;
             double duration = request.duration;
@@ -86,14 +92,15 @@ void ThumbnailCache::startNext()
                 if (microseconds && *microseconds > 0)
                     duration = *microseconds / 1000000.0;
             }
+            result.duration = duration;
             for (int i = 0; i < count && !cancel->load(); ++i) {
                 QImage image = libavcore::grabFrameAt(request.path,
                     duration * i / count, request.size);
                 if (image.isNull())
-                    return QVector<QImage>();
-                result.append(image);
+                    return Result();
+                result.frames.append(image);
             }
-            return cancel->load() ? QVector<QImage>() : result;
+            return cancel->load() ? Result() : result;
         }));
     }
 }

@@ -22,6 +22,7 @@ public:
     void request(const QString &key, const QString &filePath, double durationSec,
                  int count = 8, QSize size = QSize(128, 72));
     QVector<QImage> frames(const QString &key);
+    double duration(const QString &key) const;
     void clear();
     quint64 requestCount() const { return m_requestCount; }
     int activeCount() const { return m_active; }
@@ -39,7 +40,8 @@ private:
         QSize size;
     };
     void startNext();
-    QCache<QString, QVector<QImage>> m_cache;
+    struct Result { QVector<QImage> frames; double duration = 0.0; };
+    QCache<QString, Result> m_cache;
     QQueue<Request> m_queue;
     QSet<QString> m_pending;
     std::shared_ptr<std::atomic_bool> m_cancel;
