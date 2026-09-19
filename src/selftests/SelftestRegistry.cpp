@@ -33,6 +33,7 @@ int runAeFxGenerateSelftest();
 int runAeFxStylizeSelftest();
 int runAdjustmentLayerSelftest();
 int runAffinitySelftest();
+int runAlignDistributeSelftest();
 int runAscCdlExportSelftest();
 int runAtempoResolveSelftest();
 int runOAuthMockE2eSelftest();
@@ -685,6 +686,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "ClipColor: per-clip 色メタデータ模型 — defaultSdr / JSON round-trip / token 逆写像 / describe / codec transfer mapping (14 gates)" },
     { "clip-mask",        "VEDITOR_CLIP_MASK_SELFTEST",          runClipMaskSelftest,           false,
       "Bezier clip masks: model JSON, ProjectFile default omission, per-clip maskSystem round-trip" },
+    { "align-distribute", "VEDITOR_ALIGN_DISTRIBUTE_SELFTEST", runAlignDistributeSelftest, true,
+      "Canvas alignment, equal gaps and atomic undo (4 gates)" },
     { "clip-group", "VEDITOR_CLIP_GROUP_SELFTEST", runClipGroupSelftest, true,
       "Clip grouping, linked edits, undo and validation (5 gates)" },
     { "clip-enable", "VEDITOR_CLIP_ENABLE_SELFTEST", runClipEnableSelftest, true,

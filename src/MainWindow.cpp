@@ -6496,6 +6496,32 @@ void MainWindow::setupMenuBar()
     // コンポジション メニュー (After Effects風)
     auto *compMenu = menuBar()->addMenu("コンポジション(&C)");
 
+    auto *alignMenu = compMenu->addMenu(QStringLiteral("整列"));
+    auto *distributeMenu = compMenu->addMenu(QStringLiteral("均等配置"));
+    using Arrangement = Timeline::LayerArrangement;
+    const auto addArrangementAction = [this, compMenu](QMenu *menu, const QString &label,
+                                                       Arrangement arrangement) {
+        auto *action = menu->addAction(label);
+        const auto updateEnabled = [this, action, arrangement]() {
+            action->setEnabled(m_timeline->canArrangeSelectedLayers(arrangement));
+        };
+        updateEnabled();
+        connect(compMenu, &QMenu::aboutToShow, this, updateEnabled);
+        connect(menu, &QMenu::aboutToShow, this, updateEnabled);
+        connect(action, &QAction::triggered, this, [this, arrangement]() {
+            if (m_timeline->arrangeSelectedLayers(arrangement))
+                refreshSpecialClipPreview();
+        });
+    };
+    addArrangementAction(alignMenu, QStringLiteral("左"), Arrangement::Left);
+    addArrangementAction(alignMenu, QStringLiteral("水平中央"), Arrangement::HorizontalCenter);
+    addArrangementAction(alignMenu, QStringLiteral("右"), Arrangement::Right);
+    addArrangementAction(alignMenu, QStringLiteral("上"), Arrangement::Top);
+    addArrangementAction(alignMenu, QStringLiteral("垂直中央"), Arrangement::VerticalCenter);
+    addArrangementAction(alignMenu, QStringLiteral("下"), Arrangement::Bottom);
+    addArrangementAction(distributeMenu, QStringLiteral("水平"), Arrangement::DistributeHorizontal);
+    addArrangementAction(distributeMenu, QStringLiteral("垂直"), Arrangement::DistributeVertical);
+
     auto *meshEditAction = compMenu->addAction(QStringLiteral("メッシュワープを編集"));
     meshEditAction->setCheckable(true);
     m_meshEditAction = meshEditAction;

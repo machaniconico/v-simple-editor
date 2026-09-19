@@ -751,6 +751,11 @@ public:
     bool canGroupClips(const QVector<GroupClipTarget> &clips, QString *error = nullptr) const;
     bool setClipGrouping(const QVector<GroupClipTarget> &clips, bool grouped,
                          QString *error = nullptr);
+    enum class LayerArrangement { Left, HorizontalCenter, Right, Top, VerticalCenter, Bottom,
+                                  DistributeHorizontal, DistributeVertical };
+    QVector<GroupClipTarget> selectedArrangementTargets() const;
+    bool canArrangeSelectedLayers(LayerArrangement arrangement) const;
+    bool arrangeSelectedLayers(LayerArrangement arrangement);
     void selectAllClips();
     void selectClipsFromPlayhead(bool forward);
     void bladeAllTracksAtPlayhead();

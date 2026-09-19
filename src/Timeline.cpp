@@ -5281,6 +5281,101 @@ QVector<Timeline::GroupClipTarget> Timeline::selectedGroupClipTargets() const
     return result;
 }
 
+QVector<Timeline::GroupClipTarget> Timeline::selectedArrangementTargets() const
+{
+    QVector<GroupClipTarget> result;
+    for (const auto &target : selectedGroupClipTargets()) {
+        if (target.audio) continue;
+        const auto *track = m_videoTracks[target.trackIndex];
+        if (target.clipIndex < 0 || target.clipIndex >= track->clipCount()) continue;
+        if (!clipgeom::isNullObjectFilePath(track->clips()[target.clipIndex].filePath))
+            result.append(target);
+    }
+    return result;
+}
+
+bool Timeline::canArrangeSelectedLayers(LayerArrangement arrangement) const
+{
+    const auto targets = selectedArrangementTargets();
+    const bool distribute = arrangement == LayerArrangement::DistributeHorizontal
+                         || arrangement == LayerArrangement::DistributeVertical;
+    if (targets.size() < (distribute ? 3 : 1)
+        || m_projectWidth <= 0 || m_projectHeight <= 0) return false;
+    for (const auto &target : targets)
+        if (m_videoTracks[target.trackIndex]->isLocked()) return false;
+    return true;
+}
+
+bool Timeline::arrangeSelectedLayers(LayerArrangement arrangement)
+{
+    if (!canArrangeSelectedLayers(arrangement)) return false;
+    const bool horizontal = arrangement == LayerArrangement::Left
+                         || arrangement == LayerArrangement::HorizontalCenter
+                         || arrangement == LayerArrangement::Right
+                         || arrangement == LayerArrangement::DistributeHorizontal;
+    const bool distribute = arrangement == LayerArrangement::DistributeHorizontal
+                         || arrangement == LayerArrangement::DistributeVertical;
+    const QSize canvas(m_projectWidth, m_projectHeight);
+    const double extent = horizontal ? canvas.width() : canvas.height();
+    struct Item { GroupClipTarget target; double start; double length; double delta = 0.0; };
+    QVector<Item> items;
+    for (const auto &target : selectedArrangementTargets()) {
+        const auto &clip = m_videoTracks[target.trackIndex]->clips()[target.clipIndex];
+        const clipgeom::ClipTransform transform{clip.videoScale, clip.videoDx,
+                                                clip.videoDy, clip.rotation2DDegrees};
+        // Use the rendering SSOT, including its center pivot, scale and rotation.
+        const QRectF bounds = clipgeom::resolveTransform(transform, canvas)
+            .mapRect(QRectF(QPointF(0, 0), QSizeF(canvas)));
+        const double start = horizontal ? bounds.left() : bounds.top();
+        const double length = horizontal ? bounds.width() : bounds.height();
+        if (!std::isfinite(start) || !std::isfinite(length)) return false;
+        items.append({target, start, length, 0.0});
+    }
+    if (distribute) {
+        std::stable_sort(items.begin(), items.end(), [](const Item &a, const Item &b) {
+            return a.start < b.start;
+        });
+        double totalLength = 0.0;
+        for (const auto &item : items) totalLength += item.length;
+        const double gap = (items.last().start + items.last().length
+                          - items.first().start - totalLength) / (items.size() - 1);
+        double next = items.first().start + items.first().length + gap;
+        for (int i = 1; i + 1 < items.size(); ++i) {
+            items[i].delta = next - items[i].start;
+            next += items[i].length + gap;
+        }
+    } else {
+        for (auto &item : items) {
+            double destination = 0.0;
+            if (arrangement == LayerArrangement::HorizontalCenter
+                || arrangement == LayerArrangement::VerticalCenter)
+                destination = (extent - item.length) * 0.5;
+            else if (arrangement == LayerArrangement::Right
+                     || arrangement == LayerArrangement::Bottom)
+                destination = extent - item.length;
+            item.delta = destination - item.start;
+        }
+    }
+    bool changed = false;
+    for (const auto &item : items) changed |= std::abs(item.delta) > 1e-9;
+    if (!changed) return true;
+    const TrackClipSnapshot before = snapshotTrackClips(this);
+    for (const auto &item : items) {
+        if (std::abs(item.delta) <= 1e-9) continue;
+        auto *track = m_videoTracks[item.target.trackIndex];
+        auto clips = track->clips();
+        auto &clip = clips[item.target.clipIndex];
+        if (horizontal) clip.videoDx += item.delta / extent;
+        else clip.videoDy += item.delta / extent;
+        track->setClips(clips);
+    }
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, before);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, before);
+    saveUndoState(distribute ? QStringLiteral("均等配置") : QStringLiteral("整列"));
+    refreshPlaybackSequence();
+    return true;
+}
+
 bool Timeline::canGroupClips(const QVector<GroupClipTarget> &clips, QString *error) const
 {
     auto reject = [&](const QString &message) { if (error) *error = message; return false; };
