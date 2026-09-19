@@ -799,6 +799,33 @@ double rollingShutterSourceFps(const ClipInfo &clip)
 }
 } // namespace
 
+namespace {
+std::atomic<bool> meshWarpDisabled{false};
+std::atomic<quint64> meshWarpCalls{0};
+
+QImage applyClipMeshWarp(const QImage &source, const ClipInfo &clip)
+{
+    if (source.isNull() || !hasActiveMeshWarp(clip))
+        return source;
+    MeshGrid pixels = clip.meshWarp;
+    for (auto &row : pixels.controlPoints)
+        for (QPointF &point : row) {
+            point.setX(point.x() * source.width());
+            point.setY(point.y() * source.height());
+        }
+    ++meshWarpCalls;
+    return WarpDistortion::applyMeshWarp(source, pixels).convertToFormat(source.format());
+}
+} // namespace
+
+bool hasActiveMeshWarp(const ClipInfo &clip)
+{
+    return !meshWarpDisabled.load() && !clip.isAdjustment && clip.hasMeshWarp();
+}
+void setMeshWarpDisabledForTesting(bool disabled) { meshWarpDisabled.store(disabled); }
+void resetMeshWarpInvocationCountForTesting() { meshWarpCalls.store(0); }
+quint64 meshWarpInvocationCountForTesting() { return meshWarpCalls.load(); }
+
 void setRollingShutterDisabledForTesting(bool disabled)
 {
     rollingShutterDisabled.store(disabled);
@@ -1995,7 +2022,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
                 v1NativeRaw, v1Clip, v1LocalSec, v1SourceSec,
                 echoFrameProvider);
         } else {
-            v1Fx = applyClipFxPack(v1Graded, v1Clip, v1LocalSec);
+            v1Fx = applyClipMeshWarp(
+                applyClipFxPack(v1Graded, v1Clip, v1LocalSec), v1Clip);
         }
 
         // S7: apply the V1 clip's per-clip compositing mask (motion-tracker
@@ -2193,7 +2221,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
             nativeForMask = applyClipFxStackWithEchoFromSource(
                 nativeRaw, c, localSec, srcSec, echoFrameProvider);
         } else {
-            nativeForMask = applyClipFxPack(gradedNative, c, localSec);
+            nativeForMask = applyClipMeshWarp(
+                applyClipFxPack(gradedNative, c, localSec), c);
         }
         if (c.hasMask()
             && (hdrexport16::enabledFromEnv() || hdrmatte16::enabledFromEnv())) {
@@ -2866,18 +2895,18 @@ QImage prepareClipSourceForEcho(const QImage &source, const ClipInfo &clip,
 QImage applyClipFxStackFromSource(const QImage &source, const ClipInfo &clip,
                                   double clipLocalSeconds)
 {
-    return applyClipFxPack(
+    return applyClipMeshWarp(applyClipFxPack(
         prepareClipSourceForEcho(source, clip, clipLocalSeconds),
-        clip, clipLocalSeconds);
+        clip, clipLocalSeconds), clip);
 }
 
 QImage applyClipFxStackWithEchoFromSource(
     const QImage &source, const ClipInfo &clip, double clipLocalSeconds,
     double sourceSeconds, const EchoFrameProvider &frameProvider)
 {
-    return applyClipFxPackWithEcho(
+    return applyClipMeshWarp(applyClipFxPackWithEcho(
         prepareClipSourceForEcho(source, clip, clipLocalSeconds),
-        clip, clipLocalSeconds, sourceSeconds, frameProvider);
+        clip, clipLocalSeconds, sourceSeconds, frameProvider), clip);
 }
 
 QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize outSize)

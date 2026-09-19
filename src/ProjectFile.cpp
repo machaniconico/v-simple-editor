@@ -1934,6 +1934,8 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
         obj["colorCorrection"] = colorCorrectionToJson(clip.colorCorrection);
     if (clip.colorCurves.hasCurves())
         obj["colorCurves"] = clipCurvesToJson(clip.colorCurves);
+    if (clip.hasMeshWarp())
+        obj["meshWarp"] = clip.meshWarp.toJson();
     if (!clip.hslSecondary.isDefault())
         obj["hslSecondary"] = hslSecondaryToJson(clip.hslSecondary);
     if (!clip.colorMeta.isDefault())
@@ -2049,6 +2051,8 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
         clip.colorCorrection = colorCorrectionFromJson(obj["colorCorrection"].toObject());
     if (obj.contains("colorCurves"))
         clip.colorCurves = clipCurvesFromJson(obj["colorCurves"].toObject());
+    if (obj.contains("meshWarp"))
+        clip.meshWarp = MeshGrid::fromJson(obj["meshWarp"].toObject());
     if (obj.contains("hslSecondary"))
         clip.hslSecondary = hslSecondaryFromJson(obj["hslSecondary"].toObject());
     clip.colorMeta = obj.contains("colorMeta")

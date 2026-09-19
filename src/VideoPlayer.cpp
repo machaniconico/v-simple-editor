@@ -105,7 +105,8 @@ QImage prepareClipForCpuComposite(
     const QVector<Mask> &masks)
 {
     const QImage effected = (tlrender::hasActiveEcho(clip, clipLocalSeconds)
-        || tlrender::hasActiveRollingShutter(clip, clipLocalSeconds))
+        || tlrender::hasActiveRollingShutter(clip, clipLocalSeconds)
+        || tlrender::hasActiveMeshWarp(clip))
         ? tlrender::applyClipFxStackWithEchoFromSource(
               source, clip, clipLocalSeconds, sourceSeconds, frameProvider)
         : tlrender::applyClipFxStackFromSource(
@@ -169,7 +170,9 @@ QImage VideoPlayer::composeCpuPreviewForTest(
         clipanim::effectiveEffectsAt(v1Clip, clipLocalSeconds);
     const QVector<VideoEffect> v2Effects =
         clipanim::effectiveEffectsAt(v2Clip, clipLocalSeconds);
-    if (!videopreview::stackRequiresClipLocalCpu(v1Effects)
+    if (!tlrender::hasActiveMeshWarp(v1Clip)
+        && !tlrender::hasActiveMeshWarp(v2Clip)
+        && !videopreview::stackRequiresClipLocalCpu(v1Effects)
         && !videopreview::stackRequiresClipLocalCpu(v2Effects)) {
         return QImage();
     }
@@ -3944,7 +3947,8 @@ bool VideoPlayer::hasClipLocalCpuFxAt(qint64 timelineUsec) const
                     effectivePreviewEffectsAt(
                         m_fullPreviewEffects, timeline, m_sequence,
                         timelineUsec, previewTarget);
-                if (videopreview::stackRequiresClipLocalCpu(
+                if (tlrender::hasActiveMeshWarp(*clip)
+                    || videopreview::stackRequiresClipLocalCpu(
                         evaluated, gpuAvailable)) {
                     return true;
                 }
@@ -3962,7 +3966,8 @@ bool VideoPlayer::hasClipLocalCpuFxAt(qint64 timelineUsec) const
             continue;
         const QVector<VideoEffect> evaluated = clipanim::effectiveEffectsAt(
             *clip, entryClipLocalSeconds(entry, timelineUsec));
-        if (videopreview::stackRequiresClipLocalCpu(
+        if (tlrender::hasActiveMeshWarp(*clip)
+            || videopreview::stackRequiresClipLocalCpu(
                 evaluated, gpuAvailable)) {
             return true;
         }

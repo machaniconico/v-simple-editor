@@ -9188,6 +9188,52 @@ void Timeline::setClipLayerMaterial(int trackIdx, int clipIdx,
     scheduleEmitSequenceChanged();
 }
 
+bool ClipInfo::hasMeshWarp() const
+{
+    if (meshWarp.rows < 2 || meshWarp.cols < 2
+        || meshWarp.controlPoints.size() != meshWarp.rows)
+        return false;
+    bool changed = false;
+    for (int r = 0; r < meshWarp.rows; ++r) {
+        if (meshWarp.controlPoints[r].size() != meshWarp.cols)
+            return false;
+        for (int c = 0; c < meshWarp.cols; ++c) {
+            const QPointF &p = meshWarp.controlPoints[r][c];
+            if (!std::isfinite(p.x()) || !std::isfinite(p.y()))
+                return false;
+            changed |= std::abs(p.x() - double(c) / (meshWarp.cols - 1)) >= 1e-6
+                || std::abs(p.y() - double(r) / (meshWarp.rows - 1)) >= 1e-6;
+        }
+    }
+    return changed;
+}
+
+void Timeline::setClipMeshWarp(int trackIdx, int clipIdx, const MeshGrid &grid)
+{
+    if (trackIdx < 0 || trackIdx >= m_videoTracks.size()) return;
+    auto *track = m_videoTracks[trackIdx];
+    if (!track || track->isLocked()) return;
+    auto clips = track->clips();
+    if (clipIdx < 0 || clipIdx >= clips.size()) return;
+    const MeshGrid &old = clips[clipIdx].meshWarp;
+    if (old.rows == grid.rows && old.cols == grid.cols
+        && old.controlPoints == grid.controlPoints) return;
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    clips[clipIdx].meshWarp = grid;
+    track->setClips(clips);
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+    saveUndoState(QStringLiteral("メッシュワープ"));
+    refreshPlaybackSequence();
+}
+
+void Timeline::resetClipMeshWarp(int trackIdx, int clipIdx, int rows, int cols)
+{
+    if (rows < 2 || cols < 2) return;
+    setClipMeshWarp(trackIdx, clipIdx,
+                   WarpDistortion::createDefaultMesh(QSize(1, 1), rows, cols));
+}
+
 void Timeline::setClipShapeModifiers(int trackIdx, int clipIdx,
                                      const ShapeModifiers &modifiers, bool recordUndo)
 {

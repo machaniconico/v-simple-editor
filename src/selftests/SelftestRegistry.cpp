@@ -146,6 +146,7 @@ int runMediaPoolRatingSelftest();
 int runMediaPoolSelftest();
 int runMediaPoolThumbsSelftest();
 int runMediaRelinkSelftest();
+int runMeshWarpSelftest();
 int runMobileSelftest();
 int runMographSelftest();
 int runMotionBlurP2Selftest();
@@ -616,6 +617,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "AE-FX-5 Generate Family: gradient ramp, fill, bloom, scanlines, halftone gates (G1-G6)" },
     { "ae-fx-stylize",     "VEDITOR_AE_FX_STYLIZE_SELFTEST",      runAeFxStylizeSelftest,        false,
       "AE-FX-2 Stylize Family: glow, edges, emboss, posterize, threshold, solarize gates (G1-G7)" },
+    { "mesh-warp", "VEDITOR_MESH_WARP_SELFTEST", runMeshWarpSelftest, true,
+      "正規化メッシュワープ・描画・保存・Undo" },
     { "rolling-shutter", "VEDITOR_ROLLING_SHUTTER_SELFTEST", runRollingShutterSelftest, true,
       "Rolling shutter: bypass, repair, direction, last frame, determinism, presets (G1-G6)" },
     { "fxgrain-echo",      "VEDITOR_FXGRAIN_ECHO_SELFTEST",       runFxGrainEchoSelftest,         false,

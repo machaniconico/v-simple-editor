@@ -47,6 +47,7 @@
 #include "MotionTracker.h"   // S7: per-clip tracker data animating the mask
 #include "TimeRemap.h"
 #include "ShapeLayer.h"
+#include "WarpDistortion.h"
 
 // Shared timeline/source bounds after borrowing transition handles.
 struct OverlapInterval {
@@ -278,6 +279,9 @@ struct ClipInfo {
     // OFF and omitted from project JSON; renderFrameAt mirrors GLPreview's
     // HSL mask + secondary LGG math before the primary grade.
     HslSecondaryGrade hslSecondary;
+    // Source-relative coordinates; (1, 1) is the source width/height.
+    MeshGrid meshWarp;
+    bool hasMeshWarp() const;
     QVector<VideoEffect> effects;
     KeyframeManager keyframes;
 
@@ -995,6 +999,9 @@ public:
     void setClipLayerMaterial(int trackIdx, int clipIdx,
                               const LayerMaterial &material,
                               bool recordUndo = false);
+    // Normalized source mesh; one undo entry per changed grid.
+    void setClipMeshWarp(int trackIdx, int clipIdx, const MeshGrid &grid);
+    void resetClipMeshWarp(int trackIdx, int clipIdx, int rows, int cols);
     // Shape-clip UI edits shapes[0]. Live changes do not create undo entries.
     void setClipShapeModifiers(int trackIdx, int clipIdx,
                                const ShapeModifiers &modifiers, bool recordUndo);

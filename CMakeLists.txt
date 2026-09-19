@@ -163,6 +163,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/AeFxDistort2Selftest.cpp
     src/selftests/AeFxGenerateSelftest.cpp
     src/selftests/AeFxStylizeSelftest.cpp
+    src/selftests/mesh_warp_selftest.cpp
     src/selftests/rolling_shutter_selftest.cpp
     src/selftests/fxgrain_echo_selftest.cpp
 
