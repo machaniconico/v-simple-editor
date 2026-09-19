@@ -619,6 +619,7 @@ protected:
     void paintEvent(QPaintEvent *event) override;
     void mousePressEvent(QMouseEvent *event) override;
     void mouseMoveEvent(QMouseEvent *event) override;
+    void leaveEvent(QEvent *event) override;
     void mouseReleaseEvent(QMouseEvent *event) override;
     void dragEnterEvent(QDragEnterEvent *event) override;
     void dragMoveEvent(QDragMoveEvent *event) override;
@@ -693,6 +694,11 @@ class Timeline : public QWidget
 
 public:
     explicit Timeline(QWidget *parent = nullptr);
+    void setSkimmingEnabled(bool enabled);
+    bool skimmingEnabled() const { return m_skimmingEnabled; }
+    void setSkimmingPlaybackActive(bool playing);
+    void hoverSkim(TimelineTrack *track, const QPoint &pos);
+    void clearSkim();
     void setFilmstripEnabled(bool enabled);
     bool filmstripEnabled() const { return m_filmstripEnabled; }
     void setFilmstripCache(ThumbnailCache *cache);
@@ -1273,6 +1279,8 @@ public:
         return m_trackMatteEntries;
     }
 signals:
+    void skimPreviewRequested(const QImage &image);
+    void skimPreviewCleared();
     void trackIndicesRemapped(bool audio, QVector<int> oldToNew);
     void trackStateRestored();
     void renderInPlaceRequested(int trackIndex, int clipIndex);
@@ -1446,6 +1454,11 @@ private:
     QVector3D m_projectLightViewPosition = QVector3D();
     double m_markIn = -1.0;
     double m_markOut = -1.0;
+    bool m_skimmingEnabled = false;
+    bool m_skimmingPlaybackActive = false;
+    bool m_skimVisible = false;
+    QPointer<TimelineTrack> m_skimTrack;
+    QPoint m_skimPos;
     bool m_filmstripEnabled = false;
     QPointer<ThumbnailCache> m_filmstripCache;
     QMetaObject::Connection m_filmstripReadyConnection;

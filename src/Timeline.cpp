@@ -2332,14 +2332,84 @@ void TimelineTrack::paintFilmstrip(QPainter &painter, int clipIndex, const QRect
     }
 }
 
+void Timeline::setSkimmingEnabled(bool enabled)
+{
+    if (m_skimmingEnabled == enabled) return;
+    m_skimmingEnabled = enabled;
+    if (!enabled) clearSkim();
+    if (enabled && !m_filmstripCache) setFilmstripCache(new ThumbnailCache(this));
+}
+
+void Timeline::setSkimmingPlaybackActive(bool playing)
+{
+    m_skimmingPlaybackActive = playing;
+    if (playing) clearSkim();
+}
+
+void Timeline::clearSkim()
+{
+    m_skimTrack.clear();
+    if (!m_skimVisible) return;
+    m_skimVisible = false;
+    emit skimPreviewCleared();
+}
+
+void Timeline::hoverSkim(TimelineTrack *track, const QPoint &pos)
+{
+    // OFF must not even query the shared thumbnail cache.
+    if (!m_skimmingEnabled) return;
+    if (m_skimmingPlaybackActive || !track || track->isAudioTrack()
+        || !track->rect().contains(pos)) { clearSkim(); return; }
+    const int index = track->clipAtX(pos.x());
+    if (index < 0) { clearSkim(); return; }
+    const auto &clip = track->clips()[index];
+    if (clip.filePath.isEmpty() || !clip.sequenceRefId.isEmpty()
+        || !clip.shapes.isEmpty() || clipgeom::isNullObjectFilePath(clip.filePath)) {
+        clearSkim();
+        return;
+    }
+    auto *cache = filmstripCache();
+    if (!cache) { clearSkim(); return; }
+    m_skimTrack = track;
+    m_skimPos = pos;
+    cache->request(clip.filePath, clip.filePath, 0.0, 8);
+    const auto frames = cache->frames(clip.filePath);
+    if (frames.isEmpty()) {
+        if (m_skimVisible) {
+            m_skimVisible = false;
+            emit skimPreviewCleared();
+        }
+        return;
+    }
+    const int width = qMax(20, static_cast<int>(clip.effectiveDuration()
+                                               * track->pixelsPerSecond()));
+    const int frame = ThumbnailCache::skimIndex(pos.x() - track->clipStartX(index),
+                                                width, int(frames.size()));
+    if (frames[frame].isNull()) { clearSkim(); return; }
+    m_skimVisible = true;
+    emit skimPreviewRequested(frames[frame]);
+}
+
+void TimelineTrack::leaveEvent(QEvent *event)
+{
+    if (m_timeline && m_timeline->skimmingEnabled()) m_timeline->clearSkim();
+    QWidget::leaveEvent(event);
+}
+
 void Timeline::setFilmstripCache(ThumbnailCache *cache)
 {
     if (m_filmstripCache == cache) return;
+    clearSkim();
     disconnect(m_filmstripReadyConnection);
     m_filmstripCache = cache;
     if (cache) {
         m_filmstripReadyConnection = connect(cache, &ThumbnailCache::ready, this,
             [this](const QString &key, const QVector<QImage> &) {
+                if (m_skimmingEnabled && m_skimTrack) {
+                    const int index = m_skimTrack->clipAtX(m_skimPos.x());
+                    if (index >= 0 && m_skimTrack->clips()[index].filePath == key)
+                        hoverSkim(m_skimTrack.data(), m_skimPos);
+                }
                 if (!m_filmstripEnabled) return;
                 for (auto *track : m_videoTracks)
                     for (const auto &clip : track->clips())
@@ -2705,6 +2775,7 @@ void TimelineTrack::paintEvent(QPaintEvent *event)
 
 void TimelineTrack::mousePressEvent(QMouseEvent *event)
 {
+    if (m_timeline && m_timeline->skimmingEnabled()) m_timeline->clearSkim();
     if (m_locked) { event->accept(); return; }
     if (event->button() == Qt::LeftButton
         && event->pos().y() >= m_rowHeight - RESIZE_HANDLE_HEIGHT) {
@@ -2962,6 +3033,10 @@ void TimelineTrack::handleBodyClick(QMouseEvent *ev, int clipIndex)
 
 void TimelineTrack::mouseMoveEvent(QMouseEvent *event)
 {
+    if (m_timeline) {
+        if (event->buttons() == Qt::NoButton) m_timeline->hoverSkim(this, event->pos());
+        else if (m_timeline->skimmingEnabled()) m_timeline->clearSkim();
+    }
     if (m_marqueeCandidate) {
         const QPoint end = event->globalPosition().toPoint();
         if ((end - m_marqueeStartGlobal).manhattanLength() >= 4)
@@ -10609,6 +10684,7 @@ void Timeline::normalizeAudioClipPeak(int trackIdx, int clipIdx)
 
 void Timeline::setPlayheadPosition(double seconds)
 {
+    if (m_skimmingEnabled) clearSkim();
     m_playheadPos = qMax(0.0, seconds);
     syncPlayheadOverlay();
     // Chase mode: when playback or an external seek pushes the playhead

@@ -217,6 +217,7 @@ int runTextExportSelftest();
 int runTcburnSelftest();
 int runThreePointEditSelftest();
 int runTimelineErgoSelftest();
+int runTimelineSkimSelftest();
 int runTrackManageSelftest();
 int runTrackMatteExportIntegrationSelftest();
 int runTrackMatteParitySelftest();
@@ -830,6 +831,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Track removal/reorder: header menus, external state undo, exact row restoration and project persistence (12 gates)" },
     { "track-manage", "VEDITOR_TRACK_MANAGE_SELFTEST", runTrackManageSelftest, true,
       "Track names/colors: project roundtrip, single-step undo and invalid targets (3 gates)" },
+    { "timeline-skim", "VEDITOR_TIMELINE_SKIM_SELFTEST", runTimelineSkimSelftest, true,
+      "Timeline hover skimming: default off, shared cache mapping, preview restoration and no undo (4 gates)" },
     { "timeline-ergo", "VEDITOR_TIMELINE_ERGO_SELFTEST", runTimelineErgoSelftest, true,
       "Timeline selection, blade, gaps, duplicate, nudge, marquee, zoom, timecode, playhead moves, labels and linked selection (12 gates)" },
     { "ripple-delete", "VEDITOR_RIPPLE_DELETE_SELFTEST", runRippleDeleteSelftest, true,

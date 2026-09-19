@@ -216,6 +216,10 @@ public:
     // an active playback.
     bool isPlaying() const { return m_playing; }
 
+    // Temporary thumbnail display; the playhead frame and decoder stay untouched.
+    void showTimelineSkim(const QImage &image);
+    void clearTimelineSkim();
+
     // Iteration 15 — preview-maximize state. MainWindow listens for
     // previewMaximizeChanged and hides/shows the timeline accordingly.
     bool isPreviewMaximized() const { return m_previewMaximized; }
@@ -609,6 +613,8 @@ private:
     void closeTrackDecoder(TrackDecoder *d);
     static enum AVPixelFormat poolGetHwFormatCallback(AVCodecContext *ctx, const enum AVPixelFormat *pixFmts);
 
+    QLabel *m_timelineSkimDisplay = nullptr;
+    QImage m_timelineSkimImage;
     QLabel *m_videoDisplay;
     GLPreview *m_glPreview = nullptr;
     bool m_useGL = true;

@@ -5850,9 +5850,36 @@ void VideoPlayer::refreshDisplayedFrame()
                  resolvedDisplayTimelineUsec(-1));
 }
 
+void VideoPlayer::showTimelineSkim(const QImage &image)
+{
+    if (m_playing || image.isNull()) return;
+    if (!m_timelineSkimDisplay) {
+        m_timelineSkimDisplay = new QLabel(this);
+        m_timelineSkimDisplay->setObjectName(QStringLiteral("timelineSkimPreview"));
+        m_timelineSkimDisplay->setAttribute(Qt::WA_TransparentForMouseEvents);
+        m_timelineSkimDisplay->setAlignment(Qt::AlignCenter);
+        m_timelineSkimDisplay->setStyleSheet(QStringLiteral("background: black;"));
+    }
+    m_timelineSkimImage = image;
+    QWidget *surface = m_useGL && m_glPreview ? static_cast<QWidget *>(m_glPreview) : m_videoDisplay;
+    m_timelineSkimDisplay->setGeometry(QRect(surface->mapTo(this, QPoint()), surface->size()));
+    m_timelineSkimDisplay->setPixmap(QPixmap::fromImage(image.scaled(
+        m_timelineSkimDisplay->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation)));
+    m_timelineSkimDisplay->show();
+    m_timelineSkimDisplay->raise();
+}
+
+void VideoPlayer::clearTimelineSkim()
+{
+    // Reveal the still-live playhead surface without seeking or recompositing.
+    if (m_timelineSkimDisplay) m_timelineSkimDisplay->hide();
+    m_timelineSkimImage = QImage();
+}
+
 void VideoPlayer::resizeEvent(QResizeEvent *event)
 {
     QWidget::resizeEvent(event);
+    if (!m_timelineSkimImage.isNull()) showTimelineSkim(m_timelineSkimImage);
     if (m_regionPickerOverlay && m_glPreview) {
         QStackedWidget *stack = qobject_cast<QStackedWidget *>(m_glPreview->parentWidget());
         m_regionPickerOverlay->setGeometry(stack ? stack->geometry() : m_glPreview->geometry());

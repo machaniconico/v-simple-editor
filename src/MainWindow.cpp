@@ -4835,6 +4835,19 @@ void MainWindow::setupMenuBar()
 
     // 表示 メニュー
     auto *viewMenu = menuBar()->addMenu("表示(&V)");
+    auto *skimAction = viewMenu->addAction(QStringLiteral("タイムラインのスキミング"));
+    skimAction->setCheckable(true);
+    skimAction->setChecked(QSettings(QStringLiteral("VSimpleEditor"),
+        QStringLiteral("Preferences")).value(QStringLiteral("timeline/skimming"), false).toBool());
+    m_timeline->setSkimmingEnabled(skimAction->isChecked());
+    connect(skimAction, &QAction::toggled, this, [this](bool enabled) {
+        m_timeline->setSkimmingEnabled(enabled);
+        QSettings(QStringLiteral("VSimpleEditor"), QStringLiteral("Preferences"))
+            .setValue(QStringLiteral("timeline/skimming"), enabled);
+    });
+    connect(m_timeline, &Timeline::skimPreviewRequested, m_player, &VideoPlayer::showTimelineSkim);
+    connect(m_timeline, &Timeline::skimPreviewCleared, m_player, &VideoPlayer::clearTimelineSkim);
+    connect(m_player, &VideoPlayer::stateChanged, m_timeline, &Timeline::setSkimmingPlaybackActive);
     auto *filmstripAction = viewMenu->addAction(QStringLiteral("クリップのサムネイルを表示"));
     filmstripAction->setCheckable(true);
     filmstripAction->setChecked(QSettings(QStringLiteral("VSimpleEditor"),

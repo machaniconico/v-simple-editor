@@ -519,6 +519,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/align_distribute_selftest.cpp
     src/selftests/clip_group_selftest.cpp
     src/selftests/timeline_ergo_selftest.cpp
+    src/selftests/timeline_skim_selftest.cpp
     src/selftests/FreezeFrameSelftest.cpp
     src/MotionSectionWidget.h
     src/MotionSectionWidget.cpp
