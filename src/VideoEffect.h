@@ -1,5 +1,11 @@
 #pragma once
 
+namespace offsetwheel {
+void setDisabledForTest(bool disabled);
+void resetCallCountForTest();
+int callCountForTest();
+}
+
 #include <QImage>
 #include <QColor>
 #include <QVector>
@@ -48,6 +54,7 @@ struct ColorCorrection {
     double exposure = 0.0;      // -3.0 to 3.0
 
     // Lift/Gamma/Gain color wheels (DaVinci Resolve style)
+    double offsetR = 0.0, offsetG = 0.0, offsetB = 0.0; // -2.0 to 2.0; Stage 1 additive
     double liftR = 0.0, liftG = 0.0, liftB = 0.0;       // -1.0 to 1.0
     double gammaR = 0.0, gammaG = 0.0, gammaB = 0.0;     // -1.0 to 1.0
     double gainR = 0.0, gainG = 0.0, gainB = 0.0;        // -1.0 to 1.0
@@ -64,6 +71,7 @@ struct ColorCorrection {
             && hue == 0.0 && temperature == 0.0 && tint == 0.0
             && gamma == 1.0 && highlights == 0.0 && shadows == 0.0
             && exposure == 0.0
+            && offsetR == 0.0 && offsetG == 0.0 && offsetB == 0.0
             && liftR == 0.0 && liftG == 0.0 && liftB == 0.0
             && gammaR == 0.0 && gammaG == 0.0 && gammaB == 0.0
             && gainR == 0.0 && gainG == 0.0 && gainB == 0.0

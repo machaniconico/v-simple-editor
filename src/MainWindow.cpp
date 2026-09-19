@@ -6751,6 +6751,9 @@ void MainWindow::setupMenuBar()
             && near(a.highlights, b.highlights)
             && near(a.shadows, b.shadows)
             && near(a.exposure, b.exposure)
+            && near(a.offsetR, b.offsetR)
+            && near(a.offsetG, b.offsetG)
+            && near(a.offsetB, b.offsetB)
             && near(a.liftR, b.liftR)
             && near(a.liftG, b.liftG)
             && near(a.liftB, b.liftB)
@@ -6795,6 +6798,7 @@ void MainWindow::setupMenuBar()
                      static_cast<double>(cw.gain.z()),
                      cw.gainLuma};
         m_player->glPreview()->setLiftGammaGain(values);
+        m_player->glPreview()->setOffset({cw.offset.x(), cw.offset.y(), cw.offset.z()});
         const std::array<std::array<double,3>,3> logValues = {{
             {static_cast<double>(cw.logShadow.x()),
              static_cast<double>(cw.logShadow.y()),

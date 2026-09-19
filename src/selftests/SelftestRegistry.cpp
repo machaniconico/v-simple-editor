@@ -164,6 +164,7 @@ int runMusicRemixSelftest();
 int runMultiCamSelftest();
 int runNestSequenceSelftest();
 int runObsSelftest();
+int runOffsetWheelSelftest();
 int runOnionSkinSelftest();
 int runParitySelftest();
 int runPlanarSelftest();
@@ -547,6 +548,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "ColorCorrection LGG 9-field project serialization round-trip/default-omit/backward-compat gates" },
     { "color-warper", "VEDITOR_COLOR_WARPER_SELFTEST", runColorWarperSelftest, false,
       "Hue/saturation mesh CPU math and persistence (6 gates)" },
+    { "offset-wheel", "VEDITOR_OFFSET_WHEEL_SELFTEST", runOffsetWheelSelftest, true,
+      "Offset wheel CPU/GPU, project, MCP and preset parity (5 gates)" },
     { "grade-log-wheel", "VEDITOR_GRADE_LOG_WHEEL_SELFTEST", runGradeLogWheelSelftest, false,
       "ColorCorrection Log Shadow/Midtone/Highlight CPU math and project serialization (5 gates)" },
     { "aihighlight",       "VEDITOR_AIHIGHLIGHT_SELFTEST",        runAIHighlightSelftest,        false,

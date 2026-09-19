@@ -2116,6 +2116,9 @@ QJsonObject ProjectFile::colorCorrectionToJson(const ColorCorrection &cc)
         if (value != 0.0)
             obj[key] = value;
     };
+    addIfNonZero(QStringLiteral("offsetR"), cc.offsetR);
+    addIfNonZero(QStringLiteral("offsetG"), cc.offsetG);
+    addIfNonZero(QStringLiteral("offsetB"), cc.offsetB);
     addIfNonZero(QStringLiteral("liftR"), cc.liftR);
     addIfNonZero(QStringLiteral("liftG"), cc.liftG);
     addIfNonZero(QStringLiteral("liftB"), cc.liftB);
@@ -2159,6 +2162,9 @@ ColorCorrection ProjectFile::colorCorrectionFromJson(const QJsonObject &obj)
     cc.highlights = obj["highlights"].toDouble();
     cc.shadows = obj["shadows"].toDouble();
     cc.exposure = obj["exposure"].toDouble();
+    cc.offsetR = obj["offsetR"].toDouble(0.0);
+    cc.offsetG = obj["offsetG"].toDouble(0.0);
+    cc.offsetB = obj["offsetB"].toDouble(0.0);
     cc.liftR = obj["liftR"].toDouble(0.0);
     cc.liftG = obj["liftG"].toDouble(0.0);
     cc.liftB = obj["liftB"].toDouble(0.0);

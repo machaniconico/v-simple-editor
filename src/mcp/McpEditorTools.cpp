@@ -309,6 +309,9 @@ const McpColorField kMcpColorFields[] = {
     // ColorGradingPanel::syncColorCorrectionFromWheels adds RGB and luma
     // lift/gain (-1..1 each). sliderToGamma supplies 0.1..4.0 for both
     // gamma factors, stored by syncColorCorrectionFromWheels as log2(RGB * luma).
+    {"offsetR", &ColorCorrection::offsetR, -2, 2},
+    {"offsetG", &ColorCorrection::offsetG, -2, 2},
+    {"offsetB", &ColorCorrection::offsetB, -2, 2},
     {"liftR", &ColorCorrection::liftR, -2, 2},
     {"liftG", &ColorCorrection::liftG, -2, 2},
     {"liftB", &ColorCorrection::liftB, -2, 2},
@@ -332,8 +335,14 @@ const McpColorField kMcpColorFields[] = {
 QJsonObject colorCorrectionToJson(const ColorCorrection &cc)
 {
     QJsonObject result;
-    for (const auto &field : kMcpColorFields)
-        result.insert(QString::fromLatin1(field.name), cc.*(field.member));
+    for (const auto &field : kMcpColorFields) {
+        // Preserve the existing readback shape for grades without offset.
+        const bool offset = field.member == &ColorCorrection::offsetR
+            || field.member == &ColorCorrection::offsetG
+            || field.member == &ColorCorrection::offsetB;
+        if (!offset || cc.*(field.member) != 0.0)
+            result.insert(QString::fromLatin1(field.name), cc.*(field.member));
+    }
     return result;
 }
 

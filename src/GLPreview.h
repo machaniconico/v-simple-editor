@@ -57,6 +57,7 @@ public:
     void setLutIntensity(double intensity);
     void clearLut();
     // US-WIRE-2: Lift/Gamma/Gain color wheels from ColorGradingPanel
+    void setOffset(const std::array<double,3> &values);
     void setLiftGammaGain(const std::array<std::array<double,4>,3> &values);
     // Log range wheels: Shadow / Midtone / Highlight RGB adjustments.
     void setLogWheels(const std::array<std::array<double,3>,3> &values);
@@ -444,6 +445,8 @@ private:
     QImage::Format m_textureFormat = QImage::Format_Invalid;
 
     // Lift/Gamma/Gain uniform locations (vec4: xyz=RGB, w=Luma)
+    int m_locOffset = -1;
+    std::array<double,3> m_offset = {{0.0, 0.0, 0.0}};
     int m_locLift = -1, m_locLggGamma = -1, m_locGain = -1;
     // Identity: lift=(0,0,0,0), gamma=(1,1,1,1), gain=(1,1,1,1)
     std::array<std::array<double,4>,3> m_liftGammaGain = {{

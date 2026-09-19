@@ -10,6 +10,14 @@
 #include <cmath>
 #include <cstdint>
 
+namespace offsetwheel {
+static thread_local bool disabledForTest = false;
+static thread_local int callsForTest = 0;
+void setDisabledForTest(bool disabled) { disabledForTest = disabled; }
+void resetCallCountForTest() { callsForTest = 0; }
+int callCountForTest() { return callsForTest; }
+}
+
 // --- Helpers ---
 
 static inline int clamp255(int v) { return qBound(0, v, 255); }
@@ -1426,7 +1434,10 @@ QImage VideoEffectProcessor::applyColorCorrection(const QImage &input, const Col
 
     // Lift/Gamma/Gain followed by Log range wheels — must match GLSL
     // applyLiftGammaGain() and applyLogWheels().
-    const bool hasLGG = cc.liftR != 0.0 || cc.liftG != 0.0 || cc.liftB != 0.0
+    const bool hasOffset = !offsetwheel::disabledForTest
+        && (cc.offsetR != 0.0 || cc.offsetG != 0.0 || cc.offsetB != 0.0);
+    if (hasOffset && offsetwheel::callsForTest < 2147483647) ++offsetwheel::callsForTest;
+    const bool hasLGG = hasOffset || cc.liftR != 0.0 || cc.liftG != 0.0 || cc.liftB != 0.0
                      || cc.gammaR != 0.0 || cc.gammaG != 0.0 || cc.gammaB != 0.0
                      || cc.gainR != 0.0 || cc.gainG != 0.0 || cc.gainB != 0.0;
     if (hasLGG || hasLog) {
@@ -1447,6 +1458,14 @@ QImage VideoEffectProcessor::applyColorCorrection(const QImage &input, const Col
                     r += cc.liftR * 0.5;
                     g += cc.liftG * 0.5;
                     b += cc.liftB * 0.5;
+
+                    // Offset uses the same Stage 1 scale as lift: uniform across
+                    // shadows and highlights, before the gamma/gain transforms.
+                    if (hasOffset) {
+                        r += cc.offsetR * 0.5;
+                        g += cc.offsetG * 0.5;
+                        b += cc.offsetB * 0.5;
+                    }
 
                     // Stage 2 — Gamma: power curve; internalGamma = pow(2, gammaR) — matches GPU contract
                     // cc.gammaR in [-1,1], neutral=0 → internalGamma=1 → identity pow(in,1)
