@@ -1249,6 +1249,7 @@ public:
     }
 signals:
     void trackIndicesRemapped(bool audio, QVector<int> oldToNew);
+    void trackStateRestored();
     void renderInPlaceRequested(int trackIndex, int clipIndex);
     void clipSelected(int index);
     // V3 sprint — track-aware overload. emitted alongside the int-only
@@ -1327,6 +1328,8 @@ private:
     std::function<QJsonObject()> m_collectExternalTrackState;
     std::function<void(const QJsonObject&)> m_applyExternalTrackState;
     void captureExternalTrackState();
+    quint64 m_trackStructureRevision = 0;
+    quint64 m_nextTrackStructureRevision = 0;
     void removeTrackInternal(bool audio, int index);
 public:
     void restoreState(const TimelineState &state);

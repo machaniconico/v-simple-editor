@@ -747,6 +747,7 @@ private:
     void handleMediaRelinkHistoryChanged();
     QJsonObject collectExternalTrackState() const;
     void applyExternalTrackState(const QJsonObject &state);
+    void syncTrackMatteEntriesFromTimeline();
     void remapExternalTrackIndices(bool audio, const QVector<int> &oldToNew);
     void collectAudioState(ProjectData &data);
     void applyAudioState(const ProjectData &data);

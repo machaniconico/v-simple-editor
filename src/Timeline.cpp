@@ -4115,6 +4115,7 @@ void Timeline::addVideoTrack(bool recordUndo)
         createTrackHeader(track, QString("V%1").arg(num), false));
 
     m_videoTracks.append(track);
+    m_trackStructureRevision = ++m_nextTrackStructureRevision;
     wireTrackSelection(track);
     updateInfoLabel();
     if (recordUndo) saveUndoState(QStringLiteral("トラックを追加"));
@@ -4199,6 +4200,7 @@ void Timeline::addAudioTrack(bool recordUndo)
         createTrackHeader(track, QString("A%1").arg(num), true));
 
     m_audioTracks.append(track);
+    m_trackStructureRevision = ++m_nextTrackStructureRevision;
     wireTrackSelection(track);
     updateInfoLabel();
     if (recordUndo) saveUndoState(QStringLiteral("トラックを追加"));
@@ -4257,6 +4259,7 @@ bool Timeline::moveTrack(bool audio, int from, int to, QString *err)
 
 void Timeline::remapTrackIndices(bool audio, const QVector<int> &oldToNew)
 {
+    m_trackStructureRevision = ++m_nextTrackStructureRevision;
     // Track identity is the widget during this operation. Clip order within
     // each widget is unchanged; clip-order survivor remapping must not run.
     auto &tracks = audio ? m_audioTracks : m_videoTracks;
@@ -12156,6 +12159,7 @@ TimelineState Timeline::currentState() const
     state.playheadPos = m_playheadPos;
     state.clipParentEntries = clipParentEntries();
     state.trackMatteEntries = m_trackMatteEntries;
+    state.trackStructureRevision = m_trackStructureRevision;
 
     if (m_audioMixer) {
         const int n = audioTrackCount();
@@ -12175,6 +12179,9 @@ TimelineState Timeline::currentState() const
 void Timeline::restoreState(const TimelineState &state)
 {
     undotrace::log("restoreState:enter");
+    const bool structureChanged = m_trackStructureRevision != state.trackStructureRevision
+        || m_videoTracks.size() != state.videoTracks.size()
+        || m_audioTracks.size() != state.audioTracks.size();
     // Deferred deletion keeps menu callbacks safe; remap receivers clear retained pointers.
     while (m_videoTracks.size() > qMax(1, int(state.videoTracks.size())))
         removeTrackInternal(false, m_videoTracks.size() - 1);
@@ -12301,7 +12308,13 @@ void Timeline::restoreState(const TimelineState &state)
     // VideoPlayer rebuilds its sequence after undo/redo.
     refreshTextStrip();
     scheduleEmitSequenceChanged();
-    if (m_applyExternalTrackState) m_applyExternalTrackState(state.externalTrackState);
+    m_trackStructureRevision = state.trackStructureRevision;
+    m_nextTrackStructureRevision = qMax(m_nextTrackStructureRevision, m_trackStructureRevision);
+    // Playback flags and mixer edits are not ordinary timeline undo state.
+    // Restore external owners only when crossing a track-structure change.
+    if (structureChanged && m_applyExternalTrackState)
+        m_applyExternalTrackState(state.externalTrackState);
+    emit trackStateRestored();
     syncActiveSequenceFromCurrentTracks();
     undotrace::log("restoreState:exit");
 }

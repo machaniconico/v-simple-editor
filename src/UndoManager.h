@@ -40,6 +40,9 @@ struct TimelineState {
     QVector<QColor> videoTrackColors, audioTrackColors;
     QVector<double> audioTrackGains;
     QJsonObject externalTrackState;
+    // Identity of the track structure, shared by ordinary edits. A new
+    // add/remove/move gets a fresh revision, including compound operations.
+    quint64 trackStructureRevision = 0;
     QHash<QString, QString> clipParentEntries;
     QHash<QString, TimelineTrackMatteEntry> trackMatteEntries;
     // スナップショット時のプロジェクト出力ジオメトリ。SNS プリセット(プロジェクトを

@@ -3,6 +3,8 @@
 #include "../AudioMixer.h"
 #include "../AudioBusRouting.h"
 #include "../ProjectFile.h"
+#include "../MainWindow.h"
+#include <QJsonArray>
 #include <memory>
 
 #include <QCoreApplication>
@@ -304,6 +306,95 @@ int runTrackOpsSelftest()
             && routing.trackBus(2) == bus;
         t.undo();
         gate(7, ok && mixer->collectTrackState() == initialMixer && routing.toJson() == initialRouting);
+    }
+    {
+        Timeline t;
+        setup(t);
+        auto mixer = std::make_unique<AudioMixer>();
+        int applied = 0;
+        t.setExternalTrackStateHooks([&]() { return mixer->collectTrackState(); },
+            [&](const QJsonObject &state) { ++applied; mixer->applyTrackState(state); });
+        QObject::connect(&t, &Timeline::trackIndicesRemapped, &t,
+            [&](bool audio, const QVector<int> &map) {
+                if (audio) mixer->remapTrackIndices(map);
+            });
+        baseline(t);
+        // An ordinary edit adjacent to a structural entry must not inherit
+        // its restore policy, in either direction or through history jumps.
+        bool ok = t.moveTrack(true, 1, 2)
+            && t.setTrackCustomName(false, 0, QStringLiteral("改名"));
+        mixer->setTrackSolo(1, true);
+        mixer->setTrackMute(1, true);
+        mixer->setTrackGain(1, 0.4);
+        mixer->setTrackEqEnabled(1, true);
+        const auto live = mixer->collectTrackState();
+        t.undo();
+        ok = ok && applied == 0 && mixer->collectTrackState() == live
+            && mixer->collectTrackState()["states"].toArray()[1].toObject()["solo"].toBool();
+        t.redo();
+        ok = ok && applied == 0 && mixer->collectTrackState() == live;
+        QObject::connect(t.undoManager(), &UndoManager::stateJumpRequested,
+                         &t, &Timeline::restoreState);
+        ok = t.undoManager()->jumpTo(1) && ok
+            && applied == 0 && mixer->collectTrackState() == live;
+        ok = t.undoManager()->jumpTo(0) && ok && applied == 1;
+        ok = t.undoManager()->jumpTo(2) && ok && applied == 2;
+        gate(8, ok);
+    }
+    {
+        // Exercise the real MainWindow hook, which used to overwrite the
+        // carrier with its stale pre-split sidecar on redo.
+        MainWindow window;
+        auto *t = window.findChild<Timeline *>();
+        bool ok = t != nullptr;
+        if (t) {
+            const QVector<QVector<ClipInfo>> video{{clip(0), clip(1)}};
+            const QVector<QVector<ClipInfo>> audio{{}};
+            t->restoreFromProject(video, audio, 0.0, -1.0, -1.0, 100);
+            TimelineTrackMatteEntry matte;
+            matte.matteType = TrackMatteType::AlphaMatte;
+            matte.matteSourceClipId = QStringLiteral("0:0");
+            t->setTrackMatteEntries({{QStringLiteral("0:1"), matte}});
+            baseline(*t);
+            // Synchronize the window's sidecar to the initial carrier via
+            // the production restore notification, before splitting.
+            t->restoreState(t->currentState());
+            QString error;
+            ok = t->splitClipByIndex(false, 0, 0, 1.0, &error) && ok
+                && t->trackMatteEntries().contains(QStringLiteral("0:2"));
+            t->undo();
+            ok = ok && t->trackMatteEntries().contains(QStringLiteral("0:1"))
+                && !t->trackMatteEntries().contains(QStringLiteral("0:2"));
+            t->redo();
+            ok = ok && t->trackMatteEntries().contains(QStringLiteral("0:2"))
+                && !t->trackMatteEntries().contains(QStringLiteral("0:1"));
+            // Also cross a structural boundary, where external apply runs.
+            t->addVideoTrack();
+            t->undo();
+            ok = ok && t->videoTrackCount() == 1
+                && t->trackMatteEntries().contains(QStringLiteral("0:2"));
+        }
+        gate(9, ok);
+    }
+    {
+        Timeline t;
+        t.setProjectOutputConfig(1920, 1080, false);
+        baseline(t);
+        const auto serial = t.undoManager()->saveSerial();
+        // SNS uses a compound snapshot: adding V2 must not push its own undo.
+        t.setProjectOutputConfig(1080, 1920, true);
+        t.addVideoTrack(false);
+        t.undoManager()->saveState(t.currentState(), QStringLiteral("Apply SNS preset"));
+        bool ok = t.undoManager()->saveSerial() == serial + 1;
+        t.undo();
+        ok = ok && t.videoTrackCount() == 1 && !t.canUndo()
+            && t.currentState().projectWidth == 1920
+            && t.currentState().projectHeight == 1080
+            && !t.currentState().projectExplicitOutput;
+        t.redo();
+        gate(10, ok && t.videoTrackCount() == 2
+            && t.currentState().projectWidth == 1080
+            && t.currentState().projectHeight == 1920);
     }
     std::fprintf(stderr, "[track-ops] summary: %d PASS, %d FAIL\n", passed, failed);
     return failed;
