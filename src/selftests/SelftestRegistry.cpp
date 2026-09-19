@@ -807,7 +807,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "graph-editor", "VEDITOR_GRAPH_EDITOR_SELFTEST", runGraphEditorSelftest, true,
       "GraphEditor edit/undo, per-track Loop Out UI, ProjectFile persistence, and ClipAnim evaluation parity" },
     { "seq-from-clip", "VEDITOR_SEQ_FROM_CLIP_SELFTEST", runSeqFromClipSelftest, true,
-      "Sequence from clip: placement, AV links, notification, undo, reference preservation, nested menus and audio-only media (7 gates)" },
+      "Sequence from clip: placement, AV links, notification, undo, reference preservation, nested menus, audio-only media and generated clip menus (8 gates)" },
     { "sequence-dock", "VEDITOR_SEQUENCE_DOCK_SELFTEST", runSequenceDockSelftest, true,
       "Sequence dock: list, rename/create undo, active tracks and project persistence (4 gates)" },
     { "nest-sequence", "VEDITOR_NEST_SEQUENCE_SELFTEST", runNestSequenceSelftest, true,

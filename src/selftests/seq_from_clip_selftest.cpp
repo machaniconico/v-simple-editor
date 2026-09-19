@@ -221,6 +221,15 @@ int runSeqFromClipSelftest()
         && !audioState.audioTracks.isEmpty() && audioState.audioTracks[0].size() == 1
         && audioState.audioTracks[0][0].filePath == audioPath
         && audioState.audioTracks[0][0].leadInSec == 0.0);
+    Timeline generated;
+    ClipInfo shapeClip;
+    shapeClip.displayName = QStringLiteral("シェイプクリップ");
+    shapeClip.duration = 1.0;
+    shapeClip.outPoint = 1.0;
+    shapeClip.shapes.append(ShapeLayer::createRectangle(QSizeF(64, 48)));
+    gate(8, generated.insertShapeClipAtPlayhead(shapeClip)
+        && sequenceMenuEnabled(generated.videoTracks().value(0), false));
+
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
     return failed;
 }

@@ -8265,7 +8265,7 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
             aClearAct = atMenu->addAction(QStringLiteral("音声トランジション削除"));
         }
         QAction *aSequence = aMenu.addAction(QStringLiteral("このクリップから新規シーケンス"));
-        aSequence->setEnabled(aClip.sequenceRefId.isEmpty());
+        aSequence->setEnabled(aClip.sequenceRefId.isEmpty() && !aClip.filePath.isEmpty());
         const ClipInfo sequenceSource = aClip;
         QAction *aChosen = aMenu.exec(globalPos);
         if (aChosen == aSequence) {
@@ -8517,7 +8517,7 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
 
     QMenu menu;
     QAction *sequenceFromClip = menu.addAction(QStringLiteral("このクリップから新規シーケンス"));
-    sequenceFromClip->setEnabled(clipInfo.sequenceRefId.isEmpty());
+    sequenceFromClip->setEnabled(clipInfo.sequenceRefId.isEmpty() && !clipInfo.filePath.isEmpty());
     const ClipInfo sequenceSource = clipInfo;
     const int renderTrack = m_videoTracks.indexOf(track);
     if (renderTrack >= 0) {
