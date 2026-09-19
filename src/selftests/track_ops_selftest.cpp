@@ -91,7 +91,7 @@ int runTrackOpsSelftest()
             && t.currentState().selectedVideoTrackIndex == 1
             && t.currentState().activeVideoTrackIndex == 1
             && t.undoManager()->saveSerial() == serial + 1 && layoutOrder(t, false)
-            && removed && removed->isHidden();
+            && removed && removed->QWidget::isHidden();
         QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
         ok = ok && removed.isNull();
         t.undo();
