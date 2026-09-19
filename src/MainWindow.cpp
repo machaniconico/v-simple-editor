@@ -9186,7 +9186,7 @@ QJsonObject MainWindow::collectExternalTrackState() const
     QJsonObject state;
     if (auto *mixer = m_timeline->audioMixer()) state["mixer"] = mixer->collectTrackState();
     state["buses"] = m_audioBusRouting.toJson();
-    state["trackFlags"] = m_timeline->trackFlagsToJson();
+    // Timeline playback flags (muted/solo/hidden) are not undoable.
     state["adjustments"] = adjustmentLayersToJsonArray(m_timeline->adjustmentLayers());
     QJsonArray mattes;
     for (const auto &entry : m_trackMatteClipEntries)
@@ -9216,7 +9216,6 @@ QJsonObject MainWindow::collectExternalTrackState() const
 void MainWindow::applyExternalTrackState(const QJsonObject &state)
 {
     if (state.isEmpty()) return; // snapshots predating hook registration
-    m_timeline->applyTrackFlagsFromJson(state.value("trackFlags").toObject());
     if (auto *mixer = m_timeline->audioMixer())
         mixer->applyTrackState(state.value("mixer").toObject());
     m_audioBusRouting.fromJson(state.value("buses").toObject());
