@@ -8265,6 +8265,7 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
             aClearAct = atMenu->addAction(QStringLiteral("音声トランジション削除"));
         }
         QAction *aSequence = aMenu.addAction(QStringLiteral("このクリップから新規シーケンス"));
+        aSequence->setEnabled(aClip.sequenceRefId.isEmpty());
         const ClipInfo sequenceSource = aClip;
         QAction *aChosen = aMenu.exec(globalPos);
         if (aChosen == aSequence) {
@@ -8516,6 +8517,7 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
 
     QMenu menu;
     QAction *sequenceFromClip = menu.addAction(QStringLiteral("このクリップから新規シーケンス"));
+    sequenceFromClip->setEnabled(clipInfo.sequenceRefId.isEmpty());
     const ClipInfo sequenceSource = clipInfo;
     const int renderTrack = m_videoTracks.indexOf(track);
     if (renderTrack >= 0) {
@@ -12004,7 +12006,6 @@ bool Timeline::createSequence(const QString &name,
         external.insert(QStringLiteral("_sequenceCreationActiveId"), m_activeSequenceId);
         m_undoManager->updateCurrentExternalTrackState(external);
     }
-    const TrackClipSnapshot before = snapshotTrackClips(this);
     TimelineSequence sequence;
     sequence.id = uniqueSequenceId(m_sequences, QStringLiteral("sequence"), m_sequences.size());
     sequence.name = name.trimmed();
@@ -12013,8 +12014,8 @@ bool Timeline::createSequence(const QString &name,
     if (sequence.videoTracks.isEmpty()) sequence.videoTracks.append(QVector<ClipInfo>{});
     if (sequence.audioTracks.isEmpty()) sequence.audioTracks.append(QVector<ClipInfo>{});
     if (!addSequence(sequence) || !setActiveSequence(sequence.id)) return false;
-    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, before);
-    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, before);
+    // Sequence navigation preserves the existing carrier keys; remapping is
+    // only valid for clip mutations within the same sequence.
     saveUndoState(QStringLiteral("新規シーケンス"));
     return true;
 }
@@ -12056,8 +12057,9 @@ bool Timeline::createSequenceFromClip(const ClipInfo &source)
     for (const auto &sequence : existingSequences) names.insert(sequence.name);
     for (int suffix = 2; names.contains(name); ++suffix)
         name = QStringLiteral("%1 (%2)").arg(base).arg(suffix);
-    QVector<QVector<ClipInfo>> video{QVector<ClipInfo>{clip}};
+    QVector<QVector<ClipInfo>> video{QVector<ClipInfo>{}};
     QVector<QVector<ClipInfo>> audio{QVector<ClipInfo>{}};
+    if (media.videoStreamFound) video[0].append(clip);
     if (media.audioStreamFound) audio[0].append(clip);
     if (!createSequence(name, video, audio)) return false;
     const QString info = QStringLiteral("素材 %1x%2 %3fps / プロジェクト %4x%5 %6fps")

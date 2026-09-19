@@ -2,11 +2,15 @@
 #include "../UndoManager.h"
 #include "../libavcore/Encode.h"
 
+#include <QAction>
+#include <QApplication>
 #include <QDataStream>
 #include <QFile>
 #include <QImage>
+#include <QMenu>
 #include <QStatusBar>
 #include <QTemporaryDir>
+#include <QTimer>
 #include <cstdio>
 
 namespace {
@@ -45,6 +49,26 @@ bool writeMedia(const QString &path, const QString &wavPath = QString())
     for (int i = 0; i < 30; ++i)
         if (!encoder.pushFrameRgb24(frame.constBits(), frame.bytesPerLine(), i)) return false;
     return !encoder.finalize().has_value();
+}
+
+bool sequenceMenuEnabled(TimelineTrack *track, bool expectedEnabled)
+{
+    if (!track || track->clips().isEmpty()) return false;
+    bool matched = false;
+    QTimer::singleShot(0, track, [&] {
+        auto *menu = qobject_cast<QMenu *>(QApplication::activePopupWidget());
+        if (menu) {
+            for (QAction *action : menu->actions()) {
+                if (action->text() == QStringLiteral("このクリップから新規シーケンス"))
+                    matched = action->isEnabled() == expectedEnabled;
+            }
+        }
+        // Close even when popup discovery fails, so a failed gate cannot hang.
+        for (QWidget *widget : QApplication::topLevelWidgets())
+            if (auto *openMenu = qobject_cast<QMenu *>(widget)) openMenu->close();
+    });
+    track->clipContextMenuRequested(0, QPoint(20, 20));
+    return matched;
 }
 }
 
@@ -144,6 +168,59 @@ int runSeqFromClipSelftest()
     const bool invalidRejected = !fresh.createSequenceFromMedia(dir.filePath(QStringLiteral("missing.mp4")))
         && fresh.undoManager()->saveSerial() == invalidSerial && fresh.sequences().isEmpty();
     gate(4, notified && oneSave && restored && redone && freshCreated && freshRestored && invalidRejected);
+
+    Timeline references;
+    const QVector<QVector<ClipInfo>> referenceVideo{{source}, {source}};
+    const QVector<QVector<ClipInfo>> referenceAudio{QVector<ClipInfo>{}};
+    references.restoreFromProject(referenceVideo, referenceAudio, 0.0, -1.0, -1.0, 100);
+    const QString childKey = QStringLiteral("1:0");
+    TimelineTrackMatteEntry matte;
+    matte.matteType = TrackMatteType::AlphaMatte;
+    matte.matteSourceClipId = QStringLiteral("0:0");
+    references.setTrackMatteEntries({{childKey, matte}});
+    references.setClipParentEntries({{childKey, QStringLiteral("0:0")}});
+    const auto originalParents = references.clipParentEntries();
+    const auto originalMattes = references.trackMatteEntries();
+    const QString originalId = references.sequenceList().first().id;
+    auto referencesPreserved = [&] {
+        auto parents = references.clipParentEntries();
+        // The sequence-store carrier intentionally changes when a sequence is added.
+        parents.remove(timeline_nesting::sequenceStoreParentKey());
+        const auto mattes = references.trackMatteEntries();
+        return parents == originalParents && mattes.size() == originalMattes.size()
+            && mattes.contains(childKey)
+            && mattes.value(childKey).matteType == originalMattes.value(childKey).matteType
+            && mattes.value(childKey).matteSourceClipId == originalMattes.value(childKey).matteSourceClipId;
+    };
+    const bool clipReferences = fixtures && references.createSequenceFromClip(source)
+        && references.setActiveSequence(originalId) && referencesPreserved();
+    const bool emptyReferences = references.createSequence(QStringLiteral("空のシーケンス"))
+        && references.setActiveSequence(originalId) && referencesPreserved();
+    gate(5, clipReferences && emptyReferences);
+
+    Timeline menus;
+    const bool menuCreated = fixtures && menus.createSequenceFromMedia(av);
+    const bool mediaMenus = menuCreated
+        && sequenceMenuEnabled(menus.videoTracks().value(0), true)
+        && sequenceMenuEnabled(menus.audioTracks().value(0), true);
+    const QString nestedId = menus.activeSequenceId();
+    const bool nestedCreated = menuCreated && menus.createSequence(QStringLiteral("ネストの配置先"))
+        && menus.addSequenceClip(nestedId);
+    gate(6, mediaMenus && nestedCreated
+        && sequenceMenuEnabled(menus.videoTracks().value(0), false)
+        && sequenceMenuEnabled(menus.audioTracks().value(0), false));
+
+    Timeline audioOnly;
+    const QString audioInitialId = audioOnly.activeSequenceId();
+    const QString audioPath = dir.filePath(QStringLiteral("audio.wav"));
+    const bool audioCreated = fixtures && audioOnly.createSequenceFromMedia(audioPath);
+    const auto audioState = audioOnly.currentState();
+    gate(7, audioCreated && audioOnly.sequenceList().size() == 2
+        && audioOnly.activeSequenceId() != audioInitialId
+        && !audioState.videoTracks.isEmpty() && audioState.videoTracks[0].isEmpty()
+        && !audioState.audioTracks.isEmpty() && audioState.audioTracks[0].size() == 1
+        && audioState.audioTracks[0][0].filePath == audioPath
+        && audioState.audioTracks[0][0].leadInSec == 0.0);
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
     return failed;
 }
