@@ -28,6 +28,15 @@ extern "C" {
 
 namespace libavcore {
 
+AVPixelFormat alphaExportPixelFormat(const std::string &codec, int proresProfile)
+{
+    if (codec == "libvpx-vp9" || codec == "vp9") return AV_PIX_FMT_YUVA420P;
+    if ((codec == "prores" || codec == "prores_ks")
+        && (proresProfile == 4 || proresProfile == 5))
+        return AV_PIX_FMT_YUVA444P10LE;
+    return AV_PIX_FMT_NONE;
+}
+
 // P3-D65-in-BT2020 mastering display chromaticity coordinates (x265 units,
 // i.e. 1/50000 of CIE xy). These are the SSOT for both hdr10MasterDisplayString
 // (public API) and buildX265Hdr10Params (internal x265-params builder).
@@ -499,7 +508,11 @@ bool FrameEncoder::configureEncoderContext(const EncodeRequest& req,
     // pix_fmts array NULL for MF encoders).
     const std::string& name = m_activeEncoderName;
     AVPixelFormat targetPixFmt = AV_PIX_FMT_YUV420P;
-    if (req.proresProfile >= 4) {
+    if (req.keepAlpha) {
+        targetPixFmt = alphaExportPixelFormat(name, req.proresProfile);
+        if (targetPixFmt == AV_PIX_FMT_NONE
+            || !encoderSupportsPixelFormat(encoder, targetPixFmt)) return false;
+    } else if (req.proresProfile >= 4) {
         targetPixFmt = AV_PIX_FMT_YUVA444P10LE;
     } else if (req.proresProfile >= 0) {
         targetPixFmt = AV_PIX_FMT_YUV422P10LE;
@@ -523,8 +536,6 @@ bool FrameEncoder::configureEncoderContext(const EncodeRequest& req,
         if (list && list[0] != AV_PIX_FMT_NONE) targetPixFmt = list[0];
         av_free(const_cast<AVPixelFormat*>(list));
     }
-    if (req.keepAlpha && targetPixFmt != AV_PIX_FMT_YUVA444P10LE)
-        return false;
     m_encCtx->pix_fmt = targetPixFmt;
     m_pixFmt = targetPixFmt;
     m_encCtx->bit_rate = 0; // CRF has no target bitrate.
@@ -1114,8 +1125,8 @@ void FrameEncoder::muxAudioPassthroughPackets()
 std::optional<std::string> FrameEncoder::open(const EncodeRequest& req)
 {
     if (m_opened) return std::string("FrameEncoder already opened");
-    if (req.keepAlpha && (req.videoCodecName.rfind("prores", 0) != 0
-        || req.proresProfile < 4 || req.proresProfile > 5))
+    if (req.keepAlpha
+        && alphaExportPixelFormat(req.videoCodecName, req.proresProfile) == AV_PIX_FMT_NONE)
         return std::string("このコーデックはアルファを保持できません");
     m_keepAlpha = req.keepAlpha;
     const AVRational fps = effectiveFpsRational(req);
@@ -1157,6 +1168,8 @@ std::optional<std::string> FrameEncoder::open(const EncodeRequest& req)
         return std::string("avcodec_parameters_from_context failed");
     }
     m_outStream->time_base = m_encCtx->time_base;
+    if (req.keepAlpha && m_pixFmt == AV_PIX_FMT_YUVA420P)
+        av_dict_set(&m_outStream->metadata, "alpha_mode", "1", 0);
 
     if (req.audioEncode) {
         if (!req.audioSourcePath.empty()) {

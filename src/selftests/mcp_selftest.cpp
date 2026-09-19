@@ -3966,6 +3966,42 @@ int runMcpSelftest()
            : fail("G165 alpha export validation and queue wiring", QStringLiteral("alpha validation or queued settings mismatch"));
     }
 
+    // US-612 G174: the real MCP handler shares the alpha export policy.
+    {
+        bool ok = exportRootReady && timelineReady;
+        const QJsonObject valid{{"outputPath", exportRoot.filePath("alpha-vp9.webm")},
+            {"keepAlpha", true}, {"videoCodec", "libvpx-vp9"}, {"audioCodec", "libopus"}};
+        const auto response = callProjectInfoTool(1740, QStringLiteral("export_video"), valid);
+        const QString id = toolPayload(response).value("jobId").toString();
+        ok &= !id.isEmpty() && !toolResult(response).value("isError").toBool(true);
+        auto invalid = valid;
+        invalid.insert("videoCodec", "libx264");
+        invalid.insert("outputPath", exportRoot.filePath("alpha-h264.mp4"));
+        const auto rejected = callProjectInfoTool(1741, QStringLiteral("export_video"), invalid);
+        ok &= toolResult(rejected).value("isError").toBool(false) && toolPayload(rejected).isEmpty();
+        QHash<QString, QJsonObject> captured;
+        auto *queue = projectInfoWindow.findChild<RenderQueue*>();
+        if (queue) {
+            const auto connection = QObject::connect(queue, &RenderQueue::jobsChanged, queue, [&]() {
+                const auto jobs = queue->jobs();
+                if (jobs.isEmpty()) return;
+                for (const auto &job : jobs) captured.insert(job.uuid, job.exportConfig);
+                queue->clear();
+            });
+            auto *previousTools = projectInfoWindow.m_mcpTools;
+            projectInfoWindow.m_mcpTools = &projectInfoTools;
+            QCoreApplication::processEvents(QEventLoop::AllEvents);
+            projectInfoWindow.m_mcpTools = previousTools;
+            QObject::disconnect(connection);
+        }
+        ok &= captured.size() == 1 && captured.contains(id)
+            && captured.value(id).value("keepAlpha").toBool(false)
+            && captured.value(id).value("videoCodec").toString() == QStringLiteral("libvpx-vp9");
+        ok ? pass("G174 VP9 alpha acceptance and H.264 rejection")
+           : fail("G174 VP9 alpha acceptance and H.264 rejection",
+                  QStringLiteral("alpha validation or queued settings mismatch"));
+    }
+
     QJsonObject knownStatusResponse;
     if (!exportJobId.isEmpty()) {
         knownStatusResponse = callProjectInfoTool(

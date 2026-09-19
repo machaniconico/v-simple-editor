@@ -3,6 +3,7 @@
 #include <QInputDialog>
 #include <QSignalBlocker>
 #include "CodecDetector.h"
+#include "libavcore/Encode.h"
 #include "PremiereXmlExporter.h"
 #include "YoutubeChapterGen.h"
 #include <QVBoxLayout>
@@ -299,7 +300,7 @@ void ExportDialog::setupUI()
     mainLayout->addWidget(outputGroup);
 
     // Marked range
-    m_keepAlphaCheckbox = new QCheckBox(tr("アルファチャンネルを保持 (ProRes 4444 のみ)"), this);
+    m_keepAlphaCheckbox = new QCheckBox(tr("アルファチャンネルを保持 (ProRes 4444 / VP9)"), this);
     mainLayout->addWidget(m_keepAlphaCheckbox);
 
     m_markedRangeCheckbox = new QCheckBox(tr("マークした In/Out 範囲のみ書き出す"), this);
@@ -706,7 +707,7 @@ ExportConfig ExportDialog::currentSettings() const
         }
     }
     c.keepAlpha = m_keepAlphaCheckbox->isChecked() && !c.audioOnly
-        && c.videoCodec.startsWith("prores") && c.proresProfile >= 4;
+        && libavcore::alphaExportPixelFormat(c.videoCodec.toStdString(), c.proresProfile) != AV_PIX_FMT_NONE;
     if (c.audioOnly) c.audioCodec = ExportConfig::audioCodecForContainer(c.container);
     return c;
 }
@@ -771,8 +772,8 @@ void ExportDialog::updateSummary()
 {
     if (m_keepAlphaCheckbox) {
         const auto c = currentSettings();
-        const bool enabled = !c.audioOnly && c.videoCodec.startsWith("prores")
-            && c.proresProfile >= 4
+        const bool enabled = !c.audioOnly
+            && libavcore::alphaExportPixelFormat(c.videoCodec.toStdString(), c.proresProfile) != AV_PIX_FMT_NONE
             && static_cast<ExportType>(m_exportTypeCombo->currentData().toInt()) == ExportType::Video;
         m_keepAlphaCheckbox->setEnabled(enabled);
         if (!enabled) m_keepAlphaCheckbox->setChecked(false);

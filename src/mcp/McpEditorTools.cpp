@@ -2412,6 +2412,7 @@ void McpEditorTools::registerWriteTools()
                 {QStringLiteral("type"), QStringLiteral("string")}
             }},
             {QStringLiteral("keepAlpha"), QJsonObject{
+                {QStringLiteral("description"), QStringLiteral("ProRes 4444 / 4444 XQ または VP9 でアルファチャンネルを保持")},
                 {QStringLiteral("type"), QStringLiteral("boolean")},
                 {QStringLiteral("default"), false}
             }},

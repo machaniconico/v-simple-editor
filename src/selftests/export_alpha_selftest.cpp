@@ -1,4 +1,5 @@
 #include "../ExportDialog.h"
+#include "../CodecDetector.h"
 #include "../RenderQueue.h"
 #include "../ShapeLayer.h"
 #include "../Timeline.h"
@@ -10,13 +11,13 @@
 #include <cstdio>
 
 namespace {
-bool render(Timeline &timeline, const QString &path, bool alpha, int profile)
+bool render(Timeline &timeline, const QString &path, bool alpha, int profile, const QString &codec = QStringLiteral("prores"))
 {
     RenderQueue queue;
     RenderJob job;
     job.outputPath = path;
     job.timeline = &timeline;
-    job.codec = "prores";
+    job.codec = codec;
     job.width = 128;
     job.height = 64;
     job.endUs = 1000000;
@@ -136,7 +137,7 @@ int runExportAlphaSelftest()
     QCheckBox *checkbox = nullptr;
     QComboBox *presets = nullptr;
     for (auto *candidate : dialog.findChildren<QCheckBox *>())
-        if (candidate->text() == QStringLiteral("アルファチャンネルを保持 (ProRes 4444 のみ)"))
+        if (candidate->text() == QStringLiteral("アルファチャンネルを保持 (ProRes 4444 / VP9)"))
             checkbox = candidate;
     for (auto *candidate : dialog.findChildren<QComboBox *>())
         if (candidate->findText(QStringLiteral("ProRes 4444")) >= 0) presets = candidate;
@@ -206,6 +207,63 @@ int runExportAlphaSelftest()
         refusal &= !checkbox->isEnabled() && !checkbox->isChecked();
     }
     gate(4, refusal);
+
+    bool vp9 = true;
+    if (CodecDetector::isEncoderAvailable("libvpx-vp9")) {
+        const QString path = temp.filePath("alpha.webm");
+        libavcore::FrameEncoder::resetAlphaFrameCountForTest();
+        RenderQueue::resetBlackCompositeCountForTest();
+        vp9 = ready && render(timeline, path, true, -1, "libvpx-vp9");
+        const QImage image = libavcore::grabFrameAt(path, 0.5);
+        vp9 &= pixelsMatch(image, true)
+            && libavcore::FrameEncoder::alphaFrameCountForTest() > 0
+            && RenderQueue::blackCompositeCountForTest() == 0;
+        if (!image.isNull()) {
+            vp9 &= image.pixelColor(96, 32).alpha() == 0
+                && image.pixelColor(32, 32).alpha() == 255;
+        }
+        vp9 &= checkbox && presets;
+        if (checkbox && presets) {
+            const int index = presets->findText(QStringLiteral("VP9 WebM"));
+            vp9 &= index >= 0;
+            if (index >= 0) {
+                presets->setCurrentIndex(index);
+                vp9 &= checkbox->isEnabled() && !checkbox->isChecked();
+                checkbox->setChecked(true);
+                for (auto *output : dialog.findChildren<QLineEdit *>())
+                    if (output->placeholderText() == QStringLiteral("Select output file..."))
+                        output->setText(temp.filePath("dialog.webm"));
+                vp9 &= QMetaObject::invokeMethod(&dialog, "onExport", Qt::DirectConnection)
+                    && dialog.config().keepAlpha
+                    && dialog.config().videoCodec == QStringLiteral("libvpx-vp9");
+                presets->setCurrentIndex(0);
+                vp9 &= !checkbox->isEnabled() && !checkbox->isChecked();
+            }
+        }
+    } else {
+        std::fprintf(stderr, "SKIP G5: libvpx-vp9 unavailable\n");
+    }
+    gate(5, vp9);
+
+    bool policy = true;
+    for (const QString &codec : {QStringLiteral("prores"), QStringLiteral("prores_ks"),
+            QStringLiteral("vp9"), QStringLiteral("libvpx-vp9"),
+            QStringLiteral("h264"), QStringLiteral("libx264")}) {
+        for (int profile = -1; profile <= 6; ++profile) {
+            const bool expected = codec == "vp9" || codec == "libvpx-vp9"
+                || ((codec == "prores" || codec == "prores_ks") && (profile == 4 || profile == 5));
+            const QJsonObject config{{"videoCodec", codec}, {"proresProfile", profile}, {"keepAlpha", true}};
+            policy &= RenderQueue::alphaExportError(config).isEmpty() == expected;
+            policy &= (libavcore::alphaExportPixelFormat(codec.toStdString(), profile)
+                != AV_PIX_FMT_NONE) == expected;
+            auto audioOnly = config;
+            audioOnly.insert("audioOnly", true);
+            policy &= !RenderQueue::alphaExportError(audioOnly).isEmpty();
+        }
+    }
+    policy &= !RenderQueue::alphaExportError(QJsonObject{{"videoCodec", "prores_ks"},
+        {"proresProfile", 4.5}, {"keepAlpha", true}}).isEmpty();
+    gate(6, policy);
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
     return failed;
 }

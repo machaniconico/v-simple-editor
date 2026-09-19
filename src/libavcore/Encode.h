@@ -37,6 +37,9 @@ class QImage;
 
 namespace libavcore {
 
+// Single source of truth for alpha export; NONE means unsupported.
+AVPixelFormat alphaExportPixelFormat(const std::string &codec, int proresProfile);
+
 // Generate an x265 'master-display' parameter string for HDR10 exports.
 // Chromaticity coordinates (G/B/R/WP) are fixed to P3-D65-in-BT2020 primaries
 // (x265 units: 1/50000 of CIE xy). Luminance terms L(max,min) are derived from

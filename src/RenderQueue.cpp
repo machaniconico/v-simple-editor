@@ -477,8 +477,7 @@ QString RenderQueue::alphaExportError(const QJsonObject &config)
     if (!alpha.toBool()) return {};
     const QString codec = config.value("videoCodec").toString();
     const auto profile = config.value("proresProfile");
-    if ((codec != "prores" && codec != "prores_ks")
-        || (profile.toDouble(-1) != 4 && profile.toDouble(-1) != 5)
+    if (libavcore::alphaExportPixelFormat(codec.toStdString(), profile.toInt(-1)) == AV_PIX_FMT_NONE
         || config.value("audioOnly").toBool())
         return QStringLiteral("このコーデックはアルファを保持できません");
     return {};
