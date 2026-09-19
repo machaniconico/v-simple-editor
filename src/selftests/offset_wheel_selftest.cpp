@@ -27,15 +27,12 @@ bool pixelsEqual(const QImage &a, const QImage &b)
         if (std::memcmp(a.constScanLine(y), b.constScanLine(y), a.width()*a.depth()/8)) return false;
     return true;
 }
-// Compare RGB or signed RGB deltas, retaining the first out-of-tolerance
-// coordinate and original samples so failures distinguish setup from math.
+// Keep diagnostics for direct RGB comparisons. Display readbacks are compared
+// with CPU only on flat inputs in the central video region, never as deltas.
 bool compareRgb(const char *label, const QImage &cpu, const QImage &gpu,
-                const QImage *cpuBase = nullptr, const QImage *gpuBase = nullptr,
                 int tolerance = 1)
 {
-    if (cpu.isNull() || gpu.isNull() || cpu.size() != gpu.size()
-        || (cpuBase && (cpuBase->isNull() || cpuBase->size() != cpu.size()))
-        || (gpuBase && (gpuBase->isNull() || gpuBase->size() != gpu.size()))) {
+    if (cpu.isNull() || gpu.isNull() || cpu.size() != gpu.size()) {
         std::fprintf(stderr, "G3 %s: invalid readback/size CPU=%dx%d GPU=%dx%d\n",
             label, cpu.width(), cpu.height(), gpu.width(), gpu.height());
         return false;
@@ -44,11 +41,8 @@ bool compareRgb(const char *label, const QImage &cpu, const QImage &gpu,
     int maxError = 0, firstX = -1, firstY = -1;
     for (int y = 0; y < cpu.height(); ++y) for (int x = 0; x < cpu.width(); ++x) {
         const QColor a = cpu.pixelColor(x,y), b = gpu.pixelColor(x,y);
-        const QColor a0 = cpuBase ? cpuBase->pixelColor(x,y) : QColor(0,0,0);
-        const QColor b0 = gpuBase ? gpuBase->pixelColor(x,y) : QColor(0,0,0);
-        for (int d : {std::abs((a.red()-a0.red())-(b.red()-b0.red())),
-                      std::abs((a.green()-a0.green())-(b.green()-b0.green())),
-                      std::abs((a.blue()-a0.blue())-(b.blue()-b0.blue()))}) {
+        for (int d : {std::abs(a.red()-b.red()), std::abs(a.green()-b.green()),
+                      std::abs(a.blue()-b.blue())}) {
             error += d;
             maxError = qMax(maxError,d);
             if (d > tolerance && firstX < 0) { firstX = x; firstY = y; }
@@ -62,13 +56,6 @@ bool compareRgb(const char *label, const QImage &cpu, const QImage &gpu,
         const QColor a = cpu.pixelColor(firstX,firstY), b = gpu.pixelColor(firstX,firstY);
         std::fprintf(stderr, "G3 %s: first=(%d,%d) CPU=(%d,%d,%d) GPU=(%d,%d,%d)\n",
             label, firstX, firstY, a.red(), a.green(), a.blue(), b.red(), b.green(), b.blue());
-        if (cpuBase && gpuBase) {
-            const QColor a0 = cpuBase->pixelColor(firstX,firstY), b0 = gpuBase->pixelColor(firstX,firstY);
-            std::fprintf(stderr, "G3 %s: base CPU=(%d,%d,%d) GPU=(%d,%d,%d) delta CPU=(%d,%d,%d) GPU=(%d,%d,%d)\n",
-                label, a0.red(), a0.green(), a0.blue(), b0.red(), b0.green(), b0.blue(),
-                a.red()-a0.red(), a.green()-a0.green(), a.blue()-a0.blue(),
-                b.red()-b0.red(), b.green()-b0.green(), b.blue()-b0.blue());
-        }
     }
     return ok;
 }
@@ -107,8 +94,9 @@ int runOffsetWheelSelftest()
     }
     check(2, shift);
 
-    // Exercise the production shader. Never resize a readback: create the
-    // source at the physical framebuffer size, including fractional-DPI setups.
+    // Review option B: flat frames remove spatial sampling ambiguity. Compare
+    // only the physical-pixel centre of letterboxRect(), without resampling.
+    // Both backends execute production grading; there is no shader/math replica.
     GLPreview preview;
     preview.setFixedSize(64,64);
     preview.show();
@@ -116,59 +104,81 @@ int runOffsetWheelSelftest()
     preview.displayFrame(input);
     const QImage probe = preview.grabFramebuffer();
     const bool contextOk = preview.context() && preview.context()->isValid() && !probe.isNull();
-    bool offsetOk = false, neutralOk = false;
-    if (contextOk) {
-        QImage source(probe.size(), QImage::Format_RGB888);
-        for (int y = 0; y < source.height(); ++y)
-            for (int x = 0; x < source.width(); ++x)
-                source.setPixelColor(x, y, QColor(40 + 160*x/qMax(1,source.width()-1),
-                    40 + 160*y/qMax(1,source.height()-1),
-                    50 + 120*(x+y)/qMax(1,source.width()+source.height()-2)));
-        preview.displayFrame(source);
+    if (!contextOk) {
+        std::fprintf(stderr, "SKIP G3: no usable GL context/readback (headless/WSL)\n");
+    } else {
+        ColorGradingPanel gpuPanel;
         auto renderGpu = [&](const ColorCorrection &grade) {
-            preview.setEffectsEnabled(true);
-            preview.setColorCorrection(grade);
-            // setColorCorrection does not populate the separate LGG uniforms.
-            const std::array<std::array<double,4>,3> wheels = {{
-                {grade.liftR, grade.liftG, grade.liftB, 0.0},
-                {std::pow(2.0,grade.gammaR), std::pow(2.0,grade.gammaG), std::pow(2.0,grade.gammaB), 1.0},
-                {grade.gainR, grade.gainG, grade.gainB, 0.0}
+            gpuPanel.setColorCorrection(grade);
+            const ColorWheels cw = gpuPanel.currentWheels();
+            // Same values and setter order as MainWindow's
+            // applyColorWheelsToPreview. Do not also call setColorCorrection:
+            // this gate exercises the wheels path, with all other effects neutral.
+            const std::array<std::array<double,4>,3> values = {{
+                {cw.lift.x(), cw.lift.y(), cw.lift.z(), cw.liftLuma},
+                {cw.gamma.x(), cw.gamma.y(), cw.gamma.z(), cw.gammaLuma},
+                {cw.gain.x(), cw.gain.y(), cw.gain.z(), cw.gainLuma}
             }};
-            preview.setLiftGammaGain(wheels);
-            preview.setOffset({grade.offsetR,grade.offsetG,grade.offsetB});
+            preview.setEffectsEnabled(true);
+            preview.setLiftGammaGain(values);
+            preview.setOffset({cw.offset.x(), cw.offset.y(), cw.offset.z()});
+            preview.setLogWheels({{
+                {cw.logShadow.x(), cw.logShadow.y(), cw.logShadow.z()},
+                {cw.logMid.x(), cw.logMid.y(), cw.logMid.z()},
+                {cw.logHigh.x(), cw.logHigh.y(), cw.logHigh.z()}
+            }});
             return preview.grabFramebuffer().convertToFormat(QImage::Format_RGB888);
         };
-        const auto cpuNeutral = VideoEffectProcessor::applyColorCorrection(source, ColorCorrection{});
-        const auto gpuNeutral = renderGpu(ColorCorrection{});
-        const bool controlA = compareRgb("control-A neutral", cpuNeutral, gpuNeutral);
+        bool parityOk = true;
+        // Dark/mid/bright inputs include low/high clamp cases. The mixed grade
+        // distinguishes Stage 1 addition from addition after gamma or gain.
         ColorCorrection lift;
         lift.liftR = 0.125;
-        const auto cpuLift = VideoEffectProcessor::applyColorCorrection(source, lift);
-        const auto gpuLift = renderGpu(lift);
-        const bool controlB = compareRgb("control-B lift", cpuLift, gpuLift);
-        const auto cpuOffset = VideoEffectProcessor::applyColorCorrection(source, cc);
-        const auto gpuOffset = renderGpu(cc);
-        const bool directOffset = compareRgb("offset direct", cpuOffset, gpuOffset);
-        // If the full preview pipeline differs even without offset, isolate
-        // the signed change on each backend. Also require the lift control's
-        // change to agree. No resampling, tolerance widening or GLSL replica.
-        const bool liftDelta = compareRgb("control-B delta", cpuLift, gpuLift, &cpuNeutral, &gpuNeutral);
-        const bool offsetDelta = compareRgb("offset delta", cpuOffset, gpuOffset, &cpuNeutral, &gpuNeutral);
-        std::fprintf(stderr, "G3: comparison=%s controlA=%d controlB=%d direct=%d liftDelta=%d offsetDelta=%d DPR=%.3f framebuffer=%dx%d\n",
-            controlA && controlB ? "direct+delta" : "delta (controls differ)",
-            int(controlA), int(controlB), int(directOffset), int(liftDelta), int(offsetDelta),
-            double(preview.devicePixelRatioF()), probe.width(), probe.height());
-        offsetOk = liftDelta && offsetDelta && (!(controlA && controlB) || directOffset);
-        const auto neutral = renderGpu(ColorCorrection{});
-        preview.setEffectsEnabled(false);
-        const auto bypass = preview.grabFramebuffer().convertToFormat(QImage::Format_RGB888);
-        neutralOk = compareRgb("neutral vs bypass", neutral, bypass, nullptr, nullptr, 0);
+        ColorCorrection mixed = cc;
+        mixed.liftR = 0.0625; mixed.liftG = -0.0625;
+        mixed.gammaR = 0.5; mixed.gammaG = -0.5; mixed.gammaB = 0.25;
+        mixed.gainR = 0.25; mixed.gainG = -0.25; mixed.gainB = 0.125;
+        for (const QColor &color : {QColor(12,20,28), QColor(96,128,160), QColor(230,240,248)}) {
+            QImage source(64,64,QImage::Format_RGB888);
+            source.fill(color);
+            preview.displayFrame(source);
+            const QImage neutral = renderGpu(ColorCorrection{});
+            const QRectF video = preview.letterboxRect();
+            const double dpr = preview.devicePixelRatioF();
+            const QRect roi(int(std::ceil((video.x()+video.width()*0.375)*dpr)),
+                            int(std::ceil((video.y()+video.height()*0.375)*dpr)),
+                            int(std::floor(video.width()*0.25*dpr)),
+                            int(std::floor(video.height()*0.25*dpr)));
+            std::fprintf(stderr, "G3: input=(%d,%d,%d) DPR=%.3f framebuffer=%dx%d ROI=(%d,%d,%d,%d)\n",
+                color.red(), color.green(), color.blue(), dpr, neutral.width(), neutral.height(),
+                roi.x(), roi.y(), roi.width(), roi.height());
+            auto compareCpu = [&](const char *label, const ColorCorrection &grade, const QImage &gpu) {
+                if (roi.isEmpty() || !gpu.rect().contains(roi)) {
+                    std::fprintf(stderr, "G3 %s: invalid central video region\n", label);
+                    return false;
+                }
+                QImage flatReference(roi.size(),QImage::Format_RGB888);
+                flatReference.fill(color);
+                return compareRgb(label, VideoEffectProcessor::applyColorCorrection(flatReference,grade),
+                                  gpu.copy(roi));
+            };
+            const bool controlA = compareCpu("control-A neutral", ColorCorrection{}, neutral);
+            preview.setEffectsEnabled(false);
+            const auto bypass = preview.grabFramebuffer().convertToFormat(QImage::Format_RGB888);
+            const bool neutralOk = compareRgb("neutral vs bypass", neutral, bypass, 0);
+            parityOk &= controlA && neutralOk;
+            if (!controlA) {
+                std::fprintf(stderr, "G3: neutral reference mismatch; offset comparisons not evaluated\n");
+                continue; // A failed baseline is a gate failure, never a delta fallback.
+            }
+            const bool controlB = compareCpu("control-B lift", lift, renderGpu(lift));
+            const bool offsetOk = compareCpu("offset direct", cc, renderGpu(cc));
+            const bool stageOk = compareCpu("offset with lift/gamma/gain", mixed, renderGpu(mixed));
+            parityOk &= controlB && offsetOk && stageOk;
+        }
+        check(3, parityOk);
     }
-    if (!contextOk || !offsetOk || !neutralOk)
-        std::fprintf(stderr, "G3: context/readback=%d offset-parity=%d neutral-bypass=%d\n",
-            int(contextOk), int(offsetOk), int(neutralOk));
     preview.hide();
-    check(3, contextOk && offsetOk && neutralOk);
 
     ClipInfo clip;
     clip.filePath = QStringLiteral("offset-wheel.mp4");
