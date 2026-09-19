@@ -1,4 +1,5 @@
 #include "RenderQueue.h"
+#include "SequenceExport.h"
 #include <atomic>
 #include "TimelineFrameRenderer.h"
 #include "ProjectFile.h"
@@ -475,6 +476,7 @@ QString RenderQueue::alphaExportError(const QJsonObject &config)
     if (!alpha.isUndefined() && !alpha.isBool())
         return QStringLiteral("keepAlpha は真偽値で指定してください");
     if (!alpha.toBool()) return {};
+    if (config.value("imageSequence").toBool()) return {};
     const QString codec = config.value("videoCodec").toString();
     const auto profile = config.value("proresProfile");
     if (libavcore::alphaExportPixelFormat(codec.toStdString(), profile.toInt(-1)) == AV_PIX_FMT_NONE
@@ -988,8 +990,75 @@ void RenderQueue::startNextJob()
 // tenBitHevcEncoderAvailable; an 8-bit job never visits the subprocess
 // fallback. Drop-in replacing the bundled DLL with a libx265-enabled build
 // flips HDR jobs to the in-process path automatically — no recompile needed.
+void RenderQueue::startSequenceExport(int jobIndex)
+{
+    const RenderJob job = m_jobs[jobIndex];
+    const auto &cfg = job.exportConfig;
+    const auto settings = sequenceexport::Settings::fromJson(cfg, job.outputPath);
+    QString error = alphaExportError(cfg);
+    if (error.isEmpty()) error = sequenceexport::validate(settings);
+    if (!error.isEmpty()) {
+        QMetaObject::invokeMethod(this, [this, error]() { finishCurrentJob(false, error); }, Qt::QueuedConnection);
+        return;
+    }
+    if (m_renderThread) {
+        m_renderThread->wait();
+        delete m_renderThread;
+        m_renderThread = nullptr;
+    }
+    Timeline *owned = nullptr;
+    Timeline *timeline = resolveTimeline(job, &owned);
+    const double fps = cfg.value("fps").toDouble(30.0);
+    const QSize size(cfg.value("width").toInt(job.width), cfg.value("height").toInt(job.height));
+    if (!timeline || !std::isfinite(fps) || fps <= 0 || size.isEmpty()) {
+        delete owned;
+        QMetaObject::invokeMethod(this, [this]() {
+            finishCurrentJob(false, QStringLiteral("連番のタイムラインまたは出力設定が無効です"));
+        }, Qt::QueuedConnection);
+        return;
+    }
+    const qint64 total = static_cast<qint64>(timeline->totalDuration() * fps + 0.5);
+    qint64 startUs = qMax(qint64(0), job.startUs);
+    qint64 frames = qMax(qint64(0), total - static_cast<qint64>(startUs * fps / 1000000.0));
+    if (cfg.value("exportMarkedRangeOnly").toBool()) {
+        const auto range = computeExportRange(timeline->markedIn(), timeline->markedOut(),
+            fps, total, true, timeline->hasMarkedRange());
+        frames = range.frameCount();
+        startUs = range.usedMarkedRange ? static_cast<qint64>(timeline->markedIn() * 1000000.0)
+                                      : static_cast<qint64>(range.startFrame * 1000000.0 / fps);
+    } else if (job.endUs > startUs) {
+        frames = qMin(frames, static_cast<qint64>((job.endUs - startUs) * fps / 1000000.0 + 0.5));
+    }
+    const auto timecode = timecodeBurnInForRender(cfg, timeline);
+    m_renderThread = QThread::create([this, job, settings, timeline, owned, size, fps, startUs, frames, timecode]() {
+        const QString error = sequenceexport::write(timeline, settings, size, fps, startUs, frames,
+            [this]() { return m_cancelRequested.load(); },
+            [this, job](int percent) {
+                emit jobProgress(job.id, qMin(percent, 99));
+                emit jobProgressUuid(job.uuid, qMin(percent, 99));
+            },
+            [timeline, timecode, fps, size](QImage &frame, qint64 usec) {
+                if (!timecode.has_value()) return;
+                QPainter painter(&frame);
+                const double sec = usec / 1000000.0;
+                timecode->paintOnto(painter, QRectF(QPointF(0, 0), QSizeF(size)), sec, fps,
+                                   timecodeBurnInClipNameAt(timeline, sec));
+            });
+        QMetaObject::invokeMethod(this, [this, owned, error]() {
+            delete owned;
+            finishCurrentJob(error.isEmpty(), error);
+        }, Qt::QueuedConnection);
+    });
+    m_renderThread->start();
+}
+
 void RenderQueue::startRenderPipe(int jobIndex)
 {
+    if (m_jobs[jobIndex].exportConfig.value("imageSequence").toBool()
+        && sequenceexport::enabledForTest()) {
+        startSequenceExport(jobIndex);
+        return;
+    }
     const RenderJob jobCopy = m_jobs[jobIndex];
     const QString alphaError = alphaExportError(jobCopy.exportConfig);
     if (!alphaError.isEmpty()) {

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <QObject>
 #include <QString>
 #include <QStringList>
@@ -200,6 +201,7 @@ private:
     //      with a libx265-enabled build flips HDR jobs to the in-process
     //      path automatically — no recompile needed.
     void startRenderPipe(int jobIndex);
+    void startSequenceExport(int jobIndex);
     // US-MF-6 / US-B3-7: ffmpeg.exe subprocess encode for 10-bit HDR
     // (HDR10 / HLG) jobs — reached only when no 10-bit HEVC encoder is
     // available in the loaded avcodec DLL. A worker QThread renders every
@@ -236,7 +238,7 @@ private:
     // frame-render + in-process encode loop; m_cancelRequested is the cross-thread
     // cancellation flag (mirrors VideoStabilizer::m_cancelled).
     QThread *m_renderThread = nullptr;
-    bool m_cancelRequested = false;
+    std::atomic<bool> m_cancelRequested{false};
 
     // US-MF-6: ffmpeg.exe subprocess handle for the 10-bit HDR (HDR10/HLG)
     // render branch. Only the HDR subprocess path sets this; the in-process

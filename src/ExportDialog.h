@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QDialog>
+#include <QJsonObject>
 #include <QComboBox>
 #include <QSpinBox>
 #include <QLineEdit>
@@ -15,6 +16,7 @@
 enum class ExportType {
     Video,       // 既存 video encode (preset/codec 設定を使う)
     PremiereXml, // Premiere Pro XML (FCP7) — PremiereXmlExporter を呼出
+    ImageSequence, // PNG / TIFF 連番静止画
 };
 
 struct ExportPreset {
@@ -57,6 +59,12 @@ struct ExportConfig {
     bool hdr10 = false;  // 10-bit BT.2020/PQ output when true (preserved for backward compat)
     int proresProfile = -1;  // -1 = not ProRes; 0..5 = Proxy/LT/SQ/HQ/4444/4444XQ
     bool keepAlpha = false;
+    bool imageSequence = false;
+    QString sequenceFolder;
+    QString sequencePattern = "name_%06d.png";
+    int sequenceDigits = 6;
+    int sequenceStart = 0;
+    void appendSequenceSettings(QJsonObject &json) const;
     HDRSettings hdrSettings; // extended HDR metadata
     bool exportMarkedRangeOnly = false;
     bool audioOnly = false;
@@ -109,6 +117,11 @@ private:
     ProjectConfig m_projectConfig;
     QVector<ClipInfo> m_clips;
 
+    QWidget *m_sequenceSettings = nullptr;
+    QComboBox *m_sequenceFormat = nullptr;
+    QLineEdit *m_sequencePattern = nullptr;
+    QSpinBox *m_sequenceDigits = nullptr;
+    QSpinBox *m_sequenceStart = nullptr;
     QCheckBox *m_keepAlphaCheckbox = nullptr;
     QCheckBox *m_audioOnlyCheckbox = nullptr;
     QComboBox *m_audioContainerCombo = nullptr;

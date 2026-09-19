@@ -9,6 +9,9 @@
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QFormLayout>
+#include <QImageWriter>
+#include <QRegularExpression>
+#include "SequenceExport.h"
 #include <QGroupBox>
 #include <QDialogButtonBox>
 #include <QFileDialog>
@@ -32,6 +35,17 @@ int defaultCrfFor(const QString &codec)
 {
     return codec.contains("av1") ? 30 : 23;
 }
+}
+
+void ExportConfig::appendSequenceSettings(QJsonObject &json) const
+{
+    if (!imageSequence) return;
+    json["imageSequence"] = true;
+    json["sequenceFolder"] = sequenceFolder.isEmpty() ? outputPath : sequenceFolder;
+    json["sequencePattern"] = sequencePattern;
+    json["sequenceDigits"] = sequenceDigits;
+    json["sequenceStart"] = sequenceStart;
+    json["keepAlpha"] = keepAlpha;
 }
 
 QString ExportConfig::audioCodecForContainer(const QString &container)
@@ -99,6 +113,7 @@ void ExportDialog::setupUI()
     m_exportTypeCombo = new QComboBox(this);
     m_exportTypeCombo->addItem("動画ファイル (Video)", static_cast<int>(ExportType::Video));
     m_exportTypeCombo->addItem("Premiere Pro XML (FCP7)", static_cast<int>(ExportType::PremiereXml));
+    m_exportTypeCombo->addItem(tr("連番静止画 (PNG / TIFF)"), static_cast<int>(ExportType::ImageSequence));
     typeLayout->addWidget(m_exportTypeCombo);
     m_audioOnlyCheckbox = new QCheckBox(tr("音声のみ (映像なし)"), this);
     typeLayout->addWidget(m_audioOnlyCheckbox);
@@ -113,6 +128,53 @@ void ExportDialog::setupUI()
     m_audioContainerCombo->setVisible(false);
     typeLayout->addWidget(m_audioContainerCombo);
     mainLayout->addWidget(typeGroup);
+
+    m_sequenceSettings = new QGroupBox(tr("連番静止画の設定"), this);
+    auto *sequenceForm = new QFormLayout(m_sequenceSettings);
+    m_sequenceFormat = new QComboBox(this);
+    m_sequenceFormat->setObjectName("sequenceFormat");
+    m_sequenceFormat->addItem("PNG", "png");
+    if (QImageWriter::supportedImageFormats().contains("tiff"))
+        m_sequenceFormat->addItem("TIFF", "tiff");
+    m_sequencePattern = new QLineEdit("name_%06d.png", this);
+    m_sequencePattern->setObjectName("sequencePattern");
+    m_sequenceDigits = new QSpinBox(this);
+    m_sequenceDigits->setObjectName("sequenceDigits");
+    m_sequenceDigits->setRange(1, 12);
+    m_sequenceDigits->setValue(6);
+    m_sequenceStart = new QSpinBox(this);
+    m_sequenceStart->setObjectName("sequenceStart");
+    m_sequenceStart->setRange(0, 2147483647);
+    sequenceForm->addRow(tr("画像形式:"), m_sequenceFormat);
+    sequenceForm->addRow(tr("ファイル名パターン:"), m_sequencePattern);
+    sequenceForm->addRow(tr("番号の桁数:"), m_sequenceDigits);
+    sequenceForm->addRow(tr("開始番号:"), m_sequenceStart);
+    sequenceForm->addRow(new QLabel(tr("出力先にはフォルダを指定してください。音声は含まれません。\n音声が必要な場合は「音声のみ」で別途書き出してください。"), this));
+    mainLayout->addWidget(m_sequenceSettings);
+    m_sequenceSettings->hide();
+    connect(m_sequenceFormat, &QComboBox::currentIndexChanged, this, [this]() {
+        QString pattern = m_sequencePattern->text();
+        const int dot = pattern.lastIndexOf('.');
+        if (dot >= 0) pattern.truncate(dot);
+        m_sequencePattern->setText(pattern + '.' + m_sequenceFormat->currentData().toString());
+    });
+    connect(m_sequenceDigits, &QSpinBox::valueChanged, this, [this](int digits) {
+        QString pattern = m_sequencePattern->text();
+        pattern.replace(QRegularExpression("%d|%0[1-9][0-9]*d"), QStringLiteral("%0") + QString::number(digits) + QLatin1Char('d'));
+        m_sequencePattern->setText(pattern);
+    });
+    connect(m_sequencePattern, &QLineEdit::textChanged, this, [this](const QString &pattern) {
+        const int format = m_sequenceFormat->findData(QFileInfo(pattern).suffix().toLower());
+        if (format >= 0) {
+            const QSignalBlocker blocker(m_sequenceFormat);
+            m_sequenceFormat->setCurrentIndex(format);
+        }
+        const auto match = QRegularExpression("%0([1-9][0-9]*)d").match(pattern);
+        if (match.hasMatch()) {
+            const QSignalBlocker blocker(m_sequenceDigits);
+            m_sequenceDigits->setValue(match.captured(1).toInt());
+        }
+    });
 
     // Preset
     auto *presetGroup = new QGroupBox("Export Preset");
@@ -545,6 +607,7 @@ void ExportDialog::onExportTypeChanged(int index)
 {
     const auto type = static_cast<ExportType>(m_exportTypeCombo->itemData(index).toInt());
     const bool isVideo = (type == ExportType::Video);
+    m_sequenceSettings->setVisible(type == ExportType::ImageSequence);
 
     // Codec / preset controls are only relevant for video encode
     if (m_presetCombo) m_presetCombo->setEnabled(isVideo);
@@ -560,6 +623,11 @@ void ExportDialog::onExportTypeChanged(int index)
 void ExportDialog::onBrowseOutput()
 {
     const auto type = static_cast<ExportType>(m_exportTypeCombo->currentData().toInt());
+    if (type == ExportType::ImageSequence) {
+        const QString folder = QFileDialog::getExistingDirectory(this, tr("連番の出力フォルダ"), m_outputEdit->text());
+        if (!folder.isEmpty()) m_outputEdit->setText(folder);
+        return;
+    }
     QString filter;
     if (type == ExportType::PremiereXml) {
         filter = "Premiere XML (*.xml)";
@@ -620,6 +688,15 @@ void ExportDialog::onExport()
     }
 
     m_config = currentSettings();
+    if (m_config.imageSequence) {
+        QJsonObject json;
+        m_config.appendSequenceSettings(json);
+        const QString error = sequenceexport::validate(sequenceexport::Settings::fromJson(json, m_config.outputPath));
+        if (!error.isEmpty()) {
+            QMessageBox::warning(this, tr("連番静止画"), error);
+            return;
+        }
+    }
 
     accept();
 }
@@ -684,7 +761,12 @@ ExportConfig ExportDialog::currentSettings() const
     ExportConfig c = m_config;
     const bool user = !m_presetCombo->currentData().toString().isEmpty();
     c.outputPath = m_outputEdit->text();
-    c.audioOnly = m_audioOnlyCheckbox->isChecked();
+    c.imageSequence = static_cast<ExportType>(m_exportTypeCombo->currentData().toInt()) == ExportType::ImageSequence;
+    c.sequenceFolder = c.imageSequence ? c.outputPath : QString();
+    c.sequencePattern = m_sequencePattern->text();
+    c.sequenceDigits = m_sequenceDigits->value();
+    c.sequenceStart = m_sequenceStart->value();
+    c.audioOnly = !c.imageSequence && m_audioOnlyCheckbox->isChecked();
     c.videoCodec = m_videoCodecCombo->currentData().toString();
     c.audioCodec = m_audioCodecCombo->currentData().toString();
     c.container = defaultExtension();
@@ -706,8 +788,12 @@ ExportConfig ExportDialog::currentSettings() const
             c.proresProfile = list[index].proresProfile;
         }
     }
+    if (c.imageSequence) {
+        c.hdr10 = false;
+        c.hdrSettings.mode = QStringLiteral("sdr");
+    }
     c.keepAlpha = m_keepAlphaCheckbox->isChecked() && !c.audioOnly
-        && libavcore::alphaExportPixelFormat(c.videoCodec.toStdString(), c.proresProfile) != AV_PIX_FMT_NONE;
+        && (c.imageSequence || libavcore::alphaExportPixelFormat(c.videoCodec.toStdString(), c.proresProfile) != AV_PIX_FMT_NONE);
     if (c.audioOnly) c.audioCodec = ExportConfig::audioCodecForContainer(c.container);
     return c;
 }
@@ -730,7 +816,7 @@ void ExportDialog::updateMarkedRangeCheckboxEnabled()
     if (m_exportTypeCombo) {
         const auto type =
             static_cast<ExportType>(m_exportTypeCombo->currentData().toInt());
-        isVideo = (type == ExportType::Video);
+        isVideo = (type == ExportType::Video || type == ExportType::ImageSequence);
     }
 
     const bool rangeSelectable =
@@ -772,11 +858,15 @@ void ExportDialog::updateSummary()
 {
     if (m_keepAlphaCheckbox) {
         const auto c = currentSettings();
-        const bool enabled = !c.audioOnly
+        const bool enabled = c.imageSequence || (!c.audioOnly
             && libavcore::alphaExportPixelFormat(c.videoCodec.toStdString(), c.proresProfile) != AV_PIX_FMT_NONE
-            && static_cast<ExportType>(m_exportTypeCombo->currentData().toInt()) == ExportType::Video;
+            && static_cast<ExportType>(m_exportTypeCombo->currentData().toInt()) == ExportType::Video);
         m_keepAlphaCheckbox->setEnabled(enabled);
         if (!enabled) m_keepAlphaCheckbox->setChecked(false);
+    }
+    if (static_cast<ExportType>(m_exportTypeCombo->currentData().toInt()) == ExportType::ImageSequence) {
+        m_summaryLabel->setText(tr("連番静止画 | 音声なし | 出力先: フォルダ"));
+        return;
     }
     if (m_audioOnlyCheckbox->isChecked()) {
         m_summaryLabel->setText(tr("音声のみ | %1 | %2 kbps | .%3")

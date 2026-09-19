@@ -209,6 +209,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/TimecodeBurnInDialog.cpp
     src/FrameDiff.cpp
     src/FrameExport.h
+    src/SequenceExport.cpp
+    src/SequenceExport.h
     src/FrameExport.cpp
     src/FrameClipboard.h
     src/FrameClipboard.cpp
@@ -401,6 +403,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/EdlExport.h
     src/EdlExport.cpp
     src/selftests/export_pro_selftest.cpp
+    src/selftests/img_sequence_selftest.cpp
     src/selftests/export_alpha_selftest.cpp
     src/selftests/export_presets_selftest.cpp
     src/selftests/edl_export_selftest.cpp

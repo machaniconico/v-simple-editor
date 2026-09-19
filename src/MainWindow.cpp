@@ -10544,7 +10544,8 @@ void MainWindow::exportVideo()
     RenderJob job;
     job.name = QFileInfo(exportCfg.outputPath).fileName();
     QString audioMixError;
-    const QString preparedAudioMixPath = prepareExportAudioMix(&audioMixError);
+    const QString preparedAudioMixPath = exportCfg.imageSequence
+        ? QString() : prepareExportAudioMix(&audioMixError);
     if (!audioMixError.isEmpty()) {
         QMessageBox::warning(this, QStringLiteral("Export"),
                              audioMixError);
@@ -10603,6 +10604,7 @@ void MainWindow::exportVideo()
     if (exportCfg.proresProfile >= 0)
         cfg["proresProfile"] = exportCfg.proresProfile;
     if (exportCfg.keepAlpha) cfg["keepAlpha"] = true;
+    exportCfg.appendSequenceSettings(cfg);
     job.exportConfig = cfg;
 
     if (isHdrExport && dvxml::enabledFromEnv()) {
@@ -16799,6 +16801,7 @@ void MainWindow::onMobileExport()
                     }
                     if (cfg.proresProfile >= 0)
                         jcfg["proresProfile"] = cfg.proresProfile;
+                    cfg.appendSequenceSettings(jcfg);
                     job.exportConfig = jcfg;
 
                     auto *progress = new QProgressDialog(
