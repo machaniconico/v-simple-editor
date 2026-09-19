@@ -1,11 +1,5 @@
 #pragma once
 
-namespace offsetwheel {
-void setDisabledForTest(bool disabled);
-void resetCallCountForTest();
-int callCountForTest();
-}
-
 #include <QImage>
 #include <QColor>
 #include <QVector>

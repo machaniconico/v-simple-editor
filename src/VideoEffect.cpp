@@ -10,14 +10,6 @@
 #include <cmath>
 #include <cstdint>
 
-namespace offsetwheel {
-static thread_local bool disabledForTest = false;
-static thread_local int callsForTest = 0;
-void setDisabledForTest(bool disabled) { disabledForTest = disabled; }
-void resetCallCountForTest() { callsForTest = 0; }
-int callCountForTest() { return callsForTest; }
-}
-
 // --- Helpers ---
 
 static inline int clamp255(int v) { return qBound(0, v, 255); }
@@ -1434,9 +1426,7 @@ QImage VideoEffectProcessor::applyColorCorrection(const QImage &input, const Col
 
     // Lift/Gamma/Gain followed by Log range wheels — must match GLSL
     // applyLiftGammaGain() and applyLogWheels().
-    const bool hasOffset = !offsetwheel::disabledForTest
-        && (cc.offsetR != 0.0 || cc.offsetG != 0.0 || cc.offsetB != 0.0);
-    if (hasOffset && offsetwheel::callsForTest < 2147483647) ++offsetwheel::callsForTest;
+    const bool hasOffset = cc.offsetR != 0.0 || cc.offsetG != 0.0 || cc.offsetB != 0.0;
     const bool hasLGG = hasOffset || cc.liftR != 0.0 || cc.liftG != 0.0 || cc.liftB != 0.0
                      || cc.gammaR != 0.0 || cc.gammaG != 0.0 || cc.gammaB != 0.0
                      || cc.gainR != 0.0 || cc.gainG != 0.0 || cc.gainB != 0.0;
