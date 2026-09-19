@@ -8,9 +8,84 @@
 #include <QEventLoop>
 #include <QTemporaryDir>
 #include <QTimer>
+#include <cerrno>
 #include <cstdio>
+extern "C" {
+#include <libavutil/error.h>
+}
 
 namespace {
+// This fixture is static, so its first frame contains the same covered and
+// uncovered regions as every later frame. The native VP9 decoder ignores the
+// WebM BlockAdditional alpha layer; explicitly use libvpx-vp9 to measure it.
+QImage grabVp9AlphaFrame(const QString &path)
+{
+    struct DecoderResources {
+        AVFormatContext *format = nullptr;
+        AVCodecContext *decoder = nullptr;
+        AVPacket *packet = av_packet_alloc();
+        AVFrame *frame = av_frame_alloc();
+        AVFrame *rgba = av_frame_alloc();
+        SwsContext *scaler = nullptr;
+        ~DecoderResources()
+        {
+            sws_freeContext(scaler);
+            av_frame_free(&rgba);
+            av_frame_free(&frame);
+            av_packet_free(&packet);
+            avcodec_free_context(&decoder);
+            avformat_close_input(&format);
+        }
+    } resources;
+    const AVCodec *codec = avcodec_find_decoder_by_name("libvpx-vp9");
+    if (!codec || !resources.packet || !resources.frame || !resources.rgba
+        || avformat_open_input(&resources.format, path.toUtf8().constData(), nullptr, nullptr) < 0
+        || avformat_find_stream_info(resources.format, nullptr) < 0)
+        return {};
+    const int stream = av_find_best_stream(resources.format, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+    if (stream < 0 || resources.format->streams[stream]->codecpar->codec_id != AV_CODEC_ID_VP9)
+        return {};
+    resources.decoder = avcodec_alloc_context3(codec);
+    if (!resources.decoder
+        || avcodec_parameters_to_context(resources.decoder, resources.format->streams[stream]->codecpar) < 0
+        || avcodec_open2(resources.decoder, codec, nullptr) < 0)
+        return {};
+
+    bool draining = false;
+    for (;;) {
+        const int received = avcodec_receive_frame(resources.decoder, resources.frame);
+        if (received == 0) break;
+        if (received != AVERROR(EAGAIN) || draining) return {};
+        int read = 0;
+        do {
+            av_packet_unref(resources.packet);
+            read = av_read_frame(resources.format, resources.packet);
+        } while (read >= 0 && resources.packet->stream_index != stream);
+        if (read < 0 && read != AVERROR_EOF) return {};
+        draining = read == AVERROR_EOF;
+        const int sent = avcodec_send_packet(resources.decoder, draining ? nullptr : resources.packet);
+        av_packet_unref(resources.packet);
+        if (sent < 0) return {};
+    }
+
+    const AVFrame *frame = resources.frame;
+    // Reject a decoder result that has already discarded alpha.
+    if (frame->format != AV_PIX_FMT_YUVA420P) return {};
+    resources.scaler = sws_getContext(frame->width, frame->height,
+        static_cast<AVPixelFormat>(frame->format), frame->width, frame->height,
+        AV_PIX_FMT_RGBA, SWS_BILINEAR, nullptr, nullptr, nullptr);
+    resources.rgba->format = AV_PIX_FMT_RGBA;
+    resources.rgba->width = frame->width;
+    resources.rgba->height = frame->height;
+    if (!resources.scaler || av_frame_get_buffer(resources.rgba, 64) < 0
+        || sws_scale(resources.scaler, frame->data, frame->linesize, 0, frame->height,
+            resources.rgba->data, resources.rgba->linesize) != frame->height)
+        return {};
+    // Copy out of the padded FFmpeg allocation before resources are released.
+    return QImage(resources.rgba->data[0], frame->width, frame->height,
+        resources.rgba->linesize[0], QImage::Format_RGBA8888).copy();
+}
+
 bool render(Timeline &timeline, const QString &path, bool alpha, int profile, const QString &codec = QStringLiteral("prores"))
 {
     RenderQueue queue;
@@ -209,12 +284,14 @@ int runExportAlphaSelftest()
     gate(4, refusal);
 
     bool vp9 = true;
-    if (CodecDetector::isEncoderAvailable("libvpx-vp9")) {
+    const bool vp9EncoderAvailable = CodecDetector::isEncoderAvailable("libvpx-vp9");
+    const bool vp9AlphaDecoderAvailable = avcodec_find_decoder_by_name("libvpx-vp9") != nullptr;
+    if (vp9EncoderAvailable && vp9AlphaDecoderAvailable) {
         const QString path = temp.filePath("alpha.webm");
         libavcore::FrameEncoder::resetAlphaFrameCountForTest();
         RenderQueue::resetBlackCompositeCountForTest();
         vp9 = ready && render(timeline, path, true, -1, "libvpx-vp9");
-        const QImage image = libavcore::grabFrameAt(path, 0.5);
+        const QImage image = grabVp9AlphaFrame(path);
         vp9 &= pixelsMatch(image, true)
             && libavcore::FrameEncoder::alphaFrameCountForTest() > 0
             && RenderQueue::blackCompositeCountForTest() == 0;
@@ -241,7 +318,9 @@ int runExportAlphaSelftest()
             }
         }
     } else {
-        std::fprintf(stderr, "SKIP G5: libvpx-vp9 unavailable\n");
+        std::fprintf(stderr, "SKIP G5: libvpx-vp9 encoder %s, alpha decoder %s\n",
+            vp9EncoderAvailable ? "available" : "unavailable",
+            vp9AlphaDecoderAvailable ? "available" : "unavailable");
     }
     gate(5, vp9);
 
