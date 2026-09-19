@@ -16,6 +16,11 @@ A professional video editing application built from scratch with C++17, Qt6, and
 - Select all / select forward・backward from playhead / blade all tracks at playhead (Ctrl+Shift+K)
 - Frame nudge (Alt+←/→ = 1 frame, Alt+Shift+←/→ = 10 frames) / close all gaps (only gaps common to every unlocked track)
 - Track name & color (track header context menu, MCP `set_track_property`)
+- Track remove / reorder with full undo, including track-matte, parenting, adjustment-layer, mixer and bus references (track header context menu, Track menu, MCP `add_track` / `remove_track` / `move_track`)
+- Marquee (rubber-band) clip selection, zoom to sequence / selection, go to timecode (`Ctrl+Shift+J`)
+- Move clip head / tail to playhead, select clips by label, linked-selection toggle
+- Sequence list dock (switch / create / rename, MCP `get_sequences` / `set_active_sequence`)
+- Clip filmstrip thumbnails on the timeline (off by default) and media-pool thumbnails with hover skimming
 - Media pool ratings (favorite / rejected / 1-5 stars), filters (all / favorites / exclude rejected / unused), rename, show in Explorer
 - Undo / redo (unlimited history)
 - Snap to grid & playhead
@@ -39,11 +44,12 @@ A professional video editing application built from scratch with C++17, Qt6, and
 - Image overlay & Picture-in-Picture
 - 9 video effects (blur, sharpen, sepia, negative, etc.)
 - Color correction (10 parameters: brightness, contrast, saturation, hue, temperature, tint, gamma, highlights, shadows, exposure)
-- LUT import (.cube format + 4 built-in LUTs)
+- LUT import (.cube format + 4 built-in LUTs), applied from the Effects menu to the selected clip and honoured by export (defect fix: menu LUT used to affect preview only)
 - Log-range color wheels (Shadow / Midtone / Highlight) and still store with wipe compare
 - Color warper (12 x 3 hue / saturation mesh, CPU and GPU parity)
 - Camera Log → Rec.709 (S-Log3 / LogC3 / V-Log / Cineon, exposure offset, gamma 2.4 / linear / Rec.709 OETF output)
 - Luma key / color key (CPU-only, alpha survives through export; place last in the stack)
+- Broadcast safe (Rec.709 legal / full-range limiter) and Leave Color (keep one hue, desaturate the rest), both CPU-only so preview matches export
 - Flip / Flop, solid color layer insertion, and 5 parametric warps (wave / ripple / spherize / fisheye / pinch)
 - Effect stacking with keyframe animation (5 interpolation modes)
 - Plugin system (5 built-in: Glow, Emboss, Posterize, Edge Detect, Color Shift)
@@ -63,6 +69,8 @@ A professional video editing application built from scratch with C++17, Qt6, and
 - Dialogue leveler (automatic speech loudness leveling to a target LUFS)
 - Music remix (beat-aware BGM re-timing to a target duration)
 - Per-track 4-band EQ / compressor / reverb / noise reduction as a shared DSP module, applied to export as well as playback (defect fix: projects using track FX now export the processed sound)
+- Master bus EQ (post-mix, off by default) and correct panel-to-engine track mapping (defect fix: A1's FX used to land on another track)
+- Track FX and master EQ are saved in the project and cleared when switching projects (defect fix: settings used to leak between projects)
 
 ### AI & Automation
 - Silence detection
@@ -81,6 +89,8 @@ A professional video editing application built from scratch with C++17, Qt6, and
 - 3D camera (dolly, pan, orbit, zoom) with optional true perspective projection (look-at, roll, layer rotation)
 - 3D camera solve from planar tracks (homography decomposition, no external solver)
 - Two-view relative pose (normalized 8-point + RANSAC + essential decomposition) and linear triangulation (numeric core, no UI yet)
+- Multi-frame feature tracking, two-view pose chaining and small-scale bundle adjustment (Levenberg-Marquardt, dense solver, up to 30 frames x 150 points; numeric core, no UI yet)
+- Mesh warp per clip with on-preview grid handles (Composition menu, off by default, CPU path so preview matches export)
 - Expression engine (wiggle, noise, ease, `audioLevel()` from linked audio)
 - Convert audio to keyframes (RMS envelope → opacity / scale / rotation / position)
 - Shape layers (8 primitives) as timeline clips, with Repeater / Trim Paths modifiers
@@ -101,6 +111,8 @@ A professional video editing application built from scratch with C++17, Qt6, and
 - Render queue (batch export)
 - Rate control: bitrate or CRF quality mode (H.264 / H.265 / VP9 0..51, AV1 0..63 with software AV1 fallback)
 - Audio-only export (m4a / wav / mp3, PCM intermediate mix)
+- User export presets (save / delete current settings, resolved by name from MCP `export_video`)
+- Alpha export on ProRes 4444 / 4444 XQ (`keepAlpha`, off by default; transparent areas stay transparent in the MOV)
 - Screen recorder (cross-platform)
 - Speed ramp (variable speed with easing)
 - Timeline markers & YouTube chapter export
@@ -227,8 +239,15 @@ MCP の変更系ツールは確認ダイアログを出さず、原則として�
 | `relink_media` | 見つからないメディア / LUT のパスを `mapping`（`[{from, to}]`、1 件以上）で一括再リンクする。`to` が全て実在するファイルのときだけ変更し、リンクした映像・音声、パーティクル設定やオーバーレイの参照、ネストしたシーケンスまで 1 回の Undo で更新する。存在しないファイルを指定すると「ファイルが見つかりません」のエラーで何も変更しない。応答は `{"ok":true,"relinked":N}` | あり |
 | `music_remix` | 音声クリップ（`kind` は `audio` のみ）をビート境界のセグメントで再構成し、`targetSec`（0 より大きく 86400 以下）の尺へ自動調整する。継ぎ目にはコンスタントパワーのクロスフェードが付く。ビートが 2 個未満の素材は変更せずエラー。応答に `resultDuration` と `segmentCount` を返す | あり |
 | `dialogue_level` | 音声クリップ（`kind` は `audio` のみ）の短時間ラウドネスを解析し、会話音量を `targetLufs`（既定 -18）へ平準化する音量エンベロープを生成する。応答に `pointCount` / `measuredLufsMin` / `measuredLufsMax` を返す | あり |
+| `get_sequences` | プロジェクト内の全シーケンスを列挙する（`{ok, sequences:[{id, name, active}]}`）。引数なし | なし |
+| `set_active_sequence` | `id` のシーケンスへ切り替える。存在しない `id` はエラー | なし（Ctrl+Z 対象外） |
+| `add_track` | `kind`（`video` / `audio`）のトラックを末尾に追加する | あり（1 回） |
+| `remove_track` | `kind` / `trackIndex`（0 始まり）のトラックを削除する。載っているクリップも消え、トラックマット / 親子付け / 調整レイヤー / ミキサー / バス送りの参照も付け替わる。最後の 1 本とロック中は拒否 | あり（1 回で本数も中身も復元） |
+| `move_track` | `kind` / `trackIndex` のトラックを `newTrackIndex` へ移動する。範囲外はエラー | あり（1 回） |
 
-MCP サーバの自己テストは `--selftest=mcp` または `VEDITOR_MCP_SELFTEST=1` で実行できます（実装: `src/selftests/mcp_selftest.cpp`、ゲート G1..G162。ツール数は 42）。
+`export_video` には書き出しプリセット名を渡す `preset`（組み込み → ユーザープリセットの順に解決。他の引数を併記するとそちらが優先）と、ProRes 4444 / 4444 XQ でアルファを保持する `keepAlpha` / `proresProfile` があります（`keepAlpha` は `videoCodec` が `prores` かつ `proresProfile` が 4 または 5 のときだけ受理）。
+
+MCP サーバの自己テストは `--selftest=mcp` または `VEDITOR_MCP_SELFTEST=1` で実行できます（実装: `src/selftests/mcp_selftest.cpp`、ゲート G1..G170。ツール数は 47）。
 
 ---
 
@@ -342,6 +361,7 @@ cmake --build build
 | Copy / Paste | `Ctrl+C` / `Ctrl+V` |
 | Duplicate / Select All | `Ctrl+D` / `Ctrl+A` |
 | Blade All Tracks at Playhead | `Ctrl+Shift+K` |
+| Go to Timecode | `Ctrl+Shift+J` |
 | Nudge 1 / 10 frames | `Alt+←/→` / `Alt+Shift+←/→` |
 | Split at Playhead | `S` |
 | Delete / Ripple Delete | `Del` / `Shift+Del` |
@@ -557,6 +577,7 @@ v-simple-editor/
 - [x] Tracker Preset system: Motion / Planar with Registry + Dialog UX + ProjectFile persistence
 - [x] Selftest argv-switch SSOT: `kArgvSelftests[]` 182-entry table in `src/selftests/SelftestRegistry.cpp`, `--selftest=<name>` + `VEDITOR_*_SELFTEST` + `--selftest={list,help,all}` + unknown-name guard
 - [x] CI workflow draft (`.github/workflows/selftest.yml`, `workflow_dispatch` only)
+- [x] Wave 6 (17 stories): menu LUT export fix, marquee / zoom / timecode jump, clip-edge & label selection, track FX mapping fix + master EQ, track FX persistence fix, export user presets, ProRes 4444 alpha export, media-pool thumbnails, clip filmstrip, sequence dock, broadcast safe / leave color, mesh warp, track remove / reorder, bundle adjustment
 - [ ] CI green run + auto trigger on push / PR
 - [x] `src/main.cpp` split refactor (selftest functions → `src/selftests/`, dispatcher → SelftestRegistry module)
 - [ ] CRLF → LF wholesale normalization (per repo-root `.gitattributes`)
