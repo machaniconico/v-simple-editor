@@ -10071,6 +10071,7 @@ void MainWindow::exportVideo()
     }
     if (exportCfg.proresProfile >= 0)
         cfg["proresProfile"] = exportCfg.proresProfile;
+    if (exportCfg.keepAlpha) cfg["keepAlpha"] = true;
     job.exportConfig = cfg;
 
     if (isHdrExport && dvxml::enabledFromEnv()) {

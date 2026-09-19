@@ -1409,6 +1409,33 @@ bool FrameEncoder::pushFrameRgba32(const uchar* rgba, int stride, int64_t pts)
             m_encCtx->width, m_encCtx->height, m_pixFmt,
             SWS_BILINEAR, nullptr, nullptr, nullptr);
         if (!m_rgbaToYuvCtx) return false;
+        if (swscolor::matrixEnabledFromEnv()) {
+            const AVColorSpace dstCs = swscolor::resolveColorspace(
+                m_encCtx->colorspace, m_encCtx->width, m_encCtx->height);
+            const AVColorRange dstRange =
+                swscolor::resolveRange(m_encCtx->color_range);
+            int *currentInvTable = nullptr;
+            int *currentTable = nullptr;
+            int currentSrcRange = 0;
+            int currentDstRange = 0;
+            int brightness = 0;
+            int contrast = 0;
+            int saturation = 0;
+            if (sws_getColorspaceDetails(m_rgbaToYuvCtx, &currentInvTable,
+                                          &currentSrcRange, &currentTable,
+                                          &currentDstRange, &brightness,
+                                          &contrast, &saturation) >= 0) {
+                const int *srcCoeffs = sws_getCoefficients(SWS_CS_DEFAULT);
+                const int *dstCoeffs =
+                    sws_getCoefficients(swscolor::swsCoeffsId(dstCs));
+                if (srcCoeffs && dstCoeffs) {
+                    (void)sws_setColorspaceDetails(
+                        m_rgbaToYuvCtx, srcCoeffs, 1, dstCoeffs,
+                        dstRange == AVCOL_RANGE_JPEG ? 1 : 0,
+                        brightness, contrast, saturation);
+                }
+            }
+        }
     }
     AVFrame* frame = av_frame_alloc();
     if (!frame) return false;
