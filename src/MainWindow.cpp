@@ -7052,6 +7052,88 @@ void MainWindow::setupMenuBar()
 
     m_effectControlsPanel->setTimeline(m_timeline);
     m_effectControlsPanel->setMainWindow(this);
+    // Keep this action on the dock so rebuilding effect rows does not remove it.
+    auto *effectMaskAction = new QAction(QStringLiteral("このエフェクトにマスクを設定…"), m_effectControlsPanel);
+    m_effectControlsPanel->addAction(effectMaskAction);
+    m_effectControlsPanel->setContextMenuPolicy(Qt::ActionsContextMenu);
+    connect(effectMaskAction, &QAction::triggered, this, [this]() {
+        int trackIdx = -1, clipIdx = -1;
+        ClipInfo clip;
+        if (!selectedVideoClipRef(trackIdx, clipIdx, &clip) || clip.effects.isEmpty())
+            return;
+        QStringList choices;
+        for (int i = 0; i < clip.effects.size(); ++i)
+            choices.append(QStringLiteral("%1: %2").arg(i + 1).arg(VideoEffect::typeName(clip.effects[i].type)));
+        bool accepted = false;
+        const QString choice = QInputDialog::getItem(this, QStringLiteral("エフェクトのマスク"),
+            QStringLiteral("対象エフェクト"), choices, 0, false, &accepted);
+        if (!accepted) return;
+        const int index = choices.indexOf(choice);
+        if (index < 0) return;
+        const QImage frame = decodeClipFrameAtSourceTime(clip,
+            clipSourceTimeAtPlayheadSeconds(trackIdx, clipIdx, clip));
+        if (frame.isNull()) return;
+        RotoToolsDialog dialog(this);
+        dialog.setWindowTitle(QStringLiteral("エフェクトのマスク - %1").arg(choice));
+        dialog.setFrame(frame);
+        RotoPath initial;
+        if (!clip.effects[index].mask.isDefault()) {
+            const Mask &mask = clip.effects[index].mask.masks().first();
+            initial.feather = mask.feather.amount * qMin(frame.width(), frame.height());
+            QVector<QPointF> points = mask.points;
+            if (mask.shape == MaskShape::Rectangle || mask.shape == MaskShape::Ellipse) {
+                QPainterPath outline;
+                const QRectF rect(mask.rect.x() * frame.width(), mask.rect.y() * frame.height(),
+                                  mask.rect.width() * frame.width(), mask.rect.height() * frame.height());
+                if (mask.shape == MaskShape::Ellipse) outline.addEllipse(rect);
+                else outline.addRect(rect);
+                points.clear();
+                for (const QPointF &point : outline.toFillPolygon())
+                    points.append(QPointF(point.x() / frame.width(), point.y() / frame.height()));
+            }
+            for (const QPointF &point : points) {
+                RotoPoint p;
+                p.position = QPointF(point.x() * frame.width(), point.y() * frame.height());
+                p.handleIn = p.handleOut = p.position;
+                initial.points.append(p);
+            }
+        }
+        dialog.setRotoPath(initial);
+        if (dialog.exec() != QDialog::Accepted) return;
+        const RotoPath path = dialog.rotoPath();
+        const double featherPercent = QInputDialog::getDouble(this, QStringLiteral("エフェクトのマスク"),
+            QStringLiteral("フェザー（フレーム短辺の %）"),
+            100.0 * path.feather / qMin(frame.width(), frame.height()), 0.0, 100.0, 2, &accepted);
+        if (!accepted) return;
+        MaskSystem system;
+        if (path.points.size() >= 3) {
+            Mask mask = clip.effects[index].mask.isDefault()
+                ? Mask() : clip.effects[index].mask.masks().first();
+            mask.shape = MaskShape::Polygon;
+            mask.points.clear();
+            mask.feather.amount = featherPercent / 100.0;
+            // Rasterizer consumes polygons: flatten the edited cubic path before normalizing.
+            QPainterPath outline;
+            outline.moveTo(path.points.first().position);
+            for (int i = 0; i < path.points.size(); ++i) {
+                const RotoPoint &a = path.points[i];
+                const RotoPoint &b = path.points[(i + 1) % path.points.size()];
+                outline.cubicTo(a.handleOut, b.handleIn, b.position);
+            }
+            outline.closeSubpath();
+            for (const QPointF &point : outline.toFillPolygon())
+                mask.points.append(QPointF(qBound(0.0, point.x() / frame.width(), 1.0),
+                                          qBound(0.0, point.y() / frame.height(), 1.0)));
+            system.addMask(mask);
+        }
+        for (int i = 1; i < clip.effects[index].mask.masks().size(); ++i)
+            system.addMask(clip.effects[index].mask.masks()[i]);
+        clip.effects[index].mask = system;
+        m_timeline->setClipEffectsAndKeyframes(trackIdx, clipIdx, clip.effects, clip.keyframes);
+        m_effectControlsPanel->refreshFromCurrentClip();
+        refreshSpecialClipPreview();
+    });
+
     connect(m_timeline, &Timeline::clipSelectedOnTrack,
             m_effectControlsPanel, &effectctrl::EffectControlsPanel::refreshFromCurrentClip);
     connect(m_effectControlsPanel, &effectctrl::EffectControlsPanel::effectsChanged,

@@ -768,6 +768,7 @@ QJsonObject PresetLibrary::videoEffectToJson(const VideoEffect &ve)
     obj["param1"]    = ve.param1;
     obj["param2"]    = ve.param2;
     obj["param3"]    = ve.param3;
+    if (!ve.mask.isDefault()) obj["mask"] = ve.mask.toJson();
     obj["keyColor"]  = ve.keyColor.name(QColor::HexRgb);
     obj["keyColorR"] = ve.keyColor.red();
     obj["keyColorG"] = ve.keyColor.green();
@@ -789,6 +790,7 @@ VideoEffect PresetLibrary::videoEffectFromJson(const QJsonObject &obj)
     ve.param3   = obj["param3"].toDouble(0.0);
     ve.startSec = obj["startSec"].toDouble(-1.0);
     ve.endSec   = obj["endSec"].toDouble(-1.0);
+    ve.mask.fromJson(obj["mask"].toObject());
 
     QColor keyColor(obj["keyColor"].toString());
     if (keyColor.isValid()) {

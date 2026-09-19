@@ -101,6 +101,7 @@ int runEasingSelftest();
 int runEasingPresetsSelftest();
 int runEffectKeyframeParitySelftest();
 int runEffectLibrarySelftest();
+int runEffectMaskSelftest();
 int runVfxFootageSelftest();
 int runEffectPresetSelftest();
 int runEffectTimingSelftest();
@@ -640,6 +641,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "FilmGrain deterministic CPU effect + Echo temporal compositor + preview routing gates (G1-G16)" },
     { "flip-solid", "VEDITOR_FLIP_SOLID_SELFTEST", runFlipSolidSelftest, true,
       "Flip CPU parity, involution, preset round-trip and solid insertion/undo (G1-G5)" },
+    { "effect-mask", "VEDITOR_EFFECT_MASK_SELFTEST", runEffectMaskSelftest, true,
+      "エフェクト単位マスク・保存・CPUパリティ・正規化座標 (G1-G6)" },
     { "effect-preset", "VEDITOR_EFFECT_PRESET_SELFTEST", runEffectPresetSelftest, false,
       "FXP-1 effect preset stack JSON save/load/apply with optional effect keyframes (5 gates)" },
     { "effect-library", "VEDITOR_EFFECT_LIBRARY_SELFTEST", runEffectLibrarySelftest, false,

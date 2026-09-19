@@ -5,6 +5,7 @@
 #include <QVector>
 #include <QString>
 #include <QPointF>
+#include "MaskSystem.h"
 
 // --- Color Correction / Grading ---
 
@@ -254,6 +255,9 @@ struct VideoEffect {
     QColor keyColor = QColor(0, 255, 0); // ChromaKey / Tint / GradientRamp / Fill / PhotoFilter / Tritone
     double startSec = -1.0; // clip-local seconds; -1 == no start limit
     double endSec = -1.0;   // clip-local seconds; -1 == no end limit
+    // Normalized coordinates; feather and expansion are fractions of the short side.
+    MaskSystem mask;
+    bool hasActiveEffectMask() const { return enabled && type != VideoEffectType::None && !mask.isDefault(); }
 
     static QString typeName(VideoEffectType t);
     static QVector<VideoEffectType> allTypes();
@@ -360,6 +364,9 @@ public:
     // Calling-thread switch; resets the shared Warp kernel invocation counter.
     static void setWarpEnabledForTesting(bool enabled);
     static int warpInvocationCountForTesting();
+    static void setEffectMaskDisabledForTesting(bool disabled);
+    static int effectMaskInvocationCountForTesting();
+    static QImage blendEffectMask(const QImage &before, const QImage &after, const VideoEffect &effect);
     static QImage applyEffect(const QImage &input, const VideoEffect &effect);
     static QImage applyEffectStack(const QImage &input, const ColorCorrection &cc,
                                    const QVector<VideoEffect> &effects);

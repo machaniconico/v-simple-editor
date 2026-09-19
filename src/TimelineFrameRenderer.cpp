@@ -1006,8 +1006,8 @@ QImage applyClipFxPackWithEcho(const QImage &graded, const ClipInfo &clip,
                     const QImage frame = frameProvider ? frameProvider(src, loc) : QImage();
                     return frame.isNull() ? frame : applyPrefix(frame, effectIndex, loc, src);
                 };
-                result = applyRollingShutterFromSource(
-                    result, effect, clip, localSeconds, currentSourceSeconds, prefixProvider);
+                result = VideoEffectProcessor::blendEffectMask(result, applyRollingShutterFromSource(
+                    result, effect, clip, localSeconds, currentSourceSeconds, prefixProvider), effect);
                 continue;
             }
             if (!effect.enabled || effect.type != VideoEffectType::Echo) {
@@ -1080,7 +1080,8 @@ QImage applyClipFxPackWithEcho(const QImage &graded, const ClipInfo &clip,
                 echoes.append(echoFrame);
             }
 
-            result = composeEcho(result, echoes, decay, blend);
+            result = VideoEffectProcessor::blendEffectMask(
+                result, composeEcho(result, echoes, decay, blend), effect);
         }
         return result;
     };

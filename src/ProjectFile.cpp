@@ -2201,6 +2201,7 @@ QJsonObject ProjectFile::effectToJson(const VideoEffect &e)
     obj["param1"] = e.param1;
     obj["param2"] = e.param2;
     obj["param3"] = e.param3;
+    if (!e.mask.isDefault()) obj["mask"] = e.mask.toJson();
     obj["keyColor"] = e.keyColor.name();
     if (e.startSec != -1.0)
         obj["startSec"] = e.startSec;
@@ -2220,6 +2221,7 @@ VideoEffect ProjectFile::effectFromJson(const QJsonObject &obj)
     e.keyColor = QColor(obj["keyColor"].toString("#00ff00"));
     e.startSec = obj["startSec"].toDouble(-1.0);
     e.endSec = obj["endSec"].toDouble(-1.0);
+    e.mask.fromJson(obj["mask"].toObject());
     return e;
 }
 

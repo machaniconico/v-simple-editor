@@ -1826,9 +1826,58 @@ int VideoEffectProcessor::safeLeaveColorInvocationCountForTesting()
     return safeLeaveColorCalls;
 }
 
+namespace {
+thread_local bool effectMaskDisabled = false;
+thread_local int effectMaskCalls = 0;
+}
+
+void VideoEffectProcessor::setEffectMaskDisabledForTesting(bool disabled)
+{
+    effectMaskDisabled = disabled;
+    effectMaskCalls = 0;
+}
+
+int VideoEffectProcessor::effectMaskInvocationCountForTesting() { return effectMaskCalls; }
+
+QImage VideoEffectProcessor::blendEffectMask(const QImage &before, const QImage &after,
+                                             const VideoEffect &effect)
+{
+    if (effectMaskDisabled || !effect.hasActiveEffectMask() || before.isNull()
+        || after.isNull() || before.size() != after.size()) return after;
+    ++effectMaskCalls;
+    QVector<Mask> masks = effect.mask.masks();
+    const double w = before.width(), h = before.height(), shortSide = qMin(w, h);
+    for (Mask &mask : masks) {
+        mask.rect = QRectF(mask.rect.x() * w, mask.rect.y() * h,
+                           mask.rect.width() * w, mask.rect.height() * h);
+        for (QPointF &point : mask.points)
+            point = QPointF(point.x() * w, point.y() * h);
+        mask.feather.amount *= shortSide;
+        mask.expansion *= shortSide;
+    }
+    const QImage coverage = MaskSystem::generateMaskImage(masks, before.size());
+    QImage result = before.convertToFormat(QImage::Format_RGBA8888);
+    const QImage output = after.convertToFormat(QImage::Format_RGBA8888);
+    for (int y = 0; y < result.height(); ++y) {
+        uchar *dst = result.scanLine(y);
+        const uchar *src = output.constScanLine(y);
+        const uchar *alpha = coverage.constScanLine(y);
+        for (int x = 0; x < result.width(); ++x)
+            for (int c = 0; c < 4; ++c)
+                dst[4*x+c] = (dst[4*x+c] * (255-alpha[x]) + src[4*x+c] * alpha[x] + 127) / 255;
+    }
+    return result;
+}
+
 QImage VideoEffectProcessor::applyEffect(const QImage &input, const VideoEffect &effect)
 {
     if (!effect.enabled || effect.type == VideoEffectType::None) return input;
+
+    if (!effectMaskDisabled && effect.hasActiveEffectMask() && !input.isNull()) {
+        VideoEffect unmasked = effect;
+        unmasked.mask = MaskSystem();
+        return blendEffectMask(input, applyEffect(input, unmasked), effect);
+    }
 
     switch (effect.type) {
     case VideoEffectType::BroadcastSafe:

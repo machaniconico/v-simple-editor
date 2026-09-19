@@ -108,6 +108,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/effect_keyframe_parity_selftest.cpp
     src/selftests/safe_leavecolor_selftest.cpp
     src/selftests/keyers_selftest.cpp
+    src/selftests/effect_mask_selftest.cpp
     src/selftests/EffectPresetSelftest.cpp
     src/selftests/EffectLibrarySelftest.cpp
     src/selftests/VfxFootageSelftest.cpp

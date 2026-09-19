@@ -128,7 +128,7 @@ bool stackRequiresClipLocalCpu(const QVector<VideoEffect> &effects,
                 return false;
             const bool hasTiming = effect.startSec >= 0.0
                 || effect.endSec >= 0.0;
-            return !gpuAvailable || hasTiming
+            return !gpuAvailable || hasTiming || effect.hasActiveEffectMask()
                 || !gpuPreviewSupportsEffect(effect.type);
         });
 }
