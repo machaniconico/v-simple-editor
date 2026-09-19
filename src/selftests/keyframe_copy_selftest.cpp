@@ -5,6 +5,9 @@
 #include "../clipanim/ClipAnim.h"
 
 #include <QApplication>
+#include <QAction>
+#include <QListWidget>
+#include <QMenu>
 #include <cmath>
 #include <cstdio>
 
@@ -156,6 +159,57 @@ int runKeyframeCopySelftest()
     undoOk = undoOk && timeline.undoManager()->currentIndex() == collisionBefore
         && sameManager(model(0), original) && sameManager(model(1), destinationBefore);
     gate(4, undoOk);
+    // G5: a separate, completely unanimated clip offers the source property
+    // without mutating the model, then creates it through the toolbar action.
+    ClipInfo unanimated;
+    unanimated.filePath = QStringLiteral("keyframe-copy-empty-model.mov");
+    unanimated.duration = 12.0;
+    unanimated.outPoint = 12.0;
+    unanimated.videoScale = 2.75;
+    Timeline emptyTimeline;
+    emptyTimeline.videoTracks()[0]->addClip(unanimated);
+    emptyTimeline.videoTracks()[0]->setSelectedClip(0);
+    emptyTimeline.undoManager()->saveState(emptyTimeline.currentState(), QStringLiteral("貼り付け前"));
+    GraphEditorPanel emptyPanel;
+    emptyPanel.setTimeline(&emptyTimeline);
+    emptyPanel.setSelectedClip(0, 0);
+    emptyPanel.setPlayheadSeconds(3.5);
+    const int emptyBefore = emptyTimeline.undoManager()->currentIndex();
+    auto emptyModel = [&]() { return emptyTimeline.videoTracks()[0]->clips()[0].keyframes; };
+    bool g5 = emptyModel().tracks().isEmpty();
+    const auto *destinations = emptyPanel.findChild<QListWidget *>();
+    g5 = g5 && destinations && destinations->currentItem()
+        && destinations->currentItem()->data(Qt::UserRole).toString() == sourceProperty;
+    QAction *pasteAction = nullptr;
+    for (auto *menu : emptyPanel.findChildren<QMenu *>()) {
+        QMetaObject::invokeMethod(menu, "aboutToShow", Qt::DirectConnection);
+        for (auto *action : menu->actions()) {
+            if (action->text() == QStringLiteral("再生ヘッド位置にキーフレームを貼り付け"))
+                pasteAction = action;
+        }
+    }
+    g5 = g5 && emptyModel().tracks().isEmpty()
+        && emptyTimeline.undoManager()->currentIndex() == emptyBefore
+        && pasteAction && pasteAction->isEnabled();
+    if (pasteAction)
+        pasteAction->trigger();
+    const auto newManager = emptyModel();
+    const auto *newTrack = newManager.track(sourceProperty);
+    g5 = g5 && newManager.tracks().size() == 1 && newTrack
+        && newTrack->defaultValue() == unanimated.videoScale && newTrack->count() == 9
+        && emptyTimeline.undoManager()->currentIndex() == emptyBefore + 1;
+    if (newTrack && newTrack->count() == 9) {
+        for (int i = 0; i < 9; ++i) {
+            const auto &key = newTrack->keyframes()[i];
+            g5 = g5 && std::abs(key.time - (3.5 + i * 0.25)) < 1e-9
+                && samePayload(key, source.keyframes()[i]);
+        }
+    }
+    emptyTimeline.undo();
+    QApplication::processEvents();
+    g5 = g5 && emptyTimeline.undoManager()->currentIndex() == emptyBefore
+        && sameManager(emptyModel(), unanimated.keyframes);
+    gate(5, g5);
     std::fprintf(stderr, "[keyframe-copy] summary: %d PASS, %d FAIL\n", passed, failed);
     return failed;
 }
