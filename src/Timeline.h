@@ -743,6 +743,14 @@ public:
     void selectClipsWithSameLabel();
     void setLinkedSelectionEnabled(bool enabled) { m_linkedSelectionEnabled = enabled; }
     bool linkedSelectionEnabled() const { return m_linkedSelectionEnabled; }
+    // US-605: reuse AV link identity without changing existing edit semantics.
+    // Linked-selection OFF suppresses selection propagation only; linked drag
+    // and trim retain AV behavior. Multi-member cross-track drops are Wave 8.
+    struct GroupClipTarget { bool audio; int trackIndex; int clipIndex; };
+    QVector<GroupClipTarget> selectedGroupClipTargets() const;
+    bool canGroupClips(const QVector<GroupClipTarget> &clips, QString *error = nullptr) const;
+    bool setClipGrouping(const QVector<GroupClipTarget> &clips, bool grouped,
+                         QString *error = nullptr);
     void selectAllClips();
     void selectClipsFromPlayhead(bool forward);
     void bladeAllTracksAtPlayhead();

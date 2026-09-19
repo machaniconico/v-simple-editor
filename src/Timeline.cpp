@@ -2645,6 +2645,12 @@ void TimelineTrack::paintEvent(QPaintEvent *event)
                 }
             }
         }
+        // Shared link identity also covers imported AV pairs; no new project state.
+        if (m_clips[i].linkGroup > 0) {
+            const QColor groupColor = QColor::fromHsv((m_clips[i].linkGroup % 36) * 10, 180, 245);
+            painter.fillRect(QRect(clipRect.left() + 3, clipRect.top() + 3, 10, 4), groupColor);
+        }
+
         x += clipWidth;
     }
 
@@ -5261,6 +5267,76 @@ bool Timeline::freezeFrameAtPlayhead(TimelineTrack *track, int clipIndex)
     scheduleEmitSequenceChanged();
     updateInfoLabel();
     emit positionChanged(m_playheadPos);
+    return true;
+}
+
+QVector<Timeline::GroupClipTarget> Timeline::selectedGroupClipTargets() const
+{
+    QVector<GroupClipTarget> result;
+    for (bool audio : {false, true}) {
+        const auto &tracks = audio ? m_audioTracks : m_videoTracks;
+        for (int t = 0; t < tracks.size(); ++t)
+            for (int c : tracks[t]->selectedClips()) result.append({audio, t, c});
+    }
+    return result;
+}
+
+bool Timeline::canGroupClips(const QVector<GroupClipTarget> &clips, QString *error) const
+{
+    auto reject = [&](const QString &message) { if (error) *error = message; return false; };
+    if (clips.size() < 2)
+        return reject(QStringLiteral("別々のトラックから 2 個以上のクリップを選択してください。"));
+    QSet<TimelineTrack *> seen;
+    for (const auto &target : clips) {
+        auto *track = trackAt(target.audio, target.trackIndex);
+        if (!track || target.clipIndex < 0 || target.clipIndex >= track->clipCount())
+            return reject(QStringLiteral("クリップの位置が無効です。"));
+        if (track->isLocked()) return reject(QStringLiteral("ロック中のトラックは変更できません。"));
+        if (seen.contains(track))
+            return reject(QStringLiteral("同一トラックの複数クリップはグループ化できません。"));
+        seen.insert(track);
+    }
+    return true;
+}
+
+bool Timeline::setClipGrouping(const QVector<GroupClipTarget> &clips, bool grouped, QString *error)
+{
+    auto reject = [&](const QString &message) { if (error) *error = message; return false; };
+    if (grouped && !canGroupClips(clips, error)) return false;
+    if (clips.isEmpty()) return reject(QStringLiteral("クリップを選択してください。"));
+    bool changed = grouped;
+    for (const auto &target : clips) {
+        auto *track = trackAt(target.audio, target.trackIndex);
+        if (!track || target.clipIndex < 0 || target.clipIndex >= track->clipCount())
+            return reject(QStringLiteral("クリップの位置が無効です。"));
+        if (track->isLocked())
+            return reject(QStringLiteral("ロック中のトラックは変更できません。"));
+        changed = changed || track->clips()[target.clipIndex].linkGroup != 0;
+    }
+    if (!changed) return true;
+    TrackClipSnapshot before = snapshotTrackClips(this);
+    int group = 0;
+    if (grouped) {
+        QSet<int> used;
+        for (const auto *track : m_videoTracks)
+            for (const auto &clip : track->clips()) used.insert(clip.linkGroup);
+        for (const auto *track : m_audioTracks)
+            for (const auto &clip : track->clips()) used.insert(clip.linkGroup);
+        do { group = allocateLinkGroup(); } while (used.contains(group));
+    }
+    for (const auto &target : clips) {
+        auto *track = trackAt(target.audio, target.trackIndex);
+        auto updated = track->clips();
+        updated[target.clipIndex].linkGroup = group;
+        track->setClips(updated);
+        // Group identity changes, but indices do not. Teach the remapper the
+        // new identity at the same slot so parent/matte entries survive.
+        if (!target.audio) before[target.trackIndex][target.clipIndex].linkGroup = group;
+    }
+    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, before);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, before);
+    saveUndoState(grouped ? QStringLiteral("グループ化") : QStringLiteral("グループ解除"));
+    scheduleEmitSequenceChanged();
     return true;
 }
 

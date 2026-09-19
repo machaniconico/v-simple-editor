@@ -1195,7 +1195,7 @@ int runMcpSelftest()
             rpcRequest(73, QStringLiteral("tools/list")))))
         .value(QStringLiteral("result")).toObject()
         .value(QStringLiteral("tools")).toArray();
-    constexpr int kExpectedProjectInfoToolCount = 36 + 1 + 2 + 2 + 1 + 2 + 3 + 1; // US-308: compare_project; US-312: render/decompose; US-400: color/LUT; US-406: track properties; US-509: sequences; US-511: track operations
+    constexpr int kExpectedProjectInfoToolCount = 36 + 1 + 2 + 2 + 1 + 2 + 3 + 1 + 2; // US-308: compare_project; US-312: render/decompose; US-400: color/LUT; US-406: track properties; US-509: sequences; US-511: track operations; US-605: group/ungroup
     bool outputSchemasDeclared = projectInfoToolDescriptors.size()
         == kExpectedProjectInfoToolCount;
     for (const QJsonValue& value : projectInfoToolDescriptors) {
@@ -5730,6 +5730,65 @@ int runMcpSelftest()
         projectTimeline->restoreState(saved);
     } else {
         fail("G171 set_clip_enabled", QStringLiteral("Timeline was not available"));
+    }
+    // US-605: real transport validation and atomic grouping/ungrouping.
+    if (projectTimeline) {
+        const TimelineState saved = projectTimeline->currentState();
+        ClipInfo clip;
+        clip.filePath = QStringLiteral("clip-group-test.mp4");
+        clip.duration = clip.outPoint = 2.0;
+        projectTimeline->restoreFromProject(QVector<QVector<ClipInfo>>{{clip, clip}, {clip}},
+            QVector<QVector<ClipInfo>>{{clip}}, 0.0, -1.0, -1.0, 100);
+        projectTimeline->undoManager()->clear();
+        projectTimeline->undoManager()->saveState(projectTimeline->currentState(), QStringLiteral("基準"));
+        int requestId = 60500;
+        auto call = [&](const QString &name, const QJsonArray &clips) {
+            return callProjectInfoTool(++requestId, name, {{"clips", clips}});
+        };
+        const QJsonObject v1{{"kind", "video"}, {"trackIndex", 0}, {"clipIndex", 0}};
+        const QJsonObject v2{{"kind", "video"}, {"trackIndex", 1}, {"clipIndex", 0}};
+        const QJsonObject a1{{"kind", "audio"}, {"trackIndex", 0}, {"clipIndex", 0}};
+        const QJsonArray targets{v1, v2, a1};
+        const auto before = projectTimeline->undoManager()->saveSerial();
+        bool good = true;
+        for (const auto &invalid : {QJsonArray{}, QJsonArray{v1}, QJsonArray{v1, v1},
+                QJsonArray{v1, QJsonObject{{"kind", "video"}, {"trackIndex", 0}, {"clipIndex", 1}}}})
+            good = toolResult(call(QStringLiteral("group_clips"), invalid)).value("isError").toBool() && good;
+        good = good && projectTimeline->undoManager()->saveSerial() == before;
+        const auto grouped = toolPayload(call(QStringLiteral("group_clips"), targets));
+        const int group = grouped.value("linkGroup").toInt();
+        good = good && grouped.value("ok").toBool() && group > 0
+            && grouped.value("undoRecorded").toBool()
+            && projectTimeline->undoManager()->saveSerial() == before + 1
+            && projectTimeline->videoTracks()[0]->clips()[0].linkGroup == group
+            && projectTimeline->videoTracks()[1]->clips()[0].linkGroup == group
+            && projectTimeline->audioTracks()[0]->clips()[0].linkGroup == group
+            && projectTimeline->videoTracks()[0]->clips()[1].linkGroup == 0;
+        good ? pass("G172 group_clips")
+             : fail("G172 group_clips", QStringLiteral("group validation/identity/undo mismatch"));
+        const auto serial = projectTimeline->undoManager()->saveSerial();
+        good = toolResult(call(QStringLiteral("ungroup_clips"), QJsonArray{v1,
+            QJsonObject{{"kind", "audio"}, {"trackIndex", 0}, {"clipIndex", 99}}}))
+            .value("isError").toBool();
+        good = good && projectTimeline->undoManager()->saveSerial() == serial
+            && projectTimeline->videoTracks()[0]->clips()[0].linkGroup == group;
+        const auto ungrouped = toolPayload(call(QStringLiteral("ungroup_clips"), targets));
+        good = good && ungrouped.value("ok").toBool() && ungrouped.value("undoRecorded").toBool()
+            && ungrouped.value("linkGroup").toInt(-1) == 0
+            && projectTimeline->undoManager()->saveSerial() == serial + 1
+            && projectTimeline->videoTracks()[0]->clips()[0].linkGroup == 0
+            && projectTimeline->videoTracks()[1]->clips()[0].linkGroup == 0
+            && projectTimeline->audioTracks()[0]->clips()[0].linkGroup == 0;
+        projectTimeline->undo();
+        good = good && projectTimeline->videoTracks()[0]->clips()[0].linkGroup == group
+            && projectTimeline->videoTracks()[1]->clips()[0].linkGroup == group
+            && projectTimeline->audioTracks()[0]->clips()[0].linkGroup == group;
+        good ? pass("G173 ungroup_clips")
+             : fail("G173 ungroup_clips", QStringLiteral("ungroup validation/atomicity/undo mismatch"));
+        projectTimeline->restoreState(saved);
+    } else {
+        fail("G172 group_clips", QStringLiteral("Timeline was not available"));
+        fail("G173 ungroup_clips", QStringLiteral("Timeline was not available"));
     }
     server.stop();
     qInfo().noquote().nospace() << "[mcp] selftest end, passed=" << passed

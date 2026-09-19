@@ -4551,6 +4551,25 @@ void MainWindow::setupMenuBar()
         settings.setValue(QStringLiteral("timeline/linkedSelection"), enabled);
     });
 
+    auto *groupAction = editMenu->addAction(QStringLiteral("グループ化"));
+    auto *ungroupAction = editMenu->addAction(QStringLiteral("グループ解除"));
+    connect(editMenu, &QMenu::aboutToShow, this, [this, groupAction, ungroupAction]() {
+        const auto targets = m_timeline->selectedGroupClipTargets();
+        QString reason;
+        groupAction->setEnabled(m_timeline->canGroupClips(targets, &reason));
+        groupAction->setStatusTip(reason);
+        ungroupAction->setEnabled(!targets.isEmpty());
+        if (!reason.isEmpty() && !targets.isEmpty()) statusBar()->showMessage(reason, 5000);
+    });
+    auto applyGrouping = [this](bool grouped) {
+        QString error;
+        if (!m_timeline->setClipGrouping(m_timeline->selectedGroupClipTargets(), grouped, &error))
+            statusBar()->showMessage(error, 5000);
+        updateEditActions();
+    };
+    connect(groupAction, &QAction::triggered, this, [applyGrouping]() { applyGrouping(true); });
+    connect(ungroupAction, &QAction::triggered, this, [applyGrouping]() { applyGrouping(false); });
+
     m_selectAllClipsAction = editMenu->addAction("すべて選択");
     m_selectForwardAction = editMenu->addAction("再生ヘッド以降を選択");
     m_selectBackwardAction = editMenu->addAction("再生ヘッド以前を選択");

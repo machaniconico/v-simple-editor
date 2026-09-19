@@ -1943,6 +1943,52 @@ void McpEditorTools::registerWriteTools()
 
     const QJsonObject clipProperties = clipSelectorProperties();
 
+    for (bool grouped : {true, false}) {
+        const QString name = grouped ? QStringLiteral("group_clips") : QStringLiteral("ungroup_clips");
+        m_registry->registerTool(withOutputSchema({
+            name,
+            grouped ? QStringLiteral("別々のトラックのクリップをグループ化する。取り消し可能。")
+                    : QStringLiteral("指定クリップのグループを解除する。取り消し可能。"),
+            schemaWithRequired(QJsonObject{{"clips", QJsonObject{
+                {"type", "array"}, {"minItems", grouped ? 2 : 1},
+                {"items", schemaWithRequired(clipProperties, {"kind", "trackIndex", "clipIndex"})}
+            }}}, {"clips"}),
+            guardedWrite(name, [this, grouped](const QJsonObject &args, QString *err) -> QJsonObject {
+                if (!rejectUnknownArguments(args, {QStringLiteral("clips")}, err)) return {};
+                if (!args.value("clips").isArray())
+                    return setError(err, QStringLiteral("clips must be an array")), QJsonObject{};
+                const auto values = args.value("clips").toArray();
+                if (values.size() < (grouped ? 2 : 1))
+                    return setError(err, QStringLiteral("クリップの指定数が不足しています。")), QJsonObject{};
+                Timeline *current = timeline();
+                QVector<Timeline::GroupClipTarget> targets;
+                for (const auto &value : values) {
+                    if (!value.isObject())
+                        return setError(err, QStringLiteral("clips entries must be objects")), QJsonObject{};
+                    const auto selector = value.toObject();
+                    if (!rejectUnknownArguments(selector, {QStringLiteral("kind"), QStringLiteral("trackIndex"),
+                            QStringLiteral("clipIndex")}, err)) return {};
+                    if (!selector.contains("kind") || !selector.contains("trackIndex"))
+                        return setError(err, QStringLiteral("kind and trackIndex are required")), QJsonObject{};
+                    ClipTarget target;
+                    if (!readClipTarget(selector, m_window, current, &target, err)) return {};
+                    targets.append({target.audio, target.trackIndex, target.clipIndex});
+                }
+                const auto serial = current->undoManager()->saveSerial();
+                if (!current->setClipGrouping(targets, grouped, err)) return {};
+                const auto &first = targets.first();
+                const int group = current->trackAt(first.audio, first.trackIndex)->clips()[first.clipIndex].linkGroup;
+                syncSelectionAfterEdit();
+                return {{"ok", true}, {"linkGroup", group},
+                        {"undoRecorded", current->undoManager()->saveSerial() > serial}};
+            })
+        }, schemaWithRequired(QJsonObject{
+            {"ok", QJsonObject{{"type", "boolean"}}},
+            {"linkGroup", QJsonObject{{"type", "integer"}}},
+            {"undoRecorded", QJsonObject{{"type", "boolean"}}}
+        }, {"ok", "linkGroup", "undoRecorded"})));
+    }
+
     QJsonObject exportVideoOutputSchema = outputSchemaOf(QJsonObject{
         {QStringLiteral("preset"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
         {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
