@@ -4002,6 +4002,47 @@ int runMcpSelftest()
                   QStringLiteral("alpha validation or queued settings mismatch"));
     }
 
+    // US-614 G175: validate nested arguments and capture the actual queued job.
+    {
+        const QJsonObject metadata{{"title", "題名"}, {"author", "作成者"},
+            {"copyright", "権利"}, {"comment", "コメント"}};
+        QJsonObject args{{"outputPath", exportRoot.filePath("metadata.mp4")}, {"metadata", metadata}};
+        const auto response = callProjectInfoTool(1750, QStringLiteral("export_video"), args);
+        const QString id = toolPayload(response).value("jobId").toString();
+        bool ok = exportRootReady && timelineReady && !id.isEmpty()
+            && !toolResult(response).value("isError").toBool(true);
+        for (const QJsonValue &invalid : {QJsonValue("invalid"), QJsonValue(QJsonObject{{"unknown", "x"}}),
+                QJsonValue(QJsonObject{{"title", 42}})}) {
+            args.insert("metadata", invalid);
+            ok &= toolResult(callProjectInfoTool(1751, QStringLiteral("export_video"), args))
+                .value("isError").toBool(false);
+        }
+        args.insert("metadata", metadata);
+        args.insert("unknownMetadata", "x");
+        ok &= toolResult(callProjectInfoTool(1752, QStringLiteral("export_video"), args))
+            .value("isError").toBool(false);
+        QHash<QString, QJsonObject> captured;
+        auto *queue = projectInfoWindow.findChild<RenderQueue*>();
+        if (queue) {
+            const auto connection = QObject::connect(queue, &RenderQueue::jobsChanged, queue, [&]() {
+                const auto jobs = queue->jobs();
+                if (jobs.isEmpty()) return;
+                for (const auto &job : jobs) captured.insert(job.uuid, job.exportConfig);
+                queue->clear();
+            });
+            auto *previousTools = projectInfoWindow.m_mcpTools;
+            projectInfoWindow.m_mcpTools = &projectInfoTools;
+            QCoreApplication::processEvents(QEventLoop::AllEvents);
+            projectInfoWindow.m_mcpTools = previousTools;
+            QObject::disconnect(connection);
+        }
+        ok &= captured.size() == 1 && captured.contains(id);
+        for (auto it = metadata.constBegin(); it != metadata.constEnd(); ++it)
+            ok &= captured.value(id).value(it.key()) == it.value();
+        ok ? pass("G175 export metadata")
+           : fail("G175 export metadata", QStringLiteral("metadata validation or queued settings mismatch"));
+    }
+
     QJsonObject knownStatusResponse;
     if (!exportJobId.isEmpty()) {
         knownStatusResponse = callProjectInfoTool(

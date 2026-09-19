@@ -37,6 +37,14 @@ int defaultCrfFor(const QString &codec)
 }
 }
 
+void ExportConfig::appendMetadataSettings(QJsonObject &json) const
+{
+    if (!title.isEmpty()) json.insert("title", title);
+    if (!author.isEmpty()) json.insert("author", author);
+    if (!copyright.isEmpty()) json.insert("copyright", copyright);
+    if (!comment.isEmpty()) json.insert("comment", comment);
+}
+
 void ExportConfig::appendSequenceSettings(QJsonObject &json) const
 {
     if (!imageSequence) return;
@@ -303,6 +311,22 @@ void ExportDialog::setupUI()
     codecForm->addRow("ハードウェアエンコード:", m_hwEncoderCombo);
 
     mainLayout->addWidget(codecGroup);
+
+    auto *metadataGroup = new QGroupBox(tr("メタデータ"), this);
+    auto *metadataForm = new QFormLayout(metadataGroup);
+    m_metadataTitle = new QLineEdit(metadataGroup);
+    m_metadataAuthor = new QLineEdit(metadataGroup);
+    m_metadataCopyright = new QLineEdit(metadataGroup);
+    m_metadataComment = new QLineEdit(metadataGroup);
+    m_metadataTitle->setObjectName("exportMetadataTitle");
+    m_metadataAuthor->setObjectName("exportMetadataAuthor");
+    m_metadataCopyright->setObjectName("exportMetadataCopyright");
+    m_metadataComment->setObjectName("exportMetadataComment");
+    metadataForm->addRow(tr("タイトル:"), m_metadataTitle);
+    metadataForm->addRow(tr("作成者:"), m_metadataAuthor);
+    metadataForm->addRow(tr("著作権:"), m_metadataCopyright);
+    metadataForm->addRow(tr("コメント:"), m_metadataComment);
+    mainLayout->addWidget(metadataGroup);
 
     // Output file
     auto *outputGroup = new QGroupBox("Output");
@@ -744,6 +768,11 @@ void ExportDialog::applyPreset(const ExportConfig &config, bool userPreset)
         combo->setCurrentIndex(index);
     };
     m_config = config;
+    m_metadataTitle->setText(config.title);
+    m_metadataAuthor->setText(config.author);
+    m_metadataCopyright->setText(config.copyright);
+    m_metadataComment->setText(config.comment);
+
     select(m_videoCodecCombo, config.videoCodec);
     select(m_audioCodecCombo, config.audioCodec);
     select(m_hwEncoderCombo, config.hwEncoder);
@@ -767,6 +796,11 @@ void ExportDialog::applyPreset(const ExportConfig &config, bool userPreset)
 ExportConfig ExportDialog::currentSettings() const
 {
     ExportConfig c = m_config;
+    c.title = m_metadataTitle->text();
+    c.author = m_metadataAuthor->text();
+    c.copyright = m_metadataCopyright->text();
+    c.comment = m_metadataComment->text();
+
     const bool user = !m_presetCombo->currentData().toString().isEmpty();
     c.outputPath = m_outputEdit->text();
     c.imageSequence = static_cast<ExportType>(m_exportTypeCombo->currentData().toInt()) == ExportType::ImageSequence;

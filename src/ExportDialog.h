@@ -44,6 +44,8 @@ struct ExportConfig {
     enum class RateControl { Bitrate, Crf };
     RateControl rateControl = RateControl::Bitrate;
     int crf = -1; // -1: codec default (23, or 30 for AV1)
+    QString title, author, copyright, comment; // Empty: omit container tags.
+    void appendMetadataSettings(QJsonObject &json) const;
     QString outputPath;
     QString videoCodec = "libx264";
     QString audioCodec = "aac";
@@ -136,6 +138,10 @@ private:
     QSpinBox *m_videoBitrateSpin;
     QSpinBox *m_audioBitrateSpin;
     QLineEdit *m_outputEdit;
+    QLineEdit *m_metadataTitle = nullptr;
+    QLineEdit *m_metadataAuthor = nullptr;
+    QLineEdit *m_metadataCopyright = nullptr;
+    QLineEdit *m_metadataComment = nullptr;
     QLabel *m_summaryLabel;
     QLabel *m_hdrWarningLabel = nullptr;
     QCheckBox *m_markedRangeCheckbox = nullptr;

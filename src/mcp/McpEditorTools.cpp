@@ -2407,6 +2407,16 @@ void McpEditorTools::registerWriteTools()
         QStringLiteral("export_video"),
         QStringLiteral("audioOnly=true は m4a / wav / mp3 の音声のみを同期で書き出し、ok と outputPath を返す (jobId なし)。映像設定は無視して warnings を返す。通常は現在のタイムラインを動画ファイルへ非同期で書き出す。tools/call はジョブ投入後すぐに jobId を返し、完了は get_export_status で確認する。width / height / fps の省略時は現在のプロジェクト設定を使い、videoBitrate / audioBitrate は kbps (既定 10000 / 192)、videoCodec / audioCodec は ffmpeg のエンコーダ名 (既定 libx264 / aac)。音声はトリム・分割・並べ替え・音量・ミュートを反映したタイムラインのミックスを ffmpeg で作ってから多重化する (ffmpeg が PATH に無いと単純な 1 クリップ構成以外は failed になる)。"),
         schemaWithRequired(QJsonObject{
+            {QStringLiteral("metadata"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("object")},
+                {QStringLiteral("additionalProperties"), false},
+                {QStringLiteral("properties"), QJsonObject{
+                    {QStringLiteral("title"), QJsonObject{{"type", "string"}}},
+                    {QStringLiteral("author"), QJsonObject{{"type", "string"}}},
+                    {QStringLiteral("copyright"), QJsonObject{{"type", "string"}}},
+                    {QStringLiteral("comment"), QJsonObject{{"type", "string"}}}
+                }}
+            }},
             {QStringLiteral("preset"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
             {QStringLiteral("outputPath"), QJsonObject{
                 {QStringLiteral("type"), QStringLiteral("string")}
@@ -2470,6 +2480,7 @@ void McpEditorTools::registerWriteTools()
                      [this](const QJsonObject& args, QString* err) -> QJsonObject {
             if (!rejectUnknownArguments(args,
                                         {QStringLiteral("outputPath"),
+                                         QStringLiteral("metadata"),
                                          QStringLiteral("preset"),
                                          QStringLiteral("keepAlpha"),
                                          QStringLiteral("proresProfile"),
@@ -2484,6 +2495,15 @@ void McpEditorTools::registerWriteTools()
                                          QStringLiteral("audioCodec"),
                                          QStringLiteral("audioBitrate")}, err))
                 return {};
+
+            if (args.contains("metadata") && !args.value("metadata").isObject())
+                return setError(err, QStringLiteral("metadata はオブジェクトで指定してください")), QJsonObject{};
+            const QJsonObject metadata = args.value("metadata").toObject();
+            if (!rejectUnknownArguments(metadata, {QStringLiteral("title"), QStringLiteral("author"),
+                    QStringLiteral("copyright"), QStringLiteral("comment")}, err)) return {};
+            for (auto it = metadata.constBegin(); it != metadata.constEnd(); ++it)
+                if (!it.value().isString())
+                    return setError(err, QStringLiteral("metadata の値は文字列で指定してください")), QJsonObject{};
 
             QString outputPath;
             if (!requiredString(args, QStringLiteral("outputPath"),
@@ -2685,6 +2705,10 @@ void McpEditorTools::registerWriteTools()
                 merged.insert(QStringLiteral("hdrMaxCll"), baseConfig.hdrSettings.maxCll);
                 merged.insert(QStringLiteral("hdrMaxFall"), baseConfig.hdrSettings.maxFall);
                 job.exportConfig = merged;
+            }
+            for (auto it = metadata.constBegin(); it != metadata.constEnd(); ++it) {
+                if (it.value().toString().isEmpty()) job.exportConfig.remove(it.key());
+                else job.exportConfig.insert(it.key(), it.value());
             }
             if (keepAlpha || args.contains(QStringLiteral("keepAlpha")))
                 job.exportConfig.insert(QStringLiteral("keepAlpha"), keepAlpha);

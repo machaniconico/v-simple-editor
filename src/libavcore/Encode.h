@@ -61,6 +61,7 @@ struct EncodeRequest {
     int fpsNum = 0;                     // Optional rational fps numerator.
     int fpsDen = 0;                     // Optional rational fps denominator.
     int64_t videoBitrateBits = 0;       // Video bitrate in bits per second (caller multiplies kbps×1000)
+    std::string title, author, copyright, comment; // UTF-8; empty tags are omitted.
     std::string outputPath;             // UTF-8
     std::string audioSourcePath;        // Optional UTF-8 source for stream-copy audio muxing
     int64_t audioStartUs = 0;            // Optional stream-copy audio trim start; 0 preserves legacy behavior
@@ -133,6 +134,10 @@ public:
     bool pushFrameRgb24(const uint8_t* src, int stride, int64_t pts);
     // Packed straight RGBA; valid only for an open keepAlpha session.
     bool pushFrameRgba32(const uchar* rgba, int stride, int64_t pts);
+    // Test seam for checking that default exports never enter metadata code.
+    static void setMetadataEnabledForTest(bool enabled);
+    static void resetMetadataWriteCountForTest();
+    static int metadataWriteCountForTest();
     // Test seam: disabling RGBA input must leave opaque exports unaffected.
     static void setAlphaInputEnabledForTest(bool enabled);
     static void resetAlphaFrameCountForTest();

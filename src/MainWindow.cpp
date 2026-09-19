@@ -10605,6 +10605,7 @@ void MainWindow::exportVideo()
         cfg["proresProfile"] = exportCfg.proresProfile;
     if (exportCfg.keepAlpha) cfg["keepAlpha"] = true;
     exportCfg.appendSequenceSettings(cfg);
+    exportCfg.appendMetadataSettings(cfg);
     job.exportConfig = cfg;
 
     if (isHdrExport && dvxml::enabledFromEnv()) {
@@ -16802,6 +16803,7 @@ void MainWindow::onMobileExport()
                     if (cfg.proresProfile >= 0)
                         jcfg["proresProfile"] = cfg.proresProfile;
                     cfg.appendSequenceSettings(jcfg);
+                    cfg.appendMetadataSettings(jcfg);
                     job.exportConfig = jcfg;
 
                     auto *progress = new QProgressDialog(

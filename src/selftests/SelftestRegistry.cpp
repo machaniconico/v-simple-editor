@@ -108,6 +108,7 @@ int runEffectTimingSelftest();
 int runExposureAidsSelftest();
 int runExportAlphaSelftest();
 int runExportAuditSelftest();
+int runExportMetaSelftest();
 int runExportPresetsSelftest();
 int runExportProSelftest();
 int runExportRangeSelftest();
@@ -534,6 +535,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "PNG/TIFF sequence export, alpha, configuration and cancellation (6 gates)" },
     { "export-alpha", "VEDITOR_EXPORT_ALPHA_SELFTEST", runExportAlphaSelftest, true,
       "ProRes alpha export and opaque default path (4 gates)" },
+    { "export-meta", "VEDITOR_EXPORT_META_SELFTEST", runExportMetaSelftest, true,
+      "Container metadata GUI wiring, encoding, defaults and presets (4 gates)" },
     { "export-presets", "VEDITOR_EXPORT_PRESETS_SELFTEST", runExportPresetsSelftest, true,
       "Export user preset persistence and name resolution (4 gates)" },
     { "export-pro",        "VEDITOR_EXPORT_PRO_SELFTEST",         runExportProSelftest,         false,

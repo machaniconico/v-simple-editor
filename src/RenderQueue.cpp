@@ -1363,6 +1363,11 @@ void RenderQueue::startRenderPipe(int jobIndex)
     request.isHlg = isHlg;
     request.proresProfile = proresProfile;
     request.keepAlpha = cfg.value("keepAlpha").toBool(false);
+    request.title = cfg.value("title").toString().toUtf8().toStdString();
+    request.author = cfg.value("author").toString().toUtf8().toStdString();
+    request.copyright = cfg.value("copyright").toString().toUtf8().toStdString();
+    request.comment = cfg.value("comment").toString().toUtf8().toStdString();
+
     request.hdrMasterMaxNits =
         cfg.value("hdrMasterMaxLum").toDouble(1000.0);
     request.hdrMasterMinNits =

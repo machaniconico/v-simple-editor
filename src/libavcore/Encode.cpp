@@ -27,6 +27,13 @@ extern "C" {
 }
 
 namespace libavcore {
+namespace {
+std::atomic<bool> s_metadataEnabled{true};
+std::atomic<int> s_metadataWriteCount{0};
+}
+void FrameEncoder::setMetadataEnabledForTest(bool enabled) { s_metadataEnabled.store(enabled); }
+void FrameEncoder::resetMetadataWriteCountForTest() { s_metadataWriteCount.store(0); }
+int FrameEncoder::metadataWriteCountForTest() { return s_metadataWriteCount.load(); }
 
 AVPixelFormat alphaExportPixelFormat(const std::string &codec, int proresProfile)
 {
@@ -1193,7 +1200,25 @@ std::optional<std::string> FrameEncoder::open(const EncodeRequest& req)
         }
     }
 
-    if (avformat_write_header(m_outFmt, nullptr) < 0) {
+    // Do not create even empty tags for legacy/default exports. Muxers that
+    // do not support a tag simply ignore it.
+    AVDictionary *headerOptions = nullptr;
+    if (s_metadataEnabled.load()
+        && (!req.title.empty() || !req.author.empty() || !req.copyright.empty() || !req.comment.empty())) {
+        ++s_metadataWriteCount;
+        if (!req.title.empty()) av_dict_set(&m_outFmt->metadata, "title", req.title.c_str(), 0);
+        if (!req.author.empty()) av_dict_set(&m_outFmt->metadata, "author", req.author.c_str(), 0);
+        if (!req.copyright.empty()) av_dict_set(&m_outFmt->metadata, "copyright", req.copyright.c_str(), 0);
+        if (!req.comment.empty()) av_dict_set(&m_outFmt->metadata, "comment", req.comment.c_str(), 0);
+        // MOV/MP4's legacy atom whitelist discards author. mdta preserves all
+        // four names verbatim and is enabled only for explicitly tagged exports.
+        if (std::string(m_outFmt->oformat->name) == "mp4"
+            || std::string(m_outFmt->oformat->name) == "mov")
+            av_dict_set(&headerOptions, "movflags", "use_metadata_tags", 0);
+    }
+    const int headerResult = avformat_write_header(m_outFmt, &headerOptions);
+    av_dict_free(&headerOptions);
+    if (headerResult < 0) {
         releaseAll();
         return std::string("Failed to write header");
     }
