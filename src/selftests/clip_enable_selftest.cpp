@@ -11,7 +11,6 @@
 #include <QColor>
 #include <QFile>
 #include <QImage>
-#include <QJsonDocument>
 #include <QTemporaryDir>
 #include <cmath>
 #include <cstdio>
@@ -130,8 +129,13 @@ int runClipEnableSelftest()
         && mix(QStringLiteral("disabled.wav"), silent)
         && peak(audible) > 0.1 && peak(silent) < 0.0001
         && timeline.undoManager()->saveSerial() == audioSerial + 1;
-    audioOk = audioOk && !ProjectFile::clipFromJson(ProjectFile::clipToJson(
-        timeline.audioTracks().first()->clips().first())).visible;
+    ProjectData audioProject;
+    audioProject.videoTracks = timeline.allVideoTracks();
+    audioProject.audioTracks = timeline.allAudioTracks();
+    ProjectData loadedAudio;
+    audioOk = audioOk && ProjectFile::fromJsonString(ProjectFile::toJsonString(audioProject), loadedAudio)
+        && !loadedAudio.audioTracks.isEmpty() && !loadedAudio.audioTracks.first().isEmpty()
+        && !loadedAudio.audioTracks.first().first().visible;
     timeline.undo();
     gate(3, audioOk && timeline.audioTracks().first()->clips().first().visible
         && !timeline.computeAudioPlaybackSequence().isEmpty());
@@ -145,12 +149,8 @@ int runClipEnableSelftest()
     timeline.videoTracks()[1]->setClips({nullClip});
     project.videoTracks = timeline.allVideoTracks();
     project.audioTracks = timeline.allAudioTracks();
-    bool noVisible = true;
-    for (const auto *track : timeline.videoTracks())
-        for (const auto &item : track->clips())
-            noVisible = noVisible && !QJsonDocument(ProjectFile::clipToJson(item)).toJson().contains("\"visible\"");
     const QString defaultPath = temporary.filePath(QStringLiteral("default.vedit"));
-    noVisible = ProjectFile::save(defaultPath, project) && noVisible;
+    bool noVisible = ProjectFile::save(defaultPath, project);
     QFile saved(defaultPath);
     noVisible = saved.open(QIODevice::ReadOnly) && noVisible;
     noVisible = noVisible && !saved.readAll().contains("\"visible\"");
