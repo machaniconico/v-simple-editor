@@ -2,6 +2,7 @@
 #include "Timeline.h"
 #include "VideoEffect.h"
 #include "EffectParamSchema.h"
+#include "TransformAnimator.h"
 #include "clipanim/ClipAnim.h"
 
 #include <QAbstractItemView>
@@ -28,6 +29,17 @@
 #include <cmath>
 #include <functional>
 #include <utility>
+
+QVector<GraphEditorCurveTrack> graphEditorEditableCurves(
+    const QVector<GraphEditorCurveTrack> &curves)
+{
+    QVector<GraphEditorCurveTrack> editable;
+    for (const auto &curve : curves) {
+        if (!curve.isPastePlaceholder)
+            editable.append(curve);
+    }
+    return editable;
+}
 
 namespace {
 
@@ -121,6 +133,12 @@ bool pasteTrackDefault(const ClipInfo &clip, const QString &property, double &va
                 : clip.colorCorrection.hueSatWarp.satScale[field.ring][field.hue];
             return true;
         }
+    }
+    const auto transformProperty = TransformAnimator::propertyFromName(property);
+    // propertyFromName falls back to PositionX for unknown names.
+    if (TransformAnimator::propertyName(transformProperty) == property) {
+        value = TransformAnimator::propertyDefaultValue(transformProperty);
+        return true;
     }
     int effectIndex = -1;
     QString param;
@@ -380,6 +398,7 @@ public:
     {
         return m_selectedCurveIndex >= 0
             && m_selectedCurveIndex < m_curves.size()
+            && !m_curves[m_selectedCurveIndex].isPastePlaceholder
             && m_selectedKeyframeIndex >= 0
             && m_selectedKeyframeIndex
                 < m_curves[m_selectedCurveIndex].track.keyframes().size();
@@ -977,6 +996,7 @@ private:
 
         constexpr double kHandleRadius = 8.0;
         if (m_selectedCurveIndex < 0 || m_selectedCurveIndex >= m_curves.size()
+            || m_curves[m_selectedCurveIndex].isPastePlaceholder
             || m_selectedKeyframeIndex < 0) {
             return {};
         }
@@ -1027,6 +1047,8 @@ private:
         }
 
         for (int curveIndex = 0; curveIndex < m_curves.size(); ++curveIndex) {
+            if (m_curves[curveIndex].isPastePlaceholder)
+                continue;
             const LaneMetrics metrics = laneMetricsForCurve(curveIndex);
             const auto &keyframes = m_curves[curveIndex].track.keyframes();
             for (int keyframeIndex = 0; keyframeIndex < keyframes.size(); ++keyframeIndex) {
@@ -1040,6 +1062,8 @@ private:
             return {};
 
         for (int curveIndex = 0; curveIndex < m_curves.size(); ++curveIndex) {
+            if (m_curves[curveIndex].isPastePlaceholder)
+                continue;
             const LaneMetrics metrics = laneMetricsForCurve(curveIndex);
             const auto &keyframes = m_curves[curveIndex].track.keyframes();
             for (int keyframeIndex = 0; keyframeIndex + 1 < keyframes.size(); ++keyframeIndex) {
@@ -1067,6 +1091,7 @@ private:
             return;
 
         if (m_dragCurveIndex < 0 || m_dragCurveIndex >= m_curves.size()
+            || m_curves[m_dragCurveIndex].isPastePlaceholder
             || !m_dragMetrics.valid) {
             return;
         }
@@ -1263,7 +1288,7 @@ GraphEditorPanel::GraphEditorPanel(QWidget *parent)
             return;
 
         KeyframeManager keyframes = clips[m_clipIdx].keyframes;
-        for (const auto &curve : curves) {
+        for (const auto &curve : graphEditorEditableCurves(curves)) {
             KeyframeTrack editedTrack = curve.track;
             editedTrack.setPropertyName(curve.propertyName);
             keyframes.addTrack(editedTrack);
@@ -1314,6 +1339,8 @@ GraphEditorPanel::GraphEditorPanel(QWidget *parent)
 
                 const int row = m_trackList->currentRow();
                 if (row < 0 || row >= m_tracks.size())
+                    return;
+                if (m_tracks[row].isPastePlaceholder)
                     return;
                 if (m_trackIdx < 0 || m_trackIdx >= m_timeline->videoTracks().size())
                     return;
@@ -1477,6 +1504,7 @@ void GraphEditorPanel::rebuildForSelection()
         curve.propertyName = s_clipboardSourceProperty;
         curve.track = KeyframeTrack(curve.propertyName, pasteDefault);
         curve.displayName = QStringLiteral("貼り付け先: %1").arg(curve.propertyName);
+        curve.isPastePlaceholder = true;
         curve.color = curveColorForTrack(curve.propertyName, colorIndex++);
         m_tracks.append(curve);
     }

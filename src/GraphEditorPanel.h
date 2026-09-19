@@ -18,7 +18,12 @@ struct GraphEditorCurveTrack {
     QString displayName;
     KeyframeTrack track;
     QColor color;
+    // View-only, read-only destination; only explicit paste creates its track.
+    bool isPastePlaceholder = false;
 };
+
+QVector<GraphEditorCurveTrack> graphEditorEditableCurves(
+    const QVector<GraphEditorCurveTrack> &curves);
 
 class GraphEditorPanel : public QDockWidget
 {

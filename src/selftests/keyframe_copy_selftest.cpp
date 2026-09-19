@@ -2,6 +2,7 @@
 #include "../Timeline.h"
 #include "../UndoManager.h"
 #include "../EffectParamSchema.h"
+#include "../TransformAnimator.h"
 #include "../clipanim/ClipAnim.h"
 
 #include <QApplication>
@@ -210,6 +211,121 @@ int runKeyframeCopySelftest()
     g5 = g5 && emptyTimeline.undoManager()->currentIndex() == emptyBefore
         && sameManager(emptyModel(), unanimated.keyframes);
     gate(5, g5);
+
+    // G6: Dynamic Zoom's unprefixed properties, plus every other transform
+    // property, must create a destination on a completely unanimated clip.
+    bool g6 = true;
+    const QVector<TransformProperty> transformProperties = {
+        TransformProperty::PositionX, TransformProperty::PositionY,
+        TransformProperty::ScaleX, TransformProperty::ScaleY,
+        TransformProperty::Rotation, TransformProperty::Opacity,
+        TransformProperty::AnchorX, TransformProperty::AnchorY,
+        TransformProperty::SkewX, TransformProperty::SkewY
+    };
+    for (const auto property : transformProperties) {
+        const QString name = TransformAnimator::propertyName(property);
+        KeyframeTrack transformSource(name, TransformAnimator::propertyDefaultValue(property));
+        for (const auto &point : source.keyframes()) {
+            transformSource.addKeyframe(point.time, point.value, point.interpolation,
+                point.bezX1, point.bezY1, point.bezX2, point.bezY2,
+                point.hasSpatialTangent, point.spatialOutX, point.spatialOutY,
+                point.spatialInX, point.spatialInY);
+        }
+        ClipInfo transformClip = unanimated;
+        transformClip.keyframes.addTrack(transformSource);
+        Timeline transformTimeline;
+        transformTimeline.videoTracks()[0]->addClip(transformClip);
+        transformTimeline.videoTracks()[0]->addClip(unanimated);
+        transformTimeline.videoTracks()[0]->setSelectedClip(0);
+        transformTimeline.undoManager()->saveState(transformTimeline.currentState(),
+                                                  QStringLiteral("変形貼り付け前"));
+        GraphEditorPanel transformPanel;
+        transformPanel.setTimeline(&transformTimeline);
+        transformPanel.setSelectedClip(0, 0);
+        const bool didCopy = transformPanel.selectKeyframes(name, indices)
+            && transformPanel.copySelectedKeyframes();
+        transformPanel.setSelectedClip(0, 1);
+        transformPanel.setPlayheadSeconds(15.5); // second clip local time 3.5
+        const int undoBefore = transformTimeline.undoManager()->currentIndex();
+        g6 = g6 && transformTimeline.videoTracks()[0]->clips()[1].keyframes.tracks().isEmpty();
+        const bool didPaste = transformPanel.pasteKeyframes();
+        const auto result = transformTimeline.videoTracks()[0]->clips()[1].keyframes;
+        const auto *created = result.track(name);
+        g6 = g6 && didCopy && didPaste && result.tracks().size() == 1 && created
+            && created->defaultValue() == TransformAnimator::propertyDefaultValue(property)
+            && created->count() == 9
+            && transformTimeline.undoManager()->currentIndex() == undoBefore + 1;
+        if (created && created->count() == 9) {
+            for (int i = 0; i < 9; ++i) {
+                g6 = g6 && std::abs(created->keyframes()[i].time - (3.5 + i * 0.25)) < 1e-9
+                    && samePayload(created->keyframes()[i], source.keyframes()[i]);
+            }
+        }
+        transformTimeline.undo();
+        QApplication::processEvents();
+        g6 = g6 && transformTimeline.undoManager()->currentIndex() == undoBefore
+            && sameManager(transformTimeline.videoTracks()[0]->clips()[1].keyframes,
+                           unanimated.keyframes)
+            && sameManager(transformTimeline.videoTracks()[0]->clips()[0].keyframes,
+                           transformClip.keyframes);
+    }
+    // Unknown names must not inherit propertyFromName's PositionX fallback.
+    ClipInfo unknownClip = unanimated;
+    KeyframeTrack unknownSource = source;
+    unknownSource.setPropertyName(QStringLiteral("unknown.transform.property"));
+    unknownClip.keyframes.addTrack(unknownSource);
+    Timeline unknownTimeline;
+    unknownTimeline.videoTracks()[0]->addClip(unknownClip);
+    unknownTimeline.videoTracks()[0]->addClip(unanimated);
+    GraphEditorPanel unknownPanel;
+    unknownPanel.setTimeline(&unknownTimeline);
+    unknownPanel.setSelectedClip(0, 0);
+    const bool unknownCopied = unknownPanel.selectKeyframes(unknownSource.propertyName(), indices)
+        && unknownPanel.copySelectedKeyframes();
+    unknownPanel.setSelectedClip(0, 1);
+    const int unknownBefore = unknownTimeline.undoManager()->currentIndex();
+    const bool unknownPasted = unknownPanel.pasteKeyframes();
+    g6 = g6 && unknownCopied && !unknownPasted
+        && unknownTimeline.videoTracks()[0]->clips()[1].keyframes.tracks().isEmpty()
+        && unknownTimeline.undoManager()->currentIndex() == unknownBefore;
+    gate(6, g6);
+
+    // G7: exercise the production edit-callback filter. Real empty tracks
+    // remain editable; placeholders never enter the addTrack loop, even if
+    // a future view accidentally supplies keys for a placeholder.
+    GraphEditorCurveTrack realCurve;
+    realCurve.propertyName = sourceProperty;
+    realCurve.track = source;
+    KeyframePoint editedPoint = realCurve.track.keyframes().first();
+    editedPoint.value = 42.0;
+    realCurve.track.setKeyframePoint(0, editedPoint);
+    GraphEditorCurveTrack placeholder;
+    placeholder.propertyName = QStringLiteral("motion.opacity");
+    placeholder.track = KeyframeTrack(placeholder.propertyName, 1.0);
+    placeholder.isPastePlaceholder = true;
+    GraphEditorCurveTrack realEmpty;
+    realEmpty.propertyName = QStringLiteral("motion.rotation");
+    realEmpty.track = KeyframeTrack(realEmpty.propertyName, 0.0);
+    bool g7 = true;
+    for (bool populated : {false, true}) {
+        if (populated)
+            placeholder.track.addKeyframe(1.0, 0.5);
+        const auto editable = graphEditorEditableCurves({realCurve, placeholder, realEmpty});
+        KeyframeManager editedManager;
+        editedManager.addTrack(source);
+        editedManager.addTrack(realEmpty.track);
+        for (const auto &curve : editable) {
+            KeyframeTrack editedTrack = curve.track;
+            editedTrack.setPropertyName(curve.propertyName);
+            editedManager.addTrack(editedTrack);
+        }
+        const auto *edited = editedManager.track(sourceProperty);
+        g7 = g7 && editable.size() == 2 && editedManager.tracks().size() == 2
+            && !editedManager.hasTrack(placeholder.propertyName)
+            && editedManager.hasTrack(realEmpty.propertyName)
+            && edited && samePayload(edited->keyframes().first(), editedPoint);
+    }
+    gate(7, g7);
     std::fprintf(stderr, "[keyframe-copy] summary: %d PASS, %d FAIL\n", passed, failed);
     return failed;
 }
