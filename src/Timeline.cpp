@@ -2305,7 +2305,8 @@ void TimelineTrack::paintFilmstrip(QPainter &painter, int clipIndex, const QRect
     auto *cache = m_timeline->filmstripCache();
     if (!cache) return;
     // Same key, count and size as MediaPoolDock; pending/cached requests coalesce.
-    cache->request(clip.filePath, clip.filePath, clip.duration, 8);
+    // Probe the full source duration: a clip may end before the source does.
+    cache->request(clip.filePath, clip.filePath, 0.0, 8);
     const auto frames = cache->frames(clip.filePath);
     if (frames.isEmpty()) return;
     const QRect body = clipRect.adjusted(0, 4, 0, -4);
