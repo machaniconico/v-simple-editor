@@ -21,12 +21,14 @@ public:
     explicit ImportHubDialog(QWidget* parent = nullptr);
 
 signals:
+    void edlImportRequested(const QString& filePath);
     void timelineImportRequested(const QList<obs::layout::TimelineClipPlacement>& placements);
     void imageImportRequested(const QImage& image, const QString& name);
     void meshImportRequested(const blender::mesh::MeshData& meshData);
     void exrSequenceImportRequested(const QString& folderPath, const QString& pattern);
 
 private slots:
+    void onEdlBrowseClicked();
     // OBS tab
     void onObsBrowseFolderClicked();
     void onObsScanClicked();

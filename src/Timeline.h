@@ -871,6 +871,8 @@ public:
     bool renameSequence(const QString &id, const QString &name);
     bool createSequence(const QString &name);
     // Atomically create, populate and activate a sequence (one undo entry).
+    // Generic interchange import entry: accepts offline ClipInfo paths without probing.
+    // Undo restores the previously active sequence and the entire sequence store.
     bool createSequence(const QString &name, const QVector<QVector<ClipInfo>> &videoTracks,
                         const QVector<QVector<ClipInfo>> &audioTracks);
     bool createSequenceFromClip(const ClipInfo &clip);

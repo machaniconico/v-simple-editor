@@ -1195,7 +1195,7 @@ int runMcpSelftest()
             rpcRequest(73, QStringLiteral("tools/list")))))
         .value(QStringLiteral("result")).toObject()
         .value(QStringLiteral("tools")).toArray();
-    constexpr int kExpectedProjectInfoToolCount = 36 + 1 + 2 + 2 + 1 + 2 + 3 + 1 + 2; // US-308: compare_project; US-312: render/decompose; US-400: color/LUT; US-406: track properties; US-509: sequences; US-511: track operations; US-605: group/ungroup
+    constexpr int kExpectedProjectInfoToolCount = 36 + 1 + 2 + 2 + 1 + 2 + 3 + 1 + 2 + 1; // US-308: compare_project; US-312: render/decompose; US-400: color/LUT; US-406: track properties; US-509: sequences; US-511: track operations; US-605: group/ungroup
     bool outputSchemasDeclared = projectInfoToolDescriptors.size()
         == kExpectedProjectInfoToolCount;
     for (const QJsonValue& value : projectInfoToolDescriptors) {
@@ -4041,6 +4041,35 @@ int runMcpSelftest()
             ok &= captured.value(id).value(it.key()) == it.value();
         ok ? pass("G175 export metadata")
            : fail("G175 export metadata", QStringLiteral("metadata validation or queued settings mismatch"));
+    }
+
+    // US-616 G176: exercise the registered import tool and restore the fixture.
+    {
+        QTemporaryDir edlDir;
+        const QString path = edlDir.filePath(QStringLiteral("import.edl"));
+        QFile file(path);
+        const QByteArray contents("TITLE: MCP EDL\nFCM: NON-DROP FRAME\n"
+            "001 MISSING V C 00:00:00:00 00:00:01:00 00:00:00:00 00:00:01:00\n");
+        bool ok = edlDir.isValid() && file.open(QIODevice::WriteOnly);
+        if (ok) ok = file.write(contents) == contents.size();
+        file.close();
+        const QString beforeId = projectTimeline ? projectTimeline->activeSequenceId() : QString();
+        const int beforeCount = projectTimeline ? projectTimeline->sequenceList().size() : 0;
+        const auto response = callProjectInfoTool(1760, QStringLiteral("import_edl"), {{"filePath", path}});
+        const bool created = !toolResult(response).value("isError").toBool(true);
+        ok &= created && projectTimeline && projectTimeline->sequenceList().size() == beforeCount + 1
+            && projectTimeline->activeSequenceId() != beforeId
+            && toolPayload(response).value("unresolvedFiles").toInt() == 1;
+        const QString afterId = projectTimeline ? projectTimeline->activeSequenceId() : QString();
+        const auto rejected = callProjectInfoTool(1761, QStringLiteral("import_edl"),
+            {{"filePath", edlDir.filePath(QStringLiteral("absent.edl"))}});
+        ok &= toolResult(rejected).value("isError").toBool(false)
+            && projectTimeline && projectTimeline->activeSequenceId() == afterId;
+        if (created && projectTimeline) projectTimeline->undo();
+        ok &= projectTimeline && projectTimeline->activeSequenceId() == beforeId
+            && projectTimeline->sequenceList().size() == beforeCount;
+        ok ? pass("G176 import_edl creates a sequence and rejects missing paths")
+           : fail("G176 import_edl creates a sequence and rejects missing paths", QStringLiteral("import or undo mismatch"));
     }
 
     QJsonObject knownStatusResponse;

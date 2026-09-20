@@ -170,6 +170,7 @@ double exporter_loudnessGainDb();
 // ED-3: EdlExport は ED-1 で追加された純粋エンジン (QApplication 不要) なので
 // 常時ビルドに含まれる。HAVE_* ガードは不要で直接 include する。
 #include "EdlExport.h"
+#include "EdlImport.h"
 #if __has_include("SmartEditDialog.h")
   #include "SmartEditDialog.h"
   #define HAVE_SMARTEDIT 1
@@ -383,6 +384,27 @@ void setMasterEqBypassForTest(bool bypass)
 }
 quint64 masterEqPassesForTest() { return masterEqPasses; }
 } // namespace audiofxexport
+
+// Shared by the file menu and import hub; no persistent widget state needed.
+static void importEdlIntoTimeline(QWidget *parent, Timeline *timeline, const QString &path)
+{
+    if (!timeline || path.isEmpty()) return;
+    const auto result = edl::readEdl(path, timeline->projectFrameRate());
+    if (!result.error.isEmpty()) {
+        QMessageBox::warning(parent, QStringLiteral("EDL 読み込み"), result.error);
+        return;
+    }
+    if (!timeline->createSequence(result.document.title, result.videoTracks, result.audioTracks)) {
+        QMessageBox::warning(parent, QStringLiteral("EDL 読み込み"), QStringLiteral("シーケンスを作成できません。"));
+        return;
+    }
+    QMessageBox report(QMessageBox::Information, QStringLiteral("EDL 読み込み"),
+        QStringLiteral("新規シーケンスに読み込みました。\n解決済み: %1 ファイル\nオフライン: %2 ファイル\n警告: %3 件\nフレームレート: %4 fps（プロジェクト設定）")
+            .arg(result.resolvedFiles).arg(result.unresolvedFiles).arg(result.warnings.size())
+            .arg(timeline->projectFrameRate()), QMessageBox::Ok, parent);
+    if (!result.warnings.isEmpty()) report.setDetailedText(result.warnings.join(QLatin1Char('\n')));
+    report.exec();
+}
 
 namespace {
 // US-601: AudioMixer has no public amount getter. Keep its project value
@@ -4238,6 +4260,15 @@ void MainWindow::setupMenuBar()
 {
     // ファイル メニュー
     auto *fileMenu = menuBar()->addMenu("ファイル(&F)");
+
+    auto *edlImportAction = fileMenu->addAction(QStringLiteral("EDL を読み込み…"));
+    edlImportAction->setObjectName(QStringLiteral("action_edl_import"));
+    edlImportAction->setStatusTip(QStringLiteral("CMX3600 の V / A、カット / ディゾルブをプロジェクトの FPS で新規シーケンスに読み込みます。"));
+    connect(edlImportAction, &QAction::triggered, this, [this] {
+        const QString path = QFileDialog::getOpenFileName(this, QStringLiteral("EDL を読み込み…"),
+            QString(), QStringLiteral("EDL ファイル (*.edl);;すべてのファイル (*)"));
+        importEdlIntoTimeline(this, m_timeline, path);
+    });
 
     auto *newAction = fileMenu->addAction("新規プロジェクト(&N)...");
     newAction->setShortcut(QKeySequence::New);
@@ -16871,6 +16902,9 @@ void MainWindow::onImportHub()
     if (!m_importHubDialog) {
         m_importHubDialog = new ImportHubDialog(this);
         m_importHubDialog->setObjectName(QStringLiteral("importHubDialog"));
+
+        connect(m_importHubDialog, &ImportHubDialog::edlImportRequested,
+                this, [this](const QString &path) { importEdlIntoTimeline(this, m_timeline, path); });
 
         connect(m_importHubDialog, &ImportHubDialog::timelineImportRequested,
                 this, [this](const QList<obs::layout::TimelineClipPlacement> &placements) {

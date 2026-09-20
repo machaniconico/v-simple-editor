@@ -96,6 +96,7 @@ int runDolbyVisionSelftest();
 int runDvTimelineSelftest();
 int runDynzoomSelftest();
 int runEdlExportSelftest();
+int runEdlImportSelftest();
 int runE2eSelftest();
 int runEasingSelftest();
 int runEasingPresetsSelftest();
@@ -684,6 +685,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Project camera: opt-in projection, view/roll, JSON, overlap and animated export parity (G1-G9)" },
     { "light3d",            "VEDITOR_LIGHT3D_SELFTEST",            runLight3DSelftest,            true,
       "3D lights: compositor/export parity, keyframe edits, dialog guards, JSON, determinism (16 gates)" },
+    { "edl-import", "VEDITOR_EDL_IMPORT_SELFTEST", runEdlImportSelftest, true,
+      "CMX3600 import, dissolve, offline media and sequence undo" },
     { "edl-export",        "VEDITOR_EDL_EXPORT_SELFTEST",         runEdlExportSelftest,          false,
       "EdlExport: CMX3600 timecode + event lines + drop-frame" },
     { "tcburn",            "VEDITOR_TCBURN_SELFTEST",             runTcburnSelftest,             true,
