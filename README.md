@@ -22,6 +22,15 @@ A professional video editing application built from scratch with C++17, Qt6, and
 - Sequence list dock (switch / create / rename, MCP `get_sequences` / `set_active_sequence`)
 - Clip filmstrip thumbnails on the timeline (off by default) and media-pool thumbnails with hover skimming
 - Media pool ratings (favorite / rejected / 1-5 stars), filters (all / favorites / exclude rejected / unused), rename, show in Explorer
+- Keyword collections (auto-generated virtual bins from clip tags, media-pool asset context menu "Edit Keywords…") and SmartBin creation/editing with name/tag/name-query/type conditions (media-pool bin-tree context menu "Create Smart Bin…")
+- Clip enable/disable toggle (excludes a clip from preview and export, MCP `set_clip_enabled`)
+- Clip grouping across tracks (linked select / move / trim / delete, MCP `group_clips` / `ungroup_clips`)
+- Align (6 directions) and distribute (horizontal / vertical) selected clips (Composition menu)
+- Keyframe copy & paste across parameters and clips (Graph Editor, playhead-relative shift)
+- Timeline hover skimming (off by default)
+- New sequence from a selected clip (media-pool asset context menu "New Sequence from This Clip"; video (+audio) clips are placed at V1 (+A1) head, audio-only clips at A1 head)
+- Unused-media removal (media-pool bin-tree context menu "Remove Unused Media…") now also checks LUT / image-overlay / particle-config references, not only the existing provider list; the existing "Unused" filter shares the same check (defect fix: previously narrower)
+- CMX3600 EDL / FCPXML import into a new sequence (MCP `import_edl` / `import_fcpxml`)
 - Undo / redo (unlimited history)
 - Snap to grid & playhead
 - Timeline zoom
@@ -50,6 +59,8 @@ A professional video editing application built from scratch with C++17, Qt6, and
 - Camera Log → Rec.709 (S-Log3 / LogC3 / V-Log / Cineon, exposure offset, gamma 2.4 / linear / Rec.709 OETF output)
 - Luma key / color key (CPU-only, alpha survives through export; place last in the stack)
 - Broadcast safe (Rec.709 legal / full-range limiter) and Leave Color (keep one hue, desaturate the rest), both CPU-only so preview matches export
+- Offset color wheel (printer-light style, CPU/GPU parity, MCP `set_color_correction` `offsetR`/`offsetG`/`offsetB`)
+- Per-effect mask (Bezier path with 3+ points and feather; brush strokes are not supported and are discarded)
 - Flip / Flop, solid color layer insertion, and 5 parametric warps (wave / ripple / spherize / fisheye / pinch)
 - Effect stacking with keyframe animation (5 interpolation modes)
 - Plugin system (5 built-in: Glow, Emboss, Posterize, Edge Detect, Color Shift)
@@ -71,6 +82,10 @@ A professional video editing application built from scratch with C++17, Qt6, and
 - Per-track 4-band EQ / compressor / reverb / noise reduction as a shared DSP module, applied to export as well as playback (defect fix: projects using track FX now export the processed sound)
 - Master bus EQ (post-mix, off by default) and correct panel-to-engine track mapping (defect fix: A1's FX used to land on another track)
 - Track FX and master EQ are saved in the project and cleared when switching projects (defect fix: settings used to leak between projects)
+- De-esser (dynamic sibilance suppression) added to the track FX chain, off by default
+- Channel-strip audio mixer dock (faders + meters, hidden by default; defect fix: fader/normalize track gain now reaches export even without track FX)
+- Manual loudness-normalization gain and normalizer amount are now saved in the project (defect fix: previously reset on reopen)
+- Automatic loudness normalization on export (off by default; -14 LUFS streaming / -23 LUFS broadcast presets or custom target; not available in the batch export queue). The saved manual gain above is now actually applied at export time (defect fix: a Windows file-handle issue in the post-process step used to prevent the replacement from taking effect)
 
 ### AI & Automation
 - Silence detection
@@ -88,9 +103,10 @@ A professional video editing application built from scratch with C++17, Qt6, and
 - Particle system (7 presets)
 - 3D camera (dolly, pan, orbit, zoom) with optional true perspective projection (look-at, roll, layer rotation)
 - 3D camera solve from planar tracks (homography decomposition, no external solver)
-- Two-view relative pose (normalized 8-point + RANSAC + essential decomposition) and linear triangulation (numeric core, no UI yet)
-- Multi-frame feature tracking, two-view pose chaining and small-scale bundle adjustment (Levenberg-Marquardt, dense solver, up to 30 frames x 150 points; numeric core, no UI yet)
+- Two-view relative pose (normalized 8-point + RANSAC + essential decomposition) and linear triangulation (numeric core)
+- Multi-frame feature tracking (Planar Tracker dialog's "Feature Tracking (3D)" section): KLT tracking → two-view pose chaining → bundle adjustment solves camera position/look-at keyframes directly from the UI (Levenberg-Marquardt, Schur-complement solver by default, up to 60 frames x 800 points). Frame range is specified in 0-based source frames, and the default start/end auto-fill from the clip's trimmed in/out (clamped to the 60-frame window); applied keyframes correctly convert to timeline time honoring the clip's trim/speed/reverse; not applicable to speed-ramped or time-remapped clips
 - Mesh warp per clip with on-preview grid handles (Composition menu, off by default, CPU path so preview matches export)
+- Puppet pin: interactive mesh deformation via draggable pins on the preview (Composition menu, off by default, CPU path so preview matches export)
 - Expression engine (wiggle, noise, ease, `audioLevel()` from linked audio)
 - Convert audio to keyframes (RMS envelope → opacity / scale / rotation / position)
 - Shape layers (8 primitives) as timeline clips, with Repeater / Trim Paths modifiers
@@ -112,7 +128,10 @@ A professional video editing application built from scratch with C++17, Qt6, and
 - Rate control: bitrate or CRF quality mode (H.264 / H.265 / VP9 0..51, AV1 0..63 with software AV1 fallback)
 - Audio-only export (m4a / wav / mp3, PCM intermediate mix)
 - User export presets (save / delete current settings, resolved by name from MCP `export_video`)
-- Alpha export on ProRes 4444 / 4444 XQ (`keepAlpha`, off by default; transparent areas stay transparent in the MOV)
+- Alpha export on ProRes 4444 / 4444 XQ or VP9 (yuva420p) (`keepAlpha`, off by default; transparent areas stay transparent in the output)
+- Image-sequence export (PNG / TIFF, GUI export dialog only)
+- Export metadata embedding (title / author / copyright / comment, MCP `export_video` `metadata`)
+- Subtitle export mode: none / burn-in / mov_text embedded stream / both (MP4 / MOV only, GUI export dialog only)
 - Screen recorder (cross-platform)
 - Speed ramp (variable speed with easing)
 - Timeline markers & YouTube chapter export
@@ -244,10 +263,15 @@ MCP の変更系ツールは確認ダイアログを出さず、原則として�
 | `add_track` | `kind`（`video` / `audio`）のトラックを末尾に追加する | あり（1 回） |
 | `remove_track` | `kind` / `trackIndex`（0 始まり）のトラックを削除する。載っているクリップも消え、トラックマット / 親子付け / 調整レイヤー / ミキサー / バス送りの参照も付け替わる。最後の 1 本とロック中は拒否 | あり（1 回で本数も中身も復元） |
 | `move_track` | `kind` / `trackIndex` のトラックを `newTrackIndex` へ移動する。範囲外はエラー | あり（1 回） |
+| `set_clip_enabled` | 映像・音声クリップの有効状態を `enabled` で切り替える。Null Object は対象外 | あり |
+| `group_clips` | 別々のトラックのクリップをグループ化する。`clips`（`{kind, trackIndex, clipIndex}` の配列、2 件以上）を指定する。応答は `{ok, linkGroup, undoRecorded}` | あり |
+| `ungroup_clips` | 指定クリップのグループを解除する。`clips`（配列、1 件以上） | あり |
+| `import_edl` | `filePath` の CMX3600 EDL をプロジェクトの FPS で新規シーケンスへ読み込む。未解決素材はオフラインになる。応答は `{ok, activeId, resolvedFiles, unresolvedFiles, warnings}` | あり（1 回） |
+| `import_fcpxml` | `filePath` の FCPXML の spine 直下 asset-clip を最大 2 トラック（lane）までの新規シーケンスへ読み込む。未解決素材はオフラインになる。応答は `{ok, activeId, resolvedFiles, unresolvedFiles, warnings}` | あり（1 回） |
 
-`export_video` には書き出しプリセット名を渡す `preset`（組み込み → ユーザープリセットの順に解決。他の引数を併記するとそちらが優先）と、ProRes 4444 / 4444 XQ でアルファを保持する `keepAlpha` / `proresProfile` があります（`keepAlpha` は `videoCodec` が `prores` かつ `proresProfile` が 4 または 5 のときだけ受理）。
+`export_video` には書き出しプリセット名を渡す `preset`（組み込み → ユーザープリセットの順に解決。他の引数を併記するとそちらが優先）と、ProRes 4444 / 4444 XQ または VP9（yuva420p）でアルファを保持する `keepAlpha` / `proresProfile` があります（`keepAlpha` は `videoCodec` が `prores` かつ `proresProfile` が 4 または 5、または `videoCodec` が VP9 系のときだけ受理）。`metadata`（`title` / `author` / `copyright` / `comment` の各文字列、いずれも省略可）を指定すると、非空の項目だけが書き出しファイルへメタデータとして埋め込まれます。連番静止画書き出し・字幕の mov_text 埋め込み・自動ラウドネス正規化は書き出しダイアログのみの機能で、`export_video` の引数には含まれません。
 
-MCP サーバの自己テストは `--selftest=mcp` または `VEDITOR_MCP_SELFTEST=1` で実行できます（実装: `src/selftests/mcp_selftest.cpp`、ゲート G1..G170。ツール数は 47）。
+MCP サーバの自己テストは `--selftest=mcp` または `VEDITOR_MCP_SELFTEST=1` で実行できます（実装: `src/selftests/mcp_selftest.cpp`、ゲート G1..G177。ツール数は 52）。
 
 ---
 
@@ -578,6 +602,7 @@ v-simple-editor/
 - [x] Selftest argv-switch SSOT: `kArgvSelftests[]` 182-entry table in `src/selftests/SelftestRegistry.cpp`, `--selftest=<name>` + `VEDITOR_*_SELFTEST` + `--selftest={list,help,all}` + unknown-name guard
 - [x] CI workflow draft (`.github/workflows/selftest.yml`, `workflow_dispatch` only)
 - [x] Wave 6 (17 stories): menu LUT export fix, marquee / zoom / timecode jump, clip-edge & label selection, track FX mapping fix + master EQ, track FX persistence fix, export user presets, ProRes 4444 alpha export, media-pool thumbnails, clip filmstrip, sequence dock, broadcast safe / leave color, mesh warp, track remove / reorder, bundle adjustment
+- [x] Wave 7 (24 stories, US-600..623): clip enable/disable, loudness-gain project persistence, keyword bins, sequence-from-clip, unused-media removal scope extension, clip grouping, align/distribute, keyframe copy/paste, timeline hover skim, per-effect mask, offset wheel, puppet pin, VP9 alpha export, image-sequence export, export metadata, mov_text subtitle embedding, EDL/FCPXML import, de-esser, audio mixer dock (track-gain export fix), automatic loudness normalization on export, multi-frame camera tracking with keyframe application, bundle adjustment Schur-complement solver
 - [ ] CI green run + auto trigger on push / PR
 - [x] `src/main.cpp` split refactor (selftest functions → `src/selftests/`, dispatcher → SelftestRegistry module)
 - [ ] CRLF → LF wholesale normalization (per repo-root `.gitattributes`)
