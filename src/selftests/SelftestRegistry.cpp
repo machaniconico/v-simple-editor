@@ -113,6 +113,7 @@ int runExportMetaSelftest();
 int runExportPresetsSelftest();
 int runExportProSelftest();
 int runExportRangeSelftest();
+int runFcpxmlImportSelftest();
 int runFlipSolidSelftest();
 int runFrameClipboardSelftest();
 int runFrameExportSelftest();
@@ -940,6 +941,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Frame.io collaboration smoke (asset upload + review-link stub)" },
     { "davinci",           "VEDITOR_DAVINCI_SELFTEST",            runDavinciSelftest,            true,
       "DaVinci Resolve XML round-trip I/O smoke (timeline + grade export)" },
+    { "fcpxml-import", "VEDITOR_FCPXML_IMPORT_SELFTEST", runFcpxmlImportSelftest, true,
+      "FCPXML roundtrip, rational times, two lanes, warnings and sequence undo (G1-G5)" },
     { "fcpxml",            "VEDITOR_FCPXML_SELFTEST",             runFcpxmlSelftest,             true,
       "FCPXML import/export round-trip smoke (Final Cut Pro X interchange)" },
     { "smartedit",         "VEDITOR_SMARTEDIT_SELFTEST",          runSmartEditSelftest,          true,

@@ -1,5 +1,6 @@
 #include "McpEditorTools.h"
 #include "../EdlImport.h"
+#include "../FcpxmlImport.h"
 #include "../ExportUserPresets.h"
 
 #include "McpToolRegistry.h"
@@ -1947,6 +1948,32 @@ void McpEditorTools::registerWriteTools()
                 const auto result = edl::readEdl(path, current->projectFrameRate());
                 if (!result.error.isEmpty()) return setError(err, result.error), QJsonObject{};
                 if (!current->createSequence(result.document.title, result.videoTracks, result.audioTracks))
+                    return setError(err, QStringLiteral("シーケンスを作成できません")), QJsonObject{};
+                return {{"ok", true}, {"activeId", current->activeSequenceId()},
+                    {"resolvedFiles", result.resolvedFiles}, {"unresolvedFiles", result.unresolvedFiles},
+                    {"warnings", QJsonArray::fromStringList(result.warnings)}};
+            })
+    }, outputSchemaOf(QJsonObject{{"ok", QJsonObject{{"type", "boolean"}}},
+        {"activeId", QJsonObject{{"type", "string"}}},
+        {"resolvedFiles", QJsonObject{{"type", "integer"}}},
+        {"unresolvedFiles", QJsonObject{{"type", "integer"}}},
+        {"warnings", QJsonObject{{"type", "array"}, {"items", QJsonObject{{"type", "string"}}}}}},
+        {"ok", "activeId", "resolvedFiles", "unresolvedFiles", "warnings"})));
+
+    m_registry->registerTool(withOutputSchema({
+        QStringLiteral("import_fcpxml"),
+        QStringLiteral("FCPXML の素材クリップを最大 2 トラックの新規シーケンスへ読み込む。未解決素材はオフライン。取り消しは1回。"),
+        schemaWithRequired(QJsonObject{{"filePath", QJsonObject{{"type", "string"}}}}, {"filePath"}),
+        guardedWrite(QStringLiteral("import_fcpxml"),
+            [this](const QJsonObject &args, QString *err) -> QJsonObject {
+                if (!rejectUnknownArguments(args, {QStringLiteral("filePath")}, err)) return {};
+                QString path;
+                if (!requiredString(args, QStringLiteral("filePath"), &path, err)) return {};
+                auto *current = timeline();
+                if (!current) return setError(err, QStringLiteral("エディターを利用できません")), QJsonObject{};
+                const auto result = fcpx::xml::readFcpxml(path);
+                if (!result.error.isEmpty()) return setError(err, result.error), QJsonObject{};
+                if (!current->createSequence(result.title, result.videoTracks, result.audioTracks))
                     return setError(err, QStringLiteral("シーケンスを作成できません")), QJsonObject{};
                 return {{"ok", true}, {"activeId", current->activeSequenceId()},
                     {"resolvedFiles", result.resolvedFiles}, {"unresolvedFiles", result.unresolvedFiles},

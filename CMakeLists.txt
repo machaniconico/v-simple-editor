@@ -404,6 +404,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/EdlExport.cpp
     src/EdlImport.h
     src/EdlImport.cpp
+    src/FcpxmlImport.h
+    src/FcpxmlImport.cpp
     src/selftests/export_pro_selftest.cpp
     src/selftests/img_sequence_selftest.cpp
     src/selftests/export_alpha_selftest.cpp
@@ -412,6 +414,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/export_presets_selftest.cpp
     src/selftests/edl_export_selftest.cpp
     src/selftests/edl_import_selftest.cpp
+    src/selftests/fcpxml_import_selftest.cpp
     # WS (ワークスペース): 名前付きドックレイアウトの純粋モデル (Premiere/Resolve 相当)。
     src/WorkspaceManager.h
     src/WorkspaceManager.cpp

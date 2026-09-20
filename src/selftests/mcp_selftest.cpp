@@ -1195,7 +1195,7 @@ int runMcpSelftest()
             rpcRequest(73, QStringLiteral("tools/list")))))
         .value(QStringLiteral("result")).toObject()
         .value(QStringLiteral("tools")).toArray();
-    constexpr int kExpectedProjectInfoToolCount = 36 + 1 + 2 + 2 + 1 + 2 + 3 + 1 + 2 + 1; // US-308: compare_project; US-312: render/decompose; US-400: color/LUT; US-406: track properties; US-509: sequences; US-511: track operations; US-605: group/ungroup
+    constexpr int kExpectedProjectInfoToolCount = 36 + 1 + 2 + 2 + 1 + 2 + 3 + 1 + 2 + 1 + 1; // US-308: compare_project; US-312: render/decompose; US-400: color/LUT; US-406: track properties; US-509: sequences; US-511: track operations; US-605: group/ungroup
     bool outputSchemasDeclared = projectInfoToolDescriptors.size()
         == kExpectedProjectInfoToolCount;
     for (const QJsonValue& value : projectInfoToolDescriptors) {
@@ -4070,6 +4070,42 @@ int runMcpSelftest()
             && projectTimeline->sequenceList().size() == beforeCount;
         ok ? pass("G176 import_edl creates a sequence and rejects missing paths")
            : fail("G176 import_edl creates a sequence and rejects missing paths", QStringLiteral("import or undo mismatch"));
+    }
+
+    // US-617 G177: exercise the registered import tool and restore the fixture.
+    {
+        QTemporaryDir fcpxmlDir;
+        const QString path = fcpxmlDir.filePath(QStringLiteral("import.fcpxml"));
+        QFile file(path);
+        const QByteArray contents("<fcpxml><resources><asset id=\"a\" src=\"missing.mov\"/></resources>"
+            "<project name=\"MCP FCPXML\"><sequence><spine><asset-clip ref=\"a\" duration=\"1s\"/>"
+            "</spine></sequence></project></fcpxml>");
+        bool ok = fcpxmlDir.isValid() && file.open(QIODevice::WriteOnly);
+        if (ok) ok = file.write(contents) == contents.size();
+        file.close();
+        const QString beforeId = projectTimeline ? projectTimeline->activeSequenceId() : QString();
+        const int beforeCount = projectTimeline ? projectTimeline->sequenceList().size() : 0;
+        const auto response = callProjectInfoTool(1770, QStringLiteral("import_fcpxml"), {{"filePath", path}});
+        const bool created = !toolResult(response).value("isError").toBool(true);
+        ok &= created && projectTimeline && projectTimeline->sequenceList().size() == beforeCount + 1
+            && projectTimeline->activeSequenceId() != beforeId
+            && toolPayload(response).value("unresolvedFiles").toInt() == 1;
+        const QString afterId = projectTimeline ? projectTimeline->activeSequenceId() : QString();
+        QFile invalid(fcpxmlDir.filePath(QStringLiteral("invalid.fcpxml")));
+        ok &= invalid.open(QIODevice::WriteOnly);
+        ok &= invalid.write("<fcpxml><project>") == 17;
+        invalid.close();
+        const auto serial = projectTimeline ? projectTimeline->undoManager()->saveSerial() : 0;
+        const auto rejected = callProjectInfoTool(1771, QStringLiteral("import_fcpxml"),
+            {{"filePath", invalid.fileName()}});
+        ok &= toolResult(rejected).value("isError").toBool(false)
+            && projectTimeline && projectTimeline->activeSequenceId() == afterId
+            && projectTimeline->undoManager()->saveSerial() == serial;
+        if (created && projectTimeline) projectTimeline->undo();
+        ok &= projectTimeline && projectTimeline->activeSequenceId() == beforeId
+            && projectTimeline->sequenceList().size() == beforeCount;
+        ok ? pass("G177 import_fcpxml creates a sequence and rejects malformed XML")
+           : fail("G177 import_fcpxml creates a sequence and rejects malformed XML", QStringLiteral("import or undo mismatch"));
     }
 
     QJsonObject knownStatusResponse;

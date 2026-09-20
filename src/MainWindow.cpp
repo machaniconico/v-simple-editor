@@ -171,6 +171,7 @@ double exporter_loudnessGainDb();
 // 常時ビルドに含まれる。HAVE_* ガードは不要で直接 include する。
 #include "EdlExport.h"
 #include "EdlImport.h"
+#include "FcpxmlImport.h"
 #if __has_include("SmartEditDialog.h")
   #include "SmartEditDialog.h"
   #define HAVE_SMARTEDIT 1
@@ -399,6 +400,26 @@ static void importEdlIntoTimeline(QWidget *parent, Timeline *timeline, const QSt
         return;
     }
     QMessageBox report(QMessageBox::Information, QStringLiteral("EDL 読み込み"),
+        QStringLiteral("新規シーケンスに読み込みました。\n解決済み: %1 ファイル\nオフライン: %2 ファイル\n警告: %3 件\nフレームレート: %4 fps（プロジェクト設定）")
+            .arg(result.resolvedFiles).arg(result.unresolvedFiles).arg(result.warnings.size())
+            .arg(timeline->projectFrameRate()), QMessageBox::Ok, parent);
+    if (!result.warnings.isEmpty()) report.setDetailedText(result.warnings.join(QLatin1Char('\n')));
+    report.exec();
+}
+
+static void importFcpxmlIntoTimeline(QWidget *parent, Timeline *timeline, const QString &path)
+{
+    if (!timeline || path.isEmpty()) return;
+    const auto result = fcpx::xml::readFcpxml(path);
+    if (!result.error.isEmpty()) {
+        QMessageBox::warning(parent, QStringLiteral("FCPXML 読み込み"), result.error);
+        return;
+    }
+    if (!timeline->createSequence(result.title, result.videoTracks, result.audioTracks)) {
+        QMessageBox::warning(parent, QStringLiteral("FCPXML 読み込み"), QStringLiteral("シーケンスを作成できません。"));
+        return;
+    }
+    QMessageBox report(QMessageBox::Information, QStringLiteral("FCPXML 読み込み"),
         QStringLiteral("新規シーケンスに読み込みました。\n解決済み: %1 ファイル\nオフライン: %2 ファイル\n警告: %3 件\nフレームレート: %4 fps（プロジェクト設定）")
             .arg(result.resolvedFiles).arg(result.unresolvedFiles).arg(result.warnings.size())
             .arg(timeline->projectFrameRate()), QMessageBox::Ok, parent);
@@ -16902,6 +16923,9 @@ void MainWindow::onImportHub()
     if (!m_importHubDialog) {
         m_importHubDialog = new ImportHubDialog(this);
         m_importHubDialog->setObjectName(QStringLiteral("importHubDialog"));
+
+        connect(m_importHubDialog, &ImportHubDialog::fcpxmlImportRequested,
+                this, [this](const QString &path) { importFcpxmlIntoTimeline(this, m_timeline, path); });
 
         connect(m_importHubDialog, &ImportHubDialog::edlImportRequested,
                 this, [this](const QString &path) { importEdlIntoTimeline(this, m_timeline, path); });

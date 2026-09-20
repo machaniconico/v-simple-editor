@@ -21,6 +21,7 @@ public:
     explicit ImportHubDialog(QWidget* parent = nullptr);
 
 signals:
+    void fcpxmlImportRequested(const QString& filePath);
     void edlImportRequested(const QString& filePath);
     void timelineImportRequested(const QList<obs::layout::TimelineClipPlacement>& placements);
     void imageImportRequested(const QImage& image, const QString& name);
@@ -28,6 +29,7 @@ signals:
     void exrSequenceImportRequested(const QString& folderPath, const QString& pattern);
 
 private slots:
+    void onFcpxmlBrowseClicked();
     void onEdlBrowseClicked();
     // OBS tab
     void onObsBrowseFolderClicked();
