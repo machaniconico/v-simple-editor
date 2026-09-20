@@ -67,7 +67,8 @@ ImportResult parseEdl(const QString &text, double frameRate)
         if (line.startsWith(QStringLiteral("* FROM CLIP NAME:")) && commentEvent >= 0) {
             result.document.events[commentEvent].clipName = line.mid(17).trimmed(); continue;
         }
-        commentEvent = -1;
+        // Unsupported lines (including M2 and other comments) do not detach
+        // FROM CLIP NAME from the last accepted event.
         const auto fields = line.split(QRegularExpression(QStringLiteral("\\s+")), Qt::SkipEmptyParts);
         bool numberOk = false;
         EdlEvent event;
@@ -143,9 +144,17 @@ void resolveClips(ImportResult &result, const QString &directory)
         clip.outPoint = clip.duration = event.srcOutFrames / fps;
         clip.speed = double(event.srcOutFrames - event.srcInFrames) / double(event.recOutFrames - event.recInFrames);
         clip.leadInSec = qMax(0.0, start - end);
-        if (event.transition == QLatin1Char('D')) {
+        if (event.transition == QLatin1Char('D') && !track.isEmpty()
+            && qAbs(start - end) < 1e-8) {
             clip.leadIn.type = TransitionType::CrossDissolve;
             clip.leadIn.duration = qMin(event.transitionFrames / fps, (event.recOutFrames - event.recInFrames) / fps);
+            clip.leadIn.alignment = TransitionAlignment::Start;
+            auto &outgoing = track.last();
+            outgoing.trailOut = clip.leadIn;
+            // CMX dissolves start at the incoming record IN. Preserve the cut
+            // (outPoint), but reserve source handles for the outgoing overlap.
+            outgoing.duration = qMax(outgoing.duration,
+                outgoing.outPoint + clip.leadIn.duration * outgoing.speed);
         }
         track.append(clip);
         end = event.recOutFrames / fps;

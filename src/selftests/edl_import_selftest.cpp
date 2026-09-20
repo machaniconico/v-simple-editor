@@ -58,7 +58,20 @@ int runEdlImportSelftest()
         "003 SOUND A C 00:00:00:00 00:00:03:00 00:00:00:00 00:00:03:00\n");
     auto transitions = edl::parseEdl(dissolve, 24.0);
     edl::resolveClips(transitions, dir.path());
+    Timeline dissolveTimeline;
+    const bool dissolveCreated = dissolveTimeline.createSequence(transitions.document.title,
+        transitions.videoTracks, transitions.audioTracks);
+    const auto overlaps = dissolveTimeline.videoOverlapIntervals();
+    const bool composed = dissolveCreated && !overlaps.isEmpty() && overlaps[0].size() == 2
+        && overlaps[0][0].trailOutType == TransitionType::CrossDissolve
+        && overlaps[0][1].leadInType == TransitionType::CrossDissolve
+        && overlaps[0][0].trailOutDuration > 0.0 && overlaps[0][1].leadInDuration > 0.0
+        && std::abs(overlaps[0][0].timelineEnd - 1.5) < 1e-8
+        && std::abs(overlaps[0][1].timelineStart - 1.0) < 1e-8;
     gate(2, transitions.error.isEmpty() && transitions.videoTracks[0].size() == 2
+        && composed && transitions.videoTracks[0][0].outPoint == 1.0
+        && transitions.videoTracks[0][0].duration == 1.5
+        && transitions.videoTracks[0][0].trailOut.alignment == TransitionAlignment::Start
         && transitions.videoTracks[0][1].leadIn.type == TransitionType::CrossDissolve
         && transitions.videoTracks[0][1].leadIn.duration == 0.5
         && transitions.videoTracks[0][1].inPoint == 2.0
@@ -69,7 +82,9 @@ int runEdlImportSelftest()
     // Use a real video fixture for resolution and the production relink API.
     const QString mediaPath = dir.filePath(QStringLiteral("found.mp4"));
     const bool fixture = QFile::copy(QDir::current().absoluteFilePath(QStringLiteral("test_assets/e2e_clip.mp4")), mediaPath);
-    auto found = edl::parseEdl(QStringLiteral("001 FOUND V C 00:00:00:00 00:00:01:00 00:00:00:00 00:00:01:00\n"
+    auto found = edl::parseEdl(QStringLiteral("001 LONGSCEN V C 00:00:00:00 00:00:01:00 00:00:00:00 00:00:01:00\n"
+        "M2 LONGSCEN 048.0 00:00:00:00\n"
+        "* UNSUPPORTED COMMENT\n"
         "* FROM CLIP NAME: found.mp4\n"), 24.0);
     edl::resolveClips(found, dir.path());
     Timeline relink;
@@ -78,7 +93,9 @@ int runEdlImportSelftest()
     repaired = repaired && relink.currentState().videoTracks[0][0].filePath == mediaPath;
     qint64 ignored = 0;
     gate(3, repaired && found.resolvedFiles == 1 && found.unresolvedFiles == 0
-        && found.warnings.isEmpty() && missing.error.isEmpty() && missing.unresolvedFiles == 1 && missing.resolvedFiles == 0
+        && found.error.isEmpty() && found.warnings.size() == 2
+        && found.videoTracks[0].size() == 1 && found.videoTracks[0][0].filePath == mediaPath
+        && missing.error.isEmpty() && missing.unresolvedFiles == 1 && missing.resolvedFiles == 0
         && missing.warnings.size() == 2 && missing.videoTracks[0].size() == 1
         && !QFileInfo::exists(missing.videoTracks[0][0].filePath)
         && QFileInfo(missing.videoTracks[0][0].filePath).fileName() == QStringLiteral("UNKNOWN")
