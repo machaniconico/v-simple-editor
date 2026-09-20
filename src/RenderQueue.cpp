@@ -1,5 +1,9 @@
 #include "RenderQueue.h"
 #include "SequenceExport.h"
+#include "SubtitleIO.h"
+#include <algorithm>
+#include <memory>
+#include <QTemporaryDir>
 #include <atomic>
 #include "TimelineFrameRenderer.h"
 #include "ProjectFile.h"
@@ -44,6 +48,80 @@
 #include <limits>
 #include <optional>
 #include <string>
+
+void RenderQueue::appendSubtitleTrack(QJsonObject &config,
+    const QVector<SubtitleSegment> &segments, const SubtitleStyle &style,
+    const QObject *rendererOwner)
+{
+    SubtitleTrackRenderer track;
+    track.setSegments(segments);
+    track.setStyle(style);
+    if (!segments.isEmpty()) config["subtitleTrack"] = track.toJson();
+    // Preserve the existing installation condition: renderSubtitleTrack()
+    // creates these renderers and installs the latest one in Exporter.
+    if (rendererOwner) {
+        const auto installed = rendererOwner->findChildren<SubtitleTrackRenderer *>(
+            QString(), Qt::FindDirectChildrenOnly);
+        if (!installed.isEmpty()) {
+            config["subtitleBurnInTrack"] = installed.last()->toJson();
+            config["subtitleTrack"] = installed.last()->toJson();
+        }
+    }
+}
+
+std::vector<libavcore::SubtitleCue> RenderQueue::subtitleCues(
+    const QJsonObject &config, qint64 startUs, qint64 durationUs)
+{
+    const auto mode = static_cast<subtitle::ExportMode>(config.value("subtitleMode").toInt(1));
+    if (!subtitle::embeds(mode) || durationUs <= 0) return {};
+    SubtitleTrackRenderer track;
+    track.fromJson(config.value("subtitleTrack").toObject());
+    std::vector<libavcore::SubtitleCue> clips;
+    std::vector<int64_t> boundaries;
+    for (const auto &segment : track.segments()) {
+        if (!std::isfinite(segment.startTime) || !std::isfinite(segment.endTime)
+            || segment.startTime < 0 || segment.endTime > 1e9 || segment.text.isEmpty()) continue;
+        const int64_t begin = std::max<int64_t>(0, std::llround(segment.startTime * 1e6) - startUs);
+        const int64_t end = std::min<int64_t>(durationUs, std::llround(segment.endTime * 1e6) - startUs);
+        if (end <= begin) continue;
+        clips.push_back({begin, end, segment.text.toUtf8().toStdString()});
+        boundaries.push_back(begin);
+        boundaries.push_back(end);
+    }
+    // tx3g has one active sample per track. Split overlaps and join their
+    // text so simultaneous captions remain visible without invalid DTS.
+    std::sort(boundaries.begin(), boundaries.end());
+    boundaries.erase(std::unique(boundaries.begin(), boundaries.end()), boundaries.end());
+    std::vector<libavcore::SubtitleCue> result;
+    for (size_t i = 1; i < boundaries.size(); ++i) {
+        std::string text;
+        for (const auto &clip : clips) {
+            if (clip.startUs <= boundaries[i-1] && clip.endUs >= boundaries[i]) {
+                if (!text.empty()) text += '\n';
+                text += clip.text;
+            }
+        }
+        if (text.empty()) continue;
+        if (!result.empty() && result.back().endUs == boundaries[i-1] && result.back().text == text)
+            result.back().endUs = boundaries[i];
+        else result.push_back({boundaries[i-1], boundaries[i], text});
+    }
+    return result;
+}
+
+void RenderQueue::paintSubtitles(QImage &frame, const QJsonObject &config, qint64 timeUs)
+{
+    const auto mode = static_cast<subtitle::ExportMode>(config.value("subtitleMode").toInt(1));
+    if (!subtitle::burns(mode)) return;
+    QJsonObject data = config.value("subtitleBurnInTrack").toObject();
+    if (data.isEmpty() && mode == subtitle::ExportMode::Both)
+        data = config.value("subtitleTrack").toObject();
+    if (data.isEmpty()) return;
+    SubtitleTrackRenderer renderer;
+    renderer.fromJson(data);
+    QPainter painter(&frame);
+    renderer.paintOnto(painter, QRectF(frame.rect()), timeUs / 1e6);
+}
 
 // Shared by the render paths and the export-meta selftest.
 namespace renderqueue_metadata {
@@ -241,6 +319,7 @@ bool runLoudnessAudioPostprocess(const QString &ffmpegBin,
                                  double gainDb,
                                  const QString &audioCodec,
                                  int audioBitrateKbps,
+                                 bool copySubtitles,
                                  QString *error)
 {
     const QStringList filterArgs =
@@ -273,6 +352,9 @@ bool runLoudnessAudioPostprocess(const QString &ffmpegBin,
          << QStringLiteral("-c:a") << codec
          << QStringLiteral("-b:a")
          << QStringLiteral("%1k").arg(audioBitrateKbps);
+    if (copySubtitles)
+        args << QStringLiteral("-map") << QStringLiteral("0:s?")
+             << QStringLiteral("-c:s") << QStringLiteral("copy");
     args << filterArgs;
     args << tempPath;
 
@@ -1082,10 +1164,47 @@ void RenderQueue::startSequenceExport(int jobIndex)
 
 void RenderQueue::startRenderPipe(int jobIndex)
 {
+    auto &subtitleJob = m_jobs[jobIndex];
+    const auto subtitleMode = static_cast<subtitle::ExportMode>(subtitleJob.exportConfig.value("subtitleMode").toInt(1));
+    if (subtitle::embeds(subtitleMode)
+        && (!subtitle::supportsMovText(QFileInfo(subtitleJob.outputPath).suffix())
+            || subtitleJob.exportConfig.value("imageSequence").toBool(false))) {
+        QMetaObject::invokeMethod(this, [this]() {
+            finishCurrentJob(false, QStringLiteral("mov_text 字幕は MP4 / MOV 動画のみ対応しています"));
+        }, Qt::QueuedConnection);
+        return;
+    }
+
     if (m_jobs[jobIndex].exportConfig.value("imageSequence").toBool()
         && sequenceexport::enabledForTest()) {
         startSequenceExport(jobIndex);
         return;
+    }
+    if (subtitle::embeds(subtitleMode)
+        && !subtitleJob.exportConfig.contains("subtitleTrack")
+        && isProjectFilePath(subtitleJob.projectFilePath)) {
+        ProjectData data;
+        if (ProjectFile::load(subtitleJob.projectFilePath, data)) {
+            QVector<SubtitleSegment> segments;
+            for (const auto &entry : data.subtitleSegments) {
+                SubtitleSegment segment;
+                segment.startTime = entry.start;
+                segment.endTime = entry.end;
+                segment.text = entry.text;
+                segments.append(segment);
+            }
+            SubtitleStyle style;
+            if (!data.subtitleStyle.isEmpty()) {
+                style.font.setFamily(data.subtitleStyle.value("fontName").toString());
+                style.font.setPointSize(data.subtitleStyle.value("fontSize").toInt(28));
+                style.font.setBold(data.subtitleStyle.value("fontBold").toBool(true));
+                style.color = QColor(data.subtitleStyle.value("color").toString("#ffffffff"));
+                style.outlineColor = QColor(data.subtitleStyle.value("outlineColor").toString("#ff000000"));
+                style.outlineWidth = data.subtitleStyle.value("outlineWidth").toDouble(2.0);
+                style.verticalPos = data.subtitleStyle.value("verticalPos").toDouble(0.85);
+            }
+            appendSubtitleTrack(subtitleJob.exportConfig, segments, style, nullptr);
+        }
     }
     const RenderJob jobCopy = m_jobs[jobIndex];
     const QString alphaError = alphaExportError(jobCopy.exportConfig);
@@ -1230,6 +1349,7 @@ void RenderQueue::startRenderPipe(int jobIndex)
     }
 
     libavcore::EncodeRequest request;
+    request.subtitles = subtitleCues(cfg, startUsec, static_cast<qint64>(totalFrames * usecPerFrame));
     request.width = outW;
     request.height = outH;
     const FpsRational fpsRational = deriveFpsRational(fps);
@@ -1307,6 +1427,9 @@ void RenderQueue::startRenderPipe(int jobIndex)
         && !timecodeRenderer.has_value()
         && !blockSmartRenderForSequences
         && !hasExportMetadata
+        && request.subtitles.empty()
+        && !cfg.contains("subtitleBurnInTrack")
+        && cfg.value("subtitleMode").toInt(1) != 3
         && !blockSmartRenderForLighting) {
         if (m_cancelRequested) {
             delete owned;
@@ -1485,6 +1608,8 @@ void RenderQueue::startRenderPipe(int jobIndex)
                 if (applyAces)
                     frame = aces::applyPipelineToImage(frame, acesPipe);
 
+                paintSubtitles(frame, jobCopy.exportConfig, usec);
+
                 if (!request.keepAlpha) {
                 ++s_blackCompositeCount;
                 // A video file is OPAQUE — it has no alpha channel. The SSOT
@@ -1575,6 +1700,7 @@ void RenderQueue::startRenderPipe(int jobIndex)
                         loudnessGainDb,
                         loudnessAudioCodec,
                         loudnessAudioBitrateKbps,
+                        !request.subtitles.empty(),
                         &loudnessError)) {
                     failMsg = loudnessError;
                     encodeOk = false;
@@ -1803,9 +1929,33 @@ void RenderQueue::startRenderPipeSubprocess(int jobIndex)
         args << QStringLiteral("-i") << audioInputPath;
     }
 
+    std::shared_ptr<QTemporaryDir> subtitleTemp;
+    const auto cues = subtitleCues(cfg, startUsec, static_cast<qint64>(totalFrames * usecPerFrame));
+    if (!cues.empty()) {
+        subtitleTemp = std::make_shared<QTemporaryDir>();
+        QList<caption::Clip> captions;
+        for (const auto &cue : cues) {
+            caption::Clip clip;
+            clip.startMs = cue.startUs / 1000;
+            clip.endMs = cue.endUs / 1000;
+            clip.text = QString::fromUtf8(cue.text.data(), static_cast<qsizetype>(cue.text.size()));
+            captions.append(clip);
+        }
+        const QString path = subtitleTemp->filePath("captions.srt");
+        if (!subtitleTemp->isValid() || !subtitle::exportSrt(path, captions)) {
+            delete owned;
+            QMetaObject::invokeMethod(this, [this]() {
+                finishCurrentJob(false, QStringLiteral("字幕の一時ファイルを作成できません"));
+            }, Qt::QueuedConnection);
+            return;
+        }
+        args << "-i" << path;
+    }
     args << QStringLiteral("-map") << QStringLiteral("0:v:0");
     if (haveAudio)
         args << QStringLiteral("-map") << QStringLiteral("1:a?");
+    if (subtitleTemp)
+        args << "-map" << (haveAudio ? "2:s:0" : "1:s:0") << "-c:s" << "mov_text";
 
     // Video codec + rate control.
     args << QStringLiteral("-c:v") << videoCodec;
@@ -1894,7 +2044,7 @@ void RenderQueue::startRenderPipeSubprocess(int jobIndex)
 
     m_renderThread = QThread::create(
         [this, jobCopy, tl, owned, ffmpegBin, args, outW, outH,
-         totalFrames, startUsec, usecPerFrame, timecodeRenderer, fps]() {
+         totalFrames, startUsec, usecPerFrame, timecodeRenderer, fps, subtitleTemp]() {
         QString failMsg;
         const bool ok = [&]() -> bool {
             QProcess *proc = new QProcess();
@@ -1953,6 +2103,7 @@ void RenderQueue::startRenderPipeSubprocess(int jobIndex)
                 // A video file is OPAQUE — flatten the (possibly partially
                 // transparent) SSOT composite onto opaque black and feed
                 // rgb24, identical to the in-process branch.
+                paintSubtitles(frame, jobCopy.exportConfig, usec);
                 QImage rgb(outW, outH, QImage::Format_RGB888);
                 rgb.fill(Qt::black);
                 {

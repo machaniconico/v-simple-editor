@@ -1,5 +1,6 @@
 #include "Encode.h"
 #include <atomic>
+#include <algorithm>
 
 #include "color/SwsColorParams.h"
 #include "playback/swsmatrix_flag.h"
@@ -31,6 +32,12 @@ namespace {
 std::atomic<bool> s_metadataEnabled{true};
 std::atomic<int> s_metadataWriteCount{0};
 }
+static std::atomic<bool> s_subtitleMuxEnabled{true};
+static std::atomic<int> s_subtitleStreamCount{0};
+void FrameEncoder::setSubtitleMuxEnabledForTest(bool enabled) { s_subtitleMuxEnabled.store(enabled); }
+void FrameEncoder::resetSubtitleStreamCountForTest() { s_subtitleStreamCount.store(0); }
+int FrameEncoder::subtitleStreamCountForTest() { return s_subtitleStreamCount.load(); }
+
 void FrameEncoder::setMetadataEnabledForTest(bool enabled) { s_metadataEnabled.store(enabled); }
 void FrameEncoder::resetMetadataWriteCountForTest() { s_metadataWriteCount.store(0); }
 int FrameEncoder::metadataWriteCountForTest() { return s_metadataWriteCount.load(); }
@@ -413,6 +420,8 @@ void FrameEncoder::releaseAll()
         avformat_free_context(m_outFmt);
         m_outFmt = nullptr;
     }
+    m_subtitleStream = nullptr;
+    m_subtitles.clear();
     m_outStream = nullptr;
     m_audioInStream = nullptr;
     m_audioOutStream = nullptr;
@@ -712,6 +721,67 @@ bool FrameEncoder::openEncoderWithFallback(const EncodeRequest& req)
     }
 
     return false;
+}
+
+// ISO/IEC 14496-17 tx3g sample description (plain UTF-8, white Serif).
+// Each sample is a big-endian uint16 byte count followed by the text.
+bool FrameEncoder::configureSubtitles(const EncodeRequest &req)
+{
+    if (req.subtitles.empty()) return true;
+    const std::string container = m_outFmt->oformat->name;
+    if (container != "mp4" && container != "mov") return false;
+    m_subtitles = req.subtitles;
+    std::stable_sort(m_subtitles.begin(), m_subtitles.end(),
+        [](const SubtitleCue &a, const SubtitleCue &b) { return a.startUs < b.startUs; });
+    int64_t previousEnd = 0;
+    for (const auto &cue : m_subtitles) {
+        if (cue.startUs < previousEnd || cue.endUs <= cue.startUs
+            || cue.text.empty() || cue.text.size() > 65535) return false;
+        previousEnd = cue.endUs;
+    }
+    m_subtitleStream = avformat_new_stream(m_outFmt, nullptr);
+    if (!m_subtitleStream) return false;
+    ++s_subtitleStreamCount;
+    m_subtitleStream->time_base = AVRational{1, 1000000};
+    auto *par = m_subtitleStream->codecpar;
+    par->codec_type = AVMEDIA_TYPE_SUBTITLE;
+    par->codec_id = AV_CODEC_ID_MOV_TEXT;
+    static const uint8_t description[] = {
+        0,0,0,0, 1,255, 0,0,0,0, // display flags, justification, background
+        0,0,0,0,0,0,0,0,          // text box
+        0,0,0,0, 0,1, 0,18, 255,255,255,255, // default style
+        0,0,0,18, 'f','t','a','b', 0,1, 0,1, 5,'S','e','r','i','f'
+    };
+    par->extradata = static_cast<uint8_t *>(av_mallocz(sizeof(description) + AV_INPUT_BUFFER_PADDING_SIZE));
+    if (!par->extradata) return false;
+    std::memcpy(par->extradata, description, sizeof(description));
+    par->extradata_size = static_cast<int>(sizeof(description));
+    return true;
+}
+
+bool FrameEncoder::muxSubtitles()
+{
+    if (!m_subtitleStream) return true;
+    AVPacket *packet = av_packet_alloc();
+    if (!packet) return false;
+    bool ok = true;
+    for (const auto &cue : m_subtitles) {
+        const int size = static_cast<int>(cue.text.size());
+        if (av_new_packet(packet, size + 2) < 0) { ok = false; break; }
+        packet->data[0] = static_cast<uint8_t>(size >> 8);
+        packet->data[1] = static_cast<uint8_t>(size & 255);
+        std::memcpy(packet->data + 2, cue.text.data(), size);
+        packet->pts = packet->dts = cue.startUs;
+        packet->duration = cue.endUs - cue.startUs;
+        packet->flags = AV_PKT_FLAG_KEY;
+        packet->stream_index = m_subtitleStream->index;
+        av_packet_rescale_ts(packet, AVRational{1, 1000000}, m_subtitleStream->time_base);
+        if (av_interleaved_write_frame(m_outFmt, packet) < 0) ok = false;
+        av_packet_unref(packet);
+        if (!ok) break;
+    }
+    av_packet_free(&packet);
+    return ok;
 }
 
 bool FrameEncoder::configureAudioPassthrough(const std::string& audioSourcePath)
@@ -1193,6 +1263,11 @@ std::optional<std::string> FrameEncoder::open(const EncodeRequest& req)
         configureAudioPassthrough(req.audioSourcePath);
     }
 
+    if (s_subtitleMuxEnabled.load() && !req.subtitles.empty() && !configureSubtitles(req)) {
+        releaseAll();
+        return std::string("mov_text 字幕のコンテナ・時刻・テキストが無効です");
+    }
+
     if (!(m_outFmt->oformat->flags & AVFMT_NOFILE)) {
         if (avio_open(&m_outFmt->pb, req.outputPath.c_str(), AVIO_FLAG_WRITE) < 0) {
             releaseAll();
@@ -1223,6 +1298,10 @@ std::optional<std::string> FrameEncoder::open(const EncodeRequest& req)
         return std::string("Failed to write header");
     }
 
+    if (!muxSubtitles()) {
+        releaseAll();
+        return std::string("mov_text 字幕の書き込みに失敗しました");
+    }
     m_opened = true;
     return std::nullopt;
 }

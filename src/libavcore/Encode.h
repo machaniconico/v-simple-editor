@@ -21,6 +21,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <vector>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -49,11 +50,18 @@ AVPixelFormat alphaExportPixelFormat(const std::string &codec, int proresProfile
 //   "G(8500,39850)B(6550,2300)R(35400,14600)WP(15635,16450)L(10000000,50)"
 std::string hdr10MasterDisplayString(double masterMaxNits, double masterMinNits);
 
+struct SubtitleCue {
+    int64_t startUs = 0;
+    int64_t endUs = 0;
+    std::string text; // UTF-8, at most 65535 bytes per sample
+};
+
 // Request descriptor mirroring the relevant fields of Exporter's ExportConfig.
 // The descriptor uses standard C++ types; codecOptionsFor exposes Qt pairs.
 struct EncodeRequest {
     enum class RateControl { Bitrate, Crf };
     RateControl rateControl = RateControl::Bitrate;
+    std::vector<SubtitleCue> subtitles; // Empty: no subtitle stream or mux changes.
     int crf = -1;
     int width = 0;
     int height = 0;
@@ -134,6 +142,9 @@ public:
     bool pushFrameRgb24(const uint8_t* src, int stride, int64_t pts);
     // Packed straight RGBA; valid only for an open keepAlpha session.
     bool pushFrameRgba32(const uchar* rgba, int stride, int64_t pts);
+    static void setSubtitleMuxEnabledForTest(bool enabled);
+    static void resetSubtitleStreamCountForTest();
+    static int subtitleStreamCountForTest();
     // Test seam for checking that default exports never enter metadata code.
     static void setMetadataEnabledForTest(bool enabled);
     static void resetMetadataWriteCountForTest();
@@ -185,6 +196,8 @@ private:
     bool configureEncoderContext(const EncodeRequest& request,
                                   const AVCodec* encoder,
                                   AVDictionary** outOpts);
+    bool configureSubtitles(const EncodeRequest& request);
+    bool muxSubtitles();
     bool configureAudioPassthrough(const std::string& audioSourcePath);
     void muxAudioPassthroughPackets();
     bool configureAudioEncoder(const EncodeRequest& request);
@@ -201,6 +214,8 @@ private:
     AVFormatContext* m_audioInFmt = nullptr;
     AVCodecContext* m_encCtx = nullptr;
     AVCodecContext* m_audioEncCtx = nullptr;
+    AVStream* m_subtitleStream = nullptr;
+    std::vector<SubtitleCue> m_subtitles;
     AVStream* m_outStream = nullptr;
     AVStream* m_audioInStream = nullptr;
     AVStream* m_audioOutStream = nullptr;

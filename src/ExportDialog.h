@@ -11,6 +11,7 @@
 #include <QCheckBox>
 #include <QPlainTextEdit>
 #include "ProjectSettings.h"
+#include "SubtitleIO.h"
 #include "Timeline.h"
 
 enum class ExportType {
@@ -43,6 +44,8 @@ struct HDRSettings {
 struct ExportConfig {
     enum class RateControl { Bitrate, Crf };
     RateControl rateControl = RateControl::Bitrate;
+    subtitle::ExportMode subtitleMode = subtitle::ExportMode::BurnIn;
+    void appendSubtitleSettings(QJsonObject &json) const;
     int crf = -1; // -1: codec default (23, or 30 for AV1)
     QString title, author, copyright, comment; // Empty: omit container tags.
     void appendMetadataSettings(QJsonObject &json) const;
@@ -133,6 +136,7 @@ private:
     QComboBox *m_videoCodecCombo;
     QComboBox *m_audioCodecCombo;
     QComboBox *m_hwEncoderCombo;
+    QComboBox *m_subtitleModeCombo = nullptr;
     QComboBox *m_rateControlCombo = nullptr;
     QSpinBox *m_crfSpin = nullptr;
     QSpinBox *m_videoBitrateSpin;

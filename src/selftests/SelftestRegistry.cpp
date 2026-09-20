@@ -211,6 +211,7 @@ int runSocialSelftest();
 int runSpatialPathSelftest();
 int runSpectralEditSelftest();
 int runStereoPanSelftest();
+int runSubMovtextSelftest();
 int runSubtitleCpsSelftest();
 int runSubtitleKaraokeSelftest();
 int runSubXlatSelftest();
@@ -733,6 +734,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "AutoColor: frame stats + gray-world WB + brightness/contrast closed-loop proof + manual grade preservation" },
     { "wb-eyedropper",    "VEDITOR_WB_EYEDROPPER_SELFTEST",       runWbEyedropperSelftest,       false,
       "WB eyedropper inverse temperature/tint helper + closed-loop VideoEffect forward proof" },
+    { "sub-movtext", "VEDITOR_SUB_MOVTEXT_SELFTEST", runSubMovtextSelftest, true,
+      "mov_text subtitle streams, burn-in modes, containers and queue wiring (6 gates)" },
     { "subtitle-cps",     "VEDITOR_SUBTITLE_CPS_SELFTEST",        runSubtitleCpsSelftest,        false,
       "Subtitle CPS readability helper: visible character counting, zero-duration sentinel, strict threshold" },
     { "subtitle-karaoke", "VEDITOR_SUBTITLE_KARAOKE_SELFTEST",    runSubtitleKaraokeSelftest,    false,

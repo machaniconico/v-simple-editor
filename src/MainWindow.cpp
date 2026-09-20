@@ -10604,6 +10604,8 @@ void MainWindow::exportVideo()
     if (exportCfg.proresProfile >= 0)
         cfg["proresProfile"] = exportCfg.proresProfile;
     if (exportCfg.keepAlpha) cfg["keepAlpha"] = true;
+    exportCfg.appendSubtitleSettings(cfg);
+    RenderQueue::appendSubtitleTrack(cfg, m_subtitleSegments, m_subtitleStyle, this);
     exportCfg.appendSequenceSettings(cfg);
     exportCfg.appendMetadataSettings(cfg);
     job.exportConfig = cfg;
@@ -16802,6 +16804,8 @@ void MainWindow::onMobileExport()
                     }
                     if (cfg.proresProfile >= 0)
                         jcfg["proresProfile"] = cfg.proresProfile;
+                    cfg.appendSubtitleSettings(jcfg);
+                    RenderQueue::appendSubtitleTrack(jcfg, m_subtitleSegments, m_subtitleStyle, this);
                     cfg.appendSequenceSettings(jcfg);
                     cfg.appendMetadataSettings(jcfg);
                     job.exportConfig = jcfg;

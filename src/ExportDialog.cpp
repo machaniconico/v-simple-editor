@@ -37,6 +37,11 @@ int defaultCrfFor(const QString &codec)
 }
 }
 
+void ExportConfig::appendSubtitleSettings(QJsonObject &json) const
+{
+    json["subtitleMode"] = static_cast<int>(subtitleMode);
+}
+
 void ExportConfig::appendMetadataSettings(QJsonObject &json) const
 {
     if (!title.isEmpty()) json.insert("title", title);
@@ -339,6 +344,16 @@ void ExportDialog::setupUI()
     mainLayout->addWidget(outputGroup);
 
     // Marked range
+    auto *subtitleLayout = new QFormLayout;
+    m_subtitleModeCombo = new QComboBox(this);
+    m_subtitleModeCombo->setObjectName("exportSubtitleMode");
+    m_subtitleModeCombo->addItem(tr("なし"), 0);
+    m_subtitleModeCombo->addItem(tr("焼き込み（従来の設定を引き継ぐ）"), 1);
+    m_subtitleModeCombo->addItem(tr("mov_text 埋め込み"), 2);
+    m_subtitleModeCombo->addItem(tr("両方"), 3);
+    m_subtitleModeCombo->setCurrentIndex(1);
+    subtitleLayout->addRow(tr("字幕"), m_subtitleModeCombo);
+    mainLayout->addLayout(subtitleLayout);
     m_keepAlphaCheckbox = new QCheckBox(tr("アルファチャンネルを保持 (ProRes 4444 / VP9)"), this);
     mainLayout->addWidget(m_keepAlphaCheckbox);
 
@@ -785,6 +800,7 @@ void ExportDialog::applyPreset(const ExportConfig &config, bool userPreset)
     m_rateControlCombo->setCurrentIndex(config.rateControl == ExportConfig::RateControl::Crf ? 1 : 0);
     m_audioOnlyCheckbox->setChecked(config.audioOnly);
     if (config.audioOnly) select(m_audioContainerCombo, config.container);
+    m_subtitleModeCombo->setCurrentIndex(static_cast<int>(config.subtitleMode));
     m_keepAlphaCheckbox->setChecked(config.keepAlpha);
     m_markedRangeCheckbox->setChecked(config.exportMarkedRangeOnly);
     m_outputEdit->setText(output);
@@ -814,6 +830,7 @@ ExportConfig ExportDialog::currentSettings() const
     c.videoCodec = m_videoCodecCombo->currentData().toString();
     c.audioCodec = m_audioCodecCombo->currentData().toString();
     c.container = defaultExtension();
+    c.subtitleMode = static_cast<subtitle::ExportMode>(m_subtitleModeCombo->currentData().toInt());
     c.videoBitrate = m_videoBitrateSpin->value();
     c.audioBitrate = m_audioBitrateSpin->value();
     c.rateControl = m_rateControlCombo->currentIndex() == 1
@@ -900,6 +917,21 @@ void ExportDialog::updateRateControlControls()
 
 void ExportDialog::updateSummary()
 {
+    if (m_subtitleModeCombo) {
+        const bool supported = subtitle::supportsMovText(defaultExtension())
+            && !m_audioOnlyCheckbox->isChecked()
+            && m_exportTypeCombo->currentData().toInt() == static_cast<int>(ExportType::Video);
+        auto *model = qobject_cast<QStandardItemModel *>(m_subtitleModeCombo->model());
+        for (int i : {2, 3}) {
+            if (model && model->item(i)) {
+                model->item(i)->setEnabled(supported);
+                model->item(i)->setToolTip(supported ? QString() : tr("mov_text 字幕は MP4 / MOV 動画のみ対応しています"));
+            }
+        }
+        if (!supported && m_subtitleModeCombo->currentIndex() >= 2)
+            m_subtitleModeCombo->setCurrentIndex(1);
+    }
+
     if (m_keepAlphaCheckbox) {
         const auto c = currentSettings();
         const bool enabled = c.imageSequence || (!c.audioOnly

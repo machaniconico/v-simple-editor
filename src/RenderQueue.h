@@ -9,6 +9,8 @@
 #include <QJsonObject>
 #include <QMutex>
 
+#include "SubtitleTrackRenderer.h"
+#include "libavcore/Encode.h"
 #include "AcesColor.h"  // AC: ACES カラーマネジメント パイプライン (production export 配線)
 
 class QThread;
@@ -117,6 +119,13 @@ public:
     // enabled=false (既定) のときレンダーワーカーは一切適用せずビット同一。
     void setAcesPipeline(const aces::AcesPipeline &p);
     void setLoudnessGainDb(double gainDb);
+
+    static void appendSubtitleTrack(QJsonObject &config,
+        const QVector<SubtitleSegment> &segments, const SubtitleStyle &style,
+        const QObject *rendererOwner);
+    static std::vector<libavcore::SubtitleCue> subtitleCues(
+        const QJsonObject &config, qint64 startUs, qint64 durationUs);
+    static void paintSubtitles(QImage &frame, const QJsonObject &config, qint64 timeUs);
 
     static QString alphaExportError(const QJsonObject &config);
     static void resetBlackCompositeCountForTest();
