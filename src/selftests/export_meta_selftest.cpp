@@ -1,3 +1,4 @@
+#include "../CodecDetector.h"
 #include "../ExportDialog.h"
 #include "../ExportUserPresets.h"
 #include "../RenderQueue.h"
@@ -122,7 +123,12 @@ int runExportMetaSelftest()
     const bool ready = temp.isValid() && timeline.insertShapeClipAtPlayhead(clip);
     timeline.refreshPlaybackSequence();
     bool encoded = ready, defaults = ready;
-    for (const QString &extension : {QStringLiteral("mp4"), QStringLiteral("mov"), QStringLiteral("webm")}) {
+    for (const QString &extension : {QStringLiteral("mp4"), QStringLiteral("mov"),
+            QStringLiteral("mkv"), QStringLiteral("webm")}) {
+        if (extension == "webm" && !CodecDetector::isEncoderAvailable("libvpx-vp9")) {
+            std::fprintf(stderr, "SKIP G2/G3: webm (libvpx-vp9 encoder unavailable); mkv remains required\n");
+            continue;
+        }
         const QString codec = extension == "webm" ? "libvpx-vp9" : "mpeg4";
         const QString taggedPath = temp.filePath("tagged." + extension);
         Tags actual;
@@ -160,6 +166,15 @@ int runExportMetaSelftest()
     restored.appendMetadataSettings(restoredJson);
     for (auto it = tags.constBegin(); it != tags.constEnd(); ++it)
         presets &= restoredJson.value(it.key()).toString() == it.value();
+    const QJsonObject defaultPreset = ExportUserPresets::toJson(ExportConfig{});
+    QJsonObject legacyPreset = ExportUserPresets::toJson(config);
+    for (auto it = tags.constBegin(); it != tags.constEnd(); ++it) {
+        presets &= !defaultPreset.contains(it.key());
+        legacyPreset.remove(it.key());
+    }
+    const ExportConfig legacyRestored = ExportUserPresets::fromJson(legacyPreset);
+    presets &= legacyRestored.title.isEmpty() && legacyRestored.author.isEmpty()
+        && legacyRestored.copyright.isEmpty() && legacyRestored.comment.isEmpty();
     if (hadEnv) qputenv("VEDITOR_EXPORT_PRESET_DIR", oldEnv);
     else qunsetenv("VEDITOR_EXPORT_PRESET_DIR");
     gate(4, presets);

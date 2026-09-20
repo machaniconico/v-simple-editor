@@ -43,6 +43,10 @@ QJsonObject toJson(const ExportConfig &c)
     j.insert("hdr10", c.hdr10);
     j.insert("proresProfile", c.proresProfile);
     if (c.keepAlpha) j.insert("keepAlpha", true);
+    if (!c.title.isEmpty()) j.insert("title", c.title);
+    if (!c.author.isEmpty()) j.insert("author", c.author);
+    if (!c.copyright.isEmpty()) j.insert("copyright", c.copyright);
+    if (!c.comment.isEmpty()) j.insert("comment", c.comment);
     j.insert("exportMarkedRangeOnly", c.exportMarkedRangeOnly);
     j.insert("audioOnly", c.audioOnly);
     j.insert("crf", c.crf);
@@ -75,6 +79,10 @@ ExportConfig fromJson(const QJsonObject &j)
     c.hdr10 = j.value("hdr10").toBool(c.hdr10);
     c.proresProfile = j.value("proresProfile").toInt(c.proresProfile);
     c.keepAlpha = j.value("keepAlpha").toBool(false);
+    c.title = j.value("title").toString();
+    c.author = j.value("author").toString();
+    c.copyright = j.value("copyright").toString();
+    c.comment = j.value("comment").toString();
     c.exportMarkedRangeOnly = j.value("exportMarkedRangeOnly").toBool(c.exportMarkedRangeOnly);
     c.audioOnly = j.value("audioOnly").toBool(c.audioOnly);
     c.crf = j.value("crf").toInt(c.crf);
