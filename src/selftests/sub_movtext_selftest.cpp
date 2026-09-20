@@ -158,7 +158,9 @@ int runSubMovtextSelftest()
     QObject owner;
     SubtitleTrackRenderer installed(&owner);
     SubtitleStyle style; style.font.setPointSize(16);
-    installed.setSegments(segments); installed.setStyle(style);
+    SubtitleSegment stale = first;
+    stale.startTime = 0; stale.endTime = 3; stale.text = QStringLiteral("古いプロジェクトの字幕");
+    installed.setSegments(QVector<SubtitleSegment>{stale}); installed.setStyle(style);
     auto settings = [&](Mode mode) {
         ExportConfig config; config.subtitleMode = mode;
         QJsonObject json;
@@ -183,16 +185,26 @@ int runSubMovtextSelftest()
                             {1000000, 1500000, second.text.toUtf8().toStdString()}});
     gate(1, g1);
 
-    // Existing branch stays in production. Disable ONLY the additive mux
-    // branch; compare outputs with it enabled, and require zero invocations.
+    // No subtitle keys is the baseline-equivalent configuration. Compare its
+    // pixels against a frame that never enters subtitle painting, independently
+    // of the mux switch (which cannot detect accidental default burn-in).
     bool g2 = ready && ExportConfig{}.subtitleMode == Mode::BurnIn;
+    const QImage untouched = ready ? libavcore::grabFrameAt(source, 0.5) : QImage();
+    QImage missingKeys = untouched.copy();
+    QImage defaultMode = untouched.copy();
+    RenderQueue::paintSubtitles(missingKeys, QJsonObject{}, 500000);
+    RenderQueue::paintSubtitles(defaultMode, settings(Mode::BurnIn), 500000);
+    g2 &= !untouched.isNull() && missingKeys == untouched && defaultMode == untouched
+        && !settings(Mode::BurnIn).contains("subtitleBurnInTrack");
     for (const QString &route : {QStringLiteral("normal"), QStringLiteral("batch")}) {
-        QJsonObject config = settings(Mode::BurnIn);
+        // BatchExportQueue intentionally supplies no subtitle settings.
+        const QJsonObject config = route == QStringLiteral("normal")
+            ? settings(Mode::BurnIn) : QJsonObject{};
         const QString baseline = temp.filePath(route + "-baseline.mp4");
         const QString output = temp.filePath(route + "-default.mp4");
         libavcore::FrameEncoder::resetSubtitleStreamCountForTest();
         libavcore::FrameEncoder::setSubtitleMuxEnabledForTest(false);
-        const bool baseOk = ready && render(timeline, baseline, source, config);
+        const bool baseOk = ready && render(timeline, baseline, source, QJsonObject{});
         libavcore::FrameEncoder::setSubtitleMuxEnabledForTest(true);
         Streams streams;
         const bool outputOk = ready && render(timeline, output, source, config) && inspect(output, streams);
@@ -206,6 +218,9 @@ int runSubMovtextSelftest()
 
     ExportDialog dialog(ProjectConfig{});
     auto *combo = dialog.findChild<QComboBox *>("exportSubtitleMode");
+    QLineEdit *outputEdit = nullptr;
+    for (auto *edit : dialog.findChildren<QLineEdit *>())
+        if (edit->placeholderText() == "Select output file...") outputEdit = edit;
     bool g3 = combo && combo->count() == 4 && combo->currentData().toInt() == 1;
     QComboBox *codec = nullptr;
     for (auto *candidate : dialog.findChildren<QComboBox *>())
@@ -218,6 +233,19 @@ int runSubMovtextSelftest()
             && !model->item(2)->toolTip().isEmpty();
         codec->setCurrentIndex(codec->findData("libx264"));
         g3 &= model && model->item(2)->isEnabled() && model->item(3)->isEnabled();
+        g3 &= outputEdit != nullptr;
+        if (outputEdit && model) {
+            combo->setCurrentIndex(2);
+            outputEdit->setText(temp.filePath("manual.mkv"));
+            g3 &= !model->item(2)->isEnabled() && !model->item(3)->isEnabled()
+                && !model->item(2)->toolTip().isEmpty() && combo->currentIndex() == 1;
+            outputEdit->setText(temp.filePath("manual.MOV"));
+            g3 &= model->item(2)->isEnabled() && model->item(3)->isEnabled();
+            outputEdit->setText(temp.filePath("manual.webm"));
+            g3 &= !model->item(2)->isEnabled() && !model->item(3)->isEnabled();
+            outputEdit->clear();
+            g3 &= model->item(2)->isEnabled() && model->item(3)->isEnabled();
+        }
     }
     libavcore::EncodeRequest invalid;
     invalid.width = 320; invalid.height = 180; invalid.videoCodecName = "mpeg4";
@@ -233,7 +261,14 @@ int runSubMovtextSelftest()
     bool g4 = ready && render(timeline, bothPath, source, settings(Mode::Both))
         && inspect(bothPath, bothStreams) && matches(bothStreams, expected);
     const QImage both = libavcore::grabFrameAt(bothPath, 0.5);
-    const QImage burn = libavcore::grabFrameAt(temp.filePath("normal-default.mp4"), 0.5);
+    // Explicit burn-in data is refreshed from the current segments, even when
+    // the caller's config previously held a stale track.
+    QJsonObject explicitBurn = settings(Mode::BurnIn);
+    explicitBurn["subtitleBurnInTrack"] = installed.toJson();
+    RenderQueue::appendSubtitleTrack(explicitBurn, segments, style, &owner);
+    const QString burnPath = temp.filePath("explicit-burn.mp4");
+    g4 &= ready && render(timeline, burnPath, source, explicitBurn);
+    const QImage burn = libavcore::grabFrameAt(burnPath, 0.5);
     const QImage plain = libavcore::grabFrameAt(temp.filePath("embedded.mp4"), 0.5);
     gate(4, g4 && !both.isNull() && both == burn && both != plain);
 
@@ -244,9 +279,6 @@ int runSubMovtextSelftest()
         && code.contains("cfg.appendSubtitleSettings(jcfg);")
         && code.contains("RenderQueue::appendSubtitleTrack(cfg, m_subtitleSegments, m_subtitleStyle, this);")
         && code.contains("RenderQueue::appendSubtitleTrack(jcfg, m_subtitleSegments, m_subtitleStyle, this);");
-    QLineEdit *outputEdit = nullptr;
-    for (auto *edit : dialog.findChildren<QLineEdit *>())
-        if (edit->placeholderText() == "Select output file...") outputEdit = edit;
     g5 &= outputEdit && combo;
     for (Mode mode : {Mode::None, Mode::BurnIn, Mode::MovText, Mode::Both}) {
         if (outputEdit && combo) {
@@ -271,15 +303,29 @@ int runSubMovtextSelftest()
 
     const QString nonePath = temp.filePath("none.mp4");
     Streams noneStreams;
-    const bool noneOk = ready && render(timeline, nonePath, source, settings(Mode::None)) && inspect(nonePath, noneStreams);
+    QJsonObject noneConfig = explicitBurn;
+    noneConfig["subtitleMode"] = static_cast<int>(Mode::None);
+    const bool noneOk = ready && render(timeline, nonePath, source, noneConfig) && inspect(nonePath, noneStreams);
     const QImage none = libavcore::grabFrameAt(nonePath, 0.5);
     QJsonObject noInstallation;
     RenderQueue::appendSubtitleTrack(noInstallation, segments, style, nullptr);
     QImage noBurn(320, 180, QImage::Format_RGBA8888); noBurn.fill(Qt::black);
     const QImage unchanged = noBurn;
     RenderQueue::paintSubtitles(noBurn, noInstallation, 500000);
+    bool cleared = true;
+    for (Mode mode : {Mode::None, Mode::BurnIn, Mode::MovText, Mode::Both}) {
+        QJsonObject oldConfig = settings(mode);
+        oldConfig["subtitleBurnInTrack"] = installed.toJson();
+        RenderQueue::appendSubtitleTrack(oldConfig, QVector<SubtitleSegment>{}, style, &owner);
+        QImage frame = unchanged.copy();
+        RenderQueue::paintSubtitles(frame, oldConfig, 500000);
+        cleared &= oldConfig.contains("subtitleTrack") && oldConfig.value("subtitleTrack").toObject().isEmpty()
+            && !oldConfig.contains("subtitleBurnInTrack")
+            && RenderQueue::subtitleCues(oldConfig, 0, 3000000).empty() && frame == unchanged;
+    }
     gate(6, noneOk && noneStreams.total == 2 && noneStreams.subtitle == 0
-        && !none.isNull() && none == plain && none != burn && noBurn == unchanged);
+        && !none.isNull() && none == plain && none != burn && noBurn == unchanged && cleared
+        && !subtitle::burns(Mode::None) && !subtitle::embeds(Mode::None));
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
     return failed;
 }

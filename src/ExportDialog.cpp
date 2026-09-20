@@ -392,6 +392,7 @@ void ExportDialog::setupUI()
     mainLayout->addWidget(buttons);
 
     // Connections
+    connect(m_outputEdit, &QLineEdit::textChanged, this, &ExportDialog::updateSummary);
     connect(m_audioOnlyCheckbox, &QCheckBox::toggled, this, [this]() {
         updateAudioOnlyControls();
         const QFileInfo output(m_outputEdit->text());
@@ -918,7 +919,9 @@ void ExportDialog::updateRateControlControls()
 void ExportDialog::updateSummary()
 {
     if (m_subtitleModeCombo) {
-        const bool supported = subtitle::supportsMovText(defaultExtension())
+        const QString suffix = m_outputEdit->text().isEmpty()
+            ? defaultExtension() : QFileInfo(m_outputEdit->text()).suffix();
+        const bool supported = subtitle::supportsMovText(suffix)
             && !m_audioOnlyCheckbox->isChecked()
             && m_exportTypeCombo->currentData().toInt() == static_cast<int>(ExportType::Video);
         auto *model = qobject_cast<QStandardItemModel *>(m_subtitleModeCombo->model());

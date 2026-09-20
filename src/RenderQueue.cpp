@@ -53,20 +53,21 @@ void RenderQueue::appendSubtitleTrack(QJsonObject &config,
     const QVector<SubtitleSegment> &segments, const SubtitleStyle &style,
     const QObject *rendererOwner)
 {
+    Q_UNUSED(rendererOwner);
+    // RenderQueue historically had no subtitle burn-in. Never discover legacy
+    // Exporter renderers here: they can outlive the current project's subtitles.
+    // Preserve only an explicit burn-in request, refreshing it from current data.
+    const bool burnInRequested = config.contains("subtitleBurnInTrack");
+    // An explicit empty track also prevents startRenderPipe() from reloading subtitles
+    // from an older on-disk project after the user has deleted all current cues.
+    config["subtitleTrack"] = QJsonObject{};
+    config.remove("subtitleBurnInTrack");
+    if (segments.isEmpty()) return;
     SubtitleTrackRenderer track;
     track.setSegments(segments);
     track.setStyle(style);
-    if (!segments.isEmpty()) config["subtitleTrack"] = track.toJson();
-    // Preserve the existing installation condition: renderSubtitleTrack()
-    // creates these renderers and installs the latest one in Exporter.
-    if (rendererOwner) {
-        const auto installed = rendererOwner->findChildren<SubtitleTrackRenderer *>(
-            QString(), Qt::FindDirectChildrenOnly);
-        if (!installed.isEmpty()) {
-            config["subtitleBurnInTrack"] = installed.last()->toJson();
-            config["subtitleTrack"] = installed.last()->toJson();
-        }
-    }
+    config["subtitleTrack"] = track.toJson();
+    if (burnInRequested) config["subtitleBurnInTrack"] = track.toJson();
 }
 
 std::vector<libavcore::SubtitleCue> RenderQueue::subtitleCues(
