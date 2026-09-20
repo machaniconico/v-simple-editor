@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QObject>
+#include <QByteArray>
 #include <QVector>
 #include <QString>
 #include <QHash>
@@ -163,6 +164,9 @@ public:
     void setTrackSolo(int trackIdx, bool solo);
     void setTrackGain(int trackIdx, double gain);
     double trackGain(int trackIdx) const;
+    // Production readData probe with the hardware sink stopped. Consumes the
+    // sequence from zero and stops the decode worker; dedicated test mixers only.
+    QByteArray renderPcmForTest(int frames);
 
     // Bus / submix / aux-send routing (AB-4). Replaces the per-track →
     // master bus-gain map consulted in the mix loop. The routing object is

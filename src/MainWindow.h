@@ -1066,6 +1066,7 @@ private:
 
     // Audio meters dock
     QDockWidget *m_audioMetersDock = nullptr;
+    QDockWidget *m_audioMixerDock = nullptr;
     QList<QMetaObject::Connection> m_meterConnections;
     QList<class AudioMeterWidget *> m_audioMeterWidgets;
     class AudioMeterWidget *m_masterMeter = nullptr;

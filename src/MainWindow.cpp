@@ -303,6 +303,7 @@ double exporter_loudnessGainDb();
 #include <array>
 #include <limits>
 #include "AudioMeterWidget.h"
+#include "AudioMixerDock.h"
 #include "GradientStopBar.h"
 #include "BrushAnimationDialog.h"
 #include "PathText.h"
@@ -996,6 +997,9 @@ QString prepareTimelineAudioMixForExport(Timeline *timeline, QString *error,
             legacyEqCoeffs.insert(track, mixer->trackEqCoeffs(track));
             legacyEqEnabled.insert(track, mixer->trackEqEnabled(track));
             trackGains.insert(track, mixer->trackGain(track));
+            // MIXER-DOCK: non-unity gain needs the existing post-DSP gain path,
+            // including when no track effect is enabled.
+            useTrackFx = useTrackFx || mixer->trackGain(track) != 1.0;
             useTrackFx = useTrackFx || chain.eqEnabled || chain.compEnabled
                 || chain.reverbEnabled || chain.nrEnabled || chain.deesser.enabled
                 || (legacyEqEnabled.value(track) && !legacyEqConfigs.value(track).isDefault());
@@ -8023,6 +8027,11 @@ void MainWindow::setupMenuBar()
     });
     m_menuHelpEntries.append({m_llmAssistantToggleAction,
         QStringLiteral("画面右下の「LLM に指示を出す」ボタンを表示するかどうかを切り替えます。")});
+
+    m_audioMixerDock = new AudioMixerDock(m_timeline, m_player->audioMixer(), this);
+    addDockWidget(Qt::BottomDockWidgetArea, m_audioMixerDock);
+    m_audioMixerDock->hide();
+    viewMenu->addAction(m_audioMixerDock->toggleViewAction());
 
     // 取り込み配置ポリシー: 並列トラック (V2/A2...) か 現在トラック追加 (V1/A1 連結)
     auto *importPlacementGroup = new QActionGroup(this);
@@ -19640,12 +19649,12 @@ void MainWindow::onMeterRequestNormalize(int trackIdx, double gainDb)
         return;
     }
 
-    m_timeline->undoManager()->saveState(m_timeline->currentState(), "Normalize audio");
-
     const double oldGain = mixer->trackGain(trackIdx);
     const double factor = std::pow(10.0, gainDb / 20.0);
     const double newGain = std::clamp(oldGain * factor, 0.0, 4.0);
     mixer->setTrackGain(trackIdx, newGain);
+    // Store the completed edit, so a following mixer-fader undo returns here.
+    m_timeline->saveUndoState(QStringLiteral("Normalize audio"));
 
     statusBar()->showMessage(
         QString("T%1 ノーマライズ: +%2dB (gain %3→%4)")
@@ -19670,8 +19679,6 @@ void MainWindow::onMeterRequestNormalizeAll()
         const double gainDb = std::clamp(-1.0 - peak, -24.0, 12.0);
         if (std::abs(gainDb) < 0.001)
             continue;
-        if (!anyApplied)
-            m_timeline->undoManager()->saveState(m_timeline->currentState(), "Normalize all audio");
         const double oldGain = mixer->trackGain(i);
         const double factor = std::pow(10.0, gainDb / 20.0);
         const double newGain = std::clamp(oldGain * factor, 0.0, 4.0);
@@ -19680,6 +19687,7 @@ void MainWindow::onMeterRequestNormalizeAll()
     }
 
     if (anyApplied) {
+        m_timeline->saveUndoState(QStringLiteral("Normalize all audio"));
         statusBar()->showMessage(
             QStringLiteral("全トラックをノーマライズしました"), 4000);
     } else {

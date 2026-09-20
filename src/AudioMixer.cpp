@@ -2300,6 +2300,43 @@ double AudioMixer::trackGain(int trackIdx) const
     return m_trackStates[trackIdx].gain;
 }
 
+QByteArray AudioMixer::renderPcmForTest(int frames)
+{
+    if (frames <= 0 || frames > kSampleRateHz * 60 || isPlaying()
+        || (m_sink && m_sink->state() != QAudio::StoppedState))
+        return {};
+    // setSequence creates a stopped sink even for headless callers. Its
+    // existence must not reject the probe; only an active transport may.
+    if (m_decodeRunner) {
+        m_decodeRunner->requestStop();
+        m_decodeRunner->wait();
+        delete m_decodeRunner;
+        m_decodeRunner = nullptr;
+    }
+    seekTo(0);
+    MixerIODevice io(this);
+    io.open(QIODevice::ReadOnly | QIODevice::Unbuffered);
+    QByteArray result(frames * kBytesPerFrame, '\0');
+    m_playing.store(true, std::memory_order_release);
+    // Match audio-xfade's mixerWindowRms: prime the production decoders,
+    // then refill before each 10 ms pull without starting the hardware sink.
+    for (int pass = 0; pass < 16; ++pass) refillRings();
+    for (int offset = 0; offset < frames; offset += 480) {
+        // Fill through the existing decoder, then pull the actual playback
+        // mixer. No duplicate DSP, gain arithmetic, or platform audio sink.
+        refillRings();
+        const int bytes = qMin(480, frames - offset) * kBytesPerFrame;
+        if (io.read(result.data() + offset * kBytesPerFrame, bytes) != bytes
+            || masterClockUs() != static_cast<qint64>(offset + bytes / kBytesPerFrame)
+                * 1'000'000 / kSampleRateHz) {
+            result.clear();
+            break;
+        }
+    }
+    m_playing.store(false, std::memory_order_release);
+    return result;
+}
+
 void AudioMixer::setBusRouting(const audiobus::AudioBusRouting &r)
 {
     audiobus::AudioBusRouting snapshot = r;

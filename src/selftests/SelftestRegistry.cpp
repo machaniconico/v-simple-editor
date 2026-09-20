@@ -160,6 +160,7 @@ int runMediaPoolSelftest();
 int runMediaPoolThumbsSelftest();
 int runMediaRelinkSelftest();
 int runMeshWarpSelftest();
+int runMixerDockSelftest();
 int runMobileSelftest();
 int runMographSelftest();
 int runMotionBlurP2Selftest();
@@ -912,6 +913,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Music Remix: beat-boundary shortening/extension, intro/outro retention, crossfade, and one-step undo" },
     { "deesser", nullptr, runDeEsserSelftest, true,
       "De-esser: disabled bypass, band-only attenuation, threshold, playback/export parity, persistence (5 gates)" },
+    { "mixer-dock", nullptr, runMixerDockSelftest, true,
+      "Audio mixer dock: track strips, existing gain path, flags, gesture undo, hidden identity (5 gates)" },
     { "dialogue-leveler", nullptr,                                runDialogueLevelerSelftest,    true,
       "Dialogue Leveler: K-weighted envelope, silence gate, gain clamps, determinism, undo, and persistence" },
     { "auto-clip-gen",     "VEDITOR_AUTO_CLIP_GEN_SELFTEST",      runAutoClipGenSelftest,        true,

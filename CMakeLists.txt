@@ -691,6 +691,9 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/NoiseReductionPanel.h
     src/AudioMeterWidget.cpp
     src/AudioMeterWidget.h
+    src/AudioMixerDock.cpp
+    src/AudioMixerDock.h
+    src/selftests/mixer_dock_selftest.cpp
     src/HistoryDockWidget.cpp
     src/HistoryDockWidget.h
     src/LutImporter.cpp
