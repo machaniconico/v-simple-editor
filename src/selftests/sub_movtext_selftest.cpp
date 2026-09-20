@@ -190,12 +190,16 @@ int runSubMovtextSelftest()
     // of the mux switch (which cannot detect accidental default burn-in).
     bool g2 = ready && ExportConfig{}.subtitleMode == Mode::BurnIn;
     const QImage untouched = ready ? libavcore::grabFrameAt(source, 0.5) : QImage();
-    QImage missingKeys = untouched.copy();
-    QImage defaultMode = untouched.copy();
-    RenderQueue::paintSubtitles(missingKeys, QJsonObject{}, 500000);
-    RenderQueue::paintSubtitles(defaultMode, settings(Mode::BurnIn), 500000);
-    g2 &= !untouched.isNull() && missingKeys == untouched && defaultMode == untouched
-        && !settings(Mode::BurnIn).contains("subtitleBurnInTrack");
+    const QJsonObject defaultConfig = settings(Mode::BurnIn);
+    g2 &= !untouched.isNull() && !defaultConfig.contains("subtitleBurnInTrack");
+    for (int i = 0; i < 36; ++i) {
+        const qint64 timeUs = std::llround(i * 1000000.0 / 12);
+        QImage missingKeys = untouched.copy();
+        QImage defaultMode = untouched.copy();
+        RenderQueue::paintSubtitles(missingKeys, QJsonObject{}, timeUs);
+        RenderQueue::paintSubtitles(defaultMode, defaultConfig, timeUs);
+        g2 &= missingKeys == untouched && defaultMode == untouched;
+    }
     for (const QString &route : {QStringLiteral("normal"), QStringLiteral("batch")}) {
         // BatchExportQueue intentionally supplies no subtitle settings.
         const QJsonObject config = route == QStringLiteral("normal")
@@ -322,6 +326,21 @@ int runSubMovtextSelftest()
         cleared &= oldConfig.contains("subtitleTrack") && oldConfig.value("subtitleTrack").toObject().isEmpty()
             && !oldConfig.contains("subtitleBurnInTrack")
             && RenderQueue::subtitleCues(oldConfig, 0, 3000000).empty() && frame == unchanged;
+        // Exercise the production queue after deleting the current project's
+        // cues, with both a stale config and an old child renderer still alive.
+        const QString clearedPath = temp.filePath(
+            QStringLiteral("cleared-%1.mp4").arg(static_cast<int>(mode)));
+        Streams clearedStreams;
+        libavcore::FrameEncoder::resetSubtitleStreamCountForTest();
+        const bool clearedOk = ready && render(timeline, clearedPath, source, oldConfig)
+            && inspect(clearedPath, clearedStreams);
+        const QImage clearedFrame = clearedOk
+            ? libavcore::grabFrameAt(clearedPath, 0.5) : QImage();
+        cleared &= clearedOk && clearedStreams.total == 2
+            && clearedStreams.video == 1 && clearedStreams.audio == 1
+            && clearedStreams.subtitle == 0 && clearedStreams.cues.empty()
+            && libavcore::FrameEncoder::subtitleStreamCountForTest() == 0
+            && !clearedFrame.isNull() && clearedFrame == plain;
     }
     gate(6, noneOk && noneStreams.total == 2 && noneStreams.subtitle == 0
         && !none.isNull() && none == plain && none != burn && noBurn == unchanged && cleared
