@@ -134,6 +134,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/ObjectRemovalSelftest.cpp
     src/selftests/Light3DSelftest.cpp
     src/selftests/camera3d_selftest.cpp
+    src/selftests/camtrack_solve_selftest.cpp
     src/selftests/camtrack_ui_selftest.cpp
     src/selftests/camera_solve_selftest.cpp
     src/selftests/feature_tracker_selftest.cpp

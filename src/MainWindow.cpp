@@ -15629,6 +15629,9 @@ void MainWindow::openPlanarTrackerDialog()
     m_planarTrackerDialog->setFeatureTrackingSource(clip.filePath, fps,
         std::isfinite(sourceFrames) && sourceFrames > 0
             && sourceFrames <= std::numeric_limits<int>::max() ? int(sourceFrames) : 0);
+    m_planarTrackerDialog->setFeatureClipTiming(clip.inPoint,
+        clip.outPoint > 0 ? clip.outPoint : clip.duration, clip.speed, clip.reversed,
+        !clip.speedRamp.isIdentity() || clip.hasTimeRemap());
     m_planarTrackerDialog->setWindowModality(Qt::ApplicationModal);
 
     m_planarTrackerDialog->show();

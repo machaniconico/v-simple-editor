@@ -69,6 +69,7 @@ int runBezierEasingSelftest();
 int runBlenderSelftest();
 int runBroadcastCaptionSelftest();
 int runBundleAdjustSelftest();
+int runCamtrackSolveSelftest();
 int runCamtrackUiSelftest();
 int runCapcutCaptionSelftest();
 int runCaptionSelftest();
@@ -686,6 +687,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Two-view essential pose, RANSAC, triangulation, degeneracy and determinism (6 gates)" },
     { "feature-tracker", "VEDITOR_FEATURE_TRACKER_SELFTEST", runFeatureTrackerSelftest, false,
       "Shi-Tomasi 特徴点検出とピラミッド LK 多点追跡 (G1-G6)" },
+    { "camtrack-solve", "VEDITOR_CAMTRACK_SOLVE_SELFTEST", runCamtrackSolveSelftest, true,
+      "Camera tracking solve: noise-free nonplanar 64 points / 10 frames, substantial parallax; limits, rejection, undo, trim/speed/reverse (G1-G5)" },
     { "camtrack-ui", "VEDITOR_CAMTRACK_UI_SELFTEST", runCamtrackUiSelftest, true,
       "KLT tracking UI, bounded decoding, planar compatibility and BA limits (4 gates)" },
     { "camera-solve",      "VEDITOR_CAMERA_SOLVE_SELFTEST",       runCameraSolveSelftest,        true,

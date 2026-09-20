@@ -20,6 +20,7 @@ bool solveDenseLinearSystem(QVector<double> A, QVector<double> b, int n,
 struct Track2D {
     int pointId = -1;
     QVector<QPair<int, QPointF>> observations;
+    double strength = 0; // Shi-Tomasi rank; higher is stronger.
 };
 
 struct MultiViewTracks {
@@ -40,6 +41,7 @@ QVector<camsolve::Pose> chainTwoViewPoses(const MultiViewTracks& tracks,
 
 struct BundleResult {
     bool valid = false;
+    bool converged = false;
     QString reason;
     QVector<camsolve::Pose> poses;
     QVector<QVector3D> points;
@@ -56,6 +58,17 @@ BundleResult bundleAdjust(const MultiViewTracks& tracks,
                           QVector<camsolve::Pose> initialPoses,
                           QVector<QVector3D> initialPoints,
                           const camsolve::Intrinsics& intrinsics, int maxIters = 20);
+// Retains original sample indices so sparse solves can use the existing camera API.
+struct CameraTrackSolve {
+    MultiViewTracks input;
+    QVector<int> sourceFrames;
+    bool thinned = false;
+    BundleResult bundle;
+};
+CameraTrackSolve sampleCameraTracks(const MultiViewTracks& tracks);
+CameraTrackSolve solveCameraTracks(const MultiViewTracks& tracks,
+                                  const camsolve::Intrinsics& intrinsics);
+
 // World-to-camera poses suitable for camsolve::applyPosesToCamera.
 QVector<camsolve::Pose> toCameraPoses(const BundleResult& result);
 

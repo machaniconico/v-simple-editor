@@ -390,6 +390,16 @@ PlanarTrackerDialog::PlanarTrackerDialog(QWidget* parent)
     rightLayout->addWidget(m_featureButton);
     rightLayout->addWidget(m_featureProgress);
     rightLayout->addWidget(m_featureSummary);
+    m_featureSolveButton = new QPushButton(tr("カメラを解析"), this);
+    m_featureSolveButton->setObjectName(QStringLiteral("featureSolveButton"));
+    m_featureSolveButton->setEnabled(false);
+    m_featureSolveSummary = new QLabel(this);
+    m_featureSolveSummary->setObjectName(QStringLiteral("featureSolveSummary"));
+    m_featureSolveSummary->setWordWrap(true);
+    rightLayout->addWidget(m_featureSolveButton);
+    rightLayout->addWidget(m_featureSolveSummary);
+    connect(m_featureSolveButton, &QPushButton::clicked, this,
+            [this] { solveFeatureCamera(); });
     connect(m_featureButton, &QPushButton::clicked,
             this, &PlanarTrackerDialog::onFeatureTrackClicked);
     rightLayout->addStretch();
@@ -966,6 +976,13 @@ void PlanarTrackerDialog::setPlanarFrameLoader(std::function<QList<QImage>()> lo
 void PlanarTrackerDialog::setFeatureTrackingSource(const QString& path, double fps, int frameCount)
 {
     if (m_featureWorker) return;
+    m_featureSolveButton->setEnabled(false);
+    m_featureSolveSummary->clear();
+    m_featureSolveResult = {};
+    m_featureIn = 0;
+    m_featureOut = fps > 0 ? frameCount / fps : 0;
+    m_featureSpeed = 1;
+    m_featureReversed = false;
     m_featurePath = path;
     m_featureFps = fps;
     m_featureFrameCount = frameCount;
@@ -988,6 +1005,9 @@ void PlanarTrackerDialog::onFeatureTrackClicked()
 {
     if (m_featureWorker) return;
     m_featureTracks = {};
+    m_featureSolveResult = {};
+    m_featureSolveButton->setEnabled(false);
+    m_featureSolveSummary->clear();
     m_featureAnalysisSize = {};
     const int first = m_featureStart->value(), last = m_featureEnd->value();
     const int count = last - first + 1, maxPoints = m_featureMaxPoints->value();
@@ -1064,7 +1084,7 @@ void PlanarTrackerDialog::onFeatureTrackClicked()
         m_featureAnalysisSize = result->size;
         const bool success = result->error.isEmpty() && result->tracks.frameCount >= 2;
         if (success) {
-            m_featureTracks = result->tracks;
+            setFeatureTrackingResult(result->tracks, result->size, m_featureStartFrame);
             const int total = int(m_featureTracks.tracks.size());
             m_featureSummary->setText(tr("追跡点数: %1 / %2、フレーム数: %3、脱落率: %4%")
                 .arg(result->complete).arg(total).arg(m_featureTracks.frameCount)
@@ -1073,4 +1093,84 @@ void PlanarTrackerDialog::onFeatureTrackClicked()
         emit featureTrackingFinished(success);
     });
     m_featureWorker->start();
+}
+
+void PlanarTrackerDialog::setFeatureClipTiming(double inPoint, double outPoint,
+                                               double speed, bool reversed, bool nonLinearTiming)
+{
+    m_featureNonLinearTiming = nonLinearTiming;
+    m_featureIn = inPoint;
+    m_featureOut = outPoint;
+    m_featureSpeed = speed;
+    m_featureReversed = reversed;
+    if (!std::isfinite(inPoint) || !std::isfinite(outPoint) || !std::isfinite(m_featureFps) || m_featureFps <= 0
+        || inPoint < 0 || outPoint <= inPoint) return;
+    const double first = std::ceil(inPoint * m_featureFps - 1e-9);
+    const double last = std::ceil(outPoint * m_featureFps - 1e-9) - 1;
+    m_featureStart->setValue(int(std::clamp(first, 0.0, double(m_featureStart->maximum()))));
+    m_featureEnd->setValue(int(std::clamp(std::min(last, first + sfm::kMaxBundleFrames - 1),
+                                        0.0, double(m_featureEnd->maximum()))));
+}
+
+void PlanarTrackerDialog::setFeatureTrackingResult(const sfm::MultiViewTracks& tracks,
+                                                   QSize size, int first)
+{
+    m_featureTracks = tracks;
+    m_featureAnalysisSize = size;
+    m_featureStartFrame = first;
+    m_featureSolveResult = {};
+    m_featureSolveSummary->clear();
+    m_featureSolveButton->setEnabled(tracks.frameCount >= 2 && tracks.tracks.size() >= 8);
+}
+
+bool PlanarTrackerDialog::solveFeatureCamera()
+{
+    if (m_featureWorker) return false;
+    m_featureSolveResult = sfm::sampleCameraTracks(m_featureTracks);
+    const double first = m_featureStartFrame / m_featureFps;
+    const double last = (double(m_featureStartFrame) + m_featureTracks.frameCount - 1) / m_featureFps;
+    QString error;
+    if (!std::isfinite(m_featureFps) || m_featureFps <= 0
+        || !std::isfinite(m_featureIn) || !std::isfinite(m_featureOut)
+        || m_featureIn < 0 || m_featureOut <= m_featureIn
+        || !std::isfinite(m_featureSpeed) || m_featureSpeed <= 0
+        || !std::isfinite(m_cameraStartSec) || first < m_featureIn - 1e-9
+        || last >= m_featureOut || m_featureTracks.frameCount < 2)
+        error = tr("解析範囲がクリップの使用区間外です。適用できません。");
+    else if (m_featureNonLinearTiming)
+        // The inverse mapping below is linear in inPoint / speed / reversed only, so a
+        // ramped clip would place every keyframe at a silently wrong time.
+        error = tr("速度ランプまたはタイムリマップのあるクリップには適用できません。");
+    else if (m_featureAnalysisSize.isEmpty() || m_cameraCanvas.isEmpty())
+        error = tr("解析画像のサイズが不正です。");
+    else {
+        const double focal = m_cameraFov * std::max(
+            double(m_featureAnalysisSize.width()) / m_cameraCanvas.width(),
+            double(m_featureAnalysisSize.height()) / m_cameraCanvas.height());
+        m_featureSolveResult = sfm::solveCameraTracks(m_featureTracks,
+            camsolve::makeIntrinsicsFromFocalPx(focal, m_featureAnalysisSize));
+        if (!m_featureSolveResult.bundle.valid) error = m_featureSolveResult.bundle.reason;
+    }
+    const auto& result = m_featureSolveResult;
+    m_featureSolveSummary->setText(tr("%1使用フレーム数: %2 / %3、使用点数: %4 / %5\nRMS 再投影誤差: %6 px")
+        .arg(result.thinned ? tr("間引きあり — ") : QString())
+        .arg(result.input.frameCount).arg(m_featureTracks.frameCount)
+        .arg(result.input.tracks.size()).arg(m_featureTracks.tracks.size())
+        .arg(std::isfinite(result.bundle.rms) ? QString::number(result.bundle.rms, 'g', 6) : tr("∞（算出不可）")));
+    if (!error.isEmpty()) {
+        m_featureSolveSummary->setText(m_featureSolveSummary->text() + "\n" + error
+            + tr("\n平面シーンでは既存の 3D カメラ解析を使ってください"));
+        return false;
+    }
+    // Invalid entries preserve unsolved sample times without inventing poses.
+    QVector<camsolve::Pose> timed(m_featureTracks.frameCount);
+    const auto poses = sfm::toCameraPoses(result.bundle);
+    for (int i = 0; i < poses.size(); ++i) {
+        const int frame = result.sourceFrames[i];
+        timed[m_featureReversed ? timed.size() - 1 - frame : frame] = poses[i];
+    }
+    const double start = m_cameraStartSec + (m_featureReversed
+        ? m_featureOut - last : first - m_featureIn) / m_featureSpeed;
+    emit cameraSolveApplied(timed, m_featureFps * m_featureSpeed, start);
+    return true;
 }

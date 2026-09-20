@@ -71,6 +71,7 @@ MultiViewTracks trackAcrossFrames(const QVector<QImage>& frames, int maxPoints)
     for (const auto& point : points) {
         Track2D track;
         track.pointId = int(result.tracks.size());
+        track.strength = double(points.size() - result.tracks.size());
         track.observations.append(qMakePair(0,point));
         result.tracks.append(track);
         live.append({point,0.0f,true});
@@ -327,6 +328,7 @@ BundleResult bundleAdjust(const MultiViewTracks& tracks, QVector<camsolve::Pose>
     if (!std::isfinite(cost)) return reject("初期点がカメラの背後にあるか投影が不正です");
     result.rmsHistory.append(std::sqrt(cost/observationCount));
     const int cameraParams = 6*(tracks.frameCount-1), n = cameraParams+3*int(points.size());
+    bool converged = cost <= 1e-24;
     double lambda = 1e-3;
     for (int iteration = 0; iteration < maxIters && cost > 1e-24; ++iteration) {
         QVector<double> normal(n*n,0.0), gradient(n,0.0);
@@ -363,6 +365,10 @@ BundleResult bundleAdjust(const MultiViewTracks& tracks, QVector<camsolve::Pose>
             }
             lambda *= 10;
         }
+        converged = cost <= 1e-24 || (accepted
+            && (oldRms-result.rmsHistory.last())/std::max(oldRms,1e-30) < 1e-6);
+        // An already exact reconstruction need not accept a numerically smaller step.
+        converged = converged || std::sqrt(cost/observationCount) < 1e-4;
         if (!accepted || (oldRms-result.rmsHistory.last())/std::max(oldRms,1e-30) < 1e-6) break;
     }
     result.poses = std::move(initialPoses);
@@ -390,6 +396,77 @@ BundleResult bundleAdjust(const MultiViewTracks& tracks, QVector<camsolve::Pose>
     if (!std::isfinite(result.rms)) return reject("結果の投影が不正です");
     for (int frame = 1; frame < result.poses.size(); ++frame) result.poses[frame].residual = result.rms;
     result.valid = true;
+    result.converged = converged;
+    return result;
+}
+
+CameraTrackSolve sampleCameraTracks(const MultiViewTracks& tracks)
+{
+    CameraTrackSolve result;
+    if (tracks.frameCount <= 0) return result;
+    const int count = std::min(tracks.frameCount, kMaxBundleFrames);
+    result.input.frameCount = count;
+    for (int i = 0; i < count; ++i)
+        result.sourceFrames.append(count == 1 ? 0
+            : int(qint64(i) * (tracks.frameCount - 1) / (count - 1)));
+    auto ranked = tracks.tracks;
+    std::stable_sort(ranked.begin(), ranked.end(), [](const Track2D& a, const Track2D& b) {
+        const double x = std::isfinite(a.strength) ? a.strength : 0;
+        const double y = std::isfinite(b.strength) ? b.strength : 0;
+        return x > y;
+    });
+    for (auto track : ranked) {
+        const auto observations = track.observations;
+        track.observations.clear();
+        for (const auto& obs : observations) {
+            const auto it = std::lower_bound(result.sourceFrames.cbegin(), result.sourceFrames.cend(), obs.first);
+            if (it != result.sourceFrames.cend() && *it == obs.first)
+                track.observations.append(qMakePair(int(it-result.sourceFrames.cbegin()), obs.second));
+        }
+        // A point lost before the second retained frame cannot be triangulated.
+        // Keep the strongest usable tracks; report the actual number used.
+        if (track.observations.size() < 2 || track.observations.first().first != 0) continue;
+        result.input.tracks.append(std::move(track));
+        if (result.input.tracks.size() == kMaxBundlePoints) break;
+    }
+    result.thinned = count != tracks.frameCount || result.input.tracks.size() != tracks.tracks.size();
+    return result;
+}
+
+CameraTrackSolve solveCameraTracks(const MultiViewTracks& tracks, const camsolve::Intrinsics& k)
+{
+    auto result = sampleCameraTracks(tracks);
+    const auto reject = [&](const QString& reason) {
+        result.bundle.valid = false;
+        result.bundle.reason = reason;
+        return result;
+    };
+    if (result.input.frameCount < 2 || result.input.tracks.size() < 8)
+        return reject(QStringLiteral("最低2フレーム・8点が必要です"));
+    const auto poses = chainTwoViewPoses(result.input, k);
+    for (const auto& pose : poses) if (!pose.valid)
+        return reject(QStringLiteral("姿勢の連結に失敗しました"));
+    QVector<QVector3D> points;
+    for (const auto& track : result.input.tracks) {
+        QPointF first, last;
+        int lastFrame = -1;
+        bool hasFirst = false;
+        for (const auto& obs : track.observations) {
+            if (obs.first == 0) { first = obs.second; hasFirst = true; }
+            if (obs.first > lastFrame) { lastFrame = obs.first; last = obs.second; }
+        }
+        if (!hasFirst || lastFrame <= 0)
+            return reject(QStringLiteral("三角測量に必要な観測が不足しています"));
+        const auto& pose = poses[lastFrame];
+        const double t[3] = {pose.t.x(), pose.t.y(), pose.t.z()};
+        const auto point = triangulate({Correspondence{first, last}}, k, pose.R, t);
+        if (point.size() != 1) return reject(QStringLiteral("三角測量に失敗しました"));
+        points.append(point.first());
+    }
+    result.bundle = bundleAdjust(result.input, poses, points, k, 40);
+    if (!result.bundle.valid || !result.bundle.converged || result.bundle.rms > 2.0)
+        return reject(result.bundle.reason.isEmpty()
+            ? QStringLiteral("未収束、または RMS が許容値 2 px を超えました") : result.bundle.reason);
     return result;
 }
 
