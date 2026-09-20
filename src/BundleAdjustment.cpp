@@ -5,6 +5,7 @@
 #include <QHash>
 #include <QSet>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <utility>
@@ -203,11 +204,103 @@ void rotateBundleCamera(BundleCamera& camera, const double* w)
     std::copy(rotated,rotated+9,camera.R);
 }
 
+// Block diagonal camera/point Hessians and only observed camera-point edges.
+struct BundleEdge {
+    int camera = 0;
+    std::array<double,18> h{}; // 6 x 3, row-major
+};
+struct BundleBlocks {
+    QVector<std::array<double,36>> cameras;
+    QVector<std::array<double,9>> points;
+    QVector<QVector<BundleEdge>> edges;
+    QVector<double> gradient;
+    BundleBlocks(int frames, int count)
+        : cameras(frames-1), points(count), edges(count),
+          gradient(6*(frames-1)+3*count,0.0) {}
+};
+
+// Apply the same LM diagonal damping before elimination as the dense oracle.
+// S = U - W V^-1 W^T, rhs = -gc + W V^-1 gp.
+bool solveBundleSchur(const BundleBlocks& blocks, double lambda, QVector<double>& delta)
+{
+    const int m = 6*int(blocks.cameras.size());
+    QVector<double> reduced(m*m,0.0), rhs(m);
+    double* const matrix = reduced.data();
+    for (int camera = 0; camera < blocks.cameras.size(); ++camera) {
+        const auto& u = blocks.cameras[camera];
+        for (int i = 0; i < 6; ++i) {
+            const int row = 6*camera+i;
+            rhs[row] = -blocks.gradient[row];
+            for (int j = 0; j < 6; ++j) matrix[row*m+6*camera+j] = u[6*i+j];
+            matrix[row*m+row] += lambda*std::max(u[6*i+i],1e-12);
+        }
+    }
+    QVector<std::array<double,9>> inverses(blocks.points.size());
+    for (int point = 0; point < blocks.points.size(); ++point) {
+        const auto& v = blocks.points[point];
+        QVector<double> damped(9);
+        for (int i = 0; i < 9; ++i) damped[i] = v[i];
+        for (int i = 0; i < 3; ++i) damped[3*i+i] += lambda*std::max(v[3*i+i],1e-12);
+        auto& inverse = inverses[point];
+        for (int col = 0; col < 3; ++col) {
+            QVector<double> unit(3,0.0), solution;
+            unit[col] = 1;
+            if (!solveDenseLinearSystem(damped,unit,3,solution)) return false;
+            for (int row = 0; row < 3; ++row) inverse[3*row+col] = solution[row];
+        }
+        const auto& edges = blocks.edges[point];
+        for (int a = 0; a < edges.size(); ++a) {
+            const auto& left = edges[a];
+            double product[18] = {};
+            for (int i = 0; i < 6; ++i) for (int j = 0; j < 3; ++j)
+                for (int k = 0; k < 3; ++k)
+                    product[3*i+j] += left.h[3*i+k]*inverse[3*k+j];
+            for (int i = 0; i < 6; ++i) {
+                const int row = 6*left.camera+i;
+                for (int j = 0; j < 3; ++j)
+                    rhs[row] += product[3*i+j]*blocks.gradient[m+3*point+j];
+                // Form each scalar in one triangle, mirror it exactly.
+                for (int b = 0; b <= a; ++b) {
+                    const auto& right = edges[b];
+                    for (int j = 0; j < (b == a ? i+1 : 6); ++j) {
+                        const int col = 6*right.camera+j;
+                        const double value = product[3*i]*right.h[3*j]
+                            + product[3*i+1]*right.h[3*j+1]
+                            + product[3*i+2]*right.h[3*j+2];
+                        matrix[row*m+col] -= value;
+                        if (row != col) matrix[col*m+row] -= value;
+                    }
+                }
+            }
+        }
+    }
+    QVector<double> cameraDelta;
+    if (!solveDenseLinearSystem(std::move(reduced),std::move(rhs),m,cameraDelta)) return false;
+    delta.resize(blocks.gradient.size());
+    std::copy(cameraDelta.cbegin(),cameraDelta.cend(),delta.begin());
+    for (int point = 0; point < blocks.points.size(); ++point) {
+        double pointRhs[3];
+        for (int j = 0; j < 3; ++j) pointRhs[j] = -blocks.gradient[m+3*point+j];
+        for (const auto& edge : blocks.edges[point])
+            for (int j = 0; j < 3; ++j) for (int i = 0; i < 6; ++i)
+                pointRhs[j] -= edge.h[3*i+j]*cameraDelta[6*edge.camera+i];
+        for (int i = 0; i < 3; ++i) {
+            double value = 0;
+            for (int j = 0; j < 3; ++j) value += inverses[point][3*i+j]*pointRhs[j];
+            if (!std::isfinite(value)) return false;
+            delta[m+3*point+i] = value;
+        }
+    }
+    return true;
+}
+
 // Optionally accumulate only the nine active columns of each observation.
-// The normal matrix is dense; the observation Jacobian is never allocated.
+// Blocks are used in production; the optional dense matrix is the test oracle.
+// The observation Jacobian is never allocated globally.
 double bundleCost(const MultiViewTracks& tracks, const QVector<BundleCamera>& cameras,
                   const QVector<BundlePoint>& points, const camsolve::Intrinsics& k,
-                  QVector<double>* normal = nullptr, QVector<double>* gradient = nullptr)
+                  QVector<double>* normal = nullptr, QVector<double>* gradient = nullptr,
+                  BundleBlocks* blocks = nullptr)
 {
     const int cameraParams = 6*(tracks.frameCount-1);
     const int n = cameraParams+3*int(points.size());
@@ -227,7 +320,7 @@ double bundleCost(const MultiViewTracks& tracks, const QVector<BundleCamera>& ca
             const double residual[2] = {k.f*p[0]/p[2]+k.cx-observation.second.x(),
                                         k.f*p[1]/p[2]+k.cy-observation.second.y()};
             cost += residual[0]*residual[0]+residual[1]*residual[1];
-            if (!h) continue;
+            if (!h && !blocks) continue;
             const double projection[2][3] = {{k.f/p[2],0,-k.f*p[0]/(p[2]*p[2])},
                                               {0,k.f/p[2],-k.f*p[1]/(p[2]*p[2])}};
             const double rotation[3][3] = {{0,rotated[2],-rotated[1]},
@@ -244,6 +337,33 @@ double bundleCost(const MultiViewTracks& tracks, const QVector<BundleCamera>& ca
                     jacobian[row][6+j] += projection[row][axis]*camera.R[3*axis+j];
                 }
             }
+            if (blocks) {
+                auto& v = blocks->points[point];
+                for (int i = 0; i < 3; ++i) {
+                    blocks->gradient[cameraParams+3*point+i] +=
+                        jacobian[0][6+i]*residual[0]+jacobian[1][6+i]*residual[1];
+                    for (int j = 0; j < 3; ++j)
+                        v[3*i+j] += jacobian[0][6+i]*jacobian[0][6+j]
+                                  +jacobian[1][6+i]*jacobian[1][6+j];
+                }
+                if (frame > 0) {
+                    auto& u = blocks->cameras[frame-1];
+                    BundleEdge edge;
+                    edge.camera = frame-1;
+                    for (int i = 0; i < 6; ++i) {
+                        blocks->gradient[6*(frame-1)+i] +=
+                            jacobian[0][i]*residual[0]+jacobian[1][i]*residual[1];
+                        for (int j = 0; j < 6; ++j)
+                            u[6*i+j] += jacobian[0][i]*jacobian[0][j]+jacobian[1][i]*jacobian[1][j];
+                        for (int j = 0; j < 3; ++j)
+                            edge.h[3*i+j] = jacobian[0][i]*jacobian[0][6+j]
+                                          +jacobian[1][i]*jacobian[1][6+j];
+                    }
+                    blocks->edges[point].append(edge);
+                }
+                continue;
+            }
+            // Preserved dense assembly, reachable only with the selftest switch.
             for (int i = frame == 0 ? 6 : 0; i < 9; ++i) {
                 g[indices[i]] += jacobian[0][i]*residual[0]+jacobian[1][i]*residual[1];
                 for (int j = frame == 0 ? 6 : 0; j < 9; ++j)
@@ -329,21 +449,36 @@ BundleResult bundleAdjust(const MultiViewTracks& tracks, QVector<camsolve::Pose>
     result.rmsHistory.append(std::sqrt(cost/observationCount));
     const int cameraParams = 6*(tracks.frameCount-1), n = cameraParams+3*int(points.size());
     bool converged = cost <= 1e-24;
+    const bool denseSelftest = qEnvironmentVariableIntValue("VEDITOR_BUNDLE_DENSE_SELFTEST") == 1;
     double lambda = 1e-3;
     for (int iteration = 0; iteration < maxIters && cost > 1e-24; ++iteration) {
-        QVector<double> normal(n*n,0.0), gradient(n,0.0);
-        bundleCost(tracks,cameras,points,k,&normal,&gradient);
+        QVector<double> normal, gradient;
+        BundleBlocks blocks(tracks.frameCount,int(points.size()));
+        if (denseSelftest) {
+            normal.fill(0.0,n*n);
+            gradient.fill(0.0,n);
+            bundleCost(tracks,cameras,points,k,&normal,&gradient);
+        } else {
+            bundleCost(tracks,cameras,points,k,nullptr,nullptr,&blocks);
+        }
         bool accepted = false;
         const double oldRms = std::sqrt(cost/observationCount);
         for (int retry = 0; retry < 8; ++retry) {
-            auto damped = normal;
-            double* matrix = damped.data();
-            QVector<double> rhs(n), delta;
-            for (int i = 0; i < n; ++i) {
-                matrix[i*n+i] += lambda*std::max(normal[i*n+i],1e-12);
-                rhs[i] = -gradient[i];
+            QVector<double> delta;
+            bool solved = false;
+            if (denseSelftest) {
+                auto damped = normal;
+                double* matrix = damped.data();
+                QVector<double> rhs(n);
+                for (int i = 0; i < n; ++i) {
+                    matrix[i*n+i] += lambda*std::max(normal[i*n+i],1e-12);
+                    rhs[i] = -gradient[i];
+                }
+                solved = solveDenseLinearSystem(std::move(damped),std::move(rhs),n,delta);
+            } else {
+                solved = solveBundleSchur(blocks,lambda,delta);
             }
-            if (solveDenseLinearSystem(std::move(damped),std::move(rhs),n,delta)) {
+            if (solved) {
                 auto candidateCameras = cameras;
                 auto candidatePoints = points;
                 for (int frame = 1; frame < tracks.frameCount; ++frame) {

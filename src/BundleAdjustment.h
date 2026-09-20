@@ -10,8 +10,8 @@
 
 namespace sfm {
 
-inline constexpr int kMaxBundleFrames = 30;
-inline constexpr int kMaxBundlePoints = 150;
+inline constexpr int kMaxBundleFrames = 60;
+inline constexpr int kMaxBundlePoints = 800;
 
 // A is n*n, row-major. On failure x is empty; inputs are not modified.
 bool solveDenseLinearSystem(QVector<double> A, QVector<double> b, int n,
@@ -53,7 +53,8 @@ struct BundleResult {
 
 // Points correspond to tracks in vector order, not pointId. Frame 0 is fixed;
 // absolute monocular scale is unobservable (no metric scale is recovered).
-// Rotations use local axis-angle increments. No dense observation Jacobian.
+// Rotations use local axis-angle increments. Schur elimination is the default.
+// Tests only: VEDITOR_BUNDLE_DENSE_SELFTEST=1 selects the preserved dense oracle.
 BundleResult bundleAdjust(const MultiViewTracks& tracks,
                           QVector<camsolve::Pose> initialPoses,
                           QVector<QVector3D> initialPoints,

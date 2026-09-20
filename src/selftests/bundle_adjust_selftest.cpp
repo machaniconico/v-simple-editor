@@ -1,5 +1,6 @@
 #include "../BundleAdjustment.h"
 
+#include <QByteArray>
 #include <QElapsedTimer>
 #include <algorithm>
 #include <cstring>
@@ -135,14 +136,14 @@ struct BundleScene {
     QVector<QVector3D> points;
 };
 
-BundleScene bundleScene(const camsolve::Intrinsics& k, bool noisy)
+BundleScene bundleScene(const camsolve::Intrinsics& k, bool noisy, int frameCount = 20, int pointCount = 100)
 {
     BundleScene scene;
-    scene.tracks.frameCount = 20;
+    scene.tracks.frameCount = frameCount;
     std::mt19937 rng(518);
     const auto uniform = [&]() { return (double(rng())+0.5)/4294967296.0; };
-    for (int frame = 0; frame < 20; ++frame) {
-        const double angle = 0.025*frame;
+    for (int frame = 0; frame < frameCount; ++frame) {
+        const double angle = frameCount == 20 ? 0.025*frame : 0.025*frame*19/(frameCount-1);
         const double c = std::cos(angle), s = std::sin(angle);
         camsolve::Pose pose;
         const double r[9] = {c,0,s, 0,1,0, -s,0,c};
@@ -173,11 +174,11 @@ BundleScene bundleScene(const camsolve::Intrinsics& k, bool noisy)
         }
         scene.initial.append(pose);
     }
-    for (int point = 0; point < 100; ++point) {
+    for (int point = 0; point < pointCount; ++point) {
         const QVector3D truth(float(3*uniform()-1.5),float(2*uniform()-1),float(5+3*uniform()));
         sfm::Track2D track;
         track.pointId = 1000+point*3;
-        for (int frame = 0; frame < 20; ++frame) {
+        for (int frame = 0; frame < frameCount; ++frame) {
             const auto& pose = scene.truth[frame];
             double p[3] = {};
             for (int i = 0; i < 3; ++i) {
@@ -253,7 +254,7 @@ bool samePoseBits(const camsolve::Pose& a, const camsolve::Pose& b)
 
 bool sameBundleBits(const sfm::BundleResult& a, const sfm::BundleResult& b)
 {
-    if (!a.valid || !b.valid || a.reason != b.reason || a.poses.size() != b.poses.size()
+    if (!a.valid || !b.valid || a.converged != b.converged || a.reason != b.reason || a.poses.size() != b.poses.size()
         || a.points.size() != b.points.size() || a.rmsHistory.size() != b.rmsHistory.size()
         || std::memcmp(&a.rms,&b.rms,sizeof(double))) return false;
     for (int i = 0; i < a.poses.size(); ++i) if (!samePoseBits(a.poses[i],b.poses[i])) return false;
@@ -287,7 +288,7 @@ int runBundleAdjustSelftest()
     const QImage base = texture();
     QVector<QImage> frames;
     for (int frame = 0; frame < 10; ++frame) frames.append(translate(base,2*frame,-frame));
-    const auto tracked = sfm::trackAcrossFrames(frames);
+    const auto tracked = sfm::trackAcrossFrames(frames,150);
     int complete = 0;
     bool trackingOk = tracked.frameCount == 10 && tracked.tracks.size() <= 150;
     for (qsizetype i = 0; i < tracked.tracks.size(); ++i) {
@@ -310,7 +311,7 @@ int runBundleAdjustSelftest()
             for (int xPixel = 0; xPixel < 320+2*frame; ++xPixel)
                 occludedFrames[frame].scanLine(y)[xPixel] = 0;
     }
-    const auto occluded = sfm::trackAcrossFrames(occludedFrames);
+    const auto occluded = sfm::trackAcrossFrames(occludedFrames,150);
     int hidden = 0, terminated = 0, visibleComplete = 0;
     for (const auto& track : occluded.tracks) {
         // Exclude points that already died in the unobscured sequence, so this
@@ -385,10 +386,10 @@ int runBundleAdjustSelftest()
 
     const auto repeated = sfm::bundleAdjust(cleanScene.tracks,cleanScene.initial,cleanScene.points,k);
     auto oversized = cleanScene.tracks;
-    oversized.frameCount = 31;
+    oversized.frameCount = sfm::kMaxBundleFrames+1;
     const auto rejected = sfm::bundleAdjust(oversized,cleanScene.initial,cleanScene.points,k);
     oversized = cleanScene.tracks;
-    oversized.tracks.resize(151);
+    oversized.tracks.resize(sfm::kMaxBundlePoints+1);
     const auto tooManyPoints = sfm::bundleAdjust(oversized,cleanScene.initial,cleanScene.points,k);
     auto malformed = cleanScene.tracks;
     malformed.tracks[0].observations[0].first = -1;
@@ -399,6 +400,62 @@ int runBundleAdjustSelftest()
          && !rejected.valid && !rejected.reason.isEmpty() && sfm::toCameraPoses(rejected).isEmpty()
          && !tooManyPoints.valid && !tooManyPoints.reason.isEmpty()
          && !badObservation.valid && !badIntrinsics.valid);
+    const bool hadBackend = qEnvironmentVariableIsSet("VEDITOR_BUNDLE_DENSE_SELFTEST");
+    const QByteArray oldBackend = qgetenv("VEDITOR_BUNDLE_DENSE_SELFTEST");
+    bool equivalent = true;
+    for (bool withNoise : {false,true}) {
+        const auto& fixture = withNoise ? noisyScene : cleanScene;
+        qputenv("VEDITOR_BUNDLE_DENSE_SELFTEST","1");
+        const auto dense = sfm::bundleAdjust(fixture.tracks,fixture.initial,fixture.points,k);
+        qputenv("VEDITOR_BUNDLE_DENSE_SELFTEST","0");
+        const auto schur = sfm::bundleAdjust(fixture.tracks,fixture.initial,fixture.points,k);
+        const auto again = sfm::bundleAdjust(fixture.tracks,fixture.initial,fixture.points,k);
+        double rotationDifference = 0, translationDifference = 0;
+        const bool sizes = dense.poses.size() == schur.poses.size() && !dense.poses.isEmpty();
+        for (int i = 0; sizes && i < dense.poses.size(); ++i) {
+            for (int j = 0; j < 9; ++j)
+                rotationDifference = std::max(rotationDifference,std::abs(dense.poses[i].R[j]-schur.poses[i].R[j]));
+            translationDifference = std::max(translationDifference,
+                double((dense.poses[i].t-schur.poses[i].t).length()));
+        }
+        const double rmsDifference = std::abs(dense.rms-schur.rms);
+        const bool deterministic = sameBundleBits(schur,again);
+        const bool ok = dense.valid && schur.valid && dense.converged && schur.converged && sizes
+            && rotationDifference < 1e-5 && translationDifference < 1e-4
+            && rmsDifference < 1e-5 && deterministic;
+        std::cerr << "G7 noisy=" << withNoise << " denseValid=" << dense.valid
+                  << " schurValid=" << schur.valid << " denseConverged=" << dense.converged
+                  << " schurConverged=" << schur.converged << " sizes=" << sizes
+                  << " maxRotationEntry=" << rotationDifference << " translation=" << translationDifference
+                  << " rmsDifference=" << rmsDifference << " deterministic=" << deterministic << '\n';
+        equivalent = equivalent && ok;
+    }
+    gate(7,equivalent);
+
+    // Exercise the entire advertised capacity, with perturbed cameras and points.
+    const auto largeScene = bundleScene(k,false,sfm::kMaxBundleFrames,sfm::kMaxBundlePoints);
+    timer.restart();
+    const auto large = sfm::bundleAdjust(largeScene.tracks,largeScene.initial,largeScene.points,k);
+    const qint64 largeMs = timer.elapsed();
+    const double largeRms = measuredBundleRms(large,largeScene.tracks,k);
+    auto beyondFrames = largeScene.tracks;
+    beyondFrames.frameCount = sfm::kMaxBundleFrames+1;
+    const auto frameLimit = sfm::bundleAdjust(beyondFrames,largeScene.initial,largeScene.points,k);
+    auto beyondPoints = largeScene.tracks;
+    beyondPoints.tracks.resize(sfm::kMaxBundlePoints+1);
+    const auto pointLimit = sfm::bundleAdjust(beyondPoints,largeScene.initial,largeScene.points,k);
+    const bool limits = !frameLimit.valid && !pointLimit.valid
+        && frameLimit.reason.contains(QString::number(sfm::kMaxBundleFrames))
+        && pointLimit.reason.contains(QString::number(sfm::kMaxBundlePoints));
+    std::cerr << "G8 frames=" << largeScene.tracks.frameCount << " points=" << largeScene.points.size()
+              << " ms=" << largeMs << " valid=" << large.valid << " converged=" << large.converged
+              << " RMS=" << largeRms << " acceptedSteps=" << large.rmsHistory.size()-1
+              << " limits=" << limits << '\n';
+    gate(8,sfm::kMaxBundleFrames >= 60 && sfm::kMaxBundlePoints >= 800
+        && large.valid && large.converged && large.rmsHistory.size() > 1
+        && largeMs <= 10000 && largeRms < 0.05 && limits);
+    if (hadBackend) qputenv("VEDITOR_BUNDLE_DENSE_SELFTEST",oldBackend);
+    else qunsetenv("VEDITOR_BUNDLE_DENSE_SELFTEST");
     std::cerr << "summary: " << passed << " PASS, " << failed << " FAIL\n";
     return failed;
 }

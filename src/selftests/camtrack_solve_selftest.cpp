@@ -4,6 +4,7 @@
 #include "../Timeline.h"
 #include "../UndoManager.h"
 
+#include <QByteArray>
 #include <QLabel>
 #include <QSpinBox>
 #include <algorithm>
@@ -251,6 +252,70 @@ int runCamtrackSolveSelftest()
     std::fprintf(stderr, "G5 defaultStart=%d defaultEnd=%d defaults=%d mappedTimes=%d outsideRejected=%d\n",
         defaultStart, defaultEnd, defaults, times, outside);
     gate(5, defaults && times && outside && ramped);
+    // Exercise the BA acceptance boundary through the real dialog/apply path.
+    // The environment switch selects only the preserved dense test oracle.
+    const QByteArray oldBackend = qgetenv("VEDITOR_BUNDLE_DENSE_SELFTEST");
+    const bool hadBackend = qEnvironmentVariableIsSet("VEDITOR_BUNDLE_DENSE_SELFTEST");
+    for (int scenario = 0; scenario < 2; ++scenario) {
+        auto input = tracks;
+        std::mt19937 noiseRng(623);
+        const auto uniform = [&] { return (double(noiseRng())+.5)/4294967296.0; };
+        for (int point = 0; point < input.tracks.size(); ++point) {
+            for (auto& obs : input.tracks[point].observations) {
+                if (scenario == 0) {
+                    // Keep endpoint triangulation clean; minority interior outliers
+                    // leave enough inliers for every two-view initialization.
+                    if (point % 8 == 0 && obs.first > 0 && obs.first < input.frameCount-1)
+                        obs.second += QPointF(obs.first % 2 ? 20 : -20, point % 3 ? -20 : 20);
+                } else {
+                    const double radius = .5*std::sqrt(-2*std::log(uniform()));
+                    const double angle = 2*pi*uniform();
+                    obs.second += QPointF(radius*std::cos(angle), radius*std::sin(angle));
+                }
+            }
+        }
+        bool ok = true;
+        sfm::BundleResult oracle;
+        QString oracleMessage;
+        for (bool dense : {true, false}) {
+            qputenv("VEDITOR_BUNDLE_DENSE_SELFTEST", dense ? "1" : "0");
+            dialog.setFeatureClipTiming(0, 10, 1, false, false);
+            dialog.setFeatureTrackingResult(input, {1280,720}, 0);
+            const auto priorCamera = camera.toJson();
+            const int priorSignals = appliedSignals;
+            const bool accepted = dialog.solveFeatureCamera();
+            const auto actual = dialog.featureSolveResult().bundle;
+            const QString message = dialog.findChild<QLabel*>("featureSolveSummary")->text();
+            const bool reached = std::isfinite(actual.rms) && !actual.rmsHistory.isEmpty();
+            const bool unchanged = camera.toJson() == priorCamera;
+            const bool warned = message.contains(QStringLiteral("許容値 2 px"));
+            const auto* positionKeys = camera.track(Camera3DProperty::PositionX);
+            bool appliedNow = appliedSignals == priorSignals+1
+                && positionKeys && positionKeys->count() >= input.frameCount
+                && emitted.size() == input.frameCount;
+            for (int i = 0; appliedNow && i < emitted.size(); ++i) {
+                const auto expected = camsolve::poseToCameraState(emitted[i], camera.camera());
+                const auto keyed = camera.getCameraAt(emittedStart+double(i)/emittedFps);
+                appliedNow = (keyed.position-expected.position).length() < 1e-5
+                    && (keyed.target-expected.target).length() < 1e-5;
+            }
+            const bool decision = scenario == 0
+                ? (!accepted && !actual.valid && actual.rms > 2 && warned && unchanged
+                   && appliedSignals == priorSignals)
+                : (accepted && actual.valid && actual.converged && actual.rms < 2 && appliedNow);
+            const bool parity = dense || (actual.valid == oracle.valid
+                && actual.converged == oracle.converged && actual.reason == oracle.reason
+                && warned == oracleMessage.contains(QStringLiteral("許容値 2 px")));
+            std::fprintf(stderr, "G%d dense=%d reached=%d accepted=%d valid=%d converged=%d rms=%g warned=%d unchanged=%d applied=%d decision=%d parity=%d reason=%s\n",
+                6+scenario, dense, reached, accepted, actual.valid, actual.converged,
+                actual.rms, warned, unchanged, appliedNow, decision, parity, qPrintable(actual.reason));
+            ok = ok && reached && decision && parity;
+            if (dense) { oracle = actual; oracleMessage = message; }
+        }
+        gate(6+scenario, ok);
+    }
+    if (hadBackend) qputenv("VEDITOR_BUNDLE_DENSE_SELFTEST", oldBackend);
+    else qunsetenv("VEDITOR_BUNDLE_DENSE_SELFTEST");
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
     return failed;
 }
