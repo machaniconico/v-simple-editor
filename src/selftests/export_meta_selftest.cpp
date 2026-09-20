@@ -8,16 +8,24 @@
 #include <QEventLoop>
 #include <QFile>
 #include <QMap>
+#include <QStringList>
 #include <QTemporaryDir>
 #include <QTimer>
 #include <cstdio>
+
+// Exercise the production helpers without starting an HDR subprocess.
+namespace renderqueue_metadata {
+bool hasMetadata(const QJsonObject &cfg);
+void appendSubprocessArgs(QStringList &args, const QJsonObject &cfg,
+                          const QString &outputPath);
+}
 
 namespace {
 using Tags = QMap<QString, QString>;
 const Tags tags{{"title", QStringLiteral("題名 / Title")},
     {"author", QStringLiteral("作成者 / Author")},
     {"copyright", QStringLiteral("© 2026 制作者")},
-    {"comment", QStringLiteral("コメント / Comment")}};
+    {"comment", QStringLiteral("コメント / Comment = value")}};
 
 bool readTags(const QString &path, Tags &result)
 {
@@ -106,6 +114,47 @@ int runExportMetaSelftest()
     const QByteArray code = source.readAll();
     gui &= code.contains("exportCfg.appendMetadataSettings(cfg);\n    job.exportConfig = cfg;")
         && code.contains("cfg.appendMetadataSettings(jcfg);\n                    job.exportConfig = jcfg;");
+
+    // Verify the production wiring as well as the helpers: stream copy must
+    // be gated before concatCopy, and subprocess tags must precede the output.
+    QFile queueSource("src/RenderQueue.cpp");
+    gui &= queueSource.open(QIODevice::ReadOnly);
+    const QByteArray queueCode = queueSource.readAll();
+    const qsizetype guardStart = queueCode.indexOf("const bool hasExportMetadata = renderqueue_metadata::hasMetadata(cfg);");
+    const qsizetype copyStart = queueCode.indexOf("libavcore::concatCopy", guardStart);
+    gui &= guardStart >= 0 && copyStart > guardStart
+        && queueCode.mid(guardStart, copyStart - guardStart).contains("&& !hasExportMetadata");
+    gui &= queueCode.contains(
+        "renderqueue_metadata::appendSubprocessArgs(args, cfg, jobCopy.outputPath);\n"
+        "    args << QStringLiteral(\"-progress\") << QStringLiteral(\"pipe:2\");\n"
+        "    args << jobCopy.outputPath;");
+    const QStringList prefix{QStringLiteral("-c:v"), QStringLiteral("libx265")};
+    QJsonObject metadata;
+    config.appendMetadataSettings(metadata);
+    QStringList expected = prefix;
+    for (const char *key : {"title", "author", "copyright", "comment"}) {
+        const QString name = QString::fromLatin1(key);
+        expected << QStringLiteral("-metadata") << (name + "=" + tags.value(name));
+    }
+    for (const QString &ext : {QStringLiteral("mp4"), QStringLiteral("MOV"), QStringLiteral("mkv")}) {
+        QStringList args = prefix;
+        renderqueue_metadata::appendSubprocessArgs(args, metadata, "tagged." + ext);
+        QStringList wanted = expected;
+        if (ext != "mkv") wanted << "-movflags" << "use_metadata_tags";
+        gui &= args == wanted && renderqueue_metadata::hasMetadata(metadata);
+    }
+    // Any one nonempty field blocks stream copy; omitted/empty fields must
+    // not generate empty tag arguments. Preserve whitespace and '=' verbatim.
+    for (auto it = tags.constBegin(); it != tags.constEnd(); ++it) {
+        QJsonObject single;
+        for (auto emptyIt = tags.constBegin(); emptyIt != tags.constEnd(); ++emptyIt)
+            single.insert(emptyIt.key(), QString());
+        single.insert(it.key(), it.value());
+        QStringList args;
+        renderqueue_metadata::appendSubprocessArgs(args, single, "single.mkv");
+        gui &= renderqueue_metadata::hasMetadata(single)
+            && args == QStringList{QStringLiteral("-metadata"), it.key() + "=" + it.value()};
+    }
     gate(1, gui);
 
     Timeline timeline;
@@ -154,6 +203,18 @@ int runExportMetaSelftest()
     gate(2, encoded);
     QJsonObject empty;
     ExportConfig{}.appendMetadataSettings(empty);
+    for (bool explicitEmpty : {false, true}) {
+        QJsonObject emptyConfig;
+        if (explicitEmpty) {
+            for (auto it = tags.constBegin(); it != tags.constEnd(); ++it)
+                emptyConfig.insert(it.key(), QString());
+        }
+        for (const QString &ext : {QStringLiteral("mp4"), QStringLiteral("mov"), QStringLiteral("mkv")}) {
+            QStringList args = prefix;
+            renderqueue_metadata::appendSubprocessArgs(args, emptyConfig, "empty." + ext);
+            defaults &= args == prefix && !renderqueue_metadata::hasMetadata(emptyConfig);
+        }
+    }
     gate(3, defaults && empty.isEmpty());
 
     const bool hadEnv = qEnvironmentVariableIsSet("VEDITOR_EXPORT_PRESET_DIR");

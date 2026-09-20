@@ -45,6 +45,34 @@
 #include <optional>
 #include <string>
 
+// Shared by the render paths and the export-meta selftest.
+namespace renderqueue_metadata {
+bool hasMetadata(const QJsonObject &cfg)
+{
+    return !cfg.value("title").toString().isEmpty()
+        || !cfg.value("author").toString().isEmpty()
+        || !cfg.value("copyright").toString().isEmpty()
+        || !cfg.value("comment").toString().isEmpty();
+}
+
+void appendSubprocessArgs(QStringList &args, const QJsonObject &cfg,
+                          const QString &outputPath)
+{
+    if (!hasMetadata(cfg))
+        return;
+    for (const char *key : {"title", "author", "copyright", "comment"}) {
+        const QString name = QString::fromLatin1(key);
+        const QString value = cfg.value(name).toString();
+        if (!value.isEmpty())
+            args << QStringLiteral("-metadata") << (name + QLatin1Char('=') + value);
+    }
+    // Match FrameEncoder: legacy MOV/MP4 atoms discard the author tag.
+    const QString suffix = QFileInfo(outputPath).suffix().toLower();
+    if (suffix == QLatin1String("mp4") || suffix == QLatin1String("mov"))
+        args << QStringLiteral("-movflags") << QStringLiteral("use_metadata_tags");
+}
+} // namespace renderqueue_metadata
+
 namespace {
 QString makeUuid() {
     return QUuid::createUuid().toString(QUuid::WithoutBraces);
@@ -1272,11 +1300,13 @@ void RenderQueue::startRenderPipe(int jobIndex)
     const bool blockSmartRenderForSequences =
         timelineHasSequenceRenderModel(tl);
     const bool blockSmartRenderForLighting = timelineHasProjectLighting(tl);
+    const bool hasExportMetadata = renderqueue_metadata::hasMetadata(cfg);
     if (smartrender::enabledFromEnv()
         && !cfg.value("keepAlpha").toBool(false)
         && !applyLoudnessFilter
         && !timecodeRenderer.has_value()
         && !blockSmartRenderForSequences
+        && !hasExportMetadata
         && !blockSmartRenderForLighting) {
         if (m_cancelRequested) {
             delete owned;
@@ -1334,6 +1364,10 @@ void RenderQueue::startRenderPipe(int jobIndex)
                 << "[smart-render] whole timeline not stream-copy eligible:"
                 << passThrough.reason;
         }
+    } else if (smartrender::enabledFromEnv() && hasExportMetadata) {
+        qInfo().noquote()
+            << "[smart-render] whole timeline not stream-copy eligible:"
+            << "export metadata requires encoding";
     } else if (smartrender::enabledFromEnv()
                && !applyLoudnessFilter
                && (blockSmartRenderForSequences || blockSmartRenderForLighting)) {
@@ -1854,6 +1888,7 @@ void RenderQueue::startRenderPipeSubprocess(int jobIndex)
         args << QStringLiteral("-shortest");
     }
 
+    renderqueue_metadata::appendSubprocessArgs(args, cfg, jobCopy.outputPath);
     args << QStringLiteral("-progress") << QStringLiteral("pipe:2");
     args << jobCopy.outputPath;
 
