@@ -630,6 +630,7 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
         am["trackEq"] = teArr;
         am["compressor"] = compressorToJson(data.masterCompressor);
         am["autoDuck"] = autoDuckToJson(data.autoDuck);
+        // Chain owns de-esser serialization/default omission for tracks and master.
         QJsonArray fxArray;
         for (auto it = data.trackFx.cbegin(); it != data.trackFx.cend(); ++it) {
             QJsonObject chain = it.value().toJson();
@@ -960,6 +961,7 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
 
     // Audio mixer (tolerate missing keys)
     data.trackEqStates.clear();
+    // Both project readers restore de-esser settings through the shared Chain codec.
     data.trackFx.clear();
     data.masterFx = trackfx::Chain{};
     if (root.contains("audioMixer")) {
@@ -1261,6 +1263,7 @@ QString ProjectFile::toJsonString(const ProjectData &data)
         am["trackEq"] = teArr;
         am["compressor"] = compressorToJson(data.masterCompressor);
         am["autoDuck"] = autoDuckToJson(data.autoDuck);
+        // Chain owns de-esser serialization/default omission for tracks and master.
         QJsonArray fxArray;
         for (auto it = data.trackFx.cbegin(); it != data.trackFx.cend(); ++it) {
             QJsonObject chain = it.value().toJson();
@@ -1561,6 +1564,7 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
 
     // Audio mixer (tolerate missing keys)
     data.trackEqStates.clear();
+    // Both project readers restore de-esser settings through the shared Chain codec.
     data.trackFx.clear();
     data.masterFx = trackfx::Chain{};
     if (root.contains("audioMixer")) {

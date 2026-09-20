@@ -2402,9 +2402,16 @@ void AudioMixer::MasterEqFilter::setEq(const EqSettings &eq)
     m_coefs[3] = computeEqBand(eq.high, 3, kSampleRateHz);
 }
 
+void AudioMixer::MasterEqFilter::setDeEsser(const trackfx::DeEsserSettings &settings)
+{
+    m_deesserEnabled = settings.enabled;
+    m_deesser.setSettings(settings, kSampleRateHz);
+}
+
 void AudioMixer::MasterEqFilter::reset()
 {
     m_history.fill(0.0);
+    m_deesser.reset();
 }
 
 double AudioMixer::MasterEqFilter::processSample(double sample, int channel)
@@ -2425,6 +2432,17 @@ double AudioMixer::MasterEqFilter::processSample(double sample, int channel)
 
 void AudioMixer::MasterEqFilter::process(float *samples, int frames)
 {
+    if (m_deesserEnabled) {
+        for (int frame = 0; frame < frames; ++frame) {
+            const int i = frame * kChannels;
+            double left = processSample(samples[i], 0) * 32768.0;
+            double right = processSample(samples[i + 1], 1) * 32768.0;
+            m_deesser.processFrame(left, right);
+            samples[i] = static_cast<float>(left / 32768.0);
+            samples[i + 1] = static_cast<float>(right / 32768.0);
+        }
+        return;
+    }
     for (int frame = 0; frame < frames; ++frame)
         for (int ch = 0; ch < kChannels; ++ch) {
             const int i = frame * kChannels + ch;
@@ -2434,6 +2452,17 @@ void AudioMixer::MasterEqFilter::process(float *samples, int frames)
 
 void AudioMixer::MasterEqFilter::process(int32_t *samples, int frames)
 {
+    if (m_deesserEnabled) {
+        for (int frame = 0; frame < frames; ++frame) {
+            const int i = frame * kChannels;
+            double left = processSample(samples[i], 0);
+            double right = processSample(samples[i + 1], 1);
+            m_deesser.processFrame(left, right);
+            samples[i] = static_cast<int32_t>(left);
+            samples[i + 1] = static_cast<int32_t>(right);
+        }
+        return;
+    }
     for (int frame = 0; frame < frames; ++frame)
         for (int ch = 0; ch < kChannels; ++ch) {
             const int i = frame * kChannels + ch;
@@ -2448,6 +2477,7 @@ void AudioMixer::clearTrackFx()
     m_trackFxProcessors.clear();
     m_masterFxChain = trackfx::Chain{};
     m_masterEqFilter.setEq(EqSettings{});
+    m_masterEqFilter.setDeEsser(trackfx::DeEsserSettings{});
     m_masterEqFilter.reset();
     m_trackEq.clear();
     m_trackEqCoefs.clear();
@@ -2497,15 +2527,25 @@ trackfx::Chain AudioMixer::masterChain() const
 void AudioMixer::setMasterEq(const EqSettings &eq, bool enabled)
 {
     QMutexLocker lock(&m_controlMutex);
-    m_masterFxChain = trackfx::Chain{}; // Only EQ is supported on this bus.
     m_masterFxChain.eq = eq;
     m_masterFxChain.eqEnabled = enabled;
-    m_masterEqFilter.setEq(eq);
+    m_masterEqFilter.setEq(enabled ? eq : EqSettings{});
+}
+
+void AudioMixer::setMasterDeEsser(const trackfx::DeEsserSettings &settings)
+{
+    trackfx::Chain chain;
+    chain.deesser = settings;
+    const auto restored = trackfx::Chain::fromJson(chain.toJson()).deesser;
+    QMutexLocker lock(&m_controlMutex);
+    m_masterFxChain.deesser = restored;
+    m_masterEqFilter.setDeEsser(restored);
 }
 
 void AudioMixer::processMasterEqLocked(int32_t *samples, int frames)
 {
-    if (m_masterEqBypassForTest || !m_masterFxChain.eqEnabled) return;
+    if (m_masterEqBypassForTest
+        || (!m_masterFxChain.eqEnabled && !m_masterFxChain.deesser.enabled)) return;
     ++m_masterEqProcessCalls;
     m_masterEqFilter.process(samples, frames);
 }

@@ -333,6 +333,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/beat_detect_selftest.cpp
     src/selftests/music_remix_selftest.cpp
     src/selftests/whisper_guide_selftest.cpp
+    src/selftests/deesser_selftest.cpp
     src/selftests/dialogue_leveler_selftest.cpp
     src/selftests/safe_zone_selftest.cpp
     src/selftests/flip_solid_selftest.cpp

@@ -206,6 +206,7 @@ public:
 
     trackfx::Chain masterChain() const;
     void setMasterEq(const EqSettings &eq, bool enabled = true);
+    void setMasterDeEsser(const trackfx::DeEsserSettings &settings);
     void setMasterEqBypassForTest(bool bypass);
     quint64 masterEqProcessCallsForTest() const;
     // Exercises the same post-sum, pre-normalizer stage as readData.
@@ -223,6 +224,7 @@ public:
     // headroom; only the final output conversion may clamp to s16.
     struct MasterEqFilter {
         void setEq(const EqSettings &eq);
+        void setDeEsser(const trackfx::DeEsserSettings &settings);
         void reset();
         void process(float *samples, int frames);
         void process(int32_t *samples, int frames);
@@ -230,6 +232,8 @@ public:
         double processSample(double sample, int channel);
         std::array<EqBandCoefsParam, 4> m_coefs{};
         std::array<double, 16> m_history{};
+        trackfx::DeEsserProcessor m_deesser;
+        bool m_deesserEnabled = false;
     };
 
     // Per-track feed-forward compressor / limiter (Audition / Resolve

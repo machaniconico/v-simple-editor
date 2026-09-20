@@ -91,6 +91,7 @@ int runCredAuditLogSelftest();
 int runCredTtlSelftest();
 int runCredentialVaultSelftest();
 int runDavinciSelftest();
+int runDeEsserSelftest();
 int runDialogueLevelerSelftest();
 int runDolbyVisionSelftest();
 int runDvTimelineSelftest();
@@ -909,6 +910,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "MCP server: JSON-RPC framing + tool registry dispatch + HTTP transport auth + write-tool validation + AI chat helpers (145 gates)" },
     { "music-remix",      nullptr,                                  runMusicRemixSelftest,        true,
       "Music Remix: beat-boundary shortening/extension, intro/outro retention, crossfade, and one-step undo" },
+    { "deesser", nullptr, runDeEsserSelftest, true,
+      "De-esser: disabled bypass, band-only attenuation, threshold, playback/export parity, persistence (5 gates)" },
     { "dialogue-leveler", nullptr,                                runDialogueLevelerSelftest,    true,
       "Dialogue Leveler: K-weighted envelope, silence gate, gain clamps, determinism, undo, and persistence" },
     { "auto-clip-gen",     "VEDITOR_AUTO_CLIP_GEN_SELFTEST",      runAutoClipGenSelftest,        true,

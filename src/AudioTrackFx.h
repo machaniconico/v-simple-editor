@@ -40,6 +40,34 @@ struct CompressorState {
     double currentGrDb = 0.0;// last gain reduction in dB (for meter)
 };
 
+struct DeEsserSettings {
+    double frequencyHz = 6000.0;
+    double thresholdDb = -24.0;
+    double ratio = 4.0;
+    double rangeDb = 12.0;
+    bool listen = false;
+    bool enabled = false;
+};
+
+// Stereo-linked band-only attenuation. Samples use the PCM16 amplitude scale,
+// but remain double so the master bus retains its above-full-scale headroom.
+class DeEsserProcessor {
+public:
+    void setSettings(const DeEsserSettings &settings, int sampleRate);
+    void processFrame(double &left, double &right);
+    void reset();
+    void setBypassForTest(bool bypass) { m_bypassForTest = bypass; }
+    uint64_t processCallsForTest() const { return m_processCalls; }
+private:
+    DeEsserSettings m_settings;
+    EqBandCoefsParam m_band;
+    std::array<double, 4> m_history{};
+    double m_env = 0.0;
+    double m_attack = 0.0, m_release = 0.0;
+    bool m_bypassForTest = false;
+    uint64_t m_processCalls = 0;
+};
+
 struct ReverbSettings {
     double mixRatio = 0.0;       // 0.0..1.0  (UI 0..100 / 100)
     double decaySeconds = 1.0;   // 0.1..5.0
@@ -72,6 +100,7 @@ struct Chain {
     EqSettings eq;
     CompressorSettings comp;
     ReverbSettings reverb;
+    DeEsserSettings deesser;
     bool nrEnabled = false;
     bool eqEnabled = false;
     bool compEnabled = false;
@@ -94,6 +123,8 @@ public:
     void process(float *interleaved, int frames);
     void reset();
     void resetFeedback(); // seek: preserve NR statistics and GR meter
+    void setDeEsserBypassForTest(bool bypass) { m_deesserBypassForTest = bypass; }
+    uint64_t deEsserProcessCallsForTest() const { return m_deesser.processCallsForTest(); }
     double currentGainReductionDb() const { return m_compState.currentGrDb; }
     double estimatedNoiseFloorDb() const { return m_nrState.estimatedFloorDb; }
 private:
@@ -121,6 +152,8 @@ private:
     std::array<EqBandCoefsParam, 4> m_coefs{};
     std::array<double, 16> m_hist{};
     CompressorState m_compState;
+    DeEsserProcessor m_deesser;
+    bool m_deesserBypassForTest = false;
     NRState m_nrState;
     ReverbState m_reverbState;
 };

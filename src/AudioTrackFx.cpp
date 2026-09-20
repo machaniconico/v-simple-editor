@@ -9,6 +9,16 @@
 
 namespace trackfx {
 namespace {
+// Shared by the existing compressor and the band-limited de-esser detector.
+void followEnvelope(double level, double &env, double attack, double release)
+{
+    if (level > env) {
+        env = level + (env - level) * attack;
+    } else {
+        env = level + (env - level) * release;
+    }
+}
+
 struct BiquadCoefs { double b0, b1, b2, a1, a2; };
 
 BiquadCoefs calcLowShelf(double freq, double gainDB, double fs) {
@@ -84,6 +94,63 @@ EqBandCoefsParam computeEqBand(const EqBand &band,
 }
 } // namespace
 
+void DeEsserProcessor::setSettings(const DeEsserSettings &settings, int sampleRate)
+{
+    const auto bounded = [](double x, double fallback, double low, double high) {
+        return std::isfinite(x) ? std::clamp(x, low, high) : fallback;
+    };
+    DeEsserSettings next = settings;
+    next.frequencyHz = bounded(next.frequencyHz, 6000.0, 1000.0, 16000.0);
+    next.thresholdDb = bounded(next.thresholdDb, -24.0, -60.0, 0.0);
+    next.ratio = bounded(next.ratio, 4.0, 1.0, 20.0);
+    next.rangeDb = bounded(next.rangeDb, 12.0, 0.0, 24.0);
+    if (next.enabled != m_settings.enabled || next.frequencyHz != m_settings.frequencyHz)
+        reset();
+    m_settings = next;
+    const double fs = std::clamp(sampleRate, 1000, 384000);
+    const double frequency = std::min(next.frequencyHz, fs * 0.45);
+    // RBJ constant-peak bandpass, Q=3. Reuse the existing peaking biquad's
+    // unity-gain denominator (A=1); numerator isolates its resonant band.
+    const auto denominator = calcPeaking(frequency, 0.0, 3.0, fs);
+    const double alpha = std::sin(2.0 * M_PI * frequency / fs) / 6.0;
+    m_band = {alpha / (1.0 + alpha), 0.0, -alpha / (1.0 + alpha),
+              denominator.a1, denominator.a2, true};
+    m_attack = std::exp(-1.0 / (5.0 * fs * 0.001));
+    m_release = std::exp(-1.0 / (100.0 * fs * 0.001));
+}
+
+void DeEsserProcessor::reset()
+{
+    m_history.fill(0.0);
+    m_env = 0.0;
+    m_processCalls = 0;
+}
+
+void DeEsserProcessor::processFrame(double &left, double &right)
+{
+    if (m_bypassForTest || !m_settings.enabled) return;
+    ++m_processCalls;
+    double band[2];
+    const double input[2] = {left, right};
+    for (int ch = 0; ch < 2; ++ch) {
+        double &z1 = m_history[ch * 2];
+        double &z2 = m_history[ch * 2 + 1];
+        band[ch] = m_band.b0 * input[ch] + z1;
+        z1 = m_band.b1 * input[ch] - m_band.a1 * band[ch] + z2;
+        z2 = m_band.b2 * input[ch] - m_band.a2 * band[ch];
+    }
+    followEnvelope(std::max(std::abs(band[0]), std::abs(band[1])),
+                   m_env, m_attack, m_release);
+    const double envDb = 20.0 * std::log10(std::max(m_env, 1e-9) / 32768.0);
+    const double reduction = std::min(m_settings.rangeDb,
+        std::max(0.0, envDb - m_settings.thresholdDb) * (1.0 - 1.0 / m_settings.ratio));
+    const double removed = 1.0 - std::pow(10.0, -reduction / 20.0);
+    // Complementary split: dry - band + attenuated band. Below threshold
+    // removed is exactly zero; all-pass residual and dry signal are untouched.
+    left = m_settings.listen ? band[0] : left - removed * band[0];
+    right = m_settings.listen ? band[1] : right - removed * band[1];
+}
+
 // Persist stage gates separately from settings.enabled, including dormant settings.
 QJsonObject Chain::toJson() const
 {
@@ -93,6 +160,14 @@ QJsonObject Chain::toJson() const
     if (eqEnabled != defaults.eqEnabled) object["eqEnabled"] = eqEnabled;
     if (compEnabled != defaults.compEnabled) object["compEnabled"] = compEnabled;
     if (reverbEnabled != defaults.reverbEnabled) object["reverbEnabled"] = reverbEnabled;
+    QJsonObject deesserObject;
+    if (deesser.frequencyHz != defaults.deesser.frequencyHz) deesserObject["frequencyHz"] = deesser.frequencyHz;
+    if (deesser.thresholdDb != defaults.deesser.thresholdDb) deesserObject["thresholdDb"] = deesser.thresholdDb;
+    if (deesser.ratio != defaults.deesser.ratio) deesserObject["ratio"] = deesser.ratio;
+    if (deesser.rangeDb != defaults.deesser.rangeDb) deesserObject["rangeDb"] = deesser.rangeDb;
+    if (deesser.listen != defaults.deesser.listen) deesserObject["listen"] = deesser.listen;
+    if (deesser.enabled != defaults.deesser.enabled) deesserObject["enabled"] = deesser.enabled;
+    if (!deesserObject.isEmpty()) object["deesser"] = deesserObject;
     QJsonObject eqObject;
     {
         QJsonObject stage;
@@ -174,6 +249,13 @@ Chain Chain::fromJson(const QJsonObject &object)
         const double result = value.toDouble(fallback);
         return std::isfinite(result) ? std::clamp(result, low, high) : fallback;
     };
+    const QJsonObject deesserObject = object["deesser"].toObject();
+    chain.deesser.frequencyHz = number(deesserObject["frequencyHz"], chain.deesser.frequencyHz, 1000.0, 16000.0);
+    chain.deesser.thresholdDb = number(deesserObject["thresholdDb"], chain.deesser.thresholdDb, -60.0, 0.0);
+    chain.deesser.ratio = number(deesserObject["ratio"], chain.deesser.ratio, 1.0, 20.0);
+    chain.deesser.rangeDb = number(deesserObject["rangeDb"], chain.deesser.rangeDb, 0.0, 24.0);
+    chain.deesser.listen = deesserObject["listen"].toBool(false);
+    chain.deesser.enabled = deesserObject["enabled"].toBool(false);
     chain.nrEnabled = object["nrEnabled"].toBool(chain.nrEnabled);
     chain.eqEnabled = object["eqEnabled"].toBool(chain.eqEnabled);
     chain.compEnabled = object["compEnabled"].toBool(chain.compEnabled);
@@ -251,6 +333,7 @@ Processor::Processor(const Chain &chain, int sampleRate, int channels)
 void Processor::setChain(const Chain &chain)
 {
     m_chain = chain;
+    m_deesser.setSettings(chain.deesser, m_sampleRate);
     m_coefs[0] = computeEqBand(chain.eq.low, 0, m_sampleRate);
     m_coefs[1] = computeEqBand(chain.eq.lowMid, 1, m_sampleRate);
     m_coefs[2] = computeEqBand(chain.eq.highMid, 2, m_sampleRate);
@@ -260,6 +343,7 @@ void Processor::setChain(const Chain &chain)
 void Processor::resetFeedback()
 {
     m_hist.fill(0.0);
+    m_deesser.reset();
     m_compState.env = 0.0;
     m_nrState.env = 0.0;
     for (int ch = 0; ch < kChannels; ++ch) {
@@ -289,7 +373,8 @@ void Processor::process(float *interleaved, int frames)
     if (!interleaved || frames <= 0 || frames > std::numeric_limits<int>::max() / 2) return;
     const bool eqActive = m_chain.eqEnabled && (m_coefs[0].active || m_coefs[1].active
         || m_coefs[2].active || m_coefs[3].active);
-    if (!eqActive
+    const bool deesserActive = m_chain.deesser.enabled && !m_deesserBypassForTest;
+    if (!eqActive && !deesserActive
         && !(m_chain.nrEnabled && m_chain.nr.enabled && m_chain.nr.reductionDb > 1e-6)
         && !(m_chain.compEnabled && m_chain.comp.enabled && m_chain.comp.ratio > 1.0001)
         && !(m_chain.reverbEnabled && m_chain.reverb.enabled && m_chain.reverb.mixRatio > 1e-6)) return;
@@ -463,6 +548,19 @@ void Processor::process(float *interleaved, int frames)
         }
     }
 
+    // NR -> EQ -> de-esser -> compressor -> reverb, shared by playback/export.
+    QVarLengthArray<int16_t, 8192> scratchDeEsser;
+    if (deesserActive) {
+        scratchDeEsser.resize(copySamples);
+        for (int i = 0; i < copySamples; i += 2) {
+            double left = src[i], right = src[i + 1];
+            m_deesser.processFrame(left, right);
+            scratchDeEsser[i] = static_cast<int16_t>(std::clamp(left, -32768.0, 32767.0));
+            scratchDeEsser[i + 1] = static_cast<int16_t>(std::clamp(right, -32768.0, 32767.0));
+        }
+        src = scratchDeEsser.constData();
+    }
+
     // Per-track feed-forward compressor / limiter (Audition / Resolve
     // Fairlight parity). Runs AFTER the 4-band EQ stage and BEFORE the
     // 3-band / preamp / gain stages so per-track meters and the master
@@ -495,11 +593,7 @@ void Processor::process(float *interleaved, int frames)
             const double xR = static_cast<double>(src[i + 1]);
             const double level = std::max(std::abs(xL), std::abs(xR));
             // Envelope follower: attack on rising, release on falling.
-            if (level > env) {
-                env = level + (env - level) * atkCoef;
-            } else {
-                env = level + (env - level) * relCoef;
-            }
+            followEnvelope(level, env, atkCoef, relCoef);
 
             // Static gain curve in dB. Reference 0 dBFS at 32768.
             const double envDb = 20.0 * std::log10(std::max(env, 1e-9) / 32768.0);
