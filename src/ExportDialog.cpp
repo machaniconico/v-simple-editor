@@ -37,6 +37,12 @@ int defaultCrfFor(const QString &codec)
 }
 }
 
+void ExportConfig::appendLoudnessSettings(QJsonObject &json) const
+{
+    json["autoLoudness"] = autoLoudness;
+    json["targetLufs"] = targetLufs;
+}
+
 void ExportConfig::appendSubtitleSettings(QJsonObject &json) const
 {
     json["subtitleMode"] = static_cast<int>(subtitleMode);
@@ -262,6 +268,33 @@ void ExportDialog::setupUI()
     m_audioBitrateSpin->setValue(192);
     m_audioBitrateSpin->setSuffix(" kbps");
     codecForm->addRow("Audio Bitrate:", m_audioBitrateSpin);
+    m_autoLoudness = new QCheckBox(tr("ラウドネスを自動で合わせる"), this);
+    m_autoLoudness->setObjectName("autoLoudness");
+    codecForm->addRow(m_autoLoudness);
+    m_loudnessPreset = new QComboBox(this);
+    m_loudnessPreset->addItems({tr("配信 -14 LUFS"), tr("放送 -23 LUFS"), tr("自由入力")});
+    m_targetLufs = new QDoubleSpinBox(this);
+    m_targetLufs->setObjectName("targetLufs");
+    m_targetLufs->setRange(-70.0, -1.0);
+    m_targetLufs->setDecimals(1);
+    m_targetLufs->setValue(-14.0);
+    m_targetLufs->setSuffix(" LUFS");
+    m_loudnessPreset->setEnabled(false);
+    m_targetLufs->setEnabled(false);
+    codecForm->addRow(tr("ラウドネスのプリセット:"), m_loudnessPreset);
+    codecForm->addRow(tr("目標ラウドネス:"), m_targetLufs);
+    connect(m_autoLoudness, &QCheckBox::toggled, this, [this](bool on) {
+        m_loudnessPreset->setEnabled(on);
+        m_targetLufs->setEnabled(on);
+    });
+    connect(m_loudnessPreset, &QComboBox::currentIndexChanged, this, [this](int index) {
+        if (index < 2) {
+            const QSignalBlocker blocker(m_targetLufs);
+            m_targetLufs->setValue(index == 0 ? -14.0 : -23.0);
+        }
+    });
+    connect(m_targetLufs, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
+        [this](double) { m_loudnessPreset->setCurrentIndex(2); });
 
     // Hardware encoder combo
     m_hwEncoderCombo = new QComboBox(this);
@@ -799,6 +832,15 @@ void ExportDialog::applyPreset(const ExportConfig &config, bool userPreset)
     m_crfSpin->setRange(-1, config.videoCodec.contains("av1") ? 63 : 51);
     m_crfSpin->setValue(config.crf);
     m_rateControlCombo->setCurrentIndex(config.rateControl == ExportConfig::RateControl::Crf ? 1 : 0);
+    m_autoLoudness->setChecked(config.autoLoudness);
+    {
+        // Setting the value would otherwise fire valueChanged and drop the preset
+        // combo to 自由入力 even when the target matches a preset.
+        const QSignalBlocker blocker(m_targetLufs);
+        m_targetLufs->setValue(config.targetLufs);
+    }
+    m_loudnessPreset->setCurrentIndex(config.targetLufs == -14.0 ? 0
+                                      : config.targetLufs == -23.0 ? 1 : 2);
     m_audioOnlyCheckbox->setChecked(config.audioOnly);
     if (config.audioOnly) select(m_audioContainerCombo, config.container);
     m_subtitleModeCombo->setCurrentIndex(static_cast<int>(config.subtitleMode));
@@ -834,6 +876,8 @@ ExportConfig ExportDialog::currentSettings() const
     c.subtitleMode = static_cast<subtitle::ExportMode>(m_subtitleModeCombo->currentData().toInt());
     c.videoBitrate = m_videoBitrateSpin->value();
     c.audioBitrate = m_audioBitrateSpin->value();
+    c.autoLoudness = m_autoLoudness->isChecked() && !c.imageSequence;
+    c.targetLufs = m_targetLufs->value();
     c.rateControl = m_rateControlCombo->currentIndex() == 1
         ? ExportConfig::RateControl::Crf : ExportConfig::RateControl::Bitrate;
     c.crf = (user || c.rateControl == ExportConfig::RateControl::Crf) ? m_crfSpin->value() : -1;

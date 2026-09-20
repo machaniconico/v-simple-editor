@@ -132,6 +132,10 @@ public:
     static int blackCompositeCountForTest();
 
     static QStringList buildLoudnessAudioFilterArgs(double gainDb);
+    // Called before submission by MainWindow; OFF does not access the file.
+    static QString measureAutoLoudness(QJsonObject &config, const QString &mixPath);
+    static void resetAutoLoudnessMeasurementCountForTest();
+    static int autoLoudnessMeasurementCountForTest();
 
     // RenderJob::projectFilePath は音声 mux 元 (メディア or 事前ミックス) を兼ねる。
     // プロジェクト JSON (.veditor / .vsep / .json) を音声ソースとして開かないための判定。
@@ -266,3 +270,8 @@ private:
 
     double m_loudnessGainDb = 0.0;
 };
+
+// MainWindow export submission seam, shared by normal and batch/mobile export.
+namespace loudnessauto {
+QString prepareJob(RenderJob &job);
+}

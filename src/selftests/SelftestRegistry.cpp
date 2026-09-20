@@ -149,6 +149,7 @@ int runLibavcoreDecodeSelftest();
 int runLibavcoreEncodeSelftest();
 int runLiveMatteResolveSelftest();
 int runLogToRec709Selftest();
+int runLoudnessAutoSelftest();
 int runLoudnessExportWireSelftest();
 int runLoudnessPersistSelftest();
 int runLoudnessSelftest();
@@ -528,6 +529,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "RenderQueue ACES/ODT ownership decision for 8-bit vs 16-bit tonemap paths (2 gates)" },
     { "renderqueue-fps-rational", "VEDITOR_RENDERQUEUE_FPS_RATIONAL_SELFTEST", runRenderQueueFpsRationalSelftest, false,
       "RenderQueue in-process export fps rational derivation (6 gates)" },
+    { "loudness-auto", nullptr, runLoudnessAutoSelftest, true,
+      "Automatic export loudness normalization (5 gates)" },
     { "loudness-persist", nullptr, runLoudnessPersistSelftest, true,
       "Project loudness gain and playback normalizer persistence (4 gates)" },
     { "loudness-export-wire", "VEDITOR_LOUDNESS_EXPORT_WIRE_SELFTEST", runLoudnessExportWireSelftest, false,

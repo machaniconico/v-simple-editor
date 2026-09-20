@@ -4,6 +4,7 @@
 #include <QJsonObject>
 #include <QComboBox>
 #include <QSpinBox>
+#include <QDoubleSpinBox>
 #include <QLineEdit>
 #include <QProgressBar>
 #include <QPushButton>
@@ -72,6 +73,9 @@ struct ExportConfig {
     void appendSequenceSettings(QJsonObject &json) const;
     HDRSettings hdrSettings; // extended HDR metadata
     bool exportMarkedRangeOnly = false;
+    bool autoLoudness = false;
+    double targetLufs = -14.0;
+    void appendLoudnessSettings(QJsonObject &json) const;
     bool audioOnly = false;
     static QString audioCodecForContainer(const QString &container);
 
@@ -130,6 +134,9 @@ private:
     QSpinBox *m_sequenceStart = nullptr;
     QCheckBox *m_keepAlphaCheckbox = nullptr;
     QCheckBox *m_audioOnlyCheckbox = nullptr;
+    QCheckBox *m_autoLoudness = nullptr;
+    QComboBox *m_loudnessPreset = nullptr;
+    QDoubleSpinBox *m_targetLufs = nullptr;
     QComboBox *m_audioContainerCombo = nullptr;
     QComboBox *m_exportTypeCombo = nullptr;
     QComboBox *m_presetCombo;

@@ -2919,6 +2919,63 @@ QString renderinplace::prepareAudioMix(Timeline *timeline, const QString &output
     return prepareTimelineAudioMixForExport(timeline, error, outputPath, durationSeconds);
 }
 
+QString loudnessauto::prepareJob(RenderJob &job)
+{
+    if (!job.exportConfig.value("autoLoudness").toBool(false)) return {};
+    job.exportConfig.remove("loudnessAutoError");
+    QString error;
+    QString mix;
+    if (job.timeline && job.timeline->totalDuration() > 0.0
+        && !job.timeline->computeAudioPlaybackSequence().isEmpty()) {
+        // Force the existing mixer to produce PCM even for passthrough clips.
+        mix = prepareTimelineAudioMixForExport(job.timeline, &error,
+            nextExportAudioMixPath() + QStringLiteral(".wav"), job.timeline->totalDuration());
+    }
+    QString measurementPath = mix;
+    QTemporaryDir rangeTemporary;
+    if (!mix.isEmpty() && job.timeline) {
+        double start = qMax(0.0, job.startUs / 1000000.0);
+        double end = job.endUs > 0 ? job.endUs / 1000000.0 : job.timeline->totalDuration();
+        if (job.exportConfig.value("exportMarkedRangeOnly").toBool()
+            && job.timeline->hasMarkedRange()) {
+            start = qBound(0.0, job.timeline->markedIn(), job.timeline->totalDuration());
+            end = qBound(start, job.timeline->markedOut(), job.timeline->totalDuration());
+        }
+        if (start > 0.0 || end < job.timeline->totalDuration()) {
+            measurementPath = rangeTemporary.filePath(QStringLiteral("range.wav"));
+            const QStringList args{QStringLiteral("-y"), QStringLiteral("-i"), mix,
+                QStringLiteral("-ss"), ffmpegNumber(start), QStringLiteral("-t"), ffmpegNumber(end - start),
+                QStringLiteral("-vn"), QStringLiteral("-c:a"), QStringLiteral("pcm_s16le"), measurementPath};
+            if (!rangeTemporary.isValid() || !runFfmpegForAudioMix(args, &error)) measurementPath.clear();
+        }
+    }
+    QString message = RenderQueue::measureAutoLoudness(job.exportConfig, measurementPath);
+    if (!error.isEmpty()) {
+        message += QStringLiteral(" / 警告: ") + error;
+        job.exportConfig["loudnessAutoStatus"] = message;
+        qWarning().noquote() << message;
+    }
+    if (!mix.isEmpty()) {
+        // The existing queue muxes compressed audio by stream copy. Use the
+        // same AAC intermediate as the ordinary timeline mix after measuring PCM.
+        const QString muxPath = nextExportAudioMixPath();
+        const QStringList args{QStringLiteral("-y"), QStringLiteral("-i"), mix,
+            QStringLiteral("-vn"), QStringLiteral("-c:a"), QStringLiteral("aac"),
+            QStringLiteral("-b:a"), QStringLiteral("192k"), muxPath};
+        if (runFfmpegForAudioMix(args, &error)) job.projectFilePath = muxPath;
+        else {
+            message += QStringLiteral(" / 音声ミックス変換失敗: ") + error;
+            job.exportConfig["loudnessAutoStatus"] = message;
+            job.exportConfig["loudnessAutoError"] = error;
+            qWarning().noquote() << message;
+        }
+        QFile::remove(mix);
+    }
+    job.loudnessGainDb = job.exportConfig.value("loudnessGainDb").toDouble();
+    qInfo().noquote() << job.name << message;
+    return message;
+}
+
 void syncTimeRemapEntriesToTimeline(
     Timeline *timeline,
     const QHash<QString, TimeRemapClipEntry> &source)
@@ -10648,8 +10705,25 @@ bool MainWindow::exportAudioOnly(const ExportConfig &config, QString *error)
         QStringLiteral("-c:a"), codec};
     if (codec != QStringLiteral("pcm_s16le"))
         args << QStringLiteral("-b:a") << QString::number(config.audioBitrate) + QStringLiteral("k");
-    const double gain = exporter_loudnessGainDb();
-    if (gain != 0.0)
+    double gain = exporter_loudnessGainDb();
+    if (config.autoLoudness) {
+        QString measurementPath = mix;
+        if (start > 0.0) {
+            measurementPath = temporary.filePath(QStringLiteral("measure.wav"));
+            QString measureError;
+            const QStringList trimArgs{QStringLiteral("-y"), QStringLiteral("-i"), mix,
+                QStringLiteral("-ss"), ffmpegNumber(start), QStringLiteral("-t"), ffmpegNumber(end - start),
+                QStringLiteral("-vn"), QStringLiteral("-c:a"), QStringLiteral("pcm_s16le"), measurementPath};
+            if (!runFfmpegForAudioMix(trimArgs, &measureError)) measurementPath.clear();
+        }
+        QJsonObject loudnessConfig;
+        config.appendLoudnessSettings(loudnessConfig);
+        const QString message = RenderQueue::measureAutoLoudness(loudnessConfig, measurementPath);
+        statusBar()->showMessage(message, 30000);
+        gain = loudnessConfig.value("loudnessGainDb").toDouble();
+        args << RenderQueue::buildLoudnessAudioFilterArgs(gain);
+    }
+    if (!config.autoLoudness && gain != 0.0)
         args << QStringLiteral("-af") << QStringLiteral("volume=%1dB").arg(ffmpegNumber(gain));
     args << QStringLiteral("-f")
          << (config.container.toLower() == QStringLiteral("m4a") ? QStringLiteral("ipod") : config.container.toLower())
@@ -10704,7 +10778,7 @@ void MainWindow::exportVideo()
     job.name = QFileInfo(exportCfg.outputPath).fileName();
     QString audioMixError;
     const QString preparedAudioMixPath = exportCfg.imageSequence
-        ? QString() : prepareExportAudioMix(&audioMixError);
+        ? QString() : (exportCfg.autoLoudness ? QString() : prepareExportAudioMix(&audioMixError));
     if (!audioMixError.isEmpty()) {
         QMessageBox::warning(this, QStringLiteral("Export"),
                              audioMixError);
@@ -10754,6 +10828,7 @@ void MainWindow::exportVideo()
     const double loudnessGainDb = exporter_loudnessGainDb();
     job.loudnessGainDb = loudnessGainDb;
     cfg["loudnessGainDb"] = loudnessGainDb;
+    exportCfg.appendLoudnessSettings(cfg);
     const bool isHdrExport =
         exportCfg.hdr10 || exportCfg.hdrSettings.mode != QStringLiteral("sdr");
     if (isHdrExport) {
@@ -10846,6 +10921,8 @@ void MainWindow::exportVideo()
     m_renderQueue->setAcesPipeline(m_acesPipeline);
     m_renderQueue->setLoudnessGainDb(loudnessGainDb);
     statusBar()->showMessage("Exporting: " + exportCfg.outputPath);
+    const QString loudnessStatus = loudnessauto::prepareJob(job);
+    if (!loudnessStatus.isEmpty()) statusBar()->showMessage(loudnessStatus, 30000);
     m_renderQueue->addJob(job);
     m_renderQueue->start();
 }
@@ -16956,6 +17033,7 @@ void MainWindow::onMobileExport()
                     const double loudnessGainDb = exporter_loudnessGainDb();
                     job.loudnessGainDb = loudnessGainDb;
                     jcfg["loudnessGainDb"] = loudnessGainDb;
+                    cfg.appendLoudnessSettings(jcfg);
                     if (cfg.hdr10 ||
                         cfg.hdrSettings.mode != QStringLiteral("sdr")) {
                         jcfg["hdr10"]   = true;
@@ -17008,6 +17086,8 @@ void MainWindow::onMobileExport()
                     m_renderQueue->setLoudnessGainDb(loudnessGainDb);
                     statusBar()->showMessage(
                         QStringLiteral("モバイル書き出し: ") + cfg.outputPath);
+                    const QString loudnessStatus = loudnessauto::prepareJob(job);
+                    if (!loudnessStatus.isEmpty()) statusBar()->showMessage(loudnessStatus, 30000);
                     m_renderQueue->addJob(job);
                     m_renderQueue->start();
                 });

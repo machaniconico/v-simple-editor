@@ -1,3 +1,4 @@
+#include "LoudnessMaster.h"
 #include "RenderQueue.h"
 #include "SequenceExport.h"
 #include "SubtitleIO.h"
@@ -563,6 +564,45 @@ bool RenderQueue::isProjectFilePath(const QString &path)
         || suffix == QLatin1String("json");
 }
 
+namespace {
+std::atomic<int> autoLoudnessMeasurements{0};
+}
+
+void RenderQueue::resetAutoLoudnessMeasurementCountForTest()
+{
+    autoLoudnessMeasurements.store(0);
+}
+
+int RenderQueue::autoLoudnessMeasurementCountForTest()
+{
+    return autoLoudnessMeasurements.load();
+}
+
+QString RenderQueue::measureAutoLoudness(QJsonObject &config, const QString &mixPath)
+{
+    if (!config.value("autoLoudness").toBool(false)) return {};
+    double measured = std::numeric_limits<double>::quiet_NaN();
+    if (!mixPath.isEmpty()) {
+        ++autoLoudnessMeasurements;
+        measured = loudness::measureIntegratedLufs(mixPath);
+    }
+    const double target = config.value("targetLufs").toDouble(-14.0);
+    const bool skip = std::isnan(measured) || !std::isfinite(measured)
+        || measured <= -70.0 || !std::isfinite(target);
+    const double gain = skip ? 0.0 : loudness::computeGainDb(measured, target);
+    config["loudnessGainDb"] = gain;
+    config.remove("measuredLufs");
+    if (std::isfinite(measured)) config["measuredLufs"] = measured;
+    const QString message = skip
+        ? QStringLiteral("自動ラウドネス: 無音・音声なし・測定失敗のためスキップ（適用ゲイン 0 dB）")
+        : QStringLiteral("自動ラウドネス: 測定 %1 LUFS / 目標 %2 LUFS / 適用ゲイン %3 dB")
+            .arg(measured, 0, 'f', 2).arg(target, 0, 'f', 1).arg(gain, 0, 'f', 2);
+    config["loudnessAutoStatus"] = message;
+    if (skip) qWarning().noquote() << message;
+    else qInfo().noquote() << message;
+    return message;
+}
+
 QStringList RenderQueue::buildLoudnessAudioFilterArgs(double gainDb)
 {
     if (!hasLoudnessGain(gainDb))
@@ -663,10 +703,17 @@ void RenderQueue::addJob(const RenderJob &job)
     if (hadLoudnessGain || hasLoudnessGain(copy.loudnessGainDb))
         cfg[QStringLiteral("loudnessGainDb")] = copy.loudnessGainDb;
     copy.exportConfig = cfg;
+    // Keep the two rejection causes on separate channels: piggybacking the loudness
+    // failure on alphaExportError() hid the alpha message whenever both applied.
     const QString alphaError = alphaExportError(cfg);
-    if (!alphaError.isEmpty()) {
-        emit jobFailed(copy.id, alphaError);
-        emit jobCompletedUuid(copy.uuid, false, alphaError);
+    const QString loudnessError = cfg.value("loudnessAutoError").toString();
+    QString rejection = alphaError;
+    if (!loudnessError.isEmpty())
+        rejection = rejection.isEmpty() ? loudnessError
+                                        : rejection + QLatin1Char('\n') + loudnessError;
+    if (!rejection.isEmpty()) {
+        emit jobFailed(copy.id, rejection);
+        emit jobCompletedUuid(copy.uuid, false, rejection);
         return;
     }
 
@@ -1560,7 +1607,8 @@ void RenderQueue::startRenderPipe(int jobIndex)
         // posted to it), so deleteLater on the owning thread is the safe
         // disposal. We schedule that back on the queue thread at the end.
         const bool ok = [&]() -> bool {
-            libavcore::FrameEncoder encoder;
+            auto encoderOwner = std::make_unique<libavcore::FrameEncoder>();
+            libavcore::FrameEncoder &encoder = *encoderOwner;
             if (auto err = encoder.open(request)) {
                 failMsg = QStringLiteral("failed to open encoder: ")
                     + QString::fromStdString(*err);
@@ -1694,6 +1742,10 @@ void RenderQueue::startRenderPipe(int jobIndex)
             }
 
             if (encodeOk && haveAudio && hasLoudnessGain(loudnessGainDb)) {
+                // finalize() writes the trailer but keeps the output handle
+                // open. Close it before ffmpeg reads/replaces the file: Windows
+                // otherwise rejects the rename of the unnormalized export.
+                encoderOwner.reset();
                 QString loudnessError;
                 if (!runLoudnessAudioPostprocess(
                         findFFmpegBinary(),
