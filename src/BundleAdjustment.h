@@ -10,6 +10,9 @@
 
 namespace sfm {
 
+inline constexpr int kMaxBundleFrames = 30;
+inline constexpr int kMaxBundlePoints = 150;
+
 // A is n*n, row-major. On failure x is empty; inputs are not modified.
 bool solveDenseLinearSystem(QVector<double> A, QVector<double> b, int n,
                             QVector<double>& x);
@@ -25,7 +28,7 @@ struct MultiViewTracks {
 };
 
 // Detect only in frame 0. Rejected tracks never restart or gain new observations.
-MultiViewTracks trackAcrossFrames(const QVector<QImage>& frames, int maxPoints = 150);
+MultiViewTracks trackAcrossFrames(const QVector<QImage>& frames, int maxPoints = kMaxBundlePoints);
 
 // World-to-camera poses, X_camera = R * X_world + t, with frame 0 identity.
 // Monocular scale is fixed by making the first baseline one unit. Subsequent

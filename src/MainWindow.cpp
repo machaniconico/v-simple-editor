@@ -15547,6 +15547,14 @@ void MainWindow::openAIMaskDialog()
 
 void MainWindow::openPlanarTrackerDialog()
 {
+    // A hidden dialog can still own a bounded KLT job. Keep its source context
+    // intact until that job completes, even if another clip is selected.
+    if (m_planarTrackerDialog && m_planarTrackerDialog->featureTrackingRunning()) {
+        m_planarTrackerDialog->show();
+        m_planarTrackerDialog->raise();
+        m_planarTrackerDialog->activateWindow();
+        return;
+    }
     int trackIndex = -1;
     int clipIndex = -1;
     ClipInfo clip;
@@ -15562,26 +15570,40 @@ void MainWindow::openPlanarTrackerDialog()
     if (!std::isfinite(fps) || fps <= 0 || !std::isfinite(frameCount)
         || frameCount < 1 || frameCount > std::numeric_limits<int>::max())
         return;
-    QList<QImage> frames;
-    QProgressDialog progress(QStringLiteral("解析用フレームを読み込み中…"),
-                             QStringLiteral("キャンセル"), 0, int(frameCount), this);
-    progress.setWindowModality(Qt::ApplicationModal);
-    for (int i = 0; i < int(frameCount); ++i) {
-        progress.setValue(i);
-        if (progress.wasCanceled())
-            return;
-        // Canvas-space input keeps corner coordinates consistent with intrinsics,
-        // including clip speed, reverse, transforms and the project output size.
-        QImage frame = tlrender::renderFrameAt(m_timeline,
-            qRound64((startSec + double(i) / fps) * 1000000.0), canvas);
-        if (frame.isNull()) {
-            QMessageBox::warning(this, QStringLiteral("プラナートラッカー"),
-                                 QStringLiteral("解析用フレームを読み込めませんでした。"));
-            return;
+    // Keep full-resolution planar frames lazy: the independent KLT path only
+    // decodes its bounded, downscaled source-media range.
+    const auto loadPlanarFrames = [this, frameCount, startSec, fps, canvas]() -> QList<QImage> {
+        QList<QImage> frames;
+        QProgressDialog progress(QStringLiteral("解析用フレームを読み込み中…"),
+                                 QStringLiteral("キャンセル"), 0, int(frameCount), this);
+        progress.setWindowModality(Qt::ApplicationModal);
+        for (int i = 0; i < int(frameCount); ++i) {
+            progress.setValue(i);
+            if (progress.wasCanceled())
+                return QList<QImage>{};
+            // Canvas-space input keeps corner coordinates consistent with intrinsics,
+            // including clip speed, reverse, transforms and the project output size.
+            QImage frame = tlrender::renderFrameAt(m_timeline,
+                qRound64((startSec + double(i) / fps) * 1000000.0), canvas);
+            if (frame.isNull()) {
+                QMessageBox::warning(this, QStringLiteral("プラナートラッカー"),
+                                     QStringLiteral("解析用フレームを読み込めませんでした。"));
+                return QList<QImage>{};
+            }
+            frames.append(frame);
         }
-        frames.append(frame);
+        progress.setValue(int(frameCount));
+        return frames;
+    };
+    const QImage reference = tlrender::renderFrameAt(m_timeline,
+        qRound64(startSec * 1000000.0), canvas);
+    if (reference.isNull()) {
+        // Lazy frame loading moved this check ahead of the loop; keep telling the
+        // user why the dialog does not open, as the eager version did.
+        QMessageBox::warning(this, QStringLiteral("プラナートラッカー"),
+                             QStringLiteral("解析用フレームを読み込めませんでした。"));
+        return;
     }
-    progress.setValue(int(frameCount));
     if (!m_planarTrackerDialog) {
         m_planarTrackerDialog = new PlanarTrackerDialog(this);
         m_planarTrackerDialog->setObjectName(QStringLiteral("planarTrackerDialog"));
@@ -15601,8 +15623,12 @@ void MainWindow::openPlanarTrackerDialog()
     m_planarTrackerDialog->setInitialState(m_planarTrackerState);
     m_planarTrackerDialog->setCameraSolveContext(
         canvas, m_projectCamera.camera().fov, fps, startSec);
-    m_planarTrackerDialog->setReferenceFrame(frames.first());
-    m_planarTrackerDialog->setFrames(frames);
+    m_planarTrackerDialog->setReferenceFrame(reference);
+    m_planarTrackerDialog->setPlanarFrameLoader(loadPlanarFrames);
+    const double sourceFrames = std::ceil(clip.duration * fps);
+    m_planarTrackerDialog->setFeatureTrackingSource(clip.filePath, fps,
+        std::isfinite(sourceFrames) && sourceFrames > 0
+            && sourceFrames <= std::numeric_limits<int>::max() ? int(sourceFrames) : 0);
     m_planarTrackerDialog->setWindowModality(Qt::ApplicationModal);
 
     m_planarTrackerDialog->show();

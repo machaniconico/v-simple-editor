@@ -264,8 +264,12 @@ BundleResult bundleAdjust(const MultiViewTracks& tracks, QVector<camsolve::Pose>
         result.reason = QString::fromUtf8(reason);
         return result;
     };
-    if (tracks.frameCount > 30 || tracks.tracks.size() > 150 || initialPoints.size() > 150)
-        return reject("上限は30フレーム、150点です");
+    if (tracks.frameCount > kMaxBundleFrames || tracks.tracks.size() > kMaxBundlePoints
+        || initialPoints.size() > kMaxBundlePoints) {
+        result.reason = QStringLiteral("上限は%1フレーム、%2点です")
+                            .arg(kMaxBundleFrames).arg(kMaxBundlePoints);
+        return result;
+    }
     if (tracks.frameCount < 2 || tracks.tracks.isEmpty()
         || initialPoses.size() != tracks.frameCount || initialPoints.size() != tracks.tracks.size()
         || maxIters < 0) return reject("初期姿勢・点と観測のサイズが不正です");

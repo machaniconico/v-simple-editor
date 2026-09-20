@@ -1,6 +1,12 @@
 #include "PlanarTrackerDialog.h"
 
 #include "PlanarTrackerPresetRegistry.h"
+#include "FeatureTracker.h"
+#include "libavcore/FrameGrab.h"
+#include <QThread>
+#include <cmath>
+#include <memory>
+#include <utility>
 
 #include <algorithm>
 
@@ -355,6 +361,37 @@ PlanarTrackerDialog::PlanarTrackerDialog(QWidget* parent)
             this, &PlanarTrackerDialog::onCameraSolveClicked);
     rightLayout->addWidget(m_progress);
     rightLayout->addWidget(m_summaryLabel);
+    auto* featureForm = new QFormLayout;
+    auto* limits = new QLabel(tr("特徴点トラッキング (3D) — 上限 %1 フレーム / %2 点")
+        .arg(sfm::kMaxBundleFrames).arg(sfm::kMaxBundlePoints), this);
+    limits->setObjectName(QStringLiteral("featureLimits"));
+    limits->setWordWrap(true);
+    rightLayout->addWidget(limits);
+    m_featureStart = new QSpinBox(this);
+    m_featureEnd = new QSpinBox(this);
+    m_featureMaxPoints = new QSpinBox(this);
+    m_featureStart->setObjectName(QStringLiteral("featureStart"));
+    m_featureEnd->setObjectName(QStringLiteral("featureEnd"));
+    m_featureMaxPoints->setObjectName(QStringLiteral("featureMaxPoints"));
+    m_featureMaxPoints->setRange(8, sfm::kMaxBundlePoints);
+    m_featureMaxPoints->setValue(sfm::kMaxBundlePoints);
+    featureForm->addRow(tr("開始フレーム (素材・0始まり):"), m_featureStart);
+    featureForm->addRow(tr("終了フレーム (含む):"), m_featureEnd);
+    featureForm->addRow(tr("最大特徴点数:"), m_featureMaxPoints);
+    rightLayout->addLayout(featureForm);
+    m_featureButton = new QPushButton(tr("特徴点を追跡"), this);
+    m_featureButton->setObjectName(QStringLiteral("featureTrackButton"));
+    m_featureButton->setEnabled(false);
+    m_featureProgress = new QProgressBar(this);
+    m_featureProgress->setVisible(false);
+    m_featureSummary = new QLabel(this);
+    m_featureSummary->setObjectName(QStringLiteral("featureSummary"));
+    m_featureSummary->setWordWrap(true);
+    rightLayout->addWidget(m_featureButton);
+    rightLayout->addWidget(m_featureProgress);
+    rightLayout->addWidget(m_featureSummary);
+    connect(m_featureButton, &QPushButton::clicked,
+            this, &PlanarTrackerDialog::onFeatureTrackClicked);
     rightLayout->addStretch();
     rightLayout->addWidget(m_buttonBox);
 
@@ -421,6 +458,7 @@ void PlanarTrackerDialog::setReferenceFrame(const QImage& frame)
 // ---------------------------------------------------------------------------
 void PlanarTrackerDialog::setFrames(const QList<QImage>& frames)
 {
+    m_planarFrameLoader = {};
     m_result.clear();
     m_frames = frames;
     if (!frames.isEmpty() && m_reference.isNull())
@@ -787,6 +825,12 @@ void PlanarTrackerDialog::onResetCorners()
 // ---------------------------------------------------------------------------
 void PlanarTrackerDialog::onTrackClicked()
 {
+    if (m_planarFrameLoader) {
+        const auto frames = m_planarFrameLoader();
+        if (frames.isEmpty()) return;
+        setFrames(frames);
+        m_planarFrameLoader = {};
+    }
     if (m_frames.isEmpty()) {
         QMessageBox::information(this, tr("情報"),
                                  tr("フレームが投入されていません。"));
@@ -902,4 +946,131 @@ void PlanarTrackerDialog::rebuildSummary()
                              .arg(tracked)
                              .arg(avgConf, 0, 'f', 2);
     m_summaryLabel->setText(text);
+}
+
+PlanarTrackerDialog::~PlanarTrackerDialog()
+{
+    if (m_featureWorker) {
+        m_featureWorker->requestInterruption();
+        m_featureWorker->wait();
+        delete m_featureWorker;
+    }
+}
+
+void PlanarTrackerDialog::setPlanarFrameLoader(std::function<QList<QImage>()> loader)
+{
+    setFrames({});
+    m_planarFrameLoader = std::move(loader);
+}
+
+void PlanarTrackerDialog::setFeatureTrackingSource(const QString& path, double fps, int frameCount)
+{
+    if (m_featureWorker) return;
+    m_featurePath = path;
+    m_featureFps = fps;
+    m_featureFrameCount = frameCount;
+    m_featureTracks = {};
+    m_featureAnalysisSize = {};
+    m_featureSummary->clear();
+    m_featureStartFrame = 0;
+    m_featureProgress->setVisible(false);
+    m_featureStart->setToolTip(tr("素材の先頭を0として、毎秒%1フレームで解析します。タイムラインの速度変更・トリムは適用しません。")
+        .arg(fps));
+    m_featureEnd->setToolTip(m_featureStart->toolTip());
+    m_featureStart->setRange(0, std::max(0, frameCount - 1));
+    m_featureEnd->setRange(0, std::max(0, frameCount - 1));
+    m_featureStart->setValue(0);
+    m_featureEnd->setValue(std::max(0, std::min(frameCount, sfm::kMaxBundleFrames) - 1));
+    m_featureButton->setEnabled(!path.isEmpty());
+}
+
+void PlanarTrackerDialog::onFeatureTrackClicked()
+{
+    if (m_featureWorker) return;
+    m_featureTracks = {};
+    m_featureAnalysisSize = {};
+    const int first = m_featureStart->value(), last = m_featureEnd->value();
+    const int count = last - first + 1, maxPoints = m_featureMaxPoints->value();
+    QString error;
+    if (count < 2 || first < 0 || last >= m_featureFrameCount)
+        error = tr("範囲が不正です。最低2フレームを指定してください。");
+    else if (count > sfm::kMaxBundleFrames)
+        error = tr("メモリ使用量を制限するため、上限は%1フレームです。範囲を短くしてください。")
+            .arg(sfm::kMaxBundleFrames);
+    else if (maxPoints < 8)
+        error = tr("特徴点は最低8点必要です。");
+    else if (m_featurePath.isEmpty() || !std::isfinite(m_featureFps) || m_featureFps <= 0)
+        error = tr("動画素材またはフレームレートが不正です。");
+    if (!error.isEmpty()) {
+        m_featureSummary->setText(error);
+        emit featureTrackingFinished(false);
+        return;
+    }
+    m_featureStartFrame = first;
+    m_featureButton->setEnabled(false);
+    m_featureStart->setEnabled(false);
+    m_featureEnd->setEnabled(false);
+    m_featureMaxPoints->setEnabled(false);
+    m_featureProgress->setVisible(true);
+    m_featureProgress->setRange(0, count);
+    m_featureProgress->setValue(0);
+    m_featureSummary->setText(tr("解析用フレームを読み込み中…"));
+    struct Result { sfm::MultiViewTracks tracks; QSize size; QString error; int complete = 0; };
+    auto result = std::make_shared<Result>();
+    const QString path = m_featurePath;
+    const double fps = m_featureFps;
+    m_featureWorker = QThread::create([this, result, path, fps, first, count, maxPoints] {
+        QVector<QImage> frames;
+        // Bounding both dimensions also bounds extreme-aspect-ratio memory use.
+        for (int i = 0; i < count; ++i) {
+            if (QThread::currentThread()->isInterruptionRequested()) return;
+            QImage frame = libavcore::grabFrameAt(path, double(first + i) / fps, QSize(1280, 1280));
+            if (frame.isNull()) { result->error = tr("フレームを取得できませんでした。"); return; }
+            const int shorter = std::min(frame.width(), frame.height());
+            if (shorter > 720)
+                frame = frame.scaled(qRound(frame.width() * 720.0 / shorter),
+                    qRound(frame.height() * 720.0 / shorter), Qt::KeepAspectRatio, Qt::SmoothTransformation);
+            frame = frame.convertToFormat(QImage::Format_Grayscale8);
+            if (i == 0) {
+                result->size = frame.size();
+                if (feattrack::detectShiTomasi(frame, maxPoints).size() < 8) {
+                    result->error = tr("特徴点が不足しています。最低8点が必要です。"); return;
+                }
+            } else if (frame.size() != result->size) {
+                result->error = tr("フレームの解像度が途中で変化しています。"); return;
+            }
+            frames.append(frame);
+            QMetaObject::invokeMethod(this, [this, i] { m_featureProgress->setValue(i + 1); }, Qt::QueuedConnection);
+        }
+        QMetaObject::invokeMethod(this, [this] {
+            m_featureProgress->setRange(0, 0);
+            m_featureSummary->setText(tr("特徴点を追跡中…"));
+        }, Qt::QueuedConnection);
+        result->tracks = sfm::trackAcrossFrames(frames, maxPoints);
+        for (const auto& track : result->tracks.tracks)
+            if (track.observations.size() == count) ++result->complete;
+        if (result->complete < 8)
+            result->error = tr("最後まで追跡できた特徴点が不足しています。最低8点が必要です。");
+    });
+    connect(m_featureWorker, &QThread::finished, this, [this, result] {
+        m_featureWorker->deleteLater();
+        m_featureWorker = nullptr;
+        m_featureButton->setEnabled(true);
+        m_featureStart->setEnabled(true);
+        m_featureEnd->setEnabled(true);
+        m_featureMaxPoints->setEnabled(true);
+        m_featureProgress->setRange(0, 100);
+        m_featureProgress->setValue(100);
+        m_featureAnalysisSize = result->size;
+        const bool success = result->error.isEmpty() && result->tracks.frameCount >= 2;
+        if (success) {
+            m_featureTracks = result->tracks;
+            const int total = int(m_featureTracks.tracks.size());
+            m_featureSummary->setText(tr("追跡点数: %1 / %2、フレーム数: %3、脱落率: %4%")
+                .arg(result->complete).arg(total).arg(m_featureTracks.frameCount)
+                .arg(100.0 * (total - result->complete) / total, 0, 'f', 1));
+        } else m_featureSummary->setText(result->error);
+        emit featureTrackingFinished(success);
+    });
+    m_featureWorker->start();
 }
