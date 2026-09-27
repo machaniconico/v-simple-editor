@@ -98,8 +98,10 @@ void AudioMixerDock::rebuild()
         channel->setObjectName(QStringLiteral("mixerStrip%1").arg(i));
         auto *column = new QVBoxLayout(channel);
         strip.name = new QLabel(channel);
+        strip.name->setObjectName(QStringLiteral("mixerName%1").arg(i));
         strip.name->setAlignment(Qt::AlignCenter);
         strip.db = new QLabel(channel);
+        strip.db->setObjectName(QStringLiteral("mixerDb%1").arg(i));
         strip.db->setAlignment(Qt::AlignCenter);
         strip.fader = new QSlider(Qt::Vertical, channel);
         strip.fader->setObjectName(QStringLiteral("mixerFader%1").arg(i));
@@ -109,6 +111,7 @@ void AudioMixerDock::rebuild()
         strip.fader->setMinimumHeight(150);
         strip.fader->setValue(positionForGain(m_mixer->trackGain(i)));
         auto *meter = new AudioMeterWidget(channel);
+        meter->setObjectName(QStringLiteral("mixerMeter%1").arg(i));
         meter->setTrackIndex(i);
         meter->setFixedWidth(26);
         // This strip exposes only the controls supported here.

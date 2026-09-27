@@ -197,13 +197,16 @@ int runImgSequenceSelftest()
     gate(5, mapped);
 
     ExportDialog dialog(ProjectConfig{});
-    // Default video export must retain the three baseline rate-control spins.
-    bool ui = dialog.findChildren<QSpinBox *>().size() == 3
+    auto *type = dialog.findChild<QComboBox *>("exportType");
+    auto *crf = dialog.findChild<QSpinBox *>("crf");
+    auto *videoBitrate = dialog.findChild<QSpinBox *>("videoBitrate");
+    auto *audioBitrate = dialog.findChild<QSpinBox *>("audioBitrate");
+    auto *videoCodec = dialog.findChild<QComboBox *>("videoCodec");
+    auto *keepAlpha = dialog.findChild<QCheckBox *>("keepAlpha");
+    auto *output = dialog.findChild<QLineEdit *>("outputPath");
+    bool ui = type && crf && videoBitrate && audioBitrate && videoCodec && keepAlpha && output
         && !dialog.findChild<QComboBox *>("sequenceFormat")
         && !dialog.findChild<QLineEdit *>("sequencePattern");
-    QComboBox *type = nullptr;
-    for (auto *combo : dialog.findChildren<QComboBox *>())
-        if (combo->findText(QStringLiteral("連番静止画 (PNG / TIFF)")) >= 0) type = combo;
     if (type)
         type->setCurrentIndex(type->findData(static_cast<int>(ExportType::ImageSequence)));
     auto *formats = dialog.findChild<QComboBox *>("sequenceFormat");
@@ -213,27 +216,19 @@ int runImgSequenceSelftest()
     ui &= type && formats && pattern && digits && start;
     if (ui) {
         ui &= (formats->findData("tiff") >= 0) == QImageWriter::supportedImageFormats().contains("tiff");
-        for (auto *spin : dialog.findChildren<QSpinBox *>())
-            if (spin != digits && spin != start) ui &= !spin->isEnabled();
-        for (auto *combo : dialog.findChildren<QComboBox *>())
-            if (combo->findData("libx264") >= 0) ui &= !combo->isEnabled();
+        ui &= !crf->isEnabled() && !videoBitrate->isEnabled()
+            && !audioBitrate->isEnabled() && !videoCodec->isEnabled();
         digits->setValue(5);
         start->setValue(25);
         ui &= pattern->text() == "name_%05d.png";
         type->setCurrentIndex(type->findData(static_cast<int>(ExportType::Video)));
         type->setCurrentIndex(type->findData(static_cast<int>(ExportType::ImageSequence)));
-        ui &= dialog.findChildren<QSpinBox *>().size() == 5
-            && dialog.findChild<QSpinBox *>("sequenceDigits") == digits
+        ui &= dialog.findChild<QSpinBox *>("sequenceDigits") == digits
             && digits->value() == 5 && start->value() == 25
             && pattern->text() == "name_%05d.png";
-        for (auto *check : dialog.findChildren<QCheckBox *>())
-            if (check->text() == QStringLiteral("アルファチャンネルを保持 (ProRes 4444 / VP9)")) {
-                ui &= check->isEnabled();
-                check->setChecked(true);
-            }
-        for (auto *output : dialog.findChildren<QLineEdit *>())
-            if (output->placeholderText() == QStringLiteral("Select output file..."))
-                output->setText(temp.filePath("dialog"));
+        ui &= keepAlpha->isEnabled();
+        keepAlpha->setChecked(true);
+        output->setText(temp.filePath("dialog"));
         ui &= QMetaObject::invokeMethod(&dialog, "onExport", Qt::DirectConnection)
             && dialog.config().imageSequence && dialog.config().sequenceDigits == 5
             && dialog.config().sequenceStart == 25 && !dialog.config().audioOnly

@@ -222,13 +222,9 @@ int runSubMovtextSelftest()
 
     ExportDialog dialog(ProjectConfig{});
     auto *combo = dialog.findChild<QComboBox *>("exportSubtitleMode");
-    QLineEdit *outputEdit = nullptr;
-    for (auto *edit : dialog.findChildren<QLineEdit *>())
-        if (edit->placeholderText() == "Select output file...") outputEdit = edit;
+    auto *outputEdit = dialog.findChild<QLineEdit *>("outputPath");
     bool g3 = combo && combo->count() == 4 && combo->currentData().toInt() == 1;
-    QComboBox *codec = nullptr;
-    for (auto *candidate : dialog.findChildren<QComboBox *>())
-        if (candidate->findData("libvpx-vp9") >= 0 && candidate->findData("libx264") >= 0) codec = candidate;
+    auto *codec = dialog.findChild<QComboBox *>("videoCodec");
     g3 &= codec != nullptr;
     if (codec && combo) {
         codec->setCurrentIndex(codec->findData("libvpx-vp9"));

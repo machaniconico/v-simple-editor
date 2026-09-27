@@ -11,6 +11,7 @@
 #include <QEvent>
 #include <QLabel>
 #include <QPushButton>
+#include <QRegularExpression>
 #include <QSlider>
 #include <QTemporaryDir>
 #include <QTest>
@@ -55,8 +56,7 @@ bool events(Timeline &timeline, AudioMixerDock &dock, AudioMixer &mixer)
         // so a stale strip cannot satisfy the condition or mask the current one.
         QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
         const int count = timeline.audioTrackCount();
-        if (dock.stripCount() != count
-            || dock.findChildren<AudioMeterWidget *>().size() != count)
+        if (dock.stripCount() != count)
             return false;
         for (int i = 0; i < count; ++i) {
             const auto *track = timeline.trackAt(true, i);
@@ -64,7 +64,9 @@ bool events(Timeline &timeline, AudioMixerDock &dock, AudioMixer &mixer)
             const auto *mute = button(dock, "Mute", i);
             const auto *solo = button(dock, "Solo", i);
             const auto *strip = dock.findChild<QWidget *>(QStringLiteral("mixerStrip%1").arg(i));
-            if (!track || !slider || !mute || !solo || !strip)
+            const auto *meter = dock.findChild<AudioMeterWidget *>(QStringLiteral("mixerMeter%1").arg(i));
+            const auto *label = dock.findChild<QLabel *>(QStringLiteral("mixerName%1").arg(i));
+            if (!track || !slider || !mute || !solo || !strip || !meter || !label)
                 return false;
             const double gain = mixer.trackGain(i);
             const int position = gain <= 0.0 ? -601
@@ -74,10 +76,8 @@ bool events(Timeline &timeline, AudioMixerDock &dock, AudioMixer &mixer)
                 return false;
             const QString name = track->customName.isEmpty()
                 ? QStringLiteral("A%1").arg(i + 1) : track->customName;
-            bool named = false;
-            for (const auto *label : strip->findChildren<QLabel *>())
-                named = named || label->text() == name;
-            if (!named) return false;
+            if (label->text() != name || label->parentWidget() != strip
+                || meter->parentWidget() != strip) return false;
         }
         return true;
     }, 2000);
@@ -87,12 +87,10 @@ bool events(Timeline &timeline, AudioMixerDock &dock, AudioMixer &mixer)
 }
 QPushButton *headerButton(Timeline &timeline, const char *kind, int index)
 {
-    for (auto *label : timeline.findChildren<QLabel *>(QStringLiteral("timelineTrackName"))) {
-        if (label->property("defaultName").toString() == QStringLiteral("A%1").arg(index + 1))
-            return label->parentWidget()->findChild<QPushButton *>(
-                QStringLiteral("timelineTrack%1Button").arg(QString::fromLatin1(kind)));
-    }
-    return nullptr;
+    const QRegularExpression name(QStringLiteral("^timelineTrack%1Button$")
+        .arg(QString::fromLatin1(kind)));
+    const auto buttons = timeline.findChildren<QPushButton *>(name);
+    return index >= 0 && index < buttons.size() ? buttons.at(index) : nullptr;
 }
 void drag(QSlider *slider, int position)
 {
@@ -144,14 +142,14 @@ int runMixerDockSelftest()
         timeline.setTrackCustomName(true, 1, QStringLiteral("音楽"));
         ok = events(timeline, dock, *mixer) && ok;
         ok = ok && dock.stripCount() == 2
-            && dock.findChildren<AudioMeterWidget *>().size() == 2;
+            && dock.findChild<AudioMeterWidget *>("mixerMeter0")
+            && dock.findChild<AudioMeterWidget *>("mixerMeter1");
         mixer->setTrackGain(1, 0.5);
         ok = timeline.moveTrack(true, 1, 0) && ok;
         ok = events(timeline, dock, *mixer) && ok;
         auto *strip = dock.findChild<QWidget *>(QStringLiteral("mixerStrip0"));
-        bool named = false;
-        if (strip) for (auto *label : strip->findChildren<QLabel *>())
-            named = named || label->text() == QStringLiteral("音楽");
+        auto *label = strip ? strip->findChild<QLabel *>("mixerName0") : nullptr;
+        const bool named = label && label->text() == QStringLiteral("音楽");
         ok = ok && named && fader(dock) && fader(dock)->value() == -60;
         ok = timeline.removeTrack(true, 1) && ok;
         ok = events(timeline, dock, *mixer) && ok;

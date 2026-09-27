@@ -130,13 +130,16 @@ void ExportDialog::setupUI()
     auto *typeGroup = new QGroupBox("Export Type");
     auto *typeLayout = new QVBoxLayout(typeGroup);
     m_exportTypeCombo = new QComboBox(this);
+    m_exportTypeCombo->setObjectName("exportType");
     m_exportTypeCombo->addItem("動画ファイル (Video)", static_cast<int>(ExportType::Video));
     m_exportTypeCombo->addItem("Premiere Pro XML (FCP7)", static_cast<int>(ExportType::PremiereXml));
     m_exportTypeCombo->addItem(tr("連番静止画 (PNG / TIFF)"), static_cast<int>(ExportType::ImageSequence));
     typeLayout->addWidget(m_exportTypeCombo);
     m_audioOnlyCheckbox = new QCheckBox(tr("音声のみ (映像なし)"), this);
+    m_audioOnlyCheckbox->setObjectName("audioOnly");
     typeLayout->addWidget(m_audioOnlyCheckbox);
     m_audioContainerCombo = new QComboBox(this);
+    m_audioContainerCombo->setObjectName("container");
     for (const QString &container : {QString("m4a"), QString("wav"), QString("mp3")}) {
         m_audioContainerCombo->addItem(container, container);
         if (!CodecDetector::isEncoderAvailable(ExportConfig::audioCodecForContainer(container))) {
@@ -152,6 +155,7 @@ void ExportDialog::setupUI()
     auto *presetGroup = new QGroupBox("Export Preset");
     auto *presetLayout = new QVBoxLayout(presetGroup);
     m_presetCombo = new QComboBox(this);
+    m_presetCombo->setObjectName("preset");
     const auto presetList = presets();
     for (const auto &p : presetList)
         m_presetCombo->addItem(p.name);
@@ -208,6 +212,7 @@ void ExportDialog::setupUI()
     auto *codecForm = new QFormLayout(codecGroup);
 
     m_videoCodecCombo = new QComboBox(this);
+    m_videoCodecCombo->setObjectName("videoCodec");
     {
         auto videoEncoders = CodecDetector::availableVideoEncoders();
         for (const auto &enc : videoEncoders) {
@@ -225,6 +230,7 @@ void ExportDialog::setupUI()
     codecForm->addRow("Video Codec:", m_videoCodecCombo);
 
     m_audioCodecCombo = new QComboBox(this);
+    m_audioCodecCombo->setObjectName("audioCodec");
     {
         auto audioEncoders = CodecDetector::availableAudioEncoders();
         QString bestAAC = CodecDetector::bestAACEncoder();
@@ -247,16 +253,19 @@ void ExportDialog::setupUI()
     codecForm->addRow("Audio Codec:", m_audioCodecCombo);
 
     m_rateControlCombo = new QComboBox(this);
+    m_rateControlCombo->setObjectName("rateControl");
     m_rateControlCombo->addItem(tr("ビットレート"));
     m_rateControlCombo->addItem(tr("品質 (CRF)"));
     codecForm->addRow(tr("レート制御:"), m_rateControlCombo);
     m_crfSpin = new QSpinBox(this);
+    m_crfSpin->setObjectName("crf");
     m_crfSpin->setRange(kCrfMin, kCrfMax);
     m_crfSpin->setValue(defaultCrfFor(m_videoCodecCombo->currentData().toString()));
     m_crfSpin->setEnabled(false);
     codecForm->addRow(tr("品質 (CRF):"), m_crfSpin);
 
     m_videoBitrateSpin = new QSpinBox(this);
+    m_videoBitrateSpin->setObjectName("videoBitrate");
     m_videoBitrateSpin->setRange(kVideoBitrateMin, kVideoBitrateMax);
     m_videoBitrateSpin->setValue(10000);
     m_videoBitrateSpin->setSuffix(" kbps");
@@ -264,6 +273,7 @@ void ExportDialog::setupUI()
     codecForm->addRow("Video Bitrate:", m_videoBitrateSpin);
 
     m_audioBitrateSpin = new QSpinBox(this);
+    m_audioBitrateSpin->setObjectName("audioBitrate");
     m_audioBitrateSpin->setRange(kAudioBitrateMin, kAudioBitrateMax);
     m_audioBitrateSpin->setValue(192);
     m_audioBitrateSpin->setSuffix(" kbps");
@@ -272,6 +282,7 @@ void ExportDialog::setupUI()
     m_autoLoudness->setObjectName("autoLoudness");
     codecForm->addRow(m_autoLoudness);
     m_loudnessPreset = new QComboBox(this);
+    m_loudnessPreset->setObjectName("loudnessPreset");
     m_loudnessPreset->addItems({tr("配信 -14 LUFS"), tr("放送 -23 LUFS"), tr("自由入力")});
     m_targetLufs = new QDoubleSpinBox(this);
     m_targetLufs->setObjectName("targetLufs");
@@ -298,6 +309,7 @@ void ExportDialog::setupUI()
 
     // Hardware encoder combo
     m_hwEncoderCombo = new QComboBox(this);
+    m_hwEncoderCombo->setObjectName("hwEncoder");
     {
         // Get available HW encoders to determine which vendors are present
         auto hwEncoders = CodecDetector::hwAccelVideoEncoders();
@@ -370,6 +382,7 @@ void ExportDialog::setupUI()
     auto *outputGroup = new QGroupBox("Output");
     auto *outputLayout = new QHBoxLayout(outputGroup);
     m_outputEdit = new QLineEdit(this);
+    m_outputEdit->setObjectName("outputPath");
     m_outputEdit->setPlaceholderText("Select output file...");
     auto *browseBtn = new QPushButton("Browse...", this);
     outputLayout->addWidget(m_outputEdit);
@@ -388,6 +401,7 @@ void ExportDialog::setupUI()
     subtitleLayout->addRow(tr("字幕"), m_subtitleModeCombo);
     mainLayout->addLayout(subtitleLayout);
     m_keepAlphaCheckbox = new QCheckBox(tr("アルファチャンネルを保持 (ProRes 4444 / VP9)"), this);
+    m_keepAlphaCheckbox->setObjectName("keepAlpha");
     mainLayout->addWidget(m_keepAlphaCheckbox);
 
     m_markedRangeCheckbox = new QCheckBox(tr("マークした In/Out 範囲のみ書き出す"), this);

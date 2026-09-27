@@ -215,23 +215,15 @@ int runExportAlphaSelftest()
     refusal &= openError.has_value() && !encoder.isOpen()
         && QString::fromStdString(*openError) == QStringLiteral("このコーデックはアルファを保持できません");
     ExportDialog dialog(ProjectConfig{});
-    QCheckBox *checkbox = nullptr;
-    QComboBox *presets = nullptr;
-    for (auto *candidate : dialog.findChildren<QCheckBox *>())
-        if (candidate->text() == QStringLiteral("アルファチャンネルを保持 (ProRes 4444 / VP9)"))
-            checkbox = candidate;
-    for (auto *candidate : dialog.findChildren<QComboBox *>())
-        if (candidate->findText(QStringLiteral("ProRes 4444")) >= 0) presets = candidate;
+    auto *checkbox = dialog.findChild<QCheckBox *>("keepAlpha");
+    auto *presets = dialog.findChild<QComboBox *>("preset");
     refusal &= checkbox && presets;
     if (checkbox && presets) {
         refusal &= !checkbox->isChecked() && !checkbox->isEnabled();
         presets->setCurrentIndex(presets->findText(QStringLiteral("ProRes 4444")));
         refusal &= checkbox->isEnabled() && !checkbox->isChecked();
         checkbox->setChecked(true);
-        QLineEdit *output = nullptr;
-        for (auto *candidate : dialog.findChildren<QLineEdit *>())
-            if (candidate->placeholderText() == QStringLiteral("Select output file..."))
-                output = candidate;
+        auto *output = dialog.findChild<QLineEdit *>("outputPath");
         refusal &= output != nullptr;
         if (output) {
             output->setText(temp.filePath("dialog.mov"));
@@ -316,9 +308,9 @@ int runExportAlphaSelftest()
                 presets->setCurrentIndex(index);
                 vp9 &= checkbox->isEnabled() && !checkbox->isChecked();
                 checkbox->setChecked(true);
-                for (auto *output : dialog.findChildren<QLineEdit *>())
-                    if (output->placeholderText() == QStringLiteral("Select output file..."))
-                        output->setText(temp.filePath("dialog.webm"));
+                if (auto *output = dialog.findChild<QLineEdit *>("outputPath"))
+                    output->setText(temp.filePath("dialog.webm"));
+                else vp9 = false;
                 vp9 &= QMetaObject::invokeMethod(&dialog, "onExport", Qt::DirectConnection)
                     && dialog.config().keepAlpha
                     && dialog.config().videoCodec == QStringLiteral("libvpx-vp9");
