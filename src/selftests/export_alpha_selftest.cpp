@@ -5,6 +5,7 @@
 #include "../Timeline.h"
 #include "../libavcore/Encode.h"
 #include "../libavcore/FrameGrab.h"
+#include "SelftestGate.h"
 #include <QEventLoop>
 #include <QTemporaryDir>
 #include <QTimer>
@@ -143,11 +144,8 @@ bool pixelsMatch(const QImage &image, bool alpha)
 
 int runExportAlphaSelftest()
 {
-    int passed = 0, failed = 0;
-    const auto gate = [&](int n, bool ok) {
-        std::fprintf(stderr, "%s G%d\n", ok ? "PASS" : "FAIL", n);
-        ok ? ++passed : ++failed;
-    };
+    selftest::GateTally tally;
+    const auto gate = [&](int n, bool ok) { tally.gate(n, ok); };
     QTemporaryDir temp;
     Timeline timeline;
     timeline.setProjectOutputConfig(128, 64, true);
@@ -170,9 +168,12 @@ int runExportAlphaSelftest()
     libavcore::FrameEncoder::setAlphaInputEnabledForTest(false);
     const QString opaquePath = temp.filePath("opaque.mov");
     const bool opaque = ready && render(timeline, opaquePath, false, 4);
-    gate(1, !ExportConfig{}.keepAlpha && opaque
-        && libavcore::FrameEncoder::alphaFrameCountForTest() == 0
-        && RenderQueue::blackCompositeCountForTest() >= 1);
+    const bool defaultOpaque = !ExportConfig{}.keepAlpha;
+    const int opaqueAlphaFrames = libavcore::FrameEncoder::alphaFrameCountForTest();
+    const int blackComposites = RenderQueue::blackCompositeCountForTest();
+    std::fprintf(stderr, "export-alpha G1: defaultOpaque=%d rendered=%d alphaFrames=%d blackComposites=%d\n",
+        defaultOpaque, opaque, opaqueAlphaFrames, blackComposites);
+    gate(1, defaultOpaque && opaque && opaqueAlphaFrames == 0 && blackComposites >= 1);
     libavcore::FrameEncoder::setAlphaInputEnabledForTest(true);
 
     bool alpha = ready;
@@ -181,12 +182,17 @@ int runExportAlphaSelftest()
         RenderQueue::resetBlackCompositeCountForTest();
         const QString path = temp.filePath(QStringLiteral("alpha-%1.mov").arg(profile));
         const bool rendered = ready && render(timeline, path, true, profile);
-        alpha &= rendered && pixelsMatch(libavcore::grabFrameAt(path, 0.5), true)
-            && libavcore::FrameEncoder::alphaFrameCountForTest() > 0
-            && RenderQueue::blackCompositeCountForTest() == 0;
+        const bool pixels = rendered && pixelsMatch(libavcore::grabFrameAt(path, 0.5), true);
+        const int alphaFrames = libavcore::FrameEncoder::alphaFrameCountForTest();
+        const int blackFrames = RenderQueue::blackCompositeCountForTest();
+        std::fprintf(stderr, "export-alpha G2 profile=%d: rendered=%d pixels=%d alphaFrames=%d blackComposites=%d\n",
+            profile, rendered, pixels, alphaFrames, blackFrames);
+        alpha &= rendered && pixels && alphaFrames > 0 && blackFrames == 0;
     }
     gate(2, alpha);
-    gate(3, opaque && pixelsMatch(libavcore::grabFrameAt(opaquePath, 0.5), false));
+    const bool opaquePixels = opaque && pixelsMatch(libavcore::grabFrameAt(opaquePath, 0.5), false);
+    std::fprintf(stderr, "export-alpha G3: rendered=%d pixels=%d\n", opaque, opaquePixels);
+    gate(3, opaquePixels);
 
     RenderQueue rejected;
     QString error;
@@ -283,18 +289,21 @@ int runExportAlphaSelftest()
     }
     gate(4, refusal);
 
-    bool vp9 = true;
-    const bool vp9EncoderAvailable = CodecDetector::isEncoderAvailable("libvpx-vp9");
+    QString vp9Reason;
+    const bool vp9EncoderAvailable = selftest::requireEncoder("libvpx-vp9", &vp9Reason);
     const bool vp9AlphaDecoderAvailable = avcodec_find_decoder_by_name("libvpx-vp9") != nullptr;
     if (vp9EncoderAvailable && vp9AlphaDecoderAvailable) {
         const QString path = temp.filePath("alpha.webm");
         libavcore::FrameEncoder::resetAlphaFrameCountForTest();
         RenderQueue::resetBlackCompositeCountForTest();
-        vp9 = ready && render(timeline, path, true, -1, "libvpx-vp9");
+        bool vp9 = ready && render(timeline, path, true, -1, "libvpx-vp9");
         const QImage image = grabVp9AlphaFrame(path);
-        vp9 &= pixelsMatch(image, true)
-            && libavcore::FrameEncoder::alphaFrameCountForTest() > 0
-            && RenderQueue::blackCompositeCountForTest() == 0;
+        const bool vp9Pixels = pixelsMatch(image, true);
+        const int vp9AlphaFrames = libavcore::FrameEncoder::alphaFrameCountForTest();
+        const int vp9BlackFrames = RenderQueue::blackCompositeCountForTest();
+        std::fprintf(stderr, "export-alpha G5: rendered=%d pixels=%d alphaFrames=%d blackComposites=%d\n",
+            vp9, vp9Pixels, vp9AlphaFrames, vp9BlackFrames);
+        vp9 &= vp9Pixels && vp9AlphaFrames > 0 && vp9BlackFrames == 0;
         if (!image.isNull()) {
             vp9 &= image.pixelColor(96, 32).alpha() == 0
                 && image.pixelColor(32, 32).alpha() == 255;
@@ -317,12 +326,11 @@ int runExportAlphaSelftest()
                 vp9 &= !checkbox->isEnabled() && !checkbox->isChecked();
             }
         }
+        gate(5, vp9);
     } else {
-        std::fprintf(stderr, "SKIP G5: libvpx-vp9 encoder %s, alpha decoder %s\n",
-            vp9EncoderAvailable ? "available" : "unavailable",
-            vp9AlphaDecoderAvailable ? "available" : "unavailable");
+        tally.skip(5, vp9EncoderAvailable ? "libvpx-vp9 alpha decoder unavailable"
+            : qPrintable(vp9Reason));
     }
-    gate(5, vp9);
 
     bool policy = true;
     for (const QString &codec : {QStringLiteral("prores"), QStringLiteral("prores_ks"),
@@ -343,6 +351,5 @@ int runExportAlphaSelftest()
     policy &= !RenderQueue::alphaExportError(QJsonObject{{"videoCodec", "prores_ks"},
         {"proresProfile", 4.5}, {"keepAlpha", true}}).isEmpty();
     gate(6, policy);
-    std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
-    return failed;
+    return tally.finish();
 }

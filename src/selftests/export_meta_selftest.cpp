@@ -5,6 +5,7 @@
 #include "../ShapeLayer.h"
 #include "../Timeline.h"
 #include "../libavcore/Encode.h"
+#include "SelftestGate.h"
 #include <QEventLoop>
 #include <QFile>
 #include <QMap>
@@ -73,11 +74,8 @@ bool render(Timeline &timeline, const QString &path, const QString &codec, const
 
 int runExportMetaSelftest()
 {
-    int passed = 0, failed = 0;
-    const auto gate = [&](int n, bool ok) {
-        std::fprintf(stderr, "%s G%d\n", ok ? "PASS" : "FAIL", n);
-        ok ? ++passed : ++failed;
-    };
+    selftest::GateTally tally;
+    const auto gate = [&](int n, bool ok) { tally.gate(n, ok); };
     QTemporaryDir temp;
     ExportDialog dialog(ProjectConfig{});
     bool gui = temp.isValid();
@@ -171,13 +169,7 @@ int runExportMetaSelftest()
     clip.shapes = {shape};
     const bool ready = temp.isValid() && timeline.insertShapeClipAtPlayhead(clip);
     timeline.refreshPlaybackSequence();
-    bool encoded = ready, defaults = ready;
-    for (const QString &extension : {QStringLiteral("mp4"), QStringLiteral("mov"),
-            QStringLiteral("mkv"), QStringLiteral("webm")}) {
-        if (extension == "webm" && !CodecDetector::isEncoderAvailable("libvpx-vp9")) {
-            std::fprintf(stderr, "SKIP G2/G3: webm (libvpx-vp9 encoder unavailable); mkv remains required\n");
-            continue;
-        }
+    const auto checkContainer = [&](const QString &extension, bool &encoded, bool &defaults) {
         const QString codec = extension == "webm" ? "libvpx-vp9" : "mpeg4";
         const QString taggedPath = temp.filePath("tagged." + extension);
         Tags actual;
@@ -199,6 +191,12 @@ int runExportMetaSelftest()
         defaults &= baseline && empty && readTags(baselinePath, baselineTags) && readTags(emptyPath, emptyTags)
             && baselineTags == emptyTags && libavcore::FrameEncoder::metadataWriteCountForTest() == 0;
         for (auto it = tags.constBegin(); it != tags.constEnd(); ++it) defaults &= !emptyTags.contains(it.key());
+        std::fprintf(stderr, "export-meta %s: tagged=%d metadata=%d baseline=%d empty=%d defaults=%d\n",
+            qPrintable(extension), wrote, encoded, baseline, empty, defaults);
+    };
+    bool encoded = ready, defaults = ready;
+    for (const QString &extension : {QStringLiteral("mp4"), QStringLiteral("mov"), QStringLiteral("mkv")}) {
+        checkContainer(extension, encoded, defaults);
     }
     gate(2, encoded);
     QJsonObject empty;
@@ -239,6 +237,15 @@ int runExportMetaSelftest()
     if (hadEnv) qputenv("VEDITOR_EXPORT_PRESET_DIR", oldEnv);
     else qunsetenv("VEDITOR_EXPORT_PRESET_DIR");
     gate(4, presets);
-    std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
-    return failed;
+    QString webmReason;
+    if (selftest::requireEncoder("libvpx-vp9", &webmReason)) {
+        bool webmEncoded = ready, webmDefaults = ready;
+        checkContainer(QStringLiteral("webm"), webmEncoded, webmDefaults);
+        gate(5, webmEncoded);
+        gate(6, webmDefaults);
+    } else {
+        tally.skip(5, qPrintable(webmReason));
+        tally.skip(6, qPrintable(webmReason));
+    }
+    return tally.finish();
 }

@@ -134,6 +134,7 @@ int runFreezeFrameSelftest();
 int runFrameIoSelftest();
 int runRollingShutterSelftest();
 int runFxGrainEchoSelftest();
+int runGateTallySelftest();
 int runGradeKeyframeSelftest();
 int runGradeKeyframeExtSelftest();
 int runColorWarperSelftest();
@@ -610,6 +611,8 @@ void disarmWatchdog()
 // ---------------------------------------------------------------------------
 const ArgvSelftestEntry kArgvSelftests[] = {
     // QApplication-free (needsQApplication=false) -------------------------
+    { "gate-tally", nullptr, runGateTallySelftest, false,
+      "PASS / FAIL / SKIP tally and forced missing encoder (4 gates)" },
     { "proxy",             nullptr,                               runProxySelftestV2,            false,
       "ProxyManager regression gate (libavcore + QSettings struct defaults, 6 gates)" },
     { "hdr-routing",       "VEDITOR_HDR_ROUTING_SELFTEST",        runHdrRoutingSelftest,         false,
@@ -631,11 +634,11 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "img-sequence", "VEDITOR_IMG_SEQUENCE_SELFTEST", runImgSequenceSelftest, true,
       "PNG/TIFF sequence export, alpha, configuration and cancellation (6 gates)" },
     { "export-alpha", "VEDITOR_EXPORT_ALPHA_SELFTEST", runExportAlphaSelftest, true,
-      "ProRes alpha export and opaque default path (4 gates)" },
+      "ProRes/VP9 alpha export and opaque default path (6 gates)" },
     { "export-meta", "VEDITOR_EXPORT_META_SELFTEST", runExportMetaSelftest, true,
-      "Container metadata GUI wiring, encoding, defaults and presets (4 gates)" },
+      "Container metadata GUI wiring, encoding, defaults and presets (6 gates)" },
     { "export-presets", "VEDITOR_EXPORT_PRESETS_SELFTEST", runExportPresetsSelftest, true,
-      "Export user preset persistence and name resolution (4 gates)" },
+      "Export user preset persistence and name resolution (5 gates)" },
     { "export-pro",        "VEDITOR_EXPORT_PRO_SELFTEST",         runExportProSelftest,         false,
       "Export rate control options and queue persistence" },
     { "export-range",      "VEDITOR_EXPORT_RANGE_SELFTEST",       runExportRangeSelftest,       false,

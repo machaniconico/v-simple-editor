@@ -1,5 +1,6 @@
 #include "../CodecDetector.h"
 #include "../ExportUserPresets.h"
+#include "SelftestGate.h"
 #include <QDir>
 #include <QFileInfo>
 #include <QTemporaryDir>
@@ -7,11 +8,8 @@
 
 int runExportPresetsSelftest()
 {
-    int passed = 0, failed = 0;
-    auto gate = [&](int n, bool ok) {
-        std::fprintf(stderr, "%s G%d\n", ok ? "PASS" : "FAIL", n);
-        ok ? ++passed : ++failed;
-    };
+    selftest::GateTally tally;
+    const auto gate = [&](int n, bool ok) { tally.gate(n, ok); };
     const QJsonObject expected{
         {"rateControl", "crf"}, {"crf", 20}, {"videoCodec", "libx265"},
         {"audioCodec", "pcm_s16le"}, {"container", "wav"},
@@ -63,7 +61,13 @@ int runExportPresetsSelftest()
         "Discord (25MB制限)", "ニコニコ動画", "H.265 高画質", "VP9 WebM", "Custom"};
     QStringList actual;
     for (const auto &p : ExportDialog::presets()) actual.append(p.name);
+    QStringList expectedNonAv1 = names;
+    expectedNonAv1.removeAt(9);
+    QStringList actualNonAv1 = actual;
+    actualNonAv1.removeAll(names.at(9));
     bool restored = ExportUserPresets::save({name, config});
+    bool av1Selection = true;
+    bool checkedAv1 = false;
     {
         ExportDialog dialog(ProjectConfig{});
         QComboBox *presetCombo = nullptr;
@@ -96,43 +100,50 @@ int runExportPresetsSelftest()
                 // Programmatic selection also exercises the built-in reset while
                 // audio-only mode disables interactive selection. Do not uncheck it.
                 for (int index = 0; index < names.size(); ++index) {
+                    bool selectionOk = true;
                     presetCombo->setCurrentIndex(index);
                     presetCombo->setCurrentIndex(userIndex);
-                    restored &= audioOnly->isChecked() && !presetCombo->isEnabled();
+                    selectionOk &= audioOnly->isChecked() && !presetCombo->isEnabled();
                     presetCombo->setCurrentIndex(index);
-                    restored &= !audioOnly->isChecked() && presetCombo->isEnabled();
-                    restored &= QFileInfo(output->text()).suffix() != "wav";
-                    restored &= QMetaObject::invokeMethod(&dialog, "onExport", Qt::DirectConnection);
+                    selectionOk &= !audioOnly->isChecked() && presetCombo->isEnabled();
+                    selectionOk &= QFileInfo(output->text()).suffix() != "wav";
+                    selectionOk &= QMetaObject::invokeMethod(&dialog, "onExport", Qt::DirectConnection);
                     const auto selected = dialog.config();
-                    restored &= ExportUserPresets::toJson(selected).value("hdrSettings")
+                    selectionOk &= ExportUserPresets::toJson(selected).value("hdrSettings")
                         == ExportUserPresets::toJson(ExportConfig{}).value("hdrSettings");
-                    restored &= !selected.audioOnly
+                    selectionOk &= !selected.audioOnly
                         && QStringList{"mp4", "mkv", "webm", "mov"}.contains(selected.container);
                     const auto spins = dialog.findChildren<QSpinBox *>();
-                    restored &= spins.size() == 3;
+                    selectionOk &= spins.size() == 3;
                     for (auto *spin : spins) {
                         if (spin->suffix().isEmpty()) {
-                            restored &= spin->minimum() == 0
+                            selectionOk &= spin->minimum() == 0
                                 && spin->maximum() == (selected.videoCodec.contains("av1") ? 63 : 51);
                         } else if (spin->singleStep() == 500) {
-                            restored &= spin->minimum() == 500 && spin->maximum() == 100000;
+                            selectionOk &= spin->minimum() == 500 && spin->maximum() == 100000;
                         } else {
-                            restored &= spin->minimum() == 64 && spin->maximum() == 512;
+                            selectionOk &= spin->minimum() == 64 && spin->maximum() == 512;
                         }
                     }
                     if (names[index] == "ProRes 4444")
-                        restored &= selected.audioBitrate == 512 && selected.videoBitrate == 100000;
+                        selectionOk &= selected.audioBitrate == 512 && selected.videoBitrate == 100000;
+                    std::fprintf(stderr, "export-presets preset[%d]: selected=%d codec=%s container=%s audioOnly=%d spins=%lld\n",
+                        index, selectionOk, qPrintable(selected.videoCodec), qPrintable(selected.container),
+                        selected.audioOnly, static_cast<long long>(spins.size()));
+                    if (index == 9) {
+                        checkedAv1 = true;
+                        av1Selection &= selectionOk;
+                    } else {
+                        restored &= selectionOk;
+                    }
                 }
             }
         }
     }
     // Save actual bitrate-mode dialog settings, then reopen to exercise the
     // persisted unset CRF sentinel with both H.264 and AV1.
-    for (const int builtinIndex : {0, 9}) {
-        if (builtinIndex == 9 && !CodecDetector::isEncoderAvailable("libsvtav1")) {
-            std::fprintf(stderr, "SKIP G3 AV1 (libsvtav1 not registered)\n");
-            continue;
-        }
+    const auto checkCrf = [&](int builtinIndex) {
+        bool crfOk = true;
         const int defaultCrf = builtinIndex == 9 ? 30 : 23;
         const QString savedName = QStringLiteral("未設定CRF-%1").arg(builtinIndex);
         for (int phase = 0; phase < 2; ++phase) {
@@ -149,7 +160,7 @@ int runExportPresetsSelftest()
                 if (spin->suffix().isEmpty()) crf = spin;
             for (auto *edit : dialog.findChildren<QLineEdit *>())
                 if (edit->placeholderText() == QStringLiteral("Select output file...")) output = edit;
-            restored &= presetCombo && rateControl && crf && output;
+            crfOk &= presetCombo && rateControl && crf && output;
             if (!presetCombo || !rateControl || !crf || !output) continue;
             output->setText(temp.filePath("crf-export.mp4"));
             presetCombo->setCurrentIndex(builtinIndex);
@@ -159,30 +170,35 @@ int runExportPresetsSelftest()
                 crf->setValue(27);
                 presetCombo->setCurrentIndex(names.size() - 1); // Custom retains codec.
                 presetCombo->setCurrentIndex(builtinIndex);
-                restored &= crf->value() == 27;
+                crfOk &= crf->value() == 27;
                 rateControl->setCurrentIndex(0);
-                restored &= QMetaObject::invokeMethod(&dialog, "onExport", Qt::DirectConnection);
+                crfOk &= QMetaObject::invokeMethod(&dialog, "onExport", Qt::DirectConnection);
                 const auto bitrateConfig = dialog.config();
-                restored &= bitrateConfig.rateControl == ExportConfig::RateControl::Bitrate
+                crfOk &= bitrateConfig.rateControl == ExportConfig::RateControl::Bitrate
                     && bitrateConfig.crf == -1;
-                restored &= ExportUserPresets::save({savedName, bitrateConfig});
+                crfOk &= ExportUserPresets::save({savedName, bitrateConfig});
             } else {
                 const int userIndex = presetCombo->findData(savedName);
-                restored &= userIndex >= 0;
+                crfOk &= userIndex >= 0;
                 if (userIndex < 0) continue;
                 presetCombo->setCurrentIndex(userIndex);
-                restored &= crf->value() == -1;
+                crfOk &= crf->value() == -1;
                 presetCombo->setCurrentIndex(builtinIndex);
-                restored &= crf->minimum() == 0 && crf->value() == defaultCrf
+                crfOk &= crf->minimum() == 0 && crf->value() == defaultCrf
                     && crf->maximum() == (builtinIndex == 9 ? 63 : 51);
                 rateControl->setCurrentIndex(1);
-                restored &= QMetaObject::invokeMethod(&dialog, "onExport", Qt::DirectConnection);
-                restored &= dialog.config().rateControl == ExportConfig::RateControl::Crf
+                crfOk &= QMetaObject::invokeMethod(&dialog, "onExport", Qt::DirectConnection);
+                crfOk &= dialog.config().rateControl == ExportConfig::RateControl::Crf
                     && dialog.config().crf == defaultCrf;
             }
         }
-    }
-    gate(3, actual.size() == 20 && actual == names && restored);
+        return crfOk;
+    };
+    const bool h264Crf = checkCrf(0);
+    const bool nonAv1NamesMatch = actualNonAv1.size() == 19 && actualNonAv1 == expectedNonAv1;
+    std::fprintf(stderr, "export-presets G3: nonAv1Count=%lld namesMatch=%d dialog=%d h264Crf=%d\n",
+        static_cast<long long>(actualNonAv1.size()), nonAv1NamesMatch, restored, h264Crf);
+    gate(3, nonAv1NamesMatch && restored && h264Crf);
     ExportConfig resolved;
     QString error;
     bool priority = ExportUserPresets::save({names.first(), config})
@@ -194,8 +210,17 @@ int runExportPresetsSelftest()
         && !ExportUserPresets::resolve("missing", &resolved, &error)
         && error == QStringLiteral("プリセットが見つかりません: missing");
     gate(4, priority);
+    QString av1Reason;
+    if (selftest::requireEncoder("libsvtav1", &av1Reason)) {
+        const bool av1Crf = checkCrf(9);
+        const bool av1Listed = actual.size() == 20 && actual.at(9) == names.at(9);
+        std::fprintf(stderr, "export-presets G5: listed=%d selected=%d selection=%d av1Crf=%d\n",
+            av1Listed, checkedAv1, av1Selection, av1Crf);
+        gate(5, av1Listed && checkedAv1 && av1Selection && av1Crf);
+    } else {
+        tally.skip(5, qPrintable(av1Reason));
+    }
     if (hadEnv) qputenv("VEDITOR_EXPORT_PRESET_DIR", oldEnv);
     else qunsetenv("VEDITOR_EXPORT_PRESET_DIR");
-    std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
-    return failed;
+    return tally.finish();
 }
