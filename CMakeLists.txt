@@ -538,6 +538,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/track_ops_selftest.cpp
     src/selftests/align_distribute_selftest.cpp
     src/selftests/clip_group_selftest.cpp
+    src/selftests/linked_trim_selftest.cpp
     src/selftests/timeline_ergo_selftest.cpp
     src/selftests/timeline_skim_selftest.cpp
     src/selftests/FreezeFrameSelftest.cpp

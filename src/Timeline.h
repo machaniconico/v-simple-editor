@@ -594,6 +594,19 @@ public:
     // emit modified(); the drag owner batches a single save-undo on release.
     void applyDragMove(int clipIdx, double leadIn, double nextLeadIn);
 
+    // US-705: linked trim (TrimLeft / TrimRight on a linkGroup member).
+    // Timeline answers linkedTrimStarted synchronously with the delta range
+    // [lo, hi] (timeline seconds) every member can take; the drag then clamps
+    // to it and Timeline applies the same delta to every member.
+    void setLinkedTrimBounds(double lo, double hi);
+    // Timeline calls this from linkedTrimStarted when a member's track is
+    // locked: the press then starts no trim at all.
+    void rejectLinkedTrim();
+    // Quietly set one member's trimmed edge. Left edge: edgePoint = inPoint,
+    // gapLeadIn = this clip's leadInSec. Right edge: edgePoint = outPoint,
+    // gapLeadIn = next clip's leadInSec (-1 = no next clip). No modified().
+    void applyLinkedTrim(int clipIdx, bool leftEdge, double edgePoint, double gapLeadIn);
+
     void setTimeline(Timeline *t) { m_timeline = t; }
 
 signals:
@@ -617,6 +630,10 @@ signals:
     void linkedDragStarted(int clipIndex);
     void linkedDragDelta(int clipIndex, double deltaSec);
     void linkedDragCancelled();
+    void linkedTrimStarted(int clipIndex, bool leftEdge);
+    void linkedTrimDelta(int clipIndex, bool leftEdge, double deltaSec);
+    void linkedTrimFinished();
+    void linkedTrimCancelled();
     void crossTrackDropped(int clipIndex, int linkGroup, double dropTime);
     void effectDropped(const QString &entryId, int clipIndex);
 
@@ -662,6 +679,13 @@ private:
     double m_dragOriginalLeadInNext = -1.0;
     // Screen-X of the dragged clip's left edge at drag start, used for snap.
     int m_dragOriginalClipStartX = 0;
+    // US-705: Alt held at trim press = trim only the grabbed clip (fixed for
+    // the whole drag). m_linkedTrimActive is set by setLinkedTrimBounds.
+    bool m_trimSoloLink = false;
+    bool m_linkedTrimActive = false;
+    bool m_linkedTrimRejected = false;
+    double m_linkedTrimLo = 0.0;
+    double m_linkedTrimHi = 0.0;
     bool m_snapEnabled = true;
     int m_dropTargetIndex = -1;
 
@@ -1512,6 +1536,20 @@ private:
     };
     QVector<LinkedDragPartner> m_linkedDragPartners;
 
+    // US-705: every linkGroup member (source included) captured at the start
+    // of a TrimLeft / TrimRight drag. Timeline applies one shared delta.
+    struct LinkedTrimPartner {
+        TimelineTrack *track = nullptr;
+        int clipIdx = -1;
+        double speed = 1.0;
+        double origIn = 0.0;
+        double origOut = 0.0;
+        double origLeadIn = 0.0;
+        double origLeadInNext = -1.0; // -1 = no next clip
+    };
+    QVector<LinkedTrimPartner> m_linkedTrimPartners;
+    bool m_linkedTrimLeftEdge = false;
+
     // Single-shot debouncer for sequenceChanged + audioSequenceChanged.
     // Owned by Qt object tree; created in the ctor.
     QTimer *m_emitSequenceTimer = nullptr;
@@ -1526,6 +1564,8 @@ private:
     void applyLinkedDragDelta(double rawDeltaSec);
     void revertLinkedDragPartners();
     void clearLinkedDragState();
+    void captureLinkedTrimPartners(TimelineTrack *source, int clipIdx, bool leftEdge);
+    void applyLinkedTrimDelta(double deltaSec);
     void handleCrossTrackLinkedDrop(TimelineTrack *destTrack, int linkGroup, double dropTime);
 
     // Snap line visual feedback

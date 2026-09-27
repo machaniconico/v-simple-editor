@@ -159,6 +159,7 @@ int runLayerStyleSelftest();
 int runLayerStyleUiSelftest();
 int runLibavcoreDecodeSelftest();
 int runLibavcoreEncodeSelftest();
+int runLinkedTrimSelftest();
 int runLiveMatteResolveSelftest();
 int runLogToRec709Selftest();
 int runLoudnessAutoSelftest();
@@ -813,6 +814,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Canvas alignment, equal gaps and atomic undo (4 gates)" },
     { "clip-group", "VEDITOR_CLIP_GROUP_SELFTEST", runClipGroupSelftest, true,
       "Clip grouping, linked edits, undo and validation (5 gates)" },
+    { "linked-trim", "VEDITOR_LINKED_TRIM_SELFTEST", runLinkedTrimSelftest, true,
+      "Linked edge-drag trim across AV pairs / groups, Alt solo, clamps, locked partners and undo (9 gates)" },
     { "clip-enable", "VEDITOR_CLIP_ENABLE_SELFTEST", runClipEnableSelftest, true,
       "Clip enable: rendering, persistence, undo, audio and Null Object parenting (5 gates)" },
     { "clip-parent-parity", "VEDITOR_CLIP_PARENT_PARITY_SELFTEST", runClipParentParitySelftest, true,

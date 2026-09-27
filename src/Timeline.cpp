@@ -1925,6 +1925,35 @@ void TimelineTrack::applyDragMove(int clipIdx, double leadIn, double nextLeadIn)
     update();
 }
 
+void TimelineTrack::setLinkedTrimBounds(double lo, double hi)
+{
+    m_linkedTrimLo = lo;
+    m_linkedTrimHi = hi;
+    m_linkedTrimActive = true;
+}
+
+void TimelineTrack::rejectLinkedTrim()
+{
+    m_linkedTrimRejected = true;
+    m_linkedTrimActive = false;
+}
+
+void TimelineTrack::applyLinkedTrim(int clipIdx, bool leftEdge, double edgePoint, double gapLeadIn)
+{
+    if (clipIdx < 0 || clipIdx >= m_clips.size()) return;
+    ClipInfo &clip = m_clips[clipIdx];
+    if (leftEdge) {
+        clip.inPoint = edgePoint;
+        clip.leadInSec = qMax(0.0, gapLeadIn);
+    } else {
+        clip.outPoint = edgePoint;
+        if (gapLeadIn >= 0.0 && clipIdx + 1 < m_clips.size())
+            m_clips[clipIdx + 1].leadInSec = qMax(0.0, gapLeadIn);
+    }
+    updateMinimumWidth();
+    update();
+}
+
 void TimelineTrack::removeClipPreservingDownstream(int index, bool notify)
 {
     if (index < 0 || index >= m_clips.size()) return;
@@ -2996,6 +3025,18 @@ bool TimelineTrack::tryHitTrimEdge(QMouseEvent *ev, int clipIndex, const QRectF 
         m_dragStartX = ev->pos().x();
         m_dragOriginalValue = m_clips[clipIndex].inPoint;
         m_dragOriginalLeadIn = m_clips[clipIndex].leadInSec;
+        m_trimSoloLink = ev->modifiers().testFlag(Qt::AltModifier);
+        m_linkedTrimActive = false;
+        m_linkedTrimRejected = false;
+        if (!m_trimSoloLink && m_clips[clipIndex].linkGroup > 0)
+            emit linkedTrimStarted(clipIndex, true);
+        if (m_linkedTrimRejected) {
+            // A locked partner makes the linked trim ineligible: swallow the
+            // press without starting a trim (no edit, no undo entry).
+            m_linkedTrimRejected = false;
+            m_dragMode = DragMode::None;
+            m_dragClipIndex = -1;
+        }
         return true;
     }
     if (localX >= clipWidth - TRIM_HANDLE_WIDTH) {
@@ -3004,6 +3045,18 @@ bool TimelineTrack::tryHitTrimEdge(QMouseEvent *ev, int clipIndex, const QRectF 
         m_dragStartX = ev->pos().x();
         m_dragOriginalValue = m_clips[clipIndex].outPoint > 0
             ? m_clips[clipIndex].outPoint : m_clips[clipIndex].duration;
+        m_trimSoloLink = ev->modifiers().testFlag(Qt::AltModifier);
+        m_linkedTrimActive = false;
+        m_linkedTrimRejected = false;
+        if (!m_trimSoloLink && m_clips[clipIndex].linkGroup > 0)
+            emit linkedTrimStarted(clipIndex, false);
+        if (m_linkedTrimRejected) {
+            // A locked partner makes the linked trim ineligible: swallow the
+            // press without starting a trim (no edit, no undo entry).
+            m_linkedTrimRejected = false;
+            m_dragMode = DragMode::None;
+            m_dragClipIndex = -1;
+        }
         return true;
     }
     return false;
@@ -3227,6 +3280,10 @@ void TimelineTrack::mouseMoveEvent(QMouseEvent *event)
     }
     if (m_dragMode == DragMode::TrimLeft || m_dragMode == DragMode::TrimRight) {
         if (m_dragClipIndex < 0 || m_dragClipIndex >= m_clips.size()) {
+            if (m_linkedTrimActive) {
+                m_linkedTrimActive = false;
+                emit linkedTrimCancelled();
+            }
             m_dragMode = DragMode::None;
             m_dragClipIndex = -1;
             setCursor(Qt::ArrowCursor);
@@ -3235,6 +3292,13 @@ void TimelineTrack::mouseMoveEvent(QMouseEvent *event)
         int snappedX = snapToEdge(event->pos().x());
         int dx = snappedX - m_dragStartX;
         double deltaSec = static_cast<double>(dx) / m_pixelsPerSecond;
+        if (m_linkedTrimActive) {
+            // Linked trim: [lo, hi] already intersects every member's room,
+            // so Timeline applies this one delta to all of them unclamped.
+            const double clamped = qBound(m_linkedTrimLo, deltaSec, m_linkedTrimHi);
+            emit linkedTrimDelta(m_dragClipIndex, m_dragMode == DragMode::TrimLeft, clamped);
+            updateMinimumWidth(); update(); return;
+        }
         ClipInfo &clip = m_clips[m_dragClipIndex];
         // deltaSec is a TIMELINE delta; inPoint/outPoint live in SOURCE time.
         // For a speed-scaled clip the source moves speed× as fast as the
@@ -3377,6 +3441,10 @@ void TimelineTrack::mouseReleaseEvent(QMouseEvent *event)
         }
     }
     if (m_dragMode == DragMode::TrimLeft || m_dragMode == DragMode::TrimRight) {
+        if (m_linkedTrimActive) {
+            m_linkedTrimActive = false;
+            emit linkedTrimFinished();
+        }
         emit modified();
         emit interactionCompleted(QStringLiteral("Trim clip"));
     }
@@ -4386,6 +4454,7 @@ void Timeline::remapTrackIndices(bool audio, const QVector<int> &oldToNew)
     for (int index : oldToNew) if (index >= 0) ++count;
     tracks = QVector<TimelineTrack *>(count, nullptr);
     m_linkedDragPartners.clear();
+    m_linkedTrimPartners.clear();
     auto detach = [](QVBoxLayout *layout, QWidget *widget) {
         const int index = layout->indexOf(widget);
         if (index >= 0) delete layout->takeAt(index);
@@ -10969,6 +11038,21 @@ void Timeline::wireTrackSelection(TimelineTrack *track)
         revertLinkedDragPartners();
         clearLinkedDragState();
     });
+    connect(track, &TimelineTrack::linkedTrimStarted, this,
+        [this, track](int clipIdx, bool leftEdge) {
+            captureLinkedTrimPartners(track, clipIdx, leftEdge);
+        });
+    connect(track, &TimelineTrack::linkedTrimDelta, this,
+        [this](int, bool, double deltaSec) {
+            applyLinkedTrimDelta(deltaSec);
+        });
+    connect(track, &TimelineTrack::linkedTrimFinished, this, [this]() {
+        m_linkedTrimPartners.clear();
+    });
+    connect(track, &TimelineTrack::linkedTrimCancelled, this, [this]() {
+        applyLinkedTrimDelta(0.0);
+        m_linkedTrimPartners.clear();
+    });
     connect(track, &TimelineTrack::crossTrackDropped, this,
         [this, track](int /*insertIdx*/, int linkGroup, double dropTime) {
             handleCrossTrackLinkedDrop(track, linkGroup, dropTime);
@@ -11085,6 +11169,83 @@ void Timeline::applyLinkedDragDelta(double rawDeltaSec)
             ? p.origLeadInNext - clamped
             : -1.0;
         p.track->applyDragMove(p.clipIdx, newLeadIn, newNextLeadIn);
+    }
+}
+
+void Timeline::captureLinkedTrimPartners(TimelineTrack *source, int clipIdx, bool leftEdge)
+{
+    m_linkedTrimPartners.clear();
+    m_linkedTrimLeftEdge = leftEdge;
+    if (!source || clipIdx < 0 || clipIdx >= source->clips().size()) return;
+    const int linkGroup = source->clips()[clipIdx].linkGroup;
+    if (linkGroup <= 0) return;
+    bool lockedPartner = false;
+    auto capture = [&](TimelineTrack *t) {
+        if (!t) return;
+        const auto &clips = t->clips();
+        for (int i = 0; i < clips.size(); ++i) {
+            if (clips[i].linkGroup != linkGroup) continue;
+            if (t->isLocked()) lockedPartner = true;
+            LinkedTrimPartner p;
+            p.track = t;
+            p.clipIdx = i;
+            p.speed = qMax(0.001, clips[i].speed);
+            p.origIn = clips[i].inPoint;
+            p.origOut = clips[i].outPoint > 0 ? clips[i].outPoint : clips[i].duration;
+            p.origLeadIn = clips[i].leadInSec;
+            p.origLeadInNext = (i + 1 < clips.size()) ? clips[i + 1].leadInSec : -1.0;
+            m_linkedTrimPartners.append(p);
+        }
+    };
+    for (auto *t : m_videoTracks) capture(t);
+    for (auto *t : m_audioTracks) capture(t);
+    // Same convention as the other linked ops (duplicateSelectedClips): a
+    // locked partner makes the entire linked operation ineligible.
+    if (lockedPartner) {
+        m_linkedTrimPartners.clear();
+        source->rejectLinkedTrim();
+        return;
+    }
+    if (m_linkedTrimPartners.isEmpty()) return;
+
+    // Intersect every member's allowed TIMELINE delta. Source limits
+    // (inPoint >= 0, outPoint <= duration, 0.1 s minimum length, same as the
+    // single-clip trim branch) are converted with /speed per member; the
+    // neighbour gaps (own leadInSec / next clip's leadInSec) are already
+    // timeline seconds, so neighbours are never pushed or overlapped.
+    double lo = -1e18;
+    double hi = 1e18;
+    for (const auto &p : m_linkedTrimPartners) {
+        const ClipInfo &c = p.track->clips()[p.clipIdx];
+        if (leftEdge) {
+            lo = qMax(lo, -p.origIn / p.speed);
+            lo = qMax(lo, -p.origLeadIn);
+            hi = qMin(hi, (p.origOut - 0.1 - p.origIn) / p.speed);
+        } else {
+            hi = qMin(hi, (c.duration - p.origOut) / p.speed);
+            lo = qMax(lo, (p.origIn + 0.1 - p.origOut) / p.speed);
+            if (p.origLeadInNext >= 0.0)
+                hi = qMin(hi, p.origLeadInNext);
+        }
+    }
+    // A member already past a limit must not force movement: 0 stays legal.
+    lo = qMin(lo, 0.0);
+    hi = qMax(hi, 0.0);
+    source->setLinkedTrimBounds(lo, hi);
+}
+
+void Timeline::applyLinkedTrimDelta(double deltaSec)
+{
+    for (const auto &p : m_linkedTrimPartners) {
+        if (!p.track) continue;
+        if (m_linkedTrimLeftEdge) {
+            p.track->applyLinkedTrim(p.clipIdx, true,
+                p.origIn + deltaSec * p.speed, p.origLeadIn + deltaSec);
+        } else {
+            p.track->applyLinkedTrim(p.clipIdx, false,
+                p.origOut + deltaSec * p.speed,
+                p.origLeadInNext >= 0.0 ? p.origLeadInNext - deltaSec : -1.0);
+        }
     }
 }
 
