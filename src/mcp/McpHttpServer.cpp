@@ -5,6 +5,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QDateTime>
+#include <QDebug>
 #include <QHostAddress>
 #include <QPointer>
 #include <QSettings>
@@ -238,10 +239,12 @@ bool McpHttpServer::start(quint16 preferredPort)
     if (portOverrideOk && portOverride > 0 && portOverride <= 65535)
         preferredPort = static_cast<quint16>(portOverride);
 
+    quint32 lastTried = preferredPort;
     for (int attempt = 0; attempt < 20; ++attempt) {
         const quint32 candidate = static_cast<quint32>(preferredPort) + attempt;
         if (candidate > 65535)
             break;
+        lastTried = candidate;
         if (m_server->listen(QHostAddress::LocalHost,
                              static_cast<quint16>(candidate))) {
             m_port = m_server->serverPort();
@@ -250,6 +253,11 @@ bool McpHttpServer::start(quint16 preferredPort)
         }
     }
 
+    qWarning().noquote()
+        << QStringLiteral("MCP サーバを起動できませんでした: ポート %1-%2 (%3)")
+               .arg(preferredPort)
+               .arg(lastTried)
+               .arg(m_server->errorString());
     m_port = 0;
     m_token.clear();   // 保存済みトークン自体は QSettings に残る (次回 start で復帰)
     return false;

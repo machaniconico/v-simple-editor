@@ -5,9 +5,18 @@
 
 #include "SelftestRegistry.h"
 
+#include <chrono>
+#include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <iostream>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
 #include <QString>
 #include <QStringList>
 #include <QCoreApplication>
@@ -251,6 +260,8 @@ int runProjectDiffSelftest();
 int runVideostabDeshakeSelftest();
 int runVimeoSelftest();
 int runWarpFxSelftest();
+int runWatchdogSelftest();
+int runWatchdogProbeSelftest();
 int runWatermarkSelftest();
 int runWbEyedropperSelftest();
 int runWhisperGuideSelftest();
@@ -508,6 +519,82 @@ bool requireSelftest(bool condition, const QString &message, QString *error)
         *error = message;
     qCritical() << "selftest failed:" << message;
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// US-700: per-entry watchdog. Each arm spawns a detached std::thread holding
+// its own shared state, so disarm never has to join and a selftest that
+// calls exit() cannot trip std::thread's joinable-destructor terminate.
+// ---------------------------------------------------------------------------
+namespace {
+
+struct WatchdogState {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool cancelled = false;
+};
+
+std::mutex g_watchdogMutex;
+std::shared_ptr<WatchdogState> g_watchdogState;
+
+int watchdogTimeoutSec()
+{
+    const char* raw = std::getenv("VEDITOR_SELFTEST_TIMEOUT_SEC");
+    if (!raw || !*raw)
+        return 900;
+    char* end = nullptr;
+    const long v = std::strtol(raw, &end, 10);
+    if (end == raw || *end != '\0' || v < 0 || v > 86400 * 7)
+        return 900;
+    return static_cast<int>(v);
+}
+
+} // namespace
+
+void armWatchdog(const char* name)
+{
+    disarmWatchdog();
+    const int sec = watchdogTimeoutSec();
+    if (sec == 0) {
+        std::cerr << "[watchdog] disabled" << std::endl;
+        return;
+    }
+    const std::string entryName = name ? name : "?";
+    std::cerr << "[watchdog] armed " << sec << "s (" << entryName << ")" << std::endl;
+
+    auto state = std::make_shared<WatchdogState>();
+    {
+        std::lock_guard<std::mutex> lock(g_watchdogMutex);
+        g_watchdogState = state;
+    }
+    std::thread([state, sec, entryName]() {
+        std::unique_lock<std::mutex> lock(state->mutex);
+        const bool cancelled = state->cv.wait_for(
+            lock, std::chrono::seconds(sec), [&state]() { return state->cancelled; });
+        if (cancelled)
+            return;
+        std::fflush(stdout);
+        std::fprintf(stderr, "summary: TIMEOUT after %ds (selftest=%s)\n",
+                     sec, entryName.c_str());
+        std::fflush(stderr);
+        std::_Exit(124);
+    }).detach();
+}
+
+void disarmWatchdog()
+{
+    std::shared_ptr<WatchdogState> state;
+    {
+        std::lock_guard<std::mutex> lock(g_watchdogMutex);
+        state.swap(g_watchdogState);
+    }
+    if (!state)
+        return;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->cancelled = true;
+    }
+    state->cv.notify_all();
 }
 
 // ---------------------------------------------------------------------------
@@ -1026,6 +1113,10 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "OAuth refresh_token auto-trigger e2e (YT 5 + Vimeo 5 gates via mock server). needs QApplication." },
     { "platform-mock-e2e", "VEDITOR_PLATFORM_MOCK_SELFTEST",      runPlatformMockE2eSelftest,    true,
       "Instagram Graph API + X Media Upload を localhost mock 経由で e2e exercise (13 gates: server + 5 IG + 7 X). QApplication 必要。" },
+    { "watchdog", "VEDITOR_WATCHDOG_SELFTEST", runWatchdogSelftest, false,
+      "Selftest watchdog: timeout exit 124, armed/disabled lines, MCP port-exhaustion warning, per-entry re-arm in sweep (5 gates)" },
+    { "watchdog-probe", nullptr, runWatchdogProbeSelftest, false,
+      "内部用 (--selftest=watchdog の子プロセス。VEDITOR_WATCHDOG_PROBE_MODE=hang|slow)" },
 };
 
 const std::size_t kArgvSelftestsCount = sizeof(kArgvSelftests) / sizeof(kArgvSelftests[0]);
@@ -1086,7 +1177,10 @@ std::optional<int> dispatchPreQApplication(int argc, char* argv[])
             if (std::strcmp(req, e.name) == 0) {
                 writeLogLine("INFO",
                     QString("argv-switch: --selftest=%1").arg(QString::fromLatin1(e.name)));
-                return e.fn();
+                armWatchdog(e.name);
+                const int rc = e.fn();
+                disarmWatchdog();
+                return rc;
             }
         }
     }
@@ -1101,27 +1195,42 @@ std::optional<int> dispatchLegacyTrackmatte(const QStringList& args)
 {
     if (args.contains(QStringLiteral("--selftest-trackmatte-parity"))) {
         writeLogLine("INFO", "running --selftest-trackmatte-parity");
-        return runTrackMatteParitySelftest();
+        armWatchdog("selftest-trackmatte-parity");
+        const int rc = runTrackMatteParitySelftest();
+        disarmWatchdog();
+        return rc;
     }
 
     if (args.contains(QStringLiteral("--selftest-trackmatte-export-integration"))) {
         writeLogLine("INFO", "running --selftest-trackmatte-export-integration");
-        return runTrackMatteExportIntegrationSelftest();
+        armWatchdog("selftest-trackmatte-export-integration");
+        const int rc = runTrackMatteExportIntegrationSelftest();
+        disarmWatchdog();
+        return rc;
     }
 
     if (args.contains(QStringLiteral("--selftest-trackmatte-reindex"))) {
         writeLogLine("INFO", "running --selftest-trackmatte-reindex");
-        return runTrackMatteReindexSelftest();
+        armWatchdog("selftest-trackmatte-reindex");
+        const int rc = runTrackMatteReindexSelftest();
+        disarmWatchdog();
+        return rc;
     }
 
     if (args.contains(QStringLiteral("--selftest-trackmatte-rm6-duplicate"))) {
         writeLogLine("INFO", "running --selftest-trackmatte-rm6-duplicate");
-        return runTrackMatteRm6DuplicateSelftest();
+        armWatchdog("selftest-trackmatte-rm6-duplicate");
+        const int rc = runTrackMatteRm6DuplicateSelftest();
+        disarmWatchdog();
+        return rc;
     }
 
     if (args.contains(QStringLiteral("--selftest-trackmatte-rm5-reorder"))) {
         writeLogLine("INFO", "running --selftest-trackmatte-rm5-reorder");
-        return runTrackMatteRm5ReorderSelftest();
+        armWatchdog("selftest-trackmatte-rm5-reorder");
+        const int rc = runTrackMatteRm5ReorderSelftest();
+        disarmWatchdog();
+        return rc;
     }
 
     return std::nullopt;
@@ -1144,14 +1253,48 @@ std::optional<int> dispatchPostQApplication(const QStringList& args)
     // PRD-ARGV-EXTRAS: VEDITOR_ALL_SELFTEST=1 mirrors --selftest=all.
     if (args.contains(QStringLiteral("--selftest=all"))
         || qEnvironmentVariableIntValue("VEDITOR_ALL_SELFTEST") != 0) {
+        // US-700: VEDITOR_ALL_SELFTEST_FILTER = ordered, comma-separated list
+        // (duplicates allowed). Unset / empty keeps the full table order.
+        // A nonempty filter with an empty item (e.g. "," or "a,,b") is rejected.
+        std::vector<const ArgvSelftestEntry*> sweep;
+        const QString filterRaw = qEnvironmentVariable("VEDITOR_ALL_SELFTEST_FILTER");
+        const QStringList filter = filterRaw.isEmpty()
+            ? QStringList() : filterRaw.split(QLatin1Char(','));
+        for (const QString& raw : filter) {
+            const QString name = raw.trimmed();
+            if (name.isEmpty()) {
+                std::cerr << "empty item in VEDITOR_ALL_SELFTEST_FILTER: \""
+                          << filterRaw.toStdString() << "\"" << std::endl;
+                return 2;
+            }
+            const ArgvSelftestEntry* found = nullptr;
+            for (std::size_t j = 0; j < kArgvSelftestsCount; ++j) {
+                if (name == QString::fromLatin1(kArgvSelftests[j].name)) {
+                    found = &kArgvSelftests[j];
+                    break;
+                }
+            }
+            if (!found) {
+                std::cerr << "unknown selftest in VEDITOR_ALL_SELFTEST_FILTER: "
+                          << name.toStdString() << std::endl;
+                return 2;
+            }
+            sweep.push_back(found);
+        }
+        if (filter.isEmpty()) {
+            for (std::size_t j = 0; j < kArgvSelftestsCount; ++j)
+                sweep.push_back(&kArgvSelftests[j]);
+        }
         writeLogLine("INFO", "argv-switch: --selftest=all (full sweep)");
         int passed = 0;
         int failed = 0;
-        for (std::size_t j = 0; j < kArgvSelftestsCount; ++j) {
-            const auto& e = kArgvSelftests[j];
+        for (const ArgvSelftestEntry* entry : sweep) {
+            const auto& e = *entry;
             writeLogLine("INFO",
                 QString("[--selftest=all] running --selftest=%1").arg(QString::fromLatin1(e.name)));
+            armWatchdog(e.name);
             const int rc = e.fn();
+            disarmWatchdog();
             if (rc == 0) {
                 ++passed;
                 writeLogLine("INFO",
@@ -1175,7 +1318,10 @@ std::optional<int> dispatchPostQApplication(const QStringList& args)
         const QString sw = QStringLiteral("--selftest=%1").arg(QString::fromLatin1(e.name));
         if (args.contains(sw)) {
             writeLogLine("INFO", QString("argv-switch: %1").arg(sw));
-            return e.fn();
+            armWatchdog(e.name);
+            const int rc = e.fn();
+            disarmWatchdog();
+            return rc;
         }
     }
 
@@ -1188,7 +1334,10 @@ std::optional<int> dispatchPostQApplication(const QStringList& args)
         if (qEnvironmentVariableIntValue(e.envVar) != 0) {
             writeLogLine("INFO",
                 QString("running %1").arg(QString::fromLatin1(e.envVar)));
-            return e.fn();
+            armWatchdog(e.name);
+            const int rc = e.fn();
+            disarmWatchdog();
+            return rc;
         }
     }
 
