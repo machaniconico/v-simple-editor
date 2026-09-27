@@ -105,6 +105,10 @@ bool pasteTrackDefault(const ClipInfo &clip, const QString &property, double &va
         {QStringLiteral("grade.saturation"), clip.colorCorrection.saturation},
         {QStringLiteral("grade.exposure"), clip.colorCorrection.exposure},
         {QStringLiteral("grade.temperature"), clip.colorCorrection.temperature},
+        {QStringLiteral("grade.hue"), clip.colorCorrection.hue},
+        {QStringLiteral("grade.gamma"), clip.colorCorrection.gamma},
+        {QStringLiteral("grade.highlights"), clip.colorCorrection.highlights},
+        {QStringLiteral("grade.shadows"), clip.colorCorrection.shadows},
         {QStringLiteral("brush_progress"), 0.0}
     };
     const auto it = values.constFind(property);
@@ -1191,6 +1195,12 @@ private:
     LaneMetrics m_dragMetrics;
     bool m_dragChanged = false;
 };
+
+bool GraphEditorPanel::pasteTrackDefaultForTest(const ClipInfo &clip,
+                                                const QString &property, double &value)
+{
+    return pasteTrackDefault(clip, property, value);
+}
 
 GraphEditorPanel::GraphEditorPanel(QWidget *parent)
     : QDockWidget(QStringLiteral("Graph Editor"), parent)

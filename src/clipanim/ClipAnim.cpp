@@ -31,6 +31,10 @@ const QString kGradeContrastTrack = QStringLiteral("grade.contrast");
 const QString kGradeSaturationTrack = QStringLiteral("grade.saturation");
 const QString kGradeExposureTrack = QStringLiteral("grade.exposure");
 const QString kGradeTemperatureTrack = QStringLiteral("grade.temperature");
+const QString kGradeHueTrack = QStringLiteral("grade.hue");
+const QString kGradeGammaTrack = QStringLiteral("grade.gamma");
+const QString kGradeHighlightsTrack = QStringLiteral("grade.highlights");
+const QString kGradeShadowsTrack = QStringLiteral("grade.shadows");
 const QString kGradeLiftRTrack = QStringLiteral("grade.liftR");
 const QString kGradeLiftGTrack = QStringLiteral("grade.liftG");
 const QString kGradeLiftBTrack = QStringLiteral("grade.liftB");
@@ -759,6 +763,14 @@ ColorCorrection effectiveColorCorrectionAt(const ClipInfo& clip,
                          clipLocalSeconds, cc.exposure);
     applyGradeTrackValue(clip, kGradeTemperatureTrack,
                          clipLocalSeconds, cc.temperature);
+    applyGradeTrackValue(clip, kGradeHueTrack,
+                         clipLocalSeconds, cc.hue);
+    applyGradeTrackValue(clip, kGradeGammaTrack,
+                         clipLocalSeconds, cc.gamma);
+    applyGradeTrackValue(clip, kGradeHighlightsTrack,
+                         clipLocalSeconds, cc.highlights);
+    applyGradeTrackValue(clip, kGradeShadowsTrack,
+                         clipLocalSeconds, cc.shadows);
 
     applyGradeTrackValue(clip, kGradeLiftRTrack,
                          clipLocalSeconds, cc.liftR);

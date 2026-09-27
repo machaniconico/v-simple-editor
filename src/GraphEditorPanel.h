@@ -7,6 +7,7 @@
 #include <QVector>
 #include "Keyframe.h"
 
+struct ClipInfo;
 class GraphEditorCurveView;
 class QComboBox;
 class QLabel;
@@ -36,6 +37,9 @@ public:
     bool selectKeyframes(const QString &property, const QVector<int> &indices);
     bool copySelectedKeyframes();
     bool pasteKeyframes();
+    // Test hook: forwards to the paste-default table used by pasteKeyframes().
+    static bool pasteTrackDefaultForTest(const ClipInfo &clip, const QString &property,
+                                         double &value);
 
 public slots:
     void setSelectedClip(int trackIdx, int clipIdx);
