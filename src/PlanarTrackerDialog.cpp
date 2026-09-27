@@ -3,6 +3,8 @@
 #include "PlanarTrackerPresetRegistry.h"
 #include "FeatureTracker.h"
 #include "libavcore/FrameGrab.h"
+#include <QDebug>
+#include <QPointer>
 #include <QThread>
 #include <cmath>
 #include <memory>
@@ -325,6 +327,7 @@ PlanarTrackerDialog::PlanarTrackerDialog(QWidget* parent)
     m_progress->setVisible(false);
 
     m_summaryLabel = new QLabel(QStringLiteral("--"), this);
+    m_summaryLabel->setObjectName(QStringLiteral("planarSummary"));
     m_summaryLabel->setWordWrap(true);
 
     m_buttonBox = new QDialogButtonBox(
@@ -443,6 +446,12 @@ PlanarTrackerDialog::PlanarTrackerDialog(QWidget* parent)
     connect(m_dampingSpin, QOverload<int>::of(&QSpinBox::valueChanged),
             this, &PlanarTrackerDialog::onDampingChanged);
 
+    // The pending-load summary derives its expected frame count from the range.
+    connect(m_featureStart, QOverload<int>::of(&QSpinBox::valueChanged),
+            this, &PlanarTrackerDialog::rebuildSummary);
+    connect(m_featureEnd, QOverload<int>::of(&QSpinBox::valueChanged),
+            this, &PlanarTrackerDialog::rebuildSummary);
+
     connect(m_buttonBox, &QDialogButtonBox::accepted, this, &PlanarTrackerDialog::accept);
     connect(m_buttonBox, &QDialogButtonBox::rejected, this, &QDialog::reject);
 
@@ -459,20 +468,23 @@ PlanarTrackerDialog::PlanarTrackerDialog(QWidget* parent)
 // ---------------------------------------------------------------------------
 void PlanarTrackerDialog::setReferenceFrame(const QImage& frame)
 {
+    // A new reference means a new clip: drop the previous clip's frames too.
+    m_frames.clear();
     m_result.clear();
     m_reference = frame;
     m_cornerWidget->setReferenceImage(frame);
     onResetCorners();   // reset corners to new image bounds
+    rebuildSummary();
 }
 
 // ---------------------------------------------------------------------------
 void PlanarTrackerDialog::setFrames(const QList<QImage>& frames)
 {
     m_planarFrameLoader = {};
-    m_result.clear();
-    m_frames = frames;
     if (!frames.isEmpty() && m_reference.isNull())
         setReferenceFrame(frames.first());
+    m_result.clear();
+    m_frames = frames;
     rebuildSummary();
 }
 
@@ -951,26 +963,69 @@ void PlanarTrackerDialog::rebuildSummary()
     if (tracked > 0)
         avgConf /= tracked;
 
-    const QString text = tr("投入: %1 / 追跡済: %2 / 平均信頼度: %3")
-                             .arg(total)
-                             .arg(tracked)
-                             .arg(avgConf, 0, 'f', 2);
+    QString text;
+    if (total == 0 && m_planarFrameLoader) {
+        // Frames load lazily on 追跡; report the count the loader is expected to
+        // supply instead of 0, from the dialog's own range and source length.
+        const int expected = std::min(
+            std::max(0, m_featureEnd->value() - m_featureStart->value() + 1),
+            std::max(0, m_featureFrameCount));
+        text = tr("投入: 読み込み待ち (期待 %1 フレーム) / 追跡済: %2 / 平均信頼度: %3")
+                   .arg(expected)
+                   .arg(tracked)
+                   .arg(avgConf, 0, 'f', 2);
+    } else {
+        text = tr("投入: %1 / 追跡済: %2 / 平均信頼度: %3")
+                   .arg(total)
+                   .arg(tracked)
+                   .arg(avgConf, 0, 'f', 2);
+    }
     m_summaryLabel->setText(text);
+}
+
+std::function<QImage(const QString&, double, const QSize&)>&
+PlanarTrackerDialog::featureGrabFunctionForTest()
+{
+    static std::function<QImage(const QString&, double, const QSize&)> grab =
+        [](const QString& path, double seconds, const QSize& maxSize) {
+            return libavcore::grabFrameAt(path, seconds, maxSize);
+        };
+    return grab;
+}
+
+std::function<void()>& PlanarTrackerDialog::featureOrphanCallbackHookForTest()
+{
+    static std::function<void()> hook;
+    return hook;
 }
 
 PlanarTrackerDialog::~PlanarTrackerDialog()
 {
-    if (m_featureWorker) {
-        m_featureWorker->requestInterruption();
-        m_featureWorker->wait();
-        delete m_featureWorker;
+    if (!m_featureWorker) return;
+    QThread* worker = m_featureWorker;
+    worker->requestInterruption();
+    // Block the GUI thread for at most 5 seconds: decoding or KLT may not reach
+    // an interruption check sooner.
+    if (worker->wait(5000)) {
+        delete worker;
+        return;
     }
+    qWarning().noquote() << QStringLiteral("特徴点解析スレッドの停止を待ちきれませんでした");
+    // Detach: the worker captures only copies and reports through its own
+    // context object (see onFeatureTrackClicked), never this dialog, so it can
+    // finish on its own and then delete itself.
+    connect(worker, &QThread::finished, worker, &QObject::deleteLater);
+    if (worker->isFinished()) worker->deleteLater(); // finished before the connect
+    // The application-exit wait was registered when the worker started (see
+    // onFeatureTrackClicked); it stays connected until the worker is deleted.
 }
 
 void PlanarTrackerDialog::setPlanarFrameLoader(std::function<QList<QImage>()> loader)
 {
-    setFrames({});
+    m_frames.clear();
+    m_result.clear();
     m_planarFrameLoader = std::move(loader);
+    rebuildSummary();
 }
 
 void PlanarTrackerDialog::setFeatureTrackingSource(const QString& path, double fps, int frameCount)
@@ -999,6 +1054,9 @@ void PlanarTrackerDialog::setFeatureTrackingSource(const QString& path, double f
     m_featureStart->setValue(0);
     m_featureEnd->setValue(std::max(0, std::min(frameCount, sfm::kMaxBundleFrames) - 1));
     m_featureButton->setEnabled(!path.isEmpty());
+    // MainWindow calls this after setPlanarFrameLoader, so the pending-load
+    // summary must be rebuilt against the new frame count.
+    rebuildSummary();
 }
 
 void PlanarTrackerDialog::onFeatureTrackClicked()
@@ -1039,13 +1097,24 @@ void PlanarTrackerDialog::onFeatureTrackClicked()
     auto result = std::make_shared<Result>();
     const QString path = m_featurePath;
     const double fps = m_featureFps;
-    m_featureWorker = QThread::create([this, result, path, fps, first, count, maxPoints] {
+    const auto grab = featureGrabFunctionForTest();
+    // Queued callbacks go to a per-run context object, not to this dialog. The
+    // dialog may be destroyed while the worker still runs (see the destructor);
+    // the context lives until the worker finishes, and each callback checks the
+    // QPointer before touching the dialog.
+    QObject* ctx = new QObject;
+    m_featureWorkerContext = ctx;
+    const QPointer<PlanarTrackerDialog> dialog(this);
+    const auto orphaned = [] {
+        if (const auto& hook = featureOrphanCallbackHookForTest()) hook();
+    };
+    m_featureWorker = QThread::create([ctx, dialog, orphaned, grab, result, path, fps, first, count, maxPoints] {
         QVector<QImage> frames;
         // Bounding both dimensions also bounds extreme-aspect-ratio memory use.
         for (int i = 0; i < count; ++i) {
             if (QThread::currentThread()->isInterruptionRequested()) return;
-            QImage frame = libavcore::grabFrameAt(path, double(first + i) / fps, QSize(1280, 1280));
-            if (frame.isNull()) { result->error = tr("フレームを取得できませんでした。"); return; }
+            QImage frame = grab(path, double(first + i) / fps, QSize(1280, 1280));
+            if (frame.isNull()) { result->error = PlanarTrackerDialog::tr("フレームを取得できませんでした。"); return; }
             const int shorter = std::min(frame.width(), frame.height());
             if (shorter > 720)
                 frame = frame.scaled(qRound(frame.width() * 720.0 / shorter),
@@ -1054,27 +1123,57 @@ void PlanarTrackerDialog::onFeatureTrackClicked()
             if (i == 0) {
                 result->size = frame.size();
                 if (feattrack::detectShiTomasi(frame, maxPoints).size() < 8) {
-                    result->error = tr("特徴点が不足しています。最低8点が必要です。"); return;
+                    result->error = PlanarTrackerDialog::tr("特徴点が不足しています。最低8点が必要です。"); return;
                 }
             } else if (frame.size() != result->size) {
-                result->error = tr("フレームの解像度が途中で変化しています。"); return;
+                result->error = PlanarTrackerDialog::tr("フレームの解像度が途中で変化しています。"); return;
             }
             frames.append(frame);
-            QMetaObject::invokeMethod(this, [this, i] { m_featureProgress->setValue(i + 1); }, Qt::QueuedConnection);
+            QMetaObject::invokeMethod(ctx, [dialog, orphaned, i] {
+                if (!dialog) { orphaned(); return; }
+                dialog->m_featureProgress->setValue(i + 1);
+            }, Qt::QueuedConnection);
         }
-        QMetaObject::invokeMethod(this, [this] {
-            m_featureProgress->setRange(0, 0);
-            m_featureSummary->setText(tr("特徴点を追跡中…"));
+        QMetaObject::invokeMethod(ctx, [dialog, orphaned] {
+            if (!dialog) { orphaned(); return; }
+            dialog->m_featureProgress->setRange(0, 0);
+            dialog->m_featureSummary->setText(PlanarTrackerDialog::tr("特徴点を追跡中…"));
         }, Qt::QueuedConnection);
+        const auto interrupted = [result] {
+            if (!QThread::currentThread()->isInterruptionRequested()) return false;
+            result->tracks = {};
+            result->error = PlanarTrackerDialog::tr("解析を中断しました。");
+            return true;
+        };
+        if (interrupted()) return;
         result->tracks = sfm::trackAcrossFrames(frames, maxPoints);
+        if (interrupted()) return;
         for (const auto& track : result->tracks.tracks)
             if (track.observations.size() == count) ++result->complete;
         if (result->complete < 8)
-            result->error = tr("最後まで追跡できた特徴点が不足しています。最低8点が必要です。");
+            result->error = PlanarTrackerDialog::tr("最後まで追跡できた特徴点が不足しています。最低8点が必要です。");
     });
+    connect(m_featureWorker, &QThread::finished, ctx, &QObject::deleteLater);
+    // Application exit: registered now, while the event loop still runs, because
+    // aboutToQuit is emitted before app.exec() returns and so before MainWindow
+    // (and this dialog) is destroyed. The handler interrupts the worker and waits
+    // at most 2 seconds. It never deletes the worker: destroying a running QThread
+    // aborts with "QThread: Destroyed while thread is still running", so a worker
+    // that is still running is intentionally leaked to the process exit.
+    // The worker is the context object, so the connection is dropped when the
+    // worker is deleted (by the finished handler below, by the destructor, or by
+    // its own deleteLater after detaching); the handler never sees a dead worker.
+    if (qApp) {
+        QThread* worker = m_featureWorker;
+        connect(qApp, &QCoreApplication::aboutToQuit, worker, [worker] {
+            worker->requestInterruption();
+            worker->wait(2000);
+        });
+    }
     connect(m_featureWorker, &QThread::finished, this, [this, result] {
         m_featureWorker->deleteLater();
         m_featureWorker = nullptr;
+        m_featureWorkerContext = nullptr;
         m_featureButton->setEnabled(true);
         m_featureStart->setEnabled(true);
         m_featureEnd->setEnabled(true);

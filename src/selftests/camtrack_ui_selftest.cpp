@@ -1,20 +1,32 @@
 #include "../PlanarTrackerDialog.h"
+#include "../MainWindow.h"
+#include "../Timeline.h"
 #include "../libavcore/Encode.h"
+#include "SelftestGate.h"
 
 #include <QApplication>
 #include <QAbstractButton>
+#include <QElapsedTimer>
 #include <QEventLoop>
 #include <QLabel>
 #include <QMessageBox>
 #include <QPainter>
+#include <QPointer>
 #include <QPushButton>
+#include <QRegularExpression>
+#include <QSemaphore>
 #include <QSpinBox>
 #include <QTemporaryDir>
 #include <QTest>
+#include <QThread>
 #include <QTimer>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <iostream>
+#include <memory>
+#include <sstream>
 #include <random>
 #include <limits>
 
@@ -29,16 +41,19 @@ QImage texture(QSize size)
         const int x = 30 + int(rng() % (size.width() - 80));
         const int y = 30 + int(rng() % (size.height() - 80));
         const int value = int(rng() % 256);
-        painter.fillRect(x, y, 8 + int(rng() % 16), 8 + int(rng() % 16), QColor(value, value, value));
+        // Draw the sizes in a fixed order; argument evaluation order is unspecified.
+        const int width = 8 + int(rng() % 16);
+        const int height = 8 + int(rng() % 16);
+        painter.fillRect(x, y, width, height, QColor(value, value, value));
     }
     return image;
 }
 
-bool writeClip(const QString& path, QSize size, bool blank = false)
+bool writeClip(const QString& path, QSize size, bool blank = false, int fps = 10, int frames = 6)
 {
     libavcore::EncodeRequest request;
     request.width = size.width(); request.height = size.height();
-    request.fps = 10; request.fpsNum = 10; request.fpsDen = 1;
+    request.fps = fps; request.fpsNum = fps; request.fpsDen = 1;
     request.videoBitrateBits = 8000000;
     request.outputPath = path.toStdString();
     request.videoCodecName = "mpeg4";
@@ -47,7 +62,7 @@ bool writeClip(const QString& path, QSize size, bool blank = false)
     libavcore::FrameEncoder encoder;
     if (encoder.open(request)) return false;
     const QImage base = texture(size);
-    for (int i = 0; i < 6; ++i) {
+    for (int i = 0; i < frames; ++i) {
         QImage frame(size, QImage::Format_RGB888);
         frame.fill(QColor(96, 96, 96));
         if (!blank) {
@@ -60,8 +75,15 @@ bool writeClip(const QString& path, QSize size, bool blank = false)
 }
 
 // Drive the actual UI asynchronously; timer ticks prove the event loop remains live.
-bool runTracking(PlanarTrackerDialog& dialog, int first, int last, int& ticks)
+// On the timeout (60 s by default), sets timedOut and waits for the worker to
+// finish, so the next run is not silently rejected by setFeatureTrackingSource's
+// early return. If the worker still runs after stopWaitMs, sets stuck: the
+// dialog is unusable and the caller must end the selftest (see abortStuck).
+// Once stuck is set, further runs do not touch the dialog.
+bool runTracking(PlanarTrackerDialog& dialog, int first, int last, int& ticks, bool& timedOut,
+                 bool& stuck, int timeoutMs = 60000, int stopWaitMs = 300000)
 {
+    if (stuck) return false;
     dialog.findChild<QSpinBox*>("featureStart")->setValue(first);
     dialog.findChild<QSpinBox*>("featureEnd")->setValue(last);
     QEventLoop loop;
@@ -73,11 +95,53 @@ bool runTracking(PlanarTrackerDialog& dialog, int first, int last, int& ticks)
     QObject::connect(&heartbeat, &QTimer::timeout, &loop, [&] { ++ticks; });
     timeout.setSingleShot(true);
     QObject::connect(&timeout, &QTimer::timeout, &loop, &QEventLoop::quit);
-    heartbeat.start(); timeout.start(60000);
+    heartbeat.start(); timeout.start(timeoutMs);
     dialog.findChild<QPushButton*>("featureTrackButton")->click();
     if (!finished) loop.exec();
     QObject::disconnect(connection);
+    if (!finished) {
+        timedOut = true;
+        const bool stopped = QTest::qWaitFor([&] { return !dialog.featureTrackingRunning(); }, stopWaitMs);
+        std::fprintf(stderr, "runTracking %d..%d: timeout after %d ms, worker stopped=%d "
+                     "(waited up to %d ms)\n", first, last, timeoutMs, int(stopped), stopWaitMs);
+        stuck = !stopped;
+    }
     return finished && success;
+}
+
+// A worker that did not stop leaves the shared dialog unusable: fail the current
+// gate and tell the caller to finish the tally without running later gates.
+bool abortStuck(selftest::GateTally& tally, int number)
+{
+    tally.gate(number, false, "timeout (worker still running; later gates not run)");
+    return true;
+}
+
+QImage checkerboard()
+{
+    QImage image(256, 256, QImage::Format_RGB888);
+    for (int y = 0; y < image.height(); ++y)
+        for (int x = 0; x < image.width(); ++x) {
+            const int v = ((x / 8) + (y / 8)) % 2 ? 230 : 25;
+            image.setPixelColor(x, y, QColor(v, v, v));
+        }
+    return image;
+}
+
+QString g_capturedWarning;
+QtMessageHandler g_previousHandler = nullptr;
+
+void captureWarning(QtMsgType type, const QMessageLogContext& context, const QString& message)
+{
+    if (message.contains(QStringLiteral("特徴点解析スレッドの停止を待ちきれませんでした")))
+        g_capturedWarning = message;
+    if (g_previousHandler) g_previousHandler(type, context, message);
+}
+
+int expectedFromSummary(const QString& text)
+{
+    const auto match = QRegularExpression(QStringLiteral("期待 (\\d+) フレーム")).match(text);
+    return match.hasMatch() ? match.captured(1).toInt() : -1;
 }
 
 struct PlanarRun {
@@ -163,10 +227,16 @@ bool diagnosePlanar(const char* label, const PlanarRun& run, int expectedLoads)
 
 int runCamtrackUiSelftest()
 {
-    int passed = 0, failed = 0;
+    selftest::GateTally tally;
+    // A tracking run that hit the 60 s timeout fails its gate as "timeout". If its
+    // worker did not stop either, gate() returns true and the selftest ends.
+    bool timedOut = false, stuck = false;
     const auto gate = [&](int number, bool ok) {
-        std::fprintf(stderr, "%s G%d\n", ok ? "PASS" : "FAIL", number);
-        if (ok) ++passed; else ++failed;
+        if (stuck) return abortStuck(tally, number);
+        if (timedOut) tally.gate(number, false, "timeout");
+        else tally.gate(number, ok);
+        timedOut = false;
+        return false;
     };
     QTemporaryDir temporary;
     const QString moving = temporary.filePath("moving.avi");
@@ -178,7 +248,7 @@ int runCamtrackUiSelftest()
     dialog.setFeatureTrackingSource(moving, 10, 6);
     dialog.findChild<QSpinBox*>("featureMaxPoints")->setValue(40);
     int ticks = 0;
-    bool tracked = media && runTracking(dialog, 1, 4, ticks);
+    bool tracked = media && runTracking(dialog, 1, 4, ticks, timedOut, stuck);
     int accurate = 0;
     const auto& tracks = dialog.featureTracks();
     for (const auto& track : tracks.tracks) {
@@ -192,14 +262,15 @@ int runCamtrackUiSelftest()
         if (ok) ++accurate;
     }
     const QString summary = dialog.findChild<QLabel*>("featureSummary")->text();
-    gate(1, tracked && tracks.frameCount == 4 && tracks.tracks.size() <= 40
+    if (gate(1, tracked && tracks.frameCount == 4 && tracks.tracks.size() <= 40
          && accurate >= 8 && ticks > 0 && dialog.featureStartFrame() == 1
          && summary.contains(QStringLiteral("追跡点数"))
          && summary.contains(QStringLiteral("フレーム数: 4"))
-         && summary.contains(QStringLiteral("脱落率")));
+         && summary.contains(QStringLiteral("脱落率"))))
+        return tally.finish();
 
     const auto rejectedWith = [&](const QString& text, int first, int last) {
-        const bool rejected = !runTracking(dialog, first, last, ticks);
+        const bool rejected = !runTracking(dialog, first, last, ticks, timedOut, stuck);
         return rejected && dialog.featureTracks().tracks.isEmpty()
             && dialog.findChild<QLabel*>("featureSummary")->text().contains(text);
     };
@@ -211,10 +282,11 @@ int runCamtrackUiSelftest()
     dialog.setFeatureTrackingSource(blank, 10, 6);
     rejected = rejectedWith(QStringLiteral("最低8点"), 0, 3) && rejected;
     dialog.setFeatureTrackingSource(large, 10, 6);
-    const bool scaled = media && runTracking(dialog, 0, 2, ticks);
+    const bool scaled = media && runTracking(dialog, 0, 2, ticks, timedOut, stuck);
     const QSize size = dialog.featureAnalysisSize();
-    gate(2, rejected && scaled && std::min(size.width(), size.height()) <= 720
-         && size.width() < 1440 && size.height() < 900);
+    if (gate(2, rejected && scaled && std::min(size.width(), size.height()) <= 720
+             && size.width() < 1440 && size.height() < 900))
+        return tally.finish();
 
     // Diagnose the rejected fixture on both entry points. texture() keeps a fixed
     // 30px margin and its patches are at most 23px wide, so in a 320x240 frame the
@@ -306,6 +378,262 @@ int runCamtrackUiSelftest()
              QStringLiteral("上限 %1 フレーム / %2 点").arg(sfm::kMaxBundleFrames).arg(sfm::kMaxBundlePoints))
          && dialog.findChild<QSpinBox*>("featureEnd")->value() == sfm::kMaxBundleFrames - 1
          && dialog.findChild<QSpinBox*>("featureMaxPoints")->maximum() == sfm::kMaxBundlePoints);
-    std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
-    return failed;
+
+    const auto summaryOf = [](PlanarTrackerDialog& d) {
+        auto* label = d.findChild<QLabel*>(QStringLiteral("planarSummary"));
+        return label ? label->text() : QStringLiteral("<planarSummary missing>");
+    };
+
+    {
+        // G5: the dialog alone, in MainWindow's order of calls.
+        PlanarTrackerDialog d;
+        d.setFeatureTrackingSource(QStringLiteral("g5-source.avi"), 10, 30);
+        d.findChild<QSpinBox*>("featureStart")->setValue(3);
+        d.findChild<QSpinBox*>("featureEnd")->setValue(14);
+        int loads = 0;
+        d.setPlanarFrameLoader([&] { ++loads; return QList<QImage>{}; });
+        const QString text = summaryOf(d);
+        std::fprintf(stderr, "G5 summary=\"%s\" expected=%d (want 12) loads=%d\n",
+                     qUtf8Printable(text), expectedFromSummary(text), loads);
+        gate(5, text.contains(QStringLiteral("読み込み待ち")) && expectedFromSummary(text) == 12
+             && !text.contains(QStringLiteral("投入: 0")) && loads == 0);
+    }
+
+    {
+        // G6: clip A tracks 4 frames; reopening on clip B must not show A's count.
+        PlanarTrackerDialog d;
+        d.setReferenceFrame(reference);
+        const QList<QImage> clipA{reference, reference, reference, reference};
+        d.setPlanarFrameLoader([&] { return clipA; });
+        const bool invoked = QMetaObject::invokeMethod(&d, "onTrackClicked", Qt::DirectConnection);
+        const QString textA = summaryOf(d);
+        const int trackedA = int(d.trackResult().size());
+        QImage referenceB = reference.mirrored(true, false);
+        d.setReferenceFrame(referenceB);
+        d.setPlanarFrameLoader([&] { return QList<QImage>{referenceB}; });
+        d.setFeatureTrackingSource(QStringLiteral("g6-clip-b.avi"), 10, 30);
+        d.findChild<QSpinBox*>("featureStart")->setValue(0);
+        d.findChild<QSpinBox*>("featureEnd")->setValue(6);
+        const QString textB = summaryOf(d);
+        std::fprintf(stderr, "G6 invoked=%d clipA tracked=%d (want 4) summaryA=\"%s\" "
+                     "summaryB=\"%s\" expectedB=%d (want 7) containsA4=%d trackedB=%d\n",
+                     int(invoked), trackedA, qUtf8Printable(textA), qUtf8Printable(textB),
+                     expectedFromSummary(textB), int(textB.contains(QLatin1Char('4'))),
+                     int(d.trackResult().size()));
+        gate(6, invoked && trackedA == 4 && textA.contains(QStringLiteral("投入: 4"))
+             && expectedFromSummary(textB) == 7 && !textB.contains(QLatin1Char('4'))
+             && d.trackResult().isEmpty());
+    }
+
+    {
+        // G7: MainWindow::openPlanarTrackerDialog, the real production path.
+        const QString clipPath = temporary.filePath("g7-source.avi");
+        const bool clipOk = temporary.isValid()
+            && writeClip(clipPath, {320, 240}, false, 24, 48);
+        MainWindow window;
+        auto* timeline = window.findChild<Timeline*>();
+        bool selected = false;
+        QString error;
+        if (clipOk && timeline) {
+            ClipInfo clip;
+            clip.filePath = clipPath;
+            clip.displayName = QStringLiteral("g7");
+            clip.duration = 2.0;
+            clip.inPoint = 0.0;
+            clip.outPoint = 2.0;
+            clip.speed = 1.0;
+            clip.opacity = 1.0;
+            timeline->videoTracks().first()->setClips(QVector<ClipInfo>{clip});
+            timeline->refreshPlaybackSequence();
+            selected = timeline->selectClipByIndex(false, 0, 0, &error);
+        }
+        // An unexpected QMessageBox would block invokeMethod; fail instead.
+        QString modalText;
+        QTimer modalGuard;
+        modalGuard.setInterval(500);
+        QObject::connect(&modalGuard, &QTimer::timeout, &modalGuard, [&] {
+            if (auto* box = qobject_cast<QMessageBox*>(QApplication::activeModalWidget())) {
+                modalText = box->text();
+                std::fprintf(stderr, "G7 modal: %s\n", qUtf8Printable(modalText));
+                box->reject();
+            }
+        });
+        modalGuard.start();
+        const bool invoked = selected
+            && QMetaObject::invokeMethod(&window, "openPlanarTrackerDialog");
+        modalGuard.stop();
+        auto* d = window.findChild<PlanarTrackerDialog*>();
+        const QString text = d ? summaryOf(*d) : QStringLiteral("<dialog missing>");
+        const int start = d ? d->findChild<QSpinBox*>("featureStart")->value() : -1;
+        const int end = d ? d->findChild<QSpinBox*>("featureEnd")->value() : -1;
+        const int frameCount = d ? d->featureFrameCount() : -1;
+        const int want = std::min(frameCount, end - start + 1);
+        const int got = expectedFromSummary(text);
+        std::fprintf(stderr, "G7 clipOk=%d selected=%d (%s) invoked=%d summary=\"%s\" "
+                     "start=%d end=%d frameCount=%d want=%d got=%d\n",
+                     int(clipOk), int(selected), qUtf8Printable(error), int(invoked), qUtf8Printable(text),
+                     start, end, frameCount, want, got);
+        if (!modalText.isEmpty()) {
+            const QByteArray detail = "modal: " + modalText.toUtf8();
+            tally.gate(7, false, detail.constData());
+        } else {
+            gate(7, invoked && d && text.contains(QStringLiteral("読み込み待ち"))
+                 && got == want && got > 0 && !text.contains(QStringLiteral("投入: 0")));
+        }
+        if (d) d->hide();
+    }
+
+    {
+        // G8: closing the dialog mid-analysis blocks for at most ~5 s, and the
+        // worker's late callbacks land on its context, not the dead dialog.
+        auto semaphore = std::make_shared<QSemaphore>(0);
+        auto entered = std::make_shared<std::atomic<bool>>(false);
+        auto orphaned = std::make_shared<std::atomic<int>>(0);
+        auto finished = std::make_shared<std::atomic<bool>>(false);
+        const auto savedGrab = PlanarTrackerDialog::featureGrabFunctionForTest();
+        const QImage board = checkerboard();
+        PlanarTrackerDialog::featureGrabFunctionForTest() =
+            [semaphore, entered, board](const QString&, double, const QSize&) {
+                entered->store(true);
+                semaphore->acquire();
+                return board;
+            };
+        PlanarTrackerDialog::featureOrphanCallbackHookForTest() = [orphaned] { ++*orphaned; };
+        auto* d = new PlanarTrackerDialog;
+        d->setFeatureTrackingSource(QStringLiteral("g8-seam.avi"), 10, 6);
+        d->findChild<QSpinBox*>("featureStart")->setValue(0);
+        d->findChild<QSpinBox*>("featureEnd")->setValue(3);
+        d->findChild<QSpinBox*>("featureMaxPoints")->setValue(40);
+        d->findChild<QPushButton*>("featureTrackButton")->click();
+        QPointer<QThread> worker = d->featureWorkerThread();
+        QPointer<QObject> ctx = d->featureWorkerContext();
+        QObject probe;
+        if (worker)
+            QObject::connect(worker, &QThread::finished, &probe,
+                             [finished] { finished->store(true); }, Qt::DirectConnection);
+        const bool blocked = worker && ctx && QTest::qWaitFor([&] { return entered->load(); }, 10000);
+        g_capturedWarning.clear();
+        g_previousHandler = qInstallMessageHandler(captureWarning);
+        QElapsedTimer clock;
+        clock.start();
+        delete d;
+        const qint64 destructorMs = clock.elapsed();
+        qInstallMessageHandler(g_previousHandler);
+        g_previousHandler = nullptr;
+        const bool workerAliveAfterDelete = !worker.isNull() && !finished->load();
+        semaphore->release(100);
+        const bool workerFinished = QTest::qWaitFor([&] { return finished->load(); }, 10000);
+        const bool cleaned = QTest::qWaitFor([&] { return ctx.isNull() && worker.isNull(); }, 10000);
+        const int lateCallbacks = orphaned->load();
+        PlanarTrackerDialog::featureGrabFunctionForTest() = savedGrab;
+        PlanarTrackerDialog::featureOrphanCallbackHookForTest() = {};
+        std::fprintf(stderr, "G8 blocked=%d destructorMs=%lld (want 4500..6500) warning=\"%s\" "
+                     "workerAliveAfterDelete=%d workerFinished=%d ctxDeleted=%d workerDeleted=%d "
+                     "lateCallbacks=%d (want > 0)\n",
+                     int(blocked), static_cast<long long>(destructorMs), qUtf8Printable(g_capturedWarning),
+                     int(workerAliveAfterDelete), int(workerFinished), int(ctx.isNull()),
+                     int(worker.isNull()), lateCallbacks);
+        gate(8, blocked && destructorMs >= 4500 && destructorMs <= 6500
+             && !g_capturedWarning.isEmpty() && workerAliveAfterDelete && workerFinished
+             && cleaned && lateCallbacks > 0);
+    }
+
+    // G9 and G10 block the worker in the grab seam until released.
+    const auto blockGrab = [](const std::shared_ptr<QSemaphore>& semaphore,
+                              const std::shared_ptr<std::atomic<bool>>& entered) {
+        const QImage board = checkerboard();
+        PlanarTrackerDialog::featureGrabFunctionForTest() =
+            [semaphore, entered, board](const QString&, double, const QSize&) {
+                entered->store(true);
+                semaphore->acquire();
+                return board;
+            };
+    };
+
+    {
+        // G9: a controlled timeout whose worker does not stop marks the run stuck,
+        // later runs leave the dialog alone, and abortStuck fails the gate and
+        // lets the selftest finish its tally.
+        auto semaphore = std::make_shared<QSemaphore>(0);
+        auto entered = std::make_shared<std::atomic<bool>>(false);
+        const auto savedGrab = PlanarTrackerDialog::featureGrabFunctionForTest();
+        blockGrab(semaphore, entered);
+        PlanarTrackerDialog d;
+        d.setFeatureTrackingSource(QStringLiteral("g9-seam.avi"), 10, 6);
+        d.findChild<QSpinBox*>("featureMaxPoints")->setValue(40);
+        int localTicks = 0;
+        bool localTimedOut = false, localStuck = false;
+        const bool tracked = runTracking(d, 0, 3, localTicks, localTimedOut, localStuck, 300, 300);
+        const bool runningWhenStuck = d.featureTrackingRunning();
+        bool laterTimedOut = false;
+        QElapsedTimer laterClock;
+        laterClock.start();
+        const bool laterRan = runTracking(d, 0, 3, localTicks, laterTimedOut, localStuck);
+        const qint64 laterMs = laterClock.elapsed();
+        std::ostringstream captured;
+        std::streambuf* const previous = std::cerr.rdbuf(captured.rdbuf());
+        selftest::GateTally scratch;
+        const bool aborted = abortStuck(scratch, 1);
+        const int scratchFailed = scratch.finish();
+        std::cerr.rdbuf(previous);
+        const QString abortText = QString::fromStdString(captured.str()).trimmed()
+            .replace(QLatin1Char('\n'), QStringLiteral(" | "));
+        semaphore->release(100);
+        const bool stopped = QTest::qWaitFor([&] { return !d.featureTrackingRunning(); }, 10000);
+        PlanarTrackerDialog::featureGrabFunctionForTest() = savedGrab;
+        const bool abortOk = aborted && scratchFailed == 1 && scratch.passed == 0
+            && abortText.contains(QStringLiteral("FAIL G1 timeout (worker still running"))
+            && abortText.contains(QStringLiteral("summary: 0 PASS, 1 FAIL, 0 SKIP"));
+        std::fprintf(stderr, "G9 entered=%d tracked=%d timedOut=%d stuck=%d runningWhenStuck=%d "
+                     "laterRan=%d laterTimedOut=%d laterMs=%lld (want < 1000) abort=\"%s\" "
+                     "scratchFailed=%d stoppedAfterRelease=%d\n",
+                     int(entered->load()), int(tracked), int(localTimedOut), int(localStuck),
+                     int(runningWhenStuck), int(laterRan), int(laterTimedOut),
+                     static_cast<long long>(laterMs), qUtf8Printable(abortText), scratchFailed,
+                     int(stopped));
+        gate(9, entered->load() && !tracked && localTimedOut && localStuck && runningWhenStuck
+             && !laterRan && !laterTimedOut && laterMs < 1000 && abortOk && stopped);
+    }
+
+    {
+        // G10: the application-exit wait is registered when the worker starts.
+        // aboutToQuit is emitted through the meta-object (the real signal; this
+        // selftest is the last user of the QApplication). The handler interrupts
+        // and waits ~2 s without deleting; after the worker is deleted, a second
+        // emission finds no handler.
+        auto semaphore = std::make_shared<QSemaphore>(0);
+        auto entered = std::make_shared<std::atomic<bool>>(false);
+        const auto savedGrab = PlanarTrackerDialog::featureGrabFunctionForTest();
+        blockGrab(semaphore, entered);
+        PlanarTrackerDialog d;
+        d.setFeatureTrackingSource(QStringLiteral("g10-seam.avi"), 10, 6);
+        d.findChild<QSpinBox*>("featureMaxPoints")->setValue(40);
+        d.findChild<QSpinBox*>("featureStart")->setValue(0);
+        d.findChild<QSpinBox*>("featureEnd")->setValue(3);
+        d.findChild<QPushButton*>("featureTrackButton")->click();
+        QPointer<QThread> worker = d.featureWorkerThread();
+        const bool blocked = worker && QTest::qWaitFor([&] { return entered->load(); }, 10000);
+        QElapsedTimer clock;
+        clock.start();
+        const bool emitted = QMetaObject::invokeMethod(qApp, "aboutToQuit", Qt::DirectConnection);
+        const qint64 quitMs = clock.elapsed();
+        const bool interrupted = worker && worker->isInterruptionRequested();
+        const bool stillRunning = worker && worker->isRunning() && d.featureTrackingRunning();
+        semaphore->release(100);
+        const bool stopped = QTest::qWaitFor([&] { return !d.featureTrackingRunning(); }, 10000);
+        const bool deleted = QTest::qWaitFor([&] { return worker.isNull(); }, 10000);
+        clock.restart();
+        const bool emittedAgain = QMetaObject::invokeMethod(qApp, "aboutToQuit", Qt::DirectConnection);
+        const qint64 secondMs = clock.elapsed();
+        PlanarTrackerDialog::featureGrabFunctionForTest() = savedGrab;
+        std::fprintf(stderr, "G10 blocked=%d emitted=%d quitMs=%lld (want 1500..3500) interrupted=%d "
+                     "stillRunning=%d stopped=%d workerDeleted=%d emittedAgain=%d secondMs=%lld "
+                     "(want < 500)\n",
+                     int(blocked), int(emitted), static_cast<long long>(quitMs), int(interrupted),
+                     int(stillRunning), int(stopped), int(deleted), int(emittedAgain),
+                     static_cast<long long>(secondMs));
+        gate(10, blocked && emitted && quitMs >= 1500 && quitMs <= 3500 && interrupted
+             && stillRunning && stopped && deleted && emittedAgain && secondMs < 500);
+    }
+    return tally.finish();
 }

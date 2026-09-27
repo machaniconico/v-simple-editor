@@ -79,6 +79,15 @@ public:
     int featureStartFrame() const { return m_featureStartFrame; }
     double featureFps() const { return m_featureFps; }
     bool featureTrackingRunning() const { return m_featureWorker != nullptr; }
+    int featureFrameCount() const { return m_featureFrameCount; }
+    QThread* featureWorkerThread() const { return m_featureWorker; }
+    QObject* featureWorkerContext() const { return m_featureWorkerContext; }
+    // Test seam: the feature worker decodes through this function. The default
+    // wraps libavcore::grabFrameAt, so production behavior is unchanged.
+    static std::function<QImage(const QString&, double, const QSize&)>& featureGrabFunctionForTest();
+    // Test seam: called on the GUI thread when a worker callback arrives after
+    // the dialog was destroyed (the callback is dropped). Empty by default.
+    static std::function<void()>& featureOrphanCallbackHookForTest();
     void setPlanarFrameLoader(std::function<QList<QImage>()> loader);
 
     // Set the reference frame (first frame / anchor image)
@@ -148,6 +157,9 @@ private:
     QSize m_featureAnalysisSize;
     sfm::MultiViewTracks m_featureTracks;
     QThread* m_featureWorker = nullptr;
+    // Per-run GUI-thread object receiving the worker's queued callbacks. It is
+    // not parented to the dialog, so it outlives it until the worker finishes.
+    QObject* m_featureWorkerContext = nullptr;
     QSpinBox* m_featureStart = nullptr;
     QSpinBox* m_featureEnd = nullptr;
     QSpinBox* m_featureMaxPoints = nullptr;
