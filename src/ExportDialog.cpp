@@ -67,6 +67,34 @@ void ExportConfig::appendSequenceSettings(QJsonObject &json) const
     json["keepAlpha"] = keepAlpha;
 }
 
+QJsonObject exportcfg::toJobJson(const ExportConfig &config)
+{
+    QJsonObject json;
+    json["width"] = config.width > 0 ? config.width : 1920;
+    json["height"] = config.height > 0 ? config.height : 1080;
+    json["fps"] = config.fps > 0 ? config.fps : 30;
+    json["videoCodec"] = config.videoCodec;
+    json["videoBitrate"] = config.videoBitrate;
+    if (config.rateControl == ExportConfig::RateControl::Crf) {
+        json["rateControl"] = QStringLiteral("crf");
+        if (config.crf != -1) json["crf"] = config.crf;
+    }
+    json["audioCodec"] = config.audioCodec;
+    json["audioBitrate"] = config.audioBitrate;
+    json["exportMarkedRangeOnly"] = config.exportMarkedRangeOnly;
+    config.appendLoudnessSettings(json);
+    if (config.hdr10 || config.hdrSettings.mode != QStringLiteral("sdr")) {
+        json["hdr10"] = true;
+        json["hdrMode"] = config.hdrSettings.mode;
+    }
+    if (config.proresProfile >= 0) json["proresProfile"] = config.proresProfile;
+    if (config.keepAlpha) json["keepAlpha"] = true;
+    config.appendSubtitleSettings(json);
+    config.appendSequenceSettings(json);
+    config.appendMetadataSettings(json);
+    return json;
+}
+
 QString ExportConfig::audioCodecForContainer(const QString &container)
 {
     const QString value = container.toLower();

@@ -4,9 +4,9 @@
 #include "../ShapeLayer.h"
 #include "../Timeline.h"
 #include "../TimelineFrameRenderer.h"
+#include "SelftestGate.h"
 #include <QDir>
 #include <QEventLoop>
-#include <QFile>
 #include <QFileInfo>
 #include <QImageWriter>
 #include <QTemporaryDir>
@@ -50,11 +50,6 @@ Result runJob(RenderJob job, bool cancel = false)
     result.status = queue.jobs().first().status;
     return result;
 }
-QString readSource(const QString &path)
-{
-    QFile file(path);
-    return file.open(QIODevice::ReadOnly) ? QString::fromUtf8(file.readAll()) : QString();
-}
 bool equalPixels(const QImage &a, const QImage &b)
 {
     if (a.isNull() || b.isNull() || a.size() != b.size()) return false;
@@ -67,11 +62,8 @@ bool equalPixels(const QImage &a, const QImage &b)
 
 int runImgSequenceSelftest()
 {
-    int passed = 0, failed = 0;
-    const auto gate = [&](int n, bool ok) {
-        std::fprintf(stderr, "%s G%d\n", ok ? "PASS" : "FAIL", n);
-        ok ? ++passed : ++failed;
-    };
+    selftest::GateTally tally;
+    const auto gate = [&](int n, bool ok) { tally.gate(n, ok); };
     QTemporaryDir temp;
     Timeline timeline;
     timeline.setProjectOutputConfig(128, 64, true);
@@ -169,22 +161,15 @@ int runImgSequenceSelftest()
     }
     gate(4, policy);
 
-    // Inspect the actual two production call sites, not replicas of their mapping.
-    // Both must use the single production mapper before assigning exportConfig.
-    const QString main = readSource("src/MainWindow.cpp");
-    const int normalStart = main.indexOf("void MainWindow::exportVideo()");
-    const int normalEnd = main.indexOf("job.exportConfig = cfg;", normalStart);
-    const int batchStart = main.indexOf("QJsonObject jcfg;");
-    const int batchEnd = main.indexOf("job.exportConfig = jcfg;", batchStart);
-    bool mapped = normalStart >= 0 && normalEnd > normalStart && batchStart >= 0 && batchEnd > batchStart
-        && main.mid(normalStart, normalEnd - normalStart).contains("exportCfg.appendSequenceSettings(cfg);")
-        && main.mid(batchStart, batchEnd - batchStart).contains("cfg.appendSequenceSettings(jcfg);");
+    bool mapped = true;
     QJsonObject cfg, jcfg;
     config.appendSequenceSettings(cfg);
-    config.appendSequenceSettings(jcfg);
+    jcfg = exportcfg::toJobJson(config);
     const QJsonObject expected{{"imageSequence", true}, {"sequenceFolder", config.outputPath},
         {"sequencePattern", "shot_%04d.png"}, {"sequenceDigits", 4}, {"sequenceStart", 17}, {"keepAlpha", true}};
-    mapped &= cfg == expected && cfg == jcfg;
+    for (auto it = expected.begin(); it != expected.end(); ++it)
+        mapped &= cfg.value(it.key()) == it.value() && jcfg.value(it.key()) == it.value();
+    const bool sequenceMapped = mapped;
     RenderQueue saved;
     saved.addJob(job);
     RenderQueue loaded;
@@ -194,6 +179,8 @@ int runImgSequenceSelftest()
     if (jobs.size() == 1)
         for (auto it = expected.begin(); it != expected.end(); ++it)
             mapped &= jobs.first().exportConfig.value(it.key()) == it.value();
+    std::fprintf(stderr, "img-sequence G5 sequenceMapped=%d persisted=%d queued=%lld keys=%lld\n",
+        sequenceMapped, mapped, static_cast<long long>(jobs.size()), static_cast<long long>(jcfg.size()));
     gate(5, mapped);
 
     ExportDialog dialog(ProjectConfig{});
@@ -269,6 +256,5 @@ int runImgSequenceSelftest()
         ui &= !sequenceexport::validate(settings).isEmpty();
     }
     gate(6, ui);
-    std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
-    return failed;
+    return tally.finish("img-sequence");
 }

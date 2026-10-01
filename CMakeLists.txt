@@ -415,6 +415,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/export_pro_selftest.cpp
     src/selftests/img_sequence_selftest.cpp
     src/selftests/export_alpha_selftest.cpp
+    src/selftests/export_cfg_selftest.cpp
     src/selftests/sub_movtext_selftest.cpp
     src/selftests/export_meta_selftest.cpp
     src/selftests/export_presets_selftest.cpp

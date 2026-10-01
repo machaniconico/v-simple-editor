@@ -4,8 +4,8 @@
 #include "../UndoManager.h"
 #include "../libavcore/Encode.h"
 #include "../libavcore/FrameGrab.h"
+#include "SelftestGate.h"
 #include <QEventLoop>
-#include <QFile>
 #include <QStandardItemModel>
 #include <QTemporaryDir>
 #include <QTimer>
@@ -137,11 +137,8 @@ bool render(Timeline &timeline, const QString &path, const QString &audio,
 
 int runSubMovtextSelftest()
 {
-    int passed = 0, failed = 0;
-    auto gate = [&](int n, bool ok) {
-        std::fprintf(stderr, "%s G%d\n", ok ? "PASS" : "FAIL", n);
-        ok ? ++passed : ++failed;
-    };
+    selftest::GateTally tally;
+    const auto gate = [&](int n, bool ok) { tally.gate(n, ok); };
     QTemporaryDir temp;
     const QString source = temp.filePath("source.mp4");
     bool ready = temp.isValid() && sourceClip(source);
@@ -272,13 +269,7 @@ int runSubMovtextSelftest()
     const QImage plain = libavcore::grabFrameAt(temp.filePath("embedded.mp4"), 0.5);
     gate(4, g4 && !both.isNull() && both == burn && both != plain);
 
-    QFile mainSource("src/MainWindow.cpp");
-    bool g5 = mainSource.open(QIODevice::ReadOnly);
-    const QByteArray code = mainSource.readAll();
-    g5 &= code.contains("exportCfg.appendSubtitleSettings(cfg);")
-        && code.contains("cfg.appendSubtitleSettings(jcfg);")
-        && code.contains("RenderQueue::appendSubtitleTrack(cfg, m_subtitleSegments, m_subtitleStyle, this);")
-        && code.contains("RenderQueue::appendSubtitleTrack(jcfg, m_subtitleSegments, m_subtitleStyle, this);");
+    bool g5 = true;
     g5 &= outputEdit && combo;
     for (Mode mode : {Mode::None, Mode::BurnIn, Mode::MovText, Mode::Both}) {
         if (outputEdit && combo) {
@@ -289,6 +280,14 @@ int runSubMovtextSelftest()
         }
         RenderQueue queue;
         RenderJob job; job.outputPath = temp.filePath("queued.mp4"); job.exportConfig = settings(mode);
+        ExportConfig mappedConfig;
+        mappedConfig.subtitleMode = mode;
+        QJsonObject mapped = exportcfg::toJobJson(mappedConfig);
+        RenderQueue::appendSubtitleTrack(mapped, segments, style, &owner);
+        const bool modeMapped = mapped.value("subtitleMode").toInt(-1) == static_cast<int>(mode)
+            && mapped.value("subtitleTrack") == job.exportConfig.value("subtitleTrack");
+        std::fprintf(stderr, "sub-movtext G5 mode=%d mapped=%d\n", static_cast<int>(mode), modeMapped);
+        g5 &= modeMapped;
         queue.addJob(job);
         const auto originalJobs = queue.jobs();
         const QString queueFile = temp.filePath("queue.json");
@@ -341,6 +340,5 @@ int runSubMovtextSelftest()
     gate(6, noneOk && noneStreams.total == 2 && noneStreams.subtitle == 0
         && !none.isNull() && none == plain && none != burn && noBurn == unchanged && cleared
         && !subtitle::burns(Mode::None) && !subtitle::embeds(Mode::None));
-    std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
-    return failed;
+    return tally.finish("sub-movtext");
 }

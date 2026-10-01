@@ -3,6 +3,7 @@
 #include "../RenderQueue.h"
 #include "../Timeline.h"
 #include "../libavcore/AudioExtract.h"
+#include "SelftestGate.h"
 #include <QEventLoop>
 #include <QFile>
 #include <QImage>
@@ -79,11 +80,8 @@ bool render(RenderJob job, QString &error)
 
 int runLoudnessAutoSelftest()
 {
-    int passed = 0, failed = 0;
-    const auto gate = [&](int n, bool ok) {
-        std::fprintf(stderr, "[loudness-auto] %s G%d\n", ok ? "PASS" : "FAIL", n);
-        ok ? ++passed : ++failed;
-    };
+    selftest::GateTally tally;
+    const auto gate = [&](int n, bool ok) { tally.gate(n, ok); };
     QTemporaryDir temporary;
     ExportConfig settings;
     ExportDialog dialog(ProjectConfig{});
@@ -191,20 +189,58 @@ int runLoudnessAutoSelftest()
     queue.addJob(normal);
     queue.addJob(batch);
     const auto jobs = queue.jobs();
-    // Also verify both real MainWindow cfg blocks invoke the shared serializer
-    // and submission seam, so an omitted call cannot silently pass this gate.
-    QFile mainSource(QStringLiteral("src/MainWindow.cpp"));
-    const bool opened = mainSource.open(QIODevice::ReadOnly);
-    const QByteArray code = opened ? mainSource.readAll() : QByteArray();
-    gate(5, jobs.size() == 2 && jobs[0].exportConfig["autoLoudness"].toBool()
+    ExportConfig normalConfig = settings;
+    normalConfig.targetLufs = -14.0;
+    ExportConfig batchConfig = settings;
+    batchConfig.targetLufs = -23.0;
+    const QJsonObject normalMapped = exportcfg::toJobJson(normalConfig);
+    const QJsonObject batchMapped = exportcfg::toJobJson(batchConfig);
+    const bool queued = jobs.size() == 2 && jobs[0].exportConfig["autoLoudness"].toBool()
         && jobs[1].exportConfig["autoLoudness"].toBool()
         && jobs[0].exportConfig["targetLufs"].toDouble() == -14.0
-        && jobs[1].exportConfig["targetLufs"].toDouble() == -23.0
-        && code.contains("exportCfg.appendLoudnessSettings(cfg)")
-        && code.contains("cfg.appendLoudnessSettings(jcfg)")
-        && code.count("loudnessauto::prepareJob(job)") == 2);
+        && jobs[1].exportConfig["targetLufs"].toDouble() == -23.0;
+    const bool mapped = normalMapped.value("autoLoudness").toBool()
+        && batchMapped.value("autoLoudness").toBool()
+        && normalMapped.value("targetLufs").toDouble() == -14.0
+        && batchMapped.value("targetLufs").toDouble() == -23.0;
+    // The removed text check counted prepareJob calls inside two private UI
+    // handlers; calling those handlers would open dialogs. G2/G4 instead run
+    // prepareJob on both target profiles and render their audio. The
+    // handlers still call prepareJob themselves (outside the shared job
+    // builder that export-cfg G3 covers), so a dropped call in one handler
+    // is not detected by any gate.
+    const double normalMeasured = normal.exportConfig.value("measuredLufs").toDouble(
+        std::numeric_limits<double>::quiet_NaN());
+    const double batchMeasured = batch.exportConfig.value("measuredLufs").toDouble(
+        std::numeric_limits<double>::quiet_NaN());
+    const bool normalGainSaved = normal.exportConfig.value("loudnessGainDb").toDouble()
+        == normal.loudnessGainDb;
+    const bool batchGainSaved = batch.exportConfig.value("loudnessGainDb").toDouble()
+        == batch.loudnessGainDb;
+    const bool bothPrepared = !status.isEmpty() && !batchStatus.isEmpty()
+        && std::isfinite(normalMeasured) && std::isfinite(batchMeasured)
+        && normalGainSaved && batchGainSaved;
+    // addJob mirrors flat video fields into exportConfig, so compare the
+    // measured audio fields that prepareJob supplied on each submitted job.
+    const auto keptAudioState = [](const RenderJob &submitted, const RenderJob &prepared) {
+        for (const char *key : {"autoLoudness", "targetLufs", "measuredLufs", "loudnessGainDb"})
+            if (submitted.exportConfig.value(key) != prepared.exportConfig.value(key)) return false;
+        return true;
+    };
+    const bool queuedPrepared = jobs.size() == 2
+        && keptAudioState(jobs[0], normal) && keptAudioState(jobs[1], batch);
+    std::fprintf(stderr, "[loudness-auto] G5 queued=%d mapped=%d bothPrepared=%d "
+        "queuedPrepared=%d normalStatus=%d batchStatus=%d "
+        "normalTarget=%g batchTarget=%g normalMeasured=%g batchMeasured=%g "
+        "normalGain=%g batchGain=%g normalGainSaved=%d batchGainSaved=%d\n",
+        queued, mapped, bothPrepared, queuedPrepared,
+        !status.isEmpty(), !batchStatus.isEmpty(),
+        normalMapped.value("targetLufs").toDouble(),
+        batchMapped.value("targetLufs").toDouble(),
+        normalMeasured, batchMeasured, normal.loudnessGainDb, batch.loudnessGainDb,
+        normalGainSaved, batchGainSaved);
+    gate(5, queued && mapped && bothPrepared && queuedPrepared);
     if (normal.projectFilePath != source) QFile::remove(normal.projectFilePath);
     if (batch.projectFilePath != source) QFile::remove(batch.projectFilePath);
-    std::fprintf(stderr, "[loudness-auto] summary: %d PASS, %d FAIL\n", passed, failed);
-    return failed;
+    return tally.finish("loudness-auto");
 }

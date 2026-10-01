@@ -251,6 +251,7 @@ class MainWindow : public QMainWindow
     // 呼ばれない (McpHttpServer が GUI スレッドのイベントループで動く)。
     friend class mcp::McpEditorTools;
     friend int runMcpSelftest();
+    friend int runExportCfgSelftest();
 
 public:
     explicit MainWindow(QWidget *parent = nullptr);
@@ -681,6 +682,8 @@ protected:
     void showEvent(QShowEvent *event) override;
 
 private:
+    enum class ExportEntry { Normal, MobileBatch };
+    RenderJob buildExportRenderJob(const ExportConfig &config, ExportEntry entry);
     noiseprint::NoisePrint m_noisePrint;
     QPointer<TimelineTrack> m_noisePrintMenuTrack;
     int m_noisePrintMenuClip = -1;

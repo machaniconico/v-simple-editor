@@ -3,11 +3,12 @@
 #include "../ExportUserPresets.h"
 #include "../RenderQueue.h"
 #include "../ShapeLayer.h"
+#include "../SmartRender.h"
 #include "../Timeline.h"
 #include "../libavcore/Encode.h"
 #include "SelftestGate.h"
 #include <QEventLoop>
-#include <QFile>
+#include <QImage>
 #include <QMap>
 #include <QStringList>
 #include <QTemporaryDir>
@@ -39,7 +40,8 @@ bool readTags(const QString &path, Tags &result)
     return true;
 }
 
-bool render(Timeline &timeline, const QString &path, const QString &codec, const ExportConfig &config)
+bool render(Timeline &timeline, const QString &path, const QString &codec, const ExportConfig &config,
+            bool wholeTimeline = false)
 {
     RenderQueue queue;
     RenderJob job;
@@ -48,9 +50,12 @@ bool render(Timeline &timeline, const QString &path, const QString &codec, const
     job.codec = codec;
     job.width = 64;
     job.height = 64;
-    job.endUs = 500000;
-    job.exportConfig = {{"fps", 4}};
-    config.appendMetadataSettings(job.exportConfig);
+    job.endUs = wholeTimeline ? 0 : 500000;
+    job.exportConfig = exportcfg::toJobJson(config);
+    job.exportConfig["width"] = 64;
+    job.exportConfig["height"] = 64;
+    job.exportConfig["fps"] = 4;
+    job.exportConfig["videoCodec"] = codec;
     QEventLoop loop;
     QTimer timer;
     timer.setSingleShot(true);
@@ -70,6 +75,26 @@ bool render(Timeline &timeline, const QString &path, const QString &codec, const
     if (!done) queue.stop();
     return done && success;
 }
+
+bool writeSource(const QString &path)
+{
+    libavcore::EncodeRequest request;
+    request.outputPath = path.toStdString();
+    request.width = request.height = 64;
+    request.fps = request.fpsNum = 4;
+    request.fpsDen = 1;
+    request.videoCodecName = "mpeg4";
+    request.videoBitrateBits = 200000;
+    request.hwVendorHint = "none";
+    request.useHardwareAccel = false;
+    libavcore::FrameEncoder encoder;
+    if (encoder.open(request)) return false;
+    QImage frame(64, 64, QImage::Format_RGB888);
+    frame.fill(Qt::red);
+    for (int i = 0; i < 2; ++i)
+        if (!encoder.pushFrame(frame, i)) return false;
+    return !encoder.finalize().has_value();
+}
 }
 
 int runExportMetaSelftest()
@@ -86,18 +111,13 @@ int runExportMetaSelftest()
         gui &= edit != nullptr;
         if (edit) edit->setText(it.value());
     }
-    bool outputFound = false;
-    for (auto *edit : dialog.findChildren<QLineEdit *>()) {
-        if (edit->placeholderText() == "Select output file...") {
-            edit->setText(temp.filePath("gui.mp4"));
-            outputFound = true;
-        }
-    }
-    gui &= outputFound;
+    auto *outputEdit = dialog.findChild<QLineEdit *>("outputPath");
+    gui &= outputEdit != nullptr;
+    if (outputEdit) outputEdit->setText(temp.filePath("gui.mp4"));
     if (gui) gui &= QMetaObject::invokeMethod(&dialog, "onExport", Qt::DirectConnection);
     const ExportConfig config = dialog.config();
     RenderJob job;
-    config.appendMetadataSettings(job.exportConfig);
+    job.exportConfig = exportcfg::toJobJson(config);
     RenderQueue queue;
     job.outputPath = temp.filePath("queued.mp4");
     queue.addJob(job);
@@ -105,27 +125,7 @@ int runExportMetaSelftest()
     gui &= jobs.size() == 1;
     for (auto it = tags.constBegin(); it != tags.constEnd(); ++it)
         gui &= jobs.size() == 1 && jobs.first().exportConfig.value(it.key()).toString() == it.value();
-    // Check the actual two MainWindow call sites, rather than duplicating
-    // either GUI's config assembly in this test. Run from repository root.
-    QFile source("src/MainWindow.cpp");
-    gui &= source.open(QIODevice::ReadOnly);
-    const QByteArray code = source.readAll();
-    gui &= code.contains("exportCfg.appendMetadataSettings(cfg);\n    job.exportConfig = cfg;")
-        && code.contains("cfg.appendMetadataSettings(jcfg);\n                    job.exportConfig = jcfg;");
-
-    // Verify the production wiring as well as the helpers: stream copy must
-    // be gated before concatCopy, and subprocess tags must precede the output.
-    QFile queueSource("src/RenderQueue.cpp");
-    gui &= queueSource.open(QIODevice::ReadOnly);
-    const QByteArray queueCode = queueSource.readAll();
-    const qsizetype guardStart = queueCode.indexOf("const bool hasExportMetadata = renderqueue_metadata::hasMetadata(cfg);");
-    const qsizetype copyStart = queueCode.indexOf("libavcore::concatCopy", guardStart);
-    gui &= guardStart >= 0 && copyStart > guardStart
-        && queueCode.mid(guardStart, copyStart - guardStart).contains("&& !hasExportMetadata");
-    gui &= queueCode.contains(
-        "renderqueue_metadata::appendSubprocessArgs(args, cfg, jobCopy.outputPath);\n"
-        "    args << QStringLiteral(\"-progress\") << QStringLiteral(\"pipe:2\");\n"
-        "    args << jobCopy.outputPath;");
+    const bool guiMapped = gui;
     const QStringList prefix{QStringLiteral("-c:v"), QStringLiteral("libx265")};
     QJsonObject metadata;
     config.appendMetadataSettings(metadata);
@@ -134,12 +134,13 @@ int runExportMetaSelftest()
         const QString name = QString::fromLatin1(key);
         expected << QStringLiteral("-metadata") << (name + "=" + tags.value(name));
     }
+    bool helperArgs = true;
     for (const QString &ext : {QStringLiteral("mp4"), QStringLiteral("MOV"), QStringLiteral("mkv")}) {
         QStringList args = prefix;
         renderqueue_metadata::appendSubprocessArgs(args, metadata, "tagged." + ext);
         QStringList wanted = expected;
         if (ext != "mkv") wanted << "-movflags" << "use_metadata_tags";
-        gui &= args == wanted && renderqueue_metadata::hasMetadata(metadata);
+        helperArgs &= args == wanted && renderqueue_metadata::hasMetadata(metadata);
     }
     // Any one nonempty field blocks stream copy; omitted/empty fields must
     // not generate empty tag arguments. Preserve whitespace and '=' verbatim.
@@ -150,9 +151,56 @@ int runExportMetaSelftest()
         single.insert(it.key(), it.value());
         QStringList args;
         renderqueue_metadata::appendSubprocessArgs(args, single, "single.mkv");
-        gui &= renderqueue_metadata::hasMetadata(single)
+        helperArgs &= renderqueue_metadata::hasMetadata(single)
             && args == QStringList{QStringLiteral("-metadata"), it.key() + "=" + it.value()};
     }
+    gui &= helperArgs;
+    // The removed source-text check also claimed that the HDR fallback placed
+    // metadata before the ffmpeg subprocess output argument. That branch
+    // requires an external 10-bit encoder and has no deterministic subprocess
+    // seam here, so this gate cannot replace its ordering assertion. The
+    // helper checks above verify the generated arguments; the render below
+    // verifies the in-process output path only.
+    // A copyable single-clip timeline with smart rendering enabled must be
+    // encoded when tags are present. The encoder counter distinguishes this
+    // path from concatCopy, and the output container proves the tag survived.
+    const QByteArray oldSmart = qgetenv("VEDITOR_SMART_RENDER");
+    const bool hadSmart = qEnvironmentVariableIsSet("VEDITOR_SMART_RENDER");
+    const QByteArray oldSeam = qgetenv("VEDITOR_SMARTRENDER_TEST_SEAM");
+    const bool hadSeam = qEnvironmentVariableIsSet("VEDITOR_SMARTRENDER_TEST_SEAM");
+    qputenv("VEDITOR_SMART_RENDER", "1");
+    qputenv("VEDITOR_SMARTRENDER_TEST_SEAM", "1");
+    const QString smartSource = temp.filePath("smart-source.mp4");
+    Timeline smartTimeline;
+    smartTimeline.setProjectOutputConfig(64, 64, true);
+    ClipInfo smartClip;
+    smartClip.filePath = smartSource;
+    smartClip.duration = smartClip.outPoint = 0.5;
+    const bool smartReady = writeSource(smartSource);
+    if (smartReady) smartTimeline.restoreFromProject(
+        QVector<QVector<ClipInfo>>{{smartClip}}, QVector<QVector<ClipInfo>>{},
+        0.0, -1.0, -1.0, 100);
+    smartTimeline.refreshPlaybackSequence();
+    const QString smartOutput = temp.filePath("smart-tagged.mp4");
+    const auto eligibility = smartrender::timelinePassThrough(
+        &smartTimeline, smartOutput, "mpeg4", 64, 64, 4.0, 0, 0,
+        false, false, false, false, false, false, false);
+    libavcore::FrameEncoder::resetMetadataWriteCountForTest();
+    const bool smartRendered = smartReady && render(smartTimeline, smartOutput, "mpeg4", config, true);
+    Tags smartTags;
+    const bool smartTagged = smartRendered && readTags(smartOutput, smartTags)
+        && smartTags.value("title") == config.title;
+    const bool smartEncoded = libavcore::FrameEncoder::metadataWriteCountForTest() > 0;
+    std::fprintf(stderr, "export-meta smart render: ready=%d eligible=%d reason=%s rendered=%d tagged=%d encoded=%d title=%s\n",
+        smartReady, eligibility.eligible, qPrintable(eligibility.reason), smartRendered, smartTagged,
+        smartEncoded, qPrintable(smartTags.value("title")));
+    gui &= smartReady && eligibility.eligible && smartTagged && smartEncoded;
+    std::fprintf(stderr, "export-meta G1 guiMapped=%d helperArgs=%d smartReady=%d eligible=%d tagged=%d encoded=%d\n",
+        guiMapped, helperArgs, smartReady, eligibility.eligible, smartTagged, smartEncoded);
+    if (hadSmart) qputenv("VEDITOR_SMART_RENDER", oldSmart);
+    else qunsetenv("VEDITOR_SMART_RENDER");
+    if (hadSeam) qputenv("VEDITOR_SMARTRENDER_TEST_SEAM", oldSeam);
+    else qunsetenv("VEDITOR_SMARTRENDER_TEST_SEAM");
     gate(1, gui);
 
     Timeline timeline;

@@ -121,6 +121,7 @@ int runEffectTimingSelftest();
 int runExposureAidsSelftest();
 int runExportAlphaSelftest();
 int runExportAuditSelftest();
+int runExportCfgSelftest();
 int runExportMetaSelftest();
 int runExportPresetsSelftest();
 int runExportProSelftest();
@@ -636,6 +637,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "PNG/TIFF sequence export, alpha, configuration and cancellation (6 gates)" },
     { "export-alpha", "VEDITOR_EXPORT_ALPHA_SELFTEST", runExportAlphaSelftest, true,
       "ProRes/VP9 alpha export and opaque default path (6 gates)" },
+    { "export-cfg", "VEDITOR_EXPORT_CFG_SELFTEST", runExportCfgSelftest, true,
+      "Shared ExportConfig job mapping and normal/mobile route parity (3 gates)" },
     { "export-meta", "VEDITOR_EXPORT_META_SELFTEST", runExportMetaSelftest, true,
       "Container metadata GUI wiring, encoding, defaults and presets (6 gates)" },
     { "export-presets", "VEDITOR_EXPORT_PRESETS_SELFTEST", runExportPresetsSelftest, true,
@@ -937,7 +940,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Text letter/line spacing: default byte-identical, spacing widens render, toJson/fromJson roundtrip" },
     { "grade-wheel-wiring", "VEDITOR_GRADE_WHEEL_WIRING_SELFTEST", runGradeWheelWiringSelftest, true,
       "LGG wheels + WB -> per-clip ColorCorrection wiring: value mapping, restore, render reflection" },
-    { "grade-keyframe-ext", "VEDITOR_GRADE_KEYFRAME_EXT_SELFTEST", runGradeKeyframeExtSelftest, false,
+    { "grade-keyframe-ext", "VEDITOR_GRADE_KEYFRAME_EXT_SELFTEST", runGradeKeyframeExtSelftest, true,
       "HSL secondary and color warper keyframes: interpolation, static identity, and project roundtrip" },
     { "grade-keyframe", "VEDITOR_GRADE_KEYFRAME_SELFTEST", runGradeKeyframeSelftest, true,
       "ColorCorrection grade.* keyframes: render evaluation, byte identity, undo, and roundtrip" },

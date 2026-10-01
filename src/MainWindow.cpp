@@ -10731,6 +10731,36 @@ bool MainWindow::exportAudioOnly(const ExportConfig &config, QString *error)
     return runFfmpegForAudioMix(args, error);
 }
 
+RenderJob MainWindow::buildExportRenderJob(const ExportConfig &config, ExportEntry entry)
+{
+    RenderJob job;
+    job.name = QFileInfo(config.outputPath).fileName();
+    job.projectFilePath = m_projectFilePath;
+    job.outputPath = config.outputPath;
+    job.width = config.width > 0 ? config.width : 1920;
+    job.height = config.height > 0 ? config.height : 1080;
+    // Normal export has historically used the project's explicit resolution.
+    // Mobile profiles retain the dimensions selected in MobileExportDialog.
+    if (entry == ExportEntry::Normal && m_projectConfig.explicitOutputResolution) {
+        job.width = m_projectConfig.width;
+        job.height = m_projectConfig.height;
+    }
+    job.bitrateBps = static_cast<qint64>(config.videoBitrate) * 1000;
+    job.timeline = m_timeline;
+    job.codec = config.videoCodec;
+    // The former mobile block omitted rateControl/crf, marked-range and
+    // keepAlpha. Both routes now receive those ExportConfig values here;
+    // explicit project resolution above is the only route-specific override.
+    job.exportConfig = exportcfg::toJobJson(config);
+    job.exportConfig["width"] = job.width;
+    job.exportConfig["height"] = job.height;
+    job.exportConfig["timecodeBurnIn"] = m_tcBurnIn.toJson();
+    job.loudnessGainDb = exporter_loudnessGainDb();
+    job.exportConfig["loudnessGainDb"] = job.loudnessGainDb;
+    RenderQueue::appendSubtitleTrack(job.exportConfig, m_subtitleSegments, m_subtitleStyle, this);
+    return job;
+}
+
 void MainWindow::exportVideo()
 {
     ExportDialog dialog(m_projectConfig, this);
@@ -10774,8 +10804,7 @@ void MainWindow::exportVideo()
     if (!m_renderQueue)
         m_renderQueue = new RenderQueue(this);
 
-    RenderJob job;
-    job.name = QFileInfo(exportCfg.outputPath).fileName();
+    RenderJob job = buildExportRenderJob(exportCfg, ExportEntry::Normal);
     QString audioMixError;
     const QString preparedAudioMixPath = exportCfg.imageSequence
         ? QString() : (exportCfg.autoLoudness ? QString() : prepareExportAudioMix(&audioMixError));
@@ -10789,60 +10818,10 @@ void MainWindow::exportVideo()
     // the actual edit graph (LUT/mask/tracking are NOT serialized), and
     // RenderQueue falls back to the V1 clip's source file for audio when this
     // is a .veditor / empty path (RenderQueue.cpp:551-563).
-    job.projectFilePath = preparedAudioMixPath.isEmpty()
-        ? m_projectFilePath
-        : preparedAudioMixPath;
-    job.outputPath = exportCfg.outputPath;
-    job.width   = exportCfg.width  > 0 ? exportCfg.width  : 1920;
-    job.height  = exportCfg.height > 0 ? exportCfg.height : 1080;
-    if (m_projectConfig.explicitOutputResolution) {
-        job.width = m_projectConfig.width;
-        job.height = m_projectConfig.height;
-    }
-    job.bitrateBps = static_cast<qint64>(exportCfg.videoBitrate) * 1000;
-    job.startUs = 0;
-    job.endUs   = 0;   // 0 = whole timeline
-    // The additive in-memory edit-graph seam — the SAME pattern PARITY S8
-    // (main.cpp) and BatchExportQueue (BatchExportQueue.cpp:170) use so the
-    // real RenderQueue renders THIS live Timeline through renderFrameAt.
-    job.timeline = m_timeline;
-
-    // RenderQueue::startRenderPipe consumes these JSON fields directly
-    // (videoCodec/videoBitrate/rateControl/crf/fps/audioCodec/audioBitrate, plus the HDR10 /
-    // ProRes branch keys). Pass ExportDialog's resolved encoder verbatim.
-    QJsonObject cfg;
-    cfg["width"]        = job.width;
-    cfg["height"]       = job.height;
-    cfg["fps"]          = exportCfg.fps > 0 ? exportCfg.fps : 30;
-    cfg["videoCodec"]   = exportCfg.videoCodec;     // already ffmpeg-named
-    job.codec = exportCfg.videoCodec;
-    cfg["videoBitrate"] = exportCfg.videoBitrate;   // kbps
-    if (exportCfg.rateControl == ExportConfig::RateControl::Crf) {
-        cfg["rateControl"] = QStringLiteral("crf");
-        if (exportCfg.crf != -1) cfg["crf"] = exportCfg.crf;
-    }
-    cfg["audioCodec"]   = exportCfg.audioCodec;
-    cfg["audioBitrate"] = exportCfg.audioBitrate;
-    cfg["exportMarkedRangeOnly"] = exportCfg.exportMarkedRangeOnly;
-    cfg["timecodeBurnIn"] = m_tcBurnIn.toJson();
-    const double loudnessGainDb = exporter_loudnessGainDb();
-    job.loudnessGainDb = loudnessGainDb;
-    cfg["loudnessGainDb"] = loudnessGainDb;
-    exportCfg.appendLoudnessSettings(cfg);
+    if (!preparedAudioMixPath.isEmpty()) job.projectFilePath = preparedAudioMixPath;
+    const double loudnessGainDb = job.loudnessGainDb;
     const bool isHdrExport =
         exportCfg.hdr10 || exportCfg.hdrSettings.mode != QStringLiteral("sdr");
-    if (isHdrExport) {
-        cfg["hdr10"]   = true;
-        cfg["hdrMode"] = exportCfg.hdrSettings.mode;
-    }
-    if (exportCfg.proresProfile >= 0)
-        cfg["proresProfile"] = exportCfg.proresProfile;
-    if (exportCfg.keepAlpha) cfg["keepAlpha"] = true;
-    exportCfg.appendSubtitleSettings(cfg);
-    RenderQueue::appendSubtitleTrack(cfg, m_subtitleSegments, m_subtitleStyle, this);
-    exportCfg.appendSequenceSettings(cfg);
-    exportCfg.appendMetadataSettings(cfg);
-    job.exportConfig = cfg;
 
     if (isHdrExport && dvxml::enabledFromEnv()) {
         // Apply this export's HDR settings to L6 BEFORE buildFromTimeline so that
@@ -17039,42 +17018,7 @@ void MainWindow::onMobileExport()
                     if (!m_renderQueue)
                         m_renderQueue = new RenderQueue(this);
 
-                    RenderJob job;
-                    job.name = QFileInfo(cfg.outputPath).fileName();
-                    job.projectFilePath = m_projectFilePath;
-                    job.outputPath = cfg.outputPath;
-                    job.width   = cfg.width  > 0 ? cfg.width  : 1920;
-                    job.height  = cfg.height > 0 ? cfg.height : 1080;
-                    job.bitrateBps =
-                        static_cast<qint64>(cfg.videoBitrate) * 1000;
-                    job.startUs = 0;
-                    job.endUs   = 0;
-                    job.timeline = m_timeline;
-                    QJsonObject jcfg;
-                    jcfg["width"]        = job.width;
-                    jcfg["height"]       = job.height;
-                    jcfg["fps"]          = cfg.fps > 0 ? cfg.fps : 30;
-                    jcfg["videoCodec"]   = cfg.videoCodec;
-                    jcfg["videoBitrate"] = cfg.videoBitrate;
-                    jcfg["audioCodec"]   = cfg.audioCodec;
-                    jcfg["audioBitrate"] = cfg.audioBitrate;
-                    jcfg["timecodeBurnIn"] = m_tcBurnIn.toJson();
-                    const double loudnessGainDb = exporter_loudnessGainDb();
-                    job.loudnessGainDb = loudnessGainDb;
-                    jcfg["loudnessGainDb"] = loudnessGainDb;
-                    cfg.appendLoudnessSettings(jcfg);
-                    if (cfg.hdr10 ||
-                        cfg.hdrSettings.mode != QStringLiteral("sdr")) {
-                        jcfg["hdr10"]   = true;
-                        jcfg["hdrMode"] = cfg.hdrSettings.mode;
-                    }
-                    if (cfg.proresProfile >= 0)
-                        jcfg["proresProfile"] = cfg.proresProfile;
-                    cfg.appendSubtitleSettings(jcfg);
-                    RenderQueue::appendSubtitleTrack(jcfg, m_subtitleSegments, m_subtitleStyle, this);
-                    cfg.appendSequenceSettings(jcfg);
-                    cfg.appendMetadataSettings(jcfg);
-                    job.exportConfig = jcfg;
+                    RenderJob job = buildExportRenderJob(cfg, ExportEntry::MobileBatch);
 
                     auto *progress = new QProgressDialog(
                         QStringLiteral("モバイル向けエクスポート中..."),
@@ -17112,7 +17056,7 @@ void MainWindow::onMobileExport()
                     // AC: production export 経路に ACES SSOT を push (start()
                     // 前)。8bit 経路のみ適用、enabled=false 時はビット同一。
                     m_renderQueue->setAcesPipeline(m_acesPipeline);
-                    m_renderQueue->setLoudnessGainDb(loudnessGainDb);
+                    m_renderQueue->setLoudnessGainDb(job.loudnessGainDb);
                     statusBar()->showMessage(
                         QStringLiteral("モバイル書き出し: ") + cfg.outputPath);
                     const QString loudnessStatus = loudnessauto::prepareJob(job);

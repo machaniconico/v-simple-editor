@@ -82,6 +82,12 @@ struct ExportConfig {
     QString codecDisplayName() const;
 };
 
+namespace exportcfg {
+// Shared ExportConfig -> RenderJob::exportConfig mapping. Values that depend on
+// the live timeline or MainWindow are added by buildExportRenderJob.
+QJsonObject toJobJson(const ExportConfig &config);
+}
+
 class ExportDialog : public QDialog
 {
     Q_OBJECT
