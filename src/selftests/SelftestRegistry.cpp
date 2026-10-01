@@ -51,6 +51,7 @@ int runAudioChannelMapSelftest();
 int runAnimExportSelftest();
 int runAudioBusSelftest();
 int runAudioClipDragUndoSelftest();
+int runAudioFixtureSelftest();
 int runAudioXfadeSelftest();
 int runMorphCutSelftest();
 int runTransitionExportSelftest();
@@ -918,6 +919,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Shape clip G1-G10: JSON, raster SSOT, preview/export, trim/repeater, modifier dialog + undo, legacy brush byte identity" },
     { "colormatch-apply",  "VEDITOR_COLORMATCH_APPLY_SELFTEST",    runColorMatchApplySelftest,    true,
       "ColorMatch apply: generated .cube -> selected clip LUT fields + undo + renderFrameAt reflection" },
+    { "audio-fixture", nullptr, runAudioFixtureSelftest, true,
+      "Export PCM fixture: deterministic WAV data, track gain and flat EQ (G1-G5; VEDITOR_AUDIO_FIXTURE_OUT required)" },
     { "render-fixture", "VEDITOR_RENDER_FIXTURE_SELFTEST", runRenderFixtureSelftest, true,
       "Deterministic acceptance-lane render/audio dump (G1-G3; VEDITOR_RENDER_FIXTURE_OUT required)" },
     { "parity",            "VEDITOR_PARITY_SELFTEST",             runParitySelftest,             true,
