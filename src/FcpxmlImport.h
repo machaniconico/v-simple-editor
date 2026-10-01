@@ -12,7 +12,8 @@ struct ImportResult {
     int resolvedFiles = 0;
     int unresolvedFiles = 0;
 };
-// Only direct spine asset-clips on at most two distinct lanes are imported.
+// Spine asset-clips and nested connected asset-clips are imported on up to
+// two video lanes and two audio lanes, with lane 0 taking priority.
 ImportResult parseXml(const QString &xml, const QString &directory);
 ImportResult readFcpxml(const QString &filePath);
 } // namespace fcpx::xml

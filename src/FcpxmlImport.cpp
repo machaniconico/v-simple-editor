@@ -7,6 +7,7 @@
 #include <QUrl>
 #include <QXmlStreamReader>
 #include <algorithm>
+#include <functional>
 #include <limits>
 #include <numeric>
 
@@ -43,7 +44,7 @@ bool combine(Time a, Time b, bool subtract, Time &out)
     out.n /= divisor; out.d /= divisor;
     return true;
 }
-struct Asset { QString path, name, format; Time start; };
+struct Asset { QString path, name, format; Time start; bool audioOnly = false; };
 struct Entry { QString ref, name; int lane = 0; Time offset, duration, start; };
 }
 ImportResult parseXml(const QString &xml, const QString &directory)
@@ -67,6 +68,39 @@ ImportResult parseXml(const QString &xml, const QString &directory)
         if (time(a.value(key).toString(), v)) return true;
         reader.raiseError(QStringLiteral("不正な時刻: %1").arg(key)); return false;
     };
+    std::function<void(const Time *, const Time *)> readAssetClip;
+    readAssetClip = [&](const Time *parentOffset, const Time *parentStart) {
+        const auto a = reader.attributes();
+        Entry e; e.ref = a.value("ref").toString(); e.name = a.value("name").toString();
+        bool laneOk = true;
+        if (a.hasAttribute("lane")) e.lane = a.value("lane").toInt(&laneOk);
+        QString invalid;
+        if (!laneOk) invalid = QStringLiteral("lane");
+        for (const auto &key : {QStringLiteral("offset"), QStringLiteral("duration"), QStringLiteral("start")}) {
+            Time *value = key == QStringLiteral("offset") ? &e.offset
+                : key == QStringLiteral("duration") ? &e.duration : &e.start;
+            if ((a.hasAttribute(key) || key == QStringLiteral("duration"))
+                && !time(a.value(key).toString(), *value)) invalid = key;
+        }
+        if (parentOffset && invalid.isEmpty()) {
+            Time relative, absolute;
+            if (!combine(e.offset, *parentStart, true, relative)
+                || !combine(*parentOffset, relative, false, absolute))
+                invalid = QStringLiteral("接続位置");
+            else e.offset = absolute;
+        }
+        if (!invalid.isEmpty()) {
+            result.warnings.append(QStringLiteral("クリップの値が不正です (%1): %2 / %3")
+                .arg(invalid, e.name, e.ref));
+            reader.skipCurrentElement();
+            return;
+        }
+        entries.append(e);
+        while (reader.readNextStartElement()) {
+            if (reader.name() == QLatin1String("asset-clip")) readAssetClip(&e.offset, &e.start);
+            else warnSkip();
+        }
+    };
     while (!reader.atEnd()) {
         reader.readNext();
         if (reader.isEndElement()) { if (!stack.isEmpty()) stack.removeLast(); continue; }
@@ -84,6 +118,8 @@ ImportResult parseXml(const QString &xml, const QString &directory)
             Asset asset;
             asset.path = a.value("src").toString(); asset.name = a.value("name").toString();
             asset.format = a.value("format").toString();
+            asset.audioOnly = a.value("hasVideo") == QLatin1String("0")
+                || (!a.hasAttribute("hasVideo") && a.value("hasAudio") == QLatin1String("1"));
             if (!readTime(a, QStringLiteral("start"), asset.start)) break;
             const QString id = a.value("id").toString();
             if (id.isEmpty() || assets.contains(id)) { reader.raiseError(QStringLiteral("素材 ID が不正です。")); break; }
@@ -104,15 +140,7 @@ ImportResult parseXml(const QString &xml, const QString &directory)
         } else if (tag == "spine" && parent == "sequence" && !spine) {
             spine = true;
         } else if (tag == "asset-clip" && parent == "spine") {
-            Entry e; e.ref = a.value("ref").toString(); e.name = a.value("name").toString();
-            bool laneOk = true;
-            if (a.hasAttribute("lane")) e.lane = a.value("lane").toInt(&laneOk);
-            if (!laneOk) { reader.raiseError(QStringLiteral("lane が不正です。")); break; }
-            if (!readTime(a, QStringLiteral("offset"), e.offset)
-                || !readTime(a, QStringLiteral("duration"), e.duration, true)
-                || !readTime(a, QStringLiteral("start"), e.start)) break;
-            entries.append(e);
-            while (reader.readNextStartElement()) warnSkip();
+            readAssetClip(nullptr, nullptr);
             continue;
         } else { warnSkip(); continue; }
         stack.append(tag);
@@ -133,56 +161,83 @@ ImportResult parseXml(const QString &xml, const QString &directory)
         else result.warnings.append(QStringLiteral("素材フォーマット %1: %2×%3、フレーム時間 %4。プロジェクトの映像設定を維持します。")
             .arg(id, f.value("width").toString(), f.value("height").toString(), f.value("frameDuration").toString()));
     }
-    QMap<int, QVector<Entry>> lanes;
-    for (const auto &e : entries) lanes[e.lane].append(e);
-    result.videoTracks.clear();
-    QSet<QString> found, missing;
-    for (auto lane = lanes.begin(); lane != lanes.end(); ++lane) {
-        if (result.videoTracks.size() == 2) {
-            result.warnings.append(QStringLiteral("2 トラックの上限により lane %1 を読み飛ばしました。").arg(lane.key())); continue;
+    QMap<int, QVector<Entry>> videoLanes, audioLanes;
+    for (const auto &e : entries) {
+        if (!assets.contains(e.ref)) {
+            result.warnings.append(QStringLiteral("未定義の素材参照を読み飛ばしました: %1").arg(e.ref));
+            continue;
         }
-        auto clips = lane.value();
-        // Stable ordering via Euclidean continued fractions avoids overflowing
-        // cross-products and does not round rational offsets to seconds.
-        std::stable_sort(clips.begin(), clips.end(), [](const Entry &a, const Entry &b) {
-            qint64 an = a.offset.n, ad = a.offset.d, bn = b.offset.n, bd = b.offset.d;
-            bool reverse = false;
-            for (;;) {
-                if (an / ad != bn / bd) return reverse ? an / ad > bn / bd : an / ad < bn / bd;
-                an %= ad; bn %= bd;
-                if (!an || !bn) return reverse ? an > bn : an < bn;
-                std::swap(an, ad); std::swap(bn, bd); reverse = !reverse;
-            }
-        });
-        QVector<ClipInfo> track;
-        Time end;
-        for (const auto &e : clips) {
-            if (!assets.contains(e.ref)) { result.error = QStringLiteral("未定義の素材参照: %1").arg(e.ref); return result; }
-            const auto asset = assets.value(e.ref);
-            Time offset, gap, start, out, nextEnd;
-            if (!e.duration.n || !combine(e.offset, origin, true, offset)
-                || !combine(e.start, asset.start, true, start)
-                || !combine(start, e.duration, false, out)
-                || !combine(offset, e.duration, false, nextEnd)) {
-                result.error = QStringLiteral("クリップの時刻範囲が不正です。"); return result;
-            }
-            if (!combine(offset, end, true, gap)) {
-                result.warnings.append(QStringLiteral("lane %1 の重複クリップを読み飛ばしました: %2").arg(lane.key()).arg(e.name)); continue;
-            }
-            const QUrl url(asset.path);
-            QString path = url.isLocalFile() ? url.toLocalFile() : asset.path;
-            if (path.isEmpty()) path = QStringLiteral("offline-%1").arg(e.ref);
-            if (QDir::isRelativePath(path)) path = QDir(directory).absoluteFilePath(path);
-            if (QFileInfo(path).isFile()) found.insert(path);
-            else if (!missing.contains(path)) { missing.insert(path); result.warnings.append(QStringLiteral("オフライン素材: %1").arg(path)); }
-            ClipInfo c; c.filePath = path; c.displayName = e.name.isEmpty() ? asset.name : e.name;
-            c.inPoint = start.seconds(); c.outPoint = c.duration = out.seconds(); c.leadInSec = gap.seconds();
-            track.append(c); end = nextEnd;
-        }
-        result.videoTracks.append(track);
+        (assets.value(e.ref).audioOnly ? audioLanes : videoLanes)[e.lane].append(e);
     }
+    result.videoTracks.clear();
+    result.audioTracks.clear();
+    QSet<QString> found, missing;
+    auto importLanes = [&](const QMap<int, QVector<Entry>> &lanes, QVector<QVector<ClipInfo>> &tracks) {
+        auto laneKeys = lanes.keys();
+        std::sort(laneKeys.begin(), laneKeys.end(), [](int a, int b) {
+            if (a == 0 || b == 0) return a == 0 && b != 0;
+            const qint64 absA = a < 0 ? -qint64(a) : qint64(a);
+            const qint64 absB = b < 0 ? -qint64(b) : qint64(b);
+            if (absA != absB) return absA < absB;
+            return a > b;
+        });
+        for (int lane : laneKeys) {
+            if (tracks.size() == 2) {
+                result.warnings.append(QStringLiteral("2 トラックの上限により lane %1 を読み飛ばしました。").arg(lane));
+                continue;
+            }
+            auto clips = lanes.value(lane);
+            // Stable ordering via Euclidean continued fractions avoids overflowing
+            // cross-products and does not round rational offsets to seconds.
+            std::stable_sort(clips.begin(), clips.end(), [](const Entry &a, const Entry &b) {
+                qint64 an = a.offset.n, ad = a.offset.d, bn = b.offset.n, bd = b.offset.d;
+                bool reverse = false;
+                for (;;) {
+                    if (an / ad != bn / bd) return reverse ? an / ad > bn / bd : an / ad < bn / bd;
+                    an %= ad; bn %= bd;
+                    if (!an || !bn) return reverse ? an > bn : an < bn;
+                    std::swap(an, ad); std::swap(bn, bd); reverse = !reverse;
+                }
+            });
+            QVector<ClipInfo> track;
+            Time end;
+            for (const auto &e : clips) {
+                const auto asset = assets.value(e.ref);
+                Time offset, gap, start, out, nextEnd;
+                if (!e.duration.n || !combine(e.offset, origin, true, offset)
+                    || !combine(e.start, asset.start, true, start)
+                    || !combine(start, e.duration, false, out)
+                    || !combine(offset, e.duration, false, nextEnd)) {
+                    result.warnings.append(QStringLiteral("lane %1 の時刻範囲が不正なクリップを読み飛ばしました: %2 / %3")
+                        .arg(lane).arg(e.name, e.ref));
+                    continue;
+                }
+                if (!combine(offset, end, true, gap)) {
+                    result.warnings.append(QStringLiteral("lane %1 の重複クリップを読み飛ばしました: %2").arg(lane).arg(e.name));
+                    continue;
+                }
+                const QUrl url(asset.path);
+                QString path = url.isLocalFile() ? url.toLocalFile() : asset.path;
+                if (path.isEmpty()) path = QStringLiteral("offline-%1").arg(e.ref);
+                if (QDir::isRelativePath(path)) path = QDir(directory).absoluteFilePath(path);
+                if (QFileInfo(path).isFile()) found.insert(path);
+                else if (!missing.contains(path)) { missing.insert(path); result.warnings.append(QStringLiteral("オフライン素材: %1").arg(path)); }
+                ClipInfo c; c.filePath = path; c.displayName = e.name.isEmpty() ? asset.name : e.name;
+                c.inPoint = start.seconds(); c.outPoint = c.duration = out.seconds(); c.leadInSec = gap.seconds();
+                track.append(c); end = nextEnd;
+            }
+            if (!track.isEmpty()) tracks.append(track);
+        }
+    };
+    importLanes(videoLanes, result.videoTracks);
+    importLanes(audioLanes, result.audioTracks);
     result.resolvedFiles = found.size(); result.unresolvedFiles = missing.size();
+    if (result.videoTracks.isEmpty() && result.audioTracks.isEmpty()) {
+        result.error = QStringLiteral("読み込めるクリップがありません。");
+        return result;
+    }
     if (result.videoTracks.isEmpty()) result.videoTracks.append(QVector<ClipInfo>{});
+    if (result.audioTracks.isEmpty()) result.audioTracks.append(QVector<ClipInfo>{});
     return result;
 }
 ImportResult readFcpxml(const QString &filePath)
