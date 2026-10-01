@@ -815,7 +815,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "clip-mask",        "VEDITOR_CLIP_MASK_SELFTEST",          runClipMaskSelftest,           false,
       "Bezier clip masks: model JSON, ProjectFile default omission, per-clip maskSystem round-trip" },
     { "align-distribute", "VEDITOR_ALIGN_DISTRIBUTE_SELFTEST", runAlignDistributeSelftest, true,
-      "Canvas alignment, equal gaps and atomic undo (4 gates)" },
+      "Canvas alignment, equal gaps and atomic undo (7 gates)" },
     { "clip-group", "VEDITOR_CLIP_GROUP_SELFTEST", runClipGroupSelftest, true,
       "Clip grouping, linked edits, undo and validation (5 gates)" },
     { "linked-trim", "VEDITOR_LINKED_TRIM_SELFTEST", runLinkedTrimSelftest, true,

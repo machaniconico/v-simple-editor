@@ -347,7 +347,9 @@ bool evaluateSpatialSegment(const ClipInfo& clip,
     result.u = (pathSeconds - startTime) / (endTime - startTime);
     result.u = std::max(0.0, std::min(1.0, result.u));
     const KeyframePoint *easeKeyframe = xStart ? xStart : yStart;
-    result.u = easedProgress(result.u, easeKeyframe);
+    // Same rule as KeyframeTrack::valueAt: exactly on the end key, that key's
+    // point (a Hold segment holds p0 only over [start, end)).
+    result.u = pathSeconds >= endTime ? 1.0 : easedProgress(result.u, easeKeyframe);
     if (!std::isfinite(result.u))
         return false;
 

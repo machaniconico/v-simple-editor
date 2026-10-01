@@ -7,6 +7,7 @@
 #include "SilenceCut.h"
 #include "BeatDetect.h"
 #include "ClipGeometry.h"
+#include "clipanim/ClipAnim.h"
 #include "ThreePointEdit.h"
 #include "TrimOps.h"
 #include "TrackMatteKey.h"
@@ -40,6 +41,7 @@
 #include <QSignalBlocker>
 #include <QRubberBand>
 #include <QSet>
+#include <QtMath>
 #include <QDir>
 #include <QFont>
 #include <QJsonArray>
@@ -52,6 +54,10 @@
 #include <QSizePolicy>
 #include <QSpacerItem>
 #include <QStringList>
+
+namespace veditor {
+bool parentingEnabledFromEnv(); // TimelineFrameRenderer.cpp
+}
 
 // STAGE4B: PlaybackEntry::matteTypeOrdinal stores TrackMatteType as a plain int
 // (PlaybackTypes.h must stay MaskSystem.h-free). This is the SSOT populate site
@@ -5461,58 +5467,347 @@ bool Timeline::arrangeSelectedLayers(LayerArrangement arrangement)
                          || arrangement == LayerArrangement::DistributeVertical;
     const QSize canvas(m_projectWidth, m_projectHeight);
     const double extent = horizontal ? canvas.width() : canvas.height();
-    struct Item { GroupClipTarget target; double start; double length; double delta = 0.0; };
+    // Evaluate what renderFrameAt draws at the playhead: position keyframes via
+    // clipanim::effectiveTransformAt, then the parent chain via composeParented
+    // (same guards as TimelineFrameRenderer's parent resolve).
+    const bool parenting = veditor::parentingEnabledFromEnv();
+    const auto clipStart = [&](int trackIdx, int clipIdx) {
+        const auto &clips = m_videoTracks[trackIdx]->clips();
+        double cursor = 0.0;
+        for (int i = 0; i < clipIdx; ++i)
+            cursor += clips[i].leadInSec + clips[i].effectiveDuration();
+        return cursor + clips[clipIdx].leadInSec;
+    };
+    const auto localSecondsAt = [&](int trackIdx, int clipIdx) {
+        const auto &clip = m_videoTracks[trackIdx]->clips()[clipIdx];
+        return qBound(0.0, m_playheadPos - clipStart(trackIdx, clipIdx),
+                      clip.effectiveDuration());
+    };
+    const auto activeParentLayer = [&](const QString &key, int *trackIdx, int *clipIdx) {
+        const QStringList parts = key.split(QLatin1Char(':'));
+        if (parts.size() != 2) return false;
+        bool okTrack = false, okClip = false;
+        const int t = parts[0].toInt(&okTrack), c = parts[1].toInt(&okClip);
+        // Track 0 is the renderer's base layer, which cannot act as a parent.
+        if (!okTrack || !okClip || t <= 0 || t >= m_videoTracks.size()) return false;
+        const auto *track = m_videoTracks[t];
+        if (track->isHidden() || c < 0 || c >= track->clipCount()) return false;
+        const double start = clipStart(t, c);
+        const double end = start + track->clips()[c].effectiveDuration();
+        if (m_playheadPos < start || m_playheadPos >= end) return false;
+        // The renderer builds no parent layer for a hidden regular clip
+        // (clipenabletest::disabled) or an adjustment clip, so its child renders raw.
+        const ClipInfo &parentClip = track->clips()[c];
+        if (parentClip.isAdjustment
+            || (!parentClip.visible && !clipgeom::isNullObjectFilePath(parentClip.filePath)))
+            return false;
+        *trackIdx = t;
+        *clipIdx = c;
+        return true;
+    };
+    // 0 = no parent, 1 = parented (*parentWorld set), -1 = broken chain (renders raw).
+    std::function<int(int, int, int, QVector<QString> &, clipgeom::ClipTransform *)> resolveParent;
+    const auto resolveWorld = [&](int trackIdx, int clipIdx, int depth, QVector<QString> &stack,
+                                  clipgeom::ClipTransform *world) {
+        const auto &clip = m_videoTracks[trackIdx]->clips()[clipIdx];
+        *world = clipanim::effectiveTransformAt(clip, localSecondsAt(trackIdx, clipIdx));
+        if (depth > 8) return true;
+        clipgeom::ClipTransform parentWorld;
+        const int parented = resolveParent(trackIdx, clipIdx, depth, stack, &parentWorld);
+        if (parented < 0) return false;
+        if (parented > 0) *world = clipgeom::composeParented(*world, parentWorld, canvas);
+        return true;
+    };
+    resolveParent = [&](int trackIdx, int clipIdx, int depth, QVector<QString> &stack,
+                        clipgeom::ClipTransform *parentWorld) {
+        if (!parenting) return 0;
+        const QString key = trackMatteClipKey(trackIdx, clipIdx);
+        const QString parentKey = m_clipParentEntries.value(key);
+        if (parentKey.isEmpty()) return 0;
+        int parentTrack = -1, parentClip = -1;
+        if (!activeParentLayer(parentKey, &parentTrack, &parentClip)
+            || parentKey == key || stack.contains(key) || stack.contains(parentKey))
+            return -1;
+        stack.append(key);
+        const bool ok = resolveWorld(parentTrack, parentClip, depth + 1, stack, parentWorld);
+        stack.removeLast();
+        return ok ? 1 : -1;
+    };
+    struct Item {
+        GroupClipTarget target; double start = 0.0; double length = 0.0;
+        double localSec = 0.0; ClipInfo original; double goal = 0.0;
+        bool wrote = false;
+    };
+    const auto clipOf = [&](const Item &item) {
+        return m_videoTracks[item.target.trackIndex]->clips()[item.target.clipIndex];
+    };
+    // Bounds as renderFrameAt draws the clip at the playhead (the rendering SSOT,
+    // including its center pivot, scale and rotation) under the current parent chain.
+    const auto boundsOf = [&](const Item &item, const ClipInfo &clip) {
+        clipgeom::ClipTransform transform = clipanim::effectiveTransformAt(clip, item.localSec);
+        clipgeom::ClipTransform parentWorld;
+        QVector<QString> stack;
+        if (resolveParent(item.target.trackIndex, item.target.clipIndex, 0, stack,
+                          &parentWorld) > 0)
+            transform = clipgeom::composeParented(transform, parentWorld, canvas);
+        return clipgeom::resolveTransform(transform, canvas)
+            .mapRect(QRectF(QPointF(0, 0), QSizeF(canvas)));
+    };
+    // The aligned point of a clip's rendered bounds: left / center / right (top /
+    // middle / bottom). Distribution places left (top) edges.
+    const double anchor = arrangement == LayerArrangement::HorizontalCenter
+                       || arrangement == LayerArrangement::VerticalCenter ? 0.5
+                        : arrangement == LayerArrangement::Right
+                       || arrangement == LayerArrangement::Bottom ? 1.0 : 0.0;
+    const auto edgeOf = [&](const QRectF &bounds) {
+        return horizontal ? bounds.left() + anchor * bounds.width()
+                          : bounds.top() + anchor * bounds.height();
+    };
     QVector<Item> items;
     for (const auto &target : selectedArrangementTargets()) {
-        const auto &clip = m_videoTracks[target.trackIndex]->clips()[target.clipIndex];
-        const clipgeom::ClipTransform transform{clip.videoScale, clip.videoDx,
-                                                clip.videoDy, clip.rotation2DDegrees};
-        // Use the rendering SSOT, including its center pivot, scale and rotation.
-        const QRectF bounds = clipgeom::resolveTransform(transform, canvas)
-            .mapRect(QRectF(QPointF(0, 0), QSizeF(canvas)));
-        const double start = horizontal ? bounds.left() : bounds.top();
-        const double length = horizontal ? bounds.width() : bounds.height();
-        if (!std::isfinite(start) || !std::isfinite(length)) return false;
-        items.append({target, start, length, 0.0});
+        Item item;
+        item.target = target;
+        item.localSec = localSecondsAt(target.trackIndex, target.clipIndex);
+        item.original = clipOf(item);
+        const QRectF bounds = boundsOf(item, item.original);
+        item.start = horizontal ? bounds.left() : bounds.top();
+        item.length = horizontal ? bounds.width() : bounds.height();
+        if (!std::isfinite(item.start) || !std::isfinite(item.length)) return false;
+        // Alignment reference is the canvas (0 / center / extent), so it never
+        // moves with a clip's own width change.
+        item.goal = anchor * extent;
+        items.append(item);
     }
+    // Distribution reference: the outermost clips in spatial order keep their
+    // original rendered (world) position, and the middle ones get equal gaps
+    // between rendered bounds. An endpoint is still solved like every other clip,
+    // so when a selected ancestor moves, the endpoint is compensated back to its
+    // world position (same parent-first rule as alignment). layout() derives the
+    // middle goals from the current widths; gapSpread() is max gap - min gap.
+    const auto currentBounds = [&]() {
+        QVector<QRectF> bounds;
+        for (const auto &item : items) bounds.append(boundsOf(item, clipOf(item)));
+        return bounds;
+    };
+    const auto lo = [&](const QRectF &b) { return horizontal ? b.left() : b.top(); };
+    const auto len = [&](const QRectF &b) { return horizontal ? b.width() : b.height(); };
+    const auto layout = [&]() {
+        const QVector<QRectF> bounds = currentBounds();
+        double totalLength = 0.0;
+        for (const auto &b : bounds) totalLength += len(b);
+        const double gap = (lo(bounds.last()) + len(bounds.last()) - lo(bounds.first())
+                          - totalLength) / (items.size() - 1);
+        double next = lo(bounds.first()) + len(bounds.first()) + gap;
+        for (int i = 1; i + 1 < items.size(); ++i) {
+            items[i].goal = next;
+            next += len(bounds[i]) + gap;
+        }
+    };
+    const auto gapSpread = [&]() {
+        const QVector<QRectF> bounds = currentBounds();
+        double minGap = std::numeric_limits<double>::infinity(), maxGap = -minGap;
+        for (int i = 0; i + 1 < bounds.size(); ++i) {
+            const double gap = lo(bounds[i + 1]) - (lo(bounds[i]) + len(bounds[i]));
+            minGap = std::min(minGap, gap);
+            maxGap = std::max(maxGap, gap);
+        }
+        return maxGap - minGap;
+    };
     if (distribute) {
         std::stable_sort(items.begin(), items.end(), [](const Item &a, const Item &b) {
             return a.start < b.start;
         });
-        double totalLength = 0.0;
-        for (const auto &item : items) totalLength += item.length;
-        const double gap = (items.last().start + items.last().length
-                          - items.first().start - totalLength) / (items.size() - 1);
-        double next = items.first().start + items.first().length + gap;
-        for (int i = 1; i + 1 < items.size(); ++i) {
-            items[i].delta = next - items[i].start;
-            next += items[i].length + gap;
-        }
-    } else {
-        for (auto &item : items) {
-            double destination = 0.0;
-            if (arrangement == LayerArrangement::HorizontalCenter
-                || arrangement == LayerArrangement::VerticalCenter)
-                destination = (extent - item.length) * 0.5;
-            else if (arrangement == LayerArrangement::Right
-                     || arrangement == LayerArrangement::Bottom)
-                destination = extent - item.length;
-            item.delta = destination - item.start;
-        }
+        items.first().goal = items.first().start;
+        items.last().goal = items.last().start;
+        layout();
     }
     bool changed = false;
-    for (const auto &item : items) changed |= std::abs(item.delta) > 1e-9;
+    for (const auto &item : items)
+        changed |= std::abs(edgeOf(boundsOf(item, item.original)) - item.goal) > 1e-9;
     if (!changed) return true;
     const TrackClipSnapshot before = snapshotTrackClips(this);
-    for (const auto &item : items) {
-        if (std::abs(item.delta) <= 1e-9) continue;
+    // Solve ancestors first: moving a selected parent also moves its children, so
+    // each child is solved against its parent's already-written world transform.
+    const auto parentDepth = [&](const GroupClipTarget &target) {
+        int depth = 0;
+        QString key = trackMatteClipKey(target.trackIndex, target.clipIndex);
+        QSet<QString> seen{key};
+        while (depth <= 9) {
+            const QString parent = m_clipParentEntries.value(key);
+            if (parent.isEmpty() || seen.contains(parent)) break;
+            seen.insert(parent);
+            key = parent;
+            ++depth;
+        }
+        return depth;
+    };
+    QVector<int> solveOrder;
+    for (int i = 0; i < items.size(); ++i) solveOrder.append(i);
+    std::stable_sort(solveOrder.begin(), solveOrder.end(), [&](int a, int b) {
+        return parentDepth(items[a].target) < parentDepth(items[b].target);
+    });
+    // Each clip is solved on its rendered bounds. For a world-axis move s (px),
+    // residual(s) = edgeOf(candidate moved by s) - goal. Plain clips are linear,
+    // so the first step lands exactly. A position key can also change the
+    // rotation and so the width (Auto Orient follows the path tangent), so the
+    // solver keeps stepping (secant, then bisection once the root is bracketed).
+    // A clip that does not come within kAcceptPx is left unchanged; the other
+    // clips are still applied as one undo entry and a status message gives the
+    // count. Return value: true when something was written or every target is
+    // already in place (callers refresh the preview on it); false when nothing
+    // was written because targets could not be placed (no undo entry).
+    constexpr double kAcceptPx = 0.5;
+    constexpr double kSolvedPx = 1e-6;
+    constexpr int kMaxSolveSteps = 80;
+    // A keyframed axis gets its playhead value set (or a key added there); writing
+    // only the static value would leave the rendered frame unchanged. A key within
+    // addKeyframe's 1 ms merge window is moved to exactly the playhead, since the
+    // evaluator only returns a key's own value at its exact time.
+    const auto moveAxis = [](ClipInfo &clip, double localSec, bool xAxis, double current,
+                             double delta) {
+        if (std::abs(delta) <= 1e-12) return;
+        const QString runtimeName = xAxis ? QStringLiteral("motion.position.x")
+                                          : QStringLiteral("motion.position.y");
+        const QString publicName = xAxis ? QStringLiteral("positionX")
+                                         : QStringLiteral("positionY");
+        const auto hasKeys = [&](const QString &name) {
+            const KeyframeTrack *t = clip.keyframes.track(name);
+            return t && t->count() > 0;
+        };
+        KeyframeTrack *keys = hasKeys(runtimeName) ? clip.keyframes.track(runtimeName)
+                            : hasKeys(publicName) ? clip.keyframes.track(publicName)
+                                                  : nullptr;
+        if (!keys) {
+            (xAxis ? clip.videoDx : clip.videoDy) += delta;
+            return;
+        }
+        for (int i = 0; i < keys->count(); ++i) {
+            KeyframePoint point = keys->keyframes()[i];
+            if (std::abs(point.time - localSec) < 0.001) {
+                point.time = localSec;
+                point.value = current + delta;
+                keys->setKeyframePoint(i, point);
+                return;
+            }
+        }
+        keys->addKeyframe(localSec, current + delta);
+    };
+    const auto solveItem = [&](Item &item) {
         auto *track = m_videoTracks[item.target.trackIndex];
+        const ClipInfo base = clipOf(item);
+        // Re-evaluate against the current (possibly just moved) parent chain.
+        const clipgeom::ClipTransform local = clipanim::effectiveTransformAt(base, item.localSec);
+        clipgeom::ClipTransform parentWorld;
+        QVector<QString> stack;
+        const bool parented = resolveParent(item.target.trackIndex, item.target.clipIndex, 0,
+                                            stack, &parentWorld) > 0;
+        // Child-local displacement per world pixel along the arrangement axis.
+        double ux = horizontal ? 1.0 / canvas.width() : 0.0;
+        double uy = horizontal ? 0.0 : 1.0 / canvas.height();
+        if (parented) {
+            // Undo the parent's rotation and scale to move in child-local space.
+            const double scale = parentWorld.videoScale;
+            const double radians = qDegreesToRadians(parentWorld.rotationDeg);
+            const double wx = horizontal ? 1.0 : 0.0;
+            const double wy = horizontal ? 0.0 : 1.0;
+            ux = (wx * std::cos(radians) + wy * std::sin(radians)) / scale / canvas.width();
+            uy = (-wx * std::sin(radians) + wy * std::cos(radians)) / scale / canvas.height();
+        }
+        const auto candidate = [&](double s) {
+            ClipInfo clip = base;
+            if (s == 0.0) return clip;   // ux/uy are non-finite under a zero-scale parent
+            moveAxis(clip, item.localSec, true, local.videoDx, s * ux);
+            moveAxis(clip, item.localSec, false, local.videoDy, s * uy);
+            return clip;
+        };
+        const auto residual = [&](double s) {
+            clipgeom::ClipTransform transform =
+                clipanim::effectiveTransformAt(candidate(s), item.localSec);
+            if (parented) transform = clipgeom::composeParented(transform, parentWorld, canvas);
+            return edgeOf(clipgeom::resolveTransform(transform, canvas)
+                              .mapRect(QRectF(QPointF(0, 0), QSizeF(canvas)))) - item.goal;
+        };
+        const double g0 = residual(0.0);
+        if (std::isfinite(g0) && std::abs(g0) <= 1e-9) return true;
+        double bestS = 0.0, bestG = g0;
+        if (std::isfinite(g0) && std::isfinite(ux) && std::isfinite(uy)) {
+            double sPrev = 0.0, gPrev = g0;
+            double s = -g0, g = residual(s);
+            double bracketLo = 0.0, bracketHi = 0.0, gLo = 0.0;
+            bool bracketed = false;
+            const auto opposite = [](double a, double b) { return (a < 0.0) != (b < 0.0); };
+            if (std::isfinite(g) && opposite(g, gPrev)) {
+                bracketed = true;
+                bracketLo = sPrev; gLo = gPrev; bracketHi = s;
+            }
+            for (int step = 0; std::isfinite(g); ++step) {
+                if (std::abs(g) < std::abs(bestG)) { bestS = s; bestG = g; }
+                if (std::abs(bestG) <= kSolvedPx || step >= kMaxSolveSteps) break;
+                double next = 0.5 * (bracketLo + bracketHi);
+                if (!bracketed) {
+                    const double slope = (g - gPrev) / (s - sPrev);
+                    next = std::isfinite(slope) && std::abs(slope) > 1e-9
+                        ? s - g / slope : s + 2.0 * (s - sPrev);
+                }
+                const double gNext = residual(next);
+                if (!std::isfinite(gNext)) break;
+                if (bracketed) {
+                    if (opposite(gNext, gLo)) bracketHi = next;
+                    else { bracketLo = next; gLo = gNext; }
+                } else if (opposite(gNext, g)) {
+                    bracketed = true;
+                    bracketLo = s; gLo = g; bracketHi = next;
+                }
+                sPrev = s; gPrev = g;
+                s = next; g = gNext;
+            }
+        }
+        if (!std::isfinite(bestG) || std::abs(bestG) > kAcceptPx) return false;
+        // Within tolerance without moving: nothing to write.
+        if (bestS == 0.0) return true;
         auto clips = track->clips();
-        auto &clip = clips[item.target.clipIndex];
-        if (horizontal) clip.videoDx += item.delta / extent;
-        else clip.videoDy += item.delta / extent;
+        clips[item.target.clipIndex] = candidate(bestS);
         track->setClips(clips);
+        item.wrote = true;
+        return true;
+    };
+    int unresolved = 0;
+    if (!distribute) {
+        for (int i : solveOrder)
+            if (!solveItem(items[i])) ++unresolved;
+    } else {
+        // A key edit can change a middle clip's width (Auto Orient), which shifts
+        // the equal-gap layout itself: re-layout with the new widths and solve
+        // again, up to kMaxLayoutPasses. If the gaps still differ by more than
+        // kMaxGapSpreadPx, every selected clip is put back and reported.
+        constexpr int kMaxLayoutPasses = 6;
+        constexpr double kMaxGapSpreadPx = 1.0;
+        double spread = std::numeric_limits<double>::infinity();
+        for (int pass = 0; pass < kMaxLayoutPasses; ++pass) {
+            if (pass > 0) layout();
+            for (int i : solveOrder)
+                solveItem(items[i]);
+            spread = gapSpread();
+            if (spread <= 0.01) break;
+        }
+        if (!std::isfinite(spread) || spread > kMaxGapSpreadPx) {
+            for (auto &item : items) {
+                auto *track = m_videoTracks[item.target.trackIndex];
+                auto clips = track->clips();
+                clips[item.target.clipIndex] = item.original;
+                track->setClips(clips);
+                item.wrote = false;
+                ++unresolved;
+            }
+        }
     }
+    bool wrote = false;
+    for (const auto &item : items) wrote |= item.wrote;
+    if (unresolved > 0)
+        emit statusMessageRequested(
+            QStringLiteral("%1 個のクリップは整列位置に合わせられないため変更しませんでした。")
+                .arg(unresolved), 5000);
+    if (!wrote) return unresolved == 0;
     remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, before);
     remapClipParentEntriesAfterMutation(this, m_clipParentEntries, before);
     saveUndoState(distribute ? QStringLiteral("均等配置") : QStringLiteral("整列"));
