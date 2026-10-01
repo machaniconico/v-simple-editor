@@ -1,4 +1,5 @@
 #include "../BundleAdjustment.h"
+#include "SelftestGate.h"
 
 #include <QByteArray>
 #include <QElapsedTimer>
@@ -268,11 +269,9 @@ bool sameBundleBits(const sfm::BundleResult& a, const sfm::BundleResult& b)
 
 int runBundleAdjustSelftest()
 {
-    int passed = 0, failed = 0;
-    const auto gate = [&](int number, bool ok) {
-        std::cerr << (ok ? "PASS G" : "FAIL G") << number << '\n';
-        if (ok) ++passed; else ++failed;
-    };
+    selftest::GateTally tally;
+    const auto gate = [&](int number, bool ok) { tally.gate(number, ok); };
+    using Backend = sfm::BundleResult::Backend;
     bool solverOk = solveKnownSystem(3);
     solverOk = solveKnownSystem(50) && solverOk;
     QVector<double> x;
@@ -288,9 +287,9 @@ int runBundleAdjustSelftest()
     const QImage base = texture();
     QVector<QImage> frames;
     for (int frame = 0; frame < 10; ++frame) frames.append(translate(base,2*frame,-frame));
-    const auto tracked = sfm::trackAcrossFrames(frames,150);
+    const auto tracked = sfm::trackAcrossFrames(frames,sfm::kMaxBundlePoints);
     int complete = 0;
-    bool trackingOk = tracked.frameCount == 10 && tracked.tracks.size() <= 150;
+    bool trackingOk = tracked.frameCount == 10 && tracked.tracks.size() <= sfm::kMaxBundlePoints;
     for (qsizetype i = 0; i < tracked.tracks.size(); ++i) {
         const auto& track = tracked.tracks[i];
         trackingOk = trackingOk && track.pointId == int(i) && !track.observations.isEmpty();
@@ -311,7 +310,7 @@ int runBundleAdjustSelftest()
             for (int xPixel = 0; xPixel < 320+2*frame; ++xPixel)
                 occludedFrames[frame].scanLine(y)[xPixel] = 0;
     }
-    const auto occluded = sfm::trackAcrossFrames(occludedFrames,150);
+    const auto occluded = sfm::trackAcrossFrames(occludedFrames,sfm::kMaxBundlePoints);
     int hidden = 0, terminated = 0, visibleComplete = 0;
     for (const auto& track : occluded.tracks) {
         // Exclude points that already died in the unobscured sequence, so this
@@ -420,14 +419,19 @@ int runBundleAdjustSelftest()
         }
         const double rmsDifference = std::abs(dense.rms-schur.rms);
         const bool deterministic = sameBundleBits(schur,again);
-        const bool ok = dense.valid && schur.valid && dense.converged && schur.converged && sizes
+        // Identical paths would give zero differences; require distinct backends.
+        const bool backends = dense.backend == Backend::Dense && schur.backend == Backend::Schur
+            && again.backend == Backend::Schur;
+        const bool ok = backends && dense.valid && schur.valid && dense.converged && schur.converged && sizes
             && rotationDifference < 1e-5 && translationDifference < 1e-4
             && rmsDifference < 1e-5 && deterministic;
         std::cerr << "G7 noisy=" << withNoise << " denseValid=" << dense.valid
                   << " schurValid=" << schur.valid << " denseConverged=" << dense.converged
                   << " schurConverged=" << schur.converged << " sizes=" << sizes
                   << " maxRotationEntry=" << rotationDifference << " translation=" << translationDifference
-                  << " rmsDifference=" << rmsDifference << " deterministic=" << deterministic << '\n';
+                  << " rmsDifference=" << rmsDifference << " deterministic=" << deterministic
+                  << " denseBackend=" << int(dense.backend) << " schurBackend=" << int(schur.backend)
+                  << " againBackend=" << int(again.backend) << '\n';
         equivalent = equivalent && ok;
     }
     gate(7,equivalent);
@@ -444,9 +448,25 @@ int runBundleAdjustSelftest()
     auto beyondPoints = largeScene.tracks;
     beyondPoints.tracks.resize(sfm::kMaxBundlePoints+1);
     const auto pointLimit = sfm::bundleAdjust(beyondPoints,largeScene.initial,largeScene.points,k);
-    const bool limits = !frameLimit.valid && !pointLimit.valid
-        && frameLimit.reason.contains(QString::number(sfm::kMaxBundleFrames))
-        && pointLimit.reason.contains(QString::number(sfm::kMaxBundlePoints));
+    auto beyondInitial = largeScene.points;
+    beyondInitial.append(largeScene.points.first());
+    const auto initialLimit = sfm::bundleAdjust(largeScene.tracks,largeScene.initial,beyondInitial,k);
+    // Exact match per limit: each rejection must name the limit that was exceeded.
+    const QString frameReason = QStringLiteral("フレーム数が上限（%1フレーム）を超えています")
+        .arg(sfm::kMaxBundleFrames);
+    const QString pointReason = QStringLiteral("点数が上限（%1点）を超えています").arg(sfm::kMaxBundlePoints);
+    const QString initialReason = QStringLiteral("初期点の数が上限（%1点）を超えています")
+        .arg(sfm::kMaxBundlePoints);
+    const bool frameOk = !frameLimit.valid && frameLimit.reason == frameReason
+        && frameLimit.backend == Backend::None;
+    const bool pointOk = !pointLimit.valid && pointLimit.reason == pointReason
+        && pointLimit.backend == Backend::None;
+    const bool initialOk = !initialLimit.valid && initialLimit.reason == initialReason
+        && initialLimit.backend == Backend::None;
+    const bool limits = frameOk && pointOk && initialOk;
+    std::cerr << "G8 frameOk=" << frameOk << " frameReason=" << frameLimit.reason.toUtf8().constData()
+              << " pointOk=" << pointOk << " pointReason=" << pointLimit.reason.toUtf8().constData()
+              << " initialOk=" << initialOk << " initialReason=" << initialLimit.reason.toUtf8().constData() << '\n';
     std::cerr << "G8 frames=" << largeScene.tracks.frameCount << " points=" << largeScene.points.size()
               << " ms=" << largeMs << " valid=" << large.valid << " converged=" << large.converged
               << " RMS=" << largeRms << " acceptedSteps=" << large.rmsHistory.size()-1
@@ -454,8 +474,27 @@ int runBundleAdjustSelftest()
     gate(8,sfm::kMaxBundleFrames >= 60 && sfm::kMaxBundlePoints >= 800
         && large.valid && large.converged && large.rmsHistory.size() > 1
         && largeMs <= 10000 && largeRms < 0.05 && limits);
+
+    // Default path (no environment variable) is Schur; only the value 1 selects dense.
+    qunsetenv("VEDITOR_BUNDLE_DENSE_SELFTEST");
+    const auto defaultPath = sfm::bundleAdjust(cleanScene.tracks,cleanScene.initial,cleanScene.points,k);
+    // A valid call that runs no iteration enters no solver, so the tag must not echo the selector.
+    const auto defaultIdle = sfm::bundleAdjust(cleanScene.tracks,cleanScene.initial,cleanScene.points,k,0);
+    qputenv("VEDITOR_BUNDLE_DENSE_SELFTEST","1");
+    const auto densePath = sfm::bundleAdjust(cleanScene.tracks,cleanScene.initial,cleanScene.points,k);
+    const auto denseIdle = sfm::bundleAdjust(cleanScene.tracks,cleanScene.initial,cleanScene.points,k,0);
+    std::cerr << "G9 defaultBackend=" << int(defaultPath.backend) << " defaultValid=" << defaultPath.valid
+              << " defaultSameAsG4=" << sameBundleBits(defaultPath,adjusted)
+              << " denseBackend=" << int(densePath.backend) << " denseValid=" << densePath.valid
+              << " rejectedBackend=" << int(rejected.backend)
+              << " defaultIdleBackend=" << int(defaultIdle.backend) << " defaultIdleValid=" << defaultIdle.valid
+              << " denseIdleBackend=" << int(denseIdle.backend) << " denseIdleValid=" << denseIdle.valid << '\n';
+    gate(9,defaultPath.valid && defaultPath.backend == Backend::Schur
+         && (hadBackend || sameBundleBits(defaultPath,adjusted))
+         && densePath.valid && densePath.backend == Backend::Dense && rejected.backend == Backend::None
+         && defaultIdle.valid && defaultIdle.backend == Backend::None
+         && denseIdle.valid && denseIdle.backend == Backend::None);
     if (hadBackend) qputenv("VEDITOR_BUNDLE_DENSE_SELFTEST",oldBackend);
     else qunsetenv("VEDITOR_BUNDLE_DENSE_SELFTEST");
-    std::cerr << "summary: " << passed << " PASS, " << failed << " FAIL\n";
-    return failed;
+    return tally.finish();
 }

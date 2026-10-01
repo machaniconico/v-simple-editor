@@ -3,9 +3,11 @@
 #include "../MainWindow.h"
 #include "../Timeline.h"
 #include "../UndoManager.h"
+#include "SelftestGate.h"
 
 #include <QByteArray>
 #include <QLabel>
+#include <QRegularExpression>
 #include <QSpinBox>
 #include <algorithm>
 #include <cmath>
@@ -74,11 +76,8 @@ sfm::MultiViewTracks scene(QVector<camsolve::Pose>& truth)
 
 int runCamtrackSolveSelftest()
 {
-    int passed = 0, failed = 0;
-    const auto gate = [&](int n, bool ok) {
-        std::fprintf(stderr, "%s G%d\n", ok ? "PASS" : "FAIL", n);
-        ok ? ++passed : ++failed;
-    };
+    selftest::GateTally tally;
+    const auto gate = [&](int n, bool ok) { tally.gate(n, ok); };
     QVector<camsolve::Pose> truth;
     const auto tracks = scene(truth);
     MainWindow window;
@@ -172,6 +171,27 @@ int runCamtrackSolveSelftest()
     }
     gate(2, boundaries);
 
+    // Scenario 0 reaches bundle adjustment and is rejected (RMS > 2 px); scenario 1 is accepted.
+    const auto perturbed = [&](int scenario) {
+        auto input = tracks;
+        std::mt19937 noiseRng(623);
+        const auto uniform = [&] { return (double(noiseRng())+.5)/4294967296.0; };
+        for (int point = 0; point < input.tracks.size(); ++point) {
+            for (auto& obs : input.tracks[point].observations) {
+                if (scenario == 0) {
+                    // Keep endpoint triangulation clean; minority interior outliers
+                    // leave enough inliers for every two-view initialization.
+                    if (point % 8 == 0 && obs.first > 0 && obs.first < input.frameCount-1)
+                        obs.second += QPointF(obs.first % 2 ? 20 : -20, point % 3 ? -20 : 20);
+                } else {
+                    const double radius = .5*std::sqrt(-2*std::log(uniform()));
+                    const double angle = 2*pi*uniform();
+                    obs.second += QPointF(radius*std::cos(angle), radius*std::sin(angle));
+                }
+            }
+        }
+        return input;
+    };
     const auto after = camera.toJson();
     auto stationary = tracks;
     for (auto& track : stationary.tracks)
@@ -179,11 +199,32 @@ int runCamtrackSolveSelftest()
     dialog.setFeatureTrackingResult(stationary, {1280,720}, 0);
     const bool rejected = !dialog.solveFeatureCamera();
     const QString failure = dialog.findChild<QLabel*>("featureSolveSummary")->text();
+    const double stationaryRms = dialog.featureSolveResult().bundle.rms;
     const bool unchanged = camera.toJson() == after;
-    const bool reported = failure.contains("RMS") && failure.contains(QStringLiteral("平面シーン"));
-    std::fprintf(stderr, "G3 rejected=%d appliedSignals=%d unchanged=%d reported=%d message=%s\n",
-        rejected, appliedSignals, unchanged, reported, qPrintable(failure));
-    gate(3, rejected && appliedSignals == 1 && unchanged && reported);
+    // The stationary scene fails before bundle adjustment, so no RMS exists. A scene
+    // with interior outliers fails after it; its summary must carry the actual number,
+    // not just the fixed label. The planar-scene hint must be specific to failures.
+    dialog.setFeatureTrackingResult(perturbed(0), {1280,720}, 0);
+    const bool outlierRejected = !dialog.solveFeatureCamera();
+    const QString outlierFailure = dialog.findChild<QLabel*>("featureSolveSummary")->text();
+    const double outlierRms = dialog.featureSolveResult().bundle.rms;
+    const bool outlierUnchanged = camera.toJson() == after;
+    const auto rmsMatch = QRegularExpression(QStringLiteral("RMS 再投影誤差: (\\S+) px")).match(outlierFailure);
+    bool numeric = false;
+    const double shownRms = rmsMatch.hasMatch() ? rmsMatch.captured(1).toDouble(&numeric) : 0.0;
+    const bool rmsShown = numeric && std::isfinite(outlierRms) && std::abs(shownRms-outlierRms) <= 1e-3;
+    const bool infinityShown = !std::isfinite(stationaryRms)
+        && failure.contains(QStringLiteral("RMS 再投影誤差: ∞（算出不可） px"));
+    const bool hintOnFailure = failure.contains(QStringLiteral("平面シーン"))
+        && outlierFailure.contains(QStringLiteral("平面シーン"));
+    const bool noHintOnSuccess = !successSummary.contains(QStringLiteral("平面シーン"));
+    std::fprintf(stderr, "G3 rejected=%d unchanged=%d stationaryRms=%g infinityShown=%d message=%s\n",
+        rejected, unchanged, stationaryRms, infinityShown, failure.toUtf8().replace('\n', " | ").constData());
+    std::fprintf(stderr, "G3 outlierRejected=%d outlierUnchanged=%d appliedSignals=%d numeric=%d shownRms=%.9g bundleRms=%.9g rmsShown=%d hintOnFailure=%d noHintOnSuccess=%d message=%s\n",
+        outlierRejected, outlierUnchanged, appliedSignals, numeric, shownRms, outlierRms, rmsShown,
+        hintOnFailure, noHintOnSuccess, outlierFailure.toUtf8().replace('\n', " | ").constData());
+    gate(3, rejected && unchanged && infinityShown && outlierRejected && outlierUnchanged
+         && appliedSignals == 1 && rmsShown && hintOnFailure && noHintOnSuccess);
 
     (window.*member(Undo{}))();
     const bool restored = camera.toJson() == before;
@@ -256,25 +297,9 @@ int runCamtrackSolveSelftest()
     // The environment switch selects only the preserved dense test oracle.
     const QByteArray oldBackend = qgetenv("VEDITOR_BUNDLE_DENSE_SELFTEST");
     const bool hadBackend = qEnvironmentVariableIsSet("VEDITOR_BUNDLE_DENSE_SELFTEST");
+    bool decided = true, parityAll = true;
     for (int scenario = 0; scenario < 2; ++scenario) {
-        auto input = tracks;
-        std::mt19937 noiseRng(623);
-        const auto uniform = [&] { return (double(noiseRng())+.5)/4294967296.0; };
-        for (int point = 0; point < input.tracks.size(); ++point) {
-            for (auto& obs : input.tracks[point].observations) {
-                if (scenario == 0) {
-                    // Keep endpoint triangulation clean; minority interior outliers
-                    // leave enough inliers for every two-view initialization.
-                    if (point % 8 == 0 && obs.first > 0 && obs.first < input.frameCount-1)
-                        obs.second += QPointF(obs.first % 2 ? 20 : -20, point % 3 ? -20 : 20);
-                } else {
-                    const double radius = .5*std::sqrt(-2*std::log(uniform()));
-                    const double angle = 2*pi*uniform();
-                    obs.second += QPointF(radius*std::cos(angle), radius*std::sin(angle));
-                }
-            }
-        }
-        bool ok = true;
+        const auto input = perturbed(scenario);
         sfm::BundleResult oracle;
         QString oracleMessage;
         for (bool dense : {true, false}) {
@@ -303,19 +328,29 @@ int runCamtrackSolveSelftest()
                 ? (!accepted && !actual.valid && actual.rms > 2 && warned && unchanged
                    && appliedSignals == priorSignals)
                 : (accepted && actual.valid && actual.converged && actual.rms < 2 && appliedNow);
-            const bool parity = dense || (actual.valid == oracle.valid
+            // Identical paths would agree trivially; require that distinct backends ran.
+            const auto expectedBackend = dense ? sfm::BundleResult::Backend::Dense
+                                               : sfm::BundleResult::Backend::Schur;
+            const bool backend = actual.backend == expectedBackend
+                && (dense || oracle.backend != actual.backend);
+            const bool parity = backend && (dense || (actual.valid == oracle.valid
                 && actual.converged == oracle.converged && actual.reason == oracle.reason
-                && warned == oracleMessage.contains(QStringLiteral("許容値 2 px")));
-            std::fprintf(stderr, "G%d dense=%d reached=%d accepted=%d valid=%d converged=%d rms=%g warned=%d unchanged=%d applied=%d decision=%d parity=%d reason=%s\n",
-                6+scenario, dense, reached, accepted, actual.valid, actual.converged,
-                actual.rms, warned, unchanged, appliedNow, decision, parity, qPrintable(actual.reason));
-            ok = ok && reached && decision && parity;
+                && warned == oracleMessage.contains(QStringLiteral("許容値 2 px"))));
+            // Both sides of every parity comparison; oracle* are the preceding dense run's values.
+            const bool oracleWarned = oracleMessage.contains(QStringLiteral("許容値 2 px"));
+            std::fprintf(stderr, "G6/G7 scenario=%d dense=%d reached=%d accepted=%d valid=%d oracleValid=%d converged=%d oracleConverged=%d rms=%g warned=%d oracleWarned=%d unchanged=%d applied=%d decision=%d backend=%d oracleBackend=%d backendOk=%d parity=%d reason=%s oracleReason=%s\n",
+                scenario, dense, reached, accepted, actual.valid, oracle.valid, actual.converged,
+                oracle.converged, actual.rms, warned, oracleWarned, unchanged, appliedNow, decision,
+                int(actual.backend), int(oracle.backend), backend, parity,
+                actual.reason.toUtf8().constData(), oracle.reason.toUtf8().constData());
+            decided = decided && reached && decision;
+            parityAll = parityAll && parity;
             if (dense) { oracle = actual; oracleMessage = message; }
         }
-        gate(6+scenario, ok);
     }
+    gate(6, decided);
+    gate(7, parityAll);
     if (hadBackend) qputenv("VEDITOR_BUNDLE_DENSE_SELFTEST", oldBackend);
     else qunsetenv("VEDITOR_BUNDLE_DENSE_SELFTEST");
-    std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
-    return failed;
+    return tally.finish();
 }

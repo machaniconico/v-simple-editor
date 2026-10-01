@@ -368,16 +368,27 @@ int runCamtrackUiSelftest()
     auto extraPoints = points; extraPoints.append(points.first());
     const auto pointRejected = sfm::bundleAdjust(excessPoints, initial, extraPoints, k, 0);
     const auto initialRejected = sfm::bundleAdjust(boundary, initial, extraPoints, k, 0);
-    const QString reason = QStringLiteral("上限は%1フレーム、%2点です")
-        .arg(sfm::kMaxBundleFrames).arg(sfm::kMaxBundlePoints);
+    // Each limit has its own exact reason, so a rejection names the limit it hit.
+    const QString frameReason = QStringLiteral("フレーム数が上限（%1フレーム）を超えています")
+        .arg(sfm::kMaxBundleFrames);
+    const QString pointReason = QStringLiteral("点数が上限（%1点）を超えています").arg(sfm::kMaxBundlePoints);
+    const QString initialReason = QStringLiteral("初期点の数が上限（%1点）を超えています")
+        .arg(sfm::kMaxBundlePoints);
     dialog.setFeatureTrackingSource(moving, 10, sfm::kMaxBundleFrames + 10);
-    gate(4, accepted.valid && !frameRejected.valid && frameRejected.reason == reason
-         && !pointRejected.valid && pointRejected.reason == reason
-         && !initialRejected.valid && initialRejected.reason == reason
-         && dialog.findChild<QLabel*>("featureLimits")->text().contains(
-             QStringLiteral("上限 %1 フレーム / %2 点").arg(sfm::kMaxBundleFrames).arg(sfm::kMaxBundlePoints))
-         && dialog.findChild<QSpinBox*>("featureEnd")->value() == sfm::kMaxBundleFrames - 1
-         && dialog.findChild<QSpinBox*>("featureMaxPoints")->maximum() == sfm::kMaxBundlePoints);
+    const bool frameOk = !frameRejected.valid && frameRejected.reason == frameReason;
+    const bool pointOk = !pointRejected.valid && pointRejected.reason == pointReason;
+    const bool initialOk = !initialRejected.valid && initialRejected.reason == initialReason;
+    const QString limitsText = dialog.findChild<QLabel*>("featureLimits")->text();
+    const bool limitsLabel = limitsText.contains(
+        QStringLiteral("上限 %1 フレーム / %2 点").arg(sfm::kMaxBundleFrames).arg(sfm::kMaxBundlePoints));
+    const int featureEnd = dialog.findChild<QSpinBox*>("featureEnd")->value();
+    const int maxPoints = dialog.findChild<QSpinBox*>("featureMaxPoints")->maximum();
+    std::fprintf(stderr, "G4 accepted=%d frameOk=%d frameReason=%s pointOk=%d pointReason=%s initialOk=%d initialReason=%s limitsLabel=%d featureEnd=%d maxPoints=%d\n",
+        accepted.valid, frameOk, frameRejected.reason.toUtf8().constData(), pointOk,
+        pointRejected.reason.toUtf8().constData(), initialOk, initialRejected.reason.toUtf8().constData(),
+        limitsLabel, featureEnd, maxPoints);
+    gate(4, accepted.valid && frameOk && pointOk && initialOk && limitsLabel
+         && featureEnd == sfm::kMaxBundleFrames - 1 && maxPoints == sfm::kMaxBundlePoints);
 
     const auto summaryOf = [](PlanarTrackerDialog& d) {
         auto* label = d.findChild<QLabel*>(QStringLiteral("planarSummary"));

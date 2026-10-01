@@ -220,9 +220,12 @@ struct BundleBlocks {
 };
 
 // Apply the same LM diagonal damping before elimination as the dense oracle.
-// S = U - W V^-1 W^T, rhs = -gc + W V^-1 gp.
-bool solveBundleSchur(const BundleBlocks& blocks, double lambda, QVector<double>& delta)
+// S = U - W V^-1 W^T, rhs = -gc + W V^-1 gp. Tags used on entry, so the tag
+// follows this function rather than the caller's selector.
+bool solveBundleSchur(const BundleBlocks& blocks, double lambda, QVector<double>& delta,
+                      BundleResult::Backend& used)
 {
+    used = BundleResult::Backend::Schur;
     const int m = 6*int(blocks.cameras.size());
     QVector<double> reduced(m*m,0.0), rhs(m);
     double* const matrix = reduced.data();
@@ -385,10 +388,17 @@ BundleResult bundleAdjust(const MultiViewTracks& tracks, QVector<camsolve::Pose>
         result.reason = QString::fromUtf8(reason);
         return result;
     };
-    if (tracks.frameCount > kMaxBundleFrames || tracks.tracks.size() > kMaxBundlePoints
-        || initialPoints.size() > kMaxBundlePoints) {
-        result.reason = QStringLiteral("上限は%1フレーム、%2点です")
-                            .arg(kMaxBundleFrames).arg(kMaxBundlePoints);
+    // Each limit has its own reason so a rejection names the limit that was exceeded.
+    if (tracks.frameCount > kMaxBundleFrames) {
+        result.reason = QStringLiteral("フレーム数が上限（%1フレーム）を超えています").arg(kMaxBundleFrames);
+        return result;
+    }
+    if (tracks.tracks.size() > kMaxBundlePoints) {
+        result.reason = QStringLiteral("点数が上限（%1点）を超えています").arg(kMaxBundlePoints);
+        return result;
+    }
+    if (initialPoints.size() > kMaxBundlePoints) {
+        result.reason = QStringLiteral("初期点の数が上限（%1点）を超えています").arg(kMaxBundlePoints);
         return result;
     }
     if (tracks.frameCount < 2 || tracks.tracks.isEmpty()
@@ -450,6 +460,12 @@ BundleResult bundleAdjust(const MultiViewTracks& tracks, QVector<camsolve::Pose>
     const int cameraParams = 6*(tracks.frameCount-1), n = cameraParams+3*int(points.size());
     bool converged = cost <= 1e-24;
     const bool denseSelftest = qEnvironmentVariableIntValue("VEDITOR_BUNDLE_DENSE_SELFTEST") == 1;
+    // Each solver writes the tag when it is entered, so the tag names the solver that
+    // ran rather than the selector; it stays None when no linear solve is attempted.
+    const auto solveDense = [&](QVector<double> A, QVector<double> b, QVector<double>& x) {
+        result.backend = BundleResult::Backend::Dense;
+        return solveDenseLinearSystem(std::move(A),std::move(b),n,x);
+    };
     double lambda = 1e-3;
     for (int iteration = 0; iteration < maxIters && cost > 1e-24; ++iteration) {
         QVector<double> normal, gradient;
@@ -474,9 +490,9 @@ BundleResult bundleAdjust(const MultiViewTracks& tracks, QVector<camsolve::Pose>
                     matrix[i*n+i] += lambda*std::max(normal[i*n+i],1e-12);
                     rhs[i] = -gradient[i];
                 }
-                solved = solveDenseLinearSystem(std::move(damped),std::move(rhs),n,delta);
+                solved = solveDense(std::move(damped),std::move(rhs),delta);
             } else {
-                solved = solveBundleSchur(blocks,lambda,delta);
+                solved = solveBundleSchur(blocks,lambda,delta,result.backend);
             }
             if (solved) {
                 auto candidateCameras = cameras;

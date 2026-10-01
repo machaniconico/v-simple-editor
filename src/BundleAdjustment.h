@@ -40,6 +40,10 @@ QVector<camsolve::Pose> chainTwoViewPoses(const MultiViewTracks& tracks,
                                          const camsolve::Intrinsics& intrinsics);
 
 struct BundleResult {
+    // Linear solver the iterations entered; None when no solve was attempted
+    // (rejected input, maxIters == 0, or an initial cost already at zero).
+    enum class Backend { None, Dense, Schur };
+    Backend backend = Backend::None;
     bool valid = false;
     bool converged = false;
     QString reason;
